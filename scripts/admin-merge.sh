@@ -867,6 +867,34 @@ FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-$FAILSAFE_RERUN_TIMEOUT}"
 FIRST_CHECKS_STALL="${ADMIN_MERGE_FIRST_CHECKS_STALL:-8760}"
 FIRST_CHECKS_CEILING="${ADMIN_MERGE_FIRST_CHECKS_CEILING:-18064}"
 FIRST_CHECKS_POLL="${ADMIN_MERGE_FIRST_CHECKS_POLL:-60}"
+
+# ── THE CONFIGURED LANE THAT DOES NOT EXIST IN THIS REPO (#2862) ──
+# `WORKFLOW` defaults to `python-ci.yml`, a TORTOISE layout. On a repo whose CI
+# lives in `.github/workflows/ci.yml` (premise-labs runs its CI in `ci.yml`)
+# `gh run list --workflow python-ci.yml` matches NOTHING, and to this wait "no run
+# matched the filter" and "the PR was pushed a second ago" are the SAME state — so
+# it burned the whole legacy window and then refused with "CI never started" about
+# a PR whose checks had all passed (measured 2026-10-26, premise-labs#572: 12
+# checks, 0 failing; `--any-workflow` merged it in under two minutes).
+#
+# A repo needs no configuration to be MERGEABLE: `gh pr checks` resolves the
+# surface fine. So the filter is a TORTOSE-SHAPED OPTIMISATION, not a contract,
+# and the wait now DROPS it when it is PROVEN to select nothing while the head
+# carries checks — re-reading the list the way `--any-workflow` does.
+#
+# ⛔ AND THAT IS NOT A MERGE-DECISION LOOSENING. §4.5 (`check_surface_probe` on
+# the head) grades the evaluated tree across EVERY workflow and is untouched by
+# this: a genuinely red required check is refused there whatever lane this wait
+# happened to list. The filter only ever chose WHICH runs the wait watched.
+#
+# The drop is bounded by a COUNT, not a time: it may ATTEMPT the discriminating
+# read at most this many times per wait, and an attempt costs ONE tiny
+# `check-runs?per_page=1` read (its `total_count` is the whole surface), paid ONLY
+# on the broken path — arm (a), a repo that does have the configured workflow,
+# never pays it at all because its filtered list is non-empty. All four arms stay
+# inside the existing verdict table, so nothing here can outlive the stall/ceiling
+# bounds below. Set it to 0 to restore the pre-#2862 hardcoded-lane behaviour.
+FIRST_CHECKS_REDERIVE_MAX="${ADMIN_MERGE_FIRST_CHECKS_REDERIVE_MAX:-1}"
 # The maximum number of PENDING RUNS whose job lists this wait will fingerprint in
 # one poll. Beyond it the read is deliberately NOT attempted, because a partially
 # observed surface could show "no change" for a run that is in fact advancing —
@@ -4281,6 +4309,31 @@ for path in sys.argv[1:]:
 PY
 }
 
+# first_checks_head_check_count <head> → the number of check-runs GitHub holds for
+# this head ACROSS EVERY WORKFLOW, and rc 0 when that surface was READ; rc 1 when
+# it could not be read at all.
+#
+# ⛔ A READ THAT FAILED IS NOT A ZERO, and the caller must not collapse them: 0 is
+# the evidence that NOTHING exists at this head yet (arm (d) — an empty surface,
+# which the wait may only report as "no run has appeared"), while an unreadable
+# surface is evidence of NOTHING and must never license the same sentence.
+#
+# `per_page=1` is deliberate: `total_count` on the first page IS the whole
+# surface, so the probe cannot be expensive enough to matter inside a poll. The
+# value is read with sed rather than jq/python because it must survive the cell's
+# transport-controlled gh chain, which is not guaranteed to serve `--jq`.
+first_checks_head_check_count() {
+  local head="$1" slug body n
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  body="$TMP/fc-head-checks.json"
+  if ! $GH api "$slug/commits/$head/check-runs?per_page=1" > "$body" 2>/dev/null; then
+    return 1
+  fi
+  n="$(sed -n 's/.*"total_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$body" | head -1)"
+  [ -n "$n" ] || return 1
+  printf '%s\n' "$n"
+}
+
 # wait_for_first_checks <head> → 0 the lane is terminal at this head (there is
 # something to compare), 1 it is not (and FIRST_CHECKS_* say which way).
 #
@@ -4298,8 +4351,10 @@ wait_for_first_checks() {
   local now last_clock dt fp summary max_step digest jobs
   local max_step_run fp_run summary_run read_ok n_lines idx
   local stall_bound ceiling_bound signal_ok poll_step remaining adv
+  local rederive_left lane_filter_active head_checks
   local -a jobs_files=() pending_ids=()
   FIRST_CHECKS_WAITED=0; FIRST_CHECKS_QUIET=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""
+  FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
   FIRST_CHECKS_FINGERPRINT=""; FIRST_CHECKS_MISSING=0; FIRST_CHECKS_MISSING_STREAK=0
   stall_bound="$FIRST_CHECKS_STALL"
@@ -4328,9 +4383,18 @@ wait_for_first_checks() {
   # rejects it (`unknown flag`), and `2>/dev/null || true` hid that, so a
   # diagnostic built on it was silently dead for the very invocation
   # commit-workflow's own docs prescribe.
+  #
+  # The filter lives in `lane_filter_active`, NOT in `$ANY_WORKFLOW`: dropping it
+  # is a decision about THIS WAIT only (#2862). `ANY_WORKFLOW` also steers the
+  # failure-set lane and the base-window messages further down, so reusing it here
+  # would silently widen surfaces this fix has no business touching.
+  lane_filter_active=0
   if [ "${ANY_WORKFLOW:-0}" -ne 1 ] && [ -n "${WORKFLOW:-}" ]; then
+    lane_filter_active=1
     args+=(--workflow "$WORKFLOW")
   fi
+  rederive_left="$FIRST_CHECKS_REDERIVE_MAX"
+  case "$rederive_left" in ''|*[!0-9]*) rederive_left=1 ;; esac
   last_clock="$SECONDS"
   while :; do
     # shellcheck disable=SC2086
@@ -4353,6 +4417,54 @@ wait_for_first_checks() {
         [ -n "$obs" ] && obs="$obs; "
         obs="${obs}run ${id} status=${status} conclusion=${conclusion:--}${created:+ created=${created}}"
       done < <(printf '%s\n' "$out" | awk -F'\t' '{ printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }')
+    fi
+
+    # ── THE CONFIGURED LANE THAT SELECTS NOTHING HERE (#2862) ─────────────
+    # An EMPTY filtered list is ambiguous, and the ambiguity is what hung
+    # premise-labs#572: it means "this repo's CI is named otherwise" just as
+    # readily as "the PR was pushed a second ago", and the old wait could only
+    # read it the second way — so a misconfiguration was paid for with the whole
+    # window and reported as "CI never started" about a green PR.
+    #
+    # The discriminator costs one read: if the HEAD carries check-runs, they come
+    # from workflows whose names this repo actually has, so the configured name is
+    # NOT one of them and the filter is dropped. If the head carries NONE, the
+    # empty list was TRUE (nothing exists yet) and arm (d) reports it as such.
+    # ⛔ An UNREADABLE count drops nothing: an unread instrument is not a
+    # misconfiguration, and guessing it here would be the same class of error as
+    # reading it as "no runs".
+    #
+    # ⚠️ NO CLOCK ADVANCES on the re-derive poll. It is an immediate retry that
+    # answered nothing about the lane, so charging it to `missing` would let a
+    # misconfiguration eat the window one read at a time — the defect, not the fix.
+    if [ "$rc" -eq 0 ] && [ "$total" -eq 0 ] && [ "$lane_filter_active" -eq 1 ] \
+       && [ "$rederive_left" -gt 0 ]; then
+      # ⚠️ THE BUDGET IS SPENT ON THE ATTEMPT, NOT ON THE OUTCOME. Charging it only
+      # on a successful drop would make an UNREADABLE probe retry on every poll —
+      # one REST call per poll, forever, on the very path whose defect is "this wait
+      # burns its budget". One attempt per wait is the bound; a probe that fails
+      # leaves the pre-existing behaviour (the bounded legacy window) in place, and
+      # the message names the operator's escape.
+      rederive_left=$((rederive_left - 1))
+      if head_checks="$(first_checks_head_check_count "$head")"; then
+        # The count is recorded either way: a PROVEN-EMPTY head is a different
+        # state from an unread one, and the refusal must be able to say which.
+        FIRST_CHECKS_HEAD_CHECKS="$head_checks"
+        if [ "$head_checks" -gt 0 ]; then
+          lane_filter_active=0
+          args=()
+          [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
+          FIRST_CHECKS_REDERIVED="$WORKFLOW"
+          info "admin-merge: … FIRST-CHECKS wait: the configured lane '$WORKFLOW' has NO run at head $head, but this head carries $head_checks check-run(s) across every workflow — so '$WORKFLOW' is not this repo's CI (it is the TORTOISE default; a repo may name its CI anything, premise-labs uses ci.yml). DROPPING the lane filter for this wait and re-reading the head unfiltered. The merge decision is NOT loosened: §4.5 grades the head's evaluated tree across EVERY workflow, so a red required check is refused there exactly as before."
+          continue
+        fi
+      else
+        # An unreadable count is NOT evidence of a misconfiguration, and it must not
+        # be turned into one. Fail CLOSED — keep the filter, keep the window — but
+        # say so, because the alternative reading ("this repo's CI is elsewhere") is
+        # the exact ambiguity #2862 is about.
+        info "admin-merge: … FIRST-CHECKS wait: the configured lane '$WORKFLOW' has NO run at head $head, and the head's check-runs could not be READ — so 'this workflow is named differently here' and 'nothing has started yet' remain indistinguishable. KEEPING the filter and the bounded window (${FIRST_CHECKS_WAIT}s). If this repo's CI is named differently, pass --any-workflow."
+      fi
     fi
 
     # ── THE PROGRESS OBSERVATION ──────────────────────────────────────────
@@ -4602,8 +4714,27 @@ block_on_first_checks() {
       say_err "admin-merge: ✗ BLOCK — the FIRST-CHECKS wait expired after ${FIRST_CHECKS_WAITED}s (window ${FIRST_CHECKS_WAIT}s) — no classification attempted."
       say_err "   waited for: the lane's runs on head $head to APPEAR and reach status=completed"
       say_err "   last observed: ${FIRST_CHECKS_OBSERVED:-nothing readable}"
-      say_err "   what was missing: NO run of the lane ever attached to this head. This is the"
-      say_err "   fresh-PR race (or the lane does not trigger on pull requests), not a failure."
+      if [ -n "${FIRST_CHECKS_REDERIVED:-}" ]; then
+        # The discriminating read DID fire and found nothing at all — so the
+        # configured name is not the whole story, and saying "the lane did not
+        # trigger on pull_request" would be a guess this wait cannot support.
+        say_err "   what was missing: NO run attached to this head in the configured lane"
+        say_err "   ('${FIRST_CHECKS_REDERIVED}'), AND the filter was DROPPED (that name selects nothing here)"
+        say_err "   and the UNFILTERED read still returned nothing, AND the head carries no check-run"
+        say_err "   at all. So this is a genuinely empty surface at this head — not a lane-name mismatch."
+      elif [ "${FIRST_CHECKS_HEAD_CHECKS:-}" = "0" ]; then
+        # The probe READ the head and found ZERO checks under EVERY workflow. The
+        # empty list was TRUE, so the "does not trigger on pull_request" guess the
+        # old text offered is unnecessary — and it would have been wrong: the
+        # configured lane name was never the question.
+        say_err "   what was missing: NOTHING has attached to this head at all — a check-runs read at"
+        say_err "   this head returned total_count 0 ACROSS EVERY WORKFLOW, so the head carries no check-run"
+        say_err "   at all and the configured lane ('${WORKFLOW:-}<none>') never even came into it."
+        say_err "   An EMPTY surface is not a wrong lane name: nothing has started yet."
+      else
+        say_err "   what was missing: NO run of the lane ever attached to this head. This is the"
+        say_err "   fresh-PR race (or the lane does not trigger on pull requests), not a failure."
+      fi
       say_err "   There is no run whose progress could be observed, so this wait keeps the LEGACY"
       say_err "   bounded window rather than a stall bound."
       say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"

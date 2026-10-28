@@ -40,6 +40,12 @@ rc=$?
 # operator to wait for a remedy that cannot arrive.
 if [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "71" ]; then
+  # ⛔ THE CAPABILITY REFUSAL (#2935) IS THE ONE THIS SCRIPT COULD NOT NAME AT ALL (review of #2991,
+  # P1): `fix-one.sh` propagates the gate's own code, so 71 reached the manual operator's log as NO
+  # LINE — a run that did nothing, silently. Waiting does not clear it, so it must not be folded into
+  # the load arm above.
+  echo "[adopt-fix $PR] fixer NOT started (CAPABILITY gate) — this box could not complete one model call and RETURN (#2935); see the [capability-gate] REFUSED line in $O/logs/fix-$PR.log for which reading refused. Waiting will not clear it: repair the box (installed pi/extension set, provider credential) or dispatch the PR elsewhere." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "72" ]; then
   # A worktree that exists but is the wrong repo (or a branch the target repo does not have) is
   # refused by fix-one.sh with 72. Name it in the log the manual operator reads (#1720/#2694).
