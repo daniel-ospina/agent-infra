@@ -812,7 +812,7 @@ them to this diff grades a mechanism the file no longer has.
 | **M1** verdict back on `undeliverable` alone (the pre-#2708 line) | `§14.1–14.3` + a retargeted arm | ⛔ DO NOT APPLY — superseded by #2978, its tests live in `test_pr_doctor.py`'s #2710 block |
 | **M2** drop the queue-derived refusal axis | `§14.3` | ⛔ DO NOT APPLY — #2978 fixed the gate-order dependence by VOIDING a refused row's budget slot, not by charging it |
 | **M5** stop naming a refusal on a pass that DID dispatch | `§14.4`'s second arm | ⛔ DO NOT APPLY — that sentence is #2978's `parts` block |
-| **M6** append the refusal sentence after the stall counters | `§14.1–14.3` on the 110-char slice | ⛔ DO NOT APPLY — the placement moved with the superseded cut |
+| **M6** append the refusal sentence after the stall counters | `§14.1–14.3` on the 110-char slice | ⛔ **WRONG AS ORIGINALLY RECORDED, AND DO NOT APPLY TWICE OVER** — (a) the placement moved with the superseded cut; (b) review cycle 2 falsified the CLAIM itself. The counters this code emitted were short (`refused-recorded=3; `, `budget=4; `), so `REFUSED` landed at char ~21-31 under EITHER order and every `reason[:110]` assertion still passed: a reorder would have gone green everywhere. The run that "confirmed" it used a malformed mutant (the `stalls` loop was moved too), so those reds came from a mangled parts assembly and not from the ordering. The finding that survives is the reviewer's arithmetic, and the property actually worth pinning is the **word** surviving the cut — which #2978's `parts` block owns now |
 
 **Re-running M3/M4 is two small edits.** Each is a single edit applied to a **copy** of the tree (so the
 box's own checkout is never mutated mid-run) and graded with
