@@ -947,9 +947,27 @@ green `CELL READY` means a guarded lane: two components that decide whether the 
 cells today. `cell-install.sh --verify` now prints one `activation:` line for the shim, resolved
 through the **same** candidates `review-enforcer` reads, so the row is checked rather than asserted.
 
+#### When a cell says it is provisioned and is not — the eight measured signatures
+
+Measured 2026-10-27 while provisioning `pi-cell-1` / cell 3 / cell 4: every row below is a failure an
+operator hit **after** some step had reported success. **The gate is the authority; this table is its
+index** — `scripts/cloud-cell-bringup.sh --check` fails closed with `CHECK FAILED [<check name>]` (or a
+supervisor `FATAL`) and prints the FIX line, so read the refusal, not this table, for the current state
+of any single check. Nothing here is a procedure to run *instead* of `--check`.
+
+| failure signature | cause | the command that fixes it |
+|---|---|---|
+| `cell-install.sh --install` ends right after `LAYER VERIFIED`, and no pin is recorded | the layer is not the cell: the harness pin is created by a **separate** gate, so an install can succeed over a cell that has none (#2909) | `HOME=$HOME CELL_HOME=$HOME bash scripts/cloud-cell-bringup.sh --check` — `check_harness_pin` **refuses** a cell with no pin now; it is the only writer, so there is nothing to run first |
+| `FAIL com.eldato.ai-drainer: placeholder(s) this runtime does not know: {{AI_DRAINER_O}}`, `no StartInterval…`, then `the declared job set is BROKEN — refusing …` and the controller dies `rc=1` | shipped job declarations vs shipped runtime (#2908) | fix the declaration in `templates/launchd` and re-run `--check`; `check_schedule` refuses a non-zero `fleet-schedule.py --verify` **or any `FAIL` line** |
+| `REPO is not set and no single checkout could be derived` | TWO homes — `/home/cmux` (checkout) and `/tmp/cell-home` (farm/state/keys) | `CELL_HOME=$HOME WORKDIR=$HOME/<repo> bash scripts/cloud-cell-bringup.sh --check`; `check_one_home env` refuses a `CELL_HOME` that is not this box's home, and any cell-state path in `/tmp` outside it |
+| 17 jobs `broken target: …/.pi/agent/scripts/… does not resolve — the farm is INCOMPLETE` **while the farm is installed** | the same two homes: the declarations expand `{{HOME}}` to the home the farm is NOT under | the same fix as the row above — one home, re-run `--check` |
+| `install-*-timer.sh --status` prints `installed` for a 7-line hand-written `/tmp` shim | a hand-written unit is indistinguishable from a rendered one by name | re-render it: `scripts/cloud-cell-supervisor.sh apply` (or the owning installer's `--install`); `check_one_home units` refuses a rendered unit whose `Environment=`/`ExecStart=` carries a `/tmp` path, and the installer `--status` DRIFT arm (drainer lane) refuses a unit it did not render |
+| `FATAL: doctor session 'cell-doctor' belongs to another state dir (…)` | a stale tmux session minted by a **previous** state dir blocks the doctor role | `tmux kill-session -t cell-doctor` — the `FATAL` prints it with the owning state dir; the supervisor never clears another state dir's session (#1856) |
+| `FATAL: a controller runs from this machine's shared harness path (pid …)` | a leftover inner-chain member (`tmux → bash -c → orch-loop.sh`) from a previous state dir blocks the first start | `kill <pid>` — the `FATAL` now prints it with each pid's state dir; the supervisor does not signal a pid it cannot prove it owns |
+| `claims.sh: line 1205: printf: write error: No space left on device`, controller dead, on a cell that printed `CELL READY` | no reaping **before** lanes: the reaper came from the scheduler that would not start | `bash scripts/orchestrator-harness/disk-reaper.sh --apply --repo <checkout>`; `check_reaping_armed` runs the shared `disk-floor.sh` floor+reclaim pass and refuses a cell still under it after the pass |
+
 **On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
 checkout:
-
 ```bash
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
 #    Put it where $O will point (default ~/orchestrator): the daemon executes $O/<script>,
