@@ -1156,9 +1156,9 @@ lane_end_record() {
 # must never change the lane's exit status — the lane's work and its status are different facts).
 terminal_wip_rescue() {
   local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
-  local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 at_risk=0 l local_ref=""
+  local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 unpushed_ok=1 unpushed_col=0 at_risk=0 l local_ref=""
   local local_ref_before="" local_ref_after=""
-  local st_errf="" st_noise=0 root_top root_real root_top_real why=""
+  local st_errf="" st_noise=0 st_note="" cv_status=0 root_top root_real root_top_real why=""
   root="${WIP_PATH:-$PWD}"
   LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0; LANE_END_ROOT="$root"
   if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
@@ -1212,42 +1212,69 @@ terminal_wip_rescue() {
     # and would make every clean lane here report cannot-verify.
     st_noise="$(grep -c . "$st_errf" 2>/dev/null)"; local _g=$?
     if [ "$_g" -gt 1 ] || [ -z "$st_noise" ]; then st_rc=1; st_noise=0; fi
+    # The parenthetical this line carries must be a READING that was taken. `st_note` is built only on
+    # the branch that actually ran `git status`, so the no-temp branch below cannot print numbers for a
+    # command that never executed (review P2, round 6, PR #2975).
+    st_note="git status rc=$st_rc, ${st_noise:-0} stderr line(s)"
     rm -f "$st_errf"
   else
     # No temp file means no place for the warnings to land, so their absence cannot be read as "none"
     # — the same fail-closed reasoning as an unreadable ledger, never a silent clean.
     st_out=""; st_rc=1
+    st_note="NO status reading was taken — \`mktemp\` could not create a temp file under ${TMPDIR:-/tmp}, so git status's stderr had nowhere to land (fix TMPDIR; do not go looking at git)"
   fi
+  # ⛔ A FAILED `rev-list` IS NOT A MEASURED ZERO (review P2, round 6, PR #2975). The count was read as
+  # `rev-list … || 0`, so a measurement that returned NOTHING — a promisor/partial clone that cannot
+  # read the objects, a corrupt odb, a box under the exact pressure this rescue exists for — landed as
+  # `unpushed=0`, and the verdict below then fell through to `tree=clean` over a lane that may hold
+  # commits only locally. `0` has to mean "measured zero", so the read is TRACKED like `head_ok`: on a
+  # FAILED read the verdict is `cannot-verify` (fail-closed) and the column says `?` rather than "0".
+  # An unborn HEAD is the one case where 0 IS measured: there is no commit that could be unpushed.
   head_ok=0
   git -C "$root" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ok=1
+  unpushed_ok=1
   if [ "$head_ok" = 1 ]; then
-    unpushed="$(git -C "$root" rev-list --count HEAD --not --remotes 2>/dev/null)"
-    is_num "${unpushed:-}" || unpushed=0
+    if unpushed="$(git -C "$root" rev-list --count HEAD --not --remotes 2>/dev/null)" && is_num "${unpushed:-}"; then
+      :
+    else
+      unpushed=0; unpushed_ok=0
+    fi
   fi
-  LANE_END_UNPUSHED="$unpushed"
+  # The COLUMN distinguishes "measured 0" from "could not be read"; the arithmetic below uses the number.
+  LANE_END_UNPUSHED="$unpushed"; [ "$unpushed_ok" = 1 ] || LANE_END_UNPUSHED="?"
+  unpushed_col="$LANE_END_UNPUSHED"
   if [ "$st_rc" -ne 0 ]; then
-    LANE_END_TREE="cannot-verify"; at_risk=1
+    LANE_END_TREE="cannot-verify"; at_risk=1; cv_status=1
   elif [ -n "$st_out" ]; then
     # A listing that DID name dirty paths is the stronger fact, whether or not it also warned: the
     # rescue runs either way, and `dirty` is what was actually measured. `cannot-verify` is reserved
     # for the case where the listing is EMPTY and we cannot prove it is complete.
     LANE_END_TREE="dirty"; at_risk=1
   elif [ "${st_noise:-0}" -gt 0 ]; then
+    LANE_END_TREE="cannot-verify"; at_risk=1; cv_status=1
+  elif [ "$unpushed_ok" != 1 ]; then
+    # The listing is complete, but the OTHER half of the measurement failed — so the tree is not
+    # certified clean just because `git status` was quiet. Same verdict, different cause, and the
+    # line below says which (the status-specific wording would be a lie here).
     LANE_END_TREE="cannot-verify"; at_risk=1
   elif [ "$unpushed" -gt 0 ] 2>/dev/null; then
     LANE_END_TREE="unpushed-only"
   else
     LANE_END_TREE="clean"
   fi
-  if [ "$LANE_END_TREE" = "cannot-verify" ]; then
-    echo "[wip] ⛔ label=$label: the worktree listing at $root is INCOMPLETE (git status rc=$st_rc, ${st_noise:-0} stderr line(s)) — an EMPTY listing does NOT mean clean, so this is NOT a clean verdict. The rescue is attempted on what could be read rather than skipped, because 'no output' and 'nothing changed' are different measurements (a chmod'ed directory, an extract owned by another user, a corrupt index)" >> "$log"
+  if [ "$cv_status" = 1 ]; then
+    echo "[wip] ⛔ label=$label: the worktree listing at $root is INCOMPLETE ($st_note) — an EMPTY listing does NOT mean clean, so this is NOT a clean verdict. The rescue is attempted on what could be read rather than skipped, because 'no output' and 'nothing changed' are different measurements (a chmod'ed directory, an extract owned by another user, a corrupt index)" >> "$log"
+  elif [ "$LANE_END_TREE" = "cannot-verify" ]; then
+    # ⛔ THE OTHER CAUSE, NAMED SEPARATELY: `git status` was complete and quiet, and the UNPUSHED count
+    # could not be read. Reporting the status wording here would send an operator to the wrong command.
+    echo "[wip] ⛔ label=$label: the worktree at $root has a COMPLETE, EMPTY listing, but the unpushed-commit count could NOT be read (\`git rev-list --count HEAD --not --remotes\` returned nothing — a partial/promisor clone, a corrupt odb, or a permission problem). '0 unpushed' would be a measurement this run did not make, so this is NOT a clean verdict and the rescue is attempted" >> "$log"
   fi
   br="$(git -C "$root" branch --show-current 2>/dev/null)"
   [ -n "$br" ] || br="detached-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unborn)"
   slug="$(printf '%s' "$br" | tr '/' '-')"
   if [ "$at_risk" -eq 0 ]; then
     LANE_END_RESCUE="nothing"
-    echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=nothing unpushed=$unpushed ref=<none> — the worktree at $root holds no uncommitted work IN THE PATHS GIT DOES NOT IGNORE, so no uncommitted work was lost there and no rescue was attempted (⛔ files git IGNORES are not measured by this check: a lane whose only copy of its work is an ignored file reads clean here — the same class #2045's cap path inherits, and it is named rather than implied)" >> "$log"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=nothing unpushed=$unpushed_col ref=<none> — the worktree at $root holds no uncommitted work IN THE PATHS GIT DOES NOT IGNORE, so no uncommitted work was lost there and no rescue was attempted (⛔ files git IGNORES are not measured by this check: a lane whose only copy of its work is an ignored file reads clean here — the same class #2045's cap path inherits, and it is named rather than implied)" >> "$log"
     if [ "$unpushed" -gt 0 ] 2>/dev/null; then
       echo "[wip] NOTE label=$label: $unpushed commit(s) on $br exist ONLY locally. bg-rescue-wip.sh archives UNCOMMITTED work by design and does not push a branch, so they were not pushed. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log"
     fi
@@ -1330,7 +1357,7 @@ terminal_wip_rescue() {
       else
         LANE_END_RESCUE="FAILED"
       fi
-      echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
+      echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed_col ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
       if [ "$LANE_END_RESCUE" = "FAILED" ]; then
         echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref this run wrote pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
         if [ -n "$local_ref_before" ]; then

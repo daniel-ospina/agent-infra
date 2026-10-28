@@ -521,8 +521,9 @@ git command fail on a lock the rescue took), and it calls a backup
 ⛔ **AND A LANE THAT ENDS IS ITS OWN FACT TOO (#2834).** The cap is the RARE termination: on one
 measured fleet session of 373 dispatched lanes, `hit its … cap` appeared in **zero** lane logs, while
 **148** worktrees were left holding uncommitted or unpushed work and `origin` held no `refs/wip/*` from
-that session. So `run_agent` now ALSO runs the shipped `scripts/bg-rescue-wip.sh` at the end of EVERY
-invocation — after `wait`, after the cap snapshot, before it returns — and the tool puts the work on
+that session. So `run_agent` now ALSO runs the shipped `scripts/bg-rescue-wip.sh` at the end of every
+invocation **that started an agent** — after `wait`, after the cap snapshot, before it returns — and the
+tool puts the work on
 **origin** under `refs/wip/<branch-slug>` (built with `git commit-tree` through a throwaway index, never
 `git stash`, whose ref is repo-global and whose `pop` can silently drop a PEER lane's entry). Three
 things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
@@ -539,6 +540,12 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     change to that shipped tool's contract and is deliberately out of scope, so #2834's ask 1 is met for
     the DIRTY half and recorded for the unpushed half: the commits live in the repo's object database and
     survive the WORKTREE being removed, but not the BRANCH being deleted.
+  * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
+    (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
+    the spawn and therefore reach neither the rescue nor the ledger. That is the honest reading: nothing
+    ran, so there is no terminal transition to record, and a refused lane writes NO `lane-end.tsv` row —
+    an absent row is not "the lane ended clean", which is why the remedy for a fleet-wide gap here is the
+    log of the refusal, not this table.
 A rescuer that cannot be FOUND is `rescue=UNAVAILABLE` and a loud line naming the homes it searched —
 never a silent skip, which is how an operator's own copy of this call was a no-op for a whole session
 (`cd` before `_HERE` was resolved from a relative `BASH_SOURCE`, so `[ -f … ] && bash …` degenerated to
