@@ -14,9 +14,18 @@
 #   1. DECLARATIONS ARE READ, NOT COPIED. Every plist in templates/launchd appears as a job, and
 #      the parsed count equals the file count — so a job added the Mac way reaches Linux with no
 #      further edit, and a silently-dropped plist fails here.
-#   2. A PLACEHOLDER THE RUNTIME DOES NOT KNOW IS A LOUD FAILURE, not an empty argv. This is the
-#      one class where the second renderer could drift from install-launchd.sh, so it is pinned:
-#      adding `{{SOMETHING}}` to a template without teaching fleet-schedule.py fails the suite.
+#   2. A PLACEHOLDER THE RUNTIME DOES NOT KNOW IS A LOUD FAILURE, not an empty argv. ⛔ THIS WAS THE
+#      ONE RULE THAT DID NOT HOLD, and it cost a whole cell (agent-infra#2908, #2804): the assertion was a
+#      grep over `--status`, which on macOS DELEGATES to launchd and can never emit the wording, and
+#      the suite was not even in the shard list when #2639 introduced the drift. It is now graded by
+#      `--check` (platform-independent, parses the declarations with this runtime's loader) AND by a
+#      three-way comparison of the placeholder lists — installer array, runtime tuple, and the
+#      {{NAME}} tokens in the shipped templates — with a MUTATION arm that requires the comparison to
+#      REDDEN when a name is removed. Cases 1a-1e; both arms of the identity SKIP are pinned there too
+#      (unset → named SKIP, set → the value is rendered into the job).
+#   2b. A STAGED COPY THAT IS NOT THE CHECKOUT IS VISIBLE (case 1f). A cell executes
+#      $CELL_HOME/.pi/agent/scripts/fleet-schedule.py, so a checkout fix is invisible until the farm
+#      is refreshed; `--check` reports it as DRIFT (non-fatal) and `--verify` FAILS on it.
 #   3. INSTALL ENDS WITH EVIDENCE, NOT A PID. `--install` runs the due jobs inline; the assertions
 #      are a stamp with an rc and a fresh log line — "a unit that loads and never runs" is the
 #      exact defect this issue is about.
@@ -56,6 +65,16 @@
 #  16. AN ANNUAL CALENDAR KEEPS A NEXT OCCURRENCE. A multi-entry StartCalendarInterval with
 #      Month/Day is not `next=-` forever, and a calendar that can never match (Feb 31) FAILS.
 #  17. --stop WORKS WHERE THE SCHEDULE NEVER RAN: it creates its own OFF switch (no traceback).
+#  18. RESIDENCY IS A DECLARED PROPERTY OF THE BODY, READ IN EVERY FORM launchd DOCUMENTS — and a
+#      resident job is REFUSED BY NAME, never scheduled into a kill at JOB_TIMEOUT. A fresh review
+#      left two P2s on PR #2954 here, one failure class apart and the same class as #2908: (a)
+#      `KeepAlive` as a DICT (`{"SuccessfulExit": false}`) is launchd's documented form, was read
+#      by IDENTITY, and so a valid declaration was refused as absent — the whole layer with it;
+#      (b) the daemon skip lived INSIDE the no-schedule branch, so a resident body carrying a
+#      `StartInterval` (ai-multi-repo's shape, the moment an operator sets its identity on a cell)
+#      was "scheduled" and killed at FLEET_SCHEDULE_JOB_TIMEOUT, every ceiling. Case 18 proves the
+#      accepted forms, the named refusal, that the resident body NEVER RUNS, and — by mutation —
+#      that the accepted forms are what makes it pass.
 #
 # Run:  bash scripts/fleet-schedule.test.sh
 set -uo pipefail
@@ -244,10 +263,404 @@ while IFS= read -r p; do
 done < <(ls "$ROOT/templates/launchd"/*.plist)
 [ -z "$missing" ] && ok "all $n_plists declared label(s) appear in --status" \
   || bad "--status dropped declared job(s):$missing"
-# The runtime must know every placeholder the shipped templates use — a new one is a loud error.
-grep -q 'this runtime does not know' <<<"$out" \
-  && bad "a shipped template uses a placeholder fleet-schedule.py does not know (would run with an EMPTY argument)" \
-  || ok "no shipped template carries an unknown placeholder"
+
+# ── 1a. the shipped set is RUNNABLE by this runtime — graded by the platform-independent verb ─────
+# ⛔ THE OLD ASSERTION HERE WAS A GREP FOR A MESSAGE THE COMMAND COULD NOT EMIT. It ran `--status`
+# and hoped to find "this runtime does not know" in the output; on macOS `--status` DELEGATES to
+# install-launchd.sh (which has no notion of this runtime's placeholder set), so it was structurally
+# vacuous on the machine where templates are written. And nothing compared the two placeholder lists
+# at all. `--check` parses the declarations with THIS runtime's loader on EVERY platform, needs no
+# loop, and is what `cases 1b/1c` grade — so a template this runtime cannot run can no longer reach
+# a cell, which is exactly what happened on 2026-10-27 (cell4: MainPID=0, no reaper canary).
+case_ "1a. every shipped declaration is runnable by this runtime (--check, every platform)"
+out="$(run "$ROOT/templates/launchd" --check)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--check exits 0 on the shipped template set" \
+  || bad "the shipped template set is not runnable by this runtime: $out"
+grep -qE '^  (ERROR|FAIL) ' <<<"$out" \
+  && bad "a shipped template is refused by this runtime (cell4's outage — it refuses the WHOLE layer): $out" \
+  || ok "no shipped template is refused (0 ERROR rows)"
+grep -q 'DECLARATIONS OK' <<<"$out" \
+  && ok "--check printed its verdict, so the pass is a read and not an empty output" \
+  || bad "--check printed no verdict line: $out"
+# --check must NOT grade target EXISTENCE: whether ~/.pi/agent/scripts is farmed on THIS host is a
+# fact about the host. Grading it here would redden CI (where no farm exists) over a good template.
+out="$(env HOME="$T/nofarm" CELL_HOME="$T/nofarm" TEMPLATES_DIR="$ROOT/templates/launchd" \
+       python3 "$SCHED" --check 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--check passes with no farm installed (declarations, not this host's layer)" \
+  || bad "--check graded the host's missing farm instead of the declarations: $out"
+
+# ── 1b. THE TWO PLACEHOLDER LISTS CANNOT DRIFT ───────────────────────────────────────────────
+# #2639 added AI_DRAINER_* / AI_MULTI_REPO_* to install-launchd.sh and not to fleet-schedule.py.
+# The same shipped plist was then a designed SKIP on macOS and a hard ERROR on every cell. One list
+# would be better than a test; two self-contained renderers (the .py is FARMED to cells alone, so it
+# cannot read a sibling manifest) is the shape we have — so the lists are COMPARED, three ways:
+# the installer's array, the runtime's tuple, and the {{NAME}} tokens actually present in the shipped
+# templates. The check is self-proving: it is run a second time against a MUTATED copy (see below),
+# because a guard that cannot fail is the defect this repo keeps re-finding.
+DRIFT_PY="$T/placeholder-drift.py"
+cat > "$DRIFT_PY" <<'PY'
+import ast, os, re, sys
+sched, installer, tdir = sys.argv[1], sys.argv[2], sys.argv[3]
+# ⛔ FLOORS, so a parse that silently reads NOTHING cannot pass as "no differences". They are set
+# BELOW the shipped count on purpose (today: 15) so that a MUTATION removing a name is graded as
+# DRIFT — the membership and set-difference checks below — instead of being masked as "truncated".
+FLOOR = {"runtime": 10, "installer": 10, "templates": 5}
+KNOWN = ("AI_DRAINER_O", "AI_DRAINER_STATE", "AI_MULTI_REPO_SLUG", "AI_MULTI_REPO_REPO",
+         "AI_MULTI_REPO_STATE")
+
+def die(kind, msg):
+    print("%s: %s" % (kind, msg))
+    raise SystemExit(1 if kind == "DRIFT" else 2)
+
+def runtime_list(path):
+    tree = ast.parse(open(path).read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "PLACEHOLDERS"
+                                                for t in node.targets):
+            return list(ast.literal_eval(node.value))
+    return None
+
+def installer_list(path):
+    body = open(path).read()
+    m = re.search(r'^PLIST_PLACEHOLDERS=\((.*?)^\)', body, re.S | re.M)
+    if not m:
+        return None
+    return [ln.strip() for ln in m.group(1).splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+def template_tokens(path):
+    toks = set()
+    for name in sorted(os.listdir(path)):
+        if name.endswith(".plist"):
+            with open(os.path.join(path, name), errors="replace") as fh:
+                toks |= set(re.findall(r"\{\{([A-Z_][A-Z0-9_]*)\}\}", fh.read()))
+    return toks
+
+rt = runtime_list(sched)
+sh = installer_list(installer)
+tpl = template_tokens(tdir)
+if rt is None:
+    die("VACUOUS", "no PLACEHOLDERS tuple found in %s — the runtime's list moved and this compare is blind" % sched)
+if sh is None:
+    die("VACUOUS", "no PLIST_PLACEHOLDERS array found in %s" % installer)
+for name, got in (("runtime", rt), ("installer", sh), ("templates", tpl)):
+    if len(got) < FLOOR[name]:
+        die("VACUOUS", "parsed only %d %s name(s) (floor %d) — a truncated parse would read as agreement"
+            % (len(got), name, FLOOR[name]))
+unknown = sorted(tpl - set(rt))
+if unknown:
+    die("DRIFT", "a shipped template carries %s, which the runtime does not know — it would run "
+        "with an EMPTY argument" % ", ".join("{{%s}}" % u for u in unknown))
+only_rt = sorted(set(rt) - set(sh))
+only_sh = sorted(set(sh) - set(rt))
+if only_rt or only_sh:
+    die("DRIFT", "the two lists disagree — only in the runtime: %s; only in the installer: %s "
+        "(a name the cell runtime does not know is a HARD ERROR on every cell)"
+        % (only_rt or "none", only_sh or "none"))
+for name in KNOWN:
+    for where, have in (("fleet-schedule.py PLACEHOLDERS", rt), ("install-launchd.sh PLIST_PLACEHOLDERS", sh),
+                        ("templates/launchd", tpl)):
+        if name not in have:
+            die("DRIFT", "{{%s}} is missing from %s" % (name, where))
+if len(rt) != len(set(rt)) or len(sh) != len(set(sh)):
+    die("DRIFT", "a duplicate name in %s — the two lists would agree on a set the renderer repeats"
+        % ("runtime" if len(rt) != len(set(rt)) else "installer"))
+print("counts: runtime=%d installer=%d templates=%d" % (len(rt), len(sh), len(tpl)))
+print("checked: %s" % " ".join(KNOWN))
+print("clean")
+PY
+
+case_ "1b. the two backends' placeholder lists cannot drift (compared, not trusted)"
+out="$(python3 "$DRIFT_PY" "$SCHED" "$ROOT/scripts/install-launchd.sh" "$ROOT/templates/launchd" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "runtime tuple, installer array and shipped templates agree" \
+  || bad "PLACEHOLDER CONTRACT DRIFT (rc=$rc): $out"
+grep -q '^counts: runtime=' <<<"$out" && ok "the comparison counted what it read: $(grep '^counts:' <<<"$out")" \
+  || bad "the comparison printed no counts — it may have compared nothing: $out"
+grep -q '^checked: .*AI_DRAINER_O' <<<"$out" \
+  && ok "the five identity names #2639 broke are all present in all three lists" \
+  || bad "the identity names were not verified: $out"
+
+# ⛔ THE MUTATION. Put the drift back — delete AI_DRAINER_O from the runtime's tuple, exactly the
+# state #2639 shippped — and the check above must REDDEN, naming the name and the direction. A
+# comparison that stays green on the defect it was written for is not a guard.
+MUTANT="$T/fleet-schedule.mutated.py"
+python3 - "$SCHED" "$MUTANT" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+out = src.replace('    "AI_DRAINER_O",\n', "", 1)
+assert out != src, "the mutation did not apply — the tuple no longer holds AI_DRAINER_O"
+open(sys.argv[2], "w").write(out)
+PY
+out="$(python3 "$DRIFT_PY" "$MUTANT" "$ROOT/scripts/install-launchd.sh" "$ROOT/templates/launchd" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "MUTATION (AI_DRAINER_O removed from the runtime tuple) REDDENS the drift check" \
+  || bad "the drift check stayed GREEN/other on the very defect it exists for (rc=$rc): $out"
+grep -qE 'DRIFT: .*(missing from fleet-schedule.py PLACEHOLDERS|the two lists disagree|which the runtime does not know)' <<<"$out" \
+  && ok "the mutation fails on the CONTRACT, not on a vacuous parse: $(head -1 <<<"$out")" \
+  || bad "the mutation's failure does not name the drift: $out"
+
+# ⛔ A SECOND MUTATION, FOR THE OTHER TWO ARMS. The mutant above is caught by the TEMPLATE-vs-runtime
+# arm (`unknown`), so it proves ONE of the three pairwise comparisons: the installer⇄runtime SET
+# DIFFERENCE (`only_rt` / `only_sh`) could rot away with this suite fully green — and that is the
+# direction #2639 travelled (install-launchd.sh learned the AI_* names, the runtime did not, and the
+# two backends then disagreed about the SAME template). The name to remove is one NO template uses,
+# so the `unknown` arm cannot fire first and mask which arm actually caught it.
+MUT_SH="$T/install-launchd.mutated.sh"
+python3 - "$ROOT/scripts/install-launchd.sh" "$MUT_SH" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+out = src.replace("    SWARM_ENV_FILE\n", "", 1)
+assert out != src, "the mutation did not apply — PLIST_PLACEHOLDERS no longer lists SWARM_ENV_FILE"
+open(sys.argv[2], "w").write(out)
+PY
+out="$(python3 "$DRIFT_PY" "$SCHED" "$MUT_SH" "$ROOT/templates/launchd" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "MUTATION (SWARM_ENV_FILE removed from the INSTALLER array) REDDENS the drift check" \
+  || bad "the installer⇄runtime comparison stayed GREEN on a one-sided removal (rc=$rc): $out"
+grep -q 'the two lists disagree' <<<"$out" \
+  && ok "it fails on the SET-DIFFERENCE arm, so that direction is proven to fire: $(head -1 <<<"$out")" \
+  || bad "the second mutation did not exercise the set-difference arm: $out"
+
+# ── 1c. BOTH ARMS of the identity-placeholder skip ──────────────────────────────────────────
+# The designed behaviour is SKIP-with-a-loud-warning when unset and a RENDERED VALUE when set.
+# Both arms are pinned here, because either one alone is satisfiable by an accident: "always
+# error" passes arm 2, and "always skip" passes arm 1.
+DRAINER="$FIX/drainer"; mkdir -p "$DRAINER"; printf '# no retired labels\n' > "$DRAINER/RETIRED"
+DRMARK="$T/out/drainer.log"
+cat > "$T/drainer.spec" <<PY
+PLIST = {
+    "Label": "com.test.drainer",
+    "ProgramArguments": ["/bin/sh", "-c", "echo \"\$O|\$AI\" >> '$DRMARK'"],
+    "EnvironmentVariables": {"O": "{{AI_DRAINER_O}}", "AI": "{{AI_DRAINER_STATE}}"},
+    "StartInterval": 1,
+}
+PY
+mkplist "$DRAINER" com.test.drainer "$T/drainer.spec"
+mkplist "$DRAINER" com.test.echo    "$T/echo.spec"   # so the set is never zero-live
+
+case_ "1c. identity placeholder UNSET → named SKIP (not an error, not silently empty)"
+out="$(env -u AI_DRAINER_O -u AI_DRAINER_STATE TEMPLATES_DIR="$DRAINER" python3 "$SCHED" --check 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--check still certifies the set (a skip is not a failure)" \
+  || bad "an unset identity placeholder made the set uncertifiable (rc=$rc): $out"
+grep -q 'SKIP .*com.test.drainer.*{{AI_DRAINER_O}}, {{AI_DRAINER_STATE}}' <<<"$out" \
+  && ok "the skip is NAMED with both placeholders (loud, and never a silent empty argv)" \
+  || bad "the unset arm is not named as a SKIP: $out"
+grep -qE '^  (ERROR|FAIL) .*com.test.drainer' <<<"$out" \
+  && bad "an unset identity placeholder is an ERROR again — this is what took cell4's scheduler down: $out" \
+  || ok "it is a SKIP, not an error (the designed arm)"
+# ⛔ THE ABSENT-PHRASE IS PINNED POSITIVELY **HERE**, because case 1g asserts it NEGATIVELY (an
+# unresolvable name must NOT be filed as this machine's absence). A negative-only assertion on prose
+# that nothing pins positively is a check that cannot fail: reword `fleet-schedule.py:589` and 1g
+# keeps printing ✅ while testing nothing. One case produces the string, the other forbids it.
+grep -q 'unresolved placeholder(s) {{AI_DRAINER_O}}, {{AI_DRAINER_STATE}} — absent on this machine' <<<"$out" \
+  && ok "a genuinely unset placeholder SAYS 'absent on this machine' (the phrase 1g forbids elsewhere is pinned here)" \
+  || bad "the unset arm no longer uses the absence phrase, so 1g's negative assertion is now vacuous: $out"
+state_reset "$DRAINER"
+out="$(env -u AI_DRAINER_O -u AI_DRAINER_STATE TEMPLATES_DIR="$DRAINER" python3 "$SCHED" --install 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--install exits 0 with the job skipped" || bad "--install failed (rc=$rc): $out"
+[ ! -s "$DRMARK" ] && ok "the skipped job did NOT run with empty values (the run is what would be silent)" \
+  || bad "the skipped job executed anyway: $(cat "$DRMARK" 2>/dev/null)"
+run "$DRAINER" --stop >/dev/null 2>&1
+
+case_ "1d. identity placeholder SET → the job renders with that value"
+out="$(AI_DRAINER_O=/fixture/o AI_DRAINER_STATE=/fixture/ai TEMPLATES_DIR="$DRAINER" \
+       python3 "$SCHED" --check 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--check exits 0" || bad "--check failed with the identity set (rc=$rc): $out"
+grep -qE '^  ok .*com.test.drainer' <<<"$out" && ok "the job is RUNNABLE, not skipped" \
+  || bad "the job is still skipped with its identity set: $out"
+state_reset "$DRAINER"
+out="$(AI_DRAINER_O=/fixture/o AI_DRAINER_STATE=/fixture/ai TEMPLATES_DIR="$DRAINER" python3 "$SCHED" --install 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--install exits 0" || bad "--install failed (rc=$rc): $out"
+grep -qx '/fixture/o|/fixture/ai' "$DRMARK" 2>/dev/null \
+  && ok "the rendered env reached the job as the VALUE (not empty, not the literal placeholder)" \
+  || bad "the job ran with '$(cat "$DRMARK" 2>/dev/null)' — the placeholder was not rendered to its value"
+run "$DRAINER" --stop >/dev/null 2>&1
+
+# ── 1e. the SHIPPED template pair, both arms — the exact file that broke the cell ─────────────
+case_ "1e. the shipped ai-drainer template: SKIP when unset, runnable when set"
+out="$(env -u AI_DRAINER_O -u AI_DRAINER_STATE TEMPLATES_DIR="$ROOT/templates/launchd" \
+       python3 "$SCHED" --check 2>&1)"
+grep -qE '^  SKIP .*com.eldato.ai-drainer.*AI_DRAINER_O' <<<"$out" \
+  && ok "unset → the SHIPPED drainer is skipped by name" \
+  || bad "the shipped drainer is not skipped when its identity is unset: $out"
+grep -qE '^  (ERROR|FAIL) .*com.eldato.ai-drainer' <<<"$out" \
+  && bad "the shipped drainer is an ERROR with its identity unset (cell4's outage): $out" \
+  || ok "unset → not an error"
+out="$(AI_DRAINER_O=/fixture/o AI_DRAINER_STATE=/fixture/ai TEMPLATES_DIR="$ROOT/templates/launchd" \
+       python3 "$SCHED" --check 2>&1)"
+grep -qE '^  ok .*com.eldato.ai-drainer' <<<"$out" \
+  && ok "set → the SHIPPED drainer is runnable" \
+  || bad "the shipped drainer is not runnable with its identity set: $out"
+
+
+# ── 1f. a STAGED copy that differs from the checkout is visible ───────────────────────────────
+# A cell does not run this file from the checkout: the supervisor stages it at
+# $CELL_HOME/.pi/agent/scripts/fleet-schedule.py and the loop executes THAT. A fix landed in the
+# checkout therefore changes nothing on a running cell until the farm is refreshed — measured
+# 2026-10-27, when a "hotfix" for the placeholder drift did not take. The signal must exist and it
+# must be non-vacuous in both directions.
+case_ "1f. the STAGED scheduler is compared with the checkout (--check notes it, --verify fails)"
+STAGED="$T/staged-home/.pi/agent/scripts"; mkdir -p "$STAGED"
+cp "$SCHED" "$STAGED/fleet-schedule.py"
+out="$(INFRA_ROOT="$ROOT" TEMPLATES_DIR="$ROOT/templates/launchd" python3 "$STAGED/fleet-schedule.py" --check 2>&1)"
+grep -q 'DRIFT' <<<"$out" \
+  && bad "a byte-identical staged copy was reported as drift (a false alarm trains operators to ignore it): $out" \
+  || ok "an identical staged copy is not drift"
+printf '\n# hand-edited / stale\n' >> "$STAGED/fleet-schedule.py"
+out="$(INFRA_ROOT="$ROOT" TEMPLATES_DIR="$ROOT/templates/launchd" python3 "$STAGED/fleet-schedule.py" --check 2>&1)"; rc=$?
+grep -q 'DRIFT .*STAGED scheduler differs from the checkout' <<<"$out" \
+  && ok "--check names the staged copy as differing from the checkout" \
+  || bad "a stale staged copy was not reported: $out"
+[ "$rc" -eq 0 ] && ok "--check does NOT fail on it (a Mac's farmed copy legitimately lags a worktree)" \
+  || bad "--check failed on a lagging farmed copy (rc=$rc): $out"
+if [ "$(uname -s)" = "Darwin" ]; then
+  skip "--verify delegates to launchd on macOS, so the staged-copy FAIL can only be driven on linux"
+else
+  out="$(INFRA_ROOT="$ROOT" TEMPLATES_DIR="$ROOT/templates/launchd" python3 "$STAGED/fleet-schedule.py" --verify 2>&1)"; rc=$?
+  [ "$rc" -eq 1 ] && ok "--verify FAILS on a cell whose staged scheduler is not the checkout's" \
+    || bad "--verify certified a cell running a copy that is not the checkout's (rc=$rc): $out"
+  grep -q 'STAGED scheduler differs from the checkout' <<<"$out" \
+    && ok "the failure says why a checkout fix did not take, and how to refresh it" \
+    || bad "the failure does not name the staged copy: $out"
+fi
+# ⛔ "COULD NOT COMPARE" IS NOT "CLEAN" — the other half of the same signal. With no checkout to
+# compare against, the old code returned "" for BOTH "no drift" and "never compared", so --verify
+# could print SCHEDULE VERIFIED over the one check that exists to stop a cell certifying a build it
+# is not running. The arm must be NAMED beside the verdict, so a reader can tell the two apart.
+out="$(env -u INFRA_ROOT -u AGENT_INFRA_PATH TEMPLATES_DIR="$ROOT/templates/launchd" \
+      python3 "$STAGED/fleet-schedule.py" --verify 2>&1)"
+grep -q 'NOTE .*could not be compared with a checkout' <<<"$out" \
+  && ok "--verify NAMES the staged-copy arm it could not run (a pass is never silent about it)" \
+  || bad "--verify was silent about a staged-copy arm that never ran (the no-op-gate shape): $out"
+
+# ── 1g. the FOURTH copy of the contract: PLACEHOLDERS vs placeholder_values() ────────────────
+# The three-way comparison above covers the runtime tuple, the installer array and the template
+# tokens. It does NOT cover the resolver, and that gap is the #2804 asymmetry by a fourth route:
+# a name declared in all three compared artifacts with no entry in placeholder_values() resolved to
+# "" and was filed as "absent on this machine" — a designed per-machine SKIP — while macOS rendered
+# it from its env. So the job could never run on ANY cell, with every gate green (measured: rc 0,
+# "DECLARATIONS OK — … 0 errors", and exporting the variable changed nothing).
+NO_RESOLVER="$FIX/no-resolver"; mkdir -p "$NO_RESOLVER"; cp "$GOOD/RETIRED" "$NO_RESOLVER/RETIRED"
+cat > "$T/noresolver.spec" <<'PY'
+PLIST = {
+    "Label": "com.test.noresolver",
+    "ProgramArguments": ["/bin/sh", "-c", "true"],
+    "EnvironmentVariables": {"NEW": "{{NO_RESOLVER_PROBE}}"},
+    "StartInterval": 60,
+}
+PY
+mkplist "$NO_RESOLVER" com.test.noresolver "$T/noresolver.spec"
+mkplist "$NO_RESOLVER" com.test.echo       "$T/echo.spec"   # so the set is never zero-live
+
+case_ "1g. a declared placeholder with NO resolver is a DECLARATION error, not this machine's absence"
+# Control arm: the UNMUTATED runtime does not know the name at all (#2639's original shape), so the
+# fixture is proven to reach the loader rather than being ignored.
+out="$(TEMPLATES_DIR="$NO_RESOLVER" python3 "$SCHED" --check 2>&1)"; rc=$?
+grep -q 'does not know: {{NO_RESOLVER_PROBE}}' <<<"$out" \
+  && ok "control: an undeclared name is still the loud #2639 ERROR" \
+  || bad "the fixture does not reach the unknown-placeholder arm (rc=$rc): $out"
+# The mutation DECLARES the name in PLACEHOLDERS and leaves placeholder_values() alone — i.e. it
+# puts the tuple and the resolver out of step, exactly what "add the name in both files" produces.
+NO_RESOLVER_MUTANT="$T/fleet-schedule.no-resolver.py"
+python3 - "$SCHED" "$NO_RESOLVER_MUTANT" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+out = src.replace('    "PI_BIN_DIR",\n', '    "PI_BIN_DIR",\n    "NO_RESOLVER_PROBE",\n', 1)
+assert out != src, "the mutation did not apply — PLACEHOLDERS no longer lists PI_BIN_DIR"
+open(sys.argv[2], "w").write(out)
+PY
+out="$(TEMPLATES_DIR="$NO_RESOLVER" NO_RESOLVER_PROBE=/fixture/x \
+       python3 "$NO_RESOLVER_MUTANT" --check 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a declared-but-unresolvable name FAILS --check (rc=1)" \
+  || bad "--check certified a job that can never run anywhere (rc=$rc): $out"
+grep -q 'NO resolver in placeholder_values()' <<<"$out" \
+  && ok "the failure names the missing RESOLVER, which is what the operator has to add" \
+  || bad "the failure does not name the missing resolver: $out"
+grep -q 'absent on this machine' <<<"$out" \
+  && bad "the unresolvable name is still reported as this machine's absence (a false statement): $out" \
+  || ok "it is NOT reported as 'absent on this machine' (it is absent on every machine)"
+
+# ── 1h. --check's exit code is a CROSS-PLATFORM contract ───────────────────────────────────
+# The CONTRACT (§CONTRACT) says 3 for "no declarations at all" and 1 for a set this runtime cannot
+# run. A nonexistent TEMPLATES_DIR is the former — `--start` answers 3 for it and
+# docs/ops/fleet-schedule.md documents 3 — but the linux arm fell into a blanket
+# `except ScheduleError -> 1` while the darwin arm tested `isdir` and answered 3. One tree, two
+# verdicts for one state, and 1 is the code cloud-cell-supervisor.sh treats as FATAL.
+case_ "1h. the 'no declarations at all' state is exit 3 on BOTH platforms (and 1 is not widened)"
+darwin_check() { # darwin_check <templates-dir> → prints output, returns the real rc
+  python3 - "$SCHED" "$1" 2>&1 <<'PY'
+import os, sys
+sys.platform = "darwin"
+path, tdir = sys.argv[1], sys.argv[2]
+os.environ["TEMPLATES_DIR"] = tdir
+sys.argv = [path, "--check"]
+exec(compile(open(path).read(), path, "exec"), {"__name__": "__main__", "__file__": path})
+PY
+}
+GONE="$T/there-is-no-such-templates-dir"
+TEMPLATES_DIR="$GONE" python3 "$SCHED" --check >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 3 ] && ok "linux: an unresolvable templates dir is exit 3 (a state, not a broken set)" \
+  || bad "linux classified 'no declarations at all' as rc=$rc, not 3"
+darwin_check "$GONE" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 3 ] && ok "darwin: the SAME state is exit 3 (the two platforms agree)" \
+  || bad "darwin classified the same state as rc=$rc — the two platforms disagree"
+EMPTYDIR="$T/empty-templates"; mkdir -p "$EMPTYDIR"
+TEMPLATES_DIR="$EMPTYDIR" python3 "$SCHED" --check >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] && ok "linux: a dir that EXISTS but holds no declaration set stays exit 1 (unchanged)" \
+  || bad "an existing-but-unusable declarations dir became rc=$rc, not 1"
+darwin_check "$EMPTYDIR" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] && ok "darwin: the same, so 3 was not widened to cover a broken set" \
+  || bad "darwin answered rc=$rc for an existing-but-unusable dir, not 1"
+
+# ── 1i. the AI_MULTI_REPO TRIPLE: its RESOLVED VALUE reaches the job (the fifth route) ────────
+# Case 1g compares the tuple against `placeholder_values()` by MEMBERSHIP only. A resolver keyed to a
+# mistyped env name stays a member, so the name resolves to "", the job is filed as "absent on this
+# machine" — a designed per-machine SKIP — and macOS (which renders `{{NAME}}` from its own env)
+# disagrees. That is the #2804 asymmetry by a fifth route, on the very template this change gives a
+# schedule. The drainer pair was value-pinned in 1c/1d; the multi-repo triple had no such arm.
+MULTI="$FIX/multirepo"; mkdir -p "$MULTI"; cp "$GOOD/RETIRED" "$MULTI/RETIRED"
+MRMARK="$T/out/multirepo.log"
+cat > "$T/multirepo.spec" <<PY
+PLIST = {
+    "Label": "com.test.multirepo",
+    "ProgramArguments": ["/bin/sh", "-c", "echo \"\$OR|\$REPO|\$O\" >> '$MRMARK'"],
+    "EnvironmentVariables": {"OR": "{{AI_MULTI_REPO_SLUG}}", "REPO": "{{AI_MULTI_REPO_REPO}}",
+                            "O": "{{AI_MULTI_REPO_STATE}}"},
+    "StartInterval": 1,
+}
+PY
+mkplist "$MULTI" com.test.multirepo "$T/multirepo.spec"
+mkplist "$MULTI" com.test.echo      "$T/echo.spec"   # so the set is never zero-live
+
+case_ "1i. the AI_MULTI_REPO triple renders its VALUEs (membership is not resolution)"
+state_reset "$MULTI"
+out="$(env -u AI_MULTI_REPO_SLUG -u AI_MULTI_REPO_REPO -u AI_MULTI_REPO_STATE \
+       TEMPLATES_DIR="$MULTI" python3 "$SCHED" --install 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "unset → --install exits 0 (the triple is a named SKIP, as designed)" \
+  || bad "--install failed with the multi-repo identity unset (rc=$rc): $out"
+[ ! -s "$MRMARK" ] && ok "unset → the job did NOT run with empty values" \
+  || bad "the job ran with an unresolved identity: $(cat "$MRMARK" 2>/dev/null)"
+state_reset "$MULTI"
+out="$(AI_MULTI_REPO_SLUG=owner/repo AI_MULTI_REPO_REPO=/fixture/repo AI_MULTI_REPO_STATE=/fixture/state \
+       TEMPLATES_DIR="$MULTI" python3 "$SCHED" --install 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "set → --install exits 0" || bad "--install failed with the triple set (rc=$rc): $out"
+grep -qx 'owner/repo|/fixture/repo|/fixture/state' "$MRMARK" 2>/dev/null \
+  && ok "all three rendered env values reached the job (a mistyped resolver key would leave one empty)" \
+  || bad "the job ran with '$(cat "$MRMARK" 2>/dev/null)' — a resolver does not deliver its env value"
+out="$(AI_MULTI_REPO_SLUG=owner/repo AI_MULTI_REPO_REPO=/fixture/repo AI_MULTI_REPO_STATE=/fixture/state \
+       TEMPLATES_DIR="$ROOT/templates/launchd" python3 "$SCHED" --check 2>&1)"
+# ⛔ IT STAYS A SKIP ON THIS RUNTIME — that is the DESIGNED arm for a resident body (the 900 s
+# top-up is a macOS job; a cell's resident controller belongs to the cell's supervisor). So the
+# assertion is that the identity is NO LONGER the reason and no ERROR appears: with the trio set the
+# skip must be the RESIDENCY, by name. Asserting `ok` here would demand the opposite of the design.
+grep -qE '^  SKIP +com.eldato.ai-multi-repo +daemon \(FleetResident\)' <<<"$out" \
+  && ok "set → the SHIPPED multi-repo template skips for DECLARED RESIDENCY, not for its identity" \
+  || bad "with its identity set the shipped multi-repo template is not a by-name resident skip: $out"
+grep -qE 'com.eldato.ai-multi-repo.*unresolved placeholder' <<<"$out" \
+  && bad "the shipped multi-repo template is STILL blamed for its (now set) identity: $out" \
+  || ok "set → no placeholder blame is left on that row"
+grep -qE '^  (ERROR|FAIL) .*com.eldato.ai-multi-repo' <<<"$out" \
+  && bad "the shipped multi-repo template is an ERROR with its identity set: $out" \
+  || ok "set → not an ERROR (a resident declaration is never a layer-wide refusal)"
+run "$MULTI" --stop >/dev/null 2>&1
 
 # ── 2. install proves a RUN, not a pid ────────────────────────────────────────────────────────
 case_ "2. --install runs the due jobs and ends with a fresh log line + stamp"
@@ -333,11 +746,16 @@ d["started"] = time.time() - 120
 json.dump(d, open(p, "w"))
 PY
 touched=0
+# ⛔ `stat -c %Y` is GNU-only, so on BSD/macOS this read returned NOTHING on every pass — the wait
+# loop never broke, and the two assertions below then graded `--verify` against a state the arm had
+# not established (a false red, measured on the box this was written on). The portable pair: GNU
+# spelling first, BSD `-f %m` second. CI is Linux, where the first form answers.
+tick_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 for _ in $(seq 1 40); do
   sleep 1
   # wait for a pass to complete after the backdating (the loop skips the locked job)
-  if [ -n "$(stat -c %Y "$FLEET_SCHEDULE_STATE/tick" 2>/dev/null)" ]; then
-    age=$(( $(date +%s) - $(stat -c %Y "$FLEET_SCHEDULE_STATE/tick") ))
+  if [ -n "$(tick_mtime "$FLEET_SCHEDULE_STATE/tick")" ]; then
+    age=$(( $(date +%s) - $(tick_mtime "$FLEET_SCHEDULE_STATE/tick") ))
     [ "$age" -le 6 ] && { touched=1; break; }
   fi
 done
@@ -964,6 +1382,155 @@ out="$(cd / && env -u TEMPLATES_DIR -u INFRA_ROOT -u AGENT_INFRA_PATH \
 grep -q 'Traceback' <<<"$out" && bad "--stop raised a traceback: $out" || ok "no traceback"
 [ -f "$NOSSTATE/OFF" ] && ok "the OFF switch was created (the decision is recorded)" \
   || bad "no OFF switch was written"
+
+
+# ── 18. residency is DECLARED, read in every documented form, and refused by name ───────────
+# Both P2s a fresh review left on PR #2954 are the #2908 shape: a VALID declaration the runtime did
+# not model, whose only reachable outcome is a refused LAYER (cell4, measured 2026-10-27: MainPID=0,
+# no controller, no reaping, no liveness, no canary). So the fixtures are the declarations launchd
+# documents, not the ones this runtime happened to read.
+case_ "18. a RESIDENT body is declared (KeepAlive true/dict/int, RunAtLoad, FleetResident) and refused by name"
+RES="$FIX/resident"; mkdir -p "$RES"; cp "$GOOD/RETIRED" "$RES/RETIRED"
+cat > "$T/resident-dict.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-dict",
+    "ProgramArguments": ["/bin/sh", "-c", "echo dict >> '$MARK.residentdict'"],
+    "KeepAlive": {"SuccessfulExit": False},
+}
+PY
+cat > "$T/resident-int.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-int",
+    "ProgramArguments": ["/bin/sh", "-c", "echo int >> '$MARK.residentint'"],
+    "KeepAlive": 1,
+}
+PY
+cat > "$T/resident-ral.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-ral",
+    "ProgramArguments": ["/bin/sh", "-c", "echo ral >> '$MARK.residentral'"],
+    "RunAtLoad": 1,
+}
+PY
+cat > "$T/resident-sched.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-sched",
+    "ProgramArguments": ["/bin/sh", "-c", "echo sched >> '$MARK.residentsched'; sleep 60"],
+    "FleetResident": True,
+    "StartInterval": 1,
+}
+PY
+mkplist "$RES" com.test.resident-dict  "$T/resident-dict.spec"
+mkplist "$RES" com.test.resident-int   "$T/resident-int.spec"
+mkplist "$RES" com.test.resident-ral   "$T/resident-ral.spec"
+mkplist "$RES" com.test.resident-sched "$T/resident-sched.spec"
+mkplist "$RES" com.test.echo           "$T/echo.spec"   # so the set is never all-skip
+
+out="$(run "$RES" --check)"; rc=$?
+[ "$rc" -eq 0 ] && ok "an UNMODELLED-BUT-VALID declaration is ACCEPTED, not refused (rc=0)" \
+  || bad "a valid declaration is refused again — this is the shape that took a whole cell down: $out"
+grep -q 'DECLARATIONS OK' <<<"$out" && ok "--check printed its verdict (a read, not an empty output)" \
+  || bad "--check printed no verdict: $out"
+grep -qE '^  (ERROR|FAIL) .*com.test.resident' <<<"$out" \
+  && bad "a resident DECLARATION is an ERROR: $out" \
+  || ok "no resident declaration is an ERROR (0 ERROR rows on all four forms)"
+for pair in "resident-dict|KeepAlive dict" "resident-int|KeepAlive" "resident-ral|RunAtLoad" "resident-sched|FleetResident"; do
+  lbl="${pair%%|*}"; decl="${pair##*|}"
+  grep -qE "^  SKIP .*com.test.$lbl .*declared $decl" <<<"$out" \
+    && ok "com.test.$lbl is a NAMED skip: 'declared $decl'" \
+    || bad "com.test.$lbl is not refused by the name of the key that declared it ($decl): $out"
+done
+
+# ENFORCEMENT, NOT PROSE: the resident bodies must NEVER be started. A "scheduled" resident job is
+# the P2-2 defect — it would be started and killed at the ceiling, every ceiling (resident-sched's
+# body sleeps 60 s against the suite's 30 s FLEET_SCHEDULE_JOB_TIMEOUT precisely so a regression is
+# a kill, not a clean exit).
+state_reset "$RES"
+before="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+out="$(run "$RES" --install)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--install exits 0 with the resident jobs skipped" || bad "--install failed (rc=$rc): $out"
+after="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+[ "$after" -gt "$before" ] && ok "the non-resident fixture DID run — the case is not vacuous" \
+  || bad "no job ran at all ($before → $after lines), so 'the resident job did not run' would prove nothing"
+for m in residentdict residentint residentral residentsched; do
+  [ ! -f "$MARK.$m" ] && ok "com.test.$m did NOT run (a resident body is never scheduled into a kill)" \
+    || bad "com.test.$m RAN — a resident body is being scheduled, and would be killed at the ceiling"
+done
+out="$(run "$RES" --status)"
+grep -qE 'com.test.resident-sched .*daemon \(FleetResident\)' <<<"$out" \
+  && ok "--status names the reason in the truth table, not just in --check" \
+  || bad "--status does not name the resident declaration: $out"
+run "$RES" --stop >/dev/null 2>&1
+
+# 18b: the BOUNDARY of the dict reading is stated, not implied: launchd's dict form is a SET of
+# conditions, so an EMPTY one declares none — it stays the error it already was.
+RES_EMPTY="$FIX/resident-empty"; mkdir -p "$RES_EMPTY"; cp "$GOOD/RETIRED" "$RES_EMPTY/RETIRED"
+cat > "$T/resident-empty.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-empty",
+    "ProgramArguments": ["/bin/sh", "-c", "true"],
+    "KeepAlive": {},
+}
+PY
+mkplist "$RES_EMPTY" com.test.resident-empty "$T/resident-empty.spec"
+mkplist "$RES_EMPTY" com.test.echo          "$T/echo.spec"
+out="$(run "$RES_EMPTY" --check)"; rc=$?
+[ "$rc" -eq 1 ] && grep -qE '^  FAIL .*com.test.resident-empty.*no StartInterval' <<<"$out" \
+  && ok "an EMPTY KeepAlive dict declares no condition and is still refused (the boundary is stated)" \
+  || bad "an empty KeepAlive dict is now a resident skip (the reading is too wide): rc=$rc $out"
+
+# 18c: FleetResident marks a body whose SCHEDULE starts it — so it must NOT rescue the
+# SCHEDULELESS shape. It did: residency is decided before the schedule and both schedule branches
+# are guarded by `not job.daemon`, so `FleetResident: true` with no schedule fell through to the
+# resident SKIP and the layer was certified ("DECLARATIONS OK … 0 errors") over a plist no backend
+# would ever start — launchd loads it and never runs it (the #1864 defect a cell refuses the whole
+# layer over). docs/ops/fleet-schedule.md states the rule; this pins it to the code.
+RES_NOSCHED="$FIX/resident-nosched"; mkdir -p "$RES_NOSCHED"; cp "$GOOD/RETIRED" "$RES_NOSCHED/RETIRED"
+cat > "$T/resident-nosched.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-nosched",
+    "ProgramArguments": ["/bin/sh", "-c", "echo nosched >> '$MARK.residentnosched'"],
+    "FleetResident": True,
+}
+PY
+mkplist "$RES_NOSCHED" com.test.resident-nosched "$T/resident-nosched.spec"
+mkplist "$RES_NOSCHED" com.test.echo           "$T/echo.spec"   # so a certified set is reachable
+out="$(run "$RES_NOSCHED" --check)"; rc=$?
+[ "$rc" -eq 1 ] && grep -qiE '^  (ERROR|FAIL) .*com.test.resident-nosched.*no StartInterval' <<<"$out" \
+  && ok "FleetResident with NO schedule is a hard ERROR (the doc's own sentence, enforced)" \
+  || bad "a scheduleless FleetResident was certified as a named SKIP — the job would never run on either backend: rc=$rc $out"
+grep -q 'DECLARATIONS OK' <<<"$out" \
+  && bad "the layer was certified over a template that can never run: $out" \
+  || ok "the set is NOT certified green"
+
+# 18c: SELF-PROVING. Restore the PRE-FIX reading this P2 named (`KeepAlive is True`, with no dict
+# branch at all) and the DICT-form fixture must REDDEN — a guard that cannot fail is the defect the
+# repo keeps re-finding.
+MUTANT="$T/mutant-identity.py"
+python3 - "$SCHED" "$MUTANT" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+old = (
+    '    keep_alive = data.get("KeepAlive")\n'
+    '    if plist_true(keep_alive):\n'
+    '        return "KeepAlive"\n'
+    '    if isinstance(keep_alive, dict) and keep_alive:\n'
+    '        return "KeepAlive dict"\n'
+)
+new = (
+    '    keep_alive = data.get("KeepAlive")\n'
+    '    if keep_alive is True:  # the PRE-FIX reading, restored by the mutation\n'
+    '        return "KeepAlive"\n'
+)
+assert old in src, "the mutation target moved: resident_declaration no longer reads KeepAlive that way"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PY
+out="$(TEMPLATES_DIR="$RES" python3 "$MUTANT" --check 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "MUTATION (KeepAlive read by identity again) makes the set FAIL (rc=1)" \
+  || bad "the mutation stayed GREEN — the fixture does not grade the identity comparison (rc=$rc): $out"
+grep -qE '^  (ERROR|FAIL) .*com.test.resident-dict' <<<"$out" \
+  && ok "the mutation fails ON THE DICT FORM, by name: $(grep -E '^  (ERROR|FAIL) .*resident-dict' <<<"$out" | head -1 | cut -c1-96)" \
+  || bad "the mutation reddens something else; the dict-form fixture is not what grades this: $out"
 
 
 echo
