@@ -387,9 +387,8 @@ if [ "$parse_ok" -eq 1 ]; then
   fi
 fi
 
-# --- check 6: NO test file in the live farm (#1509) --------------------------
-# ⛔ pi's extension loader EXECUTES every `.ts` under the farm. A `*.test.ts`
-# living there is therefore not a test — it is an extension that runs its whole
+# --- check 6: no test file pi would EXECUTE in the live farm (#1509/#2841) ----
+# ⛔ A test file in the farm is not a test — it is an extension that runs its whole
 # suite at session start, and that suite's stdout becomes the session's answer.
 # Measured 2026-10-25: twelve test files sat in ~/.pi/agent/extensions, every
 # dispatched child on the box returned `auto-sync.test.ts` output instead of a
@@ -397,16 +396,110 @@ fi
 # dead — with nothing in any log naming the cause. Checks 1-5 cannot catch it:
 # they inspect the entries the manifest LISTS, and a stray leaf file is listed by
 # nobody.
+#
+# ⛔ WHAT PI LOADS IS THE SUBJECT, so it is read from pi rather than guessed from a
+# filename glob (#2841). Two primary sources, both read for this check:
+#   * pi `docs/extensions.md:46` — "Pi loads direct TypeScript or JavaScript files
+#     and subdirectories containing an `index.ts` or `index.js` entry point."
+#   * pi `dist/core/package-manager.js::collectAutoExtensionEntries` — a TOP-LEVEL
+#     entry whose name ends `.ts` or `.js` is pushed as an extension (dot-named
+#     entries and `node_modules` are skipped); a subdirectory contributes ONLY its
+#     `package.json` `extensions[]` rows, else its `index.ts`/`index.js`.
+#     Nothing recurses into a subdirectory's other files.
+# So a test file pi would EXECUTE has exactly TWO shapes, and both FAIL here:
+#   (a) a top-level farm entry named like a test and loadable — `*.test.ts`,
+#       `*.spec.ts`, `*.test.js`, `*.spec.js` (the pre-#2841 check matched
+#       `*.test.ts` only, so the other three were executed while this gate stayed
+#       GREEN: a false PASS over precisely the condition it exists for);
+#   (b) a subdirectory whose `package.json` `extensions[]` row names such a file —
+#       `resolveExtensionEntries` executes those rows verbatim, and no filename glob
+#       can see one.
+# NOT failed, and NAMED instead: a test file NESTED inside a farm subdirectory. The
+# loader never reaches it, so failing on it would be the #2425 false-block class —
+# and it was one: measured 2026-10-28, 62 nested copies sat in this box's farm, the
+# loader could not reach a single one (all nine farm `package.json`s report
+# `extensions: None`), and this check reddened a farm that cannot execute any of
+# them. Because `sync.sh` runs this gate under `set -e`, that red already aborted
+# every `./sync.sh` on the box at its parity-gate step. The nested copies are the
+# job of `pi-bootstrap/setup.sh`'s sweep, which removes them on the next sync.
+#
+# STATED LIMIT: the `.gitignore`/`.ignore` filtering the loader also honours is NOT
+# modelled here. A test file filtered by such a list is still reported — the file
+# should not be in the farm at all, and a hand-rolled ignore parser would be a new
+# false-PASS surface.
 if [ -d "$LIVE_FARM" ]; then
-  leaked=""
-  while IFS= read -r lap; do
-    [ -n "$lap" ] && leaked="$leaked$lap"$'\n'
-  done <<< "$(find "$LIVE_FARM" -maxdepth 3 -name '*.test.ts' 2>/dev/null | head -10)"
-  if [ -n "$leaked" ]; then
+  executed=""         # display lines: what pi WOULD execute (the failure block)
+  executed_paths=""   # the same files as absolute paths — keeps the inert list honest
+  # (a) top-level entries: the loader's own scan, spelled the same way — the glob
+  #     skips dot-named names exactly as `collectAutoExtensionEntries` does.
+  for lap in "$LIVE_FARM"/*; do
+    [ -e "$lap" ] || [ -L "$lap" ] || continue
+    case "$(basename "$lap")" in
+      *.test.ts|*.spec.ts|*.test.js|*.spec.js)
+        executed="$executed$lap"$'\n'
+        executed_paths="$executed_paths$(resolve_path "$lap")"$'\n'
+        ;;
+    esac
+  done
+  # (b) a subdirectory's package.json extensions[] row naming a test file. Emits
+  #     "<absolute target>\t<display line>" per hit, so the inert arm below can
+  #     exclude a file this arm has already indited (the same file must never be
+  #     reported as both "executed" and "never loaded").
+  if command -v python3 >/dev/null 2>&1; then
+    pkg_rows="$(python3 - "$LIVE_FARM" <<'PYEOF' 2>/dev/null
+import json, os, sys
+
+root = sys.argv[1]
+test_names = ('.test.ts', '.spec.ts', '.test.js', '.spec.js')
+try:
+    names = sorted(os.listdir(root))
+except OSError:
+    raise SystemExit(0)
+for name in names:
+    if name.startswith('.') or name == 'node_modules':
+        continue
+    sub = os.path.join(root, name)
+    if not os.path.isdir(sub):
+        continue
+    try:
+        with open(os.path.join(sub, 'package.json')) as f:
+            pkg = json.load(f)
+    except (OSError, ValueError):
+        continue            # no package.json, or not JSON: resolveExtensionEntries falls back to index.ts/index.js
+    rows = pkg.get('extensions') if isinstance(pkg, dict) else None
+    for row in rows or []:
+        if str(row).endswith(test_names):
+            print(f'{os.path.join(sub, str(row))}\t{sub}: package.json extensions[] -> {row}')
+PYEOF
+)"
+    if [ -n "$pkg_rows" ]; then
+      while IFS=$'\t' read -r p disp; do
+        [ -n "$p" ] || continue
+        executed_paths="$executed_paths$(resolve_path "$p")"$'\n'
+        executed="$executed$disp"$'\n'
+      done <<< "$pkg_rows"
+    fi
+  else
+    echo "⏭️  check 6's package.json arm skipped (no python3) — a farm subdir whose package.json extensions[] names a test file would not be seen; this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
+  fi
+  if [ -n "$executed" ]; then
     echo "❌ test file(s) in the live extension farm — pi EXECUTES these as extensions, so each one runs its suite at session start and its output replaces the session's answer:"
-    printf '%s' "$leaked" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
+    printf '%s' "$executed" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
     echo "   → remove them (\`mv\` them out of the farm); a test belongs in the repo's extensions/, never in the farm."
     FAILURES=$((FAILURES + 1))
+  fi
+  # Nested copies: inert (see the header) — named so nothing is silently skipped,
+  # minus any file arm (b) has already indited (it IS loaded, through package.json).
+  inert=""
+  while IFS= read -r lap; do
+    [ -n "$lap" ] || continue
+    grep -Fqx -- "$(resolve_path "$lap")" <<<"$executed_paths" && continue
+    inert="$inert$lap"$'\n'
+  done <<< "$(find "$LIVE_FARM" -mindepth 2 -maxdepth 3 -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) 2>/dev/null | grep -v '/node_modules/' | head -10)"
+  if [ -n "$inert" ]; then
+    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json extensions[]/index.ts entry, so this file is never loaded):"
+    printf '%s' "$inert" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
+    echo "   → \`pi-bootstrap/setup.sh\` sweeps these on the next sync; nothing here executes today."
   fi
 fi
 
