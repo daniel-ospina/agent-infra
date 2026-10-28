@@ -62,15 +62,38 @@ host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 
   (unbounded), never "zero headroom". `src` is the arm that answered (`uid` or `cgroup`) and is local
   to the box: it is printed by `probe`, not transported in the ref name.
 
-The fork fields are **appended** to the record and the ref name
-(`refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`), so a peer on an
-older tree still parses the leading fields; a six-slot legacy ref is refused as `fork_unknown` rather
-than read as healthy, and it self-heals on that box's next publish.
+The fork fields are **appended** to the record (`procs`, `max`, `fork`, then `boxid`/`boot`), so a peer
+that parses the record by KEY still reads the leading fields. ⛔ That tolerance does NOT extend to the ref
+NAME: the `<boxid>` path segment is part of the key, so a pre-#2707 reader drops a 3-segment ref entirely
+and falls to `bound=no_probe` (refuse, never guess), and a pre-#2707 WRITER host-prunes and deletes those
+refs — upgrade a whole hostname group together (§Identity and pruning below). A two-segment ref from before
+#2707 (no `boxid`) is read as `box_unknown` and a six-slot one likewise (`box_unknown`, because identity is
+checked BEFORE fork) — neither is ever read as healthy, and both self-heal on that box's next publish.
 
 Transport: the fleet's only shared channel is the queue repo's origin, so a box publishes its
-reading as `refs/boxes/<host>/<reading>` and every box reads the whole fleet with **one**
+reading as `refs/boxes/<host>/<boxid>/<reading>` and every box reads the whole fleet with **one**
 `git ls-remote --refs refs/boxes/*` — the same channel and the same read primitive `claims.sh`
 already uses. No new daemon, no new credential, no per-box RPC.
+
+Identity and pruning (#2707, measured 2026-10-24). `hostname` is NOT the key: all three cells are named
+`cmux`, so a hostname-keyed ref plus a host-scoped prune made each box delete its peers' records and the
+fleet read as one box (`cap_place` answering `place=<self>`). A record is keyed `<host>/<boxid>`, where
+`boxid` comes from the box's own network identity — Darwin `kern.uuid`, Linux the routable IPv4 — the two
+sources **measured to differ** across the cells. `/etc/machine-id` and `/proc/…/boot_id` are measured
+IDENTICAL on all three (cloned image), so neither is a fallback: a box with no derivable identity
+**refuses to publish** (`why=no-box-identity`) instead of manufacturing an attribution, and its peers
+never see a record they cannot attribute. `CAP_BOXID` pins one explicitly for a deploy that must.
+
+A box deletes a ref only when (a) a **local authorship ledger** proves this box wrote that exact ref
+(recorded at publish time under `CAP_STATE_DIR`, default `${TMPDIR:-/tmp}/pi-capacity`, one directory per
+repo, ring-bounded at `CAP_LEDGER_KEEP=32` refs and one filesystem per box), or (b) the record is STALE.
+A wiped `TMPDIR` therefore degrades pruning to STALE-only — refs leak for at most `CAP_PROBE_TTL` (900 s)
+and are then collected; it never causes a delete.
+Anything else is a peer's and is kept; a fresh record under this box's own key that it cannot prove it
+wrote is counted `foreign=<n>` and the reader marks the key `collide=1`, on which `cap_place` REFUSES
+(`bound=identity_collision`) rather than placing on a box the fleet cannot name. ⛔ `(key, boot)` equality
+is NOT authorship — a mis-keyed peer satisfies it, and reading it as proof deleted live peer records
+(reproduced; see `capacity.sh`'s header).
 
 ## 4. The order: FORK HEADROOM, then disk, then load
 

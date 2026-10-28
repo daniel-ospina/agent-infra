@@ -134,6 +134,87 @@
 # dispatch: a box that cannot publish is simply INELIGIBLE to its peers, which is the fail-closed
 # direction.
 #
+# ── THE KEY IS (host, boxid), AND IT HAS TO BE — MEASURED 2026-10-28 ON THE THREE CELLS ────────
+# #2707 measured that the fleet view collapsed to ONE box: every cell reads the same `hostname`
+# (`cmux`), so every cell published under one key, and `cap_publish` pruned that key's older refs on
+# every publish — i.e. each box DELETED ITS PEERS' RECORDS. `cap_place` then compared against a fleet
+# of one and always answered `place=<self>`.
+#
+# ⛔ SO WHERE DOES A PER-BOX IDENTITY COME FROM? NOT from the two sources the issue named as
+# candidates — both were measured on all three cells and both are CLONED WITH THE IMAGE:
+#
+#   source                     cell-1         cell-3         cell-4        unique?
+#   hostname                   cmux           cmux           cmux          ❌
+#   /etc/machine-id            6f3fcf06…      6f3fcf06…      6f3fcf06…     ❌ IDENTICAL
+#   /var/lib/dbus/machine-id   6f3fcf06…      6f3fcf06…      6f3fcf06…     ❌ IDENTICAL
+#   /proc/…/random/boot_id     7cc6a829…      7cc6a829…      7cc6a829…     ❌ IDENTICAL
+#   kern boot epoch (btime)    1791245194     1791245193     1791245194    ~ (1 s apart)
+#   cgroup slice               freestyle-…    freestyle-…    freestyle-…   ❌ IDENTICAL
+#   ncpu                       8              4              8             ❌ (cells 1 and 4 collide)
+#   GLOBAL IPv4                10.238.144.4   10.238.144.2   10.238.144.3  ✅ UNIQUE
+#
+# `boot_id` being identical is the one nobody expects: the cells are created from the same snapshot,
+# so the kernel's boot-time RNG state is inherited and a "random per boot" uuid repeats across boxes.
+# The only measured-unique, operator-readable identifier is the box's NETWORK identity, so `cap_boxid`
+# derives from it (Darwin: the hardware UUID, `kern.uuid`, unique per machine). `CAP_BOXID` stays the
+# explicit seam a deploy may pin (`CAP_BOXID=pi-cell-4`), exactly as `CAP_HOST` does.
+#
+# ⛔ `machine-id` IS DELIBERATELY *NOT* AN IDENTITY SOURCE, AND THAT IS ITS OWN CORRECTION (review
+# round 2). An earlier draft used it as the LAST resort, because it happens to be unique on a normal
+# machine — but on THIS fleet it is measured IDENTICAL on all three cells (the image was cloned from a
+# booted box), so as a fallback it does not merely fail to discriminate: it MANUFACTURES A FALSE
+# ATTRIBUTION, publishing under a key another box is already using while reporting success. That is the
+# #2707 defect wearing a different key, so the order is now (hw uuid, routable IPv4) and then **no
+# identity at all** — `cap_publish` refuses by name (`why=no-box-identity`) and the box is INVISIBLE to
+# its peers, which is the fail-closed direction and is the same stance as `fork_unknown`. A box that
+# reaches the origin has a routable address by construction (private ranges are `scope global`), so the
+# refusal costs nothing in practice; a deploy that must name a box pins `CAP_BOXID`.
+#
+# ⛔ THE PREFIX IS NOT THE KEY, AND THE PRUNE IS NOT HOST-SCOPED. `cap_host` still returns the HUMAN
+# name (`cmux`, `Daniels-MacBook-Air`) and a ref is keyed `refs/boxes/<host>/<boxid>/<reading>`. The
+# three cells therefore hold three keys, and `cap_publish` prunes only refs it can PROVE it wrote: a ref
+# named by this box's LOCAL AUTHORSHIP LEDGER (see below), or a STALE one, which no rule can ever treat
+# as eligible. A fresh record under this box's key that it cannot prove it wrote is another box
+# publishing under one key: it is KEPT (it is the evidence) and the publish says `foreign=<n>`.
+#
+# ⛔ AND A FLEET THAT CANNOT BE KEYED IS REFUSED, NOT COLLAPSED. Because a perfect identity is not
+# guaranteed (a deploy that pins one `CAP_BOXID` on two boxes, two LANs with the same private IP and
+# hostname), the READER detects the case: two FRESH refs under ONE key that disagree on a fact that
+# cannot change for one machine (its `ncpu`, its `boot` epoch) are two boxes, so the surviving record is
+# marked `collide=1` and `cap_place` REFUSES with `bound=identity_collision`. Picking the newest would
+# be placing work on a box the fleet cannot name — the same class of answer as `bound=no_probe`, and for
+# the same reason.
+#
+# ⛔ THE PRUNE PROVES AUTHORSHIP, IT DOES NOT INFER IT (review round 2, and this was a real defect in
+# the first draft). The first draft deleted a ref when it shared our key AND our `boot` epoch, on the
+# reading "this machine wrote it since it booted". That is an INFERENCE a mis-keyed fleet satisfies:
+# reproduced with two boxes sharing a key and a boot epoch (ncpu 4 vs 8), the second publish DELETED the
+# first box's live ref, reported `foreign=0`, and the reader still saw one box — the #2707 collapse,
+# restored, silently. `boot` epochs this close are measured (two cells share one) and `machine-id` is
+# measured shared, so the case is reachable. Authorship is now a FACT RECORDED LOCALLY: `cap_publish`
+# appends every ref it writes to a per-box ledger (`CAP_STATE_DIR`), and deletes only refs that ledger
+# names, plus refs that are STALE (no rule can ever use them). A peer's fresh ref is never deletable, no
+# matter what it shares with us, and a same-key record we cannot prove we wrote is counted in `foreign=`
+# so the operator sees it.
+#
+# The one residual, stated rather than hidden: two boxes that share key AND `ncpu` AND `boot` are
+# indistinguishable in the channel (there is no fourth fact in it), so the reader keeps the newest of
+# that key. They no longer destroy each other's records, and the identity sources are restricted to the
+# measured-unique ones so the case is not reachable by the cloned-image path that produced it.
+#
+# ⛔ THE LEDGER'S PRECONDITION is one filesystem per box (each cell has its own), which is what makes
+# "recorded here" mean "written by this box". Two boxes sharing ONE `CAP_STATE_DIR` are one state store
+# with two writers — a config no cell has, and one the reader's `collide=1` arm cannot catch, because a
+# shared writer deletes the evidence before it is read. Stated so the assumption is auditable, not
+# implied.
+#
+# ⛔ ROLLOUT: AN UN-UPGRADED BOX STILL DELETES UPGRADED PEERS' RECORDS. A box on the old tree prunes
+# `refs/boxes/<hostname>/*` with no authorship test at all, so it WILL delete the 3-segment refs this
+# tree publishes — the identity fix only holds once every box sharing a hostname runs this code (the
+# minimum is: upgrade one hostname group together, not one box at a time). An old READER meanwhile drops
+# 3-segment refs (it cannot parse them) and falls to `bound=no_probe`, which refuses rather than
+# guessing — the fail-closed direction.
+#
 # USAGE (library)
 #   . capacity.sh
 #   rec="$(cap_probe_local "$REPO" "$LANES")"      # one record line, or empty (unreadable)
@@ -169,6 +250,9 @@ CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STA
 CAP_MIN_FORK_HEADROOM="${CAP_MIN_FORK_HEADROOM:-200}"
 CAP_NS="${CAP_NS:-refs/boxes}"                 # the namespace peers publish under
 CAP_HOST="${CAP_HOST:-}"                       # identity seam (default: hostname -s)
+CAP_BOXID="${CAP_BOXID:-}"                     # per-box identity seam (default: derived, see cap_boxid)
+CAP_STATE_DIR="${CAP_STATE_DIR:-${TMPDIR:-/tmp}/pi-capacity}" # per-box authorship ledger root (see cap_publish)
+CAP_LEDGER_KEEP="${CAP_LEDGER_KEEP:-32}"       # refs remembered per repo; older lines are trimmed
 CAP_NOW="${CAP_NOW:-}"                         # clock seam (default: date +%s)
 
 cap_now() {
@@ -180,6 +264,109 @@ cap_host() {
   local h; h="$(hostname -s 2>/dev/null || hostname 2>/dev/null)" || h=""
   case "$h" in ''|*[!A-Za-z0-9._-]*) printf 'box'; return 0 ;; esac
   printf '%s' "$h"
+}
+
+# cap_ref_token <raw> -> the token form a PATH SEGMENT may carry: `[A-Za-z0-9._-]`, lower-cased, at
+# most 24 chars, never starting with `.`.
+# ⛔ IT SANITISES BY DELETION, NOT BY ESCAPING. The token becomes a ref path segment, so a raw value
+# carrying `/`, a space or a control character must not be able to NAME A DIFFERENT REF than this box
+# meant — a `x/../y` or a `x/10.0.0.9` would otherwise publish under (and prune) a peer's key.
+cap_ref_token() {
+  local raw out c i n
+  out=""
+  raw="$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z' 2>/dev/null)" || raw=""
+  n=${#raw}; i=0
+  while [ "$i" -lt "$n" ]; do
+    c="${raw:$i:1}"
+    case "$c" in
+      [A-Za-z0-9._-]) out="$out$c" ;;
+    esac
+    i=$((i + 1))
+    [ "${#out}" -ge 24 ] && break
+  done
+  while [ "${out#.}" != "$out" ]; do out="${out#.}"; done
+  # a trailing separator is legal in a ref but reads like a truncated key; drop it
+  while [ "${out%.}" != "$out" ] || [ "${out%-}" != "$out" ] || [ "${out%_}" != "$out" ]; do
+    case "$out" in *.) out="${out%.}" ;; *-) out="${out%-}" ;; *_) out="${out%_}" ;; *) break ;; esac
+  done
+  printf '%s' "$out"
+}
+
+# cap_boxid — THIS box's identity INSIDE the fleet, and the second half of a record's key.
+# It is not `hostname` (shared by every cell, measured) and not a per-boot uuid (also shared by every
+# cell, measured — see the header table); `cap_boxid_auto` reads the sources in the order the
+# measurement supports. `CAP_BOXID` is the explicit seam: a deploy that names the box gets that name.
+# An EMPTY answer is a real answer — `cap_publish` refuses to publish, so peers never see a record
+# they cannot attribute (fail-closed), instead of a record under a key two boxes share.
+cap_boxid() {
+  local b
+  if [ -n "${CAP_BOXID:-}" ]; then b="$CAP_BOXID"; else b="$(cap_boxid_auto)" || b=""; fi
+  cap_ref_token "$b"
+}
+
+# cap_boxid_auto — first AVAILABLE source wins, in order of measured discriminating power:
+#   1. the hardware UUID (Darwin `kern.uuid`) — unique per machine, survives a re-image of the OS;
+#   2. the box's GLOBAL IPv4 — measured UNIQUE on the three cells (10.238.144.2/.3/.4). `scope
+#      global` also excludes `lo` and the 169.254/16 link-local address that IS shared (measured).
+# ⛔ AND THEN NOTHING — `machine-id` is gone from this list on purpose (see the header): measured
+# IDENTICAL on all three cells, so as a fallback it publishes a FALSE ATTRIBUTION instead of refusing.
+# An empty answer here is a real answer: `cap_probe_local` still reports the reading, and `cap_publish`
+# refuses it by name. Peers then cannot see this box, which is the fail-closed direction.
+cap_boxid_auto() {
+  local v
+  if v="$(cap_hw_uuid 2>/dev/null)"; then [ -n "$v" ] && { printf '%s' "$v"; return 0; }; fi
+  if v="$(cap_boxid_net 2>/dev/null)"; then [ -n "$v" ] && { printf '%s' "$v"; return 0; }; fi
+  return 1
+}
+
+# cap_hw_uuid -> Darwin's hardware UUID, empty elsewhere (Linux has no such datum; its DMI uuid was
+# measured EMPTY on the cells).
+cap_hw_uuid() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 1
+  local v; v="$(sysctl -n kern.uuid 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9A-Za-z-]*) return 1 ;; esac
+  printf '%s' "$v"
+}
+
+# cap_boxid_net — the box's routable IPv4: the ONE address a peer can reach it on, and the only
+# identifier measured to differ across the three cells. Linux reads it through `ip` with `scope
+# global` (link-local and loopback are excluded by scope, not by a pattern); Darwin reads the
+# interface the default route uses. A box with no routable address (an isolated runner) returns 1 and
+# the next source answers.
+# ⛔ THIS IS ALSO THE SUITE'S IDENTITY SEAM: the arms in capacity-placement.test.sh §12 override THIS
+# FUNCTION to stand up two boxes with two identities on one hostname — the whole point of #2707 is
+# that `CAP_HOST` is NOT what distinguishes them.
+cap_boxid_net() {
+  local out ifc ip
+  if command -v ip >/dev/null 2>&1 && [ -r /proc/net/route ]; then
+    out="$(ip -4 -o addr show scope global 2>/dev/null)" || return 1
+    [ -n "$out" ] || return 1
+    ifc="$(printf '%s\n' "$out" | awk 'NR==1{print $2}')"
+    ip="$(printf '%s\n' "$out" | awk 'NR==1{print $4}')"
+    ip="${ip%%/*}"
+  else
+    ifc="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')" || return 1
+    [ -n "$ifc" ] || return 1
+    ip="$(ifconfig "$ifc" 2>/dev/null | awk '/inet /{print $2; exit}')" || return 1
+  fi
+  case "$ip" in ''|*[!0-9.]*) return 1 ;; esac
+  case "$ip" in 127.*|169.254.*) return 1 ;; esac
+  printf '%s' "$ip"
+}
+
+# cap_boot_epoch -> this box's boot time (epoch seconds), `0` when unreadable.
+# ⛔ IT IS NOT AN IDENTITY (measured: the cells differ by ONE second, and a cloned image can make it
+# identical). It is AUTHENTICITY: a record carrying THIS boot epoch, under THIS box's key, was written
+# by this process's machine since it booted — which is how `cap_publish` decides what it may delete,
+# and one half of how the reader tells two boxes apart under one key.
+cap_boot_epoch() {
+  local b
+  if [ -r /proc/stat ]; then
+    b="$(awk '$1=="btime"{print $2; exit}' /proc/stat 2>/dev/null)"
+  else
+    b="$(sysctl -n kern.boottime 2>/dev/null | awk -F'[{},= ]+' '{for(i=1;i<=NF;i++) if($i=="sec"){print $(i+1); exit}}')"
+  fi
+  case "$b" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$b" ;; esac
 }
 
 cap_ncpu() {
@@ -473,7 +660,7 @@ cap_fork_bound() {
 # unreadable. Lanes is passed IN by the controller (it already counts them by evidence); standalone
 # callers get a worktree count.
 cap_probe_local() {
-  local repo="${1:-.}" lanes="${2:-}" ncpu load1 disk mem host at lpc fr
+  local repo="${1:-.}" lanes="${2:-}" ncpu load1 disk mem host at lpc fr bid boot
   # ── FORK HEADROOM FIRST — GENUINELY FIRST NOW (review P3, agent-infra#2293). The header above claimed
   # "read FIRST" while this line sat AFTER ncpu/load/disk/mem, each of which forks (an `awk` or a `df`),
   # so a box with a few pids of headroom spent them and died before the read it most needed. Moving it
@@ -495,11 +682,18 @@ cap_probe_local() {
   fi
   case "$lanes" in ''|*[!0-9]*) lanes=0 ;; esac
   host="$(cap_host)"; at="$(cap_now)"
+  bid="$(cap_boxid)"; boot="$(cap_boot_epoch)"
   lpc="$(awk -v l="$load1" -v n="$ncpu" 'BEGIN{printf "%d", l/n}')"
   # The fork fields are APPENDED: existing consumers (`scripts/harness-up`, peers on an older tree)
   # parse the leading fields by key and ignore what follows, so this is additive, not a new grammar.
+  # `boxid=`/`boot=` are appended for the same reason, AND because the pair is what lets a peer say
+  # "two machines published under one key" instead of keeping the newest (see cap_parse_lsremote).
+  # ⛔ AN EMPTY `boxid=` IS PUBLISHED, NOT OMITTED: `cap_publish` refuses that record by name
+  # (`why=no-box-identity`), so a box that cannot name itself is invisible to its peers rather than
+  # publishing under a key someone else may own.
   printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s %s' \
     "$host" "$ncpu" "$load1" "$lpc" "$lanes" "$disk" "$mem" "$at" "$fr"
+  printf ' boxid=%s boot=%s' "$bid" "$boot"
 }
 
 # ── record parsing ─────────────────────────────────────────────────────────────
@@ -534,10 +728,33 @@ cap_valid_base_record() {
 cap_valid_record() {
   local r="${1:-}" k v
   cap_valid_base_record "$r" || return 1
-  for k in procs procs_max fork; do
+  for k in procs procs_max fork boot; do
     v="$(cap_kv "$r" "$k")"
     case "$v" in ''|*[!0-9]*) return 1 ;; esac
   done
+  cap_boxid_ok "$(cap_kv "$r" boxid)" || return 1
+  return 0
+}
+
+# cap_boxid_ok <token> — 0 iff the token can be a ref path segment git ACCEPTS: non-empty, only
+# `[A-Za-z0-9._-]`, and neither `.` nor `..` (a segment git itself refuses, and the one shape that
+# could walk a key into a peer's).
+# ⛔ `..` ANYWHERE AND A `.lock` SUFFIX ARE REFUSED TOO (review round 2, P3): `git check-ref-format`
+# rejects `a..b` and any path segment ending `.lock`, so accepting them here let a malformed identity
+# reach `git push` and come back as `why=push-refused` — a misleading reason on a fail-closed path,
+# exactly the kind of mislabelled refusal that costs an operator an hour.
+cap_boxid_ok() {
+  case "${1:-}" in ''|.|..|*..*|*.lock|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  return 0
+}
+
+# cap_box_bound <record> -> `box_unknown` when the record cannot be attributed to a box, else empty.
+# ⛔ A RECORD WITH NO BOX IS NOT "PROBABLY FINE": it is a peer on a pre-#2707 tree (its ref has the
+# old two-segment shape) or a writer defect, and either way nothing here can name WHICH box it is, so
+# placement must not choose it. That is the same direction as `fork_unknown`, for the same reason.
+cap_box_bound() {
+  cap_boxid_ok "$(cap_kv "${1:-}" boxid)" && return 0
+  printf 'box_unknown'
   return 0
 }
 
@@ -547,11 +764,16 @@ cap_lpc_human() { awk -v x="${1:-0}" 'BEGIN{printf "%.2f", x/100}'; }
 # The order is fixed so a refusal names a STABLE reason for a given fleet state, and it is
 # FORK -> DISK -> LOAD -> MEMORY (see the FORK HEADROOM header for why this order and not another).
 cap_bound_hit() {
-  local r="${1:-}" now="${2:-}" at age lpc disk mem forkb
+  local r="${1:-}" now="${2:-}" at age lpc disk mem forkb boxb
   cap_valid_base_record "$r" || { printf 'probe_unreadable'; return 0; }
   at="$(cap_kv "$r" at)"; age=$(( now - at ))
   [ "$age" -lt 0 ] && age=0
   if [ "$age" -gt "$CAP_PROBE_TTL" ]; then printf 'probe_stale'; return 0; fi
+  # 0. IDENTITY — before fork, disk, load and memory, because every other bound is a statement ABOUT A
+  # BOX and this read is what makes the box nameable. An unattributable record is refused here, named,
+  # rather than judged on its reading.
+  boxb="$(cap_box_bound "$r")"
+  [ -n "$boxb" ] && { printf '%s' "$boxb"; return 0; }
   # 1. FORK HEADROOM — a box that cannot spawn is refused even if every other number is lovely.
   forkb="$(cap_fork_bound "$r")"
   [ -n "$forkb" ] && { printf '%s' "$forkb"; return 0; }
@@ -576,12 +798,35 @@ cap_place() {
   [ -n "$self" ] || { printf 'refuse bound=usage detail=no-self-host\n'; return 2; }
   local now; now="$(cap_now)"
   case "$now" in ''|*[!0-9]*) printf 'refuse bound=usage detail=clock-unreadable\n'; return 2 ;; esac
-  local rec n=0 elig=0 bound hits="" hit lpc disk host detail="" winner_lpc="" winner_disk="" winner="" best_hits=""
+  local rec n=0 elig=0 bound hits="" hit lpc disk host bid detail="" winner_lpc="" winner_disk="" winner="" winner_boxid="" best_hits=""
   # Records arrive either as arguments or, when there are none, on stdin (one record per line).
   # stdin is the CONTROLLER's shape: a record contains spaces, so `cap_place h $fleet` would word-split
   # every record into fragments — a bug that reads as "no eligible box" instead of "bad call".
   local src
   if [ "$#" -gt 0 ]; then src="$(printf '%s\n' "$@" | grep -v '^$')"; else src="$(cat)"; fi
+  # ⛔ A KEY TWO BOXES PUBLISH UNDER IS NOT A FLEET OF ONE (#2707). `cap_parse_lsremote` marks a record
+  # `collide=1` when two FRESH refs under ONE key disagree about the machine (its ncpu, its boot). That
+  # is not a stale/absent box to skip — it is the fleet saying it cannot NAME the thing it would place
+  # on, and keeping the newest would be exactly the silent collapse this issue is about. So the whole
+  # decision is refused, with the key named, before any record is judged.
+  # ⛔ THIS SCAN IS BUILTINS ONLY, ON PURPOSE (review round 2, P2). It used `grep -c`, whose rc the
+  # `|| coll=0` turned into "no collision" when grep could not run — a gate that silently passes when its
+  # instrument is missing, which is exactly the class this file removes everywhere else. A `case` cannot
+  # fail to run.
+  local coll=0 ckey="" _line
+  while IFS= read -r _line; do
+    case "$_line" in
+      *collide=1*) coll=$((coll + 1)); [ -n "$ckey" ] || ckey="$_line" ;;
+    esac
+  done <<EOF
+$src
+EOF
+  if [ "$coll" -gt 0 ]; then
+    printf 'refuse bound=identity_collision detail=%s/%s evaluated=%s eligible=0 collide=[%s]\n' \
+      "$(cap_kv "$ckey" host)" "$(cap_kv "$ckey" boxid)" \
+      "$(awk 'NF{c++} END{print c+0}' <<<"$src")" "$(cap_kv "$ckey" collide)"
+    return 1
+  fi
   while IFS= read -r rec; do
     [ -n "${rec:-}" ] || continue
     n=$((n + 1))
@@ -594,13 +839,17 @@ cap_place() {
       continue
     fi
     elig=$((elig + 1))
-    lpc="$(cap_kv "$rec" lpc)"; disk="$(cap_kv "$rec" disk_free_mb)"
-    if [ -z "$winner" ]; then winner="$host"; winner_lpc="$lpc"; winner_disk="$disk"; continue; fi
+    lpc="$(cap_kv "$rec" lpc)"; disk="$(cap_kv "$rec" disk_free_mb)"; bid="$(cap_kv "$rec" boxid)"
+    if [ -z "$winner" ]; then winner="$host"; winner_lpc="$lpc"; winner_disk="$disk"; winner_boxid="$bid"; continue; fi
     # shellcheck disable=SC2055
+    # ⛔ THE LAST TIEBREAK IS THE BOXID, NOT THE HOSTNAME (#2707): two cells that share a hostname and
+    # tie on load and disk would otherwise depend on the order the records happened to arrive, and the
+    # winner could flip every cycle.
     if [ "$lpc" -lt "$winner_lpc" ] \
        || { [ "$lpc" -eq "$winner_lpc" ] && [ "$disk" -gt "$winner_disk" ]; } \
-       || { [ "$lpc" -eq "$winner_lpc" ] && [ "$disk" -eq "$winner_disk" ] && [ "$host" \< "$winner" ]; }; then
-      winner="$host"; winner_lpc="$lpc"; winner_disk="$disk"
+       || { [ "$lpc" -eq "$winner_lpc" ] && [ "$disk" -eq "$winner_disk" ] && [ "$host" \< "$winner" ]; } \
+       || { [ "$lpc" -eq "$winner_lpc" ] && [ "$disk" -eq "$winner_disk" ] && [ "$host" = "$winner" ] && [ "$bid" \< "$winner_boxid" ]; }; then
+      winner="$host"; winner_lpc="$lpc"; winner_disk="$disk"; winner_boxid="$bid"
     fi
   done <<EOF
 $src
@@ -617,77 +866,154 @@ EOF
       "$dominant" "${detail:-none}" "$n" "$CAP_LPC_CEILING" "$CAP_MIN_DISK_MB" "$CAP_MIN_MEM_MB"
     return 1
   fi
-  printf 'place=%s lpc=%s evaluated=%s eligible=%s why=none%s\n' \
-    "$winner" "$winner_lpc" "$n" "$elig" "${detail:+ ineligible=[$detail]}"
+  # `boxid=` is APPENDED: `place=<host>` stays the human name every existing reader keys on, and the
+  # identity that made the choice unambiguous is beside it (three boxes can share a hostname).
+  printf 'place=%s lpc=%s evaluated=%s eligible=%s why=none%s boxid=%s\n' \
+    "$winner" "$winner_lpc" "$n" "$elig" "${detail:+ ineligible=[$detail]}" "$winner_boxid"
   return 0
 }
 
 # ── the fleet's records, over the ONE shared channel ──────────────────────────────────────────
-# cap_ref_for <record> -> refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>
-# ⛔ THE GRAMMAR IS APPEND-ONLY, AND THE DECODERS ACCEPT THE OLD SIX-SLOT FORM AS `fork_unknown`. A ref
-# name is a string the transport already carries (see the header), so adding slots costs no fetch --
-# but a peer on an older tree must be REFUSED for a named reason, not silently read as healthy.
+# cap_ref_for <record> -> refs/boxes/<host>/<boxid>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>-<boot>
+# ⛔ THE BOXID IS A PATH SEGMENT, NOT A SLOT, AND THAT IS THE FIX (#2707). The old shape keyed a ref by
+# HOSTNAME alone, so three boxes named `cmux` shared one key and each publish deleted the others'
+# records. `<host>/<boxid>/` gives every box its own prefix, so `cap_publish`'s prune (which is scoped
+# to that prefix) can only ever reach records whose key names THIS box.
+# ⛔ THE GRAMMAR IS STILL APPEND-ONLY INSIDE THE KEY, AND THE DECODERS STILL ACCEPT THE OLD SHAPES: a
+# six-slot reading is `fork_unknown`, and the old two-segment `refs/boxes/<host>/<reading>` decodes as
+# `box_unknown` — both REFUSED for a named reason, never silently read as healthy. A ref name is a
+# string the transport already carries (see the header), so the extra segment costs no fetch.
 cap_ref_for() {
-  local r="${1:-}" h at ncpu load1 lanes disk mem procs pmax fork
+  local r="${1:-}" h bid at ncpu load1 lanes disk mem procs pmax fork boot
   cap_valid_record "$r" || return 1
-  h="$(cap_kv "$r" host)"; at="$(cap_kv "$r" at)"; ncpu="$(cap_kv "$r" ncpu)"
+  h="$(cap_kv "$r" host)"; bid="$(cap_kv "$r" boxid)"
+  # ⛔ THE HOST IS A PATH SEGMENT TOO (review round 2, P3). It was copied into the ref unchecked, so a
+  # record carrying `host=..` reached `git push` and came back as `why=push-refused` — a misleading
+  # reason on a fail-closed path. Same check as the boxid, for the same reason.
+  case "$h" in ''|.|..|*..*|*.lock|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  cap_boxid_ok "$bid" || return 1
+  at="$(cap_kv "$r" at)"; ncpu="$(cap_kv "$r" ncpu)"
   load1="$(cap_kv "$r" load1)"; lanes="$(cap_kv "$r" lanes)"
   disk="$(cap_kv "$r" disk_free_mb)"; mem="$(cap_kv "$r" mem_free_mb)"
   procs="$(cap_kv "$r" procs)"; pmax="$(cap_kv "$r" procs_max)"; fork="$(cap_kv "$r" fork)"
-  printf '%s/%s/%s-%s-%s-%s-%s-%s-%s-%s-%s' "$CAP_NS" "$h" "$at" "$ncpu" "$load1" "$lanes" \
-    "$disk" "$mem" "$procs" "$pmax" "$fork"
+  boot="$(cap_kv "$r" boot)"
+  printf '%s/%s/%s/%s-%s-%s-%s-%s-%s-%s-%s-%s-%s' "$CAP_NS" "$h" "$bid" "$at" "$ncpu" "$load1" \
+    "$lanes" "$disk" "$mem" "$procs" "$pmax" "$fork" "$boot"
 }
 
 # cap_record_from_ref <refname or path> -> record line (rc 1 if the ref is not one of ours)
-# Six numeric slots = a pre-#2293 record: it decodes WITHOUT fork fields, so `cap_fork_bound` calls it
-# `fork_unknown` (ineligible, named) instead of the whole ref being dropped as unparseable.
+# Shapes accepted, and the named refusal each older one produces:
+#   refs/boxes/<host>/<boxid>/<10 slots>   current: boxid + at…fork + boot
+#   refs/boxes/<host>/<9 slots>            pre-#2707: NO boxid -> `box_unknown` (ineligible, named)
+#   refs/boxes/<host>/<6 slots>            pre-#2293: no fork either -> `box_unknown`/`fork_unknown`
+# The PATH SEGMENT COUNT is the generation marker, so the slot count is never ambiguous: a keyed ref
+# must carry exactly ten slots, and a legacy ref may not claim a boxid it does not have.
 cap_record_from_ref() {
-  local ref="${1:-}" path base h rest
+  local ref="${1:-}" path h bid rest nseg
   case "$ref" in
     *"$CAP_NS"/*) path="${ref#*"$CAP_NS"/}" ;;
     *) return 1 ;;
   esac
+  nseg=0
+  case "$path" in */*/*) nseg=3 ;; */*) nseg=2 ;; esac
   h="${path%%/*}"; rest="${path#*/}"
-  case "$h" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  printf '%s' "$rest" | awk -v h="$h" '
+  if [ "$nseg" -eq 3 ]; then bid="${rest%%/*}"; rest="${rest#*/}"; else bid=""; fi
+  case "$h" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  if [ "$nseg" -eq 3 ]; then cap_boxid_ok "$bid" || return 1; fi
+  printf '%s' "$rest" | awk -v h="$h" -v bid="$bid" -v keyed="$([ "$nseg" -eq 3 ] && echo 1 || echo 0)" '
     { n=split($0, f, "-") }
     END{
-      if (n != 6 && n != 9) exit 1
+      if (keyed == "1") { if (n != 10) exit 1 }
+      else              { if (n != 6 && n != 9) exit 1 }
       for (i=1;i<=n;i++) if (f[i] == "" || f[i] ~ /[^0-9]/) exit 1
       lpc = int(f[3] / f[2])
       printf "host=%s ncpu=%s load1=%s lpc=%d lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s", \
         h, f[2], f[3], lpc, f[4], f[5], f[6], f[1]
-      if (n == 9) printf " procs=%s procs_max=%s fork=%s", f[7], f[8], f[9]
+      if (n >= 9) printf " procs=%s procs_max=%s fork=%s", f[7], f[8], f[9]
+      if (keyed == "1") printf " boxid=%s boot=%s", bid, f[10]
     }'
 }
 
-# cap_parse_lsremote — pure: `<sha>\t<ref>` lines on stdin -> ONE record per host (the newest `at`).
+# cap_parse_lsremote — pure: `<sha>\t<ref>` lines on stdin -> ONE record per (host, boxid) KEY, the
+# newest `at`, marked `collide=1` when two FRESH refs under ONE key disagree about the machine itself.
 # Kept separate from the git call so the suite can drive it with fixture text.
+# ⛔ ONE RECORD PER KEY, NOT PER HOST (#2707). Grouping by host is what made three `cmux` cells read as
+# one box: the newest reading won and the other two boxes simply vanished. The key is
+# `<host>/<boxid>`, so a peer sees every box, and two boxes that DO share a key are reported.
+# ⛔ THE COLLISION TEST USES ONLY FACTS A BOX CANNOT CHANGE WITHOUT BEING A DIFFERENT MACHINE, and both
+# are independent of the key: `ncpu` (a 4-core box is not an 8-core box) and the `boot` epoch (two
+# live boxes do not share a boot). `disk`/`mem`/`load` are NOT usable — they move every cycle on one
+# box, so they would flag every box as a collision. Freshness is part of the test because a STALE ref
+# under our key is the signature of our OWN previous boot, not of a peer (a live peer republishes).
+# ⛔ A `boot=0` READING IS UNKNOWN, NOT A DIFFERENT MACHINE (review round 2, P2). `boot=0` is what
+# `cap_boot_epoch` prints when the platform cannot read its boot time; comparing `0` against a real
+# epoch would mark a SINGLE box as two machines for a whole TTL and refuse the entire fleet's placement
+# (`identity_collision`) off a transient probe fault — a false block on a healthy fleet.
+# ⛔ AND THAT EXEMPTION APPLIES TO THE `boot` TERM ONLY, NEVER TO THE RECORD (review round 3, B1). Dropping
+# a record with `boot=0` from the test discarded its `ncpu` as well, and `ncpu` is not made unknown by an
+# unreadable clock: measured, two boxes under one key (4-core vs 8-core, both `boot=0`) produced 0 collision
+# marks and `place=cmux` — a false PASS in this detector. `ncpu` is ALWAYS compared; `boot` only when both
+# readings are known.
 cap_parse_lsremote() {
-  awk -v ns="$CAP_NS" '
-    function rec_for(ref,   p, h, rest, n, f, i, lpc) {
+  awk -v ns="$CAP_NS" -v now="$(cap_now)" -v ttl="$CAP_PROBE_TTL" '
+    function rec_for(ref,   p, seg, nseg, h, bid, rest, n, f, i, lpc, r) {
       p = ref; sub("^" ns "/", "", p)
       if (p == ref) return ""                       # not in our namespace
-      i = index(p, "/"); if (i <= 1) return ""
-      h = substr(p, 1, i - 1); rest = substr(p, i + 1)
+      nseg = split(p, seg, "/")
+      if (nseg == 2)      { h = seg[1]; bid = "";     rest = seg[2] }
+      else if (nseg == 3) { h = seg[1]; bid = seg[2]; rest = seg[3] }
+      else return ""
+      if (h == "" || h == "." || h == ".." || h ~ /[^A-Za-z0-9._-]/) return ""
+      if (nseg == 3 && (bid == "" || bid == "." || bid == ".." || bid ~ /[^A-Za-z0-9._-]/)) return ""
       n = split(rest, f, "-")
-      if (n != 6 && n != 9) return ""
+      if (nseg == 3) { if (n != 10) return "" }
+      else           { if (n != 6 && n != 9) return "" }
       for (i = 1; i <= n; i++) if (f[i] == "" || f[i] ~ /[^0-9]/) return ""
       lpc = int(f[3] / f[2])
       r = sprintf("host=%s ncpu=%s load1=%s lpc=%d lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s", \
-                     h, f[2], f[3], lpc, f[4], f[5], f[6], f[1])
-      if (n == 9) r = r sprintf(" procs=%s procs_max=%s fork=%s", f[7], f[8], f[9])
+                  h, f[2], f[3], lpc, f[4], f[5], f[6], f[1])
+      if (n >= 9) r = r sprintf(" procs=%s procs_max=%s fork=%s", f[7], f[8], f[9])
+      if (nseg == 3) r = r sprintf(" boxid=%s boot=%s", bid, f[10])
       return r
     }
     {
       ref = $2
       if (ref == "") { split($0, t, "\t"); ref = t[2] }
-      r = rec_for(ref, 1)
+      r = rec_for(ref)
       if (r == "") next
-      split(r, g, " "); at = g[8]; sub("^at=", "", at)
-      if (!(g[1] in best) || at + 0 > atv[g[1]] + 0) { best[g[1]] = r; atv[g[1]] = at + 0 }
+      n = split(r, g, " ")
+      h = ""; bid = ""; at = 0; ncpu = ""; boot = ""
+      for (i = 1; i <= n; i++) {
+        if (g[i] ~ /^host=/)  h    = substr(g[i], 6)
+        if (g[i] ~ /^boxid=/) bid  = substr(g[i], 7)
+        if (g[i] ~ /^at=/)    at   = substr(g[i], 4) + 0
+        if (g[i] ~ /^ncpu=/)  ncpu = substr(g[i], 6)
+        if (g[i] ~ /^boot=/)  boot = substr(g[i], 6)
+      }
+      key = h "/" bid
+      if (!(key in best) || at > atv[key]) { best[key] = r; atv[key] = at }
+      if (bid != "" && (now - at) <= ttl) {
+        # ⛔ `ncpu` IS ALWAYS COMPARABLE, `boot` ONLY WHEN BOTH READINGS ARE KNOWN (review round 3).
+        # An unreadable boot epoch is a fact about the INSTRUMENT, not about the machine — it does not
+        # make the core count unknown. Excluding the whole record when `boot` was 0 discarded the ncpu
+        # evidence too, so two boxes under one key (4-core vs 8-core, both with an unreadable boot) read
+        # as ONE box and placement went ahead — a false PASS in this very detector. Measured before the
+        # fix: two refs, one key, ncpu 4 vs 8, boot=0 on both => 0 collide marks, `place=cmux` rc 0.
+        if (!(key in ncpus)) ncpus[key] = ncpu
+        else if (ncpus[key] != ncpu && !(key in collide)) collide[key] = "ncpu " ncpus[key] " vs " ncpu
+        if (boot != "" && boot + 0 > 0) {
+          if (!(key in boots)) boots[key] = boot
+          else if (boots[key] != boot)
+            collide[key] = ((key in collide) ? collide[key] " & " : "") "boot " boots[key] " vs " boot
+        }
+      }
     }
-    END { for (k in best) print best[k] }
+    END {
+      for (k in best) {
+        if (k in collide) printf "%s collide=1 collide_sig=%s\n", best[k], collide[k]
+        else print best[k]
+      }
+    }
   ' | sort
 }
 
@@ -702,23 +1028,162 @@ cap_read_fleet() {
   printf '%s\n' "$out" | cap_parse_lsremote
 }
 
-# cap_publish <repo> <record> — publish this box's reading; prune this box's PREVIOUS refs only.
-# Best-effort by design: a publish failure must never fail a dispatch (this box becomes ineligible to
-# its peers, which is the fail-closed direction). rc 0 published · 1 refused/failed (reason on stdout)
+# ── the authorship ledger — the ONE proof of "this box wrote that ref" ────────────────────
+# A ref name is not attributable on its own (see the header: two boxes can share every fact the channel
+# carries), so authorship is RECORDED locally at publish time and never inferred at prune time.
+# cap_state_dir -> the per-box ledger root, created on demand (rc 1 if it cannot be).
+# ⛔ `$TMPDIR` IS DELIBERATE: the ledger is per-BOX state, and on this fleet each box has its own
+# filesystem, so a `/tmp` path cannot be shared with a peer. A wiped /tmp costs only a leak bounded by
+# CAP_PROBE_TTL (the stale arm still collects the ref), never a delete.
+cap_state_dir() {
+  local d="${CAP_STATE_DIR:-}"
+  [ -n "$d" ] || return 1
+  mkdir -p "$d" 2>/dev/null || return 1
+  [ -w "$d" ] || return 1
+  printf '%s' "$d"
+}
+
+# cap_ledger_file <repo> -> the ledger path for that QUEUE repo (rc 1 when the root is unavailable).
+# Keyed by the repo's REAL path, so two controllers on one box sharing a checkout share one ledger (they
+# are one box: deleting each other's reading of THIS box is harmless — the newer one wins).
+cap_ledger_file() {
+  local repo="${1:-.}" dir root h
+  dir="$(cap_state_dir 2>/dev/null)" || return 1
+  [ -n "$dir" ] || return 1
+  root="$( cd "$repo" 2>/dev/null && pwd -P )" || root="$repo"
+  h="$(printf '%s' "$root" | cksum 2>/dev/null | awk '{print $1}' 2>/dev/null)" || return 1
+  case "$h" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s/publish-%s.ledger' "$dir" "$h"
+}
+
+# cap_ledger_has <file> <ref> -> 0 iff the ledger names that exact ref.
+# ⛔ rc 1 MEANS "NOT PROVEN OURS", NEVER "no proof needed". A missing ledger, an unreadable one, or a
+# `grep` that cannot run all answer 1, so every failure direction is KEEP the ref (fail-safe).
+cap_ledger_has() {
+  local f="${1:-}" ref="${2:-}"
+  [ -n "$f" ] && [ -n "$ref" ] && [ -r "$f" ] || return 1
+  grep -Fxq -- "$ref" "$f" 2>/dev/null || return 1
+  return 0
+}
+
+# cap_ledger_add <file> <ref> — remember the ref just published; keep the file bounded.
+# Best effort: a ledger that cannot be written leaks refs (bounded by TTL), it never deletes one.
+cap_ledger_add() {
+  local f="${1:-}" ref="${2:-}" n
+  [ -n "$f" ] && [ -n "$ref" ] || return 1
+  printf '%s\n' "$ref" >> "$f" 2>/dev/null || return 1
+  n="$(awk 'END{print NR}' "$f" 2>/dev/null)" || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$n" -gt "$CAP_LEDGER_KEEP" ]; then
+    tail -n "$CAP_LEDGER_KEEP" "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+  fi
+  return 0
+}
+
+# cap_ledger_drop <file> <ref> — forget a ref this box has deleted (or that is already gone).
+# ⛔ THE REWRITE IS ONLY COMMITTED ON grep rc 0/1 — rc 127 (no grep) or 2 (unreadable) must NOT replace
+# the ledger with a partial file, or a broken `grep` would silently erase every future authorship proof.
+cap_ledger_drop() {
+  local f="${1:-}" ref="${2:-}" rc
+  [ -n "$f" ] && [ -n "$ref" ] && [ -r "$f" ] || return 1
+  grep -Fxv -- "$ref" "$f" > "$f.tmp" 2>/dev/null; rc=$?
+  case "$rc" in
+    0|1) mv "$f.tmp" "$f" 2>/dev/null || { rm -f "$f.tmp"; return 1; }; return 0 ;;
+    *)   rm -f "$f.tmp"; return 1 ;;
+  esac
+}
+
+# cap_ref_deletable <record> <ref> <ledger> <now> -> 0 iff this box may delete the ref.
+# TWO definite yeses, and NEITHER is an inference about who "probably" wrote it:
+#   (a) THE LEDGER NAMES IT — this box's own publish wrote that exact ref name, and a ref name carries
+#       its `at` so it is unique per publish. Proven locally; a peer cannot write into our ledger.
+#   (b) STALE — older than CAP_PROBE_TTL, so no rule can ever treat it as eligible; removing it cannot
+#       change any decision, and it is the only cleanup an unattributable (pre-#2707 two-segment) ref,
+#       or a ref inherited from a previous boot, can safely get.
+# ⛔ EVERYTHING ELSE IS KEPT — including a fresh ref that shares our key AND our `boot` epoch. That is
+# the review-round-2 correction: (key, boot) equality is satisfied by a mis-keyed PEER, so reading it as
+# authorship let the second publisher delete the first box's live ref (reproduced: ncpu 4 vs 8, same key,
+# same boot → one ref left, `foreign=0`, reader saw one box). Authorship is a fact, not a guess.
+cap_ref_deletable() {
+  local orec="${1:-}" oref="${2:-}" ledger="${3:-}" now="${4:-}" oat age
+  cap_valid_base_record "$orec" || return 1
+  cap_ledger_has "$ledger" "$oref" && return 0                  # (a) proven ours
+  oat="$(cap_kv "$orec" at)"; case "$oat" in ''|*[!0-9]*) oat=0 ;; esac
+  age=$(( now - oat )); [ "$age" -lt 0 ] && age=0
+  [ "$age" -gt "$CAP_PROBE_TTL" ] && return 0                   # (b) stale
+  return 1
+}
+
+# cap_publish <repo> <record> — publish this box's reading, then prune only what this box can PROVE
+# it wrote. Best-effort by design: a publish failure must never fail a dispatch (this box becomes
+# ineligible to its peers, which is the fail-closed direction).
+# rc 0 published · 1 refused/failed (reason on stdout)
+# ⛔ THE PRUNE IS AUTHORSHIP-SCOPED, NOT HOST-SCOPED (#2707). The old loop deleted every ref under
+# `refs/boxes/<this box's hostname>/*` — which, on a fleet where three boxes share a hostname, is
+# DELETE MY PEERS' RECORDS on every cycle: that is why the fleet view was one box. A ref is now
+# deletable only when
+#   (a) THIS BOX'S LEDGER NAMES IT — it is a ref this box published (proof, recorded at publish time);
+#   (b) it is STALE (older than CAP_PROBE_TTL) — no rule can ever treat a stale record as eligible, so
+#       deleting it cannot change any decision, and it is the only cleanup a legacy two-segment ref can
+#       safely get.
+# Anything else fresh under our hostname is another box's reading: KEPT (it is the evidence) and counted
+# in `foreign=`. The first draft of this fix instead inferred authorship from (key, boot) equality, which
+# a mis-keyed peer satisfies — see `cap_ref_deletable`.
 cap_publish() {
-  local repo="${1:-.}" rec="${2:-}" ref sha old
+  local repo="${1:-.}" rec="${2:-}" ref sha old orec h bid now foreign ledger
+  # ⛔ NO NAME, NO RECORD — and this is checked BEFORE the record's other fields, because "I could not
+  # name myself" is a different failure with a different remedy from "a reading is missing". A box with
+  # no identity must not publish under `host` alone: that is the collapse, and a peer would then have
+  # to guess whose reading it is.
+  cap_boxid_ok "$(cap_kv "$rec" boxid)" || { printf 'publish=refused why=no-box-identity\n'; return 1; }
   cap_valid_record "$rec" || { printf 'publish=refused why=invalid-record\n'; return 1; }
+  h="$(cap_kv "$rec" host)"; bid="$(cap_kv "$rec" boxid)"
   ref="$(cap_ref_for "$rec")" || { printf 'publish=refused why=invalid-record\n'; return 1; }
   sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || { printf 'publish=refused why=no-head\n'; return 1; }
   git -C "$repo" push -q origin "$sha:$ref" >/dev/null 2>&1 || { printf 'publish=failed why=push-refused ref=%s\n' "$ref"; return 1; }
-  # Prune THIS host's older refs. A peer's ref is never named here (the pattern is host-scoped), so a
-  # delete can only ever remove a record this box published.
-  for old in $(git -C "$repo" ls-remote --refs origin "$CAP_NS/$(cap_kv "$rec" host)/*" 2>/dev/null | awk '{print $2}'); do
+  now="$(cap_now)"; foreign=0
+  ledger="$(cap_ledger_file "$repo" 2>/dev/null)" || ledger=""
+  # (1) PROVEN-OURS: collect what the LEDGER names, whatever key or hostname it sits under — a box whose
+  # identity changed between cycles (an IP move) still cleans up after itself.
+  if [ -n "$ledger" ] && [ -r "$ledger" ]; then
+    while IFS= read -r old; do
+      [ -n "$old" ] || continue
+      [ "$old" = "$ref" ] && continue
+      # ⛔ OUTSIDE `refs/boxes/*` NOTHING IS OURS TO DELETE (review round 3, P3). A ledger line is pushed
+      # as a delete VERBATIM, so a corrupted/tampered line reading `refs/heads/main` would delete a
+      # BRANCH. Only this code writes the ledger, so this is defence-in-depth — but it is one `case`.
+      case "$old" in "$CAP_NS"/*) : ;; *) continue ;; esac
+      # The line is forgotten only when the delete actually SUCCEEDED: a transient git failure must not
+      # silently lose the proof while the ref is still on the origin (the STALE arm would collect it a
+      # whole TTL later; keeping the line retries next cycle).
+      if git -C "$repo" push -q origin ":$old" >/dev/null 2>&1; then cap_ledger_drop "$ledger" "$old"; fi
+    done < "$ledger"
+  fi
+  # (2) THIS HOSTNAME'S REFS: the stale arm, plus the `foreign=` reading. ONE enumeration — it is the
+  # only set a peer sharing this hostname can appear in, and walking it is what lets a legacy ref be
+  # cleaned up once it goes stale.
+  for old in $(git -C "$repo" ls-remote --refs origin "$CAP_NS/$h/*" 2>/dev/null | awk '{print $2}'); do
     [ "$old" = "$ref" ] && continue
-    git -C "$repo" push -q origin ":$old" >/dev/null 2>&1 || true  # a stuck old ref is harmless: the
-    #    reader keeps the NEWEST record per host, so a superseded ref cannot win a placement decision
+    orec="$(cap_record_from_ref "$old" 2>/dev/null)" || continue
+    [ -n "$orec" ] || continue
+    if cap_ref_deletable "$orec" "$old" "$ledger" "$now"; then
+      git -C "$repo" push -q origin ":$old" >/dev/null 2>&1 || true
+      cap_ledger_drop "$ledger" "$old"
+      continue
+    fi
+    # ⛔ ONLY OUR OWN KEY IS OURS TO JUDGE (see cap_ref_deletable). A peer with its own boxid is the
+    # fleet working, not a collision; a fresh record under OUR key that this box cannot prove it wrote
+    # is another publisher under our key — kept, and COUNTED, because that is the reading an operator
+    # needs and the state the reader refuses on.
+    [ "$(cap_kv "$orec" boxid)" = "$bid" ] && foreign=$((foreign + 1))
   done
-  printf 'publish=ok ref=%s\n' "$ref"
+  # Remember what this box just wrote — the ONLY thing that makes a future prune provable. Appended
+  # after the prune so a ref is never deleted in the cycle that published it.
+  cap_ledger_add "$ledger" "$ref" || true
+  # `foreign=0` is printed, not omitted: "nothing else is publishing under my key" is a reading an
+  # operator can check, and a non-zero count is the collision the reader refuses on. `ledger=` says
+  # whether authorship was RECORDED this cycle — without it, only the stale arm can ever prune.
+  printf 'publish=ok ref=%s foreign=%s ledger=%s\n' "$ref" "$foreign" "$([ -n "$ledger" ] && echo ok || echo unavailable)"
   return 0
 }
 
