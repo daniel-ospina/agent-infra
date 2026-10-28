@@ -374,8 +374,14 @@ the copy they had just repaired. The refusal now names `$bg_lib`.
 out"* so that a durable pre-delivery refusal (a dirty worktree, a refusing transport) no longer reads
 `0`. That is the same axis this split moves to `6` — and the two do not overlap: `3` is **"the chain
 would not take it"** (repair it), `6` is **"the GATE measured the box and said not now"** (wait, or
-prune/add capacity). A gate refusal consumes nothing and clears by itself; nothing about it needs
-repairing. The rebase that merged the two kept both statements of the axis in this file.
+prune/add capacity). A gate refusal consumes nothing, and **whether it clears by itself is the AXIS's
+answer, not a property of the code** — `load`/`land-backlog` clear as the box drains, `disk` needs a
+reclaim, `fork` needs a restart from outside; in none of the four is the remedy a repair of the
+transport (`GATE_REFUSAL_ACTION`, and `scripts/test_pr_doctor.py`'s
+`test_the_gate_axis_table_is_the_GATES_own_numbers`). ⛔ So `6` must never be reported with a universal
+*"it clears by itself"* — that sentence is the same class of collapse as the one this change removes,
+written into prose instead of into a counter. The rebase that merged the two kept both statements of
+the axis in this file.
 
 **`3` and `6` are the same sentence in two different worlds (agent-infra#2291).** Both used to be `3`
 with `N order(s) no worker accepted`, because a gate refusal and a transport failure are both

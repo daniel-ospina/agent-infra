@@ -7664,3 +7664,52 @@ def test_the_per_repo_row_says_WAITING_and_a_set_never_lets_6_mask_a_repair():
     assert pr._worst_rc([6, 2]) == 2
     assert pr._worst_rc([6, 4]) == 4
     assert pr._worst_rc([0, 0]) == 0
+
+
+def test_the_AGGREGATE_record_carries_the_no_room_evidence_too(monkeypatch, tmp_path):
+    """⛔ THE CANONICAL FILE IS THE ONE A READER SEES, AND IT HAS A SECOND WRITER (#2291 review, P2).
+
+    `--all-repos` does not inherit the per-repo sidecar: it grades the SET and then writes the
+    canonical `pr-doctor.status.json` ITSELF, from its own `record_exit(...)` call. So the two fields
+    that make a `6` actionable (`no_room`, `no_room_bound`) are RE-STATED by that second call, and
+    without them the machine-wide record carries a `next_action` naming an axis it does not hold —
+    the same collapse one layer up, in the file the beat actually reads.
+
+    This arm exists because the code's own comment claims that property: deleting the two fields from
+    the aggregate `record_exit` used to leave every suite green (measured, review round 1), i.e. the
+    claim had no test. The axis is `disk` on purpose — a `load` default would pass even if the field
+    were hardcoded, and `disk` is one of the two axes whose remedy is NOT "wait".
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "%s=%s,%s=%s" % (_REPO_A, co_a, _REPO_B, co_b))
+    monkeypatch.setattr(pr, "CAPACITY_SH", _fake_capacity(tmp_path, RECORD))
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    # A is quiet (a clean row), B has one order and its box's DISK gate refuses it.
+    monkeypatch.setattr(pr, "open_prs", lambda: [] if pr.REPO == _REPO_A else [_pr(9)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "red", []))
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, dry, *_r: (False, "gate REFUSED rc=77", False, "disk"))
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    assert pr.main() == pr.EXIT_NO_CAPACITY == 6, "\n".join(logs)
+
+    import json as _json
+    with open(pr.STATUS) as fh:
+        agg = _json.load(fh)
+    assert agg.get("rc") == 6, agg
+    assert agg.get("no_room") == 1, agg              # ⛔ the field this arm exists for
+    assert agg.get("no_room_bound") == "disk", agg   # ⛔ ...and the AXIS, never a hardcoded `load`
+    assert agg.get("verdict") == "NO-CAPACITY", agg
+    # The remedy travels with the axis in the aggregate too — this is the field an operator reads.
+    assert "disk" in (agg.get("next_action") or ""), agg
+    assert "reclaim" in (agg.get("next_action") or ""), agg
+    # …and the clean repo did not launder it: the canonical record still names BOTH.
+    assert set(agg["repo"].split(",")) == {_REPO_A, _REPO_B}, agg

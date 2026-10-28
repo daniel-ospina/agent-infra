@@ -3671,8 +3671,7 @@ def _confirm(name: str) -> tuple[str, str, str]:
     `bound` is the GATE's own axis (`load` | `disk` | `land-backlog` | `fork`) for a gate refusal,
     and "" for every other verdict -- INCLUDING a gate refusal that names no capacity axis (80, the
     brief gate: nothing was consumed, but re-authoring the brief is the repair, so it must not read as
-    `NO-CAPACITY`)
-    for every other verdict. It is returned rather than re-derived downstream: the code that
+    `NO-CAPACITY`). It is returned rather than re-derived downstream: the code that
     recognised the refusal is the only one that knows the code it recognised (agent-infra#2291).
 
     A partial `.rc` is never a verdict (see `_RC_RE`): `7` may be the first byte of `75\n`.
@@ -4458,7 +4457,10 @@ def repo_row(slug: str, rc: int, p: dict) -> str:
     # ⛔ 6 JOINS THE TABLE WITH ITS OWN WORD (#2291): "the box said not now" is not "the transport
     # dropped it", and an operator scanning a per-repo table must not be sent to repair a box that
     # only needs to drain. `WAITING` is the vocabulary `docs/ops/self-healing-contract.md` uses for a
-    # refusal that clears by itself; it is NOT a pass, so it never reads as `clean`.
+    # refusal whose remedy is the BOUND's own — waiting for `load`/`land-backlog`, a reclaim for
+    # `disk`, a restart from outside for `fork` — and NOT a repair of the transport; it is NOT a pass,
+    # so it never reads as `clean`. (Do not shorten this to "clears by itself": two of the four axes
+    # do not, and `GATE_REFUSAL_ACTION` is the table that says which.)
     verdict = {0: "clean", 2: "REFUSING", 3: "UNPLACED", 4: "CRASH",
                6: "WAITING"}.get(rc, "RED")
     return ("repo=%-34s open_prs=%-5s unplaced=%-5s dispatched=%-5s verdict=%s rc=%s"
