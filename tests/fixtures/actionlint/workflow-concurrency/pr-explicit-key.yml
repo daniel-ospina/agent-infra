@@ -1,0 +1,16 @@
+# YAML explicit-key syntax for the concurrency block. The reader does not model it, so it must say so
+# (R0) rather than report "no concurrency block" — the block IS there and GitHub honours it
+# (#2660 round 5: round 4 claimed this form was refused and it was not).
+name: PR explicit key
+on:
+  pull_request:
+concurrency:
+  ? group
+  : pr-explicit-key-${{ github.ref }}
+  ? cancel-in-progress
+  : true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

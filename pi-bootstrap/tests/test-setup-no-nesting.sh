@@ -30,9 +30,11 @@ DEST="$HOME_DIR/.pi/agent"
 RUNS_LOG="$TMP/runs.log"
 FAILURES=0
 SRC_MARKER=""                     # set later; guarded in cleanup
+SPEC_FIXTURE=""                   # #2841: a temporary pi-config/extensions entry, guarded in cleanup
 
 cleanup() {
   [ -n "$SRC_MARKER" ] && rm -f "$SRC_MARKER"
+  [ -n "$SPEC_FIXTURE" ] && rm -f "$SPEC_FIXTURE"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -113,13 +115,21 @@ check_content_matches() {
     [ -e "$e" ] || continue
     base="$(basename "$e")"
     case "$base" in
-      *.test.ts) continue ;;
+      *.test.ts|*.spec.ts|*.test.js|*.spec.js) continue ;;
     esac
     for s in "$@"; do
       [ "$s" = "$base" ] && continue 2
     done
     [ -e "$dest_ext/$base" ] || { fail "$label: installed $base missing"; continue; }
-    if diff -rq "$e" "$dest_ext/$base" >/dev/null 2>&1; then
+    # ⛔ The installed copy is EXPECTED to differ from the source in exactly one way:
+    # `setup.sh` sweeps test files OUT of the farm (#1509/#2841), so a nested
+    # `*.test.ts` exists in `extensions/<dir>/` and not in the farm copy. Diffing
+    # without excluding those names indicted a CORRECT copy — measured 2026-10-28,
+    # 34 of this suite's 36 failures were this assertion and every one of them was
+    # false, from the day #2849's sweep landed. The exclusion list is `setup.sh`'s own
+    # executable-test set: one definition, used by the writer and by this assertion.
+    if diff -rq -x '*.test.ts' -x '*.spec.ts' -x '*.test.js' -x '*.spec.js' \
+         "$e" "$dest_ext/$base" >/dev/null 2>&1; then
       echo "ok: $label installed $base == extensions/$base"
     else
       fail "$label: installed $base differs from extensions/$base (stale copy!)"
@@ -1842,6 +1852,38 @@ run_setup_expect_guard_fail() {
 }
 
 # --- run 1: fresh install -------------------------------------------------
+# ── #2841 — the farm must never hold a test file pi would EXECUTE ────────────────
+# Seeded BEFORE the first run because setup.sh's farm is copy-only: what a PREVIOUS
+# run (or any other writer) left behind stays there until the sweep removes it — and
+# pi EXECUTES every top-level `.ts`/`.js` in the farm
+# (`collectAutoExtensionEntries`), so a stale one runs its suite at every session
+# start. The seed covers setup.sh's whole set, not just `*.test.ts`: the pre-#2841
+# guard matched that name alone, while `.spec.ts`, `.test.js` and `.spec.js` are
+# loaded by the same loader.
+#  • leak-nest/inner.test.ts is NESTED: inert to the loader (a subdirectory is
+#    resolved through package.json/index), but still farm junk — the sweep removes it.
+#  • local-testkit.ts is the OVER-DELETE CONTROL: a name that CONTAINS "test" and is
+#    not a test file must SURVIVE. A sweep keyed on `*test*` would pass every removal
+#    assertion below while deleting real local extras from the farm.
+#  • leak-nest/node_modules/dep/parse.test.js is the WALK's over-delete control: a
+#    THIRD-PARTY test inside an installed dependency. `npm install` put it there and
+#    never re-extracts it, and the loader skips `node_modules` (so does check 6's
+#    nested arm), so the sweep must PRUNE it rather than delete it. Measured
+#    2026-10-28: 169 of this farm's 232 name-matching files sat under `/node_modules/`.
+mkdir -p "$DEST/extensions/leak-nest" "$DEST/extensions/leak-nest/node_modules/dep"
+for leak in stale.test.ts stale.spec.ts stale.test.js stale.spec.js leak-nest/inner.test.ts; do
+  : > "$DEST/extensions/$leak"
+done
+: > "$DEST/extensions/local-testkit.ts"
+: > "$DEST/extensions/leak-nest/node_modules/dep/parse.test.js"
+
+# Same defect through the COPY-LOOP half (not just the sweep): a farm-source entry
+# named `*.spec.ts` must never be copied into $DEST. `pi-config/extensions` ships no
+# spec file today, so this is the only way to exercise that arm — a temporary REAL
+# file there (the #93 marker below uses the same trick) removed by the trap.
+SPEC_FIXTURE="$ROOT/pi-bootstrap/pi-config/extensions/zz-setup-test-2841.spec.ts"
+: > "$SPEC_FIXTURE"
+
 echo "== run 1: fresh install"
 run_setup
 
@@ -1860,6 +1902,32 @@ fi
   || fail "single-file extension not copied (audit-logger.ts missing)"
 check_no_nesting "$DEST" "dest"
 check_no_nesting "$ROOT/extensions" "repo-extensions"
+
+# #2841 — neither half of the guard left a test file in the farm, and neither removed
+# a non-test file (the over-delete control). Asserted on the REAL setup.sh run above,
+# not on the pattern's text.
+for leak in stale.test.ts stale.spec.ts stale.test.js stale.spec.js leak-nest/inner.test.ts \
+            zz-setup-test-2841.spec.ts; do
+  if [ -e "$DEST/extensions/$leak" ]; then
+    fail "#2841: $leak survived setup.sh — pi EXECUTES a top-level .ts/.js in the farm as an extension, so a test file there runs its suite at every session start"
+  else
+    echo "ok: #2841 setup.sh left no $leak in the farm"
+  fi
+done
+if [ -f "$DEST/extensions/local-testkit.ts" ]; then
+  echo "ok: #2841 the over-delete control (local-testkit.ts) SURVIVED — the sweep keys on test-file names, not on 'test'"
+else
+  fail "#2841: local-testkit.ts was deleted from the farm — the sweep over-deletes (a name containing 'test' is not a test file)"
+fi
+# The WALK's over-delete control: a third-party test inside an installed dependency.
+# `node_modules` is not the farm's to sweep — the loader skips it, check 6's nested arm
+# skips it, and npm never re-extracts an already-installed package, so a delete here is
+# permanent damage to the tree (#2841 review).
+if [ -f "$DEST/extensions/leak-nest/node_modules/dep/parse.test.js" ]; then
+  echo "ok: #2841 node_modules is PRUNED — a dependency's own parse.test.js SURVIVED the sweep"
+else
+  fail "#2841: the sweep deleted a test file out of a farm dependency's node_modules — npm will not re-extract it, and the loader never executes it"
+fi
 if [ -L "$DEST/extensions/mcp-client" ]; then
   echo "ok: farm link mcp-client kept"
 else
