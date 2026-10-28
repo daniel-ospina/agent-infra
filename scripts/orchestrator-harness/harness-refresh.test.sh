@@ -2096,6 +2096,64 @@ case "$RQ" in *"after="*s*) ok "…and how long it took (after=<n>s)" ;;
   || bad "requested_at moved from '$AT1' to '$(req_of "$D/O" requested_at)' — the clock reset, so 'pending for days' is unreadable"
 stop_ctrl "$CTRL"
 
+# ⛔ S4: ONLY AN OUTSTANDING `pending` MAY BE HONOURED, AND NEVER A MOVE OUT OF A CLAIM. Without the
+# `prev_req = pending` guard, ANY prior record whose `running=` differs from the current one is certified
+# `honoured` — and a `refused`/`cleared` record's `running=` is a STAMP value, so an identity-SOURCE
+# change with the controller never restarted would be recorded as a restart that HAPPENED. That is the
+# one thing this record's own contract forbids ("Only the process moving can honour a request; a pin or
+# a stamp changing cannot"). Driven by planting a `refused` record whose `running=` is the OTHER commit,
+# then running a cycle in which the box really is current — the strongest possible bait.
+_CASE=$((_CASE+1)); echo "=== S4: a refused record is never certified honoured (only an outstanding pending can be) ==="
+D="$T/s4"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+printf 'restart request=refused reason=running-identity-unprovable requested_at=1700000000 refused_at=1700000060 requested_by=harness-refresh.sh@%s running=%s running_from=stamp:%s pin=%s pending=unprovable actuation=blocked blocked=identity actuator=none\n' \
+  "$(short "$C1")" "$(short "$C1")" "$(short "$C1")" "$(short "$C2")" > "$D/O/state/restart-request"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R4="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+stop_ctrl "$CTRL"
+R4Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R4" in *"relation=current"*) ok "the fixture really is current, so the honoured arm is reachable (the bait is live)" ;;
+              *) bad "the box was not current, so this case proves nothing about the honour guard: $R4" ;; esac
+case "$R4Q" in
+  "restart request=honoured"*) bad "a REFUSED record was certified 'honoured' on an identity-source move — a restart that never happened: $R4Q" ;;
+  "restart request=cleared"*) ok "…a refused record is CLEARED, not honoured — no restart is certified that did not happen" ;;
+  *) bad "unexpected record after a refused prior: $R4Q" ;; esac
+case "$R4Q" in *"reason=no-longer-pending"*) ok "…and the reason says the premise went away, not that the process moved" ;;
+  *) bad "the cleared record does not say why it was cleared: $R4Q" ;; esac
+
+# ⛔ S5: AN `unprovable` CYCLE MUST NOT DISCARD AN OUTSTANDING REQUEST, NOR RESET ITS CLOCK. This branch
+# used to OVERWRITE a `pending` record with `refused`, so one unreadable-identity cycle made the ask
+# VANISH from the file an actuator polls, and the next pending cycle restarted `requested_at` — which the
+# code's own comment forbids ("requested_at is the FIRST ask … never reset the clock"). Reachable with no
+# exotic config: `apply` rewrites the pin, and one unreadable `ps` cycle is enough. Driven through the
+# `PS_BIN` seam, which makes `controller_identity` unreadable while the record is still `pending`.
+_CASE=$((_CASE+1)); echo "=== S5: an unprovable cycle keeps the outstanding request and its clock (PS_BIN unreadable) ==="
+D="$T/s5"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+# The pin-per-commit cell shape the request is recorded on: write the pin (as `cell_case` does) so the
+# cycle reaches the restart-request stage instead of trying to ADVANCE an empty pin.
+printf '%s\n' "$C2" > "$D/cellhome/HARNESS-PIN"; printf '%s\n' "$TREE2" > "$D/pinfile"
+printf '{"commit": "%s"}\n' "$C1" > "$D/O/.agent-infra-stamp.json"
+# The FIRST ask, an hour and a half before this cycle: a reset to `now` must red.
+printf 'restart request=pending requested_at=1600000000 requested_by=harness-refresh.sh@%s running=%s running_from=stamp:%s pin=%s pending=deferred actuation=blocked blocked=lanes lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(short "$C1")" "$(short "$C1")" "$(short "$C1")" "$(short "$C2")" > "$D/O/state/restart-request"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R5="$(O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/pinfile" PS_BIN=/nonexistent/ps \
+      bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$D/cellhome/HARNESS-PIN" --self "$D/O" 2>&1)"
+stop_ctrl "$CTRL"
+R5Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R5" in *"pending=unprovable"*) ok "the fixture really drove the unprovable arm (an unreadable identity)" ;;
+              *) bad "the unprovable arm was not reached, so this case proves nothing: $R5" ;; esac
+case "$R5Q" in
+  "restart request=pending"*) ok "…the outstanding request SURVIVES as request=pending (an actuator polling the file still sees the ask)" ;;
+  "restart request=refused"*) bad "an unprovable cycle OVERWROTE the outstanding request with 'refused' — the ask vanished from the file an actuator polls: $R5Q" ;;
+  *) bad "unexpected record after an unprovable cycle: $R5Q" ;; esac
+[ "$(req_of "$D/O" requested_at)" = 1600000000 ] && ok "…and requested_at is still the FIRST ask (1600000000), not this cycle's now" \
+  || bad "requested_at became '$(req_of "$D/O" requested_at)' — the clock reset, so a long-pending ask reads as a fresh one"
+case "$R5Q" in *"identity=unprovable"*) ok "…and the record still discloses WHY it cannot be proven" ;;
+  *) bad "the pending record does not disclose the unprovable identity: $R5Q" ;; esac
+
 _CASE=$((_CASE+1)); echo "=== B6: the spawn-line token carries WHICH pending state (and stays bare for every other relation) ==="
 D="$T/b6"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'
