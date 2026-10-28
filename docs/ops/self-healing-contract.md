@@ -156,6 +156,16 @@ Two corollaries, both learned the hard way and both encoded below:
   and `cloud-cell-supervisor.sh`'s `worker_census` (`exit 3` when no answer can be had, *"UNKNOWN (exit 3) is
   NOT zero"*).
 
+**And the exit code is a surface, read by POLARITY** (#2710). Where a capability's codes partition
+*verdict* from *refusal*, `0` means *an answer this capability knows how to read* and `2` means *it could
+not answer* — an unknown word included, because an allow-list is the only polarity that cannot leak
+(a deny-list lets an unrecognised conclusion fall through the gap read as a pass). **A non-zero code is
+not automatically a refusal:** `check-deployed-drift.sh` uses `1` for `DRIFT`, a confident answer that
+the bytes differ, and `2` for `UNKNOWN`/cannot-verify; `capacity.sh` uses `1` for a placement refusal
+that is itself the answer. `2` is the fleet's cannot-verify code across `check-deployed-drift.sh`,
+`cycle-record.sh`, `pr-doctor.py` and `objective.py`, so a caller that has learned that one rule can read
+all four. A capability that emits its own vocabulary must still honour it.
+
 ---
 
 ## 3. Per capability
@@ -301,12 +311,27 @@ deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doct
 refusal). ⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's
 `ok` stands and *"a failure only `launchctl list` can witness is a silent failure"*.
 `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
+⛔ **AND `0` IS NOT REACHABLE FROM A PASS THAT REFUSED AN ORDER** (#2710, measured 2026-10-27). A
+worktree refusal that will not clear by waiting (uncommitted work, commits the PR head does not have)
+records a row and a cooldown; until #2710 it did **not** join the `undeliverable` axis, so a pass whose
+only outcome was four such refusals printed `dispatched 0 of 4 queued — refused-recorded=4` and exited
+**0** — this table's own word for "readable, nothing to do" — five times in one day while four PRs sat
+stuck, and each one was cleared by hand. It now exits `3`. ⛔ **AND EVERY PASS THAT COVERS THE ROW, not
+only the one that records it:** the first version of this fix refused on the recording pass and then
+returned to `0` for the 44 minutes of the row's own cooldown, which is the loop the issue is about. A
+`kind: refused` row inside its cooldown therefore counts as undelivered work (a `kind: spawn` row in
+its cooldown is a worker in flight, and stays clean), the row carries its own `refusals` count, and
+after `REFUSAL_ESCALATE_AT` consecutive refusals **at one head** the pass prints `ESCALATE #<n>` naming
+the worktree and the repair — on the verdict line too, not only in the log. A head move starts a new
+episode. The two *causes* (a box with no room vs the transport refusing) still produce different
+responses and are #2291's to separate; what is decided here is that neither may read as a clean pass.
 
 **What repairs it.** Read `read=` and `reason=` from the sidecar, then: `read=transport` +
 `predates the repair kind` → refresh `$O` with `install.sh` (a stale dispatcher silently downgrades
 every repair to a creation spawn). `read=open_prs` + HTTP 404/422 on every PR → **the repo is wrong**
-(`OBJECTIVE_REPO`, §3.7). No process at all → this is the one repair nothing does automatically on a
-cell today: `C5`.
+(`OBJECTIVE_REPO`, §3.7). A row in `refused` state → the worktree it names is not disposable: repair it
+(the refusal text carries the action) and the cooldown clears on the next pass after a dispatch. No
+process at all → this is the one repair nothing does automatically on a cell today: `C5`.
 
 **state.** cell-4: **not running** — `0` processes, log 2 days old, no unit. cell-3/1/Mac: NC.
 RECORDED: on the Mac the launchd job is the only producer, and it cannot traverse `~/Documents`
@@ -318,17 +343,44 @@ without the tmux-pane FDA grant (`fleet-harness-baseline.md` §3.1).
 two readers of one queue cannot disagree (measured 2026-10-16: they disagreed on 4 of 11 PRs, 36%).
 
 **ALIVE vs REFUSING vs IDLE.** ALIVE = one machine-parsed line:
-`OBJECTIVE VERDICT=AT-TARGET|ADVANCING|REGRESSING|FIX-MAIN|GH-RATE-LIMITED|UNKNOWN …`. IDLE is
-`AT-TARGET` (queue depth below `TARGET_PRS`). REFUSING is **`UNKNOWN`**, and `UNKNOWN error=<…>` is the
-shape a *wrong* read takes.
-⛔ **Gap, and it is the epic's defect 2:** the repo is `REPO = os.environ.get("OBJECTIVE_REPO") or
-"daniel-ospina/tortoise"` — the fallback is **silent**, `objective.py` never compares the repo it reads
-with the checkout it stands in, and **it exits 0 with `VERDICT=UNKNOWN`**, so a caller that keys on the
-exit code cannot tell a wrong-repo read from a healthy one. The mismatch control that does exist is in
-the *supervisor* (`OR` derived from the checkout's origin, and an explicit `OR` must match it), not
-here. `C6`.
+`OBJECTIVE VERDICT=AT-TARGET|ADVANCING|REGRESSING|FIX-MAIN|GH-RATE-LIMITED|UNKNOWN repo=<owner/name>
+repo_src=env|checkout|default …`. IDLE is `AT-TARGET` (queue depth below `TARGET_PRS`). REFUSING is
+**`UNKNOWN`** (and `GH-RATE-LIMITED`, which is the same fact about the same tick: the world could not be
+read), and `UNKNOWN error=<…>` is the shape a *wrong* read takes.
+⛔ **The exit code now agrees with the line (#2710; fixed here, was the epic's defect 2).** `0` only for
+a verdict in `READABLE_VERDICTS`; `2` for everything else, including a word this file has never seen
+(the allow-list polarity in §2). Before it, `main()` fell off the end on every path, so
+`VERDICT=UNKNOWN` **exited 0** and the ONE state that means "the read did not happen" was
+indistinguishable, to a launcher, from `AT-TARGET`. ⛔ **And blindness outranks the verdict word:**
+`build()`'s ladder puts `FIX-MAIN` above the blind-queue arm, so a RED main beside an unreadable queue
+printed `VERDICT=FIX-MAIN … queue=UNREADABLE` — a readable word over an unread world. The code refuses on
+any `BLINDNESS_TOKENS` fact whatever word accompanies it; §2's rule, applied where it bites.
+⛔ **The repo is an input with a NAMED source, and a mismatch refuses.** `REPO_DEFAULT`
+(`daniel-ospina/tortoise`) was `OBJECTIVE_REPO or <that literal>`: silent, and never compared with the
+checkout the process stands in — so measured 2026-10-24 an agent-infra doctor read tortoise's check-runs
+for agent-infra's SHAs and GitHub answered `422 No commit found for SHA` for every PR while the log
+looked like a quiet queue. `resolve_repo()` applies the rule the SUPERVISOR already had for `OR`:
 
-**What repairs it.** `UNKNOWN error=…` naming `422 No commit found for SHA` ⇒ set `OBJECTIVE_REPO`;
+- a **declared** repo — `OBJECTIVE_REPO`, then `OR` (which `orch-loop.sh` exports into every child, so a
+  controller cannot be silently re-pointed by whatever cwd its pass inherits) — wins (`repo_src=env`);
+- a checkout that derives a DIFFERENT slug is a NAMED REFUSAL
+  (`error=repo_mismatch(read=…, checkout=… next=…)`) issued **before the first `gh` call**;
+- a declaration that could **not be compared** (deriver missing, `git` unusable) says so on the line as
+  `repo_check=uncompared:<why>` — an inert comparison must not read as a satisfied one;
+- with nothing declared, the checkout you stand in IS the repo (`repo_src=checkout`, derived by
+  `repo-slug.sh`'s `derive_or`, the ONE deriver — never a second parser);
+- and only when nothing is derivable does the default answer, now stamped `repo_src=default` on every
+  line so it can never be silent again. The segment is APPENDED, not prepended: the fleet reads this
+  line through a fixed cut and the `| PR-DOCTOR …` fact is deliberately early.
+⚠️ **Remaining gap, stated narrowly.** The default is made loud, not removed: the Mac's beat runs the
+FARM copy (`~/.pi/agent/scripts/`), which is not a git checkout and carries no `repo-slug.sh`, so on
+that box `repo_src=default` is the expected reading until the farm carries the deriver (named on
+`#2518`). And the module-level `REPO` is still `env or default` for the two importers that supply the
+variable themselves (`pr-doctor.py`, `pr-loop.py`); the CLI is where the contract is enforced.
+
+**What repairs it.** `UNKNOWN error=repo_mismatch(…)` ⇒ unset `OBJECTIVE_REPO` or run from the checkout
+named; `UNKNOWN error=…` naming `422 No commit found for SHA` ⇒ set `OBJECTIVE_REPO`; a
+`repo_src=default` on a box that DOES stand in a checkout ⇒ deploy `repo-slug.sh` with this script;
 `GH-RATE-LIMITED` ⇒ wait (the gh limit layer is doing its job).
 
 **state.** cell-4: present at the pin (`scripts/objective.py`), no consumer running (§3.6).
@@ -521,12 +573,19 @@ harness script lives on the box (the running controller's dir, `$O`, the pin, ev
 `$HOME/orchestrator`), because #1790 measured up to **four** `orch-loop.sh` trees on one cell.
 Pinned in CI by `selftest.sh` (its 15 `check-deployed-drift:` assertions — §5.1) plus a small delta suite
 (`check-deployed-drift.test.sh`, §5.1) for the two things `selftest.sh` does not assert.
-⚠️ **Gap, stated narrowly:** `--surface` DOES read the running controller's directory from the process table
-and compares it — against **`$REF`**. It never compares the running directory against the **PIN**. Measured
-today that skew is real: pin `130638e40658`, running `…/harness/d4ccaf6ee8e6/…orch-loop.sh` — the running
-directory matches an older commit, so a `$REF` comparison reports drift (correct) but cannot say "the pin and
-the runner disagree", which is the state that persists after a pin moves. `scripts/harness-up`'s `exec` row covers
-it (#2286, pinned by `harness-surface.test.sh`); this script does not. `C6`.
+**DECIDED (#2710, item 3 of its scope): `scripts/harness-up`'s `exec` row owns the running-process vs
+PIN question, and this script must not be asked it.** `--surface` DOES read the running controller's
+directory from the process table and compares it — against **`$REF`**. It never compares the running
+directory against the **PIN**, and it should not start: the two are different questions with different
+definitions of the pin (`HARNESS-PIN` is a COMMIT, `HARNESS_PIN_FILE` is a DIRECTORY, and `up` refuses
+unless the pair agrees), and a second implementation of that pair check is exactly the drift
+`repo-slug.sh` exists to end. Measured today the skew is real — pin `130638e40658`, running
+`…/harness/d4ccaf6ee8e6/…orch-loop.sh` — so a `$REF` comparison here reports drift (correct) but cannot
+say "the pin and the runner disagree", which is the state that persists after a pin moves. That answer is
+`scripts/harness-up`'s `exec` row (#2286, pinned by `scripts/harness-surface.test.sh`), which reads the
+running controller's OWN argv and compares that tree's COMMIT with the pin. A reader who needs it asks
+`harness-up`, not `check-deployed-drift --surface`; this row is written down so the next lane does not
+"fix" the absence by adding the second implementation. `C6`.
 
 **What repairs it.** 1 → reinstall from the ref (`deploy-harness.sh`), then re-run. 2 → write the stamp
 / make the dir readable; a missing stamp is not "probably fine". A pin/process skew → restart the
@@ -643,7 +702,8 @@ a shard, and a live count rots on every subsequent PR exactly as a line number d
 | controller cycling | same suite §6/§7 | a two-cycle-stale record is `DEGRADED`, an absent one `ABSENT`, **never HEALTHY** |
 | precedence rule | `scripts/orchestrator-harness/test-gates.sh` | `mp_reason` extracted from the LIVE script: 1 un-owned PR closes the gate, an unreadable count drains |
 | spawn gate | `scripts/orchestrator-harness/spawn-gate.test.sh` | the gate refuses and ledgers |
-| repair actuator | `scripts/test_pr_doctor.py` §10 | `rc=2` has exactly one meaning and **the record always agrees with launchd** |
+| repair actuator | `scripts/test_pr_doctor.py` §10 | `rc=2` has exactly one meaning and **the record always agrees with launchd**; and (#2710) a pass whose only outcome was a durable worktree refusal exits `3`, not `0`, with the row and its repair named once it has refused `REFUSAL_ESCALATE_AT` times in a row |
+| classifier | `scripts/test_objective.py` (the #2710 block) | the exit code agrees with the line by ALLOW-LIST (every refusing verdict, and a word nobody has taught it, exit `2`; the four readable ones exit `0`), a repo/checkout mismatch refuses **before any read**, and every line names `repo=`/`repo_src=` so the silent default cannot come back |
 | deployment provenance | `scripts/orchestrator-harness/selftest.sh` — its deployed-drift block: 24 assertions, 15 of them carrying the `check-deployed-drift:` prefix (the other 9 grade `install.sh`'s stamp writer, its provenance fields, and a git-absent fallback) | through the SHIPPED script: match→0, a dirty source→1, a post-install edit→1, a missing record→2, `commit: UNKNOWN`→2, an unresolvable ref→2, an unknown commit object→2, BEHIND→1, a missing shipped file→1, an extra hand-placed script→1, a failed `mktemp`→2, an unreadable deployed `*.sh`→2 |
 | deployment provenance — **which file** | `scripts/orchestrator-harness/check-deployed-drift.test.sh` **(new here, #2700)** | a **one-byte** difference is `DRIFT` (1) and the report **NAMES that file** (and not the unchanged one); restoring the byte is `OK` (0) again; and the suite asserts its own presence in the shard list |
 | supervisor / reaper / cell surface | `scripts/harness-cohesion.test.sh`, `scripts/orchestrator-harness/install-launchd-durability.test.sh`, `scripts/cloud-cell-supervisor.test.sh` | a drifted copy is NAMED and an unreadable one is BROKEN (2, never OK); a redeploy cannot persistently disable the entrypoint; and a `keys.env` top-level exit cannot turn a failed cell start into a silent success |
@@ -702,6 +762,15 @@ invisible, i.e. `merge-one.sh` and `dispatch-merge.sh`.
   production lacks (a unique `CAP_HOST`, a pre-made record) is the pattern this epic exists to end — so
   a test's fixture seam must be named in its comment as a seam, and the production path named in the
   contract (§3.10).
+- **Two verdicts are deliberately NOT three-valued, and that is a decision, not a gap (#2710, its scope
+  item 5).** `cycle_verdict`'s `HEALTHY` grades *cycling*, not *effect*: a draining box with
+  `dispatched=0` and a named gate is healthy, and §3.1 says so. `admin-merge.sh` has no rc table at all
+  because it acts on ONE PR when asked and has no IDLE state; its refuse/wait split lives in its caller
+  (`lander.sh`, §3.4). ⛔ **Do not "fix" either into a three-valued verdict**: the effect the reader
+  wants is on the FIELDS (`dispatched=`/`nothing=`/`gate:`; the rail's `BLOCK — <reason>`), and a verdict
+  that absorbed a refusal would be the exact defect this contract exists to remove. A capability that
+  does grade effect three-valuedly (`objective.py`, `pr-doctor.py`, `capacity.sh`, `check-deployed-drift.sh`)
+  must do it in BOTH its line and its exit code, per §2's polarity rule.
 
 ---
 
@@ -714,7 +783,7 @@ invisible, i.e. `merge-one.sh` and `dispatch-merge.sh`.
 | **C3** | **#2707** — the fleet view: a per-box identity + a transport that is not partitioned by work repo (and a `cap_place` that refuses to decide on a fleet of one) | C1 | needs a design decision with a measured basis; §3.10 carries the evidence |
 | **C4** | merge precedence — **already shipped** (#2099 / #2126 / #2203), observable, and pinned by `test-gates.sh` | — | **no child filed**: it exists. The epic's "threshold" phrasing is superseded by the #2099 ruling (§6) |
 | **C5** | **#2709** — per-machine parity + activation: `pr-doctor` and a land actuator on every cell, an `auto-rail` that has a source, and one parity surface | C1, C2, #2135, #2345, #1761 | blocked on a read channel (§1.1) and on the cell doctor's own inert role pass |
-| **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | `objective.py` exits 0 on `UNKNOWN` (§3.7) `check-deployed-drift.sh` compares the RUNNING dir to `$REF`, never to the PIN, and a FAILED FETCH still compares a possibly-stale LOCAL ref (warned, and an `OK` on that path proves less than it looks) (§3.14) |
+| **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | **Landed:** `objective.py` (§3.7) and the repair actuator (§3.6) both refuse in the line AND the code, and §3.14 records who owns running-vs-pin. **Still open on this child:** the remaining capabilities' exit codes have not been graded against the §2 polarity rule (each needs its own measurement before it is changed), and `#2291` still owns separating "the box has no room" from "the transport refused" |
 
 Every child carries the same research mandate as the epic: **read
 `~/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md` → run the contradiction test → read the artifacts named

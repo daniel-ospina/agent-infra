@@ -3288,8 +3288,15 @@ def test_an_unread_queue_is_never_cached_even_without_a_gh_claim(monkeypatch, tm
 # same predicate usable elsewhere, in BOTH directions: the shipped default is unchanged, and an
 # explicitly supplied value is honoured.
 def test_the_shipped_default_repo_and_required_set_are_unchanged(monkeypatch):
-    """No consumer that supplies nothing may see a behaviour change: the beat on the laptop reads
-    tortoise, exactly as before."""
+    """No IMPORTER that supplies nothing may see a behaviour change: `REPO` stays tortoise.
+
+    ⛔ WHAT THIS PINS, AND WHAT IT DOES NOT (agent-infra#2710). The MODULE-LEVEL `REPO` is the
+    binding `pr-doctor.py` / `pr-loop.py` read through `classify_one()`, and both supply
+    `OBJECTIVE_REPO` before they exec this file. It is deliberately still `env or default`: binding a
+    repo at import would put a `bash` subprocess on every import and let a test's cwd silently pick
+    its repo. The CLI is where the contract is enforced, and `main()` resolves it -- see
+    `test_the_default_repo_is_LOUD_and_the_checkout_wins_over_it` in the #2710 block below.
+    """
     monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
     monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
     spec = importlib.util.spec_from_file_location(
@@ -3595,3 +3602,268 @@ def test_the_caller_bound_leaves_room_for_the_whole_read(monkeypatch):
         "the re-sample window cannot fit one measured slow read plus the ladder -- #1869's "
         "re-sample would be unreachable on exactly the boxes that need it")
 
+
+
+# ── REFUSAL IS A VERDICT (agent-infra#2710; contract §2, §3.7) ────────────────────────────────────
+# WHY THIS BLOCK EXISTS. `main()` printed its one line and fell off the end for EVERY path, so the
+# process exited 0 even when the line said `VERDICT=UNKNOWN`. Measured: `OBJECTIVE_REPO` naming a
+# repo that does not exist printed `VERDICT=UNKNOWN … queue=UNREADABLE` and exited 0, i.e. the ONE
+# state that means "the read did not happen" was indistinguishable, to any launcher keying on the
+# code, from `AT-TARGET`. These pin the two machine surfaces this file now owes a caller: a code
+# that cannot be read as a pass, and a repo the line NAMES instead of assuming.
+@pytest.fixture(autouse=True)
+def _no_ambient_repo_declaration(monkeypatch):
+    """⛔ A TEST MUST NOT INHERIT THE BOX\'S DECLARED REPO (review round 1, P2).
+
+    `OBJECTIVE_REPO` and `OR` are exported on fleet boxes and by `orch-loop.sh` children. Left in
+    place, `resolve_repo()` reads them, the repo/checkout comparison fires on whatever cwd pytest
+    happens to run from, and a test that claims to exercise "a failed read exits 2" can instead pass
+    through the MISMATCH path -- green while the behaviour it names was never reached -- or go red on
+    a box that exports the variable. Deleting both here makes each repo test state its own inputs.
+    (`test_pr_doctor.py` carries the same isolation for the same reason.)
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.delenv("OR", raising=False)
+
+
+def test_an_UNKNOWN_verdict_EXITS_2_so_no_launcher_can_read_it_as_healthy(monkeypatch, tmp_path,
+                                                                        capsys):
+    """The measured violation, end to end: a failed read must not exit 0.
+
+    The read is stubbed through the same seam every other test uses (GraphQL + REST both refuse), so
+    the verdict really is `UNKNOWN` -- this is not asserting the code table against itself. The
+    checkout derivation is pinned to "nothing derivable" so the MISMATCH path cannot answer instead:
+    an exit-code-only assertion would pass through either route (review round 1, P2).
+    """
+    monkeypatch.setattr(objective, "_checkout_repo", lambda path=None: (None, "underivable"))
+    cache = tmp_path / "objective.last"
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    install(monkeypatch, pr_list=_Result(1, "", "transport wedged"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 97.5, 97.5, 97.5])
+    rc = objective.main()
+    assert rc == objective.EXIT_REFUSING == 2, rc
+    line = capsys.readouterr().out
+    # ⛔ THE PATH THIS TEST NAMES, NOT THE OTHER ONE THAT ALSO EXITS 2.
+    assert "queue_read=UNREADABLE" in line, line
+    assert "repo_mismatch" not in line, line
+    # ⛔ AND THE LINE STILL PRINTS. The heartbeat calls this every tick and must never lose its line
+    # to an exception: the code is a SECOND surface, never a replacement for the first.
+    assert cache.exists() is False, "a refused read must not be cached"
+
+
+def test_a_readable_verdict_exits_0_and_a_refusing_one_exits_2(monkeypatch):
+    """The decision is POLARITY: only a verdict this file knows is readable may exit 0."""
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    for verdict, want in (("AT-TARGET", 0), ("ADVANCING", 0), ("REGRESSING", 0), ("FIX-MAIN", 0),
+                          ("UNKNOWN", 2), ("GH-RATE-LIMITED", 2),
+                          # ⛔ AND A WORD NOBODY HAS TAUGHT THIS FILE YET. An allow-list is the
+                          # only polarity that cannot leak: a documented-verdicts deny-list lets an
+                          # unrecognised conclusion fall through the gap and read as a pass.
+                          ("SOMETHING-NEW", 2), ("", 2)):
+        monkeypatch.setattr(objective, "build", lambda prev=None, v=verdict:
+                            "OBJECTIVE VERDICT=%s main=GREEN@deadbeef" % v if v
+                            else "OBJECTIVE main=GREEN@deadbeef")
+        assert objective.main() == want, (verdict, want)
+
+
+def test_BLINDNESS_outranks_the_verdict_WORD(monkeypatch):
+    """⛔ A READABLE WORD MAY NOT OUTRANK AN UNREAD WORLD (review round 1, P2 -- reproduced).
+
+    `build()`\'s ladder puts `FIX-MAIN` ABOVE the blind-queue arm, so a RED main beside an unreadable
+    queue emits `VERDICT=FIX-MAIN … queue=UNREADABLE`. That is a readable claim about a world that
+    was not read, and a caller keying on the code would have taken it as healthy. The verdict word is
+    a statement about the queue; a blindness token is a statement that there was no queue to
+    describe.
+    """
+    line = ("OBJECTIVE VERDICT=FIX-MAIN main=RED@aaaaaaaaa failing_required=python-ci-gate "
+            "queue=UNREADABLE")
+    assert objective.verdict_of(line) == "FIX-MAIN"
+    assert objective.is_blind_line(line) is True
+    assert objective._exit_for(line) == 2
+    # ...and the readable twin, one token away, is still a pass: non-vacuity.
+    assert objective._exit_for(line.replace("queue=UNREADABLE", "waiting=3")) == 0
+
+
+def test_the_default_repo_is_LOUD_and_the_checkout_wins_over_it(monkeypatch):
+    """`repo_src` names WHICH input chose the repo -- the silent default, ended.
+
+    ⛔ THE FALLBACK IS NOT REMOVED, IT IS MADE VISIBLE (agent-infra#2710 scope item 1). Removing it
+    outright would blind the Mac\'s beat, whose farm copy is not a git checkout and carries no
+    deriver; leaving it SILENT is what read tortoise\'s check-runs for agent-infra\'s SHAs for hours.
+    """
+    assert objective.resolve_repo(env="", checkout="")[:3] == (
+        objective.REPO_DEFAULT, "default", "")
+    # ...and an UNDERIVABLE checkout is stated, not assumed away: a default that could not be
+    # compared must not read like one that was.
+    assert objective.resolve_repo(env="", checkout="", checkout_why="deriver-missing")[3] == \
+        "uncompared:deriver-missing"
+
+    # An explicit value is honoured, and NAMED as the source, with the comparison made.
+    assert objective.resolve_repo(env="acme/widget", checkout="")[:2] == ("acme/widget", "env")
+
+    # ⛔ THE PROPERTY THAT WOULD HAVE PREVENTED THE INCIDENT: standing in a checkout, an unset
+    # variable reads THAT checkout -- so no process can silently read another repo again.
+    assert objective.resolve_repo(env="", checkout="acme/widget")[:2] == ("acme/widget", "checkout")
+
+    # An explicit value that DISAGREES with the checkout is a named refusal, not a read.
+    slug, src, refusal, _check = objective.resolve_repo(
+        env="acme/widget", checkout="acme/other")
+    assert (slug, src) == ("acme/widget", "env")
+    assert "repo_mismatch" in refusal, refusal
+    assert "read=acme/widget" in refusal and "checkout=acme/other" in refusal, refusal
+    assert "next=" in refusal, "a refusal carries a NEXT ACTION, not only a reason"
+
+    # ⛔ AND A DECLARATION THAT COULD NOT BE COMPARED SAYS SO (review round 1, P2). Returning a bare
+    # `("", "env")` made an INERT guard read as a satisfied one -- the exact shape this issue is
+    # about -- and made the prescribed remedy ("deploy the deriver") unactionable.
+    assert objective.resolve_repo(env="acme/widget", checkout="",
+                                  checkout_why="deriver-missing")[3] == \
+        "uncompared:deriver-missing"
+
+
+def test_OR_is_a_declaration_too_and_outranks_the_checkout(monkeypatch):
+    """⛔ THE CONTROLLER'S OWN REPO IS AN INPUT (review round 1, P2 -- it was a hole).
+
+    `orch-loop.sh` EXPORTS `OR` -- the repo it grades and dispatches for -- into every child. With
+    only cwd derivation, a controller bound to tortoise whose pass ran with a cwd inside ANOTHER
+    checkout would publish that other repo\'s queue, stamped `repo_src=checkout` (the arm this
+    contract presents as trustworthy) and exiting 0. A declaration outranks the cwd, and a
+    disagreement is the same named refusal.
+    """
+    monkeypatch.setenv("OR", "acme/graded")
+    assert objective.declared_repo() == ("acme/graded", "OR")
+    assert objective.resolve_repo(env=None, checkout="acme/other")[0] == "acme/graded"
+    assert "repo_mismatch" in objective.resolve_repo(env=None, checkout="acme/other")[2]
+    # `OBJECTIVE_REPO` is this file\'s own input and still wins over `OR`.
+    monkeypatch.setenv("OBJECTIVE_REPO", "acme/own")
+    assert objective.declared_repo() == ("acme/own", "OBJECTIVE_REPO")
+
+
+def test_a_REPO_MISMATCH_refuses_BEFORE_any_read(monkeypatch, tmp_path):
+    """The 2026-10-24 measurement: never issue the wrong repo\'s reads and report the 422s.
+
+    ⛔ THE ASSERTION IS "NOTHING WAS READ", NOT "THE CODE IS 2". A mutant that still read the wrong
+    repo would exit 2 anyway (the reads fail, the verdict is UNKNOWN), so an exit-code-only test
+    passes for the wrong reason and cannot see the regression it was written for. The read seam
+    therefore RECORDS instead of raising.
+    """
+    reads = []
+    monkeypatch.setattr(objective, "gh", lambda *a, **k: reads.append(a) or _Result(1, "", ""))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: reads.append("res") or "RES: x")
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "none"))
+    monkeypatch.setattr(objective, "_checkout_repo",
+                        lambda path=None: ("acme/checkout", ""))
+    monkeypatch.setenv("OBJECTIVE_REPO", "acme/other")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    rc = objective.main()
+    assert rc == objective.EXIT_REFUSING == 2, rc
+    assert reads == [], ("a mismatched repo must not be read at all; it was: %r" % (reads,))
+
+
+def test_the_mismatch_line_names_both_slugs_the_repo_and_the_next_action(monkeypatch, tmp_path,
+                                                                        capsys):
+    monkeypatch.setattr(objective, "_checkout_repo", lambda path=None: ("acme/checkout", ""))
+    monkeypatch.setenv("OBJECTIVE_REPO", "acme/other")
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "none"))
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    objective.main()
+    line = capsys.readouterr().out
+    assert "VERDICT=UNKNOWN" in line, line
+    assert "error=repo_mismatch(read=acme/other, checkout=acme/checkout)" in line, line
+    assert "next=" in line, line
+    # ⛔ THE REFUSAL CARRIES THE SAME SEGMENT AS EVERY OTHER LINE (review round 1, P2): the one line
+    # that reports a failed read is exactly where "which repo was this about" matters most.
+    assert "repo=acme/other" in line, line
+    assert "repo_src=env" in line, line
+
+
+def test_a_build_EXCEPTION_line_still_names_the_repo(monkeypatch, tmp_path, capsys):
+    """The failure line is the one place a reader cannot otherwise tell WHICH repo failed."""
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
+    monkeypatch.setattr(objective, "REPO_SRC", "checkout")
+    monkeypatch.setattr(objective, "_checkout_repo", lambda path=None: ("acme/widget", ""))
+    monkeypatch.setattr(objective, "build", lambda prev=None: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "none"))
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    assert objective.main() == 2
+    line = capsys.readouterr().out
+    assert "error=boom" in line, line
+    assert "repo=acme/widget" in line and "repo_src=checkout" in line, line
+
+
+def test_the_line_always_names_the_repo_and_where_it_came_from(monkeypatch):
+    """A reader must be able to tell "tortoise" from "the fallback I was standing in".
+
+    ⛔ AND THE SEGMENT GOES LAST, ON PURPOSE (review round 1, P3). The fleet reads this line through
+    a fixed `cut -c1-900` (`cadence-nudge.sh`), and the `| PR-DOCTOR …` fact is deliberately emitted
+    EARLY so a cut cannot sever it. Prepending a new segment pushed every existing one toward that
+    boundary with no measurement; appending keeps the ordering the file already argued for.
+    """
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
+    monkeypatch.setattr(objective, "REPO_SRC", "checkout")
+    monkeypatch.setattr(objective, "REPO_CHECK", "")
+    assert objective.repo_seg() == "repo=acme/widget repo_src=checkout"
+    # ...and an uncomparable declaration is on the segment, not silently dropped.
+    monkeypatch.setattr(objective, "REPO_CHECK", "uncompared:deriver-missing")
+    assert objective.repo_seg().endswith("repo_check=uncompared:deriver-missing")
+    _stub_reads(monkeypatch, waiting=3, crit_max=5.0)
+    monkeypatch.setattr(objective, "REPO_CHECK", "")
+    line = objective.build()
+    assert line.rstrip().endswith("repo=acme/widget repo_src=checkout"), line[-120:]
+    assert "| PR-DOCTOR" in line.split("repo=acme/widget")[0], (
+        "the dispatcher fact must stay ahead of the appended repo segment: %r" % line)
+
+
+def test_the_deriver_is_SOURCED_and_actually_READS_a_checkout(tmp_path):
+    """⛔ BEHAVIOUR, NOT A STRING (#2710 review round 1, P2 -- the string version was vacuous).
+
+    The first version of this check asserted that `repo-slug.sh`/`derive_or` appear in the file\'s
+    TEXT -- and both words appear in the docstring that explains them, so replacing the whole shim
+    with a second, inline parser left it green. A test for "there is one derivation" has to run the
+    derivation: a real checkout must yield its own slug, and a checkout with no origin must say so.
+    """
+    import subprocess as sp
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "commit.gpgsign=false", "-c", "user.email=a@b",
+           "-c", "user.name=a"]
+    assert sp.run(git + ["init", "-q"], capture_output=True).returncode == 0
+    (repo / "f").write_text("x")
+    assert sp.run(git + ["add", "f"], capture_output=True).returncode == 0
+    assert sp.run(git + ["commit", "-qm", "init"], capture_output=True).returncode == 0
+    assert sp.run(git + ["remote", "add", "origin",
+                         "https://github.com/acme/widget.git"], capture_output=True).returncode == 0
+    assert objective._checkout_repo(str(repo)) == ("acme/widget", "")
+
+    # ...and a checkout with NO origin is underivable, NAMED as such.
+    bare = tmp_path / "no-origin"
+    bare.mkdir()
+    git2 = ["git", "-C", str(bare), "-c", "commit.gpgsign=false", "-c", "user.email=a@b",
+            "-c", "user.name=a"]
+    assert sp.run(git2 + ["init", "-q"], capture_output=True).returncode == 0
+    assert objective._checkout_repo(str(bare)) == (None, "underivable")
+
+
+def test_a_deployment_WITHOUT_the_deriver_says_so_instead_of_guessing(tmp_path):
+    """The farm copy (`~/.pi/agent/scripts/`) has no `repo-slug.sh`: `deriver-missing`, not a guess.
+
+    Two causes, two remedies -- and the reason must reach the LINE (`repo_check=`), or the operator
+    applies "run from the checkout you mean" for ever on a box that is missing the file.
+    """
+    import importlib.util as ilu
+    import shutil as sh
+    src = pathlib.Path(__file__).with_name("objective.py")
+    lone = tmp_path / "scripts"
+    lone.mkdir()
+    sh.copy2(src, lone / "objective.py")          # deliberately NOT the deriver
+    spec = ilu.spec_from_file_location("objective_lone", lone / "objective.py")
+    mod = ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._checkout_repo(str(tmp_path)) == (None, "deriver-missing")
+    _slug, src_kind, refusal, check = mod.resolve_repo(env="acme/widget", checkout=None)
+    assert (src_kind, refusal) == ("env", "")
+    assert check == "uncompared:deriver-missing", check
