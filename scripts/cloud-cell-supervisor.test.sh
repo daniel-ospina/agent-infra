@@ -1092,6 +1092,22 @@ case "$PROV_OUT" in
   *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
   *) bad "status prints the record but not what it means: $PROV_OUT" ;;
 esac
+# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". `harness-refresh.sh`
+# writes `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
+# is a CLAIM, and NOTHING was measured busy there — so the generic blocked sentence named a cause that
+# does not exist and told the operator to wait for a population that may never exist. The identity cause
+# needs its own arm, and it must come first.
+printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=unknown checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 9 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"cannot be PROVEN"*) ok "…an unprovable IDENTITY is explained as such, on its own arm" ;;
+  *) bad "status does not explain an unprovable identity: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — nothing was measured busy, so the message names a cause that does not exist: $PROV_OUT" ;;
+  *) ok "…and does NOT claim an interruption that was never measured" ;;
+esac
 # An ABSENT record is not "nothing pending": no cycle has ever recorded one.
 rm -f "$P/o/state/restart-request"
 prov status

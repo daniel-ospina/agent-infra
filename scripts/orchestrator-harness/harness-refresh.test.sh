@@ -2011,6 +2011,16 @@ mkdir -p "$D/O/state/roles/.reap.lock"; printf '%s|t\n' "$$" > "$D/O/state/roles
 R="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
 [ "$(req_of "$D/O" blocked)" = roles ] && ok "…a live role lock alone makes blocked=roles (the safe verdict is not a constant)" \
   || bad "with a live role lock, blocked=$(req_of "$D/O" blocked), expected roles — $R"
+# ⛔ THE COUNT IS THE NUMBER OF LIVE ROLE PASSES, NOT THE NUMBER OF OUTPUT LINES. `role_pids` prints every
+# owner SPACE-separated on ONE line, so a line count is 1 whenever ANY pass is live — two live passes used
+# to be reported as "1 role pass(es) in flight (pids a,b)". The gate decision (`-gt 0`) was never wrong,
+# so this witnesses the DISCLOSURE, which is what an operator reads to decide whether to wait.
+mkdir -p "$D/O/state/roles/.merge.lock"; printf '%s|t\n' "$$" > "$D/O/state/roles/.merge.lock/own"
+R="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+case "$R" in
+  *"2 role pass(es)"*) ok "…and two live role passes are reported as TWO (a field count, not a line count)" ;;
+  *"1 role pass"*) bad "two live role passes were reported as 1 — ROLE_N counted output LINES, so the count was always 1: $R" ;;
+  *) bad "the record does not name the role count at all: $R" ;; esac
 # ⛔ S2b: AN UNREADABLE / UNSIGNALABLE ROLE POPULATION IS NOT AN EMPTY ONE. `role_pids` ends with a
 # `kill -0 … || continue`, and `kill -0` answers EPERM (rc 1) for a process that EXISTS but that this
 # user may not signal — so a live reap/merge/hygiene pass owned by ANOTHER USER was skipped, the

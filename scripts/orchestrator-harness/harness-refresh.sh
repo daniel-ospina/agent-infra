@@ -818,7 +818,13 @@ REQ=""
 if [ -n "${O:-}" ]; then
   if _roles="$(role_pids)"; then
     ROLE_LIST="$_roles"
-    ROLE_N="$(printf '%s\n' "$_roles" | awk 'NF' | wc -l | tr -d ' ')"
+    # ⛔ COUNT FIELDS, NOT LINES. `role_pids` prints every owner SPACE-separated on ONE line
+    # (`out="$out $pid"` … `printf '%s\n' "${out# }"`), so counting non-empty LINES gives 1 whenever
+    # ANY role pass is live — measured: three live locks produced `ROLE_N=1`, and the operator-facing
+    # prose then read "1 role pass(es) in flight (pids a,b,c)". The gate decision (`-gt 0`) was never
+    # wrong, so this was a disclosure defect only; the count is now the field count, and ROLE_LIST keeps
+    # its space shape because `inflight_gate` renders it with `tr ' ' ','`.
+    ROLE_N="$(printf '%s\n' "$_roles" | awk '{n+=NF} END{print n+0}')"
     case "$ROLE_N" in ''|*[!0-9]*) ROLE_N=0 ;; esac
     ROLES_DISC="$ROLE_N"
   else
@@ -925,8 +931,14 @@ set_pending() { # sets PENDING=inert|unprovable|deferred|safe, and GATE_CODE/GAT
 #   request=cleared    the premise disappeared without the process moving (the box re-pinned, the
 #                     identity became readable, or the controller went away) — said as its own word,
 #                     because "not pending any more" and "the restart happened" are different facts.
-#   request=refused    the loop REFUSES to request one, with the reason: unprovable identity, or no
-#                     live controller to restart. Nothing is asked of any actuator.
+#   request=refused    the loop REFUSES to request one, with the reason: an UNPROVABLE running
+#                     identity. That is the ONLY thing refused, and it is the only reason this word is
+#                     ever written (`grep 'request=refused'` → one writer, `reason=running-identity-unprovable`).
+#                     "No live controller" is NOT a refusal: that state is `inert` above, and it clears an
+#                     outstanding ask as `request=cleared reason=no-live-controller` (or writes nothing at
+#                     all when there was no ask), because nothing is being refused — there is simply
+#                     nothing to restart. An earlier note here listed no-controller as a refusal, which
+#                     contradicted the state list above; corrected.
 # `--print-restart` prints it; `cloud-cell-supervisor.sh status` prints it beside the self-refresh line.
 req_field() { # <name> -> value from the last request record (empty when the record or the field is absent)
   # ⛔ ON A DUPLICATED FIELD THE **LAST** OCCURRENCE ON THE LINE WINS, and that is what this expression

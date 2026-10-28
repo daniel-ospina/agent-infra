@@ -3464,6 +3464,14 @@ cmd_status() {
   if [ -f "$_rq" ]; then
     log_line "restart: $(sed 's/^restart //' "$_rq" 2>/dev/null)"
     case "$(cat "$_rq" 2>/dev/null)" in
+      # ⛔ `blocked=identity` IS ITS OWN CAUSE, AND IT COMES FIRST. The generic blocked arm below says
+      # "something this box can see would be interrupted" — but `harness-refresh.sh` writes
+      # `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
+      # is a CLAIM. Nothing was measured busy there, so the generic sentence names a cause that does not
+      # exist and tells the operator to wait for a population that may never exist — the misdirection this
+      # change exists to remove.
+      *'request=pending'*'blocked=identity'*)
+        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. Nothing is interrupted and nothing is waiting: re-check once the controller's argv/lock is readable." ;;
       *'request=pending'*'actuation=blocked'*)
         log_line "⛔ a restart is PENDING and was NOT applied — something this box can see would be interrupted (named in blocked=/lanes= above). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm, once that population is idle." ;;
       *'request=pending'*'actuation=safe'*)
