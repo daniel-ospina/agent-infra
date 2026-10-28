@@ -1,0 +1,15 @@
+# The same root in the safe direction: the comment on a continuation `cancel-in-progress` value was
+# absorbed, so a CORRECT workflow was refused for `cancel-in-progress: 'true   # yes, really'`
+# (#2660 round 6).
+name: PR cancel continuation comment
+on:
+  pull_request:
+concurrency:
+  group: pr-cancel-continuation-comment-${{ github.ref }}
+  cancel-in-progress:
+    true   # yes, really
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
