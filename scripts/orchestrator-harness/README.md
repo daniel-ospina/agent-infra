@@ -469,6 +469,7 @@ a killed worker cannot take the controller down with it.
 | `logs/` | one log per worker: `lane-*.log`, `lane-merge-<PR>.log` (the lane's merge-loop chain), `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` — `merge-rate.sh` deliberately does NOT count `lane-merge-*.log` as a lane |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
 | `state/capwip.tsv` | one row per cap kill **on every path** — epoch, label, cap seconds, elapsed, exit status, the verdict (`COMPLETE`/`PARTIAL`/`NOTHING-LOST`/`LOST`/`UNSNAPSHOTABLE`) and the snapshot dir (empty where no directory exists). The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
+| `state/lane-end.tsv` | one row per **terminal agent transition, cap or not** (#2834) — epoch, label, exit status, cap flag, the tree verdict (`dirty`/`clean`/`unpushed-only`/`cannot-verify`/`not-a-worktree`/`not-measured`), the rescue (`refs/wip/<slug>`/`nothing`/`FAILED`/`UNAVAILABLE`/`DISABLED`), the local ref that pins the archived commit, and the unpushed-commit count. The exit-path companion to `capwip.tsv`: the cap is not the common termination (`hit its … cap` appeared in **0** of 373 lane logs on the measured session), so without this row a lane that simply ENDED left no trace at all — its report said IN PROGRESS, the branch had no new commit, and the only copy of the work was a scratch worktree a reaper eventually deletes |
 
 ### Why the *reviewer* is a separate process from the *controller*
 
@@ -516,6 +517,31 @@ worker staged, its branch or its stash (it runs `git status --no-optional-locks`
 `git status` refreshes the stat cache under `.git/index.lock` and could make a surviving writer's next
 git command fail on a lock the rescue took), and it calls a backup
 `COMPLETE` only after re-parsing it.
+
+⛔ **AND A LANE THAT ENDS IS ITS OWN FACT TOO (#2834).** The cap is the RARE termination: on one
+measured fleet session of 373 dispatched lanes, `hit its … cap` appeared in **zero** lane logs, while
+**148** worktrees were left holding uncommitted or unpushed work and `origin` held no `refs/wip/*` from
+that session. So `run_agent` now ALSO runs the shipped `scripts/bg-rescue-wip.sh` at the end of EVERY
+invocation — after `wait`, after the cap snapshot, before it returns — and the tool puts the work on
+**origin** under `refs/wip/<branch-slug>` (built with `git commit-tree` through a throwaway index, never
+`git stash`, whose ref is repo-global and whose `pop` can silently drop a PEER lane's entry). Three
+things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
+  * the root is `WIP_PATH` when the caller sets it and `$PWD` otherwise, because `fix-one.sh` `cd`s into
+    the MAIN checkout while the work lives in the fixer's worktree — archiving the wrong tree would be
+    worse than no rescue, since it reports a capture the lane never received;
+  * it costs a network call only when there IS something to save (one `git status` + one `rev-list`
+    otherwise), and it never changes the lane's exit status: a lane's status and the fate of its
+    worktree are different facts;
+  * `unpushed-only` is MEASURED and NAMED but never pushed. The rescue archives uncommitted work by
+    design, `refs/wip/<slug>` is keyed by branch name, and a rescue must never move a branch — so what
+    the exit path owes there is that the fact stops being silent (the commit lives in the repo's object
+    database and survives the WORKTREE being removed; it does not survive the BRANCH being deleted).
+A rescuer that cannot be FOUND is `rescue=UNAVAILABLE` and a loud line naming the homes it searched —
+never a silent skip, which is how an operator's own copy of this call was a no-op for a whole session
+(`cd` before `_HERE` was resolved from a relative `BASH_SOURCE`, so `[ -f … ] && bash …` degenerated to
+`false`). The launcher publishes the verdict in `$D/<name>.end`, so `--status` answers "what happened to
+the work" as well as "what was the exit code":
+`caplane failed rc=143 (cap 1s hit — …) end: tree=dirty rescue=refs/wip/work (refs/wip-local/work@87d4aba)`.
 
 ⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
 `task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
