@@ -159,13 +159,39 @@ case "${1:-}" in
     if [ "${2:-}" = "new-terminal" ]; then printf 'surface:term_host42\n'; exit 0; fi
     ;;
   layout)
-    [ "${CMUX_LAYOUT_RC:-0}" = "0" ] || { echo "cmux: layout apply failed" >&2; exit "${CMUX_LAYOUT_RC}"; }
+    # ⛔ FAIL-ONCE, and WITH A CHOSEN MESSAGE (agent-infra#2404). The measured refusal carried the
+    # daemon's own JSON (`"reason":"database or disk is full"`); an arm that can only make the create
+    # fail cannot drive the message this change exists to stop relaying.
+    if [ -n "${CMUX_LAYOUT_FAIL_ONCE:-}" ]; then
+      if [ -f "$CMUX_LAYOUT_FAIL_ONCE" ]; then rm -f "$CMUX_LAYOUT_FAIL_ONCE"; else : > "$CMUX_LAYOUT_FAIL_ONCE"; printf '%s\n' "${CMUX_LAYOUT_MSG:-cmux: layout apply failed}" >&2; exit "${CMUX_LAYOUT_RC:-1}"; fi
+    fi
+    [ "${CMUX_LAYOUT_RC:-0}" = "0" ] || { printf '%s\n' "${CMUX_LAYOUT_MSG:-cmux: layout apply failed}" >&2; exit "${CMUX_LAYOUT_RC}"; }
     cat >/dev/null 2>&1 || true          # the layout document arrives on stdin
     if [ "${CMUX_NO_ID:-0}" = "1" ]; then printf '{"warnings": []}\n'; exit 0; fi
     # a workspace with NO terminal id: the create half-succeeded, so the refusal must undo it
     if [ "${CMUX_NO_ID_WS:-0}" = "1" ]; then printf '{"workspace_id": "ws_half9"}\n'; exit 0; fi
     printf '{"workspace_id": "ws_%s", "panes": [{"surfaces": [{"terminal_id": "term_%s"}]}]}\n' \
       "${CMUX_WS_SUFFIX:-x}" "${CMUX_WS_SUFFIX:-x}"
+    ;;
+  server)
+    # ⛔ THE GUEST CLI'S `server` VERBS — and the macOS host CLI's ABSENCE of them, which is the other
+    # half of the contract: `cmux server --help` answers `Error: Unknown command 'server'` on this
+    # controller (measured 2026-10-28), so a probe that treated that as "the session is down" would
+    # name an outage on every Mac spawn that failed for any reason.
+    [ "${CMUX_SERVER_UNSUPPORTED:-0}" = "1" ] && { echo "Error: Unknown command 'server'. Run 'cmux --help' for the full command list." >&2; exit 1; }
+    case "${2:-}" in
+      status)
+        [ -n "${CMUX_SERVER_STATUS:-}" ] || { echo "cannot connect to the local server" >&2; exit 1; }
+        printf '%s\n' "$CMUX_SERVER_STATUS"; exit "${CMUX_SERVER_STATUS_RC:-0}" ;;
+      ensure)
+        printf '%s\n' "ENSURE $*" >> "${CMUX_ENSURE_LOG:-/dev/null}"
+        # FAIL-ONCE models the measured flake on cell-3: `ensure` failed once and succeeded on retry.
+        if [ -n "${CMUX_ENSURE_FAIL_ONCE:-}" ]; then
+          if [ -f "$CMUX_ENSURE_FAIL_ONCE" ]; then rm -f "$CMUX_ENSURE_FAIL_ONCE"; else : > "$CMUX_ENSURE_FAIL_ONCE"; echo 'the detached session owner did not become ready' >&2; exit 1; fi
+        fi
+        exit "${CMUX_ENSURE_RC:-0}" ;;
+      *) exit 0 ;;
+    esac
     ;;
   terminal)
     [ "${2:-}" = "close" ] && printf '%s\n' "${3:-}" >> "${CMUX_CLOSED:-/dev/null}"
@@ -2250,6 +2276,107 @@ else
     ck "parse DECLARED BLIND: no 3.x /bin/bash and no docker — the legs cannot see the macOS 3.2 parse class" 0
   fi
 fi
+
+echo
+echo "── R) a create refusal carries the READINGS it took, and recovers the SESSION once (#2404) ──"
+# ⛔ THE MEASURED DEFECT THIS SECTION PINS (cell-3, 2026-11-02, agent-infra#2404). Every spawn was
+# refused with `workspace create failed: {"reason":"database or disk is full"}` on a box whose `/` had
+# 28 G free, whose inodes were 25 % used and whose `~/.cmux` was 37 M. The daemon named a cause it had
+# not checked, the refusal RELAYED IT AS THE REASON, and the reader was sent to `df` while a
+# three-day-old durable session owner stayed unable to allocate a workspace. So: a refusal must carry
+# the readings, must not present the daemon's message as the cause, and — where the reading says the
+# SESSION is the finding — must try the one idempotent recovery once before giving up.
+scenario shortdf
+cat > "$TMP/bin-shortdf/df" <<'SH'
+#!/usr/bin/env bash
+# A volume AT/BELOW the floor: 1000 KB free, and 5 % inodes so only the SPACE arm can fire.
+case "$*" in
+  *"-Pi"*|*" -i"*) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/x 100 100 10 1%% 5 95 5%% /\n' ;;
+  *) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 4000000 3999000 1000 99%% /\n' ;;
+esac
+SH
+chmod +x "$TMP/bin-shortdf/df"
+# The driver: the SHIPPED library, one spawn, the state dir pinned at a fixture so `df`/`du` ALWAYS
+# answer (an unpinned run reads the box's own $HOME and reports UNREADABLE, which would make the
+# measured-value assertions vacuous on a runner that has no ~/.cmux).
+cat > "$TMP/r1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR" "$5"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+export WT_CMUX_STATE_DIR="$5" WT_CMUX_SESSION=cloud WT_SERVER_ENSURE_SLEEP=0
+. "$1"
+wt_spawn "lane-8" "$5" 'printf RAN_OK'; echo "rc=$?"
+SH
+DISKFULL='workspace create failed: {"code":"operation.failed","details":{"operation":"resource.runtime","reason":"database or disk is full"},"message":"database or disk is full"}'
+# (R1) the cell-3 reading itself: volume healthy, owner ANSWERED `status running`, ensure did not help.
+rm -rf "$TMP/OR1" "$TMP/rstate1"; : > "$TMP/ensure1.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure1.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR1" "$TMP/cmuxr1.log" "$TMP/rstate1" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: a create refused on a healthy box still refuses (the spawn is not silently retried into success)" $rc
+case "$out" in *"FALSE CAUSE"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …and the refusal names the daemon's \`database or disk is full\` a FALSE CAUSE, because the volume was measured" $rc
+case "$out" in *"MEASURED on this box"*"free="*"inodes="*"state="*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …carrying the readings it took (free, inodes, state size) rather than a bare claim" $rc
+case "$out" in *"server status=status running"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …including the session owner's own answer, which is what the incident's table reported" $rc
+case "$out" in *"which this probe did NOT verify as the cause: workspace create failed"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …and the daemon's message is LABELLED a claim, not passed off as the reason" $rc
+[ "$(grep -c '^ENSURE server ensure --session cloud' "$TMP/ensure1.log" 2>/dev/null)" = "2" ] && rc=0 || { rc=1; cat "$TMP/ensure1.log"; }
+ck "R1: the recovery ran \`cmux server ensure --session cloud\` TWICE (the measured fail-once flake)" $rc
+case "$out" in *"tried 2 time(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …and the refusal states how many recovery attempts were spent, so the residual is on the record" $rc
+grep -q '^lane-8	' "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null && rc=0 || rc=1
+ck "R1: …and the refusal still reaches the controller's refusal record, under the WORKER's name" $rc
+# (R2) THE RECOVERY MUST EARN ITS PLACE: ensure answers on the retry, the re-attempted create succeeds.
+rm -rf "$TMP/OR2" "$TMP/rstate2"; : > "$TMP/ensure2.log"
+out="$(CMUX_LAYOUT_FAIL_ONCE="$TMP/r2.fail" CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure2.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR2" "$TMP/cmuxr2.log" "$TMP/rstate2" 2>&1)"
+rm -f "$TMP/r2.fail"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2: when the session is the fault, ONE ensure + ONE re-attempt SAVES the spawn (rc=0, not a refusal)" $rc
+grep -qx 'kind=terminal' "$TMP/OR2/state/worker-lane-8" 2>/dev/null && rc=0 || rc=1
+ck "R2: …and the saved worker is RECORDED (a recovered spawn is a real spawn, tracked and reapable)" $rc
+case "$out" in *"RECOVERED lane-8"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2: …with the recovery SAID OUT LOUD, so the box's instability is visible in the log" $rc
+case "$out" in *"REFUSED lane-8"*) rc=1 ;; *) rc=0 ;; esac
+ck "R2: …and NO refusal recorded for a spawn that succeeded" $rc
+[ "$(grep -c 'CMUX layout apply' "$TMP/cmuxr2.log")" = "2" ] && rc=0 || { rc=1; cat "$TMP/cmuxr2.log"; }
+ck "R2: …because the create really WAS attempted twice (the recovery is exercised, not decorative)" $rc
+# (R3) a volume that IS short: the daemon's message is consistent, and RESTARTING A SESSION FREES NOTHING.
+rm -rf "$TMP/OR3" "$TMP/rstate3"; : > "$TMP/ensure3.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure3.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-shortdf" "$TMP/OR3" "$TMP/cmuxr3.log" "$TMP/rstate3" 2>&1)"
+case "$out" in *"IS at or below the floor"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R3: a volume MEASURED short is reported as short (the reading decides, not the daemon's wording)" $rc
+[ ! -s "$TMP/ensure3.log" ] && rc=0 || rc=1
+ck "R3: …and NO recovery is attempted on a short volume (restarting a session frees no space)" $rc
+# (R4) THE macOS HOST CLI: no `server` verb at all. That is not an outage, and must not be called one.
+rm -rf "$TMP/OR4" "$TMP/rstate4"; : > "$TMP/ensure4.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_UNSUPPORTED=1 CMUX_ENSURE_LOG="$TMP/ensure4.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR4" "$TMP/cmuxr4.log" "$TMP/rstate4" 2>&1)"
+case "$out" in *"NO \`server\` verb"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R4: a CLI with no \`server\` verb says exactly that (a missing verb is not a dead session)" $rc
+[ ! -s "$TMP/ensure4.log" ] && rc=0 || rc=1
+ck "R4: …and no ensure is attempted where the verb does not exist" $rc
+# (R5) the operator's off switch: no probe, no recovery, and NO invented readings.
+rm -rf "$TMP/OR5" "$TMP/rstate5"; : > "$TMP/ensure5.log"
+out="$(WT_SESSION_RECOVER=0 CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure5.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR5" "$TMP/cmuxr5.log" "$TMP/rstate5" 2>&1)"
+[ ! -s "$TMP/ensure5.log" ] && rc=0 || rc=1
+ck "R5: \$WT_SESSION_RECOVER=0 takes no probe and no recovery (the operator's stop switch works)" $rc
+case "$out" in *"probe could not run"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R5: …and the refusal says the probe did not run instead of printing an empty 'MEASURED' claim" $rc
+# (R6) THE HAPPY PATH STAYS FREE: a create that answers must not pay for a probe or an ensure.
+rm -rf "$TMP/OR6" "$TMP/rstate6"; : > "$TMP/ensure6.log"
+out="$(CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure6.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR6" "$TMP/cmuxr6.log" "$TMP/rstate6" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R6: a spawn whose create answers succeeds as before (the probe is not on the happy path)" $rc
+[ ! -s "$TMP/ensure6.log" ] && rc=0 || rc=1
+ck "R6: …and it calls NO server verb at all (no cost, no risk on the 1,500-spawn path)" $rc
+grep -c '^CMUX server ' "$TMP/cmuxr6.log" | grep -qx '0' && rc=0 || rc=1
+ck "R6: …verified on the CLI's own call log, not on the module's prose" $rc
 
 echo
 echo "── P) the module INITIALISES under bash 3.2 — no heredoc inside a command substitution (#2248) ──"
