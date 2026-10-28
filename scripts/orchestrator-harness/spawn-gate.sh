@@ -1048,6 +1048,15 @@ LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-7200}"
 case "$LANE_BACKSTOP_S" in
   ''|*[!0-9]*|0) LANE_BACKSTOP_S=7200 ;;
 esac
+# ⛔ AND IT IS EXPORTED, because the lane's wall clock is a fact its CHILDREN have to be able to
+# agree with (agent-infra#2888). Two consumers outlive the lane and read this duration for themselves —
+# `chain-merge.sh`'s stale-phase marker ("how long can this lane's merge marker still mean anything",
+# it was a `LANE_TIMEOUT`-or-3300 literal) and `ai-drainer.sh`'s slice window ("how long does a lane
+# hold its rotation window"). Neither sources this file. An unexported variable leaves both reading a
+# number from before the wall was demoted, so a box running with an operator-raised backstop would
+# still have a chain declare a live lane's marker stale. Exporting it makes the override reach them;
+# the two literals that remain carry a test pinning them to this one (lane-bound.test.sh (i0)).
+export LANE_BACKSTOP_S
 #
 # ⛔ RESOLVED, NOT ASSUMED, AND ITS ABSENCE IS LOUD (the `reap_lane_venv_path` pattern below). `$O` is
 # seeded file by file, so a NEW `spawn-gate.sh` can run on a box whose `$O` predates `lane-bound.sh`.
