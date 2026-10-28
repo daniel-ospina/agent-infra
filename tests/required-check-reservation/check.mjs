@@ -28,6 +28,37 @@
 //
 // EXIT: 0 clean · 1 violation · 2 could-not-measure (an unreadable input is NEVER a pass)
 //
+// WHAT THE READER GUARANTEES, EXACTLY. It models a strict SUBSET of YAML: a block `jobs:` mapping,
+// 2-space job keys, 4-space job keys, and a `runs-on:` value that is a scalar, a block sequence, or
+// a flow sequence (single- or multi-line). Every STRUCTURAL line outside that subset — an unmodelled
+// column-0 line, a tab anywhere, an indented line under an inline top-level value, a second `jobs:`,
+// an illegal `key :value`, an indented line at job indent that is not a job start, a `---` — makes
+// the file `could-not-measure` rather than silently skipped. No structural line is ever dropped, so
+// a job cannot hide in the gaps; that is what makes the T2 sweep trustworthy.
+//
+// What is deliberately NOT modelled, and is SKIPPED rather than refused: the BODY of a job (only its
+// 4-space `runs-on:` carries routing — `steps:`/`with:`/`env:` content cannot name a runner) and the
+// body of a top-level key whose value is DEFERRED to its children (`permissions:` + `contents: read`,
+// arm 42). Neither can contain a job, so neither can hide a reservation, and refusing them would red
+// every real workflow.
+//
+// ⛔ The mirror case IS refused: the body of a top-level key whose value is INLINE on the key line
+// (`run-name: |`, `permissions: [`, `permissions: &p`). Exempting those is undecidable here — a
+// malformed header (`run-name: |#x`) and an illegally dedented body are not detectable by first
+// character, and each graded GREEN over a document yaml.safe_load REJECTS. So a legitimate top-level
+// block scalar or multi-line flow is a DELIBERATE OVER-BLOCK (exit 2, arm 47): no workflow in this
+// repo uses one (arm 0 proves the 11 real files stay green) and the refusal names the construct, so
+// the cost of a future one is a fixable message rather than a wrong verdict.
+//
+// ⚠️ RESIDUAL, stated so it is not mistaken for totality: this is NOT a YAML parser, so an INVALID
+// document spelled in a way the subset happens to accept can still grade clean. The consequence is
+// bounded and does not weaken the assertion above — an invalid workflow file does not run at all,
+// and CI grades this file's syntax with actionlint (`scripts/check-workflow-actionlint.sh`), which
+// is the parser of record for validity. The reservation invariant ("no job other than
+// `pipeline-compliance` carries `required-check`") is enforced on every file the reader accepts and
+// was differentially fuzzed against PyYAML with no leak found; validity is actionlint's job, not
+// this file's.
+//
 // Hermetic: no network, stdlib only. Seams (`RC_WORKFLOW_FILE`, `RC_DOC_FILE`, `RC_WORKFLOWS_DIR`,
 // `RC_REPO_ROOT`) exist so the mutation arms in run.sh can point at temp copies.
 
@@ -163,13 +194,24 @@ function parseJobs(file) {
   const TOP_KEY = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:(.*)$/;
   let inJobs = false;
   let sawJobs = false;
+  // A column-0 key whose inline value is ALREADY COMPLETE cannot legally own indented children.
+  // Skipping the children let a line at job indent hide after such a key, and the suite then
+  // certified a document `yaml.safe_load` REJECTS ("mapping values are not allowed here") — the
+  // same green-over-unparseable class the total-coverage rewrite was supposed to end (round 8).
+  let topComplete = false;
   let current = null;
   for (const line of lines) {
-    // A TAB cannot indent YAML, so a tab-led line means the file is not parseable at all — and a tab
-    // is not matched by the space-only job-indent guard, so such a job would be absorbed into the
-    // previous block and vanish from the sweep (VGATE round 6). Refuse the input instead.
-    if (/^\t/.test(line)) {
-      cannot(`${path.basename(file)}: tab-indented line ${JSON.stringify(line)} — YAML cannot be indented with tabs, so this file is unreadable`);
+    // A TAB is not modelled at all. YAML forbids it as indentation/separation, and a tab that is
+    // merely TRAILING or used as a separator is not decidable without tracking quoted scalars and
+    // block-scalar bodies — a first-column-only guard let `runs-on:\tubuntu-latest` and a trailing
+    // tab through as GREEN over files yaml.safe_load REJECTS (VGATE round 8). No workflow in this
+    // repo contains a tab (arm 0 proves it), so the whole character is refused: an actionable
+    // message, never a wrong verdict.
+    if (line.includes("\t")) {
+      cannot(
+        `${path.basename(file)}: tab character in ${JSON.stringify(line.trim().slice(0, 60))} — this ` +
+          `reader models SPACES only, and YAML forbids a tab as indentation or separation. Use spaces.`
+      );
     }
     // A document separator starts a SECOND document; grading the first while a reservation sits in
     // the second certified a tree the reader never read (round 6).
@@ -177,6 +219,16 @@ function parseJobs(file) {
       cannot(`${path.basename(file)}: a '---' document separator — multi-document workflows are not graded`);
     }
     if (/^ /.test(line)) {
+      // Blank and comment lines carry no structure — but they are still part of the job block (the
+      // reservation literal is DECLARED in a comment), so they must reach `current.block` below.
+      if (!/^\s*$/.test(line) && !/^\s*#/.test(line) && topComplete) {
+        cannot(
+          `${path.basename(file)}: indented line ${JSON.stringify(line.trim().slice(0, 80))} under a ` +
+            `top-level key whose value is already on the key line — this reader models a top-level ` +
+            `key as a block mapping (\`key:\` with its body indented), and a block scalar or a ` +
+            `multi-line flow value is not modelled. Refusing to certify a document it cannot follow.`
+        );
+      }
       // An INDENTED line. Outside `jobs:` it belongs to some other top-level key and is not graded;
       // inside `jobs:` it is handled by the job arms below.
       if (!inJobs) continue;
@@ -189,6 +241,16 @@ function parseJobs(file) {
         cannot(
           `${path.basename(file)}: unmodelled column-0 line ${JSON.stringify(line.trim().slice(0, 80))} ` +
             `— refusing to grade a document this reader cannot follow`
+        );
+      }
+      // `key :value` — whitespace before the colon with a value NOT starting at the next space — is
+      // NOT valid YAML (a colon must be followed by whitespace or end-of-line). Modelling it as a
+      // key with an inline value certified a document yaml.safe_load REJECTS (VGATE round 8).
+      const spaced = /^([A-Za-z_][A-Za-z0-9_-]*)(\s+):(.*)$/.exec(line);
+      if (spaced && spaced[3] !== "" && !/^\s/.test(spaced[3])) {
+        cannot(
+          `${path.basename(file)}: ${JSON.stringify(line.trim().slice(0, 60))} — whitespace before ` +
+            `':' requires the value to start with whitespace; this document does not parse`
         );
       }
       if (tk[1] === "jobs") {
@@ -204,12 +266,26 @@ function parseJobs(file) {
         }
         sawJobs = true;
         inJobs = true;
+        topComplete = false;
         current = null;
         continue;
       }
-      // Any other top-level key ends the jobs mapping.
+      // Any other top-level key ends the jobs mapping. Whether it may own indented children depends
+      // on whether its inline value is already complete.
       inJobs = false;
       current = null;
+      const restRaw = stripComment(tk[2]).trim();
+      // ⛔ NO EXEMPTION. A top-level key with ANY inline value cannot own indented children that
+      // this reader will grade. `&`/`!`/`[`/`{` needed closure tracking that was not there (VGATE
+      // round 8); a block scalar looked safe because its children are literal TEXT — but the header
+      // itself can be malformed (`run-name: |#x`) and a scalar's auto-detected content indent can be
+      // DEDENTED illegally, so "children of a block scalar" is not decidable by first character
+      // either. Each of those graded GREEN over a file yaml.safe_load REJECTS. Rather than grow a
+      // YAML parser, the rule is one line: an inline top-level value refuses indented children.
+      // This repo uses no top-level block scalar (arm 0 proves the 11 real files stay green), and
+      // the refusal names the construct, so a future one is a fixable message rather than a wrong
+      // verdict.
+      topComplete = restRaw.length > 0;
       continue;
     }
     // A new top-level key ends the jobs mapping. (Unreachable for the shapes this reader models —

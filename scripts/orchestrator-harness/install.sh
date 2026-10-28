@@ -128,9 +128,37 @@ CYC="${CYC:-240}"
 # silently evaporate the pin — the exact failure the whole SCOPE override exists to prevent.
 [ -z "${SCOPE+x}" ] && SCOPE=auto
 
+# ⛔ THE LABEL IS A SEAM ONLY FOR A SANDBOX (agent-infra#1996). launchd labels are GLOBAL: a plist
+# rendered under a throwaway $HOME still addresses the PRODUCTION job by name when it carries the
+# production label, so `launchctl bootout <sandbox plist>` — and any `-w` verb — reaches the job the
+# box is actually running. A test that answers a production label is therefore a false PASS on the one
+# thing the test exists to prove it is not touching. selftest.sh installs
+# `com.eldato.orchestrator-loop-test`, and `label_guard()` below refuses a non-default label on the
+# invoking user's real $HOME.
+BASE_LABEL="com.eldato.orchestrator-loop"
+# ⛔ THIS LINE STAYS A QUOTED LITERAL. `scripts/test_pr_doctor.py` pins pr-doctor's plist name to it
+# with `^LABEL="([^"]+)"` — written as an expression the pin still MATCHES but then compares against
+# `${LABEL:-$BASE_LABEL}.plist`, i.e. it asserts a name nothing installs and the regression it exists
+# for (a renamed label silently making pr-doctor read capacity 3/4) returns. The sandbox override is
+# therefore a SEPARATE line.
 LABEL="com.eldato.orchestrator-loop"
+[ -n "${LABEL_OVERRIDE:-}" ] && LABEL="$LABEL_OVERRIDE"
+# The OTHER production label: the recovery agent PR #1986 ships (`watchdog.plist.template`). It is
+# listed here so `label_guard` treats it as production too — the guard's rule is about the LIVE jobs,
+# and a second production label that the guard did not know about would be installable from a sandbox.
+PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
+# The invoking user's REAL home, from the passwd database rather than $HOME — that is the whole point
+# of the comparison, and `~user` expansion (not "$HOME") is what supplies it.
+# ⛔ BOTH SIDES CANONICALISED. A raw string compare reads a trailing slash (`HOME=/Users/me/`) as a
+# DIFFERENT home, so a real box reports itself as a sandbox and the guard refuses a production install
+# on the operator's own machine. Physical resolution also matches what launchd does with the path.
+_canon_dir() { ( cd "$1" 2>/dev/null && pwd -P ) || printf '%s' "$1"; }
+REAL_HOME="$(_canon_dir "$(eval printf '%s' "~$(id -un)" 2>/dev/null || true)")"
+HOME_C="$(_canon_dir "$HOME")"
+IS_SANDBOX=0
+[ -n "$REAL_HOME" ] && [ "$HOME_C" != "$REAL_HOME" ] && IS_SANDBOX=1
 # Seconds to wait for the label to show a pid AND for $O/heartbeat to advance after a start. The loop
 # writes the heartbeat at the TOP of every cycle, so a live controller refreshes it within seconds of
 # being launched; 30s is slack for a cold start, not a cycle's worth of work.
@@ -146,6 +174,40 @@ START_TIMEOUT="${START_TIMEOUT:-30}"
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
+
+# ── the LABEL guard: a non-default label is a sandbox seam, never a real install ─────────────
+# ⛔ A FUNCTION, NOT AN INLINE `if`, FOR ONE REASON: the decision has to be DRIVEN by selftest in both
+# directions, and a test that would have to run the installer on the real $HOME to prove the refusal is
+# a test that writes into the operator's LaunchAgents when the guard is broken. The decision is pure —
+# label, HOME, real home — so it is expressed as one and extracted.
+# ⛔ THE RULE IS AN XOR, NOT A HALF (review catch, 2026-10-18): a label is allowed only when it MATCHES
+# the $HOME it will be rendered into — production on the real home, test in a sandbox. Refusing only
+# `test label on the real home` leaves the MILD direction guarded and the one that reaches the live
+# controller open, because launchd resolves the label in the USER DOMAIN and ignores $HOME.
+label_guard() { # <label> <HOME> <real-home> -> 0 allowed, 1 refused (with the reason on stderr)
+  local label="$1" home="$2" real="$3" prod=0
+  case "$label" in "$BASE_LABEL"|"$PROD_WD_LABEL") prod=1 ;; esac
+  [ -n "$real" ] || return 0          # no passwd entry to compare against: nothing to protect
+  # ⛔ AND THE #446 TEST OPT-IN DOES **NOT** LIFT THIS ONE, deliberately. `ELDATO_ALLOW_TEST_HOME=1`
+  # authorises a sandbox HOME for launchd-cycle.sh's guard; it says nothing about WHICH job is
+  # addressed. The two are not the same question, and the whole seam exists because launchd resolves
+  # the label in the user domain and ignores `$HOME`: with the opt-in honoured here, a stray export
+  # would let a throwaway home address the LIVE controller — the exact failure this guard prevents.
+  # A suite that installs into a fixture `$HOME` therefore installs a TEST label (`LABEL_OVERRIDE`),
+  # which is what selftest.sh and install-launchd-durability.test.sh do.
+  if [ "$home" = "$real" ] && [ "$prod" = "0" ]; then
+    printf 'LABEL=%s on the real $HOME (%s): a non-default label is a SANDBOX seam (selftest.sh) — production installs the %s job. Refusing, so a test can never write into the live LaunchAgents.\n' \
+      "$label" "$home" "$BASE_LABEL" >&2
+    return 1
+  fi
+  if [ "$home" != "$real" ] && [ "$prod" = "1" ]; then
+    printf 'LABEL=%s under a non-real $HOME (%s; the real home is %s): a PRODUCTION label is refused outside the real home — launchd resolves the label in the user domain and IGNORES $HOME, so a plist written here still addresses the live controller and a `-w` verb would disable it. Use LABEL_OVERRIDE=<name>-test for a sandbox install.\n' \
+      "$label" "$home" "$real" >&2
+    return 1
+  fi
+  return 0
+}
+case "$LABEL" in ''|*/*|*' '*) die "LABEL='$LABEL' is not a usable launchd label" ;; esac
 
 # ── the launchd lifecycle seam ───────────────────────────────────────────────────
 # ⛔ ONE implementation for THIS job's lifecycle, sourced — never a second copy of the
@@ -170,6 +232,14 @@ case "${1:-}" in
   --uninstall) ACTION=uninstall ;;
   *) die "unknown argument '$1' (accepted: --start, --restart, --uninstall, or no argument)" ;;
 esac
+
+# ⛔ ABOVE THE `--uninstall` BRANCH, WHICH IS THE POINT (review catch, 2026-10-18). `--uninstall`
+# addresses the job BY LABEL, and launchd ignores $HOME — so an uninstall run from a sandbox $HOME
+# carrying the production label would silence the live controller by name: exactly the failure the
+# seam exists to prevent, arriving through the one branch that does not render. The config checks
+# below stay AFTER this branch (an uninstall must not be blocked by a REPO or SCOPE typo it does not
+# use); the label guard cannot follow that rule, because uninstall DOES use the label.
+label_guard "$LABEL" "$HOME" "$REAL_HOME" || exit 1
 
 # ── uninstall ────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = uninstall ]; then
@@ -561,6 +631,18 @@ command -v python3 >/dev/null 2>&1 \
   || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
 python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
   || die "merge-reminder.py is missing or does not parse"
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification, so they take the SAME parse gate: a syntax error in either one installs clean (the
+# files exist, so the loop's startup check does not fire), `python3 $O/check-class.py` exits 1 with
+# stderr discarded, and EVERY PR classifies `V=""` — no merge, no fixer, no reviewer — with no signal.
+# UNGUARDED, like their neighbours: a `[ -f ]` guard made a MISSING file pass a gate that exists to
+# catch a broken one.
+for _py in check-class.py nochk-resolve.py; do
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the NOCHECKS arm ($_py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/$_py" 2>/dev/null \
+    || die "$_py is missing or does not parse — the controller cannot classify a single PR without it"
+done
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -1114,6 +1196,7 @@ sed \
   -e "s|__HARNESS_REPO__|$(esc "$HARNESS_REPO")|g" \
   -e "s|__HARNESS_MATERIALISER__|$(esc "$MAT_FOR_PLIST")|g" \
   -e "s|__O__|$(esc "$O")|g" \
+  -e "s|__LABEL__|$(esc "$LABEL")|g" \
   -e "s|__REPO__|$(esc "$REPO")|g" \
   -e "s|__OR__|$(esc "$OR")|g" \
   -e "s|__SCOPE__|$(esc "$SCOPE")|g" \
@@ -1212,7 +1295,7 @@ SHIPPED="${HARNESS:-$HERE}"
 # absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
 # to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-# BOTH sides of the merge, deliberately, and this is what the UNION of them looks like — the note
+# BOTH sides of this merge, deliberately, and this is what the UNION of them looks like — the note
 # records why, because the asymmetry only existed for one rebase. `nonblocking-dispatch.sh` is main's
 # (the transport pr-doctor dispatches through, #1890); `merged-not-closed.sh` and
 # `check-single-source.sh` are this PR's (the single-source instruments); `live-ownership.sh` (the
@@ -1220,15 +1303,16 @@ DRIFTED=""
 # side alone leaves the installed $O without a file the loop, the dispatcher, or the anti-relapse check
 # calls — a silent drift, not a loud failure — which is why this list is checked at all.
 # ⛔ AND NEITHER LIST IS A SUPERSET OF THE OTHER, WHICH IS WHY THE UNION IS TAKEN EXPLICITLY. The
-# branch added `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890) and
-# `reviewer-preflight.sh` (the #2148 disclosure helper lane.sh calls as `$O/reviewer-preflight.sh`),
-# while origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the
-# derived repo surface, #2040).
+# branch added `lane-merge.sh` (the bounded lane merge loop, #2029) and `merge-rate.sh` (its
+# before/after measurement); origin/main added `live-ownership.sh` (the selection predicate),
+# `repo-slug.sh` (the derived repo surface, #2040), `merge-reminder.py` and `box-status.sh`. Taking
+# either list alone installs a $O missing a file a live path execs — a silent 127, not a loud error.
 # worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
 # verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
 # (a census that reads 0 workers, a reap that cannot prove a kill).
-# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by THREE
-# daemons (`orch-loop.sh`, `fix-one.sh`, `dispatch-merge.sh`), each of which only checks that the
+# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by the
+# controller `orch-loop.sh` and by `dispatch-merge.sh` (#2927 removed `fix-one.sh`'s copy — repair does
+# not read the queue), each of which only checks that the
 # verbs exist — so a stale `$O/ci-queue.sh` passes every interface guard and the box keeps deriving
 # its ceiling with the pre-review runner-count read (the 3x over-permissive one). A sourced module
 # that is not in this list is the drift the list exists to catch.
@@ -1238,6 +1322,17 @@ DRIFTED=""
 # wt-lifecycle.sh is this branch's (#2033 — the worktree residue reap); merge-reminder.py and
 # box-status.sh are main's. The union is taken for the same reason recorded above: neither side is a
 # superset, and taking either alone installs a $O without a file its caller executes.
+# brief-gate.sh (#2258) is the same class, one step sharper: it is the RESEARCH validator that
+# `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh` and `orch-send.sh`/`safe-send.sh`
+# all execute, and a $O copy that predates it makes every one of those refuse (78 = cannot verify) —
+# a whole fleet that cannot dispatch, caused by a half-synced $O. Detecting the divergence here is
+# what turns that into a warning with the cp line instead of a silent, box-wide standstill.
+# merge-reminder.py + box-status.sh arrive from main's side of this merge for the same reason: both are
+# executed by the controller, so a stale $O copy must be DETECTED (the list's whole job) rather than
+# discovered later as a mystery.
+# ⛔ `wt-lifecycle.sh` (#2033) is the sharpest instance of the class: FOUR carriers
+# (`lane.sh`, `fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`) do `. "$SELF/wt-lifecycle.sh" || exit 78`
+# before they materialise anything, so a $O without it is not degraded — it dispatches nothing.
 # ⛔ launchd-controller.sh IS IN THIS LIST BECAUSE ITS STALE BYTES **ARE** THE DEFECT (agent-infra#2098).
 # The installed plist on a Mac runs `/bin/bash $O/launchd-controller.sh`, and that file used
 # `new-session -A -d`, which ATTACHES — impossible for a launchd job — so the job crash-looped for
@@ -1246,7 +1341,14 @@ DRIFTED=""
 # runs (`install.sh`) must say so. The template ALREADY renders `/bin/bash __HARNESS__/launchd-controller.sh`
 # (its `<string>__HARNESS__/__ENTRY__</string>` argument) with `WorkingDirectory __O__` on this head
 # (#2020 lifted it), so this row guards the live file the job executes, not a future flip.
-for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification: `V` is computed by `python3 $O/check-class.py` on every PR, and the NOCHECKS arm runs
+# `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
+# `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
+# startup warning. That is exactly the partial-reseed drift this list exists to catch.
+# gate-policy.sh (#2319) is the same class and is REQUIRED now: every pi-spawning carrier sources it
+# and `exit 78`s without it, so a $O copy predating it stops every lane and every merge on the box.
+for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1262,6 +1364,10 @@ if [ -n "$DRIFTED" ]; then
   warn "  bash '$HERE'/deploy-harness.sh --src '$SHIPPED' --o '$O'   # every shipped file, byte-verified (#2041)";
 fi
 
+# pr-owner-liveness.sh (#2831) is the SAME class and it now owns TWO live decisions: whether a PR
+# reads owned (proof-of-life, with a RELEASE side effect on the worker's lock) and whether a stalled
+# drain opens the issue path. A `$O` copy predating it silently restores the phantom-ownership defect
+# — PRs owned by dead workers, which is the one failure that leaves the box unable to do either job.
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
 # "Which commit is this box running?" had no answer on the deployed laptop. The daemon executes
 # `$O/<script>`, and `$O` (=~/orchestrator) is not a git checkout at all:
@@ -1359,10 +1465,45 @@ prov_classify() {
 }
 
 # 0 = DIRTY, 1 = CLEAN, 2 = CANNOT VERIFY. A `git status` that cannot run is never read as clean.
+# ⛔ PINNED MIRROR of `pin_dirty` in scripts/lib/box.sh (byte-for-byte; drift arm in
+# cloud-cell-supervisor.test.sh §(p3)). Read the ROOT's version for why the predicate is not written
+# twice: a weaker copy here stamped `dirty: false` over a pin the runtime REFUSES.
 prov_dirty() {
-  local out
-  out="$(git -C "$PROV_TREE" status --porcelain -- . 2>/dev/null)" || return 2
-  [ -n "$out" ]
+  local out rc
+  out="$(pin_dirty "$PROV_TREE" .)"; rc=$?
+  [ "$rc" -eq 2 ] && return 2
+  [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+pin_dirty() {
+  local repo="$1" scoped="$2" top out line path keep=""
+  # ⛔ THE TOPLEVEL, because porcelain prints paths relative to the REPOSITORY ROOT even when `repo` is a
+  # subdirectory — and two of the three callers pass the harness SUBDIR (the production convention). A
+  # first version resolved entries against `$repo`, so its tolerance was unreachable there and a
+  # `.DS_Store` read DIRTY to the instruments while the runtime read CLEAN: the round-4 divergence again,
+  # with the fail direction inverted (found by review, round 5).
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 2
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    # ⛔ TOLERATE ONLY **UNTRACKED/IGNORED** DROPPINGS. A TRACKED file named `._x` is part of the pin, so a
+    # MODIFICATION to it must read DIRTY — the name is not the property (found by review, round 5: a
+    # rewritten tracked `._x` read CLEAN). `!!` = ignored, `??` = untracked.
+    case "$line" in
+      '!!'*|'??'*) case "${path##*/}" in
+        .DS_Store|._*) [ -f "$top/$path" ] && [ ! -L "$top/$path" ] && continue ;;
+      esac ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
 }
 
 write_provenance() {
@@ -1489,7 +1630,7 @@ LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 # the command reports success. It is one `-f` test away from being knowable, so it is refused here.
 case "$ACTION" in
   start|restart)
-    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"; ;;
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")"; ;;
 esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
