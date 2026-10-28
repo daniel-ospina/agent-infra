@@ -241,7 +241,19 @@ out4="$(
 GIT_RC4="$(field "$out4" GIT_RC)"; ACQ4="$(field "$out4" ACQ_RC)"; RESULT4="$(field "$out4" RESULT)"
 [ "$GIT_RC4" != "0" ]; ck "C4 [PINNED] a git call on an unresolvable CLAIM_REPO fails (rc='${GIT_RC4}', not 0)" $?
 [ "$ACQ4" = "2" ]; ck "C4 [PINNED] claim_acquire reports an infra failure (rc='${ACQ4}', want 2)" $?
-[ "$RESULT4" = "could not build claim commit" ]; ck "C4 [PINNED] the refusal is the log line the controller emits (got '${RESULT4}')" $?
+# ⛔ THE REFUSAL NOW CARRIES THE REASON (agent-infra#1990). This arm used to pin the BARE string
+# `could not build claim commit` — the shape main's own comment at claims.sh:211-213 assigns to #1990's
+# scope — so pinning it verbatim here would now be pinning the defect: the cause-blind line is what
+# made a total stall read as a healthy queue for six hours. The prefix is still the controller's log
+# line; what must be ADDITIONALLY present is the repo/cwd/git diagnosis.
+case "$RESULT4" in
+  "could not build claim commit — "*) ok "C4 [PINNED] the refusal is the controller's log line, now followed by the reason" ;;
+  *) bad "C4 [PINNED] the refusal is not the controller's log line prefixed with a reason (got '${RESULT4}')" ;;
+esac
+case "$RESULT4" in
+  *"not a readable directory: CLAIM_REPO="*"cwd="*) ok "C4 [PINNED] ...and the reason NAMES the repo and the cwd (#1990)" ;;
+  *) bad "C4 [PINNED] the reason does not name CLAIM_REPO and the cwd (got '${RESULT4}')" ;;
+esac
 # The proof that nothing ran in the caller's cwd: no claim ref of ANY name reached that origin.
 STRAY="$("$REAL_GIT" -C "$R3B" ls-remote origin 'refs/claims/*' 2>/dev/null)"
 [ -z "$STRAY" ]; ck "C4 [PINNED] nothing was pushed to the caller's cwd repo (no silent fall-through)" $?

@@ -7,50 +7,6 @@
 # removed 163 worktrees with zero data loss — but nothing prevented
 # regeneration. This is the reclamation mechanism.
 #
-# ⛔ DURABLE RULE — WHAT MAKES A WORKTREE "FINISHED" (do not re-derive this)
-# -------------------------------------------------------------------------
-# A worktree is FINISHED — and therefore reclaimable regardless of its age —
-# only on EVIDENCE, never on a name and never on a clock:
-#
-#   1. MERGED       its HEAD is an ancestor of the base (`git merge-base
-#                   --is-ancestor <head> <main>`, the same question as
-#                   `git branch --merged origin/main`). The work it exists for
-#                   is on the base, so the checkout is the last copy of
-#                   nothing. This is what makes it reclaimable, and it EXEMPTS
-#                   it from the age floor below. Before the merged exemption,
-#                   the merge was computed and PRINTED but not binding, so the
-#                   binding test was "HEAD older than 7 days": measured
-#                   2026-10-22 over the live 550-worktree tortoise estate, 250
-#                   worktrees failed ONLY on that clock.
-#   2. CLEAN        `git -C <wt> status --porcelain -unormal` is empty — no
-#                   uncommitted and no untracked file, nothing to reason about.
-#   3. NO UNPUSHED  `git rev-list --count HEAD --not --remotes` is 0: no commit
-#                   on HEAD exists on no remote ref. This catches the one shape
-#                   merged-ness cannot: a checkout whose branch already landed
-#                   but which carries a further LOCAL commit on top.
-#   4. NO STASH     the repo-global stash register names no entry for the
-#                   branch. Read as a REGISTER (one bounded read per pass),
-#                   never with `git stash` — see the lane-stash rule below.
-# plus the two standing vetoes: no live process holds the path, and the branch is
-# not an open PR head / live claim.
-#
-# Anything ambiguous is KEPT and the reason is NAMED. An aged-but-unmerged named
-# branch stays reclaimable (its commits survive on the branch ref — `git
-# worktree remove` deletes the CHECKOUT, never a ref), which is the measured
-# #1095 class; gates 2-4 apply to that path too.
-#
-# ⛔ TWO THINGS THIS TOOL MUST NEVER DO
-#   1. NEVER touch a PRIMARY checkout — not the main worktree, not a bare repo,
-#      not the checkout the reaper is running inside. `MAIN_CANON` and
-#      `is_self_or_ancestor` are the only permitted tests for that, and they run
-#      before every other gate.
-#   2. NEVER judge "finished" from a BRANCH NAME (or a path, or a lane slug)
-#      alone. A name is not a ref: `git worktree list` keeps printing
-#      `branch refs/heads/X` after X is force-deleted, and a branch called
-#      `fix-1234` says nothing about whether its work landed. Every verdict here
-#      comes from a git object read — ancestry, a resolving ref, a status byte,
-#      a rev-list count.
-#
 # POLICY CONTRACT (per issue #1095). A worktree is removed ONLY when ALL hold:
 #   * clean        — `git status --porcelain --ignored=traditional -unormal` is
 #                    empty except declared-EPHEMERAL root entries
@@ -84,6 +40,86 @@
 #                    merged/patch-equivalent scratch row keeps the merged floor.
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
+#
+# ── SEVEN-RULE DECISION TABLE (#2721) — every row PRINTS the rule and its proof.
+# A KEEP whose reason does not name the evidence it used is indistinguishable from
+# a bug, and three of the classes below were unprovable for days because the tool
+# could only say "no upstream — cannot prove it is pushed":
+#
+#   1 live holder — a process whose argv names the path, or whose cwd is the path
+#                  or ANY path INSIDE IT (PREFIX, never equality: an exact-match
+#                  test deleted a live lane's checkout while the lane stood in a
+#                  subdirectory of it — #2721, measured)                        => KEEP
+#   2 dirty       — the clean gate: tracked changes, operator data, or a probe
+#                  that cannot be evaluated                                 => KEEP
+#   3 ancestor    — clean + HEAD is an ancestor of `origin/main`: a commit already
+#                  in main cannot be lost (measured: 31 trees, +4.4 GB on cell-1) => REMOVE
+#   4 pr-merged   — clean + a PR for THIS HEAD is `MERGED`, any merge strategy
+#                  (merge / squash / rebase): after a squash the branch head is
+#                  NOT an ancestor of main, and PR state is the only durable
+#                  record that the work landed                                 => REMOVE
+#   5 pr-closed   — clean + PR `CLOSED` without a merge + head not an ancestor.
+#                  Nobody can tell whether that work should land; it is NAMED so a
+#                  human can decide                                              => KEEP
+#   6 no-pr       — clean + no PR matches this head at all: nothing proves the work
+#                  landed ("no PR — cannot prove it is landed"). Past
+#                  REAP_WT_AGED_DAYS the pre-existing #1095 aged rule still
+#                  governs a checkout whose commits survive on a branch            => KEEP
+#   7 too-young   — nothing younger than REAP_WT_MIN_AGE_MINUTES (45) is removable
+#                  by rules 3-4. A lane dispatched minutes ago is detached at
+#                  main and clean FOR EXACTLY THE SAME REASON an abandoned
+#                  checkout is; only time separates them, and the age is the
+#                  YOUNGER of HEAD's commit date and the checkout's own ctime
+#                  (a checkout made minutes ago from an hours-old main has an
+#                  hours-old HEAD — the commit date alone would not have saved
+#                  the 4-minute-old lane this floor exists for)                  => KEEP
+#
+# `rule=P` marks the PRE-EXISTING structural gates that are not one of the seven
+# and keep their own semantics: main checkout, self checkout, `worktree lock`,
+# unreadable path, bare repo, an OPEN PR head, a commit held only by a revocable
+# ref (`refs/remotes/*`, a tag, stash, bisect), a detached HEAD on no ref, and
+# the two gates added by #2541:
+#
+#   P-a NO UNPUSHED  `git rev-list --count HEAD --not --remotes` is REPORTED, and it
+#                    KEEPS nothing. The scope of this gate is a recorded decision and
+#                    it is worth stating in full, because it looks weaker than it is:
+#                      • an UNREADABLE probe is `unpushed-unverifiable` KEEP — a
+#                        question that cannot be answered is not a clear answer.
+#                      • a READABLE count > 0 is carried on the row as `unpushed=N`
+#                        and decides NOTHING. The #1095 policy this file implements
+#                        removes a clean, holder-free, non-open-PR checkout whose
+#                        commits SURVIVE the removal, and it names `refs/heads/*` as
+#                        a survival mechanism ("`git worktree remove` deletes the
+#                        CHECKOUT, never a ref"). An unpushed head's commits are held
+#                        by exactly such a ref, so vetoing them would silently void
+#                        the `branch-retained` class — the measured #1095 aged class,
+#                        re-pinned on main by the seven-rule table (rule 6 keeps the
+#                        row inside its window; past the floor the aged rule still
+#                        governs: "an unmerged head is NOT exempt: there the age floor
+#                        still separates a stale scratch checkout from work in
+#                        progress"). Voiding that is a REOPEN of #1095, not a
+#                        merge-time change, so the number is evidence and not a veto.
+#                      • `landing-proved=1` (ancestry to MAIN_REF, or a MERGED PR whose
+#                        headRefOid IS this commit) skips the probe AND the note: the
+#                        proof already says the commits are held,
+#   P-b NO STASH     the repo-global stash register names no entry for this
+#                    branch. Read as a REGISTER (one bounded read per pass),
+#                    never with `git stash`, because a bare `git stash` mutates
+#                    the stack every lane in the repo shares. An entry whose
+#                    subject names this branch is parked work ⇒ KEEP; an
+#                    UNREADABLE register is `stranded-stash-unverifiable` KEEP
+#                    (a register we cannot read is not a clear register).
+#                    The repo's lane-stash procedure pins to
+#                    `refs/lane/<branch>/stash/<nonce>` and drops the shared
+#                    entry, so gate P-b is a signal, not a proof: the PIN is what
+#                    preserves that work, and `git worktree remove` never touches
+#                    any ref.
+#
+# ⛔ THE TWO PROOFS ARE DIFFERENT CLAIMS. "This tree holds no work" (rules 3-4)
+# is git/PR state. "Nothing is using this tree" (rules 1 and 7) is the process
+# table and time. The rule that deleted a live lane satisfied the first and
+# assumed the second; both are now required, and a read that cannot be
+# established is a KEEP.
 #
 # ⛔ WHAT "FINISHED" MEANS (the durable rule — #1095, #2354). A worktree is
 # finished ONLY when LOCAL evidence proves it: its tree is CLEAN (no work that
@@ -284,12 +320,14 @@
 # WORKTREE, from a terminal, or from launchd.
 #
 # Env seams: GIT_BIN GH_BIN PS_BIN LSOF_BIN RM_BIN REAP_WT_LOG REAP_WT_DRY_RUN
-#   REAP_WT_AGED_DAYS REAP_WT_MERGED_AGE_DAYS REAP_WT_MAX_DAYS REAP_WT_MAIN_REF REAP_WT_NOW_EPOCH
+#   REAP_WT_AGED_DAYS REAP_WT_MERGED_AGE_DAYS REAP_WT_MIN_AGE_MINUTES REAP_WT_MAX_DAYS
+#   REAP_WT_MAIN_REF REAP_WT_NOW_EPOCH
 #   REAP_WT_LIST_TIMEOUT REAP_WT_STATUS_TIMEOUT REAP_WT_PS_TIMEOUT
 #   REAP_WT_CWD_TIMEOUT REAP_WT_GH_TIMEOUT REAP_WT_REMOVE_TIMEOUT
 #   REAP_WT_GIT_TIMEOUT
 #   REAP_WT_BUDGET_SECONDS REAP_WT_ROTATE REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
+#   REAP_WT_MAIN_PROOF (auto|local) REAP_WT_MAIN_PUSH_URL
 # Exit codes: 0 pass completed with nothing failed, 2 usage, 3 fail-closed
 # abort (nothing trusted), 4 pass completed but >=1 removal FAILED.
 # (`remove_one`'s internal 2 — "the checkout changed since classification, it
@@ -314,6 +352,13 @@ REAP_WT_AGED_DAYS="${REAP_WT_AGED_DAYS:-7}"
 # The age floor applied to a MERGED head. 0 = reclaim a merged checkout the same day (see POLICY
 # CONTRACT); set it equal to REAP_WT_AGED_DAYS for the pre-exemption behaviour.
 REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS:-0}"
+# RULE 7 — the minimum age (minutes) of a checkout before ANY removal rule may
+# act on it. A lane dispatched four minutes ago is detached at main and clean for
+# exactly the same reason an abandoned checkout is; only time separates them
+# (#2721: an armed pass deleted a live 4-minute-old lane's checkout). 45 minutes
+# is comfortably longer than a lane's startup (worktree add + uv sync) and short
+# enough not to protect residue past the next hour's pass.
+REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES:-45}"
 # The age floor for a LANE SCRATCH checkout (`wt-*` / `cell-wt-*` at any depth). A dead lane's
 # scratch dir is not the 7-day review surface a named issue branch is: it exists to be thrown away.
 # It still keeps every safety gate (clean / no live holder / no open PR); only the AGE differs.
@@ -339,9 +384,35 @@ REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}"
 # on WHICH row the budget defers (the A7/A15 budget fixtures) pins 0.
 REAP_WT_ROTATE="${REAP_WT_ROTATE:-1}"
 REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}"
-REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT:-1000}"
+# ⛔ THE INVARIANT IS ENFORCED IN run(), NOT LEFT TO EACH CALLER (#2541 review, P2) —
+# see the clamp immediately before lock_acquire.
+# A staleness horizon at or below the pass budget breaks the lock of an owner that
+# is still ALIVE (lock_acquire's age test never consults the budget), and two
+# concurrent ARMED passes each compute PRUNE_BLOCKED for their own pass only — so
+# the one that sees no deferred prunable record runs the path-filterless
+# `git worktree prune`. The budget is only checked BETWEEN records and each removal
+# may then take up to REAP_WT_REMOVE_TIMEOUT plus the prune, so a legitimate pass
+# legitimately overruns its budget by minutes. A shipped unit that set both to 1800
+# was exactly that shape (com.tortoise.worktree-hygiene.plist, the ARMED one), which
+# is why the clamp is here rather than in a comment telling callers to be careful.
+# CLAMP UP (never down), and SAY SO: silently changing an operator's number would
+# hide the misconfiguration instead of reporting it.
+# The bound on ONE batched `gh pr list --state all` read (the whole pass). It must
+# exceed the LARGEST repo's total PR count, or the truncation refusal below fires on
+# every pass and the worktree class becomes a no-op — which is the failure this whole
+# change exists to remove. MEASURED 2026-10-24: daniel-ospina/tortoise has **3,987**
+# PRs across all states, so the old default of 1000 would have refused there forever.
+# `gh` pages past 1000 (`--limit 1200` returned 1200), so the remedy for a bigger repo
+# is this number and not a code change.
+REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT:-5000}"
 REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF:-}"
 REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}"
+# auto = prove "merged into main" against the main the REMOTE reports (ls-remote on the push url);
+# local = the local ref chain only. The suite pins this to `local` for every fixture so no test ever
+# opens a network connection or changes verdict with the host's state.
+REAP_WT_MAIN_PROOF="${REAP_WT_MAIN_PROOF:-auto}"
+# Override the push url the resolved main is read from (tests use a local bare repo).
+REAP_WT_MAIN_PUSH_URL="${REAP_WT_MAIN_PUSH_URL:-}"
 
 # Declared-disposable, reproducible-from-manifest artifacts tolerated at the
 # worktree ROOT. Deliberately narrow — `dist/`, `build/`, `target/`, `.next/`
@@ -396,10 +467,34 @@ LATE_PRESERVE=0
 # remove_one; read by run() so the operator sees WHY, not just "changed").
 REMOVE_SKIP_VERDICT=""
 DEFERRED=0
+# ⛔ A DEFERRED REMOVAL IS NOT A DEFERRED CLASSIFICATION. An armed overrun defers a record whose
+# verdict was ALREADY `remove`, so it was classified and selected; folding it into DEFERRED deflates
+# `preserved = PRESERVE_C - DEFERRED` and makes the SUMMARY line contradict itself. Own counter.
+DEFERRED_REMOVE=0
 WT_TOTAL=0
 REMOVE_C=0
 PRESERVE_C=0
+# Records the pass actually DECIDED (a deferred record never reached classify_one).
+CLASSIFIED_C=0
+# Every preserved reason, space-separated, folded into the SUMMARY line by summary_reasons().
+PRESERVE_REASONS=""
 GH_STATE=unknown
+# RESOLVED_MAIN = the oid the REMOTE reports for its default branch ("" when unprovable), and
+# MAIN_PROOF names which source answered so the report can never claim a proof it did not use.
+RESOLVED_MAIN=""
+MAIN_PROOF="local"
+MAIN_REF_NAME=""
+# Whether the pass's PR-state read (the merged evidence for rules 4-6) could be evaluated at all.
+# `ok` = read and answerable, `na` = no GitHub origin, `unavailable` = the read failed.
+PR_MERGED_STATE="unknown"
+# Rebound after pr_state_load decides whether the read was answerable.
+pr_merged_state_from_gh() {
+    case "$GH_STATE" in
+        ok)  PR_MERGED_STATE="ok" ;;
+        na)  PR_MERGED_STATE="na" ;;
+        *)   PR_MERGED_STATE="unavailable" ;;
+    esac
+}
 START_EPOCH=0
 # A preserve-classified record that git might ALSO consider prunable makes a
 # global `git worktree prune` unsafe (it would deregister a worktree the
@@ -424,6 +519,24 @@ Usage:
   --list          print worktrees and exit
   --help          this text
 
+Decision table (env REAP_WT_MIN_AGE_MINUTES, default 45):
+  1 live holder (argv/cwd PREFIX inside the tree)      KEEP
+  2 dirty / unreadable clean gate                      KEEP
+  3 clean + head is an ancestor of origin/main         REMOVE
+  4 clean + a PR for this head is MERGED                REMOVE
+  5 clean + PR CLOSED unmerged, head not an ancestor   KEEP (named)
+  6 clean + no PR at all                               KEEP (named)
+  7 younger than REAP_WT_MIN_AGE_MINUTES               KEEP
+  P pre-existing structural gates (main/self/locked/open-PR/revocable-ref)
+Every row prints the rule it was decided by and the proof it used.
+
+"main" is read from the remote that PUSHES (REAP_WT_MAIN_PROOF=auto): the
+remote's advertised default branch and its oid, with the local ref chain as
+the fallback. REAP_WT_MAIN_PROOF=local forces the local chain (no network).
+
+The pass ends with ONE machine-readable SUMMARY line (examined/classified/
+remove/preserved/deferred/removed/reasons/main_proof/pr_merged).
+
 `git worktree remove` deletes the CHECKOUT, never the branch — named-branch
 worktrees lose no commits, and this script never runs \`git branch -D\`.
 No disk-savings figure is ever reported (see the header comment).
@@ -435,7 +548,7 @@ EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; log "REAP $*"; }
+log_line() { printf '%s\n' "$*"; log "REAP $*"; }
 log() { printf '%s\n' "$*" >>"$REAP_WT_LOG" 2>/dev/null || true; }
 
 now_epoch() {
@@ -671,6 +784,139 @@ resolve_main_ref() {
         [ $? = 0 ] && { printf '%s\n' "$r"; return 0; }
     done
     printf ''
+}
+
+# ── THE REMOTE'S OWN DEFAULT BRANCH ──────────────────────────────────────────
+# `resolve_main_ref` reads the LOCAL ref chain, which is a cache: `origin/main` can lag the remote by
+# hours, and every rule that proves "merged into main" then proves it against a stale answer. This
+# asks the remote which branch it calls HEAD and what oid that branch carries, and records WHICH
+# source answered in MAIN_PROOF so a row can never claim a proof it did not use.
+#
+# THE PUSH URL, NOT THE FETCH URL: `git ls-remote origin` reads remote.origin.url, while `ls-remote
+# <url>` on the PUSH url is what the operator actually merges into. A repo with two push urls is
+# AMBIGUOUS and claims nothing rather than picking one.
+# `ls-remote --symref <url> HEAD` is asked FIRST so a `master`- or `dev`-default repo is not silently
+# proved against a `main` that does not exist there.
+#
+# Every failure mode sets MAIN_PROOF and leaves RESOLVED_MAIN empty — i.e. no evidence is claimed —
+# and the caller falls back to the local chain. Nothing here can turn an unprovable merge into a
+# removal: `auto-unfetched` means the remote's oid is not in this repository, so no ancestry test can
+# be run against it.
+resolve_remote_main() {
+    local url="" n=0 cand="" oid="" ref="" out rc _u
+    RESOLVED_MAIN=""; MAIN_PROOF="local"; MAIN_REF_NAME=""
+    if [ "$REAP_WT_MAIN_PROOF" = "local" ]; then return 0; fi
+    if [ -n "$REAP_WT_MAIN_PUSH_URL" ]; then
+        url="$REAP_WT_MAIN_PUSH_URL"
+    else
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" remote get-url --push --all origin
+        rc=$?
+        if [ "$rc" != 0 ]; then MAIN_PROOF="unavailable"; return 0; fi
+        while IFS= read -r _u; do
+            [ -n "$_u" ] || continue
+            n=$((n + 1)); url="$_u"
+        done <"$GIT_OUT"
+        [ "$n" = 0 ] && { MAIN_PROOF="unavailable"; return 0; }
+        [ "$n" = 1 ] || { MAIN_PROOF="ambiguous"; return 0; }
+    fi
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-main.XXXXXX")" || { MAIN_PROOF="unavailable"; return 0; }
+    cand="$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}" \
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" ls-remote --symref "$url" HEAD 2>/dev/null \
+        && sed -n 's/^ref: \(refs\/heads\/[^[:space:]]*\).*/\1/p' "$out" | head -1)"
+    [ -n "$cand" ] || cand="$(printf '%s\n' refs/heads/main refs/heads/master)"
+    while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}" \
+            run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" ls-remote "$url" "$ref"
+        rc=$?
+        if [ "$rc" != 0 ]; then MAIN_PROOF="unavailable"; break; fi
+        oid="$(awk -v r="$ref" '$2 == r { print $1; exit }' "$out" 2>/dev/null)"
+        [ -n "$oid" ] && break
+    done <<EOF
+$cand
+EOF
+    rm -f "$out"
+    if [ -z "$oid" ]; then MAIN_PROOF="unavailable"; return 0; fi
+    MAIN_REF_NAME="$ref"
+    # The remote answered, but its oid must be IN this repository before any ancestry test can use
+    # it. `auto-unfetched` claims no evidence, and does NOT silently fall back to a stale local tip.
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" cat-file -e "${oid}^{commit}"
+    if [ "$?" != 0 ]; then
+        MAIN_PROOF="auto-unfetched"
+        return 0
+    fi
+    RESOLVED_MAIN="$oid"; MAIN_PROOF="auto"
+    return 0
+}
+
+# is_ancestor_of_main <sha> — true when <sha> is reachable from the main this pass resolved.
+#
+# The resolved remote oid is tried FIRST and the local ref chain SECOND. Both are tried because the
+# two can legitimately disagree (an unfetched remote tip, a repo with no remote at all), and a
+# disagreement must never read as "not merged": that is the direction that PRESERVES, which is safe,
+# but it also means a squash-landed checkout stays for a week. Trying both is what keeps the answer
+# about the commit rather than about which source happened to be consulted.
+is_ancestor_of_main() {
+    local sha="$1" t rc
+    [ -n "$sha" ] || return 1
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$t"
+        rc=$?
+        [ "$rc" = 0 ] && return 0
+    done <<EOF
+${RESOLVED_MAIN}
+${MAIN_REF}
+EOF
+    return 1
+}
+
+# ancestry_proof_text <sha> — the command that ACTUALLY proved the merge, for the row.
+#
+# ⛔ A ROW MUST CITE THE PROOF IT TOOK, and `is_ancestor_of_main` takes whichever of the two
+# candidates answers first: the RESOLVED REMOTE oid, then the local ref chain. Printing
+# `merge-base --is-ancestor <sha> ${MAIN_REF:-<no-main-ref>}=0` unconditionally is therefore a
+# citation that can be FALSE — on exactly the cell this resolution was written for (a stale local
+# tracking ref, where the remote oid is the one that answered, and the local ref returns 1), and with
+# no local ref at all the row even read `<no-main-ref>=0`. A removal row whose stated proof cannot be
+# reproduced is the "cite a proof it did not take" class, in the destructive path.
+#
+# So the proof is RE-TAKEN here, in the same order, and the ref that answered is the one printed.
+# Prints NOTHING when no candidate answers: the caller must then PRESERVE — a proof that cannot be
+# retaken removes nothing. (Rule 3 only fires after `commits_survive` saw it succeed, so that arm is
+# a guard against the repository changing under the pass, not a normal path.)
+ancestry_proof_text() {
+    local sha="$1" t
+    [ -n "$sha" ] || return 0
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$t"
+        [ "$?" = 0 ] && { printf 'merge-base --is-ancestor %s %s=0' "$sha" "$t"; return 0; }
+    done <<EOF
+${RESOLVED_MAIN}
+${MAIN_REF}
+EOF
+    return 0
+}
+
+# ancestry_candidates_text — the refs the ancestry test actually TRIED, for a row that says "not in main".
+# A row that names only the LOCAL ref is wrong on the cell the remote resolution exists for: with
+# `main_proof=auto` and no usable local tracking ref it read `<no-main-ref>` for a non-ancestry that was
+# established against the resolved remote oid. Same list, same order, as the test itself.
+ancestry_candidates_text() {
+    local out="" t
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        out="${out}${out:+,}${t}"
+    done <<EOF
+${RESOLVED_MAIN}
+${MAIN_REF}
+EOF
+    printf '%s' "${out:-?}"
 }
 
 # ── probes ─────────────────────────────────────────────────────────────
@@ -975,13 +1221,35 @@ clean_gate() {
     fi
 }
 
-# pr_head_refs_load — ONE batched call for the whole pass, with an explicit
-# limit: `gh pr list` defaults to --limit 30, so a branch whose open PR sits
-# beyond the first 30 would be a FALSE PASS on the exact class the issue
-# preserved. Only a github.com origin can have PRs; anything else is N/A.
+# pr_state_load — ONE batched call for the whole pass, with an explicit
+# limit: `gh pr list` defaults to --limit 30, so a branch whose PR sits beyond
+# the first 30 would be a FALSE PASS on the exact class the issue preserved.
+# Only a github.com origin can have PRs; anything else is N/A.
+#
+# ── WHY THIS READS `--state all` AND `headRefOid` (#2721) ────────────────────
+# The gate used to read ONLY open PR heads, as a veto. "Merged into main" was
+# provable only through ancestry, and a SQUASH merge makes the branch head a
+# non-ancestor of main, so a fully landed checkout was indistinguishable from an
+# abandoned one. Measured on this fleet: `/tmp/cell-wt-p9555b` — clean, its PR
+# #9862 MERGED — was logged `no upstream — cannot prove it is pushed` for days
+# while the box sat at 2.3 GB free; removing it freed 6004 MB.
+# The same read decides rules 4 (MERGED => REMOVE), 5 (CLOSED => KEEP + name)
+# and 6 (no PR => KEEP + name), so it must carry `state`. `headRefOid` is what
+# lets a DETACHED head — which has no branch name to match — be matched to the
+# PR that carried its commit.
+# TRUNCATION IS A REFUSAL (#2756 review). `--state all` spends one limit on
+# every state, so a repo with a long merged history can exhaust it; gh then
+# returns the newest N rows and silently drops the rest, and an absent row is NOT
+# "no PR": inside the floor that is rule 6 (KEEP), past it the aged rule
+# (REMOVE). A live branch's checkout would be reaped on a list that never
+# contained it, so a row count AT the limit fails the gate closed (exit 3).
 GH_OK=0
 PR_APPLICABLE=0
-PR_REFS=""
+# PR_ROWS — "headRefName\theadRefOid\tSTATE\tnumber", one row per PR, from ONE
+# `gh pr list --state all` call. Looked up by `pr_row_best`, never grepped: a
+# branch can own more than one PR (closed, then reopened; closed then merged as
+# a new PR), and resolving that by row ORDER would be a coin toss.
+PR_ROWS=""
 # ⛔ WHY THE OPEN-PR GATE COULD NOT BE EVALUATED, AS A TOKEN RATHER THAN A GUESS, and the sentence
 # that says what to DO about it. The abort used to say "gh unavailable or the origin-remote probe
 # failed" — naming two causes it could not distinguish, while the one that actually happens on a cell
@@ -1000,7 +1268,7 @@ github_slug() {
         *) printf '' ;;
     esac
 }
-pr_head_refs_load() {
+pr_state_load() {
     local slug="" out rc url_rc
     if [ -n "$REAP_WT_REPO_SLUG" ]; then
         slug="$REAP_WT_REPO_SLUG"
@@ -1049,8 +1317,9 @@ pr_head_refs_load() {
         return 1
     }
     run_bounded "$REAP_WT_GH_TIMEOUT" "$out" \
-        "$GH_BIN" pr list --repo "$slug" --state open --limit "$REAP_WT_PR_LIMIT" \
-        --json headRefName --jq '.[].headRefName'
+        "$GH_BIN" pr list --repo "$slug" --state all --limit "$REAP_WT_PR_LIMIT" \
+        --json headRefName,state,number,headRefOid \
+        --jq '.[] | [(.headRefName // ""), (.headRefOid // ""), (.state // ""), (.number|tostring)] | @tsv'
     rc=$?
     if [ "$rc" != 0 ]; then
         rm -f "$out"; GH_OK=0
@@ -1075,10 +1344,84 @@ pr_head_refs_load() {
         log "GH pr-list failed (rc=$rc) for $slug — fail-closed (reason=$PR_SKIP_REASON)"
         return 1
     fi
-    PR_REFS="$(cat "$out")"
+    # Normalise before storing: a producer that emits a BARE head ref (one field)
+    # is the pre-#2721 `--state open --json headRefName` shape, and that shape
+    # MEANT an open PR. Reading such a row as "state unknown" would silently
+    # disable the open-PR veto for anyone still driving this seam, which is
+    # fail-OPEN. Anything else that is not four fields is dropped (it cannot be
+    # resolved to a state, and rule 6 keeps the checkout) — never guessed.
+    # ── TRUNCATION IS A REFUSAL, NOT A KEEP (#2756 review, P1) ────────────
+    # `--state all` spends ONE limit on every state, so the cheapest way to
+    # exhaust it is a repo with a long history of merged PRs. When that happens
+    # gh returns the NEWEST N rows and silently drops the rest — and the row it
+    # drops can be an OPEN PR, which is the veto this read exists for. A row that
+    # is merely ABSENT is not evidence of "no PR": rule 6 would keep it inside the
+    # floor and the aged tail would REMOVE it past the floor, i.e. a live branch's
+    # checkout reaped on a truncated list. So a row count at the bound means the
+    # gate could not be evaluated — the same fail-closed verdict as an unreadable
+    # `gh` (exit 3, nothing removed), never a pass.
+    local nrows
+    nrows="$(grep -c . "$out" 2>/dev/null || true)"
+    case "$nrows" in ''|*[!0-9]*) nrows=0 ;; esac
+    if [ "$nrows" -ge "$REAP_WT_PR_LIMIT" ]; then
+        rm -f "$out"; GH_OK=0; GH_STATE="truncated"; PR_ROWS=""
+        PR_SKIP_REASON="gh-pr-list-truncated(limit=$REAP_WT_PR_LIMIT)"
+        PR_SKIP_REMEDY="this repo has at least ${REAP_WT_PR_LIMIT} PRs across ALL states, so gh returned only the newest and an absence is no longer evidence. Raise REAP_WT_PR_LIMIT above the repo's total PR count (daniel-ospina/tortoise measured 3,987 on 2026-10-24; the default is 5,000), or reap the repo by hand"
+        log "GH pr-list TRUNCATED at limit=$REAP_WT_PR_LIMIT for $slug (rows=$nrows) — fail-closed: an absent PR is not evidence"
+        return 1
+    fi
+    PR_ROWS="$(awk -F'\t' '
+        NF >= 4 && $1 != "" { print; next }
+        NF == 1 && $1 != ""  { printf "%s\t\tOPEN\t\n", $1 }
+    ' "$out")"
     rm -f "$out"
     GH_OK=1; GH_STATE="ok"
     return 0
+}
+
+# pr_row_best <column> <value> -> "STATE\tNUMBER\tOID" of the most DECISIVE PR
+# that matches, or "" when none does. Decision order is OPEN > MERGED > CLOSED:
+# an OPEN PR must veto a removal, and a branch that was closed unmerged and
+# later merged must read as landed. Two PRs on one head ref are normal (a
+# reopened or re-landed change), so the row order decides nothing.
+#
+# ⛔ THE OID IS RETURNED, AND IT IS NOT DECORATION (#2756 review, P0). A branch
+# NAME is reused: after `feat/x` lands, the next lane may check `feat/x` out
+# again and commit new work, with no PR yet. Matching on the name alone then
+# finds the OLD MERGED PR and "proves" UNLANDED work disposable. The caller must
+# require `headRefOid == this HEAD` before a MERGED row may remove anything —
+# GitHub durably holds the PR's head sha, so that equality is what makes both
+# the removal and the revocable-ref waiver sound.
+pr_row_best() {
+    [ -n "$PR_ROWS" ] || return 0
+    awk -F'\t' -v c="$1" -v v="$2" '
+        $c == v {
+            rank = ($3 == "OPEN") ? 3 : ($3 == "MERGED" ? 2 : ($3 == "CLOSED" ? 1 : 0))
+            if (rank > best) { best = rank; st = $3; num = $4; oid = $2 }
+        }
+        END { if (best > 0) printf "%s\t%s\t%s\n", st, num, oid }' <<<"$PR_ROWS"
+}
+pr_state_for_ref() { pr_row_best 1 "$1"; }
+pr_state_for_sha() { pr_row_best 2 "$1"; }
+
+# path_ctime <path> -> the path's inode-change time in epoch seconds, or "" when
+# it cannot be read. RULE 7's second witness (#2721): HEAD's COMMIT date is not
+# the checkout's age — a checkout created minutes ago from an hours-old main has
+# an hours-old HEAD, which is exactly how a 4-minute-old lane was classified as
+# aged. Portable without a capability probe: GNU `stat -c %Z` first, BSD
+# `stat -f %c` second; anything non-numeric (a `--help` on a stat that does not
+# know the flag) is an unusable witness, never a zero.
+#
+# REAP_WT_TREE_TS supplies an ALREADY-MEASURED witness (a caller that probed the
+# tree, or a test that needs the floor deterministic). It is validated at startup
+# (run()), because a typo here would silently remove the witness and leave rule 7
+# measuring HEAD's commit date only — the exact hole this witness closes.
+path_ctime() {
+    local p="$1" ts=""
+    if [ -n "${REAP_WT_TREE_TS:-}" ]; then printf '%s\n' "$REAP_WT_TREE_TS"; return 0; fi
+    ts="$(stat -c %Z "$p" 2>/dev/null)" || ts=""
+    case "$ts" in ''|*[!0-9]*) ts="$(stat -f %c "$p" 2>/dev/null)" || ts="" ;; esac
+    case "$ts" in ''|*[!0-9]*) printf '' ;; *) printf '%s\n' "$ts" ;; esac
 }
 
 # commits_survive <sha> <branch> -> prints the survival mechanism, or "" when
@@ -1088,14 +1431,11 @@ pr_head_refs_load() {
 # pruning it can orphan that commit (verified).
 commits_survive() {
     local sha="$1" branch="$2" merged=0 containing="" revocable="" rc=0
-    if [ -n "$MAIN_REF" ] && [ -n "$sha" ]; then
-        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
-            "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$MAIN_REF"
-        rc=$?
-        [ "$rc" = 0 ] && merged=1
-        # ANY other outcome (1 = not an ancestor, 124 = timeout, 128 = unknown
-        # object) leaves merged=0 and the arms below decide. Nothing here can
-        # turn an unverifiable merge into a removal on its own.
+    if [ -n "$sha" ]; then
+        # The RESOLVED main first, the local ref chain second (see is_ancestor_of_main). ANY outcome
+        # other than 0 (1 = not an ancestor, 124 = timeout, 128 = unknown object) leaves merged=0 and
+        # the arms below decide. Nothing here can turn an unverifiable merge into a removal on its own.
+        if is_ancestor_of_main "$sha"; then merged=1; fi
     fi
     if [ "$merged" = 1 ]; then printf 'merged\n'; return 0; fi
 
@@ -1335,29 +1675,84 @@ rotate_records() {
         awk -v o="$off" 'NR>o{print} {a[NR]=$0} END{for(i=1;i<=o;i++) print a[i]}'
 }
 
+# abstain_gate <path> <branch> <refs> <landing-proved> — the two gates of #2541
+# that OUTRANK A REMOVAL and NOTHING ELSE. Returns 0 having PRINTED the preserve
+# row when the row must be kept; returns 1 when the removal may proceed.
+#
+# ⛔ WHY "OUTRANK A REMOVAL" AND NOT "OUTRANK EVERY RULE": a generic veto placed
+# before rules 5/6 does not protect anything — it RENAMES those rows, and it voids
+# the classes main's own suite pins (a CLOSED PR row must read pr-closed-unmerged, a
+# no-PR row must read no-pr, and an aged no-PR checkout must stay reclaimable, the
+# recorded #1095 decision). So the gates decide only the rows that are otherwise
+# being DELETED, and `landing-proved=1` (ancestry to MAIN_REF, or a MERGED PR whose
+# headRefOid IS this commit) exempts a row from the unpushed arm entirely: its
+# commits are held by a ref this tool cannot lose, so "unpushed" is not evidence of
+# anything. Without that exemption the routine squash-merge shape (merge + branch
+# auto-delete + `fetch --prune`, so the tracking ref is GONE while the work is
+# provably landed) would be frozen forever.
+abstain_gate() {
+    local path="$1" branch="$2" refs="$3" proved="${4:-0}" hit unp
+    # A stash register entry naming this branch is the most specific evidence of
+    # parked work there is, and an UNREADABLE register fails closed.
+    case "$STASH_STATE" in
+        unreadable)
+            printf 'preserve\tstranded-stash-unverifiable\t\trule=P proof=stash-register:unreadable cannot read the stash register — a register we cannot read is not a clear register\n'
+            return 0 ;;
+    esac
+    if hit="$(stranded_stash_for "$branch")"; then
+        printf 'preserve\tstranded-stash\t\trule=P proof=stash-register:%s the stash register holds work for %s\n' "${hit%%$'\t'*}" "${branch#refs/heads/}"
+        return 0
+    fi
+    [ "$proved" = 1 ] && { UNPUSHED_NOTE=""; return 1; }
+    if ! unp="$(unpushed_ahead "$path")"; then
+        printf 'preserve\tunpushed-unverifiable\t\trule=P proof=git rev-list --count HEAD --not --remotes:unreadable cannot evaluate whether this head is pushed — abstaining\n'
+        return 0
+    fi
+    # ⛔ IT DOES NOT VETO AN UNPUSHED HEAD, AND THAT IS A RECORDED DECISION, not an
+    # omission. The #1095 policy this file implements removes a clean, holder-free,
+    # non-open-PR checkout whose commits SURVIVE the removal, and it names
+    # `refs/heads/*` as the survival mechanism ("`git worktree remove` deletes the
+    # CHECKOUT, never a ref"). An unpushed head's commits are held by exactly such a
+    # ref, so vetoing them would silently void the whole `branch-retained` class the
+    # policy exists to reclaim — measured on the live estate as the #1095 aged class
+    # (48 rows), and re-pinned in main by the seven-rule table (#2721: rule 6 keeps
+    # the row inside the window, and past the floor the aged rule still governs).
+    # Reversing that is a REOPEN of #1095, not a merge-time change, so this gate
+    # REPORTS the count (`unpushed=N` travels on the removal row) and decides nothing.
+    # What it does keep is the fail-closed ABOVE: a probe that cannot be evaluated is
+    # not a clear answer, and an unanswerable question never removes anything.
+    UNPUSHED_NOTE=""
+    [ "$unp" = 0 ] || UNPUSHED_NOTE=" unpushed=$unp"
+    return 1
+}
+
 # classify_one <path> <sha> <branch> <flags> <now>
 # Emits one row: "<verdict>\t<reason>\t<ephemeral>\t<detail>" (ephemeral is
 # third so the free-text detail, which may embed a path containing a tab, is
 # absorbed by cut -f4-).
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
-    local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
-    case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trecord had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
-    if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\tbare repository\n'; return 0; fi
+    local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf proof_txt=""
+    local head_ts tree_ts witness wname age_s young age_floor aged_note
+    local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor no_pr_proof
+    local unp stash_hit
+    UNPUSHED_NOTE=""
+    case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trule=P proof=worktree-list --porcelain record had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
+    if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\trule=P proof=worktree-list bare repository\n'; return 0; fi
     { [ -e "$path" ] || [ -L "$path" ]; } && exists=1
     canon="$(canonicalize "$path")"
 
     if [ -n "$canon" ] && [ "$canon" = "$MAIN_CANON" ]; then
-        printf 'preserve\tmain-checkout\t\t%s\n' "$canon"; return 0
+        printf 'preserve\tmain-checkout\t\trule=P proof=worktree-list:first-entry %s\n' "$canon"; return 0
     fi
     if [ -n "$canon" ] && is_self_or_ancestor "$canon"; then
-        printf 'preserve\tself-checkout\t\tcontains the reaper cwd (%s)\n' "$SELF_CWD_CANON"; return 0
+        printf 'preserve\tself-checkout\t\trule=P proof=cwd-prefix:%s contains the reaper cwd\n' "$SELF_CWD_CANON"; return 0
     fi
     # `locked` is checked BEFORE the gone-directory branch, deliberately: git
     # itself refuses to prune a locked record, so a locked worktree whose
     # checkout has vanished is still a PRESERVE — classifying it `prunable`
     # would claim (and count) a removal git will not perform.
-    case ",$flags," in *,locked,*) printf 'preserve\tworktree-locked\t\tgit worktree lock is set\n'; return 0 ;; esac
+    case ",$flags," in *,locked,*) printf 'preserve\tworktree-locked\t\trule=P proof=worktree-list:locked git worktree lock is set\n'; return 0 ;; esac
     if [ -z "$canon" ]; then
         # `canonicalize` failing means "cannot resolve", NOT "directory gone":
         # an existing-but-inaccessible checkout must never be treated as prunable
@@ -1371,24 +1766,24 @@ classify_one() {
         # else (unresolvable parent, or a leaf that is still there) is
         # `unreadable-path`: preserve, and prune-blocked.
         if [ "$exists" = 1 ]; then
-            printf 'preserve\tunreadable-path\t\texists but cannot be resolved (permissions?)\n'; return 0
+            printf 'preserve\tunreadable-path\t\trule=P proof=stat:present,realpath:failed exists but cannot be resolved (permissions?)\n'; return 0
         fi
         parent="$(canonicalize "$(dirname "$path")")"
         leaf="${path##*/}"
         if [ -z "$parent" ] || [ -e "$parent/$leaf" ] || [ -L "$parent/$leaf" ]; then
-            printf 'preserve\tunreadable-path\t\tcannot prove the checkout is absent (unresolvable parent: %s)\n' "${parent:-<none>}"
+            printf 'preserve\tunreadable-path\t\trule=P proof=parent:%s lacks the leaf; cannot prove the checkout is absent (unresolvable parent: %s)\n' "${parent:-<none>}" "${parent:-<none>}"
             return 0
         fi
         refs="$(commits_survive "$sha" "$branch")"
         case "$refs" in
             remote-only-ref:*|revocable-ref:*)
-                printf 'preserve\t%s\t\tsha %s is held only by %s (checkout already gone); that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`), so pruning the record would ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${refs#*:}"
+                printf 'preserve\t%s\t\trule=P proof=for-each-ref --contains %s sha %s is held only by %s (checkout already gone); that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`), so pruning the record would ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${sha:-?}" "${refs#*:}"
                 return 0 ;;
             '')
-                printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref (checkout already gone) — pruning the record would ORPHAN it\n' "${sha:-?}"
+                printf 'preserve\tdetached-unreachable\t\trule=P proof=for-each-ref --contains %s:no-ref sha %s is on no ref (checkout already gone) — pruning the record would ORPHAN it\n' "${sha:-?}" "${sha:-?}"
                 return 0 ;;
         esac
-        printf 'remove\tprunable\t\tcheckout already absent; commits survive via %s\n' "$refs"
+        printf 'remove\tprunable\t\trule=P proof=git-worktree-prunable(directory already absent) commits-survive-via=%s\n' "$refs"
         return 0
     fi
 
@@ -1407,7 +1802,7 @@ classify_one() {
             log "STALE-SHELL pid=$detail (argv) — an idle shell predating HEAD is not a live lane (#2721)"
             continue
         fi
-        printf 'preserve\tlive-process\t\tpid %s holds the path\n' "$detail"; return 0
+        printf 'preserve\tlive-process\t\trule=1 proof=ps-argv:pid=%s holds the path\n' "$detail"; return 0
     done
     _seen=""
     while detail="$(live_cwd_for "$canon" "$path" "$_seen")"; do
@@ -1417,7 +1812,7 @@ classify_one() {
             log "STALE-SHELL pid=$detail (cwd) — an idle shell predating HEAD is not a live lane (#2721)"
             continue
         fi
-        printf 'preserve\tlive-cwd\t\tpid %s has cwd inside the path\n' "$detail"; return 0
+        printf 'preserve\tlive-cwd\t\trule=1 proof=lsof-cwd-prefix:pid=%s has cwd inside the path\n' "$detail"; return 0
     done
     # A demoted holder is carried into the row, so a reader can see WHY a checkout that looked live
     # was reclaimed — and can tell a genuine idle-shell demotion from a lane that was still working.
@@ -1429,72 +1824,98 @@ classify_one() {
     cpay="${crumb#*$'\t'}"
     case "$cverdict" in
         clean) eph="$cpay" ;;
-        dirty)            printf 'preserve\tdirty\t\t%s\n' "$cpay"; return 0 ;;
-        ignored-artifact) printf 'preserve\tignored-artifact\t\t%s\n' "$cpay"; return 0 ;;
-        status-timeout)   printf 'preserve\tstatus-timeout\t\t%s\n' "$cpay"; return 0 ;;
-        *)                printf 'preserve\tstatus-error\t\t%s\n' "$cpay"; return 0 ;;
+        dirty)            printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s\n' "$cpay"; return 0 ;;
+        ignored-artifact) printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
+        status-timeout)   printf 'preserve\tstatus-timeout\t\trule=2 proof=git-status:timeout %s\n' "$cpay"; return 0 ;;
+        *)                printf 'preserve\tstatus-error\t\trule=2 proof=git-status:error %s\n' "$cpay"; return 0 ;;
     esac
 
-    refs="$(commits_survive "$sha" "$branch")"
-    case "$refs" in
-        remote-only-ref:*|revocable-ref:*)
-            printf 'preserve\t%s\t\tsha %s is held only by %s — that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`); removing the checkout would then ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${refs#*:}"
-            return 0 ;;
-        '')
-            printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref — removing would orphan it\n' "${sha:-?}"
-            return 0 ;;
-    esac
-
-    if [ "$PR_APPLICABLE" = 1 ] && [ "$branch" != "-" ]; then
-        local bn="${branch#refs/heads/}"
-        if [ -n "$PR_REFS" ] && grep -qxF -- "$bn" <<<"$PR_REFS"; then
-            printf 'preserve\topen-pr\t\tbranch %s is an open PR head\n' "$bn"; return 0
-        fi
-    fi
-
-    # ── gates 3 and 4 of the DURABLE RULE ──────────────────────────────
-    # These sit AFTER every cheap gate (so the probes only run on rows that
-    # could actually be removed) and BEFORE the age floor (so no clock can
-    # reach a row that these two would keep).
-    local unp
-    if ! unp="$(unpushed_ahead "$path")"; then
-        printf 'preserve\tunpushed-unverifiable\t\tcannot read the unpushed-commit probe — abstaining\n'; return 0
-    fi
-    if [ "$unp" != 0 ]; then
-        printf 'preserve\tunpushed-commits\t\t%s commit(s) on HEAD exist on no remote ref\n' "$unp"; return 0
-    fi
-    case "$STASH_STATE" in
-        unreadable)
-            printf 'preserve\tstranded-stash\t\tthe stash register could not be read — abstaining (a register we cannot read is not a clear register)\n'; return 0 ;;
-    esac
-    if detail="$(stranded_stash_for "$branch")"; then
-        printf 'preserve\tstranded-stash\t\tthe stash register holds work for branch %s: %s\n' "${branch#refs/heads/}" "$detail"; return 0
-    fi
-
-    local head_ts
+    # ── RULE 7's witnesses, computed BEFORE any removal rule can act ─────
     # A hung commit-graph read must not wedge the pass: the budget is only
     # checked between records, so this probe is watchdosed and a failure is
     # `unreadable-head` (PRESERVE).
     if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
         "$GIT_BIN" -C "$REPO_CANON" log -1 --format=%ct "$sha"; then
-        printf 'preserve\tunreadable-head\t\tcannot date HEAD %s (probe failed or timed out)\n' "${sha:-?}"
+        printf 'preserve\tunreadable-head\t\trule=P proof=git log -1 --format=%%ct %s:probe-failed cannot date HEAD %s\n' "${sha:-?}" "${sha:-?}"
         return 0
     fi
     head_ts="$(head -1 "$GIT_OUT" 2>/dev/null)"
     case "$head_ts" in
-        ''|*[!0-9]*) printf 'preserve\tunreadable-head\t\tcannot date HEAD %s\n' "${sha:-?}"; return 0 ;;
+        ''|*[!0-9]*) printf 'preserve\tunreadable-head\t\trule=P proof=git log -1 --format=%%ct %s:unparseable cannot date HEAD %s\n' "${sha:-?}" "${sha:-?}"; return 0 ;;
     esac
-    # The age floor is a proxy for "work may still be in progress". A MERGED or
-    # PATCH-EQUIVALENT head is the proof it is not (the change is on main and the
-    # tree is clean), so both are exempt unless an operator pins the blanket floor.
-    # A lane SCRATCH checkout (`wt-*` / `cell-wt-*`) takes its own, shorter floor:
-    # it is a throwaway dir, not a named branch awaiting review (#2354).
-    local age_floor="$REAP_WT_AGED_DAYS"
+    # The checkout's OWN ctime is the second witness (path_ctime): a checkout
+    # created minutes ago from an hours-old main has an hours-old HEAD, so the
+    # commit date alone does not measure the tree's age. The YOUNGER of the two
+    # decides, because "young" is the safe direction. A timestamp in the FUTURE
+    # of the pass clock cannot witness age (it would make every checkout
+    # infinitely young, and the reaper would then reclaim nothing at all), so it
+    # is ignored rather than trusted.
+    witness="$head_ts"; wname="head-commit"
+    tree_ts="$(path_ctime "$path")"
+    case "$tree_ts" in
+        ''|*[!0-9]*) : ;;
+        *) if [ "$tree_ts" -le "$now" ] && [ "$tree_ts" -gt "$witness" ]; then
+               witness="$tree_ts"; wname="worktree-ctime"
+           fi ;;
+    esac
+    age_s="$((now - witness))"
+    young=0
+    [ "$age_s" -lt "$((REAP_WT_MIN_AGE_MINUTES * 60))" ] && young=1
+
+    # ── RULES 4/5/6: PR state, from the pass's ONE batched read ──────────
+    # The branch name is the natural key; a DETACHED head has none, so its
+    # commit sha is matched against the PR's headRefOid instead. That is what
+    # makes a squash-merged checkout provable at all: after a squash the branch
+    # head is NOT an ancestor of main, and the PR is the only durable record
+    # that the work landed. `PR_APPLICABLE=0` (no GitHub origin) means these
+    # rules cannot be evaluated and the pre-existing aged policy decides —
+    # never rule 6, which would be a claim about a state nobody read.
+    local pr_rest=""
+    pr=""; pr_state=""; pr_num=""; pr_oid=""; pr_key=""; pr_other=""
+    if [ "$PR_APPLICABLE" = 1 ]; then
+        if [ "$branch" != "-" ]; then
+            pr="$(pr_state_for_ref "${branch#refs/heads/}")"
+            pr_key="head-ref ${branch#refs/heads/}"
+            if [ -n "$pr" ]; then
+                pr_state="${pr%%$'\t'*}"; pr_rest="${pr#*$'\t'}"
+                pr_num="${pr_rest%%$'\t'*}"; pr_oid="${pr_rest#*$'\t'}"
+                # A MERGED row whose head is NOT this commit names OTHER work on a
+                # reused branch name. It is not evidence about this head: forget it
+                # (keeping the name for the row's note) and let the sha lookup answer.
+                if [ "$pr_state" = "MERGED" ] && [ "$pr_oid" != "$sha" ]; then
+                    pr_other="$pr_key"; pr=""; pr_state=""; pr_num=""; pr_oid=""
+                fi
+            fi
+        fi
+        if [ -z "$pr" ] && [ -n "$sha" ]; then
+            pr="$(pr_state_for_sha "$sha")"
+            pr_key="head-sha ${sha:0:12}"
+        fi
+        if [ -n "$pr" ]; then
+            pr_state="${pr%%$'\t'*}"; pr_rest="${pr#*$'\t'}"
+            pr_num="${pr_rest%%$'\t'*}"; pr_oid="${pr_rest#*$'\t'}"
+        fi
+    fi
+    subj="head ${sha:0:12}"
+    [ "$branch" != "-" ] && subj="branch ${branch#refs/heads/}"
+    prnum_note=""
+    case "$pr_num" in ''|*[!0-9]*) : ;; *) prnum_note=" (#$pr_num)" ;; esac
+
+    refs="$(commits_survive "$sha" "$branch")"
+
+    # ── THE AGE FLOOR, computed ONCE before any removal rule can act.
+    # Three inputs, in this order (#1095, #2354, #2721):
+    #   1. a MERGED head (an ancestor of MAIN_REF) needs no review floor at all;
+    #   2. PATCH-EQUIVALENCE to MAIN_REF (`git cherry`, #2354) is the squash signal
+    #      and lifts the floor exactly like `merged`. It is NOT a survival proof —
+    #      see the ⛔ block in the header — so it never appears in `refs=`;
+    #   3. a LANE SCRATCH checkout (`wt-*` / `cell-wt-*`) is a throwaway dir, so its
+    #      floor is CAPPED at REAP_WT_SCRATCH_AGE_DAYS. The cap only ever LOWERS.
+    # `too-young` (rule 7) is a separate, harder minimum applied on top.
+    age_floor="$REAP_WT_AGED_DAYS"
     case "$refs" in
         merged) age_floor="$REAP_WT_MERGED_AGE_DAYS" ;;
         *)
-            # A landed-but-squashed head: the change is on main, so the review floor has nothing
-            # left to protect — same treatment as `merged`, decided by evidence, not by ancestry.
             if patch_equivalent "$sha"; then
                 age_floor="$REAP_WT_MERGED_AGE_DAYS"
                 log "CLASSIFY patch-equivalent $path head=$sha"
@@ -1503,19 +1924,170 @@ classify_one() {
     if [ "$REAP_WT_SCRATCH_AGE_DAYS" -lt "$age_floor" ] && is_scratch_path "$path"; then
         age_floor="$REAP_WT_SCRATCH_AGE_DAYS"
     fi
-    if [ "$((now - head_ts))" -le "$((age_floor * 86400))" ]; then
-        printf 'preserve\ttoo-recent\t\tHEAD age %sd ≤ %sd (%s)\n' "$(((now - head_ts) / 86400))" "$age_floor" "$refs"
+
+    # ── rule=P: an OPEN PR outranks every removal rule. Unchanged, and it is
+    # still a VETO rather than a vote: an open PR means the branch is live work
+    # by definition, whenever the last commit was made.
+    if [ "$pr_state" = "OPEN" ]; then
+        printf 'preserve\topen-pr\t\trule=P proof=gh-state %s is an open PR head%s\n' "$subj" "$prnum_note"; return 0
+    fi
+    case "$refs" in
+        remote-only-ref:*|revocable-ref:*)
+            # A revocable ref is not a survival mechanism (F3/#1104). A MERGED PR
+            # IS one — GitHub durably holds the commit's head sha — but ONLY when
+            # that PR's head IS this commit: a reused branch name can match a PR
+            # for older work whose sha GitHub holds and THIS checkout's does not
+            # (#2756 review, P0). The oid equality is the whole warrant.
+            if [ "$pr_state" != "MERGED" ] || [ "$pr_oid" != "$sha" ]; then
+                printf 'preserve\t%s\t\trule=P proof=for-each-ref --contains %s sha %s is held only by %s — that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`); removing the checkout would then ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${sha:-?}" "${refs#*:}"
+                return 0
+            fi ;;
+    esac
+
+    # ── RULE 3: the commit is already in origin/main ──────────────────────
+    # The strongest proof there is: a commit contained in main cannot be lost,
+    # whatever else the checkout holds. Fired 31 times on cell-1 (511 MB ->
+    # 8.6 GB) against trees logged `no upstream` for most of a day.
+    if [ "$refs" = "merged" ]; then
+        # ⛔ THE PROOF IS RETAKEN, not re-derived from the inputs: with a resolved remote main the
+        # ancestry was proved against THAT oid, and `${MAIN_REF}` (the local cache) can be stale — so a
+        # row printing `... ${MAIN_REF}=0` would cite a command that returns 1. See ancestry_proof_text.
+        proof_txt="$(ancestry_proof_text "$sha")"
+        if [ -z "$proof_txt" ]; then
+            # ⛔ `rule=P`, NOT `rule=3`: rule 3 is a REMOVE in the table, and printing a KEEP row as
+            # `rule=3` makes `grep 'rule=3'` report preserves as removals — the mirror of the defect the
+            # rule-6 preserve row already carries a ⛔ for (#2756 review, P2). The suppressed rule is
+            # named in words so the row still says which decision it aborted.
+            printf 'preserve\tmain-proof-vanished\t\trule=P would-remove=3 the ancestry proof that put this row in the removal path does NOT reproduce now (tried %s then %s) — a proof that cannot be retaken removes nothing\n' \
+                "${RESOLVED_MAIN:-<no-resolved-main>}" "${MAIN_REF:-<no-main-ref>}"
+            return 0
+        fi
+        # `age_floor` already carries the merged floor (computed above).
+        # A floor of 0 means "no floor", not "younger than one second": with the
+        # ctime witness a checkout can be 0 seconds old, and `age <= 0` would
+        # then report the degenerate floor instead of rule 7.
+        if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
+            printf 'preserve\ttoo-recent\t\trule=P age %sd ≤ %sd (merged floor) proof=%s\n' "$((age_s / 86400))" "$age_floor" "$proof_txt"
+            return 0
+        fi
+        if [ "$young" = 1 ]; then
+            printf 'preserve\ttoo-young\t\trule=7 age=%sm < %sm (witness=%s) proof=%s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$proof_txt"
+            return 0
+        fi
+        log "CLASSIFY merged-age-floor $path head_age=$((age_s / 86400))d merged_floor=${age_floor}d"
+        # #2541: the two abstention gates outrank the REMOVAL, never the rule row.
+        # landing-proved=1 here: ancestry to MAIN_REF is proof for this exact head.
+        abstain_gate "$path" "$branch" "$refs" 1 && return 0
+        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s\n' \
+            "$eph" "$proof_txt" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}"
         return 0
     fi
-    [ "$refs" = "merged" ] && log "CLASSIFY merged-age-floor $path head_age=$(((now - head_ts) / 86400))d merged_floor=${age_floor}d"
 
-    # `unref=` names WHICH witnesses were consulted and what they said, so the row is readable on its
-    # own: `no-proc` means the ps/lsof probes found nobody; `stale-shell:<pids>` means they found only
-    # shells sitting at a prompt since before HEAD (#2721). Without that, a reader cannot tell a
-    # genuinely dead checkout from one whose holder was demoted by a rule they would want to check.
-    printf 'remove\treclaimable\t%s\trefs=%s age=%sd clean=disposable-only unref=%s\n' \
-        "$eph" "$refs" "$(((now - head_ts) / 86400))" \
-        "${stale_txt:-no-proc,no-pr}"
+    # ── RULE 4: a MERGED PR for this head, whatever the merge strategy ────
+    # Squash merges are the reason this rule exists: the branch head is a
+    # non-ancestor of main even though the work is fully landed, so rule 3 can
+    # never fire for that class and PR state is the only proof available.
+    if [ "$pr_state" = "MERGED" ] && [ "$pr_oid" = "$sha" ]; then
+        # The operator's merged cooldown governs here too (#2756 review, P1):
+        # REAP_WT_MERGED_AGE_DAYS is the floor for BOTH landed classes, and the
+        # scratch cap may only lower it. A PR-merged head is a STRONGER proof than
+        # patch-equivalence, so it takes this floor even when `git cherry` could
+        # not see the squash (multi-commit branches).
+        pr_floor="$REAP_WT_MERGED_AGE_DAYS"
+        if [ "$REAP_WT_SCRATCH_AGE_DAYS" -lt "$pr_floor" ] && is_scratch_path "$path"; then
+            pr_floor="$REAP_WT_SCRATCH_AGE_DAYS"
+        fi
+        if [ "$pr_floor" -gt 0 ] && [ "$age_s" -le "$((pr_floor * 86400))" ]; then
+            printf 'preserve\ttoo-recent\t\trule=P proof=age:%sd≤%sd(merged floor) pr-merged %s state=MERGED%s head=%s\n' \
+                "$((age_s / 86400))" "$pr_floor" "$pr_key" "$prnum_note" "${pr_oid:0:12}"
+            return 0
+        fi
+        if [ "$young" = 1 ]; then
+            printf 'preserve\ttoo-young\t\trule=7 proof=age:%sm<%sm(witness=%s) pr-merged %s state=MERGED%s head=%s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$pr_key" "$prnum_note" "${pr_oid:0:12}"
+            return 0
+        fi
+        # landing-proved=1: the PR's headRefOid IS this commit, so GitHub durably
+        # holds the sha and the unpushed arm cannot add anything (a squash-merged
+        # head is routinely unpushed once `fetch --prune` drops the tracking ref).
+        abstain_gate "$path" "$branch" "$refs" 1 && return 0
+        printf 'remove\treclaimable\t%s\trule=4 refs=%s proof=pr-merged %s state=MERGED%s head=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s\n' \
+            "$eph" "$refs" "$pr_key" "$prnum_note" "${pr_oid:0:12}" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}"
+        return 0
+    fi
+
+    # ── RULE 5: closed without a merge, head not an ancestor — a human's call
+    if [ "$pr_state" = "CLOSED" ]; then
+        printf 'preserve\tpr-closed-unmerged\t\trule=5 proof=pr-closed %s state=CLOSED%s head-not-in=%s — the work was never merged; branch/refs survive and NOTHING was removed\n' \
+            "$pr_key" "$prnum_note" "$(ancestry_candidates_text)"
+        return 0
+    fi
+
+    # ── RULE 6: no PR at all ───────────────────────────────────────────────
+    # "Not merged" is not "abandoned", so this row NAMES itself: it used to
+    # read `too-recent` and told the operator nothing about why the checkout
+    # could not be proven disposable. Past the aged floor the PRE-EXISTING #1095
+    # policy still governs an aged, clean, holder-free checkout whose commits
+    # survive on a branch (`git worktree remove` takes the checkout, never the
+    # branch). That is a recorded decision and this rule does not reverse it; it
+    # makes the window in between legible, which is what was missing.
+    # `rule=6` is a KEEP in the table, so it is printed on the PRESERVE row only.
+    # A removal past the floor is the PRE-EXISTING aged rule (rule=P) with the
+    # no-PR evidence carried as a marker — attributing a removal to a keep-rule
+    # made `grep 'rule=6'` report removals (#2756 review, P2).
+    aged_note=""
+    if [ "$PR_APPLICABLE" = 1 ] && [ -z "$pr_state" ]; then
+        # The window is the FLOOR IN FORCE, not always 7d: a lane scratch dir past
+        # its 1-day cap, or a patch-equivalent head past the merged floor, is out of
+        # the window and falls through to the aged removal below.
+        # ⛔ A MERGED PR FOR OTHER WORK IS NOT "NO PR" (#2756 review cycle 2). This
+        # arm used to be an `elif` on the same condition, so once `pr_state` was
+        # cleared the marker below was unreachable and a REMOVE row told the operator
+        # "gh found no PR for this branch" while gh had returned a MERGED PR for it.
+        # The proof now states which of the two it is, on BOTH rows.
+        if [ -n "$pr_other" ]; then
+            no_pr_proof="gh-state:$pr_other-state=MERGED-head=other"
+        else
+            no_pr_proof="gh-state:no-PR-matches-this-head($subj)"
+        fi
+        if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
+            printf 'preserve\tno-pr\t\trule=6 proof=%s (no PR matches this head — cannot prove it is landed)%s refs=%s age=%sm\n' \
+                "$no_pr_proof" "${pr_other:+ pr-merged-other-head=$pr_other}" "$refs" "$((age_s / 60))"
+            return 0
+        fi
+        if [ -n "$pr_other" ]; then
+            aged_note=" pr-merged-other-head=$pr_other"
+        else
+            aged_note=" no-pr=gh-state(no PR matches this head: $subj)"
+        fi
+    fi
+
+    # ── rule=P: the commit is on no ref at all ─────────────────────────────
+    # Checked AFTER rules 4-6 so a merged/closed PR is reported as itself, and
+    # BEFORE the aged tail so an aged orphan is never removed: its admin record
+    # is the commit's last durable handle.
+    if [ "$refs" = "" ]; then
+        printf 'preserve\tdetached-unreachable\t\trule=P proof=for-each-ref --contains %s:no-ref sha %s is on no ref — removing would orphan it\n' "${sha:-?}" "${sha:-?}"
+        return 0
+    fi
+
+    # ── the age floor in force (already merged / patch-equivalent / scratch aware)
+    if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
+        printf 'preserve\ttoo-recent\t\trule=P proof=age:%sd≤%sd(witness=%s) refs=%s\n' "$((age_s / 86400))" "$age_floor" "$wname" "$refs"
+        return 0
+    fi
+    if [ "$young" = 1 ]; then
+        printf 'preserve\ttoo-young\t\trule=7 proof=age:%sm<%sm(witness=%s)\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname"
+        return 0
+    fi
+
+    # #2541: the abstention gates. `landing-proved=0` here — this row is the
+    # PRE-EXISTING #1095 aged rule, which the recorded policy deliberately applies to
+    # an aged, clean, holder-free checkout whose commits survive on a branch. What
+    # the gates add is the one thing the aged clock cannot see: a head carrying
+    # commits that exist on NO remote ref and that no landed proof covers.
+    abstain_gate "$path" "$branch" "$refs" 0 && return 0
+    printf 'remove\treclaimable\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s\n' \
+        "$eph" "$aged_note" "$refs" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}"
     return 0
 }
 
@@ -1628,7 +2200,35 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE"
+}
+
+# summary_reasons — the preserved reasons as `reason:count,…`, most frequent first.
+summary_reasons() {
+    [ -n "$PRESERVE_REASONS" ] || { printf 'none'; return 0; }
+    printf '%s\n' "$PRESERVE_REASONS" | tr ' ' '\n' | sed '/^$/d' | sort | uniq -c | sort -rn \
+        | awk '{printf "%s%s:%s", (n++ ? "," : ""), $2, $1}'
+}
+
+# summary_line — the pass's ONE machine-readable tally.
+#
+# ⛔ TWO identities, and the reason there are two: a DEFERRED record is one the budget stopped the
+# pass BEFORE classifying, so adding it to `classified` would claim a decision that was never made
+# (measured: a 16-record list with a 1s budget printed `classified=2 … deferred=15`, and
+# `2 = 1 + 1 + 15` is arithmetic that does not reconcile). So:
+#     classified = remove + preserved      (every record the pass actually DECIDED)
+#     examined   = classified + deferred   (`examined` is the length of git's own listing, so this
+#                                           one is checkable against WORKTREES= in the footer)
+# `preserved` EXCLUDES deferrals, and a deferred REMOVAL is its own counter (`deferred_remove`) — it
+# was classified and selected, so folding it into `deferred` deflates `preserved`. A deferred record
+# also blocks the end-of-pass prune. `removed`/`failed`/`late_preserved` are APPLY-mode outcomes and
+# stay 0 in a dry run; `remove=` is therefore "would remove" in dry-run and "selected" in apply. A
+# pass that removes nothing is visible HERE (`examined=51 classified=51 remove=0 preserved=51
+# reasons=too-recent:51`), which `REMOVED=0` alone never was.
+summary_line() {
+    printf 'SUMMARY examined=%s classified=%s remove=%s preserved=%s deferred=%s deferred_remove=%s removed=%s failed=%s late_preserved=%s prune_blocked=%s reasons=%s main_proof=%s main_ref=%s pr_merged=%s\n' \
+        "$WT_TOTAL" "$CLASSIFIED_C" "$REMOVE_C" "$((PRESERVE_C - DEFERRED))" "$DEFERRED" "$DEFERRED_REMOVE" \
+        "$REMOVED" "$FAILED" "$LATE_PRESERVE" "$PRUNE_BLOCKED" "$(summary_reasons)" "$MAIN_PROOF" "${MAIN_REF_NAME:-${MAIN_REF:-?}}" "$PR_MERGED_STATE"
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -1675,6 +2275,7 @@ run() {
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_GIT_TIMEOUT:"$REAP_WT_GIT_TIMEOUT" \
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_BUDGET_SECONDS:"$REAP_WT_BUDGET_SECONDS" \
              REAP_WT_LOCK_STALE_SECONDS:"$REAP_WT_LOCK_STALE_SECONDS" REAP_WT_PR_LIMIT:"$REAP_WT_PR_LIMIT" \
+             REAP_WT_MIN_AGE_MINUTES:"$REAP_WT_MIN_AGE_MINUTES" \
              REAP_WT_MAX_DAYS:"$REAP_WT_MAX_DAYS" \
              REAP_WT_MERGED_AGE_DAYS:"$REAP_WT_MERGED_AGE_DAYS" \
              REAP_WT_SCRATCH_AGE_DAYS:"$REAP_WT_SCRATCH_AGE_DAYS"; do
@@ -1682,6 +2283,24 @@ run() {
     done
     awk -v a="$REAP_WT_AGED_DAYS" -v m="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(a >= 0 && a <= m)}' \
         || { echo "bad --aged-days: out of range (0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
+    # `--aged-days` range is bounded above as well as below. The loop above already REFUSES a
+    # non-numeric floor (`is_pos_int`), so what this adds is the upper bound: a value that is numeric
+    # but beyond REAP_WT_MAX_DAYS. Same bound, same remedy line, for the merged floor — it governs the
+    # common arm now (every squash-landed head), so an out-of-range value must fail here, loudly,
+    # rather than silently changing every verdict in the pass.
+    awk -v m="$REAP_WT_MERGED_AGE_DAYS" -v x="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(m >= 0 && m <= x)}' \
+        || { echo "bad REAP_WT_MERGED_AGE_DAYS: $REAP_WT_MERGED_AGE_DAYS (want 0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
+    # An unrecognised proof mode must not silently become "local" OR "auto": one skips the remote
+    # read, the other opens a network call, and neither is what the operator asked for.
+    case "$REAP_WT_MAIN_PROOF" in
+        auto|local) ;;
+        *) echo "bad REAP_WT_MAIN_PROOF: $REAP_WT_MAIN_PROOF (want auto|local)" >&2; exit 2 ;;
+    esac
+    # An explicit age witness is a NUMBER or it is a refusal: a typo must not
+    # silently drop the witness and leave rule 7 measuring HEAD's commit date.
+    if [ -n "${REAP_WT_TREE_TS:-}" ]; then
+        is_pos_int "$REAP_WT_TREE_TS" || { echo "bad REAP_WT_TREE_TS: $REAP_WT_TREE_TS (want epoch seconds)" >&2; exit 2; }
+    fi
 
     # ONE reusable scratch file for every bounded git probe in the pass. The
     # property probes run PER WORKTREE, so a per-call mktemp would add forks to
@@ -1719,11 +2338,28 @@ run() {
         log "FAIL-CLOSED abort: git worktree list failed (exit 3)"
         exit 3
     fi
+    # ⛔ AN EMPTY LIST IS NOT A HEALTHY PASS (#4529 review). `git worktree list` ALWAYS records at
+    # least the main (or bare) worktree, so ZERO records means the enumeration answered nothing —
+    # and a pass that goes on to publish `examined=0 classified=0 remove=0 preserved=0 reasons=none`
+    # is the "a no-op pass is indistinguishable from a healthy one" shape this PR exists to remove,
+    # now wearing a machine-readable tally that makes it look measured. The sibling delegate refuses
+    # exactly this state (`reap-lane-venvs.sh`: "reports no worktrees at all — that cannot be true of
+    # a checkout (exit 3)"); this arm must not be the weaker one. It is checked BEFORE MAIN_CANON's
+    # fallback (which would silently invent a main) and before `--list` can print an empty success.
+    if [ -z "$WT_LIST" ]; then
+        echo "FAIL-CLOSED abort: git worktree list reported no worktrees — that cannot be true of a checkout (exit 3)" >&2
+        log "FAIL-CLOSED abort: git worktree list reported no worktrees (exit 3)"
+        exit 3
+    fi
     MAIN_CANON="$(printf '%s\n' "$WT_LIST" | head -1 | cut -f1 | while IFS= read -r p; do canonicalize "$p"; done)"
     [ -n "$MAIN_CANON" ] || MAIN_CANON="$REPO_CANON"
     SELF_CWD_CANON="$(canonicalize "$PWD")"
     now="$(now_epoch)"
     MAIN_REF="$(resolve_main_ref)"
+    # The remote's own advertised default branch OUTRANKS the local ref chain: `origin/main` is a
+    # cache, and a pass that proves "merged into main" against a stale cache is a false PASS one
+    # layer down. Failure is not fatal — every arm falls back to MAIN_REF and says so.
+    resolve_remote_main
 
     if [ "$LIST_ONLY" = 1 ]; then
         while IFS=$'\t' read -r p h b f; do
@@ -1739,12 +2375,22 @@ run() {
         echo "FAIL-CLOSED abort: REAP_WT_LOG unwritable ($REAP_WT_LOG) (exit 3)" >&2
         exit 3
     fi
+# ── enforce LOCK_STALE > BUDGET before the lock is taken (#2541 review, P2)
+    if is_pos_int "$REAP_WT_BUDGET_SECONDS" && is_pos_int "$REAP_WT_LOCK_STALE_SECONDS" \
+            && [ "$REAP_WT_LOCK_STALE_SECONDS" -le "$REAP_WT_BUDGET_SECONDS" ]; then
+        REAP_WT_LOCK_STALE_CLAMPED="$(( REAP_WT_BUDGET_SECONDS * 4 ))"
+        REAP_WT_LOCK_STALE_NOTE="REAP_WT_LOCK_STALE_SECONDS=$REAP_WT_LOCK_STALE_SECONDS did not exceed REAP_WT_BUDGET_SECONDS=$REAP_WT_BUDGET_SECONDS (a live owner's lock is broken by an age test that ignores the budget) — RAISED to $REAP_WT_LOCK_STALE_CLAMPED (4x the budget)"
+        REAP_WT_LOCK_STALE_SECONDS="$REAP_WT_LOCK_STALE_CLAMPED"
+    fi
     if ! lock_acquire; then
         echo "FAIL-CLOSED abort: lock held ($LOCK_DIR) (exit 3)" >&2
         exit 3
     fi
 
     log "==== pi-reap-worktrees pass: MODE=$MODE repo=$REPO_CANON aged=${REAP_WT_AGED_DAYS}d main=${MAIN_CANON} now=$now ===="
+    # A clamped lock horizon is REPORTED, never applied silently: it is an
+    # operator misconfiguration being corrected, and the artifact must say so.
+    [ -n "${REAP_WT_LOCK_STALE_NOTE:-}" ] && log_line "WARN $REAP_WT_LOCK_STALE_NOTE"
     WT_TOTAL="$(printf '%s\n' "$WT_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 
     # ROTATION — see rotate_records(). The offset lives in the state dir so it
@@ -1752,54 +2398,89 @@ run() {
     # actually consumed, so the deferred tail is reached next time instead of
     # never. WT_LIST itself is left untouched: the pre-prune re-read appends to
     # it and compares it as a SET.
-    OFFSET_FILE="$STATE_DIR/pi-reap-worktrees.offset"
+    #
+    # ⛔ THE OFFSET IS A PER-REPO DATUM — it is an INDEX into THIS repo's
+    # `git worktree list`, and `disk-reaper.sh` drives one reaper per repo through
+    # ONE shared REAP_WT_STATE_DIR, so a repo-agnostic filename made each repo's
+    # pass consume and overwrite its neighbour's cursor (offset_A % n_B). The
+    # cursor then indexes an unrelated list on every alternation, and a repo whose
+    # offset keeps landing near the head reintroduces the exact same-tail
+    # starvation this rotation exists to remove. Key it by REPO_CANON — the same
+    # invariant the per-repo lock already assumes.
+    OFFSET_FILE="$STATE_DIR/pi-reap-worktrees$(printf '%s' "$REPO_CANON" | cksum | cut -d' ' -f1).offset"
     WT_OFFSET="$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)"
     case "$WT_OFFSET" in ''|*[!0-9]*) WT_OFFSET=0 ;; esac
     WT_ORDER="$WT_LIST"
-    if [ "$REAP_WT_ROTATE" = 1 ]; then
+    ROTATE_ON=0
+    case "$REAP_WT_ROTATE" in
+        1|true|yes|TRUE|YES) ROTATE_ON=1 ;;
+        # ⛔ ANY OTHER VALUE IS OFF, AND IT IS SAYABLE. The pre-fix test was
+        # `[ "$REAP_WT_ROTATE" = 1 ]`, so `true`/`yes`/`01` silently restored the
+        # starve-the-tail behaviour with no line in the pass artifact a reader
+        # could find.
+        0|false|no|FALSE|NO|'') ROTATE_ON=0 ;;
+        *) ROTATE_ON=0
+           log_line "WARN REAP_WT_ROTATE='$REAP_WT_ROTATE' is not a recognised boolean — ROTATION IS OFF for this pass (the stable order's tail can starve)" ;;
+    esac
+    if [ "$ROTATE_ON" = 1 ]; then
         WT_ORDER="$(rotate_records "$WT_LIST" "$WT_OFFSET")"
         # A rotation that produced nothing must NEVER become a silent no-op
         # pass: fall back to the unrotated list, which is the pre-fix behaviour.
         #
         # ⛔ O(1) emptiness test ONLY. Do NOT write this as a whitespace
-        # substitution `${WT_ORDER//[[:space:]]/}`: bash's pattern substitution
-        # with a POSIX character class inside a bracket expression is
-        # catastrophic on a large string and is PURE SHELL CPU with NO child
-        # process, so it looks exactly like a wedged lane. MEASURED on a 72 KB
-        # worktree list (564 rows): 772 min real / 577 min user CPU, one core,
-        # no children — it silently turned every full-size pass into a hang that
-        # classified ZERO records while reading as 79% CPU. `[ -n "$x" ]` is
-        # O(1) and is all this guard needs: the list is tab-separated records, so
-        # an all-whitespace value can only arise from an input that also has
-        # WT_TOTAL=0, and that case is already handled below.
+        # substitution of a POSIX character class (`//[[:space:]]/`, and equally
+        # `//[[:blank:]]/` or `//[[:space:][:punct:]]/`): bash's pattern
+        # substitution with a class inside a bracket expression is catastrophic on
+        # a large string and is PURE SHELL CPU with NO child process, so it looks
+        # exactly like a wedged lane. MEASURED on a 72 KB worktree list (564
+        # rows): 772 min real / 577 min user CPU, one core, no children — it
+        # silently turned every full-size pass into a hang that classified ZERO
+        # records while reading as 79% CPU. `[ -n "$x" ]` is O(1) and is all this
+        # guard needs: the list is tab-separated records, so an all-whitespace
+        # value can only arise from an input that also has WT_TOTAL=0, and that
+        # case is already handled below.
         [ -n "$WT_ORDER" ] || WT_ORDER="$WT_LIST"
     fi
+    # ⛔ ROTATION IS RECORDED, not just done: `ROTATE on=… offset=… total=…` is
+    # the only line from which "did rotation run, and where is the cursor?" can be
+    # answered out of a pass artifact.
+    log_line "ROTATE on=$ROTATE_ON offset=$WT_OFFSET total=$WT_TOTAL offset-file=$OFFSET_FILE"
+
+    # PR state is now needed for EVERY real record, not only for the ones with a
+    # branch: rule 4 matches a DETACHED head by its commit sha (a detached head
+    # has no branch name, and that is exactly the class that sat unprovable on
+    # cell-4 for days — #2721). A BARE record is the main repo's own and never a
+    # candidate, so its PR state is never consulted.
 
     local need_pr=0 p h b f
     while IFS=$'\t' read -r p h b f; do
         [ -n "$p" ] || continue
-        [ "$b" = "-" ] || [ "$b" = "BARE" ] || { need_pr=1; break; }
+        [ "$b" = "BARE" ] || { need_pr=1; break; }
     done <<<"$WT_LIST"
     if [ "$need_pr" = 1 ]; then
-        if ! pr_head_refs_load; then
+        if ! pr_state_load; then
             # ⛔ THE REASON, NOT A GUESS — and it is MACHINE-READABLE. The first line names the gate,
             # the second carries `skipped=<repo> reason=<token>` for the caller (disk-reaper.sh reads
             # it to report a per-repo skip and keep reclaiming the repos it CAN verify), and the third
             # is the remedy for THIS cause. `skipped=` is on stderr like every other abort line and
             # `run_class` merges both streams, so the entry point sees it either way.
-            echo "FAIL-CLOSED abort: the open-PR gate cannot be verified for this repo (exit 3)" >&2
+            echo "FAIL-CLOSED abort: the PR-state gate cannot be verified for this repo (exit 3)" >&2
             echo "SKIPPED-REPO: skipped=${REPO_CANON:-$REPO} reason=${PR_SKIP_REASON:-unknown}" >&2
             echo "   ${PR_SKIP_REMEDY:-set REAP_WT_REPO_SLUG, or replace the origin remote with a GitHub URL}" >&2
             echo "   NOTHING in this repo was touched: a checkout whose PR state is unknown is never removed (the other repos in the pass are unaffected)" >&2
             echo "   (#2354: the scheduled pass must use the REAL gh — a wedged interactive shim is a" >&2
             echo "   deployment defect, not a reason to skip the veto; nothing is removed)" >&2
-            log "FAIL-CLOSED abort: open-PR gate unverifiable for ${REPO_CANON:-$REPO} (reason=${PR_SKIP_REASON:-unknown}) with candidates (exit 3)"
-        print_footer "$now"
+            log "FAIL-CLOSED abort: PR-state gate unverifiable for ${REPO_CANON:-$REPO} (reason=${PR_SKIP_REASON:-unknown}) with candidates (exit 3)"
+            print_footer "$now"
             exit 3
         fi
     else
         GH_STATE="na"; GH_OK=1; PR_APPLICABLE=0
     fi
+    # The pass's PR-state read IS the merged evidence (rules 4-6: a squash-merged head is never an
+    # ancestor of main, so PR state is the only proof available). Record whether it was answerable, so
+    # a consumer can tell `pr_merged=ok` (read, answered) from `pr_merged=unavailable` (never read).
+    pr_merged_state_from_gh
 
     if ! ps_load; then
         echo "FAIL-CLOSED abort: ps enumeration failed or empty — cannot verify the live-reference gate (exit 3)" >&2
@@ -1812,17 +2493,21 @@ run() {
     stash_index_load
     remote_state_load
 
-    say "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
-    say "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
-    say "      cache on SOME machines (APFS clonefile, or a hardlink) and is REAL on others"
-    say "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
-    say "      +0.6 MB when cloned; du 5,647 MiB vs df 5.90 GB real, ratio 1.004). The deliverable"
-    say "      win is FILE COUNT. Real bytes are measured per machine, never inferred from du:"
+    log_line "rules: 1 live-holder KEEP · 2 dirty KEEP · 3 ancestor-of-main REMOVE · 4 PR-MERGED REMOVE ·"
+    log_line "       5 PR-CLOSED KEEP(named) · 6 no-PR KEEP(named) · 7 younger-than-${REAP_WT_MIN_AGE_MINUTES}m KEEP ·"
+    log_line "       P pre-existing gates (main/self/locked/open-PR/revocable-ref). Every row prints rule= and proof=."
+    log_line ""
+    log_line "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
+    log_line "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
+    log_line "      cache on SOME machines (APFS clonefile, or a hardlink) and is REAL on others"
+    log_line "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
+    log_line "      +0.6 MB when cloned; du 5,647 MiB vs df 5.90 GB real, ratio 1.004). The deliverable"
+    log_line "      win is FILE COUNT. Real bytes are measured per machine, never inferred from du:"
     # The probe is FARMED (pi-bootstrap/setup.sh fleet_srcs) because cells run this reaper from
     # $DEST/scripts, not from a checkout — so a repo-relative `scripts/...` hint would not resolve
     # where this line is actually read. Name the SIBLING this script was invoked as (#1858 review P2).
-    say "      bash ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh --help   (#1851)"
-    say ""
+    log_line "      bash ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh --help   (#1851)"
+    log_line ""
 
     local elapsed=0 crumb verdict reason detail rc
     # The budget clock starts HERE, not at `now`: see the BOUNDEDNESS note in
@@ -1832,8 +2517,8 @@ run() {
         [ -n "$p" ] || continue
         elapsed="$(( $(now_epoch) - START_EPOCH ))"
         if [ "$REAP_WT_BUDGET_SECONDS" -gt 0 ] && [ "$elapsed" -ge "$REAP_WT_BUDGET_SECONDS" ]; then
-            say "preserve $p"
-            say "         reason=deferred  pass budget ${REAP_WT_BUDGET_SECONDS}s exhausted — not classified"
+            log_line "preserve $p"
+            log_line "         reason=deferred  pass budget ${REAP_WT_BUDGET_SECONDS}s exhausted — not classified"
             log "DEFERRED $p (budget)"
             # CRITICAL: a deferred record is UNCLASSIFIED, so we cannot know
             # whether it is also prunable. A global `git worktree prune` would
@@ -1848,6 +2533,10 @@ run() {
         verdict="$(printf '%s' "$crumb" | cut -f1)"
         reason="$(printf '%s' "$crumb" | cut -f2)"
         detail="$(printf '%s' "$crumb" | cut -f4- | tr '\n' ' ')"
+        # A CLASSIFIED record is one the pass actually DECIDED. A deferred record below increments
+        # PRESERVE_C but never reaches here, which is why `classified = remove + preserved` is the
+        # identity the SUMMARY line advertises and `examined = classified + deferred` is the second.
+        CLASSIFIED_C=$((CLASSIFIED_C + 1))
         report_row "$verdict" "$p" "$reason" "$detail"
         if [ "$verdict" = "remove" ]; then
             REMOVE_C=$((REMOVE_C + 1))
@@ -1856,13 +2545,13 @@ run() {
             if [ "$MODE" = apply ]; then
                 elapsed="$(( $(now_epoch) - START_EPOCH ))"
                 if [ "$REAP_WT_BUDGET_SECONDS" -gt 0 ] && [ "$elapsed" -ge "$REAP_WT_BUDGET_SECONDS" ]; then
-                    say "         NOT REMOVED (pass budget exhausted) — will be re-classified next pass"
+                    log_line "         NOT REMOVED (pass budget exhausted) — will be re-classified next pass"
                     log "DEFERRED-REMOVE $p (budget)"
                     # Its removal did not happen, so the end-of-pass prune must
                     # not run either: for a `prunable` row the prune IS the
                     # removal, and it has no path filter.
                     PRUNE_BLOCKED=1
-                    DEFERRED=$((DEFERRED + 1))
+                    DEFERRED_REMOVE=$((DEFERRED_REMOVE + 1))
                     continue
                 fi
                 if [ "$reason" = "prunable" ]; then
@@ -1872,13 +2561,13 @@ run() {
                     # also be prunable. REMOVED is incremented ONLY if the
                     # prune actually ran — otherwise the report would claim a
                     # removal that never happened.
-                    say "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
+                    log_line "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
                     log "PRUNE-PENDING $p"
                 else
                     remove_one "$p"; rc=$?
                     case "$rc" in
                         0)
-                            say "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
+                            log_line "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
                             REMOVED=$((REMOVED + 1))
                             log "REMOVED $p" ;;
                         2)
@@ -1890,17 +2579,18 @@ run() {
                             # `ignored-artifact` mean the checkout changed,
                             # while `status-*` means the probe could not be
                             # evaluated — different operator actions.
-                            say "         PRESERVED — removal-time clean re-check not clean (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
+                            log_line "         PRESERVED — removal-time clean re-check not clean (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
                             LATE_PRESERVE=$((LATE_PRESERVE + 1))
                             log "PRESERVED-LATE $p" ;;
                         *)
-                            say "         REMOVE-FAILED — see the log ($REAP_WT_LOG)"
+                            log_line "         REMOVE-FAILED — see the log ($REAP_WT_LOG)"
                             FAILED=$((FAILED + 1)) ;;
                     esac
                 fi
             fi
         else
             PRESERVE_C=$((PRESERVE_C + 1))
+            PRESERVE_REASONS="$PRESERVE_REASONS$reason "
             log "CLASSIFY preserve $p reason=$reason $detail"
             # A preserved record that git may ALSO deem prunable must not be
             # swept up by the global, path-filterless prune. The AUTHORITATIVE
@@ -1939,8 +2629,14 @@ run() {
     # budget-deferred tail is the head of the next pass rather than
     # permanently unreachable. Best-effort: an unwritable state dir must not fail a pass
     # that already removed correctly.
-    if [ "$WT_TOTAL" -gt 0 ] 2>/dev/null && [ "$REAP_WT_ROTATE" = 1 ]; then
-        printf '%s\n' "$(( (WT_OFFSET + WT_TOTAL - DEFERRED) % WT_TOTAL ))" >"$OFFSET_FILE" 2>/dev/null || true
+    if [ "$WT_TOTAL" -gt 0 ] 2>/dev/null && [ "$ROTATE_ON" = 1 ]; then
+        NEW_OFFSET="$(( (WT_OFFSET + WT_TOTAL - DEFERRED) % WT_TOTAL ))"
+        # Write-then-rename: a pass killed mid-write must not leave an EMPTY
+        # offset file, which would silently reset the cursor to 0.
+        if printf '%s\n' "$NEW_OFFSET" >"$OFFSET_FILE.tmp.$$" 2>/dev/null; then
+            mv -f "$OFFSET_FILE.tmp.$$" "$OFFSET_FILE" 2>/dev/null || rm -f "$OFFSET_FILE.tmp.$$" 2>/dev/null || true
+        fi
+        log_line "OFFSET advanced $WT_OFFSET -> $NEW_OFFSET (total=$WT_TOTAL deferred=$DEFERRED offset-file=$OFFSET_FILE)"
     fi
 
     if [ "$MODE" = apply ] && [ "$PRUNE_WANTED" -gt 0 ]; then
@@ -2006,8 +2702,8 @@ run() {
             log "PRUNE-RECHECK-FAILED (re-read, scratch file, or comparison unavailable — fail-closed, global prune skipped)"
         elif [ -n "$PRUNE_NEWLY" ]; then
             PRUNE_BLOCKED=1
-            say ""
-            say "⚠️  $(printf '%s\n' "$PRUNE_NEWLY" | wc -l | tr -d ' ') record(s) became prunable DURING this pass, after they were classified — the global prune is skipped."
+            log_line ""
+            log_line "⚠️  $(printf '%s\n' "$PRUNE_NEWLY" | wc -l | tr -d ' ') record(s) became prunable DURING this pass, after they were classified — the global prune is skipped."
             while IFS= read -r _nl; do
                 [ -n "$_nl" ] || continue
                 log "PRUNE-RECHECK-BLOCK $_nl (became prunable after classification — not an intended reclaim target)"
@@ -2016,12 +2712,12 @@ run() {
         # the pass's snapshot is authoritative again for anything that follows
         WT_LIST="$PRUNE_START_LIST"
         if [ "$PRUNE_BLOCKED" = 1 ]; then
-            say ""
-            say "⚠️  skipped \`git worktree prune\`: ${PRUNE_WANTED} reclaimable gone-checkout record(s) were"
-            say "    left registered, because a record this pass did not classify (deferred), did"
-            say "    preserve, or became prunable only after classification — and a global prune"
-            say "    has no path filter."
-            say "    Nothing was lost: those records are re-classified on the next pass."
+            log_line ""
+            log_line "⚠️  skipped \`git worktree prune\`: ${PRUNE_WANTED} reclaimable gone-checkout record(s) were"
+            log_line "    left registered, because a record this pass did not classify (deferred), did"
+            log_line "    preserve, or became prunable only after classification — and a global prune"
+            log_line "    has no path filter."
+            log_line "    Nothing was lost: those records are re-classified on the next pass."
             log "PRUNE-SKIPPED wanted=$PRUNE_WANTED (a deferred, preserved, or mid-pass-prunable record may be prunable)"
         elif run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" worktree prune; then
             REMOVED=$((REMOVED + PRUNE_WANTED))
@@ -2035,12 +2731,13 @@ run() {
         fi
     fi
 
-    say ""
+    log_line ""
     if [ "$MODE" = dry-run ]; then
-        say "DRY-RUN — nothing removed. Re-run with --apply to remove the 'remove' rows."
+        log_line "DRY-RUN — nothing removed. Re-run with --apply to remove the 'remove' rows."
     else
-        say "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED"
+        log_line "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED"
     fi
+    summary_line
     print_footer "$(now_epoch)"
     # 4 is not a failure of the PASS — it is the machine-readable form of the
     # `FAILED=` footer, so a cron/launchd wrapper cannot read a refused removal

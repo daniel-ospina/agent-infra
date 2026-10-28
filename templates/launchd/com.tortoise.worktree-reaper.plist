@@ -31,9 +31,27 @@
          with no arguments installs EVERY template and pi-bootstrap/setup.sh
          runs exactly that on every Darwin box, so a literal in a shared template
          arms a fleet with no human step. Arming is a separate, dated, reversible
-         step, rendered from THIS box's own record by
-         `install-launchd.sh`'s `arm-worktree-hygiene` verb (see the
-         {{WORKTREE_HYGIENE_MODE}} mechanism in install-launchd.sh).
+         step.
+
+         WHERE THE ARMING ACTUALLY IS — two different jobs, and pointing at the
+         wrong one wastes the operator's afternoon. The supported, recorded verb
+         is `install-launchd.sh arm-worktree-hygiene`, and it arms the SIBLING
+         unit com.tortoise.worktree-hygiene (its record is
+         state/worktree-hygiene.armed, its placeholder is WORKTREE_HYGIENE_MODE),
+         whose sweep runs `scripts/pi-reap-worktrees.sh apply` — so that verb does
+         give a box an ARMED reaper. It does NOT arm THIS unit: this template
+         carries no placeholder and no arming verb exists for it, so arming this
+         job is a hand-edit of the flag in ProgramArguments below plus a re-run of
+         scripts/install-launchd.sh, which #1678 requires to stay a separate,
+         dated, reversible step rather than something a template does by itself.
+         ⛔ Do NOT write the placeholder spelling with braces in this comment:
+         install-launchd.sh's render() substitutes over the WHOLE file, comments
+         included, so a placeholder in a comment renders to a value below that
+         starts with two hyphens, and an XML comment may not contain one
+         (W3C XML 1.0 §2.5 — the sibling's WORKTREE_HYGIENE_MODE placeholder,
+         spelled here WITHOUT braces on purpose, is exactly that value).
+         Verified: python plistlib raises ExpatError on that render in BOTH modes;
+         `plutil` tolerates it, which is exactly why the leak would ship unnoticed.
          Removing the flag is also NOT arming: with no mode flag the reaper
          falls back to REAP_WT_DRY_RUN, whose default is 1.
          ⚠️ FLAG NAMES ARE SPELLED WITHOUT THEIR LEADING DASHES THROUGHOUT THIS
@@ -69,8 +87,12 @@
          estate: a pass over 454 worktrees spent the whole budget and reported
          DEFERRED=432 (only 22 classified), and 294 worktrees still deferred 65.
          The budget bounds classification AND removal per worktree, so at 300s
-         the job could never reach the rows it exists to reap. Raised to 1800s
-         via REAP_WT_BUDGET_SECONDS below.
+         the job could never reach the rows it exists to reap. Raised in two
+         steps — to 1800s, then to the 3600s shipped in REAP_WT_BUDGET_SECONDS
+         below (quoted here rather than named, because a stale number in an
+         operator-facing comment is read as the shipped value). Whatever value
+         is set there, REAP_WT_LOCK_STALE_SECONDS below must keep exceeding it:
+         the lock's staleness test is an AGE test that ignores the budget.
 
          GH TIMEOUT, 2026-10-11 — the job fail-closed with
          `GH pr-list failed (rc=124) ... exit 3` on two passes (WORKTREES=388
