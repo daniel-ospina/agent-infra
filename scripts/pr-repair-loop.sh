@@ -389,7 +389,13 @@ one_pass() { # <dry-run:0|1>
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
         3) err "dispatch: NOT DELIVERED (rc=3) — legible work, none of it out: no worker took an order that was placed, or a refusal stopped one before delivery. NOT an empty queue." ;;
-        6) say "dispatch: DEFERRED (rc=6) — the box's own gate refused every order and nothing was consumed; the AXIS names the remedy (load/land-backlog clear by themselves, disk needs a reclaim, fork needs a restart from OUTSIDE — the dispatcher's own status record carries `no_room_bound` and the exact `next_action`)." ;;
+        # ⛔ `say` IS GONE (#2910/#2925 renamed it `log_line` because `say` is also the macOS TTS
+        # binary), AND THE BACKTICKS GO WITH IT: inside a double-quoted argument they are COMMAND
+        # SUBSTITUTION, so `no_room_bound` ran as a shell command, printed `command not found`, and
+        # the DEFERRED sentence itself never reached the journal. The machine surface (exit 6 + the
+        # `deferred` row) was right while the one line an operator reads for the new verdict was
+        # silently dropped — the same "the token never arrives" gap this change exists to close.
+        6) log_line "dispatch: DEFERRED (rc=6) — the box's own gate refused every order and nothing was consumed; the AXIS names the remedy (load/land-backlog clear by themselves, disk needs a reclaim, fork needs a restart from OUTSIDE — the dispatcher's own status record carries no_room_bound and the exact next_action)." ;;
         # ⛔ A NON-VERDICT IS A FAILURE, AND IT IS NAMED AS ONE (ai#2922). `timeout` alone gives 124,
         # a signal gives 128+n, and `pr-doctor` gives 4 for an uncaught exception -- the code an
         # unreadable cwd produced under launchd. Calling any of them "a refusal" told an operator to

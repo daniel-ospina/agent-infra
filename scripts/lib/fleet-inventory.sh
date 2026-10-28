@@ -67,6 +67,11 @@
 #   DUPLICATE  more than one live instance (the state that consumes a repo's queue twice)
 #   FAILING    present but reporting failure (a non-zero last exit, a pidfile that names the wrong
 #              process)
+#   WAITING    a periodic job whose last run exited 6 — NO-CAPACITY, the box's own gate refused and
+#              nothing was consumed (agent-infra#2291). It is a PASS for the exit code, and it is
+#              NEVER OK: "nothing done" and "checked and healthy" are different answers. It is also
+#              not FAILING — there is nothing to repair, and a table that says FAILING sends an
+#              operator to fix a box whose only fault is being full.
 #   SKIPPED    NOT APPLICABLE on this box — always with a reason. It is a PASS for the exit code
 #              (a Mac is not broken for having no cell supervisor) and it is never rendered as OK,
 #              because "not checked" and "checked and healthy" are different answers.
@@ -807,6 +812,18 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
     fleet_row "$name" "loaded, last exit 0, fresh output" "$np instances ($actual)" DUPLICATE \
       "more than one $label process is live (pid $(printf '%s\n%s\n' "$inst" "$man" | fleet_uniq_pids | awk 'NF' | tr '\n' ' ' | sed 's/ *$//')) — a hand-run copy beside the scheduled one does the same work twice"; return 0
   fi
+  # ⛔ A FULL BOX IS NOT A FAILURE (agent-infra#2291). `pr-doctor` exits 6 for NO-CAPACITY: the box's
+  # own spawn gate refused every order on its OWN measurement and nothing was consumed. That is
+  # neither OK (a pass that placed nothing must never read green in the one table an operator reads)
+  # nor FAILING (there is nothing to repair — the catch-all below told an operator to repair a box
+  # whose only fault was being full, which is the ALIVE/REFUSING/IDLE confusion #2700/#2291 exists
+  # to remove). WAITING is its own state: a PASS for the exit code, never rendered OK.
+  # Ordered BEFORE the generic non-zero arm and AFTER DUPLICATE — a box that is both full and
+  # double-scheduled must still read DUPLICATE, because that one DOES need an operator.
+  if [ "$ex" = "6" ]; then
+    fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" WAITING \
+      "the job's last run exited 6 — NO-CAPACITY: the box's own spawn gate refused every order and nothing was consumed. Nothing is broken and nothing was done: load/land-backlog clear themselves, disk needs a reclaim, fork needs a restart from OUTSIDE, and pr-doctor's own status record names the axis (no_room_bound) and the exact next action; its own log: ${out:-<none declared>}"; return 0
+  fi
   if [ -n "$ex" ] && [ "$ex" != "0" ]; then
     fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" FAILING \
       "the job's last run exited $ex — it ran and FAILED, and nothing has been reading that status (the measured pr-doctor exit-2-for-hours state); its own log: ${out:-<none declared>}"; return 0
@@ -1234,13 +1251,16 @@ fleet_rows() {
   fleet_row_second_controller
 }
 
-# fleet_state_severity <state> — 0 pass (OK, SKIPPED) · 1 not OK · 2 cannot determine.
+# fleet_state_severity <state> — 0 pass (OK, SKIPPED, WAITING) · 1 not OK · 2 cannot determine.
 # SKIPPED is a PASS deliberately: a Mac is not broken for having no cell supervisor, and a nil
 # exit would teach operators to ignore the one screen they are meant to read. It is never rendered
 # as OK, so "not checked" and "checked and healthy" stay distinguishable.
+# WAITING is a PASS for the same reason and under the same never-OK rule (agent-infra#2291): a job
+# that deferred because the box was full consumed nothing and broke nothing, the state stays visible
+# in the row and in the notes, and a non-zero exit here would make every saturated box a fleet alarm.
 fleet_state_severity() {
   case "${1:-UNKNOWN}" in
-    OK|SKIPPED) printf '0\n' ;;
+    OK|SKIPPED|WAITING) printf '0\n' ;;
     UNKNOWN)    printf '2\n' ;;
     *)          printf '1\n' ;;
   esac

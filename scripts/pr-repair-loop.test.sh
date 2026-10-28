@@ -180,15 +180,31 @@ else
 fi
 # The no-capacity arm (agent-infra#2291): the box's own gate refused, nothing consumed -> DEFERRED.
 # This is the third pole of the same discrimination: 6 is a verdict to WAIT on, 2 and 4 are not.
-rm -f "$ROW"
+# ⛔ THE OUTPUT IS CAPTURED, NOT DISCARDED. The first version of this arm ran the pass with
+# `>/dev/null 2>&1` and asserted only the exit code and the row, so a `6)` branch that called a
+# helper this file no longer has (`say`, renamed `log_line` in #2910/#2925) passed: the code and the
+# row were right while the DEFERRED sentence never reached the journal and two `command not found`
+# lines were the only thing an operator saw. A verdict that is correct in the record and SILENT in
+# the log is half a verdict (`docs/ops/self-healing-contract.md` §2), so the token is now asserted.
+rm -f "$ROW" "$TMP/nocap.out"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-nocap" \
-    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >"$TMP/nocap.out" 2>&1
 check "a NO-CAPACITY dispatch is rc=6 (deferred), NOT rc=2" 6 "$?"
 reason_is "dispatcher-no-capacity"
 if grep -q '"decision": "deferred"' "$ROW" 2>/dev/null; then
     ok "the row says decision=deferred — the same verdict as the loop's own gates"
 else
     bad "the row does not say deferred (row: $(tr -d '\n' <"$ROW" 2>/dev/null | cut -c1-200))"
+fi
+if grep -q 'DEFERRED (rc=6)' "$TMP/nocap.out" 2>/dev/null; then
+    ok "...and the DEFERRED token reaches the LOG, not just the exit code and the row"
+else
+    bad "the DEFERRED line never reached the log (a helper the file no longer defines? output: $(tr -d '\n' <"$TMP/nocap.out" 2>/dev/null | cut -c1-200))"
+fi
+if grep -q 'command not found' "$TMP/nocap.out" 2>/dev/null; then
+    bad "the 6) arm ran a command this file does not define: $(tr -d '\n' <"$TMP/nocap.out" | cut -c1-200)"
+else
+    ok "...and the 6) arm calls no undefined helper (no 'command not found')"
 fi
 rm -f "$ROW" "$TMP/reap.out"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-ok" \

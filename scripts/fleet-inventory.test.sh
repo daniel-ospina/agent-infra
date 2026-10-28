@@ -516,6 +516,33 @@ ROWS="$(run_rows 'fleet_rows ""')"
 st="$(state_of "$ROWS" pr-doctor)"
 [ "$st" = "OK" ] && ok "§6 the same job with last exit 0 reads OK (so §6 is not 'always FAILING')" \
                  || bad "§6 last exit 0 should read OK, got [$st]"
+# ⛔ agent-infra#2291: LAST EXIT 6 IS NOT A FAILURE EITHER. pr-doctor's NO-CAPACITY (the box's own
+# spawn gate refused every order, nothing consumed) used to hit the generic non-zero arm and read
+# FAILING — the one table an operator reads sending them to repair a box whose only fault is being
+# full. Both poles are pinned: it must NOT be FAILING, and it must NOT be OK (a pass that placed
+# nothing is never "checked and healthy").
+printf 'PID\tStatus\tLabel\n-\t6\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "WAITING" ] && ok "§6 a job whose last run deferred for NO-CAPACITY (exit 6) reads WAITING, not FAILING" \
+                       || bad "§6 last exit 6 should read WAITING, got [$st]"
+det="$(detail_of "$ROWS" pr-doctor)"
+case "$det" in
+  *"no_room_bound"*) ok "§6 ...and the WAITING note names where the axis is recorded (no_room_bound)" ;;
+  *) bad "§6 the WAITING note does not name the axis field (got: ${det:0:160})" ;;
+esac
+# ⛔ THE SEVERITY IS PRINTED, NOT RETURNED. `fleet_state_severity` ends in `printf '1\n'`, so its OWN
+# exit status is always 0 (printf succeeded) — the severity is the STRING it writes. A first version
+# of these two assertions read the exit status after `fleet_state_severity FAILING >/dev/null` and so
+# measured printf's success, not the severity: the WAITING arm "passed" by coincidence (it would have
+# passed with the state still returning 1) and the FAILING arm failed against correct code. Capture the
+# printed value, exactly as every other severity assertion in this file does.
+sev="$(run_rows 'fleet_state_severity WAITING')"
+[ "$sev" = "0" ] && ok "§6 ...and WAITING is a PASS for the exit code (visible in the row, never a fleet alarm)" \
+                  || bad "§6 WAITING should be severity 0 (pass), got [$sev]"
+sev="$(run_rows 'fleet_state_severity FAILING')"
+[ "$sev" = "1" ] && ok "§6 ...while FAILING still exits 1 (the new state did not defuse the real failure state)" \
+                  || bad "§6 FAILING no longer exits 1 (got [$sev]) — the WAITING arm defused the failure state"
 # A job that is declared but NOT in the launchd domain will never run — MISSING, not OK.
 printf 'PID\tStatus\tLabel\n' > "$LC_LIST"
 ROWS="$(run_rows 'fleet_rows ""')"
