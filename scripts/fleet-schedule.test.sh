@@ -398,6 +398,27 @@ grep -qE 'DRIFT: .*(missing from fleet-schedule.py PLACEHOLDERS|the two lists di
   && ok "the mutation fails on the CONTRACT, not on a vacuous parse: $(head -1 <<<"$out")" \
   || bad "the mutation's failure does not name the drift: $out"
 
+# ⛔ A SECOND MUTATION, FOR THE OTHER TWO ARMS. The mutant above is caught by the TEMPLATE-vs-runtime
+# arm (`unknown`), so it proves ONE of the three pairwise comparisons: the installer⇄runtime SET
+# DIFFERENCE (`only_rt` / `only_sh`) could rot away with this suite fully green — and that is the
+# direction #2639 travelled (install-launchd.sh learned the AI_* names, the runtime did not, and the
+# two backends then disagreed about the SAME template). The name to remove is one NO template uses,
+# so the `unknown` arm cannot fire first and mask which arm actually caught it.
+MUT_SH="$T/install-launchd.mutated.sh"
+python3 - "$ROOT/scripts/install-launchd.sh" "$MUT_SH" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+out = src.replace("    SWARM_ENV_FILE\n", "", 1)
+assert out != src, "the mutation did not apply — PLIST_PLACEHOLDERS no longer lists SWARM_ENV_FILE"
+open(sys.argv[2], "w").write(out)
+PY
+out="$(python3 "$DRIFT_PY" "$SCHED" "$MUT_SH" "$ROOT/templates/launchd" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "MUTATION (SWARM_ENV_FILE removed from the INSTALLER array) REDDENS the drift check" \
+  || bad "the installer⇄runtime comparison stayed GREEN on a one-sided removal (rc=$rc): $out"
+grep -q 'the two lists disagree' <<<"$out" \
+  && ok "it fails on the SET-DIFFERENCE arm, so that direction is proven to fire: $(head -1 <<<"$out")" \
+  || bad "the second mutation did not exercise the set-difference arm: $out"
+
 # ── 1c. BOTH ARMS of the identity-placeholder skip ──────────────────────────────────────────
 # The designed behaviour is SKIP-with-a-loud-warning when unset and a RENDERED VALUE when set.
 # Both arms are pinned here, because either one alone is satisfiable by an accident: "always
@@ -425,6 +446,13 @@ grep -q 'SKIP .*com.test.drainer.*{{AI_DRAINER_O}}, {{AI_DRAINER_STATE}}' <<<"$o
 grep -qE '^  (ERROR|FAIL) .*com.test.drainer' <<<"$out" \
   && bad "an unset identity placeholder is an ERROR again — this is what took cell4's scheduler down: $out" \
   || ok "it is a SKIP, not an error (the designed arm)"
+# ⛔ THE ABSENT-PHRASE IS PINNED POSITIVELY **HERE**, because case 1g asserts it NEGATIVELY (an
+# unresolvable name must NOT be filed as this machine's absence). A negative-only assertion on prose
+# that nothing pins positively is a check that cannot fail: reword `fleet-schedule.py:589` and 1g
+# keeps printing ✅ while testing nothing. One case produces the string, the other forbids it.
+grep -q 'unresolved placeholder(s) {{AI_DRAINER_O}}, {{AI_DRAINER_STATE}} — absent on this machine' <<<"$out" \
+  && ok "a genuinely unset placeholder SAYS 'absent on this machine' (the phrase 1g forbids elsewhere is pinned here)" \
+  || bad "the unset arm no longer uses the absence phrase, so 1g's negative assertion is now vacuous: $out"
 state_reset "$DRAINER"
 out="$(env -u AI_DRAINER_O -u AI_DRAINER_STATE TEMPLATES_DIR="$DRAINER" python3 "$SCHED" --install 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "--install exits 0 with the job skipped" || bad "--install failed (rc=$rc): $out"
@@ -581,6 +609,58 @@ TEMPLATES_DIR="$EMPTYDIR" python3 "$SCHED" --check >/dev/null 2>&1; rc=$?
 darwin_check "$EMPTYDIR" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 1 ] && ok "darwin: the same, so 3 was not widened to cover a broken set" \
   || bad "darwin answered rc=$rc for an existing-but-unusable dir, not 1"
+
+# ── 1i. the AI_MULTI_REPO TRIPLE: its RESOLVED VALUE reaches the job (the fifth route) ────────
+# Case 1g compares the tuple against `placeholder_values()` by MEMBERSHIP only. A resolver keyed to a
+# mistyped env name stays a member, so the name resolves to "", the job is filed as "absent on this
+# machine" — a designed per-machine SKIP — and macOS (which renders `{{NAME}}` from its own env)
+# disagrees. That is the #2804 asymmetry by a fifth route, on the very template this change gives a
+# schedule. The drainer pair was value-pinned in 1c/1d; the multi-repo triple had no such arm.
+MULTI="$FIX/multirepo"; mkdir -p "$MULTI"; cp "$GOOD/RETIRED" "$MULTI/RETIRED"
+MRMARK="$T/out/multirepo.log"
+cat > "$T/multirepo.spec" <<PY
+PLIST = {
+    "Label": "com.test.multirepo",
+    "ProgramArguments": ["/bin/sh", "-c", "echo \"\$OR|\$REPO|\$O\" >> '$MRMARK'"],
+    "EnvironmentVariables": {"OR": "{{AI_MULTI_REPO_SLUG}}", "REPO": "{{AI_MULTI_REPO_REPO}}",
+                            "O": "{{AI_MULTI_REPO_STATE}}"},
+    "StartInterval": 1,
+}
+PY
+mkplist "$MULTI" com.test.multirepo "$T/multirepo.spec"
+mkplist "$MULTI" com.test.echo      "$T/echo.spec"   # so the set is never zero-live
+
+case_ "1i. the AI_MULTI_REPO triple renders its VALUEs (membership is not resolution)"
+state_reset "$MULTI"
+out="$(env -u AI_MULTI_REPO_SLUG -u AI_MULTI_REPO_REPO -u AI_MULTI_REPO_STATE \
+       TEMPLATES_DIR="$MULTI" python3 "$SCHED" --install 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "unset → --install exits 0 (the triple is a named SKIP, as designed)" \
+  || bad "--install failed with the multi-repo identity unset (rc=$rc): $out"
+[ ! -s "$MRMARK" ] && ok "unset → the job did NOT run with empty values" \
+  || bad "the job ran with an unresolved identity: $(cat "$MRMARK" 2>/dev/null)"
+state_reset "$MULTI"
+out="$(AI_MULTI_REPO_SLUG=owner/repo AI_MULTI_REPO_REPO=/fixture/repo AI_MULTI_REPO_STATE=/fixture/state \
+       TEMPLATES_DIR="$MULTI" python3 "$SCHED" --install 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "set → --install exits 0" || bad "--install failed with the triple set (rc=$rc): $out"
+grep -qx 'owner/repo|/fixture/repo|/fixture/state' "$MRMARK" 2>/dev/null \
+  && ok "all three rendered env values reached the job (a mistyped resolver key would leave one empty)" \
+  || bad "the job ran with '$(cat "$MRMARK" 2>/dev/null)' — a resolver does not deliver its env value"
+out="$(AI_MULTI_REPO_SLUG=owner/repo AI_MULTI_REPO_REPO=/fixture/repo AI_MULTI_REPO_STATE=/fixture/state \
+       TEMPLATES_DIR="$ROOT/templates/launchd" python3 "$SCHED" --check 2>&1)"
+# ⛔ IT STAYS A SKIP ON THIS RUNTIME — that is the DESIGNED arm for a resident body (the 900 s
+# top-up is a macOS job; a cell's resident controller belongs to the cell's supervisor). So the
+# assertion is that the identity is NO LONGER the reason and no ERROR appears: with the trio set the
+# skip must be the RESIDENCY, by name. Asserting `ok` here would demand the opposite of the design.
+grep -qE '^  SKIP +com.eldato.ai-multi-repo +daemon \(FleetResident\)' <<<"$out" \
+  && ok "set → the SHIPPED multi-repo template skips for DECLARED RESIDENCY, not for its identity" \
+  || bad "with its identity set the shipped multi-repo template is not a by-name resident skip: $out"
+grep -qE 'com.eldato.ai-multi-repo.*unresolved placeholder' <<<"$out" \
+  && bad "the shipped multi-repo template is STILL blamed for its (now set) identity: $out" \
+  || ok "set → no placeholder blame is left on that row"
+grep -qE '^  (ERROR|FAIL) .*com.eldato.ai-multi-repo' <<<"$out" \
+  && bad "the shipped multi-repo template is an ERROR with its identity set: $out" \
+  || ok "set → not an ERROR (a resident declaration is never a layer-wide refusal)"
+run "$MULTI" --stop >/dev/null 2>&1
 
 # ── 2. install proves a RUN, not a pid ────────────────────────────────────────────────────────
 case_ "2. --install runs the due jobs and ends with a fresh log line + stamp"
@@ -1398,6 +1478,30 @@ out="$(run "$RES_EMPTY" --check)"; rc=$?
 [ "$rc" -eq 1 ] && grep -qE '^  FAIL .*com.test.resident-empty.*no StartInterval' <<<"$out" \
   && ok "an EMPTY KeepAlive dict declares no condition and is still refused (the boundary is stated)" \
   || bad "an empty KeepAlive dict is now a resident skip (the reading is too wide): rc=$rc $out"
+
+# 18c: FleetResident marks a body whose SCHEDULE starts it — so it must NOT rescue the
+# SCHEDULELESS shape. It did: residency is decided before the schedule and both schedule branches
+# are guarded by `not job.daemon`, so `FleetResident: true` with no schedule fell through to the
+# resident SKIP and the layer was certified ("DECLARATIONS OK … 0 errors") over a plist no backend
+# would ever start — launchd loads it and never runs it (the #1864 defect a cell refuses the whole
+# layer over). docs/ops/fleet-schedule.md states the rule; this pins it to the code.
+RES_NOSCHED="$FIX/resident-nosched"; mkdir -p "$RES_NOSCHED"; cp "$GOOD/RETIRED" "$RES_NOSCHED/RETIRED"
+cat > "$T/resident-nosched.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-nosched",
+    "ProgramArguments": ["/bin/sh", "-c", "echo nosched >> '$MARK.residentnosched'"],
+    "FleetResident": True,
+}
+PY
+mkplist "$RES_NOSCHED" com.test.resident-nosched "$T/resident-nosched.spec"
+mkplist "$RES_NOSCHED" com.test.echo           "$T/echo.spec"   # so a certified set is reachable
+out="$(run "$RES_NOSCHED" --check)"; rc=$?
+[ "$rc" -eq 1 ] && grep -qiE '^  (ERROR|FAIL) .*com.test.resident-nosched.*no StartInterval' <<<"$out" \
+  && ok "FleetResident with NO schedule is a hard ERROR (the doc's own sentence, enforced)" \
+  || bad "a scheduleless FleetResident was certified as a named SKIP — the job would never run on either backend: rc=$rc $out"
+grep -q 'DECLARATIONS OK' <<<"$out" \
+  && bad "the layer was certified over a template that can never run: $out" \
+  || ok "the set is NOT certified green"
 
 # 18c: SELF-PROVING. Restore the PRE-FIX reading this P2 named (`KeepAlive is True`, with no dict
 # branch at all) and the DICT-form fixture must REDDEN — a guard that cannot fail is the defect the

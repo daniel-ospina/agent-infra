@@ -531,6 +531,30 @@ def load_jobs(check_targets: bool = True) -> list:
                 "it is a named SKIP instead"
             )
 
+        # ⛔ `FleetResident` MARKS A BODY WHOSE *SCHEDULE* STARTS IT, so it must NOT rescue the
+        # SCHEDULELESS shape. Residency is decided before the schedule (rightly — a schedule must
+        # not mask a resident body), and BOTH branches above are guarded by `not job.daemon`: so a
+        # template declaring FleetResident alone skipped the no-schedule ERROR and fell through to
+        # the resident SKIP below. The layer was then certified green — `DECLARATIONS OK — …
+        # 0 errors` — over a plist that NO backend would ever start: launchd loads it silently and
+        # never runs it (the original #1864 defect, which is exactly what a Linux cell refuses the
+        # whole layer over), and this runtime will not supervise a resident service either. That is
+        # the sentence docs/ops/fleet-schedule.md already states — "`FleetResident` alone does not
+        # rescue it: nothing would ever start the job, on either backend" — ENFORCED here rather
+        # than asserted in prose (measured: `FleetResident: true` with no schedule graded a named
+        # SKIP, 0 errors, rc=0, next to one runnable job).
+        # KeepAlive keeps its arm (launchd starts and restarts the job), and so does a scheduleless
+        # RunAtLoad (the load start is what starts worker-supply), so only FleetResident is graded.
+        if job.resident_decl == "FleetResident" and job.interval is None and job.calendar is None:
+            job.error = job.error or (
+                "declares FleetResident with NO StartInterval and no StartCalendarInterval — "
+                "FleetResident marks a resident BODY whose schedule is what starts it, so with no "
+                "schedule nothing would ever start this job on either backend (launchd accepts the "
+                "plist silently and never runs it; this runtime will not supervise a resident "
+                "service). Give it a schedule, or declare the residency that starts it: KeepAlive, "
+                "or RunAtLoad on a template with no schedule"
+            )
+
         argv = data.get("ProgramArguments") or []
         if not isinstance(argv, list) or not argv:
             job.error = job.error or "no ProgramArguments"
