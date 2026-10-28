@@ -34,6 +34,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
 # these arms go red, which is the assertion that the line is load-bearing rather than decorative.
 export LANE_PREFLIGHT=0
+# ⛔ AND THE MEMORY ARM IS NEUTRALISED FOR THE SAME REASON, one gate over (agent-infra#2387). Every arm
+# below drives the SHIPPED `run_agent` with `MAX_LOAD=1000 DISK_MIN_FREE_MB=1` so that a load or disk
+# refusal cannot decide an arm about the BRIEF. `run_agent` now also consults available memory before
+# load, so on a box under the shipped 2048 MB floor the positive control (`rc=0 started=1`) returned 73
+# and the suite reported its own subject — the research-first contract — as broken. `1` disables the
+# floor's ability to bind; the SHIPPED default and its arithmetic are asserted in spawn-gate.test.sh,
+# which owns them.
+export MEM_MIN_AVAIL_MB=1
 ROOT="$(cd "$HERE/../.." && pwd)"
 GATE="$HERE/brief-gate.sh"
 PASS=0; FAIL=0
@@ -187,7 +195,12 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…the stub pi really ran (the refusal above 
 mkdir -p "$TMP/nolib"
 cp "$HERE/spawn-gate.sh" "$TMP/nolib/"
 : > "$PI_LOG"
-res="$( cd "$FIXREPO" && PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+# ⛔ AND $AGENT_INFRA_PATH (measured on a developer box, 2026-10-28: rc=0 started=1 — the arm's whole
+# claim is that the search cannot reach a real installed copy, and `brief_gate_lib` consults
+# `$AGENT_INFRA_PATH/scripts/orchestrator-harness/brief-gate.sh` as its THIRD home, which an isolated
+# HOME does not cover. Empty is enough: the search skips an empty candidate, so the arm still drives
+# the not-found path instead of silently reading the harness it is sitting in.)
+res="$( cd "$FIXREPO" && PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" AGENT_INFRA_PATH= PI_LOG="$PI_LOG" MAX_LOAD=1000 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "no validator" >/dev/null 2>&1
            printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$TMP/nolib/spawn-gate.sh" "$TMP/nolib.log" "$CANON" )"
 [ "$res" = "rc=78 started=0" ]; ck $? "a MISSING validator is 78/cannot-verify, not a pass ($res)"
@@ -475,7 +488,16 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
 # at all). Declared here so the reference is accounted for; the broader class is named in the STATED
 # LIMIT below rather than silently believed to be covered.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# ⛔ FOUR ENTRIES ARRIVED AFTER THIS LIST DID, AND THE CENSUS WAS RED FOR THEM ON main (measured
+# here at the merge onto main, 2026-10-28 — the equality is right, the list had simply fallen behind
+# the files: all four reference `brief-gate.sh`, none is a dispatch path):
+#   ai-drainer.sh            — a WORKER-shaped dispatch; it names the gate as the reason its role is
+#                              `worker` and not `prfix` (the #2910 note).
+#   ai-drainer.test.sh       — the suite that drives it.
+#   lane-bound.test.sh       — drives `run_agent`, so it renders a brief fixture from the validator
+#                              (the class the review-cycle-3 note above describes).
+#   reviewer-preflight.test.sh — the delivery-brief renderer that the same dispatch paths splice.
+EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
