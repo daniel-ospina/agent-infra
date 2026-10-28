@@ -163,6 +163,12 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
     monkeypatch.setattr(objective.subprocess, "run", fake_run)
     monkeypatch.setattr(objective, "_sleep", sleeps.append)
     monkeypatch.setattr(objective, "_rest_get", fake_rest_get)
+    # ⛔ THE SHIPPED CALLERS DECLARE THEIR BOUND (#2227), so this is the production composition:
+    # `heartbeat-loop.sh` and `lane-scan-fallback.sh` hand the reader `OBJECTIVE_CALLER_BOUND_S=180`
+    # and the reader clips its read to fit inside it. The CONSERVATIVE default (a box whose loop
+    # predates the declaration) is pinned separately, by deleting this env in
+    # `test_the_caller_bound_leaves_room_for_the_whole_read`.
+    monkeypatch.setenv(objective.CALLER_BOUND_ENV, "180")
     monkeypatch.setattr(objective, "_gh_token", lambda: gh_token or "")
     return sleeps
 
@@ -1872,6 +1878,10 @@ def test_a_double_refusal_still_reports_rate_limited_and_unreadable(monkeypatch)
     If REST fails too, nothing has been read: `queue=UNREADABLE` and `gh=RATE-LIMITED(queue)`
     must appear unchanged, and the verdict must still be the rate-limit one (which outranks the
     queue). Main was readable throughout, so it keeps saying so.
+
+    ⛔ AND THE REFUSAL MUST NAME ITSELF (#2227). `queue_read=UNREADABLE(waited=…, last_good=…)`
+    carries the two facts a reader needs to tell a crowded box from an outage, and prints NO
+    count -- the fail-closed half of #1869 is that this token may say less, never more.
     """
     install(monkeypatch, pr_list=REST_REFUSED, rest_prs=None)   # no second source
     line = objective.build()
@@ -1879,7 +1889,10 @@ def test_a_double_refusal_still_reports_rate_limited_and_unreadable(monkeypatch)
     assert "gh=RATE-LIMITED(queue)" in line, line
     assert "VERDICT=GH-RATE-LIMITED" in line, line
     assert "main=GREEN" in line, line
-    assert "queue_read=" not in line, line
+    qr = line[line.index("queue_read=UNREADABLE("):]
+    assert "waited=" in qr and "last_good=" in qr, line      # WHAT IT WAITED, HOW OLD THE LAST GOOD
+    assert "tried " in qr, line                              # ...and WHAT IT TRIED
+    assert "waiting=" not in line, line                      # ...and NO count from an unread queue
 
 
 def test_a_rest_payload_is_never_an_empty_queue(monkeypatch):
@@ -3275,8 +3288,15 @@ def test_an_unread_queue_is_never_cached_even_without_a_gh_claim(monkeypatch, tm
 # same predicate usable elsewhere, in BOTH directions: the shipped default is unchanged, and an
 # explicitly supplied value is honoured.
 def test_the_shipped_default_repo_and_required_set_are_unchanged(monkeypatch):
-    """No consumer that supplies nothing may see a behaviour change: the beat on the laptop reads
-    tortoise, exactly as before."""
+    """No IMPORTER that supplies nothing may see a behaviour change: `REPO` stays tortoise.
+
+    ⛔ WHAT THIS PINS, AND WHAT IT DOES NOT (agent-infra#2710). The MODULE-LEVEL `REPO` is the
+    binding `pr-doctor.py` / `pr-loop.py` read through `classify_one()`, and both supply
+    `OBJECTIVE_REPO` before they exec this file. It is deliberately still `env or default`: binding a
+    repo at import would put a `bash` subprocess on every import and let a test's cwd silently pick
+    its repo. The CLI is where the contract is enforced, and `main()` resolves it -- see
+    `test_the_default_repo_is_LOUD_and_the_checkout_wins_over_it` in the #2710 block below.
+    """
     monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
     monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
     spec = importlib.util.spec_from_file_location(
@@ -3382,3 +3402,644 @@ def test_the_graphql_fallback_asks_the_SAME_repo_the_rest_read_does(monkeypatch)
     assert "name=agent-infra" in argv, argv
     # ...and the shipped default cannot leak back in beside the derived one.
     assert "name=tortoise" not in argv, argv
+
+
+# ── #2227: A LATE ANSWER IS NOT AN ABSENT ONE ───────────────────────────────────────────────
+# MEASURED 2026-10-20 on three cloud cells: `gh` is serialised PER BOX (#2005), so ONE
+# `gh pr view` cost **63.0 s at 13 lanes** against **0.676 s at 3** and **0.091 s on the wire**.
+# Every reader with a tight budget therefore reported ABSENCE for a fact it had not established:
+# `queue_read=BLIND(14/14 unread, samples=3)`, `merged_24h=?`, `VERDICT=UNKNOWN`. The state was
+# not wrong -- it was NOT YET SERVED.
+#
+# FOUR PROPERTIES, and each one is load-bearing on its own:
+#   (a) a read that ANSWERS slowly is DATA, carrying its latency, and is never called BLIND;
+#   (b) a read that FAILS says what it tried, how long it waited, and how old the last good
+#       sample is -- so a busy box cannot read like an outage, nor a stale refusal like a live one;
+#   (c) a cached number is NEVER presented as current (#1869's rule, which this change must not
+#       relax): a refusal carries an AGE and no counts;
+#   (d) the read budget and the CALLER'S bound compose -- a budget above the caller's kill is an
+#       inert bound that writes NO line, which is strictly worse than an honest refusal.
+
+def _clock_at(monkeypatch, ticks):
+    """Fake `_wall()` as a list of readings. Distinct from `_monotonic()`, which fakes BOUNDS."""
+    it = iter(ticks)
+    monkeypatch.setattr(objective, "_wall", lambda: next(it))
+
+
+def test_a_read_that_ANSWERS_slowly_is_DATA_with_its_latency(monkeypatch):
+    """(a) 63 s is a measurement, not a failure -- the exact shape the fleet misread hourly.
+
+    The read answers with a READABLE merge state and simply takes 63 s (the measured worst case).
+    The line must carry the counts, the latency, and NO blind/fail-closed caveat -- and the verdict
+    must be a property of the QUEUE, not of the clock.
+    """
+    install(monkeypatch, pr_list=[_Result(0, json.dumps(
+        [_pr(n, "BLOCKED") for n in range(1, 5)]))])
+    _clock_at(monkeypatch, [0.0, 63.1])
+    line = objective.build()
+    assert "queue_read=SLOW(waited=63.1s" in line, line
+    assert "the counts are DATA" in line, line
+    assert "queue_read=BLIND" not in line, line
+    assert "NOT a clearance" not in line, line
+    assert "open=4" in line and "waiting=4" in line, line
+    assert "gh=" not in line, line
+    assert "VERDICT=UNKNOWN" not in line, line
+    # ...and the cut the fleet reads this line through still reaches the qualifier (#1872).
+    assert line.index("queue_read=SLOW") < line.index(QUEUE_SEG), line
+
+
+def test_a_fast_read_stays_silent_so_SLOW_means_something(monkeypatch):
+    """The negative control for (a): a fast read prints no `queue_read` token at all.
+
+    Without this, `queue_read=SLOW` could be printed unconditionally and the first test would pass
+    on a build that cannot tell a fast read from a late one. 0.7 s is the MEASURED quiet-box cost.
+    """
+    install(monkeypatch, pr_list=[_Result(0, json.dumps([_pr(1, "BLOCKED"), _pr(2, "DIRTY")]))])
+    _clock_at(monkeypatch, [0.0, 0.676])
+    line = objective.build()
+    assert "queue_read=" not in line, line
+    assert "open=2" in line and "waiting=2" in line, line
+
+
+def test_a_REFUSED_read_says_what_it_tried_how_long_it_waited_and_the_age_of_the_last_good(
+        monkeypatch, tmp_path):
+    """(b) The refusal names itself: cause, wait, and the AGE of the last good sample.
+
+    Measured failure shape: `lane-actions read failed rc=1: lane-status.py failed: TimeoutExpired`
+    -- pr-doctor surfaced a stack-trace fragment with no duration and no age, so a box that was
+    merely crowded was indistinguishable from a dead monitor.
+    """
+    cache = tmp_path / "objective.last"
+    cache.write_text("2020-01-01T00:00:00+00:00\nOBJECTIVE VERDICT=ADVANCING waiting=3\n")
+    aged = 1800
+    # Age the cache by its MTIME (the thing `_last_good_age_s` reads), not by patching os.path --
+    # a global getmtime stub would also change what the rest of `build()` sees.
+    _stamp = objective.time.time() - aged
+    os.utime(str(cache), (_stamp, _stamp))
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    install(monkeypatch, pr_list=_Result(1, "", "API rate limit exceeded"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 100.4])
+    line = objective.build()
+    assert "queue_read=UNREADABLE(waited=100.4s, last_good=" in line, line
+    assert "tried gh pr list" in line, line          # WHAT it tried
+    assert "waited=100.4s" in line, line             # HOW LONG it waited
+    assert "1800s" in line or "1799s" in line, line  # HOW OLD the last good sample is
+
+
+def test_a_cached_value_is_never_presented_as_current(monkeypatch, tmp_path):
+    """(c) #1869 SURVIVES: a refusal may borrow the cache's AGE, never its numbers.
+
+    The cache holds `waiting=3 open=3`. The read fails. If any of those appear on the line, this
+    change reopened the exact fail-open #1869 closed -- a stale number standing where an unread
+    one belongs, on the one line the fleet acts from.
+    """
+    cache = tmp_path / "objective.last"
+    cache.write_text("2020-01-01T00:00:00+00:00\n"
+                     "OBJECTIVE VERDICT=ADVANCING main=GREEN@deadbeef open=3 drafts=0 "
+                     "nondraft=3 waiting=3 ci_crit_med=5.0m\n")
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    install(monkeypatch, pr_list=_Result(1, "", "read timed out"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 99.0])
+    line = objective.build()
+    assert "queue_read=UNREADABLE(" in line, line
+    for stale in ("waiting=3", "open=3", "nondraft=3", "ci_crit_med=5.0m"):
+        assert stale not in line, (stale, line)
+    assert "the QUEUE counts are NOT shown because none were read" in line, line
+    assert "VERDICT=UNKNOWN" in line, line
+
+
+def test_a_stale_refusal_cannot_serve_as_a_cached_line(monkeypatch, tmp_path, capsys):
+    """(c), second half: an UNREADABLE queue must not be CACHED either.
+
+    `main()`'s blind guard keys on `queue=UNREADABLE`, and this change adds a second token for the
+    same fact. Pinned so the guard cannot drift away from the vocabulary: a refusal that got
+    cached would be served for the whole serve window, which is how one blip became a blackout.
+    """
+    cache = tmp_path / "objective.last"
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    install(monkeypatch, pr_list=_Result(1, "", "transport wedged"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 97.5, 97.5, 97.5])
+    objective.main()
+    assert not cache.exists(), "a refused read was CACHED and would be served to the fleet"
+
+
+def test_the_caller_bound_leaves_room_for_the_whole_read(monkeypatch):
+    """(d) THE BUDGET AND THE KILL MUST COMPOSE, OR THE BUDGET IS INERT.
+
+    `objective.py` caps its read; two shell callers bound the PROCESS. If a caller's bound is at or
+    below the read cap, the process is SIGKILLed mid-read and writes NO line at all -- so raising
+    the read budget while leaving the caller behind makes this fix strictly worse than the false
+    absence it replaces.
+
+    ⛔ AND THEY DEPLOY SEPARATELY (#2227): `objective.py` is in the fleet farm, `heartbeat-loop.sh`
+    is a DECLARED, WITHHELD farm entry (#1553). So the caller must DECLARE its bound and the reader
+    must CLIP to it -- a box running the new reader under the OLD loop has to keep printing. Both
+    halves are pinned: the shell export matches its own `run_bounded`, and the reader honours it
+    while defaulting to the SMALLEST deployed bound when nothing is declared.
+    """
+    import re
+    here = pathlib.Path(__file__).resolve().parent
+    declared = {}
+    for fname, pat in (
+            ("heartbeat-loop.sh",
+             r'OBJECTIVE_CALLER_BOUND_S=(\d+)\s*\\?\s*\n?\s*run_bounded\s+(\d+)\s+"objective-refresh"'),
+            ("lane-scan-fallback.sh",
+             r'OBJECTIVE_CALLER_BOUND_S=(\d+)\s*\\?\s*\n?\s+bounded\s+(\d+)\s+/usr/bin/python3\s+'
+             r'"\$SCRIPTS/objective\.py"')):
+        text = (here / fname).read_text()
+        m = re.search(pat, text)
+        assert m, (fname, "the objective invocation/bound was not found -- fix the pattern")
+        assert int(m.group(1)) == int(m.group(2)), (
+            fname, "the DECLARED bound must equal the bound actually enforced")
+        declared[fname] = int(m.group(1))
+
+    # A declared bound the reader cannot fit its read into is a kill timer, not a budget.
+    for fname, b in declared.items():
+        monkeypatch.setenv(objective.CALLER_BOUND_ENV, str(b))
+        cap = objective._read_cap_s()
+        assert cap + objective.CALLER_OVERHEAD_S <= b, (fname, cap, b)
+        assert cap > objective.GH_SERIALISED_LATENCY_S, (
+            fname, cap, "a cap at or below the MEASURED 63 s serialised latency re-creates the "
+            "false absence this change exists to remove")
+
+    # ...and with NOTHING declared (a box whose loop predates this change) the conservative default
+    # still has to finish and print, while staying above the measurement.
+    monkeypatch.delenv(objective.CALLER_BOUND_ENV, raising=False)
+    default_cap = objective._read_cap_s()
+    assert default_cap + objective.CALLER_OVERHEAD_S <= objective.DEFAULT_CALLER_BOUND_S, (
+        default_cap, objective.DEFAULT_CALLER_BOUND_S)
+    assert default_cap > objective.GH_SERIALISED_LATENCY_S, default_cap
+
+    # An unparseable declaration is not an optimistic one: it falls back to the CONSERVATIVE
+    # default, because guessing high is the direction that loses the line.
+    for junk in ("", "abc", "0", "-5"):
+        monkeypatch.setenv(objective.CALLER_BOUND_ENV, junk)
+        assert objective._read_cap_s() == default_cap, junk
+
+    # ⛔ THE CLIP MUST HOLD AT EVERY DECLARED BOUND, NOT ONLY AT THE SHIPPED ONES (#2227 review,
+    # VGATE). A `max(1.0, …)` floor in `_read_cap_s()` re-exceeded the caller's own bound for any
+    # declaration at or below `CALLER_OVERHEAD_S` -- the clip defeated by the expression implementing
+    # it. Only 180 / the 90 default were exercised, so the floor was invisible.
+    for b in (25, 24, 20, 10, 1, 0.5):
+        monkeypatch.setenv(objective.CALLER_BOUND_ENV, str(b))
+        cap = objective._read_cap_s()
+        # EXACTLY the clip, never a floor above it: a bound below the caller's own overhead leaves
+        # NO room, and the honest cap is 0 (the read fails fast and prints).
+        assert cap == max(0.0, min(float(objective.QUEUE_READ_MAX_S),
+                                   b - objective.CALLER_OVERHEAD_S)), (b, cap)
+        assert cap <= max(0.0, b - objective.CALLER_OVERHEAD_S), (b, cap)
+
+    # The full cap is the one reachable only with a caller that declared room for it.
+    assert objective.QUEUE_READ_MAX_S > objective.GH_SERIALISED_LATENCY_S, (
+        objective.QUEUE_READ_MAX_S, objective.GH_SERIALISED_LATENCY_S)
+    assert objective.QUEUE_BLIND_BUDGET_S < objective.QUEUE_READ_MAX_S, (
+        "the re-sample window is a SUB-window of the read: a primary that eats it must still "
+        "leave the REST second source room to answer")
+    assert objective.QUEUE_BLIND_BUDGET_S >= (objective.GH_SERIALISED_LATENCY_S
+                                             + sum(objective.QUEUE_BLIND_BACKOFF_S)), (
+        "the re-sample window cannot fit one measured slow read plus the ladder -- #1869's "
+        "re-sample would be unreachable on exactly the boxes that need it")
+
+
+
+# ── REFUSAL IS A VERDICT (agent-infra#2710; contract §2, §3.7) ────────────────────────────────────
+# WHY THIS BLOCK EXISTS. `main()` printed its one line and fell off the end for EVERY path, so the
+# process exited 0 even when the line said `VERDICT=UNKNOWN`. Measured: `OBJECTIVE_REPO` naming a
+# repo that does not exist printed `VERDICT=UNKNOWN … queue=UNREADABLE` and exited 0, i.e. the ONE
+# state that means "the read did not happen" was indistinguishable, to any launcher keying on the
+# code, from `AT-TARGET`. These pin the two machine surfaces this file now owes a caller: a code
+# that cannot be read as a pass, and a repo the line NAMES instead of assuming.
+@pytest.fixture(autouse=True)
+def _no_ambient_repo_declaration(monkeypatch):
+    """⛔ A TEST MUST NOT INHERIT THE BOX\'S DECLARED REPO (review round 1, P2).
+
+    `OBJECTIVE_REPO` and `OR` are exported on fleet boxes and by `orch-loop.sh` children. Left in
+    place, `resolve_repo()` reads them, the repo/checkout comparison fires on whatever cwd pytest
+    happens to run from, and a test that claims to exercise "a failed read exits 2" can instead pass
+    through the MISMATCH path -- green while the behaviour it names was never reached -- or go red on
+    a box that exports the variable. Deleting both here makes each repo test state its own inputs.
+    (`test_pr_doctor.py` carries the same isolation for the same reason.)
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.delenv("OR", raising=False)
+
+
+def test_an_UNKNOWN_verdict_EXITS_2_so_no_launcher_can_read_it_as_healthy(monkeypatch, tmp_path,
+                                                                        capsys):
+    """The measured violation, end to end: a failed read must not exit 0.
+
+    The read is stubbed through the same seam every other test uses (GraphQL + REST both refuse), so
+    the verdict really is `UNKNOWN` -- this is not asserting the code table against itself. The
+    checkout derivation is pinned to "nothing derivable" so the MISMATCH path cannot answer instead:
+    an exit-code-only assertion would pass through either route (review round 1, P2).
+    """
+    monkeypatch.setattr(objective, "_checkout_repo", lambda path=None: (None, "underivable"))
+    cache = tmp_path / "objective.last"
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    install(monkeypatch, pr_list=_Result(1, "", "transport wedged"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 97.5, 97.5, 97.5])
+    rc = objective.main()
+    assert rc == objective.EXIT_REFUSING == 2, rc
+    line = capsys.readouterr().out
+    # ⛔ THE PATH THIS TEST NAMES, NOT THE OTHER ONE THAT ALSO EXITS 2.
+    assert "queue_read=UNREADABLE" in line, line
+    assert "repo_mismatch" not in line, line
+    # ⛔ AND THE LINE STILL PRINTS. The heartbeat calls this every tick and must never lose its line
+    # to an exception: the code is a SECOND surface, never a replacement for the first.
+    assert cache.exists() is False, "a refused read must not be cached"
+
+
+def test_a_readable_verdict_exits_0_and_a_refusing_one_exits_2(monkeypatch, tmp_path):
+    """The decision is POLARITY: only a verdict this file knows is readable may exit 0.
+
+    ⛔ HERMETIC (review round 2, P2). The first version left `CACHE` on the REAL state dir, so
+    `main()`'s serve arm ran `main_sha()` — a LIVE `gh api repos/<repo>/commits/main` — once per
+    iteration: measured 7 real API calls from one unit test, against the file's own rule that "without
+    this seam every test … would reach the REAL api.github.com". Pinning `CACHE` to a path that does
+    not exist means the serve arm is never entered, so the test asserts only the cell it names.
+    """
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "objective.last"))
+    # ⛔ AND THE LIVENESS READ ITSELF: iteration 1 WRITES that cache, so from iteration 2 the serve
+    # arm is entered and asks `main_sha()` -- a live `gh api`. Pinning `CACHE` alone was not enough
+    # (measured: 7 real calls, 14.8s).
+    monkeypatch.setattr(objective, "main_sha", lambda: "deadbeef")
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    for verdict, want in (("AT-TARGET", 0), ("ADVANCING", 0), ("REGRESSING", 0), ("FIX-MAIN", 0),
+                          ("UNKNOWN", 2), ("GH-RATE-LIMITED", 2),
+                          # ⛔ AND A WORD NOBODY HAS TAUGHT THIS FILE YET. An allow-list is the
+                          # only polarity that cannot leak: a documented-verdicts deny-list lets an
+                          # unrecognised conclusion fall through the gap and read as a pass.
+                          ("SOMETHING-NEW", 2), ("", 2)):
+        monkeypatch.setattr(objective, "build", lambda prev=None, v=verdict:
+                            "OBJECTIVE VERDICT=%s main=GREEN@deadbeef" % v if v
+                            else "OBJECTIVE main=GREEN@deadbeef")
+        assert objective.main() == want, (verdict, want)
+
+
+def test_BLINDNESS_outranks_the_verdict_WORD(monkeypatch):
+    """⛔ A READABLE WORD MAY NOT OUTRANK AN UNREAD WORLD (review round 1, P2 -- reproduced).
+
+    `build()`\'s ladder puts `FIX-MAIN` ABOVE the blind-queue arm, so a RED main beside an unreadable
+    queue emits `VERDICT=FIX-MAIN … queue=UNREADABLE`. That is a readable claim about a world that
+    was not read, and a caller keying on the code would have taken it as healthy. The verdict word is
+    a statement about the queue; a blindness token is a statement that there was no queue to
+    describe.
+    """
+    line = ("OBJECTIVE VERDICT=FIX-MAIN main=RED@aaaaaaaaa failing_required=python-ci-gate "
+            "queue=UNREADABLE")
+    assert objective.verdict_of(line) == "FIX-MAIN"
+    assert objective.is_blind_line(line) is True
+    assert objective._exit_for(line) == 2
+    # ...and the readable twin, one token away, is still a pass: non-vacuity.
+    assert objective._exit_for(line.replace("queue=UNREADABLE", "waiting=3")) == 0
+
+
+def test_the_default_repo_is_LOUD_and_the_checkout_wins_over_it(monkeypatch):
+    """`repo_src` names WHICH input chose the repo -- the silent default, ended.
+
+    ⛔ THE FALLBACK IS NOT REMOVED, IT IS MADE VISIBLE (agent-infra#2710 scope item 1). Removing it
+    outright would blind the Mac\'s beat, whose farm copy is not a git checkout and carries no
+    deriver; leaving it SILENT is what read tortoise\'s check-runs for agent-infra\'s SHAs for hours.
+    """
+    assert objective.resolve_repo(env="", checkout="")[:3] == (
+        objective.REPO_DEFAULT, "default", "")
+    # ...and an UNDERIVABLE checkout is stated, not assumed away: a default that could not be
+    # compared must not read like one that was.
+    assert objective.resolve_repo(env="", checkout="", checkout_why="deriver-missing")[3] == \
+        "uncompared:deriver-missing"
+
+    # An explicit value is honoured, and NAMED as the source, with the comparison made.
+    assert objective.resolve_repo(env="acme/widget", checkout="")[:2] == ("acme/widget", "env")
+
+    # ⛔ THE PROPERTY THAT WOULD HAVE PREVENTED THE INCIDENT: standing in a checkout, an unset
+    # variable reads THAT checkout -- so no process can silently read another repo again.
+    assert objective.resolve_repo(env="", checkout="acme/widget")[:2] == ("acme/widget", "checkout")
+
+    # An explicit value that DISAGREES with the checkout is a named refusal, not a read.
+    slug, src, refusal, _check = objective.resolve_repo(
+        env="acme/widget", checkout="acme/other")
+    assert (slug, src) == ("acme/widget", "env")
+    assert "repo_mismatch" in refusal, refusal
+    assert "read=acme/widget" in refusal and "checkout=acme/other" in refusal, refusal
+    assert "next=" in refusal, "a refusal carries a NEXT ACTION, not only a reason"
+
+    # ⛔ AND A DECLARATION THAT COULD NOT BE COMPARED SAYS SO (review round 1, P2). Returning a bare
+    # `("", "env")` made an INERT guard read as a satisfied one -- the exact shape this issue is
+    # about -- and made the prescribed remedy ("deploy the deriver") unactionable.
+    assert objective.resolve_repo(env="acme/widget", checkout="",
+                                  checkout_why="deriver-missing")[3] == \
+        "uncompared:deriver-missing"
+
+
+def test_OR_is_a_declaration_too_and_outranks_the_checkout(monkeypatch):
+    """⛔ THE CONTROLLER'S OWN REPO IS AN INPUT (review round 1, P2 -- it was a hole).
+
+    `orch-loop.sh` EXPORTS `OR` -- the repo it grades and dispatches for -- into every child. With
+    only cwd derivation, a controller bound to tortoise whose pass ran with a cwd inside ANOTHER
+    checkout would publish that other repo\'s queue, stamped `repo_src=checkout` (the arm this
+    contract presents as trustworthy) and exiting 0. A declaration outranks the cwd, and a
+    disagreement is the same named refusal.
+    """
+    monkeypatch.setenv("OR", "acme/graded")
+    assert objective.declared_repo() == ("acme/graded", "OR")
+    assert objective.resolve_repo(env=None, checkout="acme/other")[0] == "acme/graded"
+    assert "repo_mismatch" in objective.resolve_repo(env=None, checkout="acme/other")[2]
+    # `OBJECTIVE_REPO` is this file\'s own input and still wins over `OR`.
+    monkeypatch.setenv("OBJECTIVE_REPO", "acme/own")
+    assert objective.declared_repo() == ("acme/own", "OBJECTIVE_REPO")
+
+
+def test_a_REPO_MISMATCH_refuses_BEFORE_any_read(monkeypatch, tmp_path):
+    """The 2026-10-24 measurement: never issue the wrong repo\'s reads and report the 422s.
+
+    ⛔ THE ASSERTION IS "NOTHING WAS READ", NOT "THE CODE IS 2". A mutant that still read the wrong
+    repo would exit 2 anyway (the reads fail, the verdict is UNKNOWN), so an exit-code-only test
+    passes for the wrong reason and cannot see the regression it was written for. The read seam
+    therefore RECORDS instead of raising.
+    """
+    reads = []
+    monkeypatch.setattr(objective, "gh", lambda *a, **k: reads.append(a) or _Result(1, "", ""))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: reads.append("res") or "RES: x")
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "none"))
+    monkeypatch.setattr(objective, "_checkout_repo",
+                        lambda path=None: ("acme/checkout", ""))
+    monkeypatch.setenv("OBJECTIVE_REPO", "acme/other")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    rc = objective.main()
+    assert rc == objective.EXIT_REFUSING == 2, rc
+    assert reads == [], ("a mismatched repo must not be read at all; it was: %r" % (reads,))
+
+
+def test_the_mismatch_line_names_both_slugs_the_repo_and_the_next_action(monkeypatch, tmp_path,
+                                                                        capsys):
+    monkeypatch.setattr(objective, "_checkout_repo", lambda path=None: ("acme/checkout", ""))
+    monkeypatch.setenv("OBJECTIVE_REPO", "acme/other")
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "none"))
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    objective.main()
+    line = capsys.readouterr().out
+    assert "VERDICT=UNKNOWN" in line, line
+    assert "error=repo_mismatch(read=acme/other, checkout=acme/checkout)" in line, line
+    assert "next=" in line, line
+    # ⛔ THE REFUSAL CARRIES THE SAME SEGMENT AS EVERY OTHER LINE (review round 1, P2): the one line
+    # that reports a failed read is exactly where "which repo was this about" matters most.
+    assert "repo=acme/other" in line, line
+    assert "repo_src=env" in line, line
+
+
+def test_a_build_EXCEPTION_line_still_names_the_repo(monkeypatch, tmp_path, capsys):
+    """The failure line is the one place a reader cannot otherwise tell WHICH repo failed."""
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
+    monkeypatch.setattr(objective, "REPO_SRC", "checkout")
+    monkeypatch.setattr(objective, "_checkout_repo", lambda path=None: ("acme/widget", ""))
+    monkeypatch.setattr(objective, "build", lambda prev=None: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "none"))
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    assert objective.main() == 2
+    line = capsys.readouterr().out
+    assert "error=boom" in line, line
+    assert "repo=acme/widget" in line and "repo_src=checkout" in line, line
+
+
+def test_the_line_always_names_the_repo_and_where_it_came_from(monkeypatch):
+    """A reader must be able to tell "tortoise" from "the fallback I was standing in".
+
+    ⛔ AND THE SEGMENT GOES LAST, ON PURPOSE (review round 1, P3). The fleet reads this line through
+    a fixed `cut -c1-900` (`cadence-nudge.sh`), and the `| PR-DOCTOR …` fact is deliberately emitted
+    EARLY so a cut cannot sever it. Prepending a new segment pushed every existing one toward that
+    boundary with no measurement; appending keeps the ordering the file already argued for.
+    """
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
+    monkeypatch.setattr(objective, "REPO_SRC", "checkout")
+    monkeypatch.setattr(objective, "REPO_CHECK", "")
+    assert objective.repo_seg() == "repo=acme/widget repo_src=checkout"
+    # ...and an uncomparable declaration is on the segment, not silently dropped.
+    monkeypatch.setattr(objective, "REPO_CHECK", "uncompared:deriver-missing")
+    assert objective.repo_seg().endswith("repo_check=uncompared:deriver-missing")
+    _stub_reads(monkeypatch, waiting=3, crit_max=5.0)
+    monkeypatch.setattr(objective, "REPO_CHECK", "")
+    line = objective.build()
+    assert line.rstrip().endswith("repo=acme/widget repo_src=checkout"), line[-120:]
+    assert "| PR-DOCTOR" in line.split("repo=acme/widget")[0], (
+        "the dispatcher fact must stay ahead of the appended repo segment: %r" % line)
+
+
+def test_the_deriver_is_SOURCED_and_actually_READS_a_checkout(tmp_path):
+    """⛔ BEHAVIOUR, NOT A STRING (#2710 review round 1, P2 -- the string version was vacuous).
+
+    The first version of this check asserted that `repo-slug.sh`/`derive_or` appear in the file\'s
+    TEXT -- and both words appear in the docstring that explains them, so replacing the whole shim
+    with a second, inline parser left it green. A test for "there is one derivation" has to run the
+    derivation: a real checkout must yield its own slug, and a checkout with no origin must say so.
+    """
+    import subprocess as sp
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "commit.gpgsign=false", "-c", "user.email=a@b",
+           "-c", "user.name=a"]
+    assert sp.run(git + ["init", "-q"], capture_output=True).returncode == 0
+    (repo / "f").write_text("x")
+    assert sp.run(git + ["add", "f"], capture_output=True).returncode == 0
+    assert sp.run(git + ["commit", "-qm", "init"], capture_output=True).returncode == 0
+    assert sp.run(git + ["remote", "add", "origin",
+                         "https://github.com/acme/widget.git"], capture_output=True).returncode == 0
+    assert objective._checkout_repo(str(repo)) == ("acme/widget", "")
+
+    # ...and a checkout with NO origin is underivable, NAMED as such.
+    bare = tmp_path / "no-origin"
+    bare.mkdir()
+    git2 = ["git", "-C", str(bare), "-c", "commit.gpgsign=false", "-c", "user.email=a@b",
+            "-c", "user.name=a"]
+    assert sp.run(git2 + ["init", "-q"], capture_output=True).returncode == 0
+    assert objective._checkout_repo(str(bare)) == (None, "underivable")
+
+
+def test_a_deployment_WITHOUT_the_deriver_says_so_instead_of_guessing(tmp_path):
+    """The farm copy (`~/.pi/agent/scripts/`) has no `repo-slug.sh`: `deriver-missing`, not a guess.
+
+    Two causes, two remedies -- and the reason must reach the LINE (`repo_check=`), or the operator
+    applies "run from the checkout you mean" for ever on a box that is missing the file.
+    """
+    import importlib.util as ilu
+    import shutil as sh
+    src = pathlib.Path(__file__).with_name("objective.py")
+    lone = tmp_path / "scripts"
+    lone.mkdir()
+    sh.copy2(src, lone / "objective.py")          # deliberately NOT the deriver
+    spec = ilu.spec_from_file_location("objective_lone", lone / "objective.py")
+    mod = ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._checkout_repo(str(tmp_path)) == (None, "deriver-missing")
+    _slug, src_kind, refusal, check = mod.resolve_repo(env="acme/widget", checkout=None)
+    assert (src_kind, refusal) == ("env", "")
+    assert check == "uncompared:deriver-missing", check
+
+
+def test_an_UNREADABLE_CWD_is_a_NAMED_cause_and_not_a_laundered_underivable(monkeypatch, tmp_path):
+    """⛔ agent-infra#2922: `os.getcwd()` IS NOT A TOTAL FUNCTION, and its failure was LAUNDERED.
+
+    Under launchd with no Full Disk Access the call RAISES instead of returning a path --
+    `PermissionError` for a TCC-denied `WorkingDirectory`, `FileNotFoundError` for a deleted one
+    (both measured on this box). `_checkout_repo()` evaluated it INSIDE the `try` around
+    `subprocess.run`, so the raise was caught by the broad `except Exception` below and reported as
+    `underivable` -- the cause whose remedy is "go and debug `git`/`bash`". So an operator on such a
+    box debugged the deriver for ever while the actual cause was the launcher's working directory,
+    and it is the exact outcome #2922's Objective forbids: "when the cwd is unreadable and no other
+    evidence names the repo, the refusal NAMES the unreadable cwd".
+
+    Reproduced before the fix: with `os.getcwd` raising, `_checkout_repo()` returned
+    `(None, 'underivable')`, and `resolve_repo()` put `repo_check=uncompared:underivable` on the
+    line. Both assertions below are red on that code.
+    """
+
+    def boom():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(objective.os, "getcwd", boom)
+    assert objective._checkout_repo() == (None, "cwd-unreadable")
+    # an EMPTY path is the same signal as no path: both mean "resolve the cwd", never `"."`
+    assert objective._checkout_repo("") == (None, "cwd-unreadable")
+    _slug, src_kind, refusal, check = objective.resolve_repo(env="acme/widget", checkout=None)
+    assert (src_kind, refusal) == ("env", "")
+    assert check == "uncompared:cwd-unreadable", check
+
+    # ⛔ AND THE TWO FACTS STAY APART: an explicit checkout that is not a checkout is still
+    # `underivable`. A fix that renamed every reason would satisfy the arm above and destroy this one.
+    monkeypatch.undo()
+    assert objective._checkout_repo(str(tmp_path)) == (None, "underivable")
+
+
+def test_an_explicit_path_never_touches_the_cwd(monkeypatch, tmp_path):
+    """The other half of totality: a caller that SUPPLIES a path must not call `os.getcwd()` at all.
+
+    `REPO`, `PR_DOCTOR_REPO_DIR` and `--repo` are explicit, and on a launchd box the cwd is the one
+    input that may be unreadable. Resolving it anyway is how a pass that already held the datum for
+    the repo died asking a question it did not need answered (agent-infra#2913, #2922).
+    """
+
+    def boom():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(objective.os, "getcwd", boom)
+    # an explicit path still resolves normally -- the deriver answers, no cwd is consulted
+    assert objective._checkout_repo(str(tmp_path)) == (None, "underivable")
+
+
+# ── REVIEW ROUND 2 (#2710): three ways the rule above could still let a wrong answer through ──────
+# Each of these was REPRODUCED before the fix, by running it against the pre-fix file. They are the
+# gaps a first pass over the refusal rule leaves: an incomplete blindness inventory, a tool that
+# answers GREEN from another repo's gates, and a token that a third party can put in the line.
+def test_a_BLIND_queue_read_refuses_whatever_the_verdict_says(monkeypatch):
+    """⛔ `queue_read=BLIND` WAS NOT IN THE BLINDNESS INVENTORY (review round 2, reproduced).
+
+    `_queue_read_is_blind` calls `BLIND` "this file's word for 'the QUEUE read did not answer'", and
+    `build()` prints it beside the counts it disowns -- while `AT-TARGET` (the IDLE word) is derived
+    from exactly those counts. A line that says its own numbers are not a clearance exited 0.
+    Reproduced end to end before the fix: a 4-PR queue with every `mergeStateStatus=UNKNOWN`
+    printed `VERDICT=AT-TARGET … queue_read=BLIND(4/4 unread, samples=4) -- the QUEUE counts are NOT
+    a clearance` and returned rc 0.
+    """
+    real = ("OBJECTIVE VERDICT=AT-TARGET main=GREEN@9c4788400 open=4 drafts=0 nondraft=4 "
+            "queue_read=BLIND(4/4 unread, samples=4) -- the QUEUE counts are NOT a clearance "
+            "repo=acme/widget repo_src=checkout")
+    assert objective.is_blind_line(real) is True
+    assert objective._exit_for(real) == 2
+    # the OTHER spelling: the spent-deadline arm, which prints no counts at all
+    unreadable = real.replace("queue_read=BLIND(4/4 unread, samples=4)",
+                              "queue_read=UNREADABLE(waited=100.4s, last_good=812s)")
+    assert objective._exit_for(unreadable) == 2
+    # ⛔ NON-VACUITY, and the line that must NOT refuse: `REST(` is a DECIDED non-blind degradation
+    # (the count is still usable and the line says so). Refusing on it would make the rule a
+    # permanent over-block on every repo without merge-state clearance.
+    rest = real.replace("queue_read=BLIND(4/4 unread, samples=4)",
+                        "queue_read=REST(merge_state unread 2/4, samples=4)")
+    assert objective.is_blind_line(rest) is False
+    assert objective._exit_for(rest) == 0
+
+
+def test_an_error_token_inside_a_THIRD_PARTY_name_does_not_refuse_a_readable_line(monkeypatch):
+    """⛔ `error=` MATCHED AS A SUBSTRING, SO SOMEONE ELSE'S JOB NAME DECIDED THE EXIT CODE.
+
+    `build()` interpolates third-party text into the line (`failing_required=<check names>`, a
+    `PR-DOCTOR(last run) … <reason>`). Measured: a required check legitimately named
+    `pytest (error=timeout)` made a fully READABLE `FIX-MAIN` line refuse. Fail-closed, so it cannot
+    ship a wrong answer -- but a permanent over-block on another team's naming is its own defect, and
+    `error=` is only blindness where it is a FIELD.
+    """
+    readable = ("OBJECTIVE VERDICT=FIX-MAIN main=RED@abcdef123 "
+                "failing_required=test (error=timeout) repo=acme/widget repo_src=env")
+    assert objective.is_blind_line(readable) is False
+    assert objective._exit_for(readable) == 0
+    # ⛔ NON-VACUITY: the REAL failing read still refuses, both as a field and as the line's own
+    # `error=` fact. The structural match must not be loosened into "never matches".
+    assert objective._exit_for("OBJECTIVE VERDICT=UNKNOWN error=transport wedged") == 2
+    assert objective.is_blind_line("OBJECTIVE VERDICT=UNKNOWN error=boom repo=a/b") is True
+
+
+def test_a_FOREIGN_required_set_is_UNKNOWN_and_never_GREEN(monkeypatch):
+    """⛔ THE WORST SHAPE THIS ISSUE NAMES: A FALSE PASS (review round 2, P1 -- reproduced).
+
+    `REQUIRED` is TORTOISE's set by default and #2710 made `REPO` follow the checkout/`OR`, so on any
+    other repo those gates are not the ones being run: `req_red` empty, nothing in flight, GREEN.
+    Measured on this worktree with the bundled set and three ALL-RED checks:
+    `main_health() -> ('GREEN', [])`.
+
+    ⛔ AND A PRESENCE TEST WOULD HAVE BROKEN THE PRIMARY BOX (review round 2, P1 -- measured live).
+    On tortoise main `ef02b7acd` the five reusable-workflow gates are published as
+    `main-health / docs` (not `docs`) and GraphQL returned seven names containing none of them, so
+    "no required name present" is TRUE on the very repo the rubric describes. The guard therefore asks
+    about the REPO (`REQUIRED_REPO`), and this test pins that direction too: tortoise must never be
+    refused by it.
+    """
+    monkeypatch.setattr(objective, "gql_commit_checks", lambda sha: [{"name": "stub"}])
+    monkeypatch.setattr(objective, "newest_attempts", lambda cr: [])
+    monkeypatch.setattr(objective, "rollup_checks", lambda cr: ({"python-ci"}, set()))
+
+    # A repo the bundled rubric does NOT describe, with the built-in set: cannot verify -> UNKNOWN.
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
+    monkeypatch.setattr(objective, "REQUIRED_SUPPLIED", False)
+    assert objective.main_health("abc") == ("UNKNOWN", [])
+
+    # ⛔ NON-VACUITY 1: THE RUBRIC'S OWN REPO IS JUDGED, WHATEVER ITS SURFACE LOOKS LIKE. Even with
+    # a rollup whose names match nothing (the shape the presence test mistook for "foreign"), tortoise
+    # must not be refused -- its gates are rendered as `main-health / docs`, and GraphQL omits them.
+    monkeypatch.setattr(objective, "REPO", "daniel-ospina/tortoise")
+    assert objective.main_health("abc") == ("GREEN", [])
+
+    # ⛔ NON-VACUITY 2: a SUPPLIED set on a foreign repo is the repo's own -- judged, not refused.
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
+    monkeypatch.setattr(objective, "REQUIRED", ("python-ci",))
+    monkeypatch.setattr(objective, "REQUIRED_SUPPLIED", True)
+    monkeypatch.setattr(objective, "rollup_checks", lambda cr: ({"python-ci", "docs-ci"}, set()))
+    assert objective.main_health("abc") == ("RED", ["python-ci"])
+
+
+def test_a_RED_reusable_workflow_gate_is_SEEN(monkeypatch):
+    """⛔ A REQUIRED CONTEXT NAME IS NOT A CHECK-RUN NAME (review round 2, P1 -- measured).
+
+    Branch protection requires the context `docs`; a reusable workflow publishes the check-run as
+    `main-health / docs`. A bare `c in red` therefore could not see a red required gate AT ALL:
+    measured on tortoise main `ef02b7acd`, the surface carries `main-health / docs`,
+    `main-health / legal-e2e`, `main-health / license-surface`, `main-health / pricing-artifact`,
+    `main-health / test-isolation` while the required contexts are the leaves -- so `main=GREEN` could
+    sit over a red required gate. This is a PRE-EXISTING false PASS, closed by the same helper that
+    makes the foreign-rubric guard safe.
+    """
+    monkeypatch.setattr(objective, "REPO", "daniel-ospina/tortoise")
+    monkeypatch.setattr(objective, "REQUIRED_SUPPLIED", False)
+    monkeypatch.setattr(objective, "gql_commit_checks", lambda sha: [{"name": "stub"}])
+    monkeypatch.setattr(objective, "newest_attempts", lambda cr: [])
+    # The measured shape: the red gate is the LEAF under a caller workflow.
+    monkeypatch.setattr(objective, "rollup_checks",
+                        lambda cr: ({"main-health / docs", "lint"}, set()))
+    assert objective.main_health("abc") == ("RED", ["docs"])
+    # ...and IN FLIGHT too, so a queued required gate is not "green" either.
+    monkeypatch.setattr(objective, "rollup_checks",
+                        lambda cr: (set(), {"main-health / legal-e2e"}))
+    assert objective.main_health("abc") == ("FLIGHT", [])

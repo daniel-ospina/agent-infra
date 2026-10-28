@@ -129,10 +129,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, dirname, join, relative } from "node:path";
+import { resolve, dirname, join, relative, sep } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { isPrintMode } from "../shared/print-mode.js";
 import { appendJsonl } from "../shared/audit-log.js";
 
@@ -2808,6 +2809,19 @@ function _worktreeDiscardBlock(command: string): string | null {
       hit.kind === "producer" ? _wtExpandedProducerReason(hit.token) : _WT_EXPANDED_SCRIPT_REASON,
     );
   };
+  // ⛔ ONE predicate for every place a script FILE's own body is read — the two
+  // command-position walks AND the `eval` / `-c` / `$(cat)` / assignment-value readers.
+  // A SANCTIONED, PINNED script's body is audited bytes, so the arm does not apply to it
+  // (`_isAuditedSanctionedScript` = sanctioned anchor + the pin's digest, never the path
+  // alone); for anything else the refusal fires exactly as before. Patching only some of
+  // these sites makes the verdict depend on WHERE the same body was reached — which is the
+  // invariant `_expRefusal` itself states two lines above — and leaves the reported defect
+  // (a framework script, including the mandated rail, unrunnable by a false block) alive on
+  // the spellings that go through the other readers.
+  const _expRefusalForBody = (scriptPath: string, body: string): string | null =>
+    _isAuditedSanctionedScript(resolve(execCwd, scriptPath), _sha256OfBody(body))
+      ? null
+      : _expRefusal(body);
 
   // Executable-shebang script (`./undo.sh`, `/tmp/undo.sh`): extractScriptPath
   // only recognises interpreter WORDS (`bash x.sh`), so a directly-executed
@@ -3217,12 +3231,43 @@ function _worktreeDiscardBlock(command: string): string | null {
       if (disc.length) {
         sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: p });
       }
-      // #1228: a script we DID read runs an EXPANDED path — same unreadable-
-      // script hole one level down, as a direct operand (`bash ./undo*.sh`) OR
-      // as a piped producer (`bash -c 'cat ./undo*.sh | bash'`); fail closed
-      // before the walk silently skips it.
-      const expNested = _expRefusal(content);
-      if (expNested) return expNested;
+      // ⛔ A SANCTIONED script's BODY is AUDITED BYTES, so the #1228 body arm does not
+      // apply to it. WHY THE TWO EXEMPTIONS ARE NOT ONE: M4's #1129 arm skips its whole walk
+      // for an audited leaf ("the walk is skipped for the whole invocation"), while M5's
+      // #1139 arm is deliberately SET-scoped ("the SET is dropped, never the command", see
+      // the SCOPE paragraph below) — so M5's exemption was honoured for the DISCARD verdict
+      // and this refusal, re-derived from the SAME audited file inside the same walk,
+      // escaped it. The digest makes the same audited-bytes claim M4 already makes, which is
+      // why it is the key here. How the framework's own `gh` shim became unrunnable: its
+      // body carries
+      //     LC_ALL=C grep -qa '<marker>' <(head -c 8192 2>/dev/null < "$1")
+      // and `_wtProcessSubExpansion` matches ANY `<(head|tail|cat|…)` whose inner text
+      // needs a runtime expansion, so a PROCESS-SUBSTITUTION ARGUMENT to `grep` — not a
+      // script source at all — was read as an expanded script path and every path-spelled
+      // invocation of the shim was refused as "the script path contains a shell-expansion
+      // form" (measured 2026-10-24; reds `test-script-backdoor.mjs` B5c on any box where
+      // `gh` on PATH IS that shim).
+      //
+      // ⛔ THE PREDICATE IS THE DIGEST, NOT THE PATH. `_sanctionedScriptExemption` has two
+      // arms and only arm 2 checks bytes; arm 1 is PATH ONLY by spec (the pre-existing
+      // `~/.pi/agent` anchor, unchanged by #2332). Keying this stand-down on
+      // `exemption !== null` therefore exempts ARBITRARY bytes at a sanctioned relpath
+      // under the module's root — measured at review AND by the verifier: an unaudited
+      // body planted at a sanctioned relpath was ALLOWED with the path-keyed version and
+      // BLOCKED without it. That is the #1228 fail-open (silent destruction of other
+      // sessions' uncommitted work, which an expanded operand resolves at runtime).
+      // `_isAuditedSanctionedScript` adds the pin's sha256 for BOTH arms, so only the
+      // shipped bytes can take it. Note the body's own discards are still PARSED above (the
+      // set filter is what drops them), and the nested-script descent below is NOT skipped
+      // — the audited-bytes claim is about THIS file only, so whatever its body names is
+      // still walked.
+      if (!_isAuditedSanctionedScript(real, _sha256OfBody(content))) {
+        // #1228: a script we DID read runs an EXPANDED path — same unreadable-script hole
+        // one level down, as a direct operand or as a piped producer; fail closed before the
+        // walk silently skips it.
+        const expNested = _expRefusal(content);
+        if (expNested) return expNested;
+      }
       p = extractScriptPath(content) ?? seeds.shift() ?? null;
     }
     // #1885 — the SECOND, independently bounded walk: every command-position script the
@@ -3251,8 +3296,14 @@ function _worktreeDiscardBlock(command: string): string | null {
         if (disc.length) {
           sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: seed });
         }
-        const expNested = _expRefusal(content);
-        if (expNested) return expNested;
+        // Same digest-keyed stand-down as the walk above — ONE predicate, both walks (a
+        // sanctioned script reached through the command-position queue must not be gated by
+        // a rule its sibling walk already exempts it from). The nested-script push below is
+        // NOT skipped, for the same reason.
+        if (!_isAuditedSanctionedScript(real, _sha256OfBody(content))) {
+          const expNested = _expRefusal(content);
+          if (expNested) return expNested;
+        }
         const nested = extractScriptPath(content);
         if (nested && !seen.has(String(nested)) && !cpQueue.includes(nested)) cpQueue.push(nested);
       }
@@ -3323,7 +3374,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           const real = realpathSync(resolve(execCwd, val));
           if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) {
             const vContent = readFileSync(real, "utf8");
-            const expFile = _expRefusal(vContent);
+            const expFile = _expRefusalForBody(real, vContent);
             if (expFile) return expFile;
             sets.push({ discs: extractWorkingTreeDiscards(vContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: val });
           }
@@ -3352,7 +3403,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           const sp = extractScriptPath(sub);
           if (sp && !/[$`]/.test(sp)) {
             const scContent = readFileSync(resolve(execCwd, sp), "utf8");
-            const expSc = _expRefusal(scContent);
+            const expSc = _expRefusalForBody(sp, scContent);
             if (expSc) return expSc;
             sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
           }
@@ -3377,7 +3428,7 @@ function _worktreeDiscardBlock(command: string): string | null {
       const sp = extractScriptPath(payload);
       if (sp && !/[$`]/.test(sp)) {
         const eContent = readFileSync(resolve(execCwd, sp), "utf8");
-        const expFile = _expRefusal(eContent);
+        const expFile = _expRefusalForBody(sp, eContent);
         if (expFile) return expFile;
         sets.push({ discs: extractWorkingTreeDiscards(eContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
       }
@@ -3466,7 +3517,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           // where outer-glob.sh is `bash ./undo*.sh`) — the payload-text check
           // above cannot see it, and the static-discard probe below cannot read
           // the inner script. Same rule as the nested-script walk.
-          const expFile = _expRefusal(cContent);
+          const expFile = _expRefusalForBody(sp, cContent);
           if (expFile) return expFile;
           sets.push({ discs: extractWorkingTreeDiscards(cContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
         }
@@ -3490,7 +3541,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           // carry an expanded script shape (`bash -c "$(cat /tmp/x.sh)"` where
           // x.sh pipes `./undo*.sh` into bash) — the static-discard probe below
           // cannot read it, so the nested-script rule applies here too.
-          const expCat = _expRefusal(catContent);
+          const expCat = _expRefusalForBody(real, catContent);
           if (expCat) return expCat;
           sets.push({ discs: extractWorkingTreeDiscards(catContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: catPath });
           continue;
@@ -3543,7 +3594,7 @@ function _worktreeDiscardBlock(command: string): string | null {
               const st = statSync(real);
               if (st.isFile() && (st.mode & 0o111) !== 0 && st.size <= 64 * 1024) {
                 const pContent = readFileSync(real, "utf8");
-                const expP = _expRefusal(pContent);
+                const expP = _expRefusalForBody(first, pContent);
                 if (expP) return expP;
                 sets.push({ discs: extractWorkingTreeDiscards(pContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: first });
               }
@@ -3571,7 +3622,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           const sp = extractScriptPath(sub);
           if (sp && !/[$`]/.test(sp)) {
             const scContent = readFileSync(resolve(execCwd, sp), "utf8");
-            const expSc = _expRefusal(scContent);
+            const expSc = _expRefusalForBody(sp, scContent);
             if (expSc) return expSc;
             sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
           }
@@ -3630,9 +3681,15 @@ function _worktreeDiscardBlock(command: string): string | null {
   const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>();
   const gatedSets = sets.filter((s) => {
     if (s.script === null) return true; // the command's own argv is never exempt
+    // ⛔ PATH-ONLY, and therefore a KNOWN FAIL-OPEN (#2775) — same shape as the #1129 skip
+    // above: arm 1 of `_sanctionedScriptExemption` is path-keyed by spec, so a destructive
+    // script minted at a sanctioned relpath under the module's own root has its discards
+    // dropped from the set instead of being gated. Tracked as #2775 (with the measured
+    // reproduction); when it is closed, this decision must be keyed on the body's digest
+    // (`_sha256OfBody` + `_sanctionedScriptPin`), not on the path.
     let rel: string | null = null;
     // Fail closed on a probe failure: keep the set gated.
-    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { rel = null; }
+    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script))?.rel ?? null; } catch { rel = null; }
     if (rel === null) return true;
     let real = resolve(execCwd, s.script);
     try { real = realpathSync(real); } catch { /* keep the lexical path as the key */ }
@@ -3834,11 +3891,18 @@ function _worktreeDiscardBlock(command: string): string | null {
 // uncommitted work with the content walker switched off. Only scripts whose
 // git content is read-only or the documented recovery surface are listed.
 //
-// WHY THE GUARD'S OWN CHECKOUT: the realpath anchor is derived from this
-// module's location, so an agent-editable COPY of the framework (a linked
-// worktree, where the write gate is lifted) has a different realpath and is
-// NOT exempt. A repo-fingerprint anchor (isAgentInfraRepo) would have been
-// forgeable by exactly that route.
+// WHY THE GUARD'S OWN CHECKOUT — AND (since #2332) A FRAMEWORK CHECKOUT WITH THE
+// AUDITED BYTES: the realpath anchor is derived from this module's location, so
+// an agent-editable COPY of the framework (a linked worktree, where the write
+// gate is lifted) has a different realpath and is NOT exempt. A repo-fingerprint
+// anchor (isAgentInfraRepo) would have been forgeable by exactly that route, so
+// the root is never trusted ON ITS OWN: see `_sanctionedScriptExemption` — the
+// second arm requires the sanctioned relpath INSIDE a framework checkout AND a
+// sha256 match against `sanctioned-scripts.pin.json`. The pin is the half that
+// cannot be forged; the root check only confines the exemption to framework
+// trees. A copy of the audited bytes at an arbitrary path stays BLOCKED, and a
+// DIFFERENT script at a sanctioned relpath (renamed into a framework tree) is
+// BLOCKED too.
 const SANCTIONED_SCRIPT_RELPATHS = [
   // commit-workflow Step 1 (01-preflight.md) — the mandated pre-push gate.
   "scripts/check-pipeline-compliance.sh",
@@ -3919,26 +3983,248 @@ const _frameworkRoot: string | null = (() => {
   }
 })();
 
-/** Sanctioned-framework-script exemption (#1129) — returns the matched
- *  relative path (for the audit row), or null. Realpath-keyed on BOTH sides:
- *  a symlinked spelling (the hub's `scripts/`) resolves to the same file, and a
- *  copy in another checkout does not. The listed relpath is realpath'd too, so
- *  a symlinked component inside the framework's own tree cannot silently
- *  disable the exemption. */
-function _sanctionedScriptExemption(resolvedScript: string): string | null {
-  if (!_frameworkRoot) return null;
+/** THE INVARIANTS this function must keep (#2332) — it must be able to tell
+ *  "the sanctioned rail, run from a hub" from "an arbitrary script pretending
+ *  to be the rail". There are TWO arms and they carry DIFFERENT invariants;
+ *  collapsing them into one sentence was false of arm 1 (#2332 review P2):
+ *
+ *    arm 1  exempt IFF the file is the sanctioned path inside THE MODULE'S OWN
+ *           CHECKOUT. PATH ONLY — no digest is checked on this arm (it is the
+ *           pre-existing anchor, deliberately unchanged).
+ *    arm 2  exempt IFF (a) the file IS at a sanctioned relpath inside a
+ *           FRAMEWORK CHECKOUT, (b) its bytes ARE the audited bytes (the
+ *           sha256 pinned in `sanctioned-scripts.pin.json`), and (c) every
+ *           file the leaf executes by its own location hashes to its pin.
+ *
+ *  For arm 2, (a) alone is a FILENAME: any destructive script renamed
+ *  `admin-merge.sh` inside a directory carrying the framework's two fingerprint
+ *  files would pass — "a framework checkout" is purchasable (`git init` +
+ *  `manifest.json` + `pi-bootstrap/setup.sh` are all allowed operations).
+ *  (b) alone is a CONTENT RULE: the same bytes at ANY path would pass, which is
+ *  exactly the rule #1485 rejected at review (a committed script whose content
+ *  is destructive ran with the walk switched off).
+ *  TOGETHER they name ONE artifact — the framework's own rail, in a framework
+ *  tree, with the bytes the framework ships — and the half an agent cannot
+ *  reach is the BINDING, not the digest (digests are public: they hash shipped
+ *  files). Every individual ingredient is purchasable — a repo, its two
+ *  fingerprint files, the audited bytes (copy them) — so the soundness does NOT
+ *  rest on "this path is privileged". It rests on the closure below: the
+ *  exemption only ever admits an invocation whose every file the pin NAMES is
+ *  the audited one, so a forged tree that ships exactly the audited program runs
+ *  the REAL rail, which is the sanctioned behaviour by definition. A different
+ *  leaf, a different `ci_exemption.py`, a missing delegate — each declines the
+ *  exemption and the content walk runs.
+ *
+ *  ⛔ DECLARED RESIDUAL — the closure is a NAMED SET, not an EXACT SET (#2332
+ *  review P0, agent-infra #2365). An EXTRA file in one of the closed directories
+ *  that the audited leaf loads IMPLICITLY is neither pinned nor noticed:
+ *  reproduced at review with `scripts/re.py` beside `scripts/ci_exemption.py`
+ *  (`python3 <path>/ci_exemption.py` puts that directory first on `sys.path`, so
+ *  `import re` ran the injected module), and with
+ *  `ADMIN_MERGE_FAILURE_SET_SH=<agent file> bash <fw>/scripts/admin-merge.sh`
+ *  (the rail executes that override at its own call sites). So the sentence this
+ *  comment used to carry — "the worst a forged tree can achieve is running the
+ *  REAL rail" — is NOT yet true of a tree that adds files; it is true only of a
+ *  tree that ships exactly the pinned set. Closing it needs the pin to enumerate
+ *  every file under the closed directories (an exact-set closure), which is a
+ *  pin-FORMAT change: filed as #2365, deliberately not attempted here.
+ *
+ *  WHY TWO ARMS (and why this is not a widening of what the guard protects):
+ *  arm 1 is the pre-existing anchor, UNCHANGED — the module's own checkout.
+ *  It is the arm that makes the `~/.pi/agent` *copy* farm work, which is a
+ *  recorded deployment decision (#427, macOS TCC: "replacing farm symlink with
+ *  real copy"; the repo copy is CI-tested while production mints execute the
+ *  `~/.pi` copy) and the arm #1603/#1598 fixed the review RECORDER onto. Arm 2
+ *  exists because that farm ships only a PARTIAL scripts surface: `admin-merge.sh`
+ *  is not in it (#2176), so on a copy-deployed box the rail's only real home is
+ *  `$AGENT_INFRA_PATH/scripts/` — a DIFFERENT root from the module's — and arm 1
+ *  could never match it. Caught live 2026-10-22: the mandated rail was refused
+ *  from a hub-rooted session, i.e. the chokepoint that computes the failing set
+ *  before an `--admin` merge was unrunnable, and the only routes left were the
+ *  hatch or a bare `gh pr merge` that skips every comparison the rail makes
+ *  (#2332). Both arms fail CLOSED: no pin, no framework root, an unreadable
+ *  file, or a hash mismatch all return null → the content walk runs as before.
+ *  Realpath-keyed on both sides, so a symlinked spelling resolves to the same
+ *  file and a `scripts/<rel>` SYMLINK inside a framework tree still hashes the
+ *  file it points at (a mismatch unless that target IS the audited bytes).
+ *  ⚠️ SCOPE, stated exactly: arm 2 admits the audited leaf from ANY tree that
+ *  carries the framework fingerprint — including a linked worktree of this
+ *  framework at the pinned bytes — so the README must not claim otherwise. That
+ *  is intentional: once the closure is pinned, WHERE the audited program runs
+ *  from does not change what it does, and pretending the anchor is narrower than
+ *  it is would be the more dangerous error. */
+function _sanctionedScriptExemption(resolvedScript: string): { rel: string; via: "module-root" | "identity" } | null {
   let real: string;
   try {
     real = realpathSync(resolvedScript);
   } catch {
     return null;
   }
-  for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
-    let sanctioned: string;
-    try { sanctioned = realpathSync(resolve(_frameworkRoot, rel)); } catch { continue; }
-    if (real === sanctioned) return rel;
+  // ── arm 1: the guard's own checkout (pre-existing behaviour, unchanged) ──
+  if (_frameworkRoot) {
+    for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
+      let sanctioned: string;
+      try { sanctioned = realpathSync(resolve(_frameworkRoot, rel)); } catch { continue; }
+      if (real === sanctioned) return { rel, via: "module-root" };
+    }
+  }
+  // ── arm 2: identity — sanctioned relpath + framework root + audited bytes
+  //    AND the audited DELEGATION CLOSURE (see the comment above: a leaf whose
+  //    siblings the agent chose is not the sanctioned script, it is a launcher) ──
+  // Cheap pre-filter FIRST: for a command that executes some other script this
+  // returns before the pin is even read, which is the common case.
+  const candidates = SANCTIONED_SCRIPT_RELPATHS.filter((rel) => real.endsWith(sep + rel));
+  if (candidates.length === 0) return null;
+  const pin = _sanctionedScriptPin();
+  for (const rel of candidates) {
+    const want = pin.sha256[rel];
+    if (typeof want !== "string" || want.length !== 64) continue; // no pin → not exempt
+    const root = real.slice(0, real.length - rel.length - 1);
+    if (resolve(root, rel) !== real) continue;               // not literally <root>/<rel>
+    if (!_isFrameworkCheckout(root)) continue;
+    // The executed leaf is compared DIRECTLY, not via the pin's bookkeeping: a
+    // pin whose `delegates` omits the leaf (a hand re-cut, a partially-replaced
+    // deploy) must not admit arbitrary bytes at a sanctioned relpath (#2332
+    // review cycle 3). The closure then covers the REST of the program, so each
+    // half is independently load-bearing.
+    if (_sha256Of(real) !== want) continue;
+    if (!_delegationClosurePinned(root, pin.delegates, rel)) continue;
+    return { rel, via: "identity" };
   }
   return null;
+}
+
+/** #2332 / #1485 — TRUE only when `resolved` is a sanctioned script whose bytes ARE the
+ *  pinned, audited ones: arm 1 or arm 2 of `_sanctionedScriptExemption`, PLUS the digest.
+ *
+ *  ⛔ The digest is not belt-and-braces. `_sanctionedScriptExemption`'s arm 1 is PATH ONLY,
+ *  deliberately (it is the pre-existing `~/.pi/agent` anchor, kept unchanged by #2332), so
+ *  "the exemption applied" is ALSO true for arbitrary bytes written to a sanctioned relpath
+ *  under the module's own root — which on a copy-deployed box (a real `scripts/` copy inside
+ *  `~/.pi/agent`, which is not a git checkout and so is outside the write gate) an agent can
+ *  mint. A caller that stands down a CONTENT-derived refusal is making a claim about the
+ *  BYTES, so it must ask THIS question and never `_sanctionedScriptExemption(...) !== null`.
+ *  The difference is measurable: at review, an unaudited `#!/bin/bash` + `bash ./undo*.sh`
+ *  minted at a farm relpath was BLOCKED before such a stand-down and ALLOWED after it — the
+ *  #1228 fail-open (silent destruction of other sessions' uncommitted work) that this
+ *  helper's digest check keeps shut.
+ *
+ *  Both arms are considered, because both anchors were already trusted by their own
+ *  callers; the digest then narrows BOTH to the shipped bytes.
+ *
+ *  ⛔ `bodyDigest` EXISTS BECAUSE OF A TOCTOU, not for tidiness: the callers below hold a
+ *  body they ALREADY READ (`readFileSync(real, "utf8")`), and comparing a digest re-read
+ *  from the same path pairs "the body I judged" with "the bytes I hashed" only if nothing
+ *  writes the file in between — and an agent may run a writer concurrently. Hashing the
+ *  bytes in hand makes the pairing true by construction. This mirrors the pin's own reason
+ *  for being read at load (`_sanctionedScriptPin`): any read that happens AFTER the process
+ *  started is a read an agent can influence. The digest is therefore REQUIRED: every call
+ *  site has the body in hand, and there is deliberately no disk-read fallback for a caller
+ *  that does not, because that fallback is the defect this parameter exists to remove. */
+function _isAuditedSanctionedScript(resolved: string, bodyDigest: string): boolean {
+  let real: string;
+  try { real = realpathSync(resolved); } catch { return false; }
+  const sa = _sanctionedScriptExemption(real);
+  if (sa === null) return false;
+  const want = _sanctionedScriptPin().sha256[sa.rel];
+  return typeof want === "string" && want.length === 64 && bodyDigest === want;
+}
+
+/** The execution the exemption actually grants is leaf PLUS everything the leaf
+ *  executes. `admin-merge.sh` runs `$SELF_DIR/ci_exemption.py` (the exemption
+ *  GRADER) and `gh-shim/gh` runs `$SELF_DIR/../verify-admin-merge-evidence.sh`
+ *  (which says in its own words that it must not be redirectable), and the walk
+ *  is skipped for the whole invocation — so a pinned leaf beside an AGENT-CHOSEN
+ *  delegate is a launcher for arbitrary content (reproduced at review: the
+ *  audited rail at a forged root plus a one-line destructive
+ *  `ci_exemption.py` ran `reset --hard`). Pinning the leaf alone is therefore
+ *  not the identity; the closure is. Every pinned delegate must be PRESENT in
+ *  the same framework root and hash to its pin, or the whole exemption is
+ *  declined (fail-closed: absent, unreadable and mismatched are all `false`). */
+function _delegationClosurePinned(root: string, delegates: Record<string, string>, leaf: string): boolean {
+  const rels = Object.keys(delegates);
+  if (rels.length === 0) return false; // an empty closure is not a verified one
+  for (const rel of rels) {
+    if (rel === leaf) continue; // the leaf is compared directly by the caller
+    const want = delegates[rel];
+    if (typeof want !== "string" || want.length !== 64) return false;
+    const got = _sha256Of(resolve(root, rel));
+    if (got === null) return false; // absent is not "unverified", it DECLINES
+    if (got !== want) return false;
+  }
+  return true;
+}
+
+/** sha256 of a file, or null when it cannot be read (callers compare against a
+ *  digest, so null never equals one — the fail-closed direction). */
+function _sha256Of(path: string): string | null {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/** sha256 of the IN-MEMORY body a caller already holds — the TOCTOU-free form for a
+ *  decision about specific bytes (see `_isAuditedSanctionedScript`'s `bodyDigest`). */
+function _sha256OfBody(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
+}
+
+
+/** Is `root` a framework CHECKOUT (the `isAgentInfraRepo` fingerprint, read
+ *  from disk so this stays a pure path probe with no git invocation)? Arm 2
+ *  needs it so the exemption is confined to framework trees; the pin — not this
+ *  — is what makes forgery useless. Fail-closed on any probe error. */
+function _isFrameworkCheckout(root: string): boolean {
+  try {
+    return existsSync(join(root, "manifest.json")) && existsSync(join(root, "pi-bootstrap", "setup.sh"));
+  } catch {
+    return false;
+  }
+}
+
+/** The pinned digests, CAPTURED AT MODULE LOAD from the guard's own directory.
+ *  Read-at-load, not read-on-first-call (#2332 review P0): the module tree is
+ *  writable on a copy-deployed box, so any read that happens AFTER the process
+ *  started is a read an agent can influence — `write ~/.pi/agent/extensions/
+ *  main-worktree-guard/sanctioned-scripts.pin.json`, THEN run the script, and a
+ *  lazily-populated cache would accept the forged pin on the very first
+ *  exemption check. Reading at load puts the pin's integrity on the same footing
+ *  as the code that reads it (where the guard is loaded from is the trust anchor
+ *  pi already chose), and keeps the "needs a restart" boundary in one place
+ *  instead of two: forging the pin is now as useful as forging `index.ts`.
+ *  A re-cut is a deploy event, so it lands with the session restart the
+ *  deployment already implies. Any read/parse failure yields an EMPTY pin → arm
+ *  2 stays inert (fail-closed).
+ *  DECLARED RESIDUAL (agent-infra #2365): reading at load closes the WRITE-AFTER-
+ *  START window, not the pre-start one — a session that rewrites the pin and then
+ *  restarts (or a fresh session on a writable copy-deploy) still wins arm 2. The
+ *  successor is a digest of the pin compiled into `index.ts`, which this change
+ *  does not do. */
+const _PIN: { sha256: Record<string, string>; delegates: Record<string, string> } = (() => {
+  const empty = { sha256: {}, delegates: {} };
+  try {
+    const raw = readFileSync(fileURLToPath(new URL("./sanctioned-scripts.pin.json", import.meta.url)), "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    const norm = (v: unknown): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (!v || typeof v !== "object") return out;
+      for (const [k, d] of Object.entries(v as Record<string, unknown>)) {
+        if (typeof d === "string") out[k] = d.toLowerCase();
+      }
+      return out;
+    };
+    return {
+      sha256: norm((parsed as { sha256?: unknown }).sha256),
+      delegates: norm((parsed as { delegates?: unknown }).delegates),
+    };
+  } catch {
+    return empty;
+  }
+})();
+function _sanctionedScriptPin(): { sha256: Record<string, string>; delegates: Record<string, string> } {
+  return _PIN;
 }
 
 // Script-backdoor closure (Slice E): the documented escape
@@ -4015,8 +4301,15 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
     // list keyed on the guard's own checkout). Deliberate gate relaxation →
     // audited (best-effort, never blocks) so the exemption is observable.
-    const sanctionedRel = _sanctionedScriptExemption(resolved);
-    if (sanctionedRel) {
+    // ⛔ THIS CALL SITE IS PATH-ONLY AND THEREFORE A KNOWN FAIL-OPEN (#2775): it takes
+    // `_sanctionedScriptExemption`'s arm 1, which is path-keyed by spec, so arbitrary bytes
+    // planted at a sanctioned relpath under the module's own root skip the walk — the very
+    // hole `_isAuditedSanctionedScript`'s docblock warns about, still open HERE. Not closed in
+    // the 2026-10-24 #1228 fix because tightening it blocks the mandated rail on every box
+    // whose copy-deployed `~/.pi/agent/scripts` is not yet refreshed to the pin. Tracked as
+    // #2775; the digest must be carried into this decision when it is closed.
+    const sanctionedMatch = _sanctionedScriptExemption(resolved);
+    if (sanctionedMatch) {
       try {
         // #1129 (code-review P2): record the REALPATH that matched, not just
         // the listed relpath — with only the relpath, an exemption taken
@@ -4027,7 +4320,14 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
         appendJsonl({
           event: "m4_script_exemption",
           extension: "main-worktree-guard",
-          script: sanctionedRel,
+          script: sanctionedMatch.rel,
+          // #2332 — WHICH arm granted it: `module-root` is the pre-existing
+          // anchor (the `~/.pi/agent` copy farm / the module's own checkout),
+          // `identity` is the root-agnostic arm (sanctioned relpath inside a
+          // framework checkout + the pinned audited bytes). Without this field
+          // an operator cannot tell a farm exemption from a checkout one — the
+          // distinction this issue is entirely about.
+          sanctioned_via: sanctionedMatch.via,
           script_realpath: realpathSync(resolved),
           framework_root: _frameworkRoot,
           session_cwd: resolve(process.cwd()),

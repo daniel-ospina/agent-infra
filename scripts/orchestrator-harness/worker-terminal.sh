@@ -55,7 +55,17 @@
 # the concurrency caps must keep BINDING and a reaper must never kill what it cannot see. The other
 # direction — "we could not read it, so it is dead" — silently frees every slot and lets the box
 # spawn without limit exactly when the daemon is in trouble. `dead` is only ever concluded from a
-# POSITIVE read (the workspace is gone; the session name is absent).
+# POSITIVE read: (1) the workspace is gone, (2) the session name is absent, or (3) — added
+# deliberately with agent-infra#2653, see the `wt_table` absent-owner arm — the session OWNER is
+# confirmed ABSENT (`Connection refused` from an empty `cmux tree`, i.e. a socket nobody is listening
+# on, or the CLI's own `no server running`) and CONFIRMED BY TWO SAMPLES at least `WT_ABSENT_CONFIRM`
+# (default 60s) apart — a single refusal only opens the window and keeps the caps binding, because a
+# hard-killed owner leaves pty children behind. A terminal spawn proves the owner answered and closes
+# the window. No owner, no terminal. That third read is a MEASUREMENT, not a guess, and it is
+# deliberately narrow —
+# the errno-agnostic `cannot connect to session socket <path>: <reason>` wrapper does NOT qualify
+# (ENOENT / EACCES / EAGAIN are reachable with the daemon and its terminals ALIVE), so a merely
+# illegible or unreachable answer still leaves its workers UNKNOWN and the caps binding.
 #
 # ⛔ WHAT THIS FILE DELIBERATELY DOES NOT DO. No SILENT anything: a box with no surface at all is
 # refused out loud, and a tmux spawn that cannot be given an environment with a credential is refused
@@ -72,10 +82,64 @@ wt_q() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # operator has ONE place to look; WT_DIR is a test seam, never an operator knob.
 wt_dir() { printf '%s\n' "${WT_DIR:-${O:-$HOME/orchestrator}/state}"; }
 
+# The worker-name rule, ONE definition for its two consumers: `wt_spawn`'s argument check and
+# `wt_refusal_record`'s NAME COLUMN (a record must not print an identifier a spawn would refuse).
+wt_name_ok() { case "${1:-}" in ''|*[!A-Za-z0-9-]*) return 1 ;; esac; return 0; }
+
 # Say it on stderr AND in the controller's log (the controller's stdout is not read by anyone).
 wt_warn() {
   printf '[worker-terminal] %s\n' "$*" >&2
   if [ -n "${LOG:-}" ]; then printf '[worker-terminal] %s\n' "$*" >> "$LOG" 2>/dev/null || true; fi
+  # ⛔ A REFUSAL IS A MEASUREMENT, NOT ONLY A LOG LINE (measured 2026-10-22 on a cloud cell).
+  # The cmux registry's own volume reached 100% (`database or disk is full`), so EVERY `wt_spawn`
+  # returned 1 with that reason — 1,562 refusals in ONE controller log, and not one lane started for
+  # six hours. The controller recorded each refusal as a per-PR `wait` and its cycle line still read
+  # `N acted, M named wait(s)`: the reason lived in a line nobody reads and never reached the decision
+  # line. Recording it HERE is what makes it reachable: this is the single point every LAUNCHER
+  # refusal passes through, so a future spawn site cannot forget it. (Two earliest guards — a missing
+  # argument and an unsafe worker name — are ARGUMENT errors rather than launcher refusals and are
+  # deliberately not recorded: they mean the caller is broken, not that the actuator refused.)
+  case "$*" in
+    'REFUSED '*)
+      _wt_refmsg="${*#REFUSED }"
+      wt_refusal_record "${_wt_refmsg%%:*}" "${_wt_refmsg#*: }"
+      ;;
+  esac
+  return 0
+}
+
+# ── the refusal record the CONTROLLER's summary reads ─────────────────────────────────────────────
+# ONE TAB-delimited row per refused spawn: `<worker name>\t<the launcher's reason>`. The controller
+# TRUNCATES it per cycle (orch-loop.sh, beside the per-PR disposition ledger) and folds the count and
+# the first reason into the `[pr]` line, the `[dispatch]` tail and the DRAIN STALLED line — so
+# `lanes=0` can never again be printed without the actuator's own answer beside it.
+# ⛔ THE NAME COLUMN HOLDS A WORKER NAME OR NOTHING (P2 review finding, 2026-10-27, MEASURED). It was
+# filled from `${reason%%:*}` — the text before the first colon of whatever `wt_warn` was handed — and
+# the MODEL-CREDENTIAL gate refuses before it knows a session is being asked for, so its message reads
+# `REFUSED a worker on 'deepseek': …` and the column literally held `a worker on 'deepseek'`: a
+# sentence, in the column a reader (and a human scanning the TSV) reads as an IDENTIFIER. A column that
+# reads as a name when it is not one is worse than a blank, because a blank is honestly unknown while
+# that value looks attributable to a worker that does not exist. So the same rule that ADMITS a worker
+# name in `wt_spawn` decides this column, and anything else is recorded as EMPTY.
+# ⛔ BOUNDED BY CONSTRUCTION, NOT BY HOPE: at most 200 REFUSAL rows per cycle (201 lines, because
+# the controller's probe row occupies one). A refusal storm is exactly the moment a growing file
+# must not become the next full volume.
+wt_refused_file() { printf '%s\n' "$(wt_dir)/spawn-refused.tsv"; }
+wt_refusal_record() { # <name> <reason>
+  local f name reason n=0
+  f="$(wt_refused_file)" 2>/dev/null || return 0
+  [ -n "${f:-}" ] || return 0
+  name="${1:-?}"; reason="${2:-no reason given}"
+  # ONE rule for a worker name (`wt_spawn`'s argument check), so the record cannot accept an identifier
+  # a spawn would refuse, or print a sentence in the identifier column.
+  wt_name_ok "$name" || name=""
+  if [ -f "$f" ]; then
+    n="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+    case "${n:-}" in ''|*[!0-9]*) n=0 ;; esac
+  fi
+  [ "$n" -ge 201 ] && return 0
+  { printf '%s\t%s\n' "$(printf '%s' "$name" | tr -d '\t\n')" \
+      "$(printf '%s' "$reason" | tr '\t\n' '  ' | cut -c1-240)" >> "$f"; } 2>/dev/null || true
   return 0
 }
 
@@ -249,6 +313,138 @@ wt_keys_credit() {
   grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=["'\'']?[^[:space:]"'\'']' "$keys" 2>/dev/null
 }
 
+# ── THE MODEL CREDENTIAL: DELIVER IT, OR REFUSE — NEVER START A LANE THAT CANNOT AUTHENTICATE ────
+# ⛔ THE MEASURED DEFECT (2026-10-27). Every review and fixer worker on the Mac died 2-10 seconds after
+# it started, with pi's own words in its own log:
+#
+#     [agent] provider=deepseek model=deepseek-flash
+#     No API key found for deepseek.
+#     [timeout] agent pid=… wall_limit=1800s elapsed=6s rc=1
+#     [merge 10021] verdict: <none>
+#
+# 69 lane logs carried that line (56 `merge`, 11 `fix`, 2 `lane`); the last CLEAN reviewer verdict was
+# 2026-10-25T22:5x and `state/merged-*.done` stops 2026-10-24 — while the controller kept producing
+# review work the whole time (measured in its own log: `#10201 re-record`, `#10202 re-record`, … six in
+# ONE pass). So the reviews were ORDERED and none could RUN. Each death was then booked as an attempt
+# and, at `MAX_REVIEW_TRIES`, PARKED the PR with "the reviewer produced NO usable verdict … fix the
+# reviewer's budget/cap (REVIEW_TIMEOUT) or its output format" — a diagnosis naming the REVIEWER for a
+# fault in the worker's ENVIRONMENT, on a head nothing had reviewed. That park is what turned a
+# 10-second credential fault into 26 open PRs waiting for a human.
+# ⛔ THE CREDENTIAL WAS NEVER MISSING FROM THE BOX. `~/pi-keys.env` (mode 0600, sourced by `~/.zshrc`)
+# carries a valid, funded provider key (checked against the provider's own balance endpoint). It was
+# missing from the WORKER: this function sources only `$HOME/keys.env` (absent on this box) and the tmux
+# SERVER's environment carries no provider key at all (measured: a bare pane's `env` holds ZERO
+# `*_API_KEY`/`*_TOKEN` names), so nothing delivered it.
+# ⛔ SO THIS IS THE SAME DEFECT THE gh GUARD BELOW ALREADY REFUSES, ONE VARIABLE OVER — and it was left
+# ungated, so a spawn reported "provisioned" for a lane that could not make a single model call. An
+# instrument that holds the datum (models.json names the variable) and does not read it is category A.
+# ⛔ THE POLARITY: DELIVERY FIRST, AND AN UNREADABLE DATUM NEVER REFUSES. Refusal requires the required
+# env NAME to be POSITIVELY known AND its value POSITIVELY absent from every source. A missing or
+# unreadable `models.json`, a provider whose `apiKey` is a literal, and a provider pi authenticates
+# from its own auth store all leave `wt_provider_key_var` EMPTY — and an empty answer refuses nothing.
+# That asymmetry is deliberate (#2210's lesson): our own inability to read a datum must never become a
+# refusal loop that stops the fleet.
+#
+# `wt_provider_key_var <home> [<provider>]` — the env var the lane provider's apiKey resolves from.
+# Empty when we cannot say, which is the "do not refuse" answer above. The optional provider lets a
+# caller that has ALREADY resolved the pair (`wt_launcher_env`) hand it in, so the pair is measured
+# ONCE per spawn instead of three times (each measurement SOURCES the box's env files — see below).
+wt_provider_key_var() {
+  local home="${1:-}" mj prov="${2:-}"
+  [ -n "$home" ] || return 0
+  mj="$home/.pi/agent/models.json"
+  [ -r "$mj" ] || return 0
+  [ -n "$prov" ] || prov="$(wt_lane_provider "$home")"
+  command -v python3 >/dev/null 2>&1 || return 0
+  # A literal apiKey, a provider absent from the file, and an unparseable file all print NOTHING.
+  # ⛔ BOUNDED, like every other probe on this path (P1 review finding, 2026-10-27, MEASURED): this
+  # runs on the controller's SYNCHRONOUS spawn path, so an unbounded python3 there is a controller that
+  # can stop cycling (see `wt_bounded`). A fired bound prints nothing, which is the gate's own "cannot
+  # say" answer — the same fail-safe direction as an unreadable models.json, never a refusal.
+  wt_bounded "${WT_PROBE_TIMEOUT:-15}" python3 - "$mj" "$prov" <<'PY' 2>/dev/null
+import json, re, sys
+prov = sys.argv[2]
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+p = (d.get("providers") or {}).get(prov) or {}
+k = p.get("apiKey")
+if not isinstance(k, str):
+    raise SystemExit(0)
+m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", k.strip())
+if m:
+    print(m.group(1))
+PY
+}
+# `wt_lane_provider [<home>]` — the provider the lanes run on, resolved so the gate and the LANE cannot
+# disagree (`lane-exec.sh`, `spawn-gate.sh::run_agent` and `merge-one.sh` each resolve
+# `${PI_LANE_PROVIDER:-deepseek}` INSIDE the pane; this is the same default on the caller side).
+# ⛔ THE PANE IS AUTHORITATIVE, AND THE CALLER USED TO THINK OTHERWISE (P3b review finding, 2026-10-27).
+# The gate read the CALLER's `PI_LANE_PROVIDER` while the lane reads it in the PANE — and the pane's
+# value is the `keys.env` this launch line sources under `set -a` (the box's channel for `PI_LANE_*`:
+# `cloud-cell-supervisor.sh` measures that an ambient shell value does NOT reach the tmux sessions, and
+# reports the env file as the governing channel). So a `keys.env` naming another provider had the gate
+# checking one provider's credential while the lane ran — and billed — another.
+# The pane is authoritative because it is the process that spends the credential; so the gate resolves
+# THAT answer, and `wt_launcher_env` then PINS it into the launch line, which is what makes agreement
+# hold even against a stale server environment. The file is measured, not grepped, exactly as
+# `cloud-cell-supervisor.sh` measures the pair (a static match is a claim about the file, not about the
+# environment the source produces).
+# ⛔ THE PAIR IS RESOLVED TOGETHER, AND `pi-keys.env` COUNTS (P2 review finding, 2026-10-27, MEASURED).
+# The resolution used to read `keys.env` ONLY, while the launch line also sources `$home/pi-keys.env` —
+# and on a Mac `pi-keys.env` is the only env file there is. Measured: `pi-keys.env` carrying
+# `PI_LANE_PROVIDER=zai` + `PI_LANE_MODEL=qwen3.8-max` gave `gate resolves [deepseek]` and a pane whose
+# pair was `provider=[deepseek] model=[qwen3.8-max]` — the provider PINNED to the value the gate checked
+# and the model left as the file wrote it, i.e. a HALF-PINNED PAIR: two members of one decision, from two
+# different measurements. So both members are measured from BOTH files, in the ORDER THE LAUNCH LINE
+# SOURCES THEM (`keys.env`, then `pi-keys.env`), last non-blank value wins — which is exactly what the
+# pane holds after both sources — and the model is resolved here too, for the pin.
+# ⛔ AND IT IS BOUNDED (P1 review finding, 2026-10-27, MEASURED: 10.28 s vs 0.06 s). Sourcing a file
+# EXECUTES it, and this runs on the controller's SYNCHRONOUS spawn path, so a `keys.env` that sleeps or
+# blocks froze the controller's cycle — the same freeze `wt_bounded` exists to prevent for every other
+# probe here. A fired bound resolves as "this file did not answer", i.e. it contributes nothing.
+# Emits TWO lines: the provider, then the model (which may be empty).
+wt_lane_pair() { # [<home>] -> "<provider>\n<model>"
+  local home="${1:-}" f v pv mv prov="" model=""
+  for f in "$home/keys.env" "$home/pi-keys.env"; do
+    [ -n "$home" ] && [ -f "$f" ] || continue
+    v="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" env -u PI_LANE_PROVIDER -u PI_LANE_MODEL bash -c '
+          set -a; . "$1" >/dev/null 2>&1
+          printf "P=%s\nM=%s\n" "${PI_LANE_PROVIDER:-}" "${PI_LANE_MODEL:-}"' _ "$f" 2>/dev/null)" || v=""
+    pv="$(printf '%s\n' "$v" | sed -n '1s/^P=//p')"
+    mv="$(printf '%s\n' "$v" | sed -n '2s/^M=//p')"
+    case "$pv" in *[![:space:]]*) prov="$pv" ;; esac
+    case "$mv" in *[![:space:]]*) model="$mv" ;; esac
+  done
+  [ -n "$prov" ] || prov="${PI_LANE_PROVIDER:-deepseek}"
+  [ -n "$model" ] || model="${PI_LANE_MODEL:-}"
+  printf '%s\n%s\n' "$prov" "$model"
+}
+# `wt_lane_provider [<home>]` — the provider half of that pair, for the callers that need only it.
+# (`wt_lane_pair` is the whole answer: the model half must be read from the SAME measurement, or the
+# pair is assembled from two — which is the defect this replaced.)
+wt_lane_provider() {
+  wt_lane_pair "${1:-}" | sed -n '1p'
+}
+# `wt_provider_credit <VARNAME> <file>` — 0 iff the file ASSIGNS a non-blank value to that variable.
+# A static match is a CLAIM; the launch line re-verifies the delivery dynamically after the source
+# (`wt_launcher_env`'s provider guard), exactly as it does for GH — the same reason, measured there.
+wt_provider_credit() {
+  local v="${1:-}" f="${2:-}"
+  case "$v" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  [ -n "$f" ] && [ -f "$f" ] || return 1
+  grep -qE "^[[:space:]]*(export[[:space:]]+)?${v}=[\"']?[^[:space:]\"']" "$f" 2>/dev/null
+}
+# `wt_env_nonblank <VARNAME>` — 0 iff the CALLER's environment holds a non-blank value. Indirect (the
+# name comes from the provider's config), so the name is validated before it is expanded.
+wt_env_nonblank() {
+  local v="${1:-}" val
+  case "$v" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  eval "val=\${$v:-}" 2>/dev/null || val=""
+  case "$val" in *[![:space:]]*) return 0 ;; esac
+  return 1
+}
 # `wt_launcher_home` — the HOME to export. An explicit `WT_WORKER_HOME` WINS outright (it is the
 # operator saying "the credential is HERE"; silently falling through would make the knob a suggestion).
 # Otherwise: the caller's own HOME, then the cell home — each only when it actually HOLDS a credential,
@@ -281,10 +477,12 @@ wt_tmux_server_token() { wt_tmux_server_token_value >/dev/null 2>&1; }
 # the verdict: on the server-token arm the launch line neither exports a token nor reads a file for it
 # — the pane inherits it from the SERVER — so the caller-side pre-flight of the launch line has to be
 # given what the pane would inherit, or it would judge an arm it cannot see (`wt_spawn`, the P1 fix).
-wt_tmux_server_token_value() {
+wt_tmux_server_token_value() { # [<name>] — with a name, asks the SERVER about that ONE variable
   local n v
   command -v tmux >/dev/null 2>&1 || return 1
-  for n in GH_TOKEN GITHUB_TOKEN; do
+  # `$1` narrows the probe to a single name (the lane MODEL credential, whose provider models.json
+  # names); no argument keeps the original question, the two names gh honours.
+  for n in ${1:-GH_TOKEN GITHUB_TOKEN}; do
     v="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-environment -g "$n" 2>/dev/null)" || continue
     case "$v" in
       "$n="*) case "${v#"$n="}" in *[![:space:]]*) printf '%s\n' "${v#"$n="}"; return 0 ;; esac ;;
@@ -344,6 +542,95 @@ wt_launcher_env() {
   local home="${1:-}" keys have=0 keys_credit=0 caller_val=0 store_credit=0
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
+  # ── THE MODEL CREDENTIAL, DECIDED BEFORE THE gh ONE (see wt_provider_key_var's note) ─────────
+  # `pkeys` is the file this spawn must ALSO source to deliver it; empty means no delivery is needed
+  # (either the caller's environment already carries a value, or we could not name the variable).
+  # ⛔ A PANE, NOT A SUBSHELL, DECIDES NOTHING HERE: this is the CALLER-SIDE verdict. A provider we
+  # cannot provision is refused BEFORE `tmux new-session`, because after it `wt_spawn` has already
+  # reported success and the caller books an attempt for a lane that will die in seconds — the
+  # measured shape that parked 12 PRs as "the reviewer produced no usable verdict".
+  local pvar="" pkeys="" phave=0 _pf pdeliv="" prov="" prov_pair="" pmodel=""
+  # ⛔ ONE measurement of the pair, used for the credential lookup AND both pins below (P2 review
+  # finding, 2026-10-27 — the pair used to be resolved twice, and `pi-keys.env` not at all: see
+  # `wt_lane_pair`). Measuring a file EXECUTES it, so a second resolution is a second unbounded-ish
+  # source on the synchronous spawn path; one call per spawn is the whole budget.
+  prov_pair="$(wt_lane_pair "$home")"
+  prov="$(printf '%s\n' "$prov_pair" | sed -n '1p')"
+  pmodel="$(printf '%s\n' "$prov_pair" | sed -n '2p')"
+  [ -n "$prov" ] || prov="${PI_LANE_PROVIDER:-deepseek}"
+  pvar="$(wt_provider_key_var "$home" "$prov")"
+  if [ -n "$pvar" ]; then
+    # ⛔ THE CALLER'S OWN VALUE IS CREDITED ON TWO CONDITIONS, NOT ONE (P1 review finding, 2026-10-27,
+    # MEASURED — this arm delivered NOTHING). It used to be `wt_env_nonblank` alone, which credits a
+    # value the pane will never hold, twice over:
+    #   (1) EXPORTED. A tmux client hands the server only EXPORTED variables, so a plain
+    #       `DEEPSEEK_API_KEY=x` satisfied the read here and reached no pane at all. Same rule, same
+    #       reason, as the gh arm's `_wt_exported` below.
+    #   (2) NO SERVER. `tmux new-session` inherits the CALLER's environment only when it CREATES the
+    #       server; against a running one the pane gets that server's global env. Measured on this box
+    #       (2026-10-27): exported caller var => 0 key occurrences in the worker env, plain var => 0,
+    #       the file arm => 1. A steady-state box has a server, so (2) is the NORMAL case.
+    # Without both, the FILE arm (below) and the SERVER arm answer instead, and a box where neither does
+    # is REFUSED rather than handed a lane that dies at its first model call.
+    if wt_env_nonblank "$pvar" && _wt_exported "$pvar"; then
+      local _srv_rc=0
+      command -v tmux >/dev/null 2>&1 || return 1
+      wt_tmux_has_server || _srv_rc=$?
+      # ⛔ `pdeliv` IS INTERPOLATED INTO THE LAUNCH LINE, so it must carry NO `$`: the prefix is a shell
+      # string that is EVALUATED again (pre-check and pane), so a `$` here would be expanded there and a
+      # `$`-name printed EMPTY in the refusal (measured by the new pair arms: "the caller's exported ;
+      # credited because…"). The variable's NAME is named instead, which cannot be re-expanded.
+      [ "$_srv_rc" = "1" ] && { phave=1; pdeliv="inherited from this spawn's environment (this caller's exported $pvar; credited because this spawn CREATES the tmux server)"; }
+    fi
+    # ⛔ THE FILE ARM COMES BEFORE THE SERVER ARM, AND THAT ORDER IS THE FIX (P1 review finding,
+    # 2026-10-27, MEASURED). It used to be the other way round, and the consequence was a refusal that
+    # NOTHING the operator could write would clear: with the server carrying the key, arm 2 credited it,
+    # so `pkeys` stayed empty and `$home/pi-keys.env` was never sourced — so putting the key there did
+    # not change the spawn at all, and only killing the tmux server did, which no message said.
+    # It is also the FAITHFUL order: the launch line sources these files under `set -a` AFTER the pane
+    # has inherited the server's environment, so a file that ASSIGNS the variable OVERWRITES the server's
+    # value in the pane. Crediting the server while a file that assigns it sits unused made the gate's
+    # answer and the worker's value disagree; crediting the file first makes them the same answer, on
+    # the arm the launch line can actually deliver and prove. The server arm still answers for the shape
+    # it exists for — a box with no key file whose supervisor exported the key.
+    if [ "$phave" = "0" ]; then
+      # DELIVERY FROM A FILE this launch line sources. Precedence: the box-local operator file first
+      # (what this box's own shell sources), then the cell's `keys.env` (the operator-pushed contract on
+      # a cell). Whichever ASSIGNS it is used. Both are sourced, in that order, by the launch line, so
+      # this precedence is also the order that decides the pane's own value.
+      for _pf in "$home/pi-keys.env" "$keys"; do
+        [ -n "$_pf" ] && [ -f "$_pf" ] || continue
+        wt_provider_credit "$pvar" "$_pf" && { pkeys="$_pf"; phave=1; pdeliv="sourced from $_pf"; break; }
+      done
+    fi
+    if [ "$phave" = "0" ]; then
+      # THE SERVER'S OWN ENVIRONMENT, which is what an already-running server hands the pane. Asked of
+      # the server for THIS name; a box whose supervisor exported the key is a working shape and must not
+      # be refused (the same arm the gh gate carries as `wt_tmux_server_token`). ⛔ `wt_spawn`'s
+      # caller-side pre-check INJECTS this same value for this same name (`srv_pval`), because that
+      # pre-check runs in the CALLER's environment: without the injection the gate credited a credential
+      # the pre-check could not see, the prefix exited 98 there, and the spawn was REFUSED on a box whose
+      # worker would have worked — measured 2026-10-27. The invariant is that the gate's answer and the
+      # pre-check's answer are the SAME answer, on EVERY arm.
+      case "$(wt_tmux_server_token_value "$pvar" 2>/dev/null)" in *[![:space:]]*)
+        phave=1
+        # ⛔ NO BACKTICKS EITHER, AND THAT IS A CREDENTIAL LEAK, NOT TYPOGRAPHY (review finding,
+        # 2026-10-28, MEASURED). `pdeliv` is interpolated into the launch line, which is EVALUATED again
+        # (the caller-side pre-check, then the pane), so a backtick in it is COMMAND SUBSTITUTION. With a
+        # server carrying the key and a `keys.env` holding a blank `export DEEPSEEK_API_KEY=` (the shape
+        # that blanks the pane's inherited value), the refusal printed
+        # `DEEPSEEK_API_KEY=sk_…from_server` — the SERVER'S CREDENTIAL VALUE — and `wt_spawn` carries that
+        # very line into the controller's log (`${premsg:0:300}`) and the pane's stderr, while the guidance
+        # the message exists to give was replaced by the command's output. The `$` rule above is the same
+        # rule; the command is NAMED here, never executed.
+        pdeliv="inherited from the tmux SERVER's global environment (the value behind 'tmux show-environment -g $pvar'; no file here assigns it) — to stop depending on the server, put a non-blank $pvar in $home/pi-keys.env or $keys, which this launch line sources with set -a and which OVERRIDES the server's value" ;;
+      esac
+    fi
+    if [ "$phave" = "0" ]; then
+      wt_warn "REFUSED a worker on '$prov': models.json resolves its credential from \$$pvar and NO source DELIVERS a value — not this caller's environment (a caller value counts only when it is EXPORTED *and* this spawn creates the tmux server, since a running server's environment shadows it), not the tmux server's own environment (\`tmux show-environment -g $pvar\`), not $home/pi-keys.env, not $keys. A worker started now dies at its first model call within seconds (pi: 'No API key found for $prov'), and the caller books that as a review that produced NO verdict and, at MAX_REVIEW_TRIES, PARKS the PR — measured 2026-10-26/27, 69 lane logs and 12 parked PRs. Refusing here spends nothing and leaves the PR queued, which is the honest state. Put the key where the worker can read it: a non-blank \$$pvar in $home/pi-keys.env or $home/keys.env, which this launch line sources with set -a (a file also OVERRIDES the tmux server's value, so a file entry clears this refusal even when the server carries a different one)."
+      return 1
+    fi
+  fi
   # ⛔ THE CALLER'S CREDIT MUST BE **EXPORTED** (P1 review finding, 2026-10-23, measured). A tmux client
   # hands the server — and therefore the pane — only EXPORTED variables, so a `GH_TOKEN=x` that is a plain
   # shell variable satisfies `"${GH_TOKEN:-}"` here while never reaching the worker: gate rc=0, record
@@ -427,6 +714,15 @@ wt_launcher_env() {
     printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; _p="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai1713_env_sourced__ )"; case "$_p" in *__ai1713_env_sourced__) unset _p ;; *) exit 98 ;; esac; set -a; . %s; set +a' \
       "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")"
   fi
+  # ⛔ THE DELIVERY OF THE MODEL CREDENTIAL WHEN IT LIVES IN A BOX-LOCAL FILE (`~/pi-keys.env`, the file
+  # this box's `~/.zshrc` sources and the ONLY place the key exists here). Same discipline as `keys.env`
+  # above and for the same measured reason: `set -a`, a parse check, and a sentinel proving the file
+  # FINISHED (a `keys.env` carrying `exit 0` parsed, then ended the worker's shell before anything ran).
+  # Emitted BEFORE the HOME/PATH pins below, so the file cannot repoint either of them.
+  if [ -n "$pkeys" ] && [ "$pkeys" != "$keys" ]; then
+    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; _pm="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai_provider_env_sourced__ )"; case "$_pm" in *__ai_provider_env_sourced__) unset _pm ;; *) exit 98 ;; esac; set -a; . %s; set +a' \
+      "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")"
+  fi
   # ⛔ A BROKEN `keys.env` MUST NOT RUN A HALF-PROVISIONED WORKER, AND AN ORDINARY ONE MUST NOT BE FATAL
   # (review findings, 2026-10-23, both measured). `… && . FILE || exit 98` reads the status of the LAST
   # COMMAND IN THE FILE, so `[ -d /x ] && export Y` — false, last — killed a perfectly good worker AFTER
@@ -460,6 +756,33 @@ wt_launcher_env() {
   # from its env snapshot. Emitted AFTER the source, like HOME, so a `keys.env` cannot repoint where
   # `gh`, `uv` or `pi` resolve to.
   printf '; export PATH=%s' "$(wt_q "$PATH")"
+  # ⛔ AND THE PROVIDER THE GATE RESOLVED IS DELIVERED TO THE PANE (P3b review finding, 2026-10-27).
+  # The three lane files resolve `${PI_LANE_PROVIDER:-deepseek}` in the PANE (the tmux server's
+  # environment, then whatever this line sources), while the gate resolved it caller-side — so an
+  # ambient value could make the lane run, and bill, a provider whose credential was never checked (and
+  # a different model than its reviewer). `wt_lane_provider "$home"` now resolves the PANE's answer; this
+  # line PINS that answer AFTER every source, so the server's stale environment or a later source cannot
+  # move it, and gate and lane cannot disagree by construction.
+  # ⛔ AND THE MODEL IS PINNED WITH IT — BOTH MEMBERS OR NEITHER (P2 review finding, 2026-10-27,
+  # MEASURED). Pinning only the provider produced a HALF-PINNED PAIR: a `pi-keys.env` naming
+  # `PI_LANE_PROVIDER=zai` + `PI_LANE_MODEL=qwen3.8-max` (a file the old resolution never read) gave
+  # `provider=[deepseek] model=[qwen3.8-max]` in the pane — the provider pinned to what the gate checked,
+  # the model left as the file wrote it, i.e. one decision assembled from two measurements. Both members
+  # now come from the ONE `wt_lane_pair` resolution.
+  # ⛔ WHEN NO SOURCE NAMES A MODEL, THE INHERITED ONE IS CLEARED rather than left to shadow the pair: an
+  # inherited `PI_LANE_MODEL` is a model NO source in this measurement supplied, and leaving it beside a
+  # pinned provider re-creates the same half-pin from the other side (the tmux server's stale model with a
+  # gate-checked provider). Clearing it lets the lane's own `${PI_LANE_MODEL:-deepseek-flash}` default
+  # apply — the SAME default the caller-side resolution uses — so the pane's pair is always the pair this
+  # line decided, both halves. The channel for an override is the env file (`keys.env`, then
+  # `pi-keys.env` — what `cloud-cell-supervisor.sh` measures and the README documents), where it is now
+  # both MEASURED (the credential the gate checks) and PINNED.
+  printf '; export PI_LANE_PROVIDER=%s' "$(wt_q "$prov")"
+  if [ -n "$pmodel" ]; then
+    printf '; export PI_LANE_MODEL=%s' "$(wt_q "$pmodel")"
+  else
+    printf '; unset PI_LANE_MODEL'
+  fi
   # ⛔ THE WORKER MUST RESOLVE `gh`'s CONFIG THE WAY THE PROBE DID — IN BOTH DIRECTIONS.
   # `wt_gh_hosts` accepts `GH_CONFIG_DIR` / `XDG_CONFIG_HOME`, but a tmux session does NOT inherit this
   # shell's environment — so probing a repointed config dir and then starting a worker without it would
@@ -514,6 +837,84 @@ wt_launcher_env() {
     _guard="env -u GH_TOKEN -u GITHUB_TOKEN perl -e 'alarm 10; exec @ARGV' $(wt_q "$_ghbin") auth token >/dev/null 2>&1"
   fi
   printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s || exit 98 ;; esac' "$_guard"
+  # ── AND THE MODEL CREDENTIAL IS VERIFIED WHERE THE gh ONE IS — AFTER every source, against the
+  # environment the worker will actually run with. This is the question a static grep cannot answer: did
+  # the delivery LAND?
+  # ⛔ IT RUNS ON EVERY ARM (P1 review finding, 2026-10-27, MEASURED) — it used to be gated on `pkeys`,
+  # i.e. on the FILE arm, so the CALLER arm (this box's normal one) emitted no check at all: the pane
+  # started with a blank key and died at its first model call on a spawn that reported provisioned. That
+  # is exactly the gate-on-the-file-credit mistake the gh guard above was fixed for, one credential over,
+  # so it takes the gh guard's shape: whenever the required NAME is positively known, the pane proves it
+  # holds a VALUE or refuses. Where the name is NOT known (`pvar` empty: an unreadable models.json, a
+  # literal apiKey, a provider pi authenticates itself) nothing is emitted and nothing refuses — our own
+  # blindness must never become a refusal loop (#2210).
+  if [ -n "$pvar" ]; then
+    printf '; case "${%s:-}" in *[![:space:]]*) : ;; *) echo "[worker-terminal] REFUSED: the model credential \$%s is blank in the worker (%s) — this lane could not authenticate a single model call" >&2; exit 98 ;; esac' \
+      "$pvar" "$pvar" "$pdeliv"
+  fi
+  return 0
+}
+
+# WHY the launcher is not `terminal` — the PROBE'S OWN ANSWER, for the startup line and the refusal.
+# ⛔ THE ANSWER USED TO BE THROWN AWAY, AND THAT IS THE DEFECT THIS FUNCTION REMOVES. `cmux tree
+# --json >/dev/null 2>&1` keeps the DECISION and discards the REASON, so a box reports
+# `launcher=none (cmux=yes, uname=Linux)` — true, actionable in no way, and indistinguishable from a
+# tty gate, a TERM/TERM_PROGRAM gate, a `cmux tree` whose output SHAPE drifted, or a daemon that is
+# simply not there. Measured 2026-10-22 on cell-1 (agent-infra#2366): the answer the probe already
+# held was `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the box had no
+# daemon at all — and the binary that message names is the guest CLI's own CLIENT, which
+# /usr/local/libexec/cmux-cloud-adapter:762-772 requires as `[ -x "$CMUX_TUI_BIN" ]` for every verb
+# but identity and help. One log line would have said so; `none` alone left it to be re-derived.
+# An instrument that holds the datum and does not read it is a category-A defect, so the reason now
+# travels with the verdict.
+# ONE probe IN THIS FUNCTION, and the honest arithmetic for a caller — corrected after the rebase,
+# because the CALLER's cost is not this function's cost. This function makes ONE `cmux tree` call
+# (stderr only). What a `none` box costs end-to-end is FIVE, and the arithmetic is the union of both
+# sides of the merge: the startup banner's own `wt_launcher` read + this function's read (2), then the
+# SAME two on a refused spawn (2), PLUS main's deliberate re-measurement of `cmux tree` rc on the
+# refusal line (1) — main re-probes there because a presence test sent the operator to the wrong fault
+# (#2210). ⛔ An earlier draft of this comment said "TWO per startup line and per refused spawn — not
+# three", which was true only before main's rc re-measure landed; it is now FALSE and it disagrees
+# with the pinned count in the suite, so it is corrected here rather than left to misdirect the next
+# reader into resetting the pin. Pinned as a COUNT by the suite so it cannot creep back. ⚠️ Under
+# `set -e` a bare failing probe would exit the shell before `rc=$?`; every shipped call site wraps
+# this in `$( )` (a subshell absorbs the status) and both controllers run `set -u` only — but a new
+# direct caller must keep that in mind.
+wt_launcher_why() {
+  if ! command -v cmux >/dev/null 2>&1; then
+    printf 'cmux is not on PATH'
+    return 0
+  fi
+  # STDERR ONLY. `2>&1` duplicates fd2 onto the substitution's pipe BEFORE `>/dev/null` moves fd1, so
+  # the daemon's own complaint is kept and a multi-kilobyte workspace tree is not.
+  local err rc flat
+  err="$(cmux tree --json 2>&1 >/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    # Reachable only when the LAUNCHER's own probe failed and this one did not — a probe flipped
+    # between two reads. Saying anything else here would name a mechanism the code does not have.
+    printf 'cmux tree --json answered on re-probe (it failed on the launcher read): a probe flip'
+    return 0
+  fi
+  # The sibling idiom for a captured message (see wt_spawn's own refusals): flatten, then bound.
+  flat="$(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
+  printf 'cmux tree --json failed (rc=%s): %s' "$rc" "${flat:-no stderr, exit status only}"
+}
+
+# THE controller's one startup line — which launcher this surface got, and WHY when it got none.
+# It lives here, beside the verb whose verdict it reports, so that a test can drive the REAL line
+# instead of a copy of it (the copy this fix first shipped was vacuous: it matched the reason on the
+# `REFUSED` line further down the same capture, so it passed with the startup half deleted).
+# The suffix is appended ONLY for `none` — the refused state. A healthy launchd Mac reports `tmux`,
+# which is DELIBERATE and not a degrade (see the table above), and stamping `failed:` on a designed
+# state is how `failed` stops meaning anything.
+wt_startup_banner() {
+  local la
+  la="$(wt_launcher)"
+  printf '[startup] worker launcher=%s (cmux=%s, uname=%s)' "$la" \
+    "$(command -v cmux >/dev/null 2>&1 && echo yes || echo no)" "$(uname -s 2>/dev/null)"
+  case "$la" in none) printf ' — %s' "$(wt_launcher_why)" ;; esac
+  printf '\n'
   return 0
 }
 
@@ -715,10 +1116,55 @@ wt_tmux_names() {
 # never once hit (measured: three questions, three full `cmux tree` probes). The file carries its own
 # timestamp so this stays portable (no `stat` dialect in the hot path), it is written atomically, and
 # `wt_forget` removes it — a spawn or a close must never be answered from the census it invalidates.
+# WT_ABSENT_CONFIRM — how long an absent session owner must persist before its records are concluded
+# dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
+WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
+case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*|0*) WT_ABSENT_CONFIRM=60 ;; *) WT_ABSENT_CONFIRM=$(( 10#$WT_ABSENT_CONFIRM )) ;; esac
+# ⛔ ZERO IS NOT "OFF", IT IS "CONFIRM ON ONE SAMPLE" (review round 7 of #2653, P2): any `export` could
+# set it, and a gate an export can defeat is not a gate (the same reasoning `wt_bounded` records for its
+# own `0`). An ALREADY-ELAPSED window is a different input and still confirms on this sample.
+# ⛔ AND IT IS COERCED **BEFORE** `WT_ABSENT_STALE_MIN` IS DERIVED (review round 11 of #2653): done the
+# other way round, `0` made the `2*window` floor 0, leaving `4*CYC` = 20s at the sanctioned `CYC=5` —
+# NARROWER than the 60s window it must be wider than, so every stamp was discarded as stale before it
+# could confirm and the release could never fire, silently.
+[ "$WT_ABSENT_CONFIRM" -ge 1 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
+# ⛔ CYC IS READ BY THE STALENESS RULE BELOW, SO IT IS COERCED HERE, NOT ASSUMED (review round 10 of
+# #2653). This module is sourced by `dispatch-merge.sh` and `report.sh`, which do NOT coerce CYC for
+# it (`orch-loop.sh` repairs only its own shell), so a non-numeric value from the environment reaches
+# `$(( 4 * 10#$CYC ))` — and an arithmetic-expansion error TERMINATES `wt_table` before it prints.
+# An empty table is read as "this box has no workers": the caps stop binding and `wt_close` deletes a
+# record it never looked at. `CYC` also floors at 5 (install.sh, orch-loop), so a legitimate small
+# cycle is preserved.
+# ⛔ NORMALISE INTO A LOCAL, DO NOT CLASS-CHECK AND DO NOT TOUCH THE CALLER'S `CYC` (review round 13 of
+# #2653, P1). `case ''|*[!0-9]*)` ACCEPTS `08`, `[ 08 -ge 1 ]` is true (test parses decimal), and then
+# `$(( 4 * CYC ))` reads `08` as OCTAL and ERRORS — the assignment fails, and with `set -u` (every
+# consumer: orch-loop.sh, dispatch-merge.sh, report.sh) `WT_ABSENT_STALE_MIN` is UNBOUND, which is fatal
+# at SOURCE time: the controller and the merge dispatcher exit before a cycle runs, and KeepAlive
+# relaunches a process that dies in the same place — the `CYC=08` relaunch-loop the `is_num` doctrine
+# records. `0*` is therefore rejected as well, and `10#` makes the rest decimal.
+CYCN=240
+case "${CYC:-}" in
+  ''|*[!0-9]*|0*) : ;;
+  *) [ "${#CYC}" -le 9 ] && CYCN=$(( 10#$CYC )) ;;
+esac
+[ "$CYCN" -ge 1 ] 2>/dev/null || CYCN=240
+# A stamp older than this is not continuity for the CURRENT outage: it is re-stamped, never confirmed.
+# ⛔ AND IT MUST BE WIDER THAN THE CONFIRMATION WINDOW (review round 10 of #2653), or a sanctioned
+# small cycle (`CYC` floors at 5) would discard every stamp before it could ever confirm — the release
+# #2653 provides would silently never happen. Whichever is larger: 4 cycles, or twice the window.
+WT_ABSENT_STALE_MIN=$(( 4 * CYCN ))
+[ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree nrc names probe_ok raw="" tbl="" f name kind id st
-  now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
+  local now ttl dir cache hdr tree tree_err tfile absent_now absent_since absent_last _cont _mage _wl nrc names probe_ok raw="" tbl="" f name kind id st
+  # ⛔ A FAILED OR BACKWARDS CLOCK MUST NOT FREEZE THE MEMO (review round 13 of #2653, P2). `|| echo 0`
+  # is the idiom round 12 removed from the absent arm: with `now=0` (or after a backwards clock step)
+  # `now - at` is NEGATIVE, which is `< ttl`, so a memo is served FOREVER instead of for 10 s — the
+  # census freezes at the pre-step verdict, and a frozen `dead` row is the under-count direction (the
+  # caps stop binding). The age must be non-negative AND under the TTL.
+  now="$(date +%s 2>/dev/null)" || now=""
+  case "$now" in ''|*[!0-9]*) now="" ;; esac
+  ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
     hdr="$(head -1 "$cache" 2>/dev/null)"
@@ -726,11 +1172,63 @@ wt_table() {
       '# at='*)
         case "${hdr#\# at=}" in
           ''|*[!0-9]*) : ;;
-          *) [ $(( now - ${hdr#\# at=} )) -lt "$ttl" ] && { sed '1d' "$cache"; return 0; } ;;
+          *) if [ -n "$now" ]; then
+               _mage=$(( now - 10#${hdr#\# at=} ))
+               [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$ttl" ] && { sed '1d' "$cache"; return 0; }
+             fi ;;
         esac ;;
     esac
   fi
-  tree="$(cmux tree --json 2>/dev/null)" || tree=""
+  # ⛔ AN ABSENT SESSION OWNER IS A READING, NOT AN UNREADABLE ONE (agent-infra#2653, measured
+  # 2026-10-24). `cmux tree --json` was read with its stderr discarded, so a daemon that was NOT
+  # RUNNING — answering `cannot connect to session socket …: Connection refused (os error 111)` with
+  # an empty stdout — was indistinguishable from a daemon that answered something undecodable. Both
+  # read UNKNOWN, every `kind=terminal` record read UNKNOWN, and `unknown` counts as LIVE by the
+  # fail-closed rule below. The measured consequence on the live cell: 18 stale worker records (logs
+  # silent for 26-30h) counted as 18 live workers; `wt_close` could never PROVE a close (its
+  # verification read is the same unreadable census), so the records were kept forever; the review
+  # lane ceiling never fell (`review lanes=11/6` every cycle for 26h); no review was dispatched for
+  # the 8 NEEDS-REVIEW PRs; the PR queue could not drain; and the threshold-free merge-priority gate
+  # held the issue path shut while 175 candidates went undispatched on a box reporting idle lanes.
+  # A terminal lives INSIDE the session owner. If the owner is not running there is no terminal —
+  # that is a MEASUREMENT, not a guess, and it is the same polarity the tmux half already implements
+  # (`no server running` = EMPTY, `error connecting` = unreadable). A daemon that ANSWERS with
+  # something undecodable (a banner, a drifted shape) is still UNKNOWN, below, unchanged: the caps
+  # keep binding on a read that is merely illegible, and only a CONFIRMED-ABSENT transport empties
+  # the census.
+  # ⛔ THE CAPTURE MUST NOT BE ABLE TO STOP THE PROBE (review round 6 of #2653, P2). A redirect that
+  # cannot be opened makes bash SKIP the command entirely, so on an unwritable (or missing) `$dir`
+  # `cmux tree` would never run: `tree` empty, `tree_err` empty, probe UNKNOWN, and the table loses
+  # every row it derives FROM THE DAEMON — the record-less workers the census exists to keep. That is
+  # the under-count direction (caps stop binding). So the capture is optional: if the file cannot be
+  # created, the probe still runs and its stderr is discarded exactly as before.
+  # ⛔ THREE SEPARATE NAMES, BECAUSE ONE WAS DOING TWO JOBS (review round 7 of #2653): `tree_err` held
+  # the FILE PATH and then the file's CONTENT, so `rm -f "$tree_err"` removed nothing and one capture
+  # file accumulated per controller process (carrying the daemon's stale stderr, and colliding with the
+  # next run's `mkdir`). And a failing `>` redirect prints its own diagnostic on the PRE-COMMAND stderr,
+  # which `2>/dev/null` on that simple command does not silence — the `{ …; } 2>/dev/null` group does,
+  # which matters because on an unwritable `$dir` this runs on EVERY census read and the controller's
+  # log is append-only and never rotated.
+  # ⛔ ONE CAPTURE LOCATION, AND IT IS NOT `$dir` (review round 8 of #2653, P1). Round 6's fallback
+  # captured the streams differently when `$dir` was unwritable, so the SAME bytes could read one way
+  # with a writable dir and another way without it: the writable branch routed only STDERR into
+  # `tree_err` (an unparseable STDOUT left the verdict UNKNOWN), while the fallback merged both — so a
+  # `no server running` line printed on STDOUT became the absent-owner signal in one branch and not in
+  # the other. `dead` frees the caps and lets `wt_close` close a live worker's terminal, so that was
+  # the same P1 class the round-7 rc fix closed on the OTHER axis.
+  # The capture now lives in `$TMPDIR` (always writable for the user running the controller), so there
+  # is exactly ONE branch: stdout → `tree`, stderr → `tree_err`. If even that cannot be created, the
+  # probe still runs with stderr discarded and the absent-owner signal is simply UNOBSERVABLE — the
+  # census stays UNKNOWN and the caps binding, which is the pre-change behaviour and the safe side.
+  tfile="${TMPDIR:-/tmp}/.wt-tree-err.$$"
+  if { : >"$tfile"; } 2>/dev/null; then
+    tree="$(cmux tree --json 2>"$tfile")" || tree=""
+    tree_err="$(cat "$tfile" 2>/dev/null || true)"
+    rm -f "$tfile" 2>/dev/null || true
+  else
+    tree="$(cmux tree --json 2>/dev/null)" || tree=""
+    tree_err=""
+  fi
   # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
   # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
   # header already records that the id shape differs) yields an EMPTY table while `$tree` is
@@ -743,7 +1241,151 @@ wt_table() {
   if command -v tmux >/dev/null 2>&1; then names="$(wt_tmux_names)" && nrc=0 || nrc=3; else nrc=0; fi
   if [ -n "$tree" ]; then
     if raw="$(printf '%s\n' "$tree" | wt_tree_probe)"; then probe_ok=1; else raw=""; fi
+  else
+    # NOTHING IS LISTENING => NOTHING IS RUNNING. ⛔ ONLY THE TWO SHAPES THAT NAME AN ABSENT SERVER
+    # COUNT — `Connection refused` (measured: a socket file with no listener, `os error 111`) and
+    # `no server running` (the CLI's own semantic answer, the same polarity `wt_tmux_names` gives).
+    # ⛔ AND **NOT** THE WRAPPER (`cannot connect to session socket …`): it is errno-agnostic, so it
+    # also carries `No such file or directory` (a repointed HOME, a wrong/unlinked socket path) and
+    # `Permission denied` — BOTH reachable while the daemon and its terminals are ALIVE. Emptying the
+    # census on those deletes a lived worker's record and stops every cap binding, which is the P1
+    # incident the tmux half's header records (`error connecting` = unreadable). A banner, a drifted
+    # shape, `cmux: cannot read`, a missing binary (127) or any other failure stays UNKNOWN too.
+    # ⛔ AND ONE SAMPLE IS NOT A STATE (review round 5 of #2653; this repo's own rule: "a measurement
+    # artifact is not a state — never take a destructive action from a first-match reading"). Terminal
+    # records carry no pid, so once this read concludes `dead` the record can only be judged by the
+    # owner: a HARD-KILLED daemon never closes its ptys or signals its children, so an orphaned worker
+    # could still be running while the harness frees its slot and deletes its handle — and a restart
+    # window is seconds. So the absent answer is CONFIRMED by two samples at least WT_ABSENT_CONFIRM
+    # apart; the first one only opens the window (still UNKNOWN, caps binding), and a readable census
+    # closes it. Two controller cycles (CYC=240) always span the default, so the 26h stall is fixed
+    # while a single refusal sample cannot empty the census.
+    case "$tree_err" in
+      *'Connection refused'*|*'no server running'*)
+        # ⛔ A FAILED CLOCK MUST NOT BECOME THE LITERAL `0` (review round 12 of #2653, P1): `|| echo 0`
+        # handed a failure STRAIGHT THROUGH the digit guard below, PERSISTED `0` as the stamp, and the
+        # already-elapsed arm then confirmed on ONE real sample with zero elapsed window — the exact P1
+        # the two-sample rule exists to prevent, on the state that survives the process. Capture the
+        # STATUS, so a failure lands in the fail-closed `-z` branch.
+        absent_now="$(date +%s 2>/dev/null)" || absent_now=""
+        # ⛔ A FAILED CLOCK MUST NOT EMPTY THE CENSUS OR POISON THE STAMP (review round 11 of #2653, P2):
+        # a `date` printing a diagnostic makes `$(( 10#… ))` error — `wt_table` aborts before printing,
+        # and an empty table is read as "no workers" — and the failure would then PERSIST the stamp `0`,
+        # which the read arm treats as an already-elapsed window, confirming on ONE real sample. Guard it
+        # and refuse to open a window on an unusable clock: the record stays UNKNOWN (fail-closed).
+        case "$absent_now" in ''|*[!0-9]*) absent_now="" ;; esac
+        if [ -z "$absent_now" ]; then :; else
+        # ⛔ TWO VALUES, BECAUSE ONE COULD NOT TELL "A GAP" FROM "STILL ABSENT" (review round 14 of
+        # #2653, P2). The file used to hold only FIRST-SEEN. With a single value, a CONTINUOUS outage
+        # longer than `WT_ABSENT_STALE_MIN` looked like a gap: the stamp aged past the bound, the
+        # staleness rule re-opened the window, and the rows flipped `dead` → `unknown` for a full
+        # `WT_ABSENT_CONFIRM` before confirming again — so the release was a DUTY CYCLE (measured at the
+        # defaults: ~900s dead, ~60s unknown, repeating), i.e. the 26h stall reduced to one cycle in four
+        # rather than ended. Format: "<first_seen> <last_absent>". A legacy single-value file (an older
+        # harness) reads as first_seen with an empty last_absent → continuity is judged on first_seen (so a
+        # deploy that restarts the controller MID-OUTAGE still releases rather than starting the clock
+        # again), which is the safe reading for a file this build did not write.
+        absent_since=""; absent_last=""
+        if [ -f "$dir/.wt-absent-since" ]; then
+          read -r absent_since absent_last < "$dir/.wt-absent-since" 2>/dev/null || true
+        fi
+        case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
+        case "$absent_last"  in ''|*[!0-9]*) absent_last=""  ;; esac
+        # ⛔ AND IT IS `10#`-NORMALISED TOO (review round 15 of #2653, P1): `_cont` is used as a bare
+        # arithmetic VARIABLE, which re-parses its value as an expression — `08` is read as OCTAL, the
+        # expansion errors, and `wt_table` ABORTS BEFORE IT PRINTS. Every later read hits the same field
+        # (nothing repairs the file during an outage), so the census stays EMPTY: `wt_count` 0 (caps stop
+        # binding) and `wt_alive` "not alive", so `wt_close` deletes a record it never looked at. This is
+        # the field BOTH writers emit, so it is the normal case — the guard existed one line away for
+        # field 1 and not for field 2.
+        if [ -n "$absent_last" ]; then absent_last=$(( 10#$absent_last )); fi
+        # ⛔ `08` PASSES THE DIGIT GUARD AND THEN ABORTS THE ARITHMETIC (review round 8 of #2653, P2):
+        # `$(( … ))` reads a leading zero as OCTAL, `08` is not octal, the expansion errors and the
+        # FUNCTION ABORTS before printing a table — an EMPTY census, which every consumer reads as "the
+        # box has no workers" (caps stop binding, `wt_close` deletes a record it never looked at). The
+        # `10#` normalisation is the same one `floor_norm` uses, and it is also why `is_num` refuses a
+        # leading zero. ⛔ AND IT APPLIES ONLY TO A STAMP THAT EXISTS — normalising an EMPTY stamp would
+        # turn it into `0` (an already-elapsed window) and confirm on the FIRST sample, which is the
+        # single-sample conclusion this whole rule forbids.
+        absent_now=$(( 10#${absent_now:-0} ))
+        # ⛔ NORMALISE A PRESENT STAMP BEFORE ANY ARITHMETIC (see the `08` note below): the stale check
+        # immediately below does subtraction, so an `08` would abort here instead of there.
+        if [ -n "$absent_since" ]; then absent_since=$(( 10#$absent_since )); fi
+        # ⛔ A STALE STAMP IS NOT CONTINUITY (review round 9 of #2653, P1). The stamp records when an
+        # absent owner was FIRST seen; nothing requires it to belong to the CURRENT outage. If the owner
+        # was absent at T0, came back while NOTHING read the census (a deploy restarted the controller, a
+        # cycle froze in a hung probe), and went absent again, the first sample of the later outage found
+        # an ancient stamp and confirmed immediately — a single-sample `dead`, which frees every cap and
+        # lets `wt_close` delete a live worker's record.
+        # ⛔ AND A FUTURE STAMP IS NOT CONTINUITY EITHER (review round 10 of #2653): after an NTP step or
+        # a VM snapshot restore the subtraction is negative, so neither the staleness check nor the
+        # confirm test fires and the release is pinned for the whole skew — the stall this change ends,
+        # in the fail-closed direction. A non-monotonic stamp is discarded like a stale one.
+        # ⛔ AND THE EMPTINESS TEST IS A `case`, NOT `[ … -gt 0 ]` (review round 10): `[` on an empty
+        # value prints its own diagnostic on EVERY window opening — the per-read bash noise silenced
+        # everywhere else in this file. A stamp of literally `0` IS an already-elapsed window, kept.
+        # ⛔ AND A `0` STAMP IS NOT A SPECIAL CASE (review round 12 of #2653): the old `0) : ;;` arm kept
+        # it as an "already-elapsed window", which is exactly what let a failed clock (persisted as 0)
+        # confirm on the next sample. Judged by the ordinary staleness rule a `0` is older than
+        # `WT_ABSENT_STALE_MIN` on any real clock, so it is discarded → first sample → fail-closed, and
+        # epoch-zero / NTP-step inputs are covered by the same rule. (No suite writes a `0` stamp: every
+        # fixture writes `now - N`.)
+        # The continuity datum is `last_absent` when the file carries two values (this build), else
+        # `first_seen` (a legacy stamp). A FUTURE value, or one older than the bound, breaks continuity.
+        _cont="${absent_last:-$absent_since}"
+        case "$_cont" in
+          '') : ;;
+          *)  if [ "$_cont" -gt "$absent_now" ] \
+                 || [ $(( absent_now - _cont )) -gt "$WT_ABSENT_STALE_MIN" ]; then
+                absent_since=""; absent_last=""
+              fi ;;
+        esac
+        if [ -z "$absent_since" ]; then
+          # ⛔ NAMED, NOT SWALLOWED (review round 6 of #2653, P2): if the window cannot be persisted
+          # every sample restarts it, the comparison never elapses, and the census stays UNKNOWN for
+          # ever — exactly the 26h stall this change exists to end, with nothing saying so. `wt_warn`
+          # writes to stderr AND `$LOG`, which is where that stall would have been visible.
+          # ⛔ LATCHED (review round 9 of #2653, P2): the write fails on EVERY attempt, so an unlatched
+          # warning is ~250 B per census read (~12/cycle, ~1 MB/day) into the append-only, never-rotated
+          # log — the same hazard this file just removed bash's own per-read diagnostic for. Named once
+          # per process; the state is still visible in stderr and `$LOG`.
+          # A successful write RE-ARMS the warning (the next inability to confirm is a new fact).
+          { printf '%s %s\n' "$absent_now" "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
+            && rm -f "${TMPDIR:-/tmp}/.wt-warned-absent-window.$$" 2>/dev/null \
+            || { _wl="${TMPDIR:-/tmp}/.wt-warned-absent-window.$$"
+                 # ⛔ THE LATCH IS A FILE, NOT A VARIABLE (review round 10 of #2653, P2): every consumer
+                 # calls `wt_table` in a COMMAND SUBSTITUTION (`$(wt_table)`, `wt_table | awk`), i.e. in a
+                 # subshell, so an in-process variable was assigned and discarded on every read — the
+                 # warning fired per read, ~12/cycle, ~1 MB/day into the append-only log. `$$` is the
+                 # parent's pid and is stable across those subshells, so this file latches.
+                 [ -e "$_wl" ] || { : >"$_wl" 2>/dev/null || true; wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED); logged once per process"; }; }
+          absent_since="$absent_now"; absent_last="$absent_now"
+        else
+          # CONTINUOUS absence: refresh ONLY the continuity datum, so the window never ages past the
+          # staleness bound while the outage lasts — and keep `first_seen`, which is what the two-sample
+          # confirmation measures.
+          { printf '%s %s\n' "$absent_since" "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null || true
+          absent_last="$absent_now"
+        fi
+        # ONE comparison, always: an ALREADY-ELAPSED stamp confirms on THIS sample — that is how an
+        # operator declares "this outage has lasted", and how the fixtures say it. ⛔ THE KNOB'S `0` DOES
+        # NOT: it is coerced to 60 above (review round 7), because zero would confirm on one sample.
+        # This comment claimed the suites set the knob to 0 — they did exactly the opposite, BECAUSE of
+        # round 7, and a reader looking for that debugging switch would think the knob was broken
+        # (review round 13).
+        [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1
+        fi ;;
+      # ⛔ ANY OTHER ANSWER CLOSES THE WINDOW TOO (review round 8 of #2653, P2). It used to close only
+      # on a READABLE tree, so an answer that proves nothing either way — the
+      # `cannot connect … No such file or directory` wrapper this module deliberately treats as UNKNOWN,
+      # a banner — left an ANCIENT stamp standing; the next absent sample then confirmed immediately, a
+      # single-sample conclusion reached through a recovery path. Closing here means an outage whose
+      # messages alternate restarts the timer: the fail-CLOSED direction (caps bind longer).
+      *) rm -f "$dir/.wt-absent-since" 2>/dev/null || true ;;
+    esac
   fi
+  # …and a readable census closes it as well (the owner answered).
+  [ -n "$tree" ] && rm -f "$dir/.wt-absent-since" 2>/dev/null || true
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).
   # An unreadable probe is UNKNOWN — never dead: see the polarity rule in the header.
@@ -803,7 +1445,11 @@ EOF
       # RECORD — a wiped $O/state, an older harness, a hand-start — was invisible here, so the census
       # under-counted it and the cap it feeds was softer than it claimed. Pre-existing, and more
       # load-bearing now that tmux is the only surface on a cell.
-      case "$name" in lane-*|merge-*|fix-*|chain-*) ;; *) continue ;; esac
+      # ⛔ `review-*` IS IN THIS LIST TOO (agent-infra#2971): the controller now dispatches a review
+      # ORDER under that tag instead of reusing `merge-<PR>`, and a session with no RECORD of its own
+      # (a wiped $O/state, a hand start) is invisible here — which would silently UNDER-count the
+      # review ceiling this census feeds, making the cap softer than it claims.
+      case "$name" in lane-*|merge-*|review-*|fix-*|chain-*) ;; *) continue ;; esac
       case "$name" in *[!A-Za-z0-9-]*) continue ;; esac
       # ⛔ IN-SHELL MEMBERSHIP, not `printf | awk` per line: a listing that STREAMS (the
       # cloud-cell-supervisor fixture streams 60k lines to prove no SIGPIPE fail-open) made this loop
@@ -820,7 +1466,12 @@ EOF
   fi
   WT_TABLE="$(printf '%s\n' "$tbl" | sed '/^$/d' | awk -F'\t' 'NF==2 && !seen[$1]++')"
   WT_TABLE_AT="$now"
-  { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$" 2>/dev/null \
+  # ⛔ THE `2>/dev/null` MUST APPLY TO THE GROUP, NOT SIT AFTER THE `>` (review round 8 of #2653, P2):
+  # a failing `>` open prints bash's own diagnostic on the PRE-COMMAND stderr, which a redirect placed
+  # after it never sees — so an unwritable `$dir` emitted raw bash noise on EVERY census read (~12 per
+  # controller cycle) into an append-only, never-rotated log. Measured: the group form silences it and
+  # keeps the same status.
+  { { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$"; } 2>/dev/null \
     && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
   printf '%s\n' "$WT_TABLE"
 }
@@ -886,12 +1537,10 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
 }
 
 wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (reason on stderr)
-  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val pre_rc preout premsg spout spmsg
+  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val srv_pvar srv_pval pre_rc preout premsg pre_where spout spmsg
   [ "$#" -ge 3 ] || { wt_warn "wt_spawn needs <name> <cwd> <command>"; return 1; }
   name="$1"; cwd="$2"; shift 2; cmd="$*"
-  case "$name" in
-    ''|*[!A-Za-z0-9-]*) wt_warn "refusing a worker name with anything but [A-Za-z0-9-]: '$name'"; return 1 ;;
-  esac
+  wt_name_ok "$name" || { wt_warn "refusing a worker name with anything but [A-Za-z0-9-]: '$name'"; return 1; }
   dir="$(wt_dir)"
   kind="$(wt_launcher)"
   case "$kind" in
@@ -904,7 +1553,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # command substitution, so it cannot hand a variable back).
       _cmrc=127
       if command -v cmux >/dev/null 2>&1; then _cmrc=0; cmux tree --json >/dev/null 2>&1 || _cmrc=$?; fi
-      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer (cmux tree rc=$_cmrc$(command -v cmux >/dev/null 2>&1 && echo ', binary present' || echo ', no binary')) AND there is no tmux binary, so there is nothing to start a worker in (checked: uname=$(uname -s 2>/dev/null || echo unknown), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent))"
+      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer (cmux tree rc=$_cmrc$(command -v cmux >/dev/null 2>&1 && echo ', binary present' || echo ', no binary')) AND there is no tmux binary, so there is nothing to start a worker in (checked: uname=$(uname -s 2>/dev/null || echo unknown), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent)) — why: $(wt_launcher_why)"
       return 1 ;;
     tmux)
       # The launchd Mac surface and the Linux cell (see wt_launcher) — WITH the environment contract.
@@ -922,7 +1571,13 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         # hardcode `$home/.config/gh/hosts.yml` while the probe goes through `wt_gh_hosts` (GH_CONFIG_DIR,
         # then XDG_CONFIG_HOME, then `$HOME/.config/gh`) — so on a repointed box the operator was sent to
         # a path that does not exist. A refusal must name the places it looked, not a guess at them.
-        wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $(wt_gh_hosts "$home") (no readable oauth_token), $home/keys.env (no GH_TOKEN/GITHUB_TOKEN value), this caller's own GH_TOKEN/GITHUB_TOKEN (only when this spawn creates the server) and the tmux server's GH_TOKEN/GITHUB_TOKEN; found none in any of them. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
+        # ⛔ AND IT MUST NOT NAME A CAUSE IT DID NOT ESTABLISH (measured 2026-10-27, found by review of the
+        # model-credential gate): `wt_launcher_env` refuses on EITHER credential, so this line — which
+        # hardcoded "the worker would have NO gh credential" — told the operator to fix a gh credential
+        # that was FINE whenever the refusal was the provider. Both surfaces are named here, the gates'
+        # own REFUSED line above carries the specific one, and this line says which question it answered
+        # ("the environment contract could not be built") rather than guessing at the answer.
+        wt_warn "REFUSED $name: tmux can start a session here, but \`wt_launcher_env\` could NOT build the worker's environment contract — so the worker is not started. The gate's own REFUSED line ABOVE names which credential failed. Both surfaces it requires: (1) a gh credential — checked $(wt_gh_hosts "$home") (no readable oauth_token), $home/keys.env (no GH_TOKEN/GITHUB_TOKEN value), this caller's own GH_TOKEN/GITHUB_TOKEN (only when this spawn creates the server) and the tmux server's GH_TOKEN/GITHUB_TOKEN; (2) the LANE MODEL credential — the \$<VAR> named by $home/.pi/agent/models.json for provider '$(wt_lane_provider "$home")', which was absent from this caller's environment, $home/pi-keys.env and $home/keys.env. A lane started without either stops at its first call (the '~21-line death' agent-infra#2210 recorded, or pi's 'No API key found for …' at 2-10s); put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
         return 1
       }
       # ⛔ THE LAUNCH LINE IS EXECUTED ONCE ON THE CALLER'S SIDE, BEFORE `new-session` (P1 review finding,
@@ -935,10 +1590,19 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # That is the dead-lane-reported-provisioned this change exists to remove, one layer below the
       # launcher: the refusal was real, and INVISIBLE. So the prefix runs once here and a non-zero
       # REFUSES the spawn before any session is created.
-      # ⛔ THE PROBE MUST SEE WHAT THE PANE WOULD INHERIT, not what the caller happens to hold. On the
-      # server-token arm the credential comes from the tmux SERVER's global environment (the prefix
-      # neither exports it nor reads a file for it), so the server's value is injected here; on every
-      # other arm the prefix pins or clears the names itself, which makes the injection inert.
+      # ⛔ THE PROBE MUST SEE WHAT THE PANE WOULD INHERIT, not what the caller happens to hold — FOR
+      # EVERY CREDENTIAL, not just gh (P1 review finding, 2026-10-27, MEASURED). On the server-token arm
+      # the credential comes from the tmux SERVER's global environment (the prefix neither exports it nor
+      # reads a file for it), so the server's value is injected here; on every other arm the prefix pins
+      # or clears the names itself, which makes the injection inert.
+      # ⛔ AND THE MODEL CREDENTIAL NEEDS THE SAME INJECTION, with the same argument (measured): the gate
+      # credits a server-carried `$<VAR>` — the pane inherits it — and without the injection the prefix's
+      # own model guard evaluated in a caller that holds neither, exited 98, and `wt_spawn` REFUSED a box
+      # whose worker would have worked: `HOME=…(models.json names the var) pvar=[DEEPSEEK_API_KEY] SPAWN
+      # rc=1 — REFUSED` against `rc=0` for the same box with no models.json. The invariant is that the
+      # gate's answer and the pre-check's answer are the SAME answer on EVERY arm, so the pre-check is
+      # given exactly the environment the pane would inherit: the caller's, plus the server's names.
+      # Two branches rather than an argv array, so the words cannot be split by a value with a space.
       # ⛔ PATH IS PINNED IN THE CONTRACT (P1 review finding, 2026-10-23, MEASURED — this comment used to
       # claim the opposite, and it was wrong): the pre-check below runs in the CALLER's environment while
       # the pane runs in the SERVER's, so an unpinned PATH validated a different `gh` resolution than the
@@ -947,18 +1611,56 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # (the server's PATH has no `gh`) — a spawn reported provisioned for a lane dead in its first
       # millisecond. `wt_launcher_env` now emits `export PATH=…`, so the two measure the same thing.
       srv_val="$(wt_tmux_server_token_value 2>/dev/null)" || srv_val=""
+      # The model credential's name is whatever models.json resolves it from; asked of the SERVER for
+      # that one name, the same question the gh arm asks for its two.
+      srv_pvar="$(wt_provider_key_var "$home" 2>/dev/null)" || srv_pvar=""
+      srv_pval=""
+      [ -n "$srv_pvar" ] && { srv_pval="$(wt_tmux_server_token_value "$srv_pvar" 2>/dev/null)" || srv_pval=""; }
+      # gh's value is injected under GH_TOKEN because that is the name the gate's guard reads first; the
+      # model credential is injected under ITS OWN name (it is a different variable every box).
       pre_rc=0
       # ⛔ BOUNDED, because the prefix's own guard calls `gh` (see `wt_bounded`): an unbounded probe
       # here hangs the controller's spawn path instead of refusing it. rc 142/124 is a REFUSAL — no
       # session is created — which is the fail-closed direction.
-      if [ -n "$srv_val" ]; then
+      if [ -n "$srv_val" ] && [ -n "$srv_pvar" ] && [ -n "$srv_pval" ]; then
+        preout="$(wt_bounded "${WT_PRE_TIMEOUT:-20}" env GH_TOKEN="$srv_val" "$srv_pvar=$srv_pval" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
+      elif [ -n "$srv_val" ]; then
         preout="$(wt_bounded "${WT_PRE_TIMEOUT:-20}" env GH_TOKEN="$srv_val" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
+      elif [ -n "$srv_pvar" ] && [ -n "$srv_pval" ]; then
+        preout="$(wt_bounded "${WT_PRE_TIMEOUT:-20}" env "$srv_pvar=$srv_pval" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
       else
         preout="$(wt_bounded "${WT_PRE_TIMEOUT:-20}" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
       fi
       if [ "$pre_rc" -ne 0 ]; then
         premsg="${preout//$'\n'/ }"
-        wt_warn "REFUSED $name: the credential contract this launch line carries FAILS when it is executed (rc=$pre_rc), so the worker would die at once and be recorded as a started lane: ${premsg:0:300}"
+        # ⛔ AND IT SAYS WHAT ENVIRONMENT IT JUDGED (P1 review finding, 2026-10-27). This pre-check runs in
+        # the CALLER's environment PLUS the tmux server's own global names (what the pane inherits), and it
+        # used to say nothing about that — so a refusal on the server-credential arm read as though the
+        # caller were the problem, sending the operator to `pi-keys.env` when the value was one
+        # `tmux show-environment -g` away. It names both inputs now, and the pane-side line above (carried
+        # in ${premsg}) names the exact credential and every source that was checked.
+        pre_where=""
+        [ -n "$srv_val" ] && pre_where="GH_TOKEN"
+        if [ -n "$srv_pvar" ] && [ -n "$srv_pval" ]; then pre_where="${pre_where:+$pre_where and }$srv_pvar"; fi
+        if [ -n "$pre_where" ]; then
+          pre_where=" (this caller's environment plus the tmux SERVER's own global $pre_where, which is what the pane inherits)"
+        else
+          # ⛔ THE SERVER'S ANSWER IS THREE-VALUED, so the REFUSAL may not assert absence (review finding,
+          # 2026-10-28). An empty `srv_val`/`srv_pval` collapses three different states — the server holds
+          # neither name, there IS no server, and the probe could not answer at all (`wt_bounded` fired,
+          # rc 142/124; or no `tmux`). The old wording said "the tmux server carries neither name" for all
+          # three, i.e. it named a cause it had not established, which is the rule this file states for
+          # itself at the launcher and `env` sites. `wt_tmux_has_server` is the existing three-valued
+          # probe (0 = answers · 1 = none · 3 = no answer), so it decides the clause.
+          local _pwrc=0
+          wt_tmux_has_server || _pwrc=$?
+          case "$_pwrc" in
+            0) pre_where=" (this caller's environment; a tmux server ANSWERED and carries neither name)" ;;
+            1) pre_where=" (this caller's environment; no tmux server answers on this socket, so the pane inherits only this)" ;;
+            *) pre_where=" (this caller's environment; the tmux server did NOT answer within ${WT_PROBE_TIMEOUT:-15}s, so what it carries is UNKNOWN — not established as absent)" ;;
+          esac
+        fi
+        wt_warn "REFUSED $name: the credential contract this launch line carries FAILS when it is executed (rc=$pre_rc), so the worker would die at once and be recorded as a started lane. The pre-check ran with the environment the PANE would inherit$pre_where — so this is not a caller-side artefact, and the pane-side line carried below names the credential and every source it checked: ${premsg:0:300}"
         return 1
       fi
       # ⛔ THE SHELL-COMMAND MUST BE ONE ARGUMENT (P0 review finding, 2026-10-23, MEASURED). tmux runs
@@ -993,7 +1695,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # reason discarded (a permission-broken socket dir answers `directory … has unsafe permissions`)
       # is the one diagnostic that matters most where it was missing.
       spmsg="${spout//$'\n'/ }"
-      wt_warn "tmux could not start $name: ${spmsg:0:300}"
+      wt_warn "REFUSED $name: tmux could not start it: ${spmsg:0:300}"
       return 1 ;;
     terminal) : ;;
     *) wt_warn "REFUSED $name: unreadable launcher '$kind'"; return 1 ;;
@@ -1011,7 +1713,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
     set -- "$@" --cwd "$cwd" --no-open -- /bin/bash "$runf"
     out="$(cmux "$@" 2>&1)" || { wt_warn "REFUSED $name: cmux surface new-terminal failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; return 1; }
     id="$(printf '%s\n' "$out" | grep -oE 'term_[A-Za-z0-9]+|surface:[0-9]+' | head -1)"
-    [ -n "$id" ] || { wt_warn "REFUSED $name: cmux surface new-terminal printed no terminal id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; return 1; }
+    [ -n "$id" ] || { wt_warn "REFUSED $name: cmux surface new-terminal printed no terminal id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true; return 1; }
     ws=""
   else
     # The guest CLI's equivalent (see the header): one terminal surface, the run script typed into it.
@@ -1028,13 +1730,18 @@ PY
     id="$(printf '%s\n' "$out" | sed -n 's/.*"terminal_id": *"\([^"]*\)".*/\1/p' | head -1)"
     ws="$(printf '%s\n' "$out" | sed -n 's/.*"workspace_id": *"\([^"]*\)".*/\1/p' | head -1)"
     [ -n "$id" ] || { wt_warn "REFUSED $name: cmux created the workspace but printed no terminal_id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; \
-      [ -n "${ws:-}" ] && cmux workspace rm "$ws" >/dev/null 2>&1; rm -f "$envf" "$runf"; wt_forget; return 1; }
+      [ -n "${ws:-}" ] && cmux workspace rm "$ws" >/dev/null 2>&1; rm -f "$envf" "$runf"; rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true; wt_forget; return 1; }
   fi
   mkdir -p "$dir" 2>/dev/null || true
   # ⛔ THE RECORD WRITE IS CHECKED. A spawn that returns 0 without a record is an UNTRACKABLE worker: the
   # census can still see its surface (so the slot is held) but `wt_close` has no `kind`/`id` to close it
   # with — the worker holds a slot forever and the reap can never free it. So a failed write closes the
   # terminal it just created and FAILS the spawn.
+  # ⛔ THE OWNER HAS ANSWERED BY HERE (a terminal id came back), so the absent window is stale whatever
+  # happens to the RECORD WRITE below: a failed `printf > worker-<name>` returns 1 at the check below,
+  # and clearing only on the success tail left the ancient stamp standing — a second route to a
+  # one-sample confirmation (review round 9 of #2653, P2).
+  rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true
   if ! printf 'kind=terminal\nid=%s\nworkspace=%s\ngrammar=%s\ncwd=%s\nrun=%s\ncreated=%s\n' \
     "$id" "${ws:-}" "$grammar" "$cwd" "$runf" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null; then
     wt_warn "REFUSED $name: created terminal '$id' but could not record it in $dir — closing that terminal rather than leaving an untrackable worker behind"
@@ -1044,6 +1751,13 @@ PY
     wt_forget
     return 1
   fi
+  # ⛔ A TERMINAL SPAWN PROVES THE OWNER ANSWERED (review round 6 of #2653, P2), so the absent window
+  # must not survive it: otherwise the window stays ancient across an outage, and the FIRST absent
+  # sample after a restart-and-crash confirms immediately — the single-sample conclusion the two-sample
+  # rule exists to forbid. ⛔ AND IT BELONGS HERE, NOT IN wt_forget: wt_forget also runs for TMUX
+  # spawns, which prove nothing about the cmux owner and are exactly what the controller keeps doing
+  # during an outage — clearing there would restart the timer on every outage spawn and re-create the
+  # 26h stall.
   wt_forget
   return 0
 }

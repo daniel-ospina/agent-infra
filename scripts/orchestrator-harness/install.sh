@@ -144,9 +144,37 @@ CYC="${CYC:-240}"
 # silently evaporate the pin — the exact failure the whole SCOPE override exists to prevent.
 [ -z "${SCOPE+x}" ] && SCOPE=auto
 
+# ⛔ THE LABEL IS A SEAM ONLY FOR A SANDBOX (agent-infra#1996). launchd labels are GLOBAL: a plist
+# rendered under a throwaway $HOME still addresses the PRODUCTION job by name when it carries the
+# production label, so `launchctl bootout <sandbox plist>` — and any `-w` verb — reaches the job the
+# box is actually running. A test that answers a production label is therefore a false PASS on the one
+# thing the test exists to prove it is not touching. selftest.sh installs
+# `com.eldato.orchestrator-loop-test`, and `label_guard()` below refuses a non-default label on the
+# invoking user's real $HOME.
+BASE_LABEL="com.eldato.orchestrator-loop"
+# ⛔ THIS LINE STAYS A QUOTED LITERAL. `scripts/test_pr_doctor.py` pins pr-doctor's plist name to it
+# with `^LABEL="([^"]+)"` — written as an expression the pin still MATCHES but then compares against
+# `${LABEL:-$BASE_LABEL}.plist`, i.e. it asserts a name nothing installs and the regression it exists
+# for (a renamed label silently making pr-doctor read capacity 3/4) returns. The sandbox override is
+# therefore a SEPARATE line.
 LABEL="com.eldato.orchestrator-loop"
+[ -n "${LABEL_OVERRIDE:-}" ] && LABEL="$LABEL_OVERRIDE"
+# The OTHER production label: the recovery agent PR #1986 ships (`watchdog.plist.template`). It is
+# listed here so `label_guard` treats it as production too — the guard's rule is about the LIVE jobs,
+# and a second production label that the guard did not know about would be installable from a sandbox.
+PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
+# The invoking user's REAL home, from the passwd database rather than $HOME — that is the whole point
+# of the comparison, and `~user` expansion (not "$HOME") is what supplies it.
+# ⛔ BOTH SIDES CANONICALISED. A raw string compare reads a trailing slash (`HOME=/Users/me/`) as a
+# DIFFERENT home, so a real box reports itself as a sandbox and the guard refuses a production install
+# on the operator's own machine. Physical resolution also matches what launchd does with the path.
+_canon_dir() { ( cd "$1" 2>/dev/null && pwd -P ) || printf '%s' "$1"; }
+REAL_HOME="$(_canon_dir "$(eval printf '%s' "~$(id -un)" 2>/dev/null || true)")"
+HOME_C="$(_canon_dir "$HOME")"
+IS_SANDBOX=0
+[ -n "$REAL_HOME" ] && [ "$HOME_C" != "$REAL_HOME" ] && IS_SANDBOX=1
 # Seconds to wait for the label to show a pid AND for $O/heartbeat to advance after a start. The loop
 # writes the heartbeat at the TOP of every cycle, so a live controller refreshes it within seconds of
 # being launched; 30s is slack for a cold start, not a cycle's worth of work.
@@ -162,6 +190,40 @@ START_TIMEOUT="${START_TIMEOUT:-30}"
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
+
+# ── the LABEL guard: a non-default label is a sandbox seam, never a real install ─────────────
+# ⛔ A FUNCTION, NOT AN INLINE `if`, FOR ONE REASON: the decision has to be DRIVEN by selftest in both
+# directions, and a test that would have to run the installer on the real $HOME to prove the refusal is
+# a test that writes into the operator's LaunchAgents when the guard is broken. The decision is pure —
+# label, HOME, real home — so it is expressed as one and extracted.
+# ⛔ THE RULE IS AN XOR, NOT A HALF (review catch, 2026-10-18): a label is allowed only when it MATCHES
+# the $HOME it will be rendered into — production on the real home, test in a sandbox. Refusing only
+# `test label on the real home` leaves the MILD direction guarded and the one that reaches the live
+# controller open, because launchd resolves the label in the USER DOMAIN and ignores $HOME.
+label_guard() { # <label> <HOME> <real-home> -> 0 allowed, 1 refused (with the reason on stderr)
+  local label="$1" home="$2" real="$3" prod=0
+  case "$label" in "$BASE_LABEL"|"$PROD_WD_LABEL") prod=1 ;; esac
+  [ -n "$real" ] || return 0          # no passwd entry to compare against: nothing to protect
+  # ⛔ AND THE #446 TEST OPT-IN DOES **NOT** LIFT THIS ONE, deliberately. `ELDATO_ALLOW_TEST_HOME=1`
+  # authorises a sandbox HOME for launchd-cycle.sh's guard; it says nothing about WHICH job is
+  # addressed. The two are not the same question, and the whole seam exists because launchd resolves
+  # the label in the user domain and ignores `$HOME`: with the opt-in honoured here, a stray export
+  # would let a throwaway home address the LIVE controller — the exact failure this guard prevents.
+  # A suite that installs into a fixture `$HOME` therefore installs a TEST label (`LABEL_OVERRIDE`),
+  # which is what selftest.sh and install-launchd-durability.test.sh do.
+  if [ "$home" = "$real" ] && [ "$prod" = "0" ]; then
+    printf 'LABEL=%s on the real $HOME (%s): a non-default label is a SANDBOX seam (selftest.sh) — production installs the %s job. Refusing, so a test can never write into the live LaunchAgents.\n' \
+      "$label" "$home" "$BASE_LABEL" >&2
+    return 1
+  fi
+  if [ "$home" != "$real" ] && [ "$prod" = "1" ]; then
+    printf 'LABEL=%s under a non-real $HOME (%s; the real home is %s): a PRODUCTION label is refused outside the real home — launchd resolves the label in the user domain and IGNORES $HOME, so a plist written here still addresses the live controller and a `-w` verb would disable it. Use LABEL_OVERRIDE=<name>-test for a sandbox install.\n' \
+      "$label" "$home" "$real" >&2
+    return 1
+  fi
+  return 0
+}
+case "$LABEL" in ''|*/*|*' '*) die "LABEL='$LABEL' is not a usable launchd label" ;; esac
 
 # ── the launchd lifecycle seam ───────────────────────────────────────────────────
 # ⛔ ONE implementation for THIS job's lifecycle, sourced — never a second copy of the
@@ -186,6 +248,14 @@ case "${1:-}" in
   --uninstall) ACTION=uninstall ;;
   *) die "unknown argument '$1' (accepted: --start, --restart, --uninstall, or no argument)" ;;
 esac
+
+# ⛔ ABOVE THE `--uninstall` BRANCH, WHICH IS THE POINT (review catch, 2026-10-18). `--uninstall`
+# addresses the job BY LABEL, and launchd ignores $HOME — so an uninstall run from a sandbox $HOME
+# carrying the production label would silence the live controller by name: exactly the failure the
+# seam exists to prevent, arriving through the one branch that does not render. The config checks
+# below stay AFTER this branch (an uninstall must not be blocked by a REPO or SCOPE typo it does not
+# use); the label guard cannot follow that rule, because uninstall DOES use the label.
+label_guard "$LABEL" "$HOME" "$REAL_HOME" || exit 1
 
 # ── uninstall ────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = uninstall ]; then
@@ -568,6 +638,27 @@ done
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-limit.py" 2>/dev/null \
     || die "gh-limit.py does not parse"
 }
+# The merge reminder (#2603) is a TIMER'S ENTRY POINT, and a syntax error in it is a cycle that dies
+# with a traceback in a log nobody reads — the same class as a broken gh-limit.py, so it takes the
+# same parse gate. `box-status.sh` is a `*.sh` and is already covered by the sweep above.
+# ⛔ UNGUARDED, like its neighbour: a `[ -f ]` guard made a MISSING file pass this gate, so a
+# checkout without merge-reminder.py was reported as parsing fine while the timer had no script.
+command -v python3 >/dev/null 2>&1 \
+  || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
+  || die "merge-reminder.py is missing or does not parse"
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification, so they take the SAME parse gate: a syntax error in either one installs clean (the
+# files exist, so the loop's startup check does not fire), `python3 $O/check-class.py` exits 1 with
+# stderr discarded, and EVERY PR classifies `V=""` — no merge, no fixer, no reviewer — with no signal.
+# UNGUARDED, like their neighbours: a `[ -f ]` guard made a MISSING file pass a gate that exists to
+# catch a broken one.
+for _py in check-class.py nochk-resolve.py; do
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the NOCHECKS arm ($_py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/$_py" 2>/dev/null \
+    || die "$_py is missing or does not parse — the controller cannot classify a single PR without it"
+done
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -644,6 +735,348 @@ if [ -f "$HERE/gh-rest/gh" ]; then
 else
   warn "gh-rest/gh missing from the shipped set — the daemon will reach GitHub over GraphQL only"
 fi
+
+# ── THE PIN: which tree the controller RUNS (agent-infra#2231) ────────────────────────────────────
+# ⛔ THE DEFECT THIS REPLACES. The rendered program used to be `$O/orch-loop.sh` — a COPY of a script
+# the repo carries, in a directory that is not a git checkout (`git rev-parse --show-toplevel` there
+# answers `fatal: not a git repository`). Three fixes made on one Mac (a bounded gh probe, the
+# worklist wiring, three cell bring-up traps) existed ONLY in copies of that shape, so any re-deploy
+# from the repo would have erased them, and nothing on the box could say which commit it was running.
+# The cells never had this defect: they exec `<pin root>/<sha12>/scripts/orchestrator-harness/orch-loop.sh`,
+# a detached worktree AT THE PINNED COMMIT, and record the sha in `HARNESS-PIN`. This block gives the
+# Mac the SAME mechanism, through the SAME materialiser — no second launcher, no new pin format.
+#
+# The three records, spelled exactly as the cells spell them:
+#   HARNESS-PIN       the sha record (`~/.pi/agent/state/HARNESS-PIN`), read by harness-up/status and
+#                     written by harness-refresh.sh
+#   .harness-path     the DIR record, the path the controller execs
+#   HARNESS_PIN_DIR   the root the per-commit worktrees are created under
+HARNESS_REPO="${HARNESS_REPO:-}"
+HARNESS_REF="${HARNESS_REF:-origin/main}"
+HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$HOME/harness}"
+HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}"
+HARNESS_PIN="${HARNESS_PIN:-$HOME/.pi/agent/state/HARNESS-PIN}"
+# ⛔ THE INSTALLER'S OWN SOURCE IS NOT EVIDENCE OF THE PIN. `install.sh` runs from a checkout that may
+# be ahead of, behind, or off the pin's line; taking its directory as "the harness" is precisely how a
+# copy became the thing in service. It is used for ONE thing: locating the materialiser.
+# The ONE parser for a rendered plist's program: the pin block reads the INSTALLED job with it (to
+# find a live-only entrypoint) and the post-render assertion reads its own render with it. Two parsers
+# would let the two answers disagree.
+plist_program() { # <plist> -> the program the job execs (first non-interpreter element, else `Program`)
+  # ⛔ THE FILE IS FLATTENED FIRST, THEN THE ARRAY'S <string> ELEMENTS ARE MATCHED IN DOCUMENT ORDER.
+  # Both of the previous parsers keyed on LAYOUT and lost: `sed 's|.*<string>\(.*\)</string>.*|\1|p'`
+  # returns `a</string><string>b` on a ONE-LINE array (which a hand-edited plist is), and a
+  # `for tok in $(awk …)` loop WORD-SPLITS a program path containing a space. The repo already records
+  # the measurement that live plists and rendered templates differ in layout
+  # (`orchestrator-bringup.sh`'s flatten-then-match), so this does the same: flatten, extract the
+  # ProgramArguments body, match each element with an awk loop (not field splitting), then take the first
+  # element that is not a flag and not an interpreter. Only then the `Program` key, also flattened.
+  local flat args prog
+  [ -f "$1" ] || return 0
+  flat="$(tr '\n' ' ' < "$1" 2>/dev/null || true)"
+  args="$(printf '%s' "$flat" | sed -n 's:.*<key>ProgramArguments</key>[[:space:]]*<array>\(.*\)</array>.*:\1:p')"
+  prog="$(printf '%s' "$args" | awk '
+    { s = $0
+      while (match(s, /<string>[^<]*<\/string>/)) {
+        v = substr(s, RSTART + 8, RLENGTH - 17)
+        print v
+        s = substr(s, RSTART + RLENGTH)
+      } }' \
+    | awk '!(/^-/) && !/(^|\/)(ba|z|k)?sh$/ && !/\/env$/ { print; exit }')"
+  if [ -z "$prog" ]; then
+    prog="$(printf '%s' "$flat" | sed -n 's:.*<key>Program</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
+  fi
+  printf '%s' "$prog"
+}
+pin_refuse() { echo "❌ REFUSED (pin): $*" >&2; exit 78; }
+pin_say()    { echo "  · $*"; }
+# absent | path | unexaminable — `-e`/`-f` cannot tell "absent" from "I may not look", and a pin
+# record behind an unsearchable ancestor must not read as "never written" (harness-up's rule, the
+# same answer because both read the same records).
+pin_path_state() {
+  local p="$1" q
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  if [ -L "$p" ] && [ ! -e "$p" ]; then printf 'unexaminable'; return 0; fi
+  if [ -e "$p" ]; then printf 'path'; return 0; fi
+  q="$(dirname "$p")"
+  while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
+    if [ -L "$q" ] && [ ! -e "$q" ]; then printf 'unexaminable'; return 0; fi
+    if [ -e "$q" ]; then
+      if [ -x "$q" ]; then printf 'absent'; else printf 'unexaminable'; fi
+      return 0
+    fi
+    q="$(dirname "$q")"
+  done
+  printf 'absent'
+}
+# write_record <file> <content> — temp-then-rename, so a half-written pin can never replace a good one
+# (harness-refresh.sh's rule; an ENOSPC in an in-place write destroys the only record of the pin).
+pin_write_record() {
+  local f="$1" d tmp
+  d="$(dirname "$f")"
+  mkdir -p "$d" 2>/dev/null || pin_refuse "cannot create $d — the pin record cannot be written"
+  tmp="$f.tmp.$$"
+  printf '%s\n' "$2" > "$tmp" 2>/dev/null || { rm -f "$tmp"; pin_refuse "cannot write $tmp"; }
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; pin_refuse "cannot install $f"; }
+}
+# The pinned sha, when there is one this box can read. Empty means "no usable record", never "current".
+PIN_SHA=""
+case "$(pin_path_state "$HARNESS_PIN")" in
+  unexaminable) pin_refuse "the pin sha record $HARNESS_PIN cannot be EXAMINED (unsearchable ancestor or an unresolvable link), so the commit this box is pinned to cannot be read — refusing to render a job that would run whatever tree happens to be reachable" ;;
+  path) if [ ! -r "$HARNESS_PIN" ]; then
+          pin_refuse "the pin sha record $HARNESS_PIN exists but cannot be READ — the commit this box is pinned to is unknown, and unknown is not current"
+        fi
+        # ⛔ A RECORD THAT IS NOT A FILE IS CANNOT-VERIFY, NOT AN EMPTY PIN. `-e` is true for a DIRECTORY,
+        # and `head -1 <dir>` fails — with `|| true` that would read as "no pin recorded" and MEND over
+        # it (and without `|| true` it aborted the installer with `head`'s status and no message). Neither
+        # is a verdict: refuse by name.
+        if [ ! -f "$HARNESS_PIN" ]; then
+          pin_refuse "the pin sha record $HARNESS_PIN exists but is NOT A REGULAR FILE (a directory, a socket, …) — the commit this box is pinned to cannot be read, and an unreadable record is never an absent one"
+        fi
+        # ⛔ `|| true`: under `set -e` a record that is a DIRECTORY (or unreadable after the state check)
+        # kills the run with `head`'s status and NO diagnostic, instead of the named rc=78 refusal below
+        # — the same hazard this block already guards for HARNESS/PIN_HEAD/PIN_TOP.
+        PIN_SHA="$(head -1 "$HARNESS_PIN" 2>/dev/null | tr -d '[:space:]' || true)" ;;
+esac
+# The dir record, read through the same three-state answer.
+PIN_DIR_RECORDED=""
+case "$(pin_path_state "$HARNESS_PIN_FILE")" in
+  unexaminable) pin_refuse "the pin dir record $HARNESS_PIN_FILE cannot be EXAMINED — the directory this box's controller reads cannot be identified, so nothing may be rendered" ;;
+  path) if [ ! -r "$HARNESS_PIN_FILE" ]; then
+          pin_refuse "the pin dir record $HARNESS_PIN_FILE exists but cannot be READ — refusing to guess which tree the controller reads"
+        fi
+        if [ ! -f "$HARNESS_PIN_FILE" ]; then
+          pin_refuse "the pin dir record $HARNESS_PIN_FILE exists but is NOT A REGULAR FILE — the directory this box's controller reads cannot be identified"
+        fi
+        PIN_DIR_RECORDED="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || true)" ;;
+esac
+# Which checkout the pin is compared against (and where a pin would be materialised FROM). Derived, in
+# order, from: an explicit HARNESS_REPO, this script's own checkout, the resolved harness dir, the dir
+# record's tree, the pin root. ⛔ A STAGING COPY IS NOT A CHECKOUT: `install.sh` is run from a staged
+# directory in its own suite (and by an operator who copies it beside the pin), so `$HERE` alone is not
+# enough — the refusal below is for a box where NONE of the candidates is a checkout.
+# ⛔ `|| true` INSIDE each substitution: `A || B="$(cmd)"` still lets `set -e` kill the script on a
+# failing `cmd` (the assignment is the last command of the `||` list), so a non-checkout candidate
+# would abort the installer with git's 128 and no diagnostic instead of reaching the refusal.
+pin_main_worktree() { # <candidate dir> -> its main worktree, empty when it is not a checkout
+  [ -n "${1:-}" ] && [ -d "$1" ] || return 0
+  git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}' || true
+}
+if [ -z "$HARNESS_REPO" ]; then
+  for _cand in "$HERE" "${HARNESS:-}" "$PIN_DIR_RECORDED" "$HARNESS_PIN_DIR"; do
+    HARNESS_REPO="$(pin_main_worktree "$_cand")"
+    [ -n "$HARNESS_REPO" ] && break
+  done
+fi
+[ -n "$HARNESS_REPO" ] && git -C "$HARNESS_REPO" rev-parse --git-dir >/dev/null 2>&1 \
+  || pin_refuse "no agent-infra checkout resolved to materialise/verify the pin from (set HARNESS_REPO=<agent-infra checkout>) — without it this installer cannot tell a pinned worktree from a home-dir copy, which is the whole point"
+
+# HARNESS — the directory the job will EXEC. Explicit `HARNESS` wins (an operator may pin a deliberate
+# checkout), then the dir record, then materialise.
+HARNESS="${HARNESS:-}"
+HARNESS_SRC="--harness/HARNESS"
+[ -n "$HARNESS" ] || { HARNESS="$PIN_DIR_RECORDED"; HARNESS_SRC="$HARNESS_PIN_FILE"; }
+if [ -z "$HARNESS" ]; then
+  # NOTHING RECORDED. Materialise through the cells' own materialiser — never copy. `--pin-only` is the
+  # flag that means "advance the pin, leave the running box alone", which is exactly a first pin.
+  MAT="${HARNESS_MATERIALISER:-$HARNESS_REPO/scripts/cloud-cell-supervisor.sh}"
+  [ -f "$MAT" ] || pin_refuse "no pin is recorded and no materialiser exists at $MAT — this installer will not fall back to copying the harness into a home directory (that is the divergence it exists to end); install the harness from a checkout that carries scripts/cloud-cell-supervisor.sh"
+  # ⛔ `--force` IS REQUIRED AND IT IS NOT A BYPASS HERE. On this box a controller is very likely
+  # RUNNING while the FIRST pin is created (every Mac up to this change runs `$O/orch-loop.sh`), and the
+  # materialiser refuses a live box without it — the refusal exists to stop a re-seed under a running
+  # controller, and `--pin-only` is precisely the flag that does NOT re-seed `$O`. harness-refresh.sh
+  # passes the same pair, for the same reason (it advances the pin every cycle under a live loop).
+  pin_say "no pin recorded — materialising $HARNESS_REF through $MAT"
+  # ⛔ FORCE A PER-COMMIT WORKTREE UNDER THE PIN ROOT, AND DO NOT LET THE MATERIALISER ANSWER
+  # `unchanged` (review finding, P1). `harness_apply` resolves `$HARNESS` most-explicit-first, and when
+  # that tree is ALREADY at the ref it answers `unchanged` and writes NO record — leaving the operator's
+  # own CHECKOUT to be recorded as the pin. On this fleet every checkout lives under `~/Documents/GitHub`,
+  # which macOS TCC protects from a launchd-born bash: a job whose program is that tree cannot open it,
+  # and under KeepAlive that is a silent crash-loop, while every install-time check (run as the installing
+  # user) passes. The pin root is chosen TCC-safe by construction (`~/harness`, see
+  # orchestrator-bringup.sh), so the pin is materialised INTO it: naming the per-commit child as
+  # `$HARNESS` makes `cur` unresolvable, which is exactly the `changed` branch that creates the worktree
+  # and records it.
+  _want_pin="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null || true)"
+  _force_tree=""
+  [ -n "$_want_pin" ] && _force_tree="$HARNESS_PIN_DIR/$(printf '%s' "$_want_pin" | cut -c1-12)/scripts/orchestrator-harness"
+  # ⛔ `env`, NOT A `${VAR:+NAME=value}` PREFIX: bash lexes assignments BEFORE expansion, so a
+  # post-expansion `HARNESS=<path>` word is treated as a COMMAND ("No such file or directory"), not as an
+  # assignment — measured with this suite's own diagnostics in the CI log.
+  if ! env HARNESS="${_force_tree:-}" \
+       HARNESS_REPO="$HARNESS_REPO" HARNESS_REF="$HARNESS_REF" HARNESS_PIN_DIR="$HARNESS_PIN_DIR" \
+       HARNESS_PIN_FILE="$HARNESS_PIN_FILE" CELL_HOME="$HOME" \
+       bash "$MAT" apply --force --pin-only >"${TMPDIR:-/tmp}/pin-apply.$$" 2>&1; then
+    sed 's/^/    /' "${TMPDIR:-/tmp}/pin-apply.$$" >&2; rm -f "${TMPDIR:-/tmp}/pin-apply.$$"
+    pin_refuse "the materialiser $MAT could not pin $HARNESS_REF — nothing was rendered, so the job still runs whatever it ran before"
+  fi
+  sed 's/^/    /' "${TMPDIR:-/tmp}/pin-apply.$$"; rm -f "${TMPDIR:-/tmp}/pin-apply.$$"
+  # ⛔ `|| true`, for the same reason as PIN_HEAD/PROV_*: under `set -e` a failing substitution aborts
+  # the installer with `head`'s status and NO diagnostic, before the guard on the next line can name
+  # what happened (the record the materialiser just wrote, unreadable — ENOSPC / a race).
+  MATERIALISED=1
+  HARNESS="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || true)"
+  HARNESS_SRC="$HARNESS_PIN_FILE (materialised)"
+  # ⛔ `unchanged` IS A SUCCESS THAT WRITES NO RECORD, AND IT IS THE COMMONEST FIRST PIN (review finding,
+  # P1): when the box's own checkout is ALREADY at `$HARNESS_REF`, `harness_apply` answers
+  # `HARNESS_APPLIED=unchanged` and deliberately leaves the operator's checkout where it is — so there
+  # is no path for this installer to read, and the old code refused with "reported success but … is
+  # empty". The fresher the checkout, the more certain the refusal. So resolve the tree the materialiser
+  # itself resolved (its own fallback, cloud-cell-supervisor.sh's sibling of $HARNESS_REPO) and accept
+  # it ONLY when its HEAD is exactly the commit the ref names; every check below then still runs on it
+  # (a copy, a pruned tree, a wrong commit all keep their refusals), and the records are written below.
+  if [ -z "$HARNESS" ]; then
+    # ⛔ THE ONLY TREE A MATERIALISED PIN MAY NAME IS THE ONE THE INSTALLER ASKED FOR (review finding, P1).
+    # `harness_apply` answers `unchanged` and writes no record when the forced per-commit tree already
+    # exists at the ref and is clean — an ORDINARY state (a sha record with no dir record is what
+    # harness-refresh leaves between its two writes, and what an interrupted first install leaves). The
+    # previous fallback then searched the MATERIALISER's own candidates, which with the default
+    # materialiser are the operator's checkout — so the installer could record, and certify, a
+    # `~/Documents` tree a launchd job cannot read (silent KeepAlive crash-loop) and that may even be
+    # DIRTY, i.e. bytes no commit describes. The operator's checkout is never a candidate here: the pin
+    # root route was attempted, so the pin is the forced tree or there is no pin.
+    if [ -n "$_force_tree" ] && [ -d "$_force_tree" ]; then
+      _fb_head="$(git -C "$_force_tree" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+      if [ -n "$_want_pin" ] && [ "$_fb_head" = "$_want_pin" ]; then
+        HARNESS="$_force_tree"; HARNESS_SRC="materialiser:unchanged ($_force_tree is $HARNESS_REF at ${_fb_head:0:12})"
+        pin_say "the materialiser answered 'unchanged' and wrote no record — the per-commit tree $HARNESS is already at $HARNESS_REF, so that tree is the pin; the records are written below"
+      fi
+    fi
+  fi
+  [ -n "$HARNESS" ] || pin_refuse "the materialiser reported success but $HARNESS_PIN_FILE is empty AND neither the materialiser's sibling harness nor $HARNESS_REPO/scripts/orchestrator-harness is a worktree at $HARNESS_REF — the applied tree cannot be identified, so nothing may be rendered"
+fi
+HARNESS="${HARNESS%/}"
+# ⛔ IS THE RESOLVED DIRECTORY THE ONE THE JOB WILL ACTUALLY READ? Three facts, all required, because
+# the failure they prevent is silent in every direction:
+#   (1) it is a directory carrying orch-loop.sh — the file the job execs;
+#   (2) it is a `git worktree` of the checkout, at a COMMIT (not a copy: a copy has no answer here);
+#   (3) that commit IS the pin (when a sha is recorded). A dir record that names a different tree than
+#       the sha record is #2216's shape — a re-pin that lands where nothing reads — and it must refuse
+#       rather than render a job that starts from a tree the pin does not name.
+[ -d "$HARNESS" ] || pin_refuse "the resolved harness dir $HARNESS (from $HARNESS_SRC) does not exist — refusing to render a job whose program is missing (launchd would KeepAlive-crash-loop on it). The tree the pin names has been removed (a pruned worktree); re-materialise it: HARNESS_REPO=$HARNESS_REPO bash $HARNESS_REPO/scripts/cloud-cell-supervisor.sh apply --force --pin-only, then re-run this installer"
+[ -r "$HARNESS/orch-loop.sh" ] || pin_refuse "the resolved harness dir $HARNESS carries no readable orch-loop.sh — that is the file the controller execs, so this is not a harness (a home-dir copy of a few helpers is exactly this shape)"
+# ⛔ `|| true` ON BOTH: this script runs under `set -e`, and `VAR="$(cmd)"` takes the command's status —
+# so a NON-repo (the copy this block exists to refuse) would ABORT the installer with git's 128 and no
+# diagnostic at all, instead of reaching the refusal below that names the path.
+PIN_HEAD="$(git -C "$HARNESS" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+PIN_TOP="$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$PIN_HEAD" ] || pin_refuse "the resolved harness dir $HARNESS is NOT a git worktree (no HEAD) — it is a copy. The controller must run the pinned commit, so a copy cannot be rendered into the job; pin the harness instead: HARNESS_REPO=$HARNESS_REPO bash $HARNESS_REPO/scripts/cloud-cell-supervisor.sh apply --pin-only"
+[ -n "$PIN_TOP" ] || pin_refuse "the resolved harness dir $HARNESS has no worktree top level — not a checkout of anything"
+if [ -n "$PIN_SHA" ] && [ "${MATERIALISED:-0}" = 1 ] && [ "$PIN_SHA" != "$PIN_HEAD" ]; then
+  # ⛔ THE MATERIALISER JUST SUPERSEDED THIS RECORD (review finding, P2). A sha record with no dir record
+  # is an ordinary state (harness-refresh writes sha then dir; an interrupted first install leaves it),
+  # and the materialise above then pins the CURRENT ref — so comparing against the sha read BEFORE that
+  # run refused DISAGREE on a box the installer had itself just repaired, with a printed remedy that
+  # cannot clear it (`apply --pin-only` never writes the sha record). The sha read is re-taken here, at
+  # the one point after the mutation, and a superseded value is MENDED — said out loud — exactly like an
+  # absent one. The real DISAGREE arm (an explicit tree / an existing dir record that names another
+  # commit) is unchanged: MATERIALISED is set only on the materialise path.
+  pin_write_record "$HARNESS_PIN" "$PIN_HEAD"
+  pin_say "pin sha record MENDED after the materialise: $HARNESS_PIN named ${PIN_SHA:0:12}, the materialiser pinned ${PIN_HEAD:0:12} — recorded the tree it created"
+  PIN_SHA="$PIN_HEAD"
+fi
+if [ -n "$PIN_SHA" ]; then
+  WANT_SHA="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "${PIN_SHA}^{commit}" 2>/dev/null || true)"
+  [ -n "$WANT_SHA" ] || pin_refuse "$HARNESS_PIN names '$PIN_SHA', which is not a commit in $HARNESS_REPO — the record cannot be resolved, so what this box is pinned to is UNKNOWN"
+  [ "$PIN_HEAD" = "$WANT_SHA" ] || pin_refuse "the pin and the tree DISAGREE: $HARNESS_PIN names ${PIN_SHA:0:12} but the resolved dir $HARNESS (from $HARNESS_SRC) is at ${PIN_HEAD:0:12}. Rendering now would start a controller on code the pin does not name. Remedy: restart the harness so the pin is materialised first (bash scripts/harness-up up), or re-pin deliberately (cloud-cell-supervisor.sh apply --pin-only)."
+else
+  # No sha record yet: MEND it from the tree we resolved (harness-refresh's exit-11 rule — the record is
+  # what every other reader consults, and an absent record is not "current").
+  pin_write_record "$HARNESS_PIN" "$PIN_HEAD"
+  PIN_SHA="$PIN_HEAD"
+  pin_say "pin sha record MENDED: $HARNESS_PIN now names ${PIN_HEAD:0:12}"
+fi
+# The dir record must exist and name THIS directory, or the next reader (harness-up, the drift check, a
+# human) resolves a different tree than the one the job runs.
+if [ "$PIN_DIR_RECORDED" != "$HARNESS" ]; then
+  pin_write_record "$HARNESS_PIN_FILE" "$HARNESS"
+  pin_say "pin dir record $HARNESS_PIN_FILE now names $HARNESS (was ${PIN_DIR_RECORDED:-none})"
+fi
+pin_say "pin: ${PIN_HEAD:0:12} at $HARNESS"
+# ⛔ A RECORDED CHECKOUT IS MUTABLE, AND NOTHING RE-CHECKS AT EXEC TIME (review finding, P3). An EXPLICIT
+# `HARNESS` records the operator's working checkout (the materialise path never does — see the forced
+# per-commit tree above), so a later `git pull` there makes launchd exec a commit the pin does not name,
+# with no refusal in between (`harness-up up` catches it at start; a KeepAlive restart does not). The
+# remedy names the STEP that actually clears it: a re-run alone would re-read the dir record this run has
+# just written and record the same checkout again (measured).
+if [ "$(git -C "$HARNESS_REPO" rev-parse --show-toplevel 2>/dev/null)" = "$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null)" ]; then
+  warn "this pin names the MAIN WORKTREE $HARNESS — a checkout that can move (a \`git pull\` there makes the job exec a commit the pin does not name; \`harness-up up\` refuses at start, a launchd KeepAlive restart does not). To freeze it, remove that record and re-run with no explicit HARNESS (rm -f \"$HARNESS_PIN_FILE\" && re-run this installer): the materialise path forces a per-commit worktree under $HARNESS_PIN_DIR."
+fi
+MAT_FOR_PLIST="${HARNESS_MATERIALISER:-$HARNESS_REPO/scripts/cloud-cell-supervisor.sh}"
+[ -f "$MAT_FOR_PLIST" ] || MAT_FOR_PLIST=""
+# ⛔ THE PROGRAM IS NOT CHOSEN YET HERE (HARNESS_ENTRY is selected below): naming `orch-loop.sh` in this
+# line printed TWO contradictory program lines on a pin that carries the entrypoint. Name the pin, not a
+# program; the one program line is emitted after the choice.
+ok "harness pinned: ${PIN_HEAD:0:12} at $HARNESS"
+# ⛔ THE PINNED TREE IS NOW A SHIPPED SURFACE, SO IT GETS THE SAME SYNTAX SWEEP the checkout got above.
+# A pin can name a commit whose `orch-loop.sh` does not parse (a bad land), and launchd would then
+# KeepAlive-crash-loop on it with nothing but syntax errors in launchd.err. Refuse at install time.
+for _f in "$HARNESS"/*.sh; do
+  [ -f "$_f" ] || continue
+  bash -n "$_f" || pin_refuse "syntax error in the PINNED $(basename "$_f") ($HARNESS) — this commit cannot run, and installing it would crash-loop under KeepAlive"
+done
+ok "pinned scripts parse ($HARNESS)"
+
+# ── WHICH PINNED FILE IS THE PROGRAM (and the one refusal that protects a live-only entrypoint) ──
+# ⛔ THE MAC'S LAUNCHD JOB CANNOT RUN `orch-loop.sh` DIRECTLY ON A BOX THAT NEEDS THE TMUX WRAPPER.
+# macOS TCC protects `~/Documents`, and the denial is on the tree's CONTENT rather than on the job's
+# cwd, so a launchd child can `cd` into the PRODUCT checkout and still fail every read inside it —
+# `_claim_commit` returns empty and every candidate is refused with a misleading "could not build claim
+# commit" (measured: 793 consecutive refusals beside healthy `[cap]` lines; full record in
+# docs/ops/fleet-harness-baseline.md §3.1). The live workaround is a small entrypoint that keeps the
+# controller inside the tmux pane that holds the Full Disk Access grant.
+# ⛔ WHEN THIS WAS WRITTEN that entrypoint (`launchd-controller.sh`) was NOT on main — it existed only
+# in `~/orchestrator` (docs/ops/ACTIVATION-MATRIX.md row 7 records the installed plist naming it, and
+# `git ls-tree origin/main` → absent). agent-infra#2020 has since LANDED it (this branch rewrites it),
+# so the pin now carries the file and the first arm below wins on every box. The clause is kept
+# because the arms still have to hold for a box whose INSTALLED plist names a program the pinned tree
+# does not carry. The installer does the
+# ONLY thing that neither loses it nor keeps running a home-dir copy silently:
+#   · if the PINNED tree carries an entrypoint, that is the program (pin wins, same as every other file);
+#   · if it does not, and this box is LIVE on a home-dir entrypoint the repo does not carry, REFUSE and
+#     name both — because rendering `$HARNESS/orch-loop.sh` here would silently delete the TCC wrapper,
+#     and silently rendering the home copy is the divergence this whole change exists to end.
+# `HARNESS_ENTRY=<name>` is the deliberate override (a name INSIDE the pinned tree, never a path).
+HARNESS_ENTRY="${HARNESS_ENTRY:-}"
+if [ -z "$HARNESS_ENTRY" ]; then
+  if [ -f "$HARNESS/launchd-controller.sh" ]; then HARNESS_ENTRY="launchd-controller.sh"
+  else HARNESS_ENTRY="orch-loop.sh"; fi
+fi
+case "$HARNESS_ENTRY" in
+  ''|*/*) pin_refuse "HARNESS_ENTRY must be a NAME inside the pinned harness dir (got '$HARNESS_ENTRY') — a path would let the program be anything, which is what the pin check exists to prevent" ;;
+esac
+[ -f "$HARNESS/$HARNESS_ENTRY" ] || pin_refuse "HARNESS_ENTRY=$HARNESS_ENTRY does not exist in the pinned tree $HARNESS — the job would exec a missing program and crash-loop under KeepAlive"
+# The live-only entrypoint that is NOT in the pin — detected from WHAT THE INSTALLED JOB RUNS, not from
+# what happens to sit in `$O`. ⛔ `$O` IS THE WORKER SEED, NOT EVIDENCE OF A RUNNING PROGRAM (review
+# finding, P1): a pre-pin seed, or a hand `cp`, leaves `$O/launchd-controller.sh` behind even on a box
+# whose plist has already moved onto the pin — and refusing THAT box would be a permanent false block
+# whose message ("this box RUNS …") describes a fact it never tested. So the evidence is the rendered
+# plist launchd will actually load: its ProgramArguments program, read with the same parser the
+# post-render assertion uses. No installed plist => nothing is running that could be lost => no refusal.
+LIVE_ENTRY=""; _live_prog=""
+if [ -f "$PLIST" ]; then
+  _live_prog="$(plist_program "$PLIST")"
+  # ⛔ `basename --` AND a guard: a program token beginning with `-` makes bare basename exit non-zero,
+  # and under `set -e` that killed the installer with basename's stderr and NO diagnostic at all.
+  _live_base="$(basename -- "${_live_prog:-}" 2>/dev/null || true)"
+  # ⛔ AN INSTALLED PLIST WHOSE PROGRAM CANNOT BE READ IS CANNOT-VERIFY, NEVER "NOTHING TO LOSE". The
+  # empty parse used to fall through to "no live-only entrypoint" — so a job that runs the wrapper via
+  # the `Program` key (or a binary plist awk cannot read) silently lost it, which is the incident this
+  # gate exists to prevent. The render side already refuses an unparsable program; the two halves of the
+  # same parser must not disagree.
+  if [ -z "${_live_prog:-}" ]; then
+    pin_refuse "the INSTALLED launchd job $PLIST exists but its program cannot be READ (no ProgramArguments program, no parsable Program key — a binary plist?) — whether it runs a live-only entrypoint the pinned tree does not carry is UNKNOWN, and cannot-verify is not a pass. Inspect it (plutil -p \"$PLIST\") and re-run."
+  fi
+  # In scope only when the installed program is a script the PIN does not carry AND that file is on
+  # disk. A plist naming a deleted path is a different failure (start's, not this installer's).
+  if [ -n "${_live_base:-}" ] && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
+    LIVE_ENTRY="$_live_base"
+  fi
+fi
+if [ -n "$LIVE_ENTRY" ]; then
+  pin_refuse "the INSTALLED launchd job runs a LIVE-ONLY entrypoint that the pinned tree does not carry: its program is ${_live_prog:-?} (${LIVE_ENTRY}), and $HARNESS/$LIVE_ENTRY does not exist. That file exists in NO commit - it keeps the controller inside the tmux pane that holds the macOS Full Disk Access grant (docs/ops/fleet-harness-baseline.md section 3.1) - so rendering the pin's $HARNESS_ENTRY now would silently drop it and every candidate would be refused with 'could not build claim commit'. The content must LAND first (PR #2020 lifts it). Nothing was installed; the previous plist is untouched."
+fi
+ok "program: $HARNESS/$HARNESS_ENTRY (pinned; selected from the pin, not from \$O)"
 
 # ── render plist ─────────────────────────────────────────────────────────────────
 echo "==> rendering $PLIST"
@@ -760,7 +1193,8 @@ done
 # literal `4`; 2.5x cores now) — exit 0, plutil OK, and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
 # below can only fire on a genuinely unrendered TEMPLATE token, never on a value that merely looks
 # like one (a legal `O=/tmp/__DATA__host` used to be refused with a diagnostic naming the wrong cause).
-for _v in "$O" "$REPO" "$OR" "$SCOPE" "$HOME" "$DAEMON_PATH"; do
+for _v in "$O" "$REPO" "$OR" "$SCOPE" "$HOME" "$DAEMON_PATH" \
+           "$HARNESS" "$HARNESS_ENTRY" "$HARNESS_PIN" "$HARNESS_PIN_FILE" "$HARNESS_PIN_DIR" "$HARNESS_REPO" "$MAT_FOR_PLIST"; do
   case "$_v" in *__[A-Z_]*__*) die "a substituted value contains a template token ('$_v') — sed applies its rules in order, so a later rule would rewrite it" ;; esac
   case "$_v" in *$'\n'*) die "a substituted value contains a newline, which sed cannot put in a replacement" ;; esac
 done
@@ -777,7 +1211,15 @@ done
 RENDER="$PLIST.new.$$"
 trap 'rm -f "$RENDER"' EXIT
 sed \
+  -e "s|__HARNESS__|$(esc "$HARNESS")|g" \
+  -e "s|__ENTRY__|$(esc "$HARNESS_ENTRY")|g" \
+  -e "s|__HARNESS_PIN__|$(esc "$HARNESS_PIN")|g" \
+  -e "s|__HARNESS_PIN_FILE__|$(esc "$HARNESS_PIN_FILE")|g" \
+  -e "s|__HARNESS_PIN_DIR__|$(esc "$HARNESS_PIN_DIR")|g" \
+  -e "s|__HARNESS_REPO__|$(esc "$HARNESS_REPO")|g" \
+  -e "s|__HARNESS_MATERIALISER__|$(esc "$MAT_FOR_PLIST")|g" \
   -e "s|__O__|$(esc "$O")|g" \
+  -e "s|__LABEL__|$(esc "$LABEL")|g" \
   -e "s|__REPO__|$(esc "$REPO")|g" \
   -e "s|__OR__|$(esc "$OR")|g" \
   -e "s|__SCOPE__|$(esc "$SCOPE")|g" \
@@ -810,6 +1252,22 @@ if grep -q '__[A-Z_]*__' "$RENDER"; then
   _toks="$(grep -o '__[A-Z_]*__' "$RENDER" | sort -u | tr '\n' ' ')— a template token has no substitution rule"
   rm -f "$RENDER"; die "rendered plist still contains ${_toks}"
 fi
+# ⛔ POST-RENDER, READ THE PROGRAM BACK OUT OF THE FILE — "the resolved dir is the one the job reads" is a
+# claim about the RENDERED PLIST, not about a shell variable. Everything above can be right while the
+# template still names something else (a second `__O__` in ProgramArguments, a stale template on a box
+# whose checkout predates this change, a hand-edited copy of the template in a staging dir). This is the
+# one check that cannot be satisfied by the installer's own bookkeeping.
+# The parse is awk over the plist itself rather than `plutil -extract`: the same assertion must be
+# runnable where plutil does not exist (the CI Linux runner stubs it), and an extract that silently
+# returns nothing there would turn this assertion into a no-op — a false PASS of exactly the class it
+# exists to prevent.
+PROGRAM_WANT="$(xml_esc "$HARNESS/$HARNESS_ENTRY")"
+PROGRAM_GOT="$(plist_program "$RENDER")"
+[ -n "$PROGRAM_GOT" ] || { rm -f "$RENDER"; die "the rendered plist declares no ProgramArguments program — launchd would load a job with nothing to exec (parse: $(plist_program "$RENDER"))" ; }
+if [ "$PROGRAM_GOT" != "$PROGRAM_WANT" ]; then
+  rm -f "$RENDER"
+  die "REFUSED (pin): the rendered job would exec '$PROGRAM_GOT' but the pin resolved '$PROGRAM_WANT' — the plist and the pin disagree, and starting this job would run a tree the pin does not name. Nothing was installed (the previous plist is untouched)."
+fi
 # ⛔ IS THE LOADED JOB ON THIS RENDER? Recorded BEFORE the mv, because that is the only moment the file
 # content exists — and it is what makes this installer safe on a live box (agent-infra#1975 item 3): a
 # validation run that renders the same bytes must not disturb a healthy production controller.
@@ -836,9 +1294,17 @@ PLIST_CHANGED=1
 mv -f "$RENDER" "$PLIST"
 ok "plist valid"
 if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render launchd loaded"; fi
-# launchd runs $O/<script>, not the copies in this directory — check EVERY script the daemon
-# invokes, not just orch-loop.sh. A drift here is silent and serious: a fix applied only to the
-# shipped copy (e.g. the fail-closed ai-review-gate classifier) would never reach the running box.
+# launchd runs the PINNED tree's orch-loop.sh (see the pin block above), and that tree's helpers are
+# SOURCED by it — so the copies that can drift from what the daemon executes are the ones in `$O`,
+# which the WORKERS run. Check EVERY script either surface invokes, not just orch-loop.sh. A drift
+# here is silent and serious: a fix applied only to the shipped copy (e.g. the fail-closed
+# ai-review-gate classifier) would never reach the running box.
+# ⛔ `SHIPPED` IS THE PINNED TREE, NOT THIS INSTALLER'S CHECKOUT. Before the pin existed the two were
+# always the same directory, so comparing `$O` against `$HERE` was right by accident. Now the daemon
+# execs `$HARNESS` and `$O` is seeded from it, so `$HERE` (a checkout that may be ahead of, behind, or
+# off the pin's line) is the WRONG reference: it would report drift on a perfectly consistent box and,
+# worse, stay silent when `$O` lags the tree that is actually running.
+SHIPPED="${HARNESS:-$HERE}"
 # claims.sh is in this list because it is SOURCED by orch-loop.sh and merge-one.sh, so the daemon
 # executes it — leaving it out let a fix to the claim CAS sit in the repo while $O ran the old one
 # (the same silent-drift failure this list exists to name). repo-authority.sh is here for the SAME
@@ -855,7 +1321,7 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
 # to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-# BOTH sides of the merge, deliberately, and this is what the UNION of them looks like — the note
+# BOTH sides of this merge, deliberately, and this is what the UNION of them looks like — the note
 # records why, because the asymmetry only existed for one rebase. `nonblocking-dispatch.sh` is main's
 # (the transport pr-doctor dispatches through, #1890); `merged-not-closed.sh` and
 # `check-single-source.sh` are this PR's (the single-source instruments); `live-ownership.sh` (the
@@ -863,36 +1329,66 @@ DRIFTED=""
 # side alone leaves the installed $O without a file the loop, the dispatcher, or the anti-relapse check
 # calls — a silent drift, not a loud failure — which is why this list is checked at all.
 # ⛔ AND NEITHER LIST IS A SUPERSET OF THE OTHER, WHICH IS WHY THE UNION IS TAKEN EXPLICITLY. The
-# branch added `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890) and
-# `reviewer-preflight.sh` (the #2148 disclosure helper lane.sh calls as `$O/reviewer-preflight.sh`),
-# while origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the
-# derived repo surface, #2040).
+# branch added `lane-merge.sh` (the bounded lane merge loop, #2029) and `merge-rate.sh` (its
+# before/after measurement); origin/main added `live-ownership.sh` (the selection predicate),
+# `repo-slug.sh` (the derived repo surface, #2040), `merge-reminder.py` and `box-status.sh`. Taking
+# either list alone installs a $O missing a file a live path execs — a silent 127, not a loud error.
 # worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
 # verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
 # (a census that reads 0 workers, a reap that cannot prove a kill).
-# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by THREE
-# daemons (`orch-loop.sh`, `fix-one.sh`, `dispatch-merge.sh`), each of which only checks that the
+# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by the
+# controller `orch-loop.sh` and by `dispatch-merge.sh` (#2927 removed `fix-one.sh`'s copy — repair does
+# not read the queue), each of which only checks that the
 # verbs exist — so a stale `$O/ci-queue.sh` passes every interface guard and the box keeps deriving
 # its ceiling with the pre-review runner-count read (the 3x over-permissive one). A sourced module
 # that is not in this list is the drift the list exists to catch.
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh gh-rest/gh gh-limit.py; do
+# brief-gate.sh (#2258) is the same class, one step sharper: it is the RESEARCH validator that
+# `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh` and `orch-send.sh`/`safe-send.sh`
+# all execute, and a $O copy that predates it makes every one of those refuse (78 = cannot verify) —
+# a whole fleet that cannot dispatch, caused by a half-synced $O. Detecting the divergence here is
+# what turns that into a warning with the cp line instead of a silent, box-wide standstill.
+# merge-reminder.py + box-status.sh arrive from main's side of this merge for the same reason: both are
+# executed by the controller, so a stale $O copy must be DETECTED (the list's whole job) rather than
+# discovered later as a mystery.
+# ⛔ launchd-controller.sh IS IN THIS LIST BECAUSE ITS STALE BYTES **ARE** THE DEFECT (agent-infra#2098).
+# The installed plist on a Mac runs `/bin/bash $O/launchd-controller.sh`, and that file used
+# `new-session -A -d`, which ATTACHES — impossible for a launchd job — so the job crash-looped for
+# 7,633 launches while every other instrument read the box as merely idle. A stale $O copy of the
+# entry point is therefore the most expensive drift on the box, and the one verb an operator actually
+# runs (`install.sh`) must say so. The template ALREADY renders `/bin/bash __HARNESS__/launchd-controller.sh`
+# (its `<string>__HARNESS__/__ENTRY__</string>` argument) with `WorkingDirectory __O__` on this head
+# (#2020 lifted it), so this row guards the live file the job executes, not a future flip.
+#
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification: `V` is computed by `python3 $O/check-class.py` on every PR, and the NOCHECKS arm runs
+# `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
+# `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
+# startup warning. That is exactly the partial-reseed drift this list exists to catch.
+# gate-policy.sh (#2319) is the same class and is REQUIRED now: every pi-spawning carrier sources it
+# and `exit 78`s without it, so a $O copy predating it stops every lane and every merge on the box.
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
-  diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
+  diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
-  warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
-  warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  # ⛔ NOT A BARE `cp '$HERE'/*.sh '$O'/` ANY MORE (review P2). That line is the depth-1, unverified copy
+  # ⛔ NOT A BARE `cp` ANY MORE (review P2). That line is the depth-1, unverified copy
   # #2041 measured as a false PASS — and it was the MOST operator-visible remedy in the harness, the one
   # README §4.1 tells the operator to run right after a verified redeploy. The helper copies every
   # shipped file (subdirectories and `gh-limit.py` included) and byte-verifies each one; it refuses
-  # rather than half-applies.
-  warn "  bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'   # every shipped file, byte-verified (#2041)";
+  # rather than half-applies. The SOURCE is the PINNED tree ($SHIPPED), not $HERE: that is what makes
+  # the fix land in the tree the daemon executes.
+  warn "the running copy at \$O differs from the PINNED tree ($SHIPPED):$DRIFTED"
+  warn "  the daemon executes \$SHIPPED/<script> and the workers execute \$O/<script> — sync \$O so the two are one commit:"
+  warn "  bash '$HERE'/deploy-harness.sh --src '$SHIPPED' --o '$O'   # every shipped file, byte-verified (#2041)";
 fi
 
+# pr-owner-liveness.sh (#2831) is the SAME class and it now owns TWO live decisions: whether a PR
+# reads owned (proof-of-life, with a RELEASE side effect on the worker's lock) and whether a stalled
+# drain opens the issue path. A `$O` copy predating it silently restores the phantom-ownership defect
+# — PRs owned by dead workers, which is the one failure that leaves the box unable to do either job.
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
 # "Which commit is this box running?" had no answer on the deployed laptop. The daemon executes
 # `$O/<script>`, and `$O` (=~/orchestrator) is not a git checkout at all:
@@ -919,12 +1415,24 @@ fi
 # ── harness provenance (agent-infra#1745) BEGIN ──
 STAMP="$O/.agent-infra-stamp.json"
 PROV_REF="${HARNESS_REF:-origin/main}"
+# ⛔ THE RECORD MUST DESCRIBE THE TREE THE BOX RUNS, NOT THIS INSTALLER'S CHECKOUT. `commit`/`relation`
+# from `$HERE` were accurate while `$HERE` was the only source; with a pin they describe a tree the
+# daemon does not execute, and `harness-refresh.sh` falls back to this record for RUNNING whenever its
+# own `git -C $SELF` read fails (it runs from `$O`, which is not a git checkout) — so a checkout ahead
+# of the pin would make the box refuse its own refresh as `ahead`.
+# ⛔ A SCOPED VARIABLE, NOT A REASSIGNMENT OF `$HERE`. `$HERE` is load-bearing AFTER this block — the
+# closing text's `$SELF` is `bash $HERE/install.sh` (the remedy commands an operator is told to run)
+# and `$HERE/repo-slug.sh` is sourced for the OR display. Reassigning it here made `--uninstall` in that
+# text resolve into the PINNED tree's installer, which is an older copy and is GONE as soon as the pin
+# advances and the old worktree is pruned. (Review finding, P2.) The block stays self-contained so the
+# suite can still extract and source it with only HERE/O set: with no HARNESS in scope this is `$HERE`.
+PROV_TREE="${HARNESS:-$HERE}"
 PROV_SHA="sha256sum"
 command -v sha256sum >/dev/null 2>&1 || PROV_SHA="shasum -a 256"
-# The checkout $HERE lives in. `worktree list` names the MAIN worktree first, so a linked worktree
+# The checkout $PROV_TREE lives in. `worktree list` names the MAIN worktree first, so a linked worktree
 # (or a pinned copy) does not become its own repo — the trap cloud-cell-supervisor.sh documents.
-# Empty when $HERE is not a git checkout at all: the measured laptop state, not an error.
-PROV_REPO="$(git -C "$HERE" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')" || true
+# Empty when $PROV_TREE is not a git checkout at all: the measured laptop state, not an error.
+PROV_REPO="$(git -C "$PROV_TREE" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')" || true
 
 # sha256 over the `*.sh` seeded into $O, folded in the SAME order and with the SAME separator as
 # cloud-cell-supervisor.sh's o_payload_hash, so the two records are comparable byte for byte.
@@ -961,7 +1469,7 @@ prov_payload_hash() {
 # measured 2026-10-14 on the cells, `rev-list --count e8d5ce29..origin/main` printed 1 while
 # `--is-ancestor` printed NO, so a tree off main's line reads as "1 behind" to a counter.
 prov_classify() {
-  PROV_COMMIT="$(git -C "$HERE" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+  PROV_COMMIT="$(git -C "$PROV_TREE" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
   PROV_REFCOMMIT=""; PROV_REL="untracked"
   [ -n "$PROV_COMMIT" ] || return 0
   PROV_REL="unknown"
@@ -978,10 +1486,45 @@ prov_classify() {
 }
 
 # 0 = DIRTY, 1 = CLEAN, 2 = CANNOT VERIFY. A `git status` that cannot run is never read as clean.
+# ⛔ PINNED MIRROR of `pin_dirty` in scripts/lib/box.sh (byte-for-byte; drift arm in
+# cloud-cell-supervisor.test.sh §(p3)). Read the ROOT's version for why the predicate is not written
+# twice: a weaker copy here stamped `dirty: false` over a pin the runtime REFUSES.
 prov_dirty() {
-  local out
-  out="$(git -C "$HERE" status --porcelain -- . 2>/dev/null)" || return 2
-  [ -n "$out" ]
+  local out rc
+  out="$(pin_dirty "$PROV_TREE" .)"; rc=$?
+  [ "$rc" -eq 2 ] && return 2
+  [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+pin_dirty() {
+  local repo="$1" scoped="$2" top out line path keep=""
+  # ⛔ THE TOPLEVEL, because porcelain prints paths relative to the REPOSITORY ROOT even when `repo` is a
+  # subdirectory — and two of the three callers pass the harness SUBDIR (the production convention). A
+  # first version resolved entries against `$repo`, so its tolerance was unreachable there and a
+  # `.DS_Store` read DIRTY to the instruments while the runtime read CLEAN: the round-4 divergence again,
+  # with the fail direction inverted (found by review, round 5).
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 2
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    # ⛔ TOLERATE ONLY **UNTRACKED/IGNORED** DROPPINGS. A TRACKED file named `._x` is part of the pin, so a
+    # MODIFICATION to it must read DIRTY — the name is not the property (found by review, round 5: a
+    # rewritten tracked `._x` read CLEAN). `!!` = ignored, `??` = untracked.
+    case "$line" in
+      '!!'*|'??'*) case "${path##*/}" in
+        .DS_Store|._*) [ -f "$top/$path" ] && [ ! -L "$top/$path" ] && continue ;;
+      esac ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
 }
 
 write_provenance() {
@@ -1014,13 +1557,13 @@ write_provenance() {
   # variable" (both measured in review; the second was audible in the shipped suite's stderr).
   # `dep_why` is declared in this function's `local` at the top; do NOT re-declare it here.
   dep_why=""
-  for _depf in "$HERE"/*.sh; do
+  for _depf in "$PROV_TREE"/*.sh; do
     _depb="${_depf##*/}"
     { [ -f "$O/$_depb" ] && cmp -s "$_depf" "$O/$_depb"; } || dep_why="$dep_why ${_depb}(differs-or-missing)"
   done
   for _depf in "$O"/*.sh; do
     _depb="${_depf##*/}"
-    [ -f "$HERE/$_depb" ] || dep_why="$dep_why ${_depb}(not-shipped)"
+    [ -f "$PROV_TREE/$_depb" ] || dep_why="$dep_why ${_depb}(not-shipped)"
   done
   local dep_match=true
   # An `if`, not `[ … ] && …`: the bare AND-OR list's status is 1 in the normal (in-sync) case, and a
@@ -1045,7 +1588,7 @@ write_provenance() {
 {
   "version": 1,
   "surface": "laptop",
-  "harness": "$HERE",
+  "harness": "$PROV_TREE",
   "commit": "$commit",
   "ref": "$PROV_REF",
   "refCommit": "${PROV_REFCOMMIT:-UNKNOWN}",
@@ -1061,17 +1604,17 @@ STAMPEOF
   fi
   mv -f "$tmp" "$STAMP" 2>/dev/null || { rm -f "$tmp"; warn "could not record the harness provenance at $STAMP"; return 0; }
   if [ "$commit" = UNKNOWN ]; then
-    warn "harness provenance: the source at $HERE is not a git checkout — recorded commit UNKNOWN"
+    warn "harness provenance: the source at $PROV_TREE is not a git checkout — recorded commit UNKNOWN"
     warn "  'which commit is this box running?' has no answer until install.sh runs from a checkout (#1745)"
   else
     ok "provenance recorded: $commit [$rel] (payload ${payload:0:12}) → $STAMP"
   fi
   if [ "$dirty_word" = true ]; then
-    warn "the source tree at $HERE has UNCOMMITTED changes — the recorded commit does not describe the running bytes"
+    warn "the source tree at $PROV_TREE has UNCOMMITTED changes — the recorded commit does not describe the running bytes"
   fi
   if [ "$dep_match" = false ]; then
-    warn "the DEPLOYED copy at \$O does NOT match the source at $HERE:$dep_why"
-    warn "  the record names $commit, but the box is not running those bytes — bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"
+    warn "the DEPLOYED copy at \$O does NOT match the source at $PROV_TREE:$dep_why"
+    warn "  the record names $commit, but the box is not running those bytes — bash '$HERE'/deploy-harness.sh --src '$PROV_TREE' --o '$O'"
   fi
   return 0
 }
@@ -1108,11 +1651,32 @@ LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 # the command reports success. It is one `-f` test away from being knowable, so it is refused here.
 case "$ACTION" in
   start|restart)
-    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: cp '$HERE'/*.sh '$O'/"; ;;
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")"; ;;
 esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
-  restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
+  restart)
+    # ⛔ AN EXPLICIT `--restart` MUST APPLY THIS RENDER'S ENVIRONMENT, WHICH MEANS THE OLD PANE MUST GO
+    # (this PR's entry point adopts a live session instead of replacing it — see its `else` arm).
+    # `launchctl bootout` stops only the SUPERVISOR: the controller pane's parent is the tmux SERVER, so
+    # the session outlives the job. Without this kill, `--restart` bootstraped a fresh supervisor, which
+    # adopted the still-running pane — and the closing banner then printed "this run did it and PROVED
+    # it" (pid + heartbeat, both true) over a controller still running the OLD MAX_LANES/MAX_LOAD. It is
+    # also what makes `launchd-cycle.sh`'s wedged-controller remedy (`install.sh --restart`) actually
+    # recover: re-supervising the SAME wedged pane cannot unwedge anything. Adopt stays correct for the
+    # implicit path (a KeepAlive relaunch must never interrupt a healthy controller); it is wrong for
+    # this one, which is a deliberate operator act. Same target as the --uninstall path below: the
+    # job's own session name only, so this can only ever stop the controller this job started.
+    CTRL_SESS="${CONTROLLER_SESSION:-orch-controller}"
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$CTRL_SESS" 2>/dev/null; then
+      warn "restarting: ending the '$CTRL_SESS' session first, so the new job starts a controller with THIS render's environment"
+      tmux kill-session -t "=$CTRL_SESS" 2>/dev/null || true
+      # Ordered, not racy: the replacement must not start while the old lock pid is still alive, or the
+      # new controller exits 0 at once with `already running` and the assertion below reads a stale pid.
+      _kn=0
+      while tmux has-session -t "=$CTRL_SESS" 2>/dev/null && [ "$_kn" -lt 50 ]; do sleep 0.2; _kn=$(( _kn + 1 )); done
+    fi
+    lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                                    || exit 1 ;;
 esac
 # Record the render launchd is now running, so the NEXT run can tell "current" from "the file was
 # overwritten earlier and never reloaded" (see PLIST_CHANGED above). Written AFTER the start succeeded —
@@ -1157,7 +1721,8 @@ cat <<EOF
 
 ✅ Installed $LABEL
 
-  harness   $O
+  controller  $HARNESS/$HARNESS_ENTRY   (the PINNED tree the daemon execs; agent-infra#2231)
+  workers     $O   (the worker surface lanes/fixers are seeded into)
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR_SHOW)
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES red_fix=$MAX_RED_FIX red_fix_tries=$MAX_RED_FIX_TRIES
@@ -1257,5 +1822,5 @@ Liveness — a stale heartbeat means the controller is wedged:
 Stop it before handing the machine to a human, and capture dirty work (README §6):
 
     $SELF --uninstall        # bootout + remove the plist — NO persistent disable is written
-    pkill -f "[b]ash $O/orch-loop.sh"; pgrep -fl '[o]rch-loop'   # verify YOUR controller is gone, then: rm -f "$O/.orch.lock"
+    pkill -f "[b]ash $HARNESS/$HARNESS_ENTRY"; pgrep -fl '[o]rch-loop'   # verify YOUR controller is gone, then: rm -f "$O/.orch.lock"
 EOF

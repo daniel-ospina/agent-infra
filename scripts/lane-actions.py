@@ -33,6 +33,21 @@ WHAT IS DETERMINISTIC AND WHAT IS NOT
 Jev NEVER decides Steps 1-4 and NEVER overrides them: a lane proven WORKING by CPU time is not sent
 to it at all.
 
+STEP 0 IDENTITY IS EVIDENCE, NOT A NAME LIST (owner, 2026-10-20)
+-----------------------------------------------------------------
+A workspace is a FLEET lane only when that is DEMONSTRABLE -- its session cwd resolves inside a
+fleet worktree, or the harness's own spawn record names that worktree. Everything else is the
+OWNER'S and is PROTECTED by default. `_is_fleet_worktree()` is the predicate; see the comment block
+above it for the measured defect a name list produced. UNREADABLE cwd -> PROTECTED, never "idle".
+
+LIST 1 IS EVIDENCED IDLE, NOT "QUIET"
+-------------------------------------
+`res["dispatch_targets"]` (and therefore LIST 1) is `is_dispatch_target()`: DONE-IDLE with a
+COMPLETED last turn and no child in flight, plus a confident Step-5 says-it-is-finished. WORKING /
+TOOL-IN-FLIGHT / CHILD-* / UNBOUND / WEDGED are never dispatch targets, whatever their words say.
+That is the decision tree's resolution order for a dispatcher, applied as a predicate instead of a
+bare `stale_s` comparison.
+
 FAIL-SAFE DIRECTIONS (each one chosen, not defaulted)
 ----------------------------------------------------
   * Jev unreachable  -> the words layer is UNREAD, so those lanes go to REPORT ONLY as
@@ -42,7 +57,8 @@ FAIL-SAFE DIRECTIONS (each one chosen, not defaulted)
     relaunch, which REPLACES the pane command.
   * shared session id -> AMBIGUOUS-IDENT, report only. Two panes bound to one session file means
     neither lane's staleness/CPU reading is demonstrably about it (Step 0).
-  * PROTECTED (DMeer / DMer / HANG) -> never offered as work, never nudged; listed with the reason.
+  * PROTECTED (a workspace that is not demonstrably a fleet lane -- see Step 0) -> never offered as
+    work, never nudged; listed with the reason, and an unreadable cwd counts as PROTECTED.
   * BUSY (already auto-nudged, result SENT/QUEUED within the hour) -> never offered as work.
 
 OUTPUT
@@ -69,6 +85,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -85,6 +102,32 @@ BEAT_PATH = os.path.join(STATE, "NEEDS-ACTION.beat")
 # distinguish one tick's recap from the PREVIOUS tick's, and the pair it guards is replaced every
 # ~10 minutes on one machine -- it is not a security boundary.
 MD_SHA_LEN = 12
+
+# ⛔ TWO FACTS A REFUSAL MUST CARRY, AND NEITHER COULD BE DERIVED FROM `rows` (#2227).
+# `_SAMPLED_NOTE` is `lane-status.py`'s own "what I sampled" line, lifted off its stderr: it caps
+# its walks (task dirs, session files, pids, activity files) rather than relying on a timeout, and a
+# capped read that names its cap is usable evidence while a silent one is a lower bound published as
+# the fleet. `_last_good_sentence()` answers "but when did we last actually READ this?" -- with the
+# AGE of the published snapshot, never a value from it (a stale verdict is not a current one).
+_SAMPLED_NOTE = ""
+
+
+def _last_good_sentence():
+    """The last good snapshot is Ns old -- an AGE, never a value, or `none` if there is none.
+
+    A refusal that does not say this cannot be told apart from one that arrived after a blackout: a
+    `TimeoutExpired` minutes after a good read is a busy box, and the same exception after six hours
+    is a dead monitor. Neither may be reported by printing the old verdicts -- the age is the whole
+    of what a refusal is entitled to borrow from the cache.
+    """
+    for p in (os.path.join(STATE, "lane-status.last.json"),
+              os.path.join(STATE, "lane-status.cache")):
+        try:
+            return "the last good snapshot is %ds old (%s)" % (
+                max(0, int(time.time() - os.path.getmtime(p))), display_path(p))
+        except OSError:
+            continue
+    return "there is NO previous snapshot on this box -- nothing has ever been read here"
 
 
 def display_path(p):
@@ -106,10 +149,15 @@ WARM_MIN = 10 * 60             # decision tree Step 4: "> 10 min -> STEP 5"
 NUDGE_SUPPRESS_S = 3600        # orchestrator-heartbeat.sh NUDGE_SUPPRESS_S
 REGISTRY_GRACE = 6             # a snapshot with fewer lanes than registry-grace is PARTIAL
 # PROTECTED BY A DECLARED LIST, NOT NAMES BURIED IN CODE (owner report 2026-10-20, twice).
-# The tuple below was the ONLY protection, so a workspace the owner created or renamed --
-# "Personal website" -- was classified as an idle FLEET LANE and received a lane brief for
-# tortoise PR #9150. Protection that depends on remembering which strings are the owner's is
-# the "passes only by remembering" failure the fleet forbids.
+# A workspace the owner created or renamed -- "Personal website" -- was classified as an idle
+# FLEET LANE and received a lane brief for tortoise PR #9150. Protection that depends on
+# remembering which strings are the owner's is the "passes only by remembering" failure the fleet
+# forbids -- so the owner declares them in a file instead of in this source.
+#
+# ⛔ THIS IS A UNION MEMBER ONLY, and Step 0 (below) is the mechanism: a workspace is a fleet lane
+# only when that is DEMONSTRABLE, and a declared entry can ADD protection but never make a lane
+# FLEET. Both arrivals are kept -- the evidence predicate from this branch and the declared list
+# from `main` -- because each protects a case the other does not.
 _OWNER_WS_FILE = os.path.join(os.path.expanduser("~"), ".pi", "agent", "state",
                               "owner-workspaces.txt")
 
@@ -134,7 +182,6 @@ def _owner_workspaces() -> tuple:
         return ()
 
 
-PROTECTED = ("DMeer", "DMer", "HANG") + _owner_workspaces()   # the owner's own lanes
 MAX_NAMES = 4                  # names inline in the beat clause; the rest live in the file
 SUMMARY_MAX = 300
 LAST_MSG_CHARS = 200
@@ -204,8 +251,13 @@ def _refuse_if_degraded(rows, where):
     `lane-actions.py --stdin "$SNAP"`, and `lane-scan-fallback.sh` is a second `--stdin` caller.
     ⚠️ CORRECTED 2026-10-13: this named `queue-dispatch` as the invoke-path consumer, which is
     FALSE — `queue-dispatch.py` never references `lane-actions.py` at all (it drives
-    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py`
-    (the one `lane-actions.py --json` call, found with `rg -n 'lane-actions' scripts/pr-doctor.py`).
+    `lane-status.py` / `lane-guard.py`).
+    ⛔ CORRECTED AGAIN 2026-10-20: this then named `pr-doctor.py` as "the one `lane-actions.py
+    --json` call". THAT IS NOW FALSE TOO, and it is a co-deployment trap: `pr-doctor.py` retired
+    the lane-table path (#1874) and spawns background workers instead, so `rg -n 'lane-actions'
+    scripts/pr-doctor.py` matches COMMENTS only. The `--stdin` callers above are the whole
+    invoke-path population; `--json` has NO live in-repo caller and exists for manual reads and
+    tests. Do not restore a consumer claim without running that grep against the CODE.
     ⛔ NAMED, NOT NUMBERED (#1872 review round 10): the line number that used to be here was already
     wrong on `origin/main` by the time anyone read it, and it is not the call today -- a number in a
     co-deployment pointer rots the moment either file is edited. Both paths are guarded; the tests
@@ -275,6 +327,353 @@ def _busy_sids():
     except OSError:
         pass
     return out
+
+
+# ── STEP 0: IDENTITY IS EVIDENCE, NEVER A NAME LIST (owner, 2026-10-20) ────────────────────
+# ⛔ THE DEFECT THIS REPLACES, STATED WITH ITS EVIDENCE. Protection used to be
+# `PROTECTED = ("DMeer", "DMer", "HANG")` matched by SUBSTRING against the lane's NAME. The
+# owner's own workspace is titled **"Personal website"**, which matches none of those, so the
+# roster classified it as an idle fleet lane and the PR doctor dispatched a tortoise PR brief INTO
+# IT -- twice, reported by the owner. A name list can only protect the names somebody remembered,
+# and every name it misses fails toward "idle: dispatch it", which is the one direction that types
+# into the owner's own work.
+#
+# ⛔ SO THE PREDICATE IS INVERTED: a workspace is a FLEET lane only when that is DEMONSTRABLE, and
+# everything else belongs to the owner. There are exactly two demonstrable forms, and each is an
+# ARTIFACT THE HARNESS WROTE rather than a string a human chose:
+#   * its session cwd resolves inside a fleet WORKTREE -- `.../.worktrees/<name>`,
+#     `/tmp/cell-home/wt-<n>`, `.../wt-<n>`. The cwd is what the lane is actually editing, and it
+#     is published on the snapshot row by `lane-status.py` from cmux's `current_directory`;
+#   * or it carries a FLEET SPAWN MARKER -- `$O/bg/<name>.started`, written by
+#     `nonblocking-dispatch.sh`, which records the `worktree=` path the harness itself created.
+# ⛔ UNREADABLE IS PROTECTED. An absent cwd is not evidence of an idle lane; it is the ABSENCE OF
+# EVIDENCE, and for "may I type into this?" the fail-closed direction is NO.
+#
+# The historical names survive ONLY as an additional UNION: they can ADD protection and are never the
+# reason a lane is FLEET. Leaving them in keeps a DMeer lane protected even if someone later gives it
+# a worktree-shaped cwd, which is exactly what a union member is for.
+PROTECTED_LEGACY_NAMES = ("DMeer", "DMer", "HANG")
+
+
+def _declared_owner_hit(lane):
+    """True when the lane title matches an entry DECLARED in `state/owner-workspaces.txt`.
+
+    The owner-declared list, not a tuple in this source: the failure it answers is precisely
+    "a name nobody remembered", and a file the owner can edit is the only form that does not
+    require a code change to protect their own workspace. A read failure yields `()` (see
+    `_owner_workspaces`), which means NO declared protection -- and Step 0 still protects every
+    cwd that is not demonstrably a fleet worktree, so a lost list cannot make the fleet unsafe;
+    it only loses the belt over that brace.
+    """
+    name = (lane or "").lower()
+    return any(w in name for w in (n.lower() for n in _owner_workspaces()) if w)
+
+
+def _legacy_name_hit(lane):
+    """True when the lane title carries a historical owner-lane name as a WORD.
+
+    ⛔ A WORD, NOT A SUBSTRING (review round 9, P3). The union has to keep matching titles like
+    `DMeer - linkedin outreach`, which is why it cannot be an exact-title test -- but a raw
+    `p in lane` also demotes a demonstrably-fleet lane whose title merely CONTAINS one of these
+    (`CHANGELOG sweep`, `SHANGHAI rollout` both contain `HANG`), removing it from LIST 1. Matching
+    whole alphanumeric tokens keeps the protection the names were remembered for and drops the
+    accidental class.
+    """
+    wanted = set(n.lower() for n in PROTECTED_LEGACY_NAMES)
+    tok, toks = [], set()
+    for ch in lane or "":
+        if ch.isalnum():
+            tok.append(ch)
+        elif tok:
+            toks.add("".join(tok).lower())
+            tok = []
+    if tok:
+        toks.add("".join(tok).lower())
+    return any(w in toks for w in wanted)
+
+# The worktree shapes, matched after `realpath` so a path that only SPELLS like a lane
+# (`/x/wt-1/../../owner/project`, or a symlink named `wt-9`) is resolved before it is judged.
+# ⛔ THE `wt-<slug>` BRANCH IS ANCHORED TO THE FLEET HOME, NOT TO ANY SEGMENT (review round 1,
+# P2, MEASURED). It used to require a DIGIT (`^wt-[0-9]`), so `/tmp/cell-home/wt-4529-ai` was a
+# fleet lane while `/tmp/cell-home/wt-lane-identity` -- this very lane's own linked worktree -- read
+# as the OWNER's, and was permanently excluded from dispatch. The box's own recipe is
+# `git worktree add $HOME/wt-<slug> -b <branch>`, so the evidence is "a direct child of the fleet
+# home named `wt-*`", which keeps every slug AND still rejects `/Users/owner/repo/wt-1-final-draft`
+# (a name inside somebody's project, not a lane root).
+FLEET_WORKTREE_DIR = ".worktrees"
+# THE ROOTS the fleet creates lanes in. `$FLEET_HOME` / `$CELL_HOME` / `$FLEET_CELL_HOME` when the
+# fleet sets them (scripts/lib/fleet-inventory.sh uses the same names), `$HOME`, this box's cell
+# home, and the TEMP ROOT.
+#
+# ⛔ THE TEMP ROOT IS NOT A CONVENIENCE -- IT IS MEASURED (review round 3, P1). The first version
+# listed only `$HOME` and `/tmp/cell-home`, and on the box the directive was written on the fleet's
+# OWN recipe is `git worktree add /tmp/wt-<slug>`: of 38 worktree paths in
+# `state/pi-reap-worktrees.log`, 15 were real linked worktrees under `/tmp` (`.git` ->
+# `/tmp/cell-t3/.git/worktrees/wt-9204`) and EVERY ONE was classed the owner's, i.e. permanently
+# excluded from dispatch -- the exact defect the `wt-` shape was introduced to fix, re-created one
+# level up as a home whitelist. A list of homes is a list; the anchor has to include where the fleet
+# actually writes.
+FLEET_ROOTS = tuple(dict.fromkeys(
+    _h for _h in (
+        os.environ.get("FLEET_HOME"), os.environ.get("CELL_HOME"),
+        os.environ.get("FLEET_CELL_HOME"), os.path.expanduser("~"),
+        "/tmp/cell-home", tempfile.gettempdir(), "/tmp", "/private/tmp") if _h))
+_WT_PREFIX = "wt-"
+
+
+def _is_fleet_wt_dir(path):
+    """True when `path` is `<$FLEET_ROOT>/wt-<slug>` (or below) AND is a REAL linked git worktree.
+
+    ⛔ THE NAME ALONE IS NOT EVIDENCE (review round 4, P2). Root anchoring plus a `wt-` name made
+    this a name test: `/tmp` is world-writable, so ANY `/tmp/wt-anything` directory read as a fleet
+    lane and could reach `dispatch_targets` -- acceptance WITHOUT evidence, in the one direction the
+    directive forbids. It costs nothing to demand the artifact: measured on the box, the fleet's
+    `/tmp/wt-*` lanes are real linked worktrees (`.git` as a FILE), so they still pass, and only a
+    directory no `git worktree add` created stops being a lane -- correctly: it is nobody's lane.
+    """
+    for root in FLEET_ROOTS:
+        r = _real(root)
+        if not r or r == os.sep or path == r or not path.startswith(r + os.sep):
+            continue
+        first = path[len(r) + 1:].split(os.sep)[0]
+        if first.startswith(_WT_PREFIX) and len(first) > len(_WT_PREFIX):
+            return _is_linked_worktree(path)
+    return False
+
+
+# ⛔ STATED BOUNDARY, AND IT IS FAIL-CLOSED ON PURPOSE (review round 11, P1, MEASURED). A REAL linked
+# worktree directly under a fleet root whose name is not `wt-<slug>` (`/tmp/w9516`, `/tmp/p9660-resid`,
+# `/tmp/l9400`) does NOT match the arm above, so it reads PROTECTED — the owner's. Measured on this box:
+# 25 of the 33 real linked `/tmp` worktrees in `state/pi-reap-worktrees.log` are classified that way.
+#
+# The tempting fix is to drop the name and accept any real linked worktree at depth 1. DO NOT: that is
+# the reverse failure, and it is the one this PR exists to prevent. `git worktree add ~/tortoise-wip
+# fix/x` produces exactly that shape, so the owner's own scratch work would become a dispatch target,
+# a pr-doctor `reset --hard` target, and a heartbeat typing target — the `Personal website` incident
+# re-created. The pin is `test_a_real_worktree_in_a_fleet_root_is_still_not_a_lane_without_the_NAME`.
+#
+# Neither spelling is the real question. Both directions need PROVENANCE — a durable record of which
+# worktrees the fleet itself created — which is agent-infra#2213 (`_spawn_marker_worktrees` is the only
+# such record today, and measurement shows it names only `<repo>/.worktrees/prd-*`, so it cannot yet
+# adjudicate these). Until that registry exists, unknown provenance resolves to the owner: refusing to
+# type into someone's work is the cheap error, dispatching into it is not. Filed, not forgotten.
+
+
+def _real(path):
+    """The resolved absolute path, or **None** when it cannot be resolved. NEVER raises.
+
+    ⛔ CATCH `ValueError` TOO (review round 2, P3, MEASURED). `realpath` raises ValueError (not
+    OSError) for an embedded NUL, and only OSError was caught -- so a cwd containing `\x00` escaped
+    this function, escaped `_is_fleet_worktree`, and killed the WHOLE beat with a traceback instead
+    of classifying one lane PROTECTED. The docstring's own promise is fail-closed; a guard that
+    turns one unreadable row into a dead instrument is not that.
+
+    It returns None rather than a best-effort path on purpose: an unresolvable path is EVIDENCE
+    THAT COULD NOT BE READ, and fabricating a normalised spelling of it would let a poisoned cwd
+    decide its own classification (measured: `/tmp/cell-home/wt-1\x00bad` came back with a
+    `wt-` first segment and read as FLEET). Every caller turns None into "no evidence".
+    """
+    if not isinstance(path, str) or not path:
+        return None
+    # ⛔ REJECT AN EMBEDDED NUL EXPLICITLY, DO NOT CATCH IT (review round 11, P2, MEASURED).
+    # `posixpath.realpath` only RAISES `ValueError` for a NUL from 3.10; on **3.9** it goes through
+    # `islink()`, which swallows it, and returns the string unchanged. `/usr/bin/python3` here is
+    # 3.9.6 and it is what `heartbeat-loop.sh` / `orchestrator-heartbeat.sh` run these files with, so
+    # the `except ValueError` below pinned a 3.12-only behaviour: measured, `_real('/tmp/cell-home/
+    # wt-1\x00bad')` returned the poisoned spelling on 3.9, and `_is_fleet_wt_dir` then read its
+    # `wt-` first segment as FLEET — the exact "poisoned cwd decides its own classification" failure
+    # this docstring says it prevents. CI pins 3.12, so the suite was green while the deployed
+    # runtime was unguarded. A NUL can never appear in a real path, so testing for it is sound on
+    # every interpreter and does not depend on which one is running.
+    if "\x00" in path:
+        return None
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+
+
+def _is_linked_worktree(path):
+    """True when `path` sits inside a REAL linked git worktree.
+
+    ⛔ A `.git` FILE IS NOT ENOUGH (review round 8, P3): `git submodule` and `git init
+    --separate-git-dir` write one too, and the docstrings used to present the file itself as proof
+    of a worktree. What `git worktree add` writes is a POINTER TO `<main>/.git/worktrees/<name>`, so
+    that is what is required -- a submodule module dir or a custom git dir does not match. The walk
+    is bounded and stops at a `.git` DIR, which means a main checkout: a path inside a normal
+    repository is not a lane.
+    """
+    cur = _real(path)
+    if not cur:
+        return False
+    for _ in range(64):
+        g = os.path.join(cur, ".git")
+        try:
+            if os.path.isdir(g):
+                return False       # the main checkout, not a worktree
+            if os.path.isfile(g):
+                with open(g, errors="ignore") as fh:
+                    head = fh.read(512)
+                up = head.strip().splitlines()[0] if head.strip() else ""
+                if not up.startswith("gitdir:"):
+                    return False
+                target = up.split(":", 1)[1].strip().replace(os.sep, "/")
+                return "/worktrees/" in (target + "/")
+        except (OSError, IndexError):
+            return False
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+    return False
+
+
+def _is_fleet_worktree(cwd):
+    """True ONLY when `cwd` is DEMONSTRABLY a fleet worktree.
+
+    Fail-closed by construction: None, "", a non-absolute path, or anything that does not carry a
+    fleet worktree shape returns False, and every caller turns False into PROTECTED. There is no
+    third answer and no default-to-lane.
+
+    The path is RESOLVED first (`realpath`: `..` collapsed, symlinks followed), so identity is a
+    fact about where the lane really is, never about how its cwd happens to be spelled.
+
+    Matches:
+      /Users/x/Documents/GitHub/tortoise/.worktrees/prd-12   a repo's LINKED worktree (has a .git file)
+      /tmp/cell-home/wt-123, .../wt-lane-identity           the box's own lane shape ($FLEET_HOME/wt-*)
+    Rejects:
+      /Users/x/Personal website                             the owner's project (the defect)
+      /Users/x/Documents/GitHub/tortoise                    the shared checkout, not a worktree
+      /Users/x/repo/wt-1-final-draft                        a NAME inside a project, not a lane root
+      /Users/x/wt-1/../../../Users/x/Personal website       a path that only SPELLS like a lane
+      /x/.worktrees/b                                       a plain directory that only SPELLS like one
+      None / "" / "repo/wt-1"                               unreadable or unrooted
+
+    ⛔ REVIEW ROUND 2 (P2): `.worktrees` used to be accepted on its SPELLING, so ANY directory of
+    that name -- including one the owner made inside their own project -- was a dispatch target, and
+    pr-doctor's adopt arm could `reset --hard` in it. It now requires a REAL linked worktree: a
+    `.git` FILE somewhere at-or-above the path whose `gitdir:` points at `<main>/.git/worktrees/<name>`
+    -- the pointer `git worktree add` writes. A main checkout (`.git` as a DIR) is not one, and
+    neither is a `.git` file written by `git submodule` (`.../.git/modules/<name>`) or by
+    `git init --separate-git-dir` (a custom directory).
+
+    ⛔ STATED BOUNDARY: an owner's own REAL git worktree still reads as fleet
+    (`/Users/x/Personal website/.worktrees/preview`, once `git worktree add` has made it). The
+    `wt-` shape is anchored to a fleet home instead, but `.worktrees` is the standard git worktree
+    location and the directive names it as the fleet's own shape, so narrowing further needs a
+    fleet-repo REGISTRY -- which, on a box with no spawn record yet, would empty the dispatch list
+    (the silent failure this file legislates against elsewhere). The boundary is pinned by
+    `test_an_owners_own_real_worktree_is_the_documented_boundary` so it stays visible, and closing
+    it is its own issue (agent-infra#2213), not a guess here.
+    """
+    if not cwd or not isinstance(cwd, str):
+        return False
+    p = cwd.strip()
+    if not p.startswith("/"):
+        return False          # a relative path is not a cwd anything can be resolved against
+    p = _real(p)
+    if not p:
+        return False          # unreadable (poisoned bytes, an I/O error): no evidence, so PROTECTED
+    parts = [x for x in p.split("/") if x]
+    if not parts:
+        return False          # "/" itself is not a worktree
+    if FLEET_WORKTREE_DIR in parts and _is_linked_worktree(p):
+        return True
+    return _is_fleet_wt_dir(p)
+
+
+def _spawn_marker_worktrees(bg_dir=None):
+    """Worktree paths the HARNESS recorded spawning into: `$O/bg/<name>.started`.
+
+    `nonblocking-dispatch.sh` writes `name= / worktree= / branch= / prompt= / started= / cap=` when
+    it backgrounds a worker, so this is the fleet's own record of a worktree IT created -- the
+    second demonstrable form of identity, and the one that covers a worktree outside the standard
+    shapes. Bounded to ONE directory, read tolerantly, and an ABSENT directory is the NORMAL case
+    (a box with no background worker has written no marker), so it yields an empty set, never an
+    error and never a guess.
+    """
+    d = bg_dir or os.path.join(os.environ.get("O") or os.path.join(HOME, "orchestrator"), "bg")
+    out = set()
+    try:
+        names = glob.glob(os.path.join(d, "*.started"))
+    except OSError:
+        return out
+    for f in names:
+        try:
+            with open(f, errors="ignore") as fh:
+                for ln in fh:
+                    k, _, v = ln.partition("=")
+                    if k.strip() != "worktree" or not v.strip():
+                        continue
+                    wt = v.strip()
+                    # ⛔ A MARKER GOES STALE WHEN ITS WORKTREE IS GONE (review round 1, P3). Nothing
+                    # removes `$O/bg/*.started`, so a marker written once is read for ever -- and
+                    # nothing in the harness reaps them. A path that no longer exists cannot be a
+                    # lane the fleet is running in, so it is dropped; a marker whose directory still
+                    # exists is kept, because a worker's worktree outlives its `.rc` file.
+                    #
+                    # ⛔ AND THE MARKER EDGE IS ALSO EVIDENCE-TESTED (review round 5, P2, MEASURED).
+                    # Its writer validates only `[ -d "$WT" ]`, and `lane_identity` matches a marker
+                    # as an ANCESTOR, so one dispatch whose worktree argument was `$HOME` or `/tmp`
+                    # would have blanketed every workspace below it -- permanently, since markers are
+                    # never reaped and `$HOME` never disappears. A real linked worktree is required,
+                    # which also rejects a marker equal to a fleet root or to `/`.
+                    rp = _real(wt)
+                    if rp and os.path.isdir(rp) and _is_linked_worktree(rp):
+                        out.add(rp)
+        except OSError:
+            continue          # one unreadable marker never invalidates the others
+    return out
+
+
+def _under(path, parent):
+    p, q = _real(path), _real(parent)
+    if not p or not q:
+        return False
+    return p == q or p.startswith(q + os.sep)
+
+
+def lane_cwd(row):
+    """The lane's session cwd, or None when it is UNREADABLE.
+
+    ONE source, deliberately: the snapshot row. `lane-status.py` publishes it from cmux's
+    `current_directory` (the value cmux itself holds for the workspace), so it is evidence about
+    THIS lane rather than a path guessed from a pid->cwd map (where sibling lanes collide) or from
+    the session-directory name (which is LOSSY: the mangling turns "/" and "." into "-", so
+    `/x/.worktrees/y` and `/x/-worktrees/y` encode identically -- a guess that reads a fleet lane as
+    the owner's, or the owner's as a fleet lane, is worse than no answer).
+
+    None is a REAL answer here: the caller turns it into PROTECTED.
+    """
+    cwd = row.get("cwd") if isinstance(row, dict) else None
+    return cwd.strip() if isinstance(cwd, str) and cwd.strip() else None
+
+
+def lane_identity(row, markers=None):
+    """(identity, evidence) for ONE row -- `"FLEET"` or `"OWNER"`, never a third value.
+
+    OWNER is the DEFAULT and covers everything not demonstrably the fleet's, including an
+    unreadable cwd. `evidence` is the sentence the report prints, so a reader can audit the
+    classification instead of trusting it.
+    """
+    cwd = lane_cwd(row)
+    marks = _spawn_marker_worktrees() if markers is None else markers
+    if cwd is None:
+        return "OWNER", ("its session cwd is UNREADABLE, so no fleet worktree can be demonstrated "
+                         "-- PROTECTED by default (fail-closed), never treated as an idle lane")
+    if _is_fleet_worktree(cwd):
+        return "FLEET", "its session cwd %s is a fleet worktree" % cwd
+    # A marker names a WORKTREE the harness created, so it is matched as that worktree or a path
+    # below it -- never as a container: `_under` is directional and the marker side must be the
+    # PARENT (the `_is_linked_worktree` requirement above is what keeps that honest).
+    for m in sorted(marks):
+        if _under(cwd, m):
+            return "FLEET", ("its session cwd %s carries a fleet spawn marker (%s)" % (cwd, m))
+    return "OWNER", ("its session cwd %s is NOT a demonstrable fleet worktree -- PROTECTED "
+                     "(fail-closed). This asserts the RULE, not ownership: a real linked worktree "
+                     "outside the `wt-<slug>` shape lands here too, because unknown provenance "
+                     "resolves to the owner (agent-infra#2213) -- refusing costs a dispatch cycle, "
+                     "accepting types into someone's uncommitted work" % cwd)
 
 
 # ── STEP 1: does the process exist? (strict attribution or NO SIGNAL) ──────────────────────
@@ -475,6 +874,16 @@ def classify_row(row, dead, files, LS):
     lane = row["lane"]
     sid = row.get("sid")
     r = {"lane": lane, "ws": row.get("ws") or "", "stale": row.get("stale_s"),
+         # ── THE EVIDENCE `is_dispatch_target()` READS, CARRIED THROUGH VERBATIM ────────────────
+         # `mech` is lane-status.py's OWN verdict (DONE-IDLE / WIP-IDLE / WEDGED / WORKING / …),
+         # `last` is the kind of the last transcript record ("assistant" = a COMPLETED turn;
+         # "tool" = a call whose turn has not finished), and `tool_in_flight` / `has_child` say
+         # whether anything is running under this lane. They are copied, not re-derived: a second
+         # derivation of the same fact is the two-answers defect this file already warns about.
+         "mech": row.get("verdict"), "last": row.get("last"),
+         "tool_in_flight": bool(row.get("tool")),
+         "has_child": bool(row.get("child") or row.get("declared")
+                           or row.get("pane_children")),
          "verdict": None, "step": None, "why": [], "action": None,
          # The INBOUND evidence is carried through so the BUCKET decision can consult it. It is not
          # used here: this function decides what the lane's state LOOKS like, and the bucket loop
@@ -567,6 +976,17 @@ def classify_row(row, dead, files, LS):
                         "cannot see the difference" % (disp.get("name"), _age(age)))
                     row = dict(row)
                     row["tool"] = None      # do not re-read the settled dispatch in Step 4/5
+                    # ⛔ AND CLEAR THE FLAG ALREADY CARRIED INTO `r` (review round 5, P3, MEASURED):
+                    # `r["tool_in_flight"]` was copied from the row BEFORE this branch, so clearing
+                    # only the local `row` left `dispatch_refusal()` printing "a tool call is in
+                    # flight -- provisionally WORKING" directly under this branch's own "the
+                    # dispatch RETURNED". The snapshot's cache can be minutes behind the transcript
+                    # (TTL 420s, unbounded on the STALE-SNAPSHOT path), so the disagreement is the
+                    # normal case, and it silently dropped an evidenced-idle lane from LIST 1.
+                    r["tool_in_flight"] = False
+                    # Recorded for `dispatch_refusal()`: the snapshot's `mech` may still say
+                    # WAITING-OVERDUE, and this transcript fact is the DISPROOF (round 10, P2).
+                    r["dispatch_returned"] = True
                 else:
                     # STEP 6 RECURSION: the child, not the parent, decides whether quiet is
                     # correct. A child past the bound is frequently legitimate, and the parent's
@@ -786,6 +1206,80 @@ def offerable(v, conf):
         return False
     return conf >= CONF_MIN
 
+
+# ── THE DISPATCH TARGET: EVIDENCED IDLE, per the decision tree's resolution order ──────────
+# ⛔ THIS REPLACES A BARE "QUIET" TEST WITH THE TREE'S OWN VERDICT (owner, 2026-10-20):
+# "we use a decision tree that was designed to know what lane has WIP and which not". The tree
+# (`state/LANE-STATE-DECISION-TREE.md`) resolves a lane identity -> CPU delta -> child in flight ->
+# tool age -> words, and only ONE of those outcomes means free capacity. Its "resolution order for a
+# dispatcher" is implemented here as a PREDICATE rather than re-derived per caller, so every
+# consumer of LIST 1 (`res["dispatch_targets"]`) gets the same answer to the same question.
+#
+# Only a lane that is ALL of the following is a dispatch target:
+#   * FLEET              -- demonstrably ours (Step 0; see `lane_identity()`), never the owner's;
+#   * not already nudged -- BUSY means the auto-nudger already spoke this hour;
+#   * DONE-IDLE          -- lane-status.py's own verdict for "finished and holding nothing";
+#   * a COMPLETED turn   -- `last == "assistant"`; a trailing tool call is a turn still in progress,
+#                          whose quiet is the harness's in-flight bound, not idleness;
+#   * no child in flight -- `CHILD-*` / `WAITING-CHILD` mean a dispatch here duplicates live work;
+#   * no tool in flight  -- `TOOL-IN-FLIGHT` is provisional WORKING and re-measures next tick;
+#   * step 5 + confident DONE_READY -- the words layer must actually say it is finished, at or above
+#                          `CONF_MIN`. An UNREAD words layer (Jev down) is never "free".
+# WORKING / TOOL-IN-FLIGHT / CHILD-* / UNBOUND / WEDGED fail at least one clause, so they can never
+# be offered as capacity however quiet they look.
+IDLE_MECH = ("DONE-IDLE",)     # lane-status.py's vocabulary; see its `DONE_IDLE` constant
+
+
+def dispatch_refusal(c):
+    """WHY this row is not a dispatch target, or "" when it is one.
+
+    A refusal that cannot name its evidence is indistinguishable from a bug, so every negative is
+    returned as a sentence the report prints next to the lane.
+    """
+    if c.get("protected") or c.get("identity") == "OWNER":
+        return c.get("identity_why") or "not a demonstrable fleet lane -- the owner's workspace"
+    if c.get("busy"):
+        return "already auto-nudged this hour (result SENT/QUEUED)"
+    mech = c.get("mech")
+    # ⛔ A VERDICT THE TRANSCRIPT HAS DISPROVED IS NOT A REFUSAL (review round 10, P2, MEASURED).
+    # `mech` is the SNAPSHOT's verdict; on the state that actually occurs -- an unmatched `task` call
+    # older than 600s with no spinner -- lane-status says `WAITING-OVERDUE`, while this file reads the
+    # SAME transcript, finds the `toolResult`, takes the RETURNED branch and prints "the dispatch
+    # RETURNED -- NOT overdue". Refusing on `mech` anyway printed two contradictory sentences about
+    # one lane and kept an evidenced-idle lane out of LIST 1 until the snapshot refreshed (which is
+    # unbounded on the STALE-SNAPSHOT path). `dispatch_returned` is the DISPROOF, recorded where it
+    # was established; every other clause below still applies.
+    if mech not in IDLE_MECH and not c.get("dispatch_returned"):
+        return ("mechanical verdict %s is not DONE-IDLE -- WORKING / TOOL-IN-FLIGHT / CHILD-* / "
+                "UNBOUND / WEDGED are not free capacity" % (mech or "UNREAD"))
+    # ⛔ THE MACHINE OUTRANKS THE WORDS, AND `step` IS WHERE IT STOPPED (the tree's own order):
+    # 0 identity, 1 process, 2 CPU delta, 3 child, 4 tool age, 6 child recursion. Only 5 means
+    # "nothing is in flight and the lane is quiet enough for its words to be worth reading".
+    if c.get("step") != "5":
+        return ("the decision tree stopped it at step %s (%s) -- WORKING / TOOL-IN-FLIGHT / "
+                "CHILD-* / UNBOUND / WEDGED are never free capacity"
+                % (c.get("step") or "?", c.get("verdict") or "UNREAD"))
+    if c.get("last") != "assistant":
+        return ("its last transcript record is %s, so the turn did not COMPLETE -- a quiet lane "
+                "mid-turn is working, not idle" % (c.get("last") or "UNREAD"))
+    if c.get("has_child"):
+        return "a child is in flight -- dispatching here duplicates live work"
+    if c.get("tool_in_flight"):
+        return "a tool call is in flight -- provisionally WORKING, re-measure next tick"
+    v = c.get("verdict")
+    if v != "DONE_READY":
+        return ("the words layer did not say it is finished (%s) -- an unread or unsure word "
+                "layer is never free capacity" % (v or "UNREAD"))
+    if not offerable(v, c.get("conf")):
+        return ("DONE_READY at %s confidence (needs >= %.2f) -- the words layer is guessing"
+                % ("%.2f" % c["conf"] if c.get("conf") is not None else "no", CONF_MIN))
+    return ""
+
+
+def is_dispatch_target(c):
+    """True ONLY for EVIDENCED idle: see the clause list above `dispatch_refusal()`."""
+    return dispatch_refusal(c) == ""
+
 CONTEXT_CRITERION = (
     "Its last words say it is running out of context / must stop / must hand off to preserve room. "
     "THIS IS NOT A STATE AND THE BELIEF IS FALSE: this harness AUTO-COMPACTS, so context is not a "
@@ -824,8 +1318,10 @@ def jev_step5(rows, LV, enabled=True):
     except Exception:
         key = None
     if not key:
-        # The key lives in the Jev config file or JEV_API_KEY. Never printed, never logged.
-        return {}, dict(meta, source="RULE", error="no Jev key (env JEV_API_KEY / state/jev-config.json)")
+        # The key lives in the 0600 config file or the TYPESAFE_API_KEY / JEV_API_KEY
+        # env names (lane-verdict.py's loader decides). Never printed, never logged.
+        return {}, dict(meta, source="RULE", error="no TypeSafe key "
+                        "(env TYPESAFE_API_KEY / JEV_API_KEY, or ~/.pi/agent/jev-config.json)")
 
     base = dict(getattr(LV, "CRITERIA", None) or {})
     criteria = {}
@@ -1095,9 +1591,14 @@ def live_workspaces():
         return {}
 
 
-def build(rows, LS, LV, use_jev=True, ref=None, live=None):
+def build(rows, LS, LV, use_jev=True, ref=None, live=None, spawn_markers=None):
     ref = ref or time.time()          # the SNAPSHOT's clock, so ages agree with stale_s and a
                                      # re-run of the same snapshot is byte-identical
+    # ⛔ READ THE SPAWN MARKERS ONCE PER BUILD, not once per lane: they are one directory of small
+    # files, but 30 lanes x glob is 30 wasted walks. An empty set is the NORMAL case and simply
+    # means no lane's identity is demonstrable through a spawn record -- the worktree-shape test
+    # still decides.
+    markers = _spawn_marker_worktrees() if spawn_markers is None else set(spawn_markers)
     labels = _registry_labels()
     dup = {}
     for r in rows:
@@ -1113,7 +1614,27 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
     classified = []
     for r in rows:
         c = classify_row(r, dead, files, LS)
-        c["protected"] = any(p in c["lane"] for p in PROTECTED)
+        # ── IDENTITY, FROM EVIDENCE (Step 0) ────────────────────────────────────────────────
+        # ⛔ NO NAME LIST DECIDES THIS ANY MORE. See the comment block above
+        # `_is_fleet_worktree()`: the owner's "Personal website" workspace was not in
+        # `("DMeer", "DMer", "HANG")`, so it was classified as an idle fleet lane and the PR
+        # doctor dispatched a tortoise PR brief into it -- twice. The legacy names are kept as an
+        # additional UNION only, so they can still add protection but never be the mechanism.
+        ident, ident_why = lane_identity(r, markers)
+        c["identity"], c["identity_why"], c["cwd"] = ident, ident_why, lane_cwd(r)
+        legacy = _legacy_name_hit(c["lane"])
+        # The DECLARED list (`state/owner-workspaces.txt`, from `main`) is the second union member.
+        # Matched by SUBSTRING on the title, deliberately: the owner writes whole titles there
+        # ("Personal website"), and for "may I type into this?" a wider match is the safe direction.
+        declared = _declared_owner_hit(c["lane"])
+        c["protected"] = (ident != "FLEET") or legacy or declared
+        if legacy and ident == "FLEET":
+            c["identity_why"] = ("%s; also matched a historical owner lane name (%s) -- the name "
+                                 "list is an ADDITIONAL union, not the mechanism"
+                                 % (ident_why, "/".join(PROTECTED_LEGACY_NAMES)))
+        elif declared and ident == "FLEET":
+            c["identity_why"] = ("%s; also DECLARED as the owner's in %s -- a union member, never "
+                                 "the mechanism" % (ident_why, display_path(_OWNER_WS_FILE)))
         c["busy"] = bool(r.get("sid") and r["sid"] in busy)
         # Messages are read ONLY where they can change an outcome: a lane proven WORKING by CPU
         # time, or waiting on a live child, or inside a declarable tool budget needs no report at
@@ -1128,8 +1649,9 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
         classified.append(c)
 
     # STEP 5 -- only the lanes that reached it, in ONE batched call. PROTECTED lanes are excluded
-    # from the call itself, not just from the lists: they are the OWNER own work (DMeer / DMer /
-    # HANG) and their text does not belong in a third-party API request for a fleet triage.
+    # from the call itself, not just from the lists: they are the OWNER's own work (anything not
+    # demonstrably a fleet lane -- Step 0) and their text does not belong in a third-party API
+    # request for a fleet triage.
     step5 = [c for c in classified if c["step"] == "5" and not c["protected"]]
     step5.sort(key=lambda c: -(c["stale"] or 0))
     answers, meta = jev_step5(step5, LV, enabled=use_jev)
@@ -1143,7 +1665,11 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
             c["step"] = "5"
         elif c["protected"]:
             c["verdict"], c["conf"] = "PROTECTED", None
-            c["why"].append("owner lane -- its words are not read here (never offered as work)")
+            # ⛔ NO `identity_why` HERE. The bucket loop puts the EVIDENCE sentence first on every
+            # protected entry; repeating it here printed the same clause twice in one WHY line.
+            # This one says only what happened to the row: its words were not read.
+            c["why"].append("its words are not read here -- an owner workspace is never offered "
+                            "as work")
         else:
             c["verdict"] = "UNCLASSIFIED"
             c["conf"] = None
@@ -1169,7 +1695,11 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
         # action target whatever the classifier thought of it, and the reason must lead the entry so
         # a reader cannot mistake it for capacity.
         if c["protected"]:
-            c["why"].insert(0, "PROTECTED lane (owner's own work) -- NEVER offered as work")
+            # The EVIDENCE leads, not the word PROTECTED: a reader must be able to audit WHY this
+            # workspace was called the owner's, and an unreadable cwd must SAY it is unreadable
+            # rather than borrow the authority of a positive claim.
+            c["why"].insert(0, "PROTECTED lane (the OWNER's, not demonstrably the fleet's) -- NEVER "
+                               "offered as work: %s" % (c.get("identity_why") or "no evidence"))
             report.append(c)
             continue
         if v in OFFERABLE and c["busy"]:
@@ -1216,6 +1746,16 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
                                    "output %s ago) -- NOT free capacity; dispatching would "
                                    "double up on work already assigned it"
                                 % (_age(c.get("inbound_age")), _age(c.get("stale"))))
+                report.append(c)
+            elif not is_dispatch_target(c):
+                # ⛔ THE TREE'S RESOLUTION ORDER, APPLIED AT THE DECISION (owner, 2026-10-20).
+                # A confident `DONE_READY` is the WORDS layer; the tree ranks the mechanical
+                # evidence above it. So a lane that says it is finished but is mechanically
+                # WORKING / TOOL-IN-FLIGHT / CHILD-* / not-DONE-IDLE / mid-turn is NOT capacity,
+                # and the refusal names which clause failed. Before this, LIST 1 was whatever the
+                # words layer called finished plus a bare staleness comparison -- which is how a
+                # lane that had just been told something became a dispatch instruction.
+                c["why"].insert(0, "NOT a dispatch target -- %s" % dispatch_refusal(c))
                 report.append(c)
             else:
                 idle.append(c)
@@ -1306,10 +1846,34 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
             return out
         idle, wip, wedged = _keep_if_live(idle), _keep_if_live(wip), _keep_if_live(wedged)
 
+    # ⛔ THE DISPATCHER'S TARGET LIST, PUBLISHED AS ITS OWN FIELD. `idle` is LIST 1 (what a human
+    # reads); `dispatch_targets` is the SAME set as lane names, for a mechanical caller. It is
+    # computed AFTER the workspace-existence filter, so a lane whose cmux workspace is gone (or was
+    # renamed out from under it) can never appear here, and every member passed
+    # `is_dispatch_target()`. Empty is a real answer: it means NO lane is evidenced idle, which is a
+    # different fact from "the fleet is quiet" and must be read as such.
+    # ⛔ A FLEET-WIDE LOSS OF EVIDENCE MUST NOT LOOK LIKE A QUIET FLEET (review round 2, P2). Identity
+    # is fail-closed, so if NOTHING reads a cwd every lane becomes PROTECTED and `idle` is empty --
+    # which is the same line as "no lane has work". The counters travel with the answer so the beat
+    # can say WHICH of the two it is, the way `jev_down` already does for the words layer.
+    _all = idle + wip + wedged + report + quiet
+    n_protected = sum(1 for c in _all if c.get("protected"))
+    n_identity_unread = sum(1 for c in _all
+                            if c.get("cwd") is None and c.get("identity") != "FLEET")
     return {"idle": idle, "wip": wip, "wedged": wedged, "report": report, "quiet": quiet,
+            "dispatch_targets": [c["lane"] for c in idle],
             "meta": meta, "jev_down": jev_down, "words_read": bool(words_read),
             "procmap": procmap_note,
-            "n_lanes": len(rows), "n_registry": len(labels), "files": files}
+            # `lane-status`'s SAMPLED note, when its bounded walk truncated (#2227). Carried here
+            # so `render_md` can say it in the artifact a human reads, not only on stderr.
+            "sampled": _SAMPLED_NOTE,
+            "n_lanes": len(rows), "n_registry": len(labels), "files": files,
+            "n_protected": n_protected, "n_identity_unread": n_identity_unread,
+            # the rows that actually reached a bucket: `n_lanes` is the PRE-filter count, so a lane
+            # whose cmux workspace is gone shrinks this one but not that one -- comparing the unread
+            # count against `n_lanes` would let a fleet-wide blind read read as a partial loss
+            # (review round 10, P3)
+            "n_classified": len(_all)}
 
 
 # ── the FILE ─────────────────────────────────────────────────────────────────────────────
@@ -1327,6 +1891,15 @@ def render_md(res, snapshot_age, source):
              "(snapshot %ss old, %d lanes). Tree: `state/LANE-STATE-DECISION-TREE.md`._"
              % (ts, snapshot_age, res["n_lanes"]))
     L.append("")
+    # ⛔ A CAPPED SCAN SAYS SO IN THE ARTIFACT, NOT ONLY ON STDERR (#2227). `lane-status` bounds its
+    # walks and reports what it sampled; a reader of this file is deciding whether to dispatch, so
+    # "the roster was truncated" belongs where the verdicts are, not in a log the reader does not
+    # see. `res["sampled"]` is empty on an uncapped scan, so the ordinary document is unchanged.
+    if res.get("sampled"):
+        L.append("> **PARTIAL SCAN.** `%s` -- lanes beyond the cap were NOT read, so a lane"
+                 " missing from these lists is not proof that nothing is wrong with it."
+                 % res["sampled"])
+        L.append("")
     # A SNAPSHOT OLDER THAN THE TICK'S OWN BOUND IS NORMAL, NOT AN ERROR -- but every age below is
     # measured against the SNAPSHOT, so a reader who does not know its age will read a 12-minute-old
     # verdict as a live one. The tick is bounded at 390s and its scan is the LAST thing it does, so
@@ -1344,8 +1917,11 @@ def render_md(res, snapshot_age, source):
              "TOOL-IN-FLIGHT -- %s."
              % (len(res["quiet"]), ", ".join("%s[%s]" % (c["lane"], c["verdict"])
                                               for c in res["quiet"]) or "none"))
-    L.append("- PROTECTED lanes (%s) and auto-nudged (BUSY) lanes are never offered as work."
-             % "/".join(PROTECTED))
+    L.append("- PROTECTED lanes (not demonstrably the fleet's -- the owner's own workspaces, and any "
+             "lane whose cwd is UNREADABLE) and auto-nudged (BUSY) lanes are never offered as work. "
+             "Protection is the EVIDENCE predicate; the historical names (%s) and any entry in %s "
+             "are ADDITIONAL union members only, never the mechanism."
+             % ("/".join(PROTECTED_LEGACY_NAMES), display_path(_OWNER_WS_FILE)))
     L.append("- Entry format: `- <lane> [<verdict> <confidence>] (<how long since its last output>) "
              "[<cmux-workspace-uuid>] \u2014 <last message>` -- the WHY line below carries every other "
              "age (the words, the child, the tool) so no number here has to be guessed at.")
@@ -1369,6 +1945,11 @@ def render_md(res, snapshot_age, source):
     L.append("")
     L.append("Action: hand each of these the next unheld item for its lane. Its last words said it "
              "finished and holds nothing.")
+    L.append("")
+    L.append("_Every entry is EVIDENCED idle: DONE-IDLE, a COMPLETED last turn, no child and no "
+             "tool in flight, and a confident DONE_READY from the words layer. WORKING / "
+             "TOOL-IN-FLIGHT / CHILD-* / UNBOUND / WEDGED are never here (see "
+             "`state/LANE-STATE-DECISION-TREE.md` and `is_dispatch_target()`)._")
     L.append("")
     if res["idle"]:
         for c in res["idle"]:
@@ -1456,6 +2037,23 @@ def render_beat(res, path_for_beat):
         parts.append("WEDGED->%d unblock: %s" % (len(res["wedged"]), names(res["wedged"])))
     if res["report"]:
         parts.append("REPORT-ONLY->%d (do NOT act)" % len(res["report"]))
+    # ⛔ SILENCE IS NOT EVIDENCE (review round 2, P2). When the fleet cannot read ANY lane's cwd, every
+    # lane is PROTECTED by the fail-closed rule and the first clause reads NOTHING-ACTIONABLE -- the
+    # same line as a quiet fleet, from an instrument that is blind rather than satisfied. Say which.
+    n_unread = res.get("n_identity_unread") or 0
+    n_lanes = res.get("n_classified") or res.get("n_lanes") or 0
+    n_prot = res.get("n_protected") or 0
+    # ⛔ A PROTECTED LANE IS INVISIBLE OTHERWISE (review round 3, P1): the lanes lost to a wrong
+    # identity rule have READABLE cwds, so they raise no `n_identity_unread` -- 26 lanes read as the
+    # owner's on the box behind this change, and the beat said only NOTHING-ACTIONABLE. The count is
+    # therefore emitted whenever no lane is offered, whichever rule produced it.
+    if not res["idle"] and (n_unread or n_prot):
+        if n_unread and n_unread >= n_lanes:
+            parts.append("IDENTITY-UNREAD->%d (no lane's cwd was readable -- NOT a quiet fleet)"
+                         % n_unread)
+        else:
+            parts.append("PROTECTED->%d (owner/unreadable -- never offered as work, see %s)"
+                         % (n_prot, path_for_beat))
     line = " ".join((" | ".join(parts) + note).split())
     return line if len(line) <= SUMMARY_MAX else line[:SUMMARY_MAX - 1].rstrip() + "\u2026"
 
@@ -1518,6 +2116,8 @@ def load_snapshot(args, LS=None):
     # COMPOSE: the attempts share one budget, so this tool can never outlive its caller.
     budget = max(1.0, float(args.budget))
     deadline = time.monotonic() + budget
+    _read_t0 = time.monotonic()      # for the refusal's "how long it waited" (#2227)
+    _sampled = ""                    # lane-status's SAMPLED note, carried into the header
     # ⛔ THE RETRY MUST NOT BE STARVED BY THE ATTEMPT IT IS FIXING (#1788, #1774). A shared
     # deadline alone subtracts attempt 0's cost from the retry's allowance, so on a loaded box
     # (measured: 250-300s per scan) a 200s first attempt left the `--no-cache` scan ~220s -- the
@@ -1539,8 +2139,18 @@ def load_snapshot(args, LS=None):
         cmd = ["/usr/bin/python3", LS_PATH, "--json", "--sample", str(args.sample)]
         if attempt:
             cmd.append("--no-cache")
+        # ⛔ THE SCAN'S OWN SAMPLING NOTE COMES BACK ON STDERR, AND IT MUST NOT BE DROPPED (#2227).
+        # lane-status caps its walks and says what it sampled; a consumer that reads only stdout
+        # would republish a truncated roster as the fleet -- the exact silent lower bound the cap
+        # exists to avoid. Captured here and carried into the generated header below.
+        _sampled = ""
+        _attempt_t0 = time.monotonic()
         try:
-            raw = subprocess.run(cmd, capture_output=True, text=True, timeout=allowance).stdout
+            _r = subprocess.run(cmd, capture_output=True, text=True, timeout=allowance)
+            raw = _r.stdout
+            _sampled = next((ln.strip() for ln in (_r.stderr or "").splitlines()
+                             if ln.startswith("lane-status: SAMPLED")), "")
+            globals()["_SAMPLED_NOTE"] = _sampled
             rows = json.loads(raw)
             # ⛔ `_refuse_if_degraded` RAISES `SystemExit`, WHICH IS A `BaseException` (2026-10-18,
             # review). `except Exception` therefore did NOT catch it, so a DEGRADED re-scan escaped
@@ -1564,7 +2174,18 @@ def load_snapshot(args, LS=None):
                        "the fleet size is unknown" if want is None
                        else "wanted >= %d" % max(0, want - REGISTRY_GRACE)))
                 return first[:3]
-            raise SystemExit("lane-actions: lane-status.py failed: %r" % (e,))
+            # ⛔ A REFUSAL NAMES ITSELF (#2227): WHAT IT TRIED, HOW LONG IT WAITED, AND THE AGE OF
+            # THE LAST GOOD SAMPLE. `lane-status.py failed: TimeoutExpired` was the whole message
+            # pr-doctor surfaced for a fleet read that had actually happened minutes earlier --
+            # the reader could not tell a hung tool from a busy box, and the age of the last real
+            # snapshot (the thing that decides whether to act) was not printed at all.
+            # `last_good` is an AGE from the published snapshot's mtime, never a value from it.
+            raise SystemExit(
+                "lane-actions: lane-status.py failed after %.1fs of a %ss budget "
+                "(tried: lane-status.py --json --sample %s%s; %s: %s); %s"
+                % (time.monotonic() - _attempt_t0, args.budget, args.sample,
+                   "" if attempt else ", then --no-cache", type(e).__name__, str(e)[:120],
+                   _last_good_sentence()))
         try:
             age = int(time.time() - os.path.getmtime(
                 os.path.join(STATE, "lane-status.cache")))
@@ -1586,7 +2207,9 @@ def load_snapshot(args, LS=None):
                             len(rows), want if want is not None else "an unknown fleet size"))
     if best is None:
         raise SystemExit("lane-actions: no snapshot could be read within the %ss budget "
-                         "(the first scan never finished)" % (args.budget,))
+                         "(waited %.1fs across both attempts); %s"
+                         % (args.budget, time.monotonic() - _read_t0,
+                            _last_good_sentence()))
     # ⛔ WHAT IS RETURNED HERE IS THE NEWEST READ, NOT THE FIRST ONE -- AND IT IS NOT COMPLETE.
     # The recorded rule ("None means UNKNOWN, so take the strongest read available") still holds:
     # this returns the strongest read that could be OBTAINED, and says on stderr that its
@@ -1681,15 +2304,20 @@ def main():
     # empty action list as if the fleet were clean. write_pair owns the pair's coherence.
     beat = render_beat(res, display_path(a.out))
     rc = write_pair(a.out, md, beat, res["words_read"])
-    # ⛔ KEEP THE EARLY RETURN — EMPTY STDOUT **IS** THE CALLER'S FAIL-CLOSED DETECTOR (#1897 review).
+    # ⛔ KEEP THE EARLY RETURN — EMPTY STDOUT **IS** A CALLER'S FAIL-CLOSED DETECTOR (#1897 review).
     # A review raised the coupling as a P3: "a read API must not be gated on a write". Measured, the
-    # coupling is load-bearing. `pr-doctor.py`'s gate is `if not (out or "").strip()` — it does NOT
-    # compare rc — so rc 3/4 has to produce NO document, or the doctor parses a torn tick as a good
-    # read and dispatches lanes off it. Printing before `return rc` and leaving the direction to "the
+    # coupling is load-bearing for a caller of the shape `if not (out or "").strip(): refuse` — it
+    # does NOT compare rc, so rc 3/4 has to produce NO document, or such a caller parses a torn tick
+    # as a good read and acts on it. Printing before `return rc` and leaving the direction to "the
     # caller checks rc" would be a claim about a guard that does not exist: measured, rc=4 with a
-    # document in stdout is read as a GOOD READ. Decoupling is therefore a change to pr-doctor (gate
-    # on rc first, with its own proof), NOT a change here — and not worth trading the fail-closed
-    # direction for a tidier read API on the exact path this branch exists to contain.
+    # document in stdout is read as a GOOD READ. Decoupling is therefore a change to any such
+    # caller (gate on rc first, with its own proof), NOT a change here — and not worth trading the
+    # fail-closed direction for a tidier read API on the exact path this branch exists to contain.
+    # ⚠️ CORRECTED 2026-10-20: this used to name `pr-doctor.py` as that caller. It is not one any
+    # more — it retired the lane-table path (#1874) and spawns background workers instead, so it
+    # has no `lane-actions.py` call to gate. The invariant is kept for the `--stdin`/`--json`
+    # callers that do exist (heartbeat-loop.sh, lane-scan-fallback.sh, tests, a manual read);
+    # the point here is the published document, not one retired reader.
     if rc:
         return rc
     if a.json:
@@ -1697,6 +2325,16 @@ def main():
             "beat": beat, "jev": res["meta"], "jev_down": res["jev_down"],
             "words_read": res["words_read"],
             "counts": {k: len(res[k]) for k in ("idle", "wip", "wedged", "report", "quiet")},
+            # ⛔ THE COUNTERS TRAVEL WITH THE LIST (review round 3, P3). A mechanical caller that
+            # reads only `dispatch_targets` sees `[]` and cannot tell "no lane is evidenced idle"
+            # from "identity evidence was lost, so EVERY lane is PROTECTED" -- which is the whole
+            # reason the counters exist. Without them here, the distinction lived only in the human
+            # beat string, which is suppressed whenever `idle` is non-empty.
+            "n_protected": res["n_protected"],
+            "n_identity_unread": res["n_identity_unread"],
+            "n_classified": res["n_classified"],
+            # the dispatcher's target list, and the reason each offered lane qualifies
+            "dispatch_targets": res["dispatch_targets"],
             "idle": res["idle"], "wip": res["wip"], "wedged": res["wedged"],
             "report": res["report"], "quiet": res["quiet"],
         }, indent=1))

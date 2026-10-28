@@ -48,7 +48,7 @@ the missing half of.
 `bash capacity.sh probe` prints one line; peers publish the same line to the shared origin.
 
 ```
-host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=1792598400
+host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=1792598400 procs=412 procs_max=15641 fork=1 src=uid
 ```
 
 - `lpc` — **load per CPU, in integer hundredths** (bash 3.2 has no floats). This is the number the
@@ -58,13 +58,120 @@ host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 
 - `mem_free_mb` — the same helper the controller's own memory gate uses.
 - `at` — the epoch of the reading. A record with no age is a stale flag waiting to be read as
   current.
+- `procs` / `procs_max` / `fork` — fork headroom (§4). `procs_max=0` means **no ceiling was found**
+  (unbounded), never "zero headroom". `src` is the arm that answered (`uid` or `cgroup`) and is local
+  to the box: it is printed by `probe`, not transported in the ref name.
+
+The fork fields are **appended** to the record (`procs`, `max`, `fork`, then `boxid`/`boot`), so a peer
+that parses the record by KEY still reads the leading fields. ⛔ That tolerance does NOT extend to the ref
+NAME: the `<boxid>` path segment is part of the key, so a pre-#2707 reader drops a 3-segment ref entirely
+and falls to `bound=no_probe` (refuse, never guess), and a pre-#2707 WRITER host-prunes and deletes those
+refs — upgrade a whole hostname group together (§Identity and pruning below). A two-segment ref from before
+#2707 (no `boxid`) is read as `box_unknown` and a six-slot one likewise (`box_unknown`, because identity is
+checked BEFORE fork) — neither is ever read as healthy, and both self-heal on that box's next publish.
 
 Transport: the fleet's only shared channel is the queue repo's origin, so a box publishes its
-reading as `refs/boxes/<host>/<reading>` and every box reads the whole fleet with **one**
+reading as `refs/boxes/<host>/<boxid>/<reading>` and every box reads the whole fleet with **one**
 `git ls-remote --refs refs/boxes/*` — the same channel and the same read primitive `claims.sh`
 already uses. No new daemon, no new credential, no per-box RPC.
 
-## 4. The ceiling: 8.00 load per CPU — and what it protects
+Identity and pruning (#2707, measured 2026-10-24). `hostname` is NOT the key: all three cells are named
+`cmux`, so a hostname-keyed ref plus a host-scoped prune made each box delete its peers' records and the
+fleet read as one box (`cap_place` answering `place=<self>`). A record is keyed `<host>/<boxid>`, where
+`boxid` comes from the box's own network identity — Darwin `kern.uuid`, Linux the routable IPv4 — the two
+sources **measured to differ** across the cells. `/etc/machine-id` and `/proc/…/boot_id` are measured
+IDENTICAL on all three (cloned image), so neither is a fallback: a box with no derivable identity
+**refuses to publish** (`why=no-box-identity`) instead of manufacturing an attribution, and its peers
+never see a record they cannot attribute. `CAP_BOXID` pins one explicitly for a deploy that must.
+
+A box deletes a ref only when (a) a **local authorship ledger** proves this box wrote that exact ref
+(recorded at publish time under `CAP_STATE_DIR`, default `${TMPDIR:-/tmp}/pi-capacity`, one file per
+repo, ring-bounded at `CAP_LEDGER_KEEP=32` refs and one filesystem per box), or (b) the record is STALE.
+A wiped `TMPDIR` therefore degrades pruning to STALE-only — refs leak for at most `CAP_PROBE_TTL` (900 s)
+and are then collected; it never causes a delete.
+Anything else is a peer's and is kept; a fresh record under this box's own key that it cannot prove it
+wrote is counted `foreign=<n>`. When two fresh refs under one key disagree on `ncpu` or on `boot`, the
+reader marks the key `collide=1` and `cap_place` REFUSES (`bound=identity_collision`) rather than placing
+on a box the fleet cannot name. `foreign>0` alone is a *reading*, not a refusal: a box's own unprovable
+prior ref (a wiped `TMPDIR`) raises it without any collision. ⛔ `(key, boot)` equality
+is NOT authorship — a mis-keyed peer satisfies it, and reading it as proof deleted live peer records
+(reproduced; see `capacity.sh`'s header).
+
+## 4. The order: FORK HEADROOM, then disk, then load
+
+⛔ Two bounds precede these, in this order: **`probe_stale`/`probe_unreadable`** (the reading's age is
+checked first) and **`box_unknown`** (a record that names no box is not judged on its numbers at all —
+`cap_bound_hit` checks identity before fork, because every other bound is a statement *about a box*).
+
+**Measured 2026-10-21 19:50–20:10 UTC (#2293).** Cloud **cell-4** (8 vCPU) could not spawn at all:
+
+```
+/bin/bash: fork: Resource temporarily unavailable
+spawn /bin/bash EAGAIN          (rc 128; persistent over 75 s)
+last good reading: load=2.54/8 (0.32x)  lanes=11  pi_procs=16
+```
+
+The Mac hit the same wall minutes later, and there it is provable in isolation: `echo ok` (a shell
+builtin, no fork) worked while every spawn failed. So the binding resource was **process/fork
+headroom** — invisible to load average, to memory, and to any lane counter. A 12th lane placed by a
+load-only rule lands on a box with **no pids left**, and that failure is not graceful: the box cannot
+be probed from inside, nothing can be cleaned up locally, and every retry by an already-placed lane
+forks more.
+
+The probe therefore reads, in this order, and refuses by the FIRST bound it hits:
+
+1. **fork headroom** — `procs` (live process count) against `procs_max` (the smallest of `ulimit -u`,
+   `kern.maxprocperuid`, and the cgroup `pids.max`), plus a **two-fork probe** (`fork=1|0`). Below
+   `CAP_MIN_FORK_HEADROOM=200` spare processes the box is refused.
+   The cgroup arm reads **the caller's own cgroup**, resolved from `/proc/self/cgroup` (walking up to
+   the mount root), not just the mount root — measured on a fleet cell, `/sys/fs/cgroup/pids.max` does
+   not exist while `/system.slice/<svc>.service/pids.max` is `4692`, so a root-only read reports
+   `src=uid` and never sees the ceiling the box is actually bound by. The resolution uses builtins
+   only (`read`, parameter expansion), because it runs on the path whose whole purpose is a box that
+   cannot fork.
+2. **disk** — as §4's floors describe.
+3. **load** — last, because on a box that dies at fork before it gets CPU-busy it is the least
+   informative of the three.
+
+Why the order matters: the remedies differ and so do their time scales. A fork refusal **never clears
+by waiting** — the remedy is an external restart or letting the box drain. A disk refusal clears by
+pruning. Only a load refusal clears on its own. Reporting `load=` for a box that cannot fork sends an
+operator to wait for an event that cannot arrive.
+
+**A fork failure is fatal to the process that attempts it.** Measured on this tree's bash (5.2.21):
+`ulimit -u 5; ( exit 0 )` prints `fork: retry: …` four times, then `fork: Resource temporarily
+unavailable`, and **the script exits 254** — a `while` loop dies on its first failed fork. That is why
+`bash capacity.sh probe` exits **254** when it could not fork (a named answer, not a crash), why the
+probe runs inside a child, and why the controller treats 254 as `fork_exhausted` and stops forking for
+that cycle.
+
+**The controller survives it.** Measured: the local `com.eldato.orchestrator-loop` recorded a last exit
+of **128** and never came back — launchd's relaunch needs the very fork that is failing. So
+`orch-loop.sh` reads fork headroom **first** (before `date`, `git`, `gh` — before anything that spawns),
+and when a box is starved it takes a builtin-only path: it writes a cycle record (`nothing=fork_exhausted`,
+`fork=starved`) and naps on a FIFO opened at startup (`read -t` — no child process), then retries. The
+box still cannot be repaired from inside; what changes is that it is **alive and named** instead of
+vanishing into a respawn loop that cannot start.
+
+That path is builtins-only in the WRITER too: `cycle_record_write` builds its path and sanitises every
+field with parameter expansion (no `$( )`, no `tr`, no `mkdir` when the state dir already exists).
+Driven: `( ulimit -u 1; cycle_record_write … )` returns 0 and the record is on disk, where a
+substitution-based writer exits **254** having written nothing. A cycle whose clock cannot be read
+without a fork (bash 3.2 has no `printf '%(…)T`) records `start=0`, and `harness status` reports that
+record **UNREADABLE** — never `DEGRADED`-stale, which would tell an operator to restart a controller
+that is alive and writing.
+
+`bin/harness status` gains the verdict for that state:
+
+| verdict | rc | meaning |
+|---|---|---|
+| `FORK-STARVED` | 1 | the controller is fresh and alive, and its own fork reading says the box cannot spawn |
+
+The refusal names the read (`bound=fork_headroom` / `fork_probe` / `fork_unknown`), so "no box is
+eligible" is never a bare fact: `fork_headroom` is a box that needs an external restart, `fork_probe` is
+a box whose own probe refused, `fork_unknown` is a peer that published no fork reading at all.
+
+## 5. The ceiling: 8.00 load per CPU — and what it protects
 
 `CAP_LPC_CEILING=800` (hundredths). Measured, not derived: the fleet's own incident data puts the
 saturation point at **8–10× cpu load**, and the controller's local hard gate is `ncpu*10` (`MAX_LOAD`),
@@ -95,6 +202,9 @@ Every refusal names **which** bound it hit, because the remedies differ:
 | `bound=` | meaning | remedy |
 |---|---|---|
 | `load_per_cpu` | every box is past 8× cpu | the fleet needs more boxes |
+| `fork_headroom` | spare processes below `CAP_MIN_FORK_HEADROOM` (200) | **external restart or drain** — it cannot be cleaned from inside (#2293) |
+| `fork_probe` | the box's two-fork probe refused | the same: the box cannot spawn at all |
+| `fork_unknown` | a peer published no fork reading (a pre-#2293 record) | upgrade that box; it is ineligible until it republishes |
 | `disk` | free space below the floor | `cloud-cell-supervisor.sh prune` on that box |
 | `memory` | available memory below the floor | a leak somewhere on that box |
 | `probe_stale` | a record older than `CAP_PROBE_TTL` (900 s) | that box's controller is not publishing |
@@ -104,7 +214,7 @@ Relation to `docs/ops/load-policy.md`: that policy's per-core thresholds (2.5× 
 background batches** on a host; `MAX_LOAD` (10×, `spawn-gate.sh`) refuses a *local* spawn; this 8×
 ceiling decides **cross-box placement**. Three different decisions, three numbers, each named.
 
-## 5. The rule, and the fail-closed direction
+## 6. The rule, and the fail-closed direction
 
 `cap_place <this-box> <records…>` (or records on stdin) →
 
@@ -125,13 +235,13 @@ In the controller the verdict has three outcomes, and only two of them stop work
   stand-down.
 - `refuse` → `GATE_WHY="capacity-placement(bound=…)"`: nothing is placed, and the bound is named.
 
-## 6. The self-dispatch proof
+## 7. The self-dispatch proof
 
 `orch-loop.sh` appends **one line per cycle** to `$O/state/cycles`:
 
 ```
 start=… end=… cycle=… interval=240 selected=issue:#2216 selected_n=1 dispatched=1 ids=#2216
-nothing=none placement=place placed_on=cell-1 bound=none lpc_self=7
+nothing=none placement=place placed_on=cell-1 bound=none lpc_self=7 fork=ok fork_procs=412 fork_max=15641
 ```
 
 `bin/harness status` prints the last N and grades the **newest** record:
@@ -151,7 +261,7 @@ state that read as fine on cell-1.
 This is what answers "is it self-dispatching" without a human reading a pane: a live pane shows a
 *process*, a fresh record shows a *cycle*.
 
-## 7. Tests
+## 8. Tests
 
 `scripts/orchestrator-harness/capacity-placement.test.sh` (in `scripts/run-bash-shards.sh`, so both
 CI lanes run it): the saturated box skipped and the least-loaded eligible box chosen; an
@@ -297,3 +407,140 @@ Tests:
 `scripts/ci_runner_pool.test.sh` (in both bash lanes), whose install stubs model GitHub's own cwd
 contract and listener argv, and which includes a mutant with the floor comparison defused that must
 stop refusing.
+
+
+## 9. The required-check reservation — so the ONE required status never queues behind advisory work
+
+`agent-infra` has exactly one required status context (branch protection =
+`["pipeline-compliance"]`, measured). That job is ~9 s of work. On 2026-10-24 it was measured
+queueing **13 minutes** for those 9 seconds, behind 66 queued runs (~1,650 jobs) of *advisory*
+work — `bash-suites` alone is an 8-job matrix. A `pipeline-compliance` that is `queued` is
+indistinguishable from a broken gate, so merges stall for hours while every recorded, green
+candidate PR sits there.
+
+The fix is a **reservation**, not a new gate: a small number of runner slots that carry a dedicated
+label `required-check`, which only `pipeline-compliance` asks for. Same check, same commit, same
+assertions — it simply does not wait behind 1,600 advisory jobs.
+
+### 9.1 The job side (this repo)
+
+`.github/workflows/pipeline-compliance.yml` routes **only** the `pipeline-compliance` job through
+the `PIPELINE_COMPLIANCE_RUNS_ON` variable, whose default is `ubuntu-latest` (the reservation value
+is declared in that job's comment block). It also carries `timeout-minutes: 20` (#2055): a hung
+step on a reserved slot would otherwise hold a runner and silently park the only required check.
+
+Every other job keeps `ubuntu-latest`. `tests/required-check-reservation/run.sh` pins all three
+properties, including a mutation that moves one more job onto the reservation (it must fail).
+
+**The default is the fallback, deliberately.** GitHub Actions has no fallback/OR in `runs-on`:
+labels are ANDed, and a job whose labels match no online runner does not run at all — it waits
+`queued` until GitHub cancels it (the self-hosted **job-queue limit is 24 h**: *"A job can be in
+the queue for 24 hours before it is automatically cancelled"*). An unconditional
+`[self-hosted, Linux, X64, required-check]` would therefore make the repo's *only* required check
+unsatisfiable until a runner is labelled — worse than the queue — and would deadlock every
+consumer reusing this file via `workflow_call`. With the variable unset the job runs exactly as it
+does today; the reservation is one command to engage and the same one to release.
+
+That 24 h cancel is **not a safe place to wait**, which is the second half of the same argument: a
+`cancelled` check is in the rail's `NON_RED_CONC` allow-list (`scripts/admin-merge.sh`), so a reservation that was
+engaged but never labelled would end as a **non-red** required check instead of a visibly `queued`
+one — the rail's own fail-open class (#2474). Hence §9.3's release deadline.
+
+A second job or a matrix arm is **not** an option: branch protection requires the context to be
+named exactly `pipeline-compliance`, and a matrix arm renames it (`pipeline-compliance ([...])`)
+while a second job reports a different context. Either way the required context is never
+satisfied and every PR blocks.
+
+### 9.2 Applying the label — the exact, reproducible call
+
+Do this **before** engaging the variable, then verify. `<id>` is a runner id from the listing.
+
+1. List the runners and pick the slots to reserve:
+
+```bash
+gh api --paginate repos/daniel-ospina/agent-infra/actions/runners \
+  --jq '.runners[] | {id, name, status, busy, labels: [.labels[].name]}'
+```
+
+2. Add `required-check` to each reserved runner and remove `ubuntu-latest` from it. Use the
+   non-destructive pair — **`PUT …/labels` REPLACES every custom label on the runner** (it is
+   documented as *"Remove all previous custom labels and set the new custom labels"*), so using it
+   here would silently delete any other custom label a fleet cell carries and leave work that
+   targets that label unrunnable:
+
+```bash
+# add the reservation label (additive; POST does not touch the rest)
+gh api -X POST repos/daniel-ospina/agent-infra/actions/runners/ID/labels \
+  -f 'labels[]=required-check'
+
+# then remove ONLY the label that leaks the reservation back to advisory work
+gh api -X DELETE repos/daniel-ospina/agent-infra/actions/runners/ID/labels/ubuntu-latest
+```
+
+If you do use `PUT` (e.g. to rebuild a mislabelled runner in one call), you must pass the
+**complete surviving CUSTOM label set** — and that set is **`self-hosted-x64` plus `required-check`**,
+which is the live listing's custom labels MINUS `ubuntu-latest`. Do **not** copy step 1's listing
+verbatim: it includes `ubuntu-latest`, and re-adding it would revert this reservation to advisory
+work while you believe you followed this doc. Do **not** list `self-hosted`/`Linux`/`X64`: those are
+AUTOMATIC labels GitHub stamps from the host, they are not part of the custom set `PUT` replaces,
+and `scripts/ci_runner_gate.sh` excludes them from its own body for exactly that reason.
+
+Removing `ubuntu-latest` is part of the reservation, not a detail: a reserved runner that still
+carries `ubuntu-latest` keeps accepting advisory jobs, so the reservation is advisory too. Keep
+`self-hosted-x64` — the pool marker is what makes the runner selectable at all, and dropping it
+strands a registered-but-jobless runner (#2373).
+
+3. Verify the reservation is visible to the scheduler (THE ARTIFACT, not the send):
+
+```bash
+gh api --paginate repos/daniel-ospina/agent-infra/actions/runners \
+  --jq '.runners[] | select([.labels[].name] | index("required-check")) | "\(.id) \(.name) status=\(.status) labels=\([.labels[].name]|join(","))"'
+```
+
+### 9.3 Engaging and releasing the reservation
+
+```bash
+# ENGAGE — the required check now uses the reserved slots.
+gh variable set PIPELINE_COMPLIANCE_RUNS_ON --repo daniel-ospina/agent-infra \
+  --body '["self-hosted","Linux","X64","required-check"]'
+
+# RELEASE (the fallback) — back to exactly today's behaviour, immediately.
+gh variable delete PIPELINE_COMPLIANCE_RUNS_ON --repo daniel-ospina/agent-infra
+```
+
+`RELEASE` is the documented fallback and it is always available: it is what keeps a dead or
+unlabelled reservation from being an outage of the only required check.
+
+**⛔ RELEASE WITHIN 24 HOURS of a reservation going dark.** Tell-tale: the required check is sitting
+`queued` on the engaged label. Do not wait it out. GitHub's self-hosted **job-queue limit is 24 h**,
+and the job is then `cancelled` — which `scripts/admin-merge.sh` treats as **non-red**
+(`NON_RED_CONC`), so past that point the required context stops being a visible obstruction and
+becomes a silent one. Release the variable first, then repair the label; verify the required check
+is neither `queued` nor `cancelled` on the head before trusting the rail.
+
+### 9.4 Residuals, stated because they are not fixed here
+
+- **A `cancelled` REQUIRED check is non-red in the rail** (`NON_RED_CONC` allow-list in `scripts/admin-merge.sh`,
+  `{success, neutral, skipped, cancelled, stale}`). This is pre-existing and is the same class as
+  #2474 (a cancelled guard leg satisfying a completeness check with no verdict); the reservation
+  makes it *reachable* via the 24 h queue cancel, which is why §9.3 carries a deadline. The rail
+  fix — a `cancelled` context that is REQUIRED must not be non-red — belongs to #2474, not here.
+
+- **The label is not durable on its own.** `scripts/ci_runner_gate.sh` preserves custom labels it
+  did not add, so it will not strip `required-check` — but on its fallback arm it *adds*
+  `ubuntu-latest` to the pool, which leaks reserved slots back to advisory work. Re-assert §9.2
+  after a fallback flip. (Do **not** try to solve this by taking the reserved runners out of that
+  gate's pool: `self-hosted-x64` is the pool selector the gate resolves (`POOL_LABEL_X64`), so
+  dropping it strands the whole x86 arm — the #2373 failure §9.2 warns about. The leak is repaired
+  by re-asserting §9.2, not by removing the marker.)
+- **A dead reserved listener is a single point of failure** for the only required check. This is
+  #2682 blocker 2 (the `ai-runner-*` restart loop) and it is *why* the fallback in §9.3 exists.
+- **#2682 blocker 1 is still open.** It recorded: keep the required check off self-hosted capacity
+  until a dedicated, ephemeral, credential-free runner exists. The runners available today are
+  persistent fleet cells and this repo is public, so engaging the reservation runs the PR's own
+  `scripts/check-pipeline-compliance.sh` on a fleet machine. Engaging it is therefore an operator
+  decision — the change ships **off** by default for exactly that reason.
+- The starvation engine is that the pool advertises `ubuntu-latest` at all (the standing-rule
+  violation in #2344/#2656, whose blast radius #2589 measured). The durable fix is that the pool
+  stops advertising it, as `daniel-ospina/tortoise`'s pool does. The reservation reduces the blast
+  radius; it does not remove it.

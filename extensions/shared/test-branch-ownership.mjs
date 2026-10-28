@@ -1008,7 +1008,15 @@ releaseRepoLock(lockKey, PID);
 {
   // origin (bare) → seed clone → target clones, so upstream/refs/remotes exist.
   const fOrigin = join(ROOT, "ff-origin.git");
-  git(ROOT, `init -q --bare "${fOrigin}"`);
+  // #2581 — the bare repo starts EMPTY, so the branch every clone below checks out is named by
+  // `init.defaultBranch` from the box's EFFECTIVE config (this suite reads the global channel,
+  // `~/.gitconfig`). Where it is unset (a CI runner, a fresh cell) git names it `master` and the
+  // fixture's own `git push -q origin main` below dies with `error: src refspec main does not
+  // match any` — a message that names the refspec, never the cause. Measured 2026-10-23: this
+  // file and main-worktree-guard/test-module-load.mjs were main's only two reds while both were
+  // green on a box whose config supplied the value. Name the branch in the FIXTURE (`-b main`,
+  // the repo-wide idiom): the suite's verdict is then a function of this commit, not the box.
+  git(ROOT, `init -q --bare -b main "${fOrigin}"`);
   const seed = join(ROOT, "ff-seed");
   git(ROOT, `clone -q "${fOrigin}" "${seed}"`);
   git(seed, "config user.email t@bo.local && git config user.name bo-test");
@@ -1026,6 +1034,12 @@ releaseRepoLock(lockKey, PID);
   git(ROOT, `clone -q "${fOrigin}" "${equal}"`);
 
   const bare = join(ROOT, "ff-bare");
+  // #2581 — unused fixture: created here and never referenced again, so it needs no pin. The set
+  // that DOES need one is the EMPTY-bare repos that get CLONED — in this file that is
+  // `ff-origin.git` alone (the `bare.git` at the top is a `clone --bare` of a non-empty repo and
+  // is used only as a git-dir/cwd target). Annotated because this is the file's second
+  // `init --bare`: a reader grepping for "the sites that need a pin" must not add one here or
+  // conclude the pin set is incomplete.
   git(ROOT, `init -q --bare "${bare}"`);
 
   const pBehind = fastForwardOntoUpstreamProof(behind, "main");

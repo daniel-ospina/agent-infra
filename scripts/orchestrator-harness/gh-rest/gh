@@ -65,9 +65,16 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   # ⛔ NO PIPE: `head | grep -q` races — grep exits at its first match, head takes SIGPIPE, and under
   # `pipefail` the pipeline reads FAILED even though the marker was found (the #841 class). A false
   # negative here would let the walk pick a shim as the real gh, i.e. recurse.
-  local _head
-  _head="$(head -c 8192 "$1" 2>/dev/null)" || return 1
-  grep -q 'harness-gh-shim-marker' <<<"$_head" && return 0
+  # ⛔ NO COMMAND SUBSTITUTION EITHER — THE CANDIDATE IS USUALLY A COMPILED BINARY (#2184). Reading a
+  # binary into a variable makes bash >= 4.4 print `warning: command substitution: ignored null byte in
+  # input` on STDERR of a call that SUCCEEDS, and callers here merge stderr into the bytes they parse
+  # (`2>&1`). MEASURED on all three cloud cells: that warning became the reported OUTPUT of every PR
+  # read (`NOCHECKS:READ-FAILED:transport … ignored null byte in input`), so every acting arm found no
+  # work while the PR queue sat there — a false green that looked like an idle cell.
+  # `grep -a` so a binary candidate is matched rather than skipped as "binary file matches"; `grep -q`
+  # is ONE process, so it cannot race itself the way `head | grep -q` does. `2>/dev/null` keeps an
+  # unreadable candidate from putting the SHELL's own open error on a successful call's stderr.
+  grep -qa 'harness-gh-shim-marker' "$1" 2>/dev/null && return 0
   [ -f "$(dirname "$1")/../gh-limit.py" ]
 }
 REAL_GH="${GH_REST_REAL_GH:-}"
@@ -232,6 +239,30 @@ read_json() {   # read_json <jq -s program> <gh argv...>  — body (jq output) o
   printf '%s\n' "$_body" | jq -s "$_prog"
 }
 
+# ── PAYLOAD TRANSPORT: A JSON PAYLOAD NEVER TRAVELS THROUGH argv OR THE ENVIRONMENT ──────────────
+# ⛔ THE REFUSAL IS SILENT, AND IT LOOKS LIKE "NO WORK TO DO". The two projections below handed the
+# WHOLE payload to python through argv/the environment — `R="$runs" S="$sts" python3 -c …` and
+# `python3 -c … "$cs"`. Both are bounded by ARG_MAX (~1 MiB here), and a BUSY PR exceeds it: the
+# kernel refused the exec with `Argument list too long`, the projection printed nothing, and the
+# caller read EMPTY STDOUT as an empty check surface. MEASURED on the cells (2026-10-25):
+#   `PR path: NO UNIT SPAWNED this cycle — 10 row(s) with a named reason (most common: 6 check
+#    surface READ-FAILED:other: …/gh-rest/gh: line 420: python3: Argument list too long)`
+# That is the same false green as the null-byte defect above it: a FAILED read reported as "no work".
+# So the payload is staged in a FILE and the child receives its PATH: file names are tiny, there is
+# no encoding trap (argv/env are byte strings), and stdin stays free for the program's own input.
+stage_payload() {  # stage_payload <tag> <content>  → path on stdout; rc 1 (nothing left behind) if it cannot stage
+  local _tag="$1" _p="$2" _f _want _got
+  _f="$(mktemp "${TMPDIR:-/tmp}/gh-rest-$_tag.XXXXXX")" || return 1
+  # ⛔ A SHORT WRITE IS NOT A PAYLOAD, AND A FULL TMPDIR WRITES ONE. An unchecked redirect leaves a
+  # TRUNCATED document that the child then parses (or fails to) — so the byte count is verified back
+  # and every failure removes the file and returns 1, which the caller turns into `die`.
+  if ! printf '%s' "$_p" >"$_f"; then rm -f "$_f"; return 1; fi
+  _want="$(printf '%s' "$_p" | wc -c | tr -d '[:space:]')"
+  _got="$(wc -c <"$_f" | tr -d '[:space:]')"
+  if [ "$_want" != "$_got" ]; then rm -f "$_f"; return 1; fi
+  printf '%s' "$_f"
+}
+
 [ $# -ge 2 ] || delegate
 SUB="$1 $2"
 
@@ -344,12 +375,35 @@ case "$SUB" in
   [ "$SUB" = "issue view" ] && { kind=issue; base="repos/$REPO/issues/$NUM"; }
   raw="$(run_real api "$base" 2>&1)" || die "$raw"
   guard_api_error "$raw"
+  # ⛔ A VIEW OF ONE NUMBER IS NOT A LIST, AND A PR-NUMBERED TARGET IS NOT "NO ISSUE" (measured
+  # 2026-10-24, the empty agent-infra funnel). The projection below drops `pull_request` rows because
+  # a LIST of /issues is not a list of issues — that rule belongs to the LIST path ONLY. On VIEW it
+  # produced `out=[]`, and the "single object" promise was then printed as an EMPTY ARRAY with rc 0:
+  # `gh issue view 2645 --repo daniel-ospina/agent-infra --json number,title,state,stateReason,
+  # assignees,url` answered `[]`. `collision_preflight.py` reads that payload as `issue landed` AND
+  # `issue assignee/holder`, so it refused non-object JSON on BOTH surfaces: the candidate is
+  # INCOMPLETE, and six INCOMPLETE candidates are `ABORT: … judged NOTHING` — an empty backlog with
+  # capacity free, which is the one symptom this adapter must never manufacture. An issue and a PR
+  # SHARE a number sequence, so the question is legitimate and real gh answers it; DELEGATE rather
+  # than answer it with a shape the caller cannot read (and rather than invent an issue payload for a
+  # pull request, which would be the other fail-open).
+  if [ "$kind" = issue ] && printf '%s' "$raw" | jq -e 'type == "object" and (.pull_request != null)' >/dev/null 2>&1; then
+    delegate
+  fi
   case ",$JSON_F," in
     *,comments,*)
       cs="$(read_json '[.[][] | {body:.body, author:{login:(.user.login)}, createdAt:.created_at}]' \
                       api --paginate "repos/$REPO/issues/$NUM/comments?per_page=100")" \
         || die "the PR comment read failed (the refusal is on stderr)"
-      raw="$(printf '%s' "$raw" | python3 -c 'import sys,json; d=json.load(sys.stdin); d["comments"]=json.loads(sys.argv[1]); print(json.dumps(d))' "$cs")" || die "comment merge failed"
+      # ⛔ THE COMMENTS PAYLOAD IS ARGV-SIZED TOO (see stage_payload): a long thread on a busy PR is
+      # megabytes, and `python3 -c … "$cs"` was refused with `Argument list too long`.
+      __cs_f="$(stage_payload cs "$cs")" \
+        || die "cannot stage the comment payload for #$NUM (TMPDIR=${TMPDIR:-/tmp})"
+      raw="$(printf '%s' "$raw" | python3 -c 'import sys,json
+f=sys.argv[1]
+d=json.load(sys.stdin); d["comments"]=json.load(open(f, encoding="utf-8", errors="surrogateescape")); print(json.dumps(d))' "$__cs_f")" \
+        || { rm -f "$__cs_f"; die "comment merge failed"; }
+      rm -f "$__cs_f"
       ;;
   esac
   printf '%s' "$raw" | python3 -c "$PROJECT" "$JSON_F" "$kind" 0 | emit || exit 1
@@ -399,12 +453,29 @@ case "$SUB" in
     die "cannot read the legacy commit-status surface for #$NUM (the read failed, so the check set is INCOMPLETE — retry rather than reading it as green or pending)"
   fi
   rm -f "$__sts_err"
-  R="$runs" S="$sts" python3 -c '
-import os, json
-def load(k, key):
-    try: return (json.loads(os.environ.get(k) or "{}") or {}).get(key) or []
-    except Exception: return []
-runs=load("R","check_runs"); stat=load("S","statuses")
+  # ⛔ THE PAYLOAD DOES NOT FIT IN argv/env ON A BUSY PR (see stage_payload). Both documents are
+  # staged as files and the child gets their PATHS; a failure to stage is a failed read, not an
+  # empty surface — this is the read the cell log named at `gh-rest/gh: line 420`.
+  __runs_f="$(stage_payload runs "$runs")" \
+    || die "cannot stage the check-runs payload for #$NUM (TMPDIR=${TMPDIR:-/tmp}) — refusing to read it as an empty check set"
+  __sts_f="$(stage_payload sts "$sts")" \
+    || { rm -f "$__runs_f"; die "cannot stage the legacy commit-status payload for #$NUM (TMPDIR=${TMPDIR:-/tmp}) — refusing to read it as an empty check set"; }
+  __proj_rc=0
+  python3 -c '
+import sys, json
+def load(path, key):
+    # ⛔ A PAYLOAD WE CANNOT PARSE IS NOT AN EMPTY SURFACE. The old loader swallowed the exception
+    # and returned [] — an unreadable document read as "no checks" with rc 0, which is the same
+    # false green this read already `die`s on in bash. An EMPTY body with rc 0 is the one benign
+    # case (verified above, so not a refused read): that is "no rows" and still yields [].
+    raw=open(path, encoding="utf-8", errors="surrogateescape").read()
+    if not raw.strip(): return []
+    try: d=json.loads(raw)
+    except Exception as e:
+        sys.stderr.write("gh-rest: cannot parse the %s payload (%s) — refusing to read it as an empty check surface\n" % (key, e))
+        raise SystemExit(1)
+    return (d.get(key) or []) if isinstance(d, dict) else []
+runs=load(sys.argv[1],"check_runs"); stat=load(sys.argv[2],"statuses")
 out=[]
 for c in runs:
     st=(c.get("status") or "").lower(); cc=(c.get("conclusion") or "").lower()
@@ -424,7 +495,10 @@ for s in stat:
                 "workflow":(s.get("creator") or {}).get("login") or "","link":s.get("target_url"),
                 "status":"","conclusion":"",
                 "startedAt":s.get("created_at"),"completedAt":s.get("updated_at")})
-print(json.dumps(out))' | emit || exit 1
+print(json.dumps(out))' "$__runs_f" "$__sts_f" | emit || __proj_rc=$?
+  # Clean up on EVERY path: the success line, the projection failure, and `emit`'s own `die`.
+  rm -f "$__runs_f" "$__sts_f"
+  [ "$__proj_rc" -eq 0 ] || exit 1
   exit 0 ;;
 
 "pr list")

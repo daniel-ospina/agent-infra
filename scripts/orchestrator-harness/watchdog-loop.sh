@@ -142,7 +142,7 @@ SLEEP_BIN="${WATCHDOG_SLEEP_BIN:-sleep}"
 now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 # One line per decision: tab-separated so `status`, awk and a human all read it, and the verb is in
 # the SECOND field so a `grep -w WEDGED` cannot match a sentence about one.
-say() {
+log_line() {
   local line
   line="$(now_iso)"$'\t'"$*"
   # ⛔ stderr is silenced BEFORE the append: redirections apply left to right, so `>> "$LOG" 2>/dev/null`
@@ -165,7 +165,7 @@ rotate_log() {
   case "${sz:-}" in ''|*[!0-9]*) return 0 ;; esac
   [ "$sz" -le "$LOG_MAX_BYTES" ] && return 0
   : > "$LOG" 2>/dev/null || return 0
-  say "verdict=LOG-ROTATED"$'\t'"note=previous lines dropped at ${sz}B (bound ${LOG_MAX_BYTES}B)"
+  log_line "verdict=LOG-ROTATED"$'\t'"note=previous lines dropped at ${sz}B (bound ${LOG_MAX_BYTES}B)"
 }
 
 # ── the two READINGS, and neither may claim health it did not observe ───────────────────────────
@@ -299,7 +299,7 @@ restart_stack() {
   # IN THE PRODUCT and not only in the test's discipline. It sits AFTER the stub seam on purpose: a
   # stub IS the restart under test, and suppressing it would make every restart assertion vacuous.
   if [ -n "${WATCHDOG_NO_RESTART:-}" ]; then
-    say "verdict=RESTART-SUPPRESSED"$'\t'"note=WATCHDOG_NO_RESTART is set — the platform restart verb was NOT invoked"
+    log_line "verdict=RESTART-SUPPRESSED"$'\t'"note=WATCHDOG_NO_RESTART is set — the platform restart verb was NOT invoked"
     return 0
   fi
   case "$(uname -s 2>/dev/null)" in
@@ -315,10 +315,16 @@ restart_stack() {
       [ -n "$sup" ] || { [ -f "$O/cloud-cell-supervisor.sh" ] && sup="$O/cloud-cell-supervisor.sh"; }
       [ -n "$sup" ] || { [ -f "$SELF_DIR/../cloud-cell-supervisor.sh" ] && sup="$SELF_DIR/../cloud-cell-supervisor.sh"; }
       if [ -n "$sup" ] && [ -f "$sup" ]; then
-        bash "$sup" start >>"$LOG" 2>&1 || rc=$?
+        # ⛔ PIN `ORCH_FOREGROUND=0` (review P2, #2402). A watchdog that itself runs INSIDE a service-managed
+        # controller's environment inherits `Environment=ORCH_FOREGROUND=1` from the unit (it is exported into
+        # the whole controller tree, and a tmux server started by that controller carries it to every lane
+        # shell). Inherited, `start` takes the FOREGROUND branch: it parks inside the handover wait for up to
+        # CONTROLLER_HANDOVER_TIMEOUT instead of delegating to the unit — the same inheritance the doctor pins
+        # against, at a call site the doctor's pin cannot reach.
+        ORCH_FOREGROUND=0 bash "$sup" start >>"$LOG" 2>&1 || rc=$?
       else
         rc=127
-        say "verdict=RESTART-UNAVAILABLE"$'\t'"note=no $O/cloud-cell-supervisor.sh and no SUPERVISOR set — nothing was restarted"
+        log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=no $O/cloud-cell-supervisor.sh and no SUPERVISOR set — nothing was restarted"
       fi ;;
   esac
   return "$rc"
@@ -396,7 +402,7 @@ status_show() {
 main() {
   mkdir -p "$STATE_DIR" 2>/dev/null
   rotate_log
-  [ -n "$_bad" ] && say "verdict=BOUND-FALLBACK"$'\t'"note=non-numeric bound(s) ignored, defaults used:$_bad"
+  [ -n "$_bad" ] && log_line "verdict=BOUND-FALLBACK"$'\t'"note=non-numeric bound(s) ignored, defaults used:$_bad"
 
   # ⛔ `announced` is LOCAL: as a global it was inherited from the environment, and `env announced=1`
   # made the probe path suppress the generic decision line — a real restart with NO line saying it
@@ -413,7 +419,7 @@ main() {
   hb_is_fresh() { [ "${1:-missing}" != "missing" ] && [ "$1" -le "$HB_STALE" ]; }
 
   if hb_is_fresh "$age" && [ -n "$pid" ]; then
-    say "verdict=HEALTHY"$'\t'"pid=$pid"$'\t'"heartbeat=${age}s"
+    log_line "verdict=HEALTHY"$'\t'"pid=$pid"$'\t'"heartbeat=${age}s"
     [ -f "$STREAK_FILE" ] && rm -f "$STREAK_FILE" 2>/dev/null   # a live cycle ends the streak
     return 0
   fi
@@ -424,7 +430,7 @@ main() {
   # It is not HEALTHY either (the contract requires a pid), so it is UNCERTAIN: reported, never restarted,
   # and the streak is NOT cleared — a repeat is still a repeat.
   if hb_is_fresh "$age" && [ -z "$pid" ]; then
-    say "verdict=UNCERTAIN"$'\t'"pid=none"$'\t'"heartbeat=${age}s"$'\t'"restart=0"$'\t'"reason=the heartbeat is ${age}s old (limit ${HB_STALE}s) so the loop IS cycling, but no pid could be identified — NOT restarted (killing a cycling controller on a bookkeeping miss is the P0); check $O/.orch.lock"
+    log_line "verdict=UNCERTAIN"$'\t'"pid=none"$'\t'"heartbeat=${age}s"$'\t'"restart=0"$'\t'"reason=the heartbeat is ${age}s old (limit ${HB_STALE}s) so the loop IS cycling, but no pid could be identified — NOT restarted (killing a cycling controller on a bookkeeping miss is the P0); check $O/.orch.lock"
     return 0
   fi
 
@@ -458,12 +464,12 @@ main() {
       if printf '%s' "$episode" 2>/dev/null > "$EPISODE_FILE"; then
         :
       else
-        say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $EPISODE_FILE — this pass keeps the previous episode number so its evidence is deduped, not duplicated"
+        log_line "verdict=PERSIST-FAILED"$'\t'"note=cannot write $EPISODE_FILE — this pass keeps the previous episode number so its evidence is deduped, not duplicated"
         episode=$(( episode - 1 ))
       fi
     fi
   else
-    say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE — the restart cap cannot be counted, so restarting is treated as EXHAUSTED for this pass (fail closed)"
+    log_line "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE — the restart cap cannot be counted, so restarting is treated as EXHAUSTED for this pass (fail closed)"
     streak=$(( MAX_CONSEC + 1 ))
   fi
 
@@ -485,7 +491,7 @@ main() {
       # The countdown is stated as the ABSOLUTE observation index the probe falls on (`2N+1`), which is
       # the one number a reader can verify against the streak beside it. (`2N - streak` would be the
       # remaining stopped passes, off by one against this index; not worth a second formula.)
-      say "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=restart ${streak} would exceed the consecutive cap (${MAX_CONSEC}) — restarting disabled for this episode; crash at $CRASH_FILE; the next probe comes on observation $(( MAX_CONSEC * 2 + 1 )) of this episode (${streak} so far)"
+      log_line "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=restart ${streak} would exceed the consecutive cap (${MAX_CONSEC}) — restarting disabled for this episode; crash at $CRASH_FILE; the next probe comes on observation $(( MAX_CONSEC * 2 + 1 )) of this episode (${streak} so far)"
       return 0
     fi
     # ⛔ THE PROBE DOES NOT RE-ARM A FULL BUDGET. It continues the SAME episode with the budget already
@@ -501,20 +507,20 @@ main() {
     # restarted — one restart per pass, for ever (measured in review with a fault-injected write; the
     # log claimed fail-closed the whole time). A cap that cannot be recorded is a cap that is spent.
     if ! printf '%s' "$streak" 2>/dev/null > "$STREAK_FILE"; then
-      say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE after a probe — the probe is NOT issued (a restart the cap cannot count is the tight loop this file exists to prevent)"
+      log_line "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE after a probe — the probe is NOT issued (a restart the cap cannot count is the tight loop this file exists to prevent)"
       return 0
     fi
-    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=observation ${obs} of this episode (> 2x${MAX_CONSEC}) — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next probe comes $((${MAX_CONSEC} + 1)) passes after this one)"
+    log_line "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=observation ${obs} of this episode (> 2x${MAX_CONSEC}) — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next probe comes $((${MAX_CONSEC} + 1)) passes after this one)"
     announced=1          # the decision is already stated; do not state it twice
   fi
 
-  [ "${announced:-0}" = "1" ] || say "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"reason=$reason"
+  [ "${announced:-0}" = "1" ] || log_line "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"reason=$reason"
 
   # ── 4. ONE restart, then PROVE it after a settle window. Never a second restart in this pass: a
   #       loop that restarts until something looks healthy is the behaviour this file replaces.
   restart_stack || rc=$?
   if [ "$rc" -ne 0 ]; then
-    say "verdict=RESTART-FAILED"$'\t'"pid=${pid:-none}"$'\t'"rc=$rc"$'\t'"note=the platform restart verb failed; nothing else was attempted"
+    log_line "verdict=RESTART-FAILED"$'\t'"pid=${pid:-none}"$'\t'"rc=$rc"$'\t'"note=the platform restart verb failed; nothing else was attempted"
     return 0
   fi
   [ "$SETTLE" -gt 0 ] && "$SLEEP_BIN" "$SETTLE" 2>/dev/null
@@ -522,14 +528,14 @@ main() {
   local pid2 age2
   pid2="$(controller_pid)"; age2="$(hb_age)"
   if hb_is_fresh "$age2" && [ -n "$pid2" ]; then
-    say "verdict=RECOVERED"$'\t'"pid=$pid2"$'\t'"heartbeat=${age2}s"$'\t'"note=cycling after one restart"
+    log_line "verdict=RECOVERED"$'\t'"pid=$pid2"$'\t'"heartbeat=${age2}s"$'\t'"note=cycling after one restart"
     rm -f "$STREAK_FILE" 2>/dev/null
   else
     # ⛔ NOT a second restart, and NOT a cleared streak: the next pass observes again, and N of those
     # in a row is what stops the loop. A restart that did not cure the wedge is the ONLY evidence that
     # restarting is useless, so it must be reported (and it is the last moment the output is still on
     # disk for the crash record).
-    say "verdict=STILL_NOT_CYCLING"$'\t'"pid=${pid2:-none}"$'\t'"heartbeat=${age2}s"$'\t'"note=one restart did not restore cycling (no second restart in this pass)"
+    log_line "verdict=STILL_NOT_CYCLING"$'\t'"pid=${pid2:-none}"$'\t'"heartbeat=${age2}s"$'\t'"note=one restart did not restore cycling (no second restart in this pass)"
   fi
   return 0
 }

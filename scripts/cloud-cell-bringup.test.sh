@@ -73,6 +73,12 @@
 
 set -uo pipefail
 
+# #2235: the suite must not inherit an ambient repo selector. gh gives `GH_REPO` precedence over the
+# checkout for every call that omits `--repo`, so a value exported by the developer's shell (or by a
+# cell's keys.env) would be judged against every fixture checkout's origin — reddening unrelated arms
+# and letting this harness carry the very defect the new conformance arm exists to catch.
+unset GH_REPO
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRINGUP="$HERE/cloud-cell-bringup.sh"
 
@@ -83,9 +89,28 @@ skip() { SKIP=$((SKIP + 1)); echo "  ⏭ SKIPPED — $1"; }
 say_case() { echo; echo "── $1 ──"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-1718.XXXXXX")"
+# The scheduled layer (agent-infra#1864) runs the declarations it is pointed at, so it is pointed at
+# a HERMETIC fixture here: without TEMPLATES_DIR the shipped templates would run the REAL reapers
+# (pi-reap-idle.sh is armed with REAP_DRY_RUN=0) against this host, which is not a test. The loop is
+# stopped on the way out — a detached loop outlives the suite otherwise and keeps ticking at a
+# deleted directory.
+export TEMPLATES_DIR="$T/schedule-templates"
+mkdir -p "$TEMPLATES_DIR"
+printf '# fixture: nothing retired\n' > "$TEMPLATES_DIR/RETIRED"
+cat > "$TEMPLATES_DIR/com.test.bringup-schedule.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.test.bringup-schedule</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/sh</string><string>-c</string><string>echo ran >> "$T/schedule-marker"</string></array>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
 # `chmod -R u+w` first: one case makes a parent directory unwritable to force `rm -f` to fail, and
 # the suite must still be able to clean up after itself.
-trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
+trap 'HOME="$T/home" CELL_HOME="$T/home" TEMPLATES_DIR="$T/schedule-templates" python3 "$HERE/fleet-schedule.py" --stop >/dev/null 2>&1; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
 
 if [ -f "$BRINGUP" ]; then ok "shipped script present: cloud-cell-bringup.sh"
 else bad "missing $BRINGUP"; echo; echo "  PASS=$PASS FAIL=$FAIL"; exit 1; fi
@@ -198,8 +223,23 @@ printf '#!/bin/sh\nmode="${GH_STUB_MODE:-ok}"\ncase "$1 $2" in\n  "auth login") 
 # SYSTEMCTL_STUB_MODE=fail makes `daemon-reload`/`enable` refuse, which is the shape of a cell whose
 # scheduler cannot be armed — the bring-up must refuse that cell rather than certify it.
 export SYSTEMD_UNIT_DIR="$T/systemd-units"
+# ⛔ THE READ SIDE TOO, OR THE SUITE CHANGES THE HOST (review P2, #2402). `SYSTEMD_UNIT_DIR` is the
+# installer's WRITE seam; `installed_units`/`find_installed_unit` READ `${CONTROLLER_SYSTEM_UNIT_DIR:-
+# /etc/systemd/system}` and `$HOME/.config/systemd/user`, and `--install` refuses when a second copy is
+# already installed. Pinning only the write side left every read-back arm reading this box — so on any cell
+# that has run install-controller-service.sh (the exact box shape this PR creates) the new controller check
+# sees a foreign copy, `--install` refuses, and the bring-up dies on its own deployment target. The
+# installer's own suite pins both seams for the same reason; HOME is pinned with them because the user-scope
+# directory is derived from it.
+export CONTROLLER_SYSTEM_UNIT_DIR="$T/systemd-units"
+export HOME="$T/home"
+# The one-home check (#2916) refuses a cell-state path under a volatile root that is NOT under
+# CELL_HOME. This fixture's home IS under the host's temp dir, so the shipped default (`/tmp:/var/tmp`)
+# would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
+# SYSTEMD_UNIT_DIR above; the shipped default is what cloud-cell-bringup.verify.test.sh's red arms use.
+export CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root
 export SYSTEMCTL="$STUB/systemctl"
-printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *show*) echo 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
+printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
@@ -226,7 +266,7 @@ printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"   # header onl
 printf '60\n' > "$T/swappiness"                                     # the image default, so the pin is a CHANGE
 SWAP_LOG="$T/swap-calls.log"
 # `fallocate` allocates SPARSELY for the fixture (dd seek), so a 4 GiB request costs no disk here.
-printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nn="${sz%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || : > "$f"\nexit 0\n' > "$STUB/fallocate"
+printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\nn="${sz%%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || exit 1\n[ "$(wc -c < "$f")" = "$((n * 1048576))" ] || exit 1\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nexit 0\n' > "$STUB/fallocate"
 printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "mkswap $*" >> "$SWAP_STUB_LOG"\nexit 0\n' > "$STUB/mkswap"
 # `swapon <file>` appends a REAL /proc/swaps row (path, type, size_kb, used_kb, prio) to the fixture,
 # so the script's own reading of the swap record is what the case asserts on. `--show` is only there
@@ -236,7 +276,15 @@ printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "swapoff $*" >> "$SWAP_ST
 printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "sysctl $*" >> "$SWAP_STUB_LOG"\nfor a in "$@"; do case "$a" in vm.swappiness=*) printf "%%s\\n" "${a#vm.swappiness=}" > "$SWAP_SYSCTL_FILE" ;; esac; done\nexit 0\n' > "$STUB/sysctl"
 chmod +x "$STUB"/*
 # ── fixtures: a HOME, a pre-existing clone (so check_repo never reaches the network), a keys.env ──
-mkdir -p "$T/home" "$T/cell/.git" "$T/tok"
+mkdir -p "$T/home" "$T/tok"
+# ⛔ A REAL CHECKOUT, NOT AN EMPTY `.git` DIRECTORY (measured on CI, 2026-10-24). `mkdir -p "$T/cell/.git"`
+# is not a repository: real git refuses it, so the disk-reaper installer's `git -C <path> rev-parse
+# --git-dir` dropped the ONLY candidate it could have scanned and refused to install. Locally that was
+# masked because the developer shell exports AGENT_INFRA_PATH, which the installer accepted instead —
+# the arm then asserted a unit whose DISK_REAPER_REPOS named the DEVELOPER'S checkout, not the cell's.
+git init -q "$T/cell" >/dev/null 2>&1 || { echo "fixture: git init failed" >&2; exit 1; }
+git -C "$T/cell" -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false \
+    commit -q --allow-empty -m fixture >/dev/null 2>&1 || { echo "fixture: git commit failed" >&2; exit 1; }
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
 TOK="$T/tok/.gh-tok"
 printf 'ghp_FAKE_PUSH_CAPABLE_TOKEN\n' > "$TOK"   # (re-created per case; asserted deleted after)
@@ -278,7 +326,37 @@ export HARNESS_REPO="$INFRA" GIT_STUB_REAL=1
 # in BR_RC and combined output in BR_OUT, exactly as cloud-cell-supervisor.test.sh does.
 BR_RC=0; BR_OUT=''
 br() {
-  BR_OUT="$(PATH="$STUB:$PATH" \
+  # ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} is expanded UNQUOTED on purpose (it carries `NAME=value` pairs), so a
+  # value with whitespace would make `env` treat the remaining words as the command: the bring-up never
+  # runs, `env` exits 127, and an arm asserting only a non-zero rc passes VACUOUSLY. Refuse it here.
+  case "${BR_EXTRA_ENV:-}" in
+    *[[:space:]]*) echo "fixture: BR_EXTRA_ENV must not contain whitespace (got '$BR_EXTRA_ENV')" >&2; exit 1 ;;
+  esac
+  # ⛔ HERMETIC FROM THE BOX (measured on a fresh CI runner, 2026-10-24). Every ambient repo variable is
+  # CLEARED here, because the disk-reaper installer falls back to them when nothing tells it which repo
+  # to scan: with $AGENT_INFRA_PATH exported by a developer's shell the install succeeded locally while
+  # the SAME suite failed 24 arms on CI, where nothing is exported — a host dependency wearing a test's
+  # clothes. With them cleared, the only repo the installer can learn about is the one the bring-up
+  # passes from its own verified checkout, which is what the `Environment=DISK_REAPER_REPOS=` arm asserts.
+  # `-u DEEPSEEK_API_KEY` for the SAME reason as the repo vars: on a developer's box the provider key is
+  # exported and the run sails past `check_provider`, while on a bare runner the identical invocation
+  # dies there - measured 2026-10-24, where the GH_REPO-ordering arm asserted an `ok: gh login` line the
+  # CI run never reached (the key it needed came from the author's shell, not from the fixture). An arm
+  # that needs a key must pass one explicitly (`BR_EXTRA_ENV=...`), so no arm silently inherits one.
+  # BOTH provider keys the bring-up accepts (`cloud-cell-bringup.sh`: it refuses only when NEITHER is
+  # set), so an ambient `ANTHROPIC_API_KEY` cannot stand in for the fixture's either — measured: with
+  # only that key ambient, the pre-fix ordering arm PASSED locally for the wrong reason.
+  # `GH_REPO` too: an operator shell exporting the fleet's slug would let the "a GLOBAL GH_REPO pushed
+  # in keys.env is DROPPED" arm stay green even with its own post-source drop deleted (measured: the
+  # mutated bring-up still passed that arm as `GH_REPO=daniel-ospina/tortoise` ambient, and reddened
+  # without it). The one arm that needs an ambient slug asks for it by name.
+  # `INFRA_ROOT` is cleared for the same reason as the others: the bring-up tries it FIRST when it
+  # resolves the infra checkout, so a developer shell that exports it makes the layer arms grade a
+  # DIFFERENT checkout (measured: an ambient decoy's installer ran and the suite still reported 142/0).
+  BR_OUT="$(env -u AGENT_INFRA_PATH -u INFRA_ROOT -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
+            -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
+            PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" GH_REPO="${BR_GH_REPO:-}" \
+            ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
             REPO_SLUG="daniel-ospina/tortoise" \
@@ -355,6 +433,24 @@ case "$BR_OUT" in
   *"disk reaper scheduled"*) ok "bring-up INSTALLS and reports the disk reaper timer (#2032)" ;;
   *) bad "bring-up does not schedule the disk reaper — the sinks are unbounded again: $BR_OUT" ;;
 esac
+# #2416 — harness ACTIVATION is scheduled by the same pass, and the bring-up refuses `CELL READY`
+# without it. A cell that runs whatever code it had at its last start is the drift the pass exists to
+# stop, and this step was the only one whose failure mode (an unscheduled clock) is invisible in
+# `status`: the box looks healthy and simply stops receiving every merged harness fix.
+case "$BR_OUT" in
+  *"harness activation scheduled"*) ok "bring-up INSTALLS and reports the harness-apply timer (#2416)" ;;
+  *) bad "bring-up does not schedule harness activation — the cell will run stale code: $BR_OUT" ;;
+esac
+if [ -f "$T/systemd-units/eldato-harness-apply.timer" ]; then
+  ok "the harness-apply timer unit was rendered and installed"
+else
+  bad "no harness-apply timer unit was installed under $T/systemd-units"
+fi
+if grep -q 'ExecStart=/bin/bash .*harness-apply-pass.sh' "$T/systemd-units/eldato-harness-apply.service" 2>/dev/null; then
+  ok "and it runs the pass, not the scheduler's own copy of the logic"
+else
+  bad "the harness-apply unit does not name the pass"
+fi
 if [ -f "$T/systemd-units/eldato-disk-reaper.timer" ]; then
   ok "the timer unit was rendered and installed"
 else
@@ -370,6 +466,60 @@ if grep -q 'Environment=DISK_REAPER_REPOS=' "$T/systemd-units/eldato-disk-reaper
 else
   bad "the unit carries no DISK_REAPER_REPOS — those classes would fail closed every hour"
 fi
+
+say_case "the reaper timer scans the CELL's own checkout, never an ambient \$REPO"
+# ⛔ THIS IS THE ARM THAT PINS THE PRODUCT FIX (measured on a fresh CI runner, 2026-10-24). The installer
+# falls back to ambient variables when nobody tells it which repo to scan — and it REFUSES outright when
+# that fallback yields nothing, which withheld CELL READY on a box that had just cloned its checkout.
+# The bring-up already KNOWS the checkout it verified, so it must say so; an ambient $REPO naming some
+# OTHER checkout must not win. A decoy repo here makes the two answers DIFFERENT, which is what makes the
+# assertion able to fail: without the fix the unit names the decoy.
+git init -q "$T/decoy" >/dev/null 2>&1 || { echo "fixture: git init decoy failed" >&2; exit 1; }
+git -C "$T/decoy" -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false \
+    commit -q --allow-empty -m decoy >/dev/null 2>&1 || { echo "fixture: decoy commit failed" >&2; exit 1; }
+printf '%s\n' "$TOK_BODY" > "$TOK"
+rm -f "$T/systemd-units/eldato-disk-reaper.service" "$T/systemd-units/eldato-disk-reaper.timer"
+BR_AMBIENT_REPO="$T/decoy" br ok normal --check
+case "$(cat "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null)" in
+  *"DISK_REAPER_REPOS=$T/cell"*)
+    ok "the installed unit scans the CELL's checkout the bring-up just verified" ;;
+  *) bad "the installed unit does not scan the cell's checkout — $(grep -h 'DISK_REAPER_REPOS=' "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null || echo 'no unit at all')" ;;
+esac
+case "$(cat "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null)" in
+  *"$T/decoy"*)
+    bad "an ambient \$REPO($T/decoy) was scanned instead of the cell's own checkout — the reaper would reap a repo this cell does not own" ;;
+  *) ok "an ambient \$REPO is NOT substituted for the cell's checkout" ;;
+esac
+
+# #2402 — the CONTROLLER is supervised by a service unit the bring-up INSTALLS and reads back. Without
+# this the installer exists but nothing invokes it, so a rebuilt cell keeps the measured defect (the
+# controller dies with the last tmux session) while the banner says CELL READY.
+case "$BR_OUT" in
+  *"controller supervised"*) ok "bring-up INSTALLS the controller service unit and reports it (#2402)" ;;
+  *) bad "bring-up does not put the controller under a service — the installer is never invoked, so an empty box still loses its dispatcher: $BR_OUT" ;;
+esac
+if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
+  ok "the controller unit was rendered and installed"
+  grep -qxF 'Restart=always' "$T/systemd-units/eldato-orchestrator.service" \
+    && ok "the installed controller unit carries Restart=always (an orderly exit 0 is restarted)" \
+    || bad "the installed controller unit does not carry Restart=always — the measured defect is re-shipped"
+else
+  bad "no controller unit was installed under $T/systemd-units"
+fi
+
+say_case "a cell whose CONTROLLER cannot be supervised is refused (not certified)"
+# A REAL installer that fails is the shape: the fix must not be "install it, ignore the exit code".
+printf '%s\n' '#!/bin/sh' 'echo "installer: no service manager available" >&2' 'exit 1' > "$T/broken-controller-installer.sh"
+chmod +x "$T/broken-controller-installer.sh"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+CONTROLLER_SERVICE_INSTALLER="$T/broken-controller-installer.sh" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero when the controller service cannot be installed (rc=$BR_RC)" \
+                   || bad "bring-up returned 0 with an unsupervised controller"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness on a cell whose controller has nothing above it" ;;
+  *) ok "does not claim CELL READY when the controller is unsupervised" ;;
+esac
+rm -f "$T/broken-controller-installer.sh"
 
 say_case "a cell whose reaper timer cannot be ENABLED is refused (not certified)"
 printf '%s\n' "$TOK_BODY" > "$TOK"
@@ -612,6 +762,68 @@ esac
 case "$BR_OUT" in
   *"CELL READY"*) ok "the repaired cell reaches CELL READY" ;;
   *) bad "the repaired cell never reaches CELL READY — output: $BR_OUT" ;;
+esac
+# ── 2c) the SCHEDULED layer (#1864): a cell that comes up has jobs that RUN ──────────────────────
+# The measured defect was a whole layer that never reached the cells (10 plists, 0 live) and no
+# instrument that said so. The acceptance is therefore a RUN, not a loaded unit or a present file:
+# a stamp with an rc plus a fresh log line, produced by the job itself.
+say_case "the scheduled layer is installed AND proven by a run (#1864)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+# Make the fixture job DUE again: it already ran on the earlier clean runs and its interval is an
+# hour, so without clearing the stamp this case would assert on a job that had nothing to do — and
+# pass for the wrong reason. (A never-run job is due immediately, which is the same path a fresh
+# cell takes.)
+rm -f "$T/schedule-marker" \
+      "$T/home/.pi/agent/state/fleet-schedule/jobs/com.test.bringup-schedule.json"
+br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "bring-up still exits 0 with the scheduled layer" \
+                   || bad "bring-up FAILED on the scheduled layer (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"scheduled layer live: SCHEDULE VERIFIED"*) ok "it reports the scheduler's own verified verdict" ;;
+  *) bad "no verified schedule verdict in the bring-up output — output: $BR_OUT" ;;
+esac
+[ -f "$T/schedule-marker" ] && ok "the declared job actually RAN during bring-up (its own marker exists)" \
+                            || bad "no job ran — 'scheduled' would be believed, not proven"
+log="$T/home/.pi/agent/state/fleet-schedule/logs/com.test.bringup-schedule.log"
+grep -q 'fleet-schedule run com.test.bringup-schedule start' "$log" 2>/dev/null \
+  && ok "the run left a fresh log line at $log" || bad "no run log line at $log"
+[ ! -e "$TOK" ] && ok "the token is still removed on this path" || bad "token SURVIVED the scheduled-layer run"
+
+# ── 2d) a scheduled layer that cannot be honoured REFUSES the cell ──────────────────────────────
+# A "CELL READY" over a cell with no reaping/liveness/canary is the false PASS this whole script
+# exists to remove, so a broken declaration must be fatal. The broken job's target does not exist —
+# the same rule install-launchd.sh applies to a plist ("a dead job must never be installed").
+say_case "a broken job declaration refuses the cell (no false CELL READY)"
+BROKENDIR="$T/schedule-broken"
+mkdir -p "$BROKENDIR"
+printf '# fixture: nothing retired\n' > "$BROKENDIR/RETIRED"
+cat > "$BROKENDIR/com.test.broken.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.test.broken</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/sh</string><string>{{HOME}}/.pi/agent/scripts/cell-bringup-1864-missing.sh</string></array>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_OUT="$(PATH="$STUB:$PATH" \
+          CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=normal TEMPLATES_DIR="$BROKENDIR" \
+          REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$BRINGUP" --check 2>&1)"
+BR_RC=$?
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero ($BR_RC) on an unhonourable job set" \
+                   || bad "bring-up returned 0 over a job set it could not schedule"
+case "$BR_OUT" in
+  *"broken target"*) ok "the failure names the broken target" ;;
+  *) bad "the failure is not diagnosable — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness with no working scheduled layer" ;;
+  *) ok "never claims CELL READY with a broken schedule" ;;
 esac
 
 # ── 3) an abort BEFORE check_gh is reached — the window the pre-fix code left open ───────────────
@@ -889,10 +1101,17 @@ say_case "an OPERATOR-SHELL GH_REPO is DROPPED even when keys.env is ABSENT"
 # first cut only ran it AFTER sourcing, and a missing keys.env is a supported non-fatal path — so on
 # exactly the arm with no file to blame, an operator shell's sticky `GH_REPO` survived and every
 # check below graded another repo. Nothing in the suite covered it: every `br …` case writes
-# $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later for the
-# missing provider key — the ORDERING is what proves the drop happened before any check ran).
+# $T/keys.env first. Assert the DROP line, and the ORDERING, on the no-file arm.
+# ⛔ THE PROVIDER KEY MUST COME FROM SOMEWHERE (measured on the CI runner, 2026-10-24): this arm used to
+# rely on the CALLER's shell exporting it, so `ok: gh login` -- the first repo-reading check the ordering
+# is anchored on -- never printed on CI and the assertion could not observe the claim it makes
+# (`drop=3 check=none`), while passing on the author's box. The scenario it models is "the operator's
+# shell carries the key, keys.env is absent", so the key is supplied the way that operator would: in the
+# ENVIRONMENT (BR_EXTRA_ENV), never in the file this arm proves is absent. `br()` clears the ambient
+# keys, so an arm that needs one asks for it by name.
 rm -f "$T/absent.env"
-BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" br ok normal --check
+BR_ENV_FILE="$T/absent.env" BR_GH_REPO="daniel-ospina/tortoise" BR_EXTRA_ENV="DEEPSEEK_API_KEY=fake" \
+  br ok normal --check
 case "$BR_OUT" in
   *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the operator-shell GH_REPO is dropped and NAMED with keys.env ABSENT" ;;
   *) bad "with keys.env absent, bring-up did not drop an operator-shell GH_REPO — output: $BR_OUT" ;;
@@ -913,7 +1132,7 @@ printf 'DEEPSEEK_API_KEY=fake\nexport REPO=daniel-ospina/tortoise\n' > "$T/keys.
 printf '%s\n' "$TOK_BODY" > "$TOK"
 br ok normal --check
 case "$BR_OUT" in
-  *"REPO='daniel-ospina/tortoise' is not an absolute path"*) ok "an owner/name REPO is named, not silently accepted (a `*/*` test made this arm unreachable)" ;;
+  *"REPO='daniel-ospina/tortoise' is not an absolute path"*) ok "an owner/name REPO is named, not silently accepted (a '*/*' test made this arm unreachable)" ;;
   *) bad "bring-up accepted REPO=daniel-ospina/tortoise without a word — the guard is inert for the class it names: $BR_OUT" ;;
 esac
 printf 'DEEPSEEK_API_KEY=fake\nexport REPO=/srv/cell/checkout\n' > "$T/keys.env"
@@ -1243,7 +1462,54 @@ else
   bad "swap_target_mb() is no longer extractable from the shipped script"
 fi
 
+# ── 16) the ARMING PREDICATE, driven from the shipped function ────────────────────────────────
+# #2164: a cell reported CELL READY while every lane on it logged `#984 … only the string scanner is
+# active`. The ready path now conditions its claim on the layer's own activation line, and the
+# direction of that condition is the whole point — read backwards it certifies a DISARMED cell as
+# armed, which is the defect. Driven from the shipped predicate (extracted, not re-derived), and
+# driven in BOTH directions so a predicate that always answers the same way cannot pass.
+say_case "arming predicate: a DISARMED activation line is DEGRADED, an armed one is not"
+sed -n '/^gh_shim_disarmed() {/,/^}/p' "$BRINGUP" > "$T/shimsed.sh"
+if [ -s "$T/shimsed.sh" ]; then
+  ( . "$T/shimsed.sh"
+    armed='activation: gh shim PRESENT at /home/cell/.pi/agent/gate-bin/gh'
+    disarmed='activation: gh shim PRESENT at /home/cell/.pi/agent/gate-bin/gh (DISARMED: AGENT_GH_SHIM=0)'
+    absent='activation: (none) gh shim absent — string scanner only'
+    gh_shim_disarmed "$armed"    && printf '1' || printf '0'
+    gh_shim_disarmed "$disarmed" && printf '1' || printf '0'
+    gh_shim_disarmed "$absent"   && printf '1' || printf '0'
+  ) > "$T/shim.out"
+  got=$(cat "$T/shim.out")
+  # armed=0 (the caller's else: NOT degraded), DISARMED=1 (the caller's warn arm), absent=0 — an
+  # absent shim is settled by `--verify`'s rc=0 before this predicate is ever consulted.
+  [ "$got" = "010" ] \
+    && ok "armed->NOT degraded, DISARMED->DEGRADED, no activation line->not this predicate's call" \
+    || bad "the arming predicate is INVERTED or blind: got '$got', expected '010' (armed, DISARMED, absent)"
+else
+  bad "gh_shim_disarmed() is no longer extractable from the shipped script"
+fi
+
 echo
+say_case "the controller check resolves the installer from the LAYER, not from where this script was pushed"
+# ⛔ A REAL CELL RUNS THIS SCRIPT FROM /tmp (pushed standalone), and the installer is not in the farm list:
+# a check that only looks "beside this script" (or in $HOME/.pi/agent/scripts) therefore DIED on every
+# provisioned cell — killing the bring-up it was added to protect. Resolution must use the layer checkout
+# check_operational_layer just installed, which is what this arm pins.
+mkdir -p "$T/standalone"
+cp "$BRINGUP" "$T/standalone/cloud-cell-bringup.sh"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+SA_RC=0
+SA_OUT="$(PATH="$STUB:$PATH" CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" GH_STUB_MODE=ok CURL_STUB_MODE=normal \
+          INFRA_ROOT="$(cd "$HERE/.." && pwd)" REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$T/standalone/cloud-cell-bringup.sh" --check 2>&1)" || SA_RC=$?
+case "$SA_OUT" in
+  *"controller supervised"*) ok "a standalone-pushed bring-up finds the installer in the layer checkout" ;;
+  *"install-controller-service.sh not found"*) bad "a standalone-pushed bring-up cannot find the installer — every cell bring-up dies at the controller check" ;;
+  *) bad "the standalone run did not reach the controller check (rc=$SA_RC): $(printf '%s' "$SA_OUT" | tail -6 | tr '\n' ' ')" ;;
+esac
+rm -rf "$T/standalone"
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"
 if [ "$SKIP" -gt 0 ]; then

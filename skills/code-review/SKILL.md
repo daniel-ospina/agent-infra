@@ -594,9 +594,11 @@ Treat this as authoritative; weigh findings against it. Downgrade reviewer recom
 
 Resolve the change's **risk class** and extract complexity ratings from the linked issue, then detect file surfaces from the PR diff. The class caps the reviewer **count**; surfaces and ratings select which **sections** of a merged reviewer's brief apply (Step 4).
 
+**0a. Resolve the REVIEW CLASS — which questions this review asks (agent-infra#2861):** read **every** `### Review Scope Contract` block in the PR and each block's `Class:` line, and set `REVIEW_CLASS` to the **list**, one entry per block (`protocol; gate-enforcement`) (named distinctly from `check-pipeline-compliance.sh`'s `ARTIFACT_CLASS`, which is the docs-only *diff* class — two meanings for one name is how a reader confuses them), and route the question set through `review-discipline` (artifact class → canon → questions). **This is an output, not a paragraph**: export `REVIEW_CLASS` **and, when any resolved block is `gate-enforcement` whose `Threat classes` sub-block is present and is not the `(not adversarial)` sentinel, `export ADVERSARIAL_BOUND=1`** — that export is what arms the 2-cycle bound for a change shipped by `task-workflow-standard`, which declares its threat surface as a contract sub-block and never as a scoping `### Adversarial Threat Surface` (default `code` + `class-uncertain` when no block resolves, and the same for a compound/ambiguous `Class:` line), echo it, and pass it into each Step 4 reviewer brief as `REVIEW_CLASS: <class>. Questions your class asks: <from review-discipline>. Questions it must NOT ask: <…>` — a class that is resolved and never handed to the panel is decoration. **A multi-block contract is not reduced to one class:** suppressing a block's questions is exactly how the `gate-enforcement` block of a protocol change gets silently dropped (`review-discipline` §"Two classes match the same path?"), so the list is carried whole and the verdict is reported per block. The class **never** changes the reviewer count (that is Step 0 below) — it changes **what the panel is asked**: `docs-marketing` is reviewed for alignment with the marketing canon and must not be asked for code correctness or absolute factual correctness; `gate-enforcement` is asked whether the gate can fail open and whether every declared threat class is covered, with `THREAT SURFACE COVERED` as its clean exit. Acceptance is **coverage of the contract's `R<n>` surface**, not a cycle count: an uncovered `R<n>` blocks however many rounds ran. No contract in the PR and none in the linked issue's plan comment → treat the class as `code` and record `class-uncertain: <why>` in the review output.
+
 **0. Resolve the risk class — BEFORE dispatch (do not skip):**
 
-Classify the **change** with `proportional-gates` §Change Classification (overall risk = the highest dimension), and read the reviewer count and cycle cap from `proportional-gates` §Review Cycles — the **single owner** of reviewer counts and cycle caps. Do **not** restate its cells here. This step must produce **one** of the four values §Review Cycles' own row labels name, and Step 4 consumes that exact value:
+Classify the **change** with `proportional-gates` §Change Classification (overall risk = the highest dimension), and read the reviewer count and cycle cap from `proportional-gates` §Review Cycles — the **single owner** of the **code panel's** reviewer counts and cycle caps. (The pre-code `PLAN-VERIFY` verifier count in `task-workflow-standard` is a different gate and takes its count from `issue-scoping` §Tier Scaling; `review-discipline` §Boundaries states the exception.) Do **not** restate its cells here. This step must produce **one** of the four values §Review Cycles' own row labels name, and Step 4 consumes that exact value:
 
 | Classification result (overall = the highest dimension) | `RISK_CLASS` |
 |---|---|
@@ -665,7 +667,7 @@ a slot in the capped panel. A surface match must never increase the number of re
 | `DATA_TOUCHED` | schema-correctness section | same | + ontology-alignment section | **C** |
 | `CONFIG_TOUCHED` | config-validation section | — | — | **D** |
 
-Store all variables (`RISK_CLASS`, `UX_RATING`, `ARCH_RATING`, `ONTOLOGY_RATING`, the four
+Store all variables (`RISK_CLASS`, `REVIEW_CLASS`, `UX_RATING`, `ARCH_RATING`, `ONTOLOGY_RATING`, the four
 `*_TOUCHED` flags, and `INFRA_RISK`) for Step 4 dispatch.
 
 > Whether a matched surface reviewer actually **runs** is Step 4's panel cap: at the smaller
@@ -785,7 +787,7 @@ if [ -n "$INFRA_RISK" ]; then
   echo "[code-review] Infrastructure files detected (risk: $INFRA_RISK) — dispatching reviewer E; the tier scales depth inside it"
 fi
 
-echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} panel_max=$PANEL_MAX — dispatching: $AGENTS"
+echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} REVIEW_CLASS=${REVIEW_CLASS:-<unset>} ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0} panel_max=$PANEL_MAX — dispatching: $AGENTS"
 ```
 
 > ⛔ **A surface match is not a reviewer.** `UI_TOUCHED`/`ARCH_TOUCHED`/`DATA_TOUCHED`/
@@ -796,6 +798,14 @@ echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} panel_max=$PANEL_MAX — d
 
 **Shared dispatch preamble — inject into EVERY reviewer prompt below** (#1141):
 ```
+REVIEW_CLASS: <resolved in Step 3.6 / 0a — one value PER BLOCK, e.g. `protocol; gate-enforcement`>.
+  Questions each class asks (under its own class):
+  <that class's questions, from `review-discipline`>. Questions each must NOT ask:
+  <same row>. Your remit is the contract's declared risk surface (R1..Rn) **plus** any
+  finding that is (a) caused by the diff, (b) newly reachable or value-bearing because
+  of it, or (c) purpose-defeating. Anything else is OUT-OF-SCOPE: recorded, never
+  looped on. Acceptance is coverage of that surface, not a cycle count. If no contract
+  reached you, say `class-uncertain: <why>` in your output and review as `code`.
 ISOLATED CHECKOUTS — never copy the repo. If your review needs a checkout other
 than the one you are in (e.g. to run a check or probe the PR branch), get it with
     bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> [--paths <p1,p2> | --full] -- <cmd...>
@@ -1300,12 +1310,11 @@ For each cycle:
 
    c. **Zero-progress**: Track `files_changed_per_cycle`. If files changed = 0 for 2 consecutive cycles, the fixer is making zero code progress. Exit reason = `zero-progress`. Escalate to human. (Previously mapped onto `fingerprint-stall`, which made three distinct conditions indistinguishable in the persisted record.)
 
-**Adversarial domain — declared threat surface (bound: 2 cycles).** Engages when the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code: argv/path/symlink resolution, working-tree discard, merge/verify gates — anything whose correctness is "an attacker cannot make it fail open").
+**Adversarial domain — declared threat surface (bound: 2 cycles).** Engages when the change declares a threat surface in **either** form: a `**Threat classes**` sub-block of a `### Review Scope Contract` (the shape `task-workflow-standard` writes, and the one 0a sees), **or** a scoping comment carrying a legacy `### Adversarial Threat Surface` declaration (gate/enforcement code: argv/path/symlink resolution, working-tree discard, merge/verify gates — anything whose correctness is "an attacker cannot make it fail open").
 
 - **Acceptance** = every in-scope threat class has a test that fails without the fix, plus green CI — *not* "the reviewer ran out of ideas". The scoping declaration is the reference: the reviewer verifies each listed class is covered and tries to reproduce an in-scope bypass.
 - **Clean-exit verdict:** a fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) satisfies the clean-exit conditions below. A literal `NO ISSUES FOUND` is *not* required — never manufacture one.
-- **Cap: at most 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported (the reference's
-  pre-loop setup reads it; unset → the change's own class cap). It **tightens** the class's cap and
+- **Cap: at most 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported — **0a sets it that way when a resolved `REVIEW_CLASS` entry is `gate-enforcement` and carries a `Threat classes` sub-block**, so the class the router already resolves is what arms the bound; without that, the bound is inert for exactly the changes this pipeline produces. **Note on `references/fixer-loop.md`'s L1 comment:** it still reads "from the scoping declaration" and is **byte-pinned verbatim** by `tier-config-parity.test.ts` ("the approved L1 fence is present verbatim, exactly once"), so it is not edited here — this paragraph is the authoritative statement of what the export reads, and the pinned wording is retired with the cap in sequence step 2 (#2861 §11). It **tightens** the class's cap and
   never widens it, so `High` → 2 and a tighter class cap (e.g. `low`'s `—`) stays as it is. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
 - **Disclose:** when the merge rests on threat-list coverage rather than `NO ISSUES FOUND`, the PR body must carry `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>` and the report must say so in plain words. Exit reason: `adversarial-capped`. <!-- adversarial-bound: cap=2 -->
 
@@ -1681,8 +1690,39 @@ fi
   `ai-review-gate` workflow and turns the check green (the marker is HMAC-signed;
   see the workflow header in `.github/workflows/ai-review-gate.yml`).
 - If the PR head moves AFTER recording (fix commits, merge of main), the gate
-  turns red again: re-review the new head and re-record. NEVER re-record a moved
-  head without a fresh review — the gate binds the full head sha.
+  turns red again: re-review the new head and re-record — UNLESS a carry arm
+  proves the reviewed artifact is unchanged (the same three-dot DIGEST, or a
+  base-only move — the base advanced, YOUR OWN commits did not, or #1377: the
+  rendered diff moved but the reviewed PATCH is byte-identical), AND the target
+  head is not measurably red (#1575 clause E refuses the carry; re-run the
+  failing checks and re-record instead), in which case nothing is owed: pass
+  the recorded head and the recorded verdict to `record-review.sh` and it
+  re-binds (`mint:"carried"`, no `--evidence`). See
+  `commit-workflow/workflow/04-merge-deploy.md` condition 6. NEVER re-record a
+  moved head with a CHANGED artifact without a fresh review — the gate binds the
+  full head sha.
+- **A HEAD MOVE WITH AN UNCHANGED PATCH OWES A RE-RECORD, NOT A REVIEW (#1377).**
+  The review is a review OF THE DIFF. When `main` lands work that rewrites the
+  hunk CONTEXT around your change, the rendered diff moves even though every
+  line you submitted is byte-identical; asking a reviewer to look again can only
+  re-earn a verdict the diff already has. Ask first:
+
+  ```bash
+  ~/.pi/agent/scripts/record-review.sh --check-carry <pr> <owner/repo>
+  #   carry        0  the gate carries the record as-is → land it
+  #   carry-patch  6  the RENDERED diff moved, the PATCH did not → RE-RECORD, do not review
+  #   fresh        1  the patch changed → a review really is owed
+  ```
+
+  `carry-patch` is verified by `patch_dimension_carry`: the reviewed diff is
+  RECONSTRUCTED from the prior signed marker's own `@ <sha>` and must reproduce
+  that marker's `diff=` (the anchor), then both sides are projected onto their
+  PATCH identity (blob ids, hunk line numbers and hunk CONTEXT dropped; paths
+  and every `+`/`-` line kept BYTE-EXACT) and compared. Do NOT "just use
+  `git patch-id --stable`": it ignores whitespace, so a whitespace-only edit
+  would carry a verdict it does not deserve (#1362 D1). The token is not
+  `carry` and the exit is not 0 because the merge gate does NOT carry a record
+  whose binding moved — the mechanical re-record is still owed.
 - A saved record with a FAILED evidence post (transient API error) leaves the
   gate red: re-run `record-review.sh` to retry the post (the script warns and
   exits 0 on transient failures).

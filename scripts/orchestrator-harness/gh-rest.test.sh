@@ -31,6 +31,20 @@ if [ "${STUB_ANY_FAIL:-0}" = 1 ]; then
   printf 'gh-limit: gh rate limit (bucket=core reset=1700003600) — FAILED after 4 attempts\n' >&2
   exit 1
 fi
+# §Z: a page LARGER THAN ARG_MAX. Served from a file so the fixture can be megabytes without
+# travelling through this script's own argv (which would hit the very limit under test).
+if [ -n "${STUB_CHECKRUNS_FILE:-}" ]; then
+  case "$*" in *"check-runs"*) cat "$STUB_CHECKRUNS_FILE"; exit 0 ;; esac
+fi
+if [ -n "${STUB_COMMENTS_FILE:-}" ]; then
+  case "$*" in *"/comments"*) cat "$STUB_COMMENTS_FILE"; exit 0 ;; esac
+fi
+# §Z(e): an UNPARSEABLE body with rc 0 — the "a failed read is not an empty surface" contract has to
+# be reachable from the suite, and the only way to make the READ succeed while its BODY is garbage is
+# to serve the garbage. (STUB_STS_FAIL fails the read in bash, which is a different path.)
+if [ -n "${STUB_STATUSES_FILE:-}" ]; then
+  case "$*" in *"/status") cat "$STUB_STATUSES_FILE"; exit 0 ;; esac
+fi
 case "$*" in *"/comments?per_page"*)
   if [ "${STUB_COMMENTS_FAIL:-0}" = 1 ]; then
     printf 'gh-limit: gh rate limit (bucket=core reset=1700003600) — FAILED after 4 attempts\n' >&2
@@ -49,6 +63,9 @@ case "$*" in *"--jq .head.sha"*)
   fi
   printf '%s' '75c0353907f016cf71661d8a6b11f61bf4d5092f'; exit 0 ;; esac
 case "$*" in *"--auto"*) printf 'STUB: delegated auto-merge'; exit 0 ;; esac
+# A DELEGATED `issue view` (PR-numbered target): real gh answers such a number with an OBJECT, and the
+# adapter must pass that answer through untouched. Only the REST path below starts with `repos/`.
+case "$*" in *"issue view 900 "*) printf '%s' '{"number":900,"title":"a pull request","state":"MERGED","stateReason":"","assignees":[],"url":"https://example/900"}'; exit 0 ;; esac
 # POST /comments (pr comment) and GET /comments (pr view --json comments) share a path — split on method.
 case "$*" in *"-X POST"*"/comments"*) printf '{"id":7,"html_url":"https://github.com/o/r/pull/8833#issuecomment-7"}'; exit 0 ;; esac
 path="$(printf '%s\n' "$@" | grep -m1 -E '^repos/')"
@@ -68,6 +85,7 @@ case "$path" in
   *"/pulls?state="*)      printf '%s' '[{"number":9001,"title":"unrelated newest","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"other","sha":"o1"}},{"number":3,"title":"c","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"c","sha":"c3"}},{"number":2,"title":"b","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"b","sha":"b2"}}]'; exit 0 ;;
   *"/issues?state="*)     printf '%s' '[{"number":900,"title":"a pull request","state":"open","pull_request":{"url":"x"}},{"number":8491,"title":"real issue","state":"open","labels":[{"name":"P0-blocker"}]},{"number":8492,"title":"another","state":"open","labels":[]}]'; exit 0 ;;
   *"/issues/8833/comments"*|*"/comments?per_page"*) printf '%s\n%s\n' '[{"body":"LGTM","user":{"login":"rev"},"created_at":"2026-10-17"}]' '[{"body":"second","user":{"login":"rev2"},"created_at":"2026-10-18"}]'; exit 0 ;;
+  *"/issues/900")        printf '%s' '{"number":900,"title":"a pull request","state":"open","state_reason":null,"assignees":[],"html_url":"https://example/900","pull_request":{"url":"x"}}'; exit 0 ;;
   *"/issues/9008"*)      printf '%s' '{"number":9008,"title":"dup","state":"closed","state_reason":"duplicate","assignees":[]}'; exit 0 ;;
   *"/issues/8491"*)       printf '%s' '{"number":8491,"title":"real issue","state":"open","labels":[{"name":"P0-blocker"}],"assignees":[{"login":"daniel-ospina"}]}'; exit 0 ;;
 esac
@@ -190,6 +208,31 @@ run pr view 8833 --repo o/r --json stateReason >/dev/null 2>&1
 ck "pr view --json stateReason still DELEGATES (gh rejects the field for PRs; REST must not invent it)" \
    "$(haslog 'pr view 8833 --repo o/r --json stateReason' && echo 0 || echo 1)"
 
+# ── D5. `issue view` of a PR-NUMBERED target must DELEGATE, never answer `[]` ────────────────
+# Issues and pull requests SHARE one number sequence, so `gh issue view <n>` on a PR number is a
+# legitimate question — and it is the exact read `collision_preflight.py` makes for `issue landed`
+# AND `issue assignee/holder` (#2645 in daniel-ospina/agent-infra is such a number). Measured
+# 2026-10-24: the adapter applied its LIST-only "drop pull_request rows" filter on the VIEW path,
+# printed `[]` with rc 0, and a fail-closed caller refused non-object JSON on BOTH surfaces. The
+# candidate became INCOMPLETE, and six INCOMPLETE candidates are `ABORT: … judged NOTHING` — an
+# empty dispatch backlog with capacity free, produced by the adapter (the class its own header calls
+# "does not degrade the fleet, it disables it").
+: >"$TMP/log"
+out="$(run issue view 900 --repo o/r --json number,title,state,stateReason,assignees,url 2>&1)"
+ck "issue view of a PR-numbered target DELEGATES (an empty [] is non-object JSON to the pre-flight)" \
+   "$(haslog 'issue view 900 --repo o/r' && echo 0 || echo 1)"
+ck "issue view of a PR-numbered target never prints the LIST shape ([])" \
+   "$([ "$out" != "[]" ] && [ -n "$out" ] && echo 0 || echo 1)"
+ck "issue view of a PR-numbered target returns a JSON OBJECT, the shape the caller was promised" \
+   "$(printf '%s' "$out" | json_eq 'isinstance(d, dict) and d.get("number")==900')"
+# NON-VACUITY for the same arm: a REAL issue number must still be served over REST, not delegated —
+# otherwise "delegate on a PR" could hide a resolver that delegates everything (a silent GraphQL draw
+# on the scarce bucket, which is the reason this arm exists at all).
+: >"$TMP/log"
+run issue view 8491 --repo o/r --json number,state >/dev/null 2>&1
+ck "an ordinary issue read still stays on REST (the PR arm did not license delegating everything)" \
+   "$(haslog 'repos/o/r/issues/8491' && ! haslog 'issue view 8491' && echo 0 || echo 1)"
+
 # ── E. pr list --head must reach the API (chain-merge.sh:44 — else the WRONG PR is merged) ───────
 : >"$TMP/log"
 run pr list --repo o/r --state open --head BR --json number --jq '.[0].number' >/dev/null 2>&1
@@ -304,6 +347,108 @@ ck "a refused COMMENTS read names the bucket (not a bare jq parse error)" \
 _o="$(GH_LIMIT_NO_WAIT=1 STUB_STS_FAIL=1 run pr checks 8833 --repo o/r --json name,state 2>"$TMP/err-x")"; _r=$?
 ck "a refused legacy commit-status read FAILS the call (rc!=0) and says the set is incomplete" \
    "$([ "$_r" -ne 0 ] && has 'INCOMPLETE' "$(cat "$TMP/err-x")" && [ -z "$_o" ] && echo 0 || echo 1)"
+
+# ── Z. A PAYLOAD BIGGER THAN THE KERNEL'S LIMIT STILL PROJECTS (it used to be refused by exec) ────
+# ⛔ THE DEFECT THIS PINS IS A FAILED READ THAT LOOKED LIKE "NO WORK". The projections handed the
+# WHOLE check-runs / statuses / comments payload to python through argv and the environment
+# (`R="$runs" S="$sts" python3 -c …`, `python3 -c … "$cs"`), which the kernel bounds by ARG_MAX.
+# A BUSY PR exceeds it, the exec is refused with `Argument list too long`, the projection prints
+# nothing — and the caller reads EMPTY STDOUT as an empty check surface. MEASURED on the cells
+# (2026-10-25): `PR path: NO UNIT SPAWNED this cycle — 6 check surface READ-FAILED:other:
+# …/gh-rest/gh: line 420: python3: Argument list too long`. So a payload over the limit must still
+# produce the CORRECT check set — not merely "not crash".
+#
+# The fixture is sized from the box's OWN limits (min(ARG_MAX, 2 MiB), per the reproduction the
+# issue prescribes) and the arm asserts the fixture REALLY exceeds it, so a machine with a huge
+# ARG_MAX cannot silently turn this into a vacuous pass.
+_argmax="$(getconf ARG_MAX 2>/dev/null || true)"
+case "${_argmax:-}" in ''|*[!0-9]*) _argmax=1048576 ;; esac
+# ⛔ SIZE FROM THE KERNEL LIMIT AND COMPARE LIKE WITH LIKE. An earlier version capped `_argmax` at
+# 2 MiB and then sized the fixture at 2 × that cap — so the "cannot be vacuous" assertion compared the
+# fixture against the SAME capped number it was derived from, which is ALWAYS true and is a false
+# assurance on any box whose limit is bigger. The fixture is 2 × the kernel's own ARG_MAX and it is
+# asserted against the kernel's own ARG_MAX (2 × ARG_MAX >= min(ARG_MAX, 2 MiB) on every box).
+_big_n=$(( _argmax * 2 ))
+python3 - "$TMP/big-runs.json" "$TMP/big-comments.json" "$_big_n" <<'PY'
+import json, sys
+runs_path, comments_path, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+pad = "x" * n          # a field the projection does NOT emit, so the fixture is big and the
+                        # answer it must produce is exactly the small, known check set below.
+runs = {"check_runs": [
+    {"name": "ai-review-gate", "status": "completed", "conclusion": "success",
+     "started_at": "2026-10-23T01:00:00Z", "completed_at": "2026-10-23T01:05:00Z",
+     "details_url": "https://x/runs/1", "app": {"slug": "github-actions"},
+     "output": {"summary": pad}},
+    {"name": "changes", "status": "in_progress", "conclusion": None,
+     "started_at": "2026-10-23T01:06:00Z", "details_url": "https://x/runs/2",
+     "app": {"slug": "github-actions"}, "output": {"summary": pad}},
+]}
+open(runs_path, "w").write(json.dumps(runs) + "\n")
+open(comments_path, "w").write(json.dumps([
+    {"body": pad, "user": {"login": "rev"}, "created_at": "2026-10-17"},
+    {"body": "second", "user": {"login": "rev2"}, "created_at": "2026-10-18"},
+]) + "\n")
+PY
+_big_sz="$(wc -c <"$TMP/big-runs.json" | tr -d '[:space:]')"
+ck "§Z fixture really exceeds the KERNEL limit (${_big_sz}B > ARG_MAX ${_argmax}B) — the arm cannot be vacuous" \
+   "$([ "${_big_sz:-0}" -gt "$_argmax" ] && echo 0 || echo 1)"
+out="$(STUB_CHECKRUNS_FILE="$TMP/big-runs.json" run pr checks 8833 --repo o/r --json name,state 2>&1)"; rc=$?
+# The check set must be CORRECT, not merely non-empty: the two runs from page 1 AND the legacy
+# StatusContext (a separate read, which unions into the same surface) prove both payloads arrived.
+# `json_eq` prints 0/1 on stdout, so a pipeline into it decides the arm by CONTENT.
+_set_ok="$(printf '%s' "$out" | json_eq 'any(x["name"]=="ai-review-gate" and x["state"]=="success" for x in d) and any(x["name"]=="changes" and x["state"]=="in_progress" for x in d) and any(x["name"]=="vercel/deploy" for x in d)')"
+[ "${_set_ok:-1}" = "0" ] && _set_rc=0 || _set_rc=1
+ck "§Z a check-runs payload over ARG_MAX still projects, and the check set is CORRECT" \
+   "$([ "$rc" -eq 0 ] && [ "$_set_rc" -eq 0 ] && echo 0 || echo 1)"
+[ "$rc" -eq 0 ] && [ "$_set_rc" -eq 0 ] \
+  || printf '       rc=%s set=%s stdout=[%.300s]\n' "$rc" "${_set_ok:-?}" "$out"
+# ⛔ THE EXACT FAILURE IS WHAT IS FORBIDDEN. The defect's whole signature is the KERNEL's refusal
+# arriving as empty stdout; assert the words are absent from BOTH streams, so a future change that
+# reintroduces argv/env passing fails here even if it happens to answer correctly on a bigger box.
+ck "§Z …with NO 'Argument list too long' on stdout or stderr" \
+   "$(! has 'Argument list too long' "$out" && ! has 'E2BIG' "$out" && echo 0 || echo 1)"
+
+# The COMMENTS payload is the second argv site: a long thread on a busy PR is megabytes too.
+out="$(STUB_COMMENTS_FILE="$TMP/big-comments.json" run pr view 8833 --repo o/r --json state,comments 2>&1)"; rc=$?
+_comm_ok="$(printf '%s' "$out" | json_eq 'isinstance(d.get("comments"),list) and len(d["comments"])==2 and len(d["comments"][0]["body"])>1000000 and d["comments"][1]["body"]=="second"')"
+[ "${_comm_ok:-1}" = "0" ] && _comm_rc=0 || _comm_rc=1
+ck "§Z a >ARG_MAX COMMENTS payload survives intact (both comments, the big body untruncated)" \
+   "$([ "$rc" -eq 0 ] && [ "$_comm_rc" -eq 0 ] && echo 0 || echo 1)"
+ck "§Z …and that path reports no 'Argument list too long' either" \
+   "$(! has 'Argument list too long' "$out" && echo 0 || echo 1)"
+
+# ⛔ AN UNPARSEABLE BODY WITH rc 0 IS A FAILED READ, NOT AN EMPTY CHECK SET — and without an arm this
+# guarantee rots: reverting it to the old `except Exception: return []` left every assertion green
+# (measured). The read SUCCEEDS here (the stub exits 0) and only the document is garbage, which is the
+# one path that used to answer `[]` with rc 0 — a check surface that reads "no checks".
+printf '<html>oops</html>\n' >"$TMP/bad-sts.json"
+out="$(STUB_STATUSES_FILE="$TMP/bad-sts.json" run pr checks 8833 --repo o/r --json name,state 2>"$TMP/err-p")"; rc=$?
+ck "§Z an UNPARSEABLE check payload FAILS the read (rc!=0, no surface) and names the key" \
+   "$([ "$rc" -ne 0 ] && [ -z "$out" ] && has 'cannot parse the statuses payload' "$(cat "$TMP/err-p")" && echo 0 || echo 1)"
+# …while an EMPTY body with rc 0 stays benign: that is "no rows", not a refused read, so the surface
+# must still be produced from the check runs alone.
+printf '' >"$TMP/empty-sts.json"
+out="$(STUB_STATUSES_FILE="$TMP/empty-sts.json" run pr checks 8833 --repo o/r --json name,state 2>&1)"; rc=$?
+_empt_ok="$(printf '%s' "$out" | json_eq 'any(x["name"]=="ai-review-gate" for x in d)')"
+ck "§Z an EMPTY status body (rc 0) still yields the check set — it is 'no rows', not a failed read" \
+   "$([ "$rc" -eq 0 ] && [ "${_empt_ok:-1}" = 0 ] && echo 0 || echo 1)"
+
+# ⛔ NON-VACUITY, PINNED IN THE SUITE RATHER THAN ONLY IN THE PR TEXT: no projection site may pass
+# its payload through the environment or argv. The env form is the one the kernel refused; the
+# comments form put it in argv. A grep is enough here because the SHAPE is the defect and the arms
+# above already prove the behaviour (reverting to either form fails them: measured on the pre-fix
+# shim, the check-runs arm dies rc=1 with `Argument list too long` and prints the kernel message
+# instead of a check set).
+# The patterns name the SHAPE, not the two exact lines that were removed: any payload read out of the
+# environment (`os.environ`, `os.getenv`), and any of the three payload variables handed to python as
+# a value. (`[$]` rather than `\$`: a `\$` inside nested quotes is consumed by the OUTER double
+# quotes and silently produced a zero-match pattern here once.)
+_env_sites="$(grep -vE '^[[:space:]]*#' "$SHIM" | grep -cE 'os[.](environ|getenv)' || true)"
+ck "§Z no projection reads its payload from the process ENVIRONMENT" \
+   "$([ "${_env_sites:-0}" -eq 0 ] && echo 0 || echo 1)"
+_argv_sites="$(grep -vE '^[[:space:]]*#' "$SHIM" | grep -cE 'python3.*"[$](cs|runs|sts)"' || true)"
+ck "§Z no projection hands a payload VARIABLE to python as a value" \
+   "$([ "${_argv_sites:-0}" -eq 0 ] && echo 0 || echo 1)"
 
 echo
 printf 'gh-rest: %d passed, %d failed\n' "$pass" "$fail"

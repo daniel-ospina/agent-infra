@@ -38,9 +38,16 @@ LEAN BY DESIGN, and it follows the house pattern the other line-producers use
 heartbeat can call it every tick CHEAPLY, never raise. "Cheap" is not "free" on
 one path: a recompute that lands inside GitHub's lazy `mergeStateStatus` window
 re-reads a few times before it will call the queue blind (#1869), which spends
-up to `QUEUE_BLIND_BUDGET_S` of the beat's own 90 s refresh bound -- and a
+up to `QUEUE_READ_MAX_S` of the caller's own refresh bound -- and a
 refresh killed at that bound writes NO line at all. It reads; it does not act.
 Nothing dispatches from here.
+
+A LATE ANSWER IS NOT AN ABSENT ONE (#2227). `gh` is serialised per box (#2005), so on a
+crowded box a queue read legitimately costs ~63 s (measured at 13 lanes) against 0.09 s on
+the wire. Every read therefore reports HOW LONG it took: a read that answered late prints
+`queue_read=SLOW(waited=63.1s)` beside REAL counts, a read that never answered prints
+`queue_read=UNREADABLE(waited=100.4s, last_good=812s)` beside NO counts, and `BLIND` stays
+reserved for its #1869 meaning (the merge state never came back readable).
 
 THREE MEASUREMENT TRAPS THIS SCRIPT EXISTS TO AVOID, all hit for real:
   1. A run's `createdAt -> updatedAt` INCLUDES QUEUE WAIT. It read 44.3 min and
@@ -58,7 +65,25 @@ THREE MEASUREMENT TRAPS THIS SCRIPT EXISTS TO AVOID, all hit for real:
      declared, and a queue that never settles is still reported BLIND (#1869).
 
 Usage:  objective.py [--json] [--max-age 240]
-Output: OBJECTIVE VERDICT=... prs_waiting=N ... main=RED|GREEN|UNKNOWN@sha ...
+Output: OBJECTIVE VERDICT=... repo=<owner/name> repo_src=env|checkout|default ... main=RED|GREEN|UNKNOWN@sha ...
+
+EXIT (agent-infra#2710 -- a refusal is a verdict, and UNKNOWN is never a pass):
+  0  a READABLE verdict about the tree/queue: `AT-TARGET`, `ADVANCING`, `REGRESSING`, `FIX-MAIN`.
+     `FIX-MAIN` is a finding about main, not a failure of this read -- it exits 0 like the rest.
+  2  REFUSING -- the world could not be read, or the repo this process would read is not the one
+     its checkout is. Two ways to reach it, and the SECOND outranks the first: a verdict that is
+     not in `READABLE_VERDICTS` (an allow-list, so a word this file has never seen refuses too),
+     and any line carrying a `BLINDNESS_TOKENS` fact (`queue=UNREADABLE`, `gh=UNREADABLE`,
+     `main=UNKNOWN@?`, `error=`) whatever word it also carries -- `build()`'s ladder puts
+     `FIX-MAIN` above the blind-queue arm, so without that rule a RED main beside an unreadable
+     queue printed a readable word over an unread world. The reason is on the SAME line
+     (`error=…` / `repo_mismatch(...)`) and the next action is named there. 2 is the fleet's
+     cannot-verify code (`check-deployed-drift.sh`, `cycle-record.sh`, `pr-doctor.py`), so a caller
+     that reads only exit codes can tell a refusal from a healthy read.
+⛔ BEFORE #2710 THIS FILE ALWAYS EXITED 0. Measured: `OBJECTIVE_REPO` naming a repo that does not
+   exist printed `VERDICT=UNKNOWN … queue=UNREADABLE` and exited 0, so the ONE state that means
+   "the read did not happen" was indistinguishable, to any launcher, from `AT-TARGET`. Never a
+   crash (the heartbeat calls this every tick): a refusal is a printed line AND a code.
 """
 from __future__ import annotations
 import json, os, re, subprocess, sys, time
@@ -70,10 +95,275 @@ from datetime import datetime, timedelta, timezone
 # second predicate (#1872) -- but it hardcoded tortoise, so a consumer standing in ANY other repo
 # read a DIFFERENT repo's check-runs and attestations: every agent-infra PR came back
 # `rerun-checks`, or `record-review` forever because it looked for tortoise's attestation file. The
-# repo is therefore an INPUT: such a consumer supplies it as `OBJECTIVE_REPO`. ⚠️ NOTHING SHIPPED
-# SETS IT TODAY, so every shipped caller gets the default below and answers exactly as before --
-# which is the property the first test in `test_objective.py`'s seam block pins.
-REPO = os.environ.get("OBJECTIVE_REPO") or "daniel-ospina/tortoise"
+# repo is therefore an INPUT: such a consumer supplies it as `OBJECTIVE_REPO`. ⚠️ `pr-doctor.py` is
+# the first shipped consumer to supply it (#2700): its `_objective()` sets the variable to its own
+# `REPO` BEFORE it execs this file, then restores it -- so the default below is what every OTHER
+# caller still gets, and that is the property `test_objective.py`'s seam block pins (it deletes the
+# variable first, so it pins the default rather than the ambient state of whichever suite ran before
+# it). `pr-loop.py` is the SECOND (#2708): its `_objective()` derives the slug from its checkout's
+# `origin` (through `repo-slug.sh`, the ONE deriver) and REFUSES when it cannot, rather than letting
+# the default answer for another repo -- its effect is pinned by
+# `tests/inert-capability-effects/run.sh` §1. The remaining shipped callers that do NOT supply it,
+# and are therefore still answered about tortoise, are the direct script callers of this file:
+# `heartbeat-loop.sh:470`, `orchestrator-heartbeat.sh:224`, `cadence-nudge.sh:329,475`, and
+# `lane-scan-fallback.sh:76`. Fixing those, and the required-set half of the same seam, is the open
+# work on **#2518** (the live root -- #1989 is CLOSED and its P1s were carried to #2518).
+# Naming them here is so the next lane can find them from the file that knows.
+#
+# ⛔ AND THE REPO READ MUST MATCH THE CHECKOUT THIS PROCESS STANDS IN (agent-infra#2710, the
+# contract's §3.7 "C6" row). The fallback above was SILENT, so a process standing in agent-infra
+# answered about tortoise with full confidence -- measured 2026-10-24: a doctor on a cell read
+# tortoise's check-runs for agent-infra's SHAs, GitHub replied `422 No commit found for SHA` for
+# EVERY PR, and every pass refused to dispatch while the log looked like a quiet queue. The
+# mismatch control already existed for the SUPERVISOR's `OR` (`cloud-cell-supervisor.sh`, the repo
+# derived from the checkout's origin, an explicit value must match it); this applies the SAME rule
+# here, in the ONE classifier, instead of inventing a second one.
+#
+# THE CONTRACT, DECIDED ONCE (agent-infra#2710's scope, item 1) -- `resolve_repo()` is the code:
+#   1. a DECLARED repo (`OBJECTIVE_REPO`, then `OR`)   -> read it, `repo_src=env`. If this process
+#                                                      stands in a checkout that derives a DIFFERENT
+#                                                      slug, that is a NAMED REFUSAL, not a read; if
+#                                                      the checkout cannot be derived at all, the
+#                                                      line says `repo_check=uncompared:<why>` so an
+#                                                      inert comparison cannot read as a satisfied one.
+#   2. nothing declared, checkout derivable          -> read the checkout's own `owner/name`,
+#                                                      `repo_src=checkout`. A process standing in a
+#                                                      repo cannot silently read another one.
+#   3. nothing declared, nothing derivable          -> `REPO_DEFAULT`, `repo_src=default`. Kept, and
+#                                                      MADE LOUD: the source is on every line, so a
+#                                                      reader can never again mistake it for an answer
+#                                                      about the repo it is standing in. (Removing it
+#                                                      outright would blind `heartbeat-loop.sh` on the
+#                                                      Mac, whose farm copy `~/.pi/agent/scripts/` is
+#                                                      not a git checkout and carries no deriver --
+#                                                      named as a gap in the contract, not papered over
+#                                                      with a refusal that breaks the primary box.)
+# ⛔ AND `OR` IS A DECLARATION TOO (review round 1, P2). `orch-loop.sh` EXPORTS `OR` -- the repo the
+# controller GRADES and dispatches for -- into every child it starts. Taking the cwd as authoritative
+# when nothing else is set would let a controller bound to tortoise, whose pass happens to run with a
+# cwd inside ANOTHER checkout (a lane worktree, a second checkout on the box), publish that other
+# repo's queue into `objective.last` under the arm this contract presents as trustworthy. So a
+# declared repo outranks the cwd, and a declaration that DISAGREES with the checkout is the same
+# named refusal as an explicit `OBJECTIVE_REPO` disagreement -- the supervisor's own rule for `OR`.
+# `--res` / `--gate-clause` return before any of this, so they resolve nothing. `--json` does NOT
+# return early (it only disables the cache), so it resolves like any other read.
+REPO_DEFAULT = "daniel-ospina/tortoise"
+# The declared-repo variables, in precedence order. `OBJECTIVE_REPO` is this file's own input
+# (agent-infra#1989); `OR` is the fleet's grading repo, exported by `orch-loop.sh`.
+DECLARED_ENVS = ("OBJECTIVE_REPO", "OR")
+
+
+def _safe_cwd():
+    """The process's cwd, or None when the OS REFUSES to say where the process is.
+
+    ⛔ `os.getcwd()` IS NOT A TOTAL FUNCTION (ai#2922). Under launchd with no Full Disk Access the
+    call RAISES (`PermissionError`, or `FileNotFoundError` for a deleted `WorkingDirectory`) instead
+    of returning a path, so a bare `os.getcwd()` inside a `try` is not a resolution -- it is a
+    failure that lands in whatever `except` happens to be nearest. Measured on this box: a deleted
+    cwd raises `FileNotFoundError`, an unreadable one raises `PermissionError`.
+    """
+    try:
+        return os.getcwd()
+    except OSError:                            # PermissionError, ENOENT, ENOENT-after-delete
+        return None
+
+
+def _checkout_repo(path=None):
+    """(slug, reason): the `owner/name` of the checkout this process stands in, or (None, why).
+
+    ⛔ SOURCED, NEVER RE-IMPLEMENTED: `scripts/orchestrator-harness/repo-slug.sh`'s `derive_or` is
+    the fleet's ONE answer to "which owner/name is this checkout" (shared with `orch-loop.sh`,
+    `refresh-candidates.sh` and `pr-loop.py`). A python copy of the parse would be a THIRD
+    derivation -- the drift that file exists to end -- so the slug is obtained by sourcing it, with
+    the same 10-line shim `pr-loop.py::_checkout_repo` uses (a shim, not a parser: the rules live in
+    the shell file). `why` is "deriver-missing" when this script was deployed without it (the farm
+    copy `~/.pi/agent/scripts/` is such a box today) and "underivable" otherwise -- two causes, two
+    remedies, and the difference is reported rather than collapsed.
+
+    ⛔ THREE CAUSES NOW, AND THE THIRD IS THE CWD (ai#2922). "cwd-unreadable" is the launcher's
+    working directory being unreadable to the OS -- under launchd, TCC denying a `WorkingDirectory`
+    under `~/Documents`. It used to be swallowed by the broad `except` below and reported as
+    "underivable", whose remedy is to go and debug `git`/`bash`; the actual remedy is to move the
+    job's `WorkingDirectory` out of the protected tree or to declare `REPO`. Collapsing it sent an
+    operator to the wrong remedy for ever, which is the failure this whole resolution exists to end.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    lib = None
+    for cand in (os.path.join(here, "orchestrator-harness", "repo-slug.sh"),
+                 os.path.join(here, "repo-slug.sh")):
+        if os.path.isfile(cand):
+            lib = cand
+            break
+    if lib is None:
+        return None, "deriver-missing"
+    # ⛔ RESOLVED OUTSIDE THE `try`: a cwd that cannot be read is a NAMED cause, never a neighbour
+    # of whatever exception the subprocess happened to raise.
+    if not path:
+        path = _safe_cwd()
+        if path is None:
+            return None, "cwd-unreadable"
+    try:
+        res = subprocess.run(
+            ["bash", "-c", '. "$1" >/dev/null 2>&1; derive_or "$2"', "_", lib,
+             str(path)],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None, "underivable"
+    if res.returncode != 0:
+        return None, "underivable"
+    slug = (res.stdout or "").strip()
+    if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", slug or ""):
+        return None, "underivable"
+    return slug, ""
+
+
+def declared_repo():
+    """(slug, variable): the first DECLARED repo in `DECLARED_ENVS` order, or (None, '')."""
+    for var in DECLARED_ENVS:
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            return val, var
+    return None, ""
+
+
+def resolve_repo(env=None, checkout=None, checkout_why=None):
+    """(slug, src, refusal, check): WHICH repo this read is about, WHERE that came from, and
+    whether the answer could be CHECKED.
+
+    `src` is `env` (a declared variable), `checkout` or `default` -- the third is the silent
+    fallback this function exists to end, and it is reported on every line so it can never be
+    silent again. `refusal` is a complete, machine-parseable reason naming both slugs when a
+    DECLARED repo disagrees with the checkout this process stands in -- the 2026-10-24 measurement,
+    made loud.
+
+    ⛔ `check` IS NOT DECORATION (review round 1, P2). When `_checkout_repo()` cannot answer -- the
+    deriver is missing from this deployment, or `git`/`bash` cannot be run -- the comparison is
+    IMPOSSIBLE, and returning `("", "env")` would let a declared repo pass as if it had been
+    verified: an inert guard that reads as a satisfied one, which is the shape this whole issue is
+    about. `check` therefore carries the reason (`uncompared:deriver-missing` /
+    `uncompared:underivable` / `uncompared:cwd-unreadable`) so the line can say so; and it is empty
+    when the comparison either happened or was not needed (nothing declared, or nothing to compare
+    against anyway).
+
+    `checkout` and `checkout_why` are injectable so the mismatch rule is testable without a git
+    fixture; production callers pass nothing and the real cwd is used.
+    """
+    if env is None:
+        env, _var = declared_repo()
+    env = (env or "").strip()
+    if checkout is None:
+        checkout, checkout_why = _checkout_repo()
+    if env:
+        if checkout:
+            if checkout.lower() != env.lower():
+                return (env, "env",
+                        "repo_mismatch(read=%s, checkout=%s) next=unset-OBJECTIVE_REPO-or-run-from-%s"
+                        % (env, checkout, env), "")
+            return env, "env", "", ""
+        # Nothing to compare against: say WHICH of the two causes, or a reader applies the wrong
+        # remedy for ever (the same two-causes rule `_checkout_repo` already follows).
+        return env, "env", "", "uncompared:%s" % (checkout_why or "underivable")
+    if checkout:
+        return checkout, "checkout", "", ""
+    return REPO_DEFAULT, "default", "", "uncompared:%s" % (checkout_why or "underivable")
+
+
+_env_repo = (os.environ.get("OBJECTIVE_REPO") or "").strip()
+# The MODULE-LEVEL default, unchanged for importers (`pr-doctor.py`, `pr-loop.py`, the test suite):
+# both shipped importers supply `OBJECTIVE_REPO` before they exec this file, and resolving a repo
+# here would put a `bash` subprocess on every import AND let a test's cwd silently choose its repo.
+# The CLI (`main()`) resolves properly -- see `resolve_repo()` -- because that is the path every
+# shell caller in the fleet takes.
+REPO, REPO_SRC = ((_env_repo, "env") if _env_repo else (REPO_DEFAULT, "default"))
+# Empty unless the CLI could not CHECK the repo it was told to read -- see `resolve_repo`.
+REPO_CHECK = ""
+
+# The two codes this file emits. `2` is the fleet's cannot-verify code, deliberately the same one
+# `check-deployed-drift.sh` (0 OK / 1 DRIFT / 2 UNKNOWN), `cycle-record.sh` (2 ABSENT/UNREADABLE) and
+# `pr-doctor.py` (2 REFUSING) use: a reader that has learned one of them has learned all three.
+EXIT_READABLE = 0
+EXIT_REFUSING = 2
+
+# ⛔ THE BLINDNESS TOKENS, IN ONE PLACE, BECAUSE THEY DECIDE THE EXIT CODE TOO (review round 1, P2).
+# `main()`'s cache guard and `_exit_for()` must agree on "the world could not be read", or a line can
+# print a failed read and exit 0. It happened: `build()`'s ladder puts `FIX-MAIN` ABOVE the
+# blind-queue arm, so a RED main beside an unreadable queue emitted `VERDICT=FIX-MAIN … 
+# queue=UNREADABLE` -- a readable word over an unread world. `_exit_for()` therefore refuses on any
+# of these tokens WHATEVER the verdict word says: the word cannot outrank the read.
+BLINDNESS_TOKENS = ("gh=UNREADABLE", "main=UNKNOWN@?", "queue=UNREADABLE", "error=",
+                    # ⛔ THE QUEUE'S OWN BLINDNESS WORD WAS MISSING FROM ITS OWN INVENTORY (review
+                    # round 2, reproduced). `_queue_read_is_blind` calls `BLIND` "this file's word
+                    # for 'the QUEUE read did not answer'" and `build()` emits
+                    # `queue_read=BLIND(4/4 unread …) -- the QUEUE counts are NOT a clearance`,
+                    # while `AT-TARGET` (the IDLE word) is derived from exactly those counts. So a
+                    # line that disowns its own numbers exited 0 and read as a clearance. Both
+                    # spellings: the `BLIND(` arm above and the `UNREADABLE(` arm
+                    # (`queue_read=UNREADABLE(waited=…)`, the spent-deadline path).
+                    # NOT `queue_read=REST(`: that arm is a DECIDED non-blind degradation (the
+                    # count is still usable and the line says so), so refusing on it would be the
+                    # over-block this list must not become.
+                    "queue_read=BLIND", "queue_read=UNREADABLE")
+
+
+# ⛔ `error=` IS MATCHED STRUCTURALLY, NOT AS A SUBSTRING (review round 2, reproduced). `build()`
+# interpolates THIRD-PARTY text into the line — check names (`failing_required=…`), a doctor's
+# `reason`, a PR title — so a CI job legitimately named `pytest (error=timeout)` made a fully
+# READABLE line refuse. That is fail-closed so it cannot ship a wrong answer, but a permanent
+# over-block on someone else's job name is its own defect. `error=` is only blindness where it is a
+# FIELD: at the start of the line or after whitespace.
+_ERROR_FIELD = re.compile(r"(?:^|\s)error=")
+
+
+def is_blind_line(line):
+    """True when an OBJECTIVE line says the world could not be read (see BLINDNESS_TOKENS)."""
+    line = line or ""
+    if any(tok in line for tok in BLINDNESS_TOKENS if tok != "error="):
+        return True
+    return bool(_ERROR_FIELD.search(line))
+
+
+def repo_seg():
+    """The repo segment: WHICH repo was read, WHERE that answer came from, and whether it was
+    CHECKED.
+
+    ⛔ `repo_src` IS THE POINT (#2710). `default` is the fallback that read tortoise's check-runs
+    for agent-infra's SHAs for hours: the value is still allowed, but it can no longer be SILENT --
+    every line says which repo it is about and which input chose it, on the same stdout line a
+    non-terminal reader parses. `repo_check` appears whenever the comparison could NOT be made —
+    a declared repo with no derivable checkout, **or** a fallback to `REPO_DEFAULT` that could not
+    be compared against anything (review round 2: this sentence stated a narrower rule than the
+    code and than this change's own test) — so an inert guard is visible instead of implied.
+    """
+    seg = "repo=%s repo_src=%s" % (REPO, REPO_SRC)
+    return seg + (" repo_check=%s" % REPO_CHECK if REPO_CHECK else "")
+
+
+# The verdicts that ARE an answer. An ALLOW-LIST on purpose: `_exit_for()` returns 0 only for a
+# word in here, so a verdict nobody has taught this file yet is a refusal rather than a pass.
+READABLE_VERDICTS = ("AT-TARGET", "ADVANCING", "REGRESSING", "FIX-MAIN")
+
+
+def verdict_of(line):
+    """The verdict word on an OBJECTIVE line, or "" when the line carries no recognisable token.
+
+    ⛔ IT READS THE LINE, NOT AN IN-PROCESS VARIABLE. `main()` has six exit paths (cached serve,
+    exception, build, the mismatch refusal) and the code must agree with the line a reader SEES --
+    deriving it from anything else is how two readers of one verdict start disagreeing.
+    """
+    m = re.search(r"\bVERDICT=([A-Za-z-]+)", line or "")
+    return m.group(1) if m else ""
+
+
+def _exit_for(line):
+    """EXIT_READABLE for a verdict this file knows to be readable, else EXIT_REFUSING.
+
+    ⛔ BLINDNESS OUTRANKS THE WORD. A verdict word is a statement about the queue; a blindness token
+    is a statement that the queue was not read, and no word may outrank it -- `FIX-MAIN` beside
+    `queue=UNREADABLE` is a readable claim about an unread world.
+    """
+    if is_blind_line(line):
+        return EXIT_REFUSING
+    return EXIT_READABLE if verdict_of(line) in READABLE_VERDICTS else EXIT_REFUSING
 STATE = os.path.expanduser("~/.pi/agent/state")
 CACHE = os.path.join(STATE, "objective.last")
 
@@ -131,6 +421,21 @@ def _required_from_env():
 
 
 REQUIRED = _required_from_env()
+# ⛔ THE REPO THE BUNDLED SET WAS READ FROM (review round 2, P1 — reproduced, and it nearly broke the
+# primary box). `REQUIRED_DEFAULT` is tortoise's branch-protection contexts, read and verified there.
+# The foreign-rubric guard below may NOT be expressed as "no required name appears on the surface",
+# because that is transport-dependent and, on tortoise itself, FALSE: measured on main `ef02b7acd`, the
+# REST surface publishes the five reusable-workflow gates as `main-health / docs`, … and GraphQL's
+# `statusCheckRollup.contexts` returned a SEVEN-name list containing none of them. A presence test
+# would therefore have answered UNKNOWN for ever on the one repo the rubric describes — converting a
+# silent false pass into a loud permanent refusal with no shipped remedy. The guard is about WHICH
+# REPO, so it asks that question directly instead of inferring it from a name list.
+REQUIRED_REPO = "daniel-ospina/tortoise"
+# ⛔ READ AT IMPORT, WITH `REQUIRED` (review round 2). The guard asks "was this set SUPPLIED?", and
+# reading that answer at CALL time while `REQUIRED` was bound at IMPORT time made the two disagree: a
+# caller (or a test) that exports `OBJECTIVE_REQUIRED` after import gets `from_env=True` beside the
+# still-bundled `REQUIRED`. One binding, one answer.
+REQUIRED_SUPPLIED = bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip())
 
 GREEN = {"success", "neutral", "skipped"}
 NON_RED = {"cancelled", "stale"}          # not green, but not evidence of failure
@@ -247,6 +552,14 @@ GH_LAST_ERROR = ""
 # refusal (#2138 r7). NOTE `_rest_get` DECODES its own body, so it also raises for a 200 it could
 # not parse -- that is a body failure, and the classification below says so (#2138 r8).
 _REST_TRANSPORT = False
+
+# ⛔ THE LAST **FAILED** QUEUE READ, KEPT SO ITS REFUSAL CAN NAME ITSELF (#2227).
+# `queue()` returns None when nothing was read, which is the correct fail-closed answer (#1869) --
+# but a bare `None` also erases HOW LONG the read waited and WHAT it tried, so the beat could only
+# print `gh=UNREADABLE(queue)` with no wait and no age, and a 100 s serialisation delay read
+# exactly like an instant 403. Empty dict = no failed read this pass. AGE IS THE ONLY THING A
+# REFUSAL MAY BORROW FROM THE CACHE -- never a count (see `_last_good_age_s`).
+QUEUE_READ_FAIL = {}
 
 # ⛔ THE BINARY IS RESOLVED, NOT TAKEN FROM PATH ALONE (#1872, reviewer E). `pr-doctor.py`
 # records the incident at its own `GH` constant: on the fleet box `~/.pi/agent/shims/gh` is a
@@ -464,6 +777,30 @@ def main_sha():
     return None
 
 
+def _req_leaves(names):
+    """`names` plus the reusable-workflow LEAF of each (`main-health / docs` -> `docs`).
+
+    ⛔ REQUIREMENT NAMES DO NOT EQUAL CHECK-RUN NAMES (review round 2, P1 — measured). Branch
+    protection names a required CONTEXT (`docs`); when that context is produced by a reusable
+    workflow, the check-run GitHub publishes is `<caller> / <job>` (`main-health / docs`). A bare
+    `c in red` therefore could not see a RED required gate at all — measured on tortoise main
+    `ef02b7acd`: the surface carries `main-health / docs`, `main-health / legal-e2e`,
+    `main-health / license-surface`, `main-health / pricing-artifact`, `main-health / test-isolation`,
+    and the required contexts are the leaves. So `main=GREEN` has been able to sit over a red
+    required gate: a false PASS of exactly the class #2710 exists to remove, pre-existing this
+    change and fixed by the same helper. Matching only ADDS names (exact match is included), so it
+    cannot turn a RED into a GREEN.
+    """
+    out = set()
+    for n in names or ():
+        n = (n or "").strip()
+        if not n:
+            continue
+        out.add(n)
+        out.add(n.rsplit(" / ", 1)[-1].strip())
+    return out
+
+
 def main_health(sha):
     """(state, failing_required) judged by polarity on the newest attempt per group."""
     global GH_BLOCKED
@@ -485,10 +822,30 @@ def main_health(sha):
         _note_gh_failure(GH_LAST_ERROR, "main", transport=None)
         return "UNKNOWN", []
     red, flight = rollup_checks(cr)
-    req_red = [c for c in REQUIRED if c in red]
+    # ⛔ AND A FOREIGN RUBRIC IS NOT A GREEN MAIN (review round 2, P1 — reproduced, and it is the
+    # WORST shape this issue names: a false PASS). `REQUIRED` is TORTOISE's set by default, and #2710
+    # made `REPO` follow the checkout/`OR` — so on any OTHER repo those gates are not the ones being
+    # run: `req_red` is empty, nothing is in flight, and the answer was GREEN. Measured on this
+    # worktree with the bundled set and three ALL-RED checks: `main_health() -> ('GREEN', [])`. The
+    # repo half of the seam landed in round 1; this is the half that says "I cannot judge this repo
+    # with another repo's gates". CANNOT-VERIFY IS NEVER A PASS, so the answer is UNKNOWN (which
+    # `_exit_for()` also refuses on).
+    #
+    # ⛔ IT IS ASKED OF THE REPO, NOT OF THE NAME LIST (see `REQUIRED_REPO`): a presence test is
+    # transport-dependent and answers UNKNOWN on tortoise itself.
+    #
+    # ⚠️ A SUPPLIED SET IS NOT RE-CHECKED THIS WAY, deliberately, and the residual is named: a
+    # supplied set whose names have gone stale (a renamed job) still answers GREEN, because "absent
+    # from this surface" cannot distinguish a stale declaration from a transport that renders names
+    # differently — measured above: GraphQL returned 7 names, REST returned 22, same sha. Refusing on
+    # absence would be a permanent over-block on a correct configuration; a stale supplied set is a
+    # seam to repair, tracked on #2518 with the rest of the rubric seam.
+    if not REQUIRED_SUPPLIED and (REPO or "").lower() != REQUIRED_REPO.lower():
+        return "UNKNOWN", []
+    req_red = [c for c in REQUIRED if _req_leaves([c]) & _req_leaves(red)]
     if req_red:
         return "RED", req_red
-    if any(c in flight for c in REQUIRED):
+    if any(_req_leaves([c]) & _req_leaves(flight) for c in REQUIRED):
         return "FLIGHT", []
     return "GREEN", []
 
@@ -629,10 +986,47 @@ def _monotonic():
     An attempt count alone does not bound a re-sample loop: the READ can be slow (a full
     recompute costs ~12 s measured, and one hung `gh` costs up to its own 120 s timeout), so a
     fixed ladder of sleeps on top of a slow read is bounded by nothing the beat can honour
-    (`run_bounded 90`). The loop therefore checks a wall-clock deadline as well -- and a
-    deadline is only honest if it can be tested without waiting for it.
+    (`run_bounded` in `heartbeat-loop.sh`). The loop therefore checks a wall-clock deadline as
+    well -- and a deadline is only honest if it can be tested without waiting for it.
     """
     return time.monotonic()
+
+
+def _wall():
+    """Elapsed-time MEASUREMENT, a separate seam from `_monotonic()` (#2227).
+
+    Two functions over the same clock is not redundancy, it is what keeps two DIFFERENT claims
+    testable at once. `_monotonic()` answers "has the budget been spent?" and tests fake it as a
+    tick LADDER (`iter([0.0, budget + 1, ...])`), which is the only way to prove a bound without
+    sleeping. `_wall()` answers "how long did this take?" and tests fake it as ELAPSED SECONDS.
+    Sharing one seam would mean a test that fakes the bound is also, silently, claiming to have
+    measured a latency -- and the first fixture that returned a ladder would publish a 101-second
+    "latency" for a read that took none.
+
+    The distinction matters because the two facts are reported in different places and only one of
+    them may ever affect a decision: a spent budget stops a re-read (a bound), a long duration is
+    printed beside data that WAS read (a measurement). Nothing dispatches from a duration.
+    """
+    return time.monotonic()
+
+
+def _last_good_age_s():
+    """Age, in seconds, of the last CACHED objective line -- or None if there is none.
+
+    ⛔ AGE ONLY. THIS FUNCTION MUST NEVER RETURN A VALUE FROM THE CACHE (#1869). A refused read
+    that printed last hour's `waiting=14` would be the exact fail-open #1869 closed: a stale
+    number standing where an unread one belongs. What a reader of a refusal genuinely needs is
+    "how old is the last thing we DID establish", so that a refusal three hours into a bad window
+    cannot be mistaken for one that just started -- and the age alone answers that without
+    publishing a single count.
+
+    The cache is written by `main()` under the blind guard, so its mtime IS the last SUCCESSFUL
+    read: a failed read refuses to cache (see `main()`), which is what makes the age meaningful.
+    """
+    try:
+        return max(0, int(time.time() - os.path.getmtime(CACHE)))
+    except OSError:
+        return None
 
 
 def _gh_retry(argv, attempts=3, timeout=120, deadline=None):
@@ -654,7 +1048,7 @@ def _gh_retry(argv, attempts=3, timeout=120, deadline=None):
     for i in range(attempts):
         # ⛔ `deadline` BOUNDS THE WHOLE RETRY POLICY, NOT JUST ONE ATTEMPT (#2138 r4, A). The
         # queue read's cap covers the read the fleet depends on -- but a retrying 5xx could spend
-        # `attempts x timeout` (3 x 120 s) and be killed by `run_bounded 90`, writing NO line at
+        # `attempts x timeout` (3 x 120 s) and be killed by `run_bounded`, writing NO line at
         # all. With a deadline, each attempt's timeout is clipped to what is left of it and the
         # backoff sleep is clipped too, so retries still happen (the resilience this function
         # exists for) inside a bound the caller can price into the tick.
@@ -716,6 +1110,19 @@ SURFACE_PATHS = _surface_from_env()
 # is never a check this predicate waits on.
 # `rerun-checks` and `resolve-conflict` sit ABOVE `record-review` because a missing check
 # tells you NOTHING and a rebase CHANGES THE HEAD, staling any attestation.
+# ⛔ AND `resolve-conflict` SITS ABOVE EVERY **EVIDENCE** ARM IN `classify_pr` -- `call-rail`
+# included -- which is why that one arm order is a refinement of this tuple rather than a
+# transcription of it. A `DIRTY` head is not landable at ANY evidence quality, and a rebase
+# stales the attestation, so the class must name the REBASE (see the arm-1 note). This tuple
+# orders the REPORTING/dispatch priority; it is not a licence for `call-rail` to claim a PR the
+# rail refuses.
+# ⛔ THE REFINEMENT STOPS THERE, AND IT HAS TO: the ONE arm that still outranks `resolve-conflict`
+# is the WEDGED re-trigger (arm 0), which is exactly what this tuple records (`rerun-checks`
+# before `resolve-conflict`). Those two requirements together -- the tuple's ladder for the
+# wedged arm, and #1936's refinement for `call-rail` -- are only jointly satisfiable because the
+# wedged arm and `call-rail` are disjoint, so no ordering among the three can change an answer.
+# See the arm-0 note; a future edit that makes them overlap must revisit this tuple, not quietly
+# pick a side.
 CLASS_ORDER = ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict",
                "record-review", "running", "fix-ci")
 # ⛔ `running` IS A CLASS, NOT A GAP (#1872). A required check that is still IN FLIGHT is not
@@ -907,12 +1314,13 @@ def rollup_checks(cr):
 # `fix-ci`, i.e. the beat told the fleet to go REPAIR CODE for a job that never ran (measured on
 # this branch's base at main=57edbd7a0: `{'fix-ci': 1}`). With #1872 landed (#1930) the same shape
 # is worse in the way that matters: `rollup_checks` puts ANY non-`completed` status in `flight`,
-# so arm 5 answers `running` -- "the head is still executing" -- and both readers SKIP the PR and
-# wait for a completion that will never arrive. #1930 said so as it landed: "#1926 (`running` has
-# no age bound, so a wedged check-run parks a PR forever)". The re-trigger arms cannot reach it
-# either: a wedged run IS a required context that REPORTED (so `req_seen` is non-empty, and the
-# `gated_absent` arm 7 sees it as present) while never reaching `completed` -- so every
-# absence-based arm is structurally blind to it, and only an AGE can tell it from a healthy run.
+# so the `running` arm (arm 4) answers -- "the head is still executing" -- and both readers SKIP
+# the PR and wait for a completion that will never arrive. #1930 said so as it landed: "#1926
+# (`running` has no age bound, so a wedged check-run parks a PR forever)". The re-trigger arms
+# cannot reach it either: a wedged run IS a required context that REPORTED (so `req_seen` is
+# non-empty, and the partial-absence `rerun-checks` arm (arm 6) sees it as present) while never
+# reaching `completed` -- so every absence-based arm is structurally blind to it, and only an AGE
+# can tell it from a healthy run.
 #
 # THE BOUND, and what it is derived from. Two clocks have to be covered, because the age of a
 # non-completed check is measured from whichever applies (see `flight_age_min`): a STARTED run's
@@ -943,15 +1351,16 @@ def rollup_checks(cr):
 # ⛔ SCOPE, STATED -- AND THE TWO SHAPES ARE NOT THE SAME SHAPE (#1948 review cycle 4, P3).
 # The aged set is the REQUIRED contexts (`GATED_CHECKS`). A wedged RAIL gate
 # (`drift-guard`/`flip-gate`/`provenance`) is not in it, and it is never a `blocked-by-rail`
-# REPAIR: `rail_block_reason` ACCEPTS an in-flight gate, but arm 1 returns `blocked-by-rail` only
-# when that gate is in `red` (`if _rail in red`), so a wedged rail gate is non-`completed`, never
-# `red`. That is DELIBERATE, one block above (#1872 review round 7: "an in-flight rail gate reads
-# `running` and a RED one still reads `blocked-by-rail`") -- an in-flight gate is not work to
-# repair. WHAT THEN HAPPENS DEPENDS ON WHETHER A REQUIRED GATE IS PRESENT:
-#   * EVERY gated context present: `rail_block_reason` names the wedged gate, arm 1 falls through
-#     to `running`, and the head WAITS -- unbounded, which is the one wait this change does not
-#     bound. Ageing it there would change the ladder for a non-required surface, and that is a
-#     separate call, deliberately not made here.
+# REPAIR: `rail_block_reason` ACCEPTS an in-flight gate, but `call-rail` (arm 2) returns
+# `blocked-by-rail` only when that gate is in `red` (`if _rail in red`), so a wedged rail gate is
+# non-`completed`, never `red`. That is DELIBERATE, one block above (#1872 review round 7: "an
+# in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`") -- an in-flight
+# gate is not work to repair. WHAT THEN HAPPENS DEPENDS ON WHETHER A REQUIRED GATE IS PRESENT:
+#   * EVERY gated context present: `rail_block_reason` names the wedged gate, `call-rail` falls
+#     through to `running`, and the head WAITS -- unbounded, which is the one wait this change does
+#     not bound. Ageing it there would change the ladder for a non-required surface, and that is a
+#     separate call, deliberately not made here. (A CONFLICTED head no longer reaches that wait at
+#     all: arm 1 answers it with the REBASE, which is the #1936 change.)
 #   * a REQUIRED gate ABSENT: `wedge_evidence`'s all-contexts read (below) ages EVERY context, so
 #     the rail gate can be the ONLY name in the reason -- `«drift-guard» queued <age>m` -- and the
 #     head reads `rerun-checks` even when it is DIRTY. Measured through `classify_one` with the
@@ -968,8 +1377,9 @@ def rollup_checks(cr):
 # children finish, so when a required gate is absent AND every check in flight is past the bound,
 # nothing can create it and the `gated_absent and flight` term of `running` would wait for ever.
 # A rail gate appears in THAT read only as one of the stuck jobs to START -- it is named as work to
-# do, never as a `blocked-by-rail` repair -- and arm 1 still answers first on a fully-green gated
-# set, where nothing is named as an order at all.
+# do, never as a `blocked-by-rail` repair -- and `call-rail` (arm 2) still decides a fully-green
+# gated set, where nothing is named as an order at all, except for a CONFLICTED head, which arm 1
+# takes as the REBASE.
 FLIGHT_BOUND_MIN = 90.0
 
 # The contexts a landing actually waits on. `ai-review-gate` is EXCLUDED for the same reason
@@ -1335,7 +1745,14 @@ def touches_surface(p):
 
 
 def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
-    """The ONE action class for a non-draft PR, FIRST MATCH in CLASS_ORDER, or None if unread.
+    """The ONE action class for a non-draft PR, FIRST MATCH in a stated order, or None if unread.
+
+    The order below is CLASS_ORDER with ONE refinement: `resolve-conflict` is checked ahead of
+    `call-rail`, because a head GitHub reports as conflicted cannot be landed at ANY evidence
+    quality -- see arm 1. That refinement does NOT disturb the recorded precedence of
+    `rerun-checks` over `resolve-conflict`: the re-trigger arm that can outrank a conflict is the
+    WEDGED one (arm 0), and hoisting it is behaviour-preserving because it and `call-rail` are
+    provably disjoint (see arm 0).
 
     Pure on purpose: `cr` is a check-run list ALREADY READ, `att_clean` the attestation
     verdict, `stalled` the aged-out GATED flight list and `flight_stalled` the same list over
@@ -1350,7 +1767,7 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     red, flight = rollup_checks(cr)
     seen = {c.get("name") for c in cr if c.get("name")}
     req_seen = [n for n in REQUIRED if n in seen]
-    # `ai-review-gate` is DIFF-BOUND (arm 1), so it is not a gate this predicate WAITS on: its
+    # `ai-review-gate` is DIFF-BOUND (arm 2), so it is not a gate this predicate WAITS on: its
     # truth is the head-bound attestation file, never its check-run. Everything below is about
     # the other six.
     # ⛔ THE GATED SET HAS ONE OWNER (#1926 review): `GATED_CHECKS`, above. An inline copy here
@@ -1371,65 +1788,32 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     # attestation). The gate's real condition is SEMANTIC -- "a clean review is recorded at this
     # head" -- and the head-bound attestation FILE states that authoritatively, so the check-run
     # is only a stale PROXY for `ai-review-gate` and never for the other six.
-    # 1. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
-    #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
-    #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
-    #    ⛔ THIS ARM STAYS FIRST, so a LANDABLE PR is never delayed by a running check elsewhere
-    #    (see arm 5): the cheapest landing on the board must not queue behind a non-gating job.
-    #    ⛔ A RAIL GATE *IN FLIGHT* IS NOT A DEFECT TO REPAIR (#1872 review round 7).
-    #    `rail_block_reason` deliberately accepts a gate that is in flight as well as one that is
-    #    red -- but the two are opposite instructions. `blocked-by-rail` becomes the brief "THE RAIL
-    #    REFUSES IT ON <gate>. REPAIR THAT, THEN MERGE." MEASURED: all six required contexts green,
-    #    attestation clean, `drift-guard` merely `in_progress` -> `blocked-by-rail(drift-guard)`, so
-    #    a lane was dispatched to repair a gate that had not concluded. That is the same harm arm 5
-    #    exists to remove ("a check in flight is not work", 3h burned on #7924), so an
-    #    in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`.
-    #    ⛔ AND A DIRTY HEAD IS STILL THE ONE THING A LANE CAN FIX (#1872 review round 12). This
-    #    arm already returns LAST-BUT-ONE in `CLASS_ORDER`, so returning `running` from here put it
-    #    ABOVE `resolve-conflict` -- the single exception to the arm order, and the one arm the suite
-    #    did not pin. MEASURED: six required contexts green + attestation + DIRTY + `drift-guard`
-    #    `in_progress` -> `running`, i.e. "wait", while the only available fix is a REBASE that no
-    #    check will ever do. Both consumers skip `running` and its only escalation is `STUCK`, which
-    #    is emitted for `call-rail` alone, so such a PR could wait forever.
-    if not nongreen and att_clean:
-        _rail = rail_block_reason(red, flight, seen)
-        if _rail:
-            if _rail in red:
-                return "blocked-by-rail"
-            if (pr.get("mergeStateStatus") or "") == "DIRTY":
-                return "resolve-conflict"
-            return "running"
-        return "call-rail"
-    # 2. rerun-checks -- NO required check has REPORTED at this head, and nothing is executing.
-    #    ⛔ `and not flight` IS LOAD-BEARING (#1872 review). Without it this arm SHADOWED arm 5
-    #    for the exact shape arm 5 was written for: a fresh head where no required context has
-    #    reported yet while other checks are already running -- which is the NORMAL first state
-    #    of a push, because `python-ci-gate` (and `docs`, `legal-e2e`) are created seconds after
-    #    the children. `req_seen` empty means "not reported yet" as often as "never ran", and
-    #    the two need OPPOSITE actions: wait, versus START the workflow. Worse, the dispatcher's
-    #    `rerun-checks` brief asserts "(Nothing is in flight ...)" and tells the lane to push an
-    #    empty commit -- so the shadowed arm sent it to churn a 20-second-old head, wasting
-    #    runner capacity and staling the attestation. `drive`/`drift-guard`/`sigpipe-guard`
-    #    being red cannot reach here: they are not in REQUIRED.
-    if not req_seen and not flight:
-        return "rerun-checks"
-    # 3. rerun-checks (WEDGED) -- a required check is still non-completed PAST the flight bound.
+    # 0. rerun-checks (WEDGED) -- a required check is still non-completed PAST the flight bound.
     #    This is NOT a wait: nothing will ever complete it (GitHub does not reconcile a run that
     #    was never picked up), so the work is to START it, which is what `rerun-checks` means to a
     #    lane, and the reason names the check, its state and its age.
-    #    ⛔ IT SITS ABOVE `running` (arm 5) BECAUSE A WEDGED RUN *IS* IN FLIGHT. That is the whole
-    #    trap: `rollup_checks` puts any non-`completed` status in `flight`, so arm 5 matches this
+    #    ⛔ IT SITS ABOVE `running` (arm 4) BECAUSE A WEDGED RUN *IS* IN FLIGHT. That is the whole
+    #    trap: `rollup_checks` puts any non-`completed` status in `flight`, so arm 4 matches this
     #    shape and answers "the head is still executing" -- forever, because nothing will ever
     #    complete it. Sibling #1872 said so when it landed: "#1926 (`running` has no age bound, so
     #    a wedged check-run parks a PR forever)". The age bound is the missing dimension, and
     #    without this arm the class is a WAIT that never ends (pre-merge on this branch's base it
     #    was `fix-ci`, i.e. a lane sent to REPAIR CODE FOR A JOB THAT NEVER RAN -- measured
     #    `{'fix-ci': 1}`; on the merged tree it is `running`).
-    #    ⛔ AND IT SITS ABOVE `resolve-conflict` (arm 4), where `CLASS_ORDER` records it. That is the
+    #    ⛔ AND IT SITS ABOVE `resolve-conflict` (arm 1), where `CLASS_ORDER` records it. That is the
     #    recorded ladder, not a preference: a rebase CHANGES THE HEAD, so a re-trigger before it is
     #    at worst one redundant API call, while the reverse order lets a DIRTY PR with a wedged
     #    suite sit in `resolve-conflict` while the wedge is never named. Pinned by test.
-    #    ⛔ AND IT BOUNDS THE OTHER HALF OF `running` TOO (#1926 review, P1). Arm 5's
+    #    ⛔ HOISTING IT HERE IS BEHAVIOUR-PRESERVING, and that is why the ladder above and #1936's
+    #    refinement can both hold: this arm and `call-rail` (arm 2) are PROVABLY DISJOINT.
+    #    `wedge_evidence` is non-empty only when a GATED check is stalled, or when a required gate
+    #    is ABSENT while every attempt in flight is stalled -- both need a non-green gated check
+    #    (`gated_red`/`gated_flight`/`gated_absent`), and `call-rail` requires `not nongreen`. So
+    #    neither order can change an answer, and `call-rail`'s promise -- a LANDABLE PR is never
+    #    delayed by a check elsewhere -- survives intact. What it does buy is the only ordering
+    #    that satisfies BOTH recorded decisions at once: `rerun-checks` above `resolve-conflict`
+    #    (#1926's pinned ladder) and `resolve-conflict` above `call-rail` (#1936).
+    #    ⛔ AND IT BOUNDS THE OTHER HALF OF `running` TOO (#1926 review, P1). Arm 4's
     #    `gated_absent and flight` term had NO age term, so a required gate that is absent while a
     #    NON-required child job is wedged satisfied it forever: `gated_flight == []`,
     #    `gated_absent == [6 names]`, `flight == {"test (a)"}` -> `running`, indefinitely, while
@@ -1443,20 +1827,85 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     if not gated_red and wedge_evidence(stalled, gated_absent,
                                         inflight_attempts(cr), flight_stalled):
         return "rerun-checks"
-    # 4. resolve-conflict -- GitHub says DIRTY. A rebase CHANGES THE HEAD, so it is right even
-    #    while checks are still running (they all re-run anyway) -- which is why it sits ABOVE
-    #    the `running` arm below.
-    #    ⛔ AND IT CANNOT FIRE FOR AN ATTESTED PR: arm 1 returns first, so a green+attested head
-    #    that has since gone DIRTY reads `call-rail`, whose brief says the rail would take it --
-    #    while the rail refuses a conflicted PR. Pre-existing, and DELIBERATELY left alone here
-    #    (the edge is pinned by `test_knows_the_one_edge_the_strict_order_creates` as "PINNED, NOT
-    #    ENDORSED", so fixing it changes the arm spec). Tracked in agent-infra #1936 (QUALIFIED, not
-    #    a bare `#1936`: these files live in agent-infra but a bare number reads as the repo under
-    #    test, tortoise, where #1936 is an unrelated packs feature); two reviewers rated it
-    #    P1, so it should land before this ordering is trusted.
-    if (pr.get("mergeStateStatus") or "") == "DIRTY":
+    # 1. resolve-conflict -- a POSITIVE conflict answer (`mergeStateStatus=DIRTY` or
+    #    `mergeable=CONFLICTING`), so THE RAIL WILL REFUSE THIS HEAD whatever the checks say, and
+    #    the work is a REBASE.
+    # ⛔ THIS ARM MUST PRECEDE `call-rail`. It did not, and the resulting class was a lie the
+    #    dispatcher then repeated to a lane: a fully green, CURRENTLY ATTESTED PR whose base had
+    #    moved (head untouched, so nothing stale) read `call-rail`, and the brief for that class
+    #    tells a lane "MERGE #N -- nothing else is needed ... Everything is done except the last
+    #    step" -- while `scripts/admin-merge.sh` refuses exactly that PR (`CONFLICTED`).
+    #    MEASURED 2026-10-16 against this predicate: `DIRTY + 7 green + attested -> call-rail`
+    #    with `rail_block_reason -> None`, because `rail_block_reason` reads CHECKS ONLY and
+    #    cannot see mergeability. It is a NORMAL live shape, not a corner: an attested green PR
+    #    goes DIRTY when its base advances without touching its head -- so no lane was ever told
+    #    to rebase, and the PR sat until something else noticed.
+    #    A rebase CHANGES THE HEAD and stales the attestation, which is the same reason
+    #    `resolve-conflict` already sat above `record-review`.
+    #    ⛔ IT IS THEREFORE ALSO RIGHT WHILE CHECKS ARE STILL RUNNING (they all re-run anyway),
+    #    which is why it sits above the `running` arm (arm 4).
+    #    Only a POSITIVE conflict answer counts -- a literal `DIRTY` state, or
+    #    `mergeable=CONFLICTING`. `mergeStateStatus` is computed LAZILY and reads UNKNOWN
+    #    fleet-wide while it recomputes, and treating an UNREAD state as a conflict would send
+    #    every PR to a needless rebase -- absence is not evidence (see `rail_block_reason`).
+    #    ⛔ `mergeable=CONFLICTING` IS AN ANSWER, NOT AN ABSENCE, AND THIS PREDICATE NOW HAS IT.
+    #    The queue read requests both fields (`queue()`'s `--json` list) and the classifier read
+    #    only the state word, so the ONE disagreement window GitHub actually produces --
+    #    `mergeable` settled at CONFLICTING while `mergeStateStatus` is still recomputing as
+    #    UNKNOWN -- read `call-rail` on a head GitHub says it cannot merge. `mergeable=UNKNOWN`
+    #    (the field's own unread value) stays not-evidence, on the same rule.
+    #    ⛔ THIS ARM IS NOW THE ONLY PLACE A CONFLICT IS DECIDED. `call-rail` used to carry a
+    #    second `DIRTY` check inside its `_rail` branch (#1872 round 12); with this arm above it
+    #    that check could never fire, and a duplicate that cannot fire is a second definition
+    #    waiting to diverge.
+    if (pr.get("mergeStateStatus") or "") == "DIRTY" \
+            or (pr.get("mergeable") or "") == "CONFLICTING":
         return "resolve-conflict"
-    # 5. running -- THE HEAD IS STILL EXECUTING, and nothing can be decided about it yet.
+    # 2. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
+    #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
+    #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
+    #    ⛔ NO ARM ABOVE THIS ONE CAN DELAY A LANDABLE PR, which is the property this arm used to
+    #    state as "STAYS FIRST": arm 0 is disjoint from it (see there), and arm 1 fires only on a
+    #    head the rail REFUSES -- i.e. not landable. So the cheapest landing on the board still
+    #    never queues behind a check elsewhere (see arm 4).
+    #    ⛔ A RAIL GATE *IN FLIGHT* IS NOT A DEFECT TO REPAIR (#1872 review round 7).
+    #    `rail_block_reason` deliberately accepts a gate that is in flight as well as one that is
+    #    red -- but the two are opposite instructions. `blocked-by-rail` becomes the brief "THE RAIL
+    #    REFUSES IT ON <gate>. REPAIR THAT, THEN MERGE." MEASURED: all six required contexts green,
+    #    attestation clean, `drift-guard` merely `in_progress` -> `blocked-by-rail(drift-guard)`, so
+    #    a lane was dispatched to repair a gate that had not concluded. That is the same harm arm 4
+    #    exists to remove ("a check in flight is not work", 3h burned on #7924), so an
+    #    in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`.
+    #    ⛔ AND A DIRTY HEAD IS STILL THE ONE THING A LANE CAN FIX (#1872 review round 12). This
+    #    arm returning `running` from here once put it ABOVE `resolve-conflict` -- the single
+    #    exception to the arm order, and the one arm the suite did not pin. MEASURED: six required
+    #    contexts green + attestation + DIRTY + `drift-guard` `in_progress` -> `running`, i.e.
+    #    "wait", while the only available fix is a REBASE that no check will ever do. Both
+    #    consumers skip `running` and its only escalation is `STUCK`, which is emitted for
+    #    `call-rail` alone, so such a PR could wait forever. ARM 1 now answers every conflicted
+    #    head before this arm is reached, so there is no DIRTY check left in here: a second one
+    #    could never fire.
+    if not nongreen and att_clean:
+        _rail = rail_block_reason(red, flight, seen)
+        if _rail:
+            if _rail in red:
+                return "blocked-by-rail"
+            return "running"
+        return "call-rail"
+    # 3. rerun-checks -- NO required check has REPORTED at this head, and nothing is executing.
+    #    ⛔ `and not flight` IS LOAD-BEARING (#1872 review). Without it this arm SHADOWED arm 4
+    #    for the exact shape arm 4 was written for: a fresh head where no required context has
+    #    reported yet while other checks are already running -- which is the NORMAL first state
+    #    of a push, because `python-ci-gate` (and `docs`, `legal-e2e`) are created seconds after
+    #    the children. `req_seen` empty means "not reported yet" as often as "never ran", and
+    #    the two need OPPOSITE actions: wait, versus START the workflow. Worse, the dispatcher's
+    #    `rerun-checks` brief asserts "(Nothing is in flight ...)" and tells the lane to push an
+    #    empty commit -- so the shadowed arm sent it to churn a 20-second-old head, wasting
+    #    runner capacity and staling the attestation. `drive`/`drift-guard`/`sigpipe-guard`
+    #    being red cannot reach here: they are not in REQUIRED.
+    if not req_seen and not flight:
+        return "rerun-checks"
+    # 4. running -- THE HEAD IS STILL EXECUTING, and nothing can be decided about it yet.
     #    ⛔ THE SIGNAL IS NOT ONLY "a REQUIRED check is in flight". MEASURED 2026-10-16:
     #    `python-ci-gate` is ABSENT while its child jobs run (`test (a)`, `test-slow (a)`, ...) --
     #    the gate job is created only AFTER the matrix finishes. So the absence of a required
@@ -1466,7 +1915,7 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     #    `unreviewed` (go review it) -- so on #8825 the two readers disagreed about whether to
     #    work at all. The series is enumerated once, in the file header (4 of 11: #8825 plus
     #    #8806/#8822/#8824); these three are the ones this arm answers, and #8822 is the
-    #    nothing-in-flight shape arm 7 answers instead.
+    #    nothing-in-flight shape arm 6 answers instead.
     #    ⛔ BUT A RED REQUIRED CHECK IS STILL WORK, even beside a running unrelated job: waiting
     #    on a lint/typecheck job to finish before repairing a genuinely failing gate would only
     #    delay the fix (#8708). So the arm covers flight-or-not-yet-reported, NEVER red -- the
@@ -1476,16 +1925,16 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     #    was reported `running` for the rest of the suite and no lane ever repaired it.
     if (gated_flight or (gated_absent and flight)) and not gated_red:
         return "running"
-    # 6. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
+    # 5. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
     #    current clean attestation at this head. This is the LEGITIMATE case, and it is the exact
-    #    complement of arm 1: the ONLY difference between landing a PR and re-recording it is
+    #    complement of arm 2: the ONLY difference between landing a PR and re-recording it is
     #    whether the attestation at THIS head exists, which is why the file -- not the check-run
     #    -- decides. (An all-green `ai-review-gate` with a SUPERSEDED record lands here too: a
     #    green gate at an old head is evidence about that head, not this one.)
     if not nongreen and not att_clean:
         return "record-review"
-    # 7. rerun-checks -- SOME required check never ran at this head while others COMPLETED, and
-    #    the head is not executing (arm 5). Absence is not green, and it is not a failure to FIX:
+    # 6. rerun-checks -- SOME required check never ran at this head while others COMPLETED, and
+    #    the head is not executing (arm 4). Absence is not green, and it is not a failure to FIX:
     #    the job that was never created has to be STARTED. MEASURED #8822: `python-ci-gate`
     #    absent (its job never got created), `drift-guard` red, `ai-review-gate` red and NOTHING
     #    in flight -- the arms above made that `fix-ci` (send a lane to repair code), and the
@@ -1494,9 +1943,8 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     #    re-trigger the check first.
     if gated_absent and not gated_red:
         return "rerun-checks"
-    # 8. fix-ci -- a required check is RED: real code work.
+    # 7. fix-ci -- a required check is RED: real code work.
     return "fix-ci"
-
 
 def fix_ci_reasons(cr):
     """The REQUIRED check names that are RED, sorted -- the IN-PROGRESS work list.
@@ -1680,9 +2128,9 @@ KNOWN_MERGE_STATES = frozenset({"BLOCKED", "DIRTY", "UNSTABLE", "CLEAN", "BEHIND
 # publishing one sample from it beside fourteen from `gh pr list` is how two differently-wrong
 # reads get reported as one measurement. Sample the same query again.
 #
-# BUDGET, and why it is small: the beat's refresh is bounded at 90 s (`heartbeat-loop.sh`,
-# `run_bounded 90 objective-refresh`) and a full recompute already costs ~12 s (~513 graphql
-# calls, one per PR/check-suite). Each re-read is ONE list query plus a few seconds of waiting,
+# BUDGET: the beat's refresh is bounded by `run_bounded` in `heartbeat-loop.sh` (raised to 180 s
+# alongside this read in #2227; see `QUEUE_READ_MAX_S`) and a full recompute already costs ~12 s
+# (~513 graphql calls, one per PR/check-suite). Each re-read is ONE list query plus a few seconds of
 # and `classify_queue` runs ONCE after the loop, so a re-sample never repeats the per-PR storm.
 # A recompute window longer than this budget is genuinely not settled FOR THIS BEAT; BLIND is
 # then the truthful answer (and, until #1916, a BLIND line IS still cached -- `main()`'s guard
@@ -1690,9 +2138,99 @@ KNOWN_MERGE_STATES = frozenset({"BLOCKED", "DIRTY", "UNSTABLE", "CLEAN", "BEHIND
 # that as "the next beat re-samples": the next RECOMPUTE does).
 QUEUE_BLIND_ATTEMPTS = 4                      # 1 fresh read + 3 re-reads
 QUEUE_BLIND_BACKOFF_S = (2, 5, 10)            # ~17 s of waiting, all attempts together
-QUEUE_BLIND_BUDGET_S = 20                     # WALL-CLOCK bound on re-sampling, from read 1:
-                                              # a slow first read spends the budget it would
-                                              # otherwise spend on waiting
+
+# ⛔ THE READ BUDGET IS SET FROM A MEASUREMENT, NOT FROM TASTE (#2227). Every `gh` call on a box is
+# SERIALISED (per-box single flight, #2005 -- deliberate: one shared account, and GitHub's
+# secondary limit is triggered by concurrency, so the queue is the remedy). The consequence is that
+# a read's LATENCY is a function of HOW MANY LANES ARE ON THE BOX, and nothing to do with GitHub:
+#
+#     2026-10-20, three cloud cells, 9-14 lane processes per box
+#       lanes=13   `gh pr view`                 63.0 s     <- the worst case this budget answers to
+#       lanes=3    `gh pr view`                  0.676 s
+#       --         raw `curl api.github.com`     0.091 s   <- network + account are FINE
+#
+# The old budget was 20 s for the whole re-sample ladder and 45 s for the read, i.e. BOTH below the
+# measured worst case. A read that simply had not been served yet therefore hit its own timeout and
+# the beat published ABSENCE (`queue_read=BLIND`, `merged_24h=?`, `VERDICT=UNKNOWN`) for a fact it
+# had not established -- roughly hourly, and wrong every time. A budget under the measured latency
+# does not bound the read, it manufactures a false absence.
+GH_SERIALISED_LATENCY_S = 63.0                # MEASURED worst case (13 lanes, one box). Re-measure
+                                              # this before changing the budget below; do not
+                                              # substitute an estimate for it.
+# 1.6x the measurement: one MORE lane than the box we measured is ordinary traffic, not an outage,
+# and a budget that sits exactly ON the measurement re-introduces the false absence the first time
+# the fleet grows by one lane.
+QUEUE_READ_MAX_S = int(GH_SERIALISED_LATENCY_S * 1.6)     # = 100 s
+# ⛔ THIS CAPS THE WHOLE QUEUE READ -- primary AND fallback AND the re-sample ladder (#2138 r3, A;
+# #2227). Anchoring the fallback to `now + TIMEOUT` was right for the slow-primary case and WRONG
+# for the slow-REFUSAL one: `_gh_retry` retries a 5xx three times, so a refusal can arrive having
+# spent most of the budget, and a fresh 30 s socket push would carry the tick past
+# `heartbeat-loop.sh`'s own bound -- where a killed refresh writes NO line at all, strictly worse
+# than the refusal it replaces. Measured from the START of the read: the fallback and every re-read
+# get whatever is left of it, and a refusal that has already spent it gets NO socket and raises its
+# own cause, so the line still prints.
+# ⛔ THE COMPOSITION WITH THE CALLER'S BOUND IS PART OF THIS CONSTANT, AND IT IS ENFORCED BY
+# `test_the_caller_bound_leaves_room_for_the_whole_read` (#2227). The refresh is bounded by
+# `run_bounded` in `heartbeat-loop.sh` and by `bounded` in `lane-scan-fallback.sh`; both are sized
+# ABOVE this cap plus the ~12 s of tick work before `queue()` (`main_sha`, `main_health`,
+# `ci_critical_path`) and the per-PR `classify_queue()` storm after it (one check-run read per open
+# PR, ~12 s on a full recompute). Raising this cap without raising those makes the read budget
+# INERT: the process is killed first and writes nothing.
+# ⛔ THE RE-SAMPLE WINDOW IS DERIVED FROM THE SAME MEASUREMENT, AND IS NOT THE READ CAP (#2227).
+# It must fit ONE slow-but-successful read (63 s measured) plus the backoff ladder above (17 s),
+# or #1869's re-sample is unreachable on exactly the boxes that need it: a 20 s window was spent
+# merely being SERVED, so the ladder never ran and a merely-late merge state was declared blind.
+# It stays BELOW `QUEUE_READ_MAX_S` on purpose -- it is a SUB-window of the read, and the REST
+# second source is anchored to the OUTER cap, so a primary that eats this whole window still
+# leaves the fallback room to answer (that property is pinned by
+# `test_a_SLOW_primary_read_still_leaves_the_fallback_one_page`).
+QUEUE_BLIND_BUDGET_S = 85                     # = 63 s measured read + 17 s ladder + 5 s margin
+# A read that ANSWERS but costs more than this is reported as SLOW beside its data. The measured
+# quiet-box cost is 0.676 s (3 lanes), so 5 s is ~7x the fast path: comfortably above ordinary
+# jitter, comfortably below the 63 s serialised worst case. It NEVER changes a count or a verdict --
+# `read_s` is a property of the READ, not of the queue.
+SLOW_READ_S = 5.0
+
+# ⛔ THE READER CLIPS ITS OWN CAP TO THE CALLER'S BOUND, AND THAT IS A DEPLOYMENT FACT, NOT A
+# REFINEMENT (#2227). `QUEUE_READ_MAX_S` only bounds the READ; the PROCESS is bounded by whichever
+# shell wraps it, and those two are deployed SEPARATELY: `objective.py` is in the fleet farm, but
+# `heartbeat-loop.sh` is a DECLARED, WITHHELD entry there (#1553) because the live copy is ahead of
+# the repo. So this file can reach a box whose loop still kills the refresh at 90 s -- and a read
+# cap of 100 would then guarantee the refresh is SIGKILLed mid-read, writing NO line at all, which
+# is strictly worse than the false absence this change removes.
+# Therefore the caller DECLARES its bound and the reader clips to it: a box running the new loop
+# gets the full 100 s, a box running the old one gets 66 s (still above the 63 s measurement, and
+# it still PRINTS), and neither can be killed before it has said something.
+CALLER_BOUND_ENV = "OBJECTIVE_CALLER_BOUND_S"
+# The SMALLEST caller bound in the fleet today -- `heartbeat-loop.sh`'s historical 90 s. Used when a
+# caller declares nothing, so the default is the conservative one.
+DEFAULT_CALLER_BOUND_S = 90
+# What the read must leave the rest of the refresh: ~12 s of tick work before `queue()`
+# (`main_sha`, `main_health`, `ci_critical_path`) and ~12 s of per-PR `classify_queue()` after it.
+CALLER_OVERHEAD_S = 24
+
+
+def _read_cap_s():
+    """The wall-clock cap for ONE queue read, clipped to what the caller will actually allow.
+
+    A declared bound that cannot parse falls back to the conservative default rather than to the
+    optimistic one: guessing HIGH here is the direction that gets the process killed and loses the
+    line, and a lost line cannot be distinguished from a monitor that never ran.
+    """
+    raw = os.environ.get(CALLER_BOUND_ENV)
+    try:
+        bound = float(raw)
+        if not (bound > 0):
+            raise ValueError(raw)
+    except (TypeError, ValueError):
+        bound = float(DEFAULT_CALLER_BOUND_S)
+    # ⛔ NO 1.0 FLOOR (#2227 review, VGATE). A `max(1.0, …)` here would silently RE-EXCEED the
+    # caller's bound for any declaration at or below `CALLER_OVERHEAD_S` -- i.e. the clip would be
+    # defeated by the very expression that implements it, and the invariant this function states
+    # ("neither can be killed before it has said something") would be false for small bounds. A
+    # cap of 0 is the honest answer to "you have declared no room": the read fails fast on its own
+    # spent deadline and PRINTS `queue_read=UNREADABLE(waited=…)` instead of running past the kill.
+    return max(0.0, min(float(QUEUE_READ_MAX_S), bound - CALLER_OVERHEAD_S))
 
 
 # ⛔ THE QUEUE READ HAS A SECOND SOURCE, AND IT IS A DIFFERENT BUCKET (#2138).
@@ -1727,22 +2265,8 @@ QUEUE_REST_MAX_PAGES = 5                      # a bound on PAGES; reaching it wi
 QUEUE_REST_TIMEOUT_S = 30                     # PER-PAGE ceiling, further clipped to the queue read's
                                               # own remaining budget and re-checked after every
                                               # page (`_queue_rest(deadline=…)`), so the fallback
-                                              # cannot add a 5 x 30 s tail to a beat that is killed
-                                              # at 90 s
-# ⛔ THIS CAPS THE QUEUE LIST FETCH (primary + fallback), NOT THE WHOLE QUEUE READ (#2138 r3, A).
-# Anchoring the fallback to `now + TIMEOUT` was right for the slow-primary case and WRONG for the
-# slow-REFUSAL one: `_gh_retry` retries a 5xx three times, so a refusal can arrive having spent
-# 60-75 s of the beat's 90 s refresh bound, and a fresh 30 s socket push the tick past
-# `run_bounded 90 objective-refresh` (`heartbeat-loop.sh`) -- where a killed refresh writes NO line
-# at all, strictly worse than the refusal it replaces. Half the bound, measured from the START of
-# the read: the fallback gets whatever is left of it (still a full page in the ordinary case), and
-# a refusal that has already spent it gets NO socket and raises its own cause, so the line prints.
-# ⛔ WHAT IS OUTSIDE THIS BOUND, SAID PLAINLY: the ~12 s of tick work before `queue()` runs
-# (`main_sha`, `main_health`, `ci_critical_path`) and the per-PR `classify_queue()` storm AFTER the
-# list is in hand (one check-run read per open PR, ~12 s on a full recompute) are neither included
-# nor claimed to be -- 12 + 45 + 12 is still under the 90 s kill, which is why the split is safe,
-# not because the cap covers them.
-QUEUE_READ_MAX_S = 45
+                                              # cannot add a 5 x 30 s tail to the read's own
+                                              # `QUEUE_READ_MAX_S` cap
 
 
 def _gh_hosts_path():
@@ -1941,7 +2465,7 @@ def _body_names_rate_limit(e, deadline=None):
     `timeout=0.5`** — 9.6x the timeout and 9.6x the page budget. That is the same mechanism this
     file already records for the 200 path, and the earlier version of this helper asserted the
     opposite for the error path. At `QUEUE_REST_TIMEOUT_S = 30` the worst case would be 4096 x 30 s,
-    i.e. a stall past `run_bounded 90 objective-refresh`, where the beat is killed with NO line
+    i.e. a stall past the caller's `run_bounded` bound, where the beat is killed with NO line
     written — the silent stall the chunk loop exists to prevent.
 
     So: `read1()` where it exists, `deadline` checked BEFORE every chunk, and `ERR_BODY_BYTES` as
@@ -2030,7 +2554,7 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
     deadline between calls but called `r.read(8192)`, and on CPython that is
     `BufferedReader.read(n)` -> up to **n `recv`s**, each resetting the socket's per-recv timeout.
     The deadline cannot fire INSIDE a call, so the worst case was 8192 x `QUEUE_REST_TIMEOUT_S`,
-    i.e. a stall past `run_bounded 90 objective-refresh` — and a killed beat writes NO line, which
+    i.e. a stall past `run_bounded`'s bound — and a killed beat writes NO line, which
     is strictly worse than the refusal this fallback replaces. "At most one chunk" is a bound on
     BYTES, not on TIME; stated as one chunk it was false. So: `read1` where the response offers it
     (one recv per call, and `HTTPResponse.read1` exists on every CPython this repo runs), the
@@ -2183,8 +2707,10 @@ def _queue_rest(deadline=None):
     kill"; that is not true as written, and this file's own
     `test_a_response_that_arrives_past_the_budget_contributes_NO_chunk` demonstrates a page whose
     `open()` alone spends 60 s against a 10 s budget. The arithmetic in `QUEUE_READ_MAX_S`
-    (12 + 45 + 12 against the 90 s kill) leaves ~21 s of headroom, which is LESS than one 30 s
-    header phase -- so a header stall can carry the tick past the kill, where NO line prints.
+    (12 + 100 + 12 against the 180 s bound) leaves ~56 s of headroom -- less than two 30 s
+    header phases, so a header stall can still carry the tick past that bound, where NO line
+    prints. (#2227 raised the cap and the bound together; before it the same arithmetic left
+    ~21 s of headroom, which made the read budget a kill timer rather than a budget.)
     Stated rather than papered over: closing it needs a bound on the header phase (a shorter
     per-recv timeout, or a watchdog around `open()`), which is a change to `_rest_get`'s socket
     handling and not to this budget.
@@ -2405,8 +2931,12 @@ def queue():
     reads = 0
     resample_failed = 0
     read_start = _monotonic()
-    read_deadline = read_start + QUEUE_READ_MAX_S   # the cap the WHOLE read answers to (see above)
-    deadline = read_start + QUEUE_BLIND_BUDGET_S    # measured from the FIRST read
+    _cap = _read_cap_s()                            # clipped to the CALLER's bound (see above)
+    read_deadline = read_start + _cap               # the cap the WHOLE read answers to
+    deadline = read_start + min(float(QUEUE_BLIND_BUDGET_S), _cap)   # measured from read 1
+    _t0 = _wall()          # MEASUREMENT, not a bound -- see `_wall()`
+    attempts_tried = 1     # reads ATTEMPTED (not samples accepted): what the refusal reports
+    QUEUE_READ_FAIL.clear()
     for attempt in range(QUEUE_BLIND_ATTEMPTS):
         remaining = deadline - _monotonic()
         if attempt and remaining <= 0:
@@ -2581,10 +3111,31 @@ def queue():
                          else isinstance(e, (RuntimeError, subprocess.TimeoutExpired)))
             _note_gh_failure(f"queue read failed: {e}", surface, transport=transport)
             if sample is None:
+                # ⛔ A FAILED READ IS A FACT ABOUT THE READ, AND THE RECORD MUST SURVIVE THE
+                # `return None` (#2227). The caller cannot report "how long it waited" or "what
+                # it tried" from a bare `None` -- and a refusal whose message omits both is
+                # indistinguishable from one that failed instantly, which is exactly how a
+                # crowded box read as an outage. Recorded here, at the ONE exit that loses the
+                # data; the reader is `build()`'s queue segment.
+                #
+                # WHAT IT TRIED IS READ FROM THE FAILURE RECORD, NOT FROM THE ATTEMPT COUNTER:
+                # the primary failure path ALSO consults the REST second source, so a counter
+                # that stands at 1 would claim the fallback was never reached on the very ticks
+                # that ran it. `GH_LAST_ERROR` is the record of the LAST read that failed, and
+                # the REST arm prefixes its own cause with "rest second source".
+                _rest_tried = "rest second source" in (GH_LAST_ERROR or "")
+                QUEUE_READ_FAIL.update(
+                    waited_s=round(_wall() - _t0, 1),
+                    tries=attempts_tried,
+                    tried=("gh pr list --limit %d (GraphQL)" % QUEUE_PRIMARY_LIMIT
+                           + ("; then REST /pulls" if _rest_tried
+                              else "; the REST second source was not reached")),
+                    cause=str(e)[:160])
                 return None
             resample_failed += 1
             break
         reads += 1
+        attempts_tried = reads
         ms = Counter(p.get("mergeStateStatus") or "?" for p in non)
         unknown = _mergeable_unknown(ms)
         blind_now = _queue_read_is_blind(unknown, len(non), source)
@@ -2632,9 +3183,16 @@ def queue():
             # "an unread value must never render as a zero" shape this file forbids. No consumer
             # reads these two today; making them honest is what stops the next one inheriting a
             # false zero.
+            # `dirty`/`unstable` are None whenever the merge state was unread (see above).
             "dirty": None if (blind or unread) else ms.get("DIRTY", 0),
             "unstable": None if (blind or unread) else ms.get("UNSTABLE", 0), "unknown": unknown,
             "source": source,
+            # ⛔ HOW LONG THE READ TOOK IS PART OF THE ANSWER, NOT A DEBUG DETAIL (#2227). On this
+            # fleet a queue read costs 0.7 s on a quiet box and 63 s at 13 lanes, and until now
+            # both printed as a bare `open=14` -- so a reader could not tell a fast path from one
+            # that had spent the entire budget and got in by a hair. `read_s` is what lets
+            # `build()` say SLOW beside the data instead of leaving the reader to guess.
+            "read_s": round(_wall() - _t0, 1),
             "mergeable_reads": reads, "resample_failed": resample_failed,
             "classes": classes, "by_class": by_class, "surface": surface,
             # ⛔ THE OWNER'S LIST SURVIVES THE REFUSAL (#1872): `classify_queue()` returns it in
@@ -2784,12 +3342,28 @@ def build(prev=None):
         # can only be calibrated from the second: on the settling path the count is the datum, and
         # on the never-settling path it is the only datum there is.
         _rsf = " resample=FAILED" if q.get("resample_failed") else ""
+        # ⛔ THE WAIT IS PART OF EVERY `queue_read` TOKEN (#2227). It is appended AFTER the token's
+        # closing paren rather than inside it, so every existing pin on the token's shape
+        # (`queue_read=BLIND(14/14 unread, samples=4)`) still matches: the count, the threshold and
+        # the ordering are #1869's and are unchanged, and the DURATION is the new fact beside them.
+        # A refusal that says nothing about how long it waited reads like an instant one -- which is
+        # how a crowded box (63 s, measured) was reported as an outage (0.09 s on the wire).
+        _waited = q.get("read_s")
+        _wait_tok = (f" waited={_waited:.1f}s" if isinstance(_waited, (int, float)) else "")
+        # ⛔ SLOW IS NOT BLIND, AND THAT IS THE WHOLE POINT (#2227). The read ANSWERED -- the
+        # counts beside this token are DATA -- it simply answered late, because `gh` is serialised
+        # per box (#2005) and this box had 13 lanes on it. `BLIND` stays reserved for its #1869
+        # meaning (the merge state never came back readable), because a word that covers both
+        # "we waited 63 s and got an answer" and "we never got an answer" cannot be acted on.
+        _slow = (not _blind and _src != "rest"
+                 and isinstance(_waited, (int, float)) and _waited >= SLOW_READ_S)
         if _u:
             parts.append(f"mergeable_state_unknown={_u}")
         if _blind:
             # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
             # fail-closed job belongs to whatever token stands where the zeros used to.
-            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread, samples={_reads}){_rsf}"
+            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread, samples={_reads})"
+                         f"{_rsf}{_wait_tok}"
                          " -- the QUEUE counts are NOT a clearance")
         elif _src == "rest":
             # ⛔ THE FALLBACK MUST NOT MANUFACTURE BLINDNESS (#2138), AND IT MUST NOT PASS FOR A
@@ -2803,7 +3377,8 @@ def build(prev=None):
             # says exactly which half is trustworthy.
             if _u:
                 parts.append(f"queue_read=REST(merge_state unread {_u}/{q['nondraft']},"
-                             f" samples={_reads}){_rsf} -- list read over REST; GitHub did not"
+                             f" samples={_reads}){_rsf}{_wait_tok} -- list read over REST;"
+                             " GitHub did not"
                              " compute the merge state, so the CLASS counts are NOT a clearance"
                              " (queue depth IS read)")
             else:
@@ -2812,7 +3387,8 @@ def build(prev=None):
                 # file could not read as a list, and when it hit its own row cap — so the old
                 # wording sent a reader to hunt a rate limit that never happened. Saying only
                 # what is known costs the same.
-                parts.append(f"queue_read=REST(samples={_reads}){_rsf} -- the open-PR list was"
+                parts.append(f"queue_read=REST(samples={_reads}){_rsf}{_wait_tok} -- the"
+                             " open-PR list was"
                              " read over REST because the GraphQL read produced no usable list"
                              " (refused, or an answer this file could not read as one)")
             # ⛔ THE FILE OVERLAY IS A THIRD, SEPARATE DEGRADATION, AND OMITTING ITS TOKEN IS
@@ -2824,7 +3400,14 @@ def build(prev=None):
             # `ASK-USER` exists for. So it is PRINTED as unread, before the `QUEUE(` segment.
             parts.append("ASK-USER: surface=UNREAD(rest list carries no file list)")
         elif _reads > 1 or _rsf:
-            parts.append(f"queue_read=SETTLED(samples={_reads}){_rsf}")
+            parts.append(f"queue_read=SETTLED(samples={_reads}){_rsf}{_wait_tok}")
+        elif _slow:
+            # THE READ THAT WAS MERELY LATE. No caveat, because there is nothing to caveat: the
+            # counts, the classes and the owner's list are all real. The sentence exists so a
+            # reader can see the fleet is queueing rather than the instrument being unreliable --
+            # and so `waited=` is never the only difference between two lines that look alike.
+            parts.append(f"queue_read=SLOW(waited={_waited:.1f}s, samples={_reads}){_rsf}"
+                         " -- the counts are DATA: the read answered late, it did not fail")
         if q.get("surface"):
             _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
             parts.append(f"ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else ""))
@@ -2890,6 +3473,26 @@ def build(prev=None):
         waiting = q["nondraft"]
     else:
         parts.append("queue=UNREADABLE")
+        # ⛔ A REFUSAL MUST NAME ITSELF (#2227): WHAT IT TRIED, HOW LONG IT WAITED, AND THE AGE OF
+        # THE LAST THING THAT WAS ACTUALLY READ. `queue=UNREADABLE` alone is three facts short of a
+        # diagnosis -- and the missing one that matters most is the WAIT, because a 100 s wait that
+        # timed out is a crowded box (a capacity fact: add no lanes, or spread them) while a 0.3 s
+        # refusal is a rate limit (a wait-a-minute fact). The two demand opposite responses and used
+        # to print the same token.
+        #
+        # ⛔ AND IT PRINTS NO COUNT. This is #1869's line, not a relaxation of it: the last good
+        # sample's AGE is borrowed from the cache's mtime, never its numbers, so a stale value can
+        # never stand in for an unread one. `last_good=none` is said out loud rather than omitted,
+        # because an absent token would read as "we have never read it" only by inference.
+        _lg = _last_good_age_s()
+        _lg_tok = f"last_good={_lg}s" if _lg is not None else "last_good=none"
+        _wait = QUEUE_READ_FAIL.get("waited_s")
+        _wait_ref = (f"waited={_wait:.1f}s" if isinstance(_wait, (int, float))
+                     else "waited=?")
+        parts.append(
+            f"queue_read=UNREADABLE({_wait_ref}, {_lg_tok})"
+            f" -- tried {QUEUE_READ_FAIL.get('tried') or 'gh pr list (GraphQL)'}; the QUEUE counts"
+            " are NOT shown because none were read (a stale number is never substituted)")
         waiting = None
     # ⛔ THE QUEUE'S SHAPE IS NOT THE DISPATCHER'S HEALTH, AND THE VERDICT MUST SURVIVE BOTH A BLIND
     # QUEUE AND A LONG ONE (2026-10-18, owner-reported + review). Emitted OUTSIDE every queue branch
@@ -2943,7 +3546,7 @@ def build(prev=None):
         # steady or shrinking. (Named ADVANCING since 2026-09-29; the word is kept for
         # interface stability.)
         verdict = "ADVANCING"
-    return f"OBJECTIVE VERDICT={verdict} " + " ".join(parts)
+    return f"OBJECTIVE VERDICT={verdict} " + " ".join(parts) + " " + repo_seg()
 
 
 # ⛔ A VERDICT MAY NOT BE SERVED STALER THAN THIS (measured 2026-10-06, #4844).
@@ -3307,6 +3910,22 @@ def main():
     if "--json" in args:
         max_age = 0
 
+    # ⛔ WHICH REPO THIS READ IS ABOUT IS DECIDED BEFORE ANYTHING IS READ (#2710). The order and the
+    # three sources are documented once, above `REPO_DEFAULT`; this is the only place the CLI binds
+    # them. A MISMATCH REFUSES BEFORE THE FIRST `gh` CALL: reading the wrong repo and then reporting
+    # the 422s was the measured cost (every PR `unreadable`, hours of it), and a named refusal costs
+    # one line instead.
+    global REPO, REPO_SRC, REPO_CHECK
+    _slug, _src, _mismatch, REPO_CHECK = resolve_repo()
+    REPO, REPO_SRC = _slug, _src
+    if _mismatch:
+        # ⛔ THE REFUSAL LINE CARRIES THE SAME SEGMENT AS EVERY OTHER (#2710 review round 1): the one
+        # line that reports a failed read is exactly where "which repo was this about" matters most,
+        # and a reader keyed on `repo=` must not get nothing from it.
+        line = "OBJECTIVE VERDICT=UNKNOWN error=%s %s" % (_mismatch, repo_seg())
+        print(line)
+        return EXIT_REFUSING
+
     # self-cache: the heartbeat calls this every tick; recompute at most once per window
     _serve_max = min(max_age, VERDICT_SERVE_MAX_S) if max_age else 0
     try:
@@ -3336,14 +3955,16 @@ def main():
                     _serve = False          # cannot PROVE liveness → do not serve
                 if _serve:
                     print(_cached)
-                    return
+                    return _exit_for(_cached)
     except Exception:
         pass
 
     try:
         line = build(_previous_sample())
     except Exception as e:                      # never break the heartbeat
-        line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]}"
+        # ⛔ AND THIS LINE NAMES THE REPO TOO. It is the line a failed read produces, so it is the
+        # one place a reader cannot otherwise tell a tortoise read from an agent-infra one.
+        line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]} {repo_seg()}"
     # `RES:` GOES ON ITS OWN LINE -- and NOT because the objective line is too long for the cut
     # (#1872 review round 18: that sentence was false the moment the cut reached 900, and MEASURED
     # an objective line is ~300 chars; the sibling comment in `cadence-nudge.sh` says the same).
@@ -3369,14 +3990,13 @@ def main():
     # The retry in _gh_retry absorbs the blip at source; this stops a surviving one from being
     # frozen. Both are the same rule this file's header already states in another form: an
     # empty read and an absent thing must never share a word -- and must never share a cache.
-    blind = ("gh=UNREADABLE" in line or "main=UNKNOWN@?" in line or "error=" in line
-             # ⛔ AND AN UNREAD QUEUE IS A FAILED READ EVEN WHEN NO SURFACE CLAIMED BLINDNESS
-             # (#2138 r5, A/P2). A payload the primary could not use AND no second source is a
-             # non-transport failure -- correctly not a claim (`transport=False`: GitHub answered,
-             # we mangled it) -- but the line then says `queue=UNREADABLE` with no `gh=` token, so
-             # this guard matched nothing and FROZE the blind line for the whole serve window. The
-             # guard keys on the FACT (the queue could not be read), not on which token said so.
-             or "queue=UNREADABLE" in line)
+    # ⛔ AND AN UNREAD QUEUE IS A FAILED READ EVEN WHEN NO SURFACE CLAIMED BLINDNESS (#2138 r5,
+    # A/P2). A payload the primary could not use AND no second source is a non-transport failure --
+    # correctly not a claim (`transport=False`: GitHub answered, we mangled it) -- but the line then
+    # says `queue=UNREADABLE` with no `gh=` token, so the guard would match nothing and FREEZE the
+    # blind line for the whole serve window. The guard keys on the FACT (the queue could not be
+    # read), not on which token said so -- hence ONE predicate, shared with `_exit_for()`.
+    blind = is_blind_line(line)
     try:
         if not blind:
             os.makedirs(STATE, exist_ok=True)
@@ -3386,7 +4006,13 @@ def main():
     except Exception:
         pass
     print(line)
+    # ⛔ THE EXIT CODE IS THE SECOND MACHINE SURFACE, AND IT MUST AGREE WITH THE LINE (#2710).
+    # Before this, every path exited 0 -- a wrong/unreadable world (`VERDICT=UNKNOWN`) was
+    # indistinguishable, to any launcher keying on the code, from `AT-TARGET`. POLARITY, not
+    # vocabulary: only a verdict this file KNOWS to be readable exits 0; anything else -- including
+    # one it has never seen -- is a refusal. A missing check is not a green check.
+    return _exit_for(line)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

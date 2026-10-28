@@ -3,22 +3,25 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.eldato.orchestrator-loop</string>
-  <!-- ⛔ THE JOB RUNS `launchd-controller.sh`, NOT `orch-loop.sh` DIRECTLY, AND THAT IS LOAD-BEARING
-       (measured 2026-10-18, this Mac). macOS TCC denies a launchd-born process the READ of a
-       protected tree, and the product checkout lives under ~/Documents. The denial is on the tree's
-       CONTENT, not merely on the job's cwd: `cd` into the repo SUCCEEDS and every read inside it
-       still fails, so `git` dies `Unable to read current working directory: Operation not permitted`,
-       `_claim_commit` returns "", and every candidate is refused with the misleading `could not build
-       claim commit` while `gh` reads (cwd-blind) look healthy and `launchctl print` says `running`.
-       The Full Disk Access grant on this box is attached to the **tmux binary**, so a process in a tmux
-       pane inherits it. `launchd-controller.sh` launches the controller as a tmux session and blocks
-       while it lives, so KeepAlive still supervises. A cwd-only fix (a readable WorkingDirectory
-       plus `( cd "$REPO" && git … )`) is NOT sufficient on this class — that was measured and failed. -->
+  <string>__LABEL__</string>
+  <!-- ⛔ THE PROGRAM IS THE PINNED TREE, NOT A HOME-DIR COPY (agent-infra#2231, mac pin parity).
+       This used to be `__O__/orch-loop.sh` — `~/orchestrator/orch-loop.sh`, a COPY of a script the
+       repo carries, at no commit at all (a `git rev-parse` there says "not a git repository"). That
+       is the divergence this job now cannot have: the path below is a detached `git worktree` of the
+       agent-infra checkout AT THE PINNED COMMIT, created by `cloud-cell-supervisor.sh`'s pin-only
+       apply — the same materialiser every cloud cell uses — and
+       named by `.harness-path` / `$HOME/.pi/agent/state/HARNESS-PIN`. install.sh REFUSES to render
+       this plist unless the resolved directory IS that worktree at that commit, so a copy can no
+       longer be what the job reads. `__ENTRY__` is chosen INSIDE that tree at render time
+       (`launchd-controller.sh` when the pin carries it — the tmux/Full-Disk-Access wrapper a Mac needs
+       to read the product checkout — else `orch-loop.sh`), never a name from outside it.
+       `$O` (`__O__`) stays the WORKER surface: lanes and fixers are
+       still seeded there, exactly as on a cell (`$O` is seeded so workers can be invoked from it;
+       the controller itself execs the harness it was started from). -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>__O__/launchd-controller.sh</string>
+    <string>__HARNESS__/__ENTRY__</string>
   </array>
 
   <!-- ⛔ THE JOB'S CWD MUST NOT BE THE REPO. A launchd job started with a TCC-denied cwd cannot even
@@ -79,6 +82,25 @@
     <string>__REPO__</string>
     <key>O</key>
     <string>__O__</string>
+
+    <!-- ── THE PIN (agent-infra#2215 / #2231) ──────────────────────────────────────────────────────
+         The same three records the cells read, so this box answers "which harness am I on?" the same
+         way a cell does: HARNESS-PIN is the SHA, `.harness-path` the DIR the controller execs, and
+         HARNESS_PIN_DIR the root the per-commit worktrees live under. They are in the daemon's env
+         (not re-derived by the children) because `harness-refresh.sh` — which runs INSIDE the
+         controller's cycle — reads them to decide whether this box is current, and what to materialise
+         if it is behind. Without HARNESS_MATERIALISER a Mac can only ever report `behind ... pin NOT
+         advanced` (exit 25); with it, the Mac advances its pin exactly like a cell does. -->
+    <key>HARNESS_PIN</key>
+    <string>__HARNESS_PIN__</string>
+    <key>HARNESS_PIN_FILE</key>
+    <string>__HARNESS_PIN_FILE__</string>
+    <key>HARNESS_PIN_DIR</key>
+    <string>__HARNESS_PIN_DIR__</string>
+    <key>HARNESS_REPO</key>
+    <string>__HARNESS_REPO__</string>
+    <key>HARNESS_MATERIALISER</key>
+    <string>__HARNESS_MATERIALISER__</string>
 
     <!-- drain scope: auto (count rule) | own (pin own-only) | broad (pin broad).
          A fleet runs exactly ONE broad box; the rest pin own (README section 5). -->

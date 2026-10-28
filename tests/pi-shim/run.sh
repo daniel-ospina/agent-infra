@@ -309,6 +309,13 @@ chmod +x "$TMP/bin76/gh"
 FIXREPO="$TMP/repofix"; mkdir -p "$FIXREPO"
 git init -q "$FIXREPO" && git -C "$FIXREPO" remote add origin https://github.com/owner/repo.git
 : > "$TMP/agent.log"; rm -f "$TMP/O/state/walltime.tsv"
+# ⛔ THE BRIEF MUST EXIST, AND IT MUST BE COMPLIANT (review cycle 3, P1). `run_agent` now runs the
+# research-first gate BEFORE the load gate, so this arm's `$TMP/brief.txt` — never created, because the
+# arm only cares about the 76->75 translation — made `brief_gate_missing` answer NO-FILE and `run_agent`
+# return 80 (`AGENT_BRIEF_REFUSED`), not the 75 the arm asserts: measured 27/29 on this tree, 29/29 on
+# main before the gate existed. Rendered from the shipped validator so it cannot drift from its advice.
+"$ROOT/scripts/orchestrator-harness/brief-gate.sh" --section lane > "$TMP/brief.txt"
+[ -s "$TMP/brief.txt" ] || { echo "FATAL: could not render the brief fixture"; exit 2; }
 res="$(PATH="$TMP/bin76:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
@@ -402,7 +409,7 @@ FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 run_shim runner >/dev/null 2>&
 [ "$rc" -eq 0 ] && [ -s "$TMP/probe" ] \
   && pass "POSITIVE CONTROL: with a floor this box meets, the spawn point RUNS the real pi (rc=$rc)" \
   || fail "the memory gate refused a spawn the box could afford (rc=$rc)"
-# ── and the TRANSLATION, 72 -> AGENT_MEM_REFUSED, so no caller learns a new code ──
+# ── and the TRANSLATION, 82 -> AGENT_MEM_REFUSED, so no caller learns a new code ──
 mkdir -p "$TMP/bin72"
 printf '#!/usr/bin/env bash\nexit 72\n' > "$TMP/bin72/pi"
 chmod +x "$TMP/bin72/pi"
@@ -417,7 +424,7 @@ res="$(PATH="$TMP/bin72:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 
   printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
 ' _ "$GATE" "$TMP/agent.log" "$TMP/brief.txt" "$FIXREPO" 2>/dev/null)"
 [ "$res" = "rc=73 started=0" ] \
-  && pass "run_agent turns the spawn point's 72 into AGENT_MEM_REFUSED with AGENT_STARTED=0 ($res)" \
+  && pass "run_agent turns the spawn point's 82 into AGENT_MEM_REFUSED with AGENT_STARTED=0 ($res)" \
   || fail "a spawn-point MEMORY refusal was not translated for the callers ($res)"
 grep -q '\[mem-gate\] REFUSED .*spawn point refused the launch for MEMORY' "$TMP/agent.log" \
   && pass "…and the translated line NAMES memory (not load), which is what the callers' remedy keys on" \

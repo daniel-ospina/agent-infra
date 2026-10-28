@@ -117,7 +117,7 @@
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
 #      nothing was consumed — re-dispatch when the box is quiet, do NOT read this as a
 #      code verdict (merge-one.sh's code for the same cause)
-#   73 a spawn-point MEMORY refusal (PI_GATE_MEM_REFUSED=72, agent-infra#2387): the reviewer
+#   81 a spawn-point MEMORY refusal (PI_GATE_MEM_REFUSED=82, agent-infra#2387): the reviewer
 #      never started and nothing was consumed either — a capacity event like 75, with a
 #      DIFFERENT remedy (resident lanes must finish; load falling does not clear it)
 #   10 the P0/P1/P2 SCANNER did not run (awk missing/broken): the transcript could not be
@@ -142,7 +142,7 @@ set -uo pipefail
 PROG="review-pr"
 E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9 E_SCAN=10
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
 die() { local rc="$1"; shift; err "$PROG: $*"; exit "$rc"; }
 usage() {
@@ -414,10 +414,40 @@ SHA_CMD=""
 # ⛔ RESOLVED BY RUNNING IT, NOT BY `command -v` (P2, sixth fresh review): a sha256sum that exists but
 # FAILS (busybox stub, restrictive sandbox, a shim) would be chosen by a lookup and then yield an empty
 # token for every oversized diff — the run would die after the review was paid for, blaming the diff.
+# ⛔ `$_SHA_CMD` IS USED UNQUOTED AT ITS CALL SITES (it may be the two-word `shasum -a 256`), so it is
+# named with the leading underscore that marks a word-splitting command here. `$SHA_CMD` stays the
+# quoted display string; both are set from the same probe so they cannot disagree.
+_SHA_CMD=""
 if printf 'probe\n' | sha256sum >/dev/null 2>&1; then
-  SHA_CMD="sha256sum"
+  SHA_CMD="sha256sum"; _SHA_CMD="sha256sum"
 elif printf 'probe\n' | shasum -a 256 >/dev/null 2>&1; then
-  SHA_CMD="shasum -a 256"
+  SHA_CMD="shasum -a 256"; _SHA_CMD="shasum -a 256"
+fi
+# ⛔ THE RECORDER'S DIFF IDENTITY IS NORMALIZED, SO THE SEAM MUST KNOW THE NORMALIZER (P1, fourth fresh
+# review of #2288): `record-review.sh` signs sha256 over `scripts/lib/diff-normalize.py`'s output (raw
+# digest only as a loud fallback), and its normalizer rewrites `index` lines and hunk headers — so
+# hashing the raw capture produces a digest that NEVER matches a real marker. Resolved next to the
+# sibling repo layout; `DIFF_NORMALIZER_OK` is the arm switch the post-record check reads.
+# ⛔ ITS OWN DIRECTORY, NOT `$SELF_DIR` (P1, this lane — the first version read `$SELF_DIR`, which is
+# only assigned LATER, inside the recorder-resolution branch, so under the fixture override the
+# normalizer was never found and the very P1 this fixes would have survived on the clean path).
+# ⛔ THE NORMALIZER IS THE RECORDER'S, SO LOOK BESIDE THE RECORDER FIRST (P2, fifth fresh review of
+# #2288 — MEASURED: with the seam copied away from `scripts/lib` (or reached through the supported
+# `REVIEW_PR_RECORD_SH` seam / the `$HOME/.pi/agent/scripts` fallback), the seam's three seam-relative
+# candidates found nothing, so the normalized arm was skipped and a real recorder's normalized digest
+# was refused with a message blaming the BASE — on the only success path, with the comment already
+# posted and the record already written). `$RECORDER` is resolved above; the seam-relative candidates
+# stay as fallbacks for a fixture that stubs the recorder.
+_D="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+DIFF_NORMALIZER=""
+_RD=""
+[ -n "${RECORDER:-}" ] && _RD="$(cd "$(dirname "$RECORDER")" 2>/dev/null && pwd || true)"
+for _cand in "${_RD:+$_RD/lib/diff-normalize.py}" "$_D/lib/diff-normalize.py" "$_D/../scripts/lib/diff-normalize.py" "$_D/../lib/diff-normalize.py"; do
+  if [ -s "$_cand" ]; then DIFF_NORMALIZER="$(cd "$(dirname "$_cand")" && pwd)/$(basename "$_cand")"; break; fi
+done
+DIFF_NORMALIZER_OK=""
+if command -v python3 >/dev/null 2>&1 && [ -n "$DIFF_NORMALIZER" ]; then
+  DIFF_NORMALIZER_OK=1
 fi
 DIFF_TAIL=""
 DIFF_LASTLINE=""
@@ -791,7 +821,7 @@ run_reviewer() { # <secs> <log> <prompt-file>
   printf '%s\n' "[review-pr] reviewer pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc capped=${alive_after_cap}" >> "$log"
   return "$rc"
 }
-say "review-pr: reviewing $REPO#$PR at ${HEAD:0:12}… with a fresh-context reviewer (cap ${TIMEOUT}s)"
+log_line "review-pr: reviewing $REPO#$PR at ${HEAD:0:12}… with a fresh-context reviewer (cap ${TIMEOUT}s)"
 run_reviewer "$TIMEOUT" "$LOG" "$PROMPT"
 AGENT_RC=$?
 cp "$LOG" "$TRANSCRIPT" 2>/dev/null || true
@@ -815,15 +845,15 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
   exit 75
 fi
 # ⛔ THE SPAWN POINT'S MEMORY REFUSAL IS THE SAME CLASS AND ITS OWN CODE (agent-infra#2387): the shim
-# exits PI_GATE_MEM_REFUSED=72 when available memory is below the spawn gate's floor, having consumed
+# exits PI_GATE_MEM_REFUSED=82 when available memory is below the spawn gate's floor, having consumed
 # nothing. Without this arm it reached the `AGENT_RC -ne 0` branch below, which names a
 # "crashed/killed/failed reviewer" and tells the operator to re-run — straight back into the same
 # memory floor, with the true cause (and the fact that nothing was paid for) never stated. Fails
 # closed either way, so this is reporting, not exposure: a capacity event named as a crash.
-if [ "$AGENT_RC" = "${PI_GATE_MEM_REFUSED:-72}" ]; then
+if [ "$AGENT_RC" = "${PI_GATE_MEM_REFUSED:-82}" ]; then
   err "$PROG: the reviewer was NOT STARTED — the spawn-point MEMORY gate refused (rc=$AGENT_RC, PI_GATE_MEM_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
   err "  This is a capacity event, not a code verdict and not a crash. Re-run when resident lanes finish and release their working set — this does NOT clear by waiting for load; the [pi-gate] line in the transcript carries the reading and the floor (MEM_MIN_AVAIL_MB)."
-  exit "${AGENT_MEM_REFUSED:-73}"
+  exit "${AGENT_MEM_REFUSED:-81}"
 fi
 # ⛔ THE EXIT STATUS IS THE SIGNAL, NOT A STRING IN THE TRANSCRIPT (P3, fresh review of #2288). This
 # arm used to ALSO match `^\[pi-gate\] REFUSED` anywhere in the log, so a reviewer that QUOTED the
@@ -1112,11 +1142,18 @@ grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
                         # four spaces correctly exited 6. Expand tabs on a COPY (the printed line
                         # keeps the text as the reviewer wrote it).
                         t = ln[i]; gsub(/\t/, "    ", t)
-                        if (t ~ /^    /) continue
+                        # ⛔ AN INDENTED LINE IS STILL A LINE (P2, sixth fresh review of #2288 — MEASURED
+                        # fail-OPEN: `  - 2 blocking defects remain in scripts/x.sh` four columns in —
+                        # an ordinary nested markdown bullet — was dropped by this skip, so the COUNT
+                        # channel never saw it and a signed clean record was minted). The skip stays for
+                        # VERDICT SELECTION (a 4-column line is a code quotation, the declared residual)
+                        # but the line is emitted with a marker so the count channel still reads it, and
+                        # the verdict-shaped grep excludes the marker.
+                        if (t ~ /^    /) { print "\001" ln[i]; continue }
                         print ln[i]
                       }
-                    }' \
-             | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tr -d '\r' > "$RUN_DIR/verdict-lines.txt"
+                    }' | tr -d '\r' > "$RUN_DIR/survivors.txt"
+  grep -av $'^\001' "$RUN_DIR/survivors.txt" | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" > "$RUN_DIR/verdict-lines.txt"
   LAST_LINE="$(tail -1 "$RUN_DIR/verdict-lines.txt" 2>/dev/null)"
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS KEPT (P1/P2, fresh review of #2288): the
   # contradiction guard read only this LAST line, so a counted CLEAN — or an `ISSUES 2` — one line
@@ -1125,6 +1162,13 @@ grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
   # unaffected; the count/binding checks below therefore iterate over it rather than over $LAST.)
 LAST="$LAST_LINE"
 VERDICT_LINES_FILE="$RUN_DIR/verdict-lines.txt"
+# ⛔ THE COUNT CHANNEL IS THE WHOLE SURVIVOR SET, NOT ONLY THE VERDICT-SHAPED LINES (P1, third fresh
+# review of #2288 — MEASURED: `I found two blocking issues:` on one line and a bare `CLEAN` on the
+# next recorded a signed clean record, because the counted line carried no verdict word). A reported
+# count of findings anywhere in the accepted region is a finding, whatever line the reviewer put it
+# on; the zero filter below keeps `0 blocking findings` clean, and quoted/fenced/indented regions
+# are already excluded by the map, so a clean report that QUOTES someone else's count is unaffected.
+SURVIVORS_FILE="$RUN_DIR/survivors.txt"
 # ⛔ THE VERDICT MUST BE THE LAST VERDICT-SHAPED LINE IN THE TRANSCRIPT (P1, fresh review of
 # #2288 — this was a FAIL-OPEN). The map above skips quoted regions, so `tail -1` over the SURVIVORS
 # silently promotes an EARLIER verdict: measured, `**Verdict:** CLEAN` … an unclosed ``` … then
@@ -1310,6 +1354,10 @@ function counts_only(r,   guard, seen) {
 # which is the ratchet this rule exists to stop. The NIT tags below are the same kind of closed
 # list: a label that tags ITSELF as a note is a note, and P3-class notes never block.
 function noun() { return "(findings?|blockers?|issues?|defects?|bugs?|severity|priority|critical|high|major)" }
+# ⛔ ONE NUMERAL CLASS FOR BOTH READERS (P0, eighth fresh review of #2288): the count classifier and the
+# severity scanner count arm must agree on what a count IS, or one of them silently fails open — the
+# class was duplicated and they drifted one spelling over, twice. §BI-2 asserts they stay equal.
+function numwords() { return "(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|dozen|single|sole|lone|several|multiple|many)" }
 function nittag(s) { return (s ~ /^[[:space:]]*[*_`]*(\()?\[(nit|note|optional|informational|suggestion)[)\]][[:space:]]*:/ || s ~ /^[[:space:]]*[*_`]*\((nit|note|optional|informational|suggestion)\)/) }
 function sepafter(s) { return (s ~ /^[[:space:]*_`]*[][):.,;—–-]/) }
 function label(s,   a, b, pre, post, sl) {
@@ -1437,7 +1485,15 @@ function label(s,   a, b, pre, post, sl) {
       # was invisible until the numeral-zero cue below made the sibling form (`0 P1, 2 P2`) reach this
       # token at all: the comma arm used to fire on the FIRST token and block the line for the wrong
       # reason, so the missing arm had no failing case. Non-zero only — `0` is the cue, not a count.
-      if (!negpre && pre ~ /(^|[^[:alnum:]])[1-9][0-9]*[[:space:]]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # ⛔ AND THE COUNT MAY BE SEPARATED FROM THE TOKEN (P0, eighth fresh review of #2288 — MEASURED,
+      # pre-existing on main: the count arm required the digits to sit IMMEDIATELY before the token, so
+      # `**Verdict:** CLEAN — 2 blocking P1 defects remain in scripts/x.sh.` produced NO blocking line and
+      # a SIGNED clean record, while `2 P2 findings` blocked. A severity token between the numeral and
+      # the finding noun is ordinary reviewer prose, so the count may now cross up to three words. Word
+      # numerals are included, and the bridge is written as OPTIONAL GROUPS rather than `{0,3}` because
+      # mawk does not support interval expressions (measured: a `{0,3}` here compiles everywhere and
+      # matches nothing under mawk, silently fail-open).
+      if (!negpre && pre ~ ("(^|[^[:alnum:]])(" numwords() "|[1-9][0-9]*)([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "[[:space:]-]*[(]?[[:space:]-]*$")) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
       # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
       # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
@@ -1692,8 +1748,191 @@ fi
 # refused (rc 7, no record) where the pre-fix head recorded it. `was|is|are|were` is now allowed
 # before the participle. The direction stays fail-closed: a count with NO resolved participle still
 # refuses.
+# \u2550\u2550 COUNT_SCAN_AWK — the ONE classifier for "does this line report a non-zero count of findings?"
+# Three arms over one numeral class and one noun class:
+#   forward   <numeral> [up to 3 words] <noun> [copula] [repair]      e.g. "2 blocking defects remain"
+#   mirror    <noun> [up to 2 words] [:=] or [ -] <numeral>           e.g. "defects remaining: two"
+#   multiply  <severity> [× x X * times] <n>, or the reverse         e.g. "P1 x 2", "0 × P1"
+# A match is SKIPPED (not a count) when
+#   \u2022 its numeral is a ZERO — "0 defects", "P1 x 0", "findings: 0" all stay clean; or
+#   \u2022 the match itself ends in a repair verb — "1 finding was fixed"; or
+#   \u2022 the CLAUSE holding the count begins (within three words) with a repair verb —
+#     "Fixed the 3 issues from round 1.". The clause is everything after the last clause separator
+#     (`;`, `,`, and/but/however/yet/while/although), which is what keeps a repair in ONE clause from
+#     exempting a live count in the NEXT: "closed the loop, but 2 blocking defects remain" refuses.
+# Prints each offending fragment; prints nothing when the line reports no non-zero count.
+COUNT_SCAN_AWK='
+function clause_before(pre,   parts, n) {
+  # (the separator may END the prefix, which is exactly what happens when the count follows it:
+  # `we fixed the flaky test and 2 blocking defects remain` — pre ends at "and", so a trailing
+  # `[[:space:]]` requirement missed it and the repair in the FIRST clause exempted the second, measured)
+  # ⛔ AND EVERY SENTENCE BOUNDARY COUNTS (P1, ninth fresh review of #2288 — MEASURED: the set omitted
+  # `.`, `(`, `though`, `whereas`, so `fixed the P3 nit though 2 blocking defects remain` and
+  # `fixed the P3 nit (2 blocking defects remain)` recorded a SIGNED clean record — the same leak round
+  # seven fixed for `but`, one connector over). A full stop ends a clause as surely as a semicolon does.
+  # ⛔ RELATIVE AND ADVERBIAL CLAUSES ARE CLAUSES (P0, adversarial review of #2288 — MEASURED: a repair
+  # verb opening the clause exempted a live count inside a relative clause — `fixed the guard that leaves 2
+  # blocking defects unresolved` recorded a signed clean record — and the same leak sat behind `so` and
+  # `because`, which the reviewer named as an out-of-scope residual. Both are the same boundary defect.)
+  n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though|that|which|who|whose|where|when|if|so|because|since)([[:space:]]|$)/)
+  return parts[n]
+}
+function repair_led(cl,   n, w, i, low) {
+  # ⛔ A REPAIR MUST BE IN VERB POSITION, NOT MERELY PRESENT (P0, tenth fresh review of #2288 — MEASURED
+  # REGRESSION this branch introduced: `repair_re` holds ordinary NOUNS (`fix`, `close`, `remove`), so
+  # matching it ANYWHERE in the clause made `**Verdict:** CLEAN — the retry fix leaves 2 blocking defects
+  # unresolved.` classify as "a repair" and mint a SIGNED clean record over a stated pair of blockers; the
+  # same sentences exited 7 before this branch. The window this replaced was precisely what rejected them.
+  # So the exemption is GRAMMATICAL: the verb must OPEN the clause (`Fixed the 3 issues`, `Closes the 2
+  # issues`), or follow a subject phrase that can govern it (`the PR fixes`, `this branch addresses`,
+  # `We have also fixed`), and it must not be a determiner-headed NOUN (`the fix`, `the removed guard`,
+  # `the closed path` — the `the X` subject list below is a closed set, so those cannot match).
+  low = cl; gsub(/[[:space:]]+/, " ", low)
+  # strip the VERDICT DECORATION first (`**Verdict:** CLEAN — `), or the subject phrase is never at the
+  # start and every legitimate repair would be refused (this lane: the first version of this fix did
+  # exactly that, measured)
+  for (i = 0; i < 4; i++) {
+    # ⛔ LEADING NON-ALNUM, NOT `[[:punct:]]` (this lane, MEASURED under mawk): a C-locale `[[:punct:]]`
+    # does not classify the multi-byte em dash, so the decoration strip left `— ` in place and every
+    # legitimate repair on a verdict line refused under mawk while passing under gawk.
+    sub(/^[^[:alnum:]]+/, "", low)
+    if (low ~ /^verdict[[:space:]]*[:.]?[[:space:]]*/) { sub(/^verdict[[:space:]]*[:.]?[[:space:]]*/, "", low); continue }
+    if (low ~ /^clean([^[:alnum:]]|$)/) { sub(/^clean[^[:alnum:]]*/, "", low); continue }
+  }
+  # ⛔ `fixes to …` IS A NOUN PHRASE, NOT A VERB (P0, adversarial review of #2288 — MEASURED:
+  # `Fixes to the retry path leave 2 blocking defects unresolved.` opened with a repair word, so the
+  # determiner-free noun escaped the closed subject list and recorded a signed clean record.)
+  if (low ~ ("^(" repair ")[[:space:]]+(to|of|for|in|on|at|by|with)([^[:alnum:]]|$)")) return 0
+  # ⛔ …AND THE REPAIR MUST GOVERN THE COUNT BY ADJACENCY (P0, third adversarial pass of #2288 — MEASURED:
+  # a closed PREDICATE vocabulary is not a structural rule. It closed `… fixed leaves 2 blocking …` and left
+  # `Fixing the guard left 2 blocking defects unresolved.` recording a signed clean — one TENSE apart from a
+  # refused twin — plus `introduced`, `created`, `revealed`, `surfaced`, `means`, `depends`, `carries`. So the
+  # test is adjacency: after the repair lexeme the clause may hold only whitespace and an optional DETERMINER,
+  # because the counted NP must be the direct object of that verb. Every legitimate grant in the suite satisfies it
+  # (`Fixed the 3 issues`, `Closes the 2 issues`, `the PR fixes 2 bugs`), and an intervening verb of ANY
+  # tense cannot.)
+  if (match(low, ("^(" repair ")")) || match(low, ("^(the pr|this pr|the branch|this branch|we|i|it)[[:space:]]+(" AUX ")*(" repair ")"))) {
+    if (substr(low, RSTART + RLENGTH) ~ /^[[:space:]]*((the|a|an|this|that|these|those|its|their|our|my|your|all|both|any|every|each|no)[[:space:]]*)?$/) return 1
+    return 0
+  }
+  return 0
+}
+BEGIN {
+  # (the same class the severity scanner uses, so the two readers cannot drift: §BI-2 asserts it)
+  num = "[0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many"
+  # (`failures?|errors?` were MISSING while the sibling scanner is fed `defect(s)` — P2, ninth fresh
+  # review of #2288: `CLEAN — 2 blocking failures remain.` recorded a signed clean record)
+  noun = "findings?|blockers?|issues?|defects?|bugs?|failures?|errors?|regressions?|vulnerabilit(y|ies)|violations?|problems?"
+  repair = "(fixed|addressed|resolved|closed|removed|repaired|fix|fixes|fixing|address|addresses|addressing|close|closes|closing|resolve|resolves|resolving|remove|removes|removing|re-review|re-reviewed)"
+  repair_re = "^(" repair ")$"
+  # ⛔ NO INTERVAL EXPRESSIONS (P0, this lane — MEASURED: mawk does not support `{n,m}`, so the whole
+  # classifier silently matched NOTHING under mawk and every pin in this guard flipped to fail-open on a
+  # mawk-only box; the suite caught it only because it is run under both dialects). The bridges are
+  # written out as optional groups instead, which every POSIX awk supports.
+  # ⛔ A PARENTHESISED COUNT IS STILL A COUNT (P0, ninth fresh review of #2288 — MEASURED, pre-existing and
+  # still open: both arms took a BARE numeral, so `two (2) blocking defects remain`,
+  # `2 (two) blocking defects remain`, `(2) blocking defects remain`, `blocking defects remaining: (2)` and
+  # `2 (P1) defects remain` each recorded a SIGNED clean record). `pnum` is the numeral OR a parenthesised
+  # numeral, and the zero test strips the brackets before reading the number.
+  # one optional alphabetic word, used for the subject-phrase bridge (see repair_led)
+  AUX = "(have|has|had|also|now|already|just|finally|then|both)[[:space:]]+"
+  pnum = "([(][[:space:]]*(" num ")[[:space:]]*[)])|(" num ")"
+  PN = "(" pnum ")"
+  # ⛔ A SEVERITY TOKEN IS BRIDGE-FILLER, NOT A SUFFIX (P1, second adversarial pass of #2288 — MEASURED:
+  # the `(P1)` slot sat ONLY immediately before the noun, so `2 (P1) blocking defects remain` and
+  # `2 [P1] open blocking defects remain` were invisible to the classifier while `2 (P1) defects remain`
+  # refused. The bridge word may BE a severity token in any of its three slots.)
+  BW = "([[:space:]-]+([[:alpha:]][[:alpha:]-]*|[([]?[[:space:]]*p[0-3]s?[[:space:]]*[])]?))?"
+  fwd = "(^|[^[:alnum:]])(" pnum ")" BW BW BW "([[:space:]]*[(][[:space:]]*p[0-3][[:space:]]*[)])?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
+  # ⛔ THE MIRROR ARM GETS THE SAME BRIDGE WIDTH AS THE FORWARD ARM (P1, adversarial review of #2288 —
+  # MEASURED: it capped the noun→numeral bridge at TWO words while the forward arm allowed THREE, so
+  # `blocking defects that remain unresolved: 2` was a count to one arm and not the other, and recorded a
+  # signed clean record. Two arms over one numeral class must share one bridge.)
+  mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" pnum ")"
+  # (the severity token is folded too: the line is lowercased above, so `P[0-3]` would never match)
+  # (a PLURAL severity with a count is a count too: `P1s: 2` — P2, ninth fresh review of #2288, which
+  # recorded a signed clean record because neither reader knew the plural form)
+  # ⛔ THE MULTIPLIER SLOTS TAKE THE SHARED NUMERAL CLASS, SPELLED NUMERALS INCLUDED (P0, adversarial
+  # review of #2288 — MEASURED: the slots were `[0-9]+`, so `P1 × two remain` and `P1s: two` were not
+  # counts at all and recorded signed clean records, while `P1 × 2` refused)
+  mul = "(^|[^[:alnum:]])((" PN ")[[:space:]]*(×|x|\\*|times)[[:space:]]*(p[0-3]s?)|(p[0-3]s?)[[:space:]]*(×|x|\\*|times)[[:space:]]*(" PN ")|p[0-3]s[[:space:]]*[:=][[:space:]]*(" PN "))"
+}
+{
+  # ⛔ CASE-FOLDED, because awk match() honours no -i (P0, seventh fresh review of #2288 — MEASURED:
+  # Two defects, both in the guard: and Closes the 2 issues it links. recorded clean because the
+  # numeral/noun/repair classes are written lowercase and a capitalised sentence opener never matched).
+  # IGNORECASE is gawk-only, so the fold is explicit; the printed fragment is lowercase, which is fine
+  # in a refusal message.
+  line = tolower($0)
+  for (arm = 1; arm <= 3; arm++) {
+    re = (arm == 1) ? fwd : (arm == 2 ? mir : mul)
+    off = 0; rest = line
+    while (match(rest, re)) {
+      frag = substr(rest, RSTART, RLENGTH)
+      abs_end = off + RSTART + RLENGTH - 1
+      pre = substr(line, 1, off + RSTART - 1)
+      # ⛔ CAPTURED BEFORE `off` MOVES (this lane — the first version read `off + RSTART` AFTER the
+      # advance, so `_head` was empty, the paren check never fired and the repair exemption still
+      # swallowed `fixed the P3 nit (2 blocking defects remain)`).
+      _head = substr(line, off + RSTART); sub(/^[[:space:]]+/, "", _head)
+      rest = substr(rest, RSTART + RLENGTH)
+      off = abs_end
+      # a zero numeral is not a count: strip severity tokens first, then read the number
+      bare = frag; gsub(/[pP][0-3]/, "", bare); gsub(/[()]/, " ", bare)
+      dig = ""
+      if (match(bare, /[0-9]+/)) dig = substr(bare, RSTART, RLENGTH)
+      if (dig == "0") continue
+      # a repair stated inside the match ("1 finding was fixed") is not a live count — UNLESS the line
+      # then says the count is LIVE (P0, fourth adversarial pass of #2288 — MEASURED: an ATTRIBUTIVE
+      # participle inside the counted NP exempted it, so `the 2 blocking defects fixed in round 1 still
+      # remain` recorded a signed clean record. `fixed` there is a reduced relative, not a predicated
+      # repair, and the live cue that follows is what says so.)
+      # ⛔ THE WINDOW STARTS AT THE MATCH END — `off` IS ALREADY THERE (P0, fifth adversarial pass of
+      # #2288 — MEASURED: `RSTART`/`RLENGTH` still held the leftover `match(bare, /[0-9]+/)` from the digit
+      # test, so the window began 3 characters Late for a digit count and one character Early for a spelled
+      # one: `the 2 blocking defects fixed left in the code path` recorded clean while its spelled twin
+      # refused, and `2 blocking defects fixed; the P3 nits are left as-is` refused across the `;` boundary
+      # the tool otherwise respects. Both directions, one line.)
+      _after0 = substr(line, abs_end + 1)
+      # (`left unchanged|as-is|alone|intact|untouched` describes SOMETHING ELSE, not a defect left over:
+      # blanked before the cue test, or `2 blocking defects fixed and the parser left unchanged` — a clean
+      # verdict — refused. A false refusal costs a paid re-run.)
+      _cue = _after0
+      gsub(/left[[:space:]-]+(unchanged|as-is|alone|intact|untouched|behind)/, " ", _cue)
+      if (frag ~ ("(" repair ")$") && _cue !~ /^[^.;:,!?()]*(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/) continue
+      # ⛔ AN OPENING PAREN STARTS A NEW CLAUSE (P1, ninth fresh review of #2288 — MEASURED:
+      # `fixed the P3 nit (2 blocking defects remain)` recorded clean because the parenthesis belongs to
+      # the MATCH, so the prefix still held the repair and the clause split never saw the boundary).
+      cl = (substr(_head, 1, 1) == "(") ? "" : clause_before(pre)
+      # …and one stated at the head of THIS clause is not either
+      if (repair_led(cl)) continue
+      # ⛔ AN INDEFINITE ARTICLE NEEDS THE REPAIR ANYWHERE IN THE CLAUSE (P2, eighth fresh review of
+      # #2288 — MEASURED over-block, the direction that costs a PAID run: `a` is a numeral here, so
+      # `**Verdict:** CLEAN — a bug in the retry path was fixed in round 2.` refused once this branch
+      # widened the noun list to `bugs?`). `a`/`an` is not a count unless something else says the
+      # finding is live, and a repair verb in the clause is that something.
+      # (the repair may sit AFTER the match — `a bug in the retry path was fixed in round 2` — so the
+      # clause is searched on both sides of the count. ⛔ IT IS THE CLAUSE, NOT THE LINE (P0, fourth
+      # adversarial pass of #2288 — MEASURED: `a blocking defect remains, no fix applied.` recorded a
+      # signed clean record because the NOUN `fix` in another clause satisfied a line-wide search, and so
+      # did `a blocking defect remains. The fix is elsewhere.` and `Reviewed the fix; a blocking defect
+      # remains.`)
+      _aftcl = _after0
+      sub(/[.;:,!?()].*$/, "", _aftcl)
+      # ⛔ THE ARTICLE ARM NEEDS THE SAME LIVENESS GATE AS THE NUMERAL ARM (P0, fifth adversarial pass of
+      # #2288 — MEASURED: an UNPREDICATED repair lexeme in the same clause exempted it — `a blocking defect
+      # remains after the fix to the retry path`, `after the fix a blocking defect remains`, `a blocking
+      # defect remains and needs a fix`, `a blocking defect that round 1 fixed still remains` all recorded a
+      # signed clean record, while their numeral twins refused.)
+      if (frag ~ /^([^[:alnum:]]*)(a|an)([[:space:]-]|$)/ && _cue !~ /^[^.;:,!?()]*(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/ && (cl " " _aftcl) ~ ("(^|[^[:alnum:]])(" repair ")([^[:alnum:]]|$)")) continue
+      print frag
+    }
+  }
+}
+'
+
 refuse_counted_clean() {
-  local _vl _vw _hit _one _dig
+  local _vl _vw _hit _hit2 _hit3 _one _dig _tail _bare _scan _src
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS READ, NOT ONLY THE FINAL ONE (P1/P2, fresh
   # review of #2288 — both MEASURED, both minted a signed clean record):
@@ -1703,9 +1942,20 @@ refuse_counted_clean() {
   #       count channel read only the accepted line.
   # The file iterated here is the SAME survivor set the verdict comes from (quoted regions
   # excluded), so a clean report that QUOTES someone else's `ISSUES 2` is unaffected.
+  # ⛔ A MISSING/UNREADABLE FILE MUST NOT READ AS "NO COUNTED LINE" (P3, third fresh review of #2288 —
+  # MEASURED: under `set -uo pipefail` without `-e` a redirect failure skips the loop body, the function
+  # returns 0, and the guard passes exactly as if it had read zero counted lines). The sibling file gets
+  # the same explicit invariant at its own read site; this one gets it here.
+  for _src in "$SURVIVORS_FILE" "$VERDICT_LINES_FILE"; do
+  [ -r "$_src" ] \
+    || die "$E_SCAN" "the transcript-analysis file $_src is missing or unreadable — the count guard cannot be shown to have run, so no verdict is recorded (transcript: $TRANSCRIPT)"
   while IFS= read -r _vl; do
     [ -n "$_vl" ] || continue
     # (b) an EARLIER verdict-shaped line that says ISSUES is a contradiction, whatever its count.
+    # ONLY ON A VERDICT-SHAPED LINE: the count channel is the whole survivor set (a count can hide on
+    # an unshaped line), but a bare mention of the word "issues" in prose is not a verdict — so this
+    # half of the guard reads the verdict-shaped subset only.
+    if [ "$_src" = "$VERDICT_LINES_FILE" ]; then
     _vw="$(printf '%s' "$_vl" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
     if [ "$_vw" = "issues" ] && [ "$_vl" != "$LAST" ]; then
       err "$PROG: the transcript states ISSUES on an earlier verdict-shaped line and a CLEAN verdict last — a reviewer that reported issues and then closed with a bare CLEAN has not reviewed this revision clean."
@@ -1714,26 +1964,88 @@ refuse_counted_clean() {
       err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
       die "$E_ISSUES" "a self-contradicting transcript (an ISSUES verdict line, then CLEAN) is never recorded — re-run the review"
     fi
+    fi
     # (a) a non-zero count of findings on ANY verdict-shaped line.
     # ⛔ THE QUANTIFIER REACHES THE NOUN, AND A COPULA IS A PARTICIPLE (kept from the concurrent fix
     # this commit is rebased onto): the bridge between the numeral and `finding(s)` is any run of up
     # to three words, and a resolved participle may carry `was|is|are|were`. Vocabulary also carries
     # the word numerals this lane added (single/sole/lone/half a dozen/thirteen…twenty).
-    _hit="$(printf '%s' "$_vl" \
-      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|issues?|blockers?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
-      | grep -viE '[[:space:]-](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
+    # ⛔ THE FINDING NOUNS ARE A SUPERSET OF THE SEVERITY SCANNER'S, AND THAT IS DELIBERATE (P1, third
+    # fresh review of #2288 — MEASURED fail-OPEN; P2, fourth review — the earlier comment here claimed
+    # the lists were identical, which they are NOT and should not be). `noun()` is
+    # `findings?|blockers?|issues?|defects?|bugs?|severity|priority|critical|high|major`: its last five
+    # entries are SEVERITY words, which must never be read as a countable noun (`2 critical` is not a
+    # count of findings), so this list cannot be `noun()` verbatim — it is `noun()`'s finding nouns PLUS
+    # the general synonyms a reviewer actually writes, and §BI asserts every finding noun of `noun()` is
+    # present here, so an edit to one without the other goes red.
+    #   Before this arm the list was `findings?|issues?|blockers?|problems?`, so
+    #   `CLEAN — 2 defects remain in scripts/x.sh`, `CLEAN — two blocking defects remain`,
+    #   `ISSUES 0 — one blocking defect is pre-existing` and their `regressions?/vulnerabilit(y|ies)|
+    #   violations?` twins all exited 0 and wrote a SIGNED clean record over a reported blocker.
+    # ⚠️ DECLARED RESIDUAL, OVER-BLOCK (P2, fourth fresh review of #2288): a VERDICT-shaped line that
+    # reports a non-zero count and only explains later that those findings are REPAIRED — `CLEAN — the 2
+    # defects reported in #123 are fixed on this branch.` — is refused, because the participle exemption
+    # is positional and a mechanical reader cannot tell that sentence from `2 defects remain; 1 was
+    # fixed.` (which must refuse: a blocker is still open). Guessing wrong mints a signed clean record
+    # over a reported blocker, so the direction is fail-closed and the refusal prints the remedy: say it
+    # without a count (`the defects from #123 are fixed on this branch`) — the ordinary-line cue below
+    # exempts that shape, and §BI pins BOTH directions.
+    # ⛔ AND ON A LINE THAT IS NOT VERDICT-SHAPED, A COUNT NEEDS A LIVE-FINDING CUE (P2, fourth fresh
+    # review of #2288 — MEASURED over-block, the direction that costs a PAID re-run: widening the
+    # channel to every survivor line made `Fixed the 3 issues from round 1.` and
+    # `CLEAN — the 2 defects reported in #123 are fixed on this branch.` refuse, because the resolved
+    # participle has to sit immediately after the noun). A verdict-shaped line is self-contradictory by
+    # construction, so there a count always refuses; on an ordinary line the reviewer is describing work
+    # done unless the sentence says the findings are still there — `remain(s|ing)`, `unresolved`,
+    # `still`, `left`, `open`, `outstanding`, `blocking`, `found`, `located`. Both measured fail-opens
+    # from the third review (`I found two blocking issues:`, `2 defects remain`) carry a cue.
+    # ⛔ THE NOUN CAN BE ATTRIBUTIVE, AND THEN IT IS NOT A COUNT (P2, fifth fresh review of #2288 —
+    # MEASURED over-block: `CLEAN — 2 bug fixes applied.`, `CLEAN — 3 regression tests added.`,
+    # `CLEAN — 1 bug report reviewed, no defects.` all refused, each burning a PAID reviewer run — and
+    # this is NOT the later-sentence-repair residual, no repair clause is involved). `bug fixes` is work
+    # done, `bug report` is a document: the noun there qualifies the next word instead of counting a
+    # finding. The pair is blanked OUT of a COPY of the line before matching, so a line that also
+    # reports a real count keeps it (`1 defect remains; 3 bug fixes applied` still refuses).
+    # (the noun is DROPPED, not merely separated — keeping it would leave `1 finding NOUNWORDed`, whose
+    # `1 finding` still matches the count grammar; and the attributive word needs a right-hand boundary,
+    # or `fix` matches the `fix` inside `fixed` and eats a genuine repair participle)
+    _scan="$(printf '%s' "$_vl" | sed -E 's/(bug|bugs|regression|regressions|defect|defects|issue|issues|finding|findings|problem|problems|violation|violations)[[:space:]-]+(fix|fixes|fixup|fixups|report|reports|test|tests|suite|suites|scan|scans|class|classes|count|counts|free|coverage|pass|passes|series)([^[:alnum:]]|$)/\2\3/g' 2>/dev/null)"
+    [ -n "$_scan" ] || _scan="$_vl"
+    # ⛔ ONE CLASSIFIER, THREE ARMS, AND A CLAUSE-SCOPED EXEMPTION (P0/P1, seventh fresh review of #2288 —
+    # all MEASURED, each either minting a SIGNED clean record or burning a paid run):
+    #   (a) the exemption was `^[^0-9]*(fixed|…)` — matched ANYWHERE before the first digit, so a repair
+    #       in one clause exempted a LIVE count in a later one:
+    #       `**Verdict:** CLEAN — closed the loop on the retry path, but 2 blocking defects remain in
+    #       scripts/x.sh.` recorded clean. It is clause-scoped now: the clause holding the count (split on
+    #       `;`, `,`, ` and `, ` but `, ` however `, ` yet `, ` while `, ` although `) must begin — within
+    #       three words — with a repair verb.
+    #   (b) the mirror arm accepted DIGITS only while the forward grammar it mirrors accepts word
+    #       numerals: `**Verdict:** CLEAN — blocking findings: two (scripts/x.sh:42).` recorded clean.
+    #       Both arms share ONE numeral class now.
+    #   (c) the repair vocabulary was past-participle-only, so a clean report describing what the PR does
+    #       NOW was refused: `The PR fixes 2 bugs in the parser.`, `This branch addresses 2 issues raised
+    #       in review.`, `Closes the 2 issues it links.`
+    # The arms are: forward `<numeral> … <noun>`, mirror `<noun> … [:=-] <numeral>`, and the multiplier
+    # `<severity> ×|x|*|times <n>` — every spelling as an ALTERNATION, because inside a bracket expression
+    # the multi-byte `×` does not match under `LANG=C` (measured).
+    # ⛔ A FAILED CLASSIFIER IS NOT AN EMPTY ONE (P1, eighth fresh review of #2288 — MEASURED: a
+    # classifier that compiles but matches nothing — exactly the mawk `{0,3}` class this branch already
+    # hit — exits 0 and prints nothing, so every pin in this guard goes fail-open and a signed clean
+    # record is minted. `2>/dev/null || true` was swallowing both the status and the reason. The canary
+    # is a string the classifier MUST report: if it does not, the guard cannot be shown to have run and
+    # the run refuses with E_SCAN instead of recording.
+    if [ -z "${COUNT_SCAN_CANARY_OK:-}" ]; then
+      _canary="$(printf '%s\n' '1 blocking defect remains.' | awk "$COUNT_SCAN_AWK" 2>/dev/null)"
+      [ -n "$_canary" ] \
+        || die "$E_SCAN" "the count classifier did not report a canary finding (\"1 blocking defect remains.\") — it compiled but is not working under $(command -v awk), so the contradiction guard cannot be shown to have run. No verdict is recorded (transcript: $TRANSCRIPT)."
+      COUNT_SCAN_CANARY_OK=1
+    fi
+    _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK")" \
+      || die "$E_SCAN" "the count classifier FAILED on this transcript line (awk rc=$?) — a failed scan is not an empty scan, so no verdict is recorded (transcript: $TRANSCRIPT)"
     [ -n "$_hit" ] || continue
-    # ⛔ A ZERO IS NOT A COUNT (the counter-directions §AN/§AP pin): `CLEAN — 0 blocking findings`
-    # must keep recording, so each MATCH is read for its own number and a zero match is skipped —
-    # the line keeps being scanned rather than being exempted whole.
-    while IFS= read -r _one; do
-      [ -n "$_one" ] || continue
-      _dig="$(printf '%s' "$_one" | grep -oE '[0-9]+' | head -1)"
-      [ -n "$_dig" ] && [ "$_dig" -eq 0 ] && continue
-      CLEAN_COUNT_WORDS="$_one"; CLEAN_COUNT_LINE="$_vl"; break
-    done <<<"$_hit"
-    [ -n "$CLEAN_COUNT_WORDS" ] && break
-  done < "$VERDICT_LINES_FILE"
+    CLEAN_COUNT_WORDS="$(printf '%s' "$_hit" | head -1)"; CLEAN_COUNT_LINE="$_vl"; break
+  done < "$_src"
+  done
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
     err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and a verdict-shaped line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
     err "  offending line: ${CLEAN_COUNT_LINE:-$LAST}"
@@ -2106,6 +2418,43 @@ marker_state() { # <body> -> signed | unsigned | absent
   [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
   printf 'absent'
 }
+# ⛔ A FUNCTION CALLED IN A COMMAND SUBSTITUTION CANNOT PUBLISH A GLOBAL (P3, this lane — found by the
+# new arm going red for the WRONG reason): `MARKER_STATE="$(marker_state ...)"` runs in a subshell, so
+# the diff group it parsed died with it and the seam fell back to a live read that could itself fail.
+# The marker's `diff=` is therefore read by its own pass, here, with no network call.
+marker_diff_for() { # <body> -> the diff group of EVERY marker bound to THIS pr/head/repo
+  local body="$1" line pr_re head_re repo_lc signed=0
+  pr_re="$PR"; head_re="$HEAD"; repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+  # ⛔ SIGNED MARKERS WIN (P2, seventh fresh review of #2288 — MEASURED: accepting "any" same-head
+  # marker let an AUTHOR-SEEDED unsigned line — the PR body is author-writable — satisfy the diff check
+  # while the recorder's own signed marker attested a different diff, reopening exactly the case this
+  # check exists for). So when any marker at this head carries a `sig=`, only signed markers are read;
+  # an unsigned line cannot vote. Where NO marker is signed (a key-less recorder run, which is its own
+  # named refusal above), the unsigned ones are the only evidence there is and are used.
+  marker_scan() { # <body> <want-signed 0|1> -> diffs
+    local b="$1" want="$2" ln pre he rl
+    pre="$PR"; he="$HEAD"; rl="$repo_lc"
+    while IFS= read -r ln; do
+      [[ "$ln" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
+      [ "${BASH_REMATCH[1]}" = "$pre" ] || continue
+      [ "${BASH_REMATCH[3]}" = "$he" ] || continue
+      [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$rl" ] || continue
+      { [ "$want" = "0" ] || [ -n "${BASH_REMATCH[6]}" ]; } || continue
+      printf '%s\n' "${BASH_REMATCH[4]# diff=}"
+    done <<<"$b"
+  }
+  marker_scan "$body" 1 >/dev/null 2>&1 || true
+  if [ -n "$(marker_scan "$body" 1)" ]; then
+    marker_scan "$body" 1
+  else
+    marker_scan "$body" 0
+  fi
+  signed=0; : "$signed"
+  # EVERY same-head marker is printed, not just the first (P3, sixth fresh review of #2288): a head can
+  # carry two (an earlier recorder run, then a re-run the E_ALREADY message advises), and a first-match
+  # read would keep seeing the STALE one and refuse forever.
+  return 0
+}
 BODY_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"
 BODY_RC=$?
 [ "$BODY_RC" -eq 0 ] \
@@ -2118,7 +2467,62 @@ case "$MARKER_STATE" in
   *)
     die "$E_RECORD" "record-review.sh rc=0 and the record file exists, but the PR BODY carries no marker bound to $REPO#$PR at ${HEAD:0:12}… — check (c) reads the body, not the record store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). Re-run the recorder to retry the post: \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` (its append is idempotent)." ;;
 esac
-say "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, and a SIGNED marker bound to this head is present in the PR body (check (c)'s artifact). The HMAC is verified by the gate, not here."
+# ⛔ THE RECORD'S OWN DIFF MUST BE THE DIFF THE REVIEWER READ (P2, third fresh review of #2288 —
+# MEASURED, a signed record minted over a diff nobody reviewed). The pre-post DIFF_AFTER check reads
+# the diff ONCE more, but `record-review.sh` then hashes the LIVE diff again at record time
+# (`diff_hash_for_pr`), so a BASE retarget landing in the window between those two reads — or between
+# the recorder's read and the gate's — mints a marker whose `diff=` is a diff the reviewer never saw,
+# at the unchanged head, and check (c) stays green because it binds the head sha. Every read is
+# separated by a network round trip, so the window is real. The marker's own `diff=` group is the
+# authoritative statement of what was signed: compare it to what was reviewed, and where the recorder
+# wrote no `diff=` group, fall back to one more live read. Cost on the clean path: zero extra calls
+# when the group is present, one read when it is not.
+MARKER_DIFFS="$(marker_diff_for "$BODY_AFTER")"
+MARKER_DIFF="$(printf '%s' "$MARKER_DIFFS" | grep -oE '[0-9a-f]{64}' | head -1)"
+if [ -n "${MARKER_DIFFS//[[:space:]]/}" ]; then
+  # ⛔ THE DIGEST MUST BE THE ONE THE RECORDER MINTS, NOT A PLAUSIBLE-LOOKING SHA (P1, fourth fresh
+  # review of #2288 — MEASURED: `sha256(raw capture)` is NOT what `record-review.sh` signs, so EVERY
+  # clean run on a healthy box exited 8 AFTER posting the comment and writing the record, and the
+  # re-run it advises hits E_ALREADY forever — an unsatisfiable wall on the tool's only success path).
+  # The recorder hashes the FETCHED FILE bytes (trailing newline included) through the shared
+  # normalizer `scripts/lib/diff-normalize.py`, and falls back to the RAW digest when python3 or the
+  # normalizer is unavailable. So this reproduces both of the recorder's forms and accepts either:
+  # both are identities of the bytes the reviewer read, which is the property being checked.
+  DIFF_RAW_HASH="$(printf '%s\n' "$DIFF_FULL" | $_SHA_CMD | cut -d' ' -f1 2>/dev/null)"
+  DIFF_NORM_HASH=""
+  if [ -n "$DIFF_NORMALIZER_OK" ]; then
+    DIFF_NORM_HASH="$(printf '%s\n' "$DIFF_FULL" | python3 "$DIFF_NORMALIZER" 2>/dev/null | $_SHA_CMD | cut -d' ' -f1 2>/dev/null)"
+  fi
+  # ⛔ AND SAY SO WHEN THE COMPARISON COULD NOT RUN (P2, fifth fresh review of #2288): without the
+  # normalizer only the recorder's RAW fallback form can be matched, so a recorder that DID normalize
+  # is unverifiable here — that must name its own cause ("could not be computed"), not accuse the base
+  # of having moved, which sends the operator to a re-run that cannot succeed.
+  if [ -z "$DIFF_NORM_HASH" ]; then
+    [ -n "$DIFF_RAW_HASH" ] && [ "$MARKER_DIFF" != "$DIFF_RAW_HASH" ] \
+      && err "$PROG: ⚠️ the record's diff= is not the RAW digest of the reviewed diff, and the shared diff normalizer (scripts/lib/diff-normalize.py, looked for beside the recorder and beside this script) could not be run — so the recorder's NORMALIZED digest could not be computed here. This is an unverifiable comparison, not proof that the base moved."
+  fi
+  if [ -z "$DIFF_RAW_HASH" ] && [ -z "$DIFF_NORM_HASH" ]; then
+    die "$E_SCAN" "no portable sha256 tool could digest the reviewed diff (tried sha256sum, shasum -a 256), so the record's diff identity cannot be checked — refusing to report success on an unverified attestation ($(printf '%s' "$SHA_CMD" | sed 's/^$/none resolved/'))"
+  fi
+  # ANY same-head marker matching is enough: the record is one artifact and its diff= is stated once
+  # per marker, so a second marker written by a re-run of the recorder must be able to CLEAR the first
+  # (P3, sixth fresh review of #2288 — a first-match read made the E_ALREADY remedy unsatisfiable).
+  _dok=0
+  while IFS= read -r _md; do
+    [ -n "$_md" ] || continue
+    if [ "$_md" = "$DIFF_RAW_HASH" ] || { [ -n "$DIFF_NORM_HASH" ] && [ "$_md" = "$DIFF_NORM_HASH" ]; }; then _dok=1; fi
+  done <<<"$MARKER_DIFFS"
+  if [ "$_dok" != "1" ]; then
+    die "$E_MOVED" "the SIGNED record's diff ($(printf '%s' "$MARKER_DIFFS" | tr '\n' ' ')) is NOT the diff the reviewer read (raw $DIFF_RAW_HASH, normalized ${DIFF_NORM_HASH:-n/a}) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. ⛔ THE REMEDY IS THE RECORDER, NOT A RE-RUN OF THIS SEAM (P3, sixth fresh review of #2288): this run already wrote the record, so re-running the seam would exit at the unchanged-head guard. Re-run it by hand — \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` — which appends a marker for the diff on disk now, and a same-head marker that matches CLEARS this check."
+  fi
+else
+  DIFF_SIGNED="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" \
+    || die "$E_RECORD" "the record carries no diff= group and the diff could not be re-read to check it — refusing to report success on an unverified attestation (transcript: $TRANSCRIPT)"
+  if [ "$DIFF_SIGNED" != "$DIFF_FULL" ]; then
+    die "$E_MOVED" "the diff CHANGED during the record step (head unchanged: a BASE retarget) and the record carries no diff= group to prove otherwise — re-run this command at the new base."
+  fi
+fi
+log_line "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, and a SIGNED marker bound to this head is present in the PR body (check (c)'s artifact). The HMAC is verified by the gate, not here."
 # ⛔ THE CLEAN PATH DOES NOT LEAVE THE SCRATCH TRANSCRIPT BEHIND (P3, fresh review of #2288):
 # `cleanup` removes only $RUN_DIR, so every invocation — success included — left
 # `$TMPDIR/review-pr-<PR>.XXXXXX/reviewer.log` with the reviewer's FULL, UNREDACTED output on disk,

@@ -134,18 +134,57 @@ case "${1:-} ${2:-}" in
           "$(cur_state)" "$(cat "$SCEN/draft" 2>/dev/null || echo false)"
         exit 0 ;;
       *baseRefName*)
-        printf '%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)"; exit 0 ;;
+        # ⛔ HONOUR $jqprog WITH REAL jq when it is installed. Hand-emitting the shape
+        # is what let a DOUBLE-ESCAPED program ship green (round-3 review: the queue
+        # path's `"\\(.headRefOid)\\t..."` reached jq literally, so the split produced
+        # garbage and `--queue` could never hand off while every scenario passed). With
+        # the program actually executed, that class reddens here. When jq is absent the
+        # arm falls back to the shape, and the static no-double-escape assertion below
+        # still covers the class — the fallback is weaker, never unsound.
+        _h="$(cur_head)"; _b="$(cat "$SCEN/base" 2>/dev/null || echo main)"
+        if [ -n "$jqprog" ] && command -v jq >/dev/null 2>&1; then
+          printf '{"headRefOid":"%s","baseRefName":"%s"}' "$_h" "$_b" | jq -r "$jqprog"
+        else
+          printf '%s\t%s\n' "$_h" "$_b"
+        fi
+        exit 0 ;;
       *headRefOid*)
         cur_head; exit 0 ;;
     esac
     exit 1 ;;
   "pr comment")
+    # The ENQUEUE command is a send; the QUEUE's own check-run is the artifact. The
+    # fake models the real sequence faithfully: the run moves off `waiting` only when
+    # the queue TAKES the PR, which the scenario supplies as a second fixture. A
+    # scenario that omits it models "posted and ignored" — the shape a rail must NOT
+    # report as success.
+    case "$*" in
+      *'@Mergifyio queue'*)
+        [ -f "$SCEN/mergify-run-queued" ] && cp "$SCEN/mergify-run-queued" "$SCEN/mergify-run" ;;
+    esac
     exit 0 ;;
   "api"*)
     ep="${2:-}"; jqprog=""
     prev=""
     for x in "$@"; do [ "$prev" = "--jq" ] && jqprog="$x"; prev="$x"; done
     case "$ep" in
+      */contents/.mergify.yml)
+        # The QUEUE DECLARATION — the only admissible evidence of "the queue is not
+        # armed". A PR head with no Mergify run is NOT that evidence (measured: 3 of 12
+        # open PRs had no run while the queue was armed).
+        if [ "${SCEN_DECL_UNREADABLE:-0}" = 1 ]; then
+          # A body that DECODES but is not a config (a submodule returns `null`; a
+          # corrupt body decodes to noise). "Does not contain queue_rules:" must not be
+          # read as "positively no queue" for these — it is an unreadable instrument.
+          printf '<html>not a config</html>' | base64
+          exit 0
+        fi
+        if [ "${SCEN_NO_QUEUE:-0}" = 1 ]; then
+          printf 'merge_protections_settings:\n  auto_merge_conditions: true\n' | base64
+        else
+          printf 'queue_rules:\n  - name: main\n    batch_size: 4\n' | base64
+        fi
+        exit 0 ;;
       */branches/*/protection*)
         # #1565: the DECLARED live `strict` read. An ABSENT fixture models the real
         # 404/403 (protection unconfigured, or a token without admin on the repo) —
@@ -158,6 +197,25 @@ case "${1:-} ${2:-}" in
         # the fixture is multi-line (one line per page), and only a paginated read
         # is served every line. A single-line fixture is unaffected.
         page() { local f="$1"; shift; if [[ " $* " == *" --paginate "* ]]; then cat "$SCEN/$f"; else head -1 "$SCEN/$f"; fi; }
+        case "$jqprog" in
+          *app.slug*)
+            # QUEUE-MODE read (`--queue`): the Mergify check-run. The fixture is the
+            # REAL two-value emit — "<id>\t<title>" then the summary verbatim — so the
+            # rail's line splitting is exercised, and the summary carries a REAL
+            # base64url `itemprop` payload that `queue_state_decode` genuinely decodes.
+            #
+            # THREE shapes, because the rail must tell them apart:
+            #   fixture present      ⇒ a published verdict
+            #   fixture ABSENT       ⇒ the read SUCCEEDED and there is no verdict for
+            #                          this head ("NONE" — not yet evaluated, NOT "no
+            #                          queue"; the declaration probe decides that)
+            #   SCEN_MERGIFY_UNREADABLE=1 ⇒ the read FAILED (403/rate limit/network).
+            #                          The rail must stop, never fall back or succeed:
+            #                          an empty body is not evidence about the queue.
+            [ "${SCEN_MERGIFY_UNREADABLE:-0}" = 1 ] && { echo "gh: HTTP 403: rate limit exceeded" >&2; exit 1; }
+            if [ -f "$SCEN/mergify-run" ]; then cat "$SCEN/mergify-run"; else echo NONE; fi
+            exit 0 ;;
+        esac
         case "$jqprog" in
           *'!= "completed"'*) page pending "$@" 2>/dev/null || echo 0 ;;
           *'== "completed"'*) page completed "$@" 2>/dev/null || echo 1 ;;
@@ -402,6 +460,9 @@ new_scen() {
   SCEN_RECORD_RC=0; SCEN_RECORD_LOG=; SCEN_ADMIN_RC=0; ATOMIC_LAND_CONFIRM_MAX=60
   SCEN_RECORD_NO_WRITE=0
   SCEN_RECORD_REFUSE_PREFLIGHT=0; SCEN_RECORD_CLAUSE_E=0; SCEN_RECORD_CLAUSE_E_ALL=0
+  SCEN_NO_QUEUE=0
+  SCEN_MERGIFY_UNREADABLE=0
+  SCEN_DECL_UNREADABLE=0
   SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
   # #2374: the cross-box review-registry union is OFF by default here — this suite
   # is hermetic and executes the rail ~85 times; a live store would make every
@@ -490,6 +551,8 @@ rail_exec() { # <extra args...>
   SCEN_RECORD_MOVES_HEAD="${SCEN_RECORD_MOVES_HEAD:-0}" \
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
+  SCEN_NO_QUEUE="${SCEN_NO_QUEUE:-0}" SCEN_MERGIFY_UNREADABLE="${SCEN_MERGIFY_UNREADABLE:-0}" \
+  SCEN_DECL_UNREADABLE="${SCEN_DECL_UNREADABLE:-0}" \
   ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
   ATOMIC_LAND_REGISTRY_SYNC="${SCEN_REGISTRY_SYNC:-off}" \
   ATOMIC_LAND_DRIFT_GUARD="${SCEN_DRIFT_CMD:-}" \
@@ -504,6 +567,58 @@ run_rail() { # <extra args...>
 calls() { cat "$SCEN/calls"; }
 called() { grep -qF -- "$1" "$SCEN/calls"; }
 count_call() { grep -cF -- "$1" "$SCEN/calls"; }
+
+# mergify_fixture: the queue's own check-run, with a REAL machine-readable payload.
+# <state> <queued_at> <ready 0|1> <unmet-leaf-description> [dest] [title-override]
+#   ready=1 ⇒ every leaf's `match` is true (the live "Merge queue is ready" shape)
+#   ready=0 ⇒ the named leaf is false, the rest true — which is what proves the
+#             decoder reports the UNMET leaf and not the satisfied ones.
+mergify_fixture() {
+  python3 - "$1" "$2" "$3" "$4" "${6:-}" > "$SCEN/${5:-mergify-run}" <<'PY'
+import base64, json, sys
+
+state, queued, ready, unmet = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
+title_override = sys.argv[5] if len(sys.argv) > 5 else ""
+
+def leaf(desc, match):
+    return {"description": desc, "match": match, "subconditions": []}
+
+leaves = ["check-success=ai-review-gate", "check-success=docs"]
+subs = [leaf(d, False if (d == unmet) else True) for d in leaves]
+conds = [
+    {"description": "any of", "match": ready, "subconditions":
+        [{"description": "all of", "match": ready, "subconditions": subs}]},
+    {"description": "-closed", "match": True, "subconditions": []},
+    # A SATISFIED "any of" whose own leaves are FALSE: the fixture that catches a
+    # decoder walking branches the queue already resolved.
+    {"description": "any of", "match": True, "subconditions":
+        [leaf("-mergify-configuration-changed", True),
+         leaf("check-success = @mergify/Configuration changed", False)]},
+]
+payload = {"version": 1, "state": state, "queue_rule_name": None,
+           "queued_at": (queued or None), "estimated_time_of_merge": None,
+           "speculative_check_pr": None, "required_conditions": conds}
+# ⛔ ALPHABET PIN. Mergify's payload is base64URL: a real one carried `-` (measured on
+# tortoise#9604's paused run), and a decoder that accepts only `+/=` silently reports
+# `unreadable` for a readable verdict. The filler is grown until the ENCODED string
+# actually contains a base64url-only character, so every scenario that reads a queue
+# verdict exercises the alphabet rather than trusting that alignment produced one.
+for _fill in range(1, 9):
+    payload["alphabet_pin"] = ">" * _fill
+    b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    if "-" in b64 or "_" in b64:
+        break
+else:
+    raise SystemExit("fixture could not produce a base64url-only character")
+title = "Merge queue is ready" if ready else "Waiting for queue conditions to match"
+if title_override:
+    title = title_override
+summary = ("### Queue entry conditions\n\n- [ ] `check-success=ai-review-gate`\n\n"
+           "<span itemprop=\"mergify.v1.%s\"></span>\n" % b64)
+print("120289497949\t%s" % title)
+print(summary, end="")
+PY
+}
 
 # Run the rail under a hard wall-clock watchdog and report its exit status.
 #
@@ -2652,6 +2767,354 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" \
   && fail "consulted the predicate for a measured-current head (needless subprocess)" \
   || pass "and did NOT spend a predicate call on it"
 
+# ═══ 17h. --queue — hand the PR to the merge queue instead of admin-merging ══
+# The owner's question was "why can't we merge 20 at a time instead of paying a full
+# CI cycle per PR?" The queue in `.mergify.yml` is that mechanism (batch_size 4, one
+# CI run per batch), but nothing HANDED a PR to it, so every landing THIS RAIL performs
+# goes through that one direct land step and pays its own cycle. (Scoped deliberately:
+# a claim about landings in general cannot be supported — the queue announced two
+# enqueues in the measured span, so those particular landings did not pay their own.)
+# What these scenarios pin, in order of what would hurt most if it broke:
+#   A. a ready PR is enqueued by the DOCUMENTED command, admin-merge is NOT called,
+#      and the state reported is the one the QUEUE published (not "I posted");
+#   B. an entry REFUSAL never falls back to the admin door — the queue's own unmet
+#      condition is quoted and the rail stops (bypassing would ship unreviewed work);
+#   C. ABSENT queue ⇒ the rail SAYS `QUEUE-NOT-ARMED` and uses the existing path;
+#   D. posted-but-never-taken is a FAILURE, not a success (#1359).
+echo "── 17h-A. --queue on a ready PR: enqueue, do not admin-merge, report what the queue said"
+new_scen qready
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture waiting "" 1 ""
+mergify_fixture queued "2026-10-23T11:00:00Z" 1 "" mergify-run-queued
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the rail exits 0 once the queue has TAKEN the PR" || fail "expected rc 0, got $rc ($(tail -2 "$SCEN/err"))"
+called 'pr comment 42' && pass "the documented enqueue command was posted" || fail "no enqueue comment was posted (calls: $(calls))"
+called '@Mergifyio queue' && pass "the command posted is '@Mergifyio queue'" || fail "the comment did not carry the queue command"
+called 'admin-merge' && fail "admin-merge ran on a --queue hand-off (the whole point is NOT paying a per-PR merge)" \
+  || pass "admin-merge did NOT run — the queue owns the merge"
+called 'app.slug' && pass "the queue's own check-run was read (entry state observed, not assumed)" \
+  || fail "the rail enqueued without reading the queue state"
+grep -q 'QUEUE #42 — state=queued' "$SCEN/out" \
+  && pass "the reported state is the one the QUEUE published (state=queued)" \
+  || fail "the rail did not report the observed queue state (out: $(cat "$SCEN/out"))"
+grep -q 'queued_at=2026-10-23T11:00:00Z' "$SCEN/out" \
+  && pass "the observation carries the queue's own queued_at" \
+  || fail "the observation dropped queued_at"
+
+# ═══ 17h-B. an entry REFUSAL is reported, never routed around ════════════
+echo "── 17h-B. --queue the queue will not take: quote the refusal, never admin-merge"
+new_scen qrefused
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+# The queue publishes an unmet leaf AND never takes the PR (no mergify-run-queued),
+# which is what a genuine refusal looks like from the outside.
+mergify_fixture waiting "" 0 'check-success=docs'
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail STOPS when the queue will not take the PR (rc 1)" || fail "expected rc 1, got $rc"
+called 'admin-merge' && fail "a queue that will not take the PR fell back to the land step — the bypass this flag must never be" \
+  || pass "a non-take did NOT fall back to the land step"
+grep -qE 'still WAITING|ANSWERED with state' "$SCEN/err" && pass "the failure says the queue did not take it" || fail "the failure is unnamed"
+grep -q 'check-success=docs' "$SCEN/out" "$SCEN/err" \
+  && pass "the queue's own unmet condition is quoted verbatim" || fail "the unmet condition was not quoted"
+# A still-`waiting` queue has REFUSED nothing — the rail merely stopped waiting.
+# Calling that "REFUSED" sends the operator to fix a condition that is only in
+# progress, so the wording is pinned.
+grep -q 'REFUSED' "$SCEN/err" && fail "a still-waiting queue was reported as REFUSED" \
+  || pass "still-waiting is not reported as a refusal"
+# The published verdict is a CACHE of the last evaluation. It must be QUOTED, but it
+# must not be what decides: a PR whose conditions have since gone green still shows
+# the old leaves (measured on tortoise#9718), and refusing on that is an instrument
+# false positive. So the rail must still ASK the queue.
+called '@Mergifyio queue' && pass "the rail still ASKED the queue (the stale verdict is not the decision)" \
+  || fail "the rail refused on the cached verdict without asking the queue"
+grep -q 'PUBLISHED verdict above is its last evaluation' "$SCEN/out" \
+  && pass "it says the published verdict may be stale, rather than presenting it as live" \
+  || fail "the stale-verdict caveat is missing"
+# The leaf under the SATISFIED "any of" must not be reported as a blocker — a
+# decoder that walks every false leaf would list this one and misdirect the fix.
+grep -q 'mergify/Configuration changed' "$SCEN/out" "$SCEN/err" \
+  && fail "a false leaf under a SATISFIED branch was reported as unmet" \
+  || pass "resolved branches are not reported as unmet"
+
+# ═══ 17h-C. the repo declares NO queue ⇒ QUEUE-NOT-ARMED, and the DIRECT path runs ═
+# ⛔ This is the P0 the review found, pinned: the fallback must run the EXISTING path
+# WHOLE — update, terminal wait, base certification, land — and not call the land step
+# from inside the queue path, where those guards have already been skipped.
+echo "── 17h-C. --queue where the repo declares no queue: QUEUE-NOT-ARMED, direct path runs whole"
+new_scen qnotarmed
+SCEN_NO_QUEUE=1
+printf 'BEHIND\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the rail still lands via the existing path (rc 0)" || fail "expected rc 0, got $rc ($(tail -2 "$SCEN/err"))"
+grep -q 'QUEUE-NOT-ARMED' "$SCEN/out" && pass "it says QUEUE-NOT-ARMED" || fail "QUEUE-NOT-ARMED was not reported"
+grep -q 'falling back to the EXISTING land path' "$SCEN/out" \
+  && pass "the fallback is NAMED (a silent one is indistinguishable from the queue working)" \
+  || fail "the fallback was silent"
+called 'pr update-branch 42' && pass "the DIRECT path ran whole — the branch was updated" \
+  || fail "the fallback skipped the direct path's update step"
+called 'record-review 42' && pass "the DIRECT path re-recorded at the moved head" || fail "the fallback skipped the direct path's record step"
+called 'admin-merge 42' && pass "the existing land step actually ran" || fail "nothing landed"
+called '@Mergifyio queue' && fail "an enqueue command was posted with no queue declared" \
+  || pass "no enqueue command was posted"
+# The P0 the review found was that the fallback called the land step with the direct
+# path's guards already skipped. Assert the GUARDS, not an inference from the calls:
+# the terminal wait ran (its own line), and nothing reports a queue-mode skip.
+grep -q 'waiting (≤' "$SCEN/out" && pass "the DIRECT path's terminal wait actually ran (not inferred)" \
+  || fail "the terminal wait did not run on the fallback path"
+grep -q 'skipped under --queue' "$SCEN/out" && fail "the fallback still reported queue-mode skips" \
+  || pass "no queue-mode skip reported on the fallback path"
+
+# ═══ 17h-D. posted but never taken is a FAILURE ═══════════════════════════
+echo "── 17h-D. --queue posted but the queue never took it: FAIL, and do not admin-merge instead"
+new_scen qignored
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture waiting "" 1 ""
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "a comment that never became a queue entry FAILS (rc 1)" || fail "expected rc 1, got $rc"
+called 'admin-merge' && fail "the rail admin-merged after its enqueue was ignored" \
+  || pass "it did not fall through to admin-merge"
+grep -q 'did NOT TAKE' "$SCEN/err" && pass "the failure names the un-taken hand-off" || fail "the failure is unnamed"
+
+# ═══ 17h-E. a PAUSED queue is a deliberate stop, not an absent queue ════
+# Measured live 2026-10-23: Mergify paused this repo's queue by itself — "Stopping a
+# batch-restart storm: repeated Restarted-from-batch cycles were minting a new
+# merge-queue branch every ~100 seconds". A pause must NOT take the QUEUE-NOT-ARMED
+# fallback: admin-merging past it would defeat exactly the thing that was switched
+# off, on exactly the PRs it was switched off for.
+echo "── 17h-E. --queue on a PAUSED queue: report it verbatim, no enqueue, NO admin-merge"
+new_scen qpaused
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture waiting "" 1 "" mergify-run \
+  '⏸️ Checks are suspended, the merge queue is currently paused on this repository, for the following reason: `Stopping a batch-restart storm: repeated Restarted-from-batch cycles`'
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail STOPS on a paused queue (rc 1)" || fail "expected rc 1, got $rc"
+grep -q 'QUEUE-PAUSED' "$SCEN/out" && pass "it says QUEUE-PAUSED (not QUEUE-NOT-ARMED — different causes, different routes)" \
+  || fail "the pause was not named as a pause"
+grep -q 'batch-restart storm' "$SCEN/out" && pass "the queue's own reason is quoted verbatim" \
+  || fail "the pause reason was not quoted"
+called 'admin-merge' && fail "a PAUSED queue fell back to admin-merge — routing around a deliberate stop" \
+  || pass "no admin-merge fallback past a pause"
+called '@Mergifyio queue' && fail "the rail posted the enqueue command into a paused queue" \
+  || pass "no enqueue command was posted"
+
+# ═══ 17h-F. --queue does NOT update the branch (the queue does it) ════
+# The single biggest per-PR cost the queue removes: an update moves the head, stales
+# the record and re-buys a CI cycle. #3016 Option 1 records that the queue replaces
+# the update-lock. Unpinned, a future edit could restore the update and the suite
+# would stay green while the flag quietly stopped buying anything.
+echo "── 17h-F. --queue on a BEHIND PR: NO branch update (the queue owns it)"
+new_scen qbehind
+printf 'BEHIND\n' > "$SCEN/state"
+printf '%s\n' "$HEAD_OLD" > "$SCEN/head"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture waiting "" 1 ""
+mergify_fixture queued "2026-10-23T11:00:00Z" 1 "" mergify-run-queued
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the PR is handed to the queue (rc 0)" || fail "expected rc 0, got $rc ($(tail -2 "$SCEN/err"))"
+called 'pr update-branch' && fail "--queue updated the branch — the head moves, the record stales, and a CI cycle is re-bought" \
+  || pass "no branch update — the queue merges onto the current base itself (#3016)"
+grep -q 'queue performs the update itself' "$SCEN/out" && pass "it says why the update is skipped" \
+  || fail "the skip is silent"
+
+# ═══ 17h-G. --queue does NOT wait for the head's checks to go terminal ═
+# Entry gates on the cheap `queue_conditions`; the heavy gate is re-run on the
+# composition. If the rail still waited for terminal checks it would re-buy the cycle
+# the queue exists to share, so this is pinned by a head whose checks never settle.
+echo "── 17h-G. --queue with NON-terminal checks at the head: still enqueues (no terminal wait)"
+new_scen qpending
+printf 'CLEAN\n' > "$SCEN/state"
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+printf '5\n' > "$SCEN/pending"   # 5 checks still pending, forever
+mergify_fixture waiting "" 1 ""
+mergify_fixture queued "2026-10-23T11:00:00Z" 1 "" mergify-run-queued
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "enqueued with 5 checks still pending (rc 0)" || fail "expected rc 0, got $rc ($(tail -2 "$SCEN/err"))"
+grep -q 'skipped under --queue' "$SCEN/out" && pass "it says the terminal wait is skipped, and why" \
+  || fail "the terminal-wait skip is not reported"
+# ⛔ The reason string must survive SHELL EXPANSION. A backticked key inside a
+# double-quoted `say` runs as a command substitution and silently prints "()" —
+# measured live on 2026-10-23, where the line emitted `merge_conditions: command not
+# found` into the rail's own output. Asserting the key's TEXT is what catches that.
+grep -q 'merge_conditions' "$SCEN/out" && pass "the skip reason survives shell expansion (no backtick substitution)" \
+  || fail "the skip reason lost its text to a command substitution"
+grep -q 'command not found' "$SCEN/out" "$SCEN/err" && fail "the rail ran a backticked span as a command" \
+  || pass "no stray command substitution in the output"
+grep -q 'checks terminal' "$SCEN/out" && fail "the rail waited for terminal checks in queue mode (re-buying the cycle the queue exists to share)" \
+  || pass "the rail did NOT wait for the head's checks to settle"
+called 'admin-merge' && fail "admin-merge ran in queue mode" || pass "no land step"
+
+# ═══ 17h-H. --queue --dry-run mutates nothing ════════════════════════
+echo "── 17h-H. --queue --dry-run: no comment, no land, no lock"
+new_scen qdry
+printf 'CLEAN\n' > "$SCEN/state"
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture waiting "" 1 ""
+run_rail 42 --repo "$REPO" --queue --dry-run --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the inspection completes (rc 0)" || fail "expected rc 0, got $rc"
+called '@Mergifyio queue' && fail "--dry-run posted the enqueue command" || pass "no enqueue command posted"
+called 'admin-merge' && fail "--dry-run landed" || pass "nothing landed"
+grep -q 'would post' "$SCEN/out" && pass "it says what it WOULD do" || fail "no plan printed"
+[ -d "$SCEN/home/.pi/agent/locks" ] && fail "--dry-run took the per-PR lock" || pass "no lock taken"
+
+# ═══ 17h-I. an UNKNOWN queue state is never a success (allow-list) ══
+# An exclude-list reading ("anything not waiting is queued") reports `dequeued`,
+# `cancelled` and any future state as a successful hand-off — the #1359 false-success
+# class. Only queued/in_place/merged may report success.
+echo "── 17h-I. --queue: a state that does not mean 'held' is NOT reported as success"
+new_scen qweird
+printf 'CLEAN\n' > "$SCEN/state"
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture waiting "" 1 ""
+mergify_fixture dequeued "" 1 "" mergify-run-queued
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "state=dequeued is NOT a success (rc 1)" || fail "expected rc 1, got $rc"
+grep -q 'ANSWERED with state=dequeued' "$SCEN/err" && pass "it names the state the queue answered with" \
+  || fail "the answered state is not named"
+grep -q '✅' "$SCEN/out" && fail "a non-held state printed the success marker" || pass "no success marker for a non-held state"
+
+# ═══ 17h-J. a pause in the DECODED state (neutral title) is caught ═════
+# The machine-readable state is the detector of record; the title is only the quoted
+# reason. A title-worded detector alone misses a pause whose wording changes, so this
+# scenario carries `state: paused` and a title with no pause word at all.
+echo "── 17h-J. --queue: pause detected from the DECODED state, not the title"
+new_scen qpausedstate
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture 'paused: batch-restart storm' "" 1 "" mergify-run 'Merge queue status'
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "a state-level pause stops the rail (rc 1)" || fail "expected rc 1, got $rc"
+grep -q 'QUEUE-PAUSED' "$SCEN/out" && pass "named QUEUE-PAUSED from the state alone" \
+  || fail "the state-level pause was not detected (title has no pause word)"
+called 'admin-merge' && fail "a state-level pause fell back to the land step" || pass "no land step"
+called '@Mergifyio queue' && fail "the enqueue command was posted into a paused queue" || pass "no enqueue posted"
+
+# ═══ 17h-K. an UNREADABLE queue read must STOP, never fall back or succeed ═
+# The class: a 403 / rate limit returns an empty body, which is indistinguishable from
+# "nothing published" unless the read's exit status is checked. Treating it as absent
+# would route the PR to the land step on a transient error; treating it as idle would
+# report success. Both are the false-success / unsafe-land classes.
+echo "── 17h-K. --queue when the queue read FAILS: stop, never fall back, never succeed"
+new_scen qunreadable
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+SCEN_MERGIFY_UNREADABLE=1
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "an unreadable queue read STOPS (rc 1)" || fail "expected rc 1, got $rc"
+grep -q 'could not READ the merge queue state' "$SCEN/err" && pass "it names the unreadable read" \
+  || fail "the read failure was not named"
+called 'admin-merge' && fail "an unreadable queue read fell back to the land step" || pass "no land step"
+called '@Mergifyio queue' && fail "the rail posted the command on an unreadable queue" || pass "no enqueue posted"
+
+# ═══ 17h-L. a declared queue with NO verdict yet: ask it (do not fall back) ═
+echo "── 17h-L. --queue, queue declared but no verdict at this head: ask the queue"
+new_scen qnoverdict
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "no verdict and no take ⇒ failure, not a silent success (rc 1)" || fail "expected rc 1, got $rc"
+called '@Mergifyio queue' && pass "it ASKED the queue (no verdict is not 'no queue')" \
+  || fail "it never asked the queue"
+called 'admin-merge' && fail "a declared queue fell back to the land step" || pass "no land step"
+grep -q 'QUEUE-NOT-ARMED' "$SCEN/out" && fail "a DECLARED queue was reported as not armed" \
+  || pass "a declared queue is never reported as not armed"
+
+# ═══ 17h-M. every jq program in the rail must be SINGLE-escaped ═════════
+echo "── 17h-M. no double-escaped jq program in the rail (a static pin)"
+# ⛔ Pin the jq SHAPE, not "any double backslash": the rail legitimately contains
+# `\(` inside an ERE (the review-marker regex at read_record), so a loose pattern
+# false-reds. The bad shape is specifically `"\(.` — an interpolation marker escaped.
+grep -qF '"\\(.' "$RAIL" \
+  && fail "the rail contains a DOUBLE-escaped jq interpolation — jq will emit it literally" \
+  || pass "no double-escaped jq interpolation in the rail"
+# And a live proof that the programs this suite depends on do resolve when executed.
+if command -v jq >/dev/null 2>&1; then
+  [ "$(printf '{"headRefOid":"aaa","baseRefName":"main"}' | jq -r '"\(.headRefOid)\t\(.baseRefName)"')" = "$(printf 'aaa\tmain')" ] \
+    && pass "the head/base jq program actually interpolates when executed" \
+    || fail "the head/base jq program does not interpolate"
+else
+  pass "jq not installed — static escape pin covers the class"
+fi
+
+# ═══ 17h-N. an UNREADABLE queue DECLARATION stops (never "not armed") ══
+# The polarity this pins: only a positively-read config with no `queue_rules:` may take
+# the fallback. A body that decodes but is not a config must stop, because falling back
+# would silently reverse the operator's --queue on a repo that may well declare one.
+echo "── 17h-N. --queue when the queue DECLARATION is unreadable: stop"
+new_scen qdeclbad
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+SCEN_DECL_UNREADABLE=1
+mergify_fixture waiting "" 1 ""
+mergify_fixture queued "2026-10-23T11:00:00Z" 1 "" mergify-run-queued
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "an unreadable declaration STOPS (rc 1)" || fail "expected rc 1, got $rc"
+grep -q "could not read" "$SCEN/err" && pass "it says the declaration could not be read" \
+  || fail "the unreadable declaration was not named"
+grep -q 'QUEUE-NOT-ARMED' "$SCEN/out" && fail "an UNREADABLE declaration was reported as 'not armed'" \
+  || pass "unreadable is not reported as not-armed"
+called 'admin-merge' && fail "an unreadable declaration fell back to the land step" || pass "no land step"
+
+# ═══ 17h-O. a pause that lands MID-WAIT is caught by the wait loop ═══════
+# The measured case (2026-10-23): the queue paused three seconds AFTER an enqueue was
+# posted. Without this scenario the mid-wait pause arms are never executed and could be
+# deleted with the suite staying green.
+echo "── 17h-O. --queue: pause arriving mid-wait is caught by the wait loop"
+new_scen qmidpause
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+mergify_fixture waiting "" 1 ""
+mergify_fixture 'paused: batch-restart storm' "" 1 "" mergify-run-queued 'Merge queue status'
+run_rail 42 --repo "$REPO" --queue --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "a mid-wait pause STOPS (rc 1)" || fail "expected rc 1, got $rc"
+grep -q 'paused while #42 was waiting' "$SCEN/out" && pass "the MID-WAIT arm caught it (not the pre-command one)" \
+  || fail "the mid-wait pause was not caught"
+called 'admin-merge' && fail "a mid-wait pause fell back to the land step" || pass "no land step"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -2680,6 +3143,15 @@ if true; then
   MUTATION_JOBS="${ATOMIC_LAND_MUTATION_JOBS:-4}"
   case "$MUTATION_JOBS" in ''|*[!0-9]*) MUTATION_JOBS=4 ;; esac
   [ "$MUTATION_JOBS" -ge 1 ] 2>/dev/null || MUTATION_JOBS=4
+  # How long to wait for a child's verdict ARTIFACT once `wait` has reaped a pid (#2622: the reaped
+  # pid is not always the process still writing, so the artifact can land a few seconds later) — and
+  # a TOTAL budget for those waits across the whole drain, because a systemic breakage (the child
+  # never writes one) must not add `WAIT x 65` to a sharded step whose own bound is 70 min: the
+  # slots are BOUNDED, so a real abort stays RED with its cause named instead of eating the clock.
+  MUTATION_VERDICT_WAIT="${ATOMIC_LAND_VERDICT_WAIT:-20}"
+  case "$MUTATION_VERDICT_WAIT" in ''|*[!0-9]*) MUTATION_VERDICT_WAIT=20 ;; esac
+  MUTATION_VERDICT_BUDGET="${ATOMIC_LAND_VERDICT_BUDGET:-120}"
+  case "$MUTATION_VERDICT_BUDGET" in ''|*[!0-9]*) MUTATION_VERDICT_BUDGET=120 ;; esac
   MUT_QUEUE=()          # "<name>\t<mutated rail>" per queued mutation, in call order
   mut_reported=0
   # The declared population. Two guards read it, and they catch DIFFERENT things (below): the
@@ -2688,43 +3160,235 @@ if true; then
   # `mutate_and_expect_fail` line moves both sides of it. Bump this when you add a class; that a
   # deletion has to walk past a number is the whole point (same doctrine as the shard runner's
   # `MIN_SUITES` floor).
-  MUTATION_FLOOR=65
+  # ⛔ BUMP THIS WHEN YOU ADD A CLASS. The floor is the ONLY guard that sees a DELETED
+  # `mutate_and_expect_fail` line (the queue→drain comparison structurally cannot — deleting
+  # one moves both sides of it together, see the note at the guards below). A floor left
+  # BELOW the population makes that guard inert for every class added after it: measured
+  # 2026-10-24, `--queue` raised the population 65 → 71 while the floor stayed at 65, so
+  # deleting all six Q mutations reported `71 → 65 ≥ 65` and stayed green — the coverage
+  # they carry would have gone silently (review finding, PR #2536).
+  MUTATION_FLOOR=71
   mutation_drain() { # run the queued mutations in batches, reporting each by name
-    local total="${#MUT_QUEUE[@]}" i=0 k n name src rc
+    local total="${#MUT_QUEUE[@]}" i=0 k n name src rc LOGF=""
     local -a pids names
     [ "$total" -eq 0 ] && return 0
     while [ "$i" -lt "$total" ]; do
       pids=(); names=(); n=0
       while [ "$i" -lt "$total" ] && [ "$n" -lt "$MUTATION_JOBS" ]; do
         IFS=$'\t' read -r name src <<< "${MUT_QUEUE[$i]}"
+        # The verdict is an ARTIFACT, not a line of prose in the log (see the drain note below): the
+        # child writes "<failures> <checks>" to this path as its last act.
         ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_ANCHORS=0 ATOMIC_LAND_SUITE_RAIL="$src" \
+          ATOMIC_LAND_VERDICT="$MUT/$name.verdict" \
           bash "$0" >"$MUT/$name.log" 2>&1 &
         pids+=("$!"); names+=("$name")
         i=$((i + 1)); n=$((n + 1))
       done
       k=0
       while [ "$k" -lt "${#pids[@]}" ]; do
+        n="${names[$k]}"
         rc=0; wait "${pids[$k]}" || rc=$?
         mut_reported=$((mut_reported + 1))
-        # ⛔ A NON-ZERO EXIT IS NOT A VERDICT BY ITSELF. The child is a WHOLE suite run, and a child
-        # that died for a reason unrelated to the mutation — OOM-killed (137), a full /tmp (1), a
-        # watchdog bound lost to contention (124) — exits non-zero exactly like a caught mutation.
-        # Serial execution made that rare; concurrent children widen it, and reading it as "class
-        # covered" is a FALSE PASS over an unchecked class. So require the child's OWN summary line:
-        # the suite prints "❌ N of M atomic-land test(s) failed" on every failing path, including a
-        # crash-free run of a mutated rail, and prints nothing of the sort when it dies mid-run.
-        if [ "$rc" -ne 0 ] \
-           && grep -qE '^❌ [0-9]+ of [0-9]+ atomic-land test\(s\) failed$' "$MUT/$name.log"; then
-          pass "mutation ${names[$k]} reddens the suite (class covered)"
-        elif [ "$rc" -ne 0 ]; then
-          fail "mutation ${names[$k]} exited $rc with NO failure verdict — it did not run to a verdict, so it covers nothing: $(tail -1 "$MUT/$name.log" 2>/dev/null)"
-        else
-          fail "mutation ${names[$k]} did NOT redden the suite (class NOT covered)"
-        fi
+        # The `wait` above REAPS; it never decides (see `mutation_verdict`).
+        mutation_verdict "$n" "$rc"
         k=$((k + 1))
       done
     done
   }
+  # mutation_verdict <name> <rc> — THE ONE PLACE a child's coverage is decided (#2622).
+  #
+  # ⛔ THE VERDICT IS AN ARTIFACT, NOT A LOG SCRAPE — AND NOT AN EXIT STATUS.
+  # This used to grep the child's stdout for its summary line. That reads a file whose WRITER MAY
+  # STILL BE RUNNING: on a loaded box (CI runs these children 4-up) the pid the drain's `wait` reaps
+  # is gone while the child is still live and still appending — measured on origin/main (848ba4b1):
+  # `ps -p <waited>` empty, and the log 933 bytes longer 3 s later, ENDING WITH THE CHILD'S OWN
+  # "❌ 14 of 290 atomic-land test(s) failed". The grep read a PARTIAL log, matched nothing, and a
+  # mutation whose coverage is real was reported as an unattributed abort — a false red that took
+  # `main` down (11 and 14 "failed" of 361 on the same tree, two consecutive runs).
+  # So the child publishes the verdict where a reader cannot race it, and this function requires the
+  # ARTIFACT: "<failures> <checks>".
+  #
+  # ⛔ A NON-ZERO EXIT IS NOT A VERDICT BY ITSELF EITHER. A child that died for a reason unrelated to
+  # the mutation — OOM-killed (137), a full /tmp, a watchdog bound lost to contention (124) — exits
+  # non-zero exactly like a caught mutation; reading that as "class covered" is a FALSE PASS over an
+  # unchecked class. `rc` is therefore REPORTED, never trusted: only `failures > 0` is coverage.
+  # And when there is no artifact, the report NAMES THE CAUSE — rc, the signal, the log path and the
+  # diagnostic NEAREST THE DEATH (the LAST match, not the first: a fixture that kills a rail legitimately
+  # prints its own 'Killed' line earlier — see the note in the body) — because "did not run to a verdict"
+  # with a section header as its only
+  # evidence is the unattributable-failure class (#1185) that made this shard impossible to triage.
+  mutation_verdict() { # <name> <rc>
+    local name="$1" rc="$2" verdict="$MUT/$1.verdict" waited=0 f c signame diag sig present=0 cap
+    # `[ -s ]`, not `[ -f ]`: the writer OPENS the artifact a few syscalls before the write lands, and
+    # a child killed in that window leaves a ZERO-BYTE file — "exists" is not "has a verdict".
+    # ⛔ THE BUDGET IS A CAP ON THE WAIT, AND IT IS CHARGED ONLY WHEN NOTHING ARRIVES (below).
+    # Charging it for benign lateness — the measured ~3 s tail, and anything slower on a loaded
+    # runner — would let ordinary slowness exhaust it, and an exhausted budget turns every REMAINING
+    # child into an abort WITHOUT A SINGLE POLL: exactly the false red this function removes
+    # (measured: 8 s of benign lateness per batch → 5 phoney aborts at the tail of the drain).
+    while [ ! -s "$verdict" ] && [ "$waited" -lt "$MUTATION_VERDICT_WAIT" ] \
+          && [ "$waited" -lt "$MUTATION_VERDICT_BUDGET" ]; do
+      sleep 1; waited=$((waited + 1))
+    done
+    f=""; c=""
+    if [ -s "$verdict" ]; then present=1; read -r f c <"$verdict"; fi
+    # An artifact that does not parse is not a verdict: treat it as absent (fail-closed).
+    case "$f" in ''|*[!0-9]*) f=""; c="" ;; esac
+    if [ -n "$f" ] && [ "$f" -gt 0 ]; then
+      pass "mutation $name reddens the suite (class covered) — $f of $c test(s) failed"
+      return 0
+    fi
+    if [ -n "$f" ]; then
+      fail "mutation $name did NOT redden the suite (class NOT covered) — its verdict artifact reports 0 of ${c:-?} test(s) failed"
+      return 0
+    fi
+    # ⚠️ Reaching here means NO USABLE ARTIFACT — the only path that spends the budget.
+    cap=""
+    if [ "$waited" -lt "$MUTATION_VERDICT_WAIT" ]; then
+      cap=" of a ${MUTATION_VERDICT_WAIT}s slot; the ${MUTATION_VERDICT_BUDGET}s drain budget is spent, so later children are not polled"
+    fi
+    MUTATION_VERDICT_BUDGET=$((MUTATION_VERDICT_BUDGET - waited))
+    sig=""
+    if [ "$rc" -gt 128 ]; then
+      signame=""
+      signame="$(kill -l $((rc - 128)) 2>/dev/null)"
+      sig=" (killed by SIG${signame:-$((rc - 128))})"
+    fi
+    # The diagnostic NEAREST the death, not the first: a scenario legitimately kills a rail (7d) and
+    # bash prints `Killed` for it, so "the first diagnostic in the log" would point at a fixture doing
+    # its job. awk keeps the LAST match in ONE pass, with no pipe and no second read of a file that may
+    # be large. (⛔ Not for SIGPIPE — `tail` reads to EOF and would be safe; the SIGPIPE shape is
+    # `grep -q` closing the pipe early. The reason is one pass, not safety from a signal.)
+    diag="$(awk '/syntax error|unbound variable|command not found|Terminated|Killed/{d=$0} END{if (d != "") print d}' "$MUT/$name.log" 2>/dev/null)"
+    # ⛔ …AND A LOG WITH NONE OF THOSE PATTERNS IS STILL EVIDENCE. The code this replaced always
+    # appended `tail -1`; keeping only the pattern match narrowed the abort path, so `No space left on
+    # device`, `Bad substitution` and a plain scenario `❌ expected rc 0, got 1` all produced an abort
+    # with NO log evidence at all — measurably weaker than what it replaced, on the one path whose
+    # whole job is attribution (#1185).
+    [ -n "$diag" ] || diag="$(tail -1 "$MUT/$name.log" 2>/dev/null)"
+    if [ "$present" = 1 ]; then
+      fail "mutation $name produced an UNREADABLE verdict artifact (<failures> <checks> expected), rc=$rc$sig — its generated run did not report a verdict, so it covers nothing (log: $MUT/$name.log)${diag:+; last diagnostic: $diag}"
+    else
+      fail "mutation $name produced NO verdict artifact in ${waited}s$cap (rc=$rc$sig) — its generated run never reached a verdict, so it covers nothing (log: $MUT/$name.log)${diag:+; last diagnostic: $diag}"
+    fi
+    return 0
+  }
+  # ⛔ THE DECISION ITSELF, PINNED WITHOUT RUNNING 65 CHILDREN (#2622). `mutation_verdict` is the ONE
+  # place a child's coverage is decided, so it is exercised directly here: a reddening artifact, a
+  # kept-green artifact, an ABSENT artifact (must name rc + the nearest diagnostic — the #1185 class),
+  # a kill (must name the SIGNAL), and the RACE this fix exists for (the artifact lands AFTER the
+  # drain's `wait` has already returned). Without these arms a rewrite of `mutation_verdict` back to
+  # "grep the log" would leave every mutation still reporting something, and no assertion would
+  # notice that the something had stopped being attributable.
+  # Gated like the population guards below: a CHILD run is a measurement of a mutated rail, and these
+  # arms must not change its assertion count.
+  if [ "$RUN_MUTATIONS" != "0" ]; then
+    _sv="$TMP/selftest-verdicts"; mkdir -p "$_sv"
+    printf '3 290\n' >"$_sv/red.verdict"
+    _o="$(MUT="$_sv" mutation_verdict red 1 2>&1)"
+    case "$_o" in
+      *"✅"*"class covered"*"3 of 290"*) pass "verdict arm: an artifact reporting failures is COVERAGE (a reddening child is not re-run)" ;;
+      *) fail "verdict arm: a reddening child did not read as coverage (got: $_o)" ;;
+    esac
+    printf '0 290\n' >"$_sv/green.verdict"
+    _o="$(MUT="$_sv" mutation_verdict green 0 2>&1)"
+    # ⛔ THE SEVERITY, NOT JUST THE WORDING (review 3, P1 on #2623). This arm used to test only that
+    # the text contained "did NOT redden", which `fail`->`pass` on that branch does not change — so
+    # the whole mutation guard could go inert and SILENT: every class that stopped reddening would
+    # print `✅ … did NOT redden (class NOT covered)`, increment nothing, and the suite would report all
+    # green. That is a FALSE PASS over every unchecked bypass class, the one outcome §18 exists to
+    # prevent. The marker is part of the assertion in BOTH directions.
+    case "$_o" in
+      *"❌"*"did NOT redden"*) pass "verdict arm: an artifact reporting 0 failures is class NOT covered — not an abort, and not coverage" ;;
+      *) fail "verdict arm: a kept-green child did not read as a coverage gap (got: $_o)" ;;
+    esac
+    printf 'mutated rail: line 9: syntax error near unexpected token\n' >"$_sv/dead.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=2 mutation_verdict dead 1 2>&1)"
+    case "$_o" in
+      *"NO verdict artifact"*"rc=1"*"syntax error"*) pass "verdict arm: an absent artifact ABORTS with rc and the diagnostic named (the failure is attributable)" ;;
+      *) fail "verdict arm: an aborted child was not attributed (got: $_o)" ;;
+    esac
+    # ⛔ …AND A DIAGNOSTIC THAT MATCHES NONE OF THOSE PATTERNS IS STILL EVIDENCE (review 3, P2 on
+    # #2623). The `dead` arm above carries `syntax error`, so it passes with or without the `tail -1`
+    # fallback. Without it, an abort whose only evidence is a full disk or a bash abort inside the rail
+    # reports the log path and NOTHING to look for — the #1185 unattributable-failure class, back
+    # again with nothing red.
+    printf 'bash: line 42: No space left on device\n' >"$_sv/enospc.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=1 mutation_verdict enospc 1 2>&1)"
+    case "$_o" in
+      *"last diagnostic: "*"No space left on device"*) pass "verdict arm: a log with no known pattern still yields the last diagnostic (the abort is attributable)" ;;
+      *) fail "verdict arm: an abort with an unfamiliar log dropped its only evidence (got: $_o)" ;;
+    esac
+    # ⛔ TWO MATCHES, IN THE ORDER A REAL SCENARIO PRODUCES THEM (final review, #2623): every arm above
+    # carries exactly ONE match, so an awk rewritten to keep the FIRST (`if (d=="") d=$0`) would keep
+    # them all green while an abort reverted to the benign `Killed` line a fixture prints legitimately —
+    # misattribution on the one path whose whole job is attribution (#1185).
+    # ⛔ AND THE BENIGN LINE COMES AFTER THE MATCH (final review, #2623). With the match last, "awk keeps
+    # the last MATCH" and "keeps the last LINE" produce the SAME string, so dropping the pattern list —
+    # or reverting to `tail -1` — would pass every arm while an abort reported a fixture's own benign
+    # line. Measured: with this ordering, filter-drop / dead-awk / first-match mutants each go red.
+    printf 'Killed\nbash: line 7: FOO: unbound variable\nscenario 7d done\n' >"$_sv/twomatch.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=1 mutation_verdict twomatch 1 2>&1)"
+    case "$_o" in
+      *"last diagnostic: "*"scenario 7d done"*) fail "verdict arm: the report took the LAST LINE, not the last MATCH — the pattern list is inert (got: $_o)" ;;
+      *"last diagnostic: "*"unbound variable"*) pass "verdict arm: with TWO matches the report keeps the NEAREST THE DEATH, not the first, and never a benign trailing line" ;;
+      *) fail "verdict arm: a two-match log reported the wrong diagnostic (got: $_o)" ;;
+    esac
+    printf 'Terminated\n' >"$_sv/killed.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=2 mutation_verdict killed 137 2>&1)"
+    case "$_o" in
+      *"SIGKILL"*) pass "verdict arm: a signalled child names the SIGNAL, not a bare 137" ;;
+      *) fail "verdict arm: a signalled child did not name its signal (got: $_o)" ;;
+    esac
+    # THE RACE (the measured false red): nothing on disk when the decision starts, the artifact
+    # arrives 2 s later. A log-scraping decision read the partial log and reported an abort here.
+    ( sleep 2; printf '4 290\n' >"$_sv/late.verdict" ) &
+    _vpid=$!
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict late 1 2>&1)"
+    wait "$_vpid" 2>/dev/null
+    case "$_o" in
+      *"class covered"*"4 of 290"*) pass "verdict arm: an artifact that lands AFTER the reaping wait is still read as coverage (the #2622 race)" ;;
+      *) fail "verdict arm: the late-artifact race was read as an abort (got: $_o)" ;;
+    esac
+    # ⛔ A WAIT THAT SUCCEEDS MUST CHARGE NOTHING. (Review finding 1 on #2623: charging every waited
+    # second let ordinary slowness exhaust the budget, after which every remaining child was aborted
+    # unpolled — the same false red, reintroduced by the fix for it.) Called DIRECTLY, not through
+    # `$( )`: the budget lives in this shell, and a subshell would make the assertion vacuous. Its own
+    # verdict line is NOT suppressed — a hidden `pass`/`fail` would still move `checks`/`failures` and
+    # produce a count with no matching line (review finding 3 on #2623).
+    ( sleep 2; printf '5 290\n' >"$_sv/late2.verdict" ) &
+    _vpid=$!
+    _b0="$MUTATION_VERDICT_BUDGET"
+    MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict late2 1
+    wait "$_vpid" 2>/dev/null
+    [ "$MUTATION_VERDICT_BUDGET" -eq "$_b0" ] \
+      && pass "verdict arm: a wait that SUCCEEDS charges nothing to the drain budget (benign lateness cannot starve later children)" \
+      || fail "verdict arm: a successful wait spent the drain budget ($_b0 -> $MUTATION_VERDICT_BUDGET) — enough benign lateness would false-abort every later child"
+    # ⛔ NOR IS A ZERO-BYTE ARTIFACT A VERDICT (review finding 2 on #2623): the writer OPENS the file a
+    # few syscalls before the write lands, so "exists" is not "has a verdict". Pinned because a
+    # rewrite from `[ -s ]` back to `[ -f ]` leaves EVERY OTHER ARM GREEN, while turning a live
+    # child's mid-write window into "produced an UNREADABLE verdict artifact" — a false abort with no
+    # assertion firing.
+    : >"$_sv/midwrite.verdict"
+    ( sleep 2; printf '9 290\n' >"$_sv/midwrite.verdict" ) &
+    _vpid=$!
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict midwrite 1 2>&1)"
+    wait "$_vpid" 2>/dev/null
+    case "$_o" in
+      *"class covered"*"9 of 290"*) pass "verdict arm: a ZERO-BYTE artifact is not 'arrived' — the decision waits for content (a live child is not aborted mid-write)" ;;
+      *) fail "verdict arm: a zero-byte artifact was read as the verdict (got: $_o)" ;;
+    esac
+    # ⛔ AND AN EXHAUSTED BUDGET MUST SAY SO, not report "in 0s … never reached a verdict" as if the
+    # child were at fault. Forced here by charging the budget down first.
+    _b1="$MUTATION_VERDICT_BUDGET"
+    MUTATION_VERDICT_BUDGET=0
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict starved 1 2>&1)"
+    MUTATION_VERDICT_BUDGET="$_b1"
+    case "$_o" in
+      *"drain budget is spent"*) pass "verdict arm: an exhausted drain budget is NAMED in the abort (it does not read as the child's fault)" ;;
+      *) fail "verdict arm: an exhausted budget was not named (got: $_o)" ;;
+    esac
+  fi
   # Two perl traps have cost this harness real coverage (all four instances fixed
   # here, found by a fresh review of this file): (1) `$` is NOT literal in a perl
   # REPLACEMENT — `"$GH"` becomes `""` unless it is spelled `\044GH`, silently
@@ -2757,8 +3421,14 @@ if true; then
     # result must still PARSE. This catches the `||`-in-a-pattern trap only; it
     # does NOT catch an emptied-`$` replacement, which still parses and still
     # reddens for the wrong reason (see the traps note above).
-    if ! bash -n "$src" 2>/dev/null; then
-      fail "mutation $name produced a file that does not PARSE — corrupt mutation, not coverage"
+    # ⛔ NAME THE GENERATED PROGRAM, NOT JUST THE VERDICT ABOUT IT. The diagnostic used to be
+    # discarded (`2>/dev/null`) and the message said only "does not PARSE", so a generator that
+    # emitted invalid shell — e.g. a perl replacement that emptied a condition and produced the
+    # literal `if then` — reported a corrupt mutation with no file and no line to look at. `bash -n`
+    # already prints `<file>: line N: <message>`; keep the first line of it.
+    if ! _parse="$(bash -n "$src" 2>&1)"; then
+      _parse="${_parse%%$'\n'*}"
+      fail "mutation $name: generated rail is not valid shell (${_parse:-bash -n gave no diagnostic}) — corrupt mutation, not coverage"
       return
     fi
     if [ "$RUN_MUTATIONS" = "0" ]; then
@@ -2799,7 +3469,11 @@ if true; then
   # B2b: accept every verdict (BOTH the pre-unit gate and the post-record re-read guard)
   mutate_and_expect_fail B2b  's/if ! verdict_accepted "\$RECORD_VERDICT"; then/if false; then/g'
   # B3: add a hand-rolled --admin merge beside the mandated rail
-  mutate_and_expect_fail B3   's/bash "\$ADMIN_MERGE" "\$PR"/"\044GH" pr merge "\044PR" --admin; bash "\044ADMIN_MERGE" "\044PR"/'
+  # `/g` is deliberate but currently inert: there is exactly ONE mandated-rail call
+  # site (the direct land step — the queue path has no fallback by design). Keeping
+  # the flag means a future second site cannot silently escape the class, which is
+  # what a single-replacement form would do if a call site were ever added above this one.
+  mutate_and_expect_fail B3   's/bash "\$ADMIN_MERGE" "\$PR"/"\044GH" pr merge "\044PR" --admin; bash "\044ADMIN_MERGE" "\044PR"/g'
   # B4: never confirm the merge
   mutate_and_expect_fail B4   's/confirm_merged\(\) \{/confirm_merged() { return 0;/'
   # B5: allow a draft
@@ -3061,6 +3735,28 @@ if true; then
   # DIFFERENT host (a mirror, a GitLab/GHE path) is a different repository, and its
   # green would be attributed to the target. 17g-E17 and 17g-E18 must both redden.
   mutate_and_expect_fail B31  's/^    if \[ -z "\$target_host_l" \] \|\| \[ "\$origin_host_l" != "\$target_host_l" \]; then$/    if false; then/m'
+  # ── queue mode (--queue) ──────────────────────────────────────────────
+  # Q1: an UNREADABLE queue read must stop. Removing the rc check lets the rail treat
+  # a failed read as "no verdict" and post the command — 17h-K reddens.
+  mutate_and_expect_fail Q1  's/^  if ! row="\$\(queue_check_run\)"; then$/  if false; then/m'
+  # Q2: "posted" is not "taken". Adding `waiting` to the wait-loop allow-list makes a
+  # hand-off the queue ignored report success — 17h-D reddens.
+  mutate_and_expect_fail Q2  's/^      queued\|in_place\|merged\)$/      queued|in_place|merged|waiting)/m'
+  # Q3: the absent-queue verdict must be NAMED. Silencing it makes the direct path
+  # indistinguishable from the queue having worked — 17h-C reddens.
+  mutate_and_expect_fail Q3  's/^    1\) log_line "atomic-land: QUEUE-NOT-ARMED/    1) : "atomic-land: QUEUE-NOT-ARMED/m'
+  # Q4: a pause in the DECODED state must stop. Neutralising that arm (the `)` is kept
+  # so the mutant still PARSES — a corrupt mutant "reddens" for the wrong reason and
+  # reports a covered class that is not covered) lets 17h-J's state-level pause proceed
+  # to the enqueue path, where the untouched TITLE arm cannot see a neutral title.
+  mutate_and_expect_fail Q4  's/^    \*paused\*\|\*Paused\*\|\*suspend\*\|\*Suspend\*\)$/    *never-matches*)/m'
+  # Q5: the PRE-COMMAND allow-list. Making it match every state reports "the queue
+  # already holds #<PR>" for a PR it does not hold and returns 0 WITHOUT enqueueing, so
+  # 17h-A loses its enqueue, 17h-I exits 0 instead of 1, and 17h-L never asks — all redden.
+  mutate_and_expect_fail Q5  's/^    queued\|in_place\|merged\)$/    *)/m'
+  # Q6: an UNREADABLE declaration must stop, not fall through to the direct path (the
+  # verdict that silently reverses the operator's --queue) — 17h-N reddens.
+  mutate_and_expect_fail Q6  's/^    \*\) stop "could not read/    2) : "could not read/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
@@ -3117,6 +3813,13 @@ if true; then
   fi
 fi
 
+# The verdict ARTIFACT (#2622): a child launched by `mutation_drain` is asked for its result where
+# a reader cannot race it, instead of leaving the parent to scrape this log. Written on BOTH paths,
+# because the parent must be able to tell "0 failures" (class NOT covered) from "never finished"
+# (an abort, with its cause reported).
+if [ -n "${ATOMIC_LAND_VERDICT:-}" ]; then
+  printf '%s %s\n' "$failures" "$checks" >"$ATOMIC_LAND_VERDICT"
+fi
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks atomic-land test(s) failed"
   exit 1
