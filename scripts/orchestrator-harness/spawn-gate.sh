@@ -1093,23 +1093,48 @@ wip_rescue_path() {
   return 1
 }
 
+# lane_end_record <label> <rc> <cap> — ONE writer for the terminal ledger, on EVERY terminal path.
+#
+# ⛔ WHY THIS IS A FUNCTION AND NOT THE TAIL OF `terminal_wip_rescue` (review F1, PR #2975). Two paths
+# return BEFORE the measurement — the operator hatch (`WIP_RESCUE_DISABLE=1`) and a mis-pointed root
+# (`tree=not-a-worktree`) — and both used to return with the fields set and NO row, while this file
+# and the README both claim "one row per terminal, on every path". The absence landed on exactly the
+# case the row exists to catch: `not-a-worktree` is what a caller that forgot `WIP_PATH` looks like
+# (`fix-one.sh` `cd`s into the MAIN checkout), so the one transition where a lane's work may have been
+# archived from the WRONG tree left the fleet's aggregate surface with nothing at all. `not-measured`
+# is the same shape from the other side: a hatch that blanks the ledger is indistinguishable from a
+# lane that never ended. Routing every path through one writer makes the invariant structural instead
+# of a comment two of three paths ignored; `wip-rescue-exit.test.sh` drives both paths and reads the
+# row, so a fourth path that forgets is a red suite and not a quiet gap.
+lane_end_record() {
+  local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" o_root
+  o_root="${O:-${HOME:-$PWD}/orchestrator}"
+  mkdir -p "$o_root/state" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$rc" "$cap" \
+    "$LANE_END_TREE" "$LANE_END_RESCUE" "${LANE_END_REF:-}" "${LANE_END_UNPUSHED:-0}" \
+    >> "$o_root/state/lane-end.tsv" 2>/dev/null
+  return 0
+}
+
 # terminal_wip_rescue <label> <rc> <cap-hit> <logfile>
 # Sets LANE_END_TREE / LANE_END_RESCUE / LANE_END_REF / LANE_END_UNPUSHED, appends the terminal record
 # to `state/lane-end.tsv` and writes the human line into the agent's log. Returns 0 always (a rescue
 # must never change the lane's exit status — the lane's work and its status are different facts).
 terminal_wip_rescue() {
   local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
-  local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 at_risk=0 l
+  local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 at_risk=0 l local_ref=""
   root="${WIP_PATH:-$PWD}"
   LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0
   if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
     LANE_END_TREE="not-measured"; LANE_END_RESCUE="DISABLED"
     echo "[wip] end label=$label rc=$rc cap=$cap tree=not-measured rescue=DISABLED — WIP_RESCUE_DISABLE=1 (an operator escape hatch, not a default): the tree at $root was NOT examined, so this lane's uncommitted work (if any) is on this disk only" >> "$log" 2>/dev/null || true
+    lane_end_record "$label" "$rc" "$cap"
     return 0
   fi
   if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
     LANE_END_TREE="not-a-worktree"; LANE_END_RESCUE="UNAVAILABLE"
     echo "[wip] end label=$label rc=$rc cap=$cap tree=not-a-worktree rescue=UNAVAILABLE — $root is not a git worktree, so a rescue cannot be pointed at it. If this lane's work lives elsewhere, the caller must pass WIP_PATH=<that worktree> (fix-one.sh does); nothing was examined here and this line is NOT a verdict that the worktree was clean" >> "$log"
+    lane_end_record "$label" "$rc" "$cap"
     return 0
   fi
   # ── one read, and it must be able to FAIL ────────────────────────────────────────────────────
@@ -1161,34 +1186,45 @@ terminal_wip_rescue() {
       else
         bash "$out" "$root" "$note" >> "$log" 2>&1; rc2=$?
       fi
+      # ── the archive commit is read UNCONDITIONALLY (review F2, PR #2975) ─────────────────────────
+      # `refs/wip-local/<slug>` is written by bg-rescue-wip.sh under a CHECKED update-ref (so the sha
+      # below is a ref that exists, not a claim), and it is readable without a network round trip.
+      # Reading it only when rc2 = 0 collapsed THREE callee outcomes into `FAILED` with an EMPTY ref,
+      # and two of those three leave a real archive behind:
+      #   * `bg-rescue-wip.sh:363-367` — PUSHED=1 and a partial listing: the commit IS on origin under
+      #     `refs/wip/<slug>`; the skipped paths are what stays local. Reported as "could not archive/
+      #     push" (false) with no ref in the ledger — a pushed ref hidden from the fleet record.
+      #   * `:384-396` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
+      #     callee prints the sha, so the ONE pointer to the archived commit was neither shown nor
+      #     recorded, while the line claimed the work was only at $root.
+      # So: ref present + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box push
+      # UNCONFIRMED) — which is neither `FAILED` (nothing archived) nor `refs/wip/<slug>` (a push this
+      # code cannot see without a network call it deliberately does not make). `FAILED` is now reserved
+      # for its only honest meaning: the callee failed AND no ref pins anything.
+      if git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" >/dev/null 2>&1; then
+        local_ref="refs/wip-local/$slug@$(git -C "$root" rev-parse --short "refs/wip-local/$slug" 2>/dev/null)"
+      fi
       if [ "$rc2" -eq 0 ]; then
-        # The archive commit is pinned by `refs/wip-local/<slug>` in this clone (bg-rescue-wip sets it
-        # under a checked update-ref) and pushed to `refs/wip/<slug>` on origin. Read the LOCAL ref for
-        # the sha: it is the same commit, and it is readable without a network round trip.
-        if git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" >/dev/null 2>&1; then
-          LANE_END_REF="refs/wip-local/$slug@$(git -C "$root" rev-parse --short "refs/wip-local/$slug" 2>/dev/null)"
-          LANE_END_RESCUE="refs/wip/$slug"
-        else
-          LANE_END_RESCUE="nothing"
-        fi
+        LANE_END_REF="$local_ref"; LANE_END_RESCUE="refs/wip/$slug"
+      elif [ -n "$local_ref" ]; then
+        LANE_END_REF="$local_ref"; LANE_END_RESCUE="archived-local"
       else
         LANE_END_RESCUE="FAILED"
       fi
       echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
       if [ "$LANE_END_RESCUE" = "FAILED" ]; then
-        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+      elif [ "$LANE_END_RESCUE" = "archived-local" ]; then
+        echo "[wip] ⛔ label=$label: the rescue did NOT finish cleanly (bg-rescue-wip.sh exit $rc2) BUT this worktree's work IS archived and pinned at $LANE_END_REF. bg-rescue-wip.sh exits 2 both for a PARTIAL archive (the ref WAS pushed to origin; the skipped paths are what stays local) and for a push that failed (the local ref is still valid), so read the replayed lines above for which one this was — this line does not guess. Do NOT reap this worktree before retrieving it" >> "$log"
       fi
     fi
   fi
   # The append-only ledger, beside capwip.tsv: "the lane finished" and "the lane vanished" used to
   # read identically in `bg/dispatch.log`, which records only the START. One row per terminal, on
   # every path — the same rule cap_wip_record follows, for the same reason (an absence must not be the
-  # only signal).
-  local o_root="${O:-${HOME:-$PWD}/orchestrator}"
-  mkdir -p "$o_root/state" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$rc" "$cap" \
-    "$LANE_END_TREE" "$LANE_END_RESCUE" "${LANE_END_REF:-}" "$unpushed" \
-    >> "$o_root/state/lane-end.tsv" 2>/dev/null
+  # only signal). ⛔ The TWO early paths above write through this same writer, so "every path" is one
+  # function's invariant rather than three call sites that have to agree.
+  lane_end_record "$label" "$rc" "$cap"
   return 0
 }
 
