@@ -853,7 +853,15 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
       # ⛔ A STALE VERDICT IS NOT `ok` (2026-10-18, review). The whole point of reading a record is
       # to notice when nothing is writing it; printing `ok` from a week-old file reproduces exactly
       # the failure this block was added to end. Bound = two 1200s dispatch intervals.
-      if [ "${_prc:-0}" -ne 0 ]; then
+      # ⛔ AND "NO CAPACITY" IS NEITHER `ok` NOR RED (#2291). `pr-doctor` exits 6 when the box's own
+      # spawn gate refused every order: nothing was consumed and (for load) it clears by itself. The
+      # heartbeat printed that as `PR-DOCTOR RED rc=6`, i.e. the same line a broken dispatcher
+      # produces — so the one screen an operator reads could not tell "wait" from "repair". It gets
+      # its own token, and it is never `ok`: the queue is not moving while the box has no room.
+      if [ "${_prc:-0}" -eq 6 ]; then
+        printf '%s PR-DOCTOR WAITING (no capacity) rc=%s (%ss ago) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
+      elif [ "${_prc:-0}" -ne 0 ]; then
         printf '%s PR-DOCTOR RED rc=%s (%ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
       elif [ "${_pdry:-0}" = "1" ]; then

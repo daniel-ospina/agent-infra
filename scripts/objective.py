@@ -2953,6 +2953,14 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
         # A DRY RUN IS NOT A PASS: it stamps no fleet-visible verdict (pr-doctor skips the write),
         # and if an older one ever carries the flag it must never read as production.
         return "PR-DOCTOR(last run): DRY RUN (not a pass)"
+    # ⛔ "NO CAPACITY" IS NEITHER `ok` NOR `RED` (#2291). The dispatcher exits 6 when the box's own
+    # spawn gate refused every order: nothing was consumed, and (for a load refusal) it clears by
+    # itself. Before this, the beat printed `PR-DOCTOR(last run): RED rc=6` -- the same token a broken
+    # dispatcher produces -- so the operator's next move (wait vs repair) had to be guessed from prose
+    # that the beat then truncates at 110 chars. The verdict FIELD wins over the code when present
+    # (an older record has none), and the code is the fallback so a 6 can never read as ok.
+    verdict = str(d.get("verdict") or "")
+    waiting = (rc == 6) or (verdict == "NO-CAPACITY")
     # ⛔ A VERDICT THAT STOPPED BEING WRITTEN IS *UNREPORTED*, NOT `ok` (2026-10-18, review).
     # The failure this whole segment exists to expose is "a dead dispatcher reads healthy"; an
     # unbounded age reproduces it one level up -- kill the launchd job, or touch
@@ -2961,6 +2969,9 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
     if age > 2400:
         return "PR-DOCTOR(last run): UNREPORTED (verdict is STALE, %dm old: %s)" % (
             age // 60, reason)
+    if waiting:
+        return "PR-DOCTOR(last run): WAITING (no capacity) rc=%d %dm ago — %s" % (
+            rc, age // 60, reason)
     return "PR-DOCTOR(last run): %s rc=%d %dm ago — %s" % (
         "RED" if rc else "ok", rc, age // 60, reason)
 

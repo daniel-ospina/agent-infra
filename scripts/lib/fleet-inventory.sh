@@ -70,11 +70,19 @@
 #   SKIPPED    NOT APPLICABLE on this box — always with a reason. It is a PASS for the exit code
 #              (a Mac is not broken for having no cell supervisor) and it is never rendered as OK,
 #              because "not checked" and "checked and healthy" are different answers.
+#   WAITING    it ran, its verdict is "there is no room right now and nothing was consumed" — a
+#              job whose ONLY non-zero exit is the capacity code (pr-doctor's 6). It is a PASS for
+#              the exit code and it is NEVER rendered OK: a machine with no room is not broken, and
+#              it is not healthy either — the queue is simply not moving. Rendering it FAILING (the
+#              pre-#2291 state) is the false alarm that teaches operators to ignore this screen;
+#              rendering it OK is the silent capacity waste the same issue measured twice in a
+#              night. Exit code 0 of the component is still the ONLY thing that means OK.
 #   UNKNOWN    the check itself could not be performed (an unreadable process table, an unparseable
 #              job definition). Fail-closed: it is never a pass — the abstention doctrine this repo
 #              already applies to lane liveness (`docs/ops/fleet-liveness.md`).
 #
-# Exit code of the table: 0 all rows OK or SKIPPED · 1 any row not OK · 2 any row UNKNOWN. That is
+# Exit code of the table: 0 all rows OK, SKIPPED or WAITING · 1 any row not OK · 2 any row UNKNOWN.
+# That is
 # the same 0/1/2 contract `orchestrator-bringup.sh` uses, so one screen has one vocabulary.
 #
 # Sourced by `scripts/orchestrator-bringup.sh` (the fleet's ONE entry point). It deliberately does
@@ -739,14 +747,19 @@ fleet_row_cadence_timer() {
 #   own output fresh?  (its StandardOutPath, within 2× its OWN StartInterval + slack)
 # A second instance (a hand-run copy alongside the scheduled one) is DUPLICATE — counted by DISTINCT
 # pid, so the job's own in-flight run is not mistaken for a second one.
-_fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <what> [own-log] [requires]
+_fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <what> [own-log] [requires] [waiting-exits]
   # `own-log` (5th) is the log the COMPONENT ITSELF writes, for a job whose plist declares no
   # StandardOutPath/StandardErrorPath. It is not a guess: each path below is cited from the script
   # that opens it. Without it, four of this box's reapers read OK on "last exit 0" alone — a job
   # launchd stops scheduling (or whose runs die before they write) would read OK forever, which is
   # exactly the "silently off" state this file exists to end. Measured in review of this change:
   # pi-reap-worktrees.log was 16.0h old against that job's own 12.08h bound and rendered OK.
-  local name="${1:?}" label="${2:?}" script="${3:-}" what="${4:?}" own_log="${5:-}" requires="${6:-}"
+  #
+  # `waiting-exits` (7th) is a SPACE-SEPARATED list of non-zero exit codes that mean "no room, nothing
+  # consumed" rather than "this job failed" — `pr-doctor`'s 6 (#2291). It is opt-in per row because a
+  # non-zero exit means failure for every other job here, and a generic allowance would turn every
+  # FAILING into a WAITING. Absent/empty keeps the old behaviour byte for byte.
+  local name="${1:?}" label="${2:?}" script="${3:-}" what="${4:?}" own_log="${5:-}" requires="${6:-}" waiting="${7:-}"
   local plist; plist="$(fleet_plist "$label")"
   [ -n "$requires" ] || requires="$script"
   if [ ! -f "$plist" ]; then
@@ -808,6 +821,16 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
       "more than one $label process is live (pid $(printf '%s\n%s\n' "$inst" "$man" | fleet_uniq_pids | awk 'NF' | tr '\n' ' ' | sed 's/ *$//')) — a hand-run copy beside the scheduled one does the same work twice"; return 0
   fi
   if [ -n "$ex" ] && [ "$ex" != "0" ]; then
+    # ⛔ A CAPACITY REFUSAL IS NOT A FAILURE (#2291, contract §2: "a refusal is not a failure, it is
+    # the answer"). `pr-doctor` exits 6 when the box's own spawn gate refused every order: nothing
+    # was consumed and (for load) it clears by itself. Without this arm the row rendered a working
+    # dispatcher on a busy box as FAILING — the false alarm #2291 measures and the reason its
+    # exit-code contract was asked for. WAITING is a pass for the exit code and is never OK.
+    case " $waiting " in
+      *" $ex "*)
+        fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" WAITING \
+          "its last run reported NO CAPACITY (exit $ex): the box's own gate refused the work and nothing was consumed, so the queue is not moving and nothing is broken. Read the bound and the box measurement from the pass verdict (\`$what\` writes $out); a load refusal clears by itself, a disk/land-backlog/fork one does not"; return 0 ;;
+    esac
     fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" FAILING \
       "the job's last run exited $ex — it ran and FAILED, and nothing has been reading that status (the measured pr-doctor exit-2-for-hours state); its own log: ${out:-<none declared>}"; return 0
   fi
@@ -836,8 +859,10 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
 }
 
 fleet_row_pr_doctor() {
+  # 7th arg = 6: `pr-doctor`'s NO-CAPACITY verdict (#2291). A busy box that consumed nothing is
+  # WAITING, not FAILING — and never OK, because the queue is not moving while it waits.
   _fleet_row_launchd_job pr-doctor com.tortoise.pr-doctor \
-    "$FLEET_AGENT_SCRIPTS/pr-doctor.py" pr-doctor
+    "$FLEET_AGENT_SCRIPTS/pr-doctor.py" pr-doctor "" "" "6"
 }
 
 # ── component: the objective reminder ─────────────────────────────────────────────────────────
@@ -1234,13 +1259,15 @@ fleet_rows() {
   fleet_row_second_controller
 }
 
-# fleet_state_severity <state> — 0 pass (OK, SKIPPED) · 1 not OK · 2 cannot determine.
+# fleet_state_severity <state> — 0 pass (OK, SKIPPED, WAITING) · 1 not OK · 2 cannot determine.
 # SKIPPED is a PASS deliberately: a Mac is not broken for having no cell supervisor, and a nil
 # exit would teach operators to ignore the one screen they are meant to read. It is never rendered
-# as OK, so "not checked" and "checked and healthy" stay distinguishable.
+# as OK, so "not checked" and "checked and healthy" stay distinguishable. WAITING is the same
+# shape for a different reason ("ran, and there is no room" — #2291): a pass for the exit code, a
+# state of its own, never OK.
 fleet_state_severity() {
   case "${1:-UNKNOWN}" in
-    OK|SKIPPED) printf '0\n' ;;
+    OK|SKIPPED|WAITING) printf '0\n' ;;
     UNKNOWN)    printf '2\n' ;;
     *)          printf '1\n' ;;
   esac

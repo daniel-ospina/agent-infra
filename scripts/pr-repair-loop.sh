@@ -372,6 +372,13 @@ one_pass() { # <dry-run:0|1>
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
         3) err "dispatch: UNDELIVERED (rc=3) — the work was placed and no worker took it." ;;
+        # ⛔ 6 IS THIS SCRIPT'S OWN EXIT_DEFERRED, ONE LAYER DOWN (#2291). `pr-doctor` now exits 6 when
+        # the box's own spawn gate refused every order: nothing was consumed and (for load) it clears
+        # by itself. Before this arm it fell into `*)` below and was recorded as `refusing` /
+        # `dispatcher-refused` — i.e. this layer relabelled "no room" as "the chain is broken", the
+        # exact mislabel the code was added to end. It is the same fact as this script's own
+        # `cap-zero` DEFERRED verdict, so it lands on the same state and the same exit code.
+        6) err "dispatch: NO CAPACITY (rc=6) — the box's own gate refused the work; nothing was consumed and it clears by itself. Read the bound from pr-doctor's verdict." ;;
         *) err "dispatch: unexpected rc=$rc_dispatch from pr-doctor." ;;
     esac
     # ⛔ THE RECORD FOLLOWS THE DISPATCHER'S OWN VERDICT, not the fact that it returned. A pass whose
@@ -381,6 +388,7 @@ one_pass() { # <dry-run:0|1>
     case "$rc_dispatch" in
         0) write_status dispatched "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "pass-complete"; return "$EXIT_OK" ;;
         3) write_status placed-undelivered "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-worker-took-it"; return "$EXIT_UNDELIVERED" ;;
+        6) write_status deferred "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-capacity"; return "$EXIT_DEFERRED" ;;
         *) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
     esac
 }

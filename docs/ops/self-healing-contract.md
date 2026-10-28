@@ -296,9 +296,17 @@ fix the red).
 `0` a readable pass (it dispatched, **or** there was genuinely nothing to do — the line names which,
 `queue is empty: no open non-draft PRs`); `2` **REFUSING** — *"I could not read the world, or could not
 deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doctor.status.json` with
-`rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` placed but no worker took it;
-`4` crash; `64` the command line is unusable (**not** 2, so a launchd typo cannot masquerade as a
-refusal). ⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's
+`rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **UNDELIVERED** — the transport
+refused the order (or a worktree refusal that will not clear by waiting), so an operator must repair
+the chain; `6` **NO-CAPACITY** — the box's own spawn gate refused every order, **nothing was consumed**,
+and the sidecar also carries `verdict`, `refusal_bound` (`load` | `disk` | `land-backlog` | `fork`) and
+`room` (the `capacity.sh probe` record measured at decision time); `4` crash; `64` the command line is
+unusable (**not** 2, so a launchd typo cannot masquerade as a refusal). ⛔ `3` and `6` are SEPARATE
+because their remedies are opposite — wait vs repair — and a caller that merges them sends an operator
+to the wrong one with full confidence (#2291, measured: `EXIT rc=3 -- 1 order(s) no worker accepted`
+for both). `6` is a pass for `fleet-inventory`'s table (state `WAITING`) and is **never** rendered
+`ok`: the queue is not moving while the box has no room. ⛔ The sidecar **must** be overwritten by a
+refusing pass — otherwise the previous pass's
 `ok` stands and *"a failure only `launchctl list` can witness is a silent failure"*.
 `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
 

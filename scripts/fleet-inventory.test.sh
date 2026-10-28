@@ -57,9 +57,14 @@
 #       suite goes from ~35s to ~5min: the wall clock is the symptom the arm pins)
 #   (s) nest the cell-identity test back inside "supervisor script missing" → §9p + §4 (a Linux dev
 #       box / CI runner reads MISSING again: the entry point's supervisor path always EXISTS)
+#   (u) drop the `waiting-exits` arm of `_fleet_row_launchd_job` (pr-doctor's 6 → the FAILING arm)
+#       → §6's "exit (6) reads WAITING" arm ONLY. Measured: it reddens that one arm and leaves the
+#       exit-7 control green, which is the proof the allowance is narrow rather than generic.
+#   (v) add 6 to `fleet_state_severity`'s "not OK" side (WAITING fails the table)   → §6's "WAITING
+#       is a PASS for the table's exit code" arm only
 #   (t) do not clear a pidfile the row has PROVEN stale                        → §9q (2 arms: start
 #       cannot repair the row, and the row stays FAILING afterwards)
-#   (u) have the caller assume it started something                          → §9r only
+#   (w) have the caller assume it started something                          → §9r only
 #   (v) accept any non-empty FLEET_CELL_HOME as cell identity                → §9p only (a defaulted
 #       path made every Linux box a "cell": the entry point defaults CELL_HOME)
 #   (w) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
@@ -516,6 +521,31 @@ ROWS="$(run_rows 'fleet_rows ""')"
 st="$(state_of "$ROWS" pr-doctor)"
 [ "$st" = "OK" ] && ok "§6 the same job with last exit 0 reads OK (so §6 is not 'always FAILING')" \
                  || bad "§6 last exit 0 should read OK, got [$st]"
+# ⛔ #2291: `pr-doctor`'s OWN exit 6 is the dispatcher saying "the box's gate refused every order,
+# nothing was consumed". It is neither a failure (the pre-#2291 reading, which sent operators to
+# repair a healthy busy box) nor OK (the queue is not moving). WAITING, and a PASS for the code.
+printf 'PID\tStatus\tLabel\n-\t6\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "WAITING" ] && ok "§6 pr-doctor's NO-CAPACITY exit (6) reads WAITING — no room, nothing failed" \
+                      || bad "§6 last exit 6 should read WAITING, got [$st]"
+# ⛔ `severity_of_row`, NOT `severity_of` (the helper exists for exactly this): a whole-fixture table
+# answers a different question — this box leaves `second-controller` UNKNOWN, so `severity_of` returns
+# 2 whatever this row says and the arm could not redden for its own behaviour (measured here: it did
+# not, on a green WAITING row).
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=0" ] && ok "§6 …and WAITING is a PASS for the table's exit code" \
+                                        || bad "§6 WAITING must not fail the table, got $(severity_of_row "$ROWS" pr-doctor)"
+case "$(printf '%s\n' "$ROWS" | awk -F'\t' '$1=="pr-doctor"{print $4}')" in
+  OK) bad "§6 …but it must NEVER render OK — the queue is not moving while the box has no room" ;;
+  *)  ok "§6 …and it is never rendered OK (a distinct state, like SKIPPED)" ;;
+esac
+# ⛔ CONTROL: the allowance is for 6 ALONE. A different non-zero exit on the same row is FAILING —
+# otherwise this arm would be "every exit is WAITING", the false-PASS direction.
+printf 'PID\tStatus\tLabel\n-\t7\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "FAILING" ] && ok "§6 …but exit 7 on the same row is still FAILING (the allowance is narrow)" \
+                       || bad "§6 exit 7 should still be FAILING, got [$st]"
 # A job that is declared but NOT in the launchd domain will never run — MISSING, not OK.
 printf 'PID\tStatus\tLabel\n' > "$LC_LIST"
 ROWS="$(run_rows 'fleet_rows ""')"

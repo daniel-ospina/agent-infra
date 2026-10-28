@@ -671,12 +671,18 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
     monkeypatch.setenv("MAX_REVIEW", "12")
-    assert pr.main() == 0
+    # ⛔ 3, NOT 0 (#2291). A durable refusal is an order the transport would not take for a reason
+    # that will NOT clear by waiting, so the pass is neither "readable, nothing to do" (0) nor "the
+    # box has no room" (6). Until this change a pass whose ONLY outcome was recorded refusals exited
+    # 0 -- i.e. the refuse -> cooldown -> retry -> refuse loop #2710 counts five times in one day
+    # reported itself to every reader as a healthy quiet queue.
+    assert pr.main() == 3
     # ⛔ AND THE PASS LINE NAMES IT. A pass whose only outcome was a recorded refusal printed
     # `dispatched 0 of 1 queued — nothing to do`, which contradicts the row it just wrote and reads
     # as a quiet queue. The refusal is a stall, so it is counted and named.
     joined = "\n".join(logs)
     assert "refused-recorded=1" in joined, joined
+    assert "VERDICT=REFUSED" in joined, joined
     assert "nothing to do" not in joined, joined
     assert saved.get("1", {}).get("head") == "a" * 40, "a persistent refusal must record a row"
     assert saved["1"]["kind"] == "refused", \
@@ -2954,6 +2960,255 @@ def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monk
     assert "REFUSING" not in joined, joined  # …but the pass is not a refusal
 
 
+def _refused_pass(monkeypatch, detail, logs=None):
+    """Drive ONE `main()` pass whose only order is refused with `detail` (the real shapes)."""
+    logs = [] if logs is None else logs
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (False, detail, False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    return pr.main(), "\n".join(logs)
+
+
+def test_the_box_refusing_and_the_transport_refusing_are_TWO_codes_and_TWO_reasons(monkeypatch):
+    """⛔ THE DEFECT OF #2291, MEASURED 2026-10-27 ON A LIVE BOX.
+
+    `pr-doctor: EXIT rc=3 -- 1 order(s) no worker accepted` was emitted, byte for byte, for two
+    facts that need opposite responses: a spawn gate that refused on load (`rc=75`, nothing
+    consumed, clears by itself -> WAIT) and a dispatcher that was not installed (`rc=127`, nothing
+    will ever clear it -> REPAIR). A watchdog keyed on the code could not tell them apart, so it
+    either retried a broken install for ever or "repaired" a healthy loaded box.
+
+    This is the property, not the wording: the two causes must not share an exit code, and their
+    recorded reasons must differ.
+    """
+    monkeypatch.setattr(pr, "box_room",
+                        lambda repo_dir="": "host=box ncpu=8 load1=4520 lpc=565 "
+                                           "disk_free_mb=4649 mem_free_mb=2176 via=capacity.sh")
+    rc_box, log_box = _refused_pass(monkeypatch, "gate REFUSED rc=75 (load)")
+    reason_box = json.loads(pathlib.Path(pr.STATUS).read_text())["reason"]
+    rc_chain, log_chain = _refused_pass(monkeypatch, "rc=127: bash: nonblocking-dispatch.sh: "
+                                                   "No such file or directory")
+    reason_chain = json.loads(pathlib.Path(pr.STATUS).read_text())["reason"]
+
+    assert rc_box == pr.EXIT_NO_CAPACITY == 6, log_box
+    assert rc_chain == pr.EXIT_UNDELIVERED == 3, log_chain
+    assert rc_box != rc_chain, "the two facts still share a code -- #2291 is not fixed"
+    assert reason_box != reason_chain
+    assert "VERDICT=NO-CAPACITY" in reason_box, reason_box
+    assert "VERDICT=UNDELIVERED" in reason_chain, reason_chain
+    # The remedies are the whole point: one says wait, the other says repair.
+    assert "next=wait" in reason_box, reason_box
+    assert "next=repair" in reason_chain, reason_chain
+    # …and the parseable surface carries it too, for a reader that never sees the log.
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+    assert side["verdict"] == "UNDELIVERED" and side["rc"] == 3, side
+
+
+def test_a_capacity_refusal_records_the_BOX_MEASUREMENT_and_the_bound_that_was_hit(monkeypatch):
+    """The report must carry the NUMBER it is talking about, not just "nobody took it".
+
+    The bound comes from the gate's own refusal code (the gate already decided); the measurement is
+    `capacity.sh probe`'s own record, passed through verbatim. Both land on the sidecar, so a reader
+    that truncates the log line still has the figures.
+    """
+    monkeypatch.setattr(pr, "box_room",
+                        lambda repo_dir="": "host=box ncpu=8 load1=4520 lpc=565 "
+                                           "disk_free_mb=4649 mem_free_mb=2176 via=capacity.sh")
+    rc, joined = _refused_pass(monkeypatch, "gate REFUSED rc=75 (load)")
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+    assert rc == 6, joined
+    assert side["verdict"] == "NO-CAPACITY", side
+    assert side["no_capacity"] == 1, side
+    assert side["refusal_bound"] == "load=1", side
+    assert "lpc=565" in side["room"], side["room"]
+    assert "via=capacity.sh" in side["room"], side["room"]
+
+
+def test_a_disk_refusal_names_the_PRUNE_remedy_and_not_wait(monkeypatch):
+    """One code per remedy is only worth having if the AXIS reaches the sentence.
+
+    A disk refusal never clears by waiting (`spawn-gate.sh`: "This is NOT a load refusal: waiting
+    does not clear it"), so a verdict that says "wait" for it sends an operator to an event that
+    cannot arrive -- the exact mislabel the gate's own 75/77 split exists to prevent.
+    """
+    monkeypatch.setattr(pr, "box_room", lambda repo_dir="": "host=box ncpu=8 lpc=9 via=capacity.sh")
+    rc, joined = _refused_pass(monkeypatch, "gate REFUSED rc=77 (disk)")
+    assert rc == 6, joined
+    assert "next=prune" in joined, joined
+    assert "next=wait" not in joined, joined
+    assert "bound=disk=1" in joined, joined
+
+
+def test_the_capacity_seams_are_the_gates_own_numbers():
+    """`GATE_REFUSAL_BOUND` may not invent a code or a name: it is the gate's table, re-read.
+
+    A wrong key here would classify a refusal as a different bound -- sending an operator to a
+    remedy that cannot work, with full confidence. Pinned against `spawn-gate.sh`'s own exports.
+    """
+    gate = (_HARNESS / "spawn-gate.sh").read_text()
+    exported = dict(re.findall(r"^(AGENT_[A-Z_]+)=(\d+)$", gate, re.M))
+    for const, code in (("AGENT_FORK_REFUSED", 73), ("AGENT_LAND_BACKLOG", 74),
+                        ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77)):
+        assert exported.get(const) == str(code), (
+            "spawn-gate.sh no longer exports %s=%d -- GATE_REFUSAL_BOUND is stale" % (const, code))
+        assert pr.GATE_REFUSAL_BOUND[code], "the gate declares %d and this file does not" % code
+    assert pr.GATE_REFUSALS == tuple(sorted(pr.GATE_REFUSAL_BOUND))
+    # ⛔ 73 (fork) IS THE ONE THAT WAS MISSING: a fork refusal was read as a DISPATCH, so the state
+    # "this box cannot start a process at all" (measured on cell-4 at load 0.32x, #2293) wrote a
+    # spawn row and burnt a 90-min budget slot for an agent that never existed.
+    assert 73 in pr.GATE_REFUSALS
+    # Every axis must also have a next action -- a named bound with no remedy is a diagnosis the
+    # reader has to re-derive, which is the property #2710 exists to enforce.
+    assert set(pr.GATE_REFUSAL_BOUND.values()) == set(pr.GATE_NEXT_ACTION), (
+        pr.GATE_REFUSAL_BOUND, sorted(pr.GATE_NEXT_ACTION))
+
+
+def test_box_room_reports_capacity_sh_verbatim_and_decides_nothing(tmp_path, monkeypatch):
+    """⛔ A SECOND MEASUREMENT WOULD BE A FINDING AGAINST THIS FIX (#2291).
+
+    `capacity.sh` is the fleet's ONE measured primitive (#2253), and `spawn-gate.sh` already sources
+    it rather than counting privately. So `box_room()` must run THAT script and pass its record
+    through -- no threshold of its own, no verdict of its own. Proven by changing one field in the
+    fixture and watching the reported room change: a hardcoded or re-derived number would not move.
+    """
+    cap = tmp_path / "capacity.sh"
+    cap.write_text('#!/usr/bin/env bash\n'
+                   '[ "$1" = probe ] || exit 2\n'
+                   'echo "host=fixture ncpu=8 load1=4520 lpc=565 disk_free_mb=4649 '
+                   'mem_free_mb=2176 at=1 procs=1 procs_max=9 fork=1 src=cgroup"\n')
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    first = pr.box_room()
+    assert "lpc=565" in first and "via=capacity.sh" in first, first
+    assert "next=" not in first and "bound=" not in first, (
+        "box_room() must MEASURE -- a remedy or a bound here would be a second gate: %r" % first)
+    cap.write_text(cap.read_text().replace("lpc=565", "lpc=117"))
+    second = pr.box_room()
+    assert "lpc=117" in second and "lpc=565" not in second, second
+
+
+def test_an_unreadable_box_measurement_is_NAMED_and_never_becomes_a_number(tmp_path, monkeypatch):
+    """A probe that could not run is `unreadable`, not `load 0` -- and it does not change the code.
+
+    The gate already refused; the measurement is evidence about the box, not the decision. So an
+    unreadable probe exits 6 with the same verdict and says why it has no figures (#2710: an
+    abstention is not a pass -- and here it is not a failure of the fact either).
+    """
+    cap = tmp_path / "capacity.sh"
+    cap.write_text('#!/usr/bin/env bash\necho "probe=unreadable why=a core field" >&2\nexit 2\n')
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    room = pr.box_room()
+    assert room.startswith("unreadable"), room
+    assert "why=" in room, room
+
+    rc, joined = _refused_pass(monkeypatch, "gate REFUSED rc=75 (load)")
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+    assert rc == 6, joined
+    assert side["room"].startswith("unreadable"), side["room"]
+
+
+def test_the_two_rc3_causes_are_reproduced_END_TO_END_through_the_REAL_gate(monkeypatch,
+                                                                          tmp_path):
+    """⛔ THE REPRODUCTION, NOT A STUB OF IT (#2291).
+
+    Everything above stubs `dispatch()`'s return value, which proves the BRANCH but not that a real
+    `spawn-gate.sh` refusal REACHES it. So this drives the real `nonblocking-dispatch.sh` against a
+    stub `spawn-gate.sh` that refuses exactly as the shipped one does (writes its own `[load-gate]
+    REFUSED` line, returns 75), and then the real dispatcher-missing path, THROUGH `main()`.
+
+    On `origin/main` both of these emitted `EXIT rc=3 -- 1 order(s) no worker accepted`, byte for
+    byte -- measured on a live box 2026-10-27 and reproduced here before the fix. The assertion is
+    therefore the historical one plus its negation: the two paths must NOT share a code.
+    """
+    rc_box, log_box, side_box = _through_the_real_transport(
+        monkeypatch, tmp_path / "gate",
+        'run_agent() { echo "[load-gate] REFUSED $1: load=99 >= max_load=40 — no agent started; '
+        'nothing was consumed" >> "$2"; return 75; }\n')
+    assert rc_box == 6, log_box
+    assert "VERDICT=NO-CAPACITY" in log_box and "bound=load=1" in log_box, log_box
+    assert side_box["verdict"] == "NO-CAPACITY" and side_box["rc"] == 6, side_box
+
+    # PATH B: the transport itself is not there. Nothing about the box; an operator must repair it.
+    rc_chain, log_chain, side_chain = _through_the_real_transport(
+        monkeypatch, tmp_path / "chain", 'run_agent() { return 0; }\n',
+        dispatcher="/nonexistent/nonblocking-dispatch.sh")
+    assert "VERDICT=UNDELIVERED" in log_chain, log_chain
+    assert rc_chain == 3, log_chain
+    assert side_chain["verdict"] == "UNDELIVERED", side_chain
+    assert rc_box != rc_chain, (
+        "the two facts share a code again -- this is the defect #2291 was filed for")
+
+
+def _through_the_real_transport(monkeypatch, tmp_path, run_agent_body, dispatcher=None):
+    """One real pass: real `nonblocking-dispatch.sh`, stub gate, everything else stubbed.
+
+    `dispatcher` overrides the transport path AFTER the wiring, because `_wire_dispatch` points it at
+    the shipped one -- and a `setattr` before the call would be silently undone, which is how a test
+    can assert about the wrong path and stay green.
+    """
+    d, wt = _orch(tmp_path, run_agent_body)
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    if dispatcher:
+        monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", dispatcher)
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(11)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    return rc, "\n".join(logs), json.loads(pathlib.Path(pr.STATUS).read_text())
+
+
+def test_a_no_capacity_record_reads_WAITING_in_the_beat_and_never_RED_or_ok(monkeypatch,
+                                                                          tmp_path):
+    """The BEAT is the screen an operator reads, so it must carry the distinction too (#2291).
+
+    `objective.pr_doctor_last_run()` rendered every non-zero `rc` as `RED`, so a loaded box and a
+    broken dispatcher produced the same line -- and the beat truncates `reason` at 110 chars, so
+    the prose that WOULD have distinguished them is the first thing lost. WAITING is its own token
+    and is neither: not RED (nothing is broken) and never `ok` (the queue is not moving).
+    """
+    sd = tmp_path / "state"
+    sd.mkdir()
+
+    def _seed(payload):
+        (sd / "pr-doctor.status.json").write_text(json.dumps(payload))
+        return pr.CLASSIFIER.pr_doctor_last_run(str(sd))
+
+    now = time.time()
+    waiting = _seed({"rc": 6, "verdict": "NO-CAPACITY",
+                     "reason": "VERDICT=NO-CAPACITY bound=load=1 room=host=box lpc=565",
+                     "at_epoch": now})
+    assert "WAITING" in waiting and "no capacity" in waiting, waiting
+    assert "RED" not in waiting and "ok" not in waiting.replace("WAITING", ""), waiting
+    # ⛔ AN OLDER RECORD CARRIES NO `verdict` FIELD, and 6 must still never read as `ok` -- that is
+    # the whole fail-closed direction: a record written before this change cannot be re-read into a
+    # pass it never claimed.
+    older = _seed({"rc": 6, "reason": "1 order(s) no worker accepted", "at_epoch": now})
+    assert "WAITING" in older and "RED" not in older, older
+    # CONTROL: the transport refusal is still RED. Without this the arm would be "every non-zero is
+    # WAITING", which is the false-pass direction of the same defect.
+    chain = _seed({"rc": 3, "verdict": "UNDELIVERED", "reason": "VERDICT=UNDELIVERED",
+                   "at_epoch": now})
+    assert "RED" in chain and "WAITING" not in chain, chain
+    # …and a 6 that has gone STALE is still an abstention, not a wait: nothing has written a verdict.
+    stale = _seed({"rc": 6, "verdict": "NO-CAPACITY", "reason": "x", "at_epoch": now - 4000})
+    assert "UNREPORTED" in stale, stale
+
+
 def test_a_rail_gate_in_flight_is_running_and_a_red_one_is_the_rail(monkeypatch):
     """⛔ A GATE THAT HAS NOT CONCLUDED IS NOT A DEFECT TO REPAIR (#1872 review round 7).
 
@@ -4721,15 +4976,34 @@ def _seed_status(home, payload):
     return p
 
 
-def test_the_exit_contract_is_one_table_with_five_distinct_codes():
-    """A code that two facts share is a code that answers neither. Each meaning is its own value."""
+def test_the_exit_contract_is_one_table_with_six_distinct_codes():
+    """A code that two facts share is a code that answers neither. Each meaning is its own value.
+
+    ⛔ SIX SINCE #2291, and the sixth is the point of that issue: `NO-CAPACITY` (the box has no room,
+    nothing consumed, clears by itself) shared `3` with `UNDELIVERED` (the transport would not take
+    the order and an operator must repair it). Opposite remedies, one code, one sentence -- measured
+    live as `EXIT rc=3 -- 1 order(s) no worker accepted` for BOTH.
+    """
     table = {"clean": pr.EXIT_CLEAN, "refusing": pr.EXIT_REFUSING,
              "undelivered": pr.EXIT_UNDELIVERED, "crash": pr.EXIT_CRASH,
-             "usage": pr.EXIT_USAGE}
+             "no_capacity": pr.EXIT_NO_CAPACITY, "usage": pr.EXIT_USAGE}
     assert pr.EXIT_CLEAN == 0
     assert pr.EXIT_REFUSING == 2, "2 is the fleet's refusal code — it may not be reassigned"
+    assert pr.EXIT_UNDELIVERED == 3, "3 keeps its recorded meaning: read, placed, nobody took it"
+    assert pr.EXIT_NO_CAPACITY == 6, "6 is the fleet's 'deferred: no room' value (see below)"
     assert pr.EXIT_USAGE == 64, "usage errors take sysexits.h EX_USAGE (64), not 2"
     assert len(set(table.values())) == len(table), table
+    # ⛔ 6 IS NOT INVENTED HERE -- it is the code the CELL layer already uses for this exact fact.
+    # `pr-repair-loop.sh` wraps this script, and its own "there is no room for even one repair
+    # worker" verdict is EXIT_DEFERRED=6. Pinned against that file so a renumbering on either side
+    # reddens this suite instead of leaving two layers disagreeing about "no room".
+    loop = (_REPO / "scripts" / "pr-repair-loop.sh").read_text()
+    assert re.search(r"^EXIT_DEFERRED=6\b", loop, re.M), \
+        "pr-repair-loop.sh no longer declares EXIT_DEFERRED=6 -- pr-doctor's 6 has lost its sibling"
+    # …and it is NOT sysexits' EX_TEMPFAIL (75), which is the value a third-party caller might
+    # expect: 75 is the LOAD GATE's code inside a worker's `.rc`, and one namespace cannot carry both.
+    assert pr.EXIT_NO_CAPACITY != 75, ("75 is the spawn gate's load-refusal code in "
+                                       "$O/bg/<name>.rc — see the OVERRIDES line in pr-doctor.py")
 
 
 def test_no_second_producer_of_a_verdict_code_exists_in_the_source():

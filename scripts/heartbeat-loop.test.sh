@@ -622,6 +622,46 @@ else
   pass "13. run 2's report carries no stale tail: the child's stderr is truncated at every launch"
 fi
 
+echo ""
+echo "14. #2291: a NO-CAPACITY verdict is WAITING, not RED — and a transport refusal is still RED"
+# ⛔ THE TWO FACTS THAT SHARED `EXIT rc=3` NOW SHARE NOTHING a reader can confuse. `pr-doctor` writes
+# rc=6 when the box's own spawn gate refused every order (nothing consumed, clears by itself); the
+# beat used to print that as `PR-DOCTOR RED rc=6`, the same line a broken dispatcher produces, so the
+# one screen an operator reads could not tell "wait" from "repair". The record is seeded directly:
+# the reader under test is the status.json block, and the stub child only writes its own rc.
+FIX14="$(mkfix no-capacity 0)"; LOG14="$(logof "$FIX14")"
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "reason": "VERDICT=NO-CAPACITY bound=load=1 room=host=box ncpu=8 load1=4520 lpc=565; 1 order(s) the BOX refused", "at": "x", "at_epoch": %s}\n' \
+  "$(date +%s)" > "$FIX14/agent/state/pr-doctor.status.json"
+run_pass "$FIX14"
+TXT14="$(cat "$LOG14" 2>/dev/null)"
+if has "$TXT14" "PR-DOCTOR WAITING (no capacity) rc=6"; then
+  pass "14. a NO-CAPACITY record reads WAITING — the box has no room, nothing failed"
+else
+  fail "14. a no-capacity record produced no WAITING line (see $LOG14) — a busy box reads as a broken dispatcher"
+fi
+if has "$TXT14" "PR-DOCTOR RED rc=6"; then
+  fail "14. a no-capacity record was reported as RED — the operator is sent to repair a box that only needs to be waited for"
+else
+  pass "14. …and it is NOT reported as RED"
+fi
+if has "$TXT14" "lpc=565"; then
+  pass "14. …and the box's own measurement reaches the line"
+else
+  fail "14. the no-capacity line carried no box measurement — the report says 'nobody took it' without saying what was measured"
+fi
+# CONTROL: the allowance is for code 6 only. A transport refusal (3) must still be RED, or this arm
+# would be "everything is WAITING" — the false-pass direction.
+FIX14B="$(mkfix transport-refusal 0)"; LOG14B="$(logof "$FIX14B")"
+printf '{"rc": 3, "verdict": "UNDELIVERED", "reason": "VERDICT=UNDELIVERED next=repair the dispatch chain", "at": "x", "at_epoch": %s}\n' \
+  "$(date +%s)" > "$FIX14B/agent/state/pr-doctor.status.json"
+run_pass "$FIX14B"
+TXT14B="$(cat "$LOG14B" 2>/dev/null)"
+if has "$TXT14B" "PR-DOCTOR RED rc=3"; then
+  pass "14. a TRANSPORT refusal is still RED (the WAITING allowance is narrow)"
+else
+  fail "14. a transport refusal no longer reads RED — code 3 has been swallowed with 6 (see $LOG14B)"
+fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0
