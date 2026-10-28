@@ -41,22 +41,38 @@ if [ "$NAME" = "--status" ]; then
     # early is the SIGPIPE shape `scripts/check-no-sigpipe-grep.sh` exists to keep out of the tree.
     CAPNOTE="$(awk -F= '/^note=/{sub(/^note=/, ""); print; exit}' "$D/$NAME.cap" 2>/dev/null)"
   fi
+  # ⛔ THE TERMINAL RECORD (#2834) — WHAT HAPPENED TO THE WORK, NOT ONLY WHAT THE EXIT CODE WAS.
+  # `bg/dispatch.log` records the START and this call used to report `rc` alone, so "the lane
+  # finished with nothing to do" and "the lane finished and left its only copy of the work in a
+  # worktree a reaper will delete" printed the SAME `done rc=0`. run_agent now measures the tree on
+  # every terminal transition and this file publishes its verdict, so the answer to "did anything
+  # need saving, and where is it" is one status call away instead of an archaeology exercise.
+  ENDNOTE=""
+  if [ -f "$D/$NAME.end" ]; then
+    ENDNOTE="$(awk -F= '
+      /^tree=/{t=$2} /^rescue=/{r=$2} /^ref=/{f=$2} /^unpushed=/{u=$2}
+      END{ if (t=="" && r=="") exit
+           s = " end: tree=" t " rescue=" r
+           if (f != "") s = s " (" f ")"
+           if (u != "" && u != "0") s = s " unpushed=" u
+           print s }' "$D/$NAME.end" 2>/dev/null)"
+  fi
   # ⛔ LIVENESS IS NOT %CPU. `%CPU == 0` means WAITING, not finished — a lane blocked in a long tool
   # call sits at 0 % CPU (docs/ops/fleet-liveness.md). The authoritative signal is the worker's own
   # exit-status file, written by the subshell below; the pid probe only distinguishes
   # running from vanished.
   if [ -n "$RC" ]; then
     if [ "$RC" = "0" ]; then
-      printf '%s done rc=0%s\n' "$NAME" "${CAPNOTE:+ (${CAPNOTE})}"
+      printf '%s done rc=0%s%s\n' "$NAME" "${CAPNOTE:+ (${CAPNOTE})}" "$ENDNOTE"
     else
-      printf '%s failed rc=%s%s\n' "$NAME" "$RC" "${CAPNOTE:+ (${CAPNOTE})}"
+      printf '%s failed rc=%s%s%s\n' "$NAME" "$RC" "${CAPNOTE:+ (${CAPNOTE})}" "$ENDNOTE"
     fi
   elif [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
     echo "$NAME running pid=$PID"
   else
     # No status file and no live pid: the worker is gone and its verdict was never recorded. Say so
     # rather than reporting a success that nothing produced.
-    printf '%s lost (no exit status recorded and pid %s is gone) log=%s%s\n' "$NAME" "${PID:-<unknown>}" "$D/$NAME.log" "${CAPNOTE:+ (${CAPNOTE})}"
+    printf '%s lost (no exit status recorded and pid %s is gone) log=%s%s%s\n' "$NAME" "${PID:-<unknown>}" "$D/$NAME.log" "${CAPNOTE:+ (${CAPNOTE})}" "$ENDNOTE"
   fi
   exit 0
 fi
@@ -142,7 +158,11 @@ bash "$bg_lib" --check "$PROMPT" worker || {
 
 LOG="$D/$NAME.log"; RC="$D/$NAME.rc"; PIDF="$D/$NAME.pid"; STAMP="$D/$NAME.started"
 CAPF="$D/$NAME.cap"   # written by the worker below when the wall-clock cap fired (#2045)
-rm -f "$CAPF"
+ENDF="$D/$NAME.end"   # the TERMINAL RECORD (#2834): rc + what the exit path did with the worktree
+# ⛔ BOTH CLEARED BEFORE LAUNCH. A `.end` left by a PREVIOUS run of the same name would be read as
+# THIS run's terminal record — the same staleness that made `--status` report a finished worker for a
+# live one, one file over.
+rm -f "$CAPF" "$ENDF"
 # The worker is a fleet lane in every respect except that nobody waits for it. ⛔ THE GATE DECISION
 # IS MEASURED (agent-infra#2319) — this used to bypass review + VGATE unconditionally; see lane.sh.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -205,6 +225,15 @@ cd "$WT" || exit 2
     esac
     printf 'cap_s=%s\nresult=%s\nsnapshot=%s\nnote=%s\n' "$T" "${WIP_SNAPSHOT_RESULT:-none}" "${WIP_SNAPSHOT_DIR:-}" "$note" > "$CAPF"
   fi
+  # ⛔ `.end` BEFORE `.rc`, for the reason `.cap` is: `--status` reads `.rc` FIRST, so writing the
+  # exit status first leaves a window in which a terminal report exists without the fate of the work.
+  # ⛔ THE FIELDS COME FROM run_agent'S OWN MEASUREMENT (`terminal_wip_rescue`, #2834) — never from a
+  # second reading here, which could disagree with the `[wip] end` line already in the lane's log.
+  # TOLERANT ON PURPOSE: an `$O/spawn-gate.sh` older than #2834 sets none of these, and a missing
+  # field must degrade to an absent field, never to a crash in a worker's exit path.
+  printf 'rc=%s\ncap=%s\ntree=%s\nrescue=%s\nref=%s\nunpushed=%s\n' \
+    "$rc" "${AGENT_CAP_HIT:-0}" "${LANE_END_TREE:-}" "${LANE_END_RESCUE:-}" \
+    "${LANE_END_REF:-}" "${LANE_END_UNPUSHED:-0}" > "$ENDF"
   echo "$rc" > "$RC"
 ) <&- &
 PID=$!
