@@ -247,7 +247,7 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…with the stub pi actually invoked"
 # above is REFUSED when absent (80) because a worker that never looked first is that gate's defect;
 # this one is APPENDED, because an otherwise complete authored brief must not become a dead dispatch
 # over one missing sentence — so the assertion is on the FILE the worker receives, not the source.
-DELIVERY_HEAD="$(bash "$HERE/reviewer-preflight.sh" --delivery-brief prfix | head -1)"
+DELIVERY_HEAD="$(bash "$HERE/reviewer-preflight.sh" --delivery-brief bg | head -1)"
 [ -n "$DELIVERY_HEAD" ]; ck $? "the delivery section renders a heading ($(printf '%.40s' "$DELIVERY_HEAD"))"
 AUTH="$TMP/authored.txt"; cp "$CANON" "$AUTH"
 grep -qF -- "$DELIVERY_HEAD" "$AUTH"; rc=$?
@@ -263,8 +263,24 @@ grep -qF -- "$DELIVERY_HEAD" "$AUTH"; ck $? "…and the brief the worker receive
 cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
   bash "$NB" bgdelivery2 "$TMP/wt" "$AUTH" 20 >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ] && [ "$(grep -cF -- "$DELIVERY_HEAD" "$AUTH")" -eq 1 ]; ck $? "…and a SECOND dispatch does NOT append a second copy (idempotent, rc=$rc)"
-# A role-correct negative: the `prfix` text must not order a worker to open a PR it already has.
-grep -qF 'Your PR is ALREADY OPEN' "$AUTH"; ck $? "…and the appended text is the prfix role (never 'open the PR' on an existing one)"
+# ⛔ THE ROLE IS THE KIND'S, NOT A HARDCODED ONE (this PR's review, cycle 1 — P2). This dispatch passes
+# FOUR arguments, so `$WK` is the documented `bg` default and the role must be `bg`. It used to render
+# `prfix` unconditionally, which told an `ai-drainer.sh` hygiene lane "Your PR is ALREADY OPEN" — a
+# false statement about a worker that owns no PR. Asserted BOTH ways so neither sentence can be
+# silently swapped back: the `bg` claim is absent, and the conditional one is present.
+case "$(cat "$AUTH")" in *"Your PR is ALREADY OPEN"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…and a 4-arg (bg) dispatch does NOT get the prfix claim 'Your PR is ALREADY OPEN'"
+grep -qF 'already has an open PR, commit and push onto it' "$AUTH"; ck $? "…it gets the bg role's CONDITIONAL PR sentence instead"
+# …and the other side of the same arm: a declared `prfix` dispatch DOES get the prfix sentence. Without
+# this, a regression that rendered `bg` for everything would pass every assertion above.
+AUTH_PRFIX="$TMP/authored-prfix.txt"; cp "$CANON" "$AUTH_PRFIX"
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery3 "$TMP/wt" "$AUTH_PRFIX" 20 prfix >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a DECLARED prfix dispatch still LAUNCHES (rc=$rc)"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery3.rc" ] && break; sleep 0.1; done
+grep -qF 'Your PR is ALREADY OPEN' "$AUTH_PRFIX"; ck $? "…and IT gets the prfix role (the role follows \$WK, both directions)"
+case "$(cat "$AUTH_PRFIX")" in *"already has an open PR, commit and push onto it"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…never the bg sentence (so the two arms cannot both pass on one hardcoded role)"
 
 # ── orch-send.sh + safe-send.sh: the pane-order paths. Stub `cmux` records every call, so "refused"
 # is again proven by absence.

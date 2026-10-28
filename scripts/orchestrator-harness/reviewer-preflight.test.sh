@@ -589,6 +589,7 @@ echo "§G commit as you go — a cap kill must leave a PR behind (#2981)"
 # These arms read the ARTIFACT a worker receives, never the helper's own prose.
 DELIVERY_LANE="$(delivery_brief_section lane)"
 DELIVERY_PRFIX="$(delivery_brief_section prfix)"
+DELIVERY_BG="$(delivery_brief_section bg)"
 delivery_brief_section banana >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 2 ]; ck $? "an unknown role is a usage error (2), never the wrong audience's PR duty"
 
@@ -600,6 +601,8 @@ has_resume()      { case "$1" in *'read `git status` and `git diff` FIRST'*"PRED
 has_adopt()       { case "$1" in *"Never discard"*'`git checkout -- .`'*'`git reset --hard`'*) return 0;; *) return 1;; esac; }
 has_open_pr()     { case "$1" in *"Open the PR as soon as the first commit is pushed"*) return 0;; *) return 1;; esac; }
 has_no_second()   { case "$1" in *"do NOT open a second PR"*) return 0;; *) return 1;; esac; }
+# The `bg` role's own predicate: the CONDITIONAL sentence, which is neither of the two above.
+has_bg_pr()       { case "$1" in *"already has an open PR, commit and push onto it"*) return 0;; *) return 1;; esac; }
 
 for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
   "$_p" "$DELIVERY_LANE"; ck $? "the helper renders it ($_p)"
@@ -633,6 +636,26 @@ has_open_pr "$DELIVERY_PRFIX"; rc=$?
 [ "$rc" -ne 0 ]; ck $? "⛔ …and is NOT told to open a PR it already has"
 for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
   "$_p" "$DELIVERY_PRFIX"; ck $? "prfix carries the same rule: $_p"
+done
+
+# §G.2b THE THIRD ROLE, AND WHY IT EXISTS. `bg` is `nonblocking-dispatch.sh`'s DEFAULT kind (#2409),
+# and its callers are not all PR-repairers: `ai-drainer.sh` dispatches a multi-PR hygiene lane with
+# four arguments. That lane received the `prfix` sentence — "Your PR is ALREADY OPEN" — which is
+# FALSE about a worker that owns no PR and opens none. The fix is a role whose sentence is true for
+# both worlds, so the arms below assert it BOTH ways: no false order to open a PR it may not have,
+# and no false claim that one exists.
+echo
+echo "§G.2b bg: conditional on the PR sentence — the dispatcher's DEFAULT kind (never a false claim)"
+has_bg_pr "$DELIVERY_BG"; ck $? "bg: the PR sentence is CONDITIONAL ('already has an open PR, commit and push onto it')"
+has_open_pr "$DELIVERY_BG"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and a bg worker is NOT ordered to open a PR (the ai-drainer lane would open nothing)"
+has_no_second "$DELIVERY_BG"; ck $? "…while the no-duplicate rule SURVIVES (it is not role-specific)"
+case "$DELIVERY_BG" in *"Your PR is ALREADY OPEN"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "⛔ …and it makes NO claim that a PR exists — the exact false sentence the P2 fix removes"
+case "$DELIVERY_PRFIX" in *"already has an open PR"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…and neither role's sentence leaked into the other (the predicates are not vacuous)"
+for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
+  "$_p" "$DELIVERY_BG"; ck $? "bg carries the same rule: $_p"
 done
 
 # §G.3 THE CONTROLLER TEMPLATE — the authored-brief source. Byte for byte, or it is a second copy.

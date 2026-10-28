@@ -157,13 +157,24 @@ apply_gate_policy nonblocking-dispatch
 # section (or that came from a generated composer) is left byte-for-byte alone.
 # ⛔ THE SECTION HAS ONE HOME. It is rendered by `reviewer-preflight.sh`, never copied here; the
 # needle is that render's own first line, so a reworded heading cannot silently stop matching.
-# ⛔ `prfix` IS THE ROLE: a worker on this path is repairing an ALREADY-OPEN PR, so telling it to
-# "open the PR" would be a false order.
+# ⛔ THE ROLE COMES FROM `$WK`, NEVER FROM A GUESS. `$WK` is the SAME declared kind that selects the
+# spawn-gate policy (#2409), and this dispatcher's callers sit on both sides of it: `pr-doctor.py`
+# passes `prfix` (one ALREADY-OPEN PR it repairs), while `ai-drainer.sh` passes FOUR arguments — so
+# `$WK` is the documented `bg` default and its brief is a multi-PR hygiene order that opens no PR.
+# Rendering `prfix` unconditionally handed that drainer lane "Your PR is ALREADY OPEN", which is
+# false about its situation — the untrue-order class #2148/#2325 exist to remove (caught in this
+# PR's review, cycle 1).
+# ⛔ NO SECOND COPY OF THE VOCABULARY. `$WK` was already narrowed to exactly `bg|prfix` by the closed
+# vocabulary ~90 lines above (the `kind '$WK' is not bg or prfix` arm), so a `case` here could never
+# reach a third branch — it would be an INERT enforcer that reads as protection. The role is the kind,
+# and the ONE place that decides a role is valid is the helper's own `*)` arm below: it returns 2 for
+# an unknown role, and the `|| exit 78` refuses the dispatch. Fail-closed in one home, not two.
+NB_DELIVERY_ROLE="$WK"
 NB_DELIVERY_SH="$SELF/reviewer-preflight.sh"
 [ -f "$NB_DELIVERY_SH" ] || {
   echo "nonblocking-dispatch.sh: reviewer-preflight.sh not found at $NB_DELIVERY_SH — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
-NB_DELIVERY="$(bash "$NB_DELIVERY_SH" --delivery-brief prfix)" || {
-  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief failed — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+NB_DELIVERY="$(bash "$NB_DELIVERY_SH" --delivery-brief "$NB_DELIVERY_ROLE")" || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief $NB_DELIVERY_ROLE failed — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
 NB_DELIVERY_HEADING="$(printf '%s\n' "$NB_DELIVERY" | head -1)"
 [ -n "$NB_DELIVERY_HEADING" ] || {
   echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief rendered NOTHING — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }

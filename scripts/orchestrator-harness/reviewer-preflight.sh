@@ -9,10 +9,17 @@
 #   landing_artifacts_brief_section [self|harness]   → the section that tells the lane HOW to produce
 #     the artifacts `pipeline-compliance` checks ([a] issue ref, [b] scoping marker, [c] the
 #     head-bound review record, [d] plan evidence); spliced into the brief by lane.sh (#2325).
-#   delivery_brief_section [lane|prfix]              → the section that tells a worker to COMMIT AND
+#   delivery_brief_section [lane|prfix|bg]           → the section that tells a worker to COMMIT AND
 #     PUSH as it goes (and to adopt, never discard, an uncommitted tree it inherited); spliced into
 #     every generated brief that orders work — lane.sh, fix-one.sh, pr-doctor.py — and appended by
 #     nonblocking-dispatch.sh to any authored brief that does not already carry it (#2981).
+#
+# ⛔ THE ROLE IS WHAT THE WORKER'S SITUATION IS, NOT WHICH SCRIPT STARTED IT. `lane` = no PR yet, so
+# open one. `prfix` = ONE already-open PR that is yours. `bg` = a worker whose brief may cover MANY
+# already-open PRs or none it opens itself (`ai-drainer.sh`'s multi-PR hygiene lane, and the
+# dispatcher's own `bg` default), so its sentence is CONDITIONAL — it neither orders a PR into
+# existence nor claims one it does not have. Handing a `bg` worker the `prfix` sentence is the same
+# false-order class #2148/#2325 exist to remove (found in this PR's own review, cycle 1).
 #
 # WHY (agent-infra#2148, measured 2026-10-19 on cell-2). Three lanes rebased, implemented, tested,
 # pushed and opened their PRs, and were then stopped by the review-enforcer:
@@ -323,9 +330,10 @@ BRIEF
 # remove from a brief. `lane` opens its own PR; `prfix`/`fixer` already have one.
 DELIVERY_BRIEF_HEADING='## COMMIT AS YOU GO — a killed lane must leave a PR behind (agent-infra#2981)'
 
-# delivery_brief_section [lane|prfix] — the same text for every worker that changes a tree; only
-# the sentence about the PR differs.
-delivery_brief_section() { # delivery_brief_section [lane|prfix]
+# delivery_brief_section [lane|prfix|bg] — the same text for every worker that changes a tree; only
+# the sentence about the PR differs. `bg` is conditional ON PURPOSE: it is the dispatcher's DEFAULT
+# kind, so the worker behind it may be repairing one PR, many PRs, or opening none.
+delivery_brief_section() { # delivery_brief_section [lane|prfix|bg]
   local role="${1:-lane}" open_pr
   case "$role" in
     lane)
@@ -334,8 +342,11 @@ delivery_brief_section() { # delivery_brief_section [lane|prfix]
   the same work.' ;;
     prfix)
       open_pr='**Your PR is ALREADY OPEN — commit and push onto it, and do NOT open a second PR.**' ;;
+    bg)
+      open_pr='**If the work you were given already has an open PR, commit and push onto it** — and
+  do NOT open a second PR for the same work.' ;;
     *)
-      printf 'reviewer-preflight.sh: unknown role "%s" (expected lane|prfix)\n' "$role" >&2
+      printf 'reviewer-preflight.sh: unknown role "%s" (expected lane|prfix|bg)\n' "$role" >&2
       return 2 ;;
   esac
   cat <<BRIEF
@@ -375,13 +386,13 @@ BRIEF
 
 # CLI, for tests and for a human who wants the exact text:
 #   bash reviewer-preflight.sh --line [self|harness|reviewer] | --brief [self|harness]
-#                                  | --landing-brief [self|harness] | --delivery-brief [lane|prfix]
+#                                  | --landing-brief [self|harness] | --delivery-brief [lane|prfix|bg]
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --line)  shift; reviewer_preflight_line "${1:-self}" ;;
     --brief) shift; reviewer_brief_section "${1:-self}" ;;
     --landing-brief) shift; landing_artifacts_brief_section "${1:-self}" ;;
     --delivery-brief) shift; delivery_brief_section "${1:-lane}" ;;
-    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness] | --landing-brief [self|harness] | --delivery-brief [lane|prfix]\n' "$0" >&2; exit 2 ;;
+    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness] | --landing-brief [self|harness] | --delivery-brief [lane|prfix|bg]\n' "$0" >&2; exit 2 ;;
   esac
 fi
