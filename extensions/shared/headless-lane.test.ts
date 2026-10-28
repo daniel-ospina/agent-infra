@@ -561,7 +561,7 @@ async function main() {
     equal(norm(sh).join(" "), want, `box-status.sh's \`unset\` list drifted from headless-lane.ts — update BOTH (the copies are listed in the module comment)`);
   });
 
-  await test("A14 — the hub-write guard's SECOND copy of this predicate is still UN-SCRUBBED (known gap #2993) — flipping this pin means the gap closed", () => {
+  await test("A14 — the hub-write guard's SECOND copy of this predicate is still UN-SCRUBBED (known gap #2993) — flipping this pin means the gap closed", async () => {
     // A13 keeps the relocation list in step; it says nothing about the file that
     // re-implements this predicate with NO list at all, so it can never catch that
     // copy. Pinning the GAP (not a guarantee) is the point: `headless-lane.ts`
@@ -576,19 +576,45 @@ async function main() {
     // RED-when-fixed: when #2993 lands, delete it, close the issue, and correct the
     // `headless-lane.ts` header paragraph that names it.
     const repo = resolve(HERE, "..", "..");
-    const src = readFileSync(join(repo, "extensions", "main-worktree-guard", "classify-git.mjs"), "utf8");
-    const block = src.match(/export function gitCheckoutIsLinkedWorktree\(cwd\) \{([\s\S]*?)\n\}/);
+    // BEHAVIOUR, not source text (round 6, finding 2). The first version of this pin
+    // asserted `!/\benv\s*:/.test(fnBody)`, which mis-reported in BOTH directions
+    // (measured by replaying its own extraction): `env: process.env` — a no-op — and a
+    // GIT_DIR-only scrub both read as "the gap looks CLOSED, close #2993" while the
+    // vector stayed live, and a fix applied OUTSIDE the function body (consuming one
+    // owner, cleaning process.env) read as "still open". `classify-git.mjs` is plain
+    // `node:*`-only ESM, so the pin can call the real function and be right about every
+    // fix shape. Re-anchoring is still guarded, because a renamed function would
+    // otherwise make the call below throw for the wrong reason.
+    const cgPath = join(repo, "extensions", "main-worktree-guard", "classify-git.mjs");
+    const cgSrc = readFileSync(cgPath, "utf8");
     ok(
-      block,
-      "gitCheckoutIsLinkedWorktree is no longer in classify-git.mjs — if it was moved or removed, re-measure it and update BOTH this pin and #2993 (do not just delete the assertion)",
+      cgSrc.includes("export function gitCheckoutIsLinkedWorktree("),
+      "gitCheckoutIsLinkedWorktree is no longer exported by classify-git.mjs — if it moved or was renamed, re-measure the gap and update BOTH this pin and #2993 (do not just delete the assertion)",
     );
-    const body = block![1];
-    ok(body.includes("git rev-parse --git-dir"), "the pinned function no longer runs the `--git-dir` probe this gap is about — re-anchor the pin before trusting it");
-    ok(body.includes("git rev-parse --git-common-dir"), "the pinned function no longer runs the `--git-common-dir` probe this gap is about — re-anchor the pin before trusting it");
+    const cg = (await import(pathToFileURL(cgPath).href)) as {
+      gitCheckoutIsLinkedWorktree: (cwd: string) => boolean;
+    };
     equal(
-      /\benv\s*:/.test(body),
+      cg.gitCheckoutIsLinkedWorktree(FIXTURE.hub),
       false,
-      "classify-git.mjs's gitCheckoutIsLinkedWorktree now passes an `env:` — the #2993 gap looks CLOSED: delete this pin, correct the headless-lane.ts header paragraph that names it, and close #2993",
+      `the HUB alone (${FIXTURE.hub}) must NOT read as a linked worktree — if this is red the classifier changed shape and the measurement below no longer means what the gap says`,
+    );
+    // Measured (#2993, real git): with GIT_DIR exported to a REAL worktree's gitdir,
+    // `--git-dir` and `--git-common-dir` differ, so this copy answers true for the HUB
+    // and `isWorktreeCwdWrite(hub)` lifts the hub-write gate.
+    const priorGitDir = process.env.GIT_DIR;
+    let relocated: boolean;
+    try {
+      process.env.GIT_DIR = FIXTURE.wtGitDir;
+      relocated = cg.gitCheckoutIsLinkedWorktree(FIXTURE.hub);
+    } finally {
+      if (priorGitDir === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = priorGitDir;
+    }
+    equal(
+      relocated,
+      true,
+      "the #2993 gap is CLOSED — an exported GIT_DIR no longer relocates classify-git.mjs's read for the hub. Delete this pin, correct the headless-lane.ts header paragraph that names it, and close #2993 (this assertion is deliberately red-when-fixed)",
     );
     // A disclosure nobody re-reads is the same drift, one level up: the header
     // paragraph is the only place a reader learns the scope of the scrub.
@@ -682,13 +708,22 @@ async function main() {
 
     // M2: the HUB arm. Reintroduce the historical path-insensitive fail-open: treat
     // EVERY checkout as a linked worktree (#618/#621's shape — isMain lost).
-    await expectRed("M2a — hub arm (derivation)", async () => {
-      const mod = await mutatedModule(
-        "m2",
-        "return { topLevel, gitDir, commonDir, linkedWorktree: gitDir !== commonDir };",
-        "return { topLevel, gitDir, commonDir, linkedWorktree: true };",
-      );
-      const c = mod.deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.hub });
+    //
+    // Round 6, finding 1: M2 had NO sanity leg, so `mutatedModule`'s own
+    // `ok(SRC.includes(from), "mutation anchor … is stale")` — and a temp-copy write or
+    // import failure — was caught by `expectRed` and counted as the required RED. The
+    // hub arm's evidence would then print "went RED as required" while the mutation had
+    // never applied. Load the mutant OUTSIDE every `expectRed` (M1a's shape), so those
+    // failures fail the suite, and share one loaded module with the sanity leg and M2a.
+    const M2_FROM = "return { topLevel, gitDir, commonDir, linkedWorktree: gitDir !== commonDir };";
+    const M2_TO = "return { topLevel, gitDir, commonDir, linkedWorktree: true };";
+    const M2 = await mutatedModule("m2", M2_FROM, M2_TO);
+    await test("M2-sanity — the hub arm's mutation is APPLIED (so M2a's RED is the assertion, not a stale anchor)", () => {
+      const c = M2.deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.hub });
+      equal(c.lane, true, `sanity: the mutated copy should derive a lane for the HUB (the #618/#621 fail-open), got false — ${c.why}`);
+    });
+    await expectRed("M2a — hub arm (derivation)", () => {
+      const c = M2.deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.hub });
       equal(c.lane, false, `lane: expected false — a headless run in the HUB has no lane contract, got true (${c.why})`);
     });
     await expectRed("M2b — hub arm (wiring)", async () => {
