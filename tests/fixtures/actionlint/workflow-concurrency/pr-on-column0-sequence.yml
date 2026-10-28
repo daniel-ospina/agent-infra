@@ -1,0 +1,14 @@
+# A block sequence may sit at its parent key indent — even column 0. That line was consumed by the
+# top-level branch before the `on:` sequence arm, so a correct workflow was refused as "could not
+# read any trigger" although `on:` is right there (#2660 round 9).
+name: PR on column0 sequence
+on:
+- pull_request
+concurrency:
+  group: pr-on-column0-sequence-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

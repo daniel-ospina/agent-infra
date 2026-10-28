@@ -38,6 +38,38 @@
 #     budget that OUR OWN polling spent is indistinguishable, from inside a lane, from GitHub being
 #     down — so the layer says which one it is, in one token a caller can print verbatim.
 #
+# ⛔ ACCOUNT SCOPE, NOT BOX SCOPE (agent-infra#2137). The two remedies above bound what THIS BOX
+# sends; they do not bound what the ACCOUNT sends. Four boxes acting as ONE account share ONE pair of
+# buckets, so a per-box budget is ~4x the account's, and GitHub's SECONDARY (burst/concurrency)
+# limit is enforced on the ACCOUNT. Measured 2026-10-20: `gh api rate_limit` honestly reported
+# graphql ~4573/5000 while the fleet was refused — the primary counter does not predict a secondary
+# limit, so a box cannot tell "the account is out" from "my box is fine". Two things follow, and
+# neither needs cross-box messaging:
+#
+#   * PARTITION THE ACCOUNT BUDGET. GitHub's primary limit is per ACCOUNT (5,000/hr per bucket for
+#     authenticated users, shared by every token and app acting for that user). A declared fleet size
+#     (`GH_LIMIT_ACCOUNT_FLEET_SIZE`, default 4) divides that budget, a safety fraction
+#     (`GH_LIMIT_ACCOUNT_SAFETY`, default 0.8) keeps headroom, and this box then sends at most its
+#     share per window (`GH_LIMIT_ACCOUNT_WINDOW_S`, default 60 s) — 5000 x 0.8 / 4 / 60 ≈ 16/min at
+#     the defaults. A partition is testable and needs no peer to be reachable.
+#   * AN UNCLASSIFIED REFUSAL IS ITS OWN CLASS. `status=?` — a limit whose bucket/status could not be
+#     parsed — used to be the one case that produced a FULL-WINDOW block, because the only number
+#     available was a bucket reset ~43 minutes away while the refusal was secondary. It is now
+#     classified `unclassified` and treated like a secondary limit: >= 1 minute with upward jitter,
+#     doubling per attempt, and the classification is RECORDED. It never adopts a bucket reset as its
+#     wait, because the primary counter does not predict a secondary limit.
+#
+# ⛔ THE RECORD IS EVIDENCE WITH A WINDOW, NOT A STATE. `last-limit` now carries `kind=` (the
+# classification used), `until=` (the block window that classification justifies — never a reset for
+# an unclassified/secondary refusal) and `remaining=` (what the exempt `/rate_limit` read said). The
+# layer blocks a call on that marker ONLY within `until`, NEVER on a marker older than the window it
+# recorded, and it REVALIDATES with one exempt REST `rate_limit` read before any long wait: if that
+# bucket reports headroom, the marker is stale, it is annotated `stale=` (the age stays — the age is
+# evidence) and the call proceeds. Every refusal/backoff line names its own evidence: the
+# classification, the AGE of the evidence it used (`0s` when the refusal is in hand, the marker's age
+# when the marker is what it waited on), the remaining count read, and the attempt number — a line
+# that cannot say how old its evidence is reads the same as a live one.
+#
 # WHAT THIS IS NOT. It is not a retry that hides the problem. A limited call RECORDS itself — in
 # `$GH_LIMIT_DIR/last-limit` (read by the controller's heartbeat) and in `events.log` — and a final
 # failure says so on stderr in the API's own terms. A cycle that was limited never looks like a
@@ -140,6 +172,28 @@ MUTATION_GAP = cfg_secs("GH_LIMIT_MUTATION_GAP", 1.0, 1.0, 60)     # ">= 1 secon
 NO_WAIT = cfg_int("GH_LIMIT_NO_WAIT", 0, 0, 1)
 # The lock budget under NO_WAIT — small enough to fit inside a 90 s caller alongside one request.
 NO_WAIT_LOCK_S = cfg_secs("GH_LIMIT_NO_WAIT_LOCK_S", 5.0, 1.0, 600)
+
+# ── ACCOUNT SCOPE (agent-infra#2137): the budget is the ACCOUNT's, so a box must assume its peers exist ──
+# The declared fleet size is an ENV VALUE, not a measurement: boxes cannot see each other, and a
+# partition derived from an unreachable peer would be unavailable exactly when it is needed. A
+# declaration is conservative in the safe direction (too few boxes => too generous a share => the
+# account limit is hit, which the backoff below handles; too many => a box is slower than it needs to
+# be, which costs latency, not correctness).
+ACCOUNT_FLEET_SIZE = cfg_int("GH_LIMIT_ACCOUNT_FLEET_SIZE", 4, 1, 64)
+ACCOUNT_BUDGET_PER_HOUR = cfg_int("GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR", 5000, 60, 100000)
+ACCOUNT_SAFETY = max(0.1, min(_finite("GH_LIMIT_ACCOUNT_SAFETY", 0.8), 1.0))
+ACCOUNT_WINDOW_S = cfg_secs("GH_LIMIT_ACCOUNT_WINDOW_S", 60, 10, 3600)
+# WHICH buckets are partitioned. `graphql` by default: that is the measured exhaustion (#1762/#1939)
+# and the bucket the heartbeat's ~513-call refresh bursts use. `core` is deliberately NOT paced by
+# default — #1962/#2137 move the hot reads ONTO REST, so pacing REST here would push the fleet back
+# onto the bucket that is already refusing. An operator who measures core pressure opts in with
+# `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`.
+ACCOUNT_PARTITION_BUCKETS = tuple(
+    b.strip().lower() for b in cfg("GH_LIMIT_ACCOUNT_PARTITION_BUCKETS", "graphql").split(",") if b.strip())
+# A marker older than this is not evidence about now (matches `orch-loop.sh`'s GH_LIMIT_STALE_S).
+MARKER_MAX_AGE = cfg_secs("GH_LIMIT_MARKER_MAX_AGE", 900, 60, 86400)
+# A wait longer than this is worth ONE exempt REST read before committing to it (requirement 3).
+GATE_REVALIDATE_S = cfg_secs("GH_LIMIT_GATE_REVALIDATE_S", 30, 1, 600)
 CACHE_MAX_BODY = 1024 * 1024
 CACHE_MAX_BYTES = cfg_int("GH_LIMIT_CACHE_MAX_BYTES", 64 * 1024 * 1024, 1024, 1 << 30)  # whole cache
 CACHE_MAX_ENTRIES = cfg_int("GH_LIMIT_CACHE_MAX_ENTRIES", 500, 1, 100000)
@@ -317,21 +371,139 @@ def write_state(name, text):
         return False
 
 
-def record_limit(bucket, reset, attempts, waited, status, remaining=None):
+def record_limit(bucket, reset, attempts, waited, status, kind="unclassified", until=None, remaining=None):
     """The durable record the controller's heartbeat reads (`gh=<bucket> reset=<epoch>`).
 
-    ⛔ AND IT CARRIES THE REMAINING COUNT WHEN THE REFUSED RESPONSE CARRIED ONE. A SECONDARY (burst)
-    refusal on the `core` bucket looks exactly like a primary one, but its `x-ratelimit-remaining` is
-    above zero — and without that number the record is indistinguishable from “the core pool is EMPTY”,
-    so `core_record_reset()` would gate every write on the box for the length of the PRIMARY window
-    (up to an hour) on a pool with thousands of requests left. The field is optional and last, so
-    every reader that only wants `bucket`/`reset` is unaffected.
-    """
-    extra = "" if remaining is None else " remaining=%d" % remaining
+    ⛔ IT CARRIES ITS OWN EVIDENCE AND ITS OWN WINDOW (#2137). `kind=` is the classification this
+    observation used, `until=` is the block window that classification justifies, and `remaining=` is
+    what the exempt `/rate_limit` read said. Before this, the record carried the BUCKET RESET and
+    nothing else — so a refusal classified `status=?` (secondary, ~1 minute) wrote a reset ~43
+    minutes away, and every consumer that trusted it blocked the box for the full window. A reader
+    must block until `until`, never until `reset`. The older fields stay where they were and keep
+    their meaning, so `orch-loop.sh`'s token (and any older reader) still parses the line."""
     write_state("last-limit",
-                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s%s"
+                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s kind=%s until=%s remaining=%s"
                 % (int(clock()), bucket, ("%d" % reset) if reset else "0", attempts, int(waited),
-                   status if status is not None else "?", extra))
+                   status if status is not None else "?", kind or "unclassified",
+                   ("%d" % until) if until else "0",
+                   ("%d" % remaining) if remaining is not None else "?"))
+
+
+def marker_until(kind, reset, wait, now):
+    """The BLOCK WINDOW an observation justifies — and the whole point of requirement 2/5.
+
+    A PRIMARY exhaustion is honest about the full window: `remaining == 0` and a reset in the future
+    is exactly "this bucket is out until then", and the docs say not to call again before it. A
+    SECONDARY or UNCLASSIFIED refusal is not: the primary counter does not predict it (documented,
+    and measured — graphql ~4573/5000 while refused), so its reset is NOT a recovery time. Its window
+    is the wait this layer itself will honour, capped at the documented one-minute floor, so a
+    `status=?` observation can never become an hour-long box-wide block again."""
+    if kind == "primary" and reset and reset > now:
+        return int(reset)
+    # ⛔ A `retry-after` WINDOW IS THE SERVER'S OWN DELAY, NOT THE FLOOR. `plan_wait` honours that
+    # header exactly (bounded by MAX_WAIT), so capping the RECORD at the one-minute floor published a
+    # window shorter than the one this process was obeying: with `Retry-After: 300` the box slept 300 s
+    # while its own marker told every peer client it was free again in 60 — 240 s of peer traffic inside
+    # a cool-down the layer itself respected.
+    if kind == "retry-after" and wait and wait > 0:
+        return int(now + min(float(wait), float(MAX_WAIT)))
+    if wait and wait > 0:
+        return int(now + min(float(wait), float(BASE_WAIT)))
+    return int(now + BASE_WAIT)
+
+
+def record_window(limit, kind, reset, wait, now):
+    """The window a refusal justifies, for the paths that have no `plan_wait` result to hand.
+
+    ⛔ ONE EXPRESSION, THREE CALL SITES. The give-up and NO_WAIT paths pass `wait=None`, so a
+    `retry-after` refusal recorded the 60 s floor while `plan_wait` was obeying the server's delay —
+    publishing a window shorter than the one the layer honoured. `limit.retry_after` is the only wait
+    those paths can imply, and it is exactly what `plan_wait` would have used."""
+    if wait is None and kind == "retry-after" and limit.retry_after:
+        wait = float(limit.retry_after)
+    return marker_until(kind, reset, wait, now)
+
+
+def _parse_marker(raw):
+    """`key=value …` text into a dict (the on-disk `last-limit` shape), or None when unparsable."""
+    try:
+        parts = dict(kv.split("=", 1) for kv in raw.split() if "=" in kv)
+    except ValueError:
+        return None
+    return parts or None
+
+
+def read_marker():
+    """`last-limit` as a dict, or None. Read defensively: a torn/dir/corrupt record is not an error."""
+    try:
+        with open(os.path.join(state_dir(), "last-limit")) as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return _parse_marker(raw)
+
+
+def marker_window(marker):
+    """(kind, until_epoch) — the classification the marker recorded and the window it justifies.
+
+    ⛔ A MARKER WITH NO `kind=` IS `unclassified`, NEVER `primary`. Records written before this change
+    carry `reset=` and nothing else, and the measured stale marker was exactly that shape with a
+    reset ~43 min ahead. Deriving a primary window from it would restore the full-window block for
+    every marker already on disk, so the migration default is the bounded one."""
+    kind = (marker.get("kind") or "unclassified").strip()
+    at = as_int(marker.get("at"))
+    until = as_int(marker.get("until"))
+    if until and until > 0:
+        return kind, until
+    # No window recorded (a legacy marker): bound it by what this layer will actually wait.
+    if at is None:
+        return kind, 0
+    return kind, marker_until(kind, as_int(marker.get("reset")), BASE_WAIT, at)
+
+
+def marker_age(marker):
+    """Seconds since the marker was written, or None. The AGE is part of every line that uses it."""
+    at = as_int(marker.get("at")) if marker else None
+    return None if at is None else int(clock()) - at
+
+
+def mark_marker_stale(remaining, why, expect=None):
+    """Annotate a marker whose own evidence contradicts it. ⛔ ANNOTATE, NEVER DELETE.
+
+    The age is the evidence an operator needs ("refused 4 minutes ago, probe says 4573 left"), so the
+    record keeps its `at=` and gains `stale=`/`reval_remaining=`/`why=`. Deleting it would make the
+    next reader unable to tell "no limit happened" from "a limit happened and was cleared".
+
+    ⛔ AND IT DOES **NOT** WRITE `recovered=`. That field is the cycle token's "this limit was read
+    past" mark, and the only honest source of it is a REAL REQUEST THAT SUCCEEDED (`record_recovery`).
+    A `/rate_limit` read is exempt from the primary limit — measured at 4999/5000 while every GraphQL
+    call was refused — so deriving `recovered=` from it would make a box that is still being refused
+    report itself recovered, which is the false pass this whole layer exists to prevent. The gate
+    suppresses on `stale=`, so nothing needs that field."""
+    path = os.path.join(state_dir(), "last-limit")
+    try:
+        with open(path) as fh:
+            cur = fh.read().strip()
+    except OSError:
+        return False
+    if not cur or "stale=" in cur:
+        return False
+    # ⛔ ANNOTATE ONLY THE RECORD WE READ. `record_limit` writes `last-limit` OUTSIDE the box lock (a
+    # refusal must not queue behind a sleeping gate), so between this gate's read and this write a
+    # concurrent client can have replaced the file — with another bucket's marker, or with a FRESH
+    # genuine refusal whose `until` is a real window. Stamping `stale=` on that record would clear a
+    # block that must hold, and the gate suppresses on `stale=` for good, so the drop would be silent
+    # and permanent (fail-open). Identity is `at` + `bucket` + `kind`: same observation, same record.
+    if expect is not None:
+        now_rec = _parse_marker(cur) or {}
+        if (as_int(now_rec.get("at")), now_rec.get("bucket"), now_rec.get("kind")) != \
+           (as_int(expect.get("at")), expect.get("bucket"), expect.get("kind")):
+            log_event("marker-gate: NOT annotating last-limit — it was replaced under me (read at=%s, found at=%s)"
+                      % (expect.get("at"), now_rec.get("at")))
+            return False
+    now = int(clock())
+    extra = " stale=%d reval_remaining=%s why=%s" % (now, ("%d" % remaining) if remaining is not None else "?", why)
+    return write_state("last-limit", cur + extra)
 
 
 def record_recovery(bucket):
@@ -392,6 +564,13 @@ def log_event(line):
 
 
 # ── single flight ───────────────────────────────────────────────────────────────────────────────
+# ⛔ THIS PROCESS'S CUMULATIVE LOCK WAIT. `NO_WAIT` bounds the time a bounded caller may spend in the
+# lock queue for the WHOLE call, not per acquire: `_dispatch` takes the lock twice on the floor path
+# (the exempt meter probe, then the call), and a per-acquire budget made that two budgets. Read and
+# written only by `acquire_lock`, reset never — a process is one call.
+_LOCK_WAIT_SPENT = [0.0]
+
+
 def acquire_lock(strict=False):
     """One gh call in flight per box. Returns the fd to hold (or None when re-entrant/unavailable).
 
@@ -423,11 +602,22 @@ def acquire_lock(strict=False):
     # its own subprocess bound (the heartbeat's 90 s refresh), so a busy box turned a rate-limit
     # verdict into a silent timeout — the same non-goal, reached from the lock. Proceed UNSERIALISED
     # after NO_WAIT_LOCK_S and say so, rather than being killed mid-wait with no record at all.
+    #
+    # ⛔ AND THE NO_WAIT BUDGET IS PER PROCESS, NOT PER ACQUIRE (#2342 review, the merge regression).
+    # `_dispatch` takes this lock TWICE on the floor path — once for the exempt meter probe and once
+    # for the call itself — so a per-acquire budget DOUBLED the wait a bounded caller imposed on
+    # itself (measured: 2 x NO_WAIT_LOCK_S = 10 s, against a suite bound of `<= 10` s and against every
+    # caller that budgeted one 5 s wait). The second acquire sees what the first one spent: a caller
+    # whose lock budget is gone proceeds UNSERIALISED AT ONCE (the same documented fallback) instead of
+    # paying the budget again.
     budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT else LOCK_TIMEOUT
-    deadline = time.monotonic() + budget      # real monotonic: the fake clock is for BACKOFF
+    budget = max(0.0, budget - _LOCK_WAIT_SPENT[0])
+    _wait_start = time.monotonic()
+    deadline = _wait_start + budget           # real monotonic: the fake clock is for BACKOFF
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _LOCK_WAIT_SPENT[0] += time.monotonic() - _wait_start
             break
         except OSError as exc:
             if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
@@ -435,6 +625,7 @@ def acquire_lock(strict=False):
                 # filesystem without flock — SMB/CIFS, some FUSE mounts) would spin here for the full
                 # LOCK_TIMEOUT on EVERY gh call and then proceed unserialised anyway: a 10-minute
                 # stall on the box that looks like a slow network.
+                _LOCK_WAIT_SPENT[0] += time.monotonic() - _wait_start
                 log_event("WARNING gh.lock unusable (%s) — proceeding UNSERIALISED" % exc)
                 if strict:
                     try:
@@ -446,6 +637,7 @@ def acquire_lock(strict=False):
             if time.monotonic() >= deadline:
                 # Bounded, and announced in the evidence log rather than blocking for ever: an
                 # unbounded wait behind one slow gh call would park the whole box's merge sweep.
+                _LOCK_WAIT_SPENT[0] += time.monotonic() - _wait_start
                 log_event("WARNING gh.lock not acquired within %ds — proceeding UNSERIALISED" % int(budget))
                 if strict:
                     try:
@@ -470,6 +662,221 @@ def release_lock(fd):
         os.close(fd)
     except OSError:
         pass
+
+
+# ── the ACCOUNT partition (agent-infra#2137, requirement 1) ────────────────────────────────────
+def account_share():
+    """This box's share of the ACCOUNT's hourly budget, as calls per window.
+
+    GitHub's primary limit is per ACCOUNT, not per machine: a personal access token, an OAuth app and
+    a GitHub App acting for the same user all draw on the same 5,000/hr bucket ("All of these requests
+    count towards your personal rate limit of 5,000 requests per hour"). Four boxes therefore act as
+    ONE client of a 5,000/hr budget, and bounding each box at 5,000/hr bounds the account at 20,000/hr
+    — four times what it has. This is the partition: budget x safety / fleet, per window.
+
+    ⛔ THE FLOOR IS 1, NOT 0. A share that rounds to zero would refuse EVERY call on a box and turn a
+    conservative configuration into a dead harness; one call per window is slow, and slow is
+    recoverable. The knob's value is a DECLARATION (`GH_LIMIT_ACCOUNT_FLEET_SIZE`), not a measurement:
+    a peer that cannot be reached is still a peer spending the same budget."""
+    per_min = (float(ACCOUNT_BUDGET_PER_HOUR) * float(ACCOUNT_SAFETY)
+               / float(ACCOUNT_FLEET_SIZE) / 60.0)
+    per_window = max(1, int(per_min * float(ACCOUNT_WINDOW_S) / 60.0))
+    return {"fleet": ACCOUNT_FLEET_SIZE, "budget": ACCOUNT_BUDGET_PER_HOUR,
+            "safety": ACCOUNT_SAFETY, "window": int(ACCOUNT_WINDOW_S),
+            "per_min": per_min, "per_window": per_window}
+
+
+def _budget_file(bucket):
+    return "budget-%s" % re.sub(r"[^a-z0-9]", "", str(bucket).lower() or "core")
+
+
+def _budget_take(bucket, now, cap, window):
+    """Record one slot in this box's sliding window, or report when the next one frees up.
+
+    Called under the box lock: the window file is shared by every process of this uid on this box, so
+    a read-modify-write outside the lock would let N callers each see "one slot left" and take it
+    (measured shape: the same defect the mutation stamp had). Returns (allowed, wait_seconds, used)."""
+    path = os.path.join(state_dir(), _budget_file(bucket))
+    try:
+        with open(path) as fh:
+            stamps = [int(x) for x in fh.read().split() if x.strip().lstrip("-").isdigit()]
+    except (OSError, ValueError):
+        stamps = []
+    cut = now - window
+    # ⛔ LOWER *AND* UPPER BOUND. A stamp from the FUTURE is invalid by construction (a clock that
+    # stepped back: NTP, a VM resume — the same class `last-mutation` guards), and honouring one made
+    # `oldest + window - now` a huge number, i.e. every call refused with `rc 75` until wall-clock
+    # caught up. Future stamps are DROPPED, not believed.
+    stamps = sorted(s for s in stamps if cut < s <= now)
+    if len(stamps) < cap:
+        stamps.append(int(now))
+        write_state(_budget_file(bucket), "\n".join("%d" % s for s in stamps) + "\n")
+        return True, 0.0, len(stamps)
+    # The window is full: the next slot frees when the OLDEST entry leaves it.
+    return False, max(1.0, float(stamps[0] + window - now)), len(stamps)
+
+
+def record_budget(bucket, next_slot, share):
+    """A durable record of a LOCAL budget refusal, kept OUT of `last-limit`.
+
+    ⛔ SEPARATE FILE ON PURPOSE. `last-limit` is what the heartbeat prints as
+    `gh=rate_limited(...)`, so writing a partition refusal there would publish OUR refusal as GitHub's
+    -- the false attribution that the local-refusal rule exists to prevent. This file is the evidence
+    an operator needs to see why a box is quiet (`next_slot`, the share it enforced, the declared
+    fleet), and `events.log` carries the same line in sequence."""
+    write_state("last-budget",
+                "at=%d bucket=%s next_slot=%ds per_window=%d window=%ds fleet=%d budget=%d/hr safety=%.2f"
+                % (int(clock()), bucket, int(next_slot), share["per_window"], share["window"],
+                   share["fleet"], share["budget"], share["safety"]))
+
+
+def _overdraw_once(bucket, now, window):
+    """True for the FIRST over-share call in the current window, so the overdraw line is evidence
+    rather than a flood.
+
+    ⛔ WHY THIS EXISTS. The heartbeat's refresh is ~513 graphql calls in one bounded run with
+    `GH_LIMIT_NO_WAIT=1` (the file's own P9 reasoning). Against a 16-call window share that is ~497
+    over-share calls; one line each would cross `EVENTS_MAX_BYTES` mid-run, and from then on
+    `log_event` rewrites the file to its last 500 lines on EVERY call — so the log would converge to
+    100% overdraw lines and evict every refusal, probe and marker decision this layer exists to keep.
+    The overdraw is still VISIBLE (once per window per bucket); it just cannot eat the record."""
+    name = _budget_file(bucket) + ".over"
+    try:
+        with open(os.path.join(state_dir(), name)) as fh:
+            last = int((fh.read() or "0").split()[0])
+    except (OSError, ValueError, IndexError):
+        last = 0
+    if last and 0 <= now - last < window:
+        return False
+    write_state(name, "%d" % int(now))
+    return True
+
+
+def budget_gate(bucket, now):
+    """Seconds to wait before sending, or 0.0 when a slot was taken for THIS send.
+
+    ⛔ A BOUNDED CALLER IS NOT PARKED. `GH_LIMIT_NO_WAIT` exists because its caller has its own
+    subprocess bound (the heartbeat's 90 s refresh); spending that bound in a queue here would turn a
+    rate-limit verdict into a timeout — the failure #2137's NO_WAIT half exists to prevent. Such a
+    caller proceeds and the OVERDRAW is recorded, so the partition is enforced for every caller that
+    can wait and the one class that cannot is visible instead of silent."""
+    if bucket not in ACCOUNT_PARTITION_BUCKETS:
+        return 0.0
+    share = account_share()
+    lock = acquire_lock()
+    try:
+        allowed, wait, used = _budget_take(bucket, now, share["per_window"], share["window"])
+    finally:
+        release_lock(lock)
+    if allowed:
+        if used == share["per_window"]:
+            log_event("account budget: %s at its share (%d/%d per %ds, fleet=%d budget=%d/hr safety=%.2f)"
+                      % (bucket, used, share["per_window"], share["window"], share["fleet"],
+                         share["budget"], share["safety"]))
+        return 0.0
+    if NO_WAIT:
+        if _overdraw_once(bucket, now, share["window"]):
+            log_event("account budget: %s OVER the box's share (%d/%d per %ds) — NO_WAIT caller proceeds over the "
+                      "partition (it cannot be paced without outliving its own bound); further overdraw in "
+                      "this window is not repeated here"
+                      % (bucket, used, share["per_window"], share["window"]))
+        return 0.0
+    return wait
+
+
+def marker_gate(gh_argv, real_gh, now):
+    """The ACCOUNT view shared by every client on this box: may this call be sent at all?
+
+    Returns the seconds waited (0.0 = proceed). This is the half that makes an observation on ONE box
+    useful to every other client on it: a refusal writes `until=` and the box's next calls wait out
+    that window instead of each spending four attempts to discover the same thing.
+
+    ⛔ FOUR BOUNDS, EACH ONE CLOSING A MEASURED FAILURE:
+      1. only within `until` — the window the CLASSIFICATION justifies, never the bucket reset for an
+         unclassified/secondary refusal (that is the 43-minute block that blinded the beat);
+      2. never on a marker OLDER than the window it recorded, nor older than `MARKER_MAX_AGE` — an
+         old observation is a fact about the past, not a state (the `last-mutation` future-stamp class);
+      3. revalidated with ONE exempt REST `rate_limit` read before any long wait: if that bucket now
+         reports headroom, the marker is stale, it is annotated (age kept) and the call proceeds;
+      4. never for a NO_WAIT caller, and never for a call that makes no request (`gh --version`, `help`,
+         `auth token`) — those cannot be refused, and parking them would only hide the tooling."""
+    if NO_WAIT or not makes_request(gh_argv):
+        return 0.0
+    marker = read_marker()
+    # ⛔ `marker` IS A DICT, so membership tests its KEYS (`recovered`, `stale`) — the `=` spelling
+    # made both checks always false, which quietly disabled the suppressor this gate depends on: a
+    # marker already marked recovered (by `record_recovery`) or stale (by `mark_marker_stale`) still
+    # blocked, and if the probe could not answer it paid the WHOLE window again.
+    if not marker or "recovered" in marker or "stale" in marker:
+        return 0.0
+    bucket = bucket_for(gh_argv)
+    if marker.get("bucket") != bucket:
+        return 0.0
+    age = marker_age(marker)
+    if age is None or age < 0 or age > MARKER_MAX_AGE:
+        if age is not None and age >= 0:
+            log_event("marker-gate: IGNORED a %s marker aged %ds (> %ds) — an old record is not a state"
+                      % (bucket, age, int(MARKER_MAX_AGE)))
+        return 0.0
+    kind, until = marker_window(marker)
+    if until <= now:
+        # ⛔ REQUIREMENT 5: the marker is older than the window it recorded. This is the measured
+        # stale shape — `attempts=1 waited=0` with a reset ~43 min ahead — and it must not block.
+        log_event("marker-gate: IGNORED a %s marker whose window ended %ds ago (kind=%s age=%ds)"
+                  % (bucket, int(now - until), kind, age))
+        return 0.0
+    wait = float(until - now)
+    remaining = as_int(marker.get("remaining"))
+    if wait > GATE_REVALIDATE_S:
+        # ⛔ REQUIREMENT 3: one REST `rate_limit` read is UNMETERED, so a long wait is worth checking
+        # before it is paid. A bucket that reports headroom contradicts the marker: the refusal was
+        # secondary, or the window has moved on — either way the marker must stop blocking.
+        p_remaining, p_reset = probe_rate_limit(real_gh, bucket)
+        if p_remaining is not None:
+            remaining = p_remaining
+        if p_remaining is not None and p_remaining > 0 and kind != "retry-after":
+            # ⛔ EXCEPT FOR `retry-after`. That window is the SERVER'S own instruction, and headroom on
+            # the primary counter does not contradict it — GitHub's own docs say secondary limits strike
+            # while the primary counter looks healthy, which is exactly why `plan_wait` honours the
+            # header verbatim and `probe_rate_limit` documents its `remaining` as untrusted for health.
+            # Clearing a 300 s cool-down on `remaining > 0` put every later client on the box back
+            # inside a cool-down this layer was still obeying — the same failure the recorded window
+            # itself was fixed for.
+            # ⛔ THE LINE MUST DESCRIBE WHAT ACTUALLY HAPPENED. `mark_marker_stale` refuses to annotate a
+            # record that was REPLACED between this gate's read and its write (another client's refusal,
+            # possibly a real primary window that must hold). Logging "cleared it" then would put two
+            # contradictory decisions in `events.log` and claim to have cleared a record that is still
+            # blocking the next client.
+            if mark_marker_stale(p_remaining, "remaining-gt-0", expect=marker):
+                log_event("marker-gate: STALE %s marker (kind=%s age=%ds) — revalidation read remaining=%d > 0, "
+                          "cleared it and proceeding instead of waiting %ds"
+                          % (bucket, kind, age, p_remaining, int(wait)))
+            else:
+                log_event("marker-gate: %s marker (kind=%s age=%ds) contradicted by revalidation (remaining=%d > 0) "
+                          "but NOT annotated — it was replaced under me; proceeding, the new record stands for the "
+                          "next client"
+                          % (bucket, kind, age, p_remaining))
+            return 0.0
+        log_event("marker-gate: revalidated %s (kind=%s age=%ds remaining=%s) — the wait stands"
+                  % (bucket, kind, age, "%d" % p_remaining if p_remaining is not None else "?"))
+    if wait > MAX_WAIT:
+        # ⛔ THE IN-CALL BOUND APPLIES TO THE GATE TOO. Sleeping the cap and then SENDING anyway is
+        # the worst of both: the caller pays the full bound and the request is one the marker says is
+        # doomed. The gate declines, the attempt is made (it is now the cheaper evidence), and the
+        # normal refusal path fails fast in `plan_wait`-time so the caller's own deferral takes over.
+        log_event("marker-gate: a %s marker's window is %ds away (kind=%s age=%ds remaining=%s) — beyond "
+                  "the %ds in-call bound, so NOT holding the call for it"
+                  % (bucket, int(wait), kind, age,
+                     "%d" % remaining if remaining is not None else "?", int(MAX_WAIT)))
+        return 0.0
+    # ⛔ THE LINE STATES ITS OWN EVIDENCE (requirement 4): classification, marker AGE, the remaining
+    # count read, and the attempt number. A refusal that cannot say how old its evidence is reads the
+    # same as a live one.
+    log_event("marker-gate: waiting %ds on a %s marker — evidence: kind=%s marker_age=%ds remaining=%s "
+              "attempt=preflight"
+              % (int(wait), bucket, kind, age, "%d" % remaining if remaining is not None else "?"))
+    pause(wait)
+    return wait
 
 
 # ── argv shape ─────────────────────────────────────────────────────────────────────────────────
@@ -868,8 +1275,14 @@ PASS_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_PASS_CACHE_MAX_BYTES", 64 * 1024 * 1024
 
 def pass_cache_enabled():
     """Is the feature on at all? Read-only — no directory work, because this is asked once per
-    invocation on a path that also handles `gh auth token`."""
-    return bool(cfg(PASS_CACHE_ENV, ""))
+    invocation on a path that also handles `gh auth token`.
+
+    ⛔ `0` IS OFF. The value is a DIRECTORY, so this used to be `bool(value)` — which made the
+    documented disable (`GH_LIMIT_PASS_CACHE=0`) ENABLE the cache and create a directory literally
+    named `0` in the caller's CWD. A switch that does the opposite of what it says is worse than no
+    switch: an operator who turned the cache off kept writing to disk."""
+    raw = cfg(PASS_CACHE_ENV, "").strip()
+    return bool(raw) and raw != "0"
 
 
 def pass_cache_dir():
@@ -877,7 +1290,7 @@ def pass_cache_dir():
     that only exports the name still gets a working cache; ANY inability to use it is returned as
     None (a broken cache must never break the call)."""
     d = cfg(PASS_CACHE_ENV, "")
-    if not d:
+    if not d or d.strip() == "0":
         return None
     try:
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -2309,6 +2722,11 @@ def conditional_fetch(real_gh, plan):
 
 # ── rate-limit classification and the documented backoff ──────────────────────────────────────
 LIMIT_PHRASES = ("rate limit", "rate-limit", "abuse detection", "secondary rate")
+# GitHub's own vocabulary for the SECONDARY (burst/concurrency) limit. `already exceeded for user ID`
+# is the measured wording the fleet receives when the primary budget is healthy (#1762/#1910), so it
+# is the strongest available signal that the refusal is not about the point budget.
+SECONDARY_PHRASES = ("abuse detection", "secondary rate", "already exceeded for user id",
+                     "exceeded a secondary")
 
 
 class Limit(object):
@@ -2512,9 +2930,36 @@ def classify(res, argv, headers):
     return None
 
 
-def plan_wait(limit, attempt, real_gh, now):
+def limit_kind(limit):
+    """What KIND of refusal this is. Drives both the wait and the evidence recorded for it.
+
+    ⛔ `unclassified` IS A REAL CLASS, NOT A FALLBACK. A refusal whose HTTP status could not be parsed
+    (GraphQL reports it in prose alone) and whose text names no secondary vocabulary used to fall
+    through to "no usable header" — where the only number available was a bucket reset, which for a
+    secondary refusal is not a recovery time. `unclassified` is therefore treated like a secondary
+    limit (>= 1 minute, jittered, doubling) and NEVER adopts a reset as its wait."""
+    if limit.retry_after is not None:
+        return "retry-after"
+    low = (limit.message or "").lower()
+    if any(p in low for p in SECONDARY_PHRASES):
+        return "secondary"
+    if limit.status is None:
+        return "unclassified"
+    if limit.remaining == 0:
+        return "primary"
+    return "unclassified"
+
+
+def plan_wait(limit, attempt, real_gh, now, kind=None):
     """The documented order, and nothing invented: retry-after, then the bucket's reset when the
-    bucket is empty, then >= BASE_WAIT doubling. Returns (seconds, reset_epoch, why)."""
+    bucket is empty, then >= BASE_WAIT doubling. Returns (seconds, reset_epoch, why, remaining).
+
+    ⛔ THE RESET IS HONOURED FOR A PRIMARY REFUSAL ONLY (agent-infra#2137, requirement 2). GitHub
+    documents that the primary counter does NOT predict a secondary limit — measured, graphql
+    ~4573/5000 while every call was refused — so a reset read beside a secondary/unclassified refusal
+    is not a recovery time. Adopting it produced the full-window block this change removes."""
+    if kind is None:
+        kind = limit_kind(limit)
     if limit.retry_after is not None and limit.retry_after >= 0:
         # ⛔ A `retry-after: 0` IS NOT PERMISSION TO RETRY AT ONCE. Taken verbatim it produced four
         # back-to-back requests with zero seconds waited — the burst secondary limits react to, and
@@ -2522,8 +2967,8 @@ def plan_wait(limit, attempt, real_gh, now):
         # attempt cap still bounds the total.
         if limit.retry_after < 1:
             log_event("retry-after=%ds is below the 1s floor — waiting 1s" % limit.retry_after)
-            return 1.0, limit.reset, "retry-after-floor"
-        return float(limit.retry_after), limit.reset, "retry-after"
+            return 1.0, limit.reset, "retry-after-floor", limit.remaining
+        return float(limit.retry_after), limit.reset, "retry-after", limit.remaining
     remaining, reset = limit.remaining, limit.reset
     if remaining is None or reset is None:
         # No usable header: ask the exempt endpoint for THIS bucket's reset (the refused call did
@@ -2532,15 +2977,16 @@ def plan_wait(limit, attempt, real_gh, now):
         p_remaining, p_reset = probe_rate_limit(real_gh, limit.bucket)
         remaining = p_remaining if remaining is None else remaining
         reset = p_reset if reset is None else reset
-    if remaining == 0 and reset and reset > now:
-        return float(reset - now) + 1.0, reset, "reset"
+    if kind == "primary" and remaining == 0 and reset and reset > now:
+        return float(reset - now) + 1.0, reset, "reset", remaining
     # Exponential, JITTERED UPWARDS only, so the floor the docs state (>= 1 minute) is never
-    # breached by jitter: 60, 120, 240 …
+    # breached by jitter: 60, 120, 240 … A secondary/unclassified refusal lands here, with the reset
+    # recorded as EVIDENCE (the bucket's own number) but never as this call's wait.
     base = BASE_WAIT * (2 ** (attempt - 1))
-    return base * (1.0 + random.random() * 0.2), reset, "backoff"
+    return base * (1.0 + random.random() * 0.2), reset, "backoff", remaining
 
 
-def fail_loudly(limit, attempts, waited, reset):
+def fail_loudly(limit, attempts, waited, reset, kind=None, remaining=None, marker_age_s=None):
     # ⛔ THE WORDS MATTER: the harness's own classifiers look for "rate limit" (objective.py's
     # TRANSPORT_MARKERS) to turn a refused read into `VERDICT=GH-RATE-LIMITED` instead of
     # `UNKNOWN`/`STALL`. "rate_limited" does not contain it, so the token would be lost at exactly the
@@ -2567,10 +3013,16 @@ def fail_loudly(limit, attempts, waited, reset):
             named = "%s — " % record_core_exhausted(None, None)
         else:
             named = "gh-secondary-rate-limited remaining=%d — " % rem
+    # ⛔ AND THE LINE CARRIES ITS OWN EVIDENCE (agent-infra#2137, requirement 4): the classification
+    # used, the marker's AGE, the remaining count read, and the attempt number. Without the age a
+    # refusal built on a 40-minute-old record is indistinguishable from one that just happened, so an
+    # operator cannot tell whether to wait or to fix something else.
     sys.stderr.write(
-        "gh-limit: %sgh rate limit (bucket=%s reset=%s) — FAILED after %d attempt(s), %ds waited. "
-        "This is a REFUSED call, not an empty answer%s\n"
-        % (named, limit.bucket, reset if reset else "?", attempts, int(waited),
+        "gh-limit: %sgh rate limit (bucket=%s reset=%s kind=%s) — FAILED after %d attempt(s), %ds waited. "
+        "evidence: remaining=%s marker_age=%s. This is a REFUSED call, not an empty answer%s\n"
+        % (named, limit.bucket, reset if reset else "?", kind or limit_kind(limit), attempts, int(waited),
+           ("%d" % remaining) if remaining is not None else "?",
+           ("%ds" % marker_age_s) if marker_age_s is not None else "none",
            (" (%s)" % limit.message) if limit.message else ""))
 
 
@@ -3777,6 +4229,15 @@ def _dispatch(real_gh, gh_argv):
     attempt = 0
     waited = 0.0
     mutating = is_mutating(gh_argv)
+    # ⛔ THE ACCOUNT VIEW COMES FIRST (#2137). If this BOX's record says the bucket is inside a
+    # window, every client on the box waits it out: that is what makes one box's observation useful
+    # to its peers instead of each client spending four attempts to rediscover the same refusal. The
+    # gate is bounded (see marker_gate), so a bad record cannot park the box — that failure is the
+    # reason this whole change exists.
+    # ⛔ AND ITS WAIT COUNTS. `waited` is what the refusal line reports as the time this call spent;
+    # dropping a 60-300 s gate pause from it made that evidence wrong by exactly the window it claims
+    # to have honoured (measured: 499 s of waits reported as 439 s).
+    waited += marker_gate(gh_argv, real_gh, clock())
     if mutating:
         # The bulk of the mutation gap is waited OUTSIDE the lock (a 1 s pause under the box lock
         # would park every unrelated gh call); the remainder is re-checked inside it, immediately
@@ -3785,6 +4246,12 @@ def _dispatch(real_gh, gh_argv):
         if w > 0:
             log_event("pacing mutation: waiting %.2fs (>= %.1fs between mutative calls)" % (w, MUTATION_GAP))
             pause(w)
+    bucket = bucket_for(gh_argv)
+    # A call that makes no request cannot spend the ACCOUNT's budget (`gh auth token` is an offline
+    # keyring read the harness runs every refresh; `--version`/`help` are local). Counting them would
+    # pace local commands against a network budget.
+    counts_budget = makes_request(gh_argv)
+    res = None
     # ⛔ BUDGET FIRST, TRANSPORT SECOND — AND THE BUDGET READ IS FREE. `core_pressure` touches two
     # local files (a snapshot someone already paid for, and the durable refusal record) and makes NO
     # request, so this decision costs nothing on the hot path. It is also why a box does not need to
@@ -3811,8 +4278,8 @@ def _dispatch(real_gh, gh_argv):
     # over-block this accepts: on a box with no REST adapter a GraphQL-native merge could have
     # succeeded during a core-empty window — refused, visible, and re-runnable; the alternative is the
     # burst this layer exists to prevent.)
-    _bucket = bucket_for(gh_argv)
-    if reaches_api(gh_argv) and (_bucket == "core" or (mutating and _bucket == "graphql")):
+    bucket = bucket_for(gh_argv)
+    if reaches_api(gh_argv) and (bucket == "core" or (mutating and bucket == "graphql")):
         # ⛔ MEASURE THE POOL BEFORE DECIDING ON IT (#2342 review P1). The floor can only act on a
         # MEASURED `remaining`, and the only non-zero source of one is `budget.json` — whose only
         # writer WAS the `--budget` verb, which NO harness script calls, plus the refusal path's own
@@ -3923,6 +4390,53 @@ def _dispatch(real_gh, gh_argv):
                 # remaining UNKNOWN (an undated record — no measurement, so no floor claim), or the
                 # caller declared this read essential: it can still succeed, so it is sent.
     while True:
+        # ⛔ THE PARTITION IS TAKEN IMMEDIATELY BEFORE THE SEND (requirement 1): the slot is a
+        # REQUEST, so a retry spends another one, and NO_WAIT callers proceed over the partition with
+        # the overdraw recorded rather than dying in a queue they cannot afford. ONE pause at most: a
+        # second full window means a peer (or a clock jump) took the slot, and waiting again would
+        # multiply the layer's in-call bound by the attempt count.
+        if counts_budget:
+            bwait = budget_gate(bucket, clock())
+            if bwait > 0:
+                if bwait > MAX_WAIT:
+                    share = account_share()
+                    record_budget(bucket, bwait, share)
+                    sys.stderr.write(
+                        "gh-limit: this box's share of the ACCOUNT's %s budget is exhausted (fleet=%d,"
+                        " %d per %ds) and the next slot is %ds away — beyond the %ds in-call bound, so"
+                        " refusing now rather than holding the call\n"
+                        % (bucket, share["fleet"], share["per_window"], share["window"], int(bwait),
+                           int(MAX_WAIT)))
+                    log_event("account budget: %s next slot %ds away (> %ds bound) — failing fast"
+                              % (bucket, int(bwait), int(MAX_WAIT)))
+                    # ⛔ NEVER SUBTRACT WHAT THE CHILD PRINTED. This branch is reachable on a RETRY, so
+                    # a previous attempt's stdout/stderr may be the only evidence the caller has; the
+                    # local refusal must ADD its reason, not replace the child's answer.
+                    if res is not None:
+                        if res.out:
+                            sys.stdout.buffer.write(res.out)
+                        if res.err:
+                            sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
+                    # ⛔ AND THE CALLER READS THE VERDICT FROM THE EXIT CODE. 75 (EX_TEMPFAIL) is the
+                    # layer's "refused LOCALLY, retry later" signal — the same one the give-up path uses
+                    # — so a caller that only inspects stderr cannot mistake a partition refusal for a
+                    # success. Nothing was sent, and the rejection is what makes the partition real.
+                    return 75
+                log_event("account budget: %s at this box's share — waiting %ds before attempt %d"
+                          % (bucket, int(bwait), attempt + 1))
+                w0 = bwait
+                pause(bwait)
+                waited += w0
+                bwait = budget_gate(bucket, clock())
+                if bwait > 0:
+                    # ⛔ NEVER FALL THROUGH SILENTLY. Sending with no slot and no line is exactly the
+                    # invisible over-partition burst this change exists to remove; the send happens
+                    # (the caller has already waited its bounded share) and the overdraw is recorded.
+                    # The line names the time actually WAITED (`w0`), not the time still remaining,
+                    # and it is bounded to once per window so it cannot flood `events.log`.
+                    if _overdraw_once(bucket, clock(), account_share()["window"]):
+                        log_event("account budget: %s still at its share after waiting %ds — proceeding "
+                                  "OVER the partition (recorded, not silent)" % (bucket, int(w0)))
         attempt += 1
         lock = acquire_lock()
         try:
@@ -3990,7 +4504,13 @@ def _dispatch(real_gh, gh_argv):
             # and `repo-authority.sh` goes silent. `core_reset` was captured before any of that.
             limit = classify(res, gh_argv, headers)
             if limit is not None:
-                record_limit("graphql", limit.reset, attempt, 0.0, limit.status, limit.remaining)
+                # ⛔ THE CLASSIFICATION DECIDES THE WINDOW HERE TOO (#2137). Passing the remaining
+                # count in the old positional slot would have written a GraphQL `kind=` of "remaining=3200",
+                # and recording the bucket reset as the window is the full-window block that #2137
+                # exists to remove.
+                _fo_kind = limit_kind(limit)
+                record_limit("graphql", limit.reset, attempt, 0.0, limit.status, _fo_kind,
+                             marker_until(_fo_kind, limit.reset, None, clock()), limit.remaining)
             # ⛔ THE BAND IS NOT EXHAUSTION, ON THIS PATH TOO. `core_empty` is false when the pool still
             # had headroom (the read was moved to GraphQL to PRESERVE that headroom): writing
             # `gh-core-exhausted … remaining=0` here made `health_reset()` report pressure, so every
@@ -4028,13 +4548,20 @@ def _dispatch(real_gh, gh_argv):
                 sys.stderr.buffer.write(res.err)
             return res.rc
         now = clock()
+        kind = limit_kind(limit)
         if _speculative_read and attempt >= 1:
-            # the ONE bet was made and did not pay off (no 304): refuse by name, do not retry
+            # The ONE speculative conditional GET was made and did not pay off (no 304):
+            # refuse by name, do not retry into the pool.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
-            log_event("GAVE UP (speculative conditional read) bucket=%s status=%s attempts=%d"
-                      % (limit.bucket, limit.status, attempt))
-            fail_loudly(limit, attempt, waited, reset)
+            # The age names the evidence that was used (see the give-up arm below).
+            prior = read_marker() if limit.reset is None else None
+            page = marker_age(prior) if prior and prior.get("bucket") == limit.bucket else 0
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                         record_window(limit, kind, reset, None, now), limit.remaining)
+            log_event("GAVE UP (speculative conditional read) bucket=%s status=%s kind=%s attempts=%d remaining=%s marker_age=%ds"
+                      % (limit.bucket, limit.status, kind, attempt,
+                         "%d" % limit.remaining if limit.remaining is not None else "?", page))
+            fail_loudly(limit, attempt, waited, reset, kind, limit.remaining, page)
             if res.out:
                 sys.stdout.buffer.write(res.out)
             if res.err:
@@ -4045,10 +4572,18 @@ def _dispatch(real_gh, gh_argv):
             # (the probe) — and this is the attempt that is about to fail, on a box that is already
             # refusing calls. `limit.reset` is what the refused response itself carried.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
-            log_event("GAVE UP bucket=%s status=%s attempts=%d waited=%ds reset=%s"
-                      % (limit.bucket, limit.status, attempt, int(waited), reset))
-            fail_loudly(limit, attempt, waited, reset)
+            # ⛔ THE AGE NAMES THE EVIDENCE THAT WAS USED. If this response carried its own reset, the
+            # evidence is the refusal in hand (age 0). Only when the reset was BORROWED from an earlier
+            # record does that record's age describe this line — and reporting a 40-minute-old marker
+            # as the basis of a live refusal is precisely the reading `fail_loudly` must not create.
+            prior = read_marker() if limit.reset is None else None
+            page = marker_age(prior) if prior and prior.get("bucket") == limit.bucket else 0
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                         record_window(limit, kind, reset, None, now), limit.remaining)
+            log_event("GAVE UP bucket=%s status=%s kind=%s attempts=%d waited=%ds reset=%s remaining=%s marker_age=%ds"
+                      % (limit.bucket, limit.status, kind, attempt, int(waited), reset,
+                         "%d" % limit.remaining if limit.remaining is not None else "?", page))
+            fail_loudly(limit, attempt, waited, reset, kind, limit.remaining, page)
             # The failed attempt's own words still reach the caller, AFTER the announcement that
             # names the bucket and the reset — never instead of it. BOTH streams: the "never
             # subtract what the child printed" rule is unconditional (review round 8).
@@ -4064,21 +4599,32 @@ def _dispatch(real_gh, gh_argv):
             # skipped too — it may spend a `/rate_limit` probe, and this caller is not going to wait
             # for the answer anyway.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
-            log_event("rate_limited bucket=%s status=%s attempt=%d reset=%s — NO_WAIT, returning at once"
-                      % (limit.bucket, limit.status, attempt, reset))
-            fail_loudly(limit, attempt, waited, reset)
+            prior = read_marker() if limit.reset is None else None
+            page = marker_age(prior) if prior and prior.get("bucket") == limit.bucket else 0
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                         record_window(limit, kind, reset, None, now), limit.remaining)
+            log_event("rate_limited bucket=%s status=%s kind=%s attempt=%d reset=%s remaining=%s — NO_WAIT, returning at once (evidence_age=%ds)"
+                      % (limit.bucket, limit.status, kind, attempt, reset,
+                         "%d" % limit.remaining if limit.remaining is not None else "?", page))
+            fail_loudly(limit, attempt, waited, reset, kind, limit.remaining, page)
             if res.out:
                 sys.stdout.buffer.write(res.out)
             if res.err:
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
-        wait, reset, why = plan_wait(limit, attempt, real_gh, now)
-        record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
+        wait, reset, why, remaining = plan_wait(limit, attempt, real_gh, now, kind)
+        # ⛔THE WINDOW IS WRITTEN FROM THE CLASSIFICATION, NOT FROM THE RESET (requirement 2/5). An
+        # unclassified/secondary observation blocks its peers for at most the documented floor; only a
+        # PRIMARY exhaustion may claim the bucket's reset as its window.
+        record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                     marker_until(kind, reset, wait, now), remaining)
         if wait > MAX_WAIT:
-            log_event("reset beyond the in-call bound bucket=%s wait=%ds reset=%s — failing fast"
-                      % (limit.bucket, int(wait), reset))
-            fail_loudly(limit, attempt, waited, reset)
+            log_event("reset beyond the in-call bound bucket=%s wait=%ds reset=%s kind=%s attempt=%d "
+                      "remaining=%s evidence_age=0s — failing fast"
+                      % (limit.bucket, int(wait), reset, kind, attempt,
+                         "%d" % remaining if remaining is not None else "?"))
+            # The wait is `reset`-derived here, so the evidence age is this response's own (0).
+            fail_loudly(limit, attempt, waited, reset, kind, remaining, 0)
             if res.out:
                 sys.stdout.buffer.write(res.out)
             sys.stderr.write("gh-limit: the next wait is %ds away (%s), beyond the %ds in-call bound — "
@@ -4087,8 +4633,9 @@ def _dispatch(real_gh, gh_argv):
             if res.err:
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
-        log_event("rate_limited bucket=%s status=%s attempt=%d/%d reset=%s why=%s waiting=%ds"
-                  % (limit.bucket, limit.status, attempt, MAX_ATTEMPTS, reset, why, int(wait)))
+        log_event("rate_limited bucket=%s status=%s kind=%s attempt=%d/%d reset=%s why=%s remaining=%s evidence_age=0s waiting=%ds"
+                  % (limit.bucket, limit.status, kind, attempt, MAX_ATTEMPTS, reset, why,
+                     "%d" % remaining if remaining is not None else "?", int(wait)))
         # NOT under the lock: see the docstring. The wait is what the docs demand; the lock is only
         # about overlap.
         pause(wait)
