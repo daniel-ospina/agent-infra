@@ -46,14 +46,24 @@
 #       tree — clean, merged, aged, no open PR — was reaped under the running lane. §3 runs the
 #       SHIPPED reaper twice over two trees that differ ONLY in that holder.
 #
+#   §4  THE RESEARCH CONTRACT A BRIEF CARRIES IS THE ONE THE GATE WILL ADJUDICATE — and the pass
+#       names the copy that rendered it.
+#       Failure it prevents (measured 2026-10-27, TWICE in one day): a stale `$O/brief-gate.sh`
+#       rendered a pre-#2258 contract and the SAME stale copy validated it, so `pr-doctor` refused
+#       every order rc=80 for ~9 h with nothing refusing and nothing logged; and the fix for a stale
+#       sibling reached the farm while the driver kept resolving the stale copy first, invisibly,
+#       because no pass said which copy it used. The old acceptance test was a PRESENCE test
+#       (`rc == 0 and stdout.strip()`), which an inert copy satisfies perfectly.
+#
 # NON-VACUITY
-#   §2 and §3 are pairs with opposite verdicts on one-byte-different inputs (the issue's own
-#   requirement). '--mutations' additionally plants a defect into a TEMP COPY of each of the two
-#   shipped files it names below (§1's pr-loop.py and §2's repo-authority.sh) and requires the arm
-#   to go RED; a mutation that leaves the suite green is reported as a FAILURE, because it means the
-#   assertion is not load-bearing. ⚠️ §3 has NO mutation arm, and says so: its non-vacuity is the
-#   opposite-verdict pair in ONE pass (the held tree preserved, its identical twin removed), because
-#   executing a mutated copy of the reaper is refused by the harness's own script-content gate.
+#   §2, §3 and §4 are pairs with opposite verdicts on one-byte-different inputs (the issue's own
+#   requirement). '--mutations' additionally plants a defect into a TEMP COPY of each of the three
+#   shipped files it names below (§1's pr-loop.py, §2's repo-authority.sh, §4's pr-doctor.py) and
+#   requires the arm to go RED; a mutation that leaves the suite green is reported as a FAILURE,
+#   because it means the assertion is not load-bearing. ⚠️ §3 has NO mutation arm, and says so: its
+#   non-vacuity is the opposite-verdict pair in ONE pass (the held tree preserved, its identical twin
+#   removed), because executing a mutated copy of the reaper is refused by the harness's own
+#   script-content gate.
 #
 # HERMETIC: temp git fixtures, a stub 'gh' (STUB_GH_*) and a stub 'lsof' on a private PATH, no
 # network, no real state (own HOME + GIT_CONFIG_GLOBAL + GIT_CONFIG_NOSYSTEM). ⚠️ 'ps' is the REAL
@@ -353,8 +363,16 @@ REAP_LOG="$WORK/reap.log"
 # ⛔ THE SCRIPT PATH IS LITERAL (#709's script-content gate): a reaper invoked through a variable
 # path is a script the guard cannot statically read, and it fails closed — correctly, since an
 # unreadable script could discard any checkout.
+# ⛔ `REAP_WT_MIN_AGE_MINUTES=0` IS LOAD-BEARING AND WAS MISSING (#2708, measured 2026-10-28). Rule 7
+# — "nothing younger than REAP_WT_MIN_AGE_MINUTES (45) is removable", added by #2756 — reads the
+# WORKTREE's ctime, and both fixture trees are created seconds before the pass. So both were
+# `preserve reason=too-young`, the "twin is removed" arm was red on main, and the suite that exists to
+# prove this gate DISCRIMINATES could not discriminate at all: it had been left behind by a change to
+# the capability it grades. The floor is exactly the kind of default a fixture must pin, like the age
+# floors it already pinned two lines up.
 ( cd "$ROOT" && REAP_WT_STATE_DIR="$WORK/reap-state" REAP_WT_AGED_DAYS=0 \
-    REAP_WT_MERGED_AGE_DAYS=0 PS_BIN=/bin/ps LSOF_BIN="$STUB_LSOF" GH_BIN="$STUB/gh" \
+    REAP_WT_MERGED_AGE_DAYS=0 REAP_WT_MIN_AGE_MINUTES=0 \
+    PS_BIN=/bin/ps LSOF_BIN="$STUB_LSOF" GH_BIN="$STUB/gh" \
     bash scripts/pi-reap-worktrees.sh --apply --repo "$FIXTURE" ) >"$REAP_LOG" 2>&1
 reap_rc=$?
 REAP_TAIL="$(tail -c 700 "$REAP_LOG")"
@@ -379,6 +397,152 @@ if [ ! -d "$FIXTURE/.worktrees/wt-dead" ]; then
     ok "§3 …and the removed checkout is GONE from disk"
 else
     bad "§3 the reaper reported a removal but the directory is still on disk"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# §4 — THE RESEARCH CONTRACT A BRIEF CARRIES IS THE ONE THE GATE WILL ADJUDICATE
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# THE MEASURED DEFECT (agent-infra#2708, 2026-10-27, twice in one day):
+#
+#   • `pr-doctor` refused EVERY order `rc=80` for ~9 h because the deployed `$O/brief-gate.sh` was a
+#     stale copy — and the SAME stale copy validated the contract it rendered, so both halves agreed,
+#     nothing refused, nothing logged, and 18-25 PRs sat unmoving.
+#   • the fix for a stale sibling reached `~/.pi/agent/scripts/` and never reached the copy the driver
+#     resolves FIRST, because no pass said WHICH copy had rendered the contract.
+#
+# The old acceptance predicate was a PRESENCE test — `rc == 0 and stdout.strip()`, i.e. "some copy
+# answered with some text" — and that is satisfiable by an inert capability. §4 asserts the EFFECT
+# instead: the brief the shipped `brief()` writes must be ADMITTED by the gate that will judge it, and
+# the pass must NAME the copy that rendered it. The probe drives the SHIPPED file (it renders text and
+# never dispatches), and the `$O` it sees is a fixture, never the box's.
+PINNED_GATE="$ROOT/scripts/orchestrator-harness/brief-gate.sh"
+PROBE_BRIEF="$HERE/probe_brief_contract.py"
+if [ -f "$PINNED_GATE" ] && [ -f "$PROBE_BRIEF" ]; then
+    ok "§4 precondition: the pinned validator and the probe are present"
+else
+    bad "§4 precondition: missing $PINNED_GATE or $PROBE_BRIEF — nothing below would test a capability"
+fi
+
+# The fixture is the measured SHAPE, not an invented one: `$O` holds the copy the dispatchers resolve
+# FIRST, and the farm (`$HOME/.pi/agent/scripts`) holds the copy a fix reaches. The suite's HOME is
+# already private, so the farm here is a fixture too.
+FARM="$HOME/.pi/agent/scripts"
+mkdir -p "$FARM"
+cp "$PINNED_GATE" "$FARM/brief-gate.sh"
+ORCH="$WORK/orch"
+mkdir -p "$ORCH"
+
+# ── the STALE copy: a PRE-#2258 gate in miniature. It renders a contract with INTERNAL/EXTERNAL/RUNG
+# and NO `CONTRADICTION TEST:` line, and its own `--check` ADMITS that contract — which is exactly why
+# a box holding only this copy shipped a nine-hour-stale contract silently. The mode selects the
+# contract it insists on: "old" = the stale copy itself, "new" = the mutant's lenient reviewer.
+stale_gate() { # <dir> <old|new>
+    local d="$1" mode="$2"
+    mkdir -p "$d"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -u' 'case "${1:-}" in' '  --section)'
+        printf '%s\n' "    printf '## RESEARCH FIRST — pre-#2258 shape\\n\\nSTALE-CONTRACT-MARKER: this copy predates the contradiction test.\\n\\nINTERNAL: what the tracker already holds\\nEXTERNAL: what is looked up outside it\\nRUNG: 2 — web_search sonar\\n' ;;"
+        printf '%s\n' '  --check)'
+        printf '%s\n' '    f="${2:--}"'
+        # ⛔ STDIN IS READ ONCE. The first draft grepped /dev/stdin four times; the second read is at
+        # EOF, so the stale copy refused its OWN section and every arm below was unexercisable.
+        printf '%s\n' '    if [ "$f" = "-" ]; then f="$(mktemp)"; cat >"$f"; fi'
+        if [ "$mode" = "new" ]; then
+            printf '%s\n' "    if grep -qi 'RESEARCH FIRST' \"\$f\"; then exit 0; fi"
+        else
+            printf '%s\n' "    if grep -qi 'RESEARCH FIRST' \"\$f\" && grep -qi '^INTERNAL:' \"\$f\" && grep -qi '^EXTERNAL:' \"\$f\" && grep -qi '^RUNG:' \"\$f\"; then exit 0; fi"
+        fi
+        printf '%s\n' '    exit 80 ;;' '  *) exit 78 ;;' 'esac'
+    } >"$d/brief-gate.sh"
+    chmod +x "$d/brief-gate.sh"
+}
+stale_gate "$ORCH" old
+
+# ── PRECONDITION, asserted before it is relied on (#1113 shape): the two copies must DISAGREE about
+# the same contract, or every arm below tests a fixture that cannot tell them apart.
+printf '## RESEARCH FIRST\n\nINTERNAL: x\nEXTERNAL: y\nRUNG: 2 — web_search sonar\n\n## the order\n\nDo it.\n' \
+    >"$WORK/no-ct.txt"
+if bash "$ORCH/brief-gate.sh" --check "$WORK/no-ct.txt" >/dev/null 2>&1; then
+    ok "§4 precondition: the STALE copy ADMITS a contract with no CONTRADICTION TEST (the defect's shape)"
+else
+    bad "§4 precondition: the stale fixture refused the old contract, so it is not a stale copy — the arms below would pass vacuously"
+fi
+if bash "$PINNED_GATE" --check "$WORK/no-ct.txt" >/dev/null 2>&1; then
+    bad "§4 precondition: the PINNED gate admits a contract with no CONTRADICTION TEST — the shipped contract is not enforced and this arm asserts nothing"
+else
+    ok "§4 precondition: the PINNED gate REFUSES that same contract (the pair is one field apart)"
+fi
+
+brief_probe() { # <pr-doctor.py> <orch-dir> -> the probe's stdout
+    # ⛔ `AGENT_INFRA_PATH` and `O` are UNSET: either would splice the BOX's installed copies into the
+    # ladder, and the arm would then depend on what this machine has installed, not on the capability.
+    env -u AGENT_INFRA_PATH -u O HOME="$HOME" python3 "$PROBE_BRIEF" "$1" "$2" 1 2>/dev/null
+}
+gate_admits() { bash "$PINNED_GATE" --check "$1" lane >/dev/null 2>&1; }
+brief_of() { printf '%s' "$1" | sed -n '/^---BRIEF---$/,/^---LOG---$/p' | sed '1d;$d' >"$2"; }
+log_of()   { printf '%s' "$1" | sed -n '/^---LOG---$/,$p' | sed '1d'; }
+
+# ── ARM 1: a STALE `$O` copy must not be spliced into every brief ────────────────────────────
+out_stale="$(brief_probe "$ROOT/scripts/pr-doctor.py" "$ORCH")"
+brief_of "$out_stale" "$WORK/brief-stale.txt"
+if [ -s "$WORK/brief-stale.txt" ] && gate_admits "$WORK/brief-stale.txt"; then
+    ok "§4 a brief written while the DEPLOYED copy is stale is still ADMITTED by the gate that judges it"
+else
+    bad "§4 the brief a pass would write carries a contract the pinned gate REFUSES — every order would be refused rc=80 downstream, the measured nine-hour stall (log: $(log_of "$out_stale" | tr '\n' ' ' | head -c 300))"
+fi
+if grep -q 'STALE-CONTRACT-MARKER' "$WORK/brief-stale.txt"; then
+    bad "§4 …and the STALE deployed copy rendered it (its marker reached the brief) — the presence test this arm replaces"
+else
+    ok "§4 …and the stale copy did NOT render it (its marker is absent from the brief)"
+fi
+
+# ── ARM 2: the pass must NAME the copy that rendered the contract (case 3: a fix that reached the
+# wrong copy was invisible precisely because no pass said which one it used).
+if log_of "$out_stale" | grep -q 'research contract rendered by '; then
+    ok "§4 …and the pass NAMES the copy: $(log_of "$out_stale" | grep -m1 'rendered by ' | head -c 220)"
+else
+    bad "§4 the pass did not record which brief-gate.sh copy rendered the contract — a fix deployed to the wrong copy stays invisible (log: $(log_of "$out_stale" | tr '\n' ' ' | head -c 300))"
+fi
+
+# ── ARM 3 (the opposite verdict, one copy apart): a HEALTHY deployed copy IS honoured, and named.
+# Without this half, a `research_section()` that ignored `$O` entirely would pass ARM 1.
+cp "$PINNED_GATE" "$ORCH/brief-gate.sh"
+out_ok="$(brief_probe "$ROOT/scripts/pr-doctor.py" "$ORCH")"
+brief_of "$out_ok" "$WORK/brief-ok.txt"
+if [ -s "$WORK/brief-ok.txt" ] && gate_admits "$WORK/brief-ok.txt"; then
+    ok "§4 a healthy deployed copy yields a brief the pinned gate ADMITS"
+else
+    bad "§4 a healthy deployed copy produced a brief the pinned gate REFUSES"
+fi
+if log_of "$out_ok" | grep -q "rendered by $ORCH/brief-gate.sh"; then
+    ok "§4 …and it is the DEPLOYED copy that rendered it (the ladder is honoured, not bypassed)"
+else
+    bad "§4 the deployed copy was not used even though it is healthy and first on the ladder (log: $(log_of "$out_ok" | tr '\n' ' ' | head -c 300))"
+fi
+
+# ── --mutations: plant the PRE-FIX acceptance back in and require the suite to go RED ───────
+# The mutation is the capability going inert the way it ACTUALLY went inert: the acceptance predicate
+# is restored to the presence test (here: unconditional), so the stale copy's section is spliced and
+# the gate that will judge the brief refuses it. If this mutant still passed, ARM 1 would be asserting
+# the fixture rather than the capability.
+if [ "$MUTATIONS" -eq 1 ]; then
+    stale_gate "$ORCH" new
+    mkdir -p "$WORK/mut4"
+    cp "$ROOT/scripts/objective.py" "$WORK/mut4/objective.py"
+    sed 's|^        ok, why = _section_admitted(section, paths)$|        ok, why = True, ""   # MUTANT: the pre-fix presence test|' \
+        "$ROOT/scripts/pr-doctor.py" >"$WORK/mut4/pr-doctor.py"
+    if cmp -s "$ROOT/scripts/pr-doctor.py" "$WORK/mut4/pr-doctor.py"; then
+        bad "§4 --mutations: the acceptance line was not found, so the mutant IS the original file — stale proof, not evidence"
+    else
+        out_mut="$(brief_probe "$WORK/mut4/pr-doctor.py" "$ORCH")"
+        brief_of "$out_mut" "$WORK/brief-mut.txt"
+        marker_hits="$(grep -c 'STALE-CONTRACT-MARKER' "$WORK/brief-mut.txt" || true)"
+        if [ "${marker_hits:-0}" -gt 0 ] && ! gate_admits "$WORK/brief-mut.txt"; then
+            ok "§4 --mutations: with the presence test restored, the stale contract reaches the brief and the gate REFUSES it — ARM 1 is LIVE"
+        else
+            bad "§4 --mutations: the mutant did not reproduce the defect (marker=$marker_hits) — the mutation did not land, so it proves nothing"
+        fi
+    fi
 fi
 
 echo ""
