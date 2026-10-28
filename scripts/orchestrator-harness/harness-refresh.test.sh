@@ -2265,6 +2265,93 @@ case "$R10Q" in
   "restart request=honoured"*) ok "…and the honoured record is UNTOUCHED — nothing outstanding, nothing written" ;;
   *) bad "a routine cycle overwrote the honoured record (nothing was outstanding, so nothing should have been written): $R10Q" ;; esac
 
+# ⛔ S11: A ROLES DIRECTORY THAT EXISTS BUT CANNOT BE LISTED IS `unknown`, NOT EMPTY. The `-r`/`-x`
+# guard's absence is the fail-open it was written for: the glob does not expand, the loop prints nothing,
+# `ROLE_N` lands 0, and the gate answers `actuation=safe` over a LIVE role pass. That guard was itself
+# unwitnessed until this case. chmod 000 is the faithful shape; under uid 0 it is still listable, so the
+# case DECLARES that instead of passing quietly.
+_CASE=$((_CASE+1)); echo "=== S11: an unlistable state/roles is roles-unreadable, not an empty population ==="
+D="$T/s11"; mkdir -p "$D/O/state/roles/.reap.lock" "$D/cellhome" "$D/pinroot"
+TREE1="$(mk_pin_tree "$D/pinroot" "$C1")"; TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+printf '%s|t\n' "$$" > "$D/O/state/roles/.reap.lock/own"     # a LIVE role pass that must not be missed
+chmod 000 "$D/O/state/roles" 2>/dev/null
+CTRL="$(start_ctrl "$TREE1")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R11="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+stop_ctrl "$CTRL"
+if [ -r "$D/O/state/roles" ]; then
+  echo "  ⚠️  NOT A WITNESS ON THIS HOST: uid $(id -u) can still list a 000 directory, so the" \
+       "unlistable arm is unreachable here. The assertion below still runs. (CI runs as a non-root uid.)"
+else
+  ok "the plant really is unlistable by us, so the arm under test is the one driven"
+fi
+[ "$(req_of "$D/O" blocked)" = roles-unreadable ] && ok "…blocked=roles-unreadable and actuation=$(req_of "$D/O" actuation) — a live role pass is never read as an empty population" \
+  || bad "an unlistable state/roles was read as EMPTY: blocked=$(req_of "$D/O" blocked) actuation=$(req_of "$D/O" actuation), expected blocked=roles-unreadable — $R11"
+chmod 755 "$D/O/state/roles" 2>/dev/null
+
+# ⛔ S12: THE CLAIM BOUND IS TWO-SIDED, AND THE SECOND SIDE HAD NO WITNESS. S6 covers a `stamp:` on the
+# PRIOR end; this covers a `stamp:` on the CURRENT end — the case `:953-955` states as "on EITHER side".
+# Without it, a box with NO controller and an identity that resolves only from the stamp's CLAIM certifies
+# `honoured` with `now=unknown`: a restart recorded from a claim, which is the one thing the contract
+# forbids. No `.orch.lock` (no controller), and the stamp names UNKNOWN so the current identity is a claim.
+_CASE=$((_CASE+1)); echo "=== S12: a CLAIM on the current end is not a move either (no controller, stamp=UNKNOWN) ==="
+D="$T/s12"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "UNKNOWN"}\n' > "$D/O/.agent-infra-stamp.json"
+printf 'restart request=pending requested_at=1700000000 requested_by=harness-refresh.sh@%s running=%s running_from=self:%s pin=%s pending=deferred actuation=blocked blocked=lanes lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(short "$C1")" "$(short "$C1")" "$D/O" "$(short "$C2")" > "$D/O/state/restart-request"
+R12="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+R12Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R12" in *"relation=current"*) ok "the box is current with no controller, so the honour arm is reachable (the bait is live)" ;;
+               *) bad "the fixture did not reach the honour arm, so this case is vacuous: $R12" ;; esac
+case "$R12Q" in
+  "restart request=honoured"*) bad "a restart was certified from a STAMP claim on the current end — no controller exists and now= is not even a commit: $R12Q" ;;
+  "restart request=cleared"*) ok "…a claim on the CURRENT end is CLEARED, not honoured" ;;
+  *) bad "unexpected record when the current identity is a claim: $R12Q" ;; esac
+
+# ⛔ S13: THE TMUX LAUNCHER'S ARGV **QUOTES** THE SCRIPT PATH, AND NO OTHER CASE HAS A QUOTE IN ARGV.
+# Both readers dequote before comparing (`:563` in the source-2 split, `:405` in `controller_identity`), and
+# both comments call this the real cell shape — yet every other plant is launched as
+# `bash "<path>"`, so until this case the dequote could be deleted with the suite green. `COLUMNS=20`
+# rides along because the same read needs `-ww`: an exported COLUMNS truncates the command column and the
+# path is the LAST token, so without `-ww` the quoted operand is cut mid-name and the stage gives up
+# silently (#2926). One plant, two bounds.
+#   ⛔ `exec -a bash yes` — `yes` never OPENS its operand (so the quoted string really survives in the
+#   process table) and never exits (so `ps` has something to read). `exec -a` is what puts a SHELL name in
+#   argv[0] while argv[1] stays a quoted path; a plain `bash '<path>'` would try to open a file whose name
+#   contains quotes and exit immediately.
+#   ⛔ WHAT THIS CASE DOES **NOT** PROVE, SAID PLAINLY: the dequote and `-ww` each exist in TWO copies (the
+#   source-2 reader and `controller_identity`), they are the SAME predicate, and on this fixture each copy
+#   answers for the other — measured: removing EITHER dequote alone leaves 304/0, removing BOTH reddens
+#   this case; same for `-ww` (both removed reddens this case AND A36i). So this is an AGGREGATE witness
+#   of the bound, not a per-copy one. That is a property of the redundant readers, not of the case: do not
+#   "tidy" one copy away believing the other is covered — the suite cannot tell you it was.
+_CASE=$((_CASE+1)); echo "=== S13: a QUOTED argv path still resolves under COLUMNS (dequote + ps -ww) ==="
+D="$T/s13"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+# ⛔ THE PIN MUST EXIST BEFORE THE RUN. Without it the cycle is in MEND mode and `running=` comes from the
+# tip, so the case passed while reading NEITHER argv reader — a green that witnessed nothing (caught by
+# mutating the dequote and `-ww` and watching the suite stay green). Stamp names C1 so a failed argv read
+# is distinguishable from a successful one: C2 means the controller's tree answered, C1 means it did not.
+printf '%s\n' "$C2" > "$D/cellhome/HARNESS-PIN"; printf '%s\n' "$TREE2" > "$D/pinfile"
+printf '{"commit": "%s"}\n' "$C1" > "$D/O/.agent-infra-stamp.json"
+_Q="$TREE2/scripts/orchestrator-harness/orch-loop.sh"
+bash -c 'exec -a bash yes "$1"' _ "'$_Q'" >/dev/null 2>&1 & _PQ=$!
+sleep 1
+case "$(COLUMNS=20 ps -ww -o command= -p "$_PQ" 2>/dev/null)" in
+  # ⛔ THE PATTERN MUST CONTAIN REAL GLOBS (`*` OUTSIDE the quotes): a fully-quoted pattern in `case` is
+  # LITERAL, so `"bash '*"` would match the six characters `bash '*` and nothing else — the same
+  # inert-match class this whole change exists to remove.
+  *"bash '"*) ok "the plant's argv[0] is a shell and argv[1] really is the QUOTED path (the allow-list cannot be what rejects it)" ;;
+  *) bad "the plant did not keep a quoted path in argv[1]: $(ps -ww -o command= -p "$_PQ" 2>/dev/null)" ;; esac
+printf '%s\n' "$_PQ" > "$D/O/.orch.lock"
+R13="$(O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$D/pinroot" COLUMNS=20 \
+        bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$D/cellhome/HARNESS-PIN" --self "$D/O" 2>&1)"
+rm -f "$D/O/.orch.lock"; reap "$_PQ"
+case "$R13" in *"running=$(short "$C2")"*) ok "…the QUOTED path resolved to the tree the controller executes (dequoted, and not truncated)" ;;
+               *"running=$(short "$C1")"*) bad "a quoted argv path fell back to the stamp — the dequote (or -ww) is missing, which is #2641 back on every cell: $R13" ;;
+               *) bad "the record named neither tree: $R13" ;; esac
+
 _CASE=$((_CASE+1)); echo "=== B6: the spawn-line token carries WHICH pending state (and stays bare for every other relation) ==="
 D="$T/b6"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'

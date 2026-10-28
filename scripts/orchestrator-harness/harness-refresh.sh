@@ -401,6 +401,12 @@ controller_identity() { # sets CTRL_HEAD/CTRL_TREE from the LIVE controller. rc 
   # #2641 back). The quote characters live in variables, not as backslash escapes: this file is read by
   # a gate that dequotes it statically (see #2175), and a backslash-quote in the body changes what that
   # read sees.
+  # ⛔ AND IT IS THE SAME PREDICATE AS THE SOURCE-2 SPLIT'S DEQUOTE ABOVE. The two readers are redundant
+  # (source-2 is pin-rooted, this one is the fallback), so on any fixture each answers for the other and
+  # NEITHER copy can be individually witnessed: removing either one alone leaves the suite green, and only
+  # removing BOTH reddens S13 (measured). That makes this an aggregate witness, not a per-copy one — so if
+  # you are ever tempted to delete one as "covered by the other", the suite will not stop you and the
+  # quoted-argv cell shape will come back.
   sh_tok="${1#\'}"; sh_tok="${sh_tok%\'}"; sh_tok="${sh_tok#\"}"; sh_tok="${sh_tok%\"}"
   path_tok="${2#\'}"; path_tok="${path_tok%\'}"; path_tok="${path_tok#\"}"; path_tok="${path_tok%\"}"
   case "${sh_tok##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
