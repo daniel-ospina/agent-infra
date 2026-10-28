@@ -1213,21 +1213,41 @@ case "$R9" in *"running=$(short "$C2")"*)
 # `current` for a tree the controller is not executing, and `current` feeds `REL_RUN` (the ahead/diverged
 # refusals). The plant is asserted to be argv-shaped before the outcome is read (the A25 lesson: a dead or
 # unnamed plant makes every assertion below vacuously pass).
+#
+# ⛔ AND THE PLANT MUST BE PORTABLE (review cycle 10, P2 — the macOS measurement is this PR's own
+# 2026-10-27T22:03Z review comment). The first version drove `tail <path> -f`: GNU tail permutes a trailing
+# option, but BSD/macOS tail uses getopt and STOPS at the first operand, so `<path> -f` became TWO file
+# operands — tail printed, exited, `ps` was empty, the plant assertion below redded, and the Mac half of the
+# fleet got a red suite on a change that is green in CI (CI has no macos runner). Moving `-f` in front of
+# the operand is not a fix either: argv[1] then holds the flag and the case witnesses nothing. So the
+# OPERAND blocks by itself — a FIFO at the harness path, held open by a writer, and `tail` with NO flag
+# blocks reading it. Same shape on Linux and BSD, and argv stays `cat <path>` with the path at argv[1].
+# The tree is a real worktree INSIDE the pin root, so the recorded-root bound, the toplevel guard and the
+# age rule all accept it: the shell allow-list is the ONLY thing that can reject this plant.
 _CASE=$((_CASE+1)); echo "=== A36j: argv[1] IS the path but argv[0] is NOT a shell -> cannot answer (allow-list) ==="
-bash -c 'exec -a cat tail "$1" -f' _ "$_O26R" >/dev/null 2>&1 & _P32=$!
-sleep 1
-case "$(ps -ww -o command= -p "$_P32" 2>/dev/null)" in
-  "cat "*"orch-loop.sh -f"*) ok "the plant's argv really is `cat <path> -f` (argv[1] = the path, argv[0] not a shell)" ;;
-  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P32" 2>/dev/null)" ;; esac
-printf '%s\n' "$_P32" > "$D/o/.orch.lock"
-RA="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
-       --pin "$PIN" --self "$D/o" 2>&1)"
-rm -f "$D/o/.orch.lock"; reap "$_P32"
-case "$RA" in *"running=$(short "$C2")"*)
-                bad "a NON-SHELL argv[1] answered for the box (false current) — the shell allow-list is gone: $RA" ;;
-             *"running=$(short "$C1")"*)
-                ok "a non-shell that names the path as an argument cannot answer — the shell allow-list holds" ;;
-             *) bad "the record named neither tree: $RA" ;; esac
+_T36J="$D/pins/jtree"
+git -C "$T/src" worktree add --detach "$_T36J" "$C2" >/dev/null 2>&1
+_F36J="$_T36J/scripts/orchestrator-harness/orch-loop.sh"
+rm -f "$_F36J"; mkfifo "$_F36J" 2>/dev/null
+if [ ! -p "$_F36J" ]; then
+  ok "mkfifo is unavailable on this host — nothing to block on (A36c/A36h/A36o still witness the allow-list)"
+else
+  sleep 120 > "$_F36J" & _W36J=$!
+  bash -c 'exec -a cat tail "$1"' _ "$_F36J" >/dev/null 2>&1 & _P32=$!
+  sleep 1
+  case "$(ps -ww -o command= -p "$_P32" 2>/dev/null)" in
+    "cat "*"orch-loop.sh"*) ok "the plant's argv really is `cat <path>` (argv[1] = the path, argv[0] not a shell)" ;;
+    *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P32" 2>/dev/null)" ;; esac
+  printf '%s\n' "$_P32" > "$D/o/.orch.lock"
+  RA="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+         --pin "$PIN" --self "$D/o" 2>&1)"
+  rm -f "$D/o/.orch.lock"; reap "$_P32"; reap "$_W36J"; rm -f "$_F36J"
+  case "$RA" in *"running=$(short "$C2")"*)
+                  bad "a NON-SHELL argv[1] answered for the box (false current) — the shell allow-list is gone: $RA" ;;
+               *"running=$(short "$C1")"*)
+                  ok "a non-shell that names the path as an argument cannot answer — the shell allow-list holds" ;;
+               *) bad "the record named neither tree: $RA" ;; esac
+fi
 
 # ⛔ A36k: THE PIN-FILE ARM IS THE ONLY RECORD THAT CAN NAME A READ DIR OUTSIDE THE PIN ROOT (#2216), AND IT
 # HAD NO WITNESS (review cycle 6, measured: deleting the block left the suite green at 211/211 — every A36*
@@ -1362,6 +1382,127 @@ else
   reap "$_P36"
   rm -f "$D/o/.orch.lock" "$_F26" "$D/o/fifo.out"
 fi
+
+# ⛔ A36n: THE LOCK READ'S `-f` IS LOAD-BEARING AND HAD NO WITNESS (review cycle 10, P2). The stage guards
+# `$O/.orch.lock` with `-f` for exactly the reason A36m guards the pin file with it — `head` BLOCKS ON OPEN
+# on a non-regular file — and nothing distinguished `-f` from `-r` there: MEASURED on a scratch copy,
+# `-f` → `-r` at the lock read left the suite at 226 passed / 0 failed. On a cell that is a silent hang of
+# the controller's WHOLE cycle, every cycle (the refresh is a synchronous child of `orch-loop.sh`).
+#
+# ⛔ THE CONTROL ARM COMES FIRST, AND THAT IS WHAT KEEPS THIS CASE FROM BEING A SKIP IN DISGUISE: a REGULAR
+# lock on the same fixture must resolve C2, so the FIFO arm's C1 cannot be read as "the stage never ran"
+# (the A36m lesson).
+_CASE=$((_CASE+1)); echo "=== A36n: a FIFO \$O/.orch.lock does not hang the refresh (the gate is -f, not -r) ==="
+_L36N="$D/o/.orch.lock"
+rm -f "$_L36N"
+bash "$_O26" & _P36N=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P36N" 2>/dev/null)" in
+  *"$_O26"*) ok "the plant really executes <pin-tree>/scripts/orchestrator-harness/orch-loop.sh" ;;
+  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P36N" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P36N" > "$_L36N"
+_KC36N="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_KC36N" in
+  *"running=$(short "$C2")"*) ok "control: a REGULAR lock on this fixture resolves C2 — the stage is reached" ;;
+  *) bad "control: a REGULAR lock did not resolve C2, so this case proves nothing about the FIFO: $_KC36N" ;; esac
+rm -f "$_L36N"; mkfifo "$_L36N" 2>/dev/null
+if [ ! -p "$_L36N" ]; then
+  ok "mkfifo is unavailable on this host — nothing to hang on (A36m pins the same gate on the pin file)"
+else
+  O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$D/o" >"$D/o/lockfifo.out" 2>&1 & _R36N=$!
+  _i36n=0
+  while kill -0 "$_R36N" 2>/dev/null && [ "$_i36n" -lt 60 ]; do sleep 0.25; _i36n=$((_i36n+1)); done
+  if kill -0 "$_R36N" 2>/dev/null; then
+    # Clean up BOTH the refresh and any `head` blocked on the FIFO, by the FIFO's own unique path so nothing
+    # else on the host can be signalled, and never let a red test leak a hang.
+    kill -9 "$_R36N" 2>/dev/null; pkill -9 -f "$_L36N" 2>/dev/null; wait "$_R36N" 2>/dev/null
+    bad "the refresh was still blocked after 15s on a FIFO lock — head blocks on open; the gate must be -f, not -r"
+  else
+    wait "$_R36N" 2>/dev/null
+    ok "the refresh returned instead of blocking on the FIFO lock — the -f gate rejected a non-regular lock"
+    case "$(cat "$D/o/lockfifo.out")" in
+      *"running=$(short "$C1")"*)
+        ok "…and RUNNING fell to the seed stamp (the safe direction) — the FIFO was not read as an owner" ;;
+      *"running=$(short "$C2")"*)
+        bad "the FIFO lock was read as a controller's pid file" ;;
+      *relation=*)
+        bad "the refresh wrote a record but named neither tree — the lock stage was skipped, not exercised: $(cat "$D/o/lockfifo.out")" ;;
+      *)
+        bad "the refresh returned but produced no record: $(cat "$D/o/lockfifo.out")" ;;
+    esac
+  fi
+fi
+rm -f "$_L36N" "$D/o/lockfifo.out"; reap "$_P36N"
+
+# ⛔ A36o: THE TOKEN SPLIT MUST NOT GLOB (review cycle 10, P2). `for _w in $_argv` splits the ONE `ps`
+# string on whitespace, which is the point — but with globbing ON a `*`/`?` token is expanded against the
+# filesystem, so a word that was never in argv can be INVENTED, and an invented word that looks like a
+# controller path then answers for the box. MEASURED on a scratch copy: replacing the
+# `case $- in *f*) … set -f ;; esac` line with `_glob_had=0` left the suite at 226 passed / 0 failed.
+#
+# ⛔ THE TWO ARMS DIFFER IN ONE CHARACTER — `?` vs `h` — so this case cannot pass by the stage being
+# skipped: argv[1] = the REAL path must resolve C2 (control), and argv[1] = the GLOB that matches that same
+# file must not. The plant is `yes`: it never OPENS its argument (so the literal glob really survives in the
+# process table) and never exits (so `ps` has something to read). Both are asserted before the outcome.
+_CASE=$((_CASE+1)); echo "=== A36o: a glob token in argv is not expanded into a controller path (set -f) ==="
+_G36O="$_T24/scripts/orchestrator-harness/orch-loop.s?"
+bash -c 'exec -a bash yes "$1"' _ "$_G36O" >/dev/null 2>&1 & _P36O=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P36O" 2>/dev/null)" in
+  "bash "*"orch-loop.s?") ok "the plant's argv[1] really is the GLOB, and argv[0] is a shell (the allow-list cannot be what rejects it)" ;;
+  *) bad "the plant did not keep the literal glob in argv[1]: $(ps -ww -o command= -p "$_P36O" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P36O" > "$D/o/.orch.lock"
+_RO36O="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RO36O" in *"running=$(short "$C2")"*) bad "a GLOB token was expanded into a controller path (globbing on in the token split): $_RO36O" ;;
+                 *"running=$(short "$C1")"*) ok "a glob token is not expanded — an invented word cannot answer for the box" ;;
+                 *) bad "the record named neither tree — the stage was skipped, not exercised: $_RO36O" ;; esac
+reap "$_P36O"
+bash -c 'exec -a bash yes "$1"' _ "$_T24/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 & _P36Q=$!
+sleep 1
+printf '%s\n' "$_P36Q" > "$D/o/.orch.lock"
+_RC36O="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RC36O" in *"running=$(short "$C2")"*) ok "control: the same plant naming the REAL path resolves C2 — the stage is reached" ;;
+                 *) bad "control: the real path did not resolve C2, so the glob arm proves nothing: $_RC36O" ;; esac
+rm -f "$D/o/.orch.lock"; reap "$_P36Q"
+
+# ⛔ A36p: THE RECORDED-ROOT BOUND IS WHOLE-PATH, NOT A SUFFIX MATCH (review cycle 10, P2). `_nl=$'\n'` is
+# what keeps the membership test an EQUALITY between one recorded entry and one candidate path; with it
+# empty, `_acc` is one run-on string and the test degrades to a SUBSTRING match — a tree whose raw path is
+# only a textual SUFFIX of a recorded path then answers for this box. MEASURED on a scratch copy:
+# `_nl=$'\n'` → `_nl=""` left the suite at 226 passed / 0 failed.
+#
+# The fixture makes the raw strings differ while the recorded entry still ENDS WITH the controller's path:
+# the pin root is `<…>/nlroot` CONCATENATED with the controller tree's own path, so `_acc` ends with
+# `<ctrl>/scripts/…` while `<ctrl>` is a real worktree — its own toplevel — OUTSIDE that pin root.
+#
+# ⛔ AND THE CONTROL ARM IS THE POINT: the same plant under a pin root that legitimately CONTAINS it (the
+# single-child arm) must resolve C2, so the negative arm cannot be a skipped stage in disguise.
+_CASE=$((_CASE+1)); echo "=== A36p: a tree that is only a textual SUFFIX of a recorded root cannot answer (whole-path bound) ==="
+_T36P="$T/a24/nlsuffix"
+git -C "$T/src" worktree add --detach "$_T36P" "$C2" >/dev/null 2>&1
+printf '#!/bin/bash\nsleep 120\n' > "$_T36P/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_T36P/scripts/orchestrator-harness/orch-loop.sh" & _P36R=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P36R" 2>/dev/null)" in
+  *"$_T36P/scripts/orchestrator-harness/orch-loop.sh"*) ok "the plant really executes its own tree's harness path" ;;
+  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P36R" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P36R" > "$D/o/.orch.lock"
+_RC36P="$(O="$D/o" HARNESS_PIN_DIR="$T/a24" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RC36P" in *"running=$(short "$C2")"*) ok "control: the SAME plant under a pin root that CONTAINS it resolves C2 — the stage is reached" ;;
+                 *) bad "control: the containing pin root did not resolve C2, so the suffix arm proves nothing: $_RC36P" ;; esac
+_P36PR="$T/a24/nlroot$_T36P"
+mkdir -p "$_P36PR"
+_RS36P="$(O="$D/o" HARNESS_PIN_DIR="$_P36PR" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RS36P" in *"running=$(short "$C2")"*) bad "a tree that is only a textual SUFFIX of the pin root answered (the bound degraded to a substring match): $_RS36P" ;;
+                 *"running=$(short "$C1")"*) ok "a suffix of a recorded root is not a recorded root — the stamp stands" ;;
+                 *) bad "the record named neither tree — the stage was skipped, not exercised: $_RS36P" ;; esac
+rm -f "$D/o/.orch.lock"; reap "$_P36R"
 
 # ⛔ A36b: A TREE OUTSIDE EVERY RECORDED ROOT CANNOT ANSWER FOR THIS BOX. The harness path is SHARED
 # across repos on one machine, so "a controller is running" and "MY controller is running" are different
