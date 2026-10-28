@@ -2065,6 +2065,16 @@ case "$PRH" in "restart request=honoured"*) ok "…and with no CELL_HOME it read
 PRA="$(env -u O -u CELL_HOME -u HOME bash "$RR" --print-restart 2>&1)"
 case "$PRA" in *no-O-set*) ok "…and with neither CELL_HOME nor HOME it abstains (unknown), it does not guess" ;;
   *) bad "an underivable O answered instead of abstaining: $PRA" ;; esac
+# ⛔ AN ABSENT RECORD IS NOT `none`. Nothing has ever recorded a request, which is a DIFFERENT fact from
+# "a cycle measured nothing pending" — and `none` is the fleet's measured-nothing word (`pending=none`).
+# The absent arm must abstain and carry the distinction in `reason=`, or a consumer cannot tell the two
+# apart. (Pinned because the absent arm shipped as `request=none` while this very block's comment said
+# an absent record is not `none`.)
+PRN="$(env -u O CELL_HOME="$D/norecord" HOME="$D/home" bash "$RR" --print-restart 2>&1)"
+case "$PRN" in
+  "restart request=unknown reason=no-cycle-has-recorded-one o="*) ok "…an ABSENT record abstains as unknown (never 'none'), and names the path it read" ;;
+  "restart request=none"*) bad "an absent record answered request=none — 'nothing recorded yet' is indistinguishable from 'a cycle measured nothing pending': $PRN" ;;
+  *) bad "unexpected answer for an absent record: $PRN" ;; esac
 stop_ctrl "$CTRL"
 
 _CASE=$((_CASE+1)); echo "=== S3: the transition is OBSERVABLE — requested at T, HONOURED at T+n when the process moves ==="

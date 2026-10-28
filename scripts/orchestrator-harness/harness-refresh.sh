@@ -180,7 +180,12 @@ log_line() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 # exactly when an operator asks "did my restart get honoured?". It PRINTS THE RECORD VERBATIM; deriving
 # a verdict here would create a second opinion about a state this script already decided once.
 # ⛔ AN ABSENT RECORD IS NOT `none`: nothing has ever recorded a request, which is a different fact
-# from "nothing is pending" — the same absence-vs-empty rule the whole file follows.
+# from "nothing is pending" — the same absence-vs-empty rule the whole file follows. So the absent arm
+# answers `unknown` and carries the distinction in `reason=`, exactly as the no-`O` arm does; `none` is
+# the fleet's MEASURED-nothing word (`pending=none`, `orch-loop.sh`) and using it here would make a
+# consumer unable to tell "no cycle has recorded one yet" from "a cycle measured nothing pending". The
+# box's other reader says the same thing in words (`cloud-cell-supervisor.sh status`: "NO REQUEST
+# RECORD at … — that is not the same as 'nothing pending'").
 if [ "$PRINT_RESTART" = 1 ]; then
   # ⛔ `O` IS DEFAULTED HERE, AND NOWHERE ELSE IN THIS SCRIPT, AND IT IS `$CELL_HOME/orchestrator` —
   # NOT the pin's `.pi/agent`. It was previously REQUIRED, but nothing in this file ever sets it
@@ -205,7 +210,7 @@ if [ "$PRINT_RESTART" = 1 ]; then
     esac
   fi
   if [ -f "$O/state/restart-request" ]; then cat "$O/state/restart-request"
-  else printf 'restart request=none reason=no-cycle-has-recorded-one o=%s\n' "$O"; fi
+  else printf 'restart request=unknown reason=no-cycle-has-recorded-one o=%s\n' "$O"; fi
   exit 0
 fi
 # ── bounded execution, because this runs at the top of the controller's cycle ──────────────────────
@@ -924,6 +929,13 @@ set_pending() { # sets PENDING=inert|unprovable|deferred|safe, and GATE_CODE/GAT
 #                     live controller to restart. Nothing is asked of any actuator.
 # `--print-restart` prints it; `cloud-cell-supervisor.sh status` prints it beside the self-refresh line.
 req_field() { # <name> -> value from the last request record (empty when the record or the field is absent)
+  # ⛔ ON A DUPLICATED FIELD THE **LAST** OCCURRENCE ON THE LINE WINS, and that is what this expression
+  # does — not by choice but because `sed`'s leading `.*` is GREEDY, so it consumes up to the final
+  # `name=`; `awk`'s `exit` never enters into it, since it only makes the first non-empty LINE win. An
+  # earlier note here said "first occurrence wins", which is the opposite of the behaviour and would
+  # mislead anyone relying on it to fail safe. No writer in this file duplicates a field (every record is
+  # one `printf` of one line), so the behaviour is unobserved in practice — it is stated correctly here
+  # rather than pinned by a test, because pinning it would pin a shape no writer produces.
   [ -n "$REQ" ] && [ -f "$REQ" ] || return 0
   sed -n "s/.*[[:space:]]$1=\([^[:space:]]*\).*/\1/p" "$REQ" 2>/dev/null | awk 'NF{print; exit}'
 }
