@@ -1048,7 +1048,13 @@ cap_wip_snapshot() {
 # only NAMES the fixer's worktree in the agent's prompt, so `$PWD` there is NOT the tree the work is in;
 # it already sets `WIP_PATH="$WT"` for the cap snapshot, for exactly this reason. Archiving the main
 # checkout instead would be worse than no rescue: it would report a capture the lane never received,
-# and it would push a ref of a tree nobody was working in.
+# and it would push a ref of a tree nobody was working in. ⛔ What is ENFORCED here is the PRECEDENCE
+# (arm H: a valid `WIP_PATH` wins over a dirty `$PWD`) plus the root rule below; a caller that sets
+# NEITHER and happens to sit at the ROOT of another checkout is a worktree root too and cannot be told
+# apart by any predicate in this function — so that residual is RECORDED, not refused: field 9 of the
+# `lane-end.tsv` row names the tree that was measured, which is what makes a wrong-tree archive visible
+# in the aggregate surface. The claim is narrowed to what the code does, because a comment that promises
+# a prevention it cannot make is how the next reader trusts a guard that is not there.
 #
 # ⛔ THREE VERDICTS, AND `cannot-verify` IS NOT `clean`. A `git status` that cannot run (corrupt
 # index, ENOSPC, EACCES, safe.directory) is CANNOT-VERIFY — the repo's own ruling for this call, and
@@ -1080,6 +1086,7 @@ LANE_END_TREE=""        # dirty | clean | unpushed-only | cannot-verify | not-a-
 LANE_END_RESCUE=""      # refs/wip/<slug>@<sha> | nothing | FAILED | UNAVAILABLE | DISABLED
 LANE_END_REF=""         # the local ref that pins the archived commit (empty when nothing was archived)
 LANE_END_UNPUSHED=0     # commits on this branch that exist only locally — NAMED, never pushed (above)
+LANE_END_ROOT=""        # the tree that was MEASURED — the only column that can expose a wrong-tree archive
 LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 
 # wip_rescue_path — resolve scripts/bg-rescue-wip.sh the way the other helpers are resolved. `$O` is
@@ -1111,20 +1118,28 @@ wip_rescue_path() {
 # ⛔ WHY THIS IS A FUNCTION AND NOT THE TAIL OF `terminal_wip_rescue` (review F1, PR #2975). Two paths
 # return BEFORE the measurement — the operator hatch (`WIP_RESCUE_DISABLE=1`) and a mis-pointed root
 # (`tree=not-a-worktree`) — and both used to return with the fields set and NO row, while this file
-# and the README both claim "one row per terminal, on every path". The absence landed on exactly the
-# case the row exists to catch: `not-a-worktree` is what a caller that forgot `WIP_PATH` looks like
-# (`fix-one.sh` `cd`s into the MAIN checkout), so the one transition where a lane's work may have been
-# archived from the WRONG tree left the fleet's aggregate surface with nothing at all. `not-measured`
-# is the same shape from the other side: a hatch that blanks the ledger is indistinguishable from a
-# lane that never ended. Routing every path through one writer makes the invariant structural instead
-# of a comment two of three paths ignored; `wip-rescue-exit.test.sh` drives both paths and reads the
-# row, so a fourth path that forgets is a red suite and not a quiet gap.
+# and the README both claim "one row per terminal, on every path". Both are paths on which nothing was
+# MEASURED, so an absent row was indistinguishable from a lane that never ended — and `not-measured`
+# is the same shape from the other side: a hatch that blanks the ledger reads as a lane that vanished.
+# Routing every path through one writer makes the invariant structural instead of a comment two of
+# three paths ignored; `wip-rescue-exit.test.sh` drives both paths and reads the row, so a fourth path
+# that forgets is a red suite and not a quiet gap.
+#
+# ⛔ FIELD 9 IS THE ROOT THAT WAS MEASURED, AND IT IS THE ONLY SURFACE THAT CAN SHOW A WRONG TREE
+# (review P2, round 4, PR #2975). The root guard below refuses a path that is not the ROOT of a
+# worktree — but `fix-one.sh`'s own hazard, a caller that omits `WIP_PATH` while its cwd is the MAIN
+# checkout, is a worktree root too, so no predicate in this function can tell the two apart. Rather
+# than claim a prevention it cannot make, the row NAMES the tree it measured (and the log line already
+# does), so a wrong-tree archive is visible in the aggregate surface instead of only in one lane's log.
 lane_end_record() {
-  local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" o_root
+  local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" o_root root_col
   o_root="${O:-${HOME:-$PWD}/orchestrator}"
+  # A tab or newline in the path would shift every later column, so the field is flattened — the row is
+  # a fixed-arity TSV and a consumer reading $5/$6 must never be handed a path fragment.
+  root_col="$(printf '%s' "${LANE_END_ROOT:-}" | tr '\t\n' '  ')"
   mkdir -p "$o_root/state" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$rc" "$cap" \
-    "$LANE_END_TREE" "$LANE_END_RESCUE" "${LANE_END_REF:-}" "${LANE_END_UNPUSHED:-0}" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$rc" "$cap" \
+    "$LANE_END_TREE" "$LANE_END_RESCUE" "${LANE_END_REF:-}" "${LANE_END_UNPUSHED:-0}" "$root_col" \
     >> "$o_root/state/lane-end.tsv" 2>/dev/null
   return 0
 }
@@ -1137,18 +1152,34 @@ terminal_wip_rescue() {
   local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
   local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 at_risk=0 l local_ref=""
   local local_ref_before="" local_ref_after=""
-  local st_errf="" st_noise=0
+  local st_errf="" st_noise=0 root_top root_real root_top_real why=""
   root="${WIP_PATH:-$PWD}"
-  LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0
+  LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0; LANE_END_ROOT="$root"
   if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
     LANE_END_TREE="not-measured"; LANE_END_RESCUE="DISABLED"
     echo "[wip] end label=$label rc=$rc cap=$cap tree=not-measured rescue=DISABLED — WIP_RESCUE_DISABLE=1 (an operator escape hatch, not a default): the tree at $root was NOT examined, so this lane's uncommitted work (if any) is on this disk only" >> "$log" 2>/dev/null || true
     lane_end_record "$label" "$rc" "$cap"
     return 0
   fi
-  if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+  # ⛔ THE ROOT RULE IS THE CALLEE'S OWN, NOT A WEAKER ONE (review P2, round 4, PR #2975). The guard
+  # used to be `rev-parse --git-dir`, which SUCCEEDS ANYWHERE INSIDE A REPOSITORY — a subdirectory
+  # included — so it ratified a root that this code then MEASURED and handed to `bg-rescue-wip.sh`,
+  # which refuses it one layer down at its own `:96-103` (`--show-toplevel` ≠ `pwd -P`) and returns
+  # `rescue=FAILED`. So the pre-check could not tell a lane's worktree from a corner of one, and the
+  # fleet's record said the RESCUE failed rather than the POINTER. This is the same lesson as the
+  # `st_noise` fix above and as `cap_wip_snapshot` (#2045): the gate that decides whether the
+  # measurement means anything cannot be the weakest of the three. Same predicate as the callee,
+  # expressed once here, so the verdicts line up instead of contradicting.
+  root_top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)"
+  root_real="$(cd "$root" 2>/dev/null && pwd -P)"
+  root_top_real="$([ -n "$root_top" ] && cd "$root_top" 2>/dev/null && pwd -P)"
+  if [ -z "$root_top" ]; then why="it is not inside a git repository at all"
+  elif [ -z "$root_real" ] || [ -z "$root_top_real" ]; then why="that path could not be resolved to a directory"
+  elif [ "$root_real" != "$root_top_real" ]; then why="that path is inside the worktree at $root_top, not its root"
+  fi
+  if [ -n "$why" ]; then
     LANE_END_TREE="not-a-worktree"; LANE_END_RESCUE="UNAVAILABLE"
-    echo "[wip] end label=$label rc=$rc cap=$cap tree=not-a-worktree rescue=UNAVAILABLE — $root is not a git worktree, so a rescue cannot be pointed at it. If this lane's work lives elsewhere, the caller must pass WIP_PATH=<that worktree> (fix-one.sh does); nothing was examined here and this line is NOT a verdict that the worktree was clean" >> "$log"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=not-a-worktree rescue=UNAVAILABLE — $root is not the ROOT of a git worktree ($why), so a rescue cannot be pointed at it. If this lane's work lives elsewhere, the caller must pass WIP_PATH=<that worktree> (fix-one.sh does); nothing was examined here and this line is NOT a verdict that the worktree was clean" >> "$log"
     lane_end_record "$label" "$rc" "$cap"
     return 0
   fi

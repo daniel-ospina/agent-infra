@@ -126,7 +126,7 @@ ck "A3 …and the pushed archive CONTAINS the uncommitted file's bytes ('$got')"
 grep -q "\[wip\] end label=early exit rc=0 cap=0 tree=dirty rescue=refs/wip/$SLUG" "$O/logs/lane.log"; rc=$?
 ck "A4 the lane's log carries a TERMINAL RECORD naming rc, the trigger and the rescue ref (#2834 ask 2)" $rc
 [ -s "$O/state/lane-end.tsv" ] && awk -F'\t' 'NR==1 && $2=="early exit" && $5=="dirty" && $6 ~ /^refs\/wip\// {found=1} END{exit !found}' "$O/state/lane-end.tsv"; rc=$?
-ck "A5 …and the append-only ledger state/lane-end.tsv holds the row (epoch, label, rc, cap, tree, rescue, ref, unpushed)" $rc
+ck "A5 …and the append-only ledger state/lane-end.tsv holds the row (epoch, label, rc, cap, tree, rescue, ref, unpushed, root)" $rc
 
 # ── B) NON-VACUITY: remove the exit-path call and the ref MUST be absent ──────────────────────────
 # A copy of the shipped helper, mutated in exactly one place: the call. Everything else — the source,
@@ -234,8 +234,9 @@ rm -f "$WT/orphan.txt"
 
 # ── F) A MIS-POINTED WIP_PATH IS NOT A CLEAN TREE ────────────────────────────────────────────────
 # fix-one.sh `cd`s into the MAIN checkout and passes WIP_PATH=<the fixer's worktree>; a caller that
-# forgets it would have the rescue read the wrong tree. Not-a-worktree must be its own verdict, and it
-# must not be reachable as "clean".
+# forgets it would have the rescue read the wrong tree. `not-a-worktree` is its own verdict, and it
+# must not be reachable as "clean". What this guard CAN refuse is a path that is not a worktree ROOT
+# (arm F4); what it cannot is another checkout's root (arm F7, recorded not refused).
 mkdir -p "$TMP/notgit"
 : > "$O/logs/notgit.log"
 O="$O" WIP_PATH="$TMP/notgit" bash -c '
@@ -247,13 +248,54 @@ ck "F1 a WIP_PATH that is not a git worktree is tree=not-a-worktree, never a cle
 grep -q 'the worktree was CLEAN\|nothing was lost' "$O/logs/notgit.log"; rcc=$?
 ck "F2 …and it never claims the tree was clean" $([ "$rcc" -ne 0 ] && echo 0 || echo 1)
 # ⛔ F3 — THE ROW EXISTS ON THE PATH THAT RETURNS BEFORE THE MEASUREMENT (review F1, PR #2975).
-# `not-a-worktree` is what a caller that forgot `WIP_PATH` looks like, and it used to return with NO
+# `not-a-worktree` is a root that is not a worktree ROOT, and it used to return with NO
 # `lane-end.tsv` row while the file and the README both claim one row per terminal on every path —
-# so the one transition where a lane's work may have been archived from the WRONG tree was invisible
-# in the fleet's aggregate surface. This reads the LEDGER, not the log line (the arm above already
-# reads the line, and a line with no row is exactly the defect).
+# so a transition on which nothing was MEASURED was invisible in the fleet's aggregate surface. This
+# reads the LEDGER, not the log line (the arm above already reads the line, and a line with no row is
+# exactly the defect).
 awk -F'\t' '$2=="mis-pointed" && $5=="not-a-worktree" && $6=="UNAVAILABLE" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcf3=$?
 ck "F3 …and the append-only ledger still holds a row for it — 'one row per terminal, on every path' includes the paths that return before the measurement" $rcf3
+
+# ⛔ F4 — A PATH *INSIDE* A WORKTREE IS NOT ITS ROOT (review P2, round 4, PR #2975). The guard used to be
+# `rev-parse --git-dir`, which SUCCEEDS ANYWHERE INSIDE A REPOSITORY, so a subdirectory was ratified
+# here, measured, and then refused one layer down by `bg-rescue-wip.sh:96-103` — the record said the
+# RESCUE failed when the POINTER was wrong. The pre-check now carries the callee's own predicate, so
+# the verdict is `not-a-worktree` and it names the enclosing worktree.
+mkdir -p "$WT/nested/deep"
+: > "$O/logs/nested.log"
+O="$O" WIP_PATH="$WT/nested/deep" bash -c '
+  . "$1"
+  terminal_wip_rescue "nested-root" 0 0 "$2"
+' _ "$GATE" "$O/logs/nested.log" 2>/dev/null
+grep -q 'tree=not-a-worktree rescue=UNAVAILABLE' "$O/logs/nested.log"; rcn=$?
+ck "F4 a WIP_PATH that is INSIDE a worktree but not its root is tree=not-a-worktree, not a measured subdirectory" $rcn
+grep -q 'inside the worktree at' "$O/logs/nested.log"; rcn2=$?
+ck "F5 …and the line NAMES the enclosing worktree, so the caller is told which root to pass" $rcn2
+awk -F'\t' '$2=="nested-root" && $5=="not-a-worktree" && $9=="'"$WT"'/nested/deep" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcn3=$?
+ck "F6 …and the row's root column holds the path that was refused, not the parent it named" $rcn3
+
+# ⛔ F7/F8 — THE RESIDUAL, RECORDED RATHER THAN CLAIMED AWAY (review P2, round 4, PR #2975). A caller
+# that sets NO `WIP_PATH` while its cwd sits at the ROOT of another checkout IS a worktree root, so no
+# predicate in `terminal_wip_rescue` can tell it from the lane's own tree — the honest answer is that
+# the row NAMES the tree it measured. The foreign checkout carries only an UNPUSHED commit (at_risk=0),
+# so this arm costs no network call and touches no remote: it is asserting VISIBILITY, not a rescue.
+FOREIGN="$TMP/foreign"
+git init -q -b foreign "$FOREIGN"
+git -C "$FOREIGN" config user.name t; git -C "$FOREIGN" config user.email t@t
+printf 'seed\n' > "$FOREIGN/seed.txt"
+git -C "$FOREIGN" add seed.txt && git -C "$FOREIGN" commit -q -m seed
+printf 'committed but never pushed\n' > "$FOREIGN/local.txt"
+git -C "$FOREIGN" add local.txt && git -C "$FOREIGN" commit -q -m 'local only'
+: > "$O/logs/foreign.log"
+O="$O" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  terminal_wip_rescue "forgot-wip-path" 0 0 "$3"
+' _ "$GATE" "$FOREIGN" "$O/logs/foreign.log" 2>/dev/null
+awk -F'\t' '$2=="forgot-wip-path" && $9=="'"$FOREIGN"'" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcf7=$?
+ck "F7 a cwd that IS another checkout's root is recorded with THAT root in the row — the surface a wrong-tree archive is caught on" $rcf7
+grep -qF "at $FOREIGN" "$O/logs/foreign.log"; rcf8=$?
+ck "F8 …and the lane log names the measured tree too, so the wrong tree is never silent" $rcf8
 
 # ── H) WIP_PATH BEATS $PWD — the shape the PRODUCTION caller actually has ─────────────────────
 # `fix-one.sh` `cd`s into the MAIN checkout and only NAMES the fixer's worktree in the agent's prompt,
