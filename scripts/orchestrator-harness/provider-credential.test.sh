@@ -89,6 +89,18 @@ O="$4"; WT_DIR="$O/state"; mkdir -p "$WT_DIR"
 . "$LIB"
 wt_gh_hosts_token() { return 0; }
 unset DEEPSEEK_API_KEY ZAI_API_KEY
+# ⛔ THE LANE PAIR IS A CALLER-SIDE SOURCE TOO, so the driver isolates it exactly as it isolates the
+# key — and for the same MEASURED reason. `wt_lane_pair` falls back to the CALLER's
+# `PI_LANE_PROVIDER` / `PI_LANE_MODEL` when no env file names one (worker-terminal.sh:421), and the
+# fleet EXPORTS `PI_LANE_MODEL=deepseek-flash` into every lane — so a driver that inherited it answered
+# the arm whose PREMISE is "no source names a model" from the caller instead. Measured 2026-10-28 on a
+# fleet box: `MODEL=[deepseek-flash]` and **37/38** assertions, while the same tree is 38/38 in a shell
+# that exports no `PI_LANE_*` (the author's). An arm whose premise depends on the ambient shell is a
+# false GREEN on one box and a false RED on another; the assertion, not the environment, must decide.
+# An arm that MEANS to supply a caller-side member passes CALLER_PROVIDER / CALLER_MODEL, explicitly.
+unset PI_LANE_PROVIDER PI_LANE_MODEL
+if [ -n "${CALLER_PROVIDER:-}" ]; then export PI_LANE_PROVIDER="$CALLER_PROVIDER"; fi
+if [ -n "${CALLER_MODEL:-}" ]; then export PI_LANE_MODEL="$CALLER_MODEL"; fi
 if [ "${WITH_KEY:-0}" = "1" ]; then export DEEPSEEK_API_KEY=sk_caller_value; fi
 # `WITH_KEY=shell` — the SAME value as a plain SHELL VARIABLE, not in the environment. A tmux client
 # never carries it, so crediting it is the measured "0 key occurrences in the worker env" defect.
@@ -137,10 +149,10 @@ h="$TMP/h-unread";    mkhome "$h"; rm -f "$h/.pi/agent/models.json"; mkdir -p "$
 h="$TMP/h-deliver"; mkhome "$h"
 printf 'export DEEPSEEK_API_KEY=sk_from_pi_keys\n' > "$h/pi-keys.env"
 out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-deliver" 2>&1)"
-printf '%s\n' "$out" | grep -q '^RC=0$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "a box that holds the key ONLY in pi-keys.env still PRODUCES a launch contract (no refusal)" $rc
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-printf '%s' "$pfx" | grep -q "pi-keys.env" && rc=0 || rc=1
+grep -q "pi-keys.env" <<<"$pfx" && rc=0 || rc=1
 ck "…and the launch line sources \$HOME/pi-keys.env (the file this box's own ~/.zshrc sources)" $rc
 seen="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-deliver" "$BASH" -c "$pfx; env" 2>/dev/null | grep -c '^DEEPSEEK_API_KEY=sk_from_pi_keys$')"
 [ "$seen" = "1" ] && rc=0 || { rc=1; echo "      prefix executed WITHOUT delivering the key"; }
@@ -150,11 +162,11 @@ ck "…and the EXECUTED prefix leaves the value in the worker's environment (the
 h="$TMP/h-refuse"; mkhome "$h"   # no pi-keys.env, no caller value
 out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-refuse" 2>&1)"
 err="$(cat "$TMP/O-refuse/err.txt" 2>/dev/null)"
-printf '%s\n' "$out" | grep -q '^RC=1$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=1$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "nothing provides the model credential => wt_launcher_env REFUSES (no worker is started)" $rc
-printf '%s' "$err" | grep -q 'DEEPSEEK_API_KEY' && rc=0 || { rc=1; echo "      stderr=$err"; }
+grep -q 'DEEPSEEK_API_KEY' <<<"$err" && rc=0 || { rc=1; echo "      stderr=$err"; }
 ck "…and the refusal names the VARIABLE that is missing (not the reviewer, not its output format)" $rc
-printf '%s' "$err" | grep -q 'pi-keys.env' && printf '%s' "$err" | grep -q 'keys.env' && rc=0 || rc=1
+grep -q 'pi-keys.env' <<<"$err" && grep -q 'keys.env' <<<"$err" && rc=0 || rc=1
 ck "…and every file it looked in, so the operator is sent to a real path" $rc
 
 # ── 5. THE CALLER'S OWN VALUE: credited only when it can REACH the pane, and then PROVEN there ──
@@ -168,10 +180,10 @@ ck "…and every file it looked in, so the operator is sent to a real path" $rc
 # authenticate; a pane that holds it must keep it and proceed.
 h="$TMP/h-caller"; mkhome "$h"
 out="$(WITH_KEY=1 TMUX_SERVER_EXISTS=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller" 2>&1)"
-printf '%s\n' "$out" | grep -q '^RC=0$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "an EXPORTED caller value, on a spawn that creates the server, is a credential => no refusal" $rc
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-printf '%s' "$pfx" | grep -q 'pi-keys.env' && rc=1 || rc=0
+grep -q 'pi-keys.env' <<<"$pfx" && rc=1 || rc=0
 ck "…and no pi-keys.env source is emitted for a box that has no such file" $rc
 rcs="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-caller" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; echo $?)"
 [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      the prefix let a worker start with NO model credential (rc=$rcs)"; }
@@ -257,7 +269,7 @@ printf 'PI_LANE_PROVIDER=zai\nexport ZAI_API_KEY=sk_zai_from_keys\n' > "$h/keys.
 got="$(bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
 [ "$got" = "zai" ] && rc=0 || { rc=1; echo "      wt_lane_provider -> '$got' (the caller's ambient default was used instead)"; }
 ck "wt_lane_provider resolves the provider the PANE runs (keys.env), not the caller's ambient default" $rc
-out="$(WITH_KEY=0 PI_LANE_PROVIDER=deepseek bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-prov" 2>&1)"
+out="$(WITH_KEY=0 CALLER_PROVIDER=deepseek bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-prov" 2>&1)"
 grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "…so the gate requires ZAI_API_KEY (which keys.env provides), not the caller's DEEPSEEK_API_KEY" $rc
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
@@ -314,6 +326,20 @@ else
   case "$envout" in *"MODEL=[]") rc=0 ;; *) rc=1; echo "      $envout (a model no source named was left to shadow the pinned provider)" ;; esac
 fi
 ck "…and a model NO source names is CLEARED, so the lane's own default applies instead of a stale pair" $rc
+# …and the INVERSE: when the CALLER does name a model, THAT is the source — `wt_lane_pair` resolves it
+# and the launch line PINS it, so the pane holds ONE pair rather than two measurements. This is also
+# the arm that keeps the isolation in the driver from becoming a mute: the caller-side member is a real
+# input, and an arm that MEANT it must pass it explicitly (CALLER_MODEL) rather than inherit it.
+h="$TMP/h-pair-caller"; mkhome "$h"
+printf 'export DEEPSEEK_API_KEY=sk_from_pi_keys\n' > "$h/pi-keys.env"
+out="$(WITH_KEY=0 CALLER_MODEL=qwen3.8-max bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-pair-caller" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+if [ -z "$pfx" ]; then rc=1; echo "      no launch prefix was emitted (the spawn was refused) — nothing to execute"
+else
+  envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-pair-caller" PI_LANE_MODEL=stale-from-server "$BASH" -c "$pfx; printf 'MODEL=[%s]' \"\${PI_LANE_MODEL:-}\"" 2>&1)"
+  case "$envout" in *"MODEL=[qwen3.8-max]") rc=0 ;; *) rc=1; echo "      $envout (a caller-named model was not the pinned one — gate and pane disagree)" ;; esac
+fi
+ck "…and when the CALLER names one, THAT source is pinned, so the pane cannot keep a stale server value" $rc
 
 # ── 6b. THE CALLER-SIDE SOURCES ARE BOUNDED ────────────────────────────────────────────────────
 # ⛔ P1 review finding, 2026-10-27, MEASURED: `wt_lane_provider` did `. "$home/keys.env"` (and
@@ -337,7 +363,7 @@ dt=$(( $(date +%s) - t0 ))
 # The unbounded shape spends the file's 6 s TWICE in the caller-side resolution before the pre-check even
 # starts (~18 s measured); the bounded one spends 1 s per source. 13 s separates them with slack for a
 # loaded box, and the rc pins the DIRECTION: a bound that fires is a REFUSAL, never a started lane.
-if printf '%s\n' "$out" | grep -q 'SPAWN rc=1' && [ "$dt" -le 13 ]; then rc=0
+if grep -q 'SPAWN rc=1' <<<"$out" && [ "$dt" -le 13 ]; then rc=0
 else rc=1; echo "      rc/wall: dt=${dt}s out=$out"; fi
 ck "…and a SPAWN on that box is REFUSED in bounded time (${dt}s), not left to wait on the env file" $rc
 
@@ -365,7 +391,7 @@ h="$TMP/h-rec-gate"; mkhome "$h"
 out="$(bash "$TMP/spawn.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-rec-gate" 2>&1)"
 col="$(name_col "$TMP/O-rec-gate/state/spawn-refused.tsv")"
 reason="$(awk -F'\t' 'NR==1{print $2}' "$TMP/O-rec-gate/state/spawn-refused.tsv" 2>/dev/null)"
-if [ -z "$col" ] && printf '%s' "$reason" | grep -q 'DEEPSEEK_API_KEY'; then rc=0
+if [ -z "$col" ] && grep -q 'DEEPSEEK_API_KEY' <<<"$reason"; then rc=0
 else rc=1; echo "      first column=[$col] reason=[${reason:0:80}]"; fi
 ck "…and the MODEL-CREDENTIAL gate's refusal leaves that column EMPTY (never the sentence \"a worker on 'deepseek'\")" $rc
 
@@ -387,7 +413,7 @@ ck "the mutation applies (the apiKey-ref detection is replaced with 'm = None')"
 h="$TMP/h-mut"; mkhome "$h"
 mut_out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$MUT" "$h" "$TMP/bin" "$TMP/O-mut" 2>&1)"
 # ARM 4's predicate, verbatim, evaluated against the mutant.
-printf '%s\n' "$mut_out" | grep -q '^RC=1$' && mutred=0 || mutred=1
+grep -q '^RC=1$' <<<"$mut_out" && mutred=0 || mutred=1
 [ "$mutred" = "1" ] && rc=0 || { rc=1; echo "      mutant ALSO refused — arm 4 tests nothing"; }
 ck "MUTANT: arm 4's predicate (\"nothing provides it => REFUSE\") FAILS — the mutant answers RC=0 and spawns a lane that cannot authenticate" $rc
 
