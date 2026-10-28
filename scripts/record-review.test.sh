@@ -612,6 +612,49 @@ else
 fi
 [ -f "$Q6" ] && ok "record written in guard+evidence flow" || bad "record written in guard+evidence flow"
 
+# ── #1224 — ONE MINT, TWO ARTIFACTS, AND THEY MUST AGREE ──────────────────
+# check (c) now reads the head-bound RECORD FILE first and falls back to the
+# BODY marker only when no record covers the head (agent-infra#1224). That makes
+# AGREEMENT between the two a correctness property: if one run could write a
+# record at head H with verdict V and append a marker naming a DIFFERENT
+# revision, the fallback would be evidence for a revision nobody recorded — the
+# gate's own fallback certifying an unreviewed head. The assertion is on the
+# (pr, verdict, head, repo) fields only; the marker's optional ` diff=`/` sig=`
+# are tolerated, because those are the producer's signing/CARRY contract (#2982)
+# and are not part of the binding the gate reads.
+# The SECOND run pins idempotency from the outside: the record must come back
+# BYTE-IDENTICAL (no churned `reviewed_at`; the #1709 rec 7 no-op is §15.4) and
+# the body post must remain a no-op-once-posted append (§12). Together they are
+# what makes a duplicate execution harmless — and a duplicate execution is the
+# documented remedy for a skipped post.
+Q6V="$(sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6H="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6_RE="review recorded: reviews/424246\.json verdict=${Q6V} @ ${Q6H}( diff=[0-9a-f]{64})? \(daniel-ospina/agent-infra\)( sig=[0-9a-f]{64})?$"
+cp "$Q6" "$T/q6-before.json" 2>/dev/null || true
+P1224="$T/p1224-patch.json"; : > "$P1224"
+STUB_CAPTURE="$P1224" run_record "daniel-ospina/agent-infra" 424246
+# The capture is the PATCH payload (`{"body": "…"}`, exactly what the producer
+# sends), so the assertion reads `.body` rather than grepping the JSON envelope —
+# the envelope would defeat the end-anchor below. Without jq the raw file is read:
+# the marker line is then embedded in JSON and the anchor simply does not apply.
+P1224_BODY="$T/p1224-body.txt"
+if command -v jq >/dev/null 2>&1; then
+    jq -r '.body // ""' "$P1224" > "$P1224_BODY" 2>/dev/null || cp "$P1224" "$P1224_BODY"
+else
+    cp "$P1224" "$P1224_BODY"
+fi
+if [ "$RECORD_RC" = "0" ] && grep -qE "$Q6_RE" "$P1224_BODY" 2>/dev/null; then
+    ok "#1224 the body marker and the record AGREE on (pr, verdict, head, repo) — the gate's fallback is evidence for the revision the record certifies"
+else
+    bad "#1224 the body marker and the record DISAGREE (or the re-run posted nothing) — check (c)'s fallback would certify a different revision than the record"
+fi
+if cmp -s "$Q6" "$T/q6-before.json"; then
+    ok "#1224 a duplicate run left the record BYTE-IDENTICAL (idempotent — reviewed_at not churned)"
+else
+    bad "#1224 a duplicate run REWROTE the record (non-idempotent write / reviewed_at churn)"
+fi
+unset Q6V Q6H Q6_RE P1224 P1224_BODY
+
 echo "── 7. Stale-sha refusal: mismatched head → exit 3, no record ────"
 MISMATCH_SHA="$(printf 'b%.0s' $(seq 1 40))" # 40×b — stub answers aaaa…, so bbbb… is stale
 STUB_HEAD_SHA="$SHA" run_record_rc "daniel-ospina/agent-infra" 424247 "$MISMATCH_SHA"

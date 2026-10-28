@@ -32,9 +32,16 @@
 #   b. SCOPING COMMENT   — linked issue has a comment with the
 #                          `<!-- issue-scoping:` marker (posted by the
 #                          issue-scoping skill)
-#   c. CODE-REVIEW EVID  — the PR body or a commit message must carry a
-#                          record-review.sh RECORD MARKER bound to THIS PR at
-#                          its CURRENT head (#1825):
+#   c. CODE-REVIEW EVID  — a HEAD-BOUND code-review record must exist for THIS
+#                          PR at its CURRENT head (#1825). Two artifacts can
+#                          carry it, and the order is fixed (#1224):
+#                          1. the RECORD FILE, written and owned by
+#                             record-review.sh, which the PR cannot edit:
+#                             ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json
+#                                 → {pr, head_sha, verdict, repo, reviewed_at}
+#                          2. only when no record covers this head, the marker
+#                             line a record-review.sh run APPENDS to the PR body
+#                             (or a commit message):
 #                             review recorded: reviews/<PR>.json verdict=<v> @
 #                               <40-hex head sha>[ diff=<64hex>] (owner/repo)
 #                               [ sig=<64hex>]
@@ -51,6 +58,18 @@
 #                          Low content-shape class, read from the producer's
 #                          OWN definition (record-review.sh::clean_low_*,
 #                          SOURCED — never restated here).
+#                          ⛔ SOURCE ORDER (#1224): the head-bound RECORD FILE
+#                          ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json is read
+#                          FIRST, and the body/commit marker is the FALLBACK. The
+#                          body is one `gh pr edit` away from any lane — an
+#                          unrelated typo fix destroyed the attestation on
+#                          agent-infra#1209 and premise-labs#3788 — while the
+#                          record cannot be edited by the PR at all. Every (c)
+#                          line PRINTS which source answered, so a green proved by
+#                          the immutable artifact is distinguishable from one
+#                          proved by a mutable field. A record whose head_sha is
+#                          NOT the head being merged is always refused, naming
+#                          both shas: a record certifies exactly one revision.
 #   d. PLAN DOC          — complexity:standard/complex issues need a plan doc:
 #                          the PR adds/modifies a file under docs/plans/*.md,
 #                          OR the scoping comment contains a `Wiring` section
@@ -506,6 +525,150 @@ has_review_record() {
 has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
 has_clean_micro_marker() { grep -qE "$CLEAN_MICRO_MARKER_RE" <<<"$1"; }
 has_clean_low_marker() { grep -qE "$CLEAN_LOW_MARKER_RE" <<<"$1"; }
+
+# ── #1224: THE HEAD-BOUND RECORD FILE IS THE FIRST SOURCE ────────────────────
+#
+# THE DEFECT THIS REMOVES FROM THE TRUST PATH. `record-review.sh` mints TWO
+# artifacts for one review: the record FILE
+# (`~/.pi/agent/reviews/<owner>-<repo>-<PR>.json`, carrying `head_sha` and
+# `verdict`) and a marker line APPENDED to the PR BODY. The body is one
+# `gh pr edit` away from anybody — an unrelated typo fix, a corrected claim, the
+# closing keyword `pipeline-compliance` demands — while the file cannot be edited
+# by the PR at all. Measured 2026-09-18: agent-infra#1209 and premise-labs#3788
+# both went RED on a genuinely reviewed head because the body had been improved
+# after the review. So the RECORD is read first and the BODY is the fallback.
+#
+# ⛔ NEVER THE OTHER WAY ROUND, and never silently: which source answered is
+# PRINTED on every (c) arm (`source=record (…)` / `source=body (…)`), so a
+# reader can tell a green proved by an immutable artifact from one proved by a
+# mutable field — and a red that says BOTH were absent.
+#
+# ⛔ THIS MAKES THE BODY AUTHORITATIVE NOWHERE. The fallback keeps every existing
+# binding (PR number, repo, head, #513 tier, #1356 shape) so no in-flight PR
+# loses its only surviving copy, and the tier bindings are applied to the
+# verdict OF THE SOURCE THAT ANSWERED. An in-flight PR whose only record is the
+# body still passes, and still prints `source=body`.
+#
+# ⛔ THE HEAD COMPARISON IS THE WHOLE POINT. A record bound to a different
+# revision is the STALE class: accepting it would certify an unreviewed head, so
+# it is refused BY NAME, with both shas printed.
+#
+# Fail closed everywhere: an absent file, an unreadable field, a `verdict`
+# outside the accepted set, or an empty head are all NON-evidence — the arms
+# below refuse rather than degrade to "close enough".
+REVIEW_STORE_VERDICTS_RE='^(clean|clean-micro|clean-low)$'
+
+# review_store_candidates <pr> <owner/repo> — the record paths, qualified first.
+# The producer writes the repo-QUALIFIED name and keeps a legacy `<pr>.json`
+# until a qualified record for the same repo migrates it (#426), so both are
+# read (a box mid-migration must not read as "no evidence"); the qualified name
+# wins because it is the one the producer maintains. The repo spelling is
+# lowercased for the file name only — `has_review_record` already compares repo
+# case-insensitively, and GitHub repo names are case-insensitive.
+review_store_candidates() {
+  local pr="$1" repo="$2" slug
+  [ -n "$pr" ] && [ -n "$repo" ] || return 0
+  slug="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  printf '%s\n' \
+    "${HOME:-/nonexistent}/.pi/agent/reviews/${slug%/*}-${slug#*/}-$pr.json" \
+    "${HOME:-/nonexistent}/.pi/agent/reviews/${repo%/*}-${repo#*/}-$pr.json" \
+    "${HOME:-/nonexistent}/.pi/agent/reviews/$pr.json"
+}
+
+# review_record_field <file> <field> — the record's raw string value, "" if absent.
+# Same idiom the record's other consumers use (merge-one.sh::record_at_head,
+# admin-merge.sh's update-safety read): a flat `"key":"value"` scan, so a
+# record whose fields are in a different ORDER still reads. ⛔ It reads NOTHING
+# from a record re-serialised with spaces around the colon (`"head_sha": "…"`)
+# — that yields empty, which every caller treats as NON-evidence: a fail-closed
+# miss, never a pass on a field we could not read. The producer writes compact
+# JSON, and this refuses rather than guesses if that ever changes.
+review_record_field() {
+  local f="$1" key="$2"
+  sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | command head -1
+}
+
+# review_record_at_head <pr> <owner/repo> <head> — prints "<path> <verdict>" and
+# returns 0 iff a RECORD for this PR carries EXACTLY this head_sha.
+#
+# ⛔ THE BINDING IS THIS FUNCTION'S ONE ASSERTION, and it is load-bearing: with
+# `[ "$sha" = "$head" ] || continue` removed, a record for an OLDER head is
+# accepted and check (c) certifies an unreviewed revision (the suite's §1224b
+# mutation flips exactly that line).
+review_record_at_head() {
+  local pr="$1" repo="$2" head="$3" f sha verdict rec_repo want_repo
+  [ -n "$pr" ] && [ -n "$repo" ] && [ -n "$head" ] || return 1
+  want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$f" ] || continue
+    verdict="$(review_record_field "$f" verdict)"
+    [[ "$verdict" =~ $REVIEW_STORE_VERDICTS_RE ]] || continue
+    # A record that NAMES another repo is not this PR's, however its number
+    # reads — PR numbers collide across repos, and the legacy `<pr>.json`
+    # candidate is shared by all of them. An absent `repo` field is the legacy
+    # shape (#426) and is accepted on the head binding alone.
+    rec_repo="$(review_record_field "$f" repo)"
+    if [ -n "$rec_repo" ]; then
+      [ "$(printf '%s' "$rec_repo" | tr 'A-Z' 'a-z')" = "$want_repo" ] || continue
+    fi
+    sha="$(review_record_field "$f" head_sha)"
+    [ "$sha" = "$head" ] || continue
+    printf '%s %s\n' "$f" "$verdict"
+    return 0
+  done < <(review_store_candidates "$pr" "$repo")
+  return 1
+}
+
+# resolve_review_evidence <evid-text> <pr> <owner/repo> <head>
+#   Returns 0 iff a HEAD-BOUND source was found, and sets:
+#     REVIEW_EVIDENCE_SOURCE          record | body
+#     REVIEW_EVIDENCE_VERDICT         clean | clean-micro | clean-low
+#     REVIEW_EVIDENCE_WHERE           the record path, or "PR body/commit messages"
+#     REVIEW_EVIDENCE_STALE_PATH/SHA  a record present at ANOTHER head (refused,
+#                                     reported) — "" when there is none
+#     REVIEW_EVIDENCE_RECORD_PRESENT  the first record file seen for this PR,
+#                                     even when unusable (so a refusal can say
+#                                     "a file exists but is not evidence")
+#   Order is RECORD then BODY. The body arm is the pre-#1224 matcher verbatim
+#   (`has_review_record`), so nothing about what a body marker must SAY changed
+#   here — only which artifact is consulted first.
+resolve_review_evidence() {
+  local text="$1" pr="$2" repo="$3" head="$4" hit path verdict f sha
+  REVIEW_EVIDENCE_SOURCE=""; REVIEW_EVIDENCE_VERDICT=""; REVIEW_EVIDENCE_WHERE=""
+  REVIEW_EVIDENCE_STALE_PATH=""; REVIEW_EVIDENCE_STALE_SHA=""; REVIEW_EVIDENCE_RECORD_PRESENT=""
+  [ -n "$pr" ] && [ -n "$repo" ] && [ -n "$head" ] || return 1
+  # 1. THE IMMUTABLE SOURCE.
+  if hit="$(review_record_at_head "$pr" "$repo" "$head")"; then
+    path="${hit% *}"; verdict="${hit##* }"
+    REVIEW_EVIDENCE_SOURCE="record"
+    REVIEW_EVIDENCE_VERDICT="$verdict"
+    REVIEW_EVIDENCE_WHERE="$path"
+    REVIEW_EVIDENCE_RECORD_PRESENT="$path"
+    return 0
+  fi
+  # Remember what was there for the refusal text: a record at another head is a
+  # DIFFERENT fact from "no record at all" and the remedy differs.
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    [ -n "$REVIEW_EVIDENCE_RECORD_PRESENT" ] || REVIEW_EVIDENCE_RECORD_PRESENT="$f"
+    sha="$(review_record_field "$f" head_sha)"
+    if [ -n "$sha" ] && [ "$sha" != "$head" ]; then
+      REVIEW_EVIDENCE_STALE_PATH="$f"; REVIEW_EVIDENCE_STALE_SHA="$sha"
+      break
+    fi
+  done < <(review_store_candidates "$pr" "$repo")
+  # 2. THE FALLBACK — the PR body / commit messages, unchanged bindings.
+  if has_review_record "$text" "$pr" "$repo" "$head"; then
+    REVIEW_EVIDENCE_SOURCE="body"
+    REVIEW_EVIDENCE_WHERE="PR body/commit messages"
+    if has_clean_micro_marker "$text"; then REVIEW_EVIDENCE_VERDICT="clean-micro"
+    elif has_clean_low_marker "$text"; then REVIEW_EVIDENCE_VERDICT="clean-low"
+    else REVIEW_EVIDENCE_VERDICT="clean"; fi
+    return 0
+  fi
+  return 1
+}
 
 # resolve_issue_only_ref <target> — map an --issue-only target to owner/repo#N:
 # a bare number resolves against $GH_REPO, an explicit owner/repo#N passes
@@ -1306,23 +1469,35 @@ run_checks() {
       fail c "code-review evidence cannot be graded — the PR's current head sha could not be read, so no record can be BOUND to this revision. Re-run the gate once the API is reachable (the fetch this check needs is pulls/$PR_NUMBER .head.sha)."
       echo "      Missing: a readable PR head sha."
       echo "      Invoke:  re-run this gate — a transient API/permission failure leaves the head unresolved."
-    elif has_review_record "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD"; then
+    elif resolve_review_evidence "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD"; then
+      # #1224 — WHICH SOURCE ANSWERED, printed on every arm of (c).
+      REV_SRC="source=${REVIEW_EVIDENCE_SOURCE} (${REVIEW_EVIDENCE_WHERE})"
+      REV_FELLBACK=""
+      if [[ "$REVIEW_EVIDENCE_SOURCE" == "body" && -n "$REVIEW_EVIDENCE_STALE_PATH" ]]; then
+        REV_FELLBACK="; the on-disk record ${REVIEW_EVIDENCE_STALE_PATH} is bound to ${REVIEW_EVIDENCE_STALE_SHA} — NOT this head — so it was refused and the body answered"
+      fi
       # #513 verdict-tier binding (Approach B): clean-micro certifies the
       # MICRO process only (record-review.sh verifies the linked issue's
       # complexity:micro label at mint; micro skips checks b–e, so reaching
-      # this branch means the issue is NOT micro). A non-micro PR whose
-      # body/commits claim verdict=clean-micro is a false certification —
-      # the record-review.sh marker carries the verdict verbatim. Remediation
-      # includes the stale-marker removal step: record-review.sh APPENDS
-      # markers and never removes them, so re-recording clean leaves the old
-      # clean-micro line behind and this binding keeps firing.
+      # this branch means the issue is NOT micro). A non-micro PR carrying
+      # verdict=clean-micro is a false certification — the verdict is read
+      # from the SOURCE THAT ANSWERED (the record's own field when the record
+      # answered, the marker text when the body did; #1224 moved the source,
+      # not the rule). Remediation includes the stale-marker removal step:
+      # record-review.sh APPENDS markers and never removes them, so
+      # re-recording clean leaves the old clean-micro line behind.
       # Precision (#513 self-review catch): the binding must match the
       # record-review.sh MARKER shape (verdict=… @ <40-hex sha>) — never bare
       # prose mentioning the marker text (this PR's own description tripped
       # the bare-substring grep on the first pipeline-compliance run).
-      if has_clean_micro_marker "$EVID_TEXT"; then
-        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
-      elif has_clean_low_marker "$EVID_TEXT"; then
+      case "$REVIEW_EVIDENCE_VERDICT" in
+        clean-micro) REV_KIND="micro" ;;
+        clean-low)   REV_KIND="low" ;;
+        *)           REV_KIND="plain" ;;
+      esac
+      if [[ "$REV_KIND" == "micro" ]]; then
+        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>), and remove the stale \"verdict=clean-micro\" marker line from the PR body. [$REV_SRC]"
+      elif [[ "$REV_KIND" == "low" ]]; then
         # #1356 clean-low content-shape binding. clean-low certifies that EVERY
         # changed path of the recorded revision is in the Low content-shape
         # class. Unlike clean-micro (a tier exemption), clean-low claims a
@@ -1343,12 +1518,12 @@ run_checks() {
         if [[ "$CLEAN_LOW_CLASS_SOURCED" != "true" ]]; then
           fail c "clean-low verdict marker, but the Low content-shape class could not be read — record-review.sh is not beside this gate (looked at $RECORD_REVIEW_SH), so the diff's shape is UNVERIFIABLE and the clean-low attestation is refused. Ship record-review.sh alongside scripts/check-pipeline-compliance.sh (both are agent-infra files; templates/.github/workflows/pipeline-compliance.yml's WIRING notes cover copying/fetching it), or re-record with the verdict the diff earns."
         elif pr_is_clean_low_shaped "$FILES"; then
-          pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… (clean-low marker; the PR's diff IS Low-shaped)"
+          pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… (clean-low verdict; the PR's diff IS Low-shaped) [$REV_SRC$REV_FELLBACK]"
         else
-          fail c "clean-low verdict marker on a diff that is NOT Low-shaped — clean-low certifies that EVERY changed path is in the Low content-shape class, defined ONCE by record-review.sh::clean_low_path_ok (sourced, not restated), and this PR's diff is not. Re-record at the current head with the verdict the diff actually earns (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact> — its own shape guard refuses clean-low here), and remove the stale \"verdict=clean-low\" marker line from the PR body."
+          fail c "clean-low verdict marker on a diff that is NOT Low-shaped — clean-low certifies that EVERY changed path is in the Low content-shape class, defined ONCE by record-review.sh::clean_low_path_ok (sourced, not restated), and this PR's diff is not. Re-record at the current head with the verdict the diff actually earns (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact> — its own shape guard refuses clean-low here), and remove the stale \"verdict=clean-low\" marker line from the PR body. [$REV_SRC$REV_FELLBACK]"
         fi
       else
-        pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… (record-review.sh marker)"
+        pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… [$REV_SRC$REV_FELLBACK]"
       fi
     else
       # #1825 — the remedy NAMES the producer and the head it must bind to, and
@@ -1357,9 +1532,19 @@ run_checks() {
       # them (agent-infra#1904's own failure text). A gate that teaches a lane
       # how to pass it without doing the work is how (c) trained lanes to route
       # around the process.
-      fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): a line of exactly the form 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825)."
-      echo "      Missing: the code-review record marker for this PR at this head."
-      echo "      Invoke:  code-review — Step 10 records the verdict (record-review.sh <PR> <head-sha> <verdict> --evidence <artifact>), and the tool appends the marker this check reads. If a record already exists at an OLDER head, re-record at the current one: a record certifies exactly one revision."
+      # #1224 — the refusal names BOTH sources it consulted, and prints the
+      # record's own head when one exists at a different revision ("a record
+      # exists but certifies another revision" is a different fact from "no
+      # record at all", and only one of them is fixed by re-recording).
+      if [[ -n "$REVIEW_EVIDENCE_STALE_SHA" ]]; then
+        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER at the CURRENT head (${PR_HEAD:0:12}…): the on-disk record ${REVIEW_EVIDENCE_STALE_PATH} is bound to ${REVIEW_EVIDENCE_STALE_SHA} but this PR's head is ${PR_HEAD} — a record certifies exactly ONE revision, so accepting it would certify an unreviewed head. No head-bound marker exists in the PR body/commit messages either. [source=none: record=${REVIEW_EVIDENCE_STALE_PATH} (stale), body=absent]"
+        echo "      Missing: a review record for head $PR_HEAD (the record on disk is for ${REVIEW_EVIDENCE_STALE_SHA})."
+        echo "      Invoke:  re-record at the current head — record-review.sh <PR> $PR_HEAD <verdict> --evidence <artifact> — which rewrites the record FILE and appends the marker beside it."
+      else
+        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh artifact for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): the record file '~/.pi/agent/reviews/${GH_REPO%/*}-${GH_REPO#*/}-$PR_NUMBER.json' (head_sha == $PR_HEAD) or the marker line 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825). [source=none: record absent at ${HOME:-~}/.pi/agent/reviews, body/commits absent]"
+        echo "      Missing: the code-review record for this PR at this head."
+        echo "      Invoke:  code-review — Step 10 records the verdict (record-review.sh <PR> <head-sha> <verdict> --evidence <artifact>), which writes BOTH the head-bound record file and the body marker this check falls back to. If a record already exists at an OLDER head, re-record at the current one: a record certifies exactly one revision."
+      fi
     fi
 
     # d. PLAN DOC — standard/complex only.
@@ -1491,7 +1676,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for an issue reference that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count, and can auto-close an issue on merge): EITHER a closing keyword (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL), which auto-closes on merge, OR a non-closing traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N), which does not — accepted for ANY diff (#1630), so a PR implementing only PART of an issue need not lie; the artifact-only class ($ARTIFACT_CLASS_DESC) is no longer required for the traceability form — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
-  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER + /commits → the PR body or a commit message must carry a record-review.sh RECORD MARKER bound to THIS PR at its CURRENT head: 'review recorded: reviews/<PR>.json verdict=<v> @ <40-hex head sha> (<owner/repo>)'. No phrase ('code-review', 'reviewer', 'VGATE', …) satisfies it (#1825). Two markers carry a VERDICT and are bound: verdict=clean-micro on a non-micro issue fails, and verdict=clean-low is accepted only when the PR's whole diff is in the Low content-shape class sourced from record-review.sh (#513, #1356)"
+  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER + /commits → READ RECORD-FIRST (#1224): the head-bound record FILE ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json is consulted first, and the PR body/commit marker is the FALLBACK, so a body edit cannot destroy the proof | ⛔ the body (marker line 'review recorded: reviews/<PR>.json verdict=<v> @ <40-hex head sha> (<owner/repo>)') is accepted ONLY when no record covers this head; the (c) line always prints source=<record|body> | A record whose head_sha is NOT the current head is REFUSED naming both shas | No phrase ('code-review', 'reviewer', 'VGATE', …) satisfies it (#1825) | Two markers carry a VERDICT and are bound: verdict=clean-micro on a non-micro issue fails, and verdict=clean-low is accepted only when the PR's whole diff is in the Low content-shape class sourced from record-review.sh (#513, #1356)"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
   echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
   echo ""
@@ -1853,6 +2038,104 @@ if [[ "$FAIL_ALL" == "1" ]]; then
     echo "  ❌ passes 11–14: $P11_FAILS field-binding assertion(s) failed" >&2
     exit 2
   fi
+  summarize || true
+
+  # ── #1224 — THE RECORD-FIRST READ: the red-to-green case, the refusal that
+  # must survive the fix, and the fallback that keeps in-flight PRs working ──
+  #
+  # THE MEASURED DEFECT. The attestation lived only in the PR body, so a later
+  # body edit — a typo fix, a corrected claim, the closing keyword that
+  # `pipeline-compliance` itself demands — destroyed it, and check (c) went RED
+  # on a review that genuinely happened (agent-infra#1209 and premise-labs#3788,
+  # both 2026-09-18). The record FILE is head-bound and the PR cannot edit it, so
+  # (c) now reads it FIRST and falls back to the body only when it is absent.
+  #
+  #   1224a  body marker WIPED + on-disk record for THIS head  ⇒ PASS,
+  #          source=record.  THIS IS THE RED-TO-GREEN CASE: it is the population
+  #          the issue measures (the NO_MARKER class), and it must move from red
+  #          to green — not the other way while looking green.
+  #   1224b  record bound to a DIFFERENT head, no body marker ⇒ FAIL, naming BOTH
+  #          shas. The refusal the fix must never relax: a record certifies one
+  #          revision, and accepting a stale one certifies an UNREVIEWED head.
+  #   1224c  NO record at all + body marker at this head ⇒ PASS, source=body.
+  #          The fallback control: every in-flight PR, and every box whose store
+  #          was never written, keeps working — so this change cannot strand a
+  #          PR that is green today.
+  #
+  # Each pass runs under its OWN $HOME: an ambient record on the machine RUNNING
+  # the suite would let 1224a pass for the wrong reason and make 1224c
+  # unreachable. Failures ACCUMULATE (no early exit) so the SELF_TEST can show
+  # which mutation flipped which pass, and that the OTHER passes stayed green.
+  P1224_FAILS=0
+  P1224_BASE="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-1224.XXXXXX")"
+  P1224_ALT="$(printf 'b%.0s' {1..40})"
+  p1224_record() { # p1224_record <home> <head> <verdict> — the producer's record
+    mkdir -p "$1/.pi/agent/reviews"
+    printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"%s","reviewed_at":"2026-09-18T00:00:00Z"}\n' \
+      "$PR_NUMBER" "$2" "$3" "$GH_REPO" > "$1/.pi/agent/reviews/${GH_REPO%/*}-${GH_REPO#*/}-$PR_NUMBER.json"
+  }
+  p1224_fixtures() { # p1224_fixtures <body> <commits> — a PR whose ONLY question is (c)
+    PR_BODY="$1"; LABELS="complexity:standard"
+    SCOPING_COMMENT='<!-- issue-scoping: 2026-09-18 (standard) -->'
+    COMMIT_MSGS="$2"
+    FILES=$'added\tdocs/plans/2026-09-18-issue-1224-review-record-source.md\t'
+    FILES_EXPECTED=1
+    FAILURES=0
+  }
+  p1224_run() { # p1224_run <home> <log> — run_checks against a given record store
+    local home="$1" log="$2" saved_home="$HOME"
+    HOME="$home"
+    run_checks > "$log" 2>&1 || true
+    HOME="$saved_home"
+  }
+
+  echo ""
+  echo "== SIMULATION: pass 1224a (#1224: body attestation WIPED, on-disk record intact → (c) PASSES) =="
+  p1224_record "$P1224_BASE/a" "$FIX_HEAD" clean
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/a" "$P1224_BASE/a.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=record' "$P1224_BASE/a.log"; then
+    echo "  ✅ pass 1224a: (c) PASSED from the on-disk record with NO body marker (0 failures, source=record)"
+  else
+    echo "  ❌ pass 1224a: the on-disk record at THIS head did NOT satisfy check (c) (failures=$FAILURES) — the #1224 red-to-green case is broken" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/a.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224b (#1224: record bound to ANOTHER head → (c) REFUSES, naming both shas) =="
+  p1224_record "$P1224_BASE/b" "$P1224_ALT" clean
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/b" "$P1224_BASE/b.log"
+  if [[ "$FAILURES" -eq 1 ]] \
+    && grep -q '❌ \[c\]' "$P1224_BASE/b.log" \
+    && grep -q "$P1224_ALT" "$P1224_BASE/b.log" \
+    && grep -q "$FIX_HEAD" "$P1224_BASE/b.log"; then
+    echo "  ✅ pass 1224b: a record bound to ${P1224_ALT:0:12}… was REFUSED for head ${FIX_HEAD:0:12}…, with BOTH shas named (1 failure)"
+  else
+    echo "  ❌ pass 1224b: a record bound to ANOTHER head was ACCEPTED, or the refusal did not name both shas (failures=$FAILURES) — a stale record would certify an unreviewed head" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/b.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224c (#1224 fallback: NO record at all → the body attestation still PASSES) =="
+  mkdir -p "$P1224_BASE/c"   # a HOME with NO ~/.pi/agent/reviews at all
+  p1224_fixtures "Fixes #1" "$(rec_marker clean)"
+  p1224_run "$P1224_BASE/c" "$P1224_BASE/c.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=body' "$P1224_BASE/c.log"; then
+    echo "  ✅ pass 1224c: with no record on disk the body marker still satisfied (c) (0 failures, source=body)"
+  else
+    echo "  ❌ pass 1224c: the body FALLBACK stopped working (failures=$FAILURES) — every in-flight PR whose only record is the body would be stranded" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/c.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  if [[ "$P1224_FAILS" -ne 0 ]]; then
+    echo "  ❌ passes 1224a–c: $P1224_FAILS record-source assertion(s) failed" >&2
+    exit 2
+  fi
+  rm -rf "$P1224_BASE"
   summarize || true
 
   exit 1
@@ -3131,6 +3414,84 @@ $big_filler"
   unset CL_SHA40 CL_MODERN CL_PROSE CL_MODERN_OK CL_PROSE_OK CL_LOG CL_RC CL_OK CL_MUT_DIR CL_MUT CL_MLOG CL_MRC \
     CL_ABS_DIR CL_ABS CL_ALOG CL_ARC CL_AOK CL_AMUT CL_AMLOG CL_AMRC 2>/dev/null || true
 
+  # ── #1224 — the RECORD-FIRST source, and the two mutations that must flip it ──
+  # check (c) read its attestation from ONE place: the PR body, which any
+  # `gh pr edit` overwrites (a typo fix did exactly that on agent-infra#1209 and
+  # premise-labs#3788). It now reads the head-bound RECORD FILE first and the
+  # body only as a fallback. THREE runs pin it, because a suite that only proved
+  # the happy path would let a fail-open land green:
+  #   * the REAL gate must report passes 1224a/1224b/1224c clean (record-first
+  #     works, the stale record is refused with both shas, the body fallback
+  #     still serves) — this is what puts those vectors in front of CI at all,
+  #     since CI runs SELF_TEST and never FAIL_ALL (#991).
+  #   * MUTANT A deletes the JSON read (`review_record_at_head() { return 1; }`)
+  #     and must FLIP pass 1224a — while 1224c stays green, which is what makes
+  #     the mutation specific to the record read rather than to check (c) as a
+  #     whole.
+  #   * MUTANT B drops the head comparison (`[ "$sha" = "$head" ] || continue`
+  #     becomes `:`) and must FLIP pass 1224b — while 1224a and 1224c stay green.
+  #     That line is the whole point of the fix: with it gone a record for an
+  #     OLDER head certifies an UNREVIEWED revision.
+  RV1224_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-1224-mut.XXXXXX")"
+  rv1224_drive() { # rv1224_drive <script> <log> — FAIL_ALL, isolated $HOME, rc on stdout
+    local s="$1" log="$2" rc=0
+    mkdir -p "$RV1224_DIR/home"
+    HOME="$RV1224_DIR/home" \
+    PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+      PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+      GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$s" >"$log" 2>&1 || rc=$?
+    printf '%s' "$rc"
+  }
+  RV1224_RC="$(rv1224_drive "$SELF_SRC" "$RV1224_DIR/real.log")"
+  RV1224_BAD=0
+  for RV1224_P in 1224a 1224b 1224c; do
+    grep -q "✅ pass $RV1224_P" "$RV1224_DIR/real.log" || RV1224_BAD=$((RV1224_BAD + 1))
+  done
+  if [[ "$RV1224_RC" == "1" && "$RV1224_BAD" == "0" ]]; then
+    printf '✅ #1224: the REAL gate reads the head-bound record FIRST — 1224a passes with the body attestation WIPED (source=record), 1224b REFUSES a record bound to another head naming both shas, and 1224c still accepts the body fallback (source=body)\n'
+  else
+    printf '❌ #1224: the record-first read is unpinned or wrong (rc=%s, %s of 3 vectors not green) — check (c) still depends on the mutable PR body alone\n' "$RV1224_RC" "$RV1224_BAD" >&2
+    grep -E 'pass 1224|❌ \[c\]' "$RV1224_DIR/real.log" >&2 || true
+    selffail=$((selffail + 1))
+  fi
+  # MUTANT A — the JSON read deleted. Nothing else touched, so the body fallback
+  # must survive: 1224c green is the control that proves what was removed.
+  RV1224_MA="$RV1224_DIR/mutantA.sh"
+  perl -0pe 's/\Qreview_record_at_head()\E \{.*?\n\}/review_record_at_head() { return 1; }/s' "$SELF_SRC" > "$RV1224_MA" || true
+  if [[ ! -s "$RV1224_MA" ]] || cmp -s "$RV1224_MA" "$SELF_SRC" || ! bash -n "$RV1224_MA" 2>/dev/null; then
+    printf '❌ #1224 mutation A: could not delete the record read (review_record_at_head reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_ARC="$(rv1224_drive "$RV1224_MA" "$RV1224_DIR/mutA.log")"
+    if grep -q '❌ pass 1224a' "$RV1224_DIR/mutA.log" && grep -q '✅ pass 1224c' "$RV1224_DIR/mutA.log"; then
+      printf '✅ #1224 mutation A is caught: with the JSON record read DELETED, 1224a flips to red ("❌ pass 1224a: the on-disk record at THIS head did NOT satisfy check (c)") while the body fallback 1224c stays green — the record read is load-bearing, and only it\n'
+    else
+      printf '❌ #1224 mutation A NOT caught (mutant rc=%s) — deleting the record read does not redden 1224a, so the vector proves nothing\n' "$RV1224_ARC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutA.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT B — the head comparison dropped: the fix's whole point.
+  RV1224_MB="$RV1224_DIR/mutantB.sh"
+  # ⛔ EXPLICIT ESCAPING, not \Q...\E: `\Q` quotemeta runs AFTER variable
+  # interpolation in a Perl regex, so \Q"$sha"\E compiles to `""` and silently
+  # matches nothing — the mutation would report itself blind (measured here).
+  perl -0pe 's/\n    \[ "\$sha" = "\$head" \] \|\| continue/\n    :/' "$SELF_SRC" > "$RV1224_MB" || true
+  if [[ ! -s "$RV1224_MB" ]] || cmp -s "$RV1224_MB" "$SELF_SRC" || ! bash -n "$RV1224_MB" 2>/dev/null; then
+    printf '❌ #1224 mutation B: could not drop the head comparison ([ "$sha" = "$head" ] || continue reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_BRC="$(rv1224_drive "$RV1224_MB" "$RV1224_DIR/mutB.log")"
+    if grep -q '❌ pass 1224b' "$RV1224_DIR/mutB.log" && grep -q '✅ pass 1224a' "$RV1224_DIR/mutB.log"; then
+      printf '✅ #1224 mutation B is caught: with the head comparison DROPPED, 1224b flips to red ("❌ pass 1224b: a record bound to ANOTHER head was ACCEPTED…") while 1224a stays green — the head binding is what refuses a stale record, not the record'\''s presence\n'
+    else
+      printf '❌ #1224 mutation B NOT caught (mutant rc=%s) — dropping the head comparison does not redden 1224b, so a stale record would certify an unreviewed head\n' "$RV1224_BRC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutB.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  rm -rf "$RV1224_DIR"
+
   # ── #1825 — check (c)'s evidence is a HEAD-BOUND RECORD, not a phrase ──────
   # The issue's measured defect: (c) was a substring alternation over the PR
   # body and the commit messages, so a PR merged with no reviewer behind it as
@@ -3379,7 +3740,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825)."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; check (c) accepts ONLY a record BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and (#1224) that evidence is read from the head-bound RECORD FILE first with the PR body as a FALLBACK only — the source that answered is printed on every (c) line, the body-wiped red-to-green case passes from the record, a record bound to another head is REFUSED naming both shas, and two mutations (the record read deleted; the head comparison dropped) each redden exactly their own vector."
   exit 0
 fi
 

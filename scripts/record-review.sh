@@ -120,6 +120,21 @@
 # consumed by the review-enforcer merge registry gate
 # (extensions/review-enforcer/index.ts, issue #138).
 #
+# ONE MINT, TWO ARTIFACTS — AND THEY ARE NOT INTERCHANGEABLE (#1224).
+#   1. the RECORD FILE, ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json, which is
+#      head-bound (`head_sha`) and which the PR itself cannot edit. The gate
+#      reads it FIRST.
+#   2. a MARKER LINE appended to the PR BODY, signed, so a human can see the
+#      attestation on the PR. It is the gate's FALLBACK, used only when no
+#      record covers the head.
+# The order matters and must not be reversed. The body is one `gh pr edit` away
+# from anybody — an unrelated typo fix, a corrected claim, the closing keyword
+# the compliance gate demands — and that edit used to destroy the only copy,
+# reddening a genuinely reviewed PR (agent-infra#1209, premise-labs#3788, both
+# 2026-09-18). So: never stop writing the record, and never make the body
+# authoritative anywhere. Both writes are idempotent, and a failure to post the
+# body is NOT a failure to record (see the post block).
+#
 # Canonical copy — production lives at ~/.pi/agent/scripts/record-review.sh,
 # refreshed from this repo copy by the pi-bootstrap/setup.sh merge-gate
 # scripts farm (#562) on every sync (auto-sync at session_start / sync.sh).
@@ -3477,11 +3492,16 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   if BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
     [ "$BODY" = "null" ] && BODY=""
   else
-    echo "⚠️ record-review: could not read PR body (transient API failure?) — evidence post skipped; record still saved. Re-run record-review.sh to retry the post." >&2
+    echo "⚠️ record-review: could not read PR body (transient API failure?) — evidence post skipped. #1224: the RECORD at $FILE was already written and is the gate's PRIMARY source, so the review counts at this head regardless; the body marker is only the human-readable copy and the fallback. Re-run record-review.sh (idempotent) if you also want that copy restored." >&2
     exit 0
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
   # not silently skip the evidence post; the gate would fail with no trace).
+  # ⛔ #1224: THIS POST IS NOT THE EVIDENCE OF RECORD. check (c) reads the
+  # head-bound record FILE above first and only falls back to this line, so the
+  # body is a human-readable copy and a fallback — never the trust anchor. Do
+  # not "simplify" by making this the primary artifact, and do not let a failed
+  # post look like a failed record.
   MISSING=""
   if ! grep -qF "$MARKER" <<<"$BODY"; then
     MISSING="$MARKER"
