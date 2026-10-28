@@ -424,11 +424,19 @@ the tree) reporting the code a genuinely overloaded box produces (wait). So:
   `bash $O/capacity.sh probe <checkout>` (`host ncpu load1 lpc lanes disk_free_mb mem_free_mb at procs
   procs_max fork src`, agent-infra#2253), read once *after* the decision and **never** used to take it —
   the gate already decided, on its own numbers. An unreadable probe is recorded as
-  `room_read: false` with the reason and does not change the code, because the refusal stands on the
+  `room_read: false` with the reason in `room_why` (a missing `capacity.sh`, a probe that could not
+  fork, a core field that could not be measured — each names a DIFFERENT repair, which is why the
+  reason belongs in the record a non-terminal reader parses and not only in the log) and does not
+  change the code, because the refusal stands on the
   gate's measurement (`capacity.sh` exits 254 when the read itself could not fork, 2 when a core field
   could not be measured);
 - the readers agree on the word: `heartbeat-loop.sh` prints `PR-DOCTOR WAITING rc=6`,
-  `objective.py::pr_doctor_last_run` renders `WAITING (no capacity)`, `repo_row()` says `verdict=WAITING`.
+  `objective.py::pr_doctor_last_run` renders `WAITING (no capacity)`, `repo_row()` says `verdict=WAITING`,
+  and the same beat's SCHEDULED-JOB arm prints `PR-DOCTOR LAUNCHD WAITING (last exit 6)` rather than
+  `LAUNCHD RED` (agent-infra#2291 review, P1 — the arm reported launchd's non-zero last exit as a
+  failure, so one pass printed both `WAITING` and `RED` about one verdict; `6` is now DECLARED a
+  non-failure there, the way systemd's `SuccessExitStatus=` declares one, and every other non-zero
+  last exit still reads `RED`).
   **None of them reads `6` as `ok`** (§2: cannot-verify is never a pass) and none reads it as `RED`.
   ⛔ AND ALL THREE ARE FRESHNESS-BOUNDED FIRST FOR `0` AND `6` (#2291 review, P2 — the first version
   of this paragraph claimed it for every code and for all three readers, which the code refutes).

@@ -7553,8 +7553,25 @@ def test_an_unreadable_box_probe_is_named_and_never_softens_the_verdict(monkeypa
     assert rc == 6, joined
     assert payload.get("room") == "" and payload.get("room_read") is False, payload
     assert "UNREADABLE" in joined and "not installed" in joined, joined
+    # ⛔ AND THE REASON IS IN THE SIDECAR, NOT ONLY IN THE LOG (#2291 review, P3 -- reproduced).
+    # `docs/ops/self-healing-contract.md` §3.6 promises `room_read: false` *with the reason*; the
+    # first version wrote the flag and sent the `why` to `log()` alone, so a reader holding only the
+    # sidecar could see the box was unmeasurable but not WHICH repair it needs -- a missing
+    # `capacity.sh` (reinstall the harness) and a box that cannot fork (restart it) are opposite
+    # actions. The log assertion above must NOT be what satisfies the contract.
+    assert "not installed" in (payload.get("room_why") or ""), payload
     assert payload.get("no_room_bound") == "disk"
     assert "reclaim disk" in payload.get("next_action", ""), payload
+
+
+def test_a_READABLE_box_probe_records_no_reason_to_explain(monkeypatch, tmp_path):
+    """`room_why` is EMPTY on a successful read — the field says why it failed, never invents one."""
+    monkeypatch.setattr(pr, "CAPACITY_SH", _fake_capacity(tmp_path, RECORD))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+                                      launched=False, bound="load")
+    assert rc == 6
+    assert payload.get("room_read") is True and payload.get("room") == RECORD, payload
+    assert payload.get("room_why") == "", payload
 
 
 def test_pr_doctor_owns_no_SECOND_set_of_capacity_thresholds():

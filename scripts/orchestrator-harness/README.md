@@ -2382,7 +2382,10 @@ exit of `pr-doctor.py` writes `$STATE/pr-doctor.status.json` (`rc`, a one-line r
 went out) and prints `dispatched N of M queued — <why>`, so `dispatched 0` is never healthy while the
 queue has runnable items; `objective.py` renders the last pass's verdict as `PR-DOCTOR(last run):
 RED rc=N Nm ago — <reason>` beside the queue's own shape, and `heartbeat-loop.sh` prints the same
-verdict and launchd's last exit. The `issue_work` field is **PUBLISHED AND UNREAD**: the retired
+verdict and launchd's last exit — `LAUNCHD RED (last exit N)` for a real failure, and
+`LAUNCHD WAITING (last exit 6)` when that last exit is `NO-CAPACITY`, because `6` is a declared
+non-failure (agent-infra#2291) and reporting it as `RED` from the scheduled-job arm made one pass
+print two contradictory words about one verdict. The `issue_work` field is **PUBLISHED AND UNREAD**: the retired
 `retired/queue-dispatch.py` was its only consumer — it SKIPPED new issue work while un-owned PRs
 existed, refusing only on a positive, FRESH reading (a missing, stale, unreadable or refused record
 blocked nothing and said so).

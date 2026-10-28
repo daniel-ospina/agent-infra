@@ -912,15 +912,38 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
   fi
   # The SCHEDULED job is a separate component: its verdict is final only when it is NOT running
   # (a live pid's second column is the PREVIOUS run's status, so it is not a verdict yet).
-  _plline=$(launchctl list 2>/dev/null | awk -v l=com.tortoise.pr-doctor '$3==l {print $1" "$2}')
+  # ⛔ THE BINARY IS A SEAM SO THE ARM CAN BE TESTED (#2291 review, P1). The suite stubs every other
+  # child of a pass, but `launchctl` could not be stubbed: this file PINS `PATH` a few dozen lines
+  # above (agent-infra#1988), which discards whatever the caller prepended -- so the arm had no
+  # fixture and `LAUNCHD RED (last exit 6)` shipped unseen. `HEARTBEAT_LAUNCHCTL` is the same kind of
+  # seam as `HEARTBEAT_PASS_ONCE`: it changes nothing about a real run (the default IS `launchctl`)
+  # and it is the only way to put a job table in front of the reader.
+  _plline=$("${HEARTBEAT_LAUNCHCTL:-launchctl}" list 2>/dev/null \
+            | awk -v l=com.tortoise.pr-doctor '$3==l {print $1" "$2}')
   _plpid=${_plline%% *}
   _plcode=${_plline#* }
   # `-` in the status column means "not running and NO last-exit code recorded", which is not a
   # failure to report as one -- an earlier version printed `LAUNCHD RED (last exit -)`.
+  # ⛔ AND EXIT 6 IS NOT A FAILURE HERE EITHER (agent-infra#2291 review, P1 -- reproduced). The
+  # `.rc` and sidecar readers above were taught that a NO-CAPACITY pass is `WAITING`, but this arm
+  # still read launchd's LAST EXIT STATUS as a boolean (`!= "0"`), so ONE pass printed BOTH words
+  # about the SAME verdict -- `PR-DOCTOR WAITING rc=6` AND `PR-DOCTOR LAUNCHD RED (last exit 6)` --
+  # falsifying the contract this very change writes (`docs/ops/self-healing-contract.md` §3.6: "none
+  # reads it as `RED`"). It bit hardest on the Mac, where that doc says the scheduled job is the
+  # ONLY producer, and the suite could not see it because `launchctl` was never stubbed.
+  # The fix is the one every supervisor uses for an intentional non-zero code: DECLARE it instead of
+  # inferring failure from non-zero -- systemd's `SuccessExitStatus=` (and `ExecCondition=`'s
+  # 1..254 skip range) exists for exactly this, and its docs are explicit that an undeclared non-zero
+  # means failure. So 6 gets its own non-failure word, and every other non-zero code keeps `RED`.
   if [ -n "$_plline" ] && [ "$_plpid" = "-" ] && [ -n "$_plcode" ] && [ "$_plcode" != "0" ] \
      && [ "$_plcode" != "-" ] && [ "$_plcode" != "$_plline" ]; then
-    printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
-      "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
+    if [ "$_plcode" = "6" ]; then
+      printf "%s PR-DOCTOR LAUNCHD WAITING (last exit 6) -- the scheduled job last exited NO-CAPACITY: the box's own gate refused the order and nothing was consumed. Read the status record's AXIS (load | disk | land-backlog | fork | capability) for the remedy; stdout is %s\n" \
+        "$(date '+%m-%d %H:%M:%S')" "$STATE/pr-doctor.launchd.log" >> "$LOG"
+    else
+      printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
+    fi
   fi
   EL=$(elapsed); SLP=$(( TARGET - EL )); [ "$SLP" -lt 5 ] && SLP=5
   printf '%s PASS done in %ss (target %ss) sleeping %ss\n' \

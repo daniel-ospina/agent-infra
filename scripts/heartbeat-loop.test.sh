@@ -148,9 +148,16 @@ mkfix() {
 # run_pass <fixture> — ONE real pass of the real loop, bounded. The bound is a runaway guard, not
 # a timeout for a slow child: the stubs are instantaneous, so anything near the bound means the
 # one-pass exit is gone and the suite must fail rather than hang CI forever.
+# ⛔ THE FIXTURE'S OWN `launchctl` REPLACES THE REAL ONE (agent-infra#2291 review). The loop PINS
+# `PATH`, so a prepended directory is discarded -- the seam `HEARTBEAT_LAUNCHCTL` is what puts a job
+# table in front of the reader. Without it the arm is unseedable here AND non-hermetic on a Mac cell,
+# which is exactly how `LAUNCHD RED (last exit 6)` shipped. A fixture that seeds no stub gets the
+# real binary's absence (Linux) or table (Mac), i.e. the pre-existing behaviour, unchanged.
 run_pass() {
-  local d="$1"
+  local d="$1" lc=""
+  [ -x "$d/bin/launchctl" ] && lc="$d/bin/launchctl"
   ( HOME="$d/home" HEARTBEAT_PI_AGENT_DIR="$d/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=1 \
+      HEARTBEAT_LAUNCHCTL="${lc:-launchctl}" \
       /bin/bash "$LOOP" >/dev/null 2>&1 ) &
   local pid=$! wd
   # ⛔ KILL THE GROUP, NOT THE SUBSHELL. `kill "$wd"` reaped the watchdog subshell and orphaned the
@@ -168,6 +175,22 @@ run_pass() {
 }
 
 logof(){ printf '%s' "$1/agent/state/orchestrator-heartbeat.log"; }
+
+# mkfix_launchd <fixture> <pid-column> <last-exit-column> — stub `launchctl list`.
+#
+# ⛔ THE SCHEDULED-JOB ARM WAS UNTESTED, WHICH IS WHY IT SHIPPED A CONTRADICTION (#2291 review, P1).
+# The arm reads `launchctl list`'s PID and LAST-EXIT columns for `com.tortoise.pr-doctor` and reported
+# any non-zero last exit as `LAUNCHD RED` — including 6, which the same pass had just reported as
+# `WAITING`. Nothing seeded a job table, so no case could observe it (and on a Mac cell the arm would
+# have read the REAL table, making the suite non-hermetic). This writes the two columns the loop's
+# `awk` splits on: `$1` = pid (`-` = not running, which is when a verdict is final), `$2` = last exit.
+mkfix_launchd() {
+  local d="$1" pid="$2" code="$3"
+  mkdir -p "$d/bin"
+  printf '#!/bin/bash\nprintf "%%s\\t%%s\\tcom.tortoise.pr-doctor\\n" "%s" "%s"\n' "$pid" "$code" \
+    > "$d/bin/launchctl"
+  chmod +x "$d/bin/launchctl"
+}
 
 # wait_rc <sidecar> <expected> — the detached child writes asynchronously; give it a real window
 # instead of sleeping a fixed amount (a fixed sleep is a flake generator on a loaded runner).
@@ -459,6 +482,38 @@ if has "$LOG8FTXT" "PR-DOCTOR RED rc=3" && ! has "$LOG8FTXT" "PR-DOCTOR WAITING"
   pass "   and the TRANSPORT (rc=3) still reads RED — the word is chosen, not blanket-softened"
 else
   fail "rc=3 was not reported as RED (got: $(grep -m1 'PR-DOCTOR' "$LOG8F" 2>/dev/null | cut -c1-140))"
+fi
+
+echo ""
+echo "8i. the SCHEDULED-JOB arm agrees with the other readers: a last exit of 6 is not RED (#2291)"
+# ⛔ ONE PASS, TWO WORDS, ABOUT ONE VERDICT (agent-infra#2291 review, P1 -- reproduced). The state
+# reader above prints `PR-DOCTOR WAITING rc=6`; this arm printed `PR-DOCTOR LAUNCHD RED (last exit 6)`
+# eleven lines later. `docs/ops/self-healing-contract.md` §3.6 claims that no reader reads 6 as `RED`,
+# so the arm falsified the contract the same change adds. The control (a real failure, exit 3, seeded
+# in the same shape) is what stops this arm passing by exempting every non-zero code.
+FIX8I="$(mkfix launchdnocap 0)"; LOG8I="$(logof "$FIX8I")"
+mkfix_launchd "$FIX8I" - 6
+: > "$FIX8I/agent/state/PR-DOCTOR-OFF"        # no launch: this arm is about the scheduled job
+run_pass "$FIX8I"
+LOG8ITXT="$(cat "$LOG8I" 2>/dev/null)"
+if has "$LOG8ITXT" "PR-DOCTOR LAUNCHD WAITING (last exit 6)"; then
+  pass "a scheduled job whose last exit is 6 reads 'LAUNCHD WAITING', not RED"
+else
+  fail "launchd's last exit 6 was not reported as WAITING (got: $(grep -m1 'LAUNCHD' "$LOG8I" 2>/dev/null | cut -c1-160))"
+fi
+if has "$LOG8ITXT" "PR-DOCTOR LAUNCHD RED"; then
+  fail "the SAME pass printed both WAITING and 'LAUNCHD RED' about one NO-CAPACITY verdict"
+else
+  pass "   …and the same pass does NOT also claim LAUNCHD RED"
+fi
+FIX8J="$(mkfix launchdrealred 0)"; LOG8J="$(logof "$FIX8J")"
+mkfix_launchd "$FIX8J" - 3
+: > "$FIX8J/agent/state/PR-DOCTOR-OFF"
+run_pass "$FIX8J"
+if has "$(cat "$LOG8J" 2>/dev/null)" "PR-DOCTOR LAUNCHD RED (last exit 3)"; then
+  pass "   CONTROL: a scheduled job that really fails (last exit 3) still reads 'LAUNCHD RED'"
+else
+  fail "a real failure (last exit 3) was not reported as LAUNCHD RED — 6 must be DECLARED, not blanket-forgiven (got: $(grep -m1 'LAUNCHD' "$LOG8J" 2>/dev/null | cut -c1-160))"
 fi
 
 # ⛔ AND THE WAITING ARM IS FRESHNESS-BOUNDED (agent-infra#2291 review, P1 — reproduced). The `rc=6`

@@ -4670,6 +4670,10 @@ def run_all_repos(args, explicit) -> int:
     # aggregate record IS the one a reader sees (#2291 review, P2). `no_room_bound` is the axis of a
     # NON-CLEAN repo's refusal (dirty-first `ordered`, so a 6 is never the one that gets dropped); a
     # clean repo does not have one.
+    # ⛔ THE PROBE'S RAW RECORD AND ITS `why` STAY IN THE PER-REPO REGISTER (#2291 review, P3).
+    # `no_room`/`no_room_bound` are summable and pick-first-able, so they belong here; a set of boxes'
+    # probe lines has no single value, and inventing one would be a second instrument. Each repo's own
+    # `pr-doctor-<owner>-<name>.json` carries `room`/`room_read`/`room_why`.
     _no_room = sum((r.get("no_room") or 0) for r in results)
     _no_room_bound = next((r.get("no_room_bound") for r in ordered
                            if (r.get("no_room_bound") or "")), "")
@@ -5358,10 +5362,18 @@ def run_pass(args, rubric_note: str = "") -> int:
         next_override = {}
         if code == EXIT_NO_CAPACITY and GATE_REFUSAL_ACTION.get(no_room_bound):
             next_override["next_action"] = GATE_REFUSAL_ACTION[no_room_bound]
+        # ⛔ AND AN UNREADABLE PROBE'S REASON IS RECORDED, NOT ONLY LOGGED (#2291 review, P3).
+        # `docs/ops/self-healing-contract.md` §3.6 promises the sidecar holds `room_read: false`
+        # *with the reason*; the first version wrote the flag and sent the `why` to `log()` alone, so
+        # a reader holding ONLY the sidecar could see the box was unmeasurable but not WHICH repair it
+        # needs -- an `$O` that predates `capacity.sh` (install the harness) or a box that cannot fork
+        # (restart it) are opposite actions, and telling them apart is this issue's own subject one
+        # layer down. `room_why` is empty on a successful read, where there is nothing to explain.
         return record_exit(code, why, **next_override,
                            no_room=no_room, no_room_bound=no_room_bound,
                            room=((room or {}).get("record") or ""),
                            room_read=(room or {}).get("read"),
+                           room_why=((room or {}).get("why") or ""),
                            queued=queued, dispatched=dispatched, prs=delivered,
                            open_prs=queue_n,
                            dry_run=bool(args.dry_run),
