@@ -1266,9 +1266,25 @@ fi
 # printed NOTHING, while the identical line without the apostrophe reported :1; the same bytes are a
 # genuine #2969-class defect on bash 3.2 (`syntax error near unexpected token 'newline'`), so (p1)
 # certified a broken module. `indq` (`"…"`) and `esc` (`\`) are tracked so `inq` opens only at a REAL
-# delimiter — and `$( )`/`case` inside `"…"` are still counted, because bash DOES substitute there.
-# Both flags are per-line, and an embedded `awk '…'`/heredoc body is still scanned as shell: that
-# over-reports (red, fail-closed) rather than claiming a skip it cannot see.
+# delimiter — and `$( )`/`case` INSIDE `"…"` are still counted, because bash DOES substitute there.
+# ⛔ QUOTE STATE NOW CARRIES ACROSS LINES (#2969 review cycle 6). A span opened on one line closes on
+# a later one — that is the `awk '…'` program this file hands to awk, which is why the cycle-5 scanner
+# reported `:1354`, a line of awk SOURCE, as a shell substitution. Reset per line, every line of such
+# a program was scanned as shell; carried, the whole program is skipped as the literal text bash
+# reads. A file whose spans do not balance is already invalid bash, so nothing is lost by carrying.
+# ⛔ AND FOUR SHAPES THAT SILENCED A REAL `case` ARE NOW LEXED RATHER THAN DECLARED AWAY (cycle 6):
+#   * `$(( … ))` — the `$(` was counted and the SECOND `(` skipped, so both closing `)`s decremented
+#     and depth fell to 0 one operand early: `x="$( age=$(( now - 1 ))\n case "$s" in …` reported
+#     nothing. Arithmetic is now consumed as a BALANCED unit.
+#   * a TRAILING comment — a `)` in `… | head -1   # first page (see #2296)` closed the substitution
+#     early, so the `case` on the next line of the very read shape named above was invisible. A `#`
+#     that starts a word, outside both quote spans, ends the line.
+#   * a RESUMED `"…"` span — closing a `$( )` returns into the enclosing double-quote, where an
+#     apostrophe is literal again; `indq=0` on close re-opened the cycle-5 blindness one shape over.
+#     The suspended state is pushed on `$(` and popped on `)`.
+#   * a QUOTED heredoc body (`<<'EOF' … EOF`) — bash substitutes nothing in one, and scanning it as
+#     shell let a `)` in the body silence a later substitution. Bodies of UNQUOTED heredocs are still
+#     scanned, because bash DOES substitute there and a `case` in one really does break 3.2.
 # ⛔ THAT SECOND SKIP IS NOT COSMETIC — ITS ABSENCE WAS A FALSE PASS (#2969 review cycle 4, P2). The
 # earlier comment claimed "an unbalanced `)` inside a string … Neither shape exists in this module".
 # Measured: it does, three times. ci-queue.sh's multi-line reads close their `$( )` on a LATER line,
@@ -1281,19 +1297,28 @@ fi
 # `ciq_gh`'s answer is post-processed — was therefore INVISIBLE: measured, a module with that `case`
 # reported `(p1) … (none)` and the whole suite went CLEAN at 133/0, while the same bytes on bash 3.2
 # printed `syntax error near unexpected token 'newline'` and reddened 34 arms.
-# ⛔ REMAINING LIMIT, stated because it is still real: a `)` that is literal TEXT inside `"…"` at
-# the level it closes is not distinguished from a substitution close, so it decrements depth early
-# (under-report, fail-open), and the reverse — a literal `$(` inside `"…"` — is counted as a
-# substitution, which over-reports and reds (fail-closed). The quote state is also PER LINE and reset
-# on every `$( )` boundary, so a `'` opened on one line is not carried into the next. None of these
-# shapes exists in this module today; the single-quoted case is handled, which is where every BRE in
-# this file lives.
+# ⛔ REMAINING LIMITS, stated because they are still real, all in the UNDER-report direction and all
+# absent from this module today: a `)` that is literal text inside `"…"` at the level it closes is
+# not told apart from a substitution close (depth falls early); a heredoc with a VARIABLE delimiter
+# (`<<$X`) cannot be resolved, so its body is scanned as shell; and the `$(( … ))` unit is skipped
+# whole, so a `$( )` nested inside arithmetic is not tracked. The AUTHORITATIVE arm remains (p3)/(p4),
+# which run this module on a real 3.2 interpreter whenever one is reachable.
 cis_in_comsub() {
-  local f="$1" n=0 depth=0 line i len ch prev nxt first found inq indq esc
+  local f="$1" n=0 depth=0 line i len ch prev nxt first found
+  local inq=0 indq=0 esc=0 aps=0 iqs="" hd="" hq=0 dl="" w="" rest=""
   while IFS= read -r line; do
-    n=$((n + 1)); found=0; inq=0; indq=0; esc=0
+    n=$((n + 1)); found=0; esc=0
+    # A QUOTED heredoc body is literal text: skip to the delimiter, verbatim.
+    if [ -n "$hd" ]; then
+      w="${line#"${line%%[![:space:]]*}"}"
+      if [ "$w" = "$hd" ]; then hd=""; fi
+      continue
+    fi
     first="${line#"${line%%[![:space:]]*}"}"
-    case "$first" in '#'*) continue ;; esac
+    # ⛔ only OUTSIDE both spans — a `#` inside `"…"` or `'…'` is not a comment.
+    if [ "$inq" -eq 0 ] && [ "$indq" -eq 0 ]; then
+      case "$first" in '#'*) continue ;; esac
+    fi
     len=${#line}; i=0
     while [ "$i" -lt "$len" ]; do
       ch="${line:$i:1}"
@@ -1306,6 +1331,12 @@ cis_in_comsub() {
       # A backslash escapes the NEXT character. Inside `"…"` that is what stops `\"` from closing
       # the span; outside any quote it is what stops `\$( ` from opening a substitution.
       if [ "$esc" -eq 1 ]; then esc=0; i=$((i + 1)); continue; fi
+      # `$(( … ))`: consume the whole arithmetic unit by matching its own parens, so the `))` that
+      # closes it cannot be read as two substitution-closes.
+      if [ "$aps" -gt 0 ]; then
+        case "$ch" in '(') aps=$((aps + 1)) ;; ')') aps=$((aps - 1)) ;; esac
+        i=$((i + 1)); continue
+      fi
       case "$ch" in
         '\\')
           esc=1
@@ -1319,21 +1350,53 @@ cis_in_comsub() {
           # review cycle 5, P2) — the fail-open direction this whole arm exists to close.
           [ "$indq" -eq 1 ] || inq=1
           ;;
+        '#')
+          # A `#` that STARTS A WORD (and is outside both spans) begins a comment, which bash does
+          # not substitute: a `)` in it must never close a substitution.
+          prev=""; [ "$i" -gt 0 ] && prev="${line:$((i - 1)):1}"
+          case "$prev" in ''|' '|'\t'|';'|'&'|'|'|'(') i="$len"; continue ;; esac
+          ;;
+        '<')
+          rest="${line:$((i + 1))}"
+          # `<<<` is a herestring, not a heredoc; only a QUOTED delimiter's body is substitution-free.
+          case "$rest" in
+            '<<'*) : ;;
+            '<'*)
+              w="${rest#<}"
+              case "$w" in -*) w="${w#-}" ;; esac
+              w="${w#"${w%%[![:space:]]*}"}"
+              case "$w" in
+                "'"*) hq=1; w="${w#\'}"; dl="${w%%\'*}" ;;
+                '"'*) hq=1; w="${w#\"}"; dl="${w%%\"*}" ;;
+                *) hq=0; dl="" ;;
+              esac
+              if [ "$hq" -eq 1 ] && [ -n "$dl" ]; then hd="$dl"; fi
+              ;;
+          esac
+          ;;
         '$')
           nxt="${line:$((i + 1)):1}"
           if [ "$nxt" = '(' ]; then
+            if [ "${line:$((i + 2)):1}" = '(' ]; then
+              aps=2; i=$((i + 3)); continue
+            fi
             depth=$((depth + 1))
             # ⛔ QUOTING RESTARTS INSIDE A SUBSTITUTION. bash parses `$( … )` as a FRESH shell
             # context, so `x="$( printf "don't" … )"` is not one long double-quoted span: the
             # outer `"` is suspended for the length of the substitution and the inner quotes belong
-            # to it. Carrying the outer state in would swallow the inner `'` and hide a real `case`
-            # (measured, #2969 review cycle 5, P2).
-            indq=0; esc=0
+            # to it. The suspended state is pushed here and restored on the closing `)`.
+            iqs="$indq $iqs"; indq=0; esc=0
             i=$((i + 2)); continue
           fi
           ;;
         ')')
-          if [ "$depth" -gt 0 ]; then depth=$((depth - 1)); indq=0; esc=0; fi
+          if [ "$depth" -gt 0 ]; then
+            depth=$((depth - 1))
+            # restore the span the substitution was opened inside (0 when there was none)
+            if [ -n "$iqs" ]; then indq="${iqs%% *}"; else indq=0; fi
+            case "$iqs" in *' '*) iqs="${iqs#* }" ;; *) iqs="" ;; esac
+            esc=0
+          fi
           ;;
         'c')
           if [ "$depth" -gt 0 ] && [ "${line:$i:4}" = case ]; then
@@ -1374,6 +1437,61 @@ ck "(p1b) control: the SAME line without the apostrophe is reported too (${cth:-
    "$( [ -n "$cth" ]; echo $? )"
 ck "(p1c) a \`case\` inside a genuinely SINGLE-QUOTED span is NOT reported (${sqh:-none}) — the skip is still applied where bash really substitutes nothing" \
    "$( [ -z "$sqh" ]; echo $? )"
+
+# ⛔ FOUR MORE SHAPES THAT SILENCED A REAL `case` (#2969 review cycle 6, P2), each measured on the
+# cycle-5 scanner and each fixable only by LEXING the construct rather than declaring it away. Every
+# one of these bytes is `syntax error near unexpected token 'newline'` on bash 3.2 while `bash -n`
+# exits 0 on 5.x, i.e. exactly the blindness (p1) exists to catch — and each printed NOTHING before
+# the corresponding fix, which is why (p1) was green over a broken module.
+csf="$T/comsub-shapes"; mkdir -p "$csf"
+# (p1d) `$(( … ))`: the `$(` counted +1, the second `(` skipped, BOTH closing `)`s decremented.
+cat >"$csf/arith.sh" <<'CIQEOF'
+x="$(
+  age=$(( now - 1 ))
+  case "$s" in a) : ;; esac
+)"
+CIQEOF
+# (p1e) a TRAILING comment carrying a `)` — the `case` after it is the module's own read shape.
+cat >"$csf/trailcomment.sh" <<'CIQEOF'
+queued="$(ciq_gh x \
+          | sed -n 's/.*"c":[ ]*\([0-9]*\).*/\1/p' | head -1   # bound it (was 5s) and close it )
+          case "$CIQ_STATE" in fresh) queued=0 ;; *) : ;; esac )" || queued=""
+CIQEOF
+# (p1f) a RESUMED `"…"` span: closing the substitution returns into the outer double quote, where the
+# apostrophe is literal again — resetting `indq=0` there re-created the cycle-5 blindness one shape on.
+cat >"$csf/resumed.sh" <<'CIQEOF'
+x="$( printf a )it's $( case "$s" in a) : ;; esac )"
+CIQEOF
+# (p1g) TRUE NEGATIVE — a QUOTED heredoc body is literal text to bash: a `case` in one is not a
+# substitution and must NOT be reported (reporting it would red this arm on a module that is fine).
+cat >"$csf/heredoc.sh" <<'CIQEOF'
+cat <<'EOS'
+case "$s" in a) : ;; esac )
+EOS
+x=$(( 1 + 1 ))
+CIQEOF
+# (p1h) TRUE NEGATIVE — a multi-line `awk '…'` program is ONE single-quoted span, so the `$( case` it
+# contains is awk SOURCE. Reset per line, the scanner called this a shell substitution (measured:
+# `:1354` of this very file); carried across lines, it is skipped as the literal text bash reads.
+cat >"$csf/awkprog.sh" <<'CIQEOF'
+awk '
+  { print }
+  /^x/ { y = "src=\$( case \"${S}\" in " }
+' file
+CIQEOF
+for pair in 'p1d:arith:reported:a real `case` AFTER a `$(( … ))`' \
+            'p1e:trailcomment:reported:a real `case` AFTER a trailing comment carrying `)`' \
+            'p1f:resumed:reported:a real `case` AFTER a resumed `"…"` span with an apostrophe'; do
+  tag="${pair%%:*}"; rest="${pair#*:}"; fx="${rest%%:*}"; why="${rest#*:}"; why="${why#*:}"
+  got="$(cis_in_comsub "$csf/$fx.sh")"
+  ck "($tag) $why IS reported (${got:-<missed>})" "$( [ -n "$got" ]; echo $? )"
+done
+for pair in 'p1g:heredoc:a `case` in a QUOTED heredoc body is never substituted — not reported' \
+            'p1h:awkprog:a `case`-inside-`$( )` in a multi-line awk program is source, not a substitution'; do
+  tag="${pair%%:*}"; rest="${pair#*:}"; fx="${rest%%:*}"; why="${rest#*:}"
+  got="$(cis_in_comsub "$csf/$fx.sh")"
+  ck "($tag) TRUE NEGATIVE: $why (${got:-none})" "$( [ -z "$got" ]; echo $? )"
+done
 
 # ⛔ MUTANT: reinstate the CONSTRUCT by DERIVING it from the module's own hoisted block — the
 # patterns and the values are READ OUT of the module, not restated here, so the control cannot drift
