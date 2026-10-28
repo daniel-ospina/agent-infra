@@ -579,11 +579,16 @@ printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' 
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
-# `ci-queue.sh` now gates EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue defers
-# (fail-closed — an unreadable queue is not an empty one). The `gh` stub above FAILS every call by
-# design (the arms below need a failing `gh pr view`), so without a genuine reading every fixer arm
-# would be deferred before it ever reached the load/disk gate it exists to test: six "load-gate
-# regressions" that are not regressions. That is what these seven arms reported before this stub
+# ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
+# because `ci-queue.sh` gated EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue
+# defers (fail-closed — an unreadable queue is not an empty one), while the `gh` stub above FAILS
+# every call by design (the arms below need a failing `gh pr view`) — so without a genuine reading
+# every fixer arm was deferred before it reached the load/disk gate it exists to test. The fixer arms
+# no longer consult the module at all (a fixer is REPAIR), so this rig currently changes no verdict.
+# It stays because (a) `fix-one.sh`/`adopt-fix.sh` and the arms must still pass on a box where the
+# module IS installed and answering, which is the production shape, and (b) it is the seam that goes
+# live again the moment any arm re-acquires a read — and a future lane deleting it as "dead setup"
+# would be re-introducing exactly the six false "load-gate regressions" it was written to stop. That is what these seven arms reported before this stub
 # existed, on a tree where nothing was wrong with the load gate.
 # ⛔ THE READING IS SUPPLIED, NOT THE GATE SWITCHED OFF. `gh-queue` answers ONLY the three endpoints
 # `ci-queue.sh` reads, with a SHALLOW queue (1 queued, 0 running, 3 runners → ceiling 6) — the

@@ -1867,7 +1867,7 @@ Every entry point this directory's consolidation carried, classified against the
 | `scripts/merge-queue.py` | the DRAIN line for the heartbeat (open PRs vs merged-today, and which lane is on it) | runs INSIDE `orchestrator-heartbeat.sh` | no unit of its own | no unit of its own | current — but it is **not a merge-queue runner**, despite the name: landings are performed by `cloud-cell-doctor.sh merge` (cell) and `orch-loop.sh`'s own sweep (Mac) |
 | `scripts/orchestrator-harness/claims.sh` | cross-box claim registry — a **LIBRARY** (sourced by the controller and the lanes) | sourced; the registry itself is DATA on the remote (`refs/claims/*`) | none needed | none needed | current (not a service: `up` never installs it) |
 | `scripts/orchestrator-harness/capacity.sh` | measured placement — a **LIBRARY** plus a `probe` CLI | sourced per dispatch | none needed | none needed | current |
-| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch and before every push | none needed | none needed | current |
+| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch of NEW-PR work and before a CI rerun — **never** by a repair push (#2927) | none needed | none needed | current |
 | `scripts/orchestrator-harness/disk-floor.sh` | the pre-dispatch disk floor — a **LIBRARY** | sourced by the controller | none needed | none needed | current |
 | `scripts/deploy-mac-orchestrator.sh` | copies the harness into `$O` and stamps the commit | by hand (§4 step 1) | — | — | current for the DEPLOY; ACTIVATION is `install.sh --start` / `harness-up up` |
 | `scripts/cloud-cell-bringup.sh` | full cell PROVISIONING (clone, keys, farm, units) | by hand, once per cell | installs several units | — | current — provisioning is not convergence: `up` does not run it |
@@ -4288,19 +4288,23 @@ The remedy is `ci-queue.sh`: one sourced module (also runnable standalone —
 question — may this box send more CI-spending work yet. The ceiling is **derived**, not a constant:
 `ceil(runners × horizon_min ÷ job_p90_min)`, and it is a **measured queue read, NOT a lane cap**: the
 owner ruling of 2026-10-17 ("dispatch should be gated on capacity, not on number of lanes") is why
-nothing here re-states a lane ceiling. Three surfaces read it, so they cannot disagree: `orch-loop.sh`
-(one read per PASS — the sweep's and the dispatch block's, so at most TWO live reads per cycle —
-in-shell, before dispatch — and THREE fixer spawn arms: the CONFLICTED one, the
-CI-red one, and the review-gate one, whose product is also a new head — plus the CI RERUN, which is
-the only other surface in the sweep that ADDS queue), `fix-one.sh` (the lane
-whose whole product is a NEW HEAD), and `dispatch-merge.sh` (the batch that stampedes). ⛔ The FOURTH
-fixer spawn arm — the RED-TREE one — is NOT gated yet: it books its attempt and spawns before any
-`ciq_push_ok` call, so a deep queue still starts that lane and `fix-one.sh` defers its first push.
-Disclosed rather than implied; home agent-infra #2408. ⛔ That census is the SWEEP's, not the
-fleet's: `pr-doctor`'s `prfix` workers are a **second** ungated pusher and are not an orch-loop arm
-at all — `pr-doctor.py` spawns up to `MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or
-`gh run rerun`) with no queue read (`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd
-job still adds CI behind a deep queue; wiring that surface is agent-infra #2540.
+nothing here re-states a lane ceiling. ⛔ **Repair does not read it at all (#2927).** The two actions
+that DO — the two that add a run to the queue — are `orch-loop.sh` (one read per PASS — the sweep's
+and the dispatch block's, so at most TWO live reads per cycle — in-shell, before the ISSUE dispatch,
+plus the CI RERUN site, which queues a fresh run for the same head) and `dispatch-merge.sh` (the batch
+that stampedes, issue→PR). ⛔ THE FIXER ARMS AND `fix-one.sh` ARE NO LONGER ON THAT LIST, AND THAT IS
+THE CHANGE: a fixer is REPAIR on a PR that already exists, bounded by lane slots, the cross-box claim
+and the load/disk gate. The depth this module prices is CI concurrency belonging to NEW-PR work; gating
+repair with it skipped 41 consecutive repair dispatches while 8 runners and ~11 lane slots sat idle.
+The former FOURTH-arm disclosure (the RED-TREE fixer spawning before any `ciq_push_ok` call, home
+#2408) is therefore moot — nothing on the repair path reads this module, so a started lane pushes
+instead of being turned away. ⛔ That census is the SWEEP's, not the fleet's: `pr-doctor`'s `prfix`
+workers remain an **ungated** pusher and are not an orch-loop arm at all — `pr-doctor.py` spawns up to
+`MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or `gh run rerun`) with no queue read
+(`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd job still adds CI behind a deep queue.
+⚠️ #2540 asked for the OPPOSITE — more gating on repair pushes — and #2927 records why its premise (a
+fixer push is the queue pressure) is what the measurement contradicts; wiring that surface is a
+re-open of #2927, not an execution of #2540.
 
 Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired into
 `run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work
