@@ -1311,7 +1311,7 @@ def _read_pid(path: str):
 
 
 def _worker_pid_files(worker: str) -> list:
-    """The EXISTING pid files under `$O/bg` that could belong to `worker` -- at most TWO.
+    """The EXISTING pid files under `$O/bg` that could belong to `worker`.
 
     ⛔ NO WILDCARD, BECAUSE THE NUMBERS COLLIDE (#2725). This used to add EVERY `bg/*-0*<n>.pid`
     whose TRAILING NUMBER matched, which was right while the only qualified names came from the
@@ -1319,10 +1319,12 @@ def _worker_pid_files(worker: str) -> list:
     repo (see `worker_name`), that wildcard answers repo B's row `prd-<B>-42` with repo A's LIVE
     `prd-<A>-42.pid` -- the identical "keyed by the PR number" collision #2725 removes at the
     worker, one layer down, in the budget path, where it silently holds a real MAX_FIX slot. So the
-    two spellings of ONE PR's worker are COMPUTED from the name, never globbed:
+    two spellings of ONE PR's worker are COMPUTED from the name, never globbed -- see
+    `_worker_spellings()`, which is the ONE home of that set (up to four names; every generation of
+    the name is in it, not "two"):
 
-      * a row written since #2725 is qualified -> the other spelling is the legacy `prd-<n>`;
-      * a row written before it is short        -> the other spelling is THIS repo's qualified name.
+      * a row written since #2725 is qualified  -> the other spellings are the legacy ones;
+      * a row written before it is short        -> the other spellings are this repo's.
 
     The row and the artifact must spell the number the SAME way: these are two computed paths, not a
     pattern, so `prd-42` does not answer for a file called `prd-<tag>-0042.pid` (the old `-0*`
@@ -1346,7 +1348,6 @@ def _worker_pid_files(worker: str) -> list:
     m = re.search(r"([0-9]{1,10})\Z", worker)
     if not m:
         return paths
-    head = worker[:m.start()]
     n = int(m.group(1))
     for nm in _worker_spellings(worker, n):
         p = bg_path(nm, "pid")
@@ -3573,11 +3574,14 @@ def void_refused_rows(st: dict) -> list[str]:
 
     ⚠️ A ROW WRITTEN BEFORE #2725 CARRIES THE REPO-BLIND NAME (#2725). Its `worker` is `prd-<n>`, so
     `bg_path()` resolves the pre-change artifact -- which on a multi-repo box could be ANOTHER
-    repo's, i.e. another repo's gate refusal could void this row. It is bounded, not silent: rows
-    stop being eligible at `STALE_DISPATCH_S` (90 min), and the legacy spelling is on its way out
-    (see the note in `worker_live_for`), so the exposure ends with the pre-change rows. Stated here
-    rather than "fixed" because the row's name is durable content this function may not rewrite:
-    guessing which repo a legacy row meant is the very ambiguity the change removes.
+    repo's, i.e. another repo's gate refusal could void this row. This loop has NO age filter (it
+    scans the whole register), so the exposure is not bounded here; what bounds it is that a voided
+    row only loses a COOLDOWN and a budget slot -- a pre-#2725 row that old is already past
+    `STALE_DISPATCH_S` and holds neither -- and the spawn itself is still gated by
+    `worker_live_for()`, so the worst case is a stale row dropped, never a duplicate spawn. The
+    exposure also shrinks by itself: see `worker_live_for` on what is left writing `prd-<n>`.
+    Stated here rather than "fixed" because the row's name is durable content this function may not
+    rewrite: guessing which repo a legacy row meant is the very ambiguity the change removes.
     """
     voided = []
     for k in list(st):
@@ -3730,11 +3734,20 @@ def worker_live_which(number) -> tuple:
 
     `name` is the spelling that answered (`True`/`None`), and `""` when nothing did (`False`), so a
     caller must fall back to its own name only for the cosmetic label -- never as evidence.
+
+    ⛔ AND THE SPELLING SET IS THE BUDGET'S SET (#2725 cycle 3, P1). This asks about the same PR's
+    worker that `_worker_pid_files()` accounts for, so it MUST ask every generation of that name --
+    `prd-<n>`, `prd-<full-slug>-<n>`, `prd-<repo-NAME>-<n>` -- or a worker reachable only by the
+    third is `False` here, and `dispatch()` then resets its worktree and spawns a second agent into
+    it (`rm -f "$RC"`, `: > "$LOG"` over the live worker's artifacts). `_worker_spellings()` is the
+    ONE home of the set, and over-matching holds a slot while missing frees one: the asymmetry is
+    the same one the other two generations already trade on.
     """
-    names = [worker_name(number)]
     plain = "prd-%s" % number
-    if plain not in names:
-        names.append(plain)              # the PRE-#2725 spelling for the SAME worktree
+    try:
+        names = _worker_spellings(worker_name(number), int(number))
+    except (TypeError, ValueError):
+        names = [worker_name(number), plain]      # unparseable number: the two literal spellings
     for nm in names:
         live = worker_live(nm)
         if live is None:                  # unanswerable: do not spawn
@@ -3844,8 +3857,8 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # `nonblocking-dispatch.sh` starts by `rm -f "$RC"`, `: > "$LOG"`, `echo … > "$PIDF"`, which
     # deterministically destroys the live worker's log, exit status and pid. So liveness is asked
     # (the harness owns the question), never inferred from the state row.
-    # ⛔ BOTH NAMES: the worktree is `prd-<n>` in EVERY mode, so a live worker started by the OTHER
-    # mode owns the same directory (see `worker_live_for()`).
+    # ⛔ EVERY SPELLING OF THIS PR (`_worker_spellings()`): the worktree is `prd-<n>` in EVERY mode,
+    # so a live worker started by the OTHER mode owns the same directory (see `worker_live_for()`).
     live, live_name = worker_live_which(n)
     if live:
         # ⛔ NAME THE SPELLING THAT ANSWERED (#2725 review, P2). It may be the legacy `prd-<n>`
@@ -3871,7 +3884,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
     # costs one `--status` on the only path that spawns anything.
-    again, again_name = worker_live_which(n)   # BOTH SPELLINGS: the worktree is `prd-<n>` always
+    again, again_name = worker_live_which(n)   # EVERY spelling: the worktree is `prd-<n>` always
     if again is not False:
         return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
                        "was being prepared -- refusing to spawn a second one"

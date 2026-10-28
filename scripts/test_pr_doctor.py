@@ -5691,6 +5691,34 @@ def test_two_repos_do_not_share_a_worker_identity(monkeypatch, tmp_path):
     assert name_b == "prd-daniel-ospina-tortoise-1234"
 
 
+def test_a_LIVE_worker_of_the_THIRD_generation_is_not_reported_absent(monkeypatch, tmp_path):
+    """LIVENESS must ask the SAME closed set the budget accounts for (#2725 cycle 3, P1).
+
+    `prd-<repo-NAME>-<n>` is the generation the pre-#2725 MULTI-REPO path wrote (owner-blind tag),
+    and `worker-supply.sh` still re-offers a dead pre-change order UNDER ITS RECORDED NAME, so such
+    a worker can be running now. Measured before this was closed: with `REPO=daniel-ospina/
+    agent-infra` and that worker LIVE, `worker_live_which(42)` returned `(False, '')` because it
+    asked only `prd-daniel-ospina-agent-infra-42` and `prd-42`. `dispatch()` then reset that worker's
+    worktree (`--hard`) and spawned a second agent into it -- the unrecoverable direction.
+    """
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    pr.apply_repo(_REPO_A, "")
+    live_name = "prd-agent-infra-42"          # owner-blind: NOT this pass's qualified spelling
+    assert live_name != pr.worker_name(42)
+    asked = []
+
+    def _status(name):
+        asked.append(name)
+        return "running" if name == live_name else "lost"
+
+    monkeypatch.setattr(pr, "worker_status", _status)
+    assert pr.worker_live_which(42) == (True, live_name), \
+        "a live worker of the third generation must be seen, and NAMED: asked=%r" % (asked,)
+    assert pr.worker_live_for(42) is True
+
+
 def test_a_worker_live_under_ANOTHER_repo_does_not_block_this_repos_spawn(monkeypatch, tmp_path):
     """Symptom 1: repo B SKIPPED its own PR because repo A's worker held the name.
 

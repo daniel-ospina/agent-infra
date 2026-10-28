@@ -2448,7 +2448,9 @@ always, so two orders can name one directory — the #2280 defect, which `worker
 (`pr-doctor.py`) fixes on the doctor's side and which this supervisor must not reintroduce one
 layer down (`nonblocking-dispatch.sh` performs **no** liveness check of its own, so this is the only
 guard there is). Before every re-offer it asks `--status` for **every order that records the same
-worktree**, plus the pre-#2725 spelling `prd-<n>` when that differs from the order's name (the
+worktree**, plus every spelling `prd-doctor._worker_spellings()` returns for that PR — the two
+pre-#2725 generations (`prd-<n>`, and the owner-blind `prd-<repo-NAME>-<n>` written by the old
+multi-repo path) — when they differ from the order's name (the
 primary arm matches the `.started` record's `worktree` field, so it is name-agnostic and a
 repo-qualified order needs no change): a `running`
 holder refuses the re-offer (`live`, the slot is held), and an unanswerable holder refuses it too
