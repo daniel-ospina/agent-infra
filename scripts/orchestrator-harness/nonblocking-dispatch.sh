@@ -194,11 +194,32 @@ NB_DELIVERY_PR_LINE="$(awk '/^- \*\*/{print; exit}' <<<"$NB_DELIVERY")"
   echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief $NB_DELIVERY_ROLE rendered no PR sentence — refusing to start a worker whose PR duty cannot be verified (#2981)" >&2; exit 78; }
 # A brief is already complete only when it carries the heading AND this role's own sentence. A brief
 # that carries the heading but a FOREIGN role's sentence is appended to rather than refused, which is
-# this path's stated policy (an otherwise complete authored brief must not become a dead dispatch); the
-# appended copy is the authoritative one and it lands AFTER the stale sentence, so the worker's last
-# word on its PR duty is the true one. The already-correct case stays byte-for-byte untouched.
-if ! grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" 2>/dev/null \
+# this path's stated policy (an otherwise complete authored brief must not become a dead dispatch).
+# The already-correct case stays byte-for-byte untouched.
+# ⛔ APPENDING IS NOT ENOUGH — THE STALE ORDER MUST BE MARKED SUPERSEDED (this PR's review, cycle 3,
+# P2). Append-only left the worker holding BOTH orders: `pr-doctor.py` dispatching a template-derived
+# brief as `prfix` yields "Open the PR as soon as the first commit is pushed" AND "Your PR is ALREADY
+# OPEN". "The last word wins" was an ASSUMPTION about reading order that nothing enforced, and the
+# surviving sentence is the false order #2148/#2325 exist to remove — the very sentence this file's
+# own comment above calls out. So when the heading was ALREADY present (i.e. a foreign role's copy is
+# above), a one-line supersession notice precedes the appended section. The stale bullet is NOT
+# deleted: the append policy stands, and a brief is never rewritten under its author. The notice lands
+# BEFORE the correct sentence, so the reader meets "this is superseded" and then the true order.
+NB_DELIVERY_SUPERSEDE="⛔ THE COMMIT-AS-YOU-GO SECTION BELOW SUPERSEDES ANY COPY ABOVE THIS LINE — the copy above carries a DIFFERENT role's PR instruction, which does not describe your situation. Your PR duty is the one stated in the section below."
+NB_DELIVERY_HAD_HEADING=0
+# …and whether the notice was actually WRITTEN, which is a DIFFERENT question: the heading pre-exists
+# on an already-correct brief too, so keying the post-condition on HAD_HEADING alone demanded a notice
+# on a brief that needs none — the first cut of this fix refused every re-dispatch of a correct brief
+# (caught by the suite's own idempotence arm, which is why that arm exists).
+NB_DELIVERY_SUPERSEDE_DUE=0
+grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" 2>/dev/null && NB_DELIVERY_HAD_HEADING=1
+if [ "$NB_DELIVERY_HAD_HEADING" -eq 0 ] \
    || ! grep -qF -- "$NB_DELIVERY_PR_LINE" "$PROMPT" 2>/dev/null; then
+  if [ "$NB_DELIVERY_HAD_HEADING" -eq 1 ]; then
+    NB_DELIVERY_SUPERSEDE_DUE=1
+    printf '\n%s\n' "$NB_DELIVERY_SUPERSEDE" >> "$PROMPT" || {
+      echo "nonblocking-dispatch.sh: could not mark the foreign-role COMMIT-AS-YOU-GO section superseded in $PROMPT — refusing to start a worker that would read a false PR order (#2981)" >&2; exit 78; }
+  fi
   printf '\n%s\n' "$NB_DELIVERY" >> "$PROMPT" || {
     echo "nonblocking-dispatch.sh: could not append the COMMIT-AS-YOU-GO section to $PROMPT — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
 fi
@@ -208,6 +229,14 @@ fi
 grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" \
   && grep -qF -- "$NB_DELIVERY_PR_LINE" "$PROMPT" || {
   echo "nonblocking-dispatch.sh: the brief at $PROMPT STILL lacks its COMMIT-AS-YOU-GO section (heading or the $NB_DELIVERY_ROLE PR sentence) after the append — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
+# …and a brief that HAD a foreign copy must now say so, or the post-condition above is satisfied while
+# the false order is the first thing the worker reads. Keyed on SUPERSEDE_DUE, not HAD_HEADING: an
+# already-correct brief carries the heading and owes NO notice. A marker that was never written must not
+# read as written, and a marker that was never OWED must not be demanded.
+if [ "$NB_DELIVERY_SUPERSEDE_DUE" -eq 1 ]; then
+  grep -qF -- "$NB_DELIVERY_SUPERSEDE" "$PROMPT" || {
+    echo "nonblocking-dispatch.sh: the brief at $PROMPT carried a FOREIGN-role COMMIT-AS-YOU-GO section and its supersession notice did not land — refusing to start a worker that would read a false PR order (#2981)" >&2; exit 78; }
+fi
 # ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
 # checkout, not a review bypass, and #2319 does not rule on it.
 export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1

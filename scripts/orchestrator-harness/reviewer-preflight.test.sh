@@ -724,12 +724,27 @@ for _f in "$TEMPLATE" "$LANE" "$HERE/fix-one.sh" "$HERE/brief-gate.sh" "$HERE/sp
   grep -qF "$DELIVERY_BRIEF_HEADING" "$_f" 2>/dev/null && STRAY="$STRAY $_f"
 done
 [ -z "$STRAY" ]; ck $? "no composer carries its own copy of the section (stray:${STRAY:- none})"
-# …and every composer that hands a worker a brief OBTAINS it from the helper.
-for _f in "$LANE" "$HERE/fix-one.sh" "$HERE/nonblocking-dispatch.sh"; do
-  grep -q 'delivery_brief_section\|--delivery-brief' "$_f" 2>/dev/null; ck $? "$(basename "$_f") splices the canonical section"
-done
-grep -q 'delivery_brief_section\|--delivery-brief' "$(cd "$HERE/../.." && pwd)/scripts/pr-doctor.py" 2>/dev/null
-ck $? "pr-doctor.py splices the canonical section"
+# …and every composer that hands a worker a brief SPLICES it into that brief — it does not merely
+# CALL the renderer (this PR's review, cycle 3 — P2). ⛔ THE OLD ARM WAS A FALSE PASS: it grepped for
+# `--delivery-brief`, a string every composer also carries in its own comments and FATAL messages, so
+# deleting the line that actually inserts the section into the prompt left it GREEN. That is the
+# no-op-gate shape this suite exists to refuse, and the composer it left uncovered — `fix-one.sh` — is
+# the one behind the five `prfix` lanes #2981 measured. The needle is now the SPLICE ITSELF: a line
+# consisting SOLELY of the variable that holds the render.
+_delivery_splice() { # _delivery_splice <file> <VAR> — a line that is exactly `$VAR`
+  grep -qxF "\$$2" "$1" 2>/dev/null
+}
+_delivery_splice "$LANE" DELIVERY_BRIEF; ck $? "lane.sh SPLICES \$DELIVERY_BRIEF into the brief heredoc (not just renders it)"
+_delivery_splice "$HERE/fix-one.sh" FIX_DELIVERY_BRIEF; ck $? "fix-one.sh SPLICES \$FIX_DELIVERY_BRIEF into the fixer brief heredoc (the composer behind the #2981 batch)"
+# nonblocking-dispatch.sh has no heredoc: it appends the render to the AUTHORED brief, and the artifact
+# that brief becomes is driven by brief-gate.test.sh §D.2. Pinned here is that the append really writes
+# the RENDERED text (deleting the `printf` leaves the render call and every FATAL message in place).
+grep -qF '"$NB_DELIVERY" >> "$PROMPT"' "$HERE/nonblocking-dispatch.sh" 2>/dev/null
+ck $? "nonblocking-dispatch.sh WRITES the rendered section into the authored brief"
+# pr-doctor.py returns the concatenation, so the splice is the `+` operand — `delivery_section()` alone
+# also appears in its own `def`, which is what makes the render-only needle vacuous.
+grep -qF 'delivery_section() +' "$(cd "$HERE/../.." && pwd)/scripts/pr-doctor.py" 2>/dev/null
+ck $? "pr-doctor.py SPLICES delivery_section() into the brief it returns"
 
 echo
 

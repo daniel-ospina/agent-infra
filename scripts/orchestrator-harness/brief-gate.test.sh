@@ -297,6 +297,19 @@ cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1
 [ "$rc" -eq 0 ]; ck $? "…and a prfix dispatch over a template-derived (lane) brief still LAUNCHES (rc=$rc)"
 for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery4.rc" ] && break; sleep 0.1; done
 grep -qF 'Your PR is ALREADY OPEN' "$AUTH_TMPL"; ck $? "⛔ …and the brief the worker received NOW carries the prfix sentence (a role-invariant heading would have skipped the append)"
+# ⛔ AND THE STALE ORDER IS MARKED SUPERSEDED, IN THAT ORDER (this PR's review, cycle 3 — P2). The arm
+# above proves the CORRECT sentence ARRIVED; it cannot see the FALSE one still sitting above it
+# ("Open the PR as soon as the first commit is pushed"). Asserting only arrival is half an assertion:
+# append-only left the worker holding both, relying on a reading-order assumption nothing enforced.
+# The append policy is NOT reversed — the author's bullet stays where its author put it — so what must
+# now be true is that the worker meets the notice and THEN the true order, last.
+grep -qF 'SUPERSEDES ANY COPY ABOVE THIS LINE' "$AUTH_TMPL"; ck $? "⛔ …and the stale lane order is MARKED SUPERSEDED (arrival alone cannot see the false order still above it)"
+awk '/SUPERSEDES ANY COPY ABOVE THIS LINE/{m=NR} /Your PR is ALREADY OPEN/{if(!p)p=NR} END{exit !(m && p && p>m)}' "$AUTH_TMPL"
+ck $? "…and the notice lands BEFORE the true sentence, so the last word the worker reads is the true one"
+# The already-correct case must NOT gain a notice — its brief has no stale copy, so a notice there
+# would be a false claim of its own (and it would break the byte-for-byte promise above).
+case "$(cat "$AUTH_PRFIX")" in *"SUPERSEDES ANY COPY ABOVE THIS LINE"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…and a brief that was ALREADY role-correct gets NO supersession notice (idempotent, no false claim)"
 
 # ── orch-send.sh + safe-send.sh: the pane-order paths. Stub `cmux` records every call, so "refused"
 # is again proven by absence.
