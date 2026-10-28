@@ -1,0 +1,14 @@
+# A plain flow scalar with an apostrophe: `dont's-group` opens no string, so the comma still
+# separates the two pairs and `cancel-in-progress: true` is read. A quote-blind splitter swallowed the
+# comma, left `cancel` EMPTY, and R2 read empty as the non-cancelling default — one value with two
+# verdicts, the escape being the flow form (#2660 round 11).
+name: push flow apostrophe
+on:
+  push:
+    branches: [main]
+concurrency: {group: dont's-group, cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

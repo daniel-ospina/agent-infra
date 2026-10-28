@@ -321,3 +321,80 @@ def test_the_beat_and_the_dispatcher_read_the_same_function():
         "while its class counts are built on an unread merge state")
     # And no second threshold lives in `pr-loop.py`.
     assert "2 * " not in loop_src, "a second definition of \"blind\" appeared in pr-loop.py"
+
+
+# ── agent-infra#2922: an unreadable cwd on the LAUNCHD path ────────────────────────────────────
+# `pr-loop.py` carries the SAME `_checkout_repo` shim as `objective.py` (deliberately -- one
+# derivation, two callers). It therefore carried the SAME defect: `os.getcwd()` was evaluated inside
+# the `try` around `subprocess.run`, so a launcher refusing to report the cwd was reported as
+# `underivable` -- the remedy for a broken `git`/`bash` -- instead of as the cwd itself. Both files
+# are fixed together, so both are pinned together; a fix in one only would leave the beat's other
+# reader sending an operator to the wrong remedy.
+def test_an_UNREADABLE_CWD_is_named_here_too_not_only_in_objective_py(monkeypatch):
+    """Reproduced before the fix: `pl._checkout_repo()` returned `(None, 'underivable')` here."""
+
+    def boom():
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(pl.os, "getcwd", boom)
+    assert pl._checkout_repo() == (None, "cwd-unreadable")
+    assert pl._checkout_repo("") == (None, "cwd-unreadable")
+
+
+def test_the_two_shims_agree_on_the_cwd_reason(monkeypatch):
+    """One defect, one word: the twin must not answer a THIRD spelling that a reader cannot match."""
+    def boom():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(pl.os, "getcwd", boom)
+    assert pl._checkout_repo()[1] == objective._checkout_repo()[1] == "cwd-unreadable"
+
+
+def _refusal(monkeypatch, exc):
+    """The text `_objective()` refuses with, when the cwd cannot be read."""
+    def boom():
+        raise exc
+
+    monkeypatch.setattr(pl.os, "getcwd", boom)
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    try:
+        pl._objective()
+    except SystemExit as exc_info:
+        return str(exc_info.code)
+    raise AssertionError("_objective() did not refuse on an unreadable cwd")
+
+
+def test_the_CWD_REASON_reaches_the_REMEDY_and_not_the_origin_remote_one(monkeypatch):
+    """The reason is only worth computing if the OPERATOR receives its remedy (ai#3000 review, P1).
+
+    Reproduced before the fix: `_checkout_repo()` returned `(None, 'cwd-unreadable')` -- this PR's
+    own new answer -- and `_objective()`'s two-branch catch-all then told the operator "cannot
+    derive this checkout's repo from its origin remote ... Run from the checkout you mean": the
+    remedy for a DIFFERENT cause, so a launchd cwd failure sent them to debug `git`/`bash` for ever.
+    The cause was computed and eaten by the catch-all; this pins the far end of the wire.
+    """
+    msg = _refusal(monkeypatch, PermissionError(1, "Operation not permitted"))
+    assert "working directory" in msg.lower(), (
+        "the refusal for `cwd-unreadable` does not name the cwd: %r" % msg)
+    assert "run from the checkout you mean" not in msg.lower(), (
+        "a cwd failure still hands the operator the origin-remote remedy: %r" % msg)
+    assert "OBJECTIVE_REPO" in msg, "the refusal names no remedy at all: %r" % msg
+
+
+def test_the_OTHER_two_causes_keep_their_OWN_remedy(monkeypatch):
+    """Over-reach guard: adding the third branch must not reroute the two that were already right."""
+    msg = _refusal(monkeypatch, FileNotFoundError(2, "No such file or directory"))
+    assert "working directory" in msg.lower(), msg
+
+    # `deriver-missing` still gets ITS own remedy -- poisoning HERE removes the deriver sibling.
+    monkeypatch.setattr(pl, "HERE", pl.HERE / "this-path-has-no-deriver")
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    try:
+        pl._objective()
+    except SystemExit as exc_info:
+        missing = str(exc_info.code)
+    else:
+        raise AssertionError("_objective() did not refuse with no deriver present")
+    assert "slug deriver is MISSING" in missing, missing
+    assert "working directory" not in missing.lower(), (
+        "a MISSING DERIVER is now reported as a cwd failure: %r" % missing)
