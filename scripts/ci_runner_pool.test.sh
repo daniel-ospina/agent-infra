@@ -1316,6 +1316,9 @@ assert_contains "$out" "cannot-act why=tmpdir-value-not-literal" "naming the sha
 assert_contains "$out" "value=\$HOME/ci-tmp" "and the value it read"
 assert_absent "$RUNNER_ROOT/pi-runner-exp/\$HOME" "no literal '\$HOME' directory was created (the false PASS this replaces)"
 
+assert_absent "$RUNNER_ROOT/pi-runner-exp/ci-tmp" "and nothing was guessed at either"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-exp") ))" "0" "nothing was started"
+
 # ── (9a) SHELL SYNTAX THIS PARSER DOES NOT MODEL IS REFUSED, NEVER TRUNCATED ────────────────
 # ⛔ Truncating at syntax instead of refusing it created a DIFFERENT directory and reported
 #   `created tmpdir=…` with rc 0 over the real path's absence — measured on the round-2 shape:
@@ -1334,13 +1337,17 @@ syn_expect() { # <case#> <value> <truncated-path-that-must-NOT-exist>
   assert_eq "$?" "2" "value [$2] is cannot-act (rc 2), never a truncated path"
   assert_contains "$out" "cannot-act why=tmpdir-value-" "naming the shape it refused"
   assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-syn$1") ))" "0" "and it started nothing"
-  assert_absent "$RUNNER_ROOT/pi-runner-syn$1/$3" "the truncated path [$3] was NOT created"
+  assert_absent "$3" "the truncated path [$3] was NOT created"
 }
-syn_expect 1 '/tmp/x/a\ b'      'a\'
-syn_expect 2 '/tmp/x/x; echo hi' 'x;'
-syn_expect 3 "/tmp/x/adj'x"     "x/adj'x"
-assert_absent "$RUNNER_ROOT/pi-runner-exp/ci-tmp" "and nothing was guessed at either"
-assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-exp") ))" "0" "nothing was started"
+# ⛔ THE TRUNCATED PATHS ARE ABSOLUTE — round 2's parser returned `/tmp/x/a\`, `/tmp/x/x;` and
+# `/tmp/x/adj'x`, which live OUTSIDE the fixture. Asserting `$RUNNER_ROOT/<suffix>` (the first draft)
+# could never fail AND let a regression write into the host's /tmp, so the subject is the real path and
+# it is cleaned up before and after.
+rm -rf '/tmp/x/a\' '/tmp/x/x;' "/tmp/x/adj'x" 2>/dev/null
+syn_expect 1 '/tmp/x/a\ b'      '/tmp/x/a\'
+syn_expect 2 '/tmp/x/x; echo hi' '/tmp/x/x;'
+syn_expect 3 "/tmp/x/adj'x"      "/tmp/x/adj'x"
+rm -rf '/tmp/x/a\' '/tmp/x/x;' "/tmp/x/adj'x" 2>/dev/null
 fresh_pool tmpcmt; reset_logs
 register pi-runner-cmt
 printf 'TMPDIR=%s/pi-runner-cmt/tmp  # scratch\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-cmt/.env"
@@ -1502,7 +1509,7 @@ else
     err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
     ensure_tmpdir "$ROOT/pi-runner-own" 1
   ' 2>&1)"
-  assert_contains "$own_out" "cannot-act why=tmpdir-owner-mismatch" "the live arm refuses an owner it cannot be"
+  assert_contains "$own_out" "cannot-measure why=tmpdir-owner-mismatch" "the live arm refuses an owner whose access it cannot measure"
   assert_contains "$own_out" "pid=1 runs as user=" "naming the live listener it compared"
   assert_absent "$RUNNER_ROOT/pi-runner-own/tmp" "and it created nothing under the wrong owner"
   POOL="$POOL" ROOT="$RUNNER_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c '

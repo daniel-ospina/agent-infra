@@ -624,10 +624,13 @@ instance_tmpdir() {
   # ⛔ WHAT FOLLOWS THE VALUE MUST BE BLANK OR A COMMENT. Anything else is a second shell word that a
   # sourcing shell would either CONCATENATE (`'/tmp/a'x` → `/tmp/ax`) or run (`… ; rm -rf /`), and this
   # parser models neither — so it refuses rather than create the path it happened to read (#3004
-  # review round 3, P1). Only a `#` that a sourcing shell would also treat as a comment start is
-  # tolerated, and only after whitespace (an unquoted `#` mid-word is part of the value, not a comment).
+  # review round 3, P1). ⛔ AND `#` IS ONLY A COMMENT AT THE START OF A WORD: for a QUOTED value `rest`
+  # begins immediately after the closing quote, so `'/tmp/a'#x` has `#x` CONCATENATED into the word
+  # (`/tmp/a#x`) and is NOT a comment — accepting it created the truncated `/tmp/a` and reported
+  # `created tmpdir=…` over the listener's absent path (#3004 review round 4, P1). Hence: blank, or
+  # WHITESPACE followed by nothing-or-comment. Never `#` with no whitespace before it.
   case "$rest" in
-    ''|'#'*) : ;;
+    '') : ;;
     [[:space:]]*) case "${rest#"${rest%%[![:space:]]*}"}" in ''|'#'*) : ;; *)
         err "cannot-act why=tmpdir-value-trailing-syntax value=$raw (named by $d/.env) — a sourcing shell would CONCATENATE or EXECUTE what follows the value (${rest}), so the path this tool read is not the path the listener uses; write one plain absolute path in $d/.env"
         return 2 ;; esac ;;
@@ -670,6 +673,28 @@ ensure_tmpdir() {
   # listener anyway is the defect — the env it would inherit is unknown.
   [ "$rc" -eq 0 ] || return 2
   [ -n "$t" ] || return 0
+  # ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1), AND THAT IS TRUE WHETHER
+  # OR NOT THE DIRECTORY ALREADY EXISTS (#3004 review round 4, P2). Everything below measures access as
+  # THIS process: for the START path that is the right subject, because `start_listener` execs `run.sh`
+  # as the same user. For a LIVE listener it is not — so a wrong-owner directory that ALREADY exists
+  # (a hand `sudo mkdir -m 700`, or an earlier root pass) was reported "satisfiable" by a `-w` test
+  # that is trivially true for root, which is the same false PASS the create branch refuses. The
+  # comparison therefore runs first, for both branches, and a mismatch is cannot-measure — this tool
+  # cannot establish another user's access, and saying "fine" is what the issue is about.
+  if [ -n "$live_pid" ]; then
+    lu="$(ps -o user= -p "$live_pid" 2>/dev/null | tr -d '[:space:]')"
+    # ⛔ ONLY A READING THAT LOOKS LIKE A USER MAY REFUSE. `ps` is a READ this file already treats as
+    # fallible, and this repo's own suite replaces it (`$BIN/ps` models the process table), so a
+    # garbage line must degrade to "no mismatch proven" — NOT to a refusal that would block a legal
+    # repair on every box whose `ps` is a shim. A refusal is only ever minted from a name-shaped read.
+    case "$lu" in
+      ''|*[!A-Za-z0-9_.-]*) lu="" ;;
+    esac
+    if [ -n "$lu" ] && [ "$lu" != "$(id -un 2>/dev/null)" ]; then
+      err "cannot-measure why=tmpdir-owner-mismatch path=$t (named by $d/.env) — the live listener pid=$live_pid runs as user=$lu and this pass runs as user=$(id -un 2>/dev/null), so this process cannot establish whether that user can write the directory, and every job on it dies at mktemp if it cannot; run this pass as $lu (or as the listener's own user) so the check measures the right process"
+      return 2
+    fi
+  fi
   if [ ! -d "$t" ]; then
     # ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1). The owner claim below
     # holds for the START path: `start_listener` execs `run.sh` as this same process's user. The LIVE
@@ -679,21 +704,6 @@ ensure_tmpdir() {
     # write it, its jobs would still die (EACCES instead of ENOENT), and every instrument in this file
     # would call the row clean — `[ -w ]` is trivially true for root and `status` tests existence only.
     # This tool cannot create a directory in another user's name, so it REFUSES and names both users.
-    # ⛔ Exempt from dry-run: a preview must predict the SAME refusal as the real pass, not a start.
-    if [ -n "$live_pid" ]; then
-      lu="$(ps -o user= -p "$live_pid" 2>/dev/null | tr -d '[:space:]')"
-      # ⛔ ONLY A READING THAT LOOKS LIKE A USER MAY REFUSE. `ps` is a READ this file already treats as
-      # fallible, and this repo's own suite replaces it (`$BIN/ps` models the process table), so a
-      # garbage line must degrade to "no mismatch proven" — NOT to a refusal that would block a legal
-      # repair on every box whose `ps` is a shim. A refusal is only ever minted from a name-shaped read.
-      case "$lu" in
-        ''|*[!A-Za-z0-9_.-]*) lu="" ;;
-      esac
-      if [ -n "$lu" ] && [ "$lu" != "$(id -un 2>/dev/null)" ]; then
-        err "cannot-act why=tmpdir-owner-mismatch path=$t (named by $d/.env) — the live listener pid=$live_pid runs as user=$lu and this pass runs as user=$(id -un 2>/dev/null), so a mode-700 directory created here would belong to the wrong user and every job on it would still die; create it as $lu, or run this pass as $lu"
-        return 2
-      fi
-    fi
     # ⛔ A PREVIEW MAY NOT MUTATE, AND IT MAY NOT LIE (#3004 review, P2). `--dry-run` used to skip this
     # check entirely (it sat downstream of the DRY return), so an uncreatable target previewed as
     # "would start the listener" (rc 0) and then refused for real (rc 2) — the lying preview this file
