@@ -329,19 +329,21 @@ if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
   # `request=cleared reason=no-live-controller` — from inside a LIVE controller. `ps -p` reads across
   # users, so it is the second opinion: GONE requires BOTH to say gone.
   # ⛔ AND THE FLAG WORKS IN BOTH DIRECTIONS, SO ITS SAFETY ARGUMENT HAS TO COVER BOTH. It does NOT "only
-  # ever downgrade": `CONTROLLER_LIVE=1` also ENABLES the controller's-argv identity reads — the
-  # pin-rooted source-2 reader AND, as its fallback, `controller_identity` — which is how `restart-pending`
-  # can honestly END on a cell. ⛔ IT DOES NOT CHANGE WHAT A CASUAL READER MIGHT ASSUME: with NO controller
-  # live neither reader runs, the STAMP answers, and the relation is simply whatever that claim implies —
+  # ever downgrade": `CONTROLLER_LIVE=1` also ENABLES `controller_identity` (the source-3 read) and the
+  # process-tree population, so it can turn `restart-pending` into `current` — which is how that state
+  # can honestly END on a cell. ⛔ BUT IT DOES NOT GATE EVERY READER: the pin-rooted source-2 stage below
+  # establishes liveness from the lock pid ITSELF (`kill -0` + `_began_before_lock`) and never consults
+  # this flag. ⛔ AND IT DOES NOT CHANGE WHAT A CASUAL READER MIGHT ASSUME: with NO controller live
+  # neither reader runs, the STAMP answers, and the relation is whatever that claim implies —
   # `restart-pending` while the stamp is not the pin, and `current` when it happens to name it. So "no
   # controller" is not by itself a `restart-pending`, and "a controller" is not by itself a `current`.
   # ⛔ DO NOT ATTRIBUTE THE PROMOTION TO ONE READER: source-3 runs only `if [ -z "$RUNNING" ]`, so on the
   # standard cell posture (`HARNESS_PIN_DIR` + `HARNESS_PIN_FILE`, flat `$O`) it is source-2 that answers
-  # and `RUNNING_FROM=proc:<tree>` that gets recorded. What keeps the promotion
-  # sound is NOT this flag but the OWNERSHIP re-verification the flag gates: both readers refuse unless
-  # `_began_before_lock` proves the named process began at/before the lock was written, which a recycled
-  # pid cannot satisfy. So a `ps -p` false positive cannot buy a `current` on its own — not because the
-  # flag is downgrade-only, but because the stage it opens re-checks ownership by age.
+  # and `RUNNING_FROM=proc:<tree>` that gets recorded. What keeps the promotion sound is that EACH stage
+  # proves OWNERSHIP for itself — `_began_before_lock` refuses unless the named process began at/before
+  # the lock was written, which a recycled pid cannot satisfy. So a `ps -p` false positive cannot buy a
+  # `current` on its own: not because the flag is downgrade-only, but because every stage it opens
+  # re-checks ownership by age.
   if [ -n "$CONTROLLER_PID" ] \
      && { kill -0 "$CONTROLLER_PID" 2>/dev/null || "${PS_BIN:-ps}" -p "$CONTROLLER_PID" >/dev/null 2>&1; }; then
     CONTROLLER_LIVE=1
@@ -504,12 +506,17 @@ RUNNING_FROM="self:$SELF"
 # outside every recorded root is a PEER repo's controller and must never answer for this box; without
 # the pin file and flat-pin arms, a box on either would keep the permanent `restart-pending` this stage
 # exists to remove.
-# ⛔ It does NOT require `CONTROLLER_LIVE`: that is computed ABOVE this block (this PR moved that one
-# read up, so the lock is read ONCE), and it gates more than it used to — the `stamp:*` downgrade, the
-# controller-argv identity stage (`controller_identity`) and the process-tree population. This stage
-# establishes liveness itself from the lock pid it names.
-#   ⛔ DO NOT ADD A SECOND `CONTROLLER_LIVE` READ HERE. Two reads of one record is exactly the defect
-#   the move above removed; a lane that trusts the old "computed below" wording would re-introduce it.
+# ⛔ IT DOES NOT REQUIRE `CONTROLLER_LIVE`, AND THAT FLAG DOES NOT GATE IT: the flag gates
+# `controller_identity` and the process-tree population, not this stage. This stage establishes liveness
+# from the lock pid it names (`kill -0` + `_began_before_lock`) and never consults the flag.
+# ⛔ AND SAY THIS PLAINLY, BECAUSE AN EARLIER NOTE HERE GOT IT WRONG: the lock IS read more than once per
+# run — once by the `CONTROLLER_LIVE` read above, once here for this stage's own ownership proof, and once
+# more by the refusal prose. That is deliberate, not a defect: each stage proves ownership from the RECORD
+# rather than trusting another stage's verdict, and ownership is the one thing a cheap read can get wrong
+# (#1856: a recycled pid under a shared pin root). What must NOT be added here is a SECOND CONTROLLER_LIVE
+# COMPUTATION — the flag means one thing, computed once; this stage asks a different question of the same
+# record and answers it itself. (#2958 moved the single `CONTROLLER_LIVE` read above the RUNNING
+# computation; that move is NOT this PR's.)
 #
 # _began_before_lock <lock-file> <pid> — 0 when the process provably began at/before the lock was
 # written. This is the AGE half of the fleet's ONE controller-ownership rule (#1178), carried inline
