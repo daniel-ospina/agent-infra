@@ -6810,19 +6810,21 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
     # `TMPDIR=/var/folders/...` it is ~141 chars, so the path ends at char ~194 and the arm failed on
     # every macOS box while passing on `ubuntu-latest` (whose temp root is shorter) -- a verdict
     # decided by the box's `$TMPDIR` grades the box, not the ordering. So the ordering is asserted at
-    # its EXACT OFFSET (box-independent), and the 160-char property is asserted separately against a
-    # PRODUCTION-LENGTH `$O` (~27 chars; a real box resolves `$HOME/.pi/agent/scripts/brief-gate.sh`,
-    # which is 32 + len($HOME) chars — 44-52 in practice)
-    # in the block after it.
+    # its EXACT OFFSET (box-independent), and the 160-char property is asserted separately against
+    # an `$O` no LONGER than production's (the block after it): `/tmp/oXXXXXX` is 14 chars, against
+    # the real `$O/brief-gate.sh` = 27 + len($HOME) = 41 in this fleet (`$O` defaults to
+    # `$HOME/orchestrator`), so that assertion is CONSERVATIVE rather than box-dependent.
+    # `$HOME/.pi/…` is only the FOURTH candidate (32 + len($HOME)) and is NOT the path a real box
+    # resolves — the first candidate, `$O/brief-gate.sh`, always exists on an installed box.
     path = str(d / "brief-gate.sh")
     prefix = "rc=80: nonblocking-dispatch.sh: REFUSED — brief-gate="
     assert detail.splitlines()[0].startswith(prefix + path), (
         "the naming line did not LEAD with brief-gate=<resolved path> at char %d, so the path is "
         "still behind the gate's teaching block: %r" % (len(prefix), detail[:200]))
 
-    # ── AND THE 160-CHAR SLICE IS REAL FOR A PATH THE SIZE OF A PRODUCTION `$O` ────────────────
-    # `/tmp/oXXXXXX` rather than `tmp_path`: on macOS `tmp_path` nests under /private/var/folders and
-    # no preamble short enough to name the copy would rescue a 141-char path.
+    # ── AND THE 160-CHAR SLICE IS REAL FOR AN `$O` NO LONGER THAN A REAL BOX'S ─────────────
+    # `/tmp/oXXXXXX` (14 chars) rather than `tmp_path`: on macOS `tmp_path` nests under
+    # /private/var/folders and no preamble short enough to name the copy would rescue a 141-char path.
     short = pathlib.Path(tempfile.mkdtemp(dir="/tmp", prefix="o"))
     try:
         for f in ("brief-gate.sh", "spawn-gate.sh"):

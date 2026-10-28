@@ -146,8 +146,10 @@ fi
 # The gate's output is therefore CAPTURED and re-emitted AFTER the naming line, and the path is placed
 # at char 53 of `detail` (`rc=80: ` + `brief-gate=`) rather than after a 90-char preamble, so it sits
 # at ~char 46 of this line — the whole path fits the 160-char slice whenever the resolved path is
-# ≤ 107 chars, which every production `$O` is (the resolver's own `$HOME/.pi/agent/scripts/brief-gate.sh`
-# is 32 + `len($HOME)` chars — 44-52 in practice, never near 107). ⚠️ The
+# ≤ 107 chars, which every production `$O` is (the path a real box RESOLVES is `$O/brief-gate.sh`,
+# `$O` defaulting to `$HOME/orchestrator` — 27 + `len($HOME)` chars, 41 in this fleet; the
+# `$HOME/.pi/agent/scripts` candidate is only the FOURTH fallback, 32 + `len($HOME)`, and both are
+# nowhere near 107). ⚠️ The
 # bound is the ORDERING plus that length; a box whose resolved path is longer than ~107 chars shows a
 # truncated tail, not a missing name (#2986 review, P1: the first form of the arm asserted the pytest
 # fixture's 141-char macOS temp path against 160, so it graded the box's `$TMPDIR` and was red on
