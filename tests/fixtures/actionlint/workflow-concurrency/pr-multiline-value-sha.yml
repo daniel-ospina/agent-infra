@@ -1,0 +1,16 @@
+# A value that STARTS on the key line and continues on the next is one YAML scalar. Arming the
+# continuation accumulator only for an EMPTY value dropped the rest, so `-${{ github.sha }}` on the
+# next line vanished — a per-commit variable hidden from R1, i.e. the inert gate it exists to refuse
+# (#2660 round 10).
+name: PR multiline value sha
+on:
+  pull_request:
+concurrency:
+  group: pr-multiline-value-sha-${{ github.ref }}
+    -${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
