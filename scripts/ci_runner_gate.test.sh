@@ -168,26 +168,44 @@ case "$*" in
   # `token@l1|l2|l3` gives ONE runner its own label set (`|` because the token list is comma-split),
   # which is the only way to build "one demand-matching runner among idle ones that cannot take it"
   # — the state that used to be certified as `saturated` (#3002 review P1, round 3).
+  # ⛔ THE STUB ALSO SPEAKS THE PAGE ROW (#3002 review P1): a real `--jq` emits
+  # `<#page> TAB <type> TAB <count>` FIRST on every page, and ONLY when it parsed a body. The stub
+  # therefore emits it for every mode that ANSWERS with a `.runners` array — including `empty`, whose
+  # point is a readable zero (`"runners": []` → count 0) — and emits NOTHING for `blank`, which is the
+  # body that produced no output at all. Without those two the suite could not tell the states apart,
+  # which is exactly the defect being pinned.
+  #   blank = the read produced NOTHING (empty body, jq read no input) — UNREADABLE, never zero
+  #   short = a page DECLARING 2 registrations that emitted 1 — a truncated stream, UNREADABLE
+  #   rowgarbage = one good registration row beside a non-row, with a page row that AGREES with the
+  #                good one — the only body that isolates the ROW-shape check from the page-row and
+  #                declared-count guards (both of which would otherwise refuse it for another reason)
   *".status"*)
     case "${GH_CENSUS_MODE:-ok}" in
       forbidden)      printf '{"message":"Resource not accessible by personal access token","documentation_url":"https://docs.github.com/rest/actions/self-hosted-runners#list-self-hosted-runners-for-a-repository","status":"403"}\ngh: Resource not accessible by personal access token (HTTP 403)\n' >&2; exit 1 ;;
       forbidden-bare) printf 'gh: Resource not accessible by personal access token (HTTP 403)\n' >&2; exit 1 ;;
       garbage)        printf 'null\n' ;;
-      empty)          : ;;
+      empty)          printf '#page\tarray\t0\n' ;;
+      blank)          : ;;
+      short)          printf '#page\tarray\t2\nonline\tfalse\tself-hosted,ubuntu-latest\n' ;;
+      rowgarbage)     printf '#page\tarray\t1\nnull\nonline\tfalse\tself-hosted,ubuntu-latest\n' ;;
       *)              _census="${GH_CENSUS:-busy}"; _census="${_census//,/ }"
                       _lc=""; [ -n "${GH_CENSUS_LABELCOUNT:-}" ] && _lc=$'\t'"$GH_CENSUS_LABELCOUNT"
+                      _rows=""; _n=0
                       for _c in $_census; do
                         _cl="${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}"
                         case "$_c" in
                           ?*@*) _cl="${_c#*@}"; _cl="${_cl//|/,}"; _c="${_c%%@*}" ;;
                         esac
                         case "$_c" in
-                          idle) printf 'online\tfalse\t%s%s\n' "$_cl" "$_lc" ;;
-                          busy) printf 'online\ttrue\t%s%s\n'  "$_cl" "$_lc" ;;
-                          off)  printf 'offline\tfalse\t%s%s\n' "$_cl" "$_lc" ;;
-                          *)    printf '%s\n' "$_c" ;;
+                          idle) _row="online"$'\t'"false"$'\t'"$_cl$_lc" ;;
+                          busy) _row="online"$'\t'"true"$'\t'"$_cl$_lc" ;;
+                          off)  _row="offline"$'\t'"false"$'\t'"$_cl$_lc" ;;
+                          *)    _row="$_c" ;;
                         esac
-                      done ;;
+                        _rows="$_rows$_row"$'\n'; _n=$((_n+1))
+                      done
+                      printf '#page\tarray\t%s\n' "$_n"
+                      printf '%s' "$_rows" ;;
     esac
     exit 0 ;;
   *"-X PUT"*)
@@ -1089,8 +1107,35 @@ assert_eq "$RC" "2" "(7) a null census body → exit 2"
 assert_contains "$OUT" "census UNREADABLE" "(7) the failure is named as a body/schema problem"
 assert_not_contains "$OUT" "offline=0" "(7) 'no runners' is never invented from an unreadable body"
 run_gate census-empty GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=empty --
-assert_eq "$RC" "0" "(7) an EMPTY census is a readable zero, not a failed read"
+assert_eq "$RC" "0" "(7) an EMPTY POOL is a readable zero, not a failed read"
 assert_contains "$OUT" "runners=0" "(7) and it says so"
+
+# ⛔ (7b) A BODY THAT PRODUCED NOTHING IS NOT A POOL WITH NO RUNNERS (#3002 review P1). `jq` over an
+# EMPTY input stream emits nothing and exits 0, so a blank 200 and an empty pool were byte-identical —
+# and the gate resolved that toward `runners=0`, which in mode=local with a demand is a `stranded`
+# DENY, i.e. a relabel taken on a read with no value in it. The page row is what tells them apart; with
+# no page row the pass must refuse, exactly as `current_mode` does for the identical body.
+echo "── #3002 P1: a census read that produced NO page row is UNREADABLE, never 'zero runners' ──"
+run_gate census-blank GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=blank --
+assert_eq "$RC" "2" "(7b) a blank census body → exit 2 (could-not-measure), not a measured zero"
+assert_contains "$OUT" "census UNREADABLE" "(7b) the read is named unreadable"
+assert_contains "$OUT" "capacity=unknown" "(7b) capacity is UNKNOWN, never a count of zero"
+assert_not_contains "$OUT" "runners=0" "(7b) 'zero runners' is never invented from a body that said nothing"
+assert_not_contains "$OUT" "stranded" "(7b) and a blank body can never produce a stranded DENY"
+assert_not_contains "$OUT" "healthy" "(7b) nor can it read healthy"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "(7b) nothing is relabelled on a read with no value in it"
+# ⛔ (7c) THE STREAM CAN ALSO BE CUT BETWEEN the page row and the rows it declares. Every page row and
+# every registration row come from the SAME jq run, so a mismatch is a TRUNCATED body — an UNDERCOUNT,
+# which is the failure shape that reads as a healthy pool. Refused, not counted.
+run_gate census-short GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=short --
+assert_eq "$RC" "2" "(7c) a page declaring 2 registrations that emitted 1 → exit 2"
+assert_contains "$OUT" "census UNREADABLE" "(7c) a truncated stream is named unreadable"
+assert_not_contains "$OUT" "runners=1" "(7c) the undercount is never reported as the pool size"
+# …and the manual read verb answers the same way (it computes no verdict, and says UNKNOWN).
+run_gate status-blank GH_FALLBACK_N=1 GH_CENSUS_MODE=blank -- --status
+assert_eq "$RC" "2" "(7d) --status on a blank census body → exit 2"
+assert_contains "$OUT" "capacity=unknown" "(7d) --status says UNKNOWN rather than inventing a zero pool"
+assert_contains "$OUT" "runners=unmeasured" "(7d) …with the census keys carried, not dropped"
 
 # ── #3002 review fixes — each one is a defect this pass's own artifacts could not answer ────────
 # ⛔ (11) THE BLIND REPORT COULD NOT SAY HOW DEEP THE QUEUE WAS. `queued` is declared `local` INSIDE
@@ -1272,28 +1317,32 @@ else
   bad "(m1) the mutant could not be generated (anchor moved) — the three-state split is unproven"
 fi
 
-# (m2) THE OLD FAILURE MODE: an unreadable body read as "no rows", i.e. as a measured zero.
+# (m2) THE OLD FAILURE MODE: an unreadable ROW read as "no rows", i.e. as a measured zero. Driven by
+# `rowgarbage` — a good registration row beside a non-row under a page row that AGREES with the good
+# one — because that is the only body where the row-shape check is the guard that fires (#3002 review
+# P1 added two more guards, and a mutant that survives because a DIFFERENT guard refused proves
+# nothing about this one).
 MUT2="$T/ci_runner_gate.mutant-zerofill.sh"
 if mutate_gate "$MUT2" \
   '    case "$row" in *$'"'"'\t'"'"'*) ;; *) return 1 ;; esac
     st="${row%%$'"'"'\t'"'"'*}"' \
-  '    case "$row" in *$'"'"'\t'"'"'*) ;; *) continue ;; esac   # MUTANT::m2 — an unreadable body is read as zero rows
+  '    case "$row" in *$'"'"'\t'"'"'*) ;; *) continue ;; esac   # MUTANT::m2 — an unreadable row is read as zero rows
     st="${row%%$'"'"'\t'"'"'*}"'; then
   ok "(m2) the zero-fill mutant was generated from the SHIPPED gate"
   GATE_UNDER_TEST="$MUT2"
-  run_gate mutant-zerofill GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=garbage --
+  run_gate mutant-zerofill GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=rowgarbage --
   GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
   # ⛔ A CRASH IS NOT A KILL (#3002 review P2). Without this guard a mutant that died before printing
   # anything scored as "killed", because the kill test only asked whether "census UNREADABLE" was
   # ABSENT — and a mutant that crashed never printed it. Same guard m1 already had; m2/m3/m4 lacked it.
   assert_eq "$RC" "0" "(m2) the mutant still RUNS — so the red below is the property, not a crash"
   if grep -qF "census UNREADABLE" <<<"$OUT"; then
-    bad "(m2) MUTATION SURVIVED: a null census body still refused — the readable-zero distinction is not load-bearing"
+    bad "(m2) MUTATION SURVIVED: a non-conforming census row still refused — the per-row shape check is not load-bearing"
   else
-    ok "(m2) mutation killed: a null body is now read as 'zero runners' (rc=$RC) — a measured fact invented from an unreadable read"
+    ok "(m2) mutation killed: a non-row is now skipped and the body reads as a measured pool (rc=$RC) — a fact invented from a row this pass cannot read"
   fi
 else
-  bad "(m2) the mutant could not be generated (anchor moved) — the readable-zero distinction is unproven"
+  bad "(m2) the mutant could not be generated (anchor moved) — the row-shape distinction is unproven"
 fi
 
 # (m3) THE FLAPPER: the mode gate dropped, so a pool stripped BY DESIGN reads as stranded and the
@@ -1444,6 +1493,49 @@ if mutate_gate "$MUT8" \
   fi
 else
   bad "(m8) the mutant could not be generated (anchor moved) — the per-job demand sets are unproven"
+fi
+
+# (m9) THE PAGE-ROW GUARD IS GONE: a read that produced NOTHING is a zero pool again (#3002 review P1).
+# This is the mutant that restores the reviewed defect exactly — the blank 200 body that used to become
+# `runners=0`, and in mode=local a `stranded` DENY, i.e. a relabel on a read with no value in it.
+MUT9="$T/ci_runner_gate.mutant-nopageRow.sh"
+if mutate_gate "$MUT9" \
+  '[ "$pages" -gt 0 ] || return 1' \
+  ':   # MUTANT::m9 — a body that produced nothing is read as a pool of zero runners'; then
+  ok "(m9) the no-page-row mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT9"
+  run_gate mutant-nopagerow GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=blank --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  assert_not_contains "$OUT" "census UNREADABLE" \
+    "(m9) the mutant still RUNS to a verdict — so the red below is the property, not a crash"
+  if grep -qF "runners=0" <<<"$OUT"; then
+    ok "(m9) mutation killed: a read that produced nothing is read as 'zero runners' again, and the pool is RELABELLED on it (arm 7b reddens)"
+  else
+    bad "(m9) MUTATION SURVIVED: the blank body did NOT become a zero pool"
+  fi
+else
+  bad "(m9) the mutant could not be generated (anchor moved) — the page-row guard is unproven"
+fi
+
+# (m10) THE DECLARED-COUNT CHECK IS GONE: a stream CUT between the page row and its registrations is
+# counted as whatever arrived, so a truncated body is reported as a smaller but healthy-looking pool.
+MUT10="$T/ci_runner_gate.mutant-nocount.sh"
+if mutate_gate "$MUT10" \
+  '[ "$n" = "$declared" ] || return 1' \
+  ':   # MUTANT::m10 — a truncated stream is counted as whatever arrived'; then
+  ok "(m10) the declared-count mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT10"
+  run_gate mutant-nocount GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=short --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  assert_not_contains "$OUT" "census UNREADABLE" \
+    "(m10) the mutant still RUNS to a verdict — so the red below is the property, not a crash"
+  if grep -qF "runners=1" <<<"$OUT"; then
+    ok "(m10) mutation killed: a page declaring 2 that emitted 1 is reported as a 1-runner pool (arm 7c reddens)"
+  else
+    bad "(m10) MUTATION SURVIVED: the truncated stream was NOT read as an undercount"
+  fi
+else
+  bad "(m10) the mutant could not be generated (anchor moved) — the truncation guard is unproven"
 fi
 
 echo "── --dry-run and --status stay read-only ──"

@@ -267,11 +267,26 @@ need gh; need curl; need python3
 # that cannot, the caller turns the failure into `capacity=unknown` rather than into a count of zero.
 RUNNER_LIST_PATH="repos/$REPO/actions/runners"
 runner_census() {
-  # FOUR fields, the last one OPTIONAL (see CENSUS_LABEL_AMBIGUOUS): `<status> TAB <busy> TAB
-  # <labels,comma> TAB <label count>`. The count is what lets the reader tell a 3-label set from a
-  # 2-label set whose second label contains a comma, which the join above cannot distinguish.
+  # ⛔ TWO KINDS OF ROW, and the FIRST kind is what makes the read READABLE AT ALL (#3002 review P1).
+  #
+  #   <#page> TAB <type> TAB <count>                                    — one per page, FIRST on the page
+  #   <status> TAB <busy> TAB <labels,comma> TAB <label count>          — one per registration
+  #
+  # The registration row's last field is OPTIONAL (see CENSUS_LABEL_AMBIGUOUS): the count is what lets
+  # the reader tell a 3-label set from a 2-label set whose second label contains a comma, which the
+  # join cannot distinguish.
+  #
+  # ⛔ WHY THE PAGE ROW EXISTS: `jq` over an EMPTY input stream emits NOTHING and exits 0, so "the pool
+  # has no runners" and "the response body contained nothing at all" used to be BYTE-IDENTICAL output
+  # (empty stdout, rc 0) — and this script resolved that ambiguity toward "measured zero". A blank 200
+  # then read as `runners=0`, which in mode=local with a measured demand is a `stranded` DENY, i.e. a
+  # relabel taken on a read with no value in it — while `current_mode` (:800) refuses the identical
+  # body. A page row is emitted by JQ ITSELF the moment it parses a body whose `.runners` is an array,
+  # so its presence distinguishes "answered, with N runners" (N may be 0) from "produced nothing"
+  # without a second read. `.runners|type` is carried rather than assumed: a body that answers with
+  # `.runners: null` is a SCHEMA change, not an empty pool, and must not be counted as one either.
   gh api --paginate "$RUNNER_LIST_PATH" \
-    --jq '.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)"' 2>"$GH_ERR"
+    --jq '("#page\t\(\.runners|type)\t\(\.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR"
 }
 
 # census_capability <body> — WHICH permission the read needed, named from the response itself.
@@ -309,8 +324,9 @@ offers_all() {
 }
 
 # census_classify <rows> — the three states, PER RUNNER, and the demand match.
-# rc 0 = measured (zero rows is a readable zero) · rc 1 = unreadable rows (a schema change, a
-# truncated body, gh's own error text) — never counted as zero runners.
+# rc 0 = measured, and that includes a pool of ZERO runners — but ONLY when a page row said so.
+# rc 1 = unreadable: a schema change, a truncated body, gh's own error text — or a stream with NO page
+# row in it at all, which is what an empty response body produces. Never counted as zero runners.
 # offers_any <runner-label-set> <newline-separated job label sets> — does this runner satisfy ANY one
 # queued job's whole set? (Per job, never per union — see DEMAND_LABELS.)
 offers_any() {
@@ -324,6 +340,7 @@ offers_any() {
 
 census_classify() {
   local rows="$1" row st busy rest labels lcount nl commas n=0
+  local pages=0 declared=0 ptype pcount
   CENSUS_ON_IDLE=0; CENSUS_ON_BUSY=0; CENSUS_OFFLINE=0; CENSUS_DEMAND_IDLE=0; CENSUS_DEMAND_BUSY=0
   CENSUS_LABEL_AMBIGUOUS=0
   # ⛔ THE DERIVED FIELDS ARE CLEARED AT ENTRY, not only written on success (#3002 review P2): after an
@@ -335,6 +352,18 @@ census_classify() {
   CENSUS_REGISTRATIONS=""
   while IFS= read -r row; do
     [ -n "$row" ] || continue
+    # ⛔ A PAGE ROW IS THE PROOF THE BODY ANSWERED (#3002 review P1) — see runner_census. It is
+    # consumed here and never counted as a registration; without at least one of them the stream is a
+    # read that produced nothing, and "nothing" is NOT "no runners" (:391 below).
+    case "$row" in
+      '#'*)
+        case "$row" in '#page'$'\t'*$'\t'*) ;; *) return 1 ;; esac
+        ptype="${row#*$'\t'}"; pcount="${ptype#*$'\t'}"; ptype="${ptype%%$'\t'*}"
+        [ "$ptype" = array ] || return 1
+        case "$pcount" in ''|*[!0-9]*) return 1 ;; esac
+        pages=$((pages+1)); declared=$((declared+pcount))
+        continue ;;
+    esac
     case "$row" in *$'\t'*) ;; *) return 1 ;; esac
     st="${row%%$'\t'*}"; rest="${row#*$'\t'}"
     case "$rest" in *$'\t'*) ;; *) return 1 ;; esac
@@ -384,6 +413,17 @@ $labels" ;;
       CENSUS_OFFLINE=$((CENSUS_OFFLINE+1))
     fi
   done <<<"$rows"
+  # ⛔ NO PAGE ROW ⇒ THE READ PRODUCED NOTHING ⇒ UNREADABLE (#3002 review P1). This is the arm that
+  # used to fall through to `runners=0`: one blank 200 body became a measured zero, and in mode=local
+  # with a demand that is a `stranded` DENY — a relabel taken on a read with no value in it. An empty
+  # POOL still reads as a readable zero, because a body carrying `"runners": []` makes jq emit the page
+  # row with count 0; a body carrying nothing makes jq emit nothing at all.
+  [ "$pages" -gt 0 ] || return 1
+  # …and the registrations COUNTED must be the registrations the pages DECLARED. Every page row and
+  # every registration row are emitted by the same jq run, so a mismatch can only mean the stream was
+  # TRUNCATED between them (a proxy cutting the body, a partial read) — i.e. an UNDERCOUNT, which is
+  # the failure shape that reads as a healthy pool. Refused, not counted.
+  [ "$n" = "$declared" ] || return 1
   CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY offline=$CENSUS_OFFLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY label_ambiguity=$CENSUS_LABEL_AMBIGUOUS demand=${DEMAND_SHOWN:-unknown}"
   CENSUS_DETAIL="$((CENSUS_ON_IDLE+CENSUS_ON_BUSY)) of $n online (idle=$CENSUS_ON_IDLE busy=$CENSUS_ON_BUSY offline=$CENSUS_OFFLINE)"
   return 0
