@@ -318,10 +318,13 @@ if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
   # `request=cleared reason=no-live-controller` — from inside a LIVE controller. `ps -p` reads across
   # users, so it is the second opinion: GONE requires BOTH to say gone.
   # ⛔ AND THE FLAG WORKS IN BOTH DIRECTIONS, SO ITS SAFETY ARGUMENT HAS TO COVER BOTH. It does NOT "only
-  # ever downgrade": `CONTROLLER_LIVE=1` also ENABLES the source-3 upgrade (`controller_identity` →
-  # `RUNNING`), which is the only thing that can honestly END `restart-pending` on a cell — the file's own
-  # header says so (`current` is reachable only through the controller's argv). What keeps that promotion
-  # sound is NOT this flag but the OWNERSHIP re-verification it gates: the upgrade refuses unless
+  # ever downgrade": `CONTROLLER_LIVE=1` also ENABLES the controller's-argv identity reads — the
+  # pin-rooted source-2 reader AND, as its fallback, `controller_identity` — which is how `restart-pending`
+  # can honestly END on a cell (with no controller live, the stamp is the honest answer and the relation
+  # stays `restart-pending`). ⛔ DO NOT ATTRIBUTE THAT TO ONE READER: source-3 runs only `if [ -z
+  # "$RUNNING" ]`, so on the standard cell posture (`HARNESS_PIN_DIR` + `HARNESS_PIN_FILE`, flat `$O`) it
+  # is source-2 that answers and `RUNNING_FROM=proc:<tree>` that gets recorded. What keeps the promotion
+  # sound is NOT this flag but the OWNERSHIP re-verification the flag gates: both readers refuse unless
   # `_began_before_lock` proves the named process began at/before the lock was written, which a recycled
   # pid cannot satisfy. So a `ps -p` false positive cannot buy a `current` on its own — not because the
   # flag is downgrade-only, but because the stage it opens re-checks ownership by age.
