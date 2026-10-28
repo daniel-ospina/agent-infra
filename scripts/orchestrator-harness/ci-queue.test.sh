@@ -192,8 +192,14 @@ ck "(b6b) a refused runner read falls back to the measured floor, never the allo
 feed 5 499999999 -
 ciq_read "$OR" >/dev/null 2>&1
 v="$(ciq_eval)"
+# ⛔ THE ORDER CONSTRAINT IS PART OF THIS ARM (#2969 review cycle 2, P2). The pre-fix spelling was
+# `case "$v" in *'runners=~20'*'ceiling=40'*)`, i.e. the two tokens IN THAT ORDER; the first repair
+# rewrote it as two independent `has` calls and silently dropped the order, so `ceiling=40 runners=~20`
+# — the DERIVATION BEFORE ITS INPUT, which `ciq_eval` never emits — started passing here. Equivalent to
+# the old glob on every probe, and `[[ ]]`, not `case`, because this file is the one place that must
+# never reintroduce the `case`-in-`$( )` shape it exists to catch.
 ck "(b6c) an absurd \`running\` is CLAMPED by the allowance, never made the ceiling (got: ${v})" \
-   "$( { has "$v" 'runners=~20' && has "$v" 'ceiling=40'; } ; echo $? )"
+   "$( [[ $v == *'runners=~20'*'ceiling=40'* ]]; echo $? )"
 feed 97 7 0
 ciq_ci_allowed "$OR"; d0=$?
 ck "(b7) hosted CI, zero repo runners: the MEASURED incident (97) is DEFERRED" "$( [ "$d0" -eq 1 ]; echo $? )"
@@ -1243,8 +1249,12 @@ fi
 #   * NESTED: `$(printf %s "$(date)"; case "$s" in a) : ;; esac)` — the inner substitution's `)` was
 #     consumed by the `*')'*` guard, so a genuinely broken `case` after it was skipped.
 # Both were measured real in this repo, not hypothesised: the depth scanner reports 3 sites in
-# scripts/harness-surface.test.sh that the line-scoped form missed (:1160, :1287, :1307 — all of the
-# `"$(if …; then case … esac; else … fi)"` shape), and 0 sites the line-scoped form found are lost.
+# scripts/harness-surface.test.sh that the line-scoped form missed — :1160 is
+# `"$(if …; then case … esac; else … fi)"`, and :1287/:1307 are `"$(cmd; case … esac)"` — and 0 sites
+# the line-scoped form found are lost. ⛔ NAMED EXACTLY, because the CHARACTERISATION is what a future
+# editor acts on (#2969 review cycle 2, P2): calling all three "the if/then shape" told a reader that
+# only `$(if … then case …)` is caught, when the missed class also includes the `$(cmd; case …)`
+# spelling they would think safe to keep.
 # ⛔ DECLARED LIMITS, not silently assumed: this skips FULL-LINE comments (prose here discusses `case`
 # and `$( )`, and flagging prose would be a false positive), but it does NOT lex quotes — a literal
 # `$(` inside a quoted string is counted as a substitution (can only over-report), and an unbalanced
@@ -1349,10 +1359,10 @@ for c in ${CIQ_BASH3:-} /bin/bash /usr/bin/bash /usr/local/bin/bash /opt/homebre
   case "$($c -c 'printf %s "$BASH_VERSION"' 2>/dev/null)" in 3.*) B3="$c"; break ;; esac
 done
 legal_source() { [ "${1:-}" = gh ] || [ "${1:-}" = 'record(cache)' ] || [ "${1:-}" = unknown ]; }
-cli_source() { # <interpreter> <module> <state-dir> -> the `source=` field of the status line, as printed
+cli_source() { # <interpreter> <module> <state-dir> [<ttl>] [<gh>] -> the `source=` field of the status line, as printed
   mkdir -p "$3"
-  CIQ_GH="$STUB" CIQ_TEST_QUEUED=1 CIQ_TEST_RUNNING=0 CIQ_TEST_RUNNERS=5 CIQ_TEST_BUSY=true \
-  CIQ_TEST_OFFLINE=0 CIQ_TEST_NOTOTAL=0 CIQ_TTL=0 CIQ_STALE_MAX=0 \
+  CIQ_GH="${5:-$STUB}" CIQ_TEST_QUEUED=1 CIQ_TEST_RUNNING=0 CIQ_TEST_RUNNERS=5 CIQ_TEST_BUSY=true \
+  CIQ_TEST_OFFLINE=0 CIQ_TEST_NOTOTAL=0 CIQ_TTL="${4:-0}" CIQ_STALE_MAX=0 \
     "$1" "$2" status --repo "$OR" --state-dir "$3" 2>/dev/null \
     | sed -n 's/.*source=\(.*\) age=[^ ]*$/\1/p' | head -1
 }
@@ -1365,6 +1375,24 @@ cli_source() { # <interpreter> <module> <state-dir> -> the `source=` field of th
 gotp="$(cli_source "${B3:-bash}" "$MOD" "$T/rt-fixed")"
 ck "(p3a) the CLI reports a DERIVED source= ('${gotp:-<none>}') on $(basename "${B3:-bash}") — never the literal remainder of the printf" \
    "$( legal_source "$gotp"; echo $? )"
+# ⛔ ALL THREE VALUES THE HOIST MOVED, NOT ONE (#2969 review cycle 2, P2). (p3a) drove the CLI with
+# CIQ_TTL=0 against an EMPTY state dir — i.e. state=fresh — so `src` was ALWAYS 'gh', and the hoisted
+# `record(cache)` and `unknown` branches were executed by NO arm in this file: a typo in either would
+# have been caught by nothing, in the one arm that exists to assert the VALUE of the field this bug
+# corrupted. The two arms below drive the other two branches. They need no 3.x interpreter, for the
+# same reason (p3a) does not: the value is version-independent even where the corruption is not.
+seed_record() { # <state-dir> -> an in-TTL record the module serves as `cache` (no live read happens)
+  mkdir -p "$1"
+  printf 'repo=%s\nqueued=2\nrunning=1\nrunners=5\nbusy=1\nat=%s\n' \
+    "$OR" "$(date +%s)" > "$1/ci-queue-daniel-ospina_agent-infra"
+}
+seed_record "$T/rt-cache"
+gotc="$(cli_source "${B3:-bash}" "$MOD" "$T/rt-cache" 300)"
+ck "(p3b) a TTL hit reports source=record(cache) ('${gotc:-<none>}') — the second value the hoist moved" \
+   "$( [ "${gotc:-}" = 'record(cache)' ]; echo $? )"
+gotu="$(cli_source "${B3:-bash}" "$MOD" "$T/rt-unknown" 0 /nonexistent-ciq-gh)"
+ck "(p3c) a failed read reports source=unknown ('${gotu:-<none>}') — the catch-all the hoist moved" \
+   "$( [ "${gotu:-}" = unknown ]; echo $? )"
 if [ -z "$B3" ]; then
   printf '  ⚠️  (p3) DECLARED, NOT SKIPPED — no bash 3.x on this host (%s); bash 4.4+ parse this shape\n' \
     "$(bash --version 2>/dev/null | head -1)"
@@ -1383,8 +1411,17 @@ else
     bad "(p4) there is no mutant to drive — the runtime control would prove nothing (measured on a reverted module: this arm used to pass VACUOUSLY)"
   else
     mgot="$(cli_source "$B3" "$mutp/ci-queue.sh" "$T/rt-mut")"
-    ck "(p4) MUTANT — on bash 3.2 the reinstated construct CORRUPTS source= ('${mgot:-<none>}'), so (p3) is not always-green" \
-       "$( { legal_source "$mgot"; } ; [ $? -ne 0 ]; echo $? )"
+    # ⛔ NO OUTPUT IS NOT A CORRUPTION (#2969 review cycle 2, P2 — a FALSE PASS). `legal_source` refuses
+    # the EMPTY string, so the earlier spelling `{ legal_source "$mgot"; } ; [ $? -ne 0 ]` printed ✅ for
+    # a mutant that emitted NOTHING: the arm certified "the construct CORRUPTS source=" while having
+    # measured nothing at all, and the message even read ('<none>'). That is the same fail-closed
+    # polarity the ABSENT-mutant guard above was added for, and the same one (p2)/(o1b) already use.
+    if [ -z "$mgot" ]; then
+      bad "(p4) the mutant produced NO status line, so the runtime control proves nothing — an empty value is not a corruption"
+    else
+      ck "(p4) MUTANT — on bash 3.2 the reinstated construct CORRUPTS source= ('${mgot}'), so (p3) is not always-green" \
+         "$( { legal_source "$mgot"; } ; [ $? -ne 0 ]; echo $? )"
+    fi
   fi
 fi
 
