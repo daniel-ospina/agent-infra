@@ -79,13 +79,22 @@ fails.
 - an **unset identity placeholder** (`{{AI_DRAINER_O}}`, `{{AI_MULTI_REPO_SLUG}}`, …) — env-only with
   no default on purpose: a default would put a lane dispatcher and a second controller on every box
   in the fleet;
-- a **`KeepAlive`/`RunAtLoad` daemon** (`com.eldato.worker-supply`). launchd runs it once and restarts
-  it on exit; the loop supervises nothing, so it would start the process and kill it at
+- a **RESIDENT body** — a declaration that the job is a long-lived service. launchd supervises it and
+  restarts it; the loop supervises nothing, so it would start the process and kill it at
   `FLEET_SCHEDULE_JOB_TIMEOUT` — a restart every ceiling, not a service. It is a valid declaration,
   so it is a skip rather than an error: refusing the entire layer over it is what went dark above.
-  A resident daemon on a cell belongs to the cell's own supervisor, not to this loop.
-  A template with **neither** a schedule nor `KeepAlive`/`RunAtLoad` is still a hard **ERROR** — on
-  launchd that shape loads silently and never runs, which is the original defect (#1864).
+  A resident job on a cell belongs to the cell's own supervisor, not to this loop. Which keys declare
+  it, and why residency is DECIDED BEFORE the schedule:
+
+  | key | when it means "resident" |
+  |---|---|
+  | `KeepAlive` | `<true/>`, or a non-empty condition DICT (`{"SuccessfulExit": false}`, `{"Crashed": true}`, `PathState`, `NetworkState`, `OtherJobEnabled`) — launchd documents both forms and the runtime reads both, plus the integer `1` a round-tripped plist carries. An EMPTY dict declares no condition and is not a resident declaration. **A `KeepAlive` job is a skip whether or not it also carries a schedule:** a schedule must not mask the declaration, or a resident body with `StartInterval` becomes a job started and killed every ceiling. |
+  | `FleetResident` | this runtime's own key (launchd ignores keys it does not know), for a resident body that **must** keep its schedule — `com.eldato.ai-multi-repo` is the one: the 900 s top-up is correct on the Mac, and the same plist is a named SKIP on a cell, even with its identity set. |
+  | `RunAtLoad` | **only when the template has no schedule at all** (`com.eldato.worker-supply`): then the load start is the only thing that ever starts it. With an interval it means "also run once at load" on a bounded pass (`com.tortoise.ci-runner-gate` here, and the `reaper/` + `harness-apply/` templates another installer reads), so reading it as residency would silently take those jobs off every cell. |
+
+  A template with **neither** a schedule nor a resident declaration is still a hard **ERROR** — on
+  launchd that shape loads silently and never runs, which is the original defect (#1864). `FleetResident`
+  alone does not rescue it: nothing would ever start the job, on either backend.
 
 ## Lifecycle
 

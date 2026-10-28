@@ -55,12 +55,20 @@
          three times the primary `controller-watchdog`'s 5-minute poll, and each tick costs one
          lock read when the controller is healthy.
 
-         ⛔ ON A LINUX CELL THIS JOB IS A NAMED SKIP — because its three identity placeholders are
-         unset there, not because of the interval. If an operator ever SETS them on a cell, the tick
-         loop supervises nothing: it would start the launcher, the launcher would exec a controller
-         that never returns, and the loop would kill it at FLEET_SCHEDULE_JOB_TIMEOUT (1800 s) — a
-         controller restarted every ceiling, not a service. A resident second controller on a cell
-         belongs to the cell's own supervisor, not to that loop.
+         ⛔ ON A LINUX CELL THIS JOB IS REFUSED BY NAME, NOT KILLED ON A CLOCK. Its three identity
+         placeholders are unset there, so it is already a named SKIP for that reason; if an operator
+         ever SETS them, `FleetResident` below (a fleet key this runtime reads; launchd ignores keys
+         it does not know — measured 2026-10-27: such a plist bootstraps rc=0) makes it a named SKIP
+         on the cell a second time, whatever its StartInterval says. That is the code enforcement of
+         the distinction this paragraph used to only describe: the tick loop supervises nothing, so
+         it would start the launcher, the launcher would exec a controller that never returns, and
+         the loop would kill it at FLEET_SCHEDULE_JOB_TIMEOUT (1800 s) — a controller restarted every
+         ceiling, not a service. On the Mac the StartInterval is still the top-up described above;
+         a resident second controller on a CELL belongs to the cell's own supervisor.
+         ⛔ WHY A DECLARATION AND NOT A GUESS. The loop cannot tell whether a program returns, so
+         "is this body resident" is only knowable from the plist. `KeepAlive` would be WRONG here
+         (launchd would restart it in a loop that hides the launcher's loud refusals), and this file
+         still needs its 900 s top-up, so the declaration had to be a third thing: FleetResident.
 
          ⛔ THE DECISION THE CONTROLLER MAKES PER CYCLE IS NOT THIS PLIST'S. HEARTBEAT is
          read from {{AI_MULTI_REPO_STATE}}/heartbeat by the inventory row, which is the only
@@ -100,6 +108,14 @@
     <false/>
     <key>KeepAlive</key>
     <false/>
+    <!-- ⛔ THE BODY IS A RESIDENT SERVICE, EVEN THOUGH THIS PLIST SCHEDULES IT. The launcher execs
+         orch-loop.sh, which never returns — so on a host with no supervisor (a Linux cell) this job
+         must be REFUSED by `fleet-schedule.py`, not started-and-killed at its 1800 s ceiling. This
+         key is the declaration that makes that a named SKIP; launchd ignores it (measured
+         2026-10-27). Do not replace it with KeepAlive: that would make launchd restart the job in
+         a loop, which is the one thing this template deliberately does not do. -->
+    <key>FleetResident</key>
+    <true/>
     <!-- 900 s: a top-up, not a sweep — see the note above. -->
     <key>StartInterval</key>
     <integer>900</integer>

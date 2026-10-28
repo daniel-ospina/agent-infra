@@ -62,7 +62,9 @@ CONTRACT
                                          nothing, need no loop. Exit 1 if any declaration cannot
                                          be run (or if every job is skipped), 3 if there are no
                                          declarations at all. Runs on EVERY platform including
-                                         macOS — it is the pre-merge gate for the shipped set.
+                                         macOS; `scripts/fleet-schedule.test.sh` is the pre-merge
+                                         gate, and this verb is what it drives against the shipped
+                                         set.
   python3 fleet-schedule.py --install     parse, run the DUE jobs now, start the loop, verify.
                                          Non-zero if the job set cannot be parsed, a job target
                                          is broken, or the loop does not come up.
@@ -293,6 +295,59 @@ def render(text: str, values: dict) -> tuple:
 # ──────────────────────────────────────────────────────────────── job declarations
 
 
+def plist_true(value) -> bool:
+    """Is this plist entry launchd's TRUE? Read by VALUE, never by identity or truthiness.
+
+    `<true/>` reads as `True`, and `1 is not True` — a plist round-tripped through JSON, YAML or
+    `plutil -convert` carries the INTEGER 1 where the schema says boolean, so an `is True` test
+    reads a valid declaration as ABSENT. Truthiness is not the fix either: the string "NO" is
+    truthy, and so is `{"SuccessfulExit": false}` — the very dict whose conditions say the
+    opposite of what a bare truthiness test would conclude.
+    """
+    return value is True or (isinstance(value, int) and not isinstance(value, bool) and value == 1)
+
+
+def resident_declaration(data) -> str:
+    """Which plist key declares this job's body a RESIDENT SERVICE, or "" if none does.
+
+    ⛔ RESIDENCY IS DECLARED, BECAUSE THIS RUNTIME CANNOT WITNESS IT. The tick loop starts a job and
+    kills it at FLEET_SCHEDULE_JOB_TIMEOUT; launchd supervises it and restarts it. Those are not
+    the same contract, and only the body's own declaration says which one applies — nothing here
+    can tell whether a program returns.
+
+    launchd accepts KeepAlive in TWO documented forms and BOTH are a resident service: `<true/>`
+    ("keep it running") and a DICT of restart conditions (`{"SuccessfulExit": false}`,
+    `{"Crashed": true}`, `PathState`, `NetworkState`, `OtherJobEnabled`). This read only
+    `data.get("KeepAlive") is True`, so the dict form was treated as ABSENT and the job was refused
+    with "declare KeepAlive/RunAtLoad" — telling an operator to declare what they had already
+    declared, and refusing the WHOLE layer over it. That is exactly the shape that left cell4 with
+    no scheduler at all (agent-infra#2908, measured 2026-10-27: MainPID=0, no reaper canary). An
+    unmodelled-but-VALID declaration must be ACCEPTED, so every variant of the documented form is
+    read, and one it cannot enumerate (`{"PathState": {...}}`) still counts.
+
+    An EMPTY dict is not a declaration: launchd's dict form is a SET of conditions, and an empty
+    one states none — this runtime declines to launder it into a skip, so it stays the error it
+    already was.
+
+    `FleetResident` is this runtime's own key (launchd ignores keys it does not know — measured
+    2026-10-27: a plist carrying it bootstrapped rc=0 and booted out clean), for the one thing no
+    launchd key can say: "this body may never return, even though the plist schedules it".
+    `RunAtLoad` is deliberately NOT read here — shipped templates use it as "also run once at
+    load" on a bounded job (`com.tortoise.ci-runner-gate`, which this loader reads, and the
+    `reaper/` `harness-apply/` templates another installer reads), and treating it as residency
+    would silently stop those jobs on every cell. It is read where it does mean residency: a
+    template with NO schedule at all, whose only start is its load (worker-supply).
+    """
+    keep_alive = data.get("KeepAlive")
+    if plist_true(keep_alive):
+        return "KeepAlive"
+    if isinstance(keep_alive, dict) and keep_alive:
+        return "KeepAlive dict"
+    if plist_true(data.get("FleetResident")):
+        return "FleetResident"
+    return ""
+
+
 class Job:
     def __init__(self, label, argv, env, interval, calendar, stdout, stderr):
         self.label = label
@@ -304,12 +359,13 @@ class Job:
         self.stderr = stderr
         self.skip = ""   # non-empty → this machine does not run it (named, never silent)
         self.error = ""  # non-empty → the declaration itself is broken (verify FAILS)
-        self.daemon = False  # KeepAlive/RunAtLoad: a long-lived service, not a periodic job
+        self.daemon = False  # a resident service: a body this loop cannot supervise
+        self.resident_decl = ""  # WHICH plist key declared that (named in every skip/error)
 
     @property
     def cadence(self):
         if self.daemon:
-            return "daemon (KeepAlive)"
+            return "daemon (%s)" % (self.resident_decl or "resident")
         if self.calendar is not None:
             c = self.calendar
             if "_all" in c:
@@ -413,6 +469,17 @@ def load_jobs(check_targets: bool = True) -> list:
                 % label
             )
 
+        # ⛔ RESIDENCY IS DECIDED BEFORE THE SCHEDULE, because a SCHEDULE MUST NOT MASK IT. The
+        # decision used to live INSIDE the no-schedule branch, so `KeepAlive: {"SuccessfulExit":
+        # false}` (a valid declaration, read as absent — see resident_declaration) AND any resident
+        # body that also carried a StartInterval fell through as "scheduled": the loop would start
+        # it and kill it at JOB_TIMEOUT. That is a controller restarted every ceiling, not a
+        # service, and it armed the moment an operator set AI_MULTI_REPO_* on a cell — the plist's
+        # prose said so and nothing enforced it. Residency is now a property of the BODY, and a
+        # resident body is REFUSED BY NAME below whatever its schedule says.
+        job.resident_decl = resident_declaration(data)
+        job.daemon = bool(job.resident_decl)
+
         # Schedule. A template with NEITHER key would run never, and a job that loads and never
         # runs is the whole defect this file exists to close: say so loudly.
         raw_interval = data.get("StartInterval")
@@ -427,22 +494,23 @@ def load_jobs(check_targets: bool = True) -> list:
             # launchd allows an array of calendar dicts. A single-entry array is the same dict; a
             # multi-entry one is matched as "any of these", which is what launchd does with it.
             job.calendar = {"_all": raw_calendar} if len(raw_calendar) > 1 else raw_calendar[0]
-        else:
-            # ⛔ A KeepAlive DAEMON IS A VALID DECLARATION, but not a periodic one. launchd runs it
-            # once and restarts it on exit; a tick loop has no supervisor, so it can only start the
-            # process and kill it at JOB_TIMEOUT — a restart every ceiling, not a service. Accepting
-            # it as "scheduled" would be the false PASS this file exists to close; refusing the whole
-            # LAYER over it is what left cell4 with no scheduler at all (measured 2026-10-27). So it
-            # is a NAMED SKIP below, and `--check` reports it on every machine — including the ones
-            # where launchd does run it.
-            if data.get("KeepAlive") is True or data.get("RunAtLoad") is True:
-                job.daemon = True
-            else:
-                job.error = (
-                    "no StartInterval and no StartCalendarInterval — a job with no schedule would "
-                    "never run (launchd accepts it silently; this runtime does not). If it is a "
-                    "long-lived service, declare KeepAlive/RunAtLoad and it is a named SKIP instead"
-                )
+        elif not job.daemon and plist_true(data.get("RunAtLoad")):
+            # ⛔ RunAtLoad IS READ HERE AND NOWHERE ELSE: with no interval and no calendar, a load
+            # start is the ONLY thing that ever starts the job, so a `RunAtLoad: true` template is
+            # a service launchd keeps (worker-supply). With a schedule it means "also run once at
+            # load" on a bounded pass — `com.tortoise.ci-runner-gate` here, plus the `reaper/` and
+            # `harness-apply/` templates another installer reads — so reading it as residency
+            # everywhere would silently take those jobs off every cell.
+            job.daemon = True
+            job.resident_decl = "RunAtLoad"
+        elif not job.daemon:
+            job.error = (
+                "no StartInterval and no StartCalendarInterval — a job with no schedule would "
+                "never run (launchd accepts it silently; this runtime does not). If it is a "
+                "long-lived service, declare KeepAlive (true, or a condition dict — both forms "
+                "count) or RunAtLoad, or FleetResident for a resident body with a schedule, and "
+                "it is a named SKIP instead"
+            )
 
         argv = data.get("ProgramArguments") or []
         if not isinstance(argv, list) or not argv:
@@ -550,8 +618,11 @@ def load_jobs(check_targets: bool = True) -> list:
         # a KeepAlive template pointed at a missing script is an ERROR (a broken farm), never a skip.
         if job.daemon and not job.error and not job.skip:
             job.skip = (
-                "declared KeepAlive/RunAtLoad — a long-lived DAEMON. The tick loop supervises nothing, "
-                "so it would start it and kill it at JOB_TIMEOUT; this machine runs no service for it"
+                "declared %s — a resident SERVICE body, which this runtime cannot supervise: the "
+                "tick loop would start it and kill it at JOB_TIMEOUT, so it would be a restart "
+                "every ceiling rather than a service. A resident job on a cell belongs to the "
+                "cell's own supervisor (cloud-cell-supervisor.sh), never to this loop"
+                % job.resident_decl
             )
         jobs.append(job)
     # ⛔ ZERO JOBS IS A FAILURE, not a clean run. A templates dir that EXISTS but holds no

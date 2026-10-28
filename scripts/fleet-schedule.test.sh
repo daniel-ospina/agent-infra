@@ -65,6 +65,16 @@
 #  16. AN ANNUAL CALENDAR KEEPS A NEXT OCCURRENCE. A multi-entry StartCalendarInterval with
 #      Month/Day is not `next=-` forever, and a calendar that can never match (Feb 31) FAILS.
 #  17. --stop WORKS WHERE THE SCHEDULE NEVER RAN: it creates its own OFF switch (no traceback).
+#  18. RESIDENCY IS A DECLARED PROPERTY OF THE BODY, READ IN EVERY FORM launchd DOCUMENTS — and a
+#      resident job is REFUSED BY NAME, never scheduled into a kill at JOB_TIMEOUT. A fresh review
+#      left two P2s on PR #2954 here, one failure class apart and the same class as #2908: (a)
+#      `KeepAlive` as a DICT (`{"SuccessfulExit": false}`) is launchd's documented form, was read
+#      by IDENTITY, and so a valid declaration was refused as absent — the whole layer with it;
+#      (b) the daemon skip lived INSIDE the no-schedule branch, so a resident body carrying a
+#      `StartInterval` (ai-multi-repo's shape, the moment an operator sets its identity on a cell)
+#      was "scheduled" and killed at FLEET_SCHEDULE_JOB_TIMEOUT, every ceiling. Case 18 proves the
+#      accepted forms, the named refusal, that the resident body NEVER RUNS, and — by mutation —
+#      that the accepted forms are what makes it pass.
 #
 # Run:  bash scripts/fleet-schedule.test.sh
 set -uo pipefail
@@ -1204,6 +1214,131 @@ out="$(cd / && env -u TEMPLATES_DIR -u INFRA_ROOT -u AGENT_INFRA_PATH \
 grep -q 'Traceback' <<<"$out" && bad "--stop raised a traceback: $out" || ok "no traceback"
 [ -f "$NOSSTATE/OFF" ] && ok "the OFF switch was created (the decision is recorded)" \
   || bad "no OFF switch was written"
+
+
+# ── 18. residency is DECLARED, read in every documented form, and refused by name ───────────
+# Both P2s a fresh review left on PR #2954 are the #2908 shape: a VALID declaration the runtime did
+# not model, whose only reachable outcome is a refused LAYER (cell4, measured 2026-10-27: MainPID=0,
+# no controller, no reaping, no liveness, no canary). So the fixtures are the declarations launchd
+# documents, not the ones this runtime happened to read.
+case_ "18. a RESIDENT body is declared (KeepAlive true/dict/int, RunAtLoad, FleetResident) and refused by name"
+RES="$FIX/resident"; mkdir -p "$RES"; cp "$GOOD/RETIRED" "$RES/RETIRED"
+cat > "$T/resident-dict.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-dict",
+    "ProgramArguments": ["/bin/sh", "-c", "echo dict >> '$MARK.residentdict'"],
+    "KeepAlive": {"SuccessfulExit": False},
+}
+PY
+cat > "$T/resident-int.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-int",
+    "ProgramArguments": ["/bin/sh", "-c", "echo int >> '$MARK.residentint'"],
+    "KeepAlive": 1,
+}
+PY
+cat > "$T/resident-ral.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-ral",
+    "ProgramArguments": ["/bin/sh", "-c", "echo ral >> '$MARK.residentral'"],
+    "RunAtLoad": 1,
+}
+PY
+cat > "$T/resident-sched.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-sched",
+    "ProgramArguments": ["/bin/sh", "-c", "echo sched >> '$MARK.residentsched'; sleep 60"],
+    "FleetResident": True,
+    "StartInterval": 1,
+}
+PY
+mkplist "$RES" com.test.resident-dict  "$T/resident-dict.spec"
+mkplist "$RES" com.test.resident-int   "$T/resident-int.spec"
+mkplist "$RES" com.test.resident-ral   "$T/resident-ral.spec"
+mkplist "$RES" com.test.resident-sched "$T/resident-sched.spec"
+mkplist "$RES" com.test.echo           "$T/echo.spec"   # so the set is never all-skip
+
+out="$(run "$RES" --check)"; rc=$?
+[ "$rc" -eq 0 ] && ok "an UNMODELLED-BUT-VALID declaration is ACCEPTED, not refused (rc=0)" \
+  || bad "a valid declaration is refused again — this is the shape that took a whole cell down: $out"
+grep -q 'DECLARATIONS OK' <<<"$out" && ok "--check printed its verdict (a read, not an empty output)" \
+  || bad "--check printed no verdict: $out"
+grep -qE '^  (ERROR|FAIL) .*com.test.resident' <<<"$out" \
+  && bad "a resident DECLARATION is an ERROR: $out" \
+  || ok "no resident declaration is an ERROR (0 ERROR rows on all four forms)"
+for pair in "resident-dict|KeepAlive dict" "resident-int|KeepAlive" "resident-ral|RunAtLoad" "resident-sched|FleetResident"; do
+  lbl="${pair%%|*}"; decl="${pair##*|}"
+  grep -qE "^  SKIP .*com.test.$lbl .*declared $decl" <<<"$out" \
+    && ok "com.test.$lbl is a NAMED skip: 'declared $decl'" \
+    || bad "com.test.$lbl is not refused by the name of the key that declared it ($decl): $out"
+done
+
+# ENFORCEMENT, NOT PROSE: the resident bodies must NEVER be started. A "scheduled" resident job is
+# the P2-2 defect — it would be started and killed at the ceiling, every ceiling (resident-sched's
+# body sleeps 60 s against the suite's 30 s FLEET_SCHEDULE_JOB_TIMEOUT precisely so a regression is
+# a kill, not a clean exit).
+state_reset "$RES"
+before="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+out="$(run "$RES" --install)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--install exits 0 with the resident jobs skipped" || bad "--install failed (rc=$rc): $out"
+after="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+[ "$after" -gt "$before" ] && ok "the non-resident fixture DID run — the case is not vacuous" \
+  || bad "no job ran at all ($before → $after lines), so 'the resident job did not run' would prove nothing"
+for m in residentdict residentint residentral residentsched; do
+  [ ! -f "$MARK.$m" ] && ok "com.test.$m did NOT run (a resident body is never scheduled into a kill)" \
+    || bad "com.test.$m RAN — a resident body is being scheduled, and would be killed at the ceiling"
+done
+out="$(run "$RES" --status)"
+grep -qE 'com.test.resident-sched .*daemon \(FleetResident\)' <<<"$out" \
+  && ok "--status names the reason in the truth table, not just in --check" \
+  || bad "--status does not name the resident declaration: $out"
+run "$RES" --stop >/dev/null 2>&1
+
+# 18b: the BOUNDARY of the dict reading is stated, not implied: launchd's dict form is a SET of
+# conditions, so an EMPTY one declares none — it stays the error it already was.
+RES_EMPTY="$FIX/resident-empty"; mkdir -p "$RES_EMPTY"; cp "$GOOD/RETIRED" "$RES_EMPTY/RETIRED"
+cat > "$T/resident-empty.spec" <<PY
+PLIST = {
+    "Label": "com.test.resident-empty",
+    "ProgramArguments": ["/bin/sh", "-c", "true"],
+    "KeepAlive": {},
+}
+PY
+mkplist "$RES_EMPTY" com.test.resident-empty "$T/resident-empty.spec"
+mkplist "$RES_EMPTY" com.test.echo          "$T/echo.spec"
+out="$(run "$RES_EMPTY" --check)"; rc=$?
+[ "$rc" -eq 1 ] && grep -qE '^  FAIL .*com.test.resident-empty.*no StartInterval' <<<"$out" \
+  && ok "an EMPTY KeepAlive dict declares no condition and is still refused (the boundary is stated)" \
+  || bad "an empty KeepAlive dict is now a resident skip (the reading is too wide): rc=$rc $out"
+
+# 18c: SELF-PROVING. Restore the PRE-FIX reading this P2 named (`KeepAlive is True`, with no dict
+# branch at all) and the DICT-form fixture must REDDEN — a guard that cannot fail is the defect the
+# repo keeps re-finding.
+MUTANT="$T/mutant-identity.py"
+python3 - "$SCHED" "$MUTANT" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+old = (
+    '    keep_alive = data.get("KeepAlive")\n'
+    '    if plist_true(keep_alive):\n'
+    '        return "KeepAlive"\n'
+    '    if isinstance(keep_alive, dict) and keep_alive:\n'
+    '        return "KeepAlive dict"\n'
+)
+new = (
+    '    keep_alive = data.get("KeepAlive")\n'
+    '    if keep_alive is True:  # the PRE-FIX reading, restored by the mutation\n'
+    '        return "KeepAlive"\n'
+)
+assert old in src, "the mutation target moved: resident_declaration no longer reads KeepAlive that way"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PY
+out="$(TEMPLATES_DIR="$RES" python3 "$MUTANT" --check 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "MUTATION (KeepAlive read by identity again) makes the set FAIL (rc=1)" \
+  || bad "the mutation stayed GREEN — the fixture does not grade the identity comparison (rc=$rc): $out"
+grep -qE '^  (ERROR|FAIL) .*com.test.resident-dict' <<<"$out" \
+  && ok "the mutation fails ON THE DICT FORM, by name: $(grep -E '^  (ERROR|FAIL) .*resident-dict' <<<"$out" | head -1 | cut -c1-96)" \
+  || bad "the mutation reddens something else; the dict-form fixture is not what grades this: $out"
 
 
 echo
