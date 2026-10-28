@@ -180,6 +180,25 @@ function main() {
     // Skip test files themselves
     if (file.includes('.test.') || file.includes('.spec.') || file.includes('__tests__')) continue;
 
+    // ⛔ A SYMLINK IS AN ALIAS, NOT A MODULE (#2934). `pi-bootstrap/pi-config/extensions/`
+    // is a farm of symlinks into `extensions/`, so EVERY new extension arrives in this list
+    // twice: once as the module (with its test, in the same diff) and once as the alias
+    // (with no test, because it is not a module at all). Reading the alias as an untested
+    // module reported `new module(s) without tests: pi-bootstrap/pi-config/extensions/
+    // task-signal-forensics.ts` for a PR that ships `extensions/task-signal-forensics.test.ts`
+    // — a false BLOCK, and a check whose own answer was already in its hand (`lstat` says
+    // "symlink"). The TARGET stays in this same list whenever it lives inside the repo, so
+    // skipping the alias loses no coverage; a symlink to a module OUTSIDE the repo is a
+    // stated residual (that module is not this repo's to test).
+    let isLink = false;
+    try {
+      isLink = fs.lstatSync(fullPath).isSymbolicLink();
+    } catch {
+      // Unreadable for another reason: fall through to the normal test check, which is the
+      // STRICT direction. Skipping here would turn an unreadable file into a pass.
+    }
+    if (isLink) continue;
+
     // Check exemption
     const exemptResult = isExempt(fullPath);
     if (exemptResult.exempt) {
