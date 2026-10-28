@@ -306,10 +306,12 @@ fix the red).
 `0` a readable pass (it dispatched, **or** there was genuinely nothing to do — the line names which,
 `queue is empty: no open non-draft PRs`); `2` **REFUSING** — *"I could not read the world, or could not
 deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doctor.status.json` with
-`rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` placed but no worker took it;
-`4` crash; `64` the command line is unusable (**not** 2, so a launchd typo cannot masquerade as a
-refusal). ⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's
-`ok` stands and *"a failure only `launchctl list` can witness is a silent failure"*.
+`rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
+legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
+worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `4` crash;
+`64` the command line is unusable (**not** 2, so a launchd typo cannot masquerade as a refusal).
+⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's `ok` stands
+and *"a failure only `launchctl list` can witness is a silent failure"*.
 `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
 ⛔ **AND `0` IS NOT REACHABLE FROM A PASS THAT REFUSED AN ORDER** (#2710, measured 2026-10-27). A
 worktree refusal that will not clear by waiting (uncommitted work, commits the PR head does not have)
@@ -348,6 +350,21 @@ consumes nothing (`void_refused_rows` already states the rule), so it may not ho
 cooldown/refusal arm now runs BEFORE the gate: a pass over its dispatch budget still COUNTS and NAMES the
 refusals it covers. The cooldown and placed-order causes are also counted separately, so the verdict line
 cannot say "no worker accepted" about a pass in which no order was placed.
+
+⛔ **AND THE PASS VERDICT ON THAT AXIS IS PINNED BY NAME (#2710; measured 2026-10-28 — five
+consecutive 45-minute windows, 18–25 PRs unmoving, `rc=0` while the heartbeat stayed fresh).**
+`scripts/test_pr_doctor.py`'s #2710 block drives it: `test_FOUR_refused_rows_at_the_SHIPPED_caps_still_refuse_and_escalate`
+(the shipped `MAX_FIX`=3 path), `test_a_pass_WAITING_OUT_a_refusal_cooldown_is_not_a_clean_pass` (the
+44-minutes-out-of-45 hole — **and** the opposite verdict, since a `kind: spawn` row in its cooldown must
+still be `0`), `test_a_SATURATED_pass_still_refuses_and_names_a_refused_row`, and
+`test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass` (both row orderings, because that
+defect was ordering-dependent). So the rule cannot be satisfied by answering "not clean" to everything.
+
+⛔ **#2708's remaining cut is the STALE-HELPER half of the same class** — a refusal that does not say
+WHICH copy judged it. `nonblocking-dispatch.sh` resolved `brief-gate.sh` from four candidates and then
+said only that "the gate" refused, so after the 2026-10-28 case 3 measurement (the driver resolved
+`$O/objective.py` while the fix landed on `~/.pi/agent/scripts/objective.py`) an operator was sent to
+the copy they had just repaired. The refusal now names `$bg_lib`.
 
 **What repairs it.** Read `read=` and `reason=` from the sidecar, then: `read=transport` +
 `predates the repair kind` → refresh `$O` with `install.sh` (a stale dispatcher silently downgrades
@@ -783,6 +800,8 @@ a shard, and a live count rots on every subsequent PR exactly as a line number d
 | spawn gate | `scripts/orchestrator-harness/spawn-gate.test.sh` | the gate refuses and ledgers |
 | repair actuator | `scripts/test_pr_doctor.py` §10 | `rc=2` has exactly one meaning and **the record always agrees with launchd**; and (#2710) a pass whose only outcome was a durable worktree refusal exits `3`, not `0`, with the row and its repair named once it has refused `REFUSAL_ESCALATE_AT` times in a row |
 | classifier | `scripts/test_objective.py` (the #2710 block) | the exit code agrees with the line by ALLOW-LIST (every refusing verdict, and a word nobody has taught it, exit `2`; the four readable ones exit `0`), a repo/checkout mismatch refuses **before any read**, and every line names `repo=`/`repo_src=` so the silent default cannot come back |
+| inert-capability class itself — repo binding, fail-closed required set, reaper live-cwd | `tests/inert-capability-effects/run.sh` (§1–§3, landed in #2757) | the SHIPPED `_objective()` returns the CHECKOUT's repo (and a named REFUSAL when the origin is unreadable, never the `tortoise` default); an unreadable branch protection is **not** an empty required set (the same function, one byte of `gh` behaviour apart, yields OPPOSITE merge authorities); a live holder whose cwd is a SUBDIRECTORY keeps its tree **and its identical twin is removed in the same pass**. ⛔ **Fixed here (#2708): §3 could never pass** — the fixture creates its trees seconds before the pass and did not override `REAP_WT_MIN_AGE_MINUTES`, so rule 7's 45-min floor preserved **everything** (`reasons=too-young:2`) and both removal arms were red on every box, i.e. the live-cwd gate it exists to pin had no working test at all while the suite reported covering it. Verified by removing the one-line override again: `…the holder-free twin was not removed either, so the preserve arm proves nothing`, `2 of 16 assertion(s) failed` |
+| repair actuator — **which copy judged the brief** **(#2708)** | `scripts/test_pr_doctor.py` — `test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it` | the brief the doctor **COMPOSES** is accepted by the gate the dispatcher **RESOLVES** (agreement, not construction); and when it is refused, the refusal **NAMES the `brief-gate.sh` path that judged it** (`nonblocking-dispatch.sh` prints `$bg_lib`), so an operator is sent to the copy that refused rather than the copy they just fixed — ⛔ and the naming line is emitted BEFORE the gate's ~3.3 KB teaching block, because `pr-doctor` logs only `detail[:160]` on its not-dispatched line (`scripts/pr-doctor.py:5093`): appended after it, the path sat at byte ~3290 of ~3655 and both slices cut it off (measured; that was this change's own review finding). ⚠️ **The bound is the ORDERING plus the path LENGTH** (#2986 review, P1 — the first form of this arm was RED on macOS): the path starts at char 53, so the whole path fits the 160-char slice whenever the resolved path is ≤ 107 chars — true of every production `$O` (the path a real box RESOLVES is `$O/brief-gate.sh`, `$O` defaulting to `$HOME/orchestrator` — 27 + `len($HOME)` chars, 41 in this fleet; the `$HOME/.pi/agent/scripts` candidate is only the fourth fallback, at 32 + `len($HOME)`) — 44-52 in practice) — while a longer resolved path shows a truncated tail. The arm therefore grades the offset (box-independent) and asserts the full path inside `detail[:160]` against a **production-length `$O`** (`/tmp/oXXXXXX`), not against a pytest temp root, whose length is a property of the box's `$TMPDIR` |
 | deployment provenance | `scripts/orchestrator-harness/selftest.sh` — its deployed-drift block: 24 assertions, 15 of them carrying the `check-deployed-drift:` prefix (the other 9 grade `install.sh`'s stamp writer, its provenance fields, and a git-absent fallback) | through the SHIPPED script: match→0, a dirty source→1, a post-install edit→1, a missing record→2, `commit: UNKNOWN`→2, an unresolvable ref→2, an unknown commit object→2, BEHIND→1, a missing shipped file→1, an extra hand-placed script→1, a failed `mktemp`→2, an unreadable deployed `*.sh`→2 |
 | deployment provenance — **which file** | `scripts/orchestrator-harness/check-deployed-drift.test.sh` **(new here, #2700)** | a **one-byte** difference is `DRIFT` (1) and the report **NAMES that file** (and not the unchanged one); restoring the byte is `OK` (0) again; and the suite asserts its own presence in the shard list |
 | supervisor / reaper / cell surface | `scripts/harness-cohesion.test.sh`, `scripts/orchestrator-harness/install-launchd-durability.test.sh`, `scripts/cloud-cell-supervisor.test.sh` | a drifted copy is NAMED and an unreadable one is BROKEN (2, never OK); a redeploy cannot persistently disable the entrypoint; and a `keys.env` top-level exit cannot turn a failed cell start into a silent success |
@@ -801,6 +820,39 @@ Its non-vacuity is also **structural**: §1/§2/§3 are one fixture, **one byte 
 verdicts — a check that cannot see a one-byte change fails §2, and a check that is permanently red fails
 §1.
 
+**The retained arm's non-vacuity is TWO mutations that were RUN** (#2708, re-run after the rebase onto
+#2978). M3 and M4 below are the only mutations this change's remaining diff can be graded by; M1, M2,
+M5 and M6 graded the pass-verdict cut that #2978 landed independently, and they are recorded here as
+⛔ **DO NOT APPLY** — the arms they reddened (`§14.1–14.4`) were removed with that cut, so re-applying
+them to this diff grades a mechanism the file no longer has.
+
+| mutation (the shape each capability actually went inert in) | reds | ⛔ status |
+|---|---|---|
+| **M3** `research_section()` returns `""` — the pre-#2258 stale copy that shipped section-less briefs (measured case 2: 9 h of `rc=80`) | `test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it` (the composed brief stops passing the gate) | live — RUN |
+| **M4** drop `$bg_lib` from the dispatcher's refusal text — a refusal that does not name the copy that judged it (measured case 3: the fix landed on a copy that does not run) | the same test (the refusal stops naming which copy judged it) | live — RUN |
+| **M1** verdict back on `undeliverable` alone (the pre-#2708 line) | `§14.1–14.3` + a retargeted arm | ⛔ DO NOT APPLY — superseded by #2978, its tests live in `test_pr_doctor.py`'s #2710 block |
+| **M2** drop the queue-derived refusal axis | `§14.3` | ⛔ DO NOT APPLY — #2978 fixed the gate-order dependence by VOIDING a refused row's budget slot, not by charging it |
+| **M5** stop naming a refusal on a pass that DID dispatch | `§14.4`'s second arm | ⛔ DO NOT APPLY — that sentence is #2978's `parts` block |
+| **M6** append the refusal sentence after the stall counters | `§14.1–14.3` on the 110-char slice | ⛔ **WRONG AS ORIGINALLY RECORDED, AND DO NOT APPLY TWICE OVER** — (a) the placement moved with the superseded cut; (b) review cycle 2 falsified the CLAIM itself. The counters this code emitted were short (`refused-recorded=3; `, `budget=4; `), so `REFUSED` landed at char ~21-31 under EITHER order and every `reason[:110]` assertion still passed: a reorder would have gone green everywhere. The run that "confirmed" it used a malformed mutant (the `stalls` loop was moved too), so those reds came from a mangled parts assembly and not from the ordering. The finding that survives is the reviewer's arithmetic, and the property actually worth pinning is the **word** surviving the cut — which #2978's `parts` block owns now |
+
+**Re-running M3/M4 is two small edits.** Each is a single edit applied to a **copy** of the tree (so the
+box's own checkout is never mutated mid-run) and graded with
+`python3 -m pytest scripts/test_pr_doctor.py -q -k NAMES_the_copy_of_the_gate`
+
+M4 is the one that matters most for the *class*: it changes **no exit code and adds or removes no log line** anywhere
+— the refusal still exits 80 with the same teaching message — so every exit-code assertion in the tree
+stays green while the operator is once again sent to the copy they already fixed. That is why the arm
+asserts the PATH, not the verdict. ⚠️ The text of ONE line does move, and it is the one this change is
+about: `detail` loses `brief-gate=<path>` (`pr-doctor.py:3766-3767` builds it; `:3768` is the FAIL
+line that logs `detail[:200]`, `:5093` renders `detail[:160]`), which is exactly the field the arm reads.
+
+⛔ **A correction, recorded rather than rewritten:** an earlier draft of this section explained
+`§14.3` with the sentence "a refusal row charges its capacity class, so at the shipped `MAX_FIX`=3 three
+refused rows zero the class budget". That was true of #2708's own cut and is **false of the shipped
+file**: #2978 landed the opposite resolution — *a refusal consumed nothing, so it must not hold a
+budget slot* — and a reader who applied the deleted sentence would reintroduce the defect. The
+mechanism is `pass_budgets()`'s `kind == "refused"` skip, and the contract above states it.
+
 ### 5.2 Capabilities with NO suite of their own (the honest gap list)
 
 **The standard, applied once:** "exercised end-to-end from a shard that drives the shipped file" counts
@@ -817,6 +869,12 @@ is the gap list.
 None of these is a *new* finding (they are named here so the gap is a list, not a surprise); `C2` (#2708)
 owns the decision about which of them earns a test — starting from the ones whose inertness would be
 invisible, i.e. `merge-one.sh` and `dispatch-merge.sh`.
+
+⛔ **#2708's first cuts went at the capability where inertness is MOST invisible, not at the list above**
+— `pr-doctor`'s own pass verdict, which is the one whose "I am running" and "I am refusing" states were
+measured indistinguishable three times in one day (2026-10-28). Those rows are now in §5.1. The list in
+this section is unchanged by that work: it is still the gap, and `merge-one.sh` / `dispatch-merge.sh` are
+still where the next cut should start.
 
 ---
 
