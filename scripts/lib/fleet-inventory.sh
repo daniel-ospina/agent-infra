@@ -760,6 +760,12 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
   # non-zero exit means failure for every other job here, and a generic allowance would turn every
   # FAILING into a WAITING. Absent/empty keeps the old behaviour byte for byte.
   local name="${1:?}" label="${2:?}" script="${3:-}" what="${4:?}" own_log="${5:-}" requires="${6:-}" waiting="${7:-}"
+  # ⛔ A CAPACITY PASS IS NOT EXEMPT FROM FRESHNESS (review P1, #2291). `_capwait` carries the row to
+  # the freshness block below instead of returning here: returning early skipped EVERY freshness arm
+  # (`no output file` → UNKNOWN, `never written` → LATE, `age > bound` → LATE), so a *loaded* job that
+  # had produced no output for longer than 2×StartInterval+slack read WAITING — a PASS for the table's
+  # exit code — for ever. That is the state this file's own header says must never be green.
+  local _capwait="" _capdetail=""
   local plist; plist="$(fleet_plist "$label")"
   [ -n "$requires" ] || requires="$script"
   if [ ! -f "$plist" ]; then
@@ -838,24 +844,27 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
     # comes from the component's OWN record (`refusal_bound`), not from a second measurement.
     case " $waiting " in
       *" $ex "*)
-        _fdb="$(_fleet_pr_doctor_bound)" || _fdb="-"
+        _fdb="$(_fleet_pr_doctor_bound "$ex")" || _fdb="-"
         case "$_fdb" in
           -)
-            # Absent/unreadable bound: whether it clears is UNKNOWN, and an abstention is never a
+            # Absent/unreadable bound, OR a record that is not the pass this row is explaining
+            # (different `rc`/`verdict`): whether it clears is UNKNOWN, and an abstention is never a
             # pass — the file's own doctrine.
             fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" UNKNOWN \
-              "its last run exited $ex (no capacity) but the record's \`refusal_bound\` could not be read, so whether this clears by itself is UNKNOWN; read $FLEET_AGENT_STATE/pr-doctor.status.json"; return 0 ;;
+              "its last run exited $ex (no capacity) but the record's \`refusal_bound\` could not be read — or it describes a DIFFERENT pass (its \`rc\`/\`verdict\` disagree with this row's exit, and both launchers write the same file) — so whether this clears by itself is UNKNOWN; read $FLEET_AGENT_STATE/pr-doctor.status.json"; return 0 ;;
         esac
         _fhard="$(printf '%s' "$_fdb" | tr ',' '\n' | awk -F= '$1 != "load" && $1 != "" {print $1}' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
         if [ -n "$_fhard" ]; then
           fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" FAILING \
             "its last run exited $ex because the box refused on ${_fhard% } — nothing was consumed, but this bound does NOT clear by waiting (\`spawn-gate.sh\` says so per axis), so it is not a pass: prune the disk / restart the box / land the open PRs as the pass verdict's \`next=\` says. The record: $FLEET_AGENT_STATE/pr-doctor.status.json"; return 0
         fi
-        fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" WAITING \
-          "its last run reported NO CAPACITY on load (exit $ex, bound=${_fdb:-?}): the box's own gate refused the work, nothing was consumed and nothing is broken — it clears when load falls. The box measurement is in the pass verdict (\`$what\` writes $FLEET_AGENT_STATE/pr-doctor.status.json)"; return 0 ;;
+        # The load axis DOES clear by itself — but "it clears" is only a pass if the job is still
+        # RUNNING and still reporting, which the freshness block below decides. Carry it there.
+        _capwait=1
+        _capdetail="its last run reported NO CAPACITY on load (exit $ex, bound=${_fdb:-?}): the box's own gate refused the work, nothing was consumed and nothing is broken — it clears when load falls. The box measurement is in the pass verdict (\`$what\` writes $FLEET_AGENT_STATE/pr-doctor.status.json)" ;;
+      *) fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" FAILING \
+        "the job's last run exited $ex — it ran and FAILED, and nothing has been reading that status (the measured pr-doctor exit-2-for-hours state); its own log: ${out:-<none declared>}"; return 0 ;;
     esac
-    fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" FAILING \
-      "the job's last run exited $ex — it ran and FAILED, and nothing has been reading that status (the measured pr-doctor exit-2-for-hours state); its own log: ${out:-<none declared>}"; return 0
   fi
   if [ -n "$bound" ]; then
     if [ -z "$out" ]; then
@@ -878,7 +887,31 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
         "no output for $(fleet_human_age "$age") against its own ${interval}s interval (bound ${bound}s) — either it is not being scheduled or every run is dying before it writes"; return 0
     fi
   fi
+  # ⛔ THE CAPACITY ROW REACHES WAITING ONLY THROUGH HERE (review P1, #2291), i.e. only after the
+  # freshness arms above have had their say. A stale `6` is LATE, not a pass.
+  if [ -n "$_capwait" ]; then
+    fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" WAITING "$_capdetail"
+    return 0
+  fi
   fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" OK ""
+}
+
+# _fleet_json_field — one top-level number-or-string field out of a JSON blob, or "" when absent.
+#
+# TWO LAYOUTS, TWO VALUE SHAPES, FOUR EXPRESSIONS. The live record is written by
+# `json.dump(…, indent=1, sort_keys=True)`, so each top-level key OPENS a line (the anchored pair);
+# the suite's fixtures seed one-line JSON (the `[{,]`-prefixed pair). Values may be a quoted string
+# (`refusal_bound`, which CONTAINS commas — e.g. `disk=2,load=1`) or a bare number (`rc`), so each
+# layout needs both shapes. `head -1` keeps the FIRST hit, which is the top-level key in either
+# layout. No `\|` alternation: this file runs under BSD sed on macOS as well as GNU sed on a cell.
+_fleet_json_field() { # <file> <key>
+  local f="$1" k="$2"
+  sed -n \
+    -e 's/^[[:space:]]*"'"$k"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    -e 's/^[[:space:]]*"'"$k"'"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p' \
+    -e 's/.*[{,][[:space:]]*"'"$k"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    -e 's/.*[{,][[:space:]]*"'"$k"'"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p' \
+    "$f" 2>/dev/null | head -1
 }
 
 # _fleet_pr_doctor_bound — the capacity AXIS pr-doctor's own record names, or "" when unreadable.
@@ -886,10 +919,23 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
 # ⛔ THE AXIS DECIDES THE SEVERITY (`_fleet_row_launchd_job`'s waiting arm), and only `load` clears by
 # itself — so the datum has to come from the component's own artifact rather than from a guess here.
 # It is read, never re-measured: `capacity.sh probe` already wrote the numbers into the same record.
-_fleet_pr_doctor_bound() {
-  local f="${FLEET_AGENT_STATE:-}/pr-doctor.status.json" b
+#
+# ⛔ AND IT MUST BE THE SAME PASS THE ROW IS EXPLAINING (review P1, #2291). `refusal_bound` is written
+# by EVERY pass that had any gate refusal — `rc 0` and `rc 3` passes included — and the status file is
+# written by BOTH launchers (launchd, and the heartbeat's detached child) while the row's last exit
+# describes only one of them. Read blind, a `6` from a DISK refusal whose record was then overwritten
+# by a later load-bound pass rendered WAITING (a PASS) with `bound=load=…`: the exact "waiting does
+# not clear a full disk" mislabel the axis split exists to prevent. So the record's own `rc` (and its
+# `verdict`, when present) must agree with the exit code this row is explaining; a record that
+# disagrees is UNREADABLE, and an unreadable read is an abstention — never a pass.
+_fleet_pr_doctor_bound() { # <the last-exit code this row is explaining>
+  local f="${FLEET_AGENT_STATE:-}/pr-doctor.status.json" b rc verdict
   [ -n "${FLEET_AGENT_STATE:-}" ] && [ -f "$f" ] || return 1
-  b="$(sed -n 's/.*"refusal_bound"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)"
+  rc="$(_fleet_json_field "$f" rc)"
+  verdict="$(_fleet_json_field "$f" verdict)"
+  b="$(_fleet_json_field "$f" refusal_bound)"
+  [ -n "$rc" ] && [ "$rc" = "${1:-}" ] || return 1
+  [ -z "$verdict" ] || [ "$verdict" = "NO-CAPACITY" ] || return 1
   [ -n "$b" ] || return 1
   printf '%s' "$b"
 }

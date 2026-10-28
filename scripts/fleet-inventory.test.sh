@@ -62,10 +62,19 @@
 #       exit-7 control green, which is the proof the allowance is narrow rather than generic.
 #   (v) add 6 to `fleet_state_severity`'s "not OK" side (WAITING fails the table)   → §6's "WAITING
 #       is a PASS for the table's exit code" arm only
-#   (w) treat EVERY bound as self-clearing (drop the axis split)                     → §6's "a DISK
+#   (w2) treat EVERY bound as self-clearing (drop the axis split)                   → §6's "a DISK
 #       refusal reads FAILING" + "it FAILS the table's exit code" arms AND the UNKNOWN arm
 #   (x) read the axis but default an unreadable one to WAITING                     → §6's UNKNOWN arm
 #       only (the fail-open direction: "cannot tell" became a pass)
+#   (x2) return on the capacity arm BEFORE the freshness arms (the pre-review shape) → §6's "a STALE
+#       exit 6 is LATE" + "it fails the table's exit code" arms only. The fresh-arm controls
+#       ("WAITING is a PASS", "never rendered OK") stay GREEN by design: they pin the OPPOSITE
+#       direction, so a mutation that removes the freshness check cannot redden them.
+#   (x3) read `refusal_bound` WITHOUT checking the record is the pass being explained → §6's
+#       "a record from a DIFFERENT pass is UNKNOWN" arm only.
+#       ⛔ THE LABELS ABOVE ARE SUFFIXED `2`/`3` RATHER THAN RE-LETTERED (review P3, #2291): `(w)`
+#       below is a PRE-EXISTING entry (the §9r mutation), and one fixer must be able to name ONE
+#       mutation and get ONE reddened arm. Leave the pre-existing letters alone; suffix the new ones.
 #   (t) do not clear a pidfile the row has PROVEN stale                        → §9q (2 arms: start
 #       cannot repair the row, and the row stays FAILING afterwards)
 #   (w) have the caller assume it started something                          → §9r only
@@ -572,6 +581,32 @@ st="$(state_of "$ROWS" pr-doctor)"
                        || bad "§6 exit 6 without a readable bound should read UNKNOWN, got [$st]"
 [ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=2" ] && ok "§6 …which is the table's fail-closed code" \
                                                  || bad "§6 UNKNOWN must exit 2, got $(severity_of_row "$ROWS" pr-doctor)"
+# ⛔ AND A CAPACITY PASS IS NOT EXEMPT FROM FRESHNESS (review P1, #2291). The `6` arm used to `return`
+# BEFORE every freshness arm, so a LOADED job that had produced no output for longer than
+# 2×StartInterval+slack read WAITING — a PASS for the table's exit code — for ever. That is exactly
+# the "a job that stopped running cannot be distinguished from a healthy one" state this file's own
+# header says must never be green.
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+printf 'PID\tStatus\tLabel\n-\t6\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+touch -t 202001010000 "$STATE/pr-doctor.out"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "LATE" ] && ok "§6 …and a STALE exit 6 is LATE, not WAITING — 'wait' is not the answer to 'nothing is running'" \
+                   || bad "§6 a stale exit 6 should read LATE, got [$st]"
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=1" ] && ok "§6 …which fails the table's exit code (a dead job is not green)" \
+                                                   || bad "§6 a stale exit 6 must not pass the table, got $(severity_of_row "$ROWS" pr-doctor)"
+# ⛔ AND THE AXIS MUST COME FROM THE SAME PASS (review P1, #2291). Both launchers write the one record
+# and EVERY pass that had any gate refusal writes `refusal_bound` — `rc 0` and `rc 3` passes included —
+# so a `6` explaining a DISK refusal could have been rendered WAITING from a later load-bound pass's
+# record: the exact "waiting does not clear a full disk" mislabel the axis split exists to prevent.
+# A record whose `rc`/`verdict` disagree with the exit this row is explaining is UNREADABLE, and an
+# unreadable read is an abstention — never a pass.
+touch "$STATE/pr-doctor.out"     # fresh again: the AXIS, not the clock, is under test here
+printf '{"rc": 3, "verdict": "UNDELIVERED", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "UNKNOWN" ] && ok "§6 …and a record from a DIFFERENT pass (rc=3 against the row's exit 6) is UNKNOWN, not WAITING" \
+                      || bad "§6 a mismatched record should read UNKNOWN, got [$st]"
 # ⛔ CONTROL: the allowance is for 6 ALONE. A different non-zero exit on the same row is FAILING —
 # otherwise this arm would be "every exit is WAITING", the false-PASS direction.
 printf 'PID\tStatus\tLabel\n-\t7\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
