@@ -191,6 +191,111 @@ rm -f "$CAPF" "$ENDF"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/gate-policy.sh" 2>/dev/null || { echo "nonblocking-dispatch.sh: FATAL: $SELF/gate-policy.sh missing — refusing to start a worker that cannot say whether its gates are on" >&2; exit 78; }
 apply_gate_policy nonblocking-dispatch
+# ── COMMIT AS YOU GO on an AUTHORED brief (#2981) — APPENDED, never refused ──────────────────────────
+# This is the one dispatch path whose brief the CALLER wrote (`pr-doctor.py`, or a human), and it is
+# the path the measured 5-of-5 zero-commit batch came through. The research contract above is a GATE
+# (absent = refuse with 80) because a worker that never looked first is the defect it exists for. This
+# one is APPENDED instead: an authored brief that is otherwise complete must not become a dead
+# dispatch over one missing sentence, and the append is idempotent — a brief that already carries the
+# section (or that came from a generated composer) is left byte-for-byte alone.
+# ⛔ THE SECTION HAS ONE HOME. It is rendered by `reviewer-preflight.sh`, never copied here; the
+# needle is that render's own first line, so a reworded heading cannot silently stop matching.
+# ⛔ THE ROLE COMES FROM `$WK`, NEVER FROM A GUESS. `$WK` is the SAME declared kind that selects the
+# spawn-gate policy (#2409), and this dispatcher's callers sit on both sides of it: `pr-doctor.py`
+# passes `prfix` (one ALREADY-OPEN PR it repairs), while `ai-drainer.sh` passes FOUR arguments — so
+# `$WK` is the documented `bg` default and its brief is a multi-PR hygiene order that opens no PR.
+# Rendering `prfix` unconditionally handed that drainer lane "Your PR is ALREADY OPEN", which is
+# false about its situation — the untrue-order class #2148/#2325 exist to remove (caught in this
+# PR's review, cycle 1).
+# ⛔ NO SECOND COPY OF THE VOCABULARY. `$WK` was already narrowed to exactly `bg|prfix` by the closed
+# vocabulary ~90 lines above (the `kind '$WK' is not bg or prfix` arm), so a `case` here could never
+# reach a third branch — it would be an INERT enforcer that reads as protection. The role is the kind,
+# and the ONE place that decides a role is valid is the helper's own `*)` arm below: it returns 2 for
+# an unknown role, and the `|| exit 78` refuses the dispatch. Fail-closed in one home, not two.
+NB_DELIVERY_ROLE="$WK"
+# ⛔ THE HELPER IS RESOLVED THE WAY THIS FILE ALREADY RESOLVES `brief-gate.sh` ABOVE — NEVER FROM `$SELF`
+# ALONE (review of #2981, P2). The `$O`-SKEW paragraph on the gate resolver is 30 lines up: "`$O` is
+# seeded file by file, so a NEW dispatcher can run against an OLD `$O/spawn-gate.sh`", and that is why
+# that resolver searches FOUR homes instead of pinning one. A `$SELF`-only pin here re-creates the
+# class one screen below the comment that documents it: on a half-seeded `$O` (new
+# `nonblocking-dispatch.sh`, helper not seeded beside it) EVERY dispatch on the box would exit 78 — a
+# fleet that cannot dispatch, caused by the rule whose whole purpose is that a lane delivers
+# something. Corpus precedent, same failure: `install.sh` on `brief-gate.sh` — "a $O copy that
+# predates it makes every one of those refuse (78 = cannot verify) — a whole fleet that cannot
+# dispatch". Nearest copy wins, so the executing script's own directory is still first, and STILL
+# fail-closed if no home has it.
+NB_DELIVERY_SH=""
+for _rp in "$SELF/reviewer-preflight.sh" "${HARNESS:-}/reviewer-preflight.sh" "$O/reviewer-preflight.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/reviewer-preflight.sh" \
+           "${HOME:-}/.pi/agent/scripts/orchestrator-harness/reviewer-preflight.sh"; do
+  [ -n "$_rp" ] && [ -f "$_rp" ] && { NB_DELIVERY_SH="$_rp"; break; }
+done
+[ -n "$NB_DELIVERY_SH" ] || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh not found (looked in $SELF, $O, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts/orchestrator-harness) — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+NB_DELIVERY="$(bash "$NB_DELIVERY_SH" --delivery-brief "$NB_DELIVERY_ROLE")" || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief $NB_DELIVERY_ROLE failed — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+NB_DELIVERY_HEADING="$(printf '%s\n' "$NB_DELIVERY" | head -1)"
+[ -n "$NB_DELIVERY_HEADING" ] || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief rendered NOTHING — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
+# ⛔ THE HEADING ALONE IS NOT THE KEY (this PR's review, cycle 2 — P2). The heading is ROLE-INVARIANT:
+# all three roles render it byte-identically, so a heading-only test calls a brief complete when it
+# carries ANOTHER role's copy and leaves it alone. That collision is REACHABLE, not theoretical —
+# `templates/LANE-BRIEF.md` is pinned to the `lane` render (it orders "Open the PR as soon as the first
+# commit is pushed"), a controller authors its brief by copying that template, and `pr-doctor.py` then
+# dispatches it as `prfix`: the heading matches, nothing is appended, and the worker is ordered to open
+# a PR it ALREADY HAS — exactly the false-order class #2148/#2325 exist to remove, reached through the
+# append path instead of the render path. So the key is the role's OWN PR sentence.
+# ⛔ The sentence is taken from the render, never restated here (the ONE home rule): it is the first
+# `- **` bullet of the section, and `reviewer-preflight.test.sh` §G.2b pins that order so a reordered
+# bullet cannot silently make this read the wrong line. Here-string, not a pipe: no SIGPIPE (#841).
+NB_DELIVERY_PR_LINE="$(awk '/^- \*\*/{print; exit}' <<<"$NB_DELIVERY")"
+[ -n "$NB_DELIVERY_PR_LINE" ] || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief $NB_DELIVERY_ROLE rendered no PR sentence — refusing to start a worker whose PR duty cannot be verified (#2981)" >&2; exit 78; }
+# A brief is already complete only when it carries the heading AND this role's own sentence. A brief
+# that carries the heading but a FOREIGN role's sentence is appended to rather than refused, which is
+# this path's stated policy (an otherwise complete authored brief must not become a dead dispatch).
+# The already-correct case stays byte-for-byte untouched.
+# ⛔ APPENDING IS NOT ENOUGH — THE STALE ORDER MUST BE MARKED SUPERSEDED (this PR's review, cycle 3,
+# P2). Append-only left the worker holding BOTH orders: `pr-doctor.py` dispatching a template-derived
+# brief as `prfix` yields "Open the PR as soon as the first commit is pushed" AND "Your PR is ALREADY
+# OPEN". "The last word wins" was an ASSUMPTION about reading order that nothing enforced, and the
+# surviving sentence is the false order #2148/#2325 exist to remove — the very sentence this file's
+# own comment above calls out. So when the heading was ALREADY present (i.e. a foreign role's copy is
+# above), a one-line supersession notice precedes the appended section. The stale bullet is NOT
+# deleted: the append policy stands, and a brief is never rewritten under its author. The notice lands
+# BEFORE the correct sentence, so the reader meets "this is superseded" and then the true order.
+NB_DELIVERY_SUPERSEDE="⛔ THE COMMIT-AS-YOU-GO SECTION BELOW SUPERSEDES ANY COPY ABOVE THIS LINE — the copy above carries a DIFFERENT role's PR instruction, which does not describe your situation. Your PR duty is the one stated in the section below."
+NB_DELIVERY_HAD_HEADING=0
+# …and whether the notice was actually WRITTEN, which is a DIFFERENT question: the heading pre-exists
+# on an already-correct brief too, so keying the post-condition on HAD_HEADING alone demanded a notice
+# on a brief that needs none — the first cut of this fix refused every re-dispatch of a correct brief
+# (caught by the suite's own idempotence arm, which is why that arm exists).
+NB_DELIVERY_SUPERSEDE_DUE=0
+grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" 2>/dev/null && NB_DELIVERY_HAD_HEADING=1
+if [ "$NB_DELIVERY_HAD_HEADING" -eq 0 ] \
+   || ! grep -qF -- "$NB_DELIVERY_PR_LINE" "$PROMPT" 2>/dev/null; then
+  if [ "$NB_DELIVERY_HAD_HEADING" -eq 1 ]; then
+    NB_DELIVERY_SUPERSEDE_DUE=1
+    printf '\n%s\n' "$NB_DELIVERY_SUPERSEDE" >> "$PROMPT" || {
+      echo "nonblocking-dispatch.sh: could not mark the foreign-role COMMIT-AS-YOU-GO section superseded in $PROMPT — refusing to start a worker that would read a false PR order (#2981)" >&2; exit 78; }
+  fi
+  printf '\n%s\n' "$NB_DELIVERY" >> "$PROMPT" || {
+    echo "nonblocking-dispatch.sh: could not append the COMMIT-AS-YOU-GO section to $PROMPT — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
+fi
+# ⛔ AND THEN VERIFY IT LANDED. An append that reported success and wrote nothing is the exact shape
+# this section exists to refuse, so the post-condition is asserted rather than assumed — and it is
+# asserted on BOTH halves, because the heading check alone is the vacuous one this block just fixed.
+grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" \
+  && grep -qF -- "$NB_DELIVERY_PR_LINE" "$PROMPT" || {
+  echo "nonblocking-dispatch.sh: the brief at $PROMPT STILL lacks its COMMIT-AS-YOU-GO section (heading or the $NB_DELIVERY_ROLE PR sentence) after the append — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
+# …and a brief that HAD a foreign copy must now say so, or the post-condition above is satisfied while
+# the false order is the first thing the worker reads. Keyed on SUPERSEDE_DUE, not HAD_HEADING: an
+# already-correct brief carries the heading and owes NO notice. A marker that was never written must not
+# read as written, and a marker that was never OWED must not be demanded.
+if [ "$NB_DELIVERY_SUPERSEDE_DUE" -eq 1 ]; then
+  grep -qF -- "$NB_DELIVERY_SUPERSEDE" "$PROMPT" || {
+    echo "nonblocking-dispatch.sh: the brief at $PROMPT carried a FOREIGN-role COMMIT-AS-YOU-GO section and its supersession notice did not land — refusing to start a worker that would read a false PR order (#2981)" >&2; exit 78; }
+fi
 # ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
 # checkout, not a review bypass, and #2319 does not rule on it.
 export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1

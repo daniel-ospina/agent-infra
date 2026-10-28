@@ -62,6 +62,23 @@ brief_gate_sh="$(brief_gate_lib)" || {
   echo "[fix $PR] FATAL: brief-gate.sh not found — refusing to run a fixer whose brief nothing validated (#2258)" >&2; exit 78; }
 FIX_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section fixer)" || {
   echo "[fix $PR] FATAL: brief-gate.sh --section failed — refusing to run a fixer whose brief omits the research contract (#2258)" >&2; exit 78; }
+# ── COMMIT AS YOU GO is part of the fixer's brief too (#2981) ───────────────────────────────────────
+# The measured batch behind #2981 was five `prfix` lanes — FIXERS — every one killed at its 2400 s cap
+# with 0 commits and 0 PRs, holding its single commit for the end. A fixer is dispatched TO an existing
+# PR, so it renders the `prfix` role: "commit and push onto it", never "open the PR". ONE home for the
+# text (`reviewer-preflight.sh --delivery-brief`), the same way the research contract has one home.
+for _rp in "$SELF/reviewer-preflight.sh" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/reviewer-preflight.sh" \
+           "${HOME:-}/.pi/agent/scripts/orchestrator-harness/reviewer-preflight.sh"; do
+  [ -n "$_rp" ] && [ -f "$_rp" ] && { delivery_sh="$_rp"; break; }
+done
+[ -n "${delivery_sh:-}" ] || {
+  echo "[fix $PR] FATAL: reviewer-preflight.sh not found (looked in $SELF, \$AGENT_INFRA_PATH, ~/.pi/agent) — refusing to run a fixer whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+FIX_DELIVERY_BRIEF="$(bash "$delivery_sh" --delivery-brief prfix)" || {
+  echo "[fix $PR] FATAL: reviewer-preflight.sh --delivery-brief failed — refusing to run a fixer whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+# ⛔ AN EMPTY RENDER IS A FAILED RENDER: spliced as a variable, an empty section is a blank line and
+# every other assertion stays green.
+[ -n "$FIX_DELIVERY_BRIEF" ] || {
+  echo "[fix $PR] FATAL: reviewer-preflight.sh --delivery-brief rendered NOTHING — refusing to run a fixer that would hold its work to the cap (#2981)" >&2; exit 78; }
 # ⛔ THE REPO-IDENTITY GATE (agent-infra#2694/#2724). This is the PR-lane half: a fixer given a
 # checkout and a DIFFERENT target repo used to materialise a worktree in the checkout and run there,
 # reporting failures about branches instead of about the repo. Missing = FATAL, because a silently
@@ -553,6 +570,8 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 cat > "$L-fixer.txt" <<EOF
 $FIX_RESEARCH_BRIEF
 
+$FIX_DELIVERY_BRIEF
+
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
 If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
@@ -582,6 +601,18 @@ EOF
 bash "$brief_gate_sh" --check "$L-fixer.txt" fixer 2>>"$L.log" || {
   echo "[fix $PR] FATAL: the GENERATED fixer brief fails brief-gate.sh — refusing to run a fixer whose brief lost its research contract (a harness defect in the heredoc above) (#2258)" >> "$L.log"
   echo "[fix $PR] FATAL: generated fixer brief refused by brief-gate.sh (harness defect, see $L.log)" >&2
+  exit 78
+}
+# ── AND THE DELIVERY CONTRACT IS CHECKED AT BUILD TIME TOO (#2981) ──────────────────────────────────
+# `brief-gate.sh` validates the RESEARCH contract only, so a heredoc edit that drops this section would
+# leave every other assertion green — the invisibility that cost 144 KB. The needle is the RENDERED
+# heading's own first line, never a literal: a second copy of the text is the drift this refuses, and
+# an EMPTIED constant would make `grep -F ""` match every line (an inert guard that reads as
+# protection) — hence the `-n`.
+FIX_DELIVERY_HEADING="$(printf '%s\n' "$FIX_DELIVERY_BRIEF" | head -1)"
+[ -n "$FIX_DELIVERY_HEADING" ] && grep -qF -- "$FIX_DELIVERY_HEADING" "$L-fixer.txt" || {
+  echo "[fix $PR] FATAL: the GENERATED fixer brief lost its COMMIT-AS-YOU-GO section — refusing to run a fixer that would hold its work to the cap (a harness defect in the heredoc above) (#2981)" >> "$L.log"
+  echo "[fix $PR] FATAL: generated fixer brief lost its COMMIT-AS-YOU-GO section (harness defect, see $L.log)" >&2
   exit 78
 }
 # ⛔ THE VOLUME IS THE WORKTREE, AND IT MUST BE PASSED EXPLICITLY (review round 2, P2). This script
