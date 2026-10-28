@@ -325,6 +325,16 @@ after `REFUSAL_ESCALATE_AT` consecutive refusals **at one head** the pass prints
 the worktree and the repair — on the verdict line too, not only in the log. A head move starts a new
 episode. The two *causes* (a box with no room vs the transport refusing) still produce different
 responses and are #2291's to separate; what is decided here is that neither may read as a clean pass.
+⛔ **AND THE ACCOUNTING PRECEDES THE BUDGET GATE** (review round 2, P1 — reproduced). A `kind: refused`
+row never launched a worker, so it has no `$O/bg/<worker>.pid`; `_worker_state` answers `unknown` for it,
+and `pass_budgets` was charging it to its class. At the SHIPPED defaults (`MAX_FIX=3`) the incident's
+**four** refusals exhausted the fix budget, and the budget gate sits ABOVE the cooldown arm — so the pass
+skipped the accounting entirely and printed `dispatched 0 of 4 queued — budget=4` with `EXIT rc=0`. That is
+the same silent clean pass, at the default capacity, with the row count the incident measured. A refusal
+consumes nothing (`void_refused_rows` already states the rule), so it may not hold a budget slot, and the
+cooldown/refusal arm now runs BEFORE the gate: a pass over its dispatch budget still COUNTS and NAMES the
+refusals it covers. The cooldown and placed-order causes are also counted separately, so the verdict line
+cannot say "no worker accepted" about a pass in which no order was placed.
 
 **What repairs it.** Read `read=` and `reason=` from the sidecar, then: `read=transport` +
 `predates the repair kind` → refresh `$O` with `install.sh` (a stale dispatcher silently downgrades
@@ -354,7 +364,20 @@ a verdict in `READABLE_VERDICTS`; `2` for everything else, including a word this
 indistinguishable, to a launcher, from `AT-TARGET`. ⛔ **And blindness outranks the verdict word:**
 `build()`'s ladder puts `FIX-MAIN` above the blind-queue arm, so a RED main beside an unreadable queue
 printed `VERDICT=FIX-MAIN … queue=UNREADABLE` — a readable word over an unread world. The code refuses on
-any `BLINDNESS_TOKENS` fact whatever word accompanies it; §2's rule, applied where it bites.
+any `BLINDNESS_TOKENS` fact whatever word accompanies it; §2's rule, applied where it bites. ⛔ **And the
+inventory must be COMPLETE, or the rule has a hole** (review round 2, reproduced): `queue_read=BLIND(…)` —
+the file's own word for "the QUEUE read did not answer", printed beside the counts it disowns — was not in
+`BLINDNESS_TOKENS`, so `VERDICT=AT-TARGET … queue_read=BLIND(4/4 unread, samples=4) -- the QUEUE counts are
+NOT a clearance` exited **0**. Both spellings (`BLIND(`, `UNREADABLE(`) now refuse; `REST(` deliberately does
+not, because it is a decided non-blind degradation. `error=` is matched as a FIELD, not a substring: a
+required check legitimately named `pytest (error=timeout)` was refusing a fully readable line.
+⛔ **And a required set that does not describe this repo is `UNKNOWN`, never `GREEN`** (review round 2, P1 —
+reproduced, and it is the worst shape this issue names). `REQUIRED` is tortoise's set by default and this
+change made `REPO` follow the checkout/`OR`, so on any other repo every required name is merely ABSENT:
+`req_red` empty, nothing in flight, `GREEN` — measured with three ALL-RED checks on the head,
+`main_health() -> ('GREEN', [])`. The repo half of the seam landed in round 1; this is the half that says
+"I cannot judge this repo with another repo's gates". A supplied set (`OBJECTIVE_REQUIRED`, resolved from
+branch protection) is judged as before; only the foreign-rubric case changes, and it changes to the truth.
 ⛔ **The repo is an input with a NAMED source, and a mismatch refuses.** `REPO_DEFAULT`
 (`daniel-ospina/tortoise`) was `OBJECTIVE_REPO or <that literal>`: silent, and never compared with the
 checkout the process stands in — so measured 2026-10-24 an agent-infra doctor read tortoise's check-runs

@@ -6495,3 +6495,110 @@ def test_HALF_a_rubric_seam_is_a_hybrid_rubric_and_refuses_even_the_built_in_rep
             assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
     finally:
         pr.canonical_paths()
+
+
+# ── REVIEW ROUND 2 (#2710): the budget gate ran BEFORE the refusal accounting ─────────────────────
+def _four_refused_rows(monkeypatch, logs, refusals, orch_dir):
+    """The incident's own shape: four rows in their cooldown, an EMPTY `$O/bg`, shipped defaults.
+
+    ⛔ `ORCH_DIR` IS PINNED TO AN EMPTY DIRECTORY, AND THAT IS THE WHOLE POINT (review round 2). A
+    refused row never launched a worker, so it has no `bg/<worker>.pid` -- which is exactly the state
+    `_worker_state` answers "unknown" (charged) or "gone" (free) from. Left on the box's real
+    `ORCH_DIR`, a stray pid file made the rows read "gone" and the budget interaction this test
+    exists for never happened: the assertion passed for a reason it does not name.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(orch_dir))
+    rows = {}
+    for n in (1, 2, 3, 4):
+        rows[str(n)] = {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                        "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+                        "refusals": refusals, "why": "worktree dirty -- refusing"}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(rows))
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in (1, 2, 3, 4)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    # An EMPTY ORCH_DIR is the state of a PR that never spawned a worker -- i.e. every refused row.
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError(
+                            "a row inside its own cooldown must not be dispatched")))
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    # ⛔ THE SHIPPED CAPS, DELIBERATELY. Every other pass test raises MAX_FIX/MAX_REVIEW, which is
+    # exactly why one row hid this: at the defaults, three refused rows exhaust the fix budget.
+    for v in ("MAX_FIX", "MAX_REVIEW", "MAX_TOTAL"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def test_FOUR_refused_rows_at_the_SHIPPED_caps_still_refuse_and_escalate(monkeypatch, tmp_path):
+    """⛔ THE BUDGET GATE RAN BEFORE THE REFUSAL ACCOUNTING (review round 2, P1 -- reproduced).
+
+    A refused row never launched a worker, so it has no `$O/bg/<worker>.pid`; `_worker_state`
+    answers "unknown", and `pass_budgets` charged the row to its class. At the SHIPPED defaults
+    (`DEFAULT_MAX_FIX=3`) the incident's four rows exhausted the fix budget, and the budget gate sits
+    ABOVE the cooldown arm -- so the pass skipped it entirely and printed
+    `dispatched 0 of 4 queued — budget=4` with `EXIT rc=0`: this file's word for "readable, nothing to
+    do", at the defaults, with the row count the incident actually measured. `void_refused_rows`
+    already states the rule this contradicted: *"A refusal consumed nothing, so it must not hold a
+    cooldown and a budget slot"*.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, pr.REFUSAL_ESCALATE_AT, tmp_path)
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    joined = "\n".join(logs)
+    assert "budget=" not in joined.split("dispatched")[-1], joined
+    # ⛔ AND EVERY ONE IS NAMED ON THE VERDICT LINE -- this is the sentence the contract states:
+    # "EVERY PASS THAT COVERS THE ROW, not only the one that records it".
+    assert "4 PR(s) still undeliverable" in joined, joined
+    assert "refused in an earlier pass" in joined, joined
+    assert "ESCALATE #1" in joined, joined
+
+
+def test_a_cooldown_pass_does_not_claim_an_order_was_rejected(monkeypatch, tmp_path):
+    """⛔ ONE COUNT, TWO CAUSES, ONE FALSE SENTENCE (review round 2, P2).
+
+    `undeliverable` decides the CODE on both arms, but its sentence said "no worker accepted" -- a
+    transport failure. On a cooldown pass NO ORDER WAS PLACED, so that sentence sent an operator
+    hunting a transport fault in a pass that attempted nothing.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, 1, tmp_path)
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "no worker accepted" not in joined, joined
+    assert "still undeliverable" in joined, joined
+    # below the threshold, an escalation would be crying wolf
+    assert "ESCALATE" not in joined, joined
+
+
+def test_a_CORRUPTED_refusal_count_degrades_instead_of_crashing(monkeypatch, tmp_path):
+    """⛔ `int("3x")` RAISED, AND THE BAD ROW WAS NEVER REWRITTEN (review round 2).
+
+    `__main__` records a crash as `EXIT_CRASH=4`; because the cooldown arm never rewrites the row,
+    the bad value survived and EVERY later pass crashed before dispatching anything for any PR -- a
+    corrupted counter turned a named refusal into a permanently silent doctor. A bad count means
+    "unknown count": never escalate, never crash.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, "3x", tmp_path)
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    joined = "\n".join(logs)
+    assert "ESCALATE" not in joined, joined
+    assert pr._as_int("3x") == 0 and pr._as_int(None) == 0 and pr._as_int("3") == 3
+
+
+def test_a_refused_row_no_longer_holds_a_budget_slot(monkeypatch, tmp_path):
+    """The rule `void_refused_rows` states, applied where the budget is actually COUNTED."""
+    st = {str(n): {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                   "head": "a" * 40, "at_epoch": pr.now() - 60, "refusals": 1}
+          for n in (1, 2, 3, 4)}
+    # an EMPTY bg dir: no pid file, which is what every refused row looks like
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    budgets = pr.pass_budgets(st, {"max_fix": 3, "max_review": 4})
+    assert budgets["used"] == 0, budgets
+    assert budgets["unknown"] == 0, budgets
+    # ⛔ NON-VACUITY: a row that IS waiting on a worker still holds its slot.
+    st["9"] = {"action": "fix-ci", "worker": pr.worker_name("9"), "kind": "spawn",
+               "head": "a" * 40, "at_epoch": pr.now() - 60}
+    assert pr.pass_budgets(st, {"max_fix": 3, "max_review": 4})["used"] == 1

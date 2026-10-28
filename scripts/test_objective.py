@@ -3653,8 +3653,20 @@ def test_an_UNKNOWN_verdict_EXITS_2_so_no_launcher_can_read_it_as_healthy(monkey
     assert cache.exists() is False, "a refused read must not be cached"
 
 
-def test_a_readable_verdict_exits_0_and_a_refusing_one_exits_2(monkeypatch):
-    """The decision is POLARITY: only a verdict this file knows is readable may exit 0."""
+def test_a_readable_verdict_exits_0_and_a_refusing_one_exits_2(monkeypatch, tmp_path):
+    """The decision is POLARITY: only a verdict this file knows is readable may exit 0.
+
+    ⛔ HERMETIC (review round 2, P2). The first version left `CACHE` on the REAL state dir, so
+    `main()`'s serve arm ran `main_sha()` — a LIVE `gh api repos/<repo>/commits/main` — once per
+    iteration: measured 7 real API calls from one unit test, against the file's own rule that "without
+    this seam every test … would reach the REAL api.github.com". Pinning `CACHE` to a path that does
+    not exist means the serve arm is never entered, so the test asserts only the cell it names.
+    """
+    monkeypatch.setattr(objective, "CACHE", str(tmp_path / "objective.last"))
+    # ⛔ AND THE LIVENESS READ ITSELF: iteration 1 WRITES that cache, so from iteration 2 the serve
+    # arm is entered and asks `main_sha()` -- a live `gh api`. Pinning `CACHE` alone was not enough
+    # (measured: 7 real calls, 14.8s).
+    monkeypatch.setattr(objective, "main_sha", lambda: "deadbeef")
     monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
     monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
     for verdict, want in (("AT-TARGET", 0), ("ADVANCING", 0), ("REGRESSING", 0), ("FIX-MAIN", 0),
@@ -3867,3 +3879,93 @@ def test_a_deployment_WITHOUT_the_deriver_says_so_instead_of_guessing(tmp_path):
     _slug, src_kind, refusal, check = mod.resolve_repo(env="acme/widget", checkout=None)
     assert (src_kind, refusal) == ("env", "")
     assert check == "uncompared:deriver-missing", check
+
+
+# ── REVIEW ROUND 2 (#2710): three ways the rule above could still let a wrong answer through ──────
+# Each of these was REPRODUCED before the fix, by running it against the pre-fix file. They are the
+# gaps a first pass over the refusal rule leaves: an incomplete blindness inventory, a tool that
+# answers GREEN from another repo's gates, and a token that a third party can put in the line.
+def test_a_BLIND_queue_read_refuses_whatever_the_verdict_says(monkeypatch):
+    """⛔ `queue_read=BLIND` WAS NOT IN THE BLINDNESS INVENTORY (review round 2, reproduced).
+
+    `_queue_read_is_blind` calls `BLIND` "this file's word for 'the QUEUE read did not answer'", and
+    `build()` prints it beside the counts it disowns -- while `AT-TARGET` (the IDLE word) is derived
+    from exactly those counts. A line that says its own numbers are not a clearance exited 0.
+    Reproduced end to end before the fix: a 4-PR queue with every `mergeStateStatus=UNKNOWN`
+    printed `VERDICT=AT-TARGET … queue_read=BLIND(4/4 unread, samples=4) -- the QUEUE counts are NOT
+    a clearance` and returned rc 0.
+    """
+    real = ("OBJECTIVE VERDICT=AT-TARGET main=GREEN@9c4788400 open=4 drafts=0 nondraft=4 "
+            "queue_read=BLIND(4/4 unread, samples=4) -- the QUEUE counts are NOT a clearance "
+            "repo=acme/widget repo_src=checkout")
+    assert objective.is_blind_line(real) is True
+    assert objective._exit_for(real) == 2
+    # the OTHER spelling: the spent-deadline arm, which prints no counts at all
+    unreadable = real.replace("queue_read=BLIND(4/4 unread, samples=4)",
+                              "queue_read=UNREADABLE(waited=100.4s, last_good=812s)")
+    assert objective._exit_for(unreadable) == 2
+    # ⛔ NON-VACUITY, and the line that must NOT refuse: `REST(` is a DECIDED non-blind degradation
+    # (the count is still usable and the line says so). Refusing on it would make the rule a
+    # permanent over-block on every repo without merge-state clearance.
+    rest = real.replace("queue_read=BLIND(4/4 unread, samples=4)",
+                        "queue_read=REST(merge_state unread 2/4, samples=4)")
+    assert objective.is_blind_line(rest) is False
+    assert objective._exit_for(rest) == 0
+
+
+def test_an_error_token_inside_a_THIRD_PARTY_name_does_not_refuse_a_readable_line(monkeypatch):
+    """⛔ `error=` MATCHED AS A SUBSTRING, SO SOMEONE ELSE'S JOB NAME DECIDED THE EXIT CODE.
+
+    `build()` interpolates third-party text into the line (`failing_required=<check names>`, a
+    `PR-DOCTOR(last run) … <reason>`). Measured: a required check legitimately named
+    `pytest (error=timeout)` made a fully READABLE `FIX-MAIN` line refuse. Fail-closed, so it cannot
+    ship a wrong answer -- but a permanent over-block on another team's naming is its own defect, and
+    `error=` is only blindness where it is a FIELD.
+    """
+    readable = ("OBJECTIVE VERDICT=FIX-MAIN main=RED@abcdef123 "
+                "failing_required=test (error=timeout) repo=acme/widget repo_src=env")
+    assert objective.is_blind_line(readable) is False
+    assert objective._exit_for(readable) == 0
+    # ⛔ NON-VACUITY: the REAL failing read still refuses, both as a field and as the line's own
+    # `error=` fact. The structural match must not be loosened into "never matches".
+    assert objective._exit_for("OBJECTIVE VERDICT=UNKNOWN error=transport wedged") == 2
+    assert objective.is_blind_line("OBJECTIVE VERDICT=UNKNOWN error=boom repo=a/b") is True
+
+
+def test_a_FOREIGN_required_set_is_UNKNOWN_and_never_GREEN(monkeypatch):
+    """⛔ THE WORST SHAPE THIS ISSUE NAMES: A FALSE PASS (review round 2, reproduced).
+
+    `REQUIRED` is TORTOISE's set by default and #2710 made `REPO` follow the checkout/`OR`, so on any
+    other repo every required name is simply ABSENT from the rollup: `req_red` empty, nothing in
+    flight, GREEN. Measured on this worktree with the bundled set and three all-red checks:
+    `main_health() -> ('GREEN', [])`. The repo half of the seam landed in round 1; this is the half
+    that says "I cannot judge this repo with another repo's gates".
+    """
+    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+    monkeypatch.setattr(objective, "gql_commit_checks", lambda sha: [{"name": "stub"}])
+    # Three checks, ALL RED, none of them in this file's bundled required set.
+    monkeypatch.setattr(objective, "rollup_checks",
+                        lambda cr: ({"python-ci", "docs-ci", "script-validate"}, set()))
+    monkeypatch.setattr(objective, "newest_attempts", lambda cr: [])
+    assert objective.main_health("abc") == ("UNKNOWN", [])
+
+    # ⛔ NON-VACUITY 1: the same red surface WITH a required name present is still RED, not UNKNOWN.
+    monkeypatch.setattr(objective, "rollup_checks",
+                        lambda cr: ({"python-ci-gate", "python-ci"}, set()))
+    assert objective.main_health("abc") == ("RED", ["python-ci-gate"])
+
+    # ⛔ NON-VACUITY 2: a required name that is present and GREEN is GREEN -- the fix must not turn
+    # every healthy main into UNKNOWN.
+    monkeypatch.setattr(objective, "rollup_checks", lambda cr: (set(), set()))
+    monkeypatch.setattr(objective, "newest_attempts", lambda cr: [("python-ci-gate", {})])
+    assert objective.main_health("abc") == ("GREEN", [])
+
+    # ⛔ NON-VACUITY 3: a SUPPLIED set is the repo's own, so it is judged rather than refused.
+    # (Both halves at once, because `REQUIRED` and `REQUIRED_SUPPLIED` are bound together at import --
+    # patching only the env after import is the inconsistency the code now refuses to have.)
+    monkeypatch.setattr(objective, "REQUIRED", ("python-ci",))
+    monkeypatch.setattr(objective, "REQUIRED_SUPPLIED", True)
+    monkeypatch.setenv("OBJECTIVE_REQUIRED", "python-ci")
+    monkeypatch.setattr(objective, "rollup_checks",
+                        lambda cr: ({"python-ci", "docs-ci"}, set()))
+    assert objective.main_health("abc") == ("RED", ["python-ci"])

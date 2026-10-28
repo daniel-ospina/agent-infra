@@ -261,12 +261,36 @@ EXIT_REFUSING = 2
 # blind-queue arm, so a RED main beside an unreadable queue emitted `VERDICT=FIX-MAIN … 
 # queue=UNREADABLE` -- a readable word over an unread world. `_exit_for()` therefore refuses on any
 # of these tokens WHATEVER the verdict word says: the word cannot outrank the read.
-BLINDNESS_TOKENS = ("gh=UNREADABLE", "main=UNKNOWN@?", "queue=UNREADABLE", "error=")
+BLINDNESS_TOKENS = ("gh=UNREADABLE", "main=UNKNOWN@?", "queue=UNREADABLE", "error=",
+                    # ⛔ THE QUEUE'S OWN BLINDNESS WORD WAS MISSING FROM ITS OWN INVENTORY (review
+                    # round 2, reproduced). `_queue_read_is_blind` calls `BLIND` "this file's word
+                    # for 'the QUEUE read did not answer'" and `build()` emits
+                    # `queue_read=BLIND(4/4 unread …) -- the QUEUE counts are NOT a clearance`,
+                    # while `AT-TARGET` (the IDLE word) is derived from exactly those counts. So a
+                    # line that disowns its own numbers exited 0 and read as a clearance. Both
+                    # spellings: the `BLIND(` arm above and the `UNREADABLE(` arm
+                    # (`queue_read=UNREADABLE(waited=…)`, the spent-deadline path).
+                    # NOT `queue_read=REST(`: that arm is a DECIDED non-blind degradation (the
+                    # count is still usable and the line says so), so refusing on it would be the
+                    # over-block this list must not become.
+                    "queue_read=BLIND", "queue_read=UNREADABLE")
+
+
+# ⛔ `error=` IS MATCHED STRUCTURALLY, NOT AS A SUBSTRING (review round 2, reproduced). `build()`
+# interpolates THIRD-PARTY text into the line — check names (`failing_required=…`), a doctor's
+# `reason`, a PR title — so a CI job legitimately named `pytest (error=timeout)` made a fully
+# READABLE line refuse. That is fail-closed so it cannot ship a wrong answer, but a permanent
+# over-block on someone else's job name is its own defect. `error=` is only blindness where it is a
+# FIELD: at the start of the line or after whitespace.
+_ERROR_FIELD = re.compile(r"(?:^|\s)error=")
 
 
 def is_blind_line(line):
     """True when an OBJECTIVE line says the world could not be read (see BLINDNESS_TOKENS)."""
-    return any(tok in (line or "") for tok in BLINDNESS_TOKENS)
+    line = line or ""
+    if any(tok in line for tok in BLINDNESS_TOKENS if tok != "error="):
+        return True
+    return bool(_ERROR_FIELD.search(line))
 
 
 def repo_seg():
@@ -276,8 +300,10 @@ def repo_seg():
     ⛔ `repo_src` IS THE POINT (#2710). `default` is the fallback that read tortoise's check-runs
     for agent-infra's SHAs for hours: the value is still allowed, but it can no longer be SILENT --
     every line says which repo it is about and which input chose it, on the same stdout line a
-    non-terminal reader parses. `repo_check` appears only when the answer could NOT be compared
-    (a declared repo and no derivable checkout), so an inert guard is visible instead of implied.
+    non-terminal reader parses. `repo_check` appears whenever the comparison could NOT be made —
+    a declared repo with no derivable checkout, **or** a fallback to `REPO_DEFAULT` that could not
+    be compared against anything (review round 2: this sentence stated a narrower rule than the
+    code and than this change's own test) — so an inert guard is visible instead of implied.
     """
     seg = "repo=%s repo_src=%s" % (REPO, REPO_SRC)
     return seg + (" repo_check=%s" % REPO_CHECK if REPO_CHECK else "")
@@ -366,6 +392,12 @@ def _required_from_env():
 
 
 REQUIRED = _required_from_env()
+# ⛔ READ AT IMPORT, WITH `REQUIRED` (review round 2). The guard in `main_health` asks "was this set
+# SUPPLIED?", and reading that answer at CALL time while `REQUIRED` was bound at IMPORT time made the
+# two disagree: a caller (or a test) that exports `OBJECTIVE_REQUIRED` after import gets
+# `from_env=True` beside the still-bundled `REQUIRED` -- the foreign-rubric case would then skip the
+# guard and answer GREEN from a set nobody supplied. One binding, one answer.
+REQUIRED_SUPPLIED = bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip())
 
 GREEN = {"success", "neutral", "skipped"}
 NON_RED = {"cancelled", "stale"}          # not green, but not evidence of failure
@@ -728,6 +760,23 @@ def main_health(sha):
         _note_gh_failure(GH_LAST_ERROR, "main", transport=None)
         return "UNKNOWN", []
     red, flight = rollup_checks(cr)
+    # ⛔ AND AN ABSENT REQUIRED SET IS NOT A GREEN MAIN (review round 2, P1 — reproduced, and it is
+    # the WORST shape this issue names: a false PASS). `REQUIRED` is TORTOISE's set by default, and
+    # #2710 made `REPO` follow the checkout/`OR` — so on any other repo every one of those names is
+    # simply NOT PRESENT in the rollup: `req_red` is empty, nothing is in flight, and the function
+    # answered GREEN for a head whose checks were ALL RED. Measured on this worktree with the
+    # bundled set and three all-red checks: `main_health() -> ('GREEN', [])`. The repo half of the
+    # seam landed; this is the half that says "I cannot judge this repo with another repo's gates".
+    # CANNOT-VERIFY IS NEVER A PASS: if not one required name appears on the surface at all, the
+    # required set does not describe this repo, and the honest answer is UNKNOWN — which
+    # `_exit_for()` also refuses on. `_supply_required()`'s caller (a consumer that resolved the set
+    # from branch protection) supplies names that DO appear, so a correctly-configured repo is
+    # unaffected; only the foreign-rubric case changes, and it changes to the truth.
+    from_env = REQUIRED_SUPPLIED
+    if not from_env and not (set(REQUIRED) & (red | flight)):
+        _seen = {n for n, _newest in newest_attempts(cr)}
+        if not (set(REQUIRED) & _seen):
+            return "UNKNOWN", []
     req_red = [c for c in REQUIRED if c in red]
     if req_red:
         return "RED", req_red
