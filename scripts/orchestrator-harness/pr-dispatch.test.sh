@@ -253,8 +253,17 @@ PY
     # lane-count assertions then read 12/9 and depended on what the machine happened to be doing. A
     # stub that answers nothing makes the tmux arm UNKNOWN, which invents no rows.
     PATH="$TMP/bin-tmuxnone:$PATH"
-    sess() { return 1; }
+    # ⛔ `OWN_LIVE=1` IS THE SEAM THE ARM-LEVEL OWNERSHIP PAIR DRIVES (#2831 (c)). It answers the one
+    # question the fixture owns — "does the census see a worker for this PR?" — through `sess`, which is
+    # inert everywhere else (`return 1`) so no other drive changes meaning.
+    sess() { [ "${OWN_LIVE:-0}" = "1" ] && return 0; return 1; }
     claim_live() { return 1; }
+    # The SHIPPED `pr_owner_live` (extracted above), not a re-implementation — see the note at the
+    # extraction. `PL_MOD=0` keeps it on the documented pre-module path, so this drive never reaps a
+    # lock; the module's own verdict is graded by pr-owner-liveness.test.sh against real lock files.
+    PL_MOD=0
+    # shellcheck source=/dev/null
+    . "$TMP/owner-live.sh"
     can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }
     # ⛔ THE SHIPPED park_ctrl (review of #2664, P2) — a stub makes every "PARKED" assertion a claim
@@ -266,8 +275,10 @@ PY
     # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
     # and the driver could never reach a spawn it is supposed to prove. That is the same `! 127`
     # polarity trap the loop's own top-level definition carries a ⛔ comment about, reproduced one
-    # layer down. `CIQ_PUSH_RC=1` is how an arm asks for the deferred world.
-    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    # layer down. ⛔ AND IT RECORDS THAT IT RAN (#2927): the three FIXER arms must no longer consult
+    # it at all, and a stub that refuses silently would make "not called" and "called and ignored"
+    # indistinguishable. `CIQ_PUSH_RC=1` is how an arm asks for the refused world.
+    ciq_push_ok() { printf 'CALLED\n' >> "$TMP/ciqspy"; return "${CIQ_PUSH_RC:-0}"; }
     ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     # The refusal line prints `$(spawn_gate_tok)`; give it the shipped function and real inputs so the
     # driven line carries a reading instead of an empty field (see the extraction above).
@@ -338,8 +349,9 @@ PY
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
     # …and the CI-queue predicate for the same reason as `drive()` above: the CONFLICTING arm now
     # calls `ciq_push_ok`, and an undefined command is `! 127` = TRUE = DEFER, which would make this
-    # rig unable to prove the conflict path ever dispatches.
-    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    # rig unable to prove the conflict path ever dispatches. It records its calls for the same reason
+    # as `drive()` above (#2927): the conflict arm must not consult it any more.
+    ciq_push_ok() { printf 'CALLED\n' >> "$TMP/ciqspy"; return "${CIQ_PUSH_RC:-0}"; }
     ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     . "$TMP/shq.sh"
     . "$TMP/spawntok.sh"
@@ -422,6 +434,82 @@ drive "" rail 0
   && ok "an EMPTY class (unreadable check read) also gets a named wait" \
   || bad "an empty class still falls through (waits=$(waits) spawns=$(spawns))"
 
+# ⛔ THE NAMED VERDICTS (agent-infra#2719). Before the arm, all four causes arrived as the ONE token
+# above and the only thing the cycle could print was "re-read next cycle". Each cause has its own
+# remedy, so each must reach its own row — and NOT ONE of them may spawn: an empty check surface is
+# never a green and never a reason to act on the code.
+for _nm in \
+  "NOCHECKS:READ-FAILED:transport: error connecting to api.github.com" \
+  "NOCHECKS:BUDGET:this box's share of the ACCOUNT's core budget is exhausted (fleet=4)" \
+  "NOCHECKS:WAIT:a run is executing and has produced no check-run yet (Python CI run 77 in_progress)" \
+  "NOCHECKS:DEFERRED-REPAIR:ci-check-repair (scheduled workflow) owns the re-trigger" \
+  "NOCHECKS:RUN-STARTED:a token the resolver never emits (a NEW token must still not spawn)"; do
+  drive "$_nm" rail 0
+  _k="${_nm%%:*}"; _r="$(reason)"
+  [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] \
+    && ok "${_nm%%:*}…: one wait row, NOTHING spawned (the cause is named, not acted on)" \
+    || bad "${_nm}: spawns=$(spawns) acts=$(acts) waits=$(waits)"
+  case "$_r" in *"${_nm#NOCHECKS:}"*) ok "…and the ledger row CARRIES the named cause" ;;
+    *) bad "the ledger row does not carry the cause: '$_r'" ;; esac
+  # ⛔ AND IT MUST HAVE REACHED THE NAMED ARM, NOT THE RESIDUAL `*)` CATCH-ALL (review P3,
+  # agent-infra#2719). Both arms write one `wait` row carrying `$V`, so every other assertion here
+  # passed with the `NOCHECKS:*` arm DELETED — measured. The residual arm's reason text is the
+  # distinguishing fact: it says "unreadable or empty", which is exactly the collapse this change
+  # removes.
+  case "$_r" in *"unreadable or empty"*) bad "'${_nm%%:*}' fell through to the residual catch-all: '$_r'" ;;
+    *) ok "…and it was the NAMED arm that handled it (not the residual catch-all)" ;; esac
+  [ ! -f "$TMP/O/state/parked-4242" ] \
+    && ok "…and a non-terminal cause never parks the head" \
+    || bad "'${_nm%%:*}' PARKED a head that a later cycle can still resolve"
+done
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234)" rail 0
+[ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] \
+  && ok "NOCHECKS:UNRESOLVABLE: one wait row and NOTHING spawned (a dead end is never a fix or a merge)" \
+  || bad "NOCHECKS:UNRESOLVABLE: spawns=$(spawns) acts=$(acts) waits=$(waits)"
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "…and it PARKS the head (no further cycle is spent on a named dead end)" \
+  || bad "the unresolvable verdict did not park the head ($(cat "$TMP/O/state/parked-4242" 2>/dev/null))"
+grep -q 'NOCHECKS-UNRESOLVABLE' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…with the verdict as the park REASON (so the next cycle reports why, not 'parked')" \
+  || bad "the park carries no reason ($(cat "$TMP/O/state/parkreason-4242" 2>/dev/null))"
+grep -q 'PARKED — NOCHECKS-UNRESOLVABLE' "$TMP/d.log" \
+  && ok "…and the log line says PARKED with the verdict" \
+  || bad "the log does not report the park"
+# ⛔ A VERDICT THAT NEVER REACHED THE PR MUST NOT PARK (agent-infra#2719 review P2): the arm never
+# re-enters a parked head, so a failed post would be retried never and the PR would be dead-ended with
+# no explanation anywhere a human looks.
+# the earlier drive PARKED this head, and `drive()` does not clear the park files (they are the very
+# state this assertion is about) — so clear them first or the assertion reads the previous drive's park.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234) [post=failed]" rail 0
+[ ! -f "$TMP/O/state/parked-4242" ] \
+  && ok "[post=failed]: the head is NOT parked (the verdict is retried instead of lost)" \
+  || bad "a verdict that could not be posted still parked the head"
+[ "$(waits)" = "1" ] && [ "$(spawns)" = "0" ] \
+  && ok "[post=failed]: still one wait row and nothing spawned" \
+  || bad "[post=failed]: waits=$(waits) spawns=$(spawns)"
+grep -q 'verdict could NOT be posted' "$TMP/d.log" \
+  && ok "…and the log NAMES the failed post" \
+  || bad "the log does not report the failed post"
+# …but a post that has now failed its bounded number of times IS parked, with the failure as the reason.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234) [post=failed-parked]" rail 0
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "[post=failed-parked]: the bounded-retry case DOES park (the token is not terminal for ever)" \
+  || bad "a post that exhausted its attempts was not parked — the retry would loop for ever"
+grep -q 'could not be posted' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…and the park reason records the post failure (a human can see why nothing was published)" \
+  || bad "the park reason does not record the post failure"
+# …and when the post bound itself cannot be COUNTED (state/ unwritable), it is named and parked.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head [post=failed-inert]" rail 0
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "[post=failed-inert]: an UNCOUNTABLE post bound parks too (a named dead end beats a comment loop)" \
+  || bad "an uncountable post bound was left retrying for ever"
+grep -q 'could not be counted' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…and the park reason says the bound was INERT" \
+  || bad "the park reason does not name the inert bound"
+
 echo
 echo "=== T1: a claim has a spawn behind it, and a failed spawn is never silent ==="
 clear_workers; drive GREEN rail 0 1
@@ -464,30 +552,6 @@ drive_conflict 0 0
 [ "$(acts)" = "0" ] && grep -qi 'fixer spawn FAILED' "$TMP/d.log" \
   && ok "CONFLICTING: a FAILED conflict-fixer spawn is a wait + a printed line (never a phantom act)" \
   || bad "CONFLICTING: a failed spawn recorded acts=$(acts) — the record claims work that did not happen"
-# ⛔ THE DEFERRAL ITSELF IS DRIVEN, NOT MERELY STUBBED (#2333 review cycle 2, P1). Without this arm
-# the new gate is exercised only by its own module suite, and the wiring's failure mode — a deferral
-# that spawns anyway, or one that is recorded as an ACT — would be invisible here.
-CIQ_PUSH_RC=1; drive_conflict 0; unset CIQ_PUSH_RC
-[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
-  && ok "CONFLICTING on a deep/unknown CI queue: NO spawn, ONE wait row, and the deferral is NAMED" \
-  || bad "CONFLICTING on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
-# ⛔ THE OTHER TWO PUSHERS' DEFER ARMS ARE DRIVEN TOO, NOT MERELY GREPPED (#2333 review, P2). The
-# review-gate fixer and the CI-red fixer each carry a defer arm of their own, and before these arms
-# they were pinned ONLY by text greps on the call site (`ci-queue.test.sh` e4b/e4c/e6) — so a defer
-# branch that ALSO SPAWNED (moving the `printf … > argv-$PR` / `wt_spawn` into the defer body) kept
-# every arm green while the gate silently stopped deferring on two of the four CI-spending surfaces.
-# That is exactly the class the CONFLICTED drive above was added for, one arm short.
-CIQ_PUSH_RC=1; drive 'FAILED:pipeline-compliance' rail 0 1; unset CIQ_PUSH_RC
-[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
-  && ok "CI-red fixer on a deep/unknown CI queue: NO spawn, a wait row, and the deferral is NAMED" \
-  || bad "CI-red fixer on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
-# The review-gate arm only reaches ITS defer branch for a PR with FINDINGS at this head (a head with
-# none is a re-record, which spends no CI), so the needsfix marker is supplied — otherwise this drive
-# would exercise the re-record path and prove nothing about the defer arm.
-NEEDSFIX=1; CIQ_PUSH_RC=1; drive 'FAILED:ai-review-gate' rail 0 1; unset NEEDSFIX CIQ_PUSH_RC
-[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
-  && ok "review-gate fixer on a deep/unknown CI queue: NO spawn, a wait row, and the deferral is NAMED" \
-  || bad "review-gate fixer on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
 drive GREEN rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO merge slot' "$TMP/d.log" \
   && ok "GREEN+rail at the merge-lane ceiling: refused and named" \
@@ -512,6 +576,41 @@ drive 'FAILED:docs-lint' rail 0 1
   && ok "a red that is not a required check: nothing spawned, but the PR is NAMED (no silent red)" \
   || bad "a non-required red is still unattributed (acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';'))"
 
+# ⛔ THE THREE DRIVES ABOVE SPAWN, SO THEY CONSUME THE SHARED `fixcount-4242` AND LEAVE A `fixspend`
+# RECORD BEHIND (the defer arms they replaced changed no state at all). Each one therefore starts from
+# a cleared counter: without it the third drive reads an exhausted attempt cap and parks instead of
+# spawning, which would make it assert the wrong branch. `mv`, never `rm` on a `$TMP/…` path (#709).
+t5_clear() {
+  for _f in fixcount-4242 fixspend-4242-abc1234 parked-4242 parkreason-4242 argv-4242; do
+    [ -e "$TMP/O/state/$_f" ] && mv "$TMP/O/state/$_f" "$TMP/state.spent.$_f.$RANDOM" 2>/dev/null
+  done
+  return 0
+}
+
+# ⛔ THE CI-QUEUE GATE IS GONE FROM ALL THREE FIXER ARMS, AND THESE DRIVE THAT (#2927). Until this
+# change each of them deferred on `ciq_push_ok`, so a deep queue stopped PR-REPAIR work: measured
+# 2026-10-27 on cell 4, 41 consecutive repair dispatches were skipped while 8 self-hosted runners and
+# ~11 lane slots sat idle. The predicate is stubbed to REFUSE (`CIQ_PUSH_RC=1`) *and* to record being
+# asked — so "the arm no longer consults the queue" is measured, not inferred from a missing log line.
+t5_clear; : > "$TMP/ciqspy"
+CIQ_PUSH_RC=1; drive_conflict 0; unset CIQ_PUSH_RC
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] && [ ! -s "$TMP/ciqspy" ] && ! grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "CONFLICTING with a REFUSING queue predicate: the fixer is spawned AND the predicate is never consulted" \
+  || bad "CONFLICTING still consults the queue: spawns=$(spawns) acts=$(acts) called=$([ -s "$TMP/ciqspy" ] && echo yes || echo no) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
+: > "$TMP/ciqspy"
+CIQ_PUSH_RC=1; drive 'FAILED:pipeline-compliance' rail 0 1; unset CIQ_PUSH_RC
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] && [ ! -s "$TMP/ciqspy" ] && ! grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "CI-red fixer with a REFUSING queue predicate: spawned, and the predicate is never consulted" \
+  || bad "CI-red fixer still consults the queue: spawns=$(spawns) acts=$(acts) called=$([ -s "$TMP/ciqspy" ] && echo yes || echo no)"
+# The review-gate arm only reaches ITS fixer branch for a PR with FINDINGS at this head (a head with
+# none is a re-record, which spends no CI), so the needsfix marker is supplied.
+t5_clear; : > "$TMP/ciqspy"
+NEEDSFIX=1; CIQ_PUSH_RC=1; drive 'FAILED:ai-review-gate' rail 0 1; unset NEEDSFIX CIQ_PUSH_RC
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] && [ ! -s "$TMP/ciqspy" ] && ! grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "review-gate fixer with a REFUSING queue predicate: spawned, and the predicate is never consulted" \
+  || bad "review-gate fixer still consults the queue: spawns=$(spawns) acts=$(acts) called=$([ -s "$TMP/ciqspy" ] && echo yes || echo no)"
+
+
 echo
 echo "=== T7: the review remedy is DISPATCHABLE, keyed on (PR, head), and BOUNDED (agent-infra#2653) ==="
 # ⛔ WHAT THIS SECTION IS FOR. The controller printed the correct remedy (`NEEDS-REVIEW — the remedy is
@@ -527,10 +626,12 @@ STORE="$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-4242.json"
 clear_revdisp() { mv "$REV_DISP" "$TMP/revdisp.spent.$RANDOM" 2>/dev/null || true; }
 clear_store()   { mv "$STORE" "$TMP/store.spent.$RANDOM" 2>/dev/null || true; }
 seed_revdisp()  { printf '%s %s\n' "$1" "$2" > "$REV_DISP"; }
-# ⛔ THE REVIEW-GATE ARM IS ONLY REACHED FOR A HEAD WITH NO FINDINGS (#2132). The T5 drives above leave
-# a `needsfix-4242-abc1234` marker behind (they need it to exercise the DEFER arm), and every drive
-# here shares ONE `$O/state`. Leaving it in place routes these drives into the FIXER arm and the whole
-# section would then grade a path it never reached — measured: (a) reported "spawns=1" for a fixer.
+# ⛔ THE REVIEW-GATE ARM IS ONLY REACHED FOR A HEAD WITH NO FINDINGS (#2132). The T5 drives above may
+# leave a `needsfix-4242-abc1234` marker behind (the review-gate arm there supplies one; since #2927 it
+# CONSUMES it by spawning rather than deferring, but the clearing must not depend on which branch T5
+# took), and every drive here shares ONE `$O/state`. Leaving it in place routes these drives into the
+# FIXER arm and the whole section would then grade a path it never reached — measured: (a) reported
+# "spawns=1" for a fixer.
 clear_needsfix() { mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.spent.$RANDOM" 2>/dev/null || true; }
 # ⛔ A DRIVE THAT SPAWNS LEAVES A WORKER RECORD, WHICH INFLATES THE NEXT DRIVE'S CENSUS (measured):
 # the `lanes-in-use` fixture says 9, and a leftover `worker-merge-4242` made the same assertion read
@@ -810,6 +911,13 @@ echo "=== T1b: a cycle that acted on nothing must SAY so (never 'dispatching') =
 # live-ownership.test.sh §8(d)-(f). Here we assert the orchestrator half: the ledger exists for the
 # PR, and the parent summariser turns it into words.
 sed -n '/# \[prdisp-apply:begin\]/,/# \[prdisp-apply:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/apply.sh"
+# ⛔ THE SHIPPED OWNERSHIP PREDICATE IS DRIVEN, NOT STUBBED (#2831, review P2). An earlier version of
+# T9 re-implemented the PRE-change guard in a stub, so the five arms were exercised against a
+# predicate that no longer ships: a shipped `pr_owner_live` that always returned 1 (the #2831 defect
+# itself) would have passed. This extraction is the real function from the loop, driven with the
+# fixture's own `sess`/`claim_live` answers.
+sed -n '/^pr_owner_live() {/,/^}/p' "$ORCH" > "$TMP/owner-live.sh"
+grep -q 'pl_verdict' "$TMP/owner-live.sh" || bad "the shipped pr_owner_live() could not be extracted — T9 would grade a stub"
 if [ -s "$TMP/apply.sh" ] && grep -q 'no per-PR read this cycle' "$TMP/apply.sh"; then
   # One counted PR the sweep never saw (a 304 / scope-filtered row) must still be NAMED.
   apply() { # apply <OPEN_ROWS> <SWEEP_LIST> [<row the SWEEP already wrote>]
@@ -915,6 +1023,63 @@ if [ -s "$TMP/sum.sh" ] && grep -q 'PR path:' "$TMP/sum.sh"; then
   grep -q 'NO UNIT SPAWNED this cycle — 1 row(s) with a named reason' "$TMP/s.log" \
     && ok "an idle cycle: NO UNIT SPAWNED, with the wait count and the dominant reason" \
     || bad "the idle summary does not name the state: $(cat "$TMP/s.log")"
+  # ⛔ THE DEFERRED MAJORITY MUST NOT ANSWER FOR THE SAMPLE (agent-infra#2933). MEASURED 2026-10-27 on
+  # the tortoise target: 26 PRs open, K=8 examined per cycle, and the line printed `most common: 15
+  # outside this cycle's sweep window`. That "reason" is computed across ALL rows, so it names a fact
+  # about the rows the sweep did NOT read — the deferred rows always outnumber the window, so the modal
+  # reason was always the deferral and the examined rows' own reasons were NEVER printed. An operator
+  # could not tell "everything examined is legitimately waiting" from "the rows the sweep read are being
+  # refused by something broken". Below, every examined row waits for a DIFFERENT reason: each of them
+  # must be printed, the deferred reason must appear nowhere as a reason, and the two counts must be
+  # separate clauses. The window is the shipped `SWEEP_WINDOW_PR`/`SWEEP_WIN_NOTE` shape, so this drives
+  # the SAME predicate the sweep uses to decide what it read (never a second, drifting definition).
+  _wdef="outside this cycle's sweep window (window=11-16 of 24 (K=6/cycle, rotating)); it is read within 4 cycles"
+  _wled="$(printf '11\tabc\tGREEN\twait\tcapacity: fix-lane ceiling 2 reached or the spawn gate refused\n12\tabc\tGREEN\twait\tcapacity: fix-lane ceiling 4 reached or the spawn gate refused\n13\tabc\tGREEN\twait\ta worker already owns this PR\n14\tabc\tGREEN\twait\tcheck surface in flight — nothing spawned\n15\tabc\tGREEN\twait\tcheck surface READ-FAILED:NOCHECKS — nothing spawned\n16\tabc\tGREEN\twait\tparked at this head — needs a human')"$'\n'
+  # ⛔ `$(printf …)` STRIPS THE TRAILING NEWLINE, so appending substitutions row by row would FUSE the
+  # deferred rows into a narrower ledger (measured while writing this: 24 rows became 6) and the test
+  # would then "prove" the sample/deferral split on a population that has no deferred rows at all.
+  for _i in 1 2 3 4 5 6 7 8 9 10 17 18 19 20 21 22 23 24; do
+    _wled="$_wled$(printf '%s\tabc\t-\twait\t%s' "$_i" "$_wdef")"$'\n'
+  done
+  # A SUBSHELL, so the window cannot leak into the cases above or below (they must keep driving the
+  # no-window and unwritable paths).
+  ( SWEEP_WINDOW_PR=" 11  12  13  14  15  16 "; SWEEP_WIN_NOTE="window=11-16 of 24 (K=6/cycle, rotating)"; \
+    SEL_N=24; SWEEP_ROWS_PER_CYCLE=6; summarise "$_wled" 1 open-rows 12 )
+  _wl="$(grep '^\[pr\] PR path' "$TMP/s.log" 2>/dev/null)"
+  case "$_wl" in
+    *"examined 6 (window 11-16 of 24 (K=6/cycle, rotating))"*"18 deferred or scope-excluded this cycle"*)
+      ok "a bounded sweep: the EXAMINED count and the deferred count are separate clauses (#2933)" ;;
+    *) bad "the summary did not separate the examined sample from the deferred rows: $_wl" ;;
+  esac
+  _wmiss=""
+  for _wlbl in "2 capacity: fix-lane ceiling N reached or the spawn gate refused" \
+               "1 a worker already owns this PR" "1 check surface in flight" \
+               "1 check surface READ-FAILED:NOCHECKS" "1 parked at this head"; do
+    case "$_wl" in *"$_wlbl"*) ;; *) _wmiss="$_wmiss [$_wlbl]" ;; esac
+  done
+  [ -z "$_wmiss" ] && ok "…EVERY examined row's own reason is printed, not the modal deferred one" \
+                   || bad "the summary hid examined reason(s):$_wmiss"
+  case "$_wl" in
+    *"most common"*|*"outside this cycle's sweep window"*)
+      bad "…the deferred rows' reason is still being reported as THE reason (#2933)" ;;
+    *) ok "…and no deferred row's reason is printed as a reason" ;;
+  esac
+  # ⛔ ONE LINE, AND `spawned=N` STILL NAMED — the contract the old line had, kept.
+  if [ "$(grep -c '^\[pr\] PR path' "$TMP/s.log" 2>/dev/null)" = "1" ]; then
+    case "$_wl" in *"spawned="*) ok "…still exactly ONE \[pr\] line per cycle, still naming spawned=N" ;;
+      *) bad "the [pr] line lost its spawned= clause: $_wl" ;; esac
+  else
+    bad "an idle cycle printed $(grep -c '^\[pr\] PR path' "$TMP/s.log" 2>/dev/null) [pr] lines, not one"
+  fi
+  # ⛔ AND A CYCLE WITH NO WINDOW AT ALL IS NOT "EXAMINED 0". When nothing was selected to read (a
+  # deferral, a failed listing, a cache-less 304) the only honest population IS every row — reporting
+  # "examined 0" there would hide the very reasons the line exists to print, and going silent is the
+  # defect this line already fixed once.
+  summarise "$(printf '11\tabc\t-\twait\tno per-PR read this cycle (the open-PR listing was unchanged — 304 — or unreadable)\n12\tabc\t-\twait\tno per-PR read this cycle (the open-PR listing was unchanged — 304 — or unreadable)\n')" 1 open-rows 23
+  grep -q 'NO SWEEP WINDOW this cycle' "$TMP/s.log" \
+    && grep -q '2 no per-PR read this cycle' "$TMP/s.log" \
+    && ok "no window at all: the reasons are for every row, never 'examined 0' and never silent" \
+    || bad "a window-less cycle did not report its rows' reasons: $(cat "$TMP/s.log")"
   # ⛔ THE FORWARD CLAIM (review P2): the old wording asserted "issues stay CLOSED" from a block that
   # cannot know — all-counted-parked legitimately opens the gate. It must not come back.
   grep -qi 'issues stay CLOSED' "$TMP/s.log" \
@@ -1338,6 +1503,26 @@ if [ -n "$_GATE_ON" ]; then
 else
   bad "the merge-priority gate did not fire on 1 un-owned PR — T8 cannot bind"
 fi
+
+echo
+echo "=== T9 (#2831): a PR a LIVE worker owns is never stolen, and the same arm still spawns when it is not ==="
+# ⛔ THE PAIR IS THE TEST. A one-sided assertion ("owned -> no spawn") passes on an arm that NEVER
+# spawns, and the real defect (#2831) was exactly that: 5 PRs reported "a worker already owns this PR"
+# with no workers alive, so nothing was ever taken. The contrast half — same arm, same fixture, owner
+# NOT live — must spawn, or the ownership guard is indistinguishable from an inert arm.
+OWN_LIVE=1 drive 'FAILED:pipeline-compliance' rail 0 1
+_owns_n="$(spawns)"; _owns_rows="$(rows)"; _owns_why="$(cat "$LEDGER" 2>/dev/null | awk -F'\t' '$4=="wait"{print $5}' | head -1)"
+[ "$_owns_n" = "0" ] && [ "$_owns_rows" -ge 1 ] \
+  && ok "a LIVE owner: 0 spawns, and the PR still carries a named wait ($_owns_rows row(s))" \
+  || bad "a live owner was not respected: spawns=$_owns_n rows=$_owns_rows"
+case "$_owns_why" in
+  *"already owns this PR"*) ok "…and the wait names OWNERSHIP, not capacity (so the reason a reader sees is the truth)" ;;
+  *) bad "…the wait reason is not ownership: '$_owns_why'" ;;
+esac
+OWN_LIVE=0 drive 'FAILED:pipeline-compliance' rail 0 1
+[ "$(spawns)" = "1" ] \
+  && ok "CONTRAST: with the owner NOT live the same arm spawns the fixer (so the guard above is not an inert arm)" \
+  || bad "CONTRAST half failed: the arm spawned nothing even with no owner (spawns=$(spawns)) — the ownership assertion above would be vacuous"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
