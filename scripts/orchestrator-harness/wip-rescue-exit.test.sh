@@ -292,10 +292,10 @@ O="$O" bash -c '
   cd "$2" || exit 2
   terminal_wip_rescue "forgot-wip-path" 0 0 "$3"
 ' _ "$GATE" "$FOREIGN" "$O/logs/foreign.log" 2>/dev/null
-awk -F'\t' '$2=="forgot-wip-path" && $9=="'"$FOREIGN"'" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcf7=$?
-ck "F7 a cwd that IS another checkout's root is recorded with THAT root in the row — the surface a wrong-tree archive is caught on" $rcf7
-grep -qF "at $FOREIGN" "$O/logs/foreign.log"; rcf8=$?
-ck "F8 …and the lane log names the measured tree too, so the wrong tree is never silent" $rcf8
+awk -F'\t' '$2=="forgot-wip-path" && $5=="unpushed-only" && $9=="'"$FOREIGN"'" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcf7=$?
+ck "F7 a cwd that IS another checkout's root is MEASURED (tree=unpushed-only) and recorded with THAT root in the row — the surface a wrong-tree archive is caught on" $rcf7
+grep -qF "at $FOREIGN" "$O/logs/foreign.log" && grep -q 'tree=unpushed-only' "$O/logs/foreign.log"; rcf8=$?
+ck "F8 …and the lane log names the MEASURED tree (not a refusal) too, so the wrong tree is never silent" $rcf8
 
 # ── H) WIP_PATH BEATS $PWD — the shape the PRODUCTION caller actually has ─────────────────────
 # `fix-one.sh` `cd`s into the MAIN checkout and only NAMES the fixer's worktree in the agent's prompt,
@@ -486,6 +486,41 @@ ck "J7 …and the rescue still never changes the lane's exit status (the functio
   $([ "$rcblind" -eq 0 ] && echo 0 || echo 1)
 rm -rf "$WT/hidden"
 
+echo
+# ── K) A PUSHED ARCHIVE WITH NO LOCAL PIN IS NOT "nothing" (review P2, round 5, PR #2975) ─────────
+# ⛔ `bg-rescue-wip.sh` writes `refs/wip-local/<slug>` under a GUARD (`:246-252` warns and carries on), and
+# then exits 0 once the PUSH succeeds (`:362-368`). So `rc2=0` + no new local ref has TWO causes, and the
+# caller used to record both as `rescue=nothing` — "nothing needed saving" — over work that IS on origin.
+# A D/F conflict is how that state is reached in one command: a ref named `refs/wip-local/<slug>/x` makes
+# `refs/wip-local/<slug>` unwritable, so the pin fails while the push does not.
+seed_sha="$(git -C "$WT" rev-parse HEAD)"
+# Arm I leaves `refs/wip-local/<slug>` itself behind, which would make the CHILD ref the D/F conflict. Clear
+# it first so the conflict is the one this arm needs: the pin unwritable, the push unaffected.
+git -C "$WT" update-ref -d "refs/wip-local/$SLUG" 2>/dev/null
+git -C "$WT" update-ref "refs/wip-local/$SLUG/dfblock" "$seed_sha" 2>/dev/null; rcdf=$?
+ck "K0 the fixture really made refs/wip-local/$SLUG unwritable (a D/F conflict: a child ref exists under it)" $rcdf
+# ⛔ `pi_stub` only INSTALLS the stub; it RUNS inside `run_agent`. This arm drives `terminal_wip_rescue`
+# directly, so it creates the dirty file itself — the same way arms E/F/G do.
+printf 'the work a lane leaves behind\n' > "$WT/early.txt"
+: > "$O/logs/df.log"
+O="$O" WIP_PATH="$WT" bash -c '
+  . "$1"
+  terminal_wip_rescue "df-conflict" 0 0 "$2"
+' _ "$GATE" "$O/logs/df.log" 2>/dev/null; rcdf2=$?
+gotdf="$(git -C "$BARE" show "refs/wip/$SLUG:early.txt" 2>/dev/null)"
+ck "K1 the push DID succeed, so origin really holds the work ('$gotdf')" \
+  $([ "$gotdf" = "the work a lane leaves behind" ] && echo 0 || echo 1)
+awk -F'\t' '$2=="df-conflict" && $5=="dirty" && $6=="refs/wip/'"$SLUG"'" && $7=="" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rck2=$?
+ck "K2 an exit-0 rescue that pushed but could not write its local pin is recorded as rescue=refs/wip/<slug> with an EMPTY ref — NOT rescue=nothing" $rck2
+grep -q 'rescue=nothing' "$O/logs/df.log"; rck3=$?
+ck "K3 …and nothing in that transition says 'nothing' — the archive on origin is not reported as unsaved work" \
+  $([ "$rck3" -ne 0 ] && echo 0 || echo 1)
+grep -q 'could not write its LOCAL pin' "$O/logs/df.log"; rck4=$?
+ck "K4 …and a loud line names the empty ref column over an archive that EXISTS, so it is not read as 'nothing archived'" $rck4
+ck "K5 …and the rescue still never changes the lane's exit status (the function returned $rcdf2)" \
+  $([ "$rcdf2" -eq 0 ] && echo 0 || echo 1)
+git -C "$WT" update-ref -d "refs/wip-local/$SLUG/dfblock" 2>/dev/null
+rm -f "$WT/early.txt"
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
