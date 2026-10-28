@@ -137,15 +137,22 @@ if [ -z "$bg_lib" ]; then
 fi
 # ⛔ THE NAMING LINE GOES FIRST, ON THE OUTSIDE OF THE GATE'S OWN OUTPUT (#2708 review, P2 —
 # reproduced). The gate prints a ~3.5 KB teaching block on refusal, and `pr-doctor` logs only SLICES
-# of the captured stderr: `detail[:200]` on its FAIL line (`scripts/pr-doctor.py:3768`) and
-# `detail[:160]` on the pass line (`:5090`). With the path APPENDED after that block it lands at byte
-# ~3290 of ~3655 — measured on the fixture in `test_pr_doctor.py`, `'brief-gate.sh' in detail[:160]`
-# was False and `in detail[:200]` was False — so the operator who reads the doctor's log still could
-# not tell which copy refused, i.e. case 3's 6 h 32 m "which copy?" hunt was narrowed but not closed.
+# of the captured stderr: `detail[:200]` on its FAIL line (`scripts/pr-doctor.py:3771`) and
+# `detail[:160]` on its NOT-DISPATCHED line (`:5093`; `:5090` is the REFUSED-and-RECORDED line, which
+# rc=80 never reaches). With the path APPENDED after that block it lands at byte ~3290 of ~3655 —
+# measured on the fixture in `test_pr_doctor.py`, `'brief-gate.sh' in detail[:160]` was False and
+# `in detail[:200]` was False — so the operator who reads the doctor's log still could not tell which
+# copy refused, i.e. case 3's 6 h 32 m "which copy?" hunt was narrowed but not closed.
 # The gate's output is therefore CAPTURED and re-emitted AFTER the naming line, and the path is placed
-# at ~char 46 of that line (`brief-gate=<path>`) rather than after a 90-char preamble, so it survives
-# even the 160-char slice on the pass line. The canonical section still reaches the reader verbatim. On
-# success the gate prints nothing, so the capture is invisible on the normal path.
+# at char 53 of `detail` (`rc=80: ` + `brief-gate=`) rather than after a 90-char preamble, so it sits
+# at ~char 46 of this line — the whole path fits the 160-char slice whenever the resolved path is
+# ≤ 107 chars, which every production `$O` is (`~/.pi/agent/scripts/brief-gate.sh` is 34). ⚠️ The
+# bound is the ORDERING plus that length; a box whose resolved path is longer than ~107 chars shows a
+# truncated tail, not a missing name (#2986 review, P1: the first form of the arm asserted the pytest
+# fixture's 141-char macOS temp path against 160, so it graded the box's `$TMPDIR` and was red on
+# every macOS box while green on ubuntu-latest).
+# The canonical section still reaches the reader verbatim. On success the gate prints nothing, so the
+# capture is invisible on the normal path.
 if ! brief_out="$(bash "$bg_lib" --check "$PROMPT" worker 2>&1)"; then
   echo "nonblocking-dispatch.sh: REFUSED — brief-gate=$bg_lib judged the brief at $PROMPT and refused it (agent-infra#2258). NOTHING WAS STARTED: no worker, no session, no model call. The [brief-gate] block BELOW names every missing element and prints the canonical section." >&2
   printf '%s\n' "$brief_out" >&2

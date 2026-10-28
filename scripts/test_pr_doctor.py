@@ -6796,17 +6796,43 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
 
     # ⛔ AND IT MUST SURVIVE THE CUT THE OPERATOR ACTUALLY READS (#2708 review, P2 — reproduced).
     # Naming the copy in a string no reader renders is the same defect one layer down. `pr-doctor`
-    # logs SLICES of this stderr -- `detail[:200]` on the FAIL line (`scripts/pr-doctor.py:3768`) and
-    # `detail[:160]` on the pass line (`:5090`, the rc=80 path, which writes no state row) -- and the
-    # gate's own teaching block is ~3.3 KB. Measured BEFORE the reorder that follows from this arm:
-    # the path sat at byte ~3290 of a ~3655-byte capture, so `in detail[:160]` was **False** and the
-    # operator still could not tell which copy refused. The dispatcher therefore emits the naming
-    # line FIRST and re-emits the block after it; this assertion grades the rendered line, not the
-    # buffer it was cut from.
-    # The SMALLEST slice either line applies is 160 chars (`detail[:160]` on the pass line), so that
-    # is the bound this asserts -- asserted on `detail` rather than on a logged line because a log
-    # line carries a prefix whose length depends on the worktree path, i.e. on the box.
-    assert str(d / "brief-gate.sh") in detail[:160], (
-        "the copy that judged the brief is outside the 160-char slice pr-doctor renders, so the "
-        "operator is still sent to the copy they just fixed. detail[:200]=%r" % (detail[:200],))
+    # logs SLICES of this stderr -- `detail[:200]` on the FAIL line (`scripts/pr-doctor.py:3771`) and
+    # `detail[:160]` on the NOT-DISPATCHED line (`:5093`, the rc=80 path, which writes no state row;
+    # `:5090` is the REFUSED-and-RECORDED line, which rc=80 never takes) -- and the gate's own
+    # teaching block is ~3.3 KB. Measured BEFORE the reorder that follows from this arm: the path sat
+    # at byte ~3290 of a ~3655-byte capture, so `in detail[:160]` was **False** and the operator still
+    # could not tell which copy refused. The dispatcher therefore emits the naming line FIRST and
+    # re-emits the block after it.
+    #
+    # ⛔ THE PROPERTY IS THE ORDERING, NOT THE END OF THE PATH (#2986 review, P1 -- MEASURED RED on
+    # macOS). The earlier form of this arm read `str(d / "brief-gate.sh") in detail[:160]`, and
+    # `str(d / "brief-gate.sh")` here is a PYTEST TEMP PATH: with this fleet's own
+    # `TMPDIR=/var/folders/...` it is ~141 chars, so the path ends at char ~194 and the arm failed on
+    # every macOS box while passing on `ubuntu-latest` (whose temp root is shorter) -- a verdict
+    # decided by the box's `$TMPDIR` grades the box, not the ordering. So the ordering is asserted at
+    # its EXACT OFFSET (box-independent), and the 160-char property is asserted separately against a
+    # PRODUCTION-LENGTH `$O` (~27 chars; a real box resolves `~/.pi/agent/scripts/brief-gate.sh`, 34)
+    # in the block after it.
+    path = str(d / "brief-gate.sh")
+    prefix = "rc=80: nonblocking-dispatch.sh: REFUSED — brief-gate="
+    assert detail.splitlines()[0].startswith(prefix + path), (
+        "the naming line did not LEAD with brief-gate=<resolved path> at char %d, so the path is "
+        "still behind the gate's teaching block: %r" % (len(prefix), detail[:200]))
+
+    # ── AND THE 160-CHAR SLICE IS REAL FOR A PATH THE SIZE OF A PRODUCTION `$O` ────────────────
+    # `/tmp/oXXXXXX` rather than `tmp_path`: on macOS `tmp_path` nests under /private/var/folders and
+    # no preamble short enough to name the copy would rescue a 141-char path.
+    short = pathlib.Path(tempfile.mkdtemp(dir="/tmp", prefix="o"))
+    try:
+        for f in ("brief-gate.sh", "spawn-gate.sh"):
+            shutil.copy(str(d / f), str(short / f))
+        monkeypatch.setattr(pr, "ORCH_DIR", str(short))
+        monkeypatch.setenv("O", str(short))
+        ok_s, detail_s, record_s = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+        assert (ok_s, record_s) == (False, False), (ok_s, detail_s, record_s)
+        assert str(short / "brief-gate.sh") in detail_s[:160], (
+            "a production-length `$O` does not fit the 160-char slice pr-doctor renders, so the "
+            "operator is still sent to the copy they just fixed. detail[:200]=%r" % (detail_s[:200],))
+    finally:
+        shutil.rmtree(str(short), ignore_errors=True)
     assert logged, "the refusal produced no log line at all"
