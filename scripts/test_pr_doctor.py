@@ -5699,6 +5699,48 @@ def test_the_checkout_boundary_is_a_PATH_SEGMENT_not_a_STRING_PREFIX(monkeypatch
         "an unconfigured root is absent evidence, and absent evidence must PROBE"
 
 
+def test_a_started_record_with_NO_worktree_line_probes_rather_than_narrows(tmp_path, monkeypatch):
+    """⛔ THE EMPTY-`worktree` ARM, AND THE RECORD THAT HAS A FILE BUT NO FIELD (#2725 cycle 3).
+
+    `_started_worktree()` answers "" for TWO different situations, and both must reach the PROBE
+    branch of `_in_this_checkout()` (`if not worktree ...: return True`):
+
+      * there is no `.started` file at all (pruned, or a superseded order), and
+      * there IS a file but it carries no `worktree=` line -- which `nonblocking-dispatch.sh` only
+        writes on ACCEPT, so a partial or hand-written record is realistic, and a record written by
+        an older dispatcher need not have the field.
+
+    Neither is evidence that the worker is foreign. Narrowing on a MISSING field would read a live
+    worker as somebody else's and let the pass adopt its worktree -- `rm -f "$RC"`, `: > "$LOG"`
+    under a running agent. `_in_this_checkout("")` is asserted DIRECTLY here, because it was
+    previously only reached indirectly through a dispatch-level test.
+
+    ⛔ WHICH GUARD DECIDES IT, MEASURED (do not claim a mutation this cannot produce). Removing the
+    `not worktree` disjunct ALONE does NOT redden this test, and cannot: `_rp("")` returns "" and the
+    next guard (`if not root or not wt`) answers True for it. So that disjunct is a cheap early-out
+    -- it saves two `realpath` calls and states the intent -- and the DECISION belongs to the
+    `not wt` guard. Removing THAT one reddens this test (`_in_this_checkout('') is False`), and it
+    reddens the poisoned-record test too. The behaviour is what is pinned here; the disjunct is
+    defence in depth, and its redundancy is deliberate rather than an untested path.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    # the branch itself, directly
+    assert pr._in_this_checkout("") is True, "an absent worktree is absent evidence: probe, never narrow"
+
+    # and through the shipped reader: a `.started` file with metadata but NO `worktree=` line
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nbranch=fix/x\nkind=prfix\n")
+    assert pr._started_worktree("prd-42") == "", "the fixture must actually lack the field"
+    assert pr.worker_live_for(42) is True, asked
+    assert "prd-42" in asked, "a field-less record narrowed the attribution: %r" % (asked,)
+    pr.canonical_paths()
+
+
 def test_a_row_written_before_the_rename_still_holds_and_frees_its_slot(tmp_path, monkeypatch):
     """⛔ IN-FLIGHT ROWS SURVIVE THE RENAME (#2725), both directions.
 
