@@ -865,12 +865,24 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
       # ⛔ A STALE VERDICT IS NOT `ok` (2026-10-18, review). The whole point of reading a record is
       # to notice when nothing is writing it; printing `ok` from a week-old file reproduces exactly
       # the failure this block was added to end. Bound = two 1200s dispatch intervals.
+      # ⛔ AND THE STALE ARM OUTRANKS EVERY RC ARM (review P1, #2291). The rc arms used to be tested
+      # FIRST, so the stale branch was unreachable for ANY non-zero rc -- pre-existing, but #2291 is
+      # what made it reachable with a BENIGN token: a `6` whose `at_epoch` was six hours old printed
+      # `PR-DOCTOR WAITING (no capacity) rc=6 (21600s ago)`, i.e. "the box has no room, wait" for a
+      # dispatcher that had written NO verdict at all in six hours. `objective.pr_doctor_last_run()`
+      # deliberately orders it the other way (`age > 2400` -> UNREPORTED, BEFORE `waiting`), so the
+      # two readers of one record disagreed about the same file on the one screen an operator reads.
+      # A stale record is UNREPORTED whatever it says, so the age test comes first here too.
+      if [ "${_page:-0}" -gt 2400 ]; then
+        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) rc=%s :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_page" "${_prc:-?}" "$_pwhy" >> "$LOG"
       # ⛔ AND "NO CAPACITY" IS NEITHER `ok` NOR RED (#2291). `pr-doctor` exits 6 when the box's own
       # spawn gate refused every order: nothing was consumed and (for load) it clears by itself. The
       # heartbeat printed that as `PR-DOCTOR RED rc=6`, i.e. the same line a broken dispatcher
       # produces — so the one screen an operator reads could not tell "wait" from "repair". It gets
       # its own token, and it is never `ok`: the queue is not moving while the box has no room.
-      if [ "${_prc:-0}" -eq 6 ]; then
+      # (Reached only when the record is FRESH — see the age arm above.)
+      elif [ "${_prc:-0}" -eq 6 ]; then
         printf '%s PR-DOCTOR WAITING (no capacity) rc=%s (%ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
       elif [ "${_prc:-0}" -ne 0 ]; then
@@ -879,9 +891,6 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
       elif [ "${_pdry:-0}" = "1" ]; then
         printf '%s PR-DOCTOR DRY RUN (not a pass verdict, %ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"
-      elif [ "${_page:-0}" -gt 2400 ]; then
-        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) :: %s\n' \
-          "$(date '+%m-%d %H:%M:%S')" "$_page" "$_pwhy" >> "$LOG"
       else
         printf '%s PR-DOCTOR ok rc=0 (%ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"

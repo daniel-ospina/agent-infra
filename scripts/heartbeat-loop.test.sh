@@ -717,6 +717,41 @@ else
   fail "14e. a crashing scheduled job no longer reads RED — the WAITING arm swallowed every exit"
 fi
 
+# ⛔ A STALE RECORD IS UNREPORTED BEFORE IT IS ANYTHING ELSE (review P1, #2291). The rc arms were
+# tested BEFORE the age arm, so a `6` written six hours ago printed
+# `PR-DOCTOR WAITING (no capacity) rc=6 (21600s ago)` -- "the box has no room, wait" -- for a
+# dispatcher that had written NO verdict at all since. `objective.pr_doctor_last_run()` deliberately
+# orders it the other way (`age > 2400` -> UNREPORTED, before `waiting`), so the two readers of ONE
+# record disagreed about the same file, on the one screen an operator reads.
+FIX14F="$(mkfix stale-no-capacity 0)"; LOG14F="$(logof "$FIX14F")"
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "reason": "VERDICT=NO-CAPACITY bound=load=1", "at_epoch": %s}\n' \
+  "$(( $(date +%s) - 21600 ))" > "$FIX14F/agent/state/pr-doctor.status.json"
+run_pass "$FIX14F"
+TXT14F="$(cat "$LOG14F" 2>/dev/null)"
+if has "$TXT14F" "PR-DOCTOR RED UNREPORTED (verdict is STALE"; then
+  pass "14f. a SIX-HOUR-OLD rc=6 reads UNREPORTED — a stale verdict is never 'wait'"
+else
+  fail "14f. a stale rc=6 was not reported as UNREPORTED (got: $(grep -m1 'PR-DOCTOR' "$LOG14F" 2>/dev/null | cut -c1-140))"
+fi
+if has "$TXT14F" "WAITING (no capacity)"; then
+  fail "14f. a six-hour-old rc=6 still printed WAITING — nothing has written the record for six hours, so 'wait' answers a question nobody asked"
+else
+  pass "14f. …and it does NOT claim WAITING"
+fi
+# CONTROL: staleness outranks every rc arm, which is the SAME order `objective.pr_doctor_last_run()`
+# uses. A FRESH rc=3 is still RED (14's control above), so this narrows staleness rather than
+# swallowing failures.
+FIX14G="$(mkfix stale-transport 0)"; LOG14G="$(logof "$FIX14G")"
+printf '{"rc": 3, "verdict": "UNDELIVERED", "reason": "VERDICT=UNDELIVERED", "at_epoch": %s}\n' \
+  "$(( $(date +%s) - 21600 ))" > "$FIX14G/agent/state/pr-doctor.status.json"
+run_pass "$FIX14G"
+TXT14G="$(cat "$LOG14G" 2>/dev/null)"
+if has "$TXT14G" "PR-DOCTOR RED UNREPORTED (verdict is STALE"; then
+  pass "14g. …and a stale rc=3 is UNREPORTED too (one ordering, matching objective.py)"
+else
+  fail "14g. a stale rc=3 was not reported as UNREPORTED (got: $(grep -m1 'PR-DOCTOR' "$LOG14G" 2>/dev/null | cut -c1-140))"
+fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0
