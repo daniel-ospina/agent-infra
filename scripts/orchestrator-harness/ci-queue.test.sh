@@ -1255,10 +1255,20 @@ fi
 # editor acts on (#2969 review cycle 2, P2): calling all three "the if/then shape" told a reader that
 # only `$(if … then case …)` is caught, when the missed class also includes the `$(cmd; case …)`
 # spelling they would think safe to keep.
-# ⛔ DECLARED LIMITS, not silently assumed: this skips FULL-LINE comments (prose here discusses `case`
-# and `$( )`, and flagging prose would be a false positive) and it SKIPS SINGLE-QUOTED SPANS, because
+# ⛔ DECLARED LIMITS, not silently assumed: it skips FULL-LINE comments (prose here discusses `case`
+# and `$( )`, and flagging prose would be a false positive) and it skips SINGLE-QUOTED SPANS, because
 # bash substitutes nothing there — a `$( )` in them can never be a substitution, and a `)` in them can
 # never close one.
+# ⛔ THE SKIP IS CONTEXT-AWARE, AND THAT IS NOT COSMETIC (#2969 review cycle 5, P2). bash reads a `'`
+# inside `"…"` as LITERAL TEXT, so a scanner that opened a single-quoted span at EVERY `'` swallowed
+# the rest of the line. Measured on the cycle-4 detector —
+#   x="$( printf "don't" ; case "$s" in a) : ;; esac )"
+# printed NOTHING, while the identical line without the apostrophe reported :1; the same bytes are a
+# genuine #2969-class defect on bash 3.2 (`syntax error near unexpected token 'newline'`), so (p1)
+# certified a broken module. `indq` (`"…"`) and `esc` (`\`) are tracked so `inq` opens only at a REAL
+# delimiter — and `$( )`/`case` inside `"…"` are still counted, because bash DOES substitute there.
+# Both flags are per-line, and an embedded `awk '…'`/heredoc body is still scanned as shell: that
+# over-reports (red, fail-closed) rather than claiming a skip it cannot see.
 # ⛔ THAT SECOND SKIP IS NOT COSMETIC — ITS ABSENCE WAS A FALSE PASS (#2969 review cycle 4, P2). The
 # earlier comment claimed "an unbalanced `)` inside a string … Neither shape exists in this module".
 # Measured: it does, three times. ci-queue.sh's multi-line reads close their `$( )` on a LATER line,
@@ -1271,14 +1281,17 @@ fi
 # `ciq_gh`'s answer is post-processed — was therefore INVISIBLE: measured, a module with that `case`
 # reported `(p1) … (none)` and the whole suite went CLEAN at 133/0, while the same bytes on bash 3.2
 # printed `syntax error near unexpected token 'newline'` and reddened 34 arms.
-# ⛔ REMAINING LIMIT, stated because it is still real: DOUBLE-quoted spans are NOT lexed. A literal
-# `$(` inside one is counted as a substitution (over-report → the arm reds, fail-closed), and a `)`
-# inside one can decrement depth early (under-report). Neither exists in this module today; the
-# single-quoted case is now handled, which is where every BRE in this file lives.
+# ⛔ REMAINING LIMIT, stated because it is still real: a `)` that is literal TEXT inside `"…"` at
+# the level it closes is not distinguished from a substitution close, so it decrements depth early
+# (under-report, fail-open), and the reverse — a literal `$(` inside `"…"` — is counted as a
+# substitution, which over-reports and reds (fail-closed). The quote state is also PER LINE and reset
+# on every `$( )` boundary, so a `'` opened on one line is not carried into the next. None of these
+# shapes exists in this module today; the single-quoted case is handled, which is where every BRE in
+# this file lives.
 cis_in_comsub() {
-  local f="$1" n=0 depth=0 line i len ch prev nxt first found inq
+  local f="$1" n=0 depth=0 line i len ch prev nxt first found inq indq esc
   while IFS= read -r line; do
-    n=$((n + 1)); found=0; inq=0
+    n=$((n + 1)); found=0; inq=0; indq=0; esc=0
     first="${line#"${line%%[![:space:]]*}"}"
     case "$first" in '#'*) continue ;; esac
     len=${#line}; i=0
@@ -1290,16 +1303,37 @@ cis_in_comsub() {
         [ "$ch" = "'" ] && inq=0
         i=$((i + 1)); continue
       fi
+      # A backslash escapes the NEXT character. Inside `"…"` that is what stops `\"` from closing
+      # the span; outside any quote it is what stops `\$( ` from opening a substitution.
+      if [ "$esc" -eq 1 ]; then esc=0; i=$((i + 1)); continue; fi
       case "$ch" in
+        '\\')
+          esc=1
+          ;;
+        '"')
+          if [ "$indq" -eq 1 ]; then indq=0; else indq=1; fi
+          ;;
         "'")
-          inq=1
+          # ⛔ ONLY A REAL DELIMITER OPENS A SPAN. Inside `"…"` an apostrophe is literal text, so
+          # opening a span here would swallow the rest of the line and hide a real `case` (#2969
+          # review cycle 5, P2) — the fail-open direction this whole arm exists to close.
+          [ "$indq" -eq 1 ] || inq=1
           ;;
         '$')
           nxt="${line:$((i + 1)):1}"
-          if [ "$nxt" = '(' ]; then depth=$((depth + 1)); i=$((i + 2)); continue; fi
+          if [ "$nxt" = '(' ]; then
+            depth=$((depth + 1))
+            # ⛔ QUOTING RESTARTS INSIDE A SUBSTITUTION. bash parses `$( … )` as a FRESH shell
+            # context, so `x="$( printf "don't" … )"` is not one long double-quoted span: the
+            # outer `"` is suspended for the length of the substitution and the inner quotes belong
+            # to it. Carrying the outer state in would swallow the inner `'` and hide a real `case`
+            # (measured, #2969 review cycle 5, P2).
+            indq=0; esc=0
+            i=$((i + 2)); continue
+          fi
           ;;
         ')')
-          [ "$depth" -gt 0 ] && depth=$((depth - 1))
+          if [ "$depth" -gt 0 ]; then depth=$((depth - 1)); indq=0; esc=0; fi
           ;;
         'c')
           if [ "$depth" -gt 0 ] && [ "${line:$i:4}" = case ]; then
@@ -1319,6 +1353,27 @@ cis_in_comsub() {
 hits="$(cis_in_comsub "$MOD")"
 ck "(p1) the module carries NO \`case\` inside a \`\$( )\` (${hits:-none}) — the shape bash 3.2 re-parses at execution" \
    "$( [ -z "$hits" ]; echo $? )"
+
+# ⛔ THE APOSTROPHE-IN-A-DOUBLE-QUOTED-STRING SHAPE (#2969 review cycle 5, P2), and it is a PAIR so
+# the arm cannot pass on the fixture rather than on the quote state: the first line carries a real
+# `case` inside `$( )` AND an apostrophe in a `"…"` span (bash reads it as literal, so the `case`
+# really is substituted and really does break 3.2); its twin is the same bytes WITHOUT the apostrophe,
+# which the pre-fix scanner also reported — so a difference between them is the quote state alone.
+# The third is the TRUE NEGATIVE: a `case` in a genuinely single-quoted span is never substituted, so
+# reporting it would red the arm on a module that is fine, and the skip must not be over-applied.
+cqf="$T/comsub-quotes"; mkdir -p "$cqf"
+printf '%s\n' 'x="$( printf "don'\''t" ; case "$s" in a) : ;; esac )"' > "$cqf/apostrophe.sh"
+printf '%s\n' 'x="$( printf "dont" ; case "$s" in a) : ;; esac )"' > "$cqf/control.sh"
+printf '%s\n' 'x='\''$( case "$s" in a) : ;; esac )'\''' > "$cqf/single.sh"
+dqh="$(cis_in_comsub "$cqf/apostrophe.sh")"
+cth="$(cis_in_comsub "$cqf/control.sh")"
+sqh="$(cis_in_comsub "$cqf/single.sh")"
+ck "(p1a) a real \`case\` inside \`\$( )\` AFTER an apostrophe inside a \"…\" span IS reported (${dqh:-<missed>}) — that apostrophe is literal text to bash, so the code after it still runs" \
+   "$( [ -n "$dqh" ]; echo $? )"
+ck "(p1b) control: the SAME line without the apostrophe is reported too (${cth:-<missed>}) — so (p1a) measures the quote state, not the fixture" \
+   "$( [ -n "$cth" ]; echo $? )"
+ck "(p1c) a \`case\` inside a genuinely SINGLE-QUOTED span is NOT reported (${sqh:-none}) — the skip is still applied where bash really substitutes nothing" \
+   "$( [ -z "$sqh" ]; echo $? )"
 
 # ⛔ MUTANT: reinstate the CONSTRUCT by DERIVING it from the module's own hoisted block — the
 # patterns and the values are READ OUT of the module, not restated here, so the control cannot drift
