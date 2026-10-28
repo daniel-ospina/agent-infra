@@ -218,8 +218,10 @@ NEXT_ACTION_BY_RC = {
     EXIT_REFUSING: "repair the read/delivery named in `reason` -- nothing was dispatched",
     EXIT_UNDELIVERED: "repair the transport named in `reason` (the install, the worktree, or the "
                       "worker liveness read) -- waiting will not clear it",
-    EXIT_NO_CAPACITY: "the box's own gate refused the order; `no_room_bound` in this record names "
-                      "its axis, and its remedy is the one `pr-doctor --status` prints",
+    EXIT_NO_CAPACITY: "the box's own gate refused the order and nothing was consumed; the AXIS "
+                      "names the remedy -- load/land-backlog clear by themselves, disk needs a "
+                      "reclaim, fork needs a restart from outside (`no_room_bound`, where the record "
+                      "carries one, is that axis)",
     EXIT_CRASH: "read `reason` for the traceback -- the pass did not complete",
     EXIT_USAGE: "fix the command line -- nothing was attempted",
 }
@@ -1172,25 +1174,34 @@ CONFIRM_WINDOW_S = 1.0
 # `7` is not a refusal code, so dispatch() recorded as launched a spawn the gate had REFUSED.
 # Require the trailing newline, so a partial write is never a verdict.
 _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
-# ⛔ EVERY CODE `run_agent` CAN WRITE INTO A BACKGROUNDED WORKER'S `.rc` AS A REFUSAL, and nothing
-# else. This tuple answers ONE question -- "did the gate consume this order?" -- so its membership is
-# decided by that question and not by "is it about capacity": a fork refusal consumed nothing too, and
-# leaving 73 out made it read as a DISPATCH (agent-infra#2291 review, P1: a box out of processes
-# reported `dispatched += 1` and the pass exited CLEAN with nothing running).
-# ⛔ 80 (AGENT_BRIEF_REFUSED) IS DELIBERATELY ABSENT and `dispatch()` says why at the spawn: it comes
-# back on the FOREGROUND call for pr-doctor's own brief, so no worker ever exists to have an `.rc`.
-# 76 (PI_GATE_REFUSED) is translated into 75 inside `run_agent` before any caller sees it, and 78
-# (BRIEF_GATE_UNAVAILABLE / the spawn point's fork code) is a TRANSPORT fact -- a missing
-# spawn-gate.sh is exactly the failure the no-room split exists to keep OUT of this tuple.
-GATE_REFUSALS = (75, 77, 74, 73)
+# ⛔ EVERY CODE AN AGENT-FACING GATE CAN WRITE INTO A BACKGROUNDED WORKER'S `.rc` AS A REFUSAL.
+# This tuple answers ONE question -- "did the gate consume this order?" -- so its membership is decided
+# by that question and not by "is it about capacity": a fork refusal consumed nothing too, and leaving
+# 73 out made it read as a DISPATCH (agent-infra#2291 review, P1: a box out of processes reported
+# `dispatched += 1` and the pass exited CLEAN with nothing running).
+# ⛔ 80 (AGENT_BRIEF_REFUSED) IS ON THIS TUPLE AND IS **NOT** ON THE AXIS MAP, and that pair is the
+# point: `run_agent` runs `brief_gate_run` INSIDE the backgrounded worker too (`spawn-gate.sh`'s gate
+# seam, which writes `[brief-gate] REFUSED` to `$log` and returns the brief gate's code), and
+# `nonblocking-dispatch.sh` writes that status into `.rc` -- so a disagreement between the foreground
+# check and the in-worker one is a `.rc` of 80 with the brief gate's own line, and an earlier version
+# of this comment claimed "no worker ever exists to have an `.rc`", which is false of that arm. With
+# 80 on the tuple that case is a REFUSAL (not recorded, not a false PASS); with NO entry in
+# `GATE_REFUSAL_BOUND` it is counted as UNDELIVERED work (rc 3, repair the brief) rather than as
+# `NO-CAPACITY` (rc 6, wait) -- because a brief refusal is a property of the BRIEF that no amount of
+# waiting or disk reclaiming will fix, and the gate says so in as many words.
+# ⛔ 76 (PI_GATE_REFUSED) and 78 (PI_FORK_REFUSED) are NOT here: `run_agent` translates both into the
+# first gate's code before any caller sees them, so no caller can be handed one.
+GATE_REFUSALS = (75, 77, 74, 73, 80)
 # ⛔ THE GATE'S OWN BOUND, BY ITS OWN CODE (agent-infra#2291). `spawn-gate.sh` refuses on ONE measured
 # bound per spawn and names it in the code it writes, so the axis is READ (`dispatch()` carries it out)
 # rather than re-derived here from load/disk thresholds -- a second set of thresholds in this file would
 # be a second instrument, and the two would eventually disagree about the same box (this file's own
 # rule: exactly one authority per fact). The literals are `spawn-gate.sh`'s exits, and
-# `test_the_gate_axis_table_is_the_GATES_own_numbers` ENUMERATES them from that script (minus a
-# declared, reasoned exclusion set) so a new gate code reddens the suite instead of silently losing its
-# axis -- which is how 73 stayed invisible while the comment here claimed the table was complete.
+# `test_the_gate_axis_table_is_the_GATES_own_numbers` ENUMERATES that script's numeric constants (minus
+# a declared, reasoned exclusion set) so a new gate code reddens the suite instead of silently losing
+# its axis -- which is how 73 stayed invisible while the comment here claimed the table was complete.
+# ⛔ THIS MAP IS A SUBSET OF `GATE_REFUSALS`, NOT ALL OF IT: a refusal with no capacity bound (80, the
+# brief gate) belongs on the tuple above and nowhere here.
 GATE_REFUSAL_BOUND = {75: "load", 77: "disk", 74: "land-backlog", 73: "fork"}
 # What to DO about each bound. The axis decides the operator's next action, and `spawn-gate.sh`
 # documents each remedy beside its own refusal line: load clears by itself; a full disk never does;
@@ -1216,8 +1227,13 @@ GATE_REFUSAL_ACTION = {
 # same reason, one code later: without it the 73 in `GATE_REFUSALS` would still be read as "launched"
 # (`gate_refused()` requires BOTH the code and the gate's own line), so a box that could not fork
 # would have kept reporting a successful dispatch.
+# `[brief-gate]` is the research-first gate (agent-infra#2258, exit 80) at the same seam, and it is
+# here for the same reason as 73 -- the in-worker arm writes this line before returning.
+# ⛔ `[pi-gate] REFUSED` IS DELIBERATELY NOT HERE. It is the SPAWN POINT's own line, written with
+# `printf` to the shim's stderr rather than `echo … >> "$log"`, and it can never fire on its own:
+# `gate_refused()` tests the CODE first and no caller is ever handed 76/78 (both are translated).
 REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED",
-                   "[fork-gate] REFUSED")
+                   "[fork-gate] REFUSED", "[brief-gate] REFUSED")
 # `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
 # and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
 # refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent
@@ -3502,13 +3518,13 @@ def read_rc(path: str):
 
 
 def gate_refused(name: str, code) -> bool:
-    """True iff a 73/74/75/77 `.rc` was written by the GATE, not by a `pi` that exited it itself.
+    """True iff a 73/74/75/77/80 `.rc` was written by the GATE, not by a `pi` that exited it itself.
 
     The codes share the 0-255 exit namespace with `pi`, so the code alone is ambiguous -- and the
     two meanings have OPPOSITE consequences here ("nothing consumed, do not record" vs "an agent
     ran, record it"). The discriminator is durable and already on disk: `spawn-gate.sh` appends
-    `[load-gate] REFUSED` / `[disk-gate] REFUSED` / `[land-backlog] REFUSED` / `[fork-gate] REFUSED`
-    to the worker log BEFORE
+    `[load-gate] REFUSED` / `[disk-gate] REFUSED` / `[land-backlog] REFUSED` / `[fork-gate] REFUSED` /
+    `[brief-gate] REFUSED` to the worker log BEFORE
     run_agent returns, and the harness writes `.rc` only after that -- so at the instant the code is
     readable the marker is too. A `pi` that failed on its own writes no gate line.
 
@@ -3653,7 +3669,9 @@ def _confirm(name: str) -> tuple[str, str, str]:
          vanished without a verdict -- neither a launch nor a refusal, and never a row.
 
     `bound` is the GATE's own axis (`load` | `disk` | `land-backlog` | `fork`) for a gate refusal,
-    and ""
+    and "" for every other verdict -- INCLUDING a gate refusal that names no capacity axis (80, the
+    brief gate: nothing was consumed, but re-authoring the brief is the repair, so it must not read as
+    `NO-CAPACITY`)
     for every other verdict. It is returned rather than re-derived downstream: the code that
     recognised the refusal is the only one that knows the code it recognised (agent-infra#2291).
 
@@ -3896,9 +3914,10 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     """Spawn a background worker for one PR. Returns (launched, detail, record, bound).
 
     ⛔ `bound` IS THE FOURTH FACT AND IT IS WHY THIS FILE CAN TELL TWO REFUSALS APART (#2291). It
-    is the GATE's own axis (`load` | `disk` | `land-backlog`) when the SPAWN GATE refused -- nothing
-    was consumed, the box simply has no room, and the order clears by itself -- and "" for every
-    other cause, which is the transport: a missing/stale dispatcher, a worktree that would destroy
+    is the GATE's own axis (`load` | `disk` | `land-backlog` | `fork`) when the SPAWN GATE refused --
+    nothing was consumed, and the AXIS names the remedy (load and land-backlog clear by themselves, a
+    disk refusal never does, a fork refusal needs a restart from outside) -- and "" for every other
+    cause, which is the transport: a missing/stale dispatcher, a worktree that would destroy
     work, an unconfirmed spawn, an unreadable liveness. Those two need OPPOSITE responses (wait vs
     repair), so they may not leave here looking identical. `record` cannot carry it: a gate refusal
     and a transient worktree failure are both `record=False`, which is exactly the collapse
@@ -3913,9 +3932,10 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     `record` says whether the ATTEMPT belongs in the state file even though nothing was launched.
     Two of the three refusal classes differ in exactly that:
 
-      * a GATE refusal (load 75 / disk 77 / land-backlog 74) consumed nothing and CLEARS BY ITSELF
-        -> not recorded; a row would burn a 45-min cooldown and a 90-min budget slot for work that
-        never ran;
+      * a GATE refusal (load 75 / disk 77 / land-backlog 74 / fork 73) consumed nothing, so it is
+        NEVER recorded; the remedy is the AXIS's (load and land-backlog clear by themselves, a disk
+        refusal never does, a fork refusal needs a restart from outside). A brief refusal (80) is the
+        same "nothing consumed" fact with NO capacity axis, so it is counted as undelivered work;
       * a WORKTREE refusal that is a verdict about the tree (uncommitted work, commits the PR
         head does not have, a file the next checkout would overwrite, a path we may not delete)
         does NOT clear by waiting -> recorded, so the PR reaches a cooldown instead of logging the
@@ -4028,10 +4048,18 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # ⛔ AND THE REMEDY IS THE BOUND'S OWN, NOT "IT CLEARS BY ITSELF" (#2291 review). Load and
         # land-backlog do clear by themselves; a disk refusal never does; a FORK refusal cannot be
         # cleared from inside the box at all. One sentence is true of all four only if the AXIS says it.
-        log("spawn %s: %s -- no agent started, nothing consumed; the box's GATE refused the order "
-            "(bound=%s): %s" % (name, detail, bound or "unknown",
-                                GATE_REFUSAL_ACTION.get(bound)
-                                or "wait for the box to drain, then re-run"))
+        # ⛔ AND A REFUSAL THAT NAMES NO AXIS (80, the brief gate) MUST NOT BORROW THE CAPACITY
+        # SENTENCE: the repair is the BRIEF, and telling an operator to wait for the box to drain would
+        # send them to watch a box that is healthy while the same refused order is re-dispatched.
+        if bound:
+            log("spawn %s: %s -- no agent started, nothing consumed; the box's GATE refused the order "
+                "(bound=%s): %s" % (name, detail, bound,
+                                    GATE_REFUSAL_ACTION.get(bound)
+                                    or "wait for the box to drain, then re-run"))
+        else:
+            log("spawn %s: %s -- no agent started, nothing consumed, and the gate named NO capacity "
+                "axis: repair what its own line above names -- this will not clear by waiting, and "
+                "re-dispatching it elsewhere refuses there too" % (name, detail))
         return False, detail, False, bound
     if verdict == "unconfirmed":
         # Nothing durable says either way. NOT recorded, and that is safe BECAUSE liveness is
@@ -4400,11 +4428,17 @@ def _unplaced(p: dict):
     It is the same blindness axis `_finish` refuses on -- unreadable checks, an unusable
     changed-file list, an order no worker accepted -- summed into ONE number, because the question
     a per-repo row answers is "did this repo's queue get worked", not "which read failed".
+
+    ⛔ AND `no_room` IS ON IT (#2291 review, P3). A gate refusal is not a blindness axis and it is
+    not in `_finish`'s refusal precedence, but the ROW is a queue measurement: `open_prs=3
+    unplaced=0 dispatched=0 verdict=WAITING` reads as "three PRs, nothing to move", on the one pass
+    where nothing moved. The cause is still distinguishable, because the row's own `verdict=` names
+    it and the register keeps the two counters apart.
     """
     if "dispatched" not in p:
         return None                    # the pass never got as far as counting (a blind queue read)
     return sum(p.get(k) or 0 for k in ("unreadable", "surface_unreadable", "surface_partial",
-                                       "surface_abandoned", "undeliverable"))
+                                       "surface_abandoned", "undeliverable", "no_room"))
 
 
 def repo_row(slug: str, rc: int, p: dict) -> str:
@@ -4549,7 +4583,15 @@ def run_all_repos(args, explicit) -> int:
         log(row)
         results.append({"repo": slug, "rc": rc, "reason": LAST_PASS.get("reason", ""),
                         "open_prs": LAST_PASS.get("open_prs"),
-                        "unplaced": _unplaced(LAST_PASS)})
+                        "unplaced": _unplaced(LAST_PASS),
+                        # ⛔ THE AGGREGATE RECORD MUST CARRY THE SAME EVIDENCE THE PER-REPO ONE DOES
+                        # (#2291 review, P2). The canonical file is the one the beat and
+                        # `objective.py` read, and its `next_action` for a `6` names the axis -- so
+                        # without these two fields the machine-wide record would point at a bound it
+                        # does not hold. Stated as counts, not as a bound, for the same reason the
+                        # per-repo record keeps them apart.
+                        "no_room": LAST_PASS.get("no_room") or 0,
+                        "no_room_bound": LAST_PASS.get("no_room_bound") or ""})
     # The AGGREGATE record belongs in the canonical file: each repo's own pass already wrote its
     # per-repo record, and leaving STATUS on the last repo would publish that repo's verdict as the
     # machine's. `repos` carries the per-repo rows so a reader can see WHICH one is red.
@@ -4565,8 +4607,16 @@ def run_all_repos(args, explicit) -> int:
                        for r in ordered)
     log("all-repos: %d repo(s) graded, %d non-clean%s -- %s"
         % (len(results), len(dirty), (" (%s)" % ",".join(dirty)) if dirty else "", summary[:400]))
+    # ⛔ AND THE NO-ROOM EVIDENCE IS SUMMED FROM THE SET, not left to the default, because the
+    # aggregate record IS the one a reader sees (#2291 review, P2). `no_room_bound` is the axis of a
+    # NON-CLEAN repo's refusal (dirty-first `ordered`, so a 6 is never the one that gets dropped); a
+    # clean repo does not have one.
+    _no_room = sum((r.get("no_room") or 0) for r in results)
+    _no_room_bound = next((r.get("no_room_bound") for r in ordered
+                           if (r.get("no_room_bound") or "")), "")
     return record_exit(rc, "all-repos: %d of %d repo(s) non-clean -- %s"
                        % (len(dirty), len(results), summary),
+                       no_room=_no_room, no_room_bound=_no_room_bound,
                        repo=",".join(r["repo"] for r in ordered), repos=results)
 
 
@@ -5028,7 +5078,7 @@ def run_pass(args, rubric_note: str = "") -> int:
     dispatched = 0
     undeliverable = 0        # legible work the TRANSPORT refused or dropped (see `_finish`)
     no_room = 0              # order(s) the BOX's own gate refused; nothing consumed (#2291)
-    no_room_bound = ""       # the gate's own axis behind the last of them (load|disk|land-backlog)
+    no_room_bound = ""       # the gate's own axis behind the last of them (load|disk|land-backlog|fork)
     delivered = []           # WHICH PRs actually went out -- the record must name them
     escalated = []           # rows refused >= REFUSAL_ESCALATE_AT times in a row (#2710)
     carried = 0              # of `undeliverable`: refused in an EARLIER pass, still in cooldown
@@ -5064,9 +5114,10 @@ def run_pass(args, rubric_note: str = "") -> int:
         are separated below: what is decided HERE is that neither of them may read as a clean pass.
 
         ⛔ AND THE BOX SAYING NO IS A THIRD AXIS, WITH ITS OWN CODE (agent-infra#2291). A spawn
-        GATE refusal ("load 45.2/8 cpu", "only 400MB free", "creation held by the land backlog") means
-        the ORDER WAS NEVER OFFERED TO A WORKER: nothing was consumed, and it clears by itself. A
-        TRANSPORT failure means the order was offered and dropped by a broken chain. Both used to
+        GATE refusal ("load 45.2/8 cpu", "only 400MB free", "creation held by the land backlog",
+        "out of processes") means the ORDER WAS NEVER OFFERED TO A WORKER: nothing was consumed, and
+        the axis names what clears it. A TRANSPORT failure means the order was offered and dropped by
+        a broken chain. Both used to
         increment `undeliverable` (both are `record=False` in `dispatch()`), so both printed
         `N order(s) no worker accepted` and returned 3 -- reproduced on `main` through the real
         `dispatch()` -> `_confirm()` -> `gate_refused()` chain, and it is the same shape the fleet

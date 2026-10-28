@@ -3293,11 +3293,12 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
         return "PR-DOCTOR(last run): UNREPORTED (verdict is STALE, %dm old: %s)" % (
             age // 60, reason)
     # ⛔ "RED" IS A CLAIM ABOUT A FAILURE, AND A FULL BOX IS NOT ONE (agent-infra#2291). rc=6 is
-    # pr-doctor's NO-CAPACITY: the spawn gate refused on its own measurement, nothing was consumed,
-    # and it clears by itself -- `docs/ops/self-healing-contract.md` 3.6 calls that state REFUSING,
-    # and the response is to WAIT or add capacity, never to repair an install. It is still NOT `ok`
-    # (a pass that placed nothing must never read green in the beat), so it gets its own word rather
-    # than borrowing either neighbour's.
+    # pr-doctor's NO-CAPACITY: the spawn gate refused on its own measurement and nothing was consumed.
+    # It is still NOT `ok` (a pass that placed nothing must never read green in the beat), so it gets
+    # its own word rather than borrowing either neighbour's. ⛔ AND THE REMEDY IS THE AXIS'S, NOT
+    # "wait" (#2291 review, P3): `docs/ops/self-healing-contract.md` 3.6 gives `6` its own word and
+    # says load/land-backlog clear by themselves while disk needs a reclaim and fork needs an outside
+    # restart, so this line claims only that the pass placed nothing.
     word = "WAITING (no capacity)" if rc == 6 else ("RED" if rc else "ok")
     return "PR-DOCTOR(last run): %s rc=%d %dm ago — %s" % (
         word, rc, age // 60, reason)

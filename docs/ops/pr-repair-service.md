@@ -71,7 +71,7 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    | decision | meaning |
    |---|---|
    | `dispatched` | the dispatcher ran and returned 0 — work was placed, or the queue was genuinely empty |
-   | `deferred` | the machine said not now; the reason carries the measurement (`disk-floor:3481<4096`, `load-ceiling:…`, `cap-zero`) |
+   | `deferred` | the machine said not now; the reason carries the measurement (`disk-floor:3481<4096`, `load-ceiling:…`, `cap-zero`), or `dispatcher-no-capacity` when pr-doctor's spawn gate refused the order (its own axis — `load`/`disk`/`land-backlog`/`fork` — is in the dispatcher's status record) |
    | `refusing` | a read a pass needs could not be taken, or the dispatcher itself refused (rc=2) — **never** "nothing to do" |
    | `placed-undelivered` | legible work, **none of it out** (pr-doctor rc=3): no worker took an order that was placed, **or** a durable refusal stopped the order before delivery (`agent-infra#2710` — a dirty worktree, a queue parked under the 45-min cooldown the refusal created; measured for #2708). The pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted. ⚠️ The `reason` token on this row is still `no-worker-took-it` for both causes; the human line on stderr names both, and renaming the token is left to a change that can verify every reader |
    | `idle` | a `--dry-run` pass: measured and derived, dispatched nothing |
@@ -137,7 +137,8 @@ poll).
 
 ⛔ **The pass's exit codes are the trigger's vocabulary**, and they are not interchangeable: `0` (a pass
 completed) and `2` (REFUSING — a read it needed could not be taken) and `6` (DEFERRED — the machine
-said not now: below the disk floor, above the load ceiling, or a cap of 0) are **verdicts** and consume
+said not now: below the disk floor, above the load ceiling, a cap of 0, or the dispatcher's own spawn
+gate refusing every order on the `load`/`disk`/`land-backlog`/`fork` axis) are **verdicts** and consume
 the backstop window; `3` (UNDELIVERED) is retried under `REPAIR_TRIGGER_RETRY_MIN_S`; anything else is
 `PASS-FAILED`, which does **not** consume the window so a later tick retries instead of waiting half an
 hour on a crash. A trigger whose pass is absent (`PASS-MISSING`) is never a clean window — CPython

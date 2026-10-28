@@ -720,6 +720,43 @@ def test_a_fork_refusal_still_needs_the_GATES_OWN_line(tmp_path, monkeypatch):
     assert pr.gate_refused("prd-16", 73) is True
 
 
+def test_a_BRIEF_refusal_is_a_REFUSAL_with_NO_capacity_axis(tmp_path, monkeypatch):
+    """80 consumed nothing — so it is not a dispatch — but it is not the box saying "not now" either.
+
+    ⛔ THE ONE-HUNDRED-AND-EIGHTY-WAY MISTAKE THIS PREVENTS (#2291 review, P2). `run_agent` runs
+    `brief_gate_run` INSIDE the backgrounded worker too (`spawn-gate.sh`'s gate seam), and
+    `nonblocking-dispatch.sh` writes that status into `.rc` — so a `.rc` of 80 with the brief gate's
+    own line is a real state, and an earlier version of this file's comment claimed "no worker ever
+    exists to have an `.rc`", which is false of that arm. Read as "launched" it is the same false PASS
+    as a missing 73; read as `NO-CAPACITY` it would tell an operator to wait for a box that is healthy
+    while the brief stays refused, on every box it is re-dispatched to.
+    """
+    d = tmp_path / "orch"
+    d.mkdir()
+    (d / "spawn-gate.sh").write_text(
+        'run_agent() { echo "[brief-gate] REFUSED bg: the brief was not admitted (exit 80)" '
+        '>> "$2"; return 80; }\n')
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setenv("O", str(d))
+    ok, detail, record, bound = pr.dispatch(_pr(17), "fix-ci", _OK_BRIEF, dry=False)
+    # Nothing was consumed -> not recorded, not dispatched…
+    assert (ok, record) == (False, False), detail
+    assert "gate REFUSED rc=80" in detail, detail
+    # …and NO capacity axis, so the caller must count it as undelivered work (rc 3, repair),
+    # never as `NO-CAPACITY` (rc 6, wait).
+    assert bound == "", bound
+    assert 80 in pr.GATE_REFUSALS and 80 not in pr.GATE_REFUSAL_BOUND
+
+
 def test_a_TRANSPORT_failure_carries_NO_axis(tmp_path, monkeypatch):
     """The control: a dispatcher that fails outright is the TRANSPORT, so `bound` stays empty.
 
@@ -2568,11 +2605,23 @@ def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
 
 def test_the_refusal_markers_are_the_gates_own_lines():
     """Anti-drift on the ONE piece of prose this file reads: reword it in spawn-gate.sh and the
-    refusal detection silently stops working (every refusal would read as a real dispatch)."""
+    refusal detection silently stops working (every refusal would read as a real dispatch).
+
+    ⛔ AND IT IS BOTH DIRECTIONS (#2291 review, P2). A per-marker loop only catches a RENAMED marker;
+    a NEW gate line the tuple does not list is invisible to it, which is the same one-way shape that
+    let `73` go unclassified. The reverse assertion below makes a new `echo "[…] REFUSED …" >>"$log"`
+    arm in `spawn-gate.sh` redden this suite until the tuple names it. `[pi-gate]` is excluded because
+    it is not a `$log` marker at all -- it is `printf` output on the shim's stderr.
+    """
     gate = (_HARNESS / "spawn-gate.sh").read_text()
     for marker in pr.REFUSAL_MARKERS:
         assert 'echo "%s ' % marker in gate, \
             "spawn-gate.sh no longer writes %r -- REFUSAL_MARKERS is stale" % marker
+    in_the_gate = set(re.findall(r'echo "(\[[a-z-]+\] REFUSED) ', gate))
+    assert in_the_gate, "no echo-released [tag] REFUSED arm found in spawn-gate.sh -- this pin stopped looking"
+    assert in_the_gate == set(pr.REFUSAL_MARKERS), \
+        ("spawn-gate.sh writes a refusal marker REFUSAL_MARKERS does not name: %s"
+         % sorted(in_the_gate - set(pr.REFUSAL_MARKERS)))
 
 
 def test_an_unreadable_worker_status_REFUSES_to_spawn(monkeypatch, tmp_path):
@@ -7490,44 +7539,65 @@ def test_pr_doctor_owns_no_SECOND_set_of_capacity_thresholds():
 
 
 def test_the_gate_axis_table_is_the_GATES_own_numbers():
-    """ENUMERATED from `spawn-gate.sh`, not from a hard-coded trio.
+    """ENUMERATED from `spawn-gate.sh`'s numeric constants, not from a hard-coded trio.
 
     ⛔ A HARD-CODED TRIO CERTIFIED A TABLE THAT WAS MISSING A CODE (agent-infra#2291 review, P1 --
-    reproduced). The old body iterated the three names it was testing and then asserted the two sets
-    agreed, so `AGENT_FORK_REFUSED=73` was STRUCTURALLY INVISIBLE to it: a fourth code could be added
-    to the gate and this test stayed green while `gate_refused()` read that refusal as a dispatch.
-    The enumeration now comes FROM the gate, minus a DECLARED exclusion set, so a new gate code
-    reddens this test until someone classifies it one way or the other.
+    reproduced). The original body iterated the three names it was testing and then asserted the two
+    sets agreed, so `AGENT_FORK_REFUSED=73` was STRUCTURALLY INVISIBLE to it: a fourth code could be
+    added to the gate and this test stayed green while `gate_refused()` read that refusal as a
+    DISPATCH.
+
+    ⛔ AND SELECTING BY NAME SHAPE WAS THE SAME BUG ONE LAYER UP (#2291 review, P2). Matching
+    `^AGENT_[A-Z_]+_REFUSED=` would miss a gate named `AGENT_NOMEM=70` or a bare `return 71`, which is
+    exactly how `AGENT_LAND_BACKLOG=74` already sits outside that shape. So the enumeration is EVERY
+    numeric constant in the file, minus a DECLARED exclusion set that names (and reasons about) each
+    non-agent-facing one -- a new constant is then in `expected` and reddens this test until someone
+    classifies it.
     """
     gate = (_HARNESS / "spawn-gate.sh").read_text()
-    agent_codes = {int(m.group(2)): m.group(1)
-                   for m in re.finditer(r"^(AGENT_[A-Z_]+_REFUSED|AGENT_LAND_BACKLOG)=(\d+)\s*$",
-                                        gate, re.M)}
-    # Codes the gate declares for an order pr-doctor never sees in a BACKGROUNDED worker's `.rc`,
-    # each with the reason it is not on this axis. A new name in the difference is the signal to
-    # classify the new code -- that is the whole point of enumerating rather than listing.
-    NOT_IN_A_WORKER_RC = {
-        "AGENT_BRIEF_REFUSED": "pr-doctor's own brief is gated in the FOREGROUND, before any "
-                               "worker exists to have an `.rc` (see `dispatch()`'s spawn arm)",
+    constants = {m.group(1): int(m.group(2))
+                 for m in re.finditer(r"^([A-Z][A-Z0-9_]*)=(\d+)\s*$", gate, re.M)}
+    # Every numeric constant in `spawn-gate.sh` that is NOT a code an agent-facing gate writes into a
+    # BACKGROUNDED worker's `.rc`. Each needs its reason, because "it is not on the axis" is a
+    # classification, not an accident.
+    NOT_AN_AGENT_REFUSAL = {
+        "PI_GATE_REFUSED": "the spawn point's own code, translated into AGENT_LOAD_REFUSED inside "
+                           "`run_agent` -- no caller is ever handed 76",
+        "PI_FORK_REFUSED": "translated into AGENT_FORK_REFUSED inside `run_agent` (same arm)",
+        "BRIEF_GATE_UNAVAILABLE": "the helper is MISSING: that is the TRANSPORT fact this split "
+                                  "exists to keep out of the no-room axis",
+        "PI_GATE_LEDGER_MAX_BYTES": "a byte cap for the ledger, not an exit code",
+        "AGENT_STARTED": "a flag the gate sets, not an exit code",
+        "CAP_GATE_MOD_LOADED": "a module-loaded flag, not an exit code",
     }
-    expected = {code: name for code, name in agent_codes.items()
-                if name not in NOT_IN_A_WORKER_RC}
-    assert len(expected) >= 4, (agent_codes, "the enumeration stopped matching spawn-gate.sh")
-    assert set(expected) == set(pr.GATE_REFUSALS), (expected, pr.GATE_REFUSALS)
-    # `gate_refused()` short-circuits on the tuple and `_confirm()` reads the axis from the map, so a
-    # code in one but not the other is either a false PASS (tuple only) or a lost axis (map only).
-    assert set(pr.GATE_REFUSALS) == set(pr.GATE_REFUSAL_BOUND), \
-        (pr.GATE_REFUSALS, pr.GATE_REFUSAL_BOUND)
-    # 78 is the TRANSPORT fact this whole split exists for (`spawn-gate.sh: not found`), so it may
+    expected = {name: code for name, code in constants.items()
+                if name not in NOT_AN_AGENT_REFUSAL}
+    assert len(expected) >= 5, (constants, "the enumeration stopped matching spawn-gate.sh")
+    # The CODES `gate_refused()` accepts are exactly the agent-facing refusals.
+    assert set(expected.values()) == set(pr.GATE_REFUSALS), (expected, pr.GATE_REFUSALS)
+    # …and the AXIS map covers a SUBSET of them: a refusal with no capacity bound (the brief gate, 80)
+    # is still a refusal -- nothing was consumed -- but its remedy is "re-author the brief", so it must
+    # NOT be counted as `NO-CAPACITY` (wait). This is the classification that makes the two differ.
+    NO_CAPACITY_AXIS = {
+        "AGENT_BRIEF_REFUSED": "a property of the BRIEF: waiting and reclaiming both leave it "
+                               "refused, so it is a repair (rc 3), not a wait (rc 6)",
+    }
+    assert set(pr.GATE_REFUSAL_BOUND) == {code for name, code in expected.items()
+                                          if name not in NO_CAPACITY_AXIS}, \
+        (expected, pr.GATE_REFUSAL_BOUND, NO_CAPACITY_AXIS)
+    assert set(pr.GATE_REFUSAL_BOUND) <= set(pr.GATE_REFUSALS)
+    # 78 is the TRANSPORT fact the whole split exists for (`spawn-gate.sh: not found`), so it may
     # never be absorbed into "the box said not now".
     assert 78 not in pr.GATE_REFUSALS and 78 not in pr.GATE_REFUSAL_BOUND
-    # The markers are the second half of the discriminator, so they must cover the same gates.
-    assert len(pr.REFUSAL_MARKERS) == len(pr.GATE_REFUSAL_BOUND), \
-        (pr.REFUSAL_MARKERS, pr.GATE_REFUSAL_BOUND)
     # Each axis names a DIFFERENT remedy, so a reader is told what to do and not just what happened.
     actions = [pr.GATE_REFUSAL_ACTION.get(b) for b in pr.GATE_REFUSAL_BOUND.values()]
     assert all(actions), (pr.GATE_REFUSAL_BOUND, pr.GATE_REFUSAL_ACTION)
     assert len(set(actions)) == len(actions), (pr.GATE_REFUSAL_BOUND, actions)
+    # The remedies must not merge back: the two that a single sentence used to cover ("it clears by
+    # itself") are the two the gate says the opposite about.
+    assert "clears by itself" in pr.GATE_REFUSAL_ACTION["load"]
+    for axis in ("disk", "fork"):
+        assert "does NOT clear" in pr.GATE_REFUSAL_ACTION[axis], pr.GATE_REFUSAL_ACTION[axis]
 
 
 def test_every_declared_exit_code_has_a_verdict_word(monkeypatch, tmp_path):

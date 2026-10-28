@@ -2388,9 +2388,10 @@ repo=daniel-ospina/tortoise             open_prs=0     unplaced=0     dispatched
 The verdict words are the exit codes' own vocabulary and stay distinct: `clean` (`0`), `REFUSING`
 (`2` — I could not READ the queue), `UNPLACED` (`3` — I read it, placed the work, no worker took it),
 `CRASH` (`4`), `WAITING` (`6` — the box's own spawn GATE refused the order and consumed nothing, so
-nothing is broken and nothing was done; the gate's own axis is in the row's `rc` context and in the
-sidecar's `no_room_bound`, and its remedy differs by axis — `load`/`land-backlog` clear by themselves,
-`disk` needs a reclaim, `fork` needs the box restarted or drained from outside). Each entry is
+nothing is broken and nothing was done; the gate's own axis is NOT in this row — it is in the sidecar's
+`no_room_bound`, which this row's reason text usually names — and its remedy differs by axis:
+`load`/`land-backlog` clear by themselves, `disk` needs a reclaim, `fork` needs the box restarted or
+drained from outside). Each entry is
 `owner/name`, or `owner/name=<checkout>` when the checkout is not the one
 `REPO` names; `?` in a column means the pass never got far enough to count it. Repeated `--repo`
 flags REPLACE the `PR_DOCTOR_REPOS` default rather than joining it (a named list is the narrower

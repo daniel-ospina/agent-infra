@@ -401,11 +401,15 @@ the tree) reporting the code a genuinely overloaded box produces (wait). So:
 - the readers agree on the word: `heartbeat-loop.sh` prints `PR-DOCTOR WAITING rc=6`,
   `objective.py::pr_doctor_last_run` renders `WAITING (no capacity)`, `repo_row()` says `verdict=WAITING`.
   **None of them reads `6` as `ok`** (§2: cannot-verify is never a pass) and none reads it as `RED`.
-  ⛔ AND ALL THREE ARE FRESHNESS-BOUNDED FIRST (#2291 review, P1 — reproduced): a `WAITING` record is a
-  claim about a dispatcher that is still passing, so a record past the 2400 s bound reads `RED
-  UNREPORTED (verdict is STALE)` in the beat and `UNREPORTED (verdict is STALE, …)` in `objective.py` —
-  the two readers check the SAME age bound before the word, so they cannot disagree about one record. A
-  box that filled up and then died must not print the reassuring word for ever.
+  ⛔ AND ALL THREE ARE FRESHNESS-BOUNDED FIRST FOR `0` AND `6` (#2291 review, P2 — the first version
+  of this paragraph claimed it for every code and for all three readers, which the code refutes).
+  `heartbeat-loop.sh` and `objective.py::pr_doctor_last_run` read the SAME 2400 s bound before the
+  word, so a `NO-CAPACITY` record past it reads `RED UNREPORTED (verdict is STALE)` in the beat and
+  `UNREPORTED (verdict is STALE, …)` in the objective — and a box that filled up and then died cannot
+  print the reassuring word for ever. `repo_row()` takes no age at all (it renders one pass's counts),
+  and for `2`/`3`/`4` the two readers word an old record differently — `RED rc=N` in the beat versus
+  `UNREPORTED (verdict is STALE…)` in the objective. Both are non-green and neither is `ok`; they are
+  not the same sentence, so this paragraph does not claim they are.
 
 **What repairs it.** Read `read=` and `reason=` from the sidecar, then: `read=transport` +
 `predates the repair kind` → refresh `$O` with `install.sh` (a stale dispatcher silently downgrades
