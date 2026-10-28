@@ -87,7 +87,7 @@ EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; log "$*"; }
+log_line() { printf '%s\n' "$*"; log "$*"; }
 log() { printf '%s\n' "$*" >>"$PRUNE_LOG" 2>/dev/null || true; }
 
 # Trim leading/trailing whitespace (bash 3.2 — no external tools).
@@ -299,8 +299,8 @@ run() {
     cutoff=$(( now - MAX_AGE_DAYS * 86400 ))
 
     if [ ! -d "$ROOT" ]; then
-        say "[task-session-prune] freed=0MB remaining=0MB pruned=0"
-        say "MODE=$MODE NOW=$now ROOT=$ROOT (absent — nothing to do)"
+        log_line "[task-session-prune] freed=0MB remaining=0MB pruned=0"
+        log_line "MODE=$MODE NOW=$now ROOT=$ROOT (absent — nothing to do)"
         echo "[task-session-prune] MODE=$MODE pruned=0 freed=0B remaining=0B dirs=0 (root absent)"
         exit 0
     fi
