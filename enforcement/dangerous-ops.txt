@@ -28,6 +28,71 @@
 # previous session clears the gate, because re-read friction after a reload was the
 # larger cost (eldato #7416, agent-infra #1331). Do NOT delete the window to
 # "tighten" this: that silently reverses a recorded decision. The route is a reopen.
+#
+# ── WHAT THIS GATE IS, AND WHAT IT IS NOT (issue #1329) — READ BEFORE RELYING ON IT ──
+# This is a WORKFLOW-COMPLIANCE gate for a COOPERATING agent. It is NOT a security
+# boundary, and it must not be described or relied on as one. skill-enforcer matches a
+# case-insensitive regex against the bash-visible command text, plus canonical spellings
+# derived from it (shared/git-command-parse.ts `commandSpellings`) that remove a git/gh
+# invocation's GLOBAL options and normalise the SEPARATOR between the command word and its
+# verb to one space. It stops an agent that re-spells a command without noticing this list.
+# It does not stop one that intends to evade it.
+#
+# CLOSED — every rule below matches these:
+#   * the listed spellings;
+#   * a git/gh invocation carrying GLOBAL options between the command word and the verb
+#     — `git -C <dir> commit`, `git --no-pager commit`, `git -c k=v commit`,
+#     `git --git-dir=<dir> commit`, `git -C <dir> stash pop`, `gh -R <owner/name> pr create`,
+#     `git -C <dir> worktree add <path>`. (Before #1329 these ran UNGATED — measured;
+#     `git -C <dir>` is how this fleet commits in a linked worktree.)
+#   * a WIDER OR DIFFERENT SEPARATOR between the command word and the verb — a tab, or a
+#     run of spaces: `git<TAB>commit`, `git  commit`, `git -C <dir><TAB>commit`. Shell
+#     tokenisation does not distinguish these, so the derived spelling collapses the
+#     separator to one space. (Measured OPEN at the first head of #1329 while this list
+#     claimed the class closed — the derivation computed the right spelling and then
+#     failed to match the rule's single literal space.) Quoted text keeps its own
+#     spacing: normalising inside a quoted payload would turn a mention into a command.
+#   * a path-qualified or wrapper-prefixed command — `/usr/bin/git commit`,
+#     `command git commit`, `env FOO=1 git commit`, `sudo git commit`,
+#     `bash -c 'git commit'`, `xargs git commit` — these still CONTAIN the literal
+#     pattern, so the raw match always caught them.
+#
+# NOT CLOSED — each of these bypasses EVERY rule below, deliberately and visibly:
+#   * variable indirection            `g=commit; git $g -m x`; `eval "$CMD"`
+#   * alias / function invocation     `gc -m x` (the `alias gc='git commit'` DEFINITION
+#                                     is caught; later uses of `gc` are not)
+#   * arbitrary nesting               `sh -c "git -C <dir> commit"` — the nested text is
+#                                     quoted data, not a command word, so it is neither
+#                                     raw-matched (the options split the pattern) nor
+#                                     normalised. (`bash -c 'git commit'` IS caught: the
+#                                     literal pattern is present.)
+#   * quote/escape splicing in the verb   `git com"mit"`, `git comm\it`, `git \` ⏎ `commit`
+#   * a quoted MENTION with options   `rg -n 'git -C x commit'` — quoting makes it data;
+#                                     the gate does not reinterpret quoted regions.
+# A static text gate cannot read shell state (aliases, variables, nesting), and closing
+# those would mean executing or fully interpreting the shell — not a fit for a gate that
+# runs on every bash call. That reason is TRUE for variable indirection, aliases and
+# nesting, and it is NOT the reason the splicing entries stay open (#1329 review, P3):
+# quote removal, backslash-escape removal and line-continuation joining are a BOUNDED
+# lexing pass over the same quote model this module already owns — no shell execution, no
+# interpretation. They stay open as a TRADE, not an impossibility: closing splicing means
+# re-scanning quoted payloads, and that same pass would start blocking quoted MENTIONS
+# (`rg -n 'git -C x commit'`, the entry above). Whichever way that trade is settled, this
+# list should say which — #1329 is about a declaration an adopter can rely on.
+# The class is DECLARED, not hidden: the boundary is pinned by
+# a test in extensions/skill-enforcer.test.ts so a later change cannot widen or silently
+# narrow it without updating this header.
+#
+# BYPASS, BY DESIGN: SKILL_ENFORCER_DISABLED=1 / AGENT_ALLOW_MAIN_EDITS=1 (the block
+# message advertises the first), and a read remembered from a previous session
+# (#7416) — with the 24 h bound on IDLENESS, exactly as "What \"read\" means"
+# above states it; a restored read is re-stamped by each tracked read and each
+# clean session_shutdown. Because the sanctioned bypass is one environment variable,
+# no lane can reasonably treat this manifest as a defence against a determined agent —
+# only as a reminder to a compliant one.
+#
+# If you ADD a rule, add the spelling you expect to see to the truth table in
+# extensions/skill-enforcer.test.ts, and keep the CLOSED/NOT CLOSED lists above honest.
 
 commit-workflow # git commit|git push|git merge|git add|gh pr create|gh pr merge|git stash pop|git checkout -- # hard # Use commit-workflow/SKILL.md for all git operations. Pre-flight checks, PR creation, code-review gate, and auto-merge.
 

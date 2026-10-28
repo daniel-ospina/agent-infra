@@ -44,6 +44,13 @@ done
 
 # ── extraction: the shipped fragments (markers, so a refactor that drops them fails loudly) ──────
 sed -n '/# \[redfix:begin\]/,/# \[redfix:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/redfix.sh"
+# ⛔ THE REFUSAL LINE'S EVIDENCE TOKEN IS EXTRACTED TOO (agent-infra#1732 review). The block calls
+# `spawn_gate_tok`, which is DEFINED OUTSIDE the block (up by `can_spawn`), so a drive that sources
+# only the block renders `(fix lanes=4/4, )` — an empty field where the gate's reading belongs — and,
+# because stderr is discarded, it does so SILENTLY. The suite stayed green while the thing its own
+# assertion names ("with its ceiling and the load gate") was gone; that is the false-record class this
+# file exists to catch, so the token is sourced from the shipped file and DRIVEN below.
+sed -n '/^spawn_gate_tok() {/,/^}/p' "$ORCH" > "$TMP/spawntok.sh"
 if [ -s "$TMP/redfix.sh" ] && grep -q 'RED TREE ->' "$TMP/redfix.sh"; then
   ok "the red-fixer router is extracted from the shipped loop ($(awk 'END{print NR}' "$TMP/redfix.sh") lines)"
 else
@@ -265,10 +272,11 @@ drive_route() {
       esac
       return 0
     }
-    # ⛔ THE SPAWN SURFACE IS THE LAUNCHER, NOT TMUX (agent-infra#2209/#2210). The controller spawns
-    # through `worker-terminal.sh`, so on a cloud cell a worker gets a daemon-OWNED durable terminal;
-    # a tmux window (or a transient exec child) dies at ~21 log lines, and a dead red-fixer is
-    # indistinguishable from one that found nothing to fix. The stubs below answer the launcher's own
+    # ⛔ THE SPAWN SURFACE IS THE LAUNCHER, NOT A HAND-WRITTEN COMMAND (agent-infra#2209/#2210). The
+    # controller spawns through `worker-terminal.sh`, so a worker gets a daemon-OWNED durable terminal
+    # where the cmux daemon answers and tmux WITH the HOME+keys.env contract where it does not — a
+    # credential-less worker dies early (the `~21 log lines` death was the environment, agent-infra#2210
+    # reopened), and a dead red-fixer is indistinguishable from one that found nothing to fix. The stubs below answer the launcher's own
     # verbs and record into the SAME spy, in the SAME `<session> -- <command>` shape the assertions
     # already read — so every arm keeps testing what it was written to test, and the `wt_count`
     # default (an EMPTY census line) is what a box with no workers really answers.
@@ -285,6 +293,10 @@ drive_route() {
     }
     wt_alive() { sess "$1"; }
     for _once in 1; do
+      # The refusal line prints `$(spawn_gate_tok)`; give it the shipped function and real inputs,
+      # so the driven line carries an actual reading instead of an empty field ($TMP/spawntok.sh).
+      . "$TMP/spawntok.sh"
+      L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
       . "$TMP/redfix.sh"
       echo FALLTHROUGH >> "$TMP/d.log"
       break
@@ -374,9 +386,9 @@ drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefde
   || bad "(3) spawns=$(spawns) with the box already saturated"
 [ -f "$TMP/rO/state/redfix-4242" ] && bad "(3) the box-cap refusal consumed an attempt" \
   || ok "(3) the box-cap refusal consumes NO attempt (it retries when a slot frees)"
-grep -q 'NO red-fixer slot' "$TMP/d.log" \
-  && ok "(3) the capacity refusal is PRINTED with its ceiling and the load gate (#2126 T5)" \
-  || bad "(3) the capacity refusal printed no reason"
+grep -q 'NO red-fixer slot' "$TMP/d.log" && grep -q 'mem-gate=9000M/512' "$TMP/d.log" \
+  && ok "(3) the capacity refusal is PRINTED with its ceiling and BOTH gate arms — load and memory (#2126 T5, #1732)" \
+  || bad "(3) the capacity refusal printed no reason, or lost its gate evidence: $(grep -o 'NO red-fixer slot ([^)]*)' "$TMP/d.log" | head -1)"
 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 0 0 ""
 [ "$(spawns)" = "1" ] && ! grep -qE '^deadbeefdeadbeefdeadbeefdeadbeefdeadbeef [1-9]' "$TMP/rO/state/redfix-4242" 2>/dev/null \
   && [ "$(cat "$TMP/rO/state/fixcount-4242" 2>/dev/null)" = "0" ] \
@@ -580,9 +592,13 @@ echo "  -- (3c2) the refund PRODUCER (fix-one.sh) writes the marker the controll
 rm -rf "$TMP/gO"; mkdir -p "$TMP/gO/state"
 printf '2\n' > "$TMP/gO/state/fixcount-4242"
 : > "$TMP/gO/log"
+# ⛔ THE FRAGMENT IS THE FUNCTION ITSELF (agent-infra#2762 review, 2nd cycle, P2): fix-one.sh now
+# defines `refund_gate_attempt` so the repo-identity refusals — which exit BEFORE any agent could be
+# booked — reuse the SAME refund instead of a second copy. Sourcing defines it; the call below is the
+# entry point the two production paths use.
 (
   PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO"; L="$TMP/gO/log"; CTRL=1
-  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt
 ) >/dev/null 2>&1
 [ -f "$TMP/gO/state/fixgate-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] \
   && ok "(3c2) a gate refusal writes fixgate-<PR>-<HEAD> (the marker the controller refunds on)" \
@@ -592,7 +608,7 @@ printf '2\n' > "$TMP/gO/state/fixcount-4242"
   || bad "(3c2) fixcount=[$(cat "$TMP/gO/state/fixcount-4242" 2>/dev/null)] — the refund block is not wired"
 rm -rf "$TMP/gO2"; mkdir -p "$TMP/gO2/state"; printf '2\n' > "$TMP/gO2/state/fixcount-4242"
 ( PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO2"; L="$TMP/gO2/log"; CTRL=0
-  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh" ) >/dev/null 2>&1
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt ) >/dev/null 2>&1
 [ ! -f "$TMP/gO2/state/fixgate-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] && [ "$(cat "$TMP/gO2/state/fixcount-4242")" = "2" ] \
   && ok "(3c2) a MANUAL run (CTRL=0) refunds nothing (it never booked an attempt)" \
   || bad "(3c2) a manual run refunded an attempt it never booked"
@@ -715,11 +731,15 @@ case "$(cat "$TMP/spy")" in
   *) bad "(6) OPENAI_API_KEY is not unset at the spawn — an ambient credential outranks the pin" ;;
 esac
 # The ONE gated `pi` invocation. Structural pin, on purpose: launching a real agent to prove a flag
-# would make this suite non-hermetic, and the flag is a literal in one place.
-if grep -q 'pi -p --provider deepseek --model deepseek-v4-flash' "$HERE/spawn-gate.sh"; then
-  ok "(6) the gated invocation NAMES provider+model explicitly (spawn-gate.sh) — nothing is env-derived"
+# would make this suite non-hermetic. The pair is ENV-OVERRIDABLE BY DESIGN (agent-infra#2208), so the
+# pin is asserted as its two halves — the two-variable argv AND each resolved default. Deleting either
+# the override or its default reddens this; the previous form pinned a literal that the fix removed.
+if grep -q 'pi -p --provider "$lane_provider" --model "$lane_model"' "$HERE/spawn-gate.sh" \
+   && grep -q 'PI_LANE_PROVIDER:-deepseek' "$HERE/spawn-gate.sh" \
+   && grep -q 'PI_LANE_MODEL:-deepseek-flash' "$HERE/spawn-gate.sh"; then
+  ok "(6) the gated invocation NAMES provider+model explicitly (spawn-gate.sh), from env-overridable defaults that resolve (agent-infra#2208)"
 else
-  bad "(6) spawn-gate.sh no longer pins --provider/--model explicitly"
+  bad "(6) spawn-gate.sh does not pin --provider/--model from overridable defaults"
 fi
 
 echo
@@ -775,9 +795,14 @@ case "$_landed_arm" in *'fixgate-$pr-'*) rc=0 ;; *) rc=1 ;; esac
 
 echo
 echo "  -- wiring: the role's own shard is registered in the ONE shard list --"
-grep -q 'red-fixer.test.sh' "$HERE/../../scripts/run-bash-shards.sh" \
-  && ok "red-fixer.test.sh is a shard (a suite nobody runs is not a gate)" \
-  || bad "red-fixer.test.sh is NOT in scripts/run-bash-shards.sh — it would never run in CI"
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (agent-infra#2609): the list
+# is DERIVED from the tree, so the driver's text names no suite and a `grep` of the file would always
+# fail — and it failed with a message that told the next lane to hand-edit the driver.
+if bash "$HERE/../../scripts/run-bash-shards.sh" --list 2>/dev/null | grep -qx 'scripts/orchestrator-harness/red-fixer.test.sh'; then
+  ok "red-fixer.test.sh is a shard (a suite nobody runs is not a gate)"
+else
+  bad "red-fixer.test.sh is NOT executed by run-bash-shards.sh --list — it would never run in CI"
+fi
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

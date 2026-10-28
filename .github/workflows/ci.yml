@@ -121,60 +121,35 @@ jobs:
       - name: search-cost harness (corpus contract, both directions)
         run: bash tests/search-cost/run.sh
 
-  admin-merge:
-    # #930 — the safe-admin-merge rail. `--admin` bypasses required checks, so
-    # nothing makes it *safe*: it cannot tell a check already red on main from a
-    # NEW failure the PR introduces (tortoise #3420 merged carrying a test that
-    # was not in main's failing set, and main ratcheted redder). This job is the
-    # per-PR half: scripts/ci-failure-set.sh is the ONE parser, and
-    # scripts/admin-merge.sh is the chokepoint (union baseline + flake re-run +
-    # head-bound evidence). The refusal half (a raw `gh pr merge --admin`
-    # without evidence) is pinned by extensions/review-enforcer/index.test.ts.
-    # Hermetic: a fake `gh` serves every call — no network, no provider keys.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Safe admin-merge rail suite (parser, #3469 trap, flake, parity)
-        run: bash tests/admin-merge/run.sh
-      - name: Atomic land unit suite (#1367)
-        # update → verify → record → land as ONE unit. The land step DELEGATES to
-        # admin-merge.sh (the suite above) and the record step to record-review.sh;
-        # this suite pins only the sequencing and the fail-closed preconditions.
-        run: bash tests/atomic-land/run.sh
-      - name: Review-evidence diff normalizer (#1362 D1)
-        # The ONE implementation of the diff normalization the review-evidence
-        # digest is computed over, plus the three byte-level D1 properties
-        # (base-move invariant, content change, whitespace change). This is a
-        # dedicated per-PR step AND the suite is registered in the one shard
-        # list (scripts/run-bash-shards.sh) that both lanes run — same
-        # deliberate double-run as the admin-merge suites above. The producer's
-        # integration pins live in scripts/record-review.test.sh §12, which is
-        # likewise in the shard list, so it runs in BOTH lanes.
-        run: bash scripts/diff-normalize.test.sh
-      - name: Argv-level admin-merge guard suite (#984)
-        # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
-        # where bash has already resolved `-${V:--}admin=true` into `--admin`. The
-        # suite drives the real shim through a real shell with the splices that
-        # defeated the string scanner, and asserts refusal.
-        run: bash tests/gh-shim/run.sh
-      - name: Certificate contract suite (#1388)
-        # The ONE contract, pinned against a REAL captured evidence comment rather
-        # than a hand-written fixture. bcbb7df (#3756) renamed the producer's
-        # residual clause and BOTH gates kept requiring the old name; every admin
-        # merge was refused fleet-wide for six days with every suite green, because
-        # a hand-written fixture cannot notice that the producer moved. This suite
-        # extracts the required literals FROM the gate, asserts each exists in real
-        # evidence, mutates the producer's clause one word and requires refusal, and
-        # pins clause 6 — that the TS gate owns no copy of the clause set.
-        run: bash tests/admin-merge-evidence-contract/run.sh
+  # ⛔ NO `admin-merge` JOB (agent-infra#2439). Its five suites are SHARDS now
+  # (`scripts/run-bash-shards.sh`: `tests/admin-merge/run.sh`,
+  # `tests/atomic-land/run.sh`, `scripts/diff-normalize.test.sh`,
+  # `tests/gh-shim/run.sh` and `tests/admin-merge-evidence-contract/run.sh`), which
+  # is a strictly better home: the shard list is the ONE list BOTH lanes run
+  # (#1369), so the same guarantee is kept and the post-merge lane gains the
+  # evidence-contract suite for free, while the PR lane stops paying for it TWICE.
+  #
+  # The double-run was measured, not assumed: on PR #2385's head this job spent
+  # 3,009 s of runner time re-running four suites the `bash-suites` job had
+  # already run on the SAME commit (`bash-suites` alone is 5,600 s of that PR's
+  # 9,079 s runner-seconds; this job was a further 3,009 s, i.e. 33%). At 14
+  # runners and ~20 concurrent PR pushes that duplicate is what a landing waits
+  # behind. The rail's own rationale (#930: `scripts/ci-failure-set.sh` is the
+  # ONE parser, `scripts/admin-merge.sh` the chokepoint) is unchanged — it is the
+  # RUN SITE that moved, not the coverage. The refusal half stays in
+  # `extensions/review-enforcer/index.test.ts`.
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-    # every extensions/ top-level entry except *.test.ts must be farm-wired
+    # every TRACKED extensions/ top-level entry except *.test.ts, and except
+    # dot-named repo furniture such as .gitkeep, must be farm-wired
     # into pi-bootstrap/pi-config/extensions (single source of truth — a new
     # extension that isn't wired ships on NO machine) AND listed in manifest.json
     # files.extensions.entries (the consumer ship-list — a tree entry with no
-    # manifest row ships on NO consumer, #498 staleness class). Repo-tree only,
+    # manifest row ships on NO consumer, #498 staleness class). #2425: "tracked"
+    # means git lists it under extensions/ (the index is read); an untracked,
+    # git-ignored directory such as extensions/<x>/node_modules is not an
+    # extension and cannot false-block. Repo-tree only,
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
     # checks 1–5 (materialized copy / mistargeted link / unwired entry /
     # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
@@ -248,6 +223,10 @@ jobs:
         # green while the real module drifts. The suite lives here, loads the
         # canonical file BY LOCATION and pins `__file__` to it. This step is what
         # keeps it non-inert — an unwired suite passes in CI by never running.
+        # #2139 — `scripts/test_beta_progress.py` is named for the same reason as the two
+        # suites above: the DELIVERY line's REST second source lives in a file CI could not
+        # execute, so the fallback, the same-source rule and the paged window were pinned by
+        # nothing. A suite the repo does not RUN is a suite it does not HAVE.
         # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
         # #1552 — `scripts/test_objective.py` and `scripts/test_turn_classify_state.py`
         # are named here for the SAME reason: both lived ONLY on the laptop
@@ -255,7 +234,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -269,6 +248,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # #2818 — the pin-freshness gate below judges the PR's OWN COMMIT, not
+          # the synthetic merge GitHub checks out for `pull_request` (a merge
+          # result mixes the branch's pin with `main`'s scripts, so the verdict
+          # tracked how far `main` had moved). Depth 2 = the merge commit plus its
+          # two parents, i.e. the head tree, without a full clone.
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -298,7 +284,7 @@ jobs:
         run: python3.12 tools/fleet/liveness.test.py
       - name: Fleet liveness mutation evidence (#1178, zero-dep)
         # The suite above is only a pin if it can FAIL. `--mutations`
-        # reintroduces each of the 31 defects into a TEMP copy of the module (or
+        # reintroduces each of the 38 defects into a TEMP copy of the module (or
         # of the identity library) and re-runs the paired test against it in a
         # subprocess — a mutation whose paired test still passes is reported as
         # a suite failure. Its own step, not a second command in the step above:
@@ -312,16 +298,107 @@ jobs:
         # under launchd with no agent in the loop. Zero-dep by construction: the
         # suite is a standalone script, drives the report as a subprocess
         # against temp fixtures with hermetic ps/date shims and a stubbed gh, and
-        # carries a RED control that mutates the report seven ways (escalate
+        # carries a RED control that mutates the report eight ways (escalate
         # every state / escalate nothing / drop the child exclusion / drop the
         # open-workspace filter / drop the policy text's 24h carve-out / name
         # one reason for a state several paths reach, #1273 / drop the
-        # markdown-cell escape, #1272) and the
+        # markdown-cell escape, #1272 / drop the population-gap declaration,
+        # #1777) and the
         # CLASSIFIER it consumes two more (drop the turn-ended guard and drop
         # the compaction-tail abstention, #1254), requiring each paired leg to
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: PR state router suite (#2866, zero-dep)
+        # #2866 — the router is the ONE answer to "what does this PR need next, and should anything
+        # be running for it right now". Its rules are what decide whether CI is spent (a `cancelled`
+        # check is NOT a failure; an empty surface is NOT green; `attested_sha` must be the merged
+        # head — with the gate's own `carried` arm honoured), so an unwired suite would leave the
+        # whole policy unmeasured. Zero-dep by construction: a stub `gh` answers every read from
+        # fixtures, and a stub `record-review.sh` answers the diff-hash seam — no network.
+        run: python3.12 tools/fleet/pr_state.test.py
+      - name: PR state router mutation evidence (#2866, zero-dep)
+        # The suite above is only a pin if it can FAIL. `--mutations` reverts each rule in a TEMP copy
+        # of the module and re-runs the paired test against it in a subprocess — a mutation whose
+        # test still passes is reported as a suite failure. Its own step, so one verdict cannot
+        # suppress the other (the same rule the two fleet-liveness steps above follow).
+        run: python3.12 tools/fleet/pr_state.test.py --mutations
+      - name: pi pool reaper gate suite (zero-dep)
+        # The `pi` session pool had NO owner: the `ppid=1 + our-checkout + testish` orphan class
+        # cannot see a lane's `pi` (bare argv, reparented to launchd or under tmux), so days-old
+        # stopped sessions accumulated while the box's own lanes waited for capacity (measured
+        # 2026-10-22: 64 `pi`, 21 of them 1-9 days old at a 0.00 s CPU delta). `scripts/
+        # orphan-reap.py --pool pi` owns them, and it consumes `tools/fleet/liveness.py::evaluate`
+        # (`idle` is the only kill authorisation) rather than forming a second opinion. The suite
+        # drives the census through injected ps / session-index / stat / clock readers (NO live
+        # process is touched), asserts the four states stay distinguishable, and its --mutations
+        # pass requires each of gates 1-3 to be load-bearing (drop one and its paired test must
+        # go RED). Its own step, so one verdict cannot suppress another.
+        run: python3.12 scripts/orphan-reap.test.py --mutations
+      - name: finished-lane reaper suite (#2163, zero-dep)
+        # A lane's reader treats a missing `<tag>.rc` as RUNNING, so a print-mode `pi` whose turn
+        # ended but which never exited reads as work in progress for hours (measured 2026-10-23:
+        # 46 bare `pi`, 27 finished, oldest 6 h 21 m). `pi-done-not-exited.py` imports the canon's
+        # turn boundary (`tools/fleet/liveness.py`) and the pool owner's session binding / gate 2
+        # (`scripts/orphan-reap.py`) and adds ONE predicate: launcher ownership (`TAG` in the
+        # process's own environ). The suite builds NINETEEN real process trees (a script named `pi`, a
+        # real launcher, a real fd-1 log, a pi-named transcript) plus a control lane, and requires
+        # BOTH directions: the finished ones are reaped, while a growing log, an OPEN turn, an
+        # ABSTAINING turn boundary, a shared log, a live child, a SIGTERM-ignoring target and a
+        # no-owner `pi` all survive — plus the silence bound, the arming gate (#2391) and the
+        # refusal bucket. Its own step, so one verdict cannot suppress another.
+        run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py
+      - name: finished-lane reaper — mutation control (#2163, zero-dep)
+        # The repo's rule for a zero-dep suite: a suite whose ability to go RED is only CLAIMED in
+        # prose is the false-PASS shape (see the siblings' --mutations/--red-control steps). This
+        # patches a temp copy of the tool with each defect the suite claims to guard — an abstaining
+        # turn boundary folded into `turn-ended` (the state that shipped a P0 in cycle 1), the
+        # log-growth veto dropped, the open-turn veto dropped, the log-only arm's silence bound
+        # dropped, the pre-signal log re-read removed, `tag` granted for ANY TAG, the argv ownership
+        # rung deleted, the print-mode predicate deleted, the peer-claimed guard disabled, and `--pid`
+        # binding only the requested subset, and `code_only()` reverted — and requires the suite to fail.
+        run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py --mutations
+      - name: Ref-claim registry reader suite (#1777, zero-dep)
+        # #1777 — an orchestrator lane runs `pi -p --no-session`, so it writes no
+        # transcript and no cmux store record and is in NO population
+        # lane_liveness.py can build; a controller then read that absence as
+        # "free" over a live fixer committing to the branch. This step pins the
+        # reader of the durable, holder-authored `refs/claims/<pr>-<sha12>`
+        # registry (tools/fleet/claim_lanes.py). Zero-dep by construction: a
+        # standalone script, real git over a file:// transport against temp bare
+        # repos, and a git PATH shim for the failure modes. It asserts the read
+        # NEVER decides a state — every claim verdict is an
+        # `liveness.CLAIM_REASONS` abstention (the ONE verdict function stays
+        # liveness.evaluate, #1178) — and that its exit code is fail-closed: 0 only
+        # when a claim IS visible for the queried head, 3 when nothing was
+        # established (including "no claim visible").
+        run: python3.12 tools/fleet/claim_lanes.test.py
+      - name: Ref-claim reader mutation evidence (#1777, zero-dep)
+        # 30 mutations, each reintroducing the defect its test exists to catch:
+        # a failed read read as an absence, an empty registry read as a failed
+        # one, a missing/stale/shape-drifted snapshot accepted, presence dropped
+        # when metadata fails, the LOCAL ref space read instead of the registry,
+        # the cwd read instead of the target repo, a negative lease accepted, a
+        # NON-FINITE staleness bound accepted (argparse takes `nan`, and every
+        # comparison against it is False — a stale snapshot certified fresh), a
+        # RELATIVE remote left relative (one --repo answering per cwd) or an
+        # absolute/scp-like one misclassified as relative, a
+        # credential in the remote URL echoed into the report (including one whose
+        # password tail holds `@`, or a token in the query string), the commit
+        # HEADERS parsed as the message (so a pusher-minted header supplies
+        # owner=/lease_until= where claims.sh reads the body), `origin` with no
+        # --repo escaping as a TypeError instead of the usage exit 2, the PR
+        # inferred from the ls-remote ORDER instead of the match (so a
+        # lower-sorting claim key hides a live holder), an un-normalised sha, a
+        # short sha consumed by a coincidental decoy prefix, a multi-PR head
+        # reduced to one match by ref order, the two key shapes of `refs/claims/`
+        # conflated (so a short `--sha` head-matches an `issue-<N>` ref and the CLI
+        # exits 0 for a head nobody holds), the excluded non-head keys no longer
+        # named, and the cascade order inverted. One
+        # hygiene mutation leaves the JSON verdict `detail` raw while the text
+        # renderer sanitizes the same attacker-influencable owner string. Its own
+        # step so neither verdict suppresses the other.
+        run: python3.12 tools/fleet/claim_lanes.test.py --mutations
       - name: Successor-preflight suite (#1317, zero-dep)
         # #1317 — a successor lane was dispatched to a unit whose predecessor was
         # live and mid-review, on a state assertion ("out of context") nobody had
@@ -351,6 +428,31 @@ jobs:
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
+      - name: Dispatch-preflight suite (zero-dep)
+        # The complementary question to the successor preflight above: that tool
+        # asks "is a predecessor still ALIVE", this one asks "is there anything
+        # left to LAND". Measured 2026-10-18: 12 of 15 dispatched worktrees sat on
+        # a HEAD that origin/main already contained, and ALL 12 produced +0 commits
+        # — a whole lane spent discovering there was nothing to do. The suite is
+        # zero-dep and hermetic (temp git repos, a refs/remotes/origin/main base,
+        # no network, and the process's GIT_* environment cleared so a leaked
+        # GIT_DIR cannot redirect a fixture into the caller's repo), and it carries
+        # its own RED control: 16 mutations of the shipped file (the contained-delta
+        # read skipped, the merge result trusted on its own, a merge conflict
+        # treated as an error, an unsupported merge-tree losing its name, a
+        # `--help` exit reported as HAS-WORK, dirty files ignored,
+        # `--untracked-files=normal` dropped, dirty gated behind base resolution,
+        # the work-tree-root identity check dropped, and six fail-closed reads
+        # turned into HAS-WORK) must each turn their paired leg RED. The control
+        # refuses to run at all if the unmutated suite is not green.
+        # Visible, not merge-blocking, for the same reason as its sibling above:
+        # `pipeline-compliance` is the repo's only required check.
+        run: python3.12 tools/fleet/dispatch_preflight.test.py
+      - name: Dispatch-preflight mutation evidence (zero-dep)
+        # Its own step, not a second command in the step above — sequencing would
+        # suppress one verdict when the other fails (the rule every suite here
+        # follows).
+        run: python3.12 tools/fleet/dispatch_preflight.test.py --red-control
       - name: fleet-health REAPER-table suite (#1862, zero-dep)
         # #1862 — the restored orphan reaper (`com.eldato.pi-reap-orphans`) is installed
         # unconditionally by install-launchd.sh, but `fleet-health.py`'s `reaper_section()` reads a
@@ -460,6 +562,13 @@ jobs:
         run: python3.12 tools/fleet/outcome_canary.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Spawn-capacity suite (#2665, zero-dep)
+        # The ≥1-dispatch floor's classifier: a `task`/`subagent` result that produced NO verdict
+        # must not count as a review. Zero-dependency (node stdlib + tsx), so it runs in THIS job,
+        # which performs no `npm ci` — and its consumer's suite lives in
+        # extensions/review-enforcer/index.test.ts (the `npm ci` job), so the classifier's own pins
+        # ran nowhere until this step existed.
+        run: npx tsx extensions/shared/spawn-capacity.test.ts
       - name: Kill-switch / session-escape suite (#1419)
         # #1419 — the deadlock escape. Zero-dependency (node stdlib + tsx), so it
         # MUST run in THIS job, which performs no `npm ci`; it is also invoked
@@ -567,6 +676,30 @@ jobs:
         # class-keyed ceiling. Its mutation section deletes the ceiling and flattens the
         # class caps, so a suite that only proves the acceptance path cannot stay green.
         run: npx tsx extensions/loop-enforcer/review-scale.test.ts
+      - name: Loop-enforcer cron exit property (#2935/#2944 — the interval must not hold the event loop)
+        # #2935 — every cell lane printed its answer and then never exited; the
+        # cause was THIS module's `setInterval`, a REF'd handle nothing cleared.
+        # The suite was wired only into ci-main.yml's
+        # `extensions/loop-enforcer/*.test.ts` glob, so a mutation that
+        # reintroduced the hang was caught POST-merge, on main, not on the PR
+        # that caused it. Zero-dep (`node:*` + `./scheduler.ts`, whose only import
+        # is `./manifest.ts`, itself `node:*` only), so it runs in THIS job, which
+        # performs no `npm ci`. The assertion is `hasRef() === false` — the exact
+        # property, and timing-free, so the mutation fails immediately instead of
+        # hanging the suite.
+        run: npx tsx extensions/loop-enforcer/scheduler-unref.test.ts
+      - name: Loop-enforcer cron re-arm across session replacement (#2948)
+        # #2948 — #2944 cleared the tick on `session_shutdown`, which pi also emits
+        # on session REPLACEMENT ("new" | "resume" | "fork"), and those flows do
+        # not re-run extension factories — so the timer was never recreated and
+        # every cron-type loop silently stopped firing until a `/reload`.
+        # Both directions are pinned (replacement re-arms and still fires; quit
+        # stays cleared), plus a child-process exit probe so #2944's fix cannot
+        # regress. Zero-dep: it drives the real factory via `./index.ts`, whose pi
+        # import is TYPE-only, with a hermetic $HOME — so it runs in THIS job.
+        # Wired here as well as into ci-main.yml's glob: a suite that lives only
+        # behind the post-merge glob reports this class of regression on main.
+        run: npx tsx extensions/loop-enforcer/cron-rearm.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
@@ -650,6 +783,27 @@ jobs:
         # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
         # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/reviewer-preflight.test.ts
+      - name: Headless-lane contract suite (#2965, zero-dep)
+        # #2965 — a guard must judge what the process IS, not who launched it. `lane.sh` exports
+        # SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless `pi -p` started any other way (a
+        # cloud-cell dispatch, a hand-run "pi -p … --no-session") got the gates and none of the
+        # affordances, so its `git commit` was refused and the lane exited with ZERO commits —
+        # measured 2026-10-27, and silent, because nothing fails loudly when a gate simply says no.
+        # This suite builds a REAL hub and REAL linked worktrees with git and pins BOTH arms: a
+        # derived lane acts, the hub stays guarded. Both halves matter — a suite that only pinned
+        # the worktree arm would accept a change that lifted the hub gate (what #618/#621 measured).
+        # Zero-dep (`node:*`, ./headless-lane.js, ../skill-enforcer.js, the `git` binary), so it runs
+        # in THIS job (no `npm ci`); the BLOCKING backstop is the post-merge ci-main.yml
+        # `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/headless-lane.test.ts
+      - name: Headless-lane contract MUTATION evidence (#2965, zero-dep)
+        # The suite above is only a pin if it can FAIL. Mutations reintroduce each arm's defect —
+        # the derivation reverted so a linked worktree no longer derives a lane, and the historical
+        # path-insensitive fail-open that treats EVERY checkout as a linked worktree (#618/#621) —
+        # into a TEMP copy of the module, and into the wiring through the contract seam, requiring
+        # each paired assertion to go RED and printing it verbatim. Its own step so neither verdict
+        # can suppress the other (the rule every sibling suite here follows).
+        run: npx tsx extensions/shared/headless-lane.test.ts --mutations
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
@@ -707,6 +861,59 @@ jobs:
         # ci-main.yml is POST-MERGE only, and a fail-open regression in a guard
         # must not reach main before anything reads it.
         run: node extensions/main-worktree-guard/test-script-backdoor.mjs
+      - name: main-worktree-guard sanctioned-script IDENTITY + pin (#2332)
+        # The exemption for `SANCTIONED_SCRIPT_RELPATHS` was a realpath STRING
+        # EQUALITY against the module's own checkout, which is only correct where
+        # the guard and the scripts live in ONE tree. On a copy-deployed box the
+        # module root is `~/.pi/agent` (partial `scripts/`, no `admin-merge.sh`
+        # at all, #2176) while the rail lives in `$AGENT_INFRA_PATH/scripts/` —
+        # so the mandated merge rail was REFUSED from every hub-rooted session
+        # and the only routes left were the hatch or a bare `gh pr merge` that
+        # skips every comparison the rail makes. This suite pins the two halves
+        # that make the widened exemption safe — sanctioned relpath INSIDE a
+        # framework checkout, sha256 equal to the pin, AND the audited DELEGATION
+        # CLOSURE (every `$SELF_DIR` helper the script executes) — and MUTATES the
+        # shipped source to prove each part is load-bearing (literal-path equality
+        # restored ⇒ the rail blocks again; leaf digest dropped ⇒ a renamed
+        # destructive script is allowed; root check dropped ⇒ a non-framework dir
+        # is exempted; closure dropped ⇒ the pinned rail runs an agent-chosen
+        # `ci_exemption.py`, its own grader). It is a PIN-FRESHNESS gate
+        # too: a PR that changes (or deletes) a listed script — or a helper one of
+        # them executes by its own location — without re-cutting
+        # `sanctioned-scripts.pin.json` reds here, so a stale pin cannot reach
+        # main and silently block the rail.
+        #
+        # ⛔ #2818 — `--ref` is the whole fix for the treadmill. Without it the
+        # gate reads the pin and the scripts out of the SAME CHECKOUT, which here
+        # is GitHub's synthetic MERGE of head onto the base TIP: a merge result
+        # takes each file from whichever side changed it, so a branch that re-cut
+        # its pin beside ITS OWN sanctioned-script edit carried that pin next to
+        # scripts an unrelated merge had since changed — red until someone re-cut,
+        # and every new merge re-opened it on every other open PR. Naming the head
+        # commit answers the question the gate exists to answer ("did THIS change
+        # drift the sanctioned surface without re-cutting?"), which no unrelated
+        # merge can invalidate. The polarity is unchanged and is pinned by
+        # `test-sanctioned-pin-merge-base.mjs`: untouched surface ⇒ pass however
+        # far main moved; edited surface without a re-cut ⇒ fail; edited +
+        # re-cut ⇒ pass.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step
+        # for the same reason as the suite above: the `extensions/*/test*.mjs`
+        # glob in ci-main.yml is POST-MERGE only.
+        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"
+      - name: main-worktree-guard pin freshness is a property of ONE commit (#2818)
+        # The non-vacuity rig for the line above. Hermetic git repos build the
+        # treadmill: a branch re-cuts its pin beside its OWN sanctioned-script
+        # edit, an unrelated merge moves another sanctioned script on `main`, and
+        # the merge GitHub would build then carries the branch's pin beside main's
+        # scripts. Asserts (a) the change PASSES judged on its own commit; (a′)
+        # the SAME change FAILS judged on the merged tree — the pre-#2818 reading,
+        # so dropping `--ref` reds this suite instead of silently restoring the
+        # treadmill; (b) an edit without a re-cut still FAILS; (b′) a deletion
+        # without one still FAILS; (c) edit + re-cut PASSES, base moved or not.
+        # It also asserts this wiring (`--ref`, `fetch-depth: 2`, this step),
+        # because an unwired suite passes by never running.
+        # Zero-dep (`node:*` + the `git` binary), ~2s.
+        run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked
@@ -900,20 +1107,11 @@ jobs:
       - name: Shared-predicate parity pin (#1330)
         run: npx tsx extensions/verification-gate/tool-call-event-parity.test.ts
 
-  setup-suite:
-    # #449 — pi-bootstrap setup regression suite, per-PR gate: the ONLY run-site
-    # that catches the #447 ship-list drift class at PR time (previously the
-    # parity suite ran nowhere in CI — the drift shipped silently and was found
-    # by manual invocation only). Real setup.sh under a temp HOME, hermetic
-    # (npm stubbed, launchctl shim, Darwin-gated assertions); ~2min.
-    # Covers: no-nesting (#93), active-file refresh, farm-link preservation,
-    # extensions/ content parity (single source of truth #95), launchd
-    # isolation (#446).
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: pi-bootstrap setup regression suite
-        run: bash pi-bootstrap/tests/test-setup-no-nesting.sh
+  # ⛔ NO `setup-suite` JOB (agent-infra#2439). Its one step was
+  # `pi-bootstrap/tests/test-setup-no-nesting.sh`, which is ALREADY a shard of
+  # `scripts/run-bash-shards.sh` — so this job re-ran it on every PR push (17 s of
+  # the 23 s job was the suite itself). The #449 rationale stands and is cited on
+  # that shard line; only the second run site is gone.
 
   bash-suites:
     # #1369 — Route A of the lane-split fix: the PR lane must RUN the bash work its check
@@ -942,9 +1140,78 @@ jobs:
     # (`ADMIN_MERGE_LANE_JOB_PREFIX`, default `test`), so it stays outside that family and
     # cannot move the rail's lane-coverage comparison (#1349 — a separate remedy; nothing
     # here helps or hinders it).
+    #
+    # ⛔ DURATION, not runner capacity, was this job's defect (measured 2026-10-23, PR #2412):
+    # the run started 10:25:04Z, was still `in_progress` at 13:11Z — ~2h46m inside the ONE step
+    # "Bash shards — the ONE list both lanes run" — and then failed. Measured alongside that:
+    # 80 open PRs, and the account pool was NOT starved (agent-infra: 5 in progress / 3 queued
+    # against a 20-job pool). One unsharded job holding a serial sweep for hours starves CI by
+    # DURATION while every capacity signal reads healthy. Two defects, and the second is why the
+    # first was invisible:
+    #   1. every shard ran SERIALLY in one job → the fix is the MATRIX below.
+    #   2. the job declared NO `timeout-minutes` (agent-infra #2055) → a hung shard burned hours
+    #      and then reddened the PR without naming itself. The bound below makes a hang FAIL FAST,
+    #      and the job that trips it names the slice it was running.
+    #
+    # ⛔ THE MATRIX CARRIES A SLICE, NEVER A LIST. `scripts/run-bash-shards.sh` remains the ONE
+    # source of the shard list (its header records why every duplicated-list form was proven
+    # unsound). This job contributes only a LANE WIDTH, and even that is not typed twice: the
+    # denominator is `strategy.job-total`, GitHub's own count of the jobs this matrix expands to,
+    # so widening or narrowing the matrix below is a ONE-LINE edit that cannot leave a stale `/N`
+    # behind. The slice arrives as `BASH_SHARD_SLICE` in the STEP's `env` — not as an argument —
+    # because the step's `run` must stay the bare call `bash scripts/run-bash-shards.sh`: that is
+    # what `check-ci-lane-parity` asserts (an argument there is a MENTION, not the call, and the
+    # lane un-wires — the #1369 class).
+    #
+    # COVERAGE IS ARITHMETIC, NOT TRUST. Each slice asserts that the SET of shards it executed is
+    # exactly the set its index derives from the list (a sorted-path comparison, not a count — a
+    # broken modulus that runs the right NUMBER of the wrong shards is caught too), AND that
+    # `executed + skipped == listed`. The slices therefore sum to the whole list. A slice that runs
+    # nothing, or a neighbour's shards twice, fails its own assertion rather than reporting a green
+    # check over a hole.
     runs-on: ubuntu-latest
+    # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Sized from CI's own
+    # measurements (PR #2412 job 120365087427: the list then held 74 shards — it is 78 today, and
+    # the per-slice sizes are DERIVED, so no number here goes stale — 73.6 min, 59.7 s/shard
+    # mean; #2483's
+    # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
+    # remaining shards 26m25s).
+    #
+    # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is
+    # ~33 min ON ITS OWN (66 serial mutation re-runs, each <81 s — which is why a gap analysis over
+    # the log cannot see it), so with 8 round-robin slices the worst slice is ≈ 33 min + its 9
+    # siblings ≈ 37 min, and no wider matrix goes below 33. The shard step's own bound below is 70
+    # min = ~1.9x that slice: enough for runner variance, and it still fails fast against the
+    # unbounded 1h52m this job shipped with.
+    # Splitting those two shards is #2483 — until it lands, slicing halves the wall (73.6 → ~37 min
+    # of shard work) and nothing can make it shorter.
+    #
+    # ⛔ THIS JOB BOUND IS A PURE BACKSTOP, AND THE INVARIANT IS ARITHMETIC: it sits ABOVE the sum
+    # of its steps' bounds, so it can never fire before the step that is actually running trips its
+    # OWN bound. That matters because the two produce different conclusions — a step trip is
+    # `failure` (RED), a job trip is `cancelled`, which this repo's merge rail names NON-RED. A job
+    # bound below the sum would let the non-red one win: 10 (checkout) + 10 (node) + 70 (shards) =
+    # 90 < 100.
+    timeout-minutes: 100
+    strategy:
+      # false: every slice reports its own result, so one hang cannot hide the other slices'
+      # verdicts — the diagnostic this job lacked, since a single step reported nothing until
+      # it died.
+      fail-fast: false
+      matrix:
+        # Slices, not shards. Width = the number of entries here; the per-slice sizes are DERIVED by
+        # the runner's own round-robin (`pos % n`) over whatever the list holds today, not asserted
+        # here — they shift when a `run_shard` line is added, and the runner re-derives them, so
+        # nothing in this file goes stale. The runner refuses a count wider than its own list.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      # ⛔ checkout and setup-node carry their own bounds too. Unbounded, a hang in EITHER would be
+      # caught by the JOB bound above — i.e. reported `cancelled`, which the rail reads as NON-RED,
+      # while no shard had run: every shard ungated behind a non-red check, which is worse than
+      # losing one slice. `timeout-minutes` applies to `uses:` steps as well as `run:` steps (the
+      # runner sets the step deadline before `step.RunAsync()` for either kind).
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       # The runner below includes `tests/search-cost/run.sh`, whose harness type-strips index.ts and
       # needs Node >= 22.13 — ci.yml's own `search-cost` job pins it for exactly this reason, with the
       # note that inheriting the runner's Node "is not a contract". Same pin here, and the same pin in
@@ -952,12 +1219,82 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+        timeout-minutes: 10
+      - name: Bash shards — the ONE list both lanes run (#1369)
+        # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
+        # hand-kept number, and never a list: the list is the runner's).
+        env:
+          BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+        # ⛔ THE BOUND IS ON THE STEP, NOT ONLY ON THE JOB — the two are DIFFERENT conclusions, and
+        # only one of them blocks. A JOB that trips `jobs.<id>.timeout-minutes` is reported
+        # `cancelled`: the service cancels the job, the job-cancellation callback sets
+        # `jobContext.Result = TaskResult.Canceled` (`StepsRunner.cs:149-155`, the `Canceled` arm at
+        # :154), and a step still running when that happens takes `TaskResult.Canceled`
+        # (`StepsRunner.cs:331-336`). (`JobRunner.cs` has NO timeout handling at all — its
+        # `TaskResult.Canceled` at :198 is the *initialize* cancel path, not this one.)
+        # A `cancelled` check is NON-RED to this repo's rail (`scripts/admin-merge.sh`
+        # `NON_RED_CONC`), so a job-only bound would let a PR merge with THIS slice's shards never
+        # executed — a false PASS dressed as a fail-fast, which is the #1369 shape one level up.
+        # A STEP that trips its own bound takes the other branch in the same file: at
+        # `StepsRunner.cs:324-329`, `timeoutMinutes` fires with `jobCancellationToken` NOT
+        # cancelled, so the result is `TaskResult.Failed` — which the job reports as `failure`,
+        # which the rail reds. 70 min leaves 20 min of job bound for checkout/setup and stays ~1.9x
+        # the measured worst slice (~37 min), so it cannot false-block a slow-but-healthy slice.
+        timeout-minutes: 70
+        run: bash scripts/run-bash-shards.sh
+
+  bash-suites-gate:
+    # #1369's two guard steps, ONCE per PR — not once per slice. They lived in `bash-suites`
+    # while it was a single job; inside a MATRIX they would run 8 times, and
+    # `tests/ci-lane-parity/run.sh` executes, once per runtime pin, a fixture built from the
+    # runner's own lines with every `run_shard <path>` line rewritten to the hermetic
+    # `tests/ci-lane-parity/stand-in-shard.sh` (there is no `runner-fast.sh` any more — #2529
+    # removed it; the quoted `run_shard "$sentinel"` call survives the rewrite by design, so the
+    # failure-recording arm still has something to fail). It costs ~8 s today, but it is a whole
+    # suite per slice: running it 8 times would buy nothing and would re-create this PR's own
+    # defect in the job that exists to catch it.
+    #
+    # ⛔ NOT conditional and no `needs:` — `check-ci-lane-parity` refuses `if`/`needs`/
+    # `continue-on-error` on the call-carrying job exactly so a lane cannot be made to look wired
+    # while it never runs. This job is a plain sibling: it runs on every PR, and its failure reds
+    # the PR like any other. `bash-suites` still makes the bare call the guard asserts.
+    runs-on: ubuntu-latest
+    # #2055: the bound this job never had. ⛔ THE BOUND IS SIZED FROM THE CURRENT SUITE, NOT FROM
+    # THE 38m41s FIGURE THIS COMMENT USED TO CARRY — that measurement is PR #2412's (job
+    # 120365087427, 2026-10-23T10:25Z), and it predates #2529 (`00814821`, 16:09Z the same day),
+    # which stopped the suite's fixture re-running the real shard list and replaced it with one
+    # hermetic stand-in. MEASURED AFTER #2529 (2026-10-24, `bash-suites-gate` step 5, 17 PR runs
+    # sampled from the Actions API): 6-12 s on 16 of them (3x6, 1x7, 8x8, 2x9, 2x12 s) and one
+    # 17 s outlier — the ~90 static arms, not the shard list, are the wall now. The stale figure
+    # outlived its cause by a day and was read as "the one confirmed per-PR cost left"; a bound
+    # derived from it protects nothing while it looks sized.
+    #
+    # 15 min ≈ 53x the worst observed 17 s: a bound BELOW the real run would false-block every PR
+    # (a red that is not a defect is how a gate loses its authority), while a bound 400x above it
+    # is not a fail-fast — it is the #2055 stall with a label on it.
+    #
+    # ⛔ SAME ARITHMETIC AS `bash-suites`: the job bound sits ABOVE the sum of the step bounds below
+    # (10 + 10 + 5 + 15 = 40 < 60), so a running step always trips its OWN bound first — which is
+    # `failure` (red), never the job-level `cancelled` this repo's rail reads as non-red.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+        timeout-minutes: 10
       - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
+        # Step bounds, not just the job bound, for the reason recorded on `bash-suites` above: a
+        # step timeout is `failed` (red), a job timeout is `cancelled` (non-red to the rail).
+        # The guard itself is a single node run — 0.3-0.4 s locally, ≤1 s on the runner.
+        timeout-minutes: 5
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        # 15 min for a suite measured at 6-17 s on PR runs since #2529 — see the bound's
+        # arithmetic in this job's header.
+        timeout-minutes: 15
         run: bash tests/ci-lane-parity/run.sh
-      - name: Bash shards — the ONE list both lanes run (#1369)
-        run: bash scripts/run-bash-shards.sh
 
   vendor-drift:
     # #383 — the SINGLE vendor drift gate: bash syntax + manifest verification

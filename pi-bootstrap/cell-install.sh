@@ -161,6 +161,18 @@
 #                    'checkout-shaped' is not a trust signal by itself — whoever can
 #                    pre-create that path would choose the extensions and farmed scripts
 #                    that pi then EXECUTES. Pass INFRA_ROOT explicitly to override.
+#        AGENT_GH_SHIM_DIR  a PREFERENCE, not an override, and it decides ONE HALF of a
+#                    two-part contract. --verify checks (1) the INSTALLED copy
+#                    ($CELL_HOME/.pi/agent/scripts/gh-shim), on its own and unconditionally:
+#                    it is what a lane started WITHOUT this variable resolves, so it must be
+#                    present and executable whether or not the variable is set — a valid
+#                    preference never stands in for it. This variable decides only (2) WHOSE
+#                    `../verify-admin-merge-evidence.sh` sibling is required: the FIRST
+#                    candidate holding an EXECUTABLE `gh` — [this variable, then the installed
+#                    copy], mirroring the review-enforcer's resolveGhShimDir(), so an unusable
+#                    value falls back rather than failing a healthy cell — is the winner, and
+#                    the sibling is resolved through symlinks (a symlinked shim AND a symlinked
+#                    candidate directory alike).
 #
 #   Idempotent and refresh-on-rerun, exactly like setup.sh's farms: installed files are
 #   real copies (not symlinks — a cell's checkout can live under /tmp, and #427 is the
@@ -183,7 +195,7 @@ MODE="${1:---install}"
 FAILURES=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
 die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
-say()  { printf '  %s\n' "$*"; }
+log_line()  { printf '  %s\n' "$*"; }
 
 # ── the deny list: what must not run ON A CELL ──────────────────────────────
 # Kept as data so the deny is readable and testable, and so the DEFAULT for a new
@@ -458,7 +470,15 @@ install_farms() {
   if [ "$n" -lt "$MIN_FARM_FILES" ]; then
     die "the declared farm set parsed to only $n file(s) (floor: $MIN_FARM_FILES) — setup.sh's shape changed and this parse would install a PARTIAL layer, then verify clean against its own truncated reading. Nothing was certified."
   fi
-  say "scripts farm: $n file(s) installed (declared by pi-bootstrap/setup.sh)"
+  log_line "scripts farm: $n file(s) installed (declared by pi-bootstrap/setup.sh)"
+  # Observability for the layer that decides whether a landing is evidence-bound (#984). `--verify`
+  # is the authority (`guard_gh_shim`), but an INSTALL log should say out loud whether the cell now
+  # carries an argv layer at all — install silence is how a cell ran degraded while looking green.
+  if [ -x "$DEST/scripts/gh-shim/gh" ]; then
+    log_line "argv-level gh shim: $DEST/scripts/gh-shim/gh (merge gate not degraded — #984)"
+  else
+    fail "the argv-level gh shim did not land at $DEST/scripts/gh-shim/gh — this cell's merge gate would run DEGRADED (#984)"
+  fi
 }
 
 # ── 1b. the UNFARM leg (#1924) ───────────────────────────────────────────────
@@ -592,10 +612,10 @@ install_extensions() {
     # `--install` and would still refuse the cell, so this is not a false PASS — but a log that
     # contradicts itself two lines later is exactly what sends an operator down the wrong path.
     rm -rf "$DEST/extensions/$dbase" || die "could not remove the denied extension at $DEST/extensions/$dbase — the cell would keep running it"
-    say "removed denied extension: $dbase ($(denied_extension_note "$dbase"))"
+    log_line "removed denied extension: $dbase ($(denied_extension_note "$dbase"))"
     removed=$((removed + 1))
   done
-  say "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied on a cell, $removed removed"
+  log_line "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied on a cell, $removed removed"
 }
 
 # Extension runtime dependencies. Four shipped extensions import bare packages
@@ -641,7 +661,7 @@ install_extension_deps() {
     if (cd "$d" && env -i PATH="$PATH" HOME="$npm_home" TMPDIR="${TMPDIR:-/tmp}" \
           ${npm_env[@]+"${npm_env[@]}"} \
           npm install --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null 2>&1); then
-      say "deps installed: $base"
+      log_line "deps installed: $base"
     else
       fail "npm install failed for $base — that extension will not load (re-run with network, or: cd '$d' && npm install --omit=dev)"
     fi
@@ -654,7 +674,7 @@ install_skills() {
   [ -d "$INFRA_ROOT/skills" ] || die "no skills/ directory in $INFRA_ROOT"
   mkdir -p "$DEST/skills" && cp -R "$INFRA_ROOT/skills/." "$DEST/skills/" \
     || die "could not install skills"
-  say "skills: $(find "$DEST/skills" -name SKILL.md 2>/dev/null | wc -l | tr -d ' ') SKILL.md file(s) installed"
+  log_line "skills: $(find "$DEST/skills" -name SKILL.md 2>/dev/null | wc -l | tr -d ' ') SKILL.md file(s) installed"
 }
 
 # copy_repo_path <rel> — install a repo file or directory at its basename under $DEST.
@@ -702,7 +722,7 @@ install_config() {
   done
   # The step's own narrative may not contradict its FAIL line: an unconditional `say` here
   # used to print 'installed' straight after a recorded failure.
-  [ "$cfg_fail" -eq 0 ] && say "agents + behavior-control + small config files installed" || true
+  [ "$cfg_fail" -eq 0 ] && log_line "agents + behavior-control + small config files installed" || true
 
   # settings.json — MERGED, never clobbered (same contract as setup.sh: source wins per
   # key, local extras survive, `retry` deep-merged per key so a local
@@ -725,12 +745,12 @@ if isinstance(src.get("retry"), dict) and isinstance(dst.get("retry"), dict):
     merged["retry"] = retry
 json.dump(merged, open(sys.argv[2], "w"), indent=2)
 PY
-      say "settings.json merged (local extras preserved)"
+      log_line "settings.json merged (local extras preserved)"
     elif [ -f "$DEST/settings.json" ]; then
       fail "python3 is missing and settings.json already exists — refusing to clobber it; merge by hand or install python3"
     else
       install_file "$src" "$DEST/settings.json" || fail "could not install settings.json"
-      say "settings.json copied (python3 not found — plain copy)"
+      log_line "settings.json copied (python3 not found — plain copy)"
     fi
   fi
 
@@ -739,11 +759,11 @@ PY
   if [ -f "$base_agents" ]; then
     if [ ! -e "$DEST/AGENTS.md" ]; then
       install_file "$base_agents" "$DEST/AGENTS.md" || fail "could not install AGENTS.md"
-      say "AGENTS.md installed from templates/AGENTS.base.md"
+      log_line "AGENTS.md installed from templates/AGENTS.base.md"
     elif ! cmp -s "$base_agents" "$DEST/AGENTS.md"; then
-      say "AGENTS.md already present and DIFFERS from templates/AGENTS.base.md — left alone (a global rules file is hand-edited state). Reconcile by hand."
+      log_line "AGENTS.md already present and DIFFERS from templates/AGENTS.base.md — left alone (a global rules file is hand-edited state). Reconcile by hand."
     else
-      say "AGENTS.md already matches templates/AGENTS.base.md"
+      log_line "AGENTS.md already matches templates/AGENTS.base.md"
     fi
   else
     fail "templates/AGENTS.base.md is missing from $INFRA_ROOT — a cell would get no global rules"
@@ -758,7 +778,7 @@ PY
 migrate_legacy_tools_farm() {
   if [ -d "$DEST/tools/fleet" ]; then
     rm -rf "$DEST/tools/fleet"
-    say "migrated the legacy tools/fleet/ out of pi's boot-blocking namespace (#1277)"
+    log_line "migrated the legacy tools/fleet/ out of pi's boot-blocking namespace (#1277)"
   fi
   # A tools/ left empty by the removal above is not a boot-blocker (pi's scan ignores an
   # empty dir) but it is noise, and setup.sh removes it too — same surface, same output.
@@ -792,7 +812,7 @@ install_spawn_gate() {
     die "$src is missing from the checkout — the pi spawn-point gate (#1884) cannot be installed, so a hand-written runner's \`pi\` would be ungated and silent"
   fi
   install_file "$src" "$dst" || die "could not install $dst"
-  say "pi spawn-point gate installed at $dst (#1884)"
+  log_line "pi spawn-point gate installed at $dst (#1884)"
 }
 
 # Check (both modes; READ-ONLY). Byte-compared, not `[ -e ]`: a stale or hand-edited copy of a GATE
@@ -810,6 +830,195 @@ guard_spawn_gate() {
     fail "pi spawn-point gate DIFFERS from the checkout: $dst (a stale or hand-edited copy — the ceiling it applies is not the one this install reviewed)"
   elif [ ! -x "$dst" ]; then
     fail "pi spawn-point gate is NOT EXECUTABLE: $dst — PATH would resolve past it to the real pi, silently"
+  fi
+}
+
+# ── the argv-level `gh` shim (#984) — the merge gate's SECOND layer ─────────────
+# The review-enforcer answers "will this command text make gh perform an admin merge?" from
+# STRING rules, and that class is not closable in a scanner: resolving `$VAR`/`$(…)` requires
+# EVALUATING a shell, which a gate cannot do without running the command it exists to refuse. So
+# the extension prepends `EXTENSION_DIR/../../scripts/gh-shim` to PATH on every bash call and
+# lets the shim decide from its OWN argv, where the shell has already finished (the scanner stays
+# as the fast first layer and produces the better messages; the shim is the layer that does not
+# share its ceiling).
+#
+# ⛔ THE TWO PLATFORMS DIFFER ONLY IN WHAT THAT EXPRESSION RESOLVES TO, and the difference is
+# invisible in code: on a laptop the extensions are kept as farm SYMLINKS into the checkout, so
+# `../..` IS the checkout and the shim is found without ever being installed; on a CELL they are
+# real COPIES, so `../..` is `$DEST` and the shim must exist at `$DEST/scripts/gh-shim/gh`.
+# Nothing farmed that directory, so every cell lane logged
+#   `#984 argv-level gh shim not found — only the string scanner is active`
+# and the merge gate ran DEGRADED — no argv inspection at all — while `--verify` printed LAYER
+# VERIFIED. The gate that must certify a landing could not do its job on the boxes doing the work.
+#
+# ⛔ RESOLVED THE WAY THE EXTENSION RESOLVES IT, not written as `$DEST/scripts/gh-shim`: the
+# WIRING is the claim. If the installer ever puts extensions somewhere else, this must fail LOUDLY
+# instead of certifying a shim the extension will never look at.
+# ⛔ `AGENT_GH_SHIM_DIR` IS A **PREFERENCE**, NOT AN OVERRIDE, AND IT GOVERNS **ONE HALF ONLY**.
+# The two halves are verified SEPARATELY because they fail in OPPOSITE directions:
+#   (1) THE INSTALLED COPY, `EXTENSION_DIR/../../scripts/gh-shim/gh`, is required on its own, whether
+#       or not a preference is exported. It is the gate a lane started WITHOUT the variable runs, so
+#       a cell that lacks it — or holds it NON-EXECUTABLE, where bash SKIPS the PATH entry and the
+#       real gh runs with nothing on any stream — is DEGRADED no matter what the operator's shell
+#       exports. Letting the candidate loop decide this was a FALSE PASS: a valid preference made
+#       `--verify` print LAYER VERIFIED over a 644 installed shim, certifying exactly the silent
+#       fail-open the shim exists to prevent.
+#   (2) THE VERIFIER SIBLING belongs to whichever candidate WINS — mirror `resolveGhShimDir()`'s
+#       candidate list and order literally: `[AGENT_GH_SHIM_DIR, installed]`, first one holding an
+#       EXECUTABLE `gh`. An unusable override FALLS BACK there (pinned by
+#       extensions/review-enforcer/index.test.ts for a nonexistent AND a non-executable override),
+#       so verifying only the named directory would FAIL a cell whose gate the extension is
+#       enforcing correctly — and because `--install` ends by verifying, that false block would make
+#       `cloud-cell-bringup.sh --check` die on a healthy box and prescribe `--install` as the remedy
+#       for a failure `--install` just produced. The shim that RUNS is the one whose
+#       `../verify-admin-merge-evidence.sh` matters.
+# ⛔ THE SIBLING IS FOUND BY FOLLOWING THE LINK, PHYSICALLY — NOT BY A LEXICAL `$dir/../`. The
+# normal state is `~/.pi/agent/shims/gh` as a SYMLINK into the farmed shim (the harness injects
+# that neutral entry), and `scripts/gh-shim/gh` resolves its own directory by walking its links
+# for exactly this reason. A lexical join looked for `$DEST/verify-admin-merge-evidence.sh`, which
+# nothing installs, so a HEALTHY cell was REFUSED and the prescribed `--install` could never
+# repair it. THE SAME DEFECT HAS A SECOND FACE: a symlinked CANDIDATE DIRECTORY
+# (`AGENT_GH_SHIM_DIR=$TMP/ghshim` with `$TMP/ghshim -> $DEST/scripts/gh-shim`). Walking only the
+# FINAL component does not help there, because bash's `cd` is LOGICAL: `cd -- $link/..` strips a
+# component of the LEXICAL path, so the guard tested `<the link's lexical parent>/verify-…`, which
+# nothing installs either — and refused a healthy cell whose shim resolves that sibling fine (the
+# kernel's stat follows the link). Every `..` below is therefore taken PHYSICALLY (`cd -P`/`pwd -P`),
+# so the path TESTED is the path the KERNEL resolves.
+# ⛔ EXECUTE BIT: required on the SHIM (see (1)), but NOT on the verifier: the shim invokes it as
+# `bash "$VERIFY"`, so `-x` there would be a false block. It must merely be PRESENT and non-empty
+# — the shim fails CLOSED when it cannot find it, which refuses every admin merge on the cell
+# rather than certifying one.
+# Resolve a path's FINAL component through any symlinks, as `scripts/gh-shim/gh` does for itself
+# (`while [ -L … ]`, portable — no `readlink -f`, which BSD/macOS readlink lacks), and resolve each
+# hop's DIRECTORY PHYSICALLY (`cd -P`). Only the last component is walked here, which is the shape
+# this guard meets: the harness injects `~/.pi/agent/shims/gh` as a LINK to the farmed shim, and
+# the shim itself walks its own chain — while a DIRECTORY that is a link is handled by the caller's
+# physical `..` (walking the final component cannot see it, and must not: it would move the path).
+# ⛔ THE WALK IS BOUNDED. `[ -L ]` on a link CYCLE is TRUE FOREVER (a self-link never stops being a
+# symlink), so an unbounded walk HANGS the caller instead of failing it — and `--install` ends by
+# verifying, so the hang would land on `cloud-cell-bringup.sh --check`. Over the bound the function
+# prints NOTHING and returns 1, and the caller REFUSES: it never hands back a path it did not
+# resolve, because a guessed path can name a real `../verify-…` and thereby certify a shim that
+# cannot be executed at all.
+# (Same treatment for a hop whose directory or link cannot be read: unresolvable ⇒ return 1.)
+GH_SHIM_MAX_LINK_HOPS=40
+gh_shim_realpath() {
+  local p="$1" d hops=0 max="${GH_SHIM_MAX_LINK_HOPS:-40}"
+  # ⛔ THE BOUND MUST BE A NUMBER BEFORE IT IS USED. `[ N -gt abc ]` is an ERROR (rc 2), not a
+  # false, so `&& return 1` NEVER FIRES and the loop goes on to resolve the next hop — with a
+  # self-referential link that is an infinite walk, i.e. exactly the hang this bound exists to
+  # prevent, reached through the bound itself. (MEASURED with this guard removed: a self-link
+  # under a non-numeric bound was still spinning at 10s and printing `integer expression
+  # expected`.) The fallback is the same 40 the script-level constant holds, so a caller that
+  # sources this function with a corrupted value still gets a bounded resolver.
+  case "$max" in ''|*[!0-9]*) max=40 ;; esac
+  while [ -L "$p" ]; do
+    hops=$((hops + 1))
+    [ "$hops" -gt "$max" ] && return 1
+    d="$(CDPATH= cd -P -- "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    p="$(readlink "$p")" || return 1
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  printf '%s' "$p"
+}
+
+# The directory `review-enforcer` puts on PATH: `${EXTENSION_DIR}/../../scripts/gh-shim`.
+# ⛔ THE EXTENSION'S `EXTENSION_DIR` IS A **REALPATH**. It is `dirname(fileURLToPath(import.meta.url))`
+# — node resolves a symlinked module to its target before `import.meta.url` exists — so the SAME
+# expression names two DIFFERENT directories by platform: on a cloud cell the extensions are real
+# COPIES and it is `$DEST`; on a laptop setup.sh deliberately keeps them as farm SYMLINKS into the
+# checkout, and it is `<checkout>`. A guard that normalises the LEXICAL `$DEST/extensions/review-
+# enforcer/../../scripts/gh-shim` (a plain `cd && pwd` does: it strips `..` by string, never by
+# inode) therefore certifies `$DEST/scripts/gh-shim` on BOTH platforms — which on the symlink
+# platform is not the directory the gate reads: it is (a) a false PASS, where deleting the
+# CHECKOUT's shim leaves `LAYER VERIFIED` while every lane logs `#984 … not found`, the exact
+# defect this check exists to close, or the farmed copy can be deleted and the guard still refuses;
+# and (b) a false BLOCK, naming a path the extension never looks at, on a healthy symlink platform.
+# Taking the EXTENSION DIRECTORY physically first is what makes `../../scripts/gh-shim` on its
+# result the REALPATH form on both platforms — the path the kernel would resolve for the module.
+# The `dirname` pair (rather than a literal `..`) only removes the `..` from the message: on an
+# already-physical path the two forms name the same directory.
+gh_shim_extension_dir() {
+  local ext
+  ext="$(CDPATH= cd -P -- "$DEST/extensions/review-enforcer" 2>/dev/null && pwd -P)"
+  if [ -n "$ext" ]; then
+    printf '%s' "$(dirname "$(dirname "$ext")")/scripts/gh-shim"
+  else
+    # No extension on the cell at all — the MISSING-extension guard reports that separately. Name
+    # the path it WOULD have resolved, with the `../..` form, so the message stays actionable.
+    printf '%s' "$DEST/extensions/review-enforcer/../../scripts/gh-shim"
+  fi
+}
+
+guard_gh_shim() {
+  local override="${AGENT_GH_SHIM_DIR:-}" installed norm cand chosen="" verifier real
+  installed="$(gh_shim_extension_dir)"
+  # Normalised PHYSICALLY (`cd -P`, not `cd`): the extension directory was already taken
+  # physically above, so this is a no-op for the normal case and the authority on any platform
+  # where the physical form and the lexical form disagree. When the directory does not exist the
+  # unnormalised form is kept — the missing-shim message has to name the path the extension would
+  # have used.
+  if norm="$(CDPATH= cd -P -- "$installed" 2>/dev/null && pwd -P)"; then installed="$norm"; fi
+  # (1) the installer-owned copy, verified INDEPENDENTLY of the preference. The `also` clause says
+  # out loud that a readable override does not stand in for it, so an operator whose fix is to
+  # point AGENT_GH_SHIM_DIR somewhere sane is not left guessing why the cell is still refused.
+  local also=""
+  [ -n "$override" ] && also=" (AGENT_GH_SHIM_DIR=$override is a PREFERENCE and does not stand in for the installed copy, which is what this cell's lanes resolve)"
+  if [ ! -f "$installed/gh" ]; then
+    fail "the argv-level gh SHIM is MISSING: $installed/gh$also — the review-enforcer puts exactly that directory on PATH for every bash call and finds no executable \`gh\` in it, so this cell would run the merge gate DEGRADED (the string scanner only — the documented limit #984 exists to get past) while reporting itself ready. Re-run --install"
+    return 0
+  fi
+  if [ ! -x "$installed/gh" ]; then
+    fail "the argv-level gh SHIM is NOT EXECUTABLE: $installed/gh$also — bash SKIPS a non-executable PATH entry, so the real gh runs and the merge gate is DEGRADED with nothing on any stream (#984). Re-run --install"
+    return 0
+  fi
+  # (2) whose verifier sibling has to exist: the same candidate list/order as `resolveGhShimDir()`.
+  for cand in ${override:+"$override"} "$installed"; do
+    if [ -f "$cand/gh" ] && [ -x "$cand/gh" ]; then chosen="$cand"; break; fi
+  done
+  [ -n "$chosen" ] || chosen="$installed"   # unreachable: (1) just proved the installed copy qualifies
+  # FOLLOW THE LINK the shim follows, then take ITS `../` PHYSICALLY: a symlinked shim, or a
+  # symlinked candidate DIRECTORY, would otherwise point the check at a path nothing installs.
+  if ! real="$(gh_shim_realpath "$chosen/gh")" || [ -z "$real" ]; then
+    fail "the argv-level gh SHIM cannot be RESOLVED through its symlinks: $chosen/gh — the chain is a CYCLE, longer than ${GH_SHIM_MAX_LINK_HOPS:-40} hops, or unreadable, so this cell's shim cannot be executed and its admin-merge verifier sibling cannot be located. Refusing rather than guessing a path (#984). Re-run --install"
+    return 0
+  fi
+  verifier="$(dirname "$real")/../verify-admin-merge-evidence.sh"
+  # Normalise for the message (the field is read by whoever has to act on it); an unreadable
+  # directory keeps the unnormalised form rather than printing an empty path. `-P`/`pwd -P` is
+  # what makes this PHYSICAL: with a logical `cd`, `$symlinked-dir/..` strips a component of the
+  # LEXICAL path and the guard tests a path nothing installs, refusing a healthy cell.
+  if norm="$(CDPATH= cd -P -- "$(dirname "$real")/.." 2>/dev/null && pwd -P)"; then
+    verifier="$norm/verify-admin-merge-evidence.sh"
+  fi
+  if [ ! -s "$verifier" ]; then
+    # The resolved path is named in the message (and, when a LINK moved it, so is what it was
+    # resolved FROM) so the operator can see which artifact the gate actually looked for.
+    # ⛔ KEYED ON WHAT THE KERNEL HAD TO FOLLOW, never on a string comparison between the
+    # normalised and the lexical form. Those differ textually for EVERY candidate whose path
+    # contains a `..`, so the clause fired on plain directories too and told the operator a link
+    # was involved when none was — on the very message an operator reads to find the artifact
+    # (MEASURED on this PR's own `ovr-nosib` fixture, a plain directory two levels deep).
+    local via=""
+    if [ "$real" != "$chosen/gh" ]; then
+      via=" (resolved from $chosen/gh through its symlinks)"
+    elif [ -L "$chosen" ]; then
+      via=" (the candidate DIRECTORY $chosen is a SYMLINK, so its ../ is taken PHYSICALLY to $(dirname "$verifier"))"
+    fi
+    # ⛔ WHO CAN REPAIR IT DECIDES WHAT TO PRESCRIBE. `--install` writes the INSTALLED pair only, so
+    # "Re-run --install" is the remedy ONLY when the failing candidate's verifier IS the installed
+    # one (the same directory, named through a symlink or not — arm 3c/3d's healthy states). When
+    # the failing candidate is an `AGENT_GH_SHIM_DIR` override, `--install` cannot touch it: the
+    # extension PREFERS that directory, so the operator would re-run the install, watch it succeed,
+    # and find the cell still refused — a wrong prescription in the diagnostic is its own false
+    # trail. Keyed on the RESOLVED verifier's directory (not on `$chosen` being textually equal to
+    # `$installed`), because a symlinked candidate directory that points AT the installed shim is
+    # still repaired by re-installing.
+    local fixit=" Re-run --install"
+    if [ "$(dirname "$verifier")" != "$(dirname "$installed")" ]; then
+      fixit=" ⛔ Re-running --install will NOT repair this: the candidate missing its verifier is not the installed copy, it is AGENT_GH_SHIM_DIR=$chosen, which the extension PREFERS over the installed shim — fix or unset that override."
+    fi
+    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier$via — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge through the shim this cell resolves ($chosen) would be refused (#984).$fixit"
   fi
 }
 
@@ -913,7 +1122,7 @@ verify_layer() {
   # A success line must not appear in a log whose own verdict is FAIL: a reader who greps for
   # "verified N farm file(s)" would otherwise take a failed leg as clean.
   if [ "$farm_bad" -eq 0 ]; then
-    say "verified $farm_n declared farm file(s) against the checkout"
+    log_line "verified $farm_n declared farm file(s) against the checkout"
   fi
 
   # ── the UNFARM leg (#1924) ────────────────────────────────────────────────
@@ -961,7 +1170,7 @@ verify_layer() {
       # still-farmed retired name is invisible), so its clean answer proves nothing — and
       # `retired_n` would count entries read from a list the run could not fully build from.
       if [ "$retired_present" -eq 0 ] && [ "$conflict_rc" -eq 0 ] && [ "$declared_ok" = 1 ]; then
-        say "verified $retired_n declared retirement(s) absent from the cell"
+        log_line "verified $retired_n declared retirement(s) absent from the cell"
       fi
 
       # ...and that the leg RAN against THIS declaration. With an empty retirement list the
@@ -1015,7 +1224,7 @@ verify_layer() {
           done <<<"$snap_sorted"
         fi
         if [ "$snap_ok" = 1 ] && [ "$declared_ok" = 1 ] && [ -z "$uninstalled" ] && [ -z "$gone" ]; then
-          say "verified the farm declaration snapshot against the checkout's declared set"
+          log_line "verified the farm declaration snapshot against the checkout's declared set"
         elif [ "$snap_ok" = 1 ] && [ "$declared_ok" = 1 ]; then
           msg="the farm declaration snapshot ($snap_rel) is not this checkout's declared set — re-run --install."
           if [ -n "$uninstalled" ]; then
@@ -1044,26 +1253,29 @@ verify_layer() {
 
   # ── the argv-level gh shim (docs/ops/ACTIVATION-MATRIX.md, row 1) ────────────
   # The shim (`scripts/gh-shim/gh`) is the only layer a shell TOKEN SPLICE cannot defeat (`--ad""min`,
-  # `$'--admin'`) — a discarded PATH entry still defeats it, which is the shim's own declared limit —
-  # and it is the one component that is DEPLOYED-but-not-ACTIVE: this installer copies the
-  # operational layer, and nothing in it places the shim where `review-enforcer` resolves it — so a
-  # cell reports a green layer while the gate falls back to string scanning (`#984 argv-level gh shim not found`).
+  # `$'--admin'`) — a discarded PATH entry still defeats it, which is the shim's own declared limit.
+  # It IS farmed now (`setup.sh` · `merge_gate_srcs`, which this installer PARSES — one declaration,
+  # both platforms), and `guard_gh_shim` — not this line — is the AUTHORITY on whether the cell is
+  # armed: it fails BY NAME when the shim the extension resolves is absent, non-executable, or
+  # missing its evidence-verifier sibling, and it runs in `--verify` and at the end of `--install`.
+  # Before the farm, the cell carried no `scripts/gh-shim` AT ALL and every lane logged
+  #   `#984 argv-level gh shim not found — only the string scanner is active`
+  # while reporting LAYER VERIFIED; that is why this line exists as a readable report of the
+  # activation state (armed / disarmed / absent) at the moment a reader looks — silence would have
+  # left a green layer and a degraded gate indistinguishable in the log.
   #
-  # The two candidates below are the extension's OWN list (`resolveGhShimDir`), in its order, so this
-  # report cannot drift from what the gate will actually do. ⛔ `$DEST/shims` is NOT a third
-  # candidate even though the extension materialises there: `resolveGhShimDir` never READS it, so a
-  # neutral link with no resolvable source is a link the gate ignores — which is exactly the
-  # false comfort this line exists to break (measured on this laptop: `~/.pi/agent/shims/gh` is a
-  # healthy-looking symlink while the extension resolves null, because its source candidate,
-  # `~/.pi/agent/scripts/gh-shim`, is absent and the only working source is an env var the launchd
-  # controller does not receive).
-  #
-  # REPORT-ONLY, deliberately: `fail` here would make every cell running today RED (none carries
-  # `scripts/gh-shim`) and `cloud-cell-bringup.sh --check` would refuse `CELL READY` — the right
-  # verdict, but only once the farm actually delivers the shim. Until then the honest line is the
-  # report: a reader must never see `LAYER VERIFIED` and infer that the merge gate is armed.
-  local shim_state="absent" shim_at="" shim_cand
-  for shim_cand in "${AGENT_GH_SHIM_DIR:-}" "$DEST/scripts/gh-shim"; do
+  # The candidates below are the extension's OWN list (`resolveGhShimDir`), in its order, and the
+  # default candidate is the directory the extension actually RESOLVES (`gh_shim_extension_dir`:
+  # physically, so a farm-SYMLINKED extension reports the checkout it resolves into, not a lexical
+  # path the gate never reads) — so this report cannot drift from what the gate will do.
+  # ⛔ `$DEST/shims` is NOT a third candidate even though the extension materialises there:
+  # `resolveGhShimDir` never READS it, so a neutral link with no resolvable source is a link the
+  # gate ignores — which is exactly the false comfort this line exists to break. (Measured on the
+  # laptop this fleet runs: `~/.pi/agent/shims/gh` was a healthy-looking symlink while the extension
+  # resolved null, because its source candidate, `~/.pi/agent/scripts/gh-shim`, did not exist yet.)
+  local shim_state="absent" shim_at="" shim_cand shim_installed
+  shim_installed="$(gh_shim_extension_dir)"
+  for shim_cand in "${AGENT_GH_SHIM_DIR:-}" "$shim_installed"; do
     [ -n "$shim_cand" ] || continue
     if [ -f "$shim_cand/gh" ] && [ -x "$shim_cand/gh" ]; then
       shim_state="present"
@@ -1076,15 +1288,15 @@ verify_layer() {
     # `ghShimWillEnforce` requires the same variable not to be 0, so a box with an executable shim
     # and this kill switch in its env injects nothing and enforces nothing. Reporting "armed" there
     # would invert the purpose of this block (a green line a reader trusts more than `LAYER VERIFIED`).
-    say "activation: gh shim PRESENT at $shim_at but DISARMED — AGENT_GH_SHIM=0, so the review-enforcer injects nothing and the string scanner is the only layer the GATE itself has (#984). A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2."
+    log_line "activation: gh shim PRESENT at $shim_at but DISARMED — AGENT_GH_SHIM=0, so the review-enforcer injects nothing and the string scanner is the only layer the GATE itself has (#984). A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2."
   elif [ "$shim_state" = present ]; then
-    say "activation: gh shim PRESENT at $shim_at (argv-level admin-merge guard armed)"
+    log_line "activation: gh shim PRESENT at $shim_at (argv-level admin-merge guard armed)"
   else
     local stale=""
     if [ -e "$DEST/shims/gh" ] || [ -L "$DEST/shims/gh" ]; then
       stale=" ⛔ $DEST/shims/gh exists but it is never a resolution CANDIDATE: it is a mirror the extension writes from a RESOLVED source and then injects (materializeGhShim → withGhShim), so with no resolvable source it is never armed — do not read it as armed."
     fi
-    say "activation: gh shim ABSENT — looked at \${AGENT_GH_SHIM_DIR:-} and $DEST/scripts/gh-shim; the review-enforcer then runs the string scanner only (#984), which is all the GATE itself has. A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2.$stale"
+    log_line "activation: gh shim ABSENT — looked at \${AGENT_GH_SHIM_DIR:-} and $shim_installed; the review-enforcer then runs the string scanner only (#984), which is all the GATE itself has. A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2.$stale"
   fi
 
   local entries
@@ -1172,7 +1384,7 @@ verify_layer() {
   if [ "$seen_dep" -eq 0 ]; then
     fail "no extension in $DEST/extensions declared any dependencies — the dependency check proved nothing (a truncated or hand-made extensions/ tree)"
   else
-    say "verified $seen_dep extension(s) that declare runtime deps"
+    log_line "verified $seen_dep extension(s) that declare runtime deps"
   fi
 
   # skills/. The install is a `cp -R` of the WHOLE tree, so the read-back compares the whole tree.
@@ -1190,7 +1402,7 @@ verify_layer() {
   else
     shipped_content_matches "$INFRA_ROOT/skills" "$DEST/skills"
     case $? in
-      0) say "verified the skills tree against the checkout" ;;
+      0) log_line "verified the skills tree against the checkout" ;;
       2) fail "skills/ ships NO files in the checkout ($INFRA_ROOT/skills) — verify cannot vouch for an empty tree" ;;
       3) fail "skills/ could not be compared IN FULL ($INFRA_ROOT/skills) — refusing to certify a subset: an unreadable tree, a non-regular entry, or a name the file list cannot represent" ;;
       *) fail "SKILLS CONTENT DIFFERS from the checkout: skills/ (a stale, truncated or hand-edited copy)" ;;
@@ -1266,9 +1478,20 @@ PY
 
   guard_tools_dir
   guard_spawn_gate
+  guard_gh_shim
 
   if [ "$FAILURES" -eq 0 ]; then
-    say "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
+    log_line "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
+    # ⛔ THE LAYER IS NOT THE CELL (agent-infra#2916 check 2, correcting #2909). This line used to be
+    # the last thing an operator saw before starting lanes, and `--install` can end here with NO
+    # HARNESS PIN — measured: a `bash -x` trace STOPS at exactly this `log_line`, and the pin was then
+    # recorded by a DIFFERENT script (`cloud-cell-bringup.sh::check_harness_pin`), i.e. the work that
+    # made the cell usable was done by something other than the thing that reported success.
+    # The pin is created in exactly ONE place, and a second copy here would be the duplicated-mechanism
+    # defect the #2916 mandate forbids — so this NAMES it instead of duplicating it, and the cell is
+    # not ready until that gate has run. Nothing here writes or checks the pin: the gate is the
+    # authority and this is the pointer to it.
+    log_line "the LAYER only — the harness PIN is not recorded by this script: a cell is NOT ready to start a controller until 'cloud-cell-bringup.sh --check' has pinned the harness (that gate REFUSES without one; a hand-copied harness is the §11 defect)"
   fi
 }
 

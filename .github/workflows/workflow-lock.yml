@@ -137,6 +137,23 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
 
+# NO `concurrency:` BLOCK, DELIBERATELY (#2474). A per-PR group here cannot tell a
+# head from its successor: the key is the PR, not the sha, so a `gh run rerun` of a
+# SUPERSEDED head arrives in the SAME group as the newest head and cancels its
+# in-flight run (concurrency orders by ARRIVAL, not head age). The rerun-on-a-stale-
+# head measurement behind that is `Pipeline Compliance`'s, not this file's — this
+# workflow had no reruns in the window; its own measured waste is superseded-head
+# runs that ran to completion. Both are in #2474. That is a fail-open for this file, not
+# a speed-up: the job's failure blocks the merge, `cancelled` is non-red
+# (`NON_RED_CONC`, scripts/admin-merge.sh) and counts as measured-nothing, and
+# `guard_generation_complete` accepts an already-terminal leg as "observed at this
+# head" — so a cancelled leg would satisfy that wait while contributing no verdict.
+# Fix the rail's treatment of a terminal-`cancelled` guard leg BEFORE adding
+# supersession here (#2474). `cancel-in-progress: false` is NOT a safe substitute: by
+# default a group keeps only ONE run pending and a newer arrival cancels that
+# pending one, and "pending" is this job's common state while the runner queue is
+# deep.
+
 # Read-only. `contents: read` covers the checkout and the git tree + blob calls.
 # `pull-requests: read` IS required (#843): the merge commit is resolved from
 # `GET /repos/{owner}/{repo}/pulls/{number}` — see the step below for why the
