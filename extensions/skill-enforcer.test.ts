@@ -53,6 +53,9 @@ import hook, {
 // The derivation itself is asserted in its own suite (extensions/shared/
 // git-command-parse.test.ts); this file only needs it for the OR property below.
 import { commandSpellings } from "./shared/git-command-parse.js";
+// #2965 — the derived lane contract is a bypass channel, so it must be pinned
+// OFF before any gate assertion can mean anything (see scrubBypassEnv).
+import { _setLaneContractForTest } from "./shared/headless-lane.js";
 
 const REPO_ROOT = resolve(__dirname, "..");
 const REAL_MANIFEST = join(REPO_ROOT, "enforcement", "dangerous-ops.txt");
@@ -116,12 +119,44 @@ function makePi(): FakePi {
 // The ambient fleet shell really does carry SKILL_ENFORCER_DISABLED=1 and
 // PI_MODE=print, and AGENT_INFRA_PATH here points at a DIFFERENT checkout than
 // this module's realpath. A control that inherits those passes vacuously.
+//
+// ⛔ #2965 — THERE IS A THIRD BYPASS CHANNEL NOW, AND THE AMBIENT SHELL SATISFIES
+// IT. The gate bypasses for a lane whose contract `shared/headless-lane.ts`
+// DERIVES (print mode + a LINKED worktree), and this suite runs from
+// `.worktrees/<name>` under a shell that carries PI_MODE=print — so the derived
+// lane is `true` here unless it is pinned off. This is not hypothetical: with the
+// derivation wired and this pin removed, the WHOLE BLOCKING HALF of this file goes
+// red — every gate assertion below stops seeing a block, because the bypass is
+// consulted before the rules. (Deliberately no assertion COUNT here: the exact
+// figure moves with the ambient posture — a bare shell, a fleet shell, and a run
+// where the hermeticity leg also trips each give a different total, and a number
+// in an always-loaded comment is a stale flag waiting to happen.) The pin is the
+// same discipline as scrubbing the env vars above, and it is honest rather than
+// convenient: the derivation itself is pinned in BOTH directions (worktree →
+// lane, hub → not a lane, a supervised child in the hub, plus a mutation per arm)
+// by `extensions/shared/headless-lane.test.ts`.
+// `headless: false` is what an ordinary (interactive) session derives, which is
+// exactly the posture these gate assertions are written for.
+const GUARDED_CONTRACT = {
+  headless: false,
+  linkedWorktree: false,
+  lane: false,
+  cwd: process.cwd(),
+  topLevel: null,
+  gitDir: null,
+  commonDir: null,
+  branch: null,
+  kind: null,
+  tag: null,
+  why: "pinned by the suite (see #2965 note above) — the guarded arm",
+};
 function scrubBypassEnv() {
   delete process.env.SKILL_ENFORCER_DISABLED;
   delete process.env.AGENT_ALLOW_MAIN_EDITS;
   delete process.env.ELDATO_ALLOW_MAIN_EDITS;
   delete process.env.AGENT_SKILLS_PREFIX;
   delete process.env.ELDATO_SKILLS_PREFIX;
+  _setLaneContractForTest(GUARDED_CONTRACT);
 }
 
 // A fresh handler set, a fresh reads file, and a session that has started.
