@@ -732,11 +732,41 @@ assert_contains "$TXT" "RAIL_RUN_GH_HOST" "HOST-ABSTAIN: and names the knob that
 # decoration: it is the value `pr_url_names` compared with (`${4:-github.com}`), so a row that omits it
 # tells the reader nothing about what failed. This arm reddens if the default is ever moved back into
 # sed, which is how the empty-host rendering was found (#2959 review, P1).
+# ⛔ `GH_MODE=otherhost`, NOT `fail`: a FAILING gh makes `pr_state` return at its `|| return 0` BEFORE
+# `pr_url_names` is ever called, so the arm would stay green even if the printed default diverged from
+# the compared one. `otherhost` serves `https://ghe.example.com/…`, so the abstention is CAUSED by the
+# comparison against the `github.com` default — the arm now proves the two defaults are ONE (#2959
+# review, cycle 2, P2).
 craft 185 nohost rc=0 >/dev/null   # no `host=` kv: this run recorded none
-OUT="$(GH_MODE=fail poll 185)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
-assert_rc 25 "$RC" "HOST-DEFAULT: an unreadable artifact abstains"
+OUT="$(GH_MODE=otherhost poll 185)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST-DEFAULT: a URL on another host abstains, caused BY the default comparison"
 assert_contains "$TXT" "on host github.com" "HOST-DEFAULT: the abstention spells out the DEFAULT host it compared"
 assert_contains "$TXT" "start a new run" "HOST-DEFAULT: and the remedy names the action that can change a RECORDED host (a re-poll cannot)"
+assert_contains "$TXT" "RAIL_RUN_REPO_SLUG" "HOST-DEFAULT: and names the identity pin that OUTRANKS the knob (else the advice is inert)"
+
+# ── AG1d: a host-naming IDENTITY pin outranks the knob, and the note says so ──────────────────
+# `start` writes `${host_hint:-$(resolve_host)}`, and `RAIL_RUN_GH_HOST` lives INSIDE `resolve_host`,
+# so a host-naming `--repo`/`RAIL_RUN_REPO_SLUG` makes the knob UNREAD. That precedence is correct (the
+# (slug, host) pair is one identity) — but it makes an abstention that names ONLY the knob wrong for
+# this shape: a lane does exactly what it is told and records the SAME pin host again. Both halves are
+# asserted here: what `start` RECORDS, and what the note therefore has to say (#2959 review, cycle 2).
+PIN_DIR="$T/host-pin"; mkdir -p "$PIN_DIR"
+git -C "$PIN_DIR" init -q >/dev/null 2>&1
+git -C "$PIN_DIR" remote add origin 'https://github.com/acme/widgets.git' >/dev/null 2>&1
+OUT="$(cd "$PIN_DIR" && RAIL_RUN_REPO_SLUG=pin.example.com/acme/widgets RAIL_RUN_GH_HOST=knob.example.com FAKE_RAIL_SLEEP=1 "$BASH_BIN" "$RR" start 186 2>&1)"
+assert_rc 0 "$?" "HOST/PRECEDENCE: start with a host-naming identity pin AND the knob set"
+PIN_ID="$(run_id_of "$OUT")"
+PIDS+=("$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-186/$PIN_ID" pid)")
+PIN_HOST="$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-186/$PIN_ID" host)"
+if [ "$PIN_HOST" = "pin.example.com" ]; then
+  ok "HOST/PRECEDENCE: the identity pin outranks RAIL_RUN_GH_HOST (recorded pin.example.com, not knob.example.com)"
+else
+  bad "HOST/PRECEDENCE: recorded host='$PIN_HOST' (want pin.example.com) — the identity pin must outrank the knob"
+fi
+craft 187 pinhost rc=0 host=pin.example.com >/dev/null
+OUT="$(GH_MODE=otherhost poll 187)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST/PRECEDENCE: the pin's host is not this run's landing either"
+assert_contains "$TXT" "on host pin.example.com" "HOST/PRECEDENCE: the abstention names the PIN's host"
 
 # ── AG2: the host is RESOLVED from `origin`, not assumed to be github.com ────────────────────
 # Every arm above PINS the host (`RAIL_RUN_GH_HOST` or a hand-built run dir), so `resolve_host` had

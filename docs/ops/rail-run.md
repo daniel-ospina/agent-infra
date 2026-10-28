@@ -121,7 +121,7 @@ load-bearing distinctions honest:
   **The host comes from the same value as the slug.** When `--repo` — or the checkout-wide
   `RAIL_RUN_REPO_SLUG` pin, which is spelled the same way — is given as `[HOST/]OWNER/REPO`, the host
   it names is recorded; only a bare `owner/repo` (or no identity argument at all) falls back to
-  `origin`. Reading the host from `origin` while the slug came from `--repo` (or from the pin, which is
+  `RAIL_RUN_GH_HOST` and then to `origin`. Reading the host from `origin` while the slug came from `--repo` (or from the pin, which is
   the seam for a checkout whose `origin` does *not* name its repo) recorded a `github.com/<slug>` pair
   for a target on another host, so the artifact check demanded a URL that host never serves and
   `landed` was unreachable — fail-closed, but a run nobody could land.
@@ -180,7 +180,7 @@ Three stated residuals:
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
 ```
 
-**213 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; the only number asserted anywhere is the pass/fail line). The suite is mostly
+**218 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; the only number asserted anywhere is the pass/fail line). The suite is mostly
 negative — `running` must never read as landed or refused, `rc=0` is not a landing when the artifact
 disagrees, `gone-without-verdict` is never a landing *or* claimed over an unread artifact, an
 unreadable liveness or PR read abstains, a live pid with the wrong incarnation is not "running", a

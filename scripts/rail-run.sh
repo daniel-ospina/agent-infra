@@ -830,8 +830,13 @@ derive() {
       # whose ONLY caller is `start`; `derive` reads the RECORDED file, so setting the knob and
       # re-polling the SAME run reproduces this identical row — the re-poll loop this line exists to
       # stop. The host is fixed at start, so the fix is a NEW run (measured, #2959 review).
+      # ⛔ AND THE KNOB IS NOT THE WHOLE REMEDY: `start` writes `${host_hint:-$(resolve_host)}`, so a
+      # host-naming `--repo`/`RAIL_RUN_REPO_SLUG` makes the knob UNREAD (measured: `--repo
+      # pin.example.com/o/r` with `RAIL_RUN_GH_HOST=knob.example.com` records `pin.example.com`).
+      # Naming only the knob left the same inert-advice defect one input shape over — a lane told to
+      # set it and start again records the pin's host again (#2959 review, cycle 2).
       local host; host="$(file_or_empty "$rd/host")"
-      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr on host ${host:-github.com} — so the API did not confirm which PR this is. The host is RECORDED at start, so re-polling cannot change it: if this checkout's origin cannot attest its host, set RAIL_RUN_GH_HOST=<web host> and start a new run"
+      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr on host ${host:-github.com} — so the API did not confirm which PR this is. The host is RECORDED at start, so re-polling cannot change it: set RAIL_RUN_GH_HOST=<web host> and start a new run — but a host-naming --repo or RAIL_RUN_REPO_SLUG outranks that knob, so if one of those supplied the host, correct it there"
     fi
     return 0
   }
