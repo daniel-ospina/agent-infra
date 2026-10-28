@@ -184,26 +184,54 @@ ciq_read "$OR" >/dev/null 2>&1
 feed 31 5 -
 ciq_read "$OR" >/dev/null 2>&1
 v="$(ciq_eval)"
-ck "(b6b) a refused runner read falls back to the measured floor, never the allowance (got: ${v})" \
-   "$( case "$v" in *'ceiling=10'*) echo 0 ;; *) echo 1 ;; esac )"
+has "$v" 'ceiling=40'
+ck "(b6b) a refused runner read never takes the hosted ALLOWANCE (the permissive direction)" "$( [ $? -ne 0 ]; echo $? )"
+has "$v" 'runners=~1'
+ck "(b6b2) …it takes the documented 1-runner floor (got: ${v})" "$?"
 # A garbled `running` must not become a ceiling the gate can never reach: 9 digits pass
-# `ciq_is_count` and would yield ceiling ~2e9, switching back-pressure off silently. Driven on the
-# UNMEASURED path (refused endpoint), where the floor is the only runner source.
+# `ciq_is_count` and would yield ceiling ~2e9, switching back-pressure off silently.
+# ⛔ AND IT MUST NOT BECOME THE FLEET SIZE AT ALL (#2927). This arm replaces the old "clamped by the
+# allowance" shape: with NOTHING measured, the in-progress count is DEMAND answering a SUPPLY
+# question, so a garbled `running` now lands on the same 1-runner floor as any other number.
 feed 5 499999999 -
 ciq_read "$OR" >/dev/null 2>&1
 v="$(ciq_eval)"
-ck "(b6c) an absurd \`running\` is CLAMPED by the allowance, never made the ceiling (got: ${v})" \
-   "$( case "$v" in *'runners=~20'*'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
+has "$v" 'ceiling=2'
+ck "(b6c) an absurd \`running\` is never made the ceiling (got: ${v})" "$?"
+has "$v" 'runners=~1'
+ck "(b6c2) …and it is never made the FLEET either" "$?"
+# ⛔ THE MEASURED DEFECT, ARMS (b6d)/(b6e) — 2026-10-27, cell 4 (#2927). The live line was
+# `runners=~2 => ceiling=4 => DEEP` with `queued=33 running=2` on a repo whose 8-registered fleet was
+# all online and idle: the ceiling was derived from the jobs EXECUTING, so the gate read the box's own
+# load as the world's capacity, and 41 consecutive PR-REPAIR dispatches were skipped by it.
+# (b6d) is that exact reading: the fleet size was not read, so `running=2` must not become `~2`.
+feed 33 2 -
+v="$(ciq_read "$OR" >/dev/null 2>&1; ciq_eval)"
+has "$v" 'runners=~2'
+ck "(b6d) the measured 2026-10-27 shape: an unreadable fleet size is NOT reported as the in-progress count (got: ${v})" "$( [ $? -ne 0 ]; echo $? )"
+has "$v" 'runners=~1'
+ck "(b6d2) …it is reported as the documented floor, and the ceiling from it" "$?"
+has "$v" 'fleet=unreadable(the actions/runners endpoint refused'
+ck "(b6d3) …and the line NAMES the reading that failed, in the endpoint's own words" "$?"
+# (b6e) the same queue numbers with a FLEET that can be read: the 8 online runners must decide, and
+# the queue must then be deep. This is the arm that makes (b6d) a measurement of the FLEET and not a
+# blanket "always small".
+feed 33 2 8
+v="$(ciq_read "$OR" >/dev/null 2>&1; ciq_eval)"
+has "$v" 'runners=8'
+ck "(b6e) a READABLE fleet is what the ceiling is derived from (got: ${v})" "$?"
+has "$v" 'ceiling=16'
+ck "(b6e2) …ceiling=ceil(8*20/10)=16, and 33 queued is over it (so new work still defers)" "$?"
 feed 97 7 0
 ciq_ci_allowed "$OR"; d0=$?
 ck "(b7) hosted CI, zero repo runners: the MEASURED incident (97) is DEFERRED" "$( [ "$d0" -eq 1 ]; echo $? )"
 feed 4 1 0
 ciq_read "$OR" >/dev/null 2>&1
-ck "(b8) an unmeasured runner count is DECLARED inferred in the record (runners=${CIQ_RUNNERS:-?})" \
-   "$( case "${CIQ_RUNNERS:-}" in '~'*) echo 0 ;; *) echo 1 ;; esac )"
+has "${CIQ_RUNNERS:-?}" '~'
+ck "(b8) an unmeasured runner count is DECLARED inferred in the record (runners=${CIQ_RUNNERS:-?})" "$?"
 v="$(ciq_eval)"
-ck "(b9) the ceiling comes from the allowance, not from \`running\` (ceiling=40, got: ${v})" \
-   "$( case "$v" in *'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
+has "$v" 'ceiling=40'
+ck "(b9) the ceiling comes from the allowance, not from \`running\` (ceiling=40, got: ${v})" "$?"
 # ⛔ A DECLARED FLEET THAT IS ENTIRELY OFFLINE IS NOT THE HOSTED ZERO (#2333 review P1). Collapsing
 # `total_count>=1 with nothing online` into "no fleet" claims the allowance and ALLOWS the incident's
 # own 31-deep queue with nothing able to drain it. Fail CLOSED: ceiling floors at 1 runner = 2.
@@ -228,12 +256,15 @@ ck "(b12) declared-but-offline still honours \`running\` (4 queued, 7 running =>
 # incident's own queue. Both arms below are red on the pre-fix tree (ceiling 40 => allowed).
 feed 31 5 0 true 0 1
 ciq_ci_allowed "$OR"; d0=$?
-ck "(b13) an answered-but-UNPARSEABLE runners body fails CLOSED (31 queued, 5 running => ceiling 10 => DEFERRED)" \
+ck "(b13) an answered-but-UNPARSEABLE runners body fails CLOSED (31 queued => 1-runner floor => DEFERRED)" \
    "$( [ "$d0" -eq 1 ]; echo $? )"
 feed 31 5 0 true 0 1
 ciq_read "$OR" >/dev/null 2>&1
-ck "(b14) …and the record carries the measured floor, never the allowance (runners=${CIQ_RUNNERS:-?})" \
-   "$( [ "${CIQ_RUNNERS:-}" = '~5' ]; echo $? )"
+ck "(b14) …and the record carries the documented floor, never the allowance (runners=${CIQ_RUNNERS:-?})" \
+   "$( [ "${CIQ_RUNNERS:-}" = '~1' ]; echo $? )"
+v="$(ciq_eval)"
+has "$v" 'fleet=unreadable(the actions/runners page carried no parseable total_count)'
+ck "(b14b) …and the line says WHAT it could not read (got: ${v})" "$?"
 
 printf '\n── (c) NOT STICKY: a fresh read decides, not a memory of the last one ──────\n'
 feed 31 5 5
@@ -364,6 +395,59 @@ ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c6) an unreadable queue INSIDE the window falls back to the record and SAYS so (state=cache)" \
    "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ]; } ; echo $? )"
 
+printf '\n── (c6b) the FLEET disclosure survives the cache ─────────────────────────\n'
+# ⛔ A DISCLOSURE THAT LIVES ONLY IN MEMORY IS ABSENT ON THE PATH OPERATORS READ IT FROM (#2927 review,
+# P3). `fleet=unreadable(...)` is the ONE place branch (c) says WHICH reading failed. It was printed
+# from `CIQ_FLEET` and nothing else, while the record carried only repo/queued/running/runners/busy/at
+# and both cache arms reset the field — so a TTL or staleness hit rendered `runners=~1 ceiling=2
+# state=cache` with the *why* silently dropped, i.e. exactly the inference-presented-as-a-measurement
+# the field exists to prevent, on the path (cache) the token exists for. `busy=` is the precedent: a
+# disclosure field carried through the record. Pinned in three parts — the WRITER persists it, the
+# READER restores it, and an OLDER record (no `fleet=` line) neither breaks nor invents one.
+# ⛔ THE RECORD CARRIES THE VALUE, NOT THE KEY (#2927 review, P3). It used to read
+# `fleet=fleet=unreadable(…)` on disk — the writer prefixed `fleet=` onto a value that already began
+# with it. It round-tripped and (c6b) pinned the doubled form, so nothing broke; but an on-disk record
+# is permanent text a human reads, so the writer now strips the key and the readers re-attach it
+# (`ciq_fleet_restore`). (c6b) therefore pins the CORRECTED single-key form, and (c6d) pins that the
+# restored token still names the failed reading.
+feed 33 2 -
+ciq_read "$OR" >/dev/null 2>&1
+ck "(c6b) a branch-(c) read PERSISTS the fleet disclosure in the record, keyed ONCE" \
+   "$(grep -q '^fleet=unreadable(' "$REC"; echo $?)"
+ck "(c6b') …and the record does NOT carry the doubled key the writer used to emit" \
+   "$([ "$(grep -c '^fleet=fleet=' "$REC")" = 0 ]; echo $?)"
+qenv /nonexistent-gh 0 900
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+v="$(ciq_eval)"
+ck "(c6c) …and the record is served as CACHE when the live read fails (rc=$rc state=${CIQ_STATE:-?})" \
+   "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ]; } ; echo $? )"
+has "$v" 'fleet=unreadable(the actions/runners endpoint refused'
+ck "(c6d) …and the CACHED token still NAMES the reading that failed (got: ${v})" "$?"
+# An older record has no `fleet=` line at all: it must restore as EMPTY (no behaviour change), never
+# as a disclosure the writer did not put there.
+printf 'repo=%s\nqueued=4\nrunning=2\nrunners=~1\nbusy=\nat=%s\n' "$OR" "$(date +%s)" > "$REC"
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+v="$(ciq_eval)"
+ck "(c6e) a record with NO fleet= line (an older record) still serves (rc=$rc)" \
+   "$( [ "$rc" -eq 0 ]; echo $? )"
+has "$v" 'fleet='
+ck "(c6f) …and it INVENTS no disclosure (got: ${v})" "$( [ $? -ne 0 ]; echo $? )"
+# ⛔ A RECORD WRITTEN BY THE PRE-FIX WRITER CAN STILL BE ON DISK (#2928 review, P3). The record is
+# permanent text in a state dir shared with whatever else runs out of it, so the mixed-version
+# direction a reader CAN close from its own side — an OLD record read by THIS reader — must be
+# tolerated rather than stepped over: `ciq_fleet_restore` strips a stored `fleet=` before attaching
+# its own, so both shapes restore keyed exactly ONCE. (c6g') is the assertion that goes red if that
+# tolerance is dropped (the token would render `fleet=fleet=unreadable(…)` — the doubled form back).
+printf 'repo=%s\nqueued=4\nrunning=2\nrunners=~1\nbusy=\nfleet=fleet=unreadable(the actions/runners endpoint refused: HTTP 404) fallback=runners=~1\nat=%s\n' \
+  "$OR" "$(date +%s)" > "$REC"
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+v="$(ciq_eval)"
+ck "(c6g) a PRE-FIX record (doubled key on disk) still serves as a reading (rc=$rc)" \
+   "$( [ "$rc" -eq 0 ]; echo $? )"
+has "$v" 'fleet=unreadable('
+ck "(c6g') …and the key is restored exactly ONCE, not doubled (got: ${v})" \
+   "$( [ $? -eq 0 ] && ! grep -q -F -- 'fleet=fleet=' <<<"$v"; echo $? )"
+
 printf '\n── (c7) UNKNOWN defers (fail closed), and says which it was ───────────────\n'
 state
 qenv /nonexistent-gh 0 0
@@ -490,38 +574,51 @@ ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per P
    "$( { [ "$(grep -cF 'ciq_read "${OR:-}"' "$LOOP")" -eq 2 ] \
         && [ "$(grep -cF 'ciq_read "${OR:-}" >/dev/null 2>&1 || true' "$LOOP")" -eq 1 ] \
         && [ "$(grep -cF 'CIQ_VER="$(ciq_eval)"; CIQ_RC=$?' "$LOOP")" -eq 2 ]; } ; echo $? )"
-grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
+# ⛔ THE SHIPPED FORM, NOT THE RENDERED VALUE (#2927): the gate VECTOR made every arm assign through
+# `${GATE_WHY:-…}` so a later arm cannot overwrite the first one that fired. The rendered `GATE_WHY`
+# is unchanged — `ci-queue($CIQ_VER)` — so this pin follows the assignment the module actually performs.
+grep -F -q 'GATE_WHY="${GATE_WHY:-ci-queue($CIQ_VER)}"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -cF 'if ciq_push_ok; then' "$LOOP")"
-ck "(e4) BOTH fixer push arms defer (the CONFLICTED and CI-red spawn sites)" "$( [ "$n" -eq 2 ]; echo $? )"
+# ⛔ THE THREE FIXER SPAWN ARMS NO LONGER CONSULT THE QUEUE AT ALL (#2927). They are REPAIR — they act
+# on a PR that already exists — and the class rule in ci-queue.sh's header says only work that ADDS a
+# new CI run is queue-gated. ⛔ NOT because the pass is "already spent": a repair push DOES start a
+# fresh run. The basis is #2927's decision plus the measurement below. Measured 2026-10-27: those calls were
+# the last-line half of a gate that skipped 41 consecutive repair dispatches while 8 self-hosted
+# runners and ~11 lane slots sat idle. This is a COUNT OF ZERO on purpose: a reintroduced gate on any
+# fixer arm reddens here.
+ck "(e4) NO fixer spawn arm consults the CI queue — a fixer is repair, not CI-spending work (found $n, expected 0)" \
+   "$( [ "$n" -eq 0 ]; echo $? )"
 # ⛔ COUNT CODE, NOT PROSE (the same false RED test-gates.sh carried — #2762 review): two COMMENTS in
 # orch-loop.sh quote `-lt "$MF"` to explain the drain-aware ceiling, so a raw `grep -c` counted 5 and
 # this arm was red on a correct tree. The pin (exactly one comparison per spawn site) is unchanged.
 m="$(grep -F -- '-lt "$MF"' "$LOOP" | grep -vc '^[[:space:]]*#')"
-ck "(e4-eligibility) …and the deferral NESTS inside each spawn arm's own eligibility, so a deep queue is never reported as the binding reason for a PR the capacity gate refused — with exactly ONE \$MF comparison per fixer spawn site (found $m, expected 3: the count test-gates.sh asserts so that every fixer spawn site is on the drain-aware budget, which a DUPLICATED predicate would inflate) (#2333 cycle 7, P2)" \
-   "$( { [ "$n" -eq 2 ] && [ "$m" -eq 3 ] && [ "$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")" -eq 0 ]; } ; echo $? )"
-ck "(e4b) AND SO DOES THE THIRD PUSHER — the review-gate fixer arm (its product is a new head too)" \
-   "$( grep -q '_fix_eligible" = "1" ] && ciq_push_ok' "$LOOP"; echo $? )"
-ck "(e4c) …and its defer arm cannot fire for a PR that was simply not eligible (the guard is shared, not duplicated)" \
-   "$( grep -q 'elif \[ "\$_fix_eligible" = "1" \]; then' "$LOOP"; echo $? )"
+ck "(e4-eligibility) …and every fixer spawn site still carries its own capacity/claim eligibility — exactly ONE \$MF comparison per site (found $m, expected 3, which is the count test-gates.sh asserts) with no sibling '! ciq_push_ok' defer arm left behind" \
+   "$( { [ "$n" -eq 0 ] && [ "$m" -eq 3 ] && [ "$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")" -eq 0 ]; } ; echo $? )"
+ck "(e4b) …the review-gate fixer included — its eligibility predicate is no longer shared with a queue gate" \
+   "$( grep -q '_fix_eligible" = "1" ] && ciq_push_ok' "$LOOP"; [ $? -ne 0 ]; echo $? )"
+ck "(e4c) …and the hoisted predicate is still what the park/re-record chain asks, so a non-eligible PR is never reported as anything else" \
+   "$( grep -q '_fix_eligible" = "1" ]; then' "$LOOP"; echo $? )"
 n="$(grep -c 'ciq_defer_note_here "CONFLICTED fixer' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "CI-red fixer' "$LOOP")"
-ck "(e5) each push arm emits the deferral line" "$( { [ "$n" -eq 1 ] && [ "$m" -eq 1 ]; } ; echo $? )"
-n="$(grep -c 'ci-queue(\${CIQ_VER:-unmeasured})' "$LOOP")"
-# ⛔ WHAT THIS PINS, AND WHAT IT DOES NOT (#2333 review, P2). It pins the ROW COUNT — every one of
-# the four CI-spending arms carries a wait disposition naming the verdict — and that no arm
-# defaults to `deep` (e6b). It does NOT pin `${…:-unmeasured}`: every such row is reached only
-# THROUGH `ciq_push_ok`, which assigns `CIQ_VER` on both of its paths, so the default is a
-# defensive floor and never fires (orch-loop.sh states exactly that above the CONFLICTED arm).
-# An earlier label claimed the arm "says unmeasured when the cycle's own read has not run yet",
-# i.e. it asserted the cycle-6 P0 this wiring exists to prevent — the count would have stayed
-# green on exactly that regression.
-ck "(e6) every CI-SPENDING arm (both fixer spawns + the review-gate fixer + the rerun) writes a wait disposition carrying the verdict it decided on (n=$n)" "$( [ "$n" -eq 4 ]; echo $? )"
-ck "(e6b) no push arm DEFAULTS the verdict to \`deep\` — a label the arm never measured" \
+ck "(e5) neither fixer arm emits a queue deferral line any more (CONFLICTED=$n CI-red=$m, expected 0 0)" \
+   "$( { [ "$n" -eq 0 ] && [ "$m" -eq 0 ]; } ; echo $? )"
+n="$(grep -c 'ci-queue(${CIQ_VER:-unmeasured})' "$LOOP")"
+# ⛔ WHAT THIS PINS, AND WHAT IT DOES NOT. It pins the ROW COUNT — the ONE arm still queue-gated in
+# this block (the CI rerun, which genuinely adds a run to the queue) carries a wait disposition naming
+# the verdict it decided on — and that no arm defaults to `deep` (e6b). It no longer pins the default
+# `${…:-unmeasured}` on the FIXER rows, because those rows are gone with the gate.
+ck "(e6) exactly ONE CI-SPENDING arm is still queue-gated in this block — the RERUN — and it writes a wait disposition carrying the verdict it decided on (n=$n)" \
+   "$( [ "$n" -eq 1 ]; echo $? )"
+ck "(e6b) no arm DEFAULTS the verdict to \`deep\` — a label the arm never measured" \
    "$( grep -q 'CIQ_VER:-deep' "$LOOP"; [ $? -ne 0 ]; echo $? )"
-grep -q 'ci-queue.sh' "$FIX" && grep -q 'ciq_ci_allowed "\$OR"' "$FIX"
-ck "(e7) fix-one.sh gates the lane that PUSHES" "$?"
+ck "(e6c) …and the rerun is the site that calls the predicate (one call site, measured)" \
+   "$( [ "$(grep -cF '! ciq_push_ok' "$LOOP")" -eq 1 ]; echo $? )"
+# ⛔ fix-one.sh IS ALSO REACHED DIRECTLY and by adopt-fix.sh, so its own gate had to go with the
+# controller's — otherwise the last-line half of the gate survives on the paths nobody watches.
+ck "(e7) fix-one.sh does NOT gate the lane that PUSHES (no module sourced, no predicate call)" \
+   "$( { grep -q 'ciq_ci_allowed' "$FIX" || grep -qF '. "$SELF/ci-queue.sh"' "$FIX"; } ; [ $? -ne 0 ]; echo $? )"
 grep -q 'fixbail-\$PR-\$HEAD' "$FIX"
-ck "(e8) fix-one.sh's deferral writes the bail marker, so no attempt is consumed" "$?"
+ck "(e8) …and the refusals it DOES still make (cross-box CAS, load/disk) keep writing the refundable bail marker, so no attempt is consumed" "$?"
 grep -q 'ci-queue.sh' "$DISPATCH" && grep -F -q 'ciq_defer_note_here "the whole batch' "$DISPATCH"
 ck "(e9) dispatch-merge.sh (the batch stampede) reads the same module and defers the batch" "$?"
 # ⛔ THE MODULE'S VERDICT IS PINNED BEHAVIOURALLY, NOT BY VOCABULARY (#2333 review, P1). The arm this
@@ -568,8 +665,13 @@ ck "(e10c) the module contains no lane-cap COMPARISON in executable lines (got '
 # calls per deferred PR. Every wiring site uses the in-shell entry point; this arm is what stops a
 # future edit reverting one of them.
 n="$(grep -c 'ciq_defer_note_here "' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "' "$FIX")"; p="$(grep -c 'ciq_defer_note_here "' "$DISPATCH")"
-ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$p)" \
-   "$( { [ "$n" -eq 4 ] && [ "$m" -eq 1 ] && [ "$p" -eq 1 ]; } ; echo $? )"
+# ⛔ THE COUNTS ARE 2 AND 0, NOT 4 AND 1, AND THAT IS #2927: `orch-loop.sh` keeps the IN-SHELL note at
+# the ONE arm still queue-gated (the CI rerun) and `fix-one.sh` has none because a fixer is repair.
+# `dispatch-merge.sh` is unchanged (new-PR production). The invariant this arm exists for is unchanged
+# too — every deferral that still exists uses the IN-SHELL entry point, and the sum is pinned so a
+# gate deleted here cannot be replaced by a re-reading call site.
+ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$p, expected 1 0 1)" \
+   "$( { [ "$n" -eq 1 ] && [ "$m" -eq 0 ] && [ "$p" -eq 1 ]; } ; echo $? )"
 # ⛔ THE RE-READING ENTRY POINT IS A REFERENCE, NOT A WIRING TARGET (#2333 merge review, P3). Every
 # shipping site must call the IN-SHELL note. `ciq_defer_note` RE-READS, and a second read can
 # DISAGREE with the decision it was handed — and on a disagreement it prints NOTHING, i.e. a
@@ -609,15 +711,19 @@ guard_names() { sed -n 's/.*declare -f \(ciq_[a-z0-9_ ]*\) >\/dev\/null.*/\1/p' 
 # (live-ownership, rail-refusal, capacity, ci-queue) and the first one's names are not these.
 msg_names()   { sed -n 's/.*is present but INCOMPLETE (needs \(ciq_[^)]*\)).*/\1/p' "$1" | head -1 | tr '/' ' ' | sed 's/ *$//'; }
 _discrep=""; _derived=0
-for _f in "$LOOP" "$FIX" "$DISPATCH"; do
+for _f in "$LOOP" "$DISPATCH"; do
   _g="$(guard_names "$_f")"; _m="$(msg_names "$_f")"
   [ -n "$_g" ] && [ -n "$_m" ] && _derived=$(( _derived + 1 ))
   [ "$_g" = "$_m" ] || _discrep="$_discrep $(basename "$_f")"
 done
 ck "(e13) each INCOMPLETE disclosure names exactly the functions its own \`declare -f\` guard requires, in order — both sides derived from the file (discrepant:${_discrep:- none})" \
    "$( [ -z "$_discrep" ]; echo $? )"
-ck "(e14) …and the derivation is non-vacuous: a guard list AND a message list were found in all three files (found in $_derived/3)" \
-   "$( [ "$_derived" -eq 3 ]; echo $? )"
+ck "(e14) …and the derivation is non-vacuous: a guard list AND a message list were found in BOTH files that still load the module (found in $_derived/2)" \
+   "$( [ "$_derived" -eq 2 ]; echo $? )"
+# …and the file that STOPPED loading it carries neither — the positive form of (e7), so "no gate in
+# fix-one.sh" is asserted by the same derivation rather than by a separate grep that could rot.
+ck "(e14b) fix-one.sh carries NO interface guard and NO INCOMPLETE disclosure (it loads no module)" \
+   "$( { [ -z "$(guard_names "$FIX")" ] && [ -z "$(msg_names "$FIX")" ]; } ; echo $? )"
 
 printf '\n── (h) THE PREDICATE ITSELF, DRIVEN (not grepped) ────────────────────────────\n'
 # ⛔ WHY THIS SECTION EXISTS (#2296 cycle 6, P0). `(e12)` was two textual greps, and no arm anywhere
@@ -722,11 +828,19 @@ ck "(h5) an UNREADABLE queue DEFERS through the shipped predicate (rc=$rc) — f
 # driven in four states, the way (h0)/(h0b) drive the predicate and its reset.
 printf '\n── (h6) the ISSUE-path gate ARM, EXTRACTED and driven in both polarities ──────\n'
 ARM_RAW="$T/gatearm.raw"
-awk '/^  elif \[ "\$\{CIQ:-0}" = "1" \] && \[ "\$\{CIQ_RC:-1}" != "1" \]; then/{print; exit}' "$LOOP" > "$ARM_RAW"
+# ⛔ EXTRACTED BY ITS OWN BOUNDARIES, NOT BY AN `elif` LINE (#2927). The arm was one `elif … then`
+# before the gate VECTOR; it is a nested guard now (the outer `if` closes on its `else …; fi` line, so
+# a `/^  fi$/` range would still be right — but an `elif` anchor matches NOTHING and this rig then
+# graded an EMPTY file: (h6) and its three sisters went red while (h6a)/(h6d)/(h6f) passed vacuously
+# on nothing, which is the shape a polarity pin must never have. The range is now the arm's OWN
+# markers: this file's other `if [ "${CIQ:-0}" = "1" ]` is the READ, not the gate, so a bare pattern
+# anchor cannot tell the two apart.
+sed -n '/# \[ciq-arm:begin\]/,/# \[ciq-arm:end\]/p' "$LOOP" | sed '1d;$d' > "$ARM_RAW"
 ck "(h6) the ISSUE-path ci-queue arm was EXTRACTED from orch-loop.sh (not a restatement)" \
-   "$( { [ -s "$ARM_RAW" ] && grep -q 'CIQ_RC' "$ARM_RAW" && grep -qF 'ci-queue($CIQ_VER)' "$ARM_RAW"; } ; echo $? )"
-mkarm() { # <raw elif line> <out> — wrap the shipped line in a drivable if/elif chain
-  { printf 'GATE_WHY=""\nif false; then :\n'; sed 's/^ *elif /elif /' "$1"; printf 'fi\nprintf "%%s" "$GATE_WHY"\n'; } > "$2"
+   "$( { [ -s "$ARM_RAW" ] && grep -q 'CIQ_RC' "$ARM_RAW" && grep -qF 'ci-queue($CIQ_VER)' "$ARM_RAW" \
+        && grep -qF 'GATE_VEC=' "$ARM_RAW"; } ; echo $? )"
+mkarm() { # <raw arm block> <out> — run the shipped block with GATE_WHY pre-set empty
+  { printf 'GATE_WHY=""\nGATE_VEC=""\n'; cat "$1"; printf '\nprintf "%%s" "$GATE_WHY"\n'; } > "$2"
 }
 ARM="$T/gatearm.sh"; mkarm "$ARM_RAW" "$ARM"
 gaw() { # <arm-file> <CIQ> <CIQ_RC> -> GATE_WHY as the arm renders it
@@ -978,57 +1092,19 @@ fi
 # run-bash-shards.sh by design (spawn-gate.test.sh pins the excluded set), so NO CI LANE ran it.
 # Measured before this arm: the `exit 0` → `:` mutant left this file 83 passed, 0 failed, CLEAN.
 # The shipped block is EXTRACTED (not restated) and driven under a stub module in both polarities.
-printf '\n── (j) the fix-one.sh deferral EXITS, driven with a stub module ───────────────\n'
-FBLK="$T/fixgate.sh"
-awk '/^if \[ -f "\$SELF\/ci-queue.sh" \]; then$/{f=1} f{print} f&&/^fi$/{exit}' "$FIX" > "$FBLK"
-ck "(j1) fix-one.sh's gate block was EXTRACTED (not a restatement)" \
-   "$( { [ -s "$FBLK" ] && grep -q 'ciq_ci_allowed "\$OR"' "$FBLK" && grep -q '^      exit 0$' "$FBLK"; } ; echo $? )"
-mkstub() { # $1 = dir, $2 = ciq_ci_allowed's rc (1 = DEEP, 0 = SHALLOW)
-  mkdir -p "$1"
-  {
-    printf '%s\n' 'ciq_read() { return 0; }' \
-      'ciq_eval() { return 1; }' \
-      'ciq_defer_note_here() { printf "note=[ci-queue] DEFERRED %s\n" "$1"; }' \
-      "ciq_ci_allowed() { return $2; }" \
-      'ciq_verdict() { printf "%s" "stub"; }' \
-      'ciq_is_count() { return 0; }' \
-      'ciq_ceiling() { printf "4"; }' \
-      'ciq_defer_line() { printf "stub-line"; }' \
-      'ciq_horizon_min() { printf "20"; }' \
-      'ciq_job_p90_min() { printf "10"; }'
-  } > "$1/ci-queue.sh"
-  printf '%s\n' 'CIQ_QUEUED=99; CIQ_RUNNING=1; CIQ_RUNNERS=2; CIQ_CEILING=4; CIQ_STATE=deep; CIQ_AGE=0' >> "$1/ci-queue.sh"
-}
-mkstub "$T/fixself-deep" 1
-mkstub "$T/fixself-shallow" 0
-drive_fixgate() { # $1 = block file, $2 = stub dir → writes $T/sentinel iff the block FELL THROUGH
-  : > "$T/fixlog.log"
-  rm -f "$T/sentinel"
-  ( SELF="$2"; OR="o/r"; PR="7"; BR="fix/b"; HEAD="$(printf 'deadbeef%.0s' 1 2 3 4 5)"; CTRL=1
-    O="$T/fixstate"; mkdir -p "$O/state"; L="$T/fixlog"
-    # shellcheck source=/dev/null
-    . "$1"
-    printf 'FELL-THROUGH\n' >> "$T/sentinel" ) >/dev/null 2>&1
-  printf '%s' "$?"
-}
-rc="$(drive_fixgate "$FBLK" "$T/fixself-deep")"
-ck "(j2) a DEEP queue EXITS the fixer before it runs (rc=$rc, no fall-through, bail marker written) — the lane that PUSHES does not" \
-   "$( { [ "$rc" = 0 ] && [ ! -e "$T/sentinel" ] \
-        && grep -q 'DEFERRED' "$T/fixlog.log" && [ -e "$T/fixstate/state/fixbail-7-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ]; } ; echo $? )"
-rc="$(drive_fixgate "$FBLK" "$T/fixself-shallow")"
-ck "(j3) …and a SHALLOW queue FALLS THROUGH (rc=$rc, sentinel present) — so (j2) is a decision, not a constant exit" \
-   "$( { [ "$rc" = 0 ] && [ -e "$T/sentinel" ] && ! grep -q 'DEFERRED' "$T/fixlog.log"; } ; echo $? )"
-# …and the effect is not decoration: without the `exit 0` the block FALLS THROUGH on a DEEP queue.
-sed 's/^      exit 0$/      :/' "$FBLK" > "$T/fixgate-mutant.sh"
-if cmp -s "$FBLK" "$T/fixgate-mutant.sh"; then
-  bad "(j4) the deferral mutation did not apply — this arm would prove nothing"
-elif ! bash -n "$T/fixgate-mutant.sh" 2>/dev/null; then
-  bad "(j4) the deferral mutant does not parse — a broken mutant proves nothing about the exit"
-else
-  rc="$(drive_fixgate "$T/fixgate-mutant.sh" "$T/fixself-deep")"
-  ck "(j5) MUTANT — a deferral without its \`exit 0\` reaches the push (rc=$rc, sentinel=$([ -e "$T/sentinel" ] && echo yes || echo no)), so (j2) is not always-green" \
-     "$( { [ "$rc" = 0 ] && [ -e "$T/sentinel" ]; } ; echo $? )"
-fi
+printf '\n── (j) fix-one.sh does NOT gate a repair on the queue (#2927) ────────────────\n'
+# ⛔ THIS SECTION USED TO DRIVE THE DELETED GATE. It extracted `if [ -f "$SELF/ci-queue.sh" ] … fi`
+# from fix-one.sh and proved that a DEEP queue EXITED the fixer before any work — with its own
+# `exit 0`-deleted mutant. That block no longer exists: a fixer is REPAIR, so there is no block to
+# extract, no deferral to mutate, and no bail marker written for a queue. The invariant is now the
+# ABSENCE of the call on the shipped bytes, asserted positively below (a reintroduced gate reddens
+# (j1)/(j2)), together with the presence of the gate a fixer IS bounded by.
+ck "(j1) fix-one.sh sources no CI-queue module (a fixer is bounded by this BOX's capacity, not by CI)" \
+   "$( grep -qF '. "$SELF/ci-queue.sh"' "$FIX"; [ $? -ne 0 ]; echo $? )"
+ck "(j2) …and never calls the queue predicate" \
+   "$( grep -q 'ciq_ci_allowed' "$FIX"; [ $? -ne 0 ]; echo $? )"
+ck "(j3) …while the LOAD/disk spawn gate it IS bounded by is still sourced (the bound was narrowed, not removed)" \
+   "$( grep -q 'spawn-gate.sh' "$FIX"; echo $? )"
 # ⛔ (m) THE CI-RERUN GATE — the one SWEEP act that ADDS queue (#2333 review round 4, P2). The PR
 # names it as "the only other surface in the sweep that ADDS queue", and it was pinned by NOTHING:
 # (e6) counts the `ci-queue(...)` token, and pr-dispatch.test.sh's T3 cycle never reaches this block
