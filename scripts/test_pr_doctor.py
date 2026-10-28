@@ -6811,7 +6811,8 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
     # every macOS box while passing on `ubuntu-latest` (whose temp root is shorter) -- a verdict
     # decided by the box's `$TMPDIR` grades the box, not the ordering. So the ordering is asserted at
     # its EXACT OFFSET (box-independent), and the 160-char property is asserted separately against a
-    # PRODUCTION-LENGTH `$O` (~27 chars; a real box resolves `~/.pi/agent/scripts/brief-gate.sh`, 34)
+    # PRODUCTION-LENGTH `$O` (~27 chars; a real box resolves `$HOME/.pi/agent/scripts/brief-gate.sh`,
+    # which is 32 + len($HOME) chars — 44-52 in practice)
     # in the block after it.
     path = str(d / "brief-gate.sh")
     prefix = "rc=80: nonblocking-dispatch.sh: REFUSED — brief-gate="

@@ -360,7 +360,9 @@ REAP_LOG="$WORK/reap.log"
 # passed while the removal arms failed). Measured on a clean box:
 # `reasons=too-young:2,main-checkout:1,live-cwd:1` and both §3 removal arms red — i.e. this section could never PASS anywhere, so the live-cwd gate it exists to
 # pin had no working test at all while the suite reported covering it. The floor is not what §3 is
-# about (it is pinned by `scripts/pi-reap-worktrees.test.sh` R7); the same override, with the same
+# about (it is pinned by `scripts/pi-reap-worktrees.test.sh` G6e and G6f, `:974-1000` — G6f drives
+# it through `--apply` and asserts the footer's `MIN_AGE_MINUTES=45`; there is no arm labelled `R7`,
+# which is a dangling reference in that file's own `:1173` comment); the same override, with the same
 # rationale, is what that suite uses in its own A7 fixture.
 ( cd "$ROOT" && REAP_WT_STATE_DIR="$WORK/reap-state" REAP_WT_AGED_DAYS=0 \
     REAP_WT_MERGED_AGE_DAYS=0 REAP_WT_MIN_AGE_MINUTES=0 \
