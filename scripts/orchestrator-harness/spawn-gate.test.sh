@@ -1575,6 +1575,19 @@ CWT="$CREPO/.worktrees/cap-1"
 # A linked worktree shares the repository config, so this origin is what `git -C "$CWT" remote`
 # answers for the arms' cwd.
 git -C "$CREPO" remote add origin https://github.com/owner/repo.git
+# ⛔ AND ITS TRANSPORT IS LOCAL (agent-infra#2834). The exit-path rescue now runs at the end of EVERY
+# `run_agent`, so the cap arms below — which leave the worktree DIRTY on purpose — would otherwise
+# attempt a real `git fetch`/`git push` against github.com from a test suite that promises to touch no
+# real state. `url.<bare>.insteadOf` rewrites the TRANSPORT only: `repo-slug.sh` reads
+# `git config --local --get remote.origin.url` and still sees the GitHub slug the creation gate needs
+# (a local `remote set-url` would be refused 74 by THAT gate), while the rescue's fetch and push land
+# in this bare repo. Hermetic, and it lets these arms exercise the rescue instead of skipping it.
+git init -q --bare -b main "$CAPRIG/origin.git"
+git -C "$CREPO" config url."$CAPRIG/origin.git".insteadOf https://github.com/owner/repo.git
+# The rescue builds its archive with `git commit-tree`, which needs an AUTHOR IDENTITY of its own; the
+# fixture's per-commit `-c user.email=…` would leave it with none, and the arm would then be measuring
+# a missing identity rather than the cap.
+git -C "$CREPO" config user.name t; git -C "$CREPO" config user.email t@t
 printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$CAPRIG/bin/gh"
 chmod +x "$CAPRIG/bin/gh"
 # A worker that never finishes inside the cap. (arm 6 replaces it with one that IGNORES SIGTERM;
