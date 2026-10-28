@@ -28,6 +28,7 @@ and a passing draft must still exit 0).
 """
 import importlib.util
 import io
+import json
 import os
 from contextlib import redirect_stdout
 
@@ -215,12 +216,12 @@ class _Recorder:
         return [c for c in self.calls if all(n in c for n in needles)]
 
 
-def _run_gate(monkeypatch, text, dry=False):
+def _run_gate(monkeypatch, text, dry=False, jev_result=None):
     rec = _Recorder()
     monkeypatch.setattr(ao, "sh", rec)
     monkeypatch.setattr(ao, "sh_status", lambda args, timeout=None: (0, "", ""))
     monkeypatch.setattr(ao, "fetch_question", lambda repo, n: text)
-    monkeypatch.setattr(ao, "jev", lambda state: {
+    monkeypatch.setattr(ao, "jev", lambda state: jev_result or {
         "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
         "usage": {"cost_usd": 0.0},
     })
@@ -650,3 +651,154 @@ def test_headings_do_not_dilute_the_sentence_average():
     prose = "\n".join(["## What happened"] + [" ".join(["word"] * 55) + "."] * 2)
     marks, _ = _marks(prose)
     assert marks["understandable"] < BAR, marks
+
+
+# ── THE VENDOR IS TYPESAFE (2026-10-26) ────────────────────────────────────────────────────────
+# This file's bars were measured against `jev-1.13.0` on a host that is NOT the vendor's API
+# (tortoise#7864 paid that lookalike). The endpoint/model legs live in
+# test_turn_classify_state.py (same constants, same sweep); what is pinned HERE is the key and
+# the request `ao.jev()` actually builds, so a migration can never unkey the gate into a silent
+# "no question was checked", nor reshape the payload into the array form the API rejects.
+
+def test_key_reads_the_typesafe_name_then_the_legacy_one(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))          # no ~/.pi/agent/jev-config.json in play
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    assert ao._key() is None, "no key must read as None — the caller turns that into 'NOT a pass'"
+    monkeypatch.setenv("JEV_API_KEY", "legacy-name-key")
+    assert ao._key() == "legacy-name-key"
+    monkeypatch.setenv("TYPESAFE_API_KEY", "vendor-name-key")
+    assert ao._key() == "vendor-name-key"
+
+
+def test_this_files_copy_of_the_endpoint_and_model_is_the_real_vendor():
+    """⛔ EVERY COPY OF THE CONSTANTS NEEDS ITS OWN LEG. They live in three files (turn-classify.py,
+    this file, and the deployed state/lane-verdict.py that lane-actions.py reads as LV.*) plus the
+    deployed ~/.pi/agent/scripts copies — and a review measured that reverting THIS file alone to
+    `jevtypesafeai.com` left the whole suite green, because the turn-classify legs assert
+    turn-classify's copies. A partial rotation that misses one file is silent, which is the exact
+    stale-constant class the migration exists to end.
+
+    The MODEL is the vendor alias `jev-latest` by owner ruling (2026-10-27), so the bars in this
+    file — calibrated on the lookalike host's `jev-1.13.0`, never re-measured against the
+    vendor (tortoise#7864) — now score answers a model the vendor can move without a
+    diff on our side. That is the owner's call; what this leg pins is THIS file's copy — every
+    copy carries its own leg, per the paragraph above, and a green run here says nothing about
+    `turn-classify.py` — and `test_turn_classify_state.py` pins the echo that makes a move visible."""
+    assert ao.JEV_URL == "https://api.typesafe.ai/v1/systemone", ao.JEV_URL
+    assert ao.JEV_MODEL == "jev-latest", ao.JEV_MODEL
+
+
+def test_the_summary_line_reports_the_version_the_api_answered_with():
+    """⛔ THE LINE MUST REPORT THE VERSION THE RESPONSE CARRIED, NOT THE ALIAS SENT.
+
+    The fleet sends the alias `jev-latest` (owner ruling 2026-10-27), so a line built from
+    `JEV_MODEL` would read `model=jev-latest` and look correct while telling a reader nothing
+    about which version judged the question. This asserts the line comes from the RESPONSE —
+    and the fixture's answer is deliberately a version, not the alias. (In a token response;
+    when the API reports money instead, `meta_line` prints cost and carries no version, which
+    is why this is a claim about the line and not about "the only place" anything appears.)
+    """
+    line = ao.meta_line({"model": "jev-1.14.0",
+                         "usage": {"input_tokens": 10, "output_tokens": 2}})
+    assert line == "model=jev-1.14.0 tokens=10/2", line
+    assert "jev-latest" not in line, (
+        "the summary reported the alias we sent instead of the version that answered")
+
+
+def test_the_printed_summary_line_reports_the_echoed_version(monkeypatch):
+    """⛔ THE CALL SITE, NOT JUST THE HELPER (review 2026-10-27).
+
+    The leg above asserts `meta_line()` IN ISOLATION. That left the place the fleet actually
+    reads — `print(meta_line(result))` in `main()` — uncovered: measured, rebuilding that print
+    from `JEV_MODEL` (`%s ... % JEV_MODEL`) printed `model=jev-latest`, looked correct, and left
+    this whole file GREEN. So the regression the module comment claims is caught was not caught.
+
+    This drives the REAL `main()` through the `_run_gate` harness with a TOKEN-shaped response
+    (the branch that prints a version at all — the cost-only branch carries none by design).
+    After this leg the claim "the summary line is asserted" is true of the site that prints it
+    and not merely of the helper it calls.
+    """
+    rc, _rec, out = _run_gate(monkeypatch, V9, jev_result={
+        "model": "jev-1.14.0",
+        "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+    })
+    assert rc == 0, out
+    assert "model=jev-1.14.0" in out, out
+    assert "model=jev-latest" not in out, (
+        "the PRINTED line reported the alias we sent instead of the version that answered: %r"
+        % (out,))
+
+
+def test_jev_sends_a_name_keyed_questions_map_with_instructions(monkeypatch):
+    """THE PAYLOAD, ASSERTED. `ao.jev()` is stubbed by nine other legs in this file, so its real
+    request was exercised by nothing. The API rejects an ARRAY of questions (422) and rejects a
+    question that has neither criteria nor instructions (400) — an array would make every owner
+    question bounce as "cannot check", which reads as a gate failure rather than a shape bug.
+    ⛔ The `instructions` assertion is NOT justified by a refusal: measured 2026-10-26, a
+    criteria-bearing question WITHOUT instructions returns 200. We assert it because it carries
+    the instruction text the marks are graded on, and because its absence here is a bug we want
+    to see, not a 4xx we are documenting."""
+    seen = {}
+
+    class _Resp:
+        def __init__(self, payload):
+            self._b = json.dumps(payload).encode()
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data.decode())
+        seen["auth"] = req.get_header("Authorization")
+        return _Resp({"model": "jev-1.13.0",
+                      "answers": {name: {"type": "noul", "noul": 0.9} for name in ao.QUESTIONS},
+                      "usage": {"input_tokens": 100, "output_tokens": 10}})
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(ao.urllib.request, "urlopen", fake_urlopen)
+    out = ao.jev("Should we migrate the fleet? Options: A or B. We recommend A.")
+
+    assert seen["url"] == ao.JEV_URL == "https://api.typesafe.ai/v1/systemone", seen["url"]
+    assert seen["body"]["model"] == ao.JEV_MODEL == "jev-latest", seen["body"]
+    assert seen["auth"] == "Bearer k", seen["auth"]
+    qs = seen["body"]["questions"]
+    assert isinstance(qs, dict) and set(qs) == set(ao.QUESTIONS), sorted(qs)
+    for name, q in qs.items():
+        assert q.get("type") in ("noul", "choice", "score"), (name, q)
+        assert isinstance(q.get("instructions"), str) and q["instructions"].strip(), (name, q)
+    assert out and set(out["answers"]) == set(ao.QUESTIONS), out
+    # The real API reports tokens, not money. Assert the TOKEN shape is what the caller keeps —
+    # the earlier form (`"cost_usd" not in out["usage"]`) was a tautology: `out` is the fixture
+    # from `fake_urlopen`, built without that key, so it passed no matter what the real path did.
+    assert out.get("usage") == {"input_tokens": 100, "output_tokens": 10}, out.get("usage")
+
+
+def test_key_falls_back_to_the_0600_store(monkeypatch, tmp_path):
+    """⛔ THE STORE IS THE ONLY KEY SOURCE ON THIS BOX (review 2026-10-26). No plist and no shell
+    profile sets either env name — the live beat works because `_key()` falls back to
+    `~/.pi/agent/jev-config.json`. `turn-classify.py`'s equivalent fallback was pinned and this
+    one was not: deleting it left every ask-owner leg green while the gate silently stopped
+    checking questions ("no TypeSafe key … this is NOT a pass")."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    cfg = tmp_path / ".pi" / "agent" / "jev-config.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"apiKey": "from-the-store", "model": "jev-1.13.0"}))
+    assert ao._key() == "from-the-store"
+    # ⛔ WHITESPACE IS NOT A KEY. `if k:` is truthy for "   ", so a space-valued env var used to
+    # beat the populated store above and go out as `Bearer ` — a 401 whose cause looks like a set
+    # key. The loader must fall THROUGH to the store, and strip what it does return.
+    monkeypatch.setenv("TYPESAFE_API_KEY", "   ")
+    assert ao._key() == "from-the-store"
+    monkeypatch.setenv("JEV_API_KEY", "  padded-key\n")
+    assert ao._key() == "padded-key"
