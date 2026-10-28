@@ -782,6 +782,8 @@ assert_rc 25 "$RC" "WRONG-ID: a same-host url naming another repo abstains"
 assert_contains "$TXT" "wrong IDENTITY" "WRONG-ID: the note names the identity, not the host"
 assert_contains "$TXT" "start a new run" "WRONG-ID: and prescribes the ONLY action that records a new identity"
 assert_contains "$TXT" "--repo" "WRONG-ID: naming the correct --repo as what the new run must carry"
+assert_contains "$TXT" "--repo github.com/" "WRONG-ID: and SPELLING the host it just proved right — a BARE owner/repo supplies no host, so start would re-record RAIL_RUN_GH_HOST/origin (#2959 review, cycle 6, P2)"
+assert_contains "$TXT" "BARE" "WRONG-ID: and saying why the bare form is not enough, so the reader does not shorten it"
 assert_not_contains "$TXT" "DIFFERENT host" "WRONG-ID: and does not blame the host that MATCHED"
 # (c) the run may STILL BE ALIVE — the host remedy must not be prescribed as an action to take NOW,
 #     because `start` refuses a new run while `prev_in_flight` holds (RAIL_RUN_RECORD_MAX, 24 h). This

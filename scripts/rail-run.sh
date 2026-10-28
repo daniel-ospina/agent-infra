@@ -858,7 +858,7 @@ derive() {
       # is printed over (#2959 review, cycle 3, P1):
       #   • same host, different repo/PR — the HOST matched; following the advice records a different,
       #     also-wrong host, so that case must be pointed at `--repo` instead;
-      #   • a FAILED read (`gh` 502) — `pr_state` returns at its `|| return 0` BEFORE `pr_url_names` is
+      #   • a FAILED read (`gh` 502) — `pr_state` returns at its `|| return 12` BEFORE `pr_url_names` is
       #     called, so no comparison happened at all, and prescribing "start a new run" (a second merge
       #     attempt) for a transient read is exactly backwards;
       #   • and it CONTRADICTED the line above it on the `gone` branch, which says "re-poll rather than
@@ -899,16 +899,28 @@ derive() {
         14)
           # Same host, wrong repo/PR: the host is RIGHT, so the fault is the IDENTITY, and no poll can
           # move it (`derive` refuses a poll that names a different `--repo`). Only a new run records one.
+          # ⛔ AND THAT RUN MUST SPELL THE HOST (#2959 review, cycle 6, P2). The bare form `--repo
+          # owner/repo` supplies no host — `host_from_slug_arg` returns nothing for it (`:319`) — so
+          # `start` records `${host_hint:-$(resolve_host)}`, i.e. the knob and then `origin`. Measured:
+          # the remedy "start a new run with --repo <owner/repo>" written for a run whose host IS
+          # `ghe.example.com` re-recorded `github.com` and produced cause 13 on the very next poll — a
+          # second merge attempt that could never land, plus a third run. Spelling the host is the ONE
+          # form that re-records both halves this message just proved: the identity from the argv value,
+          # the host from the same value.
           if [ "$run_over" = "1" ]; then
-            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY (a renamed or transferred repo, or the wrong slug for PR $pr), and no poll can change an identity a run recorded, because naming a different --repo is refused as an identity mismatch. The remedy is to start a new run with --repo <the owner/repo the url actually names>"
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY (a renamed or transferred repo, or the wrong slug for PR $pr), and no poll can change an identity a run recorded, because naming a different --repo is refused as an identity mismatch. The remedy is to start a new run naming BOTH halves — --repo $host/<the owner/repo the url actually names> — because a BARE owner/repo supplies no host, so start would record RAIL_RUN_GH_HOST and then origin instead of the $host this run proves is right"
           else
-            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY, and no poll can change an identity a run recorded. The remedy is a new run with --repo <the owner/repo the url actually names>, and a start can be refused while THIS record still looks live — that refusal is BOUNDED (RAIL_RUN_CLAIM_MAX / RAIL_RUN_RECORD_MAX), so re-poll and start once the bound passes"
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY, and no poll can change an identity a run recorded. The remedy is a new run naming BOTH halves — --repo $host/<the owner/repo the url actually names> — because a BARE owner/repo supplies no host and would re-record RAIL_RUN_GH_HOST/origin instead of $host; and a start can be refused while THIS record still looks live — that refusal is BOUNDED (RAIL_RUN_CLAIM_MAX / RAIL_RUN_RECORD_MAX), so re-poll and start once the bound passes"
           fi ;;
         *)
           # The READ failed: nothing was compared, so there is no host verdict to give. A second run
           # would reproduce the same transient failure on the same head. `src` is 12 for a `gh` that
-          # errored, answered an unrecognised shape, or answered NO url at all — in every one of those
-          # `pr_url_names` never ran, so the sentence must not name a host as the cause.
+          # errored, answered an unrecognised shape, or answered NO url at all — and in every one of the
+          # three NO HOST VERDICT EXISTS: `pr_url_names` (called at `:413`) never runs for the first two,
+          # and for the third it returns at its own empty-url guard (`:378`) BEFORE comparing any host or
+          # path. (It DOES run for that third cause — the earlier wording here said it never ran, which is
+          # false about the call order even though the message's claim holds: #2959 review, cycle 6, P3.)
+          # So the sentence must not name a host as the cause.
           abstain_why="the read of PR $pr in $slug on host $host did not complete — gh did not answer, or answered something that names no url for this PR, so NOTHING was compared and no host verdict exists. This abstains about the READ, not the host: re-poll, because a new run would not fix a transient read" ;;
       esac
     fi
