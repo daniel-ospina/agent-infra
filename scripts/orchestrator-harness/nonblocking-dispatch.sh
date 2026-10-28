@@ -148,6 +148,33 @@ rm -f "$CAPF"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/gate-policy.sh" 2>/dev/null || { echo "nonblocking-dispatch.sh: FATAL: $SELF/gate-policy.sh missing — refusing to start a worker that cannot say whether its gates are on" >&2; exit 78; }
 apply_gate_policy nonblocking-dispatch
+# ── COMMIT AS YOU GO on an AUTHORED brief (#2981) — APPENDED, never refused ──────────────────────────
+# This is the one dispatch path whose brief the CALLER wrote (`pr-doctor.py`, or a human), and it is
+# the path the measured 5-of-5 zero-commit batch came through. The research contract above is a GATE
+# (absent = refuse with 80) because a worker that never looked first is the defect it exists for. This
+# one is APPENDED instead: an authored brief that is otherwise complete must not become a dead
+# dispatch over one missing sentence, and the append is idempotent — a brief that already carries the
+# section (or that came from a generated composer) is left byte-for-byte alone.
+# ⛔ THE SECTION HAS ONE HOME. It is rendered by `reviewer-preflight.sh`, never copied here; the
+# needle is that render's own first line, so a reworded heading cannot silently stop matching.
+# ⛔ `prfix` IS THE ROLE: a worker on this path is repairing an ALREADY-OPEN PR, so telling it to
+# "open the PR" would be a false order.
+NB_DELIVERY_SH="$SELF/reviewer-preflight.sh"
+[ -f "$NB_DELIVERY_SH" ] || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh not found at $NB_DELIVERY_SH — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+NB_DELIVERY="$(bash "$NB_DELIVERY_SH" --delivery-brief prfix)" || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief failed — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+NB_DELIVERY_HEADING="$(printf '%s\n' "$NB_DELIVERY" | head -1)"
+[ -n "$NB_DELIVERY_HEADING" ] || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief rendered NOTHING — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
+if ! grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" 2>/dev/null; then
+  printf '\n%s\n' "$NB_DELIVERY" >> "$PROMPT" || {
+    echo "nonblocking-dispatch.sh: could not append the COMMIT-AS-YOU-GO section to $PROMPT — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
+fi
+# ⛔ AND THEN VERIFY IT LANDED. An append that reported success and wrote nothing is the exact shape
+# this section exists to refuse, so the post-condition is asserted rather than assumed.
+grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" || {
+  echo "nonblocking-dispatch.sh: the brief at $PROMPT STILL lacks its COMMIT-AS-YOU-GO section after the append — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
 # ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
 # checkout, not a review bypass, and #2319 does not rule on it.
 export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
