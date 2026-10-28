@@ -771,11 +771,18 @@ reportManifestState();
 // records added sub-agent startup lines as a defect class. A child (and any
 // launcher that already set `KIND`/`TAG`) has nothing applied, so it prints
 // nothing; a session that actually gained an affordance prints exactly one line.
-// The guards the OPERATOR needs are unchanged: a launcher-set lane still prints
-// "⏸️ Disabled" at `session_start`, and one that bypasses through THIS derivation
-// prints the "derived lane contract: <why>" form there — so every process that
-// acts with the gates off still says so, once.
+//
+// ⛔ AND EXACTLY ONE LINE PER PROCESS (review cycle 2, P1). This line carries the
+// same `why` the `session_start` "Disabled — derived lane contract" line carries,
+// so emitting both printed the identical sentence twice for the one shape that
+// matters most — a raw `pi -p` in a linked worktree, the case #172 is about.
+// `DERIVED_ANNOUNCED_AT_LOAD` is what makes the two sites ONE announcement: this
+// one wins when something was INFERRED, and `session_start` emits the derived
+// form only when nothing was (a launcher-set lane emits its own "Disabled" line
+// there and is unaffected). Every process that acts with the gates off still says
+// so, once — which is the claim the round-1 comment made and the code did not.
 const DERIVED_LANE = laneContract();
+let DERIVED_ANNOUNCED_AT_LOAD = false;
 if (DERIVED_LANE.lane) {
   const applied = applyLaneContract();
   const named = [applied.kind ? `KIND=${applied.kind}` : "", applied.tag ? `TAG=${applied.tag}` : ""].filter(Boolean).join(" ");
@@ -785,6 +792,7 @@ if (DERIVED_LANE.lane) {
         ` (inferred ${named})` +
         ` — a launcher-set SKILL_ENFORCER_DISABLED/AGENT_ALLOW_MAIN_EDITS still wins where present`,
     );
+    DERIVED_ANNOUNCED_AT_LOAD = true;
   }
 }
 
@@ -879,11 +887,17 @@ export default function (pi: ExtensionAPI) {
       // #2965 — say WHICH affordance applied. "Disabled" alone left an operator
       // unable to tell a launcher's env var from a DERIVED lane contract, which
       // is the difference between "someone set this" and "this was inferred".
+      // ⛔ The derived form is the FALLBACK announcement, not a second one: when
+      // the module-load line already named the inferred contract
+      // (`DERIVED_ANNOUNCED_AT_LOAD`), repeating the same `why` here would put two
+      // identical sentences in one process's log (review cycle 2, P1).
       const derived = laneContract();
       const viaEnv = process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1";
-      console.log(
-        viaEnv ? `[skill-enforcer] ⏸️  Disabled` : `[skill-enforcer] ⏸️  Disabled — derived lane contract: ${derived.why}`,
-      );
+      if (viaEnv) {
+        console.log(`[skill-enforcer] ⏸️  Disabled`);
+      } else if (!DERIVED_ANNOUNCED_AT_LOAD) {
+        console.log(`[skill-enforcer] ⏸️  Disabled — derived lane contract: ${derived.why}`);
+      }
     }
   });
 

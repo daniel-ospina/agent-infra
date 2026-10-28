@@ -70,7 +70,9 @@ function tmpDir(prefix: string): string {
   return d;
 }
 function cleanup() {
-  _setLaneContractForTest(null);
+  // One seam is enough: `_setLaneContractForTest(null)` and
+  // `_resetLaneContractForTest()` are both `cached = null` — the first was a dead
+  // no-op statement (review cycle 2, P2), the same class round 1 removed.
   _resetLaneContractForTest();
   for (const d of TMP) rmSync(d, { recursive: true, force: true });
 }
