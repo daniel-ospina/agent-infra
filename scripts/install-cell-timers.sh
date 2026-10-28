@@ -79,7 +79,7 @@ SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 UNITS=(eldato-objective-reminder.service eldato-objective-reminder.timer \
        eldato-controller-watchdog.service eldato-controller-watchdog.timer)
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 usage() { sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
@@ -167,8 +167,8 @@ cmd_dry_run() {
   do_render_all "$r" "$out" || { rm -rf "$out"; return 1; }
   for f in "${UNITS[@]}"; do printf '=== %s ===\n' "$f"; cat "$out/$f"; done
   rm -rf "$out"
-  say ""
-  say "dry run: rendered 4 units for platform=$PLATFORM; nothing was written or enabled."
+  log_line ""
+  log_line "dry run: rendered 4 units for platform=$PLATFORM; nothing was written or enabled."
   return 0
 }
 
@@ -177,15 +177,15 @@ cmd_install() {
   if [ "$PLATFORM" = "Darwin" ]; then
     # ⛔ NOT A SILENT SKIP: on a Mac these two jobs are LaunchAgents, and install-launchd.sh owns them.
     # Naming the owner is the difference between "not applicable" and "nobody installed it".
-    say "platform=Darwin: a Mac has no systemd. These two jobs are installed from templates/launchd/ by:"
-    say "    bash $INFRA_ROOT/scripts/install-launchd.sh"
-    say "  (com.eldato.objective-reminder and com.eldato.controller-watchdog — nothing was written here.)"
+    log_line "platform=Darwin: a Mac has no systemd. These two jobs are installed from templates/launchd/ by:"
+    log_line "    bash $INFRA_ROOT/scripts/install-launchd.sh"
+    log_line "  (com.eldato.objective-reminder and com.eldato.controller-watchdog — nothing was written here.)"
     return 0
   fi
   r="$(pick_reminder)" || { err "objective-reminder.sh not found (looked at \$REMINDER_SCRIPT, $CELL_HOME/.pi/agent/scripts, $INFRA_ROOT/scripts)"; return 1; }
   preflight "$r" || return 1
   resolve_target || { err "no systemd target on this box: tried a SYSTEM unit via passwordless sudo and a USER unit via 'systemctl --user'. Nothing was installed — a scheduled pass with no scheduler is the false PASS this installer refuses."; return 1; }
-  say "installing into the $TARGET scope: $UNIT_DIR (systemctl: $SC)"
+  log_line "installing into the $TARGET scope: $UNIT_DIR (systemctl: $SC)"
 
   out="$(mktemp -d "${TMPDIR:-/tmp}/cell-timers.XXXXXX")" || return 1
   if ! do_render_all "$r" "$out"; then rm -rf "$out"; return 1; fi
@@ -193,7 +193,7 @@ cmd_install() {
   mkdir -p "$UNIT_DIR" 2>/dev/null || { err "cannot create $UNIT_DIR"; rm -rf "$out"; return 1; }
   for u in "${UNITS[@]}"; do
     if [ -f "$UNIT_DIR/$u" ] && cmp -s "$out/$u" "$UNIT_DIR/$u"; then
-      say "  $u: unchanged"
+      log_line "  $u: unchanged"
       continue
     fi
     if [ "$TARGET" = system ] || [ "$(id -u)" = 0 ]; then
@@ -201,7 +201,7 @@ cmd_install() {
     else
       cp "$out/$u" "$UNIT_DIR/$u" 2>/dev/null || { err "cannot write $UNIT_DIR/$u"; rc=1; }
     fi
-    [ "$rc" -eq 0 ] && say "  $u: installed"
+    [ "$rc" -eq 0 ] && log_line "  $u: installed"
   done
   rm -rf "$out"
   [ "$rc" -eq 0 ] || return 1
@@ -218,22 +218,22 @@ cmd_install() {
     # ⛔ WITHOUT LINGER a user manager stops at the last logout: the timers silently stop on the box
     # nobody is logged into, which is every cell. Name it (the disk reaper's installer does the same).
     if command -v loginctl >/dev/null 2>&1 && ! loginctl show-user "$(id -un)" 2>/dev/null | grep -q 'Linger=yes'; then
-      say "  ⚠️  Linger is NOT enabled for $(id -un): these timers stop at logout. Enable with: sudo loginctl enable-linger $(id -un)"
+      log_line "  ⚠️  Linger is NOT enabled for $(id -un): these timers stop at logout. Enable with: sudo loginctl enable-linger $(id -un)"
     fi
   fi
-  say "installed: objective reminder every 10 min, controller watchdog every 5 min ($TARGET scope)."
-  say "  read back with: bash $0 --status"
+  log_line "installed: objective reminder every 10 min, controller watchdog every 5 min ($TARGET scope)."
+  log_line "  read back with: bash $0 --status"
   return 0
 }
 
 cmd_status() {
   local u st rc=0 out line
   if [ "$PLATFORM" = "Darwin" ]; then
-    say "platform=Darwin — these jobs are launchd, not systemd: NOT APPLICABLE here."
-    say "  check them with: bash $INFRA_ROOT/scripts/install-launchd.sh --status"
+    log_line "platform=Darwin — these jobs are launchd, not systemd: NOT APPLICABLE here."
+    log_line "  check them with: bash $INFRA_ROOT/scripts/install-launchd.sh --status"
     return 0
   fi
-  resolve_target || { say "UNKNOWN: no systemd manager answers, so neither timer's state can be read (that is not 'healthy')"; return 2; }
+  resolve_target || { log_line "UNKNOWN: no systemd manager answers, so neither timer's state can be read (that is not 'healthy')"; return 2; }
   for u in eldato-objective-reminder.timer eldato-controller-watchdog.timer; do
     st="$($SC is-active "$u" 2>/dev/null || true)"
     en="$($SC is-enabled "$u" 2>/dev/null || true)"
@@ -255,7 +255,7 @@ cmd_status() {
 cmd_uninstall() {
   local u
   if [ "$PLATFORM" = "Darwin" ]; then
-    say "platform=Darwin — nothing to remove here; the launchd jobs belong to install-launchd.sh."
+    log_line "platform=Darwin — nothing to remove here; the launchd jobs belong to install-launchd.sh."
     return 0
   fi
   resolve_target || { err "no systemd manager answers, so nothing can be disabled"; return 1; }
@@ -264,7 +264,7 @@ cmd_uninstall() {
   done
   for u in "${UNITS[@]}"; do rm -f "$UNIT_DIR/$u" 2>/dev/null || true; done
   $SC daemon-reload >/dev/null 2>&1 || true
-  say "removed both timers and their units from $UNIT_DIR (the passes' own logs are left in $STATE_DIR)."
+  log_line "removed both timers and their units from $UNIT_DIR (the passes' own logs are left in $STATE_DIR)."
   return 0
 }
 

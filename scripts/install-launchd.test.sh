@@ -481,11 +481,16 @@ assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired ora
 # does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
 # and a pinned 9 measured here reads 11 beside a checkout. So: the always-installable jobs pinned by
 # name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
-# fixture's own template dir — with the gated inventory itself pinned at 3, so a newly added gated
+# fixture's own template dir — with the gated inventory itself pinned at 4, so a newly added gated
 # job cannot raise both sides of the equation at once. The pin is the ONLY place this count is
 # stated: adding a gated template without bumping it here reds this suite on main, which is what
 # happened when worktree-hygiene (#1095/#1678) landed, and again when pr-doctor + controller-watchdog
-# (#2303) landed: the templates arrived, the pin did not. The number is 12 since #2303.
+# (#2303) landed: the templates arrived, the pin did not. ⛔ IT WAS STALE AGAIN when this branch reached
+# it: the tree carries FOUR gated templates (branch-reaper #1787, worktree-reaper #1311,
+# worktree-hygiene #2047, pr-doctor #2303) and the pin still said 3, so this shard was red for a reason
+# no PR had anything to do with. The number of always-installable jobs is 13 since #2700 added
+# `com.eldato.worker-supply` (the repair-pool supply half: it needs only {{AGENT_INFRA_PATH}} +
+# {{PATH}} + {{HOME}}, so there is no tortoise gate to skip it on).
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 GATED_TEMPLATES1=0
 GATED_INSTALLED1=0
@@ -500,7 +505,7 @@ done
 # `com.tortoise.worktree-hygiene` to the gated set (branch-reaper #1787 + worktree-reaper #1311 +
 # worktree-hygiene #2047), and the result was a RED `bash-suites` on main that had nothing to do with any
 # PR that touched it. Keep this list in step with `grep -l '{{TORTOISE_REPO}}' templates/launchd/*.plist`.
-assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047)"
+assert_eq "$GATED_TEMPLATES1" "4" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047 + pr-doctor #2303)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
@@ -519,7 +524,7 @@ else
     # invariant instead of relying on the exit code alone.
     assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
 fi
-assert_eq "$BOOTSTRAP_COUNT1" "$((12 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (12 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate + the #1862-restored pi-reap-orphans + pr-doctor (#2303) + controller-watchdog (#2303), plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+assert_eq "$BOOTSTRAP_COUNT1" "$((13 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (13 always-installable on a non-swarm host: corruption-canary + provider-latency-tripwire + fleet-cost-weekly + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + objective-reminder + ci-runner-gate + the #1862-restored pi-reap-orphans + controller-watchdog (#2303) + worker-supply (#2700); pr-doctor is one of the FOUR {{TORTOISE_REPO}}-gated templates above, NOT always-installable, so a list that names it here is off by one the moment someone follows it)"
 # #1949 (rebased onto #2006; re-keyed after review): name the two gated JOBS, so an ambient
 # `TORTOISE_REPO` fails with its cause instead of being absorbed by the derived count above.
 # ⛔ The guard must be `GATED_VISIBLE1` (derived from the FILESYSTEM), never `GATED_INSTALLED1`:
