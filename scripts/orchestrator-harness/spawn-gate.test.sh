@@ -133,11 +133,18 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `LANE_MEM_MB` is 512, so the token pair matches. That made this shard RED on `main` for every PR
   # that rebased onto it (found while rebasing #2323: `got_pi` carried `ai-drainer.sh`). Excluded by
   # name, with its own non-launcher assertion below — the same ruling, not a second exception class.
+  # ⛔ `orphaned-harness.sh` IS THE THIRD OF THAT CLASS (#2867/#2871, `49115c1e6`). It is a READ-ONLY
+  # reporter ("never stops a unit, never kills a session, never deletes anything") that quotes
+  # `pi -p --no-session` when explaining why a lane leaves no transcript. Its only `-p` tokens in
+  # CODE are `ps -o comm= -p <pid>` and `systemctl show -p ExecStart`, and NEITHER co-occurs with
+  # `--no-session` — so the pair that matched is prose, exactly like `ai-drainer.sh`. It landed after
+  # this census and put the shard RED on `main` for every PR that rebased onto it. Excluded by name,
+  # with its own non-launcher assertion below.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -203,6 +210,14 @@ _nl_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
 _nl_code="$(sed 's/#.*//' "$HERE/ai-drainer.sh" 2>/dev/null)"
 if grep -qE -e "$_nl_flag" <<<"$_nl_code" && grep -qF -- '--no-session' <<<"$_nl_code"; then rc=1; else rc=0; fi
 ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gated dispatchers; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+# …and the same proof for orphaned-harness.sh (#2867/#2871). Its `-p` tokens are `ps -p <pid>` and
+# `systemctl show -p ExecStart`, so WITH the comments stripped neither the flag nor its `--no-session`
+# partner survives as a pair. A real launch added to that file (in code) puts the pair back and this
+# arm goes RED — the exclusion cannot swallow one, and it is the detector's own predicate, not a list
+# of verbs this test hopes is complete.
+_nl_code="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
+if grep -qE -e "$_nl_flag" <<<"$_nl_code" && grep -qF -- '--no-session' <<<"$_nl_code"; then rc=1; else rc=0; fi
+ck "the excluded orphaned-harness.sh is a NON-launcher in CODE (a read-only orphan REPORT whose -p tokens are ps/systemctl flags; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
