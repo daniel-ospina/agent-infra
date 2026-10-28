@@ -9,6 +9,10 @@
 #   landing_artifacts_brief_section [self|harness]   → the section that tells the lane HOW to produce
 #     the artifacts `pipeline-compliance` checks ([a] issue ref, [b] scoping marker, [c] the
 #     head-bound review record, [d] plan evidence); spliced into the brief by lane.sh (#2325).
+#   delivery_brief_section [lane|prfix]              → the section that tells a worker to COMMIT AND
+#     PUSH as it goes (and to adopt, never discard, an uncommitted tree it inherited); spliced into
+#     every generated brief that orders work — lane.sh, fix-one.sh, pr-doctor.py — and appended by
+#     nonblocking-dispatch.sh to any authored brief that does not already carry it (#2981).
 #
 # WHY (agent-infra#2148, measured 2026-10-19 on cell-2). Three lanes rebased, implemented, tested,
 # pushed and opened their PRs, and were then stopped by the review-enforcer:
@@ -295,14 +299,89 @@ specific files you changed.
 BRIEF
 }
 
+# ── Commit as you go (#2981) ──────────────────────────────────────────────────────────────────────
+# WHY (agent-infra#2981, measured 2026-10-27/28). Five repair lanes (`prfix`, all dispatched within
+# ~2 minutes on one box) were each killed at their 2400 s cap: **0 commits, 0 PRs, 144 KB of work**
+# that survived only as rescue patch files. The rescue worked correctly (`bg-rescue-wip.sh` wrote a
+# VERIFIED patch), and that is exactly the point — a working rescue is not a delivered result. Every
+# lane was holding its single commit for the end, and the end was a `kill -TERM`.
+#
+# The briefs those lanes received already carried the research contract (#2258), the reviewer step
+# (#2148), the landing artifacts (#2325) and the push refspec (#1894) — every rule the fleet had
+# already paid for — and never the cheapest one. This section is that rule: commit as soon as you
+# have a coherent unit, push, get the PR open, then keep improving it.
+#
+# ⛔ THE SECOND HALF IS NOT A FOOTNOTE. After that batch EVERY one of the five worktrees held its
+# predecessor's uncommitted work, and a resumed lane that "starts from a clean tree" (or runs
+# `git checkout -- .`) throws a whole predecessor's work away — silently, with no error and nothing
+# in the log. The rule above leaves committed work behind; this half is what makes the next run able
+# to USE it instead of destroying it. One unit of work must not cost two full wall clocks.
+#
+# ⛔ ROLE-CORRECT ON ONE SENTENCE, for the reason the landing section is role-correct on [c]: a
+# `prfix` worker is dispatched TO AN EXISTING PR (`pr-doctor.py` composes that brief), so ordering it
+# to "open the PR" would be a FALSE instruction — the class of untruth #2148 and #2325 both exist to
+# remove from a brief. `lane` opens its own PR; `prfix`/`fixer` already have one.
+DELIVERY_BRIEF_HEADING='## COMMIT AS YOU GO — a killed lane must leave a PR behind (agent-infra#2981)'
+
+# delivery_brief_section [lane|prfix] — the same text for every worker that changes a tree; only
+# the sentence about the PR differs.
+delivery_brief_section() { # delivery_brief_section [lane|prfix]
+  local role="${1:-lane}" open_pr
+  case "$role" in
+    lane)
+      open_pr='**Open the PR as soon as the first commit is pushed**, then keep improving it — the PR
+  being open is a starting line, not a finish line. Once it exists you do NOT open a second PR for
+  the same work.' ;;
+    prfix)
+      open_pr='**Your PR is ALREADY OPEN — commit and push onto it, and do NOT open a second PR.**' ;;
+    *)
+      printf 'reviewer-preflight.sh: unknown role "%s" (expected lane|prfix)\n' "$role" >&2
+      return 2 ;;
+  esac
+  cat <<BRIEF
+${DELIVERY_BRIEF_HEADING}
+
+**Commit as soon as you have a coherent unit, push it, then KEEP IMPROVING it.** Do not save your
+work for one commit at the end. The wall clock does not warn before it fires: a lane killed at its
+cap takes the uncommitted tree with it, so a lane that holds everything delivers NOTHING — its work
+is indistinguishable from no work at all while it exists only in a worktree that is about to be
+reaped.
+
+MEASURED 2026-10-27/28 (agent-infra#2981): five repair lanes in one batch, all five killed at their
+2400 s cap — **0 commits, 0 PRs, 144 KB of work** recovered only as rescue patch files. Not one of
+them had done the wrong work. Not one of them had delivered it.
+
+- A commit is a checkpoint, not a ceremony: commit when what you have BUILDS, or when the next thing
+  you are about to write would make the tree worse. Several small commits are the deliverable; one
+  perfect commit that never happens is not.
+- ${open_pr}
+- **Push after every commit**, not once at the end — a commit that exists only in your worktree does
+  not survive the worktree being reaped, and it is not what the merge chain reads.
+- Keep working on the SAME branch once the PR exists. Do not restate the whole change in one final
+  commit at the end of the run; that is the shape this rule exists to remove.
+
+## ON RESUME — read the tree before you touch it
+
+If you did not write the tree you just found, **read \`git status\` and \`git diff\` FIRST** — before
+any edit, and before any checkout. An uncommitted tree in THIS worktree is your PREDECESSOR's work on
+this same task: a lane killed at its cap leaves exactly that, and it can be tens of KB of finished,
+tested work.
+
+Adopt it: read the diff, keep what is right, finish what is unfinished, commit it. ⛔ **Never discard
+it** — no \`git checkout -- .\`, no \`git stash\`, no \`git clean\`, no \`git reset --hard\` over
+uncommitted work, and never "start from a clean tree". Discarding it is how the same work dies twice.
+BRIEF
+}
+
 # CLI, for tests and for a human who wants the exact text:
 #   bash reviewer-preflight.sh --line [self|harness|reviewer] | --brief [self|harness]
-#                                  | --landing-brief [self|harness]
+#                                  | --landing-brief [self|harness] | --delivery-brief [lane|prfix]
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --line)  shift; reviewer_preflight_line "${1:-self}" ;;
     --brief) shift; reviewer_brief_section "${1:-self}" ;;
     --landing-brief) shift; landing_artifacts_brief_section "${1:-self}" ;;
-    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness] | --landing-brief [self|harness]\n' "$0" >&2; exit 2 ;;
+    --delivery-brief) shift; delivery_brief_section "${1:-lane}" ;;
+    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness] | --landing-brief [self|harness] | --delivery-brief [lane|prfix]\n' "$0" >&2; exit 2 ;;
   esac
 fi

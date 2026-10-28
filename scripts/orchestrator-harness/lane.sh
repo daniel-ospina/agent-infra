@@ -203,6 +203,19 @@ REVIEWER_BRIEF="$(reviewer_brief_section harness)" || {
 # FAIL LOUD if the helper cannot render it, because a brief that silently drops it is the defect.
 LANDING_BRIEF="$(landing_artifacts_brief_section harness)" || {
   echo "[lane $N] FATAL: landing_artifacts_brief_section failed — refusing to start a lane whose brief omits the landing artifacts" >&2; exit 78; }
+# ── COMMIT AS YOU GO, disclosed for the same reason (#2981) ──────────────────────────────────────
+# Five `prfix` lanes were killed at their caps with ZERO commits and 144 KB of work that reached no
+# PR, because every one of them held its single commit for the end and the end was a `kill -TERM`.
+# This brief already stated the research contract, the reviewer step and the landing artifacts; the
+# cheapest rule of all was missing. Same treatment as the two sections above: rendered ONCE, spliced
+# as a VARIABLE (never a `$(...)` inside the unquoted heredoc — #1835), FAIL LOUD if the helper
+# cannot render it, and CHECKED at build time below — a brief that silently drops it is the defect.
+DELIVERY_BRIEF="$(delivery_brief_section lane)" || {
+  echo "[lane $N] FATAL: delivery_brief_section failed — refusing to start a lane whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+# ⛔ AN EMPTY RENDER IS A FAILED RENDER. The section is spliced below as a variable, so a helper that
+# returns nothing would insert a blank line and every other assertion would stay green.
+[ -n "$DELIVERY_BRIEF" ] || {
+  echo "[lane $N] FATAL: delivery_brief_section rendered NOTHING — refusing to start a lane whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
 
 # ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test line
 # below. A lane's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for an
@@ -313,6 +326,8 @@ Then report it. "Blocked" with no reason forces the next lane to re-derive every
 
 $RESEARCH_BRIEF
 
+$DELIVERY_BRIEF
+
 $LANDING_BRIEF
 
 $REVIEWER_BRIEF
@@ -332,6 +347,15 @@ EOF
 # here — so it is 78 (cannot run), never 80 (brief refused).
 bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.log" || {
   echo "[lane $N] FATAL: the GENERATED brief fails brief-gate.sh — refusing to start a lane whose brief lost its research contract (a harness defect in the heredoc above, NOT a brief-authoring error) (#2258)" >&2
+  exit 78
+}
+# ⛔ AND THE DELIVERY CONTRACT IS CHECKED HERE TOO (#2981). `brief-gate.sh` validates the RESEARCH
+# contract only; a heredoc edit that drops this section would leave every other assertion green — the
+# exact invisibility that cost 144 KB. Cheap, build-time, and it refuses BEFORE a lane is started.
+# ⛔ THE `-n` IS PART OF THE GUARD, NOT DECORATION: `grep -F ""` matches EVERY line, so an emptied
+# heading constant would make this check INERT while it still read as protection (a no-op gate).
+[ -n "$DELIVERY_BRIEF_HEADING" ] && grep -qF -- "$DELIVERY_BRIEF_HEADING" "$O/logs/prompt-$N.txt" || {
+  echo "[lane $N] FATAL: the GENERATED brief lost its COMMIT-AS-YOU-GO section — refusing to start a lane that would hold its work to the cap (a harness defect in the heredoc above) (#2981)" >&2
   exit 78
 }
 # ── CAPACITY TRANSFER: make the refusal a DURABLE, READABLE record (agent-infra#1909) ──────

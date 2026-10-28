@@ -580,6 +580,121 @@ _composed4=1; [ -n "$STRIPPED2" ] || _composed4=0
 
 echo
 
+echo "§G commit as you go — a cap kill must leave a PR behind (#2981)"
+# THE DEFECT (agent-infra#2981, measured 2026-10-27/28). Five `prfix` lanes, one batch: all five
+# killed at their 2400 s cap, **0 commits, 0 PRs, 144 KB of work** recovered only as rescue patches.
+# The rescue worked; the work still reached no PR, and the next run had to adopt its predecessor's
+# tree before it could add a line. The briefs those lanes received carried the research contract, the
+# reviewer step, the landing artifacts and the push refspec — and never the cheapest rule of all.
+# These arms read the ARTIFACT a worker receives, never the helper's own prose.
+DELIVERY_LANE="$(delivery_brief_section lane)"
+DELIVERY_PRFIX="$(delivery_brief_section prfix)"
+delivery_brief_section banana >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ]; ck $? "an unknown role is a usage error (2), never the wrong audience's PR duty"
+
+# ONE predicate per requirement, shared by the composed-brief arm AND the non-vacuity controls.
+has_commit_rule() { case "$1" in *"Commit as soon as you have a coherent unit, push it, then KEEP IMPROVING it"*) return 0;; *) return 1;; esac; }
+has_push_each()   { case "$1" in *"Push after every commit"*) return 0;; *) return 1;; esac; }
+has_cap_reason()  { case "$1" in *"killed at its"*"cap takes the uncommitted tree with it"*) return 0;; *) return 1;; esac; }
+has_resume()      { case "$1" in *'read `git status` and `git diff` FIRST'*"PREDECESSOR's work on"*) return 0;; *) return 1;; esac; }
+has_adopt()       { case "$1" in *"Never discard"*'`git checkout -- .`'*'`git reset --hard`'*) return 0;; *) return 1;; esac; }
+has_open_pr()     { case "$1" in *"Open the PR as soon as the first commit is pushed"*) return 0;; *) return 1;; esac; }
+has_no_second()   { case "$1" in *"do NOT open a second PR"*) return 0;; *) return 1;; esac; }
+
+for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
+  "$_p" "$DELIVERY_LANE"; ck $? "the helper renders it ($_p)"
+done
+
+# §G.1 THE ARTIFACT, NOT THE HELPER: the brief a lane.sh lane would ACTUALLY be given (§C composed it).
 echo
+echo "§G.1 the composed brief a lane.sh lane RECEIVES"
+[ -s "$BRIEF_FILE" ]; ck $? "the composed brief from §C is non-empty (an empty artifact fails every arm below)"
+COMPOSED_G="$(cat "$BRIEF_FILE" 2>/dev/null || true)"
+has_commit_rule "$COMPOSED_G"; ck $? "the imperative: commit as soon as you have a coherent unit, then KEEP IMPROVING"
+has_push_each   "$COMPOSED_G"; ck $? "…push after every commit (not once at the end)"
+has_cap_reason  "$COMPOSED_G"; ck $? "…and WHY: the cap kill takes the uncommitted tree with it"
+has_resume      "$COMPOSED_G"; ck $? "resume: read git status / git diff FIRST — the tree is your predecessor's work"
+has_adopt       "$COMPOSED_G"; ck $? "…and ADOPT it: never checkout -- . / stash / clean / reset --hard over it"
+has_open_pr     "$COMPOSED_G"; ck $? "the lane role opens its OWN PR as soon as the first commit is pushed"
+has_no_second   "$COMPOSED_G"; ck $? "…and is told not to open a SECOND PR"
+case "$COMPOSED_G" in *"$DELIVERY_BRIEF_HEADING"*) rc=0;; *) rc=1;; esac
+ck $rc "…under the findable heading the helper owns"
+# The rule must not have DISPLACED what the brief already said.
+grep -q '## RESEARCH FIRST' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the research contract SURVIVES the insertion"
+grep -q '## Reviewer step' "$BRIEF_FILE" 2>/dev/null; ck $? "…as does the reviewer step"
+grep -q '## Deliverable' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the Deliverable section"
+
+# §G.2 ROLE-CORRECT ON ONE SENTENCE. `pr-doctor.py` dispatches its worker TO AN EXISTING PR, so
+# ordering that worker to "open the PR" would be a FALSE instruction (the #2148/#2325 untruth class).
+echo
+echo "§G.2 role-correct on the PR sentence only — what is owed is identical"
+has_no_second "$DELIVERY_PRFIX"; ck $? "prfix: the PR is ALREADY OPEN, so it must not open a second one"
+has_open_pr "$DELIVERY_PRFIX"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and is NOT told to open a PR it already has"
+for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
+  "$_p" "$DELIVERY_PRFIX"; ck $? "prfix carries the same rule: $_p"
+done
+
+# §G.3 THE CONTROLLER TEMPLATE — the authored-brief source. Byte for byte, or it is a second copy.
+echo
+echo "§G.3 templates/LANE-BRIEF.md mirrors the section BYTE FOR BYTE (drift-pinned block)"
+DBLOCK="$(awk '/^<!-- BEGIN delivery-contract/{f=1;next} /^<!-- END delivery-contract -->$/{exit} f' "$TEMPLATE")"
+[ -n "$DBLOCK" ]; ck $? "the template carries a delivery-contract block"
+if [ "$DBLOCK" = "$DELIVERY_LANE" ]; then rc=0; else rc=1; fi
+ck $rc "the block EQUALS the helper's rendered lane section (one home: edit the helper, not the template)"
+grep -qF 'BEGIN delivery-contract' "$TEMPLATE"; ck $? "…under named markers, so the pin cannot drift silently"
+grep -q 'edit THERE, not here' "$TEMPLATE"; ck $? "…and the marker says where the text actually lives"
+
+# §G.4 NON-VACUITY, both levels.
+echo
+echo "§G.4 NON-VACUITY — the arms above can fail"
+# (a) predicate level: strip the clause from the COMPOSED text; the SAME predicate must fire.
+NO_COMMIT="$(printf '%s\n' "$COMPOSED_G" | sed 's/Commit as soon as you have a coherent unit, push it, then KEEP IMPROVING it/./')"
+has_commit_rule "$NO_COMMIT"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "stripping the imperative MAKES has_commit_rule FAIL"
+NO_RESUME="$(printf '%s\n' "$COMPOSED_G" | sed 's/PREDECESSOR.s work on/./')"
+has_resume "$NO_RESUME"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "…stripping the resume half MAKES has_resume FAIL (both halves are pinned)"
+# (b) composer level: a helper that renders the section WITHOUT its heading must make lane.sh REFUSE.
+# That is lane.sh's BUILD-TIME guard, and without this arm it could be inert (exit 0, or a grep that
+# never matches) while every arm above stayed green — the no-op-gate shape.
+STRIPG="$TMP/stripg"; mkdir -p "$STRIPG"
+cp "$HERE/spawn-gate.sh" "$STRIPG/spawn-gate.sh"; cp "$LANE" "$STRIPG/lane.sh"
+cp "$HERE/repo-target.sh" "$STRIPG/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIPG/repo-slug.sh"
+cp "$HERE/brief-gate.sh" "$STRIPG/brief-gate.sh"; cp "$HERE/gate-policy.sh" "$STRIPG/gate-policy.sh"
+sed "s#^DELIVERY_BRIEF_HEADING=.*#DELIVERY_BRIEF_HEADING=''#" "$HELPER" > "$STRIPG/reviewer-preflight.sh"
+grep -q "^DELIVERY_BRIEF_HEADING=''$" "$STRIPG/reviewer-preflight.sh"; ck $? "the heading-stripped helper copy was produced"
+for _rigbr in fix/stripg; do git -C "$TMP" update-ref "refs/heads/$_rigbr" HEAD 2>/dev/null || true; done
+mkdir -p "$TMP/o5/logs"
+(
+  cd "$TMP" || exit 1
+  O="$TMP/o5" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+    bash "$STRIPG/lane.sh" 2981 fix/stripg acme/widget
+) >"$TMP/o5/lane.out" 2>&1
+_rc5=$?
+[ "$_rc5" = "78" ]; ck $? "⛔ a composer that loses the section REFUSES the lane with 78 — the build-time guard is LIVE (rc=$_rc5)"
+grep -q 'COMMIT-AS-YOU-GO' "$TMP/o5/lane.out" 2>/dev/null; ck $? "…and says WHICH section was lost, in the refusal"
+
+# §G.5 ONE SOURCE, ASSERTED. The heading literal must live in the helper (its definition) and in the
+# drift-pinned template copy — nowhere else. A second copy is the drift this section exists to refuse.
+echo
+echo "§G.5 the heading has ONE home (plus the pinned template copy)"
+STRAY=""
+for _f in "$TEMPLATE" "$LANE" "$HERE/fix-one.sh" "$HERE/brief-gate.sh" "$HERE/spawn-gate.sh" \
+          "$HERE/nonblocking-dispatch.sh" "$(cd "$HERE/../.." && pwd)/scripts/pr-doctor.py"; do
+  [ -f "$_f" ] || continue
+  case "$_f" in "$TEMPLATE"|"$HELPER") continue;; esac
+  grep -qF "$DELIVERY_BRIEF_HEADING" "$_f" 2>/dev/null && STRAY="$STRAY $_f"
+done
+[ -z "$STRAY" ]; ck $? "no composer carries its own copy of the section (stray:${STRAY:- none})"
+# …and every composer that hands a worker a brief OBTAINS it from the helper.
+for _f in "$LANE" "$HERE/fix-one.sh" "$HERE/nonblocking-dispatch.sh"; do
+  grep -q 'delivery_brief_section\|--delivery-brief' "$_f" 2>/dev/null; ck $? "$(basename "$_f") splices the canonical section"
+done
+grep -q 'delivery_brief_section\|--delivery-brief' "$(cd "$HERE/../.." && pwd)/scripts/pr-doctor.py" 2>/dev/null
+ck $? "pr-doctor.py splices the canonical section"
+
+echo
+
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
