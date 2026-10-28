@@ -110,6 +110,17 @@ trap 'rm -rf "$TMP"' EXIT
 # `stand-in-shard.sh`; it is not this suite's current cost and a bound sized from it protects
 # nothing. Re-measure before quoting a number here.
 CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
+# ⛔ THE FIXTURE COPIES ARE HERMETIC: THEY MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING.
+# `stage_guard` gives each fixture root the real helper so `run-bash-shards.sh`'s fail-closed load
+# succeeds — but the copies then call `fixture_guard_placement` with the DEFAULT root set, so a
+# fixture's exit code would depend on whether the machine running this suite happens to have a
+# controller executing from a cell root. Measured on a box with 4 live controllers: 22 of 121
+# assertions failed here versus 15 with this line, and the 7 extra were all `rc 78` guard refusals —
+# i.e. the suite's verdict became host-dependent, which is what "hermetic" in this file's header
+# forbids. `${FIXTURE_LIVE_ROOTS-…}` takes an explicit empty value as "no roots" (no colon on
+# purpose), so this is exactly the seam the helper advertises for a caller like this one. The real
+# gate still runs in `run-bash-shards.sh` itself, which is not a fixture.
+FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 # cheap_runner <out-file> <one-shard-target> — a copy of the REAL runner whose DISCOVERY points at
 # exactly one cheap target. ⛔ Since agent-infra#2609 the list is DERIVED (`SUITE_GLOBS` + each
 # suite's own `# shard:` marker), so this fixture replaces that ONE data list instead of rewriting

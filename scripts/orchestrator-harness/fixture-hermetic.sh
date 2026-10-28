@@ -144,20 +144,25 @@ fixture_start_group() { # <cmd...> -> prints the pid (== pgid) of the started pr
 # probing the GROUP first: a group whose leader has already exited still exists while its children
 # live, and that is precisely the case an "is this pid a leader?" (`ps -o pgid=`) test gets WRONG.
 fixture_terminate() { # <sig> <id> — the group when one exists, else the process
-  case "${2:-}" in ''|*[!0-9]*) return 0 ;; esac
+  # ⛔ `0` IS REJECTED AS WELL AS NON-NUMERIC. `kill -0 -- -0` SUCCEEDS ("-0" is the CALLER's own
+  # process group), so `fixture_terminate TERM 0` would TERM the suite itself and its siblings, and
+  # `fixture_alive_id 0` would report a permanent false leak. `$!` is never 0, so this is latent
+  # rather than reachable today — but these are plain functions in a sourced helper with nothing
+  # restricting the ids to the ledger, and "numeric" must not silently include 0.
+  case "${2:-}" in ''|*[!0-9]*|0) return 0 ;; esac
   if kill -0 -- "-$2" 2>/dev/null; then kill -"$1" -- "-$2" 2>/dev/null
   else kill -"$1" "$2" 2>/dev/null; fi
 }
 
 fixture_alive_id() { # <id> -> 0 when the recorded group OR process is still alive
-  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${1:-}" in ''|*[!0-9]*|0) return 1 ;; esac
   kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null
 }
 
 fixture_survivors() { # <id...> -> prints each survivor; returns the count (READ ONLY)
   local id survivors=0 what
   for id in "$@"; do
-    case "$id" in ''|*[!0-9]*) continue ;; esac
+    case "$id" in ''|*[!0-9]*|0) continue ;; esac
     fixture_alive_id "$id" || continue
     survivors=$((survivors + 1))
     if kill -0 -- "-$id" 2>/dev/null; then what="process group $id"; else what="pid $id"; fi
@@ -178,7 +183,7 @@ fixture_reap_all() { # -> 0 when every recorded group is gone; nonzero = number 
   : > "$FIXTURE_PGID_FILE"          # truncate first: a re-entrant trap must not re-signal a recycled id
   [ -n "$list" ] || return 0
   for pgid in $list; do
-    case "$pgid" in ''|*[!0-9]*) continue ;; esac
+    case "$pgid" in ''|*[!0-9]*|0) continue ;; esac
     fixture_terminate TERM "$pgid"
   done
   i=0

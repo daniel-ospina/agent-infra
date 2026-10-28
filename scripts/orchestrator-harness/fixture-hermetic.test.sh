@@ -81,6 +81,20 @@ P4="$(plant "$T/h4" | tail -1)"
 sleep 0.3
 ck "the plant is ALIVE before the teardown (pid $P4) — otherwise this case passes vacuously" "$(alive "$P4" && echo 0 || echo 1)"
 ck "…and its group is recorded in the ledger" "$(grep -qx "$P4" "$FIXTURE_PGID_FILE" && echo 0 || echo 1)"
+# ⛔ AND ASSERT THE GROUP ITSELF, NOT JUST THAT THE PID DIES (review, cycle 3). `fixture_terminate`
+# falls back to the PID when no group exists, so a plant that is NOT in its own group is still
+# killed — which means reverting the `setpgrp`-before-`exec` idiom (or `fixture_start_group` itself)
+# leaves every OTHER arm green while the GROUP guarantee, and every descendant of a fixture,
+# silently disappears. That is the false PASS #3011 exists to close, one layer up. This is the
+# mechanism's only discriminator, so it is paired with a control that must answer the other way —
+# otherwise "pgid == pid" would be satisfied by any process that happens to lead its own group.
+ck "…and it LEADS its own process group (pgid == pid), so a reap ends its descendants too" \
+   "$([ "$(ps -o pgid= -p "$P4" 2>/dev/null | tr -d ' ')" = "$P4" ] && echo 0 || echo 1)"
+bash -c 'sleep 20' & UNGROUPED=$!
+sleep 0.3
+ck "…and the same read says the OPPOSITE for a plain 'bash … &' start (pgid pid), so it is not vacuous" \
+   "$([ "$(ps -o pgid= -p "$UNGROUPED" 2>/dev/null | tr -d ' ')" != "$UNGROUPED" ] && echo 0 || echo 1)"
+kill "$UNGROUPED" 2>/dev/null; wait "$UNGROUPED" 2>/dev/null
 fixture_reap_all; rc=$?
 ck "fixture_reap_all reports every group gone (rc=$rc)" "$rc"
 sleep 0.2
@@ -150,11 +164,20 @@ ROOT8="$T/root8"; P8="$(plant "$ROOT8" | tail -1)"
 # or, worse, the full shard list executes (H4 already carries the same precondition; H8 lacked it).
 sleep 0.3
 ck "…and the plant is ALIVE before driving the driver (pid $P8) — otherwise the refusal is vacuous" "$(alive "$P8" && echo 0 || echo 1)"
-OUT="$(FIXTURE_LIVE_ROOTS="$ROOT8" bash "$SHARDS" 2>&1)"; rc=$?
-ck "the shipped driver REFUSES to run shards on a live cell (rc=$rc, want 78)" "$([ "$rc" -eq 78 ] && echo 0 || echo 1)"
-case "$OUT" in *"REFUSES TO RUN ON A LIVE CELL"*) ok "…with its own refusal, not a shard failure" ;;
-                                *) bad "the refusal text is missing: $OUT" ;; esac
-case "$OUT" in *"SHARD FAILED"*) bad "it ran shards anyway after refusing" ;; *) ok "…and no shard was executed" ;; esac
+# ⛔ AND THE PRECONDITION MUST GATE THE INVOCATION, not merely be reported (review, cycle 3). `ck` only
+# increments the failure counter, so a dead plant still fell through to the driver: with no controller
+# present the guard passes, the driver runs the WHOLE derived shard list (minutes), and the inner
+# fixture-hermetic.test.sh recurses the same way. The failure direction was safe — rc≠78 reds the arm —
+# but a broken `plant` turned the cheapest shard into an unbounded recursive full-population run.
+if alive "$P8"; then
+  OUT="$(FIXTURE_LIVE_ROOTS="$ROOT8" bash "$SHARDS" 2>&1)"; rc=$?
+  ck "the shipped driver REFUSES to run shards on a live cell (rc=$rc, want 78)" "$([ "$rc" -eq 78 ] && echo 0 || echo 1)"
+  case "$OUT" in *"REFUSES TO RUN ON A LIVE CELL"*) ok "…with its own refusal, not a shard failure" ;;
+                                  *) bad "the refusal text is missing: $OUT" ;; esac
+  case "$OUT" in *"SHARD FAILED"*) bad "it ran shards anyway after refusing" ;; *) ok "…and no shard was executed" ;; esac
+else
+  bad "H8 skipped the driver — the plant died, so a passing guard could not be attributed to it"
+fi
 fixture_reap_all >/dev/null 2>&1
 
 echo "───────────────────────────────────────────────"
