@@ -748,11 +748,43 @@ assert_rc 25 "$RC" "HOST-DEFAULT: a URL on another host abstains, caused BY the 
 assert_contains "$TXT" "on host github.com" "HOST-DEFAULT: the abstention spells out the DEFAULT host it compared"
 assert_contains "$TXT" "start a new run" "HOST-DEFAULT: and the remedy names the action that can change a RECORDED host (a re-poll cannot)"
 assert_contains "$TXT" "RAIL_RUN_REPO_SLUG" "HOST-DEFAULT: and names the identity pin that OUTRANKS the knob (else the advice is inert)"
-# ⛔ THE ADVICE MUST NOT PRESCRIBE THE HOST REMEDY FOR A FAILED READ (#2959 review, cycle 3, P1).
-# `pr_state` returns BEFORE any comparison when gh itself fails, so this cause needs a re-poll — and
-# the note has to say so, or it prescribes a second merge attempt for a transient read.
-assert_contains "$TXT" "read itself failed, re-poll" "HOST-DEFAULT: a FAILED read is pointed at a re-poll, not at a new run"
-assert_contains "$TXT" "check --repo" "HOST-DEFAULT: and a same-host/different-repo mismatch is pointed at --repo, not at the host"
+# ⛔ ONE CAUSE, ONE REMEDY (#2959 review, cycle 4, P2). This arm's cause is a DIFFERENT HOST, so the
+# note must NOT send the reader to `--repo` (a wrong identity records another wrong host) and must not
+# blame a read that SUCCEEDED. Those remedies live on their own arms below, where their cause is built.
+assert_not_contains "$TXT" "check --repo" "HOST-DEFAULT: a host mismatch does NOT send the reader to --repo"
+assert_not_contains "$TXT" "did not complete" "HOST-DEFAULT: and does not blame a read that DID complete"
+
+# ── AG1f: the three abstention causes carry three DIFFERENT remedies ──────────────────────────
+# `pr_state` now names WHICH comparison failed, so each cause gets only its own sentence. Before this,
+# ONE static blob was printed for every cause: a transient `gh` 502 was told to "start a new run" (a
+# SECOND merge attempt for a read that only needed a re-poll), and a run whose liveness was unresolved
+# was told to do the one thing `start` REFUSES while it may still be alive. Each arm builds ONE cause.
+# (a) the READ failed — nothing was compared, so re-polling is the remedy and a new run is not.
+craft 189 readfail rc=137 >/dev/null
+OUT="$(GH_MODE=fail poll 189)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "READ-FAIL: a failed gh read against a killed run still abstains"
+assert_contains "$TXT" "did not complete" "READ-FAIL: the note blames the READ, not the host"
+assert_contains "$TXT" "re-poll" "READ-FAIL: and points at a re-poll"
+assert_not_contains "$TXT" "start a new run" "READ-FAIL: a second merge attempt is NOT prescribed for a transient read"
+assert_not_contains "$TXT" "check --repo" "READ-FAIL: and it is not blamed on the identity"
+# (b) SAME host, different repo/PR — the host matched, so the remedy is --repo and never a new run.
+craft 190 wrongidentity rc=0 >/dev/null
+OUT="$(GH_MODE=wrongrepo poll 190)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "WRONG-ID: a same-host url naming another repo abstains"
+assert_contains "$TXT" "wrong IDENTITY" "WRONG-ID: the note names the identity, not the host"
+assert_contains "$TXT" "check --repo" "WRONG-ID: and points at --repo"
+assert_not_contains "$TXT" "start a new run" "WRONG-ID: a new run would record the wrong host again"
+# (c) the run may STILL BE ALIVE — the host remedy must not be prescribed as an action to take NOW,
+#     because `start` refuses a new run while `prev_in_flight` holds (RAIL_RUN_RECORD_MAX, 24 h). This
+#     is the `rail_liveness=unknown` branch the round-3 diff newly made print the note; NO arm reached
+#     it before (`rg -n railpid scripts/rail-run.test.sh` had only the START record-fields loop).
+#     `pid=999999` is positively gone; `railstart=abc` makes the RAIL's probe ABSTAIN (exit 2).
+craft 191 livemismatch pid=999999 start=0 railpid=$$ railstart=abc >/dev/null
+OUT="$(GH_MODE=otherhost poll 191)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "LIVE-HOST: a host mismatch on a possibly-live run still abstains"
+assert_state "$TXT" unknown "LIVE-HOST: it claims neither a death nor a landing"
+assert_contains "$TXT" "REFUSED until this one is positively gone" "LIVE-HOST: the note says the new run is REFUSED for now"
+assert_not_contains "$TXT" "and start a new run" "LIVE-HOST: so it does not tell the reader to start one NOW"
 
 # ── AG1e: the reason line reaches the paths that ALREADY COMPUTED it ──────────────────────────
 # `read_artifact` sets `abstain_why`, and the no-incarnation branch used to print `read <log> and
