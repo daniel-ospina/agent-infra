@@ -3180,7 +3180,7 @@ lane_shard_set() {
   : > "$allnames"
   LANE_SET_LISTED=0; LANE_SET_WINDOW="$limit"; LANE_SET_CONSULTED=0
   LANE_SET_MEASURED=0; LANE_SET_NONMEASURING=0; LANE_SET_JOBS=0
-  LANE_SET_JOB_SAMPLE=""; LANE_SET_EMPTY_STOP=""
+  LANE_SET_JOB_SAMPLE=""; LANE_SET_EMPTY_STOP=""; LANE_SET_ALLNAMES=""
   while :; do
     if ! lane_run_ids "$flag" "$value" "$raw" > "$listing"; then
       say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
@@ -3266,6 +3266,12 @@ lane_shard_set() {
   # code lane was in the window at all", and those two have opposite remedies —
   # so the refusal NAMES what it saw. Read BEFORE the accumulator is removed.
   LANE_SET_JOB_SAMPLE="$(lane_job_sample "$allnames")"
+  # #2842: the RAW executed names of this side, not only the rendered sample. A
+  # refusal whose remedy is "set the prefix" has to be able to name a prefix that
+  # WORKS for the names this window carried — and the sample is a RENDERING
+  # (` | `-joined, truncated, with a `(+N more)` tail), so parsing a rendering
+  # back is not a datum. Read BEFORE the accumulator is removed.
+  LANE_SET_ALLNAMES="$(sort -u "$allnames" 2>/dev/null | grep '[^[:space:]]' || true)"
   rm -f "$allnames"
   # Drop any blank line before the union: a single blank entry would be counted
   # as a shard by `wc -l` and would match the empty pattern under `grep -xF`.
@@ -3540,6 +3546,63 @@ print("true" if c else "false")
   return 0
 }
 
+# lane_prefix_candidates <names-file> <out-file> [<max>] — the exact, copy-pasteable
+# retry values for a parity FAMILY that selected nothing (#2842).
+#
+# The refusal has named ADMIN_MERGE_LANE_JOB_PREFIX since #4844 and the executed job
+# names the window carried since #7734 — and a lane still paid a whole extra cycle,
+# because a knob plus a name list leaves the operator to GUESS the value and the
+# obvious guess is wrong: the family match is a case-SENSITIVE prefix (`lane_shards`
+# compares with Python `startswith`), so the lowercase `unit` the rail's own example
+# teaches selects NOTHING in a repo whose job is `Unit tests`. The operator follows
+# the printed remedy, is refused a second time, and the only remaining door the same
+# message names is the override — which is the steer #2842 reports.
+#
+# So this DERIVES the value instead of describing it. A job NAME is trivially a
+# prefix that selects itself (`'Unit tests'.startswith('Unit tests')`), so the
+# suggestion cannot be wrong about the name it came from; WHICH name is the test
+# shard stays the operator's decision, and the evidence states the family, so a
+# narrowed family is disclosed rather than silent. Auto-deriving the family instead
+# (the issue's first suggestion) is deliberately NOT done here: the rail cannot know
+# which executed names are test shards, and a family derived from the WRONG names
+# would quietly take a real shard out of the comparison — a fail-open in the gate
+# this file exists to be.
+#
+# LIFECYCLE names are excluded: `lane_has_test_shard` refuses a family made only of
+# bookkeeping jobs, so suggesting one would hand the operator a value that lands on a
+# DIFFERENT refusal. Blank lines are dropped for the same reason `lane_count` drops
+# them (a blank entry is a name that measures nothing), and the overflow is COUNTED,
+# never dropped silently.
+lane_prefix_candidates() {
+  local f="$1" out="$2" max="${3:-6}"
+  # The scan file MUST NOT be the caller's output path: the `rm -f` below would
+  # then delete the very answer this function just wrote — which is exactly the bug
+  # a first run of it had (the file was created, filled and removed in one call).
+  local lifecycle="$TMP/lane-lifecycle-cand.txt" list="$TMP/lane-candidate-scan.tmp"
+  local total="" name="" quoted=""
+  : > "$out"
+  [ -f "$f" ] || return 0
+  printf '%s\n' "$LANE_LIFECYCLE_JOBS" > "$lifecycle"
+  # NO `grep -c` UPSTREAM OF A QUIET CONSUMER (#864): every stage here reads its
+  # input to EOF, so no writer takes SIGPIPE under `pipefail`.
+  grep '[^[:space:]]' "$f" 2>/dev/null | sort -u | grep -vxF -f "$lifecycle" > "$list" || true
+  total="$(grep -c '[^[:space:]]' "$list" 2>/dev/null || true)"; total="${total:-0}"
+  [ "$total" -gt 0 ] || { rm -f "$list"; return 0; }
+  sed -n "1,${max}p" "$list" | {
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      # POSIX single-quote escaping, so a name holding a quote is still copy-pasteable.
+      quoted="$(printf '%s' "$name" | sed "s/'/'\\\\''/g")"
+      printf "ADMIN_MERGE_LANE_JOB_PREFIX='%s'\n" "$quoted"
+    done
+  } >> "$out"
+  if [ "$total" -gt "$max" ]; then
+    printf '(… +%s more executed job name(s) not listed here)\n' "$((total - max))" >> "$out"
+  fi
+  rm -f "$list"
+  return 0
+}
+
 # lane_parity_check <head> <main-run-limit> — decide whether the two sides are
 # comparable AT ALL, and leave both named shard sets behind so the evidence and
 # the refusal can state the lanes instead of asserting a bare `0 | 0`.
@@ -3557,6 +3620,17 @@ print("true" if c else "false")
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
+# #2842: WHICH condition left the reference EMPTY, when that condition is not an
+# unreadable list. The refusal used to assert ONE cause for every empty reference
+# ("the shard lists are not readable"), which is FALSE — and misleading in a
+# specific direction — when the job lists WERE readable and the family simply
+# matched none of them: the operator is told the coverage was unmeasurable when in
+# fact it was measured and MISNAMED.
+#   "family"    — readable job lists, and none of the executed names matches the family
+#   "lifecycle" — the family matches, but only workflow BOOKKEEPING jobs
+#   ""          — no such claim holds (unreadable/unobserved reference), so the
+#                 generic wording — which IS accurate there — is kept verbatim.
+LANE_PARITY_EMPTY_KIND=""
 # #6928: the diff-gated shards the target's selector DECLINED for this head, and
 # the verdict it answered. Set by lane_parity_check on the forgiveness path; read
 # by the evidence builder so a certified `PR ⊇ main` line is DISCLOSED as resting
@@ -3573,6 +3647,7 @@ lane_parity_check() {
   local head="$1" main_runs="$2" rc=0
   local LANE_PR_FROZEN="" LANE_MAIN_FROZEN="" LANE_DECLINED_FROZEN=""
   LANE_PARITY_REASON=""
+  LANE_PARITY_EMPTY_KIND=""
   if [ -z "${TMP:-}" ] || [ ! -d "${TMP:-}" ]; then
     say_err "admin-merge: ✗ internal error — lane parity called without a TMP directory"
     LANE_PARITY_REASON="the rail's own working directory is missing"
@@ -3598,6 +3673,9 @@ lane_parity_check() {
     LANE_PARITY_REASON="the PR head's lane runs could not be listed or read"
     return 2
   fi
+  # #2842: the PR window's RAW executed names, frozen here — the refusal that names
+  # the prefix knob reads them when this head's family selected nothing of its own.
+  printf '%s\n' "${LANE_SET_ALLNAMES:-}" > "$TMP/lane-pr-alljobs.txt"
   # ── FREEZE EACH REFERENCE AS SOON AS ITS OWN FETCH RETURNS (#1439) ──────────
   # freezing BOTH after both fetches is not enough, because a cross-alias makes the
   # second fetch OVERWRITE the first reference: with `lane-main.txt` a symlink to
@@ -3614,6 +3692,9 @@ lane_parity_check() {
     LANE_PARITY_REASON="main's lane runs could not be listed or read"
     return 2
   fi
+  # #2842: main's RAW executed names, frozen for the refusal's derived retry value.
+  # Read here, not later: the scratch dir is shared and a later write could alias it.
+  printf '%s\n' "${LANE_SET_ALLNAMES:-}" > "$TMP/lane-main-alljobs.txt"
   LANE_MAIN_FROZEN="$(cat "$TMP/lane-main.txt")"
   # Capture MAIN's window accounting NOW: the LANE_SET_* globals are overwritten
   # by every lane_shard_set call, and the reason below is a claim about MAIN.
@@ -3660,11 +3741,15 @@ lane_parity_check() {
     if [ "$main_jobs" -eq 0 ]; then
       LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
     else
+      # #2842: the lists WERE readable — this is a NAMING mismatch, and the refusal
+      # must say so rather than borrow the unreadable-list wording above.
+      LANE_PARITY_EMPTY_KIND="family"
       LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: --workflow <file>. --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
     fi
     return 2
   fi
   if ! lane_has_test_shard "$TMP/lane-main.txt"; then
+    LANE_PARITY_EMPTY_KIND="lifecycle"
     LANE_PARITY_REASON="the shard family '${LANE_JOB_PREFIX}*' matched ONLY lifecycle jobs on main ($(tr '\n' ' ' < "$TMP/lane-main.txt" | sed 's/ $//')) — a bookkeeping family measures no test"
     return 2
   fi
@@ -8672,10 +8757,45 @@ $attribution_line"
       # and names the route that does work, instead of one that cannot.
       if [ "$parity_rc" -eq 2 ]; then
         say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY and the"
-        say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
-        say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
-        say_err "   readable — and an unreadable shard list is NOT an empty one."
+        # #2842: STATE THE CONDITION THAT ACTUALLY HELD. Every empty reference used
+        # to be described as an UNREADABLE list. That is accurate when the listing or
+        # a job list could not be read — and FALSE, in the direction of "your repo's
+        # coverage cannot be measured", when the lists were read perfectly and simply
+        # carried no job in the family. The operator then chases a comparability
+        # defect that does not exist while the one-line naming fix sits unread in WHY.
+        case "${LANE_PARITY_EMPTY_KIND:-}" in
+          family)
+            say_err "   lane coverage could not be established: the shard FAMILY '${LANE_JOB_PREFIX}*'"
+            say_err "   selected NOTHING from job lists that WERE READABLE. That is a NAMING"
+            say_err "   mismatch — NOT an unreadable list and NOT a red check: no failing check"
+            say_err "   was measured on either side, so nothing here says this PR is broken."
+            say_err "   The job name(s) it executed are listed in WHY below." ;;
+          lifecycle)
+            say_err "   lane coverage could not be established: the shard FAMILY '${LANE_JOB_PREFIX}*'"
+            say_err "   matched only workflow LIFECYCLE (bookkeeping) jobs, which measure no test."
+            say_err "   That is a MISNAMED family — NOT an unreadable list and NOT a red check." ;;
+          *)
+            say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
+            say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
+            say_err "   readable — and an unreadable shard list is NOT an empty one." ;;
+        esac
         say_err "   WHY: ${LANE_PARITY_REASON}."
+        # #2842: THE REMEDY MUST CARRY A VALUE THAT WORKS. Naming the knob and the
+        # names it saw still leaves the operator to guess the value, and the guess the
+        # rail's own example teaches ('unit') is refuted by a case-SENSITIVE prefix
+        # match against 'Unit tests'. So the retry command is DERIVED from the names
+        # this window actually executed.
+        if [ "${LANE_PARITY_EMPTY_KIND:-}" = "family" ] || [ "${LANE_PARITY_EMPTY_KIND:-}" = "lifecycle" ]; then
+          lane_prefix_candidates "$TMP/lane-main-alljobs.txt" "$TMP/lane-candidates.txt"
+          if [ -s "$TMP/lane-candidates.txt" ]; then
+            say_err "   THE RETRY VALUE, derived from the job name(s) main's lane EXECUTED — the"
+            say_err "   family is a PREFIX match and CASE-SENSITIVE ('unit' does NOT select"
+            say_err "   'Unit tests'), so pick the line whose name is the TEST shard:"
+            sed 's/^/      /' "$TMP/lane-candidates.txt" >&2
+            say_err "   Re-run the rail unchanged with it exported. This repairs a NAME — it is"
+            say_err "   not a bypass, and it is not what AGENT_ADMIN_MERGE_OVERRIDE=1 is for."
+          fi
+        fi
       else
         say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY, and the"
         say_err "   PR's lane did NOT EXECUTE $(lane_count "$TMP/lane-missing.txt") test shard(s) that main's lane executes."
@@ -8710,6 +8830,18 @@ $attribution_line"
         say_err "   Remedy: run the FULL lane for this head (the shards above are what main"
         say_err "   measures), then re-run the rail. If this lane's test shards are not named"
         say_err "   '${LANE_JOB_PREFIX}*', set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use."
+        # #2842: the OTHER shape of the same defect — main's family matched, this
+        # head's did not. Then the useful names are the PR's, and naming only the knob
+        # leaves the operator to guess the value against a CASE-SENSITIVE match.
+        if [ "$(lane_count "$TMP/lane-pr.txt")" -eq 0 ]; then
+          lane_prefix_candidates "$TMP/lane-pr-alljobs.txt" "$TMP/lane-candidates.txt"
+          if [ -s "$TMP/lane-candidates.txt" ]; then
+            say_err "   This head's lane EXECUTED job name(s) the family '${LANE_JOB_PREFIX}*' does not"
+            say_err "   match (a PREFIX match, and CASE-SENSITIVE: 'unit' does NOT select"
+            say_err "   'Unit tests'). The retry value(s), for the name that is the TEST shard:"
+            sed 's/^/      /' "$TMP/lane-candidates.txt" >&2
+          fi
+        fi
         say_err "   If this repo's PR lane CANNOT run them by design (a trigger-split repo,"
         say_err "   see #1349), the audited route is AGENT_ADMIN_MERGE_OVERRIDE=1, which is"
         say_err "   logged as admin_merge_override."
