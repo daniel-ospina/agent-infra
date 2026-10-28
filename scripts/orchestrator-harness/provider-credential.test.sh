@@ -25,6 +25,7 @@
 #   REFUSAL    nothing provides it => the spawn is refused, with the variable and the files it checked
 #   POLARITY   an unreadable/absent models.json, a literal apiKey, or an already-present value refuses
 #              NOTHING — our own inability to read a datum must never become a refusal loop
+#   AGREEMENT  the provider whose credential the gate checked is the provider the LANE resolves
 # Run: bash provider-credential.test.sh
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -181,19 +182,54 @@ ck "…and WITH the value in the pane it proceeds and keeps it (the delivery LAN
 # with no file either, REFUSE.
 h="$TMP/h-caller-plain"; mkhome "$h"
 out="$(WITH_KEY=shell TMUX_SERVER_EXISTS=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller-plain" 2>&1)"
-printf '%s\n' "$out" | grep -q '^RC=1$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=1$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "the SAME value as a plain (non-exported) shell variable is NOT a credential => refused, not spawned blank" $rc
 h="$TMP/h-caller-srv"; mkhome "$h"
 out="$(WITH_KEY=1 TMUX_SERVER_EXISTS=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller-srv" 2>&1)"
-printf '%s\n' "$out" | grep -q '^RC=1$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=1$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "…and it is NOT a credential against an ALREADY-RUNNING server either (that pane inherits the SERVER's env)" $rc
 # ── 5b. …while a box whose SERVER carries the key is a working shape, not a refusal ───────────
 h="$TMP/h-srvkey"; mkhome "$h"
 out="$(WITH_KEY=0 TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-srvkey" 2>&1)"
-printf '%s\n' "$out" | grep -q '^RC=0$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "a tmux SERVER whose own environment carries the key => no refusal (the pane inherits it)" $rc
 
-# ── 6. MUTATION: remove the apiKey-ref detection and arm 4 MUST redden ──────────────────────────
+# ── 6. THE GATE AND THE LANE RESOLVE THE SAME PROVIDER (P3b) ────────────────────────────────
+# The gate decides WHICH credential this spawn must be able to deliver; `lane-exec.sh`, `merge-one.sh`
+# and `spawn-gate.sh::run_agent` resolve the provider INSIDE the pane. The pane is authoritative (it is
+# what spends the credential, and `keys.env` is the box's channel for PI_LANE_*), so the gate must read
+# the PANE's answer — and the launch line must PIN it, or an inherited value shadows the one checked.
+# (a) the gate follows the pane's channel: a keys.env naming `zai` must be the provider checked.
+h="$TMP/h-prov"; mkhome "$h" '{"providers":{"deepseek":{"apiKey":"$DEEPSEEK_API_KEY"},"zai":{"apiKey":"$ZAI_API_KEY"}}}'
+printf 'PI_LANE_PROVIDER=zai\nexport ZAI_API_KEY=sk_zai_from_keys\n' > "$h/keys.env"
+got="$(bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
+[ "$got" = "zai" ] && rc=0 || { rc=1; echo "      wt_lane_provider -> '$got' (the caller's ambient default was used instead)"; }
+ck "wt_lane_provider resolves the provider the PANE runs (keys.env), not the caller's ambient default" $rc
+out="$(WITH_KEY=0 PI_LANE_PROVIDER=deepseek bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-prov" 2>&1)"
+grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
+ck "…so the gate requires ZAI_API_KEY (which keys.env provides), not the caller's DEEPSEEK_API_KEY" $rc
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+# An EMPTY prefix means the spawn was refused, so there is nothing to execute — say that, rather than
+# handing bash an empty command and reporting its syntax error as if it were the gate's verdict.
+if [ -z "$pfx" ]; then rc=1; echo "      no launch prefix was emitted (the spawn was refused) — nothing to execute"
+else
+  envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-prov" "$BASH" -c "$pfx; printf 'P=[%s] Z=[%s]' \"\${PI_LANE_PROVIDER:-}\" \"\${ZAI_API_KEY:-}\"" 2>&1)"
+  case "$envout" in *"P=[zai] Z=[sk_zai_from_keys]") rc=0 ;; *) rc=1; echo "      $envout" ;; esac
+fi
+ck "…and the executed launch line leaves the lane on that SAME provider with that key (gate and lane agree)" $rc
+# (b) the delivery of the decision: an inherited value must not shadow what the gate resolved.
+h="$TMP/h-pin"; mkhome "$h"
+printf 'export DEEPSEEK_API_KEY=sk_from_pi_keys\n' > "$h/pi-keys.env"
+out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-pin" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+if [ -z "$pfx" ]; then rc=1; echo "      no launch prefix was emitted — nothing to execute"
+else
+  envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-pin" PI_LANE_PROVIDER=zai "$BASH" -c "$pfx; printf 'P=[%s]' \"\${PI_LANE_PROVIDER:-}\"" 2>&1)"
+  case "$envout" in *"P=[deepseek]") rc=0 ;; *) rc=1; echo "      $envout (an ambient PI_LANE_PROVIDER=zai shadowed the provider the gate checked)" ;; esac
+fi
+ck "…and a value inherited from the SERVER cannot shadow it: the launch line PINS what the gate resolved" $rc
+
+# ── 7. MUTATION: remove the apiKey-ref detection and arm 4 MUST redden ──────────────────────────
 # The mutation is the defect in its original form: the gate holds the datum (models.json names the
 # variable) and does not read it. If the mutant passes arm 4's OWN predicate, arm 4 is not measuring
 # the gate and the whole suite is theatre.
