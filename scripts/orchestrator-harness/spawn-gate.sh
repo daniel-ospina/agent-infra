@@ -1035,11 +1035,14 @@ cap_wip_snapshot() {
 #
 # ⛔ WHY HERE, AT THE END OF `run_agent`, AND NOT IN EACH LAUNCHER. `lane.sh`, `fix-one.sh` and
 # `nonblocking-dispatch.sh` are three entry points with three exit paths and three report formats;
-# `merge-one.sh` has a fourth `run_agent` of its own. At the END of `run_agent` "the agent has stopped"
-# is KNOWN (the hard kill, if any, has already landed), so every caller in the tree gets the guarantee
-# by construction — the same argument #1932 used to put the venv teardown beside the spawn. A
-# launcher that adds its own copy would be the `fourth launch path` this file's census exists to
-# refuse.
+# `merge-one.sh` has a fourth `run_agent` of its own. At the END of this `run_agent` "the agent has
+# stopped" is KNOWN (the hard kill, if any, has already landed), so every CALLER OF THIS FUNCTION
+# gets the guarantee by construction — the same argument #1932 used to put the venv teardown beside
+# the spawn. A launcher that adds its own copy would be the `fourth launch path` this file's census
+# exists to refuse. ⛔ It does NOT reach `merge-one.sh`'s copy, whose agent is a reviewer that lands a
+# comment and a signed record rather than worktree work: that residual is named in
+# `docs/ops/lane-signal-forensics.md` and is unchanged here — the guarantee is per-function, not a
+# claim about every `run_agent`-shaped loop in the tree.
 #
 # ⛔ THE ROOT IS `WIP_PATH`, THEN `$PWD` — NEVER A GUESS. `fix-one.sh` `cd`s into the MAIN checkout and
 # only NAMES the fixer's worktree in the agent's prompt, so `$PWD` there is NOT the tree the work is in;
@@ -1049,7 +1052,11 @@ cap_wip_snapshot() {
 #
 # ⛔ THREE VERDICTS, AND `cannot-verify` IS NOT `clean`. A `git status` that cannot run (corrupt
 # index, ENOSPC, EACCES, safe.directory) is CANNOT-VERIFY — the repo's own ruling for this call, and
-# the reason the pre-check is fail-closed rather than a `[ -z "$(git status)" ]` one-liner.
+# the reason the pre-check is fail-closed rather than a `[ -z "$(git status)" ]` one-liner. ⛔ IT ALSO
+# COVERS A STATUS THAT *SUCCEEDS* WHILE WARNING: `--porcelain` exits 0 with EMPTY stdout when it
+# cannot read a directory, so "rc=0 and no output" is not the same measurement as "nothing changed".
+# The warnings on stderr are the only signal that the listing was incomplete, which is why they are
+# captured below instead of discarded — see the `st_noise` note in the pre-check.
 #
 # ⛔ UNPUSHED COMMITS ARE MEASURED, AND DELIBERATELY NOT PUSHED. #2834 asks for "a dirty tree OR
 # unpushed commits"; the rescue archives UNCOMMITTED work and says so in its own declared LIMITS
@@ -1077,7 +1084,13 @@ LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 
 # wip_rescue_path — resolve scripts/bg-rescue-wip.sh the way the other helpers are resolved. `$O` is
 # seeded FILE BY FILE, so a new spawn-gate.sh can run beside an `$O` that predates the rescue; the
-# harness dir is the second home, and the two farmed copies are last so an operator's install wins.
+# harness dir's parent (the repo's `scripts/`) is the second home, and the two farmed copies are last
+# so an operator's install wins. ⛔ THE FARMED HOME IS NOT OPTIONAL ON A FLAT `$O` (review F3, round 3):
+# the `$O` payload is `scripts/orchestrator-harness/*` only (§4's `cp …/orchestrator-harness/*.sh`,
+# `deploy-harness.sh --src`), and this file lives one directory ABOVE that — so on a box whose
+# launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile) all four homes missed
+# and every at-risk lane recorded `UNAVAILABLE`: loud, but the archive never happened. `setup.sh`'s
+# farm now delivers `bg-rescue-wip.sh` to `~/.pi/agent/scripts/`, the fourth home below.
 wip_rescue_path() {
   local c here
   if [ -n "$LANE_WIP_RESCUE_SH" ]; then printf '%s\n' "$LANE_WIP_RESCUE_SH"; return 0; fi
@@ -1123,6 +1136,8 @@ lane_end_record() {
 terminal_wip_rescue() {
   local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
   local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 at_risk=0 l local_ref=""
+  local local_ref_before="" local_ref_after=""
+  local st_errf="" st_noise=0
   root="${WIP_PATH:-$PWD}"
   LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0
   if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
@@ -1138,7 +1153,33 @@ terminal_wip_rescue() {
     return 0
   fi
   # ── one read, and it must be able to FAIL ────────────────────────────────────────────────────
-  st_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$root" status --porcelain -uall 2>/dev/null)"; st_rc=$?
+  # ⛔ STDERR IS THE ONLY SIGNAL THAT THE LISTING WAS INCOMPLETE (review P1, round 2, PR #2975).
+  # `git status --porcelain -uall` EXITS 0 WITH EMPTY STDOUT when it cannot read a directory, and
+  # says why on stderr. Reproduced against this file's own pre-check: a MODIFIED TRACKED file inside a
+  # `chmod 000` directory yields `rc=0 out=[]` plus `warning: could not open directory 'sub/':
+  # Permission denied`. With stderr discarded that is the CLEAN verdict — the one answer this leg must
+  # never give: the rescue is never called, and `state/lane-end.tsv` records `tree=clean rescue=nothing`
+  # over work that was never enumerated, i.e. an affirmative safety claim where an absence would at
+  # least be honest. The rule is not new here: `cap_wip_snapshot` (#2045) implements it 300 lines above
+  # (`st_noise`, and `st_rc -eq 0 && st_noise -eq 0 || st_ok=0`), and `bg-rescue-wip.sh` §2 carries it
+  # as `INCOMPLETE_RE`. The pre-check is the gate that decides whether that callee runs AT ALL, so it
+  # cannot be the weakest of the three: any stderr content means CANNOT-VERIFY, and the callee — which
+  # owns the finer `INCOMPLETE_RE` judgement of what to archive — gets to run and decide.
+  st_errf="$(mktemp "${TMPDIR:-/tmp}/lane-end-se.XXXXXX" 2>/dev/null)"
+  if [ -n "$st_errf" ]; then
+    st_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$root" status --porcelain -uall 2>"$st_errf")"; st_rc=$?
+    # ⛔ `grep -c` EXITS 1 WHEN IT SELECTS NOTHING — which is the HEALTHY case, since a complete
+    # enumeration warns about nothing. Only "could not run" (>=2) or an unparseable count is a
+    # failure; reading exit 1 as one made COMPLETE unreachable in `cap_wip_snapshot` (VGATE cycle 11)
+    # and would make every clean lane here report cannot-verify.
+    st_noise="$(grep -c . "$st_errf" 2>/dev/null)"; local _g=$?
+    if [ "$_g" -gt 1 ] || [ -z "$st_noise" ]; then st_rc=1; st_noise=0; fi
+    rm -f "$st_errf"
+  else
+    # No temp file means no place for the warnings to land, so their absence cannot be read as "none"
+    # — the same fail-closed reasoning as an unreadable ledger, never a silent clean.
+    st_out=""; st_rc=1
+  fi
   head_ok=0
   git -C "$root" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ok=1
   if [ "$head_ok" = 1 ]; then
@@ -1149,11 +1190,19 @@ terminal_wip_rescue() {
   if [ "$st_rc" -ne 0 ]; then
     LANE_END_TREE="cannot-verify"; at_risk=1
   elif [ -n "$st_out" ]; then
+    # A listing that DID name dirty paths is the stronger fact, whether or not it also warned: the
+    # rescue runs either way, and `dirty` is what was actually measured. `cannot-verify` is reserved
+    # for the case where the listing is EMPTY and we cannot prove it is complete.
     LANE_END_TREE="dirty"; at_risk=1
+  elif [ "${st_noise:-0}" -gt 0 ]; then
+    LANE_END_TREE="cannot-verify"; at_risk=1
   elif [ "$unpushed" -gt 0 ] 2>/dev/null; then
     LANE_END_TREE="unpushed-only"
   else
     LANE_END_TREE="clean"
+  fi
+  if [ "$LANE_END_TREE" = "cannot-verify" ]; then
+    echo "[wip] ⛔ label=$label: the worktree listing at $root is INCOMPLETE (git status rc=$st_rc, ${st_noise:-0} stderr line(s)) — an EMPTY listing does NOT mean clean, so this is NOT a clean verdict. The rescue is attempted on what could be read rather than skipped, because 'no output' and 'nothing changed' are different measurements (a chmod'ed directory, an extract owned by another user, a corrupt index)" >> "$log"
   fi
   br="$(git -C "$root" branch --show-current 2>/dev/null)"
   [ -n "$br" ] || br="detached-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unborn)"
@@ -1176,6 +1225,17 @@ terminal_wip_rescue() {
       # Output is CAPTURED and replayed rather than streamed, so a partial write cannot interleave on
       # the lane's own log, and so the verdict below follows the SHIPPED script's exit status rather
       # than a grep of prose it might change.
+      # ⛔ THE REF MUST BE *THIS RUN'S*, AND `refs/wip-local/<slug>` IS NOT PER-RUN (review F1, round 3).
+      # It lands in the repo's COMMON git dir (a ref written from one linked worktree is visible from
+      # every other), it is keyed by branch slug alone, and bg-rescue-wip.sh never removes it. So an
+      # EARLIER rescue of the same slug — an earlier `run_agent` for this lane, or a PEER lane on a
+      # reused branch (the case named in the header) — survives a run that archives NOTHING:
+      # `bg-rescue-wip.sh:62` exits 2 at `mktemp` and `:156-161` exits 0 on "nothing at risk", both
+      # BEFORE `:247`'s update-ref. Treating mere EXISTENCE as proof made the record say "this
+      # worktree's work IS archived and pinned" over work that is still single-copy — the full-disk
+      # path, which is exactly where the rescue matters most. So read it BEFORE, read it AFTER, and
+      # only a CHANGED sha counts as an archive this run produced.
+      local_ref_before="$(git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" 2>/dev/null)"
       outf="$(mktemp "${TMPDIR:-/tmp}/wip-exit.XXXXXX" 2>/dev/null)"
       if [ -n "$outf" ]; then
         bash "$out" "$root" "$note" > "$outf" 2>&1; rc2=$?
@@ -1197,15 +1257,24 @@ terminal_wip_rescue() {
       #   * `:384-396` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
       #     callee prints the sha, so the ONE pointer to the archived commit was neither shown nor
       #     recorded, while the line claimed the work was only at $root.
-      # So: ref present + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box push
-      # UNCONFIRMED) — which is neither `FAILED` (nothing archived) nor `refs/wip/<slug>` (a push this
-      # code cannot see without a network call it deliberately does not make). `FAILED` is now reserved
-      # for its only honest meaning: the callee failed AND no ref pins anything.
-      if git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" >/dev/null 2>&1; then
+      # So: a ref THIS RUN wrote + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box
+      # push UNCONFIRMED) — which is neither `FAILED` (nothing archived) nor `refs/wip/<slug>` (a push
+      # this code cannot see without a network call it deliberately does not make). `FAILED` keeps its
+      # only honest meaning: the callee failed AND no new ref pins anything.
+      # ⛔ AN UNCHANGED sha is a STALE snapshot of an earlier rescue, not this lane's work: it is named
+      # in FAILED's line and never promoted to a ref column. (The one case where a real archive could
+      # reuse a sha — same tree, same note, same SECOND — under-claims as "nothing", which is the safe
+      # direction: the ref still exists, and the replayed callee lines above show what happened.)
+      local_ref_after="$(git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" 2>/dev/null)"
+      if [ -n "$local_ref_after" ] && [ "$local_ref_after" != "$local_ref_before" ]; then
         local_ref="refs/wip-local/$slug@$(git -C "$root" rev-parse --short "refs/wip-local/$slug" 2>/dev/null)"
       fi
-      if [ "$rc2" -eq 0 ]; then
+      if [ "$rc2" -eq 0 ] && [ -n "$local_ref" ]; then
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="refs/wip/$slug"
+      elif [ "$rc2" -eq 0 ]; then
+        # Exit 0 with no NEW ref is the callee's own "nothing at risk" arm: it archived nothing, so
+        # claiming a pushed ref here would be a push this code never saw.
+        LANE_END_RESCUE="nothing"
       elif [ -n "$local_ref" ]; then
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="archived-local"
       else
@@ -1213,7 +1282,15 @@ terminal_wip_rescue() {
       fi
       echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
       if [ "$LANE_END_RESCUE" = "FAILED" ]; then
-        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref this run wrote pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+        if [ -n "$local_ref_before" ]; then
+          echo "[wip] ⛔ label=$label: NOTE — refs/wip-local/$slug@$local_ref_before still exists, but it was written by an EARLIER rescue of this branch and this run did NOT update it. That snapshot may PREDATE the work now in the tree; do not read it as covering this lane" >> "$log"
+        fi
+      elif [ "$LANE_END_RESCUE" = "nothing" ] && [ "$LANE_END_TREE" = "cannot-verify" ]; then
+        # ⛔ rc2=0 with an INCOMPLETE listing is NOT "the tree was clean": the callee found nothing at
+        # risk in the paths IT could read, while this run could not certify that it saw all of them.
+        # Said out loud because `rescue=nothing` reads as a safety claim everywhere else in this file.
+        echo "[wip] ⛔ label=$label: the rescue ran and found nothing at risk in the paths it could read, BUT this worktree's listing was INCOMPLETE (see the line above) — read 'rescue=nothing' here as 'the rescue did not certify this tree', NOT as 'the tree was clean'. Do not reap this worktree on the strength of this row" >> "$log"
       elif [ "$LANE_END_RESCUE" = "archived-local" ]; then
         echo "[wip] ⛔ label=$label: the rescue did NOT finish cleanly (bg-rescue-wip.sh exit $rc2) BUT this worktree's work IS archived and pinned at $LANE_END_REF. bg-rescue-wip.sh exits 2 both for a PARTIAL archive (the ref WAS pushed to origin; the skipped paths are what stays local) and for a push that failed (the local ref is still valid), so read the replayed lines above for which one this was — this line does not guess. Do NOT reap this worktree before retrieving it" >> "$log"
       fi
