@@ -134,6 +134,17 @@ ck "A5 …and the append-only ledger state/lane-end.tsv holds the row (epoch, la
 # delivers the guarantee.
 MUT="$TMP/mut"; mkdir -p "$MUT"
 grep -v '^  terminal_wip_rescue "\$label"' "$GATE" > "$MUT/spawn-gate.sh"
+# ⛔ THE MUTANT MUST BE ABLE TO START (review F2, round 3). `run_agent` refuses BEFORE the spawn when
+# `brief-gate.sh` is unresolvable (`spawn-gate.sh:1455-1468`), and `$MUT` has none of its homes — so on
+# a runner with no `$AGENT_INFRA_PATH` and no `~/.pi/agent/scripts/brief-gate.sh` this arm went green
+# because the LANE NEVER RAN, not because the call was removed: a control whose verdict is a function
+# of the box is not a control. Ship the gate beside the mutant (its `$here` home) and ASSERT below
+# that the mutant lane started.
+cp "$HERE/brief-gate.sh" "$MUT/"
+# …AND `repo-slug.sh`, which is resolved from the helper's OWN directory (`spawn-gate.sh:432`): without
+# it the creation back-pressure gate cannot read the repo and refuses with 74 (`AGENT_LAND_BACKLOG`)
+# before the spawn — the same vacuity through another door, which this arm's own assertion caught.
+cp "$HERE/repo-slug.sh" "$MUT/"
 grep -q '^terminal_wip_rescue()' "$MUT/spawn-gate.sh" && ! grep -q '^  terminal_wip_rescue "\$label"' "$MUT/spawn-gate.sh"; rc=$?
 ck "B1 the mutation removed the CALL and kept the function (so the arm below tests the wiring, not a delete)" $rc
 # A SECOND worktree with the same shape, so the two arms cannot see each other's refs.
@@ -149,8 +160,12 @@ res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi2.log" bash -c '
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "mutant" >/dev/null 2>&1
-  printf "rc=%s" "$?"
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
 ' _ "$MUT/spawn-gate.sh" "$WT" "$O" "$O/logs/mut.log" "$PROMPT")"
+ck "B1b the MUTANT lane itself ran (so B2/B3 test the removed call, not a refusal that never dispatched) ($res)" \
+  $([ "$res" = "rc=0 started=1" ] && echo 0 || echo 1)
+grep -q 'PI_RAN' "$O/pi2.log" 2>/dev/null; rcpi=$?
+ck "B1c …and its stub agent really executed against the fixture worktree" $rcpi
 git -C "$BARE" rev-parse -q --verify "refs/wip/mutation-probe" >/dev/null 2>&1; rc=$?
 ck "B2 with the exit-path call REMOVED the same lane leaves NO ref for its branch (so arm A is not vacuous)" $([ "$rc" -ne 0 ] && echo 0 || echo 1)
 grep -q '\[wip\] end' "$O/logs/mut.log"; rcn=$?
@@ -336,6 +351,35 @@ awk -F'\t' '$2=="cap disabled" && $5=="not-measured" && $6=="DISABLED" {f=1} END
 ck "G8 …and the disabled path still appends its own ledger row (tree=not-measured rescue=DISABLED)" $rcdisrow
 git -C "$WT" config --unset-all url."$TMP/not-a-repo.git".insteadOf
 git -C "$WT" config url."$BARE".insteadOf "$GHURL"
+
+# ── I) A STALE refs/wip-local IS NOT THIS RUN'S ARCHIVE (review F1, round 3) ──────────────────────
+# `refs/wip-local/<slug>` lives in the repo's COMMON git dir and is keyed by branch slug alone, so an
+# EARLIER rescue of this branch leaves one behind. A run that archives NOTHING — an unwritable TMPDIR
+# is the cheap reproduction of `bg-rescue-wip.sh:62`, the full-disk shape — must not be recorded as
+# `archived-local`, because that is a durability verdict about work that is still SINGLE-COPY. This
+# arm is the exact case: the ref exists (arms A/G wrote it), the rescue cannot archive, and the record
+# must say FAILED with no ref, naming the stale one as stale.
+printf 'work that will NOT be archived\n' > "$WT/stale.txt"
+before_sha="$(git -C "$WT" rev-parse -q --verify refs/wip-local/work 2>/dev/null)"
+: > "$O/logs/staleref.log"
+TMPDIR="$TMP/no-such-tmpdir" O="$O" WIP_PATH="$WT" bash -c '
+  . "$1"
+  terminal_wip_rescue "stale ref" 0 0 "$2"
+' _ "$GATE" "$O/logs/staleref.log" 2>/dev/null
+rcstale=$?
+after_sha="$(git -C "$WT" rev-parse -q --verify refs/wip-local/work 2>/dev/null)"
+ck "I1 the fixture really left a STALE ref unchanged by this run (before=$before_sha after=$after_sha)" \
+  $([ -n "$before_sha" ] && [ "$before_sha" = "$after_sha" ] && echo 0 || echo 1)
+grep -q 'rescue=archived-local' "$O/logs/staleref.log"; rcac=$?
+ck "I2 a rescue that archived NOTHING is NOT recorded as archived-local, even though a stale refs/wip-local/<slug> exists" \
+  $([ "$rcac" -ne 0 ] && echo 0 || echo 1)
+grep -q 'rescue=FAILED .*ref=<none>' "$O/logs/staleref.log"; rcfl=$?
+ck "I3 …it is FAILED with NO ref, so the row cannot pin this lane to a snapshot the run did not write" $rcfl
+grep -q 'written by an EARLIER rescue' "$O/logs/staleref.log"; rcnote=$?
+ck "I4 …and the stale ref is NAMED as stale (it may predate the work now in the tree), not silently ignored" $rcnote
+ck "I5 …and the rescue still never changes the lane's exit status (the function returned $rcstale)" \
+  $([ "$rcstale" -eq 0 ] && echo 0 || echo 1)
+rm -f "$WT/stale.txt"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
