@@ -657,6 +657,20 @@ case "$DELIVERY_PRFIX" in *"already has an open PR"*) rc=0;; *) rc=1;; esac
 for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
   "$_p" "$DELIVERY_BG"; ck $? "bg carries the same rule: $_p"
 done
+# ⛔ THE PR SENTENCE IS THE SECTION'S FIRST `- **` BULLET — pin the ORDER, because
+# `nonblocking-dispatch.sh` derives each role's identity from it (a role-invariant heading cannot tell
+# a `lane` brief from a `prfix` one, so the append's key is this line). A bullet reordered above it
+# would silently point that key at the wrong text. Asserted for EVERY role, from the rendered section.
+for _r in lane prfix bg; do
+  _first_bold="$(printf '%s\n' "$(delivery_brief_section "$_r")" | awk '/^- \*\*/{print; exit}')"
+  case "$_r: $_first_bold" in
+    "lane: "*"Open the PR as soon as the first commit is pushed"*) rc=0 ;;
+    "prfix: "*"Your PR is ALREADY OPEN"*)                          rc=0 ;;
+    "bg: "*"already has an open PR, commit and push onto it"*)      rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck $rc "$_r: the FIRST '- **' bullet is that role's PR sentence (the append's key is derived from it)"
+done
 
 # §G.3 THE CONTROLLER TEMPLATE — the authored-brief source. Byte for byte, or it is a second copy.
 echo

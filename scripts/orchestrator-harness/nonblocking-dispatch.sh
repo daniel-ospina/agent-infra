@@ -178,14 +178,36 @@ NB_DELIVERY="$(bash "$NB_DELIVERY_SH" --delivery-brief "$NB_DELIVERY_ROLE")" || 
 NB_DELIVERY_HEADING="$(printf '%s\n' "$NB_DELIVERY" | head -1)"
 [ -n "$NB_DELIVERY_HEADING" ] || {
   echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief rendered NOTHING — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
-if ! grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" 2>/dev/null; then
+# ⛔ THE HEADING ALONE IS NOT THE KEY (this PR's review, cycle 2 — P2). The heading is ROLE-INVARIANT:
+# all three roles render it byte-identically, so a heading-only test calls a brief complete when it
+# carries ANOTHER role's copy and leaves it alone. That collision is REACHABLE, not theoretical —
+# `templates/LANE-BRIEF.md` is pinned to the `lane` render (it orders "Open the PR as soon as the first
+# commit is pushed"), a controller authors its brief by copying that template, and `pr-doctor.py` then
+# dispatches it as `prfix`: the heading matches, nothing is appended, and the worker is ordered to open
+# a PR it ALREADY HAS — exactly the false-order class #2148/#2325 exist to remove, reached through the
+# append path instead of the render path. So the key is the role's OWN PR sentence.
+# ⛔ The sentence is taken from the render, never restated here (the ONE home rule): it is the first
+# `- **` bullet of the section, and `reviewer-preflight.test.sh` §G.2b pins that order so a reordered
+# bullet cannot silently make this read the wrong line. Here-string, not a pipe: no SIGPIPE (#841).
+NB_DELIVERY_PR_LINE="$(awk '/^- \*\*/{print; exit}' <<<"$NB_DELIVERY")"
+[ -n "$NB_DELIVERY_PR_LINE" ] || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief $NB_DELIVERY_ROLE rendered no PR sentence — refusing to start a worker whose PR duty cannot be verified (#2981)" >&2; exit 78; }
+# A brief is already complete only when it carries the heading AND this role's own sentence. A brief
+# that carries the heading but a FOREIGN role's sentence is appended to rather than refused, which is
+# this path's stated policy (an otherwise complete authored brief must not become a dead dispatch); the
+# appended copy is the authoritative one and it lands AFTER the stale sentence, so the worker's last
+# word on its PR duty is the true one. The already-correct case stays byte-for-byte untouched.
+if ! grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" 2>/dev/null \
+   || ! grep -qF -- "$NB_DELIVERY_PR_LINE" "$PROMPT" 2>/dev/null; then
   printf '\n%s\n' "$NB_DELIVERY" >> "$PROMPT" || {
     echo "nonblocking-dispatch.sh: could not append the COMMIT-AS-YOU-GO section to $PROMPT — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
 fi
 # ⛔ AND THEN VERIFY IT LANDED. An append that reported success and wrote nothing is the exact shape
-# this section exists to refuse, so the post-condition is asserted rather than assumed.
-grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" || {
-  echo "nonblocking-dispatch.sh: the brief at $PROMPT STILL lacks its COMMIT-AS-YOU-GO section after the append — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
+# this section exists to refuse, so the post-condition is asserted rather than assumed — and it is
+# asserted on BOTH halves, because the heading check alone is the vacuous one this block just fixed.
+grep -qF -- "$NB_DELIVERY_HEADING" "$PROMPT" \
+  && grep -qF -- "$NB_DELIVERY_PR_LINE" "$PROMPT" || {
+  echo "nonblocking-dispatch.sh: the brief at $PROMPT STILL lacks its COMMIT-AS-YOU-GO section (heading or the $NB_DELIVERY_ROLE PR sentence) after the append — refusing to start a worker that would hold its work to the cap (#2981)" >&2; exit 78; }
 # ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
 # checkout, not a review bypass, and #2319 does not rule on it.
 export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1

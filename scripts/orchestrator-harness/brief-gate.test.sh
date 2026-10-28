@@ -281,6 +281,22 @@ for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery3.rc" ] && break; sleep 
 grep -qF 'Your PR is ALREADY OPEN' "$AUTH_PRFIX"; ck $? "…and IT gets the prfix role (the role follows \$WK, both directions)"
 case "$(cat "$AUTH_PRFIX")" in *"already has an open PR, commit and push onto it"*) rc=0;; *) rc=1;; esac
 [ "$rc" -ne 0 ]; ck $? "…never the bg sentence (so the two arms cannot both pass on one hardcoded role)"
+# ⛔ THE COLLISION THE ROLE-INVARIANT HEADING COULD NOT SEE (this PR's review, cycle 2 — P2). The
+# heading is IDENTICAL in all three roles, so a heading-only idempotency test declares a brief complete
+# when it carries ANOTHER role's copy. This is the reachable instance, not a hypothetical: the controller
+# template is pinned to the `lane` render, a controller authors its brief by copying it, and
+# `pr-doctor.py` dispatches that same file as `prfix` — so before the fix the heading matched, nothing
+# was appended, and the worker was ordered to open a PR it ALREADY HAS (#2148/#2325's exact class).
+# Build the fixture FROM the real template so the arm cannot drift away from the artifact it describes.
+AUTH_TMPL="$TMP/authored-from-template.txt"; cp "$ROOT/templates/LANE-BRIEF.md" "$AUTH_TMPL"
+grep -qF 'Open the PR as soon as the first commit is pushed' "$AUTH_TMPL"; ck $? "template fixture: the controller template carries the LANE PR sentence (that is what makes the collision reachable)"
+case "$(cat "$AUTH_TMPL")" in *"Your PR is ALREADY OPEN"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "template fixture: …and NOT the prfix one"
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery4 "$TMP/wt" "$AUTH_TMPL" 20 prfix >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a prfix dispatch over a template-derived (lane) brief still LAUNCHES (rc=$rc)"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery4.rc" ] && break; sleep 0.1; done
+grep -qF 'Your PR is ALREADY OPEN' "$AUTH_TMPL"; ck $? "⛔ …and the brief the worker received NOW carries the prfix sentence (a role-invariant heading would have skipped the append)"
 
 # ── orch-send.sh + safe-send.sh: the pane-order paths. Stub `cmux` records every call, so "refused"
 # is again proven by absence.

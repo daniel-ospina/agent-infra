@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # reviewer-preflight.sh — the reviewer requirement, disclosed BEFORE the lane works (#2148).
 #
-# SOURCEABLE, no side effects. Three outputs, and they are the whole surface:
+# SOURCEABLE, no side effects. Four outputs, and they are the whole surface:
 #
 #   reviewer_preflight_line [self|harness|reviewer]  → ONE line: what must happen, and the commands
 #   reviewer_brief_section [self|harness]            → the brief section that carries the step
