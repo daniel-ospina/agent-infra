@@ -1,0 +1,14 @@
+# `${{  github.workflow  }}` (irregular spacing) is the SAME expression as `${{ github.workflow }}`.
+# Substituting only two literal spellings left it un-expanded, so this file and pr-workflow-ws-b were
+# compared as templates and refused as "they would cancel each other" (#2660 round 5).
+name: alpha workflow
+on:
+  pull_request:
+concurrency:
+  group: ${{  github.workflow  }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
