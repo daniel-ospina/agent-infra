@@ -74,6 +74,15 @@ truncated parse cannot read as agreement, and a **mutation arm** that removes `A
 copy of the tuple and requires the comparison to REDDEN. Add a name in both files, or the suite
 fails.
 
+⛔ **AND ADD A RESOLVER FOR IT IN `placeholder_values()`.** Those three compared lists are not the
+whole contract: the tuple also has to be *resolvable*, and that fourth copy is hand-written. A name
+declared in all three compared artifacts with no entry in the resolver used to resolve to `""` and
+be filed as "unresolved placeholder(s) … absent on this machine" — a designed per-machine **SKIP** —
+while macOS rendered the same template from its environment. The job could then never run on any
+cell, with `--check` printing `DECLARATIONS OK — … 0 errors`, and exporting the variable changed
+nothing. It is now a **DECLARATION ERROR** that names the missing resolver, graded only where a
+template actually uses the name (pinned by `scripts/fleet-schedule.test.sh` case 1g).
+
 **Two declaration shapes the tick loop cannot run, both NAMED skips:**
 
 - an **unset identity placeholder** (`{{AI_DRAINER_O}}`, `{{AI_MULTI_REPO_SLUG}}`, …) — env-only with
@@ -210,7 +219,7 @@ target inside the layer) is exit **1** there too.
 ## Commands
 
 ```bash
-python3 scripts/fleet-schedule.py --check     # DECLARATIONS only: exit 1 if this runtime cannot run the shipped set
+python3 scripts/fleet-schedule.py --check     # DECLARATIONS only: exit 1 if this runtime cannot run the shipped set, 3 if there is no declaration set to grade (a box that was never installed)
 python3 scripts/fleet-schedule.py --install   # converge, run the due jobs NOW, start the loop, verify
 python3 scripts/fleet-schedule.py --status    # the table above
 python3 scripts/fleet-schedule.py --verify    # exit 1 on any arm above
@@ -225,6 +234,14 @@ EXISTENCE: whether `<home>/.pi/agent/scripts` is farmed is a fact about the host
 `--install`/`--verify`, and grading it in CI (where no farm exists) would refuse a good template
 set. It prints the same `ERROR`/`SKIP`/`ok` table and ends with `DECLARATIONS OK — …` or
 `DECLARATIONS BROKEN — …`; a set that is entirely skips is refused as `DECLARATIONS INERT`.
+
+Its exit codes are a **cross-platform contract**, because this verb is the pre-merge gate on both:
+**3** for the "no declarations at all" state (no `TEMPLATES_DIR`/`INFRA_ROOT` resolves, or the path
+it names does not exist — the benign never-installed box a caller must not read as fatal), and **1**
+for a set that IS here and cannot be run (a broken declaration, a dir holding no `*.plist`, or every
+job skipped). The darwin and linux arms classified the missing-path state differently (3 vs 1 — and
+1 is the code `cloud-cell-supervisor.sh` treats as fatal), so the predicate is one function now and
+case 1h in the suite pins both platforms to the same answer.
 
 ⛔ **Why it exists: the previous guard was blind, so a broken set reached main green.** The old
 assertion in `scripts/fleet-schedule.test.sh` grepped `--status` output for the runtime's own
@@ -248,6 +265,9 @@ that one installer — there is no second one. What was missing was the schedule
   a working tree);
 - `--verify` counts it as a **failure**, because a cell certifying a layer while running a copy that
   is not the checkout's is precisely the state in which "I fixed it and it did not take" is true.
+- `--verify` also prints a **`NOTE`** when there is no checkout to compare against at all (no
+  `INFRA_ROOT`/`AGENT_INFRA_PATH` resolved), so a `SCHEDULE VERIFIED` can never be silent about an
+  arm that did not run — "could not compare" is a different answer from "compared and clean".
 
 Measured cause: a checkout fix for the placeholder drift did nothing on a running cell until the
 farm was refreshed. Refresh with

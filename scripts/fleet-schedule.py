@@ -125,6 +125,13 @@ JOB_TIMEOUT = 0
 # That is why a third copy of the set — the `{{NAME}}` tokens actually present in
 # templates/launchd/*.plist — is checked too.
 #
+# ⛔ AND THE FOURTH COPY IS `placeholder_values()`, WHICH MUST RESOLVE EVERY NAME HERE. A name
+# declared in this tuple with no resolver is the SAME backend divergence by a fourth route: macOS
+# renders it from its env, while this runtime resolved it to "" and reported the job as a legitimate
+# per-machine SKIP — a silent non-run dressed as a designed absence, with `--check` still printing
+# "0 errors". That is graded in `load_jobs`, where a used-but-unresolvable name is a DECLARATION
+# error rather than a skip, and pinned by `fleet-schedule.test.sh` case 1g.
+#
 # A template that carries any OTHER {{NAME}} is an error here, not an empty string: the launchd
 # renderer would substitute empty for a name it does not know too, so the two backends agree
 # only because the list is a contract, and this one refuses rather than guesses.
@@ -439,6 +446,18 @@ def load_jobs(check_targets: bool = True) -> list:
                     retired.add(line)
 
     values = placeholder_values()
+    # ⛔ THE FOURTH COPY IS placeholder_values(), AND NOTHING COMPARED IT. PLACEHOLDERS is checked
+    # against the installer's array and against the {{NAME}} tokens in the shipped templates — so
+    # a name added to all THREE with no resolver below passed every gate while being unrunnable on
+    # every cell: render() resolved it to "" and this loop filed it as "absent on this machine",
+    # i.e. a designed per-machine SKIP, with `--check` still printing "0 errors". macOS renders the
+    # same template from its own env by name, so that is the #2804 asymmetry by a fourth route —
+    # silent this time instead of a whole-cell refusal. Measured: PROBE_NEW added to PLACEHOLDERS,
+    # to PLIST_PLACEHOLDERS and to a template left `--check` at rc 0 with
+    # "DECLARATIONS OK — … 0 errors", and exporting PROBE_NEW changed nothing (the resolver never
+    # reads it). Graded only where a template USES the name: a declared-but-unused name costs
+    # nothing, and refusing over one would block a cell on a tuple entry no template mentions.
+    unresolvable = {n for n in PLACEHOLDERS if n not in values}
     jobs = []
     for name in sorted(os.listdir(TEMPLATES_DIR)):
         if not name.endswith(".plist"):
@@ -553,6 +572,17 @@ def load_jobs(check_targets: bool = True) -> list:
                 "placeholder(s) this runtime does not know: %s — teach fleet-schedule.py the "
                 "value, or the job would run with an EMPTY argument"
                 % ", ".join("{{%s}}" % u for u in sorted(unknown))
+            )
+        # ⛔ BEFORE THE SKIP ARM, because the two states look identical from used_empty alone and
+        # one of them is a lie: "absent on this machine" is FALSE for a name this runtime declares
+        # with no resolver — it is absent on EVERY machine, for ever, and macOS would render it.
+        no_resolver = used_empty & unresolvable
+        if no_resolver and not job.error:
+            job.error = (
+                "placeholder(s) declared in PLACEHOLDERS with NO resolver in "
+                "placeholder_values(): %s — this template would be SKIPPED on every cell while "
+                "the macOS backend renders it, so it is a DECLARATION error, not this machine's "
+                "absence" % ", ".join("{{%s}}" % n for n in sorted(no_resolver))
             )
         if used_empty and not job.error:
             job.skip = (
@@ -1167,6 +1197,22 @@ def fmt_until(seconds):
     return "in %dd" % int(seconds / 86400)
 
 
+def declarations_unresolvable() -> bool:
+    """True for the "no declarations at all" state of the CONTRACT — a STATE, not a broken set.
+
+    ⛔ WHY THIS IS A FUNCTION AND NOT TWO EXPRESSIONS. `--check` is documented as exit 3 for "no
+    declarations at all" and 1 for a set this runtime cannot run. Both platform arms classified
+    that state differently: the darwin arm tested `isdir` and answered 3, while the linux arm fell
+    into a blanket `except ScheduleError -> 1`. So `TEMPLATES_DIR=/nonexistent --check` exited 1 on
+    the platform that runs the cells and 3 on the platform that authors the templates — one tree,
+    two verdicts, and 1 is the code `cloud-cell-supervisor.sh` treats as FATAL rather than as "this
+    cell was never installed". `--start` already answers 3 for exactly this state
+    (`cmd_start`'s `except ScheduleError`), and `docs/ops/fleet-schedule.md` documents 3 for it, so
+    the linux `--check` arm was the one contradicting the file's own contract.
+    """
+    return not TEMPLATES_DIR or not os.path.isdir(TEMPLATES_DIR)
+
+
 def print_table(jobs, now):
     for job in jobs:
         if job.error:
@@ -1186,8 +1232,14 @@ def print_table(jobs, now):
         )
 
 
-def staged_copy_drift() -> str:
-    """Empty unless THIS file is a copy OUTSIDE the checkout that differs from the checkout's.
+def staged_copy_report() -> tuple:
+    """(kind, detail) — is the file THIS process runs the checkout's own copy?
+
+    `kind` is one of:
+      "checkout"    — this IS a checkout's copy (or another worktree of one): nothing is staged
+      "same"        — a staged copy, byte-identical to the checkout's
+      "differs"     — a staged copy that is NOT the checkout's: a landing has not reached here
+      "no-checkout" — a staged copy, but no checkout could be resolved to compare it with
 
     ⛔ THE DEFECT THIS CLOSES. A cell does not run this file from the checkout: the supervisor
     stages a copy at `$CELL_HOME/.pi/agent/scripts/fleet-schedule.py` (cloud-cell-supervisor.sh:2383,
@@ -1201,28 +1253,43 @@ def staged_copy_drift() -> str:
     Reported as a DRIFT line by `--check` (never fatal: a Mac's farmed copy legitimately lags a
     working tree) and as a named FAILURE by `--verify` on a cell, where a staged copy that differs
     from the checkout is precisely the state that makes a landing invisible.
+
+    ⛔ "I COULD NOT COMPARE" IS ITS OWN ANSWER, never a silent clean one. This used to return ""
+    for both "no drift" and "no checkout to compare against", so `--verify` printed
+    `SCHEDULE VERIFIED` with its staged-copy arm never having run — the no-op-gate shape, over the
+    one check that exists to stop a cell certifying a build it is not running. The read-error arm
+    already failed; the no-checkout arm was silence. `kind` makes the two answerable apart, and
+    the polarity is the caller's: `--check` reports only `differs`, `--verify` fails on `differs`
+    and NAMES `no-checkout` beside its verdict.
     """
     me = os.path.abspath(__file__)
     if not INFRA_ROOT:
-        return ""
+        return "no-checkout", "no checkout could be resolved (INFRA_ROOT / AGENT_INFRA_PATH unset)"
     root = os.path.abspath(INFRA_ROOT)
     checkout_copy = os.path.join(root, "scripts", "fleet-schedule.py")
     if me == checkout_copy or me.startswith(root + os.sep):
-        return ""  # this IS a checkout's copy (or another worktree of one): nothing is staged
+        return "checkout", me  # this IS a checkout's copy (or another worktree of one)
     if not os.path.isfile(checkout_copy):
-        return ""  # a checkout that predates this file ships no scheduler to compare against
+        # A checkout that predates this file ships no scheduler to compare against.
+        return "no-checkout", "no checkout copy at %s" % checkout_copy
     try:
         with open(me, "rb") as a, open(checkout_copy, "rb") as b:
             same = a.read() == b.read()
     except OSError as exc:
-        return "the staged scheduler could not be compared with the checkout (%s)" % exc
+        return "no-checkout", "the staged scheduler could not be read (%s)" % exc
     if same:
-        return ""
-    return (
+        return "same", me
+    return "differs", (
         "the STAGED scheduler differs from the checkout: %s is not %s — this cell runs the staged "
         "copy, so a fix landed in the checkout has NOT reached it. Refresh the farm: "
         "bash %s/pi-bootstrap/cell-install.sh --install" % (me, checkout_copy, root)
     )
+
+
+def staged_copy_drift() -> str:
+    """The `differs` message only — what `--check` reports as a non-fatal DRIFT line."""
+    kind, detail = staged_copy_report()
+    return detail if kind == "differs" else ""
 
 
 def cmd_check():
@@ -1297,10 +1364,21 @@ def cmd_verify():
     # $CELL_HOME/.pi/agent/scripts/fleet-schedule.py, so when it differs from the checkout this cell
     # was installed from, the layer being certified is not the layer in the repo — the state in
     # which a landing is invisible on every running cell (measured 2026-10-27). See
-    # staged_copy_drift(). Never raised by --check, where a Mac's farmed copy legitimately lags.
-    drift = staged_copy_drift()
-    if drift:
-        failures.append(drift)
+    # staged_copy_report(). Never raised by --check, where a Mac's farmed copy legitimately lags.
+    drift_kind, drift_detail = staged_copy_report()
+    if drift_kind == "differs":
+        failures.append(drift_detail)
+    elif drift_kind == "no-checkout":
+        # ⛔ NOT A FAILURE, BUT NOT SILENCE EITHER. A cell started without INFRA_ROOT cannot be
+        # compared with the checkout it was installed from (and a Mac legitimately has no checkout
+        # at that path at all). Reporting a plain VERIFIED over an arm that never ran is the no-op
+        # gate this repo refuses, so the arm is NAMED beside the verdict: the reader can tell
+        # "compared and clean" from "could not compare".
+        print(
+            "  NOTE   the staged scheduler could not be compared with a checkout (%s) — set "
+            "INFRA_ROOT/AGENT_INFRA_PATH to have this arm actually graded" % drift_detail,
+            file=sys.stderr,
+        )
 
     pid = loop_pid()
     if not pid:
@@ -1691,7 +1769,9 @@ def main(argv):
                 return cmd_check()
             except ScheduleError as exc:
                 print("FAIL: %s" % exc, file=sys.stderr)
-                return 3 if not os.path.isdir(TEMPLATES_DIR or "-") else 1
+                # The SAME predicate as the linux arm below, so the two platforms cannot disagree
+                # about one state — see declarations_unresolvable().
+                return 3 if declarations_unresolvable() else 1
         if not INFRA_ROOT:
             print("FAIL: no agent-infra checkout found (set INFRA_ROOT or AGENT_INFRA_PATH)", file=sys.stderr)
             return 1
@@ -1722,6 +1802,14 @@ def main(argv):
         return cmd_loop()
     except ScheduleError as exc:
         print("FAIL: %s" % exc, file=sys.stderr)
+        # ⛔ `--check` IS THE PRE-MERGE GATE, so its codes are a cross-platform contract: 3 for the
+        # "no declarations at all" state (nothing to grade here — the benign never-installed box a
+        # caller must not read as fatal) and 1 for a set that IS here and cannot be run. A
+        # nonexistent TEMPLATES_DIR is the former on BOTH platforms now; it used to be 3 on darwin
+        # and 1 here. Other verbs keep the blanket 1: `--start` classifies this state itself (3),
+        # and `--install`/`--verify` have no caller keying on 3.
+        if mode == "--check" and declarations_unresolvable():
+            return 3
         return 1
 
 

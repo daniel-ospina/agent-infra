@@ -493,6 +493,94 @@ else
     && ok "the failure says why a checkout fix did not take, and how to refresh it" \
     || bad "the failure does not name the staged copy: $out"
 fi
+# ⛔ "COULD NOT COMPARE" IS NOT "CLEAN" — the other half of the same signal. With no checkout to
+# compare against, the old code returned "" for BOTH "no drift" and "never compared", so --verify
+# could print SCHEDULE VERIFIED over the one check that exists to stop a cell certifying a build it
+# is not running. The arm must be NAMED beside the verdict, so a reader can tell the two apart.
+out="$(env -u INFRA_ROOT -u AGENT_INFRA_PATH TEMPLATES_DIR="$ROOT/templates/launchd" \
+      python3 "$STAGED/fleet-schedule.py" --verify 2>&1)"
+grep -q 'NOTE .*could not be compared with a checkout' <<<"$out" \
+  && ok "--verify NAMES the staged-copy arm it could not run (a pass is never silent about it)" \
+  || bad "--verify was silent about a staged-copy arm that never ran (the no-op-gate shape): $out"
+
+# ── 1g. the FOURTH copy of the contract: PLACEHOLDERS vs placeholder_values() ────────────────
+# The three-way comparison above covers the runtime tuple, the installer array and the template
+# tokens. It does NOT cover the resolver, and that gap is the #2804 asymmetry by a fourth route:
+# a name declared in all three compared artifacts with no entry in placeholder_values() resolved to
+# "" and was filed as "absent on this machine" — a designed per-machine SKIP — while macOS rendered
+# it from its env. So the job could never run on ANY cell, with every gate green (measured: rc 0,
+# "DECLARATIONS OK — … 0 errors", and exporting the variable changed nothing).
+NO_RESOLVER="$FIX/no-resolver"; mkdir -p "$NO_RESOLVER"; cp "$GOOD/RETIRED" "$NO_RESOLVER/RETIRED"
+cat > "$T/noresolver.spec" <<'PY'
+PLIST = {
+    "Label": "com.test.noresolver",
+    "ProgramArguments": ["/bin/sh", "-c", "true"],
+    "EnvironmentVariables": {"NEW": "{{NO_RESOLVER_PROBE}}"},
+    "StartInterval": 60,
+}
+PY
+mkplist "$NO_RESOLVER" com.test.noresolver "$T/noresolver.spec"
+mkplist "$NO_RESOLVER" com.test.echo       "$T/echo.spec"   # so the set is never zero-live
+
+case_ "1g. a declared placeholder with NO resolver is a DECLARATION error, not this machine's absence"
+# Control arm: the UNMUTATED runtime does not know the name at all (#2639's original shape), so the
+# fixture is proven to reach the loader rather than being ignored.
+out="$(TEMPLATES_DIR="$NO_RESOLVER" python3 "$SCHED" --check 2>&1)"; rc=$?
+grep -q 'does not know: {{NO_RESOLVER_PROBE}}' <<<"$out" \
+  && ok "control: an undeclared name is still the loud #2639 ERROR" \
+  || bad "the fixture does not reach the unknown-placeholder arm (rc=$rc): $out"
+# The mutation DECLARES the name in PLACEHOLDERS and leaves placeholder_values() alone — i.e. it
+# puts the tuple and the resolver out of step, exactly what "add the name in both files" produces.
+NO_RESOLVER_MUTANT="$T/fleet-schedule.no-resolver.py"
+python3 - "$SCHED" "$NO_RESOLVER_MUTANT" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+out = src.replace('    "PI_BIN_DIR",\n', '    "PI_BIN_DIR",\n    "NO_RESOLVER_PROBE",\n', 1)
+assert out != src, "the mutation did not apply — PLACEHOLDERS no longer lists PI_BIN_DIR"
+open(sys.argv[2], "w").write(out)
+PY
+out="$(TEMPLATES_DIR="$NO_RESOLVER" NO_RESOLVER_PROBE=/fixture/x \
+       python3 "$NO_RESOLVER_MUTANT" --check 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a declared-but-unresolvable name FAILS --check (rc=1)" \
+  || bad "--check certified a job that can never run anywhere (rc=$rc): $out"
+grep -q 'NO resolver in placeholder_values()' <<<"$out" \
+  && ok "the failure names the missing RESOLVER, which is what the operator has to add" \
+  || bad "the failure does not name the missing resolver: $out"
+grep -q 'absent on this machine' <<<"$out" \
+  && bad "the unresolvable name is still reported as this machine's absence (a false statement): $out" \
+  || ok "it is NOT reported as 'absent on this machine' (it is absent on every machine)"
+
+# ── 1h. --check's exit code is a CROSS-PLATFORM contract ───────────────────────────────────
+# The CONTRACT (§CONTRACT) says 3 for "no declarations at all" and 1 for a set this runtime cannot
+# run. A nonexistent TEMPLATES_DIR is the former — `--start` answers 3 for it and
+# docs/ops/fleet-schedule.md documents 3 — but the linux arm fell into a blanket
+# `except ScheduleError -> 1` while the darwin arm tested `isdir` and answered 3. One tree, two
+# verdicts for one state, and 1 is the code cloud-cell-supervisor.sh treats as FATAL.
+case_ "1h. the 'no declarations at all' state is exit 3 on BOTH platforms (and 1 is not widened)"
+darwin_check() { # darwin_check <templates-dir> → prints output, returns the real rc
+  python3 - "$SCHED" "$1" 2>&1 <<'PY'
+import os, sys
+sys.platform = "darwin"
+path, tdir = sys.argv[1], sys.argv[2]
+os.environ["TEMPLATES_DIR"] = tdir
+sys.argv = [path, "--check"]
+exec(compile(open(path).read(), path, "exec"), {"__name__": "__main__", "__file__": path})
+PY
+}
+GONE="$T/there-is-no-such-templates-dir"
+TEMPLATES_DIR="$GONE" python3 "$SCHED" --check >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 3 ] && ok "linux: an unresolvable templates dir is exit 3 (a state, not a broken set)" \
+  || bad "linux classified 'no declarations at all' as rc=$rc, not 3"
+darwin_check "$GONE" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 3 ] && ok "darwin: the SAME state is exit 3 (the two platforms agree)" \
+  || bad "darwin classified the same state as rc=$rc — the two platforms disagree"
+EMPTYDIR="$T/empty-templates"; mkdir -p "$EMPTYDIR"
+TEMPLATES_DIR="$EMPTYDIR" python3 "$SCHED" --check >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] && ok "linux: a dir that EXISTS but holds no declaration set stays exit 1 (unchanged)" \
+  || bad "an existing-but-unusable declarations dir became rc=$rc, not 1"
+darwin_check "$EMPTYDIR" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] && ok "darwin: the same, so 3 was not widened to cover a broken set" \
+  || bad "darwin answered rc=$rc for an existing-but-unusable dir, not 1"
 
 # ── 2. install proves a RUN, not a pid ────────────────────────────────────────────────────────
 case_ "2. --install runs the due jobs and ends with a fresh log line + stamp"
