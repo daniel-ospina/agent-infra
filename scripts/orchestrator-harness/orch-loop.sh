@@ -1126,10 +1126,16 @@ review_gate_state() {
 
 # [reviewdisp:begin]
 # ── THE REVIEW-DISPATCH KEY: ONE REVIEW PER (PR, HEAD), BOUNDED, NEVER SILENT (agent-infra#2653) ──
-# `state/reviewdisp-<PR>` = "<head> <n>": how many review lanes the CONTROLLER has dispatched for that
-# (PR, head). The head is the key because a review is evidence ABOUT A HEAD — a push re-arms the
-# budget, and an unchanged head must never pay for the same review twice.
-# ⛔ WHY THIS EXISTS AT ALL. A review lane IS dispatchable (`merge-<PR>`, below), but the controller kept
+# `state/reviewdisp-<PR>` = "<head> <n>": review ATTEMPTS at that (PR, head), spent by BOTH arms since
+# agent-infra#2971 — the CONTROLLER on a dispatch, `merge-one.sh` on a verdict-less run nothing counted
+# above it (`REV_PAID=1` marks the dispatcher-paid run, so one attempt is never counted twice). The head
+# is the key because a review is evidence ABOUT A HEAD — a push re-arms the budget, and an unchanged head
+# must never pay for the same review twice.
+# ⛔ WHY THIS EXISTS AT ALL. A review lane IS dispatchable — it was dispatched under `merge-<PR>` until
+# agent-infra#2971 split the two identities: the review ORDER is `review-<PR>`, and `merge-<PR>` is now
+# only the GREEN arm's landing worker. Before that split a review order and a landing worker carried the
+# SAME tag, so a pass that did the right thing (review) read in the controller's own log as a re-run of
+# the thing that had just been refused — but the controller kept
 # no record of having dispatched one, so a head whose gate stayed red was re-reviewed once per cycle
 # forever, and every one of those is a PAID fresh-context reviewer. The mirror image is what the fleet
 # actually paid for: with `review_slots` bounded, a review that never binds to a (PR, head) cannot be
@@ -1233,10 +1239,10 @@ review_athead_bump() { # <pr> <head> -> prints the new count
 # `review lanes=11/6` for 26 hours; the 11 were dead records whose logs had been silent for 26-30h and
 # nothing said so. A refusal that names its holders and their age turns "the box is busy" into "these
 # eleven units are not alive", which is the only reading an operator can act on.
-review_lane_holders() { # -> "merge-<pr>(<age>) …" (max 6, then "+N more")
+review_lane_holders() { # -> "review-<pr>(<age>) merge-<pr>(<age>) …" (max 6, then "+N more")
   local n st f m age out="" extra=0 lim=6 count=0
   while IFS="$(printf '\t')" read -r n st; do
-    case "$n" in merge-*) ;; *) continue ;; esac
+    case "$n" in review-*|merge-*) ;; *) continue ;; esac
     case "$st" in dead) continue ;; esac
     count=$(( count + 1 ))
     if [ "$count" -gt "$lim" ]; then extra=$(( extra + 1 )); continue; fi
@@ -1339,7 +1345,7 @@ harness_refresh_cycle() {
   [ "${_HR_DONE:-0}" = "1" ] && return 0
   _HR_DONE=1
   HARNESS_TOKEN=""
-  local rr out rc rel run ref pin act rec line
+  local rr out rc rel run ref pin act rec line pnd
   case "${HARNESS_REFRESH:-on}" in
     off|0|no)
       HARNESS_TOKEN="refresh-off"
@@ -1367,12 +1373,16 @@ harness_refresh_cycle() {
   # under this file's `set -u` a SIGPIPE tail on the writer is invisible, and `check-no-sigpipe-grep.sh`
   # gates the shape repo-wide.
   rec="$(printf '%s\n' "$out" | awk '/^harness relation=/{print; exit}')"
-  rel=""; run=""; ref=""; pin=""; act=""; fst=""
+  rel=""; run=""; ref=""; pin=""; act=""; fst=""; pnd=""
   for kv in $rec; do
     case "$kv" in
       relation=*) rel="${kv#relation=}" ;; running=*) run="${kv#running=}" ;;
       ref=*) ref="${kv#ref=}" ;; pin=*) pin="${kv#pin=}" ;; action=*) act="${kv#action=}" ;;
       fetch=*) fst="${kv#fetch=}" ;;
+      # WHY a `restart-pending` is pending (#2641): `inert` / `unprovable` / `deferred` / `safe`. Parsed
+      # so the spawn line can carry it — the four are different facts about the box and a token that says
+      # only `restart-pending` is the always-on alarm this fixes.
+      pending=*) pnd="${kv#pending=}" ;;
     esac
   done
   # A refusal prints its record too, so `action=refused` still carries the relation. A missing record
@@ -1386,12 +1396,20 @@ harness_refresh_cycle() {
   # completely SILENT in exactly that state: the warning was prose (this block keeps only the last
   # non-record line) and the token was empty. A stale comparison is named on every spawn line instead.
   if [ "$rel" = current ] && [ -n "$fst" ] && [ "$fst" != ok ]; then rel="$fst"; fi
-  if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${run:+:$run}"; fi
+  # ⛔ THE PENDING REASON RIDES ON THE TOKEN ONLY FOR `restart-pending` (#2641): every other relation
+  # carries `pending=none`, and appending it would put a constant on every line — the shape this repo
+  # keeps deleting. `restart-pending:deferred:04bc1ddefde` says the box is on an older tree AND why the
+  # step that would fix it has not been taken; `restart-pending:unprovable:…` says the identity itself is
+  # unknown. `current` stays EMPTY, which is the whole point of the third RUNNING source: on a cell it
+  # becomes reachable, so the token finally disappears when the box really is on the pin.
+  _pnd=""
+  [ "$rel" = restart-pending ] && [ -n "$pnd" ] && [ "$pnd" != none ] && _pnd="$pnd"
+  if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${_pnd:+:$_pnd}${run:+:$run}"; fi
   export HARNESS_TOKEN
   # The record other surfaces read (status, the next cycle's diagnosis). Staged then renamed, like
   # every other record this loop writes: a truncated state file must never replace a good one.
-  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s\n' \
-      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" \
+  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s pending=%s\n' \
+      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" "${pnd:-none}" \
       > "$O/state/.harness-refresh.tmp" && mv -f "$O/state/.harness-refresh.tmp" "$O/state/harness-refresh"; } 2>/dev/null \
     || echo "[harness] WARNING: could not record state/harness-refresh — the verdict below is this cycle's only copy" >> "$LOG"
   # ONE line per cycle, in the script's own words (it already names what it did). A refusal goes to
@@ -3081,7 +3099,7 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
   # 1. the live facts `pr_owned` already proves (cwd scan, cmdline-bound lock, foreign lease).
   if pr_owned "$pr" "$sha" "$br"; then return 0; fi
   # 2. the worker RECORD (census: a `dead` row is excluded there, `unknown` counts live).
-  if sess "fix-$pr" || sess "merge-$pr"; then return 0; fi
+  if sess "fix-$pr" || sess "review-$pr" || sess "merge-$pr"; then return 0; fi
   # 3. NOTHING PROVEN. With the proof module available the verdict is a RELEASE — and it removes the
   #    record, because a verdict of "not owned" that leaves the un-spawnable record on disk would
   #    leave the PR exactly as stuck as before (that is the defect, not the fix). Without the module
@@ -4854,7 +4872,20 @@ while true; do
                 echo "#$PR REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — review re-records at this head are EXHAUSTED, but the PARK DID NOT LAND (state/parked-$PR is unwritable), so this head is NOT bounded and will re-enter this arm every cycle. REFUSAL: nothing dispatched. REPAIR: make $O/state writable (rm -rf a stray directory named parked-$PR)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-CAP PARK UNWRITABLE — a human must look at this head"
               fi
-            elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
+            elif [ "$(wt_count review- merge-)" -lt "$MR" ] && can_spawn; then
+              # ⛔ THIS SPAWN IS A REVIEW ORDER, AND IT IS NAMED AS ONE (agent-infra#2971). The remedy
+              # the NEEDS-REVIEW diagnosis names is a REVIEW, so the worker this arm starts is
+              # `review-<PR>` — not `merge-<PR>`. Until this split both arms used the SAME tag, so a
+              # pass that dispatched a review read, in the controller's own log, as another MERGE
+              # worker: `[spawn] SPAWNED … merge-10213`, `[pr] … spawned=5` (measured 2026-10-28).
+              # A reader (and the operator's eye) then cannot tell an ORDER out of the refusal from a
+              # re-run of the thing that was refused, which is exactly how the same PR was re-spawned
+              # pass after pass. `merge-<PR>` now means ONE thing: the GREEN arm's landing worker.
+              # ⛔ AND THE BUDGET IS THE MERGE ARM'S OWN (REV_PAID=1): `merge-one.sh` reads and writes
+              # the SAME `reviewdisp-<PR>` record this arm just spent (agent-infra#2971, one book), so
+              # the attempt is counted once and the reviewer-side cap and this arm's REVIEW-CAP are
+              # the same number instead of two private tallies.
+              #
               # ⛔ READ THE COUNT FROM THIS PR'S VERDICT, NOT FROM A VARIABLE LEFT BY THE LAST PR. The
               # sweep loop is one shell, so a bare `_rvn` set in the CAP branch above would still hold
               # THAT PR's count here — and this value is written to `reviewdisp-<PR>` and printed as
@@ -4866,7 +4897,7 @@ while true; do
               # ⛔ A SPAWN THAT DID NOT HAPPEN MUST SAY SO (#2126 T1). This line was `tmux … && echo`,
               # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
               # reason. Every other spawn site in this file has an explicit failure branch.
-              if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
                 # SPEND THE REVIEW BUDGET ONLY ON A SPAWN THAT HAPPENED — the same rule `fixcount`
                 # follows one arm above: bookkeeping before the spawn makes a killed/failed spawn cost
                 # a real attempt, and this counter is the only thing standing between a wedged reviewer
@@ -4875,7 +4906,7 @@ while true; do
                 # #2653, P2): the counter IS the bound, so an unwritable one would re-buy a paid review
                 # every cycle. Named, and the head is parked so the loop stops rather than spending again.
                 if ! review_disp_record "$PR" "${HEAD_N:-}" "$(( ${_rvn:-0} + 1 ))"; then
-                  echo "#$PR review lane merge-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (attempting to park it — the park's own outcome is reported below). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
+                  echo "#$PR review order review-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (attempting to park it — the park's own outcome is reported below). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
                   # ⛔ AND THE PARK IS CHECKED TOO (review round 5 of #2653, P2): if the park did not
                   # land, the PR is NOT bound — it re-enters this arm and buys another paid review every
                   # cycle. Claiming PARKED over an unwritten `parked-<PR>` is the same inert-bound
@@ -4888,8 +4919,11 @@ while true; do
                     disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE and PARK DID NOT LAND — a human must look at this head"
                   fi
                 else
+                  # The `re-record` legacy token stays in this line (suites and operators read it), but
+                  # the ORDER is named: `review-<PR>`, at the head it was ordered for.
                   echo "#$PR re-record" >>"$LOG"
-                  disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"
+                  echo "#$PR review ORDER review-$PR dispatched for (PR=$PR, head=${HEAD_N:-?}) — the remedy the NEEDS-REVIEW diagnosis names; no merge worker is spawned at an unreviewed head" >>"$LOG"
+                  disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker review-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"
                 fi
               else
                 echo "#$PR re-record spawn FAILED (no review worker started this cycle)" >>"$LOG"
@@ -4898,7 +4932,7 @@ while true; do
             else
               # ⛔ THE REFUSAL NAMES ITS HOLDERS (agent-infra#2653): a count with no owner is what let 11
               # dead worker records read as "the box is busy" for 26 hours.
-              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR — holding: $(review_lane_holders); $(spawn_gate_tok))" >>"$LOG"
+              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count review- merge-)/$MR — holding: $(review_lane_holders); $(spawn_gate_tok))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: review-lane ceiling $MR reached or the spawn gate refused"
             fi
           fi
@@ -5347,7 +5381,7 @@ while true; do
     echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="none enumerable (no per-PR rows this cycle)"
   elif [ "$PRDISP_ACTS" -gt 0 ]; then
-    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight; spawned=${PRDISP_SPAWNS:-UNMEASURED} this pass (see the [spawn] line: acted counts ACTIONS, only a spawn starts a worker)${_refsuf:-}" >>"$LOG"
+    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- review- fix-) worker(s) in flight; spawned=${PRDISP_SPAWNS:-UNMEASURED} this pass (see the [spawn] line: acted counts ACTIONS, only a spawn starts a worker)${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="#${PRDISP_FIRST}"
     [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
   else
@@ -5406,7 +5440,7 @@ PY
   # live at this instant, so the dispatch block line below can distinguish "blocked while the box
   # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
   # not). Total in-flight agents = lanes + workers.
-  WORKERS="$(wt_count merge- fix-)"
+  WORKERS="$(wt_count merge- review- fix-)"
   # A load reading that is empty or non-numeric is the DOCUMENTED FAIL-OPEN (can_spawn() defaults it
   # to 0). Kept deliberately (#1702): both supported platforms are measurable now, and failing CLOSED
   # on an unreadable probe would convert "no load back-pressure" into a permanent controller outage on

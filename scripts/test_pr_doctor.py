@@ -132,6 +132,15 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # an earlier test's env would become this one's inheritance (measured: the ambient-GH_REPO test
     # went red for exactly that reason).
     monkeypatch.setattr(pr, "_INHERITED_GH_REPO", None, raising=False)
+    # ⛔ AND THE REPO-RESOLUTION GLOBALS (#2725). A test that drives a whole pass calls `main()`,
+    # which calls `apply_repo()` -- so it leaves `REPO`, its CHECKOUT, the worktree root and the
+    # worker tag pointed at the repo IT graded. That was invisible while the worker tag was empty
+    # outside `--all-repos` mode; now that every mode tags the worker, the leak renames the NEXT
+    # test's worker (`prd-daniel-ospina-agent-infra-9` in a test that never resolved a repo) and
+    # fails it for a reason it does not test. The empty values are what a fresh process has.
+    for _name, _val in (("REPO", ""), ("REPO_DIR", ""), ("REPO_DIR_ERROR", ""),
+                        ("WORKTREE_ROOT", ""), ("_WORKER_TAG", "")):
+        monkeypatch.setattr(pr, _name, _val, raising=False)
     # ⛔ AND THE TRANSPORT'S CAPABILITY IS NOT THE BOX'S (agent-infra#2409). `main()` refuses a pass when
     # the DEPLOYED `$O/nonblocking-dispatch.sh` predates the `[bg|prfix]` argument, because such a copy
     # would silently spawn every repair as `KIND=bg` and the creation gate would hold them. That is the
@@ -671,16 +680,204 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
     monkeypatch.setenv("MAX_REVIEW", "12")
-    assert pr.main() == 0
+    # ⛔ 3, NOT 0 (agent-infra#2710, measured 2026-10-27). This assertion used to be `== 0`, and it
+    # was pinning the defect: a pass whose ONLY outcome was a recorded refusal reported the code
+    # this file defines as "readable, nothing to do" while the PR sat behind a 45-minute cooldown.
+    # One refusal is a fact about the tree; `0` is a claim that the pass had nothing to do, and it
+    # had something to do and could not deliver it. Measured: `dispatched 0 of 4 queued —
+    # refused-recorded=4` + `EXIT rc=0`, five times in one day, each cleared by hand.
+    assert pr.main() == 3
     # ⛔ AND THE PASS LINE NAMES IT. A pass whose only outcome was a recorded refusal printed
     # `dispatched 0 of 1 queued — nothing to do`, which contradicts the row it just wrote and reads
     # as a quiet queue. The refusal is a stall, so it is counted and named.
     joined = "\n".join(logs)
     assert "refused-recorded=1" in joined, joined
     assert "nothing to do" not in joined, joined
+    # The refusal's own words are the NEXT ACTION (`... -- refusing to switch it; inspect and clean
+    # it`), so the record carries them rather than a bare counter.
     assert saved.get("1", {}).get("head") == "a" * 40, "a persistent refusal must record a row"
     assert saved["1"]["kind"] == "refused", \
         "a refusal row must be stamped `refused`, or void_refused_rows will delete it on the next pass"
+    assert saved["1"]["refusals"] == 1, "the row carries the consecutive-refusal count (#2710)"
+    assert "worktree dirty -- refusing" in saved["1"]["why"], \
+        "the row must carry the reason and its next action, not only a count"
+
+
+def _refusing_pass(monkeypatch, seed_refusals, logs):
+    """Drive ONE pass in which the only order is refused and recorded; return its rc."""
+    saved = {}
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "earlier",
+              # PAST the cooldown, or the guard would skip dispatch and the pass would test nothing.
+              "at_epoch": pr.now() - pr.COOLDOWN_S - 1,
+              "refusals": seed_refusals}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    return rc, saved, "\n".join(logs)
+
+
+def test_a_refusal_ESCALATES_by_name_and_repair_after_N_consecutive_passes(monkeypatch):
+    """A row refused N times in a row is named, with its repair -- never a silent cooldown loop.
+
+    ⛔ THIS IS THE MEASURED FAILURE (agent-infra#2710, 2026-10-27): five stalls in one day, each one
+    the identical silent sequence -- refuse, cooldown, retry, refuse -- with the row never named and
+    nothing escalating. The pass must refuse (rc 3) AND name the row.
+    """
+    logs = []
+    rc, saved, joined = _refusing_pass(monkeypatch, pr.REFUSAL_ESCALATE_AT - 1, logs)
+    assert rc == 3, rc
+    assert "ESCALATE #1" in joined, joined
+    assert "refused %d consecutive times" % pr.REFUSAL_ESCALATE_AT in joined, joined
+    assert "repair:" in joined, joined
+    assert saved["1"]["refusals"] == pr.REFUSAL_ESCALATE_AT, saved
+    # ⛔ AND IT IS ON THE VERDICT LINE, NOT ONLY IN THE LOG: the log is a file a non-terminal reader
+    # does not get. The row is what an operator acts on, so the pass line names it.
+    assert "ESCALATE #1 refused %d+ consecutive times" % pr.REFUSAL_ESCALATE_AT in joined, joined
+
+
+def test_a_refusal_below_the_threshold_does_NOT_escalate(monkeypatch):
+    """One or two refusals are a fact about the tree; they must not cry wolf."""
+    logs = []
+    rc, saved, joined = _refusing_pass(monkeypatch, 1, logs)
+    assert rc == 3, rc                     # still a refusal, never a clean pass
+    assert "ESCALATE" not in joined, joined
+    assert saved["1"]["refusals"] == 2, saved
+
+
+def test_a_pass_WAITING_OUT_a_refusal_cooldown_is_not_a_clean_pass(monkeypatch):
+    """⛔ THE 44-MINUTES-OUT-OF-45 HOLE (#2710 review round 1, P1 -- reproduced).
+
+    The refusal branch only runs on the pass that RECORDS the refusal. Every pass inside the
+    45-minute cooldown took the cooldown `continue`, so `undeliverable` stayed 0 and `_finish`
+    returned EXIT_CLEAN: `rc=0`, this file's word for "readable, nothing to do", beside a PR stuck
+    behind a durable refusal -- for 44 minutes of every 45. Reproduced before the fix with a row
+    `kind=refused, refusals=5` one minute into its cooldown:
+    `dispatched 0 of 1 queued -- cooldown=1` + `EXIT rc=0`.
+
+    A `kind=spawn` row in its cooldown is the OPPOSITE case (a worker in flight, which really is
+    nothing to do) and is asserted here too, so the count cannot be widened by accident.
+    """
+    saved = {}
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+              "refusals": 1, "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (_ for _ in ()).throw(AssertionError(
+                            "a row inside its own cooldown must not be dispatched")))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    joined = "\n".join(logs)
+    assert rc == pr.EXIT_UNDELIVERED == 3, (rc, joined)
+    assert "cooldown=1" in joined, joined
+    assert "nothing to do" not in joined, joined
+    assert saved["1"]["refusals"] == 1, "a cooldown pass must not touch the row's count"
+
+    # ...and a SPAWN row in its cooldown is still a clean pass: a worker in flight is nothing to do.
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "spawn",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60}})
+    assert pr.main() == pr.EXIT_CLEAN == 0
+
+
+def test_the_cooldown_of_an_ESCALATED_row_keeps_naming_it(monkeypatch):
+    """An escalated row must not go quiet for 45 minutes: the stored count is the escalation state."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "7": {"action": "fix-ci", "worker": pr.worker_name("7"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+              "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(7)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (_ for _ in ()).throw(AssertionError("no spawn")))
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "ESCALATE #7" in joined, joined
+    assert "repair: worktree dirty -- refusing" in joined, joined
+    assert "ESCALATE #7 refused %d+ consecutive times" % pr.REFUSAL_ESCALATE_AT in joined, joined
+
+
+def test_a_HEAD_MOVE_starts_a_NEW_refusal_episode(monkeypatch):
+    """⛔ `consecutive` must be true, and the reset is not free (#2710 review round 1, P2).
+
+    Nothing deletes a `kind: refused` row when the PR head moves (`void_refused_rows` skips every
+    non-spawn row, and it is the only row-deleting code), so a counter read unconditionally from the
+    row escalated on the FIRST refusal at a new head and printed a provenance ("at head <new>") that
+    was not true. Reproduced before the fix: row at head `b…`, PR at head `a…`, `refusals=2` ->
+    `ESCALATE #1 refused 3 consecutive times at head aaaaaaaaaaaa`.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "b" * 40, "at": "earlier", "at_epoch": pr.now() - pr.COOLDOWN_S - 1,
+              "refusals": pr.REFUSAL_ESCALATE_AT}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])          # head is `a`*40
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
+    saved = {}
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 3               # still a refusal, never a clean pass
+    assert saved["1"]["refusals"] == 1, saved
+    joined = "\n".join(logs)
+    assert "ESCALATE" not in joined, joined
+
+
+def test_a_successful_spawn_RESETS_the_consecutive_refusal_count(monkeypatch):
+    """`consecutive` is the claim, so a dispatch that went out must clear the counter."""
+    saved = {}
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "earlier",
+              "at_epoch": pr.now() - pr.COOLDOWN_S - 1, "refusals": 2}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: (True, "spawned", True))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 0
+    assert saved["1"]["kind"] == "spawn", saved
+    assert "refusals" not in saved["1"], \
+        "a dispatched row must not carry the old refusal count -- 'consecutive' would be a lie"
 
 
 def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp_path):
@@ -1548,6 +1745,7 @@ def test_a_worktree_root_the_job_does_not_own_is_refused_before_any_git_call(
     directory in the owner's own project) would create and dispatch `prd-<n>` inside work that is
     not ours. It must refuse BEFORE any git operation, not fail halfway through.
     """
+    monkeypatch.setattr(pr, "REPO_DIR", str(tmp_path))     # a checkout exists; the ROOT is what refuses
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "Personal website"))
 
@@ -1766,7 +1964,9 @@ def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, t
     monkeypatch.setenv("MAX_REVIEW", "12")
     assert pr.main() == 0
     row = saved.get("5") or {}
-    assert row.get("head") == "a" * 40 and row.get("worker") == "prd-5", \
+    # ⛔ THE NAME CARRIES THE REPO (#2725): `$O/bg` is box-global, so `prd-5` here was also the
+    # tortoise doctor's PR #5. The row records the SCOPED name it actually spawned.
+    assert row.get("head") == "a" * 40 and row.get("worker") == "prd-daniel-ospina-agent-infra-5", \
         "a launched worker must consume a state row / cooldown: %r" % (saved,)
     assert row.get("kind") == "spawn", "a launched worker's row must be a spawn row"
 
@@ -2316,6 +2516,57 @@ def test_main_shows_a_refused_row_as_refused_in_status(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "kind=refused" in out
     assert "kind=spawn" not in out, "a real dispatch must print exactly what it always did"
+
+
+def test_status_prints_the_whole_repo_qualified_worker_name(monkeypatch, capsys):
+    """⛔ THE OPERATOR'S VERB MUST NOT TRUNCATE THE IDENTITY (#2725 review, P2).
+
+    `_print_state()` formatted the worker into a hard `%-12s` column and sliced it with `[:12]`.
+    That was harmless while a name was `prd-<n>` (7 chars) and stopped being harmless the moment the
+    name carried the repo: `prd-daniel-ospina-agent-infra-5` printed as `prd-daniel-o`, which drops
+    the PR NUMBER -- the one component that says which PR the row is about -- and renders two repos
+    under one owner IDENTICALLY (`prd-daniel-o` for tortoise's #5 too). `--status` is the operator's
+    only window on this register, so a truncated identity there is the very mis-attribution this
+    change removes, printed by the verb that reports it.
+
+    The column is now as wide as the names in it; a floor of 12 keeps the historical alignment for
+    short names, so old output is unchanged.
+    """
+    a = "prd-daniel-ospina-agent-infra-5"
+    b = "prd-daniel-ospina-tortoise-5"
+    monkeypatch.setattr(pr, "load_state",
+                        lambda: {"5": {"action": "failing", "worker": a, "kind": "spawn",
+                                       "head": "a" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0},
+                                 "6": {"action": "failing", "worker": b, "kind": "spawn",
+                                       "head": "b" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0}})
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status"])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    # the WHOLE name, PR number included, for each row -- and the two must not read alike
+    assert ("worker=%s " % a) in out, "a repo-qualified worker name was truncated: %r" % (out,)
+    assert ("worker=%s " % b) in out, "a repo-qualified worker name was truncated: %r" % (out,)
+    assert "prd-daniel-o " not in out, "the worker name is still sliced to 12 chars: %r" % (out,)
+
+
+def test_status_output_for_short_names_is_unchanged(monkeypatch, capsys):
+    """⛔ AND THE FIX IS NOT A FORMAT CHANGE FOR EVERYONE (#2725 review).
+
+    The column width is `max(12, longest name)`, so a register of pre-rename `prd-<n>` rows prints
+    the same alignment it always did -- an operator's existing log greps and the reaper's habit of
+    reading this by eye must not be disturbed by a fix that only needed to stop truncating.
+    """
+    monkeypatch.setattr(pr, "load_state",
+                        lambda: {"7": {"action": "failing", "worker": "prd-7", "kind": "spawn",
+                                       "head": "a" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0}})
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status"])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    line = [ln for ln in out.splitlines() if ln.startswith("7")][0]
+    assert line.startswith("7        failing     worker=prd-7        "), \
+        "historical alignment changed for a short name: %r" % (line,)
 
 
 def test_an_agents_own_output_cannot_forge_a_refusal(tmp_path, monkeypatch):
@@ -5411,17 +5662,298 @@ def test_the_classifier_follows_the_doctor_to_the_same_repo(monkeypatch, tmp_pat
 
 
 def test_multi_repo_worker_names_cannot_collide(monkeypatch, tmp_path):
-    """Two repos can both have a PR #42; the worker name keys `$O/bg/<name>.*` on this machine."""
+    """Two repos can both have a PR #42; the worker name keys `$O/bg/<name>.*` on this machine.
+
+    ⛔ THE TAG IS NOT A MULTI-REPO FEATURE (#2725). It was assigned only in `--all-repos` mode, so
+    the ONE-DOCTOR-PER-REPO deployment -- one process per repo, which is what the box runs -- named
+    its worker `prd-42` and shared the `.rc`, `.pid`, the log, the brief AND the liveness answer
+    with the other repo's PR #42. Every mode tags now, from the register's own `repo_tag()`.
+    """
     try:
         pr.apply_repo(_REPO_A, "")
-        assert pr.worker_name(42) == "prd-42", "a single-repo pass keeps the historical name"
+        single = pr.worker_name(42)
+        assert single == "prd-daniel-ospina-agent-infra-42", \
+            "a single-repo pass names its worker by REPO, not by PR number"
         pr.apply_repo(_REPO_A, "", multi=True)
-        assert pr.worker_name(42) == "prd-daniel-ospina-agent-infra-42"
+        assert pr.worker_name(42) == single, \
+            "the mode is not part of the identity: one repo, one worker name"
         pr.apply_repo(_REPO_B, "", multi=True)
-        assert pr.worker_name(42) != "prd-daniel-ospina-agent-infra-42"
+        other = pr.worker_name(42)
+        assert other != single and other == "prd-daniel-ospina-tortoise-42"
+        pr.apply_repo(_REPO_B, "")
+        assert pr.worker_name(42) == other, "a single-repo pass over B is B, not A"
+        # ⛔ AND RESTORING THE MODULE STATE RE-DERIVES THE TAG FROM `REPO`, exactly as it re-derives
+        # the register: `canonical_paths()` blanking it would leave this process naming its next
+        # worker `prd-<n>` again, one line after it re-scoped the register to the repo.
+        pr.canonical_paths()
+        assert pr.worker_name(42) == other, "canonical_paths() is a second authority on the name"
     finally:
         pr.canonical_paths()
         pr._WORKER_TAG = ""
+
+
+def test_two_repos_PRN_share_no_worker_artifact(tmp_path, monkeypatch):
+    """⛔ THE MEASURED DEFECT (#2725): one identity, five files, two repos.
+
+    Reproduced against the real module before the change — both doctors named the worker `prd-42`,
+    so `$O/bg/prd-42.{rc,pid,log,started}` and `$STATE_DIR/pr-doctor-brief-prd-42.txt` were ONE set
+    of files for two different PRs. The `.rc` read is the dangerous one: `_confirm()` reads it to
+    decide whether a spawn was launched, so repo A's gate refusal became repo B's verdict.
+    """
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(tmp_path / "nonblocking-dispatch.sh"))
+    paths = {}
+    for slug in (_REPO_A, _REPO_B):
+        pr.apply_repo(slug, "")
+        name = pr.worker_name(42)
+        paths[slug] = {"name": name, "rc": pr.bg_path(name, "rc"),
+                       "pid": pr.bg_path(name, "pid"), "log": pr.bg_path(name, "log"),
+                       "brief": os.path.join(pr.STATE_DIR, "pr-doctor-brief-%s.txt" % name)}
+    a, b = paths[_REPO_A], paths[_REPO_B]
+    assert a["name"] != b["name"], "two repos' PR #42 are the SAME worker: %r" % (a["name"],)
+    shared = [k for k in a if a[k] == b[k]]
+    assert not shared, "worker artifacts shared between repos: %r" % (shared,)
+
+    # And the CONSEQUENCE: repo A's gate refusal must not answer for repo B's spawn.
+    os.makedirs(os.path.dirname(a["rc"]), exist_ok=True)
+    with open(a["rc"], "w") as fh:
+        fh.write("75\n")                       # load-gate refusal, written by repo A's worker
+    with open(a["log"], "w") as fh:
+        fh.write("[load-gate] REFUSED: load1 96 > ceiling 80\n")
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")   # B's own worker vanished
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
+    verdict, detail = pr._confirm(b["name"])
+    assert verdict != "refused", "repo B read repo A's 75 as its own verdict: %r" % (detail,)
+    pr.canonical_paths()
+
+
+def test_a_pre_2725_worker_ON_THIS_CHECKOUT_still_blocks_a_spawn(tmp_path, monkeypatch):
+    """⛔ BACK-COMPAT, AND IT IS THE UNSAFE DIRECTION (#2725).
+
+    A worker started before the rename lives under `$O/bg/prd-<n>`, and `worker_live_for()` must
+    still find it: reporting a running worker as ABSENT adopts its worktree and starts a second
+    agent in it (`rm -f "$RC"`, `: > "$LOG"` — the live worker's evidence is gone). So the
+    unqualified name is asked for EVERY PR, and the `.started` record is not consulted at all.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    # (a) with a record present, and (b) with no record at all — the answer must be the same,
+    # because the record cannot attribute the name (see
+    # test_a_FOREIGN_started_record_does_NOT_hide_our_live_worker for why).
+    for present in (True, False):
+        if present:
+            with open(pr.bg_path("prd-42", "started"), "w") as fh:
+                fh.write("name=prd-42\nworktree=%s\nkind=prfix\n"
+                         % os.path.join(pr.WORKTREE_ROOT, "prd-42"))
+        elif os.path.exists(pr.bg_path("prd-42", "started")):
+            os.unlink(pr.bg_path("prd-42", "started"))
+        asked.clear()
+        assert pr.worker_live_for(42) is True, (present, asked)
+        assert "prd-42" in asked, (present, asked)
+    pr.canonical_paths()
+
+
+def test_a_FOREIGN_started_record_does_NOT_hide_our_live_worker(tmp_path, monkeypatch):
+    """⛔ THE `.started` RECORD CANNOT ATTRIBUTE THE UNQUALIFIED NAME — THE COLLISION OVERWRITES IT
+    (#2980 review cycle 6, P1). This is the regression test for a fail-open that an earlier version
+    of this change shipped as a FEATURE.
+
+    `bg_path(name, "started")` is ONE box-global slot keyed by NAME ALONE, and
+    `nonblocking-dispatch.sh` writes it with a truncating `>`. Pre-#2725 BOTH repos named their
+    worker `prd-<n>`, so the surviving record names whichever repo dispatched LAST — and the other
+    repo's worker is still running. An attribution that read "the record names another repo" as
+    positive proof of foreignness therefore answered "not live" for a worker that was live, and
+    dispatched a second agent into the worktree the first one was still using: `rm -f "$RC"`,
+    `: > "$LOG"`, two agents on one git index. Asserted in BOTH directions of the record, because
+    the whole point is that the record's CONTENT cannot change the answer.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_B, str(tmp_path / "tortoise"))
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    # A record naming a tree that PROVES it is the OTHER repo — the strongest "foreign" evidence
+    # the old narrowing accepted. The live worker is under the unqualified name regardless.
+    (tmp_path / "agent-infra").mkdir()          # _git_repo mkdirs its own `repo` child
+    foreign, g = _git_repo(tmp_path / "agent-infra")
+    g("remote", "add", "origin", "https://github.com/%s.git" % _REPO_A)
+    foreign_wt = foreign / ".worktrees" / "prd-42"
+    g("worktree", "add", "--detach", str(foreign_wt), "HEAD")
+
+    for recorded in (str(foreign_wt), ""):       # another repo's tree, then no record body at all
+        with open(pr.bg_path("prd-42", "started"), "w") as fh:
+            fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % recorded)
+        asked.clear()
+        assert pr.worker_live_for(42) is True, \
+            ("a live worker under the unqualified name was reported ABSENT: the pass would adopt ",
+             "its worktree and destroy its .rc/.log", asked)
+        assert "prd-42" in asked, asked
+    pr.canonical_paths()
+
+
+def test_a_pre_2725_worker_in_an_ADOPTED_worktree_outside_the_root_still_blocks_a_spawn(tmp_path, monkeypatch):
+    """⛔ "UNDER WORKTREE_ROOT" IS NOT THE WHOLE POPULATION (#2980 review cycle 4, P1).
+
+    `materialise_worktree`'s ADOPT arm returns a worktree that is NOT under `WORKTREE_ROOT` — its
+    own comment says so, and `test_the_adopt_arm_shares_the_documented_owner_worktree_boundary`
+    drives that path for real. A pre-#2725 worker dispatched into such a tree records THAT path in
+    its `.started`; a root-prefix attribution answered "not ours", SKIPPED the probe, and let the
+    pass adopt the very worktree the live worker was running in. That attribution is gone (the
+    record cannot attribute — see test_a_FOREIGN_started_record_does_NOT_hide_our_live_worker), so
+    the tree's location can no longer decide the question at all; this pins that it does not.
+    """
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    outside = tmp_path / "wt-lane"          # fleet-shaped, REGISTERED here, OUTSIDE the root
+    g("worktree", "add", "--detach", str(outside), head)
+
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(repo))       # WORKTREE_ROOT = <repo>/.worktrees
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % outside)
+    assert pr.worker_live_for(42) is True, asked
+    assert "prd-42" in asked, asked
+    pr.canonical_paths()
+
+
+def test_a_pre_2725_worker_in_a_BROTHER_CLONE_of_the_same_repo_is_still_probed(tmp_path, monkeypatch):
+    """⛔ THE GRANULARITY IS THE REPO, NOT THE CHECKOUT (#2980 review cycle 5, P2).
+
+    A live pre-#2725 worker in a SECOND CLONE of the same repo shares the worktree name but not this
+    clone's registry. Under the removed attribution it matched no arm, read as foreign, and the pass
+    dispatched a second worker onto the same branch. It is now probed like every other name, so the
+    clone a legacy worker happens to sit in cannot hide it — asserted for a brother clone AND for a
+    different repo's tree, because the answer must not depend on which tree the record names.
+    """
+    def mk(path, slug):
+        path.mkdir(parents=True)
+
+        def g(*a):
+            return subprocess.run(["git", "-C", str(path)] + list(a), check=True,
+                                  capture_output=True, text=True)
+        g("init", "-q")
+        g("config", "user.email", "t@t")
+        g("config", "user.name", "t")
+        g("config", "commit.gpgsign", "false")
+        (path / "f.txt").write_text("base\n")
+        g("add", "f.txt")
+        g("commit", "-qm", "base")
+        g("branch", "-M", "main")
+        g("remote", "add", "origin", "https://github.com/%s.git" % slug)
+        return path
+
+    mine = mk(tmp_path / "repo", _REPO_A)
+    brother = mk(tmp_path / "brother", _REPO_A)      # a second clone of ONE repo
+    stranger = mk(tmp_path / "stranger", _REPO_B)    # a different repo's tree
+
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(mine))
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    for tree in (brother, stranger):
+        with open(pr.bg_path("prd-42", "started"), "w") as fh:
+            fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % tree)
+        asked.clear()
+        assert pr.worker_live_for(42) is True, (tree, asked)
+        assert "prd-42" in asked, asked
+    pr.canonical_paths()
+
+
+def test_the_started_record_is_never_opened_by_the_liveness_question(tmp_path, monkeypatch):
+    """⛔ THE HAZARD IS REMOVED AT THE SOURCE, NOT GUARDED (#2980 review cycle 6).
+
+    `worker_live_for()` used to read `$O/bg/<name>.started` to build its name list, which made the
+    hot path (asked about every queued PR) do an `open()` on a BOX-GLOBAL artifact — and `open()`
+    on a writer-less FIFO BLOCKS rather than raising, so one planted FIFO would stop the drain for
+    ever with no verdict, no heartbeat and no dispatch. Because the record no longer decides
+    anything, that read is GONE, so the guard is unnecessary rather than merely present: a FIFO (or
+    anything else) at that path is now inert. This replaces the bound-and-timeout test that used to
+    defend the read; it asserts the stronger property and cannot hang, because nothing is read.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    # ⛔ THE HARNESS'S OWN VERDICT IS NOT WHAT THIS TEST IS ABOUT: `worker_status` shell outs to
+    # `nonblocking-dispatch.sh --status`, which is legitimately UNANSWERABLE on a bare runner, so
+    # pin it the way this file's other worker tests do.
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or False)
+
+    os.mkfifo(pr.bg_path("prd-42", "started"))
+    try:
+        assert pr.worker_live_for(42) is False, asked
+        assert asked == ["prd-daniel-ospina-agent-infra-42", "prd-42"], asked
+        assert pr.worker_names_for(42) == asked, "the reported names are not the probed ones"
+    finally:
+        os.unlink(pr.bg_path("prd-42", "started"))
+    pr.canonical_paths()
+
+
+def test_one_repo_cannot_acquire_two_worker_identities_from_slug_case(tmp_path, monkeypatch):
+    """⛔ THE IDENTITY IS CASE-INSENSITIVE EVERYWHERE ELSE (#2980 review cycle 4, P2).
+
+    `resolve_repo` ACCEPTS a case-differing `owner/name` as the same repo (`got.lower() ==
+    slug.lower()`) and `set_tag_collisions` lowercases when it compares tags, so two legitimate
+    passes on ONE repo can carry two spellings. While `repo_tag()` preserved case, they became two
+    worker identities for ONE deterministic worktree (`prd-<n>`): neither name matched the other's
+    live worker, so both passes spawned into one git index and one branch -- the #2280 class this
+    file's identity work exists to remove, reintroduced through a resolved string.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    names = []
+    for spelling in ("daniel-ospina/agent-infra", "Daniel-Ospina/Agent-Infra"):
+        pr.apply_repo(spelling, str(tmp_path / "repo"))
+        names.append(pr.worker_name(42))
+    assert names[0] == names[1] == "prd-daniel-ospina-agent-infra-42", names
+    assert pr.repo_tag("Daniel-Ospina/Agent-Infra") == pr.repo_tag("daniel-ospina/agent-infra")
+    pr.canonical_paths()
+
+
+def test_a_row_written_before_the_rename_still_holds_and_frees_its_slot(tmp_path, monkeypatch):
+    """⛔ IN-FLIGHT ROWS SURVIVE THE RENAME (#2725), both directions.
+
+    A pending row names the worker it spawned. Rows written before the change say `prd-5` and their
+    pid file is spelled that way too, so the EXACT name still matches and nothing is lost. Rows
+    written after say `prd-daniel-ospina-agent-infra-5`. Neither type may be forgotten: a live
+    worker counted as dead is a second agent on the same PR, and a dead one counted as live is a
+    slot held for ever.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    dead = _a_dead_pid()
+
+    # (a) a pre-rename row, its pid file live -> the slot is HELD
+    (bg / "prd-5.pid").write_text("%d\n" % os.getpid())
+    st = {"5": {"action": "fix-ci", "worker": "prd-5", "at_epoch": now}}
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
+
+    # (b) the same row, its worker provably gone -> the slot is FREED (no ghost)
+    (bg / "prd-5.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1
+
+    # (c) a post-rename row is charged the same way, by its own exact name
+    st = {"5": {"action": "fix-ci", "worker": "prd-daniel-ospina-agent-infra-5",
+                "at_epoch": now}}
+    (bg / "prd-daniel-ospina-agent-infra-5.pid").write_text("%d\n" % os.getpid())
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
 
 
 def test_a_pass_with_no_checkout_grades_the_queue_and_says_it_cannot_spawn(monkeypatch, tmp_path):
@@ -6307,3 +6839,347 @@ def test_HALF_a_rubric_seam_is_a_hybrid_rubric_and_refuses_even_the_built_in_rep
             assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
     finally:
         pr.canonical_paths()
+
+
+# ── REVIEW ROUND 2 (#2710): the budget gate ran BEFORE the refusal accounting ─────────────────────
+def _four_refused_rows(monkeypatch, logs, refusals, orch_dir):
+    """The incident's own shape: four rows in their cooldown, an EMPTY `$O/bg`, shipped defaults.
+
+    ⛔ `ORCH_DIR` IS PINNED TO AN EMPTY DIRECTORY, AND THAT IS THE WHOLE POINT (review round 2). A
+    refused row never launched a worker, so it has no `bg/<worker>.pid` -- which is exactly the state
+    `_worker_state` answers "unknown" (charged) or "gone" (free) from. Left on the box's real
+    `ORCH_DIR`, a stray pid file made the rows read "gone" and the budget interaction this test
+    exists for never happened: the assertion passed for a reason it does not name.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(orch_dir))
+    rows = {}
+    for n in (1, 2, 3, 4):
+        rows[str(n)] = {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                        "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+                        "refusals": refusals, "why": "worktree dirty -- refusing"}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(rows))
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in (1, 2, 3, 4)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    # An EMPTY ORCH_DIR is the state of a PR that never spawned a worker -- i.e. every refused row.
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError(
+                            "a row inside its own cooldown must not be dispatched")))
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    # ⛔ THE SHIPPED CAPS, DELIBERATELY. Every other pass test raises MAX_FIX/MAX_REVIEW, which is
+    # exactly why one row hid this: at the defaults, three refused rows USED TO exhaust the fix budget
+    # (`pass_budgets()` charged them, because a row that never spawned has no pid file). #2710 voids a
+    # refused row's slot, so the caps stay here as the configuration that cannot be talked round by
+    # capacity: the accounting must refuse whether or not there is room.
+    for v in ("MAX_FIX", "MAX_REVIEW", "MAX_TOTAL"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def test_FOUR_refused_rows_at_the_SHIPPED_caps_still_refuse_and_escalate(monkeypatch, tmp_path):
+    """⛔ THE BUDGET GATE RAN BEFORE THE REFUSAL ACCOUNTING (review round 2, P1 -- reproduced).
+
+    A refused row never launched a worker, so it has no `$O/bg/<worker>.pid`; `_worker_state`
+    answers "unknown", and `pass_budgets` charged the row to its class. At the SHIPPED defaults
+    (`DEFAULT_MAX_FIX=3`) the incident's four rows exhausted the fix budget, and the budget gate sits
+    ABOVE the cooldown arm -- so the pass skipped it entirely and printed
+    `dispatched 0 of 4 queued — budget=4` with `EXIT rc=0`: this file's word for "readable, nothing to
+    do", at the defaults, with the row count the incident actually measured. `void_refused_rows`
+    already states the rule this contradicted: *"A refusal consumed nothing, so it must not hold a
+    cooldown and a budget slot"*.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, pr.REFUSAL_ESCALATE_AT, tmp_path)
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    joined = "\n".join(logs)
+    assert "budget=" not in joined.split("dispatched")[-1], joined
+    # ⛔ AND EVERY ONE IS NAMED ON THE VERDICT LINE -- this is the sentence the contract states:
+    # "EVERY PASS THAT COVERS THE ROW, not only the one that records it".
+    assert "4 PR(s) still undeliverable" in joined, joined
+    assert "refused in an earlier pass" in joined, joined
+    assert "ESCALATE #1" in joined, joined
+
+
+def test_a_cooldown_pass_does_not_claim_an_order_was_rejected(monkeypatch, tmp_path):
+    """⛔ ONE COUNT, TWO CAUSES, ONE FALSE SENTENCE (review round 2, P2).
+
+    `undeliverable` decides the CODE on both arms, but its sentence said "no worker accepted" -- a
+    transport failure. On a cooldown pass NO ORDER WAS PLACED, so that sentence sent an operator
+    hunting a transport fault in a pass that attempted nothing.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, 1, tmp_path)
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "no worker accepted" not in joined, joined
+    assert "still undeliverable" in joined, joined
+    # below the threshold, an escalation would be crying wolf
+    assert "ESCALATE" not in joined, joined
+
+
+def test_a_CORRUPTED_refusal_count_degrades_instead_of_crashing(monkeypatch, tmp_path):
+    """⛔ `int("3x")` RAISED, AND THE BAD ROW WAS NEVER REWRITTEN (review round 2).
+
+    `__main__` records a crash as `EXIT_CRASH=4`; because the cooldown arm never rewrites the row,
+    the bad value survived and EVERY later pass crashed before dispatching anything for any PR -- a
+    corrupted counter turned a named refusal into a permanently silent doctor. A bad count means
+    "unknown count": never escalate, never crash.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, "3x", tmp_path)
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    joined = "\n".join(logs)
+    assert "ESCALATE" not in joined, joined
+    assert pr._as_int("3x") == 0 and pr._as_int(None) == 0 and pr._as_int("3") == 3
+
+
+def test_a_refused_row_no_longer_holds_a_budget_slot(monkeypatch, tmp_path):
+    """The rule `void_refused_rows` states, applied where the budget is actually COUNTED."""
+    st = {str(n): {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                   "head": "a" * 40, "at_epoch": pr.now() - 60, "refusals": 1}
+          for n in (1, 2, 3, 4)}
+    # an EMPTY bg dir: no pid file, which is what every refused row looks like
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    budgets = pr.pass_budgets(st, {"max_fix": 3, "max_review": 4})
+    assert budgets["used"] == 0, budgets
+    assert budgets["unknown"] == 0, budgets
+    # ⛔ NON-VACUITY: a row that IS waiting on a worker still holds its slot.
+    st["9"] = {"action": "fix-ci", "worker": pr.worker_name("9"), "kind": "spawn",
+               "head": "a" * 40, "at_epoch": pr.now() - 60}
+    assert pr.pass_budgets(st, {"max_fix": 3, "max_review": 4})["used"] == 1
+
+
+# ── REVIEW ROUND 2, SECOND PASS: the accounting must not depend on PR-number ordering ─────────────
+def test_a_SATURATED_pass_still_refuses_and_names_a_refused_row(monkeypatch, tmp_path):
+    """⛔ `rc=0` DEPENDED ON WHICH PR SORTED FIRST (review round 2, P1 — reproduced).
+
+    The accounting was hoisted above `dispatched >= budgets["total"]` but the dispatch loop still
+    `break`s there, so with `budgets["total"] == 0` (a saturated box, and `--max 0` by construction) it
+    broke on the FIRST row that was not in a cooldown. Measured, same two rows, only the numbers
+    swapped: `EXIT rc=3` + `ESCALATE` when the refused row sorted first, and
+    `dispatched 0 of 2 queued — no capacity budget (…); budget=1` + `EXIT rc=0` with no escalation
+    when it sorted second. A verdict that depends on PR-number ordering is not a verdict.
+    """
+    for refused_first in (True, False):
+        logs = []
+        refused_key, fresh_key = ("1", "2") if refused_first else ("2", "1")
+        monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path / str(refused_first)))
+        st = {refused_key: {"action": "fix-ci", "worker": pr.worker_name(refused_key),
+                            "kind": "refused", "head": "a" * 40, "at": "1 min ago",
+                            "at_epoch": pr.now() - 60, "refusals": pr.REFUSAL_ESCALATE_AT,
+                            "why": "worktree dirty -- refusing"}}
+        monkeypatch.setattr(pr, "load_state", lambda: dict(st))
+        monkeypatch.setattr(pr, "open_prs",
+                            lambda: [_pr(int(refused_key)), _pr(int(fresh_key))])
+        monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+        monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+        monkeypatch.setattr(pr, "log", logs.append)
+        monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+        monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "save_state", lambda s: None)
+        # ⛔ ZERO TOTAL BUDGET: the saturated box, produced here the way the CLI produces it.
+        monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
+        rc = pr.main()
+        joined = "\n".join(logs)
+        assert rc == pr.EXIT_UNDELIVERED == 3, (refused_first, rc, joined)
+        assert ("ESCALATE #%s" % refused_key) in joined, (refused_first, joined)
+
+
+def test_the_REFUSING_arms_do_not_claim_an_order_the_pass_never_placed(monkeypatch, tmp_path):
+    """⛔ THE CONTRADICTION CAME BACK ONE BRANCH DOWN (review round 2, P2 — reproduced).
+
+    The `parts` line was split into placed/carried, but the two `REFUSING:` sentences above it still
+    interpolated raw `undeliv`. Measured with one unreadable PR and one carried refusal: the verdict
+    said "1 order(s) no worker accepted" AND "1 PR(s) still undeliverable -- refused in an earlier
+    pass", in one pass where no order was placed.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "2": {"action": "fix-ci", "worker": pr.worker_name("2"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60, "refusals": 5,
+              "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    # PR 1 unreadable, PR 2 the carried refusal.
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: None if p["number"] == 1 else ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    pr.main()
+    joined = "\n".join(logs)
+    assert "no worker accepted" not in joined, joined
+    assert "refused in an earlier pass" in joined, joined
+
+
+def test_as_int_survives_INFINITY_and_NEGATIVES(monkeypatch, tmp_path):
+    """⛔ `int(float("inf"))` RAISED `OverflowError`, WHICH `_as_int` DID NOT CATCH (review round 2).
+
+    `json.loads` accepts `1e999` / `Infinity` and yields `inf`, so a corrupted state file crashed
+    every later pass. A NEGATIVE count was passed through instead (recorded as -4, -3, …, eight
+    refusals of silence), so a count below zero is treated as unusable too.
+    """
+    assert pr._as_int(float("inf")) == 0
+    assert pr._as_int(float("-inf")) == 0
+    assert pr._as_int(float("nan")) == 0        # `int(nan)` is ValueError; pinned for completeness
+    assert pr._as_int(-5) == 0
+    assert pr._as_int("3") == 3 and pr._as_int(3) == 3
+    # ...and the pass itself survives a row carrying one.
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+              "refusals": float("inf"), "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    assert "ESCALATE" not in "\n".join(logs)
+
+
+def test_MORE_than_four_escalated_rows_are_not_silently_dropped(monkeypatch, tmp_path):
+    """⛔ A TRUNCATED LIST WITH NO MARKER READS AS THE WHOLE LIST (review round 2, P3)."""
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    rows = {str(n): {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                     "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+                     "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}
+            for n in range(1, 8)}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(rows))
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in range(1, 8)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "ESCALATE #1 #2 #3 #4 +3 more" in joined, joined
+
+
+def test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass(monkeypatch, tmp_path):
+    """⛔ 46 MINUTES LATER THE SAME FALSE CLEAN CAME BACK (review round 3 — reproduced).
+
+    The accounting only covered a row INSIDE its cooldown. Once the 45-minute window expires, a
+    saturated pass (`total == 0`, and `--max 0` by construction) broke out of the dispatch loop before
+    reaching the row and printed `no capacity budget (...); budget=1` + `EXIT rc=0` over a
+    `kind: refused` row AT the current head. The budget is the only reason the row is not retried, so
+    the budget is what decides whether the pass may still call itself clean.
+    """
+    for refused_last in (True, False):
+        logs = []
+        monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path / str(refused_last)))
+        st = {"2": {"action": "fix-ci", "worker": pr.worker_name("2"), "kind": "refused",
+                    "head": "a" * 40, "at": "an hour ago",
+                    "at_epoch": pr.now() - pr.COOLDOWN_S - 60,   # EXPIRED, not in cooldown
+                    "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}}
+        monkeypatch.setattr(pr, "load_state", lambda: dict(st))
+        order = [2, 1] if refused_last else [1, 2]
+        monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in order])
+        monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+        monkeypatch.setattr(pr, "log", logs.append)
+        monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+        monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "save_state", lambda s: None)
+        monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
+        rc = pr.main()
+        joined = "\n".join(logs)
+        assert rc == pr.EXIT_UNDELIVERED == 3, (refused_last, rc, joined)
+        assert "ESCALATE #2" in joined, (refused_last, joined)
+
+
+# ── WHICH COPY JUDGED THE BRIEF (#2708, retained through the rebase onto #2978) ────────────────────
+def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, tmp_path):
+    """⛔ THE STALE-COPY CLASS (measured 2026-10-28, case 3): a capability resolves a helper from the
+    FIRST candidate on a search path, and nothing compares the copy it RESOLVED with the copy the
+    other half of the contract will use.
+
+    Case 2 was a 9-hour-stale `pr-doctor.py` whose briefs carried no research contract while the gate
+    that judged them DID require one: every spawn refused `rc=80` for 9 hours. The effect assertion is
+    agreement, not construction: the brief the doctor COMPOSES must be ACCEPTED by the gate the
+    dispatcher RESOLVES. And when it is not, the refusal must name the copy that judged it — otherwise
+    the operator fixes the file they installed while the box keeps running the other one (case 3's
+    exact shape: the fix went to `~/.pi/agent/scripts/objective.py`, and the driver resolved
+    `$O/objective.py`).
+    """
+    d, _wt = _orch(tmp_path, "run_agent() { :; }\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    # ⛔ `research_section()` CACHES A SUCCESS (deliberately — a failure is what is re-tried), so a
+    # section resolved by an earlier test in this process would make this arm read that copy.
+    monkeypatch.setattr(pr, "_RESEARCH_SECTION", None, raising=False)
+
+    composed = pr.brief(_pr(7), "fix-ci", "python-ci-gate", [])
+    assert "## RESEARCH FIRST" in composed, composed[:400]
+    prompt = tmp_path / "brief.txt"
+    prompt.write_text(composed)
+    ok = subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--check", str(prompt), "worker"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ("the doctor composed a brief the shipped gate REFUSES — every "
+                                "spawn on the box would exit 80:\n%s%s" % (ok.stdout, ok.stderr))
+
+    # ── and the refusal NAMES the resolved copy ────────────────────────────────────────────────
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(_wt), ""))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    logged = []
+    monkeypatch.setattr(pr, "log", logged.append)
+    monkeypatch.setenv("O", str(d))
+    ok_d, detail, record = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+    assert (ok_d, record) == (False, False), (ok_d, detail, record)
+    assert "rc=80" in detail, detail
+    assert str(d / "brief-gate.sh") in detail, (
+        "the refusal did not name WHICH brief-gate.sh judged the brief, so an operator is sent to "
+        "the copy they just fixed rather than the copy that refused: %r" % (detail,))
+
+    # ⛔ AND IT MUST SURVIVE THE CUT THE OPERATOR ACTUALLY READS (#2708 review, P2 — reproduced).
+    # Naming the copy in a string no reader renders is the same defect one layer down. `pr-doctor`
+    # logs SLICES of this stderr -- `detail[:200]` on the FAIL line (`scripts/pr-doctor.py:3768`) and
+    # `detail[:160]` on the NOT-DISPATCHED line (`:5093`, the rc=80 path, which writes no state row;
+    # `:5090` is the REFUSED-and-RECORDED line, which rc=80 never takes) -- and the gate's own
+    # teaching block is ~3.3 KB. Measured BEFORE the reorder that follows from this arm: the path sat
+    # at byte ~3290 of a ~3655-byte capture, so `in detail[:160]` was **False** and the operator still
+    # could not tell which copy refused. The dispatcher therefore emits the naming line FIRST and
+    # re-emits the block after it.
+    #
+    # ⛔ THE PROPERTY IS THE ORDERING, NOT THE END OF THE PATH (#2986 review, P1 -- MEASURED RED on
+    # macOS). The earlier form of this arm read `str(d / "brief-gate.sh") in detail[:160]`, and
+    # `str(d / "brief-gate.sh")` here is a PYTEST TEMP PATH: with this fleet's own
+    # `TMPDIR=/var/folders/...` it is ~141 chars, so the path ends at char ~194 and the arm failed on
+    # every macOS box while passing on `ubuntu-latest` (whose temp root is shorter) -- a verdict
+    # decided by the box's `$TMPDIR` grades the box, not the ordering. So the ordering is asserted at
+    # its EXACT OFFSET (box-independent), and the 160-char property is asserted separately against
+    # an `$O` no LONGER than production's (the block after it): `/tmp/oXXXXXX` is 14 chars, against
+    # the real `$O/brief-gate.sh` = 27 + len($HOME) = 41 in this fleet (`$O` defaults to
+    # `$HOME/orchestrator`), so that assertion is CONSERVATIVE rather than box-dependent.
+    # `$HOME/.pi/…` is only the FOURTH candidate (32 + len($HOME)) and is NOT the path a real box
+    # resolves — the first candidate, `$O/brief-gate.sh`, always exists on an installed box.
+    path = str(d / "brief-gate.sh")
+    prefix = "rc=80: nonblocking-dispatch.sh: REFUSED — brief-gate="
+    assert detail.splitlines()[0].startswith(prefix + path), (
+        "the naming line did not LEAD with brief-gate=<resolved path> at char %d, so the path is "
+        "still behind the gate's teaching block: %r" % (len(prefix), detail[:200]))
+
+    # ── AND THE 160-CHAR SLICE IS REAL FOR AN `$O` NO LONGER THAN A REAL BOX'S ─────────────
+    # `/tmp/oXXXXXX` (14 chars) rather than `tmp_path`: on macOS `tmp_path` nests under
+    # /private/var/folders and no preamble short enough to name the copy would rescue a 141-char path.
+    short = pathlib.Path(tempfile.mkdtemp(dir="/tmp", prefix="o"))
+    try:
+        for f in ("brief-gate.sh", "spawn-gate.sh"):
+            shutil.copy(str(d / f), str(short / f))
+        monkeypatch.setattr(pr, "ORCH_DIR", str(short))
+        monkeypatch.setenv("O", str(short))
+        ok_s, detail_s, record_s = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+        assert (ok_s, record_s) == (False, False), (ok_s, detail_s, record_s)
+        assert str(short / "brief-gate.sh") in detail_s[:160], (
+            "a production-length `$O` does not fit the 160-char slice pr-doctor renders, so the "
+            "operator is still sent to the copy they just fixed. detail[:200]=%r" % (detail_s[:200],))
+    finally:
+        shutil.rmtree(str(short), ignore_errors=True)
+    assert logged, "the refusal produced no log line at all"

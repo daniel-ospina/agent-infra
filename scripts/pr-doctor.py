@@ -253,12 +253,23 @@ OWNERSHIP_NOTE = ""
 # believed it had spent is indistinguishable from a budget it had spent -- `dispatched 0` is what an
 # empty queue looks like, which is exactly the ALIVE/IDLE confusion #2700 exists to remove.
 #
-# ⚠️ THIS SCOPES THE **REGISTER**, NOT THE WORKER IDENTITY. `dispatch()` still names a worker
-# `prd-<N>` under the box-global `$O/bg`, so two repos on one box still share one worker identity --
-# repo B's PR #N is skipped as "still running" because repo A's worker holds it, and a gate refusal
-# in repo A's `.rc` can be read as repo B's verdict. Same "keyed by PR number" class, one layer
-# down, and NOT closed here: filed as #2725 with the two measured outcomes. Do not read this comment
-# as saying the class is gone.
+# ⛔ AND THE WORKER IDENTITY IS SCOPED THE SAME WAY, BY THE SAME TAG (#2725). The register fix
+# above closed one layer; `dispatch()` named its worker `prd-<N>` under the box-global `$O/bg`, so
+# the layer under it still shared an identity between two repos on one box. Both outcomes were
+# reproduced against the real module before the change (2026-10-27):
+#
+#     repo A (agent-infra) worker=prd-42  rc=$O/bg/prd-42.rc
+#     repo B (tortoise)    worker=prd-42  rc=$O/bg/prd-42.rc     <- same .rc, .pid, .log, brief
+#     repo B: worker_live_for(42) -> True   (repo B had spawned nothing)
+#     repo B: _confirm('prd-42') -> ('refused', 'gate REFUSED rc=75')   <- repo A's refusal
+#
+# `worker_name()` already had the tag; it was applied only in `--all-repos` mode. `apply_repo()` now
+# sets it in BOTH modes, from `repo_tag()` -- the one derivation `_state_file()` and the collision
+# guard already use, so the register and the worker it records a row about cannot be spelled two
+# ways. ⛔ THE GRANULARITY IS THE REPO, NOT THE CHECKOUT, deliberately: two clones of one slug share
+# the tag because they share the register (#2700 scopes that to the slug), and a worker tag finer
+# than the register would put a row in a file the other clone also owns. See `worker_live_for()`
+# for what that means for a pre-rename `prd-<N>` worker.
 #
 # ⛔ THE ORDER IS NO LONGER LOAD-BEARING, AND THAT IS THE RECONCILIATION (see the block above): the
 # register is named from the RESOLVED slug inside `apply_repo()`, not from a module-level `REPO`,
@@ -353,8 +364,10 @@ LAST_PASS: dict = {}
 # pass too (#2700), so `canonical_paths()` re-derives it from the resolved slug rather than
 # restoring this tuple's first element -- see the note there.
 _CANONICAL = (STATE, STATUS, LOG)
-# Non-empty only in `--all-repos` mode: prefixes the per-repo worker name so two repos' PR #42
-# cannot share one `$O/bg/prd-42.*` record (and one worktree slot's liveness answer).
+# The repo's `repo_tag()` plus a hyphen; it prefixes the worker name so two repos' PR #42 cannot
+# share one `$O/bg/prd-42.*` record (and one worktree slot's liveness answer). ⛔ SET IN BOTH MODES
+# (#2725): `--all-repos` was the only mode that set it, so the ONE-DOCTOR-PER-REPO deployment -- the
+# shape #2700's own evidence records on this box -- was exactly the case with no tag at all.
 _WORKER_TAG = ""
 
 
@@ -743,14 +756,19 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
         # so every repo in a set appended to the ONE canonical file while the README promised a
         # per-repo one.
         LOG_BASENAME = "pr-doctor.%s.log" % tag
-        _WORKER_TAG = tag + "-"
     else:
         # ⛔ A SINGLE-REPO PASS TOUCHES NO STATUS/LOG. Those ARE the canonical files, so re-deriving
         # them here would overwrite a caller's seam (`STATE_DIR`, `STATUS`) with a second opinion
         # about where they live -- the same "two authorities for one path" defect `--status` was
         # just given a single reader for.
         LOG_BASENAME = "pr-doctor.log"
-        _WORKER_TAG = ""
+    # ⛔ THE WORKER TAG IS SET IN BOTH MODES, THROUGH THE SAME `repo_tag()` (#2725). It used to be
+    # assigned only in the `multi` branch, which left the ONE-DOCTOR-PER-REPO deployment -- one
+    # process per repo, the shape the box actually runs -- naming its worker `prd-<n>` under the
+    # box-global `$O/bg`, i.e. sharing one `.rc`/`.pid`/`.log`/brief with the other repo's PR #n.
+    # Through `repo_tag()`, never a second `.replace()`: the register's name and the worker names its
+    # rows record must be derived once, or a pass writes rows its own file cannot be matched in.
+    _WORKER_TAG = repo_tag(slug) + "-"
     # ⛔ THE AMBIENT SELECTOR IS PINNED TO THE RESOLVED REPO, IN THAT DIRECTION ONLY. Inheriting it
     # is the #2235 hazard; OVERRIDING it with the repo evidence already selected is safe, and it is
     # what stops a worker this pass spawns from having its own rail answer about another repo.
@@ -775,12 +793,17 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
 
 
 def worker_name(number) -> str:
-    """The worker's name for a PR, qualified by the repo only when more than one is in scope.
+    """The worker's name for a PR: `prd-<repo_tag>-<n>`, qualified by the repo IN BOTH MODES.
 
     Two repos can both have a PR #42, and the worker name keys `$O/bg/<name>.*` (liveness, `.rc`,
-    the log). A single-repo pass keeps the historical `prd-<n>` -- the fleet's readers and
-    `--status` rows are pinned to it -- while a multi-repo pass prefixes the repo so one repo's
-    live worker cannot be read as the other's.
+    the log) and `$STATE_DIR/pr-doctor-brief-<name>.txt` -- BOTH box-global, neither per repo. So
+    every mode prefixes the repo, from the register's own `repo_tag()` (#2725).
+
+    ⛔ THE UNQUALIFIED `prd-<n>` IS STILL READ (#2725), never written: a worker started before this
+    change holds `$O/bg/prd-<n>.{rc,pid,started}`, and `worker_live_for()` asks for that name too --
+    unconditionally, see there -- so a rename cannot turn a running worker into an idle slot. What
+    `--status` prints is unchanged in shape (`<name> running|done|failed|lost …`); only the `<name>`
+    it is asked about, and prints, carries the tag.
     """
     return "prd-%s%s" % (_WORKER_TAG, number)
 
@@ -1021,6 +1044,15 @@ def rubric_report(note: str = "") -> str:
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
+# ⛔ HOW MANY CONSECUTIVE REFUSALS BEFORE THE ROW IS ESCALATED BY NAME (#2710). Measured
+# 2026-10-27: five stalls in one day, each time the SAME sequence and each time cleared by hand --
+# refuse, record a 45-min cooldown, retry into the same refusal, `EXIT rc=3` written into a log
+# beside successful passes, nothing escalating. One refusal is a fact about the tree; three in a row
+# at the same head is a row nobody is going to fix by waiting, and it must say so on the surface a
+# non-terminal reader parses. WHY 3: the cooldown means a refusal can only recur this many times
+# after ~2 h of the same broken worktree, which is longer than a lane takes to produce or abandon
+# one; below 3 the noise is a single transient, above it the first two passes have already reported.
+REFUSAL_ESCALATE_AT = 3
 STALE_DISPATCH_S = 90 * 60    # a dispatch with no state change this old is retryable
 
 # ── CAPACITY: the machine's own thresholds, never a private literal ─────────────────────
@@ -1206,16 +1238,18 @@ def capacity() -> dict:
 # resolved twice). An empty register, an unreadable pid file, a row with no `worker` at all -- all
 # read ALIVE.
 #
-# ⚠️ AND THE NAME IS NOT AN IDENTITY. This file's own `dispatch()` writes the SHORT worker name
-# (`prd-2035`, `name = "prd-%d" % n`) under a box-global `$O/bg`, but the repo-scoped form
-# (`prd-agent-infra-2035.pid`) is what the MULTI-REPO launcher writes (`worker_name()` in
-# `fix/pr-doctor-repo-resolution`, #2280) and what the Mac's deployed copy wrote in the measurement
-# above (`spawn prd-agent-infra-2027`). A doctor in that mode writes scoped pid files while a
-# register carried over from single-repo mode still holds short names -- and an exact-name lookup
-# then finds NOTHING, where "nothing found => assume alive" (the safe direction) faithfully keeps
-# every ghost. So the TRAILING NUMBER is matched as well. That over-matches deliberately: another
-# repo's LIVE worker with the same PR number keeps a slot (throughput), and it never frees one (a
-# duplicate dispatch).
+# ⚠️ AND A ROW'S NAME IS NOT NECESSARILY THIS FILE'S CURRENT SPELLING (#2725). Rows written before
+# the worker identity was repo-scoped hold the SHORT name (`prd-2035`); every row written now holds
+# `prd-<repo-tag>-2035` (`worker_name()`), and a register carried over from before the change holds
+# both. An exact-name lookup therefore finds NOTHING for a row from the other spelling -- where
+# "nothing found => assume alive" (the safe direction) would faithfully keep every ghost. So the
+# TRAILING NUMBER is matched as well. That over-matches deliberately: another repo's LIVE worker
+# with the same PR number keeps a slot (throughput), and it never frees one (a duplicate dispatch).
+# ⛔ Liveness is a DIFFERENT question and is answered differently: `worker_live_for()` probes the
+# unqualified name UNCONDITIONALLY and does not try to attribute it, because a slot held too long
+# costs throughput while a worker read as dead costs two agents in one index. The `.started` record
+# is a single box-global slot keyed by name, so it cannot attribute the two colliding identities --
+# see `worker_live_for()` (#2980 review cycle 6, P1).
 #
 # ⛔ AND THE SELF-REPORT NEEDS THREE STATES, NOT TWO (#2746 review). `alive` used to mean "not provably
 # gone", which counts a row with no `worker`, a row whose pid file was pruned, and a pid file we
@@ -1352,6 +1386,30 @@ def _worker_state(worker) -> str:
     return "gone" if readable and not unreadable else "unknown"
 
 
+def _as_int(value, default=0) -> int:
+    """`value` as an int, or `default` — NEVER an exception (agent-infra#2710 review round 2).
+
+    The consecutive-refusal count is read from a JSON state file that a killed pass, a hand edit or an
+    older framework version wrote. `int("3x")` raised `ValueError`, which `__main__` records as
+    EXIT_CRASH=4: the cooldown arm never rewrites the row, so the bad value SURVIVED and every later
+    pass crashed before dispatching anything for any PR — a corrupted counter turned a named refusal
+    into a permanently silent doctor. A bad count means "unknown count", which must never escalate
+    and must never crash.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        # ⛔ `OverflowError` TOO (review round 2, P2 — reproduced). `json.loads` accepts `1e999` and
+        # `Infinity` and yields `inf`; `int(float("inf"))` raises `OverflowError`, which this guard
+        # did not catch, so a hand-edited `state/pr-doctor.json` crashed EVERY later pass exactly as
+        # the `ValueError` case did. The cooldown arm never rewrites the row, so the value survives.
+        return default
+    # ⛔ AND A NEGATIVE COUNT IS NOT A COUNT (review round 2, P2). `_as_int(-5)` was passed through,
+    # so `n_ref` recorded -4, -3, … and the row could not escalate until it climbed back to 3 —
+    # eight refusals of silence. A count below zero is as unusable as a non-number.
+    return n if n >= 0 else default
+
+
 def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> dict:
     """Available dispatches this pass, per work class and in total.
 
@@ -1387,6 +1445,18 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
         state = _worker_state(v.get("worker"))
         if state == "gone":
             continue          # the worker is PROVABLY gone: the slot is free again
+        # ⛔ A REFUSAL CONSUMED NOTHING, SO IT MAY NOT HOLD A SLOT (agent-infra#2710 review round 2,
+        # P1 — reproduced). A refused row never launched a worker, so it has no `$O/bg/<worker>.pid`;
+        # `_worker_state` answers "unknown" ("no pid file is NOT proof of absence"), and the row was
+        # therefore charged to its class. Measured at the SHIPPED defaults (MAX_FIX=3): the four
+        # refusals of the 2026-10-27 incident exhausted the fix budget, the budget gate below ran
+        # BEFORE the cooldown arm, and the pass printed `dispatched 0 of 4 queued — budget=4` with
+        # `EXIT rc=0` — the silent clean pass this issue exists to remove, at the defaults, with the
+        # incident's own row count. `void_refused_rows` already states the rule in its own words: *"A
+        # refusal consumed nothing, so it must not hold a cooldown and a budget slot"* — this is that
+        # rule where the budget is actually counted.
+        if (v.get("kind") or "") == "refused":
+            continue          # counted as undelivered work in the pass, never as capacity
         if state == "alive":
             alive += 1
         else:
@@ -3549,22 +3619,53 @@ def set_rubric_note(entries: list[str]) -> str:
             % (len(slugs), ",".join(sorted(slugs))))
 
 
-def worker_live_for(number) -> object:
-    """Liveness of ANY worker that would use this PR's worktree, whatever mode named it.
+def worker_names_for(number) -> list[str]:
+    """Every worker name that resolves to this PR's ONE worktree, most specific first.
 
-    ⛔ ONE WORKTREE, TWO NAMES (#2280 review cycle 3, P2). `worker_name()` is MODE-QUALIFIED
-    (`prd-<tag>-42` in a set) while the worktree is `prd-42` in BOTH modes, so a single-repo pass and
-    an `--all-repos` pass over the SAME repo can look at one directory while calling it two things.
-    Probing only this mode's name reports a live worker as ABSENT; the pass then adopts that
-    worktree and spawns a second agent into it -- two agents, one git index, one branch. So the
-    question for a PR is asked of every name that resolves to its worktree, and an UNANSWERABLE
-    reading (`None`) wins over a negative one: the safe direction is not to spawn.
+    The worktree is `prd-<n>` in every mode (see `materialise_worktree`), while the NAME is
+    repo-qualified, so more than one name can be live for one tree. This is the single list both
+    the liveness QUESTION and the log lines that report its answer are built from, so a message
+    can never name a worker nothing wrote (#2980 review cycle 6, P2).
     """
     names = [worker_name(number)]
     plain = "prd-%s" % number
     if plain not in names:
-        names.append(plain)              # the single-repo pass's name for the SAME worktree
-    for nm in names:
+        names.append(plain)              # the pre-#2725 name for the SAME worktree
+    return names
+
+
+def worker_live_for(number) -> object:
+    """Liveness of ANY worker that would use this PR's worktree, whatever mode named it.
+
+    ⛔ ONE WORKTREE, TWO NAMES (#2280 review cycle 3, P2). `worker_name()` is repo-qualified while
+    the WORKTREE is `prd-<n>`, so a worker started before #2725 (or by a launcher that named it the
+    old way) is live under `prd-<n>` while this pass asks about `prd-<repo-tag>-<n>`. Probing only
+    this mode's name reports a live worker as ABSENT; the pass then adopts that worktree and spawns
+    a second agent into it -- two agents, one git index, one branch. So the question for a PR is
+    asked of every name that resolves to its worktree, and an UNANSWERABLE reading (`None`) wins
+    over a negative one: the safe direction is not to spawn.
+
+    ⛔ BOTH NAMES ARE PROBED UNCONDITIONALLY, AND THE `.started` RECORD IS NOT CONSULTED (#2980
+    review cycle 6, P1 -- this REPLACES an attribution that cycle 4/5 added). An earlier version
+    narrowed the unqualified probe to names whose `.started` record pointed at this checkout, and
+    treated a record naming ANOTHER repo as positive proof the name was foreign. That reasoning is
+    unsound, because `bg_path(name, "started")` is ONE BOX-GLOBAL SLOT keyed by NAME ALONE and
+    `nonblocking-dispatch.sh` writes it with a truncating `>`: the very collision #2725 is filed
+    about OVERWRITES it. Pre-rename, repo A and repo B both dispatched `prd-<n>`, so the surviving
+    record names whichever dispatched LAST -- typically the OTHER repo -- while A's worker is still
+    running. A then read its own live worker as foreign, skipped the probe, answered "not live" and
+    dispatched a second agent into the worktree the first one was still using: the exact
+    work-destroying direction this function's own reasoning forbids. The artifacts CANNOT attribute
+    the name, because the collision is what destroyed the attribution.
+
+    So the narrowing is gone rather than tightened, and the cost is the one the sibling reader
+    already accepted in the same words: `worker-supply.sh` says the unqualified name "is NOT
+    attributed to a checkout, unlike the doctor's own read -- so another repo's pre-rename worker
+    can hold this order as `live`. That is the safe direction." The two readers now agree; a false
+    "live" costs one pass of throughput and clears itself as the pre-rename artifacts age out,
+    while a false "not live" destroys a running agent's work.
+    """
+    for nm in worker_names_for(number):
         live = worker_live(nm)
         if live is None:                  # unanswerable: do not spawn
             return None
@@ -3578,8 +3679,20 @@ def repo_tag(slug: str) -> str:
 
     ONE HOME for the derivation: `apply_repo`, `--status`, and the collision guard must agree, and
     three independent `.replace()` calls are how two of them drift apart.
+
+    ⛔ LOWERCASED, BECAUSE THIS FILE ALREADY TREATS THE IDENTITY AS CASE-INSENSITIVE (#2980 review
+    cycle 4, P2). `resolve_repo` ACCEPTS a case-differing `owner/name` as the same repo
+    (`got.lower() == slug.lower()`), `set_tag_collisions` lowercases when it compares two tags, and
+    GitHub itself is case-insensitive -- so two legitimate passes on ONE repo can hand this function
+    two spellings. Preserving case made them two worker identities
+    (`prd-Daniel-Ospina-agent-infra-42` vs `prd-daniel-ospina-agent-infra-42`) for one DETERMINISTIC
+    worktree (`prd-<n>`): neither name matches the other's live worker, the register splits, no
+    cooldown holds the slot, and both passes spawn into one git index and one branch -- the #2280
+    class this file's identity work exists to remove, reintroduced by making the name depend on a
+    RESOLVED STRING rather than on the repo. Lowercasing cannot merge two DISTINCT repos, because
+    GitHub cannot own two repositories whose slugs differ only by case.
     """
-    return (slug or "").replace("/", "-")
+    return (slug or "").lower().replace("/", "-")
 
 
 def set_tag_collisions(entries: list[str]) -> str:
@@ -3673,11 +3786,13 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # `nonblocking-dispatch.sh` starts by `rm -f "$RC"`, `: > "$LOG"`, `echo … > "$PIDF"`, which
     # deterministically destroys the live worker's log, exit status and pid. So liveness is asked
     # (the harness owns the question), never inferred from the state row.
-    # ⛔ BOTH NAMES: the worktree is `prd-<n>` in EVERY mode, so a live worker started by the OTHER
-    # mode owns the same directory (see `worker_live_for()`).
+    # ⛔ BOTH NAMES: the worktree is `prd-<n>`, and a worker started before #2725 is live under the
+    # UNQUALIFIED `prd-<n>` -- `worker_live_for()` asks that name too, unconditionally, and the two
+    # are named in the refusal because either one may be the one that answered (`worker_names_for`).
     live = worker_live_for(n)
     if live:
-        return False, "worker %s is still running -- one worker per PR" % name, False
+        return False, ("worker %s is still running -- one worker per PR"
+                       % " / ".join(worker_names_for(n))), False
     if live is None:
         # ⛔ UNANSWERABLE IS NOT "FREE". Spawning on an unreadable status would re-create the exact
         # defect this guard exists for -- two workers in one deterministic directory, the second
@@ -3696,7 +3811,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
     # costs one `--status` on the only path that spawns anything.
-    again = worker_live_for(n)            # BOTH names: the worktree is `prd-<n>` in every mode
+    again = worker_live_for(n)            # BOTH names: the pre-#2725 `prd-<n>` too, if it is ours
     if again is not False:
         return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
                        "was being prepared -- refusing to spawn a second one" % name, False)
@@ -3994,6 +4109,7 @@ def _print_state(path: str, label: str = "") -> None:
               "repo this invocation resolves to, or `--all-repos` for the whole set -- but only "
               "after a pass has graded this repo, which is when a register exists to read.")
         return
+    rows: list[tuple[str, dict]] = []
     if path == STATE:
         st = load_state()
         note = _status_age_note()
@@ -4008,12 +4124,25 @@ def _print_state(path: str, label: str = "") -> None:
     for k, v in sorted(st.items()):
         if k.startswith("_"):
             continue
+        rows.append((k, v))
+    # ⛔ THE WORKER COLUMN IS AS WIDE AS THE NAMES IN IT, NEVER A SLICE OF THEM (#2725 review).
+    # It was a hard `%-12s` with a `[:12]` slice, which was harmless while a name was `prd-<n>`
+    # (<=7 chars) and is not any more: `prd-daniel-ospina-agent-infra-5` renders as
+    # `prd-daniel-o`, which drops the PR NUMBER -- the one component that says WHICH PR the row is
+    # about -- and two repos under one owner render IDENTICALLY (`prd-daniel-o` for both).
+    # `--status` is the operator's only window on this register, so a truncated identity there is
+    # the same mis-attribution this whole change removes, printed by the verb that reports it.
+    # A floor of 12 keeps the historical alignment (and therefore the existing output) byte-for-byte
+    # for short names; past that the line simply grows, because a wrapped line is legible and a
+    # truncated identity is not.
+    width = max([12] + [len((v.get("worker") or v.get("lane") or "?")) for _k, v in rows])
+    for k, v in rows:
         # `kind` is shown only when it is NOT "spawn", so a real dispatch prints exactly what
         # it always did -- and a row that exists because the PR was REFUSED can no longer be
         # read as "a worker was dispatched for this".
         kind = v.get("kind") or "spawn"
-        print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
-                                                (v.get("worker") or v.get("lane") or "?")[:12],
+        print("%-8s %-11s worker=%-*s %s%s" % (k, v.get("action"), width,
+                                                (v.get("worker") or v.get("lane") or "?"),
                                                 v.get("at"),
                                                 "" if kind == "spawn" else "  kind=" + kind))
 
@@ -4125,7 +4254,11 @@ def canonical_paths() -> None:
     STATE = _state_file(REPO) if REPO else _CANONICAL[0]
     STATUS, LOG = _CANONICAL[1], _CANONICAL[2]
     LOG_BASENAME = "pr-doctor.log"
-    _WORKER_TAG = ""
+    # ⛔ THE WORKER TAG IS RE-DERIVED FROM `REPO` TOO, FOR THE REASON ONE LINE ABOVE (#2725). The tag
+    # is `repo_tag()` of the repo this process grades, in BOTH modes, so restoring it to the empty
+    # string would be a SECOND authority on the worker's name -- and it would name the next worker
+    # `prd-<n>` again, inside a process whose register is already repo-scoped.
+    _WORKER_TAG = (repo_tag(REPO) + "-") if REPO else ""
 
 
 def clear_repo_target() -> None:
@@ -4693,6 +4826,8 @@ def run_pass(args, rubric_note: str = "") -> int:
     dispatched = 0
     undeliverable = 0        # legible work whose order NO WORKER accepted (see `_finish`)
     delivered = []           # WHICH PRs actually went out -- the record must name them
+    escalated = []           # rows refused >= REFUSAL_ESCALATE_AT times in a row (#2710)
+    carried = 0              # of `undeliverable`: refused in an EARLIER pass, still in cooldown
     stalled = {"cooldown": 0, "budget": 0, "brief": 0}
     spent = {"fix": 0, "review": 0}
 
@@ -4712,6 +4847,17 @@ def run_pass(args, rubric_note: str = "") -> int:
         nothing had been delivered: the same outcome as blindness by a different route. It gets
         its OWN exit code (3) so a launcher, a reader, or a test can tell "I could not read" (2)
         from "I read, I placed, nobody took it" (3).
+
+        ⛔ AND A DURABLE WORKTREE REFUSAL IS ON THAT SAME AXIS (#2710, measured 2026-10-27). A
+        refusal that will not clear by waiting -- dirty worktree, commits the PR head does not
+        have -- records a row and a 45-min cooldown. Until this change it did NOT reach
+        `undeliverable`, so a pass whose only outcome was four of them exited 0: this file's own
+        word for "readable, nothing to do", printed while four PRs were stuck behind a refusal.
+        Nothing was delivered in that pass, so it refuses; the row's own `ESCALATE` line names the
+        worktree and its repair once the same row has refused `REFUSAL_ESCALATE_AT` times in a row.
+        The two causes still need different responses -- that distinction is #2291's (a measurement
+        of the box separates "no room" from "the transport refused"); what is decided HERE is that
+        neither of them may read as a clean pass.
 
         ⛔ AND THE DENOMINATOR IS THE FIX (2026-10-18, owner-reported). `dispatched 0` is what this
         job printed on every pass for days while it was actually REFUSING at the lane read, and
@@ -4737,21 +4883,38 @@ def run_pass(args, rubric_note: str = "") -> int:
             _more = (" (%d usable-PR(s) still held for a changed-file read)" % _held
                      if _held and unread else "")
             if unread and undeliv:
-                log("REFUSING: %d PR(s) were UNREADABLE and %d order(s) no worker accepted,"
-                    " with nothing dispatched -- not a clean pass%s" % (unread, undeliv, _more))
+                # ⛔ `undeliv - carried`, NOT `undeliv` (review round 2, P2 — reproduced). The
+                # sentence says "no worker accepted", which is a TRANSPORT fact; a row carried from
+                # an earlier pass's refusal had no order placed at all. One unreadable PR plus one
+                # carried refusal printed both a transport claim and "refused in an earlier pass" in
+                # the same verdict — the contradiction the `parts` split above removed, one branch
+                # down. ⛔ AND A ZERO-COUNT CLAUSE IS STILL A FALSE CLAIM: when nothing was placed the
+                # clause is OMITTED, not printed with `0`.
+                _placed = undeliv - carried
+                _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
+                _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
+                log("REFUSING: %d PR(s) were UNREADABLE%s, with nothing dispatched -- not a clean"
+                    " pass%s%s" % (unread, _pl, _carried, _more))
             elif unread:
                 log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
                     " pass%s" % (unread, _more))
             elif _held and undeliv:
-                log("REFUSING: %d PR(s) had an unusable changed-file list and %d order(s) no"
-                    " worker accepted, with nothing dispatched -- not a clean pass"
-                    % (_held, undeliv))
+                _placed = undeliv - carried
+                _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
+                _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
+                log("REFUSING: %d PR(s) had an unusable changed-file list%s, with nothing"
+                    " dispatched -- not a clean pass%s" % (_held, _pl, _carried))
             elif _held:
                 log("REFUSING: %d PR(s) had an unusable changed-file list and nothing was"
                     " dispatched -- not a clean pass" % _held)
             elif undeliv:
-                log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
-                    " a clean pass" % undeliv)
+                if carried and carried == undeliv:
+                    log("REFUSING: %d PR(s) still undeliverable -- refused in an EARLIER pass and"
+                        " waiting out its cooldown; nothing was dispatched -- not a clean pass"
+                        % undeliv)
+                else:
+                    log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
+                        " a clean pass" % (undeliv - carried))
         # WHY nothing (or something) went out. Named in the line itself, so the log answers the
         # question an operator actually asks -- never a bare number.
         parts = []
@@ -4772,20 +4935,45 @@ def run_pass(args, rubric_note: str = "") -> int:
                     parts.append("%s=%d" % (k, v))
         # These two are worth stating on a pass that DID dispatch: work was left behind, and why.
         if undeliv:
-            # ⛔ NAME THE CAUSE ON THE SAME LINE. `undeliverable` covers two transport failures --
-            # a spawn that was placed and failed, and an order WITHHELD because the harness could
-            # not answer liveness -- and they need different fixes (a harness that ran and exited
-            # vs a harness that is not installed). Both refuse, so both are rc 3; only the sentence
-            # tells an operator which one they have.
+            # ⛔ NAME THE CAUSE ON THE SAME LINE. `undeliverable` covers THREE causes -- a spawn that
+            # was placed and failed, an order WITHHELD because the harness could not answer liveness,
+            # and (since #2710) a row still waiting out the cooldown of a DURABLE REFUSAL -- and they
+            # need different fixes. All three refuse, so all three are rc 3; only the sentence tells
+            # an operator which one they have. ⛔ AND THEY MAY NOT SHARE ONE SENTENCE: "no worker
+            # accepted" on a cooldown pass asserts a transport failure in a pass where NO ORDER WAS
+            # PLACED (review round 2, P2 -- the one number sent an operator hunting the wrong fault).
             # The withheld cause is stated only on a pass that DID dispatch: when nothing went out
             # the stall counters are already on this line (`live-unreadable=N`), and repeating them
             # here would say the same fact twice in one verdict.
             withheld = (stalls.get("live-unreadable") or 0) if dispatched else 0
-            parts.append("%d order(s) no worker accepted%s"
-                         % (undeliv, " (%d withheld: worker liveness unreadable)" % withheld
-                            if withheld else ""))
+            placed_and_refused = undeliv - carried
+            if placed_and_refused:
+                parts.append("%d order(s) no worker accepted%s"
+                             % (placed_and_refused,
+                                " (%d withheld: worker liveness unreadable)" % withheld
+                                if withheld else ""))
+            if carried:
+                parts.append("%d PR(s) still undeliverable -- refused in an earlier pass, waiting"
+                             " out a refusal cooldown" % carried)
         if unread:
             parts.append("%d PR(s) with UNREADABLE checks" % unread)
+        # ⛔ THE ESCALATION IS ON THE VERDICT LINE, NOT ONLY IN THE LOG (#2710). A row refused N
+        # consecutive times is the one state this job used to hide behind a 45-min cooldown: the
+        # pass line said `refused-recorded=4`, which names the COUNT and not the row, so a reader
+        # could not tell which PR was stuck or what to repair. The row and its repair are the
+        # actionable half. ⛔ AND IT IS RESTATED ON EVERY PASS THE ROW SPENDS IN ITS COOLDOWN —
+        # deliberately, so the row cannot go quiet for 45 minutes — which at the shipped cadence
+        # (heartbeat every ~9 min, launchd every 30) is ~2-5 lines per episode, not one (review
+        # round 2, P2: this comment used to claim "it can only fire once per 45 min", which the
+        # sibling arm 40 lines below contradicts by inheriting the count on purpose).
+        if escalated:
+            # ⛔ THE TRUNCATION IS MARKED, NOT SILENT (review round 2, P3 — reproduced). This line is
+            # the surface a non-terminal reader parses, so naming 4 of 7 stuck rows with no marker
+            # under-reports the stuck set while looking complete.
+            _esc = " ".join(escalated[:4]) + (" +%d more" % (len(escalated) - 4)
+                                             if len(escalated) > 4 else "")
+            parts.append("ESCALATE %s refused %d+ consecutive times -- repair the named worktree(s)"
+                         % (_esc, REFUSAL_ESCALATE_AT))
         if blind_surface or blind_partial or blind_abandoned:
             parts.append("%d PR(s) HELD for an unusable changed-file list (%s)"
                          % (blind_surface + blind_partial + blind_abandoned, _surface_how(skipped)))
@@ -4811,24 +4999,91 @@ def run_pass(args, rubric_note: str = "") -> int:
                            issue_work=issue_work,
                            un_owned=len(un_owned), owned=len(owners),
                            undeliverable=undeliv, unreadable=unread,
+                           escalated=escalated,
                            surface_unreadable=blind_surface,
                            surface_partial=blind_partial,
                            surface_abandoned=blind_abandoned,
                            ownership_read_failed=own_err[:160] if own_err else "",
                            ownership_note=OWNERSHIP_NOTE[:160])
+    # ⛔ ACCOUNTING IS ITS OWN PASS OVER THE QUEUE, AND THAT IS THE FIX (review round 2, P1 --
+    # reproduced). The accounting below dispatches NOTHING, so it has no reason to live inside the
+    # dispatch loop and every reason not to: that loop `break`s on `dispatched >= budgets["total"]`,
+    # and with `budgets["total"] == 0` (a saturated box, or `--max 0`) it breaks on the FIRST row that
+    # is not in a cooldown. Measured: the same two rows -- one fresh, one `kind=refused, refusals=5`
+    # in its cooldown -- produce `EXIT rc=3` + `ESCALATE` when the refused row sorts first, and
+    # `dispatched 0 of 2 queued -- no capacity budget (...); budget=1` + `EXIT rc=0` with NO
+    # escalation when it sorts second. A verdict that depends on PR-number ordering is not a verdict,
+    # and `rc=0` over a stuck row is the defect this issue removes. Every classified row is therefore
+    # ACCOUNTED for first; the dispatch loop then covers only the rest.
+    covered = set()
     for p, action, why, cr in classified:
+        key = str(p["number"])
+        prev = st.get(key) or {}
+        # GUARD: cooldown, and never re-dispatch while the last one may still be live
+        if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
+            covered.add(key)
+            stalled["cooldown"] += 1
+            # ⛔ A ROW WAITING OUT A **REFUSAL** COOLDOWN IS NOT "NOTHING TO DO" (#2710, review
+            # round 1 P1/measured). The refusal branch below only runs on the pass that RECORDS the
+            # refusal; every pass inside the 45-minute cooldown returned here, so `undeliverable`
+            # stayed 0 and `_finish` returned EXIT_CLEAN -- `rc=0`, "readable, nothing to do" -- for
+            # 44 minutes of every 45, beside a PR stuck behind a durable refusal. Reproduced: a row
+            # `kind=refused, refusals=5` one minute into its cooldown printed
+            # `dispatched 0 of 1 queued -- cooldown=1` and `EXIT rc=0`. The measured five stalls
+            # were exactly this shape, so a fix that only refused on the recording pass would have
+            # left the loop the issue is about untouched.
+            #
+            # A `kind=spawn` row in its cooldown is a WORKER IN FLIGHT: that really is nothing to
+            # do (it will land or push by itself), so it stays out of this count -- the same
+            # distinction `worker-running` makes below.
+            if (prev.get("kind") or "") == "refused":
+                undeliverable += 1
+                # ⛔ COUNTED SEPARATELY, BECAUSE THE CAUSE IS DIFFERENT (#2710 review round 2, P2).
+                # `undeliverable` decides the CODE (3) on both arms, but its one sentence says "no
+                # worker accepted" -- a transport failure -- and on a cooldown pass NO ORDER WAS
+                # PLACED AT ALL. Left as one number, the verdict line sent an operator hunting a
+                # transport fault in a pass that attempted nothing.
+                carried += 1
+                # The row's OWN count is the escalation state, so the cooldown passes inherit it
+                # instead of going quiet until the next attempt (~45 min later).
+                if _as_int(prev.get("refusals")) >= REFUSAL_ESCALATE_AT:
+                    escalated.append("#%s" % key)
+                    log("ESCALATE #%s (%s): refused %d consecutive times, now waiting out a %d-min "
+                        "cooldown -- repair: %s"
+                        % (key, action, _as_int(prev.get("refusals")), COOLDOWN_S // 60,
+                           (prev.get("why") or "see the earlier refusal line")[:160]))
+        elif ((prev.get("kind") or "") == "refused"
+              # ⛔ A REFUSAL WHOSE COOLDOWN HAS EXPIRED IS STILL UNDELIVERED WORK WHEN THIS PASS
+              # CANNOT RETRY IT (review round 3 — reproduced). The arm above only covers a row
+              # INSIDE its cooldown. Six minutes after it expires, a SATURATED pass (`total == 0`, and
+              # `--max 0` by construction) broke out of the dispatch loop before reaching the row, so
+              # `undeliverable` stayed 0 and the pass printed
+              # `no capacity budget (...); budget=1` + `EXIT rc=0` over a `kind=refused` row AT the
+              # current head — the same false clean, reached 46 minutes later instead of never. The
+              # budget is the only reason the row is not retried here, so the budget is what decides.
+              and (dispatched >= budgets["total"]
+                   or spent[ACTION_CLASS.get(action, "fix")]
+                   >= budgets[ACTION_CLASS.get(action, "fix")])):
+            covered.add(key)
+            undeliverable += 1
+            carried += 1
+            if _as_int(prev.get("refusals")) >= REFUSAL_ESCALATE_AT:
+                escalated.append("#%s" % key)
+                log("ESCALATE #%s (%s): refused %d consecutive times and this pass has no budget to "
+                    "retry it (fix=%d review=%d left) -- repair: %s"
+                    % (key, action, _as_int(prev.get("refusals")), budgets["fix"],
+                       budgets["review"], (prev.get("why") or "see the earlier refusal line")[:160]))
+    for p, action, why, cr in classified:
+        key = str(p["number"])
+        if key in covered:
+            continue
+        prev = st.get(key) or {}
         if dispatched >= budgets["total"]:
             stalled["budget"] += 1
             break
         cls = ACTION_CLASS.get(action, "fix")
         if spent[cls] >= budgets[cls]:
             stalled["budget"] += 1
-            continue
-        key = str(p["number"])
-        prev = st.get(key) or {}
-        # GUARD: cooldown, and never re-dispatch while the last one may still be live
-        if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
-            stalled["cooldown"] += 1
             continue
         # ⛔ A LIVE WORKER IS IN FLIGHT, NOT A FREE SLOT -- REGARDLESS OF HEAD MOVEMENT. The
         # cooldown above is keyed on the head, so a worker that pushes re-arms dispatch at T+2min
@@ -4840,8 +5095,12 @@ def run_pass(args, rubric_note: str = "") -> int:
             # COUNTED, so the pass line names it (see `_finish`): "dispatched 0 of 3 queued —
             # nothing to do" is a false clean when the truth is "three PRs already have a worker".
             stalled["worker-running"] = stalled.get("worker-running", 0) + 1
+            # ⛔ BOTH NAMES ARE NAMED, because either one may be the one that answered: pre-#2725
+            # a worker is live under the unqualified `prd-<n>`, and printing only the qualified
+            # name sends the operator to a `$O/bg/prd-<repo-tag>-<n>.*` that nothing ever wrote
+            # (#2980 review cycle 6, P2).
             log("#%s (%s): worker %s is still running -- not spawning a second one"
-                % (key, action, worker_name(key)))
+                % (key, action, " / ".join(worker_names_for(key))))
             continue
         if live is None:
             # ⛔ UNANSWERABLE IS NOT "FREE" (see worker_live): skip, loudly. It clears as soon as
@@ -4882,17 +5141,45 @@ def run_pass(args, rubric_note: str = "") -> int:
                 # RECORDED ANYWAY: a refusal that does not clear by waiting (uncommitted work in
                 # the PR's own worktree, commits the head does not have) must reach a cooldown, or
                 # the pass logs the same line for ever and the PR is never dispatched and never
-                # visible in `--status`. NOTE the row consumes the class slot on the NEXT pass via
-                # pass_budgets(), so it must not also be charged to this pass's `spent`.
+                # visible in `--status`. ⛔ NOTE A REFUSAL HOLDS **NO** CLASS SLOT AT ALL (#2710):
+                # pass_budgets() skips `kind == "refused"` -- "a refusal consumed nothing, so it must
+                # not hold a cooldown and a budget slot" -- so the row is not charged on the next pass
+                # either, and it must not be charged to this pass's `spent`. (This comment said the
+                # opposite until #2708's rebase: it predates the #2710 fix and was false in tree.)
+                #
+                # ⛔ AND IT IS UNDELIVERED WORK, SO THE PASS MAY NOT EXIT 0 (#2710). `undeliverable`
+                # is "work that was legible and no worker took it", and a worktree refusal is
+                # exactly that: measured 2026-10-27, a pass whose ONLY outcome was four recorded
+                # refusals printed `dispatched 0 of 4 queued — refused-recorded=4` and exited 0 --
+                # which this file's own table defines as "readable, nothing to do". A launcher
+                # reading the code saw a quiet queue while four PRs were stuck, and the heartbeat
+                # printing `rc=0` beside them is how the loop ran silently for hours. Refusing is
+                # still correct; exiting CLEAN on it is not.
+                #
+                # ⛔ AND THE COUNT IS CARRIED ON THE ROW (#2710), because "once" and "every pass
+                # for two hours" need different responses. It is CONSECUTIVE BY CONSTRUCTION, and
+                # the reset is IN THIS EXPRESSION -- a moved head starts a NEW episode (review round
+                # 1, P2: nothing deletes a refused row when the head moves, so the first version
+                # escalated a row that had refused ONCE at the current head and printed a provenance
+                # that was not true). A spawn replaces the row (`kind=spawn`), which also resets it.
+                n_ref = (1 if (prev or {}).get("head") != p["headRefOid"]
+                         else _as_int((prev or {}).get("refusals")) + 1)
                 st[key] = {"action": action, "worker": worker_name(key), "kind": "refused",
-                           "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
+                           "head": p["headRefOid"], "at": ts(), "at_epoch": now(),
+                           "refusals": n_ref, "why": detail[:300]}
                 # COUNTED for the same reason as the two liveness skips above: a pass whose only
                 # outcome was refusals must not summarize itself as "nothing to do". The row makes
                 # the refusal durable (`--status`), and this makes the PASS LINE agree with it.
                 stalled["refused-recorded"] = stalled.get("refused-recorded", 0) + 1
+                undeliverable += 1
+                if n_ref >= REFUSAL_ESCALATE_AT:
+                    escalated.append("#%s" % key)
+                    log("ESCALATE #%s (%s): refused %d consecutive times at head %s -- this row is "
+                        "not going to clear by waiting; repair: %s"
+                        % (key, action, n_ref, (p["headRefOid"] or "?")[:12], detail[:200]))
                 log("#%s (%s): REFUSED and RECORDED -- this will not clear by waiting, so the row "
-                    "holds a %d-min cooldown; fix the cause: %s"
-                    % (key, action, COOLDOWN_S // 60, detail[:160]))
+                    "holds a %d-min cooldown (refusal %d of %d before escalation); fix the cause: %s"
+                    % (key, action, COOLDOWN_S // 60, n_ref, REFUSAL_ESCALATE_AT, detail[:160]))
             else:
                 log("#%s (%s): not dispatched -- retried on the next pass: %s"
                     % (key, action, detail[:160]))

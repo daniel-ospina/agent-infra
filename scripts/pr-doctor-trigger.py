@@ -175,6 +175,23 @@ PASS_MISSING = 127
 # re-measure a box that just said no, 30 times per backstop — the opposite of the #2721 discipline the
 # deferral exists to enforce. 3 (UNDELIVERED) is intentionally NOT here: it is a live condition the
 # retry floor bounds (see WHY A RETRY FLOOR), and 1/4/124/etc are failures.
+# ⚠️ AND SINCE #2710 (PR #2978, landed) 3 IS NOT ONLY A LIVE CONDITION (measured cost, accepted,
+# stated): it also fires on a DETERMINISTIC refusal — every order refused by a dirty worktree, or a queue parked under the
+# 45-min cooldown such a refusal creates — which no retry can clear. A refusal-parked box therefore
+# re-runs the whole pass every `--retry-min` (default 300 s) instead of consuming the 1800 s backstop:
+# ~6x the queue reads. ⛔ AND THAT EXTRA CADENCE IS **NOT** BOUNDED BY `COOLDOWN_S` (corrected in review:
+# the first draft of this comment said it was, and that was false). The bound is THE LIFE OF THE CAUSE:
+# when the 45-min row expires the pass retries the SAME deterministic refusal, writes a fresh
+# `kind: refused` row and exits 3 again, so `last_pass` stays 0 and a box with a dirty worktree runs a
+# full classify sweep every `--retry-min` FOR AS LONG AS THE WORKTREE STAYS DIRTY — ~12/hour, each one
+# spending `gh` calls per open PR on a box the repo's own MEMORY.md `[gh]` entry records hitting
+# GitHub's SECONDARY limit under fleet concurrency (and a rate-limited read flips the pass to 2, which
+# then consumes the backstop and hides the original refusal behind a read failure). That is accepted
+# rather than fixed because it is still far cheaper than the alternative this code had before #2710 —
+# counting the refusal as a PASS and waiting the full window while 18-25 PRs sat unmoving — and because
+# the real fix is to make the CAUSE visible, which `pr-doctor`'s own line and `status.json` now do.
+# Splitting the two causes here would need pr-doctor's own `reason`, which this trigger does not read;
+# NOT doing that is a decision, not an oversight.
 PASS_VERDICTS = (0, 2, 6)
 
 
