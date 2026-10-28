@@ -7341,8 +7341,12 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
     logged = []
     monkeypatch.setattr(pr, "log", logged.append)
     monkeypatch.setenv("O", str(d))
-    ok_d, detail, record = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
-    assert (ok_d, record) == (False, False), (ok_d, detail, record)
+    # ⛔ FOUR-TUPLE (#2291): `dispatch()` carries the GATE's axis as its fourth element, and
+    # `""` is the TRANSPORT verdict. A brief refusal (rc=80) consumed nothing but has NO
+    # capacity axis, so it must NOT arrive carrying one -- if it did, the pass would send an
+    # operator to wait for a box that is fine instead of repairing the gate that refused.
+    ok_d, detail, record, bound = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+    assert (ok_d, record, bound) == (False, False, ""), (ok_d, detail, record, bound)
     assert "rc=80" in detail, detail
     assert str(d / "brief-gate.sh") in detail, (
         "the refusal did not name WHICH brief-gate.sh judged the brief, so an operator is sent to "
@@ -7385,8 +7389,8 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
             shutil.copy(str(d / f), str(short / f))
         monkeypatch.setattr(pr, "ORCH_DIR", str(short))
         monkeypatch.setenv("O", str(short))
-        ok_s, detail_s, record_s = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
-        assert (ok_s, record_s) == (False, False), (ok_s, detail_s, record_s)
+        ok_s, detail_s, record_s, bound_s = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+        assert (ok_s, record_s, bound_s) == (False, False, ""), (ok_s, detail_s, record_s, bound_s)
         assert str(short / "brief-gate.sh") in detail_s[:160], (
             "a production-length `$O` does not fit the 160-char slice pr-doctor renders, so the "
             "operator is still sent to the copy they just fixed. detail[:200]=%r" % (detail_s[:200],))
