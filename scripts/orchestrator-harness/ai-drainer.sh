@@ -168,7 +168,7 @@ mkdir -p "$AI/state" "$AI/logs" "$LANES_DIR" 2>/dev/null || {
   printf 'ai-drainer: cannot create %s — every tick would be a silent no-op\n' "$AI/state" >&2
   exit 1
 }
-say() { printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG" 2>/dev/null; }
+log_line() { printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG" 2>/dev/null; }
 
 # Every numeric seam is validated: an unvalidated value turns a fence into an abort (`[ '' -lt 700 ]`
 # is a bash error) or a silent skip. A bad value falls back to the shipped default and says so.
@@ -178,19 +178,19 @@ _num() { # <name> <value> <default>
     # ⛔ `say … && printf` LOST THE DEFAULT when the log was unwritable (a full disk, a read-only
     # remount, `LOG` pointed at a directory): `say` returns its redirect's status, so the `&&`
     # short-circuits and the caller got `""` — which defeats the very fence this function is.
-    *[!0-9]*) say "WARN: ${1}='${2}' is not a whole number — using ${3}"; printf '%s' "$3" ;;
+    *[!0-9]*) log_line "WARN: ${1}='${2}' is not a whole number — using ${3}"; printf '%s' "$3" ;;
     *) printf '%s' "$((10#$2))" ;;
   esac
 }
 MIN_SWAP_MB="$(_num MIN_SWAP_MB "$MIN_SWAP_MB" 700)"
 MIN_MEM_FREE_MB="$(_num MIN_MEM_FREE_MB "$MIN_MEM_FREE_MB" 512)"
 LANE_MEM_MB="$(_num LANE_MEM_MB "$LANE_MEM_MB" 512)"
-[ "$LANE_MEM_MB" -ge 1 ] || { say "WARN: LANE_MEM_MB=0 — using 1"; LANE_MEM_MB=1; }
+[ "$LANE_MEM_MB" -ge 1 ] || { log_line "WARN: LANE_MEM_MB=0 — using 1"; LANE_MEM_MB=1; }
 MEM_BUDGET_PCT="$(_num MEM_BUDGET_PCT "$MEM_BUDGET_PCT" 75)"
-[ "$MEM_BUDGET_PCT" -ge 1 ] || { say "WARN: MEM_BUDGET_PCT=0 would allow no lanes at all — using 1"; MEM_BUDGET_PCT=1; }
-[ "$MEM_BUDGET_PCT" -le 100 ] || { say "WARN: MEM_BUDGET_PCT=$MEM_BUDGET_PCT > 100 — using 100"; MEM_BUDGET_PCT=100; }
+[ "$MEM_BUDGET_PCT" -ge 1 ] || { log_line "WARN: MEM_BUDGET_PCT=0 would allow no lanes at all — using 1"; MEM_BUDGET_PCT=1; }
+[ "$MEM_BUDGET_PCT" -le 100 ] || { log_line "WARN: MEM_BUDGET_PCT=$MEM_BUDGET_PCT > 100 — using 100"; MEM_BUDGET_PCT=100; }
 LPC_CEILING="$(_num LPC_CEILING "$LPC_CEILING" 8)"
-[ "$LPC_CEILING" -ge 1 ] || { say "WARN: LPC_CEILING=0 — using 1"; LPC_CEILING=1; }
+[ "$LPC_CEILING" -ge 1 ] || { log_line "WARN: LPC_CEILING=0 — using 1"; LPC_CEILING=1; }
 LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 3000)"
 # (No LANE_WAIT_MAX any more — but `LANE_TIMEOUT` still feeds the dispatcher, so it still gets the
 # validation that `30m` used to defeat: an unvalidated value made bash print "value too great for
@@ -199,8 +199,8 @@ RC_GRACE_S="$(_num RC_GRACE_S "${RC_GRACE_S:-}" 30)"
 PR_BUDGET="$(_num PR_BUDGET "$PR_BUDGET" 6)"
 SLICE_WIDTH="$(_num SLICE_WIDTH "$SLICE_WIDTH" 10)"
 SLICE_TOTAL="$(_num SLICE_TOTAL "$SLICE_TOTAL" 70)"
-[ "$SLICE_WIDTH" -ge 1 ] || { say "WARN: SLICE_WIDTH=0 — using 1"; SLICE_WIDTH=1; }
-[ "$SLICE_TOTAL" -ge 1 ] || { say "WARN: SLICE_TOTAL=0 — using 1"; SLICE_TOTAL=1; }
+[ "$SLICE_WIDTH" -ge 1 ] || { log_line "WARN: SLICE_WIDTH=0 — using 1"; SLICE_WIDTH=1; }
+[ "$SLICE_TOTAL" -ge 1 ] || { log_line "WARN: SLICE_TOTAL=0 — using 1"; SLICE_TOTAL=1; }
 [ "$SLICE_TOTAL" -ge "$SLICE_WIDTH" ] || SLICE_TOTAL="$SLICE_WIDTH"
 
 # ── CPU CEILING: DERIVED, exactly as the controller derives it ────────────────────────────────
@@ -218,7 +218,7 @@ _ncpu_probe() {
   case "$n" in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$((10#$n))" ;; esac
 }
 NCPU="$(_num NCPU "${NCPU:-}" "$(_ncpu_probe)")"
-[ "$NCPU" -ge 1 ] 2>/dev/null || { say "WARN: the core probe could not answer — assuming 4 cores"; NCPU=4; }
+[ "$NCPU" -ge 1 ] 2>/dev/null || { log_line "WARN: the core probe could not answer — assuming 4 cores"; NCPU=4; }
 MAX_LANES_DERIVED=$(( NCPU * 5 / 2 ))
 [ "$MAX_LANES_DERIVED" -ge 1 ] || MAX_LANES_DERIVED=10
 [ "$MAX_LANES_DERIVED" -le 100 ] || MAX_LANES_DERIVED=10
@@ -226,7 +226,7 @@ MAX_LANES="$(_num MAX_LANES "$MAX_LANES" "$MAX_LANES_DERIVED")"
 TARGET_PIN=""
 case "${TARGET_LANES:-}" in
   '') : ;;
-  *[!0-9]*) say "WARN: TARGET_LANES='${TARGET_LANES}' is not a whole number — deriving the target instead" ;;
+  *[!0-9]*) log_line "WARN: TARGET_LANES='${TARGET_LANES}' is not a whole number — deriving the target instead" ;;
   *) TARGET_PIN="$((10#$TARGET_LANES))" ;;
 esac
 
@@ -241,7 +241,7 @@ if [ -z "${DISPATCH:-}" ]; then
   done
 fi
 if [ -z "${DISPATCH:-}" ] || [ ! -f "$DISPATCH" ]; then
-  say "FAIL: no dispatcher found (looked at \$DISPATCH, $O/bg/bg-dispatch.sh, $SELF_DIR/nonblocking-dispatch.sh)"
+  log_line "FAIL: no dispatcher found (looked at \$DISPATCH, $O/bg/bg-dispatch.sh, $SELF_DIR/nonblocking-dispatch.sh)"
   exit 1
 fi
 # ⛔ THE CONTRACT IS THE DISPATCHER'S, NOT THIS SCRIPT'S. `nonblocking-dispatch.sh` writes
@@ -282,7 +282,7 @@ _lock_holder_alive() { # prints the live holder's pid, or nothing
 }
 if ! _lock_claim; then
   holder="$(_lock_holder_alive)" \
-    && { say "SKIP: drainer already running (pid $holder)"; exit 0; }
+    && { log_line "SKIP: drainer already running (pid $holder)"; exit 0; }
   pid="$(cat "$LOCK/pid" 2>/dev/null || printf '')"
   # ⛔ RECLAIM IS ATOMIC — `mv`, never `rm -rf` followed by `mkdir`. That pair is a race with a
   # measured failure: two ticks both fail to claim, both read the dead pid, both log "reclaiming"; A
@@ -290,14 +290,14 @@ if ! _lock_claim; then
   # ticks dispatch, and A's exit trap later removes B's lock so a third can start too. `mv` of a
   # directory succeeds for exactly ONE contender.
   if mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
-    say "STALE lock from pid ${pid:-?} — reclaimed atomically"
+    log_line "STALE lock from pid ${pid:-?} — reclaimed atomically"
     rm -rf "$LOCK.stale.$$" 2>/dev/null
   else
     holder="$(_lock_holder_alive)" \
-      && { say "SKIP: drainer already running (pid $holder)"; exit 0; }
-    say "SKIP: another tick won the lock reclaim — it dispatches, not this one"; exit 0
+      && { log_line "SKIP: drainer already running (pid $holder)"; exit 0; }
+    log_line "SKIP: another tick won the lock reclaim — it dispatches, not this one"; exit 0
   fi
-  _lock_claim || { say "SKIP: cannot take the lock at $LOCK"; exit 0; }
+  _lock_claim || { log_line "SKIP: cannot take the lock at $LOCK"; exit 0; }
 fi
 # ⛔ RELEASE IS OWNERSHIP-CHECKED. `rm -rf "$LOCK"` on any exit is how a finished tick deletes a
 # SUCCESSOR's lock: the signal path ran it, then the EXIT trap ran it again, and a tick that had claimed
@@ -374,12 +374,12 @@ _swap_pair_mb() { # prints "<total_mb> <free_mb>"
 lo100="${LOAD1_100:-}"
 [ -n "$lo100" ] || lo100="$(_load1_100)"
 case "$lo100" in
-  ''|*[!0-9]*) say "FAIL: the 1-minute load average could not be read (no /proc/loadavg, no sysctl vm.loadavg) and LOAD1_100 was not set — the load arm cannot be evaluated"; exit 1 ;;
+  ''|*[!0-9]*) log_line "FAIL: the 1-minute load average could not be read (no /proc/loadavg, no sysctl vm.loadavg) and LOAD1_100 was not set — the load arm cannot be evaluated"; exit 1 ;;
 esac
 mem_avail="${MEM_AVAIL_MB:-}"
 [ -n "$mem_avail" ] || mem_avail="$(_mem_avail_mb)"
 case "$mem_avail" in
-  ''|*[!0-9]*) say "FAIL: available memory could not be read (no /proc/meminfo MemAvailable, no vm_stat) and MEM_AVAIL_MB was not set — the memory ceiling cannot be evaluated"; exit 1 ;;
+  ''|*[!0-9]*) log_line "FAIL: available memory could not be read (no /proc/meminfo MemAvailable, no vm_stat) and MEM_AVAIL_MB was not set — the memory ceiling cannot be evaluated"; exit 1 ;;
   # `unreadable` lands here (a non-numeric seam), which is the arm that proves the fail-closed path.
 esac
 sw_pair=""
@@ -394,7 +394,7 @@ else
   sw_pair="$(_swap_pair_mb)"
 fi
 case "$sw_pair" in
-  ''|*[!0-9\ ]*) say "FAIL: swap could not be read (no /proc/meminfo SwapTotal/SwapFree, no sysctl vm.swapusage) and SWAP_TOTAL_MB/SWAP_FREE_MB were not set — the capacity floor cannot be evaluated"; exit 1 ;;
+  ''|*[!0-9\ ]*) log_line "FAIL: swap could not be read (no /proc/meminfo SwapTotal/SwapFree, no sysctl vm.swapusage) and SWAP_TOTAL_MB/SWAP_FREE_MB were not set — the capacity floor cannot be evaluated"; exit 1 ;;
 esac
 swap_total="${sw_pair% *}"
 swap_free="${sw_pair#* }"
@@ -412,7 +412,7 @@ SETTLED_FAIL=0
 # logged FAIL and the unit still exited 0, i.e. a false PASS on the one health surface.
 finish() { # [<rc>] — 1 when a lane from an earlier tick failed, whatever this tick decided
   if [ "$SETTLED_FAIL" -gt 0 ]; then
-    say "FAIL: $SETTLED_FAIL lane(s) from an earlier tick died without a clean status — see the FAIL lines above"
+    log_line "FAIL: $SETTLED_FAIL lane(s) from an earlier tick died without a clean status — see the FAIL lines above"
     exit 1
   fi
   exit "${1:-0}"
@@ -424,7 +424,7 @@ _rm_wt() { # <worktree path> — only ever called for a lane whose pid is PROVAB
   # remove" every tick (the shape that made 407 worktrees / 179 GB accumulate, #1095).
   git -C "$SEED_REPO" worktree remove --force "$1" >/dev/null 2>&1 && { rm -f "$1.lane-pid" 2>/dev/null; return 0; }
   rm -rf "$1" 2>/dev/null && { rm -f "$1.lane-pid" 2>/dev/null; return 0; }
-  say "WARN: could not remove the worktree at $1 — a later tick reaps it; it is named, not silent"
+  log_line "WARN: could not remove the worktree at $1 — a later tick reaps it; it is named, not silent"
 }
 _settle_lanes() {
   local f name pid rc rc_file g w
@@ -446,18 +446,18 @@ _settle_lanes() {
     done
     if [ -z "$rc" ]; then
       if [ "$RC_CAPABLE" = "1" ]; then
-        say "FAIL: lane $name (pid $pid) vanished with NO exit status at $rc_file after ${g}s — it was refused or lost, not completed (see $O/bg/$name.log)"
+        log_line "FAIL: lane $name (pid $pid) vanished with NO exit status at $rc_file after ${g}s — it was refused or lost, not completed (see $O/bg/$name.log)"
         SETTLED_FAIL=$((SETTLED_FAIL + 1))
       else
         # Not this tick's failure to report: the DISPATCHER records no status. Say so, every tick, so
         # the gap is visible in the log rather than being either invented or hidden.
-        say "WARN: lane $name (pid $pid) finished, but $DISPATCH records no exit status ($rc_file absent) — this tick cannot tell a completed lane from a refused spawn; ship a dispatcher that writes .rc"
+        log_line "WARN: lane $name (pid $pid) finished, but $DISPATCH records no exit status ($rc_file absent) — this tick cannot tell a completed lane from a refused spawn; ship a dispatcher that writes .rc"
       fi
     elif [ "$rc" != "0" ]; then
-      say "FAIL: lane $name (pid $pid) exited $rc — see $O/bg/$name.log"
+      log_line "FAIL: lane $name (pid $pid) exited $rc — see $O/bg/$name.log"
       SETTLED_FAIL=$((SETTLED_FAIL + 1))
     else
-      say "DONE: lane $name (pid $pid) finished rc=0"
+      log_line "DONE: lane $name (pid $pid) finished rc=0"
     fi
     rm -f "$f" "$LANES_DIR/$name.slice" 2>/dev/null
     w="$AI/wt-drainer-$name"
@@ -482,7 +482,7 @@ _reap_leftovers() {
     n=$((n + 1))
   done
   git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
-  [ "$n" -eq 0 ] || say "REAPED: $n leftover worktree(s) whose lane was gone"
+  [ "$n" -eq 0 ] || log_line "REAPED: $n leftover worktree(s) whose lane was gone"
 }
 
 # ── GUARD 2: THE CENSUS — how many lanes this box is ALREADY running ───────────────────────────
@@ -680,7 +680,7 @@ rm_worktrees_on_exit() { # [loud] — one aggregate line normally, per-lane deta
     pid="$(tr -dc '0-9' 2>/dev/null <"$LANES_DIR/$n.pid")"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       live=$((live + 1))
-      [ "${1:-}" = "loud" ] && say "LEAVE: lane $n (pid $pid) is still live — leaving worktree $AI/wt-drainer-$n in place (a later tick reaps it once the pid is gone)"
+      [ "${1:-}" = "loud" ] && log_line "LEAVE: lane $n (pid $pid) is still live — leaving worktree $AI/wt-drainer-$n in place (a later tick reaps it once the pid is gone)"
       continue
     fi
     w="$AI/wt-drainer-$n"
@@ -689,7 +689,7 @@ rm_worktrees_on_exit() { # [loud] — one aggregate line normally, per-lane deta
   # ⛔ NOT A WARN. Every lane a tick dispatches outlives it (the tick never waits), so "left in place"
   # is the NORMAL state — a WARN per lane per tick is how a reader learns to ignore the log. The
   # removal path is `_settle_lanes` on the next tick, once the pid is gone.
-  [ "$live" -eq 0 ] || [ "${1:-}" = "loud" ] || say "LEAVE: $live live lane(s) still working — their worktrees stay until the pid dies; the next tick reaps them"
+  [ "$live" -eq 0 ] || [ "${1:-}" = "loud" ] || log_line "LEAVE: $live live lane(s) still working — their worktrees stay until the pid dies; the next tick reaps them"
 }
 _on_signal() { beat 2>/dev/null; rm_worktrees_on_exit loud; exit 143; }
 trap 'beat 2>/dev/null; rm_worktrees_on_exit; cleanup' EXIT
@@ -718,7 +718,7 @@ fi
 if [ "$CENSUS_LAUNCHER" = "1" ] && [ "${lau_alive:-0}" -eq 0 ]; then
   _rows="$(wt_table 2>/dev/null | grep -c . || true)"
   if [ "${_rows:-0}" -eq 0 ] && [ -n "$(ls "$O"/state/run-*.sh 2>/dev/null | head -1)" ]; then
-    say "FAIL: the launcher census returned an EMPTY table while $O/state holds worker records — wt_table aborted, so the lane count is unknown and no lane may be added blind ($CENSUS_LAUNCHER_WHY)"
+    log_line "FAIL: the launcher census returned an EMPTY table while $O/state holds worker records — wt_table aborted, so the lane count is unknown and no lane may be added blind ($CENSUS_LAUNCHER_WHY)"
     finish 1
   fi
 fi
@@ -737,12 +737,12 @@ if [ "$swap_total" -eq 0 ]; then
 else
   swap_note="swap=${swap_free}MB/${swap_total}MB"
   if [ "$swap_free" -lt "$MIN_SWAP_MB" ]; then
-    say "SKIP: swap ${swap_free}MB < ${MIN_SWAP_MB}MB floor (of ${swap_total}MB)"; finish 0
+    log_line "SKIP: swap ${swap_free}MB < ${MIN_SWAP_MB}MB floor (of ${swap_total}MB)"; finish 0
   fi
 fi
 load_ceiling_100=$((NCPU * LPC_CEILING * 100))
 if [ "$lo100" -ge "$load_ceiling_100" ]; then
-  say "SKIP: load $(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') >= ${LPC_CEILING}x${NCPU} ($(awk -v l="$load_ceiling_100" 'BEGIN{printf "%.2f", l/100}')) — do not ADD work to a saturated box; $alive_src; $swap_note"
+  log_line "SKIP: load $(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') >= ${LPC_CEILING}x${NCPU} ($(awk -v l="$load_ceiling_100" 'BEGIN{printf "%.2f", l/100}')) — do not ADD work to a saturated box; $alive_src; $swap_note"
   finish 0
 fi
 read -r target cpu_ceil mem_ceil mem_pool <<<"$(_capacity_target)"
@@ -761,11 +761,11 @@ slices=$((SLICE_TOTAL / SLICE_WIDTH))
 # ⛔ BOUND THE LOOP'S OWN RANGE. Every other derived number here is clamped; `slices` was not, and
 # SLICE_TOTAL=10000000000 with SLICE_WIDTH=1 is a multi-billion-iteration walk WHILE HOLDING THE LOCK
 # — every later tick would then skip and the box would silently stop dispatching.
-[ "$slices" -le 64 ] || { say "WARN: SLICE_TOTAL/SLICE_WIDTH=$slices > 64 windows — using 64"; slices=64; }
+[ "$slices" -le 64 ] || { log_line "WARN: SLICE_TOTAL/SLICE_WIDTH=$slices > 64 windows — using 64"; slices=64; }
 n=$((target - lanes))
 [ "$n" -ge 0 ] || n=0
 if [ "$n" -gt "$slices" ]; then
-  say "NOTE: target−alive=$n exceeds the $slices distinct slice(s) (SLICE_TOTAL=$SLICE_TOTAL/SLICE_WIDTH=$SLICE_WIDTH) — dispatching at most $slices so one tick never reuses a window"
+  log_line "NOTE: target−alive=$n exceeds the $slices distinct slice(s) (SLICE_TOTAL=$SLICE_TOTAL/SLICE_WIDTH=$SLICE_WIDTH) — dispatching at most $slices so one tick never reuses a window"
   n="$slices"
 fi
 cursor="$(cat "$CURSOR" 2>/dev/null || printf '0')"
@@ -787,17 +787,17 @@ while [ "$k" -lt "$slices" ]; do
   k=$((k + 1))
 done
 if [ "$n" -gt "${#FREE[@]}" ]; then
-  [ "$n" -eq 0 ] || say "NOTE: $n lanes wanted but only ${#FREE[@]} of $slices window(s) are free (live lanes hold${held:- none yet}); dispatching ${#FREE[@]}"
+  [ "$n" -eq 0 ] || log_line "NOTE: $n lanes wanted but only ${#FREE[@]} of $slices window(s) are free (live lanes hold${held:- none yet}); dispatching ${#FREE[@]}"
   n="${#FREE[@]}"
 fi
 if [ "$n" -eq 0 ]; then
   # ⛔ ZERO IS A NORMAL ANSWER, and it is logged with the same arithmetic as a dispatch so nobody has
   # to guess why the box is quiet: at target, the ring is fully held by live lanes, or the target
   # itself is 0 because memory/cores say so.
-  say "SKIP: nothing to add — $target_why alive=$lanes ($alive_src) free_windows=${#FREE[@]}/$slices $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}')"
+  log_line "SKIP: nothing to add — $target_why alive=$lanes ($alive_src) free_windows=${#FREE[@]}/$slices $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}')"
   finish 0
 fi
-say "START: $target_why alive=$lanes ($alive_src) dispatching $n $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') slices=$slices free_windows=${#FREE[@]} dispatcher=$DISPATCH"
+log_line "START: $target_why alive=$lanes ($alive_src) dispatching $n $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') slices=$slices free_windows=${#FREE[@]} dispatcher=$DISPATCH"
 
 # ──8<── topup-loop ───────────────────────────────────────────────────────────────────────────
 # ⛔ THIS LOOP IS THE WHOLE CHANGE. Before it, `bash "$DISPATCH"` ran ONCE per tick and the tick
@@ -819,11 +819,11 @@ while [ "$i" -lt "$n" ]; do
   cp "$brief_lane" "$BRIEF" 2>/dev/null || true
   wt="$AI/wt-drainer-$NAME"
   if ! git -C "$SEED_REPO" worktree add -f "$wt" "$SEED_REF" >/dev/null 2>&1; then
-    say "FAIL: cannot create a worktree at $wt from $SEED_REPO ($SEED_REF) — dispatched ${i} of ${n} before this, their records stand"
+    log_line "FAIL: cannot create a worktree at $wt from $SEED_REPO ($SEED_REF) — dispatched ${i} of ${n} before this, their records stand"
     exit 1
   fi
   if ! bash "$DISPATCH" "$NAME" "$wt" "$brief_lane" "$LANE_TIMEOUT" >>"$LOG" 2>&1; then
-    say "FAIL: dispatcher refused ($DISPATCH) on $NAME — dispatched ${i} of ${n} before this, their records stand"
+    log_line "FAIL: dispatcher refused ($DISPATCH) on $NAME — dispatched ${i} of ${n} before this, their records stand"
     exit 1
   fi
   lane_pid="$(tr -dc '0-9' 2>/dev/null <"$O/bg/$NAME.pid")"
@@ -831,7 +831,7 @@ while [ "$i" -lt "$n" ]; do
   # claim a lane whose liveness can never be established, so its worktree would never be reapable and
   # its status never settled — the "dispatched and forgotten" shape.
   if [ -z "$lane_pid" ]; then
-    say "FAIL: dispatcher returned but $O/bg/$NAME.pid is missing or unreadable — this lane cannot be counted or settled, so this tick reports failure instead of a false clean"
+    log_line "FAIL: dispatcher returned but $O/bg/$NAME.pid is missing or unreadable — this lane cannot be counted or settled, so this tick reports failure instead of a false clean"
     exit 1
   fi
   # ⛔ THE SIDECAR AND THE WINDOW COME FIRST. The reaper keys on `<wt>.lane-pid` and the held-window
@@ -840,14 +840,14 @@ while [ "$i" -lt "$n" ]; do
   # nothing claims (re-issued to a second lane — the double-dispatch this change exists to prevent).
   printf '%s' "$lane_pid" >"$wt.lane-pid" 2>/dev/null   # the reaper's evidence (see _reap_leftovers)
   printf '%s' "$start" >"$LANES_DIR/$NAME.slice" 2>/dev/null \
-    || say "WARN: cannot write $LANES_DIR/$NAME.slice — a later tick cannot see that this window is held"
+    || log_line "WARN: cannot write $LANES_DIR/$NAME.slice — a later tick cannot see that this window is held"
   # ⛔ EVERY RECORD WRITE IS CHECKED. An unchecked failure here is the "dispatched and forgotten"
   # shape this file refuses elsewhere: a lane whose record cannot be written is counted by the census
   # while alive but its `.rc` is NEVER read (settle iterates the records), so it is never DONE, never
   # FAILed, and its worktree is never reaped by settle. The pidfile read a few lines above is already
   # a hard FAIL for the same reason.
   if ! printf '%s' "$lane_pid" >"$LANES_DIR/$NAME.pid" 2>/dev/null; then
-    say "FAIL: cannot write the lane record $LANES_DIR/$NAME.pid — the lane $NAME (pid $lane_pid) would never be counted or settled"
+    log_line "FAIL: cannot write the lane record $LANES_DIR/$NAME.pid — the lane $NAME (pid $lane_pid) would never be counted or settled"
     finish 1
   fi
   LANE_PIDS+=("$NAME")
@@ -856,13 +856,13 @@ while [ "$i" -lt "$n" ]; do
   # ones after it — and the next tick would re-dispatch them.
   cursor=$((cursor + 1))
   if ! printf '%s' "$cursor" >"$CURSOR" 2>/dev/null; then
-    say "FAIL: cannot write the slice cursor $CURSOR — the next tick would restart at this tick's first window and hand out windows live lanes already hold"
+    log_line "FAIL: cannot write the slice cursor $CURSOR — the next tick would restart at this tick's first window and hand out windows live lanes already hold"
     finish 1
   fi
-  say "DISPATCHED: lane $NAME pid=$lane_pid slice-offset=$start worktree=$wt"
+  log_line "DISPATCHED: lane $NAME pid=$lane_pid slice-offset=$start worktree=$wt"
   i=$((i + 1))
 done
 # ──8<── /topup-loop ──────────────────────────────────────────────────────────────────────────
 
-say "DONE: dispatched $n lane(s) to fill target=$target (alive was $lanes, now $((lanes + n))); the tick does not wait for them — the next tick counts them and tops up"
+log_line "DONE: dispatched $n lane(s) to fill target=$target (alive was $lanes, now $((lanes + n))); the tick does not wait for them — the next tick counts them and tops up"
 finish 0

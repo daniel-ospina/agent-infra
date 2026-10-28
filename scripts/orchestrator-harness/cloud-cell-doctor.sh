@@ -293,7 +293,7 @@ cell_stopped_midpass() { # 0 = a stop arrived since this pass began
 # ── liveness record ──────────────────────────────────────────────────────────────────────────────
 # One file per role, key=value, written ATOMICALLY (tmp + rename): a reader must see a whole pass
 # record or the previous one, never a half-written line that parses as "never ran".
-say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 log() {
   mkdir -p "$WORKER_LOG_DIR" 2>/dev/null || true
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$WORKER_LOG_DIR/doctor.log"

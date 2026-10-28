@@ -2683,12 +2683,13 @@ def test_the_deployed_lane_verdict_constant_points_at_the_real_vendor():
     if lv is None:
         pytest.skip("no deployed ~/.pi/agent/state/lane-verdict.py on this box — nothing measured")
     assert lv.JEV_URL == "https://api.typesafe.ai/v1/systemone", lv.JEV_URL
-    assert lv.JEV_MODEL == "jev-1.13.0", (
-        "the deployed words layer must vote with the model its CRITERIA were calibrated on: %r"
-        % (lv.JEV_MODEL,))
+    assert lv.JEV_MODEL == "jev-latest", (
+        "the deployed words layer must carry the SAME model as the tracked copies (the vendor "
+        "alias, by owner ruling 2026-10-27) — a copy left on the old pin is the partial-rotation "
+        "class this leg exists for: %r" % (lv.JEV_MODEL,))
 
 
-def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
+def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
     """The request `lane-actions.py` actually builds: `LV.JEV_URL` + `LV.JEV_MODEL` from the
     loaded module, a name-keyed `questions` map (one per lane, each with `instructions`), and a
     `choice` answer read back per lane.
@@ -2702,7 +2703,7 @@ def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
 
     LV = types.SimpleNamespace(
         JEV_URL="https://api.typesafe.ai/v1/systemone",
-        JEV_MODEL="jev-1.13.0",
+        JEV_MODEL="jev-latest",
         jev_key=lambda: "test-key",
         CRITERIA={"WORKING": "it is producing output right now"},
     )
@@ -2725,7 +2726,12 @@ def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
         seen["url"] = req.full_url
         seen["body"] = json.loads(req.data.decode())
         seen["auth"] = req.get_header("Authorization")
-        return _Resp({"model": "jev-1.13.0",
+        # ⛔ THE FIXTURE'S VALUES ARE DELIBERATELY DIFFERENT. The stub SENDS `jev-latest` and
+        # ANSWERS `jev-1.14.0`, precisely so that a `meta["model"]` regressed to
+        # `LV.JEV_MODEL` is caught by the assertion below (measured: that mutation reds it).
+        # Had the fixture ANSWERED the alias, both values would be identical and the assertion
+        # would be a tautology — it is the fixture, not the vest, that would be wrong.
+        return _Resp({"model": "jev-1.14.0",
                       "answers": {"lane_00": {"type": "choice", "choice": "DONE_READY",
                                               "confidence": 0.9}},
                       "usage": {"input_tokens": 10, "output_tokens": 2}})
@@ -2736,12 +2742,40 @@ def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
     answers, meta = LA.jev_step5(rows, LV)
 
     assert seen["url"] == "https://api.typesafe.ai/v1/systemone", seen["url"]
-    assert seen["body"]["model"] == "jev-1.13.0", seen["body"]
+    assert seen["body"]["model"] == "jev-latest", seen["body"]
     assert seen["auth"] == "Bearer test-key", seen["auth"]
     q = seen["body"]["questions"]["lane_00"]
     assert q["type"] == "choice" and isinstance(q["instructions"], str) and q["instructions"], q
     assert answers == {"demo": ("DONE_READY", 0.9)}, answers
     assert meta["source"] == "JEV" and meta["error"] is None, meta
+    # ⛔ THE ECHO, FOR THIS LAYER TOO. The alias makes the reported version the only evidence of
+    # what answered: delete `meta["model"] = d.get("model")` in `lane-actions.py` and the daily
+    # report header silently reads `Jev ?`, with nothing red. It is asserted here — against the
+    # version the fixture ANSWERED with, not the alias — so that removal is a failure.
+    assert meta["model"] == "jev-1.14.0" and meta["model"] != "jev-latest", (
+        "the report must carry the version the API ANSWERED with, not the alias sent: %r" % (meta,))
+
+
+def test_the_report_header_prints_the_echoed_version_not_the_alias():
+    """⛔ THE HEADER A HUMAN READS, ASSERTED (review 2026-10-27).
+
+    `render_md` builds `READ (Jev <model>: n of m lanes answered)` from `meta["model"]`, and
+    NOTHING asserted that string: the leg above pins `meta["model"]` -- the header's INPUT, not
+    the header -- and the only other mention of `render_md` in this file monkeypatches it away
+    (`:2152`). Measured: hardcoding the header to `jev-latest` left this file's failure set
+    byte-identically green. With a vendor ALIAS, the header is the ONLY place a reader learns
+    which version judged the lanes, so it is asserted here against a version the fixture
+    ANSWERED with, never the alias we send.
+    """
+    res = {
+        "meta": {"source": "JEV", "error": None, "model": "jev-1.14.0",
+                 "answered": 1, "asked": 1},
+        "n_lanes": 1, "procmap": "ok", "sampled": "",
+        "quiet": [], "idle": [], "wip": [], "wedged": [], "report": [],
+    }
+    md = LA.render_md(res, snapshot_age=5, source="test")
+    assert "Jev jev-1.14.0" in md, md
+    assert "Jev jev-latest" not in md, md
 
 
 def _deployed_constants(filename):
@@ -2769,7 +2803,7 @@ def _deployed_constants(filename):
 
 
 @pytest.mark.parametrize("filename", ["turn-classify.py", "ask-owner.py"])
-def test_the_deployed_scripts_carry_the_real_vendor_and_the_pin(filename):
+def test_the_deployed_scripts_carry_the_real_vendor_and_the_model(filename):
     """⛔ THE FILES THE BEAT ACTUALLY EXECUTES. The sweep list names
     `~/.pi/agent/scripts/{turn-classify,ask-owner}.py`, and nothing pinned them: a rotation that
     updated the repo and missed the deployed copy would keep the fleet on the lookalike host with
@@ -2782,4 +2816,4 @@ def test_the_deployed_scripts_carry_the_real_vendor_and_the_pin(filename):
     if consts is None:
         pytest.skip("no ~/.pi/agent/scripts/%s on this box — nothing measured" % filename)
     assert consts.get("JEV_URL") == "https://api.typesafe.ai/v1/systemone", (filename, consts)
-    assert consts.get("JEV_MODEL") == "jev-1.13.0", (filename, consts)
+    assert consts.get("JEV_MODEL") == "jev-latest", (filename, consts)

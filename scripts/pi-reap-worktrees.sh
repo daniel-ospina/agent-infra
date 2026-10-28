@@ -487,7 +487,7 @@ EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; log "REAP $*"; }
+log_line() { printf '%s\n' "$*"; log "REAP $*"; }
 log() { printf '%s\n' "$*" >>"$REAP_WT_LOG" 2>/dev/null || true; }
 
 now_epoch() {
@@ -2158,21 +2158,21 @@ run() {
     self_pid_tree_load
     cwd_probe_load
 
-    say "rules: 1 live-holder KEEP · 2 dirty KEEP · 3 ancestor-of-main REMOVE · 4 PR-MERGED REMOVE ·"
-    say "       5 PR-CLOSED KEEP(named) · 6 no-PR KEEP(named) · 7 younger-than-${REAP_WT_MIN_AGE_MINUTES}m KEEP ·"
-    say "       P pre-existing gates (main/self/locked/open-PR/revocable-ref). Every row prints rule= and proof=."
-    say ""
-    say "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
-    say "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
-    say "      cache on SOME machines (APFS clonefile, or a hardlink) and is REAL on others"
-    say "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
-    say "      +0.6 MB when cloned; du 5,647 MiB vs df 5.90 GB real, ratio 1.004). The deliverable"
-    say "      win is FILE COUNT. Real bytes are measured per machine, never inferred from du:"
+    log_line "rules: 1 live-holder KEEP · 2 dirty KEEP · 3 ancestor-of-main REMOVE · 4 PR-MERGED REMOVE ·"
+    log_line "       5 PR-CLOSED KEEP(named) · 6 no-PR KEEP(named) · 7 younger-than-${REAP_WT_MIN_AGE_MINUTES}m KEEP ·"
+    log_line "       P pre-existing gates (main/self/locked/open-PR/revocable-ref). Every row prints rule= and proof=."
+    log_line ""
+    log_line "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
+    log_line "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
+    log_line "      cache on SOME machines (APFS clonefile, or a hardlink) and is REAL on others"
+    log_line "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
+    log_line "      +0.6 MB when cloned; du 5,647 MiB vs df 5.90 GB real, ratio 1.004). The deliverable"
+    log_line "      win is FILE COUNT. Real bytes are measured per machine, never inferred from du:"
     # The probe is FARMED (pi-bootstrap/setup.sh fleet_srcs) because cells run this reaper from
     # $DEST/scripts, not from a checkout — so a repo-relative `scripts/...` hint would not resolve
     # where this line is actually read. Name the SIBLING this script was invoked as (#1858 review P2).
-    say "      bash ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh --help   (#1851)"
-    say ""
+    log_line "      bash ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh --help   (#1851)"
+    log_line ""
 
     local elapsed=0 crumb verdict reason detail rc
     # The budget clock starts HERE, not at `now`: see the BOUNDEDNESS note in
@@ -2182,8 +2182,8 @@ run() {
         [ -n "$p" ] || continue
         elapsed="$(( $(now_epoch) - START_EPOCH ))"
         if [ "$REAP_WT_BUDGET_SECONDS" -gt 0 ] && [ "$elapsed" -ge "$REAP_WT_BUDGET_SECONDS" ]; then
-            say "preserve $p"
-            say "         reason=deferred  pass budget ${REAP_WT_BUDGET_SECONDS}s exhausted — not classified"
+            log_line "preserve $p"
+            log_line "         reason=deferred  pass budget ${REAP_WT_BUDGET_SECONDS}s exhausted — not classified"
             log "DEFERRED $p (budget)"
             # CRITICAL: a deferred record is UNCLASSIFIED, so we cannot know
             # whether it is also prunable. A global `git worktree prune` would
@@ -2210,7 +2210,7 @@ run() {
             if [ "$MODE" = apply ]; then
                 elapsed="$(( $(now_epoch) - START_EPOCH ))"
                 if [ "$REAP_WT_BUDGET_SECONDS" -gt 0 ] && [ "$elapsed" -ge "$REAP_WT_BUDGET_SECONDS" ]; then
-                    say "         NOT REMOVED (pass budget exhausted) — will be re-classified next pass"
+                    log_line "         NOT REMOVED (pass budget exhausted) — will be re-classified next pass"
                     log "DEFERRED-REMOVE $p (budget)"
                     # Its removal did not happen, so the end-of-pass prune must
                     # not run either: for a `prunable` row the prune IS the
@@ -2226,13 +2226,13 @@ run() {
                     # also be prunable. REMOVED is incremented ONLY if the
                     # prune actually ran — otherwise the report would claim a
                     # removal that never happened.
-                    say "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
+                    log_line "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
                     log "PRUNE-PENDING $p"
                 else
                     remove_one "$p"; rc=$?
                     case "$rc" in
                         0)
-                            say "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
+                            log_line "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
                             REMOVED=$((REMOVED + 1))
                             log "REMOVED $p" ;;
                         2)
@@ -2244,11 +2244,11 @@ run() {
                             # `ignored-artifact` mean the checkout changed,
                             # while `status-*` means the probe could not be
                             # evaluated — different operator actions.
-                            say "         PRESERVED — removal-time clean re-check not clean (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
+                            log_line "         PRESERVED — removal-time clean re-check not clean (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
                             LATE_PRESERVE=$((LATE_PRESERVE + 1))
                             log "PRESERVED-LATE $p" ;;
                         *)
-                            say "         REMOVE-FAILED — see the log ($REAP_WT_LOG)"
+                            log_line "         REMOVE-FAILED — see the log ($REAP_WT_LOG)"
                             FAILED=$((FAILED + 1)) ;;
                     esac
                 fi
@@ -2353,8 +2353,8 @@ run() {
             log "PRUNE-RECHECK-FAILED (re-read, scratch file, or comparison unavailable — fail-closed, global prune skipped)"
         elif [ -n "$PRUNE_NEWLY" ]; then
             PRUNE_BLOCKED=1
-            say ""
-            say "⚠️  $(printf '%s\n' "$PRUNE_NEWLY" | wc -l | tr -d ' ') record(s) became prunable DURING this pass, after they were classified — the global prune is skipped."
+            log_line ""
+            log_line "⚠️  $(printf '%s\n' "$PRUNE_NEWLY" | wc -l | tr -d ' ') record(s) became prunable DURING this pass, after they were classified — the global prune is skipped."
             while IFS= read -r _nl; do
                 [ -n "$_nl" ] || continue
                 log "PRUNE-RECHECK-BLOCK $_nl (became prunable after classification — not an intended reclaim target)"
@@ -2363,12 +2363,12 @@ run() {
         # the pass's snapshot is authoritative again for anything that follows
         WT_LIST="$PRUNE_START_LIST"
         if [ "$PRUNE_BLOCKED" = 1 ]; then
-            say ""
-            say "⚠️  skipped \`git worktree prune\`: ${PRUNE_WANTED} reclaimable gone-checkout record(s) were"
-            say "    left registered, because a record this pass did not classify (deferred), did"
-            say "    preserve, or became prunable only after classification — and a global prune"
-            say "    has no path filter."
-            say "    Nothing was lost: those records are re-classified on the next pass."
+            log_line ""
+            log_line "⚠️  skipped \`git worktree prune\`: ${PRUNE_WANTED} reclaimable gone-checkout record(s) were"
+            log_line "    left registered, because a record this pass did not classify (deferred), did"
+            log_line "    preserve, or became prunable only after classification — and a global prune"
+            log_line "    has no path filter."
+            log_line "    Nothing was lost: those records are re-classified on the next pass."
             log "PRUNE-SKIPPED wanted=$PRUNE_WANTED (a deferred, preserved, or mid-pass-prunable record may be prunable)"
         elif run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" worktree prune; then
             REMOVED=$((REMOVED + PRUNE_WANTED))
@@ -2382,11 +2382,11 @@ run() {
         fi
     fi
 
-    say ""
+    log_line ""
     if [ "$MODE" = dry-run ]; then
-        say "DRY-RUN — nothing removed. Re-run with --apply to remove the 'remove' rows."
+        log_line "DRY-RUN — nothing removed. Re-run with --apply to remove the 'remove' rows."
     else
-        say "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED"
+        log_line "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED"
     fi
     summary_line
     print_footer "$(now_epoch)"

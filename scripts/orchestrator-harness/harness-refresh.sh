@@ -141,7 +141,7 @@ done
 # record, and neither is a fallback for the other.)
 [ -n "$PIN" ] || PIN="${HARNESS_PIN:-${CELL_HOME:-${HOME:-}}/.pi/agent/state/HARNESS-PIN}"
 
-say() { [ "$QUIET" -eq 1 ] || echo "$@"; }
+log_line() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 # ── bounded execution, because this runs at the top of the controller's cycle ──────────────────────
 # ⛔ `timeout` IS GNU COREUTILS AND macOS SHIPS IT NOWHERE (`gtimeout` only with Homebrew coreutils), so a
 # bare `timeout` call is rc=127 on the Mac half of the fleet — which the `if !` below would read as a
@@ -187,7 +187,7 @@ refuse() { # <relation> <exit> <running> <pin> <prose…>
   local rel="$1" rc="$2" run="$3" pn="$4"; shift 4
   record "$rel" "$run" "$(short "${TIP:-}")" "$pn" refused
   echo "REFUSE $rel: $*" >&2
-  say "REFUSE $rel: $*"
+  log_line "REFUSE $rel: $*"
   exit "$rc"
 }
 
@@ -569,7 +569,7 @@ if [ "$FETCH" -eq 1 ]; then
         # A failed fetch is NOT fatal while the ref still resolves locally — pinning a commit needs no
         # network — but it must not be reported as freshness either (check-deployed-drift.sh's rule).
         FETCH_STATE="stale"
-        say "harness-refresh: WARNING — could not fetch $REF (network, auth or a timeout); comparing the LOCAL ref, which may be stale" >&2
+        log_line "harness-refresh: WARNING — could not fetch $REF (network, auth or a timeout); comparing the LOCAL ref, which may be stale" >&2
       else
         _fh="$(git -C "$REPO" rev-parse --verify --quiet "refs/harness-refresh/$_fb^{commit}" 2>/dev/null)"
         if [ -n "$_fh" ]; then
@@ -578,7 +578,7 @@ if [ "$FETCH" -eq 1 ]; then
           # The fetch succeeded and wrote nothing this script can read. Falling back to the local ref while
           # claiming `ok` is the stale-comparison-as-fresh shape all of this exists to refuse.
           FETCH_STATE="stale"
-          say "harness-refresh: WARNING — $REF fetched but refs/harness-refresh/$_fb could not be read back; comparing the LOCAL ref, which may be stale" >&2
+          log_line "harness-refresh: WARNING — $REF fetched but refs/harness-refresh/$_fb could not be read back; comparing the LOCAL ref, which may be stale" >&2
         fi
       fi ;;
     *)
@@ -589,7 +589,7 @@ if [ "$FETCH" -eq 1 ]; then
       # same box read through origin/main printed BEHIND. Same rule as a failed fetch: say it, and carry
       # it in the record.
       FETCH_STATE="local"
-      say "harness-refresh: WARNING — '$REF' is not an origin/* ref, so nothing was fetched for it: comparing the LOCAL ref, which may be stale (use origin/main)" >&2 ;;
+      log_line "harness-refresh: WARNING — '$REF' is not an origin/* ref, so nothing was fetched for it: comparing the LOCAL ref, which may be stale (use origin/main)" >&2 ;;
   esac
 fi
 TIP=""
@@ -696,9 +696,9 @@ if [ "$REL" = current ]; then
   if [ "$PIN_SHA" = "$TIP" ] && [ "$RESEED" = 0 ]; then
     record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" none
     if [ "$_rel" = restart-pending ]; then
-      say "harness RESTART-PENDING: the pin names $REF ($(short "$TIP")) but the controller executing now is not provably on it (running=$RUN_SHORT, from $RUNNING_FROM) — the pin advances the NEXT launch, and nothing is re-deployed under a live controller"
+      log_line "harness RESTART-PENDING: the pin names $REF ($(short "$TIP")) but the controller executing now is not provably on it (running=$RUN_SHORT, from $RUNNING_FROM) — the pin advances the NEXT launch, and nothing is re-deployed under a live controller"
     else
-      say "harness current: $RUN_SHORT == $REF ($(short "$TIP")) — pin already names it"
+      log_line "harness current: $RUN_SHORT == $REF ($(short "$TIP")) — pin already names it"
     fi
     exit 0
   fi
@@ -717,7 +717,7 @@ if [ "$REL" = current ]; then
     # pin it printed the short sha CONCATENATED with the full one (`was 3efaead5178433efaead517…`), in the
     # one operator-facing line that says what the record used to hold. Pick ONE of the two, never both.
     _prev="empty/absent"; [ -n "$PIN_SHA" ] && _prev="$PIN_SHORT"
-    say "harness pin MENDED: $PIN was $_prev; this box deploys $DEP_SHORT, which IS $REF — recorded it"
+    log_line "harness pin MENDED: $PIN was $_prev; this box deploys $DEP_SHORT, which IS $REF — recorded it"
     exit 11
   fi
   # current pin + --re-seed (or a stale/absent pin + --re-seed): NOT a no-op and NOT a mend. Fall
@@ -754,7 +754,7 @@ case "$MAT" in
     MAT="$REPO/scripts/cloud-cell-supervisor.sh"; MAT_FROM="HARNESS_ADOPT=1" ;;
 esac
 if [ "$ADOPT" = 0 ]; then MAT=""; MAT_FROM="--no-adopt"; fi
-[ -n "$MAT" ] && [ ! -f "$MAT" ] && { say "harness-refresh: WARNING — the materialiser '$MAT' ($MAT_FROM) does not exist; treating this box as unmaterialisable" >&2; MAT=""; }
+[ -n "$MAT" ] && [ ! -f "$MAT" ] && { log_line "harness-refresh: WARNING — the materialiser '$MAT' ($MAT_FROM) does not exist; treating this box as unmaterialisable" >&2; MAT=""; }
 
 if [ -z "$MAT" ]; then
   # ⛔ A RE-SEED REQUEST THAT CANNOT BE CARRIED OUT IS A REFUSAL ON EVERY RELATION, NOT JUST `current`
@@ -787,7 +787,7 @@ if [ -z "$MAT" ]; then
       "--re-seed was requested, but this box has NO materialiser (set HARNESS_MATERIALISER, or leave it unset on a pin-per-commit cell that sets HARNESS_PIN_FILE + CELL_HOME), so \$O was NOT re-seeded and nothing was touched. $_relnote"
   fi
   record behind "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" unmaterialised
-  say "harness BEHIND: deploys $DEP_SHORT (from $DEPLOYED_FROM), $REF is $(short "$TIP") — on $REF's line but older, and this box has NO materialiser (set HARNESS_MATERIALISER, e.g. cloud-cell-supervisor.sh, which pins per commit and re-seeds \$O atomically; or, on a pin-per-commit cell — HARNESS_PIN_FILE + CELL_HOME — leave it unset and the supervisor in \$REPO is used). The pin was NOT advanced: a pin naming a tree that does not exist reads as current to everything downstream."
+  log_line "harness BEHIND: deploys $DEP_SHORT (from $DEPLOYED_FROM), $REF is $(short "$TIP") — on $REF's line but older, and this box has NO materialiser (set HARNESS_MATERIALISER, e.g. cloud-cell-supervisor.sh, which pins per commit and re-seeds \$O atomically; or, on a pin-per-commit cell — HARNESS_PIN_FILE + CELL_HOME — leave it unset and the supervisor in \$REPO is used). The pin was NOT advanced: a pin naming a tree that does not exist reads as current to everything downstream."
   exit 25
 fi
 
@@ -951,5 +951,5 @@ if [ "$RESEED" = 1 ]; then
 else
   _inflight="IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
 fi
-say "harness $_word: $DEP_SHORT $_sep $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause; $_dep_clause — $_rest_clause; $_inflight"
+log_line "harness $_word: $DEP_SHORT $_sep $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause; $_dep_clause — $_rest_clause; $_inflight"
 exit 10
