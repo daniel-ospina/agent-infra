@@ -27,7 +27,9 @@
 # it is idle" — is an ORDER this file is the missing half of; it is quoted in that file, not here.)
 #
 # ── WHAT THE PROBE RETURNS, AND WHY EACH FIELD IS THERE ─────────────────────────────────────────
-#   host=<name>            the box's own identity (`hostname -s`, or CAP_HOST). The KEY of a record.
+#   host=<name>            the box's own identity: RESOLVED, never assumed (CAP_HOST → the control
+#                          plane's assigned name → `hostname` + a persisted instance token). The KEY of a
+#                          record, and the thing that must be UNIQUE per box — see IDENTITY below.
 #   ncpu=<int>             cores, so load can be compared ACROSS boxes of different sizes.
 #   load1=<int>            1-min load average x100 (integer arithmetic: bash 3.2 has no floats).
 #   lpc=<int>              LOAD PER CPU x100 — the one capacity number the rule compares. 29.82 on 8
@@ -140,10 +142,12 @@
 #   cap_publish "$REPO" "$rec"                     # best-effort; rc!=0 => peers cannot see this box
 #   fleet="$(cap_read_fleet "$REPO")"              # every box's newest record, one per line; rc!=0 => UNREADABLE
 #   cap_place "$(cap_host)" "$fleet" <<<""         # 0 = place=…, 1 = refuse bound=…, 2 = usage
+#   cap_host                                       # THIS box's key (resolved, never assumed — see IDENTITY)
+#   cap_inst                                       # THIS box's stable instance token (the publish scope)
 #   cap_fork_bound "$rec"                          # the FORK bound that refuses this record ('' = none)
 #   cap_fork_headroom "$rec"                       # spare processes, or `unbounded`
 #
-# USAGE (CLI)   bash capacity.sh probe|fork|place|fleet|publish [args]
+# USAGE (CLI)   bash capacity.sh probe|fork|place|fleet|publish|identity [args]
 # EXIT          0 decided · 1 refused (a REFUSAL IS NOT A FAILURE, it is the answer) · 2 cannot answer
 #               254 the read itself COULD NOT FORK (bash terminates on a failed fork; see FORK HEADROOM)
 
@@ -168,17 +172,225 @@ CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STA
 # counts LANES, it asks whether this box can still SPAWN.
 CAP_MIN_FORK_HEADROOM="${CAP_MIN_FORK_HEADROOM:-200}"
 CAP_NS="${CAP_NS:-refs/boxes}"                 # the namespace peers publish under
-CAP_HOST="${CAP_HOST:-}"                       # identity seam (default: hostname -s)
+CAP_HOST="${CAP_HOST:-}"                       # identity seam — EXPLICIT override, used verbatim
 CAP_NOW="${CAP_NOW:-}"                         # clock seam (default: date +%s)
+# The identity/transport seams (agent-infra#2707). Every one is overridable so the suite can drive two
+# DIFFERENT boxes on one test machine — which is exactly what the pre-existing suite could not do, and
+# why it never caught the collapse: it handed production's default identity path a CAP_HOST.
+CAP_BOX_STATE="${CAP_BOX_STATE:-}"              # identity token + name cache + publish witness
+CAP_HOSTNAME="${CAP_HOSTNAME:-}"                # hostname seam (default: hostname -s)
+CAP_CMUX="${CAP_CMUX:-cmux}"                    # control-plane read seam (empty/set-to-nothing: off)
+CAP_INST="${CAP_INST:-}"                        # instance-token seam (default: persisted per box)
+CAP_ID_TTL="${CAP_ID_TTL:-86400}"               # seconds before the cached cell name is re-read
+# ⚠️ STATED RESIDUAL: the control-plane read is a subprocess (`cmux self --json`, ~0.2 s measured) that
+# runs only when the name cache is MISSING or older than CAP_ID_TTL, so a cold box pays for it once and
+# every later call is a builtin file read. It is not independently bounded by a timeout — `capacity.sh`
+# has no portable one (`timeout` is absent on macOS) — so a `cmux` that HANGS on a disconnected box
+# would stall that cycle's probe. Set `CAP_CMUX=` (empty) to disable the read entirely.
 
 cap_now() {
   if [ -n "${CAP_NOW:-}" ]; then printf '%s' "$CAP_NOW"; else date +%s; fi
 }
 
+# ── IDENTITY: ONE KEY PER BOX, AND A KEY THAT CANNOT BE SILENTLY SHARED (agent-infra#2707) ─────
+# ⛔ MEASURED DEFECT (2026-10-24, all three cloud cells): `hostname -s` is `cmux` on EVERY cell (same
+# image, same /etc/hostname), so `cap_host` returned ONE key for three different boxes. Every cell then
+# published under `refs/boxes/cmux/…`, and `cap_publish` prunes `refs/boxes/<its host>/*` on every
+# publish — so each publish DELETED its peers' records. `cap_read_fleet` returned one box, and
+# `cap_place` compared against a fleet of one and always answered `place=<self>` (cell-4's own cycle
+# record: `placed_on=cmux`). A fleet view that collapses is worse than no fleet view: it looks like a
+# measurement, and the planner that was meant to move work had nothing to move it to.
+#
+# SO A BOX'S KEY IS RESOLVED, NEVER ASSUMED — each source is used only for what it can prove:
+#   1. `CAP_HOST` — EXPLICIT. A deploy may name the box (`CAP_HOST=pi-cell-4`); the operator is
+#      asserting the identity, so it is used VERBATIM (no suffix; `place=pi-cell-4` stays readable).
+#   2. THE NAME THE CONTROL PLANE ASSIGNED (`cmux self --json` → `machine.name`, e.g. `pi-cell-3`):
+#      readable, per-VM (a cloned image cannot carry it), readable locally with no peer access and no
+#      credential on the box. CACHED in the state dir, because the probe must not fork/network on a box
+#      already starved; and a cached name is preferred over the fallback EVEN WHEN the control plane is
+#      unreachable, so an outage cannot flip a box's identity (two identities = two records = one box
+#      counted twice, and `placed_on` moving under the operator).
+#   3. `hostname` + a STABLE INSTANCE TOKEN. A hostname is NOT proof of uniqueness — that is the whole
+#      defect — so a box that cannot be named by its control plane gets a discriminator appended
+#      (`cmux-1a2b3c4d5e6f`). The token is ISSUED AND PERSISTED on first use (so it is unique by
+#      construction and stable across reboots and cycles); only a box whose state cannot be written
+#      falls back to a DERIVED value (the VM id, then /etc/machine-id), because a token that changes
+#      every cycle invents a new box every cycle — the collapse in the other direction.
+#
+# ⛔ AND UNIQUENESS IS STILL NOT ASSUMED — a perfect identity is not guaranteed, so the PROTOCOL does
+# not depend on one:
+#   * every ref carries the instance token as its OWN path component,
+#     `refs/boxes/<host>/<inst>/<reading>`, and `cap_publish` prunes only `<host>/<inst>/*` — a
+#     namespace no other box can name. A peer's record is unreachable by a delete, not merely
+#     unmatched (before this, the prune pattern was host-scoped and that is what ate the peers).
+#   * the READER counts PUBLISHERS per host, so two boxes under one key are two RECORDS and are
+#     REPORTED (`collision=1`) rather than the newest silently winning.
+#   * the PUBLISHER keeps a witness of the last ref it wrote: a ref in its own namespace that is NEWER
+#     than its own last publish is not its own — another box shares the key. Then it stops pruning.
+#   * a collided record is INELIGIBLE (`cap_bound_hit` → `identity_collision`), so `cap_place` refuses
+#     to decide on a fleet it cannot distinguish instead of deciding on a fleet of one. That is the
+#     fail-closed direction: an unidentifiable box never takes work.
+cap_box_state_dir() {
+  local d="${CAP_BOX_STATE:-}"
+  [ -n "$d" ] || d="${HOME:-/tmp}/.pi/agent/state/cap-box"
+  printf '%s' "$d"
+}
+
+# _cap_state_read <file> <key> -> value, rc 1 when absent/unreadable. A BUILTIN `read` loop on
+# purpose: this runs on a box that may be fork-starved, and the identity must still be readable there.
+_cap_state_read() {
+  local f="${1:-}" k="${2:-}" line v out=""
+  case "$k" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  [ -r "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "$k="*) v="${line#"$k="}"; out="$v" ;; esac
+  done < "$f"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# _cap_state_write <file> <line>… — whole-file (the state is three short lines, and a half-written
+# identity is worse than an absent one: an absent token is RE-DERIVED, a truncated one is a new box).
+_cap_state_write() {
+  local f="${1:-}" d line
+  shift 2>/dev/null || true
+  d="${f%/*}"
+  [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || return 1
+  : > "$f" 2>/dev/null || return 1
+  for line in "$@"; do [ -n "$line" ] && { printf '%s\n' "$line" >> "$f" || return 1; }; done
+  return 0
+}
+
+# _cap_identity_set <key> <value> — update ONE key of the identity state, preserving the others.
+_cap_identity_set() {
+  local k="${1:-}" v="${2:-}" f cell at inst
+  f="$(cap_box_state_dir)/identity"
+  cell="$(_cap_state_read "$f" cell)" || cell=""
+  at="$(_cap_state_read "$f" at)" || at=""
+  inst="$(_cap_state_read "$f" inst)" || inst=""
+  case "$k" in cell) cell="$v" ;; at) at="$v" ;; inst) inst="$v" ;; esac
+  _cap_state_write "$f" "${cell:+cell=$cell}" "${at:+at=$at}" "${inst:+inst=$inst}"
+}
+
+# _cap_plane_field <name|id> — the control plane's own record of THIS machine. Best-effort by design:
+# every failure path returns rc 1 and the caller falls through to the next identity source.
+_cap_plane_field() {
+  local want="${1:-}" bin json v=""
+  bin="${CAP_CMUX:-cmux}"
+  [ -n "$bin" ] || return 1
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  json="$("$bin" self --json 2>/dev/null)" || return 1
+  [ -n "$json" ] || return 1
+  # `"machine":{` is the anchor: the top level ALSO carries a `name` (the slug, `shiny-rose-ocelot`).
+  case "$want" in
+    name) v="$(printf '%s' "$json" | sed -n 's/.*"machine":{[^}]*"name":"\([^"]*\)".*/\1/p')" ;;
+    id)   v="$(printf '%s' "$json" | sed -n 's/.*"machine":{[^}]*"id":"\([^"]*\)".*/\1/p')" ;;
+  esac
+  [ -n "$v" ] || return 1
+  printf '%s' "$v"
+}
+
+# cap_id_sanitize <raw> — [A-Za-z0-9._-] only (the ref grammar's own alphabet). Forks NOTHING in the
+# common case: a value that is already legal is returned untouched, which is every real box name.
+cap_id_sanitize() {
+  local s="${1:-}"
+  [ -n "$s" ] || return 1
+  case "$s" in
+    *[!A-Za-z0-9._-]*) s="$(printf '%s' "$s" | tr -c 'A-Za-z0-9._-' '-' | tr -d '\n')" ;;  #`sanitize`
+  esac
+  printf '%s' "$s"
+}
+
+# cap_inst — this box's STABLE instance token (12 hex). A token issued HERE and PERSISTED is the first
+# choice, because it is unique by construction and stable by construction; the other sources are only
+# for a box whose state cannot be written (a read-only home, a sealed CI image), where a stable
+# DERIVED value beats a per-call random one.
+cap_inst() {
+  local f v id
+  if [ -n "${CAP_INST:-}" ]; then cap_id_sanitize "$CAP_INST"; return 0; fi
+  f="$(cap_box_state_dir)/identity"
+  if v="$(_cap_state_read "$f" inst)"; then printf '%s' "$v"; return 0; fi
+  # 1. ISSUE AND PERSIST one. `printf` + `$RANDOM` are BUILTINS, so this costs no fork on a box that
+  #    may be fork-starved, and the value is written once and read thereafter.
+  v="$(printf '%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM")"
+  if _cap_identity_set inst "$v"; then printf '%s' "$v"; return 0; fi
+  # 2. The state is UNWRITABLE. Prefer something STABLE over a fresh random per call (a token that
+  #    changes every cycle invents a new box every cycle, which is the collapse in the other direction).
+  #    (a) the control plane's provider id for THIS VM — ASSIGNED, so a cloned image cannot carry it;
+  id="$(_cap_plane_field id)" || id=""
+  if [ -n "$id" ]; then
+    v="$(printf '%s' "${id#vm-}" | tr -cd '0-9a-f')"
+    v="${v: -12}"
+  else
+    v=""
+  fi
+  #    (b) `/etc/machine-id` — ⛔ a LAST DISCRIMINATOR, never the primary key. Its uniqueness across
+  #    the cloud cells is NOT established: they come from one image and the peer read channel is
+  #    broken (`cmux vm exec` → `no known daemon matches this route`, #2345), so it could not be
+  #    measured from here. It is reachable only on a box with no writable state, and a SHARED value
+  #    is exactly what the collision detector exists to report — which is why no single source has to
+  #    be perfect.
+  if [ -z "$v" ] && [ -r /etc/machine-id ]; then
+    v="$(tr -cd '0-9a-f' < /etc/machine-id 2>/dev/null)"
+    v="${v:0:12}"
+  fi
+  case "$v" in *[!0-9a-f]*) v="" ;; esac
+  [ ${#v} -ge 8 ] || v="$(printf '%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM")"
+  printf '%s' "$v"
+}
+
+# cap_hostname_raw — the hostname, behind a seam the suite can drive (`hostname -s` on a fleet of
+# cloud cells is the SAME string for every box; that is the defect, not the measurement).
+cap_hostname_raw() {
+  local h="${CAP_HOSTNAME:-}"
+  [ -n "$h" ] || h="$(hostname -s 2>/dev/null || hostname 2>/dev/null)" || h=""
+  printf '%s' "$h"
+}
+
+# cap_cell_name — the name the CONTROL PLANE assigned this machine, or empty. Cached with an age so
+# the probe costs one file read (no fork, no network) once the box has answered once; a cache that
+# cannot be refreshed keeps answering with what it has, because falling back to `hostname` would move
+# the box to a second identity mid-flight.
+cap_cell_name() {
+  local f cell at now name
+  f="$(cap_box_state_dir)/identity"
+  cell="$(_cap_state_read "$f" cell)" || cell=""
+  at="$(_cap_state_read "$f" at)" || at=""
+  now="$(cap_now)"
+  if [ -n "$cell" ]; then
+    case "$at" in
+      ''|*[!0-9]*) printf '%s' "$cell"; return 0 ;;
+    esac
+    case "$now" in ''|*[!0-9]*) printf '%s' "$cell"; return 0 ;; esac
+    if [ $(( now - at )) -lt "${CAP_ID_TTL:-86400}" ]; then printf '%s' "$cell"; return 0; fi
+  fi
+  name="$(_cap_plane_field name)" || name=""
+  name="$(cap_id_sanitize "$name")" || name=""
+  if [ -z "$name" ]; then
+    # Cannot ask. Keep the LAST KNOWN name (identity stability beats freshness: a box that renames
+    # itself to its hostname has published a second record under a second key).
+    [ -n "$cell" ] && { printf '%s' "$cell"; return 0; }
+    return 1
+  fi
+  _cap_identity_set cell "$name" || true
+  _cap_identity_set at "$now" || true
+  printf '%s' "$name"
+}
+
+# cap_host — THE KEY of a box (the ref component, the record's `host=`, and `cap_place`'s self).
 cap_host() {
-  if [ -n "${CAP_HOST:-}" ]; then printf '%s' "$CAP_HOST"; return 0; fi
-  local h; h="$(hostname -s 2>/dev/null || hostname 2>/dev/null)" || h=""
-  case "$h" in ''|*[!A-Za-z0-9._-]*) printf 'box'; return 0 ;; esac
+  local h=""
+  if [ -n "${CAP_HOST:-}" ]; then
+    h="$CAP_HOST"
+  else
+    h="$(cap_cell_name)" || h=""
+    if [ -z "$h" ]; then
+      h="$(cap_hostname_raw)"
+      [ -n "$h" ] && h="${h}-$(cap_inst)"
+    fi
+  fi
+  h="$(cap_id_sanitize "$h")" || h=""
+  case "$h" in ''|*[!A-Za-z0-9._-]*) h='box' ;; esac
   printf '%s' "$h"
 }
 
@@ -496,10 +708,20 @@ cap_probe_local() {
   case "$lanes" in ''|*[!0-9]*) lanes=0 ;; esac
   host="$(cap_host)"; at="$(cap_now)"
   lpc="$(awk -v l="$load1" -v n="$ncpu" 'BEGIN{printf "%d", l/n}')"
+  # The instance token and the collision flag ride the record too, APPENDED like the fork fields:
+  #   * `inst=` is the publisher the ref path names — it makes `publish` and the record verifiably the
+  #     same publisher, and an operator reading `capacity.sh probe` sees WHICH box key it will write;
+  #   * `collision=1` is the publisher's own WITNESS that another box is writing in its namespace
+  #     (`cap_publish` sets it), and it makes this box ineligible — locally, without waiting for a peer
+  #     to notice. A record with no witness state is `collision=0`, never absent-therefore-fine.
+  local inst coll
+  inst="${CAP_INST:-}"; [ -n "$inst" ] || inst="$(cap_inst)"
+  coll="$(_cap_state_read "$(cap_box_state_dir)/publish" collision)" || coll=0
+  case "$coll" in 0|1) : ;; *) coll=0 ;; esac
   # The fork fields are APPENDED: existing consumers (`scripts/harness-up`, peers on an older tree)
   # parse the leading fields by key and ignore what follows, so this is additive, not a new grammar.
-  printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s %s' \
-    "$host" "$ncpu" "$load1" "$lpc" "$lanes" "$disk" "$mem" "$at" "$fr"
+  printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s %s inst=%s collision=%s' \
+    "$host" "$ncpu" "$load1" "$lpc" "$lanes" "$disk" "$mem" "$at" "$fr" "$inst" "$coll"
 }
 
 # ── record parsing ─────────────────────────────────────────────────────────────
@@ -549,6 +771,12 @@ cap_lpc_human() { awk -v x="${1:-0}" 'BEGIN{printf "%.2f", x/100}'; }
 cap_bound_hit() {
   local r="${1:-}" now="${2:-}" at age lpc disk mem forkb
   cap_valid_base_record "$r" || { printf 'probe_unreadable'; return 0; }
+  # 0. IDENTITY — FIRST, because it invalidates the premise of every bound below (agent-infra#2707).
+  # A record whose key is claimed by MORE THAN ONE box is not a measurement of one box, so it cannot be
+  # a placement candidate — and `cap_place` must refuse rather than place on it. This is the "refuse to
+  # decide on a fleet it cannot distinguish" arm: it fires from the reader (two publishers under one
+  # host) and from the publisher (a stranger's ref newer than its own last publish).
+  case "$(cap_kv "$r" collision)" in 1) printf 'identity_collision'; return 0 ;; esac
   at="$(cap_kv "$r" at)"; age=$(( now - at ))
   [ "$age" -lt 0 ] && age=0
   if [ "$age" -gt "$CAP_PROBE_TTL" ]; then printf 'probe_stale'; return 0; fi
@@ -576,7 +804,7 @@ cap_place() {
   [ -n "$self" ] || { printf 'refuse bound=usage detail=no-self-host\n'; return 2; }
   local now; now="$(cap_now)"
   case "$now" in ''|*[!0-9]*) printf 'refuse bound=usage detail=clock-unreadable\n'; return 2 ;; esac
-  local rec n=0 elig=0 bound hits="" hit lpc disk host detail="" winner_lpc="" winner_disk="" winner="" best_hits=""
+  local rec n=0 elig=0 bound hits="" hit lpc disk host detail="" winner_lpc="" winner_disk="" winner="" best_hits="" self_hit=""
   # Records arrive either as arguments or, when there are none, on stdin (one record per line).
   # stdin is the CONTROLLER's shape: a record contains spaces, so `cap_place h $fleet` would word-split
   # every record into fragments — a bug that reads as "no eligible box" instead of "bad call".
@@ -588,6 +816,11 @@ cap_place() {
     hit="$(cap_bound_hit "$rec" "$now")"
     host="$(cap_kv "$rec" host)"
     [ -n "$host" ] || host="?"
+    # ⛔ A KEY THAT IS SHARED IS NOT A FLEET VIEW (agent-infra#2707). When THIS box's own key is
+    # claimed by more than one publisher, its reading of the fleet is compromised at the root: the
+    # other record under that key may be a twin's, so "the least-loaded box" can name a machine whose
+    # numbers belong to someone else. Refuse to decide, and name the reason, rather than place.
+    if [ "$host" = "$self" ] && [ "$(cap_kv "$rec" collision)" = "1" ]; then self_hit=1; fi
     if [ -n "$hit" ]; then
       detail="${detail}${detail:+, }${host}:${hit}"
       hits="${hits}${hit}\n"
@@ -605,6 +838,11 @@ cap_place() {
   done <<EOF
 $src
 EOF
+  if [ -n "$self_hit" ]; then
+    printf 'refuse bound=identity_collision detail=%s:identity_collision evaluated=%s eligible=%s why=this_box_s_own_key_is_claimed_by_more_than_one_publisher\n' \
+      "$self" "$n" "$elig"
+    return 1
+  fi
   if [ -z "$winner" ]; then
     # ⛔ NAME THE BOUND, MEASURED. The DOMINANT bound is the one that excluded the most boxes; with
     # no boxes at all the honest answer is `no_probe` (nothing to measure), never "no capacity".
@@ -622,34 +860,47 @@ EOF
   return 0
 }
 
-# ── the fleet's records, over the ONE shared channel ──────────────────────────────────────────
-# cap_ref_for <record> -> refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>
-# ⛔ THE GRAMMAR IS APPEND-ONLY, AND THE DECODERS ACCEPT THE OLD SIX-SLOT FORM AS `fork_unknown`. A ref
-# name is a string the transport already carries (see the header), so adding slots costs no fetch --
-# but a peer on an older tree must be REFUSED for a named reason, not silently read as healthy.
+# ── the fleet's records, over the ONE shared channel ────────────────────────────────────────
+# cap_ref_for <record> [inst] -> refs/boxes/<host>/<inst>/<at>-<ncpu>-…-<fork>
+# ⛔ THE INSTANCE COMPONENT IS THE PUBLISH SCOPE (agent-infra#2707). It is what makes a peer's record
+# UNDELETABLE rather than merely unmatched: `cap_publish` prunes `<host>/<inst>/*`, and no other box
+# can name that path. Before it, the prune pattern was `<host>/*` — one string every `cmux` cell shared.
+# ⛔ THE SLOT GRAMMAR IS STILL APPEND-ONLY, AND THE DECODERS ACCEPT THE OLD SIX-SLOT FORM AS
+# `fork_unknown`, and the OLD TWO-COMPONENT PATH (`<host>/<slots>`, no instance) from a peer on an older
+# tree — read as a distinct publisher of that host, so the mixing case is REPORTED (`collision`), never
+# silently merged with a new-form record. A ref name is a string the transport already carries (see the
+# header), so the extra path component costs no fetch.
 cap_ref_for() {
-  local r="${1:-}" h at ncpu load1 lanes disk mem procs pmax fork
+  local r="${1:-}" want_inst="${2:-}" h at ncpu load1 lanes disk mem procs pmax fork inst
   cap_valid_record "$r" || return 1
+  inst="$want_inst"; [ -n "$inst" ] || inst="${CAP_INST:-}"
+  [ -n "$inst" ] || inst="$(cap_inst)"
+  inst="$(cap_id_sanitize "$inst")" || return 1
+  [ -n "$inst" ] || return 1
   h="$(cap_kv "$r" host)"; at="$(cap_kv "$r" at)"; ncpu="$(cap_kv "$r" ncpu)"
   load1="$(cap_kv "$r" load1)"; lanes="$(cap_kv "$r" lanes)"
   disk="$(cap_kv "$r" disk_free_mb)"; mem="$(cap_kv "$r" mem_free_mb)"
   procs="$(cap_kv "$r" procs)"; pmax="$(cap_kv "$r" procs_max)"; fork="$(cap_kv "$r" fork)"
-  printf '%s/%s/%s-%s-%s-%s-%s-%s-%s-%s-%s' "$CAP_NS" "$h" "$at" "$ncpu" "$load1" "$lanes" \
-    "$disk" "$mem" "$procs" "$pmax" "$fork"
+  printf '%s/%s/%s/%s-%s-%s-%s-%s-%s-%s-%s-%s' "$CAP_NS" "$h" "$inst" "$at" "$ncpu" "$load1" \
+    "$lanes" "$disk" "$mem" "$procs" "$pmax" "$fork"
 }
 
 # cap_record_from_ref <refname or path> -> record line (rc 1 if the ref is not one of ours)
 # Six numeric slots = a pre-#2293 record: it decodes WITHOUT fork fields, so `cap_fork_bound` calls it
-# `fork_unknown` (ineligible, named) instead of the whole ref being dropped as unparseable.
+# `fork_unknown` (ineligible, named) instead of the whole ref being dropped as unparseable. Two path
+# components = a pre-#2707 ref (no instance) — still decoded, with `inst` left absent.
 cap_record_from_ref() {
-  local ref="${1:-}" path base h rest
+  local ref="${1:-}" path h inst rest
   case "$ref" in
     *"$CAP_NS"/*) path="${ref#*"$CAP_NS"/}" ;;
     *) return 1 ;;
   esac
   h="${path%%/*}"; rest="${path#*/}"
+  inst=""
+  case "$rest" in */*) inst="${rest%%/*}"; rest="${rest#*/}" ;; esac
   case "$h" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  printf '%s' "$rest" | awk -v h="$h" '
+  case "$inst" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+  printf '%s' "$rest" | awk -v h="$h" -v inst="$inst" '
     { n=split($0, f, "-") }
     END{
       if (n != 6 && n != 9) exit 1
@@ -658,18 +909,31 @@ cap_record_from_ref() {
       printf "host=%s ncpu=%s load1=%s lpc=%d lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s", \
         h, f[2], f[3], lpc, f[4], f[5], f[6], f[1]
       if (n == 9) printf " procs=%s procs_max=%s fork=%s", f[7], f[8], f[9]
+      if (inst != "") printf " inst=%s", inst
     }'
 }
 
-# cap_parse_lsremote — pure: `<sha>\t<ref>` lines on stdin -> ONE record per host (the newest `at`).
-# Kept separate from the git call so the suite can drive it with fixture text.
+# cap_parse_lsremote — pure: `<sha>\t<ref>` lines on stdin -> ONE record per PUBLISHER (the newest
+# `at`), where a publisher is (host, instance) and NOT the host alone. Kept separate from the git call
+# so the suite can drive it with fixture text.
+# ⛔ WHY THE KEY IS NOT THE HOST (agent-infra#2707): keying on the host is what collapsed three `cmux`
+# cells into one box, and the reader's "keep the newest" then made the collapse look like a clean
+# measurement. With the instance in the key, two publishers under one host are TWO records — and
+# `collision=1` says out loud that the host label does not identify one machine, so `cap_place` refuses
+# (`bound=identity_collision`) instead of picking one of them.
 cap_parse_lsremote() {
   awk -v ns="$CAP_NS" '
-    function rec_for(ref,   p, h, rest, n, f, i, lpc) {
+    function rec_for(ref,   p, h, rest, i, inst, n, f, j, lpc, r) {
       p = ref; sub("^" ns "/", "", p)
       if (p == ref) return ""                       # not in our namespace
       i = index(p, "/"); if (i <= 1) return ""
       h = substr(p, 1, i - 1); rest = substr(p, i + 1)
+      inst = ""
+      j = index(rest, "/")
+      if (j > 0) {                                  # <host>/<inst>/<slots> — the current form
+        inst = substr(rest, 1, j - 1); rest = substr(rest, j + 1)
+        if (inst == "" || inst ~ /[^A-Za-z0-9._-]/) return ""
+      }
       n = split(rest, f, "-")
       if (n != 6 && n != 9) return ""
       for (i = 1; i <= n; i++) if (f[i] == "" || f[i] ~ /[^0-9]/) return ""
@@ -677,6 +941,8 @@ cap_parse_lsremote() {
       r = sprintf("host=%s ncpu=%s load1=%s lpc=%d lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s", \
                      h, f[2], f[3], lpc, f[4], f[5], f[6], f[1])
       if (n == 9) r = r sprintf(" procs=%s procs_max=%s fork=%s", f[7], f[8], f[9])
+      R_HOST = h; R_INST = inst
+      if (inst != "") r = r sprintf(" inst=%s", inst)
       return r
     }
     {
@@ -685,9 +951,21 @@ cap_parse_lsremote() {
       r = rec_for(ref, 1)
       if (r == "") next
       split(r, g, " "); at = g[8]; sub("^at=", "", at)
-      if (!(g[1] in best) || at + 0 > atv[g[1]] + 0) { best[g[1]] = r; atv[g[1]] = at + 0 }
+      k = R_HOST SUBSEP R_INST
+      if (!(k in best) || at + 0 > atv[k] + 0) { best[k] = r; atv[k] = at + 0 }
+      publisher[k] = R_HOST              # one entry per (host,instance): the PUBLISHER count
     }
-    END { for (k in best) print best[k] }
+    END {
+      # How many distinct publishers claim each host label? >1 is the collision the issue asks the
+      # READER to be able to state, rather than resolving it by keeping the newest.
+      for (k in publisher) npub[publisher[k]]++
+      for (k in best) {
+        split(k, a, SUBSEP)
+        r = best[k]
+        if (npub[a[1]] + 0 > 1) r = r " collision=1"
+        print r
+      }
+    }
   ' | sort
 }
 
@@ -702,23 +980,62 @@ cap_read_fleet() {
   printf '%s\n' "$out" | cap_parse_lsremote
 }
 
-# cap_publish <repo> <record> — publish this box's reading; prune this box's PREVIOUS refs only.
+# cap_publish <repo> <record> — publish this box's reading; prune this box's OWN namespace only.
 # Best-effort by design: a publish failure must never fail a dispatch (this box becomes ineligible to
 # its peers, which is the fail-closed direction). rc 0 published · 1 refused/failed (reason on stdout)
+#
+# ⛔ THE PRUNE IS THE DEFECT THIS ISSUE IS ABOUT (agent-infra#2707): it used to name
+# `refs/boxes/<host>/*`, so on a fleet where every cell is `cmux` each publish deleted its PEERS'
+# records — three boxes, one surviving ref, and a planner that "saw" a fleet of one. Two things keep a
+# peer out of the delete's reach now: the pattern is `<host>/<inst>/*` (a namespace only this box can
+# name), and the witness below SKIPS the prune entirely when a ref it did not write appears in it.
 cap_publish() {
-  local repo="${1:-.}" rec="${2:-}" ref sha old
+  local repo="${1:-.}" rec="${2:-}" ref sha old host inst d w last_ref last_at own newest_at at collision=0 line
   cap_valid_record "$rec" || { printf 'publish=refused why=invalid-record\n'; return 1; }
-  ref="$(cap_ref_for "$rec")" || { printf 'publish=refused why=invalid-record\n'; return 1; }
+  host="$(cap_kv "$rec" host)"
+  inst="${CAP_INST:-}"; [ -n "$inst" ] || inst="$(cap_inst)"
+  inst="$(cap_id_sanitize "$inst")" || { printf 'publish=refused why=no-instance-token\n'; return 1; }
+  ref="$(cap_ref_for "$rec" "$inst")" || { printf 'publish=refused why=invalid-record\n'; return 1; }
   sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || { printf 'publish=refused why=no-head\n'; return 1; }
+  # ONE ls-remote, two consumers: the witness (is everything in my namespace mine?) and the prune list.
+  d="$(cap_box_state_dir)"; w="$d/publish"
+  last_ref="$(_cap_state_read "$w" ref)" || last_ref=""
+  last_at="$(_cap_state_read "$w" at)" || last_at=""
+  case "$last_at" in ''|*[!0-9]*) last_at=0 ;; esac
+  own="$(git -C "$repo" ls-remote --refs origin "$CAP_NS/$host/$inst/*" 2>/dev/null)" || own=""
+  newest_at=0
+  while IFS= read -r line; do
+    [ -n "${line:-}" ] || continue
+    at="${line##*/}"; at="${at%%-*}"
+    case "$at" in ''|*[!0-9]*) continue ;; esac
+    [ "$at" -gt "$newest_at" ] && newest_at="$at"
+  done <<EOF
+$own
+EOF
+  # ⛔ THE WITNESS. A ref in MY namespace STRICTLY NEWER than the last ref I wrote cannot be mine (I
+  # wrote the newest one I know of, and my own clock only moves forward for this record). So another box
+  # shares my key — a cloned state dir, or two boxes handed the same CAP_HOST. Say it, and delete
+  # nothing: a delete is what makes one box's publish destroy its peer's reading.
+  if [ "$newest_at" -gt "$last_at" ] && [ "$newest_at" -gt 0 ]; then collision=1; fi
   git -C "$repo" push -q origin "$sha:$ref" >/dev/null 2>&1 || { printf 'publish=failed why=push-refused ref=%s\n' "$ref"; return 1; }
-  # Prune THIS host's older refs. A peer's ref is never named here (the pattern is host-scoped), so a
-  # delete can only ever remove a record this box published.
-  for old in $(git -C "$repo" ls-remote --refs origin "$CAP_NS/$(cap_kv "$rec" host)/*" 2>/dev/null | awk '{print $2}'); do
-    [ "$old" = "$ref" ] && continue
-    git -C "$repo" push -q origin ":$old" >/dev/null 2>&1 || true  # a stuck old ref is harmless: the
-    #    reader keeps the NEWEST record per host, so a superseded ref cannot win a placement decision
-  done
-  printf 'publish=ok ref=%s\n' "$ref"
+  if [ "$collision" -eq 0 ]; then
+    # Prune THIS box's older refs, in its OWN instance namespace. A peer cannot be named here.
+    for old in $(printf '%s\n' "$own" | awk '{print $2}'); do
+      [ "$old" = "$ref" ] && continue
+      git -C "$repo" push -q origin ":$old" >/dev/null 2>&1 || true  # a stuck old ref is harmless: the
+      #    reader keeps the NEWEST record per publisher, so a superseded ref cannot win a decision
+    done
+  fi
+  # Remember what THIS box wrote (and whether its key is shared), so the next cycle can tell its own ref
+  # from a stranger's. A failed push leaves the previous witness intact on purpose: the next cycle must
+  # still compare against the last ref that actually LANDED.
+  _cap_state_write "$w" "ref=$ref" "at=$(cap_kv "$rec" at)" "collision=$collision" \
+    "last_ref=${last_ref:-}" || true
+  if [ "$collision" -eq 1 ]; then
+    printf 'publish=ok ref=%s collision=1 why=a_ref_in_this_box_s_namespace_is_newer_than_its_own_last_publish(prune_skipped)\n' "$ref"
+  else
+    printf 'publish=ok ref=%s\n' "$ref"
+  fi
   return 0
 }
 
@@ -748,11 +1065,23 @@ cap_cli() {
       printf '%s headroom=%s min_fork_headroom=%s\n' \
         "$fr" "$(cap_fork_headroom "$fr")" "$CAP_MIN_FORK_HEADROOM" ;;
     fleet)   cap_read_fleet "${1:-.}" ;;
+    # `identity` — WHICH box this is, and where each half of the answer came from. The verb an operator
+    # runs when placement says `placed_on=` something they do not recognise (agent-infra#2707), and the
+    # one that answers "did this box fall back to its hostname?": `src=cell` = the control plane named
+    # it, `src=hostname` = NOT PROVEN UNIQUE, hence the instance suffix.
+    identity)
+      local _h _i _c _src
+      _h="$(cap_host)"; _i="$(cap_inst)"; _c="$(cap_cell_name 2>/dev/null)" || _c=""
+      if [ -n "${CAP_HOST:-}" ]; then _src=explicit
+      elif [ -n "$_c" ]; then _src=cell
+      else _src=hostname; fi
+      printf 'host=%s inst=%s src=%s cell=%s state=%s\n' \
+        "$_h" "$_i" "$_src" "${_c:-none}" "$(cap_box_state_dir)" ;;
     publish) cap_publish "${1:-.}" "${2:-}" ;;
     place)   cap_place "${1:-}" ;;
     ''|-h|--help|help)
       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) printf 'capacity: unknown command %s (try: probe|fork|place|fleet|publish)\n' "$v" >&2; return 2 ;;
+    *) printf 'capacity: unknown command %s (try: probe|fork|place|fleet|publish|identity)\n' "$v" >&2; return 2 ;;
   esac
 }
 

@@ -386,43 +386,52 @@ freshness; refuse rather than place blind.
 
 **ALIVE vs REFUSING vs IDLE.** ALIVE = `place=<host> lpc=… evaluated=N eligible=M`; **REFUSING =
 `refuse bound=<the dominant bound> detail=… evaluated=N eligible=0`** with the bound named
-(`fork_headroom`/`fork_probe`/**`fork_unknown`**/`disk`/`load_per_cpu`/`memory`/`probe_stale`/
-`probe_unreadable`/`no_probe`, plus `usage` on the exit-2 arms), exit **1** (*"a REFUSAL IS NOT A FAILURE, it is the answer"*); IDLE does not apply.
+(`identity_collision`/`fork_headroom`/`fork_probe`/**`fork_unknown`**/`disk`/`load_per_cpu`/`memory`/
+`probe_stale`/`probe_unreadable`/`no_probe`, plus `usage` on the exit-2 arms), exit **1** (*"a REFUSAL IS NOT A FAILURE, it is the answer"*); IDLE does not apply.
 Exit **2 = "cannot answer"** — and that is MORE than the transport: the sub-cases are an unreadable fleet
 channel (`cap_read_fleet`), `refuse bound=usage detail=no-self-host|clock-unreadable` on a `place` call,
 `probe=unreadable` on a `probe`, and an unknown verb. ⛔ Read the reason line before deciding which: a
 `bound=usage` on `place` is a caller defect, not a git fault — the same "shared code, read the reason"
 rule as `harness-refresh.sh`'s 23 (§3.12). Exit 254 = the probe itself could not fork (a *reading*, not a
 crash).
-The fleet channel is `refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`
+The fleet channel is `refs/boxes/<host>/<inst>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`
 on the queue repo's origin, read with one `git ls-remote --refs`.
 
-⛔ **MEASURED DEFECT (2026-10-24, this box) — the fleet view collapses to ONE box.**
-`cap_host` defaults to `hostname -s`, and **two boxes demonstrably share the hostname `cmux`**: cell-4
-measured directly (`$ hostname` → `cmux`), plus a **4-core box** publishing under that same key — cell-3 by
-**elimination, not by a read** (cell-1 and cell-4 are 8-core, and §1.1 says a peer cannot be inventoried
-from a cell; the numbers are `fleet-capacity.md`'s). Nothing overrides it — no deploy path sets
-`CAP_HOST`. So both publish under the SAME key, and `cap_publish` prunes
-`refs/boxes/<that host>/*` on every publish — **each box deletes its peers' records**. Evidence, in two
-halves:
-- this box's own probe: `host=cmux ncpu=8 …` — but `refs/boxes/cmux/1792853260-4-336-0-25297-4514-9-4692-1`
-  in **tortoise** carries **`ncpu=4`**, which is not this 8-core box: **another box** published it under
-  the same key 20 s earlier (cell-3 by elimination — inferred, not read, §1.1);
-- `refs/boxes` in **agent-infra** carries two keys, neither of them cell-4's live reading: `Daniels-MacBook-Air`
-  (130 records, newest 14:36:29Z) and a `cmux` record **34 h stale** (`ncpu=4`, 2026-10-23 04:50Z). The Mac
-  publishes into a different **work repo** — cell-4's `REPO=/tmp/cell-t3` is tortoise — so a box's
-  `cap_place` only ever reads the records published to ITS repo, and the two halves of the fleet cannot see
-  each other (#2281 is the multi-repo controller half).
-Consequence: `cap_place` compares against a fleet of one and always answers `place=<self>` — cell-4's
-cycle record literally says `placed_on=cmux`. The seam, its thresholds (8.00 refuse / 4.00 prefer /
-TTL 900 s / 500 MB disk / 512 MB mem / 200 fork headroom) and its fail-closed direction are all
-correct; the **identity and the transport are not**. `C3`.
+⛔ **MEASURED DEFECT (2026-10-24, this box) — the fleet view collapsed to ONE box — FIXED by #2707.**
+`cap_host` defaulted to `hostname -s`, and **every cloud cell's hostname is `cmux`** (same image, same
+`/etc/hostname`; cell-4 measured it directly and this box re-measured it). Nothing overrides it — no
+deploy path sets `CAP_HOST` — so all three cells published under the SAME key, and `cap_publish`
+pruned `refs/boxes/<that host>/*` on every publish: **each box deleted its peers' records**, three
+cells held one ref between them, and `cap_place` compared against a fleet of one and always answered
+`place=<self>` (cell-4's cycle record: `placed_on=cmux`). Re-measured 2026-10-28 on this box with the
+shipped test fixture (two boxes, default identity path, one origin): the pre-change code leaves
+**one** ref and answers `place=cmux` while an idle peer exists.
+
+**The fix (shipped, #2707).** Every ref now carries the publisher's **instance** as its own path
+component, and a box's key is *resolved, not assumed*:
+- `cap_host` = `CAP_HOST` (explicit, verbatim) → the name the **control plane assigned**
+  (`cmux self --json` → `machine.name`, cached so an outage cannot flip the identity) → `hostname`
+  **plus a persisted instance token** (`cmux-1a2b3c4d5e6f`), because a hostname proves nothing about
+  uniqueness. `bash capacity.sh identity` prints the key, the token and `src=` (which source answered).
+- `cap_publish` prunes **only** `refs/boxes/<host>/<inst>/*` — a namespace no other box can name — so
+a peer's record is out of the delete's reach rather than merely unmatched.
+- the reader keys on **(host, instance)**, so two boxes under one key are two records, both marked
+  `collision=1`;
+- the publisher keeps a **witness** (a ref in its own namespace strictly newer than its own last
+  publish is not its own) and then publishes `collision=1` and deletes nothing;
+- a collided record is **INELIGIBLE** (`bound=identity_collision`, checked before fork), and `cap_place`
+  **refuses** rather than deciding on a fleet it cannot distinguish — including when it is this box's
+  own key that is shared.
+
 ✅ `CAP_YIELD_AT_LPC=400` (the *prefer-elsewhere* line) **is live, and it is read by the CONTROLLER, not by
 `cap_place`**: `orch-loop.sh` compares `CAP_LPC_SELF` against it and hands the work to the less-loaded box at
 or above it. The split is deliberate (placement chooses a box; the controller decides whether to yield) and
 `capacity-placement.test.sh` pins both the default and the gate. ⚠️ An earlier draft of this document called
 it inert — wrong, and corrected in review round 1: `capacity.sh` alone does not read it, which is not the
 same thing.
+⚠️ **STILL OPEN — the multi-repo half (#2281, not this fix).** `cap_read_fleet` reads the **work repo's**
+origin, so cell-4 (tortoise) and the Mac (agent-infra) cannot see each other's records at all: the identity
+fix makes each repo's namespace carry N boxes, and does not merge the two halves.
 
 **What repairs it.** `bound=disk` → prune; `bound=memory` → find the leak; `bound=load_per_cpu` → the
 fleet needs a box; `bound=fork_*` → external restart; `probe_unreadable` → the instrument, not the box.
@@ -601,7 +610,7 @@ is what §3.10's placement is for.
 | `auto-rail` actuator | ❌* no source in any repo | ❌* | ❌* | REC (label only) |
 | precedence rule (merge before new work) | ✅ in code + observed in the cycle record | NC | NC | NC |
 | placement seam present | ✅ | INF (publishes) | NC | REC ✅ (publishes) |
-| **placement sees more than one box** | ❌ (§3.10) | ❌* | ❌* | ❌* |
+| **placement sees more than one box** | ❌ (§3.10) → ✅ per-repo, #2707 | ❌* | ❌* | ❌* |
 | `check-deployed-drift` | ✅ present; pin ≠ running (§1.3) | NC | NC | REC ⚠️ (remedy destroys — baseline §3.1) |
 | disk above floor | ✅ (4649 MB ≈ 97 % used) | NC | NC | NC |
 
@@ -618,7 +627,9 @@ flatten them again — and neither should a reader who quotes only this list):
   any repo (a fleet-wide provenance fact, not four per-box reads), so the Mac's label is a RECORD, not a
   measurement. → `C5` (#2709).
 - **`❌` on cell-4, `❌*` on the other three**: the fleet view — the transport is per work-repo, so no box
-  can see another (`❌*`: a fact about the channel, not a read of each peer). → `C3` (#2707).
+  can see another (`❌*`: a fact about the channel, not a read of each peer). → `C3` (#2707). ⚠️ #2707
+  fixed the **identity** half (N boxes per repo namespace, and a shared key is now reported and refused);
+  the per-work-repo partition is still open and is #2281's.
 - **`C6`** (#2710) is not one of these rows: it is the *shape* of the answer for all of them — a
   refusal must carry a name, a reason and a next action, and `UNKNOWN` must never be a pass.
 
@@ -711,7 +722,7 @@ invisible, i.e. `merge-one.sh` and `dispatch-merge.sh`.
 |---|---|---|---|
 | **C1** | this contract | — | *(this document)* |
 | **C2** | **#2708** — effect-based self-tests for the capabilities in §5.2 that earn one | C1 | the pattern is proven (§5.1); applying it 8× is its own work |
-| **C3** | **#2707** — the fleet view: a per-box identity + a transport that is not partitioned by work repo (and a `cap_place` that refuses to decide on a fleet of one) | C1 | needs a design decision with a measured basis; §3.10 carries the evidence |
+| **C3** | **#2707** — the fleet view. **Identity: FIXED** (resolved key + instance-scoped publish + a reader/publisher collision detector; §3.10). **Transport: OPEN** — a box still reads only its own work repo's namespace, so the fleet is partitioned by work repo (#2281) | C1 | identity shipped with the evidence in §3.10; the transport half needs a decision with #2281 in view |
 | **C4** | merge precedence — **already shipped** (#2099 / #2126 / #2203), observable, and pinned by `test-gates.sh` | — | **no child filed**: it exists. The epic's "threshold" phrasing is superseded by the #2099 ruling (§6) |
 | **C5** | **#2709** — per-machine parity + activation: `pr-doctor` and a land actuator on every cell, an `auto-rail` that has a source, and one parity surface | C1, C2, #2135, #2345, #1761 | blocked on a read channel (§1.1) and on the cell doctor's own inert role pass |
 | **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | `objective.py` exits 0 on `UNKNOWN` (§3.7) `check-deployed-drift.sh` compares the RUNNING dir to `$REF`, never to the PIN, and a FAILED FETCH still compares a possibly-stale LOCAL ref (warned, and an `OK` on that path proves less than it looks) (§3.14) |

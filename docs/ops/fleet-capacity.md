@@ -61,16 +61,61 @@ host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 
 - `procs` / `procs_max` / `fork` — fork headroom (§4). `procs_max=0` means **no ceiling was found**
   (unbounded), never "zero headroom". `src` is the arm that answered (`uid` or `cgroup`) and is local
   to the box: it is printed by `probe`, not transported in the ref name.
+- `inst` / `collision` — this box's **instance token** and its own **collision witness** (§3.1).
 
 The fork fields are **appended** to the record and the ref name
-(`refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`), so a peer on an
-older tree still parses the leading fields; a six-slot legacy ref is refused as `fork_unknown` rather
-than read as healthy, and it self-heals on that box's next publish.
+(`refs/boxes/<host>/<inst>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`), so a peer
+on an older tree still parses the leading fields; a six-slot legacy ref is refused as `fork_unknown`
+rather than read as healthy, and it self-heals on that box's next publish.
 
 Transport: the fleet's only shared channel is the queue repo's origin, so a box publishes its
-reading as `refs/boxes/<host>/<reading>` and every box reads the whole fleet with **one**
+reading as `refs/boxes/<host>/<inst>/<reading>` and every box reads the whole fleet with **one**
 `git ls-remote --refs refs/boxes/*` — the same channel and the same read primitive `claims.sh`
 already uses. No new daemon, no new credential, no per-box RPC.
+
+### 3.1 Identity — one key per box, and a shared key is REPORTED (agent-infra#2707)
+
+**Measured 2026-10-24.** `hostname -s` is `cmux` on **every** cloud cell (same image, same
+`/etc/hostname`). While `host` was the key and `cap_publish` pruned `refs/boxes/<host>/*`, each cell's
+publish **deleted its peers' records**: three cells held one ref between them, `cap_read_fleet`
+returned one box, and `cap_place` compared against a fleet of one — cell-4's own cycle record read
+`placed_on=cmux`. A fleet view that collapses is worse than none: it looks like a measurement.
+
+So a box's key is **resolved, never assumed**, and each source is used only for what it can prove:
+
+| order | source | what it proves |
+|---|---|---|
+| 1 | `CAP_HOST` | the operator is asserting it. Used **verbatim** (`place=pi-cell-4` stays readable). |
+| 2 | `cmux self --json` → `machine.name` | the control plane **assigned** it: per-VM (a cloned image cannot carry it), readable with no peer access, no credential on the box. **Cached** in `$HOME/.pi/agent/state/cap-box` — the probe must not fork/network on a starved box, and a cached name is preferred over the fallback even when the control plane is unreachable, so an outage cannot flip a box to a second identity. |
+| 3 | `hostname` + `-<inst>` | nothing about uniqueness — so a discriminator is **appended** (`cmux-1a2b3c4d5e6f`). The token is persisted, so it survives reboots and cycles and is identical in every cycle. |
+
+`bash capacity.sh identity` answers *which box am I, and where did that come from* (`src=cell`,
+`src=hostname`, `src=explicit`) — the question an operator asks when `placed_on=` names a box they do
+not recognise.
+
+⛔ **And uniqueness is still not assumed**, because a perfect identity is not guaranteed (a shared
+`CAP_HOST`, a cloned state dir, two boxes from one image). Three mechanisms, each covering a case the
+others cannot:
+
+- **The prune is instance-scoped.** `cap_publish` deletes only `refs/boxes/<host>/<inst>/*` — a
+  namespace no other box can name. A peer's record is **out of the delete's reach**, not merely
+  unmatched.
+- **The reader counts PUBLISHERS per host.** A publisher is `(host, instance)`, not `host`. Two boxes
+  under one key are two records, and both are marked `collision=1` — the reader **says so** instead of
+  resolving it by keeping the newest.
+- **The publisher keeps a witness.** A ref in its own namespace **strictly newer** than the last ref
+  it wrote cannot be its own (its clock moves forward for its own record), so another box shares its
+  key. It then publishes with `collision=1` and **deletes nothing**.
+
+A record with `collision=1` is **ineligible** (`bound=identity_collision`, checked FIRST — before
+fork — because it invalidates the premise of every other bound: the record may not be a measurement of
+ONE box). With no eligible box, `cap_place` **refuses** rather than placing on a fleet it cannot
+distinguish; and a box whose OWN key is claimed by more than one publisher refuses even when a peer is
+evidently idle, because its reading of the fleet is compromised at the root.
+
+⛔ **The multi-repo half is NOT this fix.** `cap_read_fleet` still reads the **work repo's** origin, so
+cell-4 (tortoise) and the Mac (agent-infra) cannot see each other's records — that is #2281, and this
+section only makes each repo's namespace carry N boxes instead of one.
 
 ## 4. The order: FORK HEADROOM, then disk, then load
 
@@ -180,6 +225,7 @@ Every refusal names **which** bound it hit, because the remedies differ:
 | `memory` | available memory below the floor | a leak somewhere on that box |
 | `probe_stale` | a record older than `CAP_PROBE_TTL` (900 s) | that box's controller is not publishing |
 | `probe_unreadable` / `no_probe` | an absent or unparseable record | an instrument failure — never "idle" |
+| `identity_collision` | two publishers claim one key (the reader counted them), or a box saw a ref it did not write in its own namespace | **not a box's fault** — give each box a distinct identity (§3.1): set `CAP_HOST`, or let the control plane name it. Checked FIRST, because such a record may not be a measurement of one box |
 
 Relation to `docs/ops/load-policy.md`: that policy's per-core thresholds (2.5× / 1.5×) **suspend
 background batches** on a host; `MAX_LOAD` (10×, `spawn-gate.sh`) refuses a *local* spawn; this 8×

@@ -17,6 +17,14 @@
 #   log/state file as "nothing to say" — i.e. as fine.
 #     → §6/§7 are RED pre-change because nothing writes a per-cycle record and no verb grades it.
 #
+#   AND THE FLEET VIEW COLLAPSED TO ONE BOX (agent-infra#2707, measured 2026-10-24): every cloud cell's
+#   `hostname -s` is `cmux`, `cap_host` used it as the key, and `cap_publish` pruned `refs/boxes/<host>/*`
+#   — so each cell's publish DELETED its peers' records and `cap_place` compared against a fleet of one
+#   (`placed_on=cmux` in cell-4's own cycle record). §8 could not fail on that: EVERY arm of it supplies
+#   the uniqueness production lacks (`CAP_HOST="cell-4" …`).
+#     → §8b drives the DEFAULT identity path (no CAP_HOST, hostname `cmux`, two state dirs = two boxes)
+#       and is RED pre-change in every arm: identity, prune scope, reader key, collision, witness.
+#
 # HOW THESE ARE WRITTEN. Every check drives the SHIPPED files — `capacity.sh`, `cycle-record.sh`,
 # `bin/harness` and `orch-loop.sh` — never a re-implementation (a copy would pass on the broken tree
 # too). `git`, `df`, `hostname` and the clock are seams/stubs, so the suite is hermetic: no network,
@@ -70,6 +78,13 @@ echo "── §1 the probe returns load-per-cpu, lanes, disk and memory (and UNK
 . "$CAP"
 CAP_NOW="$NOW"; export CAP_NOW
 CAP_HOST="cell-1"; export CAP_HOST
+# ⛔ HERMETIC IDENTITY STATE (agent-infra#2707). The box's identity is now (partly) PERSISTED — an
+# instance token, a cached control-plane name, and the publish witness — so every arm that publishes or
+# probes would otherwise write the developer's REAL `$HOME/.pi/agent/state/cap-box`. Pinned into $TMP,
+# and the control-plane read is DISABLED so no arm can fork/network `cmux`; §8b turns it back on with a
+# stub of its own.
+CAP_BOX_STATE="$TMP/cap-identity"; export CAP_BOX_STATE
+CAP_CMUX="/bin/false"; export CAP_CMUX
 P="$(cap_probe_local "$PWD" 7)" || P=""
 ck "the probe returns a record" "$([ -n "$P" ] && echo 0 || echo 1)"
 for k in host ncpu load1 lpc lanes disk_free_mb mem_free_mb at procs procs_max fork; do
@@ -336,6 +351,172 @@ ck "…and placement MOVES OFF the now-saturated box (cell-4 at lpc=762 is no lo
    "$(q '^place=cell-1 ' "$PL2" && echo 0 || echo 1)"
 ck "an UNREADABLE channel (a repo with no origin) is rc 2, so the caller must refuse to place" \
    "$(mkdir -p "$TMP/noorigin" && git init -q "$TMP/noorigin" && cap_read_fleet "$TMP/noorigin" >/dev/null 2>&1; [ "$?" -eq 2 ] && echo 0 || echo 1)"
+
+# ── §8b THE DEFAULT IDENTITY PATH — two boxes on one origin, both visible (agent-infra#2707) ─────
+# ⛔ WHY THIS SECTION EXISTS AND §8 COULD NOT CATCH IT. Every arm of §8 supplies the uniqueness
+# production does not have (`CAP_HOST="cell-4" …`, `CAP_HOST="cell-1" …`), so the suite could not fail
+# on the configuration the fleet actually runs: `hostname -s` is `cmux` on EVERY cloud cell. Here the
+# arms go through the DEFAULT path — no CAP_HOST, the same hostname for both boxes, one state dir each
+# (which is what a box's home is) — and every one of them is RED on the pre-change tree.
+echo
+echo "── §8b the DEFAULT identity path: two boxes, one origin, one hostname ──"
+O2="$TMP/origin2.git"; W2="$TMP/work2"
+git init -q --bare "$O2" >/dev/null 2>&1; git init -q "$W2" >/dev/null 2>&1
+( cd "$W2" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O2" && git push -q origin HEAD:main ) >/dev/null 2>&1
+# capx <capfile> <state-dir> <CAP_HOST|-> <CAP_INST|-> <verb> [args…] — ONE box, in its own shell:
+# its own state dir, no CAP_HOST, no readable control plane, and the fleet's real hostname (`cmux`).
+# A fresh shell per box is what makes two boxes on ONE test machine honest: env, state dir and the
+# library under test are all per-invocation, so nothing the previous box set can leak into the next.
+capx() {
+  local cf="$1" st="$2" h="$3" i="$4"; shift 4
+  [ "$h" = "-" ] && h=""
+  [ "$i" = "-" ] && i=""
+  env -u CAP_HOST CAP_BOX_STATE="$st" CAP_CMUX="${CAPX_CMUX:-/bin/false}" CAP_HOSTNAME="${CAPX_HOSTNAME:-cmux}" \
+      CAP_NOW="$NOW" HOME="$TMP" ${h:+CAP_HOST="$h"} ${i:+CAP_INST="$i"} \
+      bash -c '. "$1"; shift; "$@"' _ "$cf" "$@"
+}
+bcap() { local st="$1" h="$2" i="$3"; shift 3; capx "$CAP" "$st" "$h" "$i" "$@"; }
+w2refs() { git -C "$W2" ls-remote --refs origin 'refs/boxes/*' 2>/dev/null; }
+BA="$TMP/boxA"; BB="$TMP/boxB"
+HA="$(bcap "$BA" - - cap_host)"; HB="$(bcap "$BB" - - cap_host)"
+ck "a box with NO CAP_HOST resolves to a per-box key, not the bare hostname [A=$HA B=$HB]" \
+   "$([ -n "$HA" ] && [ -n "$HB" ] && [ "$HA" != "$HB" ] && [ "$HA" != "cmux" ] && echo 0 || echo 1)"
+ck "  …and the key is STABLE: the same state dir answers the same key every time" \
+   "$([ "$(bcap "$BA" - - cap_host)" = "$HA" ] && echo 0 || echo 1)"
+ck "  …and two boxes with no state of their own cannot collide by accident (fresh dirs ⇒ fresh keys)" \
+   "$([ "$(bcap "$TMP/boxC" - - cap_host)" != "$HA" ] && echo 0 || echo 1)"
+# ⛔ AND A BOX WHOSE STATE CANNOT BE WRITTEN STILL GETS A NON-EMPTY, STABLE TOKEN. A per-call random
+# token would invent a NEW box every cycle — the collapse inverted — so the fallbacks must be derived,
+# and `machine-id` is used ONLY here (its uniqueness across the cells is unmeasured: the peer channel is
+# broken, #2345 — a shared value is what the collision detector is for).
+HI1="$(CAP_BOX_STATE=/dev/null/nope capx "$CAP" "$TMP/bI" - - cap_inst)"
+HI2="$(CAP_BOX_STATE=/dev/null/nope capx "$CAP" "$TMP/bI" - - cap_inst)"
+ck "an UNWRITABLE state dir still yields a token, and the same one twice [${HI1:-<empty>}]" \
+   "$([ -n "$HI1" ] && [ "$HI1" = "$HI2" ] && echo 0 || echo 1)"
+# A is saturated (8 cpu, load 30.00 => lpc=375), B is idle (load 0.56 => lpc=7).
+bcap "$BA" - - cap_publish "$W2" "$(rec "$HA" 8 3000 5 90000 3000 "$NOW")" >/dev/null 2>&1
+bcap "$BB" - - cap_publish "$W2" "$(rec "$HB" 8 56 0 120000 14000 "$NOW")" >/dev/null 2>&1
+R2="$(bcap "$BA" - - cap_read_fleet "$W2")"
+ck "two boxes publish under the DEFAULT path and BOTH records are visible to a peer [$(printf '%s\n' "$R2" | grep -c 'host=') visible]" \
+   "$([ "$(printf '%s\n' "$R2" | grep -c 'host=')" -eq 2 ] && echo 0 || echo 1)"
+ck "  …the peer's record was NOT deleted by the other box's publish (prune is instance-scoped)" \
+   "$(q "host=$HA " "$R2" && q "host=$HB " "$R2" && echo 0 || echo 1)"
+# A second reading from A must supersede A's own and still leave B alone.
+bcap "$BA" - - cap_publish "$W2" "$(rec "$HA" 8 6100 3 120000 14000 $(( NOW + 60 )))" >/dev/null 2>&1
+R2b="$(bcap "$BA" - - cap_read_fleet "$W2")"
+ck "  …a newer reading supersedes that box's own record, and only its own" \
+   "$(q "host=$HA .*lpc=762 " "$R2b" && q "host=$HB .*lpc=7 " "$R2b" && echo 0 || echo 1)"
+ck "  …so the fleet is still TWO boxes, never fewer [$(printf '%s\n' "$R2b" | grep -c 'host=')]" \
+   "$([ "$(printf '%s\n' "$R2b" | grep -c 'host=')" -eq 2 ] && echo 0 || echo 1)"
+PL2b="$(printf '%s\n' "$R2b" | bcap "$BA" - - cap_place "$HA")"
+ck "  …and placement names the OTHER box (not itself) — the answer the collapse made impossible [$PL2b]" \
+   "$(q "^place=$HB " "$PL2b" && echo 0 || echo 1)"
+# ── the collision detector: a key claimed by TWO publishers ─────────────────────────────────────
+# ⛔ A perfect identity is not guaranteed (a shared CAP_HOST, or a cloned state dir), so the READER must
+# be able to say "two different boxes published under one key" instead of silently keeping the newest.
+bcap "$TMP/bC" pi-cell-4 - cap_publish "$W2" "$(rec pi-cell-4 8 3000 5 90000 3000 "$NOW")" >/dev/null 2>&1
+bcap "$TMP/bD" pi-cell-4 ffffffffffff cap_publish "$W2" "$(rec pi-cell-4 8 56 0 120000 14000 "$NOW")" >/dev/null 2>&1
+R3="$(bcap "$TMP/bC" pi-cell-4 - cap_read_fleet "$W2")"
+ck "a key claimed by TWO publishers is REPORTED by the reader (collision=1), not resolved silently" \
+   "$(q 'host=pi-cell-4 .*collision=1' "$R3" && echo 0 || echo 1)"
+ck "  …both of its records still exist (the prune in one namespace cannot reach the other)" \
+   "$([ "$(printf '%s\n' "$R3" | grep -c 'host=pi-cell-4 ')" -eq 2 ] && echo 0 || echo 1)"
+ck "  …and they are marked INELIGIBLE together ($(printf '%s\n' "$R3" | grep -c 'collision=1') of 2)" \
+   "$([ "$(printf '%s\n' "$R3" | grep -c 'collision=1')" -eq 2 ] && echo 0 || echo 1)"
+PL3="$(printf '%s\n' "$R3" | bcap "$TMP/bC" pi-cell-4 - cap_place pi-cell-4)"; RC3=$?
+ck "cap_place REFUSES to decide on a fleet it cannot distinguish (bound=identity_collision) [$PL3]" \
+   "$([ "$RC3" -eq 1 ] && q 'bound=identity_collision' "$PL3" && echo 0 || echo 1)"
+ck "  …non-vacuity: the SAME refusal does NOT fire for the two distinguishable boxes of the default path" \
+   "$(q '^place=' "$PL2b" && echo 0 || echo 1)"
+# ── the publisher's WITNESS: a ref in MY namespace that I did not write ─────────────────────────────
+# The reader cannot see a cloned token (both boxes write the same path), so the publisher must: a ref
+# STRICTLY NEWER than its own last publish is somebody else in its namespace — say so, and delete nothing.
+BW="$TMP/boxW"
+bcap "$BW" - - cap_publish "$W2" "$(rec cmux-w 8 56 0 120000 14000 "$NOW")" >/dev/null 2>&1
+WINST="$(bcap "$BW" - - cap_inst)"
+WSHA="$(git -C "$W2" rev-parse HEAD)"
+git -C "$W2" push -q origin "$WSHA:refs/boxes/cmux-w/$WINST/$(( NOW + 30 ))-8-750-2-120000-14000-400-15041-1" >/dev/null 2>&1
+WPUB="$(bcap "$BW" - - cap_publish "$W2" "$(rec cmux-w 8 56 0 120000 14000 $(( NOW + 60 )))")"; WRC=$?
+ck "the publisher WITNESSES a stranger's newer ref in its own namespace [rc=$WRC $WPUB]" \
+   "$([ "$WRC" -eq 0 ] && q 'collision=1' "$WPUB" && echo 0 || echo 1)"
+ck "  …and deletes NOTHING when it sees one (a delete is what destroyed the peer's reading)" \
+   "$(git -C "$W2" ls-remote --refs origin "refs/boxes/cmux-w/*" | grep -q "$(( NOW + 30 ))" && echo 0 || echo 1)"
+ck "  …so the record it publishes next is INELIGIBLE to itself and to peers (collision rides the record)" \
+   "$(bcap "$BW" - - cap_probe_local "$W2" 0 | grep -q 'collision=1' && echo 0 || echo 1)"
+ck "  …and a witness on a CLEAN namespace does not fire (collision=0 for a box with no twin)" \
+   "$(bcap "$BA" - - cap_probe_local "$W2" 0 | grep -q 'collision=0' && echo 0 || echo 1)"
+# ── the identity SOURCES: assigned name, its cache, and the explicit override ─────────────────────
+STUB="$TMP/cmux-stub"
+cat > "$STUB" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = self ] || exit 3
+printf '{"name":"shiny-rose-ocelot","machine":{"id":"vm-915c3930c4e94e4884229d974522d05d","name":"pi-cell-3"},"peers":[]}\n'
+SH
+chmod +x "$STUB"
+HCELL="$(CAPX_CMUX="$STUB" capx "$CAP" "$TMP/bE" - - cap_host)"
+ck "the name the CONTROL PLANE assigned is used when it answers (readable: no CAP_HOST needed) [$HCELL]" \
+   "$([ "$HCELL" = "pi-cell-3" ] && echo 0 || echo 1)"
+HCELL2="$(capx "$CAP" "$TMP/bE" - - cap_host)"
+ck "  …and it is CACHED: a control-plane outage does NOT flip the box to a second identity [$HCELL2]" \
+   "$([ "$HCELL2" = "pi-cell-3" ] && echo 0 || echo 1)"
+ck "  …the top-level name (the machine's SLUG) is not mistaken for the machine's name" \
+   "$([ "$HCELL" != "shiny-rose-ocelot" ] && echo 0 || echo 1)"
+ck "CAP_HOST stays the EXPLICIT override: used VERBATIM, no suffix (a deploy may name the box)" \
+   "$([ "$(bcap "$TMP/bF" pi-cell-4 - cap_host)" = "pi-cell-4" ] && echo 0 || echo 1)"
+ck "an old-form (TWO-component) ref from a peer on the older tree still DECODES (no silent drop)" \
+   "$(git -C "$W2" push -q origin "$WSHA:refs/boxes/old-box/$NOW-4-814-1-80000-9000-400-15041-1" >/dev/null 2>&1; \
+      bcap "$BA" - - cap_read_fleet "$W2" | grep -q 'host=old-box .*lpc=203' && echo 0 || echo 1)"
+ck "…and a box on the OLD form under a host that ALSO has a new-form publisher is a REPORTED collision" \
+   "$(git -C "$W2" push -q origin "$WSHA:refs/boxes/cmux-w/$NOW-8-56-0-120000-14000-400-15041-1" >/dev/null 2>&1; \
+      bcap "$BA" - - cap_read_fleet "$W2" | grep -q 'host=cmux-w .*collision=1' && echo 0 || echo 1)"
+ck "capacity.sh grew an identity verb naming WHERE the key came from (the operator's question)" \
+   "$(capx "$CAP" "$TMP/bG" - - cap_cli identity | grep -q 'src=hostname' && echo 0 || echo 1)"
+
+# ── §8b-M MUTATION CONTROLS — restore ONE old behaviour at a time; each assertion must go RED ─────
+# ⛔ A check that passes with the mechanism removed is not a check. Each mutant is the SHIPPED file with
+# exactly one line replaced, and the SAME fixture must then lose the property the arm above asserts.
+mk_mut() { sed "$1" "$CAP" > "$2"; }
+# (M1) identity: the default path returns the bare hostname again (the pre-change `cap_host`).
+mk_mut 's/^      \[ -n "\$h" \] \&\& h="\${h}-\$(cap_inst)"$/      :/' "$TMP/cap-m1.sh"
+M1H="$(capx "$TMP/cap-m1.sh" "$TMP/bH" - - cap_host)"
+ck "M1 mutation: with the instance suffix removed the default path collapses to the bare hostname [$M1H]" \
+   "$([ "$M1H" = "cmux" ] && echo 0 || echo 1)"
+# (M2) the pre-change PUBLISHER: the HOST-scoped delete that ate the peers, AND no witness to stop it.
+# Both halves are removed on purpose — the witness alone already refuses to prune (see M4), so a mutant
+# that restored only the pattern would prove nothing about the delete that destroyed the peer's record.
+mk_mut 's|origin "\$CAP_NS/\$host/\$inst/\*"|origin "$CAP_NS/$host/*"|; s/^  if \[ "\$newest_at" -gt "\$last_at" \] \&\& \[ "\$newest_at" -gt 0 \]; then collision=1; fi$/  :/' "$TMP/cap-m2.sh"
+ck "M2 mutation: the prune pattern is host-scoped again AND the witness is gone (the pre-change publisher)" \
+   "$(grep -qF 'ls-remote --refs origin "$CAP_NS/$host/*"' "$TMP/cap-m2.sh" && ! grep -qF 'gt "$last_at" ]' "$TMP/cap-m2.sh" && echo 0 || echo 1)"
+O3="$TMP/origin3.git"; W3="$TMP/work3"
+git init -q --bare "$O3" >/dev/null 2>&1; git init -q "$W3" >/dev/null 2>&1
+( cd "$W3" && git config user.email t@t && git config user.name t && git commit -q --allow-empty -m init \
+  && git remote add origin "$O3" && git push -q origin HEAD:main ) >/dev/null 2>&1
+MUT_FLEET() { # MUT_FLEET <capfile> — two distinguishable boxes publish, one reads
+  capx "$1" "$TMP/m1" pi-cell-4        -              cap_publish "$W3" "$(rec pi-cell-4 8 3000 5 90000 3000 "$NOW")" >/dev/null 2>&1
+  capx "$1" "$TMP/m2" pi-cell-4        ffffffffffff   cap_publish "$W3" "$(rec pi-cell-4 8 56 0 120000 14000 "$NOW")" >/dev/null 2>&1
+  capx "$1" "$TMP/m3" -                -              cap_publish "$W3" "$(rec other-box 8 56 0 120000 14000 "$NOW")" >/dev/null 2>&1
+  capx "$1" "$TMP/m3" -                -              cap_read_fleet "$W3"
+}
+ck "  M2 control: the SHIPPED file's own prune list is instance-scoped (the mutant above is not)" \
+   "$(grep -qF 'ls-remote --refs origin "$CAP_NS/$host/$inst/*"' "$CAP" && echo 0 || echo 1)"
+MUT_OUT="$(MUT_FLEET "$TMP/cap-m2.sh")"
+ck "M2 mutation: with the host-scoped prune the two boxes collapse to ONE visible record [$(printf '%s\n' "$MUT_OUT" | grep -c 'host=pi-cell-4 ')]" \
+   "$([ "$(printf '%s\n' "$MUT_OUT" | grep -c 'host=pi-cell-4 ')" -eq 1 ] && echo 0 || echo 1)"
+SHIP_OUT="$(MUT_FLEET "$CAP")"
+ck "  …non-vacuity: the SHIPPED file keeps both [$(printf '%s\n' "$SHIP_OUT" | grep -c 'host=pi-cell-4 ')]" \
+   "$([ "$(printf '%s\n' "$SHIP_OUT" | grep -c 'host=pi-cell-4 ')" -eq 2 ] && echo 0 || echo 1)"
+# (M3) reader key: back to ONE record per HOST (the newest wins — the pre-change collapse).
+mk_mut 's/^      k = R_HOST SUBSEP R_INST$/      k = R_HOST/' "$TMP/cap-m3.sh"
+MUT3="$(MUT_FLEET "$TMP/cap-m3.sh")"
+ck "M3 mutation: keying the reader on the HOST alone hides the second publisher again" \
+   "$([ "$(printf '%s\n' "$MUT3" | grep -c 'host=pi-cell-4 ')" -eq 1 ] && echo 0 || echo 1)"
+ck "  …and no collision is reported by that mutant (the newest simply wins)" \
+   "$(printf '%s\n' "$MUT3" | grep -q 'collision=1' && echo 1 || echo 0)"
+# (M4) witness: never compare, so a stranger's ref is pruned away silently.
+mk_mut 's/^  if \[ "\$newest_at" -gt "\$last_at" \] \&\& \[ "\$newest_at" -gt 0 \]; then collision=1; fi$/  :/' "$TMP/cap-m4.sh"
+ck "M4 mutation: with the witness disabled the publish reports no collision" \
+   "$(capx "$TMP/cap-m4.sh" "$BW" - - cap_publish "$W2" "$(rec cmux-w 8 56 0 120000 14000 $(( NOW + 90 )))" | grep -q 'collision' && echo 1 || echo 0)"
 
 # ── §9 WIRING: an unwired library is inert — the CONTROLLER must call it ─────────────────────────
 echo
