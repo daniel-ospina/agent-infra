@@ -868,6 +868,11 @@ def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None, s
     env["ORCH_SEND_VERIFY_TIMEOUT"] = "0"
     if home:
         env["HOME"] = str(home)
+    else:
+        # A CLEAN RUNNER'S HOME: no `~/orchestrator/brief-gate.sh` to fall back to (#1881 review P1).
+        env["HOME"] = str(bindir.parent / "home")
+        (bindir.parent / "home").mkdir(exist_ok=True)
+    env = _runner_env(env)
     if session:
         env["FAKE_SESSION_FILE"] = str(session)
     if sid:
@@ -934,16 +939,39 @@ def _farmed_copy(tmp_path, checker_body=None):
     sibling at `<root>/scripts/lib/cmux_payload.py` — present only when `checker_body` is given.
 
     `SCRIPTS` is derived from the script's OWN location, so a copy in its own root is how a farm
-    missing a sibling is reproduced without touching this checkout."""
+    missing a sibling is reproduced without touching this checkout.
+
+    ⛔ AND IT MUST CARRY THE BRIEF GATE TOO (#1881 review P1, BLOCKING). The copy reproduced a farm
+    that had never existed: `orch-send.sh` resolves `orchestrator-harness/brief-gate.sh` beside
+    itself (fallback 2 of three) and runs it BEFORE target resolution and BEFORE the checker guard
+    these arms pin, so with no gate in the root all three arms exited **78** — on the CI runner,
+    where `AGENT_INFRA_PATH` is unset and `$HOME/orchestrator` does not exist. They passed on this
+    laptop only because fallback 3 found the operator's own `~/orchestrator/brief-gate.sh`: a
+    box-dependent green, in the suite whose whole purpose is to be runnable by CI.
+
+    The REAL gate is copied, not stubbed, so the arms still exercise the real validation and the
+    fixtures still have to be conforming briefs.
+    """
     root = tmp_path / "farmed"
     (root / "scripts").mkdir(parents=True)
     script = root / "scripts" / "orch-send.sh"
     with open(_ORCH_SEND, encoding="utf8") as fh:
         script.write_text(fh.read())
+    (root / "scripts" / "orchestrator-harness").mkdir()
+    (root / "scripts" / "orchestrator-harness" / "brief-gate.sh").write_text(
+        open(_BRIEF_GATE, encoding="utf8").read(), encoding="utf8")
     if checker_body is not None:
         (root / "scripts" / "lib").mkdir()
         (root / "scripts" / "lib" / "cmux_payload.py").write_text(checker_body)
     return script
+
+
+def _runner_env(env):
+    """The env a CLEAN CI runner has — no `AGENT_INFRA_PATH`, no `$O`, an empty `$HOME` (#1881
+    review P1). Without this the farmed-copy arms pass on a developer box and redden on the runner."""
+    env.pop("AGENT_INFRA_PATH", None)
+    env.pop("O", None)
+    return env
 
 
 def test_orch_send_refuses_when_the_checker_is_missing(tmp_path):
@@ -955,6 +983,10 @@ def test_orch_send_refuses_when_the_checker_is_missing(tmp_path):
     sent_log = tmp_path / "sent.log"
     bindir, screen = _fake_cmux_path(tmp_path, "Working... (turn started)\n")
     r = _run_orch_send(bindir, screen, LONG, script=script, session=sent_log)
+    # ⛔ NOT 78: the farmed copy carries the brief gate beside itself, so a CLEAN RUNNER (no
+    # AGENT_INFRA_PATH, no $HOME/orchestrator) reaches the checker guard this arm pins. 78 is the
+    # "brief-gate.sh not found" refusal, which made this arm red for a reason unrelated to its name.
+    assert r.returncode != 78, r.stdout + r.stderr
     assert r.returncode == 7, r.stdout + r.stderr
     assert "NOT SENT" in r.stdout
     # The pre-fix wording is the false claim this pin exists to forbid.
