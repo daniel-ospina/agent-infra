@@ -3378,7 +3378,7 @@ ARMS
   else echo "  ❌ (v8) an arm assigns GATE_WHY without a vector verdict — it can fire invisibly"; FAIL=$((FAIL+1)); fi
   # ⛔ NO `elif AMONG THE VECTORED ARMS: a chain is how the mask comes back (#2924). The winner is
   # chosen by `GATE_WHY="${GATE_WHY:-…}"`, which is order-preserving and chain-free.
-  if printf '%s' "$GV" | grep -qE '^[[:space:]]*elif '; then
+  if grep -qE '^[[:space:]]*elif ' <<<"$GV"; then
     echo "  ❌ (v9) an \`elif\` is back inside the vector block — the first arm masks the rest again"; FAIL=$((FAIL+1))
   else echo "  ok (v9) the arms are independent guards, not a masking chain"; PASS=$((PASS+1)); fi
   # ── the two mutants ────────────────────────────────────────────────────────────────────────────
