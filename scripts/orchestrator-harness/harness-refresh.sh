@@ -36,8 +36,13 @@
 # agent-infra#2315's, NOT this file's.
 # So the word is replaced by a STATE with a defined transition, in three parts:
 #   1. THE IDENTITY IS READ FROM THE PROCESS, NOT FROM A RECORD, where a cell is concerned — the live
-#      controller's argv names the tree it executes (see `controller_identity` below). That makes
-#      `current` reachable on a cell, which is the only thing that can ever END the state honestly.
+#      controller's argv names the tree it executes (see `controller_identity` below). ⛔ SCOPED, because
+#      the absolute version of this sentence was false: WHILE A CONTROLLER IS LIVE, that read is the only
+#      thing that can END the state honestly — a live controller whose identity came from the stamp is
+#      downgraded by the `stamp:*` arm below (which is itself gated on `CONTROLLER_LIVE`). With NO
+#      controller live nothing runs, the STAMP answers, and whatever it says decides the relation: the
+#      `stamp:*` downgrade cannot fire, so a stamp naming the pin reports `current` (see the note above
+#      `CONTROLLER_LIVE`). "No controller" is therefore not by itself a `restart-pending`.
 #   2. THE PENDING STATE IS CLASSIFIED, and the classification rides in the record as `pending=`:
 #        inert       no live controller — nothing runs, so nothing is stale; the next launch runs the pin.
 #        unprovable  a controller IS live and its identity is a CLAIM (the stamp) — no restart is
