@@ -717,6 +717,11 @@ cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/gate-po
 # the validator is the same class as its dependency on spawn-gate.sh.
 cp "$HERE/fix-one.sh" "$RIG/stale/"
 cp "$HERE/brief-gate.sh" "$RIG/stale/"
+# ⛔ AND THE DELIVERY-BRIEF RENDERER (agent-infra#2981), for the same reason one line up: main added it
+# as a HARD requirement of fix-one.sh (a missing renderer is 78, cannot run), so without it this stale
+# fixture exited 78 BEFORE reaching the gate and the arm read "the stale helper refused" while the
+# stale helper had never run. Measured at the merge: rc=78, fixcount left at 2.
+cp "$HERE/reviewer-preflight.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
     "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
@@ -748,7 +753,7 @@ ck "fix-one.sh NAMES the disk gate on a disk refusal (not the load gate)" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $rc
 
-# ... and the MEMORY refusal through the same caller (#2387). 73, refunded the same way, and NAMED as
+# ... and the MEMORY refusal through the same caller (#2387). 81, refunded the same way, and NAMED as
 # memory: the third remedy is neither "wait for load" nor "reclaim disk" (a lane must FINISH), so a
 # caller that folds it into either sends the operator to a reading that will never move.
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
@@ -756,8 +761,10 @@ fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; mrc=$?
 mgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
-{ [ "$mrc" -eq 73 ] && [ "$mgot" = "1" ]; }; rc=$?
-ck "fix-one.sh --argv on a MEMORY refusal exits 73 and REFUNDS the attempt (rc=$mrc, fixcount=${mgot:-<gone>})" $rc
+# ⛔ 81, NOT 73: 73 is `AGENT_FORK_REFUSED` on main, so this literal is the renumbered caller-facing
+# memory code. A test that pins the draft's number pins a code the gate no longer returns.
+{ [ "$mrc" -eq 81 ] && [ "$mgot" = "1" ]; }; rc=$?
+ck "fix-one.sh --argv on a MEMORY refusal exits 81 and REFUNDS the attempt (rc=$mrc, fixcount=${mgot:-<gone>})" $rc
 grep -q 'fixer NOT started (memory gate' "$RO/logs/fix-7.log"; rc=$?
 ck "fix-one.sh NAMES the memory gate on a memory refusal (not the load or disk one)" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
@@ -1055,19 +1062,21 @@ export -f pi
 # ⛔ AND EVERY MODULE THE FIXER HARD-REQUIRES, NOT JUST THE TWO THE ARM IS ABOUT (review, P1).
 # `fix-one.sh` `exit 78`s without each of spawn-gate.sh (L54), brief-gate.sh (L62, resolved from
 # `$SELF` here, because spawn-gate.sh's `brief_gate_lib` prefers the script's OWN directory),
-# repo-target.sh (L69) and gate-policy.sh (L73). This rig seeded only four of the five, so the arm
+# repo-target.sh (L69), gate-policy.sh (L73) and — since #2981 — reviewer-preflight.sh (L75). This rig
+# seeded only four of the five it knew about, so the arm
 # returned 78 — a HALF-DEPLOYED BOX — and its assertions read as "the cross-box refusal is broken"
 # when the refusal was never reached (measured: `got 78`, on this tree and in CI). The two modules
 # this comment once left to luck are copied explicitly; the fallbacks `brief_gate_lib` also consults
 # (`$AGENT_INFRA_PATH`, `~/.pi/agent/scripts`) are NOT relied on, so the arm cannot pass on a dev box
 # and fail on a runner whose HOME has no harness scripts (same class as round 3's HOME fix).
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$HERE/gate-policy.sh" \
-   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
+   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/reviewer-preflight.sh" "$RO/"
 # …and the arm must not be satisfiable by a rig that never reached the claim block: assert the
 # modules it needs are actually in $RO, so a future edit that drops one fails HERE, naming the
 # missing file, instead of resurfacing as a bogus 78 two assertions later.
 _rigmiss=""
-for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh; do
+for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh \
+          reviewer-preflight.sh; do
   [ -f "$RO/$_m" ] || { echo "❌ the §9 rig is missing $_m in \$RO — the cross-box arm below would exit 78 before its refusal"; _rigmiss="$_m"; }
 done
 [ -z "$_rigmiss" ]; rc=$?
@@ -1092,7 +1101,7 @@ unset -f gh; unset 'BASH_FUNC_gh%%'
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$HERE/reviewer-preflight.sh" "$RO/"
 # …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
 # `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
@@ -1200,7 +1209,7 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the disk gate on a disk refusal" $rc
-# ... and the MEMORY arm: 73 propagates out of lane.sh, the refusal line NAMES the memory gate, and
+# ... and the MEMORY arm: 81 propagates out of lane.sh, the refusal line NAMES the memory gate, and
 # the capacity record carries `gate=mem`. That last field is not decoration: chain-merge.sh reads it
 # to decide whether a peer box may take the issue, and `mem` is TRANSFERABLE (a peer with free RAM can
 # run this work) while `land` is not — so collapsing it into `load` would be right by luck and
@@ -1209,8 +1218,8 @@ ck "lane.sh NAMES the disk gate on a disk refusal" $rc
 ( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
-[ "$lrc3" -eq 73 ]; rc=$?
-ck "lane.sh on a MEMORY refusal exits 73 (got $lrc3) — not reported as a load or disk refusal" $rc
+[ "$lrc3" -eq 81 ]; rc=$?
+ck "lane.sh on a MEMORY refusal exits 81 (got $lrc3) — not reported as a load or disk refusal" $rc
 grep -q 'MEMORY gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the MEMORY gate on a memory refusal" $rc
 capgate="$(cut -f3 "$RO/state/capacity-refused-9999" 2>/dev/null)"
@@ -1949,6 +1958,18 @@ ov="$(MEM_LANE_RESERVE_MB=999999999 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '
   else echo "out-of-range floor=$MEM_MIN_AVAIL_MB (len=${#MEM_MIN_AVAIL_MB})"; fi' _ "$GATE")"
 [ "$ov" = "ok" ]; rc=$?
 ck "an absurd reserve is REPAIRED so the derived floor stays inside is_limit's range ($ov)" $rc
+# ⛔ AND EACH FACTOR IS REPAIRED AT SOURCE, NOT ONLY BECAUSE THE PRODUCT FAILED LATER (review, P2).
+# The reserve carried an upper guard and the LANE FACTOR did not, so an absurd lane factor was caught
+# one level down: the 13-digit product failed `is_limit`, the FLOOR was repaired to 2048, and the
+# factor an operator reads stayed at 999999999 — a value the gate silently does not use, which is the
+# "accepted value must be the used value" contract broken in the other direction. Both factors now
+# repair to their shipped defaults, and the assertion is on the FACTOR because that is the input.
+lf="$(MEM_LANE_RESERVE_MB=1024 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lf" = "2" ]; rc=$?
+ck "an absurd LANE FACTOR is REPAIRED to the shipped default at source (got '${lf:-<empty>}', want 2) — not merely masked by the floor's own range net" $rc
+lz="$(MEM_SPAWN_RESERVE_LANES=0 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lz" = "2" ]; rc=$?
+ck "…and a zeroed lane factor is repaired too (got '$lz') — a 0x floor is the no-op gate" $rc
 
 # ── the VERDICT, end to end through the SHIPPED run_agent: FABRICATED readings ────────────────────
 # POSITIVE CONTROL FIRST (this file's rule): the same driver, a high reading, the agent must RUN —
