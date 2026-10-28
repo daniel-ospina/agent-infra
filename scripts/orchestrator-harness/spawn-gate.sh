@@ -1035,11 +1035,14 @@ cap_wip_snapshot() {
 #
 # ⛔ WHY HERE, AT THE END OF `run_agent`, AND NOT IN EACH LAUNCHER. `lane.sh`, `fix-one.sh` and
 # `nonblocking-dispatch.sh` are three entry points with three exit paths and three report formats;
-# `merge-one.sh` has a fourth `run_agent` of its own. At the END of `run_agent` "the agent has stopped"
-# is KNOWN (the hard kill, if any, has already landed), so every caller in the tree gets the guarantee
-# by construction — the same argument #1932 used to put the venv teardown beside the spawn. A
-# launcher that adds its own copy would be the `fourth launch path` this file's census exists to
-# refuse.
+# `merge-one.sh` has a fourth `run_agent` of its own. At the END of this `run_agent` "the agent has
+# stopped" is KNOWN (the hard kill, if any, has already landed), so every CALLER OF THIS FUNCTION
+# gets the guarantee by construction — the same argument #1932 used to put the venv teardown beside
+# the spawn. A launcher that adds its own copy would be the `fourth launch path` this file's census
+# exists to refuse. ⛔ It does NOT reach `merge-one.sh`'s copy, whose agent is a reviewer that lands a
+# comment and a signed record rather than worktree work: that residual is named in
+# `docs/ops/lane-signal-forensics.md` and is unchanged here — the guarantee is per-function, not a
+# claim about every `run_agent`-shaped loop in the tree.
 #
 # ⛔ THE ROOT IS `WIP_PATH`, THEN `$PWD` — NEVER A GUESS. `fix-one.sh` `cd`s into the MAIN checkout and
 # only NAMES the fixer's worktree in the agent's prompt, so `$PWD` there is NOT the tree the work is in;
@@ -1077,7 +1080,13 @@ LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 
 # wip_rescue_path — resolve scripts/bg-rescue-wip.sh the way the other helpers are resolved. `$O` is
 # seeded FILE BY FILE, so a new spawn-gate.sh can run beside an `$O` that predates the rescue; the
-# harness dir is the second home, and the two farmed copies are last so an operator's install wins.
+# harness dir's parent (the repo's `scripts/`) is the second home, and the two farmed copies are last
+# so an operator's install wins. ⛔ THE FARMED HOME IS NOT OPTIONAL ON A FLAT `$O` (review F3, round 3):
+# the `$O` payload is `scripts/orchestrator-harness/*` only (§4's `cp …/orchestrator-harness/*.sh`,
+# `deploy-harness.sh --src`), and this file lives one directory ABOVE that — so on a box whose
+# launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile) all four homes missed
+# and every at-risk lane recorded `UNAVAILABLE`: loud, but the archive never happened. `setup.sh`'s
+# farm now delivers `bg-rescue-wip.sh` to `~/.pi/agent/scripts/`, the fourth home below.
 wip_rescue_path() {
   local c here
   if [ -n "$LANE_WIP_RESCUE_SH" ]; then printf '%s\n' "$LANE_WIP_RESCUE_SH"; return 0; fi
@@ -1123,6 +1132,7 @@ lane_end_record() {
 terminal_wip_rescue() {
   local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
   local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 at_risk=0 l local_ref=""
+  local local_ref_before="" local_ref_after=""
   root="${WIP_PATH:-$PWD}"
   LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0
   if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
@@ -1176,6 +1186,17 @@ terminal_wip_rescue() {
       # Output is CAPTURED and replayed rather than streamed, so a partial write cannot interleave on
       # the lane's own log, and so the verdict below follows the SHIPPED script's exit status rather
       # than a grep of prose it might change.
+      # ⛔ THE REF MUST BE *THIS RUN'S*, AND `refs/wip-local/<slug>` IS NOT PER-RUN (review F1, round 3).
+      # It lands in the repo's COMMON git dir (a ref written from one linked worktree is visible from
+      # every other), it is keyed by branch slug alone, and bg-rescue-wip.sh never removes it. So an
+      # EARLIER rescue of the same slug — an earlier `run_agent` for this lane, or a PEER lane on a
+      # reused branch (the case named in the header) — survives a run that archives NOTHING:
+      # `bg-rescue-wip.sh:62` exits 2 at `mktemp` and `:156-161` exits 0 on "nothing at risk", both
+      # BEFORE `:247`'s update-ref. Treating mere EXISTENCE as proof made the record say "this
+      # worktree's work IS archived and pinned" over work that is still single-copy — the full-disk
+      # path, which is exactly where the rescue matters most. So read it BEFORE, read it AFTER, and
+      # only a CHANGED sha counts as an archive this run produced.
+      local_ref_before="$(git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" 2>/dev/null)"
       outf="$(mktemp "${TMPDIR:-/tmp}/wip-exit.XXXXXX" 2>/dev/null)"
       if [ -n "$outf" ]; then
         bash "$out" "$root" "$note" > "$outf" 2>&1; rc2=$?
@@ -1197,15 +1218,24 @@ terminal_wip_rescue() {
       #   * `:384-396` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
       #     callee prints the sha, so the ONE pointer to the archived commit was neither shown nor
       #     recorded, while the line claimed the work was only at $root.
-      # So: ref present + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box push
-      # UNCONFIRMED) — which is neither `FAILED` (nothing archived) nor `refs/wip/<slug>` (a push this
-      # code cannot see without a network call it deliberately does not make). `FAILED` is now reserved
-      # for its only honest meaning: the callee failed AND no ref pins anything.
-      if git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" >/dev/null 2>&1; then
+      # So: a ref THIS RUN wrote + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box
+      # push UNCONFIRMED) — which is neither `FAILED` (nothing archived) nor `refs/wip/<slug>` (a push
+      # this code cannot see without a network call it deliberately does not make). `FAILED` keeps its
+      # only honest meaning: the callee failed AND no new ref pins anything.
+      # ⛔ AN UNCHANGED sha is a STALE snapshot of an earlier rescue, not this lane's work: it is named
+      # in FAILED's line and never promoted to a ref column. (The one case where a real archive could
+      # reuse a sha — same tree, same note, same SECOND — under-claims as "nothing", which is the safe
+      # direction: the ref still exists, and the replayed callee lines above show what happened.)
+      local_ref_after="$(git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" 2>/dev/null)"
+      if [ -n "$local_ref_after" ] && [ "$local_ref_after" != "$local_ref_before" ]; then
         local_ref="refs/wip-local/$slug@$(git -C "$root" rev-parse --short "refs/wip-local/$slug" 2>/dev/null)"
       fi
-      if [ "$rc2" -eq 0 ]; then
+      if [ "$rc2" -eq 0 ] && [ -n "$local_ref" ]; then
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="refs/wip/$slug"
+      elif [ "$rc2" -eq 0 ]; then
+        # Exit 0 with no NEW ref is the callee's own "nothing at risk" arm: it archived nothing, so
+        # claiming a pushed ref here would be a push this code never saw.
+        LANE_END_RESCUE="nothing"
       elif [ -n "$local_ref" ]; then
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="archived-local"
       else
@@ -1213,7 +1243,10 @@ terminal_wip_rescue() {
       fi
       echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
       if [ "$LANE_END_RESCUE" = "FAILED" ]; then
-        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref this run wrote pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+        if [ -n "$local_ref_before" ]; then
+          echo "[wip] ⛔ label=$label: NOTE — refs/wip-local/$slug@$local_ref_before still exists, but it was written by an EARLIER rescue of this branch and this run did NOT update it. That snapshot may PREDATE the work now in the tree; do not read it as covering this lane" >> "$log"
+        fi
       elif [ "$LANE_END_RESCUE" = "archived-local" ]; then
         echo "[wip] ⛔ label=$label: the rescue did NOT finish cleanly (bg-rescue-wip.sh exit $rc2) BUT this worktree's work IS archived and pinned at $LANE_END_REF. bg-rescue-wip.sh exits 2 both for a PARTIAL archive (the ref WAS pushed to origin; the skipped paths are what stays local) and for a push that failed (the local ref is still valid), so read the replayed lines above for which one this was — this line does not guess. Do NOT reap this worktree before retrieving it" >> "$log"
       fi
