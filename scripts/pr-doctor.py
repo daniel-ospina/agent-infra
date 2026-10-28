@@ -801,7 +801,7 @@ def worker_name(number) -> str:
 
     ⛔ THE UNQUALIFIED `prd-<n>` IS STILL READ (#2725), never written: a worker started before this
     change holds `$O/bg/prd-<n>.{rc,pid,started}`, and `worker_live_for()` asks for that name too --
-    bounded to this checkout -- so a rename cannot turn a running worker into an idle slot. What
+    unconditionally, see there -- so a rename cannot turn a running worker into an idle slot. What
     `--status` prints is unchanged in shape (`<name> running|done|failed|lost …`); only the `<name>`
     it is asked about, and prints, carries the tag.
     """
@@ -1245,9 +1245,11 @@ def capacity() -> dict:
 # "nothing found => assume alive" (the safe direction) would faithfully keep every ghost. So the
 # TRAILING NUMBER is matched as well. That over-matches deliberately: another repo's LIVE worker
 # with the same PR number keeps a slot (throughput), and it never frees one (a duplicate dispatch).
-# ⛔ Liveness is a DIFFERENT question and is answered differently: `worker_live_for()` attributes
-# the unqualified name to a checkout from the dispatcher's own `.started` record, because a slot
-# held too long costs throughput while a worker read as dead costs two agents in one index.
+# ⛔ Liveness is a DIFFERENT question and is answered differently: `worker_live_for()` probes the
+# unqualified name UNCONDITIONALLY and does not try to attribute it, because a slot held too long
+# costs throughput while a worker read as dead costs two agents in one index. The `.started` record
+# is a single box-global slot keyed by name, so it cannot attribute the two colliding identities --
+# see `worker_live_for()` (#2980 review cycle 6, P1).
 #
 # ⛔ AND THE SELF-REPORT NEEDS THREE STATES, NOT TWO (#2746 review). `alive` used to mean "not provably
 # gone", which counts a row with no `worker`, a row whose pid file was pruned, and a pid file we
@@ -3617,120 +3619,19 @@ def set_rubric_note(entries: list[str]) -> str:
             % (len(slugs), ",".join(sorted(slugs))))
 
 
-_STARTED_WT_RE = re.compile(r"^worktree=(.*)$", re.MULTILINE)
+def worker_names_for(number) -> list[str]:
+    """Every worker name that resolves to this PR's ONE worktree, most specific first.
 
-
-def _started_worktree(name: str) -> str:
-    """The `worktree=` a worker's own `.started` record names, or "" when there is none to read.
-
-    `nonblocking-dispatch.sh` writes that record when it ACCEPTS an order (`name= / worktree= /
-    branch= / kind= / prompt= / started= / cap=`), so it is the dispatcher's own answer to "which
-    tree did this worker take" -- not an inference from the worker's name. Bounded read and
-    `errors="replace"` for the reason `_read_pid` gives: a record is an artifact, and an artifact
-    must not be able to abort a pass. An unreadable record answers "" (no evidence), never a guess.
-
-    ⛔ `isfile` BEFORE THE OPEN, BECAUSE A FIFO IS NOT AN UNREADABLE FILE (#2980 review cycle 5,
-    P1). `open()` on a writer-less FIFO BLOCKS instead of raising, so the `except OSError` below
-    never fires and the pass hangs on an artifact for ever -- no verdict, no heartbeat, no dispatch.
-    This is not a theoretical shape: it is the exact rule `_worker_pid_files` already states one
-    function away (`:1312-1314`, "a FIFO is not -- `open()` on one BLOCKS with no writer"), and
-    this reader sits on the hot path, once per queued PR. `isfile` (which follows symlinks and is
-    False for a FIFO/device/directory) is the guard; the safe answer is unchanged, because no
-    readable record is no evidence.
+    The worktree is `prd-<n>` in every mode (see `materialise_worktree`), while the NAME is
+    repo-qualified, so more than one name can be live for one tree. This is the single list both
+    the liveness QUESTION and the log lines that report its answer are built from, so a message
+    can never name a worker nothing wrote (#2980 review cycle 6, P2).
     """
-    started = bg_path(name, "started")
-    if not os.path.isfile(started):
-        return ""                        # absent, or a FIFO/device that would block the open
-    try:
-        with open(started, errors="replace") as fh:
-            data = fh.read(4096)
-    except OSError:
-        return ""
-    m = _STARTED_WT_RE.search(data)
-    return (m.group(1) or "").strip() if m else ""
-
-
-def _in_this_checkout(worktree: str) -> bool:
-    """True when `worktree` is under THIS pass's `.worktrees` root (or cannot be attributed).
-
-    ⛔ COMPARED AS REAL PATHS, NOT AS SPELLINGS (#2725 review). The two sides do not come from one
-    process: `WORKTREE_ROOT` is this pass's own configuration, while the `.started` record carries
-    the path the DISPATCHER was handed. `abspath` only normalises `.`/`..`, so one directory spelled
-    two ways compares UNEQUAL -- and on macOS that is the default, not an edge case (`/tmp` is a
-    symlink to `/private/tmp`, so a `TMPDIR`-rooted worktree root and a `/tmp`-rooted record are one
-    directory with two names). Unequal means "not ours", which SKIPS probing a live pre-#2725
-    worker: the pass adopts its worktree, `nonblocking-dispatch.sh` does `rm -f "$RC"` and
-    `: > "$LOG"`, and the running agent's evidence is destroyed by a second agent in one git index.
-    That is the UNSAFE direction, so a symlinked checkout root -- which this repo already ships
-    (`scripts -> $AGENT_INFRA_PATH/scripts`) -- must not be able to produce it.
-
-    `realpath` resolves the links on both sides, so two spellings of one directory ATTRIBUTE (probe
-    it: the safe direction) while two genuinely different trees still do not.
-
-    ⛔ AND IT RESOLVES THROUGH `_rp()`, NOT `os.path.realpath()` DIRECTLY (#2725 review cycle 2, P1).
-    `worktree` is a string read out of a box-global `.started` ARTIFACT, so it is poisoned-value
-    input, and `realpath` has a VERSION-DEPENDENT failure on it that makes this function decide the
-    UNSAFE direction on the runtime that actually runs here:
-
-      * on Python >= 3.10 (CI pins 3.12) `realpath` RAISES `ValueError` for an embedded NUL, and an
-        uncaught one propagates `worker_live_for -> dispatch -> main -> EXIT_CRASH`: zero dispatches
-        on EVERY pass until a human deletes the file (the measured `_read_pid`/#2746 class);
-      * on Python 3.9 -- `/usr/bin/python3` on this box, and the interpreter the orchestrator
-        scripts invoke -- `realpath` returns the poisoned path UNCHANGED, `startswith` is False, and
-        a live pre-#2725 worker is read as FOREIGN, which is the T2 work-destroying hole above.
-
-    `_rp()` is this file's answer to exactly that split (`:2106`): it rejects an embedded NUL before
-    calling `realpath` and returns "" for anything unresolvable, never raising. An empty resolution
-    is UNREADABLE EVIDENCE, and the safe answer to unreadable evidence is to probe anyway -- the
-    same fail-closed rule `_rp()`'s own docstring states.
-
-    ⛔ AND "UNDER THIS ROOT" IS NOT THE WHOLE POPULATION (#2980 review cycle 4, P1).
-    `materialise_worktree` has an ADOPT arm whose own comment says it "returns a worktree that is
-    NOT under WORKTREE_ROOT" (`:2360`) -- a lane's branch checked out at `~/.worktrees/<name>`,
-    `$HOME/wt-<slug>`, `/tmp/wt-<slug>` or `.../.worktrees/<name>` anywhere on the box, which this
-    repo's own tests exercise (`test_the_adopt_arm_shares_the_documented_owner_worktree_boundary`).
-    A pre-#2725 worker dispatched into THAT tree records it in its `.started`, so a root-prefix test
-    alone attributed a LIVE worker as foreign, skipped the probe, and let the pass adopt the very
-    tree it was already running in -- the T2 work-destroying direction, reached through the
-    attribution instead of the collision. Membership in THIS repo's own `git worktree list` is the
-    authority the adopt arm itself enumerates, so it is the missing half: a path this checkout
-    dispatches into is ours wherever it lives, while another repo's `/tmp/wt-<slug>` is not in THIS
-    repo's list and stays foreign.
-
-    ⛔ AN UNREADABLE ENUMERATION STILL NARROWS, AND THAT IS NOT A FAIL-OPEN. When `_worktrees()`
-    cannot be read it answers `[]`, so a path outside the root answers "not ours" -- but the ADOPT
-    arm enumerates through the SAME call, so in that same state it cannot hand back that path
-    either, and no dispatch can reach a tree this function declined to attribute. The unsafe
-    direction would need both reads to disagree inside one process, and they cannot.
-    ⛔ A BROTHER CHECKOUT OF THE SAME REPO IS STILL THIS REPO (#2980 review cycle 5, P2). The two
-    arms above are both CHECKOUT-scoped: `WORKTREE_ROOT` is this pass's own root, and `_worktrees()`
-    is this CLONE's registry. But the granularity this change writes with is the REPO, not the
-    checkout, deliberately (`:269-271`: two clones of one slug share the tag because they share the
-    register). A second clone has its OWN worktree registry, so a live pre-#2725 worker sitting in
-    it matched neither arm, read as foreign, and the pass dispatched a SECOND worker onto the same
-    branch -- and the no-row path explicitly relies on the next pass seeing a running worker
-    (`:3905-3906`), which a next pass in the other clone then would not. So the recorded tree's OWN
-    `origin` settles it: a worktree that PROVES it is this slug is ours wherever it is checked out,
-    and one that proves it is another slug stays foreign. A relative path is resolved against OUR
-    cwd, which is no evidence at all -- this file already rules that at `:2247` -- so it probes.
-    """
-    if not worktree or not WORKTREE_ROOT:
-        return True                       # nothing to attribute it with: do not narrow on a guess
-    if not os.path.isabs(worktree):
-        return True                       # relative: resolved against OUR cwd -- no evidence
-    root, wt = _rp(WORKTREE_ROOT), _rp(worktree)
-    if not root or not wt:
-        return True                       # unresolvable: unreadable evidence never narrows
-    if wt.startswith(root + os.sep):
-        return True                       # by construction
-    for path, _branch in _worktrees():     # the ADOPT arm's population, everywhere it lives
-        if _rp(path) == wt:
-            return True
-    # a brother checkout of the SAME repo (its own registry cannot list this clone's worktrees)
-    slug, _why = _origin_slug(wt)         # total: ("", why) on any failure, never raises
-    if not slug:
-        return True                       # unattributable tree: no evidence, so do not narrow
-    return slug.lower() == (REPO or "").lower()
+    names = [worker_name(number)]
+    plain = "prd-%s" % number
+    if plain not in names:
+        names.append(plain)              # the pre-#2725 name for the SAME worktree
+    return names
 
 
 def worker_live_for(number) -> object:
@@ -3744,19 +3645,27 @@ def worker_live_for(number) -> object:
     asked of every name that resolves to its worktree, and an UNANSWERABLE reading (`None`) wins
     over a negative one: the safe direction is not to spawn.
 
-    ⛔ AND THE OLD NAME IS ONLY OURS WHERE THE DISPATCHER'S OWN RECORD SAYS SO (#2725). Probing a
-    box-global `prd-<n>` unconditionally is the very collision this change removes, merely on the
-    read side: repo A's pre-rename worker would hold repo B's PR #n as "still running" for as long
-    as its artifacts live. So the unqualified name is probed only when its `.started` record names
-    a tree under THIS checkout. The narrowing requires POSITIVE evidence -- an unreadable record, a
-    record with no `worktree=`, or a pass with no checkout are all probed anyway, because a false
-    "not live" destroys a running worker and a false "live" costs one pass of throughput.
+    ⛔ BOTH NAMES ARE PROBED UNCONDITIONALLY, AND THE `.started` RECORD IS NOT CONSULTED (#2980
+    review cycle 6, P1 -- this REPLACES an attribution that cycle 4/5 added). An earlier version
+    narrowed the unqualified probe to names whose `.started` record pointed at this checkout, and
+    treated a record naming ANOTHER repo as positive proof the name was foreign. That reasoning is
+    unsound, because `bg_path(name, "started")` is ONE BOX-GLOBAL SLOT keyed by NAME ALONE and
+    `nonblocking-dispatch.sh` writes it with a truncating `>`: the very collision #2725 is filed
+    about OVERWRITES it. Pre-rename, repo A and repo B both dispatched `prd-<n>`, so the surviving
+    record names whichever dispatched LAST -- typically the OTHER repo -- while A's worker is still
+    running. A then read its own live worker as foreign, skipped the probe, answered "not live" and
+    dispatched a second agent into the worktree the first one was still using: the exact
+    work-destroying direction this function's own reasoning forbids. The artifacts CANNOT attribute
+    the name, because the collision is what destroyed the attribution.
+
+    So the narrowing is gone rather than tightened, and the cost is the one the sibling reader
+    already accepted in the same words: `worker-supply.sh` says the unqualified name "is NOT
+    attributed to a checkout, unlike the doctor's own read -- so another repo's pre-rename worker
+    can hold this order as `live`. That is the safe direction." The two readers now agree; a false
+    "live" costs one pass of throughput and clears itself as the pre-rename artifacts age out,
+    while a false "not live" destroys a running agent's work.
     """
-    names = [worker_name(number)]
-    plain = "prd-%s" % number
-    if plain not in names and _in_this_checkout(_started_worktree(plain)):
-        names.append(plain)              # the pre-#2725 name for the SAME worktree
-    for nm in names:
+    for nm in worker_names_for(number):
         live = worker_live(nm)
         if live is None:                  # unanswerable: do not spawn
             return None
@@ -3878,11 +3787,12 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # deterministically destroys the live worker's log, exit status and pid. So liveness is asked
     # (the harness owns the question), never inferred from the state row.
     # ⛔ BOTH NAMES: the worktree is `prd-<n>`, and a worker started before #2725 is live under the
-    # UNQUALIFIED `prd-<n>` -- `worker_live_for()` asks that name too, attributed to this checkout by
-    # the dispatcher's own `.started` record (see there).
+    # UNQUALIFIED `prd-<n>` -- `worker_live_for()` asks that name too, unconditionally, and the two
+    # are named in the refusal because either one may be the one that answered (`worker_names_for`).
     live = worker_live_for(n)
     if live:
-        return False, "worker %s is still running -- one worker per PR" % name, False
+        return False, ("worker %s is still running -- one worker per PR"
+                       % " / ".join(worker_names_for(n))), False
     if live is None:
         # ⛔ UNANSWERABLE IS NOT "FREE". Spawning on an unreadable status would re-create the exact
         # defect this guard exists for -- two workers in one deterministic directory, the second
@@ -5185,8 +5095,12 @@ def run_pass(args, rubric_note: str = "") -> int:
             # COUNTED, so the pass line names it (see `_finish`): "dispatched 0 of 3 queued —
             # nothing to do" is a false clean when the truth is "three PRs already have a worker".
             stalled["worker-running"] = stalled.get("worker-running", 0) + 1
+            # ⛔ BOTH NAMES ARE NAMED, because either one may be the one that answered: pre-#2725
+            # a worker is live under the unqualified `prd-<n>`, and printing only the qualified
+            # name sends the operator to a `$O/bg/prd-<repo-tag>-<n>.*` that nothing ever wrote
+            # (#2980 review cycle 6, P2).
             log("#%s (%s): worker %s is still running -- not spawning a second one"
-                % (key, action, worker_name(key)))
+                % (key, action, " / ".join(worker_names_for(key))))
             continue
         if live is None:
             # ⛔ UNANSWERABLE IS NOT "FREE" (see worker_live): skip, loudly. It clears as soon as

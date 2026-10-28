@@ -5735,8 +5735,7 @@ def test_a_pre_2725_worker_ON_THIS_CHECKOUT_still_blocks_a_spawn(tmp_path, monke
     A worker started before the rename lives under `$O/bg/prd-<n>`, and `worker_live_for()` must
     still find it: reporting a running worker as ABSENT adopts its worktree and starts a second
     agent in it (`rm -f "$RC"`, `: > "$LOG"` — the live worker's evidence is gone). So the
-    unqualified name is probed whenever the dispatcher's own `.started` record attributes it to THIS
-    checkout — including when there is no record to read at all.
+    unqualified name is asked for EVERY PR, and the `.started` record is not consulted at all.
     """
     monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
     (tmp_path / "bg").mkdir()
@@ -5744,101 +5743,71 @@ def test_a_pre_2725_worker_ON_THIS_CHECKOUT_still_blocks_a_spawn(tmp_path, monke
     asked = []
     monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
 
-    # (a) its record names THIS checkout's worktree -> it is ours, ask it
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n"
-                 % os.path.join(pr.WORKTREE_ROOT, "prd-42"))
-    assert pr.worker_live_for(42) is True, asked
-    assert "prd-42" in asked, asked
-
-    # (b) no record at all (pruned, or a superseded order) -> unattributable, so still ask it
-    os.unlink(pr.bg_path("prd-42", "started"))
-    asked.clear()
-    assert pr.worker_live_for(42) is True, asked
-    assert "prd-42" in asked, asked
+    # (a) with a record present, and (b) with no record at all — the answer must be the same,
+    # because the record cannot attribute the name (see
+    # test_a_FOREIGN_started_record_does_NOT_hide_our_live_worker for why).
+    for present in (True, False):
+        if present:
+            with open(pr.bg_path("prd-42", "started"), "w") as fh:
+                fh.write("name=prd-42\nworktree=%s\nkind=prfix\n"
+                         % os.path.join(pr.WORKTREE_ROOT, "prd-42"))
+        elif os.path.exists(pr.bg_path("prd-42", "started")):
+            os.unlink(pr.bg_path("prd-42", "started"))
+        asked.clear()
+        assert pr.worker_live_for(42) is True, (present, asked)
+        assert "prd-42" in asked, (present, asked)
     pr.canonical_paths()
 
 
-def test_a_pre_2725_worker_from_ANOTHER_checkout_is_NOT_this_PRs_holder(tmp_path, monkeypatch):
-    """⛔ THE OTHER HALF (#2725): the old name is box-global, so probing it unconditionally RE-CREATES
-    the collision on the read side — repo A's pre-rename worker would hold repo B's PR #n as "still
-    running" for as long as its artifacts live. The dispatcher's own `.started` record settles it:
-    a worktree outside this checkout is somebody else's worker.
+def test_a_FOREIGN_started_record_does_NOT_hide_our_live_worker(tmp_path, monkeypatch):
+    """⛔ THE `.started` RECORD CANNOT ATTRIBUTE THE UNQUALIFIED NAME — THE COLLISION OVERWRITES IT
+    (#2980 review cycle 6, P1). This is the regression test for a fail-open that an earlier version
+    of this change shipped as a FEATURE.
+
+    `bg_path(name, "started")` is ONE box-global slot keyed by NAME ALONE, and
+    `nonblocking-dispatch.sh` writes it with a truncating `>`. Pre-#2725 BOTH repos named their
+    worker `prd-<n>`, so the surviving record names whichever repo dispatched LAST — and the other
+    repo's worker is still running. An attribution that read "the record names another repo" as
+    positive proof of foreignness therefore answered "not live" for a worker that was live, and
+    dispatched a second agent into the worktree the first one was still using: `rm -f "$RC"`,
+    `: > "$LOG"`, two agents on one git index. Asserted in BOTH directions of the record, because
+    the whole point is that the record's CONTENT cannot change the answer.
     """
     monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
     (tmp_path / "bg").mkdir()
     pr.apply_repo(_REPO_B, str(tmp_path / "tortoise"))
     asked = []
     monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
-    # A REAL foreign checkout: the record names a worktree that PROVES it is repo A. (A path that
-    # merely does not exist is UNATTRIBUTABLE, and unattributable evidence must PROBE -- that is the
-    # reverse arm, pinned by
-    # test_a_pre_2725_worker_in_a_BROTHER_CLONE_of_the_same_repo_is_still_probed.)
+
+    # A record naming a tree that PROVES it is the OTHER repo — the strongest "foreign" evidence
+    # the old narrowing accepted. The live worker is under the unqualified name regardless.
     (tmp_path / "agent-infra").mkdir()          # _git_repo mkdirs its own `repo` child
     foreign, g = _git_repo(tmp_path / "agent-infra")
     g("remote", "add", "origin", "https://github.com/%s.git" % _REPO_A)
     foreign_wt = foreign / ".worktrees" / "prd-42"
     g("worktree", "add", "--detach", str(foreign_wt), "HEAD")
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % foreign_wt)
-    assert pr.worker_live_for(42) is False, asked
-    assert "prd-42" not in asked, asked
-    assert "prd-daniel-ospina-tortoise-42" in asked, asked
-    pr.canonical_paths()
 
-
-def test_the_same_worktree_spelled_two_ways_is_still_THIS_checkouts(tmp_path, monkeypatch):
-    """⛔ THE ATTRIBUTION IS BY REAL PATH, NOT BY SPELLING (#2725 review).
-
-    `WORKTREE_ROOT` is this pass's configuration; the `.started` record carries the path the
-    DISPATCHER was handed. They are two different strings for one directory whenever a symlink is
-    involved -- and on macOS that is the DEFAULT (`/tmp` -> `/private/tmp`), as it is in this repo
-    (`scripts -> $AGENT_INFRA_PATH/scripts`). `abspath` cannot reconcile them, so the attribution
-    answered "not ours" and SKIPPED a live pre-#2725 worker: the pass adopts its worktree and
-    `nonblocking-dispatch.sh` destroys its `.rc`/`.log` under the running agent. A false "not live"
-    destroys work; a false "live" costs one pass of throughput, so the tie goes to probing.
-    """
-    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
-    (tmp_path / "bg").mkdir()
-    real_root = tmp_path / "real"
-    real_root.mkdir()
-    spelled = tmp_path / "link"
-    os.symlink(str(real_root), str(spelled))       # one directory, two names
-
-    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
-    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(spelled))     # this pass's configuration
-    asked = []
-    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
-
-    # the record names the REAL path, the config names the SYMLINK -> still this checkout
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n"
-                 % os.path.join(str(real_root), "prd-42"))
-    assert pr.worker_live_for(42) is True, asked
-    assert "prd-42" in asked, "a two-spelling worktree was read as another repo's: %r" % (asked,)
-
-    # and the CONVERSE spelling (config real, record symlinked) attributes the same way
-    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(real_root))
-    asked.clear()
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nworktree=%s/\nkind=prfix\n"
-                 % os.path.join(str(spelled), "prd-42"))      # trailing slash too
-    assert pr.worker_live_for(42) is True, asked
-    assert "prd-42" in asked, "the converse spelling (record symlinked, no trailing slash) was read as foreign: %r" % (asked,)
+    for recorded in (str(foreign_wt), ""):       # another repo's tree, then no record body at all
+        with open(pr.bg_path("prd-42", "started"), "w") as fh:
+            fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % recorded)
+        asked.clear()
+        assert pr.worker_live_for(42) is True, \
+            ("a live worker under the unqualified name was reported ABSENT: the pass would adopt ",
+             "its worktree and destroy its .rc/.log", asked)
+        assert "prd-42" in asked, asked
     pr.canonical_paths()
 
 
 def test_a_pre_2725_worker_in_an_ADOPTED_worktree_outside_the_root_still_blocks_a_spawn(tmp_path, monkeypatch):
     """⛔ "UNDER WORKTREE_ROOT" IS NOT THE WHOLE POPULATION (#2980 review cycle 4, P1).
 
-    `materialise_worktree`'s ADOPT arm returns a worktree that is NOT under `WORKTREE_ROOT` -- its
-    own comment says so (`:2360`), and
-    `test_the_adopt_arm_shares_the_documented_owner_worktree_boundary` drives that path for real. A
-    pre-#2725 worker dispatched into such a tree records THAT path in its `.started`, so a
-    root-prefix attribution answered "not ours", SKIPPED the probe, and let the pass adopt the very
-    worktree the live worker was running in: a second agent in one git index, and
-    `nonblocking-dispatch.sh` destroys the first one's `.rc`/`.log`. So attribution also accepts a
-    worktree REGISTERED to this repo, wherever on disk it lives.
+    `materialise_worktree`'s ADOPT arm returns a worktree that is NOT under `WORKTREE_ROOT` — its
+    own comment says so, and `test_the_adopt_arm_shares_the_documented_owner_worktree_boundary`
+    drives that path for real. A pre-#2725 worker dispatched into such a tree records THAT path in
+    its `.started`; a root-prefix attribution answered "not ours", SKIPPED the probe, and let the
+    pass adopt the very worktree the live worker was running in. That attribution is gone (the
+    record cannot attribute — see test_a_FOREIGN_started_record_does_NOT_hide_our_live_worker), so
+    the tree's location can no longer decide the question at all; this pins that it does not.
     """
     repo, g = _git_repo(tmp_path)
     head = g("rev-parse", "HEAD").stdout.strip()
@@ -5853,81 +5822,19 @@ def test_a_pre_2725_worker_in_an_ADOPTED_worktree_outside_the_root_still_blocks_
 
     with open(pr.bg_path("prd-42", "started"), "w") as fh:
         fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % outside)
-    assert pr._in_this_checkout(str(outside)) is True, \
-        "the adopt arm's own population was attributed as another repo's"
     assert pr.worker_live_for(42) is True, asked
     assert "prd-42" in asked, asked
-
-    # NON-VACUITY is carried by test_a_pre_2725_worker_from_ANOTHER_checkout_is_NOT_this_PRs_holder
-    # and the brother-clone test's `stranger` arm: a tree that PROVES a different slug is foreign.
-    pr.canonical_paths()
-
-
-def test_a_fifo_at_the_started_path_does_not_hang_the_pass(tmp_path, monkeypatch):
-    """⛔ AN ARTIFACT MUST NOT BE ABLE TO HANG THE PASS (#2980 review cycle 5, P1).
-
-    `_started_worktree()` reads a BOX-GLOBAL artifact, and `open()` on a writer-less FIFO BLOCKS
-    rather than raising -- so the `except OSError` never fires. It is on the hot path
-    (`worker_live_for()` is asked about every queued PR), so one planted FIFO would stop the drain
-    silently: no verdict, no heartbeat, no dispatch, for ever. That is the class the file already
-    guards for the `.pid` path (`test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot`),
-    and the rule its docstring states -- `isfile` FIRST, because a FIFO is not an unreadable file.
-    """
-    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
-    (tmp_path / "bg").mkdir()
-    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
-    # ⛔ THE HARNESS'S VERDICT IS NOT WHAT THIS TEST IS ABOUT (#2980, measured in CI). `worker_status`
-    # SHELLS OUT to `nonblocking-dispatch.sh --status`, and on a bare runner that question is
-    # legitimately UNANSWERABLE -- so `worker_live_for()` answers `None` ("do not spawn") there, and
-    # an `is not None` assertion reded `python-ci / test` over a CORRECT behaviour. Pin the verdict
-    # the way this file's other worker tests pin it: the FIFO guard is upstream of it either way,
-    # because `worker_live_for()` evaluates `_started_worktree(plain)` to build its name list FIRST.
-    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
-    fifo = pr.bg_path("prd-42", "started")
-    os.mkfifo(fifo)
-    try:
-        # ⛔ BOTH CALLS BELOW MUST BE BOUNDED, because a blocked `open()` cannot be detected by merely
-        # AWAITING it: the main thread would HANG rather than FAIL, which is the one thing this test
-        # exists to rule out (under the mutated guard, the unbounded first assertion hung the suite
-        # until pytest-timeout fired at 120 s instead of failing in 15). The call is therefore made on
-        # a daemon thread that can be abandoned and that dies with the interpreter.
-        def answered(fn, what):
-            box = {}
-
-            def run():
-                try:
-                    box["v"] = fn()
-                except BaseException as exc:         # surface it as a finding, never swallow it
-                    box["err"] = exc
-
-            t = threading.Thread(target=run, daemon=True)
-            t.start()
-            t.join(15)
-            assert not t.is_alive(), (
-                "%s blocked on a FIFO at .started — one planted FIFO would stop the drain "
-                "silently: no verdict, no heartbeat, no dispatch, for ever" % what)
-            assert "err" not in box, "%s raised on a FIFO: %r" % (what, box.get("err"))
-            return box["v"]
-
-        assert answered(lambda: pr._started_worktree("prd-42"),
-                        "_started_worktree()") == "", "a FIFO was read as a record"
-        # ...and the liveness question still ANSWERS instead of wedging the pass
-        assert answered(lambda: pr.worker_live_for(42),
-                        "worker_live_for()") is False, "a FIFO is not evidence of a live worker"
-    finally:
-        os.unlink(fifo)
     pr.canonical_paths()
 
 
 def test_a_pre_2725_worker_in_a_BROTHER_CLONE_of_the_same_repo_is_still_probed(tmp_path, monkeypatch):
     """⛔ THE GRANULARITY IS THE REPO, NOT THE CHECKOUT (#2980 review cycle 5, P2).
 
-    `WORKTREE_ROOT` is this pass's root and `_worktrees()` is this CLONE's registry, so a live
-    pre-#2725 worker in a SECOND CLONE of the same repo matched neither arm, read as foreign, and
-    the pass dispatched a second worker onto the same branch -- the very liveness check the no-row
-    path relies on (`:3905-3906`) would not see it from the other clone. A worktree that PROVES it
-    is this repo (its own `origin`) is ours wherever it is checked out; one that proves a different
-    slug stays foreign.
+    A live pre-#2725 worker in a SECOND CLONE of the same repo shares the worktree name but not this
+    clone's registry. Under the removed attribution it matched no arm, read as foreign, and the pass
+    dispatched a second worker onto the same branch. It is now probed like every other name, so the
+    clone a legacy worker happens to sit in cannot hide it — asserted for a brother clone AND for a
+    different repo's tree, because the answer must not depend on which tree the record names.
     """
     def mk(path, slug):
         path.mkdir(parents=True)
@@ -5956,23 +5863,43 @@ def test_a_pre_2725_worker_in_a_BROTHER_CLONE_of_the_same_repo_is_still_probed(t
     asked = []
     monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
 
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % brother)
-    assert pr._in_this_checkout(str(brother)) is True, "a brother clone of this repo read as foreign"
-    assert pr.worker_live_for(42) is True, asked
-    assert "prd-42" in asked, asked
+    for tree in (brother, stranger):
+        with open(pr.bg_path("prd-42", "started"), "w") as fh:
+            fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % tree)
+        asked.clear()
+        assert pr.worker_live_for(42) is True, (tree, asked)
+        assert "prd-42" in asked, asked
+    pr.canonical_paths()
 
-    # NON-VACUITY: a worktree that PROVES a DIFFERENT slug is still somebody else's (T1 read side)
-    asked.clear()
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % stranger)
-    assert pr._in_this_checkout(str(stranger)) is False, \
-        "another repo's worktree was attributed as ours -- the read-side collision is back"
-    assert pr.worker_live_for(42) is False, asked
-    assert "prd-42" not in asked, asked
 
-    # a RELATIVE record is resolved against OUR cwd, which is no evidence at all -> probe
-    assert pr._in_this_checkout(".worktrees/prd-42") is True
+def test_the_started_record_is_never_opened_by_the_liveness_question(tmp_path, monkeypatch):
+    """⛔ THE HAZARD IS REMOVED AT THE SOURCE, NOT GUARDED (#2980 review cycle 6).
+
+    `worker_live_for()` used to read `$O/bg/<name>.started` to build its name list, which made the
+    hot path (asked about every queued PR) do an `open()` on a BOX-GLOBAL artifact — and `open()`
+    on a writer-less FIFO BLOCKS rather than raising, so one planted FIFO would stop the drain for
+    ever with no verdict, no heartbeat and no dispatch. Because the record no longer decides
+    anything, that read is GONE, so the guard is unnecessary rather than merely present: a FIFO (or
+    anything else) at that path is now inert. This replaces the bound-and-timeout test that used to
+    defend the read; it asserts the stronger property and cannot hang, because nothing is read.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    # ⛔ THE HARNESS'S OWN VERDICT IS NOT WHAT THIS TEST IS ABOUT: `worker_status` shell outs to
+    # `nonblocking-dispatch.sh --status`, which is legitimately UNANSWERABLE on a bare runner, so
+    # pin it the way this file's other worker tests do.
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or False)
+
+    os.mkfifo(pr.bg_path("prd-42", "started"))
+    try:
+        assert pr.worker_live_for(42) is False, asked
+        assert asked == ["prd-daniel-ospina-agent-infra-42", "prd-42"], asked
+        assert pr.worker_names_for(42) == asked, "the reported names are not the probed ones"
+    finally:
+        os.unlink(pr.bg_path("prd-42", "started"))
     pr.canonical_paths()
 
 
@@ -5994,135 +5921,6 @@ def test_one_repo_cannot_acquire_two_worker_identities_from_slug_case(tmp_path, 
         names.append(pr.worker_name(42))
     assert names[0] == names[1] == "prd-daniel-ospina-agent-infra-42", names
     assert pr.repo_tag("Daniel-Ospina/Agent-Infra") == pr.repo_tag("daniel-ospina/agent-infra")
-    pr.canonical_paths()
-
-
-def test_a_poisoned_started_record_neither_crashes_the_pass_nor_reads_as_foreign(tmp_path, monkeypatch):
-    """⛔ AN ARTIFACT MUST NOT BE ABLE TO DECIDE THE UNSAFE DIRECTION (#2725 review cycle 2, P1).
-
-    `_in_this_checkout()` resolves a string read out of the box-global `.started` file, so it is
-    poisoned-value input, and `os.path.realpath` has a VERSION-DEPENDENT failure on it:
-
-      * Python >= 3.10 raises `ValueError` for an embedded NUL. Uncaught, it propagates
-        `worker_live_for -> dispatch -> main -> EXIT_CRASH`: ZERO dispatches on every pass until a
-        human deletes the file (the measured `_read_pid`/#2746 class);
-      * Python 3.9 -- `/usr/bin/python3` here, and the interpreter the orchestrator scripts invoke --
-        returns the poisoned path UNCHANGED, `startswith` is False, so a live pre-#2725 worker is
-        read as FOREIGN. That is the work-destroying direction: the pass adopts the worktree and
-        `nonblocking-dispatch.sh` does `rm -f "$RC"; : > "$LOG"` under a running agent.
-
-    So the attribution routes through `_rp()` (which rejects an embedded NUL and returns "" for
-    anything unresolvable, never raising), and an empty resolution means UNREADABLE EVIDENCE -- which
-    must PROBE, never narrow. Both arms are asserted here because the two Pythons fail differently
-    and only one of them is the CI interpreter.
-    """
-    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
-    (tmp_path / "bg").mkdir()
-    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
-    asked = []
-    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
-
-    # (a) an embedded NUL: the record is unreadable evidence -> probe anyway, and do NOT raise
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nworktree=%s\x00x\nkind=prfix\n"
-                 % os.path.join(pr.WORKTREE_ROOT, "prd-42"))
-    assert pr._in_this_checkout(pr._started_worktree("prd-42")) is True, \
-        "a poisoned record narrowed the attribution instead of refusing to decide"
-    assert pr.worker_live_for(42) is True, asked          # and above all: it did not raise
-    assert "prd-42" in asked, asked
-
-    # (b) an unresolvable root is the same class: unreadable evidence, so probe
-    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "wt") + "\x00")
-    asked.clear()
-    assert pr._in_this_checkout(os.path.join(str(tmp_path), "wt", "prd-42")) is True, asked
-    pr.canonical_paths()
-
-
-def test_the_checkout_boundary_is_a_PATH_SEGMENT_not_a_STRING_PREFIX(tmp_path, monkeypatch):
-    """⛔ THE `+ os.sep` GUARD, PINNED DIRECTLY (#2725 review cycles 3 and 5).
-
-    Every other `_in_this_checkout()` assertion pins a case where TWO DIFFERENT TREES are involved,
-    so a mutant that dropped the separator would still pass them: `/x/other/prd-42` does not
-    `startswith("/x/wt")` either way. The separator is load-bearing exactly once -- when a SIBLING
-    checkout's name begins with this one's (`/x/wt2` vs root `/x/wt`), where a bare prefix match
-    says "ours". That over-attributes a FOREIGN worker to this PR, which is the T3 half: its
-    liveness is then asked as this PR's holder. It costs a slot rather than destroying work, but it
-    is a wrong answer computed from a correct-looking comparison, so it gets its own assertion.
-
-    The negative arms must PROVE the tree is another repo (its own `origin`), because attribution
-    is now repo-granular: a path that cannot be attributed at all -- including one that does not
-    exist -- is ABSENT EVIDENCE, and absent evidence must PROBE (#2980 review cycle 5). The prefix
-    arm still runs FIRST, so a bare-prefix mutant answers True for these and reddens here.
-    """
-    root = tmp_path / "wt"
-    root.mkdir()
-    sibling = tmp_path / "wt2"                 # its name PREFIXES the root
-    sibling.mkdir()
-
-    def g(*a):
-        return subprocess.run(["git", "-C", str(sibling)] + list(a), check=True,
-                              capture_output=True, text=True)
-    g("init", "-q")
-    g("config", "user.email", "t@t")
-    g("config", "user.name", "t")
-    g("config", "commit.gpgsign", "false")
-    (sibling / "f.txt").write_text("x\n")
-    g("add", "f.txt")
-    g("commit", "-qm", "base")
-    g("remote", "add", "origin", "https://github.com/%s.git" % _REPO_B)   # a DIFFERENT repo
-    (sibling / "prd-42").mkdir()               # resolves to the same (foreign) repo
-
-    monkeypatch.setattr(pr, "REPO", _REPO_A)
-    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(root))
-    assert pr._in_this_checkout(str(root / "prd-42")) is True, "a child of the root is ours"
-    assert pr._in_this_checkout(str(sibling)) is False, \
-        "a SIBLING checkout whose name prefixes the root was read as ours -- the `+ os.sep` guard is gone"
-    assert pr._in_this_checkout(str(sibling / "prd-42")) is False
-
-    monkeypatch.setattr(pr, "WORKTREE_ROOT", "")
-    assert pr._in_this_checkout("/anywhere/prd-42") is True, \
-        "an unconfigured root is absent evidence, and absent evidence must PROBE"
-
-
-def test_a_started_record_with_NO_worktree_line_probes_rather_than_narrows(tmp_path, monkeypatch):
-    """⛔ THE EMPTY-`worktree` ARM, AND THE RECORD THAT HAS A FILE BUT NO FIELD (#2725 cycle 3).
-
-    `_started_worktree()` answers "" for TWO different situations, and both must reach the PROBE
-    branch of `_in_this_checkout()` (`if not worktree ...: return True`):
-
-      * there is no `.started` file at all (pruned, or a superseded order), and
-      * there IS a file but it carries no `worktree=` line -- which `nonblocking-dispatch.sh` only
-        writes on ACCEPT, so a partial or hand-written record is realistic, and a record written by
-        an older dispatcher need not have the field.
-
-    Neither is evidence that the worker is foreign. Narrowing on a MISSING field would read a live
-    worker as somebody else's and let the pass adopt its worktree -- `rm -f "$RC"`, `: > "$LOG"`
-    under a running agent. `_in_this_checkout("")` is asserted DIRECTLY here, because it was
-    previously only reached indirectly through a dispatch-level test.
-
-    ⛔ WHICH GUARD DECIDES IT, MEASURED (do not claim a mutation this cannot produce). Removing the
-    `not worktree` disjunct ALONE does NOT redden this test, and cannot: `_rp("")` returns "" and the
-    next guard (`if not root or not wt`) answers True for it. So that disjunct is a cheap early-out
-    -- it saves two `realpath` calls and states the intent -- and the DECISION belongs to the
-    `not wt` guard. Removing THAT one reddens this test (`_in_this_checkout('') is False`), and it
-    reddens the poisoned-record test too. The behaviour is what is pinned here; the disjunct is
-    defence in depth, and its redundancy is deliberate rather than an untested path.
-    """
-    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
-    (tmp_path / "bg").mkdir()
-    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
-    asked = []
-    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
-
-    # the branch itself, directly
-    assert pr._in_this_checkout("") is True, "an absent worktree is absent evidence: probe, never narrow"
-
-    # and through the shipped reader: a `.started` file with metadata but NO `worktree=` line
-    with open(pr.bg_path("prd-42", "started"), "w") as fh:
-        fh.write("name=prd-42\nbranch=fix/x\nkind=prfix\n")
-    assert pr._started_worktree("prd-42") == "", "the fixture must actually lack the field"
-    assert pr.worker_live_for(42) is True, asked
-    assert "prd-42" in asked, "a field-less record narrowed the attribution: %r" % (asked,)
     pr.canonical_paths()
 
 

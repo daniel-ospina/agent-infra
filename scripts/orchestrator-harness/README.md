@@ -2430,7 +2430,7 @@ dispatcher itself recorded** (`name worktree prompt cap kind`).
 ⛔ **AND THE LIVENESS QUESTION IS ASKED OF THE WORKTREE, NOT OF ONE NAME.** `pr-doctor.worker_name()`
 is REPO-QUALIFIED (`prd-<repo-tag>-42`, in **every** mode since #2725) while the worktree is
 `prd-42` in **both** modes, so two orders can name one directory — the #2280 defect, which
-`worker_live_for()` (`pr-doctor.py:3638`) fixes on the doctor's side and which this supervisor must
+`worker_live_for()` (`pr-doctor.py:3637`) fixes on the doctor's side and which this supervisor must
 not reintroduce one
 layer down (`nonblocking-dispatch.sh` performs **no** liveness check of its own, so this is the only
 guard there is). Before every re-offer it asks `--status` for **every order that records the same

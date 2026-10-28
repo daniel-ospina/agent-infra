@@ -368,7 +368,7 @@ ask_status() { # <name> <started-file>
 # (`prd-<repo-tag>-42`, in every mode since #2725) while the WORKTREE is `prd-42`, so two orders can
 # name one directory -- and this script is the ONLY liveness guard `nonblocking-dispatch.sh` has (it
 # performs none itself). Asking only the order's OWN name is the exact defect `worker_live_for`
-# (pr-doctor.py:3526) was written to remove: the pass reads the other order's LIVE worker as absent,
+# (pr-doctor.py:3637) was written to remove: the pass reads the other order's LIVE worker as absent,
 # re-offers, and a second agent is spawned into one git index, one branch and one log/.rc/.pid —
 # destroying the live worker's evidence.
 #
@@ -376,10 +376,13 @@ ask_status() { # <name> <started-file>
 # answered from the order population (every `$O/bg/<name>.started` recording that worktree) PLUS the
 # UNQUALIFIED `prd-<n>` alias when it differs from ours. Since #2725 that alias is the PRE-RENAME
 # worker's name (a worker started before the identity was repo-scoped), so it is a BACK-COMPAT arm:
-# the doctor itself no longer writes it. ⚠️ It is NOT attributed to a checkout, unlike the doctor's
-# own read — so another repo's pre-rename worker can hold this order as `live`. That is the safe
-# direction (a deferred re-offer), and it clears itself as those artifacts age out. An UNANSWERABLE
-# read wins over a later negative: the safe direction is not to spawn.
+# the doctor itself no longer writes it. ⚠️ Like this script, the doctor does NOT attribute that name
+# to a checkout either (#2980 review cycle 6, P1: `$O/bg/<name>.started` is ONE box-global slot keyed
+# by NAME, and the pre-rename collision OVERWRITES it, so `worktree=` names whichever repo dispatched
+# last — it cannot prove which repos hold the name). So another repo's pre-rename worker can hold
+# this order as `live`, on BOTH paths, and that agreement is deliberate: the safe direction is a
+# deferred re-offer, and it clears itself as those artifacts age out. An UNANSWERABLE read wins over
+# a later negative: the safe direction is not to spawn.
 # Prints `live:<name>` | `unknown:<name>` | nothing. Runs in its own subshell at the call site, so
 # `ask_status`'s globals (STATUS_KIND/STATUS_WHY) do not leak into the caller's walk.
 worktree_holder() { # <own-name> <worktree>
