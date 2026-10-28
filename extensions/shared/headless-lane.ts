@@ -78,6 +78,22 @@
  * textually identical to it — two languages, so no shared constant is possible,
  * but ONE list to keep in step, and this comment names the other copy.
  *
+ * ⛔ THE SCOPE OF THAT SCRUB IS THIS MODULE, NOT THE REPO — stated because the
+ * paragraph above reads as if the vector were closed everywhere. The SAME
+ * predicate is implemented a second time, UN-SCRUBBED, in
+ * `extensions/main-worktree-guard/classify-git.mjs`'s `gitCheckoutIsLinkedWorktree`
+ * (`:3965`): its two `rev-parse` probes pass no `env`, so they inherit
+ * `process.env`. Measured: from the hub with `GIT_DIR=<hub>/.git/worktrees/<wt>`
+ * the two spellings differ, that copy answers "linked worktree" for the HUB, and
+ * `isWorktreeCwdWrite` returns true — i.e. the hub-write gate returns early. So
+ * the scrub closes the relocation vector for skill-enforcer's derivation and does
+ * NOT close it for the guard whose whole job is protecting the hub. The fix
+ * belongs with that file (it carries 8+ un-scrubbed `rev-parse` reads and its own
+ * 5326-line suite, so a one-call-site scrub here would leave it half-fixed and the
+ * next reader falsely reassured); it is filed as **#2993**. `A14` in the sibling
+ * suite pins the gap, so closing it flips the pin instead of letting this comment
+ * drift.
+ *
  * ── WHY IT WRITES `KIND`/`TAG` BACK INTO THE ENVIRONMENT ───────────────────
  * `KIND`/`TAG` are the harness's own vocabulary, and consumers read them from
  * the ENVIRONMENT rather than from a derivation. The write reaches exactly two

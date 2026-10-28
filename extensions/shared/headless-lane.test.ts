@@ -561,6 +561,42 @@ async function main() {
     equal(norm(sh).join(" "), want, `box-status.sh's \`unset\` list drifted from headless-lane.ts — update BOTH (the copies are listed in the module comment)`);
   });
 
+  await test("A14 — the hub-write guard's SECOND copy of this predicate is still UN-SCRUBBED (known gap #2993) — flipping this pin means the gap closed", () => {
+    // A13 keeps the relocation list in step; it says nothing about the file that
+    // re-implements this predicate with NO list at all, so it can never catch that
+    // copy. Pinning the GAP (not a guarantee) is the point: `headless-lane.ts`
+    // scrubs, `main-worktree-guard/classify-git.mjs` does not, and a reader who
+    // reads only the first would conclude the vector is closed repo-wide.
+    //
+    // Measured for #2993 (real git, throwaway repo): from the HUB with
+    // `GIT_DIR=<hub>/.git/worktrees/w1`, `--git-dir` → the worktree's git dir and
+    // `--git-common-dir` → `<hub>/.git`, i.e. two different directories, so that
+    // copy answers "linked worktree" for the hub and `isWorktreeCwdWrite` returns
+    // true — the hub-write gate returns early. This assertion is deliberately
+    // RED-when-fixed: when #2993 lands, delete it, close the issue, and correct the
+    // `headless-lane.ts` header paragraph that names it.
+    const repo = resolve(HERE, "..", "..");
+    const src = readFileSync(join(repo, "extensions", "main-worktree-guard", "classify-git.mjs"), "utf8");
+    const block = src.match(/export function gitCheckoutIsLinkedWorktree\(cwd\) \{([\s\S]*?)\n\}/);
+    ok(
+      block,
+      "gitCheckoutIsLinkedWorktree is no longer in classify-git.mjs — if it was moved or removed, re-measure it and update BOTH this pin and #2993 (do not just delete the assertion)",
+    );
+    const body = block![1];
+    ok(body.includes("git rev-parse --git-dir"), "the pinned function no longer runs the `--git-dir` probe this gap is about — re-anchor the pin before trusting it");
+    ok(body.includes("git rev-parse --git-common-dir"), "the pinned function no longer runs the `--git-common-dir` probe this gap is about — re-anchor the pin before trusting it");
+    equal(
+      /\benv\s*:/.test(body),
+      false,
+      "classify-git.mjs's gitCheckoutIsLinkedWorktree now passes an `env:` — the #2993 gap looks CLOSED: delete this pin, correct the headless-lane.ts header paragraph that names it, and close #2993",
+    );
+    // A disclosure nobody re-reads is the same drift, one level up: the header
+    // paragraph is the only place a reader learns the scope of the scrub.
+    const header = readFileSync(join(HERE, "headless-lane.ts"), "utf8");
+    ok(/gitCheckoutIsLinkedWorktree/.test(header), "the module header no longer names classify-git.mjs's un-scrubbed copy — the scrub's scope reads as repo-wide again");
+    ok(/#2993/.test(header), "the module header no longer cites #2993 — a tracked gap that loses its issue number is indistinguishable from an accepted one");
+  });
+
   // ── B. the wiring: what the enforcer actually decides about `git commit` ──
   section("B. wiring — the shipped commit-workflow gate, with the real manifest");
 
