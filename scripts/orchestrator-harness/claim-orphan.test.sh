@@ -68,7 +68,7 @@
 #   O7 [RED→GREEN] the stamped lease term is <= the TTL that governs the keying: `<= CLAIM_TTL` for
 #      a PR claim, `<= CLAIM_ISSUE_TTL` for an issue claim. Read back from the pushed claim commit,
 #      not from the argument, so a call site that silently inflates the term is caught.
-#      ⚠️ The 157-minute lease in the incident is `CLAIM_ISSUE_TTL` (10800s = 180 min) applied to an
+#      ⚠️ The 157-minute lease in the incident is `CLAIM_ISSUE_TTL` applied to an
 #      ISSUE claim — by design, documented at its definition. O7 therefore asserts the term against
 #      the TTL THAT GOVERNS THE KEYING, and asserts the PR default is 1800s separately. Lowering the
 #      issue TTL would expire a claim mid-lane (its own comment computes 3h from the lane + chain
@@ -510,27 +510,51 @@ U7X="$(lease_until "$ORIG7" refs/claims/9209438-0123456789ab)"; NOW7X="$(now_s)"
 U7XTERM=$(( ${U7X:-0} - NOW7X ))
 [ -n "$U7X" ] && [ "$U7XTERM" -le 1800 ] && [ "$U7XTERM" -gt 1700 ]
 ck "O7 [PINNED] an UNPARSEABLE ttl still falls back to the PR default (term=${U7XTERM}s), not the ceiling" $?
+# ⛔ THE EXPECTED TERM IS READ FROM THE SHIPPED claims.sh, NOT CACHED HERE (landing-review, HIGH).
+# These four pins carried the literal 10800 and the #2029 change raised the default to 14400 — so the
+# shard went red on BOTH lanes for a change that was correct, which is exactly what a cached default
+# buys: the assertion stops testing "the term is bounded and visible" (its own stated purpose) and
+# starts testing "nobody changed the default". Read the governed value out of the source the code is
+# built from, and keep every bound RELATIVE to it.
+ISSUE_TTL_EXPECTED="$(sed -n 's/^CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-*\([0-9][0-9]*\)}".*/\1/p' \
+                       "$(dirname "${BASH_SOURCE[0]}")/claims.sh" 2>/dev/null | head -1)"
+case "$ISSUE_TTL_EXPECTED" in ''|*[!0-9]*)
+  ISSUE_TTL_EXPECTED=10800 ;;   # unreadable source: keep the historical default rather than skip the leg
+esac
+# ⛔ AND THE MAGNITUDE MUST STILL BE PINNED (landing-review, P2). Deriving BOTH sides of the
+# comparison from the file under test means a LOWERING moves both — the whole 1801..13589s range stays
+# green, which is exactly the guard the literal used to give and the #1850 duplicate-dispatch class the
+# file exists to prevent. So the shipped value must still COVER the sum its own comment derives; that is
+# an acknowledgement (the same pattern install-launchd.test.sh uses), not a cache: any term moving
+# without the TTL reddens.
+LEASE_TERMS=$(( 3300 + 5400 + 1890 + 3000 ))   # lane + chain PR wait + merge-phase wait + review/merge
+[ "$ISSUE_TTL_EXPECTED" -ge "$LEASE_TERMS" ]
+ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s)" $?
 IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
-[ "$IVAL" = "10800" ]; ck "O7 the ISSUE claim's default TTL is 10800s (got '$IVAL')" $?
+[ "$IVAL" = "$ISSUE_TTL_EXPECTED" ]
+ck "O7 the ISSUE claim's default TTL is the SHIPPED claims.sh value (${ISSUE_TTL_EXPECTED}s, got '$IVAL')" $?
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209432 >/dev/null 2>&1' >/dev/null
 U8="$(lease_until "$ORIG7" refs/claims/issue-9209432)"; NOW8="$(now_s)"
-[ -n "$U8" ] && [ "$(( U8 - NOW8 ))" -le 10800 ] && [ "$(( U8 - NOW8 ))" -gt 10600 ]
-ck "O7 [PINNED] an ISSUE claim's stamped term is <= CLAIM_ISSUE_TTL=10800s (term=$(( ${U8:-0} - NOW8 ))s)" $?
-# ⚠️ The incident's 157-minute lease is THIS one: CLAIM_ISSUE_TTL (10800s = 180 min) on an ISSUE
-# claim, by design (its own comment derives 3h from LANE_TIMEOUT + chain-merge + review). It is
+[ -n "$U8" ] && [ "$(( U8 - NOW8 ))" -le "$ISSUE_TTL_EXPECTED" ] \
+             && [ "$(( U8 - NOW8 ))" -gt "$(( ISSUE_TTL_EXPECTED - 200 ))" ]
+ck "O7 [PINNED] an ISSUE claim's stamped term is <= CLAIM_ISSUE_TTL=${ISSUE_TTL_EXPECTED}s (term=$(( ${U8:-0} - NOW8 ))s)" $?
+# ⚠️ The incident's lease is THIS one: CLAIM_ISSUE_TTL on an ISSUE
+# claim, by design (its own comment derives the term from LANE_TIMEOUT + the merge phase + review).
 # asserted here so the number is BOUNDED and visible, not so it is silently lowered.
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209436 999999999 >/dev/null 2>&1' >/dev/null
 U8B="$(lease_until "$ORIG7" refs/claims/issue-9209436)"; NOW8B="$(now_s)"
 # two-sided for the same reason: the issue ceiling is 10800s and the issue DEFAULT is also 10800s, but a
 # slip to the PR default (1800s) must not pass.
 U8TERM=$(( ${U8B:-0} - NOW8B ))
-[ -n "$U8B" ] && [ "$U8TERM" -le 10800 ] && [ "$U8TERM" -ge 10797 ]
+[ -n "$U8B" ] && [ "$U8TERM" -le "$ISSUE_TTL_EXPECTED" ] \
+              && [ "$U8TERM" -ge "$(( ISSUE_TTL_EXPECTED - 3 ))" ]
 ck "O7 [RED→GREEN] an ISSUE ttl above CLAIM_ISSUE_TTL is clamped TO IT, not to a shorter default (term=${U8TERM}s)" $?
 # An unparseable ttl must fall back to the keying's own default — never to the PR's shorter one.
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209433 07 >/dev/null 2>&1' >/dev/null
 U9="$(lease_until "$ORIG7" refs/claims/issue-9209433)"; NOW9="$(now_s)"
-[ -n "$U9" ] && [ "$(( U9 - NOW9 ))" -le 10800 ] && [ "$(( U9 - NOW9 ))" -gt 1800 ]
-ck "O7 [PINNED] an unparseable ttl falls back to the ISSUE default (10800s), never the PR's shorter one (term=$(( ${U9:-0} - NOW9 ))s)" $?
+[ -n "$U9" ] && [ "$(( U9 - NOW9 ))" -le "$ISSUE_TTL_EXPECTED" ] \
+             && [ "$(( U9 - NOW9 ))" -gt 1800 ]
+ck "O7 [PINNED] an unparseable ttl falls back to the ISSUE default (${ISSUE_TTL_EXPECTED}s), never the PR's shorter one (term=$(( ${U9:-0} - NOW9 ))s)" $?
 
 # ══ O10: the RENAME SELF-HEALS with NO roster at all (the shipped default) ══
 # The incident's blocked dispatch was the SAME box refusing its OWN lease minutes after it was

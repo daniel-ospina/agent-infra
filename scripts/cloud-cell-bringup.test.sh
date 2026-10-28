@@ -73,6 +73,12 @@
 
 set -uo pipefail
 
+# #2235: the suite must not inherit an ambient repo selector. gh gives `GH_REPO` precedence over the
+# checkout for every call that omits `--repo`, so a value exported by the developer's shell (or by a
+# cell's keys.env) would be judged against every fixture checkout's origin — reddening unrelated arms
+# and letting this harness carry the very defect the new conformance arm exists to catch.
+unset GH_REPO
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRINGUP="$HERE/cloud-cell-bringup.sh"
 
@@ -83,9 +89,28 @@ skip() { SKIP=$((SKIP + 1)); echo "  ⏭ SKIPPED — $1"; }
 say_case() { echo; echo "── $1 ──"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-1718.XXXXXX")"
+# The scheduled layer (agent-infra#1864) runs the declarations it is pointed at, so it is pointed at
+# a HERMETIC fixture here: without TEMPLATES_DIR the shipped templates would run the REAL reapers
+# (pi-reap-idle.sh is armed with REAP_DRY_RUN=0) against this host, which is not a test. The loop is
+# stopped on the way out — a detached loop outlives the suite otherwise and keeps ticking at a
+# deleted directory.
+export TEMPLATES_DIR="$T/schedule-templates"
+mkdir -p "$TEMPLATES_DIR"
+printf '# fixture: nothing retired\n' > "$TEMPLATES_DIR/RETIRED"
+cat > "$TEMPLATES_DIR/com.test.bringup-schedule.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.test.bringup-schedule</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/sh</string><string>-c</string><string>echo ran >> "$T/schedule-marker"</string></array>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
 # `chmod -R u+w` first: one case makes a parent directory unwritable to force `rm -f` to fail, and
 # the suite must still be able to clean up after itself.
-trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
+trap 'HOME="$T/home" CELL_HOME="$T/home" TEMPLATES_DIR="$T/schedule-templates" python3 "$HERE/fleet-schedule.py" --stop >/dev/null 2>&1; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
 
 if [ -f "$BRINGUP" ]; then ok "shipped script present: cloud-cell-bringup.sh"
 else bad "missing $BRINGUP"; echo; echo "  PASS=$PASS FAIL=$FAIL"; exit 1; fi
@@ -208,6 +233,11 @@ export SYSTEMD_UNIT_DIR="$T/systemd-units"
 # directory is derived from it.
 export CONTROLLER_SYSTEM_UNIT_DIR="$T/systemd-units"
 export HOME="$T/home"
+# The one-home check (#2916) refuses a cell-state path under a volatile root that is NOT under
+# CELL_HOME. This fixture's home IS under the host's temp dir, so the shipped default (`/tmp:/var/tmp`)
+# would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
+# SYSTEMD_UNIT_DIR above; the shipped default is what cloud-cell-bringup.verify.test.sh's red arms use.
+export CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root
 export SYSTEMCTL="$STUB/systemctl"
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
@@ -403,6 +433,24 @@ case "$BR_OUT" in
   *"disk reaper scheduled"*) ok "bring-up INSTALLS and reports the disk reaper timer (#2032)" ;;
   *) bad "bring-up does not schedule the disk reaper — the sinks are unbounded again: $BR_OUT" ;;
 esac
+# #2416 — harness ACTIVATION is scheduled by the same pass, and the bring-up refuses `CELL READY`
+# without it. A cell that runs whatever code it had at its last start is the drift the pass exists to
+# stop, and this step was the only one whose failure mode (an unscheduled clock) is invisible in
+# `status`: the box looks healthy and simply stops receiving every merged harness fix.
+case "$BR_OUT" in
+  *"harness activation scheduled"*) ok "bring-up INSTALLS and reports the harness-apply timer (#2416)" ;;
+  *) bad "bring-up does not schedule harness activation — the cell will run stale code: $BR_OUT" ;;
+esac
+if [ -f "$T/systemd-units/eldato-harness-apply.timer" ]; then
+  ok "the harness-apply timer unit was rendered and installed"
+else
+  bad "no harness-apply timer unit was installed under $T/systemd-units"
+fi
+if grep -q 'ExecStart=/bin/bash .*harness-apply-pass.sh' "$T/systemd-units/eldato-harness-apply.service" 2>/dev/null; then
+  ok "and it runs the pass, not the scheduler's own copy of the logic"
+else
+  bad "the harness-apply unit does not name the pass"
+fi
 if [ -f "$T/systemd-units/eldato-disk-reaper.timer" ]; then
   ok "the timer unit was rendered and installed"
 else
@@ -714,6 +762,68 @@ esac
 case "$BR_OUT" in
   *"CELL READY"*) ok "the repaired cell reaches CELL READY" ;;
   *) bad "the repaired cell never reaches CELL READY — output: $BR_OUT" ;;
+esac
+# ── 2c) the SCHEDULED layer (#1864): a cell that comes up has jobs that RUN ──────────────────────
+# The measured defect was a whole layer that never reached the cells (10 plists, 0 live) and no
+# instrument that said so. The acceptance is therefore a RUN, not a loaded unit or a present file:
+# a stamp with an rc plus a fresh log line, produced by the job itself.
+say_case "the scheduled layer is installed AND proven by a run (#1864)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+# Make the fixture job DUE again: it already ran on the earlier clean runs and its interval is an
+# hour, so without clearing the stamp this case would assert on a job that had nothing to do — and
+# pass for the wrong reason. (A never-run job is due immediately, which is the same path a fresh
+# cell takes.)
+rm -f "$T/schedule-marker" \
+      "$T/home/.pi/agent/state/fleet-schedule/jobs/com.test.bringup-schedule.json"
+br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "bring-up still exits 0 with the scheduled layer" \
+                   || bad "bring-up FAILED on the scheduled layer (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"scheduled layer live: SCHEDULE VERIFIED"*) ok "it reports the scheduler's own verified verdict" ;;
+  *) bad "no verified schedule verdict in the bring-up output — output: $BR_OUT" ;;
+esac
+[ -f "$T/schedule-marker" ] && ok "the declared job actually RAN during bring-up (its own marker exists)" \
+                            || bad "no job ran — 'scheduled' would be believed, not proven"
+log="$T/home/.pi/agent/state/fleet-schedule/logs/com.test.bringup-schedule.log"
+grep -q 'fleet-schedule run com.test.bringup-schedule start' "$log" 2>/dev/null \
+  && ok "the run left a fresh log line at $log" || bad "no run log line at $log"
+[ ! -e "$TOK" ] && ok "the token is still removed on this path" || bad "token SURVIVED the scheduled-layer run"
+
+# ── 2d) a scheduled layer that cannot be honoured REFUSES the cell ──────────────────────────────
+# A "CELL READY" over a cell with no reaping/liveness/canary is the false PASS this whole script
+# exists to remove, so a broken declaration must be fatal. The broken job's target does not exist —
+# the same rule install-launchd.sh applies to a plist ("a dead job must never be installed").
+say_case "a broken job declaration refuses the cell (no false CELL READY)"
+BROKENDIR="$T/schedule-broken"
+mkdir -p "$BROKENDIR"
+printf '# fixture: nothing retired\n' > "$BROKENDIR/RETIRED"
+cat > "$BROKENDIR/com.test.broken.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.test.broken</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/sh</string><string>{{HOME}}/.pi/agent/scripts/cell-bringup-1864-missing.sh</string></array>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_OUT="$(PATH="$STUB:$PATH" \
+          CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=normal TEMPLATES_DIR="$BROKENDIR" \
+          REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$BRINGUP" --check 2>&1)"
+BR_RC=$?
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero ($BR_RC) on an unhonourable job set" \
+                   || bad "bring-up returned 0 over a job set it could not schedule"
+case "$BR_OUT" in
+  *"broken target"*) ok "the failure names the broken target" ;;
+  *) bad "the failure is not diagnosable — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness with no working scheduled layer" ;;
+  *) ok "never claims CELL READY with a broken schedule" ;;
 esac
 
 # ── 3) an abort BEFORE check_gh is reached — the window the pre-fix code left open ───────────────

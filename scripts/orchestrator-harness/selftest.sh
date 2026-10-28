@@ -50,16 +50,52 @@ on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # need the real resolution build their own PATH explicitly (§17 daemon-PATH, §6c) and are unaffected.
 GSTUB="$TMP/stub-bin"; mkdir -p "$GSTUB"
 printf '#!/bin/bash\n[ -n "${GH_HOME_RECORD:-}" ] && printf "%%s\\n" "$HOME" >> "$GH_HOME_RECORD"\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
-# ⛔ AND A `launchctl` STUB. install.sh READS the domain on every run (the closing banner) and
-# `--uninstall` removes the job — against the REAL launchd, from a sandbox $HOME whose rendered plist
-# carries the PRODUCTION label. Measured 2026-10-17: that removal resolves by label, so this self-test
-# booted the live controller out. Nothing here may reach the real launchd.
-# ⛔ AND IT MUST SPEAK launchd's OWN NOT-FOUND LANGUAGE (`Could not find service …`, exit != 0), not a
-# bare `exit 1`: `lc_probe` classifies a non-zero read with UNRECOGNISED output as UNKNOWN and the guard
-# then refuses, so a silent stub made every `install.sh --uninstall` here fail — and the failing check
-# was labelled "blocked by SCOPE=banana", pointing the next lane at config validation instead of a
-# fixture (review finding: a registered shard went red). Real launchd prints exactly this line.
-printf '#!/bin/bash\nprintf "Bad request.\\nCould not find service in domain for user gui: 0\\n" >&2\nexit 1\n' > "$GSTUB/launchctl"; chmod +x "$GSTUB/launchctl"
+# ⛔ THE SANDBOX LABEL (agent-infra#1996). launchd labels are GLOBAL, so a plist rendered under a
+# throwaway $HOME still addresses the PRODUCTION job by name when it carries the production label —
+# addressing it writes a PERSISTENT Disabled override for the controller the box is actually running,
+# i.e. a "sandboxed" test can silence production. Every install.sh invocation in this file therefore
+# installs a TEST label (install.sh refuses a non-default label on a real $HOME), and every sandbox
+# plist below is addressed by $TPL, never by the production filename.
+PROD_LABEL="com.eldato.orchestrator-loop"
+# ⛔ BOTH PRODUCTION LABELS, not just the loop's (review catch, 2026-10-18). Disabling the production
+# WATCHDOG writes the same persistent override (PR #1986 ships it), and leaving it unguarded meant the
+# stated property ("no test can address production") was wider than the measured one.
+PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
+TEST_LABEL="$PROD_LABEL-test"
+TPL="$TEST_LABEL.plist"
+# ⛔ `LABEL_OVERRIDE`, NOT `LABEL` (review catch, 2026-10-18): install.sh assigns the production label
+# as a QUOTED LITERAL (scripts/test_pr_doctor.py pins that line), so an exported `LABEL` does not reach
+# it — the suite would render the production label into a sandbox $HOME and the label guard would
+# (correctly) refuse every install here.
+export LABEL_OVERRIDE="$TEST_LABEL"
+export PROD_LABEL PROD_WD_LABEL TEST_LABEL TPL
+
+# ⛔ AND A `launchctl` STUB, WHICH REFUSES THE PRODUCTION LABELS. install.sh READS the domain on every
+# run and `--uninstall` removes the job; against the REAL launchd, from a sandbox $HOME, that removal
+# resolved the PRODUCTION label and booted the live controller out (measured 2026-10-17). The stub is
+# first on PATH for the whole suite, records every invocation, and exits 97 when the call NAMES a
+# production label — asserted at the end of the run (§6g), so "no test addressed production" is
+# MEASURED, not assumed. The pattern excludes the test labels, which carry a `-` suffix
+# (`…-loop-test`).
+# ⛔ AND FOR EVERYTHING ELSE IT MUST SPEAK launchd's OWN NOT-FOUND LANGUAGE (`Could not find service …`,
+# exit != 0), not a bare `exit 1`: `lc_probe` classifies a non-zero read with UNRECOGNISED output as
+# UNKNOWN and the caller then refuses, so a silent stub made every `install.sh --uninstall` here fail —
+# and the failing check was labelled "blocked by SCOPE=banana", pointing the next lane at config
+# validation instead of at the fixture (review finding: a registered shard went red).
+LM_LOG="${LM_LOG:-$TMP/launchctl-calls.log}"
+export LM_LOG
+cat > "$GSTUB/launchctl" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "${LM_LOG:-/dev/null}"
+if [[ " $* " =~ (^|[^a-z-])com\.eldato\.orchestrator-loop([^a-z-]|$) ]] \
+   || [[ " $* " =~ (^|[^a-z-])com\.eldato\.orchestrator-watchdog([^a-z-]|$) ]]; then
+  printf 'REFUSED: a selftest tried to address a PRODUCTION launchd label: %s\n' "$*" >&2
+  exit 97
+fi
+printf 'Bad request.\nCould not find service in domain for user gui: 0\n' >&2
+exit 1
+SH
+chmod +x "$GSTUB/launchctl"
 PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
@@ -103,18 +139,20 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
-# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
-# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+# ⛔ THE CLASSIFIER IS A FILE, NOT A HEREDOC ANY MORE (agent-infra#2719). It lived in orch-loop.sh as an
+# inline `python3 -c` string, and the NOCHECKS arm has to ask the SAME question on a re-read — two
+# copies of these rules is how the harness and the merge rail disagreed before (#1714). So the shipped
+# artifact IS `check-class.py`: a missing file is a hard FAIL here (never a silently empty classifier,
+# which would grade GREEN on an empty answer). The required set and the review-gate NAME are still read
+# from the ENVIRONMENT (agent-infra#1764), so the driver supplies them the same way the loop does.
 CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
 CL_GATE="ai-review-gate"
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
 # clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
 # ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
 clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
-if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
+if need "$TMP/classify.py" "the classifier is the shipped check-class.py"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: ai-review-gate SKIPPED is not satisfied" $rc
@@ -290,7 +328,11 @@ fi
 # PR exists to close), and a backticked `gh pr checks` spliced a multi-line table into the Python
 # source (SyntaxError -> V="" -> no case arm matched). Extract the real assignment and drive it
 # through a logged `gh` shim so the shell, not an awk extraction, is what runs.
-awk '/^    V="\$\(gh pr checks/{f=1} f{print} /^" 2>\/dev\/null\)"$/{f=0}' "$LOOP" > "$TMP/classify_bash.sh"
+# ⛔ THE ASSIGNMENT IS ONE LINE NOW (agent-infra#2719): the Python moved to `check-class.py`, so the
+# heredoc's closing `" 2>/dev/null)"` terminator no longer exists — the old range-capture ran to the END
+# OF THE FILE (1547 lines measured) and the driver then aborted on `set -u` before printing `V`, which
+# made this whole block report a red it could not explain. Capture the ONE assignment line.
+grep -m1 '^    V="\$(gh pr checks' "$LOOP" > "$TMP/classify_bash.sh"
 if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
   mkdir -p "$TMP/bin"
   cat > "$TMP/bin/gh" <<'SH'
@@ -309,6 +351,9 @@ SH
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
     printf '%s\n' "REVIEW_GATE='ai-review-gate'"
+    # the pipeline's classifier path is resolved by the loop at startup; the driver supplies the
+    # SHIPPED file so the shell runs the real classifier, not a missing path.
+    printf '%s\n' "_CK_PY='$HERE/check-class.py'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -846,7 +891,694 @@ if need "$R/reap.py" "the reaper is extracted from the shipped refresh-candidate
   ck "shipped reaper: a saturated .open_iss does NOT mask the targeted OPEN read — 10 is RELEASED" $rc
   case "$(tr '\n' ' ' < "$RPT/landed.txt")" in *30*) rc=1;; *) rc=0;; esac
   ck "shipped reaper: the landed prune settles a CLOSED entry even when .open_iss is saturated" $rc
+  # ── 5j) a HOLDER-ONLY INCOMPLETE is decided by the CROSS-BOX claim registry (#1935) ─────────
+  # The live cloud cell's pre-flight returns nothing else: its fleet board cannot answer (no cmux
+  # lane registry, and this cmux flavor has no `sessions list`), so every candidate was INCOMPLETE
+  # and the backlog stayed 0 all evening. The tool's own arithmetic makes a holder-only INCOMPLETE a
+  # statement that every surface it COULD read was clean, so the holder question falls to the
+  # cross-box registry. Three arms: the answer is a claim (queue), it is unreadable (refuse), or
+  # another surface is ALSO unreadable (refuse — the tool could not judge the WORK).
+  HI="$TMP/holderinc"; mkdir -p "$HI/fakesc/.venv/bin"
+  printf '10\n' > "$HI/.pool"
+  : > "$HI/checked.txt"; : > "$HI/candidates.txt"; : > "$HI/dispatched.txt"
+  # The registry FILE the real reader sources; the READER function is supplied only in arm (ii), so
+  # arm (i) pins the "file present, function absent" shape the extraction really has.
+  : > "$HI/claims.sh"
+  cat > "$HI/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# the live cell's actual answer: every other surface clean, the BOARD unable to say who holds it
+cat <<'REPORT'
+collision-preflight: issue #10
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's live-session store could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's live-session store could not be read, so NO lane's liveness is measurable
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder); this is NOT clean for #10 in acme/widget
+REPORT
+exit 2
+PY
+  chmod +x "$HI/fakesc/.venv/bin/python"
+  # (i) NO CLAIM READER IN THE EXTRACTION. The extracted body carries no `issue_claim_verdict`, so the
+  # call returns 127 — an UNRECOGNISED code, which must land in the `case`'s `*)` arm and be
+  # INCOMPLETE. ⛔ THIS ARM USED TO ASSERT ONLY "#10 is absent from candidates.txt", WHICH PASSES ON
+  # ANY CODE THAT REFUSES — including the pre-fix (no re-route at all) and including the extraction's
+  # `$O/claims.sh` file being absent, i.e. it could not distinguish the `*)` arm from a no-op. It also
+  # carried a false premise ("127 … therefore QUEUES" — the `*)` arm forbids exactly that) that the
+  # removed guard rested on (review F1). So the arm now names the arm that MUST have produced the
+  # refusal (`UNRECOGNISED verdict (rc=127)`) as well as the outcome, and a body whose `*)` arm queued
+  # would redden both assertions.
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/holderinc-none.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE with NO claim reader available is NOT queued (127 is not CLEAN)" $rc
+  case "$(cat "$TMP/holderinc-none.out")" in
+    *"UNRECOGNISED verdict (rc=127)"*) rc=0;;
+    *) rc=1; echo "      out: $(grep -F '#10' "$TMP/holderinc-none.out" | head -3)";;
+  esac
+  ck "…and it is the *) UNRECOGNISED-verdict arm that refused it (the arm this case is named for)" $rc
+  # (ii) the registry ANSWERS: a stub reader returns 0, supplied the way the shipped script has it at
+  # top level — prepended to the extraction, so the real arm is what runs.
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-claim.sh"
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-claim.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=0;; *) rc=1;; esac
+  ck "holder-only INCOMPLETE: the cross-box registry's CLEAN verdict queues the candidate" $rc
+  case "$(tr '\n' ' ' < "$HI/checked.txt")" in *10*) rc=0;; *) rc=1;; esac
+  ck "holder-only INCOMPLETE queued via the registry is also marked checked" $rc
+  # (ii-b) the registry is NOT INSTALLED: nothing has answered the holder question, so refuse. This is
+  # the arm that keeps the re-route from becoming "no registry, so nobody holds it".
+  mv "$HI/claims.sh" "$HI/claims.sh.away"
+  : > "$HI/candidates.txt"; : > "$HI/checked.txt"
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-noreg.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE with NO claim registry on the box is NOT queued" $rc
+  mv "$HI/claims.sh.away" "$HI/claims.sh"
+  # (iii) a SECOND unreadable surface means the tool could not judge the work: no re-route.
+  HI2="$TMP/holderinc2"; mkdir -p "$HI2/fakesc/.venv/bin"
+  printf '10\n' > "$HI2/.pool"
+  : > "$HI2/checked.txt"; : > "$HI2/candidates.txt"; : > "$HI2/dispatched.txt"
+  cat > "$HI2/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+cat <<'REPORT'
+open PRs                        INCOMPLETE  0     gh: could not reach api.github.com
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+
+INCOMPLETE SURFACES
+  [open PRs] gh: could not reach api.github.com
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (open PRs, issue assignee/holder)
+REPORT
+exit 2
+PY
+  chmod +x "$HI2/fakesc/.venv/bin/python"
+  O="$HI2" LIMIT=5 SC="$HI2/fakesc" PY="$HI2/fakesc/.venv/bin/python" PREFLIGHT="$HI2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-multi.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI2/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "an INCOMPLETE with ANOTHER unreadable surface is NOT re-routed (the work itself is unjudged)" $rc
+
+  # ── 5k) the re-route's own safety properties, on the path where it FIRES ────────────────────
+  # Each arm reuses the fixture (holder-only report + a stub reader) and varies only what the
+  # registry ANSWERS. What is asserted every time is that a peer's work is never dispatched.
+  holder_arm() { # <name> <reader-body>  → runs the loop with that reader, prints nothing
+    { printf 'issue_claim_verdict() { CLAIM_RESULT="stub"; %s\n}\n' "$2"; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-h.sh"
+    : > "$HI/candidates.txt"; : > "$HI/checked.txt"
+    O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-h.sh" > "$TMP/holder-$1.out" 2>&1
+  }
+  # (a) A LIVE CLAIM is the primary thing this gate exists to catch: registry rc=1 must never queue.
+  holder_arm live 'return 1'
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE + a LIVE claim: NOT queued (the registry's refusal is honoured)" $rc
+  case "$(tr '\n' ' ' < "$HI/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE + a LIVE claim: NOT marked checked (re-attempted next pass)" $rc
+  # (b) A STALE READER (rc=3, a claims.sh predating the issue reader) is a permanent local refusal.
+  holder_arm stale 'return 3'
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE + a STALE claim reader (rc=3): NOT queued" $rc
+  # (c) F1's fail-OPEN (found in review): the SAME surface is also marked INCOMPLETE when the board
+  # DID answer and ATTRIBUTED a lane whose liveness it could not measure. The claim registry would
+  # then say CLEAN for a lane that never took a claim (or whose lease expired), so the name alone
+  # must NOT re-route — the whole-board wording is part of the condition.
+  H3="$TMP/holderinc3"; mkdir -p "$H3/fakesc/.venv/bin"
+  printf '10\n' > "$H3/.pool"; : > "$H3/checked.txt"; : > "$H3/candidates.txt"; : > "$H3/dispatched.txt"
+  : > "$H3/claims.sh"
+  cat > "$H3/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+cat <<'REPORT'
+issue assignee/holder           INCOMPLETE  0     claim gate: holder read from the FLEET BOARD (source: cache) — 1 lane(s) attributed, but its pid_alive is UNMEASURED
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: holder read from the FLEET BOARD (source: cache) — 1 lane(s) attributed to #10, and no pid reading exists for it
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)
+REPORT
+exit 2
+PY
+  chmod +x "$H3/fakesc/.venv/bin/python"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-h3.sh"
+  O="$H3" LIMIT=5 SC="$H3/fakesc" PY="$H3/fakesc/.venv/bin/python" PREFLIGHT="$H3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-h3.sh" > "$TMP/holder-partial.out" 2>&1
+  case "$(tr '\n' ' ' < "$H3/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "a PARTIAL board answer (a lane IS attributed) is NOT re-routed — a claimless lane is not a free issue" $rc
+  # (d) FORMAT DRIFT: an INCOMPLETE verdict with NO surface section at all must refuse, never re-route.
+  H4="$TMP/holderinc4"; mkdir -p "$H4/fakesc/.venv/bin"
+  printf '10\n' > "$H4/.pool"; : > "$H4/checked.txt"; : > "$H4/candidates.txt"; : > "$H4/dispatched.txt"
+  : > "$H4/claims.sh"
+  cat > "$H4/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# a FUTURE producer that reworded the section away: the verdict is still INCOMPLETE
+printf 'VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried\n'
+exit 2
+PY
+  chmod +x "$H4/fakesc/.venv/bin/python"
+  O="$H4" LIMIT=5 SC="$H4/fakesc" PY="$H4/fakesc/.venv/bin/python" PREFLIGHT="$H4/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-h3.sh" > "$TMP/holder-nosection.out" 2>&1
+  case "$(tr '\n' ' ' < "$H4/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "an INCOMPLETE with NO surface section (format drift) is NOT re-routed" $rc
+
+  # ── 5l) the surface SET is read from the VERDICT LINE, and a report carrying a BLOCKING hit is
+  # not a verdict at all (cycle-2 review, F1 + F2 — both reproduced fail-OPENs before these arms).
+  # The producer is resolved from the TARGET repo, so it DRIFTS; these are the shapes that would
+  # have queued a candidate the same producer's own table calls blocked or unjudged.
+  holder_report() { # <outfile> <report-body>  → a fixture whose stub prints that body for issue 10
+    local d; d="$(mktemp -d "$TMP/hrep.XXXXXX")"; mkdir -p "$d/fakesc/.venv/bin"
+    printf '10\n' > "$d/.pool"; : > "$d/checked.txt"; : > "$d/candidates.txt"; : > "$d/dispatched.txt"; : > "$d/claims.sh"
+    { printf '#!/bin/bash\ncat <<\x27REPORT\x27\n'; printf '%s\n' "$2"; printf 'REPORT\nexit 2\n'; } > "$d/fakesc/.venv/bin/python"
+    chmod +x "$d/fakesc/.venv/bin/python"; printf '%s' "$d"
+  }
+  holder_run() { # <dir> [outfile-suffix]
+    O="$1" LIMIT=5 SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" \
+      bash "$TMP/refreshloop-claim.sh" > "$TMP/holder-$2.out" 2>&1
+  }
+  holder_queued() { case "$(tr '\n' ' ' < "$1/candidates.txt")" in *10*) echo 1;; *) echo 0;; esac; }  # 1 = queued = FAIL code
+
+  # (f1) A BLOCKING HIT alongside an INCOMPLETE verdict. The re-route trusts the producer's verdict
+  # ORDER; this report is self-contradicting (the class the DEGRADED read already exists for, #1853),
+  # and its own table says COLLISION. An advisory hit must NOT trip this arm — hence the second case.
+  D5="$(holder_report x 'open PRs                        COLLISION   1     matched issue-number (10) in title, OPEN (number)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+
+HITS
+  [open PRs] #12 — matched issue-number (10) in title, OPEN (number)
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
+  holder_run "$D5" f1; ck "an INCOMPLETE verdict carrying a BLOCKING hit is NOT queued (a self-contradicting report is not a verdict)" "$(holder_queued "$D5")"
+  # …and ADVISORY hits, which also print under HITS, must keep the re-route alive: the arm above is
+  # about a BLOCKING tag, not about "any hit at all" (the producer appends ` (advisory — cannot
+  # block)` AFTER the strength tag, so an advisory line does not END with it).
+  D6="$(holder_report x 'open PRs                        ADVISORY    1     matched issue-number (10) in title, MERGED (weak) (advisory — cannot block)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+
+HITS
+  [open PRs] #11 — matched issue-number (10) in title, MERGED (weak) (advisory — cannot block)
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
+  holder_run "$D6" f1b
+  if [ "$(holder_queued "$D6")" = 1 ]; then ck "an ADVISORY hit does NOT block the re-route (the condition is the blocking tag, not any hit)" 0; else ck "an ADVISORY hit does NOT block the re-route (the condition is the blocking tag, not any hit)" 1; fi
+  # (f0) THE GREPS MUST SEE THE WHOLE REPORT — the SIGPIPE window (#841/#864). `printf | grep -q` is
+  # refused repo-wide by scripts/check-no-sigpipe-grep.sh (the PR-lane job `sigpipe-grep`), and this is
+  # the FAIL-OPEN it buys: with `pipefail` active the quiet grep exits at its FIRST match while the
+  # writer is still pushing, the writer takes SIGPIPE (141), pipefail reports the PIPELINE red — and
+  # `hits_blocking` stays 0. A report that states BOTH a blocking hit AND a holder-only INCOMPLETE is
+  # then re-routed as holder-only and QUEUED, which is the duplicate-dispatch class this block exists
+  # to refuse. The payload matters: the match must be EARLY and the body >64 KiB (the pipe buffer), or
+  # grep reads everything and the race never fires — a short-payload arm here would be vacuous. Run
+  # the loop under `bash -o pipefail`: the shipped script sets `set -u` ONLY, so the window is LATENT
+  # today rather than live — which is precisely why the guard bans the SHAPE instead of arguing about
+  # this one site, and why the fix is a here-string (no writer left to kill) rather than a trade.
+  FILLER="$(i=0; while [ "$i" -lt 2000 ]; do i=$((i + 1)); printf 'filler line %s pushing the report past the 64 KiB pipe buffer\n' "$i"; done)"
+  # SELF-CONTRADICTING and LARGE: the blocking hit is on line 2 (EARLY, so the quiet grep can exit
+  # while the writer still has ~64 KiB queued) and the holder note is the LAST line (so the second
+  # grep reads everything and does not race). That asymmetry is what separates the two outcomes on the
+  # pre-fix code: the blocking grep reads FALSE, the note grep reads TRUE, and the candidate is queued.
+  D4="$(holder_report x "open PRs                        COLLISION   1     matched issue-number (10) in title, OPEN (number)
+HITS
+  [open PRs] #12 — matched issue-number (10) in title, OPEN (number)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+$FILLER
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")"
+  # same extraction, invoked with the pipefail the race needs
+  O="$D4" LIMIT=5 SC="$D4/fakesc" PY="$D4/fakesc/.venv/bin/python" PREFLIGHT="$D4/fakesc/tools/collision_preflight.py" \
+    bash -o pipefail "$TMP/refreshloop-claim.sh" > "$TMP/holder-f0.out" 2>&1
+  ck "a >64 KiB self-contradicting report is NOT queued under pipefail (the greps are not a pipeline)" "$(holder_queued "$D4")"
+  # …and the SAME SIZE of report WITHOUT a blocking hit still re-routes, so the arm above cannot pass
+  # by refusing every large report (a fail-closed arm alone proves nothing about the fail-open).
+  D4B="$(holder_report x "issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+$FILLER
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")"
+  O="$D4B" LIMIT=5 SC="$D4B/fakesc" PY="$D4B/fakesc/.venv/bin/python" PREFLIGHT="$D4B/fakesc/tools/collision_preflight.py" \
+    bash -o pipefail "$TMP/refreshloop-claim.sh" > "$TMP/holder-f0b.out" 2>&1
+  if [ "$(holder_queued "$D4B")" = 1 ]; then ck "…and a >64 KiB HOLDER-ONLY report IS still re-routed under pipefail (no false block)" 0; else ck "…and a >64 KiB HOLDER-ONLY report IS still re-routed under pipefail (no false block)" 1; fi
+  # (f2) The COUNT now comes from the verdict line, so a body whose section was truncated by a
+  # multi-line note (or reordered) can no longer turn "2 unreadable surfaces" into "1".
+  D7="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+this note continued at column 0 — the old section parse ENDED here
+open PRs                        INCOMPLETE  0     gh: could not reach api.github.com
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+this note continued at column 0 — the old section parse ENDED here
+  [open PRs] gh: could not reach api.github.com
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)')"
+  holder_run "$D7" f2; ck "a SECOND unreadable surface is still refused when the holder note wraps (the count is the verdict line's, not a parsed section)" "$(holder_queued "$D7")"
+  # (f3) A2 ANCHORING: the report echoes the issue TITLE. A title carrying the section heading and an
+  # indented holder line must not MANUFACTURE a holder-only answer — the verdict line says the
+  # unreadable surface is `open PRs`, so nothing may be re-routed on the strength of the echo.
+  D8="$(holder_report x 'title: fake (10) INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+open PRs                        INCOMPLETE  0     gh: could not reach api.github.com
+
+INCOMPLETE SURFACES
+  [open PRs] gh: could not reach api.github.com
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (open PRs)')"
+  holder_run "$D8" f3; ck "a title echo cannot forge a holder-only INCOMPLETE (the verdict line is the answer, the body is not)" "$(holder_queued "$D8")"
+  # (f4) A SURFACE-TABLE-ONLY REPORT — NO `INCOMPLETE SURFACES` BLOCK (#1977 review, P2). The producer
+  # emits both shapes (see `mk_tool_incomplete … table` in origination-funnel.test.sh) and the measured
+  # cell output quoted in #1935 is this one, yet every fixture here carried the block — so the block-row
+  # grep read TRUE in the suite and FALSE on the live cell, and the headline fix was a no-op there
+  # (fail-closed, so silent). The row is read through `preflight_unusable_surfaces`, which handles both
+  # shapes; this arm is what makes that a requirement instead of an accident.
+  D9="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board live-session store could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
+  holder_run "$D9" f4
+  if [ "$(holder_queued "$D9")" = 1 ]; then ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 0; else ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 1; fi
+
+  # ── 5l-bis) THE PRODUCER'S WORDING IS NOT PART OF THE CONTRACT (agent-infra#2952) ──────────────
+  # THE DEFECT, MEASURED. The surface set was read with the literal phrase `could not be queried (`.
+  # tortoise fa7b27b66 (#9423, 2026-10-21) reworded that sentence to `could not be FULLY queried (`,
+  # and from that commit the parse returned an EMPTY set for EVERY verdict — so `HOLDER_ONLY` was 0
+  # for every candidate, the #1935 substitution above could never fire, and cell4 spent six days
+  # reporting `0 dispatched` / `unusable=issue-assignee-holder:12` while THIS SUITE stayed green,
+  # because every fixture above still rendered the wording shipped on the day it was written. A test
+  # that only ever replays yesterday's wording cannot fail for a producer reword — which is exactly
+  # the "guard that cannot fail" this arm exists to remove. So these arms render the producer's REAL
+  # line, and one of them renders an adverb it has never used, to pin the CONTRACT ("the surfaces are
+  # named in the parenthetical after `queried (`") instead of a phrase of the day.
+  #
+  # The body below is cell4's own report for #9889, copied VERBATIM (the board note is abridged in its
+  # middle, marked `…`) from `python3 tools/collision_preflight.py 9889 --repo .` on the cell's own
+  # checkout, 2026-10-27. It is the shape that MUST be re-routed: ONE unreadable surface, the fleet
+  # board, every other surface clean.
+  # ⛔ THE REPORT IS WRITTEN TO A FILE, NOT CAPTURED THROUGH `$(cat <<'REPORT' …)`: bash 3.2 (macOS's
+  # /bin/bash, the shell this suite gets via `env bash` on a stock runner) quote-scans the body of a
+  # heredoc that lives inside a command substitution, so a line with ONE apostrophe (`the board's …`)
+  # aborts the WHOLE suite with `unexpected EOF while looking for matching` — measured here, and the
+  # real report has three such lines. A plain `cat > file <<'REPORT'` is not scanned, and the variable
+  # is then filled from the file.
+  cat > "$TMP/cell2952.report" <<'REPORT'
+collision-preflight: issue #9889
+repo: daniel-ospina/tortoise   [resolved from: --repo PATH (git remote)]
+
+title: measure(extractor-v4): E1's before arm and E2a's 14-unit denominator are producible
+keyword gate: none — the lexical arm is deleted (#3504).
+
+SURFACE                         STATUS      HITS  NOTE
+issue landed                    CLEAN       0     issue state=OPEN; 7 timeline event(s), 1 merged cross-reference(s), none naming #9889 in its title
+merged PRs naming an OPEN issue ADVISORY    0
+open PRs                        CLEAN       0     25 PR(s) enumerated (complete, cap 1000)
+recently-closed PRs             ADVISORY    1     ⚠ PARTIAL — advisory sample, cannot block
+local branches                  CLEAN       0     17 ref(s) enumerated; 2 already merged into main
+remote branches                 CLEAN       0     1858 ref(s) enumerated
+local worktrees                 CLEAN       0     15 worktree(s) enumerated (untruncated)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv') — the lane roster is UNKNOWN, not empty … (comment prose is not read, #8175)
+
+HITS
+  [recently-closed PRs] PR #10069 docs(5333): G5's destructive half — the design DECISION recorded — prose mention of #9889 in body — not a closing reference (non-blocking) (weak) (advisory — cannot block)
+
+WEAK SIGNALS (reported, non-blocking — these do NOT block)
+  1 a prose-only cross-reference(s) of #9889; no title / branch / worktree / closing-reference match.
+  These do NOT block a dispatch.
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv') — the lane roster is UNKNOWN, not empty … (comment prose is not read, #8175)
+
+ADVISORY SURFACES — reported only; these cannot block a dispatch
+  [recently-closed PRs] 1 hit(s) — sampled the most recent 100 of ~4100 closed PR(s)
+  NOTE: a match here is on a TERMINAL PR — immutable history, not in-flight work.
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be FULLY queried (issue assignee/holder); this is NOT clean for #9889 in daniel-ospina/tortoise — the LANE ROSTER is UNKNOWN (not empty) — no lane can be attributed to this issue until it is readable
+REPORT
+  CELL2952_REPORT="$(cat "$TMP/cell2952.report")"
+  # The registry answers the way a would-be dispatcher needs it to: CLEAN, nothing claimed.
+  CELL2952="$(holder_report x "$CELL2952_REPORT")"
+  holder_run "$CELL2952" b1
+  # ⛔ `holder_queued` returns 1 for QUEUED ("1 = queued = FAIL code", its own doc) because it was
+  # written for arms that assert a refusal. Both polarities appear below, so each one is spelled out:
+  # a check that reads the raw helper value would be asserting the OPPOSITE of what its name says.
+  r2952_is_queued() { [ "$(holder_queued "$1")" = 1 ]; }   # rc 0 = the candidate WAS queued
+  # ⛔ BOTH directions, or a no-op re-route reads green: the candidate must be QUEUED **and** the
+  # queue must be the SUBSTITUTION's doing (the echo names the board+registry path). Pre-fix, this
+  # arm reds on the first assertion — the parse returned nothing, so the candidate was refused.
+  if r2952_is_queued "$CELL2952"; then rc=0; else rc=1; fi
+  ck "(2952a) the producer's REAL verdict wording ('could not be FULLY queried') is RE-ROUTED — the board is unreadable, the registry answers" $rc
+  case "$(cat "$TMP/holder-b1.out")" in
+    *"the pre-flight's HOLDER surface could not answer"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952a) …and it is the HOLDER substitution that queued it (not a silently different CLEAN path)" $rc
+  case "$(cat "$TMP/holder-b1.out")" in
+    *"+#10 CLEAN -> backlog"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952a) …and the queue entry was actually written (the positive half of the pair)" $rc
+  # ── (2952b) THE REGISTRY IS THE ONLY AUTHORITY LEFT, SO AN UNREADABLE ONE STILL REFUSES ────────
+  # Polarity, unchanged: the substitution moves the requirement from "a local board must answer" to
+  # "the cross-box registry must answer". rc=2 is claims.sh's UNREADABLE verdict; it is INCOMPLETE,
+  # never CLEAN, and the candidate must be neither queued nor retired.
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="the registry could not be read (stub)"; return 2; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  CELL2952B="$(holder_report x "$CELL2952_REPORT")"
+  r2952_run() { # <dir> <name>
+    O="$1" LIMIT=5 SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" \
+      bash "$TMP/refreshloop-2952.sh" > "$TMP/2952-$2.out" 2>&1
+  }
+  r2952_run "$CELL2952B" b2
+  if r2952_is_queued "$CELL2952B"; then rc=1; else rc=0; fi
+  ck "(2952b) an UNREADABLE claims registry is still INCOMPLETE — not queued" $rc
+  case "$(tr '\n' ' ' < "$CELL2952B/checked.txt")" in *10*) rc=1 ;; *) rc=0 ;; esac
+  ck "(2952b) …and not retired: the claim is a window, so the candidate is re-attempted next pass" $rc
+  case "$(cat "$TMP/2952-b2.out")" in
+    *"?#10 INCOMPLETE — the registry could not be read"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952b) …and the refusal names the REGISTRY as the reason (not the board, which was substituted)" $rc
+  # …and the OTHER form of "unreadable": the registry is not INSTALLED at all. Nothing has answered the
+  # holder question then, so a CLEAN here would mean "no registry, therefore nobody holds it" — the
+  # fail-open this whole substitution is shaped to avoid. (The pre-#2952 arm `(ii-b)` pins the same
+  # wiring on the OLD wording; this one pins it on the producer's real one.)
+  CELL2952B2="$(holder_report x "$CELL2952_REPORT")"
+  rm -f "$CELL2952B2/claims.sh"
+  r2952_run "$CELL2952B2" b2b
+  if r2952_is_queued "$CELL2952B2"; then rc=1; else rc=0; fi
+  ck "(2952b) an ABSENT claims registry is still INCOMPLETE — not queued (no registry is not a free issue)" $rc
+  case "$(cat "$TMP/2952-b2b.out")" in
+    *"is NOT INSTALLED"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952b) …and the refusal names the MISSING registry (the substituted authority is required, not optional)" $rc
+  # ── (2952c) A SECOND GENUINELY-UNREADABLE SURFACE STILL REFUSES ───────────────────────────────
+  # The other half of the same defect class: `issue landed` is answerable on a cell (gh reads the
+  # issue's state and timeline fine), so it must NOT be swept into the substitution — and it is not,
+  # because the surrogate is the CAUSE (the board), never a surface COUNT. A landed surface that
+  # cannot answer for its OWN reason is work the tool could not judge. Report abridged from cell4's
+  # `collision_preflight.py 2218` (same day, same box); its verdict line names BOTH surfaces.
+  CELL2952C="$(holder_report x "issue landed                    INCOMPLETE  0     issue-state-uninterpretable: state='MERGED' is neither OPEN nor CLOSED, so whether this work item is still live cannot be established — refusing to read it as free (NOT clean)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: /home/cmux/.pi/agent/state/lane-registry.tsv)
+
+INCOMPLETE SURFACES
+  [issue landed] issue-state-uninterpretable: state='MERGED' is neither OPEN nor CLOSED, so whether this work item is still live cannot be established — refusing to read it as free (NOT clean)
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: /home/cmux/.pi/agent/state/lane-registry.tsv)
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean for #2218 in daniel-ospina/tortoise — PART of this is the LANE ROSTER is UNKNOWN (not empty)")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952C" b3
+  if r2952_is_queued "$CELL2952C"; then rc=1; else rc=0; fi
+  ck "(2952c) a SECOND unreadable surface (issue landed, its own cause) is NOT re-routed — the work itself is unjudged" $rc
+  case "$(cat "$TMP/2952-b3.out")" in
+    *"?#10 INCOMPLETE from the pre-flight"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952c) …and it is the pre-flight's INCOMPLETE arm that refused it (the guard fired, it did not no-op)" $rc
+  # ── (2952d) A DIFFERENT ADVERB IS STILL THE SAME CONTRACT ────────────────────────────────────
+  # This is the arm that makes the fix a CONTRACT rather than a widened literal: the producer is not
+  # vendored, so the next reword must not silently re-break the re-route. Any `could not be … queried`
+  # renders the set; a verdict line with NO parenthetical at all renders nothing, and then the pass
+  # REFUSES **loudly** (the drift echo) instead of returning to a silent `0 dispatched`.
+  CELL2952D="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be PARTIALLY queried (issue assignee/holder); this is NOT clean')"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952D" b4
+  if r2952_is_queued "$CELL2952D"; then ck "(2952d) an adverb the producer has NOT used yet keeps the re-route alive (the anchor is 'queried (', not the phrase)" 0; else ck "(2952d) an adverb the producer has NOT used yet keeps the re-route alive (the anchor is 'queried (', not the phrase)" 1; fi
+  # (2952e) …and the DRIFT case is REFUSED **and ANNOUNCED**: no parenthetical → nothing to re-route
+  # on, plus a WARN naming the drift. Silence here is what cost six days on cell4.
+  CELL2952E="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) is unreadable; this is NOT clean')"
+  r2952_run "$CELL2952E" b5
+  if r2952_is_queued "$CELL2952E"; then rc=1; else rc=0; fi
+  ck "(2952e) a verdict line with NO surface list is NOT re-routed (drift fails CLOSED)" $rc
+  case "$(cat "$TMP/2952-b5.out")" in
+    *"WARN: #10 the pre-flight's VERDICT LINE carried no readable surface list"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952e) …and the drift is ANNOUNCED, not swallowed (a silent no-op is what must not recur)" $rc
+
+  # ── (2952f–i) THE CELL'S REAL SHAPE: TWO SURFACES, ONE CAUSE (agent-infra#2952) ─────────────────
+  # ⛔ (2952a)–(2952e) ABOVE PINNED THE *PARSER* — they all carry a verdict line naming ONE surface,
+  # which is NOT the shape a cell produces. #2952's headline defect is the one they cannot see: the
+  # claim gate ABORTS the whole issue scan on a cell, so the producer records ONE inability as TWO
+  # unreadable surfaces, both carrying the SAME board note:
+  #   `2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder)`
+  # #1935 required the holder surface to be named ALONE, so `HOLDER_ONLY` was 0 for every cell
+  # candidate and the substitution could never fire — measured as `12 unjudged`, `227 not reached`,
+  # `0 dispatched`, every pass, with the whole pre-flight budget spent refusing candidates the box
+  # could have judged. The condition is the CAUSE, so these arms key on it:
+  #   (f) every named surface's cause is the unanswerable board + the holder is named → JUDGED;
+  #   (g) …and an UNREADABLE registry is still INCOMPLETE (the substitution moves the requirement,
+  #       it does not remove it) — the same report, only the registry's verdict changed;
+  #   (h) a board-caused set that does NOT name the holder surface → refused (nothing to substitute);
+  #   (i) a surface the verdict line NAMES but the parser cannot read a cause for → refused,
+  #       because "no cause" must never satisfy "every cause is the board".
+  # ⛔ (g) IS THE POLARITY ARM AND IT IS DELIBERATELY THE *SAME FIXTURE* AS (f): if the two ever
+  # disagree the difference is the registry's answer and nothing else, so a mutant that drops the
+  # registry requirement reds (g) while (f) stays green — which is what makes (f) non-vacuous.
+  cat > "$TMP/cell2952-multi.report" <<'REPORT'
+issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv')
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv')
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean for #2218 in daniel-ospina/tortoise — PART of this is the LANE ROSTER is UNKNOWN (not empty)
+REPORT
+  CELL2952F="$(holder_report x "$(cat "$TMP/cell2952-multi.report")")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952F" f1
+  if r2952_is_queued "$CELL2952F"; then rc=0; else rc=1; fi
+  ck "(2952f) the CELL's real verdict (TWO surfaces, ONE board cause) is JUDGED — the registry answers the one open question" $rc
+  case "$(cat "$TMP/2952-f1.out")" in
+    *"the pre-flight's HOLDER surface could not answer"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952f) …and it was the HOLDER substitution that judged it (not a silently different CLEAN path)" $rc
+  # (2952g) THE POLARITY, ON THE SAME REPORT: the substitution moves the requirement from "a local
+  # board must answer" to "the cross-box registry must answer". An unreadable registry answers
+  # nothing, so the candidate is INCOMPLETE and is neither queued nor retired.
+  CELL2952G="$(holder_report x "$(cat "$TMP/cell2952-multi.report")")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="the registry could not be read (stub)"; return 2; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952G" f2
+  if r2952_is_queued "$CELL2952G"; then rc=1; else rc=0; fi
+  ck "(2952g) …with an UNREADABLE registry the SAME report is still INCOMPLETE — the cause keys the arm, not the count" $rc
+  case "$(tr '\n' ' ' < "$CELL2952G/checked.txt")" in *10*) rc=1 ;; *) rc=0 ;; esac
+  ck "(2952g) …and not retired (a claim is a window, so the candidate is re-attempted next pass)" $rc
+  # ⛔ A READABLE REGISTRY IS WHAT MAKES (h) AND (i) FALSIFIABLE (review P1, this round). (g) leaves
+  # the shared stub at rc 2, and with an UNREADABLE registry EVERY candidate below is refused by the
+  # registry requirement ALONE — so both arms read green even with the whole cause-set condition
+  # deleted, and the membership test they are recorded as pinning had NO assertion that could turn
+  # red (measured: the mutant queues neither, on either stub). Re-stub it READABLE: the refusal must
+  # then come from the membership test and nothing else, or the two arms are decoration.
+  {
+    printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'
+    cat "$TMP/refreshloop.sh"
+  } > "$TMP/refreshloop-2952.sh"
+  # (2952h) A BOARD-CAUSED SET WITHOUT THE HOLDER SURFACE. The cause matches, so the cause alone would
+  # re-route it — but there is no holder answer to substitute, so nothing may be judged.
+  # ⛔ WHAT THIS ARM DOES *NOT* PIN (review P1, this round): it cannot red from the cause-set condition
+  # alone. With the condition DELETED the candidate is still refused, because the substitution's own
+  # downstream requirement — a parsed `issue assignee/holder` ROW whose note is the board's (the
+  # `holder_note` gate below, #1935/#1977) — has nothing to match. So this arm is a pin on the
+  # COMPOSITE refusal (defence in depth: it reds only if BOTH that gate and the condition are gone),
+  # and it is NOT the assertion that condition 3 is live. (2952i) is, and was rebuilt to be.
+  CELL2952H="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be FULLY queried (issue landed); this is NOT clean')"
+  r2952_run "$CELL2952H" f3
+  if r2952_is_queued "$CELL2952H"; then rc=1; else rc=0; fi
+  ck "(2952h) a board-caused INCOMPLETE that does NOT name the holder surface is REFUSED (nothing to substitute)" $rc
+  # (2952i) A SURFACE THE VERDICT LINE NAMES, WITH NO CAUSE THIS READER CAN FIND. The cause test is
+  # SET MEMBERSHIP over the parsed rows, so an unparsed surface has no cause at all — and "no cause"
+  # must never read as "the board's cause", or the arm fails OPEN on a parser miss.
+  # ⛔ THE HOLDER ROW *IS* PARSED HERE, DELIBERATELY (review P1, this round). The earlier fixture named
+  # the holder in the verdict line and left its row out, which meant the downstream `holder_note` gate
+  # refused the candidate whatever this condition did — the arm read green with the whole condition
+  # deleted (measured, M4), so it pinned nothing. The absent surface is therefore a THIRD one (`open
+  # PRs`, a real slug — see the D5 fixture above) while BOTH board-caused rows are present: the holder
+  # answer exists and the registry is READABLE, so the ONLY thing between this candidate and the
+  # registry is the membership test. That is what makes the arm able to fail, and it is the FAIL-OPEN
+  # it now pins: a surface the tool could not read is queued as verified.
+  CELL2952I="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 3 surface(s) could not be FULLY queried (issue landed, issue assignee/holder, open PRs); this is NOT clean')"
+  r2952_run "$CELL2952I" f4
+  if r2952_is_queued "$CELL2952I"; then rc=1; else rc=0; fi
+  ck "(2952i) a surface NAMED by the verdict line but ABSENT from the parsed set is REFUSED (no cause is not the board's)" $rc
 fi
+
+# ── 5m) REPO has NO path default — required, or derived from a checkout of the QUEUE's repo ─────
+# `REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"` made one developer's home
+# directory the default checkout on every machine (#1935). These cases drive the SHIPPED script's
+# own `--check`, so what is pinned is the real resolver, not a re-implementation of it.
+RH="$TMP/repohome"; mkdir -p "$RH/cell"
+if ( unset REPO; unset TORTOISE_REPO; unset WORKDIR; unset TORTOISE
+     HOME="$RH" O="$TMP/repohome/o" OR=acme/widget bash "$REFRESH" --check > "$TMP/repo-none.out" 2>&1 ); then rc=1; else rc=0; fi
+ck "REPO unset with no derivable checkout REFUSES (non-zero, not a guess)" $rc
+case "$(cat "$TMP/repo-none.out")" in *"acme/widget"*) rc=0;; *) rc=1;; esac
+ck "the refusal NAMES the queue target it looked for" $rc
+case "$(cat "$TMP/repo-none.out")" in *"set REPO="*) rc=0;; *) rc=1;; esac
+ck "the refusal carries the one-line remedy (set REPO=…)" $rc
+# A checkout of a DIFFERENT repo at the same candidate path must NOT be adopted: the queue target and
+# the checkout must be the same repo, or the cell queues work it cannot pre-flight (#1901).
+git -C "$RH/cell" init -q 2>/dev/null && git -C "$RH/cell" remote add origin https://github.com/acme/other.git
+( unset REPO; unset TORTOISE_REPO; unset WORKDIR; unset TORTOISE
+  HOME="$RH" O="$TMP/repohome/o2" OR=acme/widget bash "$REFRESH" --check > "$TMP/repo-wrong.out" 2>&1 ) || true
+case "$(cat "$TMP/repo-wrong.out")" in *"REPO was not set"*) rc=1;; *) rc=0;; esac
+ck "a checkout of the WRONG repo at a candidate path is NOT adopted" $rc
+# …and the same path with the right origin IS adopted (the false-block control).
+git -C "$RH/cell" remote set-url origin https://github.com/acme/widget.git
+( unset REPO; unset TORTOISE_REPO; unset WORKDIR; unset TORTOISE
+  HOME="$RH" O="$TMP/repohome/o3" OR=acme/widget bash "$REFRESH" --check > "$TMP/repo-ok.out" 2>&1 ) || true
+# ⛔ THE EXPECTED PATH IS THE RESOLVER'S `pwd -P` FORM, NOT THE `$TMP`-SPELLED ONE (#1935 review,
+# P2). `resolve_repo` prints the value AFTER `cd "$cand" && pwd -P` (`REPO="$(cd "$cand" && pwd -P)"`),
+# so on macOS — where `$TMPDIR` is `/var/folders/…` and `/var` is a symlink to `/private/var` — a
+# literal `$RH/cell` matches nowhere and this positive control reds for an unrelated reason. Same rule
+# the claim-cwd suite states (`pwd -P` comparisons) and refresh-scout applies to its expected side.
+RH_REAL="$(cd "$RH/cell" && pwd -P)"
+case "$(cat "$TMP/repo-ok.out")" in *"REPO was not set — using $RH_REAL"*) rc=0;; *) rc=1;; esac
+ck "a checkout whose origin IS the queue target is DERIVED (the resolver's positive path)" $rc
+# An EXPLICIT $REPO is held to the same proof (cycle-2 review, F3). It used to be adopted on trust, so
+# `refresh --check` returned CHECK OK for a pair that `cloud-cell-supervisor.sh check` refuses — and
+# bring-up hands this script whatever checkout it finds, so a wrong pair was certified by the gate that
+# exists to catch it. Three arms: mismatch refused, unreadable origin refused, match accepted.
+#
+# ⛔ THE FIXTURES MUST BE PROVISIONABLE, OR EVERY ARM MEASURES THE WRONG GATE (measured in CI: this
+# block was RED on the PR lane and GREEN on the author's box). `--check` judges MORE than the repo
+# resolver: after `resolve_repo` it runs the #1736 provisioning gate, which refuses (rc 3) a repo
+# carrying no `tools/collision_preflight.py` and no resolvable tortoise checkout. The fixture repos
+# had neither, so out of the box the mismatch and no-origin arms passed for a reason that had nothing
+# to do with the origin check (that pass is VACUOUS pre-F3, since a trusted-on-sight repo also exits
+# non-zero there), and the accepted arm FAILED — the false block this test exists to forbid — with no
+# resolver involved at all. The author's box only passed because an ambient $TORTOISE_REPO resolved
+# the tool; the runner has none. So: the tools are VENDORED into each fixture (existence is all
+# `resolve_preflight` reads) and the three env seams the resolver consults are UNSET, exactly as the
+# derived arms above do. Each arm then isolates the property it names.
+X="$TMP/repoexplicit"; mkdir -p "$X/other/tools" "$X/samerepo/tools"
+for d in "$X/other" "$X/samerepo"; do
+  printf '# fixture: `--check` only tests that the pre-flight tool EXISTS (#1736)\n' > "$d/tools/collision_preflight.py"
+done
+git -C "$X/other" init -q; git -C "$X/other" remote add origin https://github.com/acme/other.git
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$X/other" OR=acme/widget O="$TMP/repoexplicit/o" bash "$REFRESH" --check > "$TMP/repo-explicit-mismatch.out" 2>&1 ); rc=$?
+if [ "$rc" -ne 0 ]; then xr=0; else xr=1; fi
+ck "an EXPLICIT REPO whose origin is a DIFFERENT repo is REFUSED (the two entry points agree, #1901)" $xr
+case "$(cat "$TMP/repo-explicit-mismatch.out")" in
+  *"NOT the queue target"*) xr=0 ;;
+  *) xr=1 ;;
+esac
+ck "the mismatch refusal names the queue target and the checkout's origin" $xr
+# The mismatch arm must fail for the ORIGIN reason, not because the fixture was unprovisionable:
+# assert the provisioning gate is satisfiable here, or the arm above is vacuous.
+case "$(cat "$TMP/repo-explicit-mismatch.out")" in
+  *"no tools/collision_preflight.py"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "the mismatch arm's fixture IS provisionable (the refusal is the origin check, not #1736)" $xr
+git -C "$X/samerepo" init -q   # …a checkout with NO origin cannot prove anything either
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o2" bash "$REFRESH" --check > "$TMP/repo-explicit-noorigin.out" 2>&1 ); rc=$?
+if [ "$rc" -ne 0 ]; then xr=0; else xr=1; fi
+ck "an EXPLICIT REPO with NO readable origin is REFUSED (cannot-prove is not proved)" $xr
+# …and refused BY THE ORIGIN CHECK: an rc-only assertion also passes when the resolver ADOPTED the
+# checkout on trust and #1736 refused it, which is exactly the pre-F3 behaviour this arm forbids.
+case "$(cat "$TMP/repo-explicit-noorigin.out")" in
+  *"has no readable 'origin'"*) xr=0 ;;
+  *) xr=1 ;;
+esac
+ck "the no-origin refusal names the missing remote (not a downstream provisioning failure)" $xr
+git -C "$X/samerepo" remote add origin https://github.com/acme/widget.git
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1 )
+# The ACCEPTANCE is asserted on the resolver's own line, not on rc: `[refresh] check: repo=…` is printed
+# ONLY after `resolve_repo` returns 0, so it cannot pass when the resolver refused — and unlike rc it
+# does not move when the box's `python3` is older than the tool's floor (the interpreter judge runs
+# AFTER the resolver and would turn a correct acceptance into a non-zero exit; that is a different
+# gate's red, and pinning rc here made THIS arm fail for it).
+case "$(cat "$TMP/repo-explicit-ok.out")" in
+  *"[refresh] check: repo=$X/samerepo"*) xr=0 ;;
+  *) xr=1 ;;
+esac
+ck "an EXPLICIT REPO that IS a checkout of the queue target is ACCEPTED (no false block)" $xr
+case "$(cat "$TMP/repo-explicit-ok.out")" in
+  *"NOT the queue target"*|*"has no readable 'origin'"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray rc)" $xr
+# ⛔ THE ONE PAIR ON WHICH THE TWO VERBS STILL DISAGREE, PINNED AS A DECLARED RESIDUAL (review F2).
+# An explicit $REPO whose `origin` is a FILESYSTEM PATH with $OR UNDECLARED cannot be cross-checked
+# here (there is nothing to compare a path to), so `resolve_repo` announces it and returns 0 — while
+# `cloud-cell-supervisor.sh check` calls `queue_repo_from_url` on the same path, gets nothing, sets
+# `underivable` and DIES. That is the local bare mirror this suite's own fixtures clone from, i.e.
+# reachable. The PR body used to claim the entry points "can no longer disagree about the same pair",
+# which is false for exactly this shape; the claim is narrowed and the residual is stated in
+# `resolve_repo` (see its DECLARED RESIDUAL note). This arm pins the residual AS A DECISION, so
+# turning it into a refusal is a deliberate test edit with a stated reason — never a silent tightening
+# that refuses every local dev clone (`git init` + `remote add origin <path>`).
+XP="$TMP/repolocalpath"; mkdir -p "$XP/tools" "$XP/origin.git"
+printf '# fixture: `--check` only tests that the pre-flight tool EXISTS (#1736)\n' > "$XP/tools/collision_preflight.py"
+git -C "$XP/origin.git" init -q --bare
+git -C "$XP" init -q; git -C "$XP" remote add origin "$XP/origin.git"
+( unset OR; unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$XP" O="$TMP/repolocalpath/o" bash "$REFRESH" --check > "$TMP/repo-localpath.out" 2>&1 ) || true
+case "$(cat "$TMP/repo-localpath.out")" in
+  *"the pairing is not cross-checked"*) xr=0 ;;
+  *) xr=1; echo "      out: $(cat "$TMP/repo-localpath.out" | head -3)" ;;
+esac
+ck "a local-path origin with an UNDECLARED \$OR is TOLERATED and ANNOUNCED (the stated residual, not silence)" $xr
+case "$(cat "$TMP/repo-localpath.out")" in
+  *"NOT PROVISIONABLE"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "…and it is TOLERATED, not refused (the residual is the tolerance; a refusal here would block local dev clones)" $xr
+case "$(cat "$TMP/repo-localpath.out")" in
+  *"[refresh] check: repo=$XP"*) xr=0 ;;
+  *) xr=1 ;;
+esac
+ck "…and the resolver really returned 0 for it (the NOTE is not printed on the way to a refusal)" $xr
+
+# ⛔ "DECLARED" IS THE OPERATOR'S CLAIM, NOT THE VARIABLE'S PRESENCE (#1977 review, P1).
+# `orch-loop.sh` EXPORTS `OR` on EVERY cycle — including the one where it fell back to its own default —
+# so a child that reads mere presence as "declared" refuses the local-path checkout above on EVERY
+# production pass (rc 3 → `.refresh-blocked` → a merge-only cell), while the loop's own comment calls
+# that shape legitimate. The loop therefore passes its intent in `OR_OPERATOR_DECLARED`, and these
+# three arms pin the distinction: intent=0 tolerates, intent=1 proves, no marker keeps the old rule.
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR; unset OR_OPERATOR_DECLARED
+  HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=0 O="$TMP/repolocalpath/op0" bash "$REFRESH" --check > "$TMP/repo-localpath-loop.out" 2>&1 ) || true
+case "$(cat "$TMP/repo-localpath-loop.out")" in
+  *"cannot prove it is a checkout"*) xr=1 ;;
+  *"the pairing is not cross-checked"*) xr=0 ;;
+  *) xr=1; echo "      out: $(head -3 "$TMP/repo-localpath-loop.out")" ;;
+esac
+ck "an EXPORTED \$OR the loop DERIVED (OR_OPERATOR_DECLARED=0) does not refuse a local-path checkout" $xr
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR; unset OR_OPERATOR_DECLARED
+  HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=1 O="$TMP/repolocalpath/op1" bash "$REFRESH" --check > "$TMP/repo-localpath-decl.out" 2>&1 ); rc=$?
+[ "$rc" -eq 3 ] && xr=0 || xr=1
+ck "an OPERATOR-DECLARED \$OR (OR_OPERATOR_DECLARED=1) still REFUSES a local-path checkout (rc=3)" $xr
+# ⛔ AND THE REFUSAL IS THE ONLY MESSAGE. `repo_unresolved` speaks for an UNSET $REPO; on a rejected
+# EXPLICIT one it appended "$REPO is not set" beside the true reason and prescribed the value already
+# in hand — two contradictory refusals in one run (review P2).
+case "$(cat "$TMP/repo-localpath-decl.out")" in
+  *"is not set"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "a REJECTED explicit \$REPO is not also reported as UNSET (one cause, one message)" $xr
+
 
 # ── 5e) the capture site itself: a failed `gh` leaves ABSENCE, not an empty file ──────────────
 # The reaper guard above is only sound if the capture never hands it an empty file for a FAILED
@@ -906,7 +1638,7 @@ printf '#!/bin/bash\nexit 0\n' > "$SB/.local/share/pi-node/current/bin/pi"; chmo
 if on_darwin; then
 HOSTILE="$TMP/x<y>z"
 HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
-PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL="$SB/Library/LaunchAgents/$TPL"
 [ -f "$PL" ] && rc=0 || { rc=1; echo "      install.sh did not render a plist: $(tail -3 "$TMP/inst.out")"; }
 ck "install.sh renders a plist" $rc
 if [ -f "$PL" ]; then
@@ -952,7 +1684,7 @@ ln -s "$HOME/.config/gh" "$SB2/.config/gh" 2>/dev/null || true
 mkdir -p "$SB2/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB2/.local/share/pi-node/current/bin/pi"; chmod +x "$SB2/.local/share/pi-node/current/bin/pi"
 HOME="$SB2" O="$TMP/fresh-o" REPO="$FR/repo" OR="acme/widget" bash "$INST" > "$TMP/inst-fresh.out" 2>&1
-PL2="$SB2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL2="$SB2/Library/LaunchAgents/$TPL"
 [ -f "$PL2" ] && rc=0 || { rc=1; echo "      fresh checkout: $(tail -2 "$TMP/inst-fresh.out")"; }
 ck "install.sh renders a plist on a fresh checkout (no .worktrees dir yet)" $rc
 else
@@ -983,10 +1715,10 @@ for b in tmux gh pi jq; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
 # ⛔ AND THE STUB MUST STAY ON *EVERY* PATH THIS FILE HANDS THE INSTALLER (review finding, T5): this
 # line used to be PATH="$FB:/usr/bin:/bin", which DROPPED $GSTUB, so install.sh's post-install banner read
-# the REAL domain (`launchctl print gui/<uid>/com.eldato.orchestrator-loop`). Read-only that day — and one
-# added mutating call away from the 2026-10-17 incident this whole file guards against.
+# the REAL domain. Read-only that day — and one added mutating call away from the 2026-10-17 incident
+# this whole file guards against.
 HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:$GSTUB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
-PL3="$TMP/sb3/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL3="$TMP/sb3/Library/LaunchAgents/$TPL"
 [ -f "$PL3" ] && rc=0 || { rc=1; echo "      controlled-PATH install did not render: $(tail -3 "$TMP/inst-path.out")"; }
 ck "install.sh renders with a controlled PATH (uv absent stays non-fatal)" $rc
 PLP="$(plutil -extract EnvironmentVariables.PATH raw "$PL3" 2>/dev/null || echo MISSING)"
@@ -1014,7 +1746,7 @@ printf '#!/bin/bash\nexit 0\n' > "$SB4/.local/share/pi-node/current/bin/pi"; chm
 ck "non-vacuity: the fresh sandbox HOME has no Library/LaunchAgents" $rc
 HOME="$SB4" O="$TMP/plistdir-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst-plistdir.out" 2>&1
 inst_rc=$?
-[ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && rc=0 \
+[ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/$TPL" ] && rc=0 \
   || { rc=1; echo "      install.sh rc=$inst_rc did not create the plist dir: $(tail -3 "$TMP/inst-plistdir.out")"; }
 ck "install.sh creates the plist directory on a HOME that lacks it" $rc
 else
@@ -1177,7 +1909,12 @@ mem_def="$(dval MIN_MEM_FREE_MB)"
 swp_def="$(dval MIN_SWAP_FREE)"
 [ "$mem_def" = "512" ] && rcd=0 || { rcd=1; echo "      MIN_MEM_FREE_MB resolves to '$mem_def' -- README documents 512"; }
 ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped files" $rcd
-GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
+# ⛔ BY THE MARKERS, NOT BY `^  fi$` (agent-infra#2924/#2927). The chain's closing `fi` used to be the
+# only bare `  fi` after the entry line, so the extraction could stop there; the gate VECTOR put each
+# arm in its own guard, and several of those guards close on a bare `  fi` — the first one truncated
+# the block to the merge-priority arm, ELEVEN assertions still passed and the three below went red.
+# A marker is the range the code itself declares, so adding an arm cannot silently shorten the test.
+GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/# \[gatevec:end\]/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
 mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]
@@ -1710,7 +2447,14 @@ if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.
   cat > "$TMP/ra.sh" <<SH
 pi() { sleep 60; }
 . "$TMP/runagent.sh"
-start=\$(date +%s); run_agent 2 "$TMP/ra.log" /dev/null; rc=\$?; end=\$(date +%s)
+# ⛔ THE PROMPT IS A REAL BRIEF, NOT /dev/null (agent-infra#2258). run_agent now refuses a brief with
+# no research contract (80) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
+# run_agent return 80 without ever launching `pi` — and the assertion below ("it ran, and was cut off
+# at the wall limit") would fail for a reason that has nothing to do with the timeout it exists to
+# test. Rendering the canonical block keeps the fixture HONEST: the function under test still gets a
+# brief of the shape a real dispatch carries.
+brief_gate_sh="$HERE/brief-gate.sh"; bash "\$brief_gate_sh" --section reviewer > "$TMP/ra-brief.txt"
+start=\$(date +%s); run_agent 2 "$TMP/ra.log" "$TMP/ra-brief.txt"; rc=\$?; end=\$(date +%s)
 echo "\$((end-start)) \$rc"
 SH
   ra="$(bash "$TMP/ra.sh" 2>/dev/null | tail -1)"
@@ -1917,7 +2661,7 @@ ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
 # both greps above stay green while the pin silently evaporates at install time. Assert the value
 # that actually lands in the plist, through the real installer.
 if on_darwin; then
-PL2="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL2="$SB/Library/LaunchAgents/$TPL"
 render_scope() {   # $1 = a value, or the literal __UNSET__
   if [ "$1" = "__UNSET__" ]; then
     HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" env -u SCOPE bash "$INST" >/dev/null 2>&1
@@ -2702,35 +3446,39 @@ fi
 # NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
-# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
-# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
-# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
-# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
-# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
-# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
-# With nesting, the two populations are disjoint by construction, so each is counted directly. The
-# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
-# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
-# ⛔ THREE fixer defer arms, in TWO spellings (#2333 review, P2). Two sites write the predicate as
-# the WHOLE condition (`if ciq_push_ok; then`, counted by `fixer_defer_sites`); the REVIEW-GATE site
-# SHARES the condition with its own eligibility (`if [ "$_fix_eligible" = "1" ] && ciq_push_ok;
-# then`), which the literal pattern cannot see — so without `fixer_defer_shared`, deleting that
-# `&& ciq_push_ok` left this check green while the site stopped deferring. (The fourth CI-queue
-# defer, the #PR CI RERUN, is not a fixer spawn and is pinned by ci-queue.test.sh's wiring arms.)
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY, AND IN BOTH DIRECTIONS.
+# ⛔ THE FIXER DEFER COUNT IS NOW ZERO ON PURPOSE (#2927). The three fixer spawn sites used to nest a
+# `ciq_push_ok` deferral inside their own eligibility. They no longer do: a fixer is REPAIR — it acts
+# on a PR that already exists — so the class rule in ci-queue.sh's header excludes it from queue
+# gating. ⛔ NOT because "its pass is already spent" (a repair push DOES start a fresh run): the basis
+# is #2927's decision plus the measurement that the NUMBER was demand read as supply. Measured 2026-10-27 on cell 4, that gate skipped 41
+# consecutive repair dispatches while 8 self-hosted runners and ~11 lane slots sat idle, against a
+# queue depth that belonged to GitHub-HOSTED concurrency and to NEW-PR work.
+# So `fixer_defer_sites`/`fixer_defer_shared` are pinned at 0: a gate RE-ADDED to any fixer arm
+# reddens this line, and `fixer_sites` still pins the load gate each one carries. The one CI-queue
+# defer that survives is the #PR CI RERUN (`! ciq_push_ok`), which genuinely ADDS a run to the queue;
+# it is not a fixer spawn and is pinned both here and by ci-queue.test.sh's wiring arms.
 fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
 fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
+rerun_gate=$(grep -cF '! ciq_push_ok' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
-merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
+# ⛔ AND THE REVIEW ORDER IS ITS OWN SPAWN SITE (agent-infra#2971). The re-record arm used to spawn
+# under the `merge-<PR>` tag and compare against `wt_count merge-)`; it now dispatches `review-<PR>`
+# and compares against `wt_count review- merge-)` (one review-lane budget across both tag families,
+# the semantics the ceiling always had). Without this the literal pattern above would stop seeing the
+# site — the count would read 1 and this check would be pinning half of what it names.
+merge_site=$(grep -E 'wt_count (review- )?merge-\)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
-[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
-ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
-[ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
-ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
+[ "$fixer_defer_sites" = "0" ] && rc=0 || rc=1
+ck "NO fixer spawn arm is CI-queue-gated (#2927 — a fixer is REPAIR; found $fixer_defer_sites, expected 0)" $rc
+[ "$fixer_defer_shared" = "0" ] && rc=0 || rc=1
+ck "…and the review-gate fixer's eligibility no longer shares a queue gate either (found $fixer_defer_shared, expected 0)" $rc
+[ "$rerun_gate" = "1" ] && rc=0 || rc=1
+ck "…while the one act that ADDS a run to the queue — the CI rerun — is still gated (found $rerun_gate, expected 1)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
-ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
+ck "both merge spawn sites (the review order review-<PR> + rail-mode GREEN merge-<PR>) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
@@ -3196,12 +3944,12 @@ mk_sb() { local d; d="$(mktemp -d "$TMP/sbx.XXXXXX")"
   ln -s "$HOME/.config/gh" "$d/.config/gh" 2>/dev/null || true
   [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$d/.pi/agent/scripts/record-review.sh"
   printf '#!/bin/bash\nexit 0\n' > "$d/.local/share/pi-node/current/bin/pi"; chmod +x "$d/.local/share/pi-node/current/bin/pi"
-  printf 'SEED\n' > "$d/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+  printf 'SEED\n' > "$d/Library/LaunchAgents/$TPL"
   printf '%s' "$d"; }
 run_inst_at() { # <installer> <sandbox> [VAR=VAL…] -> "<rc>|<live-plist first line>|<stderr tail>"
   local i="$1" d="$2"; shift 2
   env HOME="$d" O="$TMP/glt-o" REPO="$HERE/../.." OR="acme/widget" "$@" bash "$i" >"$d/out" 2>&1
-  printf '%s|%s|%s' "$?" "$(head -1 "$d/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" 2>/dev/null)" "$(tail -1 "$d/out")"; }
+  printf '%s|%s|%s' "$?" "$(head -1 "$d/Library/LaunchAgents/$TPL" 2>/dev/null)" "$(tail -1 "$d/out")"; }
 run_inst() { run_inst_at "$INST" "$@"; }
 # Fields are "<rc>|<live-plist-first-line>|<stderr tail>" -- slice by FIELD, not by ${out#*|}.
 inst_rc()  { printf '%s' "$1" | cut -d'|' -f1; }
@@ -3356,7 +4104,7 @@ ck "a POST-render rejection leaves the live plist intact (the render is atomic)"
 SBG="$(mk_sb)"; out="$(run_inst "$SBG")"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      a clean render failed: '$out'"; }
 ck "install.sh still installs the happy path (the new guards do not refuse a legal config)" $rc
-SBPL="$SBG/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+SBPL="$SBG/Library/LaunchAgents/$TPL"
 grep -q '__[A-Z_]*__' "$SBPL" && rc=1 || rc=0
 ck "no unrendered token survives a successful render (driven through the real installer)" $rc
 plutil -lint "$SBPL" >/dev/null 2>&1 && rc=0 || rc=1
@@ -3364,6 +4112,85 @@ ck "the freshly rendered plist is valid XML" $rc
 else
   skipd "install.sh's render guards, DRIVEN (§6 follow-on) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
 fi
+
+# ── 6f) the sandbox LABEL seam (agent-infra#1996) ──────────────────────────────────────────────
+# launchd labels are GLOBAL: a plist rendered under a throwaway $HOME still addresses the PRODUCTION
+# job by name when it carries the production label, so a `launchctl bootout` addressed at a sandbox
+# plist reaches the controller the box is actually RUNNING — a "sandboxed" test can silence
+# production, and this suite's own `launchctl` stub would have answered for it. Two halves here: the
+# real installer driven under a TEST label, and `label_guard` driven in all four directions.
+# ⛔ THE OTHER TWO HALVES OF THIS SECTION ARE NOT RE-ASSERTED HERE, AND THAT IS DELIBERATE: the
+# `WorkingDirectory` property belongs to PR #2020 (main's measured answer is the install dir, not the
+# checkout — docs/ops/fleet-harness-baseline.md:162) and the watchdog — its plist, its decisions and
+# its disarm sentinel — belongs to PR #1986, which owns that agent. One implementation, one
+# description, one suite; a second copy here is how a fleet ends up with two disarm sentinels.
+WDSB=""
+if on_darwin; then
+WDSB="$(mk_sb)"
+out="$(run_inst "$WDSB")"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      install for §6f failed: '$out'"; }
+ck "§6f: install.sh installs cleanly under the sandbox label" $rc
+PLW="$WDSB/Library/LaunchAgents/$TPL"
+lbl="$(plutil -extract Label raw "$PLW" 2>/dev/null || echo MISSING)"
+[ "$lbl" = "$TEST_LABEL" ] && rc=0 || { rc=1; echo "      rendered Label='$lbl', wanted '$TEST_LABEL'"; }
+ck "§6f: the sandbox install carries the TEST label" $rc
+# ⛔ NOT `grep -F "$PROD_LABEL"`: the TEST label CONTAINS the production one as a substring
+# (`…-loop-test`), so a substring read would fail on a correctly-labelled plist — the arm would be red
+# for the wrong reason and would be "fixed" by weakening it. The production label only counts when it
+# is NOT followed by a `-suffix`.
+# ⛔ XML COMMENTS ARE STRIPPED FIRST. The templates DOCUMENT the production label in prose, and a
+# comment cannot address launchd — but a plain grep over the file reads it as a hit and the arm goes
+# red on a correctly-labelled plist. Only the EFFECTIVE plist counts.
+if sed '/<!--/,/-->/d' "$PLW" 2>/dev/null | grep -qE "$PROD_LABEL([^a-z-]|$)"; then rc=1; else rc=0; fi
+ck "§6f: ...and no sandbox plist names the PRODUCTION label anywhere" $rc
+else
+  skipd "§6f: the sandbox-label render — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
+
+# §6f (second half) drives `label_guard` as the PURE decision it is (label, HOME, real home), so the
+# rule is proven in BOTH directions without ever installing into the real LaunchAgents — a test that
+# reproduced the failure would be the failure. No launchd and no macOS: this runs everywhere.
+awk '/^label_guard\(\) \{/,/^}/' "$INST" > "$TMP/labelguard.sh"
+if need "$TMP/labelguard.sh" "§6f: extract label_guard from install.sh"; then
+  # shellcheck source=/dev/null
+  . "$TMP/labelguard.sh"
+  BASE_LABEL="$PROD_LABEL"
+  PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
+  # A "sandbox home" for the guard: a throwaway dir, NOT $WDSB — that one exists only on macOS, and
+  # the guard's rule must be provable on every host (`label_guard` never touches launchd).
+  LG_SB="$TMP/labelguard-sb"; mkdir -p "$LG_SB"
+  label_guard "$PROD_LABEL" "$HOME" "$HOME"; lg_prod=$?
+  label_guard "$TEST_LABEL" "$LG_SB" "$HOME"; lg_sbx=$?
+  lg_msg="$( label_guard "$TEST_LABEL" "$HOME" "$HOME" 2>&1 )"; lg_real=$?
+  [ "$lg_prod" = "0" ] && [ "$lg_sbx" = "0" ] && [ "$lg_real" = "1" ] && rc=0 \
+    || { rc=1; echo "      prod=$lg_prod sandbox=$lg_sbx real=$lg_real"; }
+  ck "§6f: the label guard allows production-on-real and test-in-sandbox, and REFUSES a test label on the real \$HOME" $rc
+  grep -q 'SANDBOX seam' <<<"$lg_msg" && rc=0 || { rc=1; echo "      refusal: $lg_msg"; }
+  ck "§6f: ...and the refusal names the seam" $rc
+  # ⛔ THE DIRECTION THAT ACTUALLY REACHES PRODUCTION (review catch, 2026-10-18): a PRODUCTION label
+  # rendered into a sandbox \$HOME. launchd resolves the label in the user domain and ignores \$HOME, so
+  # that plist addresses the live controller — the half-guard this replaces allowed exactly that.
+  # BOTH production labels: the loop's AND the watchdog's (a second production label the guard did not
+  # know about is installable from a sandbox — the same defect, one job over).
+  lg_msg2="$( label_guard "$PROD_LABEL" "$LG_SB" "$HOME" 2>&1 )"; lg_sbxprod=$?
+  lg_msg3="$( label_guard "$PROD_WD_LABEL" "$LG_SB" "$HOME" 2>&1 )"; lg_sbxprodwd=$?
+  [ "$lg_sbxprod" = "1" ] && [ "$lg_sbxprodwd" = "1" ] && rc=0 \
+    || { rc=1; echo "      production-labels-in-sandbox guard: loop=$lg_sbxprod watchdog=$lg_sbxprodwd"; }
+  ck "§6f: ...and it REFUSES a PRODUCTION label under a sandbox \$HOME (loop and watchdog labels)" $rc
+  grep -q 'PRODUCTION label' <<<"$lg_msg2" && grep -q 'IGNORES' <<<"$lg_msg2" && rc=0 || { rc=1; echo "      refusal: $lg_msg2"; }
+  ck "§6f: ...and THAT refusal explains why \$HOME does not protect anything (launchd ignores it)" $rc
+fi
+
+# ── 6g) NO TEST ADDRESSED PRODUCTION ─────────────────────────────────────────────────────────────
+# The PATH stub refuses a production label (exit 97) and records every call, so this is a measurement
+# over the WHOLE run, not a promise about one section: every install.sh invocation in this file goes
+# through the test label, and any call that named a live job would be listed here.
+if [ -f "$LM_LOG" ] && grep -qE "$PROD_LABEL([^a-z-]|$)|$PROD_WD_LABEL([^a-z-]|$)" "$LM_LOG"; then
+  rc=1; echo "      a selftest addressed a production label:"; grep -E "$PROD_LABEL([^a-z-]|$)|$PROD_WD_LABEL([^a-z-]|$)" "$LM_LOG" | head -3
+else
+  rc=0
+fi
+ck "§6g: NO launchd call in this run addressed a production label (loop AND watchdog; the sandbox label held)" $rc
 
 # ── 20) a TERM'd controller EXITS; the lock/claim is not released while it is still running ──
 # agent-infra#1715. The shipped trap was `trap 'rm -f "$LOCKF"' EXIT INT TERM`: for INT/TERM a
@@ -3632,6 +4459,17 @@ if [ -f "$HERE/refresh-scout.test.sh" ]; then
   fi
 else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
+fi
+
+if [ -f "$HERE/refresh-provision.test.sh" ]; then
+  if bash "$HERE/refresh-provision.test.sh" > "$TMP/refresh-provision.out" 2>&1; then
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 0
+  else
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 1
+    grep -E '❌|==>' "$TMP/refresh-provision.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "refresh-provision.test.sh: the #2229 suite is present" 1
 fi
 
 # #2229: ORIGINATION MUST FAIL LOUDLY. The refresh is backgrounded, so its failure is a log line — and

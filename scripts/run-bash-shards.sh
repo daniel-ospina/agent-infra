@@ -23,13 +23,42 @@
 #   is a visible diff, and is what `scripts/check-ci-lane-parity.sh` now asserts (it checks the
 #   two call sites and this file's own floor, instead of diffing shell text).
 #
+# DERIVATION — the list is DISCOVERED, never enumerated (agent-infra#2609)
+# ---------------------------------------------------
+#   Until this change the list was 79 hand-appended `run_shard <path>` lines. Measured 2026-10-23:
+#   21 of the 71 open PRs in this repo touched this one file, so any two harness PRs conflicted
+#   here and every merge re-conflicted the rest. #1369's decision — ONE list, BOTH lanes run it —
+#   is unchanged and honoured: the list still exists in exactly ONE place, but that place is now a
+#   DERIVATION over the tree, so adding a suite is adding a FILE, and no two PRs conflict on this
+#   file to wire one.
+#
+#   DISCOVERY is by the conventions the suites already follow (SUITE_GLOBS below):
+#   `scripts/*.test.sh`, `scripts/*/*.test.sh`, `scripts/orchestrator-harness/test-*.sh`,
+#   `scripts/orchestrator-harness/selftest.sh`, `tests/*/run.sh`, `pi-bootstrap/tests/*.sh`.
+#   STATED LIMIT: a suite named outside those conventions is not discovered — the same stated-limit
+#   form `scripts/orchestrator-harness/spawn-gate.test.sh` uses about its own population.
+#
+#   ORDER is `LC_ALL=C sort -u` over the discovered paths: deterministic on every machine and
+#   independent of filesystem order (a shard assignment that shifted between runners would make
+#   every timing number incomparable). The order carries NO meaning: every suite is hermetic (see
+#   CONTRACT) and the slice a shard lands in was already re-derived on every list insertion.
+#
+#   EXCLUSION is DECLARED in the suite, never an omission from a list: a discovered suite that must
+#   not run here carries `# shard: off <reason>` in its own header. ⛔ The fail-closed direction is
+#   RUN — no marker means the suite runs, so the dangerous direction (a suite silently missing from
+#   CI) needs an explicit written reason. A marker with NO reason, or an unrecognised `# shard:`
+#   spelling, REFUSES the run (exit 2); it never degrades to "skip" or "run".
+#
 # CONTRACT
 #   - Runs every shard; the accumulator keeps going so one failure cannot hide the others.
-#   - Exits 1 if any shard failed, 0 otherwise.
+#   - Exits 1 if any shard failed, 0 otherwise — and NAMES each failing shard (a bare
+#     "N bash shard(s) failed" was unattributable: a syntax error in one suite read as a
+#     whole-list failure with no name).
 #   - Hermetic: every suite builds its own temp repos/HOME/shims and touches no real state.
-#   - `--list` prints the shard list, `--list-sweeps` the syntax-sweep globs. Both print the lists
-#     this script EXECUTES, from one source each (the `run_shard` lines and SWEEP_GLOBS below), so
-#     `check-ci-lane-parity` can read them without keeping a second, divergent copy.
+#   - `--list` prints the DERIVED shard list (DERIVATION above), `--list-sweeps` the syntax-sweep
+#     globs. Both print the lists this script EXECUTES, from one source each (SUITE_GLOBS + each
+#     suite's opt-out marker, and SWEEP_GLOBS below), so `check-ci-lane-parity` can read them
+#     without keeping a second, divergent copy.
 #
 # USAGE
 #   bash scripts/run-bash-shards.sh                 # run them all
@@ -49,9 +78,9 @@
 #   bare line `bash scripts/run-bash-shards.sh` (CALL_RE). An argument there reads as a MENTION,
 #   not the call, and the lane un-wires — the #1369 class this file exists to close.
 #
-#   ⛔ The LIST is still HERE and only here. `n` is a LANE WIDTH — one integer — never a list of
-#   suites, so no second copy exists that could drift from this one. A slice's expected size is
-#   DERIVED below from the list length and `n`; nothing is enumerated in the workflow.
+#   ⛔ The LIST is still derived HERE and only here. `n` is a LANE WIDTH — one integer — never a
+#   list of suites, so no second copy exists that could drift from this one. A slice's expected
+#   size is DERIVED below from the list length and `n`; nothing is enumerated in the workflow.
 #
 #   ⛔ Coverage is closed ARITHMETICALLY, not by trust: each slice asserts it executed EXACTLY its
 #   derived count, and every slice also asserts `executed + skipped == listed`. The slices' counts
@@ -60,30 +89,147 @@
 
 set -uo pipefail
 
+# ── the checkout this script BELONGS to ───────────────────────────────────────────────────────
+# Discovery reads the TREE, so the globs must resolve from the checkout the script lives in, not
+# from the caller's cwd. Two reasons, both measured in review (agent-infra#2609): the pre-change
+# `--list` read the script's own TEXT and therefore worked from anywhere, while the run path was
+# already cwd-dependent — one driver with two contracts; and a lane invoking it by ABSOLUTE path
+# from another directory got an empty `--list` and a run-path refusal. Anchoring both to
+# `${BASH_SOURCE[0]}/..` makes the two entry points agree and keeps the containment check
+# (`pwd -P` below) anchored to the same root.
+SHARD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || {
+  echo "❌ cannot resolve the directory this script lives in — refusing to derive a list from an unknown tree" >&2
+  exit 2
+}
+# In the repo the driver lives at <root>/scripts/…, so the root is one level up. A fixture that
+# copies it to <root>/… is the root itself — both layouts are stated here rather than guessed, so a
+# copy in a scratch repo does not silently read the PARENT of the tree it was pointed at.
+if [ "$(basename "$SHARD_ROOT")" = "scripts" ]; then
+  SHARD_ROOT="$(dirname "$SHARD_ROOT")"
+fi
+cd "$SHARD_ROOT" || {
+  echo "❌ cannot enter $SHARD_ROOT — refusing to derive a list from a tree it cannot read" >&2
+  exit 2
+}
+
 # The syntax-sweep targets. A DATA list, not two literal `for f in …` lines: `--list-sweeps` prints
 # exactly what the loops below iterate, so the sweep half cannot be advertised and not performed
 # (or performed and not advertised) without editing this one line.
 SWEEP_GLOBS=("scripts/*.sh" "scripts/lib/*.sh" "scripts/checkout-hygiene/*.sh" "scripts/harness-up" "scripts/harness-down" "scripts/harness-status")
 
+# ── the shard list: DISCOVERED from the tree, never enumerated (see DERIVATION in the header) ──
+# A DATA list in the same shape as SWEEP_GLOBS, and the ONLY list of suites: `--list` prints what
+# these globs resolve to, so the runner and the guard still read one source and no second copy can
+# drift from it. ⛔ A suite is added by adding a FILE that matches one of these; nothing here is
+# edited to wire one.
+SUITE_GLOBS=(
+  "scripts/*.test.sh"
+  "scripts/*/*.test.sh"
+  "scripts/orchestrator-harness/test-*.sh"
+  "scripts/orchestrator-harness/selftest.sh"
+  "tests/*/run.sh"
+  "pi-bootstrap/tests/*.sh"
+)
+
+# shard_marker <path> — a suite's own declaration, read from its HEADER only (the first 20 lines),
+# so a `# shard:` line buried in a body cannot speak for a file whose header said nothing.
+shard_marker() { awk 'NR > 20 { exit } /^# shard:/ { print; exit }' "$1" 2>/dev/null; }
+
+# shard_discover — the candidates, one per line, in GLOB order (shard_list fixes the order).
+# ⛔ The fail-closed direction is RUN: no marker ⇒ the suite runs, so the dangerous direction —
+# a suite silently missing from CI — requires a WRITTEN reason in the suite itself. "Written" is
+# load-bearing: `# shard: off` with nothing after it, or with only whitespace, REFUSES the run
+# (review finding, #2609 — a trailing space used to turn "refuse" into "drop from CI").
+shard_discover() {
+  local g f m reason
+  for g in ${SUITE_GLOBS[@]+"${SUITE_GLOBS[@]}"}; do
+    for f in $g; do
+      [ -f "$f" ] || continue
+      m="$(shard_marker "$f")"
+      case "$m" in
+        "") printf '%s\n' "$f" ;;
+        "# shard: off")
+          echo "❌ $f declares '# shard: off' with NO reason — refusing to run: an unexplained exclusion is an omission, not a decision" >&2
+          return 2 ;;
+        "# shard: off "*)
+          reason="${m#\# shard: off }"
+          case "$reason" in
+            *[![:space:]]*) : ;;   # a DECLARED opt-out: the reason is the rest of the line
+            *)
+              echo "❌ $f declares '# shard: off' with NO reason (only whitespace) — refusing to run: an unexplained exclusion is an omission, not a decision" >&2
+              return 2 ;;
+          esac ;;
+        *)
+          echo "❌ $f carries an unrecognised shard marker '$m' — refusing to run (the only marker is '# shard: off <reason>')" >&2
+          return 2 ;;
+      esac
+    done
+  done
+}
+
+# shard_list — the list. Sorted with LC_ALL=C so the order is the same on every machine and does
+# not inherit the filesystem's (a shard assignment that shifted between runners would make every
+# timing number incomparable); de-duplicated, because a path matched by two globs is ONE shard and
+# a repeated target is not extra coverage. A discovery error propagates — AND NOTHING IS PRINTED:
+# a caller that ignored the status must not be handed a partial list that looks whole.
+shard_list() {
+  local out
+  out="$(shard_discover)" || return 2
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out" | LC_ALL=C sort -u
+}
+
 if [ "${1:-}" = "--list" ]; then
-  # Only `.sh` targets: the sentinel self-check below also calls run_shard, and it must not
-  # appear in the list it is checked against.
-  sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}"
+  # The same derivation, the same sort and the same source as the run below — never a second scan.
+  # ⛔ AN EMPTY DERIVATION IS A REFUSAL HERE TOO: printing nothing and exiting 0 hands a consumer a
+  # vacuous "the list is empty" that looks like a clean answer (review finding, #2609).
+  shard_list_out="$(shard_list)" || exit 2
+  if [ -z "$shard_list_out" ]; then
+    echo "❌ the derived shard list is EMPTY — refusing to print an empty list as if it were the list (cwd $(pwd -P)): do the discovery globs match this tree?" >&2
+    exit 2
+  fi
+  printf '%s\n' "$shard_list_out"
   exit 0
 fi
 
 if [ "${1:-}" = "--list-sweeps" ]; then
-  printf '%s\n' "${SWEEP_GLOBS[@]}"
+  # `${SWEEP_GLOBS[@]+…}` and not a bare expansion: bash 3.2 (macOS) treats `"${A[@]}"` on an
+  # EMPTY array under `set -u` as an unbound variable, so this line exited 1 for an emptied list and
+  # `check-ci-lane-parity`’s §6 fixture reported "the lane’s own sweep list is unreadable" instead of
+  # the no-sweeps floor it was measuring. The same idiom guards SUITE_GLOBS above.
+  printf '%s\n' ${SWEEP_GLOBS[@]+"${SWEEP_GLOBS[@]}"}
   exit 0
 fi
 
-# run_shard <path> — one shard. Kept as a helper so `--list` can read the same source lines
-# (a list kept anywhere else would be the very duplication this file exists to remove).
-# `shard_ran` is what makes the list SELF-CHECKING at runtime: the counters are compared
-# against the listed count at the end, so a neutered helper (executing nothing while the list
-# still reads its full count) fails loudly instead of reporting "all bash shards passed". A static check
-# over this file's text could never catch that; running it can.
+# ⛔ THE PLACEMENT GUARD (agent-infra#3011) RUNS BEFORE ANY WORK, not merely before the shard loop.
+# This is the ONE seam every suite passes through (both lanes call this script), so the guard lives
+# here instead of in 70-odd copies of the same check — and it must fire BEFORE the syntax sweeps or a
+# live cell pays for a full `bash -n` sweep before being told it should not be running suites at all.
+# A CELL IS A CAPACITY RESOURCE: its load is the fleet's own busy signal, and suites run there leaked
+# 145 fixture controllers onto `pi-cell-4` (load 39 on 8 cores) because nothing refused. It is a no-op
+# on a laptop/CI (no controller executes from a cell root) and refuses with EX_CONFIG (78) — a
+# REFUSAL, not a test failure — unless HARNESS_SUITE_ALLOW_LIVE_CELL=1 is set. `--list`/`--list-sweeps`
+# above exit before this point on purpose: they execute nothing, so they stay readable everywhere.
+# shellcheck source=orchestrator-harness/fixture-hermetic.sh
+. "$SHARD_ROOT/scripts/orchestrator-harness/fixture-hermetic.sh"
+# ⛔ FAIL CLOSED ON THE SOURCE ITSELF. A `command not found` here would exit 127 once and then let
+# every suite run anyway — a guard that cannot fire is the failure class #3011 belongs to ("an
+# enforcer that cannot fire"), and `bash -n` cannot see it. If the helper is not loadable this driver
+# refuses rather than running the whole population unguarded.
+command -v fixture_guard_placement >/dev/null 2>&1 || {
+  echo "❌ cannot load scripts/orchestrator-harness/fixture-hermetic.sh — refusing to run shards with the #3011 placement guard inert" >&2
+  exit 2
+}
+fixture_guard_placement "run-bash-shards.sh"
+
+# run_shard <path> — one shard. `shard_ran` is what makes the list SELF-CHECKING at runtime: the
+# counters are compared against the derived count at the end, so a neutered helper (executing
+# nothing while the list still reads its full count) fails loudly instead of reporting "all bash
+# shards passed". A static check over this file's text could never catch that; running it can.
 shard_errors=0
+# ⛔ NO SECOND FAILURE LIST. This branch carried `shard_failed=()` feeding its own recap; main's
+# #2643 recap names from `shard_failed_list` AND accounts for sweep-only runs, so a second array
+# would be written and never read. The rc this branch adds reaches the log at the failure line.
 shard_ran=0
 shard_skipped=0
 shard_listed=0
@@ -106,11 +252,21 @@ shard_slowest=""
 #
 # It records only LISTED shards (`shard_is_listed`) — the same rule `shard_note` uses — so the
 # self-check sentinels below, which deliberately fail, cannot print a bogus name.
-shard_err_before=0
 
-# The list length, read from the same `run_shard` lines `--list` prints (one source). Needed
-# BEFORE the run now: it bounds the slice arithmetic and marks where the sentinels begin.
-listed="$(sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}" | grep -c .)"
+# THE LIST, derived ONCE. The count, the target-containment check, the execution loop and the
+# slice-coverage comparison below all read this variable, so the four cannot disagree about what
+# the list is. Needed BEFORE the run: it bounds the slice arithmetic and marks where the sentinels
+# begin.
+shard_paths="$(shard_list)" || {
+  echo "❌ the shard list could not be derived — refusing to run a partial list (see the error above)"
+  exit 2
+}
+listed=0
+[ -z "$shard_paths" ] || listed="$(awk 'NF { n++ } END { print n + 0 }' <<<"$shard_paths")"
+if [ "$listed" -lt 1 ]; then
+  echo "❌ the derived shard list is EMPTY — refusing to report success over a run that executes no suite"
+  exit 2
+fi
 
 # ── slice selection — see SLICING in the header ────────────────────────────────────────────────
 # Default: no slice (run the whole list) — the behaviour every existing caller keeps.
@@ -162,14 +318,18 @@ trap 'rm -f "$shard_ran_log"' EXIT
 # for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
 # hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
 #
-# ⛔ TWO READERS, TWO MECHANISMS — and the rail is served by the OTHER one. `run_shard` emits
+# ⛔ THREE READERS, AND THE RAIL NOW KNOWS ALL THREE (#2700). `run_shard` emits
 # `::error::bash shard failed: <path>`, a GitHub annotation, and `scripts/ci_exemption.py ids`
 # recognises it as a guard-step identity that CARRIES the shard path — measured on a log with two of
-# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. That is what
-# makes a red `bash-suites` step comparable to main's baseline PER SHARD, and it is NOT this block:
-# measured against the prose lines printed here, the same parser returns `ids=0` — they neither help
-# nor hurt it. Do not "fix" the rail here, and never delete the annotation while keeping these lines:
-# that would leave every lane unattributable again.
+# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. Since
+# #2648/#2700 the parser ALSO reads the two prose lines below as `bash-shard::<path>` family
+# identities: the per-shard `❌ FAILED SHARD: <path>` and the recap `❌ failing shard(s): <paths>`. The
+# earlier revision of this paragraph said "measured against the prose lines printed here, the same
+# parser returns `ids=0` — they neither help nor hurt it"; that was true before #2648 and is false
+# now, and a stale claim about the parser is exactly what a future lane reads before deciding whether
+# to touch the rail. **Do not "fix" the rail here, and never delete the annotation while keeping
+# these lines** — the annotation is the only one of the three that survives being taken out of the
+# step's own prose, and it is what keeps every lane attributable.
 #
 # Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
 # END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
@@ -247,7 +407,7 @@ shard_note() {
 # parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
 # of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
 # a PR-unique failure and still blocks.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" || { shard_errors=$((shard_errors + 1)); [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -294,7 +454,7 @@ while IFS= read -r t; do
     echo "❌ shard target '$t' does not exist — the list and the checkout disagree"
     exit 1
   fi
-done <<<"$(sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}")"
+done <<<"$shard_paths"
 
 echo "── bash syntax sweeps ─────────────────────────────────────────────"
 # The `bash -n` half: before #1369 the PR lane had NO shell-syntax gate at all — the purest
@@ -337,6 +497,7 @@ run_shard scripts/checkout-hygiene/hub-state-check.test.sh                 # #13
 run_shard scripts/checkout-hygiene/hub-worktree.test.sh                    # #1309/#1313 the RECOVERY half
 run_shard scripts/install-launchd.test.sh                                  # #304 installer suite
 run_shard scripts/install-controller-service.test.sh                      # #2402 the cell's controller is a SERVICE, not a tmux session: the rendered unit (Restart=always — NOT on-failure, the measured case is an orderly exit 0 — a stated RestartSec, and a StartLimit window that can actually fill at that RestartSec), the FOREGROUND exec that puts the controller in the unit's cgroup with the gh-limit layer still first on PATH (#1988), start/stop/status cooperating with an enabled unit instead of producing two dispatchers on one queue (#1761), the installer's refusals (Darwin/launchd, no service manager, a bad RestartSec, an unresolved token) and its idempotency, and the restart policy BOTH ways — a SIGKILL comes back, an ORDERLY exit 0 comes back, and the same exit-0 controller is NOT restarted under on-failure (the negative control that makes the other two mean something)
+run_shard scripts/pr-repair-loop.test.sh                                  # #2716/#2709 the cell's REPAIR half as its own unit: the cap is DERIVED (cell-3's 4 cores/24GB -> 2 workers; cell-4's 8 cores/3.4GB -> 0, deferred — #2721), both gates defer/refuse BY MEASUREMENT rather than by message (an unreachable disk floor, an unreachable load ceiling, a missing checkout, a missing dispatcher), the status row carries the deciding number, the RENDERED unit carries KillMode=process (without it a pass SIGTERMs the workers it just dispatched) and the harness-wide arm makes any future unit that reaches the dispatcher inherit it, the installer fails closed on an unresolved token and on absent artifacts, and the farm declares both files because the unit execs the farmed copy
 run_shard scripts/pi-reap-idle.test.sh                                     # #469 session reaper (fake PS/KILL/DATE shims)
 run_shard scripts/pi-task-session-prune.test.sh                            # #783 retention sweep (dry-run default)
 run_shard scripts/pi-cache-reap.test.sh                                    # #1987 the machine-global uv/npm/pip caches: an over-bound fixture MUST come back under it (prune first, escalate only with no live holder, and prove the shrink)
@@ -345,6 +506,7 @@ run_shard scripts/pi-reap-worktrees.test.sh                                # #10
 run_shard scripts/worktree-hygiene-sweep.test.sh                          # #2053 the 6-hourly sweep that runs BOTH reapers: its rc mapping, its remove-row count on a constructed fixture (the engine's rows are TAB-separated and the counter once read 0 forever), that a DRY RUN writes and removes nothing, that a missing engine prerequisite is rc=6 NAMED (not the generic 2 that let the job sit inert), and that the launchd template ships --dry-run — arming is a dated record behind an explicit verb that refuses a box whose sweep cannot run (#1678)
 run_shard scripts/reap-lane-venvs.test.sh                                  # #1932 lane-.venv reaper: the liveness witnesses both ways (a live lane is KEPT, a dead one reaped), fail-closed on every unreadable probe, TOCTOU re-probe, and REAL ps/lsof/tmux fixtures
 run_shard scripts/disk-reaper.test.sh                                     # #2032 ONE entry point over the three disk sinks: dry-run removes nothing, a LIVE-cwd worktree is never selected (and is reaped once the holder is gone), a MERGED checkout is, the size budget is honoured, a missing delegate fails closed, and the hourly timer renders armed + enabled
+run_shard scripts/harness-apply-timer.test.sh                             # #2416 HARNESS ACTIVATION ON THE CLOCK: an AHEAD box is REFUSED with its count (c4 lost three unlanded commits), a DIRTY box preserves every file BY NAME and then syncs (the Mac sat 91 commits behind on one modified file), a lying HARNESS-PIN is repaired to the tree's real head, the second install is byte-identical, and a box with no scheduler fails LOUDLY
 run_shard scripts/worktree-disk-probe.test.sh                              # #1851 apparent-vs-real disk measurement (df used delta, per machine)
 run_shard scripts/cleanup-stale-branches.test.sh                          # #1787 local-branch reaper gates (the squash-merge-aware three gates, dry-run default)
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
@@ -360,19 +522,29 @@ run_shard scripts/orchestrator-harness/cloud-cell-record-dep.test.sh       # #17
 run_shard scripts/diff-normalize.test.sh                                  # #1362 D1 review-evidence diff normalizer (one impl, shared with the gate) — ⛔ FOLDED HERE by agent-infra#2439 (it also ran as a step of ci.yml's `admin-merge` job on the same commit). The producer's integration pins live in scripts/record-review.test.sh §12, likewise a shard, so both halves run in BOTH lanes
 run_shard scripts/session-postmortem.test.sh                              # #1921 the retrospective's Transcript Patterns producer is a FARMED SIBLING (resolved from the script's own dir), and an absent/failing producer FAILS the section and the run instead of leaving a placeholder that reads as produced
 run_shard scripts/cloud-cell-supervisor.test.sh                            # #1713 a keys.env top-level exit must not turn a failed cell start into a silent success; #1761 the controller read/start/stop come from the lock (not the tmux session) and exclude descendant processes; #1989 the cell doctor is required, launched, stopped and reported
-# ⛔ #1997 OWNS, AND NOTHING HERE PINS: the supervisor's classified-read invariant — `sup_session_list` answers 0 present / 1 absent / 3 cannot-verify, every tmux target is EXACT (`=name`), a session name carrying `:`/`.` is refused rather than resolved, and `TMUX_READ_TIMEOUT` is validated > 0. Its suite (`scripts/cloud-cell-supervisor.hardening.test.sh`) was DROPPED at ba5ba770 because the implementation it pinned was never landed on this branch, so these invariants are currently UNPINNED in this tree — they must return BESIDE the implementation (#1997's land), not as a shard line restored ahead of it.
+# ⛔ #1997 OWNS, AND NOTHING HERE PINS: the supervisor's classified-read invariant — `sup_session_list` answers 0 present / 1 absent / 3 cannot-verify, every tmux target is EXACT (`=name`), a session name carrying `:`/`.` is refused rather than resolved, and `TMUX_READ_TIMEOUT` is validated > 0. Its suite (`scripts/cloud-cell-supervisor.hardening.test.sh`) was DROPPED at ba5ba770 because the implementation it pinned was never landed on this branch, so these invariants are currently UNPINNED in this tree — they must return BESIDE the implementation (#1997's land), not as a suite added ahead of it.
 run_shard scripts/orchestrator-bringup.test.sh                               # #1761 ONE entry point: a second controller for the SAME repo on this machine is refused (naming its pid) while a DIFFERENT repo is allowed, a stale record is reclaimed not blocked, and a configured repo path that is not on this machine is refused (#reseed repairs it without destroying lock/claim state)
 run_shard scripts/fleet-inventory.test.sh                                   # #2026 THE FLEET INVENTORY: status prints COMPONENT|EXPECTED|ACTUAL|STATE for every declared component and exits with the worst row — DUPLICATE on two live instances (a lock is not proof), MISSING when one is absent, a matcher that cannot match itself, SKIPPED distinct from OK, and an unreadable ps as UNKNOWN/2 rather than green
 run_shard scripts/orchestrator-harness/lander.test.sh                     # the versioned drain loop: a MERGEABLE+all-green PR is merged head-pinned, a PENDING one is NOT merged and NOT called failed (the measured case: 127 runs queued vs 5 in progress), a failing check is skipped and NAMED, a draft and a BLOCKED PR are reported with their reason, the CI queue depth is printed once per run even when nothing merges, and an unreadable board merges nothing — plus --nonvacuity, which deletes the pending arm and requires the PENDING assertion to break by name
-run_shard scripts/orchestrator-harness/cloud-cell-doctor.test.sh            # #1989 the cell's reap/doctor/merge/hygiene roles: a lane whose child is still writing is NOT reaped, a human-attached/terminal lane is NOT touched, the rail is gated on a clean attestation at the head with no blind retry, an unreadable read is cannot-verify, and `status` FAILS a started cell whose roles never ran
+run_shard scripts/orchestrator-harness/ai-drainer.test.sh                  # the SCHEDULED dispatcher's guards, each driven against the mutation that would defeat it: two concurrent invocations start ONE lane AND three ticks racing over one STALE lock still start ONE (the reclaim is an atomic `mv`, not `rm -rf` + `mkdir`, which let two contenders both "reclaim" it), the same arm against a lock-stripped copy starts TWO (so it measures the lock, not the harness), the lock is HELD while the lane pid lives — with a fresh beat while it waits — and released only when that pid dies, a lane that was SIGNALLED is reported as having no exit status (never `DONE`), while a lane that finishes rc=0 is DONE and one that refused rc=3 FAILS the tick, a dispatcher that returns with no pidfile FAILS the tick instead of releasing the lock on a zero-length wait, a pass below the swap floor or at the lane cap SKIPS with exit 0 and dispatches nothing (the cap counts a lane shaped like the real dispatcher — a backgrounded subshell whose argv names it, NOT a command line starting with `pi`, which counted zero), an unreadable swap read FAILS rather than reading as an idle box, a non-numeric LANE_TIMEOUT cannot disable the held lock, the slice cursor advances 0 → 10 and WRAPS, the tick removes its own worktree, and the multi-repo launcher refuses an unset OR, a missing state dir (without creating it), a state dir that IS the primary's, the primary's pin OR a non-canonical path to it, and an empty pin. Hermetic: fixture seed repo, fake dispatcher, no network, no gh, no tmux
+# ⛔ ONE ENTRY PER SUITE. This suite was listed TWICE (line 1 added by #1989, the second copy by #2597,
+# which should have EDITED the #1989 comment instead of appending a row): the tree ran the same suite
+# twice and `test_bash_shard_identity_is_injective_over_the_listed_shards` (tests/test_ci_exemption.py)
+# went red on main, which reds the `test` job for every PR whose base includes it — a fleet-wide merge
+# block caused by a list, not by code. Rows are additive; a suite that gains a claim gets its comment
+# amended here, never a second row.
+run_shard scripts/orchestrator-harness/cloud-cell-doctor.test.sh            # #1989 the cell's reap/doctor/merge/hygiene roles: a lane whose child is still writing is NOT reaped, a human-attached/terminal lane is NOT touched, the rail is gated on a clean attestation at the head with no blind retry, an unreadable read is cannot-verify, and `status` FAILS a started cell whose roles never ran. #2577: a review record that exists only on a PEER box becomes visible to the merge role in ONE hygiene pass (real local bare-store/ref fixture), and a failed or hanging sync LOGS + leaves the pass successful
 run_shard scripts/orchestrator-harness/cloud-cell-doctor.hardening.test.sh  # #1989 the CLASSIFICATION invariant: every read a pass acts on answers 0/1/3, so a failed read never arrives as evidence (a kill is verified before it is counted, an unparseable process table or a DECREASING cpu reading is cannot-verify, an unreadable attestation never reads as "nothing to land", a bound-killed rail is not a refusal, a failed hygiene action is not a clean row, `--dry-run` keeps the WORSE verdict, and a role row's recorded rc reaches `status`'s exit status)
 run_shard scripts/orchestrator-harness/cloud-cell-doctor.hygiene.test.sh    # #2573 the DISK-RECLAIM contract, in BOTH directions in one fixture: a stale `cloud-cell-<pid>.<rand>` dir (dead pid + past the idle floor) is reaped and a LIVE one, a no-pid one and a fresh one are LEFT with their reasons; `docker image prune -af`/`volume prune -f` run and `system prune` never does; an abandoned checkout is reclaimed while an unpushed commit and a dirty tree are preserved (driven through the SHIPPED reaper on real git); the cache sweep excludes the root a live cwd census HOLDS and still sweeps the idle ones (a live worker no longer suppresses every root), an unreadable census is cannot-verify/3, and every pass reports a signed `df` BEFORE → AFTER delta instead of a `du` sum
+run_shard scripts/orchestrator-harness/lane-reap.test.sh                 # #2163 lanes counted by EVIDENCE (lanes=<live>/<total> zombie=<n>, `?` on an unreadable read) and finished ones reaped under all three gates: a LIVE lane is never signalled, a FINISHED one always is (children first, TERM then KILL), no-log-evidence REFUSES, a deleted log needs the 12h bound, a human ancestor refuses, a working subtree is spared
 run_shard scripts/cloud-cell-bringup.test.sh                               # #1718 the pushed gh token must not outlive the bring-up, on ANY exit
 run_shard scripts/orchestrator-harness/refresh-scout.test.sh               # #1736 a cell on a non-Python repo must provision dispatch (or refuse loudly), never merge-only-and-silent; #2094 a peer-held candidate is counted WITHHELD *and* (the #1729 half, same verdict arm) written to the collision ledger in the SAME pass — the one assertion a merge resolution that keeps either side alone cannot pass
 run_shard scripts/orchestrator-harness/refresh-quota.test.sh               # #2022/#1736 follow-up + #1984/#2050 (the SAME shard, listed once — two lanes added it and the duplication was a lane-parity red): the refresh pass's per-pass API spend is BOUNDED — the board cache is enabled under the TOOL's seam (ONE rebuild per pass, not one per candidate), a starved pass judges FEWER candidates rather than none and still queues work, and a pass that can buy nothing NAMES the budget and refuses TRANSIENTLY (rc=1) instead of reporting an empty backlog — a budget that cannot buy one candidate refuses by name, and the refusal sits AFTER the `dispatched.txt` reaper, so a broke box still prunes its blacklist first (#2049/#1729 reconciled); an UNREADABLE budget is reported, not assumed (hermetic: stub gh, stub pre-flight, and a SCRIPTED core budget — no clock is faked, and this shard does NOT drive the board-cache TTL: `COLLISION_PREFLIGHT_BOARD_CACHE_TTL` expiry is reported, never exercised)
 run_shard scripts/orchestrator-harness/pr-dispatch.test.sh                  # #2126 the PR path must be HONEST and COMPLETE: every counted un-owned PR is acted on or carries a PRINTED reason (the sweep's silent `continue`s, the NOCHECKS class with no arm, a failed spawn swallowed by `&&`, and five capacity `elif`s with no else), the funnel cannot claim "dispatching" on a cycle that spawned nothing, and the disposition ledger is never an input to the gate — behaviourally DRIVEN (extracted shipped fragments + stub gh/tmux), never a log-string grep
 run_shard scripts/orchestrator-harness/pr-path-reads.test.sh               # #2601 the PR path must have a READ before it can act: `SWEEP_LIST` (the only ACTABLE row set — `pr \t branch \t draft`, which `state/pr-meta.tsv` does not carry) must SURVIVE the process, so a 304 cycle performs the read from the persisted rows instead of having no memory to inherit (measured: 152 of 221 cycles were 304s and spawned nothing), and the bounded rotating window must FINISH so the arms at the end of the loop are actually reached (measured: 0 act rows in 555 cycles). Drives the shipped blocks VERBATIM by marker in a SEPARATE SUBSHELL PER CYCLE (that is the real runtime, and the whole reason memory-only state was fatal), against a stub gh. ⛔ WIRED HERE because spawn-gate.test.sh asserts the UNWIRED population is exactly the two documented non-loop suites — an unwired new suite reds bash-suites by design (#1890, same class as gh-rest/merged-not-closed/worker-terminal)
+run_shard scripts/orchestrator-harness/nochk-resolve.test.sh              # #2719 the NOCHECKS ARM: the class used to be ONE token for three events and had no acting arm ("re-read next cycle"). MEASURED over every occurrence in the controller's own log (77/42 cycles/47 PRs): 82% were a FAILED READ whose check surface already existed. Driven against the SHIPPED resolver with a stub gh: a transient transport failure is recovered INSIDE the cycle (RECOVERED:<class>, via check-class.py), a persistent one is NAMED and opens the cycle-wide breaker, gh-limit's rc-75 refusal is BUDGET and is never retried, gh's own "no checks reported" is an EMPTY SURFACE not a read failure, a blind read recovers the class from the check-runs AUTHORITY while a TRUNCATED authority is refused rather than classified, and a head with no run at all ends in a NAMED terminal verdict — posted ONCE per head, parked, and never re-read. Hermetic: stub gh, no network, no tmux
 run_shard scripts/orchestrator-harness/red-fixer.test.sh                    # #2223 the controller's RED-FIXER role: a rail refusal that names a RED TREE spawns ONE fixer for that PR (idempotent per PR, head-keyed, capped at MAX_RED_FIX_TRIES per head and MAX_RED_FIX per box), a NEW HEAD invalidates the refusal and RE-RAILS, the audited override is never taken, and the fixer's provider/model cannot be shadowed by the image's OPENAI_API_KEY — driven against a FAKE RAIL, hermetic (no network, no gh, no tmux)
+run_shard scripts/orchestrator-harness/pr-sickness.test.sh                 # THE PR SICKNESS QUEUE (2026-10-22, seven lanes landed nothing and 25 tortoise PRs sat blocked): a RED PR no lane holds emits ONE work item whose brief is generated from the FAILURE (failing (app,name) group + run id + the failing JOB's own log excerpt), the same PR going red again while its fixer is ALIVE spawns nothing, a WAIT PR is never dispatched, an EMPTY or FAILED API answer is a NAMED error and never a green verdict, a queue above the derived ceiling DEFERS with the charged line and the deferred item returns once drained, and deleting `ps_polarity` reddens (c) and (d) — plus a targeted mutation per case so no assertion is vacuous. Hermetic: stub gh (both the check-runs API and the job-logs endpoint), stub spawn/claim; no network, no tmux
 run_shard scripts/orchestrator-harness/sweep-quota.test.sh                 # #1762 the merge sweep's listing must be conditional (ETag/304) and defer on the RESPONSE rate-limit headers, not /rate_limit
 run_shard scripts/orchestrator-harness/harness-refresh.test.sh             # #2215 the box re-pins ITSELF once per cycle: behind+clean ADVANCES the pin old->new through the materialiser, an empty pin is MENDED and said out loud (the measured three-cells state), dirty / ahead / diverged / unresolvable each REFUSE and name themselves while touching nothing, a re-pin is not repeated on the next cycle (restart-pending), and the harness rides on every dispatch row and issue spawn line — driven against the SHIPPED script and the SHIPPED loop block (hermetic bare origin, stub materialiser)
 run_shard scripts/orchestrator-harness/claim-exclusion.test.sh             # #1908 does a claim EXCLUDE a concurrent holder, per operation class — N processes raced at a barrier against a real receive-pack (hermetic bare origin)
@@ -382,26 +554,33 @@ run_shard scripts/orchestrator-harness/origination-funnel.test.sh          # #22
 run_shard scripts/orchestrator-harness/product-floor.test.sh               # #2054 THE PRODUCT WORK FLOOR: a BATCH=2 dispatch with a dispatchable product candidate contains one, floor=0 is exactly today's order, the floor is clamped to the batch and never duplicates or resurrects a candidate, an unmet floor LOGS WITH THE QUEUE-STATE TOKEN and still dispatches, the floor yields to an EMERGENCY (a P0 in the batch window, or a red tree) and says so, an UNCLASSIFIABLE candidate never satisfies the floor, and the floor sits AFTER the merge-priority gate so it can never delay a batch (hermetic: the shipped functions are extracted and driven)
 run_shard scripts/orchestrator-harness/test-gates.sh                       # the dispatch gate: mp_reason(prs, lanes, workers) must count workers, not lanes alone (hermetic)
 run_shard scripts/orchestrator-harness/live-ownership.test.sh             # #2029 the owner's dispatch rule: ownership is a LIVE process cwd (REAL worktrees + processes; the 4 selection cases, incl. registry-claims-owned-but-dead)
+run_shard scripts/orchestrator-harness/lane-merge.test.sh                         # lane-owns-merge: the BOUNDED lane merge loop — its own checks to terminal, fix/conflict rounds, the 3-round cap enforced in code, the handoff comment, and the property that a lane can never attest its own review. Offline: both API reads injected from fixtures
+run_shard scripts/orchestrator-harness/merge-rate.test.sh                         # lane-owns-merge: the before/after MEASUREMENT (PR opened vs merged). Last status line per lane wins, no-status lanes are counted as UNKNOWN rather than dropped, and an empty population prints n/a instead of a flattering 0%
+run_shard scripts/orchestrator-harness/chain-merge-verdict.test.sh                    # lane-owns-merge: the controller's chain YIELDS to a lane's merge phase — a mid-loop FIX_REQUIRED is not a handoff, a stale verdict from a previous dispatch is ignored, a MERGED lane skips the review, and the issue claim is still released. Hermetic: stub gh + stub chain
 run_shard scripts/orchestrator-harness/selftest.sh                         # #1764 harness self-test incl. the CI-red derivation (offline; previously local-only — review round 1 note)
 run_shard scripts/orchestrator-harness/gh-rest.test.sh                     # #1959 the gh REST adapter's TRANSLATION (argv in, argv out) for exactly the shapes the harness calls: `pr list --head` must not silently widen to the newest open PR, and `pr comment` must print a URL — both shipped green before, as P0s. Offline, a stub gh; unwired since #1962 landed it, so spawn-gate.test.sh's population check was red on main (review round 1)
 run_shard scripts/orchestrator-harness/merged-not-closed.test.sh       # #8468 the instrument that answers "which OPEN issue already has a MERGED PR?" — and the shape that matters is the one it must NOT answer: every unqueryable surface exits 2 (never 1, never an empty successful sweep), a path-shaped --repo is refused rather than sent to gh as repos/../x, and an empty sweep says it swept nothing. Hermetic: a stub gh. ⛔ WIRED HERE because `spawn-gate.test.sh` asserts the UNWIRED population is exactly the two documented non-loop suites — an unwired new suite reds bash-suites by design (#1890 fixed the same class for gh-rest.test.sh)
 run_shard scripts/orchestrator-harness/gh-limit.test.sh                     # #1988 ONE gh call in flight per box; the documented backoff order (retry-after, then the bucket's reset, then >=60s doubling to a bounded failure); the bucket NAMED on failure; conditional REST (ETag/304) for polling. #2137 ACCOUNT scope: the budget partitioned by a declared fleet size, an unclassified refusal bounded to its own window (never the bucket reset), and a marker revalidated + aged before it may block. Fake clock, stub gh, hermetic
 run_shard scripts/orchestrator-harness/gh-limit-pass-cache.test.sh  # #1984 the PASS-SCOPED read memo: inert unless asked, exact (stdout, stderr, rc) replay, and the four exclusions that make it safe — a failure, /rate_limit (the budget meter), `auth token` (the credential must never reach a cache file), and any mutation
+run_shard scripts/orchestrator-harness/check-deployed-drift.test.sh        # agent-infra#2700 the DELTA that selftest.sh cannot see: selftest.sh already drives the shipped script through 15 exit-code arms (match/dirty/post-install/missing-record/UNKNOWN/unresolvable-ref/unknown-object/BEHIND/missing-file/extra-script/failed-mktemp/unreadable-file), so this suite deliberately does NOT re-implement them and says so in its header. What it adds is the FILE-LEVEL truth: a ONE-BYTE difference is DRIFT (1) and the report NAMES that file (and not the unchanged one), restoring the byte is OK (0) again, and the suite asserts its own presence in this list (the epic is about capabilities wired once and silently unwired later). Non-vacuity is structural (one fixture one byte apart, opposite verdicts) AND measured: replacing the file-level drift call with a bare exit-code drift leaves every selftest.sh arm green and reds EXACTLY ONE arm here. Hermetic: fixture repo with its own git identity incl. commit.gpgsign=false, --no-fetch, no network, no $HOME
 run_shard scripts/orchestrator-harness/refresh-spend.test.sh             # #1984 a pass's own core-request SPEND: fleet-wide reads paid once per pass instead of once per candidate, an unchanged listing skipping the expensive sweep, an unreadable listing never read as 'unchanged', and LIMIT still an upper bound (hermetic: the real layer + a stub gh)
 run_shard scripts/orchestrator-harness/spawn-gate.test.sh                  # #1765 the ONE agent-invocation helper: the disk gate, the load gate, and the three callers' exit codes (hermetic; review round 2 — it was served by NO lane, so its own residual check could never fire)
-run_shard scripts/orchestrator-harness/ci-queue.test.sh                    # #2296 CI BACK-PRESSURE — the reading every other gate was missing: the ceiling is DERIVED from runners x horizon / job_p90 (not a constant), an unreadable queue DEFERS as UNKNOWN instead of opening the gate, the deferral line NAMES the depth/runners/ceiling and WHAT was deferred, EVERY CI-spending surface (fix-one.sh and adopt-fix.sh, the THREE fixer spawn arms in orch-loop.sh — CONFLICTED, CI-red and review-gate — the batch dispatcher, and the CI rerun) reads the SAME module so they cannot disagree, each of those fixer deferrals is DRIVEN by pr-dispatch.test.sh (a defer branch that also spawns goes red), a deferral consumes no attempt, and a mutant with the queue read disabled OPENS the gate (the red proof, with the driving namespace cleared so an inherited function cannot stand in for it). NOTE the fourth pusher, the RED-TREE fixer, is NOT gated yet — disclosed in the module header, home #2408
+run_shard scripts/orchestrator-harness/ci-queue.test.sh                    # #2296 CI BACK-PRESSURE — the reading every other gate was missing: the ceiling is DERIVED from runners x horizon / job_p90 (not a constant), an unreadable queue DEFERS as UNKNOWN instead of opening the gate, the deferral line NAMES the depth/runners/ceiling and WHAT was deferred, EVERY READER of it is a surface that ADDS a CI run (#2927 — the issue dispatch, the batch dispatcher and the CI rerun); NO repair surface reads it (the three fixer spawn arms in orch-loop.sh — CONFLICTED, CI-red, review-gate — and fix-one.sh/adopt-fix.sh were REMOVED, so a fixer is bounded by lane slots and the load/disk gate instead), selftest.sh PINS the fixer deferral count at 0 in orch-loop.sh, so a re-added repair read goes red, a deferral consumes no attempt, and a mutant with the queue read disabled OPENS the gate (the red proof, with the driving namespace cleared so an inherited function cannot stand in for it)
 run_shard scripts/orchestrator-harness/worker-terminal.test.sh              # #1702 the worker LAUNCHER: no `tmux new-session`/`setsid` spawn may remain in either controller, a spawn creates a daemon-owned durable terminal where the cmux daemon answers and tmux WITH an explicit HOME+keys.env contract where it does not (the ~21-line death was the missing environment, not tmux — agent-infra#2210 reopened), a box with NO surface at all refuses, the census is fail-closed (unreadable ⇒ ALIVE), a close that cannot prove the surface is gone keeps its record, and the shipped `stat`/load/swap probes answer in BOTH the GNU and the BSD shape. ⛔ WIRED HERE because spawn-gate.test.sh asserts the UNWIRED population is exactly the two documented suites — an unwired new suite reds bash-suites by design (#1890); and (#2248) that the module INITIALISES under bash 3.2 — a heredoc nested in a command substitution is executed word-by-word there, killing the controller at source time, and this runner is Linux/bash-5 so it can never observe the mis-parse: that half is pinned TEXTUALLY
 run_shard scripts/orchestrator-harness/capacity-transfer.test.sh            # #1909 R8: a capacity refusal must not consume the item's turn — the record the lane writes, the chain that stops waiting and RELEASES the cross-box claim, and the controller that stands down so a peer wins the CAS (hermetic; local bare repo, no network)
 run_shard scripts/orchestrator-harness/install-launchd-durability.test.sh  # #1975 the installer must not be able to disable the production controller: no persistent-disable verb, bootstrap→load fallback, pid+heartbeat asserted, and "not running with rc=0" is a FAILURE (hermetic: stub launchctl + throwaway HOME; §F runs on Linux too — plutil stubbed, ELDATO_ALLOW_NON_DARWIN=1 — and skips loudly only when the checkout is not a usable git work tree)
 run_shard scripts/orchestrator-harness/launchd-controller.test.sh          # #2098 the launchd ENTRY POINT, which lived only in ~/orchestrator: `tmux new-session -A -d` on an EXISTING session attaches, a launchd job has no terminal, so every KeepAlive relaunch exited 1 with `open terminal failed` for 7,633 launches. No session -> created detached; session already there -> exit 0 with NO attach and the SAME pane (never a second controller), blocking while it lives so KeepAlive supervises; the OLD `-A` form is a POSITIVE CONTROL that must still fail there (a harness that could reach a terminal would make the whole suite vacuous); the restart-rate floor is measured; and CONTROLLER_ENV is pinned to the plist's `EnvironmentVariables` key set both ways (a rendered-but-dropped limit reverts to the loop's default silently). Hermetic: private TMUX_TMPDIR socket, throwaway HOME + $O; the static `-A` arm runs even where tmux is absent
 run_shard scripts/orchestrator-harness/claim-cwd.test.sh                   # 2026-10-18 the claim builder must work from a cwd it was never given (a launchd cell's WorkingDirectory is not a repo): `git -C` returned an EMPTY hash and refused EVERY candidate with "could not build claim commit" while the controller looked alive. Hermetic: the denial is a git shim doing a real getcwd, the shipped claims.sh does the rest
 run_shard scripts/orchestrator-harness/reviewer-preflight.test.sh          # #2148 + #2325: the reviewer requirement is disclosed BEFORE the work (one line, all three commands, all three roles) and so are the LANDING artifacts a PR must carry (scoping marker position, the head-bound review record, plan/test evidence, the two commit mechanics) — asserted from lane.sh's REAL dry-run brief, with §F.4 GATE PARITY driving check-pipeline-compliance.sh's OWN extracted parsers over the shapes the brief prescribes, the controller template pinned BYTE-FOR-BYTE against the helper, and composer-level non-vacuity controls (a dropped requirement makes the assertion fire). Hermetic: no network, no agent
+run_shard scripts/orchestrator-harness/brief-gate.test.sh                  # #2258 the RESEARCH-FIRST brief gate: the validator's decisions on real brief files (refuse / admit / fail-closed on empty, missing, unknown-role), the refusal TEACHING (names every missing element and prints a pasteable block), a MUTATION proving the two central asserts can fail, and every dispatch path DRIVEN with a stub pi/cmux (run_agent, merge-one's own run_agent, nonblocking-dispatch in the foreground, orch-send, safe-send, pr-doctor's generated brief, lane.sh's dry-run brief) plus a census that a new ungated dispatch path reddens. Hermetic: stub pi/cmux, no network, no agent
 run_shard scripts/orchestrator-harness/claim-orphan.test.sh                # #2094 a host RENAME must not orphan a lease forever: the owner host is re-derived per call, a stale CLAIM_OWNER_ID is rejected, an ORPHANED-HOST claim is reclaimable regardless of its term (pre-flight CLEAN, acquire reclaims, claim_prune reaps), a KNOWN live peer is never stolen, and no ttl can mint a term past its keying's ceiling (hermetic bare origin)
 run_shard scripts/harness-cohesion.test.sh                                 # #2231 ONE launcher + a per-box divergence check: a failing self-test BLOCKS the start and names the test, an unread/unmaterialised pin dir is REFUSED (the #2216 "worktree nobody reads"), the three helpers answer IDENTICALLY with and without the commands one platform lacks (`timeout`/`gtimeout`/`pgrep -c`, shims that record any use), and `check-deployed-drift.sh --surface` names a home-only script, a differing script, a MISSING script, a component dir the RUNNING controller executes, and exits 2 (BROKEN, never OK) on an unreadable one. Hermetic: fixture repo + `DRIFT_PS` seam, no network. ⛔ The three entry points carry no `.sh` suffix by design (the operator types `scripts/harness-up`), so they are added to SWEEP_GLOBS above — the syntax gate would otherwise cover none of them
 run_shard scripts/orchestrator-harness/deploy-harness.test.sh               # #2041 the deploy must report what the COPY did: an absent source fails against a target pre-seeded with 30 scripts (the measured false PASS), a copy that fails for one file is a FAILURE and never "partial success", a copy that "succeeds" but does not match the source is caught by the verification half, every failing path notifies FAILURE and none notifies success, and a preflight refusal leaves the target byte-identical (hermetic: scratch sources/runtimes + a notifier stub)
 run_shard scripts/orchestrator-harness/capacity-placement.test.sh         # MEASURED placement + the SELF-DISPATCH PROOF (2026-10-21): one box saturated, a box twice its size idle, and nothing moved the work. The probe's fields (load-per-cpu, lanes, free disk, free memory), the 8.00 load-per-cpu ceiling and what it protects, the least-loaded-eligible choice, an unreadable/stale/absent record never being chosen, a no-eligible-box REFUSAL that names the bound, and the per-cycle record + `bin/harness status` reading a two-cycle-stale controller DEGRADED and an absent one ABSENT — never HEALTHY. Hermetic: seams for clock/host, and a LOCAL bare repo as the shared origin (real pushes, real ls-remote)
 run_shard scripts/orchestrator-harness/landing-read.test.sh                   # #2320 a box whose gh chain cannot reach a REAL binary, and an EMPTY protection read, are NAMED on `bin/harness status` (gh=CANNOT-REACH-REAL-GH naming the layer that was identified statically as a wrapper/shim, or quoting a PROBED wrapper's own refusal words / contract=UNREADABLE why=<token>) as their OWN dimension beside the cycle verdict — so a landing blocker is never mistaken for load, and never mistaken for a pass. Drives the shipped verb over stub PATHs; mutation controls delete the resolution read and make the empty contract a pass, and BOTH assertions go RED. Hermetic: stub gh, `OR` pinned, no network, no repo
+run_shard scripts/orchestrator-harness/merge-gate-read.test.sh              # #2596 the merge worker's review-gate read is LEGIBLE, and each condition ends in its OWN line: a FAILED read is `gate=UNAVAILABLE rc=<n> stderr=<gh's own words>` (the #2448 erasure, at the one call whose silence is being interpreted); a surface that CARRIES checks but no row named the gate is `gate=NO-SUCH-CHECK want=… saw=…` after its own SMALL bound (a name mismatch never resolves); an EMPTY surface is a CI WAIT on the FULL poll window ending `gate=NOT YET KNOWN … the check surface was EMPTY` (refusing that early loses a gate that appears later); a QUEUED gate is `gate=NOT YET KNOWN …` at the poll bound; and a `<caller> / <job>` row IS the gate (matched after the caller prefix admin-merge.sh already strips, and NOT as a substring) — with EVERY row naming the gate counted and the WORST state deciding, so no dedupe, order, timestamp or workflow field can discard a red row (first-match, newest-attempt and (name, workflow) keys all shipped here and were all defeated by the transport; the documented cost is that a SUPERSEDED red keeps the gate refused, exactly as the controller does). Drives the SHIPPED merge-one.sh end to end (stub gh/pi, real python3+openssl); non-vacuity: the PRE-#2596 loop, verbatim, collapses the same conditions into `gate= `, and NINE mutants (stderr capture removed, canon() disabled, first-match restored, best-row instead of worst-row, control-character strip removed so a transport-controlled name forges a log line, the try-1 RED latched again so the verdict describes a state no longer true, the read budget breaking out of the window again, the claim-lease guard accepting a leading zero so `$(( 08 * 30 ))` aborts the shell, and the classifier-failure arm leaving its token empty so the verdict prints read='') each red exactly the arm they serve
 run_shard scripts/harness-surface.test.sh                                  # #2286 the surface the ONE launcher was missing: an `exec` row that reads the RUNNING controller's OWN argv, resolves the tree it executes and compares that COMMIT with the pin (GREEN=HEALTHY on the pin's tree, RED=DEGRADED naming both shas when it is one restart behind); `up` twice is a NO-OP that starts nothing and kills nothing (the authority is invoked once — the pre-change second run called it again and reported FAILED); the capacity ceiling is MEASURED from load+disk at the decision and a fixed cap is REPORTED AND IGNORED, with an unmeasurable box REFUSING rather than substituting the cap; and the macOS arm is EXERCISED on Linux (`HARNESS_UP_OS=Darwin` + BSD-shaped `mktemp`/`stat`/`sysctl`/`launchctl` stubs, including the `mktemp` that requires a TEMPLATE and killed every prior Apple run at the launcher's last line). Hermetic: fixture git worktrees, stubbed `ps`/`tmux`/autorities, no network
+run_shard scripts/harness-unit.test.sh                                     # #2293/#2130 the unit, not the pile: placement reads FORK HEADROOM FIRST and prints its dimensions in the order they fail (fork → disk → load) with the limit each number came from — the one bound no load average can see, because a box at 0.32x load can be unable to fork at all; a tight fork ceiling BINDS the lane count, a generous one does not, and an unmeasurable one REFUSES instead of substituting a fixed cap. Lanes are counted AND judged advancing from the worker logs the controller's own reaper reads; `next` quotes the controller's own `[select]` decision and says LATE rather than presenting an old decision as the next one; the self-test row parses the LIVE tree so a syntax-broken script turns it BROKEN; and status HEALS only the two repairs that are safe while lanes work (start a controller that is not running, re-pin a pin that is behind) while refusing to kill a duplicate or cycle a live-but-late one. macOS arm EXERCISED: `HARNESS_UP_OS=Darwin` + BSD `sysctl kern.maxproc*` drives the Darwin half of the fork probe on a Linux runner. Hermetic: fixture worktree, stubbed `ps`/`sysctl`/`tmux`/`gh`/authorities, no network
 run_shard scripts/mac-pin-parity.test.sh                                   # #2231 the MAC runs the same PINNED tree as the cells: the rendered job's program is the pinned worktree (never `$O`, `~/orchestrator` or `~/.cache/orc`), the FIRST pin is materialised by the cells' own `apply --force --pin-only`, and the installer REFUSES (rc=78, both paths named) on a COPY, a pin/tree disagreement, an unreadable or unexaminable record, no pin with no materialiser, and a LIVE-ONLY entrypoint the pin does not carry; on macOS it also reads the INSTALLED plists and reds when any job runs a repo script from outside the pin. Carries the home-dir-only fix register (carrier + witness + shard wiring) and a `timeout`/`gtimeout`/`pgrep -c` portability gate. Hermetic: fixture git repo + sandbox HOME, no network, no launchd
 run_shard tests/admin-merge/run.sh                                         # #930 safe-admin-merge rail — ⛔ FOLDED HERE by agent-infra#2439: it used to ALSO be a step of ci.yml's `admin-merge` job, which re-ran this suite on the SAME commit (993 s of that job's 3,009 s, measured on PR #2385's head at 39879010341). One run site, and it is the one BOTH lanes execute (#1369)
 run_shard tests/atomic-land/run.sh                                         # #1367 atomic land unit — ⛔ FOLDED HERE by agent-infra#2439 (same duplicate job; this suite was 1,920 s of it, 32 min). The land step DELEGATES to admin-merge.sh and the record step to record-review.sh; the suite pins only the sequencing and the fail-closed preconditions
@@ -415,13 +594,27 @@ run_shard scripts/orchestrator-harness/merge-reminder.test.sh              # #26
 run_shard tests/search-cost/run.sh                                         # #1069 fleet search cost (also a per-PR job in ci.yml)
 run_shard tests/git-fixture-host-neutral/run.sh                           # agent-infra#2581: a fixture's verdict must not be a function of the BOX. main's own post-merge leg was red (check-run 120643122366) with two `FAILED extensions/…` annotations while both suites were green wherever the box's EFFECTIVE git config supplied `init.defaultBranch=main` — both built an EMPTY bare origin and cloned it, so the clone's branch came from that config (`master` when unset ⇒ `git push origin main` dies on `error: src refspec main does not match any`), and WHICH channel supplies it differs per suite (one reads the global `~/.gitconfig`, the other replaces HOME so only the system/ambient channel reaches it). The fixtures now name their own branch (`init --bare -b main`); this shard runs those suites with every ambient git-config source neutralised, plus two anti-vacuity arms (the child must provably read NO global config, failing with the actual `fatal:` message when the seam breaks; and an empty bare created with `-b main` must clone onto `main` in that environment). ⛔ In this list — not in a workflow step — because ci.yml/node-ci.yml/ci-main.yml are BYTE-LOCKED (scripts/check-workflow-lock.mjs) and a ci-main line would only run POST-MERGE, after the damage
 run_shard tests/beat-pair/run.sh                                           # #7957 H3 the recap/beat pair is BOUND, not merely written twice: a fresh recap beside a stale beat must SUPPRESS the act clause, never publish the previous tick's number (hermetic)
+# ⛔ NO ROW FOR `tests/pr-doctor-trigger/run.sh` (#2700 C5): this file DERIVES its list from
+# SUITE_GLOBS (`tests/*/run.sh` matches it), so a suite is wired by ADDING THE FILE — an enumerated
+# row here would be a second execution of the same suite (the defect #2838 records).
+run_shard tests/inert-capability-effects/run.sh                             # #2708 EFFECT-BASED self-tests for capabilities that were DEPLOYED, SCHEDULED, LOGGING and doing nothing (measured 2026-10-24, #2700): (a) pr-loop's classifier graded TORTOISE's PRs from an agent-infra checkout — every read fine, the repo wrong, `58 PR(s) had UNREADABLE checks … No commit found for SHA` (422 per PR) — so the test asserts WHICH repo the shipped `_objective()` returns for THREE checkouts (its own, a different one, and a NAMED REFUSAL when the origin is unreadable) instead of trusting the default; (b) an unreadable branch-protection read must NEVER become an EMPTY required set (an empty contract reads as NOCHECKS and silently stops every merge) — a PAIR one byte of gh behaviour apart must flip the merge authority rail⟷gate; (c) the worktree reaper must preserve a live holder whose cwd is a SUBDIRECTORY of the tree and still remove its holder-free TWIN in the same pass (both trees exist before the pass, asserted, because "the twin is gone" passes vacuously otherwise). Hermetic: temp git fixtures + stub gh/lsof on a private PATH; ⛔ NOT a test of pr-doctor.py (owned by #2280/#2746 — see the suite header for why it is named rather than landed red)
 run_shard scripts/heartbeat-loop.test.sh                                   # #1933 the detached children's exit status is CAPTURED and REPORTED. ON `origin/main` (`7a051b7b`) THE REPORT WAS ABSENT, NOT UNREACHABLE: #2056 (`838228de`) had already deleted queue-dispatch's `if [ "$rc" -ne 0 ]` branch, left a bare `rc=0` (line 581) with no reader at all, and `QUEUE-DISPATCH FAILED` survived there only in comments (91, 229, 431). A branch cut BEFORE `838228de` (this branch's fork point `57edbd7a`) still carried the pair — literal `rc=0` directly above that branch — where it could never fire. Either way no pass could print the line, and the fix ADDS the report rather than repairing it. The word now follows the rc (`REFUSED` for exactly 2, `PR-DOCTOR RED rc=N` for any other non-zero, so a crash is never called a refusal). Drives REAL one-pass runs of the real loop against stubbed children (hermetic)
 run_shard tests/heartbeat-fleet-advance/run.sh                             # #1991 the beat carries the FLEET ADVANCE standing order on BOTH bodies, in SIXTEEN fleet states (0 / 1 / 2 / 6 / 12 / 26 lanes, idle capacity, alert+capacity, dead panes, no-live-pi, questioning, alerting, queue-bottleneck, objective-at-risk, a warm tick, and the recovery-refusal path), each delivered body pinned to a byte-for-byte GOLDEN with the four sentences exactly once, the order EMBEDDED in the literals, the single send pinned, and a mutant proving the assertions are live (hermetic; drives the real tick against stubbed helpers, a stubbed screen and a recorded cmux send)
 run_shard pi-bootstrap/tests/test-setup-no-nesting.sh                      # #449 setup regression (~2min) — ⛔ FOLDED HERE by agent-infra#2439: it used to ALSO be ci.yml's whole `setup-suite` job, which re-ran this one suite on the SAME commit (17 s of that job's 23 s). This shard is now the ONLY run site; the #447 ship-list drift class it guards is unchanged
 run_shard pi-bootstrap/tests/test-models-merge.sh                          # #682 setup.sh's models.json merge must preserve live-only model ids/override keys (RED control included); both lanes by construction
 run_shard pi-bootstrap/tests/test-cell-install.sh                          # #1723 a Linux cell receives the operational layer (the farmed scripts, the guards, the skills, record-review.sh) BY CONSTRUCTION, and refuses a partial one
 run_shard pi-bootstrap/tests/test-farm-unfarm.sh                            # #1924 the farm has an UNFARM leg: two farmed scripts, one retired, re-applied — the retired one is gone from $DEST/scripts AND the other SURVIVED (an over-deleting removal leg is worse than the gap), a retirement a farm array still declares removes nothing and fails the run, an escaping entry is refused, and a cell is not certified while it still carries a retired artifact
+run_shard tests/required-check-reservation/run.sh                           # #2752 the required-check reserve: `pipeline-compliance` is the repo's ONLY required status context (~9 s of work) and was measured queuing 13 min behind 66 runs / ~1,650 ADVISORY jobs. The suite pins that it is routed through one variable to a reserved label (`required-check`) whose value is declared in the job block, that its default arm is the always-satisfiable `ubuntu-latest` FALLBACK (GitHub ANDs `runs-on` labels and never falls back, so a reservation without one is an unsatisfiable required check), that it carries `timeout-minutes` (#2055), that the reproducible NON-DESTRUCTIVE operator calls are documented (`POST /actions/runners/<id>/labels` to add `required-check`, `DELETE .../labels/ubuntu-latest` to remove it — `PUT .../labels` REPLACES every custom label, so T5 refuses a doc that only offers PUT), and — the mutation that matters — that NO OTHER job anywhere in `.github/workflows/` joins the reservation while every other job stays exactly `ubuntu-latest`
 
+# ── the run — ONE loop over the DERIVED list ──────────────────────────────────────────────────
+# There is no per-suite line here any more, on purpose: a suite is wired by the FILE it lives in
+# matching SUITE_GLOBS, so two harness PRs adding two suites no longer conflict in this file.
+# The order is the list's (LC_ALL=C sort -u) — see DERIVATION: every suite is hermetic, so no
+# suite depends on running before or after another.
+while IFS= read -r shard; do
+  [ -n "$shard" ] || continue
+  run_shard "$shard"
+done <<<"$shard_paths"
 echo "───────────────────────────────────────────────────────────────────"
 # Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
 # a helper whose execution was disabled — a text-only floor would still see the same listed count.
@@ -443,7 +636,7 @@ if [ "$slice_count" -gt 0 ]; then
   # the skips use (`pos % n == i`), and compared as a SORTED SET, so a slice that runs the right
   # number of the WRONG shards fails here — the hole a count assertion reports as green.
   exp_log="$shard_ran_log.expected"
-  sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}" \
+  printf '%s\n' "$shard_paths" \
     | awk -v i="$slice_index" -v n="$slice_count" '(NR - 1) % n == i' | sort > "$exp_log"
   sort "$shard_ran_log" > "$exp_log.ran"
   if ! cmp -s "$exp_log" "$exp_log.ran"; then
@@ -527,6 +720,15 @@ if [ "$shard_errors" -gt 0 ]; then
   # `could NOT be named` rather than blame a subsystem it never looked at.
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
+    # ⛔ A PARTIAL RECAP IS A FALSE PASS (review cycle 2, P2). The list can name SOME of the counted
+    # failures, and "2 failed" beside one name reads as a COMPLETE recap to the rail, which then
+    # compares a 1-identity certificate and admits the un-named half — the incomplete-set direction
+    # this runner exists to close. Completeness is compared from what was COUNTED (`shard_errors`)
+    # against what was NAMED, never inferred from the list being non-empty.
+    recap_named=$(printf '%s' "$shard_failed_list" | awk -F', ' '{print NF}')
+    if [ "$recap_named" -lt "$shard_errors" ]; then
+      echo "❌ …and $((shard_errors - recap_named)) of the counted failure(s) could NOT be named — the naming arm did not run for them. This is a defect in scripts/run-bash-shards.sh, not in the failing file."
+    fi
     # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
     # syntax sweeps; the list above names them together. Printing "2 failed" beside one name reads as a
     # missing name — and the missing half is exactly what the recap exists to stop hunting for.
@@ -555,3 +757,13 @@ else
   echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
   echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}"
 fi
+
+
+# ── the per-suite notes that used to ride on each `run_shard` line are NOT reproduced here ────────
+# Each of those 79 lines carried a one-sentence note (what the suite pins, which incident added it).
+# A long comment block of them is NOT inert text: the fleet's `main-worktree-guard` reads
+# command-position paths in a script's own source, so a block of ~79 path-shaped comment lines made
+# it exhaust its seed budget and REFUSE to run this script at all (measured 2026-10-23; recorded on
+# agent-infra#2189). The notes are in git history on the commit that derived this list
+# (`git log -p --follow` on this file) and each suite's own header states what it pins — a suite's
+# MEMBERSHIP needs neither.
