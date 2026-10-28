@@ -524,6 +524,29 @@ jobs:
       - name: SIGPIPE guard suite (hermetic, zero network)
         run: bash tests/sigpipe-grep/run.sh
 
+  bash32-parse-guard:
+    # #2930 — post-merge re-check of the bash-3.2 parse gate. The runtime platform of this harness is
+    # macOS, whose `/bin/bash` is 3.2.57 (bash 4+ is GPLv3, so Apple never shipped it), while every CI
+    # runner is Linux/bash 5 — so a construct 3.2 cannot parse ships GREEN and only breaks at the
+    # destination. That is what happened: `merge-reminder.test.sh` failed `bash -n` at line 2629
+    # under 3.2, `install.sh`'s `bash -n` sweep refused, and NO Mac could install the harness. This is
+    # the MAIN-line red signal: a merge that reintroduces the shape fails here even if its PR check
+    # was bypassed. Family: #2248 (3.2 executes a here-doc body's words inside a `$( )`).
+    #
+    # The gate runs the real 3.2 parser in the digest-pinned `bash:3.2` image, and is FAIL-CLOSED: no
+    # docker, no interpreter, or an interpreter that is not 3.x exits 2 and names the cause.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - name: Every shipped script parses under bash 3.2 (#2930)
+        timeout-minutes: 5
+        run: bash scripts/check-bash32-parse.sh
+      - name: bash-3.2 parse gate suite (fixtures, fail-closed arms, mutations)
+        timeout-minutes: 5
+        run: bash tests/bash32-parse/run.sh
+
   pi-config-extensions-guard:
     # #498/#502 — post-merge re-check of the pi-config extension-farm parity gate
     # (issue #95 invariant): every TRACKED extensions/ top-level entry except
@@ -570,7 +593,7 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
+    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
     if: failure()
     # RESIDUAL (round-2 review): paginate -> find -> create is check-then-act, so two
     # concurrent post-merge runs can both create (runs 34534428397 / 34534452089 failed 17s

@@ -542,8 +542,7 @@ ck "§14g and it activates nothing" "$([ ! -e "$FX/activate.txt" ] && echo 0 || 
 
 # An UNREADABLE origin/main licenses NOTHING: with an empty main every box reads as drifted, and the
 # verify loop would compare against the same empty value and never pass — a restart every cycle.
-ck "§14h an unreadable origin/main refuses the deploy arm instead of restarting the fleet" \
-   "$(python3 - "$SUT" "$O" <<'PYMOD'
+_py_s14h_unreadable_main() { python3 - "$SUT" "$O" <<'PYMOD'
 import importlib.util, sys, tempfile
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -557,7 +556,9 @@ ok = (len(got) == 1 and got[0]["box"] == "<harness origin/main>"
       and "UNREADABLE harness origin/main" in got[0]["verdict"])
 print(0 if ok else 1)
 PYMOD
-)"
+}
+ck "§14h an unreadable origin/main refuses the deploy arm instead of restarting the fleet" \
+   "$(_py_s14h_unreadable_main)"
 
 # ═══ §15 NON-VACUITY: the gates are what refuses, not a coincidence ═════════════════════════════
 echo "-- §15 mutation controls"
@@ -745,8 +746,7 @@ chmod +x "$TMP/rail.sh"
 # cell's own stop → apply → start cycle. No seam exists in the production call path.
 echo "-- §19 local activation is platform-scoped"
 : > "$O/cloud-cell-supervisor.sh"
-ck "§19 darwin => no verb; linux => stop/apply/start (driven from the shipped predicate)" \
-   "$(python3 - "$SUT" "$O" <<'PYMOD'
+_py_s19_activation_verbs() { python3 - "$SUT" "$O" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -758,7 +758,9 @@ ok = (darwin == "" and "cloud-cell-supervisor.sh" in linux
       and "stop" in linux and "apply" in linux and "start" in linux)
 print(0 if ok else 1)
 PYMOD
-)"
+}
+ck "§19 darwin => no verb; linux => stop/apply/start (driven from the shipped predicate)" \
+   "$(_py_s19_activation_verbs)"
 rm -f "$O/cloud-cell-supervisor.sh"
 
 # ═══ §20 the gates a REVIEW reconstructed, each one now pinned by a case ════════════════════════
@@ -1201,7 +1203,7 @@ echo "-- §25 reap mutex and the moment-of-action read"
 # mutex each can return "taken" and two rails run for one PR (the very defect the lock prevents).
 RPD="$TMP/reap"; mkdir -p "$RPD/state"
 printf '99999999\n' > "$RPD/state/mergeclaim-42.lock"
-rout="$(python3 - "$SUT" "$RPD/state/mergeclaim-42.lock" <<'PYMOD'
+_py_s25a_concurrent_reap() { python3 - "$SUT" "$RPD/state/mergeclaim-42.lock" <<'PYMOD'
 import importlib.util, multiprocessing as mp, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1231,7 +1233,8 @@ if __name__ == "__main__":
     wins = sum(1 for _ in ps if q.get())
     print("winners=%d" % wins)
 PYMOD
-)"
+}
+rout="$(_py_s25a_concurrent_reap)"
 ck "§25a exactly ONE of six concurrent reapers wins the lock" \
    "$(grep -qx 'winners=1' <<<"$rout" && echo 0 || echo 1)"
 ck "§25a (the sidecar mutex was cleaned up)"    "$([ ! -e "$RPD/state/mergeclaim-42.lock.reap" ] && echo 0 || echo 1)"
@@ -1244,7 +1247,7 @@ ck "§25a (the sidecar mutex was cleaned up)"    "$([ ! -e "$RPD/state/mergeclai
 RD2="$TMP/reap2"; mkdir -p "$RD2/state"
 LOCK2="$RD2/state/mergeclaim-42.lock"
 : > "$LOCK2"
-rout="$(python3 - "$SUT" "$LOCK2" <<'PYMOD'
+_py_s25d_empty_lock() { python3 - "$SUT" "$LOCK2" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1252,7 +1255,8 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 got, detail = m._take_pid_lock(Path(sys.argv[2]))
 print("got=%s|%s" % (got, detail))
 PYMOD
-)"
+}
+rout="$(_py_s25d_empty_lock)"
 ck "§25d an EMPTY lock (a creator mid-write) is NOT reaped" \
    "$(qF 'got=False|running (the lock carries no usable pid yet' "$rout" && echo 0 || echo 1)"
 ck "§25d ...and its file was left in place"          "$([ -s "$LOCK2" ] || [ -e "$LOCK2" ] && echo 0 || echo 1)"
@@ -1263,7 +1267,7 @@ import os, sys, time
 t = time.time() - 3600
 os.utime(sys.argv[1], (t, t))
 PYMOD
-rout="$(python3 - "$SUT" "$LOCK2" <<'PYMOD'
+_py_s25e_empty_old_lock() { python3 - "$SUT" "$LOCK2" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1271,7 +1275,8 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 got, detail = m._take_pid_lock(Path(sys.argv[2]))
 print("got=%s|%s" % (got, detail))
 PYMOD
-)"
+}
+rout="$(_py_s25e_empty_old_lock)"
 ck "§25e an EMPTY lock OLDER than REAP_STALE_S IS reaped (garbage, not a writer)" \
    "$(qF 'got=True|taken' "$rout" && echo 0 || echo 1)"
 
@@ -1282,7 +1287,7 @@ RD3="$TMP/reap3"; mkdir -p "$RD3/state"
 LOCK3="$RD3/state/mergeclaim-42.lock"
 printf '99999999\n' > "$LOCK3"                 # dead owner: the reap is legitimate
 printf '%s\n' "$$" > "$LOCK3.reap"             # ...but a LIVE reaper holds the mutex, with no epoch
-rout="$(python3 - "$SUT" "$LOCK3" <<'PYMOD'
+_py_s25f_reaper_no_epoch() { python3 - "$SUT" "$LOCK3" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1290,13 +1295,14 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 got, detail = m._take_pid_lock(Path(sys.argv[2]))
 print("got=%s|%s" % (got, detail))
 PYMOD
-)"
+}
+rout="$(_py_s25f_reaper_no_epoch)"
 ck "§25f a LIVE reaper with NO epoch is believed, not aged out" \
    "$(qF 'got=False|running (a reap is in progress pid=' "$rout" && echo 0 || echo 1)"
 ck "§25f ...and its mutex was not deleted"           "$([ -e "$LOCK3.reap" ] && echo 0 || echo 1)"
 
 printf '%s %s\n' "$$" "$(date +%s)" > "$LOCK3.reap"   # a live reaper WITH a fresh epoch
-rout="$(python3 - "$SUT" "$LOCK3" <<'PYMOD'
+_py_s25f_fresh_epoch() { python3 - "$SUT" "$LOCK3" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1304,12 +1310,13 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 got, detail = m._take_pid_lock(Path(sys.argv[2]))
 print("got=%s|%s" % (got, detail))
 PYMOD
-)"
+}
+rout="$(_py_s25f_fresh_epoch)"
 ck "§25f ...and a fresh epoch refuses the same way" \
    "$(qF 'got=False|running (a reap is in progress pid=' "$rout" && echo 0 || echo 1)"
 
 printf '99999999 %s\n' 1600000000 > "$LOCK3.reap"     # a DEAD reaper's mutex is the stale flag one
-rout="$(python3 - "$SUT" "$LOCK3" <<'PYMOD'           # level down: the reap must still happen
+_py_s25f_dead_mutex() { python3 - "$SUT" "$LOCK3" <<'PYMOD'           # level down: the reap must still happen
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1317,7 +1324,8 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 got, detail = m._take_pid_lock(Path(sys.argv[2]))
 print("got=%s|%s" % (got, detail))
 PYMOD
-)"
+}
+rout="$(_py_s25f_dead_mutex)"
 ck "§25f a DEAD reap mutex is itself reaped, so a crashed reaper cannot fence the PR forever" \
    "$(qF 'got=True|taken' "$rout" && echo 0 || echo 1)"
 
@@ -1328,7 +1336,7 @@ RD4="$TMP/reap4"; mkdir -p "$RD4/state"
 LOCK4="$RD4/state/mergeclaim-42.lock"
 printf '99999999\n' > "$LOCK4"                  # dead owner: a reap IS legitimate
 : > "$LOCK4.reap"                               # ...but a peer's reap mutex was just created
-rout="$(python3 - "$SUT" "$LOCK4" <<'PYMOD'
+_py_s25f_empty_mutex() { python3 - "$SUT" "$LOCK4" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1336,7 +1344,8 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 got, detail = m._take_pid_lock(Path(sys.argv[2]))
 print("got=%s|%s" % (got, detail))
 PYMOD
-)"
+}
+rout="$(_py_s25f_empty_mutex)"
 ck "§25f an EMPTY reap mutex (a peer mid-write) is not unlinked" \
    "$(qF 'got=False|running (a reap is starting: its mutex carries no usable pid yet' "$rout" && echo 0 || echo 1)"
 ck "§25f ...and the peer's mutex file is still there"            "$([ -e "$LOCK4.reap" ] && echo 0 || echo 1)"
@@ -1347,7 +1356,7 @@ import os, sys, time
 t = time.time() - 3600
 os.utime(sys.argv[1], (t, t))
 PYMOD
-rout="$(python3 - "$SUT" "$LOCK4" <<'PYMOD'
+_py_s25f_empty_old_mutex() { python3 - "$SUT" "$LOCK4" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1355,7 +1364,8 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 got, detail = m._take_pid_lock(Path(sys.argv[2]))
 print("got=%s|%s" % (got, detail))
 PYMOD
-)"
+}
+rout="$(_py_s25f_empty_old_mutex)"
 ck "§25f an EMPTY reap mutex OLDER than the bound IS cleared (a crashed peer, not a writer)" \
    "$(qF 'got=True|taken' "$rout" && echo 0 || echo 1)"
 
@@ -1363,7 +1373,7 @@ ck "§25f an EMPTY reap mutex OLDER than the bound IS cleared (a crashed peer, n
 # the rail's NAME in this process's own command line. Deleting the `pid in me` arm left the whole
 # suite green (only the PEER case was pinned), so the self-refusal could return unnoticed.
 RS="$TMP/railscan"; mkdir -p "$RS/state"
-rkout="$(python3 - "$SUT" "$RS" <<'PYMOD'
+_py_s25g_own_pid() { python3 - "$SUT" "$RS" <<'PYMOD'
 import importlib.util, os, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1376,7 +1386,8 @@ print("selfpid=%r" % m.any_rail_live(o, [(str(os.getpid()), "bash /x/admin-merge
 print("real=%r" % m.any_rail_live(o, [("888", "bash /x/admin-merge.sh 42 --repo s")]))
 print("none=%r" % m.any_rail_live(o, [("999", "bash /x/unrelated.sh")]))
 PYMOD
-)"
+}
+rkout="$(_py_s25g_own_pid)"
 ck "§25g OUR OWN pid is never a rail, whatever its argv names" \
    "$(qF "self=''" "$rkout" && echo 0 || echo 1)"
 ck "§25g ...and the pid arm holds on its own (an argv that does not name this script)" \
@@ -1398,7 +1409,7 @@ ck "§25h ...and nothing was dispatched"                          "$([ ! -e "$FX
 # that CONTAINS A SPACE (a whitespace split keys on the first word, so the bound never binds and the
 # box is restarted every cycle).
 LD="$TMP/ledger"; mkdir -p "$LD/state"
-lout="$(python3 - "$SUT" "$LD" <<'PYMOD'
+_py_s25i_space_box_name() { python3 - "$SUT" "$LD" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1410,7 +1421,8 @@ print("space=%r %r" % (m.record_deploy(o, "cell one", "a" * 12, "b" * 12, "ok"),
 (o / "state" / m.DEPLOYS).mkdir()                  # a DIRECTORY: every append now fails
 print("unwritable=%r" % (m.record_deploy(o, "cell one", "c" * 12, "d" * 12, "ok"),))
 PYMOD
-)"
+}
+lout="$(_py_s25i_space_box_name)"
 ck "§25i a box name with a SPACE round-trips through the TAB ledger and is COUNTED" \
    "$(qF "space=True (1," "$lout" && echo 0 || echo 1)"
 ck "§25i an UNWRITABLE ledger reports False (the bound is not silently inert)" \
@@ -1567,7 +1579,7 @@ chmod +x "$BIN/gh"
 # escape to `main`, which then printed "SKIPPED … (no dispatch)" beside a rail that was already
 # running — an invitation to hand-dispatch the same PR onto the same lock.
 write_baseline; reset_o
-out="$(python3 - "$SUT" "$O" "$SLUG" "$REPO_SRC" <<'PYMOD'
+_py_s26f_dispatch_kept() { python3 - "$SUT" "$O" "$SLUG" "$REPO_SRC" <<'PYMOD'
 import importlib.util, sys
 from argparse import Namespace
 from pathlib import Path
@@ -1601,7 +1613,8 @@ print("second_readings=%s" % results[1]["readings"])
 print("line=%s" % m.one_line_of(results, [], "", dispatched))
 print("skipline=%s" % m.one_line_of(results, [], "UNREADABLE report", dispatched))
 PYMOD
-)"
+}
+out="$(_py_s26f_dispatch_kept)"
 ck "§26f a dispatch already made is NOT withdrawn by a later candidate's OSError" \
    "$(qF 'dispatched=True' "$out" && echo 0 || echo 1)"
 ck "§26f ...the failing candidate is reported as UNREADABLE, not as quiet" \
@@ -1674,7 +1687,7 @@ ck "§26j ...and the deliverable was still written" "$([ -s "$O/MERGE-REMINDER.m
 # controller's cwd gone does exactly this).
 write_baseline; reset_o
 rm -f "$O/MERGE-REMINDER.md"
-out="$(python3 - "$SUT" "$O" <<'PYMOD' 2>&1
+_py_s26l_oserror_probe() { python3 - "$SUT" "$O" <<'PYMOD' 2>&1
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -1685,7 +1698,8 @@ m.repo_path_of = boom
 rc = m.main(["--o", sys.argv[2], "--repo", "daniel-ospina/agent-infra", "--no-act"])
 print("rc=%s" % rc)
 PYMOD
-)"
+}
+out="$(_py_s26l_oserror_probe)"
 ck "§26l an OSError out of the repo probe is a REPORTED cycle, not an UnboundLocalError" \
    "$(nq 'UnboundLocalError' "$out" && nq 'Traceback' "$out" && qF 'rc=3' "$out" && echo 0 || echo 1)"
 ck "§26l ...and the deliverable names the unreadable environment" \
@@ -1760,7 +1774,7 @@ ck "§26o ...and the reverse: uninstall through the SYMLINK removes the canonica
 # ⛔ AN UNREAD SURFACE MUST NOT SUPPRESS A RED THAT *WAS* READ. The guard exists to stop a false
 # "no red group"; if it fired on any unread candidate it would instead HIDE a red group — the worse
 # direction for a section whose job is to point at one root unblocking a batch.
-skout="$(python3 - "$SUT" <<'PYMOD'
+_py_s26p_red_beside_unread() { python3 - "$SUT" <<'PYMOD'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -1772,7 +1786,8 @@ print("allunread=%r" % m._shared_reds([unread]))
 print("clean=%r" % m._shared_reds([{"pr": {"number": 3}, "readings": "reds=0", "reds": 0,
                                            "red_labels": []}]))
 PYMOD
-)"
+}
+skout="$(_py_s26p_red_beside_unread)"
 ck "§26p a red group that WAS read is still reported beside an unread candidate" \
    "$(qF 'ci / build' "$skout" && echo 0 || echo 1)"
 ck "§26p ...and only the all-unread case abstains" \
@@ -2056,8 +2071,7 @@ ck "§27 a TRANSIENT unreadable origin/main is retried WITH BACKOFF (3 reads: \$
 # ⛔ THE NAME OF THE FIX IS "WITH BACKOFF", SO THAT IS WHAT IS MEASURED. Three calls issued back to
 # back are the exact shape the comment says recovers nothing; a mutant that dropped the sleep kept the
 # suite green until this assertion existed.
-ck "§27 ...and the retry is a GAP IN TIME (each gap >= MAIN_READ_BACKOFF_S)" \
-   "$(python3 - "$FX/mainstamps" <<'PY'
+_py_s27_main_stamps() { python3 - "$FX/mainstamps" <<'PY'
 import sys
 try:
     t = [int(x) for x in open(sys.argv[1]).read().split()]
@@ -2066,7 +2080,9 @@ except Exception:
 gaps = [(b - a) / 1e9 for a, b in zip(t, t[1:])]
 print(0 if len(gaps) == 2 and all(g >= 0.4 for g in gaps) else 1)
 PY
-)"
+}
+ck "§27 ...and the retry is a GAP IN TIME (each gap >= MAIN_READ_BACKOFF_S)" \
+   "$(_py_s27_main_stamps)"
 ck "§27 ...so the goals judge the boxes against the sha the header prints" \
    "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF "$MAIN12" "$MDF" && nq 'UNREADABLE (not compared)' "$MDF" && echo 0 || echo 1)"
 
@@ -2115,8 +2131,7 @@ ck "§27 ...and the row carries the short state token, NOT the sentence" \
 # beside the script - unreachable from the shell path here (the probe ships with it), so it is driven
 # through `goal_progress` directly. Its reason is a FACT, not a sentence: it is embedded in two
 # templates that already say "not compared —" and "no box was probed (".
-ck "\u00a727 a NO-PROBE inventory names the fact once (no nested 'no box could be probed (…)')" \
-   "$(python3 - "$SUT" <<'PY3'
+_py_s27_no_probe_inventory() { python3 - "$SUT" <<'PY3'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -2130,7 +2145,9 @@ ok = ("boxes.tsv=NO-PROBE" in txt and "no box could be probed (" not in txt
       and "STANDING=NOT-MEASURED" in txt and "on this cycle" not in txt)
 print(0 if ok else 1)
 PY3
-)"
+}
+ck "\u00a727 a NO-PROBE inventory names the fact once (no nested 'no box could be probed (…)')" \
+   "$(_py_s27_no_probe_inventory)"
 
 # ⛔ A MIXED FLEET IS NOT AN UNMEASURED ONE. `compared` requires every box to answer, so one
 # unanswered box used to void the measured verdicts in the action ("Nothing here is a verdict on a box"
@@ -2338,8 +2355,7 @@ ck "§27 ...and is NOT announced when the inventory is there" \
 # ⛔ THE LOCAL ROW IS A PROBED BOX — asserted through `goal_progress` ITSELF, because the shell path
 # runs the REAL probe and therefore depends on the machine's pin. A synthesized `absent` row that IS
 # readable must be fractioned and must NOT be described as an unreadable read.
-ck "§27 a probed LOCAL-ONLY row is fractioned, HOLDs, and says LOCAL ONLY" \
-   "$(python3 - "$SUT" <<'PY2'
+_py_s27_local_only_row() { python3 - "$SUT" <<'PY2'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -2358,7 +2374,9 @@ ok = ("STANDING=MARKERS-HOLD" in txt and "(1/1 box(es) on this cycle's main, dep
       and "LOCAL ONLY" in txt and "not compared" not in txt)
 print(0 if ok else 1)
 PY2
-)"
+}
+ck "§27 a probed LOCAL-ONLY row is fractioned, HOLDs, and says LOCAL ONLY" \
+   "$(_py_s27_local_only_row)"
 
 # ⛔ THE LOCAL ROW IS A PROBED BOX. Excluding `absent` from `compared` made the DEFAULT path print
 # "not compared" beside the box it had just compared, and aim the remediation at a read that never
@@ -2556,7 +2574,7 @@ ck "§27b ...and goal 2 is NOT-MEASURED for that reason, never compared against 
    "$(qF 'the harness repo could not be resolved' "$MDF" && nq 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
 # ...and the SUT DOES resolve its own checkout (the case the fix exists for): no copy is made, because
 # the script under test is ALREADY inside a checkout and running the copy would test the copy's location.
-out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+_py_s27b_own_checkout() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" <<'PYMOD'
 import importlib.util, sys
@@ -2568,7 +2586,8 @@ got = m.harness_repo_of(Path("/nonexistent-o"))
 here = Path(sys.argv[1]).resolve().parents[2]
 print(0 if got is not None and Path(got) == here.resolve() else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_own_checkout)"
 ck "§27b ...and a SUT inside a checkout resolves it from its own location (no env needed)" \
    "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
 
@@ -2611,7 +2630,7 @@ ck "§23g ...and the ledger does NOT record a VERIFIED attempt" \
 # an expression that reads as a constant. Both call sites use the bounded `script_checkout()`.
 SHALLOW="/tmp/mr-shallow.$$.py"
 cp "$SUT" "$SHALLOW"
-out="$(python3 - "$SHALLOW" <<'PYMOD'
+_py_s27b_shallow_copy() { python3 - "$SHALLOW" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -2625,7 +2644,8 @@ except Exception as e:                       # noqa: BLE001 - the point is that 
     print(1); raise SystemExit
 print(0 if here is None and isinstance(rp, Path) and hr is None else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_shallow_copy)"
 ck "§27b a SCRIPT WITH TWO PARENTS (/tmp/x.py) resolves instead of raising IndexError" \
    "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
 rm -f "$SHALLOW"
@@ -2652,7 +2672,7 @@ git -C "$PLAIN" remote add origin "$FX/plain-origin.git"
 git -C "$PLAIN" push --quiet origin main
 ck "§27b the plain fixture really is a checkout without the harness marker" \
    "$([ -d "$PLAIN/.git" ] && [ ! -e "$PLAIN/scripts/orchestrator-harness/box-status.sh" ] && echo 0 || echo 1)"
-out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+_py_s27b_plain_repo() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$PLAIN" <<'PYMOD'
 import importlib.util, os, sys
@@ -2675,12 +2695,13 @@ ok = (got_o is not None and Path(got_o).resolve() == here
       and got_home is not None and Path(got_home).resolve() == here)
 print(0 if ok else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_plain_repo)"
 ck "§27b a checkout that does NOT carry the harness is SKIPPED (falls through to the real harness, never returned)" \
    "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
 # ...and the REAL harness checkout still resolves (the opposite direction, so the test cannot pass by
 # refusing everything): this suite's own tree carries `scripts/orchestrator-harness/box-status.sh`.
-out="$(python3 - "$SUT" <<'PYMOD'
+_py_s27b_harness_marker() { python3 - "$SUT" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
@@ -2689,7 +2710,8 @@ got = m.harness_repo_of(Path("/nonexistent-o"))
 here = Path(sys.argv[1]).resolve().parents[2]
 print(0 if got is not None and Path(got) == here.resolve() else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_harness_marker)"
 ck "§27b ...and a checkout that DOES carry the harness is accepted (the check is the marker, not a refusal)" \
    "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
 
@@ -2875,7 +2897,7 @@ ck "§27b the shaped fixture really has \$AGENT_INFRA_PATH's scripts through a s
    "$([ -f "$SHAPED/scripts/orchestrator-harness/box-status.sh" ] && ! git -C "$SHAPED" ls-files --error-unmatch scripts/orchestrator-harness/box-status.sh >/dev/null 2>&1 && echo 0 || echo 1)"
 # The reminder's resolver: it must NOT return the shaped repo (it may fall through to this script's own
 # checkout, which IS the harness — what it must never do is hand a tortoise repo back as the harness).
-out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+_py_s27b_ignored_pointer() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$SHAPED" <<'PYMOD'
 import importlib.util, sys
@@ -2887,7 +2909,8 @@ got = m.harness_repo_of(shaped)
 ok = got is not None and Path(got).resolve() != shaped
 print(0 if ok else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_ignored_pointer)"
 ck "§27b harness_repo_of REFUSES a checkout whose harness path is only the gitignored scripts pointer" \
    "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
 # ...and the box probe, which names WHY (the pointer is the whole trap, so it has to be in the message).
@@ -2930,7 +2953,7 @@ out="$(env REPO= HARNESS_REPO="$LINKSHAPE" HOME="$TMP/homeplain" FIXTURE="$FX" H
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b box-status REFUSES a repo that ships a TRACKED SYMLINK as the harness file" \
    "$(grep -q '^ref: UNRESOLVED (.*not a TRACKED REGULAR FILE there (mode 120000' <<<"$out" && echo 0 || echo 1)"
-out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+_py_s27b_symlink_shape() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$LINKSHAPE" <<'PYMOD'
 import importlib.util, sys
@@ -2941,7 +2964,8 @@ shaped = Path(sys.argv[2]).resolve()
 got = m.harness_repo_of(shaped)
 print(0 if (got is None or Path(got).resolve() != shaped) else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_symlink_shape)"
 ck "§27b harness_repo_of REFUSES the same tracked-symlink shape" \
    "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
 
@@ -2964,7 +2988,7 @@ ck "§27b box-status REFUSES a gitlink (160000) and names a gitlink, not only a 
    "$(grep -q 'mode 160000' <<<"$out" && grep -q 'gitlink/submodule' <<<"$out" && echo 0 || echo 1)"
 # ...and the reminder's reader must refuse the same shape: a widened mode list (`"160000"` added) would
 # otherwise ship green, since only the box probe was pinned against it.
-out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+_py_s27b_gitlink_shape() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$LINKGIT" <<'PYMOD'
 import importlib.util, sys
@@ -2975,7 +2999,8 @@ shaped = Path(sys.argv[2]).resolve()
 got = m.harness_repo_of(shaped)
 print(0 if (got is None or Path(got).resolve() != shaped) else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_gitlink_shape)"
 ck "§27b harness_repo_of REFUSES the same gitlink shape" \
    "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
 
@@ -3013,7 +3038,7 @@ for hijack in GIT_DIR GIT_INDEX_FILE; do
   ck "§27b box-status is not hijacked by an inherited $hijack (the plain repo is still refused)" \
      "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
 done
-out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+_py_s27b_sanitised_read() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    GIT_DIR="$HERE_TOP/.git" \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$PLAIN" <<'PYMOD'
@@ -3025,10 +3050,11 @@ plain = Path(sys.argv[2]).resolve()
 got = m.harness_repo_of(plain)
 print(0 if (got is None or Path(got).resolve() != plain) else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_sanitised_read)"
 # ⛔ AND THE MAIN READ, not just the identity probe: `origin_main()` feeds the PR gates, the drift table and
 # goal 2, so an inherited `GIT_DIR` there would print ANOTHER repo's main as this cycle's main.
-out_main="$(env REPO="$REPO_SRC" GIT_DIR="$FX/plainrepo/.git" HOME="$TMP/home" FIXTURE="$FX" \
+_py_s27b_plain_main() { env REPO="$REPO_SRC" GIT_DIR="$FX/plainrepo/.git" HOME="$TMP/home" FIXTURE="$FX" \
    PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$REPO_SRC" <<'PYMOD'
 import importlib.util, sys
@@ -3041,7 +3067,8 @@ truth = m.run(["git", "-C", str(repo), "rev-parse", "--verify", "origin/main"], 
 got = m.main_sha(repo)          # ambient GIT_DIR points at a DIFFERENT repo, with no origin/main
 print(0 if truth and got == truth else 1)
 PYMOD
-)"
+}
+out_main="$(_py_s27b_plain_main)"
 # ⛔ AND EVERY *OTHER* GIT READ TOO (round-8 review, measured): eight of twelve `run(["git", …])` calls
 # inherited the environment, and under `GIT_DIR=<a foreign repo>/.git` the checkout-vs-flag MISMATCH GUARD
 # (`github_origin`) returned "" — i.e. it failed OPEN — while `git_dir` named another repository. The rule is
@@ -3057,7 +3084,7 @@ for hijack in GIT_DIR GIT_COMMON_DIR; do
     GIT_DIR)        hval="$FX/plainrepo/.git" ;;
     GIT_COMMON_DIR) hval="$FX/plainrepo/.git" ;;
   esac
-  out_all="$(env "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" \
+  _py_s27b_hijack_all() { env "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" \
      PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
      python3 - "$SUT" "$HERE_TOP" <<'PYMOD'
 import importlib.util, sys
@@ -3072,7 +3099,8 @@ truth_gdir = m.run(["git", "-C", str(repo), "rev-parse", "--absolute-git-dir"],
 ok = (slug != "" and truth_gdir and gdir.strip() == truth_gdir)
 print(0 if ok else 1)
 PYMOD
-)"
+  }
+  out_all="$(_py_s27b_hijack_all)"
   ck "§27b every git read is sanitised (github_origin does not fail open under a foreign $hijack)" \
      "$(grep -qx 0 <<<"$out_all" && echo 0 || echo 1)"
 done
@@ -3087,7 +3115,7 @@ for hijack in GIT_DIR GIT_INDEX_FILE GIT_COMMON_DIR; do
     GIT_INDEX_FILE)  hval="$HARNESS_INDEX" ;;
     GIT_COMMON_DIR)  hval="$PLAIN/.git" ;;
   esac
-  out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+  _py_s27b_hijack_single() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
      "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" \
      PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
      python3 - "$SUT" "$PLAIN" <<'PYMOD'
@@ -3099,7 +3127,8 @@ plain = Path(sys.argv[2]).resolve()
 got = m.harness_repo_of(plain)
 print(0 if (got is None or Path(got).resolve() != plain) else 1)
 PYMOD
-)"
+  }
+  out="$(_py_s27b_hijack_single)"
   ck "§27b harness_repo_of is not hijacked by an inherited $hijack either" \
      "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
 done
@@ -3123,7 +3152,7 @@ out="$(env REPO= HARNESS_REPO="$DIRSHAPE" HOME="$TMP/homeplain" FIXTURE="$FX" HA
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b box-status REFUSES a DIRECTORY at the marker path (records the nested file it found)" \
    "$(grep -q 'records scripts/orchestrator-harness/box-status.sh/nested instead' <<<"$out" && echo 0 || echo 1)"
-out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+_py_s27b_marker_dir() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$DIRSHAPE" <<'PYMOD'
 import importlib.util, sys
@@ -3134,7 +3163,8 @@ shaped = Path(sys.argv[2]).resolve()
 got = m.harness_repo_of(shaped)
 print(0 if (got is None or Path(got).resolve() != shaped) else 1)
 PYMOD
-)"
+}
+out="$(_py_s27b_marker_dir)"
 ck "§27b harness_repo_of REFUSES the same directory-at-marker-path shape" \
    "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
 
