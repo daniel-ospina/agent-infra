@@ -99,11 +99,28 @@ def _objective():
     return mod
 
 
+def _safe_cwd():
+    """The process's cwd, or None when the OS REFUSES to say where the process is.
+
+    ⛔ `os.getcwd()` IS NOT A TOTAL FUNCTION (ai#2922) -- see the twin in `objective.py`'s
+    `_checkout_repo`, which this shim mirrors deliberately. Under launchd with no Full Disk Access
+    the call RAISES (`PermissionError`, or `FileNotFoundError` for a deleted `WorkingDirectory`)
+    instead of returning a path.
+    """
+    try:
+        return os.getcwd()
+    except OSError:                            # PermissionError, ENOENT, ENOENT-after-delete
+        return None
+
+
 def _checkout_repo(path=None):
     """(slug, reason): `owner/name` of the checkout this loop acts on, or (None, why).
 
     Sourced, never re-implemented — see the block above `_objective`. The reason is "deriver-missing"
-    when the script is deployed without repo-slug.sh, else "underivable" — two different remedies.
+    when the script is deployed without repo-slug.sh, "cwd-unreadable" when the OS refuses to report
+    the working directory, else "underivable" — three different remedies, reported rather than
+    collapsed (ai#2922: a cwd failure used to reach the broad `except` below and be reported as
+    "underivable", whose remedy is to debug `git`/`bash`).
     """
     lib = None
     for cand in (HERE / "orchestrator-harness" / "repo-slug.sh", HERE / "repo-slug.sh"):
@@ -112,10 +129,15 @@ def _checkout_repo(path=None):
             break
     if lib is None:
         return None, "deriver-missing"
+    # ⛔ RESOLVED OUTSIDE THE `try`: a cwd that cannot be read is a NAMED cause.
+    if not path:
+        path = _safe_cwd()
+        if path is None:
+            return None, "cwd-unreadable"
     try:
         res = subprocess.run(
             ["bash", "-c", '. "$1" >/dev/null 2>&1; derive_or "$2"', "_", str(lib),
-             str(path or os.getcwd())],
+             str(path)],
             capture_output=True, text=True, timeout=30)
     except Exception:
         return None, "underivable"

@@ -321,3 +321,30 @@ def test_the_beat_and_the_dispatcher_read_the_same_function():
         "while its class counts are built on an unread merge state")
     # And no second threshold lives in `pr-loop.py`.
     assert "2 * " not in loop_src, "a second definition of \"blind\" appeared in pr-loop.py"
+
+
+# ── agent-infra#2922: an unreadable cwd on the LAUNCHD path ────────────────────────────────────
+# `pr-loop.py` carries the SAME `_checkout_repo` shim as `objective.py` (deliberately -- one
+# derivation, two callers). It therefore carried the SAME defect: `os.getcwd()` was evaluated inside
+# the `try` around `subprocess.run`, so a launcher refusing to report the cwd was reported as
+# `underivable` -- the remedy for a broken `git`/`bash` -- instead of as the cwd itself. Both files
+# are fixed together, so both are pinned together; a fix in one only would leave the beat's other
+# reader sending an operator to the wrong remedy.
+def test_an_UNREADABLE_CWD_is_named_here_too_not_only_in_objective_py(monkeypatch):
+    """Reproduced before the fix: `pl._checkout_repo()` returned `(None, 'underivable')` here."""
+
+    def boom():
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(pl.os, "getcwd", boom)
+    assert pl._checkout_repo() == (None, "cwd-unreadable")
+    assert pl._checkout_repo("") == (None, "cwd-unreadable")
+
+
+def test_the_two_shims_agree_on_the_cwd_reason(monkeypatch):
+    """One defect, one word: the twin must not answer a THIRD spelling that a reader cannot match."""
+    def boom():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(pl.os, "getcwd", boom)
+    assert pl._checkout_repo()[1] == objective._checkout_repo()[1] == "cwd-unreadable"
