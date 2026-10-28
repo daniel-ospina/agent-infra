@@ -662,6 +662,61 @@ else
   fail "14. a transport refusal no longer reads RED — code 3 has been swallowed with 6 (see $LOG14B)"
 fi
 
+# ⛔ THE OTHER TWO pr-doctor SURFACES IN THIS FILE (review P1, #2291). Teaching only the
+# `status.json` block left the DRAIN and the LAUNCHD arm printing `RED` for the same rc=6 — one
+# heartbeat saying "RED rc=6" one line above "WAITING (no capacity) rc=6". Both are driven here with
+# the seeding pattern the other cases already use (`pr-doctor.rc` for the drain, a `launchctl` stub
+# for the scheduled job).
+FIX14C="$(mkfix no-capacity-drain 0)"; LOG14C="$(logof "$FIX14C")"
+printf '6\n' > "$FIX14C/agent/state/pr-doctor.rc"
+run_pass "$FIX14C"
+TXT14C="$(cat "$LOG14C" 2>/dev/null)"
+if has "$TXT14C" "PR-DOCTOR WAITING (no capacity) rc=6"; then
+  pass "14c. a DRAINED rc=6 reads WAITING — the detached run is not reported as broken"
+else
+  fail "14c. the drain reported a no-capacity run without the WAITING word (got: $(grep -m1 'rc=6' "$LOG14C" 2>/dev/null | cut -c1-140))"
+fi
+if has "$TXT14C" "PR-DOCTOR RED rc=6"; then
+  fail "14c. the drain still printed 'PR-DOCTOR RED rc=6' — the same log then carries two verdicts for one pass"
+else
+  pass "14c. …and it is NOT reported as RED"
+fi
+
+# The SCHEDULED job runs pr-doctor.py directly, so LastExitStatus=6 lands on its own arm.
+STUBBIN="$TMP/stubbin"; mkdir -p "$STUBBIN"
+printf '#!/bin/bash\n[ "${1:-}" = list ] && printf -- "-\\t6\\tcom.tortoise.pr-doctor\\n"\nexit 0\n' \
+  > "$STUBBIN/launchctl"; chmod +x "$STUBBIN/launchctl"
+FIX14D="$(mkfix no-capacity-launchd 0)"; LOG14D="$(logof "$FIX14D")"
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "reason": "VERDICT=NO-CAPACITY next=wait bound=load=1", "at_epoch": %s}\n' \
+  "$(date +%s)" > "$FIX14D/agent/state/pr-doctor.status.json"
+export HEARTBEAT_LAUNCHCTL="$STUBBIN/launchctl"
+run_pass "$FIX14D"
+unset HEARTBEAT_LAUNCHCTL
+TXT14D="$(cat "$LOG14D" 2>/dev/null)"
+if has "$TXT14D" "PR-DOCTOR LAUNCHD WAITING (no capacity, last exit 6)"; then
+  pass "14d. the scheduled job's last exit 6 reads WAITING — 'the scheduled job is failing' is not claimed"
+else
+  fail "14d. the launchd arm did not report a no-capacity last exit as WAITING (got: $(grep -m1 'LAUNCHD' "$LOG14D" 2>/dev/null | cut -c1-140))"
+fi
+if has "$TXT14D" "LAUNCHD RED (last exit 6)"; then
+  fail "14d. the launchd arm still says the scheduled job is failing on a no-capacity pass"
+else
+  pass "14d. …and it is NOT reported as a failing job"
+fi
+# CONTROL: the allowance is for 6 alone. A real failure on the same arm is still RED.
+FIX14E="$(mkfix failing-launchd 0)"; LOG14E="$(logof "$FIX14E")"
+printf '#!/bin/bash\n[ "${1:-}" = list ] && printf -- "-\\t4\\tcom.tortoise.pr-doctor\\n"\nexit 0\n' \
+  > "$STUBBIN/launchctl"
+export HEARTBEAT_LAUNCHCTL="$STUBBIN/launchctl"
+run_pass "$FIX14E"
+unset HEARTBEAT_LAUNCHCTL
+TXT14E="$(cat "$LOG14E" 2>/dev/null)"
+if has "$TXT14E" "PR-DOCTOR LAUNCHD RED (last exit 4)"; then
+  pass "14e. a CRASHING scheduled job (last exit 4) is still RED (the WAITING arm is narrow)"
+else
+  fail "14e. a crashing scheduled job no longer reads RED — the WAITING arm swallowed every exit"
+fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0

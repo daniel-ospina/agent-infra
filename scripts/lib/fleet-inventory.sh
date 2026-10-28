@@ -823,13 +823,36 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
   if [ -n "$ex" ] && [ "$ex" != "0" ]; then
     # ⛔ A CAPACITY REFUSAL IS NOT A FAILURE (#2291, contract §2: "a refusal is not a failure, it is
     # the answer"). `pr-doctor` exits 6 when the box's own spawn gate refused every order: nothing
-    # was consumed and (for load) it clears by itself. Without this arm the row rendered a working
-    # dispatcher on a busy box as FAILING — the false alarm #2291 measures and the reason its
-    # exit-code contract was asked for. WAITING is a pass for the exit code and is never OK.
+    # was consumed. Without this arm the row rendered a working dispatcher on a busy box as FAILING —
+    # the false alarm #2291 measures and the reason its exit-code contract was asked for.
+    #
+    # ⛔ HOWEVER, ONLY ONE AXIS SELF-CLEARS (review P2, #2291). `spawn-gate.sh` gives four refusal
+    # codes because their remedies differ, and it says so verbatim for each: load (`:1399`) "the
+    # controller re-dispatches when load falls, and nothing was consumed"; disk (`:1392`) "This is
+    # NOT a load refusal: waiting does not clear it"; fork (`:1344`) "a fork refusal does NOT clear by
+    # waiting"; land-backlog (`:1461`) "No agent started, nothing consumed. Remedy: land/fix the open
+    # PRs". Counting EVERY 6 as a pass would therefore turn a full disk or fork exhaustion from
+    # FAILING/exit 1 into WAITING/exit **0** — the machine-readable signal `orchestrator-bringup.sh`
+    # reads would go green on a stall that can never clear itself (the same shape the exit-2-for-hours
+    # episode at `orchestrator-bringup.sh:1394` was added to catch). So the axis decides, and the axis
+    # comes from the component's OWN record (`refusal_bound`), not from a second measurement.
     case " $waiting " in
       *" $ex "*)
+        _fdb="$(_fleet_pr_doctor_bound)" || _fdb="-"
+        case "$_fdb" in
+          -)
+            # Absent/unreadable bound: whether it clears is UNKNOWN, and an abstention is never a
+            # pass — the file's own doctrine.
+            fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" UNKNOWN \
+              "its last run exited $ex (no capacity) but the record's \`refusal_bound\` could not be read, so whether this clears by itself is UNKNOWN; read $FLEET_AGENT_STATE/pr-doctor.status.json"; return 0 ;;
+        esac
+        _fhard="$(printf '%s' "$_fdb" | tr ',' '\n' | awk -F= '$1 != "load" && $1 != "" {print $1}' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+        if [ -n "$_fhard" ]; then
+          fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" FAILING \
+            "its last run exited $ex because the box refused on ${_fhard% } — nothing was consumed, but this bound does NOT clear by waiting (\`spawn-gate.sh\` says so per axis), so it is not a pass: prune the disk / restart the box / land the open PRs as the pass verdict's \`next=\` says. The record: $FLEET_AGENT_STATE/pr-doctor.status.json"; return 0
+        fi
         fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" WAITING \
-          "its last run reported NO CAPACITY (exit $ex): the box's own gate refused the work and nothing was consumed, so the queue is not moving and nothing is broken. Read the bound and the box measurement from the pass verdict (\`$what\` writes $out); a load refusal clears by itself, a disk/land-backlog/fork one does not"; return 0 ;;
+          "its last run reported NO CAPACITY on load (exit $ex, bound=${_fdb:-?}): the box's own gate refused the work, nothing was consumed and nothing is broken — it clears when load falls. The box measurement is in the pass verdict (\`$what\` writes $FLEET_AGENT_STATE/pr-doctor.status.json)"; return 0 ;;
     esac
     fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" FAILING \
       "the job's last run exited $ex — it ran and FAILED, and nothing has been reading that status (the measured pr-doctor exit-2-for-hours state); its own log: ${out:-<none declared>}"; return 0
@@ -856,6 +879,19 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
     fi
   fi
   fleet_row "$name" "loaded, last exit 0, fresh output" "$actual" OK ""
+}
+
+# _fleet_pr_doctor_bound — the capacity AXIS pr-doctor's own record names, or "" when unreadable.
+#
+# ⛔ THE AXIS DECIDES THE SEVERITY (`_fleet_row_launchd_job`'s waiting arm), and only `load` clears by
+# itself — so the datum has to come from the component's own artifact rather than from a guess here.
+# It is read, never re-measured: `capacity.sh probe` already wrote the numbers into the same record.
+_fleet_pr_doctor_bound() {
+  local f="${FLEET_AGENT_STATE:-}/pr-doctor.status.json" b
+  [ -n "${FLEET_AGENT_STATE:-}" ] && [ -f "$f" ] || return 1
+  b="$(sed -n 's/.*"refusal_bound"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)"
+  [ -n "$b" ] || return 1
+  printf '%s' "$b"
 }
 
 fleet_row_pr_doctor() {

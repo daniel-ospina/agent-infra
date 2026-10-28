@@ -124,8 +124,8 @@ reason_is "invalid-knob"
 # ── the dispatch verdict follows the dispatcher's OWN rc (round-2 review) ────────────────────────
 # A fake dispatcher: the loop must record what pr-doctor said, not that it returned. `refused` keeps
 # the pass's exit code at 2; `undelivered` is a readable pass whose work nobody took.
-mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok"
-for d in farm-refuse farm-undeliver farm-ok; do
+mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok" "$TMP/farm-nocapacity"
+for d in farm-refuse farm-undeliver farm-ok farm-nocapacity; do
     # ⛔ THE REAPER LOGS ITS ARGV (round-4 review): a dry-run that reaps must be OBSERVABLE, or the
     # dry-run guard can be deleted and the suite stays green while a "preview" removes worktrees.
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${REAP_OUT:-/dev/null}"\nexit 0\n' >"$TMP/$d/pi-reap-worktrees.sh"
@@ -133,6 +133,7 @@ for d in farm-refuse farm-undeliver farm-ok; do
 done
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(2)\n' >"$TMP/farm-refuse/pr-doctor.py"
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(3)\n' >"$TMP/farm-undeliver/pr-doctor.py"
+printf '#!/usr/bin/env python3\nimport sys\nsys.exit(6)\n' >"$TMP/farm-nocapacity/pr-doctor.py"
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' >"$TMP/farm-ok/pr-doctor.py"
 rm -f "$ROW"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-refuse" \
@@ -144,6 +145,16 @@ env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/fa
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
 check "an UNDELIVERED dispatch is rc=3 and named" 3 "$?"
 reason_is "no-worker-took-it"
+# ⛔ #2291: NO CAPACITY IS THIS SCRIPT'S OWN `EXIT_DEFERRED`, NOT A DISPATCHER REFUSAL. `pr-doctor`
+# exits 6 when the box's own spawn gate refused every order: nothing was consumed and (for load) it
+# clears by itself. Before this arm it fell into `*)` and was recorded as `refusing` /
+# `dispatcher-refused` — this layer relabelling "no room" as "the chain is broken", which is the
+# exact mislabel the new code exists to end, one layer down from where it was fixed.
+rm -f "$ROW"
+env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-nocapacity" \
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+check "a NO-CAPACITY dispatch is the loop's own DEFERRED (rc=6), not a refusal" 6 "$?"
+reason_is "no-capacity"
 rm -f "$ROW" "$TMP/reap.out"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-ok" \
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 REAP_OUT="$TMP/reap.out" \

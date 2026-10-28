@@ -1140,6 +1140,21 @@ GATE_NEXT_ACTION = {
     "fork": "restart this box from outside, or let its lanes drain -- it is out of PROCESSES and "
             "cannot be cleaned up from inside, and waiting does NOT clear it",
 }
+# ⛔ THE TOKEN COMES FIRST, THE SENTENCE AFTER IT (review P1, #2291). `record_exit()`'s own contract
+# is that the reason is a PREFIX because both readers cut the tail -- the tightest at 110 chars
+# (`objective.py::pr_doctor_last_run`; `heartbeat-loop.sh` cuts at 180). Measured with a REAL
+# `capacity.sh probe` record (164 chars): ordering the head `VERDICT next bound room` put `next=` at
+# offset 203, so NEITHER surface ever showed the remedy, and a disk refusal reached the beat as
+# "WAITING (no capacity) … disk_free_mb=" -- i.e. "just wait", when `spawn-gate.sh:1392` says
+# verbatim *"This is NOT a load refusal: waiting does not clear it"*. So the machine-readable token
+# is emitted FIRST and the prose after it: the remedy survives every cut, and the sentence is what a
+# human reads when the line is not truncated.
+GATE_NEXT_TOKEN = {"load": "wait", "disk": "prune-disk",
+                   "land-backlog": "land-prs", "fork": "restart-box"}
+# The OTHER verdicts' next actions, short enough to survive the same cut. A verdict without one is a
+# diagnosis the reader has to re-derive (#2710).
+VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
+                      "REFUSING": "restore-read", "SLOTS-FULL": "none"}
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
 # gate refused, nothing consumed" from "a `pi` exited 75 for its own reason" -- the ambiguity
@@ -3635,6 +3650,26 @@ def box_room(repo_dir: str = "") -> str:
     return "unreadable why=capacity.sh_probe_rc=%s %s" % (rc, (err or "").strip()[:80])
 
 
+def room_brief(rec: str) -> str:
+    """The FEW figures an operator acts on, taken from `box_room()`'s verbatim record.
+
+    The verbatim record is ~164 chars and is stored in the sidecar (`room=`) for whoever wants the
+    whole thing; the PASS LINE carries this compact form, because the readers cut the reason at 110
+    and a record that only exists past the cut is a measurement nobody sees. It is a PROJECTION of
+    the one measurement, never a second reading: no field here comes from anywhere else.
+    """
+    if not rec or rec.startswith("unreadable"):
+        return rec or "unreadable"
+    want = (("load1", "load1"), ("lpc", "lpc"), ("disk_free_mb", "disk_mb"),
+            ("mem_free_mb", "mem_mb"), ("procs", "procs"), ("procs_max", "procs_max"))
+    got = []
+    for key, short in want:
+        m = re.search(r"(?:^|\s)%s=([0-9]+)" % re.escape(key), rec)
+        if m:
+            got.append("%s=%s" % (short, m.group(1)))
+    return " ".join(got) or "unreadable why=no_field_parsed_from_the_probe_record"
+
+
 def set_rubric_note(entries: list[str]) -> str:
     """Why a SET cannot be judged by the operator's machine-wide rubric ("" when it can).
 
@@ -4967,6 +5002,14 @@ def run_pass(args, rubric_note: str = "") -> int:
         # reserved for "readable, nothing to do", so they ride 3 (the repair remedy) with their own
         # token and their own counter in the line.
         refused_rec = stalls.get("refused-recorded") or 0
+        # ⛔ A REFUSED ROW'S OWN COOLDOWN IS THE SAME FACT ONE PASS LATER (review P2, #2291). A
+        # `kind: "refused"` row is written with `at_epoch: now()`, so the NEXT pass counted it as a
+        # plain `cooldown` -- and `held > 0` then selected SLOTS-FULL with *"capacity is present and
+        # the queue is being served"* for work that is blocked until an operator fixes the worktree,
+        # for the rest of the 45-minute cooldown. That is the refuse -> cooldown -> retry loop #2710
+        # counts, re-labelled as served. Counted on its OWN axis, because "a worker is running" and
+        # "the worktree is dirty" are different answers to "why did nothing go out".
+        refused_cool = stalls.get("refused-cooldown") or 0
         axes = {}
         for _n, _a, _ax in no_room:
             axes[_ax] = axes.get(_ax, 0) + 1
@@ -4979,7 +5022,7 @@ def run_pass(args, rubric_note: str = "") -> int:
             code, verdict = EXIT_REFUSING, "REFUSING"
         elif not dispatched and undeliv:
             code, verdict = EXIT_UNDELIVERED, "UNDELIVERED"
-        elif not dispatched and refused_rec:
+        elif not dispatched and (refused_rec or refused_cool):
             code, verdict = EXIT_UNDELIVERED, "REFUSED"
         elif not dispatched and no_room:
             # MEASURED AT DECISION TIME, ONCE (#2291's whole second half: the report must carry the
@@ -4989,20 +5032,27 @@ def run_pass(args, rubric_note: str = "") -> int:
         elif not dispatched and (budgets["total"] == 0 or held):
             verdict = "SLOTS-FULL"
         head = "VERDICT=%s" % verdict
+        # ⛔ THE MACHINE FIELDS COME FIRST AND THE PROSE AFTER THEM (review P1, #2291): the reason is
+        # read through a 110-char cut by the beat, so the token, the bound and the few figures a
+        # reader acts on must all land inside it. Everything after the `;` is the human half.
         if verdict == "NO-CAPACITY":
-            nexts = sorted({GATE_NEXT_ACTION.get(ax, "wait") for ax in axes})
-            head += " bound=%s room=%s next=%s" % (
-                bound, room or "unreadable why=not_measured", " | ".join(nexts))
+            head += " next=%s bound=%s room=%s" % (
+                "+".join(sorted({GATE_NEXT_TOKEN.get(ax, "wait") for ax in axes})),
+                bound, room_brief(room))
+        elif verdict in VERDICT_NEXT_TOKEN:
+            head += " next=%s" % VERDICT_NEXT_TOKEN[verdict]
+        if verdict == "NO-CAPACITY":
+            head += "; " + " | ".join(sorted({GATE_NEXT_ACTION.get(ax, "wait") for ax in axes}))
         elif verdict == "UNDELIVERED":
-            head += (" next=repair the dispatch chain named on the line above -- this does NOT clear"
+            head += ("; repair the dispatch chain named on the line above -- this does NOT clear"
                      " by waiting")
         elif verdict == "REFUSED":
-            head += (" next=fix the worktree named on the line above (uncommitted work, or commits"
+            head += ("; fix the worktree named on the line above (uncommitted work, or commits"
                      " the PR head does not have) -- this does NOT clear by waiting")
         elif verdict == "REFUSING":
-            head += " next=restore the read (gh, the rate limit, TCC) and re-run"
+            head += "; restore the read (gh, the rate limit, TCC) and re-run"
         elif verdict == "SLOTS-FULL":
-            head += " next=none -- capacity is present and the queue is being served"
+            head += "; capacity is present and the queue is being served"
         log("dispatched %d of %d queued — %s" % (dispatched, queued, head + "; " + why))
         # ⛔ 2 AND 3 ARE DIFFERENT FACTS, so they get different codes: 2 = I could not read the
         # world (the PR list, the checks); 3 = I read it and the TRANSPORT would not take the order.
@@ -5034,7 +5084,13 @@ def run_pass(args, rubric_note: str = "") -> int:
         prev = st.get(key) or {}
         # GUARD: cooldown, and never re-dispatch while the last one may still be live
         if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
-            stalled["cooldown"] += 1
+            # ⛔ KEYED ON WHY THE COOLDOWN EXISTS (review P2, #2291): a row this doctor refused on
+            # durable grounds holds the same 45 minutes, but the pass is NOT "the queue is being
+            # served" -- nothing will move until a human fixes that worktree.
+            if prev.get("kind") == "refused":
+                stalled["refused-cooldown"] = stalled.get("refused-cooldown", 0) + 1
+            else:
+                stalled["cooldown"] += 1
             continue
         # ⛔ A LIVE WORKER IS IN FLIGHT, NOT A FREE SLOT -- REGARDLESS OF HEAD MOVEMENT. The
         # cooldown above is keyed on the head, so a worker that pushes re-arms dispatch at T+2min

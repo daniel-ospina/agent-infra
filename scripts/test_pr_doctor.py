@@ -3047,6 +3047,86 @@ def test_a_disk_refusal_names_the_PRUNE_remedy_and_not_wait(monkeypatch):
     assert "bound=disk=1" in joined, joined
 
 
+def test_the_remedy_survives_the_readers_110_char_cut(monkeypatch, tmp_path):
+    """⛔ A REMEDY PAST THE CUT IS A REMEDY NOBODY SEES (review P1, #2291).
+
+    `record_exit()`'s own contract is that the reason is a PREFIX because the readers cut the tail --
+    the tightest is `objective.pr_doctor_last_run`'s `[:110]`. Ordering the head
+    `VERDICT … bound … room … next` put `next=` at offset 203 with a REAL `capacity.sh probe` record,
+    so a full disk reached the beat as `WAITING (no capacity) … disk_free_mb=` -- "just wait", when
+    `spawn-gate.sh:1392` says *"This is NOT a load refusal: waiting does not clear it"*. The machine
+    fields therefore go FIRST and the prose after them.
+
+    The record here is the one measured on this box (164 chars), not a short fabrication: a 52-char
+    fixture fits any ordering and would pass while production stayed blind.
+    """
+    real = ("host=Daniels-MacBook-Air ncpu=8 load1=2158 lpc=269 lanes=5 disk_free_mb=70945 "
+            "mem_free_mb=1330 at=1793165198 procs=434 procs_max=1333 fork=1 src=uid")
+    assert len(real) > 110, "the fixture must be at least as long as the real probe record"
+    monkeypatch.setattr(pr, "box_room", lambda repo_dir="": real + " via=capacity.sh")
+    rc, _joined = _refused_pass(monkeypatch, "gate REFUSED rc=77 (disk)")
+    assert rc == 6
+    reason = json.loads(pathlib.Path(pr.STATUS).read_text())["reason"]
+    # What a reader acting on the beat must be able to see, inside ITS cut.
+    for must in ("VERDICT=NO-CAPACITY", "next=prune-disk", "bound=disk=1", "lpc=269"):
+        assert must in reason[:110], (must, reason[:110])
+    # …and the remedies that are NOT "wait" must never be readable as wait.
+    assert "next=wait" not in reason[:110], reason[:110]
+    # The reader itself, not a copy of its slicing rule.
+    sd = tmp_path / "state"
+    sd.mkdir()
+    (sd / "pr-doctor.status.json").write_text(json.dumps(
+        {"rc": 6, "verdict": "NO-CAPACITY", "reason": reason, "at_epoch": time.time()}))
+    beat = pr.CLASSIFIER.pr_doctor_last_run(str(sd))
+    assert "next=prune-disk" in beat, beat
+    # The VERBATIM record is still in the sidecar for whoever wants it: the brief form is a
+    # projection for the line, never a replacement for the measurement.
+    assert "src=uid" in json.loads(pathlib.Path(pr.STATUS).read_text())["room"]
+
+
+def test_a_refused_rows_own_cooldown_is_not_reported_as_the_queue_being_served(monkeypatch):
+    """⛔ THE SECOND PASS OF A REFUSAL IS THE SAME FACT, NOT A HEALTHY QUEUE (review P2, #2291).
+
+    A `kind: "refused"` row is written with `at_epoch: now()`, so the NEXT pass hit the plain
+    cooldown guard, `held > 0` selected SLOTS-FULL, and the pass reported *"capacity is present and
+    the queue is being served"* with rc 0 -- for work that is blocked until an operator fixes that
+    worktree, for the remaining ~45 minutes. `pr-repair-loop.sh` recorded it as `pass-complete`. That
+    is the refuse -> cooldown -> retry loop #2710 counts, re-labelled as served.
+    """
+    pr_now = pr.now()
+    row = {"1": {"head": "a" * 40, "at_epoch": pr_now - 60, "kind": "refused",
+                 "action": "fix-ci"}}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(row))
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    joined = "\n".join(logs)
+    assert rc == pr.EXIT_UNDELIVERED == 3, joined
+    assert "VERDICT=REFUSED" in joined, joined
+    assert "next=fix-worktree" in joined, joined
+    assert "SLOTS-FULL" not in joined, joined
+    assert "the queue is being served" not in joined, joined
+    assert "refused-cooldown=1" in joined, joined
+    # CONTROL: a SPAWN cooldown on the same row is still SLOTS-FULL -- the split is narrow, and a
+    # worker that is genuinely in flight must not be reported as a blocked worktree.
+    row["1"]["kind"] = "fix"
+    monkeypatch.setattr(pr, "load_state", lambda: dict(row))
+    logs.clear()
+    rc = pr.main()
+    joined = "\n".join(logs)
+    assert rc == 0, joined
+    assert "VERDICT=SLOTS-FULL" in joined, joined
+    assert "SLOTS-FULL" not in joined.replace("VERDICT=SLOTS-FULL", ""), joined
+
+
 def test_the_capacity_seams_are_the_gates_own_numbers():
     """`GATE_REFUSAL_BOUND` may not invent a code or a name: it is the gate's table, re-read.
 
