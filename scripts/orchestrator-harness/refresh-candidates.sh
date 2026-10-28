@@ -3480,6 +3480,31 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
       }
     }'
 }
+# The surface SET an INCOMPLETE verdict names, read from the verdict line's own parenthetical.
+# ⛔ WHY THIS IS NOT A LITERAL PHRASE (agent-infra#2952 — measured on cell4, not hypothesised). The
+# consumer below matched the exact words `could not be queried (`; tortoise fa7b27b66 (2026-10-21,
+# #9423) inserted the word FULLY into that sentence, and from that commit the match returned NOTHING
+# for EVERY verdict — so the holder substitution became a silent no-op on every box, while every
+# fixture in this repo still carried the OLD wording and so no check could see it. The adverb is the
+# producer's PROSE; the CONTRACT is only "the verdict line names the unreadable surfaces in ONE
+# parenthetical that follows a `queried (`". So the anchor is `queried (`, the adverb is skipped,
+# and the LEFTMOST match wins: `awk`'s index() takes the first, whereas `s/.*queried \(…\)/\1/` takes
+# the LAST — and the remedy that follows the parenthetical on the SAME line can contain one too,
+# which would silently read the WRONG surface set. A verdict line with no such parenthetical yields
+# NOTHING, never a guess: the caller refuses, and its drift echo names the cause rather than leaving
+# the box at `0 dispatched` with no reason printed.
+preflight_incomplete_surfaces() {   # <preflight output> -> the verdict line's surface list, verbatim
+  printf '%s\n' "$1" | awk '
+    seen { next }
+    index($0, "VERDICT: INCOMPLETE (exit 2)") == 1 {
+      p = index($0, "queried (")
+      if (!p) next
+      s = substr($0, p + 9)
+      e = index(s, ")")   # the list ends at the FIRST closing paren (no surface name has one)
+      if (e) s = substr(s, 1, e - 1)
+      print s; seen = 1
+    }'
+}
 # ── WHY THE WALK STOPPED (agent-infra#2183) ─────────────────────────────────────────────────────
 # `not_reached` is DERIVED (listed - the skip buckets - judged), so until now the largest bucket on a
 # starved cell carried NO measured cause at all and orch-loop.sh rendered it as `N not reached
@@ -3731,7 +3756,11 @@ while read -r N; do
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
   # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer prints the
   # `ALSO INCOMPLETE:` marker beside a COLLISION or a LANDED answer (an INCOMPLETE verdict IS the
-  # degraded reading and prints "N surface(s) could not be queried" with no marker), and
+  # degraded reading and prints its `surface(s) could not be … queried (…)` list with no marker), and
+  # ⛔ THAT ADVERB IS THE PRODUCER'S PROSE, NOT THE CONTRACT (#2952). tortoise `fa7b27b66` (#9423) made
+  # it `could not be FULLY queried`, and the arm that keyed on the old exact phrase was a silent no-op
+  # for six days; a precise quotation here is the same trap seeded for the next reader, so no arm of
+  # this pass may be written against one.
   # `resolve_preflight` prefers the repo's OWN copy, so a VENDORED producer could pair it with CLEAN and
   # reproduce the healthy-looking reading this pass exists to refuse (#1853 review). LANDED is exempt:
   # the producer's contract makes a terminal signal decisive over an incomplete one.
@@ -3777,9 +3806,11 @@ while read -r N; do
   # requirement moves from "a local board must be readable" to "the cross-box registry must answer",
   # and the CLEAN arm below is what READS it: a live claim is a COLLISION, an unreadable registry is
   # INCOMPLETE, and an ABSENT registry is INCOMPLETE when the holder answer depends on it (the
-  # HOLDER_BY_CLAIMS branch). "Cannot determine" is never CLEAN. Only the case where the holder
-  # surface is the SOLE unreadable one is re-routed: any other incomplete surface (gh down, open PRs
-  # unreadable) keeps the refusal, because there the tool could not judge the WORK itself.
+  # HOLDER_BY_CLAIMS branch). "Cannot determine" is never CLEAN. Only surfaces whose OWN cause is the
+  # unanswerable board are re-routed: a surface that is unreadable for its own reason (gh down, an
+  # issue state the tool cannot interpret, open PRs uncountable) keeps the refusal, because there the
+  # tool could not judge the WORK itself. See the CAUSE-SET arm below for why the condition is the
+  # cause and not the surface count (agent-infra#2952).
   HOLDER_BY_CLAIMS=0
   if [ "$V" = INCOMPLETE ] && [ "$degraded" -eq 0 ] && [ "$PRE_RC" -eq 2 ]; then
     # ⛔ THE SURFACE SET COMES FROM THE VERDICT LINE, NOT FROM THE REPORT BODY (cycle-2 review, F2).
@@ -3790,13 +3821,61 @@ while read -r N; do
     # (`collision_preflight.py` scan_issue_surface), which can carry a newline — and the failure mode
     # if either assumption slips is a fail-OPEN: the count reads 1, the note matches, and a candidate
     # with a SECOND unreadable surface is queued as verified. The verdict line already states the
-    # complete answer the tool is giving, so read the answer instead of re-deriving it: everything
-    # after `could not be queried (` up to the closing paren, and require it to be EXACTLY the holder.
-    inc_verdict="$(printf '%s\n' "$PRE" | sed -nE 's/^VERDICT: INCOMPLETE \(exit 2\).*could not be queried \(([^)]*)\).*/\1/p' | head -1)"
-    case "$inc_verdict" in
-      "issue assignee/holder") HOLDER_ONLY=1 ;;
-      *) HOLDER_ONLY=0 ;;
-    esac
+    # complete answer the tool is giving, so read the answer instead of re-deriving it. THE PHRASE
+    # IS NOT PART OF THE ANSWER (agent-infra#2952): the list is taken by
+    # `preflight_incomplete_surfaces`, which anchors on `queried (` and not on the adverb the
+    # producer happens to put in front of it — that literal was what made this whole arm a silent
+    # no-op for six days once tortoise#9423 reworded it to `could not be FULLY queried (`.
+    inc_verdict="$(preflight_incomplete_surfaces "$PRE")"
+    # ⛔ THE SUBSTITUTION IS KEYED ON THE CAUSE SET, NEVER ON THE SURFACE COUNT (agent-infra#2952 —
+    # measured on cell4, and the reason the #1935 arm could never fire there). #1935 required the
+    # verdict line to name the holder surface ALONE. A cell names it TWICE ('issue landed, issue
+    # assignee/holder') because the claim gate ABORTS the whole issue scan: one surface's inability is
+    # recorded as another surface's unreadability, both carrying the SAME note. So the count read 2,
+    # `HOLDER_ONLY` stayed 0, and the box spent its entire pre-flight budget refusing candidates it
+    # could have judged — `12 unjudged`, `227 not reached`, `0 dispatched`, every pass.
+    #
+    # The condition that is actually load-bearing is the CAUSE, not the population: a surface whose
+    # ONLY failure is 'the local board could not answer' is asking the one question the cross-box
+    # claims registry exists to answer, so the substitution answers it once for the whole set. The
+    # surface NAME is still required (the holder must be named, or there is nothing to substitute),
+    # and a surface carrying ANY other cause keeps the refusal — that is the `issue landed` whose own
+    # state is uninterpretable, or an unreadable `gh`, and those are the tool failing to judge the
+    # WORK, which no registry can repair.
+    #
+    # ⛔ THE SURFACE IS MATCHED AGAINST THE PARSED ROW SET, SO AN UNPARSED SURFACE FAILS CLOSED. A name
+    # the verdict line states but `preflight_unusable_surfaces` cannot read has no cause at all, and
+    # 'no cause' must never satisfy 'every cause is the board' — that is the fail-OPEN this arm is
+    # shaped to refuse, not a parser tolerance to add later.
+    HOLDER_ONLY=0
+    if [ -n "$inc_verdict" ]; then
+      # The verdict line's list is comma-separated; a surface name never contains a comma.
+      inc_named="$(printf '%s\n' "$inc_verdict" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$')" || inc_named=""
+      inc_board="$(preflight_unusable_surfaces "$PRE" 2>/dev/null | awk -F'\t' '$2 ~ /^claim gate: the FLEET BOARD could not answer/ { print $1 }')"
+      inc_n=0; inc_has_holder=0; inc_all_board=1
+      while IFS= read -r inc_s; do
+        [ -n "$inc_s" ] || continue
+        inc_n=$((inc_n + 1))
+        [ "$inc_s" = "issue assignee/holder" ] && inc_has_holder=1
+        # ⛔ WHOLE-LINE (`-x`), NOT A SUBSTRING: `local branches` is not `remote branches`, and a
+        # substring test would let one surface's cause stand in for another's. A here-string, not a
+        # pipe — `printf | grep -q` is the SIGPIPE idiom refused repo-wide (#841/#864), and there a
+        # quiet grep reads FALSE on a large report, which HERE would refuse a legitimate re-route.
+        grep -qxF -- "$inc_s" <<<"$inc_board" || inc_all_board=0
+      done <<< "$inc_named"
+      if [ "$inc_n" -gt 0 ] && [ "$inc_has_holder" -eq 1 ] && [ "$inc_all_board" -eq 1 ]; then
+        HOLDER_ONLY=1
+      fi
+    fi
+    # ⛔ A SET THAT CANNOT BE READ IS ANNOUNCED, NOT SWALLOWED (agent-infra#2952). Failing CLOSED
+    # when the verdict line cannot be read is right, and it is what the arm above does — but it kept
+    # a provisioned cell at `0 dispatched` for six days with NOTHING naming the parse, and the
+    # pre-flight's own surface table looked exactly like a board that simply cannot answer. So when
+    # the BODY says holder-only-with-the-board's-own-cause and the VERDICT LINE nevertheless named
+    # nothing, say so: it is producer drift, and the next reader must not have to diff two repos.
+    if [ -z "$inc_verdict" ] && grep -qF 'claim gate: the FLEET BOARD could not answer' <<<"$PRE"; then
+      echo "[refresh] WARN: #$N the pre-flight's VERDICT LINE carried no readable surface list although its body names the holder surface unreadable — refusing the candidate rather than re-routing it (producer format drift, agent-infra#2952)"
+    fi
     # ⛔ …AND THE REPORT MAY NOT ALSO CARRY A BLOCKING HIT (cycle-2 review, F1 — a measured fail-OPEN).
     # The whole re-route rests on the producer's verdict ORDER (LANDED → COLLISION → INCOMPLETE), so an
     # INCOMPLETE verdict means "nothing blocking was found". The producer is NOT vendored with this
