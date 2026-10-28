@@ -179,17 +179,24 @@ copied=0; kept=0
 for e in "$SRC"/extensions/*; do
   base="$(basename "$e")"
   dest="$DEST/extensions/$base"
-  # ⛔ NEVER copy a test file into the live farm (#1509). pi's extension loader
-  # EXECUTES every `.ts` under $DEST/extensions, so a `*.test.ts` there is not a
-  # test — it is an extension that runs its suite at session start and whose
-  # stdout replaces the session's answer. Measured 2026-10-25: 12 test files were
-  # farmed by this loop, every dispatched child on the box answered with
+  # ⛔ NEVER copy a test file into the live farm (#1509/#2841). pi's extension loader
+  # EXECUTES a top-level `.ts` OR `.js` under $DEST/extensions
+  # (`dist/core/package-manager.js::collectAutoExtensionEntries`:
+  # `entry.name.endsWith(".ts") || entry.name.endsWith(".js")`; pi's
+  # `docs/extensions.md` says the same — "direct TypeScript or JavaScript files"), so
+  # such a file there is not a test — it is an extension that runs its suite at session
+  # start and whose stdout replaces the session's answer. Measured 2026-10-25: 12 test
+  # files were farmed by this loop, every dispatched child on the box answered with
   # `auto-sync.test.ts` output instead of a reply, and no log named the cause.
+  # THIS LIST IS THE LOADER'S SET, not a subset of it (#2841): the original guard matched
+  # `*.test.ts` only, so a `*.spec.ts` / `*.test.js` / `*.spec.js` — all EXECUTED by the
+  # same loader — was copied and its suite ran at every session start. `.tsx`, `.mts`
+  # and `.cjs` are deliberately absent: the loader does not load them.
   # This loop is COPY-ONLY (like the scripts farm), so skipping here is not
   # enough — a test copied by an earlier run stays until it is removed, and it
-  # stays EXECUTING. Remove both halves.
+  # stays EXECUTING. Remove both halves (see the sweep below).
   case "$base" in
-    *.test.ts)
+    *.test.ts|*.spec.ts|*.test.js|*.spec.js)
       if [ -e "$dest" ]; then
         rm -f "$dest" && echo "    removed test file from live farm: $base"
       fi
@@ -214,17 +221,31 @@ for e in "$SRC"/extensions/*; do
   fi
   copied=$((copied+1))
 done
-# ⛔ RECURSIVE sweep for test files in the live farm (#1509). The `case` in the loop
+# ⛔ RECURSIVE sweep for test files in the live farm (#1509/#2841). The `case` in the loop
 # above only guards TOP-LEVEL entries, and two paths escape it: (a) an entry that is a
 # directory is copied with `cp -R`, which brings any `*.test.ts` inside it
 # (`builtin-tools/`, `verification-gate/` both carry one), and (b) this loop is
 # COPY-ONLY, so a test farmed by an earlier run whose source has since left the repo is
 # never visited at all. Both are EXECUTED by pi's extension loader at session start,
 # so the sweep is the half that makes the farm safe, not the `case`.
+# The name set is the `case`'s set, on purpose: ONE definition of "a test file pi would
+# execute", used by the writer and by the gate (scripts/check-pi-config-extensions.sh
+# check 6). A name added to one and not the other is the fail-open #2841 measured.
+# ⛔ `node_modules` IS PRUNED, because it is not the farm's to sweep: the loader skips it
+# (`if (entry.name === "node_modules") continue`), check 6's nested arm skips it
+# (`grep -v '/node_modules/'`), and a `*.test.js` inside an installed dependency is a
+# THIRD-PARTY file `npm install` put there — npm does not re-extract an already-installed
+# package, so deleting it corrupts the tree for good. Measured 2026-10-28 on this box:
+# 169 of the farm's 232 name-matching files sit under `/node_modules/`. Widening the set
+# without the prune grew a pre-existing over-delete by 10 files (`*.test.js` 9,
+# `*.spec.js` 1); the prune removes the whole class instead of only the newly-added names.
+# NB the sweep does NOT follow symlinked farm directories (`find` without `-L` does not
+# descend into them), which is what keeps a symlink-farmed machine from having its own
+# checkout's tracked test files deleted through the link.
 while IFS= read -r tf; do
   [ -n "$tf" ] || continue
   rm -f "$tf" && echo "    removed test file from live farm: ${tf#"$DEST/extensions/"}"
-done <<< "$(find "$DEST/extensions" -type f -name '*.test.ts' 2>/dev/null)"
+done <<< "$(find "$DEST/extensions" -type d -name node_modules -prune -o -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) -print 2>/dev/null)"
 
 echo "    extensions: $copied refreshed, $kept farm symlinks kept"
 

@@ -508,15 +508,19 @@ freshness; refuse rather than place blind.
 **ALIVE vs REFUSING vs IDLE.** ALIVE = `place=<host> lpc=… evaluated=N eligible=M`; **REFUSING =
 `refuse bound=<the dominant bound> detail=… evaluated=N eligible=0`** with the bound named
 (`fork_headroom`/`fork_probe`/**`fork_unknown`**/`disk`/`load_per_cpu`/`memory`/`probe_stale`/
-`probe_unreadable`/`no_probe`, plus `usage` on the exit-2 arms), exit **1** (*"a REFUSAL IS NOT A FAILURE, it is the answer"*); IDLE does not apply.
+`probe_unreadable`/`no_probe`/**`box_unknown`**/**`identity_collision`**, plus `usage` on the exit-2 arms), exit **1** (*"a REFUSAL IS NOT A FAILURE, it is the answer"*); IDLE does not apply.
 Exit **2 = "cannot answer"** — and that is MORE than the transport: the sub-cases are an unreadable fleet
 channel (`cap_read_fleet`), `refuse bound=usage detail=no-self-host|clock-unreadable` on a `place` call,
 `probe=unreadable` on a `probe`, and an unknown verb. ⛔ Read the reason line before deciding which: a
 `bound=usage` on `place` is a caller defect, not a git fault — the same "shared code, read the reason"
 rule as `harness-refresh.sh`'s 23 (§3.12). Exit 254 = the probe itself could not fork (a *reading*, not a
 crash).
-The fleet channel is `refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`
-on the queue repo's origin, read with one `git ls-remote --refs`.
+The fleet channel is keyed by **(host, boxid)** — full shape
+`refs/boxes/<host>/<boxid>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>-<boot>` — on the
+queue repo's origin, read with one `git ls-remote --refs`. `boxid` is the per-box identity (§ below); a
+pre-#2707 two-segment ref decodes as `box_unknown` and is refused, never silently dropped. A box's ref is
+deletable only by the box that a LOCAL authorship ledger (`CAP_STATE_DIR`, default `${TMPDIR:-/tmp}/pi-capacity`, ring-bounded at `CAP_LEDGER_KEEP=32`; one filesystem
+per box) proves wrote it, or once it is STALE — never because it merely shares a key with the pruner.
 
 ⛔ **MEASURED DEFECT (2026-10-24, this box) — the fleet view collapses to ONE box.**
 `cap_host` defaults to `hostname -s`, and **two boxes demonstrably share the hostname `cmux`**: cell-4
@@ -546,12 +550,35 @@ it inert — wrong, and corrected in review round 1: `capacity.sh` alone does no
 same thing.
 
 **What repairs it.** `bound=disk` → prune; `bound=memory` → find the leak; `bound=load_per_cpu` → the
-fleet needs a box; `bound=fork_*` → external restart; `probe_unreadable` → the instrument, not the box.
+fleet needs a box; `bound=fork_*` → external restart; `probe_unreadable` → the instrument, not the box;
+`identity_collision` → two boxes publish under ONE key: fix the deployment's identity (a pinned
+`CAP_BOXID` on two boxes, a shared private IP, an image-cloned id) — and do NOT "unstick" placement,
+because the fleet cannot name the box it would place on. One benign cause has the same shape and no fix
+needed: a box whose OWN pre-reboot ref is still under its key (a recreated cell, or a `TMPDIR` that did not
+survive) — it clears on that ref going stale (≤ `CAP_PROBE_TTL`), or by deleting that one ref.
+`box_unknown` → the ref names no box: a pre-#2707 box (upgrade it), or a box with no derivable identity —
+which is also not placeable BY ITSELF, so pin `CAP_BOXID` on it rather than leaving it nameless.
 For the identity defect: a per-box identity (`C3`), not a wider ceiling.
+
+**✅ REPAIRED 2026-10-28 (#2707).** The identity is derived from the box's own network identity (Darwin:
+`kern.uuid`; Linux: the routable IPv4 — the only two sources MEASURED to differ across the cells;
+`/etc/machine-id` and `/proc/…/boot_id` are measured IDENTICAL on all three, so machine-id is deliberately
+NOT a fallback — a box with no derivable identity refuses to publish rather than inventing one). The
+channel is keyed `refs/boxes/<host>/<boxid>/…`, so three `cmux` boxes hold three keys, and `cap_publish`
+prunes only refs its local ledger proves it wrote plus STALE ones. `foreign=` reports a second writer under
+this box's key, and the reader marks such a record `collide=1`, which `cap_place` refuses on
+(`bound=identity_collision`) instead of picking the newest. Residual, stated: two boxes sharing key AND
+`ncpu` AND a `boot` reading that is equal *or unreadable* carry no distinguishing fact in the channel, so the reader keeps the newest of that key —
+neither box destroys the other's record any more, and the identity sources are restricted to the
+measured-unique ones so that case is not reachable by the cloned-image path. Rollout: a box still on the
+old tree prunes host-wide with no authorship test and will delete upgraded peers' records — upgrade a
+whole hostname group together.
 
 **state.** cell-4: `lpc=66` (0.66×) eligible, published every cycle; cell-3: publishing (inferred);
 Mac: published at **14:36:29Z**, `ncpu=8 load1=514 lanes=0 disk_free=39881MB mem_free=997MB` (6-slot
-legacy form ⇒ `fork_unknown` ⇒ **ineligible** to a peer on current code).
+legacy form, no `boxid` ⇒ **ineligible** to a peer on current code: it is now ~34 h old so the bound that
+names it is `probe_stale` — age is checked before identity — and once a fresh record carries no `boxid` the
+bound is `box_unknown`, which is the one that survives self-healing).
 
 ### 3.11 Claims — `claims.sh` (+ `claim-reaper.sh`)
 

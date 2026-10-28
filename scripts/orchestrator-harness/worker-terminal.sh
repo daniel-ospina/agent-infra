@@ -1340,7 +1340,11 @@ EOF
       # RECORD — a wiped $O/state, an older harness, a hand-start — was invisible here, so the census
       # under-counted it and the cap it feeds was softer than it claimed. Pre-existing, and more
       # load-bearing now that tmux is the only surface on a cell.
-      case "$name" in lane-*|merge-*|fix-*|chain-*) ;; *) continue ;; esac
+      # ⛔ `review-*` IS IN THIS LIST TOO (agent-infra#2971): the controller now dispatches a review
+      # ORDER under that tag instead of reusing `merge-<PR>`, and a session with no RECORD of its own
+      # (a wiped $O/state, a hand start) is invisible here — which would silently UNDER-count the
+      # review ceiling this census feeds, making the cap softer than it claims.
+      case "$name" in lane-*|merge-*|review-*|fix-*|chain-*) ;; *) continue ;; esac
       case "$name" in *[!A-Za-z0-9-]*) continue ;; esac
       # ⛔ IN-SHELL MEMBERSHIP, not `printf | awk` per line: a listing that STREAMS (the
       # cloud-cell-supervisor fixture streams 60k lines to prove no SIGPIPE fail-open) made this loop
