@@ -1,0 +1,13 @@
+# The pair to pr-workflow-ws-a: a DIFFERENT workflow name, so the resolved groups differ and the two
+# do not cancel each other (#2660 round 5).
+name: beta workflow
+on:
+  pull_request:
+concurrency:
+  group: ${{  github.workflow  }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
