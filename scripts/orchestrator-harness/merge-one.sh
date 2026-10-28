@@ -44,6 +44,7 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 # ⛔ EXPORTED for the same reason as lane.sh: the SPAWN POINT is a child process (#1884).
 KIND=reviewer; TAG="$PR"; export KIND TAG
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -54,7 +55,15 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
 if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
 if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
-export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+# ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
+# ⛔ A REVIEWER STILL NEEDS THE GATES OFF? No: the reviewer is the thing that SATISFIES them. It
+# commits nothing and merges through `admin-merge.sh` (a shell rail that reads the head-bound record),
+# so it does not need — and must not silently inherit — a permanent bypass.
+. "$SELF/gate-policy.sh" 2>/dev/null || { echo "[merge $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a lander that cannot say whether its gates are on" >&2; exit 78; }
+apply_gate_policy merge-one
+# ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
+# checkout, not a review bypass, and #2319 does not rule on it.
+export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless reviewer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
@@ -94,13 +103,55 @@ elif [ -f "$_M1_HERE/rail-refusal.sh" ]; then . "$_M1_HERE/rail-refusal.sh"
 else echo "[merge $PR] ⚠️ rail-refusal.sh not found (looked in $O and ${_M1_HERE:-<unresolved>}) — a rail refusal will NOT be recorded, so no red-fixer can be spawned from it" >> "$L.log"; fi
 command -v rail_refusal_record >/dev/null 2>&1 || echo "[merge $PR] ⚠️ rail-refusal.sh is stale/partial (no rail_refusal_record) — a rail refusal will NOT be recorded" >> "$L.log"
 
+# ── the RESEARCH contract for the reviewer's brief (#2258) ───────────────────────────────────────
+# This file carries its OWN `run_agent` (see its header), so it also carries its own gate — the SAME
+# validator, resolved from the SAME two homes as every other shared module here (`$O` is what the
+# daemon executes; the directory is the fallback for a box whose $O predates this change). The rules
+# are NOT re-implemented here: this is one `bash brief-gate.sh` call, and the section it splices is
+# the same canonical text every other caller splices.
+#
+# ⛔ WHY THE REVIEWER NEEDS IT TOO, even though a review looks like the opposite of a research pass:
+# both measured defects would have passed a reviewer that only checked the diff. A reviewer told to
+# judge a change against a PREMISE, without first reading the tracker's record of that premise,
+# approves a well-formed diff of the wrong work. The CONTRADICTION TEST line is the same question the
+# adoption rule already asks, asked at the one moment the answer is still cheap.
+brief_gate_sh=""
+for _bg in "$O/brief-gate.sh" "$_M1_HERE/brief-gate.sh" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh" "${HOME:-}/.pi/agent/scripts/brief-gate.sh"; do
+  [ -n "$_bg" ] && [ -f "$_bg" ] && { brief_gate_sh="$_bg"; break; }
+done
+if [ -z "$brief_gate_sh" ]; then
+  echo "[merge $PR] FATAL: brief-gate.sh not found (looked in $O, ${_M1_HERE:-<unresolved>}, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — refusing to pay for a review whose brief nothing validated (#2258)" >> "$L.log"
+  echo "[merge $PR] FATAL: brief-gate.sh missing — no reviewer started" >&2
+  exit 78
+fi
+REVIEW_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section reviewer)" || {
+  echo "[merge $PR] FATAL: brief-gate.sh --section reviewer failed — refusing to pay for a review whose brief omits the research contract (#2258)" >> "$L.log"
+  exit 78; }
+
 # Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
 # model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
 # silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
 # agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
 # reaper in orch-loop.sh is the second line of defence.
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed bgrc
+  AGENT_STARTED=0
+  # ── THE BRIEF GATE (#2258), first and fail-closed, for the reason spawn-gate.sh gives: a brief
+  # refusal is DETERMINISTIC (it will not clear by waiting, and it follows the item to any box), so
+  # reporting it after a load/disk reading would send the operator to fix the wrong thing. This file
+  # has no load gate of its own (the installed `pi` shim is its load gate), so this is the one gate
+  # it owns — and it is the only gate on the FIRST-REVIEW path for every own-lane PR.
+  bash "$brief_gate_sh" --check "$prompt" reviewer >> "$log" 2>&1
+  bgrc=$?
+  if [ "$bgrc" != 0 ]; then
+    AGENT_STARTED=0
+    echo "[brief-gate] REFUSED reviewer for PR #$PR: the brief was not admitted (exit $bgrc) — no reviewer started, nothing consumed, NO verdict and NO needsfix marker. The brief is GENERATED here, so this is a HARNESS defect, not a capacity refusal." >> "$log"
+    return "$bgrc"
+  fi
+  # `AGENT_STARTED` is the harness's authoritative "an agent ran" flag (spawn-gate.sh sets it for the
+  # same reason): a caller must be able to tell a refusal apart from a reviewer that ran and produced
+  # nothing, and `pi` shares the 0-255 status namespace with the gate codes.
+  AGENT_STARTED=1
   start="$(date +%s)"
   # ⛔ THE SAME RESOLVED MODEL AS spawn-gate.sh's `run_agent` (agent-infra#2208, review P1). This is a
   # SECOND `run_agent` — the `chain-<N>` first-review spawn for every own-lane PR, i.e. the highest-
@@ -281,13 +332,31 @@ if [ -f "$O/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "$O/claims.sh"
   # The lease must OUTLIVE a worst-case review, or another box takes over mid-review and we get
-  # the duplicate work this exists to prevent: REVIEW_TIMEOUT (default 1800) + the 30x30s gate
-  # wait below (900) + the merge itself. Derived, not a bare constant — and passed explicitly,
+  # the duplicate work this exists to prevent: REVIEW_TIMEOUT (default 1800) + the gate wait
+  # below (GATE_POLL_TRIES x GATE_POLL_SECS = 30 x 30s = 900 by default) + the merge itself. Derived, not a bare constant — and passed explicitly,
   # because sourcing claims.sh above sets CLAIM_TTL=1800 and would silently win over a default.
   # Overflow-safe by construction: the guard above leaves REVIEW_TIMEOUT <= 999999999, so this sum
   # is < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site, so a future caller
   # that skips this guard still cannot mint a lease the reader is unable to parse.
-  CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + 1200 ))
+  # ⛔ SIZED FROM THE EFFECTIVE WAIT, NOT THE DEFAULT (review round 7 P2-3). The wait is a first-class
+  # tunable (`GATE_POLL_TRIES` x `GATE_POLL_SECS`), so a box running `GATE_POLL_SECS=60` has a 3600 s
+  # worst case — longer than the old fixed 3000 s lease, which would then expire mid-wait and let
+  # another box acquire the PR and run a DUPLICATE paid review (#1908, the duplicate this lease exists
+  # to prevent). Defaults are unchanged: 1800 + (30 x 30) + 300 = 3000.
+  # ⛔ `is_limit`, NOT A `case ''|*[!0-9]*` GUARD: that idiom (this file's own header names it) ACCEPTS
+  # a leading zero, and `$(( 08 * 30 ))` is an invalid octal — on bash 5 the assignment aborts the
+  # shell before CLAIM_LEASE exists (worker dead before the claim and before step 3); on bash 3.2 the
+  # failed assignment aborts the enclosing `if` body and resumes with status 0, silently skipping the
+  # cross-box claim. That is the P1 class `test-crossbox.sh` 4b/4c protects for REVIEW_TIMEOUT — and
+  # this face of it is new, so it is coerced the same way step 3 coerces: to the default.
+  if is_limit "${GATE_POLL_TRIES:-30}" && is_limit "${GATE_POLL_SECS:-30}"; then
+    _gw=$(( ${GATE_POLL_TRIES:-30} * ${GATE_POLL_SECS:-30} ))
+  else
+    _gw=900
+  fi
+  [ "$_gw" -ge 900 ] || _gw=900
+  [ "$_gw" -le 86400 ] || _gw=86400
+  CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))
 
   # ── the LANDING claim, FIRST (agent-infra#1952) ───────────────────────────────
   # ⛔ THIS IS THE FENCE THE HEAD KEY CANNOT PROVIDE. `claim_acquire` below is content-addressed on
@@ -392,7 +461,15 @@ fi
 # second worker for the same PR. Release first, drop the lock last. Both claims are released here:
 # the head claim that names what this worker reviewed, then the landing claim that names the PR
 # (#1952), so the coarser ref — the one every box needs to see free — is the LAST to be dropped.
-trap 'release_claim_bounded; release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
+# ⛔ AND ONE MORE THING RUNS AT EXIT: the review attempt's TERMINAL RECORD (agent-infra#2971). A
+# reviewer that spawns and then dies — killed at the cap, a TERM from the reaper, an exit that never
+# reaches the verdict arm — used to leave NOTHING behind: no marker, no counter, no reason. To the
+# controller that is indistinguishable from a reviewer that was never asked, so it re-dispatched, and
+# the pass after that did the same (`merge-10213` spawned, log stops, no CLEAN and no ISSUES — the
+# measured 2026-10-28 shape). `review_abandoned_record` writes the failed attempt and its reason
+# instead. It is registered on the trap that always runs, and it is named before the claims are
+# released so a hung release can never be what swallows it.
+trap 'review_abandoned_record; release_claim_bounded; release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
 
 # ── the repo's merge authority (agent-infra#1764) ─────────────────────────────
 # Resolved HERE, from branch protection, not assumed. On a repo that requires the review gate the
@@ -524,7 +601,22 @@ rail_attempt() {
   # this one's.
   _rf_off="$(wc -c < "$L.log" 2>/dev/null | tr -d ' ')"
   is_num "${_rf_off:-}" || _rf_off=0
-  if ( cd "$REPO" && bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
+  # ── THE HOLD-PROOF AT THE ACTION SITE (agent-infra#2867) ──
+  # The claim registry fences dispatch, not action: the rail (`admin-merge.sh`) merges with
+  # `--admin`, and nothing at the merge site verified that the lane that reached it still holds
+  # the claim for this PR at this head. So a dead harness whose claim was pruned — or a stale
+  # actor whose token a peer superseded — would still run the merge. The claim commit this worker
+  # pushed (CROSS_OWN, the fencing token) and the harness's claims.sh travel into the rail's
+  # environment; the rail refuses the merge unless `claim_action_proof` holds. An EMPTY token is
+  # deliberate: a lane that reached the rail without a head claim cannot prove ownership, and the
+  # rail refuses it (the merge is the one operation that cannot tolerate at-least-once, #1908).
+  # ⛔ The token is the HEAD claim's commit, not the landing claim's: the head key is the one that
+  # binds evidence to the sha being merged (the landing `pr-<N>` key carries no head).
+  if ( cd "$REPO" && \
+       CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}" \
+       CLAIM_ACTION_CLAIMS_SH="$O/claims.sh" \
+       CLAIM_ACTION_REPO="$REPO" \
+       bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
     echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"
     touch "$O/state/merged-$PR.done"
     # A refusal for an older head must not outlive the merge that superseded it.
@@ -707,6 +799,8 @@ fi
 # removes the cause; that commit is NOT ported here yet. Until it is, this bound is what protects the
 # box, and it stays as defence in depth afterwards — do NOT drop it in a re-port from tortoise.
 cat > "$L-reviewer.txt" <<EOF
+$REVIEW_RESEARCH_BRIEF
+
 You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Report only — do not fix code.
     cd $REPO && git fetch origin main --quiet
     gh pr view $PR --repo $OR --json title,body,files
@@ -730,6 +824,11 @@ Your comment MUST state the outcome plainly and MUST NOT contain an unresolved a
     ISSUES <n>
 Do NOT modify code, commit, or merge.
 EOF
+# ⛔ THE ATTEMPT IS MARKED IN FLIGHT BEFORE THE REVIEWER STARTS (agent-infra#2971). Everything
+# below this line can end the process without a verdict — the cap kill, a TERM from the reaper, an
+# `exit` on a path this file has not foreseen — and `review_abandoned_record` (EXIT trap) is what
+# turns each of those into a COUNTED failed attempt with its reason instead of a log that just stops.
+REV_STARTED=1
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
 AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
@@ -741,8 +840,27 @@ AGENT_RC=$?
 # AGENT_LOAD_REFUSED code, and the controller re-dispatches when the box quietens (75 is what
 # adopt-fix/chain-merge already propagate for this).
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
+  # ⛔ REV_STARTED GOES BACK TO 0: NO REVIEWER RAN (agent-infra#2971). The in-flight mark above is for
+  # an attempt that STARTED; a refusal at the spawn point is not an attempt, and the EXIT recorder
+  # would otherwise spend one of MAX_REVIEW_TRIES for a review this box never ran — the exact
+  # over-blocking this arm exists to refuse.
+  REV_STARTED=0
   echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO marker written (a needsfix marker would authorise a fixer and a needsreview marker would spend one of MAX_REVIEW_TRIES for a review that never started); re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
   exit 75
+fi
+# ⛔ THE BRIEF REFUSAL IS ITS OWN ARM (#2258), and it must NOT reach the verdict classifier. The
+# reviewer's brief is GENERATED by this file, so a refusal here means the splice lost the research
+# block or `brief-gate.sh` drifted — a HARNESS defect. Classified as a verdict-less review it would be
+# indistinguishable from a reviewer that produced nothing, and the loop would re-dispatch the same
+# broken brief until MAX_FIX_TRIES parked a PR that was never reviewed (the #1716/#1720 class). Exit
+# 80 names it: no agent ran, no verdict, no marker, and nothing to re-dispatch until the brief's own
+# build is fixed.
+if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
+  # Same reason as the load-gate arm above: no agent ran, so the EXIT recorder must stay inert.
+  REV_STARTED=0
+  echo "[merge $PR] reviewer NOT started (BRIEF gate) — no verdict, NO needsfix marker; the reviewer brief failed brief-gate.sh, which is a harness defect: fix the brief's build, not the PR" >> "$L.log"
+  echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
+  exit 80
 fi
 # ⛔ THE EXTRACTOR MUST ADMIT THE SAME SEPARATORS THE CLASSIFIER DOES (review round 8, P2). The
 # pattern required a SPACE after the token, so a reviewer whose final line was `ISSUES: 3` produced an
@@ -797,6 +915,79 @@ verdict_class() {
   esac
 }
 
+# [revbudget:begin]
+# ── ONE (PR, HEAD) REVIEW BUDGET, SHARED WITH THE CONTROLLER (agent-infra#2971) ────────────────
+# `state/reviewdisp-<PR>` = "<head> <n>". It is the SAME record `orch-loop.sh`'s [reviewdisp] block
+# keeps: the controller writes it when it dispatches a review ORDER for a (PR, head), and this file
+# spends it when a reviewer run produces nothing usable. Two arms, ONE book — before this the
+# controller's dispatch budget and this file's retry budget were separate files
+# (`reviewdisp-<PR>` / `reviewcount-<PR>`), so "we already tried review twice at this head" was
+# visible to neither: the controller could dispatch against a head this file had already given up on,
+# and this file could re-open a head the controller had parked.
+# ⛔ NO DOUBLE COUNT. A controller dispatch already spends the attempt (`REV_PAID=1` travels in the
+# spawn command). Only a path with NOBODY counting above it — `chain-<N>`, `fix-one.sh`, a hand run —
+# spends on this side. Counting both would halve a budget that was already measured as tight, which
+# is over-blocking dressed as safety.
+rev_budget_file() { printf '%s/state/reviewdisp-%s\n' "$O" "$PR"; }
+rev_budget_read() { # -> "<head> <n>" (n is coerced: it feeds -ge and $(( + 1 )))
+  local f h="" n=0
+  f="$(rev_budget_file)"
+  if [ -f "$f" ]; then read -r h n < "$f" 2>/dev/null || true; fi
+  is_limit "${n:-}" || n=0
+  printf '%s %s\n' "${h:-}" "$n"
+}
+rev_budget_spend() { # -> "<n> already|spent|unwritable"; rc 1 when the write failed
+  local rec now_h="" n=0
+  rec="$(rev_budget_read)"; n="${rec##* }"; now_h="${rec% *}"
+  [ "${now_h:-}" = "${HEAD:-}" ] || n=0
+  if [ "${REV_PAID:-0}" = "1" ]; then printf '%s already\n' "$n"; return 0; fi
+  n=$(( n + 1 ))
+  # ⛔ THE WRITE MUST BE ABLE TO FAIL LOUDLY. A `|| true` here would make the bound best-effort: the
+  # count would read 0 for ever and this file would buy a fresh PAID review every cycle with no cap
+  # ever reached and no line saying the record failed — the same class orch-loop.sh's [reviewdisp]
+  # block refuses at its own write.
+  printf '%s %s\n' "${HEAD:-}" "$n" > "$(rev_budget_file)" 2>/dev/null \
+    || { printf '%s unwritable\n' "$n"; return 1; }
+  printf '%s spent\n' "$n"
+}
+# [revbudget:end]
+
+# review_abandoned_record — the EXIT recorder for a review attempt that ended with NO verdict
+# (agent-infra#2971, requirement 3). Fires from the EXIT trap, so TERM/INT/`exit N`/an unexpected
+# death after the reviewer started all reach it; it is INERT unless this process actually ran a
+# reviewer (`REV_STARTED`) and never wrote a terminal record for it (`REV_RECORDED`), and it refuses
+# when the run DID produce a verdict — a CLEAN that failed to RECORD is its own failure, already
+# named by the park paths, and calling it "no verdict" would be a false statement in the reason a
+# human reads. Without this, `merge-10213`'s log simply stopped at 23:30 and nothing counted it.
+review_abandoned_record() {
+  local rc=$? cls spent n mode why
+  [ "${REV_STARTED:-0}" = "1" ] || return 0
+  [ "${REV_RECORDED:-0}" = "1" ] && return 0
+  [ -n "${HEAD:-}" ] || return 0
+  cls="$(verdict_class "${LAST:-}")"
+  [ "$cls" = "NO-VERDICT" ] || return 0
+  why="the reviewer run ENDED WITHOUT a CLEAN/ISSUES marker (exit rc=$rc, last line [${LAST:-<none>}]) — counted as a failed attempt, never as silence"
+  spent="$(rev_budget_spend)" || mode=unwritable
+  n="${spent%% *}"; mode="${spent##* }"
+  is_limit "${n:-}" || n=0
+  MAX_REVIEW_TRIES="${MAX_REVIEW_TRIES:-3}"
+  is_limit "$MAX_REVIEW_TRIES" || MAX_REVIEW_TRIES=3
+  if [ "${mode:-}" = "unwritable" ]; then
+    echo "[merge $PR] $why, but $(rev_budget_file) CANNOT BE WRITTEN — the (PR,head) review cap cannot be kept, so this head is PARKED rather than re-reviewed (a counter that cannot be written is not a bound)" >> "$L.log"
+    park "$why. state/reviewdisp-$PR could not be written, so MAX_REVIEW_TRIES cannot bound this head: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    return 0
+  fi
+  if [ "$n" -ge "$MAX_REVIEW_TRIES" ]; then
+    echo "[merge $PR] NEEDS-REVIEW: $why — review attempts at head=$HEAD are EXHAUSTED ${n}/${MAX_REVIEW_TRIES}, PARKED" >> "$L.log"
+    park "$why. Review attempts at head=$HEAD are exhausted (${n}/${MAX_REVIEW_TRIES}, counted once across the controller's dispatch and this run), so nothing was reviewed here and no signed marker can be minted. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewdisp-$PR'"
+    rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+    return 0
+  fi
+  touch "$O/state/needsreview-$PR-$HEAD" 2>/dev/null || echo "[merge $PR] $why, and needsreview-$PR-$HEAD WAS NOT WRITTEN (the controller reads this head as NEEDS-REVIEW by ABSENCE, so the remedy is unchanged; report.sh under-counts it)" >> "$L.log"
+  echo "[merge $PR] NEEDS-REVIEW: $why — attempt ${n}/${MAX_REVIEW_TRIES} spent at this head; the remedy is another REVIEW" >> "$L.log"
+  return 0
+}
+
 # review_state_record <class> — write the state marker the CONTROLLER acts on, at $HEAD.
 # ⛔ NO-VERDICT IS BOUNDED AND KEYED ON THE HEAD. A reviewer that never returns a verdict must not
 # buy an unbounded succession of PAID reviews (the #1717 class, one input over): MAX_REVIEW_TRIES
@@ -804,7 +995,7 @@ verdict_class() {
 # marker can be minted and no fixer can help — and a new push re-arms it. The count is per HEAD, the
 # same shape fixcount uses, so a push never inherits the previous head's attempts.
 review_state_record() {
-  local cls="${1:-}" rc_f="$O/state/reviewcount-$PR" rc_h="" rc_n=0
+  local cls="${1:-}" rc_n=0 _spent="" _spmode=""
   [ -n "${HEAD:-}" ] || return 0
   # ⛔ ONE MARKER PER PR, NOT PER (PR, HEAD) (review round 1, P2). An older head's stale-evidence
   # marker is not a fact about THIS head, and nothing swept it: the controller writes one on every red
@@ -818,7 +1009,7 @@ review_state_record() {
       # `needsfix-*`, so a PR that collected findings at five heads kept five markers for its whole
       # life (inert — both readers are head-keyed — but the docs claim they are replaced, and a state
       # directory that accumulates is how an operator stops trusting it).
-      rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* 2>/dev/null || true
+      rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* "$O/state/reviewdisp-$PR" "$O/state/reviewcount-$PR" 2>/dev/null || true
       # ⛔ AND A FAILED MARKER WRITE IS REPORTED AS WHAT IT IS (kept from main's #8602 port): the
       # controller decides with a FILE TEST (`[ -f $O/state/needsfix-<PR>-<head> ]`), so a marker that
       # did not land sends the PR to the RE-RECORD arm — a fresh review — and never to a fixer. A log
@@ -834,7 +1025,10 @@ review_state_record() {
       # restarts the count. Without this, N-1 timeouts before a findings verdict still parked the head
       # on the next timeout, with a reason claiming "a fixer has no findings to act on" at a head that
       # HAD findings (and, after a verified CLEAN, claiming nothing was reviewed at all).
-      rm -f "$O/state/reviewcount-$PR" 2>/dev/null || true
+      # ⛔ AND THE SHARED REVIEW BUDGET, ON THE SAME ARGUMENT (agent-infra#2971): a usable verdict —
+      # findings here, a verified CLEAN in review_state_clear — is what re-arms the count, because the
+      # count bounds CONSECUTIVE verdict-less attempts at a head.
+      rm -f "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" 2>/dev/null || true
       return 0 ;;
     NO-VERDICT)
       # ⛔ A VERDICT-LESS RUN DOES NOT SUPERSEDE A FINDINGS VERDICT AT THE SAME HEAD (review round 6,
@@ -850,12 +1044,18 @@ review_state_record() {
       fi
       MAX_REVIEW_TRIES="${MAX_REVIEW_TRIES:-3}"
       is_limit "$MAX_REVIEW_TRIES" || MAX_REVIEW_TRIES=3
-      if [ -f "$rc_f" ]; then read -r rc_h rc_n < "$rc_f" 2>/dev/null || true; fi
-      # is_limit, not is_num (the same reason rail_attempt gives): the value feeds `-ge` and `$(( + 1 ))`.
+      # ⛔ THE COUNT IS THE SHARED (PR, HEAD) RECORD, NOT A PRIVATE ONE ([revbudget] above). The
+      # controller's dispatch and this run are the same book, so the number in the reason below is the
+      # number the controller's own REVIEW-CAP will read.
+      _spent="$(rev_budget_spend)"; _spmode="${_spent##* }"; rc_n="${_spent%% *}"
       is_limit "${rc_n:-}" || rc_n=0
-      [ "${rc_h:-}" = "$HEAD" ] || rc_n=0
-      rc_n=$(( rc_n + 1 ))
-      printf '%s %s\n' "$HEAD" "$rc_n" > "$rc_f" 2>/dev/null || true
+      if [ "${_spmode:-}" = "unwritable" ]; then
+        # A counter that cannot be written is not a bound. Say so and stop, rather than re-buy.
+        park "the reviewer produced NO usable verdict at head=$HEAD (last line was [${LAST:-<empty>}]), and $(rev_budget_file) CANNOT BE WRITTEN — MAX_REVIEW_TRIES cannot bound this head, so it is parked instead of re-reviewed. Make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        echo "[merge $PR] NEEDS-REVIEW: no usable verdict at head=$HEAD and the (PR,head) review budget CANNOT BE WRITTEN — PARKED (an unwritable counter is not a bound)" >> "$L.log"
+        rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+        return 0
+      fi
       # ⛔ PRUNE EVERY BRANCH, NOT JUST THE WRITE BRANCH (review round 5, P2). The park branch below
       # removed only the marker AT the parked head, so a superseded marker at another head survived and
       # satisfied neither of report.sh's attributions (its head ≠ parked-<PR>, so it was not read as
@@ -867,6 +1067,9 @@ review_state_record() {
       rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-"* 2>/dev/null || true
       if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
         # ⛔ THE REASON NAMES THE LINE IT REJECTED (review round 7, P3). `parkreason-<PR>` is the only
+        # ⛔ AND IT NAMES THE SHARED BOOK (agent-infra#2971): the count is the controller's dispatch
+        # budget as well as this file's, so "3 times" now means three review attempts at this head by
+        # ANY arm — never this file's private tally sitting beside an untouched controller budget.
         # in-band remedial signal a human sees, and "a final line that was neither CLEAN nor ISSUES"
         # cannot distinguish a reviewer hit by its wall clock from one that printed an off-spec line.
         park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
@@ -897,11 +1100,13 @@ review_state_clear() {
   # MINT a `needsfix` marker at a head with a signed CLEAN marker — the exact fixer-without-findings
   # failure this issue exists to close, one round trip later.
   # ⛔ AND THE VERDICT-LESS COUNTER, BECAUSE THAT RUN WAS NOT VERDICT-LESS (review round 10, P2).
-  # `reviewcount-<PR>` bounds CONSECUTIVE runs that produced no usable verdict; this one produced one
-  # (the signed marker just verified), so it restarts. Keeping it parked a head on the next timeout
+  # The SHARED (PR, head) review budget — `reviewdisp-<PR>`, the same record the controller spends on
+  # dispatch (agent-infra#2971; it was `reviewcount-<PR>` before the two books became one) — bounds
+  # CONSECUTIVE runs that produced no usable verdict; this one produced one (the signed marker just
+  # verified), so it restarts. Keeping it parked a head on the next timeout
   # after two earlier timeouts, with a reason claiming nothing had been reviewed at a head whose
   # review had in fact completed — a park (a human) bought by a run that never failed.
-  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" 2>/dev/null || true
+  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" 2>/dev/null || true
   echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
   return 0
 }
@@ -1029,6 +1234,7 @@ case "$LAST" in
     # longer true — and report.sh counts exactly those (agent-infra#2132). This call MUST stay BELOW
     # the guard: a clear above it would let a bare rc=0 read as a satisfied head.
     review_state_clear
+    REV_RECORDED=1   # a terminal record exists for this run; the EXIT recorder must stay inert
     # ── 3a) RAIL MODE: there is no review gate to wait for (agent-infra#1825) ──
     # This repo's merge authority is its rail, which is WHY we dropped out of the rail branch to
     # mint the evidence: polling `$REVIEW_GATE` here would wait 15 minutes for a check that does
@@ -1047,29 +1253,417 @@ case "$LAST" in
     # filter previously hardcoded it inside a single-quoted expression; gh's --jq takes no --arg,
     # so the name travels via the environment and is selected in python (never spliced into a jq
     # program, where a name containing a quote would change the program).
-    gate=""
-    for i in $(seq 1 30); do
-      gate="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | GATE_NAME="$REVIEW_GATE" python3 -c "
-import sys,json,os
-n=os.environ.get('GATE_NAME') or 'ai-review-gate'
-try: d=json.load(sys.stdin)
-except Exception: raise SystemExit
-rows=d if isinstance(d,list) else (d.get('check_runs') or [])
-for c in rows:
-    if isinstance(c,dict) and str(c.get('name') or '')==n:
-        print(str(c.get('state') or '').upper()); break
-" 2>/dev/null)"
-      echo "[merge $PR] gate=$gate (try $i)" >> "$L.log"
-      [ "$gate" = "SUCCESS" ] && break
-      sleep 30
+    #
+    # ⛔⛔ THREE CONDITIONS, THREE VERDICTS — AND AN EMPTY `gate=` IS NEVER PRINTED (agent-infra#2596).
+    # The pre-#2596 loop read `gh pr checks | python3` with BOTH stderr streams sent to /dev/null and
+    # printed whatever came back. Three unrelated conditions therefore landed in the log as the same
+    # empty string, thirty times, and then as `ABORT: gate= (not green)` after 15 minutes:
+    #   (a) the READ FAILED — auth, a non-repo cwd (#2182), the shim chain answering nothing (#2320),
+    #       or a rate-limit band whose refusal `gh-limit` names ON STDERR (gh-core-floor /
+    #       gh-core-exhausted, #2448). The datum never existed, and `2>/dev/null` deleted the only
+    #       line that said why. That is the #2448 defect class, whose scope was orch-loop.sh and
+    #       lander.sh — this site was not in it.
+    #   (b) the read SUCCEEDED but no row is named `$REVIEW_GATE`. GitHub does not report a
+    #       `workflow_call` job under its bare job name: it renders `<caller> / <job>`. MEASURED on
+    #       this repo (`gh pr checks 2567 --json name,state`: `ci / lint`, `ci / typecheck`,
+    #       `ci / unit-test`, `ci / script-validate`) and on tortoise PR #9827 (`agent-infra-ci / lint`,
+    #       `agent-infra-ci / typecheck`). An exact `== n` match can never fire when the GATE's row
+    #       carries that prefix, so on such a repo the worker spends the whole window on a green gate.
+    #       ⚠️ HONEST SCOPE, measured rather than assumed: in the fleet's CURRENT state the required
+    #       gate is reported PLAINLY (tortoise's required set is `pricing-artifact docs test-isolation
+    #       license-surface legal-e2e python-ci-gate ai-review-gate`, and `gh pr checks` renders
+    #       `ai-review-gate` unprefixed), so this arm is a GUARD for the reusable-workflow shape — it
+    #       is NOT the cause of #2596's measured spin, which was the unreadable read in (a). It is
+    #       still the right match rule, because a gate moved behind a `workflow_call` would otherwise
+    #       be silently unmergeable, and #2596 exists to stop silent — and the normalisation is not
+    #       invented: it is the one the rail already applies.
+    #   (c) the row exists but is not finished (`QUEUED`/`IN_PROGRESS`), OR does not exist YET because
+    #       the run has not started. That is a WAIT. The old loop had no notion of one: it re-read
+    #       30 times and called the answer "not green" — the same line a genuinely red gate produced.
+    # The three are now classified apart and each ends in its own line; a read that produced nothing
+    # says WHY it produced nothing, because this is the one call whose silence is being interpreted.
+    #
+    # ⛔ THE NAME IS MATCHED THE WAY GITHUB NAMES CHECKS, AND ONLY THAT WAY: verbatim, or (fallback)
+    # after stripping a `<caller> / ` prefix with `rsplit(" / ", 1)` — the SAME normalisation
+    # `admin-merge.sh` applies to job names at its two re-run/parity sites (`:2431-2433`,
+    # `:3269-3271`, "stripped of a reusable-workflow caller prefix (`<caller> / <called>`, which gh
+    # renders for a `workflow_call` job)"). It is NOT a substring match: `REVIEW_GATE=compliance`
+    # must never select `pipeline-compliance` — the round-12 review recorded exactly that substring
+    # behaviour as a §5.1 bypass, and test-gates.sh pins it. `$REVIEW_GATE` can only ever BE the
+    # bare job name for such a repo, because a context containing a space is refused outright by
+    # `repo-authority.sh::_unrepresentable`, so suffix matching is the only form that can name it.
+    #
+    # ⛔ AND A WIDENED MATCH IS NEVER DECIDED BY ROW ORDER. Stripping the caller prefix means two
+    # rows can canonicalise to the gate, so "the first one that matches" can take a green
+    # `ci / unit-test` and discard a RED row explicitly named `unit-test` — a false PASS on the very
+    # surface this arm made matchable, decided by the API's row order. EVERY row whose name is the
+    # gate counts and the WORST state decides: that is the rule the controller applies in
+    # orch-loop.sh (`all(v=="nonred" and c=="success" ...)`), so the two classifiers cannot disagree.
+    # ⚠️ THE COST OF THAT, STATED PLAINLY: a SUPERSEDED row keeps the gate refused. When a re-run
+    # leaves the earlier FAILURE in the payload (the cell adapter emits every attempt, unsorted and
+    # un-deduped) the gate reads RED even though the newest attempt is green; the controller refuses
+    # the same PR for the same reason, so this is the fleet's existing behaviour rather than a new
+    # one, and the remedy is a new head or a re-run whose row replaces the old one — the verdict names
+    # the STATE, so the operator can see which row is red. Supersession-aware reading needs a signal
+    # no transport here provides (agent-infra#2625): two earlier attempts at it produced the false
+    # PASSes above, so it is a decision, not a detail.
+    # ⚠️ KNOWN DIVERGENCE, disclosed rather than hidden: orch-loop.sh's own classifier still matches
+    # the gate name EXACTLY, so a `<caller> / <job>` gate reads PENDING/FAILED there and this worker is
+    # reached only through the chain/fix/manual paths. Mirroring the normalisation in the controller is
+    # a separate change to a separate classifier (filed as agent-infra#2617), not part of this fix.
+    #
+    # ⛔ A NOT-YET-CREATED CHECK IS A BOUNDED WAIT, NOT A SPIN TO ABORT, AND IT IS TWO CASES. A surface
+    # that CARRIES checks but none named the gate is a name mismatch: it never resolves, so it gets its
+    # own SMALLER bound (`GATE_ABSENT_TRIES`), and at that bound the verdict says NO-SUCH-CHECK and prints
+    # what it WANTED and what the surface actually CARRIED. A surface that is EMPTY (no check row at all
+    # for this head) is the CI not having started: that one is charged against the FULL CI window — it
+    # resolves on its own, and refusing it early would refuse a gate that appears a minute later, which
+    # the pre-#2596 loop did not do. Either reason is logged ONCE, on the first poll and on every change
+    # of verdict — never 30 identical lines.
+    #
+    # ⛔ rc IS NOT A VERDICT (lander.sh's documented lesson): real `gh pr checks` exits 1 when a check
+    # FAILED and 8 when checks are pending, while the REST shim exits 0. The PAYLOAD decides; rc is
+    # carried into the refusal as a detail, never used to classify. An EMPTY payload is UNREADABLE,
+    # never an empty check set (#2569/#2592).
+    #
+    # ⛔ THE TOTAL WAIT IS UNCHANGED BY DEFAULT: GATE_POLL_TRIES x GATE_POLL_SECS = 30 x 30s = 900s,
+    # which is what `CLAIM_LEASE` above is sized for. The absent/unreadable bounds are EARLY EXITS
+    # on counters inside that one loop, so raising them can never outlast the poll bound itself.
+    # ⛔ ASSIGN THE DEFAULTS BEFORE VALIDATING THEM. `if ! is_limit "${X:-30}"; then X=30; fi` leaves X
+    # UNSET when the caller supplied nothing — `is_limit "30"` passes and nothing is assigned — and
+    # `set -u` then aborts the worker at the first `$(( X * … ))`. Caught by
+    # cloud-cell-record-dep.test.sh (which supplies none of these tunables and reached the merge with
+    # no GATE_POLL_SECS at all): a default that only exists inside a `${…:-}` expansion is not a
+    # default, it is a bullet for the next reader.
+    GATE_POLL_TRIES="${GATE_POLL_TRIES:-30}"
+    GATE_POLL_SECS="${GATE_POLL_SECS:-30}"
+    GATE_ABSENT_TRIES="${GATE_ABSENT_TRIES:-6}"
+    GATE_READ_TRIES="${GATE_READ_TRIES:-3}"
+    if ! is_limit "$GATE_POLL_TRIES"; then
+      echo "[merge $PR] GATE_POLL_TRIES='${GATE_POLL_TRIES:-}' is not an integer in range — using 30 (the 30 x 30s wait CLAIM_LEASE is sized for)" >> "$L.log"
+      GATE_POLL_TRIES=30
+    fi
+    if ! is_limit "$GATE_POLL_SECS"; then
+      echo "[merge $PR] GATE_POLL_SECS='${GATE_POLL_SECS:-}' is not an integer in range (at most 9 digits) — using 30 (is_limit, not is_num: the interval is MULTIPLIED for the log line, so an unbounded value wraps it)" >> "$L.log"
+      GATE_POLL_SECS=30
+    fi
+    if ! is_limit "$GATE_ABSENT_TRIES"; then
+      echo "[merge $PR] GATE_ABSENT_TRIES='${GATE_ABSENT_TRIES:-}' is not an integer in range — using 6 (3 min: long enough for a slow workflow to create its row, short enough that a WRONG NAME is not paid for with the whole CI window)" >> "$L.log"
+      GATE_ABSENT_TRIES=6
+    fi
+    if ! is_limit "$GATE_READ_TRIES"; then
+      echo "[merge $PR] GATE_READ_TRIES='${GATE_READ_TRIES:-}' is not an integer in range — using 3 (a transient gh failure is retried, a dead transport is named)" >> "$L.log"
+      GATE_READ_TRIES=3
+    fi
+    # A zero/absent poll budget would skip the loop entirely and leave the verdict empty — the exact
+    # defect this block exists to remove — and the early-exit bounds are floored at 1 for the same
+    # reason (0 would abort on the first poll, before the row could ever appear).
+    [ "${GATE_POLL_TRIES:-0}" -ge 1 ] || GATE_POLL_TRIES=30
+    [ "${GATE_ABSENT_TRIES:-0}" -ge 1 ] || GATE_ABSENT_TRIES=1
+    [ "${GATE_READ_TRIES:-0}" -ge 1 ] || GATE_READ_TRIES=1
+
+    gate_verdict=""; gate_line=""; gate_try=0; gate_absent=0; gate_unread=0; gate_last=""; gate_lastkind=""; gate_seen_empty=0
+    gate_wait=$(( GATE_POLL_TRIES * GATE_POLL_SECS ))
+    # ⛔ THE FALLBACK IS NOT `/dev/null` (review P2-2). It was, and the cleanup below then ran
+    # `rm -f /dev/null` on the boxes where `mktemp` can fail AND the worker is root (a cloud cell with a
+    # full/unwritable TMPDIR) — unlinking the device node, after which every later `>/dev/null` in the
+    # fleet CREATES a regular file in devtmpfs and the harness runs on a corrupted /dev. A capture that
+    # cannot be made is also not "no stderr": the verdict says so instead of claiming gh was silent.
+    gate_errf="$(mktemp "${TMPDIR:-/tmp}/merge-$PR-gate.XXXXXX" 2>/dev/null || true)"
+    gate_capture=1
+    if [ -z "$gate_errf" ]; then
+      # One non-mktemp fallback (a pid-suffixed path is unique per worker process); if THAT cannot be
+      # written the capture is DEGRADED, and the verdict says so instead of claiming gh was silent.
+      gate_errf="${TMPDIR:-/tmp}/merge-$PR-gate.$$"
+      if ! : > "$gate_errf" 2>/dev/null; then gate_capture=0; gate_errf="/dev/null"; fi
+    fi
+    while [ "$gate_try" -lt "$GATE_POLL_TRIES" ]; do
+      gate_try=$(( gate_try + 1 ))
+      : > "$gate_errf" 2>/dev/null || true
+      # ⛔ THE TWO STATEMENTS ARE DELIBERATELY SEPARATE: the payload is captured FIRST and its rc
+      # kept, then classified. Feeding gh straight into python would make gh's documented
+      # rc(1)=a check failed / rc(8)=checks pending indistinguishable from a broken read, and the
+      # classifier would then be reading whatever survived the pipe.
+      gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>"$gate_errf")"; gate_rc=$?
+      gate="$(printf '%s' "$gate_raw" | GATE_NAME="$REVIEW_GATE" python3 -c '
+import sys, json, os, re
+want = (os.environ.get("GATE_NAME") or "ai-review-gate").strip()
+# ⛔ EVERYTHING ECHOED INTO THE LOG GOES THROUGH `clean()` (review round 6 P2). `name` and `state` are
+# TRANSPORT-CONTROLLED — a workflow name can be a YAML block scalar, and the cell gh chain (#2320) is
+# hand-rolled — so a payload carrying `\n` forges a LINE in the merge log: a refused run logged
+# `[merge 7] gate=SUCCESS (try 1)` through `saw=`, i.e. the record a human reads to decide whether to
+# intervene positively claimed the gate was green. Control characters are collapsed to a space at this
+# boundary, so no field can ever start a new line — and `saw=`/`last=` stay single-line for the same
+# reason. (This is the same discipline the exception text below already applied.)
+_CTRL = re.compile(r"[\x00-\x1f\x7f]+")
+def clean(s):
+    return _CTRL.sub(" ", str(s or "")).strip()
+def canon(s):
+    s = clean(s)
+    if " / " in s:
+        s = s.rsplit(" / ", 1)[1].strip()
+    return s
+raw = sys.stdin.read()
+if not raw.strip():
+    print("UNREADABLE the read produced no payload at all (empty response from gh pr checks)")
+    raise SystemExit(0)
+try:
+    d = json.loads(raw)
+except Exception as e:
+    print("UNREADABLE the payload is not JSON (%s)" % str(e).replace("\n", " ")[:120])
+    raise SystemExit(0)
+rows = d if isinstance(d, list) else (d.get("check_runs") if isinstance(d, dict) else None)
+if rows is None:
+    # ⛔ A SCALAR PAYLOAD IS NOT AN EMPTY CHECK SET (review P2-1). `null` is what any jq-based
+    # wrapper prints for a missing key, and a hand-rolled gh shim is exactly the chain #2320 measured —
+    # classifying it as ABSENT reported condition (a) as condition (b) and told the operator to fix
+    # the gate NAME, against the wrong bound.
+    print("UNREADABLE the payload is not a check list (JSON %s)" % type(d).__name__)
+    raise SystemExit(0)
+if not isinstance(rows, list):
+    print("UNREADABLE the payload carries no check list")
+    raise SystemExit(0)
+# ⛔ AN EMPTY SURFACE IS NOT A WRONG GATE NAME (review P2-1). `[]` means CI has not created a single
+# check row for this head YET — the block header calls that a WAIT — so it must be charged against
+# the CI window, not against the short "the gate name must be wrong" bound, and it must not inherit
+# the remedy "waiting cannot help". The two facts get two tokens.
+if not rows:
+    print("EMPTY saw=<none: the check surface is empty>")
+    raise SystemExit(0)
+names = [clean(c.get("name")) for c in rows if isinstance(c, dict)]
+# ⛔ A SURFACE WHOSE ROWS CARRY NO USABLE NAME IS MALFORMED, NOT A WRONG GATE NAME (review round 3
+# P2-3). `[null]`, `["x","y"]` and `[{"name": null, …}]` all parse as a LIST, so they must not be
+# reported as "the surface carried checks, but none is named this gate" — there was no row to name.
+# Same class as the scalar payload above, one shape over: it is a TRANSPORT/shape failure.
+if not any(names):
+    print("UNREADABLE no row in the payload carries a usable name, so the check surface is malformed")
+    raise SystemExit(0)
+PEND    = ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED", "EXPECTED")
+NON_RED = ("CANCELLED", "STALE", "NEUTRAL", "SKIPPED")
+def state_of(c):
+    return clean(c.get("state")).upper()
+def rank(s):
+    # Allow-list polarity: 0 is the only green, and EVERY other conclusion is red — an unrecognised
+    # or empty state must never fall through a gap (the merge-rail rule, applied here).
+    if s == "SUCCESS": return 0
+    if s in PEND:      return 2
+    if s in NON_RED:   return 3
+    return 4
+cands = [c for c in rows if isinstance(c, dict) and canon(c.get("name")) == want]
+if not cands:
+    saw = "|".join([n for n in names if n][:12]) or "<none>"
+    print("ABSENT want=%s saw=%s" % (want, saw))
+    raise SystemExit(0)
+# ⛔ NEVER FIRST-MATCH (review P1). Matching after stripping `<caller> / ` widens what can BE the gate,
+# so `[{"ci / unit-test": SUCCESS}, {"unit-test": FAILURE}]` must not merge on the first row it sees:
+# the explicitly-required `unit-test` row is RED there, and a first-match loop reports SUCCESS while
+# discarding it — a FALSE PASS on the one surface this change made matchable at all, decided by the
+# payload row order. So: EVERY row naming the gate is a candidate and the WORST one decides — the rule
+# the controller applies in orch-loop.sh (`all(v=="nonred" and c=="success" ...)`), so the two cannot
+# disagree. (Anything that DEDUPES rows — first-match, newest attempt per name, newest per
+# (name, workflow) — was tried and defeated by the transport; see the block below.)
+hit = None
+for c in cands:
+    # ⛔ WORST MATCHED ROW, AND NOTHING ELSE (final rule, review rounds 2-5). Every dedupe this loop
+    # tried was defeated by the transport it runs on:
+    #   · "first match" merged on a green `ci / unit-test` while a RED row named exactly `unit-test`
+    #     was present — the verdict decided by the API row order (round 2);
+    #   · "newest attempt per name" needed an orderable `startedAt`, and a QUEUED run carries `null`
+    #     through the cell adapter and the Go zero time `0001-01-01...` through real gh, so an older
+    #     pass won and the loop merged mid-re-run (round 4);
+    #   · keying that on `(name, workflow)` cannot tell two JOBS apart: `workflow` is the app slug
+    #     (`github-actions`) for every check run the cell adapter emits, and is EMPTY on real gh for
+    #     non-Actions checks, so a green `compliance` row could still speak for a red `ci` one
+    #     (round 5). `link`/run-id does separate them — but then the two attempts of one re-run separate too.
+    # No row may be discarded, so none of that is needed: every row whose name is the gate counts and
+    # the WORST state decides. That is the rule the controller already applies in orch-loop.sh
+    # (`all(v=="nonred" and c=="success" ...)`), so the two classifiers cannot disagree, and it is
+    # transport-independent — there is no field left to project, dedupe, sort or trust.
+    if hit is None or rank(state_of(c)) > rank(state_of(hit)):
+        hit = c
+st = state_of(hit)
+# ⛔ NAMED POLARITY, NOT A DENY-LIST (review P2-3). A non-green state is not automatically a
+# FAILURE: `scripts/objective.py` records `NON_RED = {"cancelled", "stale"}` ("not green, but not
+# evidence of failure") and neutral/skipped are non-red by the same allow-list rule. Labelling a
+# CANCELLED gate "RED" sends an operator hunting a failing test for a superseded run. BOTH buckets
+# still refuse — the distinction here is the WORDING of the verdict, never the abort.
+if st == "SUCCESS":
+    print("SUCCESS")
+elif st in PEND:
+    print("PENDING state=%s" % st)
+elif st in NON_RED:
+    print("NOTGREEN state=%s" % st)
+elif not st:
+    # Its own token: the row WAS found (so this is not a transport failure, and the UNAVAILABLE
+    # wording "the read never produced a check surface" would be false here).
+    print("ROWUNREADABLE the row named %s was found but carries no state field, so its polarity is unknown" % ("<" + clean(hit.get("name")) + ">"))
+else:
+    print("RED state=%s" % st)
+' 2>>"$gate_errf")"; gate_pyrc=$?
+      # The read's own words, for the one call whose silence is being interpreted (#2448). First
+      # line only: the refusal this carries is `gh-core-floor remaining=<n> …` / `gh-core-exhausted
+      # resets_in=<Nm>`, which is a single line, and a stack trace here would bury it.
+      # ⛔ THE STDERR FIELD IS TRANSPORT-CONTROLLED TOO (review round 8 P2-2). Only `\r` used to be
+      # dropped, so a shim writing ANSI escapes put `ESC[1A ESC[2K` into the log — `cat`ting it then
+      # ERASES the line above and renders `[merge 7] gate=SUCCESS` for a refused merge. Same rule as
+      # `clean()` on the payload: strip control characters at the boundary, not at each print site.
+      gate_errline="$(head -n 1 "$gate_errf" 2>/dev/null | tr -d '\000-\010\013-\037\177' | tr -d '\r' | cut -c1-200)"
+      if [ -n "$gate_errline" ]; then :
+      elif [ "${gate_capture:-1}" = 1 ]; then gate_errline="<no stderr>"
+      else gate_errline="<capture unavailable: no temp file could be created, so gh's stderr was NOT recorded>"
+      fi
+      case "$gate" in
+        SUCCESS)
+          gate_verdict=SUCCESS; gate_line="gate=SUCCESS (try $gate_try)"; break ;;
+        RED\ state=*|NOTGREEN\ state=*)
+          # ⛔ NOT GREEN DOES NOT ABORT EARLY, DELIBERATELY. The pre-#2596 loop waited the whole window
+          # on a non-green gate, and that wait is not pointless: a re-run (a peer lane, `fix-one.sh`,
+          # the CI daemon) can flip the same row green mid-window, and aborting on the first sighting
+          # would turn that into a re-paid review next cycle. So the observation is RECORDED (and
+          # logged once, as a TRANSITION line that says polling continues) while the poll window is
+          # unchanged; the terminal verdict is emitted once, after the loop, only if the row never
+          # turns green. The abort DIRECTION is identical to the pre-#2596 code.
+          # ⛔ THE WORDING CARRIES THE POLARITY (review P2-3): `RED` only for a conclusion the repo's
+          # own allow-list calls red; a CANCELLED/STALE/NEUTRAL/SKIPPED row is NON-RED and not
+          # evidence of a failing test, so it says NOT GREEN instead of sending an operator hunting one.
+          case "$gate" in
+            RED\ state=*)      gate_kind=RED ;;
+            *)                  gate_kind=NOTGREEN ;;
+          esac
+          # ⛔ RECORDED, NOT LATCHED (review round 7 P2-1). This used to assign `gate_line` here, and
+          # nothing ever cleared it — so a gate RED at try 1 and QUEUED (a re-run in flight) at the
+          # bound still ended with "RED … refusing (a red gate does not turn green by being polled
+          # longer)", the opposite of the last observation and a contradiction of the transition line
+          # printed two lines later. The terminal line is built BELOW from the LAST observation,
+          # exactly as the EMPTY/ABSENT arms already required.
+          gate_redkind="$gate_kind"; gate_redstate="${gate#* state=}"; gate_redtry="$gate_try"
+          if [ "$gate_last" != "$gate_kind-$gate" ]; then
+            echo "[merge $PR] gate=${gate#* state=} (${gate_kind} at try $gate_try) — still polling: a re-run can flip this row, so the window is unchanged; the abort is taken when it expires" >> "$L.log"
+            gate_last="$gate_kind-$gate"; gate_lastkind="$gate_kind"
+          fi
+          gate_unread=0; gate_absent=0 ;;
+        ABSENT\ want=*)
+          gate_unread=0; gate_seen_empty=0
+          gate_absent=$(( gate_absent + 1 ))
+          if [ "$gate_absent" -ge "$GATE_ABSENT_TRIES" ]; then
+            gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (absent on all $gate_absent poll(s), bound ${GATE_ABSENT_TRIES}) — the surface carried checks, but none is named this gate, so waiting cannot help; want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)"; break
+          fi
+          if [ "$gate_last" != "$gate" ]; then
+            echo "[merge $PR] gate=NOT YET CREATED ${gate#ABSENT } (waiting, $gate_absent/$GATE_ABSENT_TRIES) — a not-yet-created check is a WAIT, not a failure" >> "$L.log"
+            gate_last="$gate"; gate_lastkind=ABSENT
+          fi ;;
+        EMPTY*)
+          # ⛔ THE CI HAS NOT STARTED FOR THIS HEAD — a WAIT, so it is the POLL bound that governs it,
+          # not the short "your gate name is wrong" bound (review P2-1). The pre-#2596 code waited the
+          # whole window here; charging an empty surface against GATE_ABSENT_TRIES would refuse at
+          # ~150 s a gate that appears at ~240 s — a refusal this change invented.
+          gate_unread=0; gate_absent=0; gate_seen_empty=1
+          if [ "$gate_last" != "$gate" ]; then
+            echo "[merge $PR] gate=NOT YET CREATED want=$REVIEW_GATE (the check surface is EMPTY at try $gate_try) — CI has created no check row for this head yet; a not-yet-created check is a WAIT, not a failure, so the full $GATE_POLL_TRIES poll(s) / ${gate_wait}s window applies" >> "$L.log"
+            gate_last="$gate"; gate_lastkind=EMPTY
+          fi ;;
+        PENDING\ state=*|UNREADABLE*|ROWUNREADABLE*|CLASSIFIERFAIL*)
+          # An unparseable/absent payload counts against its OWN bound; a check that is merely
+          # still running counts against the poll bound (it IS the CI wait this loop exists for).
+          # Both counters are CONSECUTIVE: a parsed verdict proves the transport works, so a blip
+          # before it must not be charged against a later one (#2593's lesson).
+          # NOTE: any non-EMPTY verdict proves CI has produced a surface, so `gate_seen_empty` clears.
+          gate_seen_empty=0
+          case "$gate" in
+            PENDING*) gate_kind=PENDING; gate_absent=0; gate_unread=0 ;;
+            *) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 )); gate_absent=0 ;;
+               # ⛔ THE READ BOUND DOES NOT END THE RUN (review round 7 P2-2). It used to `break`, so
+               # three failed reads ended the wait at ~90 s — while the transient it retries is named
+               # by this worker's OWN fixture, `gh-core-floor … resets_in=4m`, which clears at ~240 s.
+               # The pre-#2596 loop rode that out inside its window; breaking early turned it into a
+               # refusal, and step 1 re-runs a PAID review on every re-dispatch. The counter now only
+               # drives the wording; if the read is still failing when the window expires, the terminal
+               # verdict is UNAVAILABLE (built below).
+          esac
+          if [ "$gate_last" != "$gate" ] || [ "$gate_kind" != "$gate_lastkind" ]; then
+            case "$gate_kind" in
+              PENDING) echo "[merge $PR] gate=PENDING ${gate#PENDING } (try $gate_try) — CI is still running; waiting up to $GATE_POLL_TRIES poll(s) / ${gate_wait}s" >> "$L.log" ;;
+              *) case "$gate" in
+                   ROWUNREADABLE*) echo "[merge $PR] gate=UNREADABLE rc=$gate_rc read='${gate#ROWUNREADABLE }' stderr=$gate_errline (try $gate_try/$GATE_READ_TRIES) — the row was found but has no state to read; retrying" >> "$L.log" ;;
+                   *)              echo "[merge $PR] gate=UNREADABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (try $gate_try/$GATE_READ_TRIES) — retrying a failed READ; nothing about the repo has been observed yet" >> "$L.log" ;;
+                 esac ;;
+            esac
+            gate_last="$gate"; gate_lastkind="$gate_kind"
+          fi ;;
+        *)
+          # The classifier itself produced nothing (python3 missing/killed). That is a transport
+          # failure, and it must never read as `gate=` — say which one it was.
+          gate_unread=$(( gate_unread + 1 )); gate_absent=0
+          # ⛔ ITS OWN TOKEN (review round 8 P2-1). This arm used to leave `$gate` EMPTY while setting
+          # `gate_lastkind=UNREADABLE`, so the terminal line — built from `$gate` — printed `read=''`
+          # (an empty datum in the verdict #2596 exists to make legible) AND described the last
+          # observation as a failed READ although the read had SUCCEEDED (rc=0, well-formed payload)
+          # and it was the CLASSIFIER that died — dropping `pyrc=`, the only datum that names the
+          # fault. The token carries both, so the terminal wording (below) can name the classifier.
+          gate="CLASSIFIERFAIL pyrc=$gate_pyrc rc=$gate_rc stderr=$gate_errline"
+          gate_kind=CLASSIFIERFAIL
+          # Same as the read arm: no early break — a window that expires while the classifier cannot
+          # run ends in UNAVAILABLE (below), but a classifier that recovers mid-window still wins.
+          if [ "$gate_last" != "$gate" ]; then
+            echo "[merge $PR] gate=UNREADABLE pyrc=$gate_pyrc rc=$gate_rc read='the classifier produced no verdict' stderr=$gate_errline (try $gate_try) — the watcher itself failed; retrying" >> "$L.log"
+            gate_last="$gate"; gate_lastkind=CLASSIFIERFAIL
+          fi ;;
+      esac
+      [ "$gate_try" -lt "$GATE_POLL_TRIES" ] || break
+      sleep "$GATE_POLL_SECS"
     done
+    # ⛔ THE TERMINAL VERDICT DESCRIBES THE LAST OBSERVATION, NOT THE WORST ONE (review round 7 P2-1).
+    # The wait exists because a row can change while it is polled, so a verdict latched at try 1 can be
+    # the opposite of what is true at the bound: RED at try 1 then QUEUED (a re-run in flight) at try 3
+    # must not say "RED … does not turn green by being polled longer" — that tells the operator not to
+    # wait for the exact thing the loop was waiting for — and a read that breaks late must not report a
+    # repo STATE (the #2596 misclassification, inverted). `gate_lastkind` is the discriminator: every
+    # arm sets it, so it always names the LAST poll's verdict kind.
+    if [ -z "$gate_line" ]; then
+      case "${gate_lastkind:-}" in
+        RED|NOTGREEN)
+          if [ "${gate_redkind:-}" = RED ]; then
+            gate_verdict=RED; gate_line="gate=${gate_redstate:-<unknown>} (RED, last seen at try ${gate_redtry:-?}/$GATE_POLL_TRIES) — the gate is still not green after the wait; refusing (a red gate does not turn green by being polled longer)"
+          else
+            gate_verdict=NOTGREEN; gate_line="gate=${gate_redstate:-<unknown>} (NOT GREEN — a NON-RED conclusion that is not evidence of review, last seen at try ${gate_redtry:-?}/$GATE_POLL_TRIES) — refusing after the wait; re-run the check rather than hunting a failure"
+          fi ;;
+        ABSENT)
+          gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (the poll window expired while the surface carried checks and none was named this gate) — want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)" ;;
+        CLASSIFIERFAIL)
+          # The read SUCCEEDED; the CLASSIFIER died. Say that, and carry pyrc= — the datum that names it.
+          gate_verdict=UNAVAILABLE
+          gate_line="gate=UNAVAILABLE ${gate#CLASSIFIERFAIL } (still failing at the end of the $gate_try-poll window) — the check surface was READ but the classifier produced no verdict, so this is a TOOLING failure (python3), not a state of the repo and not transport; nothing about the gate has been observed" ;;
+        UNREADABLE|ROWUNREADABLE)
+          gate_verdict=UNAVAILABLE
+          case "$gate" in
+            ROWUNREADABLE*) gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#ROWUNREADABLE }' stderr=$gate_errline (still unreadable at the end of the $gate_try-poll window) — the row was FOUND and carries no state, so this is a malformed check surface, not a state of the repo" ;;
+            *)              gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (unreadable on all $gate_unread consecutive poll(s)) — the read never produced a check surface, so this is a TRANSPORT failure, not a state of the repo; the window is unchanged so a transient (gh-core-floor resets_in=…) can clear inside it" ;;
+          esac ;;
+        ""|EMPTY)
+          if [ "${gate_seen_empty:-0}" = 1 ]; then
+            gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='the check surface was EMPTY' after $gate_try poll(s) / ${gate_wait}s — CI never created a single check row for this head, so the gate was never observable; it needs a completed '$REVIEW_GATE' check in that window"
+          else
+            gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was never observed at all in that window"
+          fi ;;
+        *)
+          gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was still in flight when the wait expired; it needs a completed '$REVIEW_GATE' check, which CI had not produced in that window" ;;
+      esac
+      [ -n "$gate_verdict" ] || gate_verdict=UNKNOWN
+      [ -n "$gate_line" ] || gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) — unclassified last observation (kind=${gate_lastkind:-none}); this is a gap in the verdict builder, never a pass"
+    fi
+
+    # ⛔ EXACTLY ONE terminal `gate=` line per run: every progress line above is a DIFFERENT kind
+    # (`NOT YET CREATED` / `PENDING` / `UNREADABLE` / the RED transition), so the terminal verdict is
+    # emitted here once and only once.
+    echo "[merge $PR] $gate_line" >> "$L.log"
+    [ -n "${gate_errf:-}" ] && [ "$gate_errf" != "/dev/null" ] && rm -f "$gate_errf" 2>/dev/null
     # ⛔ NOT parked, deliberately (verified by reading the controller, not assumed): the signed
     # marker IS in the PR body by here (the check above proved it, rather than trusting rc=0), so
     # this head can still merge. A park would make the loop's
     # top-of-cycle parked guard `continue` past a PR whose gate turns green a minute later — a
     # stranded merge, strictly worse than the cost of the retry. A record failure cannot be
     # stranded, which is why THAT is parked.
-    if [ "$gate" != "SUCCESS" ]; then echo "[merge $PR] ABORT: gate=$gate (not green)" >> "$L.log"; exit 4; fi
+    if [ "$gate_verdict" != "SUCCESS" ]; then echo "[merge $PR] ABORT: not green — $gate_line (nothing merged, nothing parked)" >> "$L.log"; exit 4; fi
     # ── 4) merge ──
     # ⛔ UNREACHABLE IN RAIL MODE, BY CONSTRUCTION. Rail mode leaves step 3a via rail_attempt,
     # which exits — so a raw `gh pr merge` cannot land a rail repo's PR on its required checks
@@ -1096,6 +1690,7 @@ for c in rows:
     # on an unreviewed head and the PR could never converge.
     echo "[merge $PR] NOT CLEAN or no verdict at head=$HEAD (class=$(verdict_class "$LAST"))" >> "$L.log"
     review_state_record "$(verdict_class "$LAST")"
+    REV_RECORDED=1   # either a findings marker or a no-verdict record was written above
     ;;
 esac
 echo "[merge $PR] end $(date)" >> "$L.log"
