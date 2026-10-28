@@ -7,9 +7,22 @@ O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 mkdir -p "$O/logs"
 cd "$REPO" || exit 1
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# ⛔ THE FOURTH CALLER OF THE GATED FIXER (#2762 review, P1/P2). This script built a worktree and
+# fetched a branch BEFORE calling fix-one.sh, in whatever checkout `$1` named — so a mismatched pair
+# did the wrong-repo work here, one layer above the assertion that was supposed to stop it, and then
+# reported only an empty log. Assert the pair first; refuse before touching a branch.
+. "$SELF/repo-target.sh" || { echo "[adopt-fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to adopt into a repo that cannot be asserted" >&2; exit 78; }
+command -v repo_target_assert >/dev/null 2>&1 || { echo "[adopt-fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert) — refusing to adopt into a repo that cannot be asserted" >&2; exit 78; }
+REPO_ABS="$(pwd -P)"
+ADOPT_ASSERT_LINE="$(repo_target_assert "adopt-fix $PR" "$REPO_ABS" "$OR" "")"; ADOPT_ASSERT_RC=$?
+printf '%s\n' "$ADOPT_ASSERT_LINE" >> "$O/logs/adopt-$PR.log"
+if [ "$ADOPT_ASSERT_RC" -ne 0 ]; then
+  echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the checkout $REPO_ABS is not $OR; nothing fetched, no worktree built, no attempt consumed" >> "$O/logs/adopt-$PR.log"
+  exit "$ADOPT_ASSERT_RC"
+fi
 # The worktree lifecycle helper (#2033): a failed `worktree add` here used to leave the branch — and
 # for a foreign branch that is the ONE ref the adopt path just fetched, so the residue was durable.
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 . "$SELF/wt-lifecycle.sh" || { echo "[adopt-fix $PR] FATAL: $SELF/wt-lifecycle.sh missing — refusing to adopt without its rollback (#2033)" | tee -a "$O/logs/adopt-$PR.log"; exit 78; }
 git fetch origin "$BR" --quiet 2>/dev/null || true
@@ -33,6 +46,16 @@ rc=$?
 # operator to wait for a remedy that cannot arrive.
 if [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "71" ]; then
+  # ⛔ THE CAPABILITY REFUSAL (#2935) IS THE ONE THIS SCRIPT COULD NOT NAME AT ALL (review of #2991,
+  # P1): `fix-one.sh` propagates the gate's own code, so 71 reached the manual operator's log as NO
+  # LINE — a run that did nothing, silently. Waiting does not clear it, so it must not be folded into
+  # the load arm above.
+  echo "[adopt-fix $PR] fixer NOT started (CAPABILITY gate) — this box could not complete one model call and RETURN (#2935); see the [capability-gate] REFUSED line in $O/logs/fix-$PR.log for which reading refused. Waiting will not clear it: repair the box (installed pi/extension set, provider credential) or dispatch the PR elsewhere." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "72" ]; then
+  # A worktree that exists but is the wrong repo (or a branch the target repo does not have) is
+  # refused by fix-one.sh with 72. Name it in the log the manual operator reads (#1720/#2694).
+  echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the worktree/branch is not $OR; nothing pushed, no attempt consumed. See $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "77" ]; then
   echo "[adopt-fix $PR] fixer NOT started (DISK gate) — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
 # ⛔ AND THE CI-QUEUE GATE IS THE THIRD REFUSAL, NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6

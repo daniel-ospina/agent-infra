@@ -188,6 +188,15 @@ echo
 echo "§C lane.sh's REAL output (LANE_DRY_RUN=1)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/o/logs"
+# ⛔ THE DRY-RUN CWD MUST BE THE TARGET REPO (agent-infra#2724/#2694). lane.sh now refuses (72) when
+# the worktree's origin is not the repo it was dispatched for. This section asserts the RENDERED
+# brief, not the repo gate, so the fixture is a checkout of the `acme/widget` it names.
+git init -q "$TMP" 2>/dev/null && git -C "$TMP" remote add origin https://github.com/acme/widget.git 2>/dev/null
+# …and it is checked out on the branch the lane was told it is on: lane.sh refuses a worktree on a
+# DIFFERENT named branch (the `prfixup` shape), so a fixture on `main` would be refused for the
+# branch before this section could read the rendered brief.
+git -C "$TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null \
+  && git -C "$TMP" checkout -q -b fix/2148-reviewer-preflight 2>/dev/null
 # A throwaway worktree dir: lane.sh reads $PWD for the log header and the venv reaper, and
 # REAP_LANE_VENV_DISABLE keeps the reaper out of the fixture's way.
 (
@@ -494,37 +503,258 @@ echo "§F.5 NON-VACUITY — composer-level: drop ONE requirement and the asserti
 STRIP="$TMP/strip"; mkdir -p "$STRIP"
 cp "$HERE/spawn-gate.sh" "$STRIP/spawn-gate.sh"
 cp "$LANE" "$STRIP/lane.sh"
+# ⛔ THE RIG MUST CARRY THE MODULE THE LANE HARD-REQUIRES, AND ITS CWD MUST PASS THE REPO GATE
+# (#2724 follow-up; the cause was MEASURED, not guessed). `lane.sh` sources `repo-target.sh` from ITS
+# OWN directory and exits 78 without it; it then exits 78 AGAIN when `brief-gate.sh` cannot be resolved
+# (#2258), and `brief_gate_lib` looks only in `$O`, `$SELF`, `$AGENT_INFRA_PATH/...` and
+# `~/.pi/agent/scripts` — none of which exist on a CI runner or under a hidden HOME. That was the real
+# reason this section composed NOTHING in CI (`rc=78 brief-gate.sh not found`, measured) while it passed
+# on a dev box whose `~/.pi/agent/scripts` supplied the fallback; with no brief, the arms below reported
+# ✅ on nothing — the vacuity this section exists to disprove. Same rule as `spawn-gate.test.sh`'s rig:
+# copy the validator in, so resolution cannot depend on the box. The identity module is copied too.
+cp "$HERE/repo-target.sh" "$STRIP/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP/repo-slug.sh"
+cp "$HERE/brief-gate.sh" "$STRIP/brief-gate.sh"
+# ⛔ AND THE GATE-POLICY MODULE, WHICH IS THE SAME CLASS OF HARD REQUIREMENT (review, P1). `lane.sh`
+# sources it at L134 and `exit 78`s without it, and that source sits BEFORE the brief is composed —
+# so a rig without it composed NOTHING and the two control arms below were green/failing on an empty
+# artifact, the exact vacuity this section exists to forbid (measured in CI: 133 passed, 2 failed).
+cp "$HERE/gate-policy.sh" "$STRIP/gate-policy.sh"
+# ⛔ AND THE WORKTREE LIFECYCLE MODULE (#2033), WHICH IS THE SAME CLASS OF HARD REQUIREMENT ONE STEP
+# SHARPER. `lane.sh` sources it for the empty-worktree reap and exits 78 without it, and that source
+# runs BEFORE the brief is composed — so a rig without it refused with `wt-lifecycle.sh missing` and the
+# two arms below reported ✅/❌ on an empty artifact, which is the vacuity this section exists to forbid
+# (measured: 183 passed, 5 failed, every one of them this).
+cp "$HERE/wt-lifecycle.sh" "$STRIP/wt-lifecycle.sh"
 sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
 [ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
+# The cwd is the §C fixture — a checkout of `acme/widget` that this suite already proves works in CI —
+# told it is on a DIFFERENT branch. Both branch refs are created from its own HEAD and the worktree is
+# DETACHED: a detached HEAD is an allowed lane shape, so the repo gate is satisfied by IDENTITY while
+# the assertion under test stays the brief's. `update-ref` + detach, never a branch SWITCH, so building
+# the rig cannot leave the fixture on some third branch.
+for _rigbr in fix/strip fix/strip2; do
+  git -C "$TMP" update-ref "refs/heads/$_rigbr" HEAD 2>/dev/null || true
+done
+git -C "$TMP" checkout -q --detach 2>/dev/null || true
+git -C "$TMP" rev-parse --verify -q refs/heads/fix/strip >/dev/null 2>&1 \
+  && git -C "$TMP" rev-parse --verify -q refs/heads/fix/strip2 >/dev/null 2>&1 \
+  && [ -z "$(git -C "$TMP" symbolic-ref -q --short HEAD 2>/dev/null || true)" ]
+ck $? "the non-vacuity fixture is DETACHED with both branch refs present (the lane's repo gate cannot be what refuses)"
+mkdir -p "$TMP/o3/logs"
 (
   cd "$TMP" || exit 1
   O="$TMP/o3" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$STRIP/lane.sh" 2325 fix/strip acme/widget
-) >/dev/null 2>&1
+) >"$TMP/o3/lane.out" 2>&1
+_rc3=$?
 STRIPPED="$(cat "$TMP/o3/logs/prompt-2325.txt" 2>/dev/null || true)"
+# ⛔ NAME THE REASON ON THE SPOT (a rig that silently composes nothing is what hid the defect): the
+# lane's own stdout/stderr is printed the moment the artifact is absent, so the CI log says WHY.
+if [ -z "$STRIPPED" ]; then echo "  · [d]-strip lane refused/failed (rc=$_rc3) — its output follows:"; sed -n '1,6p' "$TMP/o3/lane.out"; fi
+# ⛔ COMPOSITION IS A PRECONDITION OF THE ARM, NOT A NOTE BESIDE IT (review, P2). `has_req_d ""` fails by
+# construction, so this arm was GREEN on an empty file — it could not tell "stripped correctly" from
+# "composed nothing", which is the exact sentence in the comment above. A rig that produced no brief now
+# fails the arm that claims it.
+_composed3=1; [ -n "$STRIPPED" ] || _composed3=0
 has_req_d "$STRIPPED"; rc=$?
-[ "$rc" -ne 0 ]; ck $? "⛔ removing the [d] bullet from the composer MAKES the §F.1 [d] assertion FAIL (non-vacuous)"
+[ "$_composed3" = "1" ] && [ "$rc" -ne 0 ]; ck $? "⛔ removing the [d] bullet from the composer MAKES the §F.1 [d] assertion FAIL (non-vacuous, and the rig composed a brief)"
 has_req_a "$STRIPPED" && has_req_e "$STRIPPED"; ck $? "…and the untouched requirements still pass (the control is targeted, not a broken fixture)"
 # …and the same control for the HEAD-BINDING sentence, which is the rule a lane most needs.
 STRIP2="$TMP/strip2"; mkdir -p "$STRIP2"
 cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
+cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP2/repo-slug.sh"
+cp "$HERE/brief-gate.sh" "$STRIP2/brief-gate.sh"
+cp "$HERE/gate-policy.sh" "$STRIP2/gate-policy.sh"   # same hard requirement as the first rig (review, P1)
+cp "$HERE/wt-lifecycle.sh" "$STRIP2/wt-lifecycle.sh"   # …and so is the lifecycle module (#2033)
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
 [ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
+mkdir -p "$TMP/o4/logs"
 (
   cd "$TMP" || exit 1
   O="$TMP/o4" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$STRIP2/lane.sh" 2325 fix/strip2 acme/widget
-) >/dev/null 2>&1
+) >"$TMP/o4/lane.out" 2>&1
+_rc4=$?
 STRIPPED2="$(cat "$TMP/o4/logs/prompt-2325.txt" 2>/dev/null || true)"
+if [ -z "$STRIPPED2" ]; then echo "  · head-binding strip lane refused/failed (rc=$_rc4) — its output follows:"; sed -n '1,6p' "$TMP/o4/lane.out"; fi
 # ⛔ THE FIXTURE MUST HAVE COMPOSED (review, P2): an absent/empty artifact is indistinguishable from a
 # successful strip, so this control asserts the ONE-THING-CHANGED shape: the other requirements are
 # still on the brief, and only the stripped sentence is gone.
 has_req_a "$STRIPPED2" && has_req_e "$STRIPPED2"; ck $? "the head-binding fixture still composed a brief with [a] and [e] (not an empty file)"
 case "$STRIPPED2" in *"a moved head must be RE-RECORDED at the new head"*) rc=0;; *) rc=1;; esac
-[ "$rc" -ne 0 ]; ck $? "⛔ removing the HEAD-BINDING sentence MAKES the §F.1 head-binding assertion FAIL"
+_composed4=1; [ -n "$STRIPPED2" ] || _composed4=0
+[ "$_composed4" = "1" ] && [ "$rc" -ne 0 ]; ck $? "⛔ removing the HEAD-BINDING sentence MAKES the §F.1 head-binding assertion FAIL (and the rig composed a brief)"
 
 echo
 
+echo "§G commit as you go — a cap kill must leave a PR behind (#2981)"
+# THE DEFECT (agent-infra#2981, measured 2026-10-27/28). Five `prfix` lanes, one batch: all five
+# killed at their 2400 s cap, **0 commits, 0 PRs, 144 KB of work** recovered only as rescue patches.
+# The rescue worked; the work still reached no PR, and the next run had to adopt its predecessor's
+# tree before it could add a line. The briefs those lanes received carried the research contract, the
+# reviewer step, the landing artifacts and the push refspec — and never the cheapest rule of all.
+# These arms read the ARTIFACT a worker receives, never the helper's own prose.
+DELIVERY_LANE="$(delivery_brief_section lane)"
+DELIVERY_PRFIX="$(delivery_brief_section prfix)"
+DELIVERY_BG="$(delivery_brief_section bg)"
+delivery_brief_section banana >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ]; ck $? "an unknown role is a usage error (2), never the wrong audience's PR duty"
+
+# ONE predicate per requirement, shared by the composed-brief arm AND the non-vacuity controls.
+has_commit_rule() { case "$1" in *"Commit as soon as you have a coherent unit, push it, then KEEP IMPROVING it"*) return 0;; *) return 1;; esac; }
+has_push_each()   { case "$1" in *"Push after every commit"*) return 0;; *) return 1;; esac; }
+has_cap_reason()  { case "$1" in *"killed at its"*"cap takes the uncommitted tree with it"*) return 0;; *) return 1;; esac; }
+has_resume()      { case "$1" in *'read `git status` and `git diff` FIRST'*"PREDECESSOR's work on"*) return 0;; *) return 1;; esac; }
+has_adopt()       { case "$1" in *"Never discard"*'`git checkout -- .`'*'`git reset --hard`'*) return 0;; *) return 1;; esac; }
+has_open_pr()     { case "$1" in *"Open the PR as soon as the first commit is pushed"*) return 0;; *) return 1;; esac; }
+has_no_second()   { case "$1" in *"do NOT open a second PR"*) return 0;; *) return 1;; esac; }
+# The `bg` role's own predicate: the CONDITIONAL sentence, which is neither of the two above.
+has_bg_pr()       { case "$1" in *"already has an open PR, commit and push onto it"*) return 0;; *) return 1;; esac; }
+
+for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
+  "$_p" "$DELIVERY_LANE"; ck $? "the helper renders it ($_p)"
+done
+
+# §G.1 THE ARTIFACT, NOT THE HELPER: the brief a lane.sh lane would ACTUALLY be given (§C composed it).
 echo
+echo "§G.1 the composed brief a lane.sh lane RECEIVES"
+[ -s "$BRIEF_FILE" ]; ck $? "the composed brief from §C is non-empty (an empty artifact fails every arm below)"
+COMPOSED_G="$(cat "$BRIEF_FILE" 2>/dev/null || true)"
+has_commit_rule "$COMPOSED_G"; ck $? "the imperative: commit as soon as you have a coherent unit, then KEEP IMPROVING"
+has_push_each   "$COMPOSED_G"; ck $? "…push after every commit (not once at the end)"
+has_cap_reason  "$COMPOSED_G"; ck $? "…and WHY: the cap kill takes the uncommitted tree with it"
+has_resume      "$COMPOSED_G"; ck $? "resume: read git status / git diff FIRST — the tree is your predecessor's work"
+has_adopt       "$COMPOSED_G"; ck $? "…and ADOPT it: never checkout -- . / stash / clean / reset --hard over it"
+has_open_pr     "$COMPOSED_G"; ck $? "the lane role opens its OWN PR as soon as the first commit is pushed"
+has_no_second   "$COMPOSED_G"; ck $? "…and is told not to open a SECOND PR"
+case "$COMPOSED_G" in *"$DELIVERY_BRIEF_HEADING"*) rc=0;; *) rc=1;; esac
+ck $rc "…under the findable heading the helper owns"
+# The rule must not have DISPLACED what the brief already said.
+grep -q '## RESEARCH FIRST' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the research contract SURVIVES the insertion"
+grep -q '## Reviewer step' "$BRIEF_FILE" 2>/dev/null; ck $? "…as does the reviewer step"
+grep -q '## Deliverable' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the Deliverable section"
+
+# §G.2 ROLE-CORRECT ON ONE SENTENCE. `pr-doctor.py` dispatches its worker TO AN EXISTING PR, so
+# ordering that worker to "open the PR" would be a FALSE instruction (the #2148/#2325 untruth class).
+echo
+echo "§G.2 role-correct on the PR sentence only — what is owed is identical"
+has_no_second "$DELIVERY_PRFIX"; ck $? "prfix: the PR is ALREADY OPEN, so it must not open a second one"
+has_open_pr "$DELIVERY_PRFIX"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and is NOT told to open a PR it already has"
+for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
+  "$_p" "$DELIVERY_PRFIX"; ck $? "prfix carries the same rule: $_p"
+done
+
+# §G.2b THE THIRD ROLE, AND WHY IT EXISTS. `bg` is `nonblocking-dispatch.sh`'s DEFAULT kind (#2409),
+# and its callers are not all PR-repairers: `ai-drainer.sh` dispatches a multi-PR hygiene lane with
+# four arguments. That lane received the `prfix` sentence — "Your PR is ALREADY OPEN" — which is
+# FALSE about a worker that owns no PR and opens none. The fix is a role whose sentence is true for
+# both worlds, so the arms below assert it BOTH ways: no false order to open a PR it may not have,
+# and no false claim that one exists.
+echo
+echo "§G.2b bg: conditional on the PR sentence — the dispatcher's DEFAULT kind (never a false claim)"
+has_bg_pr "$DELIVERY_BG"; ck $? "bg: the PR sentence is CONDITIONAL ('already has an open PR, commit and push onto it')"
+has_open_pr "$DELIVERY_BG"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and a bg worker is NOT ordered to open a PR (the ai-drainer lane would open nothing)"
+has_no_second "$DELIVERY_BG"; ck $? "…while the no-duplicate rule SURVIVES (it is not role-specific)"
+case "$DELIVERY_BG" in *"Your PR is ALREADY OPEN"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "⛔ …and it makes NO claim that a PR exists — the exact false sentence the P2 fix removes"
+case "$DELIVERY_PRFIX" in *"already has an open PR"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…and neither role's sentence leaked into the other (the predicates are not vacuous)"
+for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
+  "$_p" "$DELIVERY_BG"; ck $? "bg carries the same rule: $_p"
+done
+# ⛔ THE PR SENTENCE IS THE SECTION'S FIRST `- **` BULLET — pin the ORDER, because
+# `nonblocking-dispatch.sh` derives each role's identity from it (a role-invariant heading cannot tell
+# a `lane` brief from a `prfix` one, so the append's key is this line). A bullet reordered above it
+# would silently point that key at the wrong text. Asserted for EVERY role, from the rendered section.
+for _r in lane prfix bg; do
+  _first_bold="$(printf '%s\n' "$(delivery_brief_section "$_r")" | awk '/^- \*\*/{print; exit}')"
+  case "$_r: $_first_bold" in
+    "lane: "*"Open the PR as soon as the first commit is pushed"*) rc=0 ;;
+    "prfix: "*"Your PR is ALREADY OPEN"*)                          rc=0 ;;
+    "bg: "*"already has an open PR, commit and push onto it"*)      rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck $rc "$_r: the FIRST '- **' bullet is that role's PR sentence (the append's key is derived from it)"
+done
+
+# §G.3 THE CONTROLLER TEMPLATE — the authored-brief source. Byte for byte, or it is a second copy.
+echo
+echo "§G.3 templates/LANE-BRIEF.md mirrors the section BYTE FOR BYTE (drift-pinned block)"
+DBLOCK="$(awk '/^<!-- BEGIN delivery-contract/{f=1;next} /^<!-- END delivery-contract -->$/{exit} f' "$TEMPLATE")"
+[ -n "$DBLOCK" ]; ck $? "the template carries a delivery-contract block"
+if [ "$DBLOCK" = "$DELIVERY_LANE" ]; then rc=0; else rc=1; fi
+ck $rc "the block EQUALS the helper's rendered lane section (one home: edit the helper, not the template)"
+grep -qF 'BEGIN delivery-contract' "$TEMPLATE"; ck $? "…under named markers, so the pin cannot drift silently"
+grep -q 'edit THERE, not here' "$TEMPLATE"; ck $? "…and the marker says where the text actually lives"
+
+# §G.4 NON-VACUITY, both levels.
+echo
+echo "§G.4 NON-VACUITY — the arms above can fail"
+# (a) predicate level: strip the clause from the COMPOSED text; the SAME predicate must fire.
+NO_COMMIT="$(printf '%s\n' "$COMPOSED_G" | sed 's/Commit as soon as you have a coherent unit, push it, then KEEP IMPROVING it/./')"
+has_commit_rule "$NO_COMMIT"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "stripping the imperative MAKES has_commit_rule FAIL"
+NO_RESUME="$(printf '%s\n' "$COMPOSED_G" | sed 's/PREDECESSOR.s work on/./')"
+has_resume "$NO_RESUME"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "…stripping the resume half MAKES has_resume FAIL (both halves are pinned)"
+# (b) composer level: a helper that renders the section WITHOUT its heading must make lane.sh REFUSE.
+# That is lane.sh's BUILD-TIME guard, and without this arm it could be inert (exit 0, or a grep that
+# never matches) while every arm above stayed green — the no-op-gate shape.
+STRIPG="$TMP/stripg"; mkdir -p "$STRIPG"
+cp "$HERE/spawn-gate.sh" "$STRIPG/spawn-gate.sh"; cp "$LANE" "$STRIPG/lane.sh"
+cp "$HERE/repo-target.sh" "$STRIPG/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIPG/repo-slug.sh"
+cp "$HERE/brief-gate.sh" "$STRIPG/brief-gate.sh"; cp "$HERE/gate-policy.sh" "$STRIPG/gate-policy.sh"
+cp "$HERE/wt-lifecycle.sh" "$STRIPG/wt-lifecycle.sh"   # #2033: refusing on a MISSING module is this rig's own bug, not the guard's verdict
+sed "s#^DELIVERY_BRIEF_HEADING=.*#DELIVERY_BRIEF_HEADING=''#" "$HELPER" > "$STRIPG/reviewer-preflight.sh"
+grep -q "^DELIVERY_BRIEF_HEADING=''$" "$STRIPG/reviewer-preflight.sh"; ck $? "the heading-stripped helper copy was produced"
+for _rigbr in fix/stripg; do git -C "$TMP" update-ref "refs/heads/$_rigbr" HEAD 2>/dev/null || true; done
+mkdir -p "$TMP/o5/logs"
+(
+  cd "$TMP" || exit 1
+  O="$TMP/o5" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+    bash "$STRIPG/lane.sh" 2981 fix/stripg acme/widget
+) >"$TMP/o5/lane.out" 2>&1
+_rc5=$?
+[ "$_rc5" = "78" ]; ck $? "⛔ a composer that loses the section REFUSES the lane with 78 — the build-time guard is LIVE (rc=$_rc5)"
+grep -q 'COMMIT-AS-YOU-GO' "$TMP/o5/lane.out" 2>/dev/null; ck $? "…and says WHICH section was lost, in the refusal"
+
+# §G.5 ONE SOURCE, ASSERTED. The heading literal must live in the helper (its definition) and in the
+# drift-pinned template copy — nowhere else. A second copy is the drift this section exists to refuse.
+echo
+echo "§G.5 the heading has ONE home (plus the pinned template copy)"
+STRAY=""
+for _f in "$TEMPLATE" "$LANE" "$HERE/fix-one.sh" "$HERE/brief-gate.sh" "$HERE/spawn-gate.sh" \
+          "$HERE/nonblocking-dispatch.sh" "$(cd "$HERE/../.." && pwd)/scripts/pr-doctor.py"; do
+  [ -f "$_f" ] || continue
+  case "$_f" in "$TEMPLATE"|"$HELPER") continue;; esac
+  grep -qF "$DELIVERY_BRIEF_HEADING" "$_f" 2>/dev/null && STRAY="$STRAY $_f"
+done
+[ -z "$STRAY" ]; ck $? "no composer carries its own copy of the section (stray:${STRAY:- none})"
+# …and every composer that hands a worker a brief SPLICES it into that brief — it does not merely
+# CALL the renderer (this PR's review, cycle 3 — P2). ⛔ THE OLD ARM WAS A FALSE PASS: it grepped for
+# `--delivery-brief`, a string every composer also carries in its own comments and FATAL messages, so
+# deleting the line that actually inserts the section into the prompt left it GREEN. That is the
+# no-op-gate shape this suite exists to refuse, and the composer it left uncovered — `fix-one.sh` — is
+# the one behind the five `prfix` lanes #2981 measured. The needle is now the SPLICE ITSELF: a line
+# consisting SOLELY of the variable that holds the render.
+_delivery_splice() { # _delivery_splice <file> <VAR> — a line that is exactly `$VAR`
+  grep -qxF "\$$2" "$1" 2>/dev/null
+}
+_delivery_splice "$LANE" DELIVERY_BRIEF; ck $? "lane.sh SPLICES \$DELIVERY_BRIEF into the brief heredoc (not just renders it)"
+_delivery_splice "$HERE/fix-one.sh" FIX_DELIVERY_BRIEF; ck $? "fix-one.sh SPLICES \$FIX_DELIVERY_BRIEF into the fixer brief heredoc (the composer behind the #2981 batch)"
+# nonblocking-dispatch.sh has no heredoc: it appends the render to the AUTHORED brief, and the artifact
+# that brief becomes is driven by brief-gate.test.sh §D.2. Pinned here is that the append really writes
+# the RENDERED text (deleting the `printf` leaves the render call and every FATAL message in place).
+grep -qF '"$NB_DELIVERY" >> "$PROMPT"' "$HERE/nonblocking-dispatch.sh" 2>/dev/null
+ck $? "nonblocking-dispatch.sh WRITES the rendered section into the authored brief"
+# pr-doctor.py returns the concatenation, so the splice is the `+` operand — `delivery_section()` alone
+# also appears in its own `def`, which is what makes the render-only needle vacuous.
+grep -qF 'delivery_section() +' "$(cd "$HERE/../.." && pwd)/scripts/pr-doctor.py" 2>/dev/null
+ck $? "pr-doctor.py SPLICES delivery_section() into the brief it returns"
+
+echo
+
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
