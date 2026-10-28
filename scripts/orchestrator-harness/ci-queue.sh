@@ -567,7 +567,7 @@ ciq_ci_allowed() {
 # Prints the verdict, the record and the derivation. Exit code follows the verdict (0 deep, 1 ok,
 # 2 unknown) so an operator (or a hook) can branch on it without parsing.
 ciq_cli() {
-  local repo="" verb="${1:-status}" operand="" v drc rc
+  local repo="" verb="${1:-status}" operand="" v drc rc src
   # ⛔ `shift 2>/dev/null` IS NOT `shift 2` WITH STDERR SILENCED (#2333 review cycle 2, P2): bash parses
   # `2>` as an FD redirect, so that spelling shifts ONE positional and drops the verb — accidentally
   # right here, and a trap for the next editor who adds a second `shift`. Drop the verb explicitly.
@@ -593,9 +593,25 @@ ciq_cli() {
       # assigned nowhere in the repo, so it said `source=gh` on the run where gh had failed), and the
       # record's PATH is labelled a path — `at=` in the record is an epoch second, so printing a
       # path under that label was a second unmeasured claim.
-      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" \
-        "$( case "${CIQ_STATE}" in fresh) printf 'gh' ;; cache) printf 'record(cache)' ;; *) printf 'unknown' ;; esac )" \
-        "${CIQ_AGE:-?}"
+      # ⛔ NO `case` INSIDE A `$( )` HERE (#2969). On bash 3.2 — macOS's `/bin/bash`, and the
+      # interpreter the launchd controller is started with — the `)` that closes a `case` PATTERN is
+      # read as the closer of the SUBSTITUTION: the substitution is re-parsed at EXECUTION, bash
+      # reports `syntax error near unexpected token 'newline'` against this line, and substitutes the
+      # LITERAL remainder of the line instead of a value. Measured on this box: `source=` printed
+      # ` printf 'gh' ;; cache) printf 'record(cache)' ;; *) printf 'unknown' ;; esac )` while the
+      # command still exited 0 — a corrupted field under a green exit, so every consumer read the
+      # `source` of the reading as script text. `bash -n` is blind to it (it parses the outer script
+      # only) and bash 4.4+ parse it correctly, which is why only 3.2 boxes were wrong.
+      # ⛔ PARENTHESISING THE PATTERN IS NOT THE FIX: bash counts parens, so `(fresh)` only helps
+      # until the `*)` catch-all, whose own `)` closes the substitution (measured: the shape
+      # `in (fresh) … *) …` still fails). Hoisting the `case` out of the substitution removes the
+      # ambiguity for every bash instead of for the ones that happen to parse it.
+      case "${CIQ_STATE}" in
+        fresh) src='gh' ;;
+        cache) src='record(cache)' ;;
+        *)     src='unknown' ;;
+      esac
+      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" "$src" "${CIQ_AGE:-?}"
       printf 'record: queued=%s running=%s runners=%s busy=%s record-file=%s\n' \
         "${CIQ_QUEUED:-?}" "${CIQ_RUNNING:-?}" "${CIQ_RUNNERS:-?}" "${CIQ_BUSY:-?}" "$(ciq_state_dir)/ci-queue-$(ciq_slug "${repo:-}")"
       printf 'derivation: ceiling = ceil(runners * horizon / job_p90) = ceil(%s * %s / %s) = %s\n' \
