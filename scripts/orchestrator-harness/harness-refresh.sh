@@ -316,10 +316,15 @@ if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
   # controller gets EPERM, and reading that as NOT-LIVE has a consequence beyond this block: `set_pending`
   # would write `inert` and `restart_request_record` would durably record
   # `request=cleared reason=no-live-controller` — from inside a LIVE controller. `ps -p` reads across
-  # users, so it is the second opinion: GONE requires BOTH to say gone. This direction is fail-closed:
-  # `CONTROLLER_LIVE=1` only ever DOWNGRADES `current` (it gates the `stamp:*` refinement and the
-  # upgrade path re-verifies ownership with `_began_before_lock`), so a `ps` false positive cannot buy a
-  # `current` on its own.
+  # users, so it is the second opinion: GONE requires BOTH to say gone.
+  # ⛔ AND THE FLAG WORKS IN BOTH DIRECTIONS, SO ITS SAFETY ARGUMENT HAS TO COVER BOTH. It does NOT "only
+  # ever downgrade": `CONTROLLER_LIVE=1` also ENABLES the source-3 upgrade (`controller_identity` →
+  # `RUNNING`), which is the only thing that can honestly END `restart-pending` on a cell — the file's own
+  # header says so (`current` is reachable only through the controller's argv). What keeps that promotion
+  # sound is NOT this flag but the OWNERSHIP re-verification it gates: the upgrade refuses unless
+  # `_began_before_lock` proves the named process began at/before the lock was written, which a recycled
+  # pid cannot satisfy. So a `ps -p` false positive cannot buy a `current` on its own — not because the
+  # flag is downgrade-only, but because the stage it opens re-checks ownership by age.
   if [ -n "$CONTROLLER_PID" ] \
      && { kill -0 "$CONTROLLER_PID" 2>/dev/null || "${PS_BIN:-ps}" -p "$CONTROLLER_PID" >/dev/null 2>&1; }; then
     CONTROLLER_LIVE=1
@@ -409,7 +414,7 @@ controller_identity() { # sets CTRL_HEAD/CTRL_TREE from the LIVE controller. rc 
   # #2641 back). The quote characters live in variables, not as backslash escapes: this file is read by
   # a gate that dequotes it statically (see #2175), and a backslash-quote in the body changes what that
   # read sees.
-  # ⛔ AND IT IS THE SAME PREDICATE AS THE SOURCE-2 SPLIT'S DEQUOTE ABOVE. The two readers are redundant
+  # ⛔ AND IT IS THE SAME PREDICATE AS THE SOURCE-2 SPLIT'S DEQUOTE BELOW. The two readers are redundant
   # (source-2 is pin-rooted, this one is the fallback), so on any fixture each answers for the other and
   # NEITHER copy can be individually witnessed: removing either one alone leaves the suite green, and only
   # removing BOTH reddens S13 (measured). That makes this an aggregate witness, not a per-copy one — so if

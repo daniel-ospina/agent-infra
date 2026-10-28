@@ -1092,12 +1092,19 @@ case "$PROV_OUT" in
   *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
   *) bad "status prints the record but not what it means: $PROV_OUT" ;;
 esac
-# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". `harness-refresh.sh`
-# writes `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
-# is a CLAIM, and NOTHING was measured busy there — so the generic blocked sentence named a cause that
-# does not exist and told the operator to wait for a population that may never exist. The identity cause
-# needs its own arm, and it must come first.
-printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=unknown checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". On that path
+# `harness-refresh.sh` returns from `set_pending` BEFORE `inflight_gate` is consulted, so no population is
+# ever evaluated as the BLOCKER. The record's `lanes=` is still written — it is measured separately, before
+# `set_pending`, and may legitimately be a NON-ZERO number (measured: a live `$O/lane.sh` gives
+# `blocked=identity lanes=1`) — but it is not why the restart is blocked. The identity is. So the generic
+# blocked sentence named a cause that does not exist and told the operator to wait for a population that
+# may never be the thing holding the restart back. The identity cause needs its own arm, and it comes first.
+# ⛔ AND THE SPECIMEN CARRIES A NON-ZERO lanes= ON PURPOSE: it is the HARDEST case for this arm. A record
+# with `blocked=identity lanes=1` has a lane population the operator can SEE, so the generic "wait for that
+# population to go idle" advice looks plausible — yet `inflight_gate` was never consulted on this path, so
+# lanes= is not the blocker and waiting would never clear it. If the arm ever regresses to the generic one,
+# this specimen is what catches it.
+printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
   "$(( $(date +%s) - 9 ))" > "$P/o/state/restart-request"
 prov status
 case "$PROV_OUT" in
