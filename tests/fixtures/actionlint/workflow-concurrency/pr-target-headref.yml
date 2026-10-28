@@ -1,0 +1,14 @@
+# On `pull_request_target`, `github.head_ref` is the PR's head branch — a correct per-PR key. The
+# refusal claimed it "collapses every PR into one", which is what `github.ref` does there, not
+# `head_ref` (#2660 round 5).
+name: PR target head ref
+on:
+  pull_request_target:
+concurrency:
+  group: pr-target-headref-${{ github.head_ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
