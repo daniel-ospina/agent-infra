@@ -2,7 +2,8 @@
 # tests/lane-signal-forensics/run.sh — mutation harness for #2932.
 #
 # The suite (extensions/task-signal-forensics.test.ts) proves the two arms: a
-# TERMed lane records its signaller, and its uncommitted work is checkpointed.
+# TERMed lane records its PARENT and its uncommitted work is checkpointed (and that
+# the record never claims a sender it cannot observe — the third-process test).
 # A green suite proves nothing about whether an ASSERTION could ever fail, so this
 # driver removes each arm's mechanism and requires the suite to redden on the
 # assertion that names it.
@@ -87,6 +88,14 @@ echo "== lane-signal-forensics mutation harness (#2932) =="
 # hash works tracked or not; the `git diff` check below still covers the tracked
 # case from the other direction.
 SRC_HASH_BEFORE="$(shasum -a 256 "$SRC_EXT" | awk '{print $1}')"
+# ⛔ THE `git diff` GUARD COMPARES THE DIFF TO ITSELF, NOT TO `HEAD` (#2934). It used
+# to be `git diff --quiet -- <path>`, which asks "does this file differ from HEAD?" —
+# a DIFFERENT question from "did this run change it?". On the pre-commit run this
+# driver exists for, the extension is legitimately dirty, so the old form reported
+# `the tracked extension source was MODIFIED — the mutants escaped the copy` about a
+# tree no mutant had touched: a false FAIL that reads as a mutation escape. Snapshot
+# the diff and compare it after the run, which answers the actual question.
+SRC_DIFF_BEFORE="$(git -C "$ROOT" diff -- "$SRC_EXT")"
 
 # ── baseline ────────────────────────────────────────────────────────────────
 RC="$(run_suite baseline)"
@@ -175,10 +184,10 @@ if [ "$SRC_HASH_BEFORE" = "$SRC_HASH_AFTER" ]; then
 else
   bad "the extension source CHANGED during the run ($SRC_HASH_BEFORE -> $SRC_HASH_AFTER) — a mutant escaped the copy"
 fi
-if git -C "$ROOT" diff --quiet -- "$SRC_EXT"; then
-  ok "the tracked extension source is unmodified (mutants live only in the temp copy)"
+if [ "$(git -C "$ROOT" diff -- "$SRC_EXT")" = "$SRC_DIFF_BEFORE" ]; then
+  ok "the tracked extension's diff is unchanged by the run (a dirty pre-commit tree included)"
 else
-  bad "the tracked extension source was MODIFIED — the mutants escaped the copy"
+  bad "the tracked extension source was MODIFIED BY THIS RUN — the mutants escaped the copy"
 fi
 
 echo

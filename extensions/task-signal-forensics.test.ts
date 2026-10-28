@@ -3,8 +3,10 @@
  *
  * Two arms, and each one is proven by a REAL process receiving a REAL SIGTERM:
  *
- *   arm 1  the victim records WHO signalled it (pid + the parent's `ps` row),
- *          into a file it writes itself, before it dies;
+ *   arm 1  the victim records what is KNOWABLE at signal time (its own pid and
+ *          the PARENT's `ps` row) into a file it writes itself, before it dies —
+ *          and records explicitly that the sender is NOT knowable, which the
+ *          third-process case below proves rather than asserts;
  *   arm 2  the victim's uncommitted work survives the death, as a snapshot
  *          commit pinned by `refs/lane-checkpoints/…`, with the branch, HEAD,
  *          the real index and the working tree untouched.
@@ -15,7 +17,9 @@
  *   • the exit status must still be SIGTERM/143 — an instrument that rescues the
  *     work but makes the child unkillable trades one defect for a worse one;
  *   • `git status --porcelain` and `HEAD` must be IDENTICAL before and after, so
- *     "the work survived" cannot be satisfied by writing it into the branch.
+ *     "the work survived" cannot be satisfied by writing it into the branch;
+ *   • the trap must not DELAY the exit past the parent's own SIGKILL, which is
+ *     what makes it safe to run before pi's graceful shutdown.
  *
  * The fixture is a REAL process: a temp `.mjs` bootstrap that imports the
  * extension source by its own path, arms it, and idles. It is a direct child of
@@ -34,7 +38,12 @@ import { spawn, execFileSync } from "node:child_process";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
 import {
+  APPEND_RESERVE_MS,
+  CHECKPOINT_BUDGET_MS,
   CHECKPOINT_REF_PREFIX,
+  GIT_CMD_TIMEOUT_MS,
+  PS_TIMEOUT_MS,
+  SENDER_NOTE,
   SIGNAL_LOG_MAX_BYTES,
   SIGNAL_WINDOW_MS,
   appendSignalRecord,
@@ -46,6 +55,7 @@ import {
   defaultGitRunner,
   gitOpInProgress,
   installSignalForensics,
+  probePpidAtSignal,
   signalForensicsActive,
   _resetArmedForTests,
   type CheckpointResult,
@@ -201,7 +211,7 @@ function spawnLane(repoDir: string, logPath: string): Promise<{
 
 // ── arm 1 + arm 2: the end-to-end proof ─────────────────────────────────────
 
-test("E2E: a TERMed lane records its signaller and keeps its work (arms 1 + 2)", async () => {
+test("E2E: a TERMed lane records its parent and keeps its work (arms 1 + 2)", async () => {
   const repo = dirtyRepo();
   const logPath = path.join(tmpDir("lane-sig-log-"), "lane-signals.jsonl");
 
@@ -213,14 +223,28 @@ test("E2E: a TERMed lane records its signaller and keeps its work (arms 1 + 2)",
   const lane = await spawnLane(repo, logPath);
   ok(lane.pid > 0, "fixture control: the lane process exists before the signal (non-vacuity)");
 
+  const signalledAt = Date.now();
   lane.child.kill("SIGTERM");
   const { code, signal } = await lane.stop();
+  const shutdownMs = Date.now() - signalledAt;
 
   // ── exit status: an instrument must never make a child unkillable ────────
   const diedBySignal = signal === "SIGTERM" || code === 143;
   ok(
     diedBySignal,
     `exit status preserved (SIGTERM/143) — got code=${code} signal=${signal} stderr=${lane.stderr().slice(-400)}`,
+  );
+
+  // P3: the trap delays the exit, so the delay must fit the parent's budget.
+  // This module arms at module load, so its synchronous work runs BEFORE pi's own
+  // SIGTERM listener. The parent's watchdogs escalate SIGTERM -> 5 s -> SIGKILL
+  // (`armExitWatchdog` / `armCompletionWatchdog` in extensions/builtin-tools), so a
+  // handler that overran that budget would GUARANTEE the SIGKILL landed inside pi's
+  // graceful shutdown. Asserted end-to-end because it is the property nobody would
+  // notice regressing: every other assertion in this suite would still pass.
+  ok(
+    shutdownMs < 5_000,
+    `P3: SIGTERM -> exit stayed inside the parent's 5 s SIGKILL (measured ${shutdownMs} ms against a ${SIGNAL_WINDOW_MS} ms handler window)`,
   );
 
   // ── arm 1: WHO ──────────────────────────────────────────────────────────
@@ -230,13 +254,18 @@ test("E2E: a TERMed lane records its signaller and keeps its work (arms 1 + 2)",
   equal(rec.event, "lane-signalled", "arm 1: record carries the event name");
   equal(rec.signal, "SIGTERM", "arm 1: record names the signal");
   equal(rec.pid, lane.pid, "arm 1: record names the VICTIM pid");
-  equal(rec.ppid, process.pid, "arm 1: record names the real parent pid (this test process)");
-  equal(rec.parent_alive, true, "arm 1: the parent was still alive when the signal landed");
-  ok(rec.parent_argv.length > 0, `arm 1: the parent's command line was read at signal time (got ${JSON.stringify(rec.parent_argv)})`);
+  equal(rec.ppid_at_signal.pid, process.pid, "arm 1: records the real parent pid (this test process)");
+  equal(rec.ppid_at_signal.alive, true, "arm 1: the parent was still alive when the signal landed");
   ok(
-    /task-signal-forensics\.test\.ts/.test(rec.parent_argv),
-    `arm 1: parent_argv identifies THIS test's command line (got ${JSON.stringify(rec.parent_argv.slice(0, 160))})`,
+    rec.ppid_at_signal.argv.length > 0,
+    `arm 1: the parent's command line was read at signal time (got ${JSON.stringify(rec.ppid_at_signal.argv)})`,
   );
+  ok(
+    /task-signal-forensics\.test\.ts/.test(rec.ppid_at_signal.argv),
+    `arm 1: the parent's argv identifies THIS test's command line (got ${JSON.stringify(rec.ppid_at_signal.argv.slice(0, 160))})`,
+  );
+  equal(rec.sender, "unrecorded", "arm 1: the record states that attribution was NOT recorded");
+  equal(rec.sender_note, SENDER_NOTE, "arm 1: the limitation travels inside the record, not only in the doc");
   equal(rec.cwd, fs.realpathSync(repo), "arm 1: record names the victim's cwd");
   ok(typeof rec.ts === "string" && !Number.isNaN(Date.parse(rec.ts)), "arm 1: record is timestamped ISO-8601");
 
@@ -264,6 +293,102 @@ test("E2E: a TERMed lane records its signaller and keeps its work (arms 1 + 2)",
 
 // ── gates ───────────────────────────────────────────────────────────────────
 
+// P1 — the limitation, MEASURED rather than asserted.
+//
+// #2934 review P1: the claim "records who signalled" is false, and the fix is to
+// state what IS recorded rather than to chase the sender — Node's signal API does
+// not surface the kernel's `siginfo.si_pid`, and libuv keeps no such record. This
+// test is the measurement behind that decision: a THIRD process (neither the
+// victim nor its parent) delivers the SIGTERM, and the record names the PARENT.
+// So the record can rule the parent in or out and cannot name anyone else — and
+// the suite now pins that, so a later change that starts implying attribution
+// reddens here instead of misleading the next investigation.
+test("P1: a THIRD process's SIGTERM is recorded as the PARENT, not as the sender", async () => {
+  const repo = dirtyRepo();
+  const logPath = path.join(tmpDir("lane-sig-third-"), "lane-signals.jsonl");
+  const lane = await spawnLane(repo, logPath);
+
+  // The killer is a child of THIS suite, i.e. a SIBLING of the victim: neither the
+  // victim (so it is not recording itself) nor the parent.
+  const killer = spawn(
+    process.execPath,
+    [
+      "-e",
+      `setTimeout(() => { try { process.kill(${lane.pid}, "SIGTERM"); process.exit(0); } catch { process.exit(3); } }, 50);`,
+    ],
+    { stdio: "ignore" },
+  );
+  const killerPid = killer.pid as number;
+  const killerExit = await new Promise<number | null>((res) => killer.on("close", (c) => res(c)));
+  const { code, signal } = await lane.stop();
+
+  equal(killerExit, 0, `the third process really delivered the signal (its own exit was ${killerExit})`);
+  ok(signal === "SIGTERM" || code === 143, `the victim died by SIGTERM (code=${code} signal=${signal})`);
+  ok(killerPid > 0 && killerPid !== process.pid, "the killer is a distinct process from the parent");
+
+  const records = readRecords(logPath);
+  equal(records.length, 1, `arm 1: exactly one record (got ${records.length})`);
+  const rec = records[0];
+
+  // The record names the PARENT, which sent nothing.
+  equal(rec.ppid_at_signal.pid, process.pid, "P1: the record names the parent, even though the parent sent nothing");
+  equal(rec.sender, "unrecorded", "P1: and says the sender was NOT recorded, so nobody can read it as attribution");
+  // The killer appears in NO pid field. Enumerated rather than grepped: a substring
+  // search over the JSON would collide with a timestamp and pass by luck.
+  const pidFields = [rec.pid, rec.ppid_at_signal.pid, rec.pgid];
+  ok(
+    !pidFields.includes(killerPid),
+    `P1: the actual sender (pid ${killerPid}) appears in no pid field (pid=${rec.pid} ppid_at_signal=${rec.ppid_at_signal.pid} pgid=${rec.pgid})`,
+  );
+});
+
+// P2.1 — "armed in every dispatched `pi -p` child" was FALSE. The armed population
+// is exactly the two in-process dispatchers' children; the harness lanes run
+// `pi -p` with neither marker. Pinned as data so the coverage statement in the
+// header and the doc cannot drift from the gate.
+test("coverage: armed ONLY for the two in-process dispatchers' children", () => {
+  // extensions/builtin-tools `subAgentEnv` — forced, unconditionally (#176/#264).
+  const taskChild = { TASK_HEARTBEAT: "1", PI_MODE: "print" };
+  // extensions/subagent `childEnv` — the same pair, emitter silenced (#285).
+  const subagentChild = { ...taskChild, TASK_HEARTBEAT_DISABLE: "1" };
+  // scripts/orchestrator-harness/spawn-gate.sh `run_agent`: `pi -p --no-session`
+  // with neither marker — lane.sh / fix-one.sh / merge-one.sh.
+  const harnessLane = { HOME: "/x", PATH: "/usr/bin" };
+  // A fleet/interactive `pi -p` with no PI_MODE.
+  const plainPrintRun = { TASK_HEARTBEAT: undefined, PI_MODE: undefined };
+
+  ok(signalForensicsActive(taskChild), "armed in a `task`-tool child");
+  ok(signalForensicsActive(subagentChild), "armed in a `subagent`-tool child (both dispatchers force the pair)");
+  ok(!signalForensicsActive(harnessLane), "NOT armed in a harness lane — run_agent sets neither marker");
+  ok(!signalForensicsActive(plainPrintRun), "NOT armed in a plain `pi -p` run");
+});
+
+// P3 — the trap delays the exit, so the delay is bounded and the bound is asserted
+// rather than described in a comment nobody re-reads.
+test("P3: the handler budget fits the parent's SIGKILL and leaves pi a shutdown", () => {
+  const PARENT_SIGKILL_AFTER_MS = 5_000; // armExitWatchdog / armCompletionWatchdog
+  ok(
+    SIGNAL_WINDOW_MS <= PARENT_SIGKILL_AFTER_MS / 2,
+    `the whole handler takes at most ${SIGNAL_WINDOW_MS} ms, leaving pi at least half of the parent's ${PARENT_SIGKILL_AFTER_MS} ms`,
+  );
+  ok(
+    3 * PS_TIMEOUT_MS < SIGNAL_WINDOW_MS,
+    `the three ps probes (3 x ${PS_TIMEOUT_MS} ms) cannot consume the window — the snapshot always gets a turn`,
+  );
+  ok(
+    CHECKPOINT_BUDGET_MS + APPEND_RESERVE_MS <= SIGNAL_WINDOW_MS,
+    `snapshot ${CHECKPOINT_BUDGET_MS} ms + append reserve ${APPEND_RESERVE_MS} ms fits the ${SIGNAL_WINDOW_MS} ms window`,
+  );
+  ok(
+    GIT_CMD_TIMEOUT_MS <= CHECKPOINT_BUDGET_MS,
+    `no single git step (${GIT_CMD_TIMEOUT_MS} ms) may outlast the whole snapshot budget (${CHECKPOINT_BUDGET_MS} ms)`,
+  );
+  // The probe helper still measures only what its name claims.
+  const self = probePpidAtSignal(process.pid, 1_000);
+  equal(self.pid, process.pid, "probePpidAtSignal reports the pid it was asked about, and nothing about senders");
+  ok(self.alive, "and its liveness read agrees with reality");
+});
+
 test("gate: arm 1 arms only for a dispatch child", () => {
   ok(signalForensicsActive({ TASK_HEARTBEAT: "1", PI_MODE: "print" }), "armed for the dispatch-child pair");
   ok(!signalForensicsActive({ TASK_HEARTBEAT: "1" }), "NOT armed without PI_MODE=print");
@@ -285,14 +410,24 @@ test("arm 1: the record shape is bounded and typed", () => {
   const rec = buildSignalRecord({
     signal: "SIGINT",
     pid: 42,
-    facts: { ppid: 7, parentArgv: "pi", parentComm: "pi", parentAlive: true },
+    facts: { pid: 7, argv: "pi", comm: "pi", alive: true },
     pgid: 42,
     cwd: "/x",
     checkpoint: { status: "skipped", reason: "clean" },
     now: 1793133305000,
   });
   equal(rec.event, "lane-signalled", "event name");
-  equal(rec.ppid, 7, "ppid");
+  equal(rec.ppid_at_signal.pid, 7, "ppid_at_signal.pid");
+  equal(rec.ppid_at_signal.argv, "pi", "ppid_at_signal.argv");
+  equal(rec.ppid_at_signal.comm, "pi", "ppid_at_signal.comm");
+  equal(rec.ppid_at_signal.alive, true, "ppid_at_signal.alive");
+  equal(rec.sender, "unrecorded", "sender is an explicit non-answer, never an inferred one");
+  ok(/PARENT at signal time, not the sender/.test(rec.sender_note), "the note says what the field is not");
+  deepEqual(
+    Object.keys(rec),
+    ["event", "signal", "pid", "ppid_at_signal", "sender", "sender_note", "pgid", "cwd", "checkpoint", "ts"],
+    "no field's name implies an attribution the instrument cannot make",
+  );
   equal(rec.pgid, 42, "pgid");
   equal(rec.ts, new Date(1793133305000).toISOString(), "ts is the ISO form of the injected clock");
   ok(JSON.stringify(rec).includes('"reason":"clean"'), "the checkpoint reason travels inside the record");
@@ -307,13 +442,13 @@ test("arm 1: a credential on the parent's command line never reaches the log", (
     buildSignalRecord({
       signal: "SIGTERM",
       pid: 43,
-      facts: { ppid: 7, parentArgv, parentComm: "/bin/bash", parentAlive: true },
+      facts: { pid: 7, argv: parentArgv, comm: "/bin/bash", alive: true },
       cwd: "/x",
       checkpoint: { status: "skipped", reason: "clean" },
       now: 1_793_133_305_000,
     });
 
-  const inlineEnv = build("/bin/bash -c export GH_TOKEN=ghp_liveSecretValue123 && pi -p").parent_argv;
+  const inlineEnv = build("/bin/bash -c export GH_TOKEN=ghp_liveSecretValue123 && pi -p").ppid_at_signal.argv;
   ok(
     !/ghp_liveSecretValue123/.test(inlineEnv),
     `arm 1: an inline GH_TOKEN=… is redacted before it is persisted (got ${JSON.stringify(inlineEnv)})`,
@@ -321,11 +456,11 @@ test("arm 1: a credential on the parent's command line never reaches the log", (
 
   const bareToken = build("pi -p --flag ghp_bareTokenValue456");
   ok(
-    !/ghp_bareTokenValue456/.test(bareToken.parent_argv),
-    `arm 1: a bare token body is redacted whole, not up to the underscore (got ${JSON.stringify(bareToken.parent_argv)})`,
+    !/ghp_bareTokenValue456/.test(bareToken.ppid_at_signal.argv),
+    `arm 1: a bare token body is redacted whole, not up to the underscore (got ${JSON.stringify(bareToken.ppid_at_signal.argv)})`,
   );
   equal(
-    bareToken.parent_argv,
+    bareToken.ppid_at_signal.argv,
     "pi -p --flag ghp_***",
     "arm 1: the redaction is the shared seam's own rule, not a second copy",
   );
@@ -338,7 +473,7 @@ test("arm 1: the log is append-only and rotates at the ceiling", () => {
     buildSignalRecord({
       signal: "SIGTERM",
       pid: n,
-      facts: { ppid: 1, parentArgv: "p", parentComm: "p", parentAlive: true },
+      facts: { pid: 1, argv: "p", comm: "p", alive: true },
       cwd: "/x",
       checkpoint: { status: "skipped", reason: "clean" },
       now: 1_793_133_305_000,
@@ -477,7 +612,7 @@ test("arm 1: the re-raise is skipped when another owner holds the lifecycle", ()
       installSignalForensics({
         env: { TASK_HEARTBEAT: "1", PI_MODE: "print" },
         logPath: log,
-        senderProbe: () => ({ ppid: 1, parentArgv: "pi", parentComm: "pi", parentAlive: true }),
+        ppidProbe: () => ({ pid: 1, argv: "pi", comm: "pi", alive: true }),
         checkpoint: () => ({ status: "skipped", reason: "clean" }),
         raiseSignal: (pid, sig) => void raised.push([pid, sig]),
         exitProcess: (code) => void exits.push(code),
@@ -505,7 +640,7 @@ test("arm 1: as the SOLE listener it re-raises the same signal", () => {
     installSignalForensics({
       env: { TASK_HEARTBEAT: "1", PI_MODE: "print" },
       logPath: log,
-      senderProbe: () => ({ ppid: 1, parentArgv: "pi", parentComm: "pi", parentAlive: false }),
+      ppidProbe: () => ({ pid: 1, argv: "pi", comm: "pi", alive: false }),
       checkpoint: () => ({ status: "skipped", reason: "clean" }),
       raiseSignal: (pid, sig) => void raised.push([pid, sig]),
       exitProcess: (code) => void exits.push(code),
@@ -517,12 +652,12 @@ test("arm 1: as the SOLE listener it re-raises the same signal", () => {
   equal(raised[0][0], process.pid, "the re-raise targets this process");
   equal(raised[0][1], "SIGTERM", "with the same signal, so the exit status is unchanged");
   const rec = readRecords(log)[0];
-  equal(rec.parent_alive, false, "a parent that is gone is recorded as gone, not as an empty argv");
+  equal(rec.ppid_at_signal.alive, false, "a parent that is gone is recorded as gone, not as an empty argv");
   process.removeAllListeners("SIGTERM");
   _resetArmedForTests();
 });
 
-test("arm 1: an exhausted window still writes the attribution record", () => {
+test("arm 1: an exhausted window still writes the record", () => {
   // The probes are the slow step under load. If they consume the whole window, the
   // snapshot must be skipped BY NAME and the record must STILL be written: the
   // append is arm 1's only output, and before this budget was derived from one
@@ -545,9 +680,9 @@ test("arm 1: an exhausted window still writes the attribution record", () => {
       ppid: 6,
       cwd: "/x",
       now: () => clock,
-      senderProbe: () => {
+      ppidProbe: () => {
         clock += SIGNAL_WINDOW_MS + 1_000; // the probe consumed the window and more
-        return { ppid: 6, parentArgv: "pi", parentComm: "pi", parentAlive: true };
+        return { pid: 6, argv: "pi", comm: "pi", alive: true };
       },
       run: neverRuns,
       stderr: () => {},
@@ -558,7 +693,7 @@ test("arm 1: an exhausted window still writes the attribution record", () => {
   );
   process.emit("SIGTERM");
   const recs = readRecords(log);
-  equal(recs.length, 1, "the attribution record is written even when the window is gone");
+  equal(recs.length, 1, "the record is written even when the window is gone");
   equal(recs[0].checkpoint.status, "skipped", "no snapshot is claimed");
   equal(
     recs[0].checkpoint.reason,

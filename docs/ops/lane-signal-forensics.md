@@ -2,7 +2,8 @@
 
 **Status:** evidence recorded + instrument shipped (`extensions/task-signal-forensics.ts`); the
 2026-10-27 mass kill itself remains **unattributable from logs** (proof below), which is exactly why
-the instrument exists.
+the instrument exists — and, since the #2934 review, **the instrument does not claim attribution it
+cannot produce**: it records `ppid_at_signal` and says out loud that the sender is unrecorded.
 **Issue:** agent-infra#2932.
 
 ## The question this file answers
@@ -100,47 +101,104 @@ recorded the sender.**
 
 ## The instrument
 
-A child-side extension, armed in every dispatched `pi -p` child (`PI_MODE=print` +
-`TASK_HEARTBEAT=1`, the established sub-agent identity pair). On `SIGTERM` / `SIGINT` / `SIGHUP` it
-appends **one JSON line** recording the parent, then re-raises the signal so the exit code the harness
-records is unchanged (still 143 / 130 / 129):
+A child-side extension — see the coverage list below for **which** children. On `SIGTERM` / `SIGINT` /
+`SIGHUP` it appends **one JSON line**, then re-raises the signal so the exit code the harness records
+is unchanged (still 143 / 130 / 129):
 
 ```json
-{"event":"lane-signalled","signal":"SIGTERM","pid":7180,"ppid":7112,
- "parent_argv":"/bin/bash -c export PATH=\"…\" … git status --porcelain | head -3 …",
- "parent_comm":"/bin/bash","parent_alive":true,"pgid":7107,
- "cwd":"/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix-2932",
+{"event":"lane-signalled","signal":"SIGTERM","pid":18072,
+ "ppid_at_signal":{"pid":17400,"argv":"…/node --require …/tsx/dist/preflight.cjs … sample.mts",
+                   "comm":"…/bin/node","alive":true},
+ "sender":"unrecorded",
+ "sender_note":"ppid_at_signal is the PARENT at signal time, not the sender: a signal carries no
+   sender identity through Node's API, so this record names the sender only when the parent was the
+   sender — and otherwise shows only that the parent was alive with that argv, which cannot exclude
+   any other process.",
+ "pgid":16431,
+ "cwd":"/private/var/folders/…/T/sample-repo-Aa19xG",
  "checkpoint":{"status":"saved","reason":"uncommitted-work",
-   "ref":"refs/lane-checkpoints/2026-10-27T211405712Z-7180",
-   "commit":"1db689d847ec115ba36a84c346e1a46297960f44","files":6,"elapsedMs":672},
- "ts":"2026-10-27T21:14:06.404Z"}
+   "ref":"refs/lane-checkpoints/2026-10-28T021930196Z-18072",
+   "commit":"ded572e55fb9a60a3cb666a031035055cd0df40a","files":6,"elapsedMs":915},
+ "ts":"2026-10-28T02:19:31.113Z"}
 ```
 
-That sample is a real capture, not a mock: the lane was this worktree (6 files — 3 modified, 3
-new), it was TERMed 2 s after arming, and 672 ms later the work was pinned by a ref whose tree
-contained every one of the 6 files while `git status` still reported all 6 as uncommitted. The
-`parent_argv` is the whole point: it records the parent's command line at signal time, which no post-mortem
-reconstruction could have produced.
+That sample is a real capture, not a mock — the argv and the `sender_note` are the only lines elided
+(shown with `…`/wrapped); the record is otherwise verbatim. The lane was a temp repo with 6 dirty
+files (3 modified, 3 new), it was TERMed the moment it announced readiness, and 915 ms later the work
+was pinned by a ref carrying all 6 while `git status` still reported all 6 as uncommitted.
 
-⛔ **What this can and cannot answer, stated precisely** (the earlier wording here said "names the
-sender", which overstates it). `$PPID` is the **parent**, and the parent is the sender only when the
-parent is the sender. So a record answers one of two things:
+### ⛔ What the record can and CANNOT tell you — the #2934 review's P1
 
-- if the parent is the killer, `parent_argv` **names it**;
-- if the parent is alive and innocent — which is this incident's own scenario, where every remaining
-  candidate is external (jetsam, a parent-side sweep, something outside the inventory) — the record
-  **proves the sender was not the parent** and names nobody. It records the parent's `ppid` and argv,
-  so the next investigator can rule the parent in or out, but a row reading `"parent_argv":"pi"` is
-  *not* an accusation against `pi`.
+**`ppid_at_signal` is the process that FORKED the victim, and that is not the sender.** Anything can
+send `SIGTERM` to a child whose parent is the supervisor, and the record will then name the
+supervisor. This is not a missing feature to be added later: Node's signal API surfaces only the
+signal's number — libuv never exposes the kernel's `siginfo.si_pid` — so **a sender identity is not
+obtainable portably in this runtime**, and a field designed to look like one would have made the next
+investigation confidently wrong.
 
-The record shape already carries the distinction (`parent_alive`, `parent_argv`); it is the prose
-that was wrong, not the mechanism.
+So the field is named for what was measured (`ppid_at_signal`, not `ppid`), and every record carries
+`sender: "unrecorded"` plus a `sender_note` saying the same thing where the record is read. A row
+answers one of exactly two questions:
 
-`parent_argv` is read with `ps -o args= -p $PPID` at signal time — the one fact no post-mortem can
-reconstruct, because the parent may have exited by then or the pid may have been reused.
+- **the parent WAS the sender** → `ppid_at_signal` names it (`argv`, `comm`, `alive`);
+- **the parent was not the sender** → the record proves the parent was *alive with that argv* at that
+  moment, and **names nobody**. A row reading `"comm":"pi"` is **not** an accusation against `pi`, and
+  an external killer (jetsam, a parent-side sweep, a sibling lane, a human shell) leaves no trace here
+  at all.
 
-A second arm checkpoints uncommitted work before the process dies, so a killed lane's tree is
-recoverable even when the lane never committed. It is a **snapshot commit pinned by a ref**, built
+The second case is measured, not assumed: the suite has a **third process** — neither the victim nor
+its parent — deliver the `SIGTERM`, and asserts that the record names the parent and that the real
+sender appears in no pid field (`P1: a THIRD process's SIGTERM is recorded as the PARENT`). That test
+is the guard against the claim drifting back: a later change that starts implying attribution reddens
+there.
+
+**What the record is still worth.** It rules the parent IN or OUT, at signal time, with the parent's
+command line — which no post-mortem can reconstruct, because the parent may have exited or the pid may
+have been reused. For a mass kill that is the difference between "17 unattributable 143s" and "17
+deaths whose parent was a live innocent `pi`, therefore the sender was external", which is a real
+narrowing even though it names nobody.
+
+### Coverage — which `pi -p` children this arms in, exactly
+
+The earlier version of this file said "armed in every dispatched `pi -p` child". **That was false**
+(#2934 review, P2.1). The gate is `TASK_HEARTBEAT=1` **and** `PI_MODE=print`, and only the two
+in-process dispatchers set that pair, both unconditionally:
+
+| population | armed? | why |
+|---|---|---|
+| `task`-tool children | **yes** | `subAgentEnv` in `extensions/builtin-tools/index.ts` forces the pair |
+| `subagent`-tool children | **yes** | `childEnv` in `extensions/subagent/index.ts` forces the pair (`TASK_HEARTBEAT_DISABLE=1` silences the *emitter*, not the trap) |
+| harness lanes — `lane.sh`, `fix-one.sh`, `merge-one.sh` | **no** | they run `pi -p --no-session` through `spawn-gate.sh`'s `run_agent`, which sets **neither** marker |
+| fleet / interactive sessions | **no** | no `PI_MODE`, so the gate is false by construction |
+| `cloud-cell-bringup.sh` | **no** | a 120 s provider reachability probe, not a dispatch |
+
+#2932's victims were `task`-tool children — their `~/.pi/agent/task-runs/*.json` records are what
+identified them — so **the population that lost the work is covered**. The harness lanes are **not**,
+and this file must not be read as saying they are: their capture is a different mechanism
+(`cap_wip_snapshot` in `spawn-gate.sh`) with a different trigger — the **cap**, not a signal — so a
+harness lane killed *below* its cap is uncovered, and `merge-one.sh` carries its own `run_agent` copy
+with no snapshot at all.
+
+### Why this is not simply a call to `bg-rescue-wip.sh`
+
+There are already two capture mechanisms in this repo, and neither can fire here. The #2934 review
+(P2.2) is right that a second rescue is bureaucracy unless it is the *only* one that fits, so here is
+the measurement rather than a preference:
+
+| | trigger | guarantee | reachable inside the death window? |
+|---|---|---|---|
+| `scripts/bg-rescue-wip.sh` (#2045) | the **dispatcher**, *before* the TERM | reachable from `refs/wip/<slug>` on **origin** | **no** — its own bounds are `bounded 25 git fetch` + `bounded 45 git push`, and the parent escalates `SIGTERM` → **5 s** → `SIGKILL`. A 25 s + 45 s tool cannot finish, and the SIGKILL would take arm 1's record with it. It also refuses any path that is not the worktree **root**. |
+| `cap_wip_snapshot` (`spawn-gate.sh`) | `run_agent`, **after** the cap kill landed | a patch + archive directory under `$O/state` | **no** — it runs after the kill, and it hangs off `run_agent`, which a `task` child does not have |
+| arm 2 (here) | **inside the victim**, on the signal | the work is in this clone's **object database**, pinned by a ref | yes — 0.6–0.9 s for the incident's shape (bounded at 1.5 s) |
+
+So this is a second mechanism because it is the only one that runs *in the dying process*, and it
+makes a deliberately **weaker** guarantee than either of them — local objects, not the remote — because
+that is the guarantee that fits in the window. The stated cost is real: a checkpoint in a worktree that
+is then reaped with its clone is gone. The strong guarantee stays where it belongs, with the
+dispatcher, before the kill.
+
+The second arm — the one nothing above can replace — checkpoints uncommitted work before the
+process dies, so a killed lane's tree is recoverable even when the lane never committed. It is a **snapshot commit pinned by a ref**, built
 against a temporary index, so the branch, `HEAD`, the real index and the working tree are never
 touched:
 
@@ -157,25 +215,51 @@ The record carries the outcome — `saved` / `skipped` (`clean`, `not-a-repo`, `
 `git-op-in-progress:<marker>`, `window-exhausted`) / `failed` (`git-timeout`, `read-tree-failed`, …)
 — so a lane that could not be saved says so instead of reading as saved.
 
-### Why the WHOLE handler is bounded at 4.5 s
+### The shutdown delay, measured, and the bound it is held to (P3)
 
-The task harness's own watchdogs escalate `SIGTERM` → **5 s** → `SIGKILL`
-(`armExitWatchdog` / `armCompletionWatchdog` in `extensions/builtin-tools`). A handler still running
-at 5 s is SIGKILLed, and the **append is the last thing it does**, so the attribution line is what
-would be lost.
+The trap **delays the exit**, and that is a real cost: this module arms at module load, so it is the
+first `SIGTERM` listener and its synchronous work runs *before* pi's own graceful shutdown. A trap
+that stalls invites `kill -9`, which would lose the very work it protects.
 
-Bounding only the snapshot is not enough, and that earlier mistake is worth recording: the handler
-also spends up to 2 × 1.5 s probing the parent (`ps -o args=`, `ps -o comm=`) and a third 1.5 s on
-its own pgid, so the worst case was **~7.5 s** — over the window, with arm 1's output last. Under
-the load that produced this incident that slow path is the likely path.
+Measured on this box (macOS, 2026-10-27, `npx tsx`, real spawned lane, real `SIGTERM`), tree = the
+shape of #2932 (3 modified + 13 untracked files):
 
-So one deadline governs every step: `SIGNAL_WINDOW_MS` (4.5 s, leaving 0.5 s of margin before the
-SIGKILL) minus `APPEND_RESERVE_MS` for the append. Each step takes its budget from what is left —
-the probes are capped at `PS_TIMEOUT_MS` (1.5 s) or the remainder, the snapshot at
-`CHECKPOINT_BUDGET_MS` (3 s) or the remainder, one git step at `GIT_CMD_TIMEOUT_MS` (2 s). If the
-probes consume the window, the snapshot is **not attempted** and the record says
-`skipped/window-exhausted` — the record is written regardless, which is the property being bought.
-A worktree too large to snapshot in what remains records `failed/git-timeout`, equally honest.
+| | `SIGTERM` → exit |
+|---|---|
+| trap **disarmed** (`TASK_SIGNAL_FORENSICS=0`) | **4 ms** (median of 5) |
+| trap armed | **1 153 ms** (median of 5; range 1 017–1 222 ms) |
+| … of which the checkpoint | 757 ms (`checkpoint.elapsedMs`) |
+| … of which three `ps` probes | ~0.1 s each (~105 ms per `ps -o` on this box) |
+
+The snapshot alone, on progressively dirtier trees (median of 3, `read-tree` + `add -A` + `write-tree`
++ `commit-tree` + `update-ref`):
+
+| dirty tree | snapshot | outcome |
+|---|---|---|
+| 16 files (the incident) | **0.63–0.85 s** | `saved` |
+| 700 files | 2.0–2.7 s | `saved` at the old 3 s budget; **`git-timeout` at the current 1.5 s** |
+| 2 000 modified + 5 000 untracked | >2.4 s | `failed/git-timeout` |
+| 20 000 untracked (`node_modules`-scale) | >2.2 s | `failed/git-timeout` |
+
+**The bound, and why it is where it is.** The parent's watchdogs escalate `SIGTERM` → **5 s** →
+`SIGKILL` (`armExitWatchdog` / `armCompletionWatchdog` in `extensions/builtin-tools`). That 5 s is the
+whole budget for *our handler plus pi's own shutdown*, and pi's shutdown is what files the capture. So:
+
+- `SIGNAL_WINDOW_MS = 2 500` — the handler's ceiling, **half** the parent's budget, leaving pi ≥ 2.5 s.
+  (An earlier version used 4 500 ms, which left pi 0.5 s and would have guaranteed the SIGKILL landed
+  inside `session_shutdown` on every killed child — a defect introduced by *this* extension, found in
+  the #2934 review.)
+- one deadline governs every step, minus `APPEND_RESERVE_MS` (100 ms) for the record;
+- probes ≤ 3 × `PS_TIMEOUT_MS` (500 ms each) — deliberately less than the window, so the probes cannot
+  starve the snapshot of its turn;
+- snapshot ≤ `CHECKPOINT_BUDGET_MS` (1 500 ms), and no single git step may exceed it
+  (`GIT_CMD_TIMEOUT_MS` = 1 500 ms) — one wedged `git add` cannot consume the window.
+
+If the probes consume the window, the snapshot is **not attempted** and the record says
+`skipped/window-exhausted`; the record is written regardless, which is the property being bought. A
+tree too large to snapshot in what remains records `failed/git-timeout`, equally honest. Both bounds
+and the end-to-end delay are pinned by the suite (`P3: the handler budget…`, and the E2E's measured
+`SIGTERM` → exit assertion), so the numbers cannot drift away from the constants.
 
 ### Why not "make the lane's first action a commit"
 
@@ -185,7 +269,7 @@ snapshot has to be taken at the end.
 
 ## Verification — the TERM test and its two mutations
 
-`extensions/task-signal-forensics.test.ts` (16 assertion groups, CI-wired) spawns a **real lane**: a
+`extensions/task-signal-forensics.test.ts` (19 assertion groups, CI-wired) spawns a **real lane**: a
 temporary `.mjs` bootstrap that imports the extension source, arms it, announces readiness and
 idles in a deliberately dirty git repo (one modified tracked file, one untracked file). The suite
 sends that process a real `SIGTERM` and asserts, in this order:
@@ -204,18 +288,24 @@ is applied to a temp copy that the suite then imports and spawns:
 
 | mutant | change | result |
 |---|---|---|
-| **A — trap removed** | `process.on(signal, handler)` → a no-op | RED: `12 passed, 4 failed`; the named failure is **`arm 1: the signal log has exactly one record`** |
-| **B — checkpoint arm disabled** | `checkpoint = doCheckpoint ? snapshot() :` → `checkpoint = false ? snapshot() :` | RED: `14 passed, 2 failed`; the named failure is **`arm 2: the checkpoint was SAVED`**, and arm 1 stays green (the two arms are independently load-bearing) |
+| **A — trap removed** | `process.on(signal, handler)` → a no-op | RED; the named failure is **`arm 1: the signal log has exactly one record`** |
+| **B — checkpoint arm disabled** | `checkpoint = doCheckpoint ? snapshot() :` → `checkpoint = false ? snapshot() :` | RED; the named failure is **`arm 2: the checkpoint was SAVED`**, and arm 1 stays green (the two arms are independently load-bearing) |
 
-Baseline: `16 passed, 0 failed`. The driver also refuses (a) a mutation whose anchor does not match
+Baseline: `19 passed, 0 failed`. The exact counts for A and B are printed by the driver on every run
+rather than pinned here, because they move whenever an assertion group is added — the *named failing
+assertion* is the contract, and it is checked by name. The driver also refuses (a) a mutation whose anchor does not match
 exactly once, (b) a mutant that reddens everything (the suite crashed instead of asserting), and
 (c) any run that leaves the tracked source modified.
 
 ## What this does NOT do, deliberately
 
-- **It does not identify the 2026-10-27 sender.** Attribution needs a victim that survives long
-  enough to write, and every one of the 17 died to a signal it did not record. The instrument is
-  retroactive-free by construction: it can only answer the NEXT one.
+- **It does not identify the 2026-10-27 sender, and it cannot identify the NEXT one either.** The
+  record names the **parent**, and only when the parent happens to be the killer. A sender identity is
+  not obtainable in this runtime (see the P1 section), so what the NEXT incident gets is a rule-out:
+  the parent's pid, argv and liveness at signal time.
+- **It does not arm in harness lanes** (`lane.sh` / `fix-one.sh` / `merge-one.sh`) — see the coverage
+  table. They are a different population with a different capture, and the gap is stated there rather
+  than left to be inferred.
 - **It does not touch `lane.sh` / `fix-one.sh` / `merge-one.sh`.** They are a different population
   (tmux lanes that commit through their own wrapper) and this incident's victims were not among
   them. Nothing here replaces `lane-merge.sh`'s round cap or its own kill path.

@@ -1,6 +1,29 @@
 /**
- * task-signal-forensics — record who signalled a lane, and checkpoint the work
- * before the process dies (#2932).
+ * task-signal-forensics — record what was knowable at signal time, and
+ * checkpoint the work before the process dies (#2932).
+ *
+ * ⛔ IT DOES NOT RECORD WHO SIGNALLED, and the whole file is written so that
+ * nobody can read it as if it did. What is recorded is `ppid_at_signal`: the
+ * **parent** the victim was born with. Anything can send `SIGTERM` to a child
+ * whose parent is the supervisor, and the record will then name the supervisor —
+ * with no field, and no `ps` probe, able to tell that case from a kill by the
+ * parent itself. Node's signal API carries no sender identity (the kernel's
+ * `siginfo.si_pid` is not surfaced by libuv), so this is a property of the
+ * instrument, not of the effort behind it.
+ *
+ * A record therefore answers ONE of two questions, and the `sender` field says
+ * which one it can answer:
+ *
+ *   `sender: "unrecorded"`   always, today — the field exists so this stays a
+ *                            MACHINE-READABLE statement rather than prose, and so
+ *                            a future platform that can supply it has a home.
+ *   `ppid_at_signal`         the parent at signal time. It **names the sender IFF
+ *                            the parent was the sender**, and otherwise proves only
+ *                            that the parent was still alive with that argv.
+ *
+ * Measured, not assumed: the suite spawns a victim whose parent is the suite and
+ * has a THIRD process deliver the `SIGTERM`; the record then names the suite, not
+ * the sender (`P1: a THIRD process's SIGTERM is recorded as the PARENT`).
  *
  * ── The failure this exists for ───────────────────────────────────────────────
  * On 2026-10-27, 17 dispatched `pi -p` children were SIGTERM'd inside 3 s
@@ -16,18 +39,26 @@
  * show` has no `SIGTERM` event class, and the sender may have exited (or had its
  * pid reused) long before anyone looks.
  *
- * So attribution is collected AT SIGNAL TIME, in the victim, from the only
- * facts that still exist then: `$PPID` and that parent's `ps` row.
+ * So the evidence is collected AT SIGNAL TIME, in the victim, from the only
+ * facts that still exist then: `$PPID`, that parent's `ps` row, and the fact of
+ * the signal itself. What that buys is a RULE-OUT, not an accusation.
  *
- * ── Arm 1 — attribution ──────────────────────────────────────────────────────
+ * ── Arm 1 — the record ───────────────────────────────────────────────────────
  * One JSON line per death, appended to `~/.pi/agent/lane-signals.jsonl`
  * (override: `LANE_SIGNAL_LOG`):
  *
- *     {"event":"lane-signalled","signal":"SIGTERM","pid":63127,"ppid":1920,
- *      "parent_argv":"pi","parent_comm":"pi","parent_alive":true,"pgid":63127,
+ *     {"event":"lane-signalled","signal":"SIGTERM","pid":63127,
+ *      "ppid_at_signal":{"pid":1920,"argv":"pi","comm":"pi","alive":true},
+ *      "sender":"unrecorded","sender_note":"…","pgid":63127,
  *      "cwd":"/…/.worktrees/w-drainer-fix",
  *      "checkpoint":{"status":"saved","ref":"refs/lane-checkpoints/…"},
  *      "ts":"2026-10-27T19:35:02.914Z"}
+ *
+ * The field is `ppid_at_signal` and not `ppid` because the qualifier is the whole
+ * claim: it was the parent AT THAT MOMENT, read with `ps` before the process
+ * died, and the parent relationship is the only thing the probe measures. Before
+ * this rename the field, the stderr line and this header all said "sender",
+ * which read as attribution of a fact the instrument cannot observe.
  *
  * A file rather than the run record on purpose: the run record belongs to the
  * PARENT, and a parent that is itself being killed cannot be relied on to write
@@ -35,7 +66,25 @@
  *
  * ── Arm 2 — checkpoint, so a death cannot cost the work ──────────────────────
  * On the same signal, uncommitted work in the cwd is captured as a **snapshot
- * commit pinned by a ref**, using plumbing against a TEMPORARY index:
+ * commit pinned by a ref**, using plumbing against a TEMPORARY index.
+ *
+ * ⛔ WHY THIS IS NOT A CALL TO `scripts/bg-rescue-wip.sh` (the repo's existing
+ * rescue, #2045) — the one line the #2934 review asked for, with the numbers:
+ * that tool's guarantee is "reachable from `refs/wip/<slug>` on ORIGIN", and its
+ * own bounds are `bounded 25 git fetch` + `bounded 45 git push`. It runs in the
+ * DISPATCHER, before the TERM, on a harness lane (`lane.sh` / `fix-one.sh`); it
+ * also refuses any path that is not a worktree ROOT. Inside a victim whose parent
+ * escalates `SIGTERM` → **5 s** → `SIGKILL`, a 25 s + 45 s tool cannot finish, and
+ * the parent's `SIGKILL` would take arm 1's append with it. The other existing
+ * capture, `cap_wip_snapshot` in `scripts/orchestrator-harness/spawn-gate.sh`, runs
+ * AFTER `run_agent`'s cap kill has landed and hangs off `run_agent` — a `task`
+ * child has no `run_agent`. So neither existing mechanism fires inside the window
+ * or covers this population; arm 2 is the local, in-death leg, and its guarantee
+ * is deliberately the weaker one that is REACHABLE in 1.5 s: the work is in the
+ * object database, pinned by a ref. The recovery for a checkpointed lane is
+ * documented (`docs/ops/lane-signal-forensics.md`), not implied.
+ *
+ * The mechanism:
  *
  *     GIT_INDEX_FILE=<tmp> git read-tree HEAD
  *     GIT_INDEX_FILE=<tmp> git add -A           ← untracked files included
@@ -67,9 +116,35 @@
  * handler must not also mutate what it is preserving. `stash create` does not
  * include untracked files, which is most of what a killed lane leaves behind.
  *
- * ── Gating and non-behaviour-change ─────────────────────────────────────────
- * Armed only for dispatch children (`TASK_HEARTBEAT=1` + `PI_MODE=print`, the
- * pair the task tool sets unconditionally), never for an interactive session.
+ * ── Gating, coverage, and non-behaviour-change ────────────────────────────
+ * Armed only for a DISPATCH CHILD — `TASK_HEARTBEAT=1` + `PI_MODE=print`, a pair
+ * that only the two in-process dispatchers set, and both set it unconditionally:
+ * `extensions/builtin-tools` (`subAgentEnv`, the `task` tool) and
+ * `extensions/subagent` (`childEnv`, the `subagent` tool).
+ *
+ * ⛔ COVERAGE, STATED AS A POPULATION LIST BECAUSE "armed in every dispatched
+ * `pi -p` child" — what this header said before the #2934 review — IS FALSE.
+ * Measured on this tree, the armed and unarmed `pi -p` populations are:
+ *
+ *   ARMED      `task`-tool children      TASK_HEARTBEAT=1 + PI_MODE=print are
+ *              `subagent`-tool children  forced into the child env at the spawn
+ *                                       site by both dispatchers
+ *   NOT ARMED  harness lanes             `lane.sh` / `fix-one.sh` / `merge-one.sh`
+ *              (`scripts/orchestrator-harness/`) run `pi -p --no-session` inside
+ *                                       `spawn-gate.sh`'s `run_agent`, which sets
+ *                                       NEITHER marker
+ *              fleet sessions           `pi -p` with no PI_MODE, so
+ *                                       `signalForensicsActive` is false
+ *              `cloud-cell-bringup.sh`  a 120 s provider probe, not a dispatch
+ *
+ * #2932's victims were `task`-tool children — their `~/.pi/agent/task-runs/*.json`
+ * records are what identified them — so the population that lost the work IS
+ * covered. The harness lanes are NOT, and their capture is a DIFFERENT mechanism
+ * with a DIFFERENT trigger (`cap_wip_snapshot` fires at the cap, not at a
+ * signal), so a harness lane killed BELOW its cap is uncovered, and this header
+ * says so instead of reading as complete. `merge-one.sh` carries its own
+ * `run_agent` copy and has no snapshot at all.
+ *
  * `TASK_SIGNAL_FORENSICS=0` disarms arm 1, `TASK_LANE_CHECKPOINT=0` disarms
  * arm 2 (the fleet-wide valves, same shape as `ORPHAN_WATCHDOG=0`).
  *
@@ -81,6 +156,18 @@
  * graceful-shutdown path, which is what writes `session_end`) is registered, the
  * lifecycle is that handler's to end and this one stays out of the way. Both
  * directions are pinned by the suite (exit 143 on the sole-listener path).
+ *
+ * ⛔ THE HANDLER DELAYS THE EXIT, SO IT IS BOUNDED, AND THE BOUND LIVES IN
+ * `fire()`. This module arms at module load, so it is the FIRST `SIGTERM`
+ * listener and its synchronous work runs BEFORE every later one — including pi's
+ * graceful shutdown. Every millisecond it spends is a millisecond pi's shutdown
+ * does not have, out of the parent's fixed 5 s, and that is why the window is
+ * HALF that budget rather than "as much as we can get away with". Measured on
+ * this box (2026-10-27, a tree the shape of #2932 — 3 modified + 13 untracked):
+ * `SIGTERM` → exit took **1 153 ms** armed (median of 5; 757 ms of it the
+ * checkpoint, the rest three `ps` probes) against **4 ms** disarmed. A 700-file
+ * dirty tree measured 1.2–2.7 s. Past the snapshot budget the arm records
+ * `failed/git-timeout` — honest, and it keeps the exit short.
  *
  * Best-effort by construction: every failure (no fs, no git, a budget overrun,
  * an in-progress merge) is recorded as a `skipped`/`failed` reason in the same
@@ -100,31 +187,41 @@ export const DEFAULT_SIGNAL_LOG = path.join(os.homedir(), ".pi", "agent", "lane-
 export const CHECKPOINT_REF_PREFIX = "refs/lane-checkpoints/";
 export const SIGNAL_LOG_MAX_BYTES = 8 * 1024 * 1024;
 export const ARGV_MAX_CHARS = 400;
-export const GIT_CMD_TIMEOUT_MS = 2_000;
+export const GIT_CMD_TIMEOUT_MS = 1_500;
 /** ⛔ THE WHOLE HANDLER IS BOUNDED BY THE PARENT'S ESCALATION, not just the
  * snapshot: the task harness's exit watchdogs run `SIGTERM` → `setTimeout(…,
  * 5_000)` → `SIGKILL` (extensions/builtin-tools `armExitWatchdog` /
  * `armCompletionWatchdog`), so ANY handler work still running at 5 s is killed,
- * and the attribution append is the work that would be lost with it.
+ * and the record is the work that would be lost with it.
  *
- * Budgeting only the snapshot was not enough (#2934 review): the handler also
- * spends up to 2 × `PS_TIMEOUT_MS` probing the parent and one more on its own
- * pgid, which with a 3 s snapshot is ~7.5 s — so under the load that produced
- * this incident the slow path lost arm 1 entirely. `fire()` now derives every
- * step's budget from ONE deadline, so the sum cannot exceed this window. */
-export const SIGNAL_WINDOW_MS = 4_500;
+ * Two mistakes are recorded here, both found in review. (1) Budgeting only the
+ * snapshot: the handler also spends up to 2 × `PS_TIMEOUT_MS` probing the parent
+ * and one more on its own pgid, which with a 3 s snapshot is ~7.5 s, so under the
+ * load that produced this incident the slow path lost arm 1 entirely. `fire()`
+ * derives every step's budget from ONE deadline, so the sum cannot exceed this
+ * window. (2) Setting the window NEAR the parent's bound (it was 4 500 ms): the
+ * handler runs BEFORE pi's own shutdown listener, so a 4.5 s handler left pi
+ * 0.5 s of the parent's 5 s — the trap would have guaranteed that the SIGKILL
+ * landed mid-shutdown on every killed child, truncating the `session_shutdown`
+ * path that files the capture. HALF the budget leaves pi ≥ 2.5 s, and the
+ * measurement in the header says the incident's own shape needs ~1.2 s.
+ */
+export const SIGNAL_WINDOW_MS = 2_500;
 /** Reserved inside the window for the append itself, which is never optional. */
 export const APPEND_RESERVE_MS = 100;
-/** Per-`ps` timeout. Two are used for the parent and one for the pgid. */
-export const PS_TIMEOUT_MS = 1_500;
-/** Total time the snapshot may spend. ⛔ BOUNDED BY THE PARENT'S ESCALATION, not
- * by taste: a checkpoint that overruns the window is killed half-written and the
- * attribution line — the whole point of arm 1 — would be lost with it. 3 s is the
- * cap; `fire()` lowers it further when the probes have already spent part of the
- * window. A worktree too large to snapshot records `failed/git-timeout` instead,
- * which is honest, and the 16 lost files of #2932 were seconds' worth of
- * `git add`. */
-export const CHECKPOINT_BUDGET_MS = 3_000;
+/** Per-`ps` timeout. Two are used for the parent and one for the pgid, so the
+ * probes can spend at most 3 × this — kept below the window on purpose, because
+ * a probe that could eat the whole budget would leave no snapshot at all.
+ * Measured: one `ps -o args=` costs ~105 ms on this box. */
+export const PS_TIMEOUT_MS = 500;
+/** Total time the snapshot may spend, and also the per-step ceiling: no single
+ * `git` call may outlast the whole snapshot budget, so one wedged `git add`
+ * cannot consume the window and take the record with it. A worktree too large to
+ * snapshot in this time records `failed/git-timeout` instead, which is honest.
+ * Measured (`read-tree` + `add -A` + `write-tree` + `commit-tree` + `update-ref`
+ * on this box): 0.6–0.9 s for the incident's 16-file shape, 1.2–2.7 s for 700
+ * files, past 2 s at ~2 000+. */
+export const CHECKPOINT_BUDGET_MS = 1_500;
 
 export const HANDLED_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
 export type HandledSignal = (typeof HANDLED_SIGNALS)[number];
@@ -146,24 +243,45 @@ export function checkpointActive(env: Record<string, string | undefined> = proce
 
 // ── arm 1: the record ───────────────────────────────────────────────────────
 
-export interface SenderFacts {
-  ppid: number;
+/** What is knowable about the PARENT of this process at signal time.
+ *
+ * ⛔ NOT the sender. Renamed from `SenderFacts` in the #2934 review because the
+ * name asserted the one thing the probe cannot measure: `$PPID` names the process
+ * that FORKED this one, and any other process can signal this one without
+ * appearing anywhere in these fields. See `SENDER_NOTE`.
+ */
+export interface PpidAtSignal {
+  /** `$PPID` at signal time. */
+  pid: number;
   /** `ps -o args= -p <ppid>` at signal time — "" when the parent is already gone. */
-  parentArgv: string;
+  argv: string;
   /** `ps -o comm= -p <ppid>` — the executable name, which survives a NULL argv. */
-  parentComm: string;
+  comm: string;
   /** Whether the parent pid still names a live process (kill(ppid, 0)). */
-  parentAlive: boolean;
+  alive: boolean;
 }
+
+/** ⛔ STORED IN EVERY RECORD, not only in the doc. The limitation is the part a
+ * reader will get wrong, and this fleet's own lesson is that a caveat living in a
+ * document away from the artifact is invisible at the point the artifact is read.
+ * One sentence, next to the field it qualifies. */
+export const SENDER_NOTE =
+  "ppid_at_signal is the PARENT at signal time, not the sender: a signal carries no sender identity " +
+  "through Node's API, so this record names the sender only when the parent was the sender — and " +
+  "otherwise shows only that the parent was alive with that argv, which cannot exclude any other process.";
 
 export interface LaneSignalRecord {
   event: "lane-signalled";
   signal: HandledSignal;
+  /** The victim. */
   pid: number;
-  ppid: number;
-  parent_argv: string;
-  parent_comm: string;
-  parent_alive: boolean;
+  /** ⛔ The PARENT. Not the sender — see `sender` / `sender_note`. */
+  ppid_at_signal: PpidAtSignal;
+  /** Always `"unrecorded"` today, and always PRESENT: a reader that greps this
+   * field never has to infer attribution from the absence of one. A platform that
+   * can supply a real sender changes this field's type, not the record's shape. */
+  sender: "unrecorded";
+  sender_note: string;
   pgid: number | null;
   cwd: string;
   checkpoint: CheckpointResult;
@@ -181,7 +299,7 @@ export function clampArgv(raw: string): string {
 export function buildSignalRecord(input: {
   signal: HandledSignal;
   pid: number;
-  facts: SenderFacts;
+  facts: PpidAtSignal;
   pgid?: number | null;
   cwd: string;
   checkpoint: CheckpointResult;
@@ -191,16 +309,20 @@ export function buildSignalRecord(input: {
     event: "lane-signalled",
     signal: input.signal,
     pid: input.pid,
-    ppid: input.facts.ppid,
-    // Redaction at the point the value ENTERS the record, never at the sink: this
-    // is a shell command line, the exact shape the shared seam exists for
-    // (inline `GH_TOKEN=…` / `ghp_…`), and the log outlives the process that wrote
-    // it. `redactCommand` is imported rather than re-implemented so the two other
-    // command-recording sinks (verification-gate, review-enforcer) and this one
-    // cannot drift (#966, #1492).
-    parent_argv: redactCommand(clampArgv(input.facts.parentArgv)),
-    parent_comm: input.facts.parentComm.trim(),
-    parent_alive: input.facts.parentAlive,
+    ppid_at_signal: {
+      pid: input.facts.pid,
+      // Redaction at the point the value ENTERS the record, never at the sink: this
+      // is a shell command line, the exact shape the shared seam exists for
+      // (inline `GH_TOKEN=…` / `ghp_…`), and the log outlives the process that
+      // wrote it. `redactCommand` is imported rather than re-implemented so the two
+      // other command-recording sinks (verification-gate, review-enforcer) and this
+      // one cannot drift (#966, #1492).
+      argv: redactCommand(clampArgv(input.facts.argv)),
+      comm: input.facts.comm.trim(),
+      alive: input.facts.alive,
+    },
+    sender: "unrecorded",
+    sender_note: SENDER_NOTE,
     pgid: input.pgid ?? null,
     cwd: input.cwd,
     checkpoint: input.checkpoint,
@@ -426,7 +548,7 @@ export interface SignalForensicsOptions {
   pid?: number;
   ppid?: number;
   cwd?: string;
-  senderProbe?: (ppid: number) => SenderFacts;
+  ppidProbe?: (ppid: number) => PpidAtSignal;
   checkpoint?: (cwd: string, now: number, pid: number) => CheckpointResult;
   appendRecord?: (logPath: string, record: LaneSignalRecord) => void;
   stderr?: (line: string) => void;
@@ -437,9 +559,13 @@ export interface SignalForensicsOptions {
 }
 
 /** Read the parent's argv/comm. `ps` is bounded and the failure modes are
- * distinct: a gone parent is a FACT (`parent_alive: false`) and an empty argv is
- * not the same thing as a dead parent. */
-export function probeSender(ppid: number, timeoutMs: number = PS_TIMEOUT_MS): SenderFacts {
+ * distinct: a gone parent is a FACT (`alive: false`) and an empty argv is not the
+ * same thing as a dead parent.
+ *
+ * ⛔ NAMED FOR WHAT IT MEASURES. This was `probeSender`, which read as
+ * attribution; it probes `$PPID`, and the returned value is only the sender when
+ * the parent is the sender. */
+export function probePpidAtSignal(ppid: number, timeoutMs: number = PS_TIMEOUT_MS): PpidAtSignal {
   let parentAlive = true;
   try {
     process.kill(ppid, 0);
@@ -448,8 +574,8 @@ export function probeSender(ppid: number, timeoutMs: number = PS_TIMEOUT_MS): Se
   }
   // A non-positive budget means the window is already spent: return the facts we
   // hold (ppid + liveness) rather than blocking on a `ps` that would push the
-  // attribution append past the parent's SIGKILL.
-  if (timeoutMs <= 0) return { ppid, parentArgv: "", parentComm: "", parentAlive };
+  // append past the parent's SIGKILL.
+  if (timeoutMs <= 0) return { pid: ppid, argv: "", comm: "", alive: parentAlive };
   const one = (args: string[]): string => {
     const res = spawnSync("ps", args, {
       encoding: "utf8",
@@ -460,10 +586,10 @@ export function probeSender(ppid: number, timeoutMs: number = PS_TIMEOUT_MS): Se
     return res.status === 0 ? `${res.stdout ?? ""}`.trim() : "";
   };
   return {
-    ppid,
-    parentArgv: one(["-o", "args=", "-p", String(ppid)]),
-    parentComm: one(["-o", "comm=", "-p", String(ppid)]),
-    parentAlive,
+    pid: ppid,
+    argv: one(["-o", "args=", "-p", String(ppid)]),
+    comm: one(["-o", "comm=", "-p", String(ppid)]),
+    alive: parentAlive,
   };
 }
 
@@ -541,11 +667,12 @@ export function installSignalForensics(opts: SignalForensicsOptions = {}): boole
     const ppid = opts.ppid ?? process.ppid;
     const cwd = opts.cwd ?? process.cwd();
 
-    let facts: SenderFacts;
+    let facts: PpidAtSignal;
     try {
-      facts = (opts.senderProbe ?? ((parent: number) => probeSender(parent, Math.min(PS_TIMEOUT_MS, remainingWindow()))))(ppid);
+      facts = (opts.ppidProbe ??
+        ((parent: number) => probePpidAtSignal(parent, Math.min(PS_TIMEOUT_MS, remainingWindow()))))(ppid);
     } catch {
-      facts = { ppid, parentArgv: "", parentComm: "", parentAlive: false };
+      facts = { pid: ppid, argv: "", comm: "", alive: false };
     }
 
     // Own pgid is read BEFORE the snapshot, so a slow snapshot cannot starve it
@@ -582,9 +709,15 @@ export function installSignalForensics(opts: SignalForensicsOptions = {}): boole
     } catch {
       /* a log we cannot write must not stop the exit */
     }
+    // ⛔ THE OPERATOR-FACING LINE CARRIES THE SAME LIMITATION AS THE RECORD. It
+    // used to read `sender=<comm>`, which is the single most misleading token this
+    // instrument could print: it appeared in a terminal, next to an incident, and
+    // named a process that may have had nothing to do with the kill. `sender=` is
+    // now the literal `unrecorded` and the parent is named by its own field.
     stderr(
-      `[lane-signal] ${signal} pid=${record.pid} ppid=${record.ppid} sender=${record.parent_comm || "?"} ` +
-        `checkpoint=${record.checkpoint.status}/${record.checkpoint.reason}` +
+      `[lane-signal] ${signal} pid=${record.pid} ppid_at_signal=${record.ppid_at_signal.pid}` +
+        ` comm=${record.ppid_at_signal.comm || "?"} sender=${record.sender}` +
+        ` checkpoint=${record.checkpoint.status}/${record.checkpoint.reason}` +
         `${record.checkpoint.ref ? ` ref=${record.checkpoint.ref}` : ""} log=${logPath}`,
     );
 
