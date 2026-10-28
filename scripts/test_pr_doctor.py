@@ -3390,6 +3390,23 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
             "spawn-gate.sh no longer exports %s=%d -- GATE_REFUSAL_BOUND is stale" % (const, code))
         assert pr.GATE_REFUSAL_BOUND[code], "the gate declares %d and this file does not" % code
     assert pr.GATE_REFUSALS == tuple(sorted(pr.GATE_REFUSAL_BOUND))
+    # ⛔ THE NAME↔CODE RELATION, NOT MERELY THE KEYS (review P3, #2291). Everything above checks
+    # that each constant still carries its number and that `GATE_REFUSAL_BOUND[code]` is TRUTHY —
+    # so SWAPPING two names (73: "fork" <-> 73: "land-backlog") left every one of those assertions
+    # green: same keys, both values truthy, same value SET. The consequence is the one this
+    # docstring names, at its worst: a fork refusal (the box is out of PROCESSES) would tell the
+    # operator to "land/fix the open PRs -- this box is healthy", and a land-backlog hold would
+    # tell them to restart a healthy box. Derived from the gate's own CONSTANT NAMES, so a
+    # renumbering or a rename on either side reddens here.
+    want = {"AGENT_FORK_REFUSED": "fork", "AGENT_LAND_BACKLOG": "land-backlog",
+            "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk"}
+    for const, axis in want.items():
+        code = int(exported[const])
+        assert pr.GATE_REFUSAL_BOUND[code] == axis, (
+            "spawn-gate.sh exports %s=%d, but GATE_REFUSAL_BOUND[%d] is %r, not %r -- the refusal "
+            "would be reported on the wrong axis, with the wrong remedy"
+            % (const, code, code, pr.GATE_REFUSAL_BOUND[code], axis))
+    assert len(set(want.values())) == len(want), "the expectation table itself must be 1:1"
     # ⛔ 73 (fork) IS THE ONE THAT WAS MISSING: a fork refusal was read as a DISPATCH, so the state
     # "this box cannot start a process at all" (measured on cell-4 at load 0.32x, #2293) wrote a
     # spawn row and burnt a 90-min budget slot for an agent that never existed.
@@ -5962,6 +5979,34 @@ def test_all_repos_prints_one_line_per_repo_and_one_stale_queue_is_not_clean(mon
     # …and each repo got its OWN record, so `--status` can show one repo's rows alone.
     for tag in (_REPO_A, _REPO_B):
         assert (sd / ("pr-doctor.%s.status.json" % tag.replace("/", "-"))).exists(), tag
+
+
+def test_the_per_repo_row_speaks_every_exit_codes_own_vocabulary():
+    """(iv) `--all-repos` prints ONE row per repo, and each row names the code it graded.
+
+    Review P2/#2291: `repo_row`'s map stopped at `4`, so a pass that ended NO-CAPACITY printed
+    `verdict=RED rc=6` -- the pre-fix mislabel, on the one reader INSIDE `pr-doctor.py` that did not
+    know the code, and on a surface `orchestrator-harness/README.md` documents as "the exit codes'
+    own vocabulary … stay distinct". `_unplaced()` dropped the same datum, so the row reported
+    `unplaced=0` beside a non-clean verdict for a repo whose orders the BOX refused.
+    """
+    # A pass that dispatched nothing because the box's gate refused three orders: legible work that
+    # did NOT go out, and the token the beat uses for the same fact.
+    p = {"dispatched": 0, "open_prs": 10, "no_capacity": 3}
+    row = pr.repo_row("o/r", pr.EXIT_NO_CAPACITY, p)
+    assert "verdict=NO-CAPACITY" in row, row
+    assert "verdict=RED" not in row, row
+    assert "unplaced=3" in row, row
+    # CONTROLS: the pre-existing five stay exactly as they were, so this adds a word rather than
+    # widening the fallback.
+    assert "verdict=clean rc=0" in pr.repo_row("o/r", 0, {"dispatched": 0, "open_prs": 0})
+    assert "verdict=REFUSING rc=2" in pr.repo_row("o/r", 2, {})
+    assert "verdict=UNPLACED rc=3" in pr.repo_row("o/r", 3, {"dispatched": 0, "open_prs": 1})
+    assert "verdict=CRASH rc=4" in pr.repo_row("o/r", 4, {})
+    # An UNNAMED code is still the generic fallback: the map is a vocabulary, not a blanket.
+    assert "verdict=RED rc=9" in pr.repo_row("o/r", 9, {})
+    # …and the aggregate row is unchanged by the new word (it is per-repo only).
+    assert "unplaced=?" in pr.repo_row("o/r", pr.EXIT_NO_CAPACITY, {})
 
 
 def test_all_repos_without_a_named_set_refuses(monkeypatch, tmp_path):
