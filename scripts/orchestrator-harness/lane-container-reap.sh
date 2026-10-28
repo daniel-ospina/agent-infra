@@ -87,7 +87,7 @@ ABSTAINED=0
 FAILED=0
 SELF_PID="$$"
 
-say() { printf '%s\n' "$*"; log "$*"; }
+log_line() { printf '%s\n' "$*"; log "$*"; }
 log() { [ -n "$LOG" ] && { d="$(dirname "$LOG")"; [ -d "$d" ] || mkdir -p "$d" 2>/dev/null; printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; } || true; }
 
 usage() {

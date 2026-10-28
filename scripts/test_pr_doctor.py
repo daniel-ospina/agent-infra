@@ -5533,6 +5533,85 @@ def test_a_file_url_checkout_proves_no_repository(monkeypatch, tmp_path):
     assert "does not prove a repo" in why, why
 
 
+# ── 13. an UNREADABLE cwd is not evidence about a repo (launchd / TCC) ────────────────────
+#
+# ⛔ MEASURED, NOT HYPOTHESISED. `com.tortoise.pr-doctor-agent-infra` (launchd, every 900 s) failed
+# on EVERY run with `PermissionError: [Errno 1] Operation not permitted` raised out of
+# `_checkout_that_proves` -- while `REPO`, `GH_REPO`, `PR_DOCTOR_REPO` and the job's own
+# `WorkingDirectory` all named the same repo. `os.getcwd()` works for the same user in a shell and
+# fails under launchd's sandbox, so this was never a bad path: the cwd candidate was resolved
+# EAGERLY inside a tuple literal, so a candidate the pass did not need could kill the pass. The
+# crash is masked on that Mac today only by a plist workaround, so these arms are the real guard.
+
+def _cwd_is_unreadable(monkeypatch):
+    """The launchd shape: `os.getcwd()` RAISES in this process."""
+    def boom():
+        raise OSError(1, "Operation not permitted")
+    monkeypatch.setattr(os, "getcwd", boom)
+
+
+def test_an_unreadable_cwd_does_not_kill_a_pass_REPO_already_proved(monkeypatch, tmp_path):
+    """ARM 1 (the launchd shape): `REPO` proves the repo AND `os.getcwd()` raises ⇒ the pass runs.
+
+    The crash was here: the plist sets `PR_DOCTOR_REPO`, so the pass entered
+    `_checkout_that_proves()` with a `REPO` that already proved the repo -- and the eager cwd in the
+    tuple raised before the first candidate was even tested. Reported as `EXIT rc=3 -- 11 order(s)
+    no worker accepted` once the plist workaround was in place, i.e. the pass itself was fine.
+    """
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    _cwd_is_unreadable(monkeypatch)
+    # (a) the JOB-SEAM shape the plist actually produces.
+    slug, checkout, source, why = pr.resolve_repo(
+        env={"PR_DOCTOR_REPO": _REPO_A, "REPO": str(co_a)})
+    assert (slug, checkout) == (_REPO_A, str(co_a)), (slug, checkout, source, why)
+    assert source == "PR_DOCTOR_REPO" and why == "", (source, why)
+    # (b) the plain shape: `REPO` alone still answers, with its own source name.
+    slug, checkout, source, why = pr.resolve_repo(env={"REPO": str(co_a)})
+    assert (slug, checkout, source, why) == (_REPO_A, str(co_a), "REPO", ""), (
+        slug, checkout, source, why)
+
+
+def test_an_unreadable_cwd_is_a_REPORTED_skip_not_an_exception(monkeypatch, tmp_path):
+    """ARM 2: nothing else names the repo AND cwd raises ⇒ ("", why), `why` NAMING the cwd.
+
+    ⛔ SILENT DEGRADATION IS HOW THIS DEFECT STAYED INVISIBLE. An unreadable cwd is not a repo, so
+    the resolver must skip it -- but an operator who sees only "REPO is not set" would go looking
+    at `REPO` while the actual obstruction is the sandbox refusing the cwd.
+    """
+    _cwd_is_unreadable(monkeypatch)
+    ck, why = pr._checkout_that_proves(_REPO_A, {})
+    assert ck == "", ck
+    assert "cwd unreadable (OSError)" in why, why
+    # …and the operator-facing refusal names it too, rather than printing an empty path.
+    with pytest.raises(pr.RepoUnresolved) as ei:
+        pr.resolve_repo(env={})
+    msg = str(ei.value)
+    assert "cwd unreadable (OSError)" in msg, msg
+    assert "<unreadable>" in msg, msg
+
+
+def test_a_disagreeing_REPO_still_loses_to_a_cwd_that_proves_the_repo(monkeypatch, tmp_path):
+    """ARM 3: precedence is UNCHANGED -- the fix is robustness, not a loosening.
+
+    `REPO` points at a checkout of B, the cwd is a checkout of A, and the pass was asked for A: the
+    cwd is adopted exactly as before. (The rule this must not touch: a checkout that PROVES a
+    different repo is never adopted, which `test_an_inconsistent_launcher_pair_is_refused` and
+    `test_explicit_checkout_must_prove_the_repo_it_was_given_for` pin.)
+    """
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.chdir(co_a)
+    slug, checkout, source, why = pr.resolve_repo(
+        explicit=_REPO_A, env={"REPO": str(co_b)})
+    assert (slug, checkout, source) == (_REPO_A, str(co_a), "--repo"), (slug, checkout, source, why)
+    assert why == "", why
+    # A READABLE cwd that proves a DIFFERENT repo is still never adopted either.
+    monkeypatch.chdir(co_b)
+    slug, checkout, source, why = pr.resolve_repo(explicit=_REPO_A, env={})
+    assert (slug, checkout) == (_REPO_A, ""), (slug, checkout, source, why)
+    assert "is a checkout of %s" % _REPO_B in why, why
+
+
 def test_a_dry_run_refusal_never_stamps_the_fleet_verdict(monkeypatch, tmp_path):
     """A `--dry-run` that REFUSES (unresolvable repo) must not write the canonical status record.
 

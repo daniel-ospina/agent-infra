@@ -159,7 +159,7 @@ POOL_LABEL_ARM64="self-hosted-arm64"
 DRY=0
 MEM_MB=""; NCPU=""; CEILING=""; LISTENER_PID=""; SLOTS=""; SLOT_REGS=""; SLOT_ORPHANED=""
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
 
 # mb_as_gb <mb> — the human form the owner reads ("2.21 GB"), never the only form printed.
@@ -801,7 +801,7 @@ start_listener() {
   sleep "$SETTLE_S"
   rc=0; probe_listener "$d" || rc=$?
   case "$rc" in
-    0) say "listener_pid=$LISTENER_PID"; return 0 ;;
+    0) log_line "listener_pid=$LISTENER_PID"; return 0 ;;
     2) return 2 ;;
   esac
   if ev="$(orphan_evidence_file "$d" "$before" "$started")"; then
@@ -975,7 +975,7 @@ cmd_add() {
     *",$POOL_LABEL_X64,"*|*",$POOL_LABEL_ARM64,"*) ;;
     *) err "cannot-measure why=label-unknown value=$label — a runner without $POOL_LABEL_X64/$POOL_LABEL_ARM64 matches no job and is invisible to ci_runner_gate.sh"; return 2 ;;
   esac
-  say "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$SLOTS labels=$label"
+  log_line "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$SLOTS labels=$label"
 
   [ -x "$RUNNER_TEMPLATE/config.sh" ] || {
     err "cannot-act why=runner-template-absent path=$RUNNER_TEMPLATE/config.sh (one complete runner install to copy)"; return 2
@@ -988,7 +988,7 @@ cmd_add() {
     if [ -z "${RUNNER_TOKEN:-}" ] && ! command -v "$GH_CMD" >/dev/null 2>&1; then
       err "cannot-act why=no-registration-token repo=$POOL_REPO (set RUNNER_TOKEN, or put $GH_CMD on PATH) — a preview cannot mint one"; return 2
     fi
-    say "dry-run: would copy $RUNNER_TEMPLATE to $dir, register name=$name and start its listener"; return 0
+    log_line "dry-run: would copy $RUNNER_TEMPLATE to $dir, register name=$name and start its listener"; return 0
   fi
 
   token="${RUNNER_TOKEN:-}"
@@ -1084,7 +1084,7 @@ cmd_add() {
     err "registered=1 listener=dead name=$name dir=$dir — the registration is in place; run: $SELF restart --name $name"
     return 2
   fi
-  say "added name=$name dir=$dir listener_pid=$(listener_pid "$dir")"
+  log_line "added name=$name dir=$dir listener_pid=$(listener_pid "$dir")"
   return 0
 }
 
@@ -1168,17 +1168,17 @@ cmd_restart() {
   # idle — the worst of the three states. The owner's floor sentence names ADDING, not restarting.
   rc=0; probe_listener "$dir" || rc=$?
   case "$rc" in
-    0) say "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
+    0) log_line "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
     2) return 2 ;;   # cannot measure: START NOTHING (a blind start is how a listener is doubled)
   esac
   # ⛔ THE START'S OWN PRECONDITION IS CHECKED BEFORE THE DRY RETURN, so a preview cannot announce a
   # start the real pass refuses. `start_listener` re-checks it (defence in depth), but a check that
   # only lives downstream of the `--dry-run` return is a preview that lies.
   [ -x "$dir/run.sh" ] || { err "cannot-act why=runner-not-installed path=$dir/run.sh"; return 2; }
-  if [ "$DRY" = 1 ]; then say "dry-run: would start the listener for name=$name"; return 0; fi
+  if [ "$DRY" = 1 ]; then log_line "dry-run: would start the listener for name=$name"; return 0; fi
   rc=0; start_listener "$dir" || rc=$?
   case "$rc" in
-    0) say "restarted name=$name pid=$(listener_pid "$dir")"; return 0 ;;
+    0) log_line "restarted name=$name pid=$(listener_pid "$dir")"; return 0 ;;
     # ⛔ 6 IS PASSED THROUGH, NOT FOLDED INTO 2 (#2620). "I could not act" and "this registration is
     # GONE server-side" lead an operator to opposite next steps — re-run versus `reclaim` — and the
     # caller that matters here is `reconcile`, which routes 6 to the retire arm and counts 2 as
@@ -1266,7 +1266,7 @@ cmd_reclaim() {
     fi
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
-      0) live=$((live + 1)); say "live name=$(basename "$d") pid=$LISTENER_PID — not touched"; continue ;;
+      0) live=$((live + 1)); log_line "live name=$(basename "$d") pid=$LISTENER_PID — not touched"; continue ;;
       2) cannot=$((cannot + 1)); continue ;;   # unreadable: cannot prove anything about it
     esac
     # ⛔ A SYMLINKED INSTANCE IS NOT RETIRABLE BY THIS VERB (#2892 review, P1). `registered_dirs`
@@ -1282,7 +1282,7 @@ cmd_reclaim() {
     fi
     if ! ev="$(orphan_evidence_file "$d")"; then
       preserved=$((preserved + 1))
-      say "preserve name=$(basename "$d") dir=$d why=no-orphan-evidence (no listener and no 'registration has been deleted' line in listener.log/_diag — retirable with 'config.sh remove', but not by this verb: use: $SELF restart --name $(basename "$d"))"
+      log_line "preserve name=$(basename "$d") dir=$d why=no-orphan-evidence (no listener and no 'registration has been deleted' line in listener.log/_diag — retirable with 'config.sh remove', but not by this verb: use: $SELF restart --name $(basename "$d"))"
       continue
     fi
     if [ "$clock_checked" = 0 ]; then
@@ -1390,7 +1390,7 @@ cmd_reclaim() {
     # A start that comes up and SURVIVES is a REPAIR, not a retire: the registration answers GitHub, and
     # the old line was a skew artifact. Anything that cannot be proven either way is cannot-act.
     if [ "$DRY" = 1 ]; then
-      say "dry-run: would START name=$nm agent_id=$aid dir=$d evidence=$ev and retire it only if GitHub refuses the session — a dry run starts nothing and deletes nothing, so it cannot prove either outcome"
+      log_line "dry-run: would START name=$nm agent_id=$aid dir=$d evidence=$ev and retire it only if GitHub refuses the session — a dry run starts nothing and deletes nothing, so it cannot prove either outcome"
       retired=$((retired + 1))
       continue
     fi
@@ -1398,13 +1398,13 @@ cmd_reclaim() {
     case "$vrc" in
       0)
         revived=$((revived + 1))
-        say "revived name=$nm agent_id=$aid dir=$d — the listener started and SURVIVED the settle window, so this registration still answers GitHub: the 'deleted' line in its log is NOT evidence (a skewed clock prints the same line — actions/runner#4648) and nothing was deleted"
+        log_line "revived name=$nm agent_id=$aid dir=$d — the listener started and SURVIVED the settle window, so this registration still answers GitHub: the 'deleted' line in its log is NOT evidence (a skewed clock prints the same line — actions/runner#4648) and nothing was deleted"
         continue ;;
       6)
-        say "verified name=$nm agent_id=$aid dir=$d — GitHub refused a session started in THIS pass, under the clock measured here (skew=${skew}s bound=${MAX_SKEW_S}s): the retirement rests on a refusal it dated itself, not on an old log line" ;;
+        log_line "verified name=$nm agent_id=$aid dir=$d — GitHub refused a session started in THIS pass, under the clock measured here (skew=${skew}s bound=${MAX_SKEW_S}s): the retirement rests on a refusal it dated itself, not on an old log line" ;;
       *)
         cannot=$((cannot + 1))
-        say "$verout"
+        log_line "$verout"
         continue ;;
     esac
     # ⛔ RENAME FIRST, DELETE SECOND — MEASURED, AND THE REASON THIS IS NOT ONE `rm -rf` (#2620).
@@ -1424,14 +1424,14 @@ cmd_reclaim() {
     removed=1
     if ! rm -rf "$q" 2>/dev/null || [ -e "$q" ] || [ -L "$q" ]; then removed=0; qn=$((qn + 1)); fi
     if [ -n "$sib" ]; then
-      say "retired name=$nm agent_id=$aid dir=$d evidence=$ev kept=$sib — a LIVE registration still holds this name, so nothing was re-registered (re-registering here would have deleted it)"
+      log_line "retired name=$nm agent_id=$aid dir=$d evidence=$ev kept=$sib — a LIVE registration still holds this name, so nothing was re-registered (re-registering here would have deleted it)"
     elif [ "$sib_unknown" = 1 ]; then
-      say "retired name=$nm agent_id=$aid dir=$d evidence=$ev — the name is UNVERIFIED: at least one pool entry could not be read, so this pass cannot prove no live runner holds it; do NOT run '$SELF add --name $next' until the pool is readable — re-registering a name a live runner holds DELETES that runner"
+      log_line "retired name=$nm agent_id=$aid dir=$d evidence=$ev — the name is UNVERIFIED: at least one pool entry could not be read, so this pass cannot prove no live runner holds it; do NOT run '$SELF add --name $next' until the pool is readable — re-registering a name a live runner holds DELETES that runner"
     else
-      say "retired name=$nm agent_id=$aid dir=$d evidence=$ev — the name is free again; run: $SELF add --name $next"
+      log_line "retired name=$nm agent_id=$aid dir=$d evidence=$ev — the name is free again; run: $SELF add --name $next"
     fi
     if [ "$removed" = 0 ]; then
-      say "quarantined dir=$q — the registration is OUT of the pool, but its files could not be removed (a root-owned file inside, usually systemd's _diag): run: rm -rf \"$q\" as the account that owns them; this path is excluded from slots and from every later pass, and status keeps naming it until it is gone"
+      log_line "quarantined dir=$q — the registration is OUT of the pool, but its files could not be removed (a root-owned file inside, usually systemd's _diag): run: rm -rf \"$q\" as the account that owns them; this path is excluded from slots and from every later pass, and status keeps naming it until it is gone"
     fi
   done <<<"$dirs"
   # ⛔ THE SUMMARY CARRIES ITS DENOMINATOR (#2899 review round 5, P2). An all-zero line with no
@@ -1487,7 +1487,7 @@ cmd_reconcile() {
       # "this cannot be started" here, with the retire preview printed by the arm below — not "would
       # start" followed by a retirement of the very same directory.
       if [ "$(capacity_class "$d" 2>/dev/null)" = "orphaned" ]; then
-        say "dry-run: the listener for name=$(basename "$d") cannot be started — its registration no longer exists server-side (see the retire preview below)"
+        log_line "dry-run: the listener for name=$(basename "$d") cannot be started — its registration no longer exists server-side (see the retire preview below)"
         continue
       fi
       # ⛔ THE PREVIEW ASKS, IT DOES NOT RESTATE. `restart --dry-run` re-runs the same liveness probe
@@ -1554,7 +1554,7 @@ cmd_reconcile() {
   if [ -n "$cand" ]; then
     rc=0
     if [ "$DRY" = 1 ]; then rcout="$("$SELF" reclaim --dry-run 2>&1)" || rc=$?; else rcout="$("$SELF" reclaim 2>&1)" || rc=$?; fi
-    [ -n "$rcout" ] && say "$rcout"
+    [ -n "$rcout" ] && log_line "$rcout"
     reclaimed="$(printf '%s\n' "$rcout" | sed -n 's/^reclaim: retired=\([0-9][0-9]*\) .*/\1/p' | head -1)"
     case "${reclaimed:-}" in ''|*[!0-9]*) reclaimed=0 ;; esac
     case "$rc" in 0) : ;; *) cannot=$((cannot + 1)) ;; esac
@@ -1609,9 +1609,9 @@ cmd_reconcile() {
     # slots + what the preview has already announced.
     if [ "$DRY" = 1 ]; then
       [ $(( SLOTS + dry_adds )) -lt "$CEILING" ] || {
-        say "dry-run: ceiling would be reached slots=$SLOTS+$dry_adds ceiling=$CEILING ncpu=$NCPU"; break; }
+        log_line "dry-run: ceiling would be reached slots=$SLOTS+$dry_adds ceiling=$CEILING ncpu=$NCPU"; break; }
     else
-      [ "$SLOTS" -lt "$CEILING" ] || { say "ceiling reached slots=$SLOTS ceiling=$CEILING ncpu=$NCPU"; break; }
+      [ "$SLOTS" -lt "$CEILING" ] || { log_line "ceiling reached slots=$SLOTS ceiling=$CEILING ncpu=$NCPU"; break; }
     fi
     scan=0
     while [ -e "$RUNNER_ROOT/$POOL_PREFIX-$n" ]; do

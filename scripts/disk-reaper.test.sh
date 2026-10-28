@@ -2147,13 +2147,13 @@ chmod +x "$T/t55b/bin/plutil"
 } >"$T/t55b/plist-fn.sh"
 REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
     HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" >/dev/null 2>&1
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" >/dev/null 2>&1
 # a GOOD plist, textual route
 printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--apply</string></array>" \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T58b the textual fallback accepts an artifact that carries executable AND mode flag"
 assert_contains "$OUT" "EnvironmentVariables.HOME NOT verified" "T58b ... and NAMES the fact it could not verify"
 # a STALE plist (armed decision missing) — the defect the parsed arm was fixed for
@@ -2161,7 +2161,7 @@ printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--dry-run</string></array>" \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T58b the textual fallback REFUSES a stale plist that lacks the arming decision"
 assert_contains "$OUT" "does not carry --apply" "T58b ... naming the missing flag"
 # a parser that is PRESENT but FAILING must not be reported as ABSENT, and its own error must survive
@@ -2170,7 +2170,7 @@ printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--apply</string></array>" \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T58b a failing parser still falls back (it does not block the install)"
 assert_contains "$OUT" "the plist parser FAILED" "T58b ... and the operator is told the parser FAILED, not that none exists"
 assert_contains "$OUT" "No value at that key path" "T58b ... with the parser's OWN error text preserved"
@@ -2180,7 +2180,7 @@ printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--dry-run</string></array>" \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T58b the stale-plist refusal still fires"
 # ⛔ EXACT, not substring: a duplicated/jammed message satisfied a substring match, so the suite was
 # green over `…key pathplutil: …` (the `${perr:-…}`-is-not-an-else bug). Pin the whole parenthesis
@@ -2196,7 +2196,7 @@ for _u in bash grep sed cat rm mv mkdir chmod date awk tr head tail printf ls cp
     [ -e "$T/t55b/bin-none/$_u" ] || { [ -x "/usr/bin/$_u" ] && ln -s "/usr/bin/$_u" "$T/t55b/bin-none/$_u"; }
 done
 OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T58b with NO parser at all the stale plist is still refused"
 assert_contains "$OUT" "(textual check only: no plist parser was available)" "T58b ... and it says no parser was available, not that one failed"
 assert_absent "$OUT" "the plist parser FAILED" "T58b ... never claiming a failure it did not observe"
@@ -2268,7 +2268,7 @@ printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
     LAUNCHER="/x/launcher.py" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T58c a plist launcher whose --script is NOT the reaper is REFUSED"
 assert_contains "$OUT" "does not LAUNCH $REAPER" "T58c ... and names the defect"
 # ... and the rendered TCC shape (launcher + --script <reaper>) is ACCEPTED, so the pair rule is not a
@@ -2280,7 +2280,7 @@ printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
     LAUNCHER="/x/launcher.py" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T58c the rendered launcher + --script <reaper> shape is ACCEPTED (positive control)"
 # ⛔ argv[0] IS THE PROGRAM launchd EXECS. Pinning only argv[1] (the launcher) and `--script` certified
 # `[/bin/true, <launcher>, --script, <reaper>, --apply]`: launchd runs /bin/true, nothing else, while
@@ -2293,7 +2293,7 @@ printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
     LAUNCHER="/x/launcher.py" PY_BIN="/usr/bin/python3" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T58c a plist whose argv[0] is NOT the rendered interpreter is REFUSED (argv[0] is the program)"
 assert_contains "$OUT" "does not LAUNCH $REAPER" "T58c ... and names the defect"
 # A STALE interpreter is the same defect in a subtler shape (the TCC class this installer warns about):
@@ -2305,7 +2305,7 @@ printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
     '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
 OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
     LAUNCHER="/x/launcher.py" PY_BIN="/usr/bin/python3" HOME="$T/t55/home" \
-    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T58c a plist whose argv[0] is a STALE interpreter (not the rendered PY_BIN) is REFUSED"
 
 # ⛔ THE SPELLING IS PART OF THE ARTIFACT (T58d). systemd strips whitespace around `=` and accepts
