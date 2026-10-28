@@ -606,8 +606,27 @@ if [ -f "$REPO/pyproject.toml" ] && [ ! -x "$REPO/.worktrees/dispatch-scout/.ven
 fi
 
 # ── shipped scripts ──────────────────────────────────────────────────────────────
+# ⛔ #2930 — A TEST SUITE'S PARSE ERROR MUST NOT BE ABLE TO REFUSE AN INSTALL. This sweep is what
+# stopped a stock Mac from installing the harness AT ALL: `merge-reminder.test.sh` carries a
+# here-doc inside a `$( )` whose body contains an apostrophe, bash 3.2's substitution scanner does
+# not know about here-documents and desynchronises (#2248 is the same class), `bash -n` failed, and
+# `die` ran — over a file NOTHING EXECUTES at runtime. The two are not the same risk: a runtime
+# script that does not parse is a controller that crash-loops under KeepAlive (refuse, as before); a
+# `*.test.sh` that does not parse on THIS host is a suite that cannot run here (report it BY NAME
+# and continue). The class is caught before merge by scripts/check-bash32-parse.sh, which sweeps
+# every shipped `*.sh` under a real bash 3.2 in both CI lanes.
 for f in "$HERE"/*.sh; do
-  bash -n "$f" || die "syntax error in $(basename "$f")"
+  if err="$(bash -n "$f" 2>&1)"; then continue; fi
+  case "$(basename "$f")" in
+    *.test.sh)
+      warn "syntax error in the TEST suite $(basename "$f") — reported, NOT fatal (no runtime script runs it):"
+      printf '%s\n' "$err" | sed 's/^/        /'
+      ;;
+    *)
+      printf '%s\n' "$err" >&2
+      die "syntax error in $(basename "$f")"
+      ;;
+  esac
 done
 # the gh REST adapter is a bin shim, not a *.sh — check it explicitly (#1959)
 [ -f "$HERE/gh-rest/gh" ] && { bash -n "$HERE/gh-rest/gh" || die "syntax error in gh-rest/gh"; }
@@ -995,9 +1014,21 @@ ok "harness pinned: ${PIN_HEAD:0:12} at $HARNESS"
 # ⛔ THE PINNED TREE IS NOW A SHIPPED SURFACE, SO IT GETS THE SAME SYNTAX SWEEP the checkout got above.
 # A pin can name a commit whose `orch-loop.sh` does not parse (a bad land), and launchd would then
 # KeepAlive-crash-loop on it with nothing but syntax errors in launchd.err. Refuse at install time.
+# The `*.test.sh` carve-out is the one the checkout sweep above documents (#2930): a tested-but-broken
+# suite is reported by name, never a refused install.
 for _f in "$HARNESS"/*.sh; do
   [ -f "$_f" ] || continue
-  bash -n "$_f" || pin_refuse "syntax error in the PINNED $(basename "$_f") ($HARNESS) — this commit cannot run, and installing it would crash-loop under KeepAlive"
+  if _err="$(bash -n "$_f" 2>&1)"; then continue; fi
+  case "$(basename "$_f")" in
+    *.test.sh)
+      warn "syntax error in the PINNED test suite $(basename "$_f") — reported, NOT fatal (#2930):"
+      printf '%s\n' "$_err" | sed 's/^/        /'
+      ;;
+    *)
+      printf '%s\n' "$_err" >&2
+      pin_refuse "syntax error in the PINNED $(basename "$_f") ($HARNESS) — this commit cannot run, and installing it would crash-loop under KeepAlive"
+      ;;
+  esac
 done
 ok "pinned scripts parse ($HARNESS)"
 
