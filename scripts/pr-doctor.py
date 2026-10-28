@@ -5207,8 +5207,15 @@ def run_pass(args, rubric_note: str = "") -> int:
             # nothing to do, and it will land without another pass.
             undeliverable += 1
             stalled["live-unreadable"] = stalled.get("live-unreadable", 0) + 1
+            # ⛔ AND THIS LINE NAMES THE SPELLING THAT COULD NOT BE READ (#2725 cycle 3, P3). The
+            # three other sites print the name that ANSWERED; this one printed this pass's
+            # repo-qualified name while `live_name` -- returned by `worker_live_which()` precisely
+            # to identify the answering spelling -- was bound and discarded. `live_name` can be the
+            # legacy `prd-<n>` or the owner-blind `prd-<repo-NAME>-<n>`, so the operator was sent to
+            # inspect a `.pid` that was never written -- the same class the other three fix.
             log("#%s (%s): worker %s liveness could not be read -- skipping rather than "
-                "spawning blind over a possibly live worker" % (key, action, worker_name(key)))
+                "spawning blind over a possibly live worker"
+                % (key, action, live_name or worker_name(key)))
             continue
         text = brief(p, action, why, cr)
         if not text:

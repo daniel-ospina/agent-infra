@@ -2448,14 +2448,21 @@ always, so two orders can name one directory — the #2280 defect, which `worker
 (`pr-doctor.py`) fixes on the doctor's side and which this supervisor must not reintroduce one
 layer down (`nonblocking-dispatch.sh` performs **no** liveness check of its own, so this is the only
 guard there is). Before every re-offer it asks `--status` for **every order that records the same
-worktree**, plus every spelling `prd-doctor._worker_spellings()` returns for that PR — the two
-pre-#2725 generations (`prd-<n>`, and the owner-blind `prd-<repo-NAME>-<n>` written by the old
-multi-repo path) — when they differ from the order's name (the
-primary arm matches the `.started` record's `worktree` field, so it is name-agnostic and a
-repo-qualified order needs no change): a `running`
+worktree** (that arm matches the `.started` record's `worktree` field, so it is name-agnostic and a
+repo-qualified order needs no change), **plus the single pre-#2725 alias `prd-<n>`** when it differs
+from the order's own name: a `running`
 holder refuses the re-offer (`live`, the slot is held), and an unanswerable holder refuses it too
 (`unknown`) — an unreadable other name is never a licence to spawn blind. `worker-supply.test.sh`
 case (d2) pins all three arms and reddens when the guard is removed.
+
+⛔ **THOSE TWO ARMS ARE NOT THE DOCTOR'S WHOLE SET, AND THIS SCRIPT DOES NOT PRETEND THEY ARE.**
+`pr-doctor._worker_spellings()` additionally probes the owner-blind `prd-<repo-NAME>-<n>` written by
+the old multi-repo path. This supervisor cannot compute that name — it holds no repo, by design (it
+speaks to the dispatcher by NAME only, so one supervisor serves the box) — so it reaches that
+generation **only through an order record**, i.e. only while a `.started` file for it exists. A live
+owner-blind worker whose order record is gone is therefore seen by the DOCTOR (which probes it) and
+NOT by this script. Stated rather than claimed covered: the claim is what the next lane relies on
+instead of reading the code (agent-infra#3005).
 
 ```bash
 bash worker-supply.sh status     # the last pass record + a FRESH live count — the record is not the reading

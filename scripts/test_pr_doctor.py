@@ -379,7 +379,8 @@ def test_a_repo_scoped_pid_file_is_matched_by_the_short_row_name(tmp_path, monke
     (bg / "prd-2035.pid").write_text("%d\n" % dead)                        # ours: provably gone
     (bg / "prd-daniel-ospina-tortoise-2035.pid").write_text("%d\n" % os.getpid())  # ANOTHER repo: live
     assert pr._worker_pid_files("prd-2035") == [pr.bg_path("prd-2035", "pid")], \
-        "the candidate set must be the TWO spellings of this PR, never another repo's file"
+        ("the candidate set is this PR's own spellings only (see `_worker_spellings()`), never "
+         "a file belonging to another repo's tag")
     assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1, \
         "another repo's live worker for #2035 must not hold THIS repo's budget slot"
 
@@ -5890,6 +5891,23 @@ def test_the_liveness_refusal_names_the_spelling_that_ANSWERED(monkeypatch, tmp_
     # Nothing live anywhere names no one.
     monkeypatch.setattr(pr, "worker_status", lambda n: "lost")
     assert pr.worker_live_which(1234) == (False, "")
+
+
+def test_the_UNREADABLE_liveness_line_names_the_spelling_it_could_NOT_read(monkeypatch):
+    """The fourth site: an unanswerable read must name the artifact that failed, not this pass's (#2725 r3 P3).
+
+    `worker_live_which()` returns the spelling that answered for BOTH `True` and `None`; the other
+    three call sites print it, while this one printed `worker_name(key)` and DISCARDED `live_name`.
+    The unanswerable spelling can be the legacy `prd-<n>` or the owner-blind `prd-<repo-NAME>-<n>`, so
+    the operator was sent to inspect a `.pid` that was never written -- the exact class the other
+    three sites fix, in the ONE branch that is read when nothing could be read at all.
+    """
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(2)], ("fix-ci", "r", []),
+                                     live=lambda name: None if name == "prd-2" else False)
+    assert rc == 3, joined                       # an unreadable probe withholds the order
+    assert "worker prd-2 liveness could not be read" in joined, joined
+    assert "worker %s " % pr.worker_name(2) not in joined, \
+        "the line must name the spelling that failed to answer: %s" % joined
 
 
 def test_a_zero_padded_ARTIFACT_is_not_a_sibling_and_the_slot_is_HELD(tmp_path, monkeypatch):
