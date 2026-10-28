@@ -35,14 +35,20 @@
 # again (`StartLimitBurst=3`). Every harness change that night needed one. The orphan/restart half is
 # agent-infra#2315's, NOT this file's.
 # So the word is replaced by a STATE with a defined transition, in three parts:
-#   1. THE IDENTITY IS READ FROM THE PROCESS, NOT FROM A RECORD, where a cell is concerned — the live
-#      controller's argv names the tree it executes (see `controller_identity` below). ⛔ SCOPED, because
-#      the absolute version of this sentence was false: WHILE A CONTROLLER IS LIVE, that read is the only
-#      thing that can END the state honestly — a live controller whose identity came from the stamp is
-#      downgraded by the `stamp:*` arm below (which is itself gated on `CONTROLLER_LIVE`). With NO
-#      controller live nothing runs, the STAMP answers, and whatever it says decides the relation: the
-#      `stamp:*` downgrade cannot fire, so a stamp naming the pin reports `current` (see the note above
-#      `CONTROLLER_LIVE`). "No controller" is therefore not by itself a `restart-pending`.
+#   1. THE IDENTITY IS READ, IN PRECEDENCE ORDER, AND THE ORDER IS THE CONTRACT:
+#        `self:`            the script's own dir, where it is a git checkout (the laptop shape) — the
+#                           strongest evidence, and it answers FIRST, so on a laptop no process read is
+#                           involved at all.
+#        the controller's   where `self:` does not resolve (a cell's flat `$O`): the pin-rooted source-2
+#        argv               reader, then `controller_identity` as its fallback — both read the lock's pid
+#                           and the tree its argv names.
+#        the stamp          last: a CLAIM `apply` wrote. Where a controller is LIVE, a `stamp:` identity is
+#                           then DOWNGRADED to `restart-pending` by the `stamp:*` arm below; where none is
+#                           live, nothing runs and the stamp is the honest answer.
+#      ⛔ SO `restart-pending` ENDS WHEN THE ANSWERING SOURCE NAMES THE PIN — whichever source that is.
+#      Do NOT describe any ONE of these as "the only thing that can end the state": that was written here,
+#      and it is false twice over (a laptop ends it by moving `self:` with the same live pid; a box with no
+#      controller ends it by the stamp naming the pin). The code is the order above, not a single reader.
 #   2. THE PENDING STATE IS CLASSIFIED, and the classification rides in the record as `pending=`:
 #        inert       no live controller — nothing runs, so nothing is stale; the next launch runs the pin.
 #        unprovable  a controller IS live and its identity is a CLAIM (the stamp) — no restart is
