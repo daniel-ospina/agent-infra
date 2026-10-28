@@ -1422,6 +1422,38 @@ lane_bound_path() {
   return 1
 }
 
+# ── the capability gate's script, resolved the same way `lane-bound.sh` is ───────────────────────
+# ⛔ A SEPARATE LOOKUP, NOT A SECOND CONVENTION: same candidate set in the same order, so a box that
+# can find one helper can find the other, and `$O` (deployed) still wins over the checkout.
+# ⛔ THE CACHE IS INITIALISED AT MODULE SCOPE, EXACTLY LIKE `LANE_BOUND_SH` ABOVE — and that is not
+# tidiness. Without it the resolver's first statement reads an unbound variable under `set -u` (line
+# 62), the abort propagates OUT of the `$(cell_preflight_path)` command substitution, the `if` takes
+# its else branch, and `run_agent` logs "cell-lane-preflight.sh not found" — with the helper sitting
+# right there — and LAUNCHES the agent ungated on every spawn, on every box. That is the no-op-gate /
+# fail-open shape this file is written against, and it was measured on the first cut of this gate:
+# `( . ./spawn-gate.sh; cell_preflight_path )` printed `CELL_PREFLIGHT_SH: unbound variable`, rc=1.
+# ⛔ `:-` AND NOT A BARE `=""`. A bare initialisation is what makes the resolver safe under `set -u`,
+# but it ALSO CLOBBERS an operator/test override: `CELL_PREFLIGHT_SH=/path` passed in the environment
+# is a deliberate injection (the suites use exactly that to drive the gate with a fixture verdict), and
+# a bare assignment resets it to empty and silently re-resolves the DEPLOYED helper instead — measured:
+# every capability arm reported the REAL probe's verdict instead of its fixture's, and five of them
+# went red saying the gate never refused. Keep the default, keep the override.
+CELL_PREFLIGHT_SH="${CELL_PREFLIGHT_SH:-}"
+cell_preflight_path() {
+  local c here
+  if [ -n "$CELL_PREFLIGHT_SH" ]; then printf '%s\n' "$CELL_PREFLIGHT_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${O:-}/cell-lane-preflight.sh" "$here/cell-lane-preflight.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/cell-lane-preflight.sh" \
+           "${HOME:-}/.pi/agent/scripts/cell-lane-preflight.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    CELL_PREFLIGHT_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
 # ── the ONE agent invocation ─────────────────────────────────────────────────────
 # run_agent <seconds> <logfile> <promptfile> [label]
 #
@@ -1478,6 +1510,15 @@ AGENT_LOAD_REFUSED=75
 # the open queue" — make every caller mislabel one of them, and a mislabelled refusal sends an
 # operator to the wrong remedy with full confidence. Found by the integration batch review as a P0.
 AGENT_FORK_REFUSED=73
+# The CAPABILITY refusal (agent-infra#2935). A FIFTH code because it has a FIFTH remedy: not load
+# (75), not disk (77), not the repo's backlog (74), not the spawn point (76) — the BOX was measured
+# and it cannot complete one model call and RETURN. Measured 2026-10-28: six lanes on cell1 and five
+# on cell3 each ran the full 3300 s cap and produced 0 commits, and every existing gate above said
+# yes, because an idle box passes all of them BY BEING IDLE. It is not 75 (waiting does not clear it),
+# not 77 (no disk to reclaim), and the remedy — reinstall/repair the box's pi or its extension set, or
+# dispatch elsewhere — is as distinct as the others. 80+ is taken by the brief gate and adopt-fix.sh,
+# so this one sits beside the fork refusal at 71.
+AGENT_CAPABILITY_REFUSED=71
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
@@ -1885,6 +1926,85 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # a tool child could read the pane's pty — typed input stolen from a human — or, under
   # `nonblocking-dispatch.sh`'s closed stdin, inherit a CLOSED fd 0. The agent is headless: it never
   # reads stdin, so binding it to /dev/null restores the pre-change behaviour explicitly.
+  # ── THE CAPABILITY GATE (agent-infra#2935) — LAST, IMMEDIATELY BEFORE THE LAUNCH ──────────────
+  # Every gate above asks about a RESOURCE (fork, disk, load, backlog). None asks whether this box can
+  # complete one model call and RETURN, and that is the question the 2026-10-28 measurement needed:
+  # six lanes on cell1 and five on cell3 burned the full 3300 s cap each and produced 0 commits,
+  # while cell4 ran the identical launcher to 8 commits — and every gate here said yes, because an
+  # idle box passes all of them BY BEING IDLE.
+  #
+  # ⛔ WHY IT IS MEASURED HERE RATHER THAN TRUSTED. Re-measured 2026-10-28 06:00-06:40Z, per box: the
+  # provider answers (`api.deepseek.com` 401 in 0.35-0.37 s, a direct completion 200 in 636/740/895 ms),
+  # `keys.env` is present and exports on all three, DNS/TLS/ no proxy are fine everywhere, and `$O`'s
+  # `lane.sh`/`spawn-gate.sh`/`lane-exec.sh` are BYTE-IDENTICAL on all three (`3090323c`/`2fa48cc`/
+  # `193d3b`). So the box-to-box difference is not in anything a config check can read — it is in
+  # whether its `pi` finishes. That is measurable only by running it once, bounded.
+  #
+  # ⛔ IT REFUSES ON A DETERMINISTIC VERDICT AND ONLY WARNS ON A BLIP — and "which is which" is
+  # decided by POLARITY, not by a list of favourite substrings. The first cut matched exactly
+  # `why=exit-hang` / `why=call-failed` and warned on everything else, so every OTHER deterministic
+  # refusal fell through to `*) PROCEEDING` and burned the 3300 s slot the probe exists to protect:
+  # a box that hangs BEFORE the answer could only ever emit `why=no-answer` (measured:
+  # `why=no-answer alive_at=3s attempts=1` → WARN → agent started), an unreadable/empty `keys.env`
+  # (rc=2, against the probe's own "EVERY caller must refuse too") was dispatched, and a `pi` missing
+  # from PATH likewise. Meanwhile a reason added to the probe tomorrow would silently inherit the
+  # WARN arm — the same unread-code defect that left exit 71 with no reader anywhere.
+  # The rule now mirrors `tools/fleet/liveness.py`'s: ONE reason is the transient (`why=no-answer`,
+  # which the preflight emits ONLY when the process RETURNED without answering — that is its contract,
+  # stated in its own header), and EVERY other named refusal refuses. A verdict line with no
+  # recogniseable verdict at all warns, because a probe that could not run is not a verdict about the
+  # box.
+  #
+  # ⛔ IT DOES NOT SPEND THE SLOT IT IS PROTECTING: one bounded call, ~5-25 s measured on a healthy box,
+  # and the attempt is abandoned the moment the process exits. `LANE_PREFLIGHT=0` is the declared
+  # escape; `LANE_PREFLIGHT_BOUND` overrides the bound (default 45 s — the probe's OWN documented
+  # default, not a tighter number: a healthy box measured 25 s worst case, so a 30 s bound left ~1 s of
+  # slack for the post-answer exit and could refuse a working box on one slow sample).
+  if [ "${LANE_PREFLIGHT:-1}" != "0" ]; then
+    local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy=""
+    if _pf_sh="$(cell_preflight_path)"; then
+      _pf_line="$(bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
+                    --provider "$lane_provider" --model "$lane_model" 2>>"$log")"
+      _pf_rc=$?
+      echo "[capability-gate] $_pf_line" >> "$log"
+      case "$_pf_line" in
+        *why=no-answer*)
+          echo "[capability-gate] WARN $label: the probe RETURNED without an answer (rc=$_pf_rc) — PROCEEDING, because a transient cannot arm a refusal and this is the only shape a transient takes. If lanes on this box stall, the line above is the reading to start from." >> "$log" ;;
+        *LANE_CAPABILITY=refused*)
+          # The remedy follows the REASON. They are not interchangeable, and naming the wrong one is the
+          # P0 this file records twice for the fork code: an operator told "repair the extension set"
+          # on a box with no key, or "re-dispatch elsewhere" on a lane whose model id is empty, waits
+          # for an event that cannot arrive.
+          case "$_pf_line" in
+            *why=exit-hang*|*why=no-return*)
+              _pf_remedy="This does NOT clear by waiting: repair the box's installed pi/extension set (the line above carries the reading) or dispatch elsewhere." ;;
+            *why=call-failed*)
+              _pf_remedy="This does NOT clear by waiting on load: the request RESOLVED and the call errored — read the provider/key error in the line above and repair THAT." ;;
+            *why=keys-unreadable*)
+              _pf_remedy="This does NOT clear by waiting: the provider credential could not be read on this box — fix keys.env / the ambient <PROVIDER>_API_KEY before re-dispatching (the probe would have measured nothing)." ;;
+            *why=pi-missing*)
+              _pf_remedy="This does NOT clear by waiting: there is no pi on this box's PATH — install/repair the harness on the box before re-dispatching." ;;
+            *why=misconfigured*)
+              _pf_remedy="This does NOT clear by waiting: the lane's model/provider PAIR is empty, so no box could run it — fix the dispatch, not the box." ;;
+            *)  _pf_remedy="This does NOT clear by waiting: the reading above names the refusal." ;;
+          esac
+          AGENT_STARTED=0
+          echo "[capability-gate] REFUSED $label: LANE_CAPABILITY (exit $_pf_rc) — no agent was started, so nothing was consumed and no 3300s slot is spent on a box that cannot complete one call and return. $_pf_remedy Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
+          # ⛔ JOB CONTROL IS RESTORED BEFORE THE EARLY RETURN (review P2). `set -m` was turned on
+          # above for the launch, and the restore line lives after it — so this return is the one path
+          # that used to leave the CALLER with job control ON when it did not have it. With `set -m`
+          # on, bash stops redirecting an async command's stdin from /dev/null, so a later background
+          # command in the caller can inherit the pane's pty or a CLOSED fd 0 (#2163).
+          [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
+          return "$AGENT_CAPABILITY_REFUSED" ;;
+        *LANE_CAPABILITY=ok*) : ;;
+        *)
+          echo "[capability-gate] WARN $label: the capability probe produced no verdict at all (rc=$_pf_rc) — PROCEEDING, because a probe that cannot run is not a verdict about the box. If lanes on this box stall, start from the absence of a LANE_CAPABILITY line above." >> "$log" ;;
+      esac
+    else
+      echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
+    fi
+  fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`

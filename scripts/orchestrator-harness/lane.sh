@@ -404,7 +404,7 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
   echo "[lane $N] ⚠️ NO merge-phase verdict (state/lanemerge-issue-$N.verdict absent) — the lane ended without either reaching merged or naming a blocker; merge-rate.sh will count it as PR_OPENED (or UNKNOWN if the log carries no status token), never as MERGED." >> "$O/logs/lane-$N.log"
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
-# AGENT_BRIEF_REFUSED (80)
+# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71)
 # or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
@@ -414,9 +414,9 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk` and
-  # `land` are the four values the gate can refuse on, and each is chosen by the code its own caller
-  # already distinguishes, so the record can never disagree with the exit status.
+  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk`,
+  # `capability` and `land` are the five values the gate can refuse on, and each is chosen by the code
+  # its own caller already distinguishes, so the record can never disagree with the exit status.
   # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
   # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
   # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
@@ -443,9 +443,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # ⛔ FORK IS 73, NOT 74 (#2293 x #2409): 74 is the LAND-BACKLOG gate below, whose remedy is the
     # opposite of a fork refusal's, so one code for both made this very case statement label one gate
     # with the other's remedy (the integration batch's review caught it as a P0).
+    # ⛔ CAPABILITY IS ITS OWN VALUE (review of #2991, P1), AND IT IS THE ONE THAT PROVES THE RULE: a
+    # fifth refusal code was added to `spawn-gate.sh` with no reader anywhere, so a box that cannot
+    # complete one call and RETURN published `gate=load` and the reason "issue returns to the queue" —
+    # the line below the correct `[capability-gate] REFUSED` one. Waiting never clears it.
+    # ⛔ IT STILL MINTS A CAPACITY RECORD, unlike the brief refusal above, and the difference is not an
+    # oversight: a brief refusal follows the ITEM to any box, while a capability refusal is a property
+    # of THIS box, so yielding the issue to a peer is exactly the right remedy (the brief-refusal
+    # argument, read in the other direction). Tolerant default for the same $O-skew reason as the rest:
+    # a helper predating the code can never return it.
     if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
+    elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
     else _cap_gate=load; fi
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
     # README §7.2 says it in as many words ("**The yield is gate-independent, deliberately**"), and
@@ -494,6 +504,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # already idle; the reading they need is the repo's open-PR count against its landing rate, which
     # is on the `[land-backlog] REFUSED` line in the same log.
     echo "[lane $N] NOT started: LAND-BACKLOG — the repo holds more open PRs than its own measured landing rate can absorb (#2409), so new creation is held. This is NOT a capacity refusal: the box is fine and waiting will not clear it. The work is the PR queue — review, rebase or land an open PR; a P0-blocker or a base-red repair is exempt by evidence. Issue returns to the pool." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
+    # ⛔ NAMED, BECAUSE THE REMEDY IS THE ONE THING WAITING CANNOT BUY (review of #2991, P1). Without
+    # this arm a capability refusal fell into the `else` below and the operator read "load gate refused
+    # — issue returns to the queue", one line under the `[capability-gate] REFUSED` line saying the
+    # opposite. The `[capability-gate]` line above names WHICH reading refused (a hang, an unreadable
+    # key, no pi, an empty model pair) and therefore which repair applies; this line's job is to stop
+    # the reader concluding that the queue will fix it.
+    echo "[lane $N] NOT started: CAPABILITY gate refused — this box could not complete one model call and RETURN (agent-infra#2935). Waiting will NOT clear it and load has nothing to do with it: the [capability-gate] line above carries the reading it refused on, so repair THAT on this box (its installed pi/extension set, its provider credential) or dispatch the issue to another box. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
   else
     echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"
   fi
