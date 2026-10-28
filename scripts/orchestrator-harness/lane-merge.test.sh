@@ -207,6 +207,65 @@ run 14 --repo o/r --pr-tsv "$T/pr8.tsv"
 ck "after the chain merged, the next run reports MERGED from the PR's own state" \
    $([ "$RC" = 0 ] && [ "$(verdict_of 14 | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
 
+# ── 9b. THE ONE RED THE CHAIN MINTS IS NOT A FIX ROUND (#3002 measured on this repo's own PRs) ──
+# `pipeline-compliance` is agent-infra's ONLY required check and it is RED BY CONSTRUCTION on a fresh
+# PR: item (c) wants a signed review record bound to THIS head, and only merge-one.sh may mint one. The
+# loop used to spend all three rounds on it and refuse as BLOCKED_ATTEMPTS without ever launching the
+# chain — measured on 2 of 18 lanes on the box (`state/lanemerge-*.verdict`). The route is EVIDENCE-
+# gated: the ONLY red, no record at this head, and the gate's own log saying ONE failure, item (c).
+HEAD40=abcdef1234567890
+printf 'open||%s|clean\n' "$HEAD40" > "$T/pr-att.tsv"
+printf 'pipeline-compliance\tcompleted\tfailure\t51\tgithub-actions\thttps://github.com/o/r/actions/runs/9/job/777\n' \
+  > "$T/checks-attestation.tsv"
+# the gate's OWN words, both lines `scripts/check-pipeline-compliance.sh` prints
+printf '=== Pipeline Compliance Gate ===\n[[...] no head-bound code-review record for o/r#31\n\xf0\x9f\x87\x8d [c] no head-bound code-review record for o/r#31 \xe2\x80\x94 check (c) accepts ONLY the record-review.sh marker\n\xf0\x9f\x87\x8d PIPELINE COMPLIANCE: BLOCKED (1 failure(s)).\n' \
+  > "$T/job-log-c.log"
+new_o "$T/pr-att.tsv"
+run 31 --repo o/r --pr-tsv "$T/pr-att.tsv" --checks-tsv "$T/checks-attestation.tsv" --job-log "$T/job-log-c.log"
+ck "the ONLY red is the absent head-bound record → the chain is launched (exit 11), NOT a fix round" \
+   $([ "$RC" = 11 ] && grep -q "launched the merge chain" <<<"$OUT" && [ ! -f "$OT/state/lanemerge-31.round" ] && grep -q "MERGED via the rail" "$OT/logs/lane-merge-31.log" 2>/dev/null && echo 0 || echo 1)
+ck "…and the verdict names the ROUTE, so no stale FIX_REQUIRED stands as the lane's state" \
+   $([ "$(verdict_of 31 | cut -d' ' -f1)" = WAITING_CHAIN_RUNNING ] && echo 0 || echo 1)
+
+# ── 9c. …but a METADATA red of the same check is the LANE's to fix, and must not buy a review ──
+# (a)/(b) are what a lane fixes by giving the PR its issue reference / posting the scoping comment.
+# The gate says TWO failures, so rule (3) refuses to route it — the paid review is not spent.
+printf '\xf0\x9f\x87\x8d [a] no linked issue (no closing keyword in PR body)\n\xf0\x9f\x87\x8d [c] no head-bound code-review record for o/r#32\n\xf0\x9f\x87\x8d PIPELINE COMPLIANCE: BLOCKED (2 failure(s)).\n' \
+  > "$T/job-log-ac.log"
+printf 'open||%s|clean\n' "$HEAD40" > "$T/pr-att32.tsv"
+new_o "$T/pr-att32.tsv"
+run 32 --repo o/r --pr-tsv "$T/pr-att32.tsv" --checks-tsv "$T/checks-attestation.tsv" --job-log "$T/job-log-ac.log"
+ck "the same red with a SECOND failure (a metadata item) → exit 10 FIX_REQUIRED, round spent, no chain" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 32 | cut -d' ' -f1)" = FIX_REQUIRED ] && [ "$(cat "$OT/state/lanemerge-32.round")" = 1 ] && [ ! -f "$OT/logs/lane-merge-32.log" ] && echo 0 || echo 1)
+
+# ── 9d. a record ALREADY at this head means the red is about something else (do not re-review) ──
+mkdir -p "$T/home/.pi/agent/reviews"
+printf '{"head_sha": "%s", "verdict": "clean"}\n' "$HEAD40" > "$T/home/.pi/agent/reviews/o-r-33.json"
+printf 'open||%s|clean\n' "$HEAD40" > "$T/pr-att33.tsv"
+new_o "$T/pr-att33.tsv"
+run 33 --repo o/r --pr-tsv "$T/pr-att33.tsv" --checks-tsv "$T/checks-attestation.tsv" --job-log "$T/job-log-c.log"
+ck "a signed record ALREADY at this head → the red is NOT chain-minted: exit 10, no second paid review" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 33 | cut -d' ' -f1)" = FIX_REQUIRED ] && [ ! -f "$OT/logs/lane-merge-33.log" ] && echo 0 || echo 1)
+rm -f "$T/home/.pi/agent/reviews/o-r-33.json"
+
+# ── 9e. ANOTHER red alongside it keeps today's behaviour (that one may be a real fix) ───────────
+printf 'pipeline-compliance\tcompleted\tfailure\t51\tgithub-actions\thttps://github.com/o/r/actions/runs/9/job/777\nlint\tcompleted\tfailure\t52\tgithub-actions\t\n' \
+  > "$T/checks-att-two.tsv"
+printf 'open||%s|clean\n' "$HEAD40" > "$T/pr-att34.tsv"
+new_o "$T/pr-att34.tsv"
+run 34 --repo o/r --pr-tsv "$T/pr-att34.tsv" --checks-tsv "$T/checks-att-two.tsv" --job-log "$T/job-log-c.log"
+ck "a second red (lint) beside the attestation red → exit 10 FIX_REQUIRED naming both, no chain" \
+   $([ "$RC" = 10 ] && grep -q "RED:" <<<"$OUT" && grep -q "github-actions:lint" <<<"$OUT" && grep -q "github-actions:pipeline-compliance" <<<"$OUT" && [ "$(cat "$OT/state/lanemerge-34.round")" = 1 ] && [ ! -f "$OT/logs/lane-merge-34.log" ] && echo 0 || echo 1)
+
+# ── 9f. NO readable job log → cannot verify → the red stays a fix round (never a guess) ─────────
+# A five-column fixture (the pre-existing shape) has no details_url, so rule (3) cannot be evaluated.
+printf 'pipeline-compliance\tcompleted\tfailure\t51\tgithub-actions\n' > "$T/checks-att-5col.tsv"
+printf 'open||%s|clean\n' "$HEAD40" > "$T/pr-att35.tsv"
+new_o "$T/pr-att35.tsv"
+run 35 --repo o/r --pr-tsv "$T/pr-att35.tsv" --checks-tsv "$T/checks-att-5col.tsv"
+ck "the red without a verifiable job log → exit 10 (unverifiable is not a licence to launch a review)" \
+   $([ "$RC" = 10 ] && [ "$(cat "$OT/state/lanemerge-35.round")" = 1 ] && [ ! -f "$OT/logs/lane-merge-35.log" ] && echo 0 || echo 1)
+
 # ── 10. THE CAP IS SPENT WHERE IT IS SPENT — and a RED head at the cap blocks with FRESH names ──
 # ⛔ The first implementation refused at the cap BEFORE reading the checks, so the LAST allowed fix
 # was never verified and the handoff quoted STALE names from an earlier head (reviewer P1). The cap

@@ -44,6 +44,9 @@
 #   15  FIX_CONFLICT         the PR is DIRTY — re-apply this lane's own change onto current main
 #                            and force-push its OWN branch (never pick a side on a generated file)
 #   11  WAITING              the chain is running detached — call `--watch` (burns no round)
+#                            (also the route for a head whose ONLY red is the absent head-bound review
+#                            record: that artifact is minted by the chain, so it spends no fix round —
+#                            see red_is_chain_minted)
 #   12  BLOCKED_ATTESTATION  green and mergeable, but the chain produced no signed review at this
 #                            head and did not merge: the ONE thing a lane cannot supply itself
 #   13  BLOCKED_ATTEMPTS     the round cap is spent — hand off (a PR comment states the reason)
@@ -59,7 +62,7 @@ log_line() { printf '%s\n' "$*"; }
 say_err() { printf '%s\n' "$*" >&2; }
 
 PR=""; ISSUE=""; OR=""; BR=""; WATCH=0; STATUS=0
-CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""
+CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""; JOB_LOG=""
 # ── THE ROUTER SEAM (#2866) ───────────────────────────────────────────────────────────────────
 # `pr-state.sh` is the ONE consumer seam for the PR state table; a lane that re-derives "what does
 # this head need next" is the defect #2866 names. Sourced when present, and its absence is PRINTED
@@ -82,9 +85,11 @@ while [ $# -gt 0 ]; do
     --rounds)  need_val "$1" "${2:-}"; MAX_ROUNDS_OVERRIDE="$2"; shift 2 ;;
     --watch)   WATCH=1; shift ;;
     --status)  STATUS=1; shift ;;
-    # TEST SEAMS (documented, not hidden): inject the two API reads from a fixture.
+    # TEST SEAMS (documented, not hidden): inject the two API reads from a fixture, and the failing
+    # job's log (`--job-log`) that the attestation-only red is verified against.
     --checks-tsv) need_val "$1" "${2:-}"; CHECKS_TSV="$2"; shift 2 ;;
     --pr-tsv)     need_val "$1" "${2:-}"; PR_TSV="$2"; shift 2 ;;
+    --job-log)    need_val "$1" "${2:-}"; JOB_LOG="$2"; shift 2 ;;
     -h|--help) sed -n '2,60p' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) say_err "lane-merge: unknown flag '$1' (see --help)"; exit 2 ;;
     *) if [ -z "$PR" ]; then PR="$1"; else say_err "lane-merge: unexpected argument '$1'"; exit 2; fi; shift ;;
@@ -287,7 +292,11 @@ checks_read() { # checks_read <head> [--full]
   [ -n "$head" ] || { say_err "lane-merge: checks_read called with an EMPTY head — refusing (GitHub would answer for the default branch)"; return 1; }
   if [ -n "$CHECKS_TSV" ]; then [ -f "$CHECKS_TSV" ] || return 1; cat "$CHECKS_TSV"; return 0; fi
   local q="repos/$OR/commits/$head/check-runs?per_page=100&filter=all"
-  local rows='(.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.id // 0), (.app.slug // "")] | @tsv)'
+  # …and `details_url` as a SIXTH column: it is the only place the FAILING JOB's id appears, and
+  # red_is_chain_minted needs it to read the one log that can tell the gate's item (c) from (a)/(b).
+  # ADDITIVE, deliberately: every reader here takes fields 1-5 (and the classifier ignores a 6th), so
+  # an older fixture with five columns stays valid and simply cannot reach the log read.
+  local rows='(.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.id // 0), (.app.slug // ""), (.details_url // "")] | @tsv)'
   if [ "$full" = "--full" ]; then
     gh api "$q" --paginate --jq "$rows" 2>/dev/null
     return $?
@@ -800,6 +809,48 @@ review_record_at_head() {
   return 1
 }
 
+# ── the ONE red the merge chain MINTS, and why it must not spend a fix round ─────────────────────
+# ⛔ MEASURED ON THIS REPO'S OWN PRs (2026-10-28): `pipeline-compliance` is agent-infra's ONLY
+# required check, and for a freshly opened PR it is RED BY CONSTRUCTION — item (c) demands a signed
+# review record bound to THIS head, and only `merge-one.sh` may mint one (a lane that records its own
+# review is a review that did not happen). The loop counted that red as lane-fixable, spent all three
+# rounds on a red no push can clear, and refused as BLOCKED_ATTEMPTS having NEVER launched the chain
+# that both clears the red and merges — which is the "22 open PRs against 3 merged" shape this file's
+# header exists to prevent, reachable on EVERY PR of the repo the tool ships in. Verified on this
+# box's own state: `state/lanemerge-*.verdict` carried exactly this verdict for 2 of 18 lanes.
+#
+# The routing decision is taken from EVIDENCE, never from the check's name alone:
+#   1. it is the ONLY red at this head;
+#   2. there is NO signed review record at this head (this file's own reader, no API call);
+#   3. the GATE'S OWN log says exactly ONE item is failing and that item is (c).
+# (3) is what keeps an (a)/(b) metadata red — which the LANE must fix, by giving the PR its issue
+# reference or posting the issue's scoping comment — out of a paid fresh-context review. The read is
+# ONE call, paid only when (1) and (2) already hold.
+job_log() { # job_log <job-id> → the failing job's own output
+  if [ -n "$JOB_LOG" ]; then [ -f "$JOB_LOG" ] && cat "$JOB_LOG"; return 0; fi
+  # BOUNDED AT THE TAIL: the gate's summary is the last thing a job prints, and an unbounded read of
+  # a long job log would put megabytes through a variable to answer one grep.
+  gh api "repos/$OR/actions/jobs/$1/logs" 2>/dev/null | tail -c 400000
+}
+
+red_is_chain_minted() { # red_is_chain_minted <red-list> <checks-tsv>
+  local red="$1" tsv="$2" url jid log
+  # 1. the ONLY red (a comma means another check is failing too: that one may be a real fix)
+  case "$red" in *,*) return 1 ;; esac
+  [ "$red" = "github-actions:pipeline-compliance" ] || return 1
+  # 2. the artifact really is absent at THIS head: a record bound to an older head is a stranded
+  #    attestation, not coverage — and with a record present this red is about something else.
+  review_record_at_head && return 1
+  # 3. the gate's own words, from the failing job (no url/fixture → cannot verify → treat as fixable)
+  url="$(awk -F'\t' '$1=="pipeline-compliance" && $5=="github-actions" {print $6}' "$tsv" 2>/dev/null | tail -1)"
+  case "$url" in */job/[0-9]*) jid="${url##*/job/}"; jid="${jid%%[!0-9]*}" ;; *) return 1 ;; esac
+  [ -n "$jid" ] || return 1
+  log="$(job_log "$jid")" || return 1
+  printf '%s\n' "$log" | grep -q 'PIPELINE COMPLIANCE: BLOCKED (1 failure' || return 1
+  printf '%s\n' "$log" | grep -q '\[c\] no head-bound code-review record' || return 1
+  return 0
+}
+
 emit_attestation() { # emit_attestation <reason…>
   verdict BLOCKED_ATTESTATION "$*"
   post_handoff BLOCKED_ATTESTATION "$*"
@@ -1208,6 +1259,17 @@ while :; do
       esac
     fi
     [ "${lsick_action:-}" = "RERUN-FLAKE" ] && exit 11
+    # ── THE RED THE CHAIN MINTS IS NOT A FIX ROUND (see red_is_chain_minted) ────────────────────
+    if red_is_chain_minted "$RED" "$CHECK_TMP"; then
+      log_line "… the ONLY red at head ${HEAD:0:12} is pipeline-compliance's item (c): there is no head-bound"
+      log_line "   review record here, and the thing that clears it is minted by the merge chain, not by a push."
+      log_line "   Launching the chain (merge-one.sh's own rail-mode path does this) — no fix round spent."
+      launch_chain "$HEAD" || exit 2
+      disposition WAITING_CHAIN_RUNNING
+      verdict WAITING_CHAIN_RUNNING "the only red is the absent head-bound review record, which the chain mints: chain launched, no fix round spent"
+      log_line "… the merge chain owns PR #$PR now. Next: lane-merge.sh $PR --watch (bounded chunk; repeat)"
+      exit 11
+    fi
     emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
   fi
   [ "${IF:-0}" = "0" ] && break
