@@ -1,0 +1,16 @@
+# FAILURE-CLASS FIXTURE (R3): a reusable (workflow_call-only) workflow must not own concurrency —
+# the block applies in the CALLEE context, so two callers on one ref cancel each other.
+name: reusable-concurrency
+on:
+  workflow_call:
+    inputs:
+      who:
+        type: string
+concurrency:
+  group: reusable-concurrency-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.who }}"
