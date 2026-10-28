@@ -5461,14 +5461,57 @@ test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled com
     ok(!mergeInvocationInText(cmd), `prose/heredoc is not a merge invocation: ${cmd.slice(0, 70)}`);
     ok(!isAdminMergeCommand(cmd), `…and the admin-merge gate is never asked about it: ${cmd.slice(0, 70)}`);
   }
+  // ⛔ `COMMAND_SEPARATOR`'s NEWLINE, pinned on its own (review cycle 8, P2 — mutant M17), on this
+  // side of the bound because both rows are GUARDS: REFUSED at `78d897fa1` (the over-block class
+  // this PR exists to fix) and ADMITTED at `04bc1dde` and at this head (measured).
+  // The mechanism is worth stating, because "the tokenizer already splits on whitespace" makes the
+  // clause look dead: a newline never SURVIVES as a token, but it does sit in `scan.gaps` (the gap
+  // is the original text sliced between two tokens), and the gap is the only place the separator
+  // test can look. Drop `\n` from the class and the scan crosses the line break — the flag slot
+  // picks the NEXT command's `--admin`, and the selector slot picks the next line's `999`.
+  for (const cmd of [
+    `${"$"}{GH} ${"$"}{P} ${"$"}{M} 999\n--admin`, // the flag is another command's
+    `${"$"}{GH} ${"$"}{P} ${"$"}{M}\n999 --admin`, // …and so is the selector
+  ]) {
+    ok(!mergeInvocationInText(cmd), `a newline ends the invocation — the next line is not its argv: ${cmd}`);
+    ok(!isAdminMergeCommand(cmd), `…so the admin-merge gate is never asked about it: ${cmd}`);
+  }
   // The other side of the same bound: an invocation whose EVERY word is assembled is still a
-  // merge. Measured against `origin/main` — every one of these is a real `gh pr merge <n>
-  // --admin` and the base refuses it, so a bound that dropped them would be a fail-open.
+  // merge. Every row here is a real admin merge, and each is REFUSED at `78d897fa1` (the merged
+  // #2907 head) and at this head — measured — so a bound that dropped them would be a fail-open.
+  // ⚠️ NOT all of them are refused at `04bc1dde`: the rows noted below are spellings that the
+  // pre-#3953 base simply did not READ (admitted there, refused by every later base). Stating the
+  // two bases separately is the point of naming SHAs instead of `origin/main`, which moved.
   const assembled = [
     `GH=gh; ${"$"}{GH} ${"$"}{P} $M 999 --admin`,
     `GH=gh; g$'h' $P $M 999 --admin`,
     `timeout 5 g$'h' $'pr' "merge" 999 --admin`,
     `GH=gh; g$'h' $P "merge" 999 --admin`,
+    // ⛔ `isAdminFlagSlot`'s LITERAL arm, pinned on its own (review cycle 8, P2 — mutant M14).
+    // Without it a literal `--admin` in the flag slot is not a flag at all (`isVerbSlotConstruct`
+    // rejects a `-`-leading word), so this real `gh pr merge 999 --admin` becomes ADMITTED. Every
+    // other row in this block is silent about that arm because the GROUP-slot ask reads the first
+    // two constructs as selector+flag and never reaches the literal one — `GH=gh; … $M 999 --admin`
+    // stays refused with the arm deleted (measured), which is exactly why the block needed a row
+    // with NO assignment prefix. Base relation: REFUSED at `78d897fa1`, admitted at `04bc1dde`
+    // (the older base simply did not read this spelling — not an over-block this change adds).
+    `${"$"}{GH} ${"$"}{P} ${"$"}{M} 999 --admin`,
+    // ⛔ AND `isMergeSelectorToken`'s `PR_URL_RE` arm, pinned the same way (mutant M15). A URL
+    // selector is otherwise ALWAYS shielded: `GH=gh; ${GH} ${P} ${M} <url> --admin` is still
+    // refused with the arm deleted, because the GROUP-slot ask reads `${GH}`/`${P}` first. Only a
+    // shape whose URL is the SOLE readable selector faults it — measured: over a 5 680-literal
+    // corpus the arm decides ZERO times, so no corpus can pin it and only a row can. This row is
+    // `timeout 5 gh pr merge <url> --admin` and is REFUSED at `78d897fa1` and here.
+    `timeout 5 ${"$"}{GH} ${"$"}{P} ${"$"}{M} https://github.com/o/r/pull/9 --admin`,
+    // ⛔ AND THE COMMAND-FIRST ORDERING of `mergeVerbSequenceInTokens`, pinned on its own (review
+    // cycle 8, P2 — mutant M20). `mergeVerbWalk` is OR-ed in both orderings because a construct at
+    // the group stage is ambiguous, and until this row existed ONE OF THE TWO OR-ED ARMS could be
+    // deleted with the suite at 338/0. Dropping the command-first arm admits this row — a real
+    // `gh pr merge 999 --admin` (the quoted `"pr"` is data to the model while the construct `g$'h'`
+    // is the command word) — and it is REFUSED at BOTH bases (`78d897fa1`, `04bc1dde`) as well as
+    // here, so it is a guard in the strict sense. The row the block already carried
+    // (`g$'h' $P "merge"`) is silent about the ordering: it is read by the GROUP-first arm.
+    `GH=gh; g$'h' "pr" merge 999 --admin`,
   ];
   for (const cmd of assembled) {
     ok(mergeInvocationInText(cmd), `an all-assembled invocation is still a merge: ${cmd}`);
@@ -5499,6 +5542,14 @@ test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled com
     `X=gh; ${"$"}{X} ${"$"}{P} $M $N --admin`,
     `sh -c 'GH=gh; ${"$"}{GH} ${"$"}{P} $M $PR --admin'`,
     `X='GH=gh; ${"$"}{GH} ${"$"}{P} $M $PR --admin'; sh -c "$X"`,
+    // ⛔ AND `shellWordAt`'s `${X}` PAIR READ, pinned on its own (review cycle 8, P2 — mutant M16).
+    // `${PR}` arrives as the tokens `$` + `PR}`, and the selector is only readable when those two
+    // are joined. With the pair read disabled this row is ADMITTED, and note WHY it needs its own
+    // row: every other `${PR}` row in this block is shielded by the GROUP-slot ask, so the block
+    // was green over a clause it never exercised. The braces on the VERB (`${M}`, not `$M`) are
+    // what make the difference — with `$M` the group-slot ask still reads a selector. REFUSED at
+    // BOTH bases (`78d897fa1`, `04bc1dde`), so it is a guard in the strict sense.
+    `GH=gh; ${"$"}{GH} ${"$"}{P} ${"$"}{M} ${"$"}{PR} --admin`,
   ];
   for (const cmd of assembledSelector) {
     ok(mergeInvocationInText(cmd), `an assembled merge with a NON-DECIMAL selector is a merge: ${cmd}`);
@@ -7511,6 +7562,27 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "gh pr view 1; \"X=1\" $(true)",
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
+  }
+  // ⛔ THE THREE CONSTRUCT-VERB ROWS ABOVE ARE REFUSED BY A DIFFERENT ARM THAN THE ONE THIS TEST
+  // WAS WRITTEN FOR, and for a whole review cycle nothing asserted it (review cycle 8, P1). They
+  // are in the `readsNonMergeGhCall` list above, whose predicate is the DEFERRAL's polarity — so
+  // deleting the stage-2 `assembledMergeArgvAfter` call in `mergeVerbWalk` left the suite at
+  // **338 passed, 0 failed** while flipping all three to ADMITTED. Measured here (mutant M13), with
+  // `isGitOp` false as well, which is the whole failure: the handler returns at
+  // `if (!isGitOp(command))` BEFORE the evidence gate and the merge registry gate, so an assembled
+  // `gh pr merge 999 --admin` whose verb sits in `then`/`env`/`if` executes ungated. Each row is
+  // refused at BOTH bases (`78d897fa1`, `04bc1dde`), so the arm is the reason and not a shape the
+  // base refused for a different cause.
+  for (const cmd of [
+    "V=--admin; if true; then $C $P $M 999 $V; fi; gh issue comment 5", // the verb behind `then`
+    "V=--admin; env $C $P $M 999 $V; gh issue comment 5", // …behind `env`
+    "V=--admin; if $C $P $M 999 $V; then :; fi; gh issue comment 5", // …and behind `if`
+  ]) {
+    ok(mergeInvocationInText(cmd), `a construct verb behind a reserved word is still a merge: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and the admin-merge gate decides it (a FAIL-OPEN when false): ${cmd}`);
+    // The handler's OWN entry predicate, pinned because the two above can be true while this one
+    // is false — and `if (!isGitOp(command)) return undefined;` is the line that skips both gates.
+    ok(isGitOp(cmd), `…and the handler does not return before the evidence gate: ${cmd}`);
   }
   // `mergeVerbInText` — the candidate rule's shared read (`isAdminMergeCommand` calls it
   // on its spliced-verb branch), which is why it is pinned here rather than only through
