@@ -2180,6 +2180,91 @@ case "$R6Q" in
 case "$R6Q" in *"reason=no-longer-pending"*) ok "…and the reason names the premise going away, not a move" ;;
   *) bad "the cleared record does not say why it was cleared: $R6Q" ;; esac
 
+# ⛔ S7: A RE-PIN ONTO THE COMMIT ALREADY RUNNING IS NOT A MOVE. With the `prev_run != RUN_SHORT` clause
+# dropped, an outstanding ask whose recorded `running=` EQUALS the current one is certified `honoured` —
+# `was == now`, a restart recorded when nothing moved. That clause had no witness. The prior here is
+# FACT-sourced (`controller:`) and `pending`, so neither the claim bound (S6) nor the refused guard (S4)
+# can explain a green: only `prev_run != RUN_SHORT` stands between this fixture and a false honour.
+_CASE=$((_CASE+1)); echo "=== S7: a re-pin onto the commit already running certifies no move (was == now is not honoured) ==="
+D="$T/s7"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+printf 'restart request=pending requested_at=1700000000 requested_by=harness-refresh.sh@%s running=%s running_from=controller:pid=1@/nonexistent pin=%s pending=deferred actuation=blocked blocked=lanes lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(short "$C2")" "$(short "$C2")" "$(short "$C2")" > "$D/O/state/restart-request"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R7="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+stop_ctrl "$CTRL"
+R7Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R7" in *"relation=current"*) ok "the box is current, so the honoured arm is reachable (the bait is live)" ;;
+              *) bad "the box was not current, so this case proves nothing about the move test: $R7" ;; esac
+case "$R7Q" in
+  "restart request=honoured"*) bad "a record whose was == now was certified 'honoured' — a restart recorded with nothing moving: $R7Q" ;;
+  "restart request=cleared"*) ok "…was == now is CLEARED, not honoured (the process was not observed to move)" ;;
+  *) bad "unexpected record when nothing moved: $R7Q" ;; esac
+
+# ⛔ S8: THE CONTROLLER GOING AWAY IS ITS OWN TRANSITION (`reason=no-live-controller`). The `inert` arm is
+# reached by `|| [ "$PENDING" = inert ]` in the OUTER condition; without that clause the whole block is
+# skipped for a box whose relation is still `restart-pending`, and the documented `no-live-controller`
+# transition becomes unreachable — the ask then reads `pending=inert` for ever on a box with nothing to
+# restart. No `.orch.lock` here: that IS the inert shape.
+_CASE=$((_CASE+1)); echo "=== S8: with no live controller the outstanding request is CLEARED as no-live-controller ==="
+D="$T/s8"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C1" > "$D/O/.agent-infra-stamp.json"
+printf 'restart request=pending requested_at=1700000000 requested_by=harness-refresh.sh@%s running=%s running_from=stamp:%s pin=%s pending=deferred actuation=blocked blocked=lanes lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(short "$C1")" "$(short "$C1")" "$(short "$C1")" "$(short "$C2")" > "$D/O/state/restart-request"
+R8="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+R8Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R8" in *"relation=restart-pending"*) ok "the fixture reached restart-pending with no controller, so the inert arm is the one exercised" ;;
+              *) bad "the fixture did not reach restart-pending, so this case is vacuous: $R8" ;; esac
+case "$R8Q" in
+  *"reason=no-live-controller"*) ok "…the request is CLEARED as no-live-controller (nothing to restart, so nothing outstanding)" ;;
+  *"pending=inert"*) bad "the ask survived as pending=inert on a box with no controller — it can never be cleared: $R8Q" ;;
+  *) bad "unexpected record with no live controller: $R8Q" ;; esac
+
+# ⛔ S9: A `refused` RECORD IS ALSO A PRIOR ASK, so its `requested_at` must carry forward into the next
+# `pending` cycle. Dropping `refused` from that pattern resets the clock to `now`, which is the S5 defect
+# one branch over: an ask refused once and then re-requested reads as brand new instead of `waited=` days.
+# S5 cannot cover it — the record it preserves is `pending`, never `refused`.
+_CASE=$((_CASE+1)); echo "=== S9: a refused record's requested_at carries into the next pending cycle (no clock reset) ==="
+D="$T/s9"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE1="$(mk_pin_tree "$D/pinroot" "$C1")"; TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C1" > "$D/O/.agent-infra-stamp.json"
+printf 'restart request=refused reason=running-identity-unprovable requested_at=1600000000 refused_at=1600000060 requested_by=harness-refresh.sh@%s running=%s running_from=stamp:%s pin=%s pending=unprovable actuation=blocked blocked=identity actuator=none\n' \
+  "$(short "$C1")" "$(short "$C1")" "$(short "$C1")" "$(short "$C2")" > "$D/O/state/restart-request"
+CTRL="$(start_ctrl "$TREE1")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+# The pin names the NEW tree (C2) while the controller still executes C1 — the ordinary restart-pending
+# shape S3 uses; passing TREE1 as the pinfile would make the box `behind` and never reach the ask.
+R9="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+stop_ctrl "$CTRL"
+R9Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R9" in *"relation=restart-pending"*) ok "the fixture re-entered restart-pending, so the ask is live again" ;;
+              *) bad "the fixture did not reach restart-pending, so this case is vacuous: $R9" ;; esac
+case "$R9Q" in "restart request=pending"*) ok "…a new request is recorded" ;;
+  *) bad "no pending request was recorded: $R9Q" ;; esac
+[ "$(req_of "$D/O" requested_at)" = 1600000000 ] && ok "…and requested_at is still the REFUSED record's first ask (1600000000), not this cycle's now" \
+  || bad "requested_at became '$(req_of "$D/O" requested_at)' — the clock reset across a refused cycle"
+
+# ⛔ S10: NOTHING OUTSTANDING MEANS NOTHING TO WRITE. After an `honoured` record there is no ask, so a
+# later current cycle must LEAVE THE RECORD ALONE — the `case "$prev_req" in pending|refused)` guard is
+# what stops a routine cycle from overwriting the `honoured` history with a `cleared` line, which would
+# erase the very transition this record exists to make readable.
+_CASE=$((_CASE+1)); echo "=== S10: an honoured record is not overwritten by a later routine cycle (nothing outstanding) ==="
+D="$T/s10"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+printf 'restart request=honoured requested_at=1600000000 honoured_at=1600000400 after=400s requested_by=harness-refresh.sh@%s was=%s now=%s\n' \
+  "$(short "$C1")" "$(short "$C1")" "$(short "$C2")" > "$D/O/state/restart-request"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R10="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+stop_ctrl "$CTRL"
+R10Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R10" in *"relation=current"*) ok "the routine cycle ran and the box is current, so a write would have happened" ;;
+               *) bad "the box was not current, so this case is vacuous: $R10" ;; esac
+case "$R10Q" in
+  "restart request=honoured"*) ok "…and the honoured record is UNTOUCHED — nothing outstanding, nothing written" ;;
+  *) bad "a routine cycle overwrote the honoured record (nothing was outstanding, so nothing should have been written): $R10Q" ;; esac
+
 _CASE=$((_CASE+1)); echo "=== B6: the spawn-line token carries WHICH pending state (and stays bare for every other relation) ==="
 D="$T/b6"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'
