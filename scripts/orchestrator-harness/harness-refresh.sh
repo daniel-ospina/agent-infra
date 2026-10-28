@@ -349,8 +349,14 @@ if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
 fi
 
 # ── RUNNING, source 3: the CONTROLLER's OWN ARGV (agent-infra#2641) ─────────────────────────────
-# `self:` resolves on a laptop ($O is a checkout) and NEVER on a cell, whose $O is a flat seed with no
-# git identity. On a cell the only source left was the STAMP — a claim `apply` wrote, not a fact about
+# `self:` resolves on a laptop ($O is a checkout) and does NOT resolve on a SEEDED cell, whose $O is a
+# flat seed with no git identity. ⛔ "NEVER on a cell" was written here and is not true: `orch-loop.sh`
+# falls back to the copy BESIDE the loop when `$O/harness-refresh.sh` is absent, and on a pin-per-commit
+# cell the loop runs from the pinned WORKTREE — so `$SELF` can land inside a git checkout and `self:` can
+# answer there too (driven: `--self <worktree>/scripts/orchestrator-harness` reports
+# `running=<worktree HEAD>`). That shape is SAFE (a real checkout is real evidence); what the paragraph
+# below describes is the SEEDED posture, where `self:` cannot resolve. On a seeded cell the only source
+# left was the STAMP — a claim `apply` wrote, not a fact about
 # the running process — so the `stamp:*` arm downgraded `current` to `restart-pending` on EVERY cycle of
 # EVERY cell, for ever. MEASURED 2026-10-24 on pi-cell-3: running == pin == ref == 848ba4b1 and the
 # record still said `restart-pending`, while `cloud-cell-supervisor.sh status` printed `[current]` for the
@@ -1450,6 +1456,16 @@ write_pin "$APPLIED" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
 # saying `current` would be the false PASS (an operator reads "current" about last week's code).
 _rel=restart-pending
 [ "$RUNNING" = "$TIP" ] && _rel=current
+# ⛔ THE SAME CANNOT-VERIFY DOWNGRADE THE CURRENT-PIN PATH MAKES, MADE HERE TOO. The advance branch is the
+# ONE cycle where the pin has just moved, and `apply` rewrites the STAMP in that same cycle — so
+# `RUNNING` here can be the stamp's CLAIM naming the NEW tip while the controller still executes the OLD
+# tree. `[ "$RUNNING" = "$TIP" ]` then reads that claim as agreement and reports `current`: the exact
+# false PASS this job exists to end, on the path an operator reaches right after deploying. A live
+# controller whose identity comes only from the stamp cannot be certified, so it is restart-pending — and
+# `set_pending` then records WHY (`pending=unprovable`), which the `current` arm would have skipped.
+case "$RUNNING_FROM" in
+  stamp:*) [ "${CONTROLLER_LIVE:-0}" = 1 ] && [ "$_rel" = current ] && _rel=restart-pending ;;
+esac
 # The same decision the current-pin path makes, for the cycle where the pin JUST moved: the advance does
 # not restart anything, so a repin is exactly a request that has not been honoured yet.
 [ "$_rel" = restart-pending ] && set_pending
@@ -1492,10 +1508,15 @@ if [ "$DEPLOYED" = "$APPLIED" ]; then
 else
   _dep_clause="the deployed tree NOW names $(short "$APPLIED") (was $DEP_SHORT)"
 fi
-if [ "$RUNNING" = "$APPLIED" ]; then
+if [ "$RUNNING" != "$APPLIED" ]; then
+  _rest_clause="the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
+elif [ "$_rel" = current ]; then
   _rest_clause="the running controller is already on $RUN_SHORT"
 else
-  _rest_clause="the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
+  # ⛔ `RUNNING` EQUALS THE TIP BUT THE IDENTITY IS A CLAIM. Saying "already on" here would assert, in the
+  # one line an operator reads, that the controller executes the new commit — when all the box has is a
+  # stamp `apply` wrote. That is the assertion this arm exists to refuse to make.
+  _rest_clause="the running identity is only a CLAIM ($RUNNING_FROM) — it names $RUN_SHORT, but nothing proves the controller executes it, so this is restart-pending, not current"
 fi
 if [ "$_act" = reseeded ]; then _word=RESEEDED; else _word=REPINNED; fi
 # ⛔ THE NON-DESTRUCTION SENTENCE BELONGS TO THE `--pin-only` ARM ONLY (review finding). A re-seed calls

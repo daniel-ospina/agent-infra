@@ -2372,6 +2372,31 @@ case "$R13" in *"running=$(short "$C2")"*) ok "…the QUOTED path resolved to th
                *"running=$(short "$C1")"*) bad "a quoted argv path fell back to the stamp — the dequote (or -ww) is missing, which is #2641 back on every cell: $R13" ;;
                *) bad "the record named neither tree: $R13" ;; esac
 
+# ⛔ S14: THE ADVANCE PATH MUST MAKE THE SAME CANNOT-VERIFY DOWNGRADE AS THE CURRENT-PIN PATH. This is the
+# one cycle where the pin has just moved, and `apply` rewrites the STAMP in that same cycle — so `RUNNING`
+# can be the stamp's CLAIM naming the NEW tip while the controller still executes the OLD tree. The
+# advance branch used to compare `RUNNING` to `TIP` alone and report `current`: a false PASS on the path an
+# operator reaches immediately after deploying, with no `pending=` on the spawn line and no request
+# recorded. Driven with an unreadable identity (`PS_BIN=/nonexistent/ps`) so the only source left is the
+# stamp, which is deliberately made to name the TIP while the pinned tree is an older commit.
+_CASE=$((_CASE+1)); echo "=== S14: a stamp-only identity naming the tip is NOT 'current' on the advance path ==="
+D="$T/s14"; mkdir -p "$D/o/state" "$D/pin" "$D/mat"
+PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"     # behind the tip, so the advance fires
+printf '{"commit": "%s"}\n' "$C2" > "$D/o/.agent-infra-stamp.json"   # the claim `apply` writes = the NEW tip
+printf '%s\n' "$$" > "$D/o/.orch.lock"                      # a LIVE controller, as on every box
+MAT="$(mk_stub_mat "$D/mat")"
+R14="$(O="$D/o" PS_BIN=/nonexistent/ps HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" \
+        --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"; RC14=$?
+case "$RC14" in 10) ok "the fixture really took the ADVANCE path (exit 10), so the branch under test is the one driven" ;;
+                *) bad "expected exit 10 (an advance) with a behind pin, got $RC14 — the case would be vacuous: $R14" ;; esac
+case "$R14" in
+  *"relation=current"*) bad "a stamp-only identity naming the tip was reported CURRENT on the advance path — the controller may still execute the old tree, and no request was recorded: $R14" ;;
+  *"relation=restart-pending"*) ok "…a stamp-only identity is restart-pending on the advance path too (cannot-verify is not a pass)" ;;
+  *) bad "the record named neither relation: $R14" ;; esac
+case "$R14" in
+  *"already on $(short "$C2")"*) bad "the prose asserted the controller is 'already on' the tip from a CLAIM: $R14" ;;
+  *) ok "…and the prose does NOT claim the controller is already on the new commit" ;; esac
+
 _CASE=$((_CASE+1)); echo "=== B6: the spawn-line token carries WHICH pending state (and stays bare for every other relation) ==="
 D="$T/b6"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'
