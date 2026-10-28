@@ -1,0 +1,51 @@
+[Unit]
+# eldato objective reminder — put the operator's objective back in front of the agent every 10 minutes.
+#
+# WHY A TIMER AND NOT A CONTROLLER TICK. The controller cycles, the lanes work, every process read is
+# green — and the fleet can still be optimising the wrong thing. Drift is the one failure no liveness
+# predicate can see, so the reminder must run on its own clock: on a cell that clock is a systemd
+# timer, the SAME mechanism this cell already uses for its hourly disk reaper (eldato-disk-reaper) and
+# the same one the controller's own unit uses (#2402). No cron (`crontab` writes fail with EINTR on the
+# operator's Mac — recorded), and no new scheduler: the doctor loop is the cell's REPAIR cadence and is
+# deliberately not touched by this.
+#
+# ⛔ THE DELIVERY BUDGET IS THE SCRIPT'S, NOT THE UNIT'S. The pass enforces MAX_BYTES (default 420;
+# a ~969 B cmux payload failed `Broken pipe`, ~520 B is reliable, and a ~750 B version silently stopped
+# delivering for three ticks) and REFUSES over budget instead of truncating. Nothing here can shorten a
+# payload, so this unit only guarantees the pass runs often enough that a REFUSED state is discovered
+# within one interval rather than never.
+#
+# ⛔ AND A CELL HAS NO cmux. `pi-bootstrap/cell-install.sh` denies the cmux extension on a cell (a
+# headless VM has no app and no binary), so the pass runs BACKEND=tmux: the same protocol over
+# `tmux send-keys`/`capture-pane`, with the turn boundary read from the pane's own history. The target is
+# resolved by the script (a live `lane-*` session first, the controller session last) because "which
+# surface is an agent" is a runtime fact, not an install-time one.
+Description=eldato objective reminder — re-state the operator's objective into the agent's surface
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/objective-reminder.md
+# A reminder must never hold up a boot or a login, and it must not be a reason to keep a box up.
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+Environment=BACKEND=tmux
+Environment=MAX_BYTES={{MAX_BYTES}}
+# The cell's state dir, so the pass writes the same decision log the inventory row reads.
+Environment=STATE={{STATE_DIR}}
+# `SETTLE` bounds the wait between the send and the composition read. 2s is the operator box's own
+# value; the timer's period is 10 minutes, so this can never stack up.
+Environment=SETTLE=2
+# ⛔ The pass exits 0 even when it REFUSES or cannot confirm — the verdict belongs in its log, not in an
+# exit code that would read as "the reminder crashed". That makes a RED unit impossible here by
+# construction, which is why the inventory row reads the LOG's last verdict token as well as the exit.
+ExecStart=/bin/bash {{SCRIPT}}
+# A pass that hangs (a tmux server in a bad state) must not leave a unit "activating" until the next
+# 10-minute tick queues behind it.
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

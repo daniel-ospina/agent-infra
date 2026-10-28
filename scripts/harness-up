@@ -2,24 +2,53 @@
 # harness-up — ONE entry point that brings the harness up, takes it down, and answers its status.
 #
 #   ./scripts/harness-up [up]        # resolve the pin -> verify it is the dir the controller READS
-#                                    # -> MEASURE this box's capacity (load + free disk) -> self-tests
-#                                    # -> start every component in dependency order. Running it twice
-#                                    # is a NO-OP: a controller already on this run's tree is left alone
+#                                    # -> MEASURE this box's capacity (fork headroom, then disk, then
+#                                    # load) -> self-tests -> start every component in dependency
+#                                    # order. Running it twice is a NO-OP: a controller already on this
+#                                    # run's tree is left alone
 #   ./scripts/harness-up down        # stop the stack (delegated; nothing invented here)
-#   ./scripts/harness-up status      # one line per component (pid + age) + ONE verdict
+#   ./scripts/harness-up status      # what is EXECUTING, is the loop alive, is PLACEMENT healthy
+#                                    # (fork -> disk -> load), how many lanes and whether they are
+#                                    # advancing, this tree's self-test, and what it would do NEXT —
+#                                    # then ONE verdict. STATUS HEALS by default (see --no-heal).
+#                                    # It also prints the ROLE table: one MEASURED line per role
+#                                    # (controller/apply/watchdog/reminder/doctor) — RUNNING, FAILED,
+#                                    # DEAD, NEVER-INSTALLED or DANGLING, with the artefact's own last
+#                                    # error line. A unit file is never evidence that a role runs.
+#   ./scripts/harness-up roles       # the same role table, read-only (status also heals)
+#   ./scripts/harness-up heal        # RE-DRIVE what is dead: install what is missing, start what is
+#                                    # stopped, and name what it could NOT fix (exit 1 — never a
+#                                    # silent 0). Nothing is re-driven by guesswork: a role that
+#                                    # cannot be read is reported, not repaired, and a DANGLING unit
+#                                    # (its program or cwd no longer exists) is reported with the path.
+#   ./scripts/harness-up logs <role> [n]   # the role's OWN log (n lines, default 40)
+#   ./scripts/harness-up dispatch <role> [pass]  # run ONE role once, in the FOREGROUND: no session,
+#                                    # no scheduler, the role's own argv and its own output. `doctor`
+#                                    # takes a pass name (reap|doctor|merge|hygiene).
+#   The five roles, their units on each platform, and which of them has a unit at all — the table in
+#   `scripts/orchestrator-harness/README.md` §6.1 — is declared in ONE place:
+#   `harness-roles.sh`, sourced by this file. `up` INSTALLS the roles the box is configured for
+#   (`HR_ROLES`, else `$O/harness-roles.conf`, else the platform default) and REFUSES before writing
+#   anything when a role's program or working directory does not exist — the `/tmp`-cwd shape that
+#   killed a unit every ten minutes cannot be installed from here.
 #
 #   Flags: --harness <dir> --repo <agent-infra checkout> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
-#          --no-fetch --skip-selftest --timeout <secs> --plain
+#          --no-fetch --skip-selftest --timeout <secs> --plain [--no-heal|--heal]
 #          ⛔ `--repo` is THE HARNESS CHECKOUT (the repo the pin commit and `--ref` are commits OF), NOT the
 #          repo the controller drains: that one is `REPO=<work repo>` in the environment, and it is left
 #          alone. On a cell the two differ (harness=agent-infra, work=tortoise) — see the TWO repos block.
 #          Without `--repo` the harness resolves from `HARNESS_REPO` (env, then this machine's `ENV_FILE`)
 #          and then the launcher's OWN checkout; a candidate that is not a checkout ROOT is skipped.
 #          An unusable `--repo` REFUSES, naming the value; an unusable inherited candidate is skipped.
-#   Capacity knobs (all MEASUREMENTS, none a cap): HU_LOAD_PER_CPU (800 → 8.00 load per cpu, equal to
-#   capacity.sh's CAP_LPC_CEILING), HU_LOAD_PER_LANE (400 → 4.00 load units), HU_DISK_PER_LANE_MB
-#   (1100), HU_DISK_FLOOR_MB (500). HARNESS_UP_MAX_LANES is REPORTED AND IGNORED as a ceiling — a
-#   fixed cap is not a measurement.
+#   Capacity knobs (all MEASUREMENTS, none a cap), in the order they bind:
+#     fork headroom  HU_FORK_RESERVE (default: the instrument's own `min_fork_headroom` — 200 today)
+#                    and HU_FORK_PER_LANE (40 tasks a lane's process tree holds) — read FIRST, before
+#                    any probe that must fork, because a box can fork nothing at 0.32x load (#2293)
+#                    while load and disk both read healthy;
+#     disk           HU_DISK_PER_LANE_MB (1100), HU_DISK_FLOOR_MB (500);
+#     load           HU_LOAD_PER_CPU (800 → 8.00 load per cpu, equal to capacity.sh's
+#                    CAP_LPC_CEILING), HU_LOAD_PER_LANE (400 → 4.00 load units).
+#   HARNESS_UP_MAX_LANES is REPORTED AND IGNORED as a ceiling — a fixed cap is not a measurement.
 #
 # Exit: 0 HEALTHY · 1 DEGRADED · 2 BROKEN (start refused / cannot-verify) · 3 REFUSED before start.
 #
@@ -93,7 +122,7 @@ set -uo pipefail
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SELF_PATH/$(basename "${BASH_SOURCE[0]}")"
 
-say()  { printf '%s\n' "$*"; }
+log_line()  { printf '%s\n' "$*"; }
 warn() { printf 'harness-up: %s\n' "$*" >&2; }
 die()  { local m="$1" rc="${2:-3}"; printf 'harness-up: %s\n' "$m" >&2; exit "$rc"; }
 
@@ -102,11 +131,27 @@ usage() { # <exit-code>
   exit "${1:-0}"
 }
 
-VERB="${HARNESS_UP_FORCED_VERB:-}"; PLAIN=0; FETCH=1; SELFTEST=1
+VERB="${HARNESS_UP_FORCED_VERB:-}"; PLAIN=0; FETCH=1; SELFTEST=1; HEAL=1
 A_HARNESS=""; A_REPO=""; A_REPO_SEEN=0; A_REF=""; A_PIN=""; A_PINDIR=""; A_O=""
+A_ROLE=""; REST_ARGS=""
 BOUND="${HARNESS_UP_TIMEOUT:-900}"
 while [ $# -gt 0 ]; do
   case "$1" in
+    heal|roles)
+        if [ -n "${HARNESS_UP_FORCED_VERB:-}" ] && [ "${HARNESS_UP_FORCED_VERB}" != "$1" ]; then
+          die "$1 refused: this entry point is $HARNESS_UP_FORCED_VERB" 2
+        fi
+        VERB="$1"; shift ;;
+    dispatch|logs)
+        if [ -n "${HARNESS_UP_FORCED_VERB:-}" ] && [ "${HARNESS_UP_FORCED_VERB}" != "$1" ]; then
+          die "$1 refused: this entry point is $HARNESS_UP_FORCED_VERB" 2
+        fi
+        VERB="$1"; shift
+        # ⛔ THE ROLE OPERAND IS NAMED HERE, NOT DISCOVERED LATER: `dispatch` with no role would
+        # otherwise dispatch nothing and exit 0 — the exact "succeeded while doing nothing" shape.
+        [ $# -ge 1 ] || die "$VERB needs a role (known: controller apply watchdog reminder doctor)" 2
+        A_ROLE="$1"; shift
+        if [ "$VERB" = dispatch ]; then REST_ARGS="$*"; set --; fi ;;
     up|down|status)
         # ⛔ THE WRAPPER'S VERB IS NOT OVERRIDABLE. `scripts/harness-down up` used to REPLACE `down`
         # with `up` — a wrapper that runs the opposite verb of its own name turns a one-keystroke
@@ -124,6 +169,8 @@ while [ $# -gt 0 ]; do
     -o|--o)                [ $# -ge 2 ] || die "-o needs a path"; A_O="$2"; shift 2 ;;
     --no-fetch)            FETCH=0; shift ;;
     --skip-selftest)       SELFTEST=0; shift ;;
+    --no-heal)             HEAL=0; shift ;;
+    --heal)                HEAL=1; shift ;;
     --timeout)             [ $# -ge 2 ] || die "--timeout needs seconds"; BOUND="$2"; shift 2 ;;
     --plain)               PLAIN=1; shift ;;
     -h|--help)             usage 0 ;;
@@ -222,6 +269,104 @@ hp_disk_free_mb() { # <path>
   mb="$(df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf "%d\n", $4 / 1024}')"
   case "$mb" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s' "$mb"
+}
+
+# hp_fork_headroom — how many MORE tasks this box could create right now, and against WHICH limit.
+# ⛔ THIS IS A DIFFERENT QUESTION FROM LOAD, AND IT IS ASKED FIRST (agent-infra#2293). A box at 0.32x
+# load can be unable to spawn ANYTHING: fork() and clone() fail with EAGAIN when a hard TASK LIMIT is
+# reached, and no load average, free-disk or memory reading can see it. Measured shapes: a fork storm
+# (the gh-shim recursion of #2304: 3.4k processes, load 74 on 4 vCPU), and cgroup `pids.max` on a
+# shared host, which binds long before the box's own load ceiling does (measured on this Linux box
+# 2026-10-22: cgroup pids 1295/4692 — 3397 spare — against an RLIMIT_NPROC of 15641 and a
+# threads-max of 31282, i.e. the cgroup was 4x tighter than the kernel's own limit and 8x tighter
+# than the per-user one).
+# The reading is (limit − used) for EACH limit that applies, and the SMALLEST wins — a headroom
+# averaged across limits would report the loosest one and kill the spawn.
+#   Linux  threads-max   (system-wide threads)          used = live threads
+#          RLIMIT_NPROC  (threads for this uid)         used = live threads owned by this uid
+#          cgroup pids.max (v2 /v2-path/pids.max, v1 pids/pids.max) used = pids.current  ← exact
+#   macOS  kern.maxproc / kern.maxprocperuid (processes) used = live processes (all / this uid)
+#          RLIMIT_NPROC  (`ulimit -u`, what a shell actually gets)
+# Process/thread counts come from ONE `ps` read per shape, and `HU_PS` is the same process-table seam
+# `hu_pids` uses. `HU_FORK_LIMITS_FILE` (lines of `source limit used`) is the fixture seam: a suite
+# cannot change the box's real limits, and the refusal path is only testable if it can supply them.
+# rc=0 a measured answer on stdout (`headroom=<n> source=<name> used=<n> limit=<n>`)
+# rc=1 nothing could be measured — and an unmeasured fork limit is NOT unlimited headroom.
+hp_fork_headroom() {
+  local f="${HU_FORK_LIMITS_FILE:-}" bh="" bs="" bu="" bl=""
+  # _take <source> <limit> <used> — keep the tightest. Bash's dynamic scoping is what lets this see
+  # the caller's locals; it is re-defined per call, never left behind for another function to use.
+  _take() {
+    local lim="${2:-}" used="${3:-}" h
+    case "$lim" in ''|*[!0-9]*) return 0 ;; esac
+    case "$used" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$lim" -ge 1 ] 2>/dev/null || return 0
+    h=$(( lim - used )); [ "$h" -lt 0 ] && h=0
+    if [ -z "$bh" ] || [ "$h" -lt "$bh" ]; then bh="$h"; bs="${1:-unknown}"; bu="$used"; bl="$lim"; fi
+  }
+  if [ -n "$f" ]; then
+    [ -r "$f" ] || return 1
+    # shellcheck disable=SC2034 # `_take` reads these through BASH_REMATCH-free positional args
+    while read -r s l u; do _take "$s" "$l" "$u"; done < "$f"
+  else
+    local ps_cmd="${HU_PS:-ps}" n_all="" n_uid="" uid="" rl="" tm="" cg=""
+    uid="$(id -u 2>/dev/null)" || uid=""
+    # Threads on Linux (RLIMIT_NPROC and threads-max both count TASKS there), processes on macOS.
+    # ⛔ A FAILED OR EMPTY PROCESS READ IS NOT "ZERO TASKS USED" (review P1): with an absent/failing
+    # `ps`, `wc -l` gave 0 and awk's `END{c+0}` gave 0, so `used=0` and the probe answered
+    # `headroom=<full limit> rc=0` — "I could not look" spent as "there is room", the exact rule this
+    # function exists to enforce. Empty now means UNMEASURED, and no limit is taken from it.
+    _count() { # <cmd…> -> a positive integer, or empty
+      local v; v="$("$@" 2>/dev/null)" || { printf ''; return 0; }
+      # ⛔ STRIP WHITESPACE FIRST: BSD `wc -l` PADS its count to a column ("     300"), so the digit
+      # test below rejected a perfectly good reading and every Darwin process count came back EMPTY.
+      # On a box whose only working source was `kern.maxproc`, `n_all` empty meant that limit was
+      # never taken, and with no uid count either the probe REFUSED outright — "could not look" on a
+      # Mac that could be measured. Measured 2026-10-24 (bash 3.2.57, macOS): the (G) arm refused with
+      # every one of ulimit/threads-max/cgroup/maxproc reported "unreadable" against a stub table of
+      # 300 processes. `${v//[[:space:]]/}` is bash 3.2-safe and adds no pipe.
+      v="${v//[[:space:]]/}"
+      case "$v" in ''|0|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
+    }
+    case "$(hp_os)" in
+      Linux)
+        n_all="$(_count sh -c "$ps_cmd -eLo pid= 2>/dev/null | wc -l")"
+        [ -n "$uid" ] && n_uid="$(_count sh -c "$ps_cmd -eLo uid= 2>/dev/null | awk -v u='$uid' '\$1==u{c++} END{print c+0}'")" ;;
+      *)
+        n_all="$(_count sh -c "$ps_cmd -e -o pid= 2>/dev/null | wc -l")"
+        [ -n "$uid" ] && n_uid="$(_count sh -c "$ps_cmd -e -o uid= 2>/dev/null | awk -v u='$uid' '\$1==u{c++} END{print c+0}'")" ;;
+    esac
+    # RLIMIT_NPROC: `ulimit -u` prints `unlimited` on a box with no limit, which is not a number.
+    rl="$(ulimit -u 2>/dev/null)"
+    case "$rl" in ''|*[!0-9]*) rl="" ;; esac
+    if [ -n "$rl" ] && [ -n "$n_uid" ]; then _take rlimit-nproc "$rl" "$n_uid"; fi
+    case "$(hp_os)" in
+      Linux)
+        tm="$(cat /proc/sys/kernel/threads-max 2>/dev/null)"
+        case "$tm" in ''|*[!0-9]*) tm="" ;; esac
+        if [ -n "$tm" ] && [ -n "$n_all" ]; then _take threads-max "$tm" "$n_all"; fi
+        # cgroup pids: v2 is `<mount><self cgroup path>/pids.{max,current}`, v1 is
+        # `<mount>/pids/pids.{max,current}`. `max` in the limit file means unlimited, not 0.
+        cg="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head -1)"
+        for _p in "/sys/fs/cgroup${cg}" "/sys/fs/cgroup/pids"; do
+          [ -r "$_p/pids.max" ] || continue
+          local _mx _cu
+          _mx="$(cat "$_p/pids.max" 2>/dev/null)"; _cu="$(cat "$_p/pids.current" 2>/dev/null)"
+          case "$_mx" in ''|max|*[!0-9]*) continue ;; esac
+          _take cgroup-pids "$_mx" "$_cu"
+        done ;;
+      Darwin)
+        local _mp _mpu
+        _mp="$(sysctl -n kern.maxproc 2>/dev/null)"; _mpu="$(sysctl -n kern.maxprocperuid 2>/dev/null)"
+        case "$_mp" in ''|*[!0-9]*) _mp="" ;; esac
+        case "$_mpu" in ''|*[!0-9]*) _mpu="" ;; esac
+        if [ -n "$_mp" ] && [ -n "$n_all" ]; then _take kern-maxproc "$_mp" "$n_all"; fi
+        if [ -n "$_mpu" ] && [ -n "$n_uid" ]; then _take kern-maxprocperuid "$_mpu" "$n_uid"; fi ;;
+    esac
+  fi
+  [ -n "$bh" ] || return 1
+  printf 'headroom=%s source=%s used=%s limit=%s' "$bh" "${bs:-unknown}" "${bu:-?}" "${bl:-?}"
+  return 0
 }
 
 # hp_proc_argv <pid> — the process's argv, ONE TOKEN PER LINE. Linux reads /proc/<pid>/cmdline (exact,
@@ -653,7 +798,7 @@ hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stder
   for t in $SELFTESTS; do
     [ -f "$HARNESS/$t" ] || { warn "SELFTEST MISSING: $HARNESS/$t — cannot verify this tree, so nothing starts (fail closed)"; failed=1; continue; }
     args="$(selftest_args "$t")"
-    say "selftest: $t${args:+ $args}"
+    log_line "selftest: $t${args:+ $args}"
     # The extra argv is a WORD SPLIT on purpose: it is a literal list above, never caller input.
     # shellcheck disable=SC2086
     hu_run "$BOUND" bash "$HARNESS/$t" $args >"$HU_TMP/selftest.log" 2>&1
@@ -670,10 +815,10 @@ hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stder
     fi
     if [ "$rc" -ne 0 ]; then
       failed=1
-      say "selftest FAILED: $t — $(hu_bound_explain "$rc" "$BOUND")"
+      log_line "selftest FAILED: $t — $(hu_bound_explain "$rc" "$BOUND")"
       tail -n 12 "$HU_TMP/selftest.log" 2>/dev/null | sed 's/^/    /'
     else
-      say "selftest ok: $t"
+      log_line "selftest ok: $t"
     fi
   done
   return "$failed"
@@ -743,14 +888,14 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   local strict="${1:-0}" sha want got real_want real_got got_head got_root
   HU_PIN_PENDING=0
   if [ "$PIN_PRESENT" -eq 0 ]; then
-    say "pin: SKIPPED (no pin machinery on this box — HARNESS_PIN_DIR/HARNESS_PIN_FILE are unset and $PIN_FILE does not exist; the controller runs from $HARNESS)"
+    log_line "pin: SKIPPED (no pin machinery on this box — HARNESS_PIN_DIR/HARNESS_PIN_FILE are unset and $PIN_FILE does not exist; the controller runs from $HARNESS)"
     return 4
   fi
   # ⛔ AN EMPTY HARNESS IS NOT A BYPASS. `git -C ""` addresses the PROCESS CWD's repo (verified on git
   # 2.43), so a box with no resolvable harness would otherwise answer this row from whatever checkout the
   # operator happens to stand in — `pin: OK` for a repo the launcher never identified, feeding the single
   # verdict. The row is UNRESOLVED (cannot-verify), never a pass.
-  [ -n "$HREPO" ] || { say "pin: UNRESOLVED — no harness repo resolved (see the harness-up warning above), so the pin cannot be resolved in one"; return 2; }
+  [ -n "$HREPO" ] || { log_line "pin: UNRESOLVED — no harness repo resolved (see the harness-up warning above), so the pin cannot be resolved in one"; return 2; }
   # ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE. `head` on a mode-000 file, or on a path behind an
   # unsearchable ancestor, prints nothing — exactly like a record that was never written — so the pin
   # "resolved" from $REF, the read dir was never compared to the pin's tree, and the controller start
@@ -758,11 +903,11 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   # cannot see it must not return a weaker verdict than the one that can.
   case "$(hu_path_state "$PIN_SHA_FILE")" in
     unexaminable)
-      say "pin: UNEXAMINABLE — $PIN_SHA_FILE cannot be examined (an unsearchable ancestor or an unresolvable link), so the harness this box is pinned to cannot be resolved"
+      log_line "pin: UNEXAMINABLE — $PIN_SHA_FILE cannot be examined (an unsearchable ancestor or an unresolvable link), so the harness this box is pinned to cannot be resolved"
       return 2 ;;
     path)
       if [ ! -r "$PIN_SHA_FILE" ]; then
-        say "pin: UNREADABLE — $PIN_SHA_FILE exists but cannot be read, so the harness this box is pinned to cannot be resolved"
+        log_line "pin: UNREADABLE — $PIN_SHA_FILE exists but cannot be read, so the harness this box is pinned to cannot be resolved"
         return 2
       fi
       # ⛔ `-e` IS TRUE FOR A DIRECTORY, and `head -1 <dir>` yields nothing — which this function then
@@ -770,7 +915,7 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
       # record whose commit cannot be read. Same rule install.sh states: an unreadable record is never an
       # absent one.
       if [ ! -f "$PIN_SHA_FILE" ]; then
-        say "pin: NOT A REGULAR FILE — $PIN_SHA_FILE exists but is not a regular file, so the harness this box is pinned to cannot be read (cannot-verify is never an absent pin)"
+        log_line "pin: NOT A REGULAR FILE — $PIN_SHA_FILE exists but is not a regular file, so the harness this box is pinned to cannot be read (cannot-verify is never an absent pin)"
         return 2
       fi ;;
   esac
@@ -783,32 +928,32 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     local tipsha
     tipsha="$(git -C "$HREPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null)" || tipsha=""
     if [ -z "$tipsha" ]; then
-      say "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $HREPO"
+      log_line "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $HREPO"
       return 2
     fi
-    say "pin: ABSENT — nothing is recorded in $PIN_SHA_FILE; resolved ${tipsha:0:12} from $REF (the first start records it)"
+    log_line "pin: ABSENT — nothing is recorded in $PIN_SHA_FILE; resolved ${tipsha:0:12} from $REF (the first start records it)"
     return 0
   fi
   sha="$(git -C "$HREPO" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null)" || sha=""
   if [ -z "$sha" ]; then
-    say "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in the harness repo $HREPO"
+    log_line "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in the harness repo $HREPO"
     return 2
   fi
   want="$PIN_ROOT/${sha:0:12}/scripts/orchestrator-harness"
   got="$HARNESS"
   real_want="$(hu_real "$want")"
   real_got="$(hu_real "$got")"
-  say "pin: commit ${sha:0:12} (from $PIN_SHA_FILE), pin root $PIN_ROOT"
+  log_line "pin: commit ${sha:0:12} (from $PIN_SHA_FILE), pin root $PIN_ROOT"
   if [ -z "$real_got" ]; then
-    say "pin: UNREADABLE — the harness dir ($got, from $HARNESS_SRC) does not exist or cannot be entered"
+    log_line "pin: UNREADABLE — the harness dir ($got, from $HARNESS_SRC) does not exist or cannot be entered"
     return 2
   fi
   if [ ! -r "$real_got/orch-loop.sh" ]; then
-    say "pin: UNREADABLE — $real_got/orch-loop.sh cannot be read (it is the file the controller execs)"
+    log_line "pin: UNREADABLE — $real_got/orch-loop.sh cannot be read (it is the file the controller execs)"
     return 2
   fi
   if [ -n "$real_want" ] && [ "$real_want" = "$real_got" ]; then
-    say "pin: OK — the pin, the pin root, and the dir the controller reads are the same tree ($real_got)"
+    log_line "pin: OK — the pin, the pin root, and the dir the controller reads are the same tree ($real_got)"
     return 0
   fi
   # ⛔ THE PIN-ROOT SHAPE IS A CONVENTION, NOT THE PROPERTY THAT MATTERS, AND DEMANDING IT FALSE-BLOCKS THE
@@ -822,7 +967,7 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   local got_head
   got_head="$(git -C "$real_got" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || got_head=""
   if [ -n "$got_head" ] && [ "$got_head" = "$sha" ]; then
-    say "pin: OK — the dir the controller reads ($real_got) is a worktree at the pinned commit ${sha:0:12} (it is not under $PIN_ROOT: the materialiser leaves a checkout that already IS the ref where it is)"
+    log_line "pin: OK — the dir the controller reads ($real_got) is a worktree at the pinned commit ${sha:0:12} (it is not under $PIN_ROOT: the materialiser leaves a checkout that already IS the ref where it is)"
     return 0
   fi
   if [ -z "$real_want" ]; then
@@ -834,10 +979,10 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     #      tree to compare against, and refusing would block the very start that has to create it.
     #      Accepted, and SAID, because it is a weaker claim than "the pin and the read dir agree".
     if [ ! -d "$PIN_ROOT" ]; then
-      say "pin: RECORDED-NOT-MATERIALISED — $PIN_SHA_FILE names ${sha:0:12} but the pin root $PIN_ROOT does not exist on this box, so nothing is pinned to a tree here; starting from $real_got ($HARNESS_SRC)"
+      log_line "pin: RECORDED-NOT-MATERIALISED — $PIN_SHA_FILE names ${sha:0:12} but the pin root $PIN_ROOT does not exist on this box, so nothing is pinned to a tree here; starting from $real_got ($HARNESS_SRC)"
       return 0
     fi
-    say "pin: NOT MATERIALISED — the pin names $want, which does not exist, so a start from $real_got would run code the pin does not name. Remedy: materialise the pin (cloud-cell-supervisor.sh apply)."
+    log_line "pin: NOT MATERIALISED — the pin names $want, which does not exist, so a start from $real_got would run code the pin does not name. Remedy: materialise the pin (cloud-cell-supervisor.sh apply)."
     return 1
   fi
   # The dir the controller reads is a PINNED WORKTREE (root = the repo at that commit). Its commit is
@@ -849,15 +994,15 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
      && git -C "$HREPO" merge-base --is-ancestor "$got_head" "$sha" 2>/dev/null; then
     HU_PIN_PENDING=1
     if [ "$strict" = 1 ]; then
-      say "pin: STALE AFTER START — the box still reads ${got_head:0:12} while the pin names ${sha:0:12}; the start did not move it onto the pin"
+      log_line "pin: STALE AFTER START — the box still reads ${got_head:0:12} while the pin names ${sha:0:12}; the start did not move it onto the pin"
       return 1
     fi
-    say "pin: restart-pending — the box reads ${got_head:0:12}, the pin names ${sha:0:12} (an ancestor). This start must materialise the pin; it is re-checked after the components come up."
+    log_line "pin: restart-pending — the box reads ${got_head:0:12}, the pin names ${sha:0:12} (an ancestor). This start must materialise the pin; it is re-checked after the components come up."
     return 0
   fi
   # ⛔ THE MEASURED #2216 SHAPE, said with BOTH paths: "they disagree" without them is unactionable.
-  say "pin: MISMATCH — the pin resolves to $real_want but the controller READS $real_got ($HARNESS_SRC)."
-  say "      A re-pin would create a worktree nobody reads; refusing rather than starting a tree the pin does not name."
+  log_line "pin: MISMATCH — the pin resolves to $real_want but the controller READS $real_got ($HARNESS_SRC)."
+  log_line "      A re-pin would create a worktree nobody reads; refusing rather than starting a tree the pin does not name."
   return 1
 }
 
@@ -927,9 +1072,31 @@ hu_row_box() { # [strict-pin-dir]
 # required: the cell controller's argv is `<harness>/orch-loop.sh`, not `$O/orch-loop.sh` (measured
 # 2026-10-17 — a read scoped to `$O` alone found NO controller over a live loop).
 hu_ctrl_pids() {
-  local pids
+  local pids table
   pids="$(hu_pids "$HARNESS/orch-loop.sh" "$O/orch-loop.sh" 2>/dev/null)" || return 1
-  printf '%s\n' "$pids" | sed '/^$/d'
+  pids="$(printf '%s\n' "$pids" | sed '/^$/d')"
+  [ -n "$pids" ] || return 0
+  # ⛔ A CONTROLLER'S OWN DESCENDANT IS NOT A SECOND CONTROLLER (measured on this cell 2026-10-22,
+  # while testing the heal path): `orch-loop.sh` re-execs itself for its per-cycle self-refresh
+  # (#2215), so the ARGV census legitimately matched the controller AND its short-lived child, and the
+  # row said `DUPLICATE (3 live — one controller per repo)` → `VERDICT: BROKEN` on a box with ONE
+  # controller. That verdict is not merely wrong, it invites the one action the row exists to forbid:
+  # killing a "duplicate" that is the controller's own refresh. The census therefore drops any pid
+  # whose ANCESTOR is also in the set — the parent chain, read once, bounded at 40 levels, and only
+  # when the ppid table is readable (an unreadable table keeps the raw set, which is what the row
+  # reported before, rather than silently deciding the question on no evidence).
+  table="$(${HU_PS:-ps} -eo pid=,ppid= 2>/dev/null)" || table=""
+  case "$table" in *[![:space:]]*) : ;; *) printf '%s\n' "$pids"; return 0 ;; esac
+  printf '%s\n' "$table" | HU_SET="$pids" awk '
+    BEGIN { n = split(ENVIRON["HU_SET"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") set[a[i]] = 1 }
+    { if ($1 != "") par[$1] = $2 }
+    END {
+      for (p in set) {
+        x = par[p]; d = 0
+        while (x != "" && x != "0" && d++ < 40) { if (x in set) { drop[p] = 1; break } x = par[x] }
+      }
+      for (p in set) if (!(p in drop)) print p
+    }' | sort -n
 }
 # The fresh bound for the controller's own heartbeat: `orch-loop.sh` sleeps CYC (240 s default) and
 # rewrites `$O/heartbeat` every cycle, so silence past several cycles is the "alive but wedged" state.
@@ -1101,13 +1268,28 @@ hu_exec_path_of() { # <pid> -> the harness script that process executes, resolve
 # `hu_pids` (which has carried the same limit since #2231), not in this change.
 # rc=1 when the process table cannot be read (and an unreadable read is never "no pids").
 hu_any_ctrl_pids() {
-  local table
+  local table set
   table="$(${HU_PS:-ps} -eo pid=,command= 2>/dev/null)" || return 1
   case "$table" in *[![:space:]]*) ;; *) return 1 ;; esac
-  printf '%s\n' "$table" | awk '
+  set="$(printf '%s\n' "$table" | awk '
     { pid = $1; cmd = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
       n = split(cmd, tok, " ")
-      if (n >= 2 && tok[1] ~ /(bash|sh|dash|zsh|ksh)$/ && tok[2] ~ /(^|\/)orch-loop[.]sh$/) print pid }'
+      if (n >= 2 && tok[1] ~ /(bash|sh|dash|zsh|ksh)$/ && tok[2] ~ /(^|\/)orch-loop[.]sh$/) print pid }')"
+  # ⛔ THE SAME ANCESTOR FILTER AS hu_ctrl_pids, FOR THE SAME MEASURED REASON: `orch-loop.sh` re-execs
+  # itself for its per-cycle self-refresh (#2215), so a healthy box's census is the controller PLUS its
+  # descendants — measured 2026-10-22 on this cell as `DUPLICATE (5 live controllers — the executing
+  # tree is ambiguous)` for ONE controller (a `bash -c` wrapper, the controller, two cycle subshells
+  # and a lingering tmux client). Reading a process CHAIN as rival controllers is the "a measurement
+  # artifact is not a state" failure, and its remedy (kill the duplicates) is destructive.
+  [ -n "$set" ] || return 0
+  printf '%s\n' "$(${HU_PS:-ps} -eo pid=,ppid= 2>/dev/null)" | HU_SET="$set" awk '
+    BEGIN { n = split(ENVIRON["HU_SET"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") set[a[i]] = 1 }
+    { if ($1 != "") par[$1] = $2 }
+    END {
+      for (p in set) { x = par[p]; d = 0
+        while (x != "" && x != "0" && d++ < 40) { if (x in set) { drop[p] = 1; break } x = par[x] } }
+      for (p in set) if (!(p in drop)) print p
+    }' | sort -n
 }
 
 hu_row_exec() {
@@ -1342,6 +1524,69 @@ hu_row_launchd() {
 hu_capacity() {
   local load1="" ncpu="" dfree="" probe="shim" rec="" capsh="$SELF_PATH/orchestrator-harness/capacity.sh"
   local ceil percpu perlanes loadlanes dpath diskfloor diskcost avail disklen lanes now fixed="none"
+  local forkhead="" forksrc="" forkreserve="" forklane="" forkavail="" forklanes="" forkbound=1 binding="" fr=""
+  local fmin="" frh="" frc=0 forklanes_txt=""
+  # ── FORK HEADROOM IS READ **FIRST**, BEFORE ANY PROBE THAT MUST FORK TO ANSWER ────────────────
+  # (#2293, and the same ordering lesson `capacity.sh:477-481` records for itself.) This dimension is
+  # the one whose failure is TOTAL — a box at 0.32x load, or one whose cgroup pids ceiling is 4x
+  # tighter than RLIMIT_NPROC, can fork nothing while load and disk both read comfortable. So it is
+  # measured before `capacity.sh probe` and before `hp_load1_c`/`hp_ncpu`, because EVERY one of those
+  # forks: on a box that cannot fork they fail too, and the earlier refusals would then report
+  # `load_unreadable` — naming the loadavg and pointing the operator at the wrong fault — before the
+  # fork read was ever attempted. The true answer on such a box is "this box cannot fork".
+  # ⛔ capacity.sh IS THE ONE INSTRUMENT, AND ITS `fork` VERB IS THE READING ALONE. The #2552 batch
+  # landed the fork read on main while this branch was in review, under a DIFFERENT record schema
+  # (`procs=`/`procs_max=`/`fork=`/`src=`) than this branch had invented (`fork_headroom=`). A branch
+  # cannot win that: two publishers under one `refs/boxes` namespace is the defect, not the field name,
+  # so the RECORD is main's and this launcher CONSUMES it. Deriving `procs_max − procs` here would be a
+  # second implementation of `cap_h_for`'s arithmetic, so the verb answers with `headroom=` already
+  # computed there — and `min_fork_headroom=` carries the fleet's declared margin, so this file cannot
+  # invent a second one either.
+  if [ -f "$capsh" ]; then
+    fr="$(hu_bounded "${HU_CAPACITY_TIMEOUT:-20}" bash "$capsh" fork 2>/dev/null)"; frc=$?
+    # 254 is capacity.sh's own "THE READ COULD NOT FORK" (bash terminates on a failed fork): the box
+    # is out of pids, which is the TOTAL failure this dimension exists for. Name it, do not retry.
+    [ "$frc" -eq 254 ] && { printf 'capacity_refused reason=fork_exhausted probe=capacity.sh\n'; return 3; }
+  fi
+  # ── fork headroom: THE FIRST DIMENSION, because it is the one whose failure is TOTAL ───────────
+  # (READ HERE, before the load/ncpu/disk probes below: those fork to answer, so their refusals would
+  # otherwise fire first on the very box this dimension exists for.) The shim is the fallback for a
+  # box with no capacity.sh beside the launcher — the record names which answered, so a fallback can
+  # never pass as the fleet instrument.
+  case "$fr" in
+    *[[:space:]]headroom=*)
+      frh="$(printf '%s' "$fr" | sed -n 's/.*[[:space:]]headroom=\([^ ]*\).*/\1/p' | head -1)"
+      fmin="$(printf '%s' "$fr" | sed -n 's/.*[[:space:]]min_fork_headroom=\([0-9][0-9]*\).*/\1/p' | head -1)"
+      forksrc="$(printf '%s' "$fr" | sed -n 's/.*[[:space:]]src=\([^ ]*\).*/\1/p' | head -1)"
+      # `min_fork_headroom=` contains the substring `headroom=` but never after a SPACE, so the two
+      # extractions cannot collide.
+      case "$frh" in
+        unbounded)  forkhead=unbounded; forksrc="capacity.sh:${forksrc:-no-ceiling}" ;;
+        ''|*[!0-9]*) : ;;
+        *)          forkhead="$frh"; forksrc="capacity.sh:${forksrc:-unknown}" ;;
+      esac ;;
+  esac
+  if [ -z "$forkhead" ]; then
+    fr="$(hp_fork_headroom 2>/dev/null)" || fr=""
+    forkhead="$(printf '%s' "$fr" | sed -n 's/.*headroom=\([0-9][0-9]*\).*/\1/p' | head -1)"
+    forksrc="$(printf '%s' "$fr" | sed -n 's/.*source=\([^ ]*\).*/\1/p' | head -1)"
+    [ -n "$forkhead" ] && forksrc="shim:${forksrc:-unknown}"
+  fi
+  # ⛔ AN UNMEASURABLE FORK LIMIT IS NOT UNLIMITED HEADROOM. `ulimit -u` is a shell builtin and exists
+  # everywhere these boxes run, so this refusal is rare — but "I could not look" must never be spent
+  # as "there is room", which is the whole class #1745/#2293 record. `up` refuses on it like load/disk.
+  # ⛔ AND `unbounded` IS NOT UNMEASURABLE — IT IS THE OPPOSITE. `procs_max=0` means NO CEILING WAS
+  # FOUND, so `cap_h_for` answers `unbounded`, and a box no process limit bounds cannot be bound by
+  # one. It is kept as a distinct WORD so the arithmetic below skips the dimension; collapsing it into
+  # a number would either refuse every healthy unbounded box (read as 0 headroom) or pretend a ceiling
+  # exists (read as a huge one, which then divides into a fabricated lane count).
+  # ⛔ AND IT REFUSES **HERE**, BEFORE THE LOAD REFUSAL, ON BOTH PATHS. The fork read above the.
+  # capacity.sh call was only half the ordering: the shim's own fork read sat below the
+  # `load_unreadable`/`ncpu_unreadable` refusals, so on a box with no capacity.sh beside the launcher
+  # (the documented fallback) an unforkable box still reported `load_unreadable` and pointed the
+  # operator at the loadavg — the exact misdiagnosis the ordering comment above claims to prevent
+  # (review round 1). The `probe=` field names the instrument that WOULD have answered.
+  [ -n "$forkhead" ] || { printf 'capacity_refused reason=fork_unreadable probe=%s\n' "$([ -f "$capsh" ] && echo capacity.sh || echo shim)"; return 3; }
   # ── the reading: capacity.sh's record first, the shim probes as the fallback ────────────────────
   if [ -f "$capsh" ]; then
     # ⛔ BOUNDED, and a FAILED probe is not a reading: a `capacity.sh` that cannot answer leaves the
@@ -1392,25 +1637,57 @@ hu_capacity() {
   [ "$diskcost" -ge 1 ] 2>/dev/null || diskcost=1100
   avail=$(( 10#$dfree > 10#$diskfloor ? 10#$dfree - 10#$diskfloor : 0 ))
   disklen=$(( avail / 10#$diskcost ))
+  # A lane's process tree, and the tasks a box must keep for itself. 40 is a MEASUREMENT-shaped
+  # default, not a round number: one `pi` holds 11 threads on this Linux box (`ps -eo comm,nlwp`), and
+  # a lane adds its shell, the worker terminal, `gh`/`git` calls and — for a test lane — a pytest or
+  # `uv sync` tree. Both are knobs because both are measurements of a WORKLOAD, not caps — but only
+  # `HU_FORK_PER_LANE` is a workload number here: the reserve is the fleet's declared margin (below).
+  # ⛔ THE RESERVE IS THE FLEET'S DECLARED MARGIN, NOT A SECOND ONE. `min_fork_headroom` IS
+  # `CAP_MIN_FORK_HEADROOM` in capacity.sh (200) — the number the fleet's own placement gate refuses
+  # on. This launcher defaulting to its own 800 would mean two readers disagree about one reading, so
+  # the default comes FROM the instrument, and 200 is only the fallback for a box with no capacity.sh.
+  # `HU_FORK_PER_LANE` stays a workload measurement, not a cap: one `pi` holds ~11 threads and a lane
+  # adds its shell, the worker terminal, git/gh calls and (for a test lane) a pytest or `uv sync` tree.
+  forkreserve="${HU_FORK_RESERVE:-${fmin:-200}}"; case "$forkreserve" in ''|*[!0-9]*) forkreserve=200 ;; esac
+  forklane="${HU_FORK_PER_LANE:-40}";     case "$forklane" in ''|*[!0-9]*) forklane=40 ;; esac
+  [ "$forklane" -ge 1 ] 2>/dev/null || forklane=40
+  if [ "$forkhead" = unbounded ]; then
+    # No ceiling found => this dimension cannot bind. `forkbound=0` is what the derivation reads; the
+    # numbers are left at 0 and are NEVER compared, so an unbounded box cannot read as "0 lanes".
+    # ⛔ AND THE ROW MUST NOT PRINT THAT 0 EITHER: `lanes_by_fork=0` renders as `by fork=0`, which to a
+    # reader says the box with NO process ceiling can place zero lanes — a fabricated number in the
+    # one place this file forbids them. The word rides in its own field so the reader can tell "not a
+    # constraint" from "a constraint with no room".
+    forkbound=0; forkavail=0; forklanes=0; forklanes_txt="unbounded"
+  else
+    forkavail=$(( 10#$forkhead > 10#$forkreserve ? 10#$forkhead - 10#$forkreserve : 0 ))
+    forklanes=$(( forkavail / 10#$forklane )); forklanes_txt="$forklanes"
+  fi
+  # ── the derivation, IN THE ORDER THE DIMENSIONS FAIL: fork (total), disk (total, and the one that
+  # breaks a box first in practice), load (soft). `binding=` names WHICH one produced the number, so a
+  # reader can tell "the box is full" from "the box could not fork" from "this is just busy" — three
+  # states that used to print as one lane count.
   lanes=$(( loadlanes < disklen ? loadlanes : disklen ))
+  binding=disk; [ "$loadlanes" -lt "$disklen" ] && binding=load
+  if [ "$forkbound" -eq 1 ] && [ "$forklanes" -lt "$lanes" ]; then lanes=$forklanes; binding=fork; fi
   [ -n "${HARNESS_UP_MAX_LANES:-}" ] && fixed="$HARNESS_UP_MAX_LANES"
   now="$(date +%s 2>/dev/null)"
-  printf 'capacity host=%s load1=%s ncpu=%s ceiling_load=%s disk_free_mb=%s lanes_by_load=%s lanes_by_disk=%s lanes=%s fixed_ignored=%s probe=%s at=%s\n' \
+  printf 'capacity host=%s load1=%s ncpu=%s ceiling_load=%s disk_free_mb=%s lanes_by_load=%s lanes_by_disk=%s lanes_by_fork=%s fork_headroom=%s fork_source=%s binding=%s lanes=%s fixed_ignored=%s probe=%s at=%s\n' \
     "$(uname -n 2>/dev/null || printf 'unknown')" \
     "$(awk -v c="$load1" 'BEGIN{printf "%.2f", c/100}')" "$ncpu" \
     "$(awk -v c="$ceil" 'BEGIN{printf "%.2f", c/100}')" \
-    "$dfree" "$loadlanes" "$disklen" "$lanes" "$fixed" "$probe" "${now:-0}"
+    "$dfree" "$loadlanes" "$disklen" "$forklanes_txt" "$forkhead" "${forksrc:-unknown}" "$binding" "$lanes" "$fixed" "$probe" "${now:-0}"
   return 0
 }
 
 hu_row_capacity() {
   local rec="" rc=0 lanes="" load="" dfree="" ncpu="" fixed="none" probe="" why=""
+  local forkhead="" forksrc="" binding="" lb_load="" lb_disk="" lb_fork=""
   rec="$(hu_capacity 2>&1)"; rc=$?
   case "$rc" in
     0) : ;;
     3)  why="$(printf '%s' "$rec" | sed -n 's/^capacity_refused reason=\([a-z_]*\).*/\1/p' | head -1)"
-        hu_row capacity - - "REFUSED (${why:-unmeasurable} — the ceiling is a MEASUREMENT of load and disk here, and a fixed cap is not one)"
-        return 2 ;;
+        hu_row capacity - - "REFUSED ($(hu_cap_reason_txt "${why:-unmeasurable}"))"; return 2 ;;
     *) hu_row capacity - - "UNKNOWN (the capacity decision answered $rc — not a reading this reader knows)"; return 2 ;;
   esac
   lanes="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes=\([0-9]*\).*/\1/p' | head -1)"
@@ -1419,14 +1696,44 @@ hu_row_capacity() {
   dfree="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]disk_free_mb=\([0-9]*\).*/\1/p' | head -1)"
   fixed="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fixed_ignored=\([^ ]*\).*/\1/p' | head -1)"
   probe="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]probe=\([^ ]*\).*/\1/p' | head -1)"
+  # `[^ ]*`, not `[0-9]*`: `unbounded` is a legitimate reading and must print as itself rather than
+  # as `?`, which is how an absent datum is rendered.
+  forkhead="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fork_headroom=\([^ ]*\).*/\1/p' | head -1)"
+  forksrc="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fork_source=\([^ ]*\).*/\1/p' | head -1)"
+  binding="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]binding=\([a-z]*\).*/\1/p' | head -1)"
+  lb_load="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_load=\([0-9]*\).*/\1/p' | head -1)"
+  lb_disk="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_disk=\([0-9]*\).*/\1/p' | head -1)"
+  # `[^ ]*`, not `[0-9]*`: `unbounded` is a legitimate reading and must print as itself — the same
+  # rule the `fork_headroom=` parse beside it already follows.
+  lb_fork="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_fork=\([^ ]*\).*/\1/p' | head -1)"
   case "$lanes" in ''|*[!0-9]*) hu_row capacity - - "UNKNOWN (the decision ran but its lane count cannot be parsed: $rec)"; return 2 ;; esac
-  # The reading rides IN THE ROW: a lane count with no load/disk beside it is the tidy display this
-  # rule forbids, and a reader could not tell a measured 12 from a pinned 8. `via=` names WHICH probe
-  # answered, so the fallback can never pass as the fleet instrument.
-  if [ "$fixed" != none ]; then
-    hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB via=${probe:-unknown} — measured; the fixed cap '$fixed' is IGNORED as a ceiling)"; return 0
+  # The reading rides IN THE ROW: a lane count with no fork/disk/load beside it is the tidy display
+  # this rule forbids, and a reader could not tell a measured 12 from a pinned 8. The dimensions are
+  # printed in the order they FAIL (fork → disk → load), each with the number it contributed, and
+  # `via=` names WHICH probe answered so the shim fallback can never pass as the fleet instrument.
+  local dims="fork headroom=${forkhead:-?} (${forksrc:-unknown}) → disk free=${dfree:-?}MB → load=${load:-?} ncpu=${ncpu:-?}"
+  local cap_note=""
+  [ "$fixed" != none ] && cap_note=" — the fixed cap '$fixed' is IGNORED as a ceiling"
+  # ⛔ `lanes=<n> ` KEEPS ITS EXACT SHAPE (a space follows the number) — the existing suite asserts on
+  # it, and an assertion that has to be rewritten to fit a new sentence is how a check drifts from the
+  # thing it checked. The new dimensions ride INSIDE the parentheses beside it.
+  if [ "$lanes" -eq 0 ] 2>/dev/null; then
+    hu_row capacity - - "DEGRADED (no room: $dims → lanes=0 (binding=${binding:-?}; by fork=${lb_fork:-?} disk=${lb_disk:-?} load=${lb_load:-?}; via=${probe:-unknown})$cap_note)"; return 1
   fi
-  hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB via=${probe:-unknown} — measured, not a cap)"; return 0
+  hu_row capacity - - "OK (placement $dims → lanes=$lanes (binding=${binding:-?}; by fork=${lb_fork:-?} disk=${lb_disk:-?} load=${lb_load:-?}; via=${probe:-unknown} — measured, not a cap$cap_note))"; return 0
+}
+
+# What a refusal's reason MEANS, in the operator's terms. A bare `reason=disk_unreadable` is a token
+# that names a probe, not a remedy; the sentence says what is missing and that a cap is not the answer.
+hu_cap_reason_txt() {
+  case "${1:-}" in
+    fork_exhausted) printf 'this box COULD NOT FORK AT ALL (capacity.sh answered 254 — EAGAIN) — the remedy is EXTERNAL: restart or drain it; nothing inside it can be cleaned up, and a fixed lane cap is not a measurement' ;;
+    fork_unreadable) printf 'the fork/task headroom could not be measured (ulimit -u, /proc/sys/kernel/threads-max, cgroup pids.max, kern.maxproc all unreadable) — a box that cannot prove it can fork must not be given lanes, and a fixed lane cap is not a measurement' ;;
+    load_unreadable) printf 'the 1-min load average could not be read (/proc/loadavg and sysctl vm.loadavg both failed) — a fixed lane cap is not a measurement' ;;
+    ncpu_unreadable) printf 'the CPU count could not be read (nproc, sysctl hw.ncpu and getconf all failed) — a fixed lane cap is not a measurement' ;;
+    disk_unreadable) printf 'free disk could not be read for the state dir — a full disk is what breaks a box first, and a fixed lane cap is not a measurement' ;;
+    *) printf '%s — the ceiling is a MEASUREMENT of this box (fork headroom, disk, load) and a fixed cap is not one' "${1:-unmeasurable}" ;;
+  esac
 }
 
 # The cell supervisor / doctor loop. On a Mac there is no such component and the row says SKIPPED with
@@ -1446,6 +1753,240 @@ hu_row_supervisor() {
   fi
   hu_row supervisor - - "MISSING (no tmux session '$sess')"; return 1
 }
+
+# The LANES row: how many lanes are live, and whether they are ADVANCING.
+# ⛔ A COUNT ALONE IS THE DEFECT THIS ROW EXISTS AGAINST. Five lanes whose last log write was four
+# hours ago and five lanes merging PRs read identically as `lanes: 5`, and the operator's next move
+# (wait / intervene) is opposite in the two cases. Advancement is read from the ONE artefact the
+# worker launcher itself writes — `$O/logs/<worker>.log`, whose mtime `orch-loop.sh`'s own stale-worker
+# reaper reads (STALE_MIN, 40 min) — so "advancing" here and "hung" there cannot disagree.
+# ⛔ IT IS NOT A RESTART SIGNAL: a silent lane past the bound is REPAIRED by the controller's own
+# reaper, and this row only reports it. Killing lanes is never a status verb's business.
+# ⛔ COERCED, LIKE EVERY OTHER KNOB IN THIS FILE. An invalid bound is not a small typo here: with a
+# non-numeric `HU_LANE_SILENT`, `[ "$age" -le "$HU_LANE_SILENT" ]` exits 2, the `if` takes the ELSE
+# branch, and EVERY live lane reads SILENT (the row then prints `past abcs`) — the row fails in the
+# direction that invents a problem. Same class, worse direction, for the NEXT bound below (a stale
+# `[select]` line printed as `OK`), which is why both are normalised rather than trusted.
+HU_LANE_SILENT="${HARNESS_UP_LANE_SILENT:-2400}"   # 40 min = orch-loop.sh's own STALE_MIN
+case "$HU_LANE_SILENT" in ''|*[!0-9]*) HU_LANE_SILENT=2400 ;; esac
+hu_row_lanes() {
+  local d="$O/state" f name age n=0 adv=0 sil="" worst=0 retired=0 logs=0
+  # ⛔ NO `$O/state` IS NOT "NO LANES": SKIPPED with its reason (not-applicable is a pass and is never
+  # rendered as OK — the rule the launchd and supervisor rows follow).
+  [ -d "$d" ] || { hu_row lanes - - "SKIPPED (no worker records under $O/state yet — no lane has run here)"; return 4; }
+  # ⛔ LIVE LANES COME FROM THE LAUNCHER'S OWN WORKER RECORDS (`$O/state/run-<name>.sh`, written at
+  # spawn and REMOVED by wt_close), NOT from the log directory. Measured on this cell 2026-10-22: the
+  # first version enumerated `$O/logs/*.log` and reported `0/159 advancing` on a box with FIVE live
+  # lanes — 259 log files is what a week of work leaves behind, and counting retired logs as silent
+  # lanes is precisely the "a stale flag read as present-tense" defect this row exists to prevent.
+  # The same records `worker-terminal.sh` uses are the only population the controller itself counts,
+  # so "what the controller counts", "what it reaps" and "what this row names" cannot disagree.
+  for f in "$d"/run-*.sh; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f" .sh)"; name="${name#run-}"
+    case "$name" in lane-*|merge-*|fix-*|chain-*) : ;; *) continue ;; esac
+    n=$((n + 1))
+    if age="$(hu_file_age "$O/logs/$name.log")"; then
+      if [ "$age" -le "$HU_LANE_SILENT" ]; then adv=$((adv + 1))
+      else sil="$sil $name"; [ "$age" -gt "$worst" ] && worst="$age"; fi
+    else
+      # A live worker record with no log at all: the lane exists and has written nothing, which is
+      # silence — but its AGE is unknown, and unknown is not "fresh".
+      sil="$sil $name(no log)"
+    fi
+  done
+  # Retired logs are COUNTED AND NAMED as retired, never judged. They are the durable trace of work
+  # that finished; a box that has run for a week has hundreds and they are not a health signal.
+  for f in "$O/logs"/*.log; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f" .log)"
+    case "$name" in lane-*|merge-*|fix-*|chain-*) : ;; *) continue ;; esac
+    logs=$((logs + 1))
+    [ -f "$d/run-$name.sh" ] || retired=$((retired + 1))
+  done
+  if [ "$n" -eq 0 ]; then
+    hu_row lanes 0 - "OK (no lane is live — 0 worker records; $retired finished log(s) on disk, none judged)"; return 0
+  fi
+  # The bound is printed whenever it is used, because "silent" is meaningless without the number it
+  # was measured against — and that number is the controller's, not this row's invention.
+  if [ -n "$sil" ]; then hu_row lanes "$n" "$(hu_age_txt "$worst")" "DEGRADED ($adv/$n live and advancing; SILENT past ${HU_LANE_SILENT}s:$sil — the controller's own reaper closes these; $retired finished log(s) ignored)"; return 1; fi
+  hu_row lanes "$n" - "OK ($adv/$n live and advancing — every live lane wrote within ${HU_LANE_SILENT}s; $retired finished log(s) ignored)"; return 0
+}
+
+# ⛔ `chain-*` IS IN THIS POPULATION BECAUSE THE CONTROLLER COUNTS IT. `dispatch-merge.sh:217` spawns
+# its review→record→merge workers as `chain-<N>` through `wt_spawn`, and `wt_count lane- chain-` is the
+# census the controller itself takes — so leaving them out of this row made a LIVE chain worker read as
+# `OK (no lane is live — 0 worker records …)`, the false pass this row exists against. The population
+# is the launcher's own worker records because it is the one the controller counts and reaps; a
+# record kept after a kill it could not prove (worker-terminal.sh's documented `record kept, retried
+# next cycle`) is the residual this population shares with the controller, and is tracked on #2653.
+# The NEXT row: what the controller would do on its next pass, read from the line it PRINTED for that
+# decision. ⛔ THIS IS NOT A PREDICTION. `orch-loop.sh` writes one `[select]` line per cycle (the
+# owner's funnel ruling, 2026-10-18) precisely so "nothing to do" and "blocked" stop looking alike;
+# this row surfaces the last one, with its age, instead of re-deriving a second opinion that could
+# disagree with the controller's. A stale line is LATE, never "the current plan".
+HU_NEXT_STALE="${HARNESS_UP_NEXT_STALE:-900}"
+# ⛔ COERCED (see HU_LANE_SILENT). Unvalidated, this bound inverts the row's polarity in the FAIL-OPEN
+# direction: `[ "$age" -gt abc ]` exits 2, the `if` takes its ELSE branch, and a five-hour-old
+# `[select]` line prints `OK` — the row's contribution drops from DEGRADED to HEALTHY exactly when it
+# should red (measured: HARNESS_UP_NEXT_STALE=abc on a 5h log → `next|-|5h|OK: [select] …`).
+case "$HU_NEXT_STALE" in ''|*[!0-9]*) HU_NEXT_STALE=900 ;; esac
+hu_row_next() {
+  local log="$O/logs/orch-loop.log" line age
+  # Same rule as the lanes row: an ABSENT log is "no cycle has been recorded here", which is
+  # not-applicable (and a PASS), not cannot-verify. An EXISTING log with no decision line IS a real
+  # cannot-verify — a cycle ran and the operator still cannot be told what it decided.
+  [ -r "$log" ] || { hu_row next - - "SKIPPED (no cycle recorded under $O/logs yet — there is no decision line to quote)"; return 4; }
+  line="$(grep '^\[select\]' "$log" 2>/dev/null | tail -1)"
+  [ -n "$line" ] || line="$(grep '^\[dispatch\]' "$log" 2>/dev/null | tail -1)"
+  # ⛔ A LOG WITH NO DECISION LINE YET IS NOT CANNOT-VERIFY — it is a controller that has not finished
+  # its FIRST cycle. `orch-loop.sh:334` appends `[startup] worker launcher=…` to this log at boot, 240 s
+  # (CYC) before the first `[select]` line exists, so the comment this branch first shipped here
+  # ("an existing log with no decision line IS a real cannot-verify — a cycle ran") described a case
+  # that a FRESH box never reaches: it described the SECOND cycle. Returning 2 there made `up` exit 2
+  # AFTER A SUCCESSFUL START on a healthy box — the exact failure `hu_row_exec`'s own comment rejects
+  # ("teaches an operator to ignore a genuine cannot-verify"); measured on a log holding one
+  # `[startup]` line with every other row green: `VERDICT: BROKEN (rc=2)`.
+  # So the answer is bounded by the row's own staleness rule: younger than one bound is STARTING (not
+  # applicable, a pass), older than it is a controller that SHOULD have decided and has not.
+  if [ -z "$line" ]; then
+    if age="$(hu_file_age "$log")" && [ "$age" -le "$HU_NEXT_STALE" ]; then
+      hu_row next - "$(hu_age_txt "$age")" "STARTING (no [select]/[dispatch] line yet — the log is younger than ${HU_NEXT_STALE}s, i.e. the first cycle has not reached its decision; the startup line is above)"; return 4
+    fi
+    hu_row next - - "UNKNOWN (the log is older than ${HU_NEXT_STALE}s and still carries no [select] or [dispatch] line — a cycle should have decided by now)"; return 2
+  fi
+  # A log line has no timestamp of its own; the LOG's mtime is when any cycle last wrote, which bounds
+  # the line's age from above (the line cannot be older than the file it was appended to last).
+  age="$(hu_file_age "$log")" || { hu_row next - - "? ${line}"; return 2; }
+  line="$(printf '%s' "$line" | cut -c1-320)"
+  if [ "$age" -gt "$HU_NEXT_STALE" ]; then hu_row next - "$(hu_age_txt "$age")" "LATE (log older than ${HU_NEXT_STALE}s, so this is the last decision and not the next): $line"; return 1; fi
+  hu_row next - "$(hu_age_txt "$age")" "OK: $line"; return 0
+}
+
+# The SELF-TEST row: the checks that make this a healtH CHECK and not a memory. ⛔ A HEALTH CHECK THAT
+# ONLY PASSES BY REMEMBERING IS A DEFECT (the brief's rule), so every probe below is taken NOW and
+# reads a LIVE artefact: the scripts the box would EXECUTE are syntax-parsed where they are, and each
+# platform probe in the shim is called and must answer. A remembered "last run: ok" file is
+# deliberately absent — that is exactly the record this row refuses to trust.
+hu_row_selftest() {
+  local f bad="" nb=0 probes=""
+  [ -d "$HARNESS" ] || { hu_row selftest - - "BROKEN (the harness dir $HARNESS does not exist — nothing was parsed)"; return 2; }
+  for f in "$HARNESS"/*.sh; do
+    [ -f "$f" ] || continue
+    nb=$((nb + 1))
+    bash -n "$f" 2>/dev/null || bad="$bad $(basename "$f")"
+  done
+  [ "$nb" -gt 0 ] || { hu_row selftest - - "BROKEN (0 scripts found in $HARNESS — a check over nothing is not a pass)"; return 2; }
+  # Each platform question, asked rather than assumed. The NAME goes in the row so a Mac operator can
+  # see the Darwin probe answered and a cell operator the Linux one.
+  _p() { if "$1" >/dev/null 2>&1; then probes="$probes $2"; else bad="$bad $2"; fi; }
+  _p hp_ncpu ncpu; _p hp_load1_c load; _p hp_fork_headroom fork; _p hp_disk_free_mb disk
+  if hp_stat_mtime "$0" >/dev/null 2>&1; then probes="$probes mtime"; else bad="$bad mtime"; fi
+  if _t="$(hp_mktemp_d)" && [ -n "$_t" ]; then rmdir "$_t" 2>/dev/null; probes="$probes tmp"; else bad="$bad tmp"; fi
+  if [ -n "$bad" ]; then hu_row selftest - - "BROKEN (failed:${bad}; parsed $nb script(s) in $HARNESS)"; return 2; fi
+  hu_row selftest - - "OK (bash -n on $nb live script(s) in $HARNESS; shim probes answered:${probes})"; return 0
+}
+
+# ── self-heal: the two repairs that are SAFE WHILE LANES WORK ───────────────────────────────────
+# ⛔ WHAT MAY BE HEALED, AND WHAT MAY NOT, IS THE WHOLE DESIGN. Both arms below are non-destructive by
+# construction:
+#   (1) A controller that is NOT RUNNING is started. Nothing live is interrupted — the lanes are
+#       separate worker processes that the start does not touch — and `orchestrator-bringup.sh start`
+#       owns the duplicate refusal, so a second `harness-status` cannot start a second controller.
+#   (2) A pin that is BEHIND the ref is re-pinned. `harness-refresh.sh`'s advance is explicitly
+#       non-destructive (#2278: "the pin advance kills nothing") and leaves the running controller on
+#       its own tree, so lanes keep working across it.
+# ⛔ WHAT IS NEVER HEALED HERE: a DUPLICATE controller (killing one is a P0 action and belongs to a
+# human), a controller that is LATE (alive but quiet — cycling a healthy supervisor would drop
+# in-flight lanes; the controller's own watchdog owns that call), and `restart-pending` (the pin is
+# AHEAD of the running tree: closing it REQUIRES dropping the running controller, which is the
+# operator's deliberate `harness-down` then `harness-up`, never a side effect of asking for status).
+HU_HEAL_NOTE=""
+hu_heal() {
+  local st rel started=0 foreign="" rel_age=""
+  st="$(hu_row_state loop)"
+  case "$st" in
+    MISSING*)
+      # ⛔ THE LOOP ROW'S CENSUS IS SCOPED; THE EXEC ROW'S IS NOT — AND ONLY THE SCOPED ONE IS CONSULTED
+      # HERE. `hu_ctrl_pids` matches this box's state dir and harness path; `hu_any_ctrl_pids` (what the
+      # exec row reads) matches ANY `orch-loop.sh` on the box, precisely because a controller can be
+      # executing code the records never named — `~/.cache/orc/main-orch-loop.sh`, a hand-launched old
+      # worktree, a stale second pin. `orchestrator-bringup.sh`'s registry claim cannot refuse that
+      # controller either: a hand-launched one never registered there. So starting on the MISSING arm
+      # alone MANUFACTURES the duplicate this verb explicitly refuses to heal — two controllers
+      # draining one repo, two lanes on one PR — from the operator's own "just tell me the state" call.
+      # The unsafe direction is the start, so an unreadable ANY-census also declines: cannot-tell is
+      # never "nothing else is running" (measured in review round 1 of this change).
+      if foreign="$(hu_any_ctrl_pids)"; then
+        if [ -n "$foreign" ]; then
+          HU_HEAL_NOTE="$HU_HEAL_NOTE
+NOT HEALED: $st, but a controller process is live that this box's records do not name (pid(s) $(printf '%s' "$foreign" | tr '\n' ' ')— see the exec row). Starting another would DUPLICATE it, and which controller to stop is a human decision — inspect the exec row, then stop one deliberately"
+          return 0
+        fi
+      else
+        HU_HEAL_NOTE="$HU_HEAL_NOTE
+NOT HEALED: $st, and whether another controller is live could not be read (the process table was unreadable) — starting on cannot-tell risks duplicating one; run 'harness-up' if you know the box is clear"
+        return 0
+      fi
+      log_line "heal: the controller is NOT running — starting it (nothing live is interrupted; lanes are separate workers)"
+      if hu_start_loop; then HU_HEAL_NOTE="$HU_HEAL_NOTE
+HEAL: started a controller that was not running"; started=1
+      else HU_HEAL_NOTE="$HU_HEAL_NOTE
+HEAL FAILED: the controller still is not running (see above)"; fi ;;
+    DUPLICATE*)
+      HU_HEAL_NOTE="$HU_HEAL_NOTE
+NOT HEALED: $st — choosing which controller to kill is a human decision, not a status verb's" ;;
+    LATE*)
+      HU_HEAL_NOTE="$HU_HEAL_NOTE
+NOT HEALED: $st — a live-but-quiet controller is never cycled by status (that would drop in-flight lanes)" ;;
+  esac
+  rel="$(sed -n 's/^relation=\([a-z-]*\).*/\1/p' "$O/state/harness-refresh" 2>/dev/null | head -1)"
+  [ -n "$rel" ] || rel="$(sed -n 's/.*[[:space:]]relation=\([a-z-]*\).*/\1/p' "$O/state/harness-refresh" 2>/dev/null | head -1)"
+  # ⛔ A RECORDED RELATION IS NOT A LIVE STATE, AND AN AGED ONE IS NOT EVIDENCE FOR A REPAIR. The
+  # refresh row treats this same record as LATE past `HU_REFRESH_STALE` and refuses to judge on it;
+  # the heal must apply the SAME test before it ACTS on it — otherwise a days-old `relation=behind`
+  # still triggers a fetch and a pin advance, i.e. a stale flag that records a past state is spent as
+  # present-tense evidence, with the record's own row simultaneously calling it LATE.
+  rel_age="$(hu_file_age "$O/state/harness-refresh" 2>/dev/null)" || rel_age=""
+  case "${rel:-}" in
+    behind)
+      if [ -z "$rel_age" ] || [ "$rel_age" -gt "$HU_REFRESH_STALE" ]; then
+        HU_HEAL_NOTE="$HU_HEAL_NOTE
+NOT HEALED: the refresh record says relation=behind but it is ${rel_age:+older than ${HU_REFRESH_STALE}s}${rel_age:-unreadable} — a recorded relation is not a live state, so no pin advance was run on it; re-read with 'harness status' after the controller refreshes"
+        return 0
+      fi
+      log_line "heal: the pin is BEHIND $REF — re-pinning (harness-refresh advances the pin and kills nothing, #2278)"
+      if hu_start_refresh; then HU_HEAL_NOTE="$HU_HEAL_NOTE
+HEAL: re-pinned a stale harness (relation was behind)"
+      else HU_HEAL_NOTE="$HU_HEAL_NOTE
+HEAL FAILED: the pin is still behind (see above)"; fi ;;
+    restart-pending)
+      # ⛔ A RECORDED RELATION IS NOT A LIVE STATE (measured on this cell 2026-10-22): the record said
+      # `restart-pending` while NO controller was running at all, so the remedy it printed (drop the
+      # running controller) pointed at a process that did not exist. The recorded relation describes the
+      # last controller that wrote it; whether a restart is pending is only meaningful when one is
+      # RUNNING, and the live answer to that is the loop row.
+      case "$(hu_row_state loop)" in
+        OK*) HU_HEAL_NOTE="$HU_HEAL_NOTE
+NOT HEALED: the pin is AHEAD of the running tree (restart-pending) — closing it requires dropping the running controller; run 'harness-down' then 'harness-up', deliberately" ;;
+        # ⛔ THE ROWS ARE THE PRE-HEAL SET, so "nothing is running" may already be false BY THIS PASS's
+        # OWN ACTION: if the MISSING arm above started a controller, the pending restart was closed by
+        # that start, and repeating "no controller is running now" would contradict the note printed a
+        # few lines earlier — the "a recorded relation is not a live state" inversion this block exists
+        # to close, re-introduced by reading a stale row set.
+        *)   if [ "$started" -eq 1 ]; then HU_HEAL_NOTE="$HU_HEAL_NOTE
+STALE RECORD CLEARED: relation=restart-pending described the controller that had STOPPED; this pass started one, so the pending restart is closed by that start (re-read the table above for the live row)"
+             else HU_HEAL_NOTE="$HU_HEAL_NOTE
+STALE RECORD: relation=restart-pending describes the LAST controller, and no controller is running now — the loop row is the live answer"; fi ;;
+      esac ;;
+  esac
+  HU_HEAL_NOTE="$(printf '%s' "$HU_HEAL_NOTE" | sed '/^$/d')"
+  return 0
+}
+
+# The state text of one collected row (`hu_row` wrote NAME|PID|AGE|STATE).
+hu_row_state() { printf '%s' "$HU_ROWS" | awk -F'|' -v n="${1:-}" '$1==n {print $4; exit}'; }
+
 
 # The divergence row delegates to the ONE instrument that owns that question (agent-infra#1745's
 # check-deployed-drift.sh). This file never grows a second copy of it.
@@ -1517,7 +2058,7 @@ hu_start_refresh() {
       # The row reads THIS record, and until now only `orch-loop.sh` wrote it — so a box whose controller
       # had not completed a cycle yet reported "refresh: never ran" seconds after `up` had run it.
       hu_write_refresh_record "$rc" "$rel" "$log"
-      say "refresh: ok (relation=${rel:-current})"; return 0 ;;
+      log_line "refresh: ok (relation=${rel:-current})"; return 0 ;;
     # ⛔ 25 IS TRUTH, NOT A FAILURE — but it must be SAID, not swallowed: this box is on the ref's
     # line and OLDER, and has no materialiser, so the pin did not advance. Starting is still allowed
     # (the deployed $O may be legitimately operator-synced) and the verdict carries it.
@@ -1564,7 +2105,7 @@ hu_start_claims() {
   printf 'claims=%s repo=%s origin=%s at=%s\n' "$verdict" "$REPO" "$(hu_origin "$REPO")" "$(date +%s)" \
     > "$O/state/harness-claims" 2>/dev/null \
     || { warn "claims: $O/state is not writable — the probe cannot be recorded"; return 1; }
-  say "claims: ok (refs/claims $verdict)"
+  log_line "claims: ok (refs/claims $verdict)"
   return 0
 }
 
@@ -1607,7 +2148,7 @@ hu_start_loop() {
       # paths for the SAME deployment. Comparing against `$HARNESS` alone reported a healthy Mac's
       # second `up` as a failed start — the exact defect this arm removes (measured in review).
       if [ -n "$path" ] && { [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$HARNESS")" ] || [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$O")" ]; }; then
-        say "loop: ALREADY UP (pid $pid executing $path) — left alone: one controller per state dir, and a healthy one is never cycled (that would drop in-flight lanes)"
+        log_line "loop: ALREADY UP (pid $pid executing $path) — left alone: one controller per state dir, and a healthy one is never cycled (that would drop in-flight lanes)"
         return 0
       fi
       # ⛔ AN UNREADABLE PATH IS NOT A FOREIGN ONE (review round 5). `[ -n "$path" ]` being false is
@@ -1647,7 +2188,7 @@ hu_start_loop() {
   # CALLER, so the caller pins it.
   ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/loop.log" | tail -n 40
-  if [ "$rc" -eq 0 ]; then say "loop: ok"; return 0; fi
+  if [ "$rc" -eq 0 ]; then log_line "loop: ok"; return 0; fi
   warn "loop: start failed ($(hu_bound_explain "$rc" "$BOUND")) — see the output above"
   return 1
 }
@@ -1656,15 +2197,15 @@ hu_start_loop() {
 # only calls the supervisor directly when the session is genuinely absent.
 hu_start_supervisor() {
   local sess="${SESSION:-orch}" rc
-  if [ "$PLATFORM" != "cell" ]; then say "supervisor: SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 0; fi
-  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then say "supervisor: ok (session '$sess' is up)"; return 0; fi
+  if [ "$PLATFORM" != "cell" ]; then log_line "supervisor: SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 0; fi
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then log_line "supervisor: ok (session '$sess' is up)"; return 0; fi
   [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] || { warn "supervisor: no cloud-cell-supervisor.sh beside $SELF, and no session '$sess'"; return 1; }
   # ⛔ same inheritance fence as the loop arm above (review P2 round 17, #2402): inside a service-managed
   # controller's tree, an inherited `ORCH_FOREGROUND=1` would re-parent the controller into THIS shell.
   ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" start >"$HU_TMP/sup.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/sup.log" | tail -n 30
   [ "$rc" -eq 0 ] || { warn "supervisor: start failed ($(hu_bound_explain "$rc" "$BOUND"))"; return 1; }
-  say "supervisor: ok"; return 0
+  log_line "supervisor: ok"; return 0
 }
 
 hu_start_component() { # <name>
@@ -1688,32 +2229,32 @@ cmd_up() {
   # work repo are INHERITED ones (a shell export, the config file) — and an inherited value that is
   # valid-but-unintended is accepted silently. Naming its source is what makes that visible on the
   # screen instead of implied by a path the reader must recognise.
-  say "==> harness-up ($PLATFORM) — repo $REPO (${REPO_SRC:-fallback: the harness checkout}), harness repo $HREPO, ref $REF"
-  say "    state dir : $O"
-  say "    harness   : $HARNESS (from $HARNESS_SRC)"
+  log_line "==> harness-up ($PLATFORM) — repo $REPO (${REPO_SRC:-fallback: the harness checkout}), harness repo $HREPO, ref $REF"
+  log_line "    state dir : $O"
+  log_line "    harness   : $HARNESS (from $HARNESS_SRC)"
 
-  say ""
-  say "==> 1/4 the pin, and whether it is the dir the controller READS"
+  log_line ""
+  log_line "==> 1/4 the pin, and whether it is the dir the controller READS"
   hu_verify_pin; pin_rc=$?
   case "$pin_rc" in
     0|4) : ;;
     *) die "REFUSED: the resolved pin is not the tree the controller would read (see pin: above). Nothing was started." 3 ;;
   esac
 
-  say ""
-  say "==> 2/4 capacity: what THIS box may carry, measured now (never a fixed cap)"
+  log_line ""
+  log_line "==> 2/4 capacity: what THIS box may carry, measured now (never a fixed cap)"
   cap="$(hu_capacity 2>&1)"; cap_rc=$?
   if [ "$cap_rc" -ne 0 ]; then
     # ⛔ A FIXED CAP IS NOT A FALLBACK. When the box cannot be MEASURED the decision refuses, and so
     # does the start: launching a controller whose capacity nobody could read is the "looks up" state
     # this whole surface exists against (cannot-verify is never a pass).
-    say "    $(printf '%s' "$cap" | head -1)"
+    log_line "    $(printf '%s' "$cap" | head -1)"
     die "REFUSED: this box's capacity could not be MEASURED (above), and a fixed lane cap is not a measurement. Nothing was started." 3
   fi
-  say "    $(printf '%s' "$cap" | sed -n 's/^capacity //p')"
+  log_line "    $(printf '%s' "$cap" | sed -n 's/^capacity //p')"
   cap_lanes="$(printf '%s' "$cap" | sed -n 's/.*[[:space:]]lanes=\([0-9]*\).*/\1/p' | head -1)"
   cap_fixed="$(printf '%s' "$cap" | sed -n 's/.*[[:space:]]fixed_ignored=\([^ ]*\).*/\1/p' | head -1)"
-  say "    this box may carry ${cap_lanes:-?} lane(s) at the load and disk it just reported"
+  log_line "    this box may carry ${cap_lanes:-?} lane(s) at the load and disk it just reported"
   # ⛔ REPORTED, NEVER USED. An operator (or a plist) may still carry a fixed `max_lanes`; saying so is
   # the difference between "the number I read" and "the number I was told", and only the first may
   # decide placement.
@@ -1721,8 +2262,8 @@ cmd_up() {
     warn "capacity: a FIXED lane cap is configured ($cap_fixed) — IGNORED as a ceiling: the ceiling here is load and disk, measured, and a constant cannot be a measurement"
   fi
 
-  say ""
-  say "==> 3/4 self-tests (a failure here refuses the start)"
+  log_line ""
+  log_line "==> 3/4 self-tests (a failure here refuses the start)"
   if [ "$SELFTEST" -eq 1 ]; then
     hu_run_selftests || die "REFUSED: a self-test failed (named above). Nothing was started — a red tree must not be started by the thing that is supposed to notice." 3
   else
@@ -1730,30 +2271,43 @@ cmd_up() {
     warn "⛔ SELFTESTS SKIPPED BY REQUEST (--skip-selftest) — nothing verified this tree before the start"
   fi
 
-  say ""
-  say "==> 4/4 components, in dependency order: $HU_COMPONENTS"
+  log_line ""
+  log_line "==> roles: preflight + install (refuse before writing; idempotent)"
+  if hr_available; then
+    hr_install_roster || die "REFUSED: a role this box is configured to run could not be installed (named above) — nothing was started" 3
+  else
+    hr_missing_note
+  fi
+
+  log_line ""
+  log_line "==> 4/4 components, in dependency order: $HU_COMPONENTS"
   for c in $HU_COMPONENTS; do
     # ⛔ `down` must not be undone by a partial `up`: each step is attempted, a failure stops the
     # walk (a later component depends on the earlier one), and everything already up is left up.
-    if ! hu_start_component "$c"; then bad=1; say "    $c: FAILED — stopping the walk here (later components depend on it)"; break; fi
+    if ! hu_start_component "$c"; then bad=1; log_line "    $c: FAILED — stopping the walk here (later components depend on it)"; break; fi
   done
 
-  say ""
+  log_line ""
   [ "$bad" -eq 0 ] || die "started with failures — see the component lines above; nothing already up was stopped" 1
   # ⛔ RE-VERIFY THE PIN AFTER the components are up. A `restart-pending` above is closed by the start
   # materialising the pin; if it did not, the box is running code the pin does not name and saying
   # "up" would be the false success this whole check exists against.
   if [ "${HU_PIN_PENDING:-0}" = 1 ]; then
-    say ""
-    say "==> post-start pin check (the pin advanced before this launch)"
+    log_line ""
+    log_line "==> post-start pin check (the pin advanced before this launch)"
     hu_verify_pin 1 || die "DEGRADED: the pin still does not name the tree this box reads after the start — re-run after '$0 up', or check the materialiser" 1
   fi
-  cmd_status
+  # ⛔ NO HEAL HERE: this start just brought every component up, so a heal pass could only re-invoke the
+  # authority that just answered — and a second `start` is exactly the duplicate this file refuses.
+  local _heal="$HEAL"; HEAL=0
+  cmd_status; local _rc=$?
+  HEAL="$_heal"
+  return "$_rc"
 }
 
 cmd_down() {
   local rc=0
-  say "==> harness-down ($PLATFORM) — stopping via the platform authority"
+  log_line "==> harness-down ($PLATFORM) — stopping via the platform authority"
   if [ -f "$SELF_PATH/orchestrator-bringup.sh" ]; then
     hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" stop || rc=$?
   else
@@ -1761,47 +2315,172 @@ cmd_down() {
     [ "$PLATFORM" = cell ] && [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] && { hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" stop || rc=$?; } || rc=1
   fi
   [ "$rc" -eq 0 ] || die "stop reported a problem (exit $rc) — read the output above" "$rc"
-  say "down: ok"
+  log_line "down: ok"
+  return 0
+}
+
+# ══ THE ROLE REGISTRY — installed, measured, healed, dispatched from HERE ═════════════════════════
+# WHY (the owner's night, 2026-10-25): every piece of the harness existed and each looked fine, and
+# three silent failures followed — the merge role was INSTALLED AND NEVER STARTED; a unit pointed at a
+# `/tmp` cwd DIED EVERY TEN MINUTES for as long as a reclaim stood; and `status` read "installed" as
+# if it were "ok" on three components that were dead. The five roles, their units on each platform,
+# and their MEASURED-state readers live in ONE file (`harness-roles.sh`), sourced here, so this stays
+# the entry point and there is still exactly one role registry.
+# ⛔ RESOLUTION ORDER = WHERE THE BOX ACTUALLY RUNS, first: the harness the controller executes
+# (`$HARNESS`), then the checkout beside this launcher, then `$O`. A cell runs the FARMED copy; reading
+# the checkout's instead would measure (and install) a tree the box does not run.
+# ⛔ AN ABSENT MODULE IS REPORTED, NEVER SILENTLY DEGRADED. A pre-registry `$O` (the state every
+# deployed box is in until it is re-seeded) prints one named line telling the operator to re-seed, and
+# nothing else changes — the verbs that need the registry refuse by name rather than pretending.
+HARNESS_UP_OS="${HARNESS_UP_OS:-$(hp_os)}"
+HR_MOD=""
+for _hr_d in "$HARNESS" "$SELF_PATH/orchestrator-harness" "$O"; do
+  [ -n "$_hr_d" ] || continue
+  [ -f "$_hr_d/harness-roles.sh" ] && { HR_MOD="$_hr_d/harness-roles.sh"; break; }
+done
+if [ -n "$HR_MOD" ]; then
+  # shellcheck source=/dev/null
+  . "$HR_MOD"
+fi
+declare -f hr_status >/dev/null 2>&1 || HR_MOD=""
+
+hr_available() { [ -n "${HR_MOD:-}" ]; }
+hr_missing_note() {
+  log_line "roles: SKIPPED (no harness-roles.sh in \$HARNESS, beside this launcher, or \$O — the ROLE registry is what installs, measures and heals them; re-seed with: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
+}
+hr_need() { # <verb>
+  hr_available && return 0
+  hr_missing_note
+  die "'$1' needs the role registry (harness-roles.sh) and it is not on this box — refusing rather than answering nothing" 2
+}
+
+# _hr_status_verb — the READ-ONLY role table (`roles`). `status` prints the same table and also heals,
+# which is why this verb exists separately: `harness-status` promises a read.
+_hr_status_verb() {
+  hr_need roles
+  log_line "roles (measured — a unit file is never evidence that a role runs; config: $(hr_roles))"
+  hr_status
+  return $?
+}
+
+_hr_logs_verb() { # <role> [n]
+  hr_need logs
+  hr_role_known "${1:-}" || die "logs: unknown role '${1:-}' (known: $(hr_all_roles))" 2
+  hr_logs "$1" "${2:-40}"
+  return $?
+}
+
+_hr_dispatch_verb() { # <role> [args…]
+  hr_need dispatch
+  hr_dispatch "$@"
+}
+
+# cmd_heal — re-drive what is dead. ⛔ THE EXIT CODE IS THE RE-READ, never the repair's: a start that
+# returned 0 and left the role dead is exactly the class this verb exists to end.
+cmd_heal() {
+  local rrc=0 hr_rc=0
+  hu_collect_rows
+  hu_heal
+  if [ -n "${HU_HEAL_NOTE:-}" ]; then
+    log_line ""
+    printf '%s\n' "$HU_HEAL_NOTE" | sed 's/^/    /'
+    case "$HU_HEAL_NOTE" in *"HEAL FAILED"*|*"NOT HEALED"*) hr_rc=1 ;; esac
+  fi
+  log_line ""
+  if hr_available; then
+    log_line "roles: re-driving what is dead (config: $(hr_roles))"
+    hr_heal || rrc=1
+  else
+    hr_missing_note
+  fi
+  log_line ""
+  if [ "$rrc" -eq 0 ] && [ "$hr_rc" -eq 0 ]; then
+    log_line "HEAL: every configured role is running, or is not applicable on this box"
+    return 0
+  fi
+  log_line "HEAL INCOMPLETE — see NOT HEALED above; this exit is not a pass"
+  return 1
+}
+
+# ONE row pass. ⛔ NOT IN A COMMAND SUBSTITUTION: every `hu_row*` appends to `$HU_ROWS`, so
+# `HU_ROWS="$(hu_collect_rows)"` would drop every row into a subshell that ends immediately — the
+# table would print while the verdict was lost (the class this file's own `lo_select` comment names).
+ROW_VERDICT=0
+_hu_take() { # <rc>
+  case "${1:-0}" in
+    2) ROW_VERDICT=2 ;;
+    1) [ "$ROW_VERDICT" -lt 2 ] && ROW_VERDICT=1 ;;
+  esac
+}
+hu_collect_rows() {
+  local rc
+  HU_ROWS=""; ROW_VERDICT=0
+  # ── THE BRIEF'S FIVE QUESTIONS, IN ITS OWN ORDER ──────────────────────────────────────────────
+  # 1 which sha is EXECUTING (not which is pinned); 2 is the loop alive; 3 is PLACEMENT healthy
+  # (fork headroom → disk → load); 4 how many lanes and are they advancing; and the fifth — what it
+  # would do next — is a row too, because prose beside the table is the thing operators stop reading.
+  # ⛔ THE BOX ROW FIRST (from main): it says WHICH machine this answer is about and which PIN it is on.
+  # A box with no pin is DEGRADED, so its verdict joins the same ONE verdict line as every other row.
+  hu_row_box;        rc=$?; _hu_take "$rc"
+  hu_row_exec;       rc=$?; _hu_take "$rc"
+  hu_row_loop;       rc=$?; _hu_take "$rc"
+  hu_row_capacity;   rc=$?; _hu_take "$rc"
+  hu_row_lanes;      rc=$?; _hu_take "$rc"
+  hu_row_selftest;   rc=$?; _hu_take "$rc"
+  hu_row_next;       rc=$?; _hu_take "$rc"
+  hu_row_launchd;    rc=$?; _hu_take "$rc"
+  hu_row_refresh;    rc=$?; _hu_take "$rc"
+  hu_row_claims;     rc=$?; _hu_take "$rc"
+  hu_row_supervisor; rc=$?; _hu_take "$rc"
+  hu_verify_pin >"$HU_TMP/pin.txt" 2>&1; rc=$?
+  case "$rc" in 1) [ "$ROW_VERDICT" -lt 1 ] && ROW_VERDICT=1 ;; 2) ROW_VERDICT=2 ;; esac
+  hu_row_drift
+  rc=$?; _hu_take "$rc"
   return 0
 }
 
 cmd_status() {
-  local verdict=0 rc line name pid age state
-  HU_ROWS=""
-  # The BOX row first: it is the row that says WHICH machine this answer is about, and (on every
-  # platform now, the Mac included) which pin it is on. It is a row and not a verdict, but a box with no
-  # pin is DEGRADED — an unnamed harness is the state this whole screen exists to make visible.
-  hu_row_box;       rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  hu_row_loop;      rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  # ⛔ THE EXEC ROW IS THE ANSWER TO "what is running vs what the pin says", and it is a row (not prose)
-  # so its verdict reaches the ONE verdict line like every other component's.
-  hu_row_exec;      rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  hu_row_launchd;   rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  hu_row_refresh;   rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  hu_row_claims;    rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  hu_row_capacity;  rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  hu_row_supervisor; rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
-  hu_verify_pin >"$HU_TMP/pin.txt" 2>&1; rc=$?
+  local healed=0
+  hu_collect_rows
+  # ⛔ SELF-TEST AND SELF-HEAL ARE PART OF STATUS, NOT A SEPARATE CEREMONY (the brief: status must
+  # notice and heal). Healing runs only on the arms `hu_heal` documents as non-destructive, then the
+  # rows are RE-READ so the table an operator reads is the POST-heal state — a table showing the
+  # pre-heal state beside a "healed" line would make the reader doubt the one thing that worked.
+  if [ "$HEAL" -eq 1 ]; then
+    hu_heal
+    if [ -n "$HU_HEAL_NOTE" ]; then healed=1; hu_collect_rows; fi
+  fi
   sed 's/^/    /' "$HU_TMP/pin.txt"
-  case "$rc" in 1) [ "$verdict" -lt 1 ] && verdict=1 ;; 2) verdict=2 ;; esac
-  hu_row_drift
-  rc=$?
-  case "$rc" in 1) [ "$verdict" -lt 1 ] && verdict=1 ;; *)
-    # A non-zero, non-1 drift status is CANNOT-VERIFY (hu_row_drift already maps it to 2).
-    [ "$rc" -ne 0 ] && verdict=2 ;;
-  esac
-
-  say ""
+  log_line ""
   if [ "$PLAIN" -eq 0 ]; then printf '%-12s %-10s %-6s %s\n' COMPONENT PID AGE STATE; fi
   printf '%s' "$HU_ROWS" | while IFS='|' read -r name pid age state; do
     [ -n "$name" ] || continue
     printf '%-12s %-10s %-6s %s\n' "$name" "${pid:--}" "${age:--}" "$state"
   done
-  say ""
-  case "$verdict" in
-    0) say "VERDICT: HEALTHY";  return 0 ;;
-    1) say "VERDICT: DEGRADED — a component is late/absent or the deployed tree has diverged; see the rows above"; return 1 ;;
-    *) say "VERDICT: BROKEN — something could not be verified, and cannot-verify is never a pass; see the rows above"; return 2 ;;
+  if [ "$healed" -eq 1 ]; then
+    log_line ""
+    printf '%s\n' "$HU_HEAL_NOTE" | sed 's/^/    /'
+  fi
+  # ── THE ROLE TABLE (the roles the box is configured to run), MEASURED ────────────────────────
+  # ⛔ WHY THIS IS A SECOND TABLE AND NOT ONE MORE ROW. The rows above answer "is the harness
+  # dispatching, on which tree, with how much capacity". They cannot answer "would this box ever RUN
+  # the merge/apply/watchdog roles at all": a role with NO unit is invisible to every row, which is how
+  # three components read installed and were dead. This table answers that, from each role's OWN
+  # artefact, and its verdict is folded into the ONE verdict line rather than printed as a second one.
+  # A SKIPPED role (no unit on this platform) is a PASS with a reason — never OK.
+  log_line ""
+  if hr_available; then
+    log_line "roles (config: $(hr_roles)):"
+    hr_status; _role_rc=$?
+    _hu_take "$_role_rc"
+  else
+    hr_missing_note
+  fi
+  log_line ""
+  case "$ROW_VERDICT" in
+    0) log_line "VERDICT: HEALTHY";  return 0 ;;
+    1) log_line "VERDICT: DEGRADED — a component is late/absent or the deployed tree has diverged; see the rows above"; return 1 ;;
+    *) log_line "VERDICT: BROKEN — something could not be verified, and cannot-verify is never a pass; see the rows above"; return 2 ;;
   esac
 }
 
@@ -1817,8 +2496,12 @@ if [ -n "$HREPO_BAD" ] && [ "$VERB" != up ]; then
   warn "$HREPO_BAD — continuing, because '$VERB' reads no harness (a box with an unresolvable harness must still be stoppable)"
 fi
 case "$VERB" in
-  up)     cmd_up ;;
-  down)   cmd_down ;;
-  status) cmd_status ;;
-  *)      die "unknown verb '$VERB'" ;;
+  up)       cmd_up ;;
+  down)     cmd_down ;;
+  status)   cmd_status ;;
+  roles)    _hr_status_verb ;;
+  heal)     cmd_heal ;;
+  logs)     _hr_logs_verb "$A_ROLE" ;;
+  dispatch) _hr_dispatch_verb "$A_ROLE" $REST_ARGS ;;
+  *)        die "unknown verb '$VERB'" ;;
 esac
