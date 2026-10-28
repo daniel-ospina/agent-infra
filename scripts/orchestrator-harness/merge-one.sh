@@ -1017,16 +1017,54 @@ case "$LAST" in
       echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2
     fi
     # ── 2) record the review (writes the signed marker into the PR body) ──
-    "$RECORDER" "$PR" "$HEAD" clean "$OR" --evidence "comment:$CID" >> "$L.log" 2>&1
+    # ⛔ #2572 — PIN THE RECORD TO THE HEAD THE REVIEWER READ. The `--expect-head` pin is the
+    # recorder's only defence against its #2982 carry arm re-binding a `clean` to the LIVE head when
+    # the reviewed diff happens to be unchanged (tortoise#9492). This lane pays for a review of `$HEAD`
+    # (up to REVIEW_TIMEOUT, PAID) and every check above is a statement about `$HEAD`; without the pin
+    # the one call that MINTS the record could attest a different revision than the one that was read.
+    # `$HEAD` is already required to be a full 40-hex sha before the paid step (the #1717 guard above),
+    # so the pin is always STATABLE here; the recorder itself fails closed (exit 3) when it cannot
+    # CHECK the pin, so an unverifiable pin can never record.
+    REC_OUT="$(mktemp "${TMPDIR:-/tmp}/merge-$PR-record.XXXXXX" 2>/dev/null || true)"
+    [ -n "$REC_OUT" ] || REC_OUT=/dev/null
+    # ⛔ THE FALLBACK ABOVE MAY ALIAS A REAL DEVICE, so every removal goes through ONE guarded point.
+    # An unguarded `rm -f "/dev/null"` is reachable here (mktemp fails on a full/unwritable TMPDIR and
+    # REC_OUT becomes the sentinel) and as root it DELETES THE DEVICE NODE — measured on Linux — leaving
+    # the cell running with no /dev/null; unprivileged it degrades to an unsilenced permission error on
+    # the controller's stderr. This is the defect class scripts/orchestrator-harness/refresh-candidates.sh
+    # already records for its own sentinel ("an unguarded `rm -f` on an exit path then deletes THE DEVICE
+    # NODE (silently refused for an unprivileged user, destructive for root)"), and cells commonly run
+    # as root, so the guard lives in the helper rather than at each of the three call sites.
+    rec_out_cleanup() {
+      case "${REC_OUT:-}" in '' | /dev/null) return 0 ;; esac
+      rm -f "$REC_OUT" 2>/dev/null || true
+    }
+    "$RECORDER" "$PR" "$HEAD" clean "$OR" --evidence "comment:$CID" --expect-head "$HEAD" >"$REC_OUT" 2>&1
     rc=$?
+    cat "$REC_OUT" >> "$L.log" 2>/dev/null || true
     echo "[merge $PR] record-review rc=$rc" >> "$L.log"
     if [ $rc -ne 0 ]; then
+      # ⛔ THE PIN'S REFUSAL IS ITS OWN NAMED FAILURE (#2572), read from THIS call's output only —
+      # grepping `$L.log` would match a pin refusal from an EARLIER cycle and reclassify this one.
+      # rc=3 with the pin named means the PR head moved inside the window between the review and the
+      # record: the verdict is intact and its subject moved, so the parking reason must say that a
+      # fresh review is owed. Advising a hand re-record (the generic rc!=0 wording below) would tell
+      # the operator to carry a stale verdict onto a head nobody read — the exact failure being fixed.
+      if [ $rc -eq 3 ] && grep -q -- '--expect-head' "$REC_OUT" 2>/dev/null; then
+        rec_out_cleanup
+        park "the PR head MOVED between the review and the record at head=$HEAD — record-review.sh REFUSED the --expect-head pin (rc=3) rather than attest a head the reviewer never read; its refusal in the log names both shas. The review artifact exists for the REVIEWED head only, so a FRESH review at the new head is owed (a hand re-record would carry a stale verdict)."
+        echo "[merge $PR] ABORT: head moved before the record — refusing to bind a stale verdict" >> "$L.log"; exit 3
+      fi
+      rec_out_cleanup
       # No signed marker exists, so the gate cannot pass and the PR cannot merge. The pre-fix
       # `exit 3` left no marker at ALL, so the next cycle saw an unmarked FAILED:ai-review-gate and
       # spawned another fresh (paid) review — forever (#1717). Park, and name the failing rc.
       park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
       echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3
     fi
+    # the recorder's output is already in `$L.log`; the temp file is only here so THIS call's
+    # refusal can be classified without a stale match from an earlier cycle.
+    rec_out_cleanup
     # ⛔ `rc=0` IS NOT PROOF THE SIGNED MARKER REACHED THE PR BODY (#1717, fail-open).
     # record-review.sh posts the marker into the PR body BEST-EFFORT and never fails the record, so
     # it has reachable rc=0 paths with NO post at all: the body GET failed ("evidence post skipped;

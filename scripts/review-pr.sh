@@ -2356,11 +2356,37 @@ if [ ! -d "$RUN_DIR" ]; then
   err "review-pr: the run directory VANISHED mid-run ($RUN_DIR) — recreating it to capture the recorder's output. This is a defence, not an explanation; the review and the comment are unaffected."
   mkdir -p "$RUN_DIR" 2>/dev/null || true
 fi
-"$RECORDER" "$PR" "$HEAD" clean "$REPO" --evidence "comment:$CID" >"$RUN_DIR/record.out" 2>&1
+# ⛔ #2572 — THE RECORD IS PINNED TO THE HEAD THAT WAS REVIEWED, NOT TO WHATEVER HEAD THE PR IS AT.
+# `--expect-head` is the recorder's ONLY defence against its #2982 carry arm re-pointing a record at
+# a live head this run did not review: given a positional sha and a live head that differ, the carry
+# arm re-binds the verdict to the LIVE head whenever the reviewed DIFF is unchanged — a true statement
+# about the PR head, and NOT an answer to "record this sha" (tortoise#9492). Every check above this
+# line (the §G post-review head re-read included) is a statement about `$HEAD`; without the pin the
+# one call that MINTS the record is free to attest a different revision, so the seam's advertised
+# guarantee ("bound to the head it actually reviewed") held everywhere except at the chokepoint.
+# ⛔ HONEST SCOPE, the same shape as the repo-conflict branch in read_meta: `$HEAD` is validated as
+# full 40-hex at the META read, so on today's code this guard cannot fire. It stays because it IS the
+# executable statement of the invariant the pin depends on — a pin can only be STATED for a sha, and
+# a future loosening of that validation must fail HERE (nothing recorded) rather than mint a record
+# with an unstated pin. This is the fail-closed arm for "the head cannot be pinned", not decoration.
+if ! [[ "${HEAD:-}" =~ ^[0-9a-f]{40}$ ]]; then
+  die "$E_RECORD" "the reviewed head '${HEAD:-<empty>}' is not a full 40-hex sha, so --expect-head cannot be stated — refusing to call the recorder UNPINNED: a record minted here binds to whatever head the PR happens to be at (#2572), which is not the revision this run reviewed. NOTHING was recorded; the review comment (comment:$CID) is an artifact for the reviewed head only."
+fi
+"$RECORDER" "$PR" "$HEAD" clean "$REPO" --evidence "comment:$CID" --expect-head "$HEAD" >"$RUN_DIR/record.out" 2>&1
 REC_RC=$?
 sed 's/^/    /' "$RUN_DIR/record.out" >&2 || true
-[ "$REC_RC" -eq 0 ] \
-  || die "$E_RECORD" "record-review.sh FAILED rc=$REC_RC at head ${HEAD:0:12}… — no record was minted, so check (c) stays red. Its output is above; the review comment (comment:$CID) stands and can be recorded by hand once the cause is fixed."
+if [ "$REC_RC" -ne 0 ]; then
+  # ⛔ THE PIN'S REFUSAL IS ITS OWN NAMED FAILURE (#2572), not a generic recorder fault. The recorder
+  # exits 3 when the PR head is not the sha this run reviewed — i.e. the head moved inside the window
+  # between the §G re-read and the record — and its stderr (copied above) names BOTH shas. Folding
+  # that into "record-review.sh FAILED rc=3" would send the operator hunting for a recorder bug while
+  # the actionable fact is that the REVIEWED REVISION IS STALE: the verdict is intact, its subject
+  # moved, so the record that was refused is the only record that would have been honest.
+  if [ "$REC_RC" -eq 3 ] && grep -q -- '--expect-head' "$RUN_DIR/record.out" 2>/dev/null; then
+    die "$E_RECORD" "the PR head MOVED between the review and the record: the recorder REFUSED the --expect-head pin (rc=3) rather than bind this clean verdict to ${HEAD:0:12}…, and its refusal above names both shas. NOTHING was recorded — a record minted now would attest the live head, which this run did not review. Re-run this command at the new head: a fresh review is owed, not a carry."
+  fi
+  die "$E_RECORD" "record-review.sh FAILED rc=$REC_RC at head ${HEAD:0:12}… — no record was minted, so check (c) stays red. Its output is above; the review comment (comment:$CID) stands and can be recorded by hand once the cause is fixed."
+fi
 
 # rc=0 is NOT proof the artifact landed (merge-one.sh's #1717 rule: the recorder has
 # reachable rc=0 paths where the PR-body marker was never posted).
