@@ -378,6 +378,211 @@ controller_identity() { # sets CTRL_HEAD/CTRL_TREE from the LIVE controller. rc 
 #               difference is `restart-pending`, not a reason to redeploy what is already deployed.
 RUNNING="$(git -C "$SELF" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
 RUNNING_FROM="self:$SELF"
+# ── RUNNING when the script's own directory is not a checkout — the CELL shape (#2641) ────────
+# ⛔ MEASURED 2026-10-24, twelve minutes after a CORRECT activation of pi-cell-3: the pin, the seeded
+# `$O` and the running controller were all `848ba4b133a7`, and the record still said
+# `relation=restart-pending running=848ba4b133a7 …` — because `$SELF` is `$O` (orch-loop.sh prefers
+# `$O/harness-refresh.sh`), a cell's `$O` is a FLAT SEED with no git identity, so `self:` can never
+# resolve there, the stamp fallback answers instead, and the `stamp:*` arm below then downgrades
+# `current` to `restart-pending` on EVERY live cycle. Permanent `restart-pending` is the always-on
+# alarm shape: a token that is never absent is a token nobody reads, and the one record that answers
+# "is this box on the deployed commit?" could never say yes on any cell.
+# ⛔ THE IDENTITY IS AVAILABLE AND AUTHORITATIVE. `$O/.orch.lock` names the pid that OWNS this state
+# dir — the same ownership record the `CONTROLLER_LIVE` read below already trusts and the
+# supervisor's own controller census uses — and THAT process's argv names the tree it executes. So the
+# read is one pid, not a scan of the box's process table: there is nothing to disambiguate and nothing
+# else on the box can answer for it.
+# ⛔ MATCH THE INVOCATION, NEVER A MENTION OF A PATH — the rule this repo settled twice already
+# (`cloud-cell-supervisor.sh`'s `_controller_ps_awk`: "Match the INVOCATION, not the string … a
+# `bash -c` whose script text mentions the path"; `check-deployed-drift.sh`: the shell in `t[1]`, the
+# path in `t[2]`). So the path must be the SCRIPT OPERAND (argv[1]) of a shell: `orch-loop.sh` takes no
+# arguments, so `<shell> <path>` is the whole of a controller's invocation. A `sed`/`tail`/`diff` that
+# merely READS the new tree must not resolve RUNNING — that reports `current` for a controller still
+# executing the old tree (the exact false PASS this file exists to end).
+# ⛔ WHICH TREES MAY ANSWER comes from the fleet's own records, not from a new knob: the per-commit
+# child under `HARNESS_PIN_DIR` (what `apply` creates), `HARNESS_PIN_DIR` ITSELF (a legacy flat pin,
+# where the ROOT is the worktree), and the tree `HARNESS_PIN_FILE` names — the only record that can
+# name a READ dir OUTSIDE the pin root (the #2216 shape `check-deployed-drift.sh` documents). A tree
+# outside every recorded root is a PEER repo's controller and must never answer for this box; without
+# the pin file and flat-pin arms, a box on either would keep the permanent `restart-pending` this stage
+# exists to remove.
+# ⛔ It does NOT require `CONTROLLER_LIVE`: that is computed BELOW this block (it exists for the
+# `stamp:*` downgrade), and this stage establishes liveness itself from the lock pid it names.
+#
+# _began_before_lock <lock-file> <pid> — 0 when the process provably began at/before the lock was
+# written. This is the AGE half of the fleet's ONE controller-ownership rule (#1178), carried inline
+# for the same reason `bounded_fetch` is: this file is farmed into `$O`, a flat seed with no
+# `scripts/lib/`, so it cannot source the canonical copies.
+#   canonical: `lock_controller_pid` (`scripts/cloud-cell-supervisor.sh`) and
+#              `service_controller_present` (`scripts/orchestrator-harness/cloud-cell-doctor.sh`)
+# ⛔ `10#`, NOT a bare `$(( ))`: `ps -o etime=` ZERO-PADS its fields and bash reads a leading zero as
+# OCTAL, so `$((08 * 3600))` is an error — the reproduced bug that made every process whose age had an
+# `08`/`09` read as "cannot tell" (#1856 review).
+# ⛔ UNPROVABLE IS NOT OWNED. Here the failing direction is a false `current`, so an age that cannot
+# be read returns 1 and the stage falls through to the stamp path.
+# ⛔ THE SLACK IS THE FLEET'S ONE VALUE, NOT A LITERAL IN THIS FILE (#1856: "one predicate, three
+# answers"). Same value as `scripts/lib/pid-identity.sh`'s `PID_START_SLACK_SECONDS` and
+# `scripts/cloud-cell-supervisor.sh`'s `LOCK_START_SLACK_SECONDS`; `harness-refresh.test.sh`'s A37 pins
+# this copy to the canonical declaration, because a slack only REMEMBERED here goes stale the day the
+# shared default moves — and then accepts a pid that began after the lock as its owner.
+HARNESS_LOCK_START_SLACK_SECONDS="${HARNESS_LOCK_START_SLACK_SECONDS:-5}"
+_began_before_lock() { # <lock-file> <pid>
+  local lf="${1:-}" p="${2:-}" lt se r d h m s
+  [ -n "$lf" ] && [ -n "$p" ] || return 1
+  lt="$(date -r "$lf" +%s 2>/dev/null)" || return 1
+  case "$lt" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ THE `PS_BIN` SEAM IS WHAT MAKES "THE AGE CANNOT BE READ" DRIVABLE. Every other copy of this rule
+  # carries it (`scripts/lib/pid-identity.sh`, `cloud-cell-supervisor.sh`, `cloud-cell-doctor.sh`) and
+  # their suites drive the unreadable-age arm with a shim; a bare `ps` here left the arm that stops a
+  # stale lock from buying `current` DELETABLE with the suite still green (review P1, cycle 5).
+  se="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$se" ] || return 1
+  d=0
+  case "$se" in *-*) d="${se%%-*}"; r="${se#*-}" ;; *) r="$se" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  h=0; m=""; s=""
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  se=$(( $(date +%s) - ( $((10#${d:-0})) * 86400 + $((10#${h:-0})) * 3600 \
+                       + $((10#${m:-0})) * 60 + $((10#${s:-0})) ) ))
+  [ "$se" -le "$(( lt + HARNESS_LOCK_START_SLACK_SECONDS ))" ]
+}
+if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
+  _ctrl_pid=""
+  # ⛔ `-f` FIRST, LIKE THE SIBLING READ AT `CONTROLLER_LIVE` BELOW. `head` on a NON-REGULAR lock — a
+  # FIFO left by a crashed writer, a wedged network mount — BLOCKS ON OPEN, so on a cell (the only shape
+  # this block runs) the refresh and therefore the controller's whole cycle would hang every cycle with
+  # no output. `launchd-cycle.sh` records the same finding for the same read.
+  [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ] && _ctrl_pid="$(head -1 "$O/.orch.lock" 2>/dev/null)"
+  _ctrl_pid="${_ctrl_pid//[!0-9]/}"
+  _ctrl_tree=""
+  # ⛔ SHAPE IS NOT OWNERSHIP — THE AGE IS, and the failure this closes is the false-PASS direction.
+  # `$O/.orch.lock` is DATA ON DISK: it outlives a `kill -9`/OOM/reboot, so the OS can RECYCLE that pid
+  # onto a peer lane's controller — which on a cell is the SAME basename from the SAME shared harness
+  # path, so the argv shape matches perfectly. `lock_controller_pid` carries the age for exactly this
+  # reason ("A controller always writes $LOCK after it starts, so a process that BEGAN after the lock
+  # was written cannot be its owner"); without it a stale lock buys `relation=current`, and it also
+  # feeds the ahead/diverged refusals — while the pre-existing `CONTROLLER_LIVE` use of the same pid
+  # could only ever DOWNGRADE `current`, which is why the same weak evidence was safe there.
+  if [ -n "$_ctrl_pid" ] && kill -0 "$_ctrl_pid" 2>/dev/null \
+     && _began_before_lock "${O:-}/.orch.lock" "$_ctrl_pid"; then
+    # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a tty,
+    # so this read would normally be width-independent — but `ps(1)` checks `COLUMNS` FIRST (FreeBSD/Apple:
+    # "the default output width is that requested by the COLUMNS environment variable if present, else the
+    # line width of the terminal associated to the ps process, if any"). An exported COLUMNS therefore
+    # TRUNCATES the command column, and the path is the LAST token — so `*/orchestrator-harness/orch-loop.sh`
+    # is cut mid-name, no match exists, the stage gives up SILENTLY and #2641's permanent `restart-pending`
+    # is back with the fix looking present. Measured on the cell: `COLUMNS=40 ps -o command= -p $$` → 41
+    # bytes, the same read with `-ww` → the whole 305-byte line. `-ww` is unlimited on procps and
+    # "at least 131 columns" on BSD ps, and `-w` can only WIDEN a read, never narrow one.
+    _argv="$("${PS_BIN:-/bin/ps}" -ww -o command= -p "$_ctrl_pid" 2>/dev/null)"
+    # ⛔ `set -f` AROUND THE TOKEN SPLIT. The split itself is the point (a ps command line is ONE
+    # string), but with globbing ON a `*`/`?` token is expanded against the CWD and can INVENT a word
+    # that was never in argv — a token that then looks like a controller path. A path containing a SPACE
+    # stays unmatched (inherent to the `ps -o command=` form; `lock_controller_pid`'s `set -- $c` carries
+    # the same limitation).
+    case $- in *f*) _glob_had=0 ;; *) _glob_had=1; set -f ;; esac
+    # The tmux launcher's argv QUOTES the script path, so a token is de-quoted before comparison. The
+    # quote characters live in variables, not as `\'` escapes: this file is read by a gate that
+    # dequotes it statically (see #2175), and a backslash-quote in the body changes what that read sees.
+    _sq="'"; _dq='"'
+    # ⛔ POSITIONAL, NEVER "A PATH NEXT TO A SHELL". The rule this block implements — and the one all
+    # three precedents implement — is *the path is the SCRIPT OPERAND of the shell*: argv[0] is the shell
+    # and argv[1] the script it executes (`_controller_ps_awk` compares `tok[1]`/`tok[2]`,
+    # `lock_controller_pid` compares `${1##*/}`/`${2##*/}`, `check-deployed-drift.sh` `t[1]`/`t[2]`).
+    # A predecessor-token test is WEAKER than all three: a wrapper whose ARGUMENTS happen to contain the
+    # words `bash <path>` (`perl -e 'sleep 120' bash <path>`) resolved RUNNING (measured, review cycle
+    # 5) — a `current` for a tree the controller is not executing. So the pair is read at positions 0
+    # and 1 and nowhere else. A controller launched with an interpreter FLAG (`bash -x <path>`) then does
+    # not resolve: cannot-verify, which falls to the stamp — the safe direction. `orch-loop.sh` takes no
+    # arguments, so `<shell> <path>` IS the whole invocation.
+    _pos=0
+    _sh_tok=""
+    _path_tok=""
+    for _w in $_argv; do
+      _w="${_w#$_sq}"; _w="${_w%$_sq}"; _w="${_w#$_dq}"; _w="${_w%$_dq}"
+      case "$_pos" in
+        0) _sh_tok="$_w" ;;
+        1) _path_tok="$_w" ;;
+      esac
+      _pos=$((_pos+1))
+    done
+    if [ "$_glob_had" = 1 ]; then set +f; fi
+    _sh_base="${_sh_tok##*/}"
+    if [ -n "$_sh_base" ] && [ -n "$_path_tok" ]; then
+      case "$_path_tok" in */orchestrator-harness/orch-loop.sh)
+        # A shell, named without a `case` alternation: the same static read treats `|` as a pipeline.
+        case " bash sh dash zsh ksh " in
+          *" $_sh_base "*) _ctrl_tree="${_path_tok%/orchestrator-harness/orch-loop.sh}" ;;
+        esac ;;
+      esac
+    fi
+  fi
+  if [ -n "$_ctrl_tree" ]; then
+    _ok=0
+    # ⛔ `_nl=$'\n'`, NOT `_nl="$(printf '\n')"`: a command substitution STRIPS trailing newlines, so that
+    # form yields the EMPTY string, `_acc` becomes one run-on entry list and the membership test below
+    # degrades from whole-path equality into a SUBSTRING match — a `_ctrl_tree` that is only a textual
+    # suffix of a recorded path would then answer for this box, which is exactly the recorded-root bound
+    # this block exists to enforce (review cycle 7, measured: `_nl` length 0).
+    _nl=$'\n'
+    _acc="${_nl}"
+    [ -n "${HARNESS_PIN_DIR:-}" ] && _acc="${_acc}${HARNESS_PIN_DIR%/}/scripts/orchestrator-harness/orch-loop.sh${_nl}"
+    # ⛔ `-f`, NOT `-r` — THE SAME GATE THE SIBLING READS USE (review cycle 8, P3). `-r` is TRUE for a
+    # FIFO or a character device, and `head` BLOCKS ON OPEN for those: a FIFO left by a crashed writer on
+    # a wedged mount would hang this refresh, and therefore the controller's WHOLE CYCLE, silently every
+    # cycle. This file already reads this exact path with `-f` at the `DEPLOYED` read below (and
+    # `launchd-cycle.sh`/`install.sh` do the same for the same class of file), so `-r` here re-introduced
+    # on the pin file precisely the hang the lock guard above documents. A regular-but-unreadable file
+    # still yields an empty `_pinh` and falls through to the stamp — the safe direction is unchanged.
+    if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -f "$HARNESS_PIN_FILE" ]; then
+      _pinh="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+      case "$_pinh" in
+        */scripts/orchestrator-harness) _acc="${_acc}${_pinh}/orch-loop.sh${_nl}" ;;
+      esac
+    fi
+    case "$_acc" in *"${_nl}${_ctrl_tree}/orchestrator-harness/orch-loop.sh${_nl}"*) _ok=1 ;; esac
+    if [ "$_ok" = 0 ] && [ -n "${HARNESS_PIN_DIR:-}" ]; then
+      case "$_ctrl_tree" in
+        "${HARNESS_PIN_DIR%/}"/*)
+          _rest="${_ctrl_tree#"${HARNESS_PIN_DIR%/}"/}"
+          case "$_rest" in
+            */scripts)
+              _rest="${_rest%/scripts}"
+              case "$_rest" in */*) ;; *) _ok=1 ;; esac ;;
+          esac ;;
+      esac
+    fi
+    if [ "$_ok" = 1 ]; then
+      # ⛔ THE TREE MUST BE ITS OWN TOPLEVEL. `_ctrl_tree` always ends in `/scripts` (the harness lives
+      # at `<tree>/scripts/orchestrator-harness`), so `git -C` on a child that lost its own `.git` would
+      # ASCEND to an enclosing worktree and hand back ITS head — a stale child under a repo pin root
+      # would then report `current` for a tree the controller is not executing. An answer that does not
+      # match the tree the process names is cannot-verify, and falls to the stamp path.
+      #
+      # ⛔ AND THE COMPARISON MUST BE PHYSICAL ON BOTH SIDES. `_ctrl_tree` is the argv token AS WRITTEN
+      # (a symlinked `<cell-home>/harness`, or a doubled separator because the launcher's `TMPDIR` ends
+      # in `/`), while `git rev-parse --show-toplevel` answers with a PHYSICALLY resolved path. Compared
+      # raw, the test is false for every tree whose path traverses a symlink — the stage then gives up
+      # SILENTLY (`RUNNING_FROM` just stays `stamp:`), the `stamp:*` arm below downgrades, and #2641's
+      # permanent `restart-pending` returns on exactly the boxes this change exists to fix. The repo
+      # settled this predicate in a sibling: `cloud-cell-doctor.sh`'s `is_worktree_root` — "`pwd -P`
+      # because git reports a PHYSICAL toplevel, and a symlinked worktree path would otherwise never
+      # compare equal". Witnessed by A36e (a symlinked pin root) as well as by the macOS fixture root,
+      # where `/var` is a symlink into `/private/var`.
+      _want_root="$(cd "${_ctrl_tree%/scripts}" 2>/dev/null && pwd -P)"
+      _top="$(git -C "$_ctrl_tree" rev-parse --show-toplevel 2>/dev/null)"
+      if [ -n "$_want_root" ] && [ -n "$_top" ] && [ "$_top" = "$_want_root" ]; then
+        _run_c="$(git -C "$_ctrl_tree" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
+        if [ -n "$_run_c" ]; then RUNNING="$_run_c"; RUNNING_FROM="proc:$_ctrl_tree"; fi
+      fi
+    fi
+  fi
+fi
 if [ -z "$RUNNING" ]; then
   # ── source 3, the controller's own argv (#2641) — see `controller_identity` above for its bounds.
   # It sits BETWEEN `self:` and `stamp:` on purpose: `self:` is still the strongest evidence where it
@@ -432,7 +637,11 @@ fi
 # this script are excluded by name because both live in $O when it is seeded.
 in_flight_pids() {
   local t
-  t="$(ps -eo pid=,ppid=,command= 2>/dev/null)" || return 1
+  # ⛔ `-ww` FOR THE SAME REASON AS THE `_argv` READ ABOVE (#2926): an ambient `COLUMNS` truncates the
+  # command column, and a LANE whose `$O/<name>.sh` token was cut is read as absent — which is `lanes=0`,
+  # which is what lets `--re-seed` swap `$O` under a running lane. That direction is DESTRUCTIVE, so this
+  # read may not depend on an environment variable. Witnessed by A22b.
+  t="$(ps -eww -o pid=,ppid=,command= 2>/dev/null)" || return 1
   case "$t" in *[![:space:]]*) ;; *) return 1 ;; esac
   printf '%s\n' "$t" | awk -v o="$O/" -v me="$$" '
     {
