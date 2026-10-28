@@ -645,7 +645,12 @@ bash "$brief_gate_sh" --check "$L-fixer.txt" fixer 2>>"$L.log" || {
 # destroy. This script `cd`s into $REPO, so run_agent's default (`$PWD`, the main checkout) would
 # snapshot the wrong tree and report a CLEAN worktree while the fixer's work sat unsaved one
 # directory away — the loud-but-wrong verdict, which is worse than no snapshot at all.
-DISK_GATE_PATH="$WT" WIP_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ AND A BACKSTOP, NOT THE PRIMARY BOUND (agent-infra#2888). `FIX_TIMEOUT` used to default to a
+# flat 2400 s, which `walltime.tsv` shows is the MEDIAN of the `fixer` population (median = p90 =
+# 2400 s): the same censoring as `prfix`, one kind over. The bound that decides wedged-vs-slow is
+# `lane-bound.sh`'s PROGRESS allowance (45 min, the fleet's own); this argument is only the absolute
+# ceiling, so it takes the ONE default (`LANE_BACKSTOP_S`, spawn-gate.sh) instead of a local literal.
+DISK_GATE_PATH="$WT" WIP_PATH="$WT" run_agent "${FIX_TIMEOUT:-$LANE_BACKSTOP_S}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
 # ⛔ THE GATE'S OWN CODE, captured immediately. It is the ONLY thing that distinguishes the two
 # refusals below, and `$?` read after any later command would be that command's status (§7.4).
 ar=$?

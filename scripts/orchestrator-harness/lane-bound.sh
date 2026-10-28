@@ -29,6 +29,40 @@
 #   idle bound. CPU alone is not enough in the other direction either — an I/O-bound tool child can be
 #   silent AND CPU-flat at the start, which is why the two are CONJUNCTIVE and not a vote.
 #
+# ⛔ THE PROGRESS BOUND IS THE PRIMARY BOUND; THE WALL CLOCK IS A BACKSTOP (agent-infra#2888).
+#   The two axes are NOT peers, and landing them as peers is what censored ≥50% of repair lanes at
+#   their median: `prfix` rows in `walltime.tsv` read median = p90 = 2400 s, i.e. the bound, not the
+#   work. Measured 2026-10-27/28, FIVE of five lanes in one batch ended at `elapsed == cap` with zero
+#   commits and 144 KB of finished, uncommitted work between them.
+#   * `--idle` (progress) is what decides whether a lane is WEDGED. It is set to the fleet's ALREADY
+#     DECLARED no-progress allowance — 45 min — not to a number invented here: `DEFAULT_PROGRESS_AGE_MS`
+#     (`extensions/shared/heartbeat-progress-edges.ts`, the builtin-tools `no-progress` clause #5195,
+#     documented in `docs/ops/load-policy.md` §3 as `TASK_PROGRESS_AGE_MS = 2_700_000`). A second
+#     threshold for the same concept — 20 min of BOTH signals flat — had shipped here, and having two
+#     numbers for "how long may a lane show no progress" is how the wall clock came to kill a lane 5
+#     minutes before either could be consulted. The two signals are CONJUNCTIVE here where the task
+#     clause reads output alone, so this bound can only ever fire LATER than the doctrine's own
+#     allowance — never earlier.
+#   * `--wall` is an ABSOLUTE BACKSTOP for the case the progress rule cannot bound at all (a lane whose
+#     %CPU and log both creep forward for ever). It must sit ABOVE the progress allowance, otherwise it
+#     pre-empts it and the progress rule can never reach its verdict — which is exactly the shape that
+#     was shipped (wall 2400 < allowance 2700). The pre-emption is now WARNED about at arm time.
+#   * The DEFAULT backstop value is PROVISIONAL and is a SEAM, not a conclusion: today's `prfix`
+#     distribution is censored by the very value being replaced (every row reports the cap), so the
+#     ceiling cannot be sized from it. `agent-infra#2888` states the re-measurement that has to follow;
+#     until then the value must make the REAL distribution observable, not trim it. See
+#     `LANE_BACKSTOP_S` in `spawn-gate.sh` for the one default the shipped callers use.
+#
+# ⛔ KEEPING THE WEDGE KILL — WHAT THE EVIDENCE IS, STATED SO IT CAN BE FALSIFIED.
+#   “Working slowly” = at least one of the two signals advanced inside the allowance.
+#   “Wedged” = NEITHER did, for the whole allowance, on TWO CONSECUTIVE confirming samples (below).
+#   A wedged lane is therefore still killed, and it is killed by the PROGRESS bound — never by the
+#   backstop — because the backstop is required to sit above the allowance. That is the whole of the
+#   no-regression claim: nothing was removed, the progress rule was given the doctrine's own window and
+#   precedence. The latency of a wedge kill moves with that window (20 min → 45 min), which is a cost
+#   `agent-infra#2888` accepts explicitly and states in its targets ("a wedged lane is still gone within
+#   `cap`").
+#
 # ⛔ REPORTED, NOT JUST KILLED. A silent kill is the same blindness one level up: an operator who
 #   finds a dead lane with no verdict has to re-derive everything. So every exit writes ONE line —
 #   `verdict=stalled` / `verdict=exceeded-wallclock` / `verdict=finished` — carrying the last output
@@ -47,8 +81,12 @@
 #
 #     --log <file>        the lane's output. REQUIRED: it is one of the two progress signals, and a
 #                         bound that cannot read its own signal is not a bound (refused, exit 2).
-#     --wall <secs>       wall-clock ceiling. `0` disables this axis (loudly). Default 3300.
-#     --idle <secs>       silence bound: no output growth AND no CPU delta. Default 1200 (20 min).
+#     --wall <secs>       ABSOLUTE BACKSTOP. Not the primary bound (see the header): it fires whether
+#                         or not the lane was working, so it must sit above --idle. `0` disables this
+#                         axis (loudly). Default 7200 (2 h) — PROVISIONAL, an `agent-infra#2888` seam.
+#     --idle <secs>       PROGRESS bound: no output growth AND no CPU delta for this long. This is the
+#                         bound that decides wedged-vs-slow. Default 2700 (45 min) — the fleet's own
+#                         declared no-progress allowance, reused rather than re-derived (#2888).
 #     --tol-cs <cs>       CPU tolerance in centiseconds: a delta at or below this is NOT progress.
 #                         Default 10 (0.10 s).
 #     --poll <secs>       sampling interval. Default min(60, max(1, idle/4)).
@@ -128,8 +166,8 @@ done
 
 # ⛔ RESOLUTION ORDER IS FLAG → ENV → DEFAULT, AND THE FLAG WINS BY BEING PRESENT (see the parse loop
 # above, which validated and refused a non-numeric flag already).
-[ -n "$WALL_S" ]  || WALL_S="$(num_or "${LANE_BOUND_WALL_S:-}" 3300)"
-[ -n "$IDLE_S" ]  || IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 1200)"
+[ -n "$WALL_S" ]  || WALL_S="$(num_or "${LANE_BOUND_WALL_S:-}" 7200)"
+[ -n "$IDLE_S" ]  || IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 2700)"
 [ -n "$TOL_CS" ]  || TOL_CS="$(num_or "${LANE_BOUND_CPU_TOL_CS:-}" 10)"
 [ -n "$GRACE_S" ] || GRACE_S="$(num_or "${LANE_BOUND_GRACE_S:-}" 15)"
 [ -n "$POLL_S" ]  || POLL_S="$(num_or "${LANE_BOUND_POLL_S:-}" 0)"
@@ -147,6 +185,16 @@ fi
 # would look like, so the single line below is the only thing that separates the two.
 if [ "$WALL_S" -eq 0 ] && [ "$IDLE_S" -eq 0 ]; then
   printf '[lane-bound] WARN tag=%s BOTH bounds are disabled (wall=0 idle=0) — this lane is UNBOUNDED by construction\n' "$TAG"
+fi
+# ⛔ THE BACKSTOP MUST SIT ABOVE THE PROGRESS ALLOWANCE, AND A VIOLATION IS LOUD (#2888). The shipped
+# pair was wall 2400 < allowance 2700, i.e. the backstop pre-empted the bound it is supposed to back
+# up — so the progress rule could never reach its verdict and a lane was killed by elapsed time before
+# anything could ask whether it was working. This is a WARN, never a refusal: a caller (and every test
+# here) may arm a deliberately short wall to exercise the ceiling itself, and killing timing is an
+# operator decision (#1070).
+if [ "$WALL_S" -gt 0 ] && [ "$IDLE_S" -gt 0 ] && [ "$WALL_S" -le "$IDLE_S" ]; then
+  printf '[lane-bound] WARN tag=%s the BACKSTOP (wall=%ss) is NOT above the PROGRESS allowance (idle=%ss): the wall clock will pre-empt the progress bound, so a lane that is still working is killed by elapsed time (agent-infra#2888). Set --wall above --idle unless you are deliberately exercising the ceiling.\n' \
+    "$TAG" "$WALL_S" "$IDLE_S"
 fi
 
 # ── the two signals ───────────────────────────────────────────────────────────────────────────────

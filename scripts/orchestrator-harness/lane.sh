@@ -384,7 +384,13 @@ fi
 # wrong, and the lane log would end with no MERGED line even on a PR that merges (the chain is detached,
 # so the merge itself still completes — which is exactly why the missing line would be silent). The
 # bound is still a bound, and LANE_TIMEOUT overrides it as before.
-run_agent "${LANE_TIMEOUT:-3300}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
+# ⛔ AND SINCE agent-infra#2888 THAT BOUND IS THE ABSOLUTE BACKSTOP, NOT THE PRIMARY ONE: it no longer
+# defaults to a number of its own. The bound that decides wedged-vs-slow is `lane-bound.sh`'s PROGRESS
+# allowance (45 min, the fleet's own), and a lane that keeps working is no longer killed by elapsed
+# time — this argument is the ceiling for a lane that creeps forward for ever. It therefore takes the
+# ONE default (`LANE_BACKSTOP_S`, spawn-gate.sh) rather than a local literal, because three separate
+# literals is how the flat 40-minute cap outlived the allowance that contradicted it.
+run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
