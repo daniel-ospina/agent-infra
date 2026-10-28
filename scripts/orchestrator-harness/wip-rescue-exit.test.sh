@@ -105,9 +105,10 @@ drive() { # drive <gate> <cap> <label> [wip-path]
     O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
     KIND=lane; TAG=2834
     load1() { printf 1; }
+    if [ -n "$8" ]; then WIP_PATH="$8"; fi
     run_agent "$4" "$5" "$6" "$7" >/dev/null 2>&1
     printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
-  ' _ "$gate" "$WT" "$O" "$cap" "$O/logs/lane.log" "$PROMPT" "$label"
+  ' _ "$gate" "$WT" "$O" "$cap" "$O/logs/lane.log" "$PROMPT" "$label" "$wip"
 }
 wiprefs() { git -C "$BARE" for-each-ref --format='%(refname)' 'refs/wip/*' 2>/dev/null; }
 
@@ -230,6 +231,55 @@ grep -q 'tree=not-a-worktree rescue=UNAVAILABLE' "$O/logs/notgit.log"; rc=$?
 ck "F1 a WIP_PATH that is not a git worktree is tree=not-a-worktree, never a clean verdict" $rc
 grep -q 'the worktree was CLEAN\|nothing was lost' "$O/logs/notgit.log"; rcc=$?
 ck "F2 …and it never claims the tree was clean" $([ "$rcc" -ne 0 ] && echo 0 || echo 1)
+# ⛔ F3 — THE ROW EXISTS ON THE PATH THAT RETURNS BEFORE THE MEASUREMENT (review F1, PR #2975).
+# `not-a-worktree` is what a caller that forgot `WIP_PATH` looks like, and it used to return with NO
+# `lane-end.tsv` row while the file and the README both claim one row per terminal on every path —
+# so the one transition where a lane's work may have been archived from the WRONG tree was invisible
+# in the fleet's aggregate surface. This reads the LEDGER, not the log line (the arm above already
+# reads the line, and a line with no row is exactly the defect).
+awk -F'\t' '$2=="mis-pointed" && $5=="not-a-worktree" && $6=="UNAVAILABLE" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcf3=$?
+ck "F3 …and the append-only ledger still holds a row for it — 'one row per terminal, on every path' includes the paths that return before the measurement" $rcf3
+
+# ── H) WIP_PATH BEATS $PWD — the shape the PRODUCTION caller actually has ─────────────────────
+# `fix-one.sh` `cd`s into the MAIN checkout and only NAMES the fixer's worktree in the agent's prompt,
+# so its `$PWD` is deliberately the WRONG tree. Arm E sets `WIP_PATH` where `$PWD` is ALREADY the
+# worktree (it cannot tell the two apart) and arm F refuses a BAD `WIP_PATH`; neither proves the
+# property the README states — that a VALID `WIP_PATH` WINS over a dirty cwd. Without this arm the
+# `drive()`/`WIP_PATH` plumbing was dead code, and the claim rested on arms that could not see it
+# (review F3, PR #2975). The lane ends inside a DIFFERENT dirty checkout that shares the GitHub-shaped
+# slug, and the archive must be the WORKTREE's branch — never the checkout's.
+MAINCO="$TMP/mainco"
+git init -q -b main "$MAINCO"
+git -C "$MAINCO" config user.name t; git -C "$MAINCO" config user.email t@t
+git -C "$MAINCO" remote add origin "$GHURL"
+git -C "$MAINCO" config url."$BARE".insteadOf "$GHURL"
+printf 'seed\n' > "$MAINCO/seed.txt"
+git -C "$MAINCO" add seed.txt && git -C "$MAINCO" commit -q -m seed
+printf 'the worktree work a lane left behind\n' > "$WT/wtwork.txt"   # the tree the lane ACTUALLY used
+pi_stub dirty                                                         # …whose cwd is MAINCO
+: > "$O/logs/wipath.log"
+PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
+  . "$1"
+  cd "$5" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  WIP_PATH="$2"
+  run_agent 300 "$4" "$6" "wip-path wins" >/dev/null 2>&1
+  printf "rc=%s" "$?"
+' _ "$GATE" "$WT" "$O" "$O/logs/wipath.log" "$MAINCO" "$PROMPT" >/dev/null
+
+ck "H1 the lane really ended inside the OTHER dirty checkout (its own untracked file is there)" \
+  $([ -f "$MAINCO/early.txt" ] && echo 0 || echo 1)
+wk="$(git -C "$BARE" show "refs/wip/$SLUG:wtwork.txt" 2>/dev/null)"
+ck "H2 a VALID WIP_PATH wins over a dirty \$PWD: the archive is the WORKTREE's branch ('$wk')" \
+  $([ "$wk" = "the worktree work a lane left behind" ] && echo 0 || echo 1)
+git -C "$BARE" rev-parse -q --verify "refs/wip/main" >/dev/null 2>&1; rcmain=$?
+ck "H3 …and the CWD checkout was NOT archived: no refs/wip/main exists for it" $([ "$rcmain" -ne 0 ] && echo 0 || echo 1)
+git -C "$BARE" cat-file -e "refs/wip/$SLUG:early.txt" 2>/dev/null; rcother=$?
+ck "H4 …and the cwd's own file is not inside the worktree's archive (the two trees did not blur)" \
+  $([ "$rcother" -ne 0 ] && echo 0 || echo 1)
+rm -f "$WT/wtwork.txt"
 
 # ── G) THE CAP PATH STILL RESCUES, AND A FAILED PUSH DOES NOT TOUCH rc ─────────────────────────
 # "ANY terminal transition" includes the one #2045 already covered: the cap. This arm proves both
@@ -270,8 +320,20 @@ res_off="$(WIP_RESCUE_DISABLE=1 drive_cap "cap disabled" "$O/logs/capoff.log")"
 ck "G3 an unreachable remote does NOT change the lane's exit status ($res_fail with a failing rescue, $res_off with the rescue disabled)" $([ "$res_fail" = "$res_off" ] && echo 0 || echo 1)
 grep -q 'STILL ONLY ON THIS DISK' "$O/logs/capfail.log"; rcfail=$?
 ck "G4 …and the failing rescue is LOUD: it names the worktree as the only copy" $rcfail
+# ⛔ THE ARCHIVE THAT WAS PINNED IS RECORDED AS SUCH (review F2, PR #2975). bg-rescue-wip.sh exits 2
+# both for "nothing was archived" and for "archived, push failed" (`refs/wip-local/<slug>` valid).
+# Reading the ref only on rc=0 recorded a bare `FAILED` with an EMPTY ref in the second case — hiding
+# the one pointer to the archived commit from the fleet record.
+grep -qE 'rescue=archived-local .*ref=refs/wip-local/' "$O/logs/capfail.log"; rcarc=$?
+ck "G6 …and the archive that DID get pinned locally is recorded as rescue=archived-local WITH its ref, not a bare FAILED with an empty one" $rcarc
+grep -q 'rescue=FAILED' "$O/logs/capfail.log"; rcfailed=$?
+ck "G7 …so FAILED is no longer printed over a worktree whose work is in fact pinned" $([ "$rcfailed" -ne 0 ] && echo 0 || echo 1)
 grep -q 'rescue=DISABLED' "$O/logs/capoff.log"; rcdis=$?
 ck "G5 …and the operator hatch (WIP_RESCUE_DISABLE=1) says the tree was NOT examined instead of implying it was clean" $rcdis
+# ⛔ AND THE HATCH STILL WRITES A ROW (review F1, PR #2975). A hatch that blanks the ledger is
+# indistinguishable from a lane that never ended — the exact ambiguity `lane-end.tsv` exists to close.
+awk -F'\t' '$2=="cap disabled" && $5=="not-measured" && $6=="DISABLED" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcdisrow=$?
+ck "G8 …and the disabled path still appends its own ledger row (tree=not-measured rescue=DISABLED)" $rcdisrow
 git -C "$WT" config --unset-all url."$TMP/not-a-repo.git".insteadOf
 git -C "$WT" config url."$BARE".insteadOf "$GHURL"
 
