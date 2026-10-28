@@ -1,0 +1,115 @@
+[Unit]
+# eldato pr-repair — the cell's REPAIR actuator, owned by a service manager (agent-infra#2716, #2709).
+#
+# WHY THIS UNIT EXISTS, AND WHY IT IS NOT `eldato-orchestrator`. The cell has two capabilities and they
+# are not the same one: `eldato-orchestrator` DISPATCHES lanes from the issue queue (`orch-loop.sh`),
+# and this unit DRIVES THE OPEN PR QUEUE toward `merged` (`pr-repair-loop.sh` → `pr-doctor.py` → repair
+# workers). A box can have the first and be unable to do the second, and it reads healthy while it is:
+# measured on `pi-cell-3` 2026-10-24T17:15Z — `eldato-orchestrator` `active`, `pgrep -f pr-doctor.py`
+# → 0, `tmux ls` → no server, `pr-doctor.log` 2 days stale. No actor on that box repaired, reaped or
+# landed anything. Merging the two units would make one failure take both capabilities down and would
+# re-create #1761 (two dispatchers on one queue) the moment either is re-installed; they stay separate
+# units with separate names and separate installers, and neither installer may touch the other's unit.
+#
+# ⛔ THE REPAIR LOOP MUST SURVIVE THE SESSION THAT STARTED IT. That is the whole point of a unit: a
+# `nohup`/tmux loop dies with the server (the #2402 event: `tmux ls` → "no server running on
+# /tmp/tmux-1000/default"), so an operator's terminal became a dependency of the fleet's repair
+# capacity. `is-enabled` is what makes it come back at boot; `Restart=always` is what makes it come
+# back from a crash, a kill AND an orderly exit.
+Description=eldato pr-repair — the cell's PR repair loop (reap + pr-doctor dispatch)
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/pr-repair-service.md
+# The first pass reads GitHub and the checkout. Offline, it REFUSES (exit 2) rather than reporting an
+# empty queue, so the ordering is load-bearing rather than cosmetic.
+After=network-online.target
+Wants=network-online.target
+# ⛔ NAMED EXPLICITLY, because systemd's default window CANNOT FIRE HERE. The default start limit is
+# 5 starts in 10 s; with `RestartSec=15` at most one start per 15 s can ever occur, so the burst is
+# unreachable and a box that cannot start the loop for a CONFIGURATION reason would restart every
+# 15 s for ever, with the failure living only in a journal. 3 failures inside 5 minutes is a
+# configuration fault, not a transient, and it must converge to `failed` — the state an operator can
+# act on (`systemctl reset-failed` + a fix, or `--install` to re-render). A deliberate
+# `systemctl stop` never counts: systemd does not restart on a stop.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User={{USER}}
+Environment=HOME={{CELL_HOME}}
+Environment=CELL_HOME={{CELL_HOME}}
+Environment=ENV_FILE={{ENV_FILE}}
+# ⛔ PATH IS RENDERED, NOT INHERITED. A unit with no PATH gets systemd's compile-time default, which on
+# a cell does not carry the gh shim, the farmed scripts or the node/uv directories a repair worker
+# needs. The installer renders the dirs its own probes resolved (#2402's lesson: a daemon PATH nobody
+# can reproduce is the defect, and ACTIVATION-MATRIX row 10 measured it as "improvised").
+Environment=PATH={{PATH}}
+# The orchestrator's state dir — where pr-doctor writes its state file, its log and `$O/bg/<name>.rc`,
+# and where this unit's pass record lands. Carried EXPLICITLY so an installer read-back and the loop
+# cannot disagree about which directory is being watched.
+Environment=O={{O}}
+# ⛔ THE TARGET REPO IS THREE FACTS AND ALL THREE ARE RENDERED (agent-infra#1974, #2716). `pr-doctor.py`
+# shipped two hardcoded literals — the slug and `$HOME/Documents/GitHub/tortoise` — so on a cell
+# (`HOME=/tmp/cell-home`, checkout `/tmp/cell-t3`) it read a path that does not exist and reported
+# `UNREADABLE` for every PR. `GH_REPO` is what a worker's `gh` calls are pinned to, `PR_DOCTOR_REPO`
+# is what this loop dispatches for, and `PR_DOCTOR_REPO_DIR` is the checkout it may create worktrees
+# in. The classifier reads its own seam (`OBJECTIVE_REPO`) and the loop exports the pair together, so
+# the dispatcher and the classifier can never answer about different repos (#1872).
+Environment=GH_REPO={{REPO_SLUG}}
+Environment=PR_DOCTOR_REPO={{REPO_SLUG}}
+Environment=PR_DOCTOR_REPO_DIR={{REPO_PATH}}
+# Cadence and the two guards, rendered so an operator reads them instead of guessing. A pass is cheap
+# and idempotent (the dispatcher has its own cooldown), so 15 min is a liveness choice, not a load one.
+Environment=REPAIR_INTERVAL_S={{INTERVAL_S}}
+# ⛔ THE DISK FLOOR IS THE GUARD THAT KEEPS THIS UNIT OFF A CELL THAT CANNOT AFFORD IT (#2721). A
+# repair worker materialises a worktree WITH its own dependency tree; on a box with ~3.4 GB free that
+# is how a cell wedges — the 2026-10-24T16:30Z event on `pi-cell-4`. Below the floor the pass DEFERS
+# (exit 6, a named verdict in the journal and in the status row) instead of starting work it cannot
+# finish. `REAP` runs before dispatch, so the loop also reclaims the space that is reclaimable.
+Environment=REPAIR_DISK_FLOOR_MB={{DISK_FLOOR_MB}}
+Environment=REPAIR_DISK_PER_WORKER_MB={{DISK_PER_WORKER_MB}}
+# The owner's ceiling on `load1/nproc` (docs/ops/fleet-capacity.md): a box already at 8x is busy by
+# ruling, and a new repair would compete with whatever is already there. `spawn-gate.sh` applies the
+# same ceiling per spawn; this gate stops the PASS from even planning work.
+Environment=REPAIR_LOAD_CEILING_MULT={{LOAD_MULT}}
+# ── the CLOCK, if this box was installed in `trigger` mode (#2700 C5) ──────────────────────────────
+# ⛔ `--loop` IS A TIMER AND A TIMER IS THE LEAD. A pass that fires every `REPAIR_INTERVAL_S` only sees
+# the fleet at that instant, so a PR that turns red one second after one waits the whole interval with
+# nobody on it — measured on the Mac as a mean 900 s of dead time for a repair that costs one pass.
+# `REPAIR_MODE=trigger` renders the ExecStart below as `pr-repair-loop.sh --trigger`, whose main
+# process is the event-driven front end (`pr-doctor-trigger.py`): ONE `gh pr list` per poll, a pass
+# when the PR surface moves, and the old interval demoted to a BACKSTOP for the work only a clock can
+# see (a check that never reports, a worker that dies silently, a stale claim).
+# ⛔ THESE FOUR LINES ARE INERT UNDER `--loop`, AND THAT IS CORRECT: they configure the front end, and
+# the front end is not the unit's main process in timer mode. The installer validates the mode instead
+# of guessing from these values, so a box cannot end up with a trigger knob rendered over a timer.
+Environment=REPAIR_TRIGGER_POLL_S={{TRIGGER_POLL_S}}
+Environment=REPAIR_TRIGGER_DEBOUNCE_S={{TRIGGER_DEBOUNCE_S}}
+Environment=REPAIR_TRIGGER_BACKSTOP_S={{TRIGGER_BACKSTOP_S}}
+Environment=REPAIR_TRIGGER_RETRY_MIN_S={{TRIGGER_RETRY_MIN_S}}
+# The template is the ONE place the loop is named. The installer refuses an ExecStart that does not
+# resolve to this file at the farmed path, so a unit cannot be pointed at a lane worktree (the #2697
+# defect: an ExecStart baked onto `/tmp/wt-2433-fu`, a lane's unmerged branch, which a reboot erases).
+# ⛔ THE MODE WORD IS RENDERED FROM `REPAIR_MODE` (`--loop` or `--trigger`) — ONE unit, two clocks, and
+# never a second actuator beside this one: `--trigger` execs a front end whose child is this same
+# loop's one-pass mode, so the cap, both machine gates, the reap, the credential source and the status
+# row above still decide every pass.
+ExecStart={{EXEC_START}}
+# ⛔ `always`, NOT `on-failure`. The measured failure is an ORDERLY exit: the loop is killed, or a
+# deploy replaces it, and nothing comes back. `on-failure` reproduces that defect byte for byte.
+Restart=always
+RestartSec=15
+# ⛔ `process`, NOT the default `control-group`. This is the property #2716 measured the hard way: a
+# pass DISPATCHES by backgrounding workers through `nonblocking-dispatch.sh` and returning at once, so
+# a cgroup teardown at the end of the pass SIGTERMs the workers it just started — two workers
+# "launched, running" with 0-byte logs, no `.rc`, 290 MB of orphan worktrees, and `is-active=active`
+# the whole time. `process` signals this unit's main process and nothing else; the workers are
+# `disown`ed by the dispatcher and are supposed to outlive the pass. ⛔ Any future ExecStart that
+# reaches `nonblocking-dispatch.sh` needs this property too — `pr-repair-loop.test.sh` asserts it for
+# every shipped unit rather than trusting the next author to remember.
+KillMode=process
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
