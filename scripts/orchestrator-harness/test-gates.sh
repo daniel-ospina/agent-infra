@@ -1312,6 +1312,54 @@ FAKE
   printf '#claim-snapshot\t%d\tok\t0\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
   eqv "a snapshot OLDER than the age bound is NOT ownership (a claim published since would be invisible)" \
       "unowned" "$(_owned 12 ddd000000000)"
+  # ⛔ AND THE RC ITSELF, ON THE SHIPPED CHAIN (review, P1). Everything above grades `pr_owned` /
+  # `unowned_pr_count`, and BOTH answer "unowned" for rc 0 (claim-absent) and for rc 2
+  # (claim-unreadable) — they cannot tell the two words apart, and that separation IS this change.
+  # Measured: reverting the missing-file arm to the pre-fix `claim-absent; return 0` left EVERY
+  # assertion above green, because a reverted reader still says "unowned". So pin the rc the sweep
+  # actually branches on (`claim_selection_verdict`, the shipped wrapper over the shipped reader):
+  # 0 would be FREE, 1 HELD, 2 UNREADABLE — and the sweep acts on rc 0 only.
+  _seen()   { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; claim_selection_verdict "$1" "${2:-}" >/dev/null; echo $? ); }
+  : > "$O/state/claims-snapshot"
+  eqv "a FRESH, EMPTY snapshot is a registry that answered: the SELECTION verdict is rc 0 (free)" \
+      "0" "$(_seen 12 ddd000000000)"
+  rm -f "$O/state/claims-snapshot"
+  eqv "a MISSING snapshot makes the SELECTION verdict rc 2 (UNREADABLE), never free" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tfailed\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(date +%s)" > "$O/state/claims-snapshot"
+  eqv "a FAILED-FETCH header is rc 2 even when its rows are a LIVE lease (the entries are a stale read)" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tok\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
+  eqv "an OVER-AGE header is rc 2 even when its rows are a LIVE lease" \
+      "2" "$(_seen 12 ddd000000000)"
+  # ⛔ A FUTURE STAMP IS DROPPED, NEVER TRUSTED (review, P2). The reader used to CLAMP `read_at` ahead
+  # of the local clock to fresh (`age=0`), so the further ahead a stamp, the longer it was believed —
+  # with no age bound at all. Same one-sided-age rule AGENTS.md records for `skill-reads.json`.
+  printf '#claim-snapshot\t%d\tok\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(( $(date +%s) + 999 ))" > "$O/state/claims-snapshot"
+  eqv "a read instant AHEAD of this box's clock is rc 2 (its age cannot be established)" \
+      "2" "$(_seen 12 ddd000000000)"
+  # A header this reader cannot parse is not an old writer: the mtime fallback belongs ONLY to a first
+  # line that is not a header at all (that is what a pre-header writer produces).
+  printf '#claim-snapshot\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a header with NO usable read instant is rc 2, not a mtime-believed snapshot" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf 'refs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a HEADER-LESS snapshot from an older writer still answers (mtime fallback kept)" \
+      "1" "$(_seen 12 ddd000000000)"
+  # ⛔ A SNAPSHOT THAT EXISTS BUT CANNOT BE READ IS UNREADABLE, NOT ABSENT (review, P1). `[ -f ]` is a
+  # stat, so it passes on a file this process cannot open; the reader then answered `claim-absent`
+  # (FREE) with the confidently wrong reason "no entry … read 0s ago". Root ignores permissions, so
+  # the arm is skipped (LOUDLY, never silently) on a root runner rather than being vacuous.
+  if [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+    printf 'refs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+    chmod 000 "$O/state/claims-snapshot" 2>/dev/null || true
+    eqv "an UNREADABLE snapshot file is rc 2 — a failed read is not an empty registry" \
+        "2" "$(_seen 12 ddd000000000)"
+    chmod 644 "$O/state/claims-snapshot" 2>/dev/null || true
+  else
+    echo "  ⏭ SKIP an UNREADABLE snapshot file is rc 2 — the arm needs a non-root uid (chmod 000 is ignored by root)"
+  fi
+  : > "$O/state/claims-snapshot"
   # ⛔ AND THE GATE DIRECTION, not just the word. This is the assertion that catches the flip:
   # with the old `*) return 0` arm every unreadable shape counted as owned, the un-owned count went
   # to 0, and the drain gate opened with the whole PR queue invisible.

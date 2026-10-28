@@ -2845,20 +2845,22 @@ _ck_tmp="$O/.checked-decided.$$"
 : > "$_ck_tmp" || { echo "[refresh] ABORT: cannot write $_ck_tmp — the checked classification could not be persisted (#2183)"; exit "$EXIT_TRANSIENT"; }
   if [ ! -s "$O/state/checked-release-candidates" ]; then
     : # the classification ran and found EVERY entry justified: nothing to ask, nothing to release
-  elif [ ! -f "$O/claims.sh" ]; then
-    # ⛔ A BOX WITHOUT THE REGISTRY IS THE DOCUMENTED LOUD FALLTHROUGH (issue_claim_verdict's STATED
-    # LIMIT): it cannot take a claim either, so refusing to release would leave a suppression no
-    # reader on that box could ever justify. No network read happens here, so the cap does not apply.
-    echo "[reap] the claim registry ($O/claims.sh) is NOT INSTALLED — releasing on local facts only (documented fallback)"
-    # ⛔ AND THE LINE SAYS SO (review E, cycle 5): the claim read is the one fact this pass cannot
-    # answer locally, and a release made without it is indistinguishable on the operator line from a
-    # fully claim-checked one. `none` means "nothing was refused"; this uses its own value.
-    CHECKED_REFUSED="claim-registry-absent"
-    while IFS= read -r _n; do
-      case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
-      printf '%s\treleased\n' "$_n" >> "$_ck_tmp"
-    done < "$O/state/checked-release-candidates"
   else
+    # ⛔ A MISSING REGISTRY IS NOT A LICENCE TO RELEASE (agent-infra#2466, review P2). This branch used
+    # to hold an `elif [ ! -f "$O/claims.sh" ]` arm that released every candidate "on local facts
+    # only" and called it the documented loud fallthrough — citing `issue_claim_verdict`'s STATED
+    # LIMIT, a section the same change DELETED and replaced with "MISSING IS REFUSED TOO". So the arm
+    # acted on a policy that no longer existed anywhere, while the one-polarity rule it broke is
+    # stated three other places in this file (the `--check` arm, the walk's ICR=2 arm, the dispatch
+    # arm): missing, unreadable and stale are ONE polarity — refuse.
+    # The refusal is already implemented one branch below by the ask loop, which calls
+    # `issue_claim_verdict` unconditionally and maps its 2 (INCOMPLETE, the answer for a missing
+    # file) to `claim-unknown` → the suppression is KEPT and COUNTED. The arm above pre-empted it.
+    # ⛔ BUT THE OPERATOR LINE STILL SAYS IT (kept from that arm, review E cycle 5): the claim read is
+    # the one fact this pass cannot answer locally, so a pass that could not consult the registry
+    # must not be byte-identical on the line to one that did. `none` means "nothing was refused";
+    # this uses its own value. It records a REFUSAL now, which is what the slug always described.
+    [ -f "$O/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
     _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
     # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
     # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the
@@ -3063,12 +3065,13 @@ _ck_tmp="$O/.checked-decided.$$"
     # an operator to a field that never moves.
     echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — every entry it did not record is counted as skipped_checked_unknown (the breakdown still sums, so reason_conflict cannot show this) rather than name a reason nobody verified"
   fi
-  # ⛔ `refused=` IS PUBLISHED HERE (review): the no-registry fallback above sets
-  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say a release was made WITHOUT the
-  # cross-box claim read — and nothing ever wrote it here, while the funnel's reader re-initialises the
-  # variable from THIS record. Measured before this line existed: `checked_refused=none` on a box with no
-  # `$O/claims.sh`, i.e. the one release that skipped the claim check was byte-identical on the operator
-  # line to a fully claim-checked one — the "a fact with no statement" defect this change exists to end.
+  # ⛔ `refused=` IS PUBLISHED HERE (review): the absent-registry arm above sets
+  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say this pass could not consult
+  # the cross-box registry — and nothing ever wrote it here, while the funnel's reader re-initialises
+  # the variable from THIS record. Measured before this line existed: `checked_refused=none` on a box
+  # with no `$O/claims.sh`, i.e. a pass that never read the claim registry was byte-identical on the
+  # operator line to a fully claim-checked one — the "a fact with no statement" defect this change
+  # exists to end.
   if printf 'released=%s deferred=%s unjustified=%s refused=%s sort_failed=%s at=%s\n' \
        "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${CHECKED_REFUSED:-none}" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
        > "$O/state/.checked-reap.$$" 2>/dev/null \
