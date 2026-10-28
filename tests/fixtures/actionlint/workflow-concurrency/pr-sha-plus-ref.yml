@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (R1): the group carries `github.ref` AND `github.sha`. A containment test on
+# `github.ref` passes, but the resolved group is per-COMMIT — each head is its own group, so nothing is
+# ever superseded: an inert gate that looks like an optimisation (round-3 P1).
+name: pr-sha-plus-ref
+on:
+  pull_request:
+concurrency:
+  group: pr-sha-plus-ref-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
