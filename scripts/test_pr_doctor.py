@@ -131,12 +131,14 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # module global a `apply_repo()` leaves behind, so ONE test that grades a repo would decide what
     # every later test considers "this repo" -- reset to "no repo resolved", the state every test
     # that does not name one is written against. `REPO` stays EMPTY deliberately (a resolved slug
-    # would put `contract_note()` in play for the dispatch tests, which grade no repo), while the
-    # WORKER TAG carries a realistic production value: since #2725 every worker name is
-    # repo-qualified, so the suite must exercise THAT shape -- a test that expects the legacy
-    # `prd-<n>` spelling says so by patching the tag to "".
+    # would put `contract_note()` in play for the dispatch tests, which grade no repo).
+    # ⛔ THE SEEDED TAG IS DELIBERATELY NOT ANY REPO'S REAL TAG (#2725 review, P2). It used to be
+    # `daniel-ospina-agent-infra-`, which IS `repo_tag(_REPO_A)` and IS what `resolve_repo()` derives
+    # from this checkout's origin -- so an assertion written as `row["worker"] == worker_name(5)`
+    # passed even if `apply_repo()` never set the tag at all: the fixture had already seeded the
+    # answer. A tag no repo can produce makes "did `apply_repo()` set it?" a real question.
     monkeypatch.setattr(pr, "REPO", "", raising=False)
-    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-agent-infra-", raising=False)
+    monkeypatch.setattr(pr, "_WORKER_TAG", "seed-not-a-repo-", raising=False)
     # ⛔ `_INHERITED_GH_REPO` IS THE PROCESS'S INHERITANCE, captured on the first pin. One test
     # process runs many "processes", so it is reset here for the same reason every other global is:
     # an earlier test's env would become this one's inheritance (measured: the ambient-GH_REPO test
@@ -1984,8 +1986,15 @@ def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, t
     monkeypatch.setenv("MAX_REVIEW", "12")
     assert pr.main() == 0
     row = saved.get("5") or {}
-    assert row.get("head") == "a" * 40 and row.get("worker") == pr.worker_name(5), \
+    # ⛔ THE ROW MUST CARRY THE **RESOLVED** REPO'S TAG, not whatever the fixture seeded (#2725
+    # review, P2). Comparing against `worker_name(5)` alone was vacuous while the fixture seeded the
+    # same tag the pass would derive; the fixture now seeds one no repo can produce, so this fails
+    # if `apply_repo()` stops setting `_WORKER_TAG` -- the end-to-end pin for R2.
+    assert row.get("head") == "a" * 40 and row.get("worker") != "prd-5", \
         "a launched worker must consume a state row / cooldown: %r" % (saved,)
+    assert row.get("worker", "").startswith("prd-%s-" % pr.repo_tag(pr.REPO)), \
+        "the row's worker name must carry the RESOLVED repo's tag (%r): %r" \
+        % (pr.repo_tag(pr.REPO), saved)
     assert row.get("kind") == "spawn", "a launched worker's row must be a spawn row"
 
 
@@ -5827,6 +5836,53 @@ def test_the_status_worker_column_keeps_the_pr_number_visible(tmp_path, capsys):
     # …and the unit's own contract, so a caller other than the printer cannot regress silently
     assert len(pr._worker_column(long)) <= pr._WORKER_COL
     assert pr._worker_column("prd-7") == "prd-7"
+
+
+def test_the_liveness_refusal_names_the_spelling_that_ANSWERED(monkeypatch, tmp_path):
+    """A pass must not send an operator after a `.pid` that was never written (#2725 review, P2).
+
+    The LEGACY alias can be the arm that answers, and the old line printed this pass's
+    repo-qualified name regardless -- so the artifact an operator went to inspect did not exist.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-tortoise-")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda n: "running" if n == "prd-1234" else "lost")
+    assert pr.worker_live_which(1234) == (True, "prd-1234")
+    # …the DISPATCH refusal says it in the operator's words, which is where it is actually read.
+    ok, detail, record = pr.dispatch(_pr(1234), "fix-ci", _OK_BRIEF, dry=False)
+    assert (ok, record) == (False, False), (ok, detail, record)
+    assert "prd-1234 " in detail, detail
+    assert pr.worker_name(1234) not in detail, \
+        "the message must name the artifact that exists, not one that was never written: %s" % detail
+    # …and when OUR name is the one that answers, it says so instead.
+    monkeypatch.setattr(pr, "worker_status",
+                        lambda n: "running" if n == pr.worker_name(1234) else "lost")
+    assert pr.worker_live_which(1234) == (True, pr.worker_name(1234))
+    # Nothing live anywhere names no one.
+    monkeypatch.setattr(pr, "worker_status", lambda n: "lost")
+    assert pr.worker_live_which(1234) == (False, "")
+
+
+def test_a_zero_padded_ARTIFACT_is_not_a_sibling_and_the_slot_is_HELD(tmp_path, monkeypatch):
+    """The two spellings are COMPUTED, not patterned (#2725 review, P2 -- and fail-safe).
+
+    The old `-0*` wildcard matched `prd-<tag>-0042.pid` for a row `prd-42`. Nothing writes a padded
+    name, so the narrowing costs only accuracy -- and the miss is the safe direction: an absent
+    candidate is `unknown`, which HOLDS the slot rather than freeing a live worker's.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-agent-infra-")
+    st = {"42": {"action": "fix-ci", "worker": "prd-42", "at_epoch": now}}
+    (bg / "prd-daniel-ospina-agent-infra-0042.pid").write_text("%d\n" % _a_dead_pid())
+    assert pr._worker_pid_files("prd-42") == [], \
+        "a padded name is not one of the two computed spellings of this PR"
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)
+    assert (b["fix"], b["alive"], b["unknown"]) == (0, 0, 1), \
+        "a miss is UNKNOWN, which holds the slot -- never a free slot: %r" % (b,)
 
 
 def test_a_pass_with_no_checkout_grades_the_queue_and_says_it_cannot_spawn(monkeypatch, tmp_path):

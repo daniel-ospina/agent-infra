@@ -1324,10 +1324,14 @@ def _worker_pid_files(worker: str) -> list:
       * a row written since #2725 is qualified -> the other spelling is the legacy `prd-<n>`;
       * a row written before it is short        -> the other spelling is THIS repo's qualified name.
 
-    Ledger zeros are tolerated (`prd-<n>` and `prd-<tag>-0042` are both #42); a PREFIX is not,
-    because `-20350.pid` is PR 20350 and must never answer for PR 2035 -- and `int()` is bounded
-    (`[0-9]{1,10}`), because it raises ValueError past 4300 characters, which would abort the pass
-    from inside the counter (the register is read back from JSON, so the row is not necessarily ours).
+    The row and the artifact must spell the number the SAME way: these are two computed paths, not a
+    pattern, so `prd-42` does not answer for a file called `prd-<tag>-0042.pid` (the old `-0*`
+    wildcard did). Nothing writes a zero-padded name -- `echo "$PID"`-style artifacts carry whatever
+    `worker_name()` produced, and that is `%d`/`%s` of an int -- and the miss is fail-SAFE: an absent
+    candidate reads `unknown`, which HOLDS the slot. A PREFIX is likewise not a sibling, because
+    `-20350.pid` is PR 20350 and must never answer for PR 2035; `int()` is bounded (`[0-9]{1,10}`)
+    because it raises ValueError past 4300 characters, which would abort the pass from inside the
+    counter (the register is read back from JSON, so the row is not necessarily ours).
 
     `isfile` rather than `exists`: a directory at the pid path is handled by the read, but a FIFO is
     not -- `open()` on one BLOCKS with no writer, which would hang the pass on an artifact instead
@@ -3540,10 +3544,10 @@ def void_refused_rows(st: dict) -> list[str]:
     ⚠️ A ROW WRITTEN BEFORE #2725 CARRIES THE REPO-BLIND NAME (#2725). Its `worker` is `prd-<n>`, so
     `bg_path()` resolves the pre-change artifact -- which on a multi-repo box could be ANOTHER
     repo's, i.e. another repo's gate refusal could void this row. It is bounded, not silent: rows
-    stop being eligible at `STALE_DISPATCH_S` (90 min), and the legacy spelling is transitional
-    (nothing writes it any more), so the exposure ends with the pre-change rows. Stated here rather
-    than "fixed" because the row's name is durable content this function may not rewrite: guessing
-    which repo a legacy row meant is the very ambiguity the change removes.
+    stop being eligible at `STALE_DISPATCH_S` (90 min), and the legacy spelling is on its way out
+    (see the note in `worker_live_for`), so the exposure ends with the pre-change rows. Stated here
+    rather than "fixed" because the row's name is durable content this function may not rewrite:
+    guessing which repo a legacy row meant is the very ambiguity the change removes.
     """
     voided = []
     for k in list(st):
@@ -3668,9 +3672,30 @@ def worker_live_for(number) -> object:
     ⚠️ THE LEGACY ARM IS REPO-AMBIGUOUS, DELIBERATELY. `prd-42` says nothing about which repo's
     worker wrote it, so on a multi-repo box it can refuse a spawn for the wrong repo's PR #42. That
     is the SAFE direction (a refused spawn is a visible 90-min cooldown; the opposite error is two
-    agents in one directory) and it is transitional: nothing writes `prd-<n>` any more, so the alias
-    empties as pre-change workers finish, and a stale `.pid` can no longer hold it for ever (see the
-    stamp bound in `worker_live`). Remove this arm once no box carries a pre-#2725 worker record.
+    agents in one directory) and it is transitional -- and "transitional" is BOUNDED BY THE ORDER
+    RECORDS, NOT BY THE DEPLOYED CODE: `pr-doctor` writes only the qualified spelling now, but
+    `worker-supply.sh` re-offers a DEAD PRE-CHANGE ORDER UNDER ITS RECORDED NAME, so a fresh
+    `prd-<n>.{pid,started,log,rc}` can still appear (up to `MAX_REFILLS` per legacy order) long after
+    this change lands. The alias therefore lives as long as those `.started` records do. It cannot
+    hold for ever (see the stamp bound in `worker_live`), and the arm goes when no box carries a
+    pre-#2725 worker record.
+    """
+    names = [worker_name(number)]
+    plain = "prd-%s" % number
+    if plain not in names:
+        names.append(plain)              # the PRE-#2725 spelling for the SAME worktree
+    return worker_live_which(number)[0]
+
+
+def worker_live_which(number) -> tuple:
+    """`(verdict, name)` -- the same answer as `worker_live_for`, plus WHICH spelling gave it.
+
+    ⛔ A LOG LINE THAT NAMES A FILE THAT DOES NOT EXIST SENDS THE OPERATOR TO THE WRONG PLACE
+    (#2725 review, P2). The pass used to print `worker <this pass's name> is still running` even when
+    the LEGACY alias answered, so on a box whose live artifact is `$O/bg/prd-42.pid` the operator
+    went looking for a `prd-<tag>-42` that was never created -- the very "a liveness check answered
+    about the wrong one" class this change exists to remove, in the words a human acts on.
+    `name` is the spelling that answered (`True`/`None`), and `""` when nothing did (`False`).
     """
     names = [worker_name(number)]
     plain = "prd-%s" % number
@@ -3679,10 +3704,10 @@ def worker_live_for(number) -> object:
     for nm in names:
         live = worker_live(nm)
         if live is None:                  # unanswerable: do not spawn
-            return None
+            return None, nm
         if live is not False:             # running under THIS name
-            return True
-    return False
+            return True, nm
+    return False, ""
 
 
 def repo_tag(slug: str) -> str:
@@ -3789,7 +3814,12 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # mode owns the same directory (see `worker_live_for()`).
     live = worker_live_for(n)
     if live:
-        return False, "worker %s is still running -- one worker per PR" % name, False
+        # ⛔ NAME THE SPELLING THAT ANSWERED (#2725 review, P2). It may be the legacy `prd-<n>`
+        # alias, and an operator sent to look for a repo-qualified `.pid` that was never written is
+        # reading the wrong artifact -- the "answered about the wrong one" class, in the operator's
+        # own words.
+        which = worker_live_which(n)[1] or name
+        return False, "worker %s is still running -- one worker per PR" % which, False
     if live is None:
         # ⛔ UNANSWERABLE IS NOT "FREE". Spawning on an unreadable status would re-create the exact
         # defect this guard exists for -- two workers in one deterministic directory, the second
@@ -3808,10 +3838,11 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
     # costs one `--status` on the only path that spawns anything.
-    again = worker_live_for(n)            # BOTH names: the worktree is `prd-<n>` in every mode
+    again = worker_live_for(n)            # BOTH SPELLINGS: the worktree is `prd-<n>` in every mode
     if again is not False:
         return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
-                       "was being prepared -- refusing to spawn a second one" % name, False)
+                       "was being prepared -- refusing to spawn a second one"
+                % (worker_live_which(n)[1] or name), False)
     # cwd is HOME for the same TCC reason the old cmux path used it: a cwd under ~/Documents is
     # protected and a launchd-spawned caller has no Full Disk Access. The dispatcher takes absolute
     # paths and does its own `cd "$WT"` internally.
@@ -5100,9 +5131,12 @@ def run_pass(args, rubric_note: str = "") -> int:
         if live:
             # COUNTED, so the pass line names it (see `_finish`): "dispatched 0 of 3 queued —
             # nothing to do" is a false clean when the truth is "three PRs already have a worker".
+            # ⛔ AND THE LINE NAMES THE SPELLING THAT ANSWERED (#2725 review, P2): it can be the
+            # legacy `prd-<n>`, and printing this pass's repo-qualified name would send an operator
+            # after a `.pid` that was never written.
             stalled["worker-running"] = stalled.get("worker-running", 0) + 1
             log("#%s (%s): worker %s is still running -- not spawning a second one"
-                % (key, action, worker_name(key)))
+                % (key, action, worker_live_which(key)[1] or worker_name(key)))
             continue
         if live is None:
             # ⛔ UNANSWERABLE IS NOT "FREE" (see worker_live): skip, loudly. It clears as soon as

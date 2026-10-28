@@ -374,7 +374,9 @@ ask_status() { # <name> <started-file>
 #
 # So the question asked here is the DOCTOR's question — is ANY worker alive on this WORKTREE? —
 # answered from the order population (every `$O/bg/<name>.started` recording that worktree) PLUS the
-# PRE-#2725 spelling (`prd-<n>`), which is transitional: nothing writes it any more, and that arm
+# PRE-#2725 spelling (`prd-<n>`), which is transitional -- and THIS SCRIPT is why it is bounded by the
+# ORDER RECORDS rather than by the doctor's deploy: a re-offer below reuses the order's RECORDED name,
+# so a pre-change order keeps producing `prd-<n>` artifacts until it is drained or aged out. That arm
 # goes when no box carries a pre-#2725 worker record. An UNANSWERABLE read wins over a later
 # negative: the safe direction is not to spawn.
 # The PRIMARY arm is name-agnostic (it matches the `.started` record's `worktree` field), which is
