@@ -44,7 +44,7 @@ PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$*"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$*"; }
 skip() { SKIP=$((SKIP + 1)); printf '  ⏭️  SKIPPED: %s\n' "$*"; }
-say()  { printf '\n%s\n' "$*"; }
+log_line()  { printf '\n%s\n' "$*"; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/lc-test.XXXXXX")" || { echo "cannot mktemp" >&2; exit 1; }
 cleanup() {
@@ -106,7 +106,7 @@ run_no_tty() {
 session_pid() { "$TMUX_BIN" list-panes -t "=$S" -F '#{pane_pid}' 2>/dev/null; }
 
 # ── G. static `-A` arm (runs with or without tmux) ───────────────────────────────────────────────
-say "G. STATIC — no new-session line carries -A (comments stripped: this file names the trap on purpose)"
+log_line "G. STATIC — no new-session line carries -A (comments stripped: this file names the trap on purpose)"
 
 # Comment lines are stripped before the predicate, the same discipline launchd-cycle.sh uses: the
 # header QUOTES the broken form while explaining it, so a whole-file grep would prove nothing.
@@ -133,7 +133,7 @@ else
 fi
 
 # ── E. plist -> pane environment parity ─────────────────────────────────────────────────────────
-say "E. every EnvironmentVariables key in the plist is forwarded by CONTROLLER_ENV (both directions)"
+log_line "E. every EnvironmentVariables key in the plist is forwarded by CONTROLLER_ENV (both directions)"
 
 plist_keys() {
   awk '/<key>EnvironmentVariables<\/key>/,/<\/dict>/' "$1" \
@@ -175,7 +175,7 @@ else
 fi
 
 # ── F. a lane-prefixed session name is refused ───────────────────────────────────────────────────
-say "F. a session name that matches a lane prefix is REFUSED (it would be counted and reaped as a worker)"
+log_line "F. a session name that matches a lane prefix is REFUSED (it would be counted and reaped as a worker)"
 _out="$(CONTROLLER_SESSION=lane-oops bash "$TARGET" 2>&1)"; _rc=$?
 if [ "$_rc" -eq 78 ] && grep -q 'matches a lane prefix' <<<"$_out"; then
   ok "CONTROLLER_SESSION=lane-oops is refused (rc=78) and says why"
@@ -190,7 +190,7 @@ if bash -n "$TARGET" 2>/dev/null; then ok "bash -n clean"; else bad "bash -n fai
 # is the real binary declining to attach without a tty. Absence is therefore a NAMED skip that says
 # exactly what did not run — never a silent pass.
 if [ -z "$TMUX_BIN" ]; then
-  say "A/B/C/D: tmux is NOT installed on this runner"
+  log_line "A/B/C/D: tmux is NOT installed on this runner"
   skip "cases A, B and C (create / existing-session / the -A regression) did not run — the tmux binary is the artifact under test and cannot be stubbed. Case G still pins the -A shape textually."
   skip "case D (the restart-rate floor) did not run — it needs a session to end"
   printf '\n%s\n' "RESULT: $PASS passed, $FAIL failed, $SKIP skipped (tmux absent — behavioural arms NOT covered)"
@@ -199,7 +199,7 @@ if [ -z "$TMUX_BIN" ]; then
 fi
 
 # ── C. THE REGRESSION: the old form must fail with a session present and no tty ─────────────────
-say "C. REGRESSION — the OLD '\-A' form fails with a session present and NO terminal (positive control)"
+log_line "C. REGRESSION — the OLD '\-A' form fails with a session present and NO terminal (positive control)"
 "$TMUX_BIN" new-session -d -s "$S" "exec /bin/sleep 300" || bad "could not create the fixture session"
 if "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
   ok "fixture: '$S' exists, so the -A path will take the ATTACH branch"
@@ -222,7 +222,7 @@ fi
 "$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
 
 # ── A. no session -> create it, detached, exit 0 ────────────────────────────────────────────────
-say "A. no session -> creates it DETACHED and exits 0"
+log_line "A. no session -> creates it DETACHED and exits 0"
 A_ERR="$TMP/a.err"
 bash "$TARGET" >"$TMP/a.out" 2>"$A_ERR" &
 A_PID=$!
@@ -260,7 +260,7 @@ else
 fi
 
 # ── H. an EMPTY plist value still reaches the pane ──────────────────────────────────────────────
-say "H. an EMPTY plist value is FORWARDED, not dropped (the pane must not inherit the tmux SERVER's)"
+log_line "H. an EMPTY plist value is FORWARDED, not dropped (the pane must not inherit the tmux SERVER's)"
 # install.sh renders OR empty ON PURPOSE (#2040: derive it from $REPO's origin). If the entry point
 # forwards only NON-EMPTY values, the pane silently inherits the server's OR, and the controller grades
 # one repo's queue while dispatching into another -- #2040's measured symptom, and invisible.
@@ -284,7 +284,7 @@ else
   bad "case H: REPO did not reach the pane — got: $H_ENV"
 fi
 # ── B. session already exists -> exit 0, no attach, no second controller ────────────────────────
-say "B. session ALREADY EXISTS -> exit 0, NO attach, and NOT a second controller"
+log_line "B. session ALREADY EXISTS -> exit 0, NO attach, and NOT a second controller"
 "$TMUX_BIN" new-session -d -s "$S" "exec /bin/sleep 300" || bad "could not create the case-B fixture"
 B_PANE_BEFORE="$(session_pid)"
 B_ID_BEFORE="$("$TMUX_BIN" list-sessions -F '#{session_name} #{session_created}' 2>/dev/null | awk -v n="$S" '$1==n{print $2}')"
@@ -329,7 +329,7 @@ else
 fi
 
 # ── D. the restart-rate floor is real ───────────────────────────────────────────────────────────
-say "D. the restart-rate floor is REAL (a 2 s floor is measured on the clock, not read from the source)"
+log_line "D. the restart-rate floor is REAL (a 2 s floor is measured on the clock, not read from the source)"
 if grep -q 'must be a non-negative integer' <<<"$(CONTROLLER_RESTART_FLOOR=abc bash "$TARGET" 2>&1)"; then
   ok "case D: a non-numeric floor is refused by name"
 else
@@ -361,6 +361,6 @@ else
 fi
 
 # ── summary ────────────────────────────────────────────────────────────────────────────────────
-say "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
+log_line "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
