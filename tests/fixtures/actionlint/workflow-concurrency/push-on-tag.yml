@@ -1,0 +1,13 @@
+# A tagged `on:` value. Round 4 refused aliases and single-bang tags and let a double-bang tag
+# through by one character; the tag was then recorded as a trigger NAME, so the file was neither PR
+# nor push and every rule went vacuous (#2660 round 5).
+name: Push on tag
+on: !!seq [push]
+concurrency:
+  group: push-on-tag-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
