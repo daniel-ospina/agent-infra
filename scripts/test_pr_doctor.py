@@ -5673,6 +5673,32 @@ def test_a_poisoned_started_record_neither_crashes_the_pass_nor_reads_as_foreign
     pr.canonical_paths()
 
 
+def test_the_checkout_boundary_is_a_PATH_SEGMENT_not_a_STRING_PREFIX(monkeypatch):
+    """⛔ THE `+ os.sep` GUARD, PINNED DIRECTLY (#2725 review cycle 3).
+
+    Every other `_in_this_checkout()` assertion pins a case where TWO DIFFERENT TREES are involved,
+    so a mutant that dropped the separator would still pass them: `/x/other/prd-42` does not
+    `startswith("/x/wt")` either way. The separator is load-bearing exactly once -- when a SIBLING
+    checkout's name begins with this one's (`/x/wt2` vs root `/x/wt`), where a bare prefix match
+    says "ours". That over-attributes a FOREIGN worker to this PR, which is the T3 half: its
+    liveness is then asked as this PR's holder. It costs a slot rather than destroying work, but it
+    is a wrong answer computed from a correct-looking comparison, so it gets its own assertion.
+
+    The empty-`WORKTREE_ROOT` branch is pinned here too: an unconfigured root is not evidence that
+    the worker is foreign, and the only safe answer to absent evidence is to probe.
+    """
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", "/x/wt")
+    assert pr._in_this_checkout("/x/wt/prd-42") is True, "a child of the root is ours"
+    assert pr._in_this_checkout("/x/wt2/prd-42") is False, \
+        "a SIBLING checkout whose name prefixes the root was read as ours -- the `+ os.sep` guard is gone"
+    assert pr._in_this_checkout("/x/wt-suffix/prd-42") is False
+    assert pr._in_this_checkout("/x/prd-42") is False
+
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", "")
+    assert pr._in_this_checkout("/anywhere/prd-42") is True, \
+        "an unconfigured root is absent evidence, and absent evidence must PROBE"
+
+
 def test_a_row_written_before_the_rename_still_holds_and_frees_its_slot(tmp_path, monkeypatch):
     """⛔ IN-FLIGHT ROWS SURVIVE THE RENAME (#2725), both directions.
 
