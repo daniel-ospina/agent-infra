@@ -3802,9 +3802,11 @@ while read -r N; do
   # requirement moves from "a local board must be readable" to "the cross-box registry must answer",
   # and the CLEAN arm below is what READS it: a live claim is a COLLISION, an unreadable registry is
   # INCOMPLETE, and an ABSENT registry is INCOMPLETE when the holder answer depends on it (the
-  # HOLDER_BY_CLAIMS branch). "Cannot determine" is never CLEAN. Only the case where the holder
-  # surface is the SOLE unreadable one is re-routed: any other incomplete surface (gh down, open PRs
-  # unreadable) keeps the refusal, because there the tool could not judge the WORK itself.
+  # HOLDER_BY_CLAIMS branch). "Cannot determine" is never CLEAN. Only surfaces whose OWN cause is the
+  # unanswerable board are re-routed: a surface that is unreadable for its own reason (gh down, an
+  # issue state the tool cannot interpret, open PRs uncountable) keeps the refusal, because there the
+  # tool could not judge the WORK itself. See the CAUSE-SET arm below for why the condition is the
+  # cause and not the surface count (agent-infra#2952).
   HOLDER_BY_CLAIMS=0
   if [ "$V" = INCOMPLETE ] && [ "$degraded" -eq 0 ] && [ "$PRE_RC" -eq 2 ]; then
     # ⛔ THE SURFACE SET COMES FROM THE VERDICT LINE, NOT FROM THE REPORT BODY (cycle-2 review, F2).
@@ -3821,10 +3823,46 @@ while read -r N; do
     # producer happens to put in front of it — that literal was what made this whole arm a silent
     # no-op for six days once tortoise#9423 reworded it to `could not be FULLY queried (`.
     inc_verdict="$(preflight_incomplete_surfaces "$PRE")"
-    case "$inc_verdict" in
-      "issue assignee/holder") HOLDER_ONLY=1 ;;
-      *) HOLDER_ONLY=0 ;;
-    esac
+    # ⛔ THE SUBSTITUTION IS KEYED ON THE CAUSE SET, NEVER ON THE SURFACE COUNT (agent-infra#2952 —
+    # measured on cell4, and the reason the #1935 arm could never fire there). #1935 required the
+    # verdict line to name the holder surface ALONE. A cell names it TWICE ('issue landed, issue
+    # assignee/holder') because the claim gate ABORTS the whole issue scan: one surface's inability is
+    # recorded as another surface's unreadability, both carrying the SAME note. So the count read 2,
+    # `HOLDER_ONLY` stayed 0, and the box spent its entire pre-flight budget refusing candidates it
+    # could have judged — `12 unjudged`, `227 not reached`, `0 dispatched`, every pass.
+    #
+    # The condition that is actually load-bearing is the CAUSE, not the population: a surface whose
+    # ONLY failure is 'the local board could not answer' is asking the one question the cross-box
+    # claims registry exists to answer, so the substitution answers it once for the whole set. The
+    # surface NAME is still required (the holder must be named, or there is nothing to substitute),
+    # and a surface carrying ANY other cause keeps the refusal — that is the `issue landed` whose own
+    # state is uninterpretable, or an unreadable `gh`, and those are the tool failing to judge the
+    # WORK, which no registry can repair.
+    #
+    # ⛔ THE SURFACE IS MATCHED AGAINST THE PARSED ROW SET, SO AN UNPARSED SURFACE FAILS CLOSED. A name
+    # the verdict line states but `preflight_unusable_surfaces` cannot read has no cause at all, and
+    # 'no cause' must never satisfy 'every cause is the board' — that is the fail-OPEN this arm is
+    # shaped to refuse, not a parser tolerance to add later.
+    HOLDER_ONLY=0
+    if [ -n "$inc_verdict" ]; then
+      # The verdict line's list is comma-separated; a surface name never contains a comma.
+      inc_named="$(printf '%s\n' "$inc_verdict" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$')" || inc_named=""
+      inc_board="$(preflight_unusable_surfaces "$PRE" 2>/dev/null | awk -F'\t' '$2 ~ /^claim gate: the FLEET BOARD could not answer/ { print $1 }')"
+      inc_n=0; inc_has_holder=0; inc_all_board=1
+      while IFS= read -r inc_s; do
+        [ -n "$inc_s" ] || continue
+        inc_n=$((inc_n + 1))
+        [ "$inc_s" = "issue assignee/holder" ] && inc_has_holder=1
+        # ⛔ WHOLE-LINE (`-x`), NOT A SUBSTRING: `local branches` is not `remote branches`, and a
+        # substring test would let one surface's cause stand in for another's. A here-string, not a
+        # pipe — `printf | grep -q` is the SIGPIPE idiom refused repo-wide (#841/#864), and there a
+        # quiet grep reads FALSE on a large report, which HERE would refuse a legitimate re-route.
+        grep -qxF -- "$inc_s" <<<"$inc_board" || inc_all_board=0
+      done <<< "$inc_named"
+      if [ "$inc_n" -gt 0 ] && [ "$inc_has_holder" -eq 1 ] && [ "$inc_all_board" -eq 1 ]; then
+        HOLDER_ONLY=1
+      fi
+    fi
     # ⛔ A SET THAT CANNOT BE READ IS ANNOUNCED, NOT SWALLOWED (agent-infra#2952). Failing CLOSED
     # when the verdict line cannot be read is right, and it is what the arm above does — but it kept
     # a provisioned cell at `0 dispatched` for six days with NOTHING naming the parse, and the

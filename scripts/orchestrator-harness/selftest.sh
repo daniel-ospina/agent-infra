@@ -1307,6 +1307,79 @@ VERDICT: INCOMPLETE (exit 2) — 1 surface(s) is unreadable; this is NOT clean')
     *) rc=1 ;;
   esac
   ck "(2952e) …and the drift is ANNOUNCED, not swallowed (a silent no-op is what must not recur)" $rc
+
+  # ── (2952f–i) THE CELL'S REAL SHAPE: TWO SURFACES, ONE CAUSE (agent-infra#2952) ─────────────────
+  # ⛔ (2952a)–(2952e) ABOVE PINNED THE *PARSER* — they all carry a verdict line naming ONE surface,
+  # which is NOT the shape a cell produces. #2952's headline defect is the one they cannot see: the
+  # claim gate ABORTS the whole issue scan on a cell, so the producer records ONE inability as TWO
+  # unreadable surfaces, both carrying the SAME board note:
+  #   `2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder)`
+  # #1935 required the holder surface to be named ALONE, so `HOLDER_ONLY` was 0 for every cell
+  # candidate and the substitution could never fire — measured as `12 unjudged`, `227 not reached`,
+  # `0 dispatched`, every pass, with the whole pre-flight budget spent refusing candidates the box
+  # could have judged. The condition is the CAUSE, so these arms key on it:
+  #   (f) every named surface's cause is the unanswerable board + the holder is named → JUDGED;
+  #   (g) …and an UNREADABLE registry is still INCOMPLETE (the substitution moves the requirement,
+  #       it does not remove it) — the same report, only the registry's verdict changed;
+  #   (h) a board-caused set that does NOT name the holder surface → refused (nothing to substitute);
+  #   (i) a surface the verdict line NAMES but the parser cannot read a cause for → refused,
+  #       because "no cause" must never satisfy "every cause is the board".
+  # ⛔ (g) IS THE POLARITY ARM AND IT IS DELIBERATELY THE *SAME FIXTURE* AS (f): if the two ever
+  # disagree the difference is the registry's answer and nothing else, so a mutant that drops the
+  # registry requirement reds (g) while (f) stays green — which is what makes (f) non-vacuous.
+  cat > "$TMP/cell2952-multi.report" <<'REPORT'
+issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv')
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv')
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean for #2218 in daniel-ospina/tortoise — PART of this is the LANE ROSTER is UNKNOWN (not empty)
+REPORT
+  CELL2952F="$(holder_report x "$(cat "$TMP/cell2952-multi.report")")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952F" f1
+  if r2952_is_queued "$CELL2952F"; then rc=0; else rc=1; fi
+  ck "(2952f) the CELL's real verdict (TWO surfaces, ONE board cause) is JUDGED — the registry answers the one open question" $rc
+  case "$(cat "$TMP/2952-f1.out")" in
+    *"the pre-flight's HOLDER surface could not answer"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952f) …and it was the HOLDER substitution that judged it (not a silently different CLEAN path)" $rc
+  # (2952g) THE POLARITY, ON THE SAME REPORT: the substitution moves the requirement from "a local
+  # board must answer" to "the cross-box registry must answer". An unreadable registry answers
+  # nothing, so the candidate is INCOMPLETE and is neither queued nor retired.
+  CELL2952G="$(holder_report x "$(cat "$TMP/cell2952-multi.report")")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="the registry could not be read (stub)"; return 2; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952G" f2
+  if r2952_is_queued "$CELL2952G"; then rc=1; else rc=0; fi
+  ck "(2952g) …with an UNREADABLE registry the SAME report is still INCOMPLETE — the cause keys the arm, not the count" $rc
+  case "$(tr '\n' ' ' < "$CELL2952G/checked.txt")" in *10*) rc=1 ;; *) rc=0 ;; esac
+  ck "(2952g) …and not retired (a claim is a window, so the candidate is re-attempted next pass)" $rc
+  # (2952h) A BOARD-CAUSED SET WITHOUT THE HOLDER SURFACE. The cause matches, so the cause alone would
+  # re-route it — but there is no holder answer to substitute, so nothing may be judged.
+  CELL2952H="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be FULLY queried (issue landed); this is NOT clean')"
+  r2952_run "$CELL2952H" f3
+  if r2952_is_queued "$CELL2952H"; then rc=1; else rc=0; fi
+  ck "(2952h) a board-caused INCOMPLETE that does NOT name the holder surface is REFUSED (nothing to substitute)" $rc
+  # (2952i) A SURFACE THE VERDICT LINE NAMES, WITH NO CAUSE THIS READER CAN FIND. The cause test is
+  # SET MEMBERSHIP over the parsed rows, so an unparsed surface has no cause at all — and "no cause"
+  # must never read as "the board's cause", or the arm fails OPEN on a parser miss.
+  CELL2952I="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean')"
+  r2952_run "$CELL2952I" f4
+  if r2952_is_queued "$CELL2952I"; then rc=1; else rc=0; fi
+  ck "(2952i) a surface NAMED by the verdict line but ABSENT from the parsed set is REFUSED (no cause is not the board's)" $rc
 fi
 
 # ── 5m) REPO has NO path default — required, or derived from a checkout of the QUEUE's repo ─────
