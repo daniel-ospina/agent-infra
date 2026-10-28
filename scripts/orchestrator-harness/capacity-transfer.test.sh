@@ -54,6 +54,17 @@
 # argument, where a `$(…)` substituion would silently supply the status of `cat` instead.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ⛔ THE CAPABILITY GATE IS DISABLED FOR THE ARMS IN THIS FILE, BY NAME AND ON PURPOSE (agent-infra#2935).
+# `run_agent` measures the box — one bounded `pi` call — immediately before every launch, and these
+# arms drive `run_agent` with a STUB `pi` that never emits the probe's answer token. With the gate live
+# here, each arm would spend up to 2 x LANE_PREFLIGHT_BOUND on a stub and then be REFUSED by a gate
+# this file is not testing, so an arm about the LOAD or DISK gate would report a capability refusal.
+# The capability gate has its own arms (`cell-lane-preflight.test.sh`, and the capability block in
+# `spawn-gate.test.sh`, which re-enables it with LANE_PREFLIGHT=1). This is the documented operator
+# escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
+# these arms go red, which is the assertion that the line is load-bearing rather than decorative.
+export LANE_PREFLIGHT=0
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
@@ -65,6 +76,16 @@ LANE="$HERE/lane.sh"; CHAIN="$HERE/chain-merge.sh"; ORCH="$HERE/orch-loop.sh"; C
 for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
 done
+
+# ⛔ A COMPLIANT BRIEF FIXTURE (#2258): `run_agent` now runs the research-first gate BEFORE the load,
+# disk, land-backlog and fork gates, so a fixture whose whole body is `prompt` is refused with 80 and
+# every arm below that asserts a CAPACITY outcome reads that refusal instead of its subject (measured
+# on this suite: 8 arms — `bgrc=80` and `frc=80` where 74 and 0 were wanted, and the land-backlog lines
+# they grep for never appear). RENDERED from the shipped validator, never hand-typed, so the fixture
+# cannot drift from the gate’s own advice — the same rule `spawn-gate.test.sh` follows.
+BRIEF_OK="$TMP/brief-ok.txt"; export BRIEF_OK   # every driver below is a `bash -c` child
+{ printf 'RESEARCH FIRST\n'; "$HERE/brief-gate.sh" --section lane; } > "$BRIEF_OK"
+[ -s "$BRIEF_OK" ] || { echo "❌ could not render the compliant brief fixture"; exit 2; }
 
 echo "==> capacity-transfer self-test ($HERE)"
 
@@ -196,13 +217,22 @@ lbgh_shape "$TMP/lbgh-nopr"    81  0   15 0 "bug" "a normal issue" 0
 # env over-ride on purpose: pointing it at an empty repo would be a bypass). No commits needed; the
 # gate only reads `remote.origin.url`.
 LBWT="$TMP/lbwt"; mkdir -p "$LBWT"
-( cd "$LBWT" && git init -q . && git remote add origin https://github.com/daniel-ospina/agent-infra.git ) >/dev/null 2>&1
+( cd "$LBWT" && git init -q . && git remote add origin https://github.com/daniel-ospina/agent-infra.git \
+    && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && git checkout -q --detach ) >/dev/null 2>&1
+# ⛔ THE LANE'S CWD MUST BE THE TARGET REPO (agent-infra#2724/#2694). lane.sh now asserts the
+# worktree's origin against the repo it was dispatched for and REFUSES (72) when they disagree — the
+# measured wrong-repo lane. These fixtures drive the GATE, not the repo check, so their cwd is a real
+# checkout of the repo they name. A `cd "$TMP"` (a plain temp dir) would be the very defect the
+# assertion exists to catch, and the suite would report gate regressions that are not regressions.
+LANECWD="$TMP/lanecwd"; mkdir -p "$LANECWD"
+( cd "$LANECWD" && git init -q . && git remote add origin https://github.com/daniel-ospina/agent-infra.git \
+    && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && git checkout -q --detach ) >/dev/null 2>&1
 # A SECOND fixture WITH A COMMIT (and therefore a branch name). `git rev-parse --abbrev-ref HEAD` is
 # what the `prfix` evidence reads, and it fails on a repo with no commits — so the positive arm needs a
 # tree a branch can be named in, while the negative arm must be a real "branch exists, no PR" case.
 LBWT2="$TMP/lbwt2"; mkdir -p "$LBWT2"
 ( cd "$LBWT2" && git init -q . && git remote add origin https://github.com/daniel-ospina/agent-infra.git \
-    && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init ) >/dev/null 2>&1
+    && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && git checkout -q --detach ) >/dev/null 2>&1
 
 # The AUTHORITATIVE stubs: exported functions (see the header). Each records that it answered, so a
 # stub the tested script never resolved cannot pass as "stubbed".
@@ -260,7 +290,7 @@ echo "=== §1 the refusal becomes a durable record (state/capacity-refused-<N>) 
 # The yield length is pinned to a non-default value so the check is not satisfied by the default.
 LANE_YIELD=120
 BEFORE="$(date +%s)"
-( cd "$TMP" && O="$O" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
+( cd "$LANECWD" && O="$O" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
     CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" 7 feat/7-tm daniel-ospina/agent-infra ) > "$TMP/lane7.out" 2>&1
 lrc=$?
 AFTER="$(date +%s)"
@@ -284,7 +314,7 @@ ck "the lane log states the transfer (an operator can see the release is coming)
 # The DISK gate reports itself as 'disk': the two refusals have opposite remedies, so a record that
 # said 'load' on a full filesystem would send the operator to wait for an event that cannot arrive.
 rm -f "$DF_FUNC_MARK"
-( cd "$TMP" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=500 DISK_GATE_PATH="$TMP" STUB_DISK_FULL=1 \
+( cd "$LANECWD" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=500 DISK_GATE_PATH="$TMP" STUB_DISK_FULL=1 \
     CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" 8 feat/8-tm daniel-ospina/agent-infra ) > "$TMP/lane8.out" 2>&1
 l8rc=$?
 dgate=""
@@ -309,7 +339,7 @@ ck "  …and the exported df stub answered (not a real filesystem reading — a 
 # shipped 200 margin), by exporting the two capacity functions the gate consumes, so the gate, the
 # refusal code, the record and the log line are all the real ones.
 rm -f "$O/state/capacity-refused-17"
-( cd "$TMP"
+( cd "$LANECWD"
   # shellcheck shell=bash
   cap_procs_pair_vars() { printf -v "$1" '%s' 15631; printf -v "$2" '%s' 15641; printf -v "$3" '%s' uid; }
   cap_h_for_vars() {
@@ -370,7 +400,7 @@ else
 fi
 
 # A non-numeric issue id must not be turned into a path — lane.sh is also invoked by hand.
-( cd "$TMP" && O="$O" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
+( cd "$LANECWD" && O="$O" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
     bash "$LANE" '../../escape' 'x' daniel-ospina/agent-infra ) > "$TMP/laneesc.out" 2>&1
 esc_rc=$?
 { [ ! -e "$TMP/escape" ] && [ ! -e "$O/state/capacity-refused-../../escape" ]; }; rc=$?
@@ -813,7 +843,7 @@ lbgh_install "$TMP/lbgh-deep"
 : > "$PI_LOG"
 ( O="$O" KIND=bg TAG=107 \
     bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; \
-             printf "prompt\n" > "$2/bg.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             cp "$BRIEF_OK" "$2/bg.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/bg.log" "$2/bg.txt" "bg 107"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 bgrc=$?
 { [ "$bgrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
@@ -836,7 +866,7 @@ ck "§LB lambda is the BEST of the two 24h windows (10 today / 40 yesterday -> c
 lbgh_install "$TMP/lbgh-broken"
 ( O="$O" KIND=fixer TAG=42 \
     bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; \
-             printf "prompt\n" > "$2/p.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             cp "$BRIEF_OK" "$2/p.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/fix.log" "$2/p.txt" "fixer 42"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 frc=$?
 { [ "$frc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
@@ -873,7 +903,7 @@ lbgh_shape "$TMP/lbgh-prfix-name"   81 0 15 0 "bug" "a normal issue" 7 "01234567
 # a) the branch rule, tied to this HEAD
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-yes"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=78 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pg.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pg.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pg.log" "$2/pg.txt" "prfix 78"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pgrc=$?
@@ -884,7 +914,7 @@ ck "§LB …and the exemption NAMES the PR it proved, not a count or a bare 'yes
 # b) a branch NAME alone is not proof: the PR found by name is at a different commit
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-name"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=79 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/ph.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/ph.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/ph.log" "$2/ph.txt" "prfix 79"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 phrc=$?
@@ -897,7 +927,7 @@ ck "§LB …and the reason reported is the BACKLOG, not an unprovable claim (the
 # d) the same unprovable claim UNDER the ceiling RUNS — an unprovable kind is measured, not held
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-ok"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=80 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pi.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pi.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pi.log" "$2/pi.txt" "prfix 80"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pirc=$?
@@ -923,7 +953,7 @@ lbgh_shape "$TMP/lbgh-prfix-fork" 81 0 15 0 "bug" "a normal issue" 9 "$(git -C "
 lbgh_shape "$TMP/lbgh-prfix-closed" 81 0 15 0 "bug" "a normal issue" 9 "$(git -C "$LBWT2" rev-parse HEAD 2>/dev/null)" closed
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-fork"
 ( cd "$TMP/lbdet" && O="$O" KIND=prfix TAG=81 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pk.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pk.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pk.log" "$2/pk.txt" "prfix 81"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pkrc=$?
@@ -933,7 +963,7 @@ ck "§LB …and a DETACHED (fork-shape) worktree is proven by its COMMIT (rc=$pk
 #    load-bearing (a commit on `main` otherwise "proves" itself via the MERGED PR that introduced it).
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-closed"
 ( cd "$TMP/lbdet" && O="$O" KIND=prfix TAG=82 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pl.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pl.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pl.log" "$2/pl.txt" "prfix 82"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 plrc=$?
@@ -942,7 +972,7 @@ ck "§LB …and a CLOSED PR at this head does NOT exempt (rc=$plrc): the state s
 # c) no proof and over the ceiling — the arm that keeps the bypass shut
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-nopr"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=77 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pf.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pf.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pf.log" "$2/pf.txt" "prfix 77"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pfrc=$?
