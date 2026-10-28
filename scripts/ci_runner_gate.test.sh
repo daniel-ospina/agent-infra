@@ -127,7 +127,25 @@ case "$*" in
     case "${GH_DEMAND_MODE:-ok}" in
       fail) printf 'HTTP 500: upstream error\n' >&2; exit 1 ;;
       none) exit 0 ;;
-      *)    printf '%s\n' "${GH_DEMAND-ubuntu-latest}" ;;
+      *)
+        # ⛔ `GH_DEMAND_JOBS` IS `|`-SEPARATED, ONE ENTRY PER QUEUED JOB, and the stub renders the ANSWER
+        # THE GATE'S jq ASKED FOR — per-job sets, or their UNION. Without that distinction a mutation
+        # that reverts the gate to the union form cannot be detected here at all: the stub would hand
+        # back the same text either way and the mutation would survive on a rounding error (#3002
+        # review P2, round 3). `GH_DEMAND` (one set) stays for every arm that has a single job.
+        if [ -n "${GH_DEMAND_JOBS:-}" ]; then
+          case "$*" in
+            *'sort|join'*) printf '%s\n' "${GH_DEMAND_JOBS//|/$'\n'}" ;;
+            *)  _u=""
+                for _l in ${GH_DEMAND_JOBS//|/,}; do
+                  _l="${_l//,/}"
+                  case ",$_u," in *",$_l,"*) ;; *) _u="${_u:+$_u,}$_l" ;; esac
+                done
+                printf '%s\n' "$_u" ;;
+          esac
+        else
+          printf '%s\n' "${GH_DEMAND-ubuntu-latest}"
+        fi ;;
     esac
     exit 0 ;;
   # The in-progress run ids the mode substitute inspects (a DIFFERENT read from the count above, and
@@ -989,6 +1007,35 @@ assert_contains "$OUT" "demanding_idle=0" "(3d) the only demand-matching runner 
 assert_contains "$OUT" "capacity=stranded" "(3d) the pool advertised gpu, so no online runner taking it IS the fault"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(3d) and the deny keeps the pool engaged"
 
+# ⛔ THE DEMAND AND THE CLAIM ARE BOTH PER SET, NEVER PER UNION (#3002 review P2, round 3) — the union is
+# the same defect TWICE, in opposite directions:
+#   (a) a MATRIX run's queued jobs ask for DIFFERENT runners, and `offers_all` is AND semantics, so the
+#       union of the run's jobs is a set NO runner can match — the run read as `stranded` while both arch
+#       runners sat ONLINE and IDLE.
+#   (b) testing the demand against the union of every REGISTRATION's labels "covered" a demand no single
+#       machine could ever take (idle `ubuntu-latest` runner + offline `gpu` registration), re-entering the
+#       "demand the pool never advertised" deny round 2 carved out.
+echo "── #3002 P2 (round 3): a matrix run's jobs are matched PER JOB, not as one impossible set ──"
+# `$'a\nb'` cannot be written inline: the VAR=VALUE arguments are double-quoted, so an ANSI-C quote
+# there is LITERAL text (a `$`, a backslash) — which the gate rightly rejects as an unspellable demand.
+MATRIX_JOBS="self-hosted-x64|self-hosted-arm64"
+run_gate census-matrix-per-job GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+  GH_DEMAND_JOBS="$MATRIX_JOBS" \
+  GH_CENSUS="idle@self-hosted|Linux|X64|self-hosted-x64,idle@self-hosted|Linux|ARM64|self-hosted-arm64" --
+assert_eq "$RC" "0" "(3e) both jobs are servable, so nothing is stranded"
+assert_contains "$OUT" "demand=self-hosted-x64;self-hosted-arm64" "(3e) both job sets are REPORTED (one line, ;-joined)"
+assert_contains "$OUT" "demanding_idle=2" "(3e) …and BOTH idle arch runners match the job that needs them"
+assert_not_contains "$OUT" "capacity=stranded" "(3e) no runner carries the UNION of the two jobs' labels — and that is not a fault"
+assert_not_contains "$OUT" "GitHub-hosted UNHEALTHY" "(3e) so the reason never blames hosted"
+echo "── #3002 P2 (round 3): a demand NO SINGLE registration can take is never "claimed" ──"
+run_gate census-claim-needs-one-machine GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+  GH_DEMAND="gpu,ubuntu-latest" \
+  GH_CENSUS="idle@self-hosted|Linux|X64|ubuntu-latest,off@self-hosted|gpu" --
+assert_eq "$RC" "0" "(3f) the pass completes"
+assert_contains "$OUT" "demanding_idle=0" "(3f) no online runner matches the whole set"
+assert_not_contains "$OUT" "capacity=stranded" "(3f) the two labels exist on two DIFFERENT machines — that is not a claim"
+assert_not_contains "$OUT" "capacity leg" "(3f) the deny arm is not entered"
+
 # ⛔ THE ANTI-FLAPPER (#2327's decision). In mode=github the pool is stripped ON PURPOSE, so "no online
 # runner offers ubuntu-latest" is the CORRECT state. Denying on it would re-engage the fallback on
 # every healthy tick and fight the recorded decision forever. Same census as above, opposite mode.
@@ -1207,7 +1254,7 @@ PY
 MUT1="$T/ci_runner_gate.mutant-count.sh"
 if mutate_gate "$MUT1" \
   '      if [ "$busy" = true ]; then CENSUS_ON_BUSY=$((CENSUS_ON_BUSY+1)); else CENSUS_ON_IDLE=$((CENSUS_ON_IDLE+1)); fi
-      if offers_all "$labels" "$DEMAND_LABELS"; then' \
+      if offers_any "$labels" "$DEMAND_LABELS"; then' \
   '      CENSUS_ON_BUSY=$((CENSUS_ON_BUSY+1))   # MUTANT::m1 — a count, not a state
       if false; then                          # MUTANT::m1 — and no demand match either'; then
   ok "(m1) the count-not-state mutant was generated from the SHIPPED gate"
@@ -1315,8 +1362,8 @@ fi
 # pool's own advertisement is no longer consulted and a `macos-latest` queue head pins mode=local.
 MUT5="$T/ci_runner_gate.mutant-claim.sh"
 if mutate_gate "$MUT5" \
-  '  [ -n "$CENSUS_OFFERED" ] || return 1' \
-  '  return 0   # MUTANT::m5 — every demand is "claimed", the pool is never asked what it advertises'; then
+  '      if offers_all "$have" "$set"; then return 0; fi' \
+  '      return 0   # MUTANT::m5 — every demand is "claimed", no registration is asked what it carries'; then
   ok "(m5) the always-claimed mutant was generated from the SHIPPED gate"
   GATE_UNDER_TEST="$MUT5"
   run_gate mutant-claim GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
@@ -1375,6 +1422,28 @@ if mutate_gate "$MUT7" \
   fi
 else
   bad "(m7) the mutant could not be generated (anchor moved) — the current-verdict contract is unproven"
+fi
+
+# (m8) THE DEMAND GOES BACK TO THE UNION OF A RUN'S QUEUED JOBS: a matrix run's jobs ask for
+# different runners, so the union is a set no machine can match and a servable queue reads as stranded.
+MUT8="$T/ci_runner_gate.mutant-demand-union.sh"
+if mutate_gate "$MUT8" \
+  '|.labels|sort|join(",")]|unique|.[]' \
+  '|.labels[]]|unique|join(",")   # MUTANT::m8 — the UNION of every queued job, as before'; then
+  ok "(m8) the demand-union mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT8"
+  run_gate mutant-demand-union GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+    GH_DEMAND_JOBS="$MATRIX_JOBS" \
+    GH_CENSUS="idle@self-hosted|Linux|X64|self-hosted-x64,idle@self-hosted|Linux|ARM64|self-hosted-arm64" --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  assert_eq "$RC" "0" "(m8) the mutant still RUNS — so the red below is the property, not a crash"
+  if grep -qF "demanding_idle=2" <<<"$OUT"; then
+    bad "(m8) MUTATION SURVIVED: joined into one set, both arch runners STILL matched"
+  else
+    ok "(m8) mutation killed: as a union, the two jobs ask for a machine that does not exist and NEITHER idle runner matches (arm 3e reddens)"
+  fi
+else
+  bad "(m8) the mutant could not be generated (anchor moved) — the per-job demand sets are unproven"
 fi
 
 echo "── --dry-run and --status stay read-only ──"

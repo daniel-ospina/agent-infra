@@ -225,7 +225,13 @@ CENSUS_ON_BUSY=0
 CENSUS_OFFLINE=0
 CENSUS_DEMAND_IDLE=0
 CENSUS_DEMAND_BUSY=0
-DEMAND_LABELS=""       # comma-joined label set the queue HEAD is asking for ("" = not measured)
+DEMAND_LABELS=""       # ONE LABEL SET PER LINE — one per QUEUED JOB ("" = not measured)
+DEMAND_SHOWN=""        # the same sets on ONE line (`;`-joined), for the key=value surfaces
+# ⛔ ONE SET PER JOB, NEVER THE UNION OF A RUN'S JOBS (#3002 review P2, round 3). A matrix run's queued
+# jobs ask for DIFFERENT runners (`self-hosted-x64`, `self-hosted-arm64`), and `offers_all` implements
+# GitHub's AND semantics — ONE runner must carry a whole set. Joined into a single set, no runner can
+# ever match it, so a run nobody is stranded for read as `stranded` while both arch runners sat ONLINE
+# AND IDLE. The union is a fine THING TO REPORT and a wrong thing to MATCH.
 CAPABILITY=""          # which permission the inventory read needed, when it could not be read
 MODE_SOURCE="runners"  # runners | jobs-inference | none — how `mode` was obtained
 CAP_DENY=0             # set by capacity_verdict: 1 = this pass may not certify capacity
@@ -305,6 +311,17 @@ offers_all() {
 # census_classify <rows> — the three states, PER RUNNER, and the demand match.
 # rc 0 = measured (zero rows is a readable zero) · rc 1 = unreadable rows (a schema change, a
 # truncated body, gh's own error text) — never counted as zero runners.
+# offers_any <runner-label-set> <newline-separated job label sets> — does this runner satisfy ANY one
+# queued job's whole set? (Per job, never per union — see DEMAND_LABELS.)
+offers_any() {
+  local have="$1" set
+  while IFS= read -r set; do
+    [ -n "$set" ] || continue
+    offers_all "$have" "$set" && return 0
+  done <<<"$2"
+  return 1
+}
+
 census_classify() {
   local rows="$1" row st busy rest labels lcount nl commas n=0
   CENSUS_ON_IDLE=0; CENSUS_ON_BUSY=0; CENSUS_OFFLINE=0; CENSUS_DEMAND_IDLE=0; CENSUS_DEMAND_BUSY=0
@@ -313,9 +330,9 @@ census_classify() {
   # early `return 1` the counters were half-counted and the KV still described the PREVIOUS body — an
   # artifact that does not match its measurement, which is the shape this change removes elsewhere.
   CENSUS_KV=""; CENSUS_DETAIL=""
-  # The OFFERED set is built here, from the same rows, so "what the pool claims" and "what is online"
-  # can never drift into two reads that disagree (see CENSUS_OFFERED).
-  CENSUS_OFFERED=""
+  # The per-registration label sets are built here, from the same rows, so a CLAIM can be a statement
+  # about ONE machine and can never drift into a second read that disagrees (CENSUS_REGISTRATIONS).
+  CENSUS_REGISTRATIONS=""
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     case "$row" in *$'\t'*) ;; *) return 1 ;; esac
@@ -341,19 +358,20 @@ census_classify() {
       if [ -n "$labels" ]; then commas="${labels//[!,]/}"; nl=$(( ${#commas} + 1 )); fi
       [ "$nl" = "$lcount" ] || CENSUS_LABEL_AMBIGUOUS=1
     fi
-    # Every registration contributes its labels to the OFFERED set — an offline runner's label is
-    # still something the pool says it serves, and that is what makes a stranded deny meaningful.
+    # Every registration contributes its OWN label set — an offline runner's labels are still something
+    # the pool says it serves, and that is what makes a stranded deny meaningful.
     if [ -n "$labels" ]; then
-      case "$CENSUS_OFFERED" in
-        '') CENSUS_OFFERED="$labels" ;;
-        *)  CENSUS_OFFERED="$CENSUS_OFFERED,$labels" ;;
+      case "$CENSUS_REGISTRATIONS" in
+        '') CENSUS_REGISTRATIONS="$labels" ;;
+        *)  CENSUS_REGISTRATIONS="$CENSUS_REGISTRATIONS
+$labels" ;;
       esac
     fi
     n=$((n+1))
     if [ "$st" = online ]; then
       # ⛔ THE THREE STATES COME FROM THE API, PER RUNNER — never from a count of registrations.
       if [ "$busy" = true ]; then CENSUS_ON_BUSY=$((CENSUS_ON_BUSY+1)); else CENSUS_ON_IDLE=$((CENSUS_ON_IDLE+1)); fi
-      if offers_all "$labels" "$DEMAND_LABELS"; then
+      if offers_any "$labels" "$DEMAND_LABELS"; then
         if [ "$busy" = true ]; then CENSUS_DEMAND_BUSY=$((CENSUS_DEMAND_BUSY+1)); else CENSUS_DEMAND_IDLE=$((CENSUS_DEMAND_IDLE+1)); fi
       fi
     else
@@ -366,7 +384,7 @@ census_classify() {
       CENSUS_OFFLINE=$((CENSUS_OFFLINE+1))
     fi
   done <<<"$rows"
-  CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY offline=$CENSUS_OFFLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY label_ambiguity=$CENSUS_LABEL_AMBIGUOUS demand=${DEMAND_LABELS:-unknown}"
+  CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY offline=$CENSUS_OFFLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY label_ambiguity=$CENSUS_LABEL_AMBIGUOUS demand=${DEMAND_SHOWN:-unknown}"
   CENSUS_DETAIL="$((CENSUS_ON_IDLE+CENSUS_ON_BUSY)) of $n online (idle=$CENSUS_ON_IDLE busy=$CENSUS_ON_BUSY offline=$CENSUS_OFFLINE)"
   return 0
 }
@@ -382,14 +400,22 @@ census_classify() {
 # A queue whose other runs ask for something else is not measured here, and the KV says `demand=`
 # per run, not "the whole queue".
 queue_demand() {
-  local rid="$1" out
+  local rid="$1" out l sets=0
   case "$rid" in ''|*[!0-9]*) return 1 ;; esac
   out="$(gh api "repos/$REPO/actions/runs/$rid/jobs" \
-        --jq '[.jobs[]|select(.status=="queued")|.labels[]]|unique|join(",")' 2>"$GH_ERR")" || return 1
+        --jq '[.jobs[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[]' 2>"$GH_ERR")" || return 1
   # An empty answer is NOT "no demand": a matrix/`runs-on` form this read does not resolve leaves
   # the demand unmeasured, and an unmeasured demand must not become a claim about matching.
   [ -n "$out" ] || return 1
-  case "$out" in *[!A-Za-z0-9._,+-]*) return 1 ;; esac
+  # Every LINE is one QUEUED JOB's set, and each must be spellable on its own: a job whose set cannot
+  # be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because a
+  # multi-job run is now several lines — see DEMAND_LABELS).
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    case "$l" in *[!A-Za-z0-9._,+-]*) return 1 ;; esac
+    sets=$((sets+1))
+  done <<<"$out"
+  [ "$sets" -gt 0 ] || return 1
   printf '%s' "$out"
 }
 
@@ -400,28 +426,38 @@ queue_demand() {
 # offers ubuntu-latest" is the CORRECT state and denying on it would re-engage the fallback on every
 # healthy tick, forever. Only in mode=local is the pool supposed to serve, and only there is
 # "nothing online can take the demand" a conclusive fault.
-# pool_claims_demand — does THIS pool advertise every label the queue's head asks for?
+# pool_claims_demand — is there ONE registration that could serve ONE queued job's whole label set?
 # rc 0 = yes, the pool claims this work (so "nobody online can take it" is a fault of the pool).
 # rc 1 = no / cannot tell, so the deny must NOT be made.
-# ⛔ A MATCH WE CANNOT TRUST IS NOT A CLAIM (#3002 review P1, same rule as the demand counters): an
-# ambiguous label set means the split is untrustworthy, and a truncated label must never be read as
-# "the pool does not offer this" — that would be a false NARROWING, which is the safe direction, but it
-# is still an unmeasured claim, so it is refused rather than guessed.
-# ⛔ THE FALLBACK LABEL IS ALWAYS A CLAIM even when no runner currently carries it: in mode=local the
-# gate's whole purpose is that `runs-on: ubuntu-latest` work runs on this pool, and the window between
-# "fallback engaged" and "every runner relabelled" must not read as `stranded`.
+# ⛔ THE CLAIM AND THE MATCH ARE STATEMENTS ABOUT THE SAME MACHINE (#3002 review P2, round 3). Testing
+# the demand against the UNION of every registration's labels made a demand that NO SINGLE machine could
+# ever take read as claimed — `gpu,ubuntu-latest` "covered" by an idle `ubuntu-latest` runner plus an
+# offline `gpu` one — so the deny fired for work the pool could never serve. That is the same defect the
+# claim rule was carved out to prevent, re-entered through the union. Both sides are now per set.
+# ⛔ A MATCH WE CANNOT TRUST IS NOT A CLAIM (#3002 review P1): an ambiguous label set makes the split
+# untrustworthy, and a truncated label must never be read as "the pool does not offer this" — refuse
+# rather than guess.
+# ⛔ THE FALLBACK LABEL is the one label the gate ITSELF stamps, so a POOL MEMBER (a registration
+# carrying a pool marker — the only kind `managed_ids` will relabel) may claim a job that asks for it
+# before the relabel lands, and must, or a just-engaged fallback would read as `stranded` in the window
+# before the PUTs land. A registration with NO marker is never relabelled, so it gets no such credit.
 pool_claims_demand() {
-  local have want l
+  local set have
   [ -n "$DEMAND_LABELS" ] || return 1
   [ "$CENSUS_LABEL_AMBIGUOUS" = 0 ] || return 1
-  [ -n "$CENSUS_OFFERED" ] || return 1
-  have=",$(printf '%s' "$CENSUS_OFFERED" | tr '[:upper:]' '[:lower:]'),"
-  want="$(printf '%s' "$DEMAND_LABELS" | tr '[:upper:]' '[:lower:]')"
-  for l in ${want//,/ }; do
-    [ "$l" = "$FALLBACK_LABEL" ] && continue
-    case "$have" in *",$l,"*) ;; *) return 1 ;; esac
-  done
-  return 0
+  [ -n "$CENSUS_REGISTRATIONS" ] || return 1
+  while IFS= read -r set; do
+    [ -n "$set" ] || continue
+    while IFS= read -r have; do
+      [ -n "$have" ] || continue
+      if offers_all "$have" "$set"; then return 0; fi
+      case "$have" in
+        *"$POOL_LABEL_ARM64"*|*"$POOL_LABEL_X64"*)
+          offers_all "$have,$FALLBACK_LABEL" "$set" && return 0 ;;
+      esac
+    done <<<"$CENSUS_REGISTRATIONS"
+  done <<<"$DEMAND_LABELS"
+  return 1
 }
 
 capacity_verdict() {
@@ -703,6 +739,11 @@ print(age)
     fi
     [ -n "$DEMAND_LABELS" ] || log "demand: UNMEASURED for queued=$queued (neither the head nor the newest queued run reported a queued job's labels) — the capacity claim is narrowed to the runner states only"
   fi
+  # ONE LINE FOR THE KEY=VALUE SURFACES (`demand=` in the census KV, the log, the deny's reason), because
+  # DEMAND_LABELS is one set per line now. `;` between sets, so the union that is WRONG to match is still
+  # READABLE to a human: a matrix run reads `self-hosted-arm64;self-hosted-x64`.
+  DEMAND_SHOWN=""
+  [ -n "$DEMAND_LABELS" ] && DEMAND_SHOWN="${DEMAND_LABELS//$'\n'/;}"
   # Re-classify with the demand now known: the first pass classified the label sets before there was
   # anything to match them against. Cheap (it reads the rows already in memory) and it keeps the
   # counts and the matches derived from ONE body rather than two reads that could disagree.
@@ -759,7 +800,7 @@ print(age)
   # in mode=github the pool is stripped by design, so "nothing offers ubuntu-latest" is CORRECT
   # there and denying on it would re-engage the fallback on every healthy tick).
   if [ "$CAP_DENY" = 1 ]; then
-    UNHEALTHY_LEG="capacity leg: mode=${mode:-unknown} and ${CENSUS_DETAIL}, not one online runner can accept the queue's demand (${DEMAND_LABELS}) while queued=$queued — the pool cannot take the work it is supposed to be serving"
+    UNHEALTHY_LEG="capacity leg: mode=${mode:-unknown} and ${CENSUS_DETAIL}, not one online runner can accept the queue's demand (${DEMAND_SHOWN:-unknown}) while queued=$queued — the pool cannot take the work it is supposed to be serving"
     return 1
   fi
   return 0     # healthy   -> prefer GitHub
