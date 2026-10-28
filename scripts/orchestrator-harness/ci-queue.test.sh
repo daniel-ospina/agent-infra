@@ -404,10 +404,18 @@ printf '\n── (c6b) the FLEET disclosure survives the cache ─────�
 # the field exists to prevent, on the path (cache) the token exists for. `busy=` is the precedent: a
 # disclosure field carried through the record. Pinned in three parts — the WRITER persists it, the
 # READER restores it, and an OLDER record (no `fleet=` line) neither breaks nor invents one.
+# ⛔ THE RECORD CARRIES THE VALUE, NOT THE KEY (#2927 review, P3). It used to read
+# `fleet=fleet=unreadable(…)` on disk — the writer prefixed `fleet=` onto a value that already began
+# with it. It round-tripped and (c6b) pinned the doubled form, so nothing broke; but an on-disk record
+# is permanent text a human reads, so the writer now strips the key and the readers re-attach it
+# (`ciq_fleet_restore`). (c6b) therefore pins the CORRECTED single-key form, and (c6d) pins that the
+# restored token still names the failed reading.
 feed 33 2 -
 ciq_read "$OR" >/dev/null 2>&1
-ck "(c6b) a branch-(c) read PERSISTS the fleet disclosure in the record" \
-   "$(grep -q '^fleet=fleet=unreadable(' "$REC"; echo $?)"
+ck "(c6b) a branch-(c) read PERSISTS the fleet disclosure in the record, keyed ONCE" \
+   "$(grep -q '^fleet=unreadable(' "$REC"; echo $?)"
+ck "(c6b') …and the record does NOT carry the doubled key the writer used to emit" \
+   "$([ "$(grep -c '^fleet=fleet=' "$REC")" = 0 ]; echo $?)"
 qenv /nonexistent-gh 0 900
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 v="$(ciq_eval)"

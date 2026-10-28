@@ -24,11 +24,14 @@
 #
 # ── NOT GATED ON THE CI QUEUE, AND THAT IS THE POINT (#2927) ────────────────────────────────
 # Everything this file dispatches acts on a PR THAT ALREADY EXISTS: its head is red, conflicted or
-# under review, and its CI pass has already been spent on it. Repair adds no new CI run, so the CI
-# queue says nothing about whether these dispatches may proceed — and gating them on it was MEASURED
-# to cost throughput directly: 2026-10-27 on cell 4, `queued=33 running=2 runners=~2 => ceiling=4`
-# deferred 41 consecutive PR-repair dispatches (all of them this file's own
-# `skip #<n>: backpressure(q=…,r=…)`) while 11 lane slots and an 8-runner self-hosted fleet sat idle.
+# under review. ⛔ A REPAIR PUSH IS NOT FREE — it DOES start a fresh CI run (`ci-queue.sh`'s header
+# records "its pass is already spent" as NOT TRUE, and that is why the exclusion does not rest on it).
+# The CI queue still says nothing about whether these dispatches may proceed: a spent QUEUE SLOT is
+# not a reason to withhold repair from a PR that already has a head to repair — and gating on it was
+# MEASURED to cost throughput directly: 2026-10-27 on cell 4,
+# `queued=33 running=2 runners=~2 => ceiling=4` deferred 41 consecutive PR-repair dispatches (all of
+# them this file's own `skip #<n>: backpressure(q=…,r=…)`) while 11 lane slots and an 8-runner
+# self-hosted fleet sat idle.
 # The queue it was reading belonged to GitHub-HOSTED concurrency and to the ISSUE→PR path.
 # So this file sources no CI-queue module and reads no queue depth. Its real bounds, all of which stay:
 #   * LANE SLOTS — the caller's `--max-spawn` allowance (orch-loop.sh passes the remaining fix-lane
@@ -425,13 +428,13 @@ ps_held() {
   esac
 }
 
-# ── 5. NOT A CI-QUEUE GATE (see the header: repair adds no new CI run) ────────────
+# ── 5. NOT A CI-QUEUE GATE (see the header: repair spends CI, but a spent slot is no veto) ──────
 # This numbered step used to hold `ps_queue_verdict` — ~90 lines that read the repo's CI queue and
 # derived `ceiling = ceil(runners*horizon/job_p90)` — plus `ps_load_ci_queue`, which sourced
 # `ci-queue.sh` for it, plus a fallback arm that re-derived the same arithmetic when the module was
-# absent. Every dispatch this file makes acts on an EXISTING PR, so that number could only ever
-# withhold work that spent no CI — and it did: 41 consecutive skips in one measured window (#2927),
-# while the runners it was priced against sat idle.
+# absent. Every dispatch this file makes acts on an EXISTING PR — so that number was a reading of
+# THIS BOX's own load, not of the capacity to repair, and it withheld repair anyway: 41 consecutive
+# skips in one measured window (#2927), while the runners it was priced against sat idle.
 # ⛔ IF A FUTURE CHANGE WANTS A QUEUE-DEPTH GATE HERE, the queue is not the thing that changed. Argue
 # it against #2927 in the open, not by re-adding a predicate to this file line by line.
 
@@ -675,10 +678,12 @@ ps_select() {
   if [ -n "$maxspawn" ] && ! ps_is_num "$maxspawn"; then maxspawn=""; fi
 
   # ── NO QUEUE GATE ON THIS PASS (#2927) ──────────────────────────────────────────────
-  # This pass dispatches PR-REPAIR work only (fixers for EXISTING heads), which adds no new CI run, so
-  # it reads no queue depth. The former arm here read the queue once per pass, printed
-  # `[prsick] DEFERRED (backpressure)`, and — worse than the skip lines — GATED THE LEDGER DRAIN on
-  # `qrc -eq 0`, so a deep queue also froze the items already waiting in `prsick-deferred.tsv`.
+  # This pass dispatches PR-REPAIR work only (fixers for EXISTING heads). That work DOES spend CI (a
+  # repair push starts a fresh run) and is still not queue-gated — see the header: a queue slot is
+  # not the bound on repair. So it reads no queue depth. The former arm here read the queue once per
+  # pass, printed `[prsick] DEFERRED (backpressure)`, and — worse than the skip lines — GATED THE
+  # LEDGER DRAIN on `qrc -eq 0`, so a deep queue also froze the items already waiting in
+  # `prsick-deferred.tsv`.
   # The `--max-spawn` allowance below is the real bound: it is the box's remaining fix-lane headroom.
 
   # ── 1. ENUMERATE (the open listing is the authority for what MAY be dispatched) ────────────

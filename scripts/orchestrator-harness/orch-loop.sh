@@ -960,9 +960,12 @@ fi
 if declare -f ps_select ps_decide ps_polarity ps_verdict ps_held >/dev/null 2>&1; then
   PRSICK=1
   # ⛔ NO QUEUE MODULE IS LOADED FOR THE PR-SICKNESS QUEUE (#2927): every dispatch it makes is
-  # REPAIR, which adds no new CI run, so it reads no queue depth. Its bound is `--max-spawn` (the
-  # fix-lane headroom `fix_slots` computes) exactly as before. The CI-queue read this loop still
-  # needs is the dispatch block's own, below.
+  # REPAIR, which is NOT queue-gated. ⛔ The gloss this line used to carry — "adds no new CI run" — is
+  # wrong and is refuted above in `ciq_push_ok`'s note: a repair push DOES start a fresh run. The
+  # exclusion rests on #2927's decision plus the measurement that the number was demand read as
+  # supply, not on repair being free. Its bound is `--max-spawn` (the fix-lane headroom `fix_slots`
+  # computes) exactly as before. The CI-queue read this loop still needs is the dispatch block's own,
+  # below.
 else
   PRSICK=0
   # ⛔ A MISSING SELECTOR IS NAMED, NOT ASSUMED. Without this line a box that was never re-seeded

@@ -566,10 +566,15 @@ the caller sees a `RATE-LIMITED` verdict rather than an in-call sleep that outli
 issue→PR path, batch dispatch, and a rerun. **Repair is never queue-gated** — a red-check fixer, a
 review-findings fixer, a conflict fixer and the PR-sickness queue all act on a PR that already exists,
 so their bound is this box's lane slots and load gate instead. The basis is a decision plus a
-measurement, **not** a cost claim: a repair push *does* start a fresh run (it also supersedes that PR's
-own run — `ci.yml` pins `concurrency: cancel-in-progress` — so it does not stack depth onto the queue),
-and what the measurement showed is that the number being gated on was the wrong quantity. Gating repair
-on the queue skipped **41 consecutive dispatches in one window** while 8 self-hosted
+measurement, **not** a cost claim: a repair push *does* start a fresh run. On this repo it usually also
+supersedes that PR's own run — `.github/workflows/ci.yml` (`group: ci-${{ github.ref }}`) and
+`.github/workflows/harness-single-source.yml` both pin `cancel-in-progress: true` — so it adds no queue
+depth there. ⛔ But NOT everywhere: `.github/workflows/workflow-lock.yml` has **no** `concurrency:`
+block, deliberately (#2474 — a per-PR group cannot tell a head from its successor, and a cancelled
+guard leg reads non-red), so a repair push DOES stack a run on that one. Supersession is therefore a
+detail of two workflows, not the reason repair is ungated: what the measurement showed is that the
+number being gated on was the wrong quantity. Gating repair on the queue skipped **41 consecutive
+dispatches in one window** while 8 self-hosted
 runners and ~11 lane slots sat idle: the queue being read belonged to GitHub-HOSTED concurrency.
 The ceiling's `runners` term is the fleet's registered/online size, or the account's hosted allowance
 when the endpoint answers a parsed `total_count: 0`. ⛔ It is **never the in-progress job count when

@@ -145,9 +145,15 @@
 #       (i) the NUMBER was the wrong quantity — `queued=33 running=2` derived `ceiling=4` and read
 #           DEEP off demand-as-supply, so the gate was refusing repair on a reading of the box's own
 #           load rather than of the world's capacity; and
-#       (ii) on this repo a repair push SUPERSEDES rather than stacks — `ci.yml` pins
-#           `concurrency: {group: ci-${{ github.ref }}, cancel-in-progress: true}`, so the run it
-#           replaces leaves the queue with it.
+#       (ii) on this repo MOST repair pushes SUPERSEDE rather than stack — `.github/workflows/ci.yml`
+#           (`group: ci-${{ github.ref }}`, `cancel-in-progress: true`, :12-14) and
+#           `.github/workflows/harness-single-source.yml` (same shape, :41-45) each supersede, so the
+#           run a push replaces leaves the queue with it.
+#           ⛔ ONE WORKFLOW IS THE EXCEPTION AND IT STACKS — `.github/workflows/workflow-lock.yml`
+#           fires on `pull_request_target: [synchronize]` with NO `concurrency:` block (deliberate,
+#           #2474: a per-PR group cannot tell a head from its successor, and a cancelled guard leg
+#           reads non-red), so a repair push DOES add a run there. That is why the exclusion does not
+#           rest on supersession — it rests on the decision plus (i).
 #     What does NOT change, and a fixer must still expect: the push voids that PR's head-bound review
 #     attestation (#2148), so the review chain re-runs.
 #     Gating repair on this number is what produced 41 skips while 11 lane slots and 8 runners sat
@@ -267,6 +273,21 @@ ciq_record_usable() {
   [ -n "$got" ] && [ "$got" = "$want" ]
 }
 
+# ciq_fleet_restore <record> -> the value for CIQ_FLEET, with its `fleet=` key re-attached.
+# ⛔ THE RECORD STORES THE DISCLOSURE WITHOUT ITS KEY (#2927 review, P3). The writer printed
+# `fleet=%s` from a value that ALREADY began `fleet=`, so every on-disk record read
+# `fleet=fleet=unreadable(…)`. It round-tripped (a reader stripped one) and a test pinned the doubled
+# form, so nothing broke — but an on-disk record is permanent text an operator reads, and a doubled
+# key is a small permanent tax on the one field whose whole job is to be read by a human. The
+# record's own `fleet=` line IS the key; this re-attaches it. An EMPTY stored value (the honest value
+# for every branch that DID measure, and for every older record that has no `fleet=` line at all)
+# restores as empty, never as `fleet=`.
+ciq_fleet_restore() {
+  local v
+  v="$(printf '%s\n' "${1:-}" | sed -n 's/^fleet=//p' | head -1)"
+  if [ -n "$v" ]; then printf 'fleet=%s\n' "$v"; fi
+}
+
 # ciq_read <owner/repo> [<state-dir>] -> sets the CIQ_* record; 0 = usable reading, 2 = UNKNOWN.
 # Record fields (all set on every call, so a caller never reads a previous call's leftovers):
 #   CIQ_QUEUED  runs waiting for a runner
@@ -326,8 +347,10 @@ ciq_read() {
         # TTL or staleness hit the token used to drop the disclosure and keep only `runners=~1`, i.e.
         # exactly the "inference presented as a measurement" the field exists to prevent, on the path
         # cache exists for. `busy=` is the precedent: a disclosure field carried through the record.
+        # The key is re-attached on the way back (ciq_fleet_restore): the record stores the VALUE, so
+        # the line reads `fleet=unreadable(…)` on disk and not `fleet=fleet=unreadable(…)`.
         # An older record has no `fleet=` line, which reads as empty — no behaviour change.
-        CIQ_FLEET="$(printf '%s\n' "$cached" | sed -n 's/^fleet=//p' | head -1)"
+        CIQ_FLEET="$(ciq_fleet_restore "$cached")"
         if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
           # ⛔ `cache`, NOT `fresh` (#2333 review P1). A TTL hit is a RECORD — up to `ttl` seconds
           # old — and calling it fresh is the exact claim this module exists to refuse: the token
@@ -404,7 +427,7 @@ ciq_read() {
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
         CIQ_BUSY="$(printf '%s\n' "$cached" | sed -n 's/^busy=//p' | head -1)"
-        CIQ_FLEET="$(printf '%s\n' "$cached" | sed -n 's/^fleet=//p' | head -1)"
+        CIQ_FLEET="$(ciq_fleet_restore "$cached")"
         if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
           CIQ_STATE=cache; CIQ_AGE="$age"
           CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
@@ -525,8 +548,10 @@ ciq_read() {
   mkdir -p "$dir" 2>/dev/null || true
   # `fleet=` is written even when empty: the cache arms restore whatever is here, and an EMPTY field
   # is the honest value for every branch that DID measure (only branch (c) has something to disclose).
+  # ⛔ THE VALUE GOES IN WITHOUT ITS OWN `fleet=` PREFIX (#2927 review, P3): `CIQ_FLEET` already begins
+  # `fleet=`, so `${CIQ_FLEET#fleet=}` is what stops the record reading `fleet=fleet=unreadable(…)`.
   { printf 'repo=%s\nqueued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nfleet=%s\nat=%s\n' \
-      "$repo" "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "${CIQ_FLEET:-}" "$now"; } > "$f" 2>/dev/null || true
+      "$repo" "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "${CIQ_FLEET#fleet=}" "$now"; } > "$f" 2>/dev/null || true
   return 0
 }
 
