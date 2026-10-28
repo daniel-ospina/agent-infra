@@ -110,6 +110,17 @@ trap 'rm -rf "$TMP"' EXIT
 # `stand-in-shard.sh`; it is not this suite's current cost and a bound sized from it protects
 # nothing. Re-measure before quoting a number here.
 CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
+# ⛔ THE FIXTURE COPIES ARE HERMETIC: THEY MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING.
+# `stage_guard` gives each fixture root the real helper so `run-bash-shards.sh`'s fail-closed load
+# succeeds — but the copies then call `fixture_guard_placement` with the DEFAULT root set, so a
+# fixture's exit code would depend on whether the machine running this suite happens to have a
+# controller executing from a cell root. Measured on a box with 4 live controllers: 22 of 121
+# assertions failed here versus 15 with this line, and the 7 extra were all `rc 78` guard refusals —
+# i.e. the suite's verdict became host-dependent, which is what "hermetic" in this file's header
+# forbids. `${FIXTURE_LIVE_ROOTS-…}` takes an explicit empty value as "no roots" (no colon on
+# purpose), so this is exactly the seam the helper advertises for a caller like this one. The real
+# gate still runs in `run-bash-shards.sh` itself, which is not a fixture.
+FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 # cheap_runner <out-file> <one-shard-target> — a copy of the REAL runner whose DISCOVERY points at
 # exactly one cheap target. ⛔ Since agent-infra#2609 the list is DERIVED (`SUITE_GLOBS` + each
 # suite's own `# shard:` marker), so this fixture replaces that ONE data list instead of rewriting
@@ -123,6 +134,18 @@ cheap_runner() {
     { print }
   ' "$RUNNER" >"$1"
 }
+# stage_guard <fixture-root> — copy the #3011 placement-guard helper into a fixture tree.
+# ⛔ EVERY FIXTURE ROOT THAT RUNS A COPY OF THE DRIVER MUST CARRY THE GUARD HELPER. The driver sources
+# `$SHARD_ROOT/scripts/orchestrator-harness/fixture-hermetic.sh` and REFUSES (exit 2) when that load
+# fails — deliberately fail-closed, because an unloadable guard is the "enforcer that cannot fire"
+# class #3011 exists to close. A minimal fixture copies only the driver, so without this the copy is
+# refused BEFORE it exercises anything, and ~17 arms here red in BOTH lanes (measured: `rc=2`,
+# "cannot load …/fixture-hermetic.sh"). Staging the helper keeps the driver's contract intact in the
+# fixture — the alternative, weakening the refusal to a warning, reopens exactly the bypass.
+stage_guard() {
+  mkdir -p "$1/scripts/orchestrator-harness" &&
+    cp "$ROOT/scripts/orchestrator-harness/fixture-hermetic.sh" "$1/scripts/orchestrator-harness/"
+}
 # The fixture ROOT. The runner anchors discovery to the tree it LIVES in (agent-infra#2609 review:
 # `--list` used to read the script's own text and worked from any cwd, while the run path was
 # cwd-relative — one driver, two contracts). A copy therefore sits at <root>/scripts/<name> and
@@ -130,6 +153,7 @@ cheap_runner() {
 # caller's cwd. `scripts/sweepable.sh` keeps the syntax sweep non-empty (the `swept` sentinel).
 FIX="$TMP/fixture"
 mkdir -p "$FIX/scripts" "$FIX/tests/ci-lane-parity"
+stage_guard "$FIX"
 cp "$ROOT/$CHEAP" "$FIX/$CHEAP"
 printf '#!/bin/bash\n:\n' >"$FIX/scripts/sweepable.sh"
 cheap_runner "$FIX/scripts/runner-cheap.sh" "$CHEAP"
@@ -776,6 +800,7 @@ echo "8r. A SUBSTITUTED-OUT-OF-REPO TARGET → the RUNNER must refuse it"
 # OUTSIDE the checkout, so the refusal under test is the containment check and not an empty list.
 printf 'exit 0\n' >"$TMP/not-in-the-repo.sh"
 cheap_runner "$TMP/runner-subst.sh" "$TMP/not-in-the-repo.sh"
+stage_guard "$TMP"          # this copy's SHARD_ROOT is $TMP itself (see run-bash-shards.sh:100-110)
 if cmp -s "$RUNNER" "$TMP/runner-subst.sh"; then
   fail "the substitution mutation did not change the file"
 else
@@ -858,6 +883,7 @@ echo ""
 echo "8w. A SYMLINKED SHARD TARGET → the RUNNER must refuse it"
 SYMDIR="$TMP/symrepo"
 mkdir -p "$SYMDIR/scripts"
+stage_guard "$SYMDIR"
 printf 'exit 0\n' >"$TMP/outside-target.sh"
 ln -sf "$TMP/outside-target.sh" "$SYMDIR/scripts/linked.sh"
 cheap_runner "$SYMDIR/runner.sh" "scripts/linked.sh"
@@ -944,6 +970,7 @@ echo "8am. THE FAILING SHARD IS NAMED — deleting the naming must turn this arm
 NAMED_FAIL="tests/ci-lane-parity/stand-in-fail.sh"
 NAMED_FIX="$TMP/named-fixture"
 mkdir -p "$NAMED_FIX/scripts" "$NAMED_FIX/tests/ci-lane-parity"
+stage_guard "$NAMED_FIX"
 # Non-empty sweep: the fixture runner refuses to report success over a sweep that parsed nothing.
 printf '#!/bin/bash\n:\n' >"$NAMED_FIX/scripts/sweepable.sh"
 cp "$ROOT/$CHEAP" "$NAMED_FIX/$CHEAP"
@@ -990,6 +1017,8 @@ PARENTDIR="$TMP/parentrepo"
 mkdir -p "$PARENTDIR" "$TMP/outside-dir"
 printf 'exit 0\n' >"$TMP/outside-dir/stub.sh"
 ln -sfn "$TMP/outside-dir" "$PARENTDIR/scripts"
+# staged AFTER the symlink exists, so it lands through it exactly where the driver will look.
+stage_guard "$PARENTDIR"
 cheap_runner "$PARENTDIR/runner.sh" "scripts/stub.sh"
 ( cd "$PARENTDIR" && bash runner.sh ) >"$TMP/runner-parentsym.out" 2>&1
 RC=$?
@@ -1532,6 +1561,7 @@ echo "8an. ATTRIBUTION — a SWEEP failure is named too, so a MIXED run has no u
 # So the fixture is a TREE: one passing shard, and a syntax-sweep target with a real syntax error.
 SWEEP_FIX="$TMP/sweepname-fixture"
 mkdir -p "$SWEEP_FIX/scripts" "$SWEEP_FIX/tests/ci-lane-parity"
+stage_guard "$SWEEP_FIX"
 printf 'if then\n' >"$SWEEP_FIX/scripts/broken.sh"
 printf '#!/bin/bash\nexit 0\n' >"$SWEEP_FIX/tests/ci-lane-parity/pass.sh"
 awk '\
@@ -1654,6 +1684,7 @@ fi
 # ── (b) the fixture repo: discovery, opt-out, order, and a NAMED failure ─────────────────────
 PROBE="$TMP/probe-repo"
 mkdir -p "$PROBE/tests/zzz-probe" "$PROBE/tests/zzz-off" "$PROBE/tests/aaa" "$PROBE/scripts"
+stage_guard "$PROBE"
 cp "$RUNNER" "$PROBE/scripts/runner.sh"
 # A sweepable file, so the fixture runner's own sweep self-check has work to do (it refuses to
 # report success over a sweep that parsed nothing).
@@ -1739,6 +1770,7 @@ rm -rf "$PROBE/tests/zzz-fail"
 # broken modulus at a width that divides the list evenly (9 shards / 3 slices).
 PROBE2="$TMP/slice-repo"
 mkdir -p "$PROBE2/scripts"
+stage_guard "$PROBE2"
 cp "$RUNNER" "$PROBE2/scripts/runner.sh"
 printf '#!/bin/bash\n:\n' >"$PROBE2/scripts/sweepable.sh"
 for i in 1 2 3 4 5 6 7 8 9; do
