@@ -320,10 +320,13 @@ if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
   # ⛔ AND THE FLAG WORKS IN BOTH DIRECTIONS, SO ITS SAFETY ARGUMENT HAS TO COVER BOTH. It does NOT "only
   # ever downgrade": `CONTROLLER_LIVE=1` also ENABLES the controller's-argv identity reads — the
   # pin-rooted source-2 reader AND, as its fallback, `controller_identity` — which is how `restart-pending`
-  # can honestly END on a cell (with no controller live, the stamp is the honest answer and the relation
-  # stays `restart-pending`). ⛔ DO NOT ATTRIBUTE THAT TO ONE READER: source-3 runs only `if [ -z
-  # "$RUNNING" ]`, so on the standard cell posture (`HARNESS_PIN_DIR` + `HARNESS_PIN_FILE`, flat `$O`) it
-  # is source-2 that answers and `RUNNING_FROM=proc:<tree>` that gets recorded. What keeps the promotion
+  # can honestly END on a cell. ⛔ IT DOES NOT CHANGE WHAT A CASUAL READER MIGHT ASSUME: with NO controller
+  # live neither reader runs, the STAMP answers, and the relation is simply whatever that claim implies —
+  # `restart-pending` while the stamp is not the pin, and `current` when it happens to name it. So "no
+  # controller" is not by itself a `restart-pending`, and "a controller" is not by itself a `current`.
+  # ⛔ DO NOT ATTRIBUTE THE PROMOTION TO ONE READER: source-3 runs only `if [ -z "$RUNNING" ]`, so on the
+  # standard cell posture (`HARNESS_PIN_DIR` + `HARNESS_PIN_FILE`, flat `$O`) it is source-2 that answers
+  # and `RUNNING_FROM=proc:<tree>` that gets recorded. What keeps the promotion
   # sound is NOT this flag but the OWNERSHIP re-verification the flag gates: both readers refuse unless
   # `_began_before_lock` proves the named process began at/before the lock was written, which a recycled
   # pid cannot satisfy. So a `ps -p` false positive cannot buy a `current` on its own — not because the
