@@ -1256,20 +1256,44 @@ fi
 # only `$(if … then case …)` is caught, when the missed class also includes the `$(cmd; case …)`
 # spelling they would think safe to keep.
 # ⛔ DECLARED LIMITS, not silently assumed: this skips FULL-LINE comments (prose here discusses `case`
-# and `$( )`, and flagging prose would be a false positive), but it does NOT lex quotes — a literal
-# `$(` inside a quoted string is counted as a substitution (can only over-report), and an unbalanced
-# `)` inside a string can close a depth early (under-report). Neither shape exists in this module;
-# they are stated so a future reader knows where the detector's confidence ends.
+# and `$( )`, and flagging prose would be a false positive) and it SKIPS SINGLE-QUOTED SPANS, because
+# bash substitutes nothing there — a `$( )` in them can never be a substitution, and a `)` in them can
+# never close one.
+# ⛔ THAT SECOND SKIP IS NOT COSMETIC — ITS ABSENCE WAS A FALSE PASS (#2969 review cycle 4, P2). The
+# earlier comment claimed "an unbalanced `)` inside a string … Neither shape exists in this module".
+# Measured: it does, three times. ci-queue.sh's multi-line reads close their `$( )` on a LATER line,
+# and the sed BRE sitting between the two halves carries `\(…\)` — e.g. the `queued=` read…
+#   :297  queued="$(ciq_gh … \
+#   :298              | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || queued=""
+# The scanner counted only `)` (a bare `(` is never counted), so the BRE's `\)` took depth 1 → 0 on
+# :298, one line BEFORE the substitution really closed: depth_at_EOL 297=1, 298=0, 299=1, 300=0. A
+# `case` added after that sed — a realistic recurrence of exactly this bug, since that is where
+# `ciq_gh`'s answer is post-processed — was therefore INVISIBLE: measured, a module with that `case`
+# reported `(p1) … (none)` and the whole suite went CLEAN at 133/0, while the same bytes on bash 3.2
+# printed `syntax error near unexpected token 'newline'` and reddened 34 arms.
+# ⛔ REMAINING LIMIT, stated because it is still real: DOUBLE-quoted spans are NOT lexed. A literal
+# `$(` inside one is counted as a substitution (over-report → the arm reds, fail-closed), and a `)`
+# inside one can decrement depth early (under-report). Neither exists in this module today; the
+# single-quoted case is now handled, which is where every BRE in this file lives.
 cis_in_comsub() {
-  local f="$1" n=0 depth=0 line i len ch prev nxt first found
+  local f="$1" n=0 depth=0 line i len ch prev nxt first found inq
   while IFS= read -r line; do
-    n=$((n + 1)); found=0
+    n=$((n + 1)); found=0; inq=0
     first="${line#"${line%%[![:space:]]*}"}"
     case "$first" in '#'*) continue ;; esac
     len=${#line}; i=0
     while [ "$i" -lt "$len" ]; do
       ch="${line:$i:1}"
+      # A single-quoted span is literal text to bash: nothing in it opens a `$( )` or closes one.
+      # Skipping it is what keeps a sed BRE's `\)` from closing the tracked depth early (see above).
+      if [ "$inq" -eq 1 ]; then
+        [ "$ch" = "'" ] && inq=0
+        i=$((i + 1)); continue
+      fi
       case "$ch" in
+        "'")
+          inq=1
+          ;;
         '$')
           nxt="${line:$((i + 1)):1}"
           if [ "$nxt" = '(' ]; then depth=$((depth + 1)); i=$((i + 2)); continue; fi
