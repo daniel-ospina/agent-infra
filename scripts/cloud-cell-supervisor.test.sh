@@ -1105,8 +1105,8 @@ case "$PROV_OUT" in
   *) bad "status does not explain an unprovable identity: $PROV_OUT" ;;
 esac
 case "$PROV_OUT" in
-  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — nothing was measured busy, so the message names a cause that does not exist: $PROV_OUT" ;;
-  *) ok "…and does NOT claim an interruption that was never measured" ;;
+  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — on this path inflight_gate is never consulted, so no population is the blocker and the message names a cause that does not exist: $PROV_OUT" ;;
+  *) ok "…and does NOT claim an interruption that was never established" ;;
 esac
 # An ABSENT record is not "nothing pending": no cycle has ever recorded one.
 rm -f "$P/o/state/restart-request"
