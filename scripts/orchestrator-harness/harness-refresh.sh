@@ -50,9 +50,12 @@
 #      the next cycle that sees the process move records `request=honoured … after=<n>s`; a request whose
 #      premise disappears records `request=cleared`. Read it with `--print-restart`, or in
 #      `cloud-cell-supervisor.sh status`. ⛔ THIS SCRIPT CONTAINS NO ACTUATOR, DELIBERATELY: a loop that
-#      restarts itself is the one path that cannot be made safe, and the fleet already has THREE restart
-#      paths (`systemctl restart`, `cloud-cell-supervisor.sh stop/apply/start`, merge-reminder.py's
-#      deploy arm). A fourth is the duplication the owner ruled against; this one ASKS and RECORDS.
+#      restarts itself is the one path that cannot be made safe, and restart actuators already EXIST —
+#      the unit (`systemctl restart` / macOS `launchctl kickstart`), `cloud-cell-supervisor.sh
+#      stop/apply/start`, `cloud-cell-doctor.sh`'s unattended `"$SUPERVISOR" start` arm, and
+#      `merge-reminder.py`'s deploy arm (four surfaces; see the note above `inflight_gate`, which names
+#      what each one actually gates on). Adding a FIFTH here would be a second definition of "restart
+#      this box", which is a second thing to keep in step. This one ASKS and RECORDS.
 #
 # ── WHY THIS EXISTS (agent-infra#2215) ───────────────────────────────────────────────────────────
 # MEASURED 2026-10-20: three cells sat on a checkout 27 commits behind origin/main with an EMPTY
@@ -455,7 +458,7 @@ RUNNING_FROM="self:$SELF"
 # alarm shape: a token that is never absent is a token nobody reads, and the one record that answers
 # "is this box on the deployed commit?" could never say yes on any cell.
 # ⛔ THE IDENTITY IS AVAILABLE AND AUTHORITATIVE. `$O/.orch.lock` names the pid that OWNS this state
-# dir — the same ownership record the `CONTROLLER_LIVE` read below already trusts and the
+# dir — the same ownership record the `CONTROLLER_LIVE` read ABOVE already trusts and the
 # supervisor's own controller census uses — and THAT process's argv names the tree it executes. So the
 # read is one pid, not a scan of the box's process table: there is nothing to disambiguate and nothing
 # else on the box can answer for it.
@@ -473,8 +476,12 @@ RUNNING_FROM="self:$SELF"
 # outside every recorded root is a PEER repo's controller and must never answer for this box; without
 # the pin file and flat-pin arms, a box on either would keep the permanent `restart-pending` this stage
 # exists to remove.
-# ⛔ It does NOT require `CONTROLLER_LIVE`: that is computed BELOW this block (it exists for the
-# `stamp:*` downgrade), and this stage establishes liveness itself from the lock pid it names.
+# ⛔ It does NOT require `CONTROLLER_LIVE`: that is computed ABOVE this block (this PR moved that one
+# read up, so the lock is read ONCE), and it gates more than it used to — the `stamp:*` downgrade, the
+# controller-argv identity stage (`controller_identity`) and the process-tree population. This stage
+# establishes liveness itself from the lock pid it names.
+#   ⛔ DO NOT ADD A SECOND `CONTROLLER_LIVE` READ HERE. Two reads of one record is exactly the defect
+#   the move above removed; a lane that trusts the old "computed below" wording would re-introduce it.
 #
 # _began_before_lock <lock-file> <pid> — 0 when the process provably began at/before the lock was
 # written. This is the AGE half of the fleet's ONE controller-ownership rule (#1178), carried inline
@@ -520,7 +527,7 @@ _began_before_lock() { # <lock-file> <pid>
 }
 if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   _ctrl_pid=""
-  # ⛔ `-f` FIRST, LIKE THE SIBLING READ AT `CONTROLLER_LIVE` BELOW. `head` on a NON-REGULAR lock — a
+  # ⛔ `-f` FIRST, LIKE THE SIBLING READ AT `CONTROLLER_LIVE` ABOVE. `head` on a NON-REGULAR lock — a
   # FIFO left by a crashed writer, a wedged network mount — BLOCKS ON OPEN, so on a cell (the only shape
   # this block runs) the refresh and therefore the controller's whole cycle would hang every cycle with
   # no output. `launchd-cycle.sh` records the same finding for the same read.
@@ -864,7 +871,12 @@ fi
 # of this very cycle). Restart actuators ALREADY EXIST and this change adds none: the unit
 # (`systemctl restart eldato-orchestrator` / macOS `launchctl kickstart`), `cloud-cell-supervisor.sh stop
 # -> apply -> start`, `cloud-cell-doctor.sh`'s unattended `"$SUPERVISOR" start` arm, and
-# `merge-reminder.py`'s deploy arm — the last two already gate on role locks and refuse by name. A
+# `merge-reminder.py`'s deploy arm. ⛔ THEY DO NOT ALL GATE THE SAME WAY, and saying they do overstates
+# the safety: `merge-reminder.py`'s deploy arm is the one that refuses BY NAME on a live role lock /
+# landing in flight; `cloud-cell-doctor.sh`'s start arm is bounded by its own STOP-generation check and
+# the tmux session read (`cell_stopped_midpass`), not by `state/roles`; `cloud-cell-supervisor.sh start`
+# reads no role lock at all. That asymmetry is why this file records `actuation=blocked blocked=…`
+# rather than assuming every actuator will refuse for itself. A
 # further one would be duplication, and by this repo's own rule a SECOND definition of "restart this box"
 # is a second thing to keep in step. So this script ASKS, records who was asked and what it would cost,
 # and leaves the transition to an existing actuator and its confirmation to the next cycle.
