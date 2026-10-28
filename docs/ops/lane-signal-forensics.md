@@ -174,10 +174,15 @@ in-process dispatchers set that pair, both unconditionally:
 
 #2932's victims were `task`-tool children — their `~/.pi/agent/task-runs/*.json` records are what
 identified them — so **the population that lost the work is covered**. The harness lanes are **not**,
-and this file must not be read as saying they are: their capture is a different mechanism
-(`cap_wip_snapshot` in `spawn-gate.sh`) with a different trigger — the **cap**, not a signal — so a
-harness lane killed *below* its cap is uncovered, and `merge-one.sh` carries its own `run_agent` copy
-with no snapshot at all.
+and this file must not be read as saying they are. Their capture hangs off `run_agent` in
+`spawn-gate.sh`, which a `task` child does not have, and since #2834 its trigger is **every terminal
+agent transition** — the cap (`cap_wip_snapshot`, a LOCAL patch + archive under `$O/wip/`) and the
+ordinary end of the turn (`terminal_wip_rescue`, the shipped `scripts/bg-rescue-wip.sh`, which puts the
+work on **origin** under `refs/wip/<slug>`). Two residuals stay true and are not claimed away:
+  * a harness lane **killed by a signal below its cap** is still uncovered here — its wrapper never
+    reaches the end of `run_agent`, which is exactly the window arms 1 and 2 exist for; and
+  * `merge-one.sh` carries its own `run_agent` copy with no snapshot and no rescue at all (its agent is
+    a reviewer, which lands a comment + a signed record, not uncommitted worktree work).
 
 ### Why this is not simply a call to `bg-rescue-wip.sh`
 
@@ -189,6 +194,7 @@ the measurement rather than a preference:
 |---|---|---|---|
 | `scripts/bg-rescue-wip.sh` (#2045) | the **dispatcher**, *before* the TERM | reachable from `refs/wip/<slug>` on **origin** | **no** — its own bounds are `bounded 25 git fetch` + `bounded 45 git push`, and the parent escalates `SIGTERM` → **5 s** → `SIGKILL`. A 25 s + 45 s tool cannot finish, and the SIGKILL would take arm 1's record with it. It also refuses any path that is not the worktree **root**. |
 | `cap_wip_snapshot` (`spawn-gate.sh`) | `run_agent`, **after** the cap kill landed | a patch + archive directory under `$O/state` | **no** — it runs after the kill, and it hangs off `run_agent`, which a `task` child does not have |
+| `terminal_wip_rescue` → `scripts/bg-rescue-wip.sh` (`spawn-gate.sh`, #2834) | `run_agent`, on **any** terminal transition — the cap **and** an ordinary end of turn | a commit reachable from `refs/wip/<slug>` on **origin** | **no** — same window problem, and for the same reason: it runs after `wait`, so a wrapper killed by a signal never reaches it |
 | arm 2 (here) | **inside the victim**, on the signal | the work is in this clone's **object database**, pinned by a ref | yes — 0.6–0.9 s for the incident's shape (bounded at 1.5 s) |
 
 So this is a second mechanism because it is the only one that runs *in the dying process*, and it
