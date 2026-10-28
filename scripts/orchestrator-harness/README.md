@@ -2885,7 +2885,13 @@ still licenses nothing: without the posture the verdict is `25`.
 **A lane is never spawned from a behind checkout without that fact on the spawn line.**
 `HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
 **every** dispatch row (`disp`) and to the `lane-`/`chain-` spawn line in `dispatch-merge.sh`
-(`[harness=…]`). An absent token reads `unknown`, never `current`. Refusals go to `$LOG` **and** to
+(`[harness=…]`). ⛔ ONE EXCEPTION, and the sha stays LAST so `${TOKEN##*:}` still reads it:
+`restart-pending` carries WHY it is pending between the two — `<relation>:<pending>:<sha12>`, where
+`<pending>` is `deferred` / `safe` / `inert` / `unprovable` (agent-infra#2641). A bare
+`restart-pending` was the always-on alarm that change removed, so the token now says which pending
+state the box is in instead of repeating one word for ever. Consumers that only DISPLAY the token are
+unaffected; a consumer that PARSES it must read the sha from the LAST field, not the second.
+An absent token reads `unknown`, never `current`. Refusals go to `$LOG` **and** to
 stderr, once per cycle — a warning that prints on every tool call is how #1140's noise hid a signal.
 `HARNESS_REFRESH=off` disables the re-pin and says, once per cycle, that a stale checkout will now go
 unnamed (a pinned-build escape hatch, not a way to avoid a red line).

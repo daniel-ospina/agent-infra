@@ -182,11 +182,16 @@ log_line() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 # ⛔ AN ABSENT RECORD IS NOT `none`: nothing has ever recorded a request, which is a different fact
 # from "nothing is pending" — the same absence-vs-empty rule the whole file follows.
 if [ "$PRINT_RESTART" = 1 ]; then
-  if [ -z "${O:-}" ]; then
-    printf 'restart request=unknown reason=no-O-set\n'; exit 0
-  fi
+  # ⛔ `O` IS DEFAULTED HERE, AND NOWHERE ELSE IN THIS SCRIPT. It was previously REQUIRED, but nothing in
+  # this file ever sets it (`grep -n '^O='` → none) — only `PIN` gets a default (see case A18: "an
+  # operator shell is not the controller"). So this reader — the surface an operator is told to run
+  # precisely when the checkout is broken, because it needs no git, no network and no repo — printed
+  # `request=unknown reason=no-O-set` on EVERY box from an operator shell: it answered `unknown` in
+  # exactly the situation it exists for. Same expression as the pin default, so the record it reads is
+  # the one the loop wrote.
+  [ -n "${O:-}" ] || O="${CELL_HOME:-${HOME:-}}/.pi/agent"
   if [ -f "$O/state/restart-request" ]; then cat "$O/state/restart-request"
-  else printf 'restart request=none reason=no-cycle-has-recorded-one\n'; fi
+  else printf 'restart request=none reason=no-cycle-has-recorded-one o=%s\n' "$O"; fi
   exit 0
 fi
 # ── bounded execution, because this runs at the top of the controller's cycle ──────────────────────
@@ -285,7 +290,18 @@ git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
 CONTROLLER_PID=""; CONTROLLER_LIVE=0; CTRL_TREE=""; CTRL_HEAD=""
 if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
   CONTROLLER_PID="$(head -1 "$O/.orch.lock" 2>/dev/null | tr -dc '0-9')"
-  if [ -n "$CONTROLLER_PID" ] && kill -0 "$CONTROLLER_PID" 2>/dev/null; then CONTROLLER_LIVE=1; fi
+  # ⛔ `kill -0` ALONE CANNOT TELL "GONE" FROM "EPERM". A refresh run as a user that does not own the
+  # controller gets EPERM, and reading that as NOT-LIVE has a consequence beyond this block: `set_pending`
+  # would write `inert` and `restart_request_record` would durably record
+  # `request=cleared reason=no-live-controller` — from inside a LIVE controller. `ps -p` reads across
+  # users, so it is the second opinion: GONE requires BOTH to say gone. This direction is fail-closed:
+  # `CONTROLLER_LIVE=1` only ever DOWNGRADES `current` (it gates the `stamp:*` refinement and the
+  # upgrade path re-verifies ownership with `_began_before_lock`), so a `ps` false positive cannot buy a
+  # `current` on its own.
+  if [ -n "$CONTROLLER_PID" ] \
+     && { kill -0 "$CONTROLLER_PID" 2>/dev/null || "${PS_BIN:-ps}" -p "$CONTROLLER_PID" >/dev/null 2>&1; }; then
+    CONTROLLER_LIVE=1
+  fi
 fi
 
 # ── RUNNING, source 3: the CONTROLLER's OWN ARGV (agent-infra#2641) ─────────────────────────────
@@ -339,18 +355,44 @@ controller_identity() { # sets CTRL_HEAD/CTRL_TREE from the LIVE controller. rc 
   # ⛔ IT ASSIGNS RATHER THAN ECHOING, for the same reason `set_pending` does: `$(controller_identity)`
   # runs in a subshell, so CTRL_TREE was set in a process that then exited and every record printed
   # `from controller:pid=…@` with an EMPTY tree — a record naming the source but not the tree (measured).
-  local pid cmd dir top head
+  local pid cmd dir top head sh_tok path_tok glob_had=""
   [ "$CONTROLLER_LIVE" = 1 ] || return 1
   pid="$CONTROLLER_PID"
-  cmd="$("${PS_BIN:-ps}" -p "$pid" -o command= 2>/dev/null)" || return 1
+  # ⛔ THE AGE GATE. Without it a RECYCLED pid — a peer lane's controller under the same pin root —
+  # answers for this box, and `current` becomes reachable from a process that is not executing this
+  # tree. It is the one bound that separates "the lock names a live controller" from "the lock names a
+  # live controller THAT OWNS THIS LOCK", and it is the bound `_began_before_lock` and every sibling
+  # copy already implement (see the note above its definition). Witnessed by A36f (a backdated lock)
+  # and A36g (an unreadable age, driven through `PS_BIN`).
+  _began_before_lock "${O:-}/.orch.lock" "$pid" || return 1
+  # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a tty,
+  # so this read would normally be width-independent — but `ps(1)` checks `COLUMNS` FIRST, and an
+  # exported COLUMNS TRUNCATES the command column. The path is the LAST token, so it is cut mid-name, no
+  # positional match exists, the stage gives up SILENTLY and #2641's permanent `restart-pending` is back
+  # with the fix looking present. `-ww` is unlimited on procps and "at least 131 columns" on BSD ps; `-w`
+  # can only WIDEN a read, never narrow one.
+  cmd="$("${PS_BIN:-ps}" -ww -o command= -p "$pid" 2>/dev/null)" || return 1
   [ -n "$cmd" ] || return 1
+  # ⛔ `set -f` AROUND THE TOKEN SPLIT. The split itself is the point (a ps command line is ONE string),
+  # but with globbing ON a `*`/`?` token is expanded against the CWD and can INVENT a word that was
+  # never in argv — a token that then looks like a controller path. Witnessed by A36o, whose plant's
+  # argv[1] is a real glob that matches the control path. The previous state is restored.
+  case $- in *f*) glob_had=0 ;; *) glob_had=1; set -f ;; esac
   # shellcheck disable=SC2086  # word-splitting is the point: argv elements ARE the argument
   set -- $cmd
+  [ "$glob_had" = 1 ] && set +f
   [ "$#" -ge 2 ] || return 1
-  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
-  case "$2" in /*) ;; *) return 1 ;; esac
-  [ "${2##*/}" = orch-loop.sh ] || return 1
-  dir="$(cd "$(dirname "$2")" 2>/dev/null && pwd -P)" || return 1
+  # ⛔ DE-QUOTED, because the tmux launcher's argv QUOTES the script path — a raw `'<path>'` would not
+  # match `case "$path_tok" in /*` below and every cell would silently fall back to the stamp (i.e.
+  # #2641 back). The quote characters live in variables, not as backslash escapes: this file is read by
+  # a gate that dequotes it statically (see #2175), and a backslash-quote in the body changes what that
+  # read sees.
+  sh_tok="${1#\'}"; sh_tok="${sh_tok%\'}"; sh_tok="${sh_tok#\"}"; sh_tok="${sh_tok%\"}"
+  path_tok="${2#\'}"; path_tok="${path_tok%\'}"; path_tok="${path_tok#\"}"; path_tok="${path_tok%\"}"
+  case "${sh_tok##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "$path_tok" in /*) ;; *) return 1 ;; esac
+  [ "${path_tok##*/}" = orch-loop.sh ] || return 1
+  dir="$(cd "$(dirname "$path_tok")" 2>/dev/null && pwd -P)" || return 1
   [ -n "$dir" ] || return 1
   top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
   [ -n "$top" ] || return 1
@@ -694,6 +736,12 @@ role_pids() { # live role-lock owners on stdout; rc 1 when the population exists
   local d own pid out=""
   [ -n "${O:-}" ] || return 1
   [ -d "$O/state/roles" ] || { printf '\n'; return 0; }   # never created = never taken: EMPTY, not unknown
+  # ⛔ A DIRECTORY THAT EXISTS BUT CANNOT BE LISTED IS `unknown`, NOT EMPTY. Without this the glob below
+  # does not expand, `d` is the literal pattern, `[ -d ]` fails, the loop prints NOTHING, `ROLE_N=0` and
+  # `inflight_gate` reads a live role pass as an empty population — handing an actuator
+  # `actuation=safe` to kill a reap/merge/hygiene pass. That is the fail-open direction this file's own
+  # contract forbids ("Unreadable in ANY population is `unknown`, and unknown is BLOCKED").
+  [ -r "$O/state/roles" ] && [ -x "$O/state/roles" ] || return 1
   for d in "$O/state/roles"/.*.lock; do
     [ -d "$d" ] || continue
     own="$(cat "$d/own" 2>/dev/null)" || return 1
@@ -774,11 +822,16 @@ fi
 #               with `actuation=safe` for the actuator.
 # ⛔ THERE IS NO ACTUATOR IN THIS FILE, AND THAT IS THE DECISION. A loop that restarts ITSELF is the one
 # path that cannot be made safe: the thing being killed is the supervisor of the work it would kill (and
-# of this very cycle). The fleet already has THREE restart paths — the unit (`systemctl restart
-# eldato-orchestrator`), `cloud-cell-supervisor.sh stop -> apply -> start`, and merge-reminder.py's deploy
-# arm, which already gates on role locks and refuses by name. A fourth would be the duplication the owner
-# ruled against (FA5). So this script ASKS, records who was asked and what it would cost, and leaves the
-# transition to the actuator and its confirmation to the next cycle.
+# of this very cycle). Restart actuators ALREADY EXIST and this change adds none: the unit
+# (`systemctl restart eldato-orchestrator` / macOS `launchctl kickstart`), `cloud-cell-supervisor.sh stop
+# -> apply -> start`, `cloud-cell-doctor.sh`'s unattended `"$SUPERVISOR" start` arm, and
+# `merge-reminder.py`'s deploy arm — the last two already gate on role locks and refuse by name. A
+# further one would be duplication, and by this repo's own rule a SECOND definition of "restart this box"
+# is a second thing to keep in step. So this script ASKS, records who was asked and what it would cost,
+# and leaves the transition to an existing actuator and its confirmation to the next cycle.
+# (An earlier draft of this comment cited an owner ruling as "FA5" and gave the count as "THREE" —
+# neither resolves: FA5 appears nowhere else in this repo, and the surfaces above are four. Corrected in
+# review; the DECISION it carries (no actuator here) is unchanged and is what the code enforces.)
 inflight_gate() { # 0 = a restart would interrupt nothing MEASURED; 1 = it would, or cannot be known
   GATE_CODE=none; GATE_WHY=""
   case "${LANES_DISC:-unknown}" in
@@ -847,13 +900,14 @@ req_field() { # <name> -> value from the last request record (empty when the rec
   sed -n "s/.*[[:space:]]$1=\([^[:space:]]*\).*/\1/p" "$REQ" 2>/dev/null | awk 'NF{print; exit}'
 }
 restart_request_record() { # <relation>  (reads PENDING/GATE_CODE/GATE_WHY/RUN_SHORT/TIP/LANES_DISC)
-  local rel="$1" now prev_req prev_at prev_run prev_by prev_act prev_block act line
+  local rel="$1" now prev_req prev_at prev_run prev_by prev_act prev_block prev_from act line
   local was at waited after
   now="$(date +%s)"
   [ -n "$REQ" ] || return 0
   prev_req="$(req_field request)"; prev_at="$(req_field requested_at)"
   prev_run="$(req_field running)";  prev_by="$(req_field requested_by)"
   prev_act="$(req_field actuation)"; prev_block="$(req_field blocked)"
+  prev_from="$(req_field running_from)"
   case "${prev_at:-}" in ''|*[!0-9]*) prev_at="" ;; esac
   # `after=` only ever claims a real interval: an unparseable/absent stamp yields `after=unknown`, never 0.
   after=unknown; [ -n "$prev_at" ] && after=$(( now - prev_at ))s
@@ -867,25 +921,48 @@ restart_request_record() { # <relation>  (reads PENDING/GATE_CODE/GATE_WHY/RUN_S
     if [ "$rel" = restart-pending ]; then          # inert: the controller went away
       was="${prev_run:-unknown}"; at="${prev_at:-$now}"
       line="restart request=cleared requested_at=$at cleared_at=$now after=$after requested_by=${prev_by:-unknown} was=$was now=${RUN_SHORT:-unknown} reason=no-live-controller"
-    elif [ -n "${prev_run:-}" ] && [ "$prev_run" != "${RUN_SHORT:-unknown}" ]; then
+    elif [ "$prev_req" = pending ] && [ -n "${prev_run:-}" ] && [ "$prev_run" != "${RUN_SHORT:-unknown}" ] \
+         && [ "${prev_from:-}" != stamp:* ] && [ "${RUNNING_FROM:-}" != stamp:* ]; then
+      # ⛔ ONLY AN OUTSTANDING REQUEST (`pending`) MAY BE HONOURED, AND NEVER A MOVE OUT OF A CLAIM. A
+      # `cleared`/`refused` record's `running=` is a STAMP value; comparing it to a later
+      # controller-derived `RUN_SHORT` fired `honoured` on an identity-SOURCE change with the controller
+      # never restarted — certifying a restart that did not happen, against this record's own contract
+      # ("Only the process moving can honour a request; a pin or a stamp changing cannot").
+      # ⛔ THE BOUND IS `stamp:` ON EITHER SIDE, NOT `controller:` ON BOTH. A stamp is a CLAIM `apply`
+      # wrote; `self:` and `controller:` are both FACTS about a process/tree, and a laptop legitimately
+      # moves between them (its identity is `self:`), so demanding `controller:` would suppress every
+      # real restart on the Mac half of the fleet. The defect is narrower than that, and so is the fix.
       was="$prev_run"
-      line="restart request=honoured requested_at=${prev_at:-$now} honoured_at=$now after=$after requested_by=${prev_by:-unknown} was=$was now=${RUN_SHORT:-unknown} pending=none actuation=${prev_act:-unknown} blocked=${prev_block:-unknown} actuator=stop+apply+start"
+      line="restart request=honoured requested_at=${prev_at:-$now} honoured_at=$now after=$after requested_by=${prev_by:-unknown} was=$was now=${RUN_SHORT:-unknown} was_from=${prev_from:-unknown} now_from=${RUNNING_FROM:-unknown} pending=none actuation=${prev_act:-unknown} blocked=${prev_block:-unknown} actuator=stop+apply+start"
     else
       line="restart request=cleared requested_at=${prev_at:-$now} cleared_at=$now after=$after requested_by=${prev_by:-unknown} was=${prev_run:-unknown} now=${RUN_SHORT:-unknown} reason=no-longer-pending"
     fi
   elif [ "$PENDING" = unprovable ]; then
     # NOT a request: we cannot say a restart is needed, so asking for one would be an action on an
     # unproven premise — the exact shape that turns a refresh into an incident.
+    # ⛔ BUT IT MUST NOT DISCARD AN OUTSTANDING ONE. This branch used to OVERWRITE a `pending` record
+    # with `refused`, so one unreadable-identity cycle made the ask VANISH (an actuator polling the file
+    # saw no request) and reset its clock on the next pending cycle — which the code's own comment below
+    # forbids ("`requested_at` is the FIRST ask … never reset the clock"). Reachable with no exotic
+    # config: `apply` rewrites the pin, and one unreadable `ps` cycle is enough.
     at="${prev_at:-$now}"
-    line="restart request=refused reason=running-identity-unprovable requested_at=$at refused_at=$now requested_by=harness-refresh.sh@${RUN_SHORT:-unknown} running=${RUN_SHORT:-unknown} pin=${TIP_SHORT:-unknown} pending=unprovable actuation=blocked blocked=identity actuator=none"
+    if [ "$prev_req" = pending ] && [ -n "$prev_at" ]; then
+      line="restart request=pending requested_at=$at waited=$(( now - prev_at ))s requested_by=${prev_by:-harness-refresh.sh@${RUN_SHORT:-unknown}} running=${RUN_SHORT:-unknown} running_from=${RUNNING_FROM:-unknown} pin=${TIP_SHORT:-unknown} pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=${LANES_DISC:-unknown} checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start"
+    else
+      line="restart request=refused reason=running-identity-unprovable requested_at=$at refused_at=$now requested_by=harness-refresh.sh@${RUN_SHORT:-unknown} running=${RUN_SHORT:-unknown} running_from=${RUNNING_FROM:-unknown} pin=${TIP_SHORT:-unknown} pending=unprovable actuation=blocked blocked=identity actuator=none"
+    fi
   else
     # A PENDING request. The FIRST ask owns `requested_at`; a later cycle that still sees the same state
     # only advances `waited=` — a clock that resets every cycle would make "pending for three days"
     # indistinguishable from "asked 3 minutes ago", which is the whole point of the record.
-    if [ "$prev_req" = pending ] && [ -n "$prev_at" ]; then at="$prev_at"; waited=$(( now - prev_at ))s
-    else at="$now"; waited=0s; prev_by=""; fi
+    # ⛔ `refused` IS ALSO A PRIOR ASK here: it already carries a `requested_at`, so reusing it keeps the
+    # clock monotonic across a transient unreadable cycle instead of restarting it at `now`.
+    case "$prev_req" in pending|refused) if [ -n "$prev_at" ]; then at="$prev_at"; waited=$(( now - prev_at ))s
+                                        else at="$now"; waited=0s; prev_by=""; fi ;;
+      *) at="$now"; waited=0s; prev_by="" ;;
+    esac
     act=safe; [ "$PENDING" = safe ] || { act=blocked; }
-    line="restart request=pending requested_at=$at waited=$waited requested_by=${prev_by:-harness-refresh.sh@${RUN_SHORT:-unknown}} running=${RUN_SHORT:-unknown} pin=${TIP_SHORT:-unknown} pending=$PENDING actuation=$act blocked=$GATE_CODE lanes=${LANES_DISC:-unknown} checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start"
+    line="restart request=pending requested_at=$at waited=$waited requested_by=${prev_by:-harness-refresh.sh@${RUN_SHORT:-unknown}} running=${RUN_SHORT:-unknown} running_from=${RUNNING_FROM:-unknown} pin=${TIP_SHORT:-unknown} pending=$PENDING actuation=$act blocked=$GATE_CODE lanes=${LANES_DISC:-unknown} checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start"
   fi
   ( mkdir -p "$(dirname "$REQ")" 2>/dev/null
     printf '%s\n' "$line" > "$REQ.tmp.$$" 2>/dev/null && mv -f "$REQ.tmp.$$" "$REQ" ) 2>/dev/null \
