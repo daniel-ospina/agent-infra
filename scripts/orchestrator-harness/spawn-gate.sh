@@ -1064,14 +1064,20 @@ cap_wip_snapshot() {
 # The warnings on stderr are the only signal that the listing was incomplete, which is why they are
 # captured below instead of discarded — see the `st_noise` note in the pre-check.
 #
-# ⛔ UNPUSHED COMMITS ARE MEASURED, AND DELIBERATELY NOT PUSHED. #2834 asks for "a dirty tree OR
-# unpushed commits"; the rescue archives UNCOMMITTED work and says so in its own declared LIMITS
-# (pushing a branch is a different, destructive-shaped operation: `refs/wip/<slug>` is keyed by branch
-# name, so a rescue from a reused branch must never move the branch, and a lane must never push a
-# branch that is not its own). What the exit path owes in that case is that the fact stops being
-# silent, so it is MEASURED and NAMED in the terminal record: a branch's commits live in the repo's
-# own object database and survive the WORKTREE being removed, so the residual risk is the BRANCH being
-# deleted — which is a different defect with a different fix, and it is not claimed here.
+# ⛔ UNPUSHED COMMITS ARE MEASURED, AND DELIBERATELY NOT ARCHIVED HERE. #2834 asks for "a dirty tree
+# OR unpushed commits"; the exit path meets the DIRTY half and RECORDS the other rather than rescuing
+# it. ⛔ THE REASON IS THE CALLEE'S CONTRACT, NOT BRANCH SAFETY (review P2, round 5, PR #2975). An
+# earlier version of this note argued that pushing would "move a branch" — it would not:
+# `bg-rescue-wip.sh` builds its archive with `commit-tree` and pushes `refs/wip/<slug>`, which is NOT a
+# branch and is pushed without force (`:283-296`). The real binding constraint is the callee's own
+# `AT_RISK` rule (`bg-rescue-wip.sh:150-166`): it archives only a NON-EMPTY `git status`, so a
+# clean-but-unpushed tree makes it `exit 0` having done nothing, and it never considers `HEAD`'s own
+# commits. Teaching it to archive `HEAD`'s tree when the tree is clean is a change to the SHIPPED
+# tool's contract (and to what "a rescue" means), deliberately not made in this PR — so ask 1 stays
+# half-met here, and that is stated rather than implied. What the exit path owes in this case is that
+# the fact stops being silent, so it is MEASURED and NAMED: a branch's commits live in the repo's own
+# object database and survive the WORKTREE being removed, so the residual risk is the BRANCH being
+# deleted — a different defect with a different fix, and it is not claimed here.
 #
 # ⛔ IT RUNS ON THE CAP PATH TOO. The cap snapshot is LOCAL (`$O/wip/capwip-*`, on the box that may be
 # about to be reaped or wiped); the ref is off-box. #2834's ask 1 says the timeout watcher keeps its
@@ -1083,8 +1089,8 @@ cap_wip_snapshot() {
 # dirty or unreadable. A per-lane push for every clean lane would be a rate-limit defect of its own, on
 # an account 22 concurrent landers already share.
 LANE_END_TREE=""        # dirty | clean | unpushed-only | cannot-verify | not-a-worktree | not-measured
-LANE_END_RESCUE=""      # refs/wip/<slug>@<sha> | nothing | FAILED | UNAVAILABLE | DISABLED
-LANE_END_REF=""         # the local ref that pins the archived commit (empty when nothing was archived)
+LANE_END_RESCUE=""      # refs/wip/<slug> | archived-local | nothing | FAILED | UNAVAILABLE | DISABLED
+LANE_END_REF=""         # the LOCAL refs/wip-local pin; empty over an archive only when the callee could not write it
 LANE_END_UNPUSHED=0     # commits on this branch that exist only locally — NAMED, never pushed (above)
 LANE_END_ROOT=""        # the tree that was MEASURED — the only column that can expose a wrong-tree archive
 LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
@@ -1241,7 +1247,7 @@ terminal_wip_rescue() {
   slug="$(printf '%s' "$br" | tr '/' '-')"
   if [ "$at_risk" -eq 0 ]; then
     LANE_END_RESCUE="nothing"
-    echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=nothing unpushed=$unpushed ref=<none> — the worktree at $root holds no uncommitted work, so nothing was lost and no rescue was attempted" >> "$log"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=nothing unpushed=$unpushed ref=<none> — the worktree at $root holds no uncommitted work IN THE PATHS GIT DOES NOT IGNORE, so no uncommitted work was lost there and no rescue was attempted (⛔ files git IGNORES are not measured by this check: a lane whose only copy of its work is an ignored file reads clean here — the same class #2045's cap path inherits, and it is named rather than implied)" >> "$log"
     if [ "$unpushed" -gt 0 ] 2>/dev/null; then
       echo "[wip] NOTE label=$label: $unpushed commit(s) on $br exist ONLY locally. bg-rescue-wip.sh archives UNCOMMITTED work by design and does not push a branch, so they were not pushed. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log"
     fi
@@ -1303,9 +1309,21 @@ terminal_wip_rescue() {
       fi
       if [ "$rc2" -eq 0 ] && [ -n "$local_ref" ]; then
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="refs/wip/$slug"
+      elif [ "$rc2" -eq 0 ] && [ "$LANE_END_TREE" = "dirty" ]; then
+        # ⛔ rc2=0 DOES NOT PROVE THE CALLEE ARCHIVED NOTHING (review P2, round 5, PR #2975). Exit 0 has
+        # TWO disjoint causes: "nothing at risk" (`bg-rescue-wip.sh:157-161`, reached BEFORE any
+        # archive) and "PUSHED=1 with no skipped paths" (`:362-368`) — and the second one is reached
+        # even when the LOCAL pin failed, because the pin is GUARDED (`:246-252` prints `⚠ could not
+        # record refs/wip-local/<slug>` and carries on). So on a `dirty` tree, whose non-empty listing
+        # proves the callee's own `AT_RISK` was 1, rc2=0 means the archive IS on origin. Recording
+        # `nothing` there published "nothing needed saving" over work that is on origin, and made the
+        # `ref` column empty over an archive that exists — the mirror of the `archived-local` arm one
+        # branch down, and under-claiming in the same lie.
+        LANE_END_RESCUE="refs/wip/$slug"
       elif [ "$rc2" -eq 0 ]; then
-        # Exit 0 with no NEW ref is the callee's own "nothing at risk" arm: it archived nothing, so
-        # claiming a pushed ref here would be a push this code never saw.
+        # Everywhere else the callee may legitimately have found nothing at risk (a `clean` or
+        # `cannot-verify` tree produced no non-empty listing for it), so claiming a pushed ref here
+        # would be a push this code never saw.
         LANE_END_RESCUE="nothing"
       elif [ -n "$local_ref" ]; then
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="archived-local"
@@ -1318,6 +1336,11 @@ terminal_wip_rescue() {
         if [ -n "$local_ref_before" ]; then
           echo "[wip] ⛔ label=$label: NOTE — refs/wip-local/$slug@$local_ref_before still exists, but it was written by an EARLIER rescue of this branch and this run did NOT update it. That snapshot may PREDATE the work now in the tree; do not read it as covering this lane" >> "$log"
         fi
+      elif [ "$LANE_END_RESCUE" = "refs/wip/$slug" ] && [ -z "$LANE_END_REF" ]; then
+        # The pushed-archive-with-no-local-pin case above, said out loud: the ledger's `ref` column is
+        # EMPTY here over an archive that DOES exist, so a reader must not take an empty ref as "nothing
+        # was archived" — the replayed `⚠ could not record refs/wip-local/…` line names the cause.
+        echo "[wip] ⛔ label=$label: the rescue PUSHED this worktree's archive to origin refs/wip/$slug (bg-rescue-wip.sh exit 0) but could not write its LOCAL pin refs/wip-local/$slug — see the ⚠ line replayed above (a D/F conflict, a stale .lock, ENOSPC). The ref column of this lane's row is therefore EMPTY over an archive that EXISTS; origin refs/wip/$slug is the copy to retrieve before this worktree is reaped" >> "$log"
       elif [ "$LANE_END_RESCUE" = "nothing" ] && [ "$LANE_END_TREE" = "cannot-verify" ]; then
         # ⛔ rc2=0 with an INCOMPLETE listing is NOT "the tree was clean": the callee found nothing at
         # risk in the paths IT could read, while this run could not certify that it saw all of them.
