@@ -1141,6 +1141,172 @@ VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (open PRs)')"
 VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
   holder_run "$D9" f4
   if [ "$(holder_queued "$D9")" = 1 ]; then ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 0; else ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 1; fi
+
+  # ── 5l-bis) THE PRODUCER'S WORDING IS NOT PART OF THE CONTRACT (agent-infra#2952) ──────────────
+  # THE DEFECT, MEASURED. The surface set was read with the literal phrase `could not be queried (`.
+  # tortoise fa7b27b66 (#9423, 2026-10-21) reworded that sentence to `could not be FULLY queried (`,
+  # and from that commit the parse returned an EMPTY set for EVERY verdict — so `HOLDER_ONLY` was 0
+  # for every candidate, the #1935 substitution above could never fire, and cell4 spent six days
+  # reporting `0 dispatched` / `unusable=issue-assignee-holder:12` while THIS SUITE stayed green,
+  # because every fixture above still rendered the wording shipped on the day it was written. A test
+  # that only ever replays yesterday's wording cannot fail for a producer reword — which is exactly
+  # the "guard that cannot fail" this arm exists to remove. So these arms render the producer's REAL
+  # line, and one of them renders an adverb it has never used, to pin the CONTRACT ("the surfaces are
+  # named in the parenthetical after `queried (`") instead of a phrase of the day.
+  #
+  # The body below is cell4's own report for #9889, copied VERBATIM (the board note is abridged in its
+  # middle, marked `…`) from `python3 tools/collision_preflight.py 9889 --repo .` on the cell's own
+  # checkout, 2026-10-27. It is the shape that MUST be re-routed: ONE unreadable surface, the fleet
+  # board, every other surface clean.
+  # ⛔ THE REPORT IS WRITTEN TO A FILE, NOT CAPTURED THROUGH `$(cat <<'REPORT' …)`: bash 3.2 (macOS's
+  # /bin/bash, the shell this suite gets via `env bash` on a stock runner) quote-scans the body of a
+  # heredoc that lives inside a command substitution, so a line with ONE apostrophe (`the board's …`)
+  # aborts the WHOLE suite with `unexpected EOF while looking for matching` — measured here, and the
+  # real report has three such lines. A plain `cat > file <<'REPORT'` is not scanned, and the variable
+  # is then filled from the file.
+  cat > "$TMP/cell2952.report" <<'REPORT'
+collision-preflight: issue #9889
+repo: daniel-ospina/tortoise   [resolved from: --repo PATH (git remote)]
+
+title: measure(extractor-v4): E1's before arm and E2a's 14-unit denominator are producible
+keyword gate: none — the lexical arm is deleted (#3504).
+
+SURFACE                         STATUS      HITS  NOTE
+issue landed                    CLEAN       0     issue state=OPEN; 7 timeline event(s), 1 merged cross-reference(s), none naming #9889 in its title
+merged PRs naming an OPEN issue ADVISORY    0
+open PRs                        CLEAN       0     25 PR(s) enumerated (complete, cap 1000)
+recently-closed PRs             ADVISORY    1     ⚠ PARTIAL — advisory sample, cannot block
+local branches                  CLEAN       0     17 ref(s) enumerated; 2 already merged into main
+remote branches                 CLEAN       0     1858 ref(s) enumerated
+local worktrees                 CLEAN       0     15 worktree(s) enumerated (untruncated)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv') — the lane roster is UNKNOWN, not empty … (comment prose is not read, #8175)
+
+HITS
+  [recently-closed PRs] PR #10069 docs(5333): G5's destructive half — the design DECISION recorded — prose mention of #9889 in body — not a closing reference (non-blocking) (weak) (advisory — cannot block)
+
+WEAK SIGNALS (reported, non-blocking — these do NOT block)
+  1 a prose-only cross-reference(s) of #9889; no title / branch / worktree / closing-reference match.
+  These do NOT block a dispatch.
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv') — the lane roster is UNKNOWN, not empty … (comment prose is not read, #8175)
+
+ADVISORY SURFACES — reported only; these cannot block a dispatch
+  [recently-closed PRs] 1 hit(s) — sampled the most recent 100 of ~4100 closed PR(s)
+  NOTE: a match here is on a TERMINAL PR — immutable history, not in-flight work.
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be FULLY queried (issue assignee/holder); this is NOT clean for #9889 in daniel-ospina/tortoise — the LANE ROSTER is UNKNOWN (not empty) — no lane can be attributed to this issue until it is readable
+REPORT
+  CELL2952_REPORT="$(cat "$TMP/cell2952.report")"
+  # The registry answers the way a would-be dispatcher needs it to: CLEAN, nothing claimed.
+  CELL2952="$(holder_report x "$CELL2952_REPORT")"
+  holder_run "$CELL2952" b1
+  # ⛔ `holder_queued` returns 1 for QUEUED ("1 = queued = FAIL code", its own doc) because it was
+  # written for arms that assert a refusal. Both polarities appear below, so each one is spelled out:
+  # a check that reads the raw helper value would be asserting the OPPOSITE of what its name says.
+  r2952_is_queued() { [ "$(holder_queued "$1")" = 1 ]; }   # rc 0 = the candidate WAS queued
+  # ⛔ BOTH directions, or a no-op re-route reads green: the candidate must be QUEUED **and** the
+  # queue must be the SUBSTITUTION's doing (the echo names the board+registry path). Pre-fix, this
+  # arm reds on the first assertion — the parse returned nothing, so the candidate was refused.
+  if r2952_is_queued "$CELL2952"; then rc=0; else rc=1; fi
+  ck "(2952a) the producer's REAL verdict wording ('could not be FULLY queried') is RE-ROUTED — the board is unreadable, the registry answers" $rc
+  case "$(cat "$TMP/holder-b1.out")" in
+    *"the pre-flight's HOLDER surface could not answer"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952a) …and it is the HOLDER substitution that queued it (not a silently different CLEAN path)" $rc
+  case "$(cat "$TMP/holder-b1.out")" in
+    *"+#10 CLEAN -> backlog"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952a) …and the queue entry was actually written (the positive half of the pair)" $rc
+  # ── (2952b) THE REGISTRY IS THE ONLY AUTHORITY LEFT, SO AN UNREADABLE ONE STILL REFUSES ────────
+  # Polarity, unchanged: the substitution moves the requirement from "a local board must answer" to
+  # "the cross-box registry must answer". rc=2 is claims.sh's UNREADABLE verdict; it is INCOMPLETE,
+  # never CLEAN, and the candidate must be neither queued nor retired.
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="the registry could not be read (stub)"; return 2; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  CELL2952B="$(holder_report x "$CELL2952_REPORT")"
+  r2952_run() { # <dir> <name>
+    O="$1" LIMIT=5 SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" \
+      bash "$TMP/refreshloop-2952.sh" > "$TMP/2952-$2.out" 2>&1
+  }
+  r2952_run "$CELL2952B" b2
+  if r2952_is_queued "$CELL2952B"; then rc=1; else rc=0; fi
+  ck "(2952b) an UNREADABLE claims registry is still INCOMPLETE — not queued" $rc
+  case "$(tr '\n' ' ' < "$CELL2952B/checked.txt")" in *10*) rc=1 ;; *) rc=0 ;; esac
+  ck "(2952b) …and not retired: the claim is a window, so the candidate is re-attempted next pass" $rc
+  case "$(cat "$TMP/2952-b2.out")" in
+    *"?#10 INCOMPLETE — the registry could not be read"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952b) …and the refusal names the REGISTRY as the reason (not the board, which was substituted)" $rc
+  # …and the OTHER form of "unreadable": the registry is not INSTALLED at all. Nothing has answered the
+  # holder question then, so a CLEAN here would mean "no registry, therefore nobody holds it" — the
+  # fail-open this whole substitution is shaped to avoid. (The pre-#2952 arm `(ii-b)` pins the same
+  # wiring on the OLD wording; this one pins it on the producer's real one.)
+  CELL2952B2="$(holder_report x "$CELL2952_REPORT")"
+  rm -f "$CELL2952B2/claims.sh"
+  r2952_run "$CELL2952B2" b2b
+  if r2952_is_queued "$CELL2952B2"; then rc=1; else rc=0; fi
+  ck "(2952b) an ABSENT claims registry is still INCOMPLETE — not queued (no registry is not a free issue)" $rc
+  case "$(cat "$TMP/2952-b2b.out")" in
+    *"is NOT INSTALLED"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952b) …and the refusal names the MISSING registry (the substituted authority is required, not optional)" $rc
+  # ── (2952c) A SECOND GENUINELY-UNREADABLE SURFACE STILL REFUSES ───────────────────────────────
+  # The other half of the same defect class: `issue landed` is answerable on a cell (gh reads the
+  # issue's state and timeline fine), so it must NOT be swept into the substitution — and it is not,
+  # because the surrogate is the CAUSE (the board), never a surface COUNT. A landed surface that
+  # cannot answer for its OWN reason is work the tool could not judge. Report abridged from cell4's
+  # `collision_preflight.py 2218` (same day, same box); its verdict line names BOTH surfaces.
+  CELL2952C="$(holder_report x "issue landed                    INCOMPLETE  0     issue-state-uninterpretable: state='MERGED' is neither OPEN nor CLOSED, so whether this work item is still live cannot be established — refusing to read it as free (NOT clean)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: /home/cmux/.pi/agent/state/lane-registry.tsv)
+
+INCOMPLETE SURFACES
+  [issue landed] issue-state-uninterpretable: state='MERGED' is neither OPEN nor CLOSED, so whether this work item is still live cannot be established — refusing to read it as free (NOT clean)
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: /home/cmux/.pi/agent/state/lane-registry.tsv)
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean for #2218 in daniel-ospina/tortoise — PART of this is the LANE ROSTER is UNKNOWN (not empty)")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952C" b3
+  if r2952_is_queued "$CELL2952C"; then rc=1; else rc=0; fi
+  ck "(2952c) a SECOND unreadable surface (issue landed, its own cause) is NOT re-routed — the work itself is unjudged" $rc
+  case "$(cat "$TMP/2952-b3.out")" in
+    *"?#10 INCOMPLETE from the pre-flight"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952c) …and it is the pre-flight's INCOMPLETE arm that refused it (the guard fired, it did not no-op)" $rc
+  # ── (2952d) A DIFFERENT ADVERB IS STILL THE SAME CONTRACT ────────────────────────────────────
+  # This is the arm that makes the fix a CONTRACT rather than a widened literal: the producer is not
+  # vendored, so the next reword must not silently re-break the re-route. Any `could not be … queried`
+  # renders the set; a verdict line with NO parenthetical at all renders nothing, and then the pass
+  # REFUSES **loudly** (the drift echo) instead of returning to a silent `0 dispatched`.
+  CELL2952D="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be PARTIALLY queried (issue assignee/holder); this is NOT clean')"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952D" b4
+  if r2952_is_queued "$CELL2952D"; then ck "(2952d) an adverb the producer has NOT used yet keeps the re-route alive (the anchor is 'queried (', not the phrase)" 0; else ck "(2952d) an adverb the producer has NOT used yet keeps the re-route alive (the anchor is 'queried (', not the phrase)" 1; fi
+  # (2952e) …and the DRIFT case is REFUSED **and ANNOUNCED**: no parenthetical → nothing to re-route
+  # on, plus a WARN naming the drift. Silence here is what cost six days on cell4.
+  CELL2952E="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) is unreadable; this is NOT clean')"
+  r2952_run "$CELL2952E" b5
+  if r2952_is_queued "$CELL2952E"; then rc=1; else rc=0; fi
+  ck "(2952e) a verdict line with NO surface list is NOT re-routed (drift fails CLOSED)" $rc
+  case "$(cat "$TMP/2952-b5.out")" in
+    *"WARN: #10 the pre-flight's VERDICT LINE carried no readable surface list"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952e) …and the drift is ANNOUNCED, not swallowed (a silent no-op is what must not recur)" $rc
 fi
 
 # ── 5m) REPO has NO path default — required, or derived from a checkout of the QUEUE's repo ─────

@@ -3480,6 +3480,31 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
       }
     }'
 }
+# The surface SET an INCOMPLETE verdict names, read from the verdict line's own parenthetical.
+# ⛔ WHY THIS IS NOT A LITERAL PHRASE (agent-infra#2952 — measured on cell4, not hypothesised). The
+# consumer below matched the exact words `could not be queried (`; tortoise fa7b27b66 (2026-10-21,
+# #9423) inserted the word FULLY into that sentence, and from that commit the match returned NOTHING
+# for EVERY verdict — so the holder substitution became a silent no-op on every box, while every
+# fixture in this repo still carried the OLD wording and so no check could see it. The adverb is the
+# producer's PROSE; the CONTRACT is only "the verdict line names the unreadable surfaces in ONE
+# parenthetical that follows a `queried (`". So the anchor is `queried (`, the adverb is skipped,
+# and the LEFTMOST match wins: `awk`'s index() takes the first, whereas `s/.*queried \(…\)/\1/` takes
+# the LAST — and the remedy that follows the parenthetical on the SAME line can contain one too,
+# which would silently read the WRONG surface set. A verdict line with no such parenthetical yields
+# NOTHING, never a guess: the caller refuses, and its drift echo names the cause rather than leaving
+# the box at `0 dispatched` with no reason printed.
+preflight_incomplete_surfaces() {   # <preflight output> -> the verdict line's surface list, verbatim
+  printf '%s\n' "$1" | awk '
+    seen { next }
+    index($0, "VERDICT: INCOMPLETE (exit 2)") == 1 {
+      p = index($0, "queried (")
+      if (!p) next
+      s = substr($0, p + 9)
+      e = index(s, ")")   # the list ends at the FIRST closing paren (no surface name has one)
+      if (e) s = substr(s, 1, e - 1)
+      print s; seen = 1
+    }'
+}
 # ── WHY THE WALK STOPPED (agent-infra#2183) ─────────────────────────────────────────────────────
 # `not_reached` is DERIVED (listed - the skip buckets - judged), so until now the largest bucket on a
 # starved cell carried NO measured cause at all and orch-loop.sh rendered it as `N not reached
@@ -3790,13 +3815,25 @@ while read -r N; do
     # (`collision_preflight.py` scan_issue_surface), which can carry a newline — and the failure mode
     # if either assumption slips is a fail-OPEN: the count reads 1, the note matches, and a candidate
     # with a SECOND unreadable surface is queued as verified. The verdict line already states the
-    # complete answer the tool is giving, so read the answer instead of re-deriving it: everything
-    # after `could not be queried (` up to the closing paren, and require it to be EXACTLY the holder.
-    inc_verdict="$(printf '%s\n' "$PRE" | sed -nE 's/^VERDICT: INCOMPLETE \(exit 2\).*could not be queried \(([^)]*)\).*/\1/p' | head -1)"
+    # complete answer the tool is giving, so read the answer instead of re-deriving it. THE PHRASE
+    # IS NOT PART OF THE ANSWER (agent-infra#2952): the list is taken by
+    # `preflight_incomplete_surfaces`, which anchors on `queried (` and not on the adverb the
+    # producer happens to put in front of it — that literal was what made this whole arm a silent
+    # no-op for six days once tortoise#9423 reworded it to `could not be FULLY queried (`.
+    inc_verdict="$(preflight_incomplete_surfaces "$PRE")"
     case "$inc_verdict" in
       "issue assignee/holder") HOLDER_ONLY=1 ;;
       *) HOLDER_ONLY=0 ;;
     esac
+    # ⛔ A SET THAT CANNOT BE READ IS ANNOUNCED, NOT SWALLOWED (agent-infra#2952). Failing CLOSED
+    # when the verdict line cannot be read is right, and it is what the arm above does — but it kept
+    # a provisioned cell at `0 dispatched` for six days with NOTHING naming the parse, and the
+    # pre-flight's own surface table looked exactly like a board that simply cannot answer. So when
+    # the BODY says holder-only-with-the-board's-own-cause and the VERDICT LINE nevertheless named
+    # nothing, say so: it is producer drift, and the next reader must not have to diff two repos.
+    if [ -z "$inc_verdict" ] && grep -qF 'claim gate: the FLEET BOARD could not answer' <<<"$PRE"; then
+      echo "[refresh] WARN: #$N the pre-flight's VERDICT LINE carried no readable surface list although its body names the holder surface unreadable — refusing the candidate rather than re-routing it (producer format drift, agent-infra#2952)"
+    fi
     # ⛔ …AND THE REPORT MAY NOT ALSO CARRY A BLOCKING HIT (cycle-2 review, F1 — a measured fail-OPEN).
     # The whole re-route rests on the producer's verdict ORDER (LANDED → COLLISION → INCOMPLETE), so an
     # INCOMPLETE verdict means "nothing blocking was found". The producer is NOT vendored with this
