@@ -1331,7 +1331,7 @@ harness_refresh_cycle() {
   [ "${_HR_DONE:-0}" = "1" ] && return 0
   _HR_DONE=1
   HARNESS_TOKEN=""
-  local rr out rc rel run ref pin act rec line
+  local rr out rc rel run ref pin act rec line pnd
   case "${HARNESS_REFRESH:-on}" in
     off|0|no)
       HARNESS_TOKEN="refresh-off"
@@ -1359,12 +1359,16 @@ harness_refresh_cycle() {
   # under this file's `set -u` a SIGPIPE tail on the writer is invisible, and `check-no-sigpipe-grep.sh`
   # gates the shape repo-wide.
   rec="$(printf '%s\n' "$out" | awk '/^harness relation=/{print; exit}')"
-  rel=""; run=""; ref=""; pin=""; act=""; fst=""
+  rel=""; run=""; ref=""; pin=""; act=""; fst=""; pnd=""
   for kv in $rec; do
     case "$kv" in
       relation=*) rel="${kv#relation=}" ;; running=*) run="${kv#running=}" ;;
       ref=*) ref="${kv#ref=}" ;; pin=*) pin="${kv#pin=}" ;; action=*) act="${kv#action=}" ;;
       fetch=*) fst="${kv#fetch=}" ;;
+      # WHY a `restart-pending` is pending (#2641): `inert` / `unprovable` / `deferred` / `safe`. Parsed
+      # so the spawn line can carry it — the four are different facts about the box and a token that says
+      # only `restart-pending` is the always-on alarm this fixes.
+      pending=*) pnd="${kv#pending=}" ;;
     esac
   done
   # A refusal prints its record too, so `action=refused` still carries the relation. A missing record
@@ -1378,12 +1382,20 @@ harness_refresh_cycle() {
   # completely SILENT in exactly that state: the warning was prose (this block keeps only the last
   # non-record line) and the token was empty. A stale comparison is named on every spawn line instead.
   if [ "$rel" = current ] && [ -n "$fst" ] && [ "$fst" != ok ]; then rel="$fst"; fi
-  if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${run:+:$run}"; fi
+  # ⛔ THE PENDING REASON RIDES ON THE TOKEN ONLY FOR `restart-pending` (#2641): every other relation
+  # carries `pending=none`, and appending it would put a constant on every line — the shape this repo
+  # keeps deleting. `restart-pending:deferred:04bc1ddefde` says the box is on an older tree AND why the
+  # step that would fix it has not been taken; `restart-pending:unprovable:…` says the identity itself is
+  # unknown. `current` stays EMPTY, which is the whole point of the third RUNNING source: on a cell it
+  # becomes reachable, so the token finally disappears when the box really is on the pin.
+  _pnd=""
+  [ "$rel" = restart-pending ] && [ -n "$pnd" ] && [ "$pnd" != none ] && _pnd="$pnd"
+  if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${_pnd:+:$_pnd}${run:+:$run}"; fi
   export HARNESS_TOKEN
   # The record other surfaces read (status, the next cycle's diagnosis). Staged then renamed, like
   # every other record this loop writes: a truncated state file must never replace a good one.
-  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s\n' \
-      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" \
+  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s pending=%s\n' \
+      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" "${pnd:-none}" \
       > "$O/state/.harness-refresh.tmp" && mv -f "$O/state/.harness-refresh.tmp" "$O/state/harness-refresh"; } 2>/dev/null \
     || echo "[harness] WARNING: could not record state/harness-refresh — the verdict below is this cycle's only copy" >> "$LOG"
   # ONE line per cycle, in the script's own words (it already names what it did). A refusal goes to

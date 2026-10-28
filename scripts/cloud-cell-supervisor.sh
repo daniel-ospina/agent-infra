@@ -3410,7 +3410,7 @@ cmd_status() {
   # now (the controller re-pins itself every cycle). They can legitimately disagree for one cycle
   # after a re-pin, which is why both are printed — but an EMPTY pin is never a quiet absence: its
   # own state, with the remedy, because it is the state the fleet sat in for hours.
-  local _pin _pv _hrf _k _rel _run _act _at _age _fet
+  local _pin _pv _hrf _k _rel _run _act _at _age _fet _rq
   _pin="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
   _pv="$(head -1 "$_pin" 2>/dev/null | tr -d '[:space:]')"
   if [ -n "$_pv" ]; then
@@ -3451,6 +3451,34 @@ cmd_status() {
     esac
   else
     log_line "self-refresh: NO RECORD at $_hrf — no cycle has recorded a self-refresh verdict yet (started before this check existed, or the loop cannot write state)"
+  fi
+  # ── the restart DECISION, and what became of it (agent-infra#2641) ──────────────────────────
+  # `restart-pending` used to be a word printed into a reason string. On a cell it was also PERMANENT
+  # (the running identity could not be read there at all), so the same box printed `[current]` on the
+  # `harness:` line above and `restart-pending` here, for ever. The per-cycle record now carries the
+  # REASON and a request; printing it beside the verdict is what makes "requested at T … honoured at
+  # T+n / refused because Y" readable from the one verb an operator runs.
+  # ⛔ AN ABSENT RECORD IS NOT "NOTHING PENDING": no cycle has recorded a request, which is a different
+  # fact, and the same absence-vs-empty rule the rest of this file follows.
+  _rq="$O/state/restart-request"
+  if [ -f "$_rq" ]; then
+    log_line "restart: $(sed 's/^restart //' "$_rq" 2>/dev/null)"
+    case "$(cat "$_rq" 2>/dev/null)" in
+      # ⛔ `blocked=identity` IS ITS OWN CAUSE, AND IT COMES FIRST. The generic blocked arm below says
+      # "something this box can see would be interrupted" — but `harness-refresh.sh` writes
+      # `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
+      # is a CLAIM. Nothing was measured busy there, so the generic sentence names a cause that does not
+      # exist and tells the operator to wait for a population that may never exist — the misdirection this
+      # change exists to remove.
+      *'request=pending'*'blocked=identity'*)
+        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. Nothing is interrupted and nothing is waiting: re-check once the controller's argv/lock is readable." ;;
+      *'request=pending'*'actuation=blocked'*)
+        log_line "⛔ a restart is PENDING and was NOT applied — something this box can see would be interrupted (named in blocked=/lanes= above). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm, once that population is idle." ;;
+      *'request=pending'*'actuation=safe'*)
+        log_line "a restart is PENDING and was NOT applied — every population this box can measure was empty (checked=argv,roles,tree; blind=reparented-no-wrapper). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm." ;;
+    esac
+  else
+    log_line "restart: NO REQUEST RECORD at $_rq (no cycle has recorded one — that is not the same as 'nothing pending')"
   fi
   # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
   # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
