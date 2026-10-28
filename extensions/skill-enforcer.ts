@@ -891,12 +891,22 @@ export default function (pi: ExtensionAPI) {
       // the module-load line already named the inferred contract
       // (`DERIVED_ANNOUNCED_AT_LOAD`), repeating the same `why` here would put two
       // identical sentences in one process's log (review cycle 2, P1).
+      // ⛔ ONE line per process, for EVERY shape (review cycle 4, F1). The
+      // module-load line below/above already tells an operator the gates are off for
+      // this process AND names the derivation — so when it fired, nothing is added
+      // here, even when a launcher var is ALSO present. That shape printed
+      // "Lane contract DERIVED …" and then a bare "Disabled": two lines for one
+      // process. `lane.sh`/`fix-one.sh`/`merge-one.sh` export KIND/TAG so they never
+      // hit it, but a hand-run `pi -p` using the escape hatch this module prints does,
+      // and an added startup line is exactly the #172 class.
       const derived = laneContract();
       const viaEnv = process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1";
-      if (viaEnv) {
-        console.log(`[skill-enforcer] ⏸️  Disabled`);
-      } else if (!DERIVED_ANNOUNCED_AT_LOAD) {
-        console.log(`[skill-enforcer] ⏸️  Disabled — derived lane contract: ${derived.why}`);
+      if (!DERIVED_ANNOUNCED_AT_LOAD) {
+        if (viaEnv) {
+          console.log(`[skill-enforcer] ⏸️  Disabled`);
+        } else {
+          console.log(`[skill-enforcer] ⏸️  Disabled — derived lane contract: ${derived.why}`);
+        }
       }
     }
   });

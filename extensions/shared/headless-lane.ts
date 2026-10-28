@@ -179,8 +179,15 @@ function isSupervisedChild(env: Record<string, string | undefined>): boolean {
 
 /**
  * The `GIT_*` variables that can RELOCATE a git read away from the cwd, dropped
- * before any probe (see the header). Kept identical to
- * `scripts/orchestrator-harness/merge-reminder.py`'s `GIT_ENV_DROP`.
+ * before any probe (see the header).
+ *
+ * ⛔ THERE ARE THREE COPIES OF THIS LIST, in three languages, and they must agree:
+ * this one, `scripts/orchestrator-harness/merge-reminder.py`'s `GIT_ENV_DROP`, and
+ * the `unset …` line in `scripts/orchestrator-harness/box-status.sh`. A shared
+ * constant is impossible across TS/Python/shell, so `A13` in the sibling suite
+ * parses all three and goes RED on drift — a comment naming the copies cannot. Add
+ * a relocating variable to one and the measured fail-open returns: hub + an
+ * exported `GIT_DIR` derives `lane: true` and lifts every gate in the hub.
  */
 const GIT_ENV_DROP = [
   "GIT_DIR",
@@ -274,6 +281,13 @@ function classifyCheckout(
  * "linked worktree vs hub" is the one distinction this whole module exists to
  * make, so a line that misnames it is the misreport the file's own `A2` prose
  * argues against.
+ *
+ * The comparison is REALPATH'd on BOTH sides: `gitDir` is realpath'd (see
+ * `classifyCheckout`), so comparing it against an unresolved `resolve(top, ".git")`
+ * measured a real path against a LINK path — and named a MAIN checkout whose `.git`
+ * is a SYMLINK a "non-worktree checkout", the same misreport in a narrower shape
+ * (review cycle 4, F2; pinned by `A5d`). A `--separate-git-dir` checkout stays
+ * correctly OUT: its `.git` is a FILE whose realpath is the file, never the git dir.
  */
 function guardedWhy(checkout: {
   topLevel: string | null;
@@ -287,7 +301,8 @@ function guardedWhy(checkout: {
       ? `headless in a work-tree-less checkout ${checkout.gitDir} — there is no lane to derive (guarded)`
       : `headless outside any git checkout — there is no lane to derive (guarded)`;
   }
-  if (checkout.gitDir && checkout.gitDir === resolve(checkout.topLevel, ".git")) {
+  const hubGitDir = realpathOrNull(resolve(checkout.topLevel, ".git")) ?? resolve(checkout.topLevel, ".git");
+  if (checkout.gitDir && checkout.gitDir === hubGitDir) {
     return `headless in the HUB checkout ${checkout.topLevel} — the hub stays guarded`;
   }
   return (

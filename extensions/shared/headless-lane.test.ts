@@ -106,7 +106,16 @@ const FIXTURE = (() => {
   const sepGit = join(base, "sep.git");
   mkdirSync(sepTop, { recursive: true });
   git(["init", "-q", "--separate-git-dir", sepGit, "-b", "main"], sepTop);
-  return { base, hub, wtDirNamed, wtBranchNamed, sepTop, sepGit, wtGitDir: join(hub, ".git", "worktrees", "w-10137") };
+  // A MAIN checkout whose `.git` is a SYMLINK. `gitDir` is realpath'd, so a
+  // comparison against an unresolved `<top>/.git` measured a real path against a
+  // LINK path and named this a "non-worktree checkout" — same misreport as A5b, in
+  // a narrower shape (review cycle 4, F2). Pinned by A5d.
+  const symHub = join(base, "symhub");
+  mkdirSync(symHub, { recursive: true });
+  git(["init", "-q", "-b", "main"], symHub);
+  execFileSync("mv", [join(symHub, ".git"), join(base, "realgit-sym")], { encoding: "utf-8" });
+  execFileSync("ln", ["-s", join("..", "realgit-sym"), join(symHub, ".git")], { encoding: "utf-8" });
+  return { base, hub, wtDirNamed, wtBranchNamed, sepTop, sepGit, symHub, wtGitDir: join(hub, ".git", "worktrees", "w-10137") };
 })();
 
 const PRINT_ENV = { PI_MODE: "print" } as Record<string, string | undefined>;
@@ -172,6 +181,73 @@ async function commitDecision(contract: LaneContract): Promise<{ blocked: boolea
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+/**
+ * Run one real `skill-enforcer` PROCESS in a linked worktree and return the lines
+ * it logged. Two things make a child necessary: the announcement state
+ * (`DERIVED_ANNOUNCED_AT_LOAD`) is module-level, and this suite imports that module
+ * at startup — so in-process the load site has already run, with the RUNNER's cwd
+ * and env, not the fixture's.
+ *
+ * Every launcher affordance is scrubbed unless `extraEnv` puts one back, so the
+ * DERIVATION is the only thing that can lift the gates.
+ */
+function announceProbe(extraEnv: Record<string, string> = {}): { loadError: string | null; logs: string[]; status: number } {
+  const dir = tmpDir("hl-announce-");
+  const driver = join(dir, "driver.mjs");
+  const reads = join(dir, "skill-reads.json");
+  const modUrl = pathToFileURL(join(HERE, "..", "skill-enforcer.ts")).href;
+  writeFileSync(
+    driver,
+    `
+const logs = [];
+const ol = console.log, oe = console.error;
+console.log = (...a) => logs.push("log: " + a.join(" "));
+console.error = (...a) => logs.push("err: " + a.join(" "));
+let loadError = null;
+(async () => {
+  try {
+    const ns = await import(${JSON.stringify(modUrl)});
+    const hook = typeof ns.default === "function" ? ns.default : ns.default && ns.default.default;
+    if (typeof ns._setSkillReadsFileForTest === "function") ns._setSkillReadsFileForTest(${JSON.stringify(reads)});
+    const handlers = {};
+    const pi = { on(n, fn) { (handlers[n] = handlers[n] || []).push(fn); } };
+    hook(pi);
+    for (const fn of handlers["session_start"] || []) await fn({}, {});
+  } catch (e) { loadError = String((e && e.stack) || e); }
+  console.log = ol; console.error = oe;
+  process.stdout.write(JSON.stringify({ loadError, logs }));
+})();
+`,
+  );
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const k of [
+    "SKILL_ENFORCER_DISABLED",
+    "LOOP_ENFORCER_DISABLED",
+    "AGENT_ALLOW_MAIN_EDITS",
+    "ELDATO_ALLOW_MAIN_EDITS",
+    "KIND",
+    "TAG",
+    "TASK_HEARTBEAT",
+    "AGENT_SKIP_REVIEW_GATE",
+    "PI_MODE",
+  ]) delete env[k];
+  // print mode carries it: the child's argv has no `-p`, so `PI_MODE` is the only
+  // channel.
+  env.PI_MODE = "print";
+  for (const [k, v] of Object.entries(extraEnv)) env[k] = v;
+  const res = spawnSync("npx", ["tsx", driver], {
+    cwd: FIXTURE.wtDirNamed,
+    env,
+    encoding: "utf8",
+    timeout: 240000,
+  });
+  const stdout = res.stdout ?? "";
+  const start = stdout.indexOf("{");
+  if (start < 0) return { loadError: `no JSON report — status ${res.status}; stderr: ${(res.stderr ?? "").slice(0, 600)}`, logs: [], status: res.status ?? -1 };
+  const report = JSON.parse(stdout.slice(start)) as { loadError: string | null; logs: string[] };
+  return { ...report, status: res.status ?? -1 };
+}
+
 async function main() {
   // ── A. the derivation itself: what a process can observe about itself ─────
   section("A. derivation — headless + LINKED worktree is a lane; the hub is not");
@@ -223,8 +299,7 @@ async function main() {
     ok(/non-worktree checkout/.test(c.why), `why: the guarded verdict must name the shape it measured, got ${JSON.stringify(c.why)}`);
   });
 
-  await test("A5c — a cwd inside a linked worktree's GIT DIR derives the lane, and its `why` prints no literal `null`", () => {
-    const c = deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.wtGitDir });
+  await test("A5c — a cwd inside a linked worktree's GIT DIR derives the lane, and its `why` prints no literal `null`", () => {    const c = deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.wtGitDir });
     // The structural test is git-dir ≠ common-dir; both halves resolve here, so the
     // arm is the lane one and the process can act on that worktree's branch. Only
     // `--show-toplevel` is unavailable (there is no working tree), and it is
@@ -237,6 +312,18 @@ async function main() {
       `why: the operator-facing line must not interpolate a null top level, got ${JSON.stringify(c.why)}`,
     );
     ok(/no working tree to name/.test(c.why), `why: it must say WHY there is no path, got ${JSON.stringify(c.why)}`);
+  });
+
+  await test("A5d — a MAIN checkout whose `.git` is a SYMLINK is still named the HUB", () => {
+    // `gitDir` is realpath'd, so the `HUB` comparison must be too: `<top>/.git` here
+    // is a LINK to `<base>/realgit-sym`, and comparing against the unresolved path
+    // called a genuine main checkout a "non-worktree checkout" (review cycle 4, F2).
+    const c = deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.symHub });
+    equal(c.lane, false, `lane: expected false — a main checkout is not a lane, got true (${c.why})`);
+    ok(
+      /HUB/.test(c.why),
+      `why: a main checkout whose .git is a symlink is STILL the hub, got ${JSON.stringify(c.why)} — git-dir=${c.gitDir}`,
+    );
   });
 
   await test("A4 — a bare `pi -p` (no PI_MODE) is headless via argv, which is the shape that failed", () => {
@@ -394,59 +481,7 @@ async function main() {
     // `DERIVED_ANNOUNCED_AT_LOAD = true` → `A12 ❌` (2 lines); flipping the
     // `session_start` condition to `else if (DERIVED_ANNOUNCED_AT_LOAD)` → `A12 ❌`
     // (one line, wrong site). A pin that cannot fail is not a pin.
-    const dir = tmpDir("hl-announce-");
-    const driver = join(dir, "driver.mjs");
-    const reads = join(dir, "skill-reads.json");
-    const modUrl = pathToFileURL(join(HERE, "..", "skill-enforcer.ts")).href;
-    writeFileSync(
-      driver,
-      `
-const logs = [];
-const ol = console.log, oe = console.error;
-console.log = (...a) => logs.push("log: " + a.join(" "));
-console.error = (...a) => logs.push("err: " + a.join(" "));
-let loadError = null;
-(async () => {
-  try {
-    const ns = await import(${JSON.stringify(modUrl)});
-    const hook = typeof ns.default === "function" ? ns.default : ns.default && ns.default.default;
-    if (typeof ns._setSkillReadsFileForTest === "function") ns._setSkillReadsFileForTest(${JSON.stringify(reads)});
-    const handlers = {};
-    const pi = { on(n, fn) { (handlers[n] = handlers[n] || []).push(fn); } };
-    hook(pi);
-    for (const fn of handlers["session_start"] || []) await fn({}, {});
-  } catch (e) { loadError = String((e && e.stack) || e); }
-  console.log = ol; console.error = oe;
-  process.stdout.write(JSON.stringify({ loadError, logs }));
-})();
-`,
-    );
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    for (const k of [
-      "SKILL_ENFORCER_DISABLED",
-      "LOOP_ENFORCER_DISABLED",
-      "AGENT_ALLOW_MAIN_EDITS",
-      "ELDATO_ALLOW_MAIN_EDITS",
-      "KIND",
-      "TAG",
-      "TASK_HEARTBEAT",
-      "AGENT_SKIP_REVIEW_GATE",
-      "PI_MODE",
-    ]) delete env[k];
-    // print mode carries it: the child's argv has no `-p`, so `PI_MODE` is the only
-    // channel — and every launcher affordance is gone, so the DERIVATION is the only
-    // thing that can lift the gates.
-    env.PI_MODE = "print";
-    const res = spawnSync("npx", ["tsx", driver], {
-      cwd: FIXTURE.wtDirNamed,
-      env,
-      encoding: "utf8",
-      timeout: 240000,
-    });
-    const stdout = res.stdout ?? "";
-    const start = stdout.indexOf("{");
-    ok(start >= 0, `the child printed no JSON report — status ${res.status}; stderr: ${(res.stderr ?? "").slice(0, 600)}`);
-    const report = JSON.parse(stdout.slice(start)) as { loadError: string | null; logs: string[] };
+    const report = announceProbe();
     ok(!report.loadError, `the child failed to load skill-enforcer: ${report.loadError}`);
     const logs = report.logs;
     const why = logs.filter((l) => /headless in linked worktree/.test(l));
@@ -464,6 +499,66 @@ let loadError = null;
       0,
       `\`session_start\` must NOT repeat the derived \`why\` when the load site already announced it. Full log:\n     ${logs.join("\n     ")}`,
     );
+  });
+
+  await test("A12b — a launcher affordance WITHOUT KIND/TAG still prints ONE line (the round-4 duplicate)", () => {
+    // ⛔ The shape round 3's pin could not see (review cycle 4, F1): the load site
+    // fires because it INFERRED `KIND=lane`, and `session_start` ALSO fires because
+    // the bypass is true via an env var — two lines for one process. `lane.sh`,
+    // `fix-one.sh` and `merge-one.sh` all export KIND/TAG so they never hit it, but a
+    // hand-run `pi -p` using the escape hatch this module prints DOES. The load line
+    // already says the gates are off for this process, so a second, barer line adds
+    // nothing — it is the #172 added-startup-line class.
+    //
+    // Measured RED against a mutated `skill-enforcer.ts` (the `viaEnv` branch restored
+    // ahead of the `DERIVED_ANNOUNCED_AT_LOAD` guard): `A12b ❌` on the bare-`Disabled`
+    // assertion. It also caught this pin's own first attempt — a regex containing the
+    // pause glyph, whose bytes had been mangled in transit, matched nothing and passed
+    // vacuously. The match is ASCII-only (`/Disabled$/`) for that reason.
+    const report = announceProbe({ SKILL_ENFORCER_DISABLED: "1" });
+    ok(!report.loadError, `the child failed to load skill-enforcer: ${report.loadError}`);
+    const logs = report.logs;
+    const why = logs.filter((l) => /headless in linked worktree/.test(l));
+    equal(
+      why.length,
+      1,
+      `expected the derived announcement EXACTLY ONCE, got ${why.length}. Full log:\n     ${logs.join("\n     ")}`,
+    );
+    equal(
+      logs.filter((l) => /Disabled$/.test(l)).length,
+      0,
+      `a bare \`Disabled\` line must not be added when the load site already named the derivation. Full log:\n     ${logs.join("\n     ")}`,
+    );
+  });
+
+  await test("A13 — the GIT_* scrub list has THREE copies, and they AGREE (drift here is the M3 fail-open returned)", () => {
+    // The list cannot be shared across TypeScript, Python and shell, so the module
+    // comment names every copy. A comment cannot go red; this can. A new relocating
+    // variable added to one copy and not the others restores the measured fail-open
+    // (hub + exported `GIT_DIR` ⇒ `lane: true`), so the three are compared here.
+    // Measured RED by dropping `GIT_COMMON_DIR` from box-status.sh's `unset` line.
+    const repo = resolve(HERE, "..", "..");
+    const names = (src: string, re: RegExp, what: string): string[] => {
+      const block = src.match(re);
+      ok(block, `the ${what} copy of the GIT_* list no longer matches this pin's anchor (${re}) — reformatting it silently disables the drift gate`);
+      const found = [...block![1].matchAll(/["']([A-Z][A-Z0-9_]*)["']/g)].map((m) => m[1]);
+      ok(found.length > 0, `the ${what} copy of the GIT_* list parsed as EMPTY — a gate over nothing certifies nothing`);
+      return found;
+    };
+    const ts = names(readFileSync(join(HERE, "headless-lane.ts"), "utf8"), /const GIT_ENV_DROP = \[([\s\S]*?)\] as const/, "headless-lane.ts");
+    const py = names(
+      readFileSync(join(repo, "scripts", "orchestrator-harness", "merge-reminder.py"), "utf8"),
+      /GIT_ENV_DROP\s*=\s*\(([\s\S]*?)\)/,
+      "merge-reminder.py",
+    );
+    const shSrc = readFileSync(join(repo, "scripts", "orchestrator-harness", "box-status.sh"), "utf8");
+    const unsetLines = [...shSrc.matchAll(/^unset\s+((?:GIT_[A-Z0-9_]+\s*)+)$/gm)];
+    equal(unsetLines.length, 1, `expected exactly one \`unset GIT_*\` line in box-status.sh, got ${unsetLines.length}`);
+    const sh = unsetLines[0][1].trim().split(/\s+/);
+    const norm = (l: string[]) => [...new Set(l)].sort();
+    const want = norm(ts).join(" ");
+    equal(norm(py).join(" "), want, `merge-reminder.py's GIT_ENV_DROP drifted from headless-lane.ts — update BOTH (the copies are listed in the module comment)`);
+    equal(norm(sh).join(" "), want, `box-status.sh's \`unset\` list drifted from headless-lane.ts — update BOTH (the copies are listed in the module comment)`);
   });
 
   // ── B. the wiring: what the enforcer actually decides about `git commit` ──
