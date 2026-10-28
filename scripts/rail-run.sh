@@ -414,7 +414,6 @@ pr_state() {
     return 14
   fi
   return 13
-  printf '%s' "$out"
 }
 
 sig_name() { # <signal-number> -> its name when it is one this box meets daily
