@@ -1084,11 +1084,41 @@ cmd_check() {
       # network, and a fetch only ADVANCES origin/main, so this probe can never false-block. Left
       # unprobed, `--check` blessed a tree the run path refuses with `TRANSIENT: … carries 1 commit(s)
       # not in origin/main` — #2174's shape behind a CHECK OK.
-      if [ -n "$sc_main" ] && [ "$sc_head" != "$sc_main" ] \
-         && [ "$(git -C "$SC" rev-list --count "refs/remotes/origin/main..HEAD" 2>/dev/null || echo 0)" != 0 ]; then
-        echo "[refresh] check: FAIL the scout at $SC carries commits that are NOT in origin/main, so the refresh will refuse to move it"
-        echo "[refresh] TRANSIENT: scout commits ahead — the move would orphan those commits; save them (git -C $SC branch scout-work-<date> or push them), then re-run"
-        return "$EXIT_TRANSIENT"
+      # ⛔ THE SECOND HALF OF THAT SENTENCE WAS WRONG, AND IT IS #2953 (measured on cell4, 2026-10-27).
+      # A fetch does not make this probe safe in a SHALLOW checkout: a `shallow` graft makes the walk from
+      # origin/main stop early, so `origin/main..HEAD` counted 1634 for a CLEAN scout with zero local
+      # commits — and `--check` FAILing here is `cloud-cell-bringup.sh` REFUSING TO START a cell. With no
+      # fetch allowed in this mode the history cannot be connected, so an UNPROVABLE count is a WARN
+      # naming both readings; the RUN PATH fetches/deepens and refuses only when the commits are genuinely
+      # local (PROVEN by a merge base). One derivation, both paths — see `scout_ahead_verdict`.
+      # ⛔ THE OTHER HALF OF "STALE TRACKING REF vs LOCAL WORK" IS THE FULL CHECKOUT (#2956 review P2).
+      # The shallow arm above was only one arm: on a FULL checkout whose `refs/remotes/origin/main` is
+      # STALE, `n>0` plus a merge base reads `local`, and this check FAILed with "PROVEN on this
+      # checkout's own graph, so the refresh will refuse to move it" — while the run path fetches FIRST
+      # and then finds HEAD already AT the (advanced) trunk tip and proceeds. Same false block, same
+      # consequence: `cloud-cell-bringup.sh` `die`s on any non-zero `--check`, so a healthy cell could
+      # not START. The attribution is what is unprovable offline, not the count: a merge base proves
+      # HEAD carries N commits the LOCAL ref does not have, and a stale ref produces exactly the same
+      # local reading as a local commit (measured: both are ahead>0, behind=0, connected). Only a fetch
+      # separates them, and this mode may not fetch — so the verdict is `local-or-unfetched` and this
+      # check WARNS. What it still FAILs is what a fetch cannot change: an `unrelated` history (a fetch
+      # of the trunk cannot connect a disjoint one) and a verdict it has no reading for.
+      if [ -n "$sc_main" ] && [ "$sc_head" != "$sc_main" ]; then
+        scout_ahead_verdict refs/remotes/origin/main noconnect
+        case "$SCOUT_AHEAD_VERDICT" in
+          none) ;;
+          unrelated)
+            echo "[refresh] check: FAIL the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) on a history that shares NO common ancestor with refs/remotes/origin/main ($SCOUT_AHEAD_VERDICT — a FETCH cannot connect a disjoint history, so the refresh will refuse to move it)"
+            echo "[refresh] TRANSIENT: scout commits ahead — the move would orphan those commits; save them (git -C $SC branch scout-work-<date> or push them), then re-run"
+            return "$EXIT_TRANSIENT" ;;
+          unfetched)
+            echo "[refresh] check: WARN the scout at $SC is ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) off refs/remotes/origin/main and this checkout CANNOT SAY WHICH KIND: it is a SHALLOW checkout whose history does not connect to the trunk (or its tracking ref is stale), so these may be commit(s) the ref has not fetched rather than local work. The run path fetches (and deepens a shallow checkout) before deciding, and refuses only if they are genuinely local — it is NOT refusible here without the network (#2953)" ;;
+          local-or-unfetched)
+            echo "[refresh] check: WARN the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) that refs/remotes/origin/main does not have, and this checkout CANNOT SAY WHICH KIND ($SCOUT_AHEAD_VERDICT): the count is PROVEN on this checkout's own graph, but a CONNECTED count is not an ATTRIBUTION — these are either LOCAL commit(s) or commit(s) a STALE tracking ref has not fetched, and the two read IDENTICALLY offline (ahead=$SCOUT_AHEAD_COUNT, behind=0, connected). The run path fetches first and refuses only if they are genuinely local, so a FAIL here would refuse a healthy cell without the network to prove it — this is NOT refusible in this mode (#2956)" ;;
+          *)
+            echo "[refresh] check: FAIL the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) off refs/remotes/origin/main and this check has NO READING for them ('$SCOUT_AHEAD_VERDICT') — REFUSING TO CERTIFY a verdict it does not understand rather than blessing a cell on it"
+            return "$EXIT_TRANSIENT" ;;
+        esac
       fi
       # ⛔ AN UNANSWERABLE PROBE IS NAMED, NOT SILENT (review cycle 7, P2). With no local
       # `refs/remotes/origin/main` this check cannot run — and the run path WILL refuse after its
@@ -1287,6 +1317,127 @@ scout_is_worktree() {
   top="$(git -C "$SC" rev-parse --show-toplevel 2>/dev/null)" || return 1
   here="$(cd "$SC" 2>/dev/null && pwd -P)" || return 1
   [ -n "$top" ] && [ "$(cd "$top" 2>/dev/null && pwd -P)" = "$here" ]
+}
+
+# ══ "COMMITS AHEAD" IS ONLY EVIDENCE ON A CONNECTED HISTORY (agent-infra#2953) ══════════════════════
+# ⛔ MEASURED, cell4 (`vm-ce2c2fc9fd844a32851d46c3723b903e`), 2026-10-27 — a CLEAN scout with ZERO local
+# commits, refused on every pass:
+#     scout HEAD=fadb6334  dirty=0  local-only commits: 1634
+#     refs/remotes/origin/main = 1e0516ffd = the FRESH upstream tip, TWO COMMITS AHEAD of HEAD
+#     git rev-list --count origin/main..HEAD  →  1634      (the number the refusal quoted)
+#     git merge-base HEAD origin/main         →  none      (that is the whole defect)
+#     .git/shallow                            →  91a3b29be = the tip's OWN PARENT
+# A `shallow` graft makes the listed commit PARENTLESS, so the walk from origin/main stops one commit in
+# while the walk from HEAD runs down every object the box holds. The 1 634 "commits not in origin/main"
+# were therefore the checkout's OWN history, below a line the walk was forbidden to cross — not work the
+# scout authored. The guard could not tell those apart, so it refused a transient BY CONSTRUCTION: the
+# message was unactionable (there was nothing to preserve), and nothing on the box moves a shallow
+# boundary, so it could never clear.
+# ⛔ AND THE OBVIOUS CURE DOES NOT WORK, which is why this helper exists rather than "fetch first".
+# `scout_sync` ALREADY fetches (with an explicit destination) one arm above, and the ref was already
+# fresh; measured on the fixture below: 28 before the fetch, 28 after it, and 28 after `--deepen=1`.
+# Only a deepen that passes HEAD, or `--unshallow`, connects the graph (measured: 0 / ancestor=YES).
+# ⛔ SO THE COUNT IS READ ONLY WHEN IT MEANS SOMETHING. With a merge base between HEAD and the ref, the
+# number is what the message claims (local work → PRESERVE). Without one, the checkout cannot answer at
+# all, and the repair is to CONNECT the history (deepen cheapest-first, then unshallow) rather than to
+# read a graph artifact as authorship. One derivation, used by BOTH the run path and `--check` mode: a
+# second copy of this inference is how the fix would look green while `--check` still blocked cells
+# (`cloud-cell-bringup.sh` DIES on a non-zero `--check`, so a false FAIL there refuses to start a cell).
+SCOUT_AHEAD_COUNT=""
+SCOUT_AHEAD_RAW=""
+SCOUT_AHEAD_TARGET=""
+# 0 = the histories are CONNECTED (a merge base exists), so `rev-list --count` is trustworthy.
+# 1 = still severed (not shallow, or every deepening step failed) — the count is an artifact.
+scout_connect_history() {   # <ref>
+  local ref="$1" step
+  git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1 && return 0
+  [ "$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ] || return 1
+  # ⛔ A LADDER, CHEAPEST FIRST, BECAUSE THE REPAIR, NOT THE COUNT, IS THE POINT. The measured shape sits
+  # ONE commit below the graft, so the first rung costs a handful of objects while `--unshallow` on
+  # agent-infra would download its entire history on a cell that already has a disk floor (#2850).
+  for step in 2 20 200; do
+    git -C "$SC" fetch --quiet --deepen="$step" origin "+refs/heads/main:$ref" >/dev/null 2>&1 || return 1
+    git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1 && return 0
+    [ "$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ] || return 1
+  done
+  # Last rung: tear the boundary out. This is a ONE-TIME repair of the box — once the checkout is
+  # complete, every later pass is exact and this class of false refusal cannot recur.
+  git -C "$SC" fetch --quiet --unshallow origin "+refs/heads/main:$ref" >/dev/null 2>&1 || return 1
+  git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1
+}
+
+# Prints ONE word, and publishes SCOUT_AHEAD_COUNT / SCOUT_AHEAD_RAW / SCOUT_AHEAD_TARGET:
+#   none      — HEAD is reachable from <ref>: there is nothing to lose, so the gate may move.
+#   local     — HEAD carries N commits <ref> does not have, PROVEN on a connected history → PRESERVE.
+#   unrelated — the histories share NO common ancestor and the checkout is NOT shallow (a rewritten
+#               trunk, an orphan branch, or local work on a history main never had) → PRESERVE.
+#   unfetched — the checkout is SHALLOW and deepening could NOT connect it, so N counts "commit(s) the
+#               remote-tracking ref has not fetched" and says NOTHING about local work → FETCH/retry.
+#   local-or-unfetched — `noconnect` ONLY: the count is PROVEN on a connected graph (a merge base), but
+#               a CONNECTED COUNT IS NOT AN ATTRIBUTION — HEAD carrying N commits the LOCAL ref lacks is
+#               the same reading for "N local commits" and for "N commits a STALE ref has not fetched"
+#               (ahead>0, behind=0, connected, in both). Only a fetch separates them, and `noconnect` may
+#               not fetch, so this is WARNed, never refused (#2956 review, the other half of #2174's arm;
+#               the reviewer's suggested name was `unfetched-full` — named for BOTH readings instead,
+#               because the token is read by operators in the message and neither reading is proven).
+# ⛔ `unrelated` EXISTS SO THAT (b) CANNOT LEAK THROUGH THE NEW ARM (measured in this change's own
+# prototype): a scout on an ORPHAN branch is not shallow and has no merge base, and folding it into
+# `unfetched` would have printed "nothing needs preserving" over commits that exist in no other place.
+# `unfetched` is therefore gated on the shallow test, not on "no merge base".
+# `connect` may use the network (the run path, which is about to check out anyway); `noconnect` may not
+# (`--check`, which is deliberately offline: a check that needs egress would refuse a healthy cell on a
+# train). On `noconnect` a shallow checkout is `unfetched`, never `local`.
+# ⛔ THE VERDICT CROSSES IN A VARIABLE, NOT ON STDOUT (measured in this very change): called as
+# `case "$(scout_ahead_verdict …)"`, the function runs in a COMMAND-SUBSTITUTION SUBSHELL and its
+# SCOUT_AHEAD_* assignments die with it — the caller then read an EMPTY count and printed
+# "carries  LOCAL commit(s)" while the number it had just computed sat one subshell away. A multi-value
+# return is a global, not a string.
+SCOUT_AHEAD_VERDICT=""
+scout_ahead_verdict() {   # <ref> <connect|noconnect>; sets SCOUT_AHEAD_VERDICT, always returns 0
+  local ref="$1" mode="$2" n shallow
+  SCOUT_AHEAD_COUNT=""; SCOUT_AHEAD_RAW=""
+  shallow="$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)"
+  SCOUT_AHEAD_TARGET="$(git -C "$SC" rev-parse -q --verify "$ref" 2>/dev/null)" || SCOUT_AHEAD_TARGET=""
+  if [ -n "$SCOUT_AHEAD_TARGET" ] && git -C "$SC" merge-base --is-ancestor HEAD "$SCOUT_AHEAD_TARGET" >/dev/null 2>&1; then
+    SCOUT_AHEAD_VERDICT=none; return 0
+  fi
+  n="$(git -C "$SC" rev-list --count "$ref..HEAD" 2>/dev/null)" || n=""
+  case "$n" in ''|*[!0-9]*) n="" ;; esac
+  SCOUT_AHEAD_RAW="$n"
+  # ⛔ THE REPAIR MAY MOVE THE REF (the deepen fetches it) AND MAY UNSHALLOW, so re-read both.
+  if [ "$mode" = connect ]; then
+    scout_connect_history "$ref" || :
+    SCOUT_AHEAD_TARGET="$(git -C "$SC" rev-parse -q --verify "$ref" 2>/dev/null)" || SCOUT_AHEAD_TARGET=""
+    shallow="$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)"
+  fi
+  n="$(git -C "$SC" rev-list --count "$ref..HEAD" 2>/dev/null)" || n=""
+  case "$n" in ''|*[!0-9]*) n="" ;; esac
+  SCOUT_AHEAD_COUNT="$n"
+  # Ancestry first: a count of 0 IS "HEAD is contained in the ref", and reading it that way keeps the
+  # verdict immune to the graph artifact this helper exists for.
+  [ -n "$n" ] && [ "$n" -eq 0 ] 2>/dev/null && { SCOUT_AHEAD_VERDICT=none; return 0; }
+  if [ -n "$n" ] && git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1; then
+    # ⛔ THE COUNT IS PROVEN; ITS ATTRIBUTION IS NOT — AND `noconnect` CANNOT BUY ONE (#2956 review P2).
+    # Measured shape: a FULL checkout whose `refs/remotes/origin/main` is STALE (the trunk moved on, this
+    # checkout has not fetched since) has HEAD carrying exactly the commits the ref lacks — which is the
+    # SAME local reading a genuinely-local commit produces. The run path fetches first (so this resolves
+    # to `none` or to `local` there); `--check` may not, so it must not claim what only a fetch can
+    # prove. Refusing on it refused a healthy cell at `cloud-cell-bringup.sh --check`.
+    if [ "$mode" = noconnect ]; then
+      SCOUT_AHEAD_VERDICT=local-or-unfetched
+    else
+      SCOUT_AHEAD_VERDICT=local
+    fi
+    return 0
+  fi
+  # ⛔ NO MERGE BASE: shallow ⇒ the graph is severed (the artifact this change exists for); not shallow
+  # ⇒ the histories really are disjoint, which is WORK OR A REWRITE and must be preserved.
+  if [ "$shallow" = "true" ]; then
+    SCOUT_AHEAD_VERDICT=unfetched
+  else
+    SCOUT_AHEAD_VERDICT=unrelated
+  fi
+  return 0
 }
 
 # 0 = the scout IS origin/main (or is a vendored copy that cannot hide a versioned gate);
@@ -1507,11 +1658,40 @@ scout_sync() {
     # and abandons whatever HEAD was, so a commit not in origin/main becomes unreachable — and the
     # dirty guard above cannot see it, because a commit leaves the worktree clean. Count against HEAD,
     # not against the branch name: a DETACHED scout would otherwise count 0 while losing its commits.
-    commits="$(git -C "$SC" rev-list --count "$target..HEAD" 2>/dev/null || echo 0)"
-    case "${commits:-0}" in
-      ''|0) ;;
-      *) # same defect as the arm above: RC without WHY (#2688 review cycle 2, P2).
-         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries $commits commit(s) not in origin/main — moving the gate would orphan them. Keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
+    # ⛔ AND THE COUNT IS ONLY EVIDENCE ON A CONNECTED HISTORY (agent-infra#2953, measured on cell4):
+    # across a `shallow` graft it counts the checkout's OWN history and refuses a clean scout forever.
+    # The verdict distinguishes PRESERVE (`local`) from FETCH (`unfetched`) — opposite operator actions
+    # that the old single message could not tell apart, which was half the defect.
+    scout_ahead_verdict refs/remotes/origin/main connect
+    case "$SCOUT_AHEAD_VERDICT" in
+      none)
+         # The repair may have ADVANCED the ref; use the sha it left, not the pre-deepen one.
+         target="${SCOUT_AHEAD_TARGET:-$target}"
+         # Name the repair when it happened: an operator reading "scout STALE at … refreshing" for a
+         # tree that was never ahead must be able to see WHY a count was discarded.
+         case "${SCOUT_AHEAD_RAW:-0}" in
+           ''|0) ;;
+           *) echo "[refresh] REPAIR: $SC is a SHALLOW checkout whose history did not connect to origin/main, so 'commits ahead' read ${SCOUT_AHEAD_RAW} — that was this checkout's OWN history below the shallow boundary, not local work; deepened the history, and the scout is now a clean ancestor of origin/main (#2953)" ;;
+         esac ;;
+      local)
+         # same defect as the arm above: RC without WHY (#2688 review cycle 2, P2).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries $SCOUT_AHEAD_COUNT LOCAL commit(s) that origin/main does not have — moving the gate would orphan them. Keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
+         return 1 ;;
+      unrelated)
+         # ⛔ NOT FOLDED INTO `unfetched` (#2953 review of this same change): these histories share NO
+         # ancestor and the checkout is NOT shallow, so this is local work (or a rewrite) — the one
+         # shape where "nothing needs preserving" would be a lie over commits that exist nowhere else.
+         # The count can be UNREADABLE on this arm (it is reached when `rev-list` failed, not only when it
+         # answered), so it prints a WORD rather than `carries  commit(s)` (#2956 review, cosmetic).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) on a history that shares NO common ancestor with origin/main — moving the gate would orphan them. That is either local work or a rewritten trunk, and deciding between those is an operator call, not a scheduled one. Inspect them (git -C $SC log --oneline --graph origin/main..HEAD), save anything real with: git -C $SC branch scout-work-$(date +%s)"
+         return 1 ;;
+      *)
+         # REFUSED, and it says WHICH kind of difference this is — FETCH, not preserve. A deepening that
+         # failed (no egress) lands here too, which is why this is TRANSIENT and retried next cycle.
+         # ⛔ IT MAKES NO CLAIM ABOUT PRESERVATION: the pass could not connect the history, so it does not
+         # know whether these commits are local. "Nothing needs preserving" is only allowed where it was
+         # PROVEN (the `none` arm above).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC is a SHALLOW checkout whose history does not connect to origin/main, so its ${SCOUT_AHEAD_COUNT:-unreadable} commit(s) are commit(s) the REMOTE-TRACKING REF HAS NOT FETCHED as far as this pass can tell — REFUSING TO JUDGE; nothing was moved and nothing was discarded. The operator action here is FETCH, not preserve: git -C $SC fetch --unshallow origin, then re-run (the next cycle retries too)"
          return 1 ;;
     esac
     echo "[refresh] scout STALE at $before, refreshing to origin/main ${target:0:9} (#2174)"

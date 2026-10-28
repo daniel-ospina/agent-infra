@@ -700,6 +700,35 @@ _pids_minus() { # <seen> <owned>
   comm -23 <(printf '%s\n' "$1" | awk 'NF' | sort -u) <(printf '%s\n' "$2" | awk 'NF' | sort -u)
 }
 _pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
+# ── the refusal an operator can ACT on (#2916 check 6, rows 6-7) ────────────────────────────────
+# Both refusals below used to say "…give this repo its own SESSION, or stop it from the state dir that
+# owns it" — which names neither the state dir nor the command, and BOTH measured cases cost a manual
+# step on a live cell: a stale `cell-doctor` tmux session minted by a PREVIOUS state dir blocked the
+# doctor role, and a leftover inner-chain member (`tmux → bash -c → orch-loop.sh`) blocked the first
+# start and was cleared by hand. So the message carries what the box already knows: the pid, the
+# state dir the pid actually runs from, and the exact command.
+# ⛔ MESSAGE ONLY — nothing here signals anything. Auto-clearing a pid/session this state dir cannot
+# prove it owns is the #1856 hazard; the remedy is PRINTED for the operator, never executed.
+_pids_join_with_dirs() { # <pids-newline-separated> -> "pid <p> (state dir <d>)" …
+  local t p d out=""
+  t="$(ps -eo pid=,command= 2>/dev/null)" || t=""
+  for p in $1; do
+    d=""
+    [ -n "$t" ] && d="$(printf '%s\n' "$t" | awk -v pp="$p" '$1==pp' | tr ' \t' '\n\n' \
+                       | sed -n 's|^\(.*\)/orch-loop\.sh$|\1|p' | head -1)"
+    if [ -n "$d" ]; then out="$out, pid $p (state dir $d)"; else out="$out, pid $p"; fi
+  done
+  printf '%s' "${out#, }"
+}
+# The state dir a FOREIGN doctor session runs from, read from its own pane command (the same evidence
+# `doctor_session_foreign` uses). Empty when the pane does not name one — printed as <unreadable>
+# rather than guessed.
+doctor_session_state_dir() {
+  local cmd
+  cmd="$(tmux list-panes -t "=$DOCTOR_SESSION" -F '#{pane_start_command}' 2>/dev/null)" || return 1
+  [ -n "$cmd" ] || return 1
+  printf '%s\n' "$cmd" | sed -n "s/.*O='\([^']*\)'.*/\1/p" | head -1
+}
 
 # ── the controller SERVICE (agent-infra#2402) ───────────────────────────────────────────────────
 # A cell's controller used to live and die as a tmux session, with nothing above it: when the last
@@ -2546,7 +2575,7 @@ cmd_start() {
       if [ -z "$_own" ]; then
         _seen="$(seen_controller_pids 2>/dev/null)" || _seen=""
         if [ -n "$_seen" ]; then
-          die "a controller runs from this machine's shared harness path (pid $(_pids_join "$_seen")) and is not provably this state dir's — refusing to wait for it (that would supervise nothing while reporting an active unit); stop it from the state dir that owns it, or give this repo its own SESSION in $ENV_FILE"
+          die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$_seen")) and is not provably this state dir's ($OR) — refusing to wait for it (that would supervise nothing while reporting an active unit). FIX: kill $(_pids_join "$_seen") — a pid whose state dir is not $OR is a leftover inner-chain member from a previous state dir (the measured row-7 case) and it blocks this cell's first start until it is gone; if it IS this repo's, give this repo its own SESSION in $ENV_FILE instead"
         fi
       fi
       # ⛔ THE CEILING DEPENDS ON WHICH WAIT THIS IS. An owned pid is a controller doing its work — long
@@ -2709,7 +2738,7 @@ cmd_start() {
     # up" when it was not, and named `stop` as the remedy — which this same state dir refuses in this
     # exact state (#1856 review, reproduced). Starting here would put a second controller on one
     # queue, which is what #1761 forbids, so refuse and say exactly what is and is not known.
-    die "a controller runs from this machine's shared harness path (pid $(_pids_join "$live")) and is not provably this state dir's — refusing to start a second controller; it is left alone. Give this repo its own SESSION in $ENV_FILE, or stop it from the state dir that owns it"
+    die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$live")) and is not provably this state dir's ($OR) — refusing to start a second controller; it is left alone. FIX: kill $(_pids_join "$live") — a pid whose state dir is not $OR is a leftover inner-chain member from a previous state dir (the measured row-7 case) and it blocks this cell's first start until it is gone; if it IS this repo's, give this repo its own SESSION in $ENV_FILE instead"
   fi
   # ── a box whose controller is a SERVICE is started BY the service manager (agent-infra#2402) ────
   # Reaching this line means nothing of this cell's is running (every branch above returned or died), so
@@ -3410,7 +3439,7 @@ cmd_status() {
   # now (the controller re-pins itself every cycle). They can legitimately disagree for one cycle
   # after a re-pin, which is why both are printed — but an EMPTY pin is never a quiet absence: its
   # own state, with the remedy, because it is the state the fleet sat in for hours.
-  local _pin _pv _hrf _k _rel _run _act _at _age _fet
+  local _pin _pv _hrf _k _rel _run _act _at _age _fet _rq
   _pin="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
   _pv="$(head -1 "$_pin" 2>/dev/null | tr -d '[:space:]')"
   if [ -n "$_pv" ]; then
@@ -3451,6 +3480,34 @@ cmd_status() {
     esac
   else
     log_line "self-refresh: NO RECORD at $_hrf — no cycle has recorded a self-refresh verdict yet (started before this check existed, or the loop cannot write state)"
+  fi
+  # ── the restart DECISION, and what became of it (agent-infra#2641) ──────────────────────────
+  # `restart-pending` used to be a word printed into a reason string. On a cell it was also PERMANENT
+  # (the running identity could not be read there at all), so the same box printed `[current]` on the
+  # `harness:` line above and `restart-pending` here, for ever. The per-cycle record now carries the
+  # REASON and a request; printing it beside the verdict is what makes "requested at T … honoured at
+  # T+n / refused because Y" readable from the one verb an operator runs.
+  # ⛔ AN ABSENT RECORD IS NOT "NOTHING PENDING": no cycle has recorded a request, which is a different
+  # fact, and the same absence-vs-empty rule the rest of this file follows.
+  _rq="$O/state/restart-request"
+  if [ -f "$_rq" ]; then
+    log_line "restart: $(sed 's/^restart //' "$_rq" 2>/dev/null)"
+    case "$(cat "$_rq" 2>/dev/null)" in
+      # ⛔ `blocked=identity` IS ITS OWN CAUSE, AND IT COMES FIRST. The generic blocked arm below says
+      # "something this box can see would be interrupted" — but `harness-refresh.sh` writes
+      # `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
+      # is a CLAIM. Nothing was measured busy there, so the generic sentence names a cause that does not
+      # exist and tells the operator to wait for a population that may never exist — the misdirection this
+      # change exists to remove.
+      *'request=pending'*'blocked=identity'*)
+        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. Nothing is interrupted and nothing is waiting: re-check once the controller's argv/lock is readable." ;;
+      *'request=pending'*'actuation=blocked'*)
+        log_line "⛔ a restart is PENDING and was NOT applied — something this box can see would be interrupted (named in blocked=/lanes= above). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm, once that population is idle." ;;
+      *'request=pending'*'actuation=safe'*)
+        log_line "a restart is PENDING and was NOT applied — every population this box can measure was empty (checked=argv,roles,tree; blind=reparented-no-wrapper). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm." ;;
+    esac
+  else
+    log_line "restart: NO REQUEST RECORD at $_rq (no cycle has recorded one — that is not the same as 'nothing pending')"
   fi
   # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
   # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
@@ -3606,7 +3663,7 @@ start_doctor_loop() {
       return 0
     fi
     if doctor_session_foreign; then
-      die "doctor session '$DOCTOR_SESSION' belongs to another state dir — a session name is shared across cells, so it is not evidence that $OR has a doctor; pin a distinct DOCTOR_SESSION per cell in $ENV_FILE, or stop the cell that owns it"
+      die "doctor session '$DOCTOR_SESSION' belongs to another state dir ($(doctor_session_state_dir || true)) — a session name is shared across cells, so it is not evidence that $OR has a doctor. FIX: tmux kill-session -t '$DOCTOR_SESSION' (that ends the OTHER cell's doctor; its own supervisor/start re-creates it), or pin a distinct DOCTOR_SESSION for $OR in $ENV_FILE"
     fi
     # Ours-but-stale (its loop record is gone) or unprovable: replacing it is the heal `start` exists
     # for, and the alternative — reporting "already running" — would leave this cell with no doctor at
