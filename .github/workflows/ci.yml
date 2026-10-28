@@ -676,6 +676,30 @@ jobs:
         # class-keyed ceiling. Its mutation section deletes the ceiling and flattens the
         # class caps, so a suite that only proves the acceptance path cannot stay green.
         run: npx tsx extensions/loop-enforcer/review-scale.test.ts
+      - name: Loop-enforcer cron exit property (#2935/#2944 — the interval must not hold the event loop)
+        # #2935 — every cell lane printed its answer and then never exited; the
+        # cause was THIS module's `setInterval`, a REF'd handle nothing cleared.
+        # The suite was wired only into ci-main.yml's
+        # `extensions/loop-enforcer/*.test.ts` glob, so a mutation that
+        # reintroduced the hang was caught POST-merge, on main, not on the PR
+        # that caused it. Zero-dep (`node:*` + `./scheduler.ts`, whose only import
+        # is `./manifest.ts`, itself `node:*` only), so it runs in THIS job, which
+        # performs no `npm ci`. The assertion is `hasRef() === false` — the exact
+        # property, and timing-free, so the mutation fails immediately instead of
+        # hanging the suite.
+        run: npx tsx extensions/loop-enforcer/scheduler-unref.test.ts
+      - name: Loop-enforcer cron re-arm across session replacement (#2948)
+        # #2948 — #2944 cleared the tick on `session_shutdown`, which pi also emits
+        # on session REPLACEMENT ("new" | "resume" | "fork"), and those flows do
+        # not re-run extension factories — so the timer was never recreated and
+        # every cron-type loop silently stopped firing until a `/reload`.
+        # Both directions are pinned (replacement re-arms and still fires; quit
+        # stays cleared), plus a child-process exit probe so #2944's fix cannot
+        # regress. Zero-dep: it drives the real factory via `./index.ts`, whose pi
+        # import is TYPE-only, with a hermetic $HOME — so it runs in THIS job.
+        # Wired here as well as into ci-main.yml's glob: a suite that lives only
+        # behind the post-merge glob reports this class of regression on main.
+        run: npx tsx extensions/loop-enforcer/cron-rearm.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
