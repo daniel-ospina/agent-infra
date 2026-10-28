@@ -3334,6 +3334,48 @@ next step of merging. Do the work:
 # "this file could not render the contract" are different bugs.
 _RESEARCH_SECTION = None
 
+# ⛔ THE DELIVERY CONTRACT (#2981) IS THE OTHER HALF OF THE SAME LESSON, and it is the half this file
+# OWNS. Measured 2026-10-27/28: five `prfix` workers — the briefs THIS function composes — were all
+# killed at their 2400 s cap with 0 commits and 0 PRs, 144 KB of work recovered only as rescue patch
+# files. They were not doing the wrong work; they were holding one commit for the end, and the end was
+# a `kill -TERM`. The section is rendered by `reviewer-preflight.sh --delivery-brief prfix` — the same
+# ONE home that renders the lane's copy — and is never duplicated here, because a second copy of the
+# text is the drift the section's own tests refuse.
+#
+# ⛔ PR-DOCTOR'S FAILURE HERE IS NOT FATAL, DELIBERATELY. The section is APPENDED if absent by
+# `nonblocking-dispatch.sh` — the dispatcher every `prfix` worker goes through — so a box where this
+# render fails still ships a brief that carries the rule. Failing closed in BOTH places would turn one
+# missing helper into a fleet that dispatches nothing; the loud log below is what makes the gap
+# visible instead of silent.
+_DELIVERY_SECTION = None
+
+
+def delivery_section() -> str:
+    """The canonical COMMIT AS YOU GO block, or "" (loudly) if the helper cannot be found."""
+    global _DELIVERY_SECTION
+    if _DELIVERY_SECTION is not None:
+        return _DELIVERY_SECTION
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(ORCH_DIR, "reviewer-preflight.sh"),
+                 os.path.join(here, "orchestrator-harness", "reviewer-preflight.sh")):
+        if not os.path.isfile(cand):
+            continue
+        try:
+            out = subprocess.run(["bash", cand, "--delivery-brief", "prfix"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode == 0 and out.stdout.strip():
+            _DELIVERY_SECTION = out.stdout.rstrip() + "\n"
+            return _DELIVERY_SECTION
+    log("brief: reviewer-preflight.sh --delivery-brief produced nothing (looked in %s and "
+        "%s/orchestrator-harness) -- this worker brief carries NO commit-as-you-go rule, and "
+        "nonblocking-dispatch.sh will append it at dispatch (agent-infra#2981)" % (ORCH_DIR, here))
+    # A FAILURE IS NOT CACHED, for the reason `research_section` gives above: a cached "" is the
+    # "fix that is not live" shape — the box would keep composing section-less briefs long after the
+    # helper appeared. The cost of not caching is one `bash` call per brief.
+    return ""
+
 
 def research_section() -> str:
     """The canonical RESEARCH FIRST block, or "" (loudly) if the validator cannot be found."""
@@ -3364,15 +3406,18 @@ def research_section() -> str:
 
 
 def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
-    """The order text for ONE PR, with the research contract prepended (agent-infra#2258).
+    """The order text for ONE PR, with the research contract and the delivery contract prepended.
 
-    The contract goes on EVERY non-empty brief and on no empty one: `_brief_body` returns "" when it
+    Both contracts go on EVERY non-empty brief and on no empty one: `_brief_body` returns "" when it
     has no action to order, and `spawn()` treats that as "nothing to dispatch" -- prepending a section
-    to an empty order would manufacture a dispatch of nothing."""
+    to an empty order would manufacture a dispatch of nothing.
+
+    #2981 is the second contract: COMMIT AS YOU GO. A brief that never says it is a brief whose worker
+    holds its single commit for the end -- and the end is a `kill -TERM` at the wall cap."""
     body = _brief_body(pr, action, why, cr)
     if not body:
         return body
-    return research_section() + "\n" + body
+    return research_section() + "\n" + delivery_section() + "\n" + body
 
 # ---------------------------------------------------------------------------
 # 4. WHAT HAPPENED TO A WORKER — the harness's own artifacts, never a guess
