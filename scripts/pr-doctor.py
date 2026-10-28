@@ -4964,6 +4964,27 @@ def run_pass(args, rubric_note: str = "") -> int:
                         "cooldown -- repair: %s"
                         % (key, action, _as_int(prev.get("refusals")), COOLDOWN_S // 60,
                            (prev.get("why") or "see the earlier refusal line")[:160]))
+        elif ((prev.get("kind") or "") == "refused"
+              # ⛔ A REFUSAL WHOSE COOLDOWN HAS EXPIRED IS STILL UNDELIVERED WORK WHEN THIS PASS
+              # CANNOT RETRY IT (review round 3 — reproduced). The arm above only covers a row
+              # INSIDE its cooldown. Six minutes after it expires, a SATURATED pass (`total == 0`, and
+              # `--max 0` by construction) broke out of the dispatch loop before reaching the row, so
+              # `undeliverable` stayed 0 and the pass printed
+              # `no capacity budget (...); budget=1` + `EXIT rc=0` over a `kind=refused` row AT the
+              # current head — the same false clean, reached 46 minutes later instead of never. The
+              # budget is the only reason the row is not retried here, so the budget is what decides.
+              and (dispatched >= budgets["total"]
+                   or spent[ACTION_CLASS.get(action, "fix")]
+                   >= budgets[ACTION_CLASS.get(action, "fix")])):
+            covered.add(key)
+            undeliverable += 1
+            carried += 1
+            if _as_int(prev.get("refusals")) >= REFUSAL_ESCALATE_AT:
+                escalated.append("#%s" % key)
+                log("ESCALATE #%s (%s): refused %d consecutive times and this pass has no budget to "
+                    "retry it (fix=%d review=%d left) -- repair: %s"
+                    % (key, action, _as_int(prev.get("refusals")), budgets["fix"],
+                       budgets["review"], (prev.get("why") or "see the earlier refusal line")[:160]))
     for p, action, why, cr in classified:
         key = str(p["number"])
         if key in covered:

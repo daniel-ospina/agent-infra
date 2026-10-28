@@ -331,7 +331,11 @@ The first attempt only hoisted it above the class-budget `continue`; the dispatc
 first row not in a cooldown. Measured, same two rows, only the PR numbers swapped: `EXIT rc=3` +
 `ESCALATE` when the refused row sorted first, `EXIT rc=0` with no escalation when it sorted second — a
 verdict that depends on PR-number ordering is not a verdict. Every classified row is now ACCOUNTED for
-first, in its own loop, and the dispatch loop covers only the rest. A corrupted count (a non-number,
+first, in its own loop, and the dispatch loop covers only the rest. ⛔ **And a refusal whose 45-minute
+cooldown has EXPIRED is counted when the pass has no budget to retry it** (review round 3, reproduced):
+without that, the same false clean reappeared 46 minutes later, when a saturated pass (`total == 0`, or
+`--max 0`) broke out of the dispatch loop before reaching the row. The budget is the only reason such a
+row is not retried, so the budget is what decides whether the pass may still call itself clean. A corrupted count (a non-number,
 `inf` from `1e999`, or a negative) degrades to "unknown count" rather than crashing the pass, and the
 escalation list marks its truncation (`+N more`) instead of silently naming the first four.
 ⛔ **AND THE ACCOUNTING PRECEDES THE BUDGET GATE** (review round 2, P1 — reproduced). A `kind: refused`

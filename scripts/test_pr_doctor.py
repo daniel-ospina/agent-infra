@@ -6713,3 +6713,35 @@ def test_MORE_than_four_escalated_rows_are_not_silently_dropped(monkeypatch, tmp
     assert pr.main() == 3
     joined = "\n".join(logs)
     assert "ESCALATE #1 #2 #3 #4 +3 more" in joined, joined
+
+
+def test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass(monkeypatch, tmp_path):
+    """⛔ 46 MINUTES LATER THE SAME FALSE CLEAN CAME BACK (review round 3 — reproduced).
+
+    The accounting only covered a row INSIDE its cooldown. Once the 45-minute window expires, a
+    saturated pass (`total == 0`, and `--max 0` by construction) broke out of the dispatch loop before
+    reaching the row and printed `no capacity budget (...); budget=1` + `EXIT rc=0` over a
+    `kind: refused` row AT the current head. The budget is the only reason the row is not retried, so
+    the budget is what decides whether the pass may still call itself clean.
+    """
+    for refused_last in (True, False):
+        logs = []
+        monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path / str(refused_last)))
+        st = {"2": {"action": "fix-ci", "worker": pr.worker_name("2"), "kind": "refused",
+                    "head": "a" * 40, "at": "an hour ago",
+                    "at_epoch": pr.now() - pr.COOLDOWN_S - 60,   # EXPIRED, not in cooldown
+                    "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}}
+        monkeypatch.setattr(pr, "load_state", lambda: dict(st))
+        order = [2, 1] if refused_last else [1, 2]
+        monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in order])
+        monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+        monkeypatch.setattr(pr, "log", logs.append)
+        monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+        monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "save_state", lambda s: None)
+        monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
+        rc = pr.main()
+        joined = "\n".join(logs)
+        assert rc == pr.EXIT_UNDELIVERED == 3, (refused_last, rc, joined)
+        assert "ESCALATE #2" in joined, (refused_last, joined)
