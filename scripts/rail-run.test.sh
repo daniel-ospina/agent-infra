@@ -90,11 +90,12 @@ FAKE
 chmod +x "$T/bin/rail"
 
 # ── the `gh` double ───────────────────────────────────────────────────────────
-# GH_MODE: merged (default) | open | fail | wrongrepo
+# GH_MODE: merged (default) | open | fail | wrongrepo | otherhost | nourl
 # It answers with the SAME shape the real `gh pr view --json state,mergedAt,url --jq` produces, and
 # the URL names the (repo, PR) it was ASKED for — so the identity check in pr_state is exercised
 # rather than bypassed. `wrongrepo` answers MERGED for a DIFFERENT repository: the case that must
-# never read as this PR's landing (#2235).
+# never read as this PR's landing (#2235). `nourl` emits the `-` that `--jq '.url // "-"'` produces
+# when gh answers with NO url at all — the read that never reached a comparison.
 cat > "$T/bin/gh" <<'GHD'
 #!/usr/bin/env bash
 repo=""; pr=""
@@ -112,6 +113,7 @@ case "${GH_MODE:-merged}" in
   open)   printf 'OPEN - %s\n' "$url" ;;
   wrongrepo) printf 'MERGED 2026-10-27T03:56:04Z https://github.com/someone/else/pull/%s\n' "$pr" ;;
   otherhost) printf 'MERGED 2026-10-27T03:56:04Z https://ghe.example.com/%s/pull/%s\n' "${repo:-x/y}" "$pr" ;;
+  nourl)  printf 'MERGED 2026-10-27T03:56:04Z -\n' ;;
   fail)   printf 'HTTP 502: bad gateway\n' >&2; exit 1 ;;
 esac
 GHD
@@ -767,13 +769,20 @@ assert_contains "$TXT" "did not complete" "READ-FAIL: the note blames the READ, 
 assert_contains "$TXT" "re-poll" "READ-FAIL: and points at a re-poll"
 assert_not_contains "$TXT" "start a new run" "READ-FAIL: a second merge attempt is NOT prescribed for a transient read"
 assert_not_contains "$TXT" "check --repo" "READ-FAIL: and it is not blamed on the identity"
-# (b) SAME host, different repo/PR — the host matched, so the remedy is --repo and never a new run.
+# (b) SAME host, different repo/PR — the host matched, so the fault is the IDENTITY. ⛔ A POLL CANNOT
+# MOVE IT: re-polling the RECORDED slug reproduces the same url, and naming a different `--repo` is
+# refused by `derive` as an identity mismatch. So `--repo` alone is NOT the remedy — the only thing
+# that records a new identity is a NEW RUN, which is why this arm asserts one (#2959 review, cycle 5,
+# P1). The earlier arm asserted the OPPOSITE (`not_contains "start a new run"`, labelled "a new run
+# would record the wrong host again") — false for this cause: the host MATCHED, and `start` records the
+# host from the identity value, so a new run with the url's own owner/repo records the right host.
 craft 190 wrongidentity rc=0 >/dev/null
 OUT="$(GH_MODE=wrongrepo poll 190)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 25 "$RC" "WRONG-ID: a same-host url naming another repo abstains"
 assert_contains "$TXT" "wrong IDENTITY" "WRONG-ID: the note names the identity, not the host"
-assert_contains "$TXT" "check --repo" "WRONG-ID: and points at --repo"
-assert_not_contains "$TXT" "start a new run" "WRONG-ID: a new run would record the wrong host again"
+assert_contains "$TXT" "start a new run" "WRONG-ID: and prescribes the ONLY action that records a new identity"
+assert_contains "$TXT" "--repo" "WRONG-ID: naming the correct --repo as what the new run must carry"
+assert_not_contains "$TXT" "DIFFERENT host" "WRONG-ID: and does not blame the host that MATCHED"
 # (c) the run may STILL BE ALIVE — the host remedy must not be prescribed as an action to take NOW,
 #     because `start` refuses a new run while `prev_in_flight` holds (RAIL_RUN_RECORD_MAX, 24 h). This
 #     is the `rail_liveness=unknown` branch the round-3 diff newly made print the note; NO arm reached
@@ -783,8 +792,36 @@ craft 191 livemismatch pid=999999 start=0 railpid=$$ railstart=abc >/dev/null
 OUT="$(GH_MODE=otherhost poll 191)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 25 "$RC" "LIVE-HOST: a host mismatch on a possibly-live run still abstains"
 assert_state "$TXT" unknown "LIVE-HOST: it claims neither a death nor a landing"
-assert_contains "$TXT" "REFUSED until this one is positively gone" "LIVE-HOST: the note says the new run is REFUSED for now"
-assert_not_contains "$TXT" "and start a new run" "LIVE-HOST: so it does not tell the reader to start one NOW"
+assert_contains "$TXT" "refusal is BOUNDED" "LIVE-HOST: the note says the start refusal is BOUNDED, not indefinite"
+assert_contains "$TXT" "RAIL_RUN_RECORD_MAX" "LIVE-HOST: and names the bound that ends it"
+assert_not_contains "$TXT" "positively gone" "LIVE-HOST: so it does not demand a proof `prev_in_flight` never requires"
+assert_not_contains "$TXT" "and start a new run" "LIVE-HOST: and so it does not tell the reader to start one NOW"
+
+# ── AG1g: the POSITIVELY-GONE path had NO arm, and it is the common terminal one ──────────────
+# `read_artifact 1` at the "recorder GONE, rail not alive, no exit status" branch is where most runs
+# end. Reverting that ONE token to `read_artifact` left the suite at 237/0 (measured, #2959 review,
+# cycle 5, P1) — the run_over gate was UNPINNED on the branch that matters most, and the regression is
+# silent and points the wrong way: a FINISHED run would be handed the "while this record may still look
+# live" caveat, i.e. told to re-poll a record that no longer blocks anything. `pid=999999` is positively
+# gone and no `railpid` is recorded, so the probe reaches the fall-through branch (#2959 review, cycle
+# 5, P1).
+craft 192 gone pid=999999 start=0 >/dev/null
+OUT="$(GH_MODE=otherhost poll 192)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "GONE-HOST: a host mismatch on a positively-gone run still abstains"
+assert_state "$TXT" unknown "GONE-HOST: it claims neither a landing nor a death"
+assert_contains "$TXT" "start a new run" "GONE-HOST: a finished run IS told to start a new run (nothing can refuse it)"
+assert_not_contains "$TXT" "BOUNDED" "GONE-HOST: and is NOT given the while-it-may-still-be-live caveat"
+
+# ── AG1h: a read that names NO url compared nothing, so it is not a host verdict ──────────────
+# `--jq '.url // "-"'` emits `-` when gh answers with no url. Dropping `pr_state`'s `case "$url" in
+# ''|-) return 12` lets it fall through to `uhost=""`, i.e. `return 13` — a DIFFERENT host, which
+# prescribes a new merge attempt for a read that was never compared. No fixture produced a url-less
+# answer before this arm (#2959 review, cycle 5, P2).
+craft 193 nourl rc=0 >/dev/null
+OUT="$(GH_MODE=nourl poll 193)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "NO-URL: a read with no url abstains"
+assert_contains "$TXT" "did not complete" "NO-URL: it is reported as a READ failure"
+assert_not_contains "$TXT" "DIFFERENT host" "NO-URL: not as a host mismatch — no comparison ran"
 
 # ── AG1e: the reason line reaches the paths that ALREADY COMPUTED it ──────────────────────────
 # `read_artifact` sets `abstain_why`, and the no-incarnation branch used to print `read <log> and
