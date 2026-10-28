@@ -1,0 +1,14 @@
+# A quote that OPENS at a value position (the character before it is a dash, which the reader counts as
+# a value position) and never closes. Without the unclosed fallback the comma stayed inside the phantom
+# string: `cancel-in-progress: true` was never read, R2's absent-key arm took the non-cancelling
+# default, and a main-branch workflow that cancels reported GREEN (#2660 round 13).
+name: push flow apostrophe dash
+on:
+  push:
+    branches: [main]
+concurrency: {group: v5-don-'t, cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
