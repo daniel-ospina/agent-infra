@@ -133,7 +133,7 @@ write_manifest() {
 #       all-untracked | nested-git | newline-name | dash-name |
 #       dangling-ext | dotfile-ext | dot-extension | dotdot-untracked |
 #       live-test-file | live-spec-file | live-test-js | live-nested-test |
-#       live-pkg-row-test
+#       live-pkg-row-test | live-root-pkg-row-test | live-root-short-circuit
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -282,6 +282,28 @@ build_farm() {
                       > "$TMP/live-extensions/pkg/package.json" ;;
     live-dangling) mkdir -p "$TMP/live-extensions"
                    ln -s "$TMP/extensions/gone.ts" "$TMP/live-extensions/a.ts" ;;
+    # #2841 review — the FIRST branch of the loader the gate quotes: the farm
+    # ROOT's own `package.json` `extensions[]` rows are returned by
+    # `resolveExtensionEntries(dir)` and `collectAutoExtensionEntries` returns
+    # THERE, skipping the whole directory scan. A root row naming a test file is
+    # therefore executed by pi while every filename glob — and the subdirectory
+    # arm — is blind to it (the top-level entry's basename is `pkg`).
+    live-root-pkg-row-test) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions/pkg"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/pkg/leaked.test.ts"
+                    printf '{\n  "name": "farm-root",\n  "extensions": ["pkg/leaked.test.ts"]\n}\n' \
+                      > "$TMP/live-extensions/package.json" ;;
+    # #2841 review — the OTHER side of the root short-circuit: when the root
+    # resolves entries, the loader never runs its directory scan, so a TOP-LEVEL
+    # test-shaped entry is inert. Failing on it would be the #2425 false-block
+    # class this PR exists to stop; naming it keeps the skip honest.
+    live-root-short-circuit) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/leaked.test.ts"
+                    printf '{\n  "name": "farm-root",\n  "extensions": ["a.ts"]\n}\n' \
+                      > "$TMP/live-extensions/package.json" ;;
   esac
 
   # #2425 — checks 3/4a read the GIT INDEX, so every fixture is a real repo with
@@ -537,6 +559,31 @@ run_gate 1 "package.json extensions[] row names a test file" live-pkg-row-test \
   "pkg: package.json extensions" \
   "-> index.test.ts" \
   "!symlink farm into extensions/"
+
+echo ""
+echo "29. #2841 review — the farm ROOT's package.json extensions[] row naming a test file IS loaded"
+# The root short-circuit is the FIRST branch of the loader the header quotes. A
+# gate that models only the top-level and subdirectory rows exits 0 here while
+# telling the reader "nothing here executes today" about a file pi runs at every
+# session start — a false PASS over the exact condition this check exists for.
+run_gate 1 "root package.json extensions[] row names a test file" live-root-pkg-row-test \
+  "test file(s) in the live extension farm" \
+  "package.json extensions" \
+  "index entry -> pkg/leaked.test.ts" \
+  "!symlink farm into extensions/" \
+  "!not gated"
+
+echo ""
+echo "30. #2841 review — a ROOT that resolves entries makes a top-level test file INERT (named, not fatal)"
+# The other direction of case 29, and the reason it is not a one-line widening:
+# `collectAutoExtensionEntries` returns the root's entries BEFORE its directory
+# scan, so `leaked.test.ts` cannot load. Failing it would re-create the measured
+# #2425 false block (a red that aborts every `./sync.sh` under set -e).
+run_gate 0 "root short-circuit makes a top-level test file inert" live-root-short-circuit \
+  "symlink farm into extensions/" \
+  "not gated (the farm ROOT resolves extension entries" \
+  "leaked.test.ts" \
+  "!test file(s) in the live extension farm"
 
 echo ""
 if [ "$failures" -gt 0 ]; then
