@@ -133,11 +133,18 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `LANE_MEM_MB` is 512, so the token pair matches. That made this shard RED on `main` for every PR
   # that rebased onto it (found while rebasing #2323: `got_pi` carried `ai-drainer.sh`). Excluded by
   # name, with its own non-launcher assertion below — the same ruling, not a second exception class.
+  # ⛔ `orphaned-harness.sh` IS THE THIRD INSTANCE OF THAT SAME CLASS (#2867), and it landed after this
+  # census the same way. It is a READ-ONLY report — it never stops a unit, never kills a session, never
+  # spawns an agent — and `pi -p --no-session` appears only in its PROSE, where it explains that the
+  # harness lanes it is reporting on leave no transcript. Measured: without the exclusion, `got_pi`
+  # carried it and both censuses below were RED on `main` for every PR that rebased onto #2871. The
+  # exclusion is asserted (not trusted) by the same comment-stripped predicate the ai-drainer arm uses,
+  # so a real launch added to it comes back into the census.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -203,6 +210,14 @@ _nl_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
 _nl_code="$(sed 's/#.*//' "$HERE/ai-drainer.sh" 2>/dev/null)"
 if printf '%s' "$_nl_code" | grep -qE -e "$_nl_flag" && printf '%s' "$_nl_code" | grep -qF -- '--no-session'; then rc=1; else rc=0; fi
 ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gated dispatchers; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+# …and the third exclusion, by the SAME predicate (#2867): strip the `#`-comments from
+# `orphaned-harness.sh` and the token pair must be gone, so the file is a reporter and not a launcher.
+_oh_code="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
+# Here-strings, not `printf | grep -q`: a quiet grep exits on its first match, the writer takes
+# SIGPIPE, and under `pipefail` the pipeline returns 141 — so the idiom reads as "no match" ON A
+# MATCH (scripts/check-no-sigpipe-grep.sh, #841). The suite is bash, so the here-string is available.
+if grep -qE -e "$_nl_flag" <<<"$_oh_code" && grep -qF -- '--no-session' <<<"$_oh_code"; then rc=1; else rc=0; fi
+ck "the excluded orphaned-harness.sh is a NON-launcher in CODE (a read-only orphan report; the pair is prose), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -1575,6 +1590,19 @@ CWT="$CREPO/.worktrees/cap-1"
 # A linked worktree shares the repository config, so this origin is what `git -C "$CWT" remote`
 # answers for the arms' cwd.
 git -C "$CREPO" remote add origin https://github.com/owner/repo.git
+# ⛔ AND ITS TRANSPORT IS LOCAL (agent-infra#2834). The exit-path rescue now runs at the end of EVERY
+# `run_agent`, so the cap arms below — which leave the worktree DIRTY on purpose — would otherwise
+# attempt a real `git fetch`/`git push` against github.com from a test suite that promises to touch no
+# real state. `url.<bare>.insteadOf` rewrites the TRANSPORT only: `repo-slug.sh` reads
+# `git config --local --get remote.origin.url` and still sees the GitHub slug the creation gate needs
+# (a local `remote set-url` would be refused 74 by THAT gate), while the rescue's fetch and push land
+# in this bare repo. Hermetic, and it lets these arms exercise the rescue instead of skipping it.
+git init -q --bare -b main "$CAPRIG/origin.git"
+git -C "$CREPO" config url."$CAPRIG/origin.git".insteadOf https://github.com/owner/repo.git
+# The rescue builds its archive with `git commit-tree`, which needs an AUTHOR IDENTITY of its own; the
+# fixture's per-commit `-c user.email=…` would leave it with none, and the arm would then be measuring
+# a missing identity rather than the cap.
+git -C "$CREPO" config user.name t; git -C "$CREPO" config user.email t@t
 printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$CAPRIG/bin/gh"
 chmod +x "$CAPRIG/bin/gh"
 # A worker that never finishes inside the cap. (arm 6 replaces it with one that IGNORES SIGTERM;
