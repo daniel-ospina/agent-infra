@@ -3438,7 +3438,12 @@ fi
 fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
 fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
-merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
+# ⛔ AND THE REVIEW ORDER IS ITS OWN SPAWN SITE (agent-infra#2971). The re-record arm used to spawn
+# under the `merge-<PR>` tag and compare against `wt_count merge-)`; it now dispatches `review-<PR>`
+# and compares against `wt_count review- merge-)` (one review-lane budget across both tag families,
+# the semantics the ceiling always had). Without this the literal pattern above would stop seeing the
+# site — the count would read 1 and this check would be pinning half of what it names.
+merge_site=$(grep -E 'wt_count (review- )?merge-\)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
@@ -3447,7 +3452,7 @@ ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's loa
 [ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
 ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
-ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
+ck "both merge spawn sites (the review order review-<PR> + rail-mode GREEN merge-<PR>) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
