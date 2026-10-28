@@ -461,7 +461,15 @@ fi
 # second worker for the same PR. Release first, drop the lock last. Both claims are released here:
 # the head claim that names what this worker reviewed, then the landing claim that names the PR
 # (#1952), so the coarser ref — the one every box needs to see free — is the LAST to be dropped.
-trap 'release_claim_bounded; release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
+# ⛔ AND ONE MORE THING RUNS AT EXIT: the review attempt's TERMINAL RECORD (agent-infra#2971). A
+# reviewer that spawns and then dies — killed at the cap, a TERM from the reaper, an exit that never
+# reaches the verdict arm — used to leave NOTHING behind: no marker, no counter, no reason. To the
+# controller that is indistinguishable from a reviewer that was never asked, so it re-dispatched, and
+# the pass after that did the same (`merge-10213` spawned, log stops, no CLEAN and no ISSUES — the
+# measured 2026-10-28 shape). `review_abandoned_record` writes the failed attempt and its reason
+# instead. It is registered on the trap that always runs, and it is named before the claims are
+# released so a hung release can never be what swallows it.
+trap 'review_abandoned_record; release_claim_bounded; release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
 
 # ── the repo's merge authority (agent-infra#1764) ─────────────────────────────
 # Resolved HERE, from branch protection, not assumed. On a repo that requires the review gate the
@@ -816,6 +824,11 @@ Your comment MUST state the outcome plainly and MUST NOT contain an unresolved a
     ISSUES <n>
 Do NOT modify code, commit, or merge.
 EOF
+# ⛔ THE ATTEMPT IS MARKED IN FLIGHT BEFORE THE REVIEWER STARTS (agent-infra#2971). Everything
+# below this line can end the process without a verdict — the cap kill, a TERM from the reaper, an
+# `exit` on a path this file has not foreseen — and `review_abandoned_record` (EXIT trap) is what
+# turns each of those into a COUNTED failed attempt with its reason instead of a log that just stops.
+REV_STARTED=1
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
 AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
@@ -827,6 +840,11 @@ AGENT_RC=$?
 # AGENT_LOAD_REFUSED code, and the controller re-dispatches when the box quietens (75 is what
 # adopt-fix/chain-merge already propagate for this).
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
+  # ⛔ REV_STARTED GOES BACK TO 0: NO REVIEWER RAN (agent-infra#2971). The in-flight mark above is for
+  # an attempt that STARTED; a refusal at the spawn point is not an attempt, and the EXIT recorder
+  # would otherwise spend one of MAX_REVIEW_TRIES for a review this box never ran — the exact
+  # over-blocking this arm exists to refuse.
+  REV_STARTED=0
   echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO marker written (a needsfix marker would authorise a fixer and a needsreview marker would spend one of MAX_REVIEW_TRIES for a review that never started); re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
   exit 75
 fi
@@ -838,6 +856,8 @@ fi
 # 80 names it: no agent ran, no verdict, no marker, and nothing to re-dispatch until the brief's own
 # build is fixed.
 if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
+  # Same reason as the load-gate arm above: no agent ran, so the EXIT recorder must stay inert.
+  REV_STARTED=0
   echo "[merge $PR] reviewer NOT started (BRIEF gate) — no verdict, NO needsfix marker; the reviewer brief failed brief-gate.sh, which is a harness defect: fix the brief's build, not the PR" >> "$L.log"
   echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
   exit 80
@@ -895,6 +915,79 @@ verdict_class() {
   esac
 }
 
+# [revbudget:begin]
+# ── ONE (PR, HEAD) REVIEW BUDGET, SHARED WITH THE CONTROLLER (agent-infra#2971) ────────────────
+# `state/reviewdisp-<PR>` = "<head> <n>". It is the SAME record `orch-loop.sh`'s [reviewdisp] block
+# keeps: the controller writes it when it dispatches a review ORDER for a (PR, head), and this file
+# spends it when a reviewer run produces nothing usable. Two arms, ONE book — before this the
+# controller's dispatch budget and this file's retry budget were separate files
+# (`reviewdisp-<PR>` / `reviewcount-<PR>`), so "we already tried review twice at this head" was
+# visible to neither: the controller could dispatch against a head this file had already given up on,
+# and this file could re-open a head the controller had parked.
+# ⛔ NO DOUBLE COUNT. A controller dispatch already spends the attempt (`REV_PAID=1` travels in the
+# spawn command). Only a path with NOBODY counting above it — `chain-<N>`, `fix-one.sh`, a hand run —
+# spends on this side. Counting both would halve a budget that was already measured as tight, which
+# is over-blocking dressed as safety.
+rev_budget_file() { printf '%s/state/reviewdisp-%s\n' "$O" "$PR"; }
+rev_budget_read() { # -> "<head> <n>" (n is coerced: it feeds -ge and $(( + 1 )))
+  local f h="" n=0
+  f="$(rev_budget_file)"
+  if [ -f "$f" ]; then read -r h n < "$f" 2>/dev/null || true; fi
+  is_limit "${n:-}" || n=0
+  printf '%s %s\n' "${h:-}" "$n"
+}
+rev_budget_spend() { # -> "<n> already|spent|unwritable"; rc 1 when the write failed
+  local rec now_h="" n=0
+  rec="$(rev_budget_read)"; n="${rec##* }"; now_h="${rec% *}"
+  [ "${now_h:-}" = "${HEAD:-}" ] || n=0
+  if [ "${REV_PAID:-0}" = "1" ]; then printf '%s already\n' "$n"; return 0; fi
+  n=$(( n + 1 ))
+  # ⛔ THE WRITE MUST BE ABLE TO FAIL LOUDLY. A `|| true` here would make the bound best-effort: the
+  # count would read 0 for ever and this file would buy a fresh PAID review every cycle with no cap
+  # ever reached and no line saying the record failed — the same class orch-loop.sh's [reviewdisp]
+  # block refuses at its own write.
+  printf '%s %s\n' "${HEAD:-}" "$n" > "$(rev_budget_file)" 2>/dev/null \
+    || { printf '%s unwritable\n' "$n"; return 1; }
+  printf '%s spent\n' "$n"
+}
+# [revbudget:end]
+
+# review_abandoned_record — the EXIT recorder for a review attempt that ended with NO verdict
+# (agent-infra#2971, requirement 3). Fires from the EXIT trap, so TERM/INT/`exit N`/an unexpected
+# death after the reviewer started all reach it; it is INERT unless this process actually ran a
+# reviewer (`REV_STARTED`) and never wrote a terminal record for it (`REV_RECORDED`), and it refuses
+# when the run DID produce a verdict — a CLEAN that failed to RECORD is its own failure, already
+# named by the park paths, and calling it "no verdict" would be a false statement in the reason a
+# human reads. Without this, `merge-10213`'s log simply stopped at 23:30 and nothing counted it.
+review_abandoned_record() {
+  local rc=$? cls spent n mode why
+  [ "${REV_STARTED:-0}" = "1" ] || return 0
+  [ "${REV_RECORDED:-0}" = "1" ] && return 0
+  [ -n "${HEAD:-}" ] || return 0
+  cls="$(verdict_class "${LAST:-}")"
+  [ "$cls" = "NO-VERDICT" ] || return 0
+  why="the reviewer run ENDED WITHOUT a CLEAN/ISSUES marker (exit rc=$rc, last line [${LAST:-<none>}]) — counted as a failed attempt, never as silence"
+  spent="$(rev_budget_spend)" || mode=unwritable
+  n="${spent%% *}"; mode="${spent##* }"
+  is_limit "${n:-}" || n=0
+  MAX_REVIEW_TRIES="${MAX_REVIEW_TRIES:-3}"
+  is_limit "$MAX_REVIEW_TRIES" || MAX_REVIEW_TRIES=3
+  if [ "${mode:-}" = "unwritable" ]; then
+    echo "[merge $PR] $why, but $(rev_budget_file) CANNOT BE WRITTEN — the (PR,head) review cap cannot be kept, so this head is PARKED rather than re-reviewed (a counter that cannot be written is not a bound)" >> "$L.log"
+    park "$why. state/reviewdisp-$PR could not be written, so MAX_REVIEW_TRIES cannot bound this head: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    return 0
+  fi
+  if [ "$n" -ge "$MAX_REVIEW_TRIES" ]; then
+    echo "[merge $PR] NEEDS-REVIEW: $why — review attempts at head=$HEAD are EXHAUSTED ${n}/${MAX_REVIEW_TRIES}, PARKED" >> "$L.log"
+    park "$why. Review attempts at head=$HEAD are exhausted (${n}/${MAX_REVIEW_TRIES}, counted once across the controller's dispatch and this run), so nothing was reviewed here and no signed marker can be minted. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewdisp-$PR'"
+    rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+    return 0
+  fi
+  touch "$O/state/needsreview-$PR-$HEAD" 2>/dev/null || echo "[merge $PR] $why, and needsreview-$PR-$HEAD WAS NOT WRITTEN (the controller reads this head as NEEDS-REVIEW by ABSENCE, so the remedy is unchanged; report.sh under-counts it)" >> "$L.log"
+  echo "[merge $PR] NEEDS-REVIEW: $why — attempt ${n}/${MAX_REVIEW_TRIES} spent at this head; the remedy is another REVIEW" >> "$L.log"
+  return 0
+}
+
 # review_state_record <class> — write the state marker the CONTROLLER acts on, at $HEAD.
 # ⛔ NO-VERDICT IS BOUNDED AND KEYED ON THE HEAD. A reviewer that never returns a verdict must not
 # buy an unbounded succession of PAID reviews (the #1717 class, one input over): MAX_REVIEW_TRIES
@@ -902,7 +995,7 @@ verdict_class() {
 # marker can be minted and no fixer can help — and a new push re-arms it. The count is per HEAD, the
 # same shape fixcount uses, so a push never inherits the previous head's attempts.
 review_state_record() {
-  local cls="${1:-}" rc_f="$O/state/reviewcount-$PR" rc_h="" rc_n=0
+  local cls="${1:-}" rc_n=0 _spent="" _spmode=""
   [ -n "${HEAD:-}" ] || return 0
   # ⛔ ONE MARKER PER PR, NOT PER (PR, HEAD) (review round 1, P2). An older head's stale-evidence
   # marker is not a fact about THIS head, and nothing swept it: the controller writes one on every red
@@ -916,7 +1009,7 @@ review_state_record() {
       # `needsfix-*`, so a PR that collected findings at five heads kept five markers for its whole
       # life (inert — both readers are head-keyed — but the docs claim they are replaced, and a state
       # directory that accumulates is how an operator stops trusting it).
-      rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* 2>/dev/null || true
+      rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* "$O/state/reviewdisp-$PR" "$O/state/reviewcount-$PR" 2>/dev/null || true
       # ⛔ AND A FAILED MARKER WRITE IS REPORTED AS WHAT IT IS (kept from main's #8602 port): the
       # controller decides with a FILE TEST (`[ -f $O/state/needsfix-<PR>-<head> ]`), so a marker that
       # did not land sends the PR to the RE-RECORD arm — a fresh review — and never to a fixer. A log
@@ -932,7 +1025,10 @@ review_state_record() {
       # restarts the count. Without this, N-1 timeouts before a findings verdict still parked the head
       # on the next timeout, with a reason claiming "a fixer has no findings to act on" at a head that
       # HAD findings (and, after a verified CLEAN, claiming nothing was reviewed at all).
-      rm -f "$O/state/reviewcount-$PR" 2>/dev/null || true
+      # ⛔ AND THE SHARED REVIEW BUDGET, ON THE SAME ARGUMENT (agent-infra#2971): a usable verdict —
+      # findings here, a verified CLEAN in review_state_clear — is what re-arms the count, because the
+      # count bounds CONSECUTIVE verdict-less attempts at a head.
+      rm -f "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" 2>/dev/null || true
       return 0 ;;
     NO-VERDICT)
       # ⛔ A VERDICT-LESS RUN DOES NOT SUPERSEDE A FINDINGS VERDICT AT THE SAME HEAD (review round 6,
@@ -948,12 +1044,18 @@ review_state_record() {
       fi
       MAX_REVIEW_TRIES="${MAX_REVIEW_TRIES:-3}"
       is_limit "$MAX_REVIEW_TRIES" || MAX_REVIEW_TRIES=3
-      if [ -f "$rc_f" ]; then read -r rc_h rc_n < "$rc_f" 2>/dev/null || true; fi
-      # is_limit, not is_num (the same reason rail_attempt gives): the value feeds `-ge` and `$(( + 1 ))`.
+      # ⛔ THE COUNT IS THE SHARED (PR, HEAD) RECORD, NOT A PRIVATE ONE ([revbudget] above). The
+      # controller's dispatch and this run are the same book, so the number in the reason below is the
+      # number the controller's own REVIEW-CAP will read.
+      _spent="$(rev_budget_spend)"; _spmode="${_spent##* }"; rc_n="${_spent%% *}"
       is_limit "${rc_n:-}" || rc_n=0
-      [ "${rc_h:-}" = "$HEAD" ] || rc_n=0
-      rc_n=$(( rc_n + 1 ))
-      printf '%s %s\n' "$HEAD" "$rc_n" > "$rc_f" 2>/dev/null || true
+      if [ "${_spmode:-}" = "unwritable" ]; then
+        # A counter that cannot be written is not a bound. Say so and stop, rather than re-buy.
+        park "the reviewer produced NO usable verdict at head=$HEAD (last line was [${LAST:-<empty>}]), and $(rev_budget_file) CANNOT BE WRITTEN — MAX_REVIEW_TRIES cannot bound this head, so it is parked instead of re-reviewed. Make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        echo "[merge $PR] NEEDS-REVIEW: no usable verdict at head=$HEAD and the (PR,head) review budget CANNOT BE WRITTEN — PARKED (an unwritable counter is not a bound)" >> "$L.log"
+        rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+        return 0
+      fi
       # ⛔ PRUNE EVERY BRANCH, NOT JUST THE WRITE BRANCH (review round 5, P2). The park branch below
       # removed only the marker AT the parked head, so a superseded marker at another head survived and
       # satisfied neither of report.sh's attributions (its head ≠ parked-<PR>, so it was not read as
@@ -965,6 +1067,9 @@ review_state_record() {
       rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-"* 2>/dev/null || true
       if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
         # ⛔ THE REASON NAMES THE LINE IT REJECTED (review round 7, P3). `parkreason-<PR>` is the only
+        # ⛔ AND IT NAMES THE SHARED BOOK (agent-infra#2971): the count is the controller's dispatch
+        # budget as well as this file's, so "3 times" now means three review attempts at this head by
+        # ANY arm — never this file's private tally sitting beside an untouched controller budget.
         # in-band remedial signal a human sees, and "a final line that was neither CLEAN nor ISSUES"
         # cannot distinguish a reviewer hit by its wall clock from one that printed an off-spec line.
         park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
@@ -995,11 +1100,13 @@ review_state_clear() {
   # MINT a `needsfix` marker at a head with a signed CLEAN marker — the exact fixer-without-findings
   # failure this issue exists to close, one round trip later.
   # ⛔ AND THE VERDICT-LESS COUNTER, BECAUSE THAT RUN WAS NOT VERDICT-LESS (review round 10, P2).
-  # `reviewcount-<PR>` bounds CONSECUTIVE runs that produced no usable verdict; this one produced one
-  # (the signed marker just verified), so it restarts. Keeping it parked a head on the next timeout
+  # The SHARED (PR, head) review budget — `reviewdisp-<PR>`, the same record the controller spends on
+  # dispatch (agent-infra#2971; it was `reviewcount-<PR>` before the two books became one) — bounds
+  # CONSECUTIVE runs that produced no usable verdict; this one produced one (the signed marker just
+  # verified), so it restarts. Keeping it parked a head on the next timeout
   # after two earlier timeouts, with a reason claiming nothing had been reviewed at a head whose
   # review had in fact completed — a park (a human) bought by a run that never failed.
-  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" 2>/dev/null || true
+  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" 2>/dev/null || true
   echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
   return 0
 }
@@ -1165,6 +1272,7 @@ case "$LAST" in
     # longer true — and report.sh counts exactly those (agent-infra#2132). This call MUST stay BELOW
     # the guard: a clear above it would let a bare rc=0 read as a satisfied head.
     review_state_clear
+    REV_RECORDED=1   # a terminal record exists for this run; the EXIT recorder must stay inert
     # ── 3a) RAIL MODE: there is no review gate to wait for (agent-infra#1825) ──
     # This repo's merge authority is its rail, which is WHY we dropped out of the rail branch to
     # mint the evidence: polling `$REVIEW_GATE` here would wait 15 minutes for a check that does
@@ -1620,6 +1728,7 @@ else:
     # on an unreviewed head and the PR could never converge.
     echo "[merge $PR] NOT CLEAN or no verdict at head=$HEAD (class=$(verdict_class "$LAST"))" >> "$L.log"
     review_state_record "$(verdict_class "$LAST")"
+    REV_RECORDED=1   # either a findings marker or a no-verdict record was written above
     ;;
 esac
 echo "[merge $PR] end $(date)" >> "$L.log"
