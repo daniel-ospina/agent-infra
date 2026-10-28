@@ -345,7 +345,7 @@ wt_cmux_probe_reading() {
     owner-running)
       case "$sp" in
         short) printf 'the durable session owner answers `status running` yet could not allocate a workspace, AND the state volume is short — BOTH readings are real, and the owner is the one that needs a human' ;;
-        fine)  printf 'the durable session owner answers `status running` and the state volume is NOT short (free space, inodes and state size all measured), so the create failed INSIDE the session owner — the disk-full wording in the daemon message is a FALSE CAUSE' ;;
+        fine)  printf 'the durable session owner answers `status running` and the state volume is NOT short (free space, inodes and state size all measured), so NEITHER of the causes this probe can measure is the failure — the create failed inside the SESSION OWNER, which is the one candidate left; the disk-full wording in the daemon message is a FALSE CAUSE' ;;
         *)     printf 'the durable session owner answers `status running` yet could not allocate a workspace; the state volume could NOT be read, so the disk is not ruled out' ;;
       esac ;;
     *)

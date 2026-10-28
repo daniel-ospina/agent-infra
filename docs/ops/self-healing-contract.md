@@ -490,6 +490,20 @@ census. ⛔ **Liveness is the worker's own exit-status file, never `%CPU`** (`%C
 copy predates the kind: refresh `$O`. A `.rc` that never appears → the worker died before its wrapper
 wrote it; the ledger row is the only trace.
 
+⛔ **A create refusal carries a MEASUREMENT, not the daemon's guess (#2404).** On a cell, worker
+spawning goes through the guest CLI's `workspace create`, and when the durable session owner can no
+longer allocate, it fails with `{"reason":"database or disk is full"}` — measured on cell-3
+2026-11-02 while `/` had 28 G free, inodes were 25 % used and `~/.cmux` was 37 M. `wt_spawn` used to
+relay that message as THE REASON, so every reader went to `df` and the cell stayed capped at the lanes
+it already had, while its `[cap]` line read healthy. A refusal now carries
+`MEASURED on this box — space … free=… inodes=… state=…; server status=…`, names the daemon's text a
+claim it did not verify, and — where the reading says the SESSION is the finding — tries
+`cmux server ensure --session <s>` once (bounded) and re-attempts the create once. **Read the measured
+line before touching the volume**: if the volume is not short and the owner answers `status running`,
+the repair is the session owner, not the disk. The spawn path never runs `server stop --force` (it ends
+every terminal inside the owner, i.e. every live lane); that lever stays an operator action, and a
+refusal it could not clear says so. `WT_SESSION_RECOVER=0` disables probing and recovery entirely.
+
 **state.** cell-4: present (`prfix_hits=5`), workers live (2 `fix-*`, 2 `merge-*`).
 
 ### 3.9 Spawn gate — `scripts/orchestrator-harness/spawn-gate.sh`
