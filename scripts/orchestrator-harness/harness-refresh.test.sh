@@ -39,8 +39,20 @@ reap() {
   wait "$1" 2>/dev/null
   return 0
 }
+# ⛔ START EACH CONTROLLER IN ITS OWN PROCESS GROUP AND REAP THE GROUP (agent-infra#3011). The
+# previous teardown here was `trap 'rm -rf "$T"' EXIT` alone, and a deleted cwd does not end a
+# process: every run left its REAL controllers resident, parked on a fifo `read` at 0 CPU and
+# reparented to 1. MEASURED 2026-10-28 on `pi-cell-4`: 145 leaked controllers, load 33–39 on 8 cores.
+# `fixture-hermetic.sh` starts each fixture in its own group, records the group, and on EXIT reaps it
+# and VERIFIES it is gone (a survivor fails the suite, because a false PASS is half the defect).
+# shellcheck source=/dev/null
+. "$HERE/fixture-hermetic.sh"
+# ⛔ AND REFUSE TO RUN AT ALL ON A LIVE CELL (#3011): a cell is a capacity resource, and its load is
+# the fleet's own dispatch signal. Keyed on a controller EXECUTING from a cell root, never on the
+# directory existing — a stale `/tmp/cell-home` on a laptop must not block a local run.
+fixture_guard_placement "harness-refresh.test.sh"
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-refresh.XXXXXX")"
-trap 'rm -rf "$T"' EXIT
+fixture_hermetic_init "$T/.fixture-pgids" "$T"
 echo "==> harness-refresh contract ($HERE)"
 
 [ -f "$RR" ]   || { echo "  ❌ missing $RR"; exit 1; }
@@ -1807,7 +1819,7 @@ mk_pin_tree() {
   [ -d "$d" ] || { mkdir -p "$root"; git -C "$T/src" worktree add --detach "$d" "$sha" >/dev/null 2>&1; }
   printf '%s\n' "$d"
 }
-# start_ctrl <tree> -> the pid of a LIVE controller executing that tree; leaves it in $CTRL_PID_T
+# start_ctrl <tree> -> the pid of a LIVE controller executing that tree (== its process-group id)
 # The script is overwritten AFTER the worktree exists: identity comes from `git rev-parse HEAD`, which a
 # dirty worktree does not change, and the fixture's own `orch-loop.sh` just echoes a label (it would
 # exit before it could be observed).
@@ -1815,11 +1827,15 @@ start_ctrl() {
   # ⛔ `sleep 300` WOULD FORK, and a forked child of the controller is (correctly) counted by the `tree`
   # population — so the fixture would read as "1 lane child" and `actuation=safe` would be unreachable
   # for a reason that is about the FIXTURE, not the box. A `read` on a fifo blocks INSIDE bash.
-  local f; f="$(mktemp -u "${TMPDIR:-/tmp}/ctrl-fifo.XXXXXX")"; mkfifo "$f" 2>/dev/null
+  # The fifo lives INSIDE $T (not /tmp) so the teardown that removes $T also removes it — 145 stray
+  # `/tmp/ctrl-fifo.*` files were the other half of the #3011 residue.
+  local f; f="$(mktemp -u "$T/ctrl-fifo.XXXXXX")"; mkfifo "$f" 2>/dev/null
   printf 'read -r _ < %s\n' "$f" > "$1/scripts/orchestrator-harness/orch-loop.sh"
-  bash "$1/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
-  CTRL_PID_T=$!
-  printf '%s\n' "$CTRL_PID_T"
+  # ⛔ GROUPED START, NOT `bash … &` (#3011). A plain background job stays in THIS suite's process
+  # group, so the id it returns is not a group id and a reaper signalling it can miss the live
+  # process. `fixture_start_group` sets the group id before `exec` (so the id it prints IS the group)
+  # and records it, so `fixture_reap_all` ends exactly this controller and nothing else on the box.
+  fixture_start_group bash "$1/scripts/orchestrator-harness/orch-loop.sh"
 }
 stop_ctrl() { [ -n "${1:-}" ] && { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }; }
 # req_of <O> <field> -> the field's value from the request record
@@ -2059,7 +2075,12 @@ printf 'restart request=pending requested_at=1700000000 requested_by=x running=a
   > "$D/cellhome/orchestrator/state/restart-request"
 PRU="$(env -u O CELL_HOME="$D/cellhome" HOME="$D/home" bash "$RR" --print-restart 2>&1)"
 case "$PRU" in
-  "restart request=pending"*) ok "the default located $CELL_HOME/orchestrator/state/restart-request — the record the loop writes" ;;
+  # ⛔ `$D/cellhome`, NOT `$CELL_HOME`: this is an ASSERTION MESSAGE, and `CELL_HOME` is unset in the
+  # suite's own shell — under the `set -u` at the top of this file the reference ABORTED the entire
+  # suite at this line (measured on origin/main 2026-10-28: 265 ✅, 0 ❌, then
+  # `line 2062: CELL_HOME: unbound variable`, so every later case — the A36/S3 controller-identity
+  # arms — never ran). A message must never be able to fail the run it is reporting on.
+  "restart request=pending"*) ok "the default located $D/cellhome/orchestrator/state/restart-request — the record the loop writes" ;;
   *no-O-set*) bad "the operator-shell reader abstained instead of reading the record: $PRU" ;;
   *) bad "the reader asserted an absence about a box that HAS a request: $PRU" ;; esac
 case "$PRU" in *"pending=deferred"*) ok "…and it printed the state verbatim, including pending=deferred" ;;
