@@ -1449,8 +1449,14 @@ cli_source() { # <interpreter> <module> <state-dir> [<ttl>] [<gh>] -> the `sourc
 # the `source=` value — only (p1)'s grep of the file ran. Only (p4)'s 3.2 corruption CONTROL is
 # genuinely version-gated, because it needs an interpreter that has the defect.
 gotp="$(cli_source "${B3:-bash}" "$MOD" "$T/rt-fixed")"
-ck "(p3a) the CLI reports a DERIVED source= ('${gotp:-<none>}') on $(basename "${B3:-bash}") — never the literal remainder of the printf" \
-   "$( legal_source "$gotp"; echo $? )"
+# ⛔ EXACT VALUE, NOT `legal_source` (#2969 review cycle 3, P2). `legal_source` asks "is this a MEMBER of
+# {gh, record(cache), unknown}" — a set test, not the row's answer — so a `fresh)` row that returned
+# `unknown`, or a `fresh) src='gh'` row DELETED entirely (the likely refactor accident: the catch-all
+# then answers), certified as ✅ on every host: measured, both mutants green at 133/0 and 135/0 while
+# the arm's own message printed ('unknown'). The field this bug corrupted is pinned to its ONE correct
+# value on the state that corrupted it; `legal_source` stays only where (p4) asks the set question.
+ck "(p3a) the CLI reports source=gh ('${gotp:-<none>}') on $(basename "${B3:-bash}") — never the literal remainder of the printf, never another state's value" \
+   "$( [ "${gotp:-}" = gh ]; echo $? )"
 # ⛔ ALL THREE VALUES THE HOIST MOVED, NOT ONE (#2969 review cycle 2, P2). (p3a) drove the CLI with
 # CIQ_TTL=0 against an EMPTY state dir — i.e. state=fresh — so `src` was ALWAYS 'gh', and the hoisted
 # `record(cache)` and `unknown` branches were executed by NO arm in this file: a typo in either would
@@ -1477,8 +1483,8 @@ if [ -z "$B3" ]; then
   printf '      (p3a) above asserts the source= VALUE on whatever bash this is.\n'
 else
   got="$(cli_source "$B3" "$MOD" "$T/rt-fixed3")"
-  ck "(p3) on bash 3.2 ($B3) the CLI reports a DERIVED source= ('${got:-<none>}')" \
-     "$( legal_source "$got"; echo $? )"
+  ck "(p3) on bash 3.2 ($B3) the CLI reports source=gh ('${got:-<none>}')" \
+     "$( [ "${got:-}" = gh ]; echo $? )"
   # ⛔ THE CONTROL NEEDS A MUTANT TO DRIVE. When (p2) could not build one — which is what a REVERTED
   # module looks like, since there is no hoisted block to relocate — this arm must go RED, not pass
   # because an absent file's empty output happens to be "not a legal source". Measured on the
