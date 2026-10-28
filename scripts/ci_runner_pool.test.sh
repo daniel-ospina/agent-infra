@@ -1222,15 +1222,174 @@ assert_contains "$out" "defect tmpdir-missing name=pi-runner-stat path=$RUNNER_R
   "the defect names the instance and the path"
 assert_contains "$out" "restart --name pi-runner-stat" "and the action that clears it"
 assert_contains "$out" "tmpdir_defects=1" "the summary counts it, so a caller need not parse the table"
-mkdir -p "$RUNNER_ROOT/pi-runner-stat/tmp"
+# ⛔⛔ RUN THE REMEDY, DO NOT HAND-REPAIR (#3004 review, P1). This block used to `mkdir -p` by hand and
+#   then assert the report was clean — so it proved the REPORT could be satisfied, never that the
+#   command the report PRINTS works. It did not: `restart` hit the live arm, logged "not touched",
+#   exited 0 and left the directory missing. The repair below is the printed remedy itself.
+remedy="$(sed -n 's/.*run: \(.*restart --name pi-runner-stat\)$/\1/p' <<<"$out")"
+assert_contains "$remedy" "restart --name pi-runner-stat" "the remedy is parsed out of the report (not restated)"
+# shellcheck disable=SC2086
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash $remedy 2>&1)"
+assert_eq "$?" "0" "the PRINTED REMEDY runs and exits 0"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-stat/tmp" "and it actually creates the directory"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
 assert_eq "$?" "0" "once the directory exists the report is clean again"
 assert_contains "$out" "tmpdir_defects=0" "and the count returns to zero"
 
+# ── (6) THE POST-REBOOT STATE: a LIVE listener is repairable, and its listener is untouched ──
+# ⛔ THE INCIDENT IS A LIVE LISTENER (#3004 review, P1). The instance dir is persistent and its unit
+#   enabled, so after a reboot the LISTENER SURVIVES and only its /tmp TMPDIR is gone. Every creation
+#   case in this section starts a DEAD registration, which is why they were all green while the state
+#   the PR documents could not be repaired at all. This case pins the live arm specifically: the
+#   directory appears, and the SAME pid is still the only listener.
+echo "── tmpdir: a LIVE listener with a missing TMPDIR is repaired, not re-started ──"
+fresh_pool tmplive; reset_logs
+register pi-runner-live1
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-live1 >/dev/null
+live_pids="$(listener_pids_for "$RUNNER_ROOT/pi-runner-live1")"
+printf 'TMPDIR=%s/pi-runner-live1/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-live1/.env"
+assert_absent "$RUNNER_ROOT/pi-runner-live1/tmp" "the post-reboot state: LIVE listener, TMPDIR gone"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-live1)"
+assert_eq "$?" "0" "restart on the live row succeeds"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-live1/tmp" "and it CREATES the missing TMPDIR"
+assert_omits "$out" "restarted name=" "without starting a second listener for a live registration"
+assert_eq "$(listener_pids_for "$RUNNER_ROOT/pi-runner-live1")" "$live_pids" "the live listener was NOT replaced (same pid)"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-live1") ))" "1" "exactly one listener runs"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "0" "and status is clean again — the live repair cleared the defect"
+
+# ── (7) RECONCILE's live arm repairs too (it is the arm that SKIPS every row it calls live) ──
+echo "── tmpdir: reconcile repairs the row it calls live ──"
+fresh_pool tmprec; reset_logs
+register pi-runner-recl
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-recl >/dev/null
+printf 'TMPDIR=%s/pi-runner-recl/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-recl/.env"
+assert_absent "$RUNNER_ROOT/pi-runner-recl/tmp" "the live row's TMPDIR is gone before the pass"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "reconcile exits 0 (nothing was dead)"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-recl/tmp" "and it repaired the LIVE row"
+if [ -d "$RUNNER_ROOT/pi-runner-recl/tmp" ]; then ok "the live row's TMPDIR exists after the pass"; else bad "the live row's TMPDIR was NOT created"; fi
+
+# ── (8) AN UNREADABLE `.env` IS cannot-measure, NEVER A MEASURED ZERO ─────────────────────
+# ⛔ `[ -f ]` is TRUE for a mode-000 file, so the read failed and the empty result was counted as "this
+#   instance names no TMPDIR": status printed `tmpdir_defects=0` (rc 0) over an instance whose jobs all
+#   die at mktemp. `status` may legitimately run as a DIFFERENT user from the runner's, so that shape is
+#   reachable — and a count is not a reading (#2834).
+echo "── tmpdir: an unreadable .env is cannot-measure, not a measured zero ──"
+fresh_pool tmplock; reset_logs
+register pi-runner-lock
+printf 'TMPDIR=%s/pi-runner-lock/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-lock/.env"
+chmod 000 "$RUNNER_ROOT/pi-runner-lock/.env"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unreadable .env (a root shell reads it anyway)"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+  assert_eq "$?" "2" "status refuses to grade a .env it could not read (rc 2, never rc 0 over a guess)"
+  assert_contains "$out" "cannot-measure why=tmpdir-unreadable" "and it names the file"
+  assert_omits "$out" "tmpdir_defects=0" "it publishes no zero over a reading it never took"
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-lock)" "2" \
+    "and restart starts NOTHING on an env it cannot read"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-lock") ))" "0" "no listener was started for it"
+fi
+chmod 600 "$RUNNER_ROOT/pi-runner-lock/.env"
+
+# ── (9) A VALUE THAT NEEDS SHELL EXPANSION IS REFUSED, NOT GUESSED AT ────────────────────
+# ⛔ `run.sh` SOURCES `.env`; a `sed` read does not. `TMPDIR=$HOME/ci-tmp` therefore had this tool create
+#   a directory literally named `$HOME` (under the instance dir, because the value is not `/`-leading),
+#   print `created tmpdir=…` and exit 0 — while the listener inherited an ABSENT /home/…/ci-tmp. The
+#   same for a trailing comment, which is where the value ENDS for a sourcing shell (#3004 review, P1).
+echo "── tmpdir: a \$VAR value and a trailing comment are refused, not mis-created ──"
+fresh_pool tmpexp; reset_logs
+register pi-runner-exp
+printf 'TMPDIR=$HOME/ci-tmp\n' >"$RUNNER_ROOT/pi-runner-exp/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-exp)"
+assert_eq "$?" "2" "a \$VAR value is cannot-act (rc 2), never a guessed directory"
+assert_contains "$out" "cannot-act why=tmpdir-value-not-literal" "naming the shape it refused"
+assert_contains "$out" "value=\$HOME/ci-tmp" "and the value it read"
+assert_absent "$RUNNER_ROOT/pi-runner-exp/\$HOME" "no literal '\$HOME' directory was created (the false PASS this replaces)"
+assert_absent "$RUNNER_ROOT/pi-runner-exp/ci-tmp" "and nothing was guessed at either"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-exp") ))" "0" "nothing was started"
+fresh_pool tmpcmt; reset_logs
+register pi-runner-cmt
+printf 'TMPDIR=%s/pi-runner-cmt/tmp  # scratch\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-cmt/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-cmt)"
+assert_eq "$?" "2" "a trailing comment is refused too (the listener would see only the first word)"
+assert_omits "$out" "created tmpdir=" "and it claims no creation it cannot honour"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cmt") ))" "0" "nothing was started"
+
+# ── (10) `export TMPDIR=` IS THE SAME ASSIGNMENT TO A SOURCING SHELL ─────────────────────
+# `. ./.env` honours `export TMPDIR=…`; requiring a bare `TMPDIR=` made the assignment invisible to BOTH
+# the creation and the detection, so the directory was never made and status never reported it.
+echo "── tmpdir: 'export TMPDIR=' is honoured ──"
+fresh_pool tmpexport; reset_logs
+register pi-runner-exp2
+printf 'export TMPDIR=%s/pi-runner-exp2/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-exp2/.env"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-exp2)"
+assert_eq "$?" "0" "an exported assignment is read like any other"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-exp2/tmp" "so the directory is created"
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-exp2/tmp" "and the listener inherits it"
+
+# ── (11) A PREVIEW MAY NOT ANNOUNCE A START THE REAL PASS REFUSES ───────────────────────
+# ⛔ The env precondition lives in `start_listener`, i.e. DOWNSTREAM of cmd_restart's `--dry-run` return,
+#   so an uncreatable TMPDIR previewed as "would start the listener" (rc 0) and then refused for real
+#   (rc 2) — the lying preview this file refuses elsewhere. A preview must also MUTATE nothing.
+echo "── tmpdir: --dry-run tells the truth and mutates nothing ──"
+fresh_pool tmpdry; reset_logs
+register pi-runner-dry
+: >"$RUNNER_ROOT/pi-runner-dry/blocker"
+printf 'TMPDIR=%s/pi-runner-dry/blocker/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-dry/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dry --dry-run)"
+assert_eq "$?" "2" "dry-run on an UNCREATABLE target refuses (rc 2), exactly as the real pass does"
+assert_omits "$out" "would start the listener" "and does not announce a start it would refuse"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-dry") ))" "0" "the preview started nothing"
+fresh_pool tmpdry2; reset_logs
+register pi-runner-dry2
+printf 'TMPDIR=%s/pi-runner-dry2/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-dry2/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dry2 --dry-run)"
+assert_eq "$?" "0" "a creatable target previews as OK"
+assert_contains "$out" "dry-run: would create tmpdir=$RUNNER_ROOT/pi-runner-dry2/tmp" "naming the creation it would make"
+assert_absent "$RUNNER_ROOT/pi-runner-dry2/tmp" "and the preview MUTATED nothing"
+
+# ── (12) THE DEFECT LINE MUST MATCH THE ROW IT IS UNDER ────────────────────────────────────
+# The arm runs for DEAD rows too, where "the listener row above (and GitHub) report it healthy" is false.
+echo "── tmpdir: the defect line does not claim a DEAD row is healthy ──"
+fresh_pool tmpdead; reset_logs
+register pi-runner-dead
+printf 'TMPDIR=%s/pi-runner-dead/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-dead/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "3" "a DEAD row with a missing TMPDIR is still a defect (rc 3)"
+assert_contains "$out" "defect tmpdir-missing name=pi-runner-dead" "it is reported"
+assert_contains "$out" "the listener row above reports it DEAD" "and the clause matches the row state"
+assert_omits "$out" "report it healthy" "it does not assert a health the row contradicts"
+
+# ── (13) AN EXISTING BUT UNWRITABLE TARGET IS cannot-act ──────────────────────────
+# The claimed arm the review found UNTESTED (#3004): `mkdir -p` succeeds over an existing directory and
+# does NOT tighten it, so a target that exists but cannot be written is the one shape where the
+# directory test passes and `mktemp` would still fail. The verdict is the WRITABILITY, not the existence.
+echo "── tmpdir: an existing but UNWRITABLE target refuses, starting nothing ──"
+fresh_pool tmpunw; reset_logs
+register pi-runner-unw
+mkdir -p "$RUNNER_ROOT/pi-runner-unw/tmp"; chmod 500 "$RUNNER_ROOT/pi-runner-unw/tmp"
+printf 'TMPDIR=%s/pi-runner-unw/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-unw/.env"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unwritable TMPDIR (a root shell bypasses the write bit)"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-unw)"
+  assert_eq "$?" "2" "an unwritable target is cannot-act (rc 2), not a start"
+  assert_contains "$out" "cannot-act why=tmpdir-unwritable" "and it names the write bit, not the path's absence"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-unw") ))" "0" "NO listener was started — it could not run a job anyway"
+fi
+chmod 700 "$RUNNER_ROOT/pi-runner-unw/tmp"
+
 # ── MUTATION: removing the creation must break these cases ────────────────────────────────
 # ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. The copy below is the shipped script with the
-#   single `ensure_tmpdir` call deleted from `start_listener` — the fix's entire effect. If the
-#   launcher-creation cases above still passed against it, they would be asserting something else.
+#   creation DEFUSED at its single source — `ensure_tmpdir` returns immediately, so every call site
+#   (the `start_listener` start path, `cmd_restart`'s live arm and its hoisted pre-start check, and
+#   `cmd_reconcile`'s live arm) does nothing. Deleting one CALL is no longer the right mutation: the
+#   repair is deliberately reachable from more than one arm (a live listener is never started again),
+#   so a per-call-site mutation proved nothing about the others. Neutering the one function is what
+#   reproduces the incident — the listener comes up under a TMPDIR that does not exist.
 echo "── tmpdir: mutation — without the mkdir the listener is left unsatisfiable ──"
 fresh_pool tmpmut; reset_logs
 MUTTMP="$T/mutant-tmpdir.sh"
@@ -1238,9 +1397,9 @@ python3 - "$POOL" "$MUTTMP" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src, encoding="utf-8").read()
-needle = '  ensure_tmpdir "$d" || return 2\n'
-assert text.count(needle) == 1, "the ensure_tmpdir call moved: update the mutation target"
-open(dst, "w", encoding="utf-8").write(text.replace(needle, ""))
+needle = '  t="$(instance_tmpdir "$d")" || rc=$?\n'
+assert text.count(needle) == 1, "the ensure_tmpdir body moved: update the mutation target"
+open(dst, "w", encoding="utf-8").write(text.replace(needle, '  return 0  # MUTANT: the creation defused\n' + needle))
 PY
 assert_file "$MUTTMP" "the mutation copy was produced"
 register pi-runner-mut-tmp
@@ -1252,6 +1411,31 @@ assert_absent "$RUNNER_ROOT/pi-runner-mut-tmp/tmp" "the mutant leaves the target
 assert_contains "$(cat "$MUTLOG")" "absent $RUNNER_ROOT/pi-runner-mut-tmp/tmp" \
   "and its listener comes up under a TMPDIR that does not exist — the state in which every job dies at mktemp"
 pkill -f "$RUNNER_ROOT/pi-runner-mut-tmp/bin/Runner.Listener" 2>/dev/null || true
+
+# ── MUTATION: the LIVE-arm repair is load-bearing too ──────────────────────────────────────
+# ⛔ The mutation above deletes the call inside `start_listener`, which the live arm never reaches — so
+#   it proves nothing about the post-reboot state. This copy deletes ONLY the call in `cmd_restart`'s
+#   live arm; the state it must fail to repair is the one this PR is about.
+echo "── tmpdir: mutation — the LIVE-arm repair is load-bearing ──"
+fresh_pool tmpmutlive; reset_logs
+MUTLIVE="$T/mutant-live-arm.sh"
+python3 - "$POOL" "$MUTLIVE" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+needle = '    0) ensure_tmpdir "$dir" || return 2\n'
+assert text.count(needle) == 1, "the live-arm ensure_tmpdir call moved: update the mutation target"
+open(dst, "w", encoding="utf-8").write(text.replace(needle, '    0)\n'))
+PY
+assert_file "$MUTLIVE" "the live-arm mutation copy was produced"
+register pi-runner-mut-live
+bash "$POOL" restart --name pi-runner-mut-live >/dev/null 2>&1
+printf 'TMPDIR=%s/pi-runner-mut-live/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-mut-live/.env"
+mut_out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash "$MUTLIVE" restart --name pi-runner-mut-live 2>&1)"
+assert_omits "$mut_out" "created tmpdir=" "the MUTANT never repairs a LIVE row (so the case above is live)"
+assert_absent "$RUNNER_ROOT/pi-runner-mut-live/tmp" "the mutant leaves the post-reboot state broken — the defect as shipped"
+assert_contains "$mut_out" "live name=pi-runner-mut-live" "while still reporting the listener 'not touched' and exiting 0"
+pkill -f "$RUNNER_ROOT/pi-runner-mut-live/bin/Runner.Listener" 2>/dev/null || true
 
 # ══ 10. MUTATION: removing the floor check must break the suite ═════════════════════════════
 # The floor is the owner-mandated predicate (#2344 comment 6347825624). A copy with the comparison

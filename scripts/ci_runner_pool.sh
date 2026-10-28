@@ -530,17 +530,46 @@ probe_listener() {
 # box GitHub reported `online`.
 # A relative value resolves against the INSTANCE DIR, because `run.sh` `cd`s there before the listener
 # reads the variable — resolving it anywhere else would create a directory the runner never uses.
+#
+# ⛔ THREE STATES, NOT TWO (#3004 review, P1). Returning empty for BOTH "the file names no TMPDIR" AND
+# "the file could not be read" made an unreadable `.env` collapse into "names none": `[ -f ]` is TRUE
+# for a mode-000 file, `sed`'s error was discarded, and the caller then published `tmpdir_defects=0`
+# — a count over a reading nobody took. `status` may legitimately run as a DIFFERENT user from the
+# runner's, so that shape is reachable exactly as the comment on its call site describes.
+#   rc 0 + a path   · it names a TMPDIR (absolute, resolved)
+#   0, no output    · it names none (the agent-infra `ai-runner-*` shape) — nothing to create
+#   2               · CANNOT MEASURE (unreadable `.env`), or a value no shell-free read can satisfy
+#
+# ⛔ AND THE VALUE MUST BE LITERAL (#3004 review, P1). `run.sh` SOURCES `.env`, so the listener sees
+# the EXPANDED value while a `sed` read sees the raw text: `TMPDIR=$HOME/ci-tmp` had this tool create a
+# directory literally named `$HOME` under the instance dir and print `created tmpdir=…` (rc 0) over a
+# runner that still inherited an ABSENT TMPDIR — a false PASS in the exact dimension this arm adds.
+# The same went for a trailing comment (`…/tmp  # scratch`). A value needing shell evaluation is
+# refused rather than guessed at: the refusal names the value and the remedy, and it starts nothing.
 instance_tmpdir() {
   local d="$1" t
   [ -f "$d/.env" ] || return 0
-  # LAST assignment wins, which is what a shell sourcing the file would do.
-  t="$(sed -n 's/^[[:space:]]*TMPDIR=//p' "$d/.env" 2>/dev/null | tail -n 1)"
+  # An EXISTING but unreadable `.env` is cannot-measure. `-r` is the read this function actually does
+  # (and it is FALSE for a mode-000 file, which `-f` alone happily accepts).
+  [ -r "$d/.env" ] || { err "cannot-measure why=tmpdir-unreadable path=$d/.env"; return 2; }
+  # LAST assignment wins, which is what a shell sourcing the file would do. `export TMPDIR=…` is
+  # honoured too — `. ./.env` accepts it, so requiring a bare `TMPDIR=` made a legal .env invisible to
+  # BOTH the creation and the detection. The `2>/dev/null` is gone on purpose: a read that failed must
+  # be visible, not silently equal to "names none".
+  t="$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}TMPDIR=//p' "$d/.env" | tail -n 1)" || return 2
   t="${t%$'\r'}"   # a `.env` edited on a CRLF host would otherwise name a path with a CR in it
   case "$t" in     # strip ONE layer of matching quotes; the value is a path, not a shell word
     \"*\") t="${t#\"}"; t="${t%\"}" ;;
     \'*\') t="${t#\'}"; t="${t%\'}" ;;
   esac
   [ -n "$t" ] || return 0
+  # A `$`, a backtick or a `~` is EXPANDED by the sourcing listener; whitespace is where a value ends
+  # and a comment begins. None of them can be honoured from the raw text, so none is guessed at.
+  case "$t" in
+    *'$'*|*'`'*|*'~'*|*[[:space:]]*)
+      err "cannot-act why=tmpdir-value-not-literal value=$t (named by $d/.env) — the listener SOURCES .env, so this value is expanded there and cannot be satisfied from the raw text; write a literal absolute path in $d/.env"
+      return 2 ;;
+  esac
   case "$t" in /*) : ;; *) t="$d/$t" ;; esac
   printf '%s' "$t"
 }
@@ -558,10 +587,29 @@ instance_tmpdir() {
 # the verdict either (the `-p` arm can succeed while the target is still not a directory) — the test
 # is that the directory EXISTS and this user can write it, which is what `mktemp` will do next.
 ensure_tmpdir() {
-  local d="$1" t created=0
-  t="$(instance_tmpdir "$d")"
+  local d="$1" t created=0 rc=0 p
+  t="$(instance_tmpdir "$d")" || rc=$?
+  # cannot-measure (`tmpdir-unreadable`) and a non-literal value are BOTH cannot-act here: the reason
+  # was already named by `instance_tmpdir`, so this arm does not invent a second one. Starting the
+  # listener anyway is the defect — the env it would inherit is unknown.
+  [ "$rc" -eq 0 ] || return 2
   [ -n "$t" ] || return 0
   if [ ! -d "$t" ]; then
+    # ⛔ A PREVIEW MAY NOT MUTATE, AND IT MAY NOT LIE (#3004 review, P2). `--dry-run` used to skip this
+    # check entirely (it sat downstream of the DRY return), so an uncreatable target previewed as
+    # "would start the listener" (rc 0) and then refused for real (rc 2) — the lying preview this file
+    # refuses everywhere else. In DRY mode the same satisfiability question is asked WITHOUT creating:
+    # `mkdir -p` succeeds over any missing ancestors, so the test is the first ancestor that EXISTS.
+    if [ "$DRY" = 1 ]; then
+      p="$t"
+      while [ ! -e "$p" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do p="$(dirname "$p")"; done
+      if [ -d "$p" ] && [ -w "$p" ]; then
+        log_line "dry-run: would create tmpdir=$t (named by $d/.env)"
+        return 0
+      fi
+      err "cannot-act why=tmpdir-uncreatable path=$t (named by $d/.env) — nothing started: the listener would come up healthy and every job on it would die at mktemp; check the parent directory's permissions and that no FILE sits on the path"
+      return 2
+    fi
     mkdir -p -m 700 "$t" 2>/dev/null || true
     [ -d "$t" ] || {
       err "cannot-act why=tmpdir-uncreatable path=$t (named by $d/.env) — nothing started: the listener would come up healthy and every job on it would die at mktemp; check the parent directory's permissions and that no FILE sits on the path"
@@ -586,11 +634,11 @@ start_listener() {
   local d="$1" i=0 rc
   [ -x "$d/run.sh" ] || { err "cannot-act why=runner-not-installed path=$d/run.sh"; return 2; }
   # ⛔ THE ENV THE LISTENER INHERITS MUST BE SATISFIABLE BEFORE IT IS EXEC'D (agent-infra#2937). This is
-  # the ONE place a listener is started — `add`, `restart` and `reconcile` all come through here — so
-  # the creation is at START TIME and survives a reboot with no systemd drop-in to remember. A
-  # `--dry-run` is deliberately NOT special-cased: creating a missing directory is not a refusal, and
-  # a preview that announces a start the real pass then refuses would be the lying preview this file
-  # already refuses elsewhere.
+  # the ONE place a listener is STARTED — `add`, `restart` and `reconcile` all come through here — so
+  # the creation is at START TIME and survives a reboot with no systemd drop-in to remember. It is not
+  # the only place a listener RUNS, though: a listener that SURVIVED the reboot is never started again,
+  # so `cmd_restart` and `cmd_reconcile` also repair their LIVE arms (#3004 review, P1). `--dry-run`
+  # cannot reach here, but `ensure_tmpdir` is DRY-aware anyway so no future caller can mutate a preview.
   ensure_tmpdir "$d" || return 2
   ( cd "$d" && exec "$d/run.sh" ) >>"$d/listener.log" 2>&1 &
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
@@ -607,7 +655,7 @@ start_listener() {
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 d rc dirs outside t tmpdir_defects=0
+  local dead=0 live=0 d rc dirs outside t rownote tmpdir_defects=0
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -647,9 +695,14 @@ cmd_status() {
     # ⛔ MISSING ONLY, NOT UNWRITABLE: `status` may legitimately run as a different user from the one
     # that owns the runner, so a `-w` test here would report a defect on a healthy box. The launcher
     # runs as the listener's own user and DOES refuse an unwritable target.
-    t="$(instance_tmpdir "$d")"
+    t="$(instance_tmpdir "$d")" || return 2   # cannot measure: never publish tmpdir_defects=0 over it
     if [ -n "$t" ] && [ ! -d "$t" ]; then
-      err "defect tmpdir-missing name=$(basename "$d") path=$t — the listener row above (and GitHub) report it healthy, and every job on it dies at mktemp; run: $SELF restart --name $(basename "$d")"
+      # ⛔ THE CLAUSE MUST MATCH THE ROW IT IS UNDER (#3004 review, P2): this arm runs for DEAD rows
+      # too, where "report it healthy" is false — the row says DEAD and GitHub says offline — and only
+      # the missing-TMPDIR half is true. `rc` is the state this loop already measured.
+      rownote="the listener row above (and GitHub) report it healthy"
+      [ "$rc" = 1 ] && rownote="the listener row above reports it DEAD"
+      err "defect tmpdir-missing name=$(basename "$d") path=$t — $rownote, and every job on it dies at mktemp; run: $SELF restart --name $(basename "$d")"
       tmpdir_defects=$((tmpdir_defects + 1))
     fi
   done <<<"$dirs"
@@ -923,13 +976,27 @@ cmd_restart() {
   # idle — the worst of the three states. The owner's floor sentence names ADDING, not restarting.
   rc=0; probe_listener "$dir" || rc=$?
   case "$rc" in
-    0) log_line "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
+    # ⛔ A LIVE LISTENER IS NOT A REPAIRED BOX (#3004 review, P1). The scenario THIS TOOL EXISTS FOR is
+    # the post-reboot one: the instance dir is persistent and its unit is enabled, so the LISTENER
+    # SURVIVES while its /tmp TMPDIR does not. `start_listener` cannot help there — nothing is started —
+    # so skipping the live arm made `restart`, the very remedy `status` prints, answer "not touched"
+    # and exit 0 over the still-broken box: a false PASS handed to the operator, and the PR's own claim
+    # ("start-time, so a reboot cannot undo it") false for the reboot it documents. Creating a
+    # directory does not touch, restart or double-start a listener — the invariant this line states
+    # still holds; the env the listener ALREADY has is simply made satisfiable at last.
+    0) ensure_tmpdir "$dir" || return 2
+       log_line "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
     2) return 2 ;;   # cannot measure: START NOTHING (a blind start is how a listener is doubled)
   esac
   # ⛔ THE START'S OWN PRECONDITION IS CHECKED BEFORE THE DRY RETURN, so a preview cannot announce a
   # start the real pass refuses. `start_listener` re-checks it (defence in depth), but a check that
   # only lives downstream of the `--dry-run` return is a preview that lies.
   [ -x "$dir/run.sh" ] || { err "cannot-act why=runner-not-installed path=$dir/run.sh"; return 2; }
+  # ⛔ AND SO IS THE ENV PRECONDITION (#3004 review, P2): it lives in `start_listener`, i.e. downstream
+  # of this DRY return, so an uncreatable TMPDIR previewed as "would start the listener" (rc 0) and
+  # then refused for real (rc 2). `ensure_tmpdir` is DRY-aware: it REPORTS the creation it would make
+  # and refuses an unsatisfiable target, mutating nothing.
+  ensure_tmpdir "$dir" || return 2
   if [ "$DRY" = 1 ]; then log_line "dry-run: would start the listener for name=$name"; return 0; fi
   start_listener "$dir" || return 2
   log_line "restarted name=$name pid=$(listener_pid "$dir")"
@@ -964,7 +1031,11 @@ cmd_reconcile() {
     [ -n "$d" ] || continue
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
-      0) continue ;;                       # live: not touched
+      # ⛔ THE LIVE ARM IS THIS PASS'S REPAIR PATH FOR THE POST-REBOOT STATE (#3004 review, P1): the
+      # listener survived, its TMPDIR did not, and nothing below this line runs for it. Repairing the
+      # env does not touch the listener, so "not touched" stays true while the box stops being broken.
+      # An unrepairable TMPDIR is `cannot`, not a clean pass.
+      0) ensure_tmpdir "$d" || cannot=$((cannot + 1)); continue ;;
       2) cannot=$((cannot + 1)); continue ;;   # cannot measure: start nothing
     esac
     dead=$((dead + 1))
