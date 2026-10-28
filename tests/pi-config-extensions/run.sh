@@ -322,11 +322,16 @@ build_farm() {
                     printf '{\n  "name": "farm-root",\n  "extensions": ["a.ts"]\n}\n' \
                       > "$TMP/live-extensions/package.json" ;;
     # #2841 review (round 2) — the loader's `isFile` branch: a DIRECTORY named
-    # `*.test.ts` is routed to `resolveExtensionEntries`, never executed, so the
-    # top-level arm must not indite it (a false block, #2425 class).
+    # `*.test.ts` is routed to `resolveExtensionEntries`, never executed AS A FILE,
+    # so the top-level arm must not indite it (a false block, #2425 class). The
+    # fixture RESOLVES an entry (`index.ts`) on purpose: an EMPTY directory is
+    # routed to the same branch and returns null, so it cannot tell "the loader
+    # skips it" from "the loader runs what it resolves" — and the second claim is
+    # the one the arm's comment is written against.
     live-dir-named-like-test) ln -s ../../../extensions/b.ts "$FARM/b.ts"
                     mkdir -p "$TMP/live-extensions/weird.test.ts"
-                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts" ;;
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/weird.test.ts/index.ts" ;;
   esac
 
   # #2425 — checks 3/4a read the GIT INDEX, so every fixture is a real repo with
@@ -626,11 +631,12 @@ run_gate 1 "top-level extensions key does not suppress the directory scan" live-
   "!symlink farm into extensions/"
 
 echo ""
-echo "32. #2841 review round 2 — a DIRECTORY named *.test.ts is never executed (no false block)"
+echo "32. #2841 review round 2 — a DIRECTORY named *.test.ts is not a test FILE (no false block)"
 # The loader's top-level branch requires `isFile`; a directory is routed to
-# `resolveExtensionEntries`, which returns null here (no pi.extensions, no
-# index.ts/index.js), so nothing is loaded. Inditing it was the gate's own
-# #2425-class false block.
+# `resolveExtensionEntries`. This fixture RESOLVES one (`index.ts`), so the arm is
+# exercised against the loader's real isDir behaviour rather than against a directory
+# that happens to return null — while the directory's NAME is still not a test file,
+# so inditing it would be the gate's own #2425-class false block.
 run_gate 0 "a directory named like a test is not a test file" live-dir-named-like-test \
   "symlink farm into extensions/" \
   "!test file(s) in the live extension farm" \

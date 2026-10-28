@@ -231,13 +231,21 @@ done
 # The name set is the `case`'s set, on purpose: ONE definition of "a test file pi would
 # execute", used by the writer and by the gate (scripts/check-pi-config-extensions.sh
 # check 6). A name added to one and not the other is the fail-open #2841 measured.
+# ⛔ `node_modules` IS PRUNED, because it is not the farm's to sweep: the loader skips it
+# (`if (entry.name === "node_modules") continue`), check 6's nested arm skips it
+# (`grep -v '/node_modules/'`), and a `*.test.js` inside an installed dependency is a
+# THIRD-PARTY file `npm install` put there — npm does not re-extract an already-installed
+# package, so deleting it corrupts the tree for good. Measured 2026-10-28 on this box:
+# 169 of the farm's 232 name-matching files sit under `/node_modules/`. Widening the set
+# without the prune grew a pre-existing over-delete by 10 files (`*.test.js` 9,
+# `*.spec.js` 1); the prune removes the whole class instead of only the newly-added names.
 # NB the sweep does NOT follow symlinked farm directories (`find` without `-L` does not
 # descend into them), which is what keeps a symlink-farmed machine from having its own
 # checkout's tracked test files deleted through the link.
 while IFS= read -r tf; do
   [ -n "$tf" ] || continue
   rm -f "$tf" && echo "    removed test file from live farm: ${tf#"$DEST/extensions/"}"
-done <<< "$(find "$DEST/extensions" -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) 2>/dev/null)"
+done <<< "$(find "$DEST/extensions" -type d -name node_modules -prune -o -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) -print 2>/dev/null)"
 
 echo "    extensions: $copied refreshed, $kept farm symlinks kept"
 

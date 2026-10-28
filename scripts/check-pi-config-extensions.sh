@@ -563,12 +563,20 @@ PYEOF
   fi
   # (a) top-level entries: the loader's own scan, spelled the same way — the glob
   #     skips dot-named names exactly as `collectAutoExtensionEntries` does, and
-  #     `-f` (which follows symlinks) is the loader's `isFile` branch: a DIRECTORY
-  #     named `foo.test.ts` is routed to `resolveExtensionEntries` by the loader,
-  #     not executed, so inditing it would be this gate's own false block
-  #     (case 32). A BROKEN symlink is skipped too — `statSync` throws and the
-  #     loader `continue`s. When the ROOT resolves entries, the scan that would
-  #     load these never runs, so they are NAMED as inert instead (#2425).
+  #     `-f` (which follows symlinks) is the loader's `isFile` branch. A DIRECTORY
+  #     named `foo.test.ts` is NOT executed as a file: the loader routes it to
+  #     `resolveExtensionEntries` and pushes whatever THAT resolves, so the
+  #     directory's own NAME is never a test file and inditing it would be this
+  #     gate's own false block (case 32, whose fixture resolves an `index.ts` on
+  #     purpose — an EMPTY directory is routed to the same branch and returns null,
+  #     so it cannot tell "the loader skips it" from "the loader runs what it
+  #     resolves"). What such a directory resolves is arm (b)'s subject whenever it
+  #     is NAME-DETECTABLE — a test name in its `pi.extensions` row is failed there
+  #     (case 28) — and its `index.ts`/`index.js` fallback carries a non-test name,
+  #     which is outside a name-based check exactly as a plain `foo/index.ts` suite
+  #     is. A BROKEN symlink is skipped too — `statSync` throws and the loader
+  #     `continue`s. When the ROOT resolves entries, the scan that would load these
+  #     never runs, so they are NAMED as inert instead (#2425).
   for lap in "$LIVE_FARM"/*; do
     [ -f "$lap" ] || continue
     case "$(basename "$lap")" in

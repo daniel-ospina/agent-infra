@@ -1865,11 +1865,17 @@ run_setup_expect_guard_fail() {
 #  • local-testkit.ts is the OVER-DELETE CONTROL: a name that CONTAINS "test" and is
 #    not a test file must SURVIVE. A sweep keyed on `*test*` would pass every removal
 #    assertion below while deleting real local extras from the farm.
-mkdir -p "$DEST/extensions/leak-nest"
+#  • leak-nest/node_modules/dep/parse.test.js is the WALK's over-delete control: a
+#    THIRD-PARTY test inside an installed dependency. `npm install` put it there and
+#    never re-extracts it, and the loader skips `node_modules` (so does check 6's
+#    nested arm), so the sweep must PRUNE it rather than delete it. Measured
+#    2026-10-28: 169 of this farm's 232 name-matching files sat under `/node_modules/`.
+mkdir -p "$DEST/extensions/leak-nest" "$DEST/extensions/leak-nest/node_modules/dep"
 for leak in stale.test.ts stale.spec.ts stale.test.js stale.spec.js leak-nest/inner.test.ts; do
   : > "$DEST/extensions/$leak"
 done
 : > "$DEST/extensions/local-testkit.ts"
+: > "$DEST/extensions/leak-nest/node_modules/dep/parse.test.js"
 
 # Same defect through the COPY-LOOP half (not just the sweep): a farm-source entry
 # named `*.spec.ts` must never be copied into $DEST. `pi-config/extensions` ships no
@@ -1912,6 +1918,15 @@ if [ -f "$DEST/extensions/local-testkit.ts" ]; then
   echo "ok: #2841 the over-delete control (local-testkit.ts) SURVIVED — the sweep keys on test-file names, not on 'test'"
 else
   fail "#2841: local-testkit.ts was deleted from the farm — the sweep over-deletes (a name containing 'test' is not a test file)"
+fi
+# The WALK's over-delete control: a third-party test inside an installed dependency.
+# `node_modules` is not the farm's to sweep — the loader skips it, check 6's nested arm
+# skips it, and npm never re-extracts an already-installed package, so a delete here is
+# permanent damage to the tree (#2841 review).
+if [ -f "$DEST/extensions/leak-nest/node_modules/dep/parse.test.js" ]; then
+  echo "ok: #2841 node_modules is PRUNED — a dependency's own parse.test.js SURVIVED the sweep"
+else
+  fail "#2841: the sweep deleted a test file out of a farm dependency's node_modules — npm will not re-extract it, and the loader never executes it"
 fi
 if [ -L "$DEST/extensions/mcp-client" ]; then
   echo "ok: farm link mcp-client kept"
