@@ -309,9 +309,11 @@ deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doct
 `rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
 worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `6`
-**NO-CAPACITY** — the spawn GATE refused the order (its own bound: `load` | `disk` |
-`land-backlog`), nothing was consumed, and it clears by itself, so the response is wait/prune/add
-capacity and **not** a repair; `4` crash; `64` the command line is unusable (**not** 2, so a launchd
+**NO-CAPACITY** — the spawn GATE refused the order (its own bound: `load` | `disk` | `land-backlog` |
+`fork`), nothing was consumed and no transport was involved, so the response is the BOUND's own remedy
+and never a repair — `load`/`land-backlog` clear by themselves, `disk` needs a reclaim, and `fork`
+needs the box restarted or drained **from outside** (it is out of processes, and waiting on load will
+never clear it); `4` crash; `64` the command line is unusable (**not** 2, so a launchd
 typo cannot masquerade as a refusal). ⛔ The sidecar **must** be overwritten by a refusing pass —
 otherwise the previous pass's `ok` stands and *"a failure only `launchctl list` can witness is a
 silent failure"*. `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
@@ -384,9 +386,11 @@ the tree) reporting the code a genuinely overloaded box produces (wait). So:
 - the code is split, and `6` is **not a new number**: `scripts/pr-repair-loop.sh` (the cell's repair
   unit, which runs this actuator) already declares `EXIT_DEFERRED=6` for "the machine said not now", and
   it maps `pr-doctor`'s `6` onto that same row (`decision=deferred`, `reason=dispatcher-no-capacity`);
-- the **verdict is named** in the sidecar for every exit — `verdict` (`OK` | `REFUSING` |
-  `UNDELIVERED` | `NO-CAPACITY`), `reason`, `next_action`, plus `no_room`, `no_room_bound` and `room`
-  (the box's own measurement) on the `6` path;
+- the **verdict is named** in the sidecar for **every exit** — `verdict` (`OK` | `REFUSING` |
+  `UNDELIVERED` | `NO-CAPACITY` | `CRASH` | `USAGE`), `reason`, `next_action`, plus `no_room`,
+  `no_room_bound` and `room` (the box's own measurement) on the `6` path. It is applied inside
+  `record_exit` as a total default derived from `rc` (so an early refusal path cannot ship a record
+  with no verdict), and `_finish` overrides only the bound-specific `next_action`;
 - the **box measurement is the fleet's existing one**, not a second one: `room` is the raw record from
   `bash $O/capacity.sh probe <checkout>` (`host ncpu load1 lpc lanes disk_free_mb mem_free_mb at procs
   procs_max fork src`, agent-infra#2253), read once *after* the decision and **never** used to take it —
@@ -397,6 +401,11 @@ the tree) reporting the code a genuinely overloaded box produces (wait). So:
 - the readers agree on the word: `heartbeat-loop.sh` prints `PR-DOCTOR WAITING rc=6`,
   `objective.py::pr_doctor_last_run` renders `WAITING (no capacity)`, `repo_row()` says `verdict=WAITING`.
   **None of them reads `6` as `ok`** (§2: cannot-verify is never a pass) and none reads it as `RED`.
+  ⛔ AND ALL THREE ARE FRESHNESS-BOUNDED FIRST (#2291 review, P1 — reproduced): a `WAITING` record is a
+  claim about a dispatcher that is still passing, so a record past the 2400 s bound reads `RED
+  UNREPORTED (verdict is STALE)` in the beat and `UNREPORTED (verdict is STALE, …)` in `objective.py` —
+  the two readers check the SAME age bound before the word, so they cannot disagree about one record. A
+  box that filled up and then died must not print the reassuring word for ever.
 
 **What repairs it.** Read `read=` and `reason=` from the sidecar, then: `read=transport` +
 `predates the repair kind` → refresh `$O` with `install.sh` (a stale dispatcher silently downgrades

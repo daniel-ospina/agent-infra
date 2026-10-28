@@ -2387,14 +2387,18 @@ repo=daniel-ospina/tortoise             open_prs=0     unplaced=0     dispatched
 
 The verdict words are the exit codes' own vocabulary and stay distinct: `clean` (`0`), `REFUSING`
 (`2` — I could not READ the queue), `UNPLACED` (`3` — I read it, placed the work, no worker took it),
-`CRASH` (`4`). Each entry is `owner/name`, or `owner/name=<checkout>` when the checkout is not the one
+`CRASH` (`4`), `WAITING` (`6` — the box's own spawn GATE refused the order and consumed nothing, so
+nothing is broken and nothing was done; the gate's own axis is in the row's `rc` context and in the
+sidecar's `no_room_bound`, and its remedy differs by axis — `load`/`land-backlog` clear by themselves,
+`disk` needs a reclaim, `fork` needs the box restarted or drained from outside). Each entry is
+`owner/name`, or `owner/name=<checkout>` when the checkout is not the one
 `REPO` names; `?` in a column means the pass never got far enough to count it. Repeated `--repo`
 flags REPLACE the `PR_DOCTOR_REPOS` default rather than joining it (a named list is the narrower
 instruction), and a checkout is only used when its `origin` proves the resolved repo — a remote on
 another host, a local path or a `file://` URL proves nothing.
 
 The aggregate exit is non-clean when ANY repo is (precedence `4` crash > `2` could-not-read > `3`
-nobody-took-it), the canonical `pr-doctor.status.json` names every repo and carries a `repos` list,
+nobody-took-it > `6` the box said not-now), the canonical `pr-doctor.status.json` names every repo and carries a `repos` list,
 and each repo also writes its own `pr-doctor-<owner>-<name>.json` register (plus
 `pr-doctor.<owner>-<name>.{status.json,log}` in `--all-repos` mode) — so the beat's single line can
 no longer launder a stuck repo behind a quiet one. ⛔ THE REGISTER IS REPO-SCOPED FOR A SINGLE-REPO

@@ -664,6 +664,62 @@ def test_a_disk_gate_refusal_carries_ITS_OWN_axis_not_loads(tmp_path, monkeypatc
     assert pr.GATE_REFUSAL_ACTION["disk"] != pr.GATE_REFUSAL_ACTION["load"]
 
 
+def test_a_FORK_refusal_is_a_REFUSAL_and_never_a_dispatch(tmp_path, monkeypatch):
+    """73 was read as a LAUNCH, so a box out of processes reported a successful dispatch.
+
+    ⛔ THE FALSE PASS (agent-infra#2291 review, P1 -- source-derived, and the exact shape this whole
+    PR exists to remove). `spawn-gate.sh` declares FOUR agent-facing refusals, not three:
+    `AGENT_FORK_REFUSED=73` is returned at its fork gate with `[fork-gate] REFUSED … A fork refusal
+    does NOT clear by waiting: this box is out of PROCESSES`, written to the same worker log this
+    file reads. With 73 absent from `GATE_REFUSALS`, `gate_refused()` short-circuited to False and
+    `_confirm()` returned `("launched", "worker exited rc=73", "")` -- so `dispatch()` said the order
+    was placed, `run_pass` counted it in `dispatched`, and the pass exited `EXIT_CLEAN` (0) with
+    nothing running and a budget slot burnt.
+    """
+    d = tmp_path / "orch"
+    d.mkdir()
+    (d / "spawn-gate.sh").write_text(
+        'run_agent() { echo "[fork-gate] REFUSED bg: fork=1 / 0 spare processes" >> "$2"; '
+        'return 73; }\n')
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setenv("O", str(d))
+    ok, detail, record, bound = pr.dispatch(_pr(14), "fix-ci", _OK_BRIEF, dry=False)
+    assert (ok, record) == (False, False), detail
+    assert "gate REFUSED rc=73" in detail, detail
+    # The axis is the gate's own, and its remedy is NOT "wait" -- the gate says so in as many words.
+    assert bound == "fork", bound
+    assert "PROCESSES" in pr.GATE_REFUSAL_ACTION["fork"], pr.GATE_REFUSAL_ACTION["fork"]
+    assert "does NOT clear" in pr.GATE_REFUSAL_ACTION["fork"]
+    assert pr.GATE_REFUSAL_ACTION["fork"] != pr.GATE_REFUSAL_ACTION["load"]
+
+
+def test_a_fork_refusal_still_needs_the_GATES_OWN_line(tmp_path, monkeypatch):
+    """The CONTROL: a `pi` that exits 73 itself is NOT a gate refusal, even with the code in the tuple.
+
+    Adding 73 to the code table must not make every rc=73 a refusal -- `pi` shares the 0-255
+    namespace, and the discriminator is the gate's own `[fork-gate] REFUSED` line in the worker log.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    (d / "bg" / "prd-15.log").write_text("an agent ran and then failed for its own reasons\n")
+    assert pr.gate_refused("prd-15", 73) is False
+    assert pr.gate_refused("prd-15", 75) is False
+    # …and the marker alone is enough once it is the gate's: same code, same log, no agent line.
+    (d / "bg" / "prd-16.log").write_text(
+        "[fork-gate] REFUSED bg: this box is out of PROCESSES\n")
+    assert pr.gate_refused("prd-16", 73) is True
+
+
 def test_a_TRANSPORT_failure_carries_NO_axis(tmp_path, monkeypatch):
     """The control: a dispatcher that fails outright is the TRANSPORT, so `bound` stays empty.
 
@@ -7434,18 +7490,78 @@ def test_pr_doctor_owns_no_SECOND_set_of_capacity_thresholds():
 
 
 def test_the_gate_axis_table_is_the_GATES_own_numbers():
-    """The axis is read from `spawn-gate.sh`'s literals, so a renumbered gate reddens this suite."""
+    """ENUMERATED from `spawn-gate.sh`, not from a hard-coded trio.
+
+    ⛔ A HARD-CODED TRIO CERTIFIED A TABLE THAT WAS MISSING A CODE (agent-infra#2291 review, P1 --
+    reproduced). The old body iterated the three names it was testing and then asserted the two sets
+    agreed, so `AGENT_FORK_REFUSED=73` was STRUCTURALLY INVISIBLE to it: a fourth code could be added
+    to the gate and this test stayed green while `gate_refused()` read that refusal as a dispatch.
+    The enumeration now comes FROM the gate, minus a DECLARED exclusion set, so a new gate code
+    reddens this test until someone classifies it one way or the other.
+    """
     gate = (_HARNESS / "spawn-gate.sh").read_text()
-    lit = {}
-    for name in ("AGENT_LOAD_REFUSED", "AGENT_DISK_REFUSED", "AGENT_LAND_BACKLOG"):
-        m = re.search(r"^%s=(\d+)\s*$" % name, gate, re.M)
-        assert m, "spawn-gate.sh no longer declares %s" % name
-        lit[int(m.group(1))] = name
-    assert set(lit) == set(pr.GATE_REFUSAL_BOUND), (lit, pr.GATE_REFUSAL_BOUND)
+    agent_codes = {int(m.group(2)): m.group(1)
+                   for m in re.finditer(r"^(AGENT_[A-Z_]+_REFUSED|AGENT_LAND_BACKLOG)=(\d+)\s*$",
+                                        gate, re.M)}
+    # Codes the gate declares for an order pr-doctor never sees in a BACKGROUNDED worker's `.rc`,
+    # each with the reason it is not on this axis. A new name in the difference is the signal to
+    # classify the new code -- that is the whole point of enumerating rather than listing.
+    NOT_IN_A_WORKER_RC = {
+        "AGENT_BRIEF_REFUSED": "pr-doctor's own brief is gated in the FOREGROUND, before any "
+                               "worker exists to have an `.rc` (see `dispatch()`'s spawn arm)",
+    }
+    expected = {code: name for code, name in agent_codes.items()
+                if name not in NOT_IN_A_WORKER_RC}
+    assert len(expected) >= 4, (agent_codes, "the enumeration stopped matching spawn-gate.sh")
+    assert set(expected) == set(pr.GATE_REFUSALS), (expected, pr.GATE_REFUSALS)
+    # `gate_refused()` short-circuits on the tuple and `_confirm()` reads the axis from the map, so a
+    # code in one but not the other is either a false PASS (tuple only) or a lost axis (map only).
+    assert set(pr.GATE_REFUSALS) == set(pr.GATE_REFUSAL_BOUND), \
+        (pr.GATE_REFUSALS, pr.GATE_REFUSAL_BOUND)
+    # 78 is the TRANSPORT fact this whole split exists for (`spawn-gate.sh: not found`), so it may
+    # never be absorbed into "the box said not now".
+    assert 78 not in pr.GATE_REFUSALS and 78 not in pr.GATE_REFUSAL_BOUND
+    # The markers are the second half of the discriminator, so they must cover the same gates.
+    assert len(pr.REFUSAL_MARKERS) == len(pr.GATE_REFUSAL_BOUND), \
+        (pr.REFUSAL_MARKERS, pr.GATE_REFUSAL_BOUND)
     # Each axis names a DIFFERENT remedy, so a reader is told what to do and not just what happened.
-    for bound in pr.GATE_REFUSAL_BOUND.values():
-        assert pr.GATE_REFUSAL_ACTION.get(bound), bound
-    assert pr.GATE_REFUSAL_ACTION["load"] != pr.GATE_REFUSAL_ACTION["disk"]
+    actions = [pr.GATE_REFUSAL_ACTION.get(b) for b in pr.GATE_REFUSAL_BOUND.values()]
+    assert all(actions), (pr.GATE_REFUSAL_BOUND, pr.GATE_REFUSAL_ACTION)
+    assert len(set(actions)) == len(actions), (pr.GATE_REFUSAL_BOUND, actions)
+
+
+def test_every_declared_exit_code_has_a_verdict_word(monkeypatch, tmp_path):
+    """`verdict` and `next_action` are written on EVERY exit, by construction (#2291 review, P2).
+
+    ⛔ THE CONTRACT SAID "FOR EVERY EXIT" AND THE CODE MEANT "FOR THE ONES THAT REACH `_finish`".
+    `verdict`/`next_action` were kwargs only `_finish` passed, so ~12 other `record_exit` call sites
+    (the open-PR read failing, a stale classifier seam, `EXIT_USAGE`, `EXIT_CRASH`, every
+    `EXIT_REFUSING` arm) wrote `rc` + `reason` with NO verdict -- a non-terminal reader got `None`
+    for exactly the "wait or repair?" question this issue exists to answer, one layer up from the
+    ambiguity it removes. The default now lives in `record_exit`, and `_finish` overrides only the
+    bound-specific `next_action`.
+    """
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "state" / "pr-doctor.status.json"))
+    monkeypatch.setattr(pr, "NOT_A_FLEET_READING", "")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "REST_RECOVERED", False)
+    codes = [v for k, v in vars(pr).items() if k.startswith("EXIT_") and isinstance(v, int)]
+    assert codes, codes
+    for code in codes:
+        # A NEW `EXIT_*` WITHOUT A WORD IS THE FAILURE THIS TEST EXISTS FOR.
+        assert code in pr.VERDICT_BY_RC, (code, pr.VERDICT_BY_RC)
+        assert code in pr.NEXT_ACTION_BY_RC, (code, pr.NEXT_ACTION_BY_RC)
+        pr.NOT_A_FLEET_READING = ""
+        pr.record_exit(code, "a reason")
+        payload = json.load(open(pr.STATUS))
+        assert payload.get("verdict") == pr.VERDICT_BY_RC[code], payload
+        assert payload.get("next_action") == pr.NEXT_ACTION_BY_RC[code], payload
+    # …and a caller that knows better still overrides the default (the bound's own remedy).
+    pr.record_exit(pr.EXIT_NO_CAPACITY, "a reason",
+                   next_action=pr.GATE_REFUSAL_ACTION["fork"])
+    assert json.load(open(pr.STATUS)).get("next_action") == pr.GATE_REFUSAL_ACTION["fork"]
+
 
 
 def test_a_no_capacity_pass_is_NOT_reported_as_RED_by_the_beat(tmp_path):

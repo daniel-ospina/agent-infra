@@ -461,6 +461,47 @@ else
   fail "rc=3 was not reported as RED (got: $(grep -m1 'PR-DOCTOR' "$LOG8F" 2>/dev/null | cut -c1-140))"
 fi
 
+# ⛔ AND THE WAITING ARM IS FRESHNESS-BOUNDED (agent-infra#2291 review, P1 — reproduced). The `rc=6`
+# arm was placed ABOVE the staleness arm, so a dispatcher that DIED in a NO-CAPACITY pass printed the
+# reassuring word `WAITING` for ever, with the record's age demoted to a parenthetical nothing keys
+# on — the same stale-verdict defect the arm below exists to end, reached by a different code. The
+# STATE reader (not the `.rc` reader above, which carries no age at all) is what this case seeds.
+FIX8G="$(mkfix stalewaiting 0)"; LOG8G="$(logof "$FIX8G")"
+python3 - "$FIX8G/agent/state/pr-doctor.status.json" <<'PY'
+import json, sys, time
+json.dump({"rc": 6, "at_epoch": int(time.time()) - 3000,
+           "reason": "1 order(s) REFUSED by the box's own gate (bound=load)",
+           "verdict": "NO-CAPACITY", "dry_run": False}, open(sys.argv[1], "w"))
+PY
+run_pass "$FIX8G"
+LOG8GTXT="$(cat "$LOG8G" 2>/dev/null)"
+if has "$LOG8GTXT" "RED UNREPORTED (verdict is STALE"; then
+  pass "a STALE rc=6 record reads 'RED UNREPORTED (verdict is STALE)' — not the reassuring word"
+else
+  fail "a 3000s-old rc=6 record was not reported as stale (got: $(grep -m1 'PR-DOCTOR' "$LOG8G" 2>/dev/null | cut -c1-140))"
+fi
+if has "$LOG8GTXT" "PR-DOCTOR WAITING"; then
+  fail "a STALE rc=6 record still printed WAITING — a dispatcher that died full is not 'waiting'"
+else
+  pass "   …and it is NOT reported as WAITING"
+fi
+# The control: the SAME record, FRESH, must still read WAITING — so the arm above cannot pass by
+# refusing the word entirely.
+FIX8H="$(mkfix freshwaiting 0)"; LOG8H="$(logof "$FIX8H")"
+python3 - "$FIX8H/agent/state/pr-doctor.status.json" <<'PY'
+import json, sys, time
+json.dump({"rc": 6, "at_epoch": int(time.time()),
+           "reason": "1 order(s) REFUSED by the box's own gate (bound=load)",
+           "verdict": "NO-CAPACITY", "dry_run": False}, open(sys.argv[1], "w"))
+PY
+run_pass "$FIX8H"
+LOG8HTXT="$(cat "$LOG8H" 2>/dev/null)"
+if has "$LOG8HTXT" "PR-DOCTOR WAITING rc=6" && ! has "$LOG8HTXT" "verdict is STALE"; then
+  pass "   CONTROL: the same record when FRESH still reads 'PR-DOCTOR WAITING rc=6'"
+else
+  fail "a fresh rc=6 record lost its WAITING word (got: $(grep -m1 'PR-DOCTOR' "$LOG8H" 2>/dev/null | cut -c1-140))"
+fi
+
 echo ""
 echo "9. the WORD is chosen by the rc: a crash is not a refusal (REFUSED is #1872's exit-2 word)"
 FIX9="$(mkfix crash 4)"; LOG9="$(logof "$FIX9")"

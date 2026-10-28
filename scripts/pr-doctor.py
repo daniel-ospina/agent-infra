@@ -197,10 +197,32 @@ NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be 
 EXIT_CLEAN = 0        # a readable pass: it dispatched, or there was genuinely nothing to do
 EXIT_REFUSING = 2     # I could not read the world, or could not deliver to it -- 2's only meaning
 EXIT_UNDELIVERED = 3  # I read it, I placed the work, and the TRANSPORT refused the order
-EXIT_NO_CAPACITY = 6  # the BOX refused the order (spawn gate: load/disk/land-backlog) -- nothing
-                      # was consumed and it clears by itself; the response is to WAIT, not to repair
+EXIT_NO_CAPACITY = 6  # the BOX's own gate refused the order (spawn gate: load/disk/land-backlog/
+                      # fork) -- nothing was consumed, so this is not a TRANSPORT repair; the bound
+                      # names the remedy (load/land clear, disk needs a reclaim, fork a restart)
 EXIT_CRASH = 4        # an uncaught exception (see __main__)
 EXIT_USAGE = 64       # the COMMAND LINE is unusable -- nothing was attempted
+#
+# ⛔ ONE WORD PER CODE, DECLARED ONCE (agent-infra#2291 review, P2). The docs promise that the sidecar
+# NAMES the verdict for EVERY exit, and before this table `verdict`/`next_action` were kwargs only
+# `_finish` passed -- so the ~12 other `record_exit` call sites (a failed open-PR read, a stale
+# classifier seam, `EXIT_USAGE`, `EXIT_CRASH`) wrote `rc` and `reason` with NO verdict, and a reader
+# following the contract got `None` for exactly the "wait or repair?" question this issue exists to
+# answer. `record_exit` applies these as DEFAULTS and lets a caller override, so the promise holds by
+# construction instead of by remembering to pass it. Adding an `EXIT_*` without a word here reddens
+# `test_every_declared_exit_code_has_a_verdict_word`.
+VERDICT_BY_RC = {EXIT_CLEAN: "OK", EXIT_REFUSING: "REFUSING", EXIT_UNDELIVERED: "UNDELIVERED",
+                 EXIT_NO_CAPACITY: "NO-CAPACITY", EXIT_CRASH: "CRASH", EXIT_USAGE: "USAGE"}
+NEXT_ACTION_BY_RC = {
+    EXIT_CLEAN: "",
+    EXIT_REFUSING: "repair the read/delivery named in `reason` -- nothing was dispatched",
+    EXIT_UNDELIVERED: "repair the transport named in `reason` (the install, the worktree, or the "
+                      "worker liveness read) -- waiting will not clear it",
+    EXIT_NO_CAPACITY: "the box's own gate refused the order; `no_room_bound` in this record names "
+                      "its axis, and its remedy is the one `pr-doctor --status` prints",
+    EXIT_CRASH: "read `reason` for the traceback -- the pass did not complete",
+    EXIT_USAGE: "fix the command line -- nothing was attempted",
+}
 #
 # ⛔ 3 AND 6 ARE TWO FACTS, AND MERGING THEM IS #2291 (reproduced on `main`, both paths through the
 # REAL `dispatch()` -> `_confirm()` -> `gate_refused()` chain):
@@ -1134,7 +1156,8 @@ SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
 # pipe. The timeout below is a guard on the DISPATCHER, which returns in well under a second -- not
 # on the worker.
 SPAWN_CALL_TIMEOUT_S = 120
-# A gate refusal (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75) consumed nothing, so it must not
+# A gate refusal (AGENT_FORK_REFUSED=73 / AGENT_LOAD_REFUSED=75 / AGENT_DISK_REFUSED=77 /
+# AGENT_LAND_BACKLOG=74) consumed nothing, so it must not
 # be recorded. `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 the moment the
 # worker is launched, so the refusal code only ever lands in `$O/bg/<name>.rc`; this is the bound
 # dispatch() gives it to appear before concluding that the worker launched.
@@ -1149,22 +1172,37 @@ CONFIRM_WINDOW_S = 1.0
 # `7` is not a refusal code, so dispatch() recorded as launched a spawn the gate had REFUSED.
 # Require the trailing newline, so a partial write is never a verdict.
 _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
-GATE_REFUSALS = (75, 77, 74)
+# ⛔ EVERY CODE `run_agent` CAN WRITE INTO A BACKGROUNDED WORKER'S `.rc` AS A REFUSAL, and nothing
+# else. This tuple answers ONE question -- "did the gate consume this order?" -- so its membership is
+# decided by that question and not by "is it about capacity": a fork refusal consumed nothing too, and
+# leaving 73 out made it read as a DISPATCH (agent-infra#2291 review, P1: a box out of processes
+# reported `dispatched += 1` and the pass exited CLEAN with nothing running).
+# ⛔ 80 (AGENT_BRIEF_REFUSED) IS DELIBERATELY ABSENT and `dispatch()` says why at the spawn: it comes
+# back on the FOREGROUND call for pr-doctor's own brief, so no worker ever exists to have an `.rc`.
+# 76 (PI_GATE_REFUSED) is translated into 75 inside `run_agent` before any caller sees it, and 78
+# (BRIEF_GATE_UNAVAILABLE / the spawn point's fork code) is a TRANSPORT fact -- a missing
+# spawn-gate.sh is exactly the failure the no-room split exists to keep OUT of this tuple.
+GATE_REFUSALS = (75, 77, 74, 73)
 # ⛔ THE GATE'S OWN BOUND, BY ITS OWN CODE (agent-infra#2291). `spawn-gate.sh` refuses on ONE measured
 # bound per spawn and names it in the code it writes, so the axis is READ (`dispatch()` carries it out)
 # rather than re-derived here from load/disk thresholds -- a second set of thresholds in this file would
 # be a second instrument, and the two would eventually disagree about the same box (this file's own
-# rule: exactly one authority per fact). The three literals are `spawn-gate.sh`'s exits, and
-# `test_the_capacity_seams_are_the_gates_own_numbers` extracts them from that script so a renumbered
-# gate reddens the suite instead of silently losing the axis.
-GATE_REFUSAL_BOUND = {75: "load", 77: "disk", 74: "land-backlog"}
+# rule: exactly one authority per fact). The literals are `spawn-gate.sh`'s exits, and
+# `test_the_gate_axis_table_is_the_GATES_own_numbers` ENUMERATES them from that script (minus a
+# declared, reasoned exclusion set) so a new gate code reddens the suite instead of silently losing its
+# axis -- which is how 73 stayed invisible while the comment here claimed the table was complete.
+GATE_REFUSAL_BOUND = {75: "load", 77: "disk", 74: "land-backlog", 73: "fork"}
 # What to DO about each bound. The axis decides the operator's next action, and `spawn-gate.sh`
 # documents each remedy beside its own refusal line: load clears by itself; a full disk never does;
-# the land-backlog gate opens when the open-PR backlog is landed.
+# the land-backlog gate opens when the open-PR backlog is landed; a fork refusal needs the box
+# restarted or drained FROM OUTSIDE (agent-infra#2293 -- it cannot be cleaned up from inside, and
+# waiting on load will never clear it).
 GATE_REFUSAL_ACTION = {
     "load": "wait -- a load refusal clears by itself as the box drains (or add capacity)",
     "disk": "reclaim disk (prune caches/scratch) -- waiting does NOT clear this",
     "land-backlog": "land the open-PR backlog -- creation is held, the drain is not",
+    "fork": "this box is out of PROCESSES -- restart it from outside or let its lanes drain; "
+            "waiting does NOT clear this",
 }
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
@@ -1174,7 +1212,12 @@ GATE_REFUSAL_ACTION = {
 # `[land-backlog]` is the creation back-pressure gate (agent-infra#2409, exit 74). Without it a
 # refusal read as "launched", so the row burned a 45-min cooldown and a 90-min budget slot for a
 # worker that never started -- the exact accounting failure the 75/77 discrimination exists for.
-REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED")
+# `[fork-gate]` is the out-of-processes gate (agent-infra#2293, exit 73) and it belongs HERE for the
+# same reason, one code later: without it the 73 in `GATE_REFUSALS` would still be read as "launched"
+# (`gate_refused()` requires BOTH the code and the gate's own line), so a box that could not fork
+# would have kept reporting a successful dispatch.
+REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED",
+                   "[fork-gate] REFUSED")
 # `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
 # and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
 # refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent
@@ -1593,7 +1636,19 @@ def record_exit(rc: int, reason: str, **extra) -> int:
     if REST_RECOVERED:
         reason = "REST-RECOVERED: %s" % reason
     payload = {"rc": int(rc), "reason": reason, "at": ts(), "at_epoch": now(),
-               "pid": os.getpid(), "repo": REPO, "rest_recovered": REST_RECOVERED}
+               "pid": os.getpid(), "repo": REPO, "rest_recovered": REST_RECOVERED,
+               # ⛔ THE VERDICT IS NAMED FOR **EVERY** EXIT, BY CONSTRUCTION (agent-infra#2291
+               # review, P2). `verdict`/`next_action` used to be kwargs that only `_finish` passed,
+               # and `record_exit` is reached by ~12 other exits (the open-PR read failing, a stale
+               # classifier seam, `EXIT_USAGE`, `EXIT_CRASH`, every `EXIT_REFUSING` arm) -- so the
+               # sidecar carried `rc` and `reason` and NO verdict on the entire refusing class, and
+               # a non-terminal reader following the contract got `None` for exactly the "wait or
+               # repair?" question #2291 exists to answer. Stowed in the ONE exit path, which is
+               # the same move this function already makes for `REST_RECOVERED` and `LAST_PASS`:
+               # a caller that passes its own value still overrides (the bound-specific
+               # `next_action` in `_finish`), and every path it does not reach a default remains.
+               "verdict": VERDICT_BY_RC.get(int(rc), "UNKNOWN"),
+               "next_action": NEXT_ACTION_BY_RC.get(int(rc), "read `reason`")}
     payload.update(extra)
     # ⛔ THE PER-REPO LINE READS THIS, so it is stowed HERE -- the one exit path -- rather than
     # rebuilt from a second copy of each exit's counts (which is how two readers of one verdict
@@ -3447,12 +3502,13 @@ def read_rc(path: str):
 
 
 def gate_refused(name: str, code) -> bool:
-    """True iff a 74/75/77 `.rc` was written by the GATE, not by a `pi` that exited 74/75 itself.
+    """True iff a 73/74/75/77 `.rc` was written by the GATE, not by a `pi` that exited it itself.
 
     The codes share the 0-255 exit namespace with `pi`, so the code alone is ambiguous -- and the
     two meanings have OPPOSITE consequences here ("nothing consumed, do not record" vs "an agent
     ran, record it"). The discriminator is durable and already on disk: `spawn-gate.sh` appends
-    `[load-gate] REFUSED` / `[disk-gate] REFUSED` / `[land-backlog] REFUSED` to the worker log BEFORE
+    `[load-gate] REFUSED` / `[disk-gate] REFUSED` / `[land-backlog] REFUSED` / `[fork-gate] REFUSED`
+    to the worker log BEFORE
     run_agent returns, and the harness writes `.rc` only after that -- so at the instant the code is
     readable the marker is too. A `pi` that failed on its own writes no gate line.
 
@@ -3596,7 +3652,8 @@ def _confirm(name: str) -> tuple[str, str, str]:
          is still caught, a live pid is positive proof of a launch, and `lost` means the worker
          vanished without a verdict -- neither a launch nor a refusal, and never a row.
 
-    `bound` is the GATE's own axis (`load` | `disk` | `land-backlog`) for a gate refusal, and ""
+    `bound` is the GATE's own axis (`load` | `disk` | `land-backlog` | `fork`) for a gate refusal,
+    and ""
     for every other verdict. It is returned rather than re-derived downstream: the code that
     recognised the refusal is the only one that knows the code it recognised (agent-infra#2291).
 
@@ -3968,8 +4025,13 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # already here; what was missing is that this is NOT the same fact as a transport failure,
         # so the order is counted on the no-room axis instead of `undeliverable`, and the log line
         # carries the gate's own bound -- the value that made the decision.
-        log("spawn %s: %s -- no agent started, nothing consumed; the box has NO ROOM (bound=%s) "
-            "and it clears by itself" % (name, detail, bound or "unknown"))
+        # ⛔ AND THE REMEDY IS THE BOUND'S OWN, NOT "IT CLEARS BY ITSELF" (#2291 review). Load and
+        # land-backlog do clear by themselves; a disk refusal never does; a FORK refusal cannot be
+        # cleared from inside the box at all. One sentence is true of all four only if the AXIS says it.
+        log("spawn %s: %s -- no agent started, nothing consumed; the box's GATE refused the order "
+            "(bound=%s): %s" % (name, detail, bound or "unknown",
+                                GATE_REFUSAL_ACTION.get(bound)
+                                or "wait for the box to drain, then re-run"))
         return False, detail, False, bound
     if verdict == "unconfirmed":
         # Nothing durable says either way. NOT recorded, and that is safe BECAUSE liveness is
@@ -5179,18 +5241,14 @@ def run_pass(args, rubric_note: str = "") -> int:
         if room is not None:
             log("box: room=%s (%s)"
                 % (room["cited"], "measured" if room["read"] else room["why"]))
-        verdict = {EXIT_CLEAN: "OK", EXIT_REFUSING: "REFUSING",
-                   EXIT_UNDELIVERED: "UNDELIVERED", EXIT_NO_CAPACITY: "NO-CAPACITY",
-                   EXIT_CRASH: "CRASH"}.get(code, "UNKNOWN")
-        next_action = {
-            EXIT_CLEAN: "",
-            EXIT_REFUSING: "repair the read/delivery named in `reason` -- nothing was dispatched",
-            EXIT_UNDELIVERED: "repair the transport named in `reason` (the install, the worktree, "
-                              "or the worker liveness read) -- waiting will not clear it",
-            EXIT_NO_CAPACITY: GATE_REFUSAL_ACTION.get(no_room_bound)
-                              or "wait for the box to drain, then re-run",
-        }.get(code, "read `reason`")
-        return record_exit(code, why, verdict=verdict, next_action=next_action,
+        # ⛔ THE BOUND-SPECIFIC NEXT ACTION IS THE ONLY THING THIS PATH ADDS. The verdict WORD and the
+        # per-code default are declared ONCE beside the exit table (`VERDICT_BY_RC` /
+        # `NEXT_ACTION_BY_RC`) and applied by `record_exit` itself, so a non-terminal reader gets a
+        # verdict on EVERY exit rather than on this one alone (#2291 review, P2).
+        next_override = {}
+        if code == EXIT_NO_CAPACITY and GATE_REFUSAL_ACTION.get(no_room_bound):
+            next_override["next_action"] = GATE_REFUSAL_ACTION[no_room_bound]
+        return record_exit(code, why, **next_override,
                            no_room=no_room, no_room_bound=no_room_bound,
                            room=((room or {}).get("record") or ""),
                            room_read=(room or {}).get("read"),

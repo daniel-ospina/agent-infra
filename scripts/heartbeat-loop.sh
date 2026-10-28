@@ -863,9 +863,25 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
       # ⛔ A STALE VERDICT IS NOT `ok` (2026-10-18, review). The whole point of reading a record is
       # to notice when nothing is writing it; printing `ok` from a week-old file reproduces exactly
       # the failure this block was added to end. Bound = two 1200s dispatch intervals.
-      if [ "${_prc:-0}" -eq 6 ]; then
+      # ⛔ AND IT IS FRESHNESS-BOUNDED, NOT MERELY FIRST (agent-infra#2291 review, P1 -- reproduced).
+      # The `rc=6` arm used to sit ABOVE every staleness test, so a dispatcher that DIED in a
+      # NO-CAPACITY pass -- the state a box that filled up is most likely to die in -- printed the
+      # reassuring word `WAITING` for ever, with the age demoted to a parenthetical nothing keys on.
+      # That is the same stale-verdict defect the arm below exists to end, reached by a different
+      # code. `objective.py` checks staleness FIRST and then maps the word, so the two readers
+      # disagreed about one record; the age test here makes them agree.
+      # ⛔ A STALE `rc=6` GETS ITS OWN LINE RATHER THAN THE GENERIC `RED rc=6` (#2291 review). Falling
+      # through to the `-ne 0` arm would still print the word `RED` beside a NO-CAPACITY record, which
+      # reverses the split this change exists for; and `RED UNREPORTED (verdict is STALE)` is the honest
+      # word -- nothing is being REPORTED, whatever the last report said. So the age test comes first,
+      # and the line still names what the last pass said so an operator is not left guessing.
+      if [ "${_prc:-0}" -eq 6 ] && [ "${_page:-0}" -gt 2400 ]; then
+        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) -- the last pass said NO-CAPACITY (rc=6) and nothing has written since :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_page" "$_pwhy" >> "$LOG"
+      elif [ "${_prc:-0}" -eq 6 ]; then
         # ⛔ NOT RED (agent-infra#2291). The box's own gate refused the order and consumed nothing, so
-        # the recorded verdict says NO-CAPACITY and the next action is wait/prune/add capacity. Named
+        # the recorded verdict says NO-CAPACITY and the next action is the bound's remedy (`reason`
+        # carries it: load clears, disk needs a reclaim, fork needs a restart from outside). Named
         # here because this line is where an operator reads the pass, and "RED" would send them to
         # repair an install that is working.
         printf '%s PR-DOCTOR WAITING rc=6 (%ss ago) :: %s\n' \
