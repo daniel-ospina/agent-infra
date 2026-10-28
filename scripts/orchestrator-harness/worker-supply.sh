@@ -364,18 +364,21 @@ ask_status() { # <name> <started-file>
   return 0
 }
 
-# ⛔ ONE WORKTREE, TWO NAMES (#2280). `pr-doctor.worker_name()` is MODE-QUALIFIED (`prd-<tag>-42`
-# in a multi-repo pass) while the WORKTREE is `prd-42` in BOTH modes, so two orders can name one
-# directory -- and this script is the ONLY liveness guard `nonblocking-dispatch.sh` has (it performs
-# none itself). Asking only the order's OWN name is the exact defect `worker_live_for`
-# (pr-doctor.py:3526) was written to remove: the pass reads the other order's LIVE worker as absent,
-# re-offers, and a second agent is spawned into one git index, one branch and one log/.rc/.pid —
-# destroying the live worker's evidence.
+# ⛔ ONE WORKTREE, TWO SPELLINGS (#2280, #2725). `pr-doctor.worker_name()` is ALWAYS repo-qualified
+# (`prd-<tag>-42`) since #2725; `prd-42` is the name written BEFORE that change. The WORKTREE is
+# `prd-42` either way, so two orders can name one directory -- and this script is the ONLY liveness
+# guard `nonblocking-dispatch.sh` has (it performs none itself). Asking only the order's OWN name is
+# the exact defect `worker_live_for` (pr-doctor.py) was written to remove: the pass reads the other
+# order's LIVE worker as absent, re-offers, and a second agent is spawned into one git index, one
+# branch and one log/.rc/.pid — destroying the live worker's evidence.
 #
 # So the question asked here is the DOCTOR's question — is ANY worker alive on this WORKTREE? —
 # answered from the order population (every `$O/bg/<name>.started` recording that worktree) PLUS the
-# doctor's own alias (`prd-<n>`, the single-repo pass's name for the SAME tree) when it differs from
-# ours. An UNANSWERABLE read wins over a later negative: the safe direction is not to spawn.
+# PRE-#2725 spelling (`prd-<n>`), which is transitional: nothing writes it any more, and that arm
+# goes when no box carries a pre-#2725 worker record. An UNANSWERABLE read wins over a later
+# negative: the safe direction is not to spawn.
+# The PRIMARY arm is name-agnostic (it matches the `.started` record's `worktree` field), which is
+# why a repo-qualified order needs no change here.
 # Prints `live:<name>` | `unknown:<name>` | nothing. Runs in its own subshell at the call site, so
 # `ask_status`'s globals (STATUS_KIND/STATUS_WHY) do not leak into the caller's walk.
 worktree_holder() { # <own-name> <worktree>
@@ -393,7 +396,8 @@ worktree_holder() { # <own-name> <worktree>
       UNKNOWN) unk="$gname" ;;
     esac
   done
-  # The alias arm: `prd-<n>` may be live with no `.started` of its own (the earlier single-repo
+  # The alias arm: `prd-<n>` is the PRE-#2725 spelling for the SAME worktree, and it may be live
+  # with no `.started` of its own (the earlier
   # order's record was superseded). Its stamp is passed as the path it would have, so a MISSING
   # stamp cannot manufacture a stale-claim downgrade — an absent stamp leaves `running` as LIVE.
   case "$own" in

@@ -399,16 +399,17 @@ O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_MAX_REFILLS=two MAX_FIX=3 MAX_REVIEW=4 sup
 [ "$(spawns_for prd-31)" = "2" ] && ok "…and the cap HOLDS at the fallback: a third death stops the refills (the typo cannot make the bound inert)" \
                                  || bad "the crash-loop bound was INERT under a non-numeric override: $(spawns_for prd-31) re-offers"
 
-# ── (d2) ONE WORKTREE, TWO NAMES — the guard that stops a second worker into a live tree ────────
+# ── (d2) ONE WORKTREE, TWO SPELLINGS — the guard that stops a second worker into a live tree ─────
 # ⛔ FOUND BY REVIEW (#2896 round 1, P1), and it is the documented #2280 defect one layer down.
-# `pr-doctor.worker_name()` is MODE-QUALIFIED (`prd-<tag>-42` in a multi-repo pass) while the
-# WORKTREE is `prd-42` in BOTH modes, so two orders can name one directory. `worker_live_for`
-# (pr-doctor.py:3526) probes BOTH names for exactly this reason; `nonblocking-dispatch.sh` performs
+# `pr-doctor.worker_name()` is repo-qualified (`prd-<tag>-42`) in EVERY mode since #2725, while the
+# WORKTREE is `prd-42` always — and `prd-42` is still the spelling on boxes that carry a pre-#2725
+# worker record, so two orders can name one directory. `worker_live_for`
+# (pr-doctor.py) probes BOTH for exactly this reason; `nonblocking-dispatch.sh` performs
 # NO liveness check itself, so a supervisor that asks only the order's own name re-offers into a
 # tree whose other-named worker is RUNNING — a second agent on one git index, one branch, and the
 # live worker's log/.rc/.pid destroyed. Each assertion below fails if the guard is removed.
 echo "-- (d2) one worktree, two names: no second worker into a live tree"
-# (i) the ALIAS arm: `prd-42` runs, and the DEAD order is the mode-qualified name for the SAME tree.
+# (i) the ALIAS arm: `prd-42` runs, and the DEAD order is the repo-qualified name for the SAME tree.
 reset
 mkwt "$TMP/wt/prd-42" fix/42
 echo brief > "$TMP/briefs/prd-42.txt"

@@ -253,12 +253,22 @@ OWNERSHIP_NOTE = ""
 # believed it had spent is indistinguishable from a budget it had spent -- `dispatched 0` is what an
 # empty queue looks like, which is exactly the ALIVE/IDLE confusion #2700 exists to remove.
 #
-# ⚠️ THIS SCOPES THE **REGISTER**, NOT THE WORKER IDENTITY. `dispatch()` still names a worker
-# `prd-<N>` under the box-global `$O/bg`, so two repos on one box still share one worker identity --
-# repo B's PR #N is skipped as "still running" because repo A's worker holds it, and a gate refusal
-# in repo A's `.rc` can be read as repo B's verdict. Same "keyed by PR number" class, one layer
-# down, and NOT closed here: filed as #2725 with the two measured outcomes. Do not read this comment
-# as saying the class is gone.
+# ⛔ THE WORKER IDENTITY IS SCOPED THE SAME WAY, AND THROUGH THE SAME FUNCTION (#2725, measured
+# 2026-10-24). The register fix left the thing it records a row ABOUT keyed by PR number alone:
+# `worker_name()` carried the repo tag only in `--all-repos` mode, so the DEPLOYED shape (one
+# pr-doctor per repo, per #2700's own evidence) wrote `prd-<N>` into the box-global `$O/bg`. Two
+# repos on one box therefore shared `.log`/`.rc`/`.pid`/`.started` and one liveness answer: repo B's
+# PR #N was skipped as "still running" behind repo A's worker, and repo A's gate refusal in `.rc` was
+# read as repo B's verdict. The tag now comes from `repo_tag()`, the SAME derivation that names the
+# register -- never a second slug function -- and the residual is the register's own: `repo_tag` is
+# lossy (`acme/tools-api` and `acme-tools/api` flatten alike), and `set_tag_collisions()` can only
+# refuse a collision it can SEE, i.e. two repos in one `--all-repos` set. Two separate single-repo
+# passes for such a pair still share one worker name.
+#
+# ⚠️ AND THE ROOT IS STILL BOX-GLOBAL: `$O/bg` is shared deliberately, because `$O` also carries the
+# DEPLOYED dispatcher/spawn-gate/brief-gate copies, the supply service's ledger and its single-
+# instance lock. A per-repo `$O` would fork the harness install to fix a key, which is why the name
+# carries the repo instead.
 #
 # ⛔ THE ORDER IS NO LONGER LOAD-BEARING, AND THAT IS THE RECONCILIATION (see the block above): the
 # register is named from the RESOLVED slug inside `apply_repo()`, not from a module-level `REPO`,
@@ -353,8 +363,10 @@ LAST_PASS: dict = {}
 # pass too (#2700), so `canonical_paths()` re-derives it from the resolved slug rather than
 # restoring this tuple's first element -- see the note there.
 _CANONICAL = (STATE, STATUS, LOG)
-# Non-empty only in `--all-repos` mode: prefixes the per-repo worker name so two repos' PR #42
-# cannot share one `$O/bg/prd-42.*` record (and one worktree slot's liveness answer).
+# The repo tag EVERY worker name carries (`repo_tag(slug) + "-"`), re-derived from the resolved
+# slug and NEVER mode-dependent (#2725): `$O/bg` is box-global, so with a bare `prd-<N>` two repos'
+# PR #42 shared one `.rc`/`.pid`/`.log` record and one liveness answer. Empty only while no repo is
+# resolved (the same window in which `REPO` is empty).
 _WORKER_TAG = ""
 
 
@@ -743,14 +755,19 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
         # so every repo in a set appended to the ONE canonical file while the README promised a
         # per-repo one.
         LOG_BASENAME = "pr-doctor.%s.log" % tag
-        _WORKER_TAG = tag + "-"
     else:
         # ⛔ A SINGLE-REPO PASS TOUCHES NO STATUS/LOG. Those ARE the canonical files, so re-deriving
         # them here would overwrite a caller's seam (`STATE_DIR`, `STATUS`) with a second opinion
         # about where they live -- the same "two authorities for one path" defect `--status` was
         # just given a single reader for.
         LOG_BASENAME = "pr-doctor.log"
-        _WORKER_TAG = ""
+    # ⛔ THE WORKER TAG IS SET FOR **BOTH** MODES (#2725). It used to move with the STATUS/LOG pair
+    # above, i.e. only in `--all-repos`, which left the deployed one-repo-per-pass shape writing the
+    # repo-blind `prd-<N>` into the box-global `$O/bg` -- so two repos' PR #N were one worker (one
+    # `.rc` read answered for the wrong PR, and one live worker blocked the other repo's spawn). The
+    # tag is the same `repo_tag()` the register's file name uses; a second slug function here is how
+    # the name and the register would come to disagree about which repo they describe.
+    _WORKER_TAG = repo_tag(slug) + "-"
     # ⛔ THE AMBIENT SELECTOR IS PINNED TO THE RESOLVED REPO, IN THAT DIRECTION ONLY. Inheriting it
     # is the #2235 hazard; OVERRIDING it with the repo evidence already selected is safe, and it is
     # what stops a worker this pass spawns from having its own rail answer about another repo.
@@ -775,12 +792,27 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
 
 
 def worker_name(number) -> str:
-    """The worker's name for a PR, qualified by the repo only when more than one is in scope.
+    """The worker's name for a PR, ALWAYS qualified by the repo it belongs to.
 
-    Two repos can both have a PR #42, and the worker name keys `$O/bg/<name>.*` (liveness, `.rc`,
-    the log). A single-repo pass keeps the historical `prd-<n>` -- the fleet's readers and
-    `--status` rows are pinned to it -- while a multi-repo pass prefixes the repo so one repo's
-    live worker cannot be read as the other's.
+    ⛔ THE REPO IS IN THE NAME IN EVERY MODE (#2725, measured). `$O/bg/<name>.*` is BOX-GLOBAL --
+    one directory per machine -- so a bare `prd-<N>` made two repos' PR #N ONE worker: repo B's
+    PR #N was skipped as "still running" behind repo A's worker, and a gate refusal in repo A's
+    `.rc` was read as repo B's verdict (both silent; the counter that reports them,
+    `stalled["worker-running"]`, is what a healthy box reports too). The tag is `repo_tag()` -- the
+    SAME derivation that names the register -- so the two records describe one repo in one spelling.
+
+    ⚠️ THE TWO RESIDUALS, STATED RATHER THAN HIDDEN:
+      * `repo_tag` is lossy (`foo-bar/baz` and `foo/bar-baz` flatten alike), so two repos can share
+        a tag. `set_tag_collisions()` refuses that for a `--all-repos` SET, which is the only place
+        it can see both; two separate single-repo passes for such a pair still share one name.
+        That is the register's residual too, documented there -- not claimed away here.
+      * `prd-<N>` (no tag) is the spelling written before this change. Readers still probe it
+        (`worker_live_for`), and that alias is repo-AMBIGUOUS by construction: it is transitional,
+        bounded by the pre-change workers' own wall-clock cap, and it fails in the SAFE direction
+        (a stale legacy record refuses a spawn; it never causes a duplicate one).
+
+    The WORKTREE is NOT part of this: it stays `prd-<n>` in every mode because it lives inside the
+    repo's own checkout (`<repo>/.worktrees/prd-<n>`), where the directory already scopes it.
     """
     return "prd-%s%s" % (_WORKER_TAG, number)
 
@@ -1215,16 +1247,16 @@ def capacity() -> dict:
 # resolved twice). An empty register, an unreadable pid file, a row with no `worker` at all -- all
 # read ALIVE.
 #
-# ⚠️ AND THE NAME IS NOT AN IDENTITY. This file's own `dispatch()` writes the SHORT worker name
-# (`prd-2035`, `name = "prd-%d" % n`) under a box-global `$O/bg`, but the repo-scoped form
-# (`prd-agent-infra-2035.pid`) is what the MULTI-REPO launcher writes (`worker_name()` in
-# `fix/pr-doctor-repo-resolution`, #2280) and what the Mac's deployed copy wrote in the measurement
-# above (`spawn prd-agent-infra-2027`). A doctor in that mode writes scoped pid files while a
-# register carried over from single-repo mode still holds short names -- and an exact-name lookup
-# then finds NOTHING, where "nothing found => assume alive" (the safe direction) faithfully keeps
-# every ghost. So the TRAILING NUMBER is matched as well. That over-matches deliberately: another
-# repo's LIVE worker with the same PR number keeps a slot (throughput), and it never frees one (a
-# duplicate dispatch).
+# ⚠️ AND THE NAME IS AN IDENTITY NOW, BUT NOT AN INJECTIVE ONE (#2725). `dispatch()` writes ONE
+# spelling -- `prd-<repo_tag>-<N>` -- under a box-global `$O/bg`; `prd-<N>` (no tag) is what the
+# PRE-#2725 single-repo pass wrote, and `prd-<other>-<N>` is what another repo's doctor writes on the
+# same box. A register carried over from the old shape holds short names, so an exact-name lookup
+# alone would find NOTHING for a row that predates the change -- and "nothing found => assume alive"
+# (the safe direction) faithfully keeps every ghost. `_worker_pid_files()` therefore computes the
+# OTHER spelling of the SAME PR (never a wildcard, see there), which over-matches only against the
+# legacy repo-blind name. That over-match is deliberate and transitional: another repo's LIVE legacy
+# worker with the same PR number keeps a slot (throughput), and it never frees one (a duplicate
+# dispatch).
 #
 # ⛔ AND THE SELF-REPORT NEEDS THREE STATES, NOT TWO (#2746 review). `alive` used to mean "not provably
 # gone", which counts a row with no `worker`, a row whose pid file was pruned, and a pid file we
@@ -1279,12 +1311,23 @@ def _read_pid(path: str):
 
 
 def _worker_pid_files(worker: str) -> list:
-    """The EXISTING pid files under `$O/bg` that could belong to `worker`.
+    """The EXISTING pid files under `$O/bg` that could belong to `worker` -- at most TWO.
 
-    Two shapes, because the row and the launcher disagree about the name (see the block above): the
-    exact one (`prd-2035.pid`) and any repo-scoped one whose TRAILING NUMBER is the same
-    (`bg/*-2035.pid`, i.e. `prd-agent-infra-2035.pid`). Leading zeros are tolerated; a PREFIX is not,
-    because `-20350.pid` is PR 20350 and must never answer for PR 2035.
+    ⛔ NO WILDCARD, BECAUSE THE NUMBERS COLLIDE (#2725). This used to add EVERY `bg/*-0*<n>.pid`
+    whose TRAILING NUMBER matched, which was right while the only qualified names came from the
+    `--all-repos` path: it bridged a short row to a scoped artifact. Once EVERY name carries its
+    repo (see `worker_name`), that wildcard answers repo B's row `prd-<B>-42` with repo A's LIVE
+    `prd-<A>-42.pid` -- the identical "keyed by the PR number" collision #2725 removes at the
+    worker, one layer down, in the budget path, where it silently holds a real MAX_FIX slot. So the
+    two spellings of ONE PR's worker are COMPUTED from the name, never globbed:
+
+      * a row written since #2725 is qualified -> the other spelling is the legacy `prd-<n>`;
+      * a row written before it is short        -> the other spelling is THIS repo's qualified name.
+
+    Ledger zeros are tolerated (`prd-<n>` and `prd-<tag>-0042` are both #42); a PREFIX is not,
+    because `-20350.pid` is PR 20350 and must never answer for PR 2035 -- and `int()` is bounded
+    (`[0-9]{1,10}`), because it raises ValueError past 4300 characters, which would abort the pass
+    from inside the counter (the register is read back from JSON, so the row is not necessarily ours).
 
     `isfile` rather than `exists`: a directory at the pid path is handled by the read, but a FIFO is
     not -- `open()` on one BLOCKS with no writer, which would hang the pass on an artifact instead
@@ -1292,27 +1335,23 @@ def _worker_pid_files(worker: str) -> list:
 
     Nothing here decides anything: an empty list is "no evidence", not "gone".
     """
+    paths = []
     exact = bg_path(worker, "pid")
-    paths = [exact] if os.path.isfile(exact) else []
-    # ⛔ BOUNDED, LIKE EVERY OTHER DIGIT PARSE IN THIS FILE: `int()` raises ValueError past
-    # 4300 characters (a ValueError, not an OSError -- it would abort the pass from inside the
-    # counter, the same class as the `UnicodeDecodeError` fixed in `_read_pid`). `dispatch()` writes
-    # `prd-<n>`, but the register is read back from JSON, so the row is not necessarily ours.
+    if os.path.isfile(exact):
+        paths.append(exact)
     m = re.search(r"([0-9]{1,10})\Z", worker)
     if not m:
         return paths
+    head = worker[:m.start()]
     n = int(m.group(1))
-    try:
-        names = os.listdir(os.path.join(ORCH_DIR, "bg"))
-    except OSError:
-        return paths          # an unreadable directory adds no evidence; the exact file still stands
-    for f in names:
-        mm = re.match(r".*-0*([0-9]+)\.pid\Z", f)
-        if not mm or int(mm.group(1)) != n:
-            continue
-        p = os.path.join(ORCH_DIR, "bg", f)
-        if p not in paths and os.path.isfile(p):
-            paths.append(p)
+    # `prd-<n>` (with or without the `prd-` prefix) is the PRE-#2725 short spelling, so the other
+    # one is THIS repo's qualified name; anything else is qualified for some repo, so the only other
+    # spelling that could name this PR's worker is the legacy one. A foreign repo's qualified name is
+    # NEVER considered: answering with it is the defect #2725 removes.
+    other = worker_name(n) if head in ("", "prd-") else "prd-%d" % n
+    p = bg_path(other, "pid") if other != worker else ""
+    if p and p not in paths and os.path.isfile(p):
+        paths.append(p)
     return paths
 
 
@@ -3455,13 +3494,26 @@ def worker_live(name: str):
         return False
     if st != "running":
         return None
-    try:
-        age = time.time() - os.path.getmtime(bg_path(name, "started"))
-    except OSError:
-        return True                      # nothing to bound it with: believe the pid
+    # ⛔ THE STAMP BOUND IS NOT OPTIONAL, AND IT HAS A FALLBACK (#2725). A `running` answer comes
+    # from `kill -0` on a `.pid` file nothing prunes, so a worker SIGKILLed before it wrote `.rc`
+    # leaves one, and a recycled pid then reads `running` for ever. `.started` is the harness's own
+    # spawn record and is the bound of choice; an OLDER dispatcher (the `bg-dispatch.sh` overlay)
+    # wrote no stamp, and the previous answer -- "believe the pid, nothing to bound it with" -- made
+    # such a file block its PR PERMANENTLY. That was tolerable while the name was one repo's own; it
+    # is not, now that every repo probes the legacy `prd-<n>` alias, where ONE stale pid file would
+    # block PR #N in EVERY repo on the box. The `.pid` file is written once, at spawn, so its mtime
+    # bounds the claim just as well: a live worker's pid file is younger than its own cap.
+    for suffix in ("started", "pid"):
+        try:
+            age = time.time() - os.path.getmtime(bg_path(name, suffix))
+            break
+        except OSError:
+            continue
+    else:
+        return True                  # no artifact to bound it with at all: believe the pid
     if age > SPAWN_TIMEOUT_S + WORKER_STALE_SLACK_S:
-        log("worker %s claims pid running but its start stamp is %.0f min old (cap=%ds + %ds) -- "
-            "a recycled pid, treating it as gone"
+        log("worker %s claims pid running but its own spawn artifact is %.0f min old "
+            "(cap=%ds + %ds) -- a recycled pid, treating it as gone"
             % (name, age / 60, SPAWN_TIMEOUT_S, WORKER_STALE_SLACK_S))
         return False
     return True
@@ -3484,6 +3536,14 @@ def void_refused_rows(st: dict) -> list[str]:
 
     The gate marker (not the bare code) is what confirms the refusal -- see `gate_refused`, which
     also keeps this from dropping the row of a worker that RAN and exited 75 on its own.
+
+    ⚠️ A ROW WRITTEN BEFORE #2725 CARRIES THE REPO-BLIND NAME (#2725). Its `worker` is `prd-<n>`, so
+    `bg_path()` resolves the pre-change artifact -- which on a multi-repo box could be ANOTHER
+    repo's, i.e. another repo's gate refusal could void this row. It is bounded, not silent: rows
+    stop being eligible at `STALE_DISPATCH_S` (90 min), and the legacy spelling is transitional
+    (nothing writes it any more), so the exposure ends with the pre-change rows. Stated here rather
+    than "fixed" because the row's name is durable content this function may not rewrite: guessing
+    which repo a legacy row meant is the very ambiguity the change removes.
     """
     voided = []
     for k in list(st):
@@ -3595,20 +3655,27 @@ def set_rubric_note(entries: list[str]) -> str:
 
 
 def worker_live_for(number) -> object:
-    """Liveness of ANY worker that would use this PR's worktree, whatever mode named it.
+    """Liveness of ANY worker that would use this PR's worktree, whatever name it was given.
 
-    ⛔ ONE WORKTREE, TWO NAMES (#2280 review cycle 3, P2). `worker_name()` is MODE-QUALIFIED
-    (`prd-<tag>-42` in a set) while the worktree is `prd-42` in BOTH modes, so a single-repo pass and
-    an `--all-repos` pass over the SAME repo can look at one directory while calling it two things.
-    Probing only this mode's name reports a live worker as ABSENT; the pass then adopts that
-    worktree and spawns a second agent into it -- two agents, one git index, one branch. So the
-    question for a PR is asked of every name that resolves to its worktree, and an UNANSWERABLE
-    reading (`None`) wins over a negative one: the safe direction is not to spawn.
+    ⛔ ONE WORKTREE, TWO SPELLINGS (#2280 review cycle 3, P2; #2725). `worker_name()` is now ALWAYS
+    repo-qualified (`prd-<tag>-42`), while `prd-42` is the name written before that change -- and the
+    WORKTREE is `prd-42` in BOTH. A pass that probes only its own spelling reports a live worker as
+    ABSENT; it then adopts that worktree and spawns a second agent into it -- two agents, one git
+    index, one branch, and the second spawn `rm`s the first's log/.rc/.pid. So the question for a PR
+    is asked of every name that resolves to its worktree, and an UNANSWERABLE reading (`None`) wins
+    over a negative one: the safe direction is not to spawn.
+
+    ⚠️ THE LEGACY ARM IS REPO-AMBIGUOUS, DELIBERATELY. `prd-42` says nothing about which repo's
+    worker wrote it, so on a multi-repo box it can refuse a spawn for the wrong repo's PR #42. That
+    is the SAFE direction (a refused spawn is a visible 90-min cooldown; the opposite error is two
+    agents in one directory) and it is transitional: nothing writes `prd-<n>` any more, so the alias
+    empties as pre-change workers finish, and a stale `.pid` can no longer hold it for ever (see the
+    stamp bound in `worker_live`). Remove this arm once no box carries a pre-#2725 worker record.
     """
     names = [worker_name(number)]
     plain = "prd-%s" % number
     if plain not in names:
-        names.append(plain)              # the single-repo pass's name for the SAME worktree
+        names.append(plain)              # the PRE-#2725 spelling for the SAME worktree
     for nm in names:
         live = worker_live(nm)
         if live is None:                  # unanswerable: do not spawn
@@ -4018,6 +4085,28 @@ def _status_age_note() -> str:
             "repo field%s." % (STATE, age, pointer))
 
 
+# The `worker=` column's width, and the property the width may NOT break (#2725). Worker names are
+# repo-qualified now, so their length is `prd-` + owner + repo + PR number -- bounded only by
+# GitHub's own limits (owner <=39, repo <=100), i.e. ~150 characters. No fixed width is future-proof,
+# and the row's columns after this one (`at`, `kind=`) must stay aligned across rows, so the width is
+# fixed and the OVERFLOW IS CUT FROM THE LEFT: the trailing `-<n>` is the part an operator acts on,
+# and it is the part a right-cut would eat first (`prd-daniel-o` names nothing and no PR).
+_WORKER_COL = 34
+
+
+def _worker_column(name: str) -> str:
+    """`name`, shortened from the LEFT so the PR number stays visible (`…-2027`).
+
+    Total: never raises. Nothing in the tree parses this column (it is the operator's view of a
+    register row -- the row's own key is the PR number), so the only requirement is that the tail
+    survives; a legacy short name is printed unchanged.
+    """
+    name = str(name or "")
+    if len(name) <= _WORKER_COL:
+        return name
+    return "…" + name[-(_WORKER_COL - 1):]
+
+
 def _print_state(path: str, label: str = "") -> None:
     """One state file's rows, printed exactly as `--status` always printed them.
 
@@ -4057,8 +4146,8 @@ def _print_state(path: str, label: str = "") -> None:
         # it always did -- and a row that exists because the PR was REFUSED can no longer be
         # read as "a worker was dispatched for this".
         kind = v.get("kind") or "spawn"
-        print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
-                                                (v.get("worker") or v.get("lane") or "?")[:12],
+        print("%-8s %-11s worker=%-34s %s%s" % (k, v.get("action"),
+                                                _worker_column(v.get("worker") or v.get("lane") or "?"),
                                                 v.get("at"),
                                                 "" if kind == "spawn" else "  kind=" + kind))
 
@@ -4170,7 +4259,12 @@ def canonical_paths() -> None:
     STATE = _state_file(REPO) if REPO else _CANONICAL[0]
     STATUS, LOG = _CANONICAL[1], _CANONICAL[2]
     LOG_BASENAME = "pr-doctor.log"
-    _WORKER_TAG = ""
+    # ⛔ THE WORKER TAG IS RE-DERIVED TOO, AND GUARDED, FOR THE SAME REASON `STATE` IS (#2725).
+    # It is not a canonical PATH -- it belongs to the repo this pass grades -- so `--all-repos`
+    # restoring it to "" would put the AGGREGATE's crash record back on a repo-blind name, and
+    # re-deriving it from an EMPTY `REPO` (`--status` never sets one, and its crash handler comes
+    # through here) would set the tag to a bare "-", naming workers `prd--42`.
+    _WORKER_TAG = (repo_tag(REPO) + "-") if REPO else ""
 
 
 def clear_repo_target() -> None:

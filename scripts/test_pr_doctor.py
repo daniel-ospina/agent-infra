@@ -127,6 +127,16 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # Point the plist at a path that cannot exist, so a sandbox that happens to have the
     # orchestrator installed does not leak its values into a unit test.
     monkeypatch.setattr(pr, "ORCH_PLIST", "/nonexistent/pr-doctor-test/loop.plist", raising=False)
+    # ⛔ AND THE REPO SCOPING OF THE PROCESS, BECAUSE IT LEAKS THE SAME WAY (#2725). `REPO` is a
+    # module global a `apply_repo()` leaves behind, so ONE test that grades a repo would decide what
+    # every later test considers "this repo" -- reset to "no repo resolved", the state every test
+    # that does not name one is written against. `REPO` stays EMPTY deliberately (a resolved slug
+    # would put `contract_note()` in play for the dispatch tests, which grade no repo), while the
+    # WORKER TAG carries a realistic production value: since #2725 every worker name is
+    # repo-qualified, so the suite must exercise THAT shape -- a test that expects the legacy
+    # `prd-<n>` spelling says so by patching the tag to "".
+    monkeypatch.setattr(pr, "REPO", "", raising=False)
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-agent-infra-", raising=False)
     # ⛔ `_INHERITED_GH_REPO` IS THE PROCESS'S INHERITANCE, captured on the first pin. One test
     # process runs many "processes", so it is reset here for the same reason every other global is:
     # an earlier test's env would become this one's inheritance (measured: the ambient-GH_REPO test
@@ -326,33 +336,50 @@ def test_a_finished_workers_row_does_not_hold_a_class_slot(tmp_path, monkeypatch
 def test_a_repo_scoped_pid_file_is_matched_by_the_short_row_name(tmp_path, monkeypatch):
     """THE TRAP, and the whole trick of this fix.
 
-    The state row stores the SHORT worker name (`prd-2035`) while the launcher writes a REPO-SCOPED
-    pid file (`prd-agent-infra-2035.pid`), the partitioning that stopped two doctors sharing one
-    register (#2700/#2725). An exact-name lookup finds NOTHING, and "nothing found => assume alive"
-    (the safe direction) then keeps every ghost alive -- which is why the first version of this fix
-    changed nothing at all. The trailing NUMBER is matched too.
+    A register carried over from before #2725 stores the SHORT worker name (`prd-2035`) while the
+    launcher now writes the repo-scoped file (`prd-daniel-ospina-agent-infra-2035.pid`). An
+    exact-name lookup finds NOTHING, and "nothing found => assume alive" (the safe direction) then
+    keeps every ghost alive -- which is why the first version of this fix changed nothing at all.
+    So the OTHER spelling of the same PR is computed from the name (#2725 replaced the trailing-
+    number wildcard with it: the wildcard answered with ANOTHER repo's live file for the same
+    number, which held a real budget slot).
     """
     now = 1_000_000.0
     dead = _a_dead_pid()
     bg = tmp_path / "bg"
     bg.mkdir(parents=True)
     monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-agent-infra-")
     cap = {"max_fix": 1, "max_review": 1}
     st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+    scoped = pr.worker_name(2035)
+    assert scoped == "prd-daniel-ospina-agent-infra-2035", scoped
 
-    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    (bg / (scoped + ".pid")).write_text("%d\n" % dead)
     assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1, \
         "a repo-scoped pid file proves the short-named row's worker gone"
 
-    # …and the same file, LIVE, holds the slot: over-matching must never free a running worker.
-    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())
+    # …and the same file, LIVE, holds the slot: the bridge must never free a running worker.
+    (bg / (scoped + ".pid")).write_text("%d\n" % os.getpid())
     assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
 
     # A PREFIX is a different PR: 20350's dead worker must not free 2035's slot.
-    (bg / "prd-agent-infra-2035.pid").unlink()
-    (bg / "prd-20350.pid").write_text("%d\n" % dead)
+    (bg / (scoped + ".pid")).unlink()
+    (bg / (pr.worker_name(20350) + ".pid")).write_text("%d\n" % dead)
     assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0, \
         "'-20350.pid' answers for PR 20350, never for PR 2035"
+
+    # ⛔ AND A THIRD SPELLING IS NOT A SPELLING OF THIS PR (#2725, the defect this closes). Another
+    # repo's qualified file for the SAME number must not answer for ours: the trailing-number
+    # wildcard this replaced matched exactly that file, so repo A's LIVE worker for #2035 held repo
+    # B's budget slot -- the issue's headline symptom, in the budget path.
+    (bg / (pr.worker_name(20350) + ".pid")).unlink()
+    (bg / "prd-2035.pid").write_text("%d\n" % dead)                        # ours: provably gone
+    (bg / "prd-daniel-ospina-tortoise-2035.pid").write_text("%d\n" % os.getpid())  # ANOTHER repo: live
+    assert pr._worker_pid_files("prd-2035") == [pr.bg_path("prd-2035", "pid")], \
+        "the candidate set must be the TWO spellings of this PR, never another repo's file"
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1, \
+        "another repo's live worker for #2035 must not hold THIS repo's budget slot"
 
 
 def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
@@ -468,24 +495,26 @@ def test_one_live_candidate_holds_the_slot_even_when_a_sibling_pid_file_is_dead(
     bg = tmp_path / "bg"
     bg.mkdir(parents=True)
     monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-agent-infra-")
     cap = {"max_fix": 1, "max_review": 1}
     st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+    scoped = pr.worker_name(2035)
 
     (bg / "prd-2035.pid").write_text("%d\n" % dead)                  # exact name: dead
-    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())  # scoped: LIVE
+    (bg / (scoped + ".pid")).write_text("%d\n" % os.getpid())          # scoped: LIVE
     b = pr.pass_budgets(st, cap, now_epoch=now)
     assert (b["fix"], b["alive"]) == (0, 1), \
         "a LIVE sibling pid file must hold the slot even though the exact-named one is dead: %r" % (b,)
 
     (bg / "prd-2035.pid").write_text("%d\n" % os.getpid())            # exact name: LIVE
-    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)       # scoped: dead
+    (bg / (scoped + ".pid")).write_text("%d\n" % dead)                # scoped: dead
     b = pr.pass_budgets(st, cap, now_epoch=now)
     assert (b["fix"], b["alive"]) == (0, 1), \
         "…and in the other order: %r" % (b,)
 
     # One unreadable sibling is NOT a free slot either: it could name the live worker.
     (bg / "prd-2035.pid").write_text("not-a-pid\n")
-    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    (bg / (scoped + ".pid")).write_text("%d\n" % dead)
     b = pr.pass_budgets(st, cap, now_epoch=now)
     assert (b["fix"], b["alive"], b["unknown"]) == (0, 0, 1), \
         "unreadable + dead must hold the slot as UNKNOWN, never drop it: %r" % (b,)
@@ -539,8 +568,9 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: ("/wt/prd-9", ""))
     monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)   # no .rc will appear; do not wait
-    # two pre-spawn liveness probes (both "not live"), then the post-window confirmation
-    statuses = iter(["lost", "lost", "running"])
+    # Two pre-spawn liveness probes (each asks BOTH spellings: the qualified name and the legacy
+    # `prd-<n>` alias), then the post-window confirmation.
+    statuses = iter(["lost"] * 4 + ["running"])
     monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
 
     def fake_sh_err(argv, timeout=180, cwd=None, env=None, capture=True):
@@ -1708,7 +1738,7 @@ def test_the_action_for_a_free_workspace_is_a_BACKGROUND_SPAWN_not_a_workspace_s
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (fleet_wt, ""))
     monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
-    statuses = iter(["lost", "lost", "running"])
+    statuses = iter(["lost"] * 4 + ["running"])   # both spellings, twice, then the confirmation
     monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
     calls = []
     monkeypatch.setattr(pr, "sh_err",
@@ -1954,14 +1984,15 @@ def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, t
     monkeypatch.setenv("MAX_REVIEW", "12")
     assert pr.main() == 0
     row = saved.get("5") or {}
-    assert row.get("head") == "a" * 40 and row.get("worker") == "prd-5", \
+    assert row.get("head") == "a" * 40 and row.get("worker") == pr.worker_name(5), \
         "a launched worker must consume a state row / cooldown: %r" % (saved,)
     assert row.get("kind") == "spawn", "a launched worker's row must be a spawn row"
 
 
-def _artifacts(d):
-    return {s: (d / "bg" / ("prd-7." + s)).read_bytes()
-            for s in ("pid", "log", "started", "rc") if (d / "bg" / ("prd-7." + s)).exists()}
+def _artifacts(d, name=None):
+    name = name or pr.worker_name(7)
+    return {s: (d / "bg" / (name + "." + s)).read_bytes()
+            for s in ("pid", "log", "started", "rc") if (d / "bg" / (name + "." + s)).exists()}
 
 
 def test_a_live_worker_is_never_spawned_over(monkeypatch, tmp_path):
@@ -2256,15 +2287,17 @@ def test_a_refusal_split_across_two_writes_is_finally_read(monkeypatch, tmp_path
     """
     d, wt = _orch(tmp_path, "run_agent() { return 0; }\n")
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
-    rc = d / "bg" / "prd-8.rc"
+    name = pr.worker_name(8)
+    rc = d / "bg" / (name + ".rc")
     rc.parent.mkdir(parents=True, exist_ok=True)
     rc.write_text("7")                          # the first chunk of `echo 75` has landed
-    (d / "bg" / "prd-8.log").write_text("[load-gate] REFUSED bg prd-8: load=99 >= max_load=40\n")
+    (d / "bg" / (name + ".log")).write_text(
+        "[load-gate] REFUSED bg %s: load=99 >= max_load=40\n" % name)
     threading.Timer(0.4, lambda: rc.write_text("75\n")).start()
 
     def fake_sh_err(argv, timeout=180, cwd=None, env=None, capture=True):
         if "--status" in argv:
-            return "prd-8 lost (no exit status recorded and pid is gone)\n", "", 0
+            return "%s lost (no exit status recorded and pid is gone)\n" % argv[3], "", 0
         return "", "", 0
 
     monkeypatch.setattr(pr, "sh_err", fake_sh_err)
@@ -5599,17 +5632,201 @@ def test_the_classifier_follows_the_doctor_to_the_same_repo(monkeypatch, tmp_pat
 
 
 def test_multi_repo_worker_names_cannot_collide(monkeypatch, tmp_path):
-    """Two repos can both have a PR #42; the worker name keys `$O/bg/<name>.*` on this machine."""
+    """Two repos can both have a PR #42; the worker name keys `$O/bg/<name>.*` on this machine.
+
+    ⛔ THE REPO IS IN THE NAME IN EVERY MODE (#2725, review of #2700). It used to be there only in
+    an `--all-repos` set, which left the DEPLOYED shape -- one pr-doctor per repo, per #2700's own
+    evidence -- writing the repo-blind `prd-42` that collides on a box running two repos. Both
+    modes are asserted, because the collision is a property of the FILE, not of the mode.
+    """
     try:
         pr.apply_repo(_REPO_A, "")
-        assert pr.worker_name(42) == "prd-42", "a single-repo pass keeps the historical name"
+        assert pr.worker_name(42) == "prd-daniel-ospina-agent-infra-42", \
+            "a ONE-REPO pass must qualify the worker name too -- $O/bg is box-global"
         pr.apply_repo(_REPO_A, "", multi=True)
-        assert pr.worker_name(42) == "prd-daniel-ospina-agent-infra-42"
+        assert pr.worker_name(42) == "prd-daniel-ospina-agent-infra-42", \
+            "the same repo must name its worker the same way in both modes"
         pr.apply_repo(_REPO_B, "", multi=True)
         assert pr.worker_name(42) != "prd-daniel-ospina-agent-infra-42"
+        pr.apply_repo(_REPO_B, "")
+        assert pr.worker_name(42) == "prd-daniel-ospina-tortoise-42"
     finally:
         pr.canonical_paths()
-        pr._WORKER_TAG = ""
+
+
+# ── 11b. THE WORKER IDENTITY IS REPO-SCOPED (#2725) ──────────────────────────────────────────
+#
+# `$O/bg` is BOX-GLOBAL, so the worker NAME is all that can keep two repos' PR #N apart. Measured
+# on the pre-change tree: `worker_name()` dropped the repo tag unless the pass was `--all-repos`,
+# which the DEPLOYED shape (one pr-doctor per repo, per #2700's own evidence) never is -- so both
+# repos' PR #1234 derived the SAME four artifact paths, repo A's live worker made repo B answer
+# "still running -- one worker per PR", and repo A's gate refusal in `.rc` was read as repo B's
+# verdict. Each test below fails if the tag goes back to being mode-dependent.
+
+def test_two_repos_do_not_share_a_worker_identity(monkeypatch, tmp_path):
+    """THE DEFECT, as one assertion: repo A's PR #N and repo B's PR #N are the same worker."""
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    try:
+        pr.apply_repo(_REPO_A, "")
+        name_a = pr.worker_name(1234)
+        paths_a = [pr.bg_path(name_a, s) for s in ("log", "rc", "pid", "started")]
+        pr.apply_repo(_REPO_B, "")
+        name_b = pr.worker_name(1234)
+        paths_b = [pr.bg_path(name_b, s) for s in ("log", "rc", "pid", "started")]
+    finally:
+        pr.canonical_paths()
+    assert name_a != name_b, "two repos' PR #1234 must not be one worker: %r" % (name_a,)
+    assert not set(paths_a) & set(paths_b), \
+        "the box-global $O/bg artifacts must not be shared: %r" % (paths_a,)
+    assert name_a == "prd-daniel-ospina-agent-infra-1234"
+    assert name_b == "prd-daniel-ospina-tortoise-1234"
+
+
+def test_a_worker_live_under_ANOTHER_repo_does_not_block_this_repos_spawn(monkeypatch, tmp_path):
+    """Symptom 1: repo B SKIPPED its own PR because repo A's worker held the name.
+
+    Both names come from the PRODUCTION path (`apply_repo`, which is what sets the tag), and repo
+    A's worker is marked live at the name repo A would actually have written. Repo B must not
+    probe it. Answering `True` puts the PR in `stalled["worker-running"]` with no cooldown and no
+    escape -- a number a healthy box reports too, so the pass cannot tell the two apart.
+    """
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    try:
+        pr.apply_repo(_REPO_B, "")
+        name_b = pr.worker_name(1234)
+        pr.apply_repo(_REPO_A, "")
+        name_a = pr.worker_name(1234)
+        asked = []
+
+        def _status(name):
+            asked.append(name)
+            return "running" if name == name_a else "lost"     # repo A's worker is LIVE
+
+        monkeypatch.setattr(pr, "worker_status", _status)
+        pr.apply_repo(_REPO_B, "")          # …now repo B's pass asks about ITS #1234
+        assert name_a != name_b, "the two repos must name their worker differently: %r" % (name_a,)
+        assert pr.worker_live_for(1234) is False, \
+            "repo A's live worker must not read as repo B's in-flight work"
+        assert name_a not in asked, \
+            "another repo's worker name is not a spelling of this PR's worker: %r" % (asked,)
+        # …and the ASK is not vacuous: our own name IS consulted, and a live worker under it blocks.
+        assert name_b in asked, asked
+        monkeypatch.setattr(pr, "worker_status", lambda n: "running" if n == name_b else "lost")
+        assert pr.worker_live_for(1234) is True
+    finally:
+        pr.canonical_paths()
+
+
+def test_a_LIVE_LEGACY_prd_n_worker_still_blocks_a_spawn(monkeypatch, tmp_path):
+    """BACK-COMPAT: a worker started before #2725 is named `prd-<n>`, and must still be seen.
+
+    Missing it would spawn a second agent into the live worker's worktree -- two processes on one
+    git index and one branch, with the spawn `rm`-ing the first's log/.rc/.pid. The alias is
+    repo-ambiguous BY CONSTRUCTION, and that is accepted: it refuses a spawn (visible, 90-min
+    cooldown) where the opposite error destroys evidence.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-agent-infra-")
+    monkeypatch.setattr(pr, "worker_status", lambda n: "running" if n == "prd-1234" else "lost")
+    assert pr.worker_live_for(1234) is True, "the pre-#2725 name still names this PR's worker"
+
+
+def test_a_gate_refusal_under_ANOTHER_repos_worker_is_not_this_repos_verdict(
+        monkeypatch, tmp_path):
+    """Symptom 2: a gate refusal was recorded against a PR whose spawn never happened.
+
+    `_confirm()` reads `$O/bg/<name>.rc`. While the name was repo-blind, repo A's refusal inside
+    the confirm window was repo B's answer -- so B recorded a refusal (and cooled down for 90 min)
+    for work that never ran. The positive control below keeps this from passing vacuously.
+    """
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
+    monkeypatch.setattr(pr, "worker_status", lambda n: "lost")
+
+    def _refuse(name):
+        (bg / (name + ".rc")).write_text("75\n")
+        (bg / (name + ".log")).write_text("[load-gate] REFUSED %s: load=99 >= max_load=40\n" % name)
+
+    pr.apply_repo(_REPO_A, "")      # the production path sets the tag
+    name_a = pr.worker_name(1234)
+    try:
+        _refuse(name_a)                                  # repo A's refusal, under repo A's name
+        pr.apply_repo(_REPO_B, "")                      # …read from repo B's pass
+        verdict, detail = pr._confirm(pr.worker_name(1234))
+        assert verdict != "refused", \
+            "another repo's gate refusal is not this PR's verdict: %s" % detail
+        assert name_a != pr.worker_name(1234), "the names must differ for this to mean anything"
+
+        _refuse(pr.worker_name(1234))                    # the positive control: OURS is read
+        verdict, detail = pr._confirm(pr.worker_name(1234))
+        assert verdict == "refused" and "75" in detail, detail
+    finally:
+        pr.canonical_paths()
+
+
+def test_a_stale_pid_file_with_no_start_stamp_is_bounded_by_its_own_mtime(monkeypatch, tmp_path):
+    """A `running` claim with no `.started` used to be believed FOR EVER (#2725).
+
+    Pre-#2725 a recycled pid in one repo's own `prd-<n>.pid` blocked one PR. Now that every repo
+    probes the legacy alias, the same file would block PR #N in EVERY repo on the box, so the
+    claim is bounded by the pid file's own mtime -- written once, at spawn, so a live worker's is
+    younger than its cap.
+    """
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "worker_status", lambda n: "running")
+    name = "prd-7"
+    (bg / (name + ".pid")).write_text("%d\n" % os.getpid())
+    assert pr.worker_live(name) is True, "no stamp and a FRESH pid file: believe the pid"
+    old = time.time() - (pr.SPAWN_TIMEOUT_S + pr.WORKER_STALE_SLACK_S + 60)
+    os.utime(bg / (name + ".pid"), (old, old))
+    assert pr.worker_live(name) is False, \
+        "a pid file older than any worker's cap cannot be a live worker"
+
+
+def test_canonical_paths_rederives_the_worker_tag_and_never_mints_a_bare_dash(monkeypatch):
+    """The tag is repo-derived, so it is restored the same way `STATE` is -- and safely.
+
+    `--status` never resolves a REPO (it binds the register only), and its crash handler comes
+    through `canonical_paths()`: deriving from an EMPTY `REPO` would set the tag to a bare `-` and
+    name every later worker `prd--42`.
+    """
+    monkeypatch.setattr(pr, "REPO", "")
+    monkeypatch.setattr(pr, "_WORKER_TAG", "stale-repo-")
+    pr.canonical_paths()
+    assert pr.worker_name(7) == "prd-7", "no resolved repo -> no tag, never a bare '-'"
+    monkeypatch.setattr(pr, "REPO", "daniel-ospina/tortoise")
+    pr.canonical_paths()
+    assert pr.worker_name(7) == "prd-daniel-ospina-tortoise-7"
+
+
+def test_the_status_worker_column_keeps_the_pr_number_visible(tmp_path, capsys):
+    """A repo-qualified name is long, and the column used to right-cut at 12 characters.
+
+    `prd-daniel-o` names no repo and no PR: the part an operator acts on is the TRAILING number,
+    so the overflow is cut from the LEFT. Nothing parses this column (the row key is the PR
+    number), so the property is the requirement, not a width -- and it is asserted through the
+    PRINTER, because the printer is what an operator reads.
+    """
+    long = "prd-" + "o" * 39 + "-" + "r" * 100 + "-2027"
+    reg = tmp_path / "reg.json"
+    reg.write_text(json.dumps({
+        "2027": {"action": "fix-ci", "worker": long, "at": "t", "at_epoch": 1},
+        "7": {"action": "fix-ci", "worker": "prd-7", "at": "t", "at_epoch": 1},
+    }))
+    pr._print_state(str(reg))
+    out = capsys.readouterr().out
+    assert "-2027" in out, "the PR number is the part the operator acts on: %r" % out
+    assert long not in out, "the column must stay bounded: %r" % out
+    assert "worker=prd-7 " in out, "a legacy short name prints unchanged: %r" % out
+    # …and the unit's own contract, so a caller other than the printer cannot regress silently
+    assert len(pr._worker_column(long)) <= pr._WORKER_COL
+    assert pr._worker_column("prd-7") == "prd-7"
 
 
 def test_a_pass_with_no_checkout_grades_the_queue_and_says_it_cannot_spawn(monkeypatch, tmp_path):
@@ -6372,13 +6589,13 @@ def test_the_status_pointer_excludes_the_canonical_file_and_the_verdict_sidecars
 
 
 def test_a_live_worker_under_the_OTHER_modes_name_still_blocks_a_spawn(monkeypatch):
-    """One worktree, two worker names: probing only this mode's name spawns a second agent (#2280).
+    """One worktree, two worker spellings: probing only one spawns a second agent (#2280, #2725).
 
-    The worktree is `prd-<n>` in EVERY mode (`materialise_worktree`), while `worker_name()` is
-    mode-qualified. Measured shape: the armed single-repo job runs `prd-42` while an `--all-repos`
-    pass grades the same repo, asks about `prd-<tag>-42`, hears "not running", adopts the live
-    worker's worktree and starts a second agent in it — the second spawn `rm`s that worker's log,
-    `.rc` and `.pid`.
+    The worktree is `prd-<n>` always (`materialise_worktree`), while `worker_name()` is
+    repo-qualified -- and `prd-<n>` is what a pre-#2725 worker was called. Measured shape: the
+    armed job's legacy worker `prd-42` is running while a pass asks about `prd-<tag>-42`, hears
+    "not running", adopts the live worker's worktree and starts a second agent in it — the second
+    spawn `rm`s that worker's log, `.rc` and `.pid`.
     """
     asked = []
 
@@ -6426,11 +6643,12 @@ def test_a_set_whose_repos_share_a_TAG_is_REFUSED_before_anything_is_read(tmp_pa
 def test_the_POST_MATERIALISE_recheck_asks_BOTH_worker_names(monkeypatch):
     """The third liveness read is the one the window is for; probing one name there reopens it.
 
-    `worker_live_for()` exists because the WORKTREE is `prd-<n>` in every mode while
-    `worker_name()` is mode-qualified. Applying the union at the two PRE-checks only leaves the
+    `worker_live_for()` exists because the WORKTREE is `prd-<n>` always while `worker_name()` is
+    repo-qualified (and `prd-<n>` is the pre-#2725 spelling, still on boxes). Applying the union at
+    the two PRE-checks only leaves the
     post-materialise re-check — the read whose whole justification is "`materialise_worktree` can
     fetch for 300 s, and another invocation can pass the same guard inside that window" — asking
-    this mode's name alone, so the second agent still lands in the live worker's tree (and
+    this pass's name alone, so the second agent still lands in the live worker's tree (and
     `materialise_worktree` has ALREADY `reset --hard` that tree by then).
     """
     monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-tortoise-")
