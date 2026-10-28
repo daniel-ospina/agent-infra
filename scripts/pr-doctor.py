@@ -3671,13 +3671,37 @@ def _in_this_checkout(worktree: str) -> bool:
     calling `realpath` and returns "" for anything unresolvable, never raising. An empty resolution
     is UNREADABLE EVIDENCE, and the safe answer to unreadable evidence is to probe anyway -- the
     same fail-closed rule `_rp()`'s own docstring states.
+
+    ⛔ AND "UNDER THIS ROOT" IS NOT THE WHOLE POPULATION (#2980 review cycle 4, P1).
+    `materialise_worktree` has an ADOPT arm whose own comment says it "returns a worktree that is
+    NOT under WORKTREE_ROOT" (`:2360`) -- a lane's branch checked out at `~/.worktrees/<name>`,
+    `$HOME/wt-<slug>`, `/tmp/wt-<slug>` or `.../.worktrees/<name>` anywhere on the box, which this
+    repo's own tests exercise (`test_the_adopt_arm_shares_the_documented_owner_worktree_boundary`).
+    A pre-#2725 worker dispatched into THAT tree records it in its `.started`, so a root-prefix test
+    alone attributed a LIVE worker as foreign, skipped the probe, and let the pass adopt the very
+    tree it was already running in -- the T2 work-destroying direction, reached through the
+    attribution instead of the collision. Membership in THIS repo's own `git worktree list` is the
+    authority the adopt arm itself enumerates, so it is the missing half: a path this checkout
+    dispatches into is ours wherever it lives, while another repo's `/tmp/wt-<slug>` is not in THIS
+    repo's list and stays foreign.
+
+    ⛔ AN UNREADABLE ENUMERATION STILL NARROWS, AND THAT IS NOT A FAIL-OPEN. When `_worktrees()`
+    cannot be read it answers `[]`, so a path outside the root answers "not ours" -- but the ADOPT
+    arm enumerates through the SAME call, so in that same state it cannot hand back that path
+    either, and no dispatch can reach a tree this function declined to attribute. The unsafe
+    direction would need both reads to disagree inside one process, and they cannot.
     """
     if not worktree or not WORKTREE_ROOT:
         return True                       # nothing to attribute it with: do not narrow on a guess
     root, wt = _rp(WORKTREE_ROOT), _rp(worktree)
     if not root or not wt:
         return True                       # unresolvable: unreadable evidence never narrows
-    return wt.startswith(root + os.sep)
+    if wt.startswith(root + os.sep):
+        return True                       # by construction
+    for path, _branch in _worktrees():     # the ADOPT arm's population, everywhere it lives
+        if _rp(path) == wt:
+            return True
+    return False
 
 
 def worker_live_for(number) -> object:
@@ -3717,8 +3741,20 @@ def repo_tag(slug: str) -> str:
 
     ONE HOME for the derivation: `apply_repo`, `--status`, and the collision guard must agree, and
     three independent `.replace()` calls are how two of them drift apart.
+
+    ⛔ LOWERCASED, BECAUSE THIS FILE ALREADY TREATS THE IDENTITY AS CASE-INSENSITIVE (#2980 review
+    cycle 4, P2). `resolve_repo` ACCEPTS a case-differing `owner/name` as the same repo
+    (`got.lower() == slug.lower()`), `set_tag_collisions` lowercases when it compares two tags, and
+    GitHub itself is case-insensitive -- so two legitimate passes on ONE repo can hand this function
+    two spellings. Preserving case made them two worker identities
+    (`prd-Daniel-Ospina-agent-infra-42` vs `prd-daniel-ospina-agent-infra-42`) for one DETERMINISTIC
+    worktree (`prd-<n>`): neither name matches the other's live worker, the register splits, no
+    cooldown holds the slot, and both passes spawn into one git index and one branch -- the #2280
+    class this file's identity work exists to remove, reintroduced by making the name depend on a
+    RESOLVED STRING rather than on the repo. Lowercasing cannot merge two DISTINCT repos, because
+    GitHub cannot own two repositories whose slugs differ only by case.
     """
-    return (slug or "").replace("/", "-")
+    return (slug or "").lower().replace("/", "-")
 
 
 def set_tag_collisions(entries: list[str]) -> str:

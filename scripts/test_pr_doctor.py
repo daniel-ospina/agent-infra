@@ -5815,8 +5815,62 @@ def test_the_same_worktree_spelled_two_ways_is_still_THIS_checkouts(tmp_path, mo
     with open(pr.bg_path("prd-42", "started"), "w") as fh:
         fh.write("name=prd-42\nworktree=%s/\nkind=prfix\n"
                  % os.path.join(str(spelled), "prd-42"))      # trailing slash too
+    pr.canonical_paths()
+
+
+def test_a_pre_2725_worker_in_an_ADOPTED_worktree_outside_the_root_still_blocks_a_spawn(tmp_path, monkeypatch):
+    """⛔ "UNDER WORKTREE_ROOT" IS NOT THE WHOLE POPULATION (#2980 review cycle 4, P1).
+
+    `materialise_worktree`'s ADOPT arm returns a worktree that is NOT under `WORKTREE_ROOT` -- its
+    own comment says so (`:2360`), and
+    `test_the_adopt_arm_shares_the_documented_owner_worktree_boundary` drives that path for real. A
+    pre-#2725 worker dispatched into such a tree records THAT path in its `.started`, so a
+    root-prefix attribution answered "not ours", SKIPPED the probe, and let the pass adopt the very
+    worktree the live worker was running in: a second agent in one git index, and
+    `nonblocking-dispatch.sh` destroys the first one's `.rc`/`.log`. So attribution also accepts a
+    worktree REGISTERED to this repo, wherever on disk it lives.
+    """
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    outside = tmp_path / "wt-lane"          # fleet-shaped, REGISTERED here, OUTSIDE the root
+    g("worktree", "add", "--detach", str(outside), head)
+
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(repo))       # WORKTREE_ROOT = <repo>/.worktrees
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n" % outside)
+    assert pr._in_this_checkout(str(outside)) is True, \
+        "the adopt arm's own population was attributed as another repo's"
     assert pr.worker_live_for(42) is True, asked
     assert "prd-42" in asked, asked
+
+    # NON-VACUITY: the widening is a REGISTRATION test, not "everything outside the root is ours"
+    assert pr._in_this_checkout(str(tmp_path / "wt-not-registered")) is False
+    pr.canonical_paths()
+
+
+def test_one_repo_cannot_acquire_two_worker_identities_from_slug_case(tmp_path, monkeypatch):
+    """⛔ THE IDENTITY IS CASE-INSENSITIVE EVERYWHERE ELSE (#2980 review cycle 4, P2).
+
+    `resolve_repo` ACCEPTS a case-differing `owner/name` as the same repo (`got.lower() ==
+    slug.lower()`) and `set_tag_collisions` lowercases when it compares tags, so two legitimate
+    passes on ONE repo can carry two spellings. While `repo_tag()` preserved case, they became two
+    worker identities for ONE deterministic worktree (`prd-<n>`): neither name matched the other's
+    live worker, so both passes spawned into one git index and one branch -- the #2280 class this
+    file's identity work exists to remove, reintroduced through a resolved string.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    names = []
+    for spelling in ("daniel-ospina/agent-infra", "Daniel-Ospina/Agent-Infra"):
+        pr.apply_repo(spelling, str(tmp_path / "repo"))
+        names.append(pr.worker_name(42))
+    assert names[0] == names[1] == "prd-daniel-ospina-agent-infra-42", names
+    assert pr.repo_tag("Daniel-Ospina/Agent-Infra") == pr.repo_tag("daniel-ospina/agent-infra")
     pr.canonical_paths()
 
 
