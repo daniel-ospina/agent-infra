@@ -802,8 +802,14 @@ while read -r _n; do
 done < "$GSEEN"
 # An EMPTY observation set proves nothing and must not be graded as a violation of the cap: it is a
 # different fault (nothing ran, or nothing recorded) and it says so in its own words.
-if [ "$seen" -lt 1 ]; then
-  fail "no gh child recorded the concurrency it saw, so the cap was never observed (0 observations)"
+# ⛔ AND A PARTIAL SET IS NOT AN OBSERVATION OF THIS ARM'S PREMISE EITHER (#1881 review P2). Each of
+# the four children writes exactly one line at its own admission, so `seen` is the number that
+# REACHED the gate. Grading `seen == 1` as a pass let three lanes be refused — or silently never
+# start — and still report "4 parallel lanes … at most 2 in flight": the arm would be green over a
+# population one quarter the size of the one it names. `seen` must therefore be all four; a smaller
+# count is its own fault, named as such, not a cap verdict.
+if [ "$seen" -lt 4 ]; then
+  fail "only $seen of 4 gh children reached the gate, so this sample does not contain the four admissions the arm claims to observe"
 elif [ "$maxc" -le 2 ] && [ "$maxc" -ge 1 ]; then
   pass "4 parallel lanes with MAX_INFLIGHT=2 → at most 2 gh processes in flight (saw $maxc, $seen child observation(s))"
 else
