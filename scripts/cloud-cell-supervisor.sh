@@ -132,7 +132,16 @@
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
-REPO="${REPO:-/tmp/cell}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1935). This line used to be `REPO="${REPO:-/tmp/cell}"`,
+# and that path does not exist on the cloud cell: `start` died with `FATAL: no git repo at /tmp/cell`
+# — a controller that will not start, for a directory the operator never chose and nothing creates.
+# (The sibling defect is worse, in refresh-candidates.sh: ITS default was one developer's HOME
+# DIRECTORY, baked into every machine's harness.) A default is only safe if it is TRUE ON EVERY
+# BOX, so there is none — the value is REQUIRED, and resolve_repo() below may DERIVE it from a path
+# that really is a git checkout. The derivation is timid on purpose and never guesses between two
+# repos: this checkout decides the QUEUE (resolve_queue_target reads its `origin`), so adopting the
+# wrong one dispatches the wrong repo's work — the measured agent-infra#1901 defect.
+REPO="${REPO:-}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # The harness is a SIBLING of this script inside agent-infra (scripts/orchestrator-harness/),
@@ -273,8 +282,66 @@ workers_maybe_live() {
 #                        worker's `gh` too. Without it only the controller would be serialised.
 WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
-say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
-die() { say "FATAL: $*" >&2; exit 1; }
+log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+die() { log_line "FATAL: $*" >&2; exit 1; }
+
+# ── the TARGET checkout: the operator's value, else DERIVED from a real checkout ───────────────
+# Adoption rule, in order: $REPO as given; else exactly ONE candidate that is a git checkout; else,
+# when several are, the ones whose `origin` names the declared $OR — and if that is still not exactly
+# one, REFUSE. Two distinct checkouts on one box is precisely the case where a guess is unrecoverable
+# (the derivation feeds OR, and OR decides which queue the controller works), so the refusal names
+# both and asks. The candidate list is the harness's own provisioning locations — nothing walks the
+# filesystem — and `run`/`git` are the only tools this needs: no network, no config, no agent.
+REPO_SEEN=""       # what the derivation looked at, for the refusal
+resolve_repo() {
+  local cand url hits="" n=0
+  [ -n "$REPO" ] && return 0
+  REPO_SEEN=""
+  for cand in "${WORKDIR:-}" "$CELL_HOME/cell" "/tmp/cell" \
+              "${OR:+$CELL_HOME/${OR##*/}}" "${OR:+/tmp/cell-${OR##*/}}" "${OR:+/tmp/${OR##*/}}"; do
+    [ -n "$cand" ] || continue
+    case " $REPO_SEEN " in *" $cand "*) continue ;; esac
+    REPO_SEEN="${REPO_SEEN:+$REPO_SEEN }$cand"
+    [ -d "$cand" ] || continue
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    if [ -n "${OR:-}" ]; then
+      url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
+      case "$url" in
+        "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+        *) continue ;;
+      esac
+    fi
+    hits="$hits$cand\n"
+  done
+  n="$(printf '%b' "$hits" | grep -c .)"
+  case "$n" in
+    1) REPO="$(printf '%b' "$hits" | head -1)"; REPO="$(cd "$REPO" && pwd -P)" || { REPO=""; return 1; }
+       log_line "REPO was not set — using $REPO (a checkout from the provisioning candidates${OR:+, origin $OR})"
+       return 0 ;;
+    0) return 1 ;;
+  esac
+  log_line "REPO was not set and ${n} candidate checkouts match${OR:+ $OR}:"
+  printf '%b' "$hits" | sed 's/^/       /' >&2
+  return 1
+}
+
+# ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
+# not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
+assert_repo() {
+  if ! resolve_repo; then
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell"
+  fi
+  # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
+  # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
+  # EMPTY value — so a DERIVED path was the one interpolated value that reached the tmux command
+  # string unvalidated: a checkout directory named with a quote would close the quote in
+  # `REPO='$REPO'` and the rest would be parsed as shell. This is the same class as the `$HARNESS`
+  # re-check below, which exists for exactly this reason (a value that changes after the guard).
+  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO"
+  # A DERIVED checkout changes the queue target (resolve_queue_target reads its origin), so re-derive
+  # OR before anything asserts the pair.
+  resolve_queue_target || true; OR="$QUEUE_REPO"
+}
 
 # A quote or shell metacharacter in any value interpolated into the session command string would
 # break out of it — the string is handed to tmux, which runs it with sh -c. The harness applies
@@ -633,6 +700,35 @@ _pids_minus() { # <seen> <owned>
   comm -23 <(printf '%s\n' "$1" | awk 'NF' | sort -u) <(printf '%s\n' "$2" | awk 'NF' | sort -u)
 }
 _pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
+# ── the refusal an operator can ACT on (#2916 check 6, rows 6-7) ────────────────────────────────
+# Both refusals below used to say "…give this repo its own SESSION, or stop it from the state dir that
+# owns it" — which names neither the state dir nor the command, and BOTH measured cases cost a manual
+# step on a live cell: a stale `cell-doctor` tmux session minted by a PREVIOUS state dir blocked the
+# doctor role, and a leftover inner-chain member (`tmux → bash -c → orch-loop.sh`) blocked the first
+# start and was cleared by hand. So the message carries what the box already knows: the pid, the
+# state dir the pid actually runs from, and the exact command.
+# ⛔ MESSAGE ONLY — nothing here signals anything. Auto-clearing a pid/session this state dir cannot
+# prove it owns is the #1856 hazard; the remedy is PRINTED for the operator, never executed.
+_pids_join_with_dirs() { # <pids-newline-separated> -> "pid <p> (state dir <d>)" …
+  local t p d out=""
+  t="$(ps -eo pid=,command= 2>/dev/null)" || t=""
+  for p in $1; do
+    d=""
+    [ -n "$t" ] && d="$(printf '%s\n' "$t" | awk -v pp="$p" '$1==pp' | tr ' \t' '\n\n' \
+                       | sed -n 's|^\(.*\)/orch-loop\.sh$|\1|p' | head -1)"
+    if [ -n "$d" ]; then out="$out, pid $p (state dir $d)"; else out="$out, pid $p"; fi
+  done
+  printf '%s' "${out#, }"
+}
+# The state dir a FOREIGN doctor session runs from, read from its own pane command (the same evidence
+# `doctor_session_foreign` uses). Empty when the pane does not name one — printed as <unreadable>
+# rather than guessed.
+doctor_session_state_dir() {
+  local cmd
+  cmd="$(tmux list-panes -t "=$DOCTOR_SESSION" -F '#{pane_start_command}' 2>/dev/null)" || return 1
+  [ -n "$cmd" ] || return 1
+  printf '%s\n' "$cmd" | sed -n "s/.*O='\([^']*\)'.*/\1/p" | head -1
+}
 
 # ── the controller SERVICE (agent-infra#2402) ───────────────────────────────────────────────────
 # A cell's controller used to live and die as a tmux session, with nothing above it: when the last
@@ -1039,13 +1135,24 @@ QUEUE_REMOTE=""      # the origin URL we READ from the checkout (empty = nothing
 QUEUE_DERIVED=""     # owner/repo parsed out of it (empty = underivable)
 QUEUE_REPO=""        # the EFFECTIVE queue target the controller session will receive
 QUEUE_DECLARED=""    # what the operator/keys.env asked for (empty = not declared)
-QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable = refuse
+QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable|nocheckout = refuse
 
 # Read the pair. NEVER dies: `status` must still answer when the pair cannot be read — it is the verb
 # an operator runs to discover that it cannot — and every other verb keeps its own preconditions. The
 # verbs that cannot do their job call assert_queue_target() below.
 resolve_queue_target() {
   QUEUE_DECLARED="${OR:-}"
+  # ⛔ AN EMPTY $REPO IS NOT "read the queue from the CURRENT DIRECTORY". `git -C ""` silently means
+  # no `-C` at all, so the pre-#1935 load-time call derived the queue from whatever directory the
+  # operator happened to be standing in — and then held the REAL checkout against it. A controller's
+  # queue must follow the checkout it names, never the caller's cwd.
+  if [ -z "$REPO" ]; then
+    # ⛔ ITS OWN STATE, NOT `unreadable` (#1977 review, P2). With no checkout there is no origin
+    # remote to be unreadable, and rendering it as one sent the operator hunting an origin problem on
+    # a repo that does not exist — while `status`, the verb that is supposed to DISCOVER this, printed
+    # an empty path. The cause is the missing checkout, so the state names it.
+    QUEUE_REMOTE=""; QUEUE_DERIVED=""; QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="nocheckout"; return 1
+  fi
   QUEUE_REMOTE="$(git -C "$REPO" remote get-url origin 2>/dev/null)"
   QUEUE_DERIVED=""
   [ -n "$QUEUE_REMOTE" ] && QUEUE_DERIVED="$(queue_repo_from_url "$QUEUE_REMOTE")"
@@ -1148,7 +1255,7 @@ assert_gh_repo_conformance() {
   if [ "$have" != "$got" ]; then
     die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering: this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)"
   fi
-  say "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
+  log_line "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
   return 0
 }
 
@@ -1157,6 +1264,10 @@ assert_gh_repo_conformance() {
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
 # machine needs so provisioning is unambiguous.
 assert_queue_target() {
+  # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
+  # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
+  # empty path. The cause is the missing checkout, so name it.
+  [ -n "$REPO" ] || assert_repo
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
@@ -1186,6 +1297,7 @@ queue_state_text() {
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
     mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
     invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
@@ -1422,10 +1534,50 @@ STAMPEOF
 # ⛔ A caller MUST NOT read 2 as clean — cannot-verify is never a pass in this file, and the likeliest
 # trigger is the full disk this change exists for (git status refreshing the index fails, rev-parse
 # still succeeds).
+#
+# ⛔ THE PREDICATE IS `pin_dirty` BELOW, A PINNED MIRROR of `pin_dirty` in scripts/lib/box.sh (this file is
+# deployed STANDALONE, so it cannot source a sibling library — the same constraint the pid-identity mirror
+# at `_proc_start_epoch` documents). It is not re-typed by hand: the body is copied byte-for-byte and a
+# drift arm (cloud-cell-supervisor.test.sh §(p3)) reddens CI if the two ever diverge. Round 4 found the
+# divergence this prevents: the resolver refused a pin on an IGNORED file while THIS function read the
+# weaker `--porcelain`, so `check` reported the pin CLEAN and `apply` took HARNESS_APPLIED=unchanged over
+# a tree the controller would not start — an instrument that certified the state it existed to catch.
 harness_dirty() {
-  local out
-  out="$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" || return 2
-  [ -n "$out" ]
+  local out rc
+  out="$(pin_dirty "$HARNESS" .)"; rc=$?
+  [ "$rc" -eq 2 ] && return 2
+  [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+pin_dirty() {
+  local repo="$1" scoped="$2" top out line path keep=""
+  # ⛔ THE TOPLEVEL, because porcelain prints paths relative to the REPOSITORY ROOT even when `repo` is a
+  # subdirectory — and two of the three callers pass the harness SUBDIR (the production convention). A
+  # first version resolved entries against `$repo`, so its tolerance was unreachable there and a
+  # `.DS_Store` read DIRTY to the instruments while the runtime read CLEAN: the round-4 divergence again,
+  # with the fail direction inverted (found by review, round 5).
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 2
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    # ⛔ TOLERATE ONLY **UNTRACKED/IGNORED** DROPPINGS. A TRACKED file named `._x` is part of the pin, so a
+    # MODIFICATION to it must read DIRTY — the name is not the property (found by review, round 5: a
+    # rewritten tracked `._x` read CLEAN). `!!` = ignored, `??` = untracked.
+    case "$line" in
+      '!!'*|'??'*) case "${path##*/}" in
+        .DS_Store|._*) [ -f "$top/$path" ] && [ ! -L "$top/$path" ] && continue ;;
+      esac ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
 }
 
 # Is <path> a LINKED worktree of <repo> — i.e. may this script `rm -rf` it? The MAIN working tree is
@@ -1456,8 +1608,13 @@ linked_worktree_of() {
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
 # worktree of $HARNESS_REPO, an empty directory, a pin ROOT holding only hex-named pin dirs, or a root
-# whose only other entries are OS droppings (`​.DS_Store` / `._*` REGULAR files — one Finder visit to the
-# default root must not brick the cell; a hidden DIRECTORY or a dangling symlink is still refused).
+# whose only other entries are ONE OF TWO ENUMERATED classes of REGULAR, NON-SYMLINK file: OS droppings
+# (​`.DS_Store` / `._*` — one Finder visit to the default root must not brick the cell) and the harness's
+# OWN named records (`.agent-infra-version`, `AGENTS.md`, `MEMORY.md`, `README.md`, `VENDOR.md`,
+# `HARNESS-PIN`, `manifest.json`, `package.json` — agent-infra#2812: a shipped sibling component writes
+# into this root, so refusing them kept the cell unstartable for ever, once per 10-minute tick).
+# ⛔ Both classes are NAMED, never "any file", and THIS header is the whole allow-list: a hidden
+# DIRECTORY, a dangling symlink, a symlink wearing an allowed NAME, and any unlisted entry are refused.
 #
 # Is $1 a NAME `apply` could have produced for a pin directory? `apply` names each pin by the hex of
 # the commit it pins to (`cut -c1-12` below), but the LENGTH is a MOVING CONVENTION, not a property
@@ -1543,10 +1700,13 @@ pin_path_real() {
 # ⛔ The enumeration is `ls -A`, not a `"$dir"/*` glob: a glob skips HIDDEN entries and dangling
 # symlinks, so a root whose only entry was `.DS_Store` read as EMPTY-AND-SAFE on the check side while
 # the delete side refused the same root — the same false pass, one branch over. `ls -A` sees every
-# entry, and each one must be a hex-named directory — EXCEPT an OS-droppings regular file
-# (`.DS_Store` / `._*`), which is skipped: refusing it bricked all four verbs after a single Finder
-# visit to the default root on the operators' macOS server (see the header above, which states the
-# whole allow-list; this line is the one it is easiest to contradict by accident).
+# entry, and each one must be a hex-named directory — EXCEPT two ENUMERATED classes of regular,
+# NON-SYMLINK file: OS droppings (`.DS_Store` / `._*`) and the harness's OWN named records (below).
+# Refusing the first bricked all four verbs after a single Finder visit to the default root on the
+# operators' macOS server; refusing the second bricked the cell permanently against a shipped sibling
+# component. (See the header above, which states the whole allow-list; this line is the one it is
+# easiest to contradict by accident.) ⛔ Both classes are NAMED, never "any file": an unlisted entry
+# is still refused, which is the whole point of the guard.
 # ⛔ Deliberately NOT a per-entry `git worktree list` path comparison: on macOS a `$TMPDIR`-derived
 # path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
 # OWN pin as foreign and the guard becomes a false block.
@@ -1592,6 +1752,12 @@ pin_root_conformance() {
     # root from reaching the cannot-verify branch below: there is nothing of ours in it to protect.
     case "$p" in
       .DS_Store|._*) if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
+      # ⛔ HARNESS METADATA IS NOT A STRAY (#2812): `harness-apply` records the commit it converged
+      # this box to INSIDE the pin root, so the guard refused forever and the entry returns on every
+      # 10-minute tick — "remove it by hand" is not a remedy. Named explicitly, so an UNKNOWN entry is
+      # still refused.
+      .agent-infra-version|AGENTS.md|MEMORY.md|README.md|VENDOR.md|HARNESS-PIN|manifest.json|package.json)
+        if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
     esac
     entries=$((entries + 1))
     if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
@@ -1704,7 +1870,7 @@ harness_apply() {
   fi
   want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
   [ -n "$want" ] || die "cannot resolve $HARNESS_REF in $HARNESS_REPO$( [ "$fetch_failed" = 1 ] && printf ' after a failed git fetch — check the network' ) — cannot pin a harness to verify against"
-  [ "$fetch_failed" = 1 ] && say "warn: git fetch failed in $HARNESS_REPO — cannot refresh $HARNESS_REF; using the local ref"
+  [ "$fetch_failed" = 1 ] && log_line "warn: git fetch failed in $HARNESS_REPO — cannot refresh $HARNESS_REF; using the local ref"
   # ⛔ THE CONFORMANCE GUARD RUNS ON EVERY PATH, INCLUDING THE NO-OP ONE. It used to sit inside the
   # re-pin `else` below, so `apply` on a cell whose harness was already at the ref returned 0
   # ("unchanged") without ever asking whether the pin root conforms — while `check`, `start` and
@@ -1795,16 +1961,16 @@ seed_and_stamp() {
     if [ -e "$O/gh-limit/gh" ] || [ -e "$O/gh-limit.py" ]; then
       rm -f "$O/gh-limit/gh" "$O/gh-limit.py" || die "cannot remove the stale gh-limit layer from $O"
       rmdir "$O/gh-limit" 2>/dev/null || true
-      say "seed: removed the stale gh-limit layer — the harness no longer ships it"
+      log_line "seed: removed the stale gh-limit layer — the harness no longer ships it"
     fi
-    say "WARN: $HARNESS ships no gh-limit layer — this cell's gh calls will NOT be serialised or backed off (#1988)"
+    log_line "WARN: $HARNESS ships no gh-limit layer — this cell's gh calls will NOT be serialised or backed off (#1988)"
   fi
   # ⛔ MIRROR, do not merely overlay. `orch-loop.sh`/`merge-one.sh` invoke workers BY NAME from $O, so a
   # script RENAMED upstream would leave its old copy live in $O and still invocable — the record would
   # describe the harness while the cell ran a worker the harness no longer ships.
   for f in "$O"/*.sh; do
     [ -f "$f" ] || continue
-    [ -f "$HARNESS/$(basename "$f")" ] || { rm -f "$f"; say "seed: removed stale $(basename "$f") — the harness no longer ships it"; }
+    [ -f "$HARNESS/$(basename "$f")" ] || { rm -f "$f"; log_line "seed: removed stale $(basename "$f") — the harness no longer ships it"; }
   done
   stamp_write || die "cannot record the harness provenance at $STAMP"
 }
@@ -1826,7 +1992,7 @@ cmd_check_disk() {
     die "only ${mb}MB free on $(dirname "$CELL_HOME") — below the ${MIN_FREE_MB}MB floor. At this level git writes and the controller's own state writes fail with I/O errors and the loop keeps reporting lanes. Free space first: $0 prune"
   fi
   if [ "$mb" -lt "$((MIN_FREE_MB * 4))" ]; then
-    say "warn: ${mb}MB free on $(dirname "$CELL_HOME") — under $((MIN_FREE_MB * 4))MB. 'prune' reclaims the regenerable caches."
+    log_line "warn: ${mb}MB free on $(dirname "$CELL_HOME") — under $((MIN_FREE_MB * 4))MB. 'prune' reclaims the regenerable caches."
   fi
 }
 
@@ -1837,23 +2003,23 @@ cmd_check_provenance() {
   local sc sp sr live sd hd_rc
   case "$HARNESS_REL" in
     current)
-      say "ok: harness commit ${HARNESS_COMMIT:0:12} == $HARNESS_REF (${REF_COMMIT:0:12}) — $(harness_subject)" ;;
+      log_line "ok: harness commit ${HARNESS_COMMIT:0:12} == $HARNESS_REF (${REF_COMMIT:0:12}) — $(harness_subject)" ;;
     behind)
-      say "DRIFT — harness commit ${HARNESS_COMMIT:0:12} is BEHIND $HARNESS_REF (${REF_COMMIT:0:12}). It is on"
-      say "       main's line, so 'start' would mend it — but a cell running it is a cell running old code."
-      say "       Remedy: $0 apply" ;;
+      log_line "DRIFT — harness commit ${HARNESS_COMMIT:0:12} is BEHIND $HARNESS_REF (${REF_COMMIT:0:12}). It is on"
+      log_line "       main's line, so 'start' would mend it — but a cell running it is a cell running old code."
+      log_line "       Remedy: $0 apply" ;;
     diverged)
-      say "DRIFT — harness commit ${HARNESS_COMMIT:0:12} is NOT an ancestor of $HARNESS_REF (${REF_COMMIT:0:12})."
-      say "       This is the measured 2026-10-14 incident: a tree off main's line merged real PRs off the"
-      say "       shared queue while check called the cell healthy. Refusing."
-      say "       Remedy: $0 apply   (pins to $HARNESS_REF in $HARNESS_PIN_DIR)" ;;
+      log_line "DRIFT — harness commit ${HARNESS_COMMIT:0:12} is NOT an ancestor of $HARNESS_REF (${REF_COMMIT:0:12})."
+      log_line "       This is the measured 2026-10-14 incident: a tree off main's line merged real PRs off the"
+      log_line "       shared queue while check called the cell healthy. Refusing."
+      log_line "       Remedy: $0 apply   (pins to $HARNESS_REF in $HARNESS_PIN_DIR)" ;;
     untracked)
-      say "DRIFT — the harness at ${HARNESS:-<unresolved>} has NO git identity, so 'which commit is this cell"
-      say "       running?' has no answer. A hand-placed copy is this cell's oldest failure mode (#1745)."
-      say "       Remedy: $0 apply   (pins to $HARNESS_REF in $HARNESS_PIN_DIR)" ;;
+      log_line "DRIFT — the harness at ${HARNESS:-<unresolved>} has NO git identity, so 'which commit is this cell"
+      log_line "       running?' has no answer. A hand-placed copy is this cell's oldest failure mode (#1745)."
+      log_line "       Remedy: $0 apply   (pins to $HARNESS_REF in $HARNESS_PIN_DIR)" ;;
     *)
-      say "DRIFT — cannot verify the harness: $HARNESS_REF does not resolve in ${HARNESS_REPO:-<no checkout resolved>}."
-      say "       Cannot-verify is never a pass. Remedy: set HARNESS_REPO to an agent-infra checkout, then $0 apply" ;;
+      log_line "DRIFT — cannot verify the harness: $HARNESS_REF does not resolve in ${HARNESS_REPO:-<no checkout resolved>}."
+      log_line "       Cannot-verify is never a pass. Remedy: set HARNESS_REPO to an agent-infra checkout, then $0 apply" ;;
   esac
   case "$HARNESS_REL" in
     current|behind) ;;
@@ -1885,11 +2051,11 @@ cmd_check_provenance() {
     # to the sibling stamp).
     sd="$(stamp_field_raw agentInfraDirty)"
     [ "$sd" = false ] || die "DRIFT — the record at $STAMP does not say its source was CLEAN (agentInfraDirty=${sd:-<absent>}); a dirty record's commit does not describe the seeded bytes. Remedy: $0 apply"
-    say "ok: recorded install — commit ${sc:0:12}, relation '${sr}', payload ${sp:0:12}"
+    log_line "ok: recorded install — commit ${sc:0:12}, relation '${sr}', payload ${sp:0:12}"
   elif tmux has-session -t "$SESSION" 2>/dev/null; then
     die "a controller is RUNNING (tmux '$SESSION') with NO harness provenance recorded at $STAMP — 'which commit is this cell running?' has no answer for a live merge actor. Remedy: stop, then $0 apply"
   else
-    say "ok: no install recorded yet (pre-start) — 'start' or 'apply' writes $STAMP"
+    log_line "ok: no install recorded yet (pre-start) — 'start' or 'apply' writes $STAMP"
   fi
 }
 
@@ -1937,7 +2103,7 @@ cmd_check() {
   done
   # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
   # and install.sh warns rather than dying for it — so the two surfaces agree.
-  command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
+  command -v uv >/dev/null 2>&1 || log_line "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
   # ── the RESOLVED LANE MODEL, and whether THIS box's catalog lists it (agent-infra#2208) ─────
   # `spawn-gate.sh`'s and `merge-one.sh`'s `run_agent` default to `deepseek/deepseek-flash`
   # (env-overridable). A box's model list is its OWN — `pi-bootstrap/cell-install.sh` deliberately
@@ -1978,9 +2144,9 @@ cmd_check() {
   fi
   models_json="$CELL_HOME/.pi/agent/models.json"
   if ! command -v jq >/dev/null 2>&1; then
-    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (jq missing, so $models_json cannot be read; channel: $lane_chan)"
+    log_line "      lane model: $lane_provider/$lane_model — NOT VERIFIED (jq missing, so $models_json cannot be read; channel: $lane_chan)"
   elif [ ! -f "$models_json" ]; then
-    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (no $models_json on this box; channel: $lane_chan)"
+    log_line "      lane model: $lane_provider/$lane_model — NOT VERIFIED (no $models_json on this box; channel: $lane_chan)"
   else
     lane_state="$(jq -r --arg p "$lane_provider" --arg m "$lane_model" '
         (.providers[$p]) as $pv
@@ -1991,12 +2157,17 @@ cmd_check() {
             | if ($ids | index($m)) != null or ($ovr | index($m)) != null then "listed" else "absent" end
           end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
     case "$lane_state" in
-      listed) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
-      absent) say "      lane model: $lane_provider/$lane_model — NOT RESOLVABLE FROM $models_json, and this id has no pi BUILT-IN: providers.$lane_provider there does not list it, and pi's built-in catalog carries only deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro. pi MERGES the built-in catalog, so a PI_LANE_MODEL that IS built in still resolves from here — the SHIPPED DEFAULT ('deepseek-flash') is not, and on this box every harness lane would start on pi's 'Using custom model id' fallback: it runs, spends tokens, and degrades silently, which is the defect #2208 exists to remove. Remedy: add providers.$lane_provider.models.$lane_model to $models_json (pi-bootstrap/pi-config/models.json ships it, so a provisioned box is not affected — this fires on a box whose models.json was trimmed), or set PI_LANE_MODEL to a built-in id. Verify with the unfiltered: pi --list-models   [channel: $lane_chan]" ;;
-      *) say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
+      listed) log_line "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
+      absent) log_line "      lane model: $lane_provider/$lane_model — NOT RESOLVABLE FROM $models_json, and this id has no pi BUILT-IN: providers.$lane_provider there does not list it, and pi's built-in catalog carries only deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro. pi MERGES the built-in catalog, so a PI_LANE_MODEL that IS built in still resolves from here — the SHIPPED DEFAULT ('deepseek-flash') is not, and on this box every harness lane would start on pi's 'Using custom model id' fallback: it runs, spends tokens, and degrades silently, which is the defect #2208 exists to remove. Remedy: add providers.$lane_provider.models.$lane_model to $models_json (pi-bootstrap/pi-config/models.json ships it, so a provisioned box is not affected — this fires on a box whose models.json was trimmed), or set PI_LANE_MODEL to a built-in id. Verify with the unfiltered: pi --list-models   [channel: $lane_chan]" ;;
+      *) log_line "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
     esac
   fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
+  # ⛔ RESOLVE THE CHECKOUT BEFORE ANYTHING READS IT. Every verdict below is about THIS repo, and an
+  # unresolved $REPO used to reach `die "no git repo at "` — an error naming an empty path, for a
+  # value the operator never set. assert_repo() derives it or refuses with one actionable line, and
+  # re-derives OR when it derived the checkout (the queue follows the checkout's origin).
+  assert_repo
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
   # refused a worktree with "FATAL: no git repo at <path>" even though every git command in it works
@@ -2012,7 +2183,7 @@ cmd_check() {
   # YES here while `start` dies on the same config is a FALSE PASS on that question (same rule as
   # validate_scope).
   assert_queue_target
-  say "ok: queue $QUEUE_REPO == checkout $REPO (origin $QUEUE_REMOTE) — $QUEUE_STATE"
+  log_line "ok: queue $QUEUE_REPO == checkout $REPO (origin $QUEUE_REMOTE) — $QUEUE_STATE"
   assert_gh_repo_conformance
   cmd_check_disk
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
@@ -2024,7 +2195,7 @@ cmd_check() {
   # them from $O: without them the cross-box claim silently degrades to the fail-open path
   # (logged, but not the design), and the controller dies with exit 78 on the per-repo merge
   # contract — a false "CELL CAN RUN A CONTROLLER" (repo-authority.sh, review round 4).
-  say "ok: HOME, harness, tmux, gh auth, repo, state dir"
+  log_line "ok: HOME, harness, tmux, gh auth, repo, state dir"
   local missing="" w
   # ⛔ repo-slug.sh IS IN THIS LIST (review round 3, finding 1). orch-loop.sh SOURCES it from $O and
   # `exit 78`s without it, and refresh-candidates.sh refuses without it — so a $O missing it is a
@@ -2037,6 +2208,10 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
+  # lane.sh's prompt EXECUTES lane-merge.sh for the merge phase and merge-rate.sh for the
+  # before/after measurement (#2029), so a $O missing either makes every lane's merge phase exit 127
+  # while this check still printed "CELL CAN RUN A CONTROLLER" — the false PASS this list exists to
+  # prevent. Keep this list in step with install.sh's DRIFTED list (which seeds $O from it).
   # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
   # calls it for the process pass. A $O without it still runs (the census falls back to the launch
   # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
@@ -2044,7 +2219,20 @@ cmd_check() {
   # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
   # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
   # reports success.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+  # UNION of both sides of this merge (neither is a superset): lane-merge.sh + merge-rate.sh from this
+  # branch (#2029), lane-reap.sh from origin/main (#2163). Taking either alone leaves a worker the
+  # controller executes unseeded, which is the false PASS above.
+  # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh, fix-one.sh and adopt-fix.sh;
+  # all four `exit 78` without it, so its absence would make every dispatch refuse at startup while
+  # `check` still certified the cell — the same false PASS one layer down.
+  # gate-policy.sh (#2319) is SOURCED by every pi-spawning carrier on this box, which `exit 78`s without
+  # it — the same class: a $O missing it is a cell whose every lane dies at startup while `check` says
+  # "CELL CAN RUN A CONTROLLER".
+  # ⛔ spawn-gate.sh is the SAME class and was MISSING (review round 5): lane.sh:29 and fix-one.sh:54 both
+  # `. "$SELF/spawn-gate.sh" || exit 78`, and dispatch-merge.sh runs `bash '$O/lane.sh'`, so `$SELF` is
+  # `$O` — a cell without it has its every lane die at startup while `check` printed the green banner.
+  # install.sh:812 already required it; this list did not.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -2060,7 +2248,7 @@ cmd_check() {
     PATH="$O/gh-limit:$PATH" GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 gh --version >/dev/null 2>&1 \
       || die "the gh-limit layer at $O/gh-limit cannot run gh — every gh call in the session would fail. Fix the layer or remove it before starting (a cell without it MERGES but is not serialised, #1988)."
   else
-    say "WARN: no gh-limit layer in $O — this cell's gh calls are NOT serialised/backed off (#1988); run 'start' to seed it"
+    log_line "WARN: no gh-limit layer in $O — this cell's gh calls are NOT serialised/backed off (#1988); run 'start' to seed it"
   fi
 
   # ── which commit is this cell running? (agent-infra#1745) ────────────────────────────────────
@@ -2097,7 +2285,7 @@ cmd_check() {
     esac
   fi
   printf '%s\n' "$pv" | sed 's/^/    /'
-  say "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
+  log_line "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
   # ⛔ The probe above runs in THIS shell, so an AMBIENT TORTOISE_REPO makes it pass — but the
   # controller session will NOT receive it: the session re-sources $ENV_FILE and its command line
   # carries only HOME REPO O OR SCOPE, and on a PRE-EXISTING tmux server a session is served the
@@ -2113,11 +2301,11 @@ cmd_check() {
     [ -n "${TORTOISE_REPO:-}" ] && ambient="TORTOISE_REPO"
     [ -n "${TORTOISE:-}" ] && ambient="${ambient:+$ambient and }TORTOISE"
     if [ -n "$ambient" ]; then
-      say "warn: the dispatch-provisioning probe passed using this shell's ambient $ambient, which"
-      say "      $ENV_FILE does not carry. The controller session re-sources $ENV_FILE and does not"
-      say "      receive an ambient export on a pre-existing tmux server, so it would resolve no"
-      say "      tortoise checkout, refuse with rc=3, and leave the cell MERGE-ONLY."
-      say "      Fix: put TORTOISE_REPO=<a tortoise checkout> in $ENV_FILE, or vendor tools/collision_preflight.py into the repo."
+      log_line "warn: the dispatch-provisioning probe passed using this shell's ambient $ambient, which"
+      log_line "      $ENV_FILE does not carry. The controller session re-sources $ENV_FILE and does not"
+      log_line "      receive an ambient export on a pre-existing tmux server, so it would resolve no"
+      log_line "      tortoise checkout, refuse with rc=3, and leave the cell MERGE-ONLY."
+      log_line "      Fix: put TORTOISE_REPO=<a tortoise checkout> in $ENV_FILE, or vendor tools/collision_preflight.py into the repo."
     fi
   fi
   # ⛔ THE RECORD STEP IS A HARD DEPENDENCY OF THE ONLY MERGE PATH (#1717). merge-one.sh mints the
@@ -2154,7 +2342,7 @@ cmd_check() {
   if [ ! -f "$reclib" ] || [ ! -s "$reclib" ]; then
     die "diff-normalize.py MISSING (or not a regular file, or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
   fi
-  say "ok: record step present and executable ($rec, with $(recorder_lib_path))"
+  log_line "ok: record step present and executable ($rec, with $(recorder_lib_path))"
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
@@ -2165,47 +2353,83 @@ cmd_check() {
   # key file (the raw value is non-empty, so the fallback never runs, and the normalized value is
   # empty) — so that case must be checked BEFORE the file, and reported as a failure, not a "present".
   if [ -n "$KEY_IN_FILE" ]; then
-    say "ok: merge authority key present in $ENV_FILE — the controller re-sources it. On the"
-    say "    'start' path (the only supported launch) the MERGE WORKERS it spawns across the second"
-    say "    tmux boundary get it too: 'start' publishes $WORKER_ENV_NAMES into tmux update-environment"
-    say "    and dies rather than start a cell where that publication fails."
+    log_line "ok: merge authority key present in $ENV_FILE — the controller re-sources it. On the"
+    log_line "    'start' path (the only supported launch) the MERGE WORKERS it spawns across the second"
+    log_line "    tmux boundary get it too: 'start' publishes $WORKER_ENV_NAMES into tmux update-environment"
+    log_line "    and dies rather than start a cell where that publication fails."
   elif [ "$KEY_IN_FILE_SET" = 1 ]; then
-    say "warn: AI_REVIEW_GATE_KEY in $ENV_FILE is WHITESPACE-ONLY. The consumer strips whitespace,"
-    say "      so it resolves to EMPTY — and because the env value wins, it will NOT fall back to"
-    say "      $CELL_HOME/.pi/agent/.ai-review-gate-key. Every review would be recorded UNSIGNED."
-    say "      Fix: remove the key line from $ENV_FILE, or give it a real value."
+    log_line "warn: AI_REVIEW_GATE_KEY in $ENV_FILE is WHITESPACE-ONLY. The consumer strips whitespace,"
+    log_line "      so it resolves to EMPTY — and because the env value wins, it will NOT fall back to"
+    log_line "      $CELL_HOME/.pi/agent/.ai-review-gate-key. Every review would be recorded UNSIGNED."
+    log_line "      Fix: remove the key line from $ENV_FILE, or give it a real value."
   elif keyfile_has_key; then
-    say "ok: merge authority key present ($CELL_HOME/.pi/agent/.ai-review-gate-key) — the MERGE"
-    say "    WORKERS read it at \$HOME: 'start' carries HOME as one of $WORKER_ENV_NAMES into tmux"
-    say "    update-environment, and a server it CREATES inherits it, so \$HOME is $CELL_HOME in every"
-    say "    spawned worker."
+    log_line "ok: merge authority key present ($CELL_HOME/.pi/agent/.ai-review-gate-key) — the MERGE"
+    log_line "    WORKERS read it at \$HOME: 'start' carries HOME as one of $WORKER_ENV_NAMES into tmux"
+    log_line "    update-environment, and a server it CREATES inherits it, so \$HOME is $CELL_HOME in every"
+    log_line "    spawned worker."
   else
     local kfpath="$CELL_HOME/.pi/agent/.ai-review-gate-key"
     if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
-      say "warn: AI_REVIEW_GATE_KEY is set in THIS shell but not in $ENV_FILE — the controller"
-      say "      session will NOT receive it: tmux serves a new session the SERVER's environment, and"
-      say "      'start' drops this shell's export before creating the session, so it cannot be delivered."
-      say "      Write it to $ENV_FILE, or to $kfpath."
+      log_line "warn: AI_REVIEW_GATE_KEY is set in THIS shell but not in $ENV_FILE — the controller"
+      log_line "      session will NOT receive it: tmux serves a new session the SERVER's environment, and"
+      log_line "      'start' drops this shell's export before creating the session, so it cannot be delivered."
+      log_line "      Write it to $ENV_FILE, or to $kfpath."
     elif [ -e "$kfpath" ] && [ ! -r "$kfpath" ]; then
       # EXISTING but UNREADABLE is neither missing nor empty, and the remedy differs: prescribing
       # "write a key file" for a file that may already hold a valid key reproduces the fault.
-      say "warn: $kfpath exists but is NOT READABLE — treated as absent."
-      say "      It may already hold a valid key: check its mode and its parent directories (want 600)."
+      log_line "warn: $kfpath exists but is NOT READABLE — treated as absent."
+      log_line "      It may already hold a valid key: check its mode and its parent directories (want 600)."
     else
-      say "warn: no AI_REVIEW_GATE_KEY and no $kfpath."
+      log_line "warn: no AI_REVIEW_GATE_KEY and no $kfpath."
     fi
-    say "      ⛔ This does NOT make the cell safe to co-run: absence of the key does not stop"
-    say '         `gh pr merge --auto` (measured: it armed auto-merge on #8425/#8420). A started'
-    say "         cell is a MERGE ACTOR regardless of the key."
+    log_line "      ⛔ This does NOT make the cell safe to co-run: absence of the key does not stop"
+    log_line '         `gh pr merge --auto` (measured: it armed auto-merge on #8425/#8420). A started'
+    log_line "         cell is a MERGE ACTOR regardless of the key."
   fi
-  say "⛔ COLLISION: orch-loop.sh takes BROAD scope above 10 open PRs, so an UNPINNED cell drains"
-  say "   the SHARED queue. Measured 2026-10-13: a fresh cell logged '[scope] open=14 -> BROAD' and"
-  say "   began re-recording/auto-arming within ~25s. Fix: pin every cell but ONE with SCOPE=own"
-  say "   (orch-loop.sh's SCOPE override), or fix #5052, BEFORE starting a second controller."
-  say "   ⛔ The pin is a PARTITION, not a fix for the root: ownership is still inferred from LOCAL"
-  say "      branches/worktrees (#4256), invisible across machines, so two OWN-pinned cells can still"
-  say "      race the same PR."
-  say "CELL CAN RUN A CONTROLLER"
+  log_line "⛔ COLLISION: orch-loop.sh takes BROAD scope above 10 open PRs, so an UNPINNED cell drains"
+  log_line "   the SHARED queue. Measured 2026-10-13: a fresh cell logged '[scope] open=14 -> BROAD' and"
+  log_line "   began re-recording/auto-arming within ~25s. Fix: pin every cell but ONE with SCOPE=own"
+  log_line "   (orch-loop.sh's SCOPE override), or fix #5052, BEFORE starting a second controller."
+  log_line "   ⛔ The pin is a PARTITION, not a fix for the root: ownership is still inferred from LOCAL"
+  log_line "      branches/worktrees (#4256), invisible across machines, so two OWN-pinned cells can still"
+  log_line "      race the same PR."
+  log_line "CELL CAN RUN A CONTROLLER"
+}
+
+# ── the scheduled layer (agent-infra#1864) ──────────────────────────────────────────────────────
+# A cell has no launchd, no crontab binary and no systemd user bus, so the repo's recurring jobs
+# (declared once, as templates/launchd/*.plist) run from a supervised loop: scripts/fleet-schedule.py.
+# `cloud-cell-bringup.sh --check` installs and proves it; THIS is where it is brought back up
+# whenever the cell is started again — `start` is the cell's own "the cell is now alive" signal, so
+# a loop that died while the controller kept running must not need a whole bring-up to recover.
+#
+# ⛔ IDEMPOTENT AND ON THE ALREADY-RUNNING PATH, both deliberately: the early return below is hit
+# by the common `start`-after-`stop`, and placing this after it is how the loop would stay dead.
+# ⛔ A MISSING SCRIPT IS A WARN, NOT A DIE: a cell whose layer predates this line must still be
+# startable (that cell's gap is what bring-up reports). A script that EXISTS and refuses to start
+# IS fatal — a cell running lanes with no reaping and no liveness detection is the defect.
+scheduler_ensure() {
+  local sched="$CELL_HOME/.pi/agent/scripts/fleet-schedule.py" out rc=0
+  if [ ! -f "$sched" ]; then
+    log_line "warn: no scheduled layer on this cell ($sched is absent) — no reap/liveness/canary job will run; re-run cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  out="$(HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" python3 "$sched" --start 2>&1)" || rc=$?
+  # rc=3 is the scheduler's own "no job declarations found" (its documented contract): the layer's
+  # script is present but nothing tells it WHERE the declarations are, i.e. this cell was never
+  # installed by the current bring-up. That must NOT brick the controller — bring-up is the gate
+  # that installs and proves the layer — but it must never pass quietly either.
+  if [ "$rc" -eq 3 ]; then
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    log_line "warn: the scheduled layer has no job declarations on this cell — no reap/liveness/canary job will run; re-run cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    die "the scheduled layer would not start (rc=$rc) — this cell would run with no reaping, no liveness detection and no canary (#1864)"
+  fi
+  # One line, so `start` never becomes the place a scheduler is assumed rather than seen.
+  log_line "scheduled layer: $(printf '%s\n' "$out" | head -1)"
 }
 
 # Does the `cell-doctor` session belong to THIS state dir? Its command string embeds this cell's log
@@ -2290,13 +2514,13 @@ cmd_start() {
   case "$gen0" in ''|*[!0-9]*) gen0="$(stop_generation)" ;; esac
   superseded() {
     [ "$(stop_generation)" = "$gen0" ] && return 1
-    say "a STOP arrived while this start was running — aborting and leaving nothing running"
+    log_line "a STOP arrived while this start was running — aborting and leaving nothing running"
     tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null && tmux kill-session -t "=$DOCTOR_SESSION" 2>/dev/null || true
     tmux has-session -t "$SESSION" 2>/dev/null && tmux kill-session -t "$SESSION" 2>/dev/null || true
     # The loop this start just created is the only kill handle there is: end the PROCESS first, then
     # drop the record. (A `stop` racing us may already have read the record; either side ending it is
     # enough, and the fence makes a double-kill safe.)
-    end_loop_pid || say "warn: the doctor loop survived the abort and could not be ended"
+    end_loop_pid || log_line "warn: the doctor loop survived the abort and could not be ended"
     rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid" "$ROLES_DIR/loop.ident"
     # ⛔ A UNIT THIS START STARTED IS NOT KILLED BY ANY OF THE ABOVE (review P1, #2402). The delegated start
     # hands the controller to the service manager, so the teardown above ends nothing — and under
@@ -2305,7 +2529,7 @@ cmd_start() {
     # out loud, because the operator's `stop` has already returned successfully.
     if controller_unit_path >/dev/null 2>&1; then
       sup_systemctl stop "$CONTROLLER_UNIT" >/dev/null 2>&1 \
-        || say "warn: a STOP arrived, but $CONTROLLER_UNIT could not be stopped — it may restart the controller within RestartSec (systemctl stop $CONTROLLER_UNIT)"
+        || log_line "warn: a STOP arrived, but $CONTROLLER_UNIT could not be stopped — it may restart the controller within RestartSec (systemctl stop $CONTROLLER_UNIT)"
     fi
     return 0
   }
@@ -2351,7 +2575,7 @@ cmd_start() {
       if [ -z "$_own" ]; then
         _seen="$(seen_controller_pids 2>/dev/null)" || _seen=""
         if [ -n "$_seen" ]; then
-          die "a controller runs from this machine's shared harness path (pid $(_pids_join "$_seen")) and is not provably this state dir's — refusing to wait for it (that would supervise nothing while reporting an active unit); stop it from the state dir that owns it, or give this repo its own SESSION in $ENV_FILE"
+          die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$_seen")) and is not provably this state dir's ($OR) — refusing to wait for it (that would supervise nothing while reporting an active unit). FIX: kill $(_pids_join "$_seen") — a pid whose state dir is not $OR is a leftover inner-chain member from a previous state dir (the measured row-7 case) and it blocks this cell's first start until it is gone; if it IS this repo's, give this repo its own SESSION in $ENV_FILE instead"
         fi
       fi
       # ⛔ THE CEILING DEPENDS ON WHICH WAIT THIS IS. An owned pid is a controller doing its work — long
@@ -2369,7 +2593,7 @@ cmd_start() {
       # at the accepted maximum the burst could never fill, so `Restart=always` restarted for ever while
       # `--status` read the unit supervised. Check the NEXT step, not the last one.
       [ "$((_waited + 5))" -le "$_bound_now" ] || die "still waiting, ${_waited}s after this start began, for $_who — refusing to become a second dispatcher; ${_own:+raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge}${_own:-nothing owns that session, so it will never exit: stop it from the state dir that owns it}"
-      [ "$_saidd" = 1 ] || say "controller already running ($_who) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
+      [ "$_saidd" = 1 ] || log_line "controller already running ($_who) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
       _saidd=1
       sleep 5; _waited=$((_waited + 5))
       superseded && return 1
@@ -2400,6 +2624,13 @@ cmd_start() {
   # and it must refuse START (not merely be stripped) so the misconfiguration is surfaced rather than
   # silently absorbed. The session commands below strip it either way.
   assert_gh_repo_conformance
+  # BEFORE the already-running early return: see scheduler_ensure's header.
+  # ⛔ AND AFTER assert_queue_target, deliberately: --start CLEARS the OFF switch, so running this
+  # earlier meant a `start` that then REFUSED its queue target had already cleared an operator's
+  # deliberate --stop — un-stopping a schedule on a start that never started anything.
+  # ⛔ ALSO AFTER #2235'S GH_REPO REFUSAL, the same rule one refusal later: a start that refuses must
+  # not have cleared the OFF switch on its way to refusing.
+  scheduler_ensure
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
@@ -2426,7 +2657,7 @@ cmd_start() {
       if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
         foreground_handover || return 1
       else
-      say "already running (controller pid $(_pids_join "$down")) — use: status | logs | stop"
+      log_line "already running (controller pid $(_pids_join "$down")) — use: status | logs | stop"
       # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
       # the box). `start` is the idempotent launch verb, so it heals that half too rather than
       # answering "already running" about a cell that cannot reap or land.
@@ -2453,7 +2684,7 @@ cmd_start() {
       if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
         foreground_handover || return 1
       else
-      say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
+      log_line "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
       start_doctor_loop; local drc=$?
       superseded && return 1
       [ "$drc" -eq 0 ] || return 1
@@ -2492,7 +2723,7 @@ cmd_start() {
       || die "cannot read the process table (ps) — refusing to start on an unreadable read"
   fi
   if [ -n "$own" ] && [ "${ORCH_FOREGROUND:-0}" != 1 ]; then
-    say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
+    log_line "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
     # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
     # live controller exactly like the session branch above, and a cell with a controller but no
     # doctor still cannot reap, land or prune. Fenced like every other path in this function.
@@ -2507,7 +2738,7 @@ cmd_start() {
     # up" when it was not, and named `stop` as the remedy — which this same state dir refuses in this
     # exact state (#1856 review, reproduced). Starting here would put a second controller on one
     # queue, which is what #1761 forbids, so refuse and say exactly what is and is not known.
-    die "a controller runs from this machine's shared harness path (pid $(_pids_join "$live")) and is not provably this state dir's — refusing to start a second controller; it is left alone. Give this repo its own SESSION in $ENV_FILE, or stop it from the state dir that owns it"
+    die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$live")) and is not provably this state dir's ($OR) — refusing to start a second controller; it is left alone. FIX: kill $(_pids_join "$live") — a pid whose state dir is not $OR is a leftover inner-chain member from a previous state dir (the measured row-7 case) and it blocks this cell's first start until it is gone; if it IS this repo's, give this repo its own SESSION in $ENV_FILE instead"
   fi
   # ── a box whose controller is a SERVICE is started BY the service manager (agent-infra#2402) ────
   # Reaching this line means nothing of this cell's is running (every branch above returned or died), so
@@ -2580,10 +2811,10 @@ cmd_start() {
           # word already carries is now reported: rc 4 only for the states a manager stop leaves, and rc 5 for
           # a unit that has given up, which the doctor scores as a NON-clean pass.
           if [ "$_ast_word" = "failed" ]; then
-            say "REFUSING: $CONTROLLER_UNIT is FAILED — its start limit converged and this state dir has NO dispatcher. The service manager will not bring it back without a human: run '$0 start' to re-arm it."
+            log_line "REFUSING: $CONTROLLER_UNIT is FAILED — its start limit converged and this state dir has NO dispatcher. The service manager will not bring it back without a human: run '$0 start' to re-arm it."
             return 5
           fi
-          say "note: NOT re-arming $CONTROLLER_UNIT — the service manager owns this controller and reports it $(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || printf unknown): a deliberate stop is the operator's decision. Run '$0 start' to re-arm it."
+          log_line "note: NOT re-arming $CONTROLLER_UNIT — the service manager owns this controller and reports it $(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || printf unknown): a deliberate stop is the operator's decision. Run '$0 start' to re-arm it."
           return 4
         fi
       fi
@@ -2611,7 +2842,7 @@ cmd_start() {
       done
       [ -n "$(owned_controller_pids 2>/dev/null)" ] \
         || die "$CONTROLLER_UNIT is active but no controller of this state dir is running after ${waited}s — read: journalctl -u $CONTROLLER_UNIT -n 40"
-      say "controller started (systemd $CONTROLLER_UNIT, pid $(_pids_join "$(owned_controller_pids)")) — service-managed: use '$0 stop', not a session"
+      log_line "controller started (systemd $CONTROLLER_UNIT, pid $(_pids_join "$(owned_controller_pids)")) — service-managed: use '$0 stop', not a session"
       # ⛔ THE FENCE APPLIES TO THIS PATH TOO (#2402 review P2). Every other launch in this function
       # re-checks the stop generation; without it a STOP that landed between the pid read above and the
       # unit start is UNDONE — `stop` prints "controller stopped (systemd …)" and returns 0, and the
@@ -2625,7 +2856,7 @@ cmd_start() {
   # path below is the RIGHT answer — but silently ignoring it would hide the only unit on the box from the
   # operator whose cell has just lost its controller. Say it, once, and start this cell normally.
   if [ "${ORCH_FOREGROUND:-0}" != 1 ] && [ -z "${_UNIT_PATH:-}" ] && [ -n "$_UNIT_FOREIGN" ]; then
-    say "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — starting this cell's controller as a session; nothing on this box will restart IT (#2402). Install a unit for this state dir: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
+    log_line "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — starting this cell's controller as a session; nothing on this box will restart IT (#2402). Install a unit for this state dir: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
   fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
@@ -2654,7 +2885,7 @@ cmd_start() {
          # as "no workers" and the unattended prune deleted a LIVE worker's .venv. `-c` consumes all
          # input. (`tmux ls | grep -c` below is already the safe form.)
          if workers_maybe_live; then
-           say "warn: only ${mb}MB free, but workers may still be running — NOT auto-pruning caches (a pruned cache breaks the live lane). Run '$0 prune' once they finish."
+           log_line "warn: only ${mb}MB free, but workers may still be running — NOT auto-pruning caches (a pruned cache breaks the live lane). Run '$0 prune' once they finish."
          else
            cmd_prune --caches
          fi
@@ -2662,7 +2893,7 @@ cmd_start() {
   esac
   harness_apply
   seed_and_stamp
-  say "harness: ${HARNESS_COMMIT:0:12} (${HARNESS_REL}) at $HARNESS${HARNESS_APPLIED:+ [applied]}"
+  log_line "harness: ${HARNESS_COMMIT:0:12} (${HARNESS_REL}) at $HARNESS${HARNESS_APPLIED:+ [applied]}"
   # Re-check the value harness_apply() may have REPLACED: the loop above validated the one that was
   # set when the shell started, and an unreplaced-but-unsafe derived path would otherwise reach the
   # tmux command string unguarded.
@@ -2688,7 +2919,7 @@ cmd_start() {
     cp -p "$rsrc" "$rtmp" 2>/dev/null || { rm -f "$rtmp"; die "record-review.sh missing at $rec and cannot provision it from $rsrc — the harness checkout must be a full agent-infra checkout"; }
     chmod +x "$rtmp" || { rm -f "$rtmp"; die "cannot make $rec executable"; }
     mv -f "$rtmp" "$rec" || { rm -f "$rtmp"; die "cannot install the provisioned recorder at $rec"; }
-    say "provisioned record step: $rsrc -> $rec"
+    log_line "provisioned record step: $rsrc -> $rec"
   fi
   # …and its declared sibling, ALWAYS (not only when the recorder was absent): an operator's older
   # recorder copy can sit beside a missing lib, and cmd_check below refuses that cell. Preserve the
@@ -2701,7 +2932,7 @@ cmd_start() {
     cp -p "$rlibsrc" "$ltmp" 2>/dev/null || { rm -f "$ltmp"; die "diff-normalize.py missing at $rlib and cannot provision it from $rlibsrc — the harness checkout must be a full agent-infra checkout"; }
     chmod +x "$ltmp" || { rm -f "$ltmp"; die "cannot make $rlib executable"; }
     mv -f "$ltmp" "$rlib" || { rm -f "$ltmp"; die "cannot install the provisioned normalizer at $rlib"; }
-    say "provisioned record-step library: $rlibsrc -> $rlib"
+    log_line "provisioned record-step library: $rlibsrc -> $rlib"
   fi
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
@@ -2782,7 +3013,7 @@ cmd_start() {
   # the service manager's cgroup the owner of the controller — and the argv is the SAME
   # `<bash> $HARNESS/orch-loop.sh` the tmux path runs, so every existing pid/ownership read still works.
   if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
-    mkdir -p "$ROLES_DIR" 2>/dev/null && : > "$ROLES_DIR/.desired" 2>/dev/null || say "warn: could not record the desired running state at $ROLES_DIR/.desired"
+    mkdir -p "$ROLES_DIR" 2>/dev/null && : > "$ROLES_DIR/.desired" 2>/dev/null || log_line "warn: could not record the desired running state at $ROLES_DIR/.desired"
     export HOME="$CELL_HOME" CELL_HOME O REPO OR SCOPE ENV_FILE SESSION
     export HARNESS_REPO HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_MATERIALISER="${SUP_SELF:-}"
     # ⛔ AND THE GLOBAL REPO IS DROPPED ON THIS PATH TOO (review P1 round 18, #2402). The tmux path below
@@ -2815,7 +3046,7 @@ cmd_start() {
     # converge to `failed` instead of hiding the fault behind a running-looking unit.
     start_doctor_loop || return 1
     superseded && return 1
-    say "controller: FOREGROUND — this process is the controller (pid $$); its lifetime belongs to the service manager"
+    log_line "controller: FOREGROUND — this process is the controller (pid $$); its lifetime belongs to the service manager"
     exec bash "$HARNESS/orch-loop.sh"
   fi
   # ⛔ AND THE REPO A COMMAND ACTS ON IS PER-INVOCATION STATE, NEVER A GLOBAL EXPORT (measured
@@ -2832,7 +3063,7 @@ cmd_start() {
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
-    say "controller started (tmux '$SESSION'), state=$O"
+    log_line "controller started (tmux '$SESSION'), state=$O"
     superseded && return 1
   else
     die "controller exited immediately — read $O/logs/controller.log"
@@ -2907,7 +3138,7 @@ unit_stop_effect_verdict() { # <unit>
   own="$(owned_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to report a stop from an unreadable read"
   [ -n "$own" ] || return 0
-  say "warn: $1 was stopped but a controller of this state dir (pid $(_pids_join "$own")) is STILL running ${w}s AFTER the teardown — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"
+  log_line "warn: $1 was stopped but a controller of this state dir (pid $(_pids_join "$own")) is STILL running ${w}s AFTER the teardown — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"
   return 1
 }
 cmd_stop() {
@@ -2925,8 +3156,8 @@ cmd_stop() {
   # box), so "a session with this name exists" is NOT evidence that it is this cell's — the #1856
   # hazard, one layer out. Record the claim before the marker goes away: a started cell owns its
   # doctor, and the loop's own identity record proves it directly.
-  rm -f "$ROLES_DIR/.desired" 2>/dev/null || { say "warn: could not remove $ROLES_DIR/.desired — an in-flight restart may re-arm this cell"; rc=1; }
-  bump_stop_generation || { say "warn: could not record the stop generation in $O/$STOP_GEN_FILE_REL — an in-flight start may still complete and undo this stop"; rc=1; }
+  rm -f "$ROLES_DIR/.desired" 2>/dev/null || { log_line "warn: could not remove $ROLES_DIR/.desired — an in-flight restart may re-arm this cell"; rc=1; }
+  bump_stop_generation || { log_line "warn: could not record the stop generation in $O/$STOP_GEN_FILE_REL — an in-flight start may still complete and undo this stop"; rc=1; }
   # ── a SERVICE-MANAGED controller is stopped by its service manager (agent-infra#2402) ─────────
   # ⛔ THIS IS NOT AN OPTIMISATION. `Restart=always` re-creates the controller within RestartSec of ANY
   # kill this function performs (the session kill, the pid TERM, the -9 sweep), so a stop that skips the
@@ -2944,7 +3175,7 @@ cmd_stop() {
   # unit whose ownership it could not prove: the report has to sit beside the DECISION, not beside a
   # non-zero rc.
   if [ -n "$_UNIT_UNPROVABLE" ] && [ "${_UNIT_PATH:-}" = "$_UNIT_UNPROVABLE" ]; then
-    say "warn: $_UNIT_UNPROVABLE carries no Environment=O= line, so it cannot be proven to be this state dir's ($O) — it is addressed because treating it as foreign would launch a second dispatcher beside it (#1761); re-render it (install-controller-service.sh --install) so ownership is readable"
+    log_line "warn: $_UNIT_UNPROVABLE carries no Environment=O= line, so it cannot be proven to be this state dir's ($O) — it is addressed because treating it as foreign would launch a second dispatcher beside it (#1761); re-render it (install-controller-service.sh --install) so ownership is readable"
   fi
   # ⛔ A UNIT THAT IS ANOTHER STATE DIR'S IS NOT THIS CELL'S SUPERVISOR (review P1, #2402), so it is never
   # stopped on this cell's behalf — but it is NAMED: before ownership was read, this verb stopped whatever
@@ -2952,9 +3183,9 @@ cmd_stop() {
   # controller it never touched.
   if [ -n "$_UNIT_FOREIGN" ]; then
     if [ "$have_unit" -eq 1 ]; then
-      say "note: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — left alone"
+      log_line "note: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — left alone"
     else
-      say "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — it is not this cell's supervisor, so this stop leaves it alone; the pid teardown below is what stops this cell"
+      log_line "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — it is not this cell's supervisor, so this stop leaves it alone; the pid teardown below is what stops this cell"
     fi
   fi
   if [ "$have_unit" -eq 1 ]; then
@@ -2974,11 +3205,11 @@ cmd_stop() {
       # yet and fail a stop that then succeeds. Gating on the unit's own state does not separate the two
       # cases either, because in the wrong-scope case the ADDRESSED unit is equally disabled+inactive.
     else
-      say "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
+      log_line "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
     fi
   fi
   if [ -n "$_UNIT_UNPROVABLE" ] && [ "${_UNIT_PATH:-}" != "$_UNIT_UNPROVABLE" ]; then
-    say "warn: a second copy, $_UNIT_UNPROVABLE, carries no Environment=O= line — its ownership is UNKNOWN, not proven; this verb addressed $_UNIT_PATH"
+    log_line "warn: a second copy, $_UNIT_UNPROVABLE, carries no Environment=O= line — its ownership is UNKNOWN, not proven; this verb addressed $_UNIT_PATH"
   fi
   # ORDER: the desired-state marker is dropped first (with the generation bump, above — the two stop
   # signals), then the restart child, then the doctor loop, then its pid backstop, then the marker is
@@ -3007,7 +3238,7 @@ cmd_stop() {
       kill -TERM "$rpid" 2>/dev/null || true
       sleep 1
       kill -0 "$rpid" 2>/dev/null && kill -KILL "$rpid" 2>/dev/null || true
-      say "stopped an in-flight controller restart (pid $rpid)"
+      log_line "stopped an in-flight controller restart (pid $rpid)"
     fi
     rm -f "$ROLES_DIR/restart.ident"
   fi
@@ -3018,19 +3249,19 @@ cmd_stop() {
     # now is ours. So a stale marker plus a peer repo's doctor turned `stop` into a kill of the peer's
     # doctor. Ours-but-stale is the `else` arm below: reported, left alone, and healed by `start`.
     if sup_loop_alive; then
-      tmux kill-session -t "=$DOCTOR_SESSION" || { say "warn: could not stop the doctor loop '$DOCTOR_SESSION'"; rc=1; }
-      say "doctor loop stopped (tmux '$DOCTOR_SESSION')"
+      tmux kill-session -t "=$DOCTOR_SESSION" || { log_line "warn: could not stop the doctor loop '$DOCTOR_SESSION'"; rc=1; }
+      log_line "doctor loop stopped (tmux '$DOCTOR_SESSION')"
     else
       # No loop record and this cell was never started: the session is somebody else's doctor. Leave
       # it alone and say so — the same direction `stop` takes for a foreign CONTROLLER.
-      say "note: doctor session '$DOCTOR_SESSION' exists but is not provably this cell's (no loop record, cell not started) — left alone"
+      log_line "note: doctor session '$DOCTOR_SESSION' exists but is not provably this cell's (no loop record, cell not started) — left alone"
     fi
   fi
   # ⛔ The "survived" verdict is FENCED too: a live pid whose recorded identity no longer matches is
   # a RECYCLED pid, not our loop — warning about it (and returning rc=1) would tell the operator that
   # a successful stop failed.
   if ! end_loop_pid "$lpid" "$lident"; then
-    say "warn: the doctor loop (pid $lpid) survived the stop and could not be ended"; rc=1
+    log_line "warn: the doctor loop (pid $lpid) survived the stop and could not be ended"; rc=1
   fi
   rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid"
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -3053,7 +3284,7 @@ cmd_stop() {
       if [ -f "$LOCK" ]; then
         local lp; lp="$(tr -dc '0-9' 2>/dev/null < "$LOCK")"
         if [ -n "$lp" ] && ! kill -0 "$lp" 2>/dev/null; then
-          rm -f "$LOCK" && say "released a stale lock $LOCK (its owner pid $lp is gone)"
+          rm -f "$LOCK" && log_line "released a stale lock $LOCK (its owner pid $lp is gone)"
         fi
       fi
       # A stop that went through the SERVICE MANAGER says so: "not running" is true but reads as "there
@@ -3066,13 +3297,13 @@ cmd_stop() {
         unit_stop_effect_verdict "$stop_unit" || rc=1
         [ "$rc" -eq 0 ] || return 1
       fi
-      if [ -n "$stop_unit" ]; then say "controller stopped (systemd $stop_unit)"; else say "not running"; fi
+      if [ -n "$stop_unit" ]; then log_line "controller stopped (systemd $stop_unit)"; else log_line "not running"; fi
       # A doctor-loop stop failure recorded above still fails the verb: "not running" is about the
       # CONTROLLER, and this branch used to return 0 over it.
       [ "$rc" -eq 0 ] || return 1
       return 0
     fi
-    say "no tmux session '$SESSION', but a controller is live (pid $(_pids_join "$own")) — stopping it"
+    log_line "no tmux session '$SESSION', but a controller is live (pid $(_pids_join "$own")) — stopping it"
   else
     # ⛔ A TMUX SESSION IS A MACHINE-SCOPED NAME (`orch` by default), NOT A PER-REPO ONE. Two repos on
     # one machine share it, so "a session with this name exists" is not evidence that THIS repo's
@@ -3093,7 +3324,7 @@ cmd_stop() {
     # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
     # success while the controller is still running (the same "failed precondition as success" shape).
     tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
-    say "controller stopped (tmux '$SESSION')"
+    log_line "controller stopped (tmux '$SESSION')"
   fi
   # Terminate the owners this cell may signal, and PROVE they are gone BEFORE releasing the lock. A
   # lock removed while its owner lives is #1761's duplicate: the next `start` acquires it and runs a
@@ -3126,8 +3357,8 @@ cmd_stop() {
   live="$(seen_controller_pids)" \
     || die "cannot read the process table (ps) — NOT releasing $LOCK on an unreadable read"
   foreign="$(_pids_minus "$live" "$own")"
-  [ -z "$foreign" ] || say "note: a controller for ANOTHER repo is still running from the shared harness path (pid $(_pids_join "$foreign")) — left alone"
-  rm -f "$LOCK" && say "released lock $LOCK"
+  [ -z "$foreign" ] || log_line "note: a controller for ANOTHER repo is still running from the shared harness path (pid $(_pids_join "$foreign")) — left alone"
+  rm -f "$LOCK" && log_line "released lock $LOCK"
   [ "$rc" -eq 0 ] || return 1
   return 0
 }
@@ -3141,21 +3372,21 @@ cmd_status() {
   if [ -n "$own" ]; then
     # Name the owner and the scope (#1761's per-box read): the answer to "which box owns this queue",
     # from the lock and this cell's own process scope — never the tmux session alone.
-    say "controller: RUNNING (pid $(_pids_join "$own")) — scope=$SCOPE repo=$OR"
+    log_line "controller: RUNNING (pid $(_pids_join "$own")) — scope=$SCOPE repo=$OR"
   elif [ -n "$cpids" ]; then
     # ⛔ SEEN BUT NOT OWNED. HARNESS_PIN_DIR is one directory per cell home, so a controller for a
     # DIFFERENT repo on this machine runs the SAME harness path and this read returns it (#1856
     # review, reproduced). Naming it as this state dir's owner would attribute another repo's work
     # to this queue, so say exactly what was read and which part is not ours.
-    say "controller: RUNNING (pid $(_pids_join "$cpids")) — NOT this state dir's (another repo sharing the harness path); scope=$SCOPE repo=$OR"
+    log_line "controller: RUNNING (pid $(_pids_join "$cpids")) — NOT this state dir's (another repo sharing the harness path); scope=$SCOPE repo=$OR"
   elif tmux has-session -t "$SESSION" 2>/dev/null; then
     # The session exists but no orch-loop.sh pid is visible yet: `start` spends seconds in
     # check/seed before the loop execs, so report starting — NOT the false STOPPED.
-    say "controller: RUNNING (tmux '$SESSION', no orch-loop.sh pid observed yet) — scope=$SCOPE repo=$OR"
+    log_line "controller: RUNNING (tmux '$SESSION', no orch-loop.sh pid observed yet) — scope=$SCOPE repo=$OR"
   else
-    say "controller: STOPPED"
+    log_line "controller: STOPPED"
   fi
-  [ -z "$foreign" ] || say "also seen:  pid $(_pids_join "$foreign") runs this machine's harness but does not hold $LOCK — another repo's controller; reported, never signalled"
+  [ -z "$foreign" ] || log_line "also seen:  pid $(_pids_join "$foreign") runs this machine's harness but does not hold $LOCK — another repo's controller; reported, never signalled"
   # agent-infra#2402: is there anything ABOVE the controller that restarts it? A dead controller and an
   # idle box print the same `controller: STOPPED` / `lanes: 0`, so "who would restart this" belongs in
   # this output and not in an operator's memory. Reported, never refused: `status` must stay answerable
@@ -3173,34 +3404,34 @@ cmd_status() {
     local _ast
     controller_unit_active_state; _ast=$?
     case "$_ast" in
-      0) say "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human" ;;
-      1) say "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT" ;;
-      *) say "supervision: ⚠ $CONTROLLER_UNIT is installed but its STATE COULD NOT BE READ ($(sup_systemctl is-active "$CONTROLLER_UNIT" 2>&1 | head -1)) — whether anything restarts a dead controller is UNKNOWN, not 'no'" ;;
+      0) log_line "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human" ;;
+      1) log_line "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT" ;;
+      *) log_line "supervision: ⚠ $CONTROLLER_UNIT is installed but its STATE COULD NOT BE READ ($(sup_systemctl is-active "$CONTROLLER_UNIT" 2>&1 | head -1)) — whether anything restarts a dead controller is UNKNOWN, not 'no'" ;;
     esac
     # ⛔ AND THE ROW SAYS WHETHER OWNERSHIP WAS PROVEN (review P1, #2402): a unit of ANOTHER state dir's
     # must never be reported as this cell's supervision, and a unit that declares no owner at all is
     # UNKNOWN rather than either answer.
-    [ "${_UNIT_UNPROVABLE:-}" != "$_svc" ] || say "supervision: ⚠ ownership NOT proven — $_svc carries no Environment=O= line, so whether it supervises this state dir ($O) is UNKNOWN; the row above describes the copy this verb addressed"
-    [ -z "$_UNIT_FOREIGN" ] || say "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O)"
+    [ "${_UNIT_UNPROVABLE:-}" != "$_svc" ] || log_line "supervision: ⚠ ownership NOT proven — $_svc carries no Environment=O= line, so whether it supervises this state dir ($O) is UNKNOWN; the row above describes the copy this verb addressed"
+    [ -z "$_UNIT_FOREIGN" ] || log_line "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O)"
   else
-    say "supervision: ⛔ NONE — the controller is a tmux session and nothing restarts it (#2402); install the service: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
+    log_line "supervision: ⛔ NONE — the controller is a tmux session and nothing restarts it (#2402); install the service: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
     # ⛔ "NONE" IS A CLAIM ABOUT THIS STATE DIR, not about the box (review P1, #2402). A unit for another
     # cell is not this cell's supervision, and printing only NONE left an operator with no way to see
     # that the box DOES have a unit — pointed at a different state dir.
-    [ -z "$_UNIT_FOREIGN" ] || say "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O), so it will not restart this cell's controller"
-    [ -z "$_UNIT_UNPROVABLE" ] || say "supervision: ⚠ $_UNIT_UNPROVABLE carries no Environment=O= line — whether it supervises this state dir ($O) is UNKNOWN, not 'no'"
+    [ -z "$_UNIT_FOREIGN" ] || log_line "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O), so it will not restart this cell's controller"
+    [ -z "$_UNIT_UNPROVABLE" ] || log_line "supervision: ⚠ $_UNIT_UNPROVABLE carries no Environment=O= line — whether it supervises this state dir ($O) is UNKNOWN, not 'no'"
   fi
-  say "state dir: $O"
+  log_line "state dir: $O"
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
   # `status` is the verb an operator runs to DISCOVER that the pair is wrong.
-  say "queue: ${QUEUE_REPO:-<unknown>} @ $REPO — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
+  log_line "queue: ${QUEUE_REPO:-<unknown>} @ ${REPO:-<unset>} — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
   # agent-infra#1745: the answer to "which commit is this cell running?", from the record `start`
   # wrote. Printed even when the controller is stopped — a stale cell is a stale cell.
   if [ -f "$STAMP" ]; then
-    say "harness: $(stamp_field commit | cut -c1-12) [$(stamp_field relation)] from $(stamp_field harness)"
+    log_line "harness: $(stamp_field commit | cut -c1-12) [$(stamp_field relation)] from $(stamp_field harness)"
   elif [ -n "$HARNESS" ]; then
-    say "harness: UNRECORDED at $HARNESS ($(harness_commit | cut -c1-12)) — run: $0 apply"
+    log_line "harness: UNRECORDED at $HARNESS ($(harness_commit | cut -c1-12)) — run: $0 apply"
   fi
   # ── the PIN and the last self-refresh verdict (agent-infra#2215) ────────────────────────────────
   # MEASURED 2026-10-20: three cells ran 27 commits behind origin/main with an EMPTY pin. The stamp
@@ -3208,13 +3439,13 @@ cmd_status() {
   # now (the controller re-pins itself every cycle). They can legitimately disagree for one cycle
   # after a re-pin, which is why both are printed — but an EMPTY pin is never a quiet absence: its
   # own state, with the remedy, because it is the state the fleet sat in for hours.
-  local _pin _pv _hrf _k _rel _run _act _at _age _fet
+  local _pin _pv _hrf _k _rel _run _act _at _age _fet _rq
   _pin="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
   _pv="$(head -1 "$_pin" 2>/dev/null | tr -d '[:space:]')"
   if [ -n "$_pv" ]; then
-    say "pin: ${_pv:0:12} ($_pin)"
+    log_line "pin: ${_pv:0:12} ($_pin)"
   else
-    say "⛔ PIN EMPTY ($_pin) — nothing here records which harness this cell is deployed to; that is the measured 2026-10-20 state of all three cells. The controller's next cycle records it (harness-refresh.sh); '$0 apply' additionally re-seeds from $HARNESS_REF."
+    log_line "⛔ PIN EMPTY ($_pin) — nothing here records which harness this cell is deployed to; that is the measured 2026-10-20 state of all three cells. The controller's next cycle records it (harness-refresh.sh); '$0 apply' additionally re-seeds from $HARNESS_REF."
   fi
   _hrf="$O/state/harness-refresh"
   if [ -f "$_hrf" ]; then
@@ -3228,13 +3459,13 @@ cmd_status() {
     _age=""
     case "${_at:-}" in ''|*[!0-9]*) _age="age unknown (no usable at= — cannot-verify is not fresh)" ;;
       *) _age="$(( ( $(date +%s) - _at ) / 60 ))m ago" ;; esac
-    say "self-refresh: ${_rel:-unknown} (runs ${_run:-unknown}, action=${_act:-none}, fetch=${_fet:-unknown}) — $_age"
+    log_line "self-refresh: ${_rel:-unknown} (runs ${_run:-unknown}, action=${_act:-none}, fetch=${_fet:-unknown}) — $_age"
     # ⛔ A RELATION IS ONLY AS GOOD AS THE COMPARISON IT WAS MADE FROM. `current` against a ref this cycle
     # could not fetch (or did not fetch) is cannot-verify, and the state record says so — but only if
     # `status` prints it, or the operator reads `current` and stops there.
     case "${_fet:-ok}" in
       ok) : ;;
-      *) say "⛔ self-refresh comparison was NOT fresh (fetch=$_fet) — a 'current' above means 'current against the ref as of the last successful fetch', not against origin now" ;;
+      *) log_line "⛔ self-refresh comparison was NOT fresh (fetch=$_fet) — a 'current' above means 'current against the ref as of the last successful fetch', not against origin now" ;;
     esac
     # A verdict older than two cycles is not this cycle's answer: the controller has stopped
     # refreshing, so the pin above is a fact about the PAST. Same age-bound rule as the funnel, and the
@@ -3244,17 +3475,45 @@ cmd_status() {
     case "${_at:-}" in
       ''|*[!0-9]*) : ;;
       *) if [ $(( $(date +%s) - _at )) -gt $(( ${CYC:-240} * 2 + 300 )) ]; then
-           say "⛔ self-refresh STALE (>${_age:-?}) — the controller is not re-pinning; the pin above describes an older cycle"
+           log_line "⛔ self-refresh STALE (>${_age:-?}) — the controller is not re-pinning; the pin above describes an older cycle"
          fi ;;
     esac
   else
-    say "self-refresh: NO RECORD at $_hrf — no cycle has recorded a self-refresh verdict yet (started before this check existed, or the loop cannot write state)"
+    log_line "self-refresh: NO RECORD at $_hrf — no cycle has recorded a self-refresh verdict yet (started before this check existed, or the loop cannot write state)"
+  fi
+  # ── the restart DECISION, and what became of it (agent-infra#2641) ──────────────────────────
+  # `restart-pending` used to be a word printed into a reason string. On a cell it was also PERMANENT
+  # (the running identity could not be read there at all), so the same box printed `[current]` on the
+  # `harness:` line above and `restart-pending` here, for ever. The per-cycle record now carries the
+  # REASON and a request; printing it beside the verdict is what makes "requested at T … honoured at
+  # T+n / refused because Y" readable from the one verb an operator runs.
+  # ⛔ AN ABSENT RECORD IS NOT "NOTHING PENDING": no cycle has recorded a request, which is a different
+  # fact, and the same absence-vs-empty rule the rest of this file follows.
+  _rq="$O/state/restart-request"
+  if [ -f "$_rq" ]; then
+    log_line "restart: $(sed 's/^restart //' "$_rq" 2>/dev/null)"
+    case "$(cat "$_rq" 2>/dev/null)" in
+      # ⛔ `blocked=identity` IS ITS OWN CAUSE, AND IT COMES FIRST. The generic blocked arm below says
+      # "something this box can see would be interrupted" — but `harness-refresh.sh` writes
+      # `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
+      # is a CLAIM. Nothing was measured busy there, so the generic sentence names a cause that does not
+      # exist and tells the operator to wait for a population that may never exist — the misdirection this
+      # change exists to remove.
+      *'request=pending'*'blocked=identity'*)
+        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. Nothing is interrupted and nothing is waiting: re-check once the controller's argv/lock is readable." ;;
+      *'request=pending'*'actuation=blocked'*)
+        log_line "⛔ a restart is PENDING and was NOT applied — something this box can see would be interrupted (named in blocked=/lanes= above). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm, once that population is idle." ;;
+      *'request=pending'*'actuation=safe'*)
+        log_line "a restart is PENDING and was NOT applied — every population this box can measure was empty (checked=argv,roles,tree; blind=reparented-no-wrapper). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm." ;;
+    esac
+  else
+    log_line "restart: NO REQUEST RECORD at $_rq (no cycle has recorded one — that is not the same as 'nothing pending')"
   fi
   # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
   # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
   # orch-loop.sh records the reason in .refresh-blocked; surface it instead of leaving it in a log.
   if [ -f "$O/.refresh-blocked" ]; then
-    say "⛔ MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched"
+    log_line "⛔ MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched"
     sed 's/^/    /' "$O/.refresh-blocked"
   fi
   # agent-infra#1987: the cache bound runs on this cell's clock as a BACKGROUND job, so its exit
@@ -3265,7 +3524,7 @@ cmd_status() {
     # NOT "fail-closed": exit 5 (a cache over bound on the shipped dry-run stance) is the common
     # case on an unarmed box, and the reaper's exit vocabulary calls only 3 fail-closed. The record
     # below already names the cause (5 = unarmed, 3 = the pass failed) — do not contradict it.
-    say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
+    log_line "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
   # agent-infra#2032: the scheduled DISK reaper. Its pass record is the only place that answers
@@ -3280,7 +3539,7 @@ cmd_status() {
     [ -n "$cand" ] && [ -f "$cand" ] && { _dr="$cand"; break; }
   done
   if [ -z "$_dr" ]; then
-    say "⛔ DISK REAPER NOT INSTALLED — no disk-reaper.sh found (\$DISK_REAPER, \$HOME/.pi/agent/scripts, beside this script); the uv caches, dead lane venvs and merged worktrees are unbounded"
+    log_line "⛔ DISK REAPER NOT INSTALLED — no disk-reaper.sh found (\$DISK_REAPER, \$HOME/.pi/agent/scripts, beside this script); the uv caches, dead lane venvs and merged worktrees are unbounded"
   else
     _drs="$(bash "$_dr" --print-status 2>/dev/null)"; _drc=$?
     _dst="$(printf '%s\n' "$_drs" | sed -n 's/^status=//p' | head -1)"
@@ -3290,9 +3549,9 @@ cmd_status() {
             # and the old format appended a hardcoded MB to it — `uv=unmeasuredMB` reads as a byte count
             # to every consumer. Numeric values keep their unit; the sentinel is printed as it stands.
             _dr_mb() { case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}" ;; *) printf '%sMB' "$1" ;; esac; }
-            say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))"
+            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))"
     elif [ "$_dst" = "never" ]; then
-      say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
+      log_line "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
     elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
          && _dage="$(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)" \
          && [ -n "$_dage" ] && [ "$_dage" -ge 0 ] 2>/dev/null \
@@ -3306,21 +3565,21 @@ cmd_status() {
       # to skip. A stale deferral falls through to the ⛔ arm, which names the age.
       # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
       # the channel here — which is why it must not go quiet.)
-      say "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
-      say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+      log_line "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
     else
-      say "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
-      say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+      log_line "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
     fi
   fi
   # the loop's own view of itself
-  tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
+  tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || log_line "  (no orch-loop.log yet)"
   # ⛔ NOT `tmux ls | grep -c '^lane-'`: where the cmux daemon answers a cell's lanes are durable
   # terminals, so that answered 0 for a busy box. (The `grep -c` form is SIGPIPE-safe — it consumes all
   # input — but it is still the wrong SOURCE: where the launcher is tmux (#2210) it lists only that
   # surface, and the census is the one read that is right on both.) An unreadable census prints
   # UNKNOWN, never 0.
-  say "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
+  log_line "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
   # the fix for the measured "a dead loop looks identical to an idle cell".
@@ -3330,13 +3589,13 @@ cmd_status() {
     rrc=$?
     printf '%s\n' "$rl" | sed 's/^/  /'
   else
-    say "  roles: UNKNOWN — cloud-cell-doctor.sh not found (run: $0 apply)"
+    log_line "  roles: UNKNOWN — cloud-cell-doctor.sh not found (run: $0 apply)"
     [ -f "$ROLES_DIR/.desired" ] && rrc=1
   fi
   return "$rrc"
 }
 
-cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at $O/logs/orch-loop.log"; }
+cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || log_line "no log yet at $O/logs/orch-loop.log"; }
 
 # ── the cell doctor's roles (agent-infra#1989) ──────────────────────────────────────────────────
 # `cloud-cell-doctor.sh` owns the passes; this file owns the launch and the report. The seeded copy
@@ -3390,7 +3649,7 @@ start_doctor_loop() {
   # take the CONTROLLER down with it, so this is a NAMED warning and rc 0. A PRESENT doctor that fails
   # to LAUNCH is a different fact entirely and must never be reported this way (#2306).
   if ! d="$(doctor_path)"; then
-    say "warning: the doctor is not shipped (cloud-cell-doctor.sh absent — #2160 retired the forks, and no copy was found in $O, beside $SUP_SELF, or in the pinned harness) — the controller runs, but reaping/hygiene/merge is NOT automatic; read $O/logs/cell-doctor.log"
+    log_line "warning: the doctor is not shipped (cloud-cell-doctor.sh absent — #2160 retired the forks, and no copy was found in $O, beside $SUP_SELF, or in the pinned harness) — the controller runs, but reaping/hygiene/merge is NOT automatic; read $O/logs/cell-doctor.log"
     return 0
   fi
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
@@ -3400,16 +3659,16 @@ start_doctor_loop() {
     # leave this cell with no doctor at all (its reap/merge/hygiene roles silently never run) while
     # `start` printed "already running".
     if sup_loop_alive; then
-      say "doctor loop already running (tmux '$DOCTOR_SESSION', pid $(cat "$ROLES_DIR/loop.pid" 2>/dev/null))"
+      log_line "doctor loop already running (tmux '$DOCTOR_SESSION', pid $(cat "$ROLES_DIR/loop.pid" 2>/dev/null))"
       return 0
     fi
     if doctor_session_foreign; then
-      die "doctor session '$DOCTOR_SESSION' belongs to another state dir — a session name is shared across cells, so it is not evidence that $OR has a doctor; pin a distinct DOCTOR_SESSION per cell in $ENV_FILE, or stop the cell that owns it"
+      die "doctor session '$DOCTOR_SESSION' belongs to another state dir ($(doctor_session_state_dir || true)) — a session name is shared across cells, so it is not evidence that $OR has a doctor. FIX: tmux kill-session -t '$DOCTOR_SESSION' (that ends the OTHER cell's doctor; its own supervisor/start re-creates it), or pin a distinct DOCTOR_SESSION for $OR in $ENV_FILE"
     fi
     # Ours-but-stale (its loop record is gone) or unprovable: replacing it is the heal `start` exists
     # for, and the alternative — reporting "already running" — would leave this cell with no doctor at
     # all while printing success.
-    say "doctor session '$DOCTOR_SESSION' has no live loop record — replacing it with a fresh loop"
+    log_line "doctor session '$DOCTOR_SESSION' has no live loop record — replacing it with a fresh loop"
     tmux kill-session -t "=$DOCTOR_SESSION" 2>/dev/null || true
   fi
   # ⛔ A LIVE LOOP RECORD COUNTS AS RUNNING even with no session. After a tmux server restart the
@@ -3418,7 +3677,7 @@ start_doctor_loop() {
   # `supervisor start`; a session-only idempotency check would create a SECOND loop, which overwrites
   # `loop.pid` and hides the orphan from `stop`/`status` (and every later `start` adds another).
   if sup_loop_alive; then
-    say "doctor loop already running (pid $(cat "$ROLES_DIR/loop.pid" 2>/dev/null) — no tmux session, likely a tmux server restart)"
+    log_line "doctor loop already running (pid $(cat "$ROLES_DIR/loop.pid" 2>/dev/null) — no tmux session, likely a tmux server restart)"
     return 0
   fi
   # ⛔ The command string interpolates only values cmd_start has already validated (see the note on
@@ -3468,12 +3727,12 @@ start_doctor_loop() {
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     sleep 0.5
     if ! tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
-      say "FATAL: the doctor session came up and then EXITED (tmux '$DOCTOR_SESSION', doctor $d) —" >&2
-      say "       no role is scheduling. Read $O/logs/cell-doctor.log${_why:+ (tmux said: ${_why% })}" >&2
+      log_line "FATAL: the doctor session came up and then EXITED (tmux '$DOCTOR_SESSION', doctor $d) —" >&2
+      log_line "       no role is scheduling. Read $O/logs/cell-doctor.log${_why:+ (tmux said: ${_why% })}" >&2
       [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
       return 1
     fi
-    say "doctor loop started (tmux '$DOCTOR_SESSION', doctor $d)"
+    log_line "doctor loop started (tmux '$DOCTOR_SESSION', doctor $d)"
     [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
   else
     # ⛔ THE MESSAGE IS DECIDED BY THE FILE, NOT BY THE SESSION (#2306). This branch used to print
@@ -3485,18 +3744,18 @@ start_doctor_loop() {
     # this verb: the controller is up, but reap/merge/hygiene will never run.
     _why="$(head -3 "$_launch_err" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
     [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
-    say "FATAL: the doctor loop did NOT start (tmux new-session rc=${_lrc:-0}${_why:+: ${_why% }})" >&2
+    log_line "FATAL: the doctor loop did NOT start (tmux new-session rc=${_lrc:-0}${_why:+: ${_why% }})" >&2
     if [ ! -s "$d" ]; then
       # A file that exists but is EMPTY is neither absent nor a launch failure (#2306 review): it is a
       # seed killed mid-write or a full disk, and the remedy is a re-seed, not a retry.
-      say "       $d is present but EMPTY — a copy killed mid-write or a full disk, which is worse than" >&2
-      say "       absent. Re-seed it: $0 apply" >&2
+      log_line "       $d is present but EMPTY — a copy killed mid-write or a full disk, which is worse than" >&2
+      log_line "       absent. Re-seed it: $0 apply" >&2
       return 1
     fi
-    say "       the doctor IS present at $d — this is a LAUNCH failure, NOT a retired artifact (#2160" >&2
-    say "       retired the forks; the doctor survived). The controller is up but reap/merge/hygiene" >&2
-    say "       are NOT automatic until a doctor loop runs. Read $O/logs/cell-doctor.log, then retry:" >&2
-    say "       $0 start   (replacing a stale session: tmux kill-session -t '=$DOCTOR_SESSION')" >&2
+    log_line "       the doctor IS present at $d — this is a LAUNCH failure, NOT a retired artifact (#2160" >&2
+    log_line "       retired the forks; the doctor survived). The controller is up but reap/merge/hygiene" >&2
+    log_line "       are NOT automatic until a doctor loop runs. Read $O/logs/cell-doctor.log, then retry:" >&2
+    log_line "       $0 start   (replacing a stale session: tmux kill-session -t '=$DOCTOR_SESSION')" >&2
     return 1
   fi
 }
@@ -3556,17 +3815,17 @@ cmd_apply() {
   # the NEW pin (start calls seed_and_stamp) — one cycle of "pinned ahead, running behind", disclosed
   # as `restart-pending`, and never a mixed pair of script versions in one loop.
   if [ "$pin_only" = 1 ]; then
-    say "harness PINNED: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
-    say "  path:   $HARNESS"
-    say "  ref:    $HARNESS_REF in $HARNESS_REPO"
-    say "  record: $HARNESS_PIN_FILE (seed NOT updated: 'start' re-seeds \$O from this pin, so running code never mixes two harness commits)"
+    log_line "harness PINNED: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
+    log_line "  path:   $HARNESS"
+    log_line "  ref:    $HARNESS_REF in $HARNESS_REPO"
+    log_line "  record: $HARNESS_PIN_FILE (seed NOT updated: 'start' re-seeds \$O from this pin, so running code never mixes two harness commits)"
     return 0
   fi
   seed_and_stamp
-  say "harness applied: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
-  say "  path:   $HARNESS"
-  say "  ref:    $HARNESS_REF in $HARNESS_REPO"
-  say "  record: $STAMP"
+  log_line "harness applied: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
+  log_line "  path:   $HARNESS"
+  log_line "  ref:    $HARNESS_REF in $HARNESS_REPO"
+  log_line "  record: $STAMP"
 }
 
 # ── the lane-venv reaper this cell delegates to (agent-infra#1932) ────────────────────────────────
@@ -3591,7 +3850,7 @@ reclaim_lane_venvs() {
   [ -n "$repo" ] && [ -d "$repo" ] || return 0
   mb_before="$(free_mb "$CELL_HOME")"
   if ! reaper="$(venv_reaper_path)"; then
-    say "prune: warn: reap-lane-venvs.sh not found (harness \$HARNESS, ~/.pi/agent/scripts, \$AGENT_INFRA_PATH) — every worktree .venv is KEPT. A blind rm here would delete a live lane's env; that is what #1932 removed."
+    log_line "prune: warn: reap-lane-venvs.sh not found (harness \$HARNESS, ~/.pi/agent/scripts, \$AGENT_INFRA_PATH) — every worktree .venv is KEPT. A blind rm here would delete a live lane's env; that is what #1932 removed."
     return 0
   fi
   # ⛔ rc=5 is NOT a failed reap (review of PR #1949): the reaper exited 5 because free disk is below
@@ -3609,12 +3868,12 @@ reclaim_lane_venvs() {
     # KEPT. Naming only the first told an operator the env "was proven dead" and to hunt a REMOVE-FAILED
     # line that does not exist on the second path; naming only the second (the previous wording) was the
     # same error inverted. The arm states both, because `4` carries both.
-    4) say "prune: warn: a lane-venv removal did not complete (rc=4) — either it was proven dead and the delete FAILED (see the reaper's REMOVE-FAILED lines), or a removal-time re-probe failed closed and the env was KEPT (see FAIL-CLOSED); the reaper's own log says which" ;;
-    5) say "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
-    *) say "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
+    4) log_line "prune: warn: a lane-venv removal did not complete (rc=4) — either it was proven dead and the delete FAILED (see the reaper's REMOVE-FAILED lines), or a removal-time re-probe failed closed and the env was KEPT (see FAIL-CLOSED); the reaper's own log says which" ;;
+    5) log_line "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
+    *) log_line "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
   esac
   mb_after="$(free_mb "$CELL_HOME")"
-  [ -n "$mb_before" ] && [ -n "$mb_after" ] && say "prune: lane venvs: free ${mb_before}MB → ${mb_after}MB"
+  [ -n "$mb_before" ] && [ -n "$mb_after" ] && log_line "prune: lane venvs: free ${mb_before}MB → ${mb_after}MB"
   return 0
 }
 
@@ -3626,7 +3885,7 @@ reclaim_lane_venvs() {
 rm_cache() {
   [ -e "$1" ] || return 0
   local mb; mb="$(du -sm "$1" 2>/dev/null | awk '{print $1}')"
-  if rm -rf "$1" 2>/dev/null; then say "prune: -${mb:-?}MB $1"; else say "warn: could not remove $1"; fi
+  if rm -rf "$1" 2>/dev/null; then log_line "prune: -${mb:-?}MB $1"; else log_line "warn: could not remove $1"; fi
 }
 
 # Regenerable caches at ONE worktree root. `--maxdepth 5` keeps the pycache sweep bounded.
@@ -3679,7 +3938,7 @@ reap_global_caches() {
   if ! reaper="$(cache_reaper_path)"; then
     # NEVER silent: a prune that leaves the biggest consumer alone because a script was missing is
     # the same false PASS this repo keeps removing. Named, with the remedy.
-    say "warn: pi-cache-reap.sh not found (looked beside this script and in \$HOME/.pi/agent/scripts) — the machine-global uv/npm/pip caches were NOT bounded. Farm it: bash pi-bootstrap/setup.sh"
+    log_line "warn: pi-cache-reap.sh not found (looked beside this script and in \$HOME/.pi/agent/scripts) — the machine-global uv/npm/pip caches were NOT bounded. Farm it: bash pi-bootstrap/setup.sh"
     return 0
   fi
   rc=0
@@ -3691,7 +3950,7 @@ reap_global_caches() {
   # most common outcome on a busy cell, and this is the only ARMED call site — leaving it out would
   # print a warning every hour on a healthy box, which is the alarm-fatigue defect this code was
   # written to avoid (and the one `disk-reaper.sh` now maps to a green unit). 3 stays a warning.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || [ "$rc" -eq 7 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || [ "$rc" -eq 7 ] || log_line "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
   return 0
 }
 
@@ -3784,12 +4043,13 @@ cmd_prune() {
     # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
     # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
     # that is not an empty dir, a linked worktree, or a pin root of hex-named directories (plus a root
-    # whose only other entries are `.DS_Store`/`._*` regular files — see its header for the allow-list).
+    # whose only other entries are `.DS_Store`/`._*` regular files or the harness's OWN named records —
+    # see its header for the whole allow-list).
     assert_pin_dir_safe "$HARNESS_PIN_DIR"
     if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
       # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate
       # the harness's OWN source directories and reclaim them. There are no superseded siblings here.
-      say "prune: HARNESS_PIN_DIR is a single worktree — no superseded pins to reclaim"
+      log_line "prune: HARNESS_PIN_DIR is a single worktree — no superseded pins to reclaim"
     else
       for d in "$HARNESS_PIN_DIR"/*/; do
         d="${d%/}"
@@ -3824,12 +4084,12 @@ cmd_prune() {
         # not be consulted at all is this file's own "instrument that cannot answer its own question".
         case "$?" in
           0) ;;
-          2) say "prune: NOT reclaiming $d — cannot VERIFY it is a pin: ${PIN_OWNED_ERR:-HARNESS_REPO is unresolved or not a git checkout}. Fix HARNESS_REPO (or the object store), then re-run '$0 prune'"
+          2) log_line "prune: NOT reclaiming $d — cannot VERIFY it is a pin: ${PIN_OWNED_ERR:-HARNESS_REPO is unresolved or not a git checkout}. Fix HARNESS_REPO (or the object store), then re-run '$0 prune'"
              continue ;;
-          *) say "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
+          *) log_line "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
              continue ;;
         esac
-        say "prune: reclaiming superseded harness pin $d"
+        log_line "prune: reclaiming superseded harness pin $d"
         # Deregister as well as delete. A bare `git worktree prune` is banned (#1141), so the removal
         # must be PATH-SCOPED — but a removal that only `rm -rf`'d left a phantom `worktree list`
         # entry plus its admin dir behind, one per pin forever, on the very verb that exists to stop a
@@ -3840,7 +4100,7 @@ cmd_prune() {
     fi
   fi
   before="$(free_mb "$CELL_HOME")"
-  tmux has-session -t "$SESSION" 2>/dev/null && say "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
+  tmux has-session -t "$SESSION" 2>/dev/null && log_line "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
   for r in "$REPO" "$HARNESS_REPO"; do
     [ -n "$r" ] || continue
     git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
@@ -3863,20 +4123,20 @@ cmd_prune() {
       # has a cwd inside it; a skip nobody can see is the same defect as the clamp this replaces
       # (the doctor declining to reclaim precisely when the box is busiest).
       if root_excluded "$root"; then
-        say "prune: caches NOT swept at $root — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+        log_line "prune: caches NOT swept at $root — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
         continue
       fi
       sweep_root_caches "$root"
     done \
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
     if root_excluded "$r"; then
-      say "prune: caches NOT swept at $r — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+      log_line "prune: caches NOT swept at $r — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
     else
       sweep_root_caches "$r"
     fi
   done
   reap_global_caches
-  [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }
+  [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && log_line "prune: free ${before}MB → ${after}MB"; return 0; }
   # (3) /tmp review scratch. REPORTED, never deleted implicitly: a scratch checkout is source, and
   # the brief is explicit that source may be unmerged work. --scratch deletes only what is (a) a git
   # checkout, (b) NOT a registered worktree, and (c) older than DAYS.
@@ -3900,12 +4160,12 @@ cmd_prune() {
     fi
   done
   if [ -n "$kept" ]; then
-    say "prune: scratch checkouts still on disk (source — NOT deleted; use --scratch[=DAYS] to reclaim):"
+    log_line "prune: scratch checkouts still on disk (source — NOT deleted; use --scratch[=DAYS] to reclaim):"
     printf '%s\n' "$kept"
   fi
   [ "$freed_scratch" = 1 ] || true
   after="$(free_mb "$CELL_HOME")"
-  [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"
+  [ -n "$before" ] && [ -n "$after" ] && log_line "prune: free ${before}MB → ${after}MB"
 }
 
 case "${1:-status}" in
@@ -3920,5 +4180,5 @@ case "${1:-status}" in
   merge)   shift; cmd_merge "$@" ;;
   reap)    shift; cmd_reap "$@" ;;
   hygiene) shift; cmd_hygiene "$@" ;;
-  *)       say "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
+  *) log_line "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac

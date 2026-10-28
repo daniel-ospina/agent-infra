@@ -22,16 +22,29 @@
 # adds no lane ceiling of its own — the `fix-<PR>` workers it spawns are the SAME `fix-` sessions the
 # existing fixer arms spawn, so every existing census/reaper/cap counts them unchanged.
 #
-# ── BACK-PRESSURE: THE PARALLEL LANE'S RULE, RESPECTED, NOT REINVENTED ───────────────────────────
-# Sending a new head into a deep CI queue buys nothing and DESTROYS the head-bound review attestation
-# for the PR it touches (`reviewer-preflight.sh`, agent-infra#2148). The rule for that is
-# `ci-queue.sh` (branch `fix/ci-queue-backpressure`, uncommitted at the time this was written): a
-# MEASURED queue read — `ceiling = ceil(runners * horizon / job_p90)` — explicitly NOT a lane cap,
-# because the owner ruled on 2026-10-17 that dispatch is gated on capacity, not on lane count. This
-# file SOURCES that module when it is present and defers on its verdict. When it is NOT present it
-# derives the SAME arithmetic from the same two measured endpoints and SAYS SO in its own line
-# (`source=measured-fallback`), rather than silently doing something else. An UNREADABLE queue is
-# UNKNOWN and UNKNOWN DEFERS: a read failure must never open the gate.
+# ── NOT GATED ON THE CI QUEUE, AND THAT IS THE POINT (#2927) ────────────────────────────────
+# Everything this file dispatches acts on a PR THAT ALREADY EXISTS: its head is red, conflicted or
+# under review. ⛔ A REPAIR PUSH IS NOT FREE — it DOES start a fresh CI run (`ci-queue.sh`'s header
+# records "its pass is already spent" as NOT TRUE, and that is why the exclusion does not rest on it).
+# The CI queue still says nothing about whether these dispatches may proceed: a spent QUEUE SLOT is
+# not a reason to withhold repair from a PR that already has a head to repair. ⛔ AND THE REASON IS
+# NOT "a queue slot costs nothing" — that is the COST CLAIM `ci-queue.sh`'s header records as
+# refutable. `ci-queue.sh` states the basis as a DECISION PLUS A MEASUREMENT, and what the measurement
+# showed is that the NUMBER was the wrong quantity, not that repair is cheap: 2026-10-27 on cell 4,
+# `queued=33 running=2 runners=~2 => ceiling=4` derived its ceiling off demand-as-supply — a reading
+# of THIS BOX's own load presented as the world's capacity — and deferred 41 consecutive PR-repair
+# dispatches (all of them this file's own `skip #<n>: backpressure(q=…,r=…)`) while 11 lane slots and
+# an 8-runner self-hosted fleet sat idle.
+# The queue it was reading belonged to GitHub-HOSTED concurrency and to the ISSUE→PR path.
+# So this file sources no CI-queue module and reads no queue depth. Its real bounds, all of which stay:
+#   * LANE SLOTS — the caller's `--max-spawn` allowance (orch-loop.sh passes the remaining fix-lane
+#     headroom) and the `fix-<PR>` session census; a deferred item keeps its place in the ledger.
+#   * The LOAD / headroom gate (`fix-one.sh`'s `fixgate-<PR>-<HEAD>`), which is about THIS BOX's
+#     capacity to run an agent rather than about GitHub's.
+# The queue gate itself is unchanged and still applied where it belongs — to work that ADDS a new CI
+# run (`dispatch-merge.sh`'s issue→PR batches and `orch-loop.sh`'s ISSUE path) and to the merge rail's
+# own CI-spending steps. See `ci-queue.sh`'s header for the class rule; do NOT reintroduce the gate
+# here on a tuning pretext — that re-opens #2927.
 #
 # ── POLARITY, ON THE NEWEST ATTEMPT PER (app, name) ─────────────────────────────────────────────
 # One surface read per PR, from the CHECK-RUNS API (`commits/<sha>/check-runs?filter=all`), which —
@@ -103,8 +116,23 @@ PS_MAX_PRS="${PS_MAX_PRS:-10}"        # PRs inspected per pass (round-robin; eve
 ps_limit() { local v="${1:-}"; ps_is_num "$v" && [ "$v" -ge 1 ] && [ "$v" -le 500 ] && printf '%s' "$v" || printf '10'; }
 PS_MAX_TRIES="${PS_MAX_TRIES:-2}"     # HEAD-keyed fixer attempts per PR (a cap on a TREE, not a lane)
 ps_maxtries() { local v="${1:-}"; ps_is_num "$v" && [ "$v" -ge 0 ] && [ "$v" -le 50 ] && printf '%s' "$v" || printf '2'; }
-PS_HORIZON_MIN="${PS_HORIZON_MIN:-20}"   # only used by the measured fallback (ci-queue.sh owns its own)
-PS_JOB_P90_MIN="${PS_JOB_P90_MIN:-10}"
+
+# ── THE ROUTER SEAM (#2866) ───────────────────────────────────────────────────────────────────
+# `scripts/orchestrator-harness/pr-state.sh` is the ONE consumer seam for the PR state table. It is
+# sourced when present; when it is not, the seam prints `unavailable` and ps_router_row says so in
+# the pass output — never silently.
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/pr-state.sh" 2>/dev/null || true
+ps_router_row() {  # <repo> <pr> → "ACTION<TAB>run<TAB>reason"; NEVER empty (rc 2 = it did not run)
+  if declare -f prstate_row >/dev/null 2>&1; then
+    # The router reads GitHub through the SAME gh this module does, so a suite that stubs PS_GH
+    # keeps the router on the stub instead of reaching the network.
+    PR_STATE_GH="${PR_STATE_GH:-${PS_GH:-gh}}" prstate_row "${1:-}" "${2:-}"
+    return $?
+  fi
+  printf 'unavailable\t-\tpr-state.sh was not found beside pr-sickness.sh — the router did not run'
+  return 2
+}
 
 # ── 1. ENUMERATE ───────────────────────────────────────────────────────────────────────────────
 # ps_open_prs <owner/repo> -> TSV "number<TAB>sha<TAB>branch<TAB>draft(0|1)"; rc 2 = UNREADABLE.
@@ -381,6 +409,9 @@ ps_held() {
   fi
   if ps_alive "fix-$pr"; then printf 'live session fix-%s' "$pr"; return 0; fi
   if ps_alive "merge-$pr"; then printf 'live session merge-%s' "$pr"; return 0; fi
+  # The review order is its own worker tag since agent-infra#2971; without this a PR whose REVIEW is
+  # in flight reads as un-held and this selector would brief a second worker at the same head.
+  if ps_alive "review-$pr"; then printf 'live session review-%s' "$pr"; return 0; fi
   # ⛔ TWO KEYS, TWO QUESTIONS, AND BOTH ARE ASKED. A fixer/reviewer holds the PER-HEAD key
   # (`<PR>-<sha12>`); only the landing path holds the coarse `pr-<N>` key. Reading the coarse one
   # alone made this guard inert for exactly the peer we must not duplicate (measured: two boxes each
@@ -403,92 +434,15 @@ ps_held() {
   esac
 }
 
-# ── 5. BACK-PRESSURE (delegated when the parallel lane's module is present) ────────────────────
-# ps_queue_verdict <owner/repo> -> prints "ok|deep|unknown<TAB>q=<n> r=<n> ceiling=<n> source=<src>"
-# rc 0 = send, 1 = defer (deep), 2 = defer (unknown). Never fails open.
-ps_queue_verdict() {
-  local repo="$1" tok rc q r src dir tmp
-  dir="$(ps_state_dir)"
-  if declare -f ciq_verdict >/dev/null 2>&1; then
-    # ⛔ NOT IN A COMMAND SUBSTITUTION. `ciq_verdict` publishes the record in CIQ_* GLOBALS; a `$( )`
-    # sets them inside the subshell and leaves the caller with the token and no numbers — measured as
-    # `backpressure(q=?,r=?)` on the delegated path. Redirect the call instead, so the globals land
-    # in THIS shell (the same defect ci-queue.sh's own docstring warns about).
-    tmp="$(mktemp "${TMPDIR:-/tmp}/ps-ciq.XXXXXX" 2>/dev/null)" || tmp=/dev/null
-    ciq_verdict "$repo" "$dir" > "$tmp" 2>/dev/null; rc=$?
-    tok="$(cat "$tmp" 2>/dev/null)"; rm -f "$tmp" 2>/dev/null
-    q="${CIQ_QUEUED:-?}"; r="${CIQ_RUNNERS:-?}"; src=ci-queue.sh
-    case "$rc" in
-      1)
-        # ⛔ rc ALONE IS NOT A MEASUREMENT. `ci-queue.sh` is a sibling branch sourced from any
-        # `$O/ci-queue.sh`; a version skew (renamed globals) or a path that never measured answers
-        # rc=1 with no numbers, and the token then reads `ok(q=? …)` — dispatch into a queue nobody
-        # read. The measured fallback refuses a non-numeric count; so does this arm.
-        if ! ps_is_num "${q:-}" || ! ps_is_num "${r#\~}"; then
-          printf 'unknown\tq=%s r=%s ceiling=%s source=%s (the delegated verdict carried no measured count)' \
-            "${q:-?}" "${r:-?}" "${CIQ_CEILING:-?}" "$src"
-          return 2
-        fi
-        if [ "${q:-x}" = "0" ]; then
-          local q2
-          q2="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-          if ! ps_is_num "${q2:-}" || [ "${q2:-0}" -ne 0 ]; then
-            printf 'unknown\tq=%s r=%s ceiling=%s source=%s (a ZERO was re-read as %s — a spurious empty queue is not a measurement)' \
-              "${q2:-0}" "$r" "${CIQ_CEILING:-?}" "$src" "${q2:-unreadable}"
-            return 2
-          fi
-        fi
-        printf 'ok\tq=%s r=%s ceiling=%s source=%s' "$q" "$r" "${CIQ_CEILING:-?}" "$src"; return 0 ;;
-      0) printf 'deep\tq=%s r=%s ceiling=%s source=%s' "$q" "$r" "${CIQ_CEILING:-?}" "$src"; return 1 ;;
-      *) printf 'unknown\tq=%s r=%s ceiling=%s source=%s (%s)' "$q" "$r" "${CIQ_CEILING:-?}" "$src" "${tok:-no reason recorded}"; return 2 ;;
-    esac
-  fi
-  # ⛔ THE PARALLEL LANE'S MODULE IS NOT PRESENT YET. Do NOT skip the gate: derive the SAME arithmetic
-  # from the same two measured endpoints, and NAME the source so nobody mistakes this for the shipped
-  # rule. An unreadable count is UNKNOWN, and UNKNOWN defers.
-  q="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-  r="$(ps_gh "repos/$repo/actions/runners" 2>/dev/null | tr ',' '\n' | grep -c '"status":"online"' 2>/dev/null || true)"
-  ps_is_num "${r:-}" || r=""
-  [ "${r:-0}" -ge 1 ] 2>/dev/null || r=""
-  if ! ps_is_num "${q:-}" || [ -z "$r" ]; then
-    printf 'unknown\tq=%s r=%s ceiling=? source=measured-fallback (queue or runners unreadable)' "${q:-?}" "${r:-?}"
-    return 2
-  fi
-  local c=$(( (r * PS_HORIZON_MIN + PS_JOB_P90_MIN - 1) / PS_JOB_P90_MIN ))
-  if [ "$q" -gt "$c" ]; then
-    printf 'deep\tq=%s r=%s ceiling=%s source=measured-fallback' "$q" "$r" "$c"; return 1
-  fi
-  # ⛔ A CLAIM OF "EMPTY" IS THE ONE READING THAT OPENS THIS GATE, so it is the one reading that has to
-  # be corroborated. MEASURED 2026-10-22 against the real endpoint, six samples: 70, 70, 0, 70, 70, 70 —
-  # the 0 was a complete, valid 36-byte body (`{"total_count":0,"workflow_runs":[]}`) with ~70 runs
-  # actually queued. Parsing it as a measurement is a FAIL-OPEN on the exact gate whose comment says an
-  # unreadable count is UNKNOWN and defers; a spurious zero parses fine, so no rule caught it. One
-  # re-read costs a request and turns a coin-flip into UNKNOWN, which defers — the cheap direction.
-  if [ "${q:-0}" -eq 0 ]; then
-    local q2
-    q2="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-    if ! ps_is_num "${q2:-}"; then
-      printf 'unknown\tq=0 r=%s ceiling=%s source=measured-fallback (a zero queue could not be corroborated: the re-read failed)' "$r" "$c"; return 2
-    fi
-    if [ "${q2:-0}" -ne 0 ]; then
-      printf 'unknown\tq=%s r=%s ceiling=%s source=measured-fallback (a ZERO was re-read as %s — a spurious empty queue is not a measurement)' "${q2}" "$r" "$c" "${q2}"
-      return 2
-    fi
-  fi
-  printf 'ok\tq=%s r=%s ceiling=%s source=measured-fallback' "$q" "$r" "$c"; return 0
-}
-
-# ps_load_ci_queue -> source ci-queue.sh from $O or this file's directory when present.
-ps_load_ci_queue() {
-  local f=""
-  [ -n "${O:-}" ] && [ -f "$O/ci-queue.sh" ] && f="$O/ci-queue.sh"
-  [ -z "$f" ] && [ -f "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/ci-queue.sh" ] \
-    && f="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/ci-queue.sh"
-  [ -n "$f" ] || return 1
-  # shellcheck source=/dev/null
-  . "$f" 2>/dev/null || return 1
-  declare -f ciq_verdict >/dev/null 2>&1
-}
+# ── 5. NOT A CI-QUEUE GATE (see the header: repair spends CI, but a spent slot is no veto) ──────
+# This numbered step used to hold `ps_queue_verdict` — ~90 lines that read the repo's CI queue and
+# derived `ceiling = ceil(runners*horizon/job_p90)` — plus `ps_load_ci_queue`, which sourced
+# `ci-queue.sh` for it, plus a fallback arm that re-derived the same arithmetic when the module was
+# absent. Every dispatch this file makes acts on an EXISTING PR — so that number was a reading of
+# THIS BOX's own load, not of the capacity to repair, and it withheld repair anyway: 41 consecutive
+# skips in one measured window (#2927), while the runners it was priced against sat idle.
+# ⛔ IF A FUTURE CHANGE WANTS A QUEUE-DEPTH GATE HERE, the queue is not the thing that changed. Argue
+# it against #2927 in the open, not by re-adding a predicate to this file line by line.
 
 # ── 6. THE DEFERRAL QUEUE (a deferred item is NOT dropped) ────────────────────────────────────
 # One row per (repo, PR, head, check). `ps_select` drains this FIRST, so an item deferred by
@@ -552,11 +506,11 @@ psick_refund_head() {
 }
 
 # ps_decide <or> <pr> <sha> <branch> [fork] -> prints ONE decision line; rc 0 = dispatched.
-# The four shapes (the operator's grep):
+# The three shapes (the operator's grep) — `backpressure(q=…,r=…)` used to be a fourth and was
+# removed with the queue gate itself (#2927):
 #   RED #<pr> <check> -> dispatch <tag>
 #   skip #<pr>: in flight
 #   skip #<pr>: held by <lane>
-#   skip #<pr>: backpressure(q=NNN,r=N)
 # plus named refusals for the budget / park / draft / fork / unsafe-ref / no-verdict cases — never
 # silence.
 ps_decide() {
@@ -623,28 +577,35 @@ ps_decide() {
       "$pr" "$bcnt" "$(ps_maxtries "$PS_MAX_TRIES")" "${sha:0:12}"
     return 1
   fi
-  # ── BACK-PRESSURE: the one gate that is about the OTHER side's capacity ────────────────────
-  local qv qrc qfields qn rn
-  if [ -n "${PS_QV:-}" ]; then
-    qv="$PS_QV"; qrc="${PS_QRC:-2}"; qfields="${PS_QFIELDS:-}"
-  else
-    qv="$(ps_queue_verdict "$repo")"; qrc=$?
-  fi
-  # ⛔ ONE ASSIGNMENT, TWO CONSUMERS OF DIFFERENT FIELDS. The token is `ok|deep|unknown<TAB>q=<n> r=<n> …`
-  # and the `q=`/`r=` numbers live in field 2 — reading a field that was never assigned is exactly how
-  # this line printed `backpressure(q=?,r=?)` on a deep queue (found by VGATE; the pass-level gate in
-  # ps_select had its own copy, so the suite's (e) did not cover THIS one).
-  qfields="$(printf '%s' "$qv" | cut -f2)"
-  if [ "$qrc" -ne 0 ]; then
-    # ⛔ THE REQUIRED SHAPE: `skip #<pr>: backpressure(q=NNN,r=N)`. The ceiling and the rule's SOURCE
-    # ride on the `[prsick]` deferral line above, not here — one greppable shape per fact.
-    qn="$(printf '%s' "$qfields" | sed -n 's/.*q=\([0-9]*\).*/\1/p')"
-    rn="$(printf '%s' "$qfields" | sed -n 's/.*r=\([0-9~]*\).*/\1/p')"
-    printf 'skip #%s: backpressure(q=%s,r=%s)\n' "$pr" "${qn:-?}" "${rn:-?}"
-    # the deferred item keeps its place and comes back when the queue drains
-    ps_defer_append "$repo" "$pr" "$sha" "$group"
-    return 1
-  fi
+
+  # ── THE ROUTER'S ROW: IS A FIXER WHAT THIS HEAD NEEDS? (#2866) ──────────────────────────────
+  # Two reds are NOT fixer work, and this module cannot tell them apart alone:
+  #   WAIT:inherited-red  the same (app, workflow, job) is red at MAIN's head. A fixer sent here
+  #                       spends a lane trying to fix a tree it does not own; measured 2026-10-22,
+  #                       25 tortoise PRs sat blocked on ONE systemic assertion main already had.
+  #   RERUN-FLAKE         the same group PASSED on an earlier attempt at this SAME head. A fixer
+  #                       here edits code that is fine, pushes a new head, strands the head-bound
+  #                       review attestation and buys a full CI pass — for a flake.
+  # `unavailable` is printed and the module's own gates decide: a router that did not run is not a
+  # reason to stop repairing reds.
+  local prow prc paction prun preason
+  prow="$(ps_router_row "$repo" "$pr")"; prc=$?
+  paction="$(printf '%s' "${prow:-}" | cut -f1)"
+  prun="$(printf '%s' "${prow:-}" | cut -f2)"
+  preason="$(printf '%s' "${prow:-}" | cut -f3-)"
+  case "$paction" in
+    WAIT:inherited-red)
+      printf 'skip #%s: %s (router: %s)\n' "$pr" "${preason:-inherited red}" "$paction"
+      return 1 ;;
+    RERUN-FLAKE)
+      printf 'skip #%s: flake, not a fix — %s\n' "$pr" "${preason:-a job passed at this same head}"
+      printf '         re-trigger: gh run rerun %s --failed (same sha; no new head, no attestation stranded)\n' "${prun:-<run>}"
+      return 1 ;;
+    unavailable)
+      printf '[prsick] router UNAVAILABLE for #%s (%s) — this module'"'"'s own gates decide\n' "$pr" "${preason:-no reason recorded}"
+      [ "$prc" -eq 2 ] || true ;;
+    "") printf '[prsick] router returned no action for #%s — this module'"'"'s own gates decide\n' "$pr" ;;
+  esac
 
   # ── EMIT THE WORK ITEM, THEN DISPATCH ─────────────────────────────────────────────────────
   brief="$(ps_brief "$repo" "$pr" "$sha" "$group" "$rid" "$jid" "$cc" "$reds")" || {
@@ -722,29 +683,14 @@ ps_select() {
   # would silently disable the whole queue on a caller that forgot the flag.
   if [ -n "$maxspawn" ] && ! ps_is_num "$maxspawn"; then maxspawn=""; fi
 
-  # ── the queue gate is read ONCE per pass, before anything is emitted ────────────────────────
-  # ⛔ CLEARED FIRST. The verdict is handed to `ps_decide` through these globals, and the controller
-  # runs the pass in ITS OWN shell every cycle — a value left over from cycle N would be a stale
-  # queue depth used to decide cycle N+1.
-  PS_QV=""; PS_QRC=""; PS_QFIELDS=""
-  local qv qrc qfields qsrc
-  qv="$(ps_queue_verdict "$repo")"; qrc=$?
-  qfields="$(printf '%s' "$qv" | cut -f2)"; qsrc="${qfields##*source=}"
-  # ⛔ ONE READ PER PASS, REUSED BY EVERY PR. `ps_decide` used to re-read the queue for each PR (two
-  # `gh api` calls apiece on the fallback path); the numbers cannot change mid-pass in a way that
-  # matters, and a stale-by-seconds reading is still a MEASURED one. A direct call (no pass) still
-  # reads for itself, which is what the suite's (h)/(i) probes exercise.
-  PS_QV="$qv"; PS_QRC="$qrc"; PS_QFIELDS="$qfields"
-  if [ "$verb" = "1" ] || [ "$qrc" -ne 0 ]; then
-    # ⛔ A DEFERRAL IS NEVER SILENT, and it names which rule produced it. `source=measured-fallback`
-    # means the parallel lane's `ci-queue.sh` was not installed on this box yet.
-    case "$qrc" in
-      0) printf '[prsick] queue ok (%s) — sending CI-spending work\n' "$qfields" ;;
-      1) printf '[prsick] DEFERRED (backpressure): %s — ceiling=ceil(runners*%sm/%sm); the deferred item keeps its place and is re-decided when the queue drains\n' \
-           "$qfields" "${PS_HORIZON_MIN}" "${PS_JOB_P90_MIN}" ;;
-      *) printf '[prsick] DEFERRED (queue UNKNOWN — never opened): %s\n' "$qfields" ;;
-    esac
-  fi
+  # ── NO QUEUE GATE ON THIS PASS (#2927) ──────────────────────────────────────────────
+  # This pass dispatches PR-REPAIR work only (fixers for EXISTING heads). That work DOES spend CI (a
+  # repair push starts a fresh run) and is still not queue-gated — see the header: a queue slot is
+  # not the bound on repair. So it reads no queue depth. The former arm here read the queue once per
+  # pass, printed `[prsick] DEFERRED (backpressure)`, and — worse than the skip lines — GATED THE
+  # LEDGER DRAIN on `qrc -eq 0`, so a deep queue also froze the items already waiting in
+  # `prsick-deferred.tsv`.
+  # The `--max-spawn` allowance below is the real bound: it is the box's remaining fix-lane headroom.
 
   # ── 1. ENUMERATE (the open listing is the authority for what MAY be dispatched) ────────────
   rows="$(ps_open_prs "$repo")"; rc=$?
@@ -795,37 +741,35 @@ ps_select() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$drepo" "$dpr" "$dsha" "$dchk" "$dbr" >> "$keptf" 2>/dev/null || true
   done < "$(ps_defer_file)"
 
-  if [ "$qrc" -eq 0 ]; then
-    while IFS="$(printf '\t')" read -r drepo dpr dsha dchk dbr; do
-      [ -n "${dpr:-}" ] || continue
-      # ⛔ THE SAME ONE-DECISION-PER-PR INVARIANT THE ENUMERATION HAS. The drain had no guard, so a
-      # ledger holding two rows for one PR (before dedupe, or a re-appended row) decided it twice in
-      # ONE pass: two `fix-<PR>` spawns for one head, and the attempt budget consumed twice. The
-      # liveness read is NOT a substitute — wt_alive answers "not alive" for a worker that already
-      # exited (a cross-box bail or a gate refusal), so the second row would spawn.
-      case " ${SEEN_PRS:-} ${DISPATCHED_PRS:-} " in *" $dpr "*) continue ;; esac
-      if [ "$seen" -ge "$limit" ]; then break; fi
-      # REMOVE FIRST, then decide: `ps_decide` re-appends the row when its own gate defers, so the
-      # ledger survives exactly as long as the DEFERRAL does. Draining the row instead let green /
-      # in-flight / held rows live forever and eat the whole budget (measured: a 10-row ledger
-      # starved the enumeration on a 25-PR repo, cursor frozen).
-      ps_defer_drop "$repo" "$dpr" "$dsha"
-      SEEN_PRS="${SEEN_PRS} $dpr"
-      seen=$((seen+1))
-      if [ -n "$maxspawn" ] && [ "$dispatched" -ge "$maxspawn" ]; then
-        ps_defer_append "$repo" "$dpr" "$dsha" "$dchk" "$dbr"
-        printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$dpr" "$dispatched" "$maxspawn"
-        continue
-      fi
-      if ps_decide "$repo" "$dpr" "$dsha" "$dbr"; then
-        dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS} $dpr"
-      fi
-    done < "$keptf"
-  fi
+  while IFS="$(printf '\t')" read -r drepo dpr dsha dchk dbr; do
+    [ -n "${dpr:-}" ] || continue
+    # ⛔ THE SAME ONE-DECISION-PER-PR INVARIANT THE ENUMERATION HAS. The drain had no guard, so a
+    # ledger holding two rows for one PR (before dedupe, or a re-appended row) decided it twice in
+    # ONE pass: two `fix-<PR>` spawns for one head, and the attempt budget consumed twice. The
+    # liveness read is NOT a substitute — wt_alive answers "not alive" for a worker that already
+    # exited (a cross-box bail or a gate refusal), so the second row would spawn.
+    case " ${SEEN_PRS:-} ${DISPATCHED_PRS:-} " in *" $dpr "*) continue ;; esac
+    if [ "$seen" -ge "$limit" ]; then break; fi
+    # REMOVE FIRST, then decide: `ps_decide` re-appends the row when its own gate defers, so the
+    # ledger survives exactly as long as the DEFERRAL does. Draining the row instead let green /
+    # in-flight / held rows live forever and eat the whole budget (measured: a 10-row ledger
+    # starved the enumeration on a 25-PR repo, cursor frozen).
+    ps_defer_drop "$repo" "$dpr" "$dsha"
+    SEEN_PRS="${SEEN_PRS} $dpr"
+    seen=$((seen+1))
+    if [ -n "$maxspawn" ] && [ "$dispatched" -ge "$maxspawn" ]; then
+      ps_defer_append "$repo" "$dpr" "$dsha" "$dchk" "$dbr"
+      printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$dpr" "$dispatched" "$maxspawn"
+      continue
+    fi
+    if ps_decide "$repo" "$dpr" "$dsha" "$dbr"; then
+      dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS} $dpr"
+    fi
+  done < "$keptf"
   [ "$keptf" = "/dev/null" ] || rm -f "$keptf" 2>/dev/null || true
 
   # ── 3. THEN THE ENUMERATION, ROUND-ROBIN ──────────────────────────────────────────────────
-  local pr sha br draft fork cursor start idx qn rn
+  local pr sha br draft fork cursor start idx
   cursor="$(ps_state_dir)/prsick-cursor"
   start="$(cat "$cursor" 2>/dev/null || echo 0)"; ps_is_num "${start:-}" || start=0
   if [ "$total" -gt 0 ]; then start=$(( start % total )); else start=0; fi
@@ -843,14 +787,6 @@ ps_select() {
       printf 'skip #%s: fork PR (its head branch is not in this repo — a fixer cannot materialise it)\n' "$pr"
       continue
     fi
-    if [ "$qrc" -ne 0 ]; then
-      # The queue gate already spoke; record the item so it is not lost, and do not read N surfaces.
-      qn="$(printf '%s' "$qfields" | sed -n 's/.*q=\([0-9]*\).*/\1/p')"
-      rn="$(printf '%s' "$qfields" | sed -n 's/.*r=\([0-9~]*\).*/\1/p')"
-      ps_defer_append "$repo" "$pr" "$sha" "?" "$br"
-      printf 'skip #%s: backpressure(q=%s,r=%s)\n' "$pr" "${qn:-?}" "${rn:-?}"
-      continue
-    fi
     if [ -n "$maxspawn" ] && [ "$dispatched" -ge "$maxspawn" ]; then
       ps_defer_append "$repo" "$pr" "$sha" "?" "$br"
       printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$pr" "$dispatched" "$maxspawn"
@@ -865,11 +801,8 @@ EOF
   # ⛔ THE CURSOR ADVANCES BY WHAT WAS INSPECTED, NOT BY WHERE THE LOOP BROKE. Writing `idx` froze it
   # whenever the budget ran out before the cursor was reached, so the PRs past it were never visited.
   if [ "$total" -gt 0 ]; then printf '%s\n' "$(( (start + seen) % total ))" > "$cursor" 2>/dev/null || true; fi
-  # the pass-scoped verdict is PASS-scoped: a leftover value in the controller's shell would decide the
-  # next cycle from this cycle's depth
-  PS_QV=""; PS_QRC=""; PS_QFIELDS=""
-  [ "$verb" = "1" ] && printf '[prsick] pass done: inspected=%s dispatched=%s deferred=%s (queue source: %s)\n' \
-    "$seen" "$dispatched" "$(ps_defer_list | wc -l | tr -d ' ')" "$qsrc"
+  [ "$verb" = "1" ] && printf '[prsick] pass done: inspected=%s dispatched=%s deferred=%s\n' \
+    "$seen" "$dispatched" "$(ps_defer_list | wc -l | tr -d ' ')"
   return 0
 }
 
@@ -877,7 +810,6 @@ EOF
 ps_cli() {
   local verb="${1:-report}"; shift 2>/dev/null || true
   PS_STATE_DIR="${PS_STATE_DIR:-${TMPDIR:-/tmp}/ps-cli-$$}"
-  ps_load_ci_queue >/dev/null 2>&1 || true
   case "$verb" in
     report) PS_DRY_RUN=1 ps_select --verbose "$@" ;;
     *) printf 'usage: pr-sickness.sh report|pass [--repo owner/name] [--limit N] [--dry-run]\n' >&2; return 64 ;;

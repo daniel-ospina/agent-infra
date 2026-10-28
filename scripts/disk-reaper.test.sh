@@ -47,6 +47,15 @@
 #       verified is still reclaimed in the same pass — and the class verdict stays RED (#2443).
 #   T56 the installer NAMES the worktree class's gh prerequisite (auth is per-HOME), instead of
 #       letting the class be inert for an hour and then blamed on the wrong cause (#2443).
+#   T58 the INSTALLED ARTIFACT is read back after install — a drop-in that masks or replaces
+#       ExecStart, and a truncated unit with no ExecStart at all, are REFUSED before `enable --now`
+#       (#4529); T58b pins the plist TEXTUAL fallback (no parser) against the same stale arming.
+#   T59 an UNANSWERABLE tally is recorded as such (`?`), never as a measured 0, and per-repo
+#       tallies are SUMMED with a `tally=<n>/<repos>` coverage figure (#4529).
+#   T60 a class that could not be SET UP reports neither a verdict NOR a count it never computed —
+#       on EITHER surface (the operator-facing class line and the pass record), for the classes that
+#       keep no tally sentinel (`worktree`, `uv`, `duplicate-install`), and `not-run` for a class that
+#       was not selected at all (#4529).
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -80,6 +89,14 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
+# ⛔ THE SCRATCH-ROOT ARMS MUST BE SCOPED TO THE FIXTURE (#2542). The abandoned-worktree arm and the
+# duplicate-install class sweep a SCRATCH ROOT (`/tmp` by default) rather than a repo, so without this
+# a `--apply` assertion anywhere in this suite would reap the machine's own `/tmp` worktrees — it did,
+# once, on this very box (four clean abandoned checkouts). A test suite that can delete outside its
+# fixture is not a test suite. Every case that needs a synthetic root sets its own.
+REAP_AW_ROOTS="$T/scratch/absent"
+REAP_DI_ROOTS="$T/scratch/absent"
+export REAP_AW_ROOTS REAP_DI_ROOTS
 SLEEPERS=""
 cleanup() {
     local p
@@ -145,6 +162,16 @@ ENVNAME=""
 # INSIDE a `\`-continued list ends the command word, so every assignment before
 # it stops being part of the invocation's environment and the pass silently runs
 # against the REAL $HOME — 79 unrelated assertions went red that way once.
+# ⛔ HERMETIC, LIKE THE SIBLING SUITE. `REAP_WT_MAIN_PROOF` defaults to `auto`, which issues a real
+# `git ls-remote` against whatever origin a fixture carries — and T55's fixtures carry REAL github
+# origins, so the entry-point suite's outcome depended on host connectivity and an offline runner paid
+# `REAP_WT_GIT_TIMEOUT` per call. `pi-reap-worktrees.test.sh:459` already pins this; the `${…:-local}`
+# form keeps every case that deliberately exercises `auto` able to override it (T3 does: it proves the
+# remote-oid path against a LOCAL BARE origin, which is offline already).
+# ⚠️ THIS BLOCK SITS ABOVE THE ASSIGNMENT CHAIN ON PURPOSE — see the RULE 7 note: a comment line put
+# INSIDE a `\`-continued list ends the command word, and the pass then silently runs against the REAL
+# $HOME. It cost 79 unrelated red assertions the first time this file learned it (and it happened
+# again, to 124, when this note first landed in the wrong place).
 run_reaper() { # run_reaper <args...>
     HOME="$T/home" \
     DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" \
@@ -160,6 +187,7 @@ run_reaper() { # run_reaper <args...>
     REAP_VENV_LOG="$T/$ENVNAME/state/reap-lane-venvs.log" \
     REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES:-0}" \
+    REAP_WT_MAIN_PROOF="${REAP_WT_MAIN_PROOF:-local}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-1}" \
     VENV_REAPER="${VENV_REAPER:-}" \
     WORKTREE_REAPER="${WORKTREE_REAPER:-}" \
@@ -227,9 +255,54 @@ commit_in "$WT_M" "$RECENT_DATE" merged
 OUT="$(run_reaper --dry-run --repo "$REPO" --aged-days 7 2>&1)"
 assert_contains "$OUT" "refs=merged" "T3 the fixture really is merged (the assertion is not vacuous)"
 assert_contains "$OUT" "remove   $WT_M" "T3 a MERGED, clean, holder-free checkout is SELECTED"
-OUT="$(run_reaper --apply --repo "$REPO" --aged-days 7 --only worktree 2>&1)"; RC=$?
+# A REMOTE makes the "merged into main" proof resolvable (main_proof=auto) instead of falling back to
+# the local chain. The bare origin is local, so this stays offline and deterministic.
+ORIGIN_T3="$T/t3/origin.git"; "$REAL_GIT" init -q --bare "$ORIGIN_T3"
+"$REAL_GIT" -C "$REPO" remote add origin "$ORIGIN_T3"
+"$REAL_GIT" -C "$REPO" push -q origin main
+# ⛔ THE ROW MUST CITE THE PROOF IT TOOK, not the local cache it did not use. `is_ancestor_of_main`
+# tries the RESOLVED remote oid FIRST and the local chain SECOND — so on the cell this resolution
+# exists for (a stale tracking ref) the row printed `merge-base --is-ancestor <sha> <local-ref>=0`
+# for a command that returns 1. Reproduce it exactly: point the LOCAL chain behind the head, so only
+# the remote oid can prove it, then read the row's evidence.
+ORIGIN_T3_TIP="$("$REAL_GIT" -C "$ORIGIN_T3" rev-parse refs/heads/main)"
+WT_M_SHA="$("$REAL_GIT" -C "$WT_M" rev-parse HEAD)"
+INIT_T3="$("$REAL_GIT" -C "$REPO" rev-list --max-parents=0 refs/heads/main | head -1)"
+"$REAL_GIT" -C "$REPO" update-ref refs/remotes/origin/main "$INIT_T3"
+"$REAL_GIT" -C "$REPO" merge-base --is-ancestor "$WT_M_SHA" refs/remotes/origin/main >/dev/null 2>&1; RC=$?
+assert_eq "$RC" "1" "T3 precondition: the LOCAL main ref does NOT contain this head (a local citation would be false)"
+OUT="$(REAP_WT_MAIN_PROOF=auto run_reaper --dry-run --repo "$REPO" --aged-days 7 --only worktree 2>&1)"
+ROW_T3="$(grep -A1 -F "remove   $WT_M" <<<"$OUT")"
+assert_contains "$ROW_T3" "refs=merged" "T3 the head is still proved landed — by the REMOTE's tip"
+assert_contains "$ROW_T3" "proof=merge-base --is-ancestor $WT_M_SHA $ORIGIN_T3_TIP=0" \
+    "T3 the row cites the command that ANSWERED (the resolved remote oid)"
+assert_absent "$ROW_T3" "$WT_M_SHA refs/remotes/origin/main=0" \
+    "T3 ... never the stale local ref, whose cited command returns 1"
+OUT="$(REAP_WT_MAIN_PROOF=auto run_reaper --apply --repo "$REPO" --aged-days 7 --only worktree 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T3 the apply pass exits 0"
 assert_nodir "$WT_M" "T3 --apply removed the merged checkout (pass said: $(printf '%s' "$OUT" | grep -E 'remove |REMOVED|FAILED' | tr '\n' ' '))"
+# ⛔ THE PASS'S TALLY, LIFTED INTO THE RECORD. `freed_df=1MB` on its own reads as success; these
+# fields are what make "classified 2, removed 1, preserved 1 because too-recent" readable by a fleet
+# check. `candidates_worktree` was structurally 0 in APPLY mode before this (it was only accumulated
+# on the dry-run path), so an armed pass answered "no candidates" for a pass that classified fifty.
+STAT="$(cat "$T/$ENVNAME/state/disk-reaper.status")"
+assert_contains "$STAT" "mode=apply" "T3 the record names the mode"
+assert_contains "$STAT" "classified_worktree=" "T3 the record carries the delegate's classification tally"
+assert_contains "$STAT" "preserved_reasons_worktree=" "T3 ... and WHY each preserved record was kept"
+assert_contains "$STAT" "main_proof=auto" "T3 ... and which main the merge proof was read from"
+# ⛔ THE FIELD MUST BE ANSWERABLE, NOT MERELY PRESENT. `pr_merged=` was defined and then never
+# assigned, so the record carried `unknown` on every pass — an instrument that can only ever say
+# "I did not measure", which is the shape this record exists to remove. This origin is a LOCAL bare
+# repo, not a GitHub URL, so the PR-state read is genuinely N/A and the honest value is `na`.
+assert_contains "$STAT" "pr_merged=na" "T3 ... and whether the PR-state read was answerable (na: no GitHub origin)"
+assert_absent "$STAT" "pr_merged=unknown" "T3 ... the field is not left UNASSIGNED (a pass that read nothing says so)"
+# ...and the branch the remote actually named, so `main_proof=auto` is auditable (was assigned and
+# never read: the one piece of evidence the remote probe collected and then discarded).
+assert_contains "$OUT" "main_ref=refs/heads/main" "T3 ... and which branch the remote called HEAD"
+assert_eq "$(sed -n 's/^candidates_worktree=//p' <<<"$STAT" | head -1)" "1" \
+    "T3 an ARMED pass records its candidate count (it used to be a structural 0)"
+assert_contains "$OUT" "classified=" "T3 the class line is readable without the log"
+assert_contains "$OUT" "reasons=" "T3 ... including the preserved reasons"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/t3-merged | wc -l | tr -d ' ')" "1" \
     "T3 the branch ref survives (a checkout is removed, never a branch)"
 
@@ -278,7 +351,12 @@ assert_eq "$SRC" "0" "T7 --print-status exits 0 for a good pass"
 assert_contains "$ST" "status=ok" "T7 the status is ok"
 assert_contains "$ST" "mode=apply" "T7 the mode is recorded"
 assert_contains "$ST" "freed_mb_uv=" "T7 the bytes freed per class are recorded"
-assert_contains "$ST" "candidates_worktree=0" "T7 classes that did not run are recorded, not implied"
+# ⛔ `not-run`, NOT `0`. A class that was never selected has no candidate count, and a record reading
+# `verdict_worktree=not-run` beside `candidates_worktree=0 classified_worktree=0` asserts a measured
+# zero the pass never made — the same false-PASS shape the tally exists to remove, one layer up. The
+# unanswerable states are now distinct: `not-run` (not selected) and `?` (selected, no tally).
+assert_contains "$ST" "candidates_worktree=not-run" "T7 classes that did not run are recorded as not-run, never as a measured 0"
+assert_contains "$ST" "verdict_worktree=not-run" "T7 ... and the class verdict agrees with it"
 assert_contains "$ST" "verdict_uv=ok" "T7 the per-class verdict is readable without the log"
 # ⛔ AN UNKNOWABLE AGE IS NOT ok. With ok=1 and a missing/non-numeric `epoch=` the reader used to fall
 # through to `status=ok` and exit 0 — a record that cannot answer "how old is this" reported healthy,
@@ -710,6 +788,13 @@ assert_contains "$PLIST" "<string>--apply</string>" "T20 and it is ARMED, exactl
 assert_contains "$PLIST" "<integer>3600</integer>" "T20 hourly, matching the systemd timer's cadence"
 assert_contains "$PLIST" "<string>$REPO</string>" "T20 the agent carries this box's repo"
 assert_contains "$PLIST" "VENV_REAPER</key>" "T20 the delegates are PINNED (as in the systemd unit)"
+# Positive control for the plist read-back: it must assert the SAME two facts the systemd arm refuses
+# on — our executable AND the arming decision — and it must say which of them it could verify (a
+# parsed plist that carries no EnvironmentVariables.HOME says so instead of printing one unqualified
+# "verified" line). A stale plist is the shape this catches: `--dry-run` reclaims nothing while
+# `launchctl list` shows the job loaded.
+assert_contains "$OUT" "verify: ProgramArguments + mode flag read back from the installed plist" \
+    "T20 the installed plist is read back INCLUDING the arming decision (not just the executable)"
 assert_contains "$PLIST" "pi-reap-worktrees-launchd.py" "T20 it launches through the TCC launcher, not bash"
 assert_contains "$PLIST" "BOUNDED_LIB</key>" "T20 the bounded library is PINNED for the piped (bash -s) start"
 assert_absent "$PLIST" "{{" "T20 every placeholder is resolved"
@@ -1661,6 +1746,15 @@ else
     assert_dir "$WT_LIVE/.venv" "T52 the LIVE lane's .venv survives the same pass"
     assert_contains "$OUT" "KEEP live-cwd" "T52 and the surviving row names its deciding witness"
     assert_contains "$OUT" "reaped=1" "T52 exactly one env was reaped"
+    # ⛔ AN ARMED PASS MUST REPORT WHAT IT CLASSIFIED, NOT ONLY WHAT IT REMOVED (#4529). The candidate
+    # count used to come from the owner's `REAP` report rows, which an armed pass never emits — so
+    # `candidates_venv` was a structural 0 on every armed pass, exactly as `candidates_worktree` was.
+    # The tally is the owner's own (`venvs_found= reapable= kept=`), read in BOTH modes.
+    ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+    assert_contains "$ST" "candidates_venv=1" "T52 an ARMED venv pass reports its real candidate count (was a structural 0)"
+    assert_contains "$ST" "classified_venv=2" "T52 ... out of the checkouts it classified"
+    assert_contains "$ST" "preserved_venv=1" "T52 ... and says how many it kept"
+    assert_contains "$OUT" "mode=apply candidates=1" "T52 the class line carries the count without the record"
     # The distinguishing half: the SAME env is cleared once the holder is gone.
     kill "$LIVE17" 2>/dev/null; wait "$LIVE17" 2>/dev/null
     sleep 1
@@ -1704,7 +1798,7 @@ assert_contains "$ST" "ok=0" "T53 and the record is not healthy"
 assert_contains "$ST" "rc=3" "T53 and it carries the red code"
 assert_contains "$ST" "verdict_venv=fail-closed" "T53 the class verdict says fail-closed"
 assert_contains "$ST" "exited 3" "T53 the detail names the DELEGATE's own code, not the pass's"
-assert_absent "$ST" "deferred" "T53 a fail-closed class is never recorded as a deferral"
+assert_absent "$ST" "verdict_venv=deferred" "T53 a fail-closed class is never recorded as a deferral"
 SRC2=0; HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t53/state" bash "$REAPER" --print-status >/dev/null 2>&1 || SRC2=$?
 assert_eq "$SRC2" "3" "T53 --print-status exits 3 for a failed pass"
 
@@ -1765,7 +1859,7 @@ OUT="$(VENV_REAPER="$T/t53/removal.sh" run_reaper --apply --repo "$T/t53/repo-a"
 ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
 assert_eq "$RC" "4" "T53 venv's 4 (a removal FAILED) is 4 — red"
 assert_contains "$ST" "verdict_venv=removal-failed" "T53 and the class verdict names the failed removal"
-assert_absent "$ST" "deferred" "T53 a failed removal is never recorded as a deferral"
+assert_absent "$ST" "verdict_venv=deferred" "T53 a failed removal is never recorded as a deferral"
 
 # (c) COULD NOT RUN AS ASKED: the delegate returned 2 (bad arguments / wrong invocation). This is 3 —
 #     red — and it must NOT be mistaken for either a deferral or a delegate's own fail-closed 3.
@@ -1837,6 +1931,589 @@ assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T54 --help documents the sta
 assert_contains "$OUT" "TB_TIMEOUT_BIN" "T54 --help documents the watchdog pin"
 assert_contains "$OUT" "a delegate DEFERRED" "T54 --help carries the DEFERRED exit code, not a sentence cut mid-way"
 
+# ── T58: the INSTALLED ARTIFACT is read back — a drop-in mask is refused ────────────────────────
+# MEASURED (2026-10-18, pi-cell-2/-3): the installed unit executed
+#   ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply
+# and exited 127 every hour while `list-timers` showed it healthy. #2173's refuse_transient_target
+# closed the INPUT side; what it cannot see is the artifact systemd LOADS:
+#   * a `<unit>.service.d/*.conf` drop-in replaces ExecStart and the rendered bytes still match;
+#   * a truncated/partial write leaves no ExecStart at all.
+# So the install re-reads the artifact and REFUSES — before `enable --now`, because leaving an armed,
+# unverified unit firing hourly while the installer exits 1 is the same false PASS in a new place.
+ENVNAME=t55
+REPO="$(mk_repo t55redo)"
+mkdir -p "$T/t55/units" "$T/t55/home" "$T/t55/bin"
+: >"$T/t55/calls.log"
+# The fake scheduler answers exactly like systemd for the systemd-facing verbs, so the override path
+# (which reads the FILE + its own drop-in dir) is what is exercised — no real unit dir is touched.
+cat >"$T/t55/bin/systemctl" <<'SC'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
+case "$*" in
+  *is-enabled*) echo enabled ;;
+  *is-active*) echo active ;;
+  *show*) echo 0 ;;
+esac
+exit 0
+SC
+chmod +x "$T/t55/bin/systemctl"
+inst55() { # inst55 <args...>
+    # ⛔ DISK_REAPER_RUN is PINNED to the reaper itself. #2354 makes the installer PREFER the scheduled
+    # wrapper beside the reaper (`disk-reaper-run.sh`), and after that landed this repo has one — so the
+    # rendered unit would name the WRAPPER, while every assertion in T58/T58b/c/d is about the ARTIFACT
+    # READ-BACK gate (does the unit systemd LOADS run what we rendered?) and is written against $REAPER.
+    # Pinning the seam keeps this fixture measuring that gate and nothing else. The wrapper preference
+    # is measured at the END of this block, on its own unpinned install — it is NOT covered by T20,
+    # which only asserts that `disk-reaper-run.sh` exists and runs standalone.
+    HOME="$T/t55/home" DISK_REAPER="$REAPER" DISK_REAPER_RUN="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t55/home/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$T/t55/units" SYSTEMCTL="$T/t55/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/t55/calls.log" \
+    TEMPLATES_DIR="$HERE/../templates/systemd" \
+    bash "$INST" "$@"
+}
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 a clean install succeeds"
+assert_contains "$OUT" "verify: ExecStart + HOME read back from the installed artifact" \
+    "T58 the install READS THE ARTIFACT BACK and says so (not merely 'bytes were copied')"
+UNIT58="$T/t55/units/eldato-disk-reaper.service"
+assert_contains "$(cat "$UNIT58")" "ExecStart=/bin/bash $REAPER --apply" \
+    "T58 positive control: the installed unit really does carry the rendered ExecStart"
+# The mask: systemd merges <unit>.service.d/*.conf AFTER the unit, and a bare `ExecStart=` resets the
+# list — so this drop-in replaces what the reaper runs while the base file stays byte-identical.
+mkdir -p "$T/t55/units/eldato-disk-reaper.service.d"
+cat >"$T/t55/units/eldato-disk-reaper.service.d/50-mask.conf" <<'DROPIN'
+[Service]
+ExecStart=
+ExecStart=/bin/bash /tmp/tmp.deadbeef/bg/home/.pi/agent/scripts/disk-reaper.sh --apply
+DROPIN
+: >"$T/t55/calls.log"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a drop-in that REPLACES ExecStart makes the install REFUSE"
+assert_contains "$OUT" "REFUSING" "T58 the refusal is loud"
+assert_contains "$OUT" "does not run the reaper this install rendered" \
+    "T58 ... and names the defect (the unit runs something else)"
+assert_contains "$OUT" "50-mask.conf" "T58 ... and points at the drop-in directory that can cause it"
+assert_absent "$(cat "$T/t55/calls.log" 2>/dev/null || true)" "enable --now" \
+    "T58 the timer is NOT enabled over the refused unit (no armed, unverified hourly pass)"
+# Positive control that the SAME assertion path clears once the mask is gone: the refusal must be
+# about the artifact, not about the second install.
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/50-mask.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 removing the drop-in restores a clean install (the gate is about the artifact)"
+# A drop-in that merely ADDS a pre-flight command is a HEALTHY unit (`Type=oneshot` may carry several
+# ExecStart=), and refusing it would be a false block on a working cell.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/60-preflight.conf" <<'DROPIN'
+[Service]
+ExecStart=/bin/true
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 an ADDED ExecStart (a pre-flight) is accepted — our command is still among them"
+assert_contains "$OUT" "verify: ExecStart + HOME read back" "T58 ... and it is still verified, not skipped"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/60-preflight.conf"
+# The artifact must also carry the HOME the class needs for gh auth. A drop-in that moves it is the
+# measured exit-3 class ("gh unavailable or the origin-remote probe failed").
+cat >"$T/t55/units/eldato-disk-reaper.service.d/70-home.conf" <<'DROPIN'
+[Service]
+Environment=HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a drop-in that moves Environment=HOME is refused (gh auth lives under HOME)"
+assert_contains "$OUT" "is not the home this install rendered" "T58 ... and it says which two HOMEs disagree"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/70-home.conf"
+# ⛔ THE SAME REFUSAL MUST HOLD FOR EVERY SPELLING systemd ACCEPTS, not just the one-line one. A gate
+# that reads `^Environment=HOME=` and then prints "read back" is defeatable by any of these, and the
+# install would report an artifact it never checked (review B, P0): systemd takes several
+# space-separated assignments on one line, honours double and single quotes, and lets the LAST
+# assignment of a name win.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/71-home-list.conf" <<'DROPIN'
+[Service]
+Environment=PATH=/usr/bin:/bin HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a HOME moved inside a MULTI-ASSIGNMENT Environment= line is still refused"
+assert_contains "$OUT" "is not the home this install rendered" "T58 ... and says which HOMEs disagree"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/71-home-list.conf"
+cat >"$T/t55/units/eldato-disk-reaper.service.d/72-home-quoted.conf" <<'DROPIN'
+[Service]
+Environment="HOME=/tmp/tmp.deadbeef/bg/home"
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a QUOTED Environment=\"HOME=…\" is still refused"
+assert_contains "$OUT" "is not the home this install rendered" "T58 ... and says which HOMEs disagree"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/72-home-quoted.conf"
+# A LATER assignment of the same name wins in systemd, so the last one is what must be judged — the
+# base file's correct HOME must not mask a drop-in that overrides it.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/73-home-later.conf" <<'DROPIN'
+[Service]
+Environment=HOME=/tmp/one
+Environment=HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 the LAST assignment of HOME is the one judged (systemd semantics)"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/73-home-later.conf"
+# The delegate pins are read from the SAME map: a pin moved into a multi-assignment line pointed at a
+# missing file must still be reported (the class then fails closed hourly).
+cat >"$T/t55/units/eldato-disk-reaper.service.d/74-pin.conf" <<'DROPIN'
+[Service]
+Environment=PATH=/usr/bin:/bin WORKTREE_REAPER=/tmp/gone/pi-reap-worktrees.sh
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 a moved delegate pin is a WARNING, not a refusal (the other classes still run)"
+assert_contains "$OUT" "pinned delegate(s) missing after install" "T58 ... and it names the missing pin (list-form Environment= is parsed)"
+assert_contains "$OUT" "WORKTREE_REAPER(/tmp/gone/pi-reap-worktrees.sh)" "T58 ... with the path it actually found"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/74-pin.conf"
+# ⛔ A LINE SYSTEMD WOULD REJECT IS NOT A VERIFIED HOME. An unterminated quote makes systemd abandon
+# that Environment= line (the service runs WITHOUT the variable), so a tokenizer that strips the quote
+# and returns the value certifies a HOME the unit never gets — a fail-open the old line-match did not
+# have, because it compared the value with the quote still attached.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/75-unterminated.conf" <<'DROPIN'
+[Service]
+Environment="HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 an Environment= line systemd would REJECT is refused, not read as a HOME"
+assert_contains "$OUT" "cannot evaluate" "T58 ... and the refusal says why"
+assert_contains "$OUT" "cannot be" "T58 ... and states the consequence (the variables cannot be verified)"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/75-unterminated.conf"
+# ⛔ ... but an ESCAPED quote is legal systemd and must NOT be refused: the first escaped-quote
+# implementation treated `\\"` as the terminator, turning an over-block into a false refusal whose
+# reason ("systemd would REJECT") was untrue for that input.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/75-escaped.conf" <<DROPIN
+[Service]
+Environment="HOME=$T/t55/h\"ome"
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 an escaped quote parses, so the mismatch refused is the VALUE (not a parse error)"
+assert_absent "$OUT" "cannot evaluate" "T58 ... and the refusal does not blame the parser for a legal line"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/75-escaped.conf"
+# gh resolvability is REPORTED, never assumed: with no gh on the rendered PATH the worktree class
+# fails closed every pass, and the operator must see that at install time.
+# ASK THE QUESTION IN THE ENVIRONMENT UNDER TEST. `command -v gh` in the suite's own shell answers
+# about the SUITE's PATH (which carries the harness shim), not about the PATH the installer renders.
+OUT="$(PATH="/usr/bin:/bin" inst55 --install 2>&1)"
+if PATH="/usr/bin:/bin" command -v gh >/dev/null 2>&1; then
+    ok "T58 SKIP (gh resolves under /usr/bin:/bin on this host): the missing-gh report cannot be driven here"
+else
+    assert_contains "$OUT" "no \`gh\` on the PATH this unit renders" \
+        "T58 a missing gh is REPORTED at install (the class would fail closed every pass)"
+fi
+
+# ⛔ THE WRAPPER PREFERENCE IS MEASURED HERE (#2354), because nothing else measures it: T20 asserts
+# `scripts/disk-reaper-run.sh` EXISTS and runs it directly, but NOTHING fails if the installer stops
+# PREFERRING it — and that regression is silent in production (a timer-started raw reaper inherits no
+# HOME/keys/gh, fails the open-PR gate closed and reclaims nothing: the measured outage the wrapper
+# exists to fix). Deliberately UNPINNED, so the beside-wrapper is what the rendered unit names.
+WRAPPER58="$(dirname "$REAPER")/disk-reaper-run.sh"
+mkdir -p "$T/t55w/units"
+OUT="$(HOME="$T/t55/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t55/home/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$T/t55w/units" SYSTEMCTL="$T/t55/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/t55/calls.log" TEMPLATES_DIR="$HERE/../templates/systemd" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 the UNPINNED install (wrapper preference live) succeeds"
+if [ -f "$WRAPPER58" ]; then
+    assert_contains "$(cat "$T/t55w/units/eldato-disk-reaper.service")" "ExecStart=/bin/bash $WRAPPER58" \
+        "T58 the installer PREFERS the scheduled wrapper beside the reaper (#2354) — delete the preference loop and this fails"
+else
+    bad "T58 $WRAPPER58 is missing — a timer would run the raw reaper, the #2354 outage shape"
+fi
+
+# ── T58b: the plist TEXTUAL fallback (no parser) must still refuse a stale arming decision ──────
+# The parsed arm requires the executable AND the mode flag. The fallback used to check only that the
+# reaper's path appeared SOMEWHERE in the file, so a stale agent carrying `--dry-run` — or the path
+# inside an unused environment entry — read as installed, and the message claimed the parser was
+# ABSENT even when one was present but failed. Driving the function directly (extracted from the live
+# script, so it cannot drift) is the only seam for "no parser on this host".
+mkdir -p "$T/t55b/bin" "$T/t55b/units"
+for _u in bash grep sed cat rm mv mkdir chmod date awk tr head tail printf ls cp install python3 plutil; do
+    [ -e "$T/t55b/bin/$_u" ] || { [ -x "/usr/bin/$_u" ] && ln -s "/usr/bin/$_u" "$T/t55b/bin/$_u"; }
+done
+rm -f "$T/t55b/bin/python3" "$T/t55b/bin/plutil"
+# A `plutil` that EXISTS but FAILS is the case the old message mislabelled; the fallback must handle
+# it the same as an absent parser.
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$T/t55b/bin/plutil"
+chmod +x "$T/t55b/bin/plutil"
+{
+    # The plist read-back's helpers are extracted WITH it: the arm now parses ProgramArguments
+    # positionally (a membership test over the JSON text accepted `["/bin/true","<reaper>",…]` as
+    # "launches the reaper"), so a seam that extracted only the top-level function would drive a
+    # helper-less copy and refuse everything for the wrong reason.
+    for _f in plist_program_arguments_textual json_array_words argv_executes_reaper argv_has_token \
+              plist_argv_runs_reaper; do
+        sed -n "/^$_f()/,/^}/p" "$INST"
+    done
+    sed -n '/^verify_installed_artifact_plist()/,/^}/p' "$INST"
+} >"$T/t55b/plist-fn.sh"
+REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" >/dev/null 2>&1
+# a GOOD plist, textual route
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58b the textual fallback accepts an artifact that carries executable AND mode flag"
+assert_contains "$OUT" "EnvironmentVariables.HOME NOT verified" "T58b ... and NAMES the fact it could not verify"
+# a STALE plist (armed decision missing) — the defect the parsed arm was fixed for
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--dry-run</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58b the textual fallback REFUSES a stale plist that lacks the arming decision"
+assert_contains "$OUT" "does not carry --apply" "T58b ... naming the missing flag"
+# a parser that is PRESENT but FAILING must not be reported as ABSENT, and its own error must survive
+printf '%s\n' '#!/usr/bin/env bash' 'echo "plutil: Could not extract value, error: No value at that key path" >&2; exit 1' >"$T/t55b/bin/plutil"
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58b a failing parser still falls back (it does not block the install)"
+assert_contains "$OUT" "the plist parser FAILED" "T58b ... and the operator is told the parser FAILED, not that none exists"
+assert_contains "$OUT" "No value at that key path" "T58b ... with the parser's OWN error text preserved"
+# ... and the SAME fact must hold on the REFUSAL branch, which used to say "no readable plist parser
+# was available" while a parser was present and failing.
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--dry-run</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58b the stale-plist refusal still fires"
+# ⛔ EXACT, not substring: a duplicated/jammed message satisfied a substring match, so the suite was
+# green over `…key pathplutil: …` (the `${perr:-…}`-is-not-an-else bug). Pin the whole parenthesis
+# line, and its singularity.
+LINE="$(printf '%s\n' "$OUT" | grep -F "(textual check only:" || true)"
+assert_eq "$LINE" "ERR:   (textual check only: the plist parser FAILED — plutil: Could not extract value, error: No value at that key path)" \
+    "T58b ... and the REFUSAL branch names the parser FAILED, with its error, on ONE flattened line"
+assert_eq "$(printf '%s\n' "$OUT" | grep -cF 'plutil: Could not extract value')" "1" \
+    "T58b ... and the parser error appears EXACTLY ONCE (not once per expansion half)"
+# the absent-parser case must still say absent, never FAILED
+mkdir -p "$T/t55b/bin-none"
+for _u in bash grep sed cat rm mv mkdir chmod date awk tr head tail printf ls cp install; do
+    [ -e "$T/t55b/bin-none/$_u" ] || { [ -x "/usr/bin/$_u" ] && ln -s "/usr/bin/$_u" "$T/t55b/bin-none/$_u"; }
+done
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58b with NO parser at all the stale plist is still refused"
+assert_contains "$OUT" "(textual check only: no plist parser was available)" "T58b ... and it says no parser was available, not that one failed"
+assert_absent "$OUT" "the plist parser FAILED" "T58b ... never claiming a failure it did not observe"
+# ⛔ MEMBERSHIP IS NOT EXECUTION (T58c). The first cut of BOTH read-back arms asked "does the reaper's
+# PATH appear in this command line?" — `case " $exec " in *" $REAPER "*)` for systemd and
+# `*"\"$REAPER\""*` over the plist's JSON text. So a drop-in that REPLACED `ExecStart=` with
+# `/bin/true <reaper> --apply` matched: the install printed `verify: … read back`, exited 0 and ran
+# `enable --now` — a box with no reaper and every check green. Reproduced against the stub `systemctl`
+# in T58 before the fix; these assertions are that reproduction, pinned.
+mkdir -p "$T/t55/units/eldato-disk-reaper.service.d"
+cat >"$T/t55/units/eldato-disk-reaper.service.d/55-mention.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart=/bin/true $REAPER --apply
+DROPIN
+: >"$T/t55/calls.log"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58c a drop-in that only MENTIONS the reaper as an argument is REFUSED (membership != execution)"
+assert_contains "$OUT" "does not run the reaper this install rendered" "T58c ... and names the defect"
+assert_absent "$(cat "$T/t55/calls.log" 2>/dev/null || true)" "enable --now" \
+    "T58c ... and the timer is NOT armed over it"
+# A shell whose first non-option argument is NOT the reaper is refused too: `bash -c '<text>'` is one
+# argument, and whether the text runs the reaper is not a fact this gate can prove.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/55-mention.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart=/bin/bash -c "$REAPER --apply"
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58c a shell whose first argument is a SCRIPT TEXT naming the reaper is REFUSED"
+# ... while the rendered shape itself still passes (the positive control that the rule is not a blanket
+# refusal), including a shell in program position taking the reaper as its first argument.
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/55-mention.conf"
+cat >"$T/t55/units/eldato-disk-reaper.service.d/56-env.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart=/usr/bin/env bash $REAPER --apply
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58c a shell (incl. /usr/bin/env-prefixed) EXECUTING the reaper is accepted"
+assert_contains "$OUT" "verify: ExecStart + HOME read back" "T58c ... and verified, not skipped"
+# systemd's own exec prefixes (`-` ignore-failure, `@` argv[0]) are stripped before the program is read.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/56-env.conf" <<'DROPIN'
+[Service]
+ExecStart=
+ExecStart=-/bin/true
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58c a PREFIXED different program (-/bin/true) is still refused"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/56-env.conf"
+# An ExecStart with an UNTERMINATED QUOTE is a directive systemd ABANDONS (EINVAL): the unit would
+# start without it, so "verified" over it is a claim about a command that will never run.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/57-quote.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart="/bin/bash $REAPER --apply
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58c an ExecStart with an unterminated quote is REFUSED (systemd rejects the directive)"
+assert_contains "$OUT" "cannot be tokenized" "T58c ... and says so, instead of reading it as a pass"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/57-quote.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58c removing the drop-in restores a clean install (the gate is about the artifact)"
+# The launchd arm's equivalent fact is a PAIR (`<LAUNCHER> --script <reaper>`), not "the path appears".
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/usr/bin/python3</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>/bin/true</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58c a plist launcher whose --script is NOT the reaper is REFUSED"
+assert_contains "$OUT" "does not LAUNCH $REAPER" "T58c ... and names the defect"
+# ... and the rendered TCC shape (launcher + --script <reaper>) is ACCEPTED, so the pair rule is not a
+# blanket refusal of the shape this installer actually writes.
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/usr/bin/python3</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58c the rendered launcher + --script <reaper> shape is ACCEPTED (positive control)"
+# ⛔ argv[0] IS THE PROGRAM launchd EXECS. Pinning only argv[1] (the launcher) and `--script` certified
+# `[/bin/true, <launcher>, --script, <reaper>, --apply]`: launchd runs /bin/true, nothing else, while
+# the install reports success — the same fail-open as the systemd arm, in the arm that claims to assert
+# "the equivalent fact" (found in review, reproduced).
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/bin/true</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" PY_BIN="/usr/bin/python3" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58c a plist whose argv[0] is NOT the rendered interpreter is REFUSED (argv[0] is the program)"
+assert_contains "$OUT" "does not LAUNCH $REAPER" "T58c ... and names the defect"
+# A STALE interpreter is the same defect in a subtler shape (the TCC class this installer warns about):
+# the launcher and --script are right, argv[0] is an interpreter the render did not choose.
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/usr/bin/python2</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" PY_BIN="/usr/bin/python3" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; log_line() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58c a plist whose argv[0] is a STALE interpreter (not the rendered PY_BIN) is REFUSED"
+
+# ⛔ THE SPELLING IS PART OF THE ARTIFACT (T58d). systemd strips whitespace around `=` and accepts
+# indented lines, so `ExecStart =` / `  ExecStart=` are the SAME directive as `ExecStart=`, and
+# `ExecStart = /bin/true` REPLACES the command. A read-back anchored on `^ExecStart=` saw neither, so a
+# drop-in spelled this way was certified while the unit ran /bin/true (found in review; reproduced
+# against the stub systemctl below). One assertion per spelling, because a single one would be green
+# over the others.
+for _sp in 'ExecStart =\nExecStart = /bin/true' 'ExecStart=\nExecStart =/bin/true' 'ExecStart =\n  ExecStart=/bin/true' 'ExecStart=\nExecStart= /bin/true' 'ExecStart =\nExecStart = /bin/true --x' ; do
+    printf '[Service]\n%b\n' "$_sp" >"$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+    : >"$T/t55/calls.log"
+    OUT="$(inst55 --install 2>&1)"; RC=$?
+    assert_eq "$RC" "1" "T58d a spaced/indented replacement ExecStart is REFUSED (spelling: $(printf '%b' "$_sp" | tr '\n' '|'))"
+    assert_absent "$(cat "$T/t55/calls.log" 2>/dev/null || true)" "enable --now" \
+        "T58d ... and nothing is armed over it"
+done
+# ... and a spaced RESET alone (the base unit's own command stays last in force) must be VERIFIED, not
+# refused: the rule is "normalise the spelling", not "refuse anything spaced".
+printf '[Service]\nExecStart =\nExecStart = /bin/bash %s --apply\n' "$REAPER" \
+    >"$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58d a spaced RESET followed by the reaper's own spaced ExecStart is accepted"
+assert_contains "$OUT" "verify: ExecStart + HOME read back" "T58d ... and verified, not skipped"
+# The same hole in the HOME arm: `Environment = HOME=…` moved HOME invisibly.
+printf '[Service]\nEnvironment = HOME=/tmp/tmp.deadbeef/bg/home\n' \
+    >"$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58d a SPACED Environment = HOME is judged (it moved HOME)"
+assert_contains "$OUT" "is not the home this install rendered" "T58d ... and names the disagreement"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58d removing the drop-in restores a clean install"
+
+# ── T59: an UNANSWERABLE tally is recorded as such, and per-repo tallies are SUMMED ────────────
+# Two defects a review cycle found in the tally lift, both of the "record lies" class:
+#   (a) the counter defaults made `${sum_classified:-?}` unfireable, so a class that produced NO
+#       tally (an older farmed delegate, or a fail-closed abort before the SUMMARY) was recorded as a
+#       measured `0` beside `verdict=…` — reading as "healthy, nothing to do";
+#   (b) `reasons=` from several repos was CONCATENATED (`too-recent:1,too-recent:5`), which is not a
+#       histogram and does not sum to `preserved=`.
+# The stub delegate prints EXACTLY the SUMMARY shape the real one prints, so this pins the entry
+# point's contract without re-encoding the reaper's classification in a fixture.
+ENVNAME=t56
+REPO_A="$(mk_repo t56a)"
+REPO_B="$(mk_repo t56b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "remove   $1/x"' \
+    'echo "SUMMARY examined=3 classified=3 remove=0 preserved=1 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:1 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t56-delegate.sh"
+chmod +x "$T/t56-delegate.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$T/t56-silent.sh"
+chmod +x "$T/t56-silent.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-delegate.sh" run_reaper --apply --repo "$REPO_A" --repo "$REPO_B" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+# (a) two repos, one tally line each: both counted, and `reasons=` is ONE histogram.
+assert_contains "$ST" "classified_worktree=6" "T59 the per-repo tallies are SUMMED, not first-wins"
+assert_contains "$ST" "preserved_worktree=2" "T59 ... including the preserved count"
+assert_contains "$ST" "preserved_reasons_worktree=too-recent:2" "T59 per-repo reasons are MERGED into one histogram (not concatenated)"
+assert_contains "$OUT" "reasons=too-recent:2" "T59 the class line carries the merged histogram too"
+# (b) a delegate that prints NO tally must be `?` on the line and in the record — never a 0.
+OUT="$(WORKTREE_REAPER="$T/t56-silent.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$OUT" "classified=?" "T59 a class that produced NO tally says '?', not a measured 0"
+assert_contains "$ST" "classified_worktree=?" "T59 the record carries '?' for the same case"
+assert_contains "$ST" "preserved_reasons_worktree=?" "T59 ... for the reasons field too"
+assert_absent "$ST" "classified_worktree=0" "T59 and NEVER a 0 it did not measure"
+# ⛔ THE CANDIDATE FIELD IS THE SAME TRAP: in an apply pass it comes from the delegate's own
+# `remove=`, so with no tally there is no answer — `0` here is a measured-looking zero beside
+# `classified_worktree=?`, which is exactly the shape this test exists to forbid.
+assert_contains "$ST" "candidates_worktree=?" "T59 candidates in an APPLY pass with no tally is '?', not a 0"
+assert_absent "$ST" "candidates_worktree=0" "T59 ... and never an invented 0"
+# (b1b) ⛔ THE SAME RULE PER **CLASS**, NOT ONLY PER REPO — THE WORKTREE ARM'S OWN CASE (#4529).
+# `have_tally` is set by ANY repo that answered, while the published counts are class TOTALS over only
+# the repos that answered, so a two-repo pass where ONE repo answered published its partial sum as the
+# class's measured counts: `classified_worktree=5 preserved_worktree=4` beside `tally_worktree=1/2`,
+# with the repo that produced NO ANSWER silently absent from the four fields this arm exists to
+# publish. Two repos, the first answering a full SUMMARY, the second truncated mid-line (a delegate
+# dying mid-write — the likeliest truncation, since the tail fields are the ones cut). Full coverage
+# is what makes the sum an answer; short of it every count is `?`.
+REPO_PA="$(mk_repo d59-partial-a)"
+REPO_PB="$(mk_repo d59-partial-b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in */d59-partial-a) echo "SUMMARY examined=2 classified=2 remove=0 preserved=2 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:2 main_proof=local pr_merged=na"; exit 0 ;; esac; done' \
+    'echo "SUMMARY examined=1 classified=1 rem"' \
+    'exit 0' >"$T/t59-wt-partial.sh"
+chmod +x "$T/t59-wt-partial.sh"
+OUT="$(WORKTREE_REAPER="$T/t59-wt-partial.sh" run_reaper --apply --repo "$REPO_PA" --repo "$REPO_PB" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "tally_worktree=1/2" "T59 a PARTIAL worktree class discloses its coverage as 1/2"
+assert_contains "$ST" "classified_worktree=?" "T59 ... and does NOT publish the partial sum as the class's classified count"
+assert_absent   "$ST" "classified_worktree=2" "T59 ... never a class total that only one repo measured"
+assert_contains "$ST" "preserved_worktree=?" "T59 ... the preserved count is unmeasured too"
+assert_contains "$ST" "preserved_reasons_worktree=?" "T59 ... and so is the histogram (a class TOTAL, not a per-repo row)"
+assert_contains "$OUT" "classified=?" "T59 the class LINE agrees with the record about the partial class"
+# ...and the full-coverage control: the SAME stub, both repos answering, publishes the sum. Without
+# this pair the assertion above is satisfied by an arm that can never publish anything.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=2 classified=2 remove=0 preserved=2 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:2 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t59-wt-full.sh"
+chmod +x "$T/t59-wt-full.sh"
+STF="$(WORKTREE_REAPER="$T/t59-wt-full.sh" run_reaper --apply --repo "$REPO_PA" --repo "$REPO_PB" --only worktree >/dev/null 2>&1; cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$STF" "tally_worktree=2/2" "T59 control: full coverage is disclosed as 2/2"
+assert_contains "$STF" "classified_worktree=4" "T59 control: with every repo answered the class sum IS published"
+# ⛔ THE PROOF MODES FOLLOW THE SAME COVERAGE RULE. `proof`/`prm` are accumulated over the answering
+# repos exactly like the counters, but the class LINE printed the raw variables while the RECORD routes
+# them through `HAVE_WT_TALLY` — so on the partial pass above the line published `main_proof=local
+# pr_merged=na` (one repo's proof mode) while the record said `main_proof=?`: two surfaces of ONE pass
+# contradicting each other, on the field that answers "how was this merge proved". Decided once, at
+# the coverage test, so both read one value. Paired with the control below (full coverage DOES publish
+# it), so neither assertion can be satisfied by an arm that always says `?`.
+assert_contains "$(grep -F 'class=worktree' <<<"$OUT" | grep -F 'mode=apply')" "main_proof=?" "T59 the PARTIAL class LINE does not publish one repo's proof mode"
+assert_absent   "$(grep -F 'class=worktree' <<<"$OUT" | grep -F 'mode=apply')" "main_proof=local" "T59 ... never a proof mode only one of the two repos used"
+assert_contains "$ST"  "main_proof=?" "T59 ... and the RECORD agrees with the line (both '?')"
+assert_contains "$ST"  "pr_merged=?" "T59 ... pr_merged too"
+assert_contains "$STF" "main_proof=local" "T59 control: full coverage DOES publish the measured proof mode"
+# (b1c) ⛔ AN UNPARSEABLE HISTOGRAM IS NOT `none`. The `none` normalisation ran on "the `reasons=` field
+# was PRESENT" plus "the folded histogram is empty" — but an empty histogram is also what an
+# UNPARSEABLE one folds to (`reasons=too-recent:x`: the reason NAME is a word, the COUNT must be a
+# number, so the row is dropped). A farmed or version-skewed delegate therefore produced
+# `preserved=4 preserved_reasons=none` — "four checkout(s) kept, and none of them for any reason",
+# verbatim the record the normalisation exists to forbid — with no way to tell it from a genuinely
+# reason-less pass. Only a repo that SAID `none` answers; anything else ends as `?`.
+REPO_PC="$(mk_repo d59-badreasons)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=4 classified=4 remove=0 preserved=4 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:x main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t59-wt-badreasons.sh"
+chmod +x "$T/t59-wt-badreasons.sh"
+STB="$(WORKTREE_REAPER="$T/t59-wt-badreasons.sh" run_reaper --apply --repo "$REPO_PC" --only worktree >/dev/null 2>&1; cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$STB" "preserved_worktree=4" "T59 an UNPARSEABLE histogram still publishes the count it did measure"
+assert_contains "$STB" "preserved_reasons_worktree=?" "T59 ... and says ? for the histogram it could not parse"
+assert_absent   "$STB" "preserved_reasons_worktree=none" "T59 ... never 'none', which reads as four checkouts kept for no reason at all"
+# ...and the control: a repo that really SAID `none`, on full coverage, still normalises to `none` —
+# without it the assertion above is satisfied by deleting the normalisation outright.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=4 classified=4 remove=0 preserved=4 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=none main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t59-wt-none.sh"
+chmod +x "$T/t59-wt-none.sh"
+STN="$(WORKTREE_REAPER="$T/t59-wt-none.sh" run_reaper --apply --repo "$REPO_PC" --only worktree >/dev/null 2>&1; cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$STN" "preserved_reasons_worktree=none" "T59 control: an ANSWERED reasons=none is still \`none\`, not \`?\`"
+# (b2) THE SIBLING CLASS HAS THE SAME CONTRACT. `reap-lane-venvs.sh` prints one tally line per repo
+# too, and the lift used to read only the FIRST — so on a two-repo cell `classified_venv` reported one
+# repo's number beside the other repo's venvs (and a clean first repo restored the structural 0 the
+# lift exists to remove).
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "[stub] venvs_found=2 reapable=1 reaped=0 kept=1 recheck_kept=0 failed=0"' \
+    'exit 0' >"$T/t56-venv.sh"
+chmod +x "$T/t56-venv.sh"
+WORKTREE_REAPER="$T/t56-delegate.sh" VENV_REAPER="$T/t56-venv.sh" \
+    run_reaper --apply --repo "$REPO_A" --repo "$REPO_B" --only venv >/dev/null 2>&1
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "classified_venv=4" "T59 the venv tallies are SUMMED across repos too"
+assert_contains "$ST" "candidates_venv=2" "T59 ... and the candidate count is the sum, not the first repo's"
+assert_contains "$ST" "preserved_venv=2" "T59 ... and the kept count"
+# (b3) THE VENV ARM CARRIES THE SAME SENTINELS — it used to print its three counts RAW, so a class
+# that was never selected recorded `verdict_venv=not-run` beside `classified_venv=0`, and a delegate
+# that answered nothing recorded three measured zeros.
+OUT="$(VENV_REAPER="$T/t56-venv.sh" run_reaper --apply --repo "$REPO_A" --repo "$REPO_B" --only venv 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "tally_venv=2/2" "T59 the venv record states its tally COVERAGE (repos answered / scanned)"
+assert_contains "$ST" "tally_worktree=not-run" "T59 ... and the unselected worktree class says not-run there too"
+ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$ST" "classified_venv=" "T59 the venv counts are surfaced by --print-status"
+# A class that was NOT selected must not be a measured zero.
+OUT="$(run_reaper --apply --repo "$REPO_A" --only uv 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "classified_venv=not-run" "T59 an UNSELECTED venv class is 'not-run', never 0"
+assert_contains "$ST" "candidates_venv=not-run" "T59 ... for the candidate count too"
+# (b4) An ANSWERED `reasons=none` is a result, not a missing answer.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=1 classified=1 remove=1 preserved=0 deferred=0 deferred_remove=0 removed=1 failed=0 late_preserved=0 prune_blocked=0 reasons=none main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t56-clean.sh"
+chmod +x "$T/t56-clean.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-clean.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "preserved_reasons_worktree=none" "T59 an answered reasons=none is recorded as none, not '?'"
+# (b5) A REFUSAL is not a measurement: a dry pass whose delegate only refused must not claim a
+# measured 0 candidates.
+printf '%s\n' '#!/usr/bin/env bash' 'echo "class=worktree FAIL-CLOSED — gh unavailable"; exit 3' >"$T/t56-refuse.sh"
+chmod +x "$T/t56-refuse.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-refuse.sh" run_reaper --dry-run --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "candidates_worktree=?" "T59 a delegate that only REFUSED leaves candidates unanswerable ('?'), not 0"
+assert_absent "$ST" "candidates_worktree=0" "T59 ... and never an invented 0 in a dry pass"
+# (b6) THE CLASS LINE MUST AGREE WITH THE RECORD — three surfaces, three defects a review cycle found:
+#   · an ARMED venv pass printed `candidates=0` from the initialised variable while the record said `?`;
+#   · `reasons=none` was normalised AFTER the class line printed `${sum_reasons:-?}`, so a clean armed
+#     pass said `reasons=?` ("not measured") about a measurement that answered "none";
+#   · a TRUNCATED SUMMARY (a delegate killed mid-line) set the coverage to `1/1` while every sum stayed
+#     at 0 — an invented zero presented as full coverage.
+OUT="$(VENV_REAPER="$T/t56-silent.sh" run_reaper --apply --repo "$REPO_A" --only venv 2>&1)"
+assert_contains "$OUT" "class=venv" "T59 a silent venv delegate still reports the class"
+assert_contains "$OUT" "candidates=?" "T59 ... with candidates '?', not the initialised 0 (class line agrees with the record)"
+OUT="$(WORKTREE_REAPER="$T/t56-clean.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+assert_contains "$OUT" "reasons=none" "T59 an answered reasons=none reaches the CLASS LINE as none, not '?'"
+assert_absent "$OUT" "reasons=?" "T59 ... and never as 'not measured'"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=3 classified=3 preserve"' \
+    'exit 0' >"$T/t56-trunc.sh"
+chmod +x "$T/t56-trunc.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-trunc.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "tally_worktree=0/1" "T59 a TRUNCATED SUMMARY is not coverage: 0 of 1 repos answered"
+assert_contains "$ST" "classified_worktree=?" "T59 ... and the counts are '?', not the summed 0"
+assert_absent "$ST" "tally_worktree=1/1" "T59 ... never claiming the repo answered"
+# (c) a class that was NOT SELECTED is `not-run` — a different fact from `?`.
+ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$ST" "classified_worktree=" "T59 --print-status surfaces the tally fields at all"
+
 # ── T55: the worktree class fails closed PER REPO, and keeps reclaiming the others (#2443) ───────
 # MEASURED DEFECT (2026-10-23, a cell at 95% used): `gh` was present and working, but not
 # authenticated under the pass's HOME, so its PR query exited 4 ("requires authentication" per
@@ -1896,7 +2573,7 @@ assert_eq "$RC" "3" "T55 --print-status still answers 3 for a fail-closed pass"
 assert_contains "$OUT" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
     "T55 --print-status carries the skipped repo and its reason"
 assert_absent "$ST_T55" "cannot run: " \
-    "T55 the class RAN, so it is never reported as `cannot run` (that field means could-not-be-set-up)"
+    "T55 the class RAN, so it is never reported as \`cannot run\` (that field means could-not-be-set-up)"
 # and the reason survives a repo path that CONTAINS A SPACE: the skip line carries the path, so a
 # parser anchored on `skipped=<first token>` would silently anonymise exactly the repos most likely to
 # live under a hand-made directory — turning a named skip back into the class-wide verdict.
@@ -1924,7 +2601,7 @@ assert_dir "$WT_SP" "T55c and its checkout was still left alone"
 # The token is SPACE-FREE BY CONTRACT: a reason that interpolated a path containing a space
 # (`scratch-unwritable(TMPDIR=/My Temp)`) would split at the space, parse to nothing, and turn this
 # repo's skip back into an anonymous class-wide `verdict=fail-closed` (#2443 review P1).
-OUT="$(GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
+OUT="$(REAP_WT_MAIN_PROOF=local GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T55c the delegate itself exits 3 for a repo under a spaced path"
 assert_eq "$(printf '%s\n' "$OUT" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1)" \
     "gh-not-authenticated(rc=4)" "T55c the reason token is exact and space-free (a spaced repo path cannot split it)"
@@ -2170,6 +2847,222 @@ assert_eq "$RC" "6" "T57f6 the canonical lock is uid-independent — a live hold
 assert_contains "$OUT" "pi-disk-reaper/disk-reaper.lock" "T57f6 ... naming that lock"
 assert_absent "$OUT" "class=uv" "T57f6 ... and no class runs beside it"
 rm -rf "$CANON"
+# ⛔ T60 — A CLASS THAT COULD NOT BE SET UP MUST NOT REPORT A VERDICT OR A COUNT IT NEVER COMPUTED.
+# TWO surfaces report a class's verdict: the operator-facing `class=` line, and the
+# `verdict_<class>` field of the pass record. They must carry the SAME value, and they did not: the
+# class lines re-derived `$(class_verdict "$RC_WT")`, whose `*` arm yields `fail-closed`, while
+# `VERDICT_WT` is `misconfigured` on the setup-failure arms. So the line said `verdict=fail-closed`
+# beside the record's `verdict_worktree=misconfigured` for the SAME pass — erasing #2036's "could not
+# be SET UP at all" distinction from the line an operator actually reads. The bug arrived through a
+# merge-conflict resolution, which is exactly what a pinned assertion is for: `class_verdict` cannot
+# return `misconfigured` at all, so the re-derivation was ALWAYS wrong on that path.
+# ⛔ AND THE COUNT HAS THE SAME SHAPE. `misconfigured` measured NOTHING, so a confident
+# `candidates=0` beside `verdict_uv=misconfigured` is an invented zero — the "reads as a passing pass"
+# failure this report exists to remove. The uv class now carries its OWN `HAVE_UV_CAND` sentinel (the
+# first cut keyed the verdict instead, which conflated "could not be SET UP" with "RAN and failed
+# closed" and still reported `0` for an armed pass that has no rows to count), so the unanswerable
+# state reaches the record through that sentinel; the LINE said `?` and the RECORD said `0`, which is
+# the same disagreement one field over.
+# Without this case the suite stays GREEN with either half reverted — no other assertion in this
+# file reads a class line's `verdict=`.
+ENVNAME=t60
+REPO60="$(mk_repo t60)"
+OUT="$(WORKTREE_REAPER=/nonexistent/pi-reap-worktrees.sh \
+    ABANDONED_WT_REAPER=/nonexistent/reap-abandoned-worktrees.sh \
+    run_reaper --dry-run --repo "$REPO60" --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a worktree class that could not be SET UP exits fail-closed (3)"
+assert_contains "$OUT" "class=worktree rc=3 verdict=misconfigured" \
+    "T60 the class line reports the verdict the RECORD reports (misconfigured)"
+assert_absent "$OUT" "class=worktree rc=3 verdict=fail-closed" \
+    "T60 ... and never the re-derived fail-closed ('the delegate RAN' — a different remedy)"
+assert_contains "$(grep -F 'pass end' <<<"$OUT")" "candidates=?" \
+    "T60 the pass-end line does not claim a candidate total it never measured"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_worktree=misconfigured" \
+    "T60 the RECORD agrees with the line about the verdict of the same pass"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_worktree=?" \
+    "T60 ... and about the candidate total (unanswerable, never an invented 0)"
+# The uv half: the class that could not run must not contribute a measured 0 to the pass totals
+# on EITHER surface, and its record field must not contradict the line that just printed `?`.
+OUT="$(CACHE_REAPER=/nonexistent/pi-cache-reap.sh run_reaper --dry-run --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a uv class that could not be SET UP exits fail-closed (3)"
+assert_contains "$OUT" "candidates=?" \
+    "T60 the pass-end line reports the candidate total as unanswerable, not 0"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_uv=?" \
+    "T60 ... and the record agrees with the line (never an invented 0)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_uv=misconfigured" \
+    "T60 the uv record names the state that made the total unanswerable"
+# ⛔ THE THIRD CLASS TO GET A SENTINEL. `uv` and `duplicate-install` publish no TALLY of their own, so
+# both are guarded by an explicit `HAVE_*_CAND` (set only where a measurement actually happened) rather
+# than by overloading their VERDICT — `fail-closed` means the delegate RAN, which is not a measurement,
+# and an armed uv pass has no rows to count at all. Fixing one and not the other is how the same
+# invented zero survives a fix that claims to remove it (`candidates_uv=?` beside
+# `candidates_duplicate_install=0` on ONE record), so both are pinned here, on ONE fixture.
+OUT="$(DUP_INSTALL_REAPER=/nonexistent/reap-duplicate-installs.sh run_reaper --dry-run --only duplicate-install 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a duplicate-install class that could not be SET UP exits fail-closed (3)"
+assert_contains "$(grep -F 'pass end' <<<"$OUT")" "candidates=?" \
+    "T60 ... contributes no measured 0 to the pass-end total either"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_duplicate_install=?" \
+    "T60 ... and its RECORD says ?, not an invented 0 (the same class of defect as uv)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_duplicate_install=misconfigured" \
+    "T60 ... beside the verdict that explains why"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_uv=not-run" \
+    "T60 a class that was NOT SELECTED says not-run, not ? and not 0"
+# ⛔ THE FOURTH STATE: the delegate RAN and could not measure. `fail-closed` is NOT `misconfigured`
+# (a different remedy), and it is not a measurement either — so the record must claim no count. The
+# first cut of this fix keyed only `misconfigured` and reported `candidates_uv=0` beside
+# `verdict_uv=fail-closed`, which is the same invented zero one state over.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "pi-cache-reap: FAIL-CLOSED — census unreadable"' \
+    'exit 3' >"$T/t60-uv3.sh"
+chmod +x "$T/t60-uv3.sh"
+OUT="$(CACHE_REAPER="$T/t60-uv3.sh" run_reaper --dry-run --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a uv delegate that RAN and failed closed is RED (3)"
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "verdict_uv=fail-closed" "T60 ... the verdict keeps 'ran and failed' distinct from 'could not be set up'"
+assert_contains "$ST60" "candidates_uv=?" "T60 ... and a class that MEASURED nothing claims no count"
+assert_absent "$ST60" "candidates_uv=0" "T60 ... never an invented zero for a class that ran"
+# ⛔ AND THE OPERATOR-FACING LINE MUST AGREE WITH THE RECORD. The uv class line printed the RAW counter
+# (`candidates=$count`) while every sibling printed `$(_tally_num …)`, so a refusal said `candidates=0`
+# on the line and `candidates_uv=?` in the record — the two-surfaces-disagree defect this PR exists to
+# remove, on the one class that had just been given a sentinel. Asserting only the RECORD (as the
+# earlier cut did) left that fully green: this assertion is the one that can fail on it.
+assert_contains "$(grep -F 'class=uv rc=3 verdict=fail-closed mode=dry-run' <<<"$OUT")" "candidates=?" \
+    "T60 ... and the class LINE says ? too, not a raw counter"
+assert_absent "$(grep -F 'class=uv rc=3 verdict=fail-closed mode=dry-run' <<<"$OUT")" "candidates=0" \
+    "T60 ... the raw initialised counter never reaches the operator line"
+# ⛔ AND THE ARMED PASS, WHERE THE uv OWNER PUBLISHES NO TALLY. The candidate count in a dry pass comes
+# from our scan of `DRY-RUN uv …` rows; an armed pass has none and pi-cache-reap reports no total, so
+# the answer is `?` — the counter is only assigned in the dry branch, which made every armed pass record
+# `candidates_uv=0` (a measured-looking zero beside work that really happened).
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "cache=uv:/tmp/t60-no-such-cache"; exit 0 ;; esac' \
+    'echo "pi-cache-reap: uv /tmp/t60-no-such-cache -> 0KB (prune=0 evicted=0) max=1MB — UNDER its bound"' \
+    'exit 0' >"$T/t60-uv-apply.sh"
+chmod +x "$T/t60-uv-apply.sh"
+OUT="$(CACHE_REAPER="$T/t60-uv-apply.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "verdict_uv=ok" "T60 the armed uv class succeeds"
+assert_contains "$ST60" "candidates_uv=?" "T60 an ARMED uv pass does not invent a count either (no tally exists)"
+assert_absent "$ST60" "candidates_uv=0" "T60 ... the initialised 0 never reaches the record"
+# ⛔ THE SIBLING *CAN* ANSWER ON AN ARMED PASS, and did not: `reap-duplicate-installs.sh` prints
+# `SUMMARY … candidates=<n>` in BOTH modes, but the entry point assigned the counter only in the dry
+# branch, so an armed pass recorded a structural 0 beside `reaped=` work it had just done. Lift the
+# owner's own number — never re-derive it from row counts.
+mkdir -p "$T/t60/dup-root/fam-a"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-root"; exit 0 ;; esac' \
+    'echo "SUMMARY class=duplicate-install mode=apply families=1 candidates=3 reaped=1 kept=2 failed=0 census=ok rows=1 pids=0 aged=60m"' \
+    'exit 0' >"$T/t60-dup-apply.sh"
+chmod +x "$T/t60-dup-apply.sh"
+OUT="$(DUP_INSTALL_REAPER="$T/t60-dup-apply.sh" run_reaper --apply --only duplicate-install 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "candidates_duplicate_install=3" \
+    "T60 an ARMED duplicate-install pass lifts the owner's own candidate count"
+assert_absent "$ST60" "candidates_duplicate_install=0" "T60 ... instead of the structural 0 it used to record"
+# ⛔ A REFUSED CENSUS STILL PRINTS A SUMMARY — with `candidates=0` in it. Lifting that number recorded an
+# invented zero for a class that never scanned, and setting the dry sentinel unconditionally did the
+# same on the dry arm, so the dup class asserted a measurement on BOTH arms while its two siblings said
+# `?` for the same shape. `census=ok` is the evidence that makes the owner's number its own measurement.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-root"; exit 0 ;; esac' \
+    'echo "SUMMARY class=duplicate-install mode=dry-run families=0 candidates=0 reaped=0 kept=0 failed=0 census=unreadable"' \
+    'exit 3' >"$T/t60-dup-refuse.sh"
+chmod +x "$T/t60-dup-refuse.sh"
+OUT="$(DUP_INSTALL_REAPER="$T/t60-dup-refuse.sh" run_reaper --dry-run --only duplicate-install 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a duplicate-install delegate that RAN and refused its census is RED (3)"
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "candidates_duplicate_install=?" \
+    "T60 a REFUSED census is not a measured 0 (its SUMMARY prints one)"
+assert_absent "$ST60" "candidates_duplicate_install=0" "T60 ... the placeholder count never reaches the record"
+assert_contains "$(grep -F 'class=duplicate-install rc=3 verdict=fail-closed mode=dry-run' <<<"$OUT")" "candidates=?" \
+    "T60 ... and the class LINE says ? too"
+# ⛔ A HALF-ANSWERED CLASS IS NOT AN ANSWER — THE THIRD CLASS, AND THE ONE THIS PR GAVE THE SUMMING TO.
+# `reap_dup` walks `roots=` and SUMS `candidates=` over the roots that answered (`census=ok`), but the
+# guard was `_dup_ans > 0` — ANY root answered — with no coverage field anywhere: `roots=A:B`, A
+# answering `candidates=3` and B's census unreadable, published `candidates_duplicate_install=3` as the
+# class's count while B had produced NO ANSWER AT ALL. The worktree arm gates on
+# `wt_tally_repos = wt_repos` and the venv arm on `have_venv_tally`; the third class now applies the
+# same rule, and its class line carries `tally=<answered>/<roots>` so a bare `?` names its cause.
+mkdir -p "$T/t60/dup-ra" "$T/t60/dup-rb"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-ra:'"$T"'/t60/dup-rb"; exit 0 ;; esac' \
+    'for a in "$@"; do case "$a" in */dup-ra) echo "SUMMARY class=duplicate-install mode=apply families=1 candidates=3 reaped=1 kept=2 failed=0 census=ok rows=1 pids=0 aged=60m"; exit 0 ;; esac; done' \
+    'echo "SUMMARY class=duplicate-install mode=apply families=0 candidates=0 reaped=0 kept=0 failed=0 census=unreadable"' \
+    'exit 0' >"$T/t60-dup-partial.sh"
+chmod +x "$T/t60-dup-partial.sh"
+OUT="$(DUP_INSTALL_REAPER="$T/t60-dup-partial.sh" run_reaper --apply --only duplicate-install 2>&1)"
+STP="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$STP" "candidates_duplicate_install=?" "T60 one answering root of two does NOT publish its sum as the class count"
+assert_absent   "$STP" "candidates_duplicate_install=3" "T60 ... never the partial sum, which is a lower bound the record would call measured"
+assert_contains "$(grep -F 'class=duplicate-install' <<<"$OUT")" "tally=1/2" \
+    "T60 ... and the class LINE discloses the coverage that made the count unanswerable"
+# ...and the full-coverage control: the SAME stub with BOTH roots answering publishes the sum. Without
+# it the assertion above passes on an arm that can never publish a duplicate-install count at all.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-ra:'"$T"'/t60/dup-rb"; exit 0 ;; esac' \
+    'echo "SUMMARY class=duplicate-install mode=apply families=1 candidates=3 reaped=1 kept=2 failed=0 census=ok rows=1 pids=0 aged=60m"' \
+    'exit 0' >"$T/t60-dup-full2.sh"
+chmod +x "$T/t60-dup-full2.sh"
+OUTF="$(DUP_INSTALL_REAPER="$T/t60-dup-full2.sh" run_reaper --apply --only duplicate-install 2>&1)"
+STPF="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$STPF" "candidates_duplicate_install=6" \
+    "T60 control: with BOTH roots answering the class SUM is published (2 x 3)"
+assert_contains "$(grep -F 'class=duplicate-install' <<<"$OUTF")" "tally=2/2" "T60 control: full coverage is disclosed as 2/2"
+# ⛔ A HALF-ANSWERED TALLY IS NOT AN ANSWER, and the venv arm let one suppress its own fallback.
+# `have_venv_tally` was set on `venvs_found=` ALONE while `reapable=` — the field the candidate count
+# actually comes from — was parsed opportunistically. So a line TRUNCATED after `venvs_found=` (a
+# delegate dying mid-write) claimed an answer with `sum_v_cand=0`, and that same flag then suppressed
+# the row-count fallback, so the `REAP` rows the pass had just scanned were DISCARDED: the record read
+# `classified_venv=3 candidates_venv=0 tally_venv=1/1` — "three classified, nothing to do, fully
+# covered" — which is the false PASS this report exists to remove, one field over. The count must come
+# from the row we scanned and the coverage must say the repo did NOT answer.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "[stub] venvs_found=3"' \
+    "echo \"REAP dead-lane 12MB $T/t60/venv-root/.venv\"" \
+    'exit 0' >"$T/t60-venv-trunc.sh"
+chmod +x "$T/t60-venv-trunc.sh"
+OUT="$(VENV_REAPER="$T/t60-venv-trunc.sh" run_reaper --dry-run --repo "$REPO60" --only venv 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "candidates_venv=1" \
+    "T60 a half-answered venv tally does not suppress the row-count fallback"
+assert_absent "$ST60" "candidates_venv=0" \
+    "T60 ... so the REAP row the pass scanned is never reported as a measured 0"
+assert_contains "$ST60" "tally_venv=0/1" \
+    "T60 ... and its coverage says the repo did NOT answer"
+assert_contains "$ST60" "classified_venv=?" \
+    "T60 ... nor is a classified count invented out of the half-tally"
+# ⛔ AND A DESELECTED CLASS IS NOT AN UNMEASURED ONE. `--only venv` leaves the other four classes
+# `not-run`, which is a third state and NOT a hole in the total — requiring `want && have` for every
+# class printed `candidates=?` on every single-class pass, including this one whose venv arm answered.
+# A sentinel that always fires carries no information, so this pins the polarity rather than the value.
+assert_contains "$(grep -F 'pass end' <<<"$OUT")" "candidates=1" \
+    "T60 a class that was never SELECTED does not taint the pass-end total"
+# ⛔ FULL COVERAGE IS WHAT MAKES A SUM AN ANSWER, and the previous cut fixed coverage per REPO while
+# leaving it per CLASS. Two repos, one answering `reapable=0` and one truncated after a single `REAP`
+# row: `have_venv_tally` was set by the FIRST repo, so the class published the partial sum —
+# `candidates=0` on the line beside `would_free_du=12MB` and the named candidate, and
+# `candidates_venv=0 tally_venv=1/2` in the record. A candidate the pass SCANNED, reported as a
+# measured zero. The count must be the row we scanned and the sum must not be published at all.
+REPO_PA="$(mk_repo t60-partial-a)"
+REPO_PB="$(mk_repo t60-partial-b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in */t60-partial-a) echo "venvs_found=3 reapable=0 reaped=0 kept=3 recheck_kept=0 failed=0"; exit 0 ;; esac; done' \
+    'echo "venvs_found=1"' \
+    "echo \"REAP dead-lane 12MB $T/t60/partial-b/.venv\"" \
+    'exit 0' >"$T/t60-venv-partial.sh"
+chmod +x "$T/t60-venv-partial.sh"
+OUT="$(VENV_REAPER="$T/t60-venv-partial.sh" run_reaper --dry-run --repo "$REPO_PA" --repo "$REPO_PB" --only venv 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "tally_venv=1/2" "T60 a PARTIAL answer is disclosed as 1/2 coverage"
+assert_contains "$ST60" "candidates_venv=1" \
+    "T60 a partial sum does not suppress the candidate the pass SCANNED"
+assert_absent "$ST60" "candidates_venv=0" \
+    "T60 ... never a measured 0 beside the candidate it just named"
+assert_contains "$ST60" "classified_venv=?" \
+    "T60 ... and the partial sum is not published as the class's classified count"
+assert_contains "$(grep -F 'class=venv' <<<"$OUT")" "candidates=1" \
+    "T60 the class LINE agrees with the record about the candidate count"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

@@ -25,19 +25,24 @@
              bash scripts/install-launchd.sh
 
          ⛔ THE THREE GUARDS LIVE IN THE SCRIPT, NOT HERE (the plist only says WHEN):
-           * a LOCK held for the LANE's lifetime — the dispatcher returns immediately, so a
-             lock released after the call would let the next tick stack a second lane on
-             the first (the header of ai-drainer.sh states this, and
-             ai-drainer.test.sh arm (b) is its regression test);
-           * a CAPACITY floor (free swap + live lanes) — this box is swap-bound, measured
-             at 586 MB free with 15 lanes against the harness's own 600 MB floor;
-           * a ROTATING SLICE, so repeated ticks do not all hit the same PRs.
+           * a LOCK around ONE TICK'S decision (settle → census → target → dispatch). It is
+             NOT held for a lane's lifetime: two ticks computing `target − alive` at the same
+             time would each dispatch the full remainder, which is what the lock prevents —
+             and holding it for a lane's lifetime is what made a 20-minute tick dispatch once
+             an hour (ai-drainer.test.sh arm (d) is the regression test: a lane that outlives
+             its tick must neither block the next tick nor hide from its census);
+           * a MEASURED CAPACITY TARGET — min(cpu ceiling, memory ceiling), with the swap and
+             load floors refusing to ADD work; a cell with NO swap is not a box with no
+             capacity, which is why the swap floor applies only where swap exists;
+           * a ROTATING SLICE that advances PER LANE, skipping the windows live lanes hold, so
+             two lanes never work the same PRs.
 
-         ⛔ 1200s = 20 min. The lane's own cap is 3000s and the drainer holds its lock for
-         that whole time, so a tick that lands mid-lane SKIPS by design — the interval is a
-         poll, not a promise of a lane per tick. A 20-minute poll detects a finished lane
-         within 20 min of it finishing, which is why the inventory row's freshness bound is
-         derived from this interval rather than guessed.
+         ⛔ 1200s = 20 min, and a tick is a TOP-UP: count the live lanes, dispatch
+         `target − alive`, exit. A lane's own cap is 3000s, so a lane routinely outlives the
+         tick that started it — the next tick counts it and fills the remainder, so the box
+         converges on its measured capacity instead of on one lane per poll. A tick that
+         lands while ANOTHER tick holds the drainer lock skips by design. A 20-minute poll is
+         what the inventory row's freshness bound is derived from rather than guessed.
 
          ⛔ ON A LINUX CELL there is no launchd and this template is not installed: the same
          script is scheduled by templates/systemd/eldato-ai-drainer.timer through

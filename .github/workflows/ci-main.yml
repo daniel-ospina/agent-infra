@@ -134,6 +134,17 @@ jobs:
         npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
         mark "extensions/session-checks.test.ts"
         npx tsx extensions/session-checks.test.ts || failures=$((failures+1))
+        # #2932 — task-signal-forensics: when 17 dispatched children were SIGTERM'd
+        # inside 3 s, nothing on the box recorded a sender and three worktrees lost
+        # 16 uncommitted files. This suite spawns a REAL lane, sends it a REAL
+        # SIGTERM, and asserts both arms (the sender is named; the work is pinned by
+        # a checkpoint ref) plus the non-behaviour-change control (still exits by
+        # SIGTERM/143). Zero-dep: node stdlib + git only; needs Node >= 22.18 for
+        # `--experimental-strip-types`, which the fixture uses to import the`.ts`
+        # source from a plain `.mjs` bootstrap. Its mutation driver is a bash shard
+        # (`tests/lane-signal-forensics/run.sh`, discovered by run-bash-shards.sh).
+        mark "extensions/task-signal-forensics.test.ts"
+        npx tsx extensions/task-signal-forensics.test.ts || failures=$((failures+1))
         # #611 — reflect-hook capture attribution: first reflect-hook tests.
         # Zero-dep: stdlib-only; uses dynamic require for env ordering.
         mark "extensions/reflect-hook.test.ts"
@@ -549,7 +560,10 @@ jobs:
       # half of tortoise#3761; the canonical module never leaves this repo.
       # #1552 — same reasoning, same list: test_objective.py + test_turn_classify_state.py
       # were laptop-only until #1552 and are named here so the repo RUNS them.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py -x --timeout=60 -q'
+      # #2139 — test_beta_progress.py rides the same list (byte-identical to the PR lane's
+      # `test` job): the DELIVERY line's REST second source was live on four boxes and in no
+      # repo file, so nothing in CI exercised the fallback it now ships.
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''

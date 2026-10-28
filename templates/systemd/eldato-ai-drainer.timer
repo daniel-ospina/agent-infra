@@ -2,10 +2,11 @@
 # Every 20 minutes — the same cadence the macOS job uses (com.eldato.ai-drainer,
 # StartInterval=1200), so the two platforms have ONE documented cadence and not two.
 #
-# ⛔ OnUnitActiveSec, NOT OnCalendar: the drainer holds its lock until the LANE it started dies, so a
-# calendar tick can land mid-lane and skip. That is correct behaviour (a skip, logged as one), but a
-# monotonic 20-minute interval measured from the LAST ACTIVATION keeps the next tick a fixed distance
-# from the last real attempt instead of drifting into a burst of skipped ticks after a long lane.
+# ⛔ OnUnitActiveSec, NOT OnCalendar: a calendar tick can land while another tick still holds the
+# drainer lock (its critical section is short, but a dispatcher call is not free), and that tick would
+# skip. That is correct behaviour (a skip, logged as one), but a monotonic 20-minute interval measured
+# from the LAST ACTIVATION keeps the next tick a fixed distance from the last real attempt instead of
+# bunching skipped ticks.
 Description=eldato ai-drainer every 20 minutes
 
 [Timer]

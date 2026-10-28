@@ -12,7 +12,8 @@ aboutObjects: agent-infra, issue-2716, issue-2709, issue-2700, issue-2721, issue
 # PR-repair service (#2716, #2709)
 
 `scripts/install-repair-service.sh` renders and installs **`eldato-pr-repair.service`** — a systemd
-unit whose main process *is* the cell's repair loop (`scripts/pr-repair-loop.sh --loop`). It exists
+unit whose main process *is* the cell's repair loop (`scripts/pr-repair-loop.sh --loop`, or
+`--trigger` for the event-driven front end — see **The clock** below). It exists
 because the fleet has **two capabilities that were being confused for one**.
 
 | unit | what it does | what it does NOT do |
@@ -60,6 +61,9 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    `PR_DOCTOR_REPO`, `PR_DOCTOR_REPO_DIR`, `OBJECTIVE_REPO`. ⛔ `pr-doctor.py` shipped the slug and
    `$HOME/Documents/GitHub/tortoise` as literals; on a cell that path does not exist, so every git read
    and worktree add failed and reported `UNREADABLE` — indistinguishable from an empty queue (#1974).
+   ⛔ AND THE PAIR IS EVIDENCE, NOT A FALLBACK: `pr-doctor.py` no longer carries those literals at all,
+   so it refuses (exit 2) when nothing names a repo — and an unset pair is a launcher bug this loop
+   surfaces rather than a default it quietly adopts (#2716 reconciled with #2235).
 4. **Record** one status row (`$O/state/pr-repair.status.json`): the measurement, the cap, the
    **decision**, the reason and every step's rc. The vocabulary is exhaustive, and each value means one
    thing a reader can act on:
@@ -69,7 +73,7 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    | `dispatched` | the dispatcher ran and returned 0 — work was placed, or the queue was genuinely empty |
    | `deferred` | the machine said not now; the reason carries the measurement (`disk-floor:3481<4096`, `load-ceiling:…`, `cap-zero`) |
    | `refusing` | a read a pass needs could not be taken, or the dispatcher itself refused (rc=2) — **never** "nothing to do" |
-   | `placed-undelivered` | the work was placed and no worker took it (pr-doctor rc=3) — the pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted |
+   | `placed-undelivered` | legible work, **none of it out** (pr-doctor rc=3): no worker took an order that was placed, **or** a durable refusal stopped the order before delivery (`agent-infra#2710` — a dirty worktree, a queue parked under the 45-min cooldown the refusal created; measured for #2708). The pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted. ⚠️ The `reason` token on this row is still `no-worker-took-it` for both causes; the human line on stderr names both, and renaming the token is left to a change that can verify every reader |
    | `idle` | a `--dry-run` pass: measured and derived, dispatched nothing |
    | `skipped` | another pass held the lock, so this one attempted nothing. Written to its **own** file (`pr-repair.skip.json`) so a skipping process can never replace the lock holder's verdict; `--status` prints both |
 
@@ -103,6 +107,41 @@ running", both `.log` files **0 bytes**, no `.rc`, 290 MB of orphan worktrees �
 The installer asserts the property on the **rendered** artifact and refuses without it, and
 `scripts/pr-repair-loop.test.sh` asserts it for **every** shipped unit whose `ExecStart` reaches the
 dispatcher, so the next author inherits it instead of rediscovering it.
+
+## The clock: `--loop` (a timer) or `--trigger` (the event-driven front end, #2700 C5)
+
+The unit's main process is `pr-repair-loop.sh` in one of two MODES. `REPAIR_MODE` chooses, and it is
+rendered into `ExecStart` — there is no second unit and no second installer, because a second actuator
+on the same queue is #1761 one capability over.
+
+| | `REPAIR_MODE=loop` (default) | `REPAIR_MODE=trigger` |
+|---|---|---|
+| `ExecStart` | `pr-repair-loop.sh --loop` | `pr-repair-loop.sh --trigger` |
+| when a pass runs | every `REPAIR_INTERVAL_S` (default 900) | when the PR surface MOVES, plus a backstop |
+| the lead for a freshly-red PR | up to one full interval (mean 450 s at 900) | one poll + the debounce (default 60 + 90) |
+
+`--trigger` **execs** `pr-doctor-trigger.py`, and the trigger's child is **this same loop's one-pass
+mode**. So the cap, the disk floor, the load ceiling, the reap, the `keys.env` credential source and
+the status row still decide every pass: the front end chooses *when*, never *what*.
+
+⚠️ **Measured on the Mac before this existed:** `com.tortoise.pr-doctor` ran `StartInterval 1800` — a
+mean **900 s** and a worst case **1800 s** of dead time for a repair whose own cost is one pass. With
+`--poll 60 --debounce 90` the measured lead is **150 s**, and the timer survives only as
+`REPAIR_TRIGGER_BACKSTOP_S` (default 1800) for the work only a clock can see: a check that never
+reports, a worker that dies silently, a stale claim.
+
+Knobs (rendered as `Environment=`, all optional): `REPAIR_TRIGGER_POLL_S` (60), `REPAIR_TRIGGER_DEBOUNCE_S`
+(90), `REPAIR_TRIGGER_BACKSTOP_S` (1800), `REPAIR_TRIGGER_RETRY_MIN_S` (300 — the floor between
+retries of a FAILED pass, so a box that cannot deliver does not re-read the whole PR surface every
+poll).
+
+⛔ **The pass's exit codes are the trigger's vocabulary**, and they are not interchangeable: `0` (a pass
+completed) and `2` (REFUSING — a read it needed could not be taken) and `6` (DEFERRED — the machine
+said not now: below the disk floor, above the load ceiling, or a cap of 0) are **verdicts** and consume
+the backstop window; `3` (UNDELIVERED) is retried under `REPAIR_TRIGGER_RETRY_MIN_S`; anything else is
+`PASS-FAILED`, which does **not** consume the window so a later tick retries instead of waiting half an
+hour on a crash. A trigger whose pass is absent (`PASS-MISSING`) is never a clean window — CPython
+exits 2 for "can't open file", and 2 is a verdict.
 
 ## Verbs
 

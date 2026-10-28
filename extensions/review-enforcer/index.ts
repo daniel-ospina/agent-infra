@@ -1281,6 +1281,127 @@ function heredocBodyIsData(line: string): boolean {
 }
 
 /**
+ * #1382 — THE COMPOUND FRAME a heredoc opener sits INSIDE, if any.
+ *
+ * `heredocBodyIsData` proves the body is stdin DATA for the opener's OWN consumer, and for a LONE
+ * simple command that is the whole story. A COMPOUND changes what happens to that consumer's
+ * STDOUT, and the masker did not model it. Measured at the landed head of this file (run through a
+ * real `bash`, each printing its marker — EXECUTIONS, not mentions):
+ *
+ *     if true; then             for x in 1; do              case x in
+ *     cat <<'EOF'               cat <<'EOF'                 x) cat <<'EOF'
+ *     gh pr merge 999 --admin   gh pr merge 999 --admin    gh pr merge 999 --admin
+ *     EOF                       EOF                        EOF
+ *     :                         done | bash                :;;
+ *     fi | bash                                            esac | bash
+ *
+ * In each, `| bash` receives the COMPOUND's stdout, so the body executes while the gate — reading the
+ * masked text — sees no `gh` word at all and returns before any check. Measured before this fix:
+ * `isGitOp(raw)` true, `isGitOp(maskHeredocData(raw))` false. That is a FAIL-OPEN in the one gate
+ * that guards every merge, and it is why the proof below is scoped: it holds for a lone command,
+ * not for a body whose stdout still has somewhere to go.
+ *
+ * A STACK, not a depth counter: a `case` ARM ends in `)` (`case x in x) …`), which a bare counter
+ * reads as closing a `(`, while a stack whose top is `case` ignores it. An unmatched closer is
+ * IGNORED rather than decrementing, so the error stays on the fail-CLOSED side — an unmatched `fi`
+ * can never make a deeper frame read as shallower.
+ *
+ * Conservative by construction: quoted text and `#` comments cannot open or close a frame, and
+ * anything the scan cannot read leaves frames OPEN, i.e. "no mask" — a refusal, the direction this
+ * file is allowed to be wrong in.
+ */
+type HeredocFrame = "if" | "loop" | "case" | "paren" | "brace";
+
+/** The words of one line that can open or close a shell frame, quotes and comments removed. */
+function heredocFrameTokens(line: string): string[] {
+  let quote: string | null = null;
+  let buf = "";
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      buf += " ";
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      buf += " ";
+      continue;
+    }
+    if (ch === "#" && (buf === "" || /\s$/.test(buf))) break; // comment: no frame after it
+    buf += ch;
+  }
+  return buf
+    .replace(/([(){}])/g, " $1 ")
+    .split(/[\s;&|]+/)
+    .filter((t) => t !== "");
+}
+
+/** Apply one line's frame openers/closers to the carried stack. */
+function heredocFramesAdvance(line: string, stack: HeredocFrame[]): void {
+  const top = () => stack[stack.length - 1];
+  for (const w of heredocFrameTokens(line)) {
+    if (w === "if") stack.push("if");
+    else if (w === "for" || w === "while" || w === "until" || w === "select") stack.push("loop");
+    else if (w === "case") stack.push("case");
+    else if (w === "(") stack.push("paren");
+    else if (w === "{") stack.push("brace");
+    else if (w === "fi") { if (top() === "if") stack.pop(); }
+    else if (w === "done") { if (top() === "loop") stack.pop(); }
+    else if (w === "esac") { if (top() === "case") stack.pop(); }
+    else if (w === ")") { if (top() === "paren") stack.pop(); }
+    else if (w === "}") { if (top() === "brace") stack.pop(); }
+  }
+}
+
+/**
+ * Is the heredoc opened on `openerIndex` inside a frame that is still OPEN there?
+ *
+ * The opener line's own PREFIX counts too (`{ cat <<'EOF'`): the `<<` is what delimits it.
+ */
+function heredocOpenerIsInsideFrame(lines: string[], openerIndex: number): boolean {
+  const stack: HeredocFrame[] = [];
+  // ⛔ THE SCAN MUST SKIP EARLIER HEREDOC BODIES. A body is DATA, so its text cannot close a frame —
+  // but reading it as shell code let ONE prose `fi` / `}` / `)` / `esac` inside an earlier body pop a
+  // frame bash still has open, after which this function reported "no frame" and the body below was
+  // masked while the shell executed it. Measured fail-OPEN (marker printed by a real `bash`, gate
+  // silent): `if true; then` / `cat <<'A' > notes.md` / `fi` / `A` / `cat <<'EOF'` … `EOF` / `:` /
+  // `fi | bash`. Deliberately the same opener reader `maskHeredocData` uses, so the two cannot
+  // disagree about which body exists.
+  const st: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
+  for (let n = 0; n < openerIndex; n++) {
+    const openers = heredocOpenersIn(lines[n], st);
+    heredocFramesAdvance(lines[n], stack);
+    if (openers.length === 0) continue;
+    for (const op of openers) {
+      let closed = false;
+      for (n++; n < openerIndex; n++) {
+        const probe = op.stripTabs ? lines[n].replace(/^\t+/, "") : lines[n];
+        if (probe === op.delim) {
+          closed = true;
+          break;
+        }
+      }
+      // The body never ended before the opener: the "opener" under test is inside a body, i.e. not
+      // an opener at all. Treat it as enclosed — nothing is masked, which is the safe direction.
+      if (!closed) return true;
+    }
+  }
+  const at = lines[openerIndex].indexOf("<<");
+  heredocFramesAdvance(at >= 0 ? lines[openerIndex].slice(0, at) : "", stack);
+  return stack.length > 0;
+}
+
+
+/**
  * #1382 — blank out every heredoc BODY (and its terminator) whose body is DATA, LENGTH-PRESERVING so
  * every offset a later reader holds stays valid.
  *
@@ -1331,6 +1452,27 @@ export function maskHeredocData(command: string): string {
     // file may be wrong in.
     if (endsWithContinuation(lines[i])) continue;
     if (lines.slice(0, i).some(endsWithContinuation)) continue;
+    // ⛔ A COMPOUND FRAME CAN HAND THE BODY TO A PROGRAM (#1382 — measured fail-OPEN in every
+    // keyword and bracket frame; see `HeredocFrame`). `if … cat <<'EOF' … EOF … fi | bash` gives the
+    // COMPOUND's stdout to bash, so the body EXECUTES while every rule below proves DATA for the
+    // WRONG consumer and the gate, reading masked text, returns before any check.
+    //
+    // ⛔ INSIDE A FRAME, NOTHING IS MASKED — deliberately, with NO attempt to test whether this
+    // particular frame's stdout reaches a program. A first version DID test it, and a fresh review
+    // measured seven ways past the test, every one an execution with the gate silent: a prose `fi`
+    // in an EARLIER heredoc body popping the frame; a POSIX `|` followed by a newline; `fi > f; bash
+    // f` on ONE line; `bash <(if … fi)` (the sink precedes the opener); `fi | $SHELL` (the program is
+    // a variable). Enumerating frame spellings × sink routes is a shell parser, and this file has
+    // already recorded that it cannot enumerate that class — `heredocPrefixIsUnprovable` moved from a
+    // depth counter to "ANY `$(` refuses the mask" for the same reason. So the boundary moves again:
+    // a frame means "not provable", and the body keeps the pre-change refusal.
+    //
+    // STATED COST, and it is a real one: a heredoc that IS data, written INSIDE a frame (`if …; then
+    // cat >> notes.md <<'EOF' … EOF; fi`), is no longer masked — so a framed report that quotes
+    // `gh pr merge` is refused again. That is a false POSITIVE, the direction this file is allowed to
+    // be wrong in; the alternative measured above is a silent admin merge. A lone writer with no
+    // enclosing frame — the reported shape — is untouched.
+    if (heredocOpenerIsInsideFrame(lines, i)) continue;
     if (!heredocBodyIsData(lines[i])) continue;
     const reader = heredocCommandWord(lines[i]);
     // ⛔ THE SHADOW SCAN STOPS AT THE OPENER LINE (#1382 review cycle 1, P2): it used to read the
@@ -1729,13 +1871,23 @@ interface ScanTokens {
   gaps: string[];
 }
 
-function scanTokens(command: string): ScanTokens {
+function scanTokens(command: string, opts: { stripRepo?: boolean } = {}): ScanTokens {
   // bash removes a backslash-newline outright, so `g\<newline>h` is the command
   // `gh`. Do the same before tokenizing, or the continuation splits the name.
   // #1203: the mandated rail's own filename is neutralized BEFORE tokenizing, so
   // the path cannot supply the words `admin`/`merge` the verbs and flags are read
   // from. Length-preserving, so every offset below still addresses `command`.
-  const joined = stripRepoArgs(withoutMandatedRailPath(command)).replace(/\\\r?\n/g, "");
+  //
+  // ⛔ `stripRepo: false` EXISTS BECAUSE THE STRIP DELETES AN ATTACKER-CHOSEN WORD (#2206 review,
+  // P0). `stripRepoArgs` consumes the token AFTER `--repo`, and that token can be `git`: measured,
+  // `for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo git -c alias.p=push p origin
+  // HEAD:refs/heads/x` certified as a READ at zero dispatches and ran an alias push — `git` was
+  // gone from the token list `mentionsGitWord` scans, and `GIT_COMMIT_PATTERN` only knows
+  // `commit`/`push`. The strip exists to stop a repo VALUE supplying `pr`/`merge`/`admin` words to
+  // the VERB and FLAG reads; a rule that asks whether the text MENTIONS `git` must read the text as
+  // written, because under-reading there costs a write and over-reading costs a retry.
+  const pre = withoutMandatedRailPath(command);
+  const joined = (opts.stripRepo === false ? pre : stripRepoArgs(pre)).replace(/\\\r?\n/g, "");
   const mask = unquotedMask(joined);
   const tokens = joined.split(/[\s;&|(){!]+/).filter((t) => t.length > 0);
   const starts: number[] = [];
@@ -2099,6 +2251,13 @@ function hasBareGhWord(command: string): boolean {
  * this gate never saw.
  */
 const CONSTRUCT = /[$`{}<>]/;
+/**
+ * The WORD `merge` — not `admin-merge`, not `mergeStateStatus`, not `hasAdminMergeFlag`. A
+ * hyphen or a word character on either side means the text is naming a hyphenated identifier
+ * rather than spelling a verb, and that distinction is measured: `<!-- admin-merge-safety: … -->`
+ * must not read as a merge verb.
+ */
+const MERGE_WORD = /(^|[^\w-])merge([^\w-]|$)/;
 
 /**
  * A word as bash would resolve it: quotes stripped (`dequote`) and an ANSI-C LEADING `$`
@@ -2128,7 +2287,7 @@ const SUBCOMMAND_WORD = /^[a-z][a-z-]*$/;
  * its decision. The list's failure direction is a REFUSAL, which is the direction this file
  * is allowed to be wrong in.
  */
-const PR_NON_MERGE_SUBCOMMANDS = new Set([
+export const PR_NON_MERGE_SUBCOMMANDS = new Set([
   "create", "view", "list", "comment", "close", "reopen", "edit", "diff", "checkout",
   "ready", "review", "status", "lock", "unlock", "checks", "update-branch", "revert",
 ]);
@@ -2239,6 +2398,768 @@ export function readsNonMergeGhCall(command: string): boolean {
     const s = shellWord(sub);
     if (!SUBCOMMAND_WORD.test(s) || !PR_NON_MERGE_SUBCOMMANDS.has(s)) return false;
     continue; // `create`, `view`, `list`, … — read, and not a merge
+  }
+  return seen;
+}
+
+// ── #2204: a positively-readable READ is not a write ──────────────────────────
+//
+// MEASURED (2026-10-20, `~/.pi/agent/audit/gate-events.jsonl` on three cells): the
+// ≥1-dispatch floor refused `… for n in 2058 2172 …; do gh pr view … done` and
+// `for pr in …; do sha=$(gh api repos/…) …; done`. BOTH ARE READS. There is no reviewer to
+// dispatch for reading a PR body, so the refusal was a false positive — and four lanes ended
+// on it within ~60 s of starting, producing nothing. (A BARE `sha=$(gh api …)` never reached
+// the floor — `isGitOp` needs a construct, and a lone substitution has none — so the loop
+// WRAPPER is what makes the shape trippable; cycle-2 review measured the difference and the
+// tests use the trippable form.)
+//
+// WHY THE FLOOR SAW A WRITE: the candidate came from `isGitOp`'s CANDIDATE arms, not
+// from a write. `isGhPrMergeCommand` is deliberately broad — "any `gh` + `pr` under a
+// construct" — and a loop supplies the construct (`$n`), so `gh pr view $n` reads as a
+// merge CANDIDATE and falls through to the dispatch count. That is the same
+// false-positive class the admin-merge gate fixed in #1776 and #2164, and it needs the
+// same POLARITY rather than a longer allowlist: posit what a READ looks like, and refuse
+// the escape unless every word of the command can be read as one.
+//
+// ⛔ A PREFIX LIST OF `gh` VERBS IS NOT THE PREDICATE. The failing shapes put the `gh`
+// word INSIDE a shell construct — a `for` loop body, a `$(…)` — so nothing anchors on
+// "the command starts with `gh`". This scan walks EVERY `gh` word in the text; the
+// tokenizer splits on the shell's separators, including the `(` of `$(…)`, which is what
+// makes a substitution's contents readable at all.
+//
+// ⛔ THIS MUST NOT WIDEN THE FLOOR. It is consulted only on the ZERO-dispatch path, it
+// sits AFTER the admin-merge and merge-registry gates, and it answers false the moment
+// the text carries a git write, an executable word this scan cannot read, or a program
+// piped into a runner. `git commit` / `git push` at zero dispatches stay refused — that
+// is pinned by #485 T1/T1b AND by the #2204 tests that pair a read WITH a write.
+
+/**
+ * ⛔ THE ESCAPE CERTIFIES **GH READS ONLY** — and this is the third design, chosen because the first
+ * two were measurably unsound.
+ *
+ * DESIGN 1 certified a command when the text carried no known git WRITE verb (a deny list). A
+ *   cycle-2 adversarial review shipped `git update-index`, `git checkout-index`, `git ci` and
+ *   `git -c alias.p=push p` past it: with a deny list, a MISSING entry GRANTS the escape.
+ * DESIGN 2 certified a git READ by allowlisting the subcommand, then (when a flag-named program was
+ *   found) the flags, then (when a config key named one) the config namespaces. Each round closed a
+ *   layer and the next round found the next one: `git grep -O<program>`, `git ls-remote
+ *   --upload-pack=<program>`, `git -c core.pager='!git push' log`, `git -c core.gitProxy=p`,
+ *   `git -c remote.o.uploadpack=p`, and finally `git -c protocol.ext.allow=always ls-remote
+ *   ext::<program>` — which EXECUTES the program through a POSITIONAL argument, so no flag
+ *   allowlist can ever cover it. That is the shape of the problem: git's argument surface is
+ *   unbounded in the dimension that matters (any argument can name a program or transform one), and
+ *   a text layer cannot read it.
+ * DESIGN 3 (this one) removes the dimension instead of narrowing it: a command that mentions `git` at
+ *   all is NOT certified here, however it is spelled. `git commit`/`git push` keep the floor (they
+ *   are its subject); `git log` beside a read now costs a separate command. That is a real friction
+ *   and it is the right trade: an escape from a review gate must not be able to run a program, and
+ *   `git rev-parse`, `git log`, `git diff` are all one `;` away from being run on their own line.
+ *
+ * The measured cost of the false positive this escape exists to fix (`#2204`: four lanes died on
+ * `for n in …; do gh pr view $n; done`) is unchanged: that shape and its siblings carry no git word.
+ */
+
+/**
+ * The `gh` groups whose subcommands only READ, and the subcommands that qualify. An
+ * allowlist ON PURPOSE: `create`, `merge`, `edit`, `comment`, `review`, `close`, `delete`,
+ * `cancel`, `rerun` and every spelling nobody has written yet are ABSENT, so an unknown
+ * sub-word fails the read and keeps the floor. Each entry is a gh READ only; a group that is
+ * absent from this map (`secret`, `alias`, `gpg-key`, `ssh-key`, `extension`, … — setup and
+ * write commands) makes the whole command fail the escape. `api` is handled separately (its
+ * method decides), and `status` takes no subcommand at all (`GH_READ_GROUPS_NO_SUB`).
+ */
+export const GH_READ_SUBCOMMANDS: Record<string, string[]> = {
+  pr: ["view", "list", "diff", "checks", "status"],
+  issue: ["view", "list", "status"],
+  repo: ["view", "list"],
+  run: ["view", "list"], // NOT `download`: it WRITES artifact files into the working tree (#2206 review, P2)
+  workflow: ["view", "list"],
+  release: ["view", "list"],
+  ruleset: ["view", "list"],
+  search: ["prs", "issues", "repos", "code", "commits"],
+  auth: ["status"],
+  config: ["get", "list"],
+  label: ["list"],
+  gist: ["view", "list"],
+  project: ["view", "list"],
+};
+
+/** `gh` groups that take no subcommand and only read. */
+const GH_READ_GROUPS_NO_SUB = new Set(["status"]);
+
+/**
+ * A whole-word shell VARIABLE (`$F`, `$1`, `$@`, `$?`) — the shape that can stand in for a FLAG
+ * (`gh api repos/x $F y=1` is `-f y=1`). A variable INSIDE a longer word (`repos/$owner/pulls/$pr`)
+ * is a value, which a `gh api` endpoint legitimately is, so it does not match.
+ */
+const BARE_VARIABLE_WORD = /^\$[A-Za-z_][A-Za-z0-9_]*$|^\$[0-9]+$|^\$[@*?#!$-]$/;
+
+/**
+ * `gh api` flags that make the call a WRITE. `-f/--field`, `-F/--raw-field` and
+ * `--input` switch gh to POST by themselves, and an explicit non-GET `-X/--method` is a
+ * write however the endpoint is spelled. Reads (`--jq`, `--paginate`, `-X GET`, `-H`, …)
+ * are untouched. `gh api graphql` is refused outright: a mutation is a write whose verb
+ * the text cannot read.
+ */
+const API_READ_METHODS = new Set(["GET"]);
+
+/**
+ * Words that are SAFELY stripped before the executable: quote pairs and backslashes. `''git`,
+ * `"git"`, `g"i"t` and `\git` all EXECUTE `git`, and a cycle-2 review measured all four certifying a
+ * `commit` as a read because the write scan compared RAW words while every other predicate in this
+ * file compares DEQUOTED ones. Normalizing the same way closes the class: an unreadable splice is a
+ * refusal, never a pass.
+ */
+function normalizeProgramWord(w: string): string {
+  return w.replace(/["'\\]/g, "");
+}
+
+/**
+ * Does the text mention `git` anywhere — as a WORD, through the shell's own quoting?
+ *
+ * Deliberately blunt: `''git`, `\git`, `"git"`, `g"i"t` and `$'git'` all EXECUTE git, and design 2
+ * lost the floor's own two verbs to exactly that splice, so the word is NORMALIZED the way the shell
+ * would (`normalizeProgramWord` strips quotes and backslashes) before it is compared. A mention in a
+ * quoted message (`-m "fix: git push"`) costs a refusal — it did before #2204 as well, through the
+ * same `GIT_COMMIT_PATTERN`, and a mention is never worth an escape.
+ */
+function mentionsGitWord(command: string): boolean {
+  if (GIT_COMMIT_PATTERN.test(command)) return true;
+  // ⛔ NO `stripRepoArgs` ON THIS SCAN (#2206 review, P0 — see `scanTokens`' `stripRepo` note).
+  // The stripped form is the right view for reading a VERB, and the wrong view for asking whether
+  // `git` is mentioned: the strip eats the word after `--repo`, so a `git` sitting there vanished
+  // and this predicate answered false. `GIT_COMMIT_PATTERN` caught `git commit`/`git push` on the
+  // RAW text and nothing else, so every other write verb — and an alias push, the exact DESIGN-1
+  // class — was certified. Both spellings are pinned in `index.test.ts` (negative table).
+  for (const token of scanTokens(command, { stripRepo: false }).tokens) {
+    if (normalizeProgramWord(token) === "git") return true;
+  }
+  return false;
+}
+
+/**
+ * Programs a `$(…)` may run and still leave the command READABLE: each WRITES NOTHING and RUNS
+ * NOTHING but itself — it computes a value from its arguments and prints it.
+ *
+ * ⛔ `sort` AND `uniq` WERE HERE AND WERE MEASURED WRITING FILES AND RUNNING PROGRAMS: `sort
+ * --compress-program=<program>` executes that program, `sort -o <file>` and `uniq <in> <out>`
+ * overwrite any file the session can write. Only the substitution's FIRST WORD was ever checked, so
+ * an "harmless" program's own flags were the hole. Every entry here is now a program whose whole
+ * argument surface is data — and `gh` is the only other name accepted, validated by the gh loop.
+ *
+ * ⛔ THIS LIST IS NOT WHAT MAKES A `gh api` CALL READ-ONLY, AND IT MUST NOT BE ASKED TO BE (#2206
+ * review, P0). "Its whole argument surface is data" is a claim about a program's INPUTS; it says
+ * nothing about its OUTPUT, and `printf` can ASSEMBLE any word: `gh api $(printf -- '-%s%s' X POST)
+ * repos/o/r/pulls/1/merge` expands to the single argv word `-XPOST`, so the write flag never exists
+ * in the text for `hasApiWriteFlagAnywhere` to find — it certified a merge and a PR self-approval.
+ * Narrowing this list would be the DESIGN-2 loop (one layer closed per review round), so the
+ * SUBSTITUTION DIMENSION is removed for the one gh verb that writes: `readsOnlyGhRead` refuses any
+ * `gh api` whose argument list contains a substitution (`apiSegmentReads…`). `printf` stays usable
+ * where its output is a VALUE (`gh pr view $(printf '%s' 5)`), which is what it was added for.
+ */
+const HARMLESS_SUBSTITUTION_PROGRAMS = new Set([
+  "basename", "cut", "date", "dirname", "echo", "head", "hostname", "id", "jq", "mktemp",
+  "md5sum", "printf", "pwd", "readlink", "realpath", "seq", "sha256sum", "tail", "tr", "wc",
+  "whoami",
+]);
+
+/**
+ * Is there a `gh api` WRITE flag in this scan, anywhere? `-f/--field`, `-F/--raw-field` and
+ * `--input` switch gh to POST by themselves, and a non-GET `-X/--method` is a write however the
+ * endpoint is spelled — including the ATTACHED spellings (`-fbody=x`, `-XPOST`), which pflag parses
+ * exactly like the detached ones (a detached-only check let a PR self-approval read as a GET).
+ * Defence in depth against the tokenizer splitting a substitution into its own statement; the
+ * per-segment check in `readsOnlyGhRead` catches the same flags in their normal position.
+ */
+function hasApiWriteFlagAnywhere(scan: { tokens: string[] }): boolean {
+  const at = (i: number) => normalizeProgramWord(scan.tokens[i] ?? "");
+  const isGet = (v: string) => v.toUpperCase() === "GET";
+  for (let i = 0; i < scan.tokens.length; i++) {
+    // ⛔ QUOTED TOKENS ARE INCLUDED, deliberately. The data mask says "this span is DATA", and for a
+    // `gh` invocation that is exactly wrong twice: `gh api x "-fbody=APPROVE"` and
+    // `gh api x "$F=APPROVE"` both hand gh a WRITE flag as one argv word, because the shell strips
+    // the quotes and expands the variable BEFORE argv exists. The per-segment api loop still skips
+    // quoted spans (it reads structure); this check reads the argv the shell will actually build.
+    const w = at(i);
+    if (w === "-f" || w === "-F" || w === "--field" || w === "--raw-field" || w === "--input") return true;
+    if (/^--(?:field|raw-field|input)=/.test(w)) return true;
+    if (/^-[fF]./.test(w)) return true; // attached: `-fbody=x`, `-Fbody=@f`
+    // ⛔ A VARIABLE GLUED TO `=` IN AN ARGUMENT (confirming review, decisive): `BARE_VARIABLE_WORD`
+    // only matches a WHOLE variable, so `F=-fbody; gh api … $F=APPROVE` reached gh as
+    // `-fbody=APPROVE` — a POST field, i.e. a PR self-approval — and was certified a read. The
+    // expansion happens before argv exists, so this layer compares what the shell WILL produce:
+    // a word whose expanded head is a variable immediately followed by `=` is a flag this text
+    // cannot read. (`?per_page=$n` is the opposite order and stays readable.)
+    if (/^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*\}?|\d+)=/.test(w)) return true;
+    if (w === "-X" || w === "--method") return !isGet(at(i + 1));
+    if (/^--method=/.test(w)) return !isGet(w.slice("--method=".length));
+    if (/^-X./.test(w)) return !isGet(w.slice(2));
+  }
+  return false;
+}
+
+/**
+ * An executable whose BEHAVIOUR is a file (or a runner) this scan cannot read — `./push.sh`,
+ * `bash scripts/x.sh`, `node build.js`, `source env.sh`, `xargs …`. Any of them can run git work, so
+ * the read-only escape must not certify a command that runs one. A path (`includes("/")`) counts
+ * too: `/usr/bin/gh` and `$P/run` are programs whose words are not in this text.
+ *
+ * SCOPE — AND A DECLARED WIDENING. This predicate certifies GIT work and gh writes; an arbitrary
+ * program called by bare name (`rm`, `curl`, a compiled binary) is NOT certified, and when it is
+ * bundled with a certified read the command is ALLOWED here even though the pre-#2204 gate refused
+ * it whenever a construct made it a candidate (`for f in 1 2; do rm -rf /tmp/wt/$f; gh pr view $f; done`
+ * — measured by a fresh review). That widening is DELIBERATE and it is stated rather than implied:
+ * the floor's subject is review-before-shipping, not general command safety, and destructive
+ * filesystem/git operations are held by their own gates (`extensions/main-worktree-guard`,
+ * `extensions/verification-gate`) which do not depend on a dispatch count. Enumerating the
+ * dangerous binaries here is the spelling-trap this file's doctrine rejects; certifying only a
+ * read-only coreutils vocabulary instead would refuse the loop variables and globs that every
+ * triage loop contains — the false positive #2204 exists to remove.
+ */
+/**
+ * Programs whose ARGUMENTS can ship or mutate something no reviewer saw, so a command that
+ * RUNS one is not a read even when the word `git` never appears.
+ *
+ * #2204's rule (1) refuses any command that MENTIONS git, which closes the git-shaped writes.
+ * It does not close a remote write spelled WITHOUT git — measured at zero dispatches beside a
+ * `gh pr view` read (fresh review, P2), each certified as a read and each really shipping:
+ *   … ; curl -s -X PUT -H "Authorization: token $T" --data @c.json https://api.github.com/…
+ *   … ; npm publish --access public
+ *   … ; rsync -a ./ host:/srv/app/
+ * ⛔ THIS IS A DENY LIST, SO IT IS INCOMPLETE BY CONSTRUCTION. The fail-closed form is a POSITIVE
+ * allowlist of command-position words, which is a larger change than #2204 makes; the residual is
+ * filed as #2755 (`osascript -e 'do shell script …'`, `rm -rf <dir>`, and `alias x=/tmp/p.sh; x`
+ * are each certified a read at zero dispatches today) rather than implied closed by this set.
+ */
+const REMOTE_WRITE_PROGRAMS = new Set([
+  "curl", "wget", "http", "https", "httpie", "nc", "ncat", "netcat", "socat",
+  "npm", "npx", "pnpm", "yarn", "bun",
+  "pip", "pip3", "gem", "cargo", "dotnet",
+  "rsync", "scp", "sftp", "ftp", "sshpass",
+  "aws", "gcloud", "az", "fly", "flyctl", "vercel", "netlify", "heroku",
+  "docker", "podman", "kubectl", "helm", "terraform", "ansible", "ansible-playbook",
+  "hub", "tea", "glab",
+]);
+
+function isUnreadableProgramWord(w: string): boolean {
+  if (w === "") return false;
+  if (w.includes("/")) return true;
+  if (/\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl|php|ps1|bat|cmd)$/.test(w)) return true;
+  return (
+    SHELL_PAYLOAD_RUNNERS.has(w) ||
+    STDIN_PROGRAM_RUNNERS.has(w) ||
+    STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
+    REMOTE_WRITE_PROGRAMS.has(w)
+  );
+}
+
+/**
+ * Is token `i` the FILE TARGET of a redirection that belongs to a command already present
+ * (`done > /tmp/out.txt`), as opposed to a word the shell will RUN (`> /dev/null /bin/bash`)?
+ *
+ * ⛔ THE OLD TEST WAS `REDIRECTION_TOKEN.test(tok(i - 1))`, AND IT WAS A P0 BYPASS (#2206 review).
+ * Separators are stripped from TOKENS and survive only in the GAP, so in
+ * `done >/dev/null; /bin/bash /tmp/x.sh` the previous TOKEN of `/bin/bash` is the redirection
+ * `>/dev/null` although a `;` sits between them. The program check was therefore skipped and the
+ * script RAN — a command certified "Read-only … the ≥1-dispatch floor covers writes, not reads"
+ * that executed an unreviewed `/tmp/x.sh` (reproduced through the real `tool_call` handler).
+ *
+ * The target is now recognised POSITIONALLY: directly attached to its operator, ending its
+ * segment, and with a command before the operator to attach the redirection to.
+ */
+/**
+ * Is token `i` the COMMAND WORD of its own simple command — i.e. is the first word the shell
+ * would resolve as a program here?
+ *
+ * ⛔ `isCommandPositionAt` CANNOT ANSWER THIS, AND ASSUMING IT DID WAS A P0 BYPASS (#2206 cycle-3
+ * review). It reads the IMMEDIATELY preceding token, so a redirection whose TARGET is a separate
+ * word puts that target between the operator and the program:
+ *
+ *     for n in 1; do gh pr view $n; done; > a /bin/bash /tmp/x.sh
+ *
+ * `/bin/bash`'s previous token is `a`, which is neither a separator nor an introducer, so
+ * `isCommandPositionAt` said "not a command position" — while bash opens `a`, then RUNS `/bin/bash`
+ * as the command of that segment. The command was certified `Read-only … the ≥1-dispatch floor
+ * covers writes, not reads` and the script RAN (reproduced through the real `tool_call` handler).
+ * Adding the target to the redirection spellings is not enough: the same hole is reached through
+ * `2>&1`'s `&`-residue, so the question is answered POSITIONALLY instead.
+ *
+ * A word is the command word when everything between it and its segment start is EXCUSED: a
+ * redirection operator, a word that is some operator's TARGET, an assignment prefix (`FOO=1`) or a
+ * reserved word (`done`). The first word that is none of those is the command; every word after it
+ * is an argument, and an argument is data to the shell — `gh pr view 1 > a /bin/bash` passes
+ * `/bin/bash` to `gh`, it never runs it.
+ */
+function isSimpleCommandWordAt(scan: ScanTokens, i: number): boolean {
+  const isSeparator = (gap: string | undefined): boolean => /[;&|(){!\n\r]/.test(gap ?? "");
+  const reservedWord = /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/;
+  const assignmentPrefix = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/;
+  let j = i - 1;
+  while (j >= 0) {
+    const t = scan.tokens[j] ?? "";
+    // A word directly after a redirection operator is that operator's TARGET, so it is never a
+    // command word: `> a /bin/bash` opens `a` and then still needs its command. Consume the pair.
+    if (j >= 1 && REDIRECTION_TOKEN.test(scan.tokens[j - 1] ?? "")) {
+      j -= 2;
+      continue;
+    }
+    const excused =
+      REDIRECTION_TOKEN.test(t) ||
+      assignmentPrefix.test(shellWord(t)) ||
+      reservedWord.test(shellWord(t));
+    if (!excused) return false; // a real word precedes → `i` is an ARGUMENT, not a program
+    // A separator BEFORE this excused token means nothing earlier belongs to this command.
+    if (isSeparator(scan.gaps[j])) return true;
+    j--;
+  }
+  return true;
+}
+
+/**
+ * Is there an UNQUOTED single `|` in the gap before token `i`?
+ *
+ * ⛔ THE PIPE TEST READ THE RAW GAP, SO A QUOTED `|` COUNTED AS A PIPE (#2206 cycle-3 review, P1).
+ * The tokenizer splits on the character, so in the fleet's ordinary triage read
+ *
+ *     gh pr view $n --json comments --jq '.[] | .body'
+ *
+ * the quoted filter becomes the tokens `.[]`, `|`, `body'`, and the stage test then read `body` as a
+ * pipeline STAGE — which is not a readable filter, so the read was refused. Same for
+ * `grep -E 'open|closed'`. The shell runs neither as a pipe: both sit inside quotes, which the
+ * shared parser's own `mask` (`unquotedMask`, #966) already records per character, so the test
+ * consults it rather than re-deriving quote state here.
+ */
+function hasUnquotedPipeInGap(scan: ScanTokens, i: number): boolean {
+  const gap = scan.gaps[i] ?? "";
+  if (!gap.includes("|")) return false;
+  const gapStart = (scan.starts[i] ?? 0) - gap.length;
+  for (let k = 0; k < gap.length; k++) {
+    if (gap[k] !== "|") continue;
+    if (scan.mask[gapStart + k] !== true) continue; // inside quotes → data, not a pipe
+    if (gap[k - 1] === "|" || gap[k + 1] === "|") continue; // `||` is a separator, not a pipe
+    return true;
+  }
+  return false;
+}
+
+function isTrailingRedirectTarget(scan: ScanTokens, i: number): boolean {
+  if (i < 1) return false;
+  if (!REDIRECTION_TOKEN.test(scan.tokens[i - 1])) return false;
+  // A separator between the operator and this word starts a NEW command, so this word is not a
+  // target — it is whatever that new command runs.
+  if (/[;&|(){!\n\r]/.test(scan.gaps[i] ?? "")) return false;
+  // A target may be followed by MORE REDIRECTIONS of the same command (`> out 2>&1`, `> out 2>err`,
+  // `> out <in`) but not by another command WORD. ⛔ The first version demanded this word END its
+  // segment, which refused the canonical `> out 2>&1` — the exact loop shape this exemption exists
+  // to protect (`for n in …; do gh pr view $n; done > /tmp/out 2>&1`) — and made the verdict depend
+  // on the ORDER of the two redirections (#2206 review, P1 over-block).
+  let segEnd = i;
+  while (segEnd + 1 < scan.tokens.length && !/[;&|(){!\n\r]/.test(scan.gaps[segEnd + 1] ?? "")) segEnd++;
+  for (let k = i + 1; k <= segEnd; k++) {
+    if (
+      !REDIRECTION_TOKEN.test(scan.tokens[k] ?? "") &&
+      !REDIRECTION_TOKEN.test(scan.tokens[k - 1] ?? "")
+    ) return false;
+  }
+  // `> /dev/null /bin/bash`: the operator has no command to attach to, so the word after it is the
+  // command, not a target (the shell runs `/bin/bash` there).
+  if (i < 2) return false;
+  return !/[;&|(){!\n\r]/.test(scan.gaps[i - 1] ?? "");
+}
+
+/**
+ * Does the command POSITIVELY read as read-only gh work? (agent-infra#2204)
+ *
+ * TRUE only when ALL of these hold:
+ *   1. NO `git` WORD AT ALL (`mentionsGitWord`). This is the third design and it is deliberately
+ *      blunt: every attempt to CERTIFY a git read by reading its text was measured unsound, and the
+ *      last one (`git -c protocol.ext.allow=always ls-remote ext::<program>`) runs a program through a
+ *      POSITIONAL argument, which no flag allowlist can see. `git log`/`git rev-parse` beside a read
+ *      is therefore refused — run it on its own line;
+ *   2. every non-data `gh` word is followed by a readable group + sub-word that is a
+ *      gh READ — `pr view`, `issue view`, `api <GET-shaped>`, … — and at least ONE such
+ *      word exists (an empty answer is not a read);
+ *   3. no OPAQUE EXECUTABLE WORD: a construct in a command position (`$CMD`, `$'…'`,
+ *      `${V}`, a `"$S"` handed to `sh -c`) could be the executable this scan cannot read,
+ *      so it fails the read. Two exemptions, both of which leave the text READABLE rather
+ *      than trusted: a REDIRECTION operator (the shell consumes it before argv exists)
+ *      and a token whose dequoted form ends with `$` — a `$(…)` OPENING — but ONLY when the
+ *      substitution's own command word is `gh` (`gh api …`), which is the shape #2204's
+ *      `sha=$(gh api …)` evidence needs and the only thing this layer can read inside a
+ *      substitution. A wider exemption is a measured false PASS: `gh pr view 1; $(cat /tmp/f)`
+ *      with `git push` in `/tmp/f` EXECUTES that output, and the first version allowed it
+ *      (fresh review, P1);
+ *   4. every PIPELINE STAGE is a known data filter whose arguments cannot run a program or open
+ *      an output file (`READ_PIPELINE_FILTERS` + `DATA_FILTER_SCRIPT_EXECUTES`). A shell or an
+ *      interpreter reads its PROGRAM from that stream (`… | sh`, `… | python3`) and is refused, as
+ *      is a WRAPPER WORD that hides one (`… | env -i bash`, `… | xargs -n1 sh`) and a filter SCRIPT
+ *      that executes (`… | sed '1e /tmp/x.sh'`). Pure filters (`| jq`, `| head`, `| sed -n '3,12p'`)
+ *      process the data and run nothing, so they stay allowed — refusing them would re-create
+ *      #2204's false positive for the ordinary `gh pr view … --json body | jq -r .body` read.
+ *
+ * Any doubt answers FALSE and the floor keeps its decision. The polarity is the point:
+ * an unreadable command is NOT a permission — the same rule as `readsNonMergeGhCall`,
+ * applied to "is this a write" instead of "is this an admin merge".
+ */
+/**
+ * Pipeline stages a zero-dispatch READ may be piped into — a POSITIVE allowlist of filters that
+ * print what they are handed and cannot start a process.
+ *
+ * ⛔ Deliberately ABSENT, each for a measured reason: every shell and interpreter (`| sh`,
+ * `| python3` — they read their PROGRAM from the stream); the wrapper words that hide one one token
+ * later (`env`, `exec`, `command`, `nohup`, `nice`, `timeout`, `setsid`, `stdbuf`, `xargs` — the
+ * first cut tested only the token immediately after the `|` and certified `| env -i bash` and
+ * `| xargs -n1 sh`); and the filters whose FLAGS or second argument open an OUTPUT file (`sort -o f`,
+ * `uniq in out`, `tee`), which is why `HARMLESS_SUBSTITUTION_PROGRAMS` excludes them too. `sed` and
+ * `awk` are here because the triage corpus reads through them, and their SCRIPT is checked instead.
+ */
+const READ_PIPELINE_FILTERS = new Set([
+  "jq", "head", "tail", "cut", "tr", "wc", "grep", "rg", "cat", "column", "nl", "rev", "fold",
+  "sed", "awk",
+]);
+
+/**
+ * The `sed`/`awk` SCRIPT constructs that EXECUTE or WRITE — the reason a data filter still needs
+ * its arguments read.
+ *
+ * Measured bypass in the first cut: `… | sed '1e /tmp/x.sh'` was certified as a read and ran the
+ * file (sed's `e` command executes the pattern space; `w`/`W` write one), and awk's `system()` /
+ * `print > "f"` / `"cmd" | getline` do the same. An ordinary print script (`3,12p`, `s/a/b/`,
+ * `NR>1`) matches none of these and stays a read.
+ */
+/**
+ * Per-filter flags that turn a data filter into a program runner or an in-place writer.
+ *
+ * `-f`/`--file` puts the SCRIPT out of the command text, which is the only thing the
+ * `DATA_FILTER_SCRIPT_EXECUTES` check can read. `rg --pre=<PROGRAM>` runs that program to
+ * preprocess every file it searches. `sed -i`/`--in-place` and `awk -i inplace` WRITE.
+ * `awk -E`/`--exec` is gawk's second `-f` spelling. Each is a measured bypass (#2206 review).
+ *
+ * Letters are matched only on an all-letters short bundle (`-n`, `-ni`), so `awk -F,` and
+ * `sed -n '3,12p'` stay reads; `-F` (field separator) is deliberately NOT in awk's set.
+ */
+// ⛔ A `Map`, NOT a `Record` OBJECT (#2206 review, P1 — caught by this suite's own
+// `gh constructor view 2` / `gh toString pr view 1` pins). A plain object lookup returns
+// `Object.prototype.constructor` for the word `constructor`, so `badLong.test` threw out of the
+// gate instead of returning a verdict. The same hazard exists for `__proto__` and `toString`.
+const PIPELINE_FILTER_FORBIDDEN_LETTERS = new Map<string, string>([
+  ["sed", "if"],
+  ["awk", "fEi"],
+]);
+const PIPELINE_FILTER_FORBIDDEN_LONG = new Map<string, RegExp>([
+  ["sed", /^--(?:in-place|file)/],
+  ["awk", /^--(?:file|exec|include)/],
+  ["rg", /^--pre/], // `--pre=<PROGRAM>` runs it; `--pre-glob` only pairs with it
+]);
+
+const DATA_FILTER_SCRIPT_EXECUTES =
+  // The sed `e`/`w`/`W` COMMAND. The preceder class includes the QUOTES: a script is normally
+  // written `sed '1e /tmp/x.sh'`, so the address is preceded by `'` and an anchor of `;{}` +
+  // whitespace alone missed every real spelling of it (caught by re-running the probe).
+  // ⛔ THE SCRIPT'S ADDRESS CAN BE A REGEX, SO THE PRECEDER CLASS MUST INCLUDE `/` AND `\`
+  // (#2206 review, P1). The address group `([0-9$,/]*)` cannot match `/touch/`, so `sed '/touch/e'`
+  // was certified a read and GNU sed RAN the pattern space. The trail is now a negative lookahead
+  // instead of a terminator class: a bare `e`/`w`/`W` not inside a longer word is a sed command
+  // letter wherever it sits. Appending `'`/`}`/`"`/`/`/`\` covers the spellings measured escaping.
+  // A script whose `e`/`w` is part of a word (`/end/`, `NR>1`, `print`) still reads, because the
+  // lookahead refuses only a STANDALONE letter.
+  /(^|[;{}\s'"\/\\])(?:[0-9$,/]*|\/(?:\\.|[^\\/])*\/)\s*[ewW](?![A-Za-z])|s\/(?:\\.|[^\\/])*\/(?:\\.|[^\\/])*\/[a-z]*[ew]|system\s*\(|\b(?:print|printf)\b[^;{}]*[>|]|\|\s*getline/;
+
+/**
+ * Is the token at `k` part of a command substitution (`$(…)` or a backtick body)?
+ *
+ * The tokenizer splits `$(…)` on its `(` — the `$` ends one token and the program starts the next —
+ * so the opening is visible only as a `$`-terminated word whose following GAP contains `(`.
+ * ⛔ `${VAR}` IS **NOT** EXEMPT, AND THAT IS THE FAIL-CLOSED ANSWER (#2206 review, P2 — the
+ * previous text here claimed the opposite). Its gap is `{`, not `(`, so it is not a substitution
+ * this layer can read, and it is refused. An UNQUOTED `${VAR}` also undergoes word splitting: it
+ * can expand to `git push`, so a doc that called `repos/${R}/pulls` readable was describing
+ * behaviour the code never had, in the direction that costs a merge. Refusing it costs a retry.
+ * readable). A backtick is a substitution wherever it appears.
+ */
+function hasSubstitutionAt(scan: { tokens: string[]; gaps: string[] }, k: number): boolean {
+  const t = scan.tokens[k] ?? "";
+  if (t.includes("`")) return true;
+  return /\$$/.test(dequote(t)) && (scan.gaps[k + 1] ?? "").includes("(");
+}
+
+export function readsOnlyGhRead(command: string): boolean {
+  if (mentionsGitWord(command)) return false;
+  const scan = scanTokens(command);
+  const data = dataCharMask(scan);
+  const isData = (i: number) => isDataToken(scan, data, i);
+  const tok = (i: number) => scan.tokens[i] ?? "";
+  const word = (i: number) => shellWord(tok(i));
+  const endOfSegment = (i: number): number => {
+    let k = i;
+    while (k + 1 < scan.tokens.length && !/[;&|(){!\n\r]/.test(scan.gaps[k + 1] ?? "")) k++;
+    return k;
+  };
+
+  // (2b) A `gh api` WRITE flag ANYWHERE, not only in the api call's own segment. A substitution is
+  // checked here as well as in the api loop because the TOKENIZER splits on the `(` of `$(…)`: the
+  // flag's tokens land in their own statement, so the per-segment scan never sees them. That is the
+  // measured shape `gh api repos/x $(echo -f title=pwn)` — and it is why the harmless-substitution
+  // allowlist below cannot be the only defence: `echo` is a legitimate program whose OUTPUT can be
+  // flags. Quoted spans are DATA (`isData`), so `-m "fix: -f x"` and a jq filter cost nothing.
+  let apiPresent = false;
+  for (let i = 0; i + 1 < scan.tokens.length; i++) {
+    if (!isData(i) && word(i) === "gh" && word(i + 1) === "api") apiPresent = true;
+  }
+  if (apiPresent && hasApiWriteFlagAnywhere(scan)) return false;
+
+  // (3) No opaque executable word, and no unreadable PROGRAM.
+  //
+  // ⛔ THIS LOOP DOES NOT SKIP DATA TOKENS BEFORE THE PROGRAM TEST (#2206 review, P0). `isData(i)`
+  // used to be the first statement, and `isCommandName` only calls a quoted region a command name
+  // when it is the FIRST token of the simple command — so an assignment or redirection prefix
+  // demoted it to plain DATA and the program test never ran. Each of these RAN the script:
+  //   gh pr view 1; X=1 "/tmp/x.sh"
+  //   gh pr view 1; >/tmp/o "/tmp/x.sh"
+  //   gh pr view 1; 2>/dev/null "/tmp/x.sh"
+  // Quoting never prevents execution, so DATA status cannot excuse a token the shell runs. The
+  // predicate below therefore applies to EVERY token; only the checks AFTER it (which read the raw
+  // token for constructs and substitutions) stay data-exempt, because a quoted region is data to
+  // those questions and owes them nothing.
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const t = tok(i);
+    // A shell/interpreter/script in a COMMAND position runs words this text does not contain.
+    // Redirections are exempt, and so is their TARGET: `done > /tmp/out.txt` is not a program
+    // (the shell opens the file before argv exists), and reading it as one refused every loop that
+    // captured its own output — a shape #2204's evidence loops use. A PIPED-IN stage is exempt too:
+    // its stdin is data, so `… | sed -n '3,12p'`, `… | awk 'NR>1'` and `… | jq .body` run nothing
+    // (refusing them refused the ordinary `gh pr view … --json body | jq -r .body` read — fresh
+    // review, P2). The pipeline case is judged by the shell/interpreter test in (4), not here.
+    const gapBefore = scan.gaps[i] ?? "";
+    const pipedIn = hasUnquotedPipeInGap(scan, i);
+    // A WORD FRAGMENT directly attached to a substitution close is not necessarily a program: in
+    // `gh pr view $(gh api repos/x --jq .a)/x` the `/x` token is the tail of a view ARGUMENT.
+    // ⛔ The earlier example of this shape was `gh api repos/o/r/commits/$(gh api repos/x --jq
+    // .sha)/check-runs`, and it does NOT hold: the `gh api` arm refuses ANY substitution in its
+    // argument list (`hasSubstitutionAt`), deliberately, because an `echo`-fed flag is a write
+    // (`gh api repos/x $(echo -f title=pwn)`). So the api spelling is refused by that arm before
+    // this exemption can be reached — the exemption is live only for the non-api read verbs.
+    //
+    // ⛔ EVERY LEXICAL VERSION OF THIS TEST WAS A P0 BYPASS (#2206 review, two rounds). Round 1
+    // exempted anything whose gap merely ENDED in `)` (`.trimEnd()`), so `$(…) /bin/bash` with a
+    // SPACE counted. Round 2 required direct attachment and `!tok(i-1).endsWith("/")`, which still
+    // certified `$(echo)/bin/bash` — the previous token is `/bin`, which does not end with a slash,
+    // and bash assembles `/bin/bash` across the closer. Both RAN.
+    //
+    // The question is not how the fragment is SPELLED but whether the ASSEMBLED word is in command
+    // position — and `isCommandPositionAt(scan, i)` cannot answer it, because `)` is itself in its
+    // separator class, so it says "command position" for `repos/…/sha/check-runs` too. The opener
+    // can answer it: the assembled word starts where the substitution opened, so it is a command
+    // exactly when that opener is.
+    const closerOpener = ((): number | null => {
+      if (!/[)}\]]$/.test(gapBefore)) return null;
+      for (let k = i - 1; k >= 0; k--) {
+        if (/\$$/.test(tok(k)) && /^\s*\(/.test(scan.gaps[k + 1] ?? "")) return k;
+      }
+      return null;
+    })();
+    const attachedToClose =
+      closerOpener !== null && /^\//.test(t) && !isCommandPositionAt(scan, closerOpener);
+    // ⛔ A QUOTED WORD IN COMMAND POSITION IS STILL THE COMMAND (#2206 review, P0) — see the loop
+    // header. This is the ONLY question a data token owes; below here the raw token is read for
+    // constructs and substitutions, which a quoted region is data to.
+    // ⛔ ONE COPY, AND `isSimpleCommandWordAt` IS WHY (#2206 cycle-3 review, P0 + P2). The
+    // redirection-clause of `isCommandPositionAt` reads only the token IMMEDIATELY before the word,
+    // so `> a /bin/bash` slipped through: the target `a` sat between the operator and the program.
+    // The predicate is now answered positionally (see `isSimpleCommandWordAt`), and the SECOND,
+    // byte-identical copy of this condition that used to follow the `isData` skip is deleted — it
+    // could never be reached (same inputs, same expression), and it read as a class covered twice.
+    if (
+      !pipedIn &&
+      !attachedToClose &&
+      !isTrailingRedirectTarget(scan, i) &&
+      (isCommandPositionAt(scan, i) || isSimpleCommandWordAt(scan, i)) &&
+      !REDIRECTION_TOKEN.test(t) &&
+      isUnreadableProgramWord(word(i))
+    ) return false;
+    if (isData(i)) continue;
+    // Shell STRUCTURE (`{ …; }`, a subshell's parens, `[ … ]`) is not a program. Its BODY is scanned
+    // on its own, so skipping the brace neither widens nor narrows what runs — `{ cut …; } | tr …`
+    // was refused only because `{` sat in a command position (measured on the corpus).
+    if (/^[{}()[\]]+$/.test(t)) continue;
+    if (!CONSTRUCT.test(t)) continue;
+    if (REDIRECTION_TOKEN.test(t)) continue; // `2>&1`, `>/dev/null` — not a word
+    if (word(i) === "gh") continue; // the `` `gh` `` wrapper: read by the gh loop below
+    // A `$(…)` OPENING is a substitution, and it RUNS. This layer can read one only when the
+    // substitution's own command word is a KNOWN-LOCAL one, so the check is BEFORE the
+    // command-position test — an ARGUMENT substitution runs too, and `gh api repos/x $(echo -f
+    // title=pwn)` supplies a WRITE flag from inside one (fresh review, P1).
+    //
+    // The allowlist, not a blanket exemption: `$(cat /tmp/f)` executes whatever the file prints, and
+    // the first version allowed it (fresh review, P1). `gh` is validated by the gh loop below; the
+    // rest are programs whose whole argument surface is data (`HARMLESS_SUBSTITUTION_PROGRAMS` — and
+    // `sort`/`uniq` are NOT there, because their flags were measured writing files and running
+    // programs). `git` is NOT there either: `mentionsGitWord` refuses the whole command, so a
+    // `$(git rev-parse HEAD)` costs a refusal like any other git mention.
+    if (/\$$/.test(dequote(t))) {
+      const nextTok = tok(i + 1);
+      if (nextTok !== "" && !CONSTRUCT.test(nextTok)) {
+        const inner = normalizeProgramWord(nextTok);
+        if (inner === "gh" || HARMLESS_SUBSTITUTION_PROGRAMS.has(inner)) continue;
+      }
+      return false;
+    }
+    if (!isCommandPositionAt(scan, i)) continue; // an ARGUMENT (a value), not an executable
+    return false;
+  }
+
+  // (4) Every PIPELINE STAGE must be a data filter that cannot run a program or open an output
+  // file.
+  //
+  // ⛔ POSITIVE ALLOWLIST, NOT A LIST OF SHELLS. The first cut refused a shell/interpreter in the
+  // token IMMEDIATELY after the `|`, and that certified three writes at ZERO dispatches (fresh
+  // review, P1 — each reproduced through the real `tool_call` handler before it was fixed):
+  //
+  //   … | sed '1e /tmp/x.sh'   sed's `e` command RUNS /tmp/x.sh — whatever may be in it
+  //   … | env -i bash          the runner is one WRAPPER WORD past the pipe, so the shell test
+  //   … | xargs -n1 sh         never sees it; xargs builds a command from the stream
+  //
+  // A stage that is not a KNOWN filter is therefore refused: `env`, `xargs`, `sudo`, `nice`, a
+  // shell, an interpreter, and also `sort`/`uniq`/`tee`, whose flags and second argument open
+  // OUTPUT files (`sort -o f`, `uniq in out`) — the same reason `HARMLESS_SUBSTITUTION_PROGRAMS`
+  // leaves them out. `sed`/`awk` stay allowed because the corpus reads through them
+  // (`| sed -n '3,12p'`, `| awk 'NR>1'`), so their SCRIPT is inspected for the constructs that
+  // execute or write (`DATA_FILTER_SCRIPT_EXECUTES`) — refusing the filter name outright would
+  // re-create the false block that measurement cost.
+  //
+  // The polarity is this function's throughout: an unrecognised stage is NOT a read, so it costs a
+  // retry (`| head`, `| jq`) instead of certifying a program that ran with no reviewer verdict.
+  let sedOrAwkStage = false;
+  for (let i = 1; i < scan.tokens.length; i++) {
+    // ⛔ NO DATA SKIP BEFORE THE STAGE TEST (#2206 review, P0). `isData(i)` here skipped a QUOTED
+    // stage word, and a quoted stage is still executed: `gh pr view 1 | "sort" -o /tmp/f` was
+    // certified a read. The pipe test below is what identifies a stage; whether the word was written
+    // with quotes is irrelevant to what the shell runs.
+    if (!hasUnquotedPipeInGap(scan, i)) continue;
+    // ⛔ NO `isData(i - 1)` SKIP (#2206 review, P1). It was meant to stop a QUOTED argument that
+    // precedes the pipe from looking like a stage, but it skipped the STAGE CHECK ITSELF: one data
+    // token was enough to certify `… gh pr view $n --json "body" | sort -o <file>` as a read, and
+    // `sort -o` really wrote — it overwrote a repo's `.git/hooks/pre-commit` from a command the
+    // gate had just declared read-only (reproduced through the real handler). The `isData(i)` test
+    // above already governs the STAGE token; what precedes the pipe is irrelevant to that test.
+    const w = word(i);
+    if (!READ_PIPELINE_FILTERS.has(w)) return false;
+    if (w === "sed" || w === "awk") sedOrAwkStage = true;
+  }
+
+  // (4b) A data filter is only a data filter while its FLAGS cannot name a program or open an
+  // output file. This runs over EVERY position (a pipeline STAGE and a plain COMMAND), because the
+  // script check below reads the command TEXT and a flag can put the script out of its reach.
+  //
+  // ⛔ EACH ENTRY IS A MEASURED BYPASS (#2206 review, P1), certified as a read at zero dispatches
+  // and then really running/writing:
+  //   … | rg --pre=/tmp/pre.sh needle dir      rg RUNS the preprocessor on every file it searches
+  //   … | awk -f /tmp/ship.awk                 the script is out of band; it ran `git push`
+  //   … | sed -n -f /tmp/ship.sed              same
+  //   … | sed -i 's/a/b/' f , awk -i inplace   WRITES the named file
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
+    const w = word(i);
+    const badLetters = PIPELINE_FILTER_FORBIDDEN_LETTERS.get(w) ?? "";
+    const badLong = PIPELINE_FILTER_FORBIDDEN_LONG.get(w);
+    if (badLetters === "" && badLong === undefined) continue;
+    const last = endOfSegment(i);
+    for (let k = i + 1; k <= last; k++) {
+      // Quoted or not, the shell passes a flag through verbatim, so this loop does NOT skip data.
+      const ft = word(k);
+      if (badLong !== undefined && badLong.test(ft)) return false;
+      // ⛔ THE LEADING LETTERS OF THE BUNDLE, NOT THE WHOLE TOKEN (#2206 review, P1).
+      // `/^-[A-Za-z]+$/` never matched a flag with a SUFFIX, and `sed -i.bak` / `-ni.bak` is the
+      // ordinary in-place spelling on BSD and GNU sed: it WROTE the named file under a read
+      // certification. Reading the letters before the first non-letter also closes `-f<file>`-
+      // style attached spellings, while `-F,` (awk's field separator) stays a read because `F` is
+      // not in awk's set.
+      const letters = ft.startsWith("-") ? ft.slice(1).split(/[^A-Za-z]/, 1)[0] : "";
+      if (
+        badLetters !== "" &&
+        letters !== "" &&
+        [...letters].some((ch) => badLetters.includes(ch))
+      ) return false;
+    }
+  }
+  // ⛔ THE SCRIPT IS DATA ON THIS SCAN, SO IT IS READ FROM THE TEXT. `sed '1e /tmp/x.sh'` is ONE
+  // quoted token, and the tokenizer splits quoted regions on `(`/`{`/`;` too, so a stage-by-stage
+  // walk cannot see the script's own words. The construct test therefore runs over the command
+  // TEXT, and it is the fail-closed direction: the over-approximation can only REFUSE a command
+  // that carries an execute/write construct somewhere, never certify one that does.
+  if (sedOrAwkStage && DATA_FILTER_SCRIPT_EXECUTES.test(command)) return false;
+
+  // (2) Every gh invocation is a READ, and there is at least one.
+  let seen = false;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
+    const w = word(i);
+    // A PATH to a gh (`/usr/bin/gh`, `$P/g''h`) is not a read this scan can certify: it
+    // could be any wrapper at all, and the caller's fail-closed reading applies.
+    if (w !== "gh" && /(^|\/)gh$/.test(w)) return false;
+    if (w !== "gh") continue;
+    seen = true;
+    const groupTok = tok(i + 1);
+    if (groupTok === "" || CONSTRUCT.test(groupTok)) return false;
+    const group = word(i + 1);
+    if (!SUBCOMMAND_WORD.test(group)) return false; // a global flag puts the group out of reach
+    if (GH_READ_GROUPS_NO_SUB.has(group)) continue; // `gh status`
+    if (group === "api") {
+      const last = endOfSegment(i);
+      for (let k = i + 2; k <= last; k++) {
+        // ⛔ A COMMAND SUBSTITUTION IN THE ARGUMENT LIST MAKES THE CALL UNREADABLE (#2206 review,
+        // P0). Evaluated BEFORE the `isData` skip: bash runs a substitution inside DOUBLE quotes
+        // too, so `gh api "repos/$(printf …)"` is the same hole quoted. `$(printf -- '-%s%s' X
+        // POST)` is ONE argv word `-XPOST`; a backtick body assembles its words the same way. The
+        // rule is the DIMENSION, not the program: an api call is a read only when every word gh
+        // will receive is spelled in the text. `sha=$(gh api …)` is unaffected — there the
+        // substitution WRAPS the call instead of feeding it, and its arguments carry no `$(`.
+        if (hasSubstitutionAt(scan, k)) return false;
+        if (isData(k)) continue;
+        const t = tok(k);
+        const flag = word(k);
+        if (flag === "graphql") return false; // a mutation is a write
+        // AN ENDPOINT IS A VALUE: `repos/$owner/pulls/$pr` carries a construct and is still
+        // readable as an endpoint. A WHOLE-WORD variable is not — `gh api repos/x $F` could be
+        // `-f key=value` — so that fails the read.
+        if (BARE_VARIABLE_WORD.test(dequote(t))) return false;
+        const eq = flag.indexOf("=");
+        const name = eq === -1 ? flag : flag.slice(0, eq);
+        const attached = eq === -1 ? "" : flag.slice(eq + 1);
+        // A construct in a FLAG position could spell the write (`gh api repos/x -$F y=1`).
+        if (flag.startsWith("-") && CONSTRUCT.test(t)) return false;
+        // `-f/--field`, `-F/--raw-field` and `--input` switch gh to POST by themselves.
+        if (name === "--field" || name === "--raw-field" || name === "--input") return false;
+        // ⛔ THE ATTACHED SHORT SPELLING IS THE SAME FLAG: gh's pflag parsing accepts `-fbody=x`
+        // and `-Fbody=@f` exactly as `-f body=x` / `-F body=@f` (both are POSTs). Matching only the
+        // detached `-f`/`-F` let `gh api repos/o/r/pulls/1/reviews -fevent=APPROVE -fbody=lgtm` —
+        // i.e. SELF-APPROVAL of a PR — read as a GET (fresh review, P1). Prefix, not equality.
+        if (flag.startsWith("-f") || flag.startsWith("-F")) return false;
+        // `-X POST`, `-XPOST`, `--method PATCH`, `--method=DELETE`: anything but GET is a write.
+        if (name === "--method" || flag.startsWith("-X")) {
+          const method = (
+            attached || (name === "--method" ? "" : flag.slice(2)) || word(k + 1)
+          ).toUpperCase();
+          if (!API_READ_METHODS.has(method)) return false;
+          if (!attached && flag.length <= 2) k++;
+          continue;
+        }
+      }
+      continue;
+    }
+    // ⛔ OWN-PROPERTY LOOKUP. `group` is attacker-chosen text, and a plain index reaches the
+    // PROTOTYPE: `gh constructor view` yielded `Object` (not `undefined`), so `.includes` threw out
+    // of the gate — a refusal with no `gate_block` row and no recovery message, which is the
+    // "refused and indistinguishable in the log" defect #2204 names (fresh review, P2).
+    const allowed = Object.prototype.hasOwnProperty.call(GH_READ_SUBCOMMANDS, group)
+      ? GH_READ_SUBCOMMANDS[group]
+      : undefined;
+    if (allowed === undefined) return false;
+    const subTok = tok(i + 2);
+    if (subTok === "" || CONSTRUCT.test(subTok)) return false;
+    const sub = word(i + 2);
+    if (!SUBCOMMAND_WORD.test(sub) || !allowed.includes(sub)) return false;
+    i += 2; // the group/sub words are consumed; neither is a `gh` word
   }
   return seen;
 }
@@ -2443,10 +3364,19 @@ export function isAdminMergeCommand(command: string): boolean {
     // false block the LITERAL arm still produces (a quoted `--admin`, once this guess has
     // already made the command a candidate); it is deliberate, and
     // `hasLiteralAdminFlag` documents why the caller accepts it.
-    return (
-      /(^|[^\w])gh\b/.test(probe) ||
-      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
-    );
+    //
+    // ⛔ #3953: THE GUESS IS ABOUT AN OPERATION, NOT ABOUT VOCABULARY. It used to be
+    // "the text contains the word `gh`, or the words `pr` AND `merge`", which made every
+    // read-only command that merely NAMED a merge a merge it had to certify — the mandated
+    // `commits/<sha>/check-runs` read, a `branches/main/protection` projection, a heredoc
+    // body full of `hasAdminMergeFlag` identifiers. `mergeInvocationInText` asks instead
+    // for a merge VERB in argv position, and it keeps the fail-closed halves that matter: a
+    // spliced verb still counts, a verb inside a payload handed to a shell still counts, and
+    // a `gh` whose group slot is unreadable (`V="pr merge"; gh $V 999 --admin`) still
+    // counts. What it no longer counts is a READABLE `gh api`/`gh issue`/`gh pr view` call,
+    // which cannot merge anything — that is the difference between the operation and the
+    // word, and it is the whole of the #3953 class.
+    return mergeInvocationInText(bare);
   }
   // Readable text, so the only way it is still a merge is a quote-split verb
   // behind a BARE `gh` (quotes are deliberately not a construct). Requiring the
@@ -4711,6 +5641,356 @@ export function extractMergePrNumber(command: string): number | null {
   return extractMergeSelector(command).pr;
 }
 
+/** gh flags that take a VALUE and may sit before the group (`pr`): a global flag does
+ * not make the group readable, and its value is not the group. Mirrors the shim's and
+ * `extractMergeSelector`'s value list for the two flags gh accepts BEFORE the group. */
+const GLOBAL_VALUE_FLAGS = new Set(["-R", "--repo", "-A", "--hostname"]);
+
+/** A word with a shell ASSIGNMENT prefix removed (`CMD+=gh` → `gh`, `P=pr` → `pr`).
+ * A verb assembled by appends (`CMD+=gh CMD+=' ' CMD+=pr …`) puts no token that IS the
+ * word in the stream, and bash still runs `gh pr merge` — measured as a real bypass. */
+function withoutAssignmentPrefix(word: string): string {
+  return word.replace(/^[A-Za-z_][A-Za-z0-9_]*\+?=/, "");
+}
+
+/**
+ * Is `scan.tokens[i]` a word that can BE the `gh` command word — readable (`gh`, `"gh"`), or a
+ * construct where a command word belongs (`g$'h'`, `$GH`, `$'gh'`, `${GH}`)?
+ *
+ * ⛔ THE HARD PART IS WHAT IS *NOT* A WORD. `CONSTRUCT` is a character class (`[$`{}<>]`), so it
+ * accepts RESIDUE: a heredoc's `<<'EOF'`, the `<` that `<!--` splits into, the `head}` tail of
+ * `${head}`, the `-->` that closes an HTML marker. Reading those as the `gh` command word made a
+ * heredoc that WRITES this gate's own evidence marker (`cat > f <<'EOF' … <!-- admin-merge-
+ * safety: ${head} --> … EOF`) a REFUSED read-only command — measured in review cycle 4;
+ * `origin/main` admits it. So a construct is accepted only when it CARRIES ITS INTRODUCER
+ * (`$…`, a backtick, `{…}`), and the one residue that IS a word — the tail of a split `${X}`,
+ * i.e. the tokens `$` + `X}` — is accepted only where the `${` itself begins a simple command.
+ *
+ * ⛔ NOT POSITION-GATED otherwise, deliberately: a wrapper's arguments put the command word out
+ * of the position model's reach, and requiring command position lost 168 real admin merges
+ * (`timeout 5 g$'h' $'pr' "merge" 999 --admin`) that `origin/main` refuses.
+ */
+function isGhCommandWordAt(scan: ScanTokens, i: number): boolean {
+  const raw = scan.tokens[i];
+  const w = shellWord(raw);
+  // A BARE `$` is never a command word: `${RAIL}` tokenizes to `$` + `RAIL}`, and reading the `$`
+  // as the command and `RAIL}` as its group made `bash ${RAIL} 999` a merge candidate — it would
+  // have re-created #6395's refusal of the mandated rail.
+  if (w === "") return false;
+  if (w === "gh") return true;
+  // A construct that CARRIES ITS INTRODUCER: `$GH`, `$'gh'`, `g$'h'`, `x${X}`, or a backtick.
+  // Position does not matter — a wrapper's arguments put the command word out of the position
+  // model's reach (`timeout 5 g$'h' $'pr' "merge" 999 --admin`, measured: position-gating this
+  // lost 168 real admin merges that `origin/main` refuses).
+  if (/[$`]/.test(raw)) return true;
+  // A BRACE-EXPANSION word (`{pr,merge}`) is a construct too.
+  if (/^\w*\{/.test(raw)) return true;
+  // The ONE residue that IS a word: the TAIL of a split `${X}` (tokens `$` + `X}`), and only when
+  // the `${` ITSELF begins a simple command — `GH=gh; ${GH} ${P} merge 999 --admin` is a real
+  // merge `origin/main` refuses. Command position read at the TAIL is not usable: it is true for
+  // a same-shaped `${head}` mid-line in a heredoc body, because the `{` of `${` reads as a group
+  // separator to the gap test. The `${` token is where the word starts, so that is the token the
+  // position is read at.
+  if (!/^\w*\}$/.test(raw)) return false;
+  if (i === 0 || scan.tokens[i - 1] !== "$") return false;
+  return isCommandPositionAt(scan, i - 1);
+}
+
+/**
+ * Does the command carry a `gh` command word — readable, or constructed (`g$'h'`, `$GH`)?
+ *
+ * NOT position-gated: this question is only ever asked TOGETHER with something else that is
+ * already narrow (a merge-verb window, or a top-level `ghGroupIsUnreadable` that does its own
+ * position test), and a wrapper's arguments put the command word out of the position model's
+ * reach — position-gating it lost 168 real admin merges (`timeout 5 g$'h' $'pr' "merge" 999
+ * --admin`) that `origin/main` refuses.
+ */
+export function hasGhCommandWord(command: string): boolean {
+  const scan = scanTokens(command);
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isGhCommandWordAt(scan, i)) return true;
+  }
+  return false;
+}
+
+/**
+ * Is the GROUP slot of some `gh` command word itself UNREADABLE — a construct, where `pr` (or the
+ * whole verb) would have to be, possibly behind a global flag?
+ *
+ * `V="pr merge"; gh $V 999 --admin` reaches gh as `gh pr merge 999 --admin` while this scanner
+ * can see no verb at all, so this is the fail-closed floor under `mergeInvocationInText`. It is
+ * deliberately slot-SCOPED rather than the old "a `gh` word appears anywhere" test: a readable
+ * group (`gh api …`, `gh issue list …`) is not a merge and must not be read as one
+ * (agent-infra#3953).
+ */
+function ghGroupIsUnreadable(command: string): boolean {
+  const scan = scanTokens(command);
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const w = shellWord(scan.tokens[i]);
+    if (!isCommandPositionAt(scan, i)) continue;
+    if (!isGhCommandWordAt(scan, i)) continue;
+    let j = i + 1;
+    while (j < scan.tokens.length && GLOBAL_VALUE_FLAGS.has(shellWord(scan.tokens[j]))) j += 2;
+    if (j >= scan.tokens.length) continue;
+    if (CONSTRUCT.test(scan.tokens[j])) {
+      // ⛔ A construct in the GROUP slot only pays for itself behind a READABLE `gh`. Behind a
+      // construct COMMAND word it degenerates into "two constructs and the word `admin`", the
+      // vocabulary guess this predicate replaces: `bash $AIR/scripts/verify-admin-merge-
+      // evidence.sh "$PR"`, `$PY $SCRIPT --check-admin-policy`, `$JQ "$F" --arg admin x` are
+      // read-only and were refused as unevidenced admin merges (cycle-3 review, P1, measured).
+      // The one thing that makes a construct-construct command a REAL merge is the verb: bash
+      // hands gh `<group> merge <n> <flag>`, so require the merged word after the group slot.
+      // Measured payload: `GH=gh; g$'h' $P "merge" 999 --admin`, `GH=gh; $GH $P 'merge' 999
+      // --admin` (the `GH=gh` assignment is what makes origin/main read them, and a narrowing
+      // that dropped them would be a fail-open against the base).
+      if (w === "gh") return true;
+      const verb = j + 1 < scan.tokens.length ? shellWord(scan.tokens[j + 1]) : "";
+      if (verb === "merge") return true;
+      continue;
+    }
+  }
+  return false;
+}
+
+/**
+ * Is there a `gh` … `pr` … `merge` WORD SEQUENCE in the token stream, allowing an ASSIGNMENT
+ * prefix on each word?
+ *
+ * The third fail-closed fallback, for the spellings where the verb is present but glued to an
+ * assignment so no token equals `gh`: measured `X='gh pr merge 999 --admin'; sh -c "$X"` produces
+ * the token `X=gh`, and `CMD+=gh CMD+=' ' CMD+=pr … CMD+=merge` produces one assignment per word
+ * — both were ALLOWED by the exact-word walk while the shell would run a real admin merge (a
+ * fail-open; the base refused them).
+ *
+ * Two orderings are OR-ed, and the reason is measured. At the group stage a CONSTRUCT is
+ * ambiguous: it can be the GROUP slot of an all-assembled invocation (`GH=gh; ${GH} ${P} $M 999
+ * --admin`) or a fresh COMMAND word (`GH=gh; g$'h' "pr" merge 999 --admin`, where the `GH=gh`
+ * assignment already opened the group stage). A single ordering loses one of the two — measured:
+ * group-first lost 88 real admin merges that `origin/main` refuses, command-first lost 128. Both
+ * orderings only ADD candidates, so OR-ing cannot widen the rule in a direction the other does
+ * not already reach.
+ */
+function mergeVerbSequenceInTokens(command: string): boolean {
+  return mergeVerbWalk(command, true) || mergeVerbWalk(command, false);
+}
+
+/**
+ * The walk. `groupFirst` decides which reading wins for a construct at the group stage.
+ *
+ * ⛔ THE WORD TESTS ARE WHAT BOUND IT, NOT DISTANCE. A construct only counts as a word if it is
+ * not a REDIRECTION (`2>/dev/null`, `> file`, `2>&1`, `<<<`), not a `-`-leading flag (read from the
+ * DEQUOTED word, so `$'--dry-run'` is a flag), and not shell punctuation. A heredoc writing
+ * `<!-- admin-merge-safety: ${head} -->` therefore has no reachable `gh`→group→verb triple: its
+ * `<`, `<<'EOF'` and `-->` tokens are all excluded, and what remains (`head}`) cannot complete a
+ * sequence — `origin/main` admits that heredoc, and the arms that refused it are the ones this PR
+ * narrows (measured, review cycles 4 and 5). An intermediate ADJACENCY bound was removed once
+ * these tests were in place: measured redundant on the whole corpus.
+ */
+function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
+  const scan = scanTokens(command);
+  // 0: looking for the command word, 1: for `pr`, 2: for `merge`.
+  let stage = 0;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const raw = scan.tokens[i];
+    const w = shellWord(raw);
+    const verbWord = withoutAssignmentPrefix(w);
+    // The command word is `gh`, OR a construct where a command word belongs (`g$'h'`, `$GH`,
+    // `X='gh pr merge 9'`, `CMD+=gh`). ⛔ OMITTING THE CONSTRUCT CASE WAS THE CYCLE-2 P0: bash
+    // resolves `g$'h' "pr" merge 999 --admin` to `gh pr merge 999 --admin`, and with only a
+    // literal `gh` accepted NO arm matched — the quoted `"pr"` is DATA to the data-aware count
+    // whenever the simple command's first word is not literally `gh`, the group-slot arm wants a
+    // construct in the GROUP, and this walk wanted the word `gh` in the COMMAND slot. Measured
+    // across 1 500 generated inputs: 244 real admin merges fell through that one combination.
+    // NOT position-gated, deliberately: `timeout 5 g$'h' "pr" merge …` and `sudo $GH "pr" merge
+    // …` put the command word behind a WRAPPER's arguments, which the position model does not
+    // resolve, and requiring command position there re-opened the same hole one wrapper deeper
+    // (measured). A bare `$` is excluded, so `${RAIL}` (which tokenizes to `$` + `RAIL}`) cannot
+    // be read as a command word.
+    // A LEADING DASH MEANS A FLAG, NOT A WORD -- and it has to be read from the DEQUOTED word:
+    // `$'--dry-run'` does not start with `-` as a RAW token, but bash hands gh a flag, so reading
+    // the raw text only made `$PYTHON $SCRIPT $'--dry-run'` a three-construct "merge" (measured).
+    // ⛔ A REDIRECTION IS NOT A VERB EITHER (review cycle 5, P1). `CONSTRUCT` lists `<`/`>` among
+    // the shell metacharacters, so `2>/dev/null`, `>/tmp/out`, `2>&1` and `<<<` all qualified as
+    // construct words -- and an adjacent construct at the verb stage returned true, so appending
+    // ONE redirect to a read-only command made it a candidate:
+    // `bash $AIR/scripts/verify-admin-merge-evidence.sh "$PR" 2>/dev/null` and
+    // `jq --arg admin "$X" "$F" > /tmp/out` are refused at the cycle-4 head and admitted at
+    // origin/main (measured) -- the cycle-3 over-block, re-opened one token over.
+    const isConstructWord =
+      CONSTRUCT.test(raw) &&
+      w !== "" &&
+      !w.startsWith("-") &&
+      !raw.startsWith("-") &&
+      !/^\d*[<>]/.test(raw) &&
+      !/^&>>?/.test(raw) &&
+      !/^[|&;()]+$/.test(raw);
+    const isCommandWord = /\bgh\b/.test(w) || isConstructWord;
+    if (stage === 2) {
+      if (verbWord === "merge") return true;
+      if (isConstructWord) return true;
+      // A pure-whitespace assignment (`CMD+=' '`) is a SEPARATOR being assembled, not a verb
+      // slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge` read as
+      // one invocation (measured as a real bypass).
+      if (verbWord.trim() === "") continue;
+      // A word in the verb slot that is not the verb restarts the walk (a command word here can
+      // begin a fresh sequence; anything else drops back to looking for one).
+      stage = isCommandWord ? 1 : 0;
+      continue;
+    }
+    if (stage === 1) {
+      if (verbWord === "pr" || (groupFirst && isConstructWord)) {
+        stage = 2;
+        continue;
+      }
+    }
+    if (isCommandWord) stage = 1;
+  }
+  return false;
+}
+
+/**
+ * Could an ANSI-C quote be encoding a SEPARATOR — i.e. is the token structure of this
+ * command not recoverable from the text?
+ *
+ * `sh -c gh$'\x20'pr$'\x20'merge$'\x20'999$'\x20'$V` is ONE whitespace-delimited token to
+ * any reader that does not decode `\x20`, and a real `gh pr merge 999 --admin` to bash. Three
+ * such spellings were measured as live bypasses of both layers when the surrounding rule
+ * narrowed (the `$'\x20'` family, agent-infra#1425/#1776). Where the separators are not
+ * recoverable, `mergeInvocationInText` falls back to the WORDS read — the same
+ * over-approximation the #3953 narrowing removed elsewhere, kept here because here the
+ * alternative is a fail-open, not a false block.
+ */
+function ansiCEncodesSeparator(command: string): boolean {
+  return /\$'[^']*\\(?:x[0-9a-fA-F]{2}|[0-7]{1,3}|u[0-9a-fA-F]{2,4}|U[0-9a-fA-F]{4,8}|[tnrvf])/.test(
+    command,
+  );
+}
+
+/**
+ * Does this command INVOKE a merge — the OPERATION, not the word? (agent-infra#3953)
+ *
+ * This is the candidate rule's argv-position read. The defect it closes is one line of
+ * `isAdminMergeCommand`'s old over-approximation, which answered "is this an admin
+ * merge?" with *"does the text contain the word `gh`, or the words `pr` AND `merge`?"*
+ * once a construct and the word `admin` were present. A read-only command that merely
+ * NAMES a merge therefore became a merge it had to certify:
+ *
+ *   gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins}'
+ *   cat > /tmp/x.mjs <<'EOF' … `gh api "…/check-runs?filter=all"` … probes['hasAdminMergeFlag'] …
+ *
+ * The `{}` / backticks supply the construct and `admin` supplies the word, so both were
+ * refused with "no resolvable PR number" — a block on the very `check-runs` read the
+ * fleet rules MANDATE for answering "is the tree healthy".
+ *
+ * The replacement asks for a merge VERB in argv POSITION, and nothing weaker:
+ *   - the verb spelled (or spliced) in the argument list the shell will run — the token walk
+ *     in `countMergeVerbs`, REUSED rather than re-implemented, because two predicates for
+ *     "is this a merge" is the failure this file keeps re-learning. That walk is DATA-AWARE,
+ *     so a verb inside plain quoted data (`echo 'gh pr merge 9'`) is not an invocation —
+ *     while a payload handed to `sh -c`/`eval`/`trap` stays readable and still counts;
+ *   - a `gh` whose GROUP slot is unreadable still counts (`V="pr merge"; gh $V 999 --admin`,
+ *     `gh --hostname … $X 999 --admin`), because there the verb is not in the text at all;
+ *   - a verb ASSEMBLED with assignments still counts (`CMD+=gh CMD+=pr CMD+=merge`,
+ *     `X='gh pr merge 999 --admin'; sh -c "$X"`), where no token IS the word `gh`, and so
+ *     does an assembled COMMAND word (`g$'h' "pr" merge 999 --admin`, `$GH "pr" merge …`);
+ *   - ANYTHING `mergeVerbInText` names is a merge here too. That read is the caller's own,
+ *     and it is quote-blind where this walk is data-aware, so it catches the construct in a
+ *     VERB position behind a merely-quoted group word — a measured fail-open for the arms
+ *     above (`M=merge; gh "pr" $M 999 --admin`, and the same inside `if`/`while`/`timeout`).
+ *     The invariant is one-directional and pinned: `mergeVerbInText(c)` ⇒ this is true;
+ *   - where the separators are ANSI-C escapes (`gh$'\x20'pr …`) the token structure is not
+ *     recoverable, so it falls back to the WORDS read — an over-block kept deliberately,
+ *     because the alternative there is a fail-open.
+ *
+ * WHAT IT DELIBERATELY NO LONGER COUNTS, and why that cannot merge anything: a construct
+ * plus the word `admin` in a command whose `gh` calls are all READABLE NON-MERGE calls
+ * (`gh api …`, `gh issue …`, `gh pr view …`). No `gh` subcommand other than `pr merge`
+ * merges a PR, so a command with no merge verb in argv position cannot perform one; the
+ * placeholder that used to stand in for that signal was the word `gh`, which is a
+ * property of the VOCABULARY rather than of the operation.
+ *
+ * NOT NARROWED HERE (declared, not overlooked):
+ *   - the LITERAL `--admin` arm stays exactly as wide as it was — a command carrying the
+ *     flag AND a readable `gh pr merge` keeps the text layer's decision
+ *     (`hasLiteralAdminFlag`);
+ *   - a `--json`/`--search` value that spells a WHITESPACE-SEPARATED, UNQUOTED `pr` then
+ *     `merge` word pair (`gh pr view 1 --json pr merge`, `gh issue list --search pr merge`)
+ *     is still read as a verb pair, because at that point the text is indistinguishable from
+ *     an invocation without an argv layer. That residual is an OVER-BLOCK — the direction this
+ *     gate is allowed to be wrong in — and it is strictly narrower than the "any `gh` word"
+ *     rule it replaces. ⛔ The QUOTED spelling is NOT affected and must not be cited as the
+ *     example: `gh pr view 1 --jq 'pr merge'` is DATA (measured — `--jq` is a value-position
+ *     flag, so the mask covers both words and this function answers false; review cycle 5, P2).
+ *     A single token that merely contains both words (`--jq .merge`, `--json pr,merge`,
+ *     `mergeStateStatus`, `hasAdminMergeFlag`) is likewise not a word pair and is admitted.
+ */
+export function mergeInvocationInText(command: string): boolean {
+  // Same two normalizations the caller's own reads use: the rail's basename is not a
+  // verb (`admin-merge.sh`), and a repo flag's value is not a verb (`gh -R pr merge 9`).
+  const bare = stripRepoArgs(withoutMandatedRailPath(command));
+  // The DATA-AWARE count, deliberately: an `sh -c`/`eval`/`trap` payload stays readable
+  // through the mask (that is what keeps a wrapped verb an invocation), while a verb inside
+  // plain quoted data is not COUNTED here. A data-insensitive count was measured to add no
+  // coverage — every payload spelling it catches is already readable — and only widened the
+  // rule onto `echo`.
+  // ⛔ One arm below is DELIBERATELY quote-blind, so this FUNCTION can still answer true for
+  // quoted data: `echo 'gh pr merge 9'` is not counted here (the count masks quoted data) but
+  // the SEQUENCE WALK (arm 3) reads the words anyway, so this function answers true. That is
+  // the fail-closed direction and it is accepted, not overlooked — a quoted MENTION of a merge
+  // costs, at most, a resolvable PR number, while a missed INVOCATION costs the bypass. It is
+  // NOT simply "a candidate at origin/main": with no CONSTRUCT in the text the caller takes its
+  // readable-text branch, which requires a BARE `gh` word (`hasBareGhWord`) and a quoted mention
+  // supplies none — so the end-to-end predicate stays false for a quote-only spelling (measured:
+  // `echo 'gh pr merge 9 --admin'` has `hasAdminMergeFlag` true and is still false at
+  // origin/main AND false here, while this function is true).
+  // What must never vary is the ARM you are reading: the count is data-aware, the sequence
+  // walk is quote-blind.
+  // The shared count, tied to two other reads. On its own it is too blunt to be the candidate
+  // rule: it walks constructs ANYWHERE, so a heredoc that WRITES this gate's own evidence marker
+  // (`cat > f <<'EOF'` ... `<!-- admin-merge-safety: ${head} -->` ... `EOF`) counts as one merge
+  // there (`countMergeVerbs` is 1, unchanged by this PR) while `origin/main` admits it. So the
+  // window only counts when the command ALSO carries a `gh` command word (`hasGhCommandWord`,
+  // NOT position-gated: a wrapper's arguments hide the position) AND the word `merge`
+  // (`MERGE_WORD`, so a hyphenated identifier does not count). Measured with this gate removed:
+  // that heredoc and the bare marker fragment became REFUSED read-only commands -- the exact
+  // class #3953 is about.
+  if (countMergeVerbs(bare) > 0 && hasGhCommandWord(bare) && MERGE_WORD.test(bare)) return true;
+  if (ghGroupIsUnreadable(bare)) return true;
+  if (mergeVerbSequenceInTokens(bare)) return true;
+  // ⛔ NO DIVERGENCE FROM THE OTHER MERGE-READ (review cycle 1, P0). `mergeVerbInText` is
+  // the read the CALLER's own condition uses (`hasLiteralAdminFlag || mergeVerbInText ||
+  // !readsNonMergeGhCall`), and it is quote-BLIND where this walk is data-aware: it
+  // recognises a construct sitting in a VERB position right after a bare `gh` or `pr` word.
+  // Measured fail-open without this arm — bash hands gh `pr merge 999 --admin`, the base
+  // refused it, and every arm above missed it because the GROUP word was merely QUOTED
+  // (`"pr"` is not a CONSTRUCT) and the verb was a variable:
+  //
+  //   M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin
+  //   if true; then gh "pr" m$'e'rge 99900010 --admin; fi
+  //   timeout 5 gh "pr" m$'e'rge 99900010 --admin
+  //
+  // `countMergeVerbs` skips the quoted `"pr"` as DATA whenever the simple command's first
+  // word is not `gh` (an assignment prefix, a reserved word, a wrapper), so the verb window
+  // never closes — while `mergeVerbInText` DOES name a merge for all of them. Two predicates
+  // for "is this a merge" disagreeing is the failure this file keeps re-learning, so the
+  // candidate rule is made a SUPERSET of that read rather than a second opinion beside it.
+  // SCOPED PRECISELY: the pinned invariant is `mergeVerbInText(c) ⇒ mergeInvocationInText(c)`.
+  // `isAdminMergeCommand` is a DIFFERENT (narrower) question — it also requires
+  // `hasAdminMergeFlag`, so `gh pr merge 999` (no flag anywhere) is a merge this rule sees and
+  // the ADMIN-merge gate does not, which is correct and is how the registry gate gets it.
+  if (mergeVerbInText(bare)) return true;
+  // The separators are not recoverable from the text, so the token arms above are not a
+  // read of this command: refuse on the WORDS read, which is what the pre-#3953 rule did.
+  if (ansiCEncodesSeparator(bare)) {
+    const probe = normalizeForFlagScan(bare);
+    return (
+      /(^|[^\w])gh\b/.test(probe) ||
+      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
+    );
+  }
+  return false;
+}
+
 /**
  * The ONE PR-URL shape this gate resolves (#1007):
  * `https://github.com/<owner>/<repo>/pull/<digits>`.
@@ -5498,6 +6778,102 @@ export const MICRO_BLOCK_MESSAGE = [
 ].join("\n");
 
 /**
+ * The tier the refusal names, in TIER_RULE's own vocabulary (#2204).
+ *
+ * `unknown` and "" are NOT tiers that were read — they are the two ways the tier can be
+ * ABSENT (`unknown` = the pre-flight ran on an unlabeled issue and wrote that literal;
+ * "" = no marker file at all). Both map to `unlabeled`, which is the vocabulary key for
+ * "nobody determined a tier", not a tier value of its own.
+ */
+function tierLabel(tier: string): string {
+  return tier === "" || tier === "unknown" ? "unlabeled" : tier;
+}
+
+/**
+ * Provenance of a tier label (#2204 (3)): `read` only when a tier marker actually NAMED a tier.
+ * `""` (no marker), `unknown` (the pre-flight's literal for an unlabeled issue) and `unlabeled` (the
+ * vocabulary's key for "no tier") are all UNDETERMINED — a marker containing the word `unlabeled`
+ * records that nobody determined a tier, and reading it as `read` would present the absence of a
+ * tier as a tier of its own, which is the defect #2204 (3) named (cycle-2 review, P2).
+ */
+export function tierSourceFor(tier: string): "read" | "undetermined" {
+  return tier === "" || tier === "unknown" || tier === "unlabeled" ? "undetermined" : "read";
+}
+
+/**
+ * #2204 (3) — "`tier: unlabeled` must not read as the strictest tier": the refusal must
+ * NAME the tier that triggered it, and say what `unlabeled` MEANS.
+ *
+ * The pre-#2204 messages named no tier at all, and the audit `tier` alone cannot say whether a tier
+ * was DETERMINED: `unlabeled` is written when no marker exists and `unknown` is the pre-flight's
+ * literal for an unlabeled issue, so a reader had to know the vocabulary to tell either from a real
+ * tier — and the log made "stricter rules apply" look intentional. (That is what `tier_source` on
+ * the audit entry answers directly; this message says it in words.)
+ *
+ * The message also carries the two halves of #2204 (2) — the refusal is NOT terminal, and a
+ * read has a shape that does not need a reviewer at all. Neither line is decoration: the
+ * measured failure was four lanes that took the refusal as the end of the run, and the
+ * measured trigger was a command SHAPE (a loop, a `$(…)`) rather than a write.
+ *
+ * ⛔ THE RECOVERY ADVICE IS ROLE-AWARE. `role` is `reviewerRoleFor()`'s answer (#2148's split), and
+ * it exists because this text now arrives as a MODEL-VISIBLE message that TRIGGERS A TURN
+ * (`deliverBlockRecovery`), not only as a tool result. Telling a harness worker (whose brief says it
+ * has no `task` tool and must not merge) to dispatch a reviewer is the exact contradiction #2148
+ * removed for the pre-flight notice — and a `followUp` that forces a turn makes it worse, because the
+ * lane is now being told to do something it cannot do. The roles that do not dispatch get the
+ * direct instruction they can act on (push/report), plus the same "your brief overrides this" hedge.
+ */
+export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"): string {
+  const base = tier === "micro" ? MICRO_BLOCK_MESSAGE : BLOCK_MESSAGE;
+  const label = tierLabel(tier);
+  const provenance =
+    tier === ""
+      ? "no tier marker was present (/tmp/agent-issue-complexity), so the tier was NEVER DETERMINED — " +
+        "`unlabeled` here means NOBODY READ A TIER, not that a stricter tier was read. The ≥1-dispatch " +
+        "floor is uniform (#485), so the same dispatch satisfies it at every tier."
+      : tier === "unknown" || tier === "unlabeled"
+        ? `the recorded value was \`${tier === "unknown" ? "unknown" : "unlabeled"}\`, which is what the ` +
+          "pre-flight writes when the issue carried no complexity label. That is an UNDETERMINED tier, " +
+          "not a stricter one: the ≥1-dispatch floor is uniform (#485), so the same dispatch satisfies " +
+          "it at every tier."
+        : "read from the tier marker (/tmp/agent-issue-complexity); this extension can see the " +
+          "marker's CONTENT, not who wrote it.";
+  const recovery =
+    role === "reviewer"
+      ? [
+          "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran. You are the REVIEWER: you do not dispatch,",
+          "     push, record or merge — report the refused command to merge-one.sh and continue reporting.",
+        ]
+      : role === "harness"
+        ? [
+            "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran and the session is still alive: push your",
+            "     FINAL head and finish the report — the HARNESS reviewer (merge-one.sh) mints the",
+            "     attestation for this PR, so do NOT dispatch and do NOT merge (#825).",
+            "   → If your brief says you DO have a `task` tool and own the review, dispatch a reviewer and",
+            "     re-run the SAME command instead.",
+          ]
+        : [
+            "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran and the session is still alive: dispatch a reviewer",
+            "     (the `task` or `subagent` tool), then re-run the SAME command. Do not end the run on a block.",
+            "   → If your brief says you have no `task` tool, that overrides this: do NOT dispatch and do NOT",
+            "     merge — the parent's reviewer mints the attestation.",
+          ];
+  return [
+    base,
+    `   → Tier: ${label} — ${provenance}`,
+    ...recovery,
+    "   → If the command only READS (gh pr view / gh api / gh issue view), it should not have needed a",
+    "     reviewer at all (#2204). Run the read as a plain standalone command on its own line —",
+    "     `gh pr view <n>`, `gh api <GET path>`, `gh issue view <n>` — and it is allowed with ZERO",
+    "     dispatches. A refusal means the text could not be certified as a read: a loop or a `$(…)`",
+    "     that could hide a program, a path-spelled `gh`, a read bundled with a write, a `git` word",
+    "     ANYWHERE in the command (put the git command on its own line — it needs no reviewer there,",
+    "     but a git mention is never certified as a read), or a pipeline stage that can run a program",
+    "     or write a file (`| bash`, `| env -i bash`, `| xargs -n1 sh`, `| sed '1e …'`, `| sort -o f`).",
+  ].join("\n");
+}
+
+/**
  * #2665 — the CAPACITY refusal: a DISTINCT block message, not an extra sentence on the
  * compliance one.
  *
@@ -5525,6 +6901,20 @@ export function unspawnableMessage(
     `⛔ Blocked — a \`task\`/\`subagent\` spawn produced NO verdict; 0 reviewer verdicts counted`,
     `   (${spawnFaultLabel(spawnFaultClass(attempts))}, not a compliance one).`,
     ...describeSpawnCapacity(attempts, readMachineCapacity(), total),
+    // #2204 (2) + #2206 review (P2): this arm IS a refusal, and the docs (and the comment beside
+    // the return) promise a refusal says it is not terminal. Only `terminate: false` was stated —
+    // a field the MODEL never sees — while this text asked for a RETRY with nothing telling the
+    // model the run continues, which is the measured failure #2204 (2) exists to fix.
+    //
+    // ⛔ IT DEFERS TO THE ACTION PARAGRAPH, IT DOES NOT NAME A RETRY (#2206 re-review, P1). The
+    // first cut said "re-dispatch the reviewer (the RETRY above)" UNCONDITIONALLY, and
+    // `describeSpawnCapacity` has five remedy branches: at the CAP it says "stop retrying … hand the
+    // lane back", and on the latch "do NOT retry in a loop" — so the last line the model read
+    // instructed the very retry the paragraph above forbade, and cited a RETRY that does not exist
+    // at the cap. The ACTION paragraph is the last one emitted in EVERY branch and is the remedy
+    // for the fault actually read, so it is what this line points at.
+    "   → THIS BLOCK IS NOT TERMINAL: the run continues. Do not end the session on it —",
+    "     the ACTION paragraph above is the remedy for THIS fault; follow it, then keep going.",
     "   → THE REQUIREMENT IS UNCHANGED: a reviewer verdict is still mandatory before this git op",
     `     (${SPAWN_UNSPAWNABLE_TOKEN} is what the BOX did, not a waiver). The rail will also demand`,
     `     the attestation at the FINAL head — ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
@@ -5537,7 +6927,6 @@ export function unspawnableMessage(
  * (`spawnAttemptsTotal`) so the refusal never understates how many were made.
  */
 export const SPAWN_ATTEMPT_KEEP = 10;
-
 // #485: uniform ≥1-dispatch policy declaration — every tier blocks at 0
 // dispatches. Declarative: consumed by the drift-pin test (fence ↔ export
 // compare in index.test.ts T2) only — the block decision is uniform, so no
@@ -5577,6 +6966,13 @@ export default function (pi: ExtensionAPI) {
     // on every push. Both reset per session, so a resumed session is told again.
     let preflightInjected = false;
     let earlyPushNoticePrinted = false;
+    // #2204 (2) — "a refusal must be survivable". The measured failure was a lane that took the
+    // refusal as the end of the run: the block reason IS the tool result, but a `pi -p` lane that
+    // has nothing else to do simply stops. This flag makes the refusal DELIVER a model-visible
+    // recovery message once per session (see `deliverBlockRecovery` below). ONCE is the bound and
+    // the reason it is safe: a per-block message would turn a lane that keeps retrying a refused
+    // command into a token loop, and the recovery instruction does not get truer by repetition.
+    let blockRecoverySent = false;
     // #2148 — the audience, resolved per FACTORY INSTANCE (a session's `KIND` is exported by its
     // launcher and never changes mid-session). See `reviewerRoleFor`.
     const reviewerRole = reviewerRoleFor();
@@ -5589,6 +6985,7 @@ export default function (pi: ExtensionAPI) {
       countedCollectRuns.clear();
       preflightInjected = false;
       earlyPushNoticePrinted = false;
+      blockRecoverySent = false;
 
       // Warn about env vars that never reach Node.js from bash export
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
@@ -5696,6 +7093,7 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_shutdown", async (_event, _ctx) => {
       dispatchCount = 0;
       countedCollectRuns.clear();
+      blockRecoverySent = false;
       // Clear marker file to prevent persistent state leakage across sessions
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
@@ -5704,6 +7102,66 @@ export default function (pi: ExtensionAPI) {
         }
       } catch (_err) { /* best-effort cleanup */ }
     });
+
+    // ── #2204 (2): the refusal as a SURVIVABLE event ─────────────────────
+    //
+    // The block itself is a tool result — the model does read it. What the measurement shows is
+    // that a lane with nothing left to do treats it as the END of the run (four dispatches, three
+    // cells, zero output). A tool result cannot re-open a turn that is already finishing, so the
+    // recovery instruction is ALSO delivered on the model-visible channel with `deliverAs:
+    // "followUp"` + `triggerTurn: true`: "followUp" is defined as "delivered only when the agent
+    // has no more tool calls", which is exactly the moment the run would otherwise stop, and
+    // `triggerTurn` gives that moment a next turn.
+    //
+    // ONCE PER SESSION, deliberately: an unconditional message on every block would let a lane that
+    // keeps retrying a refused command buy unbounded turns. One recovery is enough to say "this is
+    // not terminal"; saying it twice is a loop. Guarded on `sendMessage` existing, so a host (or a
+    // test double) without it cannot turn a refusal into a thrown exception on the gate path.
+    //
+    // ⛔ THE BUDGET IS SPENT BY A HAND-OFF, NOT BY AN ATTEMPT (fresh review, P2). The first version
+    // set the flag before trying, so on a host without `sendMessage` (or one that threw) the session
+    // lost its one recovery with nothing handed over AND the audit recorded
+    // `phase: block_recovery` as if the model had been told. The flag is now set only when the send
+    // path RAN — and the audit field is `send_queued`, not `delivered`: `ExtensionAPI.sendMessage`
+    // returns `void` and the runtime is fire-and-forget with a swallowing error hook, so the most an
+    // extension can observe is "handed to the SDK". A field called `delivered` would be a claim this
+    // code cannot make (cycle-2 review, P2).
+    //
+    // The AUDIENCE comes from `reviewerRoleFor()` (#2148's split) — see `dispatchFloorMessage`: this
+    // text now TRIGGERS A TURN, so telling a harness worker to dispatch a reviewer would be the
+    // #2148 contradiction with a keystroke attached.
+    // ⛔ `message` IS A PARAMETER, NOT ALWAYS THE COMPLIANCE TEXT (#2206 re-review, P1). The
+    // capacity arm's diagnosis is "the BOX failed, re-running the blocked op cannot satisfy this
+    // floor" — and dropping `dispatchFloorMessage` on it delivered `❌ No reviewers were dispatched
+    // … Dispatch reviewers via task sub-agents, then retry the git operation`, i.e. the exact
+    // wrong action #2665's own note above says printing BLOCK_MESSAGE on that arm produces. It
+    // arrives as a `followUp` that TRIGGERS A TURN, so it is the instruction the model acts on.
+    // The floor arm keeps the default; the capacity arm passes its own `unspawnableMessage`.
+    const deliverBlockRecovery = (tier: string, rawCommand: string, message?: string): void => {
+      if (blockRecoverySent) return;
+      const body = message ?? dispatchFloorMessage(tier, reviewerRole);
+      let sendQueued = false;
+      if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
+        try {
+          (pi as any).sendMessage(
+            { customType: "reviewer-block-recovery", content: body, display: true },
+            { deliverAs: "followUp", triggerTurn: true }
+          );
+          sendQueued = true;
+          blockRecoverySent = true;
+        } catch (_err) { /* delivery must never throw into the gate path */ }
+      }
+      logGateEvent("reviewer_preflight", {
+        phase: "block_recovery",
+        tier: tier === "" ? "unlabeled" : tier,
+        tier_source: tierSourceFor(tier),
+        send_queued: sendQueued,
+        // #1382: the audit row records the command the CALLER wrote. This helper receives the
+        // masked READING for none of its own logic — `rawCommand` is the only thing it audits —
+        // so it must be handed the caller's text, not the heredoc-masked rewrite.
+        command: auditCommand(rawCommand),
+      });
+    };
 
     // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
     pi.on("tool_call", async (event, toolCtx) => {
@@ -6089,12 +7547,43 @@ export default function (pi: ExtensionAPI) {
       // (03-code-review.md), so its remediation differs from BLOCK_MESSAGE.
       // Pinned by index.test.ts (behavioral T1/T1b + fence drift T2 + source
       // shape T3). The #285 task-sub-agent early return above is untouched.
+      // Read ONCE, above the #2204 read escape, so the pass entry and the block entry cannot
+      // disagree about the same command's tier.
       let tier = "";
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
           tier = fs.readFileSync(ISSUE_COMPLEXITY_FILE, "utf8").trim().toLowerCase();
         }
       } catch (_err) { /* best-effort */ }
+
+      // #2204: A READ IS NOT A WRITE — and the floor must not refuse one.
+      //
+      // MEASURED: `for n in …; do gh pr view $n … done` and `sha=$(gh api repos/…)` were
+      // both refused with `no_reviewers_dispatch`, and four lanes ended on it without doing
+      // any work. Neither is a write. The candidate came from `isGitOp`'s broad arms (a
+      // construct plus `gh`+`pr` is enough), so the floor has to ask its OWN question —
+      // "is this text positively a read?" — and stand down when the answer is yes.
+      //
+      // ⛔ PLACEMENT IS PART OF THE FIX. This sits AFTER the admin-merge and merge-registry
+      // gates (a command that names a merge is decided there, with the evidence checks) and
+      // AFTER the ≥1-dispatch / task-sub-agent early return above (a dispatched session is
+      // unaffected). It is the ONLY relaxation, and `readsOnlyGhRead` fails closed on every
+      // unreadable shape — so `git commit`/`git push` at zero dispatches still block here,
+      // which is what the #2204 tests and #485 T1/T1b pin.
+      if (readsOnlyGhRead(command)) {
+        console.log(
+          "[review-enforcer] ✅ Read-only command — the ≥1-dispatch floor covers writes, not reads (#2204)"
+        );
+        logGateEvent("gate_pass", {
+          reason: "read_only_no_dispatch",
+          tier: tier === "" ? "unlabeled" : tier,
+          tier_source: tierSourceFor(tier),
+          // #1382: the audit row records the command the CALLER wrote, not the masked reading.
+          command: auditCommand(rawCommand),
+        });
+        return undefined;
+      }
+
       // #516: BOTH block returns below must emit a durable audit entry — the
       // pre-#516 dispatch-count block wrote console only (no appendJsonl),
       // unlike the merge-registry gate's logMergeGateDecision trail, so
@@ -6104,6 +7593,13 @@ export default function (pi: ExtensionAPI) {
       // unlabeled; marker-absent maps to "unlabeled") so the tier of every
       // blocked op — the docs-only micro class (#485) included — is
       // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
+      //
+      // #2204 (3): the tier vocabulary is unchanged (T1b pins it), but the entry now carries
+      // `tier_source`, because `tier: unlabeled` could not be told apart from a REAL tier: it
+      // was written both for "no marker" and for the pre-flight's literal `unknown`. A reader
+      // of the JSONL can now see that no tier was determined — and the operator-facing message
+      // says the same thing in words.
+      const tierClassification = tierSourceFor(tier);
       if (tier === "micro") {
         // #2665: CAPACITY first — the fault is upstream of the tier, so the micro remediation
         // (which is about WHICH reviewer to dispatch) would misdirect here.
@@ -6123,7 +7619,21 @@ export default function (pi: ExtensionAPI) {
             // gates use, and masking blanks proven DATA — recording it would erase evidence.
             command: auditCommand(rawCommand),
           });
-          return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
+          // #2204 (2): stated EXPLICITLY on the capacity arm too. Its own text asks for a RETRY
+          // (`describeSpawnCapacity`), so a refusal the model reads as the end of the run would
+          // contradict the remedy it was just handed — the exact measured failure #2204 (2) fixes.
+          // The value is the SDK default, so nothing changes at runtime; stating it is what stops a
+          // future edit from reaching for `terminate: true` to "make the refusal stick".
+          //
+          // ⛔ AND THE MODEL-VISIBLE HALF, ON BOTH CAPACITY EMITTERS (#2206 re-review, P2): the
+          // first fix added this call to the non-micro branch only, so a `pi -p` micro lane still
+          // got a tool result and nothing that re-opens the turn — the exact #2204 (2) failure.
+          deliverBlockRecovery("micro", rawCommand, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
+          return {
+            block: true,
+            reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+            terminate: false,
+          };
         }
         const floor = describeDispatchFloorRead(command, "micro", dispatchCount);
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
@@ -6134,11 +7644,13 @@ export default function (pi: ExtensionAPI) {
           // #2349: WHAT the floor read about the registry, so the fleet can count
           // "no record on this box" refusals instead of hand-measuring them.
           record_state: floor.recordState,
+          tier_source: "read",
           // #1382: the audit row records the command the CALLER wrote. `command` is the
           // heredoc-masked READING used by the gates; masking is never a rewrite of the record.
           command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
         }); // #516: durable audit
-        return { block: true, reason: MICRO_BLOCK_MESSAGE };
+        deliverBlockRecovery(tier, rawCommand);
+        return { block: true, reason: dispatchFloorMessage("micro", reviewerRole), terminate: false };
       }
 
       // #2665: the lane that TRIED and could not get a verdict is a different state from the
@@ -6157,7 +7669,18 @@ export default function (pi: ExtensionAPI) {
           spawn_outcomes: spawnAttempts.map((a) => a.outcome),
           command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
         });
-        return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
+        // #2204 (2): non-terminating, like the floor return below — see the note on the micro arm.
+        // AND the model-visible half: `unspawnableMessage` now states it, and the recovery is
+        // delivered here too (#2206 review, P2 — the arm stated `terminate: false` and nothing the
+        // model reads, so a lane on the one arm #2204 calls "the refusal the model reads as the end
+        // of the run" still read it that way). The message is THIS arm's, not the compliance text
+        // (#2206 re-review, P1).
+        deliverBlockRecovery(tier, rawCommand, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
+        return {
+          block: true,
+          reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+          terminate: false,
+        };
       }
 
       const floor = describeDispatchFloorRead(command, tier, dispatchCount);
@@ -6167,10 +7690,17 @@ export default function (pi: ExtensionAPI) {
         reason: "no_reviewers_dispatch",
         tier: tier === "" ? "unlabeled" : tier,
         record_state: floor.recordState, // #2349
+        tier_source: tierClassification,
         // #1382: audit the caller's command, not the masked reading (see the micro arm above).
         command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
       }); // #516: durable audit
-      return { block: true, reason: BLOCK_MESSAGE };
+      deliverBlockRecovery(tier, rawCommand);
+      // `terminate: false` is EXPLICIT (#2204 (2)). The SDK contract is "the agent stops early only
+      // when every finalized result in the batch is terminating", so a refusal that leaves this
+      // unset is already non-terminating — stating it is what stops a future edit from reaching for
+      // `terminate: true` to "make the refusal stick". The measured failure was the MODEL treating
+      // the block as terminal; `deliverBlockRecovery` is the model-visible half of that fix.
+      return { block: true, reason: dispatchFloorMessage(tier, reviewerRole), terminate: false };
     });
 
     // ── tool_result: count sub-agent dispatches ────

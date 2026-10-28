@@ -29,8 +29,8 @@ PASS=0; FAIL=0
 ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 eq()  { [ "$1" = "$2" ] && ok "$3" || bad "$3 (got '$1', want '$2')"; }
-has() { printf '%s' "$1" | grep -qF -- "$2" && ok "$3" || bad "$3 (missing '$2')"; }
-no()  { printf '%s' "$1" | grep -qF -- "$2" && bad "$3 (FOUND '$2')" || ok "$3"; }
+has() { grep -qF -- "$2" <<<"$1" && ok "$3" || bad "$3 (missing '$2')"; }
+no()  { grep -qF -- "$2" <<<"$1" && bad "$3 (FOUND '$2')" || ok "$3"; }
 
 # ── the fake `gh`: one binary, both surfaces (api + run view) ────────────────────────────────────
 cat > "$TMP/bin/gh" <<'GH'
@@ -38,6 +38,10 @@ cat > "$TMP/bin/gh" <<'GH'
 F="${PS_FIX:?}"
 case "${1:-}" in
   api)
+    # ⛔ EVERY PATH THIS STUB IS ASKED FOR IS RECORDED (#2927). The repair pass must not read the CI
+    # queue at all, and "no skip line was printed" is not evidence of that — a gate that reads and then
+    # ignores the answer looks identical in the output. This file is the measurement.
+    printf '%s\n' "$*" >> "$F/gh-calls" 2>/dev/null
     shift
     [ "${1:-}" = "--paginate" ] && shift
     [ "${1:-}" = "--allow-escape-sequences" ] && shift
@@ -57,6 +61,12 @@ case "${1:-}" in
         jid="$(printf '%s' "$ep" | sed -n 's#.*/actions/jobs/\([0-9][0-9]*\)/logs.*#\1#p')"
         [ -f "$FIX/joblog-$jid.txt" ] && { cat "$FIX/joblog-$jid.txt"; exit 0; }
         exit 1 ;;
+      *"/actions/runs?status=in_progress"*)
+        # Answered for the arm that drives the SHIPPED `ci-queue.sh` (#2927): a queue whose in-progress
+        # count is unanswerable reads as an unreadable queue, which would make that arm pass for the
+        # wrong reason.
+        printf '{"total_count": %s, "workflow_runs": []}\n' "$(cat "$F/running" 2>/dev/null || echo 0)"
+        exit 0 ;;
       *"/actions/runs?status=queued"*)
         if [ -f "$F/queued-seq" ]; then
           n="$(head -1 "$F/queued-seq" 2>/dev/null)"
@@ -66,7 +76,7 @@ case "${1:-}" in
         fi
         printf '{"total_count": %s, "workflow_runs": []}\n' "$(cat "$F/queued" 2>/dev/null || echo 0)"
         exit 0 ;;
-      *"/actions/runners")
+      *"/actions/runners"*)
         n="$(cat "$F/runners" 2>/dev/null || echo 5)"
         printf '{"total_count": %s, "runners": [' "$n"
         i=1; while [ "$i" -le "$n" ]; do
@@ -98,6 +108,12 @@ chmod +x "$TMP/bin/gh"
 
 # ── the stubs the module falls back to (no wt_*, no claim registry in a unit test) ──────────────
 cat > "$TMP/stubs.sh" <<'ST'
+# ⛔ THE ROUTER IS PINNED ABSENT FOR THIS SUITE (agent-infra #2866). `ps_decide` consults the PR state
+# router before it spends a fixer, and that consult would otherwise resolve the REAL module from this
+# checkout and reach GitHub through the suite's stub gh — a hermetic suite that silently depends on
+# the box's tree. The router's own behaviour is pinned in tools/fleet/pr_state.test.py, and the
+# seam's demotions in tests/pr-state-wiring/run.sh; here it must simply not run.
+PR_STATE_BIN="$TMP/no-router-in-this-suite"; export PR_STATE_BIN
 ps_spawn_stub() { printf '%s\n' "$1" >> "$TMP/spawns.log"; return 0; }
 ps_alive_stub() { [ -f "$FLAGS/alive-$1" ]; }
 ps_claim_stub() {
@@ -240,32 +256,54 @@ out="$(run_pass "$MOD")"; rc=$?
 has "$out" "[prsick] ENUMERATION FAILED" "a failed LISTING is named"
 eq "$rc" "2" "and the pass reports rc=2 (not a silent success)"
 
-echo "══ (e) queue above threshold ⇒ deferral with the charged line; once drained the item appears"
+echo "══ (e) REPAIR is never deferred on CI queue depth — the MEASURED 2026-10-27 fixture (#2927)"
+# ⛔ THE LIVE NUMBERS, AND BOTH ARMS USE THEM. Measured on cell 4: `queued=33 running=2`, an 8-runner
+# self-hosted fleet all online and idle, 3 of `MAX_LANES=20` lanes in use, and one RED PR needing a
+# fixer. The pass printed `skip #77: backpressure(q=33,r=2)` and dispatched nothing — 41 times in one
+# window — because a number about GitHub-HOSTED concurrency was pricing PR-REPAIR work, which adds no
+# new CI run at all. The arm below must DISPATCH; the arm after it must still DEFER for NEW-PR
+# production, which is the class the gate belongs to. Same file, same feed, same numbers.
 reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
-echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"       # ceiling = ceil(5*20/10) = 10 < 100
+echo 33 > "$FIX/queued"; echo 2 > "$FIX/running"; echo 8 > "$FIX/runners"
 out="$(run_pass)"
-has "$out" "skip #77: backpressure(q=100,r=5)" "the charged deferral line, in the required shape"
-no "$out" " -> dispatch" "nothing dispatched while the queue is deep"
-eq "$(spawns)" "0" "no spawn"
-has "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null)" "77" "the deferred item KEEPS ITS PLACE on disk"
-echo 0 > "$FIX/queued"
-out="$(run_pass)"
-has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "once drained, the deferred item is dispatched"
-eq "$(spawns)" "1" "exactly once (deferred-first + enumeration did not double it)"
-eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "0" "and its deferral row is cleared"
-# ⛔ ps_decide's OWN gate, driven DIRECTLY (VGATE found it printing `q=? r=?` because its copy of the
-# backpressure arm read a field it never assigned; the pass-level gate above is a different copy and
-# the assertions so far could not see it). A direct call must name the MEASURED numbers.
-reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
-echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
-out="$( . "$MOD"; . "$TMP/stubs.sh"; PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" \
-        ps_decide "$OR" 77 "$sha_red" fix/sick-77 )"
-has "$out" "skip #77: backpressure(q=100,r=5)" "ps_decide's own gate names the measured queue (not q=? r=?)"
-no "$out" "q=?" "no unassigned field reaches the line"
-eq "$(spawns)" "0" "and it dispatched nothing"
-echo 0 > "$FIX/queued"
+has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" \
+  "(e1) ARMS: queued=33 running=2 fleet=8 lanes=3/20 + a repair item pending => the repair DISPATCHES"
+eq "$(spawns)" "1" "(e2) exactly one spawn — the deep queue withheld nothing"
+no "$out" "backpressure" "(e3) and nothing in the pass prints a queue deferral"
+# ⛔ NOT A CLAIM ABOUT A STUB: the pass must not even ASK. The stub records every API path it answers,
+# so "the repair pass reads no queue depth" is measured rather than inferred from a missing skip line.
+no "$(cat "$FIX/gh-calls" 2>/dev/null)" "status=queued" "(e4) the repair pass never reads the CI queue (no queued endpoint was asked)"
+no "$(cat "$FIX/gh-calls" 2>/dev/null)" "actions/runners" "(e4b) …and never asks for the runner fleet either"
 
-echo "══ (f) MUTATION — delete the polarity function ⇒ (c) and (d) must FAIL"
+# ⛔ THE OTHER ARM, ON THE REAL MODULE WITH THE SAME FEED. Only NEW-PR production (and merges) add a CI
+# run, so only they are queue-gated. This drives the SHIPPED `ci-queue.sh` — sourced from this
+# checkout, not re-implemented — against the same stub `gh`, so the two arms cannot drift apart.
+ciq_run() { # -> "<token> rc=<n>" from the shipped module, over the suite's own stub feed
+  ( . "$HERE/ci-queue.sh"
+    PS_FIX="$FIX"; CIQ_GH="$TMP/bin/gh"; CIQ_STATE_DIR="$TMP/ciq"; CIQ_TTL=0; CIQ_STALE_MAX=900
+    export PS_FIX CIQ_GH CIQ_STATE_DIR CIQ_TTL CIQ_STALE_MAX
+    mkdir -p "$TMP/ciq"
+    ciq_verdict "$OR"; printf ' rc=%s' "$?" ) 2>/dev/null
+}
+tok="$(ciq_run)"
+case "$tok" in *"queued=33"*) ok "(e5) NEW-PR arm: the same queue IS read (queued=33)" ;; *) bad "(e5) NEW-PR arm: the queue was not read (got: ${tok:-<empty>})" ;; esac
+case "$tok" in *"runners=8"*) ok "(e6) …and the FLEET is the reading it uses (runners=8, not running=2)" ;; *) bad "(e6) …the runner count is not the fleet (got: ${tok:-<empty>})" ;; esac
+case "$tok" in *"deep("*"rc=0"*) ok "(e7) …and NEW-PR production is STILL DEFERRED on it (deep(…) rc=0) — the exception is repair, not the queue" ;; *) bad "(e7) NEW-PR production was not deferred on a deep queue (got: ${tok:-<empty>})" ;; esac
+case "$tok" in *"ceiling=16"*) ok "(e8) …with the ceiling derived from the FLEET: ceil(8*20/10)=16 < 33" ;; *) bad "(e8) the ceiling is not fleet-derived (got: ${tok:-<empty>})" ;; esac
+
+# ⛔ THE DEFERRAL LEDGER STILL WORKS — the reason left to defer is the caller's LANE allowance, which
+# is real capacity rather than a queue about somebody else's runners. A re-deferred row must not grow.
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+run_pass --max-spawn 0 >/dev/null; run_pass --max-spawn 0 >/dev/null
+eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "1" \
+  "(e9) a PR deferred by the LANE allowance keeps ONE row across passes (no unbounded growth)"
+out="$(run_pass)"
+has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "(e10) …and dispatches as soon as the allowance exists"
+eq "$(spawns)" "1" "(e11) exactly once (deferred-first + enumeration did not double it)"
+eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "0" "(e12) and its deferral row is cleared"
+
+
+echo "══ (f) MUTATION — restore the OLD predicate (ceiling from in-progress jobs, applied to repair)"
 # the mutation is applied to a COPY of the shipped module; nothing in-tree is touched
 python3 - "$MOD" "$TMP/mut-nopolarity.sh" <<'PY'
 import re, sys
@@ -284,6 +322,61 @@ c_token="$(token_of "$TMP/mut-nopolarity.sh" "$sha_wait" | cut -f1)"
 tok="$(pol_of "$TMP/mut-nopolarity.sh" "$TMP/rows-empty" 2>/dev/null)"
 [ "$tok" = "NOREAD" ] && bad "(d) still passes on the polarity-deleted mutant (got NOREAD)" \
                       || ok "(d) FAILS on the mutant: the classifier is gone (got '${tok:-<empty>}')"
+
+
+# ⛔ THE #2927 MUTANT: THE OLD PREDICATE, PUT BACK. `ceiling = ceil(in_progress*20/10)` — derived from
+# the jobs EXECUTING, i.e. demand standing in for supply — applied to a REPAIR dispatch. It is
+# self-contained (it reads the two counts and applies the old arithmetic) because the deleted
+# `ps_queue_verdict` no longer exists to call. On the arm-(e1) feed (queued=33, running=2, fleet=8) it
+# derives ceiling 4 and defers — which is exactly what the live cell did 41 times.
+cat > "$TMP/oldpred.inc" <<'INC'
+  # MUTATED (#2927 review): the OLD predicate — a ceiling derived from the IN-PROGRESS JOB COUNT,
+  # applied to REPAIR work. Restored deliberately, to prove arm (e1) is not always-green.
+  local _mq _mr
+  _mq="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+  _mr="$(ps_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+  if ps_is_num "${_mq:-}" && ps_is_num "${_mr:-}" && [ "${_mr:-0}" -ge 1 ] \
+     && [ "${_mq:-0}" -gt "$(( (_mr * 20 + 9) / 10 ))" ]; then
+    ps_defer_append "$repo" "$pr" "$sha" "$group"
+    printf 'skip #%s: backpressure(q=%s,r=%s)\n' "$pr" "$_mq" "$_mr"
+    return 1
+  fi
+INC
+if [ ! -s "$TMP/oldpred.inc" ]; then
+  bad "(f9) the injection body was not written — the mutation arm would prove nothing"
+else
+  python3 - "$MOD" "$TMP/mut-oldpredicate.sh" "$TMP/oldpred.inc" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+inc = open(sys.argv[3]).read()
+anchor = "  # \u2500\u2500 THE ROUTER'S ROW: IS A FIXER WHAT THIS HEAD NEEDS?"
+assert anchor in src, "the injection anchor is gone — this mutation would silently no-op"
+open(sys.argv[2], "w").write(src.replace(anchor, inc + "\n" + anchor, 1))
+print("injected")
+PY
+fi
+if [ ! -f "$TMP/mut-oldpredicate.sh" ]; then
+  bad "(f9b) the old-predicate mutant was not produced — the mutation arm would prove nothing"
+elif cmp -s "$MOD" "$TMP/mut-oldpredicate.sh"; then
+  bad "(f9b) the old-predicate mutation did not apply (byte-identical mutant)"
+elif ! bash -n "$TMP/mut-oldpredicate.sh" 2>/dev/null; then
+  bad "(f9b) the old-predicate mutant does not parse — a broken mutant proves nothing"
+else
+  ok "(f9b) the old-predicate mutant was produced and parses"
+  # CONTROL first: the SHIPPED module, driven exactly the same way, still dispatches.
+  reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+  echo 33 > "$FIX/queued"; echo 2 > "$FIX/running"; echo 8 > "$FIX/runners"
+  out="$(run_pass)"
+  has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" \
+    "(f10) CONTROL — the SHIPPED module dispatches the repair on the arm-(e1) feed, so (f11) is a mutation and not a restatement"
+  eq "$(spawns)" "1" "(f10b) …and the control spawns exactly one"
+  reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+  echo 33 > "$FIX/queued"; echo 2 > "$FIX/running"; echo 8 > "$FIX/runners"
+  out="$(run_pass "$TMP/mut-oldpredicate.sh")"
+  has "$out" "skip #77: backpressure(q=33,r=2)" \
+    "(f11) MUTANT — the old predicate DEFERS the repair (q=33,r=2 => ceiling 4), so (e1) is not always-green"
+  eq "$(spawns)" "0" "(f12) …and spawns nothing, which is the defect this change removes"
+fi
 
 echo "══ (g) the deferral ledger never resurrects a dead PR, and never starves the enumeration"
 # a row for a MERGED/CLOSED PR (absent from the open listing) must be dropped, not dispatched
@@ -333,22 +426,11 @@ out="$(run_pass)"
 has "$out" "skip #77: budget exhausted" "(control) with no refusal marker the budget binds and nothing is spawned"
 eq "$(spawns)" "0" "(control) no spawn"
 
-# (i) the DELEGATED ci-queue verdict: ciq_verdict's rc IS its contract (0=deep, 1=ok, 2=unknown).
-# Pinned here because ci-queue.sh lives on a sibling branch: a guessed mapping would either defer
-# forever or dispatch INTO a deep queue.
-cat > "$TMP/ciq.sh" <<'CIQ'
-ciq_verdict() {
-  CIQ_QUEUED="${STUB_CIQ_Q:-0}"; CIQ_RUNNERS="${STUB_CIQ_R:-1}"; CIQ_CEILING="${STUB_CIQ_C:-2}"
-  printf '%s\n' "${STUB_CIQ_TOK:-token}"
-  return "${STUB_CIQ_RC:-1}"
-}
-CIQ
-tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=0 STUB_CIQ_Q=100 STUB_CIQ_R=5 ps_queue_verdict "$OR" )"
-eq "$(printf '%s' "$tok" | cut -f1)" "deep" "delegated rc=0 (ciq deep) ⇒ DEFER"
-tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=1 STUB_CIQ_Q=2 STUB_CIQ_R=5 ps_queue_verdict "$OR" )"
-eq "$(printf '%s' "$tok" | cut -f1)" "ok" "delegated rc=1 (ciq ok) ⇒ SEND"
-tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=2 STUB_CIQ_Q=5 STUB_CIQ_R=5 ps_queue_verdict "$OR" )"
-eq "$(printf '%s' "$tok" | cut -f1)" "unknown" "delegated rc=2 (ciq unknown) ⇒ DEFER (never open the gate)"
+# ⛔ THE (i) ARM IS GONE WITH THE FUNCTION IT PINNED (#2927). It stubbed `ciq_verdict` and asserted
+# `ps_queue_verdict`'s rc mapping (0=deep, 1=ok, 2=unknown). `ps_queue_verdict` no longer exists — this
+# file reads no queue. The mapping is now driven against the SHIPPED `ci-queue.sh` by (e5)-(e8) above,
+# where a stub cannot drift from the module; the module's own rc contract is covered by
+# ci-queue.test.sh.
 
 # (j) a FORK PR and a shell-ish ref are refused WITH A REASON (fix-one.sh would abort after the
 # attempt was booked, which reads as 'needs a human' for a PR this queue can never fix).
@@ -374,10 +456,11 @@ out="$(run_pass --max-spawn 5)"
 eq "$(printf '%s\n' "$out" | grep -c 'RED #77 github-actions/docs-lint -> dispatch fix-77')" "1" \
   "exactly ONE dispatch for the duplicated PR (the drain has the same one-decision-per-PR guard)"
 eq "$(spawns)" "1" "and exactly one spawn — not one per ledger row"
-# and a re-deferral REPLACES the row instead of appending a second one
+# and a re-deferral REPLACES the row instead of appending a second one. The deferral is driven by the
+# LANE allowance (#2927): the queue is no longer a reason to defer a repair, and a fixture that used
+# it would now dispatch instead of re-deferring.
 reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
-echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
-run_pass >/dev/null; run_pass >/dev/null
+run_pass --max-spawn 0 >/dev/null; run_pass --max-spawn 0 >/dev/null
 eq "$(cat "$STATE/prsick-deferred.tsv" | grep -c .)" "1" "a re-deferred PR keeps ONE row across passes (no unbounded growth)"
 
 echo "══ (l) a malformed listing is a FAILED CALL — it must not wipe the ledger or the attempt caps"
@@ -426,28 +509,19 @@ has "$(cat "$STATE/sickbrief-77.md")" "head12: $sha12b" "the brief records the 1
 reset_all
 
 
-echo "══ (p) a SPURIOUS EMPTY queue is corroborated — a zero is the one reading that opens the gate"
-# measured 2026-10-22: the queued endpoint answered a valid 36-byte {"total_count":0} while ~70 runs
-# were queued (six samples: 70,70,0,70,70,70). Parsing that as a measurement dispatches INTO a deep
-# queue and destroys the head-bound attestation — a fail-open on the gate itself.
-reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
-printf '0\n70\n' > "$FIX/queued-seq"                        # first read lies, the re-read tells the truth
-out="$(run_pass)"
-has "$out" "a ZERO was re-read as 70" "the spurious zero is NAMED, not measured"
-has "$out" "DEFERRED (queue UNKNOWN" "and UNKNOWN defers"
-no "$out" " -> dispatch" "nothing is dispatched into a queue that is actually 70 deep"
-eq "$(spawns)" "0" "no spawn"
-# control: a queue that really is empty (both reads agree) still opens the gate
-reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
-printf '0\n0\n' > "$FIX/queued-seq"
-out="$(run_pass)"
-has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "(control) a corroborated empty queue still dispatches"
-eq "$(spawns)" "1" "(control) exactly one spawn"
+# ⛔ (p) IS GONE WITH THE PREDICATE IT TESTED (#2927). It drove the queue read's ONE corroborating
+# re-read: measured 2026-10-22 the queued endpoint answered a valid 36-byte `{"total_count":0}` while
+# ~70 runs were queued (six samples: 70,70,0,70,70,70), and a zero is the one reading that OPENS a
+# gate. That arm lived in the `ps_queue_verdict` fallback, which this file no longer has; the repo's
+# queue read is `ci-queue.sh`'s alone now, and its own defence is the cache/staleness/UNKNOWN
+# machinery covered by ci-queue.test.sh. The measurement is kept here because it is about the
+# ENDPOINT, not about this file: do not treat a single zero from it as an empty queue.
+reset_all
+
 
 echo "══ (q) a FIRST pass on a fresh state dir keeps its deferral (the writes need the directory)"
 reset_all; rm -rf "$STATE"; pulls_one 77 "$sha_red"; red_surface "$sha_red"
-echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
-out="$(run_pass)"
+out="$(run_pass --max-spawn 0)"
 no "$out" "No such file or directory" "the pass does not write into a directory it never created"
 eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "1" "and the deferred item is actually recorded on the FIRST pass"
 
@@ -483,16 +557,9 @@ no "$out" "was not an attempt" "(control) with no counter at this head, this rol
 [ -f "$STATE/fixbail-77-$sha_red" ] && ok "(control) and does not delete it" || bad "(control) a marker it never booked was deleted"
 eq "$(spawns)" "1" "(control) and the PR is still dispatched normally"
 
-echo "══ (t) a delegated verdict with NO measured numbers must DEFER (rc alone is not a measurement)"
-tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=1 CIQ_QUEUED= CIQ_RUNNERS= STUB_CIQ_Q= STUB_CIQ_R= ps_queue_verdict "$OR" )"
-# the stub always sets CIQ_*; drop them by overriding with an empty-setting twin
-cat > "$TMP/ciq-empty.sh" <<'CE'
-ciq_verdict() { CIQ_QUEUED=""; CIQ_RUNNERS=""; CIQ_CEILING=""; printf 'ok(...)\n'; return 1; }
-CE
-tok="$( . "$MOD"; . "$TMP/ciq-empty.sh"; ps_queue_verdict "$OR" )"; trc=$?
-eq "$(printf '%s' "$tok" | cut -f1)" "unknown" "rc=1 with no counts ⇒ UNKNOWN"
-eq "$trc" "2" "and the rc defers"
-has "$tok" "no measured count" "naming why"
+# ⛔ (t) IS GONE WITH `ps_queue_verdict` (#2927). It proved that a delegated verdict answering rc=1
+# with NO measured numbers is UNKNOWN rather than a dispatch — the arm that is now `ci-queue.sh`'s
+# `ciq_ci_allowed` (it refuses anything but a measured ok), covered there as (c9)/(c10).
 
 echo "══ (u) an EMPTY (but well-formed) listing never prunes the ledger or the attempt caps"
 reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
@@ -524,7 +591,7 @@ m="$(mut noRed 'RED*) ;;' 'RED*) printf "skip #%s: green\n" "$pr"; return 1 ;;')
 if [ -n "$m" ] && [ -f "$m" ]; then
   reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
   out="$(run_pass "$m")"
-  printf '%s' "$out" | grep -q ' -> dispatch' && bad "(a) still dispatches with the RED arm mutated — vacuous" \
+  grep -q ' -> dispatch' <<<"$out" && bad "(a) still dispatches with the RED arm mutated — vacuous" \
     || ok "(a) FAILS when the RED arm is removed (no work item emitted)"
 else bad "could not build the (a) mutant"; fi
 # (b) the holder gate removed ⇒ a second spawn while the fixer is alive
@@ -535,14 +602,12 @@ if [ -n "$m" ] && [ -f "$m" ]; then
   [ "$(spawns)" -gt 1 ] && ok "(b) FAILS when the holder gate is removed (a second fixer is spawned)" \
     || bad "(b) still holds with the holder gate mutated — vacuous"
 else bad "could not build the (b) mutant"; fi
-# (e) the back-pressure gate removed ⇒ dispatch into a deep queue
-m="$(mut noQueue 'if [ "$q" -gt "$c" ]; then' 'if false; then')" 2>/dev/null || m=""
-if [ -n "$m" ] && [ -f "$m" ]; then
-  reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"; echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
-  out="$(run_pass "$m")"
-  [ "$(spawns)" -gt 0 ] && ok "(e) FAILS when the back-pressure gate is removed (dispatches into a 100-deep queue)" \
-    || bad "(e) still defers with the gate mutated — vacuous"
-else bad "could not build the (e) mutant"; fi
+# ⛔ (e)'s MUTATION IS THE SECTION-(f) ARM ABOVE (f9b-f12), NOT A SEPARATE sed. Its target used to be
+# `if [ "$q" -gt "$c" ]` inside the queue predicate, which no longer exists in this module; the
+# mutation now RESTORES that old predicate (ceiling from the in-progress count, applied to repair) and
+# shows arm (e1) going red on it. A second, weaker "delete the gate" mutant here would restate the
+# same fact and could not even be built.
+
 
 echo
 echo "══ RESULT: $PASS passed, $FAIL failed"

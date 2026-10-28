@@ -9,11 +9,14 @@
 #   2. systemd timers — `install-disk-reaper-timer.sh` renders templates/systemd/* and
 #      `systemctl enable --now`s them (with a passwordless-sudo system unit, else a user unit).
 #
-# The drainer is scheduled by (2), NOT added as a fifth role. IN ONE SENTENCE WHY: the drainer's lock
-# must OUTLIVE its own pass — it waits for the LANE it dispatched (up to LANE_TIMEOUT=3000s) — so as a
-# role it would block the loop that also runs merge and doctor, and the loop's own stall bound would
-# fire on a HEALTHY drainer; and the backlog it drains may belong to a repo the cell's controller is
-# not bound to at all. See templates/systemd/eldato-ai-drainer.service for the full reasoning (and
+# The drainer is scheduled by (2), NOT added as a fifth role. IN ONE SENTENCE WHY: a role is ONE cell's
+# controller and the backlog the drainer exists for may belong to a repo that controller is not bound
+# to at all — and the fleet already schedules periodic one-shots this way.
+# ⛔ This paragraph used to say the drainer's lock "must OUTLIVE its own pass (it waits up to
+# LANE_TIMEOUT=3000s for the lane it dispatched), so a role would block the loop's merge and doctor
+# passes and trip the loop's stall bound". That described #2639's lock scope, which is WITHDRAWN: the
+# lock now covers ONE TICK'S CRITICAL SECTION (settle → census → target → dispatch) and the tick never
+# waits for a lane — a lane that outlives its tick is simply counted by the next one. See templates/systemd/eldato-ai-drainer.service for the full reasoning (and
 # for why the bring-up does not install it: a lane dispatcher is per-repo and costs model spend, so
 # it is an explicit, per-cell operator step, exactly like the disk reaper's arming).
 #
@@ -33,6 +36,11 @@
 #   DRAINER_STATE      the drainer's state dir ($AI)                   default: $HOME/orchestrator-ai
 #   DRAINER_REPO_SLUG  owner/name the brief names                      default: daniel-ospina/agent-infra
 #   DRAINER_SEED_REPO  checkout the lane's worktree is branched from    default: $HOME/agent-infra-main
+#   MAX_LANES          CPU-side ceiling of the lane target. RENDERED BLANK by default, so the unit
+#                      carries no pin and the drainer DERIVES it from this box's cores on every tick
+#                      (floor(ncpu x 5/2), the fleet's 2026-10-17 ruling) — a value rendered here is a
+#                      PIN that the script will never recompute, which is exactly wrong for a box
+#                      whose size can change. Pass it only to override that ceiling deliberately.
 #   TEMPLATES_DIR      template dir (default: this repo's templates/systemd)
 #   SYSTEMD_UNIT_DIR   install dir OVERRIDE (tests: a temp dir with SYSTEMCTL a fake)
 #   SYSTEMCTL          `systemctl` to call  default: user manager if it answers, else `sudo -n systemctl`
@@ -119,7 +127,7 @@ render() { # <template> <dest>
         -e "s|{{AI}}|$DRAINER_STATE|g" \
         -e "s|{{REPO_SLUG}}|$DRAINER_REPO_SLUG|g" \
         -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
-        -e "s|{{MAX_LANES}}|${MAX_LANES:-4}|g" \
+        -e "s|{{MAX_LANES}}|${MAX_LANES:-}|g" \
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
         -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-3000}|g" \
         -e "s|{{DRAINER}}|$DRAINER|g" \

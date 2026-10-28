@@ -34,6 +34,14 @@ TPL="$HERE/watchdog.plist.template"
 INST="$HERE/install.sh"
 
 PASS=0; FAIL=0; SKIPPED=0
+# ⛔ THE SANDBOX LABEL IS A **TEST** LABEL (agent-infra#1996). `install.sh`'s `label_guard` refuses a
+# PRODUCTION loop label on any `$HOME` but the invoking user's real one — correctly, because launchd
+# resolves a label in the user domain and IGNORES `$HOME`. Every install.sh caller below passes this
+# through the guard's own supported seam (`LABEL_OVERRIDE`), exactly as `selftest.sh` and
+# `install-launchd-durability.test.sh` do, and every assertion on the rendered loop plist derives its
+# name from it. (`WATCHDOG_LABEL` is a SEPARATE constant in install.sh and is not affected by the
+# override, so the assertions on the watchdog plist path keep naming the production label.)
+LOOP_LABEL_TEST="com.eldato.orchestrator-loop-test"
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/watchdog.XXXXXX")"
@@ -626,6 +634,13 @@ grep -q '__O__' "$TPL" \
 # ELDATO_ALLOW_NON_DARWIN opt-in — and the ASSERTIONS are about the box install.sh leaves behind.
 echo; echo "── install.sh seeds \$O/watchdog.sh and REPLACES a hand-patched copy, driven on every platform ──"
 SEED="$T/seed"; mkdir -p "$SEED/bin" "$SEED/home/Library/LaunchAgents" "$SEED/o"
+# ⛔ THIS SANDBOX INSTALLS A **TEST** LABEL (agent-infra#1996). `install.sh`'s `label_guard` refuses a
+# PRODUCTION loop label anywhere but the invoking user's real `$HOME` — correctly: launchd resolves a
+# label in the user domain and IGNORES `$HOME`, so a plist written under a throwaway home still
+# addresses the live controller. Every install.sh caller below therefore passes the guard's own
+# supported seam (`LABEL_OVERRIDE`), which is what `selftest.sh` and the durability suite do. The
+# WATCHDOG label is a separate constant in install.sh (`WATCHDOG_LABEL`, matching main's
+# `PROD_WD_LABEL`) and is unaffected — so the assertions on its plist path still hold.
 cat > "$SEED/bin/launchctl" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >> "${STUB_CALLS:?}"
@@ -641,6 +656,7 @@ chmod +x "$SEED/bin/launchctl" "$SEED/bin/plutil" "$SEED/bin/tmux" "$SEED/bin/gh
 # carry a valid REPO, i.e. the non-hermetic shape every other install.sh caller in this repo avoids
 # (`selftest.sh`, the durability suite). Every claim below depends on this run completing.
 _seed_run() { env HOME="$SEED/home" O="$SEED/o" REPO="$(cd "$HERE/../.." && pwd)" OR="acme/widget" \
+                  LABEL_OVERRIDE="$LOOP_LABEL_TEST" \
                   PATH="$SEED/bin:$PATH" STUB_CALLS="$SEED/calls" \
                   STUB_DIR="$SEED" ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
                   bash "$INST" "$@"; }
@@ -739,6 +755,7 @@ INST_O="$U/o<x>y"
 # from OR, so an inherited-or-absent pair made this Darwin group pass only on a box whose
 # environment happened to carry a valid checkout. Self-contained, like `_seed_run` above.
 iu() { env HOME="$U/home" O="$INST_O" REPO="$(cd "$HERE/../.." && pwd)" OR="acme/widget" \
+            LABEL_OVERRIDE="$LOOP_LABEL_TEST" \
             PATH="$U/bin:$PATH" STUB_CALLS="$U/calls" STUB_DIR="$U" bash "$INST"; }
 : > "$U/calls"
 # ⛔ GATE ON THE PLATFORM, NOT ON A TOOL. install.sh refuses outright off macOS ("this harness uses
@@ -800,12 +817,13 @@ fi
 # The uninstall path, driven twice. It must remove the WATCHDOG FIRST, remove both plists, and be a
 # no-op error-free the second time (an operator re-running it is not a failure).
 : > "$U/home/Library/LaunchAgents/com.eldato.orchestrator-watchdog.plist"
-: > "$U/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+: > "$U/home/Library/LaunchAgents/$LOOP_LABEL_TEST.plist"
 : > "$U/calls"
 : > "$U/booted"
 # ELDATO_ALLOW_TEST_HOME is the #446 opt-in the launchd-cycle helpers require: the sandbox HOME is by
 # construction not the account's real home, and the guard refuses (correctly) without it.
 _iu_un() { env HOME="$U/home" O="$U/o" PATH="$U/bin:$PATH" STUB_CALLS="$U/calls" STUB_DIR="$U" \
+             LABEL_OVERRIDE="$LOOP_LABEL_TEST" \
              ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --uninstall; }
 _iu_un >"$U/un1" 2>&1
 _rc1=$?
@@ -817,7 +835,7 @@ _rc2=$?
 [ -f "$U/home/Library/LaunchAgents/com.eldato.orchestrator-watchdog.plist" ] \
   && bad "a watchdog plist survives --uninstall — it would keep reloading forever" \
   || ok "uninstall removes the watchdog plist"
-[ -f "$U/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] \
+[ -f "$U/home/Library/LaunchAgents/$LOOP_LABEL_TEST.plist" ] \
   && bad "the loop plist survives --uninstall" \
   || ok "uninstall removes the loop plist"
 # The stub records the EXPANDED arguments, so match the labels the paths end in — not the shell
@@ -826,7 +844,7 @@ _rc2=$?
 # this harness precisely because it leaves a flag that defeats the next start — so an assertion pinned
 # on `unload -w` would demand the defect back. The property under test is the ORDER.
 _wd_line="$(grep -n '^bootout .*orchestrator-watchdog\.plist' "$U/calls" | head -1 | cut -d: -f1)"
-_lp_line="$(grep -n '^bootout .*orchestrator-loop\.plist' "$U/calls" | head -1 | cut -d: -f1)"
+_lp_line="$(grep -n "^bootout .*$LOOP_LABEL_TEST\\.plist" "$U/calls" | head -1 | cut -d: -f1)"
 if [ -n "$_wd_line" ] && [ -n "$_lp_line" ]; then
   [ "$_wd_line" -lt "$_lp_line" ] \
     && ok "uninstall stops the WATCHDOG before the loop (otherwise it resurrects the loop 60s later)" \
@@ -842,7 +860,7 @@ grep -qE 'launchctl (load|unload) -w|^unload -w' "$U/calls" \
 # and reloading the loop — the exact race the ordering exists to prevent. So: non-zero, plist kept, and the
 # loop is NOT touched (removing it would be undone a minute later by the survivor).
 : > "$U/home/Library/LaunchAgents/com.eldato.orchestrator-watchdog.plist"
-: > "$U/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+: > "$U/home/Library/LaunchAgents/$LOOP_LABEL_TEST.plist"
 : > "$U/calls"; : > "$U/booted"; : > "$U/persist_watchdog"
 _iu_un >"$U/un3" 2>&1; _rc3=$?
 [ "$_rc3" -ne 0 ] \
@@ -851,7 +869,7 @@ _iu_un >"$U/un3" 2>&1; _rc3=$?
 [ -f "$U/home/Library/LaunchAgents/com.eldato.orchestrator-watchdog.plist" ] \
   && ok "the survivor's plist is KEPT — it is the only handle a retry (or a human) has" \
   || bad "the plist was deleted over a watchdog that is still loaded"
-grep -q '^bootout .*orchestrator-loop\.plist' "$U/calls" 2>/dev/null \
+grep -q "^bootout .*$LOOP_LABEL_TEST\\.plist" "$U/calls" 2>/dev/null \
   && bad "uninstall went on to remove the LOOP while the watchdog survives — the survivor reloads it" \
   || ok "the loop is NOT removed while the watchdog survives"
 rm -f "$U/persist_watchdog"

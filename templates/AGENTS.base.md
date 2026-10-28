@@ -33,6 +33,35 @@ If none of those apply: **keep going.** The user can interrupt if they disagree.
 
 ---
 
+## ⛔ HARD RULE: A lane's work is MERGED, not opened
+
+**A lane is not done when it opens a PR. It is done when its PR is MERGED — or when it reports the one
+thing that blocks the merge and that nobody else can supply.**
+
+- **Opening a PR is a checkpoint, not a completion.** Measured 2026-10-18: the fleet held **22 open PRs
+  against 3 merged**, because every lane treated "PR opened" as success and exited. The merge work then
+  piled up behind the running lanes, and the backlog grew while the fleet looked busy.
+- **Drive your own PR to terminal.** Wait for its own checks to finish (bounded), read the *failing
+  names*, fix them, push, re-wait — then take it to the repo's merge path (its rail, or the harness's
+  per-PR chain). Spare capacity flows to MERGING, not just to producing.
+- **Cap the loop.** The harness cap is 3 rounds, enforced in code (`lane-merge.sh`). **A lane stuck in
+  round 5 is a failure, not thoroughness** — a fix round that has not converged is a diagnosis to report.
+- **Never attest your own review.** A review record is minted only from a fresh-context reviewer's
+  verified evidence. Recording a review that did not happen is a gate bypass, whichever way it is framed.
+- **Never edit the PR body after a review is recorded** — the attestation lives in that body and an
+  unrelated edit wipes the proof the gate reads. New information goes in a **comment**.
+- **A dirty PR** means: re-apply your own change onto current main and force-push **your own** branch.
+  Never resolve a **generated** file's conflict by picking a side — regenerate it.
+- **A handoff is a diagnosis, not a mystery.** If you cannot merge, the exact blocking reason goes on the
+  PR as a comment, so the next lane or the human inherits what you learned.
+
+Where the repo ships a merge loop — agent-infra's harness lanes get one as code,
+`scripts/orchestrator-harness/lane-merge.sh <PR>`, whose exit code is the next action — use it. Where it
+does not, take the repo's own merge path. The before/after measurement is
+`scripts/orchestrator-harness/merge-rate.sh` in the repo that ships it.
+
+---
+
 ## ⛔ HARD RULE: Process Discipline
 
 Your role is to work within the skills and processes framework we have explicitly designed. The skills, workflows, and tools embed the accumulated learnings from all previous work and should not be bypassed nor hacked. If there are difficulties or inefficiencies, the right process is to do the work as designated regardless and provide feedback in the reflection phase (after the work), for systematic improvement of all future runs. Following this process allows us to treat our system as a product we can evolve and eventually sell, but only if properly used instead of bypassed. If in absolute need, ask for permission to bypass before doing so.
@@ -340,6 +369,47 @@ Read the RUNS, on the EXACT sha, newest attempt per check:
 **What this rule does NOT decide: mergeability — and step 4's verdict is not a merge gate.** For "may I merge", read the rail, not this rule: `scripts/admin-merge.sh` groups checks by **`(app, name)`** and treats `{success, neutral, skipped, cancelled, stale}` as non-red. Its key merges two workflows that share a job name — the conflation step 3 above separates — and the rail states that as an accepted residual, so it is referenced here, not overridden. **Read the rail to merge; read this rule to know whether the tree is healthy.**
 
 A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main** — the defect is `tortoise#4877`, and the instruction-file divergence it exposed is `agent-infra#1399`.
+
+**⛔ WHEN THE QUEUE — NOT THE CODE — IS THE BLOCKER, REPRODUCE THE LANE AND MERGE ON THAT EVIDENCE.**
+Owner ruling, 2026-10-27 (`agent-infra#2936`), first exercised on `tortoise#10184`, whose `docs` lane sat
+`queued` behind 98 other runs while the repo held 6 in progress and `ci-queue-health` was *itself* pending.
+An indefinite wait for a run the queue has not started is not a gate, it is an outage — so the lane's own
+steps are run **locally**, and their output is posted as the evidence the merge rests on.
+**OVERRIDES:** the rail's precondition that a merge wait for a run that TESTED the head (`admin-merge.sh`,
+*"no run of the lane actually TESTED head"*) — when the queue is the ONLY reason no such run exists, local
+reproduction of that lane is the substitute, and the PR states it rather than implying it.
+**Name the route, because the rail cannot accept the substitute:** a head with no TESTED run is refused by
+the rail unconditionally, so the landing path is the audited `AGENT_ADMIN_MERGE_OVERRIDE=1`, which logs
+`admin_merge_override` and *bypasses* the certificate instead of faking one. It must be in the AGENT's
+environment before it starts — the gate reads the agent process, not the shell, so exporting it inside a
+tool call does nothing. A session that cannot set it, and reaches the raw client instead, **says so in the
+PR and does not claim an audit it did not get**. tortoise#10184's first record of its own merge *did* claim
+the audited override it never got, so the sentence is written from the failure: a fresh reviewer falsified
+it, and the correction is on the PR (comment `6456167700`) — the disclosure is owed *before* someone else
+finds it, which is the only version of this rule worth having.
+This is bounded hard, and a lane that reads it as a general licence has read it wrong:
+
+- **Review evidence stays mandatory and HEAD-BOUND.** The substitute replaces a *lane*, never the review
+  gate: `record-review.sh` at the final head is what makes such a merge legitimate. A push invalidates it,
+  so re-record after every fix.
+- **Reproduce THAT lane's own steps and post their output.** *"It's docs-only"* is not evidence; the lane's
+  own steps are — for tortoise's `docs` job, the conflict-marker check, the generated-artifact `--check`s,
+  markdownlint, the link check, **and** the docs-lint baseline that consumes them. That list is tortoise's
+  as of this writing, not a spec: read the job in the repo you are in, because `docs` is not the same job
+  everywhere (agent-infra runs no docs lane of its own — it ships `docs-ci.yml` to consumers).
+  A step that cannot be reproduced on this host is **declared, not skipped** — tortoise's
+  `.github/scripts/docs-link-check.sh` pins only the x86_64/aarch64 **Linux** assets, so a macOS `arm64`
+  host has no pinned `lychee` (its `DOCS_LINK_CHECK_LYCHEE=<path>` seam is the supported way to supply
+  one); where a step stands in, say what was measured instead (no new links added, the one external URL
+  resolves, the relative targets exist).
+- **A check the change class CAN fail is not droppable.** The ruling names CI-only jobs of the `legal-e2e`
+  class as bureaucracy *for a diff they cannot test*; it does not license skipping a check that could catch
+  this change.
+- **Do not make bypassing a local safety gate a habit.** The ruling names the QUEUE as the blocker; it never
+  authorises routing around the `tortoise#1484` script-backdoor guard, and the admin-merge override is a
+  **disclosed** exception whose audit record is the whole point — not a quiet way to skip review.
+
+---
 
 - **⛔ A MEASUREMENT ARTIFACT IS NOT A STATE — never take a destructive action from a FIRST-MATCH
   reading.** This has now happened **three times on healthy systems**, each caught only because the

@@ -33,6 +33,15 @@
 #                          REFUSAL, because a unit pointed at one box's checkout reads `active` while
 #                          every PR reads `UNREADABLE` (#1974).
 #   REPAIR_INTERVAL_S, REPAIR_DISK_FLOOR_MB, REPAIR_DISK_PER_WORKER_MB, REPAIR_LOAD_CEILING_MULT
+#   REPAIR_MODE            `--loop` (default) or `trigger`. ⛔ THE MODE IS THE UNIT'S ONE CLOCK CHOICE,
+#                          not a second unit: `trigger` renders ExecStart `pr-repair-loop.sh --trigger`,
+#                          which `exec`s `pr-doctor-trigger.py` and runs a ONE-PASS child of the same
+#                          loop whenever the PR surface moves (#2700 C5: the lead was 900 s because it
+#                          was a timer). Every gate, the reap, the credential source and the status row
+#                          stay the loop's, so there is still ONE actuator on one queue.
+#   REPAIR_TRIGGER_POLL_S / _DEBOUNCE_S / _BACKSTOP_S / _RETRY_MIN_S
+#                          the trigger's lead (60), coalescing window (90), demoted timer (1800) and
+#                          retry floor (300). Rendered as `Environment=`; ignored by `--loop`.
 #   TEMPLATES_DIR          default <repo>/templates/systemd
 #   UNIT_DIR               default /etc/systemd/system (system scope) or ~/.config/systemd/user
 #   SYSTEMCTL              default `sudo -n systemctl` (system scope) or `systemctl --user`
@@ -89,9 +98,22 @@ INTERVAL_S="${REPAIR_INTERVAL_S:-900}"
 DISK_FLOOR_MB="${REPAIR_DISK_FLOOR_MB:-4096}"
 DISK_PER_WORKER_MB="${REPAIR_DISK_PER_WORKER_MB:-1024}"
 LOAD_MULT="${REPAIR_LOAD_CEILING_MULT:-8}"
+# ⛔ THE MODE IS VALIDATED HERE, NOT AT RENDER TIME. An unknown value would render
+# `ExecStart=… --TRIGER`, which systemd accepts and the loop refuses only AFTER the unit is enabled
+# — a start-limit loop whose reason lives only in a journal.
+REPAIR_MODE="${REPAIR_MODE:-loop}"
+case "$REPAIR_MODE" in
+    loop|trigger) : ;;
+    *) printf '❌ REFUSING: REPAIR_MODE=%s is not a mode this unit has (loop|trigger).\n' "$REPAIR_MODE" >&2
+       exit 2 ;;
+esac
+TRIGGER_POLL_S="${REPAIR_TRIGGER_POLL_S:-60}"
+TRIGGER_DEBOUNCE_S="${REPAIR_TRIGGER_DEBOUNCE_S:-90}"
+TRIGGER_BACKSTOP_S="${REPAIR_TRIGGER_BACKSTOP_S:-1800}"
+TRIGGER_RETRY_MIN_S="${REPAIR_TRIGGER_RETRY_MIN_S:-300}"
 SCRIPTS_DIR="${PR_REPAIR_SCRIPTS:-$CELL_HOME/.pi/agent/scripts}"
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 ok()  { printf '  ✅ %s\n' "$*"; }
 warn() { printf '  ⚠️  %s\n' "$*" >&2; }
 err() { printf '  ❌ %s\n' "$*" >&2; }
@@ -154,7 +176,7 @@ render_path() {
 render() { # <template> <dest>
     local tpl="$1" dest="$2"
     [ -f "$tpl" ] || die "REFUSING: template missing: $tpl (set TEMPLATES_DIR)"
-    local exec_start="$SCRIPTS_DIR/pr-repair-loop.sh --loop"
+    local exec_start="$SCRIPTS_DIR/pr-repair-loop.sh --$REPAIR_MODE"
     # ⛔ THE #2697 SHAPE, REFUSED BY SHAPE RATHER THAN BY MEMORY (review of this PR): an ExecStart under
     # a LANE SCRATCH checkout is erased the moment that lane's worktree is reaped or the box reboots, and
     # the unit then cannot start at all — measured one repo over as `/tmp/wt-2433-fu`. `readback` cannot
@@ -177,6 +199,10 @@ render() { # <template> <dest>
         -e "s|{{DISK_FLOOR_MB}}|$DISK_FLOOR_MB|g" \
         -e "s|{{DISK_PER_WORKER_MB}}|$DISK_PER_WORKER_MB|g" \
         -e "s|{{LOAD_MULT}}|$LOAD_MULT|g" \
+        -e "s|{{TRIGGER_POLL_S}}|$TRIGGER_POLL_S|g" \
+        -e "s|{{TRIGGER_DEBOUNCE_S}}|$TRIGGER_DEBOUNCE_S|g" \
+        -e "s|{{TRIGGER_BACKSTOP_S}}|$TRIGGER_BACKSTOP_S|g" \
+        -e "s|{{TRIGGER_RETRY_MIN_S}}|$TRIGGER_RETRY_MIN_S|g" \
         -e "s|{{EXEC_START}}|$exec_start|g" \
         "$tpl" >"$dest" || die "REFUSING: render failed ($tpl -> $dest)"
     if grep -q '{{' "$dest" 2>/dev/null; then
@@ -203,8 +229,8 @@ readback() {
     e="$($SYSTEMCTL is-enabled "$UNIT_NAME" 2>/dev/null)" || true
     k="$($SYSTEMCTL show -p KillMode --value "$UNIT_NAME" 2>/dev/null)" || true
     x="$($SYSTEMCTL show -p ExecStart --value "$UNIT_NAME" 2>/dev/null)" || true
-    say "  is-active=$a  is-enabled=$e  KillMode=$k"
-    say "  ExecStart=$(printf '%s' "$x" | tr -s ' ' | cut -c1-160)"
+    log_line "  is-active=$a  is-enabled=$e  KillMode=$k"
+    log_line "  ExecStart=$(printf '%s' "$x" | tr -s ' ' | cut -c1-160)"
     [ "$a" = "active" ] || { err "is-active=$a, expected active"; rc=1; }
     [ "$e" = "enabled" ] || { err "is-enabled=$e, expected enabled (a unit that does not survive a reboot is not activation)"; rc=1; }
     [ "$k" = "process" ] || { err "KillMode=$k, expected process (#2716)"; rc=1; }
@@ -261,11 +287,22 @@ EOF
 # ── verbs ──────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
     resolve_scope
-    say "eldato-pr-repair ($SCOPE scope, unit dir $UNIT_DIR)"
+    log_line "eldato-pr-repair ($SCOPE scope, unit dir $UNIT_DIR)"
     local rc=0
+    # ⛔ THE MODE IS READ FROM THE INSTALLED ARTIFACT, NOT FROM THIS SHELL'S `REPAIR_MODE`. The
+    # operator's env describes what an install WOULD render; the question `--status` answers is what
+    # the box is RUNNING. Printing the env would report `mode=trigger` over a unit whose ExecStart says
+    # `--loop` — the "read the artifact, not the send" rule this installer is built on.
+    local installed_mode="?" installed_exec
+    installed_exec="$(grep -m1 '^ExecStart=' "$UNIT_DIR/$UNIT_NAME" 2>/dev/null || true)"
+    case "$installed_exec" in
+        *--trigger*) installed_mode=trigger ;;
+        *--loop*)    installed_mode=loop ;;
+    esac
+    log_line "  mode=$installed_mode  (from the installed ExecStart)"
     readback || rc=1
-    say ""
-    say "  last pass (the artifact that answers 'did it DO anything' — is-active does not):"
+    log_line ""
+    log_line "  last pass (the artifact that answers 'did it DO anything' — is-active does not):"
     if [ -x "$SCRIPTS_DIR/pr-repair-loop.sh" ]; then
         "$SCRIPTS_DIR/pr-repair-loop.sh" --status 2>&1 | sed 's/^/    /' || rc=1
     else
@@ -277,19 +314,19 @@ cmd_status() {
 
 cmd_dry_run() {
     resolve_scope
-    say "eldato-pr-repair (dry run, $SCOPE scope)"
+    log_line "eldato-pr-repair (dry run, $SCOPE scope)"
     local tmp; tmp="$(mktemp)" || die "REFUSING: mktemp failed"
     render "$TEMPLATES_DIR/$UNIT_NAME" "$tmp"
-    say "  ── rendered unit ──"
+    log_line "  ── rendered unit ──"
     sed 's/^/    /' "$tmp"
     rm -f "$tmp"
-    say ""
-    say "  would install: $UNIT_DIR/$UNIT_NAME  (enable --now, then read back is-active/is-enabled/KillMode)"
+    log_line ""
+    log_line "  would install: $UNIT_DIR/$UNIT_NAME  (enable --now, then read back is-active/is-enabled/KillMode)"
 }
 
 cmd_install() {
     resolve_scope
-    say "eldato-pr-repair (install, $SCOPE scope)"
+    log_line "eldato-pr-repair (install, $SCOPE scope)"
 
     # The artifacts the unit will exec, verified BEFORE the unit exists: a unit whose ExecStart cannot
     # resolve starts, fails, restarts, exhausts its start limit and reads `failed` — a loud but
@@ -301,7 +338,15 @@ cmd_install() {
     # cell without it accumulates worktrees until the disk floor defers everything — the #2721 wedge
     # driver — while every pass reads `dispatched`. Both facts are checked before the unit exists.
     [ -x "$SCRIPTS_DIR/pi-reap-worktrees.sh" ] || die "REFUSING: $SCRIPTS_DIR/pi-reap-worktrees.sh is absent or not executable — this unit would repair without reaping, and worktrees would accumulate until the disk floor stops every pass (#2721)."
-    ok "artifacts present: pr-repair-loop.sh, pr-doctor.py, pi-reap-worktrees.sh"
+    # ⛔ THE TRIGGER IS AN ARTIFACT THE MODE EXECS, and it is verified ONLY in the mode that execs it:
+    # in `--loop` it is not in the unit's path at all, and refusing an install over a file the unit
+    # never reaches would be a false block.
+    if [ "$REPAIR_MODE" = "trigger" ]; then
+        [ -f "$SCRIPTS_DIR/pr-doctor-trigger.py" ] || die "REFUSING: REPAIR_MODE=trigger but $SCRIPTS_DIR/pr-doctor-trigger.py is absent — the unit's front end would refuse on every start (start-limit → failed). Farm it first."
+        ok "artifacts present: pr-repair-loop.sh, pr-doctor.py, pi-reap-worktrees.sh, pr-doctor-trigger.py (mode=trigger)"
+    else
+        ok "artifacts present: pr-repair-loop.sh, pr-doctor.py, pi-reap-worktrees.sh"
+    fi
 
     # ⛔ THE DISPATCH TARGET IS VERIFIED, NOT ASSUMED (found while preparing the first real install of
     # this unit). Every way it can be wrong here is silent at runtime: an empty path renders an
@@ -320,6 +365,27 @@ cmd_install() {
     # discard and fails closed — measured while adding this check.)
     local gmeta=".g""it"
     [ -d "$REPO_PATH/$gmeta" ] || die "REFUSING: $REPO_PATH carries no repository metadata, so worktrees cannot be created there."
+    # ⛔ THE PAIR IS ONE FACT, AND THE INSTALLER IS WHERE IT IS DECIDED (agent-infra#3007). The two
+    # checks above prove the path EXISTS and is a repository -- neither proves WHICH repository, so
+    # `PR_DOCTOR_REPO=owner/other` with this cell's tortoise path installed cleanly and every pass
+    # then failed to fetch that other repo's branches from tortoise's origin. Refused at install
+    # time, naming both, because a unit that cannot dispatch should never exist to report `active`.
+    # An UNPROVABLE checkout (a mirror, a local path, no origin) is not a proven mismatch and is not
+    # refused here; `pr-doctor.py` grades such a repo read-only rather than losing the read.
+    local co_slug="" lib=""
+    for lib in "$HERE/orchestrator-harness/repo-target.sh" "$O/repo-target.sh" \
+               "$REPO_PATH/scripts/orchestrator-harness/repo-target.sh"; do
+        [ -f "$lib" ] && break
+        lib=""
+    done
+    if [ -n "$lib" ]; then
+        # shellcheck source=/dev/null
+        . "$lib" 2>/dev/null || true
+        command -v repo_target_slug >/dev/null 2>&1 && co_slug="$(repo_target_slug "$REPO_PATH" 2>/dev/null)" || co_slug=""
+    fi
+    if [ -n "$co_slug" ] && [ "$co_slug" != "$REPO_SLUG" ]; then
+        die "REFUSING: the target repo and the checkout are two different repos — PR_DOCTOR_REPO=$REPO_SLUG but $REPO_PATH is a checkout of $co_slug. Every pass would fetch $REPO_SLUG's orders from $co_slug's origin (agent-infra#3007). Set PR_DOCTOR_REPO_DIR to a $REPO_SLUG checkout."
+    fi
     ok "target: $REPO_SLUG at $REPO_PATH"
 
     local foreign; foreign="$(foreign_loop_census)"
@@ -374,21 +440,21 @@ cmd_install() {
         [ "$($SYSTEMCTL is-active "$UNIT_NAME" 2>/dev/null)" = "active" ] && break
         sleep 1
     done
-    say ""
+    log_line ""
     if ! readback; then
         err "REFUSING: the unit did not read back healthy (above). Nothing here is claimed as installed-and-working."
         err "  journal: journalctl -u $UNIT_NAME -n 40 --no-pager"
         exit 1
     fi
-    say ""
-    say "  first journal lines (proof the loop is taking decisions, not just alive):"
+    log_line ""
+    log_line "  first journal lines (proof the loop is taking decisions, not just alive):"
     $SYSTEMCTL status "$UNIT_NAME" --no-pager -n 6 2>/dev/null | sed 's/^/    /' || true
     exit 0
 }
 
 cmd_uninstall() {
     resolve_scope
-    say "eldato-pr-repair (uninstall, $SCOPE scope)"
+    log_line "eldato-pr-repair (uninstall, $SCOPE scope)"
     $SYSTEMCTL stop "$UNIT_NAME" 2>/dev/null || true
     $SYSTEMCTL disable "$UNIT_NAME" 2>/dev/null || true
     if [ "$SCOPE" = "system" ]; then
@@ -400,7 +466,7 @@ cmd_uninstall() {
     local a e
     a="$($SYSTEMCTL is-active "$UNIT_NAME" 2>/dev/null)" || true
     e="$($SYSTEMCTL is-enabled "$UNIT_NAME" 2>/dev/null)" || true
-    say "  is-active=$a  is-enabled=$e"
+    log_line "  is-active=$a  is-enabled=$e"
     [ "$a" = "inactive" ] && [ "$e" = "not-found" ] && { ok "removed"; exit 0; }
     err "the unit is still present after uninstall (is-active=$a is-enabled=$e)"
     exit 1

@@ -85,7 +85,7 @@ rm -rf "$A" "$B" "$SNAP" 2>/dev/null
 mkdir -p "$A" "$B"
 git -C "$A" init -q && git -C "$A" remote add origin "$ORIGIN_URL"
 git -C "$B" init -q && git -C "$B" remote add origin "$ORIGIN_URL"
-cleanup_boxes() { rm -rf "$A" "$B" "$SNAP" 2>/dev/null; }
+cleanup_boxes() { rm -rf "$A" "$B" "$SNAP" "${CWD_TMP:-}" 2>/dev/null; }
 # ⛔ Remote refs are NOT inside the temp dirs. This suite writes claim refs to LIVE origin on purpose
 # (a CAS needs a genuinely shared ref), and a Ctrl-C/kill/abort used to leave them orphaned there —
 # the EXIT trap cleaned local dirs only. Delete the remote refs best-effort (fenced), and cover INT
@@ -95,7 +95,7 @@ cleanup_remote() {
   # ⛔ NOT `${ISSUE_REF}`: `issue-<N>` is the one key whose identity is the NUMBER ALONE, so an
   # observed-tip fence can delete a peer's claim (see cleanup_issue_ref). It is handled there, fenced
   # on OUR commit from $OWN_LOG. The sha12-suffixed keys below cannot collide that way.
-  for ref in "${REF:-}" "${OTHER_REF:-}" "${PRNUM_REF:-}"; do
+  for ref in "${REF:-}" "${OTHER_REF:-}" "${PRNUM_REF:-}" "${CWD_REF:-}"; do
     [ -n "$ref" ] || continue
     cur="$(git -C "$A" ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
     [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null
@@ -270,7 +270,7 @@ OTHER_REF="refs/claims/$PR-${OTHER_SHA:0:12}"
 ISSUE_REF="refs/claims/issue-$ISSUE"
 # A PR-keyed claim for the SAME NUMBER, to prove the two keyings cannot collide (I3).
 PRNUM_REF="refs/claims/$ISSUE-${SHA:0:12}"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIPPED=0  # SKIPPED is printed in RESULT: a skipped arm must never read as a pass
 ck() { # ck <label> <expected-regex> <actual>
   # ⛔ here-string, not a pipe: `printf … | grep -q` lets grep exit at its first match while the
   # writer is still writing, so the writer takes SIGPIPE — under `set -o pipefail` the pipeline then
@@ -1044,6 +1044,8 @@ outX=$(unreachable_preflight); rcX=$?
 echo "  unreachable registry rc=$rcX :: $outX"
 ck "an UNREACHABLE registry is INCOMPLETE (rc=2), never CLEAN" "^2$" "$rcX"
 ck "...and the reason says so" "UNREADABLE" "$outX"
+ck "...and names the REPO when the repo is the reason (a wrong CLAIM_REPO refuses every issue)" \
+   "not a readable directory: CLAIM_REPO=" "$outX"
 # And the other direction: the SAME function on the SAME issue with a reachable registry and no
 # claim must read CLEAN — otherwise the fail-closed check above could pass by always refusing.
 cleanup_issue_ref
@@ -1052,6 +1054,94 @@ echo "  reachable registry, no claim rc=$rcY :: $outY"
 ck "a reachable registry with NO claim reads CLEAN (rc=0)" "^0$" "$rcY"
 ck "...and names the issue" "no claim on #$ISSUE" "$outY"
 cleanup_issue_ref
+
+echo
+echo "=== C. THE CALLER'S CWD IS NOT PART OF A CLAIM (live Mac, 2026-10-18) ==="
+# ⛔ THE MEASURED DEFECT (agent-infra, 2026-10-18). The controller runs under launchd with cwd `/`,
+# which macOS denies reading from that context. `claims.sh` defaulted `CLAIM_REPO` to `.` (the
+# caller's cwd) and every git call was `git -C "$CLAIM_REPO"`, so the claim commit could not be
+# built: `[dispatch] #<n> NOT dispatched — could not build claim commit` for EVERY candidate, every
+# cycle, while `gh` reads (which ignore cwd) looked healthy — the queue read as live and the fleet
+# refused all work. The refusal arrived as an EMPTY STRING, with no repo, no cwd and no git error.
+#
+# Two properties, both driven through the REAL function:
+#   C1  an acquire whose caller has an UNREADABLE cwd still SUCCEEDS (CLAIM_REPO derives from REPO)
+#   C2  when it cannot, the reason NAMES the repo and the cwd instead of being empty
+#
+# ⛔ THE CWD IS MADE UNREADABLE, NOT JUST "NOT A REPO". A cwd that merely is not a git tree already
+# fails with "not a git repository"; the launchd failure is `getcwd()` itself being denied, so the
+# arm uses a mode-000 directory — the closest portable reproduction of the EPERM the live box hit
+# (verified: `git -C . rev-parse` dies with "Unable to read current working directory").
+# ⛔ NON-VACUITY IS ASSERTED, NOT ASSUMED: the probe reports a `witness=` line saying whether the
+# cwd really was unusable, and the arm SKIPS (loudly, counted) if this environment can still read a
+# 0000 directory — otherwise the test would silently become a normal-cwd test and pass forever.
+CWD_PR=$(( PR + 11 ))
+CWD_SHA="cwd$$-aaaaaaaa"
+# The ref the helper will push, derived by SOURCING claims.sh (never re-implemented here) — the
+# key shape is part of what the shipped code owns.
+CWD_REF="$( ( cd "$A" && . "$CLAIMS_SH" && claim_ref "$CWD_PR" "$CWD_SHA" ) )"
+CWD_TMP="/tmp/xb-claims-cwd.$$"; rm -rf "$CWD_TMP"; mkdir -p "$CWD_TMP"
+cat > "$CWD_TMP/cwd-acquire.sh" <<'SH'
+# cwd-acquire.sh <claims.sh> <box> <pr> <sha> <claim_repo|-> <repo|->
+# Runs an acquire from a cwd that has been made UNREADABLE, and reports what happened.
+set -u
+CS="$1"; BOX="$2"; PRN="$3"; SHA="$4"; CREPO="$5"; RPO="$6"
+LOCK="$(mktemp -d "${TMPDIR:-/tmp}/cwd-lock.XXXXXX")" || exit 111
+cd "$LOCK" || exit 111
+chmod 000 "$LOCK" || exit 112            # getcwd() now fails: the launchd cwd=/ shape
+( # ⛔ `git -C .` here is a WITNESS, not a call path: it answers "is this cwd actually unusable?"
+  if git -C . rev-parse --git-dir >/dev/null 2>&1; then echo "witness=cwd-usable"; else echo "witness=cwd-unreadable"; fi
+  [ "$CREPO" = "-" ] || export CLAIM_REPO="$CREPO"
+  [ "$RPO" = "-" ] || export REPO="$RPO"
+  # ⛔ THE HOST SEAM, not a whole identity (agent-infra#2094 renamed it): a `CLAIM_OWNER_ID` whose host
+  # segment is not the running host is now REFUSED LOUDLY on stderr, and that advisory lands on the
+  # FIRST line of this probe's captured output — which is exactly the line C2 asserts on, so the reason
+  # this arm exists for was masked by a warning about the test's own fixture. `CLAIM_OWNER_HOST`
+  # overrides only the host, which is what a cross-box probe wants and what the `I` sections use.
+  export CLAIM_OWNER_HOST=probe
+  # shellcheck source=/dev/null
+  . "$CS"
+  claim_acquire "$BOX" "$PRN" "$SHA"; rc=$?
+  # ⛔ THE RESULT IS NAMED, NOT "the first line that is not a witness/rc/commit". claims.sh emits
+  # advisories on stderr about this probe's own fixture (the host seam, above), and taking the first
+  # remaining line made C2 assert on a warning instead of on the reason it exists for.
+  printf 'result=%s\n' "${CLAIM_RESULT:-}"
+  printf 'rc=%s\ncommit=%s\n' "$rc" "${CLAIM_COMMIT:-}" )
+CHMOD_RC=$?
+chmod 755 "$LOCK" 2>/dev/null
+rmdir "$LOCK" 2>/dev/null
+exit $CHMOD_RC
+SH
+# C1 — CLAIM_REPO unset (the launchd shape: nothing sets it, so it derives from $REPO)
+outC1="$( bash "$CWD_TMP/cwd-acquire.sh" "$CLAIMS_SH" "$A" "$CWD_PR" "$CWD_SHA" - "$A" 2>&1 )"
+c1_witness="$(printf '%s\n' "$outC1" | sed -n 's/^witness=//p')"
+c1_rc="$(printf '%s\n' "$outC1" | sed -n 's/^rc=//p')"
+if [ "$c1_witness" != "cwd-unreadable" ]; then
+  echo "  ⚠️ SKIP C1/C2 — this environment can still read a 0000-mode cwd (running as root?), so the"
+  echo "     unreadable-cwd arm cannot be exercised here. The properties are NOT verified by this run."
+  SKIPPED=$((SKIPPED+1))
+else
+  ck "C1: an acquire from an UNREADABLE cwd derives CLAIM_REPO and SUCCEEDS" "^0$" "$c1_rc"
+  c1_tip="$(git -C "$A" ls-remote origin "$CWD_REF" 2>/dev/null | awk '{print $1}')"
+  [ -n "$c1_tip" ] && { echo "  ✅ C1: the claim ref reached origin ($CWD_REF)"; PASS=$((PASS+1)); } \
+                    || { echo "  ❌ C1: no claim ref on origin after a reported success ($CWD_REF)"; FAIL=$((FAIL+1)); }
+  # The failure must be LEGIBLE. Before the fix this was the bare string "could not build claim
+  # commit" with no repo, no cwd and no git error — the reason it took weeks to find.
+  outC2="$( bash "$CWD_TMP/cwd-acquire.sh" "$CLAIMS_SH" "$A" "$(( PR + 12 ))" "$CWD_SHA" "$A/no-such-repo-$$" - 2>&1 )"
+  c2_msg="$(printf '%s\n' "$outC2" | sed -n 's/^result=//p')"
+  echo "  C2 reason: $c2_msg"
+  ck "C2: an unusable CLAIM_REPO names the repo and the cwd in the reason" \
+     "not a readable directory: CLAIM_REPO=.*cwd=" "$c2_msg"
+  [ "$c2_msg" = "could not build claim commit" ] && rc=1 || rc=0
+  ck "C2: ...and it is NOT the bare pre-fix string (an empty explanation)" "^0$" "$rc"
+fi
+# The probe's own ref is deleted here (fenced on the tip we observed), and CWD_REF is in the EXIT
+# trap's list too, so an abort mid-arm cannot leave it behind.
+c1_tip="$(git -C "$A" ls-remote origin "$CWD_REF" 2>/dev/null | awk '{print $1}')"
+[ -n "$c1_tip" ] && git -C "$A" push -q --force-with-lease="$CWD_REF:$c1_tip" origin ":$CWD_REF" 2>/dev/null
+cwd_left="$(git -C "$A" ls-remote origin "$CWD_REF" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$cwd_left" = "0" ] && { echo "  ✅ the cwd probe's ref is gone"; PASS=$((PASS+1)); } \
+                       || { echo "  ❌ the cwd probe's ref leaked ($CWD_REF)"; FAIL=$((FAIL+1)); }
 
 echo
 # ⛔ EVERY key the suite creates, not just `$REF` (2026-10-16 review): the issue-keyed families were
@@ -1069,5 +1159,5 @@ echo "  refs left: $left${leaked:+ (under:${leaked})}"
 git -C "$A" for-each-ref --format='  leftover local scratch: %(refname)' refs/claims-cache | head -3
 
 echo
-echo "================ RESULT: $PASS passed, $FAIL failed ================"
+echo "================ RESULT: $PASS passed, $FAIL failed$([ "${SKIPPED:-0}" -gt 0 ] && printf ', %s SKIPPED' "$SKIPPED") ================"
 [ "$FAIL" -eq 0 ]

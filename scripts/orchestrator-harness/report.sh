@@ -62,6 +62,17 @@ if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
   # `selftest.sh` asserts the two literals agree so the twins cannot drift apart again. It is a
   # TWO-COPY constant rather than a sourced one because `bin/harness` ships from `bin/` while these
   # scripts ship to `$O` — the `install.sh` copier would not carry a shared file to both.
+  #
+  # ⛔ AND THE RECOVERY AGENT IS NOT THE CONTROLLER (agent-infra#1986). The anchored pattern matches
+  # `com.eldato.orchestrator-watchdog` too — it was written (2026-10-20, #2160) when that label did not
+  # exist, and its `[-.]` suffix exists to admit `-loop`, not to admit a SECOND agent on the box. A
+  # `StartInterval` agent holds a real pid precisely while it runs, so with the substring test fixed
+  # and the label still matching, `report.sh` prints `UP (pid <watchdog>)` for a STOPPED controller —
+  # the measured false-UP this arm exists to close, one label over. So the recovery label is EXCLUDED
+  # by name here (and in `bin/harness`), which is a narrower rule than a second pattern: a new
+  # `orchestrator-*` job would still have to be judged deliberately, and `selftest.sh` drives this
+  # arm from ANY platform (it stubs `uname`) so the exclusion is pinned where merges are gated.
+  RECOVERY_UNIT='com.eldato.orchestrator-watchdog'
   HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
   # ⛔ THE PATTERN IS PASSED THROUGH THE ENVIRONMENT, NOT `-v`: a `-v` assignment is
   # ESCAPE-PROCESSED by awk, so on gawk/BSD awk `\.` becomes a bare `.` and the anchor degrades to
@@ -71,7 +82,8 @@ if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
   # branching on the field also closes the second half of the measured defect: with two matching
   # jobs `$pid` was a MULTI-LINE value, which `[ "$pid" = "-" ]` cannot read as "not running", so
   # `UP (pid 4242<newline>-)` was printed for a box with no controller.
-  _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" awk '$3 ~ ENVIRON["RE"] { print $1" "$3 }' || true)"
+  _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" WD="$RECOVERY_UNIT" \
+           awk '$3 ~ ENVIRON["RE"] && $3 != ENVIRON["WD"] { print $1" "$3 }' || true)"
   pid="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print $1; exit }')"
   _job="$(printf '%s\n' "$_ll" | awk 'NF { print $2; exit }')"
   if [ -n "${pid:-}" ]; then
