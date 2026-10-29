@@ -662,13 +662,23 @@ representable as a state**, and the pool is spent by POLLING in the last minutes
     cached is allowed the same single speculative conditional GET the empty-pool arm allows, so a
     free `304` is never refused as if it cost quota.
 * **`GH_LIMIT_ESSENTIAL=1`** is the caller's declaration that the work *cannot proceed* without the
-  read. It is set in-tree by the LANDING scripts only — `repo-authority.sh::required_checks` (the
-  protection read, which has no exact GraphQL equivalent and gates every landing), and the top of
-  `admin-merge.sh`, `atomic-land.sh` and `record-review.sh`, whose reads are the landing. Without it
-  the floor would refuse the merge contract for the last minutes of every window, `REQ_SOURCE=fallback`
-  would follow, and the rail would print "the merge contract is UNKNOWN" — the misdiagnosis this
-  whole change exists to remove. **A poll is never essential**: if polling were, the reserve would be
-  spent exactly the way the incident spent it.
+  read. ⛔ IT IS SET **PER CALL**, and there is exactly ONE in-tree declaration:
+  `repo-authority.sh::required_checks` — the protection read, which has no exact GraphQL equivalent
+  and gates every landing — as a command-scoped env assignment
+  (`GH_LIMIT_ESSENTIAL=1 "$gh" api …/protection/required_status_checks`). Without it the floor would
+  refuse the merge contract for the last minutes of every window, `REQ_SOURCE=fallback` would follow,
+  and the rail would print "the merge contract is UNKNOWN" — the misdiagnosis this whole change exists
+  to remove. **A poll is never essential**: if polling were, the reserve would be spent exactly the
+  way the incident spent it.
+  ⛔ **A SCRIPT-SCOPE `export` IS THE DEFECT, NOT A SHORTCUT** (#2342 review, P1). `admin-merge.sh`,
+  `atomic-land.sh` and `record-review.sh` each carried one, and it exempted every `gh` in those
+  scripts — including the `gh run list` FIRST-CHECKS wait this PR measures at 30 of 41 core calls
+  (73 %) in one merge cycle, and `atomic-land.sh::check_count`'s two paginated `check-runs` reads per
+  verify iteration (up to ~1,080 requests, more than the entire 800-request reserve). Their declarations
+  were removed; `gh-core-failover.test.sh` pins both halves (no file-scope `export` anywhere in-tree,
+  the per-call prefix still present). Note what the export did NOT buy a landing: `essential()` has one
+  call site and it is on the NON-mutating arm, so a WRITE is never floor-refused either way — the
+  export only spent the reserve.
 * `GH_LIMIT_CORE_LOW_WATER` still works (the deployed cells and this runbook carried it before);
   `GH_LIMIT_CORE_FLOOR` is the same number under the name that says what it does, and it wins when
   both are set.
@@ -676,10 +686,15 @@ representable as a state**, and the pool is spent by POLLING in the last minutes
   classification reads (`gh pr checks`, the REST PR listing) because they are core-only and unbounded
   per cycle — that per-candidate fan-out is exactly the spend this guard exists to stop (134 core
   requests per refresh pass; three boxes ≈ 6,030/h against a 5,000/h pool). A lane that is TOLD to
-  land still can: `admin-merge.sh`, `atomic-land.sh` and `record-review.sh` declare their reads
-  essential, so the reserve is spent by the landing it was kept for. What stops is the sweep picking
-  NEW work. That is a deliberate trade, not an oversight — and its cost is that the drain reads
-  `wait`/`unreadable` for the last ~16 % of each window unless it names the reason. It does not yet:
+  land still can: the landing's own **write** is never floor-refused (`essential()` is consulted only
+  on the non-mutating arm) and the ONE read it cannot do without declares itself per call
+  (`repo-authority.sh::required_checks`), so the reserve is spent by the landing it was kept for.
+  The rails' POLLS are deliberately floor-refusable — that spend is what the reserve protects
+  against, and exempting it (as three script-scope exports used to) made the guard unable to fire on
+  its own target. What stops during the band is the sweep picking NEW work, and the rail's polls are
+  refused BY NAME (`gh-core-floor remaining=<n>`). That is a deliberate trade, not an oversight —
+  and its cost is that the drain reads `wait`/`unreadable` for the last ~16 % of each window unless
+  it names the reason. It does not yet:
   `orch-loop.sh`'s three classification reads send stderr to `2>/dev/null`, so a `gh-core-floor`
   refusal reaches the cycle as "check surface unreadable or empty" — the incident's own signature.
   Tracked separately (agent-infra#2448); until it lands, a band-shaped stall must be diagnosed with

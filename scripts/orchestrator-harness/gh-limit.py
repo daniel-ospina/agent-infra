@@ -2745,16 +2745,31 @@ class Limit(object):
 # calls (`pr`, `issue`) is GraphQL. This is a HEURISTIC and it is stated as one: the authoritative
 # signal is the response header when the refused call carried one, and the label exists so a failure
 # says WHICH pool to look at instead of pointing at whichever counter happens to look healthy.
-# Subcommands gh serves over REST. `repo` and `gist` are here because their WRITES are REST calls
-# (`DELETE /repos/{o}/{r}`, `POST /gists`).
-REST_SUBCOMMANDS = {"run", "workflow", "release", "label", "cache", "secret", "variable",
-                    "repo", "gist"}
+# Subcommands gh serves over REST **for the shapes this file can see**: `run`/`workflow`/`release`/
+# `label`/`cache`/`secret`/`variable` have REST-only reads.
+# ⛔ `repo` AND `gist` ARE DELIBERATELY ABSENT (#2342 review, P1). They were added "because their
+# WRITES are REST calls", and that reason is unreachable: `is_mutating` answers `core` for every
+# mutation BEFORE this set is consulted, and `repo create/delete/edit/fork/…` are all in
+# `MUTATING_PAIRS`. So the entries could never affect a write — their only reachable effect was on
+# READS, and `gh repo view` / `gh repo list` are `RepositoryInfo` GraphQL queries. Labelling then
+# `core` refused them, with ZERO requests, inside a dated-empty core window while GraphQL had
+# thousands left: `admin-merge.sh`'s `gh repo view --json nameWithOwner` printed an empty slug and
+# the rail reported "the repo identity could not be resolved" — the misdiagnosis this layer exists to
+# delete (measured on the 2026-10-22 path). Writes stay covered by `is_mutating`.
+REST_SUBCOMMANDS = {"run", "workflow", "release", "label", "cache", "secret", "variable"}
 # ⛔ THE DEFAULT FOR AN UNKNOWN VERB IS `core`, NOT `graphql`. Labelling every unlisted verb `graphql`
 # meant `codespace delete`, `ruleset delete`, `ssh-key delete` and their kin were described as a healthy
 # GraphQL READ: unguarded against an empty core pool, and their refusal filed under a pool that was fine
 # (the 2026-10-22 false-healthy line, reachable from any verb nobody had listed). Enumerating the verbs
 # that are genuinely GraphQL is a finite list this file CAN know — gh's own GraphQL-first surface.
-GRAPHQL_SUBCOMMANDS = {"pr", "issue", "search", "project", "browse", "auth", "extension", "alias"}
+# ⛔ `repo` AND `gist` ARE LISTED HERE BECAUSE THEIR *READS* ARE GRAPHQL (#2342 review, P1), and the
+# fall-through default below is `core` for an unlisted verb — so removing them from REST_SUBCOMMANDS
+# alone would still label `gh repo view` as a core read. Their WRITES are unaffected: `is_mutating`
+# answers `core` before either set is consulted (`repo create/delete/edit/fork/rename/archive/sync`,
+# `gist create/delete/edit` are all in MUTATING_PAIRS), so this only reclassifies the reads that
+# `RepositoryInfo` actually serves from GraphQL.
+GRAPHQL_SUBCOMMANDS = {"pr", "issue", "search", "project", "browse", "auth", "extension", "alias",
+                       "repo", "gist"}
 
 
 # Subcommands/flag forms that never reach the API. `makes_request()` gates the RECOVERY record: a
@@ -4543,8 +4558,16 @@ def _dispatch(real_gh, gh_argv):
                 "The GraphQL failover was refused, so this read cannot be served on either transport."
                 if limit is not None else
                 "The GraphQL failover could not reproduce the REST body, so this read is refused.")
-            if res.out:
-                sys.stdout.buffer.write(res.out)
+            # ⛔ THE FAILOVER CHILD'S STDOUT IS **NOT** WRITTEN HERE (#2342 review, P2). `run_failover`
+            # returns the GraphQL child's `Result` verbatim, and `gh api graphql` prints its ERROR
+            # DOCUMENT on stdout (`{"data":null,"errors":[…]}` — the same measured shape this file
+            # records for `gh api`). Copying it out broke the contract this change states twice —
+            # "every refusal path exits non-zero with EMPTY stdout" — so a caller that reacts to
+            # emptiness/`-n` rather than to the exit status (exactly the pattern
+            # `record-review.sh::target_head_red` was fixed for) was handed a foreign document instead
+            # of "nothing". The "never SUBTRACT what the child printed" rule does not reach these
+            # bytes: the caller asked for a REST read the failover substituted, so this is the LAYER's
+            # transport, not the child the caller invoked. stderr IS kept — it is the diagnosis.
             if res.err:
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
