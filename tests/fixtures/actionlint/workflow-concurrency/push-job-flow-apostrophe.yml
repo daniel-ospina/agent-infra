@@ -1,0 +1,10 @@
+# A one-line flow job mapping whose plain scalars carry apostrophes. Two of them pair around the real
+# `concurrency:` key, so the masked line hides it and a cancelling JOB-level block reported GREEN while
+# the block spelling of the same job was refused [R0]. The raw text has a key the mask hides, so the
+# reader refuses instead of reading it as absent (#2660 round 15).
+name: push job flow apostrophe
+on:
+  push:
+    branches: [main]
+jobs:
+  build: {runs-on: ubuntu-latest, name: shard-'a, concurrency: {group: g, cancel-in-progress: true}, note: don't}

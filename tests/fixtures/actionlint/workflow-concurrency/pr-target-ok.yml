@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (positive): pull_request_target keyed on the PR NUMBER, because
+# github.ref is the base branch there (a ref key would collapse every PR into one group).
+name: pr-target-ok
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+concurrency:
+  group: pr-target-ok-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
