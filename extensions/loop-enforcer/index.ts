@@ -642,19 +642,47 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ── Cron scheduler (P1: 1-minute granularity, no external crontab) ──
+  // ONE arming strategy, and it is IDEMPOTENT (clear-then-set): it is called at factory
+  // load AND on every `session_start`. Both halves matter, and the reason is pi's
+  // lifecycle, not ours:
+  //   • `session_shutdown` fires on session REPLACEMENT too — `AgentSessionRuntime.
+  //     teardownCurrent()` emits it with reason "new" | "resume" | "fork", not only on
+  //     quit (pi's event reference: reason is "quit" | "reload" | "new" | "resume" | "fork").
+  //   • Those flows do NOT re-run extension factories: `teardownCurrent()` is followed by
+  //     `createRuntime()`, which reuses the SAME `resourceLoader` (createAgentSession only
+  //     calls `resourceLoader.reload()` when it has to construct one), so this closure —
+  //     and `cronTimer` in it — survives. Only `/reload` re-runs the factory.
+  // So clearing on shutdown without re-arming on `session_start` left every cron-type loop
+  // silently unarmed after `/new`, `/resume` or `/fork`, until a `/reload` or a restart
+  // (agent-infra#2948 — the latent regression #2944 introduced). This is also the rule the
+  // repo states verbatim in extensions/repo-freshness.ts: timers start in `session_start`,
+  // clear in `session_shutdown`.
+  // Clear-then-set is what makes the double call safe: on `/reload` the old instance is
+  // shut down and the new one armed, and the `session_start` that follows must not leak a
+  // second interval.
   let cronTimer: NodeJS.Timeout | null = null;
-  try {
-    cronTimer = startScheduler(
-      (msg: string, opts?: { deliverAs?: string }) =>
-        pi.sendUserMessage(msg, opts),
-    );
-    // #5672: suppress startup banner in print mode (task sub-agent output)
-    if (!isPrintMode()) {
-      console.log('[loop-enforcer] ⏰ Cron scheduler started');
+  function armCronScheduler(): void {
+    if (cronTimer) { clearInterval(cronTimer); cronTimer = null; }
+    try {
+      cronTimer = startScheduler(
+        (msg: string, opts?: { deliverAs?: string }) =>
+          pi.sendUserMessage(msg, opts),
+      );
+      // #5672: suppress startup banner in print mode (task sub-agent output)
+      if (!isPrintMode()) {
+        console.log('[loop-enforcer] ⏰ Cron scheduler started');
+      }
+    } catch (err) {
+      console.error('[loop-enforcer] ⚠️ Cron scheduler failed to start:', err);
     }
-  } catch (err) {
-    console.error('[loop-enforcer] ⚠️ Cron scheduler failed to start:', err);
   }
+  armCronScheduler();
+
+  // Re-arm on EVERY session_start — including the replacement flows that just cleared it.
+  // Deliberately registered OUTSIDE the `if (Type)` block below: this extension's other
+  // `session_start` handler lives inside it, so with `@sinclair/typebox` missing that flow
+  // could never re-arm either (agent-infra#2948).
+  pi.on("session_start", async () => { armCronScheduler(); });
 
 
   // ── loop_enforcer tool (agent-callable) ─────────────────────────
@@ -2082,6 +2110,14 @@ Goal: ${m.goal}` }] };
 
   // ── session_shutdown: release loops + defensive cleanup ──────
   pi.on("session_shutdown", async (_event, ctx) => {
+    // Stop the cron tick as the session tears down: a tick that fires now would inject a
+    // user message into a closing session. This fires on QUIT *and* on session
+    // replacement ("new" | "resume" | "fork") — for the replacement flows the
+    // `session_start` that follows re-arms it (see armCronScheduler above), so this clear
+    // must NOT be made conditional on the reason. It is what makes a one-shot `pi -p`
+    // exit cleanly; `scheduler.unref()` in scheduler.ts is the load-bearing half that
+    // covers the paths where this handler never runs (#2935/#2944).
+    if (cronTimer) { clearInterval(cronTimer); cronTimer = null; }
     // ponytail: #5830 — release session-owned loops to role-level before abort
     const currentSessionId = getSessionId(ctx);
     if (currentSessionId && existsSync(LOOPS_DIR)) {
