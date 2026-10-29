@@ -2398,6 +2398,11 @@ ck "R5: …and the refusal says no reading was taken instead of printing an empt
 # claims an attempt this branch deliberately skipped, inside the very message that exists to stop that.
 case "$out" in *"WT_SESSION_RECOVER=0"*"NO reading was taken"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R5: …and the READING states the probe was DISABLED, so no cause is asserted either way" $rc
+# ⛔ THE OFF SWITCH MUST ALSO SAY WHAT IT DID NOT DO (review round 5, finding F2): every other refusal
+# carries a `— recovery: …` clause, and this branch was the one that left the residual to be inferred
+# from silence — a reader could not tell whether a repair had been attempted at all.
+case "$out" in *"recovery: NOT attempted"*"WT_SESSION_RECOVER=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R5: …and it STATES that no recovery was attempted, instead of leaving it to be inferred from silence" $rc
 case "$out" in *"could be READ"*) rc=1 ;; *) rc=0 ;; esac
 ck "R5: …and it does NOT claim a read was attempted and failed (the false half the old arm passed over)" $rc
 # (R6) THE HAPPY PATH STAYS FREE: a create that answers must not pay for a probe or an ensure.
@@ -2457,6 +2462,21 @@ case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
 ck "R8: …and it does NOT issue a FALSE-CAUSE verdict on an incomplete volume reading (inode exhaustion IS a full-disk cause)" $rc
 case "$out" in *"could NOT read inodes"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R8: …but it NAMES what it could not read, so the operator knows which reading is missing" $rc
+# (R8b) THE SAME RULE ON THE ARM MOST LIKELY TO FIRE (review round 5, finding F1). R8 above exercises
+# `owner-running`; THIS one drives the identical partial volume against `owner-down` — the reading in
+# this PR's own cell-4 artifact, and the state a cell with a refused socket is in. That arm was left
+# behind by the round-4 fix and kept saying "not on the disk the daemon named" on free space alone.
+rm -rf "$TMP/OR8b" "$TMP/rstate8b"; : > "$TMP/ensure8b.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status not running' CMUX_SERVER_STATUS_RC=0 CMUX_ENSURE_LOG="$TMP/ensure8b.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-partdf" "$TMP/OR8b" "$TMP/cmuxr8b.log" "$TMP/rstate8b" 2>&1)"
+case "$out" in *"did NOT answer"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8b: a down owner on a partly-readable volume still reports the owner as DOWN" $rc
+case "$out" in *"not on the disk the daemon named"*) rc=1 ;; *) rc=0 ;; esac
+ck "R8b: …but it does NOT exonerate the disk on free space alone (inodes were UNREADABLE)" $rc
+case "$out" in *"could NOT read inodes"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8b: …and it names the reading it does not have, so the operator is not steered past it" $rc
+[ "$(grep -c 'ENSURE ' "$TMP/ensure8b.log" 2>/dev/null)" -gt 0 ] && rc=0 || rc=1
+ck "R8b: …and the recovery still runs, because a DOWN owner IS a reading that names the session" $rc
 # (R9) NO READING, NO RETRY (review round 4, finding F2). The recovery used to be gated on the ABSENCE
 # of a disqualifier (`owner != unsupported`, `not short`), which `WT_PROBE_VERDICT=unreadable`
 # satisfies — so a daemon that did not answer within WT_SERVER_TIMEOUT, the very state this path runs

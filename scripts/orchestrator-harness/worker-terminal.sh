@@ -372,8 +372,14 @@ wt_cmux_probe_reading() {
     space)
       printf 'the state volume IS at or below the floor this probe measured against (see `space …` above), so the daemon message is CONSISTENT with a measurement of this box — and no recovery is attempted, because restarting a session frees no space' ;;
     owner-down)
-      if [ "$sp" = "fine" ]; then
-        printf 'the durable session owner did NOT answer (`server status` carried a connection/no-server failure) and the state volume is NOT short (it was measured), so the create failed on the SESSION — not on the disk the daemon named'
+      # ⛔ THE SAME COMPLETENESS RULE APPLIES HERE (review round 5, finding F1). This arm was left
+      # behind by the round-4 fix, and it is the arm MOST LIKELY TO FIRE: `owner-down` is the reading
+      # in this PR's own cell-4 artifact. "not on the disk the daemon named" exonerates a disk the
+      # probe read on free space alone, while `MEASURED` above may print `inodes=UNREADABLE`.
+      if [ "$sp" = "fine" ] && [ -z "$(wt_cmux_vol_unread)" ]; then
+        printf 'the durable session owner did NOT answer (`server status` carried a connection/no-server failure) and the state volume is NOT short (free space, inodes and state size all measured), so the create failed on the SESSION — not on the disk the daemon named'
+      elif [ "$sp" = "fine" ]; then
+        printf 'the durable session owner did NOT answer (`server status` carried a connection/no-server failure); free space is measured and NOT short, but this probe could NOT read %s (see `space …` above) — so the disk is NOT ruled out, and the SESSION is the only cause this probe actually established' "$(wt_cmux_vol_unread)"
       else
         printf 'the durable session owner did NOT answer (`server status` carried a connection/no-server failure); the state volume could NOT be read, so it is NOT ruled out — the daemon cause is unconfirmed in both directions'
       fi ;;
@@ -2016,6 +2022,10 @@ PY
       if [ "${WT_SESSION_RECOVER:-1}" = "0" ]; then
         # ⛔ NOT-READ IS A VERDICT, NOT THE ABSENCE OF ONE — see `wt_cmux_probe_reading`'s `not-run` arm.
         WT_PROBE_VERDICT=not-run
+        # ⛔ THE OFF SWITCH MUST SAY WHAT IT DID NOT DO (review round 5, finding F2). Every other
+        # refusal carries a `— recovery: …` clause; this branch left the residual to be inferred from
+        # silence, so a reader could not tell whether a repair had been attempted.
+        _recovered=" — recovery: NOT attempted, because the probe and the recovery are BOTH disabled on this box (\`WT_SESSION_RECOVER=0\`); unset it to let a spawn measure the box and repair the surface"
       else
         wt_cmux_probe
         # ⛔ THE RECOVERY RUNS ONLY WHERE A READING NAMES THE SESSION (review round 4, finding F2).
