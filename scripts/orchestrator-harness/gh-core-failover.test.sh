@@ -69,6 +69,13 @@ case "\$1 \$2" in
       printf 'API rate limit exceeded for user ID 81560491.\n' >&2
       exit 1
     fi
+    # ⛔ THE REAL FAILURE SHAPE (#2342 review, P2). `gh api graphql` prints its ERROR DOCUMENT on
+    # STDOUT, not stderr — so a fixture that only writes stderr (`graphqldead` above) cannot see a
+    # failover arm that copies that body to the caller. This arm is the measured shape.
+    if [ "\${GH_TEST_SCENARIO:-}" = "graphqldeadbody" ]; then
+      printf '{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}\n'
+      exit 1
+    fi
     # Round-4 review: a CONNECTION that is absent, and one that is TRUNCATED, must not be answered as
     # if it were complete (a missing `reviews` key answered rc 0 with an empty list; 150 reviews
     # answered the first 100 as if that were all of them).
@@ -270,6 +277,22 @@ ck "(b) stderr also keeps the classifier's marker ('rate limit')" \
    $(grep -qi 'rate limit' <<<"$ERR" && echo 0 || echo 1)
 ck "(b) the message says it is NOT a broken repo/token (no false diagnosis)" \
    $(grep -q 'not a broken repo' <<<"$ERR" && echo 0 || echo 1)
+
+# ⛔ (b3) THE SAME CONTRACT AGAINST THE REAL FAILURE SHAPE (#2342 review, P2). `graphqldead` writes
+# only to stderr, so it could never prove "empty stdout" for an arm that forwards the GraphQL child's
+# stdout — and on the real CLI that stdout carries `{"data":null,"errors":[…]}`. A caller that reacts
+# to emptiness/`-n` instead of the exit status (the pattern `record-review.sh::target_head_red` was
+# fixed for) would be handed a foreign document. NON-VACUOUS: on the pre-fix arm this block's first
+# assertion fails, because the error body IS written to stdout.
+reset_env b3 graphqldeadbody
+budget graphqldeadbody
+run graphqldeadbody api repos/o/r/pulls/7 --jq .head.sha
+ck "(b3) a GraphQL error body on the CHILD's stdout still fails the call (rc != 0)" \
+   $([ "$RC" -ne 0 ] && echo 0 || echo 1)
+ck "(b3) …and stdout is EMPTY — the caller's own --jq shape is never replaced by a foreign document" \
+   $([ ! -s "$TMP/out" ] && echo 0 || echo 1)
+ck "(b3) …and the diagnosis is still on STDERR (the streams stay sacred, both ways)" \
+   $(grep -q 'gh-core-exhausted resets_in=' <<<"$ERR" && echo 0 || echo 1)
 
 echo "── (b2) a read with NO exact GraphQL equivalent is REFUSED, not approximated ─────────────────"
 reset_env b2 core0
@@ -1032,6 +1055,21 @@ ck "(p2) a HEALTHY meter lets the same read through (1 request, rc 0)" \
    $([ "$RC" -eq 0 ] && [ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
 ck "(p2) … and the probe it spent is what makes the next lane's decision possible" \
    $([ "$(reqs 'api rate_limit')" -eq 1 ] && echo 0 || echo 1)
+
+echo "── (q) the FLOOR's reserve is declared PER CALL, never at script scope (#2342 review, P1) ─────"
+# The layer's own contract (`essential()`: "A poll is never essential") is only true if no caller hands
+# a whole SCRIPT the exemption. Three rails did exactly that with a file-scope
+# `export GH_LIMIT_ESSENTIAL=1`, which exempted every poll loop in them — the `gh run list`
+# FIRST-CHECKS wait (30 of 41 core calls, 73 % of a merge cycle) and `atomic-land.sh::check_count`'s
+# two paginated `check-runs` reads per verify iteration. These two assertions are the inverse pair:
+# the blanket export must be GONE, and the one legitimate per-call declaration must SURVIVE.
+_src="${HERE}/.."
+_blanket="$(grep -rn '^[[:space:]]*export[[:space:]]\{1,\}GH_LIMIT_ESSENTIAL=' "$_src" --include='*.sh' --include='*.py' 2>/dev/null | grep -v '\.test\.sh' || true)"
+ck "(q) no file-scope 'export GH_LIMIT_ESSENTIAL=1' anywhere in-tree (a script-wide exemption disables the floor on the script's POLLS) [${_blanket:-<none>}]" \
+   $([ -z "$_blanket" ] && echo 0 || echo 1)
+_percall="$(grep -c 'GH_LIMIT_ESSENTIAL=1 "\$gh" api' "${HERE}/repo-authority.sh" 2>/dev/null || true)"
+ck "(q) …and the landing's ONE legitimate declaration survives, PER CALL, on the protection read" \
+   $([ "${_percall:-0}" -ge 1 ] && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
