@@ -208,7 +208,8 @@ export -f checks_answer
 
 run_merge() { # run_merge [env assignments…] — drives the SHIPPED worker; log = $MRG/o/logs/merge-7.log
   (
-    pi() { printf '%s\n' "${FAKE_VERDICT:-CLEAN https://github.com/acme/widget/pull/7#issuecomment-12345}"; }
+    pi() { printf 'pi-called\n' >> "${PI_LOG:-$MRG/pi.log}" 2>/dev/null
+           printf '%s\n' "${FAKE_VERDICT:-CLEAN https://github.com/acme/widget/pull/7#issuecomment-12345}"; }
     gh() {
       case "$*" in
         *"pr view"*headRefOid*) printf '%s\n' "$FAKE_HEAD"; return 0 ;;
@@ -239,6 +240,7 @@ run_merge() { # run_merge [env assignments…] — drives the SHIPPED worker; lo
     env PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" AI_REVIEW_GATE_KEY="$TEST_GATE_KEY" \
       MRG="$MRG" FAKE_HEAD="$HEAD" FAKE_REQ="${FAKE_REQ:-ai-review-gate}" \
       PRCHECKS_MODE="${PRCHECKS_MODE:-success}" RM_LOG="$MRG/rm.log" \
+      PI_LOG="${PI_LOG:-$MRG/pi.log}" \
       REVIEW_GATE="${REVIEW_GATE:-ai-review-gate}" \
       $gate_env \
       "$@" \
@@ -957,6 +959,156 @@ if qF '          gate=""' "$(cat "$MUT11")"; then
 else
   bad "§15 mutation: the token mutation did not apply — inconclusive"
 fi
+
+# ── §19 the RECORD-RECOVERY block (agent-infra#2872): what it may and may NOT skip ─────────────
+# ⛔ WHAT THESE ARMS EXIST FOR (review of #3037). The first cut of that block exited 0 on both of its
+# success arms, and in this file `exit 0` means "this worker is done" — so a carried record skipped
+# the PAID review (the point of the change) AND the two steps that LAND the PR (step 3a's
+# `rail_attempt`, step 4's `gh pr merge`), leaving the state unchanged on exit. It also reddened
+# every other arm in this suite, because the recorder REPLICA that drives them ignores argv and exits
+# 0 — which is the SECOND defect the arms below pin: rc 0 is an authorization only when the verb's
+# own stdout says `head` or `carry`.
+#   §19a rc 0 with a foreign token (a recorder that does not implement the verb) → NOT an authorisation
+#   §19b head + a clean record → no review ordered, and the MERGE IS REACHED (the P0-1 property)
+#   §19c head + an `issues` record → a review IS ordered (the fixer marker is not converted to silence)
+#   §19d carry-patch (rc 6) → re-record, no review, merge reached
+#   §19e unreadable twice (rc 3) → nothing paid AND nothing merged
+#   §19f norecord (rc 4) + a verified body marker → recovered, no review, merge reached
+#   §19g fresh (rc 1) → a review is ordered
+#   §19h rail authority + a carry → the RAIL is reached (the hand-off, not just "the review was skipped")
+
+# mkcc — a fixture whose recorder ANSWERS both verbs, driven by the environment. It mints a real
+# record AND a really-SIGNED marker, because the worker verifies the HMAC (openssl is the REAL binary
+# here) before it merges — a fake marker would make every "merged" arm fail for the wrong reason.
+mkcc() {
+  mkmrg
+  cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<'RECEOF'
+#!/bin/bash
+set -u
+rec_dir="$HOME/.pi/agent/reviews"
+cc_mint() { # cc_mint <head> <verdict> — a record, plus the signed body marker the merge path verifies
+  mkdir -p "$rec_dir"
+  printf '{"pr":7,"repo":"acme/widget","head_sha":"%s","verdict":"%s","diff_sha256":"%s"}\n' \
+    "$1" "$2" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    > "$rec_dir/acme-widget-7.json"
+  txt="review recorded: reviews/7.json verdict=clean @ $1 (acme/widget)"
+  sig="$(printf '%s' "$txt" | command openssl dgst -sha256 -hmac "${AI_REVIEW_GATE_KEY:-}" | awk '{print $NF}')"
+  printf '%s sig=%s\n' "$txt" "$sig" >> "$MRG/pr-body"
+}
+case "${1:-}" in
+  --check-carry)
+    printf '%s\t-\t-\n' "${FAKE_CC_TOKEN:-carry}"
+    printf 'record-review.sh --check-carry: synthetic answer for the suite (token %s)\n' "${FAKE_CC_TOKEN:-carry}" >&2
+    exit "${FAKE_CC_RC:-0}" ;;
+  --recover-body)
+    [ "${FAKE_CC_RECOVER_OK:-0}" = "1" ] || { echo 'no usable marker for this PR' >&2; exit 3; }
+    cc_mint "$FAKE_HEAD" "${FAKE_CC_RECORD_VERDICT:-clean}"
+    printf 'recovered\t%s\t-\n' "$FAKE_HEAD"
+    exit 0 ;;
+  *)
+    # the positional carry re-mint: record-review.sh <pr> <head> <verdict> <repo> [--expect-head …]
+    [ "${FAKE_CC_MINT_OK:-1}" = "1" ] || { echo 'the reviewed patch moved; refusing to carry' >&2; exit 3; }
+    cc_mint "${2:-}" "${3:-clean}"
+    exit 0 ;;
+esac
+RECEOF
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+cc_seed() { # cc_seed <verdict> [head] — a record THIS box holds, without touching the PR body
+  local v="$1" h="${2:-$HEAD}"
+  mkdir -p "$MRG/home/.pi/agent/reviews"
+  printf '{"pr":7,"repo":"acme/widget","head_sha":"%s","verdict":"%s","diff_sha256":"%s"}\n' \
+    "$h" "$v" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    > "$MRG/home/.pi/agent/reviews/acme-widget-7.json"
+}
+cctrace() { cat "$MRG/pi.log" 2>/dev/null; }
+CCFAST="CC_RETRY_SECS=0 GATE_POLL_SECS=0 GATE_POLL_TRIES=3"
+
+# §19a — THE FAIL-OPEN. A recorder that does not implement --check-carry exits 0 with its own
+# output; keying on rc alone read that as "the record covers this head" and ended the worker.
+# This is the shape that reddened this whole suite (its replica ignores argv).
+mkcc
+out="$(run_merge $CCFAST FAKE_CC_RC=0 FAKE_CC_TOKEN=review FAKE_CC_RECOVER_OK=0)"; rc=$?
+log="$(mrglog)"
+qF 'is not' <<<"$log" && ok "§19a rc 0 with a FOREIGN token is not an authorization (the verb's own answer is required, not rc)" \
+                     || bad "§19a the worker acted on rc 0 alone; log=$(tr '\n' ' ' <<<"$log")"
+q 'pi-called' "$(cctrace)" && ok "§19a …so it falls through to the REVIEW path (the pre-#2872 behaviour)" \
+                             || bad "§19a no reviewer was ordered on an implementation-less recorder — the fail-open is back"
+[ "$rc" -eq 0 ] && qF 'MERGED' <<<"$log" && ok "§19a …and the run still reaches the merge (nothing is stranded)" \
+                                        || bad "§19a rc=$rc, no MERGED line; log=$(tail -2 <<<"$log" | tr '\n' ' ')"
+
+# §19b — THE P0-1 PROPERTY. A clean record at this head must skip the PAID review and STILL merge.
+# The pre-fix block logged CARRY and exited 0 here: no MERGED line, no state change, forever.
+mkcc; cc_seed clean
+out="$(run_merge $CCFAST FAKE_CC_RC=0 FAKE_CC_TOKEN=head)"; rc=$?
+log="$(mrglog)"
+nq 'pi-called' "$(cctrace)" && ok "§19b head + a CLEAN record: no review is ordered (the paid step is skipped)" \
+                            || bad "§19b a review was paid for although a clean record covers this head"
+qF 'MERGED' <<<"$log" && ok "§19b …AND the merge is reached — a carry skips the REVIEW, never the MERGE (P0-1)" \
+                       || bad "§19b CARRY exited before the merge — the P0-1 defect; log=$(tr '\n' ' ' <<<"$log")"
+q 'NEEDS-REVIEW cleared' <<<"$log" && ok "§19b …through the ordinary path: the signed body marker is still verified first" \
+                                  || bad "§19b the marker guard did not run — a local record is not what the gate reads"
+
+# §19c — A HEAD-BOUND ANSWER IS NOT A CLEAN ONE (P1-2). An `issues` record at this head used to
+# read as "no review is owed", which silently replaced the fixer authorization with an exit 0.
+mkcc; cc_seed issues
+out="$(run_merge $CCFAST FAKE_CC_RC=0 FAKE_CC_TOKEN=head)"; rc=$?
+log="$(mrglog)"
+q 'pi-called' "$(cctrace)" && ok "§19c head + an ISSUES record: a review IS ordered (the fixer path is not converted to silence)" \
+                          || bad "§19c an issues record skipped the review — the remedy for findings was withheld"
+qF 'not full' <<<"$log" && ok "§19c …and the log says the record is bound but NOT clean, rather than claiming a carry" \
+                        || bad "§19c the log does not distinguish head-binding from a clean verdict"
+
+# §19d — carry-patch (rc 6): the recorder's remedy is a RE-RECORD, not a review (#1377).
+mkcc; cc_seed clean 1111111111111111111111111111111111111111
+out="$(run_merge $CCFAST FAKE_CC_RC=6 FAKE_CC_TOKEN=carry-patch FAKE_CC_MINT_OK=1)"; rc=$?
+log="$(mrglog)"
+qF 'check-carry rc=6' <<<"$log" && ok "§19d rc 6 is CARRIED into the log (not collapsed to "the diff changed")" \
+                            || bad "§19d the real rc did not survive into the log"
+nq 'pi-called' "$(cctrace)" && ok "§19d …the review is NOT re-bought for a byte-identical patch" \
+                            || bad "§19d a review was paid for a patch nobody changed"
+qF 'MERGED' <<<"$log" && ok "§19d …and the re-recorded record lands the PR" \
+                       || bad "§19d no merge after the re-record; log=$(tr '\n' ' ' <<<"$log")"
+
+# §19e — unreadable twice (rc 3): the verb says RETRY and forbids a re-review. Nothing is paid,
+# and nothing is merged on a guess.
+mkcc
+out="$(run_merge $CCFAST FAKE_CC_RC=3 FAKE_CC_TOKEN=unreadable FAKE_CC_RECOVER_OK=0)"; rc=$?
+log="$(mrglog)"
+nq 'pi-called' "$(cctrace)" && ok "§19e unreadable twice: NOTHING PAID (a failed read is not a changed artifact)" \
+                            || bad "§19e a 20-40 minute review was bought because gh was contended"
+qF 'NOTHING PAID, NOTHING MERGED' <<<"$log" && ok "§19e …and it says so, naming RETRY as the remedy" \
+                                           || bad "§19e the log does not name the remedy it took"
+nq '\[merge 7\] MERGED' <<<"$log" && ok "§19e …and nothing is merged on an unread state (the MERGE line is absent; the refusal line says NOTHING MERGED)" \
+                       || bad "§19e the worker merged without reading the diff"
+
+# §19f — norecord (rc 4) with a verified body marker: the #2872 cross-box case.
+mkcc
+out="$(run_merge $CCFAST FAKE_CC_RC=4 FAKE_CC_TOKEN=norecord FAKE_CC_RECOVER_OK=1 FAKE_CC_RECORD_VERDICT=clean)"; rc=$?
+log="$(mrglog)"
+nq 'pi-called' "$(cctrace)" && ok "§19f norecord + a SIGNED body marker: recovered, no review ordered" \
+                            || bad "§19f the review was re-bought although the verdict travelled in the body"
+qF 'MERGED' <<<"$log" && ok "§19f …and the PR lands" || bad "§19f RECOVERED exited before the merge (P0-1); log=$(tr '\n' ' ' <<<"$log")"
+
+# §19g — fresh (rc 1): the diff genuinely changed. The review is owed, and the skip must not fire.
+mkcc
+out="$(run_merge $CCFAST FAKE_CC_RC=1 FAKE_CC_TOKEN=fresh FAKE_CC_RECOVER_OK=1)"; rc=$?
+q 'pi-called' "$(cctrace)" && ok "§19g fresh: a review IS ordered (the only arm that may never be skipped)" \
+                          || bad "§19g a genuinely changed diff skipped its review"
+
+# §19h — THE HAND-OFF ON A RAIL REPO. The reviewer's acceptance is not "the review was skipped" but
+# "a recorded PR is MERGED after CARRY is logged", so the rail itself must be reached — this is the
+# arm a spy on `rail_attempt` pins, and the one the pre-fix `exit 0` made impossible.
+mkcc; cc_seed clean
+mkdir -p "$MRG/repo/scripts"
+printf '#!/bin/bash\necho RAIL-SPY-REACHED\nexit 0\n' > "$MRG/repo/scripts/admin-merge.sh"
+chmod +x "$MRG/repo/scripts/admin-merge.sh"
+out="$(run_merge $CCFAST FAKE_CC_RC=0 FAKE_CC_TOKEN=head FAKE_REQ=pipeline-compliance)"; rc=$?
+log="$(mrglog)"
+nq 'pi-called' "$(cctrace)" && ok "§19h rail repo + carry: no review ordered" \
+                            || bad "§19h a rail repo still paid for a review of a recorded head"
+qF 'MERGED via the rail' <<<"$log" && ok "§19h …and the RAIL is reached (the merge hand-off, not just the skip)" \
+                                || bad "§19h CARRY exited 0 before rail_attempt — the PR never lands (P0-1); log=$(tr '\n' ' ' <<<"$log")"
 
 printf '\n%s\n' "──────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
