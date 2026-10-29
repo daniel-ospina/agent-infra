@@ -699,6 +699,11 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
 cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/gate-policy.sh" "$RIG/stale/"
+# ⛔ AND THE WORKTREE LIFECYCLE HELPER (#2033), for the same reason as brief-gate.sh above:
+# fix-one.sh sources `$SELF/wt-lifecycle.sh` for its EXIT-trap rollback, so a rig without it exits
+# 78 (half-deployed box) BEFORE the refund arithmetic this arm exists to test — which is exactly how
+# this arm came back `rc=78, fixcount=2` instead of `rc=75, fixcount 2->1`.
+cp "$HERE/wt-lifecycle.sh" "$RIG/stale/"
 # ⛔ THE VALIDATOR TRAVELS WITH THE STALE HELPER, AND THAT IS NOT A WEAKENING (#2258). What is stale
 # here is `spawn-gate.sh`'s refusal CONSTANTS, not the brief rules: a fixture that omitted
 # `brief-gate.sh` would make fix-one.sh exit 78 (cannot verify) and this arm would read "78" as the
@@ -1036,12 +1041,12 @@ export -f pi
 # (`$AGENT_INFRA_PATH`, `~/.pi/agent/scripts`) are NOT relied on, so the arm cannot pass on a dev box
 # and fail on a runner whose HOME has no harness scripts (same class as round 3's HOME fix).
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$HERE/gate-policy.sh" \
-   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
+   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/wt-lifecycle.sh" "$RO/"
 # …and the arm must not be satisfiable by a rig that never reached the claim block: assert the
 # modules it needs are actually in $RO, so a future edit that drops one fails HERE, naming the
 # missing file, instead of resurfacing as a bogus 78 two assertions later.
 _rigmiss=""
-for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh; do
+for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh wt-lifecycle.sh; do
   [ -f "$RO/$_m" ] || { echo "❌ the §9 rig is missing $_m in \$RO — the cross-box arm below would exit 78 before its refusal"; _rigmiss="$_m"; }
 done
 [ -z "$_rigmiss" ]; rc=$?
@@ -1066,12 +1071,15 @@ unset -f gh; unset 'BASH_FUNC_gh%%'
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$HERE/wt-lifecycle.sh" "$RO/"
 # …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
 # `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/wt-lifecycle.sh" "$RO/"
 cp "$HERE/brief-gate.sh" "$RO/"
+# …and the worktree lifecycle helper (#2033): `adopt-fix.sh` sources it eagerly and `exit 78`s
+# without it, so every status this section drives (75 · 77 · 79 · 0) came back 78 — a half-deployed
+# rig reading as "the wrapper does not propagate the status".
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
