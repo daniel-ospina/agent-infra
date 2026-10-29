@@ -365,6 +365,27 @@ cmd_install() {
     # discard and fails closed — measured while adding this check.)
     local gmeta=".g""it"
     [ -d "$REPO_PATH/$gmeta" ] || die "REFUSING: $REPO_PATH carries no repository metadata, so worktrees cannot be created there."
+    # ⛔ THE PAIR IS ONE FACT, AND THE INSTALLER IS WHERE IT IS DECIDED (agent-infra#3007). The two
+    # checks above prove the path EXISTS and is a repository -- neither proves WHICH repository, so
+    # `PR_DOCTOR_REPO=owner/other` with this cell's tortoise path installed cleanly and every pass
+    # then failed to fetch that other repo's branches from tortoise's origin. Refused at install
+    # time, naming both, because a unit that cannot dispatch should never exist to report `active`.
+    # An UNPROVABLE checkout (a mirror, a local path, no origin) is not a proven mismatch and is not
+    # refused here; `pr-doctor.py` grades such a repo read-only rather than losing the read.
+    local co_slug="" lib=""
+    for lib in "$HERE/orchestrator-harness/repo-target.sh" "$O/repo-target.sh" \
+               "$REPO_PATH/scripts/orchestrator-harness/repo-target.sh"; do
+        [ -f "$lib" ] && break
+        lib=""
+    done
+    if [ -n "$lib" ]; then
+        # shellcheck source=/dev/null
+        . "$lib" 2>/dev/null || true
+        command -v repo_target_slug >/dev/null 2>&1 && co_slug="$(repo_target_slug "$REPO_PATH" 2>/dev/null)" || co_slug=""
+    fi
+    if [ -n "$co_slug" ] && [ "$co_slug" != "$REPO_SLUG" ]; then
+        die "REFUSING: the target repo and the checkout are two different repos — PR_DOCTOR_REPO=$REPO_SLUG but $REPO_PATH is a checkout of $co_slug. Every pass would fetch $REPO_SLUG's orders from $co_slug's origin (agent-infra#3007). Set PR_DOCTOR_REPO_DIR to a $REPO_SLUG checkout."
+    fi
     ok "target: $REPO_SLUG at $REPO_PATH"
 
     local foreign; foreign="$(foreign_loop_census)"
