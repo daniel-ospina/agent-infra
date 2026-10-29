@@ -622,6 +622,136 @@ else
   pass "13. run 2's report carries no stale tail: the child's stderr is truncated at every launch"
 fi
 
+echo ""
+echo "14. #2291: a NO-CAPACITY verdict is WAITING, not RED — and a transport refusal is still RED"
+# ⛔ THE TWO FACTS THAT SHARED `EXIT rc=3` NOW SHARE NOTHING a reader can confuse. `pr-doctor` writes
+# rc=6 when the box's own spawn gate refused every order (nothing consumed, clears by itself); the
+# beat used to print that as `PR-DOCTOR RED rc=6`, the same line a broken dispatcher produces, so the
+# one screen an operator reads could not tell "wait" from "repair". The record is seeded directly:
+# the reader under test is the status.json block, and the stub child only writes its own rc.
+FIX14="$(mkfix no-capacity 0)"; LOG14="$(logof "$FIX14")"
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "reason": "VERDICT=NO-CAPACITY bound=load=1 room=host=box ncpu=8 load1=4520 lpc=565; 1 order(s) the BOX refused", "at": "x", "at_epoch": %s}\n' \
+  "$(date +%s)" > "$FIX14/agent/state/pr-doctor.status.json"
+run_pass "$FIX14"
+TXT14="$(cat "$LOG14" 2>/dev/null)"
+if has "$TXT14" "PR-DOCTOR WAITING (no capacity) rc=6"; then
+  pass "14. a NO-CAPACITY record reads WAITING — the box has no room, nothing failed"
+else
+  fail "14. a no-capacity record produced no WAITING line (see $LOG14) — a busy box reads as a broken dispatcher"
+fi
+if has "$TXT14" "PR-DOCTOR RED rc=6"; then
+  fail "14. a no-capacity record was reported as RED — the operator is sent to repair a box that only needs to be waited for"
+else
+  pass "14. …and it is NOT reported as RED"
+fi
+if has "$TXT14" "lpc=565"; then
+  pass "14. …and the box's own measurement reaches the line"
+else
+  fail "14. the no-capacity line carried no box measurement — the report says 'nobody took it' without saying what was measured"
+fi
+# CONTROL: the allowance is for code 6 only. A transport refusal (3) must still be RED, or this arm
+# would be "everything is WAITING" — the false-pass direction.
+FIX14B="$(mkfix transport-refusal 0)"; LOG14B="$(logof "$FIX14B")"
+printf '{"rc": 3, "verdict": "UNDELIVERED", "reason": "VERDICT=UNDELIVERED next=repair the dispatch chain", "at": "x", "at_epoch": %s}\n' \
+  "$(date +%s)" > "$FIX14B/agent/state/pr-doctor.status.json"
+run_pass "$FIX14B"
+TXT14B="$(cat "$LOG14B" 2>/dev/null)"
+if has "$TXT14B" "PR-DOCTOR RED rc=3"; then
+  pass "14. a TRANSPORT refusal is still RED (the WAITING allowance is narrow)"
+else
+  fail "14. a transport refusal no longer reads RED — code 3 has been swallowed with 6 (see $LOG14B)"
+fi
+
+# ⛔ THE OTHER TWO pr-doctor SURFACES IN THIS FILE (review P1, #2291). Teaching only the
+# `status.json` block left the DRAIN and the LAUNCHD arm printing `RED` for the same rc=6 — one
+# heartbeat saying "RED rc=6" one line above "WAITING (no capacity) rc=6". Both are driven here with
+# the seeding pattern the other cases already use (`pr-doctor.rc` for the drain, a `launchctl` stub
+# for the scheduled job).
+FIX14C="$(mkfix no-capacity-drain 0)"; LOG14C="$(logof "$FIX14C")"
+printf '6\n' > "$FIX14C/agent/state/pr-doctor.rc"
+run_pass "$FIX14C"
+TXT14C="$(cat "$LOG14C" 2>/dev/null)"
+if has "$TXT14C" "PR-DOCTOR WAITING (no capacity) rc=6"; then
+  pass "14c. a DRAINED rc=6 reads WAITING — the detached run is not reported as broken"
+else
+  fail "14c. the drain reported a no-capacity run without the WAITING word (got: $(grep -m1 'rc=6' "$LOG14C" 2>/dev/null | cut -c1-140))"
+fi
+if has "$TXT14C" "PR-DOCTOR RED rc=6"; then
+  fail "14c. the drain still printed 'PR-DOCTOR RED rc=6' — the same log then carries two verdicts for one pass"
+else
+  pass "14c. …and it is NOT reported as RED"
+fi
+
+# The SCHEDULED job runs pr-doctor.py directly, so LastExitStatus=6 lands on its own arm.
+STUBBIN="$TMP/stubbin"; mkdir -p "$STUBBIN"
+printf '#!/bin/bash\n[ "${1:-}" = list ] && printf -- "-\\t6\\tcom.tortoise.pr-doctor\\n"\nexit 0\n' \
+  > "$STUBBIN/launchctl"; chmod +x "$STUBBIN/launchctl"
+FIX14D="$(mkfix no-capacity-launchd 0)"; LOG14D="$(logof "$FIX14D")"
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "reason": "VERDICT=NO-CAPACITY next=wait bound=load=1", "at_epoch": %s}\n' \
+  "$(date +%s)" > "$FIX14D/agent/state/pr-doctor.status.json"
+export HEARTBEAT_LAUNCHCTL="$STUBBIN/launchctl"
+run_pass "$FIX14D"
+unset HEARTBEAT_LAUNCHCTL
+TXT14D="$(cat "$LOG14D" 2>/dev/null)"
+if has "$TXT14D" "PR-DOCTOR LAUNCHD WAITING (no capacity, last exit 6)"; then
+  pass "14d. the scheduled job's last exit 6 reads WAITING — 'the scheduled job is failing' is not claimed"
+else
+  fail "14d. the launchd arm did not report a no-capacity last exit as WAITING (got: $(grep -m1 'LAUNCHD' "$LOG14D" 2>/dev/null | cut -c1-140))"
+fi
+if has "$TXT14D" "LAUNCHD RED (last exit 6)"; then
+  fail "14d. the launchd arm still says the scheduled job is failing on a no-capacity pass"
+else
+  pass "14d. …and it is NOT reported as a failing job"
+fi
+# CONTROL: the allowance is for 6 alone. A real failure on the same arm is still RED.
+FIX14E="$(mkfix failing-launchd 0)"; LOG14E="$(logof "$FIX14E")"
+printf '#!/bin/bash\n[ "${1:-}" = list ] && printf -- "-\\t4\\tcom.tortoise.pr-doctor\\n"\nexit 0\n' \
+  > "$STUBBIN/launchctl"
+export HEARTBEAT_LAUNCHCTL="$STUBBIN/launchctl"
+run_pass "$FIX14E"
+unset HEARTBEAT_LAUNCHCTL
+TXT14E="$(cat "$LOG14E" 2>/dev/null)"
+if has "$TXT14E" "PR-DOCTOR LAUNCHD RED (last exit 4)"; then
+  pass "14e. a CRASHING scheduled job (last exit 4) is still RED (the WAITING arm is narrow)"
+else
+  fail "14e. a crashing scheduled job no longer reads RED — the WAITING arm swallowed every exit"
+fi
+
+# ⛔ A STALE RECORD IS UNREPORTED BEFORE IT IS ANYTHING ELSE (review P1, #2291). The rc arms were
+# tested BEFORE the age arm, so a `6` written six hours ago printed
+# `PR-DOCTOR WAITING (no capacity) rc=6 (21600s ago)` -- "the box has no room, wait" -- for a
+# dispatcher that had written NO verdict at all since. `objective.pr_doctor_last_run()` deliberately
+# orders it the other way (`age > 2400` -> UNREPORTED, before `waiting`), so the two readers of ONE
+# record disagreed about the same file, on the one screen an operator reads.
+FIX14F="$(mkfix stale-no-capacity 0)"; LOG14F="$(logof "$FIX14F")"
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "reason": "VERDICT=NO-CAPACITY bound=load=1", "at_epoch": %s}\n' \
+  "$(( $(date +%s) - 21600 ))" > "$FIX14F/agent/state/pr-doctor.status.json"
+run_pass "$FIX14F"
+TXT14F="$(cat "$LOG14F" 2>/dev/null)"
+if has "$TXT14F" "PR-DOCTOR RED UNREPORTED (verdict is STALE"; then
+  pass "14f. a SIX-HOUR-OLD rc=6 reads UNREPORTED — a stale verdict is never 'wait'"
+else
+  fail "14f. a stale rc=6 was not reported as UNREPORTED (got: $(grep -m1 'PR-DOCTOR' "$LOG14F" 2>/dev/null | cut -c1-140))"
+fi
+if has "$TXT14F" "WAITING (no capacity)"; then
+  fail "14f. a six-hour-old rc=6 still printed WAITING — nothing has written the record for six hours, so 'wait' answers a question nobody asked"
+else
+  pass "14f. …and it does NOT claim WAITING"
+fi
+# CONTROL: staleness outranks every rc arm, which is the SAME order `objective.pr_doctor_last_run()`
+# uses. A FRESH rc=3 is still RED (14's control above), so this narrows staleness rather than
+# swallowing failures.
+FIX14G="$(mkfix stale-transport 0)"; LOG14G="$(logof "$FIX14G")"
+printf '{"rc": 3, "verdict": "UNDELIVERED", "reason": "VERDICT=UNDELIVERED", "at_epoch": %s}\n' \
+  "$(( $(date +%s) - 21600 ))" > "$FIX14G/agent/state/pr-doctor.status.json"
+run_pass "$FIX14G"
+TXT14G="$(cat "$LOG14G" 2>/dev/null)"
+if has "$TXT14G" "PR-DOCTOR RED UNREPORTED (verdict is STALE"; then
+  pass "14g. …and a stale rc=3 is UNREPORTED too (one ordering, matching objective.py)"
+else
+  fail "14g. a stale rc=3 was not reported as UNREPORTED (got: $(grep -m1 'PR-DOCTOR' "$LOG14G" 2>/dev/null | cut -c1-140))"
+fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0

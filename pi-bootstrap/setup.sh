@@ -616,7 +616,12 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
 # Mac that is strictly better than the pre-#2046 behaviour it replaces (every
 # class fail-closed with `timeout: command not found` while the pass completed).
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh)
+# #1187 adds `cmux_payload.py`: `orch-send.sh` (farmed above) resolves its payload-integrity
+# check as `$(dirname "${BASH_SOURCE[0]}")/lib/cmux_payload.py`. Farming the sender WITHOUT the
+# checker makes EVERY orchestrator dispatch REFUSE with `NOT SENT` (exit 7) and type nothing —
+# a fail-closed FALSE BLOCK on every lane order, which is the right direction and still a box that
+# cannot dispatch. Farm them together. (main meanwhile added `live-paths.sh`; both are carried.)
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0

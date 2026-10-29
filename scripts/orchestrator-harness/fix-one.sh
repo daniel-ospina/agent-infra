@@ -577,7 +577,6 @@ You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewe
 If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
 If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
->>>>>>> b718dc981 (feat(harness): a PR sickness QUEUE — a red PR nobody holds is now selected, briefed and fixed)
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
@@ -681,7 +680,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
   elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
     why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
-    why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
+    # ⛔ CODE 77 IS TWO CONDITIONS (review round 1, P2): below the floor, and above it without the
+    # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
+    # operator a full filesystem was the cause when it was not.
+    why="disk gate: either below DISK_MIN_FREE_MB, or no headroom for one lane's dependency tree (DISK-NOHEADROOM) — the '[disk-gate] REFUSED' line above names which, with both terms; reclaim space (cloud-cell-supervisor.sh prune --caches) — this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi
