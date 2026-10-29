@@ -947,6 +947,84 @@ def test_the_degraded_message_still_reports_a_real_unreadable_roster(L, monkeypa
     assert "KILLED BY A SIGNAL" not in msg
 
 
+# ── THE LANE's cwd IS PUBLISHED ON THE ROW (owner, 2026-10-20) ─────────────────────────────────
+# ⛔ WHY THIS IS IN THE SNAPSHOT AT ALL. The dispatcher must know WHOSE workspace it is about to
+# type into. Without a cwd anywhere on the row, the only available rule was a list of workspace
+# NAMES -- and the owner's own workspace is titled "Personal website", which was not on it, so it
+# was classified as an idle fleet lane and the PR doctor dispatched a tortoise PR brief into it
+# (twice, reported by the owner). These tests pin the evidence, and pin that its ABSENCE is
+# reported as absence.
+
+def test_the_row_carries_each_workspace_cwd(L, monkeypatch):
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [
+        ("WS-AAA", {"id": "WS-AAA", "current_directory": "/tmp/cell-home/wt-123"}),
+        ("WS-BBB", {"id": "WS-BBB", "current_directory": "/Users/owner/Personal website"}),
+    ])
+    cwds = L.workspace_cwds()
+    assert cwds["WS-AAA"] == "/tmp/cell-home/wt-123"
+    # the owner's own directory is PUBLISHED too -- the consumer is what protects it, and it cannot
+    # protect a lane whose cwd it was never told
+    assert cwds["WS-BBB"] == "/Users/owner/Personal website"
+
+
+def test_a_workspace_with_no_cwd_is_absent_never_a_placeholder(L, monkeypatch):
+    """⛔ AN ABSENT cwd must stay ABSENT: the consumer turns it into PROTECTED, and a placeholder
+    ("unknown", the lane name, the home dir) would turn that into a dispatchable lane."""
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [
+        ("WS-NONE", {"id": "WS-NONE"}),                       # no current_directory at all
+        ("WS-EMPTY", {"id": "WS-EMPTY", "current_directory": "   "}),
+        ("WS-OK", {"id": "WS-OK", "current_directory": "/tmp/cell-home/wt-9"}),
+    ])
+    cwds = L.workspace_cwds()
+    assert "WS-NONE" not in cwds and "WS-EMPTY" not in cwds, cwds
+    assert cwds == {"WS-OK": "/tmp/cell-home/wt-9"}, cwds
+
+
+def test_an_unreadable_roster_yields_no_cwds_rather_than_an_error(L, monkeypatch, capsys, tmp_path):
+    """⛔ AND IT SAYS SO, ON THE ARM THAT ACTUALLY FIRES (review round 4, P2, MEASURED).
+
+    `{}` is the right VALUE -- unknown, never fabricated -- but silence makes a blind instrument look
+    like a quiet fleet: every row then publishes cwd=None, every lane is PROTECTED (fail-closed,
+    correct), and the beat reads NOTHING-ACTIONABLE. The first version of this test patched
+    `_live_workspaces` to RAISE, which production never does -- the reader catches its own failures
+    and returns `[]` with `LIVE_READABLE=False` -- so the assertion passed while the shipped line was
+    unreachable. This drives the real shape: `sh_rc` failing, the cache cold.
+    """
+    monkeypatch.setattr(L, "sh_rc", lambda *a, **k: ("", False))
+    monkeypatch.setattr(L, "_LIVE_CACHE", [])
+    assert L.workspace_cwds() == {}
+    err = capsys.readouterr().err
+    assert "UNREADABLE" in err and "PROTECTED" in err and "NOT an idle fleet" in err, err
+    # ...and the SAME reader given a real roster says nothing (no false alarm on a healthy fleet)
+    import json as _json
+    monkeypatch.setattr(L, "sh_rc", lambda *a, **k: (
+        _json.dumps([{"id": "WS-1", "current_directory": str(tmp_path)}]), True))
+    monkeypatch.setattr(L, "_LIVE_CACHE", [])
+    assert L.workspace_cwds() == {"WS-1": str(tmp_path)}
+    assert capsys.readouterr().err == ""
+
+
+def test_one_odd_workspace_row_does_not_lose_the_whole_fleet_s_cwds(L, monkeypatch, capsys):
+    """⛔ REVIEW ROUND 6 (P3), MEASURED: the `try` wrapped the WHOLE loop, so one workspace whose
+    `current_directory` was not a string (`123`) discarded EVERY cwd -- and the fleet lost its
+    identity evidence for that tick, while the docstring promised per-workspace tolerance. The bad
+    row is now skipped and COUNTED, and the good rows survive."""
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [
+        ("WS-OK", {"id": "WS-OK", "current_directory": "/tmp/cell-home/wt-1"}),
+        ("WS-BAD", {"id": "WS-BAD", "current_directory": 123}),
+    ])
+    assert L.workspace_cwds() == {"WS-OK": "/tmp/cell-home/wt-1"}
+    err = capsys.readouterr().err
+    assert "SKIPPED" in err and "PROTECTED" in err, err
+
+
+def test_the_row_actually_uses_the_published_cwds():
+    """WIRING PIN: `main()` must read the map it publishes. A helper with no caller is dead code,
+    and the row would silently carry no cwd -- which makes every lane PROTECTED downstream."""
+    src = open(_PATH, encoding="utf-8").read()
+    assert "_ws_cwd = workspace_cwds()" in src, "main() no longer publishes the workspace cwds"
+    assert 'cwd=(_ws_cwd.get((s["ws"] or "").strip().upper()) or None)' in src, (
+        "the row no longer carries the workspace cwd")
 # ── Step 2 must not go blind just because a `task` child shares the lane's cwd (#1867) ────────
 # ⛔ MEASURED 2026-10-16 20:47Z. `cmux cloud` was published to the beat as
 #   `CAPACITY: 1 lane(s) idle >=20m with NO child in flight -- hand each the next unheld item`
@@ -1398,3 +1476,113 @@ def test_a_co_located_generic_only_lane_does_not_explain_the_writer(L, monkeypat
     assert verified2 is True, (
         "control: a writer that names a co-located lane in full is that lane working, not evidence "
         "about this one")
+
+
+# ── #2227: THE SCAN IS BOUNDED BY WORK, AND SAYS WHAT IT SAMPLED ───────────────────────────────
+# MEASURED 2026-10-20 on the 95-process local box: the ONLY thing bounding this tool was a
+# `subprocess.run(timeout=…)` in its caller, and a busy box exceeded it --
+# `pr-doctor RED — lane-actions read failed rc=1: lane-status.py failed: TimeoutExpired`.
+# A timeout is not a bound: it turns "this box has more work than the budget" into "the fleet is
+# unreadable", which is the same false-absence shape as reporting a late `gh` answer as BLIND.
+# So every walk is CAPPED, the caps that BITE are named, and only the GLOB walks are sampled
+# NEWEST-FIRST (`child_activity`'s file cap is a prefix of `os.walk` order -- stated in its
+# own comment, not papered over).
+
+def test_a_capped_glob_samples_newest_first_and_reports_the_total(L, tmp_path):
+    """(d) The bound picks the RIGHT sample, and says what it left out.
+
+    Newest-first is not a detail: every caller of `_jsonl_files` is looking for the transcript a
+    dispatch just produced, so the freshest files are the candidates. A cap that silently returned
+    an arbitrary 2 of 5 would make `find_child_session` MISS a live child while reporting success.
+    """
+    for i, age in enumerate([10, 300, 5000, 9000, 20000]):
+        f = tmp_path / f"s{i}.jsonl"
+        f.write_text("{}\n")
+        os.utime(str(f), (L.time.time() - age, L.time.time() - age))
+    kept, total = L._jsonl_files(str(tmp_path), cap=2)
+    assert total == 5, total
+    assert len(kept) == 2, kept
+    assert [os.path.basename(k) for k in kept] == ["s0.jsonl", "s1.jsonl"], kept
+    note = L.scan_sampled_line()
+    assert "SAMPLED" in note and "session_files=2/5" in note, note
+    assert "CAPPED" in note, note
+
+
+def test_an_uncapped_scan_says_NOTHING_AT_ALL(L, tmp_path):
+    """The negative control: a complete walk must not print a truncation note.
+
+    Without this, `scan_sampled_line()` could return a sentence unconditionally and the first test
+    would pass on a build that reports every scan as partial -- noise that teaches a reader to skip
+    the one line that matters.
+    """
+    L._SCAN_SAMPLED.clear()
+    for i in range(3):
+        (tmp_path / f"s{i}.jsonl").write_text("{}\n")
+    kept, total = L._jsonl_files(str(tmp_path), cap=60)
+    assert len(kept) == total == 3
+    assert L.scan_sampled_line() == "", L.scan_sampled_line()
+
+
+def test_the_pid_fanout_is_capped_and_the_cap_is_named(L):
+    """A runaway box cannot make `pgrep`+`lsof` unbounded (#2227).
+
+    The cap sits ABOVE the measured box (95 processes), so today's fleet is read in full and the
+    bound exists for the box that has not happened yet. When it bites, the kept pids are a PREFIX
+    -- a stable sample -- and the loss is stated rather than left to be inferred from a missing
+    lane's CPU reading.
+    """
+    L._SCAN_SAMPLED.clear()
+    many = [str(1000 + i) for i in range(L.SCAN_MAX_PROCS + 7)]
+    kept = L._bounded_pids(many, L.SCAN_MAX_PROCS)
+    assert len(kept) == L.SCAN_MAX_PROCS, len(kept)
+    assert kept[0] == "1000" and kept == many[:L.SCAN_MAX_PROCS], "the sample must be a prefix"
+    note = L.scan_sampled_line()
+    assert f"procs={L.SCAN_MAX_PROCS}/{len(many)}" in note, note
+    # ...and one pid short of the cap records NOTHING.
+    L._SCAN_SAMPLED.clear()
+    assert L._bounded_pids(many[:L.SCAN_MAX_PROCS], L.SCAN_MAX_PROCS) == \
+        many[:L.SCAN_MAX_PROCS]
+    assert L.scan_sampled_line() == "", L.scan_sampled_line()
+
+
+def test_a_capped_activity_walk_returns_the_age_it_SAW_instead_of_nothing(L, tmp_path, monkeypatch):
+    """(d) A truncated walk is EVIDENCE, not a silent zero.
+
+    `child_activity` is how a quiet child is proven to be working, and this file's own note calls
+    it the most expensive thing here. When the file cap is reached, an unqualified `None` would
+    read as "the child has written nothing" -- the opposite of what an unread walk knows. So the
+    cap returns the newest age observed so far and NAMES the truncation.
+
+    ⛔ BOTH DIRECTIONS, because the fixed test only asserted the `None` arm (#2227 review, VGATE):
+    with no hit inside the window the answer is `None`, and with a hit it is an AGE -- the second
+    is the one that says "working", so a cap that returned `None` unconditionally would pass a
+    one-armed test while silently reporting every capped child as idle.
+    """
+    L._SCAN_SAMPLED.clear()
+    monkeypatch.setattr(L, "SCAN_MAX_ACTIVITY_FILES", 5)
+    d = tmp_path / "child"
+    d.mkdir()
+    for i in range(20):
+        f = d / f"f{i}.txt"
+        f.write_text("x")
+        old = L.time.time() - 3600          # older than the 20-minute window: no hit
+        os.utime(str(f), (old, old))
+    assert L.child_activity(str(d)) is None, "no file is inside the window, so there is no age"
+    note = L.scan_sampled_line()
+    assert "activity_files=5/>=" in note, note
+    assert "CAPPED" in note, note
+
+    # THE POSITIVE ARM: the walk is still truncated, and the AGE it saw comes back.
+    # AND THE ARM WHERE THE CAP TRIPS *AFTER* HITS. Every file is fresh, so the answer cannot depend
+    # on directory order: whatever the first `cap` entries are, `newest` is already set when the cap
+    # fires, and the walk must return that age instead of discarding it. (A walk that hits its cap
+    # and returns `None` would report a WORKING child as idle -- the one direction that costs work.)
+    L._SCAN_SAMPLED.clear()
+    d2 = tmp_path / "child2"
+    d2.mkdir()
+    for i in range(20):
+        (d2 / f"fresh{i}.txt").write_text("x")
+    age = L.child_activity(str(d2))
+    assert isinstance(age, int), (age, "a capped walk that DID see a fresh write must return it")
+    assert 0 <= age < 120, age
+    assert "activity_files=" in L.scan_sampled_line(), L.scan_sampled_line()

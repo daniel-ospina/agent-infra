@@ -15,6 +15,16 @@
 # retired/do-merge.sh, and it made three checks here pass on an empty file while writing this port.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ⛔ THE CAPABILITY GATE IS DISABLED FOR EVERY ARM EXCEPT ITS OWN (agent-infra#2935). `run_agent` now
+# measures the box — one bounded `pi` call — immediately before every launch. Most arms in this file
+# drive it with a stub `pi` (a sleeper, an echo, a fork storm) that never emits the probe's answer
+# token, so with the gate live those arms would spend up to 2 x LANE_PREFLIGHT_BOUND on a stub and then
+# be REFUSED 71 by a gate they are not testing — an arm about the LOAD/DISK/watchdog gate reporting a
+# capability refusal. The capability block re-enables it explicitly with `LANE_PREFLIGHT=1`, and its
+# arms are the assertion that the gate runs at all; delete this line and the whole file turns the gate
+# back on, which is how you prove the line is load-bearing rather than decorative.
+export LANE_PREFLIGHT=0
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
@@ -24,7 +34,18 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 GATE="$HERE/spawn-gate.sh"
 mkdir -p "$TMP/bin" "$TMP/O/state"
 LOG="$TMP/log"; PROMPT="$TMP/prompt"; PI_LOG="$TMP/pi.log"; MERGE_LOG="$TMP/merge.log"
-printf 'a prompt\n' > "$PROMPT"
+# ⛔ THE FIXTURE IS A REAL BRIEF NOW (agent-infra#2258). `run_agent` refuses a brief that carries no
+# research contract (AGENT_BRIEF_REFUSED, 80) BEFORE it reads load or disk, so a fixture of
+# `printf 'a prompt\n'` would turn every control below into a brief refusal and the load/disk
+# assertions would pass while testing nothing. Rendering the canonical block from the shipped helper
+# keeps this suite's fixture HONEST (it is the same text a real dispatch carries) and pins the gate's
+# own advice as admissible — if the canonical block ever stopped satisfying the validator, this line
+# fails here rather than in production.
+PROMPT_SECTION="$(bash "$HERE/brief-gate.sh" --section lane 2>/dev/null)"
+[ -n "$PROMPT_SECTION" ] || { echo "  ❌ brief-gate.sh --section produced nothing — cannot build a valid fixture" >&2; exit 1; }
+{ printf 'a prompt for a lane\n\n'; printf '%s\n' "$PROMPT_SECTION"; } > "$PROMPT"
+bash "$HERE/brief-gate.sh" --check "$PROMPT" lane 2>/dev/null \
+  || { echo "  ❌ the suite's own fixture brief is REFUSED by the gate — the fixture is not a brief" >&2; exit 1; }
 
 echo "==> spawn-gate self-test ($HERE)"
 
@@ -45,7 +66,10 @@ done
 # `run_agent` undefined and a 127 at the SPAWN SITE — would ship green. So drive it: copy each caller
 # into a scratch dir with NO helper beside it and require the loud, non-zero refusal.
 NX="$TMP/nogate"; mkdir -p "$NX/O/logs"
-cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$NX/"
+# ⛔ gate-policy.sh IS COPIED DELIBERATELY (agent-infra#2319): fix-one.sh now sources it, and this rig
+# exists to prove a MISSING spawn-gate.sh refuses — not to prove a missing policy refuses. Without it
+# here the rig would pass for the wrong reason (rc=78 from the policy, with the right-looking message).
+cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$HERE/gate-policy.sh" "$NX/"
 out="$( ( cd "$NX" && O="$NX/O" bash "$NX/lane.sh" 9999 work daniel-ospina/agent-infra ) 2>&1 )"; nrc=$?
 # A here-string, NOT `printf | grep -q`: `grep -q` exits on first match, `printf` takes SIGPIPE, and
 # under `pipefail` the pipeline returns 141 — so the idiom reads as "no match" ON A MATCH, which is
@@ -104,25 +128,62 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `extensions/` also launches `pi` and is outside this guard's declared population. It can also
   # FALSE-POSITIVE on a non-launcher carrying a `-p` token and a `--no-session` mention, which fails
   # CLOSED (RED, and the file is named), so it cannot hide a launch path.
+  # A NON-LAUNCHER PATH IS EXCLUDED BY NAME, and the exclusion is ASSERTED rather than trusted.
+  # `pi-done-not-exited.py` (#2163) INSPECTS print-mode `pi` processes: it quotes
+  # `pi -p --no-session` in its prose and matches the launch shape in a regex (it is how it tells a
+  # launcher from a bystander), but it launches nothing. Carrying those tokens is precisely the
+  # false-positive class this detector's STATED LIMITS paragraph names, and the exclusion list is
+  # where the paragraph says a non-launcher belongs — declaring it in EXPECTED_PI instead would
+  # assert the opposite of the truth, that a census of launch paths contains a file with none.
+  # The exclusion hides nothing: the assertion below the censuses requires that file to carry no
+  # spawn primitive at all, so a future launch path added to it comes back into the census.
+  # ⛔ `ai-drainer.sh` IS THE SAME CLASS, AND IT LANDED AFTER THIS CENSUS (#2639/#2799). It launches
+  # nothing itself — it DISPATCHES the gated dispatchers (`nonblocking-dispatch.sh`/`bg-dispatch.sh`,
+  # which route through `run_agent`) — but its prose quotes `pi -p --no-session` when explaining why
+  # `LANE_MEM_MB` is 512, so the token pair matches. That made this shard RED on `main` for every PR
+  # that rebased onto it (found while rebasing #2323: `got_pi` carried `ai-drainer.sh`). Excluded by
+  # name, with its own non-launcher assertion below — the same ruling, not a second exception class.
+  # ⛔ `orphaned-harness.sh` IS THE THIRD OF THAT CLASS (#2867/#2871, `49115c1e6`). It is a READ-ONLY
+  # reporter ("never stops a unit, never kills a session, never deletes anything") that quotes
+  # `pi -p --no-session` when explaining why a lane leaves no transcript. Its only `-p` tokens in
+  # CODE are `ps -o comm= -p <pid>` and `systemctl show -p ExecStart`, and NEITHER co-occurs with
+  # `--no-session` — so the pair that matched is prose, exactly like `ai-drainer.sh`. It landed after
+  # this census and put the shard RED on `main` for every PR that rebased onto it. Excluded by name,
+  # with its own non-launcher assertion below.
+  # ⛔ `harness-refresh.sh` IS THE FOURTH OF THAT CLASS (landed on `main` in #2647/#2958, `0a3af0ced`/
+  # `191078ad4`). It restarts NOTHING pi-shaped: its only `-p` tokens in CODE are `ps -p <pid>` (five
+  # sites, including `ps -o etime= -p`), and every `--no-session` is prose explaining why a lane child
+  # leaves no trace in the session store (`harness-refresh.sh:749,751,894`). Found RED here while
+  # rebasing this branch onto current `main`: `got_pi` carried `harness-refresh.sh`, i.e. a fourth
+  # instance of the exact class this list exists for — a census that reddens on PROSE teaches the next
+  # lane to ignore it. Excluded by name, with its own non-launcher assertion below.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
   done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard "$@")
-  printf '%s' "${found# }"
+  # ⛔ SORTED, so the EQUALITY below is a SET equality. `git ls-files --cached --others` emits
+  # UNTRACKED files first and then the sorted index, so a brand-new invoker (this suite's own
+  # #2163 case: lane-exec.sh before it was committed) made the census disagree with a sorted
+  # EXPECTED list for a reason that has nothing to do with the population — a red that says
+  # "a launch path is ungated" when the truth is "the file is not staged yet". Sorting both sides
+  # keeps the assertion strict about MEMBERSHIP and indifferent to staging state.
+  [ -n "$found" ] || { printf ''; return 0; }
+  printf '%s\n' ${found# } | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 # The censuses need a git work tree: `git ls-files` is the index-bounded primitive (per AGENTS.md
 # "Search"), and if it fails the set comes back empty and the EQUALITY below goes RED — fail-closed,
 # which is the right direction for a guard whose job is "no ungated launch path exists".
 ROOT="$(cd "$HERE/../.." && pwd)"
-# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). The assertion
-# is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a THIRD
-# pi-invoker — or a regression in either of these two — fails it.
-EXPECTED_PI="merge-one.sh spawn-gate.sh"
+# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). lane-exec.sh is
+# the #2163 launcher, which carries no wrapper BY DESIGN (see its own assertion below). The assertion
+# is deliberately an EQUALITY, so each residual is asserted rather than left silent, and a NEW
+# pi-invoker — or a regression in these — fails it.
+EXPECTED_PI="cell-lane-preflight.sh lane-exec.sh merge-one.sh spawn-gate.sh"
 got_pi="$(scan_pi 'scripts/orchestrator-harness/*' | sed "s#scripts/orchestrator-harness/##g")"
 [ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
@@ -133,11 +194,64 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # a 120 s provider REACHABILITY probe rather than a lane dispatch (see the harness README §6), so it
 # is not routed through run_agent() here — but it is asserted BY NAME, so a new ungated invoker
 # anywhere under scripts/ fails this check instead of arriving unannounced.
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
+# `scripts/review-pr.sh` is DECLARED here for the same reason (#2288): it spawns the fresh-context
+# reviewer that produces the merge artifact. It carries the bound run_agent() would give it (its own
+# wall-clock watchdog), the SAME posture merge-one.sh's reviewer has — the installed `pi` shim is the
+# load gate at the spawn point, and its rc=76 refusal is handled explicitly (exit 75, nothing
+# consumed) — but no load gate of its OWN, so it belongs in this list by name, not silently.
+# `scripts/orchestrator-harness/lane-exec.sh` (#2163) is the launcher that `exec`s pi (declared below).
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/cell-lane-preflight.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
-ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
+ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh + lane-exec.sh declared)" $rc
+# ⛔ lane-exec.sh (#2163) is the SPAWN-POINT-GATED launcher: it `exec`s `pi`, so it has no wrapper to
+# route through run_agent() and no place to apply the DISK gate (which is per-worktree and therefore
+# a caller's business, the same named residual cloud-cell-bringup.sh carries). The LOAD gate reaches
+# it anyway, at the shim. What this pins is the half that made it worth writing: it must EXEC, never
+# background — a fork here would re-create the surviving wrapper the issue exists to remove.
+grep -qE '^[[:space:]]*exec pi ' "$HERE/lane-exec.sh" && rc=0 || rc=1
+ck "lane-exec.sh EXECs pi (no wrapper survives the turn)" $rc
+
+# ... and the one path excluded by NAME is really a NON-launcher, because that is the whole reason it
+# may sit outside the census. Asserted on the SPAWN PRIMITIVES, deliberately not on `run_agent` —
+# this file names `run_agent` and `pi` in prose and matches both in regexes on purpose (telling a
+# launcher from a bystander is its job). If it ever gains a way to START a process, this goes RED and
+# the path comes out of the exclusion list above.
+if grep -qE 'subprocess|Popen|os\.system|os\.exec|os\.spawn|os\.fork|popen' "$HERE/pi-done-not-exited.py" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded pi-done-not-exited.py is a NON-launcher (carries no spawn primitive), so its census exclusion hides no launch path" $rc
+# …and the same proof for ai-drainer.sh, stated as the detector's own predicate: strip the `#`-comments
+# and the token PAIR is gone, so what matched was prose. A real launch added to that file (in code)
+# puts the pair back and this arm goes RED — the exclusion cannot swallow one.
+_nl_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
+_nl_code="$(sed 's/#.*//' "$HERE/ai-drainer.sh" 2>/dev/null)"
+if grep -qE -e "$_nl_flag" <<<"$_nl_code" && grep -qF -- '--no-session' <<<"$_nl_code"; then rc=1; else rc=0; fi
+ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gated dispatchers; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+# …and the same proof for orphaned-harness.sh (#2867/#2871). Its `-p` tokens are `ps -p <pid>` and
+# `systemctl show -p ExecStart`, so WITH the comments stripped neither the flag nor its `--no-session`
+# partner survives as a pair. A real launch added to that file (in code) puts the pair back and this
+# arm goes RED — the exclusion cannot swallow one, and it is the detector's own predicate, not a list
+# of verbs this test hopes is complete. (`_oh_code`, not a reuse of `_nl_code`: the ai-drainer arm
+# above keeps its own captured code, so neither arm can be read as asserting the other's file.)
+_oh_code="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
+if grep -qE -e "$_nl_flag" <<<"$_oh_code" && grep -qF -- '--no-session' <<<"$_oh_code"; then rc=1; else rc=0; fi
+ck "the excluded orphaned-harness.sh is a NON-launcher in CODE (a read-only orphan REPORT whose -p tokens are ps/systemctl flags; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+
+# …and the same proof for orphaned-harness.sh, which this census found RED on `main` after #2871 and
+# which is the SAME false-positive class the detector's STATED LIMITS paragraph names: it carries `-p`
+# because it runs `ps -p <pid>` and `--no-session` because it EXPLAINS the lane invocation it looks for
+# in the process table. It launches nothing. Stripping the comments does not fix this one — the `-p` is
+# in CODE (`ps -p`), so the assertion is the detector's own named criterion (a SPAWN PRIMITIVE) rather
+# than the ai-drainer probe above: a real launcher added to this file brings `run_agent`/`nohup`/`&`
+# with it, and this arm goes RED.
+if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' "$HERE/orphaned-harness.sh" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded orphaned-harness.sh is a NON-launcher (no spawn primitive; its '-p' is 'ps -p'), so its census exclusion hides no launch path" $rc
+
+# ... and the same proof for harness-refresh.sh, the fourth file of that class (see the exclusion list).
+# It restarts a CONTROLLER through launchctl/systemctl, which is why the primitive list is the same one:
+# a real `pi` launch added to it brings `exec pi`/`run_agent`/`nohup` with it and this arm goes RED.
+if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' "$HERE/harness-refresh.sh" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded harness-refresh.sh is a NON-launcher (no spawn primitive; its '-p' is 'ps -p'), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -253,6 +367,21 @@ echo "PI_RAN" >> "$PI_LOG"
 exit 0
 PI
 chmod +x "$TMP/bin/pi"
+# ⛔ THE CREATION BACK-PRESSURE GATE IS SUPPLIED A READING, NOT SWITCHED OFF (#2409). `run_agent` now
+# measures the repo's landing ratio immediately before any spawn, through `gh` — and these arms drive
+# it straight from this checkout (whose origin IS agent-infra), so the system `gh` would answer
+# `LAND-BACKLOG` and every positive control below would be refused by the WRONG gate (measured: 14
+# arms). Supplying the reading is the fix the #2333 review established for its CI-queue gate: an env
+# var that opens a gate is not a gate, so this puts a calm answer where the gate actually reads.
+printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin/gh"
+chmod +x "$TMP/bin/gh"
+# ⛔ AND THE REPO MUST BE SUPPLIED TOO (review cycle 2, P2). `land_backlog_repo` derives owner/name
+# from the CURRENT worktree's origin, so every driver below that ran in "whatever checkout the runner
+# started in" reddened 14 arms the moment that checkout had no GitHub origin (measured: `cd /tmp` ->
+# 82 passed / 14 failed, all "rc=74 started=0"). A fixture with a GitHub origin makes the reading
+# explicit, exactly as `capacity-transfer.test.sh` §LB does — the arms then test their SUBJECT.
+FIXREPO="$TMP/repofix"; mkdir -p "$FIXREPO"
+git init -q "$FIXREPO" && git -C "$FIXREPO" remote add origin https://github.com/owner/repo.git
 
 # drive <load> <label> [<max-load>] — runs the SHIPPED run_agent under a controlled reading. `load1`
 # is re-declared AFTER sourcing, which is the seam described at the top. `pi` is a stub; every
@@ -260,17 +389,20 @@ chmod +x "$TMP/bin/pi"
 drive() { # drive <load> <label> <max-load>
   local load="$1" label="${2:-test agent}" max="${3:-10}"
   : > "$PI_LOG"
-  # DISK_MIN_FREE_MB=1 so these LOAD checks cannot be decided by this host's free space — the disk
+  # DISK_MIN_FREE_MB=1 so these LOAD checks cannot be decided by this host's free space, and the
+  # headroom gate (DISK_LANE_TREE_MB/DISK_LANE_RESERVE_MB, #2721) is neutralised for the same reason —
+  # the disk
   # gate runs first now (that ordering is itself pinned below), so on a genuinely full CI box the
   # load-refusal assertions would otherwise come back 77 and read as a load-gate regression.
-  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 bash -c '
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
     . "$1"
+    cd "$7" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
     LOAD="$2"; MAX_LOAD="$3"; LOG="$4"; PROMPT="$5"; LABEL="$6"
     load1() { printf "%s" "$LOAD"; }
     run_agent 1 "$LOG" "$PROMPT" "$LABEL" >/dev/null 2>&1
     rc=$?
     printf "rc=%s started=%s" "$rc" "$AGENT_STARTED"
-  ' _ "$GATE" "$load" "$max" "$LOG" "$PROMPT" "$label"
+  ' _ "$GATE" "$load" "$max" "$LOG" "$PROMPT" "$label" "$FIXREPO"
 }
 
 rm -f "$TMP/O/state/walltime.tsv"; : > "$LOG"
@@ -328,18 +460,66 @@ ck "a started run appends one 6-field row to walltime.tsv carrying the ASKED-FOR
 case "$f5" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
 ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5:-<empty>}')" $rc
 
+# ── 7b) A TURN'S STRAGGLERS DO NOT OUTLIVE run_agent (#2163) ────────────────────
+# The group the agent runs in is the whole reason the launch is under job control: a `pi` that
+# finished its turn can leave a tool child behind, and a wrapper that only `wait`s for pi then exits
+# lets it be reparented to init. Measured on the box that motivated #2163: 76 pi-shaped processes for
+# 14 working lanes. The stub forks a long sleeper and exits; after run_agent returns the sleeper must
+# be GONE. (A red here means the group reap is inert — e.g. the watchdog was launched outside the
+# job-control window, which was a real cycle-1 defect.)
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+# A DIRECT background `sleep` (not a subshell), so `$!` IS the sleeper the test must see gone, and a
+# cleanup can end exactly that process.
+sleep 300 &
+printf '%s\n' "$!" > "$STRAGGLER_PID"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+: > "$TMP/straggler.pid"
+PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" STRAGGLER_PID="$TMP/straggler.pid" O="$TMP/O" DISK_MIN_FREE_MB=1 bash -c '
+  . "$1"
+  LOG="$2"; PROMPT="$3"
+  load1() { printf "1"; }
+  run_agent 30 "$LOG" "$PROMPT" "straggler test" >/dev/null 2>&1
+' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null
+sp="$(cat "$TMP/straggler.pid" 2>/dev/null)"
+# ⛔ AN EMPTY PID FILE IS A FAILED LEG, NOT A PASS (#2163 review, P3). The stub writes the sleeper's
+# pid; if it is absent the agent never ran, and `[ -n "$sp" ] && …` would then fall through to success
+# — making the ONLY behavioural proof of the group reap vacuously green on an inert launch.
+survivor=0
+case "$sp" in
+  ''|*[!0-9]*) rc=1 ;;
+  *) if kill -0 "$sp" 2>/dev/null; then rc=1; survivor=1; else rc=0; fi ;;
+esac
+if [ "$survivor" = "1" ]; then
+  # Cleanup, fenced on WHAT the pid is: a recycled pid must not be killed blindly.
+  case "$(ps -o args= -p "$sp" 2>/dev/null)" in
+    *"sleep 300"*) kill -KILL "$sp" 2>/dev/null ;;
+  esac
+fi
+ck "run_agent reaps the turn's straggler (pid ${sp:-<none>} is gone after the turn)" $rc
+# restore the plain stub for the cases below
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+echo "PI_RAN" >> "$PI_LOG"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
 # 90 minutes later, and the reading that governs is the one taken at the spawn.
 got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" bash -c '
   . "$1"
+  cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   MAX_LOAD=10
   load1() { printf "2"; }                   # the controller-time reading: quiet
   can_spawn "$(load1)" || exit 9            # would have allowed the session
   load1() { printf "99"; }                  # load has since spiked
   run_agent 5 "$2" "$3" "late chain worker" >/dev/null 2>&1
   printf "rc=%s" "$?"
-' _ "$GATE" "$TMP/log2" "$PROMPT" 2>/dev/null)"
+' _ "$GATE" "$TMP/log2" "$PROMPT" "$FIXREPO" 2>/dev/null)"
 [ "$got" = "rc=75" ]; rc=$?
 ck "a spawn re-reads load (quiet dispatch, spiked spawn -> refused: '${got:-<none>}')" $rc
 # ... and pi's 0-255 namespace cannot be mistaken for a refusal, so AGENT_STARTED (not the exit
@@ -356,13 +536,51 @@ printf '#!/bin/sh\nexit 75\n' > "$TMP/bin75/pi"
 chmod +x "$TMP/bin75/pi"
 got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" bash -c '
   . "$1"
+  cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "0"; }
   MAX_LOAD=10
   run_agent 1 "$2" "$3" "pi that exits 75 itself" >/dev/null 2>&1
   printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
-' _ "$GATE" "$TMP/log3" "$PROMPT" 2>/dev/null)"
+' _ "$GATE" "$TMP/log3" "$PROMPT" "$FIXREPO" 2>/dev/null)"
 [ "$got" = "rc=75 started=1" ]; rc=$?
 ck "a pi that itself exits 75 is reported STARTED, not as a load refusal (want rc=75 started=1, got '${got:-<none>}')" $rc
+
+# ⛔ …AND THE SAME FOR 74 AND 73 (review P2, agent-infra#2293; renumbered by the #2293x#2409 batch).
+# PI_FORK_REFUSED used to BE 74 — the identical value as AGENT_FORK_REFUSED then — so run_agent's arm could
+# not tell the shim's refusal from a real `pi` that exited 74 (EX_IOERR): a model run that hit a disk
+# I/O error was reported as "this box could not fork" AND had AGENT_STARTED cleared, which is the
+# #1720 class in the other direction. The spawn-point code is now 78 and the caller-facing one stays
+# 73, mirroring the load pair (76 at the spawn point, 75 for the caller). ⛔ 73 and NOT 74: 74 is
+# AGENT_LAND_BACKLOG, whose remedy is the opposite of a fork refusal's, so "stays 74" here was
+# stale pre-renumber prose that stated the very collision the renumber removes.
+# pre-change tree: it produced rc=74 started=0.
+mkdir -p "$TMP/bin74"
+printf '#!/bin/sh\nexit 74\n' > "$TMP/bin74/pi"
+chmod +x "$TMP/bin74/pi"
+# Resolved HERE rather than reused from the later section: the suite runs under `set -u`, so a variable
+# assigned further down is UNBOUND at this point — which made this arm report '<none>' instead of
+# failing for the reason it names.
+_capmod74="$HERE/capacity.sh"
+[ -f "$_capmod74" ] || _capmod74="$(cd "$HERE/.." >/dev/null 2>&1 && pwd)/orchestrator-harness/capacity.sh"
+got="$(PATH="$TMP/bin74:$TMP/bin:$PATH" O="$TMP/O" DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+  . "$1" 2>/dev/null
+  cap_procs_live() { printf "400"; }
+  cap_ulimit_u() { printf "15641"; }
+  cap_maxprocperuid() { return 1; }
+  . "$2"
+  load1() { printf "0"; }
+  MAX_LOAD=10
+  run_agent 1 "$3" "$4" "pi that exits 74 itself" >/dev/null 2>&1
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+' _ "$_capmod74" "$GATE" "$TMP/log4" "$PROMPT" 2>/dev/null)"
+[ "$got" = "rc=74 started=1" ]; rc=$?
+ck "a pi that itself exits 74 (EX_IOERR) is STARTED, not read as the fork gate's refusal (want rc=74 started=1, got '${got:-<none>}')" $rc
+# …and the two codes are DISTINCT in the shipped source, which is the property that makes the arm
+# above possible at all. A grep of the declaration, so a future re-merge of the two is caught even if
+# the behavioural arm is ever weakened.
+_pf="$(grep -m1 '^PI_FORK_REFUSED=' "$GATE" | cut -d= -f2)"; _af="$(grep -m1 '^AGENT_FORK_REFUSED=' "$GATE" | cut -d= -f2)"
+{ [ -n "${_pf:-}" ] && [ -n "${_af:-}" ] && [ "$_pf" != "$_af" ]; }; rc=$?
+ck "the spawn point's fork code ($_pf) is DISTINCT from the caller-facing one ($_af) — a pi exiting the latter cannot be mistaken for the gate" $rc
 
 # ── 9) the PORTED CALLERS: a refusal must not consume a fixer attempt ───────────
 # The headline behavioural claim of this port is fix-one.sh's REFUND. orch-loop.sh books the attempt
@@ -377,6 +595,11 @@ ck "a pi that itself exits 75 is reported STARTED, not as a load refusal (want r
 RIG="$TMP/rig"; RREPO="$RIG/repo"; RO="$RIG/O"
 mkdir -p "$RIG/bin" "$RO/logs" "$RO/state" "$RREPO"
 git -C "$RREPO" init -q -b main
+# ⛔ THE FIXTURE IS A CHECKOUT OF THE REPO THE ARMS NAME (agent-infra#2724/#2694). lane.sh/fix-one.sh
+# now assert the worktree's origin against the target slug and refuse (72) when it differs or is
+# unreadable — so a fixture with no origin would be refused by the REPO gate and every load/disk arm
+# below would assert a gate that never ran.
+git -C "$RREPO" remote add origin https://github.com/daniel-ospina/agent-infra.git
 git -C "$RREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$RREPO" branch work
 git -C "$RREPO" branch adoptbranch   # adopt-fix gets its OWN branch: `work` is already checked out
@@ -388,6 +611,34 @@ printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' > "$RIG/bin/pi"
 printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
+# ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
+# ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
+# because `ci-queue.sh` gated EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue
+# defers (fail-closed — an unreadable queue is not an empty one), while the `gh` stub above FAILS
+# every call by design (the arms below need a failing `gh pr view`) — so without a genuine reading
+# every fixer arm was deferred before it reached the load/disk gate it exists to test. The fixer arms
+# no longer consult the module at all (a fixer is REPAIR), so this rig currently changes no verdict.
+# It stays because (a) `fix-one.sh`/`adopt-fix.sh` and the arms must still pass on a box where the
+# module IS installed and answering, which is the production shape, and (b) it is the seam that goes
+# live again the moment any arm re-acquires a read — and a future lane deleting it as "dead setup"
+# would be re-introducing exactly the six false "load-gate regressions" it was written to stop. That is what these seven arms reported before this stub
+# existed, on a tree where nothing was wrong with the load gate.
+# ⛔ THE READING IS SUPPLIED, NOT THE GATE SWITCHED OFF. `gh-queue` answers ONLY the three endpoints
+# `ci-queue.sh` reads, with a SHALLOW queue (1 queued, 0 running, 3 runners → ceiling 6) — the
+# production precondition under which a fixer may run — and `ciq_gh`'s documented `CIQ_GH` seam is
+# how the module's own suite feeds it too. Nothing here touches `gh`, so the arms that need a failing
+# `gh` keep it, and no env var can disable the gate (a gate an env var can open is not a gate).
+cat > "$RIG/bin/gh-queue" <<'GHQ'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count":1}' ;;
+  *status=in_progress*) echo '{"total_count":0}' ;;
+  *actions/runners*)    printf '%s\n' '{"total_count":3,"runners":[{"id":1,"name":"r1","status":"online","busy":false},{"id":2,"name":"r2","status":"online","busy":false},{"id":3,"name":"r3","status":"online","busy":false}]}' ;;
+  *) exit 1 ;;
+esac
+GHQ
+chmod +x "$RIG/bin/gh-queue"
+export CIQ_GH="$RIG/bin/gh-queue"
 # ⛔ THE FILE STUB ALONE IS NOT ENOUGH FOR THESE ARMS, AND WHAT IT PRODUCES IS THE WORST KIND OF
 # FAILURE (P1, found 2026-10-16 while fixing #1828, reproduced live). Every caller this section
 # drives runs `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a SYSTEM `pi` AHEAD
@@ -401,7 +652,12 @@ chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # PATH edit; the stub is therefore defined as an exported function as well as a file. The file stub
 # is KEPT because it is what the pre-export `drive` checks above resolve — and because dropping the
 # `export -f` below costs a RED control (fail-closed), never another silently-real agent.
-pi() { echo PI_RAN >> "$PI_LOG"; return 0; }
+# ⛔ AND WHETHER THE PR-OWNER LOCK WAS HELD WHILE IT RAN (review of PR #2576, P2). §9b's other
+# assertions are satisfied by a tree that takes the lock, RELEASES it immediately, and then runs
+# the agent that pushes — which is the whole defect. The lock must be held ACROSS the run, so the
+# only place that can witness it is the agent stub itself. It records the RECORD'S CONTENT too, so a
+# takeover can be told apart from a steal that kept the dead pid in place.
+pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && { echo PI_SAW_LOCK >> "$PI_LOG"; echo "PI_LOCK_OWNER=$(cat "$PRLOCK_PATH" 2>/dev/null)" >> "$PI_LOG"; }; return 0; }
 export -f pi
 # ...and pin the MECHANISM, not only its effect: the whole fix rests on the function surviving into
 # the callers' environment, so assert it is there BY NAME. Otherwise a future edit that drops the
@@ -412,7 +668,7 @@ ck "the rig's pi stub is EXPORTED into the callers' environment (a function beat
 # these checks exercise the gate and the refund, not the claim machinery (which has its own suite).
 fix_argv() { printf '%s\n%s\n%s\nwork\n' "$RREPO" "daniel-ospina/agent-infra" 7 > "$RIG/argv7"; }
 
-# ⛔ EVERY LOAD/SUCCESS ARM BELOW PINS DISK_MIN_FREE_MB=1, AND IT IS NOT COSMETIC (review round 2, P1).
+# ⛔ EVERY LOAD/SUCCESS ARM BELOW PINS DISK_MIN_FREE_MB=1 AND NEUTRALISES THE HEADROOM GATE, AND IT IS NOT COSMETIC (review round 2, P1).
 # The disk gate runs FIRST, so without this the arms are decided by THIS HOST's free space: on a box
 # with less than the shipped 500 MiB floor — the exact state this PR exists for — each of them gets
 # AGENT_DISK_REFUSED=77 instead of the 75/0 it asserts, and six "load-gate regressions" are reported
@@ -420,7 +676,7 @@ fix_argv() { printf '%s\n%s\n%s\nwork\n' "$RREPO" "daniel-ospina/agent-infra" 7 
 # the arms that drive the real CALLERS must do it too. Only the arm that INTENDS a disk refusal varies
 # the floor (it sets DISK_MIN_FREE_MB=9999999).
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; frc=$?
 got="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$frc" -eq 75 ] && [ "$got" = "1" ]; }; rc=$?
@@ -442,7 +698,14 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # The fixture is derived FROM THE SHIPPED HELPER (only the constant's definition is removed), so it
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
+cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/gate-policy.sh" "$RIG/stale/"
+# ⛔ THE VALIDATOR TRAVELS WITH THE STALE HELPER, AND THAT IS NOT A WEAKENING (#2258). What is stale
+# here is `spawn-gate.sh`'s refusal CONSTANTS, not the brief rules: a fixture that omitted
+# `brief-gate.sh` would make fix-one.sh exit 78 (cannot verify) and this arm would read "78" as the
+# stale-helper behaviour it is meant to test — passing for the wrong reason. The fixer's dependency on
+# the validator is the same class as its dependency on spawn-gate.sh.
 cp "$HERE/fix-one.sh" "$RIG/stale/"
+cp "$HERE/brief-gate.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
     "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
@@ -452,7 +715,7 @@ grep -q 'AGENT_DISK_REFUSED=' "$RIG/stale/spawn-gate.sh"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "...and the stale-helper fixture really carries no AGENT_DISK_REFUSED (the sed transformed it)" $rc
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$RIG/stale/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; src_=$?
 sgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$src_" -eq 75 ] && [ "$sgot" = "1" ]; }; rc=$?
@@ -477,7 +740,7 @@ ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $r
 # ... and the MANUAL path must refund NOTHING: it never incremented the counter, so refunding would
 # hand the controller a free attempt and the count would drift down forever.
 printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; frc=$?
 got="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$frc" -eq 75 ] && [ "$got" = "2" ]; }; rc=$?
@@ -490,7 +753,7 @@ ck "fix-one.sh (MANUAL/positional) refunds nothing — fixcount stays 2 (rc=$frc
 # process per suite run. A small limit bounds the leak to seconds without changing what is proven.
 : > "$PI_LOG"; : > "$MERGE_LOG"
 rows_d0=0; [ -s "$RO/state/disk.tsv" ] && rows_d0="$(wc -l < "$RO/state/disk.tsv" | tr -d ' ')"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; frc=$?
 { [ "$frc" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
 ck "POSITIVE CONTROL: gate open -> the fixer RUNS and the merge chain IS re-run (rc=$frc)" $rc
@@ -521,6 +784,281 @@ dp_p="$(cd "$dp" 2>/dev/null && pwd -P)"; wt_p="$(cd "$RREPO/.worktrees/fix-7" 2
 [ -n "$dp_p" ] && [ "$dp_p" = "$wt_p" ]; rc=$?
 ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path='${dp:-<none>}')" $rc
 
+# ── 9b) THE PR-OWNER LOCK: a fixer never runs while a LANDER owns the PR ──────
+# ⛔ THE SUBJECT IS THE SHIPPED `fix-one.sh`, DRIVEN. The defect is that `merge-one.sh` and the
+# doctor's `merge` role serialise on `$O/state/mergeclaim-<PR>.lock` while the ONE worker whose
+# product is a PUSH did not, so a lander could re-resolve a head that a fixer then moved under it —
+# and the rail refuses, with the attestation the review chain had just minted gone stale. A grep for
+# the filename would pass on an arm that opens the lock and never tests it, so every check below runs
+# the real script and asserts on what it DID: whether the stub agent ran, whether the chain was
+# re-run, which marker was written, and whether a LIVE owner's lock survived.
+#
+# ⛔ THE HEAD IS STUBBED AS A FUNCTION, NOT AS A FILE, for the reason the `pi` stub above documents:
+# fix-one.sh prepends /opt/homebrew/bin and /usr/local/bin to PATH, so a file stub is SHADOWED by a
+# system `gh` on any box that has one — and then these arms depend on the host. A function is
+# resolved before any PATH lookup, so it cannot be. It answers ONLY the head read and fails
+# everything else, which keeps the cross-box claim block and the check read on their documented
+# degraded paths (the head is what the bail marker needs).
+gh() { # exported: fix-one.sh's PATH prepend would shadow a file stub
+  case "$*" in
+    *"pr view"*) case "$*" in *"--json headRefOid"*) printf '%s\n' 0123456789abcdef0123456789abcdef01234567; return 0 ;; esac ;; esac
+  return 1
+}
+export -f gh
+# The chain stub records the HANDOFF's lock state: "the fixer released the PR-owner lock before
+# re-running the chain" is otherwise unobservable (a stub that ignores the lock passes either way).
+# MERGE_RC stays honoured — section 10 drives the wrappers through this same stub.
+printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\n[ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo MERGE_ONE_SAW_LOCK >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
+chmod +x "$RO/merge-one.sh"
+PRLOCK7="$RO/state/mergeclaim-7.lock"
+
+# A LIVE lander: the fixer must defer, refundably, and MUST NOT touch the lander's lock.
+sleep 300 & LANDER_PID=$!
+printf '%s\n' "$LANDER_PID" > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc=$?
+[ "$plrc" -eq 0 ]; rc=$?
+ck "a fixer DEFERS (rc=0) when the LANDER holds the PR-owner lock (rc=$plrc) — contention is not a failure" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "a lander-owned PR starts no agent and does NOT re-run the merge chain" $rc
+grep -q 'LANDER owns this PR (state/mergeclaim-7.lock held by live pid' "$RO/logs/fix-7.log"; rc=$?
+ck "...and NAMES the lander and its pid, not a generic refusal" $rc
+[ -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
+ck "...and writes the refundable bail marker for the head it saw (no attempt consumed)" $rc
+[ "$(cat "$RO/state/fixcount-7" 2>/dev/null)" = "2" ]; rc=$?
+ck "...and leaves fixcount alone — the controller refunds, the fixer does not decrement it" $rc
+{ [ -f "$PRLOCK7" ] && [ "$(cat "$PRLOCK7" 2>/dev/null)" = "$LANDER_PID" ]; }; rc=$?
+ck "...and the LIVE lander's lock SURVIVES — a deferred fixer must never clear another worker's claim" $rc
+kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
+
+# A STALE claim — its owner is MEASURABLY gone — is TAKEN OVER, not refused (#2574 (b)). `merge-one.sh`
+# itself reclaims this same file with `rm` + a retry, and `claim_live()` reclaims a dead owner's claim at
+# the controller's next dispatch; a fixer that only deferred would leave a manual `adopt-fix` blocked
+# behind bookkeeping that recorded a past state and is never revalidated. The takeover must still not be
+# the naive `rm && write` (two syscalls, so a peer's LIVE lock can be deleted between them): it renames
+# the record aside, VERIFIES what it detached is the dead pid it measured, and only then claims the
+# vacated path — so the assertions below check the outcome AND the evidence line.
+sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
+printf '%s\n' "$STALE_PID" > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
+{ [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG" && grep -q 'RECLAIMED a STALE claim' "$RO/logs/fix-7.log"; }; rc=$?
+ck "a STALE claim is TAKEN OVER, not refused: the fixer runs holding it and the chain re-runs (rc=$plrc2)" $rc
+grep -qF "RECLAIMED a STALE claim — state/mergeclaim-7.lock named pid $STALE_PID, which is not alive (measured with kill -0)" "$RO/logs/fix-7.log"; rc=$?
+ck "...and the takeover NAMES what it reclaimed — the lock and the pid it measured dead" $rc
+grep -qx "PI_LOCK_OWNER=$STALE_PID" "$PI_LOG" && rc=1 || rc=0
+ck "...and the record the agent worked under is NOT the dead pid (a steal that kept the stale record would pass the line above)" $rc
+{ ! grep -q 'DEFERRED' "$RO/logs/fix-7.log" && [ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; }; rc=$?
+ck "...and it is NOT a deferral — no bail marker, so no attempt is refunded for work that actually ran" $rc
+{ [ ! -f "$PRLOCK7" ] && [ -z "$(ls "$PRLOCK7".reclaim.* 2>/dev/null)" ]; }; rc=$?
+ck "...and neither the claim nor the detached stale record is left behind" $rc
+
+# ⛔ THE SAFETY ARM OF THE TAKEOVER, DRIVEN IN ISOLATION — this is the race the review reproduced.
+# Between the stale read and the detach a PEER may have reclaimed the lock, and a `rm && write`
+# reclaim then deletes that peer's LIVE claim and holds a lock two workers each believe they own.
+# `fix-one.sh` detaches by `mv`, CHECKS what it detached against the pid it measured, and puts a peer's
+# claim back with `ln` (create-if-absent) before deferring. The functions are EXTRACTED from the
+# shipped file — never re-implemented here, or the check would pass on a tree that does the wrong thing.
+# ⛔ AND THE PEER'S CLAIM MUST APPEAR *AFTER* THE READ, or the arm is VACUOUS (review of PR #2576, P2):
+# writing the live pid before the call makes the function's OWN first re-read fail, so `mv`, the
+# verification and the `ln` restore never execute — the check then passes on the banned `rm && write`
+# too. So the read is intercepted ONCE (the record answering the pid we measured) and the real file
+# already holds the peer's claim: the detach moves the PEER's record, which is exactly the case.
+PLG="$TMP/pl"; mkdir -p "$PLG"
+awk '/^prlock_take\(\)/{f=1} /^release_prlock\(\)/{f=0} f' "$HERE/fix-one.sh" > "$PLG/lib.sh"
+[ -s "$PLG/lib.sh" ] && bash -n "$PLG/lib.sh"; rc=$?
+ck "the takeover functions are EXTRACTABLE from the shipped fix-one.sh (the isolated arm below is not vacuous)" $rc
+cat > "$PLG/drive.sh" <<'PLGDRIVE'
+set -u
+PRLOCK="$1/lock"; L="$1/log"; PR=7; O="$1"
+. "$1/lib.sh"
+live="$2"; stale="$3"
+rm -f "$PRLOCK.seen"
+printf '%s\n' "$live" > "$PRLOCK"     # the record a PEER holds: it reclaimed after our measurement
+cat() { # the FIRST read of the record answers the pid we MEASURED; every later read is the real file
+  if [ "$1" = "$PRLOCK" ] && [ ! -e "$PRLOCK.seen" ]; then : > "$PRLOCK.seen"; printf '%s\n' "$stale"; return 0; fi
+  command cat "$@"
+}
+prlock_takeover "$stale"; rc=$?
+printf 'rc=%s got=%s leftovers=%s\n' "$rc" "$(command cat "$PRLOCK" 2>/dev/null)" "$(ls "$PRLOCK".reclaim.* 2>/dev/null | wc -l | tr -d ' ')"
+PLGDRIVE
+bash "$PLG/drive.sh" "$PLG" "$$" "$STALE_PID" > "$PLG/out" 2>&1
+{ grep -qx "rc=1 got=$$ leftovers=0" "$PLG/out"; }; rc=$?
+ck "a takeover that detaches a PEER's live claim puts it BACK and defers — nothing deleted, nothing left behind ($(cat "$PLG/out" 2>/dev/null))" $rc
+# ... and the SAME interception with a record that cannot be restored proves the outcome is REPORTED as
+# the different thing it is: a third party re-claims the path while our `ln` restore is being attempted.
+cat > "$PLG/drive2.sh" <<'PLGDRIVE2'
+set -u
+PRLOCK="$1/lock"; L="$1/log"; PR=7; O="$1"
+. "$1/lib.sh"
+live="$2"; stale="$3"; third="$4"
+rm -f "$PRLOCK.seen"
+printf '%s\n' "$live" > "$PRLOCK"
+cat() {
+  if [ "$1" = "$PRLOCK" ] && [ ! -e "$PRLOCK.seen" ]; then : > "$PRLOCK.seen"; printf '%s\n' "$stale"; return 0; fi
+  command cat "$@"
+}
+ln() { if [ "$1" = "$PRLOCK.reclaim.$$" ]; then printf '%s\n' "$third" > "$PRLOCK"; return 1; fi; command ln "$@"; }
+prlock_takeover "$stale"; rc=$?
+printf 'rc=%s\n' "$rc"
+PLGDRIVE2
+bash "$PLG/drive2.sh" "$PLG" "$$" "$STALE_PID" "1" > "$PLG/out2" 2>&1
+{ grep -qx 'rc=2' "$PLG/out2" && grep -q 'could NOT be restored' "$PLG/log.log"; }; rc=$?
+ck "an unrestorable displacement is reported as its OWN outcome (rc=2 + a WARNING), not as 'nothing was deleted' ($(cat "$PLG/out2" 2>/dev/null))" $rc
+
+# ⛔ AN UNREADABLE RECORD IS NOT A STALE ONE, AND STEALING IT IS THE ONE WAY TO TAKE A LIVE LANDER'S
+# CLAIM. `merge-one.sh` claims with `( set -o noclobber; echo $$ > "$CLAIM" )`: the file exists for an
+# instant BEFORE the pid is written, so "empty ⇒ dead owner" would take a lock whose owner is alive and
+# mid-claim. The fixer must treat it as LIVE: defer, and leave it exactly as it found it.
+: > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2b=$?
+{ [ "$plrc2b" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an EMPTY claim record is treated as LIVE and DEFERS (rc=$plrc2b, no agent) — a lander mid-claim is not a dead one" $rc
+{ [ -f "$PRLOCK7" ] && [ ! -s "$PRLOCK7" ]; }; rc=$?
+ck "...and it is left EXACTLY as found — never stolen from a claim whose pid may not be written yet" $rc
+grep -q 'no pid this lane can prove dead' "$RO/logs/fix-7.log"; rc=$?
+ck "...and says WHICH fact was missing, instead of reporting a stale owner it never measured" $rc
+rm -f "$PRLOCK7"
+
+# ⛔ AND A LOCK STATE NO RE-DISPATCH CAN CLEAR IS NOT REFUNDED (review of PR #2576, cycle 2 — P2). A
+# `mergeclaim-<PR>.lock` that is a DIRECTORY can never be read as an owner and never be taken; if the
+# refusal were refundable, spawn -> defer -> refund would spin for ever with `fixcount` netting to
+# zero, so `MAX_FIX_TRIES` would never park the PR and nothing would surface.
+rm -f "$PRLOCK7"; mkdir -p "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc4=$?
+{ [ "$plrc4" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an UNUSABLE lock path (a directory) refuses before any agent runs (rc=$plrc4)" $rc
+grep -q 'REFUSED (NOT refundable' "$RO/logs/fix-7.log"; rc=$?
+ck "...and says it is NOT refundable, so the cap can park the PR" $rc
+[ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
+ck "...and writes NO bail marker — a refundable spin would net fixcount to zero for ever" $rc
+grep -q 'REPAIR: inspect it' "$RO/logs/fix-7.log"; rc=$?
+ck "...and NAMES the repair for the unusable path" $rc
+rmdir "$PRLOCK7" 2>/dev/null || rm -rf "$PRLOCK7"
+
+# ⛔ THE OTHER NON-REFUNDABLE ARM — a `$O/state` that cannot be WRITTEN — had no test (review of PR
+# #2576, P3). There the lock path does not exist, so the fixer reaches the create-failure refusal, and
+# if a regression made that arm refundable, spawn -> defer -> refund would spin with `fixcount`
+# netting to zero for ever. Driven with a separate `$O` whose `state` is a REGULAR FILE, which needs no
+# root: every `state/...` write then fails with ENOTDIR, exactly the unwritable/corrupt shape this arm
+# exists for.
+RO3="$RIG/O3"; rm -rf "$RO3"; mkdir -p "$RO3/logs"; : > "$RO3/state"
+: > "$PI_LOG"; : > "$MERGE_LOG"
+( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$RO3/state/mergeclaim-7.lock" bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; plrc5=$?
+{ [ "$plrc5" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an UNWRITABLE state dir refuses before any agent runs (rc=$plrc5) — the second non-refundable arm" $rc
+grep -q 'REFUSED (NOT refundable' "$RO3/logs/fix-7.log"; rc=$?
+ck "...and says it is NOT refundable — otherwise spawn -> defer -> refund spins with fixcount netting to zero" $rc
+grep -q 'could not be CREATED although no file exists there' "$RO3/logs/fix-7.log"; rc=$?
+ck "...and names the CAUSE it measured (the create failed on an absent path), not a stale owner it never saw" $rc
+
+# POSITIVE CONTROL, and the assertion that pins the property the change exists for: with NO lock the
+# fixer runs, the lock is HELD WHILE THE AGENT RUNS, and it is RELEASED before the merge-one handoff
+# (otherwise merge-one.sh takes the same lock first and exits "already owns this PR", skipping the
+# fixer's own re-review — #2132's strand).
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc3=$?
+{ [ "$plrc3" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
+ck "POSITIVE CONTROL: with no lander the fixer RUNS and the chain is re-run (rc=$plrc3)" $rc
+grep -q PI_SAW_LOCK "$PI_LOG"; rc=$?
+ck "...and the lock is HELD WHILE THE AGENT RUNS — the property, not just the acquisition line" $rc
+{ grep -q MERGE_ONE_RAN "$MERGE_LOG" && ! grep -q MERGE_ONE_SAW_LOCK "$MERGE_LOG"; }; rc=$?
+ck "...and it is RELEASED before handing the PR to merge-one.sh (else the chain refuses its own re-review)" $rc
+[ ! -f "$PRLOCK7" ]; rc=$?
+ck "...so no lock is left behind by a completed fixer run (a stale lock would defer the next cycle)" $rc
+
+# ⛔ (c) THE CLAIM IS RELEASED ON THE CRASH PATH TOO — a lock leaked by a KILLED fixer is the same
+# stall one step later, and it is the path an operator never sees (nothing in the log after the
+# signal). The fixer is backgrounded, the `pi` stub BLOCKS so the worker is provably mid-run when it
+# is signalled, and the assertion is on the record: it named a live process before, and it is gone
+# after. A tree that releases only on its success path passes the positive control above and fails here.
+rm -f "$PRLOCK7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+# ⛔ THE BLOCKING STUB POLLS A STOP FILE INSTEAD OF `sleep 20` (review of PR #2576, P3). A bare
+# `sleep` is a CHILD of the fixer: `kill -TERM` reaches the shell, whose EXIT trap releases the claim
+# and exits, so the sleep survives — reparented and outliving the suite for its full duration (measured:
+# `pgrep -af '^sleep 20$'` after the run). Polling with a 0.1 s tick and a STOP file lets this arm stop
+# it deterministically without weakening what it proves (the fixer is mid-agent when it is signalled).
+PI_STOP="$TMP/pi.stop"; rm -f "$PI_STOP"
+pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; i=0; while [ "$i" -lt 600 ]; do [ -f "${PI_STOP:-/nonexistent}" ] && return 0; sleep 0.1; i=$((i+1)); done; return 0; }
+export -f pi
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PI_STOP="$PI_STOP" PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1 & fixpid=$!
+i=0; while ! grep -q PI_RAN "$PI_LOG" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+held="$(cat "$PRLOCK7" 2>/dev/null)"
+{ [ -n "$held" ] && kill -0 "$held" 2>/dev/null; }; rc=$?
+ck "while the agent works the claim names the LIVE fixer (lock=${held:-<none>}) — the crash arm is not vacuous" $rc
+# ⛔ SIGNAL THE LOCK OWNER, NOT THE SUBSHELL WRAPPER. `$fixpid` is the `( … ) &` subshell, NOT
+# `fix-one.sh` — measured on this box: wrapper=11948, lock owner=11953. Killing the wrapper makes
+# `wait` return 143 the instant the WRAPPER dies, while the fixer is still inside its `pi` stub, so
+# its claim is legitimately still present at assert time: the arm failed on TIMING, not on a leak
+# (the lock did disappear ~0.5 s later, unchanged). It also proved less than it claims — the signal
+# never reached the process whose EXIT trap is under test. `$held` IS that process (the pid
+# `prlock_take` wrote), so signal it, and the wrapper's `wait` then observes the fixer's own death.
+kill -TERM "${held:-$fixpid}" 2>/dev/null; : > "$PI_STOP"; wait "$fixpid" 2>/dev/null; crc=$?
+[ ! -f "$PRLOCK7" ]; rc=$?
+ck "a SIGTERM'd fixer RELEASES the claim (exit $crc, lock=${PRLOCK7##*/}) — a lock leaked by a dead fixer stalls the PR one step later" $rc
+[ ! -s "$MERGE_LOG" ]; rc=$?
+ck "...and the killed run did NOT hand the PR to the chain (a half-finished fixer must not trigger a re-review)" $rc
+# the blocking stub must not outlive the arm: its poll observes the stop file on the next 0.1s tick
+sleep 0.4
+{ ! grep -q 'while \[ "\$i" -lt 600 \]' "$HERE/spawn-gate.test.sh" || grep -q 'PI_STOP' "$HERE/spawn-gate.test.sh"; }; rc=$?
+ck "...and the blocking stub waits on a STOP FILE, not a bare \`sleep\` that outlives the killed worker" $rc
+# restore the fast stub for the section that follows, and reap the blocked one
+pi() { echo PI_RAN >> "$PI_LOG"; return 0; }
+export -f pi
+# ⛔ AND THE CROSS-BOX REFUSAL — the FIFTH rc=0-with-nothing-pushed arm (review of PR #2576, P3).
+# `fix-one.sh` refuses when another box already holds the per-head claim, and its line carries no
+# `DEFERRED` token, so without its own arm the operator's log got no line and the status said
+# SUCCESS for a run that did nothing. Driven with a claims.sh stub that refuses, and removed again so
+# the arms below are not diverted onto this path.
+# the deployed copies §10 uses; made here because this arm runs before §10's cp
+# ⛔ AND THE IDENTITY MODULE GOES WITH THEM (#2762/#2694): adopt-fix.sh and fix-one.sh source
+# `$SELF/repo-target.sh` (and it sources repo-slug.sh), so a copy without them exits 78 — a
+# half-deployed box — instead of reaching the claim refusal this arm is about.
+# ⛔ AND EVERY MODULE THE FIXER HARD-REQUIRES, NOT JUST THE TWO THE ARM IS ABOUT (review, P1).
+# `fix-one.sh` `exit 78`s without each of spawn-gate.sh (L54), brief-gate.sh (L62, resolved from
+# `$SELF` here, because spawn-gate.sh's `brief_gate_lib` prefers the script's OWN directory),
+# repo-target.sh (L69) and gate-policy.sh (L73). This rig seeded only four of the five, so the arm
+# returned 78 — a HALF-DEPLOYED BOX — and its assertions read as "the cross-box refusal is broken"
+# when the refusal was never reached (measured: `got 78`, on this tree and in CI). The two modules
+# this comment once left to luck are copied explicitly; the fallbacks `brief_gate_lib` also consults
+# (`$AGENT_INFRA_PATH`, `~/.pi/agent/scripts`) are NOT relied on, so the arm cannot pass on a dev box
+# and fail on a runner whose HOME has no harness scripts (same class as round 3's HOME fix).
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$HERE/gate-policy.sh" \
+   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
+# …and the arm must not be satisfiable by a rig that never reached the claim block: assert the
+# modules it needs are actually in $RO, so a future edit that drops one fails HERE, naming the
+# missing file, instead of resurfacing as a bogus 78 two assertions later.
+_rigmiss=""
+for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh; do
+  [ -f "$RO/$_m" ] || { echo "❌ the §9 rig is missing $_m in \$RO — the cross-box arm below would exit 78 before its refusal"; _rigmiss="$_m"; }
+done
+[ -z "$_rigmiss" ]; rc=$?
+ck "the §9 rig carries every module fix-one.sh hard-requires (a rig missing one asserts a HALF-DEPLOYED refusal, not the claim refusal)" $rc
+printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arccb=$?
+[ "$arccb" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports a CROSS-BOX claim refusal as 79 (got $arccb) — not SUCCESS for a run that pushed nothing" $rc
+grep -q 'CROSS-BOX claim' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it in the log the operator reads" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "...and nothing ran: no agent, no merge chain" $rc
+rm -f "$RO/claims.sh" "$RO/state/fixbail-7-"*
+unset -f gh; unset 'BASH_FUNC_gh%%'
+
 # ── 10) the WRAPPERS propagate the status ───────────────────────────────────────
 # adopt-fix.sh and chain-merge.sh are report-then-`echo` scripts: their LAST command used to be a
 # reporting `echo`, so `$?` was echo's — always 0 — and a wrapper doing `… && next` took the SUCCESS
@@ -528,7 +1066,12 @@ ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$RO/"
+# …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
+# `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
+# of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+cp "$HERE/brief-gate.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
@@ -545,7 +1088,7 @@ for want in 0 1 75; do
   ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — not a constant" $rc
 done
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc=$?
 [ "$arc" -eq 75 ]; rc=$?
 ck "adopt-fix.sh exits with the FIXER's status (75 on a load refusal), not echo's 0 (rc=$arc)" $rc
@@ -556,10 +1099,39 @@ ck "adopt-fix.sh NAMES the load gate on a load refusal" $rc
 # ... and the SUCCESS arm too: a constant-75 wrapper would pass the line above and report every
 # successful adopt as a refusal.
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc0=$?
 { [ "$arc0" -eq 0 ] && grep -q PI_RAN "$PI_LOG"; }; rc=$?
 ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not a constant" $rc
+# ⛔ ... AND A DEFERRAL IS NOT SUCCESS EITHER (#2576, review of PR #2576 P2). `fix-one.sh` now defers
+# (rc=0, nothing pushed) when a LANDER holds `mergeclaim-<PR>.lock`. `adopt-fix.sh` maps ITS OWN
+# deferrals to exit 79 precisely so an operator's `adopt-fix … && next` stops; a deferral it does not
+# recognise returns 0 and writes no line into `adopt-<PR>.log` — the log this wrapper exists to fill
+# (#1720) — so the operator sees SUCCESS for a fixer that did nothing and a chain that ran nothing.
+sleep 300 & ADOPT_LANDER=$!
+printf '%s\n' "$ADOPT_LANDER" > "$RO/state/mergeclaim-7.lock"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79=$?
+[ "$arc79" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS for a run that pushed nothing" $rc
+# ... and the UNUSABLE-lock refusal: also rc=0 with nothing pushed, and also invisible to an operator
+# who reads only adopt-<PR>.log unless this wrapper names it.
+rm -f "$RO/state/mergeclaim-7.lock"; mkdir -p "$RO/state/mergeclaim-7.lock"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79b=$?
+[ "$arc79b" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports an UNUSABLE PR-owner lock as 79 (got $arc79b) — not SUCCESS" $rc
+grep -q 'PR-OWNER lock, UNUSABLE' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it (UNUSABLE, with the repair pointer) in the operator's log" $rc
+rmdir "$RO/state/mergeclaim-7.lock" 2>/dev/null || rm -rf "$RO/state/mergeclaim-7.lock"
+grep -q 'PR-OWNER lock' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it in the log the operator reads" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "...and nothing ran: no agent, no merge chain" $rc
+kill "$ADOPT_LANDER" 2>/dev/null; wait "$ADOPT_LANDER" 2>/dev/null
+rm -f "$RO/state/mergeclaim-7.lock"
 # The DISK arm of the same wrapper: 77 must PROPAGATE too, and be named. A 75-only mapping would
 # report a full filesystem as "wait for the load to fall" — a remedy that cannot ever work.
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
@@ -577,7 +1149,15 @@ ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
 # lane.sh: the third ported caller. Assert it gets as far as the spawn (the prompt is written) and
 # then refuses WITHOUT starting an agent — the whole point, since lane.sh is what opens the PR.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+# ⛔ THE LANE'S CWD IS A WORKTREE OF THE TARGET REPO, ON THE BRANCH IT IS TOLD IT IS ON
+# (agent-infra#2724/#2694): lane.sh now refuses a wrong-repo worktree (72) and a worktree checked out
+# on a different named branch. These arms test the LOAD/DISK gate, so the fixture satisfies both.
+# ⛔ FROM THE WORKTREE THAT IS CHECKED OUT ON `work` (#2762 review, 6th cycle, P1). `$RREPO`'s HEAD is
+# `main` (the fixture creates `work` as a BRANCH and materialises `.worktrees/fix-7` on it), so running
+# the lane from `$RREPO` made the BRANCH assertion refuse 72 before the load gate was ever reached —
+# these two arms test the LOAD gate, so the fixture must satisfy the identity gate, exactly as the DISK
+# arm below already does.
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
@@ -587,13 +1167,179 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 # what opens a PR, so a lane refused here consumed nothing — but an operator told "load gate" would
 # re-dispatch into the same full filesystem for ever.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
 [ "$lrc2" -eq 77 ]; rc=$?
 ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the disk gate on a disk refusal" $rc
+
+# ── THE CAPABILITY GATE (agent-infra#2935) — the wiring, not the probe ───────────────────────
+# The probe's own arms live in `cell-lane-preflight.test.sh` (stub `pi`: answer+return, answer+never
+# return, never answer, …). What THIS arm pins is the half a unit test cannot see: that `run_agent`
+# asks the box at all, that a DETERMINISTIC verdict REFUSES with its own code, and that a verdict
+# which could be a transient does NOT. A box that answers and never returns is the shape that cost 12
+# of the fleet's 16 LLM-capable cores for a week; a box that merely failed to answer once is a
+# network blip, and refusing on that would stop the fleet.
+# ⛔ `run_agent` DIRECTLY, not through lane.sh: lane.sh is gated by the land-backlog ratio first
+# (`AGENT_LAND_BACKLOG`, 74) and this repo is genuinely over its ceiling, so a lane.sh route would
+# never reach the launch — the arm would be green (or red) for the wrong reason. The capability gate
+# is the LAST gate before the launch, which is exactly what sourcing the helper directly tests.
+cat > "$TMP/bin/pi" <<'PICAP'
+#!/bin/sh
+printf '%s\n' "$*" >> "${PI_LOG:-/dev/null}"
+exit 0
+PICAP
+chmod +x "$TMP/bin/pi"
+mkfake() { # mkfake <verdict-line> <exit>
+  { echo '#!/usr/bin/env bash'; echo "echo \"$1\""; echo "exit $2"; } > "$TMP/fake-preflight.sh"
+  chmod +x "$TMP/fake-preflight.sh"
+}
+cap_run() { # cap_run [VAR=value…] -> sets CRC; PI_LOG reflects what actually ran
+  # ⛔ `env`, NOT `VAR=… "$@" cmd`: an assignment that arrives through "$@" is an ARGV WORD, not an
+  # assignment, so the shell tries to exec `CELL_PREFLIGHT_SH=…` and exits 127 — which reads as "the
+  # gate refused" to anyone skimming. (Measured: rc=127 on all three arms before this note existed.)
+  : > "$PI_LOG"
+  env PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer "$@" \
+    bash -c '
+      . "$1"
+      LOG="$2"; PROMPT="$3"
+      load1() { printf "1"; }
+      run_agent 30 "$LOG" "$PROMPT" "capability test" >/dev/null 2>&1
+    ' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null
+  CRC=$?
+}
+# (a) answered-but-never-returned → REFUSED 71, and NO agent was started
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=exit-hang host=x answered_ms=2008 alive_at=30s' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "an answered-but-never-returned box is REFUSED with the capability code 71 and starts NO agent (rc=$CRC)" $rc
+grep -q 'LANE_CAPABILITY=refused why=exit-hang' "$LOG"; rc=$?
+ck "...and the lane log carries the READING it refused on (answered_ms … alive_at …)" $rc
+grep -q 'capability-gate. REFUSED' "$LOG"; rc=$?
+ck "...and NAMES the gate, so a refused spawn is not read as a cap kill or a load refusal" $rc
+# (b) no-answer → WARN and PROCEED (a transient must never arm a refusal)
+# ⛔ THE SHAPE MATTERS HERE, not just the word: `why=no-answer` means the process RETURNED, which is
+# the only shape a transient takes, so this fixture carries `returned_ms=` and `rc=`. The earlier
+# fixture was `alive_at=30s attempts=2` — a HANG wearing the WARN-side word — which the preflight can
+# no longer emit (a hang now reports `why=no-return`), so the arm was pinning a reading the probe does
+# not produce. A fixture that has drifted from the artifact tests the fixture.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=no-answer host=x returned_ms=1042 rc=1 attempts=2 bound=45s' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "an unanswered probe WARNS and still dispatches (rc=$CRC, never 71, agent ran) — a transient cannot arm a refusal" $rc
+grep -q 'capability-gate. WARN' "$LOG"; rc=$?
+ck "...and the WARN names the reading, so a stall that follows has a starting point" $rc
+# (c) the declared escape
+: > "$LOG"
+cap_run LANE_PREFLIGHT=0 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ] && ! grep -q 'capability-gate' "$LOG"; }; rc=$?
+ck "LANE_PREFLIGHT=0 is a real escape (rc=$CRC, no capability line written)" $rc
+# (d) A PERMANENT PRE-ANSWER HANG REFUSES. This is the arm the gate was vacuous for (review of #2991,
+# P1): a box that never produces the token could only ever emit `why=no-answer` and was dispatched
+# anyway, for ever.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=no-return host=x never_answered alive_at=45s attempts=2 bound=45s' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a box that hangs BEFORE the answer is REFUSED 71 and starts NO agent (rc=$CRC)" $rc
+grep -q 'LANE_CAPABILITY=refused why=no-return' "$LOG"; rc=$?
+ck "...and the log carries the pre-answer reading (never_answered alive_at …)" $rc
+# (e) rc=2 CANNOT MEASURE refuses too — the probe's own EXIT contract says so, and the caller ignored
+# it: an unreadable/empty keys.env was warned-and-dispatched, i.e. a lane started with no credential
+# burned the 3300 s cap and reported `(no response)` at the end.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=keys-unreadable host=x path=/home/cell/keys.env DEEPSEEK_API_KEY=unset' 2
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that CANNOT MEASURE (rc=2, keys unreadable) is REFUSED, not dispatched (rc=$CRC)" $rc
+grep -q 'credential could not be read' "$LOG"; rc=$?
+ck "...and the refusal names the remedy that applies (provision the key), not the extension set" $rc
+# (f) POLARITY: a reason THIS FILE HAS NEVER HEARD OF refuses. The first cut matched two substrings and
+# warned on everything else, so the fifth code arrived with no reader and a future reason would silently
+# inherit the permissive arm — the same defect class, one release later.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=some-future-verdict host=x attempts=1' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "an UNRECOGNISED refusal reason refuses (polarity, not an allow-list) (rc=$CRC)" $rc
+# (g) A VERDICT THAT NEVER CAME warns: a probe that could not run is not a verdict about the box.
+mkfake '' 1
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that produced NO verdict at all WARNS and dispatches (rc=$CRC, agent ran)" $rc
+# (h) A REFUSAL RESTORES THE CALLER'S JOB CONTROL. `set -m` is turned on above the gate and restored
+# after the launch, so the early return was the one path that left the caller with job control ON —
+# and with it on, an async command in the caller no longer gets its stdin from /dev/null (#2163).
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=exit-hang host=x answered_ms=2008 alive_at=45s' 3
+mstate="$(env PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh" \
+  bash -c '
+    . "$1"
+    LOG="$2"; PROMPT="$3"
+    load1() { printf "1"; }
+    set +m 2>/dev/null
+    run_agent 30 "$LOG" "$PROMPT" "jobctl test" >/dev/null 2>&1
+    case $- in *m*) echo MONITORING_ON ;; *) echo MONITORING_OFF ;; esac
+  ' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null)"
+[ "$mstate" = "MONITORING_OFF" ]; rc=$?
+ck "a capability refusal leaves the caller's job control as it found it (got '${mstate:-<empty>}')" $rc
+# (i) THE RESOLVER, RESOLVED THE WAY A REAL BOX DOES IT: `CELL_PREFLIGHT_SH` UNSET. Every arm above
+# pre-sets the cache, so they exercise the short-circuit and nothing else — which is why the first cut
+# of this gate shipped with `CELL_PREFLIGHT_SH` uninitialised under `set -u`: the resolver aborted
+# inside the command substitution, `run_agent` took the "not found" fail-open, and the gate never ran
+# on any box while this suite was green (review of #2991, P0).
+RES="$TMP/resolve"; mkdir -p "$RES/bin"
+cp "$HERE/spawn-gate.sh" "$RES/spawn-gate.sh"
+cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
+cat > "$RES/bin/pi" <<'PIHANG'
+#!/bin/sh
+case "$1" in --version) echo 9.9.9-stub; exit 0 ;; esac
+sleep 600
+PIHANG
+chmod +x "$RES/bin/pi"
+: > "$LOG"
+env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
+  LANE_PREFLIGHT_BOUND=2 \
+  bash -c '
+    . "$1"
+    LOG="$2"; PROMPT="$3"
+    load1() { printf "1"; }
+    # ⛔ THIS ARM MUST NOT INHERIT THE SUITE`S STUB. The fixture stubs `pi` as an exported bash FUNCTION
+    # (`export -f pi`, above), and a function outranks a PATH lookup in every descendant shell — so the
+    # probe resolved the suite`s echo-stub instead of $RES/bin/pi and reported an absent answer for a
+    # box the arm hung on purpose (measured: rc=0, the gate warned and dispatched). This is the only arm
+    # that runs the REAL probe, so it is the only one that has to drop the function; production has no
+    # such function, only the shim on PATH.
+    unset -f pi 2>/dev/null || true
+    run_agent 30 "$LOG" "$PROMPT" "resolver test" >/dev/null 2>&1
+  ' _ "$RES/spawn-gate.sh" "$LOG" "$PROMPT" 2>/dev/null
+rrc=$?
+{ [ "$rrc" -eq 71 ] && grep -q 'LANE_CAPABILITY=refused why=no-return' "$LOG"; }; rc=$?
+ck "the resolver finds the helper through the FILESYSTEM with CELL_PREFLIGHT_SH unset, and the probe RUNS (rc=$rrc)" $rc
+{ ! grep -q 'cell-lane-preflight.sh not found' "$LOG"; }; rc=$?
+ck "...and does not log the false 'not found' WARN that the unbound-variable abort produced" $rc
+
+# ── EVERY REFUSAL CODE MUST HAVE A READER (review of #2991, P1) ──────────────────────────────
+# A refusal code that no caller CLASSIFIES is worse than no gate: the box is refused correctly and the
+# operator is handed another gate's remedy. Measured on the first cut of #2935 — `AGENT_CAPABILITY_REFUSED`
+# (71) was defined here, returned here, and named by NOTHING else, so `lane.sh` fell through to
+# `_cap_gate=load` and published "load gate refused — issue returns to the queue" one line under this
+# file's own "This does NOT clear by waiting". `fix-one.sh` published "re-dispatched when 1-min load
+# falls", `chain-merge.sh` mapped it to 75 and `adopt-fix.sh` wrote no line at all.
+# This asserts the GENERAL property rather than the one instance: for every `AGENT_*_REFUSED=<code>`
+# this helper defines, some caller must name it. A sixth code added tomorrow without a reader is red
+# here, which is the only version of this guard worth having.
+_unread=""
+for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$HERE/spawn-gate.sh" | sort -u); do
+  grep -q "$_code" "$HERE/lane.sh" "$HERE/fix-one.sh" "$HERE/chain-merge.sh" \
+      "$HERE/adopt-fix.sh" "$HERE/nonblocking-dispatch.sh" 2>/dev/null || _unread="$_unread $_code"
+done
+[ -z "$_unread" ]; rc=$?
+ck "every AGENT_*_REFUSED code has a READER in its callers (unread:${_unread:- none})" $rc
 
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,
@@ -612,15 +1358,22 @@ drive_disk() { # drive_disk <path> <floor-mb> [<warn-mb>]
   # does NOT stub `load1` (the disk gate is the subject and it runs first), so without this the
   # section would go red on a busy box — and its own POSITIVE CONTROL with it. A test that fails for
   # a reason unrelated to its subject is worse than no test: it teaches the reader to ignore red.
+  # ⛔ THE HEADROOM GATE IS NEUTRALISED HERE (DISK_LANE_TREE_MB=0 / DISK_LANE_RESERVE_MB=0), because
+  # these arms are the FLOOR's: without it a host with less free space than the shipped per-lane
+  # reserve (6 GiB for a python target, 1 GiB otherwise) refuses before the floor is ever consulted,
+  # and every "the floor refused" assertion would pass for a reason it does not name. The headroom
+  # gate has its OWN arms below, which drive it with explicit costs.
   PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
   DISK_GATE_PATH="$path" DISK_MIN_FREE_MB="$floor" DISK_WARN_FREE_MB="$warn" \
+  DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
   bash -c '
     . "$1"
+    cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
     LOG="$2"; PROMPT="$3"
     run_agent 1 "$LOG" "$PROMPT" "disk gate test" >/dev/null 2>&1
     rc=$?
     printf "rc=%s started=%s" "$rc" "$AGENT_STARTED"
-  ' _ "$GATE" "$LOG" "$PROMPT"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO"
 }
 
 # POSITIVE CONTROL, FIRST — the file's own rule. On a tree with no disk probe at all the "refused"
@@ -690,7 +1443,7 @@ ck "a warn band below the floor is repaired to STRICTLY above it (got '$wb')" $r
 # fires on `mb < floor`, the warning on `mb < warn`, so a repaired-to-the-floor band could never
 # warn, i.e. the repair shipped the exact failure it existed to prevent while the value-only check
 # above stayed green. Drive the SHIPPED predicate AT the floor: the gate must allow it AND warn.
-band="$(DISK_MIN_FREE_MB=100 DISK_WARN_FREE_MB=1 bash -c '
+band="$(DISK_MIN_FREE_MB=100 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 DISK_WARN_FREE_MB=1 bash -c '
   . "$1"
   disk_ok 100  && a=allow   || a=refuse
   disk_low 100 && b=warn    || b=nowarn
@@ -755,6 +1508,87 @@ grep -q 'load-gate' "$LOG"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "...and the load refusal is NOT the only thing logged in that case" $rc
 
+# ⛔ FORK HEADROOM OUTRANKS BOTH, AND IT IS DRIVEN, NOT GREPPED (agent-infra#2293 — this section exists
+# because the verification gate found the first version of the fork arm INERT: it answered `ok` on a box
+# with 10 pids left, and every assertion about it was a grep). The reading is faked at its LEAVES
+# (`cap_procs_live`/`cap_ulimit_u`) so the real `cap_procs_pair_vars`, the real headroom arithmetic and
+# the real `spawn_fork_state` all run.
+# ⛔ THE CALLER'S VARIABLE NAMES BELOW (`p m src`) ARE THE POINT, not decoration: bash `local` is
+# DYNAMIC, so when this function's own locals were named `p`/`m`/`src` the `printf -v` writes landed in
+# the CALLEE's locals and the caller read empty strings — the arm then answered `ok`. Pinning both name
+# shapes makes that collision unrecoverable.
+cap_abspath="$(cd "$HERE/.." >/dev/null 2>&1 && pwd)/orchestrator-harness/capacity.sh"
+[ -f "$cap_abspath" ] || cap_abspath="$HERE/capacity.sh"
+# A pair that is out of headroom (10 spare, margin 200) yet PASSES the two-fork probe — the exact
+# condition the arithmetic arm exists for.
+fake_edge() { # fake_edge <procs> <max> — re-declares the leaves, then reports the module's own verdict
+  bash -c '
+    FAKE_PROCS="$1"; FAKE_MAX="$2"
+    . "$3" 2>/dev/null
+    cap_procs_live() { printf "%s" "$FAKE_PROCS"; }
+    cap_ulimit_u() { printf "%s" "$FAKE_MAX"; }
+    cap_maxprocperuid() { return 1; }
+    . "$4"
+    spawn_fork_state p m src
+    printf "COLLIDE:state=%s|detail=%s" "$p" "$m"
+    printf " \\n"
+    spawn_fork_state _dp _dm _ds
+    # Two specifiers, TWO arguments: the names `_dp _dm _ds` used to be passed as well and were never
+    # printed (a five-argument printf against a two-specifier format silently drops the tail, so a
+    # reader of the failure output saw nothing about which variables had been driven) — review P3.
+    printf "NOCLOBBER:state=%s|detail=%s" "$_dp" "$_dm"
+  ' _ "$1" "$2" "$cap_abspath" "$GATE"
+}
+edge_out="$(fake_edge 15631 15641)"
+case "$edge_out" in *"COLLIDE:state=refused"*"NOCLOBBER:state=refused"*) rc=0 ;; *) rc=1 ;; esac
+ck "a box 10 pids from its ceiling is REFUSED at the spawn point even when the caller names its vars p/m/src (dynamic-scoping collision) [$edge_out]" $rc
+case "$edge_out" in *"detail=headroom=10 < min_fork_headroom=200"*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the refusal NAMES the reading it refused (headroom, the margin, the pair) — not a bare 'busy'" $rc
+ok_out="$(fake_edge 400 15641)"
+case "$ok_out" in *"COLLIDE:state=ok"*) rc=0 ;; *) rc=1 ;; esac
+ck "POSITIVE CONTROL: the SAME box with 15k spare pids is ALLOWED (the arm is not a blanket refusal) [$ok_out]" $rc
+
+# END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
+# code (74, not 77/75), and the log says why.
+: > "$LOG"; : > "$PI_LOG"
+run_fork() { # run_fork <procs> <max> [<max-load>] [<disk-floor>]
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD="${3:-999999999}" \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB="${4:-1}" \
+  bash -c '
+    FAKE_PROCS="$5"; FAKE_MAX="$6"
+    . "$1" 2>/dev/null
+    cap_procs_live() { printf "%s" "$FAKE_PROCS"; }
+    cap_ulimit_u() { printf "%s" "$FAKE_MAX"; }
+    cap_maxprocperuid() { return 1; }
+    . "$2"
+    LOG="$3"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "fork gate test" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$cap_abspath" "$GATE" "$LOG" "$PROMPT" "$1" "$2"
+}
+ran="$(run_fork 15631 15641)"
+[ "$ran" = "rc=73 started=0" ]; rc=$?
+ck "run_agent REFUSES with the FORK code (73) on a starved box — no agent started ($ran)" $rc
+grep -q 'PI_RAN' "$PI_LOG" 2>/dev/null; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and pi was really NOT invoked (the stub never ran) — not merely 'the function returned non-zero'" $rc
+grep -q '\[fork-gate\] REFUSED' "$LOG"; rc=$?
+ck "...and the lane log names the fork gate and its reading (an operator is not left with a bare code)" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and it is NOT reported as a load refusal (the remedies differ: restart the box vs wait for load)" $rc
+# ⛔ FORK OUTRANKS DISK **AND** LOAD: all three would refuse, and the fork is the un-clearable one that
+# must be named first (the same precedence rule the disk-outranks-load arm above pins).
+: > "$LOG"; : > "$PI_LOG"
+both="$(run_fork 15631 15641 0 9999999)"
+[ "$both" = "rc=73 started=0" ]; rc=$?
+ck "a FORK refusal outranks a simultaneous DISK and LOAD refusal — the external-restart one is reported ($both)" $rc
+# …and the positive control through the same path: plenty of pids means the agent RUNS.
+: > "$LOG"; : > "$PI_LOG"
+runs="$(run_fork 400 15641)"
+[ "$runs" = "rc=0 started=1" ]; rc=$?
+ck "POSITIVE CONTROL: with headroom the SAME drive starts the agent (rc=0) — the gate is not always closed ($runs)" $rc
+
 # POSITIVE CONTROL for the drives below: with a floor this filesystem meets, the agent RUNS.
 : > "$LOG"; : > "$PI_LOG"
 res="$(drive_disk "$TMP" 1 4)"
@@ -789,7 +1623,7 @@ row="$(tail -1 "$TMP/O/state/disk.tsv" 2>/dev/null)"
 f4="$(printf '%s' "$row" | cut -f4)"; f5="$(printf '%s' "$row" | cut -f5)"
 nf="$(printf '%s' "$row" | awk -F'\t' '{print NF}')"
 case "$f4" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
-[ "$rc" -eq 0 ] && [ "$nf" = "5" ] && [ "$f5" = "$TMP" ]; rc=$?
+[ "$rc" -eq 0 ] && [ "$nf" = "7" ] && [ "$f5" = "$TMP" ]; rc=$?
 ck "a refusal records the MEASURED reading + path in disk.tsv (nf=$nf, free='${f4:-<none>}', path='${f5:-<none>}')" $rc
 
 # The WARN band: inside it the agent STILL STARTS — the warning is the point, not a second refusal.
@@ -810,6 +1644,101 @@ ck "an UNREADABLE probe fails OPEN — an unanswerable probe is not evidence of 
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
 ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not silently permissive" $rc
 
+# ── THE HEADROOM GATE (agent-infra#2721) ───────────────────────────────────────────────────────────
+# #2721's defect was NOT "the floor was too low": cell-4's spawns passed a floor of 500 MB with 2,286 MB
+# free and still filled the disk, because the lane each of them started was going to write 5-6 GB. The
+# missing instrument is the lane's OWN cost, so these arms drive IT — and they must fail on the
+# pre-#2721 tree, where `DISK_LANE_TREE_MB=999999` is an unused variable and every spawn is admitted.
+echo
+echo "── THE HEADROOM GATE (#2721): a lane's own tree against the space it has left ──"
+
+# drive_hd <path> <tree-mb> <reserve-mb> [<kind>] — the same rig as drive_disk, with the lane's cost
+# supplied EXPLICITLY so the verdict is decided by arithmetic rather than by this host's free space.
+drive_hd() { # drive_hd <path> <tree-mb> <reserve-mb> [<kind>]
+  local path="$1" tree="$2" reserve="$3" kind="${4:-}"
+  : > "$PI_LOG"
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$path" DISK_MIN_FREE_MB=1 DISK_WARN_FREE_MB=9999999 \
+  DISK_LANE_TREE_MB="$tree" DISK_LANE_RESERVE_MB="$reserve" KIND="$kind" \
+  bash -c '
+    . "$1"
+    cd "$5" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
+    LOG="$2"; PROMPT="$3"; KIND="${4:-agent}"
+    run_agent 1 "$LOG" "$PROMPT" "headroom gate test" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$kind" "$FIXREPO"
+}
+
+# POSITIVE CONTROL: a lane whose tree fits (tree 0) is ADMITTED. Without it, every refusal below
+# would pass on a gate that refuses unconditionally — the inert-gate mirror of the same defect.
+res="$(drive_hd "$TMP" 0 0)"; rc=$?
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "a lane whose tree FITS is admitted ($res)" $rc
+
+# THE REFUSAL, and it is NAMED with both terms. ⛔ THE TREE IS DELIBERATELY UNREACHABLE, not a real
+# 6 GiB: a real figure makes the arm depend on THIS HOST's free space, so the very box most likely to
+# run CI (a roomy one) would ADMIT here and report a false RED on the refusal it is supposed to pin.
+# The same idiom as the unreachable floor above (`DISK_MIN_FREE_MB=9999999`).
+: > "$LOG"
+res="$(drive_hd "$TMP" 9999999 9999999)"; rc=$?
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "DISK-NOHEADROOM: a lane whose tree + reserve exceeds free space is REFUSED (77) and nothing starts ($res)" $rc
+grep -q 'DISK-NOHEADROOM' "$LOG"; rc=$?
+ck "the refusal is NAMED 'DISK-NOHEADROOM', so it is not read as the load or the floor gate" $rc
+{ grep -q 'needs 9999999MB' "$LOG" && grep -q 'keep 9999999MB free' "$LOG" && grep -q '19999998MB is required' "$LOG"; }; rc=$?
+ck "it states BOTH terms and their sum, so the arithmetic can be checked from the log alone" $rc
+grep -q 'disk_min_free_mb=' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and it does NOT claim the floor refused: the floor is at 1MB, and the two verdicts differ" $rc
+grep -q 'NOT a load refusal' "$LOG"; rc=$?
+ck "...and it says waiting will not clear it, so an operator is not sent to a load remedy" $rc
+
+# THE OTHER DIRECTION — a tree that fits is admitted even inside the WARN band, i.e. the headroom gate
+# is a predicate and not a second, unconditional refusal.
+res="$(drive_hd "$TMP" 1 1)"; rc=$?
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "a small tree is admitted (the headroom gate is a predicate, not a blanket refusal) ($res)" $rc
+
+# ⛔ NO EXEMPTION BY KIND — a `fixer` provisions a FRESH worktree in adopt-fix.sh, so it pays the same
+# tree cost as a creation lane. Asserted in the refusing direction, because that is the claim.
+: > "$LOG"
+res="$(drive_hd "$TMP" 9999999 9999999 fixer)"; rc=$?
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "a FIXER lane is NOT exempt from the headroom gate (it provisions a fresh worktree too) ($res)" $rc
+
+# THE DERIVED PER-TARGET DEFAULTS (#1852's recorded finding: one global constant cannot serve an
+# agent-infra lane and a tortoise lane). Driven through the shipped `disk_lane_costs`, not re-derived.
+mkdir -p "$TMP/uvtarget"
+printf 'version = 1\n' > "$TMP/uvtarget/uv.lock"
+got="$(bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "350 6144" ]; rc=$?
+ck "a target with uv.lock derives the MEASURED python pair (want '350 6144', got '${got:-<none>}')" $rc
+got="$(bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP")"
+[ "$got" = "64 1024" ]; rc=$?
+ck "a target with no install step derives the harness pair (want '64 1024', got '${got:-<none>}')" $rc
+got="$(bash -c '. "$1"; DISK_LANE_TREE_MB=912 DISK_LANE_RESERVE_MB=5; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "912 5" ]; rc=$?
+ck "an operator OVERRIDE wins over the derived pair — a cell that measured differently can say so (got '${got:-<none>}')" $rc
+got="$(bash -c '. "$1"; DISK_LANE_TREE_MB=abc DISK_LANE_RESERVE_MB=; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "350 6144" ]; rc=$?
+ck "a NON-NUMERIC override is NOT an override: it derives, so a typo cannot disarm the gate (got '${got:-<none>}')" $rc
+
+# THE PREDICATE's boundaries, including the unreadable fail-open (it must match the floor's polarity).
+bash -c '. "$1"; disk_headroom_ok 100 50 50' _ "$GATE"; rc=$?
+ck "free == tree + reserve is ADMITTED (the boundary is inclusive)" $rc
+bash -c '. "$1"; disk_headroom_ok 99 50 50' _ "$GATE"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "one MB under tree + reserve is REFUSED" $rc
+bash -c '. "$1"; disk_headroom_ok "" 50 50' _ "$GATE"; rc=$?
+ck "an UNREADABLE reading fails OPEN, matching disk_ok/disk_low — a probe that cannot answer is not pressure" $rc
+
+# THE ALLOWED RUN RECORDS THE NUMBERS (fields 6-7), so "how close did we get" is answerable later.
+: > "$TMP/O/state/disk.tsv"
+res="$(drive_hd "$TMP" 7 11)"; rc=$?
+row="$(tail -1 "$TMP/O/state/disk.tsv" 2>/dev/null)"
+{ [ "$res" = "rc=0 started=1" ] && [ "$(printf '%s' "$row" | cut -f6)" = "7" ] && [ "$(printf '%s' "$row" | cut -f7)" = "11" ]; }; rc=$?
+ck "an ALLOWED run records the lane's tree + reserve in disk.tsv, so the series answers 'how close' (row='${row}')" $rc
+
 # ⛔ A NON-EMPTY BUT NON-NUMERIC READING IS "UNREADABLE" TOO, AND MUST BE ANNOUNCED (review round 1,
 # P2). `disk_ok`/`disk_low` BOTH classify a non-numeric reading as unreadable and fail open on it, but
 # the announcement tested `-z` — so the reading the predicates call "unreadable" was the one reading
@@ -821,16 +1750,684 @@ ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not sile
 res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 DISK_GATE_PATH="$TMP" \
   DISK_MIN_FREE_MB=9999999 bash -c '
     . "$1"
+    cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
     disk_free_mb() { printf "%s" "9.7e+15"; }
     LOG="$2"; PROMPT="$3"
     run_agent 1 "$LOG" "$PROMPT" "non-numeric probe" >/dev/null 2>&1
-    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT")"
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
 [ "$res" = "rc=0 started=1" ]; rc=$?
 ck "a NON-NUMERIC reading fails OPEN like an empty one — it is not a claim that the disk is full ($res)" $rc
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
 ck "...and a NON-NUMERIC reading is ANNOUNCED too — the predicates call it unreadable, so the log must agree" $rc
 
-# ── 12) a suite nothing RUNS is not a gate ──────────────────────────────
+# ── 12) a lane killed at its CAP keeps its work (#2045) ─────────────────────────────
+# THE MEASURED DEFECT (2026-10-18): eight background lanes dispatched, THREE produced nothing, and
+# one was killed at its 35-minute cap MID-WORK — 269,237 characters of transcript, seven MODIFIED
+# files in its worktree, no report file, no `.rc`, and the launcher reported
+# `worker finished: … commits=0 PR=none`. The work was recoverable only because a human happened to
+# notice a dirty temp worktree, and nothing in the harness could tell that lane from one that
+# legitimately had nothing to do: a killed lane's log is a slow lane's log.
+#
+# Every arm below drives the SHIPPED `run_agent` against a REAL git worktree and asserts on the
+# ARTIFACTS it wrote and on whether the KILL still landed — never on a message. The two properties
+# that must hold together pull in opposite directions and are pinned separately: the work is
+# preserved (arms 1–5, 8) AND a worker that IGNORES SIGTERM is still hard-killed at its cap (arm 6).
+# Trading the second for the first is the "a hung worker is never killed" regression the cap exists
+# to prevent, so it has its own arm rather than a sentence in a comment.
+CAPRIG="$TMP/caprig"; CREPO="$CAPRIG/repo"; CO="$CAPRIG/O"
+mkdir -p "$CAPRIG/bin" "$CO/logs" "$CO/state" "$CREPO"
+git -C "$CREPO" init -q -b main
+git -C "$CREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+printf 'line one\n' > "$CREPO/tracked.txt"
+git -C "$CREPO" add tracked.txt
+git -C "$CREPO" -c user.email=t@t -c user.name=t commit -q -m "seed"
+git -C "$CREPO" worktree add -q .worktrees/cap-1 -b work
+CWT="$CREPO/.worktrees/cap-1"
+# ⛔ THE CREATION BACK-PRESSURE GATE IS SUPPLIED A READING HERE TOO, NOT SWITCHED OFF (#2409/#2045).
+# `run_agent` now measures the repo's landing ratio through `gh` immediately before any spawn, so a
+# rig that supplies NEITHER a `gh` answer NOR a GitHub-origin repo is refused by the WRONG gate:
+# `land_backlog_repo` cannot derive owner/name from `$CWT`'s config, the gate fails CLOSED to
+# AGENT_LAND_BACKLOG (74), and every cap arm below then reads `cap_hit=0 dir=none` having never
+# started a worker (measured on the integration branch: 18 red arms, all `rc=74 cap_hit=0`). This is
+# the same seam, and the same rule, the `drive()` helper above already documents: an env var that
+# opens a gate is not a gate, so the calm reading is put where the gate actually READS it. The gate
+# itself is untouched — these arms test the CAP, not the backlog gate.
+# A linked worktree shares the repository config, so this origin is what `git -C "$CWT" remote`
+# answers for the arms' cwd.
+git -C "$CREPO" remote add origin https://github.com/owner/repo.git
+# ⛔ AND ITS TRANSPORT IS LOCAL (agent-infra#2834). The exit-path rescue now runs at the end of EVERY
+# `run_agent`, so the cap arms below — which leave the worktree DIRTY on purpose — would otherwise
+# attempt a real `git fetch`/`git push` against github.com from a test suite that promises to touch no
+# real state. `url.<bare>.insteadOf` rewrites the TRANSPORT only: `repo-slug.sh` reads
+# `git config --local --get remote.origin.url` and still sees the GitHub slug the creation gate needs
+# (a local `remote set-url` would be refused 74 by THAT gate), while the rescue's fetch and push land
+# in this bare repo. Hermetic, and it lets these arms exercise the rescue instead of skipping it.
+git init -q --bare -b main "$CAPRIG/origin.git"
+git -C "$CREPO" config url."$CAPRIG/origin.git".insteadOf https://github.com/owner/repo.git
+# The rescue builds its archive with `git commit-tree`, which needs an AUTHOR IDENTITY of its own; the
+# fixture's per-commit `-c user.email=…` would leave it with none, and the arm would then be measuring
+# a missing identity rather than the cap.
+git -C "$CREPO" config user.name t; git -C "$CREPO" config user.email t@t
+printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$CAPRIG/bin/gh"
+chmod +x "$CAPRIG/bin/gh"
+# A worker that never finishes inside the cap. (arm 6 replaces it with one that IGNORES SIGTERM;
+# the controls replace it with one that exits at once — a stub that outlives its cap cannot serve as
+# the "finished in time" control, it would just be another cap hit.)
+cap_stub() { # cap_stub sleep|exit0|ignoreterm
+  case "$1" in
+    exit0)      printf '#!/bin/sh\nexit 0\n' ;;
+    ignoreterm) printf '#!/bin/bash\ntrap "" TERM\nsleep 30\n' ;;
+    *)          printf '#!/bin/sh\nsleep 30\n' ;;
+  esac > "$CAPRIG/bin/pi"
+  chmod +x "$CAPRIG/bin/pi"
+}
+cap_stub sleep
+cap_dirty() {   # dirty the worktree the way a real lane leaves it: a tracked edit + an untracked file
+  printf 'line two — the work a cap kill used to destroy\n' >> "$CWT/tracked.txt"
+  printf 'brand new analysis\n' > "$CWT/untracked-new.txt"
+}
+cap_clean() {   # restore the committed content WITHOUT a path-restore verb (that is the discard the
+                # working-tree gate refuses in a worktree — and this suite must not do it in place)
+  git -C "$CWT" show HEAD:tracked.txt > "$CWT/tracked.txt"
+  rm -f "$CWT/untracked-new.txt"
+}
+# drive_cap <cap-s> <label> [<cwd>] [<wip-path>] — the shipped run_agent, load1 re-declared (the same
+# seam every other section uses), DISK_MIN_FREE_MB=1 and the headroom gate neutralised so the disk gate cannot decide an arm.
+drive_cap() { # drive_cap <cap-s> <label> [cwd] [wip-path]
+  local cap="$1" label="$2" cwd="${3:-$CWT}" wip="${4:-}"
+  PATH="$CAPRIG/bin:$PATH" O="$CO" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 WIP_PATH="$wip" bash -c '
+    . "$1"
+    # ⛔ UNSET THE EXPORTED `pi` FUNCTION FIRST. Section 9 exports one (`export -f pi`) because a
+    # function beats a caller-s own PATH prepend, and an exported function arrives in EVERY child
+    # bash — including this one. Left in place it would shadow the FILE stub these arms need, abort
+    # on its own unbound $PI_LOG under `set -u`, and return 127 instantly: every cap arm below then
+    # reads `cap_hit=0` for a reason that has nothing to do with the code under test (measured: 15
+    # red arms, all rc=127). This is the same shadowing class the #1828 comment inside section 9
+    # documents, from the other direction. (NO APOSTROPHES inside this body: it is a single-quoted
+    # `bash -c` string, and one of them silently ends it.)
+    unset -f pi 2>/dev/null || true
+    MAX_LOAD=999999999; load1() { printf "0"; }
+    cd "$2" || exit 9
+    run_agent "$3" "$4" "$5" "$6" >/dev/null 2>&1
+    rc=$?
+    # `${AGENT_CAP_HIT:-0}` — TOLERANT ON PURPOSE. On a tree without the fix these globals do not
+    # exist, and under `set -u` a bare reference would abort the arm with `unbound variable`: every
+    # red would then be a test error rather than the defect, and the pre-fix reading (a cap kill that
+    # reports NOTHING) would never be printed. With the default, the pre-fix run says
+    # `cap_hit=0 dir=none` on a run that demonstrably hit its cap — which IS the defect, stated.
+    printf "rc=%s cap_hit=%s dir=%s result=%s" "$rc" "${AGENT_CAP_HIT:-0}" "${WIP_SNAPSHOT_DIR:-none}" "${WIP_SNAPSHOT_RESULT:-none}"
+  ' _ "$GATE" "$cwd" "$cap" "$CO/logs/cap.log" "$PROMPT" "$label"
+}
+
+: > "$CO/logs/cap.log"; rm -rf "$CO/wip" "$CO/state/capwip.tsv"
+cap_clean; cap_dirty
+res="$(drive_cap 2 "capped lane")"
+case "$res" in *"cap_hit=1"*) rc=0 ;; *) rc=1 ;; esac
+ck "a run that reaches its cap sets AGENT_CAP_HIT=1 — a caller signal, never an inferred exit code ($res)" $rc
+snap="$(sed -n 's/.*dir=\([^ ]*\).*/\1/p' <<<"$res")"
+{ [ "$snap" != "none" ] && [ -d "$snap" ]; }; rc=$?
+ck "the cap wrote a snapshot directory ($snap)" $rc
+# THE ARTIFACT, RE-PARSED. "a file exists" is the false PASS this repo keeps removing: the patch
+# must PARSE as a patch and COVER the tracked change.
+if [ -f "$snap/tracked.patch" ] && git -C "$CWT" apply --numstat "$snap/tracked.patch" > "$CAPRIG/ns" 2>/dev/null; then rc=0; else rc=1; fi
+ck "…whose tracked.patch git apply can PARSE (re-verified, not assumed)" $rc
+grep -q 'tracked\.txt' "$CAPRIG/ns" 2>/dev/null; rc=$?
+ck "…and it covers the tracked edit the kill interrupted" $rc
+# THE REPLAY, DRIVEN. A parse check alone passes on a patch that parses and cannot apply.
+if [ -f "$snap/tracked.patch" ]; then
+  EXPECT="$(cat "$CWT/tracked.txt")"
+  cap_clean                       # back to the committed content: a replay target
+  ( cd "$CWT" && git apply "$snap/tracked.patch" ) >/dev/null 2>&1; arc=$?
+  { [ "$arc" -eq 0 ] && [ "$(cat "$CWT/tracked.txt")" = "$EXPECT" ]; }; rc=$?
+  ck "…and applying it to a reverted file RESTORES the work byte for byte (rc=$arc) — the replay is real" $rc
+else
+  ck "…and applying it to a reverted file RESTORES the work byte for byte (no patch was written)" 1
+fi
+if [ -f "$snap/untracked.tgz" ]; then
+  grep -qx 'untracked-new.txt' <<<"$(tar -tzf "$snap/untracked.tgz" 2>/dev/null)"; rc=$?
+  ck "…the untracked file is in untracked.tgz (an untracked file is work too)" $rc
+else
+  ck "…the untracked file is in untracked.tgz (no archive was written)" 1
+fi
+{ [ -f "$snap/SNAPSHOT.txt" ] && grep -qx 'result=COMPLETE' "$snap/SNAPSHOT.txt"; }; rc=$?
+ck "…SNAPSHOT.txt records result=COMPLETE, and COMPLETE means VERIFIED (patch parsed, archive listed)" $rc
+# The LEDGER row is what a later session reads instead of scrolling logs; the LOG line is what an
+# operator reading the lane's own log sees. Both must name the cap and the preserved directory.
+{ [ -s "$CO/state/capwip.tsv" ] && grep -q 'capped lane' "$CO/state/capwip.tsv"; }; rc=$?
+ck "a capwip.tsv row records the label, the cap and the snapshot (the fleet's own accounting)" $rc
+grep -q '\[cap\].*KILLED AT ITS 2s CAP.*work PRESERVED (COMPLETE)' "$CO/logs/cap.log"; rc=$?
+ck "the log says KILLED AT ITS CAP and names the preserved work — not silence" $rc
+grep -q '\[cap\]   replay:' "$CO/logs/cap.log"; rc=$?
+ck "…and prints the exact replay command, so recovering the work needs no guesswork" $rc
+
+# ⛔ CONTROL: a run that finishes BELOW the cap writes NOTHING. Without this, the arms above pass on
+# a tree that snapshots on EVERY run — slow, disk-hungry, and firing on healthy lanes.
+: > "$CO/logs/cap.log"; rm -rf "$CO/wip"
+cap_stub exit0
+res="$(drive_cap 30 "finished in time")"
+[ "$res" = "rc=0 cap_hit=0 dir=none result=none" ]; rc=$?
+ck "CONTROL: a run that finishes below its cap sets cap_hit=0 and writes NO snapshot ($res)" $rc
+cap_stub sleep
+[ ! -e "$CO/wip" ]; rc=$?
+ck "…and no wip/ directory is created at all on a healthy run" $rc
+# ⛔ A CLEAN TREE AT THE CAP IS NOT A LOSS, AND IT MUST STILL SAY SO. "the tree was clean" and "the
+# work was saved" are DIFFERENT FACTS, and their being indistinguishable IS the defect: both used to
+# read as `commits=0`. One `[cap]` line each; only the second mentions artifacts.
+: > "$CO/logs/cap.log"; cap_clean
+res="$(drive_cap 1 "clean at the cap")"
+case "$res" in *"cap_hit=1 dir=none"*) rc=0 ;; *) rc=1 ;; esac
+ck "a cap hit on a CLEAN worktree reports cap_hit=1 with no snapshot ($res)" $rc
+grep -q '\[cap\].*was CLEAN, so NOTHING WAS LOST' "$CO/logs/cap.log"; rc=$?
+ck "…and says NOTHING WAS LOST, so a clean cap is distinguishable from a lost one" $rc
+# ⛔ THE KILL STILL LANDS. A worker that IGNORES SIGTERM must be SIGKILLed at the cap — the snapshot
+# runs AFTER `wait`, so it can never hold the process open. This is the arm that catches a future
+# "checkpoint grace period" that quietly turns the cap into advisory.
+cap_stub ignoreterm
+: > "$CO/logs/cap.log"; rm -rf "$CO/wip"; cap_clean; cap_dirty
+h0="$(date +%s)"
+res="$(drive_cap 1 "ignores SIGTERM")"
+h1="$(date +%s)"; took=$((h1 - h0))
+case "$res" in *"cap_hit=1 dir="*) rc=0 ;; *) rc=1 ;; esac
+ck "a worker that IGNORES SIGTERM is still killed at its cap and its work is still snapshotted ($res)" $rc
+# A hard kill is a SIGNAL exit status; a clean finish is 0. Asserting the polarity, not a literal,
+# because 143 (TERM) and 137 (KILL) are both correct depending on whether the worker trapped TERM.
+case "$res" in *"rc=0 "*) rcbad=1 ;; *"rc="*) rcbad=0 ;; *) rcbad=1 ;; esac
+ck "…and the run's exit status is NON-ZERO (a hard kill, not a clean finish): $res" $rcbad
+# The watchdog budget is cap + 15 s grace + a little. THE LOWER BOUND IS THE DISCRIMINATOR: a
+# worker that HONOURED the SIGTERM would be gone in ~1 s, so a run that takes less than the grace
+# proves the trap was ignored — and one that finishes inside the upper bound proves the SIGKILL then
+# landed. Without both, this arm passes on a worker that simply died early.
+{ [ "$took" -ge 14 ] && [ "$took" -le 40 ]; }; rc=$?
+ck "…and the run took ${took}s (cap 1s + the 15s grace): the SIGTERM was IGNORED and the SIGKILL still landed" $rc
+cap_stub sleep
+# ⛔ AND THE WORKTREE IS NAMED, NOT ASSUMED. fix-one.sh `cd`s into the MAIN checkout while its work
+# lives in the fixer's worktree, so run_agent's `$PWD` default would snapshot the wrong tree and
+# report CLEAN while the fixer's work sat unsaved one directory away — a loud, WRONG verdict, which
+# is worse than no snapshot. `WIP_PATH` is that caller's answer, so drive it: cwd is the clean main
+# checkout, the dirty tree is the worktree, and the snapshot must be the WORKTREE's.
+: > "$CO/logs/cap.log"; rm -rf "$CO/wip"; cap_clean; cap_dirty
+res="$(drive_cap 2 "fixer shape" "$CREPO" "$CWT")"
+snap="$(sed -n 's/.*dir=\([^ ]*\).*/\1/p' <<<"$res")"
+{ [ "$snap" != "none" ] && [ -f "$snap/tracked.patch" ] && grep -q 'tracked\.txt' "$snap/tracked.patch"; }; rc=$?
+ck "WIP_PATH names the tree whose work is at risk: a cap kill with cwd in the MAIN checkout snapshots the FIXER's worktree ($res)" $rc
+
+# ⛔ THE ONLY DESTRUCTIVE PRIMITIVE GETS ITS OWN ARM (review cycle 2: the retention loop `rm -rf`s, and
+# nothing in the suite touched it). "it reads correctly" is not evidence for a delete: a wrong glob
+# here is silent data loss. Fixtures: 12 `capwip-*` directories (2 must go), a SIBLING capture from
+# another feature (never ours to remove), and a FILE that matches the prefix but is not a directory.
+PW="$CAPRIG/prune"; rm -rf "$PW"; mkdir -p "$PW"
+i=0; while [ "$i" -lt 12 ]; do mkdir -p "$PW/capwip-20260101-1$i"; i=$((i + 1)); done
+mkdir -p "$PW/other-capture"
+printf 'not a directory\n' > "$PW/capwip-notadir"
+bash -c '. "$1"; WIP_SNAPSHOT_KEEP=10; cap_wip_prune "$2"' _ "$GATE" "$PW"
+pdirs=0
+for d in "$PW"/capwip-*/; do [ -d "$d" ] && pdirs=$((pdirs + 1)); done
+[ "$pdirs" -eq 10 ]; rc=$?
+ck "cap_wip_prune keeps exactly WIP_SNAPSHOT_KEEP capwip DIRECTORIES out of 12 (kept=$pdirs)" $rc
+{ [ -d "$PW/other-capture" ] && [ -f "$PW/capwip-notadir" ]; }; rc=$?
+ck "…and removes NOTHING that is not a capwip-* directory (a sibling capture and a same-prefix FILE both survive)" $rc
+
+# ⛔ THE ABSENCE BRANCHES ARE VERDICTS TOO (VGATE cycle 3, F2). `WIP_SNAPSHOT_RESULT` used to be
+# EMPTY when no snapshot could be taken, and the launcher read an empty verdict as "the worktree was
+# CLEAN, nothing was lost" — so a cap kill on a FULL DISK (the leading cell failure mode) would have
+# announced that nothing was lost over work that existed only in a worktree about to be reaped. That
+# is #2045's own defect, one layer up. Every failure mode must name itself, and both are driven here.
+FB="$CAPRIG/failbranch"; mkdir -p "$FB/notagit"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" bash -c '
+  . "$1"
+  WIP_PATH="$2" cap_wip_snapshot "not a repo" 5 5 143 "$3" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/notagit" "$FB/log")"
+[ "$fb" = "rc=1 result=UNSNAPSHOTABLE" ]; rc=$?
+ck "a cap kill outside a git worktree returns 1 with result=UNSNAPSHOTABLE, never an empty verdict ($fb)" $rc
+# A wip path that is a FILE makes `mkdir -p` fail the same way a full disk does — and it fails for
+# root too, which a chmod-based fixture would not.
+mkdir -p "$FB/O/state"; printf 'not a dir\n' > "$FB/O/wip"
+cap_clean; cap_dirty
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$FB/O" WIP_PATH="$CWT" bash -c '
+  . "$1"
+  cap_wip_snapshot "disk full" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/log")"
+[ "$fb" = "rc=1 result=LOST" ]; rc=$?
+ck "…and a dirty tree it CANNOT write returns 1 with result=LOST (a full disk is not 'nothing was lost') ($fb)" $rc
+grep -q 'COULD NOT BE CREATED.*LOST if the worktree is reaped' "$FB/log"; rc=$?
+ck "…and says so loudly in the log, naming the one remaining copy" $rc
+
+# ⛔ A SNAPSHOT MUST NEVER CLAIM COMPLETE OVER NOTHING (VGATE cycle 5). Two shapes the two COUNTS
+# cannot see, both measured on the shipped code before this arm existed:
+#   (1) an UNBORN branch — `git init` + a staged file and no commit yet: `git diff HEAD` exits 128, so
+#       both counts read 0 while `status --porcelain` reports a modification, and the verdict was
+#       COMPLETE over a 0-byte patch (the log contradicted itself on one line: "work PRESERVED" over
+#       "tracked=0 path(s) -> tracked.patch (0 bytes, verified=0)");
+#   (2) an UNMERGED index — what `git merge` leaves mid-conflict, i.e. a fixer resolving conflicts, the
+#       exact caller that passes WIP_PATH. `git diff HEAD` then emits a BOGUS new-file diff that
+#       `git apply --numstat` parses happily, so parse-only "verification" passed while the replay the
+#       log prints fails with "already exists in working directory".
+UNB="$CAPRIG/unborn"; rm -rf "$UNB"; git init -q "$UNB"
+printf 'precious\n' > "$UNB/precious.txt"; git -C "$UNB" add precious.txt
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$UNB" bash -c '
+  . "$1"
+  cap_wip_snapshot "unborn branch" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/log2")"
+[ "$fb" = "rc=1 result=PARTIAL" ]; rc=$?
+ck "an UNBORN branch (dirty tree, no HEAD to diff) is PARTIAL, never COMPLETE over a 0-byte patch ($fb)" $rc
+# A real conflict, built the way git builds one, so the fixture cannot be fake.
+CFL="$CAPRIG/conflict"; rm -rf "$CFL"; git init -q -b main "$CFL"
+printf 'base\n' > "$CFL/f.txt"; git -C "$CFL" add f.txt
+git -C "$CFL" -c user.email=t@t -c user.name=t commit -q -m base
+git -C "$CFL" checkout -q -b side
+printf 'side\n' > "$CFL/f.txt"
+git -C "$CFL" -c user.email=t@t -c user.name=t commit -q -am side
+git -C "$CFL" checkout -q main
+printf 'main\n' > "$CFL/f.txt"
+git -C "$CFL" -c user.email=t@t -c user.name=t commit -q -am main
+git -C "$CFL" -c user.email=t@t -c user.name=t merge side >/dev/null 2>&1
+[ -n "$(git -C "$CFL" ls-files --unmerged)" ]; rc=$?
+ck "FIXTURE: the worktree really is mid-conflict (unmerged index stages exist)" $rc
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$CFL" bash -c '
+  . "$1"
+  cap_wip_snapshot "mid conflict" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/log3")"
+[ "$fb" = "rc=1 result=PARTIAL" ]; rc=$?
+ck "an UNMERGED index (the resolution is in NO artifact) is PARTIAL, never COMPLETE ($fb)" $rc
+
+# ⛔ CANNOT-VERIFY IS NOT CLEAN (VGATE cycle 6). A `git status` that cannot RUN must never take the
+# NOTHING-LOST branch — the repo's own ruling for this exact call (cloud-cell-supervisor.sh
+# `stamp_write`: "a `git status` that cannot run (corrupt index, ENOSPC, EACCES, safe.directory) is
+# CANNOT-VERIFY, never clean"). Two shapes, both measured against the shipped code, both of which
+# reported NOTHING-LOST over real uncommitted work: an unreadable `.git/index` (status exits 128 with
+# empty stdout) and an unreadable UNTRACKED DIRECTORY (status exits 0 with only a
+# `warning: could not open directory` and empty stdout).
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  ⏭  skip: running as root, so a chmod-000 fixture cannot make git fail"
+else
+  UC="$CAPRIG/unreadable-index"; rm -rf "$UC"; git init -q -b main "$UC"
+  printf 'base\n' > "$UC/f.txt"; git -C "$UC" add f.txt
+  git -C "$UC" -c user.email=t@t -c user.name=t commit -q -m base
+  printf 'PRECIOUS UNCOMMITTED WORK\n' >> "$UC/f.txt"
+  chmod 000 "$UC/.git/index"
+  fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$UC" bash -c '
+    . "$1"
+    cap_wip_snapshot "unreadable index" 5 5 143 "$2" >/dev/null 2>&1
+    printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+  ' _ "$GATE" "$FB/log4")"
+  chmod 644 "$UC/.git/index" 2>/dev/null || true
+  [ "$fb" = "rc=1 result=PARTIAL" ]; rc=$?
+  ck "an UNREADABLE .git/index (status cannot run) is PARTIAL, never 'nothing was lost' ($fb)" $rc
+  UD="$CAPRIG/unreadable-dir"; rm -rf "$UD"; git init -q -b main "$UD"
+  printf 'base\n' > "$UD/f.txt"; git -C "$UD" add f.txt
+  git -C "$UD" -c user.email=t@t -c user.name=t commit -q -m base
+  mkdir -p "$UD/notes"; printf 'work one\n' > "$UD/notes/a.md"; printf 'work two\n' > "$UD/notes/b.md"
+  chmod 000 "$UD/notes"
+  fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$UD" bash -c '
+    . "$1"
+    cap_wip_snapshot "unreadable dir" 5 5 143 "$2" >/dev/null 2>&1
+    printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+  ' _ "$GATE" "$FB/log5")"
+  chmod 755 "$UD/notes" 2>/dev/null || true
+  [ "$fb" = "rc=1 result=PARTIAL" ]; rc=$?
+  ck "an UNREADABLE untracked directory (status warns, exits 0) is PARTIAL, never 'nothing was lost' ($fb)" $rc
+fi
+
+# ⛔ AND A DIRTY SUBMODULE (VGATE cycle 7). `git diff HEAD` records only `Subproject commit <sha>-dirty`,
+# so a submodule's own uncommitted content is in NO artifact — while the verdict said COMPLETE. The
+# probe that was supposed to catch it was INERT: `git submodule status` does not annotate content
+# (`modified content` is a `git status` phrase), so it printed ` c1fec47 sub (heads/main)` and counted
+# zero. The state now comes from `git status --porcelain=v2`'s `<c><m><u>` field, and BOTH arms below
+# are driven — the dirty submodule, and a gitlink whose `.gitmodules` mapping is broken (which made
+# `git submodule status` fatal, blinding it for every submodule in the repo).
+SUB="$CAPRIG/subsrc"; SM="$CAPRIG/subparent"
+rm -rf "$SUB" "$SM"; git init -q -b main "$SUB"
+printf 's\n' > "$SUB/s.txt"; git -C "$SUB" add s.txt
+git -C "$SUB" -c user.email=t@t -c user.name=t commit -q -m s
+git init -q -b main "$SM"
+printf 'p\n' > "$SM/p.txt"; git -C "$SM" add p.txt
+git -C "$SM" -c user.email=t@t -c user.name=t commit -q -m p
+git -C "$SM" -c protocol.file.allow=always -c user.email=t@t -c user.name=t submodule add -q "$SUB" sub >/dev/null 2>&1
+git -C "$SM" -c user.email=t@t -c user.name=t commit -q -m sub >/dev/null 2>&1
+printf 'uncommitted submodule work\n' > "$SM/sub/UNCOMMITTED-WORK.txt"
+[ -d "$SM/sub" ] && [ -f "$SM/.gitmodules" ]; rc=$?
+ck "FIXTURE: a real submodule with uncommitted content exists (else the two arms below prove nothing)" $rc
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$SM" bash -c '
+  . "$1"
+  cap_wip_snapshot "dirty submodule" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/log6")"
+[ "$fb" = "rc=1 result=PARTIAL" ]; rc=$?
+ck "a DIRTY SUBMODULE (its content is in no artifact) is PARTIAL, never COMPLETE ($fb)" $rc
+# A gitlink with no .gitmodules mapping: `git submodule status` is FATAL here (rc=128), so a probe built
+# on it is blinded for every submodule in the repo — the inert-enforcer shape.
+GH="$CAPRIG/ghostgitlink"; rm -rf "$GH"; git init -q -b main "$GH"
+printf 'g\n' > "$GH/g.txt"; git -C "$GH" add g.txt
+git -C "$GH" -c user.email=t@t -c user.name=t commit -q -m g
+git -C "$GH" update-index --add --cacheinfo 160000,1111111111111111111111111111111111111111,ghost
+printf 'x\n' > "$GH/other.txt"
+grep -q 'ghost' <<<"$(git -C "$GH" status --porcelain=v2 --ignore-submodules=none 2>&1)"; rc=$?
+ck "FIXTURE: the ghost gitlink really appears in the porcelain=v2 read (else the arm below is vacuous)" $rc
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$GH" bash -c '
+  . "$1"
+  cap_wip_snapshot "ghost gitlink" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/log7")"
+case "$fb" in *result=COMPLETE*) rc=1 ;; *result=PARTIAL*) rc=0 ;; *) rc=1 ;; esac
+# NO BACKTICKS IN THIS MESSAGE: it is double-quoted, so `git submodule status` inside it is EXECUTED
+# while the message is built — measured, the failure line read "(fatal to )" (VGATE cycle 8, P2).
+ck "a GHOST GITLINK (no .gitmodules mapping, which is fatal to the submodule-status call) is PARTIAL, not COMPLETE ($fb)" $rc
+
+# ⛔ AND `status.showUntrackedFiles=no` MUST NOT DISABLE THE LEG (VGATE cycle 8, B2). It is a LEGAL
+# repo/global config under which `git status` hides untracked work: the read answered "clean", the leg
+# returned early with NOTHING-LOST and wrote NO snapshot at all, while `git ls-files --others` still
+# listed the work. `-uall` on the read is the fix, and this arm pins it by setting that config in the
+# fixture repo — a config must not be able to turn a safety leg off in the reassuring direction.
+SUO="$CAPRIG/ignore-untracked"; rm -rf "$SUO"; git init -q -b main "$SUO"
+printf 'base\n' > "$SUO/f.txt"; git -C "$SUO" add f.txt
+git -C "$SUO" -c user.email=t@t -c user.name=t commit -q -m base
+git -C "$SUO" config status.showUntrackedFiles no
+printf 'UNTRACKED WORK\n' > "$SUO/UNTRACKED-WORK.txt"
+grep -q 'UNTRACKED-WORK' <<<"$(git -C "$SUO" ls-files --others --exclude-standard)"; rc=$?
+ck "FIXTURE: the untracked file exists and git ls-files sees it" $rc
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$SUO" bash -c '
+  . "$1"
+  cap_wip_snapshot "showUntrackedFiles=no" 5 5 143 "$2" >/dev/null 2>&1
+  rc1=$?
+  printf "rc=%s result=%s dir=%s" "$rc1" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log8")"
+case "$fb" in *"result=COMPLETE"*) rc=0 ;; *) rc=1 ;; esac
+ck "an untracked file is CAPTURED even with status.showUntrackedFiles=no (the leg is not disabled by a config) ($fb)" $rc
+sd="$(sed -n 's/.*dir=\([^ ]*\).*/\1/p' <<<"$fb")"
+grep -qx 'UNTRACKED-WORK.txt' <<<"$(tar -tzf "$sd/untracked.tgz" 2>/dev/null)"; rc=$?
+ck "…and the work is really IN the archive, not merely counted" $rc
+
+# ⛔ AND AN ORDINARY NAME MUST NOT PRODUCE A FALSE PARTIAL (VGATE cycle 9, F1). The dirty-path reader
+# once used awk's `split($0, f, " ")`, which inherits the special single-space rule: it COLLAPSES runs
+# of spaces and DROPS leading blanks, so `two  spaces.txt` and ` lead.txt` differed from their archived
+# forms, `comm` reported them uncovered, and a FULLY PRESERVED snapshot said PARTIAL — an operator told
+# "do NOT reap" over work that was saved. Extraction is byte-exact (`index`/`substr`) now.
+SP="$CAPRIG/spaced"; rm -rf "$SP"; git init -q -b main "$SP"
+printf 'base\n' > "$SP/f.txt"; git -C "$SP" add f.txt
+git -C "$SP" -c user.email=t@t -c user.name=t commit -q -m base
+printf 'one\n' > "$SP/two  spaces.txt"
+printf 'two\n' > "$SP/ lead.txt"
+printf 'three\n' > "$SP/plain.txt"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$SP" bash -c '
+  . "$1"
+  cap_wip_snapshot "spaced names" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s dir=%s" "$?" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log9")"
+case "$fb" in *"result=COMPLETE"*) rc=0 ;; *) rc=1 ;; esac
+ck "paths with a DOUBLE SPACE and a LEADING SPACE still read COMPLETE (no false 'do NOT reap') ($fb)" $rc
+sd="$(sed -n 's/.*dir=\([^ ]*\).*/\1/p' <<<"$fb")"
+{ grep -qx 'two  spaces.txt' <<<"$(tar -tzf "$sd/untracked.tgz" 2>/dev/null)" \
+  && grep -qx ' lead.txt' <<<"$(tar -tzf "$sd/untracked.tgz" 2>/dev/null)"; }; rc=$?
+ck "…and both names are in the archive BYTE-EXACT (so the COMPLETE above is not vacuous)" $rc
+
+# ⛔ AND A COMPARATOR THAT CANNOT RUN MUST NOT READ AS 'FULLY COVERED' (VGATE cycle 9, F3). With `comm`
+# broken/absent the uncovered set is EMPTY, which the old code read as "everything is covered" — the
+# silent false PASS this leg exists to prevent. A non-zero status from sort/comm now caps the verdict.
+BAD="$CAPRIG/badcomm"; mkdir -p "$BAD"
+printf '#!/bin/sh\nexit 1\n' > "$BAD/comm"; chmod +x "$BAD/comm"
+cap_clean; cap_dirty
+fb="$(PATH="$BAD:$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$CWT" bash -c '
+  . "$1"
+  cap_wip_snapshot "broken comparator" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/log10")"
+case "$fb" in *"result=PARTIAL"*) rc=0 ;; *) rc=1 ;; esac
+ck "a comm that CANNOT RUN is PARTIAL, never a silent fully-covered answer ($fb)" $rc
+
+# ⛔ AND A BROKEN PARSER MUST NOT READ AS 'THE TREE WAS CLEAN' (VGATE cycle 10, F1). `n_dirty` defaults
+# to 0 and 0 is the PERMISSIVE answer — it short-circuits to NOTHING-LOST before any artifact exists.
+# A broken `awk` (no awk on PATH, a shadowing script, a broken build) used to produce exactly that on a
+# tree with two dirty paths. This stub is the same class as the broken-`comm` arm above, aimed at the
+# tool that decides ALL FOUR values.
+BADW="$CAPRIG/badawk"; mkdir -p "$BADW"
+printf '#!/bin/sh\nexit 1\n' > "$BADW/awk"; chmod +x "$BADW/awk"
+cap_clean; cap_dirty
+fb="$(PATH="$BADW:$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$CWT" bash -c '
+  . "$1"
+  cap_wip_snapshot "broken awk" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s" "$?" "$WIP_SNAPSHOT_RESULT"
+' _ "$GATE" "$FB/log11")"
+case "$fb" in *"result=NOTHING-LOST"*) rc=1 ;; *"result=PARTIAL"*) rc=0 ;; *) rc=1 ;; esac
+ck "a broken awk does NOT report NOTHING-LOST — a failed parse is work-at-risk ($fb)" $rc
+
+# ⛔ AND AN ORDINARY NON-ASCII NAME MUST LAND IN THE ARCHIVE (VGATE cycle 10, F3). The line-oriented
+# `git ls-files --others` QUOTES such a name (`an\303\241lisis.md`), `tar -T` cannot stat it, and the
+# file is silently MISSING while the verdict still counted other names. For a Spanish-language repo
+# `análisis.md` is an ordinary filename, not an edge case. NUL-delimited names are passed through
+# unquoted now.
+AC="$CAPRIG/accents"; rm -rf "$AC"; git init -q -b main "$AC"
+printf 'base\n' > "$AC/f.txt"; git -C "$AC" add f.txt
+git -C "$AC" -c user.email=t@t -c user.name=t commit -q -m base
+printf 'contenido\n' > "$AC/análisis.md"
+printf 'plain\n' > "$AC/plain.md"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$AC" bash -c '
+  . "$1"
+  cap_wip_snapshot "accented name" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s dir=%s" "$?" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log12")"
+ad="$(sed -n 's/.*dir=\([^ ]*\).*/\1/p' <<<"$fb")"
+{ grep -qx 'análisis.md' <<<"$(tar -tzf "$ad/untracked.tgz" 2>/dev/null)" \
+  && grep -qx 'plain.md' <<<"$(tar -tzf "$ad/untracked.tgz" 2>/dev/null)"; }; rc=$?
+ck "a NON-ASCII untracked name is IN the archive (byte-exact), beside the ASCII one ($fb)" $rc
+case "$fb" in *"result=COMPLETE"*) rc=0 ;; *) rc=1 ;; esac
+ck "…and the verdict is COMPLETE, not a false PARTIAL for a Spanish filename ($fb)" $rc
+
+# ⛔ AND A NAME BEGINNING WITH `-` MUST NOT BE READ AS A TAR OPTION (VGATE cycle 10, F3). GNU tar parses
+# a `-T` line starting with `-` as an option: `-C..` silently redirects tar's directory and the count
+# still "verifies" — an archive that is not the worktree's, reported as complete. Names are passed
+# verbatim now, so the file is captured as a FILE.
+DS="$CAPRIG/dashname"; rm -rf "$DS"; git init -q -b main "$DS"
+printf 'base\n' > "$DS/f.txt"; git -C "$DS" add f.txt
+git -C "$DS" -c user.email=t@t -c user.name=t commit -q -m base
+printf 'dash\n' > "$DS/-C.."
+printf 'normal\n' > "$DS/normal.txt"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$DS" bash -c '
+  . "$1"
+  cap_wip_snapshot "dash name" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s dir=%s" "$?" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log13")"
+dd="$(sed -n 's/.*dir=\([^ ]*\).*/\1/p' <<<"$fb")"
+grep -qx 'normal.txt' <<<"$(tar -tzf "$dd/untracked.tgz" 2>/dev/null)"; rc=$?
+ck "a leading-dash name does not REDIRECT the archive: normal.txt is still captured ($fb)" $rc
+
+# ⛔ AND A STASH IS NAMED WHERE THE MESSAGE WOULD OTHERWISE MISLEAD (VGATE cycle 10, F4). `git stash
+# push -u` leaves a CLEAN worktree, so this leg correctly has nothing to capture — but "NOTHING WAS
+# LOST" must not be read as "this repo holds nothing". `refs/stash` lives in the COMMON git dir, so it
+# SURVIVES the worktree being removed (the fact using-git-worktrees warns about from the other side);
+# the log now says so at the moment an operator would otherwise act on "nothing was lost".
+STQ="$CAPRIG/stashed"; rm -rf "$STQ"; git init -q -b main "$STQ"
+printf 'base\n' > "$STQ/f.txt"; git -C "$STQ" add f.txt
+git -C "$STQ" -c user.email=t@t -c user.name=t commit -q -m base
+printf 'hidden work\n' >> "$STQ/f.txt"
+git -C "$STQ" -c user.email=t@t -c user.name=t stash push -q -u -m probe >/dev/null 2>&1
+[ -z "$(git -C "$STQ" status --porcelain)" ] && git -C "$STQ" rev-parse --verify -q refs/stash >/dev/null 2>&1; rc=$?
+ck "FIXTURE: the worktree is clean and a stash exists (else the arm below proves nothing)" $rc
+: > "$FB/log14"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$STQ" bash -c '
+  . "$1"
+  cap_wip_snapshot "stashed work" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s dir=%s" "$?" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log14")"
+case "$fb" in *"result=NOTHING-LOST"*) rc=0 ;; *) rc=1 ;; esac
+ck "a CLEAN worktree with a stash is NOTHING-LOST for the worktree ($fb)" $rc
+grep -q 'this repo has a stash' "$FB/log14"; rc=$?
+ck "…and the log NAMES the stash, so 'nothing was lost' is not read as 'this repo holds nothing'" $rc
+
+# ⛔ AND THE REPLAY LINE MUST NOT NAME AN ARCHIVE THAT WAS NEVER CREATED (VGATE cycle 11/12). A dirty
+# tree with NO untracked work has no tarball, and naming one sends an operator to a command that cannot
+# work at the moment they are rescuing work. IT NEEDS ITS OWN FIXTURE: the stash arm above is a CLEAN
+# tree, which takes the NOTHING-LOST branch and returns before any replay line exists (the first version
+# of this arm grepped that log and was structurally unpassable — a red gate over a test-wiring defect).
+RT="$CAPRIG/trackedonly"; rm -rf "$RT"; git init -q -b main "$RT"
+printf 'base\n' > "$RT/f.txt"; git -C "$RT" add f.txt
+git -C "$RT" -c user.email=t@t -c user.name=t commit -q -m base
+printf 'more work\n' >> "$RT/f.txt"
+: > "$FB/log15"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$RT" bash -c '
+  . "$1"
+  cap_wip_snapshot "tracked only" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s dir=%s" "$?" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log15")"
+grep -q 'no untracked files were present' "$FB/log15"; rc=$?
+ck "a dirty tree with NO untracked work says so, instead of naming a tarball that does not exist ($fb)" $rc
+cl="$(awk '/replay:/ && /untracked\.tgz/ {n++} END{print n+0}' "$FB/log15")"
+[ "$cl" -eq 0 ]; rc=$?
+ck "…and its replay line does not mention untracked.tgz at all" $rc
+
+# ⛔ A LEDGER ROW ON EVERY VERDICT (review finding, P2). `state/capwip.tsv` is the fleet's own record of
+# cap kills, and it used to gain a row only on the fall-through path: a CLEAN cap kill, a `LOST`
+# snapshot (the full-disk case) and an `UNSNAPSHOTABLE` one (a mis-pointed WIP_PATH) left NO trace, so a
+# later session reading only the ledger could not tell "cap kill, nothing lost" from "no cap kill" — the
+# absence-reads-as-fine defect this whole leg exists to remove. Each verdict is driven and its row read
+# back.
+LEDGER="$CAPRIG/ledger/O"; rm -rf "$CAPRIG/ledger"
+ledger_count() { wc -l < "$LEDGER/state/capwip.tsv" 2>/dev/null | tr -d ' '; }
+cap_clean
+PATH="$CAPRIG/bin:$PATH" O="$LEDGER" WIP_PATH="$CWT" bash -c '
+  . "$1"
+  cap_wip_snapshot "clean verdict" 5 5 143 "$2" >/dev/null 2>&1
+' _ "$GATE" "$FB/log16"
+grep -q 'NOTHING-LOST' "$LEDGER/state/capwip.tsv" 2>/dev/null; rc=$?
+ck "a CLEAN cap kill WRITES a ledger row (verdict NOTHING-LOST), so 'nothing lost' is not an absence" $rc
+mkdir -p "$CAPRIG/ledger2/O/state"; printf 'not a dir\n' > "$CAPRIG/ledger2/O/wip"; cap_dirty
+PATH="$CAPRIG/bin:$PATH" O="$CAPRIG/ledger2/O" WIP_PATH="$CWT" bash -c '
+  . "$1"
+  cap_wip_snapshot "lost verdict" 5 5 143 "$2" >/dev/null 2>&1
+' _ "$GATE" "$FB/log17"
+grep -q 'LOST' "$CAPRIG/ledger2/O/state/capwip.tsv" 2>/dev/null; rc=$?
+ck "…and so does a FAILED snapshot (verdict LOST) — the full-disk case leaves a trace, not silence" $rc
+mkdir -p "$CAPRIG/ledger3/O/state" "$CAPRIG/notarepo3"
+PATH="$CAPRIG/bin:$PATH" O="$CAPRIG/ledger3/O" WIP_PATH="$CAPRIG/notarepo3" bash -c '
+  . "$1"
+  cap_wip_snapshot "unsnapshottable verdict" 5 5 143 "$2" >/dev/null 2>&1
+' _ "$GATE" "$FB/log18"
+grep -q 'UNSNAPSHOTABLE' "$CAPRIG/ledger3/O/state/capwip.tsv" 2>/dev/null; rc=$?
+ck "…and a mis-pointed WIP_PATH leaves a row too (verdict UNSNAPSHOTABLE)" $rc
+n_rows="$(awk 'END{print NR+0}' "$LEDGER/state/capwip.tsv" 2>/dev/null)"
+[ "${n_rows:-0}" -eq 1 ]; rc=$?
+ck "…exactly one row per kill, not one per path (clean kill wrote ${n_rows:-0} row(s))" $rc
+
+# ⛔ AND THE STATE READ MUST NOT TAKE AN OPTIONAL LOCK. `git status` refreshes the stat cache under
+# `.git/index.lock`; on a worktree with a surviving orphaned writer (declared residual) that lock can
+# make the LIVE writer's next git command fail — a failure the rescue would have introduced. The read
+# carries `--no-optional-locks` (measured: the index mtime moves on a plain `git status` and not with
+# the flag). Structural, because the alternative is racing a real writer.
+grep -q -- '--no-optional-locks status --porcelain=v2' "$GATE"; rc=$?
+ck "the worktree state read carries --no-optional-locks (a rescue must not interpose a lock on a live writer)" $rc
+
+# ⛔ CONTAINMENT IS A FULL-PATH TEST, NOT A BASENAME TEST (review finding, P2 — reproduced). The prune
+# list is consumed line by line, so a `capwip-*` directory whose name contains a NEWLINE arrives as two
+# fragments: the first is not a directory, and the second (`capwip-victim`) was resolved relative to the
+# CALLER'S CWD and DELETED — the only destructive primitive in this leg deleting an unrelated directory
+# outside the wip root. The victim here sits in the cwd the prune runs from, exactly the shape measured.
+PN="$CAPRIG/prune-newline"; rm -rf "$PN"; mkdir -p "$PN/wip" "$PN/cwd"
+i=0; while [ "$i" -lt 12 ]; do mkdir -p "$PN/wip/capwip-keep-$i"; i=$((i + 1)); done
+# ⛔ THE NEWLINE ENTRY MUST SORT AFTER THE KEEP BUDGET, or this arm is VACUOUS (verification finding):
+# `ls -1dt` lists a freshly created entry FIRST, so its `capwip-victim` fragment counts at n=1 — inside
+# the budget — and the pre-fix basename code never reached the rm. Backdated, the fragment is counted
+# after the budget, which is the only ordering in which the escape is reachable.
+mkdir -p "$PN/wip/capwip-a
+capwip-victim"
+touch -t 200001010000 "$PN/wip/capwip-a
+capwip-victim"
+mkdir -p "$PN/cwd/capwip-victim"
+last_line="$(ls -1dt "$PN/wip"/capwip-* 2>/dev/null | tail -1)"
+case "$last_line" in capwip-victim) rc=0 ;; *) rc=1 ;; esac
+ck "FIXTURE: the newline entry sorts LAST, so its fragment is counted after the keep budget (else this arm is vacuous)" $rc
+( cd "$PN/cwd" && bash -c '. "$1"; WIP_SNAPSHOT_KEEP=10; cap_wip_prune "$2"' _ "$GATE" "$PN/wip" )
+[ -d "$PN/cwd/capwip-victim" ]; rc=$?
+ck "a NEWLINE in a capwip name cannot make the retention rm -rf escape the wip root (victim survives)" $rc
+pkept=0
+for d in "$PN/wip"/capwip-*/; do [ -d "$d" ] && pkept=$((pkept + 1)); done
+[ "$pkept" -ge 10 ]; rc=$?
+ck "…and the ordinary snapshots are still retained (kept=$pkept of 12 + the newline-named one)" $rc
+
+# ⛔ AND THE REPLAY LINE MUST NOT PASTE A `git apply` OF AN EMPTY PATCH (review finding, P3). An
+# untracked-only tree produces a 0-byte tracked.patch, and `git apply` on it exits 128 ("No valid
+# patches in input") — an instruction that fails at the moment somebody is rescuing work, mirroring the
+# tarball that was never created (cycle 12).
+UO="$CAPRIG/untrackedonly"; rm -rf "$UO"; git init -q -b main "$UO"
+printf 'base\n' > "$UO/f.txt"; git -C "$UO" add f.txt
+git -C "$UO" -c user.email=t@t -c user.name=t commit -q -m base
+printf 'only untracked\n' > "$UO/only-untracked.txt"
+: > "$FB/log19"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$UO" bash -c '
+  . "$1"
+  cap_wip_snapshot "untracked only" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s dir=%s" "$?" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log19")"
+grep -q 'no tracked changes were captured' "$FB/log19"; rc=$?
+ck "an UNTRACKED-ONLY tree says there is no patch to apply, instead of pasting a git-apply of 0 bytes ($fb)" $rc
+# ⛔ MATCH THE COMMAND, NOT THE WORD (verification finding): the honest wording contains "patch to
+# apply", so `/apply/` matched its own prose and the arm failed on a correct fix. `git -C` is the
+# invocation shape — that is what must be absent when there is no patch.
+ue="$(awk '/replay:/ && /git -C/ {n++} END{print n+0}' "$FB/log19")"
+[ "$ue" -eq 0 ]; rc=$?
+ck "…and its replay line contains no git-apply invocation at all" $rc
+
+# ⛔ AND THE LAUNCHER MUST REPORT IT (#2045 indicator (b)). `nonblocking-dispatch.sh --status` used to
+# answer a cap kill with a bare exit status — and `worker finished: commits=0` in the reported line —
+# so a supervisor reading it saw a healthy quiescent lane and did NOT re-dispatch. Driven end to end:
+# a real dispatch, a worker killed at a 1 s cap, and the status line read back.
+BG="$CAPRIG/bg"; mkdir -p "$BG/logs" "$BG/state"
+cap_clean; cap_dirty
+# ⛔ THIS FIXTURE IS GATED TOO (review cycle 4, P1). `nonblocking-dispatch.sh` runs the research-first
+# gate in the FOREGROUND, so a bare `a prompt` brief is refused with 80 and NO worker is ever started —
+# the three cap-kill arms below then read "lost (no exit status recorded)" and assert a cap kill on a
+# dispatch that never happened. MEASURED: 165 passed / 3 failed, and the same rc/status string reproduced
+# standalone. Rendered from the validator with the role the dispatcher gates on (`worker`, i.e. KIND=bg),
+# and asserted at BUILD time: a fixture that drifts must fail here, by name, not three arms later as a
+# mysterious "lost" lane.
+{ printf 'a prompt for a background worker\n\n'; bash "$HERE/brief-gate.sh" --section worker; } > "$BG/prompt"
+bash "$HERE/brief-gate.sh" --check "$BG/prompt" worker 2>/dev/null \
+  || { echo "  ❌ the cap-kill fixture brief is REFUSED by the research-first gate" >&2; exit 1; }
+pi() { sleep 30; }            # exported: a FUNCTION beats the launcher's own PATH prepend (#1828)
+export -f pi
+( cd "$CWT" && O="$BG" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+    bash "$HERE/nonblocking-dispatch.sh" caplane "$CWT" "$BG/prompt" 1 >"$BG/dispatch.out" 2>&1 )
+n=0; while [ ! -s "$BG/bg/caplane.rc" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n+1)); done
+st="$(O="$BG" bash "$HERE/nonblocking-dispatch.sh" --status caplane 2>&1)"
+case "$st" in
+  *"failed rc="*) stfail=0 ;;
+  *"done rc=0"*)  stfail=1 ;;
+  *)              stfail=1 ;;
+esac
+ck "nonblocking-dispatch --status reports a cap-killed lane as FAILED, never as finished ($st)" $stfail
+grep -q 'cap 1s hit' <<<"$st"; rc=$?
+ck "…and NAMES the cap and the preserved snapshot, so the loss is visible in the fleet's accounting" $rc
+# ⛔ AND IT MUST NOT SOFTEN A FAILED SNAPSHOT (VGATE cycle 3, F2, end to end). Same dispatch, but the
+# snapshot cannot be taken, so the status must say WORK NOT PRESERVED — never "nothing was lost".
+# ⛔ THE ARM'S PREMISE IS CORRECTED FOR #2409, NOT THE ASSERTION. "A cap kill OUTSIDE a git worktree"
+# is unreachable end to end on the merged tree: `run_agent` derives the repo from the SPAWN cwd, so a
+# non-repo cwd is HELD by the creation back-pressure gate (74) before any worker starts — the arm then
+# measured the BACKLOG gate and never the snapshot verdict (measured on the integration branch:
+# `caplane2 failed rc=74`, no cap, no snapshot). The reachable shape of the same defect — and the one
+# the shipped message itself names ("If this lane's work lives in another directory, pass
+# WIP_PATH=<worktree>") — is a lane that spawns from a real worktree whose WIP_PATH points somewhere
+# that is not one: the spawn is measured, the cap fires, and the snapshot cannot be taken. So the
+# dispatch runs in an origin-bearing worktree and WIP_PATH names the non-git dir. Nothing is softened:
+# the cap still fires, the snapshot still genuinely fails, and the status must still say so.
+NWT="$CAPRIG/norepo-wt"; mkdir -p "$NWT"
+git -C "$NWT" init -q -b main
+git -C "$NWT" remote add origin https://github.com/owner/repo.git
+git -C "$NWT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+pi() { sleep 30; }
+export -f pi
+( cd "$NWT" && O="$BG" WIP_PATH="$FB/notagit" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+    bash "$HERE/nonblocking-dispatch.sh" caplane2 "$NWT" "$BG/prompt" 1 >"$BG/dispatch2.out" 2>&1 )
+n=0; while [ ! -s "$BG/bg/caplane2.rc" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n + 1)); done
+st2="$(O="$BG" bash "$HERE/nonblocking-dispatch.sh" --status caplane2 2>&1)"
+grep -q 'WORK NOT PRESERVED' <<<"$st2"; rc=$?
+ck "…and a cap kill it could NOT snapshot reports WORK NOT PRESERVED ($st2)" $rc
+case "$st2" in *"nothing was lost"*) nl=1 ;; *) nl=0 ;; esac
+ck "…and that line never claims 'nothing was lost' over work only the worktree still holds" $nl
+unset -f pi
+
+# ── 13) a suite nothing RUNS is not a gate ──────────────────────────────
 # ⛔ THIS SUITE IS NOW A REGISTERED CI SHARD (review round 2, P1). It was not, and the block that
 # stood here said `scripts/run-bash-shards.sh` was "held by concurrent lanes (PR #1769/#1730), so the
 # entry cannot be added from here". #1769 is MERGED (a5fa100, an ancestor of this head) — and, more to

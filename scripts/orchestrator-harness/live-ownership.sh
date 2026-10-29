@@ -329,7 +329,7 @@ lo_select_rows() {
 
 # ── the choice ────────────────────────────────────────────────────────────────
 # lo_select <total> <owned> <unowned> <parked-excluded> <first-pr|-> <capacity-reason|-> <backlog> \
-#          [<acted> <named-waits>]
+#          [<acted> <named-waits> <record|unknown> [<spawned>]]
 #
 # Prints the ONE-LINE FUNNEL that makes the cycle's choice auditable, and sets LO_CHOICE to
 # pr|issue|none. The ordering IS the rule: un-owned PRs → new issues → nothing.
@@ -347,9 +347,18 @@ lo_select_rows() {
 # declared needs-a-human (parked at this head). Counting a parked PR would latch the issue path shut
 # forever on a PR no lane may touch, which is the "stale flag that records a past state" failure this
 # harness has already been bitten by. `parked-excluded` is printed so the subtraction is visible.
+#
+# ⛔ `spawned` IS THE ONE THAT ANSWERS THE QUESTION (agent-infra#2590). `acted` counts ACTIONS and an
+# action is not a spawn: `gh pr merge`, `gh run rerun`, a draft-ready and an auto-merge ARM are all
+# `act` rows, and NONE of them starts a worker. MEASURED 2026-10-23 on a live box: the funnel said
+# "dispatching PR-takeover" on a cycle whose whole ledger was `#9528 auto-armed` beside one re-record.
+# So the claim now keys on spawns — the count the caller reads from the worker records `wt_spawn`
+# writes — and an act-only cycle gets its own wording instead of borrowing the word "dispatch".
+# Absent (older caller), the `acted`-based wording stands unchanged: a stale harness and a stale
+# module still agree, and a module must never invent a spawn count it was not given.
 lo_select() {
   local total="${1:--}" owned="${2:--}" unowned="${3:--}" parked="${4:-0}" first="${5:--}" cap="${6:-}" backlog="${7:-0}"
-  local acted="${8:-}" waits="${9:-}" rec="${10:-}"
+  local acted="${8:-}" waits="${9:-}" rec="${10:-}" spawned="${11:-}"
   local prs_why issues_why
   LO_CHOICE=none
   lo_num "$unowned" || unowned=""
@@ -358,6 +367,9 @@ lo_select() {
   # the old wording must stand. `0` is a MEASURED zero and takes the honest branch below.
   lo_num "$acted" || acted=""
   lo_num "$waits" || waits="0"
+  # Same rule for spawns, with one extra: EMPTY is "not reported", and an unreadable directory
+  # arrives empty too — so neither can be rendered as a measured zero.
+  lo_num "$spawned" || spawned=""
   if [ -z "$unowned" ]; then
     # An unreadable count is NOT "no un-owned PRs": assuming zero would OPEN the issue path on a
     # number that was never read. Treat it as "PRs first" — the drain direction.
@@ -366,7 +378,17 @@ lo_select() {
     issues_why="SKIPPED (un-owned PR fetch unreadable)"
   elif [ "$unowned" -gt 0 ]; then
     LO_CHOICE=pr
-    if [ "$acted" = "0" ] && [ "$rec" = "unknown" ]; then
+    if [ "$spawned" = "0" ] && [ "$rec" = "unknown" ]; then
+      # BOTH readings, kept apart: the spawn count WAS measured (0 worker records) while the per-PR
+      # record was not written. Saying only "nothing RECORDED" would hide a measurement we took;
+      # saying only "nothing spawned" would hide that we cannot name what it acted on.
+      prs_why="PR takeover: NO WORKER SPAWNED this cycle (measured: 0 worker records created), and the per-PR record was NOT written — what it acted on is UNKNOWN, not zero (see the [pr] line)"
+    elif [ "$spawned" = "0" ]; then
+      # A MEASURED ZERO SPAWNS (#2590). Whatever the ledger says, no worker record was created, so
+      # the word "dispatching" is a claim with no worker behind it. Name the actions that DID happen
+      # (an arm/rerun/ready starts nothing) and keep the claim out of the line.
+      prs_why="PR takeover: NO WORKER SPAWNED this cycle ($acted action(s) recorded, 0 worker records created; $waits row(s) carry a named wait — an arm/rerun/ready starts nothing, see the [spawn] and [pr] lines)"
+    elif [ "$acted" = "0" ] && [ "$rec" = "unknown" ]; then
       # ⛔ "NO UNIT SPAWNED" IS A MEASUREMENT, AND A CYCLE THAT RECORDED NOTHING DID NOT MEASURE IT
       # (review cycle 2, P1). The caller passes 0/0 when `state/` is unwritable OR when the ledger
       # holds no rows — including a truncate that succeeded and every write that failed. Those are
@@ -381,9 +403,9 @@ lo_select() {
       # printed as if it were that population (review cycle 2, P2).
       prs_why="PR takeover: NO UNIT SPAWNED this cycle ($waits recorded row(s) carry a named wait — see the [pr] line)"
     elif [ -n "${first:-}" ] && [ "$first" != "-" ]; then
-      prs_why="dispatching PR-takeover (first #$first — conflicted before pending, oldest first)"
+      prs_why="dispatching PR-takeover (first #$first — conflicted before pending, oldest first${spawned:+; $spawned worker(s) spawned})"
     else
-      prs_why="dispatching PR-takeover (target not resolved this cycle)"
+      prs_why="dispatching PR-takeover (target not resolved this cycle${spawned:+; $spawned worker(s) spawned})"
     fi
     issues_why="SKIPPED (un-owned PRs exist)"
   elif [ -n "$cap" ]; then

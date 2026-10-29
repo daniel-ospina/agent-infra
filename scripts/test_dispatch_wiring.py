@@ -98,7 +98,9 @@ Run:  python3 -m pytest scripts/test_dispatch_wiring.py -q
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
+import plistlib
 import re
 import subprocess
 
@@ -785,6 +787,27 @@ _OPEN_CASE = re.compile(r"^case\s+(.+?)\s+in\b")
 _OPEN_FUNC = re.compile(r"^(?:function\s+)?([A-Za-z_][\w-]*)\s*(?:\(\s*\))?\s*\{")
 _CLOSER = re.compile(r"^(?:fi|done|esac)\b|^\}")
 
+# ⛔ A ONE-LINER'S CLOSER MUST BE A COMMAND, NOT A WORD IN A TRAILING COMMENT (measured by an
+# independent verifier on this change, 2026-10-23). Searching the whole raw line for `\besac\b` /
+# `\bdone\b` makes `while :; do   # until done` and `case "$x" in   # esac closes it` read as
+# ONE-LINERS, i.e. as opening nothing — a FALSE GREEN in the parser whose entire job is to prove the
+# launch is not enclosed. The closer is only real at the END of the code, preceded by a statement
+# separator or the start of the line: `case x in a) : ;; esac`, `while :; do :; done`.
+_ONE_LINE_CLOSER = re.compile(r"(?:^|[;&]\s*)(?:esac|done)\s*;?\s*$")
+# A `#` comment is stripped for this test only. Stripping a real `#` inside quotes can only SHORTEN the
+# line, which makes the construct look MORE like an opener — the fail-closed direction for this gate.
+_TRAILING_COMMENT = re.compile(r"\s+#.*$")
+
+
+def _closes_on_its_own_line(s: str, word: str) -> bool:
+    """True when `s` opens a construct AND closes it with `word` on the same line."""
+    code = _TRAILING_COMMENT.sub("", s)
+    m = _ONE_LINE_CLOSER.search(code)
+    # `m.group(0)` may include the separator AND the `;` that terminates the construct
+    # (`'; done;'`), so strip both sides before the word test — `rstrip()` alone left the `;`
+    # attached and the check silently returned False for `while :; do :; done;`.
+    return bool(m) and m.group(0).strip(" \t;").endswith(word)
+
 
 def _opened_construct(s: str):
     """The construct `s` opens, as `(kind, subject)`, or None.
@@ -799,19 +822,38 @@ def _opened_construct(s: str):
     """
     m = _OPEN_CASE.match(s)
     if m:
-        return ("case", m.group(1))
+        # ⛔ A ONE-LINER (`case x in a) … ;; esac`) OPENS AND CLOSES ON ITS OWN LINE — the same
+        # rule the `if …; then …; fi` arm below already applies. Missing it here is not cosmetic:
+        # the `case` frame was pushed and never popped, so the NEXT `}` popped the case instead of
+        # the function that contained it. MEASURED 2026-10-23 on main: `slack()` gained
+        # `case "$r" in ''|*[!0-9]*) r=20 ;; esac` (agent-infra#2121, the `local r=$(remaining)`
+        # discarded-status fix), `slack()`'s own closer then popped the phantom case frame, and the
+        # dispatch launch came back enclosed by `('func', 'slack')` — a FALSE RED on a correct
+        # beat, reddening `ci / test` on main for three tests at once (`…surviving_dispatcher`,
+        # `…else_arm_with_a_trailing_comment…`, `…defeat_matrix_does_not_red_the_real_beat`).
+        # A false red here is not harmless: it trains the next lane to widen the pin, which is how
+        # a real enclosing construct gets waved through (the same failure shape as #1954's
+        # `report_detached_rc`, one matching closer later).
+        return None if _closes_on_its_own_line(s, "esac") else ("case", m.group(1))
     m = _OPEN_FUNC.match(s)
     if m and "}" not in s[m.end():]:
         return ("func", m.group(1))
+    # ⛔ THE CLOSER IS SEARCHED FOR IN THE WHOLE LINE, NOT IN `s[m.end():]`. `_OPEN_LOOP`'s subject
+    # group is lazy but its `$` anchor makes it consume the REST of the line (`while [ -n "$x" ]; do
+    # x=; done` comes back with the whole line as `group(2)`), so `m.end()` is the end of the string
+    # and `s[m.end():]` is ALWAYS empty — the one-liner would never be recognised. Measured while
+    # writing this test: the check passed for `case` and silently failed for `while`/`for`.
     m = _OPEN_LOOP.match(s)
     if m:
-        return ("loop", "%s %s" % (m.group(1), m.group(2)))
+        # Same one-line rule, for the same reason: `while …; do …; done` on one line would leave a
+        # phantom loop frame and shift every later pop by one.
+        return None if _closes_on_its_own_line(s, "done") else ("loop", "%s %s" % (m.group(1), m.group(2)))
     m = _OPEN_FOR.match(s)
     if m:
-        return ("for", m.group(1))
+        return None if _closes_on_its_own_line(s, "done") else ("for", m.group(1))
     m = _OPEN_SELECT.match(s)
     if m:
-        return ("select", m.group(1))
+        return None if _closes_on_its_own_line(s, "done") else ("select", m.group(1))
     m = _OPEN_IF.match(s)
     if m:
         # A ONE-LINER (`if …; then …; fi`) opens and closes on its own line.
@@ -2450,6 +2492,27 @@ def test_the_opener_table_opens_if_select_and_groups_but_not_elif():
     assert _opened_construct('if false; then') == ("if", "false")
     # A one-liner opens AND closes on its own line, so it opens nothing.
     assert _opened_construct('if [ -f "$X" ]; then continue; fi') is None
+    # ⛔ THE SAME RULE FOR `case`/`while`/`for`/`select` (measured 2026-10-23, main). `slack()`'s
+    # `case "$r" in ''|*[!0-9]*) r=20 ;; esac` pushed a frame that nothing ever popped, so the
+    # function's own `}` popped the case instead and the launch read as enclosed by `('func',
+    # 'slack')`. The one-liner rule existed only for `if`; a construct the table opens and the line
+    # itself closes must open nothing, whichever construct it is.
+    assert _opened_construct('case "$r" in \'\'|*[!0-9]*) r=20 ;; esac') is None
+    assert _opened_construct('while [ -n "$x" ]; do x=; done') is None
+    assert _opened_construct('for f in a b; do :; done') is None
+    # …and the multi-line spelling of the same construct is still an opener, so the rule above did
+    # not turn the whole construct off.
+    assert _opened_construct('case "$r" in') == ("case", '"$r"')
+    assert _opened_construct('while :; do') is not None
+    # ⛔ AND A CLOSER WORD IN A TRAILING COMMENT IS NOT A CLOSER (independent-verifier finding on this
+    # change, 2026-10-23). A whole-line search for `\\besac\\b`/`\\bdone\\b` read these as one-liners,
+    # i.e. as opening NOTHING — a false GREEN in the parser whose only job is to prove the launch is
+    # not enclosed. The closer must be a COMMAND at the end of the code.
+    assert _opened_construct('while :; do            # until done') is not None
+    assert _opened_construct('case "$x" in       # esac closes it') == ("case", '"$x"')
+    # …and the real one-liner still closes, including when it carries its own trailing comment.
+    assert _opened_construct('case "$r" in x) : ;; esac   # done') is None
+    assert _opened_construct('while :; do :; done;') is None
     # Any unpinned `{` opener is a group, whatever precedes it.
     assert _opened_construct('[ -n "$X" ] && {') == ("group", '[ -n "$X" ] && {')
 
@@ -2480,6 +2543,39 @@ def test_an_elif_inside_a_function_does_not_leave_a_phantom_frame(tmp_path):
         "the enclosing-construct list stops describing what actually encloses the launch")
 
 
+def test_a_one_line_case_inside_a_function_does_not_leave_a_phantom_frame(tmp_path):
+    """The MEASURED regression (2026-10-23, on main): `case … esac` on ONE LINE left a frame open.
+
+    `slack()` in `heartbeat-loop.sh` gained `case "$r" in ''|*[!0-9]*) r=20 ;; esac` in the
+    #2121 fix. `_OPEN_CASE` matched the line and pushed a `case` frame; the line's own `esac` was
+    never seen as a closer, so `slack()`'s `}` popped the CASE and the function stayed on the
+    stack — the dispatch launch then came back enclosed by `('func', 'slack')`, reddening three
+    tests on main (`…surviving_dispatcher`, `…else_arm_with_a_trailing_comment…`,
+    `…defeat_matrix_does_not_red_the_real_beat`). A false red here is not harmless: it is exactly
+    what teaches a lane to widen the pin, and one widened pin later a REAL enclosing construct
+    reads green (the #1954 shape). Pinned on a minimal fixture rather than the beat's own shape.
+    """
+    p = tmp_path / "case_balance.sh"
+    p.write_text(
+        "#!/bin/bash\n"
+        "f() {\n"
+        "  local r\n"
+        "  r=\"x\"\n"
+        "  case \"$r\" in ''|*[!0-9]*) r=20 ;; esac\n"
+        "  echo \"$r\"\n"
+        "}\n"
+        "g() {\n"
+        "  for f in a b; do :; done\n"
+        "  while [ -n \"$1\" ]; do shift; done\n"
+        "}\n"
+        "dispatch-marker\n")
+    assert subprocess.run(["bash", "-n", str(p)]).returncode == 0, (
+        "the one-liner fixture is not valid bash — fix the fixture, not the gate")
+    assert _enclosing_constructs(p, "dispatch-marker") == [], (
+        "a one-line `case`/`while`/`for` left a phantom frame open, so every closer after it pops "
+        "the wrong entry: the launch reads as inside a function that does not enclose it")
+
+
 # ⛔ T4 — A HEREDOC DELIMITER THE REGEX COULD NOT SEE. `<<'1'` (a digit-leading word) and `<<\W`
 # (a backslash-escaped word) are both real heredocs — `bash -n` clean and the launch never runs —
 # but an identifier-shaped pattern matched neither, so the body stayed scannable and the disabled
@@ -2503,3 +2599,76 @@ def test_a_defeated_gate_odd_heredoc_delimiters_are_refused(tmp_path):
         "a heredoc opened with these delimiters was NOT stripped, so this scanner treated the "
         "launch as live code while bash treated it as heredoc body (the beat dispatches nothing): "
         "%r" % survivors)
+
+
+# ── #2280: the beat must carry REPO EVIDENCE into the pinned launch ──────────────────────────────
+def _beat_function(name: str) -> str:
+    """The source of one shell function in the beat, by its own delimiters.
+
+    The launch is PINNED to `nohup … pr-doctor.py` with NO ARGUMENTS (a reading flag is still an
+    argument, and that pin exists so an argument cannot turn the pass into a no-op), so the child's
+    repo evidence can only be what the beat EXPORTS. That makes the exporter part of the wiring, and
+    it is driven here by extraction rather than by starting a loop.
+    """
+    lines = _BEAT.read_text().splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(name + "() {"))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start:end + 1])
+
+
+def test_the_beat_EXPORTS_the_repo_the_pinned_pass_will_grade(tmp_path):
+    """`pr-doctor.py` has no default repo (#2280): a pinned launch that exports no evidence refuses.
+
+    ⛔ MEASURED BEFORE THIS TEST. The beat pins HOME/O/PATH and nothing else, exports no OR/REPO, and
+    `cd "$HOME"` — which is not a checkout — then launches `pr-doctor.py` with no arguments. Remove
+    the module constant (this PR) and the beat's only dispatch entry point exits 2 on EVERY pass:
+    armed, logging, dispatching nothing. The box's own declaration (the orchestrator plist
+    `install.sh` renders) is the evidence, read only when the variable is not already set.
+    """
+    fn = _beat_function("_beat_repo_evidence") + "\n" + _beat_function("_beat_pin_repo_evidence")
+    home = tmp_path / "home"
+    (home / "Library" / "LaunchAgents").mkdir(parents=True)
+    (home / "Library" / "LaunchAgents" / "com.eldato.orchestrator-loop.plist").write_bytes(
+        plistlib.dumps({"EnvironmentVariables": {"OR": "daniel-ospina/agent-infra",
+                                                 "REPO": "/co/ai", "O": "/o"}}))
+
+    def drive(**preset):
+        env = {k: v for k, v in os.environ.items() if k not in ("OR", "REPO")}
+        env["HOME"] = str(home)
+        env.update(preset)
+        return subprocess.run(
+            ["bash", "-c", fn + '\n_beat_pin_repo_evidence\n'
+             'printf "OR=%s\\nREPO=%s\\n" "${OR:-}" "${REPO:-}"'],
+            capture_output=True, text=True, env=env, check=False).stdout.strip().splitlines()
+
+    assert drive() == ["OR=daniel-ospina/agent-infra", "REPO=/co/ai"], (
+        "the beat exported no repo evidence for the detached pass — the pinned launch would refuse")
+    # ⛔ THE PLIST IS FILLED AS ONE DECLARATION (review cycle 4, P2). Filling REPO from the plist
+    # beside an operator's `OR` for a DIFFERENT repo hands `resolve_repo()` two disagreeing answers
+    # ("the launcher named two different repos") and the pass refuses for ever — while the operator
+    # believes the pin took effect. A re-point keeps its own rank and inherits NO foreign checkout.
+    assert drive(OR="acme/pinned") == ["OR=acme/pinned", "REPO="], drive(OR="acme/pinned")
+    # The same repo as the plist declares IS the same repo: its checkout is still evidence.
+    assert drive(OR="daniel-ospina/agent-infra") == ["OR=daniel-ospina/agent-infra", "REPO=/co/ai"]
+    # A REPO-only pin is left alone too: rank 3 proves the slug from that checkout's own origin.
+    assert drive(REPO="/only/co") == ["OR=", "REPO=/only/co"], drive(REPO="/only/co")
+    # AND NOTHING IS INVENTED when the box declares nothing: the pass then refuses LOUDLY, naming
+    # every source, which is the whole design — a default here would grade a repo nobody named.
+    (home / "Library" / "LaunchAgents" / "com.eldato.orchestrator-loop.plist").unlink()
+    assert drive() == ["OR=", "REPO="], drive()
+    # A CORRUPT plist is "no evidence", not a crash in the beat (the loop must keep running).
+    (home / "Library" / "LaunchAgents" / "com.eldato.orchestrator-loop.plist").write_bytes(b"junk")
+    assert drive() == ["OR=", "REPO="], drive()
+
+
+def test_the_beat_CALLS_the_repo_evidence_pin_before_the_launch():
+    """The exporter is dead code unless an executable line calls it — before the launch line."""
+    lines = _executable_raw(_BEAT)
+    calls = [i for i, l in enumerate(lines) if l.strip() == "_beat_pin_repo_evidence"]
+    assert len(calls) == 1, (
+        "the beat must CALL `_beat_pin_repo_evidence` exactly once (found %d). Without the call the "
+        "pinned launch inherits no repo evidence and pr-doctor refuses every pass (#2280)."
+        % len(calls))
+    launch = [i for i, l in enumerate(lines) if _DISPATCH_STEP in l]
+    assert launch and calls[0] < launch[0], (
+        "the pin must run BEFORE the launch (call at %r, launch at %r)" % (calls, launch))
