@@ -1450,6 +1450,20 @@ do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-hea
   fi
   local log rc prior="$RECORD_HEAD"
   log="$(mktemp "${TMPDIR:-/tmp}/atomic-land-record.XXXXXX")"
+  # ⛔ #2572 DELIBERATELY DOES NOT PASS `--expect-head` HERE, AND THAT IS NOT AN OVERSIGHT. The flag
+  # means "the PR head must be exactly this sha" — the rule that pins a FRESH review mint to the
+  # revision a reviewer read, which is what #2572 added at the seams that mint one (review-pr.sh,
+  # merge-one.sh). This call is the OTHER shape: a CARRY. Its positional head is `$prior`, the REVIEWED
+  # head, while the live PR head is deliberately `$HEAD` — the base-only update this rail just pushed
+  # and then OBSERVED at the [2/4] re-read. So `--expect-head "$prior"` would refuse every base-only
+  # update by construction (that is precisely the situation the carry exists for), and
+  # `--expect-head "$HEAD"` would import a new exit-3 cause into the arm below, which reads EVERY
+  # exit 3 as a CONTENT refusal — reclassifying "the head moved under the rail" as "the reviewed diff
+  # changed", the misdiagnosis class #1362 D1 removed. The carry's own semantics (#2302: a carry
+  # across a merge-only head move; #2358: the LANE carry re-binds any verdict) are OUT OF SCOPE for
+  # #2572 and are not changed here. What this rail does instead of a pin: it RE-READS the record from
+  # disk after the call and refuses to proceed unless the recorded head IS `$HEAD` (the B8 check
+  # below) — so a carry that landed anywhere other than the intended head cannot be landed.
   bash "$RECORD_SH" "$PR" "$prior" "$RECORD_VERDICT" "$REPO" >"$log" 2>&1
   rc=$?
   sed 's/^/atomic-land:     record-review: /' "$log" >&2
