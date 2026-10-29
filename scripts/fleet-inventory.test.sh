@@ -81,6 +81,12 @@
 #       the env supplies a non-integer: `1.5` makes the arithmetic a syntax error, the test fails, and
 #       the fence is SKIPPED (the pid is then claimed on argv alone → §9u's recycled arm reddens)
 #   (ad) drop the recycled-pid fence entirely (accept any live pid in the lock) → §9u only
+#   (af) return on the FIRST pid the start read-back sees (no settle — the pre-#2221 shape)
+#       → §9x's two verdict arms + §9x(c). §9x(b) stays GREEN by design: it pins the OPPOSITE
+#       direction (a genuinely wrong record must still be FAILING), so a mutation that removes the
+#       wait cannot redden it — and a mutation that made the wait a blindfold would redden only it.
+#   (ag) arithmetic on the settle bound without `10#` (the octal form)    → §9x(d) only
+#       [(af) does not redden §9x(d): the pre-fix library never evaluates the bound at all]
 # A red in a section the mutation does not name means the arm is coupled to the wrong behaviour —
 # e.g. (b) reddening §2 would mean §2 is asserting the controller's duplicate logic.
 
@@ -804,6 +810,48 @@ st="$(state_of "$ROWS" controller-watchdog)"
                         || bad "§9g two identical watchdogs should be DUPLICATE, got [$st]"
 kill9 "$WL" "$WL2"
 
+# §9g2 (#2303) THE TRACKED LABEL IS SEEN. This row hard-wired `com.eldato.orchestrator-watchdog`, the
+# Mac's HAND-PROVISIONED job — which templates/launchd/RETIRED now makes install-launchd.sh remove. So
+# on a box that had been through the installer, nothing matched the row and the ONE component that takes
+# a destructive action (a `launchctl kickstart -k`) sat outside the table built to catch "silently off,
+# missing, or running twice".
+say_case "§9g2 the TRACKED com.eldato.controller-watchdog job is not invisible"
+seed_quiet_box
+rm -f "$A/com.eldato.orchestrator-watchdog.plist"
+mk_plist "com.eldato.controller-watchdog" 300 ""
+printf 'PID\tStatus\tLabel\n-\t0\tcom.eldato.controller-watchdog\n' > "$LC_LIST"
+sleep 0.2
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" controller-watchdog)"
+[ "$st" = "OK" ] && ok "§9g2 the tracked controller-watchdog job reads OK" \
+                 || bad "§9g2 the tracked job should read OK, got [$st] — $(detail_of "$ROWS" controller-watchdog)"
+d="$(printf '%s\n' "$ROWS" | awk -F'\t' -v n=controller-watchdog '$1 == n { print $3; exit }')"
+case "$d" in
+  *com.eldato.controller-watchdog*) ok "§9g2 …and the row NAMES the job it read" ;;
+  *) bad "§9g2 the row does not name the tracked label — [$d]" ;;
+esac
+# An installed-but-unloaded job is MISSING (actionable, fails the table), never SKIPPED — §9c's rule,
+# and the whole reason a silent job is dangerous is that it reads like a healthy one.
+printf 'PID\tStatus\tLabel\n' > "$LC_LIST"
+sleep 0.2
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" controller-watchdog)"
+[ "$st" = "MISSING" ] && ok "§9g2 an installed-but-NOT-loaded tracked job reads MISSING" \
+                      || bad "§9g2 a job definition with nothing loaded should read MISSING, got [$st]"
+# …and the verbs act on the SAME label the row reports, or `start` boots a job the row never read.
+LBL="$(run_rows '_fleet_label_for controller-watchdog')"
+[ "$LBL" = "com.eldato.controller-watchdog" ] && ok "§9g2 start/stop resolve the TRACKED label" \
+                                              || bad "§9g2 the verbs resolved [$LBL], not the tracked label"
+# …and the retired label is still resolvable on a box the installer has not touched since (fallback).
+mk_plist "com.eldato.orchestrator-watchdog" 20 ""
+LBL="$(run_rows '_fleet_label_for controller-watchdog')"
+[ "$LBL" = "com.eldato.controller-watchdog" ] && ok "§9g2 …and the TRACKED label still wins when BOTH are installed" \
+                                              || bad "§9g2 both installed should resolve the tracked label, got [$LBL]"
+rm -f "$A/com.eldato.controller-watchdog.plist"
+LBL="$(run_rows '_fleet_label_for controller-watchdog')"
+[ "$LBL" = "com.eldato.orchestrator-watchdog" ] && ok "§9g2 …and the retired label remains the fallback where only it exists" \
+                                               || bad "§9g2 the retired-label fallback resolved [$LBL]"
+
 # §9h (E-8) a bootstrapped job must be KICKED, or "start" produces no evidence at all. A job that is
 # not RunAtLoad reads "loaded, last exit 0" without ever having run under this start.
 say_case "§9h start kicks a job it bootstraps, so the verdict is about a RUN"
@@ -1354,6 +1402,118 @@ st="$(state_of "$ROWS" lander-drain)"
 [ "$st" = "UNKNOWN" ] && ok "§9u an unreadable record reads UNKNOWN, never OK" \
                       || bad "§9u an unreadable record should read UNKNOWN, got [$st]"
 rm -f "$LDRAIN"
+
+# §9x (#2221) `start` MUST NOT JUDGE A LAUNCHER IT HAS JUST CREATED.
+# Both pidfile loops re-exec themselves DETACHED: the pid the first read-back sees is the transient
+# LAUNCHER, and while it is alive the daemon is its CHILD — which `_fleet_ps_awk` correctly does not
+# count as a second instance. So the row's cross-check (pidfile vs the counted pid) is, for that
+# window, about two different processes, and `start` printing its table inside the window reported
+# `pid 67710, pidfile says 67715 FAILING` for a loop that `status` called OK one second later, with
+# ONE loop alive the whole time. The verdict was about the handover, not about the loop. Measured on
+# the owner's Mac, twice (2026-10-21, 2026-10-22) — reproduced here by a launcher with the shipped
+# shape, which is the only way this arm can be about the handover rather than about `sleep`.
+say_case "§9x start reads its own launch AFTER the handover, so a healthy loop is never FAILING"
+seed_quiet_box
+# A launcher with the SHIPPED shape, which is the whole point of §9x: it re-execs itself DETACHED, the
+# daemon writes the pidfile, and the launcher lingers (the handover window) before exiting.
+mk_detaching_loop() { # [linger-seconds]
+  cat > "$SCRIPTS/heartbeat-loop.sh" <<LAUNCHER
+#!/bin/bash
+PF="$STATE/heartbeat-loop.pid"; LOG="$STATE/orchestrator-heartbeat.log"
+if [ -z "\${LOOP_DETACHED:-}" ]; then
+  LOOP_DETACHED=1 nohup /bin/bash "\$0" >/dev/null 2>&1 &
+  sleep ${1:-2}                # the handover window: the launcher is alive this long
+  exit 0
+fi
+printf '%s\\n' "\$\$" > "\$PF"
+while :; do printf '%s pass\\n' "\$(date +%s)" >> "\$LOG"; sleep 1; done
+LAUNCHER
+  chmod +x "$SCRIPTS/heartbeat-loop.sh"
+}
+mk_detaching_loop 2
+t0="$(date +%s)"
+OUT="$(run_rows 'fleet_start_component heartbeat-loop' 2>&1)"; SRC=$?
+el=$(( $(date +%s) - t0 ))
+[ "$SRC" = 0 ] && ok "§9x start returns 0 for a loop that came up" \
+               || bad "§9x start returned $SRC — $OUT"
+[ "$el" -lt 12 ] && ok "§9x …and it does not hang while waiting to settle (${el}s)" \
+                 || bad "§9x start blocked ${el}s"
+# THE READ THE TABLE IS BUILT FROM, taken immediately: this is the read that printed FAILING.
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" heartbeat-loop)"
+[ "$st" = "OK" ] && ok "§9x the row printed right after start is OK (the handover is not a verdict)" \
+                 || bad "§9x start's own table called a healthy loop [$st] — $(detail_of "$ROWS" heartbeat-loop)"
+# …and it is the SAME single loop `status` would see, named by its own record: the settle must not have
+# started a second copy, and it must not have "fixed" the row by reading a dead pid as alive.
+NCOPIES="$(env FLEET_HOME="$H" FLEET_O="$O" bash -c '. "$1"; fleet_pids_for "$2"' _ "$FLEET_LIB" "$SCRIPTS/heartbeat-loop.sh" | awk 'NF' | wc -l | tr -d ' ')"
+[ "${NCOPIES:-0}" -eq 1 ] && ok "§9x exactly ONE loop is alive afterwards (no duplicate manufactured)" \
+                         || bad "§9x the fixture left ${NCOPIES} copies alive"
+PF_PID="$(tr -dc '0-9' < "$STATE/heartbeat-loop.pid" 2>/dev/null)"
+# The row's OWN pid must be the pid its record names — not merely "some pid": in the handover the row
+# also names a pid (the launcher), and asserting only that would pass on the defect.
+ROW_PID="$(printf '%s' "$ROWS" | awk -F'\t' '$1=="heartbeat-loop"{print $3}' | sed -n 's/^pid \([0-9][0-9]*\).*/\1/p')"
+[ -n "${PF_PID:-}" ] && [ "$ROW_PID" = "$PF_PID" ] \
+  && ok "§9x the row counts the pid its own record names (pid $PF_PID), not the launcher" \
+  || bad "§9x the row counts [$ROW_PID] while the record names [$PF_PID] — the handover again"
+pkill -9 -f "$SCRIPTS/heartbeat-loop.sh" 2>/dev/null
+
+# §9x(c) THE INDICATOR ITSELF: the TABLE `start` PRINTS. §9x proves the read; this proves the verb —
+# `fleet_ensure_components` is what `orchestrator-bringup.sh start` calls, and its last act is to
+# re-read the rows and render them. That rendering is the screen the operator reads.
+say_case "§9x(c) the table a fresh \`start\` prints does not call the loop it started FAILING"
+seed_quiet_box
+mk_detaching_loop 2
+OUT="$(run_rows 'fleet_ensure_components ""' 2>&1)"
+ROWL="$(printf '%s\n' "$OUT" | awk '$1=="heartbeat-loop"')"
+STATE_L="$(printf '%s\n' "$ROWL" | awk '{print $NF}')"   # the STATE column is the row's LAST field
+[ "$STATE_L" = "OK" ] && ok "§9x(c) the table \`start\` prints reads OK for the loop it just started" \
+                     || bad "§9x(c) start's table reads [$STATE_L] for the loop it just started — $ROWL"
+pkill -9 -f "$SCRIPTS/heartbeat-loop.sh" 2>/dev/null
+
+# §9x(b) THE WINDOW MUST NOT TURN A GENUINE RECORD DEFECT GREEN. A loop whose OWN record names a
+# process that is not the loop is exactly what the FAILING row exists for; waiting for the handover
+# must end in that verdict, not erase it. (If the settle made this OK, it would be the false PASS the
+# row was written to prevent — a green over a record every other reader is misled by.)
+say_case "§9x(b) a loop whose OWN pidfile is wrong still reads FAILING after the settle"
+seed_quiet_box
+cat > "$SCRIPTS/heartbeat-loop.sh" <<BADREC
+#!/bin/bash
+PF="$STATE/heartbeat-loop.pid"; LOG="$STATE/orchestrator-heartbeat.log"
+sleep 300 & NOTME=\$!
+printf '%s\\n' "\$NOTME" > "\$PF"        # ALIVE, but not this loop — the record is a lie
+while :; do printf '%s pass\\n' "\$(date +%s)" >> "\$LOG"; sleep 1; done
+BADREC
+chmod +x "$SCRIPTS/heartbeat-loop.sh"
+OUT="$(run_rows 'fleet_start_component heartbeat-loop' 2>&1)"; SRC=$?
+[ "$SRC" = 0 ] && ok "§9x(b) start returns 0 (a loop IS alive; the RECORD is the defect)" \
+               || bad "§9x(b) start returned $SRC — $OUT"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" heartbeat-loop)"; d="$(detail_of "$ROWS" heartbeat-loop)"
+[ "$st" = "FAILING" ] && ok "§9x(b) a wrong OWN record is still FAILING (the settle is not a blindfold)" \
+                      || bad "§9x(b) a genuinely wrong pidfile read [$st] after the settle — $d"
+case "$d" in
+  *"does not name the running process"*) ok "§9x(b) …and the note still names the record, not the loop" ;;
+  *) bad "§9x(b) the FAILING note does not name the record defect — [$d]" ;;
+esac
+# …and take the throwaway process with it: the pidfile names it, so the argv-scoped pkill cannot (an
+# orphan per suite run otherwise, held for its own 300 s).
+kill9 "$(tr -dc '0-9' < "$STATE/heartbeat-loop.pid" 2>/dev/null)" 2>/dev/null
+pkill -9 -f "$SCRIPTS/heartbeat-loop.sh" 2>/dev/null
+
+# §9x(d) THE WINDOW'S OWN BOUND MUST NOT BE ABLE TO ABORT THE VERB. `08`/`09`/`010` are all-digits and
+# therefore pass a digit-class fence, but bash reads them as OCTAL — `$(( 08 * 5 ))` is a fatal "value
+# too great for base" that kills the shell, so `start` would have died mid-run with no table and rc 1
+# (measured). The same class as §9v: an env value that looks numeric and is not an arithmetic token.
+say_case "§9x(d) a zero-padded settle bound cannot abort start (the fence is not a digit-class)"
+seed_quiet_box
+mk_proc_script "$SCRIPTS/heartbeat-loop.sh"
+OUT="$(run_rows 'FLEET_START_SETTLE_S=08; fleet_start_component heartbeat-loop; echo "rc=$?"' 2>&1)"; SRC=$?
+case "$OUT" in
+  *"value too great"*) bad "§9x(d) FLEET_START_SETTLE_S=08 ABORTED the verb — $(printf '%s' "$OUT" | head -1)" ;;
+  *"rc=0"*)            ok "§9x(d) a zero-padded bound (08) starts normally — no arithmetic abort" ;;
+  *)                   bad "§9x(d) start did not complete with FLEET_START_SETTLE_S=08 — $OUT (rc=$SRC)" ;;
+esac
+pkill -9 -f "$SCRIPTS/heartbeat-loop.sh" 2>/dev/null
 
 
 printf '\n%s\n' "──────────────────────────────────────────────"

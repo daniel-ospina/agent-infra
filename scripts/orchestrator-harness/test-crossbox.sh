@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off a live-origin loop proof, not a CI suite; `spawn-gate.test.sh` pins the unwired population to exactly {test-claims.sh, this}
 # TEST 2 — the ACQUIRE path of the cross-box claim in merge-one.sh, the trap release, and the P1
 # coercion of a non-integer REVIEW_TIMEOUT.
 # Hermetic: `gh` and `pi` are exported bash functions (functions shadow PATH lookup), so no reviewer
@@ -16,7 +17,18 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MERGE_ONE="$HERE/merge-one.sh"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-ORIGIN_URL="$(git -C "$REPO_ROOT" remote get-url origin)"
+# ⛔ THE FIXTURE'S ORIGIN MUST BE READ THE WAY THE GATE READS IT (#2762 review, P2). `remote get-url`
+# applies `url.*.insteadOf`, so on a box that rewrites the harness origin this suite derived a slug the
+# gate then refused (or exited 2) — a false RED in a suite that is outside the shard list, so nothing
+# else would show it. Read the repo's own file first, and keep `get-url` only as a last resort.
+ORIGIN_URL="$(git -C "$REPO_ROOT" config --local --get remote.origin.url 2>/dev/null || true)"
+[ -n "$ORIGIN_URL" ] || ORIGIN_URL="$(git -C "$REPO_ROOT" remote get-url origin)"
+# ⛔ DERIVE THE TARGET FROM THE FIXTURE, NEVER HARDCODE IT (#2762 review, P2). fix-one.sh now
+# asserts its checkout against the target repo; a literal `daniel-ospina/tortoise` made every gated
+# arm exit 72 with "the fixer ran UNCLAIMED" when this suite ran from any other repo, while it sat
+# outside CI's shard list so nothing showed it. The fixture's origin is this harness's origin.
+. "$HERE/repo-slug.sh" || { echo "❌ cannot source $HERE/repo-slug.sh"; exit 2; }
+OR_SLUG="$(repo_slug_from_remote "$ORIGIN_URL")" || { echo "❌ cannot derive an owner/name from $ORIGIN_URL"; exit 2; }
 [ -f "$MERGE_ONE" ] || { echo "❌ missing $MERGE_ONE"; exit 2; }
 [ -f "$HERE/claims.sh" ] || { echo "❌ missing $HERE/claims.sh"; exit 2; }
 
@@ -88,7 +100,18 @@ cleanup_remote() {
   # ref a failed step created). Bounded to the run's own $$-scoped namespace, so it can never touch
   # a concurrent run's refs — the reason the namespace exists (see UNIQ below).
   local ns_ref all
-  all="$(git -C "$A" ls-remote origin "${CLAIM_NS}/*" 2>/dev/null | awk '{print $2}')"
+  # ⛔ THE READ IS OBSERVED BEFORE THE SWEEP IS CERTIFIED (agent-infra#2121, empty-as-pass).
+  # `ls-remote … 2>/dev/null | awk` collapses a FAILED read (network, auth, a missing remote) into the
+  # same empty string as "there are no refs left", so the loop iterates ZERO times and this function
+  # still `return 0` — a cleanup that reports success over a sweep it never made, leaving refs in this
+  # run's namespace for the next run to trip on with nothing in the log to say why. The status is read;
+  # an unreadable sweep is UNKNOWN and SAID SO (cleanup stays best-effort and still returns 0, but no
+  # longer silently).
+  all="$(git -C "$A" ls-remote origin "${CLAIM_NS}/*" 2>/dev/null)" || {
+    echo "WARN: ref sweep READ FAILED (git ls-remote rc=$?) — refs left in ${CLAIM_NS} are UNKNOWN, not none" >&2
+    all=""
+  }
+  all="$(printf '%s\n' "$all" | awk '{print $2}')"
   for ns_ref in $all; do
     [ -n "$ns_ref" ] || continue
     cur="$(git -C "$A" ls-remote origin "$ns_ref" 2>/dev/null | awk '{print $1}')"
@@ -121,6 +144,30 @@ gh() {
   esac
 }
 export -f gh
+
+# ⏰ THE CI-QUEUE READING THIS RIG MUST SUPPLY (#2333 cycle 7, P1). The arms below drive the REAL
+# `fix-one.sh`, which now reads the CI queue before it claims and pushes — and an UNREADABLE queue
+# DEFERS (fail-closed: an unreadable queue is not an empty one). This rig has no reachable `gh` for
+# the queue endpoints (the stub above answers claim/PR reads and returns 1 for everything else), so
+# without a reading EVERY fix-one arm took the deferral branch and exited 0 BEFORE `claim_acquire`:
+# the acquiry assertions then reported "the fixer ran UNCLAIMED" (a false accusation about a
+# security-relevant property) and two arms passed VACUOUSLY on a path that never executed. The
+# reading is SUPPLIED through the module's documented `CIQ_GH` seam with a SHALLOW queue — the
+# production precondition under which such a push may happen — rather than switching the gate off,
+# because a gate an env var can open is not a gate. Exported, so it reaches fix-one.sh's child shell
+# through the same `exec env` that carries the exported `gh()` function above.
+XBQ="/tmp/xb-crossbox-gh-queue.$$"
+cat > "$XBQ" <<'GHQ'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count": 1}' ;;
+  *status=in_progress*) echo '{"total_count": 0}' ;;
+  *actions/runners*)    echo '{"total_count": 3, "runners": [{"status": "online", "busy": false}]}' ;;
+  *) exit 1 ;;
+esac
+GHQ
+chmod +x "$XBQ"
+export CIQ_GH="$XBQ"
 # Hermetic reviewer. Measured: the shipped suite ran the REAL pi and passed (elapsed 16s > the 7s
 # sample), but a warm/fast reviewer could finish and release the claim before the sample — the
 # spurious failure this was reported with. FAKE_PI_INSTANT=1 returns immediately, which the P1 step
@@ -141,7 +188,7 @@ echo "  ${CLAIM_NS}/* on origin: $(git -C "$A" ls-remote origin "${CLAIM_NS}/*" 
 echo
 echo "=== step 1: run the REAL merge-one.sh from this directory — expect ACQUIRED ==="
 rm -f "$O/state/mergeclaim-777777.lock" "$O/logs/merge-777777.log"
-( cd "$A" && O="$O" REVIEW_TIMEOUT=12 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 777777 test/branch >/dev/null 2>&1 ) &
+( cd "$A" && O="$O" REVIEW_TIMEOUT=12 bash "$MERGE_ONE" "$A" "$OR_SLUG" 777777 test/branch >/dev/null 2>&1 ) &
 MID=$!
 sleep 7
 INFLIGHT="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
@@ -189,7 +236,7 @@ echo "=== step 4 (P1): a non-integer REVIEW_TIMEOUT must NOT disable the claim =
 # which is exactly how an operator would set it, so the claim silently vanishes while the timeout works.
 clear_ref "$REF2"
 rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
-( cd "$A" && O="$O" REVIEW_TIMEOUT=30m FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 )
+( cd "$A" && O="$O" REVIEW_TIMEOUT=30m FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" "$OR_SLUG" 888888 test/branch >/dev/null 2>&1 )
 echo "  exit=$?"
 if grep -qa 'cross-box claim: acquired' "$O/logs/merge-888888.log"; then
   ok "REVIEW_TIMEOUT=30m still ran claim_acquire (coerced to an integer)"
@@ -208,7 +255,7 @@ echo "=== step 4b (P2): a LEADING-ZERO REVIEW_TIMEOUT must NOT disable the claim
 for rt in 08 09; do
   clear_ref "$REF2"
   rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
-  ( cd "$A" && O="$O" REVIEW_TIMEOUT=$rt FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 )
+  ( cd "$A" && O="$O" REVIEW_TIMEOUT=$rt FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" "$OR_SLUG" 888888 test/branch >/dev/null 2>&1 )
   if grep -qa 'cross-box claim: acquired' "$O/logs/merge-888888.log"; then
     ok "REVIEW_TIMEOUT=$rt acquired the claim (leading zero rejected, coerced to 1800)"
   else
@@ -232,7 +279,7 @@ for ft in 08 09; do
   c="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"
   [ -n "$c" ] && git -C "$A" push -q --force-with-lease="$FIXREF:$c" origin ":$FIXREF"
   rm -f "$O4F/logs/fix-666666.log"
-  ( cd "$A" && exec env O="$O4F" FIX_TIMEOUT=$ft FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
+  ( cd "$A" && exec env O="$O4F" FIX_TIMEOUT=$ft FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" "$OR_SLUG" 666666 test/branch >/dev/null 2>&1 )
   if grep -qa 'cross-box fixer claim: acquired' "$O4F/logs/fix-666666.log"; then
     ok "FIX_TIMEOUT=$ft acquired the FIXER's claim (leading zero rejected, coerced to 2400)"
   else
@@ -257,7 +304,7 @@ for rt in 9999999999999999999 9223372036854775807; do
   clear_ref "$REF2"
   rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
   t0="$(date +%s)"
-  ( cd "$A" && O="$O" REVIEW_TIMEOUT=$rt FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 )
+  ( cd "$A" && O="$O" REVIEW_TIMEOUT=$rt FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" "$OR_SLUG" 888888 test/branch >/dev/null 2>&1 )
   line="$(grep -a 'cross-box claim: acquired' "$O/logs/merge-888888.log" 2>/dev/null | head -1)"
   lu="$(printf '%s' "$line" | sed -n 's/.*lease_until=\(.*\)$/\1/p')"
   if [ -n "$lu" ] && [ "${#lu}" -le 10 ] && [ "$lu" -gt "$t0" ] 2>/dev/null && [ $(( lu - t0 )) -ge 2400 ]; then
@@ -282,7 +329,7 @@ for ft in 9999999999999999999 9223372036854775807; do
   fixref_clear
   rm -f "$O4H/logs/fix-666666.log"
   t0="$(date +%s)"
-  ( cd "$A" && exec env O="$O4H" FIX_TIMEOUT=$ft FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
+  ( cd "$A" && exec env O="$O4H" FIX_TIMEOUT=$ft FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" "$OR_SLUG" 666666 test/branch >/dev/null 2>&1 )
   line="$(grep -a 'cross-box fixer claim: acquired' "$O4H/logs/fix-666666.log" 2>/dev/null | head -1)"
   lu="$(printf '%s' "$line" | sed -n 's/.*lease_until=\(.*\)$/\1/p')"
   if [ -n "$lu" ] && [ "${#lu}" -le 10 ] && [ "$lu" -gt "$t0" ] 2>/dev/null && [ $(( lu - t0 )) -ge 3000 ]; then
@@ -299,7 +346,7 @@ echo
 echo "=== step 5 (P3.4): a TERM'd worker releases the claim on the way out ==="
 clear_ref "$REF2"
 rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
-( cd "$A" && exec env O="$O" REVIEW_TIMEOUT=60 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 ) &
+( cd "$A" && exec env O="$O" REVIEW_TIMEOUT=60 bash "$MERGE_ONE" "$A" "$OR_SLUG" 888888 test/branch >/dev/null 2>&1 ) &
 M2=$!
 sleep 5
 mid2="$(git -C "$A" ls-remote origin "$REF2" | awk '{print $1}')"
@@ -359,7 +406,7 @@ cp "$HERE/claims.sh" "$O2/claims.sh"
 printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O2/merge-one.sh"
 fixref_clear() { local c; c="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"; [ -n "$c" ] && git -C "$A" push -q --force-with-lease="$FIXREF:$c" origin ":$FIXREF"; return 0; }
 fixref_clear
-( cd "$A" && exec env O="$O2" FIX_TIMEOUT=12 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 ) &
+( cd "$A" && exec env O="$O2" FIX_TIMEOUT=12 bash "$HERE/fix-one.sh" "$A" "$OR_SLUG" 666666 test/branch >/dev/null 2>&1 ) &
 F1=$!
 sleep 6
 fixflight="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"
@@ -387,7 +434,7 @@ printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O3/merge-one.sh
 CNT="$O3/release-calls"
 printf '\nclaim_release() { echo x >> "%s"; return 1; }\n' "$CNT" >> "$O3/claims.sh"
 fixref_clear
-( cd "$A" && exec env O="$O3" FIX_TIMEOUT=60 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 ) &
+( cd "$A" && exec env O="$O3" FIX_TIMEOUT=60 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" "$OR_SLUG" 666666 test/branch >/dev/null 2>&1 ) &
 F1b=$!
 wait "$F1b" 2>/dev/null; echo "  fix-one exit=$?"
 calls="$(wc -l < "$CNT" 2>/dev/null | tr -d ' ')"
@@ -414,7 +461,7 @@ fixref_clear
 # another box holds the head with a LIVE lease, so our acquire must be REFUSED (rc=1)
 ( cd "$A" && . "$O4/claims.sh" && CLAIM_OWNER_HOST=otherbox claim_acquire "." 666666 "$SHA" 600 >/dev/null ) \
   || bad "could not seed the other box's live claim"
-( cd "$A" && exec env O="$O4" FIX_TIMEOUT=12 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
+( cd "$A" && exec env O="$O4" FIX_TIMEOUT=12 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" "$OR_SLUG" 666666 test/branch >/dev/null 2>&1 )
 echo "  fix-one exit=$?"
 if [ -f "$O4/state/fixbail-666666-$SHA" ]; then
   ok "a REFUSED fixer wrote the bail marker (the controller can refund the attempt)"
@@ -436,7 +483,7 @@ printf '\nclaim_release() { sleep 60; }\n' >> "$O/claims.sh"
 clear_ref "$REF2"
 rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
 t0="$(date +%s)"
-( cd "$A" && exec env O="$O" REVIEW_TIMEOUT=60 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 ) &
+( cd "$A" && exec env O="$O" REVIEW_TIMEOUT=60 bash "$MERGE_ONE" "$A" "$OR_SLUG" 888888 test/branch >/dev/null 2>&1 ) &
 M3=$!
 sleep 5
 kill -TERM "$M3" 2>/dev/null
@@ -469,7 +516,7 @@ cp "$HERE/claims.sh" "$O/claims.sh.bak"
 printf '\n_git() { case "$*" in *ls-remote*) return 1 ;; *) command git -C "$CLAIM_REPO" "$@" ;; esac; }\n' >> "$O/claims.sh"
 clear_ref "$REF2"
 rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
-( cd "$A" && O="$O" REVIEW_TIMEOUT=30 FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 )
+( cd "$A" && O="$O" REVIEW_TIMEOUT=30 FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" "$OR_SLUG" 888888 test/branch >/dev/null 2>&1 )
 echo "  exit=$?"
 grep -a 'cross-box claim UNAVAILABLE\|released the orphaned' "$O/logs/merge-888888.log" | sed 's/^/  /'
 if grep -qa 'released the orphaned claim commit' "$O/logs/merge-888888.log"; then
