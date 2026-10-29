@@ -1,0 +1,24 @@
+# Fixture for tests/actionlint/run.sh Case 5 — NOT a real action, never executed.
+#
+# It exists so the COMPOSITE-ACTION host (`runs.steps`) is exercised on every run. Without
+# it the `.github/actions/**` patterns match nothing in this repo (that directory is empty
+# and untracked), so that extractor branch could rot unnoticed — which is the same
+# inert-enforcer failure this check exists to prevent elsewhere.
+#
+# It must stay CLEAN: it carries no `${{ }}` inside the `script:` body, because Case 5
+# requires one body from this directory AND requires every body to be free of the sequence.
+# The `env:` expression below is deliberately outside `script:` — that is the correct place
+# for it, and Case 5 only inspects the script body.
+name: case5-composite-host-fixture
+description: exercises the composite-action extraction path of tests/actionlint/run.sh Case 5
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@v7
+      env:
+        REPO_NAME: ${{ github.event.repository.name }}
+      with:
+        script: |
+          // A composite host reaches its script body the same way a workflow does.
+          const name = process.env.REPO_NAME;
+          core.info(`fixture host for ${name}`);
