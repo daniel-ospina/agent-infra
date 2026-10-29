@@ -179,17 +179,24 @@ copied=0; kept=0
 for e in "$SRC"/extensions/*; do
   base="$(basename "$e")"
   dest="$DEST/extensions/$base"
-  # ⛔ NEVER copy a test file into the live farm (#1509). pi's extension loader
-  # EXECUTES every `.ts` under $DEST/extensions, so a `*.test.ts` there is not a
-  # test — it is an extension that runs its suite at session start and whose
-  # stdout replaces the session's answer. Measured 2026-10-25: 12 test files were
-  # farmed by this loop, every dispatched child on the box answered with
+  # ⛔ NEVER copy a test file into the live farm (#1509/#2841). pi's extension loader
+  # EXECUTES a top-level `.ts` OR `.js` under $DEST/extensions
+  # (`dist/core/package-manager.js::collectAutoExtensionEntries`:
+  # `entry.name.endsWith(".ts") || entry.name.endsWith(".js")`; pi's
+  # `docs/extensions.md` says the same — "direct TypeScript or JavaScript files"), so
+  # such a file there is not a test — it is an extension that runs its suite at session
+  # start and whose stdout replaces the session's answer. Measured 2026-10-25: 12 test
+  # files were farmed by this loop, every dispatched child on the box answered with
   # `auto-sync.test.ts` output instead of a reply, and no log named the cause.
+  # THIS LIST IS THE LOADER'S SET, not a subset of it (#2841): the original guard matched
+  # `*.test.ts` only, so a `*.spec.ts` / `*.test.js` / `*.spec.js` — all EXECUTED by the
+  # same loader — was copied and its suite ran at every session start. `.tsx`, `.mts`
+  # and `.cjs` are deliberately absent: the loader does not load them.
   # This loop is COPY-ONLY (like the scripts farm), so skipping here is not
   # enough — a test copied by an earlier run stays until it is removed, and it
-  # stays EXECUTING. Remove both halves.
+  # stays EXECUTING. Remove both halves (see the sweep below).
   case "$base" in
-    *.test.ts)
+    *.test.ts|*.spec.ts|*.test.js|*.spec.js)
       if [ -e "$dest" ]; then
         rm -f "$dest" && echo "    removed test file from live farm: $base"
       fi
@@ -214,17 +221,31 @@ for e in "$SRC"/extensions/*; do
   fi
   copied=$((copied+1))
 done
-# ⛔ RECURSIVE sweep for test files in the live farm (#1509). The `case` in the loop
+# ⛔ RECURSIVE sweep for test files in the live farm (#1509/#2841). The `case` in the loop
 # above only guards TOP-LEVEL entries, and two paths escape it: (a) an entry that is a
 # directory is copied with `cp -R`, which brings any `*.test.ts` inside it
 # (`builtin-tools/`, `verification-gate/` both carry one), and (b) this loop is
 # COPY-ONLY, so a test farmed by an earlier run whose source has since left the repo is
 # never visited at all. Both are EXECUTED by pi's extension loader at session start,
 # so the sweep is the half that makes the farm safe, not the `case`.
+# The name set is the `case`'s set, on purpose: ONE definition of "a test file pi would
+# execute", used by the writer and by the gate (scripts/check-pi-config-extensions.sh
+# check 6). A name added to one and not the other is the fail-open #2841 measured.
+# ⛔ `node_modules` IS PRUNED, because it is not the farm's to sweep: the loader skips it
+# (`if (entry.name === "node_modules") continue`), check 6's nested arm skips it
+# (`grep -v '/node_modules/'`), and a `*.test.js` inside an installed dependency is a
+# THIRD-PARTY file `npm install` put there — npm does not re-extract an already-installed
+# package, so deleting it corrupts the tree for good. Measured 2026-10-28 on this box:
+# 169 of the farm's 232 name-matching files sit under `/node_modules/`. Widening the set
+# without the prune grew a pre-existing over-delete by 10 files (`*.test.js` 9,
+# `*.spec.js` 1); the prune removes the whole class instead of only the newly-added names.
+# NB the sweep does NOT follow symlinked farm directories (`find` without `-L` does not
+# descend into them), which is what keeps a symlink-farmed machine from having its own
+# checkout's tracked test files deleted through the link.
 while IFS= read -r tf; do
   [ -n "$tf" ] || continue
   rm -f "$tf" && echo "    removed test file from live farm: ${tf#"$DEST/extensions/"}"
-done <<< "$(find "$DEST/extensions" -type f -name '*.test.ts' 2>/dev/null)"
+done <<< "$(find "$DEST/extensions" -type d -name node_modules -prune -o -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) -print 2>/dev/null)"
 
 echo "    extensions: $copied refreshed, $kept farm symlinks kept"
 
@@ -522,11 +543,17 @@ fi
 # dispatcher at `scripts/orchestrator-harness/retired/queue_verdicts.py` (still importable from
 # there, which is what keeps the retired copy runnable as a record). A farmed file that no live step
 # execs is a dependency the farm delivers to nobody.
+# agent-infra#2834 farms bg-rescue-wip.sh: `run_agent` (`spawn-gate.sh`) now EXECS it on every terminal
+# transition, and resolves it from `$O`, the harness dir's parent, `$AGENT_INFRA_PATH/scripts` and
+# `~/.pi/agent/scripts` — THIS farm is the fourth of those. It is the only one that works on a box
+# whose `$O` is the flat `scripts/orchestrator-harness/*` payload (the file lives one directory ABOVE
+# that) and whose launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile):
+# without it every at-risk lane recorded `rescue=UNAVAILABLE`, i.e. the rescue was loud and inert.
 # agent-infra#2374 adds registry-sync.sh: `cloud-cell-bringup.sh` runs it (the farmed copy is the
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do

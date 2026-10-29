@@ -63,7 +63,15 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # cannot be masked by another. The read is scoped to $O/orch-loop.sh and $HARNESS/orch-loop.sh under
 # this fixture's own mktemp tree, so no process on the host can match it and the fixture stays
 # hermetic.
-COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps"
+# ⛔ `mktemp` BELONGS HERE, and its absence was a FIXTURE DEFECT with a silent consequence: the worker
+# captures the recorder's output into a temp file and falls back to `/dev/null` when `mktemp` fails — so
+# with `mktemp` absent from this PATH every driven record call wrote the recorder's own stderr into
+# `/dev/null`, and the classification arms that grep that capture (`§8l`, `§8m`) read NOTHING. They
+# failed for a reason that named the sink rather than the subject. `mktemp` is a real coreutil (every
+# cell and runner has it) and the shipped worker depends on it, so the fixture must provide it; the
+# `/dev/null` fallback stays reachable only on a box that genuinely cannot make a temp file, which is
+# what the guarded `rec_out_cleanup` exists for.
+COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps mktemp"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p
   mkdir -p "$d"
@@ -398,7 +406,8 @@ EOF
 # shadowed by a real binary on another box — and a real `pi` here would be a live, paid model call
 # against a real `gh`. A function wins over any PATH lookup, and the subshell keeps it out of the
 # rest of this suite.
-run_merge() {
+run_merge() { # run_merge [script] — default: the SHIPPED worker. An argument drives a MUTANT copy.
+  local script="${1:-$MERGE}"
   (
     # NB: the function bodies must NOT read $HEAD/$PR — bash imports an exported function into the
     # driven script, so those names are the SCRIPT's globals, and an unset $HEAD would print an
@@ -406,7 +415,21 @@ run_merge() {
     pi() { [ -n "${PI_COUNT:-}" ] && echo x >> "$PI_COUNT"; printf '%s\n' "${FAKE_VERDICT:-CLEAN https://github.com/acme/widget/pull/${FAKE_PR}#issuecomment-12345}"; }
     gh() {
       case "$*" in
-        *"pr view"*headRefOid*) printf '%s\n' "$FAKE_HEAD"; return 0 ;;
+        *"pr view"*headRefOid*)
+          # FAKE_HEAD_SEQ (when set) is a space-separated WALK of successive head reads, the last
+          # value repeating. A CONSTANT cannot express the transition that matters below: the head
+          # moving BETWEEN the reviewed-head read ($HEAD, :188) and the LIVE_HEAD read the marker
+          # guard performs (:1211) — the one shape in which the record is minted for a head that is
+          # no longer the PR's.
+          if [ -n "${FAKE_HEAD_SEQ:-}" ]; then
+            fahead_n=0
+            [ -f "${FAKE_HEAD_SEQ_FILE:-}" ] && fahead_n="$(cat "$FAKE_HEAD_SEQ_FILE" 2>/dev/null || echo 0)"
+            fahead_n=$((fahead_n + 1))
+            printf '%s\n' "$fahead_n" > "${FAKE_HEAD_SEQ_FILE:-/dev/null}" 2>/dev/null || true
+            printf '%s\n' $FAKE_HEAD_SEQ | awk -v n="$fahead_n" 'NR <= n { v = $0 } END { print v }'
+            return 0
+          fi
+          printf '%s\n' "$FAKE_HEAD"; return 0 ;;
         *"pr view"*body*) cat "$FAKE_BODY_FILE" 2>/dev/null; return 0 ;;
         # Step 3 reads the gate as `gh pr checks --json name,state | python3`, and compares the
         # STATE of the row whose name is the repo's gate (agent-infra#1764: the name is an input,
@@ -430,9 +453,10 @@ run_merge() {
     git() { return 0; }
     export -f pi gh git
     env PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" AI_REVIEW_GATE_KEY="${FAKE_KEY_OVERRIDE-$TEST_GATE_KEY}" \
-      PI_COUNT="$MRG/pi-count" FAKE_HEAD="${FAKE_HEAD_OVERRIDE-$HEAD}" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
+      PI_COUNT="$MRG/pi-count" FAKE_HEAD="${FAKE_HEAD_OVERRIDE-$HEAD}" FAKE_HEAD_SEQ="${FAKE_HEAD_SEQ:-}" \
+      FAKE_HEAD_SEQ_FILE="$MRG/head-seq" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
       FAKE_BODY_FILE="$MRG/pr-body" \
-      "$BASH_BIN" "$MERGE" "$MRG/repo" acme/widget "$PR" fix/x
+      "$BASH_BIN" "$script" "$MRG/repo" acme/widget "$PR" fix/x
   ) 2>&1
 }
 pi_calls() { # the number of times the stubbed worker runtime was executed
@@ -602,6 +626,14 @@ ck "RED→GREEN: rc=0 with NO signed marker does not merge" $rc
 ck "RED→GREEN: rc=0 with NO signed marker writes the terminal park" $rc
 case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'NO signed marker'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
 ck "the no-marker park names the missing signed marker" $rc
+# …and at an UNCHANGED head the hand re-record IS the remedy, so it must still be printed — with the
+# pin, which verifies there. This is the other direction of §8p: the discrimination that stops the
+# stale-mint park prescribing a refused command must not silence the command where it works.
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *"record it by hand (record-review.sh $PR $HEAD clean"*'--expect-head'*"$HEAD)"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-marker park at an UNCHANGED head still prints the PINNED hand re-record" $rc
+case "$reason" in *'the head MOVED after this run'*) rc=1; note "an unchanged head was reported as moved: $reason";; *) rc=0 ;; esac
+ck "an evidence-post failure at an unchanged head is NOT reported as a head move" $rc
 out="$(run_merge)"; rc2=$?
 [ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a parked no-marker head was re-reviewed"; }
 ck "a parked no-marker head does not re-pay on the next run" $rc
@@ -733,6 +765,148 @@ ca="$(grep -n -- '-z "$MARK_CAND"' "$MERGE" | head -1 | cut -d: -f1)"
 [ -n "$ml" ] && [ -n "$ca" ] && [ "$ml" -lt "$ca" ] && rc=0 \
   || { rc=1; note "openssl probe at line '${ml:-none}', candidate arm at '${ca:-none}' — the probe must come FIRST"; }
 ck "the key/tool arms precede the candidate arm (wrong-cause ordering)" $rc
+
+# ══ the --expect-head pin's TWO rc=3 refusals, driven through the SHIPPED worker ═════════════
+# #2572 pins the mint; the CLASSIFICATION of the recorder's two pin refusals is implemented TWICE
+# (`scripts/review-pr.sh` and this worker, deliberately — each is shipped standalone) and until this
+# section only the first copy was executed. `tests/review-pr/run.sh` proves the two LITERALS still
+# match the producer's text, and `producer_names_literals` over this file does the same here; neither
+# runs a line of the worker. So a future edit that swapped the arms, dropped the `-eq 3` guards, or
+# re-keyed the split onto the FLAG's presence would ship with CI green and re-introduce the paid-review
+# defect this pin exists to stop: a gh/API transport blip classified as "a FRESH review is owed" is a
+# second PAID run (REVIEW_TIMEOUT = 1800 s) for a head nobody disputed.
+#
+# The two literals are the producer's OWN words, quoted from `scripts/record-review.sh` (the moved-head
+# refusal and the could-not-verify refusal), and `tests/review-pr/run.sh` §A3(5) greps the producer for
+# both — so a reword on either side turns CI RED instead of silently re-grading.
+PIN_MOVED_TEXT='--expect-head: the PR head is 89abcdef0123456789abcdef0123456789abcdef, NOT the 0123456789abcdef0123456789abcdef01234567 you named'
+PIN_UNCHECK_TEXT='--expect-head: could not verify the PR head against 0123456789abcdef0123456789abcdef01234567'
+# mkrecorder_refuses <exit-rc> <stderr text> — a recorder replica that refuses exactly like the
+# producer does: names the pin, writes nothing, exits non-zero.
+mkrecorder_refuses() {
+  { printf '#!/bin/bash\n'
+    printf 'printf "%%s\\n" %q >&2\n' "$2"
+    printf 'exit %s\n' "$1"
+  } > "$MRG/home/.pi/agent/scripts/record-review.sh"
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+
+# 8l) the head genuinely MOVED inside the review window: the recorder refuses the pin (rc=3), so the
+# verdict's SUBJECT moved and a FRESH review is owed. The opposite remedy here is not a typo — it is a
+# stale verdict carried onto a head nobody read, or (the shipped pre-fix behaviour) a hand re-record the
+# pin then refuses.
+mkmrg
+mkrecorder_refuses 3 "$PIN_MOVED_TEXT"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a moved-head refusal fell through to the merge"; }
+ck "RED→GREEN: a moved-head pin refusal does not merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'MOVED between the review and the record'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the moved-head park NAMES the head move" $rc
+case "$reason" in *'a FRESH review at the new head is owed'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the moved-head park prescribes a FRESH REVIEW (the only remedy that can work)" $rc
+case "$reason" in *'Re-run the RECORD'*) rc=1; note "the moved-head park prescribes the TRANSPORT remedy: $reason";; *) rc=0 ;; esac
+ck "RED→GREEN: a head move is NOT answered with the transport remedy (the two arms are not merged)" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls)"; }
+ck "the moved-head refusal re-pays for NOTHING (the review already ran)" $rc
+
+# 8m) the pin could NOT be CHECKED: a gh/API transport failure left the PR's live head unreadable.
+# THE HEAD DID NOT MOVE and the artifact this lane paid for is still valid AT it, so the remedy is to
+# RE-RUN THE RECORD — never a second paid review (#1717).
+mkmrg
+mkrecorder_refuses 3 "$PIN_UNCHECK_TEXT"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "an uncheckable-pin refusal fell through to the merge"; }
+ck "RED→GREEN: an uncheckable-pin refusal does not merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'could NOT CHECK the --expect-head pin'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the uncheckable-pin park NAMES the transport cause" $rc
+case "$reason" in *'Re-run the RECORD'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the uncheckable-pin park prescribes re-running the RECORD, not a review" $rc
+case "$reason" in *'MOVED between the review and the record'*) rc=1; note "an unreadable head was reported as a MOVE: $reason";; *) rc=0 ;; esac
+ck "RED→GREEN: a transport failure is NOT reported as a head move" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a transport blip bought a review"; }
+ck "an uncheckable pin re-pays for NOTHING (no second PAID run for an undisputed head)" $rc
+
+# 8n) MUTATION — the pre-fix classifier keyed on the FLAG's presence (`grep -q -- '--expect-head'`),
+# which merges the two arms because BOTH print the flag. Widen the moved literal to the flag name in a
+# COPY of the shipped worker: the UNCHECKABLE stub must then take the WRONG arm. §8m is what breaks, so
+# the split is proven to be the producer's words and not the flag's presence.
+mkmerge_mutant() { # mkmerge_mutant <sed-expression> — a copy of the shipped worker with ONE edit
+  rm -rf "$TMP/mut"; mkdir -p "$TMP/mut"
+  # ⛔ EVERY SIBLING MODULE THE WORKER RESOLVES FROM ITS OWN DIRECTORY MUST SIT BESIDE THE COPY.
+  # It sources `$SELF/gate-policy.sh` (fatal, exit 78) and `_M1_HERE/repo-authority.sh` (fatal, exit 1
+  # — written to the LOG, not stdout), so a copy alone dies at startup and reads as "the mutant
+  # produced no park", i.e. as a failed mutation rather than as a missing fixture file. SYMLINKED so
+  # the mutant differs from the shipped worker in EXACTLY the sed edit below and nothing else.
+  for f in "$HERE"/*.sh; do
+    case "$(basename "$f")" in merge-one.sh) continue ;; esac
+    ln -s "$f" "$TMP/mut/$(basename "$f")"
+  done
+  sed "$1" "$MERGE" > "$TMP/mut/merge-one.sh"
+  chmod +x "$TMP/mut/merge-one.sh"
+  ! cmp -s "$MERGE" "$TMP/mut/merge-one.sh"    # 0 = the edit LANDED (a no-op sed would pass vacuously)
+}
+mkmrg
+mkrecorder_refuses 3 "$PIN_UNCHECK_TEXT"
+if mkmerge_mutant "s/^      PIN_MOVED_LIT='--expect-head: the PR head is '$/      PIN_MOVED_LIT='--expect-head'/"
+then
+  out="$(run_merge "$TMP/mut/merge-one.sh")"
+  case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in
+    *'MOVED between the review and the record'*) rc=0 ;;
+    *) rc=1; note "the mutant did not take the moved arm: $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" ;;
+  esac
+else
+  rc=1; note "the mutation did not land (the PIN_MOVED_LIT line did not match)"
+fi
+ck "MUTATION: keying the split on the flag name merges the two arms (§8m breaks) — the split is the producer's words" $rc
+
+# 8o) MUTATION — the `rc -eq 3` GUARD is load-bearing. A recorder that prints the moved words but exits
+# 1 is NOT the producer's content refusal (exit 3 is that code, uniquely — exit 8's "nothing was
+# posted" invariant is not available here and exit 1 is a generic fault), so the shipped worker must
+# fall to its named-rc arm. Delete the guard in a copy and it takes the moved arm instead: a real
+# fault is then re-graded as "a head move", whose remedy (a fresh PAID review) is the wrong one.
+mkmrg
+mkrecorder_refuses 1 "$PIN_MOVED_TEXT"
+out="$(run_merge)"; rc=$?
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'failed rc=1'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "an rc≠3 carrying the moved words falls to the named-rc arm (rc=3 is the content refusal)" $rc
+case "$reason" in *'MOVED between the review and the record'*) rc=1; note "a generic fault was re-graded as a head move: $reason";; *) rc=0 ;; esac
+ck "a generic recorder fault is not reported as a head move" $rc
+mkmrg
+mkrecorder_refuses 1 "$PIN_MOVED_TEXT"
+if mkmerge_mutant 's/if \[ \$rc -eq 3 \] && grep -qF -- "\$PIN_MOVED_LIT"/if grep -qF -- "$PIN_MOVED_LIT"/'
+then
+  out="$(run_merge "$TMP/mut/merge-one.sh")"
+  case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in
+    *'MOVED between the review and the record'*) rc=0 ;;
+    *) rc=1; note "the mutant did not take the moved arm: $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" ;;
+  esac
+else
+  rc=1; note "the mutation did not land (the -eq 3 guard line did not match)"
+fi
+ck "MUTATION: dropping the rc=3 guard re-grades a generic fault as a head move" $rc
+
+# 8p) the marker arm has TWO causes too (#2988 P3): a MISSING marker at an UNCHANGED head is a failed
+# evidence post, whose remedy is a hand re-record — and the pin verifies there. A missing marker after
+# the head MOVED is not that: the record was minted for the reviewed head, so the printed re-record
+# names a sha the pinned recorder then REFUSES. The remedy would be a command that cannot work, in the
+# one file this PR exists to stop printing them from. Driven through the SHIPPED worker with the head
+# walking $HEAD → HEAD2 across its two reads (see FAKE_HEAD_SEQ).
+HEAD2F="89abcdef0123456789abcdef0123456789abcdef"
+mkmrg
+mkrecorder_posts
+out="$(FAKE_HEAD_SEQ="$HEAD $HEAD2F" run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a record minted for a STALE head fell through to the merge"; }
+ck "RED→GREEN: a record minted for a head the PR has left does not merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'the head MOVED after this run'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the stale-mint park says the head moved after the mint (not 'the post failed')" $rc
+case "$reason" in *"a FRESH review at head=$HEAD2F is owed"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the stale-mint park names the head the fresh review is owed at" $rc
+case "$reason" in *'record it by hand'*) rc=1; note "the stale-mint park prescribes a re-record the PIN refuses: $reason";; *) rc=0 ;; esac
+ck "RED→GREEN: the stale-mint park does NOT prescribe the unpinnable hand re-record" $rc
 
 # 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
 # merge, so the terminal state is a response to the failure and not a blanket refusal to merge.
