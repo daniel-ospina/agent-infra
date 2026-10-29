@@ -33,6 +33,16 @@
 #     name is `cannot-measure` rather than a jobless runner.
 #   * the RECONCILIATION pass: idempotent, restarts dead listeners, adds to the ceiling, stops on a
 #     gate verdict, and a `cannot-act` is rc 2 — never a pass reported as success.
+#   * AN ORPHANED REGISTRATION (#2892) — one GitHub deleted server-side. Measured on `pi-cell-4`
+#     2026-10-27: the listener appears and then exits **rc 0** at +4 s with
+#     "The runner registration has been deleted from the server", `config.sh --replace` refuses
+#     ("already configured"), and NOTHING could retire it. So: `restart` must report rc 6 (not a false
+#     `restarted`), `status` must show ORPHANED (not DEAD) and refuse to count it as capacity, and
+#     `reclaim` must retire the install — gated on the clock, on evidence newer than the marker, and
+#     on a live sibling that holds the name (re-registering there would delete a WORKING runner).
+#   * CAPACITY, NOT DIRECTORIES: two installs carrying one `agentName` are one slot (measured: 47 and
+#     35, both `pi-runner-cell4-x64-1`), and a box whose root is a MIXED directory (`/opt` with
+#     `/opt/containerd` in it) must still be measurable when a non-member is provably not an install.
 #   * FAIL-CLOSED: every unreadable reading is `cannot-measure` (rc 2) and changes nothing.
 #   * the MUTATION case at the end proves the floor assertion is LIVE: a copy with the floor
 #     comparison removed must stop refusing. A suite that passes against the mutant pins nothing.
@@ -54,6 +64,12 @@ bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
 assert_ne() { if [ "$1" != "$2" ]; then ok "$3"; else bad "$3 (both: $1)"; fi; }
 assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+# ⛔ THE NEGATIVE OF assert_contains: "no directory was created" is a statement about ABSENCE that a
+#   positive assertion cannot make, and a case that only ever asserts presence passes just as happily
+#   against a launcher that creates the directory unconditionally and wrongly.
+assert_omits() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi; }
+# mode_of <path> — the permission bits, portably (GNU first; BSD on the macOS lane).
+mode_of() { if stat -c '%a' "$1" >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi; }
 assert_absent() { if [ -e "$1" ]; then bad "$2 (exists: $1)"; else ok "$2"; fi; }
 assert_file() { if [ -f "$1" ]; then ok "$2"; else bad "$2 (absent: $1)"; fi; }
 count_lines() { local n; n="$(wc -l <"$1" 2>/dev/null)" || n=0; printf '%s' "$((n))"; }
@@ -133,6 +149,21 @@ cat >"$BIN/ps" <<'STUB'
 # `cannot-measure` — never "no listeners", which would double-start a listener.
 [ "${FIXTURE_PS_FAIL:-0}" = 1 ] && { echo "ps: cannot read /proc" >&2; exit 1; }
 [ "${FIXTURE_PS_EMPTY:-0}" = 1 ] && exit 0
+# ⛔ THE CALL COUNTER IS READ BEFORE THE TABLE IS PRINTED, so a seam can refuse THIS read (#2892
+# review round 4, P1). It used to be incremented at the bottom of the stub, which made every
+# "fail from the n-th read on" seam either impossible or silently off by one.
+f="${FIXTURE_T:?}/.ps-count"
+c=0; [ -f "$f" ] && c="$(cat "$f" 2>/dev/null || printf 0)"
+case "$c" in ''|*[!0-9]*) c=0 ;; esac
+c=$((c + 1)); printf '%s' "$c" >"$f" 2>/dev/null || true
+# ⛔ FIXTURE_PS_FAIL_AFTER=<n> lets the FIRST n reads through and fails every read after that — the
+# only way to reach a probe that runs LATER than the pool rows (a quarantine row in `status`), which
+# is exactly where a failed read was being READ AS A DEAD LISTENER and printed as "rm -rf as its
+# owner" over a runner that might be live.
+case "${FIXTURE_PS_FAIL_AFTER:-}" in
+  ''|*[!0-9]*) ;;
+  *) [ "$c" -gt "$FIXTURE_PS_FAIL_AFTER" ] && { echo "ps: cannot read /proc" >&2; exit 1; } ;;
+esac
 # ⛔ THE FIXTURE TABLE IS THE SUITE'S OWN PROCESSES ONLY (#2381 review, P1). The suite models a
 # listener with a real process under $T, but the HOST also runs runners (measured: three live
 # listeners under /opt/gh-runner-* on the boxes this suite runs on). Reading the whole host table
@@ -161,11 +192,7 @@ printf '    %s /sbin/init\n' 1
 # ⛔ FIXTURE_PS_OUTSIDE_AFTER=<n> plants the extra line only from the (n+1)-th ps call on — the seam
 # that reaches a guard on a LATER read, the same way FIXTURE_LS_FAIL_AFTER does for the listing. It is
 # the ONLY way to pin `add`'s POST-claim completeness re-check: an outside listener that appears
-# during the token mint (#2381 review round 6, P2).
-f="${FIXTURE_T:?}/.ps-count"
-c=0; [ -f "$f" ] && c="$(cat "$f" 2>/dev/null || printf 0)"
-case "$c" in ''|*[!0-9]*) c=0 ;; esac
-c=$((c + 1)); printf '%s' "$c" >"$f" 2>/dev/null || true
+# during the token mint (#2381 review round 6, P2). (The counter itself is read at the top of the stub.)
 if [ -n "${FIXTURE_PS_EXTRA:-}" ]; then
   if [ -n "${FIXTURE_PS_OUTSIDE_AFTER:-}" ]; then
     [ "$c" -gt "$FIXTURE_PS_OUTSIDE_AFTER" ] && printf '%s\n' "$FIXTURE_PS_EXTRA"
@@ -208,6 +235,23 @@ done
 if [ -x /bin/ls ]; then exec /bin/ls "$@"; fi
 exec /usr/bin/ls "$@"
 STUB
+# `curl` is the retirement CLOCK GUARD's probe (`reclaim` compares this against the local clock). A
+# fixture that answered "network error" to every probe would make every shrink case cannot-measure,
+# so the healthy path must be a working probe — and FIXTURE_TIME_SKEW_S / FIXTURE_CURL_FAIL are the
+# two real shapes it has to tell apart: a box whose clock is wrong, and a box that cannot be dated.
+cat >"$BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+[ "${FIXTURE_CURL_FAIL:-0}" = 1 ] && exit 6
+skew="${FIXTURE_TIME_SKEW_S:-0}"
+now="$(date -u +%s)"
+epoch=$((now - skew))
+if date -u -d "@$epoch" +%s >/dev/null 2>&1; then
+  stamp="$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S')"
+else
+  stamp="$(date -u -r "$epoch" '+%a, %d %b %Y %H:%M:%S')"
+fi
+printf 'HTTP/2 200\r\ndate: %s GMT\r\n\r\n' "$stamp"
+STUB
 chmod +x "$BIN"/*
 
 # ── the runner release, stubbed to GitHub's real shape ──────────────────────────────────────
@@ -247,12 +291,36 @@ cat >"$TEMPLATE/run.sh" <<'STUB'
 SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
+# ⛔ GITHUB'S run.sh SOURCES `.env` — so this stub is the ONE place the real contract is observable:
+#   whatever `.env` names becomes the environment the listener and every job step run under. A stub
+#   that skipped it would pass while the SHIPPED launcher left a TMPDIR nobody created, because the
+#   only thing that consumes `TMPDIR=` is the file this stub was ignoring (agent-infra#2937).
+if [ -f .env ]; then . ./.env; fi
+# ⛔ AND IT RECORDS WHAT IT INHERITED, from INSIDE the listener, at the instant the real run.sh would
+#   hand that env to a job. `absent` here is precisely the state in which every job on the instance
+#   dies at `mktemp` while GitHub reports the runner `online` — so the ordering the fix claims
+#   (directory created BEFORE exec) is asserted, not merely the directory's existence afterwards.
+if [ -n "${FIXTURE_TMPDIR_LOG:-}" ]; then
+  if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR:-}" ]; then printf 'present %s\n' "$TMPDIR"
+  else printf 'absent %s\n' "${TMPDIR:-<unset>}"; fi >>"$FIXTURE_TMPDIR_LOG"
+fi
 exec "$DIR/bin/Runner.Listener" run
 STUB
 cat >"$TEMPLATE/bin/Runner.Listener" <<'STUB'
 #!/usr/bin/env bash
 # ⛔ argv must STAY "<dir>/bin/Runner.Listener run" — the real binary never execs anything else, so a
 # stub that did would let a broken argv matcher pass. Hence a CHILD sleep, killed on TERM/EXIT.
+# ⛔ THE `.orphan` MARKER MODELS A REGISTRATION GITHUB DELETED (#2892), and it must reproduce BOTH
+# halves of the measured shape: the process APPEARS (so a start reads as successful) and then goes
+# away ~0.6 s later, AFTER printing GitHub's own line — with **rc 0**, which is exactly what the box
+# did (`DIED rc=0 after 4s`, pi-cell-4 2026-10-27T04:19Z). A stub that exited non-zero would let an
+# exit-status classifier pass, and the shipped code must classify by the message instead.
+INST="$( cd -P "$( dirname "$( dirname "${BASH_SOURCE[0]}" )" )" && pwd )"
+if [ -e "$INST/.orphan" ]; then
+  sleep 0.6
+  printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
+  exit 0
+fi
 sleep 600 &
 child=$!
 trap 'kill "$child" 2>/dev/null' EXIT TERM INT
@@ -273,6 +341,12 @@ fresh_pool() { RUNNER_ROOT="$T/root-$1"; export RUNNER_ROOT; rm -rf "$RUNNER_ROO
 # register <name> — what a hand-provisioned runner looks like: a complete install with `.runner` and
 # NO pid file of ours. This is the migration population (two such runners were the incident).
 register() { cp -a "$TEMPLATE" "$RUNNER_ROOT/$1"; : >"$RUNNER_ROOT/$1/.runner"; }
+# orphanize <name> — model a registration GITHUB DELETED: its start IS refused (the stub prints
+# GitHub's own line and exits 0, the measured shape). ⛔ A FIXTURE THAT EXPECTS A RETIREMENT MUST
+# CALL THIS (#2892 review round 3, P1): a log line on its own is no longer proof — `reclaim` starts
+# the listener and believes only a refusal it dated ITSELF, because a skew-era line survives a clock
+# that was later corrected (actions/runner#4648).
+orphanize() { : >"$RUNNER_ROOT/$1/.orphan"; }
 
 # ══ 1. ADD above the floor: a complete install per instance, configured THERE ════════════════
 echo "── add: above the floor ──"
@@ -1027,6 +1101,31 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run reconci
 assert_eq "$?" "2" "reconcile does not publish a clean summary over part of the box"
 assert_contains "$out" "why=pool-root-incomplete" "naming the same reading"
 
+# ⛔ THE SCAN ARM IS THE ONE VERB PATH WITH NO COMPLETENESS GATE — AND IT IS THE DELETE PATH (#2899
+#   review round 5, P2). With no gate, `registered_dirs` returns an EMPTY (but readable) listing, the
+#   loop never runs — so guard 3's own `outside_listener_dirs` read at `sib` is never reached either —
+#   and the pass printed `reclaim: retired=0 … cannot=0` and exited 0. "The pool is clean" and "I
+#   listed an empty directory" became the same line, over an unread pool, from the verb that DELETES.
+#   The recovery recipe this change documents (§6 step 2 of docs/research/2026-10-27-runner-pool-
+#   self-healing.md) tells the operator to run `reclaim --dry-run` then `reclaim` — on the `pi-cell-4`
+#   shape, where the installs live under `/opt` and the root defaults elsewhere, so the false clean
+#   pass is the FIRST thing that recipe produces on the box it was written for.
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run reclaim)"
+assert_eq "$?" "2" "reclaim REFUSES a pool it can only partially enumerate (rc 2, never a clean pass)"
+assert_contains "$out" "cannot-measure why=pool-root-incomplete" "naming the reading that failed"
+assert_contains "$out" "reclaim NOT attempted" "and saying the delete verb did nothing"
+assert_eq "$(grep -cF 'reclaim: retired=' <<<"$out")" "0" \
+  "no all-zero summary is published over the pool it never read"
+# The SAME root with no outside listener is a genuine empty pool: rc 0, and the summary names the root
+# it read — so an all-zero line cannot be mistaken for a clean one (control).
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "an EMPTY pool under a complete root is still a clean pass (control)"
+assert_contains "$out" "root=$RUNNER_ROOT" "and the summary names the root it read"
+# `--name` names ONE directory and never reads the pool as a whole, so it is deliberately NOT gated:
+# an incomplete root must not block a single-install verdict (the over-block direction of the same fix).
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" rc_of reclaim --name pi-runner-nope)" "3" \
+  "a --name call is a single-dir verdict, so an incomplete root does not change it"
+
 # ⛔ A WRAPPED LISTENER IS STILL A LISTENER (#2381 review round 6, P1). A listener started through a
 #   wrapper (`nohup`, `env K=V`, `bash`, `sudo`, a service shim) has `<wrapper> <dir>/bin/…` as its
 #   argv. Taking EVERYTHING before the binary gave `nohup <dir>` — not an absolute path — and the arm
@@ -1094,7 +1193,7 @@ assert_eq "$?" "3" "a FILE squatting on the name is a refusal (rc 3), not a miss
 assert_contains "$out" "is not a searchable directory (a file or a symlink)" "restart names the shape it found"
 assert_contains "$out" "clear it, or pick another name" "and the remedy that clears it"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-file)"
-assert_eq "$?" "4" "and `add` refuses that SAME path — the two verbs agree on the state"
+assert_eq "$?" "4" "and 'add' refuses that SAME path — the two verbs agree on the state"
 ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-dangle"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dangle)"
 assert_eq "$?" "3" "a DANGLING SYMLINK (not a directory) is the same refusal, not 'add it first'"
@@ -1107,6 +1206,467 @@ out="$(RUNNER_TOKEN=tok-fixture FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcil
 assert_eq "$?" "2" "reconcile refuses an inherited single-use RUNNER_TOKEN (rc 2)"
 assert_contains "$out" "why=runner-token-single-use" "naming the reason the ADD arm did not run"
 assert_eq "$(slots)" "0" "nothing was added"
+
+# ══ TMPDIR: the directory `.env` names is CREATED BY THE LAUNCHER (agent-infra#2937) ══════════
+# The measured failure: an instance's `.env` carried `TMPDIR=/tmp/ci-actions-runner-N`, the instance dir
+# is persistent and its unit enabled, and NOTHING creates that directory — so after a reboot the
+# listener survives and its TMPDIR does not. GitHub reports the runner `online`, the job is PICKED UP,
+# and it dies in its first seconds at `mktemp` (job 122457527181: exit 2). Because only jobs that use
+# `mktemp` fail, a host-wide fault presented as a flaky, PR-specific defect and cost a full
+# investigation of an unrelated PR.
+# These cases assert the ORDERING the fix claims — the directory exists BEFORE `run.sh` is exec'd — by
+# recording what the listener inherited from INSIDE the stub, which is the only place the real contract
+# (GitHub's `run.sh` sources `.env`) is observable. A case that only checked `[ -d ]` afterwards would
+# pass against a launcher that created the directory after the listener could already read it.
+echo "── tmpdir: a missing TMPDIR target is created before the listener starts ──"
+fresh_pool tmpdir; reset_logs
+register pi-runner-tmp
+TMPLOG="$T/tmpdir.log"; : >"$TMPLOG"
+printf 'LANG=en_US.UTF-8\nTMPDIR=%s/pi-runner-tmp/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-tmp/.env"
+assert_absent "$RUNNER_ROOT/pi-runner-tmp/tmp" "the TMPDIR the instance's .env names does not exist yet (the post-reboot state)"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-tmp)"
+assert_eq "$?" "0" "restart SUCCEEDS although the TMPDIR target was missing"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-tmp/tmp" \
+  "the launcher PRINTS the path it created (a gate that refuses without its reading is a wish)"
+if [ -d "$RUNNER_ROOT/pi-runner-tmp/tmp" ]; then ok "the directory now exists"; else bad "the directory was NOT created"; fi
+assert_eq "$(mode_of "$RUNNER_ROOT/pi-runner-tmp/tmp")" "700" "it is created 700 — a private per-runner temp dir"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-tmp") ))" "1" "the listener is running"
+# ⛔ THE ASSERTION THAT PINS THE ORDER, not just the outcome: the listener was exec'd WITH a usable TMPDIR.
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-tmp/tmp" \
+  "the listener inherited a TMPDIR that EXISTS at exec time (the creation precedes the start)"
+assert_eq "$(TMPDIR="$RUNNER_ROOT/pi-runner-tmp/tmp" mktemp -d >/dev/null 2>&1; printf '%s' "$?")" "0" \
+  "and the operation that failed in the incident (mktemp) now works"
+
+# ── (1) idempotence: an EXISTING directory is left exactly as it is ─────────────────────────
+# `mkdir -p` never chmods what already exists, so a hand-repaired box (the operative ones carry 755)
+# must not be silently tightened — and a second start must not re-report a creation that did not happen.
+echo "── tmpdir: an existing directory keeps its owner and mode ──"
+fresh_pool tmpkeep; reset_logs
+register pi-runner-keep
+mkdir -p "$RUNNER_ROOT/pi-runner-keep/tmp"; chmod 755 "$RUNNER_ROOT/pi-runner-keep/tmp"
+printf 'TMPDIR=%s/pi-runner-keep/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-keep/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-keep)"
+assert_eq "$?" "0" "restart succeeds when the TMPDIR already exists"
+assert_eq "$(mode_of "$RUNNER_ROOT/pi-runner-keep/tmp")" "755" "a pre-existing directory keeps its mode (no chmod)"
+assert_omits "$out" "created tmpdir=" "and it does NOT claim to have created anything"
+
+# ── (2) an instance whose .env names NO TMPDIR is untouched ────────────────────────────────
+echo "── tmpdir: an instance that names none ──"
+fresh_pool tmpnone; reset_logs
+register pi-runner-none
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-none)"
+assert_eq "$?" "0" "restart of an instance with no .env is unaffected"
+assert_omits "$out" "created tmpdir=" "no directory is invented"
+
+# ── (3) a RELATIVE value is REFUSED, because no directory here could be the one a job uses ──
+# ⛔ `run.sh` `cd`s to the instance dir before the listener READS TMPDIR — but the listener hands that
+# value to each JOB, whose working directory is `_work/<repo>/<repo>`. So `TMPDIR=scratch-here`
+# resolves under the WORKSPACE, not the instance dir: creating `$d/scratch-here` (what this case used
+# to assert as success) made a directory no job ever used, while the run printed `created tmpdir=…`,
+# exited 0, and `status` called the row clean — a false PASS in the dimension this arm adds. The
+# value is the listener's, not ours, so it is refused and the remedy is named (#3004 review, P2).
+echo "── tmpdir: a relative value is refused, not resolved somewhere a job never looks ──"
+fresh_pool tmprel; reset_logs
+register pi-runner-rel
+printf 'TMPDIR=scratch-here\n' >"$RUNNER_ROOT/pi-runner-rel/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-rel)"
+assert_eq "$?" "2" "restart refuses a relative TMPDIR (rc 2) instead of starting on a guess"
+assert_contains "$out" "cannot-act why=tmpdir-value-relative" "naming the shape it refused"
+assert_contains "$out" "value=scratch-here" "and the value it read"
+assert_absent "$RUNNER_ROOT/pi-runner-rel/scratch-here" "no instance-dir directory was invented for it"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-rel") ))" "0" "and nothing was started"
+
+# ── (4) FAIL CLOSED: a target that CANNOT be created starts nothing ────────────────────────
+# ⛔ The failure being prevented IS "the listener starts anyway". Starting it here would reproduce the
+# incident deliberately: a healthy, online runner on which every job dies at mktemp. A refusal that
+# names the path is strictly better than a runner that silently cannot work.
+echo "── tmpdir: an uncreatable target refuses, starting nothing ──"
+fresh_pool tmpbad; reset_logs
+register pi-runner-bad
+: >"$RUNNER_ROOT/pi-runner-bad/blocker"   # a FILE where a parent directory must be (ENOTDIR, portable)
+printf 'TMPDIR=%s/pi-runner-bad/blocker/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-bad/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-bad)"
+assert_eq "$?" "2" "it is cannot-act (rc 2), never a start"
+assert_contains "$out" "cannot-act why=tmpdir-uncreatable" "naming the failure"
+assert_contains "$out" "path=$RUNNER_ROOT/pi-runner-bad/blocker/tmp" "and the path it could not create"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-bad")" "0" "NO listener was started for it"
+
+# ── (5) STATUS: a LIVE row with a missing TMPDIR is a defect that exits 3 ──────────────────
+# This is the presentation that does the damage: the row says `live`, GitHub says `online`, and the
+# instance cannot run a job. rc 0 over it is a false PASS a caller would act on.
+echo "── tmpdir: status reports it on a LIVE listener, and exits 3 ──"
+fresh_pool tmpstat; reset_logs
+register pi-runner-stat
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-stat >/dev/null
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-stat")" "1" "the instance has a live listener and no TMPDIR yet"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "0" "with no TMPDIR named, status is clean (control)"
+assert_omits "$out" "defect tmpdir-missing" "and reports no defect"
+printf 'TMPDIR=%s/pi-runner-stat/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-stat/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "3" "a LIVE row carrying a missing TMPDIR exits 3 (a defect, not a healthy report)"
+assert_contains "$out" "defect tmpdir-missing name=pi-runner-stat path=$RUNNER_ROOT/pi-runner-stat/tmp" \
+  "the defect names the instance and the path"
+assert_contains "$out" "restart --name pi-runner-stat" "and the action that clears it"
+assert_contains "$out" "tmpdir_defects=1" "the summary counts it, so a caller need not parse the table"
+# ⛔⛔ RUN THE REMEDY, DO NOT HAND-REPAIR (#3004 review, P1). This block used to `mkdir -p` by hand and
+#   then assert the report was clean — so it proved the REPORT could be satisfied, never that the
+#   command the report PRINTS works. It did not: `restart` hit the live arm, logged "not touched",
+#   exited 0 and left the directory missing. The repair below is the printed remedy itself.
+remedy="$(sed -n 's/.*run: \(.*restart --name pi-runner-stat\)$/\1/p' <<<"$out")"
+assert_contains "$remedy" "restart --name pi-runner-stat" "the remedy is parsed out of the report (not restated)"
+# shellcheck disable=SC2086
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash $remedy 2>&1)"
+assert_eq "$?" "0" "the PRINTED REMEDY runs and exits 0"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-stat/tmp" "and it actually creates the directory"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "0" "once the directory exists the report is clean again"
+assert_contains "$out" "tmpdir_defects=0" "and the count returns to zero"
+
+# ── (6) THE POST-REBOOT STATE: a LIVE listener is repairable, and its listener is untouched ──
+# ⛔ THE INCIDENT IS A LIVE LISTENER (#3004 review, P1). The instance dir is persistent and its unit
+#   enabled, so after a reboot the LISTENER SURVIVES and only its /tmp TMPDIR is gone. Every creation
+#   case in this section starts a DEAD registration, which is why they were all green while the state
+#   the PR documents could not be repaired at all. This case pins the live arm specifically: the
+#   directory appears, and the SAME pid is still the only listener.
+echo "── tmpdir: a LIVE listener with a missing TMPDIR is repaired, not re-started ──"
+fresh_pool tmplive; reset_logs
+register pi-runner-live1
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-live1 >/dev/null
+live_pids="$(listener_pids_for "$RUNNER_ROOT/pi-runner-live1")"
+printf 'TMPDIR=%s/pi-runner-live1/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-live1/.env"
+assert_absent "$RUNNER_ROOT/pi-runner-live1/tmp" "the post-reboot state: LIVE listener, TMPDIR gone"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-live1)"
+assert_eq "$?" "0" "restart on the live row succeeds"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-live1/tmp" "and it CREATES the missing TMPDIR"
+assert_omits "$out" "restarted name=" "without starting a second listener for a live registration"
+assert_eq "$(listener_pids_for "$RUNNER_ROOT/pi-runner-live1")" "$live_pids" "the live listener was NOT replaced (same pid)"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-live1") ))" "1" "exactly one listener runs"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "0" "and status is clean again — the live repair cleared the defect"
+
+# ── (7) RECONCILE's live arm repairs too (it is the arm that SKIPS every row it calls live) ──
+echo "── tmpdir: reconcile repairs the row it calls live ──"
+fresh_pool tmprec; reset_logs
+register pi-runner-recl
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-recl >/dev/null
+printf 'TMPDIR=%s/pi-runner-recl/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-recl/.env"
+assert_absent "$RUNNER_ROOT/pi-runner-recl/tmp" "the live row's TMPDIR is gone before the pass"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "reconcile exits 0 (nothing was dead)"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-recl/tmp" "and it repaired the LIVE row"
+if [ -d "$RUNNER_ROOT/pi-runner-recl/tmp" ]; then ok "the live row's TMPDIR exists after the pass"; else bad "the live row's TMPDIR was NOT created"; fi
+
+# ── (8) AN UNREADABLE `.env` IS cannot-measure, NEVER A MEASURED ZERO ─────────────────────
+# ⛔ `[ -f ]` is TRUE for a mode-000 file, so the read failed and the empty result was counted as "this
+#   instance names no TMPDIR": status printed `tmpdir_defects=0` (rc 0) over an instance whose jobs all
+#   die at mktemp. `status` may legitimately run as a DIFFERENT user from the runner's, so that shape is
+#   reachable — and a count is not a reading (#2834).
+echo "── tmpdir: an unreadable .env is cannot-measure, not a measured zero ──"
+fresh_pool tmplock; reset_logs
+register pi-runner-lock
+printf 'TMPDIR=%s/pi-runner-lock/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-lock/.env"
+chmod 000 "$RUNNER_ROOT/pi-runner-lock/.env"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unreadable .env (a root shell reads it anyway)"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+  assert_eq "$?" "2" "status refuses to grade a .env it could not read (rc 2, never rc 0 over a guess)"
+  assert_contains "$out" "cannot-measure why=tmpdir-unreadable" "and it names the file"
+  assert_omits "$out" "tmpdir_defects=0" "it publishes no zero over a reading it never took"
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-lock)" "2" \
+    "and restart starts NOTHING on an env it cannot read"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-lock") ))" "0" "no listener was started for it"
+fi
+chmod 600 "$RUNNER_ROOT/pi-runner-lock/.env"
+
+# ── (9) A VALUE THAT NEEDS SHELL EXPANSION IS REFUSED, NOT GUESSED AT ────────────────────
+# ⛔ `run.sh` SOURCES `.env`; a `sed` read does not. `TMPDIR=$HOME/ci-tmp` therefore had this tool create
+#   a directory literally named `$HOME` (under the instance dir, because the value is not `/`-leading),
+#   print `created tmpdir=…` and exit 0 — while the listener inherited an ABSENT /home/…/ci-tmp. The
+#   (a trailing comment is the opposite case — a sourcing shell ENDS the value at the whitespace, so it
+#   is TOLERATED; see case 9 below.)
+echo "── tmpdir: a \$VAR value is refused, not mis-created ──"
+fresh_pool tmpexp; reset_logs
+register pi-runner-exp
+printf 'TMPDIR=$HOME/ci-tmp\n' >"$RUNNER_ROOT/pi-runner-exp/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-exp)"
+assert_eq "$?" "2" "a \$VAR value is cannot-act (rc 2), never a guessed directory"
+assert_contains "$out" "cannot-act why=tmpdir-value-not-literal" "naming the shape it refused"
+assert_contains "$out" "value=\$HOME/ci-tmp" "and the value it read"
+assert_absent "$RUNNER_ROOT/pi-runner-exp/\$HOME" "no literal '\$HOME' directory was created (the false PASS this replaces)"
+
+assert_absent "$RUNNER_ROOT/pi-runner-exp/ci-tmp" "and nothing was guessed at either"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-exp") ))" "0" "nothing was started"
+
+# ── (9a) SHELL SYNTAX THIS PARSER DOES NOT MODEL IS REFUSED, NEVER TRUNCATED ────────────────
+# ⛔ Truncating at syntax instead of refusing it created a DIFFERENT directory and reported
+#   `created tmpdir=…` with rc 0 over the real path's absence — measured on the round-2 shape:
+#     `TMPDIR=/tmp/x/a\ b`       → created `a\`       (the shell's value is `/tmp/x/a b`)
+#     `TMPDIR=/tmp/x/x; echo hi` → created `x;`       (the shell's value is `/tmp/x/x`)
+#     `TMPDIR='/tmp/adj'x`       → created `/tmp/adj` (adjacent segments concatenate: `/tmp/adjx`)
+#   A backslash, a separator, a redirection or a subshell is EVALUATION, and this tool will not
+#   evaluate another user's `.env` (`status` may run as root) — so each is `cannot-act` (#3004 review
+#   round 3, P1).
+echo "── tmpdir: backslash / separator / adjacent-segment values are refused, not truncated ──"
+syn_expect() { # <case#> <value> <truncated-path-that-must-NOT-exist>
+  fresh_pool "tmpsyn$1"; reset_logs
+  register "pi-runner-syn$1"
+  printf 'TMPDIR=%s\n' "$2" >"$RUNNER_ROOT/pi-runner-syn$1/.env"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name "pi-runner-syn$1")"
+  assert_eq "$?" "2" "value [$2] is cannot-act (rc 2), never a truncated path"
+  assert_contains "$out" "cannot-act why=tmpdir-value-" "naming the shape it refused"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-syn$1") ))" "0" "and it started nothing"
+  assert_absent "$3" "the truncated path [$3] was NOT created"
+}
+# ⛔ THE TRUNCATED PATHS ARE ABSOLUTE — round 2's parser returned `/tmp/x/a\`, `/tmp/x/x;` and
+# `/tmp/x/adj'x`, which live OUTSIDE the fixture. Asserting `$RUNNER_ROOT/<suffix>` (the first draft)
+# could never fail AND let a regression write into the host's /tmp, so the subject is the real path and
+# it is cleaned up before and after.
+rm -rf '/tmp/x/a\' '/tmp/x/x;' "/tmp/x/adj'x" 2>/dev/null
+syn_expect 1 '/tmp/x/a\ b'      '/tmp/x/a\'
+syn_expect 2 '/tmp/x/x; echo hi' '/tmp/x/x;'
+syn_expect 3 "/tmp/x/adj'x"      "/tmp/x/adj'x"
+rm -rf '/tmp/x/a\' '/tmp/x/x;' "/tmp/x/adj'x" 2>/dev/null
+fresh_pool tmpcmt; reset_logs
+register pi-runner-cmt
+printf 'TMPDIR=%s/pi-runner-cmt/tmp  # scratch\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-cmt/.env"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-cmt)"
+assert_eq "$?" "0" "a trailing comment is TOLERATED — an unquoted assignment ends at the whitespace"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-cmt/tmp (named by" "so the value BEFORE the comment is created"
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-cmt/tmp" "and that is the path the listener inherits"
+assert_absent "$RUNNER_ROOT/pi-runner-cmt/tmp  # scratch" "no directory whose NAME carries the comment was made"
+
+# ── (9b) LEGAL VALUES THE OLD REFUSAL TOOK WITH IT ──────────────────────────────────────────
+# ⛔ The previous shape stripped quotes FIRST and then refused the remainder for whitespace/`$`/`~`,
+# i.e. it removed exactly the characters that had made the value legal. A quoted path with a SPACE
+# and a single-quoted `$` are values the sourcing listener honours EXACTLY, yet both were `cannot-act`,
+# so `restart` — the remedy `status` prints — started NOTHING on a legal `.env` (#3004 review, P2).
+echo "── tmpdir: a quoted path with a space, and a single-quoted dollar, are ACCEPTED ──"
+fresh_pool tmpq; reset_logs
+register pi-runner-q
+printf 'TMPDIR="%s/pi-runner-q/dir with space"\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-q/.env"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-q)"
+assert_eq "$?" "0" "a double-quoted path containing a space is accepted"
+if [ -d "$RUNNER_ROOT/pi-runner-q/dir with space" ]; then ok "and the directory is created with that name"; else bad "the space-bearing directory was not created"; fi
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-q/dir with space" "and the listener inherits it"
+fresh_pool tmpq2; reset_logs
+register pi-runner-q2
+printf "TMPDIR='%s/pi-runner-q2/\$lit'\n" "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-q2/.env"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-q2)"
+assert_eq "$?" "0" "a single-quoted value containing a dollar is accepted (single quotes are LITERAL)"
+if [ -d "$RUNNER_ROOT/pi-runner-q2/\$lit" ]; then ok "the literal-dollar directory is created, not an expanded one"; else bad "the literal-dollar directory was not created"; fi
+
+# ── (9c) AN UNTERMINATED QUOTE NAMES NO PATH ────────────────────────────────────────────────
+# `TMPDIR="/tmp/x` has no closing quote, so the string written is not a path the listener resolves.
+# The old code created a directory literally named after the stray quote — a false success.
+echo "── tmpdir: an unterminated quote is refused, not turned into a directory ──"
+fresh_pool tmpuq; reset_logs
+register pi-runner-uq
+printf 'TMPDIR="/tmp/unterminated\n' >"$RUNNER_ROOT/pi-runner-uq/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-uq)"
+assert_eq "$?" "2" "an unterminated quote is cannot-act (rc 2)"
+assert_contains "$out" "cannot-act why=tmpdir-value-unterminated-quote" "naming the shape"
+assert_absent "$RUNNER_ROOT/pi-runner-uq/\"" "no directory named after the stray quote was created"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-uq") ))" "0" "nothing was started"
+
+# ── (10) `export TMPDIR=` IS THE SAME ASSIGNMENT TO A SOURCING SHELL ─────────────────────
+# `. ./.env` honours `export TMPDIR=…`; requiring a bare `TMPDIR=` made the assignment invisible to BOTH
+# the creation and the detection, so the directory was never made and status never reported it.
+echo "── tmpdir: 'export TMPDIR=' is honoured ──"
+fresh_pool tmpexport; reset_logs
+register pi-runner-exp2
+printf 'export TMPDIR=%s/pi-runner-exp2/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-exp2/.env"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-exp2)"
+assert_eq "$?" "0" "an exported assignment is read like any other"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-exp2/tmp" "so the directory is created"
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-exp2/tmp" "and the listener inherits it"
+
+# ── (11) A PREVIEW MAY NOT ANNOUNCE A START THE REAL PASS REFUSES ───────────────────────
+# ⛔ The env precondition lives in `start_listener`, i.e. DOWNSTREAM of cmd_restart's `--dry-run` return,
+#   so an uncreatable TMPDIR previewed as "would start the listener" (rc 0) and then refused for real
+#   (rc 2) — the lying preview this file refuses elsewhere. A preview must also MUTATE nothing.
+echo "── tmpdir: --dry-run tells the truth and mutates nothing ──"
+fresh_pool tmpdry; reset_logs
+register pi-runner-dry
+: >"$RUNNER_ROOT/pi-runner-dry/blocker"
+printf 'TMPDIR=%s/pi-runner-dry/blocker/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-dry/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dry --dry-run)"
+assert_eq "$?" "2" "dry-run on an UNCREATABLE target refuses (rc 2), exactly as the real pass does"
+assert_omits "$out" "would start the listener" "and does not announce a start it would refuse"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-dry") ))" "0" "the preview started nothing"
+fresh_pool tmpdry2; reset_logs
+register pi-runner-dry2
+printf 'TMPDIR=%s/pi-runner-dry2/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-dry2/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dry2 --dry-run)"
+assert_eq "$?" "0" "a creatable target previews as OK"
+assert_contains "$out" "dry-run: would create tmpdir=$RUNNER_ROOT/pi-runner-dry2/tmp" "naming the creation it would make"
+assert_absent "$RUNNER_ROOT/pi-runner-dry2/tmp" "and the preview MUTATED nothing"
+
+# ── (12) THE DEFECT LINE MUST MATCH THE ROW IT IS UNDER ────────────────────────────────────
+# The arm runs for DEAD rows too, where "the listener row above (and GitHub) report it healthy" is false.
+echo "── tmpdir: the defect line does not claim a DEAD row is healthy ──"
+fresh_pool tmpdead; reset_logs
+register pi-runner-dead
+printf 'TMPDIR=%s/pi-runner-dead/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-dead/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "3" "a DEAD row with a missing TMPDIR is still a defect (rc 3)"
+assert_contains "$out" "defect tmpdir-missing name=pi-runner-dead" "it is reported"
+assert_contains "$out" "the listener row above reports it DEAD" "and the clause matches the row state"
+assert_omits "$out" "report it healthy" "it does not assert a health the row contradicts"
+
+# ── (13) AN EXISTING BUT UNWRITABLE TARGET IS cannot-act ──────────────────────────
+# The claimed arm the review found UNTESTED (#3004): `mkdir -p` succeeds over an existing directory and
+# does NOT tighten it, so a target that exists but cannot be written is the one shape where the
+# directory test passes and `mktemp` would still fail. The verdict is the WRITABILITY, not the existence.
+echo "── tmpdir: an existing but UNWRITABLE target refuses, starting nothing ──"
+fresh_pool tmpunw; reset_logs
+register pi-runner-unw
+mkdir -p "$RUNNER_ROOT/pi-runner-unw/tmp"; chmod 500 "$RUNNER_ROOT/pi-runner-unw/tmp"
+printf 'TMPDIR=%s/pi-runner-unw/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-unw/.env"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unwritable TMPDIR (a root shell bypasses the write bit)"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-unw)"
+  assert_eq "$?" "2" "an unwritable target is cannot-act (rc 2), not a start"
+  assert_contains "$out" "cannot-act why=tmpdir-unwritable" "and it names the write bit, not the path's absence"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-unw") ))" "0" "NO listener was started — it could not run a job anyway"
+fi
+chmod 700 "$RUNNER_ROOT/pi-runner-unw/tmp"
+
+# ── (13b) WRITE IS NOT SEARCH: mode 200 has `-w` and NO `-x`, and `mktemp` fails in it ─────
+# ⛔ `[ -w ]` alone returned 0 SILENTLY — no `created`, no `cannot-act` — over a TMPDIR `mktemp` fails
+# in (measured: rc 1), which is the false PASS the function's header says it refuses. Case (13) cannot
+# see it: mode 500 has no WRITE bit, so it exercises the arm that was already there.
+echo "── tmpdir: a target with WRITE but no SEARCH refuses (mode 200) ──"
+fresh_pool tmpsrch; reset_logs
+register pi-runner-srch
+mkdir -p "$RUNNER_ROOT/pi-runner-srch/tmp"; chmod 200 "$RUNNER_ROOT/pi-runner-srch/tmp"
+printf 'TMPDIR=%s/pi-runner-srch/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-srch/.env"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "a search-bit-only defect (root bypasses the execute bit)"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-srch)"
+  assert_eq "$?" "2" "a target with no SEARCH bit is cannot-act (rc 2), not a silent success"
+  assert_contains "$out" "cannot-act why=tmpdir-unwritable" "and it says which bit is missing"
+  assert_contains "$out" "w=y x=n" "naming the two readings that disagree"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-srch") ))" "0" "NO listener was started"
+fi
+chmod 700 "$RUNNER_ROOT/pi-runner-srch/tmp"
+
+# ── (13c) THE LIVE ARM MAY NOT CREATE A DIRECTORY IN ANOTHER USER'S NAME ─────────────────────
+# ⛔ The owner claim (`created BY THE USER THAT WILL RUN THE LISTENER`) holds for the START path only.
+# A LIVE listener may belong to another user — the systemd unit that survived the reboot started it —
+# so a mode-700 directory made by an operator running this as root would belong to ROOT: the runner
+# could not write it, jobs would still die (EACCES instead of ENOENT), `[ -w ]` is trivially true for
+# root and `status` tests existence only, so every instrument would call the row clean. pid 1 is a
+# real live process owned by a DIFFERENT user on every non-root host, which is the whole guard.
+echo "── tmpdir: the live arm refuses to create a TMPDIR owned by another user ──"
+fresh_pool tmpown; reset_logs
+register pi-runner-own
+register pi-runner-own-shim
+printf 'TMPDIR=%s/pi-runner-own/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-own/.env"
+printf 'TMPDIR=%s/pi-runner-own-shim/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-own-shim/.env"
+# ⛔ TWO CONDITIONS MAKE THIS UNTESTABLE HERE, AND BOTH ARE `skip`, NOT A SILENT PASS: a root shell
+# owns every process it could compare against, and a container's pid 1 IS the invoking user. The
+# comparison below is run against the REAL `ps` (`$BIN` is dropped from PATH) because this suite
+# deliberately replaces `ps` with a table shim — and the guard is written to treat a shim-shaped read
+# as "no mismatch proven", so asserting the refusal through the stub would pin the opposite.
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an owner mismatch (a root shell owns every process it can compare against)"
+elif [ "$(PATH=/usr/bin:/bin:/usr/sbin:/sbin ps -o user= -p 1 2>/dev/null | tr -d '[:space:]')" = "$(id -un)" ]; then
+  skip "an owner mismatch (pid 1 in this container already runs as $(id -un))"
+else
+  # Reach the shipped functions directly, EXTRACTED VERBATIM (never a re-typed copy): `main` runs only
+  # at the bottom of the script, so extracting the two functions is how a unit-level arm is asserted.
+  own_out="$(POOL="$POOL" ROOT="$RUNNER_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c '
+    eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
+    eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
+    err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+    ensure_tmpdir "$ROOT/pi-runner-own" 1
+  ' 2>&1)"
+  assert_contains "$own_out" "cannot-measure why=tmpdir-owner-mismatch" "the live arm refuses an owner whose access it cannot measure"
+  assert_contains "$own_out" "pid=1 runs as user=" "naming the live listener it compared"
+  assert_absent "$RUNNER_ROOT/pi-runner-own/tmp" "and it created nothing under the wrong owner"
+  POOL="$POOL" ROOT="$RUNNER_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c '
+    eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
+    eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
+    err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+    ensure_tmpdir "$ROOT/pi-runner-own"
+  ' >/dev/null 2>&1
+  if [ -d "$RUNNER_ROOT/pi-runner-own/tmp" ]; then ok "the START path (no live listener) still creates it"; else bad "the start path stopped creating the directory"; fi
+fi
+# ⛔ AND THE SHIM ITSELF MUST NOT BECOME A REFUSAL: with the fixture's `ps` in PATH (a garbage-shaped
+# table), the live repair still has to go through — the false block this guard would otherwise create
+# on every box whose `ps` is not a real one.
+own_shim="$(POOL="$POOL" ROOT="$RUNNER_ROOT" bash -c '
+  eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
+  eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
+  err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+  ensure_tmpdir "$ROOT/pi-runner-own-shim" 1
+' 2>&1)"
+assert_omits "$own_shim" "tmpdir-owner-mismatch" "a shim-shaped ps reading is NOT turned into a refusal"
+if [ -d "$RUNNER_ROOT/pi-runner-own-shim/tmp" ]; then ok "and the live repair still creates the directory under it"; else bad "a shim-shaped ps blocked the repair"; fi
+
+
+# ── MUTATION: removing the creation must break these cases ────────────────────────────────
+# ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. The copy below is the shipped script with the
+#   creation DEFUSED at its single source — `ensure_tmpdir` returns immediately, so every call site
+#   (the `start_listener` start path, `cmd_restart`'s live arm and its hoisted pre-start check, and
+#   `cmd_reconcile`'s live arm) does nothing. Deleting one CALL is no longer the right mutation: the
+#   repair is deliberately reachable from more than one arm (a live listener is never started again),
+#   so a per-call-site mutation proved nothing about the others. Neutering the one function is what
+#   reproduces the incident — the listener comes up under a TMPDIR that does not exist.
+echo "── tmpdir: mutation — without the mkdir the listener is left unsatisfiable ──"
+fresh_pool tmpmut; reset_logs
+MUTTMP="$T/mutant-tmpdir.sh"
+python3 - "$POOL" "$MUTTMP" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+needle = '  t="$(instance_tmpdir "$d")" || rc=$?\n'
+assert text.count(needle) == 1, "the ensure_tmpdir body moved: update the mutation target"
+open(dst, "w", encoding="utf-8").write(text.replace(needle, '  return 0  # MUTANT: the creation defused\n' + needle))
+PY
+assert_file "$MUTTMP" "the mutation copy was produced"
+register pi-runner-mut-tmp
+MUTLOG="$T/mut-tmpdir.log"; : >"$MUTLOG"
+printf 'TMPDIR=%s/pi-runner-mut-tmp/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-mut-tmp/.env"
+mut_out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$MUTLOG" bash "$MUTTMP" restart --name pi-runner-mut-tmp 2>&1)"
+assert_omits "$mut_out" "created tmpdir=" "the MUTANT never creates the directory (so the cases above are live)"
+assert_absent "$RUNNER_ROOT/pi-runner-mut-tmp/tmp" "the mutant leaves the target missing — the exact post-reboot state"
+assert_contains "$(cat "$MUTLOG")" "absent $RUNNER_ROOT/pi-runner-mut-tmp/tmp" \
+  "and its listener comes up under a TMPDIR that does not exist — the state in which every job dies at mktemp"
+pkill -f "$RUNNER_ROOT/pi-runner-mut-tmp/bin/Runner.Listener" 2>/dev/null || true
+
+# ── MUTATION: the LIVE-arm repair is load-bearing too ──────────────────────────────────────
+# ⛔ The mutation above deletes the call inside `start_listener`, which the live arm never reaches — so
+#   it proves nothing about the post-reboot state. This copy deletes ONLY the call in `cmd_restart`'s
+#   live arm; the state it must fail to repair is the one this PR is about.
+echo "── tmpdir: mutation — the LIVE-arm repair is load-bearing ──"
+fresh_pool tmpmutlive; reset_logs
+MUTLIVE="$T/mutant-live-arm.sh"
+python3 - "$POOL" "$MUTLIVE" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+needle = '    0) ensure_tmpdir "$dir" "$LISTENER_PID" || return 2\n'
+assert text.count(needle) == 1, "the live-arm ensure_tmpdir call moved: update the mutation target"
+open(dst, "w", encoding="utf-8").write(text.replace(needle, '    0)\n'))
+PY
+assert_file "$MUTLIVE" "the live-arm mutation copy was produced"
+register pi-runner-mut-live
+bash "$POOL" restart --name pi-runner-mut-live >/dev/null 2>&1
+printf 'TMPDIR=%s/pi-runner-mut-live/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-mut-live/.env"
+mut_out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash "$MUTLIVE" restart --name pi-runner-mut-live 2>&1)"
+assert_omits "$mut_out" "created tmpdir=" "the MUTANT never repairs a LIVE row (so the case above is live)"
+assert_absent "$RUNNER_ROOT/pi-runner-mut-live/tmp" "the mutant leaves the post-reboot state broken — the defect as shipped"
+assert_contains "$mut_out" "live name=pi-runner-mut-live" "while still reporting the listener 'not touched' and exiting 0"
+pkill -f "$RUNNER_ROOT/pi-runner-mut-live/bin/Runner.Listener" 2>/dev/null || true
 
 # ══ 10. MUTATION: removing the floor check must break the suite ═════════════════════════════
 # The floor is the owner-mandated predicate (#2344 comment 6347825624). A copy with the comparison
@@ -1148,6 +1708,22 @@ out="$(bash "$POOL" --help 2>&1)"
 assert_eq "$?" "0" "--help exits 0"
 assert_contains "$out" "ci_runner_pool.sh add      --name <name>" "--help prints the VERBS (not the WHY prose)"
 assert_contains "$out" "EXIT: 0 ok" "--help prints the exit-code contract"
+# ⛔ THE rc-3 CLAUSE MAY NOT NAME A CONDITION THE CODE RETURNS 2 FOR (#2899 review round 6, P3). The
+# legend claimed `status` exits 3 for "a quarantine whose liveness could not be measured" while
+# `cmd_status` returns 2 for exactly that row (`UNPROBED`) — and the body says so twice. The legend is
+# the ONLY exit contract an operator or scheduler is meant to read, so a clause matching no code path
+# mis-routes the caller on the one signal (cannot-measure) it exists to branch on.
+# ⛔ AND THE MATCH SUBJECT MUST BE WHITESPACE-FLATTENED (#2899 review round 6, P3 — this assertion was
+# VACUOUS when first written). `usage()` prints the header VERBATIM, so a clause that wraps in the
+# source never appears contiguously in `$out`: the pre-fix head `fd1a300a9` prints "…or a quarantine
+# whose liveness could not\n      be measured (see below)", and an `assert_omits` on the single-line
+# phrase therefore passed against the very code it was written to catch. Measured both ways: joined,
+# the guard reports the phrase unexpectedly present at `fd1a300a9`; unjoined, it reports nothing.
+help_flat="$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ')"
+assert_omits "$help_flat" "quarantine whose liveness could not be measured" \
+  "the status rc-3 clause does NOT claim an UNPROBED quarantine (that is rc 2)"
+assert_contains "$out" 'quarantined install whose listener could not be probed (`UNPROBED`)' \
+  "the rc-2 paragraph names the unmeasured quarantine instead"
 assert_contains "$out" "RUNNER_TEMPLATE" "--help prints the env seams"
 assert_contains "$out" "every runner on THIS box" "--help scopes --all to this box (no cross-box read here)"
 assert_eq "$(rc_of bogus-verb)" "1" "an unknown verb exits 1"
@@ -1497,6 +2073,695 @@ RUNNER_ROOT=/: out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 env RUNNER_ROOT=/ bash
 assert_eq "$(grep -cF 'pool-root-incomplete' <<<"$out")" "0" "RUNNER_ROOT=/ does not report a listener outside itself"
 # (rc is NOT asserted here: a listener whose instance dir was deleted under it is legitimately
 #  `instance-dir-unresolvable`, and earlier cases leave such fixtures behind.)
+
+# ══ (#2892) ORPHANED REGISTRATIONS — the state no verb could leave ═════════════════════════
+# Every arm below is a measured fact from `pi-cell-4` (2026-10-27T03:30–04:20Z), where two installs
+# whose registrations GitHub had deleted sat unusable while the "self-healing" pass reported them
+# restarted, and the one slot that COULD be revived stayed dead for lack of a scheduled pass.
+
+# ── CAPACITY IS NAMES, NOT DIRECTORIES ───────────────────────────────────────────────────────
+# Measured: `/opt/gh-runner-x64-1` and `/opt/gh-runner-cell4-x64` both carry
+# `"agentName": "pi-runner-cell4-x64-1"` (agentIds 47 and 35) — one GitHub registration, two local
+# directories. Counting directories let the box read `slots=5` against `ceiling=3`.
+echo "── capacity: two directories carrying ONE GitHub name ──"
+fresh_pool dupname; reset_logs
+register pi-runner-d1
+register pi-runner-d2
+printf '{\n  "agentId": 47,\n  "agentName": "pi-runner-shared"\n}\n' >"$RUNNER_ROOT/pi-runner-d1/.runner"
+printf '{\n  "agentId": 35,\n  "agentName": "pi-runner-shared"\n}\n' >"$RUNNER_ROOT/pi-runner-d2/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_contains "$out" "slots=1 ceiling=3" "two dirs carrying one agentName are ONE slot of capacity"
+assert_contains "$out" "registrations=2" "and the directory count is still published, as its own field"
+
+# ── AN ORPHANED REGISTRATION IS NOT DEAD, AND NOT CAPACITY ──────────────────────────────────
+echo "── an orphaned registration: its own state, and zero capacity ──"
+fresh_pool orphan; reset_logs
+register pi-runner-orph
+: >"$RUNNER_ROOT/pi-runner-orph/.orphan"
+printf '{\n  "agentId": 35,\n  "agentName": "pi-runner-cell4-x64-1"\n}\n' >"$RUNNER_ROOT/pi-runner-orph/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-orph/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "3" "an ORPHANED registration fails the report (rc 3), like a DEAD one"
+assert_contains "$out" "ORPHANED" "and it is its OWN state — a bare restart is not the verb that settles it"
+assert_contains "$out" "slots=0 ceiling=3" "an orphaned registration is NOT capacity"
+assert_contains "$out" "orphaned=1" "and the summary counts it"
+# ⛔ THIS ARM PINS A RECORDED TRADE-OFF, NOT A PROOF (#2899 review round 6, P1/R1). The classifier
+# reads a LOG LINE, and a skew-era line survives a clock later corrected (actions/runner#4648) — so on
+# that shape the install is `orphaned` here and yet `restart` recovers it (see the `skewline` arm).
+# Counting such an install back into `slots` would close the over-add window and RE-OPEN the measured
+# `pi-cell-4` failure (an unretired orphan taking a slot on a box whose real capacity is one short).
+# The owner's direction (R3: an orphaned registration is not capacity) therefore stands, and every
+# branch that needs a verified verdict goes through `reclaim` / `reconcile` (rc 6). Overturning it is a
+# REOPEN of R3 with the owner — if this assertion is ever the thing in your way, that is the route,
+# not an edit here.
+
+# ── restart MUST NOT CALL AN ORPHAN RESTARTED (the lie that hid this for days) ───────────────
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-orph)"
+assert_eq "$?" "6" "restart on an orphaned registration is rc 6 (provably orphaned), not 0 and not 2"
+assert_contains "$out" "orphaned name=pi-runner-orph" "naming what it found"
+assert_contains "$out" "evidence=$RUNNER_ROOT/pi-runner-orph/listener.log" "and the file that proves it"
+assert_contains "$out" "reclaim --name pi-runner-orph" "and the verb that repairs it"
+assert_eq "$(grep -cF 'restarted name=' <<<"$out")" "0" "it does NOT report a restart it did not achieve"
+
+# ── reclaim: PREVIEW, then RETIRE ────────────────────────────────────────────────────────────
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim --dry-run)"
+assert_eq "$?" "0" "a dry-run retire pass exits 0"
+assert_contains "$out" "dry-run: would START name=pi-runner-cell4-x64-1 agent_id=35" \
+  "it announces the VERIFICATION it would run (a dry run cannot prove a retire, so it does not promise one)"
+assert_file "$RUNNER_ROOT/pi-runner-orph/.runner" "and a preview deleted NOTHING"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "reclaim exits 0 when it retired what it found"
+assert_contains "$out" "retired name=pi-runner-cell4-x64-1 agent_id=35" "it names the GITHUB identity, not the directory"
+assert_contains "$out" "reclaim: retired=1 preserved=0" "and the pass summarises itself"
+assert_absent "$RUNNER_ROOT/pi-runner-orph" "the install is gone — the name is free again"
+assert_contains "$out" "run: " "and it names the next verb for the freed name"
+
+# ── the CLOCK GUARD: this evidence is ALSO what a skewed clock produces ─────────────────────
+# actions/runner#4648/#1798: a wrong clock makes GitHub refuse the session and the listener print the
+# SAME line. Retiring is irreversible, so an unproven clock must refuse — never guess.
+echo "── reclaim: a skewed clock REFUSES, and an unmeasurable one too ──"
+fresh_pool skew; reset_logs
+register pi-runner-skew
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-skew/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TIME_SKEW_S=600 run reclaim)"
+assert_eq "$?" "3" "a clock 600 s off GitHub's REFUSES the retirement (rc 3)"
+assert_contains "$out" "skew=600s bound=120s" "printing the offset and the bound it broke"
+assert_file "$RUNNER_ROOT/pi-runner-skew/.runner" "and NOTHING was deleted"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CURL_FAIL=1 run reclaim)"
+assert_eq "$?" "2" "an UNMEASURABLE clock is cannot-measure (rc 2), never a delete"
+assert_contains "$out" "why=clock-unverified" "naming the reading it could not take"
+assert_file "$RUNNER_ROOT/pi-runner-skew/.runner" "and it still deleted nothing"
+
+# ── NO EVIDENCE = PRESERVE. A dead-but-registered listener is `restart`'s, not this verb's ───
+echo "── reclaim: a revivable registration is PRESERVED, never retired ──"
+fresh_pool preserve; reset_logs
+register pi-runner-plain
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "a pass with nothing retirable exits 0"
+assert_contains "$out" "preserve name=pi-runner-plain" "it names the registration it declined to retire"
+assert_contains "$out" "why=no-orphan-evidence" "and the reason"
+assert_file "$RUNNER_ROOT/pi-runner-plain/.runner" "the install is untouched"
+
+# ── EVIDENCE OLDER THAN THE CURRENT REGISTRATION IS NOT EVIDENCE ABOUT IT ──────────────────
+# An install repaired IN PLACE (`remove` + a fresh `add`) keeps every old log. Reading those would
+# retire a registration that its own `.runner` already superseded.
+echo "── reclaim: a _diag line older than the marker is stale evidence ──"
+fresh_pool staleproof; reset_logs
+register pi-runner-fresh
+mkdir -p "$RUNNER_ROOT/pi-runner-fresh/_diag"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-fresh/_diag/Runner_20260101-000000-utc.log"
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-fresh/_diag/Runner_20260101-000000-utc.log" 2>/dev/null || true
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "nothing is retired on stale evidence"
+assert_contains "$out" "preserve name=pi-runner-fresh" "the registration is preserved"
+assert_file "$RUNNER_ROOT/pi-runner-fresh/.runner" "and its marker is still there"
+
+# ── A NAME A LIVE SIBLING HOLDS IS NOT RE-REGISTERED ───────────────────────────────────────
+# The measured trap: two installs share `pi-runner-cell4-x64-1`, and registering that name again
+# DELETES whichever registration holds it — the exact event that orphaned the install being retired.
+echo "── reclaim: retire the stale install, never the live holder of its name ──"
+fresh_pool sibling; reset_logs
+register pi-runner-live
+register pi-runner-stale
+orphanize pi-runner-stale
+for d in pi-runner-live pi-runner-stale; do
+  printf '{\n  "agentId": 47,\n  "agentName": "pi-runner-sibname"\n}\n' >"$RUNNER_ROOT/$d/.runner"
+done
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-stale/listener.log"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-live)" "0" \
+  "baseline: the sibling's listener comes up"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires the stale install and leaves the live one alone"
+assert_contains "$out" "kept=$RUNNER_ROOT/pi-runner-live" "naming the LIVE holder of the name"
+assert_contains "$out" "nothing was re-registered" "and why it did not re-register that name"
+assert_absent "$RUNNER_ROOT/pi-runner-stale" "the stale install is gone"
+assert_file "$RUNNER_ROOT/pi-runner-live/.runner" "the live registration is untouched"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-live")" "1" "and still serving"
+
+# ── AN UNREADABLE SIBLING NAME IS NOT "NO SIBLING" ──────────────────────────────────────────
+# Guard 3 exists so the pass never tells the operator to re-register a name a working runner holds
+# (re-registering DELETES the holder). `registration_name` returns EMPTY when a sibling's `.runner`
+# cannot be read, and the old membership test therefore dropped that sibling entirely — so the pass
+# printed "the name is free again; run: add", the one instruction that can delete a live runner.
+# Measured shape: a sibling whose `.runner` carries no readable `agentName` (here: no agentName at
+# all, which needs no permissions and so does not degrade to a root-only skip).
+# ⛔ The retire itself is still evidence+clock guarded; it is the ADVICE that must never be a guess.
+echo "── reclaim: an unreadable sibling name makes the name UNVERIFIED, never 'free again' ──"
+fresh_pool sibunknown; reset_logs
+register pi-runner-uu
+register pi-runner-us
+orphanize pi-runner-us
+printf '{}\n' >"$RUNNER_ROOT/pi-runner-uu/.runner"
+printf '{\n  "agentId": 9,\n  "agentName": "shared-nm"\n}\n' >"$RUNNER_ROOT/pi-runner-us/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-us/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_contains "$out" "the name is UNVERIFIED" "the pass says it could not prove the name is free"
+case "$out" in
+  *"the name is free again"*) bad "it still printed the re-register advice over an unreadable sibling";;
+  *) ok "and it does NOT say 'the name is free again; run: add' (that is the instruction that deletes a live runner)";;
+esac
+assert_absent "$RUNNER_ROOT/pi-runner-us" "the retire still happened (evidence + clock are its guards, not this one)"
+
+# ── AN UNREADABLE *OWN* NAME IS UNVERIFIED TOO (round 3, P1) ────────────────────────────────
+# Guard 3 compares the retiring install's name against the pool. An unreadable OWN name used to SKIP
+# the guard entirely and leave `sib_unknown=0`, so the pass printed "the name is free again; run: add
+# --name <basename>" — the exact instruction that DELETES whichever live runner holds that basename.
+# Reachable with no exotic permissions: `add` accepts an EMPTY `.runner` as proof of registration, so
+# a `{}` marker sends a real install down this path.
+echo "── reclaim: an UNREADABLE own name never prints the re-register advice ──"
+fresh_pool ownunknown; reset_logs
+register pi-runner-own
+register pi-runner-ownholder
+printf '{}\n' >"$RUNNER_ROOT/pi-runner-own/.runner"
+printf '{\n  "agentId": 42,\n  "agentName": "pi-runner-own"\n}\n' >"$RUNNER_ROOT/pi-runner-ownholder/.runner"
+orphanize pi-runner-own
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-own/listener.log"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-ownholder)" "0" \
+  "baseline: the runner holding the BASENAME name is LIVE"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_contains "$out" "the name is UNVERIFIED" \
+  "an unreadable OWN name proves as little as an unreadable sibling's, so the name is UNVERIFIED"
+case "$out" in
+  *"the name is free again"*) bad "it still printed 'the name is free again' over an unreadable OWN name";;
+  *) ok "and the pass never prints 'run: add --name <basename>' on an unproven own name";;
+esac
+assert_absent "$RUNNER_ROOT/pi-runner-own" "the retire itself still happened (a fresh refusal + the clock are its guards)"
+pkill -f -- "$RUNNER_ROOT/pi-runner-ownholder/bin/Runner.Listener" 2>/dev/null || true
+
+# ── A LIVE HOLDER IN A QUARANTINE DIR IS STILL A HOLDER (round 3, P2) ───────────────────────
+# `registered_dirs` excludes `*.retired-*` BY NAME (correct: a retired runner must never re-enter
+# capacity), so a listener still RUNNING on a quarantined install was invisible to guard 3 — while this
+# file gives that state its own `status` row (LIVE-QUAR). Guard 3 enumerates quarantine names for the
+# HOLDER SCAN ONLY; capacity is never counted from them.
+echo "── reclaim: a LIVE listener in a QUARANTINE dir still holds its name ──"
+fresh_pool quarholder; reset_logs
+register pi-runner-hq
+register pi-runner-hshared
+for d in pi-runner-hq pi-runner-hshared; do
+  printf '{\n  "agentId": 71,\n  "agentName": "qname"\n}\n' >"$RUNNER_ROOT/$d/.runner"
+done
+mv "$RUNNER_ROOT/pi-runner-hshared" "$RUNNER_ROOT/pi-runner-hshared.retired-20260101T000000Z"
+qdir="$RUNNER_ROOT/pi-runner-hshared.retired-20260101T000000Z"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-hshared.retired-20260101T000000Z)" "0" \
+  "baseline: a listener IS running on the quarantined install"
+orphanize pi-runner-hq
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-hq/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires the orphaned install"
+assert_contains "$out" "kept=$qdir" \
+  "guard 3 sees the LIVE holder inside the quarantine dir (it is a holder, not capacity)"
+assert_contains "$out" "nothing was re-registered" "so it never advises re-registering that name"
+assert_file "$qdir/.runner" "the quarantined install is untouched"
+pkill -f -- "$qdir/bin/Runner.Listener" 2>/dev/null || true
+
+# ── A STALE DELETION LINE DOES NOT AUTHORISE A DELETE IF THE REGISTRATION ANSWERS (round 3, P1) ──
+# actions/runner#4648, measured: a box with an unsynchronised clock starts its runner, GitHub refuses
+# the session, the runner prints the SAME "registration has been deleted" line and EXITS PERMANENTLY.
+# NTP then corrects the clock. The newest log is still the skew-era line, so a log-only retire deletes a
+# HEALTHY registration (its GitHub registration survives holding the name, and the re-register advice
+# then DELETES it). `reclaim` therefore STARTS the listener and retires only on a refusal it dated
+# ITSELF — the only evidence a clock that was wrong yesterday cannot have written.
+echo "── reclaim: a skew-era line over a registration that STILL ANSWERS is a revival, not a retire ──"
+fresh_pool skewline; reset_logs
+register pi-runner-skewline
+printf '{\n  "agentId": 61,\n  "agentName": "pi-runner-skewline"\n}\n' >"$RUNNER_ROOT/pi-runner-skewline/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-skewline/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass exits 0"
+assert_contains "$out" "revived name=pi-runner-skewline" \
+  "the listener STARTED and SURVIVED, so the old line was a skew artifact and nothing was deleted"
+assert_contains "$out" "reclaim: retired=0 preserved=0 revived=1" "the summary counts a REVIVAL, not a retire"
+assert_file "$RUNNER_ROOT/pi-runner-skewline/.runner" "the healthy registration is untouched"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-skewline")" "1" "and it is serving jobs again"
+pkill -f -- "$RUNNER_ROOT/pi-runner-skewline/bin/Runner.Listener" 2>/dev/null || true
+
+# ── THE NEWEST LOG DECIDES ──────────────────────────────────────────────────────────────────
+# A log accumulates across every start in ONE registration's life, so "some line in some file" is not
+# evidence about the CURRENT state. GitHub prints the identical deletion line when session creation
+# fails on a SKEWED clock (actions/runner#4648), so an install whose clock was once wrong keeps that
+# line forever: after NTP corrected it, the install is revivable, and retiring it deletes a working
+# runner. A NEWER log that does not carry the line therefore vetoes the older one — the previous code
+# read `listener.log` first and returned on the first match, so the newer `_diag` was never consulted.
+echo "── reclaim: a NEWER log showing a later start VETOES older evidence ──"
+fresh_pool newest; reset_logs
+register pi-runner-veto
+orphanize pi-runner-veto
+printf '{\n  "agentId": 77,\n  "agentName": "pi-runner-veto"\n}\n' >"$RUNNER_ROOT/pi-runner-veto/.runner"
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-veto/.runner" 2>/dev/null || true
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-veto/listener.log"
+touch -t 202601010100 "$RUNNER_ROOT/pi-runner-veto/listener.log" 2>/dev/null || true
+mkdir -p "$RUNNER_ROOT/pi-runner-veto/_diag"
+printf 'Listening for Jobs\n' >"$RUNNER_ROOT/pi-runner-veto/_diag/Runner_20260101-020000-utc.log"
+touch -t 202601010200 "$RUNNER_ROOT/pi-runner-veto/_diag/Runner_20260101-020000-utc.log" 2>/dev/null || true
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "a pass with nothing retirable exits 0"
+assert_contains "$out" "preserve name=pi-runner-veto" "the registration is PRESERVED: its newest log shows a later, successful start"
+assert_file "$RUNNER_ROOT/pi-runner-veto/.runner" "and its marker is still there"
+# CONTROL: with the later log gone, the same line IS the newest evidence — so the veto above is
+# load-bearing rather than an arm that can never retire anything.
+rm -f "$RUNNER_ROOT/pi-runner-veto/_diag/Runner_20260101-020000-utc.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "control: the pass still exits 0"
+assert_contains "$out" "retired name=pi-runner-veto" "control: with no newer log, the line IS evidence and the install retires"
+assert_absent "$RUNNER_ROOT/pi-runner-veto" "control: the install is gone"
+# ── A FRESH ATTEMPT READS ONLY ITS OWN EVIDENCE, ON EVERY SOURCE ───────────────────────────
+# `skip_bytes` scoped `listener.log` only. `_diag/Runner_*.log` is a SEPARATE file per attempt, so a
+# PREVIOUS attempt's diag could supply the deletion line for a start that died for an unrelated reason
+# — and rc 6 is routed straight into `reclaim`, which deletes the install. Both sources are now
+# bounded by the attempt's own start time.
+echo "── restart: a PREVIOUS attempt's _diag is not evidence about a FRESH start ──"
+fresh_pool attempt; reset_logs
+register pi-runner-att
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-att/.runner" 2>/dev/null || true
+mkdir -p "$RUNNER_ROOT/pi-runner-att/_diag"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-att/_diag/Runner_20260101-010000-utc.log"
+touch -t 202601010100 "$RUNNER_ROOT/pi-runner-att/_diag/Runner_20260101-010000-utc.log" 2>/dev/null || true
+# This attempt's listener APPEARS (so the start is not "never appeared") and then dies without
+# printing anything: a death that is not evidence of anything.
+printf '#!/usr/bin/env bash\nsleep 1.5\nexit 1\n' >"$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
+chmod +x "$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
+out="$(RUNNER_START_SETTLE_S=3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-att)"
+assert_eq "$?" "2" "a fresh death with no evidence from THIS attempt is cannot-act (rc 2), never rc 6"
+assert_contains "$out" "why=listener-exited" "naming the reason instead of asserting an orphan"
+assert_file "$RUNNER_ROOT/pi-runner-att/.runner" "and the install is STILL a registration (rc 6 would have retired it)"
+# CONTROL: the same line, this time written BY THIS ATTEMPT (its own listener prints it, as the real one
+# does — into `listener.log` past the pre-start byte offset), IS evidence. ⛔ The control must produce the
+# line DURING the attempt: a `_diag` file written just before the start is `mt < started` and is excluded
+# by the start-time bound, which is the whole point of that bound (#2892 review round 3, P2 — this control
+# used to write it before the start and passed only because the bound was inert on `skip=0`).
+# ⛔ WHAT MAKES THE ARM ABOVE HOLD is the NEWEST-LOG rule, and this fixture says so rather than claiming
+# the start-time bound is what does it: the attempt's own (empty) `listener.log` is newer than the stale
+# `_diag`, so it vetoes. The start-time bound is DEFENCE IN DEPTH for the sources a byte offset cannot
+# scope (`_diag/Runner_*.log` is a separate file per attempt) — it is kept because it is correct, not
+# because this fixture can show it is load-bearing.
+cat >"$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener" <<'STUB'
+#!/usr/bin/env bash
+sleep 1
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
+exit 0
+STUB
+chmod +x "$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
+out="$(RUNNER_START_SETTLE_S=3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-att)"
+assert_eq "$?" "6" "control: a line written DURING this attempt IS evidence (rc 6)"
+assert_contains "$out" "orphaned name=pi-runner-att" "control: and it names the orphan"
+
+# ── THE QUARANTINE NAMESPACE IS RESERVED, AND A LIVE INSTALL IN IT IS NEVER "rm -rf" ───────
+# `registered_dirs` excludes `*.retired-*` BY NAME (correctly: a retired runner must never re-enter
+# capacity) and `status` reports such a dir as a leftover whose remedy is `rm -rf`. Nothing stopped
+# `add --name` from MINTING a live registration under that suffix, which then left the ceiling
+# silently and was reported as deletable. The suffix is now refused; a dir that carries it anyway
+# (hand-made, or from an older version) is reported as LIVE when a listener is running on it.
+echo "── add: the quarantine SUFFIX is reserved ──"
+fresh_pool suffix; reset_logs
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-x.retired-20260101T000000Z)"
+assert_eq "$?" "1" "a name carrying the quarantine suffix is REFUSED as a usage error"
+assert_absent "$RUNNER_ROOT/pi-runner-x.retired-20260101T000000Z" "and nothing was provisioned"
+# ⛔ THE REFUSAL NAMES THE RULE THE NAME ACTUALLY BROKE (#2899 review round 6, P2). The generic text
+# recited `[A-Za-z0-9._-]` / no leading dot / no `/` — every one of which THIS name satisfies — so the
+# operator was told it broke a rule it obeys and given no way to discover the reserved suffix.
+assert_contains "$out" "refused: carries the RESERVED quarantine suffix '.retired-'" \
+  "the refusal names the suffix it broke, not a character rule the name obeys"
+assert_contains "$out" "must be [A-Za-z0-9._-]" "and still prints the general contract after the reason"
+echo "── status: a RUNNING listener under a retired name is never reported as deletable ──"
+fresh_pool livequar; reset_logs
+register pi-runner-lq
+mv "$RUNNER_ROOT/pi-runner-lq" "$RUNNER_ROOT/pi-runner-lq.retired-20260101T000000Z"
+QZ="$RUNNER_ROOT/pi-runner-lq.retired-20260101T000000Z"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="424242 $QZ/bin/Runner.Listener run" run status --all)"
+assert_contains "$out" "LIVE-QUAR" "the row says LIVE, not QUARANTINE"
+assert_contains "$out" "do NOT rm -rf" "and the remedy is the opposite of deleting a working runner"
+# ⛔ THE PRESERVE ADVICE MUST EXIST FOR THE NAME IT IS PRINTED ABOUT (#2899 review round 6, P3).
+# `reclaim --name <quarantine>` is reachable — the name is refused only for ''/'.'/'..'/'-*'/'*/*' — and
+# the pass used to end with "use: restart --name <quarantine>". `restart` starts a listener on a
+# retired-named install (it refuses none of those names), i.e. the tool's own advice re-created the
+# LIVE-QUAR row above. A retired-named install is never capacity and never startable on purpose, so
+# that basename gets the bytes' owner instead. The listener here is already proven DEAD, which is why
+# pointing at `rm -rf` cannot delete a running registration.
+echo "── reclaim: a NO-EVIDENCE quarantine is not sent to 'restart' ──"
+fresh_pool qpres; reset_logs
+register pi-runner-qp
+mv "$RUNNER_ROOT/pi-runner-qp" "$RUNNER_ROOT/pi-runner-qp.retired-20260101T000000Z"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim --name pi-runner-qp.retired-20260101T000000Z)"
+assert_eq "$?" "0" "a no-evidence quarantine is PRESERVED (rc 0)"
+assert_contains "$out" "preserve name=pi-runner-qp.retired-20260101T000000Z" "naming the install it declined to retire"
+assert_omits "$out" "restart --name pi-runner-qp.retired-20260101T000000Z" \
+  "and it is NOT sent to 'restart', which would re-create a LIVE-QUAR row"
+assert_contains "$out" "rm -rf it as its owner" "it names the remedy that actually clears those bytes"
+
+# ── THE PASS THAT MAKES IT SELF-HEALING: restart → retire → add, then idempotent ────────────
+echo "── reconcile: revives, retires, provisions — and changes nothing on a second pass ──"
+fresh_pool reheal; reset_logs
+register pi-runner-rd
+register pi-runner-ro
+: >"$RUNNER_ROOT/pi-runner-ro/.orphan"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-ro/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "reconcile exits 0 when it could measure and act"
+assert_contains "$out" "restarted name=pi-runner-rd" "the revivable slot is revived"
+assert_contains "$out" "dir=$RUNNER_ROOT/pi-runner-ro evidence=" "the orphan is retired"
+assert_contains "$out" "added name=pi-runner-fixturebox-1" "and the freed capacity is provisioned"
+assert_contains "$out" "reclaimed=1" "the summary counts the retirement"
+assert_contains "$out" "orphaned=0" "and reports the pool after the pass, not before it"
+assert_absent "$RUNNER_ROOT/pi-runner-ro" "the orphan's install is gone"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "a second reconcile exits 0"
+assert_contains "$out" "reconcile: dead=0 restarted=0 added=0" "and is IDEMPOTENT: nothing left to revive or add"
+assert_contains "$out" "reclaimed=0" "and nothing left to retire"
+
+# ── A RETIREMENT WHOSE FILES CANNOT ALL BE REMOVED IS QUARANTINED, NEVER PART-DELETED ───────────
+# MEASURED ON `pi-cell-4` (2026-10-27T06:2xZ), with the first version of this verb: systemd had written
+# `_diag` as root, so `rm -rf` failed AFTER unlinking `.runner` — the pass honestly reported
+# `cannot-act why=retire-failed`, and left 6.9 GB that NO verb could see (every verb identifies a
+# registration by `.runner`). So the retire is a RENAME first: the pool loses the registration in one
+# atomic step, and the bytes that survive are a `*.retired-<stamp>` directory that `status` keeps
+# naming until somebody removes them.
+echo "── reclaim: a partial removal is QUARANTINED and stays visible ──"
+fresh_pool quarantine; reset_logs
+register pi-runner-q
+orphanize pi-runner-q
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-q/listener.log"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "a quarantined retirement (a root shell can remove anything)"
+else
+  mkdir -p "$RUNNER_ROOT/pi-runner-q/_diag/locked"; : >"$RUNNER_ROOT/pi-runner-q/_diag/locked/root-owned.log"
+  chmod 500 "$RUNNER_ROOT/pi-runner-q/_diag/locked"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+  assert_eq "$?" "0" "the pass exits 0: the registration WAS retired, which is what it promised"
+  assert_contains "$out" "quarantined dir=$RUNNER_ROOT/pi-runner-q.retired-" "naming the bytes it could not remove"
+  assert_contains "$out" "reclaim: retired=1 preserved=0 revived=0 live=0 quarantined=1" "and counting the quarantine"
+  assert_absent "$RUNNER_ROOT/pi-runner-q" "the pool no longer has the install at its registered path"
+  assert_eq "$(ls -d "$RUNNER_ROOT"/pi-runner-q.retired-* 2>/dev/null | wc -l)" "1" "the leftovers are named on disk"
+  # THE POINT OF THE RENAME: those bytes are invisible to nothing. `status` names them, and they are NOT
+  # a registration — a `.runner` inside a quarantine dir must never come back as capacity.
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_contains "$out" "QUARANTINE" "status keeps naming a quarantined install"
+  assert_contains "$out" "quarantine=1" "and the summary counts it"
+  assert_contains "$out" "slots=0 ceiling=3" "while it stays OUT of the ceiling (it is not a runner any more)"
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of reclaim)" "0" "a second pass has nothing left to retire"
+  for q in "$RUNNER_ROOT"/pi-runner-q.retired-*; do chmod -R u+rwX "$q" 2>/dev/null || true; done
+fi
+
+
+# ── REVIEW-ROUND REGRESSIONS (#2892): four ways this verb could lie or delete the wrong thing ────
+# Each fixture below was written AFTER a reviewer reproduced the defect; every one of them passes
+# against the pre-review code in a way the suite could not see.
+
+# (1) A re-registered install keeps its OLD `listener.log`. Retiring on that line deletes a HEALTHY
+#     runner — the P0 the `_diag` staleness rule already covered for one of the two sources only.
+echo "── reclaim: a listener.log OLDER than the marker is stale evidence too ──"
+fresh_pool stalelog; reset_logs
+register pi-runner-relogged
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-relogged/listener.log"
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-relogged/listener.log" 2>/dev/null || true
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "nothing is retired on a pre-registration listener.log"
+assert_contains "$out" "preserve name=pi-runner-relogged" "the healthy install is PRESERVED"
+assert_file "$RUNNER_ROOT/pi-runner-relogged/.runner" "and it still exists"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "3" "and status reads it as DEAD (revivable), never ORPHANED"
+assert_eq "$(grep -cF 'ORPHANED' <<<"$out")" "0" "no ORPHANED row for it"
+
+# (2) `tail | grep -q` returns 141 under pipefail once the log passes the pipe buffer, so the evidence
+#     is silently MISSED on exactly the long-lived installs that have one. The signature here is at
+#     byte 0 of a 200 KB log.
+echo "── reclaim: the evidence survives a log far larger than the pipe buffer ──"
+fresh_pool biglog; reset_logs
+register pi-runner-biglog
+orphanize pi-runner-biglog
+printf '{\n  "agentId": 55,\n  "agentName": "pi-runner-biglog"\n}\n' >"$RUNNER_ROOT/pi-runner-biglog/.runner"
+{ printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
+  i=0; while [ "$i" -lt 3000 ]; do printf 'INFO ordinary runner chatter line %s padding padding padding\n' "$i"; i=$((i + 1)); done
+} >"$RUNNER_ROOT/pi-runner-biglog/listener.log"
+# ⛔ THE PREMISE OF THIS ARM IS THE FILE'S SIZE, SO THE SIZE IS ASSERTED (#2892 review round 2, P2).
+# It used to compare the file to ITSELF, which pinned nothing: a shrunken fixture (the 64 KiB pipe
+# buffer is the whole reason the SIGPIPE defect appears only on long-lived installs, #841/#864) would
+# have silently retired this regression while the arm still printed ✅.
+bigbytes="$(wc -c <"$RUNNER_ROOT/pi-runner-biglog/listener.log" | tr -d ' ')"
+case "$bigbytes" in ''|*[!0-9]*) bigbytes=0 ;; esac
+if [ "$bigbytes" -gt 65536 ]; then
+  ok "fixture log is ${bigbytes} bytes — past the 64 KiB pipe buffer the SIGPIPE defect needs"
+else
+  bad "fixture log is ${bigbytes} bytes, which is NOT past the 64 KiB pipe buffer — this arm would prove nothing"
+fi
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires it"
+assert_contains "$out" "retired name=pi-runner-biglog" "a >64 KiB log is still READ (no SIGPIPE under pipefail)"
+assert_absent "$RUNNER_ROOT/pi-runner-biglog" "and the install is gone"
+
+# (3) A SYMLINKED instance: renaming the link and `rm -rf`ing it leaves the real install behind while
+#     the pass reports success. It must refuse and stay out of the way.
+echo "── reclaim: a symlinked instance is REFUSED, not retired through the link ──"
+fresh_pool syminst; reset_logs
+mkdir -p "$T/symreal/pi-runner-symreal"
+cp -a "$TEMPLATE/." "$T/symreal/pi-runner-symreal/"
+printf '{\n  "agentId": 99,\n  "agentName": "pi-runner-symname"\n}\n' >"$T/symreal/pi-runner-symreal/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$T/symreal/pi-runner-symreal/listener.log"
+ln -s "$T/symreal/pi-runner-symreal" "$RUNNER_ROOT/pi-runner-symlink"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "2" "the pass refuses (rc 2), because a retire through a link is not what the operator meant"
+assert_contains "$out" "why=instance-is-symlink" "naming the reason"
+assert_file "$T/symreal/pi-runner-symreal/.runner" "the REAL install survives, untouched"
+# ⛔ THE OLD ASSERTION COULD NEVER FAIL (#2892 review round 4, P2): `assert_absent` tests ONE literal
+# path, and `reclaim` always appends a stamp (`<dir>.retired-<UTC stamp>`), so a literal
+# `…pi-runner-symreal.retired-` — no stamp — was absent whether or not a quarantine had been made of
+# the real install. Enumerate the glob instead, so the arm proves what its label claims.
+qsym=0
+for qsymd in "$T/symreal"/pi-runner-symreal.retired-*; do [ -e "$qsymd" ] && qsym=$((qsym + 1)); done
+assert_eq "$qsym" "0" "no quarantine was made of it"
+rm -f "$RUNNER_ROOT/pi-runner-symlink"
+
+# (4) A quarantine directory keeps its `.runner`. Unreadable-but-searchable it re-entered `slots` and
+#     made every pass `cannot-measure` — the opposite of what the retire message promises.
+echo "── a quarantined install never re-enters the pool, readable or not ──"
+fresh_pool ghostq; reset_logs
+register pi-runner-live-q
+mkdir -p "$RUNNER_ROOT/ghost.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/ghost.retired-20260101T000000Z/"
+: >"$RUNNER_ROOT/ghost.retired-20260101T000000Z/.runner"
+mkdir -p "$RUNNER_ROOT/.dot.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/.dot.retired-20260101T000000Z/"
+: >"$RUNNER_ROOT/.dot.retired-20260101T000000Z/.runner"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unreadable quarantine directory (a root shell bypasses directory permissions)"
+else
+  chmod 311 "$RUNNER_ROOT/ghost.retired-20260101T000000Z"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "3" "the pool is still measurable over unreadable quarantines (rc 3 = the one DEAD runner)"
+  assert_contains "$out" "slots=1 ceiling=3" "neither quarantine is capacity, readable or not"
+  assert_eq "$(grep -cF 'instance-unreadable' <<<"$out")" "0" "and neither is reported as an unreadable instance"
+  assert_contains "$out" "quarantine=2" "BOTH are named — including the dot-named one"
+  chmod 700 "$RUNNER_ROOT/ghost.retired-20260101T000000Z"
+fi
+
+# (5) The reconcile preview counted every orphan TWICE in `dead=`, the one field a scheduler compares
+#     against `slots` to decide whether to act.
+echo "── reconcile --dry-run: an orphan is counted as dead ONCE ──"
+fresh_pool dryorphan; reset_logs
+register pi-runner-dryorph
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-dryorph/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile --dry-run)"
+assert_eq "$?" "0" "the preview exits 0"
+assert_contains "$out" "reconcile: dead=1 restarted=0" "the orphan counts as ONE dead slot in the preview"
+assert_contains "$out" "reclaimed=1" "and the preview announces the retirement"
+
+# (6) A refusal must never be printed as a message containing a COMMAND the shell executes: the
+#     preserve message carried `config.sh remove` in backticks inside a double-quoted string.
+echo "── the retire messages contain no executable substitutions ──"
+fresh_pool nocmd; reset_logs
+register pi-runner-nocmd
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim 2>&1)"
+assert_eq "$(grep -cF 'command not found' <<<"$out")" "0" "no backtick in a message ran a command"
+assert_eq "$(grep -cF 'config.sh: command not found' <<<"$out")" "0" "specifically not config.sh"
+
+
+# (7) Guard 3 (the LIVE holder of the name) must not degrade to "no sibling" when the pool listing
+#     fails on the SECOND read: an empty sibling set makes the pass advise re-registering a name that
+#     a working runner may hold, which DELETES that runner's registration.
+echo "── reclaim: an unreadable sibling listing is a refusal, not 'no sibling' ──"
+fresh_pool siblfail; reset_logs
+register pi-runner-sibl
+printf '{\n  "agentId": 56,\n  "agentName": "pi-runner-sibl"\n}\n' >"$RUNNER_ROOT/pi-runner-sibl/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-sibl/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_LS_FAIL_AFTER=1 run reclaim)"
+assert_eq "$?" "2" "the pass cannot-act (rc 2) instead of guessing"
+assert_contains "$out" "why=runner-root-unreadable" "naming the read it could not take"
+assert_file "$RUNNER_ROOT/pi-runner-sibl/.runner" "and NOTHING was retired"
+assert_eq "$(grep -cF 'add --name' <<<"$out")" "0" "it never advises re-registering the name"
+
+# ── MUTATION: the orphan SIGNATURE is load-bearing ──────────────────────────────────────────
+# If a copy whose signature no longer matches still retired the orphan, every arm above would be
+# passing on something other than the evidence.
+echo "── mutation: the orphan evidence is what authorises the delete ──"
+fresh_pool mutretire; reset_logs
+register pi-runner-mut-orph
+orphanize pi-runner-mut-orph
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-mut-orph/listener.log"
+MUT_R="$T/mutant-retire-ci_runner_pool.sh"
+python3 - "$POOL" "$MUT_R" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+needle = 'ORPHAN_SIG="registration has been deleted from the server"'
+assert text.count(needle) == 1, "the orphan signature moved: update the mutation target"
+open(dst, "w", encoding="utf-8").write(
+    text.replace(needle, 'ORPHAN_SIG="a line this script will never match"'))
+PY
+assert_file "$MUT_R" "the mutation copy was produced"
+mut_out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash "$MUT_R" reclaim 2>&1)"
+assert_eq "$?" "0" "the MUTANT cannot see the orphan, so it retires nothing"
+assert_file "$RUNNER_ROOT/pi-runner-mut-orph/.runner" "the mutant left the install in place (so the arms above pin the evidence)"
+assert_contains "$mut_out" "preserve name=pi-runner-mut-orph" "the mutant calls it unprovable"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of reclaim)" "0" "the SHIPPED script retires it"
+assert_absent "$RUNNER_ROOT/pi-runner-mut-orph" "and the fixture the mutant preserved is gone"
+
+# ══ (#2892) A MIXED RUNNER ROOT: a non-member that is PROVABLY not an install ─════════════════
+# Measured on `pi-cell-4`: every install lives under `/opt`, and `/opt/containerd` is
+# `drwx--x--x root` — unreadable to the runner user, searchable. "Cannot inspect" was one condition
+# and turned the only usable root on the box into a permanent `cannot-measure` (rc 2), so the repair
+# pass could never act on the box that needed it. Searchability is what separates the two readings.
+echo "── a searchable-but-unreadable NON-member of a mixed root ──"
+fresh_pool mixed; reset_logs
+register pi-runner-real-m
+mkdir -p "$RUNNER_ROOT/containerd" "$RUNNER_ROOT/containerd/data"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "a searchable-but-unreadable non-member (a root shell bypasses directory permissions)"
+else
+  chmod 311 "$RUNNER_ROOT/containerd"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "3" "the pool is MEASURABLE over a mixed root (rc 3 = its one DEAD runner, not 2)"
+  # ⛔ THE OLD CONTROL COULD NEVER FAIL (#2899 review round 5, P2): it asserted the ABSENCE of
+  # `containerd/x`, a path the fixture never creates, so it passed whether or not the chmod denied
+  # anything. If the mode ever stopped denying the read (a user namespace, a different owner, a
+  # `chmod` the kernel normalises away), `registered_dirs` would take the READABLE path, skip
+  # `containerd` for carrying no `.runner`, and every other assertion in this arm would be IDENTICAL
+  # in both worlds — so the arm would keep printing ✅ while R4's `has_install_marker` path stopped
+  # being exercised at all. Assert the PREDICATE the arm turns on: not readable, and still searchable.
+  if [ ! -r "$RUNNER_ROOT/containerd" ] && [ -x "$RUNNER_ROOT/containerd" ] && ! ls -A "$RUNNER_ROOT/containerd" >/dev/null 2>&1; then
+    ok "(control: the dir really is unlistable — not readable, still searchable)"
+  else
+    bad "(control: the fixture did not produce an unreadable-but-searchable dir, so this arm proves nothing)"
+  fi
+  assert_contains "$out" "slots=1 ceiling=3" "and the non-member is not counted as capacity"
+  assert_eq "$(grep -cF 'instance-unreadable' <<<"$out")" "0" "nor reported as an unreadable instance"
+  # THE CONTROL: the SAME mode OVER A MEMBER is still counted and still cannot-measure — the guard is
+  # searchability, not "skip whatever I cannot read".
+  register pi-runner-member-m
+  chmod 311 "$RUNNER_ROOT/pi-runner-member-m"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "2" "a searchable-but-unreadable MEMBER is still cannot-measure (rc 2)"
+  assert_contains "$out" "cannot-measure why=instance-unreadable" "naming it"
+  chmod 700 "$RUNNER_ROOT/pi-runner-member-m"
+  chmod 700 "$RUNNER_ROOT/containerd"
+fi
+
+# ── A PROBE THAT COULD NOT RUN IS NOT A DEAD LISTENER (#2892 review round 4, P1) ────────────────
+# `probe_listener` has three outcomes (0 live · 1 dead · 2 cannot-measure). The quarantine row folded
+# all non-zero into its else, so an UNREADABLE PROCESS TABLE printed "retired install — rm -rf as its
+# owner" — the one instruction that deletes a working registration — over a listener nobody had
+# measured. The fixture: one measurable registration (so every EARLIER read is real) plus a quarantine
+# with no `.runner` (exactly what rename-then-delete leaves behind), and a ps shim that fails only on
+# the LAST read, which is the quarantine row's.
+echo "── status: a quarantine whose liveness could NOT be read is never called deletable ──"
+fresh_pool qunprobed; reset_logs
+register pi-runner-qup
+mkdir -p "$RUNNER_ROOT/old.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/old.retired-20260101T000000Z/"
+rm -f "$RUNNER_ROOT/old.retired-20260101T000000Z/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+rcount="$(cat "$T/.ps-count" 2>/dev/null || printf 0)"
+case "$rcount" in ''|*[!0-9]*) rcount=0 ;; esac
+if [ "$rcount" -ge 2 ]; then
+  ok "the counting run read the process table ${rcount} time(s), so the LAST read can be isolated"
+else
+  bad "the counting run made only ${rcount} process-table read(s) — the seam below cannot isolate the quarantine row"
+fi
+rm -f "$T/.ps-count"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_FAIL_AFTER=$((rcount - 1)) run status)"
+assert_eq "$?" "2" "an unmeasurable quarantine row makes the report cannot-measure (rc 2), not rc 3"
+assert_contains "$out" "UNPROBED" "the row says the liveness was not measured"
+assert_contains "$out" "do NOT rm -rf" "and its remedy is the opposite of deleting a possibly-live runner"
+case "$out" in
+  *"rm -rf as its owner"*) bad "it printed the DELETE advice over a listener it could not probe" ;;
+  *) ok "the delete advice is NOT printed over an unmeasured quarantine" ;;
+esac
+rm -f "$T/.ps-count"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_contains "$out" "QUARANTINE" "(control: with the process table readable the same dir IS deletable, rc 3 = its DEAD registration)"
+assert_contains "$out" "rm -rf as its owner" "and only then does the delete advice appear"
+
+# ── A QUARANTINE LEFTOVER WITH NO `.runner` IS NOT AN UNREADABLE POOL ENTRY (#2892 round 4, P2) ──
+# The holder scan now includes `*.retired-*`, and a quarantine normally has NO `.runner` — rename-then-
+# delete unlinks it first, which is the measured `pi-cell-4` failure. Reading that as "a pool entry
+# could not be read" marked the NAME unverified on every later pass, so the documented recovery
+# (`reclaim` then `add --name …`) never printed again on a box with one leftover.
+echo "── reclaim: a quarantine leftover with no .runner does not make the NAME unverified ──"
+fresh_pool qleft; reset_logs
+register pi-runner-qleft
+printf '{\n  "agentId": 73,\n  "agentName": "pi-runner-qleft"\n}\n' >"$RUNNER_ROOT/pi-runner-qleft/.runner"
+orphanize pi-runner-qleft
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-qleft/listener.log"
+mkdir -p "$RUNNER_ROOT/old.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/old.retired-20260101T000000Z/"
+rm -f "$RUNNER_ROOT/old.retired-20260101T000000Z/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires the orphaned install"
+assert_contains "$out" "retired name=pi-runner-qleft" "naming what it retired"
+assert_contains "$out" "the name is free again" "and the documented recovery IS printed (nothing in the pool was unreadable)"
+case "$out" in
+  *UNVERIFIED*) bad "a quarantine with no .runner was read as an unreadable pool entry" ;;
+  *) ok "the name was not declared UNVERIFIED by a non-registration" ;;
+esac
+# THE CONTROL: a `.runner` that EXISTS but whose agentName cannot be parsed still makes it UNVERIFIED.
+fresh_pool qleft2; reset_logs
+register pi-runner-qleft2
+printf '{\n  "agentId": 74,\n  "agentName": "pi-runner-qleft2"\n}\n' >"$RUNNER_ROOT/pi-runner-qleft2/.runner"
+orphanize pi-runner-qleft2
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-qleft2/listener.log"
+mkdir -p "$RUNNER_ROOT/nameless"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/nameless/"
+printf '{}\n' >"$RUNNER_ROOT/nameless/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass still retires the orphaned install"
+assert_contains "$out" "the name is UNVERIFIED" "a '.runner' we could not parse still suppresses the re-register advice"
+
+# ── THE REFUSAL NAMES A REMEDY THAT EXISTS (#2892 review round 4, P2) ──────────────────────────
+# `reclaim --name` on a dir that is not a registration used to say "'add --name <name>' is the verb
+# that provisions it" — but `add` refuses an existing path with rc 4 (`name-unavailable … already
+# exists`), so the advice bounced the operator between two verbs that both refuse.
+echo "── reclaim: a dir that is not a registration names a remedy that EXISTS ──"
+fresh_pool noregr; reset_logs
+mkdir -p "$RUNNER_ROOT/pi-runner-noregr"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/pi-runner-noregr/"
+rm -f "$RUNNER_ROOT/pi-runner-noregr/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim --name pi-runner-noregr)"
+assert_eq "$?" "3" "a path that is not a registration is REFUSED (rc 3)"
+assert_contains "$out" "no .runner registration to retire" "naming the state"
+assert_contains "$out" "remove $RUNNER_ROOT/pi-runner-noregr" "and naming the action that clears it"
+addrc="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name pi-runner-noregr)"
+assert_eq "$addrc" "4" "(control: the ADVICE it used to give returns rc 4 on this very path)"
+case "$out" in
+  *"add --name pi-runner-noregr"*) bad "the refusal still advises 'add --name', which refuses the same path with rc 4" ;;
+  *) ok "the refusal does not send the operator to a verb that refuses the same path" ;;
+esac
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then
