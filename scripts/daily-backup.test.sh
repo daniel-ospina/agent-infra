@@ -89,10 +89,24 @@ case "$sub" in
       *BGSAVE*)             echo "Background saving started" ;;
       *LASTSAVE*)           echo 1700000000 ;;
       *"INFO persistence"*) echo "rdb_bgsave_in_progress:0" ;;
-      *GRAPH.LIST*)         printf 'tortoise\ntest_proj125_alpha\n' ;;
+      *GRAPH.LIST*)
+        # graphlistfail: an UNREADABLE inventory. Before #2121 the script rewrote this into
+        # `GRAPHS=""`, the per-graph loop iterated ZERO times and the run wrote a manifest
+        # claiming 0 graphs / 0 points — a FALSE PASS. It must refuse instead.
+        if [ "${SHIM_MODE:-one}" = "graphlistfail" ]; then
+          echo "Error: could not connect to Redis: Connection refused" >&2
+          exit 1
+        fi
+        printf 'tortoise\ntest_proj125_alpha\n' ;;
       *GRAPH.QUERY*)
         graph=""; prev=""
         for a in "$@"; do [ "$prev" = "GRAPH.QUERY" ] && graph="$a"; prev="$a"; done
+        # countfail: the per-graph read FAILS (a busy/evicted database). It must not be rewritten
+        # into "this graph holds 0 points" — see the #2121 case below.
+        if [ "${SHIM_MODE:-one}" = "countfail" ]; then
+          echo "Error: server busy" >&2
+          exit 1
+        fi
         if [ "${SHIM_MODE:-one}" = "lowcount" ]; then
           echo 1
         elif [ "$graph" = "tortoise" ]; then
@@ -222,6 +236,28 @@ run_backup lowcount
 assert_eq "$RC" "2" "suspiciously low point count exits 2"
 assert_eq "$(local_backups)" "1" "the exit-2 artifact is kept, not deleted by the trap"
 assert_contains "$OUT" "suspiciously low" "diagnostic warns about the low count"
+
+echo "── an UNREADABLE graph inventory is UNKNOWN, never an empty PASS (#2121) ──"
+new_case graphlistfail
+run_backup graphlistfail
+assert_eq "$RC" "1" "a failed GRAPH.LIST read exits 1 (it used to write a 0-graph manifest and exit 0)"
+assert_contains "$OUT" "GRAPH.LIST read FAILED" "the diagnostic names the read that failed"
+assert_contains "$OUT" "UNKNOWN, not empty" "the diagnostic states the inventory is unknown"
+assert_not_contains "$OUT" "Backup complete" "no completion verdict is printed over an unverified inventory"
+assert_eq "$(local_backups)" "0" "no manifest-less backup directory is left behind"
+assert_eq "$(offbox_backups)" "0" "no off-box directory is left behind"
+
+# The per-graph count is the SAME read-laundering one line down: `| grep … | head -1 || echo 0`
+# binds the `||` to `head`, so a failed GRAPH.QUERY became "0 points" in the manifest — bytes a
+# restore would compare against. It is now UNKNOWN-or-refuse, like the inventory read above.
+echo "── an UNREADABLE per-graph count is UNKNOWN, never '0 points' (#2121) ──────"
+new_case countfail
+run_backup countfail
+assert_eq "$RC" "1" "a failed per-graph GRAPH.QUERY exits 1 (it used to record 0 points)"
+assert_contains "$OUT" "point count read FAILED for graph 'tortoise'" "the diagnostic names the graph"
+assert_contains "$OUT" "UNKNOWN, not zero" "the diagnostic states the count is unknown"
+assert_not_contains "$OUT" "Backup complete" "no completion verdict over a count nothing observed"
+assert_eq "$(local_backups)" "0" "no manifest asserting an unread count is kept"
 
 echo "── --keep still validates ───────────────────────────────────────────────"
 new_case badkeep

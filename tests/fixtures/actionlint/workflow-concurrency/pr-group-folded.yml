@@ -1,0 +1,13 @@
+# A group written as a folded scalar is still a group. Reading only the key's own line left it
+# EMPTY, and the refusal then quoted `('')` about text that is in the file (#2660 round 4).
+name: PR group folded
+on: pull_request
+concurrency:
+  group: >-
+    pr-group-folded-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
