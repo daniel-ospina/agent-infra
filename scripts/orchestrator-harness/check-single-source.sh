@@ -345,6 +345,157 @@ if [ "$REQUIRE_TARGET" -eq 1 ] && [ "$targets" -eq 0 ]; then
   unknown "--require-target was given but there was nothing to compare (no existing --fork, no deployed copy) — a gate that checks nothing must not pass"
 fi
 
+# ── 4. REPO IS SET ONCE PER BOX, NEVER DEFAULTED PER SCRIPT ──────────────────────
+# ⛔ THE SAME DEFECT AS THE THREE FORKED DIRECTORIES, ONE VARIABLE OVER. The harness solved "which repo
+# do we grade?" for `OR` exactly once (`repo-slug.sh`'s `derive_or`, called once by `orch-loop.sh`), and
+# solved it for `REPO` zero times — so each script carried its own private default and three of them
+# are WRONG on every box but the one they were written on:
+#
+#     report.sh            REPO="${REPO:-$HOME/eldato/tortoise}"   ONE DEVELOPER'S HOME DIRECTORY
+#     deploy-crossbox.sh   REPO="${REPO:-/tmp/cell-ai}"           a CELL path, wrong on every laptop
+#     pi-reap-worktrees.sh REPO="${REPO:-$PWD}"                   WORST: under launchd `$PWD` is `/`,
+#                          a real directory that is not a repo, so the pass died as "not a git
+#                          repository: /" several probes after the cause
+#
+# A default is only safe if it is TRUE ON EVERY MACHINE; none of those three is, and `$PWD` is not even
+# stable across two runs of the same script. `REPO` is set ONCE per box (the launchd plist on a Mac,
+# `keys.env` on a cell) and read through ONE resolver, `repo-slug.sh`'s `resolve_repo`, which refuses by
+# name instead of guessing. So this arm forbids a PRIVATE PATH DEFAULT in any shipped script here.
+# (Why the population is the harness dir PLUS the repo's `scripts/`: see the loop below.)
+#
+# WHAT IT DOES NOT FLAG, on purpose — each is a shape that is not this defect:
+#   REPO="${REPO:-}"        an explicit "no default" (the shape to converge on)
+#   REPO="$1" / "$2"        assigned from a CALLER (fix-one.sh, merge-one.sh, chain-merge.sh, adopt-fix)
+#   REPO=""                initialised empty, then filled by the "--repo" arm or by resolve_repo
+#   REPO="$(resolve_repo)" the ONE resolver
+#   a COMMENT mentioning a default     prose is how the defect gets recorded; punishing it deletes the
+#                                      record (the same rule the fork arm's prose exemption states)
+#   a SLUG default (`…:-owner/name`)   a different defect (REPO is the CHECKOUT PATH, never a slug);
+#                                      the shape rule for a slug is repo_slug_valid's, not this arm's
+#   a TEST fixture (`*.test.sh`)       a developer instrument, not a shipped surface — the deployed arm
+#                                      already excludes them for the same reason, and a fixture whose
+#                                      repo is "/repo" is not operator advice
+# Non-vacuity: the arm counts the files it opened and answers UNKNOWN when it opened none, because a
+# `REPO` scan that scanned nothing is the inert-gate failure this whole script exists to catch.
+# ⛔ THE PENALTY IS A DIVERGENCE (rc 1), not UNKNOWN (rc 2): the harness still has one source — it has
+# a script that will point a box at a path it does not have, which is a finding about the artefact.
+# `repo_path_default_hits <file>` — prints `file:line: <that line>` per REPO path default. Portability:
+# plain POSIX awk, no gawk extensions (CI runs GNU awk, macOS runs BSD awk).
+repo_path_default_hits() {
+  awk '
+    BEGIN { q39 = sprintf("%c", 39) }                     # a single quote, without one in this program
+    function pathish(v) {
+      if (v ~ /\$HOME/ || v ~ /\$PWD/) return 1          # $HOME/…, ${HOME}/…, $PWD
+      if (v ~ /^\// || v ~ /^~/ || v ~ /^\.\//) return 1  # an absolute, home-relative or ./ path
+      return 0
+    }
+    {
+      ln = $0
+      sub(/^[ \t]+/, "", ln)
+      if (ln ~ /^#/) next                                 # a comment is not a default
+      if (ln !~ /^(export[ \t]+)?REPO=/) next
+      val = ln
+      sub(/^(export[ \t]+)?REPO=/, "", val)                # the value, without the assignment
+      sub(/[ \t]+$/, "", val)
+      # One layer of MATCHING quotes off, so `${REPO:-…}` is seen as the expansion it is (and not as a
+      # string that happens to start with a quote). A value quoted only on one side is left alone.
+      q = substr(val, 1, 1)
+      if ((q == "\"" || q == q39) && length(val) > 1 && substr(val, length(val), 1) == q)
+        val = substr(val, 2, length(val) - 2)
+      if (val ~ /^\$\{REPO:?-.*\}$/) {                  # ${REPO:-<default>} / ${REPO-<default>}
+        inner = val
+        sub(/^\$\{REPO:?-/, "", inner)
+        sub(/\}$/, "", inner)
+        if (inner == "" || !pathish(inner)) next          # no default, or a slug: not this arm
+        print FILENAME ":" FNR ": " $0
+        next
+      }
+      if (pathish(val)) print FILENAME ":" FNR ": " $0
+    }
+  ' "$@"
+}
+# The scripts that STILL carry a path default, kept NAMED so the debt is visible instead of the arm
+# being narrowed silently. Every entry is pre-existing and is somebody's separate fix; the arm PRINTS
+# them on every run (below) so an operator reads "2 scripts still default REPO", never "REPO is clean".
+# ⛔ Deleting an entry is what FIXING the file looks like; adding one is how this arm gets defeated, and
+# an entry whose file no longer carries a default is reported as stale.
+REPO_DEFAULT_KNOWN="cloud-cell-doctor.sh lane-container-reap.sh stale-main-triage.sh stale-worktrees.sh worktree-hygiene-sweep.sh"
+# ⛔ THE POPULATION IS TWO DIRECTORIES, NOT ONE — and the second is not optional. Two of the three
+# offenders live in the repo's `scripts/` (`pi-reap-worktrees.sh`, `deploy-crossbox.sh`), so a scan of
+# this directory alone left this arm blind to the very file it was written for: measured, re-introducing
+# `REPO="${REPO:-$PWD}"` into the reaper reddened NOTHING. The `scripts/` half is scanned only where
+# `$HERE/../orchestrator-harness` IS this directory (a checkout); in the flat `$O` that path does not
+# exist, `$HERE/..` is `$HOME`, and reading an operator's home for harness scripts would be a different
+# and wrong claim — the arm says which half it scanned instead of implying both.
+repo_arm_parent=""
+_repo_parent="$(cd "$HERE/.." 2>/dev/null && pwd -P)" || _repo_parent=""
+if [ -n "$_repo_parent" ] && [ -d "$_repo_parent/orchestrator-harness" ] \
+   && [ "$(cd "$_repo_parent/orchestrator-harness" 2>/dev/null && pwd -P)" = "$(cd "$HERE" && pwd -P)" ]; then
+  repo_arm_parent="$_repo_parent"
+fi
+repo_scanned_here=0
+repo_scanned_parent=0
+repo_known_hits=""
+# ⛔ THE SECOND WORD IS QUOTED, AND THAT IS LOAD-BEARING (verification finding, round 2).
+# `for _dir in "$HERE" $repo_arm_parent` WORD-SPLITS the parent path, so a checkout under a directory
+# with a space in its name (`/Volumes/My Passport/agent-infra` — the shape `bin/harness`'s own comments
+# call ordinary) silently scanned only the harness half, exited 0 over a planted
+# `REPO="${REPO:-$PWD}"` in `scripts/pi-reap-worktrees.sh`, and printed the opposite of the truth
+# ("nothing to scan there"). Quoted, with the empty case skipped explicitly, which is what the unquoted
+# form was reaching for.
+for _dir in "$HERE" "$repo_arm_parent"; do
+  [ -n "$_dir" ] || continue
+for f in "$_dir"/*.sh; do
+  [ -f "$f" ] || continue
+  case "${f##*/}" in *.test.sh) continue ;; esac        # developer instruments, not shipped surfaces
+  if [ "$_dir" = "$HERE" ]; then repo_scanned_here=$((repo_scanned_here + 1)); else repo_scanned_parent=$((repo_scanned_parent + 1)); fi
+  _base="${f##*/}"
+  case " $REPO_DEFAULT_KNOWN " in
+    *" $_base "*)
+      _hits="$(repo_path_default_hits "$f")"
+      if [ -n "$_hits" ]; then
+        _first_line="$(printf '%s\n' "$_hits" | head -1 | cut -d: -f2)"
+        repo_known_hits="$repo_known_hits $_base:$_first_line"
+      else
+        note "note: $_base no longer carries a REPO path default — delete its entry from REPO_DEFAULT_KNOWN in $0"
+      fi
+      continue ;;
+  esac
+  # ⛔ READ WITH A HEREDOC, NOT A PIPE: a `… | while read` loop runs in a SUBSHELL, so `diverge` would
+  # increment a copy of `problems` and the arm could never make the check red — the inert-gate failure
+  # inside the arm that exists to catch it.
+  while IFS= read -r _hit; do
+    [ -n "$_hit" ] || continue
+    # ⛔ NO BACKTICKS IN THIS MESSAGE. It is a double-quoted string, so `…` would be COMMAND
+    # SUBSTITUTION: measured on a planted hit, the line rendered "(and  is  under launchd)" — the
+    # REASON deleted — and executed the cwd and `/` as commands. A diagnostic that corrupts itself
+    # exactly on the red it exists to explain, and looks fine on every green run.
+    diverge "REPO has a PRIVATE path default: $_hit — REPO is set ONCE per box (the launchd plist on a Mac, keys.env on a cell) and read through repo-slug.sh's resolve_repo, which REFUSES by name. A per-script default points every other box at a path it does not have, and \$PWD is / under launchd, which is a real directory that is not a repo."
+  done <<EOF
+$(repo_path_default_hits "$f")
+EOF
+done
+done
+[ "$repo_scanned_here" -gt 0 ] || unknown "no shipped *.sh found in $HERE — the REPO-default arm compared NOTHING (not a pass)"
+# ⛔ PER-DIRECTORY COUNTS, but a NOTE — not UNKNOWN — when the second directory holds no shipped script.
+# The counts exist because one combined total hides a whole half dropping out (deploy-harness.test.sh's
+# floor lesson). The absence itself is legitimate: a fixture (selftest.sh's `bin/harness doctor` tree is
+# exactly this) may copy `scripts/orchestrator-harness/` into an otherwise empty `scripts/`, and failing
+# that closed turned three unrelated doctor arms red for a layout that scans cleanly. The narrowing this
+# guards against is pinned where it belongs — the selftest arm that PLANTS a default in `scripts/*.sh`
+# and requires a red — because a gate that refuses an honest tree is how a gate gets switched off.
+if [ -n "$repo_arm_parent" ] && [ "$repo_scanned_parent" -eq 0 ]; then
+  note "note: $(basename "$repo_arm_parent")/ beside the harness holds no other shipped *.sh — nothing to scan there (the harness-dir half was scanned)"
+fi
+# Printed in EVERY mode, including --quiet, for the same reason the fork arm's scope line is: the debt
+# is part of the answer, and a `--quiet` run that omits it reads as "no defaults anywhere".
+[ -z "$repo_known_hits" ] || echo "note: pre-existing REPO path defaults are NAMED, not silently allowed:$repo_known_hits — each is a separate fix; delete its REPO_DEFAULT_KNOWN entry when it lands"
+if [ -n "$repo_arm_parent" ]; then
+  note "ok: the REPO path-default arm scanned $repo_scanned_here shipped script(s) in $HERE and $repo_scanned_parent in ${repo_arm_parent##*/}/ (see the fork arm above for what it does NOT cover)"
+else
+  note "ok: the REPO path-default arm scanned $repo_scanned_here shipped script(s) in $HERE ONLY — $HERE/.. is not this harness's scripts/ dir, so the scripts/*.sh half was NOT scanned here"
+fi
+
 if [ "$problems" -gt 0 ]; then
   bad "FAIL: $problems divergence(s) — the harness has more than one source."
   bad "  canonical: $HERE"

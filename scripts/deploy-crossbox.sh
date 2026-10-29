@@ -20,13 +20,29 @@ CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 AI="${AI:-/tmp/cell-ai}"
 O="${O:-$CELL_HOME/orchestrator}"
 H="$AI/scripts/orchestrator-harness"
-REPO="${REPO:-/tmp/cell-ai}"
+# ⛔ `REPO` HAS NO DEFAULT HERE, AND THAT IS THE FIX. This line used to read
+# `REPO="${REPO:-/tmp/cell-ai}"` — a CELL path. This script is pushed to and run ON a cell, but it is
+# also run on a LAPTOP against a cell-shaped AI, and on any such box the default names a directory that
+# is not there; the controller then starts with `REPO=/tmp/cell-ai` (line 106 passes it through to the
+# tmux command below), and the failure arrives one generation later as a dispatch path that resolves
+# nothing. `REPO` is the operator's, set ONCE per box, and `repo-slug.sh`'s `resolve_repo` is the ONE
+# place that reads it — it refuses by name rather than guessing. Resolved below, once `$H` and `die`
+# exist.
 OR="${OR:-daniel-ospina/agent-infra}"
 SCOPE="${SCOPE:-broad}"
 MAX_LANES="${MAX_LANES:-3}"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { log_line "FATAL: $*" >&2; exit 1; }
+
+# ⛔ SOURCED FROM `$H`, THE CELL'S OWN CHECKOUT: that copy is on main (keeping it there is this
+# deploy's job), so the resolver that runs is the shipped one. A `$H` predating `resolve_repo` is
+# REFUSED BY NAME rather than silently falling back to a path default — that fallback is the defect.
+[ -f "$H/repo-slug.sh" ] || die "repo-slug.sh missing from $H — cannot resolve REPO, and this script will not guess one"
+# shellcheck source=scripts/orchestrator-harness/repo-slug.sh
+. "$H/repo-slug.sh" || die "cannot source $H/repo-slug.sh — cannot resolve REPO"
+command -v resolve_repo >/dev/null 2>&1 || die "$H/repo-slug.sh is stale (no resolve_repo) — re-seed the cell's harness first: bash $H/deploy-harness.sh --src <agent-infra checkout> --o $O"
+REPO="$(resolve_repo)" || exit $?
 
 export HOME="$CELL_HOME"
 cd "$AI" || die "no $AI"
