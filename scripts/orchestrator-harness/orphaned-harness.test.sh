@@ -110,6 +110,25 @@ else
   ok "OH2 a live harness lane (live pi descendant) is NOT named"
 fi
 
+# ── OH8: THE FLOOR IS A TRUE FLOOR — a just-spawned session is NEVER named ─────────────────
+# `NEW` (5 s old) is the shape of a worker that has been spawned and is still launching its agent: it
+# has no `pi` descendant YET, so a report that judged it dead would name EVERY lane for its first
+# MIN_SESSION_AGE_S (600 s) — and would do it exactly when an operator is hunting the real orphans.
+# ⛔ WHY THIS ARM EXISTS: `NEW` was computed and documented from the day this suite landed, but no
+# case ever drove it, so only the PAST-the-floor direction was asserted and a floor lowered to 0 —
+# which reports every freshly-spawned lane — stayed green (agent-infra#2788).
+write_scen \
+  "merge-10092 $NEW\n" \
+  "merge-10092 300\n" \
+  "300 bash 0\n" \
+  "" ""
+OH8="$(run_report)"
+if grep -q 'name=merge-10092' <<< "$OH8"; then
+  bad "OH8 a just-spawned dead-looking session (younger than MIN_SESSION_AGE_S) is NOT named"
+else
+  ok "OH8 a just-spawned dead-looking session (younger than MIN_SESSION_AGE_S) is NOT named"
+fi
+
 # ── OH3/OH4/OH5/OH6: unit signals ───────────────────────────────────────────────────────────
 mkdir -p "$T/wt-2433-fu" "$T/usr/local/bin"
 touch "$T/wt-2433-fu/run.sh" "$T/usr/local/bin/ok.sh"
@@ -183,6 +202,13 @@ PY
       '    if [ ! -e "$path" ]; then' \
       '    if false; then' \
       "orphan:kind=unit name=eldato-dead.service"
+  # M3: the FLOOR's VALUE (not just the clause) — raise it past every fixture and the old dead lane
+  # must stop being named. M1 proves the clause is load-bearing; M3 proves the 600 is what it rests on,
+  # which is the half that a floor silently lowered to 0 would keep green (#2788).
+  mut "M3-age-floor" \
+      '"$age" -ge "${MIN_SESSION_AGE_S}"' \
+      '"$age" -ge 1000000000' \
+      "orphan:kind=tmux name=merge-10090"
 
   rm -rf "$mut_dir"
 }

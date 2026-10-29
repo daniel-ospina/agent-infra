@@ -1381,7 +1381,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     owners: ["scripts/orchestrator-harness/orphaned-harness.sh"],
     value: "MIN_SESSION_AGE_S:-600",
     axis: "reap",
-    guardedBy: "scripts/orchestrator-harness/orphaned-harness.test.sh — the 600 s floor as the fixture's age arithmetic and the age comparison it drives (a session past it is reapable, one below it is not)",
+    guardedBy:
+      "scripts/orchestrator-harness/orphaned-harness.test.sh — OH1/OH2 (a dead harness lane PAST the floor is named with its PR; a live one is not), OH8 (a just-spawned session with no `pi` descendant YET is NOT named — the too-young direction), and the MUTANTS M1 (deleting the `dead && age >= floor` clause turns OH1 RED) and M3 (raising the floor past every fixture turns OH1 RED, so the VALUE is load-bearing rather than merely present). OH8 and M3 are the half this row could not previously claim: `NEW` (a 5 s old session) was computed and documented 'must NOT be named' from the day the suite landed and no case drove it, so only the past-the-floor direction was asserted and a floor lowered to 0 stayed GREEN.",
     note: "the orphan reaper's AGE FLOOR: a dead harness session younger than ten minutes is reported but never reaped, so a session that is merely between incarnations cannot be collected. Caught by the reverse scan by SHAPE (`_AGE_S`) — the name carries no family token — which is why it was invisible to a family-token search. A value of 0 would make every dead session instantly reapable, so the default is a real safety margin rather than a tuning knob.",
   },
 ];
