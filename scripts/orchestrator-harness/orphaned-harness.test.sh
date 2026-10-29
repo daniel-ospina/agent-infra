@@ -137,14 +137,16 @@ fi
 # "a minute of grace" — passed both and would report every lane for its first minute, the same
 # unreadable-report failure at a smaller scale. MID (300 s) closes that gap.
 # ⛔ WHAT THIS CASE DOES AND DOES NOT PIN, stated because it is easy to over-claim: the fixture is armed
-# at `NOW - 300`, but the report reads its OWN clock at read time (`session_age_s` runs `date +%s`), and
-# OH1/OH2/OH8 run before OH9 — so the age the report actually sees is `300 + elapsed`, never exactly 300.
-# OH9 therefore catches any floor of 300 or less ALWAYS (because the comparison is `-ge`), and a floor of
-# 301 whenever at least one second has elapsed between arming and this read — a 301 s floor would make the
-# case time-dependent, not reliably green. It pins the floor's MAGNITUDE (> 5 min), never the exact 600;
-# the exact value is pinned by the registry's `value` field, in the `MIN_AGE` row's precedent. A fixture
-# 599 s old could not pin an integer boundary without flaking, because the clock moves between arming and
-# reading (agent-infra#2788).
+# at `NOW - 300` from `$REAL_DATE`, while the report reads its OWN clock at read time (`session_age_s`
+# runs `date +%s`) — and BOTH truncate to whole seconds. So the age the report sees is `300` when the
+# read lands in the same wall-clock second as the arm (the common case: this suite reaches OH9 in well
+# under a second), or `300 + elapsed` once a whole second has passed; it is never a fixed number. That
+# same-second case is exactly the one only `-ge` catches — a 300 s floor names the fixture and OH9 reds,
+# where `-gt` would let it through. So OH9 catches any floor of 300 or less ALWAYS, and a floor of 301
+# whenever at least one second has elapsed — a 301 s floor would make the case time-dependent, not
+# reliably green. It pins the floor's MAGNITUDE (> 5 min), never the exact 600; the exact value is pinned
+# by the registry's `value` field, in the `MIN_AGE` row's precedent. A fixture 599 s old could not pin an
+# integer boundary without flaking, because the clock moves between arming and reading (agent-infra#2788).
 write_scen \
   "merge-10093 $MID\n" \
   "merge-10093 400\n" \
