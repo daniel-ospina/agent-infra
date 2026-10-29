@@ -378,6 +378,15 @@ ck "secondary: the 4th attempt is not retried — exactly 4 attempts, then a lou
 # and the rule that made this vehicle necessary is itself pinned: a WRITE is bucketed `core`.
 ck "secondary: a MUTATION is bucketed core (a write has no second pool)" \
    "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.bucket_for(['pr','merge','7'])=='core' and m.bucket_for(['repo','delete','o/r','--yes'])=='core' and m.bucket_for(['pr','view','7'])=='graphql' else 1)" && echo 0 || echo 1)"
+# ⛔ `repo`/`gist` ARE NOT `REST_SUBCOMMANDS` (#2342 review, P1). They were added "because their WRITES
+# are REST calls", but `is_mutating` answers `core` BEFORE that set is consulted — so the entries could
+# never affect a write, while their only reachable effect mislabelled `gh repo view`/`gh repo list`
+# (GraphQL `RepositoryInfo` queries) as `core`. The consequence was measured on the landing path:
+# inside a dated-empty core window `admin-merge.sh`'s `gh repo view --json nameWithOwner` was refused
+# with ZERO requests, printed an empty slug, and the rail reported "the repo identity could not be
+# resolved" while GraphQL had thousands of requests left. This pins BOTH directions.
+ck "bucket_for: a GraphQL-only repo/gist READ is graphql, while their WRITES stay core" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.bucket_for(['repo','view','o/r','--json','nameWithOwner'])=='graphql' and m.bucket_for(['repo','list'])=='graphql' and m.bucket_for(['gist','list'])=='graphql' and m.bucket_for(['gist','create','-f','x=y'])=='core' and m.bucket_for(['repo','delete','o/r','--yes'])=='core' else 1)" && echo 0 || echo 1)"
 
 ck "secondary: the failure is LOUD on stderr (never a silent success)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 ck "secondary: the message NAMES the bucket (graphql, not the REST counter that looks healthy)" \
