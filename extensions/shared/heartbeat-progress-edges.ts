@@ -1350,6 +1350,40 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: "scripts/orchestrator-harness/lane-container-reap.test.sh — case B keeps a container YOUNGER than the floor and case A reaps one past it (the too-young rule, not the default value; the default is pinned by `value` above)",
     note: "#2868/#2870 lane test-DB containers: a container younger than four hours is never reaped, which is what stops the sweep from killing a test database a lane is still using. The bare name `MIN_AGE` is in-family by SHAPE, and registering it makes the gate STRICTER, not blind: `reverseViolations` matches name AND owner, so a future script reusing the bare name fails the reverse scan by design — the correct fix then is to rename that declaration (`X_MIN_AGE`, as `CR_MIN_AGE`/`VENV_MIN_AGE` already do), NOT to add the new file to this term's owners, which would demand it carry this exact default and declaration count.",
   },
+  // — the #1881 fix lane: three MORE reverse-scan reds inherited from main —
+  // Measured 2026-10-29 at `890544aff` (the #1881 head, whose base carried them): `verify` went RED
+  // with FOUR violations — `IDLE_S`, `MIN_SESSION_AGE_S` and `TRIGGER_BACKSTOP_S` in two files — all
+  // of them byte-identical to `origin/main`, i.e. unattributable to the diff that inherited them and
+  // red for every PR cut from that base. Registered, not exempted: each IS a liveness/stall bound
+  // whose value a change must be visible on. HOW the scan reaches them differs, and that is the point
+  // of recording them here — `IDLE_S` carries a family token (`IDLE`) plus a bound suffix, while
+  // `MIN_SESSION_AGE_S` and `TRIGGER_BACKSTOP_S` are caught by SHAPE (`_AGE_S`) and by
+  // `BACKSTOP`+`_S`, so none of the three can be found by grepping for the family alone.
+  {
+    name: "TRIGGER_BACKSTOP_S",
+    owners: ["scripts/install-repair-service.sh", "scripts/pr-repair-loop.sh"],
+    value: "REPAIR_TRIGGER_BACKSTOP_S:-1800",
+    axis: "gate",
+    guardedBy: NONE,
+    note: "the repair actuator's BACKSTOP: the demoted timer that fires a `--trigger` pass when the event-driven front end has not run for 30 minutes (#2732). Both owners declare it from ONE env var with the same default — the installer writes the systemd unit that sets the timer, and the loop reads it — so they are registered as co-owners rather than exempted as a duplicate: a divergence between them is exactly the drift the reverse scan exists to catch. Registered rather than exempted because a 0 here would make the backstop fire continuously and a huge value would retire the sweep silently.",
+  },
+  {
+    name: "IDLE_S",
+    owners: ["scripts/orchestrator-harness/lane-bound.sh"],
+    value: "IDLE_S=\"\"",
+    overrides: ['IDLE_S="$2"', "LANE_BOUND_IDLE_S:-"],
+    axis: "kill",
+    guardedBy: NONE,
+    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 1200 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
+  },
+  {
+    name: "MIN_SESSION_AGE_S",
+    owners: ["scripts/orchestrator-harness/orphaned-harness.sh"],
+    value: "MIN_SESSION_AGE_S:-600",
+    axis: "reap",
+    guardedBy: "scripts/orchestrator-harness/orphaned-harness.test.sh — the 600 s floor as the fixture's age arithmetic and the age comparison it drives (a session past it is reapable, one below it is not)",
+    note: "the orphan reaper's AGE FLOOR: a dead harness session younger than ten minutes is reported but never reaped, so a session that is merely between incarnations cannot be collected. Caught by the reverse scan by SHAPE (`_AGE_S`) — the name carries no family token — which is why it was invisible to a family-token search. A value of 0 would make every dead session instantly reapable, so the default is a real safety margin rather than a tuning knob.",
+  },
 ];
 
 /**
