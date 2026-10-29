@@ -1360,6 +1360,28 @@ FAKE
     echo "  ⏭ SKIP an UNREADABLE snapshot file is rc 2 — the arm needs a non-root uid (chmod 000 is ignored by root)"
   fi
   : > "$O/state/claims-snapshot"
+  # ⛔ A `$O/claims.sh` THAT PREDATES THE VERDICT READER MUST BE NAMED, NOT LEFT TO ITS CONSEQUENCE
+  # (review, P1). `claim_snapshot_verdict` is new in this change, and with no interface probe a stale
+  # registry still fetched and published while the four-arm log read both `CLAIM_SNAPSHOT_*` globals
+  # as empty — so it printed "BOTH halves failed … the cause is on THIS BOX on both sides", a FALSE
+  # sentence pointing the operator at the disk and the remote. Every PR then read `claim-unreadable`
+  # and the sweep continued before any arm, while the issue path kept minting PRs: a cell that mints
+  # and never lands. DRIVEN through the shipped block (extracted, not copied) with a pre-#2466
+  # registry, so removing the probe makes THIS assertion red rather than silently passing.
+  sed -n '/# \[claims-snapshot:begin\]/,/# \[claims-snapshot:end\]/p' "$HERE/orch-loop.sh" \
+    | sed '1d;$d' > "$TMP/claims-snapshot.sh"
+  eqv "the claims-snapshot cycle block was extracted from the shipped loop" "yes" \
+      "$(grep -q 'claim_snapshot_verdict' "$TMP/claims-snapshot.sh" && echo yes || echo no)"
+  SO="$TMP/stale-o"; mkdir -p "$SO/state"; : > "$SO/state/.claims-pruned"
+  printf '#!/bin/bash\nclaim_issue_acquire() { return 0; }\nclaim_snapshot() { return 0; }\n' > "$SO/claims.sh"
+  SLOG="$TMP/stale-claims.log"; : > "$SLOG"
+  ( O="$SO"; REPO="$SO"; LOG="$SLOG"; . "$TMP/claims-snapshot.sh" ) >/dev/null 2>&1 || true
+  eqv "a pre-#2466 registry is NAMED as the cause (the probe fires)" "yes" \
+      "$(grep -q 'no claim_snapshot_verdict' "$SLOG" 2>/dev/null && echo yes || echo no)"
+  eqv "a stale registry does NOT report 'both halves failed' (the fetch and publish both succeeded)" \
+      "no" "$(grep -q 'BOTH halves failed' "$SLOG" 2>/dev/null && echo yes || echo no)"
+  eqv "the named line carries the ONE remedy (deploy-harness.sh)" "yes" \
+      "$(grep -q 'deploy-harness.sh' "$SLOG" 2>/dev/null && echo yes || echo no)"
   # ⛔ AND THE GATE DIRECTION, not just the word. This is the assertion that catches the flip:
   # with the old `*) return 0` arm every unreadable shape counted as owned, the un-owned count went
   # to 0, and the drain gate opened with the whole PR queue invisible.

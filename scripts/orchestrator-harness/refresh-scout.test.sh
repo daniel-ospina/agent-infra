@@ -1056,6 +1056,38 @@ rf "$D" check TORTOISE_REPO="$D/tort"
 [ "$RC" -eq 0 ] && ok "--check: still answers its own question (rc=0) — the gh precondition is the run path's" \
                || bad "--check: rc=$RC — the operator-side gate must not acquire a second gh probe (selftest pins one gh call each)"
 
+# ── 1d2) `--check` must REFUSE a registry that predates the SNAPSHOT VERDICT reader ────────────────
+# `claim_snapshot_verdict` (agent-infra#2466) is what every PR's SELECTION answer comes from. A
+# `$O/claims.sh` that predates it is a state the check used to CERTIFY — it probed only
+# `claim_issue_preflight` — and the consequence is not "merge only" but SILENT: every PR reads
+# `claim-unreadable`, the sweep `continue`s before any arm (no spawn, no red-fixer, no auto-arm, no
+# merge), while the ISSUE path keeps working because `claim_issue_acquire` IS present. A cell that
+# mints PRs and lands none, blessed by a check whose whole job is to refuse exactly that. The stub
+# is written explicitly (not copied from git) so the case cannot silently become "the current file".
+echo; echo "── --check refuses a registry that predates the snapshot VERDICT reader ──"
+mk_case check-stale-verdict
+mk_tool "$D/tort/tools/collision_preflight.py"
+printf 'claim_issue_preflight() { return 0; }\n' > "$D/o/claims.sh"
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 3 ] && ok "--check: a registry without claim_snapshot_verdict is NOT PROVISIONABLE (rc=3)" \
+               || bad "--check: certified a registry that cannot answer the selection question — rc=$RC — $OUT"
+case "$OUT" in
+  *"predates the snapshot VERDICT reader"*) ok "--check: the refusal NAMES the missing verdict reader" ;;
+  *) bad "--check: the cause is not named — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"CHECK OK"*) bad "--check: printed CHECK OK for a registry that would dispatch NOTHING" ;;
+  *) ok "--check: no CHECK OK for a stale registry" ;;
+esac
+# AND THE CONTROL: the SAME fixture WITH the verdict reader is certified, so the refusal above is the
+# missing function and not some other property of the stub (a non-vacuous direction, both ways).
+mk_case check-fresh-verdict
+mk_tool "$D/tort/tools/collision_preflight.py"
+printf 'claim_issue_preflight() { return 0; }\nclaim_snapshot_verdict() { return 0; }\n' > "$D/o/claims.sh"
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "--check: the SAME stub WITH claim_snapshot_verdict is certified (the control)" \
+                || bad "--check: rc=$RC — a registry carrying BOTH readers was still refused — $OUT"
+
 # ── 1e) ASSERT THE PROPERTY: A PASS THAT JUDGED NOTHING MUST SAY SO ──────────────────────────────
 # `checked N; backlog now 0` over a non-empty pool is the reading the fleet has been stuck in — it
 # looks like a healthy empty queue, and each `?no verdict` line is a per-candidate MASK of one

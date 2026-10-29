@@ -2277,6 +2277,15 @@ cmd_check() {
     # and telling an operator with a broken `uv` to "clear the scout" sends them the wrong way. Only a
     # TRANSIENT refusal that names the scout gets the scout wording.
     if [ "$pvrc" -eq 3 ]; then
+      # ⛔ THE DIAGNOSIS FOLLOWS THE REASON, INCLUDING FOR THE REGISTRY (review, P2). rc=3 also covers a
+      # missing/stale CROSS-BOX CLAIM REGISTRY, and for that cause "a cell started on it could only
+      # MERGE" is the OPPOSITE of the truth: it dispatches NOTHING (every claim reads unreadable) and
+      # is silent — which is what let two cells duplicate work. The remedy is the registry deploy, not
+      # the pre-flight tool, and the reason above already names it.
+      case "$pv" in
+        *"claim registry is NOT INSTALLED"*|*"predates the issue-claim reader"*|*"predates the snapshot VERDICT reader"*)
+          die "this box's CROSS-BOX CLAIM REGISTRY is missing, unloadable, or older than this harness, so a cell on it would dispatch NOTHING — silent, not merge-only (agent-infra#2466). Fix: bash $HARNESS/deploy-harness.sh --repo $REPO --o $O  (then re-run this check) — reason above: $(printf '%s' "$pv" | grep -v '^[[:space:]]*$' | tail -1)" ;;
+      esac
       die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
     fi
     case "$pv" in

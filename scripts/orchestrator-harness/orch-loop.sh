@@ -3709,6 +3709,7 @@ while true; do
   fi
   # END sweep-listing
   # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
+  # [claims-snapshot:begin]
   # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
   # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
   if [ -f "$O/claims.sh" ]; then
@@ -3722,11 +3723,24 @@ while true; do
     # exists in claims.sh for the workers that `cd "$REPO"` first; what changed is that the
     # controller no longer relies on it.
     CLAIM_REPO="$REPO"
+    # ⛔ A STALE REGISTRY MUST BE NAMED, NOT LEFT TO ITS CONSEQUENCE (review, P1). `claim_snapshot_verdict`
+    # is new in this change and nothing probed for it: on a `$O/claims.sh` that PREDATES it the snapshot
+    # still fetched and published, but `CLAIM_SNAPSHOT_FETCH`/`_WRITE` did not exist yet — so both read
+    # empty and the block below printed "BOTH halves failed … the cause is on THIS BOX on both sides",
+    # which is FALSE (both halves succeeded) and sends the operator to the disk and the remote instead of
+    # to the stale registry. The consequence is worse than a wrong sentence: every PR then reads
+    # `claim_selection_verdict` → 127 → `claim-unreadable`, and the sweep `continue`s before ANY arm,
+    # while the ISSUE path keeps working (`claim_issue_acquire` IS present) — a cell that mints PRs and
+    # lands none, the "looks alive, does nothing" shape this change exists to remove, one surface over.
+    # The codebase's own rule for this class is a presence probe carrying the deploy remedy (the dispatch
+    # gate below does exactly this), so probe here rather than infer from the consequence.
     # ⛔ ITS FAILURE REASON GOES TO $LOG, not to stderr. This job runs in a DETACHED tmux pane (see
     # launchd-controller.sh), so anything on stderr reaches no file at all: a registry refresh that
     # failed for ever was silent, and the sweep then decided from a frozen snapshot — expired leases
     # read free (spawn -> CAS-refusal churn) and live ones read held (the fleet refuses work) with
     # nothing in the operator's only surface saying why. Same idiom as `claim_prune` below.
+    claim_reader=1
+    declare -f claim_snapshot_verdict >/dev/null 2>&1 || claim_reader=0
     claim_snapshot "$O/state/claims-snapshot" 2>>"$LOG"
     # ⛔ THE READ'S OWN VERDICT IS PUBLISHED EVERY CYCLE (agent-infra#2466). Without this line the
     # only way to learn that selection is standing down is to notice that nothing happened — the
@@ -3748,7 +3762,11 @@ while true; do
     # count is printed ONLY where the number describes what was published or what the fetch answered;
     # on a failed publish the body could not be produced, so the count is not knowable and is not
     # claimed.
-    if [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ] && [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
+    if [ "$claim_reader" = 0 ]; then
+      # ONE named line, naming the ONE remedy — and NOT the "both halves failed" sentence, which is
+      # about a different failure and is false on this box.
+      echo "[claims] ⛔ claim-unreadable: $O/claims.sh predates the snapshot verdict reader (no claim_snapshot_verdict), so EVERY PR reads claim-unreadable and NOTHING is spawned or armed this cycle — while the issue path still dispatches (claim_issue_acquire is present), so this cell mints PRs and lands none; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
+    elif [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ] && [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
       echo "[claims] snapshot read=ok refs=${CLAIM_SNAPSHOT_REFS:-?} max_age=${CLAIM_SNAPSHOT_MAX_AGE:-?}s" >> "$LOG"
     elif [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ]; then
       echo "[claims] ⛔ snapshot write=failed (read=ok) — nothing was published, so the PREVIOUS snapshot is still in place — believed ONLY while that file's own header says ok and it is inside ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, and claim-unreadable otherwise (or when there is no previous snapshot at all). This is a WRITE failure under \$O/state (disk, permissions), not a network one: check the disk, not the registry" >> "$LOG"
@@ -3771,6 +3789,7 @@ while true; do
     # remedy is run. `refresh-candidates.sh --check` refuses the same state up front.
     echo "[claims] ⛔ claim-unreadable: no registry at $O/claims.sh — every PR reads claim-unreadable, so NOTHING is spawned or armed this cycle (silence is not freedom); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
   fi
+  # [claims-snapshot:end]
 
   # ── machine-global package caches (agent-infra#1987) ───────────────────────
   # The measured defect: on pi-cell-3 `~/.cache/uv` reached 7.1GB and the box refused EVERY
