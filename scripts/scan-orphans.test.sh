@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off NO CI run site in either lane (pre-existing; tracked in agent-infra#2610) - wiring it is a coverage decision, not a side effect of a refactor
 # scan-orphans.test.sh — self-check for scripts/record-worktree.sh +
 # scripts/scan-orphans.sh (issue #195 teardown fix).
 #
