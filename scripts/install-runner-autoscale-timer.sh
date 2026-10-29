@@ -162,7 +162,7 @@ err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 # hand-maintained constant: a constant silently truncated the header whenever a line was added to it.
 help_text() {
     local n
-    n="$(grep -n '^set -uo pipefail' "$0" 2>/dev/null | head -1 | cut -d: -f1)"
+    n="$(awk '/^set -uo pipefail/ {print NR; exit}' "$0" 2>/dev/null)"
     # ⛔ NO CONSTANT FALLBACK. When `$0` is not this file (invoked from a pipe: `curl … | bash`), the
     # derivation fails and a magic range silently reinstates exactly the truncation this replaced.
     if [ -z "$n" ]; then
@@ -247,7 +247,7 @@ xml_sed_repl() {
 resolve_infra_main() {
     local gdir="$INFRA_ROOT/.git" main=""
     if [ -f "$gdir" ]; then
-        main="$(sed -n 's/^gitdir: //p' "$gdir" | head -1)"
+        main="$(sed -n 's/^gitdir: //p;q' "$gdir")"
         case "$main" in
             */.git/worktrees/*) main="${main%%/.git/worktrees/*}" ;;
             *) main="" ;;
@@ -475,7 +475,7 @@ plist_is_valid() {
 # platforms (a plist pointing at a deleted script is exactly as inert as a unit that does).
 refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
     local t="${1:-scheduled}" v p bad="" skip_scratch_heuristic=0
-    for v in "SCRIPT=$SCRIPT" "HOME=$HOME" "STATE_DIR=$STATE_DIR"; do
+    for v in "SCRIPT=$SCRIPT" "HOME=$HOME" "STATE_DIR=$STATE_DIR" "PYTHON=$PYTHON"; do
         p="${v#*=}"
         is_absolute_path "$p" || {
             err "REFUSING: ${v%%=*} '$p' is not an absolute path — a scheduler resolves the command against a working directory this installer does not choose, so the pass would fail to start on every tick"
@@ -661,21 +661,48 @@ with open(sys.argv[1],"rb") as fh:
         | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*=[[:space:]]*//p'
 }
 
+# ⛔ LINE MATCHING WITHOUT A PIPELINE, BECAUSE THE PIPELINE FORM IS A FALSE-BLOCK FACTORY.
+# `printf '%s\n' "$args" | grep -Fxq "$x"` looks safe and is not: `grep -q` exits on the FIRST match and
+# closes the pipe, the writer dies of SIGPIPE (141), and `set -o pipefail` (line 115) promotes that 141
+# over grep's 0 — so a SUCCESSFUL match is reported as a failure. Measured on this box: PIPESTATUS
+# (141 0) in 100 of 3000 iterations, i.e. ~3% per call, and the launchd install makes three such calls,
+# which is why a correct plist was refused roughly one run in ten. These helpers read a here-string:
+# grep is not in the picture and no process of ours can take SIGPIPE.
+args_has_line() { # args_has_line <newline-separated values> <exact line>
+    local want="$2" l
+    while IFS= read -r l; do [ "$l" = "$want" ] && return 0; done <<< "$1"
+    return 1
+}
+
+args_first_matching() { # args_first_matching <newline-separated values> <GLOB pattern>
+    local pat="$2" l
+    while IFS= read -r l; do
+        case "$l" in $pat) printf '%s' "$l"; return 0 ;; esac
+    done <<< "$1"
+    return 0
+}
+
+args_first() { # args_first <newline-separated values>
+    local l
+    while IFS= read -r l; do printf '%s' "$l"; return 0; done <<< "$1"
+    return 0
+}
+
 verify_installed_artifact_plist() {
     local plist="$UNIT_DIR/$LABEL.plist" args
     [ -f "$plist" ] || { err "REFUSING to load: $plist is not there after the install"; return 1; }
     plist_is_valid "$plist" || { err "REFUSING to load: the installed plist does not parse"; return 1; }
     args="$(plist_program_args "$plist")"
-    printf '%s\n' "$args" | grep -Fxq "$SCRIPT" || {
-        err "REFUSING to load: the installed plist's ProgramArguments do not name the converger ($SCRIPT): $(printf '%s ' $args)"
+    args_has_line "$args" "$SCRIPT" || {
+        err "REFUSING to load: the installed plist's ProgramArguments do not name the converger ($SCRIPT): $args"
         return 1
     }
     if [ "$(mode_flag)" = "--dry-run" ]; then
-        printf '%s\n' "$args" | grep -Fxq -- "--dry-run" || {
-            err "REFUSING to load: the installed plist's ProgramArguments do not carry the DISARMED flag this install decided: $(printf '%s ' $args)"
+        args_has_line "$args" "--dry-run" || {
+            err "REFUSING to load: the installed plist's ProgramArguments do not carry the DISARMED flag this install decided: $args"
             return 1
         }
-    elif printf '%s\n' "$args" | grep -Fxq -- "--dry-run"; then
+    elif args_has_line "$args" "--dry-run"; then
         err "REFUSING: the installed plist still carries --dry-run although this install is ARMED — the record and the artifact disagree: $(printf '%s ' $args)"
         return 1
     fi
@@ -683,22 +710,32 @@ verify_installed_artifact_plist() {
 }
 
 # ── actions ─────────────────────────────────────────────────────────────────────────────────
+# ⛔ A ROOT INVOCATION LOOKS AFTER ROOT'S RUNNERS, NOT THE LANES' — AND IT MUST BE REFUSED BY EVERY
+# VERB THAT WRITES, NOT JUST BY --install. {{USER}} is `id -un` and {{HOME}} is $HOME, so
+# `sudo bash install-runner-autoscale-timer.sh` renders `User=root` with `Environment=HOME=/root`; the
+# pass then measures root's process tree, where no runner exists, and reports `under-target` every nine
+# minutes while the real pool sits over its ceiling. It was guarded in do_install ONLY, so
+# `sudo … --arm` wrote a dated record in /root AND installed an ARMEd `User=root` unit over the correct
+# one (measured: exit 0, "ARMED"), and `sudo … --disarm` reported DISARMED while removing root's record
+# and leaving the user's intact. One guard, called from every writer — including the re-render helper,
+# so a verb added later cannot miss it.
+# WHAT THIS REFUSES, EXACTLY: an invocation that arrived through sudo (`SUDO_USER` set). A genuine root
+# shell (`sudo -i`, root in a container) has no SUDO_USER and is NOT refused.
+refuse_root_invocation() {
+    [ "$(id -u)" = "0" ] || return 0
+    [ -n "${SUDO_USER:-}" ] || return 0
+    err "REFUSING to run as root (SUDO_USER=$SUDO_USER): the unit would run as root and converge root's"
+    err "process tree, not $SUDO_USER's — a green tick that measures nothing, and an arming record in"
+    err "/root that $SUDO_USER cannot find."
+    err "Run it as the user that owns the runners:  sudo -u $SUDO_USER -H bash $0 $MODE"
+    return 1
+}
+
 do_install() {
+    refuse_root_invocation || return 1
     resolve_script || return 1
     resolve_python || return 1
     resolve_provisioner
-    # ⛔ A ROOT INSTALL LOOKS AFTER ROOT'S RUNNERS, NOT THE LANES'. {{USER}} is `id -un` and {{HOME}} is
-    # $HOME, so `sudo bash install-runner-autoscale-timer.sh` renders `User=root` with
-    # `Environment=HOME=/root`; the pass then measures root's process tree, where no runner exists, and
-    # reports `under-target` every nine minutes while the real pool sits over its ceiling. WHAT THIS
-    # REFUSES, EXACTLY: an invocation that arrived through sudo (`SUDO_USER` set). A genuine root shell
-    # (`sudo -i`, root in a container) has no SUDO_USER and is NOT refused.
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        err "REFUSING to install as root (SUDO_USER=$SUDO_USER): the unit would run as root and converge"
-        err "root's process tree, not $SUDO_USER's — a green tick that measures nothing."
-        err "Run it as the user that owns the runners:  sudo -u $SUDO_USER -H bash $0 --install"
-        return 1
-    fi
     if [ -z "$PROVISIONER" ]; then
         err "WARNING: no install-ci-runner-x64.sh resolved ($PROVISIONER_WHY) — the timer can RESTART a dead"
         err "  runner and RE-REGISTER an orphaned one, but it can never ADD capacity (every pass with"
@@ -874,7 +911,7 @@ except ET.ParseError as e:
 mode_meaning() {
     case "$(mode_flag)" in
         --dry-run) printf '%s' "  (DISARMED — measures, classifies and prints the plan only; arm with --arm)" ;;
-        *)         printf '%s' "  (ARMED by $(sed -n 's/^armed-date=//p' "$ARM_FILE" 2>/dev/null | head -1) — repairs dead runners and grows toward the measured ceiling)" ;;
+        *)         printf '%s' "  (ARMED by $(sed -n 's/^armed-date=//p;q' "$ARM_FILE" 2>/dev/null) — repairs dead runners and grows toward the measured ceiling)" ;;
     esac
 }
 
@@ -885,10 +922,16 @@ mode_meaning() {
 # arming is auditable without re-running anything.
 do_arm() {
     local reason="${1:-<none given>}" json rc ceiling ncpu mem rec_tmp
+    # ⛔ FIRST STATEMENT, BEFORE THE PREFLIGHT AND BEFORE THE RECORD IS WRITTEN. This verb's first write
+    # is the arming record, not the artifact, so a guard that only ran inside the re-render refused the
+    # UNIT while leaving an `armed-by=root` record behind — the operator was told the record-in-/root was
+    # refused while it was written, and the next `--install` by the real user would then arm from a
+    # record that names root. A writer's guard goes ahead of its first write.
+    refuse_root_invocation || return 1
     resolve_script || return 1
     resolve_python || return 1
     if arm_record_valid; then
-        log_line "  runner-autoscale: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p' "$ARM_FILE" | head -1)"
+        log_line "  runner-autoscale: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p;q' "$ARM_FILE")"
         log_line "    record: $ARM_FILE (not re-dated: the date is the audit datum)"
         # Still converge the artifact: a record may exist while the installed unit predates it.
         if [ "${DRY_RUN:-0}" = "1" ]; then return 0; fi
@@ -920,9 +963,9 @@ do_arm() {
             return 1
             ;;
     esac
-    ceiling="$(printf '%s' "$json" | sed -n 's/.*"ceiling": *\([0-9][0-9]*\).*/\1/p' | head -1)"
-    ncpu="$(printf '%s' "$json" | sed -n 's/.*"ncpu": *\([0-9][0-9]*\).*/\1/p' | head -1)"
-    mem="$(printf '%s' "$json" | sed -n 's/.*"mem_available_mb": *\([0-9][0-9]*\).*/\1/p' | head -1)"
+    ceiling="$(sed -n 's/.*"ceiling": *\([0-9][0-9]*\).*/\1/p;q' <<< "$json")"
+    ncpu="$(sed -n 's/.*"ncpu": *\([0-9][0-9]*\).*/\1/p;q' <<< "$json")"
+    mem="$(sed -n 's/.*"mem_available_mb": *\([0-9][0-9]*\).*/\1/p;q' <<< "$json")"
     rm -f "$rec_tmp"
     [ -n "$ceiling" ] || {
         err "REFUSING to arm: the preflight answered (rc=$rc) but its record carries NO ceiling, so this box's"
@@ -951,10 +994,16 @@ do_arm() {
     # that record — silently. That is the same hazard `--report-only` is hardened against, so a failed
     # arm fails CLOSED: drop the record, put the artifact back to disarmed, and say so.
     if ! do_install_reinstall_only; then
-        rm -f "$ARM_FILE"
-        FORCE_MODE_FLAG="--dry-run" do_install_reinstall_only >/dev/null 2>&1 \
-            || err "  ⛔ the artifact could NOT be re-rendered disarmed either — CHECK IT BY HAND ($UNIT_DIR): an armed artifact with no record is the state this installer exists to prevent"
-        err "NOT ARMED: the armed re-render failed, so the record was removed — the box is NOT converging"
+        # The ORDER is do_disarm's, and for the same reason: prove the artifact is DISARMED before the
+        # record goes. Deleting first (as this used to) can leave an armed artifact with NO record —
+        # the one state the design forbids — whenever the forced disarmed render fails too (a full
+        # disk, a permission change, a broken template).
+        if FORCE_MODE_FLAG="--dry-run" do_install_reinstall_only; then
+            rm -f "$ARM_FILE"
+            err "NOT ARMED: the armed re-render failed, and the artifact is back to --dry-run, so the record was removed — the box is NOT converging"
+        else
+            err "STILL ARMED: the armed re-render failed AND the disarmed re-render failed, so the record was KEPT on purpose — it is the only on-disk statement that this box is converging. Fix the refusal above, then re-run --disarm."
+        fi
         return 1
     fi
     log_line "  runner-autoscale: ARMED ($ARM_FILE) — ceiling=$ceiling from ncpu=$ncpu mem_available_mb=$mem"
@@ -962,6 +1011,7 @@ do_arm() {
 }
 
 do_disarm() {
+    refuse_root_invocation || return 1
     # ⛔ NOTHING IS MUTATED BEFORE A DRY RUN RETURNS, AND NOTHING IS DELETED BEFORE THE ARTIFACT
     # PROVES IT IS DISARMED. Both orders were wrong here once, and the failure is the one state the
     # whole design forbids — an ARMED box with no record on disk:
@@ -1000,6 +1050,7 @@ do_disarm() {
 
 # Re-render + install without re-running the resolution/guards preamble (it already ran).
 do_install_reinstall_only() {
+    refuse_root_invocation || return 1
     if [ -z "$SCRIPT" ]; then resolve_script || return 1; fi
     if [ -z "$PYTHON" ]; then resolve_python || return 1; fi
     resolve_provisioner
@@ -1061,15 +1112,29 @@ do_status() {
     log_line "installed=yes artifact=$installed_path"
     # The artifact's OWN mode, read out of the file the scheduler loads — not from the record, which can
     # disagree with it after a hand-edit or an install from another checkout.
+    # ⛔ THE MODE IS THE WHOLE REMAINDER OF THE COMMAND LINE, NOT A SEARCH FOR ONE LITERAL. This used to
+    # grep for `--dry-run` alone, which made the unrecognised-argument arm below UNREACHABLE: an
+    # artifact carrying `--apply` (exactly the pi-cell-1 artifact that made every tick exit 2) matched
+    # neither `--dry-run` nor anything else, fell into the empty case, and was reported
+    # `mode=converge (ARMED)` with exit 0 — a readiness gate keying on this verb called a schedule that
+    # fails every tick healthy. Everything after the script argument is now classified.
     if [ "$TARGET" = "launchd" ]; then
-        installed_mode="$(plist_program_args "$installed_path" | grep -Fx -- '--dry-run' | head -1)"
+        installed_args="$(plist_program_args "$installed_path")"
     else
-        installed_mode="$(unit_exec_line "$installed_path" | grep -o -- '--dry-run' | head -1)"
+        installed_args="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"')"
     fi
+    # Drop the leading interpreter + script, then the `--repo <value>` pair (that is configuration, not
+    # a mode), and what remains is the mode the pass is actually invoked with.
+    installed_mode="$(printf '%s\n' "$installed_args" | awk '
+        { if ($0 ~ /^\//) { abs++; next }
+          if (abs < 2) next
+          if (skip) { skip = 0; next }
+          if ($0 == "--repo") { skip = 1; next }
+          if (NF) print }' | tr '\n' ' ' | sed 's/ *$//')"
     case "$installed_mode" in
-        --dry-run)  log_line "mode=--dry-run (DISARMED — the pass measures and prints its plan only)" ;;
-        '')         log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
-        *)          log_line "mode=$installed_mode"; err "the installed artifact carries an UNRECOGNISED mode argument — the converger accepts only --dry-run, so every tick would exit 2 (unrecognized arguments). Re-install with this installer."; rc=1 ;;
+        '')           log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
+        --dry-run)    log_line "mode=--dry-run (DISARMED — the pass measures and prints its plan only)" ;;
+        *)            log_line "mode=$installed_mode"; err "the installed artifact carries arguments the converger does not accept ('$installed_mode') — it accepts only --dry-run, because converging is its default, so every tick would exit 2 (unrecognized arguments). Re-install with this installer."; rc=1 ;;
     esac
     log_line "arm_record=$([ -f "$ARM_FILE" ] && printf 'present' || printf 'absent') ($ARM_FILE)"
     # ⛔ THE TARGET IS PART OF THE ANSWER. An artifact whose script is gone starts nothing (203/EXEC on
@@ -1078,21 +1143,18 @@ do_status() {
     # reported `script=unreadable` for any converger installed under another name (measured with a
     # fixture), which turned a perfectly good artifact into a reported failure.
     if [ "$TARGET" = "launchd" ]; then
-        installed_script="$(plist_program_args "$installed_path" | grep -E '^/.*\.py$' | head -1)"
+        installed_args="$(plist_program_args "$installed_path")"
     else
-        installed_script="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"' | grep -E '^/.*\.py$' | head -1)"
+        installed_args="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"')"
     fi
+    installed_script="$(args_first_matching "$installed_args" '/*.py')"
     # ⛔ THE INTERPRETER IS PART OF THE ANSWER TOO, AND IT WAS THE HOLE. The pass runs as
     # `<interpreter> <script> …`, so an artifact whose pinned interpreter is gone starts nothing —
     # exactly like a missing script — while `script_present=yes` and the scheduler still lists the job
     # as scheduled. This is not hypothetical: the installer pins an ABSOLUTE interpreter path
     # precisely so a login-shell change cannot move it, which is also what makes a Python upgrade that
     # retires `python3.12` turn every tick into 203/EXEC. `--status` is the verb that exists to say so.
-    if [ "$TARGET" = "launchd" ]; then
-        installed_python="$(plist_program_args "$installed_path" | head -1)"
-    else
-        installed_python="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"' | head -1)"
-    fi
+    installed_python="$(args_first "$installed_args")"
     case "$installed_python" in
         /*) : ;;
         *) installed_python="" ;;
