@@ -1692,6 +1692,35 @@ ck "CONTROL: a run that finishes below its cap sets cap_hit=0 and writes NO snap
 cap_stub sleep
 [ ! -e "$CO/wip" ]; rc=$?
 ck "…and no wip/ directory is created at all on a healthy run" $rc
+# ⛔ THE BOUND THAT KILLED IT DECIDES THE RESCUE, NOT THE CALLER'S CAP (agent-infra#2888 review, P1/P2).
+# With the wall demoted to a backstop, the PROGRESS allowance (2700 s shipped) is what ends most lanes —
+# long before the 7200 s cap — so a rescue keyed to `elapsed >= t` never fired for exactly the population
+# #2888 exists for ("144 KB of finished, uncommitted work" at a bound kill IS that lane). Driven, not
+# grepped: the SAME silent fixture, an idle allowance of 2 s and a cap of 30 s, so the bound fires at
+# ~3 s and the cap is never reached. On the pre-fix tree `elapsed >= t` is false → `cap_hit=0 dir=none`
+# and the dirty worktree is left with no snapshot at all.
+: > "$CO/logs/cap.log"; rm -rf "$CO/wip" "$CO/state/capwip.tsv"; cap_clean; cap_dirty
+res="$( export LANE_BOUND_IDLE_S=2; drive_cap 30 "stalled, not capped" )"
+case "$res" in *"cap_hit=1 dir="*) rc=0 ;; *) rc=1 ;; esac
+ck "[RED→GREEN] a PROGRESS-bound kill (well below the cap) still sets AGENT_CAP_HIT and snapshots the work ($res)" $rc
+snap2="$(sed -n 's/.*dir=\([^ ]*\).*/\1/p' <<<"$res")"
+{ [ "$snap2" != "none" ] && [ -d "$snap2" ] && [ -f "$snap2/tracked.patch" ]; }; rc=$?
+ck "…the stalled kill's snapshot is a REAL directory carrying the interrupted work ($snap2)" $rc
+grep -q 'idle_bound=2s' "$CO/logs/cap.log.lanebound" 2>/dev/null; rc=$?
+ck "…and it really was the PROGRESS bound that fired (so the arm is not measuring the wall)" $rc
+# ⛔ AND THE NUMBERS REPORTED ARE THE BOUND THAT RAN, NOT THE CALLER'S (agent-infra#2888 review, P1).
+# `LANE_BOUND_WALL_S` exists for exactly one reason — an operator capping a lane BELOW the caller's
+# default — and in that case the old code wrote the caller's 7200 s into `[timeout] … wall_limit=` and
+# into the durable `walltime.tsv` row for a run killed at 2 s. That series is what #2888's own
+# re-measurement reads to re-size the seam, so a wrong number there is the defect one level up.
+: > "$CO/logs/cap.log"; rm -rf "$CO/wip"; cap_clean
+res="$( export LANE_BOUND_WALL_S=2; drive_cap 30 "wall override" )"
+case "$res" in *"rc=143"*) rc=0 ;; *) rc=1 ;; esac
+ck "[RED→GREEN] a LANE_BOUND_WALL_S override below the caller's cap really kills the lane early ($res)" $rc
+grep -q '\[timeout\] .*wall_limit=2s' "$CO/logs/cap.log"; rc=$?
+ck "…and [timeout] reports the wall that RAN (2s), not the caller's 30s" $rc
+[ "$(awk -F'\t' 'END{print $4}' "$CO/state/walltime.tsv" 2>/dev/null)" = "2" ]; rc=$?
+ck "…and the durable walltime.tsv row carries the same 2s, so the series cannot be read as a 30s run" $rc
 # ⛔ A CLEAN TREE AT THE CAP IS NOT A LOSS, AND IT MUST STILL SAY SO. "the tree was clean" and "the
 # work was saved" are DIFFERENT FACTS, and their being indistinguishable IS the defect: both used to
 # read as `commits=0`. One `[cap]` line each; only the second mentions artifacts.

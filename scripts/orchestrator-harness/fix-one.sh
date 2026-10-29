@@ -214,11 +214,11 @@ fi
 # which orch-loop.sh refunds, so the PR loses no attempt and is re-decided from a FRESH read on the
 # next dispatch. Nothing is dropped; nothing remembers that the queue was deep.
 # ⛔ THE ALLOW IS NOT RE-READ BEFORE THIS LANE'S OWN PUSH (#2333 review, P3). The reading above happens
-# once, at LANE START; the agent runs for up to `FIX_TIMEOUT` (default 2400 s) and pushes in its own
-# shell at the end of that window, so a lane can be allowed on a shallow queue and push into a deep
-# one - a window 2.7x `CIQ_STALE_MAX`, which no cache bound in the module describes. Disclosed rather
-# than closed here (residual (ii) in ci-queue.sh's header): a second reading at the push site has to
-# answer what a refusal would do to work that is already done.
+# once, at LANE START; the agent runs for up to `FIX_TIMEOUT` (the `LANE_BACKSTOP_S` seam, 7200 s) and
+# pushes in its own shell at the end of that window, so a lane can be allowed on a shallow queue and
+# push into a deep one - a window 8x `CIQ_STALE_MAX`, which no cache bound in the module describes.
+# Disclosed rather than closed here (residual (ii) in ci-queue.sh's header): a second reading at the
+# push site has to answer what a refusal would do to work that is already done.
 if [ -f "$SELF/ci-queue.sh" ]; then
   # shellcheck source=/dev/null
   . "$SELF/ci-queue.sh"
@@ -486,7 +486,7 @@ release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT pat
   # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
   # release that would eventually have succeeded — a `git push` slower than 20s is TERM'd, the
   # fenced push leaves the ref intact, and every box then refuses that head until the lease expires
-  # (FIX_TIMEOUT+1200, up to ~1 h). Accepted because an UNBOUNDED exit path is strictly worse: it
+  # (FIX_TIMEOUT+1200, up to ~2.3 h). Accepted because an UNBOUNDED exit path is strictly worse: it
   # holds the process open with the local lock already dropped, so the controller can spawn a second
   # fixer for the same head. DO NOT remove the bound; move the release OFF the exit path instead.
   local p w rc
@@ -505,13 +505,21 @@ trap 'exit 130' INT
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "$O/claims.sh"
-  if ! is_limit "${FIX_TIMEOUT:-2400}"; then
-    echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' is not an integer in range (at most 9 digits) — using 2400 (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
-    FIX_TIMEOUT=2400
+  # ⛔ THE LEASE MUST COVER THE BOUND THAT ACTUALLY RUNS, NOT A LITERAL (agent-infra#2888 review, P1).
+  # `FIX_TIMEOUT` used to default to 2400 HERE while the run bound below had already moved to the seam
+  # — so with `FIX_TIMEOUT` unset (the shipped default; nothing outside the test suite sets it) the
+  # head claim expired 3600 s BEFORE the fixer's own 7200 s bound. A peer box then reads
+  # `refs/claims/pr-<n>-<head>` as free and starts a SECOND fixer on the same branch, which is exactly
+  # the duplicate dispatch `claims.sh`'s lease doctrine exists to prevent. Both numbers are therefore
+  # resolved from ONE expression, and the coercion writes back into `FIX_TIMEOUT` so the `run_agent`
+  # call below cannot disagree with the lease computed here.
+  if ! is_limit "${FIX_TIMEOUT:-$LANE_BACKSTOP_S}"; then
+    echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' is not an integer in range (at most 9 digits) — using ${LANE_BACKSTOP_S} (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
+    FIX_TIMEOUT="$LANE_BACKSTOP_S"
   fi
   # Overflow-safe by construction: the guard above leaves FIX_TIMEOUT <= 999999999, so this sum is
-  # < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site.
-  FIX_LEASE=$(( ${FIX_TIMEOUT:-2400} + 1200 ))
+  # < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site (`CLAIM_TTL_MAX`).
+  FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 ))
   claim_acquire "$REPO" "$PR" "$HEAD" "$FIX_LEASE" >/dev/null
   CROSS_RC=$?
   case "$CROSS_RC" in
@@ -712,7 +720,7 @@ echo "[fix $PR] fixer done $(date) — re-running merge chain" >> "$L.log"
 # ⛔ ONLY clear the latch when the release actually succeeded. A failed release (rc=1: fenced/torn
 # push) must leave CROSS_OWN set so the EXIT trap (`trap 'release_fix_claim' EXIT`) retries it at
 # process exit — otherwise the claim strands on the remote for the whole fixer lease
-# (FIX_TIMEOUT+1200, up to ~1 h) and the controller, reading the live lease as data, stops
+# (FIX_TIMEOUT+1200, up to ~2.3 h) and the controller, reading the live lease as data, stops
 # re-dispatching that head. Same latch in merge-one.sh's claim block.
 # The failure is also LOGGED (P3, second review round, 2026-10-14): a retained latch that leaves no
 # trace is indistinguishable from a released claim to anyone reading the log afterwards.

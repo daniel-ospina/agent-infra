@@ -527,9 +527,48 @@ esac
 # file exists to prevent. So the shipped value must still COVER the sum its own comment derives; that is
 # an acknowledgement (the same pattern install-launchd.test.sh uses), not a cache: any term moving
 # without the TTL reddens.
-LEASE_TERMS=$(( 3300 + 5400 + 1890 + 3000 ))   # lane + chain PR wait + merge-phase wait + review/merge
+# ⛔ EVERY TERM IS READ FROM THE FILE THAT OWNS IT (agent-infra#2888 review, P1). This sum used to be
+# four literals, the lane term included — so when #2888 raised the lane's bound from 3300 s to the 7200 s
+# `LANE_BACKSTOP_S` seam, the sum stayed 13590, the guard stayed GREEN, and `CLAIM_ISSUE_TTL` no longer
+# covered its own derivation on a live box. That is the "literal in the test" shape this file's own
+# comment above argues against, one line lower. A term that cannot be read falls back to its historical
+# literal, so a renamed variable is a stale-term READ, never a spurious skip of the leg.
+_ct_dflt() { # _ct_dflt <file> <VAR> <fallback> — the FIRST shipped `${VAR:-NNNN}` default in <file>
+  local v
+  v="$(grep -o "\${${2}:-[0-9][0-9]*}" "$HERE/$1" 2>/dev/null | head -1 | tr -dc '0-9')"
+  case "$v" in ''|*[!0-9]*) v="$3" ;; esac
+  printf '%s' "$v"
+}
+CLAIM_LANE_TERM="$(_ct_dflt spawn-gate.sh LANE_BACKSTOP_S 7200)"   # the lane's own bound (= lane.sh's)
+CLAIM_PR_WAIT_TERM="$(( $(_ct_dflt chain-merge.sh CHAIN_POLLS 90) * $(_ct_dflt chain-merge.sh CHAIN_POLL_SECS 60) ))"
+CLAIM_MERGE_TERM="$(( $(_ct_dflt chain-merge.sh LANE_PHASE_GRACE 90) + $(_ct_dflt chain-merge.sh LANE_HANDOFF_WAIT 1800) ))"
+CLAIM_REVIEW_TERM="$(( $(_ct_dflt merge-one.sh REVIEW_TIMEOUT 1800) + 1200 ))"
+LEASE_TERMS=$(( CLAIM_LANE_TERM + CLAIM_PR_WAIT_TERM + CLAIM_MERGE_TERM + CLAIM_REVIEW_TERM ))
 [ "$ISSUE_TTL_EXPECTED" -ge "$LEASE_TERMS" ]
-ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s)" $?
+ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s = lane ${CLAIM_LANE_TERM} + PR-wait ${CLAIM_PR_WAIT_TERM} + merge-phase ${CLAIM_MERGE_TERM} + review/merge ${CLAIM_REVIEW_TERM})" $?
+# ⛔ AND THE LANE TERM IS THE ONE THE LANE ACTUALLY RUNS UNDER (agent-infra#2888 review, P1). Reading a
+# term out of the file that OWNS the knob is only half the guard: `lane.sh` no longer carries a
+# `LANE_TIMEOUT` literal at all — it passes the seam — so the file to read is spawn-gate.sh, and this
+# cross-check is what makes that so rather than a choice a future editor can silently reverse.
+LANE_SEAM_IN_LANE="$(sed -n 's/.*run_agent "\${LANE_TIMEOUT:-\$LANE_BACKSTOP_S}".*/yes/p' "$HERE/lane.sh" 2>/dev/null | head -1)"
+[ "$LANE_SEAM_IN_LANE" = "yes" ]
+ck "O7 [RED→GREEN] lane.sh runs its lane under the LANE_BACKSTOP_S seam (${CLAIM_LANE_TERM}s), so the lane term this guard sums is the one that actually runs" $?
+# Control: the term really is the seam's, not the pre-#2888 literal (3300) — a reverted seam reddens here
+# instead of quietly lowering the sum back below the TTL.
+[ "$CLAIM_LANE_TERM" -gt 3300 ]
+ck "O7 [RED→GREEN] the derived lane term (${CLAIM_LANE_TERM}s) is the #2888 seam, not the retired 3300s wall" $?
+# ⛔ THE FOURTH TERM HAS A SECOND CALLER: fix-one's lease must cover the FIXER's bound, not a literal
+# (agent-infra#2888 review, P1a). The fixer now runs for `${FIX_TIMEOUT:-$LANE_BACKSTOP_S}` — 7200 s by
+# default — so a lease derived from a 2400 s literal expired 3600 s BEFORE the run it covers, and a peer
+# box reclaimed the same head mid-fix. Pinned from source in BOTH directions: the lease must reference
+# the seam, and the ceiling must be able to hold what the seam makes it.
+FIX_SEAM_IN_LEASE="$(sed -n 's/.*FIX_LEASE=$(( \${FIX_TIMEOUT:-\$LANE_BACKSTOP_S} + 1200 )).*/yes/p' "$HERE/fix-one.sh" 2>/dev/null | head -1)"
+[ "$FIX_SEAM_IN_LEASE" = "yes" ]
+ck "O7 [RED→GREEN] fix-one.sh derives FIX_LEASE from the SAME \${FIX_TIMEOUT:-\$LANE_BACKSTOP_S} the fixer runs under, not a 2400 literal" $?
+FIX_LEASE_DERIVED=$(( CLAIM_LANE_TERM + 1200 ))
+CLAIM_TTL_MAX_SHIPPED="$(_ct_dflt claims.sh CLAIM_TTL_MAX 7200)"
+[ "$CLAIM_TTL_MAX_SHIPPED" -ge "$FIX_LEASE_DERIVED" ]
+ck "O7 [RED→GREEN] the shipped CLAIM_TTL_MAX (${CLAIM_TTL_MAX_SHIPPED}s) can HOLD the fixer's derived lease (${FIX_LEASE_DERIVED}s) — a lower ceiling silently clamps it below the run it covers" $?
 IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
 [ "$IVAL" = "$ISSUE_TTL_EXPECTED" ]
 ck "O7 the ISSUE claim's default TTL is the SHIPPED claims.sh value (${ISSUE_TTL_EXPECTED}s, got '$IVAL')" $?

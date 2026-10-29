@@ -339,6 +339,17 @@ ck "a live merge lock is adopted: the record carries the LIVE pid and the RECORD
       && [ "$(awk '{print $2}' "$OT/state/lanemerge-41.chain")" = oldhead ] && echo 0 || echo 1)
 
 # ── 11c-septies. the WAITING_API refund is CAPPED, so the spin has a terminal state ────────────
+# ⛔ THE FIXTURE'S BUDGET IS DECLARED HERE, NOT INHERITED FROM THE CLOCK (agent-infra#2888 review).
+# The arms from here through 11c-vicies-bis seed `lanemerge-<n>.watch` with 15 to mean "the --watch budget
+# is SPENT". That reading silently depended on the DERIVED cap (7 chunks from a 3300 s lane clock):
+# #2888 moved the lane clock to the 7200 s seam, the derived cap became 40, and a seed of 15 stopped
+# being spent — so ten arms took the ordinary "spend one chunk" path and never rendered the hand-off they
+# exist to pin. They were GREEN while asserting nothing (measured: 96 passed / 11 failed at the new
+# clock, 106 / 1 with the old literal). These arms are about the SENTENCE a spent budget produces, so the
+# budget they spend is a declared fixture value: `LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX` is passed
+# explicitly, and no change to `lane.sh`'s clock can make them vacuous again. The clock-coupled arms are
+# §18's (which pins LANE_TIMEOUT=1500 and derives its cap) and they deliberately do NOT set this.
+FIXTURE_WATCH_MAX=7
 new_o "$T/junk-q4.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open4.tsv"
 printf '%s deadbeef %s\n' 999994 "$OT/logs/lane-merge-51.log" > "$OT/state/lanemerge-51.chain"
@@ -363,7 +374,7 @@ printf '%s deadbeef %s\n' 999993 "$OT/logs/lane-merge-52.log" > "$OT/state/lanem
 printf '[merge 52] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-52.log"
 printf '%s\n' "3" > "$OT/state/lanemerge-52.watch"
 printf '%s\n' "15" > "$OT/state/lanemerge-52.apiretry"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX MERGED_API_FAIL=1 \
       bash "$SCRIPT" 52 --watch --repo o/r --pr-tsv "$T/pr-open5.tsv" 2>&1)"; RC=$?
 ck "past the refund allowance the chunk is CHARGED (watch 3 → 4, not refunded) and the run says so" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 52 | cut -d' ' -f1)" = WAITING_API ] \
@@ -397,7 +408,7 @@ printf '%s\n' "15" > "$OT/state/lanemerge-53.watch"
 # assertion on it ("must not say the read failed") is polluted by a PREVIOUS case's legitimate
 # unreadable-read hand-off — measured here as a false FAIL.
 OMIT_LOG="$T/gh-nonies.log"; : > "$OMIT_LOG"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$OMIT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$OMIT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX MERGED_API_FAIL=1 \
       bash "$SCRIPT" 53 --watch --repo o/r --pr-tsv "$T/pr-open6.tsv" 2>&1)"; RC=$?
 # the BODY goes to gh, not to stdout — assert on the recorded comment, not on the run's output
 ck "…and the budget hand-off names the LOAD gate instead of claiming the merge read failed" \
@@ -492,7 +503,7 @@ echo "still working" > "$OT/logs/lm-56.log"
 printf '%s\n' "15" > "$OT/state/lanemerge-56.watch"
 printf '%s\n' "WAITING_HEAD_MOVED" > "$OT/state/lanemerge-56.lastdisp"
 HEADMOVED_LOG="$T/gh-tredecies.log"; : > "$HEADMOVED_LOG"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$HEADMOVED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$HEADMOVED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX \
       bash "$SCRIPT" 56 --watch --repo o/r --pr-tsv "$T/pr-open9.tsv" 2>&1)"; RC=$?
 kill "$CH_PID56" 2>/dev/null || true
 ck "the head-moved budget hand-off names the REAL pid and never ships the literal placeholder" \
@@ -539,7 +550,7 @@ printf '%s deadbeef %s\n' 999999 "$OT/logs/lm-62.log" > "$OT/state/lanemerge-62.
 printf '%s\n' "15" > "$OT/state/lanemerge-62.watch"
 printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-62.lastdisp"
 ARM_LOG="$T/gh-sedecies.log"; : > "$ARM_LOG"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX \
       bash "$SCRIPT" 62 --watch --repo o/r --pr-tsv "$T/pr-open15.tsv" 2>&1)"; RC=$?
 ck "an exhausted budget whose last chunk found NO verdict says 'nothing to fix', not 'unresolved'" \
    $([ "$RC" = 13 ] && grep -q 'NO reviewer verdict' "$ARM_LOG" && ! grep -q 'has not resolved' "$ARM_LOG" && echo 0 || echo 1)
@@ -582,7 +593,7 @@ printf '%s deadbeef %s\n' 999988 "$OT/logs/lm-67.log" > "$OT/state/lanemerge-67.
 printf '%s\n' "15" > "$OT/state/lanemerge-67.watch"
 printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-67.lastdisp"
 BODY_LOG="$T/gh-body.log"; : > "$BODY_LOG"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$BODY_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$BODY_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX \
       bash "$SCRIPT" 67 --watch --repo o/r --pr-tsv "$T/pr-open19.tsv" 2>&1)"; RC=$?
 ck "a 'checks never settled' hand-off does NOT claim CI was driven to terminal" \
    $([ "$RC" = 13 ] && ! grep -q 'driven to terminal' "$BODY_LOG" && echo 0 || echo 1)
@@ -596,7 +607,7 @@ printf '%s\n' "WAITING_API" > "$OT/state/lanemerge-68.lastdisp"
 printf "lint\nunit\n" > "$OT/state/lanemerge-68.last"
 printf 'newhead1\n' > "$OT/state/lanemerge-68.lasthead"   # the head those names belong to
 API_BODY="$T/gh-body2.log"; : > "$API_BODY"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$API_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$API_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX MERGED_API_FAIL=1 \
       bash "$SCRIPT" 68 --watch --repo o/r --pr-tsv "$T/pr-open20.tsv" 2>&1)"; RC=$?
 ck "…and an unreadable-read hand-off DOES record the CI names it actually read (without claiming CI finished)" \
    $([ "$RC" = 13 ] && grep -q 'A CI run was read at THIS head' "$API_BODY" && grep -q 'lint,unit' "$API_BODY" \
@@ -612,7 +623,7 @@ printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-69.lastdisp"
 printf "lint\nunit\n" > "$OT/state/lanemerge-69.last"
 printf 'anOLDERhead\n' > "$OT/state/lanemerge-69.lasthead"
 STALE_BODY="$T/gh-stale.log"; : > "$STALE_BODY"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$STALE_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$STALE_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX \
       bash "$SCRIPT" 69 --watch --repo o/r --pr-tsv "$T/pr-open21.tsv" 2>&1)"; RC=$?
 ck "CI names recorded at an OLDER head are not presented as 'already done' at this one" \
    $([ "$RC" = 13 ] && ! grep -q 'lint,unit' "$STALE_BODY" && ! grep -q 'read to terminal' "$STALE_BODY" && echo 0 || echo 1)
@@ -643,7 +654,7 @@ printf '%s deadbeef %s\n' 999985 "$OT/logs/lm-71.log" > "$OT/state/lanemerge-71.
 printf '%s\n' "15" > "$OT/state/lanemerge-71.watch"
 printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-71.lastdisp"
 EXEC_BODY="$T/gh-exec.log"; : > "$EXEC_BODY"
-OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$EXEC_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$EXEC_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX \
       bash "$SCRIPT" 71 --watch --repo o/r --pr-tsv "$T/pr-open23.tsv" 2>&1)"; RC=$?
 ck "a budget hand-off names a PLAIN re-run (not --watch) and its closing line keeps --repo" \
    $([ "$RC" = 13 ] && grep -q -- '--repo o/r' "$EXEC_BODY" && grep -q 'NOT --watch' "$EXEC_BODY" \
@@ -668,7 +679,7 @@ for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS WAITING_CHAIN_RUNNING; do
   printf '%s\n' "15" > "$OT/state/lanemerge-65.watch"
   printf '%s\n' "$_arm" > "$OT/state/lanemerge-65.lastdisp"
   ARM_LOG="$T/gh-arm-$_arm.log"; : > "$ARM_LOG"
-  OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+  OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=$FIXTURE_WATCH_MAX \
         bash "$SCRIPT" 65 --watch --repo o/r --pr-tsv "$T/pr-open17.tsv" 2>&1)"; RC=$?
   case "$_arm" in
     WAITING_CHAIN_ABSENT)   _want='NO chain recorded' ;;
@@ -1001,9 +1012,9 @@ ck "a TOTAL-only response is NOT a green head (0 check-runs = nothing measured, 
 
 # ── 18. the SUPERVISION BUDGET is sized to what the LANE can actually SPEND, and re-armed (E1) ────
 # ⛔ THE OLD INVARIANT WAS SATISFIED BY MAKING THE TWO SIDES EQUAL (landing review, P1, verified):
-# 1500 (WAIT_S) + 15 x 120 (MAX_WATCH x POLL) = 3300 = lane.sh's LANE_TIMEOUT, so the merge phase
-# consumed the WHOLE wall clock and left EXACTLY ZERO for the lane's implementation, its commits, its
-# pushes and opening the PR. With any real implementation time the lane was killed at 3300s still
+# 1500 (WAIT_S) + MAX_WATCH x 120 (POLL) = the lane's whole wall clock, so the merge phase consumed ALL
+# of it and left EXACTLY ZERO for the lane's implementation, its commits, its pushes and opening the PR.
+# With any real implementation time the lane was killed at the wall still
 # inside its merge phase — neither bound was ever reached by the lane that OWNS them, no verdict was
 # written, no hand-off comment was posted, and the only signal was lane.sh's "NO merge-phase verdict"
 # line. The BLOCKED_ATTEMPTS / "supervision budget spent" path was unreachable in production.
@@ -1023,6 +1034,16 @@ _ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 # the LANE's own clock — falling back to 0 here would make the arithmetic vacuous.
 _lt="$(grep -o 'LANE_TIMEOUT:-*[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
 [ -n "$_lt" ] || _lt="$(grep -o 'LANE_BACKSTOP_S:-[0-9]*' "$HERE/spawn-gate.sh" | head -1 | tr -dc '0-9')"
+# ⛔ AND THE BUDGET IS SIZED FROM THE CLOCK lane-merge.sh ITSELF RESOLVES (agent-infra#2888 review,
+# P2/P3). `_lt` used to be read from lane.sh's side ONLY, so when #2888 moved the lane to the 7200s
+# seam this assertion compared 7200 against a budget the RUNTIME still computed from lane-merge.sh's
+# 3300 literal (`LANE_WALL_S="${LANE_TIMEOUT:-3300}"`, and lane.sh does not export LANE_TIMEOUT). It
+# passed on a wider margin, and it would ALSO have passed if that literal drifted — which is the one
+# property it exists to protect. Both sides are read now and they must AGREE, so a one-sided drift
+# reddens here instead of hiding behind the other file's value.
+_lm_wall="$(sed -n 's/^LANE_WALL_S="\${LANE_TIMEOUT:-\${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+ck "lane-merge.sh derives its wall clock from the SAME seam lane.sh runs under (lane-merge.sh=${_lm_wall:-<none>}s, lane.sh=${_lt:-<none>}s)" \
+   $([ -n "$_lm_wall" ] && [ "$_lm_wall" = "$_lt" ] && echo 0 || echo 1)
 _ws="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_ws" ] || _ws="$(grep -o 'LANE_MERGE_WAIT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
 _ir="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"

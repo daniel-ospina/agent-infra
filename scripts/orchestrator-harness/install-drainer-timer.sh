@@ -120,6 +120,15 @@ render() { # <template> <dest>
     # EMPTY file — so `DRAINER_REPO_SLUG='a|b'` installed two zero-byte units, enabled the timer and
     # printed "scheduled". The checks below are on the bytes that would actually be installed.
     tmp="$2.tmp.$$"
+    # ⛔ `{{LANE_TIMEOUT}}` IS BLANK BY DEFAULT, NOT A 3000 LITERAL (agent-infra#2888 review, P2).
+    # `Environment=` is a PIN, not a comment: a rendered value wins over the script's own
+    # `${LANE_TIMEOUT:-…}` default on EVERY tick, forever. Installing the shipped
+    # `${LANE_TIMEOUT:-3000}` therefore pinned every box this installer had touched to a 3000 s lane
+    # wall — 300 s above the 2700 s progress allowance — so the censoring #2888 removes survived on the
+    # one box whose job is to drain a backlog, and an operator raising `LANE_BACKSTOP_S` saw no change
+    # there at all. Blank means "derive it from the script every tick" (which resolves that seam,
+    # 7200 s) — the same convention the template already documents for MAX_LANES — while an EXPLICIT
+    # LANE_TIMEOUT in the installer's environment still wins, because that is a deliberate pin.
     sed -e "s|{{USER}}|$(id -un)|g" \
         -e "s|{{HOME}}|$HOME_DIR|g" \
         -e "s|{{PATH}}|${PATH:-/usr/local/bin:/usr/bin:/bin}|g" \
@@ -129,7 +138,7 @@ render() { # <template> <dest>
         -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
         -e "s|{{MAX_LANES}}|${MAX_LANES:-}|g" \
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
-        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-3000}|g" \
+        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-}|g" \
         -e "s|{{DRAINER}}|$DRAINER|g" \
         "$1" >"$tmp" || { rm -f "$tmp"; err "sed could not render $1 (a value carries '|' or '&'?) — refusing to install a partial unit"; return 1; }
     # A value carrying `|`/`&` corrupts the substitution; a leftover `{{…}}` means a placeholder
