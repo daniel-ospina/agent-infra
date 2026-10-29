@@ -677,6 +677,48 @@ sed -i '/^ExecStart=/ s| --root /opt/x --dry-run||; /^ExecStart=/ s|$| --dry-run
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "a value-taking switch with NO value is refused (--want alone exits 2)"
 assert_contains "$OUT" "--want" "naming the dangling switch"
+# a value-taking switch followed by ANOTHER FLAG is a missing value too (argparse: "expected one
+# argument"), and swallowing the flag as the value reported ARMED exit 0 for a schedule that fails
+# every tick.
+for pair in "--want --json" "--root --dry-run"; do
+    sed -i '/^ExecStart=/ s| --dry-run --want||; /^ExecStart=/ s|$| '"$pair"'|' "$D/$UNIT_NAME.service"
+    OUT="$(run_install Linux "$D" --status)"; RC=$?
+    assert_eq "$RC" 1 "'$pair' is refused (the flag after it is not its value)"
+    assert_contains "$OUT" "${pair%% *}" "naming the dangling switch"
+    sed -i "/^ExecStart=/ s| $pair||" "$D/$UNIT_NAME.service"
+done
+
+# ── T27: the script is TOKEN 2, not "the argument ending in .py" ─────────────────────────
+# `resolve_script` accepts any executable regular file, so a wrapper or a console-script without the
+# suffix installs fine. The status reader then matched nothing, discarded EVERY argument, and reported
+# `mode=converge (ARMED)` over a DISARMED artifact while exiting 1 — the one question --status exists
+# to answer, answered wrong, plus a false block on a working schedule.
+say_case "T27 a converger without a .py suffix is still read positionally"
+D="$T/c27"; fresh "$D"; rm -f "$ARM"
+cp "$T/home/converger.py" "$T/home/runner-autoscale"
+chmod +x "$T/home/runner-autoscale"
+ENVV=(RUNNER_AUTOSCALE_SCRIPT="$T/home/runner-autoscale")
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a suffix-free converger installs"
+assert_contains "$OUT" "DISARMED" "and the artifact is disarmed"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "--status on that artifact is green"
+assert_contains "$OUT" "DISARMED" "and reads the mode correctly"
+assert_contains "$OUT" "script_present=yes" "and finds the script it installed"
+
+# ── T28: a FAILED launchd removal is not reported as uninstalled ────────────────────────
+# The only check was "is the label loaded", and a failed `launchctl list` reads the same as "not
+# loaded", so a plist that survived in LaunchAgents was reported removed — and launchd loads it again
+# at the next login, resuming an ARMED pass.
+say_case "T28 --uninstall refuses when the launchd plist survives the removal"
+D="$T/c28"; fresh "$D"
+run_install Darwin "$D" --install >/dev/null 2>&1
+assert_file "$D/$LABEL.plist" "precondition: the Darwin artifact is installed"
+chmod 500 "$D"                                   # the removal cannot write to the directory
+OUT="$(run_install Darwin "$D" --uninstall)"; RC=$?
+chmod 700 "$D"
+assert_eq "$RC" 1 "--uninstall exits 1 when the plist cannot be removed"
+assert_contains "$OUT" "STILL PRESENT" "saying the artifact survived"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
