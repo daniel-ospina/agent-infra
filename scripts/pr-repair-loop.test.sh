@@ -793,7 +793,7 @@ pair_rc() { printf '%s\n' "$1" | sed -n 's/^RC=//p' | tail -1; }
 # (a) THE PAIR THAT AGREES IS NOT REFUSED -- the false-block direction. Without this arm the check
 # could refuse every pass and the two mismatch arms below would still be green.
 out="$(pair_run "$TMP/co-ai" daniel-ospina/agent-infra)"
-if printf '%s' "$out" | grep -q 'two different repos\|no checkout for'; then
+if grep -q 'two different repos\|no checkout for' <<<"$out"; then
     bad "a matching pair (agent-infra + its own checkout) was REFUSED: $(printf '%s' "$out" | tail -2)"
 else
     ok "a matching pair (agent-infra + an agent-infra checkout) is not refused at the pair check"
@@ -811,8 +811,8 @@ fi
 # (b) THE MISMATCH -- the defect. `agent-infra` with a tortoise checkout must refuse, naming BOTH.
 out="$(pair_run "$TMP/co-t3" daniel-ospina/agent-infra)"
 check "a slug whose checkout is another repo REFUSES (rc=2)" 2 "$(pair_rc "$out")"
-if printf '%s' "$out" | grep -q 'daniel-ospina/agent-infra' \
-   && printf '%s' "$out" | grep -q 'is a checkout of daniel-ospina/tortoise'; then
+if grep -q 'daniel-ospina/agent-infra' <<<"$out" \
+   && grep -q 'is a checkout of daniel-ospina/tortoise' <<<"$out"; then
     ok "…and the refusal names BOTH values (API repo and the checkout's origin)"
 else
     bad "the mismatch refusal does not name both repos: $(printf '%s' "$out" | tail -2)"
@@ -824,8 +824,8 @@ reason_is "repo-checkout-mismatch:daniel-ospina/agent-infra@daniel-ospina/tortoi
 # with the default supplying the wrong half.
 out="$(pair_run "" daniel-ospina/agent-infra)"
 check "a non-default repo with no checkout REFUSES (rc=2)" 2 "$(pair_rc "$out")"
-if printf '%s' "$out" | grep -q 'no checkout for daniel-ospina/agent-infra' \
-   && printf '%s' "$out" | grep -q '/tmp/cell-t3'; then
+if grep -q 'no checkout for daniel-ospina/agent-infra' <<<"$out" \
+   && grep -q '/tmp/cell-t3' <<<"$out"; then
     ok "…naming the repo and the fallback that is not its checkout"
 else
     bad "the no-checkout refusal does not name the repo and the fallback: $(printf '%s' "$out" | tail -2)"
@@ -834,7 +834,7 @@ reason_is "checkout-unresolved:daniel-ospina/agent-infra"
 
 # (d) THE DEFAULT REPO STILL WORKS WITH ITS DEFAULT CHECKOUT SUPPLIED -- the ordinary cell shape.
 out="$(pair_run "$TMP/co-t3" "")"
-if printf '%s' "$out" | grep -q 'two different repos\|no checkout for'; then
+if grep -q 'two different repos\|no checkout for' <<<"$out"; then
     bad "the default repo with its own checkout was REFUSED: $(printf '%s' "$out" | tail -2)"
 else
     ok "the default repo (tortoise) with a tortoise checkout is not refused"
@@ -845,7 +845,7 @@ fi
 # such a repo's queue read-only instead of losing the measurement. Refusing here would turn a
 # missing read into a missing queue -- the boundary the fix must not cross.
 out="$(pair_run "$TMP/checkout" daniel-ospina/agent-infra)"
-if printf '%s' "$out" | grep -q 'two different repos\|no checkout for'; then
+if grep -q 'two different repos\|no checkout for' <<<"$out"; then
     bad "a checkout that proves NOTHING was refused as a mismatch: $(printf '%s' "$out" | tail -2)"
 else
     ok "a checkout that proves nothing is graded read-only, not refused as a mismatch"
@@ -874,15 +874,15 @@ if [ "$(uname -s)" != "Linux" ]; then
 else
     installer_pair daniel-ospina/agent-infra "$TMP/co-t3"
     check "an install whose checkout is another repo REFUSES (rc≠0)" 1 "$IP_RC"
-    if printf '%s' "$IP_OUT" | grep -q 'daniel-ospina/agent-infra' \
-       && printf '%s' "$IP_OUT" | grep -q 'is a checkout of daniel-ospina/tortoise'; then
+    if grep -q 'daniel-ospina/agent-infra' <<<"$IP_OUT" \
+       && grep -q 'is a checkout of daniel-ospina/tortoise' <<<"$IP_OUT"; then
         ok "…naming both the target repo and what the checkout actually is"
     else
         bad "the install-time mismatch refusal does not name both: $(printf '%s' "$IP_OUT" | tail -2 | tr -d '\n' | cut -c1-200)"
     fi
     # …and the false-block direction: a matching pair is not refused at this check.
     installer_pair daniel-ospina/agent-infra "$TMP/co-ai"
-    if printf '%s' "$IP_OUT" | grep -q 'are two different repos'; then
+    if grep -q 'are two different repos' <<<"$IP_OUT"; then
         bad "an install with a matching pair was refused: $(printf '%s' "$IP_OUT" | tail -2 | tr -d '\n' | cut -c1-200)"
     else
         ok "an install with a matching pair is not refused at the pair check"
