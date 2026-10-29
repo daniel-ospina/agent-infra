@@ -182,11 +182,23 @@ if [ "$POLL_S" -eq 0 ]; then
   [ "$POLL_S" -lt 1 ] && POLL_S=1
 fi
 
+# ⛔ AN ARM-TIME WARNING MUST REACH THE ARTEFACT AN OPERATOR READS (#2888 review, P2). The only
+# production caller — `spawn-gate.sh`'s `run_agent` — runs this helper with stdout AND stderr discarded
+# (`>/dev/null 2>&1 &`), so a bare `printf` here reached NOTHING on every lane, fixer and reviewer: the
+# WARN was observable only when the helper was invoked by hand, which is exactly what the test does. It
+# goes to the lane log (never to `--verdict-file`: that file is parsed for a `verdict=` token and a WARN
+# has none, so writing it there would only add noise to a machine-readable surface).
+warn_line() { # warn_line <line>
+  printf '%s\n' "$1"
+  [ -n "$LOGF" ] && printf '%s\n' "$1" >> "$LOGF" 2>/dev/null
+  return 0
+}
+
 # ⛔ A BOUND THAT IS OFF MUST SAY SO. `LANE_BOUND_IDLE_S=0 LANE_BOUND_WALL_S=0` is a supported
 # combination (an operator debugging a lane by hand) and it is also exactly what a fleet-wide typo
 # would look like, so the single line below is the only thing that separates the two.
 if [ "$WALL_S" -eq 0 ] && [ "$IDLE_S" -eq 0 ]; then
-  printf '[lane-bound] WARN tag=%s BOTH bounds are disabled (wall=0 idle=0) — this lane is UNBOUNDED by construction\n' "$TAG"
+  warn_line '[lane-bound] WARN tag='"$TAG"' BOTH bounds are disabled (wall=0 idle=0) — this lane is UNBOUNDED by construction'
 fi
 # ⛔ THE BACKSTOP MUST SIT ABOVE THE PROGRESS ALLOWANCE, AND A VIOLATION IS LOUD (#2888). The shipped
 # pair was wall 2400 < allowance 2700, i.e. the backstop pre-empted the bound it is supposed to back
@@ -195,8 +207,8 @@ fi
 # here) may arm a deliberately short wall to exercise the ceiling itself, and killing timing is an
 # operator decision (#1070).
 if [ "$WALL_S" -gt 0 ] && [ "$IDLE_S" -gt 0 ] && [ "$WALL_S" -le "$IDLE_S" ]; then
-  printf '[lane-bound] WARN tag=%s the BACKSTOP (wall=%ss) is NOT above the PROGRESS allowance (idle=%ss): the wall clock will pre-empt the progress bound, so a lane that is still working is killed by elapsed time (agent-infra#2888). Set --wall above --idle unless you are deliberately exercising the ceiling.\n' \
-    "$TAG" "$WALL_S" "$IDLE_S"
+  warn_line "$(printf '[lane-bound] WARN tag=%s the BACKSTOP (wall=%ss) is NOT above the PROGRESS allowance (idle=%ss): the wall clock will pre-empt the progress bound, so a lane that is still working is killed by elapsed time (agent-infra#2888). Set --wall above --idle unless you are deliberately exercising the ceiling.' \
+    "$TAG" "$WALL_S" "$IDLE_S")"
 fi
 
 # ── the two signals ───────────────────────────────────────────────────────────────────────────────
