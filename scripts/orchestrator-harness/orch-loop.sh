@@ -1591,12 +1591,40 @@ fi
 # A worker whose log has not grown in this many minutes is hung. `pi -p` has no internal
 # timeout and a runaway child it spawns (a reviewer's `find /` ran for 8 hours on 2026-10-12)
 # keeps the pane alive, so the concurrency caps — which count SESSIONS — silently halve.
-STALE_MIN="${STALE_MIN:-40}"
+# ⛔ 40 -> 50 IN agent-infra#2888: at 40 min (2400 s) this reaper sat BELOW lane's own 45 min (2700 s)
+# PROGRESS allowance, i.e. it pre-empted the bound the lane change exists to make primary — the same
+# ordering defect, one layer up, killing a WORKING lane on log silence alone (this reaper reads no CPU
+# and no lane-bound verdict). 50 min = 3000 s leaves the allowance plus its two confirming samples.
+# The floor is enforced at runtime below, so a stale config cannot re-invert it either.
+STALE_MIN="${STALE_MIN:-50}"
 # §4 documents STALE_MIN and README tells a cell to set it through $ENV_FILE, so it is env-supplied
 # like the rest -- but its only read is the arithmetic just below and it had NO coercion, so
 # `STALE_MIN=abc` aborted the controller mid-cycle under `set -u` ("abc: unbound variable") instead
 # of degrading. Guard-before-use, same rule as every other limit.
-is_limit "${STALE_MIN:-}" || STALE_MIN=40
+is_limit "${STALE_MIN:-}" || STALE_MIN=50
+# ⛔ THE FLOOR IS DERIVED FROM THE ALLOWANCE, NEVER RESTATED, AND A VIOLATION IS RAISED *AND* LOGGED
+# (agent-infra#2888 review, P1). `LANE_BOUND_IDLE_S` is the same seam `lane-bound.sh` resolves, so a
+# re-measured allowance moves this floor with it; the fallback reads the shipped default out of
+# `lane-bound.sh` instead of keeping a second copy of 2700 here. '+5 min' covers the two confirming
+# samples the progress rule needs before it can reach its verdict. If lane-bound.sh cannot be read the
+# floor is SKIPPED (an unreadable sibling is not evidence that the config is inverted), so this can
+# never false-block a controller.
+_stale_floor_raise() {
+  local _allow="" _floor=""
+  case "${LANE_BOUND_IDLE_S:-}" in
+    ''|*[!0-9]*) : ;;
+    *) _allow="$LANE_BOUND_IDLE_S" ;;
+  esac
+  if [ -z "$_allow" ]; then
+    _allow="$(sed -n 's/.*num_or "${LANE_BOUND_IDLE_S:-}" \([0-9][0-9]*\)).*/\1/p' "${_HERE_RS:-.}/lane-bound.sh" 2>/dev/null | head -1)"
+  fi
+  case "${_allow:-}" in ''|*[!0-9]*) return 0 ;; esac
+  _floor=$(( (_allow + 300 + 59) / 60 ))
+  [ "$(10#${STALE_MIN:-0})" -ge "$_floor" ] && return 0
+  echo "[reap-worker] STALE_MIN=${STALE_MIN}min is NOT above the lane PROGRESS allowance ($((_allow))s + 2 samples) — raising it to ${_floor}min, because a working lane that is quiet in its log would otherwise be closed by THIS reaper with no lane-bound verdict, no walltime row and no cap snapshot (agent-infra#2888). Set STALE_MIN>=${_floor} to silence this." >> "$LOG" 2>/dev/null || true
+  STALE_MIN="$_floor"
+}
+_stale_floor_raise
 
 # ── stale-worker reaper ───────────────────────────────────────────────────────
 # Kill a worker that has gone silent. It only ever touches WORKERS — the census it walks is worker

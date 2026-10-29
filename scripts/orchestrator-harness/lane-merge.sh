@@ -102,7 +102,8 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER (measured on this change's own PR: a
 # 22-check commit on a loaded box reached 7/22 completed at 15 min and was still 15-in-flight at the
 # old 900s bound, so EVERY lane would have spent a chunk on "still in flight — re-run"). 1500s covers
-# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, 3300s), so the
+# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, defaulting to
+# the `LANE_BACKSTOP_S` seam = 7200s), so the
 # supervision bound below is derived from what is left AFTER it AND after the lane's implementation
 # time — the two must not add up to the whole clock. A re-run is still permitted and still cheap (one
 # PR read) — the bound is a runaway guard, never a reason to call a head green.
