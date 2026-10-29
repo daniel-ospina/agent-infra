@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (positive): a push-triggered workflow with `group:` and NO
+# `cancel-in-progress` key. GitHub's default is not to cancel, so R2's intent is met — refusing this
+# would be a false red on a correct declaration (round-2 P2).
+name: push-group-only
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: push-group-only-${{ github.ref }}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
