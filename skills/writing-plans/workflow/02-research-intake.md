@@ -6,9 +6,9 @@ Before drafting the plan, gather all existing research. This avoids re-researchi
 
 ### Step A — Locate Prior Research
 
-**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A's *search* — research findings, codebase context, and requirements are already live in context — but **validate the scoping artifact exists**: the scoping comment must contain `### Axis Research` (+ `### Integration Docs` for standard+) or a justified-skip trigger assessment; if absent, note the gap and proceed (the plan's `### Pattern Research` is still authored by Step B). Proceed to Step B (checking for any remaining implementation gaps).
+**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A's *search* — research findings, codebase context, and requirements are already live in context — but **validate the scoping artifact exists**: the scoping comment must contain `### Axis Research` (+ `### Integration Docs` for standard+) or a justified-skip trigger assessment; if absent, note the gap and proceed (the plan's `### Pattern Research` is still authored by Step B) — **except under `task-workflow-standard` (agent-infra#2861), where the dual-granularity split is merged into one `<!-- research: v1 -->` comment whose `### Targeted Research Findings` block already carries both granularities. There, verify that comment exists and **Step B is not run at all** — its per-bucket gate (3+ calls per bucket, below) is the second research pass stage 1 already covers at the declared depth (`issue-scoping` §Tier Scaling: 8 axis queries standard / 14 complex), and its output block is the one this pipeline does not write. Record the skip in the plan comment's field 5, and carry any genuinely new gap as a plan risk rather than running B.**
 
-**Otherwise:** Check for research artifacts in this order:
+**Otherwise:** Check for research artifacts in this order — **for `task-workflow-standard` the artifact to verify is the issue's `<!-- research: v1 -->` comment** (`### Targeted Research Findings` + `> **Findings date:**`). There is no `### Axis Research`, no `### Integration Docs` and no research brief to find; if the comment is absent, proceed and note the gap (do not look for the scoping blocks or run Step B).
 
 1. **Epic research brief:** If an epic doc was found in the Prerequisite Check, look for its companion research brief:
    ```bash
@@ -30,6 +30,8 @@ Store findings as `PRIOR_RESEARCH` for use in plan drafting and Step B below.
 
 ### Step B — Multi-Call Perplexity Verification Gate (Standard + Complex only)
 
+> ⛔ **`task-workflow-standard`: Step B is NOT RUN.** That pipeline's stage 1 posts one `<!-- research: v1 -->` comment carrying both granularities at the declared axis depth (`issue-scoping` §Tier Scaling: 8 standard / 14 complex), and `### Pattern Research` is not written. Record the skip in the plan comment's field 5 and carry any new gap as a plan risk. This rule is here, at the head, because it must be decided **before** the bucket table below — not after it.
+
 **Skip for Micro tier.**
 
 **Purpose:** Verify library versions, syntax, and current best-practices for any third-party dependencies the plan will rely on, BEFORE handoff to `plan-review`. Multi-call triangulation reduces hallucination and ensures the plan reflects current reality (not training-data drift). This is the `writing-plans` analog of the gate defined in the fractal pipeline and `issue-scoping`; the protocol is intentionally identical so reviewers downstream see consistent shape regardless of which skill produced the research.
@@ -47,11 +49,11 @@ For each named library / SDK / framework the plan mentions (e.g. `supabase-js`, 
 
 This sub-step does NOT count toward the multi-call gate's 3+ call floor — it's a separate library-docs preflight. Findings inform the gate's queries below (e.g. confirms which version is in use, surfaces deprecations to probe further).
 
-If the plan touches **zero** third-party libraries / SDKs / frameworks (rare — pure config / copy / internal-helper change), skip Sub-step B.0 cleanly and document the skip in the `### Pattern Research` output block.
+If the plan touches **zero** third-party libraries / SDKs / frameworks (rare — pure config / copy / internal-helper change), skip Sub-step B.0 cleanly and document the skip in the `### Pattern Research` output block (epic/project pipelines; `task-workflow-standard` does not run Step B at all — see the rule at the head of Step B).
 
 #### Sub-step B.1 — Multi-Call Perplexity Verification Gate
 
-**Topic buckets** — for each bucket below that **applies** to the plan's third-party deps, fire **Perplexity calls proportional to topic novelty (see Research Depth table in proportional-gates). Well-known patterns: 0-1 calls. Novel patterns: 3+ calls.** (one per framing — see protocol). Skip a bucket entirely if it does not apply (see "When NOT to fire" below). Document any skip in the `### Pattern Research` output block.
+**Topic buckets** — for each bucket below that **applies** to the plan's third-party deps, fire **Perplexity calls proportional to topic novelty (see Research Depth table in proportional-gates). Well-known patterns: 0-1 calls. Novel patterns: 3+ calls.** (one per framing — see protocol). Skip a bucket entirely if it does not apply (see "When NOT to fire" below). Document any skip in the research evidence you are writing — `### Pattern Research` for the epic/project pipelines, or the `<!-- research: v1 -->` block's `Gaps:` field where Step B is not run (`task-workflow-standard`, see the note above).
 
 | Bucket | When it applies | What it surfaces |
 |---|---|---|
@@ -59,7 +61,9 @@ If the plan touches **zero** third-party libraries / SDKs / frameworks (rare —
 | **Idiomatic usage patterns** | Plan introduces a new usage pattern for a library (hooks, edge function patterns, query builders, streaming, batch APIs) | Idiomatic API usage for the exact version + known anti-patterns |
 | **Library/framework pitfalls** | Plan touches any third-party dep where misuse has known footguns (auth flows, retries, timeouts, state machines, side effects in renderers) | Common pitfalls, post-mortems, "we tried this and reverted" cases |
 
-**Per-bucket protocol (mandatory minimum, identical to epic-workflow + issue-scoping gates):**
+> **Do you run Step B at all?** Epic/project pipelines: yes, per the protocol below. **`task-workflow-standard`: no** — stage 1's `<!-- research: v1 -->` comment already carries both granularities at the declared axis depth, and Step A's note (top of this file) is the rule. Decide this *before* the bucket table, not after it.
+
+**Per-bucket protocol (mandatory minimum, identical to epic-workflow + issue-scoping gates) — epic/project pipelines only:**
 
 For each bucket that applies, issue at least **3 separate** `mcp__seo-intelligence__perplexity_research` invocations, each with a distinct framing:
 
@@ -110,7 +114,7 @@ Default to (a). Never auto-select (b) or (c).
 
 **Output**
 
-`### Pattern Research` block — embedded in the plan doc's Architecture section, persisted to the research brief's `## Raw Notes` per the persistence rules (research-protocol §13). **This block is Step B's SOLE-authorship output — scoping emits `### Axis Research` / `### Integration Docs`, never this block (issue #231 D5).** Structure (findings-date stamp is mandatory — executing-plans Step 1.5 keys staleness to it):
+`### Pattern Research` block — **epic/project pipelines only** — embedded in the plan doc's Architecture section, persisted to the research brief's `## Raw Notes` per the persistence rules (research-protocol §13). **This block is Step B's SOLE-authorship output — scoping emits `### Axis Research` / `### Integration Docs`, never this block (issue #231 D5).** Structure (findings-date stamp is mandatory — executing-plans Step 1.5 keys staleness to it):
 
 ```
 ### Pattern Research
