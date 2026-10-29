@@ -2277,6 +2277,10 @@ cmd_check() {
   # MEASURED, which the harness's reduced-surface path (#2848) can still dispatch through. Failing
   # the cell here would be a false block; writing an empty roster instead would be the fail-open
   # that #8175 exists to prevent, and the provisioner refuses to do it.
+  # ⛔ NO INTERPRETER GUARD HERE, and that is not an omission: `cmd_check`'s dependency loop above
+  # (`for dep in git python3 pi`) has already died when `python3` is missing, so a `127` from the
+  # provisioner at this point can only mean the tool itself failed — which is what the arm below
+  # says. The BRING-UP site needs the guard because its check_dispatch has no such loop.
   if [ -f "$HARNESS/provision-lane-registry.py" ]; then
     local rv rvrc
     rv=""; rvrc=0

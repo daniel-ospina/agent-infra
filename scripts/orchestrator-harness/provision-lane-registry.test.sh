@@ -123,7 +123,7 @@ chk "A8 the OWNER's project is NOT rostered (#8177 attribution)" \
 chk "A9 the shared checkout is NOT rostered" '! grep -q "11112222" "$ROSTER"'
 chk "A10 a workspace with no cwd is NOT rostered" '! grep -q "99990000" "$ROSTER"'
 chk "A12 a NAME-only wt- directory is NOT rostered (the name is not the evidence, #8177)" \
-    '! grep -q "bbbb0000" "$ROSTER"'
+    '! grep -qi "bbbb0000" "$ROSTER"'
 chk "A11 each exclusion is NAMED on the report (a vanished window is visible)" \
     'case "$OUT" in *"Personal website"*"not a fleet worktree"*) true;; *) false;; esac'
 chk "A15 the file carries the derivation MARKER (so a refresh may replace it)" \
@@ -241,7 +241,7 @@ JSON
 RC=$?
 chk "H1 rc 0 — the population IS measurable; only the one window is unplaceable" '[ "$RC" -eq 0 ]'
 chk "H2 a RELATIVE cwd gets NO row (its identity would come from the caller's directory)" \
-    '! grep -q "aaaa1111" "$ROSTER"'
+    '! grep -qi "aaaa1111" "$ROSTER"'
 chk "H3 the exclusion NAMES it as a relative spelling, not as a generic non-lane" \
     'grep -q "RELATIVE (wt-lane-88): the cwd is RELATIVE" "$T/rel.out"'
 # NON-VACUITY: the SAME directory, spelled ABSOLUTELY, IS a fleet lane.

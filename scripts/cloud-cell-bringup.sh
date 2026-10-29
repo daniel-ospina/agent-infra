@@ -737,7 +737,16 @@ check_dispatch() {
       ok "lane roster: this box's own population (agent-infra#1935)"
     fi
   else
-    warn "provision-lane-registry.py not found in the harness — the lane roster is not provisioned here;"
+    # ⛔ TWO CAUSES, TWO DIAGNOSES. The guard above has two halves (the tool is present AND an
+    # interpreter exists), and naming only the first made an absent `python3` read as a missing
+    # harness file — sending the operator to re-pull a file that is already there (review round 2,
+    # minor). The supervisor needs no twin here: its `cmd_check` dependency loop
+    # (cloud-cell-supervisor.sh:2101) dies on a missing python3 before this line is reached.
+    if [ ! -f "$harness/provision-lane-registry.py" ]; then
+      warn "provision-lane-registry.py not found at $harness — the lane roster is not provisioned here;"
+    else
+      warn "python3 is not on PATH — the lane roster provisioner cannot run here;"
+    fi
     warn "  the pre-flight's holder surface will refuse every candidate (agent-infra#1935)"
   fi
   out="$(REPO="$WORKDIR" OR="$REPO_SLUG" O="$CELL_HOME/orchestrator" bash "$harness/refresh-candidates.sh" --check 2>&1)" || outrc=$?
