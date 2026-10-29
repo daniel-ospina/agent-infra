@@ -62,17 +62,46 @@ host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 
   (unbounded), never "zero headroom". `src` is the arm that answered (`uid` or `cgroup`) and is local
   to the box: it is printed by `probe`, not transported in the ref name.
 
-The fork fields are **appended** to the record and the ref name
-(`refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`), so a peer on an
-older tree still parses the leading fields; a six-slot legacy ref is refused as `fork_unknown` rather
-than read as healthy, and it self-heals on that box's next publish.
+The fork fields are **appended** to the record (`procs`, `max`, `fork`, then `boxid`/`boot`), so a peer
+that parses the record by KEY still reads the leading fields. ⛔ That tolerance does NOT extend to the ref
+NAME: the `<boxid>` path segment is part of the key, so a pre-#2707 reader drops a 3-segment ref entirely
+and falls to `bound=no_probe` (refuse, never guess), and a pre-#2707 WRITER host-prunes and deletes those
+refs — upgrade a whole hostname group together (§Identity and pruning below). A two-segment ref from before
+#2707 (no `boxid`) is read as `box_unknown` and a six-slot one likewise (`box_unknown`, because identity is
+checked BEFORE fork) — neither is ever read as healthy, and both self-heal on that box's next publish.
 
 Transport: the fleet's only shared channel is the queue repo's origin, so a box publishes its
-reading as `refs/boxes/<host>/<reading>` and every box reads the whole fleet with **one**
+reading as `refs/boxes/<host>/<boxid>/<reading>` and every box reads the whole fleet with **one**
 `git ls-remote --refs refs/boxes/*` — the same channel and the same read primitive `claims.sh`
 already uses. No new daemon, no new credential, no per-box RPC.
 
+Identity and pruning (#2707, measured 2026-10-24). `hostname` is NOT the key: all three cells are named
+`cmux`, so a hostname-keyed ref plus a host-scoped prune made each box delete its peers' records and the
+fleet read as one box (`cap_place` answering `place=<self>`). A record is keyed `<host>/<boxid>`, where
+`boxid` comes from the box's own network identity — Darwin `kern.uuid`, Linux the routable IPv4 — the two
+sources **measured to differ** across the cells. `/etc/machine-id` and `/proc/…/boot_id` are measured
+IDENTICAL on all three (cloned image), so neither is a fallback: a box with no derivable identity
+**refuses to publish** (`why=no-box-identity`) instead of manufacturing an attribution, and its peers
+never see a record they cannot attribute. `CAP_BOXID` pins one explicitly for a deploy that must.
+
+A box deletes a ref only when (a) a **local authorship ledger** proves this box wrote that exact ref
+(recorded at publish time under `CAP_STATE_DIR`, default `${TMPDIR:-/tmp}/pi-capacity`, one file per
+repo, ring-bounded at `CAP_LEDGER_KEEP=32` refs and one filesystem per box), or (b) the record is STALE.
+A wiped `TMPDIR` therefore degrades pruning to STALE-only — refs leak for at most `CAP_PROBE_TTL` (900 s)
+and are then collected; it never causes a delete.
+Anything else is a peer's and is kept; a fresh record under this box's own key that it cannot prove it
+wrote is counted `foreign=<n>`. When two fresh refs under one key disagree on `ncpu` or on `boot`, the
+reader marks the key `collide=1` and `cap_place` REFUSES (`bound=identity_collision`) rather than placing
+on a box the fleet cannot name. `foreign>0` alone is a *reading*, not a refusal: a box's own unprovable
+prior ref (a wiped `TMPDIR`) raises it without any collision. ⛔ `(key, boot)` equality
+is NOT authorship — a mis-keyed peer satisfies it, and reading it as proof deleted live peer records
+(reproduced; see `capacity.sh`'s header).
+
 ## 4. The order: FORK HEADROOM, then disk, then load
+
+⛔ Two bounds precede these, in this order: **`probe_stale`/`probe_unreadable`** (the reading's age is
+checked first) and **`box_unknown`** (a record that names no box is not judged on its numbers at all —
+`cap_bound_hit` checks identity before fork, because every other bound is a statement *about a box*).
 
 **Measured 2026-10-21 19:50–20:10 UTC (#2293).** Cloud **cell-4** (8 vCPU) could not spawn at all:
 
@@ -257,7 +286,10 @@ bash scripts/ci_runner_pool.sh status  --all        # rows + readings (--all is 
                                                    # default already lists every runner on THIS box)
 bash scripts/ci_runner_pool.sh add     --name <n>   # floor- and ceiling-gated
 bash scripts/ci_runner_pool.sh restart --name <n>   # bring a dead listener back
+bash scripts/ci_runner_pool.sh reclaim [--name <n>] [--dry-run]
+                                                   # RETIRE a registration GitHub deleted
 bash scripts/ci_runner_pool.sh reconcile            # the pass (idempotent; NOT yet scheduled)
+                                                   # restart -> reclaim -> add, one pass, that order
 ```
 
 Rules, each measured rather than preferred:
@@ -325,6 +357,29 @@ above) and the same box reports its real slots and can restart its real registra
   registered, advertised, idle. The marker is derived from the host's arch by default; an arch we
   cannot name is `cannot-measure`, not a jobless runner. Runner **names** are unique per repo, so the
   prefix defaults to `pi-runner-<host>` — two boxes' passes must not mint the same name.
+- **`slots=` is CAPACITY, not a directory count, and `reclaim` is the verb that repairs a
+  registration GitHub deleted.** Measured on `pi-cell-4` (2026-10-27): `slots=5` against `ceiling=3`
+  on a box with two live listeners — the other three "slots" were a registration GitHub had deleted
+  server-side, a directory with no registration in it, and `/opt/containerd` — so the ADD arm could
+  never run and the box sat one runner short of its own ceiling. `status`/`reconcile` now print
+  `registrations=` (directories), `orphaned=` and `quarantine=` beside `slots=`, and `slots = live +
+  revivable + uninspectable`, DEDUPED BY `agentName` (two directories carrying one `agentName` are one
+  registration, so starting both is not twice the capacity). A registration GitHub deleted is neither
+  capacity nor a startable slot — `restart` starts a listener, the session is refused, and it exits
+  **rc 6** — which is why the repair is `reclaim`: it verifies the refusal IN THIS PASS (under a clock
+  it measured, bounded by `RUNNER_MAX_SKEW_S`) and only then renames the install to
+  `<name>.retired-<stamp>` and removes it. ⛔ **Rename-then-delete is not tidiness**: a bare `rm -rf`
+  that fails halfway has already unlinked `.runner`, leaving bytes no verb can see (measured: 6.9 GB
+  named by nothing), so the pool loses the registration in one step and the leftover keeps a name —
+  `status` reports it as `QUARANTINE` (and `LIVE-QUAR` if a listener is somehow running on it) until
+  the bytes are gone, and `.retired-` is a RESERVED suffix `add` refuses. ⛔ **rc 6 is not rc 2**: "this
+  registration is gone server-side, run `reclaim`" and "I could not act, re-run" lead an operator to
+  opposite next steps, so the code is passed through rather than folded. ⛔ And the evidence `reclaim`
+  acts on is a refusal it dated itself, **never an old log line** — a skewed clock prints the same
+  "registration has been deleted" text and exits permanently (actions/runner#4648), so an install can
+  be DEAD with a HEALTHY registration. An `ORPHANED` row in `status` therefore means "the newest
+  evidence says deleted, a blind restart cannot be assumed to clear it", not "proven gone", and the
+  exit code routes the caller to `reclaim`, the one verb that settles it.
 - **`reconcile` is the point, not the one-shot verbs.** It starts every dead listener, adds only
   above the floor and below the ceiling, and a gate verdict ENDS the pass (the verdict is a
   measurement of the box, not a per-name accident) — while a taken **name** is skipped, because one
@@ -357,11 +412,14 @@ registration for that name under `RUNNER_ROOT`, or something that is not a usabl
 the state and the action that clears it: "clear it, or pick another name" — and, for the "no
 registration" arm, that the reading is the **process table**, so an instance dir outside `RUNNER_ROOT`
 whose listener is DEAD is invisible there) · 3 `status`: the
-report contains a DEAD listener · 4 name not available (that name is taken; try another) · 5 this
+report contains a DEAD listener, an ORPHANED registration, or a `defect tmpdir-missing` row · 4 name
+not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
 local `.runner` while GitHub keeps every registration, and the first name minted after a reboot is
-always taken). ⛔ **4 is checked before 3**: a name that is already taken reports 4 even on a box that
+always taken) · 6 PROVABLY ORPHANED — the listener started and GitHub refused the session because the
+registration no longer exists server-side (`restart`, `reconcile`); nothing was measured wrongly and no
+gate refused it, so a scheduler can branch on "repair with `reclaim`". ⛔ **4 is checked before 3**: a name that is already taken reports 4 even on a box that
 is also at a gate, because the name condition is a fact about the request, not about the box — a
 caller that branches on 4 to try another name must be able to see it. `status`
 exits 3 when a listener is DEAD (the verdict a caller branches on) and 2 — never 0, never 3 — when it

@@ -124,8 +124,8 @@ reason_is "invalid-knob"
 # ── the dispatch verdict follows the dispatcher's OWN rc (round-2 review) ────────────────────────
 # A fake dispatcher: the loop must record what pr-doctor said, not that it returned. `refused` keeps
 # the pass's exit code at 2; `undelivered` is a readable pass whose work nobody took.
-mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok"
-for d in farm-refuse farm-undeliver farm-ok; do
+mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok" "$TMP/farm-crash"
+for d in farm-refuse farm-undeliver farm-ok farm-crash; do
     # ⛔ THE REAPER LOGS ITS ARGV (round-4 review): a dry-run that reaps must be OBSERVABLE, or the
     # dry-run guard can be deleted and the suite stays green while a "preview" removes worktrees.
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${REAP_OUT:-/dev/null}"\nexit 0\n' >"$TMP/$d/pi-reap-worktrees.sh"
@@ -134,6 +134,15 @@ done
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(2)\n' >"$TMP/farm-refuse/pr-doctor.py"
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(3)\n' >"$TMP/farm-undeliver/pr-doctor.py"
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' >"$TMP/farm-ok/pr-doctor.py"
+# ⛔ agent-infra#2922: A CRASH IS NOT A REFUSAL. 4 is what the dispatcher dies with -- `pr-doctor`'s
+# own `EXIT_CRASH`, and the code an unreadable cwd produced under launchd
+# (`PermissionError`/`FileNotFoundError` out of `os.getcwd()`, recorded as
+# `EXIT rc=4 -- UNCAUGHT ...`). Before this arm the record case had no `2)` case and no crash case, so
+# rc=2 and rc=4 landed on the SAME catch-all: both wrote `decision: refusing` /
+# `reason: dispatcher-refused` and exited 2. A dead dispatcher was therefore byte-identical to a
+# legitimate "could not read the world", and because 2 is a VERDICT the crash consumed the backstop
+# window instead of being retried. The assertion is the DISTINCTION, not just the new code.
+printf '#!/usr/bin/env python3\nimport sys\nsys.exit(4)\n' >"$TMP/farm-crash/pr-doctor.py"
 rm -f "$ROW"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-refuse" \
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
@@ -144,6 +153,26 @@ env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/fa
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
 check "an UNDELIVERED dispatch is rc=3 and named" 3 "$?"
 reason_is "no-worker-took-it"
+# The crash arm (agent-infra#2922): a FAILURE, never the REFUSING verdict.
+rm -f "$ROW"
+env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-crash" \
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+check "a CRASHING dispatcher is rc=4 -- a failure, NOT the rc=2 REFUSING verdict" 4 "$?"
+reason_is "dispatcher-crashed"
+if grep -q '"decision": "pass-failed"' "$ROW" 2>/dev/null; then
+    ok "...and the row says pass-failed, so a crash and a refusal are DISTINGUISHABLE"
+else
+    bad "the crash was not recorded as pass-failed (row: $(tr -d '\n' <"$ROW" 2>/dev/null | cut -c1-200))"
+fi
+# ...and the refusal side of that distinction is still recorded as its own fact, not as a failure.
+rm -f "$ROW"
+env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-refuse" \
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+if grep -q '"decision": "refusing"' "$ROW" 2>/dev/null; then
+    ok "a genuine REFUSAL still records decision=refusing (the catch-all did not eat it)"
+else
+    bad "a genuine refusal no longer records as refusing (row: $(tr -d '\n' <"$ROW" 2>/dev/null | cut -c1-200))"
+fi
 rm -f "$ROW" "$TMP/reap.out"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-ok" \
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 REAP_OUT="$TMP/reap.out" \
@@ -718,6 +747,136 @@ env UNIT_DIR="$TMP/unit-mode" SYSTEMCTL=/bin/true REPAIR_MODE=loop PR_REPAIR_SCR
 grep -q 'mode=trigger' "$TMP/status-mode.out" \
     && ok "--status reports mode=trigger from an ExecStart that says --trigger (not from the caller's env)" \
     || bad "--status reported the caller's REPAIR_MODE instead of the installed ExecStart"
+
+echo "── the repo and its checkout are ONE seam, proven before dispatch (#3007) ──"
+# ⛔ WHAT THIS PINS. The slug and the checkout used to be TWO INDEPENDENT INPUTS WITH TWO
+# INDEPENDENT DEFAULTS (`daniel-ospina/tortoise` and `/tmp/cell-t3`, that repo's cell checkout) and
+# nothing compared them. So the ONE documented knob for pointing the service at a second repo moved
+# the API repo and left the checkout where it was: measured, `PR_DOCTOR_REPO=daniel-ospina/agent-infra`
+# with the tortoise default enumerated 18 agent-infra orders and failed every one with
+# `origin/<branch> could not be fetched` -- the refs existed, the pair did not. These arms fail
+# closed on the mismatch and, equally, do not refuse the pairs that are fine.
+# Hermetic: each checkout is `git init` + a remote URL; nothing is fetched and nothing is dispatched
+# (`--dry-run`). The `flock` shim is for macOS, which has no `flock` -- without it every arm below
+# would stop at the pass-lock guard and prove nothing about the pair.
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\nexit 0\n' >"$TMP/bin/flock"; chmod +x "$TMP/bin/flock"
+co_pair() { # <dir> <slug>
+    mkdir -p "$1"
+    git -C "$1" init -q 2>/dev/null
+    git -C "$1" remote add origin "https://github.com/$2.git" 2>/dev/null
+}
+co_pair "$TMP/co-ai" daniel-ospina/agent-infra
+co_pair "$TMP/co-t3" daniel-ospina/tortoise
+pair_run() { # <checkout-or-empty> <slug-or-empty> -> prints the run's output, last line `RC=<rc>`
+    ( if [ -n "${1:-}" ]; then export PR_DOCTOR_REPO_DIR="$1"; fi
+      if [ -n "${2:-}" ]; then export PR_DOCTOR_REPO="$2"; fi
+      rm -f "$ROW"
+      env PATH="$TMP/bin:$PATH" O="$TMP/state" ENV_FILE="$TMP/empty-keys.env" \
+          PR_REPAIR_SCRIPTS="$TMP/noscripts" REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 \
+          "$LOOP" --once --dry-run 2>&1
+      echo "RC=$?" )
+}
+pair_rc() { printf '%s\n' "$1" | sed -n 's/^RC=//p' | tail -1; }
+
+# (a) THE PAIR THAT AGREES IS NOT REFUSED -- the false-block direction. Without this arm the check
+# could refuse every pass and the two mismatch arms below would still be green.
+out="$(pair_run "$TMP/co-ai" daniel-ospina/agent-infra)"
+if printf '%s' "$out" | grep -q 'two different repos\|no checkout for'; then
+    bad "a matching pair (agent-infra + its own checkout) was REFUSED: $(printf '%s' "$out" | tail -2)"
+else
+    ok "a matching pair (agent-infra + an agent-infra checkout) is not refused at the pair check"
+fi
+# …and the pass recorded NO pair refusal: whatever verdict it then reached (a missing dispatcher on
+# this fixture, an unmeasurable box on a Mac), the PAIR was accepted — which is the question here.
+# ⛔ NOT AN `rc` ASSERTION: the later gates differ by platform, and an arm that pinned one of them
+# would be testing the box rather than the pair.
+if [ -f "$ROW" ] && grep -q '"reason": "repo-checkout-mismatch\|"reason": "checkout-unresolved' "$ROW"; then
+    bad "a matching pair was refused at the pair check: $(tr -d '\n' <"$ROW" | cut -c1-160)"
+else
+    ok "…and the recorded verdict is not a pair refusal (the pass was allowed to run)"
+fi
+
+# (b) THE MISMATCH -- the defect. `agent-infra` with a tortoise checkout must refuse, naming BOTH.
+out="$(pair_run "$TMP/co-t3" daniel-ospina/agent-infra)"
+check "a slug whose checkout is another repo REFUSES (rc=2)" 2 "$(pair_rc "$out")"
+if printf '%s' "$out" | grep -q 'daniel-ospina/agent-infra' \
+   && printf '%s' "$out" | grep -q 'is a checkout of daniel-ospina/tortoise'; then
+    ok "…and the refusal names BOTH values (API repo and the checkout's origin)"
+else
+    bad "the mismatch refusal does not name both repos: $(printf '%s' "$out" | tail -2)"
+fi
+reason_is "repo-checkout-mismatch:daniel-ospina/agent-infra@daniel-ospina/tortoise"
+
+# (c) NO CHECKOUT AT ALL for a non-default repo. The `/tmp/cell-t3` fallback is the DEFAULT repo's
+# checkout, so it may not be inherited by anyone else -- silently pairing them is the same defect
+# with the default supplying the wrong half.
+out="$(pair_run "" daniel-ospina/agent-infra)"
+check "a non-default repo with no checkout REFUSES (rc=2)" 2 "$(pair_rc "$out")"
+if printf '%s' "$out" | grep -q 'no checkout for daniel-ospina/agent-infra' \
+   && printf '%s' "$out" | grep -q '/tmp/cell-t3'; then
+    ok "…naming the repo and the fallback that is not its checkout"
+else
+    bad "the no-checkout refusal does not name the repo and the fallback: $(printf '%s' "$out" | tail -2)"
+fi
+reason_is "checkout-unresolved:daniel-ospina/agent-infra"
+
+# (d) THE DEFAULT REPO STILL WORKS WITH ITS DEFAULT CHECKOUT SUPPLIED -- the ordinary cell shape.
+out="$(pair_run "$TMP/co-t3" "")"
+if printf '%s' "$out" | grep -q 'two different repos\|no checkout for'; then
+    bad "the default repo with its own checkout was REFUSED: $(printf '%s' "$out" | tail -2)"
+else
+    ok "the default repo (tortoise) with a tortoise checkout is not refused"
+fi
+
+# (e) AN UNPROVABLE CHECKOUT IS NOT A PROVEN MISMATCH. A plain directory (a mirror, an unreadable
+# launchd/TCC path) proves nothing about which repo it is, and `pr-doctor.py` deliberately grades
+# such a repo's queue read-only instead of losing the measurement. Refusing here would turn a
+# missing read into a missing queue -- the boundary the fix must not cross.
+out="$(pair_run "$TMP/checkout" daniel-ospina/agent-infra)"
+if printf '%s' "$out" | grep -q 'two different repos\|no checkout for'; then
+    bad "a checkout that proves NOTHING was refused as a mismatch: $(printf '%s' "$out" | tail -2)"
+else
+    ok "a checkout that proves nothing is graded read-only, not refused as a mismatch"
+fi
+
+# (f) THE INSTALL-TIME HALF OF THE SAME PAIR (#3007). The installer verified that the path EXISTS and
+# carries repository metadata -- neither proves WHICH repository -- so a mismatched unit could be
+# installed and report `active` while every pass failed to fetch. On a non-Linux host the installer
+# refuses at its own platform guard before it reaches the target checks, so the arm is DECLARED there
+# and REPRODUCED on a cell (pi-cell-4); it is never silently skipped.
+# Its own farm: a shared one is consumed by the arms above (measured -- this arm was refused for a
+# MISSING artifact, which would have been reported as a pair refusal that named nothing).
+mkdir -p "$TMP/farm-pair"
+cp "$ROOT/scripts/pr-repair-loop.sh" "$TMP/farm-pair/pr-repair-loop.sh"
+cp "$ROOT/scripts/pr-doctor.py" "$TMP/farm-pair/pr-doctor.py"
+cp "$ROOT/scripts/pi-reap-worktrees.sh" "$TMP/farm-pair/pi-reap-worktrees.sh"
+chmod +x "$TMP/farm-pair/pr-repair-loop.sh" "$TMP/farm-pair/pi-reap-worktrees.sh"
+installer_pair() { # <slug> <checkout> -> output in $IP_OUT, rc in $IP_RC
+    IP_OUT="$(env "${stub_scope[@]}" PR_REPAIR_SCRIPTS="$TMP/farm-pair" \
+        TEMPLATES_DIR="$ROOT/templates/systemd" PR_DOCTOR_REPO="$1" PR_DOCTOR_REPO_DIR="$2" \
+        "$INSTALLER" --install 2>&1)"
+    IP_RC=$?
+}
+if [ "$(uname -s)" != "Linux" ]; then
+    ok "installer pair arms DECLARED (not run on $(uname -s): this installer refuses at its platform guard, before the target checks)"
+else
+    installer_pair daniel-ospina/agent-infra "$TMP/co-t3"
+    check "an install whose checkout is another repo REFUSES (rc≠0)" 1 "$IP_RC"
+    if printf '%s' "$IP_OUT" | grep -q 'daniel-ospina/agent-infra' \
+       && printf '%s' "$IP_OUT" | grep -q 'is a checkout of daniel-ospina/tortoise'; then
+        ok "…naming both the target repo and what the checkout actually is"
+    else
+        bad "the install-time mismatch refusal does not name both: $(printf '%s' "$IP_OUT" | tail -2 | tr -d '\n' | cut -c1-200)"
+    fi
+    # …and the false-block direction: a matching pair is not refused at this check.
+    installer_pair daniel-ospina/agent-infra "$TMP/co-ai"
+    if printf '%s' "$IP_OUT" | grep -q 'are two different repos'; then
+        bad "an install with a matching pair was refused: $(printf '%s' "$IP_OUT" | tail -2 | tr -d '\n' | cut -c1-200)"
+    else
+        ok "an install with a matching pair is not refused at the pair check"
+    fi
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then

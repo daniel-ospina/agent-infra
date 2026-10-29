@@ -1097,12 +1097,12 @@ refund_bailed_fixer() {
     if [ -f "$O/state/fixspend-$pr-$head" ]; then
       rm -f "$O/state/fixspend-$pr-$head"
       touch "$O/state/needsfix-$pr-$head"
-      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, findings marker restored" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, findings marker restored" >>"$LOG"
     else
-      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
     fi
   else
-    echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n" >>"$LOG"
+    echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
   rm -f "$O/state/parked-$pr"
@@ -1126,10 +1126,16 @@ review_gate_state() {
 
 # [reviewdisp:begin]
 # ── THE REVIEW-DISPATCH KEY: ONE REVIEW PER (PR, HEAD), BOUNDED, NEVER SILENT (agent-infra#2653) ──
-# `state/reviewdisp-<PR>` = "<head> <n>": how many review lanes the CONTROLLER has dispatched for that
-# (PR, head). The head is the key because a review is evidence ABOUT A HEAD — a push re-arms the
-# budget, and an unchanged head must never pay for the same review twice.
-# ⛔ WHY THIS EXISTS AT ALL. A review lane IS dispatchable (`merge-<PR>`, below), but the controller kept
+# `state/reviewdisp-<PR>` = "<head> <n>": review ATTEMPTS at that (PR, head), spent by BOTH arms since
+# agent-infra#2971 — the CONTROLLER on a dispatch, `merge-one.sh` on a verdict-less run nothing counted
+# above it (`REV_PAID=1` marks the dispatcher-paid run, so one attempt is never counted twice). The head
+# is the key because a review is evidence ABOUT A HEAD — a push re-arms the budget, and an unchanged head
+# must never pay for the same review twice.
+# ⛔ WHY THIS EXISTS AT ALL. A review lane IS dispatchable — it was dispatched under `merge-<PR>` until
+# agent-infra#2971 split the two identities: the review ORDER is `review-<PR>`, and `merge-<PR>` is now
+# only the GREEN arm's landing worker. Before that split a review order and a landing worker carried the
+# SAME tag, so a pass that did the right thing (review) read in the controller's own log as a re-run of
+# the thing that had just been refused — but the controller kept
 # no record of having dispatched one, so a head whose gate stayed red was re-reviewed once per cycle
 # forever, and every one of those is a PAID fresh-context reviewer. The mirror image is what the fleet
 # actually paid for: with `review_slots` bounded, a review that never binds to a (PR, head) cannot be
@@ -1233,10 +1239,10 @@ review_athead_bump() { # <pr> <head> -> prints the new count
 # `review lanes=11/6` for 26 hours; the 11 were dead records whose logs had been silent for 26-30h and
 # nothing said so. A refusal that names its holders and their age turns "the box is busy" into "these
 # eleven units are not alive", which is the only reading an operator can act on.
-review_lane_holders() { # -> "merge-<pr>(<age>) …" (max 6, then "+N more")
+review_lane_holders() { # -> "review-<pr>(<age>) merge-<pr>(<age>) …" (max 6, then "+N more")
   local n st f m age out="" extra=0 lim=6 count=0
   while IFS="$(printf '\t')" read -r n st; do
-    case "$n" in merge-*) ;; *) continue ;; esac
+    case "$n" in review-*|merge-*) ;; *) continue ;; esac
     case "$st" in dead) continue ;; esac
     count=$(( count + 1 ))
     if [ "$count" -gt "$lim" ]; then extra=$(( extra + 1 )); continue; fi
@@ -1339,7 +1345,7 @@ harness_refresh_cycle() {
   [ "${_HR_DONE:-0}" = "1" ] && return 0
   _HR_DONE=1
   HARNESS_TOKEN=""
-  local rr out rc rel run ref pin act rec line
+  local rr out rc rel run ref pin act rec line pnd
   case "${HARNESS_REFRESH:-on}" in
     off|0|no)
       HARNESS_TOKEN="refresh-off"
@@ -1367,12 +1373,16 @@ harness_refresh_cycle() {
   # under this file's `set -u` a SIGPIPE tail on the writer is invisible, and `check-no-sigpipe-grep.sh`
   # gates the shape repo-wide.
   rec="$(printf '%s\n' "$out" | awk '/^harness relation=/{print; exit}')"
-  rel=""; run=""; ref=""; pin=""; act=""; fst=""
+  rel=""; run=""; ref=""; pin=""; act=""; fst=""; pnd=""
   for kv in $rec; do
     case "$kv" in
       relation=*) rel="${kv#relation=}" ;; running=*) run="${kv#running=}" ;;
       ref=*) ref="${kv#ref=}" ;; pin=*) pin="${kv#pin=}" ;; action=*) act="${kv#action=}" ;;
       fetch=*) fst="${kv#fetch=}" ;;
+      # WHY a `restart-pending` is pending (#2641): `inert` / `unprovable` / `deferred` / `safe`. Parsed
+      # so the spawn line can carry it — the four are different facts about the box and a token that says
+      # only `restart-pending` is the always-on alarm this fixes.
+      pending=*) pnd="${kv#pending=}" ;;
     esac
   done
   # A refusal prints its record too, so `action=refused` still carries the relation. A missing record
@@ -1386,12 +1396,20 @@ harness_refresh_cycle() {
   # completely SILENT in exactly that state: the warning was prose (this block keeps only the last
   # non-record line) and the token was empty. A stale comparison is named on every spawn line instead.
   if [ "$rel" = current ] && [ -n "$fst" ] && [ "$fst" != ok ]; then rel="$fst"; fi
-  if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${run:+:$run}"; fi
+  # ⛔ THE PENDING REASON RIDES ON THE TOKEN ONLY FOR `restart-pending` (#2641): every other relation
+  # carries `pending=none`, and appending it would put a constant on every line — the shape this repo
+  # keeps deleting. `restart-pending:deferred:04bc1ddefde` says the box is on an older tree AND why the
+  # step that would fix it has not been taken; `restart-pending:unprovable:…` says the identity itself is
+  # unknown. `current` stays EMPTY, which is the whole point of the third RUNNING source: on a cell it
+  # becomes reachable, so the token finally disappears when the box really is on the pin.
+  _pnd=""
+  [ "$rel" = restart-pending ] && [ -n "$pnd" ] && [ "$pnd" != none ] && _pnd="$pnd"
+  if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${_pnd:+:$_pnd}${run:+:$run}"; fi
   export HARNESS_TOKEN
   # The record other surfaces read (status, the next cycle's diagnosis). Staged then renamed, like
   # every other record this loop writes: a truncated state file must never replace a good one.
-  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s\n' \
-      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" \
+  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s pending=%s\n' \
+      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" "${pnd:-none}" \
       > "$O/state/.harness-refresh.tmp" && mv -f "$O/state/.harness-refresh.tmp" "$O/state/harness-refresh"; } 2>/dev/null \
     || echo "[harness] WARNING: could not record state/harness-refresh — the verdict below is this cycle's only copy" >> "$LOG"
   # ONE line per cycle, in the script's own words (it already names what it did). A refusal goes to
@@ -3081,7 +3099,7 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
   # 1. the live facts `pr_owned` already proves (cwd scan, cmdline-bound lock, foreign lease).
   if pr_owned "$pr" "$sha" "$br"; then return 0; fi
   # 2. the worker RECORD (census: a `dead` row is excluded there, `unknown` counts live).
-  if sess "fix-$pr" || sess "merge-$pr"; then return 0; fi
+  if sess "fix-$pr" || sess "review-$pr" || sess "merge-$pr"; then return 0; fi
   # 3. NOTHING PROVEN. With the proof module available the verdict is a RELEASE — and it removes the
   #    record, because a verdict of "not owned" that leaves the un-spawnable record on disk would
   #    leave the PR exactly as stuck as before (that is the defect, not the fix). Without the module
@@ -4291,7 +4309,7 @@ while true; do
             refund_bailed_fixer "$PR" "$HEAD_N" 0
             RF_N=$(( RF_N - 1 ))
             printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || true
-            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim, or the CI-queue gate deferred the push) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
+            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
           fi
           # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT (review P1, cycle 3). `fix-one.sh` writes
           # `fixgate-<PR>-<head>` when the load/disk gate refused the agent at the spawn point, so
@@ -4824,7 +4842,7 @@ while true; do
                 echo "#$PR REVIEW-AT-HEAD-UNBOUNDED at head=${HEAD_N:-?} — a CLEAN review is recorded here and the gate never went green, and state/reviewathead-$PR CANNOT BE WRITTEN, so this state can no longer escalate to a human (it would log a wait row every cycle for ever). REFUSAL: nothing dispatched; REPAIR: make $O/state writable (rm -rf a stray directory named reviewathead-$PR) and the bound resumes next cycle" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-AT-HEAD-UNBOUNDED: the escalation counter is unwritable — a human must look at this head"
               elif [ "$_ahn" -ge "${MAX_REVIEW_TRIES:-3}" ]; then
-                echo "#$PR REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — a CLEAN review is recorded here but the gate never went green, and the controller has no actuator for that: PARKED for a human. The remedy is a RE-RECORD, not a review, and it is one command: record-review.sh $PR ${HEAD_N:-?} clean $OR --evidence comment:<the id of that review comment> — the gate re-triggers on 'edited'. ⛔ AND THEN LIFT THIS PARK: the park is honoured BEFORE the acting case and the automatic lift only matches RED TREE / rail refusals, so a re-record on its own changes nothing — rm -f $O/state/parked-$PR $O/state/parkreason-$PR $O/state/reviewathead-$PR. ⛔ NO BACKTICKS AND NO APOSTROPHES IN THIS LINE: it is a double-quoted string, so a backticked command is SUBSTITUTED (the command the operator is told to run would be deleted from the log and its output spliced in) — measured on PR #2664 review round 2." >>"$LOG"
+                echo "#$PR REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — a CLEAN review is recorded here but the gate never went green, and the controller has no actuator for that: PARKED for a human. The remedy is a RE-RECORD, not a review, and it is one command: record-review.sh $PR ${HEAD_N:-?} clean $OR --evidence comment:<the id of that review comment> --expect-head ${HEAD_N:-?} — ⛔ THE PIN IS PART OF THE REMEDY (#2572, fresh review of PR #2988): this arm fires only when the record IS at this exact head, so the pin is statable and verifies, and WITHOUT it the #2982 carry arm of the recorder may re-bind that verdict to a live head nobody reviewed — the same defect #2572 closes at the two fresh-mint sites, reachable here through the one printed command an operator would run. The gate re-triggers on 'edited'. ⛔ AND THEN LIFT THIS PARK: the park is honoured BEFORE the acting case and the automatic lift only matches RED TREE / rail refusals, so a re-record on its own changes nothing — rm -f $O/state/parked-$PR $O/state/parkreason-$PR $O/state/reviewathead-$PR. ⛔ NO BACKTICKS AND NO APOSTROPHES IN THIS LINE: it is a double-quoted string, so a backticked command is SUBSTITUTED (the command the operator is told to run would be deleted from the log and its output spliced in) — measured on PR #2664 review round 2." >>"$LOG"
                 if park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-AT-HEAD-STUCK: a CLEAN review is already recorded at head=${HEAD_N:-?} and the ai-review-gate never went green over it after ${_ahn} cycle(s). No review is dispatched (a second review of an unchanged head is waste) and the controller has no re-record actuator — a human must re-record the existing evidence or re-run the gate. A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewathead-$PR'"; then
                   disp "$PR" "${HEAD_N:-}" "$V" wait "parked: REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} — recorded review, red gate, needs a human"
                 else
@@ -4854,7 +4872,20 @@ while true; do
                 echo "#$PR REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — review re-records at this head are EXHAUSTED, but the PARK DID NOT LAND (state/parked-$PR is unwritable), so this head is NOT bounded and will re-enter this arm every cycle. REFUSAL: nothing dispatched. REPAIR: make $O/state writable (rm -rf a stray directory named parked-$PR)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-CAP PARK UNWRITABLE — a human must look at this head"
               fi
-            elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
+            elif [ "$(wt_count review- merge-)" -lt "$MR" ] && can_spawn; then
+              # ⛔ THIS SPAWN IS A REVIEW ORDER, AND IT IS NAMED AS ONE (agent-infra#2971). The remedy
+              # the NEEDS-REVIEW diagnosis names is a REVIEW, so the worker this arm starts is
+              # `review-<PR>` — not `merge-<PR>`. Until this split both arms used the SAME tag, so a
+              # pass that dispatched a review read, in the controller's own log, as another MERGE
+              # worker: `[spawn] SPAWNED … merge-10213`, `[pr] … spawned=5` (measured 2026-10-28).
+              # A reader (and the operator's eye) then cannot tell an ORDER out of the refusal from a
+              # re-run of the thing that was refused, which is exactly how the same PR was re-spawned
+              # pass after pass. `merge-<PR>` now means ONE thing: the GREEN arm's landing worker.
+              # ⛔ AND THE BUDGET IS THE MERGE ARM'S OWN (REV_PAID=1): `merge-one.sh` reads and writes
+              # the SAME `reviewdisp-<PR>` record this arm just spent (agent-infra#2971, one book), so
+              # the attempt is counted once and the reviewer-side cap and this arm's REVIEW-CAP are
+              # the same number instead of two private tallies.
+              #
               # ⛔ READ THE COUNT FROM THIS PR'S VERDICT, NOT FROM A VARIABLE LEFT BY THE LAST PR. The
               # sweep loop is one shell, so a bare `_rvn` set in the CAP branch above would still hold
               # THAT PR's count here — and this value is written to `reviewdisp-<PR>` and printed as
@@ -4866,7 +4897,7 @@ while true; do
               # ⛔ A SPAWN THAT DID NOT HAPPEN MUST SAY SO (#2126 T1). This line was `tmux … && echo`,
               # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
               # reason. Every other spawn site in this file has an explicit failure branch.
-              if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
                 # SPEND THE REVIEW BUDGET ONLY ON A SPAWN THAT HAPPENED — the same rule `fixcount`
                 # follows one arm above: bookkeeping before the spawn makes a killed/failed spawn cost
                 # a real attempt, and this counter is the only thing standing between a wedged reviewer
@@ -4875,7 +4906,7 @@ while true; do
                 # #2653, P2): the counter IS the bound, so an unwritable one would re-buy a paid review
                 # every cycle. Named, and the head is parked so the loop stops rather than spending again.
                 if ! review_disp_record "$PR" "${HEAD_N:-}" "$(( ${_rvn:-0} + 1 ))"; then
-                  echo "#$PR review lane merge-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (attempting to park it — the park's own outcome is reported below). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
+                  echo "#$PR review order review-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (attempting to park it — the park's own outcome is reported below). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
                   # ⛔ AND THE PARK IS CHECKED TOO (review round 5 of #2653, P2): if the park did not
                   # land, the PR is NOT bound — it re-enters this arm and buys another paid review every
                   # cycle. Claiming PARKED over an unwritten `parked-<PR>` is the same inert-bound
@@ -4888,8 +4919,11 @@ while true; do
                     disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE and PARK DID NOT LAND — a human must look at this head"
                   fi
                 else
+                  # The `re-record` legacy token stays in this line (suites and operators read it), but
+                  # the ORDER is named: `review-<PR>`, at the head it was ordered for.
                   echo "#$PR re-record" >>"$LOG"
-                  disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"
+                  echo "#$PR review ORDER review-$PR dispatched for (PR=$PR, head=${HEAD_N:-?}) — the remedy the NEEDS-REVIEW diagnosis names; no merge worker is spawned at an unreviewed head" >>"$LOG"
+                  disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker review-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"
                 fi
               else
                 echo "#$PR re-record spawn FAILED (no review worker started this cycle)" >>"$LOG"
@@ -4898,7 +4932,7 @@ while true; do
             else
               # ⛔ THE REFUSAL NAMES ITS HOLDERS (agent-infra#2653): a count with no owner is what let 11
               # dead worker records read as "the box is busy" for 26 hours.
-              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR — holding: $(review_lane_holders); $(spawn_gate_tok))" >>"$LOG"
+              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count review- merge-)/$MR — holding: $(review_lane_holders); $(spawn_gate_tok))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: review-lane ceiling $MR reached or the spawn gate refused"
             fi
           fi
@@ -5347,7 +5381,7 @@ while true; do
     echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="none enumerable (no per-PR rows this cycle)"
   elif [ "$PRDISP_ACTS" -gt 0 ]; then
-    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight; spawned=${PRDISP_SPAWNS:-UNMEASURED} this pass (see the [spawn] line: acted counts ACTIONS, only a spawn starts a worker)${_refsuf:-}" >>"$LOG"
+    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- review- fix-) worker(s) in flight; spawned=${PRDISP_SPAWNS:-UNMEASURED} this pass (see the [spawn] line: acted counts ACTIONS, only a spawn starts a worker)${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="#${PRDISP_FIRST}"
     [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
   else
@@ -5406,7 +5440,7 @@ PY
   # live at this instant, so the dispatch block line below can distinguish "blocked while the box
   # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
   # not). Total in-flight agents = lanes + workers.
-  WORKERS="$(wt_count merge- fix-)"
+  WORKERS="$(wt_count merge- review- fix-)"
   # A load reading that is empty or non-numeric is the DOCUMENTED FAIL-OPEN (can_spawn() defaults it
   # to 0). Kept deliberately (#1702): both supported platforms are measurable now, and failing CLOSED
   # on an unreadable probe would convert "no load back-pressure" into a permanent controller outage on
@@ -5527,27 +5561,61 @@ PY
     echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   fi
   GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
-  if [ -n "$GATE_WHY" ]; then :
+  # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
+  # ⛔ ONLY THE FIRST GATE THAT FIRED WAS EVER VISIBLE. `GATE_WHY` is ONE string and the arms were an
+  # `elif` chain, so the first arm that fired MASKED every arm behind it — and the arm that fires first
+  # is `merge-priority`, which is set whenever any workable un-owned PR exists. Measured 2026-10-27:
+  # 349 of 384 cycles closed the issue path with `merge-priority` named, while the box had **25 free
+  # lane slots**; of those gated cycles **88.5% also had a capacity gate that would have refused**, and
+  # **64** were refused with `ci-queue=ok`. So an idle cycle could not say whether it was waiting for
+  # the PR sweep (normal, healthy) or being throttled by a capacity gate (a defect) — and the PR side,
+  # which is the only population whose movement can lift `merge-priority`, was itself being deferred.
+  #
+  # ⛔ THE FIX IS NOT A SECOND COPY OF THE PREDICATES. The arms are INDEPENDENT predicates, and the
+  # chain encoded exactly one thing with `elif`: the ORDER in which a winner is chosen. Each arm is now
+  # its own guard that (a) assigns `GATE_WHY` ONLY IF IT IS STILL UNSET — identical first-wins
+  # semantics, byte-for-byte the same winner — and (b) appends its own verdict to `GATE_VEC` whether it
+  # won or not. A future arm added here is therefore visible in the vector by construction, and a
+  # predicate is never written down twice (the defect that lets a gate and its report drift apart).
+  # [gatevec:begin] (extracted and DRIVEN by test-gates.sh — keep the markers)
+  GATE_VEC=""
+  if [ -n "$GATE_WHY" ]; then
+    GATE_VEC="merge-priority(${UPN_WORK:-${UPN:-?}} un-owned PR(s) workable, ${SEL_TOTAL:-${OPEN_N:-?}} candidate(s))"
+  else
+    GATE_VEC="merge-priority=clear"
+  fi
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
   # can be completely unable to spawn, so a chain that reports `load=` first describes the wrong
   # resource and points the operator at a remedy (wait) that cannot work. The order is
   # FORK -> DISK -> LOAD here as it is in capacity.sh's `cap_bound_hit`; DISK is not repeated here
   # because the spawn point (`spawn-gate.sh`) is its ONE implementation and it now runs it after this
   # same fork read.
-  elif [ "${FORK_STARVED:-0}" = "1" ]; then
-    GATE_WHY="${FORK_WHY:-fork_headroom_below_margin}"
-  elif [ -n "${CAP_FORK_BOUND_SELF:-}" ]; then
-    GATE_WHY="fork_${CAP_FORK_BOUND_SELF#fork_}(procs=${FORK_PROCS:-?}/${FORK_MAX:-?})"
-  elif [ "${LANES_UNKNOWN:-0}" = "1" ]; then GATE_WHY="lanes_unknown (the lane census could not be read -> do not add work)"
-  elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
+  if [ "${FORK_STARVED:-0}" = "1" ]; then
+    GATE_WHY="${GATE_WHY:-${FORK_WHY:-fork_headroom_below_margin}}"
+    GATE_VEC="$GATE_VEC fork=REFUSE(${FORK_WHY:-headroom_below_margin})"
+  else GATE_VEC="$GATE_VEC fork=ok"; fi
+  if [ -n "${CAP_FORK_BOUND_SELF:-}" ]; then
+    GATE_WHY="${GATE_WHY:-fork_${CAP_FORK_BOUND_SELF#fork_}(procs=${FORK_PROCS:-?}/${FORK_MAX:-?})}"
+    GATE_VEC="$GATE_VEC fork_bound=REFUSE(procs=${FORK_PROCS:-?}/${FORK_MAX:-?} by ${CAP_FORK_BOUND_SELF#fork_})"
+  else GATE_VEC="$GATE_VEC fork_bound=ok(procs=${FORK_PROCS:-?}/${FORK_MAX:-?})"; fi
+  if [ "${LANES_UNKNOWN:-0}" = "1" ]; then
+    GATE_WHY="${GATE_WHY:-lanes_unknown (the lane census could not be read -> do not add work)}"
+    GATE_VEC="$GATE_VEC lanes=UNKNOWN(the census could not be read)"
+  else GATE_VEC="$GATE_VEC lanes=$LANES/${MAX_LANES:-?}"; fi
+  if [ "$L" -ge "$MAX_LOAD" ]; then
+    GATE_WHY="${GATE_WHY:-load=$L>=max_load=$MAX_LOAD}"
+    GATE_VEC="$GATE_VEC load=REFUSE($L>=${MAX_LOAD:-?})"
+  else GATE_VEC="$GATE_VEC load=ok($L<${MAX_LOAD:-?})"; fi
   # ⛔ NO ELIGIBLE BOX ANYWHERE => NO NEW LANE ANYWHERE (measured placement, 2026-10-21). This arm is
   # reachable only when `cap_place` found a fleet with ZERO eligible boxes; it names the BOUND the
   # refusal hit (load_per_cpu / disk / memory / probe_stale / probe_unreadable / no_probe) so the
   # operator learns which resource to add, instead of reading a bare "skipped". A box that is merely
   # NOT the least-loaded one does NOT reach here — it is `place=<peer>`, which yields the item below
   # so the eligible box can actually take it (a refusal would strand it on a box that is fine).
-  elif [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
-    GATE_WHY="capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)"
+  if [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
+    GATE_WHY="${GATE_WHY:-capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)}"
+    GATE_VEC="$GATE_VEC placement=REFUSE(bound=${CAP_BOUND:-unknown} no-eligible-box)"
+  else GATE_VEC="$GATE_VEC placement=${CAP_PLACE:-${CAP_STATE:-unavailable}}"; fi
   # ⛔ THE CI-QUEUE ARM: deep (or UNKNOWN) => the ISSUE path is CLOSED, and that is the "prefer work
   # that does not need CI" rule made executable rather than advisory. Issue work opens NEW PRs, and
   # every new PR is another full CI pass queued behind the backlog; the PR sweep above already ran
@@ -5556,8 +5624,28 @@ PY
   # UNKNOWN defers too (fail closed): an unreadable queue is not an empty one, and a gh outage would
   # otherwise buy exactly the stampede on the one cycle the fleet could not see. The cache in
   # ci-queue.sh keeps that from firing on a transient error (it reports state=cache, with its age).
-  elif [ "${CIQ:-0}" = "1" ] && [ "${CIQ_RC:-1}" != "1" ]; then GATE_WHY="ci-queue($CIQ_VER)"
-  elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
+  # [ciq-arm:begin] (extracted and DRIVEN by ci-queue.test.sh (h6) — keep the markers)
+  if [ "${CIQ:-0}" = "1" ]; then
+    if [ "${CIQ_RC:-1}" != "1" ]; then
+      GATE_WHY="${GATE_WHY:-ci-queue($CIQ_VER)}"
+      GATE_VEC="$GATE_VEC ci-queue=REFUSE(${CIQ_VER:-unmeasured})"
+    else
+      # ⛔ THE QUEUE THAT WAS READ IS PRINTED EVEN WHEN IT PERMITS (#2927): an `ok` that hides the number
+      # it was derived from is the inference-as-measurement class this module exists to end, and on the
+      # idle line it is the difference between "the queue is fine" and "the queue is fine on 1 runner".
+      GATE_VEC="$GATE_VEC ci-queue=${CIQ_VER:-ok}"
+    fi
+  else GATE_VEC="$GATE_VEC ci-queue=UNMEASURED(the module is not available this cycle -> this arm is INERT)"; fi
+  # [ciq-arm:end]
+  if [ "$LANES" -ge "$MAX_LANES" ]; then
+    GATE_WHY="${GATE_WHY:-lanes=$LANES>=max_lanes=$MAX_LANES}"
+    GATE_VEC="$GATE_VEC lanes_full=$LANES>=${MAX_LANES:-?}(0 slots free)"
+  else
+    # ⛔ AN UNREADABLE CENSUS IS NOT "20 SLOTS FREE": the lanes token above already says UNKNOWN, and a
+    # slot count derived from a count nobody read would be the same inference-as-measurement defect.
+    if [ "${LANES_UNKNOWN:-0}" = "1" ]; then GATE_VEC="$GATE_VEC slots=UNKNOWN"
+    else GATE_VEC="$GATE_VEC slots=$(( ${MAX_LANES:-0} - ${LANES:-0} )) free of ${MAX_LANES:-?}"; fi
+  fi
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
   # box had 1.4 GB available RAM (53 MB free + 1297 MB inactive) and 20 of 20 lane slots idle:
@@ -5566,16 +5654,25 @@ PY
   # indistinguishable from "nothing to do".
   # Swap exhaustion only matters when RAM is ALSO tight, so require both. An UNKNOWN memory read
   # keeps the veto (fail closed) — never let a probe failure open the gate.
-  elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ] \
+  if [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ] \
        && { [ "${MEM_UNKNOWN:-0}" = "1" ] || [ "${MEMAVAIL_MB:-0}" -le "$(( MIN_MEM_FREE_MB * 2 ))" ]; }; then
-    GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M AND mem_avail=${MEMAVAIL_MB}M<=$(( MIN_MEM_FREE_MB * 2 ))M (both tight)"
+    GATE_WHY="${GATE_WHY:-swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M AND mem_avail=${MEMAVAIL_MB}M<=$(( MIN_MEM_FREE_MB * 2 ))M (both tight)}"
+    GATE_VEC="$GATE_VEC swap=REFUSE(swap_free=${SWFREE}M<=${MIN_SWAP_FREE:-600}M AND mem tight)"
+  else GATE_VEC="$GATE_VEC swap=ok(free=${SWFREE}M, min=${MIN_SWAP_FREE:-600}M)"; fi
   # "A failed probe is UNKNOWN, not ample" is only true if MEM_UNKNOWN can be SET, and it is set
   # from mem_avail_mb()'s EXIT STATUS (its awk `exit 1`s on absent fields) rather than from an empty
   # string: awk's END block always ran, so `printf "%d"` yielded 0 for unset fields and a test for
   # an empty MEMAVAIL_MB could never be true. The helper is therefore tested on its own, above.
-  elif [ "${MEM_UNKNOWN:-0}" = "1" ]; then GATE_WHY="mem_probe_failed (capacity unknown -> do not add work)"
-  elif [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then GATE_WHY="mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M"
+  if [ "${MEM_UNKNOWN:-0}" = "1" ]; then
+    GATE_WHY="${GATE_WHY:-mem_probe_failed (capacity unknown -> do not add work)}"
+    GATE_VEC="$GATE_VEC mem=UNKNOWN(the probe failed -> capacity unknown, do not add work)"
+  else
+    if [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then
+      GATE_WHY="${GATE_WHY:-mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M}"
+      GATE_VEC="$GATE_VEC mem=REFUSE(avail=${MEMAVAIL_MB}M<=min=${MIN_MEM_FREE_MB}M)"
+    else GATE_VEC="$GATE_VEC mem=ok(avail=${MEMAVAIL_MB}M>min=${MIN_MEM_FREE_MB}M)"; fi
   fi
+  # [gatevec:end]
   # ── THE FUNNEL: ONE AUDITABLE LINE PER CYCLE (owner ruling, 2026-10-18) ────────────────────
   # The choice between "work the PR queue" and "open more work" is printed, not inferred: the counts
   # it was made from, the PR it will take first, and — when the issue path is shut — WHY. Without
@@ -6288,6 +6385,12 @@ PY
     # [prtail:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
     _prtail="${_prtail}${_refsuf:-}"
     # [prtail:end]
+    # ⛔ THE GATE VECTOR RIDES THE GATE LINE (agent-infra#2924 indicator (a), #2927's owner-visible
+    # requirement). It is APPENDED, after every existing field, so every parser of this line keeps
+    # working unchanged and the reason a cycle idled is readable in one place instead of inferred from
+    # a single masking arm. Printed on the idle path only: a cycle that DISPATCHED has nothing to
+    # explain, and `GATE_VEC` describes refusals, not the work it did.
+    _prtail="${_prtail} | gates: ${GATE_VEC:-UNMEASURED}"
     dispatch_gate_line "$GATE_WHY" "${LANES_DISPLAY:-$LANES}" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
