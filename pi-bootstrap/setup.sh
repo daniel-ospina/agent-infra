@@ -543,11 +543,17 @@ fi
 # dispatcher at `scripts/orchestrator-harness/retired/queue_verdicts.py` (still importable from
 # there, which is what keeps the retired copy runnable as a record). A farmed file that no live step
 # execs is a dependency the farm delivers to nobody.
+# agent-infra#2834 farms bg-rescue-wip.sh: `run_agent` (`spawn-gate.sh`) now EXECS it on every terminal
+# transition, and resolves it from `$O`, the harness dir's parent, `$AGENT_INFRA_PATH/scripts` and
+# `~/.pi/agent/scripts` — THIS farm is the fourth of those. It is the only one that works on a box
+# whose `$O` is the flat `scripts/orchestrator-harness/*` payload (the file lives one directory ABOVE
+# that) and whose launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile):
+# without it every at-risk lane recorded `rescue=UNAVAILABLE`, i.e. the rescue was loud and inert.
 # agent-infra#2374 adds registry-sync.sh: `cloud-cell-bringup.sh` runs it (the farmed copy is the
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -610,7 +616,12 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
 # Mac that is strictly better than the pre-#2046 behaviour it replaces (every
 # class fail-closed with `timeout: command not found` while the pass completed).
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh)
+# #1187 adds `cmux_payload.py`: `orch-send.sh` (farmed above) resolves its payload-integrity
+# check as `$(dirname "${BASH_SOURCE[0]}")/lib/cmux_payload.py`. Farming the sender WITHOUT the
+# checker makes EVERY orchestrator dispatch REFUSE with `NOT SENT` (exit 7) and type nothing —
+# a fail-closed FALSE BLOCK on every lane order, which is the right direction and still a box that
+# cannot dispatch. Farm them together. (main meanwhile added `live-paths.sh`; both are carried.)
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0

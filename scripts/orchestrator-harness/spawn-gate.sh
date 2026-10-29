@@ -275,30 +275,50 @@ disk_low() { # disk_low <free-mb>
 # So ONE python lane's MARGINAL cost, on a cell whose shared uv cache is populated, is ~316 MB. Its
 # venv's `du` is ~18x that because 28,730 of its files are HARDLINKED into that cache (`nlink>1`):
 # those blocks are charged to the cache, not to the lane, and deleting the venv releases ~124 MB.
-# The gate therefore needs TWO facts, and shipping only the first is the false PASS in the state
+# The gate therefore needs THREE facts, and shipping only the first is the false PASS in the state
 # that fills a cell:
-#   * TREE (350 MB)     — the marginal cost of ONE more python lane while the shared store holds.
-#   * RESERVE (6144 MB) — the headroom a spawn must LEAVE FREE, because the sharing is not
-#     guaranteed: `pi-cache-reap.sh` prunes that cache under pressure, and `uv --link-mode=copy` or a
-#     cache on another mount both materialise the venv for real. Then one lane is `du` 5,625 MB of
-#     venv + 147 MB of checkout = 5,772 MB, rounded to 6 GiB — and a budget built on the 316 MB
-#     figure alone would admit exactly the spawns that filled cell-4.
+#   * TREE (350 MB) — the MARGINAL cost of ONE more python lane while the shared uv cache holds.
+#     This is what a lane costs, and it is what the ledger records; it is NOT what admission is
+#     bounded by (see SELF).
+#   * SELF (6144 MB) — the WORST CASE for the same lane, when the sharing is not guaranteed:
+#     `pi-cache-reap.sh` prunes that cache under pressure, and `uv --link-mode=copy` or a cache on
+#     another mount both materialise the venv for real. Then one lane is `du` 5,625 MB of venv +
+#     147 MB of checkout = 5,772 MB, rounded to 6 GiB. Admission is bounded by THIS, because the
+#     lane admitted on the strength of the reserve is exactly the lane that eats it.
+#   * RESERVE (2000 MB default = 4x the DISPATCH floor) — the headroom that must still be free AFTER
+#     that worst case. ⛔ IT IS COMPUTED FROM `DISK_MIN_FREE_MB`, NOT READ FROM `DISK_WARN_FREE_MB`
+#     (review round 3, P2). The two default to the same number, and the first version pointed at the
+#     WARN knob — which is a NOISE threshold an operator lowers to quiet the logs. Wiring an
+#     ENFORCEMENT bound to a diagnostic knob means silencing a warning silently loosens admission, and
+#     a change nobody would review as a capacity change would be one. They stay separate: 4x the
+#     dispatch floor is the guarantee this gate makes ("an admitted spawn cannot drop the cell below
+#     4x the dispatch floor"), and the band is how loudly that is reported.
 # ⛔ NOT ONE GLOBAL CONSTANT (#1852's recorded finding, reused): an agent-infra lane materialises
 # 48 MB and installs nothing, so a tortoise-sized floor would refuse every harness spawn on every
-# cell — a false BLOCK, which is its own defect class. The pair is derived from the TARGET: a
-# `uv.lock` in the gated path means a python lane. Both halves stay overridable for a cell whose
-# measurement differs (`DISK_LANE_TREE_MB` / `DISK_LANE_RESERVE_MB`) — but MEASURE THAT CELL with a
+# cell — a false BLOCK, which is its own defect class. `tree` and `self` are derived from the TARGET
+# (`python_target`: any of NINE package-manager markers — `uv.lock`, `pyproject.toml`,
+# `requirements.txt`, `poetry.lock`, `pdm.lock`, `Pipfile`, `setup.py`, … — at the top level or ONE
+# level down; `uv.lock` alone was a false PASS and is no longer the discriminator), and `reserve` from
+# the CELL's dispatch floor. All THREE stay overridable for a cell whose measurement differs
+# (`DISK_LANE_TREE_MB` / `DISK_LANE_SELF_MB` / `DISK_LANE_RESERVE_MB`) — but MEASURE THAT CELL with a
 # `df` used-delta (the recipe is in `docs/ops/disk-reaper.md`), never a guess: a guessed constant is
 # how this number was 7x wrong in the first place.
 #
-# THE ADMISSION RULE:  free_mb >= tree_mb + reserve_mb, read FRESH at every spawn. Because each
-# admitted spawn must leave the reserve untouched, N lanes can never eat the reserve one lane at a
-# time: the invariant is the one #2721 asks for (`lanes x tree < free - reserve`) without a lane
-# counter to drift out of step with reality — the free space already contains what the live lanes
-# spent. Evaluated per spawn, so a cell that drains frees slots by itself.
+# THE ADMISSION RULE:  free_mb >= max(tree_mb, self_mb) + reserve_mb, read FRESH at every spawn.
+# ⛔ `max(tree, self)` IS NOT A TYPO FOR `tree` (review round 1, P2 — the first version admitted on
+# `tree + reserve` and then said, in this same header, that a lane's worst case is 5,772 MB: the lane
+# admitted on the strength of a 6,144 MB reserve could consume 5,772 MB of it and leave ~700 MB, i.e.
+# BELOW the 2.2 GB cell-4 wedged at, while the comment claimed the reserve was untouched). With the
+# worst case in the predicate, an admitted lane can never do that, and because the reading is fresh at
+# EVERY spawn, N lanes still cannot eat the reserve one lane at a time: the invariant #2721 asks for
+# (`lanes x tree < free - reserve`) is enforced without a lane counter that can drift out of step
+# with reality — the free space already contains what the live lanes spent. Evaluated per spawn, so a
+# cell that drains frees slots by itself. On a healthy cell this admits one lane at a time until free
+# reaches `self + reserve`, which is the point: the LAST lane is the one that must still fit.
 # ⛔ THE UNREADABLE CASE FAILS OPEN, exactly as the floor's does and for the same reason: this runs in
 # a LIVE dispatch path, so a `df` that cannot answer must not stop every lane on the box for ever.
-# A READABLE reading below `tree + reserve` fails CLOSED, and the refusal is NAMED (`DISK-NOHEADROOM`)
+# A READABLE reading below `max(tree, self) + reserve` fails CLOSED, and the refusal is NAMED
+# (`DISK-NOHEADROOM`)
 # so an operator is never sent to a load remedy for a disk condition.
 #
 # ⛔ NO EXEMPTION BY `KIND`, DELIBERATELY — unlike the creation gate below. A `fixer`/`reviewer` there
@@ -306,27 +326,65 @@ disk_low() { # disk_low <free-mb>
 # a FRESH worktree for the PR it repairs, so a repair lane pays the same tree cost as a creation lane.
 # Exempting it would restore the hole this gate closes, and the exemption would be invisible.
 DISK_LANE_TREE_MB="${DISK_LANE_TREE_MB:-}"
+DISK_LANE_SELF_MB="${DISK_LANE_SELF_MB:-}"
 DISK_LANE_RESERVE_MB="${DISK_LANE_RESERVE_MB:-}"
 
-# disk_lane_costs <path> -> "<tree_mb> <reserve_mb>", MEASURED defaults derived from the target.
-# An EMPTY or non-numeric override is not an override: it derives, so a typo'd env cannot silently
-# turn the gate into "tree 0 + reserve 0" (admit always) — the inert-gate class the floor guards at
-# source time. An explicit `0` IS honoured: the test seam has to neutralise both halves in one place,
-# and an operator zeroing the reserve is making a stated choice.
-disk_lane_costs() { # disk_lane_costs <path>
-  local p="${1:-.}" tree reserve uv=0
-  [ -f "$p/uv.lock" ] && uv=1
-  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$uv" = 1 ]; then tree=350; else tree=64; fi
-  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; elif [ "$uv" = 1 ]; then reserve=6144; else reserve=1024; fi
-  printf '%s %s\n' "$tree" "$reserve"
+# python_target <path> — 0 when this path looks like a python project that will materialise a venv.
+# ⛔ `uv.lock` ALONE IS A FALSE PASS (review round 1, P2): `uv.lock` at the TOP LEVEL is only the
+# shape THIS repo's python lanes have. A pip/poetry/pdm project, a `requirements.txt` service, or a
+# monorepo whose lock sits in `backend/` all install ~5.7 GB of venv and would have derived the
+# 64MB harness pair, i.e. been admitted with 1.1 GB of headroom — exactly the class this gate
+# exists to close. The test is therefore "any package manager's marker, here or ONE level down",
+# and it fails toward the EXPENSIVE pair: over-estimating a harness lane's cost withholds a few
+# spawns on an almost-full cell, under-estimating a python lane's cost fills the cell.
+python_target() { # python_target <path>
+  local p="${1:-.}" f f2
+  # One level down (a monorepo whose installable project is a subdirectory) — BOUNDED, and globs
+  # only: this runs in the dispatch path, so it must never walk a tree.
+  # ⛔ THE SAME MARKER SET, NOT A SUBSET (review round 2, P2): the first version checked only
+  # uv.lock/pyproject.toml/requirements.txt one level down, so a `backend/poetry.lock` or a
+  # `backend/Pipfile` + `setup.py` service still derived the harness pair — the exact false pass this
+  # function exists to close, wearing DEPTH instead of the marker as its disguise.
+  for f in uv.lock poetry.lock pdm.lock Pipfile Pipfile.lock pyproject.toml setup.py setup.cfg requirements.txt; do
+    [ -e "$p/$f" ] && return 0
+    for f2 in "$p"/*/"$f"; do [ -e "$f2" ] && return 0; done
+  done
+  return 1
 }
 
-# disk_headroom_ok <free-mb> <tree-mb> <reserve-mb> — the ONE headroom predicate.
+# disk_lane_costs <path> -> "<tree_mb> <self_mb> <reserve_mb>", MEASURED defaults derived from the
+# target. An EMPTY or non-numeric override is not an override: it derives, so a typo'd env cannot
+# silently turn the gate into "0 + 0 + 0" (admit always) — the inert-gate class the floor guards at
+# source time. An explicit `0` IS honoured: the test seam neutralises all three in one place, and an
+# operator zeroing the reserve is making a stated choice.
+disk_lane_costs() { # disk_lane_costs <path>
+  local p="${1:-.}" tree self reserve py=0
+  python_target "$p" && py=1
+  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$py" = 1 ]; then tree=350; else tree=64; fi
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; elif [ "$py" = 1 ]; then self=6144; else self=64; fi
+  # 4x the DISPATCH floor — the same number the warn band defaults to, derived INDEPENDENTLY: the
+  # reserve is enforcement, the band is reporting, and an operator lowering the band to quiet logs must
+  # not be lowering admission with it (review round 3, P2).
+  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve=$(( 10#$DISK_MIN_FREE_MB * 4 )); fi
+  printf '%s %s %s\n' "$tree" "$self" "$reserve"
+}
+
+# disk_lane_need <tree-mb> <self-mb> <reserve-mb> -> the MB a spawn must find free.
+# `max(tree, self)`: a lane costs `tree` when the shared store holds and `self` when it does not, and
+# admission must survive the second. Integer-only, and total for any input (`disk_lane_costs` always
+# prints three integers), so the predicate cannot fail into a "not a number" comparison.
+disk_lane_need() { # disk_lane_need <tree-mb> <self-mb> <reserve-mb>
+  local tree="${1:-0}" self="${2:-0}" reserve="${3:-0}" worst
+  if [ "$tree" -gt "$self" ]; then worst="$tree"; else worst="$self"; fi
+  printf '%s\n' "$(( worst + reserve ))"
+}
+
+# disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-mb> — the ONE headroom predicate.
 # Same unreadable polarity as disk_ok/disk_low: a reading we cannot take is not evidence of pressure.
-disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <reserve-mb>
-  local mb="${1:-}" tree="${2:-0}" reserve="${3:-0}"
+disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-mb>
+  local mb="${1:-}"
   disk_readable "$mb" || return 0
-  [ "$mb" -ge "$(( tree + reserve ))" ]
+  [ "$mb" -ge "$(disk_lane_need "${2:-0}" "${3:-0}" "${4:-0}")" ]
 }
 
 # 1-min load average, integer. Empty when the probe fails (see can_spawn).
@@ -1012,6 +1070,381 @@ cap_wip_snapshot() {
   return 1
 }
 
+# ── THE EXIT PATH: a lane that ENDS preserves its work too, not only one that is KILLED (#2834) ──
+# ⛔ THE MEASUREMENT (#2834). `cap_wip_snapshot` above fires on ONE termination path — the wall-clock
+# cap — and that path is not the common one. On a single fleet session of 373 dispatched lanes,
+# `hit its … cap` appeared in ZERO lane logs, and 148 of those 373 worktrees were left holding
+# uncommitted or unpushed work. So the cap-kill data-loss mechanism (#2045) was fixed and THE
+# COMMONER ONE WAS NOT: a lane that finishes its turn, stops at a gate, or decides to restart simply
+# ends, and nothing ever looked at its tree. The failure is silent in exactly the #2045 shape — the
+# report says the lane is IN PROGRESS, the branch has no new commit, and the only copy of the work is
+# a scratch worktree a reaper will eventually remove.
+#
+# ⛔ THE SHIPPED `scripts/bg-rescue-wip.sh` (#2045) WAS WIRED TO *NOTHING* IN THIS REPO. Its contract
+# is the one that actually survives a reaped worktree — a commit under `refs/wip/<slug>` ON ORIGIN,
+# built through a throwaway index with `commit-tree` (never `git stash`, whose ref is repo-global and
+# whose `pop` silently drops a PEER lane's entry). The operator copy was called only from an
+# unshipped `bg-dispatch.sh`, and the operator's own copy of that call was a SILENT NO-OP for a whole
+# session: `cd "$WT"` ran before `_HERE` was resolved from a RELATIVE `BASH_SOURCE`, so every call
+# named `<worktree>/bg-rescue-wip.sh`, and `[ -f … ] && bash …` degenerated to `false`. Both halves of
+# this leg are therefore load-bearing: the CALL here, and the LOUD line when the script cannot be
+# found (a missing rescuer must never read as "nothing to rescue" — that is the same silent skip one
+# layer down, and it is what let 148 dirty worktrees accumulate while a rescue "existed").
+#
+# ⛔ WHY HERE, AT THE END OF `run_agent`, AND NOT IN EACH LAUNCHER. `lane.sh`, `fix-one.sh` and
+# `nonblocking-dispatch.sh` are three entry points with three exit paths and three report formats;
+# `merge-one.sh` has a fourth `run_agent` of its own. At the END of this `run_agent` "the agent has
+# stopped" is KNOWN (the hard kill, if any, has already landed), so every CALLER OF THIS FUNCTION
+# gets the guarantee by construction — the same argument #1932 used to put the venv teardown beside
+# the spawn. A launcher that adds its own copy would be the `fourth launch path` this file's census
+# exists to refuse. ⛔ It does NOT reach `merge-one.sh`'s copy, whose agent is a reviewer that lands a
+# comment and a signed record rather than worktree work: that residual is named in
+# `docs/ops/lane-signal-forensics.md` and is unchanged here — the guarantee is per-function, not a
+# claim about every `run_agent`-shaped loop in the tree.
+#
+# ⛔ THE ROOT IS `WIP_PATH`, THEN `$PWD` — NEVER A GUESS. `fix-one.sh` `cd`s into the MAIN checkout and
+# only NAMES the fixer's worktree in the agent's prompt, so `$PWD` there is NOT the tree the work is in;
+# it already sets `WIP_PATH="$WT"` for the cap snapshot, for exactly this reason. Archiving the main
+# checkout instead would be worse than no rescue: it would report a capture the lane never received,
+# and it would push a ref of a tree nobody was working in. ⛔ What is ENFORCED here is the PRECEDENCE
+# (arm H: a valid `WIP_PATH` wins over a dirty `$PWD`) plus the root rule below; a caller that sets
+# NEITHER and happens to sit at the ROOT of another checkout is a worktree root too and cannot be told
+# apart by any predicate in this function — so that residual is RECORDED, not refused: field 9 of the
+# `lane-end.tsv` row names the tree that was measured, which is what makes a wrong-tree archive visible
+# in the aggregate surface. The claim is narrowed to what the code does, because a comment that promises
+# a prevention it cannot make is how the next reader trusts a guard that is not there.
+#
+# ⛔ THREE VERDICTS, AND `cannot-verify` IS NOT `clean`. A `git status` that cannot run (corrupt
+# index, ENOSPC, EACCES, safe.directory) is CANNOT-VERIFY — the repo's own ruling for this call, and
+# the reason the pre-check is fail-closed rather than a `[ -z "$(git status)" ]` one-liner. ⛔ IT ALSO
+# COVERS A STATUS THAT *SUCCEEDS* WHILE WARNING: `--porcelain` exits 0 with EMPTY stdout when it
+# cannot read a directory, so "rc=0 and no output" is not the same measurement as "nothing changed".
+# The warnings on stderr are the only signal that the listing was incomplete, which is why they are
+# captured below instead of discarded — see the `st_noise` note in the pre-check.
+#
+# ⛔ UNPUSHED COMMITS ARE MEASURED, AND DELIBERATELY NOT ARCHIVED HERE. #2834 asks for "a dirty tree
+# OR unpushed commits"; the exit path meets the DIRTY half and RECORDS the other rather than rescuing
+# it. ⛔ THE REASON IS THE CALLEE'S CONTRACT, NOT BRANCH SAFETY (review P2, round 5, PR #2975). An
+# earlier version of this note argued that pushing would "move a branch" — it would not:
+# `bg-rescue-wip.sh` builds its archive with `commit-tree` and pushes `refs/wip/<slug>`, which is NOT a
+# branch and is pushed without force (`:283-296`). The real binding constraint is the callee's own
+# `AT_RISK` rule (`bg-rescue-wip.sh:150-166`): it archives only a NON-EMPTY `git status`, so a
+# clean-but-unpushed tree makes it `exit 0` having done nothing, and it never considers `HEAD`'s own
+# commits. Teaching it to archive `HEAD`'s tree when the tree is clean is a change to the SHIPPED
+# tool's contract (and to what "a rescue" means), deliberately not made in this PR — so ask 1 stays
+# half-met here, and that is stated rather than implied. What the exit path owes in this case is that
+# the fact stops being silent, so it is MEASURED and NAMED: a branch's commits live in the repo's own
+# object database and survive the WORKTREE being removed, so the residual risk is the BRANCH being
+# deleted — a different defect with a different fix, and it is not claimed here.
+#
+# ⛔ IT RUNS ON THE CAP PATH TOO. The cap snapshot is LOCAL (`$O/wip/capwip-*`, on the box that may be
+# about to be reaped or wiped); the ref is off-box. #2834's ask 1 says the timeout watcher keeps its
+# own call and that a double rescue is harmless (it accumulates onto the previous archive commit).
+#
+# ⛔ AND IT COSTS A NETWORK CALL ONLY WHEN THERE IS SOMETHING TO SAVE. The majority of lanes end with a
+# clean tree; the pre-check below is one `git status` and one `rev-list`, and the rescue (whose own
+# network calls are internally bounded: 25 s fetch, 45 s push) is reached only for a tree that is
+# dirty or unreadable. A per-lane push for every clean lane would be a rate-limit defect of its own, on
+# an account 22 concurrent landers already share.
+LANE_END_TREE=""        # dirty | clean | unpushed-only | cannot-verify | not-a-worktree | not-measured
+LANE_END_RESCUE=""      # refs/wip/<slug> | archived-local | nothing | FAILED | UNAVAILABLE | DISABLED
+LANE_END_REF=""         # the LOCAL refs/wip-local pin; empty over an archive only when the callee could not write it
+LANE_END_UNPUSHED=0     # commits on this branch that exist only locally — NAMED, never pushed (above)
+LANE_END_ROOT=""        # the tree that was MEASURED — the only column that can expose a wrong-tree archive
+LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
+
+# wip_rescue_path — resolve scripts/bg-rescue-wip.sh the way the other helpers are resolved. `$O` is
+# seeded FILE BY FILE, so a new spawn-gate.sh can run beside an `$O` that predates the rescue; the
+# harness dir's parent (the repo's `scripts/`) is the second home, and the two farmed copies are last
+# so an operator's install wins. ⛔ THE FARMED HOME IS NOT OPTIONAL ON A FLAT `$O` (review F3, round 3):
+# the `$O` payload is `scripts/orchestrator-harness/*` only (§4's `cp …/orchestrator-harness/*.sh`,
+# `deploy-harness.sh --src`), and this file lives one directory ABOVE that — so on a box whose
+# launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile) all four homes missed
+# and every at-risk lane recorded `UNAVAILABLE`: loud, but the archive never happened. `setup.sh`'s
+# farm now delivers `bg-rescue-wip.sh` to `~/.pi/agent/scripts/`, the fourth home below.
+wip_rescue_path() {
+  local c here
+  if [ -n "$LANE_WIP_RESCUE_SH" ]; then printf '%s\n' "$LANE_WIP_RESCUE_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+  for c in "${O:-}/bg-rescue-wip.sh" "$here/bg-rescue-wip.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/bg-rescue-wip.sh" \
+           "${HOME:-}/.pi/agent/scripts/bg-rescue-wip.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    LANE_WIP_RESCUE_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+# lane_end_record <label> <rc> <cap> — ONE writer for the terminal ledger, on EVERY terminal path.
+#
+# ⛔ WHY THIS IS A FUNCTION AND NOT THE TAIL OF `terminal_wip_rescue` (review F1, PR #2975). Two paths
+# return BEFORE the measurement — the operator hatch (`WIP_RESCUE_DISABLE=1`) and a mis-pointed root
+# (`tree=not-a-worktree`) — and both used to return with the fields set and NO row, while this file
+# and the README both claim "one row per terminal, on every path". Both are paths on which nothing was
+# MEASURED, so an absent row was indistinguishable from a lane that never ended — and `not-measured`
+# is the same shape from the other side: a hatch that blanks the ledger reads as a lane that vanished.
+# Routing every path through one writer makes the invariant structural instead of a comment two of
+# three paths ignored; `wip-rescue-exit.test.sh` drives both paths and reads the row, so a fourth path
+# that forgets is a red suite and not a quiet gap.
+#
+# ⛔ FIELD 9 IS THE ROOT THAT WAS MEASURED, AND IT IS THE ONLY SURFACE THAT CAN SHOW A WRONG TREE
+# (review P2, round 4, PR #2975). The root guard below refuses a path that is not the ROOT of a
+# worktree — but `fix-one.sh`'s own hazard, a caller that omits `WIP_PATH` while its cwd is the MAIN
+# checkout, is a worktree root too, so no predicate in this function can tell the two apart. Rather
+# than claim a prevention it cannot make, the row NAMES the tree it measured (and the log line already
+# does), so a wrong-tree archive is visible in the aggregate surface instead of only in one lane's log.
+lane_end_record() {
+  local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" o_root root_col
+  o_root="${O:-${HOME:-$PWD}/orchestrator}"
+  # A tab or newline in the path would shift every later column, so the field is flattened — the row is
+  # a fixed-arity TSV and a consumer reading $5/$6 must never be handed a path fragment.
+  root_col="$(printf '%s' "${LANE_END_ROOT:-}" | tr '\t\n' '  ')"
+  mkdir -p "$o_root/state" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$rc" "$cap" \
+    "$LANE_END_TREE" "$LANE_END_RESCUE" "${LANE_END_REF:-}" "${LANE_END_UNPUSHED:-0}" "$root_col" \
+    >> "$o_root/state/lane-end.tsv" 2>/dev/null
+  return 0
+}
+
+# terminal_wip_rescue <label> <rc> <cap-hit> <logfile>
+# Sets LANE_END_TREE / LANE_END_RESCUE / LANE_END_REF / LANE_END_UNPUSHED, appends the terminal record
+# to `state/lane-end.tsv` and writes the human line into the agent's log. Returns 0 always (a rescue
+# must never change the lane's exit status — the lane's work and its status are different facts).
+terminal_wip_rescue() {
+  local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
+  local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 unpushed_ok=1 unpushed_col=0 at_risk=0 l local_ref=""
+  local local_ref_before="" local_ref_after=""
+  local st_errf="" st_noise=0 st_note="" cv_status=0 root_top root_real root_top_real why=""
+  root="${WIP_PATH:-$PWD}"
+  LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0; LANE_END_ROOT="$root"
+  if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
+    LANE_END_TREE="not-measured"; LANE_END_RESCUE="DISABLED"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=not-measured rescue=DISABLED — WIP_RESCUE_DISABLE=1 (an operator escape hatch, not a default): the tree at $root was NOT examined, so this lane's uncommitted work (if any) is on this disk only" >> "$log" 2>/dev/null || true
+    lane_end_record "$label" "$rc" "$cap"
+    return 0
+  fi
+  # ⛔ THE ROOT RULE IS THE CALLEE'S OWN, NOT A WEAKER ONE (review P2, round 4, PR #2975). The guard
+  # used to be `rev-parse --git-dir`, which SUCCEEDS ANYWHERE INSIDE A REPOSITORY — a subdirectory
+  # included — so it ratified a root that this code then MEASURED and handed to `bg-rescue-wip.sh`,
+  # which refuses it one layer down at its own `:96-103` (`--show-toplevel` ≠ `pwd -P`) and returns
+  # `rescue=FAILED`. So the pre-check could not tell a lane's worktree from a corner of one, and the
+  # fleet's record said the RESCUE failed rather than the POINTER. This is the same lesson as the
+  # `st_noise` fix above and as `cap_wip_snapshot` (#2045): the gate that decides whether the
+  # measurement means anything cannot be the weakest of the three. Same predicate as the callee,
+  # expressed once here, so the verdicts line up instead of contradicting.
+  root_top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)"
+  root_real="$(cd "$root" 2>/dev/null && pwd -P)"
+  root_top_real="$([ -n "$root_top" ] && cd "$root_top" 2>/dev/null && pwd -P)"
+  if [ -z "$root_real" ]; then why="that path is not a directory this process can read"
+  elif [ -z "$root_top" ]; then why="it is not inside a git repository at all"
+  elif [ -z "$root_top_real" ]; then why="the repository root ($root_top) could not be resolved to a directory"
+  elif [ "$root_real" != "$root_top_real" ]; then why="that path is inside the worktree at $root_top, not its root"
+  fi
+  if [ -n "$why" ]; then
+    LANE_END_TREE="not-a-worktree"; LANE_END_RESCUE="UNAVAILABLE"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=not-a-worktree rescue=UNAVAILABLE — $root is not the ROOT of a git worktree ($why), so a rescue cannot be pointed at it. If this lane's work lives elsewhere, the caller must pass WIP_PATH=<that worktree> (fix-one.sh does); nothing was examined here and this line is NOT a verdict that the worktree was clean" >> "$log"
+    lane_end_record "$label" "$rc" "$cap"
+    return 0
+  fi
+  # ── one read, and it must be able to FAIL ────────────────────────────────────────────────────
+  # ⛔ STDERR IS THE ONLY SIGNAL THAT THE LISTING WAS INCOMPLETE (review P1, round 2, PR #2975).
+  # `git status --porcelain -uall` EXITS 0 WITH EMPTY STDOUT when it cannot read a directory, and
+  # says why on stderr. Reproduced against this file's own pre-check: a MODIFIED TRACKED file inside a
+  # `chmod 000` directory yields `rc=0 out=[]` plus `warning: could not open directory 'sub/':
+  # Permission denied`. With stderr discarded that is the CLEAN verdict — the one answer this leg must
+  # never give: the rescue is never called, and `state/lane-end.tsv` records `tree=clean rescue=nothing`
+  # over work that was never enumerated, i.e. an affirmative safety claim where an absence would at
+  # least be honest. The rule is not new here: `cap_wip_snapshot` (#2045) implements it 300 lines above
+  # (`st_noise`, and `st_rc -eq 0 && st_noise -eq 0 || st_ok=0`), and `bg-rescue-wip.sh` §2 carries it
+  # as `INCOMPLETE_RE`. The pre-check is the gate that decides whether that callee runs AT ALL, so it
+  # cannot be the weakest of the three: any stderr content means CANNOT-VERIFY, and the callee — which
+  # owns the finer `INCOMPLETE_RE` judgement of what to archive — gets to run and decide.
+  st_errf="$(mktemp "${TMPDIR:-/tmp}/lane-end-se.XXXXXX" 2>/dev/null)"
+  if [ -n "$st_errf" ]; then
+    st_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$root" status --porcelain -uall 2>"$st_errf")"; st_rc=$?
+    # ⛔ `grep -c` EXITS 1 WHEN IT SELECTS NOTHING — which is the HEALTHY case, since a complete
+    # enumeration warns about nothing. Only "could not run" (>=2) or an unparseable count is a
+    # failure; reading exit 1 as one made COMPLETE unreachable in `cap_wip_snapshot` (VGATE cycle 11)
+    # and would make every clean lane here report cannot-verify.
+    st_noise="$(grep -c . "$st_errf" 2>/dev/null)"; local _g=$?
+    if [ "$_g" -gt 1 ] || [ -z "$st_noise" ]; then st_rc=1; st_noise=0; fi
+    # The parenthetical this line carries must be a READING that was taken. `st_note` is built only on
+    # the branch that actually ran `git status`, so the no-temp branch below cannot print numbers for a
+    # command that never executed (review P2, round 6, PR #2975).
+    st_note="git status rc=$st_rc, ${st_noise:-0} stderr line(s)"
+    rm -f "$st_errf"
+  else
+    # No temp file means no place for the warnings to land, so their absence cannot be read as "none"
+    # — the same fail-closed reasoning as an unreadable ledger, never a silent clean.
+    st_out=""; st_rc=1
+    st_note="NO status reading was taken — \`mktemp\` could not create a temp file under ${TMPDIR:-/tmp}, so git status's stderr had nowhere to land (fix TMPDIR; do not go looking at git)"
+  fi
+  # ⛔ A FAILED `rev-list` IS NOT A MEASURED ZERO (review P2, round 6, PR #2975). The count was read as
+  # `rev-list … || 0`, so a measurement that returned NOTHING — a promisor/partial clone that cannot
+  # read the objects, a corrupt odb, a box under the exact pressure this rescue exists for — landed as
+  # `unpushed=0`, and the verdict below then fell through to `tree=clean` over a lane that may hold
+  # commits only locally. `0` has to mean "measured zero", so the read is TRACKED like `head_ok`: on a
+  # FAILED read the verdict is `cannot-verify` (fail-closed) and the column says `?` rather than "0".
+  # An unborn HEAD is the one case where 0 IS measured: there is no commit that could be unpushed.
+  head_ok=0
+  git -C "$root" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ok=1
+  unpushed_ok=1
+  if [ "$head_ok" = 1 ]; then
+    if unpushed="$(git -C "$root" rev-list --count HEAD --not --remotes 2>/dev/null)" && is_num "${unpushed:-}"; then
+      :
+    else
+      unpushed=0; unpushed_ok=0
+    fi
+  fi
+  # The COLUMN distinguishes "measured 0" from "could not be read"; the arithmetic below uses the number.
+  LANE_END_UNPUSHED="$unpushed"; [ "$unpushed_ok" = 1 ] || LANE_END_UNPUSHED="?"
+  unpushed_col="$LANE_END_UNPUSHED"
+  if [ "$st_rc" -ne 0 ]; then
+    LANE_END_TREE="cannot-verify"; at_risk=1; cv_status=1
+  elif [ -n "$st_out" ]; then
+    # A listing that DID name dirty paths is the stronger fact, whether or not it also warned: the
+    # rescue runs either way, and `dirty` is what was actually measured. `cannot-verify` is reserved
+    # for the case where the listing is EMPTY and we cannot prove it is complete.
+    LANE_END_TREE="dirty"; at_risk=1
+  elif [ "${st_noise:-0}" -gt 0 ]; then
+    LANE_END_TREE="cannot-verify"; at_risk=1; cv_status=1
+  elif [ "$unpushed_ok" != 1 ]; then
+    # The listing is complete, but the OTHER half of the measurement failed — so the tree is not
+    # certified clean just because `git status` was quiet. Same verdict, different cause, and the
+    # line below says which (the status-specific wording would be a lie here).
+    LANE_END_TREE="cannot-verify"; at_risk=1
+  elif [ "$unpushed" -gt 0 ] 2>/dev/null; then
+    LANE_END_TREE="unpushed-only"
+  else
+    LANE_END_TREE="clean"
+  fi
+  if [ "$cv_status" = 1 ]; then
+    echo "[wip] ⛔ label=$label: the worktree listing at $root is INCOMPLETE ($st_note) — an EMPTY listing does NOT mean clean, so this is NOT a clean verdict. The rescue is attempted on what could be read rather than skipped, because 'no output' and 'nothing changed' are different measurements (a chmod'ed directory, an extract owned by another user, a corrupt index)" >> "$log"
+  elif [ "$LANE_END_TREE" = "cannot-verify" ]; then
+    # ⛔ THE OTHER CAUSE, NAMED SEPARATELY: `git status` was complete and quiet, and the UNPUSHED count
+    # could not be read. Reporting the status wording here would send an operator to the wrong command.
+    echo "[wip] ⛔ label=$label: the worktree at $root has a COMPLETE, EMPTY listing, but the unpushed-commit count could NOT be read (\`git rev-list --count HEAD --not --remotes\` returned nothing — a partial/promisor clone, a corrupt odb, or a permission problem). '0 unpushed' would be a measurement this run did not make, so this is NOT a clean verdict and the rescue is attempted" >> "$log"
+  fi
+  br="$(git -C "$root" branch --show-current 2>/dev/null)"
+  [ -n "$br" ] || br="detached-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unborn)"
+  slug="$(printf '%s' "$br" | tr '/' '-')"
+  if [ "$at_risk" -eq 0 ]; then
+    LANE_END_RESCUE="nothing"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=nothing unpushed=$unpushed_col ref=<none> — the worktree at $root holds no uncommitted work IN THE PATHS GIT DOES NOT IGNORE, so no uncommitted work was lost there and no rescue was attempted (⛔ files git IGNORES are not measured by this check: a lane whose only copy of its work is an ignored file reads clean here — the same class #2045's cap path inherits, and it is named rather than implied)" >> "$log"
+    if [ "$unpushed" -gt 0 ] 2>/dev/null; then
+      echo "[wip] NOTE label=$label: $unpushed commit(s) on $br exist ONLY locally. bg-rescue-wip.sh archives UNCOMMITTED work by design and does not push a branch, so they were not pushed. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log"
+    fi
+  else
+    if ! out="$(wip_rescue_path)"; then
+      LANE_END_RESCUE="UNAVAILABLE"
+      echo "[wip] ⛔ end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=UNAVAILABLE — the worktree at $root has work that is NOT archived and bg-rescue-wip.sh was NOT FOUND (looked in \$O, the harness dir, \$AGENT_INFRA_PATH/scripts and ~/.pi/agent/scripts). That work is on this disk ONLY and is lost if the worktree is reaped. This line exists because a MISSING rescuer used to be a silent skip (see the #2834 note above), which is how dirty worktrees accumulated while a rescue 'existed'" >> "$log"
+    else
+      case "$cap" in
+        1) note="lane hit its cap (rc=$rc)" ;;
+        *) note="lane ended before its cap (rc=$rc)" ;;
+      esac
+      # Output is CAPTURED and replayed rather than streamed, so a partial write cannot interleave on
+      # the lane's own log, and so the verdict below follows the SHIPPED script's exit status rather
+      # than a grep of prose it might change.
+      # ⛔ THE REF MUST BE *THIS RUN'S*, AND `refs/wip-local/<slug>` IS NOT PER-RUN (review F1, round 3).
+      # It lands in the repo's COMMON git dir (a ref written from one linked worktree is visible from
+      # every other), it is keyed by branch slug alone, and bg-rescue-wip.sh never removes it. So an
+      # EARLIER rescue of the same slug — an earlier `run_agent` for this lane, or a PEER lane on a
+      # reused branch (the case named in the header) — survives a run that archives NOTHING:
+      # `bg-rescue-wip.sh:62` exits 2 at `mktemp` and `:156-161` exits 0 on "nothing at risk", both
+      # BEFORE `:247`'s update-ref. Treating mere EXISTENCE as proof made the record say "this
+      # worktree's work IS archived and pinned" over work that is still single-copy — the full-disk
+      # path, which is exactly where the rescue matters most. So read it BEFORE, read it AFTER, and
+      # only a CHANGED sha counts as an archive this run produced.
+      local_ref_before="$(git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" 2>/dev/null)"
+      outf="$(mktemp "${TMPDIR:-/tmp}/wip-exit.XXXXXX" 2>/dev/null)"
+      if [ -n "$outf" ]; then
+        bash "$out" "$root" "$note" > "$outf" 2>&1; rc2=$?
+        if [ -s "$outf" ]; then
+          while IFS= read -r l; do printf '[wip]   %s\n' "$l" >> "$log"; done < "$outf"
+        fi
+        rm -f "$outf"
+      else
+        bash "$out" "$root" "$note" >> "$log" 2>&1; rc2=$?
+      fi
+      # ── the archive commit is read UNCONDITIONALLY (review F2, PR #2975) ─────────────────────────
+      # `refs/wip-local/<slug>` is written by bg-rescue-wip.sh under a CHECKED update-ref (so the sha
+      # below is a ref that exists, not a claim), and it is readable without a network round trip.
+      # Reading it only when rc2 = 0 collapsed THREE callee outcomes into `FAILED` with an EMPTY ref,
+      # and two of those three leave a real archive behind:
+      #   * `bg-rescue-wip.sh:363-367` — PUSHED=1 and a partial listing: the commit IS on origin under
+      #     `refs/wip/<slug>`; the skipped paths are what stays local. Reported as "could not archive/
+      #     push" (false) with no ref in the ledger — a pushed ref hidden from the fleet record.
+      #   * `:384-396` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
+      #     callee prints the sha, so the ONE pointer to the archived commit was neither shown nor
+      #     recorded, while the line claimed the work was only at $root.
+      # So: a ref THIS RUN wrote + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box
+      # push UNCONFIRMED) — which is neither `FAILED` (nothing archived) nor `refs/wip/<slug>` (a push
+      # this code cannot see without a network call it deliberately does not make). `FAILED` keeps its
+      # only honest meaning: the callee failed AND no new ref pins anything.
+      # ⛔ AN UNCHANGED sha is a STALE snapshot of an earlier rescue, not this lane's work: it is named
+      # in FAILED's line and never promoted to a ref column. (The one case where a real archive could
+      # reuse a sha — same tree, same note, same SECOND — under-claims as "nothing", which is the safe
+      # direction: the ref still exists, and the replayed callee lines above show what happened.)
+      local_ref_after="$(git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" 2>/dev/null)"
+      if [ -n "$local_ref_after" ] && [ "$local_ref_after" != "$local_ref_before" ]; then
+        local_ref="refs/wip-local/$slug@$(git -C "$root" rev-parse --short "refs/wip-local/$slug" 2>/dev/null)"
+      fi
+      if [ "$rc2" -eq 0 ] && [ -n "$local_ref" ]; then
+        LANE_END_REF="$local_ref"; LANE_END_RESCUE="refs/wip/$slug"
+      elif [ "$rc2" -eq 0 ] && [ "$LANE_END_TREE" = "dirty" ]; then
+        # ⛔ rc2=0 DOES NOT PROVE THE CALLEE ARCHIVED NOTHING (review P2, round 5, PR #2975). Exit 0 has
+        # TWO disjoint causes: "nothing at risk" (`bg-rescue-wip.sh:157-161`, reached BEFORE any
+        # archive) and "PUSHED=1 with no skipped paths" (`:362-368`) — and the second one is reached
+        # even when the LOCAL pin failed, because the pin is GUARDED (`:246-252` prints `⚠ could not
+        # record refs/wip-local/<slug>` and carries on). So on a `dirty` tree, whose non-empty listing
+        # proves the callee's own `AT_RISK` was 1, rc2=0 means the archive IS on origin. Recording
+        # `nothing` there published "nothing needed saving" over work that is on origin, and made the
+        # `ref` column empty over an archive that exists — the mirror of the `archived-local` arm one
+        # branch down, and under-claiming in the same lie.
+        LANE_END_RESCUE="refs/wip/$slug"
+      elif [ "$rc2" -eq 0 ]; then
+        # Everywhere else the callee may legitimately have found nothing at risk (a `clean` or
+        # `cannot-verify` tree produced no non-empty listing for it), so claiming a pushed ref here
+        # would be a push this code never saw.
+        LANE_END_RESCUE="nothing"
+      elif [ -n "$local_ref" ]; then
+        LANE_END_REF="$local_ref"; LANE_END_RESCUE="archived-local"
+      else
+        LANE_END_RESCUE="FAILED"
+      fi
+      echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed_col ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
+      if [ "$LANE_END_RESCUE" = "FAILED" ]; then
+        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref this run wrote pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+        if [ -n "$local_ref_before" ]; then
+          echo "[wip] ⛔ label=$label: NOTE — refs/wip-local/$slug@$local_ref_before still exists, but it was written by an EARLIER rescue of this branch and this run did NOT update it. That snapshot may PREDATE the work now in the tree; do not read it as covering this lane" >> "$log"
+        fi
+      elif [ "$LANE_END_RESCUE" = "refs/wip/$slug" ] && [ -z "$LANE_END_REF" ]; then
+        # The pushed-archive-with-no-local-pin case above, said out loud: the ledger's `ref` column is
+        # EMPTY here over an archive that DOES exist, so a reader must not take an empty ref as "nothing
+        # was archived" — the replayed `⚠ could not record refs/wip-local/…` line names the cause.
+        echo "[wip] ⛔ label=$label: the rescue PUSHED this worktree's archive to origin refs/wip/$slug (bg-rescue-wip.sh exit 0) but could not write its LOCAL pin refs/wip-local/$slug — see the ⚠ line replayed above (a D/F conflict, a stale .lock, ENOSPC). The ref column of this lane's row is therefore EMPTY over an archive that EXISTS; origin refs/wip/$slug is the copy to retrieve before this worktree is reaped" >> "$log"
+      elif [ "$LANE_END_RESCUE" = "nothing" ] && [ "$LANE_END_TREE" = "cannot-verify" ]; then
+        # ⛔ rc2=0 with an INCOMPLETE listing is NOT "the tree was clean": the callee found nothing at
+        # risk in the paths IT could read, while this run could not certify that it saw all of them.
+        # Said out loud because `rescue=nothing` reads as a safety claim everywhere else in this file.
+        echo "[wip] ⛔ label=$label: the rescue ran and found nothing at risk in the paths it could read, BUT this worktree's listing was INCOMPLETE (see the line above) — read 'rescue=nothing' here as 'the rescue did not certify this tree', NOT as 'the tree was clean'. Do not reap this worktree on the strength of this row" >> "$log"
+      elif [ "$LANE_END_RESCUE" = "archived-local" ]; then
+        echo "[wip] ⛔ label=$label: the rescue did NOT finish cleanly (bg-rescue-wip.sh exit $rc2) BUT this worktree's work IS archived and pinned at $LANE_END_REF. bg-rescue-wip.sh exits 2 both for a PARTIAL archive (the ref WAS pushed to origin; the skipped paths are what stays local) and for a push that failed (the local ref is still valid), so read the replayed lines above for which one this was — this line does not guess. Do NOT reap this worktree before retrieving it" >> "$log"
+      fi
+    fi
+  fi
+  # The append-only ledger, beside capwip.tsv: "the lane finished" and "the lane vanished" used to
+  # read identically in `bg/dispatch.log`, which records only the START. One row per terminal, on
+  # every path — the same rule cap_wip_record follows, for the same reason (an absence must not be the
+  # only signal). ⛔ The TWO early paths above write through this same writer, so "every path" is one
+  # function's invariant rather than three call sites that have to agree.
+  lane_end_record "$label" "$rc" "$cap"
+  return 0
+}
+
 # ── the lane LIFETIME bound (2026-10-27) ────────────────────────────────────────────────────────
 # THE WALL CLOCK WAS THE ONLY AXIS, AND IT CANNOT TELL SLOW FROM STALLED. Measured 2026-10-27: nine
 # lanes across two cloud cells parked with 0 bytes of output and `00:00:00` CPU, the oldest for
@@ -1041,6 +1474,38 @@ lane_bound_path() {
            "${HOME:-}/.pi/agent/scripts/lane-bound.sh"; do
     [ -n "$c" ] && [ -f "$c" ] || continue
     LANE_BOUND_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+# ── the capability gate's script, resolved the same way `lane-bound.sh` is ───────────────────────
+# ⛔ A SEPARATE LOOKUP, NOT A SECOND CONVENTION: same candidate set in the same order, so a box that
+# can find one helper can find the other, and `$O` (deployed) still wins over the checkout.
+# ⛔ THE CACHE IS INITIALISED AT MODULE SCOPE, EXACTLY LIKE `LANE_BOUND_SH` ABOVE — and that is not
+# tidiness. Without it the resolver's first statement reads an unbound variable under `set -u` (line
+# 62), the abort propagates OUT of the `$(cell_preflight_path)` command substitution, the `if` takes
+# its else branch, and `run_agent` logs "cell-lane-preflight.sh not found" — with the helper sitting
+# right there — and LAUNCHES the agent ungated on every spawn, on every box. That is the no-op-gate /
+# fail-open shape this file is written against, and it was measured on the first cut of this gate:
+# `( . ./spawn-gate.sh; cell_preflight_path )` printed `CELL_PREFLIGHT_SH: unbound variable`, rc=1.
+# ⛔ `:-` AND NOT A BARE `=""`. A bare initialisation is what makes the resolver safe under `set -u`,
+# but it ALSO CLOBBERS an operator/test override: `CELL_PREFLIGHT_SH=/path` passed in the environment
+# is a deliberate injection (the suites use exactly that to drive the gate with a fixture verdict), and
+# a bare assignment resets it to empty and silently re-resolves the DEPLOYED helper instead — measured:
+# every capability arm reported the REAL probe's verdict instead of its fixture's, and five of them
+# went red saying the gate never refused. Keep the default, keep the override.
+CELL_PREFLIGHT_SH="${CELL_PREFLIGHT_SH:-}"
+cell_preflight_path() {
+  local c here
+  if [ -n "$CELL_PREFLIGHT_SH" ]; then printf '%s\n' "$CELL_PREFLIGHT_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${O:-}/cell-lane-preflight.sh" "$here/cell-lane-preflight.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/cell-lane-preflight.sh" \
+           "${HOME:-}/.pi/agent/scripts/cell-lane-preflight.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    CELL_PREFLIGHT_SH="$c"
     printf '%s\n' "$c"
     return 0
   done
@@ -1103,6 +1568,15 @@ AGENT_LOAD_REFUSED=75
 # the open queue" — make every caller mislabel one of them, and a mislabelled refusal sends an
 # operator to the wrong remedy with full confidence. Found by the integration batch review as a P0.
 AGENT_FORK_REFUSED=73
+# The CAPABILITY refusal (agent-infra#2935). A FIFTH code because it has a FIFTH remedy: not load
+# (75), not disk (77), not the repo's backlog (74), not the spawn point (76) — the BOX was measured
+# and it cannot complete one model call and RETURN. Measured 2026-10-28: six lanes on cell1 and five
+# on cell3 each ran the full 3300 s cap and produced 0 commits, and every existing gate above said
+# yes, because an idle box passes all of them BY BEING IDLE. It is not 75 (waiting does not clear it),
+# not 77 (no disk to reclaim), and the remedy — reinstall/repair the box's pi or its extension set, or
+# dispatch elsewhere — is as distinct as the others. 80+ is taken by the brief gate and adopt-fix.sh,
+# so this one sits beside the fork refusal at 71.
+AGENT_CAPABILITY_REFUSED=71
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
@@ -1351,20 +1825,66 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ONE lane's measured cost for THIS target (agent-infra#2721). Read once, here, so the ledger row,
   # the refusal and the warning below all quote the SAME numbers — a gate that measures twice is a
   # gate whose report can disagree with its verdict.
-  _lane_costs="$(disk_lane_costs "$dpath")"
-  _lane_tree="${_lane_costs%% *}"
-  _lane_reserve="${_lane_costs##* }"
-  _lane_need=$(( _lane_tree + _lane_reserve ))
+  # ⛔ THE COSTS ARE MEASURED ON THE CHECKOUT, NOT ON THE `df` VOLUME (review rounds 5 and 6, P2).
+  # `$dpath` is `DISK_GATE_PATH` — documented as the VOLUME ("the override exists for a box that splits
+  # them"), and an operator may legitimately point it at a mount root, where `df` answers correctly and
+  # `python_target` finds nothing: a python lane would then be classified as the 64MB harness lane and
+  # admitted on 2 GB of headroom instead of 8 GB. So the target is `$dpath` only when it IS a checkout.
+  #
+  # The fallback is the caller's cwd, and the shipped callers reach here for DIFFERENT reasons — so no
+  # single sentence covers them, and stating one as if it did is how this comment was wrong twice:
+  # `lane.sh` is LAUNCHED with its cwd already inside the worktree (its own header: "cwd must already be
+  # the worktree"; `dispatch-merge.sh` hands `$REPO/.worktrees/$WT` as the spawn cwd), while `fix-one.sh`
+  # does `cd "$REPO"` and then sets `DISK_GATE_PATH="$WT"` explicitly — which is port-provenance D5's
+  # "their `$PWD` is the MAIN CHECKOUT". `adopt-fix.sh` cds to the repo and RUNS `fix-one.sh` as a CHILD
+  # (`bash "$O/fix-one.sh" …`, then dispatches on its exit code), so it reaches that explicit path rather
+  # than inheriting it: `DISK_GATE_PATH` is a per-call prefix assignment inside `fix-one.sh`, and a
+  # sentence that says adopt-fix sets or inherits it is the same stretch this paragraph exists to stop. Both routes classify a checkout, and the main
+  # checkout is itself a checkout (python pair), so the fallback errs STRICT.
+  #
+  # ⛔ WHEN NEITHER PATH IS A CHECKOUT the target is genuinely unknown: the harness pair is charged and
+  # the line is NAMED in the log. Charging the python bound there would refuse every harness lane on any
+  # cell below ~8 GB free, and `DISK_GATE_PATH` is legitimately pointed at a scratch VOLUME whose cwd need
+  # not be a checkout at all — an over-block, traded for instrumentation instead of policy. (Rarely
+  # reached: a cwd that is not a checkout is refused further down by the LAND-BACKLOG gate, which cannot
+  # read PRs there. So this branch reports a broken caller; it does not decide which lanes run.)
+  _lane_target="$dpath"
+  [ -e "$_lane_target/.git" ] || _lane_target="$PWD"
+  if [ ! -e "$_lane_target/.git" ]; then
+    echo "[disk-gate] WARN $label: the lane target is not identifiable (DISK_GATE_PATH=$dpath and cwd=$PWD are neither a checkout) — classifying on the HARNESS pair; a python lane dispatched this way is admitted on the wrong bound, so fix the CALLER's cwd" >> "$log"
+  fi
+  _lane_costs="$(disk_lane_costs "$_lane_target")"
+  _lane_tree="$(printf '%s' "$_lane_costs" | awk '{print $1}')"
+  _lane_self="$(printf '%s' "$_lane_costs" | awk '{print $2}')"
+  _lane_reserve="$(printf '%s' "$_lane_costs" | awk '{print $3}')"
+  _lane_need="$(disk_lane_need "${_lane_tree:-0}" "${_lane_self:-0}" "${_lane_reserve:-0}")"
+  # ⛐ THE MESSAGE NAMES THE TERM THE PREDICATE ACTUALLY USED (review round 6, P2). Every phrasing
+  # below used to say "costs up to ${self}MB (marginal ${tree}MB …)" and "worst case ${self}/marginal
+  # ${tree}". Both are false once an operator sets the documented overrides the other way round
+  # (`DISK_LANE_TREE_MB=5000 DISK_LANE_SELF_MB=64`, measured): the bound becomes max = 5000 and the
+  # message then prints "costs up to 64MB … so 7000MB is required" — internally inconsistent, so an
+  # operator concludes the OVERRIDE is wrong and loosens admission, which is a capacity change made from
+  # a log line. `_lane_worst` is the same `max` the predicate takes, and it is always one of the two
+  # printed figures, so the total can be checked from the message alone.
+  if [ "${_lane_tree:-0}" -gt "${_lane_self:-0}" ]; then _lane_worst="$_lane_tree"; else _lane_worst="$_lane_self"; fi
+  # ONE message for BOTH arms that can refuse on headroom (the band branch below and the plain one):
+  # two copies of a 4-line verdict is how the numbers in a log start disagreeing with the numbers in
+  # the gate. It is rendered here, where the terms are, and printed where the decision is made.
+  _lane_nh_msg="[disk-gate] REFUSED $label: DISK-NOHEADROOM — this lane costs up to ${_lane_worst}MB (${_lane_tree}MB while the shared uv cache holds, ${_lane_self}MB if sharing is lost) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree:-?}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it"
   # DURABLE, and written for ALLOWED runs too — a series that only records refusals cannot answer
   # "how close did we get", which is the question that would have caught either incident early.
   # Same append-only shape as walltime.tsv; a refusal writes a row here (unlike walltime, where a
   # refusal would fabricate a zero-duration sample) because "the disk was below the floor" IS the
   # measurement. tab-separated: epoch, kind, tag, free MB, path, then (agent-infra#2721) the lane's
-  # tree cost and the reserve it is measured against. Fields 6-7 are APPENDED so every existing
-  # reader (`cut -f5`, `awk $4`) is unaffected.
+  # marginal tree cost, the reserve it was measured against, and — APPENDED LAST (review round 3, P2) —
+  # the worst case. ⛔ `self` GOES IN FIELD 8, NOT 7: field 7 already means RESERVE in the series main
+  # ships (#2759), and putting the worst case there silently re-labels every historical row — a
+  # pre-change harness row `64 1024` would read as "this lane costs 1024 MB without sharing", 16x its
+  # real cost, i.e. exactly the number a per-cell budget gets calibrated from. Appending at the end
+  # keeps every existing reader (`cut -f5..7`, `awk $4`) correct across the merge.
   if [ -n "${O:-}" ]; then
     mkdir -p "$O/state" 2>/dev/null || true
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "${dfree:-?}" "$dpath" "$_lane_tree" "$_lane_reserve" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "${dfree:-?}" "$dpath" "$_lane_tree" "$_lane_reserve" "$_lane_self" \
       >> "$O/state/disk.tsv" 2>/dev/null || true
   fi
   # ⛔ AN UNREADABLE PROBE IS ANNOUNCED (review round 1, P2). The fail-open above is deliberate, but
@@ -1379,7 +1899,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # predicates accept it, so the same reading was "unreadable" here and "100MB" to the verdict being
   # announced. Both now call `disk_readable`, so agreement is structural rather than maintained.
   if ! disk_readable "$dfree"; then
-    echo "[disk-gate] WARN $label: could not read free space on $dpath — the disk floor CANNOT be enforced for this spawn. Check DISK_GATE_PATH, PATH and that 'df' works. Failing OPEN by design." >> "$log"
+    echo "[disk-gate] WARN $label: could not read free space on $dpath — the disk floor AND the lane headroom CANNOT be enforced for this spawn. Check DISK_GATE_PATH, PATH and that 'df' works. Failing OPEN by design." >> "$log"
   elif ! disk_ok "$dfree"; then
     echo "[disk-gate] REFUSED $label: only ${dfree}MB free on $dpath < disk_min_free_mb=$DISK_MIN_FREE_MB — no agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) and the controller re-dispatches" >> "$log"
     return "$AGENT_DISK_REFUSED"
@@ -1388,11 +1908,30 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # the disk; the number they were missing is THIS lane's own cost. The verdict is NAMED
   # (`DISK-NOHEADROOM`) and carries both terms, so the operator can tell "the box is out of room for
   # one more lane" from "the disk is full" and from "the box is busy" without reading this file.
-  elif ! disk_headroom_ok "$dfree" "$_lane_tree" "$_lane_reserve"; then
-    echo "[disk-gate] REFUSED $label: DISK-NOHEADROOM — one lane's tree needs ${_lane_tree}MB and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it" >> "$log"
-    return "$AGENT_DISK_REFUSED"
+  # ⛔ THE BAND IS EVALUATED BEFORE THE HEADROOM REFUSAL, AND IT IS NOT THE ADVANCE WARNING (review
+  # rounds 3 and 5). `disk_low`'s band is 4x the floor (2,000) and the headroom bound is
+  # `max(tree,self) + reserve` (2,064 harness / 8,144 python), so for every shipped target a reading
+  # inside the band ALSO fails the bound: the band WARN is emitted at the refusal, not before it, and
+  # the two land in the same log for the same spawn. That is deliberate — the operator gets "this cell
+  # is filling" and the named verdict together — but the ADVANCE warning is the `within one lane of the
+  # headroom bound` arm below, which fires while a spawn is still admitted. Ordering the band first is
+  # what keeps the band reachable at all, which is the property the old order had lost.
   elif disk_low "$dfree"; then
-    echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB, one more lane needs ${_lane_need}MB = tree ${_lane_tree}MB + reserve ${_lane_reserve}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
+    echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB, one more lane needs ${_lane_need}MB = worst case ${_lane_worst}MB (marginal ${_lane_tree}MB, and ${_lane_self}MB if sharing is lost) + reserve ${_lane_reserve}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
+    if ! disk_headroom_ok "$dfree" "$_lane_tree" "$_lane_self" "$_lane_reserve"; then
+      printf '%s\n' "$_lane_nh_msg" >> "$log"
+      return "$AGENT_DISK_REFUSED"
+    fi
+  elif ! disk_headroom_ok "$dfree" "$_lane_tree" "$_lane_self" "$_lane_reserve"; then
+    printf '%s\n' "$_lane_nh_msg" >> "$log"
+    return "$AGENT_DISK_REFUSED"
+  elif [ "$dfree" -lt "$(( _lane_need + _lane_tree ))" ]; then
+    # ── THE SECOND ADVANCE WARNING: WITHIN ONE MARGINAL LANE OF THE BOUND (review round 1, P2;
+    # reworded in round 3). The band above fires when the cell is inside 4x the floor; this arm fires
+    # in the band BETWEEN the band and the bound — i.e. the cell is above its warning band but the NEXT
+    # spawn of this kind is the one that gets refused. It is a threshold, not a constant: it stays
+    # silent while there is room for several lanes.
+    echo "[disk-gate] WARN $label: ${dfree}MB free on $dpath is within one lane of the headroom bound (an admitted spawn needs ${_lane_need}MB = worst case ${_lane_worst}MB (marginal ${_lane_tree}MB, and ${_lane_self}MB if sharing is lost) + reserve ${_lane_reserve}MB) — the next lane OF THIS KIND will be refused DISK-NOHEADROOM. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) while there is still room to do it" >> "$log"
   fi
   l="$(load1)"
   if ! can_spawn "$l"; then
@@ -1510,6 +2049,85 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # a tool child could read the pane's pty — typed input stolen from a human — or, under
   # `nonblocking-dispatch.sh`'s closed stdin, inherit a CLOSED fd 0. The agent is headless: it never
   # reads stdin, so binding it to /dev/null restores the pre-change behaviour explicitly.
+  # ── THE CAPABILITY GATE (agent-infra#2935) — LAST, IMMEDIATELY BEFORE THE LAUNCH ──────────────
+  # Every gate above asks about a RESOURCE (fork, disk, load, backlog). None asks whether this box can
+  # complete one model call and RETURN, and that is the question the 2026-10-28 measurement needed:
+  # six lanes on cell1 and five on cell3 burned the full 3300 s cap each and produced 0 commits,
+  # while cell4 ran the identical launcher to 8 commits — and every gate here said yes, because an
+  # idle box passes all of them BY BEING IDLE.
+  #
+  # ⛔ WHY IT IS MEASURED HERE RATHER THAN TRUSTED. Re-measured 2026-10-28 06:00-06:40Z, per box: the
+  # provider answers (`api.deepseek.com` 401 in 0.35-0.37 s, a direct completion 200 in 636/740/895 ms),
+  # `keys.env` is present and exports on all three, DNS/TLS/ no proxy are fine everywhere, and `$O`'s
+  # `lane.sh`/`spawn-gate.sh`/`lane-exec.sh` are BYTE-IDENTICAL on all three (`3090323c`/`2fa48cc`/
+  # `193d3b`). So the box-to-box difference is not in anything a config check can read — it is in
+  # whether its `pi` finishes. That is measurable only by running it once, bounded.
+  #
+  # ⛔ IT REFUSES ON A DETERMINISTIC VERDICT AND ONLY WARNS ON A BLIP — and "which is which" is
+  # decided by POLARITY, not by a list of favourite substrings. The first cut matched exactly
+  # `why=exit-hang` / `why=call-failed` and warned on everything else, so every OTHER deterministic
+  # refusal fell through to `*) PROCEEDING` and burned the 3300 s slot the probe exists to protect:
+  # a box that hangs BEFORE the answer could only ever emit `why=no-answer` (measured:
+  # `why=no-answer alive_at=3s attempts=1` → WARN → agent started), an unreadable/empty `keys.env`
+  # (rc=2, against the probe's own "EVERY caller must refuse too") was dispatched, and a `pi` missing
+  # from PATH likewise. Meanwhile a reason added to the probe tomorrow would silently inherit the
+  # WARN arm — the same unread-code defect that left exit 71 with no reader anywhere.
+  # The rule now mirrors `tools/fleet/liveness.py`'s: ONE reason is the transient (`why=no-answer`,
+  # which the preflight emits ONLY when the process RETURNED without answering — that is its contract,
+  # stated in its own header), and EVERY other named refusal refuses. A verdict line with no
+  # recogniseable verdict at all warns, because a probe that could not run is not a verdict about the
+  # box.
+  #
+  # ⛔ IT DOES NOT SPEND THE SLOT IT IS PROTECTING: one bounded call, ~5-25 s measured on a healthy box,
+  # and the attempt is abandoned the moment the process exits. `LANE_PREFLIGHT=0` is the declared
+  # escape; `LANE_PREFLIGHT_BOUND` overrides the bound (default 45 s — the probe's OWN documented
+  # default, not a tighter number: a healthy box measured 25 s worst case, so a 30 s bound left ~1 s of
+  # slack for the post-answer exit and could refuse a working box on one slow sample).
+  if [ "${LANE_PREFLIGHT:-1}" != "0" ]; then
+    local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy=""
+    if _pf_sh="$(cell_preflight_path)"; then
+      _pf_line="$(bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
+                    --provider "$lane_provider" --model "$lane_model" 2>>"$log")"
+      _pf_rc=$?
+      echo "[capability-gate] $_pf_line" >> "$log"
+      case "$_pf_line" in
+        *why=no-answer*)
+          echo "[capability-gate] WARN $label: the probe RETURNED without an answer (rc=$_pf_rc) — PROCEEDING, because a transient cannot arm a refusal and this is the only shape a transient takes. If lanes on this box stall, the line above is the reading to start from." >> "$log" ;;
+        *LANE_CAPABILITY=refused*)
+          # The remedy follows the REASON. They are not interchangeable, and naming the wrong one is the
+          # P0 this file records twice for the fork code: an operator told "repair the extension set"
+          # on a box with no key, or "re-dispatch elsewhere" on a lane whose model id is empty, waits
+          # for an event that cannot arrive.
+          case "$_pf_line" in
+            *why=exit-hang*|*why=no-return*)
+              _pf_remedy="This does NOT clear by waiting: repair the box's installed pi/extension set (the line above carries the reading) or dispatch elsewhere." ;;
+            *why=call-failed*)
+              _pf_remedy="This does NOT clear by waiting on load: the request RESOLVED and the call errored — read the provider/key error in the line above and repair THAT." ;;
+            *why=keys-unreadable*)
+              _pf_remedy="This does NOT clear by waiting: the provider credential could not be read on this box — fix keys.env / the ambient <PROVIDER>_API_KEY before re-dispatching (the probe would have measured nothing)." ;;
+            *why=pi-missing*)
+              _pf_remedy="This does NOT clear by waiting: there is no pi on this box's PATH — install/repair the harness on the box before re-dispatching." ;;
+            *why=misconfigured*)
+              _pf_remedy="This does NOT clear by waiting: the lane's model/provider PAIR is empty, so no box could run it — fix the dispatch, not the box." ;;
+            *)  _pf_remedy="This does NOT clear by waiting: the reading above names the refusal." ;;
+          esac
+          AGENT_STARTED=0
+          echo "[capability-gate] REFUSED $label: LANE_CAPABILITY (exit $_pf_rc) — no agent was started, so nothing was consumed and no 3300s slot is spent on a box that cannot complete one call and return. $_pf_remedy Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
+          # ⛔ JOB CONTROL IS RESTORED BEFORE THE EARLY RETURN (review P2). `set -m` was turned on
+          # above for the launch, and the restore line lives after it — so this return is the one path
+          # that used to leave the CALLER with job control ON when it did not have it. With `set -m`
+          # on, bash stops redirecting an async command's stdin from /dev/null, so a later background
+          # command in the caller can inherit the pane's pty or a CLOSED fd 0 (#2163).
+          [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
+          return "$AGENT_CAPABILITY_REFUSED" ;;
+        *LANE_CAPABILITY=ok*) : ;;
+        *)
+          echo "[capability-gate] WARN $label: the capability probe produced no verdict at all (rc=$_pf_rc) — PROCEEDING, because a probe that cannot run is not a verdict about the box. If lanes on this box stall, start from the absence of a LANE_CAPABILITY line above." >> "$log" ;;
+      esac
+    else
+      echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
+    fi
+  fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`
@@ -1610,6 +2228,18 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     AGENT_CAP_HIT=1
     cap_wip_snapshot "$label" "$t" "$elapsed" "$rc" "$log" || true
   fi
+  # ── THE EXIT PATH (#2834) — the COMMONER termination, and until now the uncovered one ──────
+  # `cap_wip_snapshot` above fires only when `elapsed >= t`; a lane that finishes its turn, stops at
+  # a gate or restarts reaches HERE instead, and its uncommitted work used to be looked at by
+  # nothing (measured: 148 of 373 worktrees left dirty, `hit its … cap` in 0 lane logs). The
+  # shipped `scripts/bg-rescue-wip.sh` is the tool that puts the work on ORIGIN under
+  # `refs/wip/<slug>`, where a reaped worktree cannot take it — and it was wired to nothing in this
+  # repo. See the block above `terminal_wip_rescue` for the mechanism, the three verdicts and the
+  # two things it deliberately does not claim.
+  # ⛔ AFTER the cap snapshot and AFTER the walltime row, so a rescue can never delay the kill, and
+  # never changes `rc`: a lane's exit status and the fate of its worktree are different facts, and a
+  # caller that conflated them would re-run a lane because a PUSH failed.
+  terminal_wip_rescue "$label" "$rc" "$AGENT_CAP_HIT" "$log"
   return "$rc"
 }
 

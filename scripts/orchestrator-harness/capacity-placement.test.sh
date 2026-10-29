@@ -526,10 +526,26 @@ ck "  …and it writes the HEARTBEAT with a builtin, so no supervisor concludes 
 ck "the probe's rc=254 is read as fork_exhausted, not as 'no numbers from the probe'" \
    "$(grep -q 'CAP_RC:-0}" -eq 254' "$LOOP" && echo 0 || echo 1)"
 # THE LOCAL GATE ORDER: the fork arm must be evaluated BEFORE the load arm.
-_fk_line="$(grep -n 'elif \[ "${FORK_STARVED:-0}" = "1" \]; then' "$LOOP" | head -1 | cut -d: -f1)"
-_ld_line="$(grep -n 'elif \[ "$L" -ge "$MAX_LOAD" \]; then GATE_WHY="load=' "$LOOP" | head -1 | cut -d: -f1)"
-ck "the controller's OWN chain checks fork BEFORE load (fork=$_fk_line load=$_ld_line)" \
-   "$([ -n "${_fk_line:-}" ] && [ -n "${_ld_line:-}" ] && [ "$_fk_line" -lt "$_ld_line" ] && echo 0 || echo 1)"
+# ⛔ ANCHORED INSIDE THE GATE BLOCK, AND REQUIRING A UNIQUE MATCH (#2927 verification). Each arm
+# stopped being an `elif` line and became its own guard, so an `elif` pattern matched NOTHING and this
+# order assertion went red on an empty reading — but the obvious repair, anchoring on ``^  if [
+# "${FORK_STARVED:-0}" = "1" ]; then``, matched THREE lines (the FORK-STARVED cycle block, the gate arm
+# and the sleep block) and `head -1` silently took the FIRST, an unrelated one. That is a false pass of
+# exactly the class this suite exists to prevent: deleting the gate-chain fork arm altogether still
+# read `fork=3263 < load=5601` and PASSED. So the anchors are resolved INSIDE the vector's own markers,
+# and each must match EXACTLY ONE line there — a non-unique anchor reddens instead of taking a guess.
+GUARD_BLOCK="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$LOOP")"
+_fk_pat='  if [ "${FORK_STARVED:-0}" = "1" ]; then'
+_ld_pat='  if [ "$L" -ge "$MAX_LOAD" ]; then'
+_fk_n="$(printf '%s\n' "$GUARD_BLOCK" | grep -cxF "$_fk_pat")"
+_ld_n="$(printf '%s\n' "$GUARD_BLOCK" | grep -cxF "$_ld_pat")"
+_fk_line="$(printf '%s\n' "$GUARD_BLOCK" | grep -nxF "$_fk_pat" | head -1 | cut -d: -f1)"
+_ld_line="$(printf '%s\n' "$GUARD_BLOCK" | grep -nxF "$_ld_pat" | head -1 | cut -d: -f1)"
+ck "the controller's OWN chain checks fork BEFORE load (offsets in the gate block: fork=$_fk_line load=$_ld_line)" \
+   "$([ -n "${_fk_line:-}" ] && [ -n "${_ld_line:-}" ] && [ "${_fk_n:-0}" -eq 1 ] && [ "${_ld_n:-0}" -eq 1 ] \
+       && [ "$_fk_line" -lt "$_ld_line" ] && echo 0 || echo 1)"
+ck "  …and each anchor is UNIQUE in that block (fork×$_fk_n load×$_ld_n), so neither can resolve to a look-alike" \
+   "$([ "${_fk_n:-0}" -eq 1 ] && [ "${_ld_n:-0}" -eq 1 ] && echo 0 || echo 1)"
 ck "the cycle record carries the fork reading (fork= fork_procs= fork_max=)" \
    "$(grep -q 'fork="$_cr_fork" fork_procs=' "$LOOP" && echo 0 || echo 1)"
 # THE VERDICT: a fresh record that says fork=starved is FORK-STARVED, rc 1 — driven, not grepped.
