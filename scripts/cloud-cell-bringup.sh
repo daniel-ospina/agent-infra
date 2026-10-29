@@ -728,6 +728,11 @@ check_dispatch() {
     if [ "$provrc" -eq 3 ]; then
       warn "the LANE ROSTER could not be provisioned (the population was unmeasurable — see above);"
       warn "  the pre-flight's holder surface stays INCOMPLETE until it can be (agent-infra#1935)"
+    elif [ "$provrc" -ne 0 ]; then
+      # ⛔ A CRASH IS NOT A PROVISION (review finding 2): the provisioner's documented exits are
+      # 0/2/3, so any other non-zero is a failure of the tool itself, never "provisioned".
+      warn "the LANE ROSTER provisioning FAILED (rc=$provrc — not the tool's own refusal, so it crashed);"
+      warn "  the roster is in an UNKNOWN state and the holder surface may stay INCOMPLETE (agent-infra#1935)"
     else
       ok "lane roster: this box's own population (agent-infra#1935)"
     fi

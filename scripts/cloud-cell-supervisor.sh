@@ -2284,6 +2284,14 @@ cmd_check() {
     printf '%s\n' "$rv" | sed 's/^/    /'
     if [ "$rvrc" -eq 3 ]; then
       log_line "warn: lane roster NOT provisioned — the population is unmeasurable on this box (see above); the pre-flight's holder surface will refuse candidates until it is (agent-infra#1935)"
+    elif [ "$rvrc" -ne 0 ]; then
+      # ⛔ A CRASH IS NOT A PROVISION (review finding 2). The provisioner's documented exits are
+      # 0/2/3; anything else (rc 1 from an uncaught OSError in the atomic write on a full disk or
+      # a read-only $HOME — exactly what MIN_FREE_MB exists for, a traceback, rc 127) used to land
+      # in the arm below and print `ok: provisioned`, i.e. a false PASS on the one line this
+      # change adds to the start gate. Same shape as scheduler_ensure below: rc 3 is the tool's
+      # OWN refusal, any other non-zero is reported as what it is.
+      log_line "warn: lane roster provisioning FAILED (rc=$rvrc — not the tool's own refusal, so it crashed); the roster is in an UNKNOWN state and the pre-flight's holder surface may stay INCOMPLETE (agent-infra#1935)"
     else
       log_line "ok: lane roster — provisioned from this box's own population (agent-infra#1935)"
     fi

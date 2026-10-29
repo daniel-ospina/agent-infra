@@ -220,14 +220,43 @@ def linked_worktree(path: str) -> bool:
     return False
 
 
+def fleet_roots() -> tuple[str, ...]:
+    """The roots a `wt-<slug>` lane root may live under.
+
+    ⛔ THE SAME ANCHOR `scripts/lane-actions.py::FLEET_ROOTS` USES, deliberately: that file's
+    round-4 review established that root anchoring plus a `wt-` NAME is a name test, because a
+    world-writable root such as /tmp makes ANY `/tmp/wt-anything` read as a fleet lane. Two
+    differently-shaped anchors would let one subsystem accept a lane the other refuses, which is
+    the disagreement `lane-actions.py`'s own comment warns about. `tempfile.gettempdir()` is
+    included for the reason recorded there: the fleet's own recipe writes `/tmp/wt-<slug>` lanes.
+    """
+    out: list[str] = []
+    for cand in (os.environ.get("FLEET_HOME"), os.environ.get("CELL_HOME"),
+                 os.environ.get("FLEET_CELL_HOME"), home(),
+                 "/tmp/cell-home", tempfile.gettempdir(), "/tmp", "/private/tmp"):
+        if not cand:
+            continue
+        r = real(cand) or cand
+        if r not in out:
+            out.append(r)
+    return tuple(out)
+
+
 def is_fleet_worktree(cwd: str) -> bool:
     """True ONLY when `cwd` is DEMONSTRABLY a fleet lane's worktree.
 
     Fail-closed: an unreadable path, a non-absolute path and anything that is not a linked
-    worktree under `.worktrees/` or a `wt-*` lane root is NOT a lane, so it gets no row. The
+    worktree under `.worktrees/` or a `wt-<slug>` lane root is NOT a lane, so it gets no row. The
     cost of a wrong FALSE here is one fewer derived row on a box whose roster we are deriving
     because it has none; the cost of a wrong TRUE is a roster row attributing an issue to the
     OWNER's window — a manufactured holder, which is a blocking false COLLISION (#8177).
+
+    ⛔ THE NAME ALONE IS NOT EVIDENCE. The first version accepted any path whose basename began
+    with `wt-`, so `~/wt-notes`, a `wt-draft` directory, or any plain `wt-*` folder became a
+    roster row carrying a derived `lane:<N>` label — acceptance WITHOUT evidence, in the one
+    direction this script must never fail in. A `wt-` root must now satisfy BOTH the fleet-root
+    anchor and `linked_worktree` (the same two-of-three `_is_fleet_wt_dir` requires, plus the
+    name), so only a directory `git worktree add` actually created can be rostered.
     """
     p = real(cwd)
     if not p or not p.startswith("/"):
@@ -237,7 +266,11 @@ def is_fleet_worktree(cwd: str) -> bool:
         return False
     if ".worktrees" in parts and linked_worktree(p):
         return True
-    return parts[-1].startswith("wt-")
+    if parts[-1].startswith("wt-"):
+        for root in fleet_roots():
+            if p == root or p.startswith(root.rstrip("/") + "/"):
+                return linked_worktree(p)
+    return False
 
 
 def lane_label(cwd: str) -> str:
@@ -266,19 +299,8 @@ def issue_label(label: str) -> str:
     for ch in label:
         if ch.isdigit():
             digits += ch
-        else:
-            if digits:
-                break
-            continue
-    if not digits:
-        # a trailing/embedded number (`lane-1935`, `w-review10143`, `fix-1935-tests`)
-        cur = ""
-        for ch in label:
-            if ch.isdigit():
-                cur += ch
-            elif cur:
-                break
-        digits = cur
+        elif digits:
+            break
     return f"lane:{digits}" if digits else ""
 
 

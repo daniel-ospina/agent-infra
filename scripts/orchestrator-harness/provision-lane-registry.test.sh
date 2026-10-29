@@ -59,8 +59,11 @@ mk_case() {
   # <main>/.git/worktrees/<name> (the reader's own identity test).
   printf 'gitdir: %s\n' "$CASE/repo/.git/worktrees/lane-77" > "$CASE/repo/.worktrees/lane-77/.git"
   mkdir -p "$CASE/repo/.git/worktrees/lane-77"
-  # the box's other shapes
-  mkdir -p "$CASE/fleet/wt-lane-88"        # a cell's own lane root
+  # the box's other shapes. ⛔ THE `wt-` LANE ROOT IS A REAL LINKED WORKTREE UNDER A FLEET ROOT
+  # (HOME here): a name-only `wt-*` directory must NOT be rostered (review finding 1).
+  mkdir -p "$CASE/home/fleet/wt-lane-88" "$CASE/repo/.git/worktrees/wt-lane-88"
+  printf 'gitdir: %s\n' "$CASE/repo/.git/worktrees/wt-lane-88" > "$CASE/home/fleet/wt-lane-88/.git"
+  mkdir -p "$CASE/home/wt-notaworktree"  # a NAME-only wt- root — must never be rostered
   mkdir -p "$CASE/owner/Personal website"  # the OWNER's project — must never be rostered
   mkdir -p "$CASE/repo/.git"               # a main checkout — not a lane either
   ROSTER="$CASE/home/.pi/agent/state/lane-registry.tsv"
@@ -80,7 +83,8 @@ mk_payload() { # workspaces from the fixture dirs
   cat > "$CASE/list.json" <<JSON
 {"window_ref":"window:1","workspaces":[
  {"id":"c2c97e96-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77","current_directory":"$CASE/repo/.worktrees/lane-77"},
- {"id":"aa11bb22-cc33-dd44-ee55-ff6677889900","custom_title":"LANE 88","current_directory":"$CASE/fleet/wt-lane-88"},
+ {"id":"aa11bb22-cc33-dd44-ee55-ff6677889900","custom_title":"LANE 88","current_directory":"$CASE/home/fleet/wt-lane-88"},
+ {"id":"bbbb0000-0000-0000-0000-00000000000b","custom_title":"NAME ONLY","current_directory":"$CASE/home/wt-notaworktree"},
  {"id":"deadbeef-0000-0000-0000-000000000000","custom_title":"Personal website","current_directory":"$CASE/owner/Personal website"},
  {"id":"11112222-3333-4444-5555-666677778888","custom_title":"SHARED","current_directory":"$CASE/repo"},
  {"id":"99990000-1111-2222-3333-444455556666","custom_title":"NO CWD"}
@@ -117,6 +121,8 @@ chk "A8 the OWNER's project is NOT rostered (#8177 attribution)" \
     '! grep -qi "deadbeef" "$ROSTER"'
 chk "A9 the shared checkout is NOT rostered" '! grep -q "11112222" "$ROSTER"'
 chk "A10 a workspace with no cwd is NOT rostered" '! grep -q "99990000" "$ROSTER"'
+chk "A12 a NAME-only wt- directory is NOT rostered (the name is not the evidence, #8177)" \
+    '! grep -q "bbbb0000" "$ROSTER"'
 chk "A11 each exclusion is NAMED on the report (a vanished window is visible)" \
     'case "$OUT" in *"Personal website"*"not a fleet worktree"*) true;; *) false;; esac'
 chk "A12 the file carries the derivation MARKER (so a refresh may replace it)" \
@@ -172,12 +178,17 @@ run_it --apply
 chk "D7 a second --apply is CURRENT and byte-identical (no churn on every bring-up)" \
     '[ "$RC" -eq 0 ] && cmp -s "$ROSTER" "$T/cell.first" && case "$OUT" in *CURRENT*) true;; *) false;; esac'
 # ⛔ NON-VACUITY: the arm must be decided by the LAYOUT'S ABSENCE, not by the daemon's failure
-# alone. Adding the layout to the same fixture must flip it to REFUSED (C above is that case);
-# here the opposite direction is pinned — deleting the layout from a refused fixture flips it back.
-rm -f "$CASE/home/Library/Application Support/cmux/session-com.cmuxterm.app.json"
-mk_case cell2; mk_stub 1 junk; tmux_path
+# alone. This drives the SAME fixture twice — with the layout, then with ONLY the layout removed —
+# so it cannot pass vacuously (the previous version re-created a fresh case and `rm`'d a file that
+# case never made, which made it a duplicate of D2 rather than the control its comment claimed).
+mk_case cell; mk_stub 1 junk; tmux_path
+mkdir -p "$CASE/home/Library/Application Support/cmux"
+: > "$CASE/home/Library/Application Support/cmux/session-com.cmuxterm.app.json"
 run_it --apply
-chk "D8 the SAME daemon failure provisions when no layout exists (the discriminator is the layout)" \
+chk "D8a pre-state: the SAME fixture WITH a persisted layout is REFUSED (rc 3)" '[ "$RC" -eq 3 ]'
+rm -f "$CASE/home/Library/Application Support/cmux/session-com.cmuxterm.app.json"
+run_it --apply
+chk "D8 the SAME daemon failure provisions once ONLY the layout is gone (the discriminator is the layout)" \
     '[ "$RC" -eq 0 ] && [ -f "$ROSTER" ]'
 
 echo
@@ -213,7 +224,7 @@ chk "G1 cloud-cell-bringup.sh provisions the roster" \
 chk "G2 cloud-cell-supervisor.sh provisions the roster" \
     'grep -q "provision-lane-registry.py" "$ROOT/scripts/cloud-cell-supervisor.sh"'
 chk "G3 this suite is WIRED into the shard list (an unwired suite reds bash-suites by design)" \
-    'grep -q "provision-lane-registry.test.sh" "$ROOT/scripts/run-bash-shards.sh"'
+    'bash "$ROOT/scripts/run-bash-shards.sh" --list | grep -qx "scripts/orchestrator-harness/provision-lane-registry.test.sh"'
 
 echo
 echo "==> $PASS passed, $FAIL failed"
