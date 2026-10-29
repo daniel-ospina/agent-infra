@@ -82,6 +82,35 @@ printf '%s\n' "$*" >> "${GH_LOG:?}"
 if [ -n "${GH_NOISE:-}" ]; then
   printf 'gh-gate: the gate mutex is unavailable (lock_acquire spent 2000ms) — running this call UNGATED (announced)\n' >&2
 fi
+# ⛔ EVERY `--jq` PROGRAM THE GATE SHIPS IS COMPILED HERE (#3002 review P2). This double used to answer
+# every read by pattern-matching argv and PRINTING the rows it believed the program would emit, so the
+# program itself never reached jq — and arms (7b) (7c) (7d) (m9) (m10) certified a page-row protocol
+# the SHIPPED program did not emit. The measured cost: a census `--jq` carrying a bare `\` inside its
+# interpolation (`\(\.runners|type)`) is a COMPILE error, so on every box the census produced nothing,
+# `capacity=` was `unknown` forever, the pool could never be relabelled — behind 384 green assertions
+# and five fresh-context review rounds. A program that does not compile is a red at the call that
+# ships it, not on the box.
+_jq_prog=""; _prev=""
+for _a in "$@"; do
+  case "$_prev" in --jq) _jq_prog="$_a" ;; esac
+  case "$_a" in --jq=*) _jq_prog="${_a#--jq=}" ;; esac
+  _prev="$_a"
+done
+if [ -n "$_jq_prog" ]; then
+  command -v jq >/dev/null 2>&1 || {
+    printf 'stub: jq is missing — it is a hard dependency of the gate, and this double compiles every --jq it is handed\n' >&2
+    exit 1; }
+  # `try ( … ) catch empty` suppresses RUNTIME errors only; a SYNTAX error is raised when jq COMPILES
+  # the program, before any input is read — exactly the class this guard exists to catch. The program
+  # is passed as a `%s` ARGUMENT and never interpolated: a real program carries jq variables (`$id`),
+  # which the shell must not touch.
+  _jq_wrapped="$(printf 'try (%s) catch empty' "$_jq_prog")"
+  if ! _jq_diag="$(jq -n "$_jq_wrapped" 2>&1 >/dev/null)"; then
+    printf 'stub: the gate shipped a --jq program that does not COMPILE (#3002): %s\n%s\n' \
+      "$_jq_prog" "$_jq_diag" >&2
+    exit 1
+  fi
+fi
 # The age fixture is rendered HERE, at call time: the gate turns it into a real age, so a timestamp
 # minted when the suite starts would drift across (or into) the threshold while the suite runs.
 queue_oldest_at() {
@@ -162,9 +191,9 @@ case "$*" in
   #   idle / busy / off = a runner of the live pool (ARM64, carries ubuntu-latest)
   #   any other TOKEN   = emitted verbatim, which is how a malformed row is built
   # `GH_CENSUS_LABELS` replaces the label set, which is how "the pool does not carry the demand" is
-  # built — the state that is CORRECT in mode=github and conclusive only in mode=local.
-  # `GH_CENSUS_LABELCOUNT` emits the inventory's OPTIONAL 4th field (the runner's own label count),
-  # which is the only way to build "a label contains the comma this pass splits on".
+  # built — the state that is CORRECT in mode=github and conclusive only in mode=local. `~` separates
+  # REAL label elements, so `a,b~c` is the 2-element set ["a,b", "c"] — the only way to build "a label
+  # contains the comma this pass splits on" (arm 13b), which a comma-only separator cannot express.
   # `token@l1|l2|l3` gives ONE runner its own label set (`|` because the token list is comma-split),
   # which is the only way to build "one demand-matching runner among idle ones that cannot take it"
   # — the state that used to be certified as `saturated` (#3002 review P1, round 3).
@@ -174,38 +203,63 @@ case "$*" in
   # point is a readable zero (`"runners": []` → count 0) — and emits NOTHING for `blank`, which is the
   # body that produced no output at all. Without those two the suite could not tell the states apart,
   # which is exactly the defect being pinned.
+  # ⛔ AND THE HEALTHY BODY IS DERIVED BY RUNNING THE SHIPPED PROGRAM, NEVER IMITATED (#3002 review P2).
+  # The rows used to be hand-built to LOOK like the program's output, so the arms below certified a
+  # protocol the shipped program did not emit: a `--jq` that fails to COMPILE compiles to nothing, and
+  # every one of those arms stayed green. The body is now assembled as the API really serves it and
+  # piped through the gate's own program, so the page row and every registration row are the program's
+  # OUTPUT — and a program that does not compile cannot produce them.
   #   blank = the read produced NOTHING (empty body, jq read no input) — UNREADABLE, never zero
   #   short = a page DECLARING 2 registrations that emitted 1 — a truncated stream, UNREADABLE
   #   rowgarbage = one good registration row beside a non-row, with a page row that AGREES with the
   #                good one — the only body that isolates the ROW-shape check from the page-row and
   #                declared-count guards (both of which would otherwise refuse it for another reason)
+  #   the hand-built rows are kept ONLY for a token the API cannot produce (a malformed registration)
   *".status"*)
     case "${GH_CENSUS_MODE:-ok}" in
       forbidden)      printf '{"message":"Resource not accessible by personal access token","documentation_url":"https://docs.github.com/rest/actions/self-hosted-runners#list-self-hosted-runners-for-a-repository","status":"403"}\ngh: Resource not accessible by personal access token (HTTP 403)\n' >&2; exit 1 ;;
       forbidden-bare) printf 'gh: Resource not accessible by personal access token (HTTP 403)\n' >&2; exit 1 ;;
       garbage)        printf 'null\n' ;;
-      empty)          printf '#page\tarray\t0\n' ;;
+      empty)          printf '{"total_count":0,"runners":[]}\n' | jq -r "$_jq_prog"; exit 0 ;;
       blank)          : ;;
       short)          printf '#page\tarray\t2\nonline\tfalse\tself-hosted,ubuntu-latest\n' ;;
       rowgarbage)     printf '#page\tarray\t1\nnull\nonline\tfalse\tself-hosted,ubuntu-latest\n' ;;
       *)              _census="${GH_CENSUS:-busy}"; _census="${_census//,/ }"
-                      _lc=""; [ -n "${GH_CENSUS_LABELCOUNT:-}" ] && _lc=$'\t'"$GH_CENSUS_LABELCOUNT"
-                      _rows=""; _n=0
+                      _runners=""; _rows=""; _n=0; _derived=1
                       for _c in $_census; do
                         _cl="${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}"
                         case "$_c" in
                           ?*@*) _cl="${_c#*@}"; _cl="${_cl//|/,}"; _c="${_c%%@*}" ;;
                         esac
                         case "$_c" in
-                          idle) _row="online"$'\t'"false"$'\t'"$_cl$_lc" ;;
-                          busy) _row="online"$'\t'"true"$'\t'"$_cl$_lc" ;;
-                          off)  _row="offline"$'\t'"false"$'\t'"$_cl$_lc" ;;
-                          *)    _row="$_c" ;;
+                          idle)  _st=online;  _bu=false ;;
+                          busy)  _st=online;  _bu=true  ;;
+                          off)   _st=offline; _bu=false ;;
+                          *)     _st=""      ; _bu=""    ;;
                         esac
-                        _rows="$_rows$_row"$'\n'; _n=$((_n+1))
+                        _n=$((_n+1))
+                        if [ -z "$_st" ]; then
+                          _derived=""; _rows="$_rows$_c"$'\n'; continue
+                        fi
+                        _rows="$_rows$_st"$'\t'"$_bu"$'\t'"$_cl"$'\n'
+                        case "$_cl" in
+                          *'~'*) _elems="${_cl//\~/$'\n'}" ;;
+                          *)     _elems="${_cl//,/$'\n'}" ;;
+                        esac
+                        _ljson=""
+                        while IFS= read -r _l; do
+                          [ -n "$_l" ] || continue
+                          _l="${_l//\\/\\\\}"; _l="${_l//\"/\\\"}"
+                          _ljson="${_ljson:+$_ljson,}{\"name\":\"$_l\"}"
+                        done <<<"$_elems"
+                        _runners="${_runners:+$_runners,}{\"status\":\"$_st\",\"busy\":$_bu,\"labels\":[$_ljson]}"
                       done
-                      printf '#page\tarray\t%s\n' "$_n"
-                      printf '%s' "$_rows" ;;
+                      if [ -n "$_derived" ]; then
+                        printf '{"total_count":%d,"runners":[%s]}\n' "$_n" "$_runners" | jq -r "$_jq_prog"
+                      else
+                        printf '#page\tarray\t%s\n' "$_n"
+                        printf '%s' "$_rows"
+                      fi ;;
     esac
     exit 0 ;;
   *"-X PUT"*)
@@ -1219,9 +1273,13 @@ assert_eq "$RC" "0" "(13) …and neither does a slash"
 # …but a label carrying the COMMA this pass splits on makes every demand MATCH untrustworthy, and an
 # untrustworthy match must never become the evidence for a deny. Detected from the inventory's own
 # label count, and it NARROWS (no deny) instead of voiding the pass.
+# ⛔ THE FIXTURE IS TWO REAL LABELS, one of which CONTAINS a comma (`a,b~c` in GH_CENSUS_LABELS is the
+# 2-element set ["a,b", "c"], which the stub now renders through the gate's own program — #3002 review
+# P2). It used to be four comma-parts plus a hand-stamped label count of 2, which the shipped program
+# could never emit: the arm certified the stub, not the gate.
 echo "── #3002: an ambiguous label set NARROWS the claim — it never bricks, and never denies ──"
 run_gate census-ambiguous GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
-  GH_CENSUS="idle,idle" GH_CENSUS_LABELS="self-hosted,Linux,ARM64,self-hosted-arm64" GH_CENSUS_LABELCOUNT=2 --
+  GH_CENSUS="idle,idle" GH_CENSUS_LABELS="self-hosted,Linux,ARM64~self-hosted-arm64" --
 assert_eq "$RC" "0" "(13b) a label containing the delimiter does not refuse the pass"
 assert_contains "$OUT" "label_ambiguity=1" "(13b) the ambiguity is REPORTED, not hidden"
 assert_not_contains "$OUT" "capacity=stranded" "(13b) and NEVER becomes the evidence for a stranded deny"
@@ -1536,6 +1594,41 @@ if mutate_gate "$MUT10" \
   fi
 else
   bad "(m10) the mutant could not be generated (anchor moved) — the truncation guard is unproven"
+fi
+
+# ⛔ (17) THE DOUBLE COMPILES EVERY `--jq` IT IS HANDED — the guard that would have caught (#3002
+# review P2). Everything above reaches the census through this stub, so a program that does not
+# compile must be REFUSED at the call, not answered with rows the stub invented. The negative control
+# is the exact token the shipped commit carried (`\(\.runners|type)`); the positive control is the
+# corrected form, so the guard is not a blanket refusal.
+echo "── #3002 P2: a --jq program that does not COMPILE is red at the call, not imitated ──"
+# `GH_LOG` is exported only inside run_gate's subshell, so it is passed here explicitly — otherwise the
+# double dies on `${GH_LOG:?}` and BOTH controls are satisfied by a crash instead of by the guard.
+_jqbad_err="$(GH_LOG="$GH_LOG" "$BIN/gh" api repos/o/r/actions/runners --jq '("\(\\.status)")' 2>&1 >/dev/null)"
+_jqbad_rc=$?
+assert_eq "$_jqbad_rc" "1" "(17) a --jq carrying a bare '\\.' inside \\( … ) is REFUSED by the double"
+assert_contains "$_jqbad_err" "does not COMPILE" "(17) …and the refusal NAMES it (the #3002 P1 was a compile error)"
+GH_LOG="$GH_LOG" "$BIN/gh" api repos/o/r/actions/runners --jq '("\(.status)")' >/dev/null 2>&1
+assert_eq "$?" "0" "(17) …while the corrected form COMPILES and ROUTES (the control: not a blanket refusal)"
+
+# (m11) THE REVIEWED DEFECT, RESTORED (#3002 review P2). Every census arm above would have passed with
+# this mutant in the suite as it stood — the stub answered by pattern-matching argv — while the census
+# itself passed on NO box, so the pool could never be relabelled. The mutation restores exactly the two
+# characters the shipped commit carried, and the double must now refuse the call.
+MUT11="$T/ci_runner_gate.mutant-jq-syntax.sh"
+if mutate_gate "$MUT11" \
+  '--jq '\''("#page\t\(.runners|type)\t\(.runners|length)"),' \
+  '--jq '\''("#page\t\(\\.runners|type)\t\(\\.runners|length)"),   # MUTANT::m11 — the invalid token the shipped program carried'; then
+  ok "(m11) the invalid-token mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT11"
+  run_gate mutant-jq-syntax GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=2 \
+    GH_CENSUS="idle,idle" --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  assert_eq "$RC" "2" "(m11) the mutant cannot measure — a program that does not compile reads NOTHING"
+  assert_not_contains "$OUT" "runners=2" "(m11) the caught mutant invents no pool (arm 13 is green only because the program compiles)"
+  assert_contains "$OUT" "capacity=unknown" "(m11) …it reports UNKNOWN, which is what every box saw for real"
+else
+  bad "(m11) the mutant could not be generated (anchor moved) — the compile guard is unproven"
 fi
 
 echo "── --dry-run and --status stay read-only ──"

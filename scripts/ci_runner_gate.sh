@@ -285,8 +285,15 @@ runner_census() {
   # so its presence distinguishes "answered, with N runners" (N may be 0) from "produced nothing"
   # without a second read. `.runners|type` is carried rather than assumed: a body that answers with
   # `.runners: null` is a SCHEMA change, not an empty pool, and must not be counted as one either.
+  #
+  # ⛔ `\(` IS THE INTERPOLATION TOKEN AND A BARE `\` IS NOT A jq TOKEN (#3002 review P1). Written as
+  # `\(\.runners|type)` the whole program is a COMPILE error — jq exits 3 having read no input, so the
+  # read produced NOTHING on every box and this gate could never relabel again, while reporting a
+  # `runner_inventory:unreadable` alarm that blamed the token for our own grammar. Any edit here must
+  # be COMPILED, not eyeballed: `scripts/ci_runner_gate.test.sh` now runs every `--jq` this script ships
+  # through real `jq` (stub, "does not COMPILE"), so a recurrence reddens the suite instead of production.
   gh api --paginate "$RUNNER_LIST_PATH" \
-    --jq '("#page\t\(\.runners|type)\t\(\.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR"
+    --jq '("#page\t\(.runners|type)\t\(.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR"
 }
 
 # census_capability <body> — WHICH permission the read needed, named from the response itself.
