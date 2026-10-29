@@ -84,11 +84,21 @@ CORE_CEILING=40
 BOARD_COST=20        # modeled per-rebuild cost, from the measured 130/6 = 21.7 calls per rebuild
 CACHED_COST=1        # a cache hit costs no board read
 
-# mk_case <name> — sandbox: repo + a scout worktree that ALREADY EXISTS as a plain dir (the shipped
-# script then never runs `git worktree add`, so no repo/remote is needed), a sandbox HOME, and $O.
+# mk_case <name> — sandbox: a REAL git repo (with a real local origin) whose scout worktree ALREADY
+# EXISTS as a plain dir (the shipped script then never runs `git worktree add`), a sandbox HOME, and $O.
+# ⛔ THE REPO MUST BE PROVISIONABLE (agent-infra#1935 review, P1). `resolve_repo` verifies an EXPLICIT
+# $REPO too: it reads `git -C $REPO config --get remote.origin.url` and REFUSES (exit 3, before the
+# pool is even read) a checkout that cannot prove which repo it is — "cannot prove" is never "proved",
+# because pre-flighting one repo's issues against another repo's tree is #1901. A `mkdir -p` fixture
+# therefore reds EVERY arm of this suite at the run path. The origin is a bare dir INSIDE the sandbox:
+# real git semantics (rev-parse, config) and no network. `rf` also clears $OR (see there), so the
+# local-path origin takes the documented OR_DECLARED=0 tolerance instead of needing a URL to match.
 D=""
 mk_case() {
   D="$T/$1"; mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout/tools"
+  git init -q --bare "$D/origin.git"
+  git init -q "$D/repo"
+  git -C "$D/repo" remote add origin "$D/origin.git"
   printf '%s' "${2:-100}" > "$D/core"          # the scripted REST core budget
   # ⛔ THE FIXTURE PROVISIONS THE CROSS-BOX CLAIM REGISTRY, because the shipped pass now REQUIRES it
   # (agent-infra#2466 / #2534). A missing `$O/claims.sh` is `INCOMPLETE — never CLEAN`, so every
@@ -184,13 +194,17 @@ PY
 # rf <dir> <refresh|check> [KEY=VAL ...] — runs the SHIPPED script hermetically; $OUT/$RC.
 # The quota seams are CLEARED every run so a case's own values are the only ones in play and an
 # operator's exports cannot leak into the sandbox (the same rule the scout suite states for its own
-# ambient knobs).
+# ambient knobs). ⛔ $OR IS CLEARED TOO (#1935 review, P1): `OR_DECLARED` is 1 whenever the caller's
+# environment names a queue target, and a DECLARED target makes the fixture's local-path origin a
+# REFUSAL (it cannot prove a declared pair) — so on any box that exports $OR this suite would red for
+# a reason that has nothing to do with the quota contract. Cleared, the fixture runs in the documented
+# OR_DECLARED=0 state and the origin tolerance is the branch under test.
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
   local args=(6); [ "$mode" = check ] && args=(--check)
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
-          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
+          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u OR \
           -u COLLISION_PREFLIGHT_BOARD_CACHE -u COLLISION_PREFLIGHT_BOARD_CACHE_TTL \
           -u COLLISION_PREFLIGHT_CACHE -u COLLISION_PREFLIGHT_CORE_RESERVE \
           -u COLLISION_PREFLIGHT_CORE_PER_CANDIDATE -u COLLISION_PREFLIGHT_CORE_PACING \
