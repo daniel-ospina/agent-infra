@@ -577,7 +577,6 @@ You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewe
 If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
 If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
->>>>>>> b718dc981 (feat(harness): a PR sickness QUEUE — a red PR nobody holds is now selected, briefed and fixed)
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
