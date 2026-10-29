@@ -1,0 +1,13 @@
+# `on:` written as a block sequence is the same YAML data as `on: [push]`, which was read fine; the
+# sequence form was refused as "could not read any trigger" although `on:` is right there (#2660 round 8).
+name: Push on sequence
+on:
+  - push
+concurrency:
+  group: push-on-sequence
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

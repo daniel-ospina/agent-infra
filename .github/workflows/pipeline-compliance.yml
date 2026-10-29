@@ -71,7 +71,66 @@ permissions:
 jobs:
   pipeline-compliance:
     name: pipeline-compliance
-    runs-on: ubuntu-latest
+    # ── THE REQUIRED-CHECK RESERVATION (#2752) ────────────────────────────────────────────
+    # THE DEFECT. `pipeline-compliance` is this repo's ONLY required status context
+    # (branch protection = exactly `["pipeline-compliance"]`, measured) and ~9 s of work.
+    # It queues behind ADVISORY work that consumes every runner: measured 2026-10-24
+    # 21:43:45Z, one run waited 13 min for 9 s of work, while 66 runs (~1,650 jobs) were
+    # queued and `bash-suites` alone is 8 matrix jobs. A required check that is `queued`
+    # is indistinguishable from a broken pipeline, so nothing merges for hours.
+    #
+    # THE FIX. Reserve slots (this design assumes FOUR) carrying the label `required-check`, which
+    # ONLY this job asks for: one operator adds the label per docs/ops/fleet-capacity.md §9.2 and
+    # sets PIPELINE_COMPLIANCE_RUNS_ON per §9.3. ⛔ NOTHING IS RESERVED TODAY — no runner carries
+    # `required-check` and the variable is unset, so this job still runs on `ubuntu-latest`. Do not
+    # engage the variable before the label exists: a reserved routing with no listener queues to the
+    # 24 h cancel and lands `cancelled`, which is non-red in the merge rail (§9.4).
+    # Same check, same commit, same assertions — it just does not wait behind 1,600 advisory jobs.
+    # No other job's routing is touched (see tests/required-check-reservation).
+    #
+    # ⛔ WHY THE RESERVATION IS OPT-IN, AND WHY THE FALLBACK IS THE *DEFAULT*. `runs-on` has NO
+    #   fallback/OR semantics in GitHub Actions: a label list is ANDed, and a job whose labels
+    #   match no ONLINE runner does not run at all — it sits `queued` until GitHub cancels it (the
+    #   self-hosted job-queue limit is 24 h: "A job can be in the queue for 24 hours before it is
+    #   automatically cancelled"). Making `[self-hosted, Linux, X64, required-check]`
+    #   the unconditional default would therefore mean (a) the repo's only required check is
+    #   unsatisfiable until an operator labels a runner — the "worse than today" failure — and
+    #   (b) every consumer that reuses this file via `workflow_call` (the header keeps that path
+    #   open) would stall on a label it has never heard of. So the default IS the
+    #   fallback: `ubuntu-latest`, i.e. exactly today's behaviour. The reservation is engaged by
+    #   one variable, and releasing it is the same one command.
+    #
+    # ⛔ AND THE 24 h CANCEL IS NOT A SAFE PLACE TO WAIT. A `cancelled` check is in `NON_RED_CONC`
+    #   (scripts/admin-merge.sh), so an engaged-but-unlabelled reservation would end as a NON-RED
+    #   required check rather than a visible `queued` one — the rail's own fail-open class
+    #   (#2474). That is the second reason the fallback is the default, and why §9.3 sets a 24 h
+    #   release deadline instead of telling an operator to watch for `queued`.
+    #
+    # ⛔ WHY NOT A SECOND JOB OR A MATRIX ARM. Branch protection requires the context to be named
+    #   EXACTLY `pipeline-compliance`. A matrix arm renames the context to
+    #   `pipeline-compliance ([...])`, and a second job reports a DIFFERENT context — either way
+    #   the required context is never satisfied and every PR blocks. The route must stay ONE job
+    #   with ONE `runs-on`, which is why the fallback lives in the expression below.
+    #
+    # RESERVATION  (the value the operator sets; `required-check` is the reserved label):
+    #   ["self-hosted","Linux","X64","required-check"]
+    # ENGAGE + RELEASE are in docs/ops/fleet-capacity.md §9.2/§9.3 — the exact label call and the
+    # `gh variable` call, so the reservation is reproducible rather than folklore. §9.2 uses the
+    # NON-DESTRUCTIVE pair (`POST …/labels` to add, `DELETE …/labels/<name>` to remove) because
+    # `PUT …/labels` REPLACES every custom label on the runner. The reserved runners must NOT also
+    # carry `ubuntu-latest`, or advisory jobs take the reserved slots and the reservation is only
+    # advisory.
+    #
+    # ⚠️ RECORDED DECISION THIS TOUCHES. #2682 recorded "keep the required check off self-hosted
+    #   capacity until 1 and 2 are true" (a dedicated ephemeral, credential-free runner; a fixed
+    #   restart loop). Turning the reservation ON reverses that posture for this job, and is
+    #   therefore an operator decision, not an agent one — which is exactly why it ships OFF by
+    #   default. See the PR body and the #2682 comment for the residual.
+    runs-on: ${{ fromJSON(vars.PIPELINE_COMPLIANCE_RUNS_ON || '["ubuntu-latest"]') }}
+    # #2055 — a job with no `timeout-minutes` that hangs holds a runner indefinitely; on the
+    # RESERVED slots that is a silent outage of the only required check. 20 min is ~130x the
+    # measured 9 s of work and still well inside a GitHub-hosted job's 6 h ceiling.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Run pipeline compliance gate
