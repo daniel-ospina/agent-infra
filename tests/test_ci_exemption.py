@@ -27,6 +27,7 @@ import pytest
 import importlib.util
 import itertools
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -3119,20 +3120,26 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     earlier version of this vector fed `path` + its trailing `# comment` (every listed line has
     one), so all 80 took the old slug fallback and the vector stayed green while asserting a
     token nobody would ever compare. Caught in #2648 review cycle 3.
+
+    ⛔ AND IT READS THE LIST THE RUNNER **EXECUTES**, NOT THE RUNNER'S SOURCE TEXT (#3011). The
+    vector used to scrape `run_shard <path>` rows out of `scripts/run-bash-shards.sh`. Those rows
+    are gone — the list is DERIVED from `SUITE_GLOBS` (#2609) and an enumerated row is a SECOND
+    execution of the same suite (#2838) — so scraping them parsed zero paths and died on the
+    `>= 60` floor, or, worse on a tree that still carried a stray row, would have asserted
+    injectivity over a population that is no longer the list anyone runs. `--list` is the runner's
+    own answer to "what will you execute" (the guard, the lane-parity suite and the merge rail all
+    read it), so the population under test is by construction the executed one.
     """
-    src = (Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh").read_text()
-    listed = []
-    for line in src.splitlines():
-        line = line.strip()
-        if not line.startswith("run_shard "):
-            continue
-        # The runner's own `--list` derives the path with `\([^ ]*\.sh\)`, i.e. the first
-        # space-free token ending in `.sh`. Match that, so a trailing `# comment` is never
-        # part of the path this vector tests.
-        m = re.search(r"(\S+\.sh)\b", line.split(None, 1)[1])
-        if m is None or m.group(1).startswith("$"):
-            continue  # an interpolated or sentinel call, not a listed path
-        listed.append(m.group(1))
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(  # noqa: S603 - a repo-local script, no shell, no user input
+        ["bash", str(root / "scripts/run-bash-shards.sh"), "--list"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"the runner could not print its list (rc {proc.returncode}): {proc.stderr}"
+    listed = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
     assert len(listed) >= 60, (
         f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
         "would pass vacuously"
