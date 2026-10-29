@@ -568,7 +568,9 @@ jobs:
       # #2139 — test_beta_progress.py rides the same list (byte-identical to the PR lane's
       # `test` job): the DELIVERY line's REST second source was live on four boxes and in no
       # repo file, so nothing in CI exercised the fallback it now ships.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q'
+      # #1187 — test_cmux_payload.py rides it too, for the same reason (the sender's
+      # payload-integrity checker was about to ship with no suite running it).
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''
