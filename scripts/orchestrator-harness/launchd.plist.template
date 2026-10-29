@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.eldato.orchestrator-loop</string>
+  <string>__LABEL__</string>
   <!-- ⛔ THE PROGRAM IS THE PINNED TREE, NOT A HOME-DIR COPY (agent-infra#2231, mac pin parity).
        This used to be `__O__/orch-loop.sh` — `~/orchestrator/orch-loop.sh`, a COPY of a script the
-       repo carries, at no commit at all (`git rev-parse --show-toplevel` there says "not a git
-       repository"). That is the divergence this job now cannot have: the path below is a detached
-       `git worktree` of the agent-infra checkout AT THE PINNED COMMIT, created by
-       `cloud-cell-supervisor.sh apply --pin-only` — the same materialiser every cloud cell uses — and
+       repo carries, at no commit at all (a `git rev-parse` there says "not a git repository"). That
+       is the divergence this job now cannot have: the path below is a detached `git worktree` of the
+       agent-infra checkout AT THE PINNED COMMIT, created by `cloud-cell-supervisor.sh`'s pin-only
+       apply — the same materialiser every cloud cell uses — and
        named by `.harness-path` / `$HOME/.pi/agent/state/HARNESS-PIN`. install.sh REFUSES to render
        this plist unless the resolved directory IS that worktree at that commit, so a copy can no
        longer be what the job reads. `__ENTRY__` is chosen INSIDE that tree at render time
