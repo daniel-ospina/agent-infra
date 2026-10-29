@@ -136,13 +136,15 @@ fi
 # OH8 (5 s) and OH1 (1000 s) bracket the floor by a factor of 200, so a floor lowered to 60 — still
 # "a minute of grace" — passed both and would report every lane for its first minute, the same
 # unreadable-report failure at a smaller scale. MID (300 s) closes that gap.
-# ⛔ WHAT THIS CASE DOES AND DOES NOT PIN, stated because it is easy to over-claim: the report derives
-# the age from the wall clock and the fixture's reported age is exactly `age_s=300`, so OH9 catches a
-# floor of 300 or less ONLY because the comparison is `-ge` — a floor of 301 would leave OH9 GREEN.
-# It pins the floor's MAGNITUDE (> 5 min), never the exact 600; the exact value is pinned by the
-# registry's `value` field, in the `MIN_AGE` row's precedent. A fixture 599 s old could not pin an
-# integer boundary without flaking, because the clock moves between arming and reading
-# (agent-infra#2788).
+# ⛔ WHAT THIS CASE DOES AND DOES NOT PIN, stated because it is easy to over-claim: the fixture is armed
+# at `NOW - 300`, but the report reads its OWN clock at read time (`session_age_s` runs `date +%s`), and
+# OH1/OH2/OH8 run before OH9 — so the age the report actually sees is `300 + elapsed`, never exactly 300.
+# OH9 therefore catches any floor of 300 or less ALWAYS (because the comparison is `-ge`), and a floor of
+# 301 whenever at least one second has elapsed between arming and this read — a 301 s floor would make the
+# case time-dependent, not reliably green. It pins the floor's MAGNITUDE (> 5 min), never the exact 600;
+# the exact value is pinned by the registry's `value` field, in the `MIN_AGE` row's precedent. A fixture
+# 599 s old could not pin an integer boundary without flaking, because the clock moves between arming and
+# reading (agent-infra#2788).
 write_scen \
   "merge-10093 $MID\n" \
   "merge-10093 400\n" \
@@ -228,9 +230,11 @@ PY
       '    if [ ! -e "$path" ]; then' \
       '    if false; then' \
       "orphan:kind=unit name=eldato-dead.service"
-  # M3: the FLOOR's VALUE (not just the clause) — raise it past every fixture and the old dead lane
-  # must stop being named. M1 proves the clause is load-bearing; M3 proves the 600 is what it rests on,
-  # which is the half that a floor silently lowered to 0 would keep green (#2788).
+  # M3: the COMPARISON, not the default's value — replace the floor OPERAND with a literal past every
+  # fixture and the old dead lane must stop being named. M1 shows the clause is load-bearing; M3 shows
+  # the comparison is, with the clause intact. NEITHER mutant reads the default: a floor lowered to 0
+  # or 60 leaves M3 green (measured, #2788). The default's value is pinned by the registry's `value`
+  # fragment, in the `MIN_AGE` row's precedent — and, in this suite, by OH8 (0) and OH9 (<= 300).
   mut "M3-age-floor" \
       '"$age" -ge "${MIN_SESSION_AGE_S}"' \
       '"$age" -ge 1000000000' \
