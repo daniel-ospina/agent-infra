@@ -34,13 +34,29 @@ import clampOutputFloor, {
 
 // ── Assertion plumbing (stdlib only, no test runner) ────────────────────────────────────────
 let passed = 0;
+let skipped = 0;
+let armSkipped = false;
 const failures: string[] = [];
+/** A NAMED skip is not a pass (#2643 review, 2026-10-24). This repo's own convention
+ *  (`cloud-cell-bringup.test.sh`'s `⛔ SKIPPED … is NOT a pass`) is that a green shard must never
+ *  read as "unverified": an arm that could not be measured says so in its own counter, and the
+ *  summary prints it beside the pass count. `armSkipped` is what keeps the three counters MUTUALLY
+ *  EXCLUSIVE — without it `test()`'s normal return still counted the arm as passed (measured: an
+ *  arm printed BOTH `↷ SKIPPED` and `✅`, and `27 passed` included two arms never measured, which is
+ *  the exact false green this change exists to remove). */
+function skip(name: string, reason: string): void {
+	skipped++;
+	armSkipped = true;
+	console.log(`  ↷ SKIPPED ${name} — ${reason}`);
+}
 function test(name: string, fn: () => void | Promise<void>): Promise<void> | void {
+	armSkipped = false;
 	try {
 		const result = fn();
 		if (result && typeof (result as Promise<void>).then === "function") {
 			return (result as Promise<void>).then(
 				() => {
+					if (armSkipped) return;
 					passed++;
 					console.log(`  ✅ ${name}`);
 				},
@@ -50,6 +66,7 @@ function test(name: string, fn: () => void | Promise<void>): Promise<void> | voi
 				},
 			);
 		}
+		if (armSkipped) return undefined;
 		passed++;
 		console.log(`  ✅ ${name}`);
 	} catch (error) {
@@ -266,7 +283,7 @@ function realPiPaths(): { shim: string; root: string } | undefined {
 const piPaths = realPiPaths();
 test("resolvePiRoot realpaths the pi SHIM before stripping dist/bundle", () => {
 	if (!piPaths) {
-		console.log("     (skipped — `pi` is not on PATH in this environment)");
+		skip("resolvePiRoot realpaths the pi SHIM", "`pi` is not on PATH in this environment");
 		return;
 	}
 	const argv1 = process.argv[1];
@@ -290,12 +307,58 @@ test("resolvePiRoot honors an explicit PI_ROOT", () => {
 		else process.env.PI_ROOT = previous;
 	}
 });
-test("detectSourcePatch reports PRESENT on this install (the patch is applied)", () => {
+test("detectSourcePatch reports PRESENT for a PATCHED bundle (hermetic fixture)", () => {
+	// The positive arm used to be the LIVE install only, so the detector's "present" answer was
+	// pinned nowhere else — and a box whose pi is unpatched or upgraded failed here for a reason that
+	// has nothing to do with this checkout. Measured 2026-10-24 on the same JOB (`verify`): one run
+	// PASSED on a GitHub-hosted runner (`GitHub Actions 1000589718`) and another FAILED on the
+	// self-hosted cell runner (`ai-runner-cell1-x64-1`), nine commits apart with NONE of them touching
+	// `extensions/` — so this file is byte-identical in both, and the boxes differ in their pi install,
+	// not in the code. Cited by JOB URL, not by sha: those shas were orphaned when this branch was
+	// rebuilt on a newer main, and a citation a reader cannot resolve is not evidence.
+	//   pass: https://github.com/daniel-ospina/agent-infra/actions/runs/40059449222/job/120769571300
+	//   fail: https://github.com/daniel-ospina/agent-infra/actions/runs/40066552774/job/120790915754
+	// differ in their pi install, not in the code: a host dependency wearing a test's clothes, and one
+	// that reddens every PR's evaluated tree (§4.5 of the merge rail) whichever runner picks the job.
+	// The detector's answer is now pinned against a FIXTURE, exactly as its negative control is.
+	const dir = mkdtempSync(join(tmpdir(), "clamp-floor-probe-ok-"));
+	mkdirSync(join(dir, "dist", "bundle", "chunks"), { recursive: true });
+	writeFileSync(
+		join(dir, "dist", "bundle", "chunks", "chunk-AXIIZGTV.js"),
+		'var CONTEXT_SAFETY_TOKENS=4096,MIN_USABLE_MAX_TOKENS=1024,MIN_MAX_TOKENS=1;' +
+			'function clampMaxTokensToContext(model,context,maxTokens){const available=(model?.contextWindow??context)-CONTEXT_SAFETY_TOKENS;' +
+			'return available<MIN_USABLE_MAX_TOKENS?Math.max(1,available):Math.min(maxTokens,available)}',
+	);
+	strictEqual(detectSourcePatch(dir), true);
+	rmSync(dir, { recursive: true, force: true });
+});
+test("detectSourcePatch reports the LIVE install's state, and refuses only where the box REQUIRES the patch", () => {
+	const declared = process.env.PI_SOURCE_PATCH_REQUIRED === "1";
 	if (!piPaths) {
-		console.log("     (skipped — no pi install to probe)");
+		// ⛔ A DECLARATION WITHOUT A SUBJECT IS A FAILURE, not a skip (#2643 review): a box that says
+		// "this box must carry the source patch" and has no pi install to probe has proved nothing,
+		// and reporting green there would let `scripts/pi-patches/verify.sh` print its "change (b)
+		// holds" line over an unmeasured box.
+		strictEqual(declared, false, "PI_SOURCE_PATCH_REQUIRED=1 declares this box must carry the source patch, but no pi install could be probed (`pi` is not on PATH)");
+		skip("detectSourcePatch on this install", "no pi install to probe: `pi` is not on PATH here");
 		return;
 	}
-	strictEqual(detectSourcePatch(piPaths.root), true);
+	const state = detectSourcePatch(piPaths.root);
+	if (state === true) return; // the fleet box shape: patched, nothing to report
+	// ⛔ NOT A FAILURE BY DEFAULT, and the reason is named. Whether THIS BOX carries the upstream
+	// source patch is a per-box OPERATION owned by `scripts/pi-patches/` (its `verify.sh` is the
+	// authority, and its evidence directory is the record) — not a property of this checkout, and
+	// not something a CI runner installs. A box that must be patched DECLARES it (`verify.sh` exports
+	// the declaration below immediately before it runs this suite); then absence is a real failure and
+	// this arm fails for the right reason.
+	if (process.env.PI_SOURCE_PATCH_REQUIRED !== "1") {		skip(
+			"detectSourcePatch on this install",
+			`this box's pi install (${piPaths.root}) answers ${JSON.stringify(state)} for the source patch; ` +
+				`the patch is applied per box by scripts/pi-patches/, whose verify.sh owns that claim and declares it here`,
+		);
+		return;
+	}
+	strictEqual(state, true, "PI_SOURCE_PATCH_REQUIRED=1 declares this box must carry the source patch");
 });
 test("NEGATIVE CONTROL detectSourcePatch reports ABSENT for an unpatched bundle", () => {
 	const dir = mkdtempSync(join(tmpdir(), "clamp-floor-probe-"));
@@ -313,6 +376,11 @@ test("NEGATIVE CONTROL detectSourcePatch reports ABSENT for an unpatched bundle"
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────
 console.log(`\n${failures.length === 0 ? "✅" : "❌"} ${passed} passed, ${failures.length} failed`);
+// ⛔ A SKIP IS ITS OWN COUNT, never folded into `passed` (#2643 review). The old summary printed
+// `27 passed, 0 failed` on a box whose live patch state was never measured, which reads as "patch
+// verified" — the one thing a green shard must never mean. The `passed, failed` line keeps its
+// exact shape (other tooling parses it); the skip count rides on its own line.
+if (skipped > 0) console.log(`   ↷ ${skipped} SKIPPED arm(s) — named above; NOT a pass`);
 if (failures.length > 0) {
 	for (const failure of failures) console.log(`   - ${failure}`);
 	process.exit(1);
