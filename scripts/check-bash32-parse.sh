@@ -94,7 +94,11 @@ derive_suffixless() {
       tests/fixtures/*) continue ;; # the deliberate 3.2-hostile fixtures (same carve-out, same reason)
     esac
     first=""
-    IFS= read -r first <"$ROOT/$rel" 2>/dev/null || continue
+    # ⛔ `|| :`, not `|| continue`: a first line with no trailing newline makes `read` return 1 while
+    # still assigning `$first`, and a `continue` there would DROP a shipped program from the sweep
+    # (the false PASS this gate removes). A file that is gone or unreadable leaves `first` empty and is
+    # skipped by the shebang test below, which is the only skip this loop is allowed to make.
+    IFS= read -r first <"$ROOT/$rel" 2>/dev/null || :
     case "$first" in '#!'*) : ;; *) continue ;; esac
     nb="${first:2}"
     # Word splitting IS the tokeniser: a shebang line carries no quoting (SC2086 is intended here).
