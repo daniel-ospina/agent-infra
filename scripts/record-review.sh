@@ -250,12 +250,18 @@
 #                 clean-low guard in main and the predicates below.
 set -euo pipefail
 
-# ⛔ THE LANDING RAIL'S READS ARE ESSENTIAL (#2342). `gh-limit.py` keeps a reserve below
-# `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read that could not be served from
-# GraphQL — the reserve exists so a LANDING can still spend it. This script IS that landing, so it
-# declares its reads essential rather than being refused by its own reserve. Nothing else in-tree sets
-# this; a poll is never essential.
-export GH_LIMIT_ESSENTIAL=1
+# ⛔ THE RESERVE IS SPENT BY LANDINGS ONLY — AND "THE RESERVE" IS NOT THIS SCRIPT (#2342 review, P1).
+# `gh-limit.py` keeps a reserve below `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read
+# that could not be served from GraphQL. This file used to carry a file-scope
+# `export GH_LIMIT_ESSENTIAL=1` here, which made EVERY `gh` in this script — and in every child it
+# spawns — exempt from that floor. That is the opposite of the policy the layer states
+# (`gh-limit.py::essential()`: "A poll is never essential"; docs/ops/gh-rate-limits.md:454): the
+# floor's reason to exist is the spend measured on THIS rail's own poll loops, so exempting them left
+# the guard unable to fire on its target. ⛔ AND IT BOUGHT THE LANDING'S WRITE NOTHING: `essential()`
+# has exactly one call site, on the NON-mutating arm — a write is refused only by the dated-empty
+# guard, which never consults it. The one in-tree declaration is therefore per call, on the read a
+# landing genuinely cannot do without: `repo-authority.sh::required_checks`
+# (`GH_LIMIT_ESSENTIAL=1 "$gh" api …/protection/required_status_checks`).
 
 # ── closing_issue_refs <text> ─────────────────────────────────────────────
 # Print EVERY issue reference resolved by a closing keyword in <text>, one
