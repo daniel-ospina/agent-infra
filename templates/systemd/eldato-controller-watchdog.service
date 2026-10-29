@@ -1,0 +1,54 @@
+[Unit]
+# eldato controller watchdog — restart a controller that is ALIVE BUT NOT CYCLING, and stop restarting
+# when restarting cannot help.
+#
+# ⛔ WHY THIS UNIT EXISTS AT ALL. `scripts/orchestrator-harness/watchdog-loop.sh` is the pass, and until
+# this timer existed nothing on a cell ran it: the loop's Linux restart branch (`cloud-cell-supervisor.sh
+# start`) was reachable only if a human typed it. A watchdog with no clock is the inert-enforcer shape —
+# it reads as installed, protects nothing, and the box it was written for stays wedged. The measured
+# incident (#2303) was a cell-shaped failure on a Mac: controller up, heartbeat frozen for an hour,
+# `launchctl` loaded, every check GREEN, nothing dispatched.
+#
+# ⛔ THE CONTRACT IS THE SCRIPT'S, AND IT IS THE REASON THIS IS A TIMER AND NOT A SUPERVISOR. systemd's
+# `Restart=always` on eldato-orchestrator.service keeps a PROCESS at one instance; it restarts a process
+# that EXITED, and the measured failure is a process that is still there and no longer cycling. The pass
+# distinguishes HEALTHY (fresh heartbeat + pid), WEDGED (pid alive, heartbeat stale), DOWN (no pid, stale
+# or absent heartbeat) and UNCERTAIN (fresh heartbeat, no pid — NOT restarted: the heartbeat proves the
+# loop is cycling and killing it is the P0), and after MAX_CONSEC restart-worthy observations it STOPS
+# and records the crash once. A crash loop restarted forever is how an hour of fleet time vanished.
+Description=eldato controller watchdog — detect and bound a wedged controller
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/scripts/orchestrator-harness/ARCHITECTURE.md
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+Environment=O={{O}}
+# The bounds are in the UNIT, not inherited from a shell: a systemd unit gets no rc files, so an unset
+# variable silently keeps the script's default — and for this job the defaults ARE the contract. They are
+# written out so an operator can read and change them here rather than in a profile.
+#   HB_STALE=780  the cell supervisor's own limit (CYC*2+300 at CYC=240). Shorter would restart a healthy
+#                 controller mid-cycle; longer would let a wedge outlive the supervisor's own report.
+#   SETTLE=60     the re-check window after a restart; the loop writes $O/heartbeat as the FIRST act of a
+#                 cycle, so a restored controller proves itself in seconds.
+#   MAX_CONSEC=3  three restart-worthy observations in a row, then restarting STOPS for that episode and
+#                 one crash block is recorded; one probe restart follows a further 3 stopped passes.
+Environment=HB_STALE=780
+Environment=SETTLE=60
+Environment=MAX_CONSEC=3
+# The cell's restart verb is `cloud-cell-supervisor.sh start` — the SAME verb the doctor role uses, so no
+# second launch path is invented. The script also resolves a sibling copy; the pin makes it authoritative
+# and fails CLOSED (RESTART-UNAVAILABLE in the log) if the file is gone, which is a visible refusal rather
+# than a fallback to some other copy.
+Environment=SUPERVISOR={{SUPERVISOR}}
+Environment=WATCHDOG_STATE_DIR={{STATE_DIR}}
+ExecStart=/bin/bash {{SCRIPT}}
+# SETTLE alone is 60s; this bounds a hung restart verb so the pass cannot outlive its own timer.
+TimeoutStartSec=180
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

@@ -276,8 +276,9 @@ class ParseResult:
     #: FILE-COARSE, and an operator must be able to see that the comparison happened
     #: at file granularity rather than at test-id granularity.
     runner: list[str] = field(default_factory=list)
-    #: The subset of ``ids`` derived from `run-bash-shards.sh`'s `❌ failed shard: <path>`
-    #: attribution line (#2643) — one per failing bash shard, likewise FILE-COARSE.
+    #: The subset of ``ids`` derived from `run-bash-shards.sh`'s own attribution lines
+    #: (#2643/#2700) — the per-shard `❌ failed shard: <path>` and the recap
+    #: `❌ failing shard(s): <paths>` — one per failing bash shard, likewise FILE-COARSE.
     bash_shard: list[str] = field(default_factory=list)
     #: The `pipeline-compliance` gate ids that entered ``ids`` (#1185) — reported
     #: separately for the same reason as the families above: this identity came
@@ -1730,9 +1731,42 @@ _RUNNER_AGG_SIG = "runner-aggregate"
 #: `decide` returned ``exempt`` for the colliding key, and the constant signature cannot save
 #: it because every shard carries the same one). A path is already whitespace-free, so the
 #: slug bought nothing here. `test_bash_shard_identity_is_injective_over_the_listed_shards`
-#: pins it against the runner's real 80-shard list.
+#: pins it against the runner's real list (86 shards today).
 _BASH_SHARD_RE = re.compile(
     r"^(?:❌|✗)(?:\s*\*\*)*\s*(?i:failed shard):\s*(?P<label>\S.*?)\s*$"
+)
+
+#: THE RUNNER'S RECAP LINE — `❌ failing shard(s): <a>, <b>` — the SAME failure set the
+#: per-shard line carries, printed once at the END of the step instead of once per shard.
+#:
+#: WHAT THIS ARM IS, HONESTLY: REDUNDANCY, not the thing that repaired #2534 — and the `ids=0`
+#: that motivated it belongs to the FIXTURE, not to the run. `tests/fixtures/rail/
+#: bash-suites-shard-recap.txt` is the 7-line tail of the step: it carries the runner's generic
+#: `##[error]Process completed with exit code 1.` (which is deliberately NEVER an identity, see
+#: `_RUNNER_GENERIC_ANNOTATIONS`) but neither the per-shard line nor the step-prefixed
+#: `##[error]bash shard failed:` annotation, so the guard-step pass has nothing to attribute. On
+#: the real run that annotation DOES yield the shard on `main` (the guard-step pass predates
+#: #2648), and #2648's per-shard family — the base of this commit — is a second read of it.
+#: Nothing in `scripts/ci-failure-set.sh` truncates a capture, so no capture of this run was
+#: unattributable by design; what read `ids=0` was the excerpt, on its own.
+#:
+#: So why read it at all? Because it is the runner's own COMPLETE summary of the same set, it is
+#: one line, and it is the shape that survives independently of the per-shard one: an emitter
+#: revision (past or future) that prints only the recap still names every failing shard, and a
+#: capture assembled from a partial log can carry the foot of the step without the middle. That is
+#: a cheap second read of a set the gate already trusts the first read of — and it can only ADD
+#: identities, never remove one.
+#:
+#: ⛔ THE LIST IS SPLIT ON THE EMITTER'S OWN SEPARATOR, `", "` — never on a bare `,`. The runner
+#: builds it as `${shard_failed_list}` joined by `, ` (scripts/run-bash-shards.sh). DECLARED
+#: RESIDUAL: a path that itself contains `, ` is therefore split, and its two halves become two
+#: identities that match nothing on main — a FALSE BLOCK on that shard, in the fail-closed
+#: direction. The per-shard line ADDS the true identity but removes nothing, so the phantom
+#: halves block even when both shapes are present. No listed shard carries `, ` today
+#: (`scripts/run-bash-shards.sh --list`). A bare-`,` split would be strictly worse: it cuts every
+#: comma-containing path whether or not a space follows.
+_BASH_SHARD_RECAP_RE = re.compile(
+    r"^(?:❌|✗)(?:\s*\*\*)*\s*(?i:failing shard\(s\)):\s*(?P<names>\S.*?)\s*$"
 )
 #: ⛔ THE BOLD PAIRS ARE STRIPPED IN THE BULLET POSITION ONLY, never on the whole line
 #: (see :func:`bash_shard_failures`). `line.replace("**", "")` — the sibling's rule — also rewrote
@@ -1744,6 +1778,22 @@ _BASH_SHARD_RE = re.compile(
 #: (see :func:`bash_shard_failures`): ONE rendering rule for both `❌`-keyed parsers.
 _BASH_SHARD_KEY_PREFIX = "bash-shard::"
 _BASH_SHARD_SIG = "bash-shard"
+
+#: ⛔ THIS PASS MAY ONLY EVER ADD AN IDENTITY — never drop one (#2700 review, cycle 3, P1).
+#: A filter over the SHARED label list was tried and reverted: `$`, a backtick and `<`/`>` ARE
+#: legal in POSIX filenames, so dropping them also dropped the per-shard arm's REAL identity
+#: (`❌ FAILED SHARD: scripts/evil$a.sh`, which the parent commit attributed), and `sweep_file()`
+#: reaches `shard_named_failure` without the listed-shard gate. With any other id present the run
+#: still advances `extracted`, so `admin-merge.sh`'s `examined > extracted` refusal never fires and
+#: `decide` certifies the red PR with `blocked=[]` — the #6798/#2193 fail-open, reached from a
+#: normal repo file. So an unexpanded-looking label is NOT filtered; it becomes a `bash-shard::`
+#: token (`$shard_failed_list` -> `%24shard_failed_list`) that can never be in main's rate table.
+#:
+#: DECLARED RESIDUAL: that token BLOCKS on the shard it names, i.e. a permanent false block IF a
+#: capture ever carries this file's source verbatim. The runner prints the EXPANDED value, so no
+#: capture of a real run carries it; and it is the property the per-shard arm already had on
+#: `main` (`❌ FAILED SHARD: %s` -> `bash-shard::%25s`). Fail-closed by over-blocking, never by
+#: dropping — that asymmetry is the whole rule.
 
 #: What `_shard_token` leaves verbatim — a PATH, plus `.`/`-`/`_`. `/` is admissible because the
 #: rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`), not slash-free.
@@ -1767,16 +1817,38 @@ _SHARD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./%\-]+$")
 
 
 def _shard_token(label: str) -> str:
-    """A whitespace-free, INJECTIVE token for a shard path.
+    r"""A whitespace-free, INJECTIVE token for a shard path.
 
     See `_BASH_SHARD_RE` for why a slug is not injective, and `_SHARD_VERBATIM` for why this is
     not `quote`. Each byte outside the verbatim set becomes `%XX` (fixed width, UTF-8), so two
     different paths cannot produce one token, `%` itself is escaped (`%25`) and cannot forge an
-    escape, and there is NO fallback path that could be lossy. For the runner's 80 listed shards
-    the token IS the path, verbatim.
+    escape, and there is NO fallback path that could be lossy. For every shard the runner lists
+    (`run-bash-shards.sh --list`, 86 today) the token IS the path, verbatim.
+
+    A LEADING `./` IS STRIPPED FIRST — repo-relative normalisation, and it is a CORRECTNESS rule
+    rather than tidiness: the two shapes this module reads (the per-shard line and the recap)
+    both come from the same shell variable, but a capture assembled from different sources can
+    spell one shard `./scripts/x.sh` and the same shard `scripts/x.sh`. Un-normalised those are
+    TWO identities for ONE file, and the second one can never match the baseline the other one
+    measured — which is a permanent false block. It cannot merge two DIFFERENT files: `./a` and
+    `a` name the same path.
+
+    ⛔ THE STRIP IS LOOKAHEAD-GUARDED AND MAY NOT EMPTY THE LABEL (#2648 review, cycle 1). Two
+    measured defects in the unguarded form `^(?:\./)+`:
+
+    * a label of exactly `./` stripped to `""`, so the key became `bash-shard::` —
+      which the `ids` door reports as an id (`ok=True`, so the rail's `examined > extracted`
+      refusal does NOT fire) while `parse_failure_rows`/`parse_rates` REJECT it, so `decide`
+      sees an EMPTY failure set and certifies a red PR. A produced-but-rejected id is the
+      #6798/#2193 fail-open; the caller now drops an empty token, and this strip cannot create
+      one.
+    * `.//x` (≡ relative `x`) stripped to `/x` (ABSOLUTE) — the same token as a genuinely
+      absolute `/x`, i.e. two different paths sharing one identity. The lookahead requires a
+      non-`/` after the last `./`, so `.//x` keeps its dots (a duplicate identity for one file,
+      fail-closed) instead of colliding with another one.
     """
     out: list[str] = []
-    for ch in label.strip():
+    for ch in re.sub(r"^(?:\./)+(?=[^/])", "", label.strip()):
         if ch in _SHARD_VERBATIM:
             out.append(ch)
         else:
@@ -1787,7 +1859,10 @@ def _shard_token(label: str) -> str:
 def bash_shard_failures(
     text: str,
 ) -> tuple[list[str], dict[str, frozenset[str]]]:
-    """``(ids, {id: {signature}})`` for `run-bash-shards.sh`'s attribution lines (see `_BASH_SHARD_RE`).
+    """``(ids, {id: {signature}})`` for `run-bash-shards.sh`'s attribution lines.
+
+    TWO shapes, one helper: the per-shard line (`_BASH_SHARD_RE`) and the runner's recap
+    (`_BASH_SHARD_RECAP_RE`).
 
     ONE helper for BOTH doors, exactly as `non_nodeid_failures`, `guard_step_failures` and
     `runner_aggregate_failures` are: the `ids` CLI and the `signatures` CLI must not disagree about
@@ -1803,11 +1878,34 @@ def bash_shard_failures(
         # identity (#2648 cycle-6). The two `❌`-keyed parsers still agree on the plain rendering,
         # which is what both emit; this one additionally survives the bold shape.
         m = _BASH_SHARD_RE.match(line)
-        if m is None:
-            continue
-        key = f"{_BASH_SHARD_KEY_PREFIX}{_shard_token(m.group('label'))}"
-        ids.append(key)
-        signatures[key] = frozenset({_BASH_SHARD_SIG})
+        if m is not None:
+            labels = [m.group("label")]
+        else:
+            # THE RECAP (#2700) — every shard it names is an identity, not only the first.
+            recap = _BASH_SHARD_RECAP_RE.match(line)
+            if recap is None:
+                continue
+            labels = [
+                one.strip() for one in recap.group("names").split(", ") if one.strip()
+            ]
+        for label in labels:
+            token = _shard_token(label)
+            if not token:
+                # ⛔ A LABEL THAT ENCODES TO NOTHING IS NOT AN IDENTITY (#2648 review, cycle 1).
+                # The two doors DISAGREE about an empty token, and that disagreement is the
+                # hazard: the `ids` door REPORTS `bash-shard::` (so the rail's per-run
+                # `examined > extracted` gate passes) while `is_failure_key_loose` says False, so
+                # `parse_failure_rows` drops the row — `decide` then sees an EMPTY set and returns
+                # `CLEAN blocked=0` on a red PR. That is the #6798/#2193 fail-open exactly.
+                # Fail closed: no token, no id, and the run stays unattributable, which is the
+                # refusal this module is built around. (Defence in depth — with the lookahead in
+                # `_shard_token` no non-blank label encodes to nothing today, so this arm is
+                # reachable only if that strip is ever loosened; its test pins the COMPOUND
+                # mutation, and says so.)
+                continue
+            key = f"{_BASH_SHARD_KEY_PREFIX}{token}"
+            ids.append(key)
+            signatures[key] = frozenset({_BASH_SHARD_SIG})
     return sorted(set(ids)), signatures
 
 
@@ -2489,7 +2587,7 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
         f"runner={len(parsed.runner)} "
-        f"bash-shard={len(parsed.bash_shard)}",
+        f"bash-shard={len(parsed.bash_shard)} "
         f"pipeline-checks={len(parsed.pipeline_checks)}",
         file=sys.stderr,
     )
@@ -2509,7 +2607,8 @@ def _cmd_ids(args: argparse.Namespace) -> int:
     for key in parsed.bash_shard:
         print(
             f"ci-exemption: BASH-SHARD failure ATTRIBUTED at FILE granularity "
-            f"(run-bash-shards.sh's own '❌ failed shard: <path>' line): {key}",
+            f"(run-bash-shards.sh's own '❌ failed shard: <path>' or "
+            f"'❌ failing shard(s): <paths>' line): {key}",
             file=sys.stderr,
         )
     for key in parsed.guard_steps:
@@ -2565,7 +2664,7 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
         f"runner={len(parsed.runner)} "
-        f"bash-shard={len(parsed.bash_shard)}",
+        f"bash-shard={len(parsed.bash_shard)} "
         f"pipeline-checks={len(parsed.pipeline_checks)}",
         file=sys.stderr,
     )
