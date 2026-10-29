@@ -1482,6 +1482,16 @@ PY
 
   if [ "$FAILURES" -eq 0 ]; then
     log_line "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
+    # ⛔ THE LAYER IS NOT THE CELL (agent-infra#2916 check 2, correcting #2909). This line used to be
+    # the last thing an operator saw before starting lanes, and `--install` can end here with NO
+    # HARNESS PIN — measured: a `bash -x` trace STOPS at exactly this `log_line`, and the pin was then
+    # recorded by a DIFFERENT script (`cloud-cell-bringup.sh::check_harness_pin`), i.e. the work that
+    # made the cell usable was done by something other than the thing that reported success.
+    # The pin is created in exactly ONE place, and a second copy here would be the duplicated-mechanism
+    # defect the #2916 mandate forbids — so this NAMES it instead of duplicating it, and the cell is
+    # not ready until that gate has run. Nothing here writes or checks the pin: the gate is the
+    # authority and this is the pointer to it.
+    log_line "the LAYER only — the harness PIN is not recorded by this script: a cell is NOT ready to start a controller until 'cloud-cell-bringup.sh --check' has pinned the harness (that gate REFUSES without one; a hand-copied harness is the §11 defect)"
   fi
 }
 
