@@ -90,11 +90,12 @@ FAKE
 chmod +x "$T/bin/rail"
 
 # ── the `gh` double ───────────────────────────────────────────────────────────
-# GH_MODE: merged (default) | open | fail | wrongrepo
+# GH_MODE: merged (default) | open | fail | wrongrepo | otherhost | nourl
 # It answers with the SAME shape the real `gh pr view --json state,mergedAt,url --jq` produces, and
 # the URL names the (repo, PR) it was ASKED for — so the identity check in pr_state is exercised
 # rather than bypassed. `wrongrepo` answers MERGED for a DIFFERENT repository: the case that must
-# never read as this PR's landing (#2235).
+# never read as this PR's landing (#2235). `nourl` emits the `-` that `--jq '.url // "-"'` produces
+# when gh answers with NO url at all — the read that never reached a comparison.
 cat > "$T/bin/gh" <<'GHD'
 #!/usr/bin/env bash
 repo=""; pr=""
@@ -112,6 +113,7 @@ case "${GH_MODE:-merged}" in
   open)   printf 'OPEN - %s\n' "$url" ;;
   wrongrepo) printf 'MERGED 2026-10-27T03:56:04Z https://github.com/someone/else/pull/%s\n' "$pr" ;;
   otherhost) printf 'MERGED 2026-10-27T03:56:04Z https://ghe.example.com/%s/pull/%s\n' "${repo:-x/y}" "$pr" ;;
+  nourl)  printf 'MERGED 2026-10-27T03:56:04Z -\n' ;;
   fail)   printf 'HTTP 502: bad gateway\n' >&2; exit 1 ;;
 esac
 GHD
@@ -712,6 +714,159 @@ OUT="$(GH_MODE=otherhost poll 163)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 25 "$RC" "HOST: a MERGED read from another host is NOT a landing"
 assert_state "$TXT" unknown "HOST: it abstains"
 OUT="$(GH_MODE=merged poll 163)"; assert_rc 0 "${OUT%%|*}" "HOST: the same run lands when the host matches"
+
+# ── AG1b: the abstention NAMES the host it compared, and the knob that pins it ─────────────────
+# `unknown` is the correct state here, and on its own it is not actionable: the run RECORDS the host
+# at `start`, so a line that omits it leaves a lane unable to tell "my origin names a mirror" from
+# "the forge is down" — and it re-polls a run that can never resolve. The line names the recorded
+# host and the override, so the reader's next action is visible in the same row.
+craft 184 hostmismatch rc=0 host=ghe.example.com >/dev/null
+OUT="$(GH_MODE=merged poll 184)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST-ABSTAIN: a github.com URL is not this run's landing"
+assert_contains "$TXT" "on host ghe.example.com" "HOST-ABSTAIN: the abstention names the RECORDED host"
+assert_contains "$TXT" "RAIL_RUN_GH_HOST" "HOST-ABSTAIN: and names the knob that pins it"
+
+# ── AG1c: a run that recorded NO host spells out the default it actually compared ─────────────
+# The tempting implementation is `sed 's/^$/github.com/'` over `file_or_empty "$rd/host"` — and it is
+# WRONG: `file_or_empty` `tr -d`s every newline, so a missing/empty host file yields ZERO BYTES and sed
+# emits NOTHING for empty input (a substitution needs a line to sit on). The row then reads `on host  —`
+# with an empty host, in exactly the branch whose comment promises the default. `github.com` here is not
+# decoration: it is the value `pr_url_names` compared with (`${4:-github.com}`), so a row that omits it
+# tells the reader nothing about what failed. This arm reddens if the default is ever moved back into
+# sed, which is how the empty-host rendering was found (#2959 review, P1).
+# ⛔ `GH_MODE=otherhost`, NOT `fail`: a FAILING gh makes `pr_state` return at its `|| return 0` BEFORE
+# `pr_url_names` is ever called, so an arm built on `fail` is satisfied without the comparison running
+# at all (#2959 review, cycle 2, P2). `otherhost` serves `https://ghe.example.com/…`, so the abstention
+# is CAUSED by the comparison against the `github.com` default.
+# ⛔ WHAT THIS ARM PINS, STATED EXACTLY (#2959 review, cycle 3, P2): the MESSAGE's default. The
+# comparator's own default is a SEPARATE literal (`pr_url_names` `${4:-github.com}`), so this arm alone
+# would stay green if the two diverged. That second default is pinned by arm AG above — `craft 163
+# otherhost rc=0` records no host, and `GH_MODE=merged poll 163` then LANDS against
+# `https://github.com/fake/repo/pull/163`, which is only possible if the comparator defaulted to
+# `github.com`. Two arms, one value each.
+craft 185 nohost rc=0 >/dev/null   # no `host=` kv: this run recorded none
+OUT="$(GH_MODE=otherhost poll 185)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST-DEFAULT: a URL on another host abstains, caused BY the default comparison"
+assert_contains "$TXT" "on host github.com" "HOST-DEFAULT: the abstention spells out the DEFAULT host it compared"
+assert_contains "$TXT" "start a new run" "HOST-DEFAULT: and the remedy names the action that can change a RECORDED host (a re-poll cannot)"
+assert_contains "$TXT" "RAIL_RUN_REPO_SLUG" "HOST-DEFAULT: and names the identity pin that OUTRANKS the knob (else the advice is inert)"
+# ⛔ ONE CAUSE, ONE REMEDY (#2959 review, cycle 4, P2). This arm's cause is a DIFFERENT HOST, so the
+# note must NOT send the reader to `--repo` (a wrong identity records another wrong host) and must not
+# blame a read that SUCCEEDED. Those remedies live on their own arms below, where their cause is built.
+assert_not_contains "$TXT" "check --repo" "HOST-DEFAULT: a host mismatch does NOT send the reader to --repo"
+assert_not_contains "$TXT" "did not complete" "HOST-DEFAULT: and does not blame a read that DID complete"
+
+# ── AG1f: the three abstention causes carry three DIFFERENT remedies ──────────────────────────
+# `pr_state` now names WHICH comparison failed, so each cause gets only its own sentence. Before this,
+# ONE static blob was printed for every cause: a transient `gh` 502 was told to "start a new run" (a
+# SECOND merge attempt for a read that only needed a re-poll), and a run whose liveness was unresolved
+# was told to do the one thing `start` REFUSES while it may still be alive. Each arm builds ONE cause.
+# (a) the READ failed — nothing was compared, so re-polling is the remedy and a new run is not.
+craft 189 readfail rc=137 >/dev/null
+OUT="$(GH_MODE=fail poll 189)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "READ-FAIL: a failed gh read against a killed run still abstains"
+assert_contains "$TXT" "did not complete" "READ-FAIL: the note blames the READ, not the host"
+assert_contains "$TXT" "re-poll" "READ-FAIL: and points at a re-poll"
+assert_not_contains "$TXT" "start a new run" "READ-FAIL: a second merge attempt is NOT prescribed for a transient read"
+assert_not_contains "$TXT" "check --repo" "READ-FAIL: and it is not blamed on the identity"
+# (b) SAME host, different repo/PR — the host matched, so the fault is the IDENTITY. ⛔ A POLL CANNOT
+# MOVE IT: re-polling the RECORDED slug reproduces the same url, and naming a different `--repo` is
+# refused by `derive` as an identity mismatch. So `--repo` alone is NOT the remedy — the only thing
+# that records a new identity is a NEW RUN, which is why this arm asserts one (#2959 review, cycle 5,
+# P1). The earlier arm asserted the OPPOSITE (`not_contains "start a new run"`, labelled "a new run
+# would record the wrong host again") — false for this cause: the host MATCHED, and `start` records the
+# host from the identity value, so a new run with the url's own owner/repo records the right host.
+craft 190 wrongidentity rc=0 >/dev/null
+OUT="$(GH_MODE=wrongrepo poll 190)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "WRONG-ID: a same-host url naming another repo abstains"
+assert_contains "$TXT" "wrong IDENTITY" "WRONG-ID: the note names the identity, not the host"
+assert_contains "$TXT" "start a new run" "WRONG-ID: and prescribes the ONLY action that records a new identity"
+assert_contains "$TXT" "--repo" "WRONG-ID: naming the correct --repo as what the new run must carry"
+assert_contains "$TXT" "--repo github.com/" "WRONG-ID: and SPELLING the host it just proved right — a BARE owner/repo supplies no host, so start would re-record RAIL_RUN_GH_HOST/origin (#2959 review, cycle 6, P2)"
+assert_contains "$TXT" "BARE" "WRONG-ID: and saying why the bare form is not enough, so the reader does not shorten it"
+assert_not_contains "$TXT" "DIFFERENT host" "WRONG-ID: and does not blame the host that MATCHED"
+# (c) the run may STILL BE ALIVE — the host remedy must not be prescribed as an action to take NOW,
+#     because `start` refuses a new run while `prev_in_flight` holds (RAIL_RUN_RECORD_MAX, 24 h). This
+#     is the `rail_liveness=unknown` branch the round-3 diff newly made print the note; NO arm reached
+#     it before (`rg -n railpid scripts/rail-run.test.sh` had only the START record-fields loop).
+#     `pid=999999` is positively gone; `railstart=abc` makes the RAIL's probe ABSTAIN (exit 2).
+craft 191 livemismatch pid=999999 start=0 railpid=$$ railstart=abc >/dev/null
+OUT="$(GH_MODE=otherhost poll 191)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "LIVE-HOST: a host mismatch on a possibly-live run still abstains"
+assert_state "$TXT" unknown "LIVE-HOST: it claims neither a death nor a landing"
+assert_contains "$TXT" "refusal is BOUNDED" "LIVE-HOST: the note says the start refusal is BOUNDED, not indefinite"
+assert_contains "$TXT" "RAIL_RUN_RECORD_MAX" "LIVE-HOST: and names the bound that ends it"
+assert_not_contains "$TXT" "positively gone" "LIVE-HOST: so it does not demand a proof `prev_in_flight` never requires"
+assert_not_contains "$TXT" "and start a new run" "LIVE-HOST: and so it does not tell the reader to start one NOW"
+
+# ── AG1g: the POSITIVELY-GONE path had NO arm, and it is the common terminal one ──────────────
+# `read_artifact 1` at the "recorder GONE, rail not alive, no exit status" branch is where most runs
+# end. Reverting that ONE token to `read_artifact` left the suite at 237/0 (measured, #2959 review,
+# cycle 5, P1) — the run_over gate was UNPINNED on the branch that matters most, and the regression is
+# silent and points the wrong way: a FINISHED run would be handed the "while this record may still look
+# live" caveat, i.e. told to re-poll a record that no longer blocks anything. `pid=999999` is positively
+# gone and no `railpid` is recorded, so the probe reaches the fall-through branch (#2959 review, cycle
+# 5, P1).
+craft 192 gone pid=999999 start=0 >/dev/null
+OUT="$(GH_MODE=otherhost poll 192)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "GONE-HOST: a host mismatch on a positively-gone run still abstains"
+assert_state "$TXT" unknown "GONE-HOST: it claims neither a landing nor a death"
+assert_contains "$TXT" "start a new run" "GONE-HOST: a finished run IS told to start a new run (nothing can refuse it)"
+assert_not_contains "$TXT" "BOUNDED" "GONE-HOST: and is NOT given the while-it-may-still-be-live caveat"
+
+# ── AG1h: a read that names NO url compared nothing, so it is not a host verdict ──────────────
+# `--jq '.url // "-"'` emits `-` when gh answers with no url. Dropping `pr_state`'s `case "$url" in
+# ''|-) return 12` lets it fall through to `uhost=""`, i.e. `return 13` — a DIFFERENT host, which
+# prescribes a new merge attempt for a read that was never compared. No fixture produced a url-less
+# answer before this arm (#2959 review, cycle 5, P2).
+craft 193 nourl rc=0 >/dev/null
+OUT="$(GH_MODE=nourl poll 193)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "NO-URL: a read with no url abstains"
+assert_contains "$TXT" "did not complete" "NO-URL: it is reported as a READ failure"
+assert_not_contains "$TXT" "DIFFERENT host" "NO-URL: not as a host mismatch — no comparison ran"
+
+# ── AG1e: the reason line reaches the paths that ALREADY COMPUTED it ──────────────────────────
+# `read_artifact` sets `abstain_why`, and the no-incarnation branch used to print `read <log> and
+# re-poll` with NO cause — a `pr_state=not-read` row whose reader still cannot tell "my origin names a
+# mirror" from "the forge is down". The datum was in hand and unread, which is the one failure mode
+# this file's own doctrine calls out. Rendered before the fix: `unknown … liveness=unknown`, `no
+# incarnation recorded — with no exit status this is an ABSTENTION…`, `read …/log and re-poll` — and
+# nothing about the host. This arm reddens if `note_abstain` is dropped from that branch (#2959
+# review, cycle 3, P2).
+craft 188 noinc >/dev/null   # no rc, no pid: the liveness probe has NO incarnation to judge
+OUT="$(GH_MODE=fail poll 188)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST/REASON: no incarnation + an unreadable artifact abstains"
+assert_state "$TXT" unknown "HOST/REASON: it does not claim a death or a landing"
+assert_contains "$TXT" "on host github.com" "HOST/REASON: the abstention's reason reaches the no-incarnation branch too"
+
+# ── AG1d: a host-naming IDENTITY pin outranks the knob, and the note says so ──────────────────
+# `start` writes `${host_hint:-$(resolve_host)}`, and `RAIL_RUN_GH_HOST` lives INSIDE `resolve_host`,
+# so a host-naming `--repo`/`RAIL_RUN_REPO_SLUG` makes the knob UNREAD. ⛔ THAT PRECEDENCE PREDATES
+# THIS PR (`#2912` round 7), so the recorded-host half below is a REGRESSION GUARD, not a discriminator
+# of this diff — stated rather than implied, and `docs/ops/rail-run.md`'s "every arm names the guard it
+# discriminates" is about the guard, which a regression guard names honestly too (#2959 review, cycle
+# 3, P2 — a cycle-3 finding also claimed AG1b discriminates nothing; that half is FALSIFIED, AG1b
+# reddens against `origin/main`: 209 passed / 4 failed, measured by cycle 2).
+# The NOTE half IS this diff's: the sentence must name the pin that outranks the knob, or a lane does
+# exactly what it is told and records the SAME pin host again.
+PIN_DIR="$T/host-pin"; mkdir -p "$PIN_DIR"
+git -C "$PIN_DIR" init -q >/dev/null 2>&1
+git -C "$PIN_DIR" remote add origin 'https://github.com/acme/widgets.git' >/dev/null 2>&1
+OUT="$(cd "$PIN_DIR" && RAIL_RUN_REPO_SLUG=pin.example.com/acme/widgets RAIL_RUN_GH_HOST=knob.example.com FAKE_RAIL_SLEEP=1 "$BASH_BIN" "$RR" start 186 2>&1)"
+assert_rc 0 "$?" "HOST/PRECEDENCE: start with a host-naming identity pin AND the knob set"
+PIN_ID="$(run_id_of "$OUT")"
+PIDS+=("$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-186/$PIN_ID" pid)")
+PIN_HOST="$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-186/$PIN_ID" host)"
+if [ "$PIN_HOST" = "pin.example.com" ]; then
+  ok "HOST/PRECEDENCE: the identity pin outranks RAIL_RUN_GH_HOST (recorded pin.example.com, not knob.example.com)"
+else
+  bad "HOST/PRECEDENCE: recorded host='$PIN_HOST' (want pin.example.com) — the identity pin must outrank the knob"
+fi
+craft 187 pinhost rc=0 host=pin.example.com >/dev/null
+OUT="$(GH_MODE=otherhost poll 187)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST/PRECEDENCE: the pin's host is not this run's landing either"
+assert_contains "$TXT" "on host pin.example.com" "HOST/PRECEDENCE: the abstention names the PIN's host"
+assert_contains "$TXT" "outranks it" "HOST/PRECEDENCE: and says the pin outranks the knob, so the remedy is not inert"
 
 # ── AG2: the host is RESOLVED from `origin`, not assumed to be github.com ────────────────────
 # Every arm above PINS the host (`RAIL_RUN_GH_HOST` or a hand-built run dir), so `resolve_host` had
