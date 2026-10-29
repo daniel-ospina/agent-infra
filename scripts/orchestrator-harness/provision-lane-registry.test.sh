@@ -124,8 +124,16 @@ chk "A7 the wt- lane row is rostered with the wt- prefix removed" \
 # exist in either repo, while `turn-end.py` hands this column to the lane as
 # `gh issue list --label <it>`. So the column is EMPTY unless something actually knows the label,
 # and nothing in a cwd does.
+# ⛔ AND THE ASSERTION ITSELF WAS VACUOUS (#3032 review P1). `grep -v "^#" "$ROSTER" | grep -q
+# "lane:"` under `pipefail` is the SIGPIPE false-negative idiom `scripts/check-no-sigpipe-grep.sh`
+# exists to catch: `grep -q` exits at the FIRST match, the writer gets SIGPIPE (141), the pipeline
+# reports non-zero, and the `!` in front of it turns a roster that DOES carry a `lane:` row into a
+# PASS. Measured on this suite's own shape with a 200k-row roster whose `lane:` row is FIRST: the
+# assertion passed every time, i.e. the finding it pins (F4) could have regressed with the suite
+# green — and the repo's own guard reds the file regardless. The producer is captured and tested in
+# the shell instead, which is the shape that guard's own remedy names (and the one A5 already uses).
 chk "A16 no row carries a FABRICATED lane:<digits> label (#3032 F4)" \
-    '! grep -v "^#" "$ROSTER" | grep -q "lane:"'
+    'rows="$(grep -v "^#" "$ROSTER")"; case "$rows" in *"lane:"*) false ;; *) true ;; esac'
 chk "A8 the OWNER's project is NOT rostered (#8177 attribution)" \
     '! grep -qi "deadbeef" "$ROSTER"'
 chk "A9 the shared checkout is NOT rostered" '! grep -q "11112222" "$ROSTER"'
