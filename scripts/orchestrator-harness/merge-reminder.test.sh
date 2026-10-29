@@ -2574,6 +2574,9 @@ ck "§27b ...and goal 2 is NOT-MEASURED for that reason, never compared against 
    "$(qF 'the harness repo could not be resolved' "$MDF" && nq 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
 # ...and the SUT DOES resolve its own checkout (the case the fix exists for): no copy is made, because
 # the script under test is ALREADY inside a checkout and running the copy would test the copy's location.
+# ⛔ NO APOSTROPHE (or any unbalanced quote) IN THE PYTHON BELOW: bash 3.2 — `/bin/bash` on macOS, what
+# `install.sh` runs — does not skip a heredoc body when it scans `$( )` for quotes, so one apostrophe
+# here reads as an unterminated string, the file fails `bash -n`, and the harness cannot re-stamp (#2976).
 _py_s27b_own_checkout() { env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" <<'PYMOD'
