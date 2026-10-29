@@ -126,7 +126,7 @@ chk "A12 a NAME-only wt- directory is NOT rostered (the name is not the evidence
     '! grep -q "bbbb0000" "$ROSTER"'
 chk "A11 each exclusion is NAMED on the report (a vanished window is visible)" \
     'case "$OUT" in *"Personal website"*"not a fleet worktree"*) true;; *) false;; esac'
-chk "A12 the file carries the derivation MARKER (so a refresh may replace it)" \
+chk "A15 the file carries the derivation MARKER (so a refresh may replace it)" \
     'grep -qx "# provisioned-by: provision-lane-registry.py" "$ROSTER"'
 chk "A13 every row is 3 TAB-separated columns in the reader's grammar" \
     '[ "$(grep -v "^#" "$ROSTER" | awk -F"\t" "NF!=3" | wc -l | tr -d " ")" -eq 0 ]'
@@ -218,6 +218,99 @@ chk "F1 rc 3 (REFUSED)" '[ "$RC" -eq 3 ]'
 chk "F2 the refusal names the missing surface" \
     'case "$OUT" in *"no lane surface at all"*) true;; *) false;; esac'
 chk "F3 nothing was written" '[ ! -e "$ROSTER" ]'
+
+echo
+echo "== H. RELATIVE CWD: refused by NAME, never resolved against the caller's own directory =="
+# ⛔ THE GUARD THIS PINS (review finding 3). `os.path.realpath` ABSOLUTISES a relative argument
+# against the caller's cwd, so a resolution-first test can never fail and a relative
+# `current_directory` is silently placed wherever the bring-up (or an operator's shell) happened to
+# be. The caller here IS the fixture home, so the relative spelling `wt-lane-88` would resolve onto
+# a real linked worktree under a fleet root — which is why H2 is non-vacuous, and why H4 is the
+# control that proves the fixture path really is a lane.
+mk_case rel; mk_stub 0 payload
+cat > "$CASE/list.json" <<JSON
+{"window_ref":"window:1","workspaces":[
+ {"id":"aaaa1111-2222-3333-4444-555566667777","custom_title":"RELATIVE","current_directory":"wt-lane-88"}
+]}
+JSON
+(
+  cd "$CASE/home" || exit 1
+  env -u TMUX HOME="$CASE/home" PATH="$CASE/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+      python3 "$SCRIPT" --apply --roster "$ROSTER" >"$T/rel.out" 2>&1
+)
+RC=$?
+chk "H1 rc 0 — the population IS measurable; only the one window is unplaceable" '[ "$RC" -eq 0 ]'
+chk "H2 a RELATIVE cwd gets NO row (its identity would come from the caller's directory)" \
+    '! grep -q "aaaa1111" "$ROSTER"'
+chk "H3 the exclusion NAMES it as a relative spelling, not as a generic non-lane" \
+    'grep -q "RELATIVE (wt-lane-88): the cwd is RELATIVE" "$T/rel.out"'
+# NON-VACUITY: the SAME directory, spelled ABSOLUTELY, IS a fleet lane.
+cat > "$CASE/list.json" <<JSON
+{"window_ref":"window:1","workspaces":[
+ {"id":"aaaa1111-2222-3333-4444-555566667777","custom_title":"ABSOLUTE","current_directory":"$CASE/home/wt-lane-88"}
+]}
+JSON
+(
+  cd "$CASE/home" || exit 1
+  env -u TMUX HOME="$CASE/home" PATH="$CASE/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
+      python3 "$SCRIPT" --apply --roster "$ROSTER" >"$T/abs.out" 2>&1
+)
+chk "H4 …while the SAME directory spelled absolutely IS rostered (the discriminator is the SPELLING)" \
+    'grep -q "lane-88	AAAA1111-2222-3333-4444-555566667777	lane:88" "$ROSTER"'
+
+echo
+echo "== I. EMPTY WORKSPACE LIST: a live daemon's zero is an UNREAD population, not an empty fleet =="
+# ⛔ `parse_workspaces` returns [] for a READABLE empty list, not None, so `derive` used to accept it
+# as a measured population and write a ZERO-ROW roster — the write the `not-applicable` arm needs
+# TWO measurements to justify (review finding 4).
+mk_case empty; mk_stub 0 payload
+printf '{"window_ref":"window:1","workspaces":[]}\n' > "$CASE/list.json"
+run_it --apply
+chk "I1 rc 3 (REFUSED) — a live daemon's zero never becomes a zero-row roster" '[ "$RC" -eq 3 ]'
+chk "I2 nothing was written" '[ ! -e "$ROSTER" ]'
+chk "I3 the refusal names the empty list as an unread population" \
+    'case "$OUT" in *"ZERO workspaces"*) true;; *) false;; esac'
+mk_case empty2; mk_stub 0 payload; printf '[]\n' > "$CASE/list.json"
+run_it --apply
+chk "I4 the BARE-LIST shape refuses the same way (both arrive through parse_workspaces)" \
+    '[ "$RC" -eq 3 ] && [ ! -e "$ROSTER" ]'
+# NON-VACUITY: one real window in the same fixture IS provisioned, so I1 is about the ZERO.
+mk_case empty3; mk_stub 0 payload
+printf '{"window_ref":"window:1","workspaces":[{"id":"c2c97e96-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77","current_directory":"%s"}]}\n' \
+    "$CASE/repo/.worktrees/lane-77" > "$CASE/list.json"
+run_it --apply
+chk "I5 control: a ONE-window list IS provisioned (rc 0), so I1 is not the fixture refusing everything" \
+    '[ "$RC" -eq 0 ] && [ -f "$ROSTER" ]'
+
+echo
+echo "== J. UNREADABLE ROSTER: 'exists and could not be read' is never 'absent' =="
+# ⛔ `existing()` collapsed every OSError into (present=False), so `--apply` replaced a roster whose
+# content it never saw — defeating the one non-destructive rule this tool is built around (review
+# finding 5). A DIRECTORY at the roster path is the unreadable case that needs no uid assumption:
+# `open()` fails with EISDIR for root as well as for a normal user.
+mk_case unread; mk_stub 0 payload; mk_payload
+mkdir -p "$ROSTER"
+run_it --apply
+chk "J1 rc 3 (REFUSED) — --apply never replaces a roster it could not READ" '[ "$RC" -eq 3 ]'
+chk "J2 the refusal says the path EXISTS and could not be read" \
+    'case "$OUT" in *"EXISTS and could not be READ"*) true;; *) false;; esac'
+chk "J3 the path was not replaced (the directory is still a directory)" '[ -d "$ROSTER" ]'
+chk "J4 no temp file was left behind beside it" \
+    '[ -z "$(ls -A "$CASE/home/.pi/agent/state" | grep -v "^lane-registry.tsv$")" ]'
+# …and the per-file case the reviewer named (a roster this process may not read). Mode 000 is
+# unreadable only to a NON-root process, so it is skipped where the suite runs as root.
+if [ "$(id -u)" -ne 0 ]; then
+  mk_case unread2; mk_stub 0 payload; mk_payload
+  printf '# curated by a human\n1 Capture write doors\tFF592476-B4E6-4538-96D9-CC095927C751\tlane:c1-capture\n' > "$ROSTER"
+  cp "$ROSTER" "$T/unread2.first"
+  chmod 000 "$ROSTER"
+  run_it --apply
+  chk "J5 a mode-000 roster is REFUSED, not overwritten" '[ "$RC" -eq 3 ]'
+  chmod 644 "$ROSTER"
+  chk "J6 …and it is byte-identical afterwards" 'cmp -s "$ROSTER" "$T/unread2.first"'
+else
+  echo "skip J5-J6 (running as root: mode 000 is unreadable only to a non-root process)"
+fi
 
 echo
 echo "== G. WIRING: the bring-up and the supervisor both call it =="

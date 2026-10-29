@@ -46,11 +46,12 @@ reader will later consume, and it has exactly three arms — each decided by a M
                   layout ⇒ it has no cmux-workspace lanes at all. The roster's truthful content
                   is ZERO rows, and it is WRITTEN — an absent file is read by the board as
                   "never provisioned" and refuses every candidate, which is the defect.
-  refused         the daemon answers but the list could not be READ, or the box HAS a persisted
-                  layout it cannot read, or there is no lane surface at all (no cmux, no tmux).
-                  NOTHING is written. An unreadable read must never become an empty roster:
-                  that is the false-CLEAN #8175 exists to prevent, and it is the one direction a
-                  provisioning tool must never fail in.
+  refused         the daemon answers but the list could not be READ, or the daemon answers with
+                  ZERO workspaces (a live daemon's zero is an unread population, not an empty
+                  fleet), or the box HAS a persisted layout it cannot read, or there is no lane
+                  surface at all (no cmux, no tmux). NOTHING is written. An unreadable read must
+                  never become an empty roster: that is the false-CLEAN #8175 exists to prevent,
+                  and it is the one direction a provisioning tool must never fail in.
 
 ⛔ A HAND-MAINTAINED ROSTER IS NEVER REPLACED. Provenance decides: a file carrying this script's
 own marker is ours to refresh; a file without it (the Mac's curated roster, 96 rows of human
@@ -73,8 +74,9 @@ Exit codes
        hand-maintained roster left in place)
     2  ACTION NEEDED — the roster is absent or stale and this invocation was not allowed to
        write it (`--check`, or a hand-maintained roster without `--force`)
-    3  REFUSED — the population could not be MEASURED; nothing was written, and the reason is
-       printed (the caller must not read this as "provisioned")
+    3  REFUSED — the population could not be MEASURED, or the roster EXISTS and the read of it
+       failed; nothing was written, and the reason is printed (the caller must not read this as
+       "provisioned")
 """
 from __future__ import annotations
 
@@ -179,6 +181,21 @@ def parse_workspaces(payload: str) -> list[dict] | None:
     return [w for w in data if isinstance(w, dict)]
 
 
+def is_absolute(path: object) -> bool:
+    """True when `path` is the CALLER'S OWN absolute POSIX path.
+
+    ⛔ JUDGED BEFORE `real()`, ON PURPOSE. `os.path.realpath` ABSOLUTISES a relative argument
+    against the provisioner's own CWD, so resolving first makes every relative spelling look
+    absolute and the fail-closed rule below unreachable — the identity decision would then rest
+    on whatever directory the caller happened to be in (the bring-up's cwd, an operator's
+    shell). `scripts/lane-actions.py:569-574` rejects the spelling before resolving for exactly
+    this reason; the two must not disagree about what a lane is.
+    """
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return False
+    return path.startswith("/")
+
+
 def real(path: str) -> str | None:
     if not path or not isinstance(path, str) or "\x00" in path:
         return None
@@ -247,9 +264,11 @@ def is_fleet_worktree(cwd: str) -> bool:
 
     Fail-closed: an unreadable path, a non-absolute path and anything that is not a linked
     worktree under `.worktrees/` or a `wt-<slug>` lane root is NOT a lane, so it gets no row. The
-    cost of a wrong FALSE here is one fewer derived row on a box whose roster we are deriving
-    because it has none; the cost of a wrong TRUE is a roster row attributing an issue to the
-    OWNER's window — a manufactured holder, which is a blocking false COLLISION (#8177).
+    non-absolute case is decided on the CALLER'S spelling (`is_absolute`) BEFORE any resolution,
+    because `realpath` would otherwise absolutise it against this process's own directory and
+    make the guard inert (review finding 3). The cost of a wrong FALSE here is one fewer derived
+    row on a box whose roster we are deriving because it has none; the cost of a wrong TRUE is a
+    roster row attributing an issue to the OWNER's window — a manufactured holder, which is a blocking false COLLISION (#8177).
 
     ⛔ THE NAME ALONE IS NOT EVIDENCE. The first version accepted any path whose basename began
     with `wt-`, so `~/wt-notes`, a `wt-draft` directory, or any plain `wt-*` folder became a
@@ -258,6 +277,8 @@ def is_fleet_worktree(cwd: str) -> bool:
     anchor and `linked_worktree` (the same two-of-three `_is_fleet_wt_dir` requires, plus the
     name), so only a directory `git worktree add` actually created can be rostered.
     """
+    if not is_absolute(cwd):
+        return False
     p = real(cwd)
     if not p or not p.startswith("/"):
         return False
@@ -341,6 +362,13 @@ def derive_rows(workspaces: list[dict]) -> tuple[list[tuple[str, str, str]], lis
             excluded.append(
                 f"{title or wsid[:8]}: no cwd in the answer (unplaceable, so unattributable)")
             continue
+        if not is_absolute(cwd):
+            # ⛔ NAMED, not merely excluded: a relative spelling's identity depends on the
+            # CALLER's directory, so it is unplaceable for a reason no other exclusion shares.
+            excluded.append(
+                f"{title or wsid[:8]} ({cwd}): the cwd is RELATIVE — its identity would come from "
+                "the caller's own directory, so it is unplaceable and unattributable")
+            continue
         if not is_fleet_worktree(cwd):
             excluded.append(f"{title or wsid[:8]} ({cwd}): not a fleet worktree")
             continue
@@ -379,17 +407,35 @@ def render(rows: list[tuple[str, str, str]], arm: str, note: str) -> str:
     return "\n".join(out) + "\n"
 
 
+class RosterUnreadable(Exception):
+    """The roster EXISTS and the READ failed — never the same fact as "absent".
+
+    ⛔ TWO CAUSES WEAR THE SAME `present=False` AND THEY ARE NOT THE SAME PROBLEM (review finding
+    5). An absent file means the roster was never provisioned, so `--apply` may write one. Any
+    other `OSError` means the file is THERE and this script could not see it — a root-owned 0600
+    in a shared cell home, `EACCES`, `EISDIR` — and writing over it would destroy a roster whose
+    content this process never read. The reader (`fleet_state.registry_never_provisioned`) makes
+    this distinction explicitly; the WRITER is the one place that must not collapse it, because
+    the writer is the one that acts on it.
+    """
+
+
 def existing(path: str) -> tuple[bool, bool, list[str]]:
     """(present, ours, rows) — whether the roster exists, whether WE wrote it, and its rows.
 
     Provenance is the marker LINE, never a heuristic on the content: a hand-curated roster may
     contain anything, and guessing at "looks derived" would eventually overwrite it.
+
+    Raises `RosterUnreadable` when the path exists but cannot be read, so "absent" can only ever
+    mean ABSENT.
     """
     try:
         with open(path, errors="ignore") as fh:
             text = fh.read()
-    except OSError:
+    except FileNotFoundError:
         return False, False, []
+    except OSError as exc:
+        raise RosterUnreadable(f"{type(exc).__name__}: {exc}") from exc
     rows = [ln for ln in text.splitlines()
             if ln.strip() and not ln.startswith("#") and "\t" in ln]
     ours = any(ln.strip() == MARKER for ln in text.splitlines())
@@ -427,7 +473,13 @@ def main(argv: list[str] | None = None) -> int:
         args.apply = True
 
     path = roster_path(args.roster)
-    present, ours, rows_now = existing(path)
+    try:
+        present, ours, rows_now = existing(path)
+    except RosterUnreadable as exc:
+        print(f"REFUSED: the roster EXISTS and could not be READ ({exc}) — so this script does not "
+              "know what is in it, and a file it has never seen is never replaced")
+        print(f"  roster: {path} (present — left untouched)")
+        return 3
 
     # ── MEASURE ────────────────────────────────────────────────────────────────────────────
     measured = False
@@ -441,6 +493,21 @@ def main(argv: list[str] | None = None) -> int:
             refusal = (
                 "the cmux daemon answers, but its workspace list could not be READ"
                 + (f" (`cmux list-workspaces --json` exit {rc}: {detail[-1][:160]})" if detail else "")
+            )
+        elif not parsed:
+            # ⛔ "SAW ZERO" IS NOT "THERE ARE NONE" (review finding 4). A daemon that ANSWERS with
+            # an empty workspace list is an UNREAD population, not an empty fleet — the workspace
+            # list is per-window, so zero rows here does not prove the box has no cmux lanes.
+            # Writing the zero-row roster on this measurement would be exactly the false-CLEAN
+            # #8175 exists to prevent, and the `not-applicable` arm is deliberately required to
+            # justify the same write with TWO measurements (no daemon AND no persisted layout).
+            # The reader takes the same view of this datum (`fleet_state`: "could not confirm a
+            # single cmux window (saw 0) … absence is not evidence"), so the writer must not
+            # disagree with it.
+            refusal = (
+                "the cmux daemon answers but reported ZERO workspaces — a live daemon's zero is "
+                "an UNREAD population, not an empty fleet (the workspace list is per-window, so "
+                "absence is not evidence); the roster's truthful content cannot be measured here"
             )
         else:
             measured = True
@@ -479,7 +546,6 @@ def main(argv: list[str] | None = None) -> int:
         for why in excluded:
             print(f"  excluded: {why}")
     else:
-        layout = cmux_layout_store()
         note = ("this box has NO cmux-workspace lanes: the cmux daemon does not answer here and "
                 "no workspace layout has ever been persisted"
                 + (f" (looked for {', '.join(os.path.join(home(), *p) for p in LAYOUT_CANDIDATES)})"
@@ -488,7 +554,6 @@ def main(argv: list[str] | None = None) -> int:
                 "'never provisioned' and would refuse every candidate)")
         rows: list[tuple[str, str, str]] = []
         text = render(rows, arm, note)
-        del layout
 
     if args.print_rows:
         for label, wsid, lane in rows:
