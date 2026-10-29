@@ -950,6 +950,18 @@ live_process_for() { # <canon> <recorded> [<exclude-pids>] -> matching pid ("" w
 # walk, which would be unbounded). Best-effort by design: a missing or slow
 # lsof sets CWD_DEGRADED and the pass falls back to the argv probe — reported in
 # the footer and the log, never a silent pass.
+#
+# ⛔ CWD_DEGRADED DESCRIBES THE TABLE THAT IS IN `CWD_OUT` NOW, NOT THE PASS'S HISTORY (review
+# round 10, P2). It was a LATCH: set to 1 by any failure and cleared NOWHERE, so `holder_recheck`'s
+# "the pass HAD a good cwd table and the re-read lost it" guard read the flag's lifetime instead of
+# the current table. Reachable ordering with no execution: (a) the pass-start `lsof` times out ⇒
+# flag=1; (b) worktree A's re-read SUCCEEDS ⇒ the table in hand is good but the flag stays 1, so the
+# guard is skipped — correct by luck; (c) worktree B's re-read FAILS ⇒ the guard is skipped because
+# the flag is still 1, `holders_live` runs argv-only, and a checkout whose only witness is its cwd is
+# deleted under a live lane — verbatim the round-2 P1 this file claims is closed, in a second
+# ordering. Clearing on a successful NON-EMPTY read fixes it and leaves the no-lsof host unchanged:
+# that host degrades on EVERY call, so it keeps the documented argv-only behaviour. The footer then
+# finally reports the state of the table it names.
 cwd_probe_load() {
     CWD_OUT="$(mktemp "${TMPDIR:-/tmp}/pi-reap-cwd.XXXXXX")" || { CWD_OUT=""; CWD_DEGRADED=1; return 0; }
     if ! command -v "$LSOF_BIN" >/dev/null 2>&1; then
@@ -958,6 +970,8 @@ cwd_probe_load() {
     run_bounded "$REAP_WT_CWD_TIMEOUT" "$CWD_OUT" "$LSOF_BIN" -a -d cwd -Fpn
     if [ $? != 0 ] || [ ! -s "$CWD_OUT" ]; then
         CWD_DEGRADED=1; log "CWD probe degraded: lsof failed/empty — argv-only live-reference check"
+    else
+        CWD_DEGRADED=0
     fi
     return 0
 }
@@ -1901,6 +1915,20 @@ holder_recheck() {
     # volume this reaper exists to reclaim. The cwd predecessor was already released; this is the pair.
     ps_prev="$PS_OUT"
     if ! ps_load; then
+        # ⛔ A FAILED RE-PROBE MUST NOT WEAKEN THE PASS'S WITNESS SET (review round 10, P1).
+        # `ps_load` assigns PS_OUT BEFORE it can fail (it mints the new table first, then returns 1 on
+        # a timeout or an empty read), so returning here with PS_OUT pointing at the NEW EMPTY table
+        # left `ps_prev` — the pass's good table — orphaned, and every LATER row of the pass was then
+        # classified against an empty one. `live_process_for` begins `[ -s "$PS_OUT" ] || return 1`, so
+        # "empty" reads as "no argv holder": a checkout whose only holder is argv-visible is deleted
+        # under a live lane. The file's own loader states the rule this broke (`ps_load` header: an
+        # empty table is a probe FAILURE, not "no live processes"). The cwd arm below already restores
+        # its predecessor; this is the missing pair, and it also stops the leak of the new table into
+        # the volume this reaper exists to reclaim. Reachable, not theoretical: `REAP_WT_PS_TIMEOUT` is
+        # operator-settable and `ps -axo` on a cell carrying ~59 checkouts and 20 lanes is exactly the
+        # probe that times out — and the pass continues afterwards, by design.
+        if [ -n "${PS_OUT:-}" ] && [ "${PS_OUT:-}" != "$ps_prev" ]; then rm -f "$PS_OUT"; fi
+        PS_OUT="$ps_prev"
         REMOVE_SKIP_VERDICT="live-probe-unavailable"
         log "REMOVE-SKIP $path the live-holder re-probe could not read the process table — nothing removed, preserved (fail-closed)"
         return 2
@@ -1913,9 +1941,12 @@ holder_recheck() {
     # removal would proceed on ARGV-ONLY evidence, and (b) clobber the pass's good table for every
     # subsequent classification. A lane's own `pi` has cwd = the worktree and argv = the INSTALLED
     # path, so cwd is that holder's ONLY witness: proceeding would delete a live lane's checkout.
-    # The distinction that matters is WHEN it degraded. If the pass started degraded (no lsof on this
-    # host) the removal path is argv-only BY DOCUMENTED DESIGN and the footer says so; if the pass HAD
-    # a cwd table and the re-read lost it, that is a new fact and the answer is preserve.
+    # The distinction that matters is WHEN it degraded. `CWD_DEGRADED` describes the table in hand
+    # NOW (review round 10, P2 — it used to be a latch that was never cleared, so after one transient
+    # failure this guard could never fire again), so `cwd_prev_degraded = 0` really does mean "the
+    # table we are about to replace is good". A host with NO lsof degrades on every call, so its
+    # removal path stays argv-only BY DOCUMENTED DESIGN and the footer says so; a pass that started
+    # degraded but has since read a good table is NOT such a host, and this guard stays armed for it.
     cwd_prev="$CWD_OUT"; cwd_prev_degraded="$CWD_DEGRADED"
     cwd_probe_load
     if [ "$cwd_prev_degraded" = 0 ] && { [ "$CWD_DEGRADED" != 0 ] || [ ! -s "${CWD_OUT:-}" ]; }; then
