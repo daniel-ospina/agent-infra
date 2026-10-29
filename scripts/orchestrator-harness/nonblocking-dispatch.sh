@@ -350,24 +350,32 @@ cd "$WT" || exit 2
   # no explanation, and a test asserting the note could flake on it. In this order a status read sees
   # either "running" (no .rc yet) or a verdict WITH its note — never a verdict stripped of it.
   if [ "${AGENT_CAP_HIT:-0}" = "1" ]; then
-    # ⛔ THE NOTE FOLLOWS `WIP_SNAPSHOT_RESULT`, NEVER THE PRESENCE OF A DIRECTORY (#2045, VGATE
-    # cycle 3). An earlier version keyed on `-n "$WIP_SNAPSHOT_DIR"` and fell through to
-    # "the worktree was CLEAN, nothing was lost" when the snapshot FAILED — so a cap kill on a full
-    # disk, the leading cell failure mode, would have reported that nothing was lost over work that
-    # existed only in a worktree about to be reaped. That is #2045's own defect, one layer up.
+    # ⛔ THE NOTE NAMES THE BOUND THAT ENDED THE WORKER (#2888 review, P2-5). `AGENT_CAP_HIT` now fires
+    # on a PROGRESS kill too (verdict=stalled at ~the allowance), so restating this launcher's own
+    # `$T` published `cap 7200s hit` over a worker the 2700 s progress rule killed — a false statement
+    # about WHICH bound ended it, the defect class the same change fixed in `[timeout]`/`walltime.tsv`.
+    # `AGENT_CAP_BOUND` is run_agent's measurement of the bound that actually fired; `$T` stays the
+    # fallback for an `$O/spawn-gate.sh` older than this change (tolerant, like every other field here).
+    _cap_s="${AGENT_CAP_BOUND:-$T}"
+    case "${AGENT_BOUND_VERDICT:-}" in
+      stalled)           _cap_why="PROGRESS bound (verdict=stalled) at ${_cap_s}s" ;;
+      exceeded-wallclock) _cap_why="WALL backstop (verdict=exceeded-wallclock) at ${_cap_s}s" ;;
+      '')                _cap_why="bound ${_cap_s}s" ;;
+      *)                 _cap_why="bound ${_cap_s}s (verdict=${AGENT_BOUND_VERDICT})" ;;
+    esac
     case "${WIP_SNAPSHOT_RESULT:-}" in
       COMPLETE)
-        note="cap ${T}s hit — COMPLETE WIP snapshot: ${WIP_SNAPSHOT_DIR:-<unrecorded>}" ;;
+        note="${_cap_why} — COMPLETE WIP snapshot: ${WIP_SNAPSHOT_DIR:-<unrecorded>}" ;;
       PARTIAL)
         # A PARTIAL snapshot is a rescue aid, NOT a licence to reap: say so here, where an operator
         # reads it, rather than only in the log (VGATE cycle 8, P2).
-        note="cap ${T}s hit — PARTIAL WIP snapshot (INCOMPLETE: the worktree is still the only full copy, do NOT reap it): ${WIP_SNAPSHOT_DIR:-<unrecorded>}" ;;
+        note="${_cap_why} — PARTIAL WIP snapshot (INCOMPLETE: the worktree is still the only full copy, do NOT reap it): ${WIP_SNAPSHOT_DIR:-<unrecorded>}" ;;
       NOTHING-LOST)
-        note="cap ${T}s hit — the worktree was CLEAN, nothing was lost" ;;
+        note="${_cap_why} — the worktree was CLEAN, nothing was lost" ;;
       *)
-        note="cap ${T}s hit — WORK NOT PRESERVED (${WIP_SNAPSHOT_RESULT:-unknown}): it is still only in the worktree, so do NOT reap it. See $LOG" ;;
+        note="${_cap_why} — WORK NOT PRESERVED (${WIP_SNAPSHOT_RESULT:-unknown}): it is still only in the worktree, so do NOT reap it. See $LOG" ;;
     esac
-    printf 'cap_s=%s\nresult=%s\nsnapshot=%s\nnote=%s\n' "$T" "${WIP_SNAPSHOT_RESULT:-none}" "${WIP_SNAPSHOT_DIR:-}" "$note" > "$CAPF"
+    printf 'cap_s=%s\nresult=%s\nsnapshot=%s\nnote=%s\n' "$_cap_s" "${WIP_SNAPSHOT_RESULT:-none}" "${WIP_SNAPSHOT_DIR:-}" "$note" > "$CAPF"
   fi
   # ⛔ `.end` BEFORE `.rc`, for the reason `.cap` is: `--status` reads `.rc` FIRST, so writing the
   # exit status first leaves a window in which a terminal report exists without the fate of the work.
