@@ -21,6 +21,13 @@
 #   §E `pi` unavailable         => refusal, NO comment (nothing to record either)
 #   §F reviewer with no verdict => failure (not "issues"), NO comment, NO record
 #   §G head moved mid-review    => refusal, NO record against the new head
+#   §A3 (#2572) the record is PINNED to the REVIEWED head: the recorder REFUSES a moved head and
+#      NOTHING is minted (§A4 mutates the flag away and the SAME scenario poisons the store with a
+#      `clean` at a head nobody read); the pin's TWO exit-3 refusals — "the head MOVED" versus
+#      "could not verify the PR head" (a gh/API TRANSPORT failure) — are classified SEPARATELY, and a
+#      widened predicate is shown taking the wrong arm on the unverifiable output; and the literals
+#      both seams key on are asserted present in `record-review.sh`, so a producer reword turns CI
+#      red instead of silently re-grading a refusal
 #   §H already recorded at head => refusal to re-record an unchanged head
 #   §L a CLEAN verdict contradicted by its own [P1] line => refused, no record
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
@@ -131,7 +138,7 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
        FIXTURE_MARKER_MISSING FIXTURE_MARKER_DIFF FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
-       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC
+       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD FIXTURE_PIN_UNCHECKABLE
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -320,8 +327,40 @@ cat > "$TMP/bin/fake-record" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMP/record-argv.txt"
 pr="$1"; sha="$2"; verdict="$3"; repo="$4"; shift 4 || true
-ev=""
-while [ "$#" -gt 0 ]; do case "$1" in --evidence) ev="${2:-}"; shift 2 ;; *) shift ;; esac; done
+ev=""; pin=""
+while [ "$#" -gt 0 ]; do case "$1" in
+  --evidence) ev="${2:-}"; shift 2 ;;
+  --expect-head) pin="${2:-}"; shift 2 ;;
+  *) shift ;;
+esac; done
+# ⛔ #2572 — THE FIXTURE ENFORCES THE PIN, IT DOES NOT MERELY RECORD IT. A fixture that only checked
+# its argv would prove the flag is PASSED; this proves it is the thing that REFUSES, which is the
+# claim. `record-review.sh` exits 3, writes no record and posts no marker when the PR's live head is
+# not the sha named by `--expect-head`, and it names BOTH shas on stderr — reproduced here verbatim
+# enough that the seam's own divergence arm (which greps for the flag) is exercised for real.
+# With NO pin the fixture does what the real recorder's #2982 carry arm does — re-binds the verdict to
+# the LIVE head (a true statement about the PR head, and not an answer to "record this sha") — so the
+# unpinned call MINTS a `clean` record at a head nobody reviewed. That is the harm §A4 measures.
+if [ -n "${FIXTURE_LIVE_HEAD_AT_RECORD:-}" ] && [ "$pin" != "$FIXTURE_LIVE_HEAD_AT_RECORD" ]; then
+  if [ -n "$pin" ]; then
+    printf '\u26d4 --expect-head: the PR head is %s, NOT the %s you named — refusing to record (no record written, no marker posted).\n' \
+      "$FIXTURE_LIVE_HEAD_AT_RECORD" "$pin" >&2
+    exit 3
+  fi
+  sha="$FIXTURE_LIVE_HEAD_AT_RECORD"
+fi
+# ⛔ THE PIN'S SECOND EXIT-3 REFUSAL — `record-review.sh:3029` (P2, fresh review of PR #2988). When the
+# recorder cannot READ the PR's live head at all (gh failing: 403 secondary rate limit, 5xx, expired
+# token; the #784 population) it refuses with `could not verify the PR head against <pin>` — the head
+# did NOT move, and the remedy is a RECORD retry, not a fresh PAID review. Both refusal arms name
+# `--expect-head`, so a predicate keyed on the flag cannot tell them apart; this knob is what makes the
+# distinction DRIVABLE. Faithful on the property that matters: it writes NOTHING (no record file, no
+# body marker) and exits 3 — unlike `FIXTURE_RECORD_RC`, which does its work before exiting.
+if [ "${FIXTURE_PIN_UNCHECKABLE:-0}" = "1" ]; then
+  printf '\u26d4 --expect-head: could not verify the PR head against %s — refusing to record (no record written, no marker posted).\n' "${pin:-<none>}" >&2
+  printf '   Resolved head: <unavailable: no $REPO, or gh missing/failing>. A pin exists only if it is checked.\n' >&2
+  exit 3
+fi
 owner="${repo%%/*}"; name="${repo##*/}"
 mkdir -p "$HOME/.pi/agent/reviews"
 # FIXTURE_NO_RECORD_FILE: rc=0 having written NOTHING — the "recorder returned 0 but the
@@ -397,6 +436,8 @@ reset() {
   FIXTURE_ISSUE_BODY="the linked issue body"
   FIXTURE_CID="9001"; FIXTURE_AUTH_RC=0; FIXTURE_PI_RC=0
   FIXTURE_MOVE_HEAD_TO=""; FIXTURE_RECORD_RC=0
+  FIXTURE_LIVE_HEAD_AT_RECORD=""
+  FIXTURE_PIN_UNCHECKABLE=0
   FIXTURE_PI_SLEEP=""
   FIXTURE_COMMENT_RC=0
   unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL REVIEW_PR_MIN_TIMEOUT REVIEW_PR_KILL_GRACE
@@ -422,6 +463,7 @@ rc_of() { cat "$TMP/rc"; }
 out_has() { case "$(cat "$TMP/out.txt")" in *"$1"*) return 0;; *) return 1;; esac; }
 out_not_has() { case "$(cat "$TMP/out.txt")" in *"$1"*) return 1;; *) return 0;; esac; }
 err_has() { case "$(cat "$TMP/err.txt")" in *"$1"*) return 0;; *) return 1;; esac; }
+err_not_has() { case "$(cat "$TMP/err.txt")" in *"$1"*) return 1;; *) return 0;; esac; }
 no_record() { [ ! -f "$TMP/record-argv.txt" ]; }
 no_comment() { [ ! -f "$TMP/comment.md" ]; }
 no_reviewer() { [ ! -f "$TMP/pi-runs.txt" ]; }
@@ -435,8 +477,8 @@ run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "exit 0 on a CLEAN verdict (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "record-review.sh WAS called"
 want="$REPO_FIXTURE"; [ "$(cat "$TMP/record-argv.txt" 2>/dev/null | head -1)" = \
-  "2284 $HEAD_FIXTURE clean $want --evidence comment:9002" ]
-ck $? "…with <PR> <reviewed-head> clean <repo-from-url> --evidence comment:<id> (got: $(cat "$TMP/record-argv.txt" 2>/dev/null))"
+  "2284 $HEAD_FIXTURE clean $want --evidence comment:9002 --expect-head $HEAD_FIXTURE" ]
+ck $? "…with <PR> <reviewed-head> clean <repo-from-url> --evidence comment:<id> --expect-head <reviewed-head> (got: $(cat "$TMP/record-argv.txt" 2>/dev/null))"
 # ⛔ WHICH comment it names is asserted, not just that it names one (P2, fresh review of
 # #2288): the notes comment is posted first (id 9001) and the verdict second (id 9002), and
 # the seam must record the VERDICT — a mutant recording the notes passed every other
@@ -499,6 +541,148 @@ RECORDER_OVERRIDE="$TMP/bin/not-executable" run "$SRC" 2284
 [ "$(rc_of)" = "9" ]; ck $? "a non-executable recorder => exit 9 (rc=$(rc_of))"
 no_reviewer; ck $? "…and NO reviewer was spawned (nothing was paid for)"
 no_record; ck $? "…and no record was attempted"
+
+# ── §A3 #2572 — THE RECORD IS PINNED TO THE HEAD THAT WAS REVIEWED ───────────
+# The seam's advertised guarantee ("a record bound to the head it actually reviewed") is only a
+# guarantee if the ONE call that mints the record says which head that is. Without `--expect-head`
+# the recorder is free to re-point the verdict at the PR's LIVE head through its #2982 carry arm —
+# a true statement about the PR head, and not an answer to "record this sha" (tortoise#9492).
+# ⛔ THE FIXTURE ENFORCES THE FLAG, so these arms drive the refusal itself and not just its argv:
+# `FIXTURE_LIVE_HEAD_AT_RECORD` is the head the PR is at when the recorder runs, and the fake
+# refuses (rc=3, naming both shas) unless the caller pinned exactly that. An UNPINNED call, by
+# contrast, mints at the live head — the carry arm's real behaviour — which is the harm §A4 measures.
+echo; echo "§A3 #2572 — the recorder is PINNED to the reviewed head, and a head that moved is REFUSED"
+# one predicate, used by §A3 AND re-evaluated verbatim against the mutant in §A4: a mutation control
+# that asserts a DIFFERENT thing from the assertion it claims to falsify proves nothing.
+pin_asserted() { # <argv-file> -> 0 iff the recorder call carries --expect-head <the REVIEWED head>
+  case "$(cat "$1" 2>/dev/null)" in *"--expect-head $HEAD_FIXTURE"*) return 0 ;; *) return 1 ;; esac
+}
+PIN_ASSERTION="the recorder call carries --expect-head <the REVIEWED head $HEAD_FIXTURE>"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a pinned call at an unchanged head still records (rc=$(rc_of))"
+pin_asserted "$TMP/record-argv.txt"
+ck $? "$PIN_ASSERTION (got: $(cat "$TMP/record-argv.txt" 2>/dev/null))"
+# (2) THE MOVED HEAD. The review read HEAD_FIXTURE; by the time the recorder runs the PR is at
+# HEAD2_FIXTURE (the window between the §G re-read and the mint — §G covers the OTHER window, a move
+# during the review, and refuses before anything is posted). The pin makes this a refusal, and the
+# refusal has to name BOTH shas or the operator cannot tell a stale review from a recorder bug.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD2_FIXTURE"
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "a PR head that MOVED before the record => exit 9, never success (rc=$(rc_of))"
+out_not_has "recorded clean"; ck $? "…and the success line is NOT printed"
+err_has "MOVED between the review and the record"; ck $? "…the seam names WHEN it moved (not a generic 'the recorder failed rc=3')"
+err_has "$HEAD_FIXTURE"; ck $? "…naming the REVIEWED sha ($HEAD_FIXTURE)"
+err_has "$HEAD2_FIXTURE"; ck $? "…and the LIVE sha the recorder refused to bind ($HEAD2_FIXTURE) — BOTH shas"
+[ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]
+ck $? "…and NO record exists at all: the pin refuses BEFORE minting, so the store is never poisoned with a clean record at an unreviewed head"
+# (3) THE RESIDUAL ARM: a recorder that fails WITHOUT naming either pin refusal must stay the
+# GENERIC named failure. This is an anti-catch-all control, NOT evidence for the pin, and it says so:
+# the pre-fix source (`[ "$REC_RC" -eq 0 ] || die … "record-review.sh FAILED rc=$REC_RC …"`) satisfies
+# every assertion below, so it cannot distinguish fixed from unfixed code by itself. ⛔ What it does NOT
+# show (the pre-PR comment claimed it did, P2 fresh review of PR #2988): `FIXTURE_RECORD_RC=3` writes
+# the record AND the body marker BEFORE exiting, so "nothing written" is false for this shape — the
+# real rc=3 arms write nothing, and §A3(2)/(4) are where that is asserted.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_RECORD_RC=3
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "a recorder that refuses (rc=3) => exit 9, never success (rc=$(rc_of))"
+out_not_has "recorded clean"; ck $? "  …and no success line"
+err_has "record-review.sh FAILED rc=3"; ck $? "  …and a refusal that names NEITHER pin arm stays the generic named failure (neither new arm is a catch-all)"
+# (4) THE PIN'S SECOND REFUSAL IS NOT THE FIRST ONE (P2, fresh review of PR #2988). `record-review.sh`
+# refuses `--expect-head` for TWO reasons that need OPPOSITE remedies, and both print the flag:
+#   :2884 `the PR head is <live>, NOT the <pin> you named`  => it MOVED; a fresh review is owed
+#   :3029 `could not verify the PR head against <pin>`      => it could not be CHECKED (gh/API down);
+#                                                              the head did not move, RE-RUN THE RECORDER
+# A predicate keyed on the flag's PRESENCE merges them and orders a second PAID review for a transport
+# blip. This arm drives the producer's real second message end to end.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_PIN_UNCHECKABLE=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "an UNVERIFIABLE pin (recorder cannot read the live head) => exit 9 (rc=$(rc_of))"
+out_not_has "recorded clean"; ck $? "  …and no success line"
+err_has "could NOT CHECK the --expect-head pin"; ck $? "  …the seam names WHICH refusal it was (the pin could not be CHECKED)"
+err_not_has "MOVED between the review and the record"; ck $? "  …and does NOT report it as a MOVED head (the flag-presence predicate's misdiagnosis)"
+err_not_has "a fresh review is owed"; ck $? "  …so it does not order a fresh PAID review for a gh/API transport failure"
+err_has "Retry the RECORD"; ck $? "  …the remedy it names is the RECORD retry (the actionable one)"
+[ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]
+ck $? "  …and NOTHING was minted — the recorder refused before writing a record"
+# ⛔ THE INVERTED CONTROL (§A4's standard): re-evaluate the PRE-FIX predicate — the flag's presence,
+# nothing more — against the SAME unverifiable output, by widening the shipped literal back to the
+# flag name. It takes the MOVED arm, so the §A3(4) assertions above are what the discrimination buys,
+# not a property of the scenario.
+MUT_PRED="$TMP/mutant-widepredicate.sh"
+sed "s|^PIN_MOVED_LIT='--expect-head: the PR head is '|PIN_MOVED_LIT='--expect-head'|" "$SRC" > "$MUT_PRED"; chmod +x "$MUT_PRED"
+if cmp -s "$SRC" "$MUT_PRED"; then
+  fail "the widened-predicate mutation did not apply — the literal no longer has the anchored shape, so this control proves NOTHING (update the sed anchor)"
+else
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_PIN_UNCHECKABLE=1
+  run "$MUT_PRED" 2284
+  err_has "MOVED between the review and the record"
+  ck $? "  …and the PRE-FIX predicate (flag presence only) DOES report the same output as MOVED — so the classification is what fixes it"
+  err_not_has "could NOT CHECK the --expect-head pin"
+  ck $? "  …naming no transport failure at all, and advising a fresh review the operator never owed"
+fi
+# (5) THE LITERALS ARE A CONTRACT WITH THE PRODUCER, AND A CONTRACT THAT IS CHECKED. Classifying a
+# refusal by its words is only sound while those words are the producer's; a reword on EITHER side
+# would silently re-grade every refusal (cause 2 back onto cause 1), which is the defect §A3(4)
+# guards by EXECUTION and this arm guards by CONSTRUCTION. Both consumers declare the literals as
+# `PIN_MOVED_LIT=` / `PIN_UNCHECKABLE_LIT=`; this reads them OUT of each file and asserts the producer
+# still emits them.
+PRODUCER="$ROOT/scripts/record-review.sh"
+producer_names_literals() { # <consumer> <producer> -> 0 iff BOTH literals the consumer keys on are in the producer
+  local c="$1" p="$2" ml ul
+  ml="$(sed -n "s/^ *PIN_MOVED_LIT='\(.*\)'$/\1/p" "$c" 2>/dev/null | head -1)"
+  ul="$(sed -n "s/^ *PIN_UNCHECKABLE_LIT='\(.*\)'$/\1/p" "$c" 2>/dev/null | head -1)"
+  [ -n "$ml" ] && [ -n "$ul" ] || return 1
+  grep -qF -- "$ml" "$p" 2>/dev/null && grep -qF -- "$ul" "$p" 2>/dev/null
+}
+for consumer in "$SRC" "$ROOT/scripts/orchestrator-harness/merge-one.sh"; do
+  producer_names_literals "$consumer" "$PRODUCER"
+  ck $? "$(basename "$consumer") keys on two literals that record-review.sh still emits (moved: '…the PR head is '; uncheckable: 'could not verify the PR head against')"
+done
+# …and the guard BITES: reword the producer's second refusal and the SAME predicate goes false, so a
+# drift on either side is a RED build rather than a silent re-grading of every future refusal.
+MUT_PRODUCER="$TMP/mutant-producer.sh"
+sed 's|could not verify the PR head against|could not read the PR head for|' "$PRODUCER" > "$MUT_PRODUCER"
+if cmp -s "$PRODUCER" "$MUT_PRODUCER"; then
+  fail "the producer-reword mutation did not apply — `could not verify the PR head against` is no longer in record-review.sh, so this control proves NOTHING"
+else
+  producer_names_literals "$SRC" "$MUT_PRODUCER"
+  [ $? -ne 0 ]; ck $? "  …a reworded producer makes the SAME predicate FALSE (the drift is caught, not absorbed)"
+fi
+
+# ── §A4 MUTATION — drop the pin and the SAME move mints a record at the unreviewed head ──
+# ⛔ THIS IS THE WHOLE ISSUE, ONE LAYER UP: a suite whose pin assertion still passed with
+# `--expect-head` deleted would be VACUOUS. The mutation is applied to a COPY of the shipped script
+# and the §A3 predicate is re-evaluated against it, with the expectation INVERTED — so the assertion
+# is shown FALSE on the mutant, in its own words, rather than asserted through a proxy.
+echo; echo "§A4 mutation: without --expect-head the moved-head scenario MINTS a clean record at a head nobody reviewed"
+MUT_PIN="$TMP/mutant-nopin.sh"
+sed 's| --expect-head "\$HEAD"||' "$SRC" > "$MUT_PIN"; chmod +x "$MUT_PIN"
+if cmp -s "$SRC" "$MUT_PIN"; then
+  fail "the #2572 mutation did not apply — the recorder call no longer has the anchored shape, so this control proves NOTHING (update the sed anchor in §A4)"
+else
+  pass "mutation applied (\`--expect-head \"\$HEAD\"\` stripped from the recorder call)"
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD2_FIXTURE"
+  run "$MUT_PIN" 2284
+  if pin_asserted "$TMP/record-argv.txt"; then
+    fail "❌ $PIN_ASSERTION — STILL TRUE with the flag removed: the assertion is VACUOUS, which is exactly the defect #2572 is about"
+  else
+    pass "…and the §A3 assertion is now FALSE, verbatim: ❌ $PIN_ASSERTION (got: $(cat "$TMP/record-argv.txt" 2>/dev/null))"
+  fi
+  # THE HARM, not the argv. The mutant's seam still exits 9 (its post-record checks read the record
+  # store and the body marker), but the POISONED ARTIFACT IS ALREADY WRITTEN: a `clean` record bound to
+  # a head nobody reviewed, in the store the merge gate reads. Reporting failure is not the guarantee;
+  # not minting is.
+  grep -q "\"head_sha\":\"$HEAD2_FIXTURE\"" "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+  ck $? "  …and the MUTANT mints a clean record bound to the UNREVIEWED live head $HEAD2_FIXTURE — the poisoned artifact the pin prevents from existing at all"
+  # CONTROL: the shipped script, same scenario, leaves the store untouched — so the mint above is the
+  # missing flag's doing and not the fixture's (§A3(2) asserts the same thing next to the refusal).
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_LIVE_HEAD_AT_RECORD="$HEAD2_FIXTURE"
+  run "$SRC" 2284
+  [ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]
+  ck $? "  the UNMUTATED script records NOTHING in the same scenario — so the pin is what closed it"
+fi
 
 # ── §B findings => NO record, non-zero, findings printed ─────────────────────
 echo; echo "§B verdict with findings => NO record"
