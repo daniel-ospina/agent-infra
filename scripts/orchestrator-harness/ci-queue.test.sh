@@ -1427,7 +1427,7 @@ cis_in_comsub() {
 }
 
 hits="$(cis_in_comsub "$MOD")"
-ck "(p1) the module carries NO \`case\` inside a \`\$( )\` (${hits:-none}) — the shape bash 3.2 re-parses at execution" \
+ck "(p1) the module carries NO \`case\` inside a \`\$( )\` (${hits:-none}) — the shape bash 3.2 re-parses at execution (DEPTH-scanned: the wrapped and nested spellings are pinned by (p1d)/(p1e), and the declared blind spot is a literal \`)\` inside a \"…\" closing the tracked depth early — stated, not assumed)" \
    "$( [ -z "$hits" ]; echo $? )"
 
 # ⛔ THE APOSTROPHE-IN-A-DOUBLE-QUOTED-STRING SHAPE (#2969 review cycle 5, P2), and it is a PAIR so
@@ -1450,6 +1450,24 @@ ck "(p1b) control: the SAME line without the apostrophe is reported too (${cth:-
    "$( [ -n "$cth" ]; echo $? )"
 ck "(p1c) a \`case\` inside a genuinely SINGLE-QUOTED span is NOT reported (${sqh:-none}) — the skip is still applied where bash really substitutes nothing" \
    "$( [ -z "$sqh" ]; echo $? )"
+
+# ⛔ THE MULTI-LINE AND NESTED SHAPES — the two blind spots the LINE-SCOPED detector had (review
+# cycle 1, P2; #2969). These fixtures are what make the depth rule LOAD-BEARING rather than prose:
+# the line carrying the `case` in `wrapped.sh` holds no `$( ` at all, and in `nested.sh` the inner
+# substitution's `)` sits before it. Both are a genuine #2969-class defect on bash 3.2
+# (`command substitution: … syntax error near unexpected token 'newline'`, corrupted value, rc 0).
+# ⛔ MEASURED, not hypothesised: the pre-fix line-scoped function — replayed verbatim from
+# 604bd21e8 — answers NOTHING for both files, while the same bytes in one-line spelling are reported
+# ((p1a)/(p1b)). So without these arms a REVERT to line-scoped scanning leaves every other (p1) arm
+# fully GREEN and silently restores the blind spot; with them the revert reds here.
+printf '%s\n' 'x="$(' '  case "$X" in fresh) printf gh ;; *) printf no ;; esac' ')"' > "$cqf/wrapped.sh"
+printf '%s\n' 'x="$(printf %s "$(date)"; case "$s" in a) : ;; esac)"' > "$cqf/nested.sh"
+wrh="$(cis_in_comsub "$cqf/wrapped.sh")"
+neh="$(cis_in_comsub "$cqf/nested.sh")"
+ck "(p1d) a \`case\` inside a substitution WRAPPED ACROSS LINES is reported (${wrh:-<missed>}) — the line holding it carries no \`\$( \`, so a LINE-SCOPED detector answers (none) on genuinely broken bytes" \
+   "$( [ -n "$wrh" ]; echo $? )"
+ck "(p1e) a \`case\` AFTER a NESTED \`\$( )\` is reported (${neh:-<missed>}) — the inner substitution's \`)\` must not be read as the close of the outer one, or a broken \`case\` after it is skipped" \
+   "$( [ -n "$neh" ]; echo $? )"
 
 # ⛔ MUTANT: reinstate the CONSTRUCT by DERIVING it from the module's own hoisted block — the
 # patterns and the values are READ OUT of the module, not restated here, so the control cannot drift
