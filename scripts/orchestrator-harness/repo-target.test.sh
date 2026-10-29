@@ -107,8 +107,22 @@ TWT="$(mk_wt "$TT" wt-tortoise)" || { echo "❌ worktree fixture"; exit 2; }
 AIWT="$(mk_wt "$AI" wt-ai)" || { echo "❌ worktree fixture"; exit 2; }
 
 A1="$(repo_target_assert "unit" "$TWT" "" "$TT")"; a1=$?
-{ [ "$a1" -eq 0 ] && grep -q 'result=OK' <<<"$A1" && grep -q 'repo=daniel-ospina/tortoise' <<<"$A1" \
+{ [ "$a1" -eq 0 ] && grep -q 'check=ok' <<<"$A1" && grep -q 'repo=daniel-ospina/tortoise' <<<"$A1" \
     && grep -qF "worktree=$TWT" <<<"$A1"; }; ck "A1 target tortoise, worktree tortoise -> OK (line: $A1)" $?
+
+# ⛔ A1b/A1c — A PRE-FLIGHT LINE MUST NEVER CLAIM A RESULT (#2935).
+# `repo_target_assert` runs BEFORE the lane does any work. Its success arm used to print
+# `result=OK`, and that token is what the fleet greps for a lane's verdict: 12 lanes were
+# dispatched to two cells, each printed `result=OK`, and none of them did anything — the
+# dispatcher read success from a line that is emitted whether or not the lane ever runs. The
+# pass arm must claim only what it MEASURED (that the identity CHECK passed); `result=` is
+# reserved for a line emitted once an outcome is known, so a dispatch carrying no `result=`
+# line reads as "no outcome yet" — which is the truth.
+# MUTATION: put `result=OK` back on either pass arm and A1b/A1c redden.
+{ ! grep -q 'result=' <<<"$A1"; }; ck "A1b a passing identity line claims NO result (it is a check, not an outcome)" $?
+{ [ "$(grep -cE "printf '\\[repo-target\\] .*check=ok" "$RT")" -ge 2 ] \
+    && ! grep -qE "printf '\\[repo-target\\][^']*result=OK" "$RT"; } \
+  ; ck "A1c both PASS arms print check=ok, and no [repo-target] printf claims result=OK (REFUSED arms may)" $?
 
 A2="$(repo_target_assert "unit" "$TWT" "daniel-ospina/agent-infra" "")"; a2=$?
 { [ "$a2" -eq 72 ] && grep -q 'result=REFUSED' <<<"$A2" \
@@ -143,7 +157,7 @@ A7="$(GIT_DIR="$AI/.git" repo_target_assert "unit" "$TWT" "daniel-ospina/agent-i
 # GitHub slugs are CASE-INSENSITIVE; the cell supervisor folds case (#1745), so refusing here would
 # certify the cell healthy and then block every dispatch on it (#2762 review, P1).
 A8="$(repo_target_assert "unit" "$TWT" "Daniel-Ospina/Tortoise" "")"; a8=$?
-{ [ "$a8" -eq 0 ] && grep -q 'result=OK' <<<"$A8"; }; ck "A8 same slug in a different case -> OK (GitHub slugs are case-insensitive)" $?
+{ [ "$a8" -eq 0 ] && grep -q 'check=ok' <<<"$A8"; }; ck "A8 same slug in a different case -> OK (GitHub slugs are case-insensitive)" $?
 
 A9="$(repo_target_assert "unit" "$TWT" "" "$TWT")"; a9=$?
 { [ "$a9" -eq 72 ] && grep -q 'reason=target-self' <<<"$A9"; }; ck "A9 target dir IS the worktree under test -> REFUSED (a tautology can never refuse)" $?
@@ -156,7 +170,7 @@ A10b="$(repo_target_assert "unit" "$TWT" "/tmp/not-a-slug" "")"; a10b=$?
 # ⛔ A `url.<base>.insteadOf` REWRITE MUST NOT FORGE THE SLUG (#2762 review, P1). `git remote get-url`
 # APPLIES url rewrites, so an ambient `GIT_CONFIG_GLOBAL` mapping the tortoise URL onto agent-infra's
 # made a tortoise worktree answer `agent-infra` — through the GIT_DIR scrub — and the gate printed
-# `result=OK`: the measured #2724 defect, certified by the gate built to stop it. Identity is read
+# `check=ok`: the measured #2724 defect, certified by the gate built to stop it. Identity is read
 # from `config --get remote.origin.url` (raw), which no rewrite touches.
 FORGE_CFG="$T/gc-forge"
 printf '[url "https://github.com/daniel-ospina/agent-infra.git"]\n\tinsteadOf = https://github.com/daniel-ospina/tortoise.git\n' > "$FORGE_CFG"
@@ -169,7 +183,7 @@ A11="$(GIT_CONFIG_GLOBAL="$FORGE_CFG" repo_target_assert "unit" "$TWT" "daniel-o
 MIRROR_CFG="$T/gc-mirror"
 printf '[url "/srv/mirror/tortoise.git"]\n\tinsteadOf = https://github.com/daniel-ospina/tortoise.git\n' > "$MIRROR_CFG"
 A12="$(GIT_CONFIG_GLOBAL="$MIRROR_CFG" repo_target_assert "unit" "$TWT" "daniel-ospina/tortoise" "")"; a12=$?
-{ [ "$a12" -eq 0 ] && grep -q 'result=OK' <<<"$A12"; }; ck "A12 a benign MIRROR rewrite does not refuse a correct pair (raw config, not the rewritten URL)" $?
+{ [ "$a12" -eq 0 ] && grep -q 'check=ok' <<<"$A12"; }; ck "A12 a benign MIRROR rewrite does not refuse a correct pair (raw config, not the rewritten URL)" $?
 
 # ⛔ APPEND-SCOPE CONFIG INJECTION (#2762 review, P1): `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/...
 # OUTRANK a repo's real local origin, so `config --get` answered the injected value and the gate said
@@ -202,7 +216,7 @@ ck "A13 repo_slug_valid / repo_target_valid_slug / derive_or agree on 9 shapes (
 echo
 echo "── B. lane.sh: the post-build assertion before any lane artifact ──────────────────────────"
 lane_drive "$TWT" 3001 feat/3001-ok --repo-dir "$TT" --repo daniel-ospina/tortoise
-{ [ "$LR" -eq 0 ] && grep -q 'result=OK repo=daniel-ospina/tortoise' "$LRLOG" 2>/dev/null \
+{ [ "$LR" -eq 0 ] && grep -q 'check=ok repo=daniel-ospina/tortoise' "$LRLOG" 2>/dev/null \
     && [ -f "$LR_DIR/logs/prompt-3001.txt" ]; }; ck "B1 (a) target tortoise + tortoise worktree -> STARTS (rc=$LR, brief written)" $?
 
 lane_drive "$TWT" 3002 feat/3002-bad --repo daniel-ospina/agent-infra
@@ -225,7 +239,7 @@ lane_drive "$OWT" 3005 main --repo daniel-ospina/tortoise
 # The per-dispatch record: exactly one repo-target line per lane, naming repo + worktree + result.
 B6LOG="$T/o-3001/logs/lane-3001.log"
 nline="$(grep -c '^\[repo-target\]' "$B6LOG" 2>/dev/null || true)"
-{ [ "${nline:-0}" = "1" ] && grep -q 'worktree=' "$B6LOG" && grep -q 'result=OK' "$B6LOG"; }; ck "B6 lane log carries EXACTLY ONE [repo-target] line naming repo, worktree and result" $?
+{ [ "${nline:-0}" = "1" ] && grep -q 'worktree=' "$B6LOG" && grep -q 'check=ok' "$B6LOG"; }; ck "B6 lane log carries EXACTLY ONE [repo-target] line naming repo, worktree and result" $?
 
 # A malformed dispatch must not be silently truncated to its first three words.
 lane_drive "$TWT" 3006 feat/3006-extra --repo daniel-ospina/tortoise extra1 extra2
@@ -239,7 +253,7 @@ lane_drive "$B8WT" 3007 feat/3007-dironly --repo-dir "$TT"
 { [ "$LR" -eq 0 ] && [ -f "$LR_DIR/logs/prompt-3007.txt" ] \
     && grep -q -- '--repo daniel-ospina/tortoise' "$LR_DIR/logs/prompt-3007.txt" \
     && ! grep -q -- '--repo  ' "$LR_DIR/logs/prompt-3007.txt" \
-    && grep -q 'branch=feat/3007-dironly result=OK repo=daniel-ospina/tortoise' "$LRLOG" 2>/dev/null; }; ck "B8 --repo-dir only -> STARTS, brief names the repo, branch line is not UNREADABLE (rc=$LR)" $?
+    && grep -q 'branch=feat/3007-dironly check=ok repo=daniel-ospina/tortoise' "$LRLOG" 2>/dev/null; }; ck "B8 --repo-dir only -> STARTS, brief names the repo, branch line is not UNREADABLE (rc=$LR)" $?
 
 # ═══ C. fix-one.sh — the PR-lane builder (#2694) ═══════════════════════════════════════════════
 echo
@@ -286,9 +300,9 @@ c4=$?
 REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4003 work >/dev/null 2>&1
 c3=$?
-{ grep -q 'fixer #4003 target result=OK repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
-    && grep -q 'fixer #4003 result=OK repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
-    && grep -q 'fixer #4003 branch=work result=OK' "$FO/logs/fix-4003.log" 2>/dev/null \
+{ grep -q 'fixer #4003 target check=ok repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
+    && grep -q 'fixer #4003 check=ok repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
+    && grep -q 'fixer #4003 branch=work check=ok' "$FO/logs/fix-4003.log" 2>/dev/null \
     && [ -d "$AI/.worktrees/fix-4003" ]; }; ck "C3 matching target -> ALL THREE assertions pass (log survives the start truncation) and the worktree is built (rc=$c3, asserted by the lines not by rc)" $?
 
 # ═══ D. dispatch-merge.sh — the issue-lane batch ═══════════════════════════════════════════════
