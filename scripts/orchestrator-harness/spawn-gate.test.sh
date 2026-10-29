@@ -1095,6 +1095,18 @@ cp "$HERE/brief-gate.sh" "$RO/"
 # eleven arms below, because the ambient checkout's copy answered with a usage line). Seeded, so the
 # arms below assert PROPAGATION and nothing else.
 cp "$HERE/reviewer-preflight.sh" "$RO/"
+# ⛔ …AND THE RIG-CARRY GUARD HAS A §10 TWIN, BECAUSE THE §9 ONE DOES NOT COVER THIS RIG (review of
+# #3042, P2). Both seeds above were added for the same failure — a missing module makes every code
+# below come back 78 — but only §9 asserts that its rig actually carries them, so a future edit that
+# drops one of these `cp` lines resurfaces HERE as eleven bogus `got 78` arms with nothing naming the
+# missing file. The §9 lesson, applied where it was not: fail at the point of the edit.
+_rig10miss=""
+for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh \
+          reviewer-preflight.sh chain-merge.sh; do
+  [ -f "$RO/$_m" ] || { echo "❌ the §10 rig is missing $_m in \$RO — the propagation arms below would exit 78 before their code"; _rig10miss="$_m"; }
+done
+[ -z "$_rig10miss" ]; rc=$?
+ck "the §10 rig carries every module the wrappers hard-require (a rig missing one asserts a HALF-DEPLOYED 78, not propagation)" $rc
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
@@ -1318,6 +1330,15 @@ ck "a capability refusal leaves the caller's job control as it found it (got '${
 RES="$TMP/resolve"; mkdir -p "$RES/bin"
 cp "$HERE/spawn-gate.sh" "$RES/spawn-gate.sh"
 cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
+# ⛔ AND THE BRIEF VALIDATOR, OR THIS ARM MEASURES THE BOX (#3042 review, P2). `run_agent` refuses a
+# brief it cannot validate (CANNOT VERIFY) BEFORE it reads load, disk or the capability probe, and
+# `brief_gate_lib` resolves the validator from `$O`, then `$here`, then `$AGENT_INFRA_PATH`, then
+# `~/.pi/agent`. This rig seeded neither `$RES` nor `$TMP/O` with it, so on a box with an installed
+# harness the arm passed for the box's sake and on a bare runner it measured something else entirely:
+# `AGENT_INFRA_PATH` unset and an empty `HOME` gave `rc=78` with `[brief-gate] CANNOT VERIFY …`
+# instead of the 71 this arm asserts (measured: 247 passed / 1 failed, the failure being this arm).
+# The subject here is the CAPABILITY resolver, so the validator that gates it must travel with the rig.
+cp "$HERE/brief-gate.sh" "$RES/brief-gate.sh"
 cat > "$RES/bin/pi" <<'PIHANG'
 #!/bin/sh
 case "$1" in --version) echo 9.9.9-stub; exit 0 ;; esac
