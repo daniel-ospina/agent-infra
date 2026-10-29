@@ -1,0 +1,15 @@
+# Two space-preceded apostrophes in one plain flow scalar: the first is ordinary text, and the second is
+# too — but a word-boundary quote rule opens a string at the first and closes it at the second, so every
+# entry between them (including the cancelling pair) folds into one part and the workflow reads GREEN.
+# This pins that half of the fix separately from the unclosed fallback, which never triggers here
+# because the phantom string does close (#2660 round 13).
+name: push flow apostrophe pair
+on:
+  push:
+    branches: [main]
+concurrency: {group: shell 'em, cancel-in-progress: true, note: don't}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
