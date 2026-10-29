@@ -1,0 +1,11 @@
+# FAILURE-CLASS FIXTURE (R0): an `on:` section this reader cannot resolve (only comments beneath it).
+# An unreadable workflow must be RED, never silently treated as non-PR — otherwise every rule below
+# is vacuous for it.
+name: pr-unreadable-on
+on:
+  # the trigger is written somewhere this reader does not model
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

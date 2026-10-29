@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in ci.yml's dedicated `actionlint` job (PR lane only - no post-merge site, agent-infra#2610); a shard here would be a second run site (#2439)
 # #398 — actionlint gate tests.
 #
 # Verifies scripts/check-workflow-actionlint.sh semantics:
@@ -46,7 +47,7 @@ command -v docker >/dev/null 2>&1 || {
   exit 1
 }
 
-cleanup() { rm -f "$OUT" ${CASE5_JSON:+"$CASE5_JSON"}; }
+cleanup() { rm -f "$OUT" ${CASE5_JSON:+"$CASE5_JSON"}; rm -rf ${CASE6_DIR:+"$CASE6_DIR"}; }
 trap cleanup EXIT
 
 pass() { echo "   ✅ $1"; }
@@ -408,6 +409,426 @@ JS
     esac
   fi
 fi
+echo ""
+echo "== Case 6: the supersession invariant (scripts/check-workflow-concurrency.sh, #2474) =="
+# WHY this is a case here rather than a new shard: the rules are about the SAME artifact this
+# suite already parses (workflow YAML), the suite already runs in ci.yml's `actionlint` job, and a
+# new tests/<dir>/run.sh would add a shard to the lane while the shard baseline mapping is
+# unresolved (#2610). No new lane, no new shard, no new dependency.
+#
+# The fixtures are the failure CLASSES, and every one of them is RED for its OWN rule (the tag is
+# asserted, not just the exit code): a fixture that reds for the wrong reason pins nothing. The
+# mutations below are the load-bearing half — they prove the rules are live against THIS repo's
+# real files, not just against fixtures written to agree with the checker.
+CONC="$ROOT/scripts/check-workflow-concurrency.sh"
+CFIX="$ROOT/tests/fixtures/actionlint/workflow-concurrency"
+CASE6_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wfconc.XXXXXX")"
+
+conc_run() { # conc_run <expected-exit> <label> [args...]
+  local expected="$1"; shift
+  local label="$1"; shift
+  bash "$CONC" "$@" >"$OUT" 2>&1
+  local actual=$?
+  if [ "$actual" -eq "$expected" ]; then
+    pass "$label (exit $actual)"
+  else
+    fail "$label — expected exit $expected, got $actual"
+    sed 's/^/      /' "$OUT"
+  fi
+}
+
+conc_run 0 "the well-formed fixtures pass" \
+  "$CFIX/pr-ok.yml" "$CFIX/pr-target-ok.yml" "$CFIX/push-ok.yml" "$CFIX/push-cancel-false.yml" \
+  "$CFIX/pr-head-ref.yml" "$CFIX/push-group-only.yml" "$CFIX/push-block-scalar.yml" \
+  "$CFIX/pr-github-workflow-a.yml" "$CFIX/pr-github-workflow-b.yml" \
+  "$CFIX/pr-trailing-comment.yml" "$CFIX/push-heredoc.yml" \
+  "$CFIX/pr-nameless-a.yml" "$CFIX/pr-nameless-b.yml" "$CFIX/pr-flow-map.yml" \
+  "$CFIX/pr-number-key.yml" "$CFIX/pr-group-folded.yml" "$CFIX/pr-cancel-capital.yml" \
+  "$CFIX/pr-event-number.yml" "$CFIX/pr-target-headref.yml" "$CFIX/pr-eof.yml" \
+  "$CFIX/pr-workflow-ws-a.yml" "$CFIX/pr-workflow-ws-b.yml" \
+  "$CFIX/pr-cancel-continuation-comment.yml" "$CFIX/push-concurrency-flow-child-ok.yml" \
+  "$CFIX/pr-concurrency-flow-child.yml" \
+  "$CFIX/pr-flow-format.yml" "$CFIX/pr-flow-capital.yml" "$CFIX/push-flow-false-capital.yml" \
+  "$CFIX/push-group-continuation-eof.yml" "$CFIX/pr-run-json.yml" "$CFIX/pr-group-hash-quoted.yml" "$CFIX/push-on-sequence-ok.yml" \
+  "$CFIX/pr-group-apostrophe-comment.yml" "$CFIX/pr-on-column0-sequence.yml" \
+  "$CFIX/pr-on-sequence-mapping.yml" \
+  "$CFIX/pr-group-apostrophe-pair-ok.yml" "$CFIX/pr-multiline-value-ok.yml" \
+  "$CFIX/push-flow-apostrophe-false.yml" "$CFIX/push-on-flow-apostrophes-false.yml" \
+  "$CFIX/pr-workflow-ref.yml" "$CFIX/push-flow-apostrophe-plain-false.yml" \
+  "$CFIX/pr-group-underscore-sha.yml" "$CFIX/push-flow-apostrophe-dash-pair-false.yml" \
+  "$CFIX/pr-group-workflow-ref-alone.yml" "$CFIX/pr-workflow-ref-same-name-a.yml" \
+  "$CFIX/pr-workflow-ref-same-name-b.yml"
+
+# name + the rule tag the refusal must carry
+for pair in \
+  "pr-no-concurrency.yml R1" \
+  "pr-cancel-false.yml R1" \
+  "pr-group-sha.yml R1" \
+  "pr-target-group-ref.yml R1" \
+  "pr-group-no-identity.yml R1" \
+  "pr-on-four-space.yml R1" \
+  "pr-on-flow-map.yml R1" \
+  "push-cancel-true.yml R2" \
+  "push-single-quoted.yml R2" \
+  "push-space-colon.yml R2" \
+  "push-multiline-flow.yml R2" \
+  "push-flow-map.yml R2" \
+  "push-cancel-true-capital.yml R2" \
+  "pr-sha-plus-ref.yml R1" \
+  "pr-scalar-concurrency.yml R1" \
+  "pr-concurrency-sequence.yml R0" \
+  "push-concurrency-alias.yml R0" \
+  "pr-target-run-id.yml R1" \
+  "pr-head-sha.yml R1" \
+  "pr-group-actor.yml R1" \
+  "push-cancel-nextline.yml R2" \
+  "push-cancel-folded.yml R2" \
+  "push-jobs-flow.yml R0" \
+  "push-on-alias.yml R0" \
+  "push-eof.yml R2" \
+  "push-on-tag.yml R0" \
+  "pr-explicit-key.yml R0" \
+  "pr-hidden-sha.yml R1" \
+  "reusable-and-pr.yml R3" \
+  "pr-group-continuation-comment.yml R1" \
+  "push-bom.yml R2" \
+  "push-on-anchor.yml R2" \
+  "push-concurrency-flow-child.yml R2" \
+  "push-explicit-top-key.yml R0" \
+  "push-concurrency-merge-key.yml R0" \
+  "push-job-flow-value.yml R0" \
+  "push-job-quoted-key.yml R0" \
+  "pr-flow-group-comma-sha.yml R1" \
+  "push-on-sequence.yml R2" \
+  "push-job-apostrophe-name.yml R0" \
+  "pr-group-apostrophe-pair-comment.yml R1" \
+  "pr-multiline-value-sha.yml R1" \
+  "push-flow-apostrophe.yml R2" \
+  "push-on-flow-apostrophes.yml R2" \
+  "pr-on-flow-apostrophes.yml R1" \
+  "pr-workflow-sha.yml R1" \
+  "push-flow-apostrophe-plain.yml R2" \
+  "pr-on-flow-apostrophe-plain.yml R1" \
+  "push-flow-apostrophe-dash.yml R2" \
+  "push-flow-apostrophe-pair.yml R2" \
+  "push-flow-apostrophe-dash-pair.yml R2" \
+  "pr-group-merge-commit-sha.yml R1" \
+  "push-job-flow-apostrophe.yml R0" \
+  "reusable-concurrency.yml R3" \
+  "push-job-level.yml R0" \
+  "pr-unreadable-on.yml R0"; do
+  name="${pair% *}"; tag="${pair#* }"
+  conc_run 1 "$name blocks" "$CFIX/$name"
+  if grep -q "\[$tag\]" "$OUT"; then
+    pass "$name is refused by $tag (not by a neighbouring rule)"
+  else
+    fail "$name did not report rule $tag"
+    sed 's/^/      /' "$OUT"
+  fi
+done
+
+# One file named twice is one workflow: the duplicate-group rule must not compare a file against
+# itself and refuse a correct workflow (#2660 round 4).
+conc_run 0 "the same file passed twice is one workflow" "$CFIX/pr-ok.yml" "$CFIX/pr-ok.yml"
+grep -q '1 file(s) scanned' "$OUT" \
+  && pass "the duplicate path was collapsed before the group comparison" \
+  || { fail "the same file was counted twice"; sed 's/^/      /' "$OUT"; }
+
+# The duplicate is the same FILE, not the same STRING: `x.yml` and `./x.yml` resolve to one path.
+conc_run 0 "one file under two spellings is one workflow" "$CFIX/pr-ok.yml" "$CFIX/./pr-ok.yml"
+grep -q '1 file(s) scanned' "$OUT" \
+  && pass "the second spelling resolved to the same file" \
+  || { fail "a second spelling was counted as a second workflow"; sed 's/^/      /' "$OUT"; }
+
+# The comment strip must be LINEAR in a leading-whitespace run. The regex form re-scanned the run
+# from every start position, so one line of 100 000 spaces took 16 s — a workflow file an author can
+# commit could stall the lane. The generated input keeps the check honest without a timing rule.
+longf="$CASE6_DIR/whitespace-run.yml"
+{
+  printf 'name: whitespace run\non:\n  push:\n    branches: [main]\n'
+  # NO trailing comment: with a `#` on the run the anchored whole-line rule matches first and the
+  # unanchored trailing rule is a no-op on that input (measured: old 0.108 s vs new 0.098 s), so an
+  # arm built that way passes against the pre-change implementation. On a comment-free run the same
+  # comparison is 17.5 s vs 0.11 s — the shape that actually costs.
+  awk 'BEGIN { for (i = 0; i < 100000; i++) printf " "; print "" }'
+  printf 'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n'
+} >"$longf"
+if command -v timeout >/dev/null 2>&1; then
+  # The bound must sit BELOW the cost it guards against, or the arm passes with the regression
+  # present: the old two-sub strip needs 16-19.5 s on this file, the linear one 0.03 s, so 5 s is
+  # ~150x headroom for a slow runner and still an order of magnitude under the failure it names.
+  timeout 5 bash "$CONC" "$longf" >"$OUT" 2>&1
+  conc_rc=$?
+  if [ "$conc_rc" -eq 124 ]; then
+    fail "a 100 000-space line still stalls the check (timeout) — the comment strip is not linear"
+  elif [ "$conc_rc" -eq 0 ]; then
+    pass "a 100 000-space line is stripped in bounded time (exit 0)"
+  else
+    fail "a whitespace-run workflow should be GREEN, got exit $conc_rc"
+    sed 's/^/      /' "$OUT"
+  fi
+else
+  pass "timeout(1) unavailable — whitespace-run arm skipped (the shape is covered by the fixtures)"
+fi
+
+# The BOM fixture only tests the BOM path while the BOM is still there: assert the bytes, so a
+# formatter that strips it cannot quietly turn this arm into a duplicate of push-cancel-true.yml.
+if [ "$(head -c 3 "$CFIX/push-bom.yml" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then
+  pass "push-bom.yml still begins with a UTF-8 BOM"
+else
+  fail "push-bom.yml lost its BOM — the arm no longer tests what it claims"
+fi
+
+# A sequence-of-mappings entry must be read as its KEY. Files mode does not arm the `pr_seen`
+# vacuity check, so an exit-0 assertion alone left this unpinned: recording `- pull_request:` as a
+# trigger NAMED `pull_request:` still exits 0 while reporting zero PR entry points (#2674).
+conc_run 0 "a sequence entry that is a mapping is read as its key" --table "$CFIX/pr-on-sequence-mapping.yml"
+grep -q 'pull_request:' "$OUT" \
+  && { fail "the sequence entry was recorded as a trigger named 'pull_request:'"; sed 's/^/      /' "$OUT"; } \
+  || pass "the sequence entry is not a trigger named 'pull_request:'"
+grep -q '1 PR entry point(s)' "$OUT" \
+  && pass "the sequence entry counts as one PR entry point" \
+  || { fail "the sequence entry was not counted as a PR entry point"; sed 's/^/      /' "$OUT"; }
+
+# A workflow refused by R0 must NOT also be reported as "no pull_request-triggered workflow was
+# found": that names a second cause (a rename, a glob hole) that does not exist and sends the author
+# after it (#2660 round 10).
+NOR0_TREE="$(mktemp -d "${TMPDIR:-/tmp}/wfconc-nor0.XXXXXX")"
+mkdir -p "$NOR0_TREE/.github/workflows"
+cat >"$NOR0_TREE/.github/workflows/pr-bad.yml" <<'YAML'
+name: bad
+on: !!seq [pull_request]
+concurrency:
+  group: pr-bad-${{ github.ref }}
+  cancel-in-progress: true
+YAML
+cat >"$NOR0_TREE/.github/workflows/ci-main.yml" <<'YAML'
+name: main
+on:
+  push:
+    branches: [main]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+YAML
+conc_run 2 "a tree whose only PR workflow is unreadable is RED" --root "$NOR0_TREE"
+if grep -q 'no pull_request-triggered workflow was found' "$OUT"; then
+  fail "the unreadable PR workflow was ALSO reported as none found (two causes, one file)"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the unreadable workflow is not also reported as no PR workflow found"
+fi
+
+# The awk program the checker RUNS must be the program in the file. The program is single-quoted, so a
+# bare apostrophe in one of its comments closes the shell string early; `conc_run` folds 2>&1 into
+# $OUT, which HID that (the breakage showed up as `command: not found` on stderr while every assertion
+# still passed). Assert stderr is empty so a future edit cannot reintroduce it unseen (#2660 round 12).
+ERROUT="$(mktemp "${TMPDIR:-/tmp}/wfconc-err.XXXXXX")"
+bash "$CONC" "$CFIX/pr-ok.yml" >/dev/null 2>"$ERROUT"
+if [ -s "$ERROUT" ]; then
+  fail "the checker wrote to stderr (its awk program may be mis-quoted)"
+  sed 's/^/      /' "$ERROUT"
+else
+  pass "the checker runs its own awk program (stderr empty)"
+fi
+
+# Two different workflows using the canonical format() idiom are disjoint at runtime. Judging them by
+# the raw template text refused both (round 11, P2).
+conc_run 0 "the same format() template under two workflow names is two groups" \
+  "$CFIX/pr-workflow-format-a.yml" "$CFIX/pr-workflow-format-b.yml"
+if grep -q 'declared by more than one PR workflow' "$OUT"; then
+  fail "the format() pair was refused as sharing a group"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the format() pair is not refused as sharing a group"
+fi
+
+# Two workflows with the SAME `name:` keyed on `github.workflow_ref` are disjoint at runtime: the ref
+# carries the workflow FILE. Refusing them was a false red whose message quoted a group nothing
+# evaluates (#2660 round 15).
+conc_run 0 "same name, workflow_ref: two disjoint groups" \
+  "$CFIX/pr-workflow-ref-same-name-a.yml" "$CFIX/pr-workflow-ref-same-name-b.yml"
+if grep -q 'declared by more than one PR workflow' "$OUT"; then
+  fail "the same-named workflow_ref pair was refused as sharing a group"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the same-named workflow_ref pair is two groups"
+fi
+
+# An exempt guard that DROPS its PR trigger and gains a `concurrency:` block must still be refused.
+# Gating the stale-exemption arm on "is this still PR-triggered" made both R4 arms unreachable at
+# once: the bookkeeping arm was satisfied by the scan and this one by the missing trigger
+# (#2660 round 9).
+EXEMPT_TREE="$(mktemp -d "${TMPDIR:-/tmp}/wfconc-exempt.XXXXXX")"
+mkdir -p "$EXEMPT_TREE/.github/workflows"
+for f in harness-single-source.yml workflow-lock.yml ci.yml; do
+  cp "$ROOT/.github/workflows/$f" "$EXEMPT_TREE/.github/workflows/" 2>/dev/null || true
+done
+cat >"$EXEMPT_TREE/.github/workflows/pipeline-compliance.yml" <<'YAML'
+# guard #2474 rationale kept
+name: Pipeline compliance
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: pipeline-compliance-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+YAML
+conc_run 1 "an exempt guard that gained concurrency WITHOUT a PR trigger is RED" --root "$EXEMPT_TREE"
+grep -q 'is an EXEMPT GUARD' "$OUT" \
+  && pass "the stale exemption is named even without a PR trigger" \
+  || { fail "the stale exemption survived because the guard lost its PR trigger"; sed 's/^/      /' "$OUT"; }
+
+# An exempt guard that R0 refuses is NOT also "never scanned": one cause, one diagnostic.
+cat >"$EXEMPT_TREE/.github/workflows/pipeline-compliance.yml" <<'YAML'
+# guard #2474 rationale kept
+name: Pipeline compliance
+on:
+  pull_request:
+concurrency:
+  group: pipeline-compliance-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    concurrency: {group: x, cancel-in-progress: true}
+    steps:
+      - run: echo ok
+YAML
+# Repo mode answers an unreadable workflow with exit 2 (not 1): the scan could not verify the tree.
+conc_run 2 "an exempt guard refused by R0 is RED" --root "$EXEMPT_TREE"
+if grep -q 'no such PR-triggered workflow was scanned' "$OUT"; then
+  fail "an R0-refused guard was ALSO reported as never scanned (two causes, one file)"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the R0-refused guard is not also reported as never scanned"
+fi
+
+# R0 has several causes and each must be NAMED: one message for all of them described two files as
+# "a sequence or an alias" that contained neither (#2660 round 5).
+conc_run 1 "a flow-style jobs: is named as such" "$CFIX/push-jobs-flow.yml"
+grep -q 'flow-style' "$OUT" && pass "the flow-style jobs: cause is named" \
+  || { fail "the flow-style jobs: refusal did not name its cause"; sed 's/^/      /' "$OUT"; }
+conc_run 1 "an explicit key is named as such" "$CFIX/pr-explicit-key.yml"
+grep -q 'explicit-key syntax' "$OUT" && pass "the explicit-key cause is named" \
+  || { fail "the explicit-key refusal did not name its cause"; sed 's/^/      /' "$OUT"; }
+conc_run 1 "a tagged on: is named as such" "$CFIX/push-on-tag.yml"
+grep -q 'tagged scalar' "$OUT" && pass "the tagged on: cause is named" \
+  || { fail "the tagged on: refusal did not name its cause"; sed 's/^/      /' "$OUT"; }
+
+# Cross-file rule: two PR workflows that share one group would cancel each other. Neither file is
+# wrong on its own, so this can only be caught by reading the whole set.
+conc_run 1 "two PR workflows sharing one group block" \
+  "$CFIX/pr-shared-group-a.yml" "$CFIX/pr-shared-group-b.yml"
+grep -q 'declared by more than one PR workflow' "$OUT" \
+  && pass "the shared group is named" \
+  || { fail "the shared group was not reported"; sed 's/^/      /' "$OUT"; }
+
+conc_run 0 "the live repo workflows satisfy the invariant"
+# The expected count is DERIVED from the tree, never pinned: a hardcoded number reds the next PR
+# that adds a workflow for a reason unrelated to its change, and equality on a count does not prove
+# the SET anyway — so the set is also pinned by name below.
+live_wf=0
+for f in "$ROOT"/.github/workflows/*.yml "$ROOT"/.github/workflows/*.yaml; do
+  [ -f "$f" ] && live_wf=$((live_wf + 1))
+done
+if grep -q "$live_wf file(s) scanned" "$OUT"; then
+  pass "all $live_wf live workflows were scanned (no silent glob hole)"
+else
+  fail "expected the live scan to cover $live_wf workflows (counted from .github/workflows)"
+  sed 's/^/      /' "$OUT"
+fi
+# ...and by NAME, so a swap (11 files scanned, ci.yml not among them) cannot pass.
+conc_run 0 "--table lists the live set by name" --table
+if grep -q 'ci\.yml' "$OUT" && grep -q 'enforce-skills\.yml' "$OUT"; then
+  pass "--table names ci.yml and enforce-skills.yml"
+else
+  fail "--table did not name the live workflows it scanned"
+  sed 's/^/      /' "$OUT"
+fi
+
+# --- unreadable shapes must never read green --------------------------------------------
+# `*.yaml` is a workflow GitHub runs: a `*.yml`-only glob would be a whole-file escape.
+mkdir -p "$CASE6_DIR/yaml/.github/workflows"
+cp "$ROOT"/.github/workflows/ci.yml "$CASE6_DIR/yaml/.github/workflows/ci.yml"
+printf 'name: yaml-escape\non:\n  pull_request:\n' \
+  >"$CASE6_DIR/yaml/.github/workflows/zz-new.yaml"
+conc_run 1 "a PR workflow added as .yaml is scanned and refused" --root "$CASE6_DIR/yaml"
+grep -q 'zz-new\.yaml' "$OUT" && pass "the .yaml workflow is named" || fail "the .yaml workflow was not named"
+# CRLF is valid YAML: a `false\r` must not be refused as if it were a different value.
+printf 'name: crlf\r\non:\r\n  push:\r\n    branches: [main]\r\nconcurrency:\r\n  group: crlf-${{ github.event_name }}-${{ github.ref }}\r\n  cancel-in-progress: false\r\n' \
+  >"$CASE6_DIR/crlf.yml"
+conc_run 0 "a CRLF push workflow with cancel-in-progress: false passes" "$CASE6_DIR/crlf.yml"
+
+# --- mutations on the LIVE files: the rules must be load-bearing ---------------------------
+# One directory per variant, each keeping the workflow's own BASENAME — the rules read the file
+# stem (identity) and the exemption set reads the basename, so a renamed copy would be measuring
+# a different file than the one the rule is about.
+mkdir -p "$CASE6_DIR/full" "$CASE6_DIR/stripped" "$CASE6_DIR/exempt" "$CASE6_DIR/push"
+# (a) control: a faithful copy of ci.yml is green, so the red below is the MUTATION, not the copy.
+cp "$ROOT/.github/workflows/ci.yml" "$CASE6_DIR/full/ci.yml"
+conc_run 0 "a faithful copy of the live ci.yml passes" "$CASE6_DIR/full/ci.yml"
+# (b) strip ci.yml's concurrency block → R1 must RED it.
+awk '/^concurrency:/{skip=1;next} skip&&/^[ \t]/{next} {skip=0} {print}' \
+  "$ROOT/.github/workflows/ci.yml" >"$CASE6_DIR/stripped/ci.yml"
+conc_run 1 "ci.yml with its concurrency block removed is RED" "$CASE6_DIR/stripped/ci.yml"
+grep -q '\[R1\]' "$OUT" && pass "the removal is caught by R1" || fail "the removal was not caught by R1"
+# (c) give the EXEMPT guard a concurrency block → the exemption must go stale and RED (#2474).
+cp "$ROOT/.github/workflows/pipeline-compliance.yml" "$CASE6_DIR/exempt/pipeline-compliance.yml"
+printf 'concurrency:\n  group: pipeline-compliance-${{ github.ref }}\n  cancel-in-progress: true\n' \
+  >>"$CASE6_DIR/exempt/pipeline-compliance.yml"
+conc_run 1 "a guard workflow that gains concurrency is RED (stale #2474 exemption)" \
+  "$CASE6_DIR/exempt/pipeline-compliance.yml"
+grep -q '\[R4\]' "$OUT" && pass "the stale exemption is caught by R4" || fail "the stale exemption was not caught by R4"
+# (d) flip the push-triggered gate back to cancelling → R2 must RED it (this was the live defect).
+sed 's/^  cancel-in-progress: false$/  cancel-in-progress: true/' \
+  "$ROOT/.github/workflows/enforce-skills.yml" >"$CASE6_DIR/push/enforce-skills.yml"
+conc_run 1 "a push-triggered workflow restored to cancelling is RED" "$CASE6_DIR/push/enforce-skills.yml"
+grep -q '\[R2\]' "$OUT" && pass "the regression is caught by R2" || fail "the regression was not caught by R2"
+
+# --- repo-mode anti-vacuity: a check that read nothing must not report PASS ----------------
+mkdir -p "$CASE6_DIR/nopr/.github/workflows"
+cp "$CFIX/push-ok.yml" "$CASE6_DIR/nopr/.github/workflows/push-ok.yml"
+conc_run 2 "a tree with no PR-triggered workflow refuses to pass (exit 2)" \
+  --root "$CASE6_DIR/nopr"
+grep -q 'R1 verified NOTHING' "$OUT" && pass "the vacuity refusal names R1" || fail "the vacuity refusal did not name R1"
+
+# --- a renamed/vanished guard must not silently fall out of the exemption bookkeeping ------
+mkdir -p "$CASE6_DIR/noexempt/.github/workflows"
+cp "$ROOT/.github/workflows/harness-single-source.yml" "$CASE6_DIR/noexempt/.github/workflows/harness-single-source.yml"
+conc_run 1 "a tree missing the exempt guards is RED, not silently exempt-free" --root "$CASE6_DIR/noexempt"
+grep -q 'named in EXEMPT_FILES but no such PR-triggered workflow was scanned' "$OUT" \
+  && pass "the missing exemptions are named" \
+  || fail "the missing exemptions were not named"
+
+# --- an exempt guard that LOST its #2474 rationale is RED (the arm the exemption rests on) -----
+# Reachable only in --root mode (in FILES mode the rationale file is the repo's own copy), so without
+# this arm a regression that silently accepts an unreasoned exemption would stay green — measured by
+# neutering the arm (round 2, P2).
+mkdir -p "$CASE6_DIR/unreasoned/.github/workflows"
+sed 's/#2474/#0000/g' "$ROOT/.github/workflows/pipeline-compliance.yml" \
+  >"$CASE6_DIR/unreasoned/.github/workflows/pipeline-compliance.yml"
+sed 's/#2474/#0000/g' "$ROOT/.github/workflows/workflow-lock.yml" \
+  >"$CASE6_DIR/unreasoned/.github/workflows/workflow-lock.yml"
+conc_run 1 "an exempt guard without its #2474 rationale is RED" --root "$CASE6_DIR/unreasoned"
+grep -q 'no longer carries its' "$OUT" \
+  && pass "the missing rationale is named" \
+  || { fail "the missing rationale was not named"; sed 's/^/      /' "$OUT"; }
+
+# --- an EMPTY scan set refuses, instead of reporting PASS over nothing -----------------------
+mkdir -p "$CASE6_DIR/emptytree/.github/workflows"
+conc_run 2 "an empty workflow directory refuses to pass (exit 2)" --root "$CASE6_DIR/emptytree"
+grep -q 'no workflow files were scanned' "$OUT" \
+  && pass "the empty-scan refusal is named" \
+  || { fail "the empty-scan refusal was not named"; sed 's/^/      /' "$OUT"; }
+
 echo ""
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures actionlint test(s) failed"
