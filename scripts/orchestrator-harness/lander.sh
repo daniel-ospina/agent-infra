@@ -111,7 +111,7 @@ case "$OR" in
   *) echo "[lander] need --repo owner/name (or --repo-path with a github origin remote)" >&2; exit 64 ;;
 esac
 
-say()  { printf '[lander] %s\n' "$*"; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
+log_line()  { printf '[lander] %s\n' "$*"; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
 note() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
 
 # ── ONE JSON reader for the whole file ─────────────────────────────────────────────────────────
@@ -212,9 +212,9 @@ lander_queue_depth() {
   case "${QUEUED:-}" in ''|*[!0-9]*) QUEUED="unreadable" ;; esac
   case "${INPROG:-}" in ''|*[!0-9]*) INPROG="unreadable" ;; esac
   if [ "$QUEUED" = unreadable ] || [ "$INPROG" = unreadable ]; then
-    say "CI queue depth: UNAVAILABLE (queued=$QUEUED in-progress=$INPROG — the runs read failed; a PR waiting on CI cannot be distinguished from a stalled one this run)"
+    log_line "CI queue depth: UNAVAILABLE (queued=$QUEUED in-progress=$INPROG — the runs read failed; a PR waiting on CI cannot be distinguished from a stalled one this run)"
   else
-    say "CI queue depth: $QUEUED queued, $INPROG in progress ($(( QUEUED + INPROG )) workflow runs) — REST /repos/$OR/actions/runs"
+    log_line "CI queue depth: $QUEUED queued, $INPROG in progress ($(( QUEUED + INPROG )) workflow runs) — REST /repos/$OR/actions/runs"
   fi
 }
 
@@ -232,10 +232,10 @@ lander_authority() {
   here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
   if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
   elif [ -f "$here/repo-authority.sh" ]; then . "$here/repo-authority.sh"
-  else AUTH="unknown"; say "merge authority: UNKNOWN — repo-authority.sh was not found (looked in $O and ${here:-<unresolved>}), so nothing merges this run"; return 0
+  else AUTH="unknown"; log_line "merge authority: UNKNOWN — repo-authority.sh was not found (looked in $O and ${here:-<unresolved>}), so nothing merges this run"; return 0
   fi
   if ! command -v resolve_required_checks >/dev/null 2>&1 || ! command -v merge_authority >/dev/null 2>&1; then
-    AUTH="unknown"; say "merge authority: UNKNOWN — repo-authority.sh is stale/partial (no resolve_required_checks/merge_authority); nothing merges this run"; return 0
+    AUTH="unknown"; log_line "merge authority: UNKNOWN — repo-authority.sh is stale/partial (no resolve_required_checks/merge_authority); nothing merges this run"; return 0
   fi
   REQ_OVERRIDE="${REQ_OVERRIDE:-${LANDER_REQ:-}}"
   resolve_required_checks "$OR"
@@ -248,10 +248,10 @@ lander_authority() {
   fi
   if [ -n "$why" ]; then
     AUTH="unknown"
-    say "merge authority: UNKNOWN — $why. Nothing merges this run (the same fail-closed refusal merge-one.sh makes, agent-infra#1764): an unreadable contract is not a licence to merge."
+    log_line "merge authority: UNKNOWN — $why. Nothing merges this run (the same fail-closed refusal merge-one.sh makes, agent-infra#1764): an unreadable contract is not a licence to merge."
     return 0
   fi
-  say "merge authority: $AUTH (required checks: [${REQ}] source=${REQ_SOURCE:-read}${REQ_OVERRIDE:+ — OPERATOR OVERRIDE})"
+  log_line "merge authority: $AUTH (required checks: [${REQ}] source=${REQ_SOURCE:-read}${REQ_OVERRIDE:+ — OPERATOR OVERRIDE})"
 }
 
 # ── merge queue presence, once per run ───────────────────────────────────────────────────────
@@ -264,9 +264,9 @@ lander_detect_queue() {
   local n
   n="$(gh api "repos/$OR/rules/branches/main" --jq '[.[]|select(.type=="merge_queue")]|length' 2>/dev/null)"
   case "${n:-}" in
-    ''|*[!0-9]*) say "merge queue: UNKNOWN (the branch-rules read failed or answered something that is not a count) — merging with squash, which GitHub refuses if a queue is required"; HAS_QUEUE=0 ;;
-    0)           say "merge queue: none on main — merging with squash" ;;
-    *)           say "merge queue: PRESENT ($n rule) — handing ready PRs to the queue with --auto"; HAS_QUEUE=1 ;;
+    ''|*[!0-9]*) log_line "merge queue: UNKNOWN (the branch-rules read failed or answered something that is not a count) — merging with squash, which GitHub refuses if a queue is required"; HAS_QUEUE=0 ;;
+    0) log_line "merge queue: none on main — merging with squash" ;;
+    *) log_line "merge queue: PRESENT ($n rule) — handing ready PRs to the queue with --auto"; HAS_QUEUE=1 ;;
   esac
 }
 
@@ -574,15 +574,15 @@ lander_stale_rerun() { # <board-numbers-file>  (one PR number per line, from the
   # An explicit file is bounded in both directions, and its absence is a named refusal.
   local tmp boardf="${1:-}"
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/lander-stale.XXXXXX")" || {
-    say "stale-rerun: no scratch directory (mktemp failed under ${TMPDIR:-/tmp}) — 0 re-runs this run"
+    log_line "stale-rerun: no scratch directory (mktemp failed under ${TMPDIR:-/tmp}) — 0 re-runs this run"
     return 0
   }
   if [ -z "$boardf" ] || [ ! -r "$boardf" ]; then
-    say "stale-rerun: no readable board file was passed — 0 re-runs this run (nothing may be acted on that this run did not see)"
+    log_line "stale-rerun: no readable board file was passed — 0 re-runs this run (nothing may be acted on that this run did not see)"
     rm -rf "$tmp"; return 0
   fi
   if [ "$STALE_RERUN" != 1 ]; then
-    say "stale-rerun: DISABLED (STALE_RERUN=$STALE_RERUN) — no re-runs this run"; rm -rf "$tmp"; return 0
+    log_line "stale-rerun: DISABLED (STALE_RERUN=$STALE_RERUN) — no re-runs this run"; rm -rf "$tmp"; return 0
   fi
   # THE BUDGET, before anything is spent. `/rate_limit` is documented as NOT counting against the
   # limit, so reading it costs nothing — and 5 points per POST is the documented cost of a mutation.
@@ -623,7 +623,7 @@ r=((d.get("resources") or {}).get("core") or {}).get("remaining")
 print(r if isinstance(r,int) else "")' 2>/dev/null)"
   case "${rem:-}" in
     ''|*[!0-9]*)
-      say "stale-rerun: REST budget UNREADABLE (raw='${rem:-<empty>}') — 0 re-runs this run (an unbounded mutation on a shared 5000/hr bucket is not a measurement, it is a race)"
+      log_line "stale-rerun: REST budget UNREADABLE (raw='${rem:-<empty>}') — 0 re-runs this run (an unbounded mutation on a shared 5000/hr bucket is not a measurement, it is a race)"
       rm -rf "$tmp"; return 0 ;;
   esac
   n=$(( (rem - STALE_RERUN_RESERVE) / 5 ))
@@ -644,7 +644,7 @@ try: d=json.load(open(sys.argv[1]))
 except Exception: print(""); raise SystemExit
 print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") or {}).get("target",{}).get("committedDate") or "")' "$tmp/base.json" 2>/dev/null)"
   if [ -z "$base_iso" ]; then
-    say "stale-rerun: the base tip could not be read over GraphQL — 0 re-runs this run (nothing to measure staleness against)"
+    log_line "stale-rerun: the base tip could not be read over GraphQL — 0 re-runs this run (nothing to measure staleness against)"
     rm -rf "$tmp"; return 0
   fi
 
@@ -685,7 +685,7 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
     why="$(grep -m1 "^FATAL$(printf '\037')" "$tmp/plan.us" 2>/dev/null | cut -d"$(printf '\037')" -f2-)"
     [ -n "$why" ] || why="$(tr '\n' ' ' <"$tmp/plan.err" 2>/dev/null | cut -c1-300)"
     [ -n "$why" ] || why="the planner printed nothing explanatory"
-    say "stale-rerun: the plan did not complete (no INFO line) — 0 re-runs this run: $why"
+    log_line "stale-rerun: the plan did not complete (no INFO line) — 0 re-runs this run: $why"
     rm -rf "$tmp"; return 0
   fi
   local stale_runs=0 stale_prs=0 over=0 undated=0 nonact=0 cands=0 want=0 chose_runs=0 re_ran=0 outcomes=0 successes=0 stillred=0 excluded=0 excluded_runs=0
@@ -698,10 +698,10 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
   fi
   while IFS="$US" read -r kind a b c d e f; do
     case "$kind" in
-      FATAL)    say "stale-rerun: $a"; rm -rf "$tmp"; return 0 ;;
-      STATEERR) say "stale-rerun: THE STATE FILE COULD NOT BE WRITTEN ($a) — the outcome of every re-run this run is UNRECORDED, so it will be re-reported (and, for an unresolved re-run, re-measured) next pass. This is a degraded run, not a clean one" ;;
-      UNDATED) say "stale-rerun: #$a $b is RED but carries no started_at — NOT selected (a check that cannot be dated cannot be called stale; it stays red and visible)" ;;
-      SKIPWIN) say "stale-rerun: #$a $c skipped — run $b was already re-run inside the ${STALE_RERUN_WINDOW}s window (the state file is what stops a re-run loop)" ;;
+      FATAL) log_line "stale-rerun: $a"; rm -rf "$tmp"; return 0 ;;
+      STATEERR) log_line "stale-rerun: THE STATE FILE COULD NOT BE WRITTEN ($a) — the outcome of every re-run this run is UNRECORDED, so it will be re-reported (and, for an unresolved re-run, re-measured) next pass. This is a degraded run, not a clean one" ;;
+      UNDATED) log_line "stale-rerun: #$a $b is RED but carries no started_at — NOT selected (a check that cannot be dated cannot be called stale; it stays red and visible)" ;;
+      SKIPWIN) log_line "stale-rerun: #$a $c skipped — run $b was already re-run inside the ${STALE_RERUN_WINDOW}s window (the state file is what stops a re-run loop)" ;;
     esac
   done <"$tmp/plan.us"
 
@@ -720,23 +720,23 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
     case "$okruns" in
       *" $b "*)
         if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$f" "$g" >> "$STALE_RERUN_STATE"; then
-          say "stale-rerun: #$a $c is re-run by the SAME run $b already POSTed in this pass (check $d) — recorded so its outcome is read, not POSTed twice"
+          log_line "stale-rerun: #$a $c is re-run by the SAME run $b already POSTed in this pass (check $d) — recorded so its outcome is read, not POSTed twice"
         else
-          say "stale-rerun: #$a $c shares run $b (already POSTed) but the STATE FILE COULD NOT BE WRITTEN — its outcome will not be read"
+          log_line "stale-rerun: #$a $c shares run $b (already POSTed) but the STATE FILE COULD NOT BE WRITTEN — its outcome will not be read"
         fi
         continue ;;
     esac
-    case "$badruns" in *" $b "*) printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE" 2>/dev/null || say "stale-rerun: #$a $c shares run $b whose POST was refused, but the deferral could NOT be recorded ($STALE_RERUN_STATE) — it will be re-POSTed next pass"; continue ;; esac
+    case "$badruns" in *" $b "*) printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE" 2>/dev/null || log_line "stale-rerun: #$a $c shares run $b whose POST was refused, but the deferral could NOT be recorded ($STALE_RERUN_STATE) — it will be re-POSTed next pass"; continue ;; esac
     if [ "$DRY" = 1 ]; then
-      say "stale-rerun: #$a $c WOULD RE-RUN (check id $d started $e — before the base tip $base_iso; run $b)"
+      log_line "stale-rerun: #$a $c WOULD RE-RUN (check id $d started $e — before the base tip $base_iso; run $b)"
       continue
     fi
     if GH_LIMIT_NO_WAIT=1 gh api -X POST "repos/$OR/actions/runs/$b/rerun-failed-jobs" >/dev/null 2>"$tmp/post.err"; then
       re_ran=$((re_ran+1)); okruns="$okruns$b "
       if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$f" "$g" >> "$STALE_RERUN_STATE"; then
-        say "stale-rerun: #$a $c RE-RUN (run $b, check $d started $e < base tip $base_iso) — the result is read next pass, as success or still-red"
+        log_line "stale-rerun: #$a $c RE-RUN (run $b, check $d started $e < base tip $base_iso) — the result is read next pass, as success or still-red"
       else
-        say "stale-rerun: #$a $c was RE-RUN (run $b) but the STATE FILE COULD NOT BE WRITTEN ($STALE_RERUN_STATE) — its outcome will not be read, and the same run may be re-run again next pass"
+        log_line "stale-rerun: #$a $c was RE-RUN (run $b) but the STATE FILE COULD NOT BE WRITTEN ($STALE_RERUN_STATE) — its outcome will not be read, and the same run may be re-run again next pass"
       fi
     else
       # ⛔ A REFUSAL IS RECORDED, NOT RETRIED. Measured live: `403 This workflow is already
@@ -746,9 +746,9 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
       # an outcome, because nothing ran.
       badruns="$badruns$b "
       if printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE" 2>/dev/null; then
-        say "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — recorded as deferred; not retried inside the ${STALE_RERUN_WINDOW}s window, and NOT treated as green"
+        log_line "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — recorded as deferred; not retried inside the ${STALE_RERUN_WINDOW}s window, and NOT treated as green"
       else
-        say "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — and the deferral could NOT be recorded ($STALE_RERUN_STATE), so the same run may be POSTed again next pass. NOT treated as green"
+        log_line "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — and the deferral could NOT be recorded ($STALE_RERUN_STATE), so the same run may be POSTed again next pass. NOT treated as green"
       fi
     fi
   done <"$tmp/plan.us"
@@ -760,14 +760,14 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
     [ "$kind" = "OUTCOME" ] || continue
     outcomes=$((outcomes+1))
     case "$e" in
-      success) successes=$((successes+1)); say "stale-rerun: #$a $c is now SUCCESS (check $d, replacing $f) — the red did not reproduce on the SAME tree: a flake, or an input outside the tree" ;;
-      *)       stillred=$((stillred+1)); say "stale-rerun: #$a $c is STILL-RED (check $d, replacing $f) — the red belongs to this tree and a re-run cannot clear it (a base-side repair needs the branch UPDATED onto the new base, which moves the head; that is the owner's act, not this loop's). It stays red and visible; nothing here suppresses it" ;;
+      success) successes=$((successes+1)); log_line "stale-rerun: #$a $c is now SUCCESS (check $d, replacing $f) — the red did not reproduce on the SAME tree: a flake, or an input outside the tree" ;;
+      *)       stillred=$((stillred+1)); log_line "stale-rerun: #$a $c is STILL-RED (check $d, replacing $f) — the red belongs to this tree and a re-run cannot clear it (a base-side repair needs the branch UPDATED onto the new base, which moves the head; that is the owner's act, not this loop's). It stays red and visible; nothing here suppresses it" ;;
     esac
   done <"$tmp/plan.us"
 
-  say "stale-rerun: stale-by-base=$cands check(s) across $stale_prs PR(s) in $stale_runs run(s); budget N=$n run(s) (REST core ${rem} left, minus ${STALE_RERUN_RESERVE} reserve, 5 points per re-run POST); selected=$want check(s) in $chose_runs run(s), re-ran=$re_ran run(s), over-budget=$over check(s) left for the next run; undated=$undated non-actions=$nonact; outcomes read=$outcomes (success=$successes still-red=$stillred); excluded-by-name=$excluded check(s), run(s)-dropped=$excluded_runs (NOT base-staleness: ${STALE_RERUN_EXCLUDE} is #2467's class, owned by the recorder rerun; a RUN carrying one is dropped entirely, because the POST re-runs every failed job in it)"
+  log_line "stale-rerun: stale-by-base=$cands check(s) across $stale_prs PR(s) in $stale_runs run(s); budget N=$n run(s) (REST core ${rem} left, minus ${STALE_RERUN_RESERVE} reserve, 5 points per re-run POST); selected=$want check(s) in $chose_runs run(s), re-ran=$re_ran run(s), over-budget=$over check(s) left for the next run; undated=$undated non-actions=$nonact; outcomes read=$outcomes (success=$successes still-red=$stillred); excluded-by-name=$excluded check(s), run(s)-dropped=$excluded_runs (NOT base-staleness: ${STALE_RERUN_EXCLUDE} is #2467's class, owned by the recorder rerun; a RUN carrying one is dropped entirely, because the POST re-runs every failed job in it)"
   note "stale-rerun: base_tip=$base_iso cands=$cands prs=$stale_prs runs=$stale_runs N=$n want=$want ran=$re_ran over=$over outcomes=$outcomes success=$successes still_red=$stillred excl_run=$excluded_runs"
-  if [ "${STALE_RERUN_DEBUG:-0}" = 1 ]; then say "stale-rerun: DEBUG kept $tmp (plan, rollup, base)"; else rm -rf "$tmp"; fi
+  if [ "${STALE_RERUN_DEBUG:-0}" = 1 ]; then log_line "stale-rerun: DEBUG kept $tmp (plan, rollup, base)"; else rm -rf "$tmp"; fi
   return 0
 }
 
@@ -809,23 +809,23 @@ lander_one() { # <pr>
   local pr="$1" view vrc mergeable mstate draft head ckraw chk crc green pend fail names odd
   view="$(gh pr view "$pr" --repo "$OR" --json mergeable,mergeStateStatus,isDraft,headRefOid 2>/dev/null | py view)"; vrc=$?
   if [ "$vrc" -ne 0 ] || [ -z "$view" ]; then
-    say "#$pr skipped: could not read the PR (fail-closed — nothing merged for it)"; SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:read-failed"; return 0
+    log_line "#$pr skipped: could not read the PR (fail-closed — nothing merged for it)"; SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:read-failed"; return 0
   fi
   IFS="$US" read -r mergeable mstate draft head <<<"$view"
 
   # 1) a DRAFT is not a candidate at any state: it is the author's own "not ready" mark.
   if [ "${draft:-0}" = "1" ]; then
-    say "#$pr skipped: draft (isDraft=true — the author has not asked for it to land)"
+    log_line "#$pr skipped: draft (isDraft=true — the author has not asked for it to land)"
     SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:draft"; return 0
   fi
   # 2) a CONFLICT can never merge; it is work for a fixer, not a wait.
   if [ "$mergeable" = "CONFLICTING" ] || [ "$mstate" = "DIRTY" ]; then
-    say "#$pr skipped: mergeable=$mergeable mergeStateStatus=${mstate:-<empty>} — conflicts with $OR's base branch; a fixer owns this, waiting will not clear it"
+    log_line "#$pr skipped: mergeable=$mergeable mergeStateStatus=${mstate:-<empty>} — conflicts with $OR's base branch; a fixer owns this, waiting will not clear it"
     SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:conflict"; return 0
   fi
   # 3) GitHub still computing mergeability is NOT a defect and NOT a green light.
   if [ "$mergeable" != "MERGEABLE" ]; then
-    say "#$pr waiting: mergeable=${mergeable:-UNKNOWN} — GitHub has not finished computing mergeability (re-read next run; this is not a failure)"
+    log_line "#$pr waiting: mergeable=${mergeable:-UNKNOWN} — GitHub has not finished computing mergeability (re-read next run; this is not a failure)"
     WAITING=$((WAITING+1)); return 0
   fi
 
@@ -841,24 +841,24 @@ lander_one() { # <pr>
   if [ "$crc" -ne 0 ] || [ -z "$chk" ]; then
     # An incomplete read is neither green nor red. Reading it as "no checks" is the defect that let
     # earlier lanes call a rate-limited read a passing PR.
-    say "#$pr waiting: the check surface could not be read (incomplete read — retry, never read as green)"
+    log_line "#$pr waiting: the check surface could not be read (incomplete read — retry, never read as green)"
     WAITING=$((WAITING+1)); return 0
   fi
   IFS="$US" read -r green pend fail names odd <<<"$chk"
   if [ "${fail:-0}" -gt 0 ]; then
-    say "#$pr skipped: $fail FAILED check(s): ${names# } — never merged with a failing check (green=$green pending=$pend)"
+    log_line "#$pr skipped: $fail FAILED check(s): ${names# } — never merged with a failing check (green=$green pending=$pend)"
     SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:failed-checks"; return 0
   fi
   # ⛔ BEFORE the pending arm: a check that did not complete can never resolve into a merge, so a PR
   # carrying one is SKIPPED (named, non-red) rather than reported as a CI wait it will never leave.
   if [ -n "${odd:-}" ]; then
-    say "#$pr skipped: ${odd} did not complete (cancelled/stale) — NOT a red tree and NOT a defect, but verification never finished, so this is never merged (green=$green pending=$pend failed=$fail); re-run the checks or wait for the next push"
+    log_line "#$pr skipped: ${odd} did not complete (cancelled/stale) — NOT a red tree and NOT a defect, but verification never finished, so this is never merged (green=$green pending=$pend failed=$fail); re-run the checks or wait for the next push"
     SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:checks-incomplete"; return 0
   fi
   if [ "${pend:-0}" -gt 0 ]; then
     # ⛔ THE MEASURED CASE. Green so far, CI still running: WAIT, say "waiting-on-CI", and never
     # call it skipped/blocked/failed. Action here is what made lanes re-dispatch healthy PRs.
-    say "#$pr waiting-on-CI: $pend pending, $green green, 0 failed — CI latency, not a defect; nothing to do but wait"
+    log_line "#$pr waiting-on-CI: $pend pending, $green green, 0 failed — CI latency, not a defect; nothing to do but wait"
     WAITING=$((WAITING+1)); return 0
   fi
 
@@ -867,45 +867,45 @@ lander_one() { # <pr>
   case "$mstate" in
     CLEAN|HAS_HOOKS) : ;;
     BLOCKED)
-      say "#$pr skipped: mergeStateStatus=BLOCKED with $green green and 0 failed — GitHub says a protection rule or a required review blocks it (mergeable=MERGEABLE, reviewDecision is not exposed over REST); NOT merged, and not a CI wait: something must change outside CI"
+      log_line "#$pr skipped: mergeStateStatus=BLOCKED with $green green and 0 failed — GitHub says a protection rule or a required review blocks it (mergeable=MERGEABLE, reviewDecision is not exposed over REST); NOT merged, and not a CI wait: something must change outside CI"
       SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:blocked"; return 0 ;;
     BEHIND)
-      say "#$pr skipped: mergeStateStatus=BEHIND — behind $OR's base and the branch requires an up-to-date head; a lane/fixer must update it (checks: $green green, 0 failed)"
+      log_line "#$pr skipped: mergeStateStatus=BEHIND — behind $OR's base and the branch requires an up-to-date head; a lane/fixer must update it (checks: $green green, 0 failed)"
       SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:behind"; return 0 ;;
     ""|UNKNOWN)
-      say "#$pr waiting: mergeStateStatus empty/UNKNOWN — mergeability not yet computed by GitHub (retry; not a failure)"
+      log_line "#$pr waiting: mergeStateStatus empty/UNKNOWN — mergeability not yet computed by GitHub (retry; not a failure)"
       WAITING=$((WAITING+1)); return 0 ;;
     *)
-      say "#$pr skipped: mergeStateStatus=${mstate} (unrecognised state — allow-list is CLEAN/HAS_HOOKS, so this is NOT treated as ready; checks: $green green, 0 failed)"
+      log_line "#$pr skipped: mergeStateStatus=${mstate} (unrecognised state — allow-list is CLEAN/HAS_HOOKS, so this is NOT treated as ready; checks: $green green, 0 failed)"
       SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:state-$mstate"; return 0 ;;
   esac
 
   # 6) READY — but "ready" is about the PR; the MERGE VERB is about the repo. A rail repo's merge
   # authority is its own rail, so this component does not merge it and says who does.
   if [ "$AUTH" = "unknown" ]; then
-    say "#$pr waiting: ready (green=$green, mergeStateStatus=$mstate) but the merge contract is UNKNOWN this run — nothing merges until it is readable"
+    log_line "#$pr waiting: ready (green=$green, mergeStateStatus=$mstate) but the merge contract is UNKNOWN this run — nothing merges until it is readable"
     WAITING=$((WAITING+1)); return 0
   fi
   if [ "$AUTH" = "rail" ]; then
-    say "#$pr skipped: READY, but this repo's merge authority is its own RAIL — merge-one.sh owns this merge; a raw squash here would land it on the required checks alone with no head-bound evidence (#1764)"
+    log_line "#$pr skipped: READY, but this repo's merge authority is its own RAIL — merge-one.sh owns this merge; a raw squash here would land it on the required checks alone with no head-bound evidence (#1764)"
     SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:rail-authority"; return 0
   fi
   lander_merge "$pr" "$head"
   case "$MERGE_RESULT" in
     merged)
-      if [ -n "$MERGE_SHA" ]; then say "#$pr MERGED sha=$MERGE_SHA (head=$head, $green green, mergeStateStatus=$mstate)"
-      else say "#$pr MERGED (head=$head, $green green) — merge commit sha unreadable"; fi
+      if [ -n "$MERGE_SHA" ]; then log_line "#$pr MERGED sha=$MERGE_SHA (head=$head, $green green, mergeStateStatus=$mstate)"
+      else log_line "#$pr MERGED (head=$head, $green green) — merge commit sha unreadable"; fi
       MERGED=$((MERGED+1)) ;;
-    enqueued) say "#$pr ENQUEUED on the merge queue (head=$head, $green green) — the queue lands it"; ENQUEUED=$((ENQUEUED+1)) ;;
-    dry-run)  say "#$pr WOULD MERGE (dry-run; head=$head, $green green, mergeStateStatus=$mstate)"; WOULD=$((WOULD+1)) ;;
-    *)        say "#$pr ERROR: the merge command failed (head=$head) — see $LOG"; ERRORS=$((ERRORS+1)) ;;
+    enqueued) log_line "#$pr ENQUEUED on the merge queue (head=$head, $green green) — the queue lands it"; ENQUEUED=$((ENQUEUED+1)) ;;
+    dry-run) log_line "#$pr WOULD MERGE (dry-run; head=$head, $green green, mergeStateStatus=$mstate)"; WOULD=$((WOULD+1)) ;;
+    *) log_line "#$pr ERROR: the merge command failed (head=$head) — see $LOG"; ERRORS=$((ERRORS+1)) ;;
   esac
 }
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────
 US=$'\x1f'   # unit separator: NOT an IFS whitespace char, so empty fields survive `read`
 MERGED=0; ENQUEUED=0; WAITING=0; SKIPPED=0; ERRORS=0; WOULD=0; SKIP_REASONS=""
-say "run start: repo=$OR dry_run=$DRY max=$MAX path=$(command -v gh 2>/dev/null)"
+log_line "run start: repo=$OR dry_run=$DRY max=$MAX path=$(command -v gh 2>/dev/null)"
 # ONCE PER RUN, BEFORE ANY ACT: the number that explains a slow drain even when nothing is ready.
 lander_queue_depth
 lander_authority
@@ -916,18 +916,18 @@ LIST="$(printf '%s' "$BOARD" | py list)"; LRC=$?
 if [ "$LRC" -ne 0 ]; then
   # ⛔ FAIL-CLOSED. An unreadable board must never look like "no open PRs" (which reads as "nothing
   # to do" and is how a broken token silently stops the drain).
-  say "FATAL: the open-PR board could not be read (gh pr list returned no parseable JSON) — NOTHING merged this run"
+  log_line "FATAL: the open-PR board could not be read (gh pr list returned no parseable JSON) — NOTHING merged this run"
   note "run aborted: unreadable board (raw bytes: $(printf '%s' "$BOARD" | head -c 200))"
   exit 2
 fi
 
 N="$(printf '%s\n' "$LIST" | awk 'NF' | wc -l | tr -d ' ')"
-say "open PRs: ${N:-0} (limit $MAX)"
+log_line "open PRs: ${N:-0} (limit $MAX)"
 # ⛔ BEFORE the board loop, and only on a board that was READ: a PR the lander did not see is not
 # this step's business. Re-measuring a stale red is what makes the loop below able to see a PR as
 # ready at all when the only thing red about it is a base that has since been repaired.
 if [ "${STALE_RERUN_OFF:-0}" = 1 ]; then
-  say "stale-rerun: DISABLED by --no-stale-rerun — no re-runs this run"
+  log_line "stale-rerun: DISABLED by --no-stale-rerun — no re-runs this run"
 else
   # The board is written to a file and PASSED, never piped into the step: see the two measured
   # reasons at the top of lander_stale_rerun (a consumed stdin, and a TTY that never EOFs).
@@ -944,8 +944,8 @@ while IFS= read -r pr; do
   [ -n "$pr" ] && lander_one "$pr"
 done <<<"$(printf '%s\n' "$LIST" | awk 'NF{print $1}')"
 
-say "summary: merged=$MERGED enqueued=$ENQUEUED would_merge=$WOULD waiting=$WAITING skipped=$SKIPPED errors=$ERRORS"
-[ -n "${SKIP_REASONS# }" ] && say "skipped reasons:${SKIP_REASONS}"
+log_line "summary: merged=$MERGED enqueued=$ENQUEUED would_merge=$WOULD waiting=$WAITING skipped=$SKIPPED errors=$ERRORS"
+[ -n "${SKIP_REASONS# }" ] && log_line "skipped reasons:${SKIP_REASONS}"
 # The durable record the fleet inventory reads (`fleet_row_lander_drain`). ONE line, fixed field
 # order, written on every path that reaches the summary — a row that cannot read it must be able to
 # say "no run recorded" rather than guess health from an absent file.
