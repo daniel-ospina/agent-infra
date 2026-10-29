@@ -118,10 +118,9 @@ fi
 # has no `pi` descendant YET. Naming requires BOTH `dead` (NO live `pi` descendant) AND age >= the
 # floor, so without a floor this LAUNCH window — from spawn until `pi` exists, not the whole 600 s —
 # would be reported as an orphan, exactly when an operator is hunting the real orphans. (A lane that HAS
-# spawned `pi` is not
-# named at any age: OH2's 1000 s-old live session is never named. The 600 s is a GRACE, and the other
-# window it covers is a session whose agent has already exited — that one is genuinely dead, merely
-# between incarnations.)
+# spawned `pi` is not named at any age: OH2's 1000 s-old live session is never named. The 600 s is a
+# GRACE, and the other window it covers is a session whose agent has already exited — that one is
+# genuinely dead, merely between incarnations.)
 # ⛔ WHY THIS ARM EXISTS: `NEW` was computed and documented from the day this suite landed, but no
 # case ever drove it, so only the PAST-the-floor direction was asserted and a floor lowered to 0 —
 # which reports a freshly-spawned lane during that launch window — stayed green (agent-infra#2788).
