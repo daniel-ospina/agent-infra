@@ -268,7 +268,8 @@ def is_fleet_worktree(cwd: str) -> bool:
     because `realpath` would otherwise absolutise it against this process's own directory and
     make the guard inert (review finding 3). The cost of a wrong FALSE here is one fewer derived
     row on a box whose roster we are deriving because it has none; the cost of a wrong TRUE is a
-    roster row attributing an issue to the OWNER's window — a manufactured holder, which is a blocking false COLLISION (#8177).
+    roster row attributing an issue to the OWNER's window — a manufactured holder, which is a
+    blocking false COLLISION (#8177).
 
     ⛔ THE NAME ALONE IS NOT EVIDENCE. The first version accepted any path whose basename began
     with `wt-`, so `~/wt-notes`, a `wt-draft` directory, or any plain `wt-*` folder became a
