@@ -1,0 +1,15 @@
+# `github.workflow_sha` is a documented COMMIT SHA (the workflow file's own commit) and contains
+# `github.workflow` as a PREFIX, so it satisfied the identity rule while the per-commit rule — matching
+# `.sha` — never saw `_sha`. A group keyed on it is per-head: the block cancels nothing. RED [R1]
+# (#2660 round 12).
+name: pr workflow sha
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow_sha }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

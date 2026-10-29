@@ -36,12 +36,42 @@
 // agent-infra ships — same inode (symlink/hard link) or same bytes (folder
 // copy). See `canonicalSkillsRoot`.
 
+// ── THIS GATE IS A COMPLIANCE GATE, NOT A SECURITY BOUNDARY (#1329) ────────
+// The bash branch matches a regex against the command TEXT. That catches the
+// spellings the manifest lists, and (since #1329) also the canonical spelling
+// with a git/gh invocation's GLOBAL options removed — `git -C <dir> commit`,
+// `git --no-pager commit`, `gh -R <owner/name> pr create` — which were
+// measured ALLOWED before, `git -C <dir>` being how this fleet commits in a
+// linked worktree. It does NOT stop an agent that INTENDS to evade it:
+// variable indirection (`g=commit; git $g …`), an alias/function invocation, an
+// `eval` of a variable, quote/escape splicing inside the verb, and arbitrary
+// nesting all bypass every rule when they are spelled as they are listed here.
+// ⛔ SPLICING NEEDS NO INDIRECTION, AND THIS COMMENT USED TO SAY IT DID (#1329
+// review cycle 2, P3): `git com"mit" -m x` is measured ALLOWED with no variable,
+// no alias and no `eval` — the text gate sees `com"mit"`, and re-joining it is
+// the bounded lexing pass the manifest header now calls a TRADE rather than an
+// impossibility. What IS true, and is the reason most evasions still need
+// indirection: the LITERAL text of a git command is matched wherever it appears
+// (`eval 'git commit'` and `echo 'git commit'` are caught). The
+// adopter-facing statement of that boundary — what is closed, what is not, and
+// the sanctioned bypasses — lives in the manifest header
+// (`enforcement/dangerous-ops.txt`), where the rules are read.
+
 import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, readdirSync, statSync } from "node:fs";
 import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { isPrintMode } from "./shared/print-mode.js";
 import { register } from "./shared/health.js";
+// #2965 — the lane contract is DERIVED, not demanded. `lane.sh` exports
+// SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless run started any other
+// way (a cloud-cell dispatch, a hand-run `pi -p … --no-session`) got the gates
+// WITH the work and none of the affordances, so its `git commit` was refused and
+// the lane exited with zero commits. `shared/headless-lane.ts` derives the same
+// contract from what the process can observe (print mode + a LINKED worktree),
+// and is consulted by `_isBypassEnv` below. The hub arm is unchanged: headless
+// in the hub checkout derives nothing and stays guarded.
+import { laneContract, applyLaneContract } from "./shared/headless-lane.js";
 // #1321/#1330 — the inlined copy of pi's `isToolCallEventType` now has ONE home
 // (shared/tool-call-event.ts) and is pinned against the real export by
 // extensions/verification-gate/tool-call-event-parity.test.ts. It is imported
@@ -50,6 +80,7 @@ import { register } from "./shared/health.js";
 // would drift under a pi upgrade while the extension kept reporting
 // `✅ Loaded — enforcing N skill gates` with every gate inert (#1330).
 import { isToolCallEventType } from "./shared/tool-call-event.js";
+import { commandSpellings } from "./shared/git-command-parse.js";
 
 // ── Real module location ────────────────────────────
 // See the DEPLOYED LAYOUT note at the top of this file. The try/catch keeps a
@@ -200,7 +231,26 @@ function _getEnv(name: string): string | undefined {
   return process.env[`AGENT_${name}`] ?? process.env[`ELDATO_${name}`];
 }
 function _isBypassEnv(): boolean {
-  return process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1";
+  return process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1" || _isDerivedLane();
+}
+/**
+ * #2965 — the SAME affordance `lane.sh` gives its lanes by exporting
+ * SKILL_ENFORCER_DISABLED=1, derived instead of demanded. A guard must judge what
+ * the process IS: a headless run in a LINKED WORKTREE is a lane however it was
+ * launched. Deriving it through `laneContract()`, which MEMOISES, rather than
+ * inline here keeps that cost off the per-tool-call path: the subprocesses run
+ * once per process (the `--show-toplevel` / `--git-dir` / `--git-common-dir`
+ * trio, plus `--abbrev-ref HEAD` only in a linked worktree), and an interactive
+ * session runs none at all — the helper returns before it shells out.
+ *
+ * ⛔ The hub arm is deliberately NOT covered: a headless `pi -p` whose cwd is the
+ * hub checkout still has every gate armed, because that is the direction
+ * `extensions/main-worktree-guard` protects. The distinction is linked-worktree
+ * vs hub, never headless vs interactive — pinned in both directions by
+ * `extensions/shared/headless-lane.test.ts`.
+ */
+function _isDerivedLane(): boolean {
+  return laneContract().lane;
 }
 // Prefix override (Phase 1 default: operations/skills/). DISPLAY only since
 // #1322 — never the source of truth for read-tracking. It may also name an extra
@@ -697,6 +747,55 @@ export function reportManifestState(): void {
 }
 reportManifestState();
 
+// ── #2965 — derive the lane contract at LOAD, not on the first tool call ────
+// The derivation shells out to git; `laneContract()` memoises it, so this is the
+// only time the cost is paid (and an interactive session pays nothing — the
+// helper never runs git unless the process is headless).
+//
+// It is here, at module scope, so `KIND`/`TAG` are in the environment before any
+// SESSION runs — that is what a child process spawned later inherits, and what
+// any consumer reading `KIND` lazily sees. ⛔ It does NOT reach `review-enforcer`'s
+// #2148 audience disclosure, which resolves its role at factory-invoke time from
+// a module pi loads BEFORE this one (measured — see the header of
+// `shared/headless-lane.ts`). Correcting that is agent-infra#2966.
+//
+// Emitted on STDERR and NOT print-mode gated, for the same reason
+// `reportManifestState` is: a headless lane that suddenly acts differently is
+// exactly the process whose log an operator reads afterwards, and it must be
+// able to see that the affordance was INFERRED rather than launched.
+//
+// ⛔ PRINTED ONLY WHEN THE DERIVATION ACTUALLY APPLIED SOMETHING (review cycle 1,
+// P2). The first version printed for every derived lane and claimed "no ordinary
+// run gains a line" — false for the fleet's MOST COMMON headless run: a
+// `task`/`subagent` child in a linked worktree is a derived lane, and `#172`
+// records added sub-agent startup lines as a defect class. A child (and any
+// launcher that already set `KIND`/`TAG`) has nothing applied, so it prints
+// nothing; a session that actually gained an affordance prints exactly one line.
+//
+// ⛔ AND EXACTLY ONE LINE PER PROCESS (review cycle 2, P1). This line carries the
+// same `why` the `session_start` "Disabled — derived lane contract" line carries,
+// so emitting both printed the identical sentence twice for the one shape that
+// matters most — a raw `pi -p` in a linked worktree, the case #172 is about.
+// `DERIVED_ANNOUNCED_AT_LOAD` is what makes the two sites ONE announcement: this
+// one wins when something was INFERRED, and `session_start` emits the derived
+// form only when nothing was (a launcher-set lane emits its own "Disabled" line
+// there and is unaffected). Every process that acts with the gates off still says
+// so, once — which is the claim the round-1 comment made and the code did not.
+const DERIVED_LANE = laneContract();
+let DERIVED_ANNOUNCED_AT_LOAD = false;
+if (DERIVED_LANE.lane) {
+  const applied = applyLaneContract();
+  const named = [applied.kind ? `KIND=${applied.kind}` : "", applied.tag ? `TAG=${applied.tag}` : ""].filter(Boolean).join(" ");
+  if (named) {
+    console.error(
+      `[skill-enforcer] ⏸️  Lane contract DERIVED — ${DERIVED_LANE.why}; skill gates are off for this process` +
+        ` (inferred ${named})` +
+        ` — a launcher-set SKILL_ENFORCER_DISABLED/AGENT_ALLOW_MAIN_EDITS still wins where present`,
+    );
+    DERIVED_ANNOUNCED_AT_LOAD = true;
+  }
+}
+
 const readFiles = new Set<string>();
 
 // Per-skill bypass counter — tracks how many times each skill gate has been bypassed this session.
@@ -762,6 +861,19 @@ function logNudgeEvent(type: "fired" | "complied" | "bypassed" | "blocked", skil
   console.log(`[skill-enforcer] 📊 ${event}`);
 }
 
+/**
+ * #1329 — match a rule against every SPELLING of the command the shared parser
+ * derives (raw first, then a git/gh invocation with its GLOBAL options removed).
+ * The derivation only DELETES option runs, so this can only ADD a block: a rule
+ * that matched the raw command still matches, and the raw command is always
+ * tried first. See `commandSpellings` (shared/git-command-parse.ts) for the two
+ * load-bearing properties, and the `enforcement/dangerous-ops.txt` header for
+ * what this deliberately does not close.
+ */
+export function commandMatches(pattern: RegExp, spellings: string[]): boolean {
+  return spellings.some((spelling) => pattern.test(spelling));
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, _ctx) => {
     readFiles.clear();
@@ -772,7 +884,30 @@ export default function (pi: ExtensionAPI) {
     reportManifestState();
     // ponytail: AGENT_ALLOW_MAIN_EDITS / ELDATO_ALLOW_MAIN_EDITS also bypasses skill-enforcer (not just worktree-guard), #7470 / #7549
     if (_isBypassEnv()) {
-      console.log(`[skill-enforcer] ⏸️  Disabled`);
+      // #2965 — say WHICH affordance applied. "Disabled" alone left an operator
+      // unable to tell a launcher's env var from a DERIVED lane contract, which
+      // is the difference between "someone set this" and "this was inferred".
+      // ⛔ The derived form is the FALLBACK announcement, not a second one: when
+      // the module-load line already named the inferred contract
+      // (`DERIVED_ANNOUNCED_AT_LOAD`), repeating the same `why` here would put two
+      // identical sentences in one process's log (review cycle 2, P1).
+      // ⛔ ONE line per process, for EVERY shape (review cycle 4, F1). The
+      // module-load line below/above already tells an operator the gates are off for
+      // this process AND names the derivation — so when it fired, nothing is added
+      // here, even when a launcher var is ALSO present. That shape printed
+      // "Lane contract DERIVED …" and then a bare "Disabled": two lines for one
+      // process. `lane.sh`/`fix-one.sh`/`merge-one.sh` export KIND/TAG so they never
+      // hit it, but a hand-run `pi -p` using the escape hatch this module prints does,
+      // and an added startup line is exactly the #172 class.
+      const derived = laneContract();
+      const viaEnv = process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1";
+      if (!DERIVED_ANNOUNCED_AT_LOAD) {
+        if (viaEnv) {
+          console.log(`[skill-enforcer] ⏸️  Disabled`);
+        } else {
+          console.log(`[skill-enforcer] ⏸️  Disabled — derived lane contract: ${derived.why}`);
+        }
+      }
     }
   });
 
@@ -887,11 +1022,19 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason };
     };
 
+    // #1329: on the BASH channel the rule is tried against the raw command AND its
+    // option-normalised spellings (`git -C <dir> commit`, `git --no-pager commit`,
+    // `gh -R <o/n> pr create`), computed ONCE per call — every rule shares the list.
+    // #1328: every OTHER tool's subject is a tool NAME, which carries no git/gh global
+    // options, so `p.test(subject)` is the whole rule there. Both channels keep the one
+    // loop below, so a hard rule fires on the channel its pattern names.
+    const spellings = isBash ? commandSpellings(subject) : null;
     for (const [skillName, rules] of Object.entries(MANIFEST)) {
       for (const rule of rules) {
         if (rule.mode !== "hard") continue;
         for (const p of rule.patterns) {
-          if (p.test(subject) && !readFiles.has(skillName)) return blockReason(skillName, rule, toolName || subject);
+          const hit = spellings ? commandMatches(p, spellings) : p.test(subject);
+          if (hit && !readFiles.has(skillName)) return blockReason(skillName, rule, toolName || subject);
         }
       }
     }

@@ -1,6 +1,7 @@
 /**
  * git-command-parse.ts — THE single copy of the git/gh command-parsing helpers
- * shared by `verification-gate` and `review-enforcer` (#966).
+ * shared by `verification-gate`, `review-enforcer` and `skill-enforcer` (#966,
+ * #1329).
  *
  * ── WHY THIS MODULE EXISTS ───────────────────────────────────────────────
  * Both extensions used to carry private copies of `extractCdPath`,
@@ -198,6 +199,208 @@ function maskQuoted(command: string): string {
   let out = "";
   for (let i = 0; i < command.length; i++) out += mask[i] ? command[i] : " ";
   return out;
+}
+
+// ── command spellings for text gates (#1329) ─────────────────────────────
+// A TEXT gate — skill-enforcer's dangerous-ops manifest — matches a regex
+// against the bash command string, so a spelling that separates the command
+// word from its verb defeats it. MEASURED against the armed manifest
+// (enforcement/dangerous-ops.txt) on 2026-10-14:
+//
+//   BLOCKED (the literal pattern is still contiguous):
+//     `/usr/bin/git commit`, `command git commit`, `env FOO=1 git commit`,
+//     `sudo git commit`, `bash -c 'git commit'`, `xargs git commit`
+//   ALLOWED (the pattern is split, or the verb is indirect):
+//     `git -C <dir> commit`, `git --no-pager commit`, `git -c k=v commit`,
+//     `git -C <dir> stash pop`, `gh -R <owner/name> pr create`,
+//     `g=commit; git $g -m x`, `gc` after `alias gc='git commit'`,
+//     `eval "$CMD"`, `sh -c "git -C <dir> commit"`,
+//     `git com"mit"`, `git comm\it`, `git \` ⏎ `commit`
+//
+// The `git -C <dir>` form is the one that matters in practice: it is how this
+// fleet commits in a LINKED WORKTREE, so a cooperating agent produces it without
+// intending anything. `commandSpellings` closes that class — see its doc.
+//
+// Note the direction of the two lists: EVERY remaining evasion requires INDIRECTION
+// (a variable, an alias, a nested interpreter, or a splice) — the literal text of a
+// git command is caught wherever it appears, including inside quotes.
+
+/**
+ * Git's global options whose value is the NEXT word (as opposed to a flag, or a
+ * value carried by `--opt=value`). Incompleteness is a RECALL cost, never a
+ * false block: an option missing here is treated as valueless, so its value
+ * survives into the spelling and the spelling simply does not match — the raw
+ * command is still tried. Over-listing would be the dangerous direction (it
+ * would eat the verb), which is why the table carries only options whose
+ * separate-value form is real.
+ */
+const GIT_GLOBAL_VALUE_FLAGS = new Set([
+  "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env",
+  "--exec-path", "--attr-source", "--super-prefix", "--list-cmds",
+]);
+/** `gh`'s global flags that take a value. `-R`/`--repo` is the one that appears
+ * in real merge/create invocations (`gh -R owner/name pr merge 7` — the same
+ * spelling #931/#993 pinned for `extractRepoFlag`). */
+const GH_GLOBAL_VALUE_FLAGS = new Set(["-R", "--repo"]);
+
+interface CommandWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * Quote-aware WORD boundaries over the raw command. A quoted region (and any
+ * whitespace inside it) belongs to ONE word, so a QUOTED mention never presents
+ * `git` as a command word; unquoted shell separators end a word, so
+ * `cd /a&&git -C /b commit` still exposes `git` as its own word. Reuses
+ * `unquotedMask`, this module's single quote model.
+ */
+function commandWords(command: string): CommandWord[] {
+  const mask = unquotedMask(command);
+  const isBoundary = (c: string) =>
+    c === ";" || c === "&" || c === "|" || c === "(" || c === ")" ||
+    c === "{" || c === "}" || c === "`" || c === ">" || c === "<" || c === "\n" || c === "\r";
+  const words: CommandWord[] = [];
+  let i = 0;
+  while (i < command.length) {
+    if (mask[i] && (/\s/.test(command[i]) || isBoundary(command[i]))) { i++; continue; }
+    const start = i;
+    while (i < command.length && !(mask[i] && (/\s/.test(command[i]) || isBoundary(command[i])))) i++;
+    words.push({ text: command.slice(start, i), start, end: i });
+  }
+  return words;
+}
+
+/**
+ * Spans to DELETE from a command: for each `git`/`gh` command word, everything
+ * from the END of that word through the last of the global options that follow
+ * it. A value-taking option consumes the word after it too (`-C <dir>`, `-R
+ * <owner/name>`); a `--opt=value` token carries its own value; `--` ends option
+ * parsing; anything else that is not `-`-prefixed ends the run. Only the
+ * option run is removed — the rest of the command is left byte-for-byte.
+ */
+function gitGhGlobalOptionRuns(command: string): Array<[number, number]> {
+  const words = commandWords(command);
+  const runs: Array<[number, number]> = [];
+  for (let i = 0; i < words.length; i++) {
+    // ⛔ THE COMMAND WORD IS COMPARED CASE-INSENSITIVELY, BECAUSE THE RULE IT SERVES IS (#1329
+    // review cycle 2, P2). `skill-enforcer` compiles every rule with the `i` flag and the header
+    // says so ("a case-insensitive regex"), but this comparison was an exact lowercase match --
+    // so `GIT commit` was blocked by the raw rule while `GIT -C /x commit` was ALLOWED: the exact
+    // "one spelling" asymmetry #1329 removes, surviving in the case dimension. On a
+    // case-INSENSITIVE filesystem (macOS APFS -- a fleet platform) `GIT` resolves to
+    // /usr/bin/git, so that was a LIVE ungated `git commit`, not merely a false declaration.
+    // Lowercasing the WORD (not the command) keeps every offset intact: only the comparison
+    // changes, and the spans this function returns still index the original text.
+    const word = words[i].text.toLowerCase();
+    const valueFlags =
+      word === "git" ? GIT_GLOBAL_VALUE_FLAGS :
+      word === "gh" ? GH_GLOBAL_VALUE_FLAGS : null;
+    if (valueFlags === null) continue;
+    let j = i + 1;
+    let end = words[i].end;
+    while (j < words.length) {
+      const w = words[j].text;
+      if (!w.startsWith("-") || w === "-") break;
+      end = words[j].end;
+      j++;
+      if (w === "--") break; // end-of-options marker; the next word is not an option
+      if (w.includes("=")) continue; // `--opt=value` is self-contained
+      if (valueFlags.has(w) && j < words.length) { end = words[j].end; j++; }
+    }
+    if (end > words[i].end) { runs.push([words[i].end, end]); i = j - 1; }
+  }
+  return runs;
+}
+
+/**
+ * The command with every UNQUOTED whitespace run (space/tab) collapsed to one
+ * space; quoted text is untouched, so a payload's own spacing is preserved.
+ *
+ * ⛔ THIS EXISTS BECAUSE DELETING AN OPTION RUN LEAVES THE SEPARATOR BEHIND (#1329
+ * review, P2). `git -C /x<TAB>commit -m x` derives the CORRECT spelling
+ * `git<TAB>commit -m x` — the run is gone, exactly as intended — and then fails to
+ * match, because the rule is the literal `git commit`: ONE SPACE. The derivation
+ * computed the right answer and threw it away on a separator shell tokenisation
+ * makes meaningless. Measured pre-fix: `git -C /x<TAB>commit`, `git<TAB>commit`
+ * and `git` + two spaces + `commit` were ALL ALLOWED while the header declared
+ * that class CLOSED.
+ *
+ * Reuses `unquotedMask`, the module's single quote model, so a quoted mention's
+ * spacing cannot be normalised into a match (`rg -n 'git<TAB><TAB>commit'` keeps
+ * its own whitespace and stays a mention).
+ */
+export function collapseUnquotedWhitespace(command: string): string {
+  const mask = unquotedMask(command);
+  let out = "";
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (mask[i] && (ch === " " || ch === "\t")) {
+      while (i + 1 < command.length && mask[i + 1]
+             && (command[i + 1] === " " || command[i + 1] === "\t")) i++;
+      out += " ";
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Every spelling of `command` a text gate should try: the command itself;
+ * — when a git/gh invocation carries GLOBAL options — the same command with
+ * those option runs removed, so `git -C <dir> commit` reads like `git commit`;
+ * and — whenever the separator between tokens is wider or different from one
+ * space (a tab, a run of spaces) — that same text with every UNQUOTED whitespace
+ * run collapsed to one space. The third spelling is emitted with or without an
+ * option run, because a tab is not a different command.
+ *
+ * Two load-bearing properties:
+ *   1. NOTHING IS FABRICATED. Every returned string is the input with spans
+ *      DELETED — so a subsequence of the input — with ONE declared exception:
+ *      the LAST spelling additionally collapses unquoted whitespace runs to a
+ *      single space (`collapseUnquotedWhitespace`). That normalisation is not a
+ *      deletion, so that one spelling is not a subsequence; it is the same
+ *      tokens separated by the separator width a shell does not distinguish.
+ *      The suite pins both halves, by name, rather than claiming one property
+ *      for all of them.
+ *   2. MATCHING CAN ONLY ADD. The raw command is always returned FIRST, so a
+ *      caller that ORs across the spellings can never lose a hit it had before.
+ *      The new hits are text a shell would read as `git <verb>` with the options
+ *      stripped or the separator widened. That can include text which is not an
+ *      invocation at all — `ls git<TAB>commit` normalises to `ls git commit` and
+ *      is blocked (measured). The over-block is fail-closed and the same family as
+ *      the already-declared `echo 'git commit'` hit, and it is stated here rather
+ *      than left for a reader to discover.
+ *
+ * This is NOT a shell interpreter and does not pretend to be one: variable
+ * indirection, alias/function invocation, `eval`, quote/escape splicing inside
+ * the verb, and arbitrary nesting are all left open, deliberately and visibly.
+ * The adopter-facing statement of that boundary is the header of
+ * `enforcement/dangerous-ops.txt` (#1329).
+ */
+export function commandSpellings(command: string): string[] {
+  if (!command) return [command];
+  const runs = gitGhGlobalOptionRuns(command);
+  // The option run is deleted when there is one; otherwise this is the command itself.
+  let out = command;
+  if (runs.length > 0) {
+    out = "";
+    let cursor = 0;
+    for (const [start, end] of runs) { out += command.slice(cursor, start); cursor = end; }
+    out += command.slice(cursor);
+  }
+  const spellings = [command];
+  if (out !== command) spellings.push(out);
+  // #1329 review (P2): the separator is not a token boundary -- a tab, or a
+  // two-space run, is the same separator as one space to the shell. Emitted even
+  // when there was NO option run: `git<TAB>commit` is a pre-existing raw-match
+  // gap of the same class, and the header's CLOSED list must not be false about
+  // either form. Quoted text is untouched, so a mention keeps its own spacing.
+  const collapsed = collapseUnquotedWhitespace(out);
+  if (collapsed !== out && collapsed !== command) spellings.push(collapsed);
+  return spellings;
 }
 
 // ── PR number ────────────────────────────────────────────────────────────
