@@ -993,6 +993,82 @@ record_identity() { # <record-file> -> the record with its volatile fields remov
     "$1"
 }
 
+# ── #1224: THE RECORD'S SIGNATURE ─────────────────────────────────────────
+# record_sig_for <pr> <head> <verdict> <repo> — the HMAC-SHA256 the gate verifies
+# before it will treat a record FILE as evidence, or "" when no gate key is
+# configured (the gate then fails closed and the marker arms answer).
+#
+# ⛔ ONE definition, two writers (the main write and --recover-body), and the
+# gate pins the same canonical text in `review_record_sig_text`. The text is a
+# FIXED-ORDER field list, NOT the record's on-disk bytes: the record is written
+# by a printf whose OPTIONAL fields (diff_sha256, merge_base, mint, evidence)
+# reorder the byte layout for different mints of the SAME (pr, head, verdict,
+# repo), so signing the serialization would make a legitimate record
+# unverifiable for a reason unrelated to what it certifies — the exact problem
+# RFC 8785 (JSON Canonicalization Scheme) exists to solve: "cryptographic
+# operations like hashing and signing need the data to be expressed in an
+# invariant format so that the operations are reliably repeatable".
+#
+# ⛔ The signed text covers the record's OWN head_sha, not a live head: the
+# signature attests what the FILE says, and the gate's head comparison
+# separately attests that this is the revision merging. Two assertions, two arms.
+#
+# Why the record needs this at all: the marker is signed because the PR body is
+# attacker-writable (#784/#2055/#2872). The record FILE is worse in one respect —
+# it is PRIVATE, so an unauthenticated one leaves no trace on the PR for anyone
+# to audit. A file that is both unauthenticated and invisible is not evidence.
+record_sig_for() { # <pr> <head> <verdict> <repo>
+  local key="${GATE_KEY:-}" sig
+  [ -n "$key" ] || return 0
+  [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || return 0
+  sig="$(printf '%s' "review-record:v1:$1:$2:$3:$4" \
+    | command openssl dgst -sha256 -hmac "$key" 2>/dev/null | command awk '{print $NF}' || true)"
+  [ -n "$sig" ] && printf '%s' "$sig"
+}
+
+# post_review_evidence_comment <marker> <repo> <pr> — #1224: the copy that TRAVELS.
+#
+# WHY IT EXISTS. The record store is `$HOME/.pi/agent/reviews` — PER BOX. The
+# required `pipeline-compliance` check runs on a clean `ubuntu-latest` runner
+# where nothing materializes that directory, so a record-first gate can never
+# answer there and a body-wiped PR stays RED on the only check that blocks a
+# merge (that is what issue #1224 measures: agent-infra#1209, premise-labs#3788).
+# Issue #1224 records option (a) — gate reads the record file — as the
+# recommendation and option (b) — "post the attestation as a COMMENT… a body edit
+# cannot wipe one" — as its documented fallback. This is (a) as the primary
+# source plus (b) as the source that travels: `gh pr edit` rewrites the body and
+# cannot reach a comment.
+#
+# ⛔ It is NOT a new trust anchor. The comment carries the SAME signed marker line
+# the body already carries, so it is exactly as forgeable as the body marker was
+# and no more — but unlike the private record file it is PUBLIC, so it leaves an
+# audit trail where a human and `gh` can see it. Idempotent (a marker already
+# present is not re-posted) and best-effort: a failed comment NEVER fails the
+# record, exactly like the body post.
+post_review_evidence_comment() { # <marker> <repo> <pr>
+  local marker="$1" repo="$2" pr="$3" have rc=0
+  [ -n "$marker" ] && [ -n "$repo" ] && [ -n "$pr" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  # Read what is already there. A FAILED read is not "no comment": posting on it
+  # would duplicate the evidence on every transient API error, so it is skipped
+  # loudly instead (the body post above behaves the same way for the same reason).
+  have="$(command gh api "repos/$repo/issues/$pr/comments?per_page=100" --paginate --jq '.[].body' 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "⚠️ record-review: could not READ the PR comments (transient API failure?) — the #1224 evidence COMMENT was skipped. The signed record and the body marker are unaffected; re-run record-review.sh (idempotent) to retry the comment." >&2
+    return 0
+  fi
+  if [ -n "$have" ] && grep -qxF "$marker" <<<"$have"; then
+    return 0
+  fi
+  if command jq -n --arg body "$marker" '{body: $body}' 2>/dev/null \
+      | command gh api -X POST "repos/$repo/issues/$pr/comments" --input - >/dev/null 2>&1; then
+    echo "review evidence posted to $repo#$pr as a COMMENT (#1224: a later \`gh pr edit\` cannot wipe it, and unlike the per-box record it reaches CI)"
+  else
+    echo "note: could not post the #1224 review-evidence comment (the signed record and the body marker are still saved)" >&2
+  fi
+  return 0
+}
+
 # ── main (guarded — executable when run, inert when sourced for tests) ────
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # ── #980: the second-model subsystem was removed ────────────────────────
@@ -2292,8 +2368,14 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   fi
   RB_DIFF_FIELD=""
   [ -n "$RB_DIFF" ] && RB_DIFF_FIELD="\"diff_sha256\":\"$RB_DIFF\","
-  printf '{"pr":%d,"head_sha":"%s",%s"mint":"recovered-body","recovered_at":"%s","marker_sig":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$RB_HEAD" "$RB_DIFF_FIELD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RB_SIG" "$RB_VERDICT" "$REPO" "$RB_AT" > "$RB_TMP"
+  # #1224: a recovered record is a record, so it carries the same signature the
+  # gate verifies — a recovery that wrote an unsigned file would be restored into
+  # a state the gate then refuses, which is the opposite of repairing an absence.
+  RB_SIG_FIELD=""
+  RB_REC_SIG="$(record_sig_for "$PR" "$RB_HEAD" "$RB_VERDICT" "$REPO")"
+  [ -n "$RB_REC_SIG" ] && RB_SIG_FIELD="\"sig\":\"$RB_REC_SIG\","
+  printf '{"pr":%d,"head_sha":"%s",%s"mint":"recovered-body","recovered_at":"%s","marker_sig":"%s",%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$RB_HEAD" "$RB_DIFF_FIELD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RB_SIG" "$RB_SIG_FIELD" "$RB_VERDICT" "$REPO" "$RB_AT" > "$RB_TMP"
   # ⛔ THE LAST STEP IS ATOMIC, NOT CHECK-THEN-RENAME (round 3, P2). The re-check
   # above narrows the window to a couple of subprocesses; only a NO-CLOBBER CREATE
   # closes it. `ln` in the SAME directory is the portable compare-and-swap: it
@@ -3407,12 +3489,23 @@ if [ -n "$CARRY_ARM" ]; then
     fi
   fi
 fi
-if [ -n "$REPO" ]; then
-  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
+# ── #1224: the record's own signature, written beside the fields it covers ──
+# The gate will not treat a record FILE as evidence unless this verifies, so it
+# is computed BEFORE the write and from the same values the write uses — record
+# and signature are consistent by construction, exactly like record/marker are.
+RECORD_SIG_FIELD=""
+RECORD_SIG="$(record_sig_for "$PR" "$SHA" "$VERDICT" "$REPO")"
+if [ -n "$RECORD_SIG" ]; then
+  RECORD_SIG_FIELD="\"sig\":\"$RECORD_SIG\","
 else
-  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
+  echo "⚠️ record-review: AI_REVIEW_GATE_KEY is not configured (env or ~/.pi/agent/.ai-review-gate-key), so the record FILE cannot be signed. #1224: the gate refuses an unauthenticated record file as evidence and falls back to the signed marker in the PR body/comment — write the record on a box with the key to make the record itself authoritative." >&2
+fi
+if [ -n "$REPO" ]; then
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$RECORD_SIG_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
+else
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$RECORD_SIG_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
 fi
 # ── IDEMPOTENT SAME-HEAD WRITE (#1709 rec 7) ─────────────────────────────
 # The record this run would write is already on disk with the SAME deterministic
@@ -3492,7 +3585,15 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   if BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
     [ "$BODY" = "null" ] && BODY=""
   else
-    echo "⚠️ record-review: could not read PR body (transient API failure?) — evidence post skipped. #1224: the RECORD at $FILE was already written and is the gate's PRIMARY source, so the review counts at this head regardless; the body marker is only the human-readable copy and the fallback. Re-run record-review.sh (idempotent) if you also want that copy restored." >&2
+    # ⛔ #1224 REVIEW FINDING 2: this arm used to say the review "counts at this
+    # head regardless" because "the RECORD is the gate's PRIMARY source". That is
+    # FALSE in the environment whose verdict blocks a merge: the required
+    # `pipeline-compliance` check runs on a clean CI runner where
+    # ~/.pi/agent/reviews does not exist, so the record arm cannot answer there.
+    # What DOES travel is the marker — so post the COMMENT copy before giving up
+    # on the body copy, and say only what is true.
+    echo "⚠️ record-review: could not read PR body (transient API failure?) — the body marker was NOT posted. #1224: the signed RECORD at $FILE is on this box, and the evidence COMMENT posted below is the copy that travels, so the review is still evidenced; the BODY marker is only the human-readable copy and the local fallback. Re-run record-review.sh (idempotent) to retry the body post." >&2
+    post_review_evidence_comment "$MARKER" "$REPO" "$PR" || true
     exit 0
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
@@ -3525,6 +3626,12 @@ ${MISSING}"
       echo "note: could not post review evidence to PR body (record still saved)" >&2
     fi
   fi
+  # #1224 — THE COPY THAT TRAVELS. Posted unconditionally, not only when the body
+  # post failed: the body is what `gh pr edit` destroys and the comment is what
+  # survives it, so the comment must exist on the happy path too. Idempotent and
+  # best-effort: a re-run adds nothing twice, and a failed comment never turns a
+  # recorded review into a failure.
+  post_review_evidence_comment "$MARKER" "$REPO" "$PR" || true
 
   # ── Stale gate-run remediation (#633) ──────────────────────────────────
   # A completed pre-evidence FAILURE (the push-triggered run that evaluated

@@ -134,6 +134,27 @@ if [ "$1" = "api" ] && [ "$2" = "-X" ] \
     exit 0
 fi
 if [ "$1" = "api" ]; then
+    # #1224 — the review-evidence COMMENT: the copy that TRAVELS (a CI runner's
+    # $HOME has no record store, and the record file is per box). Placed before
+    # every other arm because the LIST form `issues/<n>/comments` must not be
+    # shadowed by the evidence arms below, which key on `issues/comments/<id>`
+    # (singular, with an id) and are a different surface.
+    #   STUB_COMMENTS         → the list read's `.[].body` answer (already-posed
+    #                           markers, for the idempotency pin).
+    #   STUB_COMMENTS_FAIL=1  → a transient READ failure: the comment post must
+    #                           then be SKIPPED, not duplicated.
+    #   STUB_COMMENT_CAPTURE  → sink for a POST body, so the suite can assert the
+    #                           COMMENT really carries the marker.
+    if grep -qE -- "/issues/[0-9]+/comments" <<<"$*"; then
+        if grep -qF -- "--jq" <<<"$*"; then
+            [ "${STUB_COMMENTS_FAIL:-0}" = "1" ] && exit 1
+            printf '%s' "${STUB_COMMENTS:-}"
+            exit 0
+        fi
+        if [ -n "${STUB_COMMENT_CAPTURE:-}" ]; then cat >"$STUB_COMMENT_CAPTURE"; else cat >/dev/null; fi
+        printf '{}\n'
+        exit 0
+    fi
     # #633 review finding 2: model the TRANSPORT, not just the URL. Real `gh api`
     # switches to POST as soon as ANY `-f`/`-F` parameter is added, and
     # `GET /commits/{ref}/check-runs` is GET-only — so a parameterized call with
@@ -630,6 +651,7 @@ fi
 Q6V="$(sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
 Q6H="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
 Q6_RE="review recorded: reviews/424246\.json verdict=${Q6V} @ ${Q6H}( diff=[0-9a-f]{64})? \(daniel-ospina/agent-infra\)( sig=[0-9a-f]{64})?$"
+Q6_RE_SIG="review recorded: reviews/424246\.json verdict=${Q6V} @ ${Q6H}( diff=[0-9a-f]{64})? \(daniel-ospina/agent-infra\)( sig=[0-9a-f]{64})?"
 cp "$Q6" "$T/q6-before.json" 2>/dev/null || true
 P1224="$T/p1224-patch.json"; : > "$P1224"
 STUB_CAPTURE="$P1224" run_record "daniel-ospina/agent-infra" 424246
@@ -653,7 +675,64 @@ if cmp -s "$Q6" "$T/q6-before.json"; then
 else
     bad "#1224 a duplicate run REWROTE the record (non-idempotent write / reviewed_at churn)"
 fi
-unset Q6V Q6H Q6_RE P1224 P1224_BODY
+unset P1224 P1224_BODY
+
+# ── #1224 review finding 3 — THE RECORD FILE IS SIGNED ────────────────────
+# The record store is private and leaves NO trace on the PR, so the gate now
+# accepts a record as evidence only when its `sig` verifies. That is a CONTRACT
+# between two files: the canonical text is declared once in the gate
+# (`review_record_sig_text`) and once here (`record_sig_for`), and a divergence
+# would make every legitimate record unusable while each file kept passing its
+# own tests. This assertion recomputes the GATE's text and checks the producer's
+# file against it, so a drift reds the producer's suite.
+Q6_SIG="$(sed -n 's/.*"sig":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6_EXPECT="$(printf '%s' "review-record:v1:424246:${Q6H}:${Q6V}:daniel-ospina/agent-infra" \
+    | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+if [ -n "$Q6_SIG" ] && [ "$Q6_SIG" = "$Q6_EXPECT" ]; then
+    ok "#1224 the record FILE carries a sig= over the gate's canonical text (pr,head,verdict,repo) — the private artifact is authenticated, not merely well-shaped"
+else
+    bad "#1224 the record FILE's sig= does not verify over the gate's canonical text (got: ${Q6_SIG:-<absent>}, want: $Q6_EXPECT) — the gate would refuse every legitimate record"
+fi
+unset Q6_SIG Q6_EXPECT
+
+# ── #1224 review finding 2 — THE COPY THAT TRAVELS IS A PR COMMENT ──────────
+# The required `pipeline-compliance` check runs on a clean CI runner whose $HOME
+# has no `~/.pi/agent/reviews`, so a record-first gate can never answer there.
+# The marker must therefore also land in a PR COMMENT (`gh pr edit` cannot wipe
+# one) — and posting it must be IDEMPOTENT, because the documented remedy for a
+# skipped post is to re-run the recorder, and a re-run that re-posted would
+# bury the timeline.
+Q1224C="$T/p1224-comment.json"; : > "$Q1224C"
+STUB_COMMENT_CAPTURE="$Q1224C" run_record "daniel-ospina/agent-infra" 424246
+Q1224C_BODY="$T/p1224-comment-body.txt"
+if command -v jq >/dev/null 2>&1; then
+    jq -r '.body // ""' "$Q1224C" > "$Q1224C_BODY" 2>/dev/null || cp "$Q1224C" "$Q1224C_BODY"
+else
+    cp "$Q1224C" "$Q1224C_BODY"
+fi
+if [ "$RECORD_RC" = "0" ] && grep -qE "$Q6_RE_SIG" "$Q1224C_BODY" 2>/dev/null; then
+    ok "#1224 the review attestation is ALSO posted as a PR COMMENT — the copy a body edit cannot wipe and a CI runner CAN read"
+else
+    bad "#1224 no PR COMMENT carrying the marker was posted — the fix stays inert on the required check, whose runner has no record store (finding 2)"
+fi
+# IDEMPOTENCE: the marker is already in the list, so a re-run must post nothing.
+Q1224D="$T/p1224-comment-2.json"; : > "$Q1224D"
+STUB_COMMENTS="$(cat "$Q1224C_BODY")" STUB_COMMENT_CAPTURE="$Q1224D" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224D" ]; then
+    bad "#1224 a re-run DUPLICATED the evidence comment (the marker was already there) — every re-record would bury the timeline"
+else
+    ok "#1224 a re-run posts NO second comment when the marker is already present (idempotent, like the body append)"
+fi
+# A FAILED LIST READ IS NOT "NO COMMENTS": posting on it would duplicate the
+# evidence on every transient API error, so the post must be skipped instead.
+Q1224E="$T/p1224-comment-3.json"; : > "$Q1224E"
+STUB_COMMENTS_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224E" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224E" ]; then
+    bad "#1224 an unreadable comment list was treated as 'no comment' and the evidence was re-posted — a transient 5xx duplicates evidence"
+else
+    ok "#1224 an unreadable comment list SKIPS the post (skipped, never duplicated)"
+fi
+unset Q1224C Q1224C_BODY Q1224D Q1224E Q6V Q6H Q6_RE Q6_RE_SIG
 
 echo "── 7. Stale-sha refusal: mismatched head → exit 3, no record ────"
 MISMATCH_SHA="$(printf 'b%.0s' $(seq 1 40))" # 40×b — stub answers aaaa…, so bbbb… is stale
