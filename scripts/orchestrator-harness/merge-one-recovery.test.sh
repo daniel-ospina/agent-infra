@@ -133,11 +133,21 @@ case "\$1" in
     fi
     printf '%s\t-\t-\n' "\${FAKE_CC_TOKEN:-unknown}"; exit "\${FAKE_CC_RC:-0}" ;;
   --recover-body)
+    # ⛔ IT RECOVERS **FROM** A MARKER THAT IS IN THE BODY, so the record it writes names the marker's
+    # head (\${FAKE_RECOVER_HEAD:-live}) and that marker line stays in the body. A replica that wrote a
+    # record with NO marker made the fixture UNFAITHFUL (the real verb reads the body) and it hid a
+    # worker that merged on a local record with no marker in the body at all.
     if [ "\${FAKE_RECOVER_RC:-1}" = "0" ]; then
-      printf '{"pr":%s,"repo":"%s","head_sha":"%s","verdict":"clean","diff_sha256":"%s"}\n' \\
-        $PR "$OR" "\${FAKE_HEAD:?}" \\
+      rhead="\${FAKE_RECOVER_HEAD:-\${FAKE_HEAD:?}}"
+      printf '{"pr":%s,"repo":"%s","head_sha":"%s","verdict":"clean","diff_sha256":"%s","mint":"recovered-body"}\n' \\
+        $PR "$OR" "\$rhead" \\
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \\
         > '$MRG/home/.pi/agent/reviews/acme-widget-$PR.json'
+      grep -qF "@ \$rhead " '$MRG/pr-body' 2>/dev/null || {
+        txt="review recorded: reviews/$PR.json verdict=clean @ \$rhead (acme/widget)"
+        sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+        printf '%s sig=%s\n' "\$txt" "\$sig" >> '$MRG/pr-body'
+      }
       : > '$MRG/recovered'
       exit 0
     fi
@@ -150,9 +160,13 @@ if [ "\${FAKE_RERECORD_RC:-0}" = "0" ]; then
     "\$1" "\$4" "\${FAKE_HEAD:?}" "\$3" \\
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \\
     > '$MRG/home/.pi/agent/reviews/acme-widget-$PR.json'
-  txt="review recorded: reviews/\$1.json verdict=\$3 @ \${FAKE_HEAD} (acme/widget)"
-  sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
-  printf '%s sig=%s\n' "\$txt" "\$sig" >> '$MRG/pr-body'
+  # FAKE_MINT_MARKER=0 models the recorder's BEST-EFFORT evidence post failing silently (the body
+  # PATCH fails, gh is contended, the repo is undetectable): record SAVED, marker NOT in the body.
+  if [ "\${FAKE_MINT_MARKER:-1}" = "1" ]; then
+    txt="review recorded: reviews/\$1.json verdict=\$3 @ \${FAKE_HEAD} (acme/widget)"
+    sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+    printf '%s sig=%s\n' "\$txt" "\$sig" >> '$MRG/pr-body'
+  fi
 fi
 exit "\${FAKE_RERECORD_RC:-0}"
 EOF
@@ -191,6 +205,7 @@ run_merge() {
         REQ="pipeline-compliance" \
         FAKE_CC_TOKEN_AFTER="${FAKE_CC_TOKEN_AFTER:-}" FAKE_CC_RC_AFTER="${FAKE_CC_RC_AFTER:-0}" \
         FAKE_RECOVER_RC="${FAKE_RECOVER_RC:-1}" FAKE_RERECORD_RC="${FAKE_RERECORD_RC:-0}" \
+        FAKE_RECOVER_HEAD="${FAKE_RECOVER_HEAD:-}" FAKE_MINT_MARKER="${FAKE_MINT_MARKER:-1}" \
         "$@" \
         "$BASH_BIN" "$MERGE" "$MRG/repo" "$OR" "$PR" fix/x
   ) 2>&1
@@ -327,6 +342,78 @@ rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
 ck "a REFUSED carry re-mint falls through to the review path (never to a stale-head record)" $rc
 rc=0; log_has "re-mint rc=3" || { rc=1; note "the log does not carry the producer's rc: $(tail -8 "$MRG/o/logs/merge-$PR.log")"; }
 ck "…and the log carries the recorder's OWN rc, not a collapsed cause" $rc
+
+# ══ 12) rc=3 IS NOT ALWAYS A TRANSPORT FAILURE (fresh review of #3037, P1-3) ═══════════════════
+# `3` is the recorder's GENERAL refusal code: a pin refusal (`--expect-head: the PR head is … NOT the
+# … you named`), an uncheckable pin, usage, or a recorder that does not implement the verb all exit 3.
+# Keying the "nothing is owed, end the worker" arm on rc alone made every one of those read as a failed
+# READ: the run logged `NOTHING PAID, NOTHING MERGED` and `exit 0` — no park, no marker, no review,
+# state unchanged — which is the silent no-op this PR exists to remove, re-introduced at the one arm
+# that answers "nothing is owed". It is also what turned `cloud-cell-record-dep.test.sh` red (§8l/§8m
+# drive a recorder that refuses exactly like the pin does).
+# REGRESSION pin: this passes on `origin/main` (no block at all ⇒ the review path) and fails on the
+# pre-fix block, so it cannot be labelled RED→GREEN.
+cc_asks() { local n; n="$(grep -c -- '--check-carry' "$MRG/recorder-calls" 2>/dev/null)"; printf '%s' "${n:-0}"; }
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN='--expect-head: the PR head is abc, NOT the def you named' FAKE_CC_RC=3)"
+rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls) — an rc=3 REFUSAL that is not 'unreadable' ended the worker without a review"; }
+ck "REGRESSION: an rc=3 answer that is NOT 'unreadable' does not end the run silently (a review is ordered)" $rc
+rc=0; [ "$(cc_asks)" = "1" ] || { rc=1; note "--check-carry was asked $(cc_asks) times — a REFUSAL was retried like a failed read"; }
+ck "…and it is NOT retried (a refusal cannot become an answer by waiting)" $rc
+rc=0; rail_ran || { rc=1; note "the run never reached the rail: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "REGRESSION(exit-0): …and the run still reaches the MERGE" $rc
+
+# ══ 10) THE MARKER GUARD STILL RUNS ON THE CARRY PATH (fresh review of #3037, P1-1) ══════════════
+# The recovery block may skip exactly ONE step — the PAID review. A record on THIS BOX is not what the
+# rail/gate reads: the SIGNED marker in the PR body is, and the recorder posts it BEST-EFFORT (#1717),
+# so a saved record with no marker is a reachable state (and a body edit removes an appended marker).
+# The first version of the carry fix closed its `if` AFTER the guard, so a carried record skipped it
+# too and landed on a local file while the printed guarantee said the opposite.
+# ⛔ RED→GREEN, and it discriminates BOTH wrong versions: on `origin/main` the same fixture orders a
+# PAID review (pi_calls=1) and then reaches the rail; on the pre-fix carry block the rail is reached
+# with pi_calls=0. Only a carried run that VERIFIES the marker parks.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0 FAKE_MINT_MARKER=0)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — the carry was not taken, so this arm would be testing the review path"; }
+ck "…(setup) the carry is taken with no paid review" $rc
+rc=0; rail_ran && { rc=1; note "THE RAIL RAN on a record whose signed marker is NOT in the PR body — a local file was treated as evidence"; }
+ck "RED→GREEN: a carried record with NO verifiable body marker never reaches the rail" $rc
+rc=0; no_park && { rc=1; note "nothing was parked, so the loop re-dispatches this head forever"; }
+ck "RED→GREEN: …it PARKS instead (a named remedy, not a re-purchase)" $rc
+rc=0; grep -q "signed marker" "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and the reason names the SIGNED marker as the missing artifact" $rc
+# The same fixture WITH the marker posted (the recorder's normal path) must still land — otherwise the
+# arm above could pass by the guard refusing every carry.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0)"
+rc=0; rail_ran || { rc=1; note "a carry whose marker IS in the body never reached the rail: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and a carry whose marker verifies still lands (the guard is not a blanket refusal)" $rc
+rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…parking nothing" $rc
+
+# ══ 11) A RECORD RESTORED FROM AN OLDER MARKER STILL CARRIES (P2) ═════════════════════════════════
+# `--recover-body` takes its head from the MARKER, so on a head that moved after the review (a
+# `strict=true` base refresh — this fleet's normal flow) the restored record names the OLD head and
+# `review_clean_at_head` correctly refuses it. Stopping there buys a full review — the purchase #2872
+# is about — even though the diff is unchanged and the record now EXISTS, which is what makes a second
+# `--check-carry` answerable for the first time.
+mkmrg; mkrecorder
+out="$(run_merge FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 \
+                 FAKE_RECOVER_HEAD="$OLDH" FAKE_CC_TOKEN_AFTER=carry FAKE_CC_RC_AFTER=0)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a recovered-then-carried record paid for a review"; }
+ck "RED→GREEN: a record restored for an OLDER head is CARRIED, not re-reviewed" $rc
+rc=0; recorder_saw "$PR $OLDH clean" || { rc=1; note "recorder argv were: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
+ck "…and the re-mint names the head the RECOVERED record names" $rc
+rc=0; rail_ran || { rc=1; note "the rail NEVER RAN: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "RED→GREEN(exit-0): …and that path still reaches the MERGE" $rc
+rc=0; log_has "RECOVERED AND CARRIED" || { rc=1; note "the log does not name the arm it took: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the log names it (a silent carry is not diagnosable)" $rc
+# NON-VACUITY: the SAME shape where the restored head is genuinely behind a CHANGED diff must pay.
+mkmrg; mkrecorder
+out="$(run_merge FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 \
+                 FAKE_RECOVER_HEAD="$OLDH" FAKE_CC_TOKEN_AFTER=fresh FAKE_CC_RC_AFTER=1)"
+rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls) — a recovered record over a CHANGED diff skipped the review"; }
+ck "…and a recovered record over a genuinely CHANGED diff still orders the review" $rc
 
 echo
 echo "==> $pass passed, $fail failed"
