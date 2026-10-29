@@ -84,6 +84,7 @@ mkmrg() { # mkmrg — a fresh merge fixture: repo (with a rail SPY), HOME, state
   : > "$MRG/pi-count"
   : > "$MRG/recorder-calls"
   : > "$MRG/pr-body"
+  : > "$MRG/headreads"
   : > "$MRG/rail-ran"
   : > "$MRG/merged"
   # THE SPY, at exactly the path `rail_attempt` executes.
@@ -130,11 +131,16 @@ case "\$1" in
   --check-carry)
     # ⛔ STDERR BEFORE THE TOKEN, ON PURPOSE (fresh review of #3037, P1/P2). The real verb writes its
     # diagnosis to STDERR and its answer to STDOUT — and on the degraded paths it writes a STDERR
-    # line BEFORE the token (`record-review.sh:1596` the #1398 local-digest notice, `:1802-1826` the
+    # line BEFORE the token (record-review.sh:1596 the #1398 local-digest notice, :1802-1826 the
     # #2982 could-not-compute block). A replica that only ever printed the token made the suite GREEN
-    # over a worker that read line 1 of the MERGED streams as the token, which turned `3:unreadable`
-    # into `3:<warning text>`, matched no arm, and bought the review. The knob exists so that
+    # over a worker that read line 1 of the MERGED streams as the token, which turned 3:unreadable
+    # into 3:<warning text>, matched no arm, and bought the review. The knob exists so that
     # population is DRIVEN, not assumed.
+    # ⛔ NO BACKTICKS ON ANY LINE OF THIS HEREDOC. It is UNQUOTED (the fixture paths must expand), so
+    # a backtick span is COMMAND SUBSTITUTION at generation time: seven of them here printed five
+    # "command not found" lines plus a "syntax error near unexpected token" on EVERY fixture build
+    # (#3037 review, P3-5). Quote or escape; never a raw backtick between the opener and its
+    # terminator.
     [ -n "\${FAKE_CC_STDERR:-}" ] && printf '%s\n' "\$FAKE_CC_STDERR" >&2
     if [ -f '$MRG/recovered' ] && [ -n "\${FAKE_CC_TOKEN_AFTER:-}" ]; then
       [ -n "\${FAKE_CC_STDERR_AFTER:-}" ] && printf '%s\n' "\$FAKE_CC_STDERR_AFTER" >&2
@@ -195,7 +201,17 @@ run_merge() {
     pi() { echo x >> "${PI_COUNT}"; printf 'CLEAN https://github.com/acme/widget/pull/%s#issuecomment-12345\n' "${FAKE_PR}"; }
     gh() {
       case "$*" in
-        *"pr view"*headRefOid*) printf '%s\n' "${FAKE_HEAD}"; return 0 ;;
+        *"pr view"*headRefOid*)
+          # ⛔ THE HEAD CAN MOVE BETWEEN THE TWO READS (fresh review of #3037, P2-1). merge-one.sh reads
+          # `headRefOid` twice — once for HEAD (:188), once inside the signed-marker guard for
+          # LIVE_HEAD (:1651) — with the same argv. FAKE_LIVE_HEAD makes the SECOND read answer a
+          # different sha, which is exactly the push-lands-mid-run window the head-moved arm exists
+          # for. Unset (the default) it answers FAKE_HEAD every time, so no other arm is affected.
+          n=0; [ -f "${FAKE_HEADREADS}" ] && n="$(cat "${FAKE_HEADREADS}" 2>/dev/null)"
+          case "${n:-}" in '' | *[!0-9]*) n=0 ;; esac
+          n=$(( n + 1 )); printf '%s\n' "$n" > "${FAKE_HEADREADS}"
+          if [ "$n" -ge 2 ] && [ -n "${FAKE_LIVE_HEAD:-}" ]; then printf '%s\n' "${FAKE_LIVE_HEAD}"; return 0; fi
+          printf '%s\n' "${FAKE_HEAD}"; return 0 ;;
         *"pr view"*body*)       cat "${FAKE_BODY_FILE}" 2>/dev/null; return 0 ;;
         *"pr checks"*)          printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n'; return 0 ;;
         *required_status_checks*) printf 'ai-review-gate\n'; return 0 ;;
@@ -210,6 +226,7 @@ run_merge() {
         AI_REVIEW_GATE_KEY="$TEST_GATE_KEY" \
         PI_COUNT="$MRG/pi-count" FAKE_PR="$PR" FAKE_HEAD="$HEAD" \
         FAKE_BODY_FILE="$MRG/pr-body" \
+        FAKE_LIVE_HEAD="${FAKE_LIVE_HEAD:-}" FAKE_HEADREADS="$MRG/headreads" \
         FAKE_CC_TOKEN="${FAKE_CC_TOKEN:-unknown}" FAKE_CC_RC="${FAKE_CC_RC:-0}" \
         FAKE_CC_STDERR="${FAKE_CC_STDERR:-}" \
         REQ="pipeline-compliance" \
@@ -250,11 +267,20 @@ ck "RED→GREEN: the carry passes no --expect-head (#1362 D1: a pin refuses ever
 rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
 ck "a satisfied record parks nothing (it still has to merge)" $rc
 
-# ══ 2) `head` — already bound to this head: merge reached, and nothing is re-minted ══════════════
+# ══ 2) `head` — already bound to this head: the PRE-EXISTING rail short-circuit still fires ══════
+# ⛔ THIS IS A COVERAGE/REGRESSION PIN, NOT A RED→GREEN (fresh review of #3037, P3-3). `run_merge`
+# drives RAIL authority, and `write_record "$HEAD"` makes `record_at_head` true, so the worker
+# short-circuits at the rail branch (`if record_at_head; then rail_attempt; fi`) and NEVER REACHES the
+# recovery block — these three assertions hold on `origin/main` AND on a worker whose `0:head` arm is
+# deleted. The label used to claim `RED→GREEN(exit-0)`, which the suite's own header (:27-:29) defines
+# as "passes on origin/main and fails only on the exit-0 version of the block" — it cannot earn it.
+# The `head` answer's BLOCK-LEVEL behaviour is pinned ON GATE AUTHORITY in §7, which is where the arm
+# is reachable; what THIS section pins is the property that matters on the rail path: a record already
+# at this head must not trigger any carry machinery, and nothing is re-minted.
 mkmrg; mkrecorder; write_record "$HEAD" clean
 out="$(run_merge FAKE_CC_TOKEN=head FAKE_CC_RC=0)"
 rc=0; rail_ran || { rc=1; note "the rail NEVER RAN on 'head'"; }
-ck "RED→GREEN(exit-0): on 'head' the rail is REACHED and nothing is paid" $rc
+ck "on 'head' the PRE-EXISTING rail short-circuit is reached and nothing is paid" $rc
 rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
 ck "…and no paid review is ordered" $rc
 rc=0; [ "$(remints)" = "0" ] || { rc=1; note "an unnecessary re-mint ran: $(grep '^7 ' "$MRG/recorder-calls")"; }
@@ -546,6 +572,36 @@ mkmrg; mkrecorder
 out="$(run_merge FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=head)"
 rc=0; recorder_saw "--recover-body $PR $OR" || { rc=1; note "calls: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
 ck "RED→GREEN: --recover-body is asked for THIS PR AND THIS REPO (the recorder refuses without it)" $rc
+
+# ══ 19) A HEAD THAT MOVED MID-RUN ON THE CARRY PATH NAMES NO PAYMENT IT DID NOT MAKE ═══════════
+# The marker guard's head-moved sub-arm was path-agnostic: on `CC_OWED=1` it asserted "this run's mint"
+# and "the record this lane paid for" (both false — the record was minted by an earlier run, possibly
+# on another box, which is the whole premise of #2872) and prescribed "a FRESH review at head=$LIVE_HEAD
+# is owed, not a carry" — which sends an operator to buy the 20-40 minute review this PR removes. A
+# moved head over an unchanged artifact is exactly `carry`/`carry-patch` (record-review.sh:1991 "Do NOT
+# re-review … land it"; :2006 "re-record at the current head … do NOT run a review cycle").
+# Reached by driving a carry whose gh head read MOVES after the early read (the second `pr view` inside
+# the guard answers a different sha), with no marker for that new head in the body.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+: > "$MRG/pr-body"        # the RECORD stays; no marker for any head is in the body
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0 FAKE_LIVE_HEAD="$OLDH")"
+rc=0; no_park && { rc=1; note "nothing parked, so the head-moved arm was never reached: $(tail -5 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…(setup) a carry whose head MOVES mid-run reaches the head-moved park" $rc
+rc=0; grep -qF 'nothing was paid' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "RED→GREEN: the carry path's head-moved reason does not claim a payment that never happened" $rc
+rc=0; grep -qF 'this lane paid for' "$MRG/o/state/parkreason-$PR" 2>/dev/null && { rc=1; note "the carry path still says 'the record this lane paid for'"; }
+ck "…and never says 'the record this lane PAID for' on an arm that ordered no review" $rc
+rc=0; grep -qF 'FRESH review at head' "$MRG/o/state/parkreason-$PR" 2>/dev/null && { rc=1; note "the carry path still prescribes the paid review a carry exists to avoid"; }
+ck "…and names the CARRY re-bind as the remedy, not a fresh review" $rc
+rc=0; grep -qF 'CARRY' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason does not name the carry remedy: $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and says the word, so the operator can find the arm that fixes it" $rc
+# NON-VACUITY: the PAID path must keep its original remedy (a fresh review IS owed there — the paid
+# mint pinned its record to $HEAD, and the pin refuses the new live head outright).
+mkmrg; mkrecorder; write_record "$OLDH" clean
+: > "$MRG/pr-body"        # …same shape on the PAID path: a review is ordered, no marker lands
+out="$(run_merge FAKE_CC_TOKEN=fresh FAKE_CC_RC=1 FAKE_MINT_MARKER=0 FAKE_LIVE_HEAD="$OLDH")"
+rc=0; grep -qF 'FRESH review at head' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and the PAID path still says a FRESH review is owed (the branch did not flatten the two arms)" $rc
 
 echo
 echo "==> $pass passed, $fail failed"

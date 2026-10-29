@@ -1014,7 +1014,16 @@ _cc_recover() {
     return 0
   fi
   rec_head="$(review_head_of "$(review_record_file_for_pr)")"
-  echo "[merge $PR] RECOVERED at head=${rec_head:0:12}…, which is NOT this head ($HEAD) — asking --check-carry again now that a record exists on this box (before the recovery it could only answer 'norecord')" >> "$L.log"
+  # ⛔ THE RECOVERED HEAD IS NOT ALWAYS A DIFFERENT ONE (fresh review of #3037, P2-1). This line used
+  # to say "which is NOT this head ($HEAD)" unconditionally — but `review_clean_at_head` also refuses
+  # a record that IS at this head with a shallow tier (`clean-micro`/`clean-low`), which is the named
+  # residual at :598-:604. Printing "head X … which is NOT this head (X)" on that path is a log line
+  # that contradicts itself and sends the reader at the wrong cause.
+  if [ -n "${rec_head:-}" ] && [ "$rec_head" = "$HEAD" ]; then
+    echo "[merge $PR] RECOVERED at head=${rec_head:0:12}…, which IS this head — but its verdict is [$(review_verdict_of "$(review_record_file_for_pr)")], not full 'clean' (a shallow tier falls to a review, and would park at the signed-marker guard anyway); asking --check-carry again so the recorder's own answer, not this predicate, decides" >> "$L.log"
+  else
+    echo "[merge $PR] RECOVERED at head=${rec_head:0:12}…, which is NOT this head ($HEAD) — asking --check-carry again now that a record exists on this box (before the recovery it could only answer 'norecord')" >> "$L.log"
+  fi
   _cc_ask
   case "$CC_RC:$CC_TOKEN" in
     0:head)
@@ -1079,53 +1088,59 @@ case "$CC_RC:$CC_TOKEN" in
       echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) says re-record rather than re-review, but the re-record did not produce a clean head-bound record (re-mint rc=${CC_RE_RC:-not attempted}) — falling through to a review, which is then the only remaining way to cover this head (fail-closed, and still cheaper than the unconditional review this block replaces)" >> "$L.log"
     fi ;;
   3:unreadable)
-    # Still unreadable after the retry. ⛔ DO NOT PAY and DO NOT MERGE ON A GUESS. Recovery is still
-    # worth one try: `--recover-body` reads the PR BODY, not the diff, so it can resolve this state
-    # when the diff read is what is contended.
-    if _cc_recover; then
-      :
-    else
-      # ⛔ BOUNDED, AND IT PARKS AT THE CAP (fresh review of #3037, P3-1). The retry above is
-      # per-CYCLE, so on a DURABLE unreadable state — the measured 2026-10-22 shape this file records
-      # at :70-76, where the gh wrapper chain resolved to itself, every `gh` call returned EMPTY and
-      # the worker refused EVERY merge for the life of the condition — `exit 0` loops each sweep
-      # forever: three recorder calls, one log line, nothing that ever fires and nothing in-band that
-      # names the gh layer. Every other repeated state in this file is bounded (`RAIL_TRIES` +
-      # `parked-<PR>`, `MAX_REVIEW_TRIES` + `reviewdisp-*`, the gate poll window), so this one is too.
-      # ⛔ HEAD-KEYED, with `RAIL_TRIES`'s own shape (a new head resets the count — the budget belongs
-      # to the HEAD) and its `is_limit` guard (`[ -ge ]`/`$(( +1 ))` on a huge digit string errors FALSE
-      # on bash 3.2 and the cap is silently missed). ⛔ BELOW the cap it still exits 0 and parks
-      # NOTHING: one contended read is a transport blip and parking on it would blame the PR for it.
-      DR_TRIES="${DIFFREAD_TRIES:-3}"
-      if ! is_limit "$DR_TRIES"; then
-        echo "[merge $PR] DIFFREAD_TRIES='$DR_TRIES' is not an integer in range — using 3" >> "$L.log"
-        DR_TRIES=3
-      fi
-      DR_F="$O/state/diffreadcount-$PR"; DR_H=""; DR_N=0
-      if [ -f "$DR_F" ]; then read -r DR_H DR_N < "$DR_F" 2>/dev/null || true; fi
-      is_limit "${DR_N:-}" || DR_N=0
-      [ "${DR_H:-}" = "${HEAD:-}" ] || DR_N=0
-      DR_N=$((DR_N + 1))
-      # ⛔ THE WRITE MUST BE ABLE TO FAIL LOUDLY (fresh review of #3037, P2). A `|| true` here makes
-      # the bound BEST-EFFORT: on a read-only $O/state, a full disk, or — the shape this file already
-      # records for `reviewdisp-$PR` at :1405 — a DIRECTORY named `diffreadcount-$PR`, the count is
-      # never persisted, the next cycle reads nothing, DR_N is 1 again, and the cap can NEVER fire.
-      # The worker would loop `exit 0` for ever while the log printed `(1/3)` every cycle and claimed
-      # the state was bounded — an INERT ENFORCER. This is exactly why `rev_budget_spend` (:1298)
-      # returns `unwritable` and its caller parks instead of assuming a budget it does not have.
-      if ! printf '%s %s\n' "${HEAD:-}" "$DR_N" > "$DR_F" 2>/dev/null; then
-        park "the diff-read counter for head=$HEAD CANNOT BE WRITTEN ($DR_F), so DIFFREAD_TRIES cannot bound this head and the worker would retry an unreadable diff for ever. Make $O/state writable (rm -rf a stray DIRECTORY named diffreadcount-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '${DR_F}'"
-        echo "[merge $PR] ABORT: state/diffreadcount-$PR is unwritable — the diff-read bound cannot be kept, so this head is parked instead of re-looped" >> "$L.log"
-        exit 3
-      fi
-      if [ "$DR_N" -ge "$DR_TRIES" ]; then
-        park "the PR's DIFF could not be READ at head=$HEAD for $DR_N consecutive cycle(s) — check-carry answered 'unreadable' and no verified body marker covers this head. A failed READ is not a changed artifact, so nothing was paid for and nothing was merged; a durable unreadable diff is a gh-layer fault on THIS box (a wrapper chain resolving to itself, an expired/unreadable token, a hard 5xx), not a fault of the PR. Fix the gh layer (bin/harness status reports gh=CANNOT-REACH-REAL-GH for exactly this), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$DR_F'"
-        echo "[merge $PR] ABORT: the diff was UNREADABLE $DR_N time(s) at head=$HEAD (cap $DR_TRIES) — parked with the gh layer named, because an unbounded exit-0 loop never surfaces itself" >> "$L.log"
-        exit 3
-      fi
-      echo "[merge $PR] check-carry=unreadable after a retry and no verified body marker covers head=$HEAD — NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle ($DR_N/$DR_TRIES — a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
-      exit 0
-    fi ;;
+    # Still unreadable after the retry. ⛔ DO NOT PAY AND DO NOT MERGE ON A GUESS.
+    # ⛔ AND DO NOT TRY RECOVERY HERE — IT CANNOT SUCCEED BY CONSTRUCTION (fresh review of #3037,
+    # P3-2). `unreadable` is reachable ONLY after the recorder found a record for this PR and repo
+    # whose digest proved a valid identity: `record-review.sh:1926` answers `norecord`/4 when there is
+    # no record, `:1966` answers `nodigest`/5 when it has no usable digest, and only then `:1984`
+    # answers `unreadable`/3. `--recover-body` REFUSES exactly in that state (`:2132-2135` — "recovery
+    # fills an ABSENCE and will not replace it", exit 5). So the `if _cc_recover` that used to sit
+    # here was a DEAD CALL, and its comment ("recovery … reads the PR BODY, not the diff, so it can
+    # resolve this state") asserted the opposite of the producer's contract — on the one population
+    # where the box is already contending for `gh`, i.e. where an extra recorder call is least free.
+    # Nothing is lost by dropping it: a record DELETED mid-cycle makes the next cycle answer
+    # `norecord`/4, and the `4:*` arm below runs recovery with its precondition actually true.
+    # The BOUND below is the whole remedy for this state.
+    # ⛔ BOUNDED, AND IT PARKS AT THE CAP (fresh review of #3037, P3-1). The retry above is
+    # per-CYCLE, so on a DURABLE unreadable state — the measured 2026-10-22 shape this file records
+    # at :70-76, where the gh wrapper chain resolved to itself, every `gh` call returned EMPTY and
+    # the worker refused EVERY merge for the life of the condition — `exit 0` loops each sweep
+    # forever: three recorder calls, one log line, nothing that ever fires and nothing in-band that
+    # names the gh layer. Every other repeated state in this file is bounded (`RAIL_TRIES` +
+    # `parked-<PR>`, `MAX_REVIEW_TRIES` + `reviewdisp-*`, the gate poll window), so this one is too.
+    # ⛔ HEAD-KEYED, with `RAIL_TRIES`'s own shape (a new head resets the count — the budget belongs
+    # to the HEAD) and its `is_limit` guard (`[ -ge ]`/`$(( +1 ))` on a huge digit string errors FALSE
+    # on bash 3.2 and the cap is silently missed). ⛔ BELOW the cap it still exits 0 and parks
+    # NOTHING: one contended read is a transport blip and parking on it would blame the PR for it.
+    DR_TRIES="${DIFFREAD_TRIES:-3}"
+    if ! is_limit "$DR_TRIES"; then
+      echo "[merge $PR] DIFFREAD_TRIES='$DR_TRIES' is not an integer in range — using 3" >> "$L.log"
+      DR_TRIES=3
+    fi
+    DR_F="$O/state/diffreadcount-$PR"; DR_H=""; DR_N=0
+    if [ -f "$DR_F" ]; then read -r DR_H DR_N < "$DR_F" 2>/dev/null || true; fi
+    is_limit "${DR_N:-}" || DR_N=0
+    [ "${DR_H:-}" = "${HEAD:-}" ] || DR_N=0
+    DR_N=$((DR_N + 1))
+    # ⛔ THE WRITE MUST BE ABLE TO FAIL LOUDLY (fresh review of #3037, P2). A `|| true` here makes
+    # the bound BEST-EFFORT: on a read-only $O/state, a full disk, or — the shape this file already
+    # records for `reviewdisp-$PR` at :1405 — a DIRECTORY named `diffreadcount-$PR`, the count is
+    # never persisted, the next cycle reads nothing, DR_N is 1 again, and the cap can NEVER fire.
+    # The worker would loop `exit 0` for ever while the log printed `(1/3)` every cycle and claimed
+    # the state was bounded — an INERT ENFORCER. This is exactly why `rev_budget_spend` (:1298)
+    # returns `unwritable` and its caller parks instead of assuming a budget it does not have.
+    if ! printf '%s %s\n' "${HEAD:-}" "$DR_N" > "$DR_F" 2>/dev/null; then
+      park "the diff-read counter for head=$HEAD CANNOT BE WRITTEN ($DR_F), so DIFFREAD_TRIES cannot bound this head and the worker would retry an unreadable diff for ever. Make $O/state writable (rm -rf a stray DIRECTORY named diffreadcount-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '${DR_F}'"
+      echo "[merge $PR] ABORT: state/diffreadcount-$PR is unwritable — the diff-read bound cannot be kept, so this head is parked instead of re-looped" >> "$L.log"
+      exit 3
+    fi
+    if [ "$DR_N" -ge "$DR_TRIES" ]; then
+      park "the PR's DIFF could not be READ at head=$HEAD for $DR_N consecutive cycle(s) — check-carry answered 'unreadable' and no verified body marker covers this head. A failed READ is not a changed artifact, so nothing was paid for and nothing was merged; a durable unreadable diff is a gh-layer fault on THIS box (a wrapper chain resolving to itself, an expired/unreadable token, a hard 5xx), not a fault of the PR. Fix the gh layer (bin/harness status reports gh=CANNOT-REACH-REAL-GH for exactly this), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$DR_F'"
+      echo "[merge $PR] ABORT: the diff was UNREADABLE $DR_N time(s) at head=$HEAD (cap $DR_TRIES) — parked with the gh layer named, because an unbounded exit-0 loop never surfaces itself" >> "$L.log"
+      exit 3
+    fi
+    echo "[merge $PR] check-carry=unreadable after a retry and no verified body marker covers head=$HEAD — NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle ($DR_N/$DR_TRIES — a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
+    exit 0 ;;
   4:*)
     # No record anywhere on this box: the #2872 case. The verdict may still travel in the body.
     if _cc_recover; then
@@ -1711,8 +1726,24 @@ case "$LAST" in
       #     no review has read. A FRESH review at `$LIVE_HEAD` is owed, exactly as the two rc=3 arms
       #     above reason. Discriminated rather than reworded, because one remedy cannot serve both.
       if [ "${HEAD}" != "${LIVE_HEAD}" ]; then
-        marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body — the head MOVED after this run's mint: the record was minted for head=$HEAD, which is no longer the PR head"
-        marker_how="the record this lane paid for is for head=$HEAD and can never satisfy a gate that reads head=$LIVE_HEAD. Re-recording it by hand CANNOT work: the --expect-head pin refuses it (record-review.sh: 'the PR head is $LIVE_HEAD, NOT the $HEAD you named'), and minting at head=$LIVE_HEAD instead would attest a revision no review has read. So a FRESH review at head=$LIVE_HEAD is owed, not a carry — run the merge again for this PR once head=$LIVE_HEAD is the tree to land, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        # ⛔ THIS TEXT WAS PATH-AGNOSTIC AND ASSERTED THE PAID PATH ON BOTH (fresh review of #3037,
+        # P2-1). On `CC_OWED=1` THIS RUN MINTED NOTHING AND PAID NOTHING — the record was minted by an
+        # earlier run, possibly on another box (the whole premise of #2872) — so "this run's mint"
+        # and "the record this lane paid for" were false, and the prescribed remedy ("a FRESH review
+        # at head=$LIVE_HEAD is owed, not a carry") sent an operator to buy the 20-40 minute review
+        # this PR exists to avoid. A head that merely MOVED is exactly `carry`/`carry-patch`:
+        # `record-review.sh:1991` says "Do NOT re-review and do NOT mint a fresh record: land it" and
+        # `:2006` says "re-record at the current head … do NOT run a review cycle". Reachable from the
+        # carry path whenever a push lands between the early HEAD read and this guard's LIVE_HEAD read
+        # (the window is a `--check-carry` plus possibly one CC_RETRY_SECS sleep) — the #2132 class:
+        # a park whose reason names a call that was never made, or names the wrong one.
+        if [ "${CC_OWED:-0}" = "1" ]; then
+          marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body — the head MOVED while this run was deciding whether a review was owed (the carried record covers head=$HEAD, which is no longer the PR head)"
+          marker_how="no review was ordered this cycle, so nothing was paid and there is no fresh verdict to record. A moved head over an UNCHANGED artifact is a CARRY, not a re-review: re-run the merge for this PR and the block's own check-carry/re-record arm re-binds the record at the new live head at no cost — and if the artifact genuinely changed with the head, that same arm answers 'fresh' and a review is ordered THEN, on evidence rather than on a guess. Do not record this by hand at head=$LIVE_HEAD: that would attest a revision no review has read. Then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        else
+          marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body — the head MOVED after this run's mint: the record was minted for head=$HEAD, which is no longer the PR head"
+          marker_how="the record this lane paid for is for head=$HEAD and can never satisfy a gate that reads head=$LIVE_HEAD. Re-recording it by hand CANNOT work: the --expect-head pin refuses it (record-review.sh: 'the PR head is $LIVE_HEAD, NOT the $HEAD you named'), and minting at head=$LIVE_HEAD instead would attest a revision no review has read. So a FRESH review at head=$LIVE_HEAD is owed, not a carry — run the merge again for this PR once head=$LIVE_HEAD is the tree to land, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        fi
       else
         marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body"
         marker_how="$RECORD_RECIPE, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
