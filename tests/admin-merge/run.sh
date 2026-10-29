@@ -231,6 +231,14 @@ fail() { checks=$((checks + 1)); echo "   ❌ $1"; failures=$((failures + 1)); }
 [ -f "$CFS" ] || { echo "❌ missing $CFS"; exit 1; }
 [ -f "$ADM" ] || { echo "❌ missing $ADM"; exit 1; }
 
+# ── #2235: THE SUITE DOES NOT INHERIT THE OPERATOR'S AMBIENT SELECTOR ───────
+# `GH_REPO` is gh's own repo selector, and a cell exports it (keys.env). An inherited
+# value would make EVERY scenario in this file run against the operator's repo — which
+# is the defect under test, arriving through the test harness. So it is DROPPED here,
+# once, and a scenario that needs an ambient value sets it for its own invocation
+# (the run_* helpers pass it through when it is present).
+unset GH_REPO
+
 # ── fake gh ───────────────────────────────────────────────
 # Driven entirely by files under $SCEN (the scenario dir). Records every
 # invocation in $SCEN/calls so the suite can assert on the merge command.
@@ -264,16 +272,31 @@ case "$key" in
     pr="${3:-}"
     # The draft probe is a DISTINCT question from the head resolutions: answer it
     # from its own fixture and never let it consume the head-seq sequence.
-    want_draft=0; want_head=0; want_base=0; want_merged=0; jprev=""
+    want_draft=0; want_head=0; want_base=0; want_merged=0; want_url=0; jprev=""
     for x in "$@"; do
       if [ "$jprev" = "--json" ]; then
         case "$x" in *isDraft*) want_draft=1 ;; esac
         case "$x" in *headRefOid*) want_head=1 ;; esac
         case "$x" in *baseRefName*) want_base=1 ;; esac
         case "$x" in *mergedAt*) want_merged=1 ;; esac
+        case "$x" in *url*) want_url=1 ;; esac
       fi
       jprev="$x"
     done
+    # ── #2235: THE PR'S OWN URL. "Already merged" is a claim about ONE PR, and a bare
+    # number identifies none (PR #2234 exists in both tortoise and agent-infra), so the
+    # rail proves the (repo, number) pair from the one field that carries both. Default =
+    # the scenario's OWN repo-slug (agent-infra when the fixture is absent), so every
+    # scenario written before this arm keeps its verdict; `pr-url` overrides it to model
+    # a url that answers for a DIFFERENT repository — the fail-open the rail must refuse.
+    if [ "$want_url" = 1 ] && [ "$want_merged" = 0 ] && [ "$want_head" = 0 ] \
+       && [ "$want_draft" = 0 ] && [ "$want_base" = 0 ]; then
+      if [ -f "$SCEN/pr-url" ]; then cat "$SCEN/pr-url"; exit 0; fi
+      if [ -f "$SCEN/pr-url-fail" ]; then printf 'gh: could not read the pull request\n' >&2; exit 1; fi
+      printf 'https://github.com/%s/pull/%s\n' \
+        "$(cat "$SCEN/repo-slug" 2>/dev/null || printf 'daniel-ospina/agent-infra')" "${pr:-0}"
+      exit 0
+    fi
     if [ "$want_draft" = 1 ] && [ "$want_head" = 0 ]; then
       # #1750: a DRAFT READ THAT FAILS needs its own seam, because the defect is exactly a
       # failed read rendered as a value — with no way to fail this probe, no scenario could
@@ -1024,6 +1047,20 @@ new_scen() {
   rm -rf "$SCEN"
   mkdir -p "$SCEN"
   : > "$SCEN/calls"
+  # ── #2235: A SCENARIO IS A CHECKOUT ─────────────────────────────────────────────────────────────
+  # `run_admin_cwd "$SCEN" …` runs the rail with its CWD set to the scenario, which is how the lane-
+  # selector and base-reproduction arms hand it a target tree. The rail now resolves its repo FROM
+  # THAT CHECKOUT (`git rev-parse --show-toplevel` + `git remote get-url origin`) instead of trusting
+  # an ambient `GH_REPO`, and a cwd that is not a checkout is exactly the state it refuses. A
+  # fixture that is not a checkout would therefore test the refusal on every one of those arms — the
+  # defects they exist for would go unmeasured. So the fixture IS one, with the repo every other
+  # fixture already names (the `repo-slug` fixtures below are all this repo too).
+  # The remote is a URL only: nothing here fetches, and `--depth`/network is never touched.
+  if ! git init -q "$SCEN" 2>/dev/null; then
+    echo "❌ cannot git-init a scenario fixture — the rail's repo resolution cannot be exercised" >&2
+    exit 1
+  fi
+  git -C "$SCEN" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
   REPRO_CMD=true
   # The ≥3.12 interpreter the #6928 fixtures supply (see selector_interp_*). It is
   # scenario-scoped STATE, so it is reset here: a scenario that forgot to set it
@@ -1044,6 +1081,13 @@ run_admin() {
   # NOSLEEP_BIN below): for a scenario whose subject is the ACCUMULATED clock, not the waiting.
   # An array, like run_admin_here, so the extra variable is one element rather than a
   # conditional word inside a line continuation.
+  #
+  # ⛔ AN `env` ARRAY, NOT A COMMAND PREFIX WITH AN EXPANDED ASSIGNMENT (#2235). Every word of the
+  # old prefix was a LITERAL assignment (`SCEN="$SCEN" ADMIN_MERGE_POLL_INTERVAL=0 bash …`), so the
+  # prefix itself was fine — what broke was adding GH_REPO to it as `"${GH_REPO:+GH_REPO=\"$GH_REPO\"}"`:
+  # quotes produced by an expansion are LITERAL CHARACTERS, and an empty expansion is not re-parsed
+  # either, so the word became a command name (rc 127) and the rail never ran. `env` takes each
+  # assignment as its own argument, so neither branch can mis-parse.
   # #2481: the FIRST-CHECKS wait is PROGRESS-AWARE now, so a scenario that sets
   # only the legacy window would otherwise fall to the DERIVED ceiling (18064s)
   # and hold the suite for hours. SUITE_FIRST_CHECKS_CEILING therefore DEFAULTS to
@@ -1062,6 +1106,9 @@ run_admin() {
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
   [ "${SUITE_NOSLEEP:-0}" = "1" ] && env_args+=("PATH=$NOSLEEP_BIN:$PATH")
+  # #2235: an ambient GH_REPO reaches the rail only when THIS invocation sets one, so a scenario can
+  # model the inherited-selector defect explicitly instead of relying on the operator's shell.
+  [ -n "${GH_REPO:-}" ] && env_args+=("GH_REPO=$GH_REPO")
   env "${env_args[@]}" bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
@@ -1082,6 +1129,10 @@ run_admin_here() {
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
+  # #2235: an ambient GH_REPO reaches the rail only when THIS invocation sets one, so a
+  # scenario can model the inherited-selector defect explicitly instead of relying on
+  # whatever the operator's shell happens to carry.
+  [ -n "${GH_REPO:-}" ] && env_args+=("GH_REPO=$GH_REPO")
   # REPRO_CMD="" means "OMIT the seam": the PRODUCTION path runs (a real base
   # worktree). A suite that always sets the seam never executes the runner
   # selection, the worktree materialisation/removal, or the alarm wrapper — the
@@ -8088,6 +8139,99 @@ grep -qF "window DID carry were: changes | lint." "$SCEN/err" \
   && pass "…while still naming the executed job names it saw" \
   || fail "the at-the-bound refusal dropped the job names: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
 
+# ── (g3) #2842: THE REFUSAL MUST CARRY A VALUE THAT WORKS ───────────────────
+# The refusal has named ADMIN_MERGE_LANE_JOB_PREFIX since #4844 and the executed
+# names since #7734 — and a lane still paid a full extra cycle (DMeer #1394,
+# 2026-10-25), because a knob plus a name list leaves the operator to GUESS the
+# value and the obvious guess is refuted by the matcher: the family is a
+# case-SENSITIVE prefix, so the lowercase `unit` the rail's own example teaches
+# selects NOTHING when the job is `Unit tests`. The operator follows the printed
+# remedy, is refused again, and the only other door the same message names is
+# AGENT_ADMIN_MERGE_OVERRIDE=1 — the bypass steer #2842 exists to remove.
+#
+# Three assertions, and the SECOND is the one that matters: the value the refusal
+# derives is one the rail then ACCEPTS — a suggestion that does not land is a
+# longer version of the same defect.
+echo "== 22d. #2842: a differently-NAMED test job — the refusal derives the retry value =="
+new_scen familynamed
+HEAD_UN="beef000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UN" > "$SCEN/head"
+printf '%s\n' "$(lane_line completed success "$HEAD_UN" 7101)" > "$SCEN/runs-$HEAD_UN"
+lane_jobset 7101 success 'Unit tests' 'changes'
+printf '%s\n' "$(lane_line completed success mainab 7102)" > "$SCEN/runs-main"
+lane_jobset 7102 success 'Unit tests' 'changes'
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a job named 'Unit tests' under the default family → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — a family that matched nothing certified"
+# THE HEADER MUST BE TRUE. Both job lists were readable, so the unreadable-list
+# wording (which the operator reads FIRST, before the WHY line) mis-describes the
+# condition as unmeasurable coverage when it was measured and misnamed.
+grep -q "shard lists are not" "$SCEN/err" \
+  && fail "the refusal claims the shard lists are UNREADABLE, but they were read and named 'Unit tests'" \
+  || pass "…and does NOT claim an unreadable list when the lists were read"
+grep -q "NOT an unreadable list and NOT a red check" "$SCEN/err" \
+  && pass "…naming the condition that held: a NAMING mismatch, not a red PR" \
+  || fail "the refusal does not separate a naming mismatch from a red check"
+grep -qF "ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests'" "$SCEN/err" \
+  && pass "…and DERIVES the retry value from the names the window executed" \
+  || fail "the refusal names the knob but no value that works with 'Unit tests': $(grep -o 'THE RETRY.*' "$SCEN/err" | head -c 200)"
+grep -q "CASE-SENSITIVE" "$SCEN/err" && pass "…stating that the match is case-sensitive (the trap the example set)" \
+  || fail "the refusal does not say the family match is case-sensitive"
+# THE DISCRIMINATOR: the value the refusal printed must LAND. Same fixtures, that
+# one variable exported — parity holds, evidence is posted, the merge proceeds.
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests' \
+  bash "$ADM" 42 --main-runs 1 >"$SCEN/out-prefixed" 2>"$SCEN/err-prefixed"
+rc=$?
+[ "$rc" -eq 0 ] && pass "…and exporting it CERTIFIES the same tree (exit 0) — the printed value lands" \
+  || { fail "the derived value did not land (exit $rc)"; sed 's/^/      /' "$SCEN/err-prefixed" | head -8; }
+grep -q "lane parity: PR ⊇ main" "$SCEN/comment" 2>/dev/null \
+  && pass "…with the parity the certificate rests on stated (family: Unit tests*)" \
+  || fail "no parity line in the posted evidence for the derived family"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge actually issued" \
+  || fail "no merge issued although the derived prefix made the lanes comparable"
+# THE TRAP ITSELF, pinned: the lowercase guess the old text taught is REFUTED by
+# the matcher. Asserted so the case-sensitivity claim above is measured and not
+# asserted — and so a future "helpful" lowercasing of either side fails here.
+new_scen familynamedlower
+printf '%s\n' "$HEAD_UN" > "$SCEN/head"
+printf '%s\n' "$(lane_line completed success "$HEAD_UN" 7101)" > "$SCEN/runs-$HEAD_UN"
+lane_jobset 7101 success 'Unit tests' 'changes'
+printf '%s\n' "$(lane_line completed success mainab 7102)" > "$SCEN/runs-main"
+lane_jobset 7102 success 'Unit tests' 'changes'
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  ADMIN_MERGE_LANE_JOB_PREFIX='unit' \
+  bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "the lowercase 'unit' the old example taught does NOT select 'Unit tests' (exit $rc)" \
+  || fail "'unit' matched 'Unit tests' — the match is not the case-sensitive prefix this file documents"
+grep -qF "ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests'" "$SCEN/err" \
+  && pass "…and the refusal hands back the value that DOES select it" \
+  || fail "a wrong guess is refused without naming the value that works"
+# THE SAME DEFECT ON THE OTHER SIDE. main's family matches and this head's does
+# not (a rename in flight): the useful names are the PR's, and a remedy that names
+# only the knob leaves the value to be guessed against the same case-sensitive match.
+new_scen familynamedpr
+printf '%s\n' "$HEAD_UN" > "$SCEN/head"
+printf '%s\n' "$(lane_line completed success "$HEAD_UN" 7301)" > "$SCEN/runs-$HEAD_UN"
+lane_jobset 7301 success 'Unit tests' 'changes'
+printf '%s\n' "$(lane_line completed success mainb1 7302)" > "$SCEN/runs-main"
+lane_jobset 7302 success 'test (a)' 'changes'
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "main runs 'test (a)' and this head runs 'Unit tests' → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty PR family certified"
+grep -qF "ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests'" "$SCEN/err" \
+  && pass "…and the PR-side mismatch is handed ITS retry value, not just the knob" \
+  || fail "the PR-side mismatch names no value: $(grep -o 'retry value(s).*' "$SCEN/err" | head -c 200)"
+
 # The parity key exists ONCE, in `lane_parity_check`, and it is not a second
 # `comm -23`: the one `comm` in this rail belongs to the parser's `--diff` (test
 # 9's parity invariant), and a reader must not have to guess which subtraction a
@@ -12144,8 +12288,15 @@ review_record() {
 # Every scenario below reaches the guard through the 4.6 STALE-GREEN refusal, the
 # first of the two call sites that perform the update.
 run_admin_guarded() {
-  HOME="$SCEN/home" SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+  # ⛔ `env` ARRAY, NOT A COMMAND PREFIX WITH AN EXPANDED ASSIGNMENT — see run_admin()'s note. A
+  # `"${VAR:+K="$VAR"}"` word is not an assignment word, so the prefix splits into a command name
+  # and the rail never runs (rc 127, which a caller can mistake for a refusal).
+  local -a genv=(
+    "HOME=$SCEN/home" "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_POLL_INTERVAL=0"
+  )
+  [ -n "${GH_REPO:-}" ] && genv+=("GH_REPO=$GH_REPO")
+  env "${genv[@]}" bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
 
@@ -13136,6 +13287,268 @@ grep -q "$NEW_RB" "$TMP/err" && pass "(d) …and the residual failure is printed
 grep -q 'pr merge' "$SCEN/calls" && fail "(d) a merge was attempted on a red" \
   || pass "(d) no merge attempted on a red"
 [ -f "$SCEN/comment" ] && fail "(d) evidence was posted on a red" || pass "(d) no evidence posted on a red"
+# ═══════════════════════════════════════════════════════════════════════════════
+# §77. #2235 — THE RAIL NEVER ACTS ON A DIFFERENT REPO THAN ITS CHECKOUT
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE DEFECT, VERBATIM (measured twice in one session, 2026-10-20/21): every cell's
+# `keys.env` exported `GH_REPO=daniel-ospina/tortoise` GLOBALLY, so an agent-infra PR
+# number was resolved and reported against TORTOISE:
+#
+#   $ bash scripts/admin-merge.sh 2232        # agent-infra PR, ambient GH_REPO=tortoise
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+#   RC=0
+#
+# A September tortoise PR. Exit 0, zero work, a ✅ over nothing. The same leak produced
+# `GraphQL: Could not resolve to a PullRequest with the number of 2231` for real open
+# agent-infra PRs, and four PRs looked "already merged" while unmerged on origin/main.
+#
+# WHAT THESE CASES PIN, and why each one is here rather than implied:
+#   (a) an ambient GH_REPO that DISAGREES with the checkout is a STOP-WORK condition that
+#       fires BEFORE ANY API CALL — proved by the fake `gh` recording NOTHING. That is the
+#       load-bearing assertion: a refusal that still called the API would be the same
+#       fail-open one line later, because the CALL is what decides the verdict.
+#   (b) the refusal names BOTH repos (an operator cannot fix what is not named).
+#   (c) an ambient GH_REPO that AGREES (case-folded — `gh` accepts any case) proceeds, so
+#       the gate is not a blanket refusal of every cell that has the line in its env.
+#   (d) "ALREADY MERGED" is not reported when the PR's own url names another repository —
+#       the number alone identifies nothing.
+#   (e) "ALREADY MERGED" is not reported when the resolved target is not this checkout's
+#       repo: a success line about a foreign repo is the exact shape of the defect.
+#   (f) the SAME-PR no-op still works (the negative control: a gate that refused every
+#       no-op would pass every case above).
+#   (g) an explicit --repo is still honoured — the documented selector is not reversed.
+#   (h) with no selector at all the CHECKOUT's origin answers, and the evidence line says so.
+#   (i) an UNREADABLE pr identity is not a no-op (a failed read must not read as a value).
+#   (j) the same slug on ANOTHER HOST is not the same PR (the url proof compares the host).
+#   (k) with no checkout and no selector, `gh repo view` (GH_REPO stripped) is the last resort.
+#   (l) a ZERO-PADDED PR is the same PR (gh parses `0042` as 42; the url echoes 42).
+#   (m) `[HOST/]OWNER/REPO` — gh's documented GH_REPO/--repo form — is the same repo, not a clash.
+#   (n) `--print-bounds <run-id>` refuses before any call (it reads timings with no --repo).
+echo "== §77 #2235: the rail resolves its repo by evidence, never from an ambient GH_REPO =="
+
+# (a)+(b) THE DISAGREEMENT REFUSAL — BEFORE ANY API CALL.
+new_scen repo-ambient-disagrees
+GH_REPO=daniel-ospina/tortoise run_admin_cwd "$SCEN" 2232
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(a) an ambient GH_REPO naming ANOTHER repo refuses (exit $rc)" \
+  || fail "(a) a foreign ambient GH_REPO was ACCEPTED (exit $rc) — the #2235 fail-open"
+# ⛔ ZERO INVOCATIONS, not "no merge": the fake logs argv on its FIRST line, so any gh
+# call at all — including the pre-check's state read — shows up here. A refusal that
+# happens after the state read is still a rail that graded the wrong repo.
+[ ! -s "$SCEN/calls" ] \
+  && pass "(a) …and made NO gh call at all (the fake recorded no invocation)" \
+  || fail "(a) …but it called gh BEFORE refusing: $(head -3 "$SCEN/calls" | tr '\n' ' ')"
+grep -qF 'daniel-ospina/tortoise' "$SCEN/err" && grep -qF 'daniel-ospina/agent-infra' "$SCEN/err" \
+  && pass "(b) …naming BOTH repos in play" \
+  || fail "(b) …but did not name both repos (err: $(head -2 "$SCEN/err" | tr '\n' ' '))"
+grep -q 'GH_REPO' "$SCEN/err" \
+  && pass "(b) …and names the selector to fix (GH_REPO)" \
+  || fail "(b) …without naming GH_REPO as the thing to remove"
+grep -q 'env -u GH_REPO' "$SCEN/err" \
+  && pass "(b) …and prints the one-line fix" \
+  || fail "(b) …without a remedy the operator can run"
+
+# (c) THE AGREEING AMBIENT PASSES — case-folded. `gh` treats owner/repo
+# case-insensitively and echoes back the spelling it was handed, so a verbatim
+# comparison would refuse a cell whose keys.env says the same repo in another case.
+new_scen repo-ambient-agrees
+GH_REPO=Daniel-Ospina/Agent-Infra run_admin_cwd "$SCEN" 42
+rc=$?
+grep -q 'REFUSING — the inherited GH_REPO' "$SCEN/err" \
+  && fail "(c) an ambient GH_REPO naming the SAME repo (other case) was refused" \
+  || pass "(c) an ambient GH_REPO naming the SAME repo (case-folded) is not refused"
+grep -q 'admin-merge: repo daniel-ospina/agent-infra' "$SCEN/out" \
+  && pass "(c) …and the resolved repo is printed on the evidence line" \
+  || fail "(c) …but the evidence line does not name the repo it acted on: $(head -2 "$SCEN/out" | tr '\n' ' ')"
+[ -s "$SCEN/calls" ] \
+  && pass "(c) …and the rail proceeded to its normal reads (not refused)" \
+  || fail "(c) …but it made no call at all, so 'not refused' is unproven"
+
+# (d) THE URL NAMES ANOTHER REPO ⇒ NOT A NO-OP. The state read says MERGED, but the PR
+# whose url comes back is a FOREIGN one — which is what a bare-number lookup produced.
+new_scen repo-url-foreign
+touch "$SCEN/merged"
+printf 'https://github.com/daniel-ospina/tortoise/pull/2232\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 2232
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(d) a MERGED state whose PR url names ANOTHER repo is refused (exit $rc)" \
+  || fail "(d) it reported ALREADY MERGED for a PR whose url answers for another repo (exit $rc)"
+grep -q 'ALREADY MERGED' "$SCEN/out" \
+  && fail "(d) …and still printed the ✅ no-op line" \
+  || pass "(d) …and printed NO ✅ no-op line"
+grep -q 'pr merge' "$SCEN/calls" \
+  && fail "(d) …but attempted a merge" \
+  || pass "(d) …and attempted no merge"
+
+# (e) THE TARGET IS NOT THIS CHECKOUT'S REPO ⇒ NOT A NO-OP, even with a self-consistent
+# url. A success line about a foreign repo is the defect's shape whichever way it arises.
+new_scen repo-noop-cross-repo
+touch "$SCEN/merged"
+printf 'https://github.com/daniel-ospina/tortoise/pull/42\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 42 --repo daniel-ospina/tortoise
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(e) a no-op for a --repo target that is NOT this checkout's repo is refused (exit $rc)" \
+  || fail "(e) it certified a cross-repo no-op (exit $rc)"
+grep -q 'ALREADY MERGED' "$SCEN/out" \
+  && fail "(e) …and still printed the ✅ no-op line" \
+  || pass "(e) …and printed NO ✅ no-op line"
+
+# (f) THE NEGATIVE CONTROL — the SAME-PR no-op still succeeds. Without this, a gate that
+# refused every no-op would satisfy (a)-(e) while breaking the at-least-once property the
+# no-op exists for.
+new_scen repo-noop-same-pr
+touch "$SCEN/merged"
+run_admin_cwd "$SCEN" 42
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(f) the SAME-PR no-op still exits 0 (the gate is not a blanket refusal)" \
+  || fail "(f) a legitimate same-repo no-op was refused (exit $rc): $(head -3 "$SCEN/err" | tr '\n' ' ')"
+grep -q 'ALREADY MERGED' "$SCEN/out" \
+  && pass "(f) …and still reports the observed artifact" \
+  || fail "(f) …but no longer reports it"
+
+# (g) AN EXPLICIT --repo IS STILL HONOURED (a real merge path, not a no-op), so the fix
+# does not reverse the documented selector. The head fixture is absent, so the run stops
+# at the head read — the observable is that it GOT there, carrying --repo.
+new_scen repo-explicit-ok
+run_admin_cwd "$SCEN" 42 --repo daniel-ospina/tortoise
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g) an explicit --repo naming another repo is honoured (it proceeds and then refuses on the absent head, exit $rc)" \
+  || fail "(g) an explicit --repo exited 0 with no head fixture — unexpected"
+grep -q -- '--repo daniel-ospina/tortoise' "$SCEN/calls" \
+  && pass "(g) …and every call carries the explicit --repo (the selector reaches gh)" \
+  || fail "(g) …but the explicit --repo never reached gh: $(head -3 "$SCEN/calls" | tr '\n' ' ')"
+grep -q 'resolved from --repo' "$SCEN/out" \
+  && pass "(g) …and the evidence line names --repo as the source" \
+  || fail "(g) …but the evidence line does not name its source"
+
+# (h) THE REFUSAL-ON-WRONG-REPO IS NOT A REFUSAL OF *ALL* AMBIENT STATE: with NO ambient
+# selector and no --repo, the checkout's own origin is used and printed.
+new_scen repo-from-checkout
+run_admin_cwd "$SCEN" 42
+grep -q 'resolved from checkout origin' "$SCEN/out" \
+  && pass "(h) with no selector at all the repo comes from the checkout's origin, and says so" \
+  || fail "(h) the checkout's origin was not the resolution source: $(head -2 "$SCEN/out" | tr '\n' ' ')"
+
+# (i) AN UNREADABLE PR IDENTITY IS NOT A NO-OP. The state read says MERGED; the proof read
+# fails. "Cannot prove it is the same PR" must not become "it is" — the same fail-open one
+# call deeper (a read that failed rendered as a value). This arm existed as a fake-gh seam
+# (`$SCEN/pr-url-fail`) with NO scenario driving it, i.e. an untested refusal.
+new_scen repo-url-unreadable
+: > "$SCEN/merged"
+: > "$SCEN/pr-url-fail"
+run_admin_cwd "$SCEN" 42
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(i) a MERGED state whose PR identity cannot be read is refused (exit $rc)"
+else
+  fail "(i) it reported ALREADY MERGED without being able to name the PR (exit $rc)"
+fi
+if grep -qi 'could not\|cannot\|unreadable\|identity' "$SCEN/err"; then
+  pass "(i) …and says the identity could not be read"
+else
+  fail "(i) …but the refusal does not say why (err: $(head -2 "$SCEN/err" | tr '\n' ' '))"
+fi
+if grep -q 'ALREADY MERGED' "$SCEN/out"; then
+  fail "(i) …and still printed the ✅ no-op line"
+else
+  pass "(i) …and printed NO ✅ no-op line"
+fi
+
+# (j) THE SAME SLUG ON ANOTHER HOST IS NOT THE SAME PR. The url proof compares owner, name
+# and number — a proof that IGNORED the host certified `https://evil.example.com/…`, so a
+# mirror/GHE PR elsewhere would certify this repo's no-op. `GH_HOST` is ambient state of
+# exactly the kind #2235 is about: it was neither stripped nor checked anywhere.
+new_scen repo-url-foreign-host
+: > "$SCEN/merged"
+printf 'https://evil.example.com/daniel-ospina/agent-infra/pull/42\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 42
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(j) a MERGED PR url on a DIFFERENT host is refused (exit $rc)"
+else
+  fail "(j) a foreign-host url certified the no-op (exit $rc)"
+fi
+if grep -q 'ALREADY MERGED' "$SCEN/out"; then
+  fail "(j) …and still printed the ✅ no-op line"
+else
+  pass "(j) …and printed NO ✅ no-op line"
+fi
+
+# (k) THE LAST RESORT: NOT A CHECKOUT AT ALL, NO SELECTOR, NO AMBIENT GH_REPO. Then — and
+# only then — `gh repo view` (with GH_REPO stripped) may name the target, and the evidence
+# line must say so. Without this arm the whole third resolution arm was unexercised, so
+# "(1) and (2) work" could not distinguish a working (3) from a missing one.
+new_scen repo-from-gh
+mkdir -p "$TMP/nocheckout"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+run_admin_cwd "$TMP/nocheckout" 42
+if grep -q 'resolved from gh repo view' "$SCEN/out"; then
+  pass "(k) with no checkout and no selector the repo comes from 'gh repo view', and says so"
+else
+  fail "(k) 'gh repo view' was not the resolution source: $(head -2 "$SCEN/out" | tr '\n' ' ')"
+fi
+if grep -q 'repo view' "$SCEN/calls"; then
+  pass "(k) …and the read really happened (not a hard-coded default)"
+else
+  fail "(k) …but no 'gh repo view' call was made"
+fi
+
+# (l) A ZERO-PADDED PR IS THE SAME PR. The rail accepts `01631` (see its argv note) and gh
+# parses it as 1631, echoing `…/pull/1631` — so a STRING compare on the url's number refused a
+# PR that is genuinely already merged (exit 2, a false block on the no-op path).
+new_scen repo-noop-zero-padded
+: > "$SCEN/merged"
+printf 'https://github.com/daniel-ospina/agent-infra/pull/42\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 0042
+rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'ALREADY MERGED' "$SCEN/out"; then
+  pass "(l) a zero-padded PR number still certifies the same-PR no-op"
+else
+  fail "(l) '0042' was refused against url /pull/42 (exit $rc) — gh parses it as 42"
+fi
+
+# (m) THE DOCUMENTED `[HOST/]OWNER/REPO` FORM. `gh help environment` documents GH_REPO that way
+# and `--repo` accepts it, so `github.com/<this repo>` names THIS repo. Case-folding alone graded
+# it as a DIFFERENT repo and refused a correct invocation — a false block on the fix's own path.
+new_scen repo-ambient-host-form
+GH_REPO=github.com/daniel-ospina/agent-infra run_admin_cwd "$SCEN" 42
+if grep -q 'REFUSING — the inherited GH_REPO' "$SCEN/err"; then
+  fail "(m) GH_REPO in its documented host form was graded as a DIFFERENT repo"
+else
+  pass "(m) GH_REPO in its documented [HOST/]OWNER/REPO form is not a disagreement"
+fi
+new_scen repo-explicit-host-form
+run_admin_cwd "$SCEN" 42 --repo github.com/daniel-ospina/agent-infra
+if grep -q "refusing --repo" "$SCEN/err"; then
+  fail "(m) --repo in its documented host form was refused as 'not an <owner>/<repo>'"
+else
+  pass "(m) --repo accepts [HOST/]OWNER/REPO, as gh does"
+fi
+
+# (n) `--print-bounds <run-id>` MUST REFUSE TOO. That arm exits BEFORE a PR is required and reads
+# the RUN's shard durations + the GREEN population with NO --repo, so it resolved through the
+# ambient GH_REPO and reported another repo's timings with no refusal (the same leak, one symptom
+# over). Every `--print-bounds <run-id>` arm in this suite passes --repo, which is why it was
+# invisible; this one carries the leak and must stop before any call.
+new_scen repo-print-bounds-refuses
+GH_REPO=daniel-ospina/tortoise run_admin_cwd "$SCEN" --print-bounds 2232
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(n) --print-bounds with a foreign ambient GH_REPO refuses (exit $rc)"
+else
+  fail "(n) --print-bounds answered for the ambient repo (exit $rc) — it read timings for another repo"
+fi
+if [ ! -s "$SCEN/calls" ]; then
+  pass "(n) …and made NO gh call at all"
+else
+  fail "(n) …but it called gh BEFORE refusing: $(head -3 "$SCEN/calls" | tr '\n' ' ')"
+fi
 
 # ── 77. #9689: THE BASELINE WINDOW COUNTS MEASUREMENTS, NOT RUN OBJECTS ───
 # A push burst to main spends the requested `--main-runs` window on runs that
@@ -14275,6 +14688,21 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
 # trigger, so the base probe measures it and then EXEMPTS it as not-PR-evaluable. A reader
 # built on the blocking-red set alone would answer "no such red" about the one red that
 # exists — that is the shape pinned here, not the `unknown`-evaluability arm.
+#
+# ⛔ THE DECLARED EQUIVALENCE ARM (#2610). That same real split is ALSO the one pair the rail
+# declares equivalent (`script-validate` on main CONTAINS `bash-suites (<n>)` on a PR — header,
+# "THE ONE DECLARED LANE EQUIVALENCE"), so this scenario exercises the mapping arm: the answer
+# must be `base-caused via script-validate ≡ bash-suites (5)`, never "no base counterpart".
+# Two more arms keep that from becoming a blanket excuse: (n1) a check name the mapping does
+# NOT name (`bash-suites-gate`, the nearest near-miss — a prefix rule would only map it if the
+# digits guard were dropped too, i.e. TWO guards stand between them) keeps today's
+# unqualified absence answer, and (n2) is the mutation — with the equivalence
+# deleted the mapped answer must disappear, so these assertions rest on that arm alone.
+# ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: main has no gate
+# JOB, so its two programs run as STEPS inside `script-validate` (ci-main.yml:456/:462) and
+# that red also has a base counterpart under the other name. (n1) pins the SCOPING decision
+# (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own note says
+# so rather than claiming the programs differ.
 echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
 new_scen named-refusal
 HEAD_NR="f9f90000000000000000000000000000000000ab"
@@ -14302,16 +14730,24 @@ grep -q "check 'bash-suites (5)'" "$SCEN/err" \
 grep -q "run 9901" "$SCEN/err" \
   && pass "(b) …and the RUN it failed in" \
   || fail "(b) the refusal names no run"
-grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
-  && pass "(c) …and answers the base question BY NAME: no base counterpart for 'bash-suites (5)'" \
-  || fail "(c) the base-counterpart answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
+  && pass "(c) …and answers the base question BY the DECLARED EQUIVALENCE: base-caused via script-validate ≡ bash-suites (5)" \
+  || fail "(c) the declared-equivalence answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+# The shard NAME must be carried: the refusal is about ONE shard, and `bash-suites` alone
+# does not say which one.
+grep -q "≡ bash-suites (5) (" "$SCEN/err" \
+  && pass "(c) …carrying the SHARD name it is about" \
+  || fail "(c) the mapped answer does not carry the shard: $(grep -n 'base-caused' "$SCEN/err" 2>/dev/null | head -2)"
 # ⛔ THE EXEMPTED-BASE-RED ARM. main's `script-validate` is measured by the probe and then
 # EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
-# An arm reading only the blocking reds prints an EMPTY list here — the false absence this
-# fixture exists to catch, and the exact shape of the real repo tonight.
-grep -q "red: script-validate" "$SCEN/err" \
-  && pass "(c) …naming the base's own red even though the probe EXEMPTED it as not-PR-evaluable" \
-  || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader answers 'none'): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
+# An arm reading only the blocking reds finds no counterpart at all — so the `exempt:` CLASS
+# in this answer is what pins the ALL_REDS reader (the false absence this fixture exists for).
+grep -q 'base: base-caused via script-validate ≡ bash-suites (5) (exempt:' "$SCEN/err" \
+  && pass "(c) …naming the base's own red as EXEMPT even though it is not in the blocking set" \
+  || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader finds no counterpart): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
+grep -q "NO BASE COUNTERPART" "$SCEN/err" \
+  && fail "(c) it ALSO claimed no counterpart about the base's own suite — the arms are not exclusive" \
+  || pass "(c) …and does NOT also claim an absent counterpart"
 grep -q "The EXEMPTION DECISION compares failures by FAILURE IDENTITY" "$SCEN/err" \
   && pass "(d) …and says a NAME answer is not an exemption (the identity is what decides)" \
   || fail "(d) the message could be read as an exemption — the two questions are not separated"
@@ -14435,6 +14871,52 @@ grep -q 'INCOMPLETE' "$SCEN/err" \
   && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
   || pass "(j) …and no completeness verdict is claimed from an unknown count"
 
+# ── (k) THE COMPLETENESS CROSS-CHECK IS NOT ANSWERED WITH SILENCE (#2610 review, cycle 6,
+# P3). The function is only reachable when `pr_extracted < pr_examined`, so `expected >= 1`
+# on every call — an absent or EMPTY named subset therefore means the named list is MISSING
+# ENTIRELY, which is exactly the anomaly the cross-check exists to report. It used to sit
+# behind `[ -s "$unattributed" ] || return 0`, so that case printed NOTHING AT ALL: the one
+# anomaly the check was written for was the one it could not report. The early return is
+# gone and the cross-check now fires first.
+#
+# ⛔ THIS ARM IS DISCRIMINATING WITHOUT A MUTATION, and that is why it is written as a
+# POSITIVE assertion: reinstating the `-s` return makes an EMPTY file take that return, so
+# the cross-check line disappears and this arm goes red. (An `rc != 0` assertion alone could
+# not: step 1c's `exit 1` fires whether or not the naming arm ran — the same reasoning that
+# forced both halves in (j).) The subset is emptied by a collector wrapper rather than by a
+# `grep` shim, because the emptiness is a property of the COLLECTOR's output, not of a read.
+new_scen named-refusal-empty-subset
+HEAD_NK="f9f9000000000000000000000000000000000057"
+printf '%s\n' "$HEAD_NK" > "$SCEN/head"
+lane_fail "$HEAD_NK" 9971 > "$SCEN/runs-$HEAD_NK"
+: > "$SCEN/log-9971"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9971"
+write_pr_checks "$(check_run 5071 'bash-suites (5)' completed failure 9971)"
+main_green_surface
+EMPTY_DIR="$TMP/cfs-empty-subset"
+mkdir -p "$EMPTY_DIR"
+printf '%s\n' '#!/bin/bash' \
+  'out=""; prev=""' \
+  'for a in "$@"; do [ "$prev" = "--unattributed" ] && out="$a"; prev="$a"; done' \
+  "bash '$CFS' \"\$@\"; rc=\$?" \
+  '[ -n "$out" ] && : > "$out"' \
+  'exit $rc' > "$EMPTY_DIR/ci-failure-set.sh"
+chmod +x "$EMPTY_DIR/ci-failure-set.sh"
+ADMIN_MERGE_FAILURE_SET_SH="$EMPTY_DIR/ci-failure-set.sh" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q 'failing PR run(s)' "$SCEN/err" \
+  && pass "(k) an EMPTY named subset still BLOCKS (exit $rc)" \
+  || fail "(k) the refusal is missing (exit $rc)"
+grep -q 'the collector published 0 unattributable run(s) where the refusal' "$SCEN/err" \
+  && pass "(k) …and the completeness cross-check FIRES instead of answering with silence" \
+  || fail "(k) the missing named list was answered with silence: $(sed -n '/published/p' "$SCEN/err" 2>/dev/null | head -2)"
+grep -q 'this list is INCOMPLETE' "$SCEN/err" \
+  && pass "(k) …saying the list is INCOMPLETE — a sample, not the set" \
+  || fail "(k) it did not say the list is incomplete"
+grep -q 'The failing run(s), NAMED' "$SCEN/err" \
+  && fail "(k) it printed a NAMED header over a list with nothing in it" \
+  || pass "(k) …and prints NO named header for an empty list"
+
 # ── (g) THE SAME-NAME ARM. An arm that always answers "no counterpart" would pass (c) and
 # lie about this surface, so a blocking base red with the same NAME is its own case.
 new_scen named-refusal-shared
@@ -14457,24 +14939,156 @@ grep -q "'bash-suites (5)' IS red on 'main'" "$SCEN/err" \
 grep -q "NO BASE COUNTERPART" "$SCEN/err" \
   && fail "(g) it ALSO claimed no counterpart — the arms are not exclusive" \
   || pass "(g) …and does NOT claim an absent counterpart on the same surface"
+# ── (n1) A NEAR-MISS NAME KEEPS TODAY'S ABSENCE ANSWER. The mapping is ONE pair, not a
+# prefix rule: `bash-suites-gate` is not a shard of the list. TWO independent guards stand
+# between them — the case pattern and the digits check — so a pattern-only widening still
+# returns nothing (pinned by (n3) below, which builds exactly that mutant). ⚠️ Its own
+# programs DO run inside main's
+# `script-validate` (as steps), so this is a SCOPING exclusion with a known residual (#2610),
+# not a claim that no counterpart exists — see the note on `declared_base_equivalent`.
+# This is also where the base's EXEMPTED red is re-pinned on the UNMAPPED path: the answer
+# still has to name `script-validate` as the base's red.
+new_scen named-refusal-unmapped
+# The scenario dir is captured BY NAME because (n3) re-enters it later: `SCEN` is a global
+# that a later `new_scen` overwrites (the cycle-2 P1), and this arm must not inherit another.
+SCEN_UNMAPPED="$SCEN"
+HEAD_NU="f9f90000000000000000000000000000000000e1"
+printf '%s\n' "$HEAD_NU" > "$SCEN/head"
+lane_fail "$HEAD_NU" 9951 > "$SCEN/runs-$HEAD_NU"
+: > "$SCEN/log-9951"
+echo 'bash-suites-gate' > "$SCEN/jobs-failed-9951"
+write_pr_checks "$(check_run 5051 'bash-suites-gate' completed failure 9951)"
+write_main_checks "$(check_run 4051 'script-validate' completed failure 6104)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6104"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6104 push 'CI on main'
+{ main_red_n mainnu01 9952 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(n1) a check name the mapping does NOT name still BLOCKS (exit $rc)" \
+  || fail "(n1) the rail merged over an unmapped unattributable red"
+grep -q "base: base-caused via" "$SCEN/err" \
+  && fail "(n1) 'bash-suites-gate' was mapped to the shard equivalence — the match is a PREFIX, not a pair" \
+  || pass "(n1) …and is NOT declared equivalent (one declared pair; only widening the pattern AND dropping the digits guard would map it)"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(n1) …keeping today's unqualified absence answer" \
+  || fail "(n1) the unmapped answer changed: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -qE "^       red: script-validate$" "$SCEN/err" \
+  && pass "(n1) …naming the base's EXEMPTED red in the absence answer (the ALL_REDS reader)" \
+  || fail "(n1) the base's exempted red vanished from the unmapped answer: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
+
+# ── (n2) MUTATION: DELETE THE EQUIVALENCE, AND THE MAPPED ANSWER MUST GO. The three (c) arms
+# assert a line the mapping arm alone produces; this proves it. The mutant keeps everything
+# else identical — `declared_base_equivalent` returns nothing — so a passing (c) against the
+# mutant would mean the line came from somewhere other than the arm.
+SCEN_EQ="$TMP/scen-named-refusal"
+MUTD2="$TMP/mut-equivalence"; rm -rf "$MUTD2"; mkdir -p "$MUTD2"
+awk '
+  /^declared_base_equivalent\(\) \{/ { infn = 1; print; print "  return 0   # MUTANT (#2610): the declared equivalence is deleted"; next }
+  infn && /^\}/ { infn = 0; print; next }
+  infn { next }
+  { print }
+' "$ADM" > "$MUTD2/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD2/"
+bash -n "$MUTD2/admin-merge.sh" \
+  && pass "(n2) the mutant (equivalence deleted) is still valid bash" \
+  || fail "(n2) the mutant does not parse — the mutation is not a clean arm deletion"
+# ⛔ THE ARM MUST BE ABLE TO FAIL, AND THAT IS ASSERTED, NOT ASSUMED (#2610 review). An absence
+# assertion is only as strong as the presence it depends on: without this precondition the arm
+# below reads "the mapped line is gone" about a scenario that never printed it. Measured with the
+# equivalence neutered BEFORE this arm existed: the suite reported
+#   ✅ (n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm
+# while the mapping was absent — a green arm asserted rather than verified. Same shape as (m)'s
+# own precondition: the SAME scenario through the UNMUTATED rail must carry the line first.
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
+  && pass "(n2) precondition: the UNMUTATED rail on this scenario prints the mapped answer" \
+  || fail "(n2) precondition FAILED — the unmutated rail never printed the mapped answer, so the absence arm below would pass vacuously: $(grep -c 'base:' "$SCEN_EQ/err" 2>/dev/null || printf 'unreadable')"
+SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  bash "$MUTD2/admin-merge.sh" 42 --main-runs 1 >"$SCEN_EQ/eq-mut-out" 2>"$SCEN_EQ/eq-mut-err"
+qrc=$?
+# The SAME refusal must still fire — a mutant that died earlier would make the absence arm
+# vacuously true, so this arm is only meaningful once THIS one holds.
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+  && pass "(n2) the mutant still refuses at step 1c — the refusal is not what the arm adds" \
+  || fail "(n2) the mutant did not reach step 1c (exit $qrc): $(head -3 "$SCEN_EQ/eq-mut-err" 2>/dev/null)"
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+  && fail "(n2) deleting the equivalence changed nothing — the (c) assertions pin no line the arm produces" \
+  || pass "(n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+  && pass "(n2) …and the pre-change answer is what the mutant prints instead" \
+  || fail "(n2) the mutant printed neither answer: $(grep -n 'base:' "$SCEN_EQ/eq-mut-err" 2>/dev/null | head -3)"
+
+# ── (n3) THE DIGITS GUARD IS ITS OWN GUARD. (n1) proves the gate is not mapped TODAY; this
+# proves WHY, so a lane that widens the pattern alone cannot quietly get a mapped line — and
+# so a lane that reads the two guards as one cannot "simplify" the digits check away without
+# a red arm. The mutant is the REAL function with ONLY the case pattern widened to
+# `bash-suites*`: the digits guard survives, so `bash-suites-gate` must still be rejected.
+MUTD3="$TMP/mut-prefix"; rm -rf "$MUTD3"; mkdir -p "$MUTD3"
+awk '
+  $0 == "    \047bash-suites (\047*\047)\047)" { print "    bash-suites*)"; next }
+  { print }
+' "$ADM" > "$MUTD3/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD3/"
+bash -n "$MUTD3/admin-merge.sh" \
+  && pass "(n3) the prefix-widened mutant is still valid bash" \
+  || fail "(n3) the mutant does not parse — the mutation is not a clean pattern widening"
+grep -q 'bash-suites\*)' "$MUTD3/admin-merge.sh" \
+  && pass "(n3) …and it really carries the widened pattern (not the shipped one)" \
+  || fail "(n3) the widening did not apply — the arm would be vacuous"
+# ⛔ SAME PRECONDITION DISCIPLINE AS (n2)/(m): the absence arms below are about a line the
+# UNMUTATED rail must NOT print on this scenario, so assert the answer it DOES print first. A
+# scenario that had drifted to a different check name would otherwise satisfy every absence arm
+# at once and prove nothing about the digits guard.
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_UNMAPPED/err" 2>/dev/null \
+  && pass "(n3) precondition: the UNMUTATED rail on this scenario prints today's absence answer" \
+  || fail "(n3) precondition FAILED — the unmutated rail did not print the absence answer, so the absence arms below would pass vacuously: $(grep -c 'base:' "$SCEN_UNMAPPED/err" 2>/dev/null || printf 'unreadable')"
+SCEN="$SCEN_UNMAPPED" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  bash "$MUTD3/admin-merge.sh" 42 --main-runs 1 >"$SCEN_UNMAPPED/px-out" 2>"$SCEN_UNMAPPED/px-err"
+prc=$?
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_UNMAPPED/px-err" 2>/dev/null \
+  && pass "(n3) the widened mutant still refuses at step 1c" \
+  || fail "(n3) the widened mutant did not reach step 1c (exit $prc): $(head -3 "$SCEN_UNMAPPED/px-err" 2>/dev/null)"
+grep -q "base: base-caused via" "$SCEN_UNMAPPED/px-err" 2>/dev/null \
+  && fail "(n3) widening the PATTERN alone mapped 'bash-suites-gate' — the digits guard is not load-bearing" \
+  || pass "(n3) …and the DIGITS guard alone still rejects 'bash-suites-gate' (a prefix rule is not enough)"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_UNMAPPED/px-err" 2>/dev/null \
+  && pass "(n3) …falling through to today's unqualified absence answer" \
+  || fail "(n3) the widened mutant printed no absence answer either: $(grep -n 'base:' "$SCEN_UNMAPPED/px-err" 2>/dev/null | head -3)"
+
 # ── MUTATION: the assertions above must rest on the naming arm, not on other text ──
+# ⛔ THE SCENARIO IS RE-POINTED EXPLICITLY (#2610 review, cycle 2 P1). `SCEN` is a GLOBAL that
+# each `new_scen` overwrites, so this block used to run the mutant in whichever scenario the
+# LAST arm happened to open. Adding scenarios (n1)/(n2) above moved that to a scenario whose
+# check is `bash-suites-gate`, where the grep below is satisfied by BOTH branches — the arm
+# could no longer fail, and a regression that deleted the naming arm outright would have kept
+# the suite green. Pin the scenario the assertion is ABOUT (named-refusal: check
+# `bash-suites (5)`, a real run, the mapped arm) instead of inheriting one.
 MUTD="$TMP/mut-named"; rm -rf "$MUTD"; mkdir -p "$MUTD"
 grep -v 'named_unattributable_runs "$TMP/pr-unattributed.txt"' "$ADM" > "$MUTD/admin-merge.sh"
 cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD/"
 bash -n "$MUTD/admin-merge.sh" \
   && pass "(m) the mutant (naming arm deleted) is still valid bash" \
   || fail "(m) the mutant does not parse — the mutation is not a clean arm deletion"
-SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
   ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
   ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
-  bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
+  bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN_EQ/mut-out" 2>"$SCEN_EQ/mut-err"
 mrc=$?
+# ⛔ THE ARM MUST BE ABLE TO FAIL: the SAME scenario run through the UNMUTATED rail must print
+# the check's name, or the absence below proves nothing.
+grep -q "check 'bash-suites (5)'" "$SCEN_EQ/err" 2>/dev/null \
+  && pass "(m) the scenario this mutation runs actually exercises the named check" \
+  || fail "(m) the pinned scenario never printed the check's name — the mutation would be vacuous"
 # The SAME refusal must still fire — a mutant that died earlier would make the absence arm
 # vacuously true, so the arm below is only meaningful once THIS one holds.
-grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/mut-err" 2>/dev/null \
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/mut-err" 2>/dev/null \
   && pass "(m) the mutant still refuses at step 1c — the refusal is not what this arm adds" \
-  || fail "(m) the mutant did not reach step 1c (exit $mrc): $(head -3 "$SCEN/mut-err" 2>/dev/null)"
-grep -q "check 'bash-suites (5)'" "$SCEN/mut-err" 2>/dev/null \
+  || fail "(m) the mutant did not reach step 1c (exit $mrc): $(head -3 "$SCEN_EQ/mut-err" 2>/dev/null)"
+grep -q "check 'bash-suites (5)'" "$SCEN_EQ/mut-err" 2>/dev/null \
   && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
   || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
 

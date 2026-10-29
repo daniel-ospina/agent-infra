@@ -1,0 +1,15 @@
+# Same `name:` as -a, group keyed on `github.workflow_ref`. `workflow_ref` carries the workflow FILE, so
+# the two are disjoint at runtime and must not be refused as sharing a group — the identity
+# substitution used to rewrite `github.workflow` inside it, producing the impossible group
+# `shared ci name_ref` and a false red (#2660 round 15). Run together with -a.
+name: shared ci name
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow_ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
