@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twenty-four tests with thirty-one paired mutations: every mutation re-
+Thirty-one tests with thirty-eight paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven of the twenty-four (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. Seven of the thirty-one (#1254) pin the TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -17,8 +17,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 24 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
+    python3 tools/fleet/liveness.test.py                # the 31 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (38)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -38,6 +38,7 @@ import datetime
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -917,6 +918,178 @@ def t20_unrecognized_stop_reason_abstains():
           "the non-terminal set is unchanged; got %s" % (liv.NON_TERMINAL_STOP_REASONS,))
 
 
+def _claim(scope="local", lease="live", pid=93756):
+    """A ref-claim row for the #1777 tests (the incident's own shape)."""
+    host = {"local": "Daniels-MacBook-Air-new", "foreign": "cmux", "unknown": ""}.get(scope, "")
+    return liv.Claim(
+        ref="refs/claims/8697-f5282009634e", key="8697-f5282009634e", pr="8697",
+        sha12="f5282009634e", owner="%s:%d" % (host, pid) if scope != "unknown" else "?",
+        owner_host=host, owner_pid=(pid if scope != "unknown" else None),
+        lease_until=(NOW_S + 1800 if lease == "live" else (NOW_S - 1800 if lease == "expired" else None)),
+        lease_state=lease, scope=scope, commit="c0ffee", age_s=600,
+    )
+
+
+def _claim_ev(**kw):
+    kw.setdefault("candidates", [])
+    return ev(**kw)
+
+
+@test("T25 an unreadable ref-claim namespace ABSTAINS (claims-unreadable), never dead (#1777)")
+def t25_claims_unreadable_abstains():
+    cr = liv.ClaimRead(readable=False, present=False, claims=(),
+                       source="origin:https://example.invalid/r.git",
+                       detail="ls-remote rc=128 (auth)")
+    v = liv.evaluate(_claim_ev(claim_read=cr))
+    check(v.state == "unknown",
+          "an unreadable namespace is an abstention, never free/dead; got %s" % v.state)
+    check(v.reason == "claims-unreadable", "the abstention is named; got %s" % v.reason)
+    check(v.holder_pid is None, "no incarnation may be asserted from an unreadable read")
+    check("rc=128" in v.detail, "the cause is surfaced; got %r" % v.detail)
+    # The load-bearing distinction: unreadable is NOT an absence — proven by the
+    # reason CHANGING when the same empty claim set is readable, not by re-asserting
+    # the fixture we just built (a self-fulfilling check proves nothing).
+    v_empty = liv.evaluate(_claim_ev(claim_read=liv.ClaimRead(readable=True, present=False)))
+    check(v_empty.reason == "no-claim-visible" and v_empty.reason != v.reason,
+          "an unreadable read and a genuinely empty read must be DIFFERENT reasons")
+
+
+@test("T26 a readable namespace with no claim ABSTAINS (no-claim-visible) and declares the gap (#1777)")
+def t26_no_claim_visible_abstains():
+    cr = liv.ClaimRead(readable=True, present=False, claims=(),
+                       siblings=("1525-aaaaaaaaaaaa",), source="origin:x")
+    v = liv.evaluate(_claim_ev(claim_read=cr))
+    check(v.state == "unknown", "no claim visible must not read as free; got %s" % v.state)
+    check(v.reason == "no-claim-visible", "got %s" % v.reason)
+    # The disclosure is the fix: the read declares the gap it cannot cover.
+    check("NOT freedom" in v.detail, "the absence disclosure is rendered; got %r" % v.detail)
+    check("HEAD-scoped" in v.detail, "the HEAD-scoping is named; got %r" % v.detail)
+    check("1525-aaaaaaaaaaaa" in v.detail,
+          "the other heads of the PR are disclosed rather than silently dropped; got %r" % v.detail)
+    check(liv.NO_CLAIM_DISCLOSURE in v.detail, "the fixed disclosure text is used verbatim")
+
+
+@test("T27 a claim verdict NEVER sets holder_pid; owner identity rides in detail (#1777/#1178)")
+def t27_claim_never_sets_holder_pid():
+    live = _claim(scope="local", lease="live")
+    for cr in (liv.ClaimRead(readable=True, present=True, claims=(live,)),
+               liv.ClaimRead(readable=True, present=True, claims=(_claim(scope="foreign"),)),
+               liv.ClaimRead(readable=True, present=True,
+                             claims=(_claim(scope="local", lease="expired"),))):
+        v = liv.evaluate(_claim_ev(claim_read=cr))
+        check(v.holder_pid is None,
+              "a claim records no process start, so no incarnation may be asserted; got %r"
+              % (v.holder_pid,))
+    v = liv.evaluate(_claim_ev(claim_read=liv.ClaimRead(readable=True, present=True,
+                                                       claims=(live,))))
+    check(v.state == "unknown" and v.reason == "claim-held", "got %s/%s" % (v.state, v.reason))
+    # "who holds this?" IS answered — as non-liveness detail.
+    check("owner=Daniels-MacBook-Air-new:93756" in v.detail,
+          "the owner identity is reported; got %r" % v.detail)
+    check("lease=live" in v.detail and "scope=local" in v.detail,
+          "the lease state and scope are reported; got %r" % v.detail)
+    check("age_s=600" in v.detail,
+          "the claim age is reported as non-liveness detail; got %r" % v.detail)
+    check("not asserted" in v.detail,
+          "the reason states that process liveness is NOT asserted; got %r" % v.detail)
+
+
+@test("T28 EVERY claim-shaped verdict ABSTAINS: unknown, named, no holder_pid (#1777 adversarial B1-B9)")
+def t28_claim_verdicts_all_abstain():
+    seen = set()
+    for readable in (True, False):
+        for present in (True, False):
+            for scope in ("local", "foreign", "unknown"):
+                for lease in ("live", "expired", "unknown"):
+                    claims = (_claim(scope=scope, lease=lease),) if present else ()
+                    cr = liv.ClaimRead(readable=readable, present=present, claims=claims,
+                                       source="origin:x")
+                    v = liv.evaluate(_claim_ev(claim_read=cr))
+                    check(v.state == "unknown",
+                          "readable=%s present=%s scope=%s lease=%s -> %s (must be unknown)"
+                          % (readable, present, scope, lease, v.state))
+                    check(v.reason in liv.CLAIM_REASONS, "unlisted reason %r" % (v.reason,))
+                    check(v.holder_pid is None, "no claim verdict may set holder_pid")
+                    # lane_liveness escalates `dead` ONLY; an unknown can never file.
+                    check(v.state not in ("dead", "wedged", "idle", "running-quiet"),
+                          "a claim-shaped query must never reach a session state; got %s" % v.state)
+                    seen.add(v.reason)
+    check(seen == set(liv.CLAIM_REASONS),
+          "the six reasons must be a PARTITION: reachable+exhaustive; got %s" % sorted(seen))
+    check(len(liv.CLAIM_REASONS) == 6, "the reason set is explicit; got %r" % (liv.CLAIM_REASONS,))
+    # The five-state vocabulary still has exactly five states — a claim adds no state.
+    check(liv.STATES == ("dead", "running-quiet", "wedged", "idle", "unknown"),
+          "the state vocabulary is unchanged; got %r" % (liv.STATES,))
+
+
+@test("T29 session evidence OUTRANKS a claim; dead stays unreachable for a claim (#1777)")
+def t29_claims_do_not_override_session_evidence():
+    live = _claim(scope="local", lease="live")
+    cr = liv.ClaimRead(readable=True, present=True, claims=(live,))
+    # (a) A growing transcript is positive liveness evidence — decided first, so a
+    #     claim can never suppress it.
+    v = liv.evaluate(ev(candidates=[], jsonl_grew=True, claim_read=cr))
+    check(v.state == "running-quiet" and v.reason.startswith("jsonl-grew"),
+          "a growing lane still reads jsonl-grew over a claim; got %s/%s" % (v.state, v.reason))
+    check(v.reason != "claim-held", "the claim must not have decided this verdict")
+    # (b) A session lane whose incarnations are gone still reads dead — a claim
+    #     attached to it must not change that.
+    v2 = liv.evaluate(ev(candidates=[C(11, "absent")], jsonl_grew=False, claim_read=cr))
+    check(v2.state == "dead",
+          "a claim must not mask a session lane's death; got %s/%s" % (v2.state, v2.reason))
+    # (c) `dead` needs a NON-EMPTY candidate set — the vacuity guard (C4) is what
+    #     makes a claim-shaped Evidence structurally unable to read dead.
+    check(liv.is_dead_evidence([]) is False, "the C4 vacuity guard is load-bearing")
+    v3 = liv.evaluate(_claim_ev(candidates=[], jsonl_grew=False, claim_read=cr))
+    check(v3.state == "unknown", "a claim-shaped Evidence never reads dead; got %s" % v3.state)
+
+
+@test("T30 the claim logic is INERT when claim_read is None — existing verdicts unchanged (#1777)")
+def t30_claim_logic_inert_without_claim_read():
+    # (state, reason, evidence) — the reason is pinned too, because a mutation that
+    # silently swaps the ABSTENTION REASON changes what the operator reads.
+    cases = (
+        ("dead", "incarnations-absent",
+         ev(candidates=[C(11, "absent")], jsonl_grew=False, jsonl_age_ms=H)),
+        ("unknown", "no-holder-record", ev(candidates=[])),
+        ("running-quiet", "jsonl-grew", ev(candidates=[C(11, "holder")], jsonl_grew=True)),
+        ("idle", "jsonl-old", ev(candidates=[C(11, "holder")], jsonl_age_ms=25 * H)),
+        ("unknown", "ps-unreadable", ev(candidates=[], ps_ok=False)),
+        ("unknown", "store-unreadable", ev(candidates=[], store_ok=False)),
+        ("unknown", "off-fence", ev(candidates=[C(11, "off-fence")])),
+    )
+    for want_state, want_reason, e in cases:
+        check(e.claim_read is None, "the fixture must exercise the inert path")
+        v = liv.evaluate(e)
+        check((v.state, v.reason) == (want_state, want_reason),
+              "claim logic must be inert for a session caller (want %s/%s, got %s/%s)"
+              % (want_state, want_reason, v.state, v.reason))
+    check(hasattr(liv, "claim_verdict") and hasattr(liv, "ClaimRead"),
+          "the claim vocabulary exists but is reachable only via claim_read")
+
+
+@test("T31 the mutation harness cannot read a NON-RUNNING test as 'caught' (#1777)")
+def t31_mutation_verdict_requires_a_real_failure():
+    """Pinned by a direct truth-table assertion, not a paired mutation.
+
+    A mutation is caught only when the paired test RAN and FAILED. The pre-fix
+    harness used `returncode != 0`, and `run_tests` ALSO returns 1 when the filter
+    matched nothing (``PASS=0 FAIL=0``) — so a renamed test id, or a typo in the
+    map, reported every mutation CAUGHT while verifying nothing: a false-PASS
+    generator inside the very evidence the suite's mutation claims rest on. The
+    decision lives in THIS file, which the harness never mutates, so it is pinned
+    where it lives (the same truth table is pinned in `claim_lanes.test.py` L23).
+    """
+    caught = _mutation_verdict
+    check(caught(0, "PASS=1 FAIL=0") is False, "a green run is not a caught mutation")
+    check(caught(1, "PASS=0 FAIL=1") is True, "a failed paired test IS caught")
+    check(caught(1, "PASS=0 FAIL=0") is False,
+          "a filter that matched NO test is not a caught mutation")
+    check(caught(1, "  ok   T1 x\nPASS=1 FAIL=0\n") is False, "same, with noise around it")
+    check(caught(1, "FAIL T1 x\nPASS=0 FAIL=2\n") is True, "more than one failure counts")
+    check(caught(1, "") is False, "an unparseable run is not a caught mutation")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # The mutation map: each entry reintroduces the defect its test catches.
 # ══════════════════════════════════════════════════════════════════════════
@@ -1508,6 +1681,48 @@ MUTATIONS = [
         "manufactures a tool pi already FAILED and the lane stands quiet past S where the "
         "watchdog's zero-tool `stream-stall` cut (#5389 review P2)",
     ),
+    Mutation(
+        "T25", "module",
+        '    if not cr.readable:',
+        '    if False:',
+        "a failed registry read is no longer distinguished from an empty one (B2/B3)",
+    ),
+    Mutation(
+        "T26", "module",
+        '    if not cr.claims:',
+        '    if False and not cr.claims:',
+        "an absence stops abstaining and falls through to another reason (the #1777 defect itself)",
+    ),
+    Mutation(
+        "T27", "module",
+        '        return Verdict("unknown", "claim-held",',
+        '        return Verdict("unknown", "claim-held", holder_pid=held[0].owner_pid,',
+        "an unprobeable claim asserts an incarnation by pid (a second identity rule, #1178)",
+    ),
+    Mutation(
+        "T27", "module",
+        '    if claim.age_s is not None:\n        parts.append("age_s=%d" % claim.age_s)\n',
+        '',
+        "the claim age is dropped from the detail, so a holder is no longer reported with its age",
+    ),
+    Mutation(
+        "T28", "module",
+        '        return Verdict("unknown", "claim-held",',
+        '        return Verdict("running-quiet", "claim-held",',
+        "a claim sheds its abstention and can be read as a green light by an exit-code consumer (B4)",
+    ),
+    Mutation(
+        "T29", "module",
+        '    if not holders:\n        if is_dead_evidence(cands):',
+        '    if not holders:\n        if ev.claim_read is not None:\n            return claim_verdict(ev.claim_read)\n        if is_dead_evidence(cands):',
+        "the claim block outranks session evidence and can mask a lane's death (B7)",
+    ),
+    Mutation(
+        "T30", "module",
+        '            if ev.claim_read is not None:\n                return claim_verdict(ev.claim_read)\n',
+        '            return claim_verdict(ev.claim_read or ClaimRead())\n',
+        "the None guard is gone, so every session abstention becomes a claim abstention",
+    ),
 ]
 
 
@@ -1558,6 +1773,23 @@ def _mutated_env(mut):
     return tmp, out, env
 
 
+def _mutation_verdict(returncode: int, body: str) -> bool:
+    """Is this mutation CAUGHT? Only if the paired test RAN and FAILED.
+
+    ⛔ `returncode != 0` is NOT the test: ``run_tests`` also exits 1 when the
+    filter matched nothing at all (``PASS=0 FAIL=0``), so a renamed test id — or a
+    typo in the map — would report every mutation CAUGHT while verifying nothing.
+    The runner publishes its own summary line, so the summary is the verdict.
+    """
+    if returncode == 0:
+        return False
+    for line in body.splitlines():
+        m = re.match(r"\s*PASS=(\d+) FAIL=(\d+)\s*$", line)
+        if m:
+            return int(m.group(2)) > 0
+    return False
+
+
 def run_mutations():
     print("── MUTATION EVIDENCE — each mutation must make its paired test RED ──")
     print("   (the mutated file is written to a temp dir; the real source is never touched)\n")
@@ -1573,7 +1805,7 @@ def run_mutations():
             body = proc.stdout.decode("utf-8", "replace")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        red = proc.returncode != 0
+        red = _mutation_verdict(proc.returncode, body)
         print("── %s mutation → %s ───────────────────────────────────────" % (mut.test_name, mut.why))
         for line in body.splitlines():
             print("   | %s" % line)
@@ -1581,7 +1813,11 @@ def run_mutations():
             print("   ✅ RED (the paired test caught the defect, rc=%d)\n" % proc.returncode)
         else:
             bad += 1
-            print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
+            if "PASS=0" in body and "FAIL=0" in body:
+                print("   ❌ NOT RUN — no test matched `%s`; this mutation verified NOTHING\n"
+                      % mut.test_name)
+            else:
+                print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
     print("MUTATIONS=%d CAUGHT=%d MISSED=%d" % (len(MUTATIONS), len(MUTATIONS) - bad, bad))
     return bad == 0
 

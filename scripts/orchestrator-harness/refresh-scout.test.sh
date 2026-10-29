@@ -34,6 +34,25 @@ LOOP="$HERE/orch-loop.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
+ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+# mut <out-path> — produce a MUTATION COPY of the shipped script by running the Python program on stdin
+# (`python3 - "$REFRESH" <out-path>`). Returns 0 only when the copy was WRITTEN; on a drifted anchor, on
+# a NO-OP revert, or on anything else it prints ONE line and removes the partial file.
+# ⛔ WHY THIS EXISTS (#2956 review, cosmetic). These controls guarded themselves with bare `assert`
+# statements, so a control whose anchor had moved died with a PYTHON TRACEBACK — and a `src.replace()`
+# that matched nothing wrote a copy IDENTICAL to the shipped script, i.e. a control that proves nothing
+# while the suite still prints `ok`. A traceback is not a diagnosis and a vacuous control is not a
+# control; both are now one clean ❌ on the arm's own `ck` line.
+mut() {
+  local out="$1" err
+  if err="$(python3 - "$REFRESH" "$out" 2>&1)"; then
+    [ -s "$out" ] && return 0
+    err="the mutation program wrote nothing"
+  fi
+  rm -f "$out"
+  echo "  (control not produced: ${err//$'\n'/ })"
+  return 1
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/refresh-scout.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 echo "==> refresh-candidates scout-provisioning contract ($HERE)"
@@ -111,6 +130,13 @@ mk_issue_claim() {   # <dir> <issue> <lease-seconds-from-now> [<owner-host>]
 # RF_PATH overrides the constructed PATH for the one case that must have no `uv` on it. The ambient
 # provisioning knobs are CLEARED every run, so a case's own values are the only ones in play and an
 # operator's exported TORTOISE_REPO/TORTOISE/SCOUT_UV cannot leak into the sandbox.
+# ⛔ $OR IS CLEARED TOO (agent-infra#1935 review). Every fixture here builds a bare LOCAL origin
+# (`git init -q --bare "$D/origin.git"`), and `resolve_repo` tolerates a local-path origin only while
+# the queue target is UNDECLARED (`OR_DECLARED=0`): a DECLARED $OR cannot be proven by a path, so it
+# is refused. An operator's shell exporting $OR (a cell's keys.env does — measured on this box) then
+# turned 114 arms of this suite red for a reason that has nothing to do with provisioning. A case
+# that WANTS a declared target sets `OR=` on its own invocation (the acme/widget arms do), so
+# clearing the ambient value costs nothing and makes the shard deterministic on any box.
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
@@ -120,7 +146,7 @@ rf() {
   local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
-          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
+          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u OR \
           HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
@@ -149,15 +175,29 @@ PY
 #     pool is genuinely EMPTY (a readable answer, not a failed read).
 #   * `auth token` answers (a credential is stored) and `gh api rate_limit` reports a HEALTHY REST
 #     bucket against a STARVED GraphQL one — the exact asymmetry the fix exists for.
+#   * <issue-numbers> is a COMMA LIST, so a case can put more than one row in the pool (the release
+#     rotation needs four). A single number still works — `mk_gh_one_issue` passes one.
+#   * <pr-head-ref> makes the pulls listing answer with ONE PR whose head ref is that branch, which is
+#     the only way a case can exercise the `pr` keep-fact (agent-infra#2183). The REST shape is
+#     `[{"head":{"ref":…}}]` because `rest_list pulls … --jq '.[]|.head.ref'` projects exactly that.
 mk_gh_rest() {
-  local d="$1" n="${2:-}" rows='[]'
-  [ -n "$n" ] && rows="[{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}]"
+  local d="$1" nums="${2:-}" pref="${3:-}" rows='[]' pulls='[]' n first=1
+  if [ -n "$nums" ]; then
+    rows='['
+    for n in ${nums//,/ }; do
+      [ "$first" -eq 1 ] || rows="$rows,"
+      first=0
+      rows="$rows{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"
+    done
+    rows="$rows]"
+  fi
+  [ -n "$pref" ] && pulls="[{\"head\":{\"ref\":\"$pref\"}}]"
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 case "\$1 \$2" in
   "auth token") exit 0 ;;
   *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
-  *"/pulls?"*) printf '[]\n' ;;                 # the reaper's branch list: readable, none
+  *"/pulls?"*) printf '%s\n' '$pulls' ;;        # the reaper's branch list (readable; empty by default)
   *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
   *"/issues?"*) printf '[]\n' ;;
   *) case "\$*" in
@@ -173,6 +213,63 @@ SH
   mk_gh_wrapper "$1"
 }
 
+# mk_tmux <dir> [lane-number ...] — a `tmux` stub. The reaper asks PATH-resolved `tmux ls -F` for the
+# live `lane-N` sessions, so a stub in the case's bin dir is what the shipped code actually reads.
+# With no numbers it answers "no sessions" (the harness's own ordinary state).
+mk_tmux() {
+  local d="$1"; shift
+  { echo '#!/bin/bash'
+    local n
+    for n in "$@"; do printf 'printf "lane-%%s\\n" %s\n' "$n"; done
+    echo 'exit 0'; } > "$d/bin/tmux"
+  chmod +x "$d/bin/tmux"
+}
+# mk_git_fail <dir> — a `git` that fails ONLY on `ls-remote`, i.e. exactly the claim registry's read
+# (`claims.sh`'s `_git` resolves `git` by bare name, so this intercepts it). Everything else is the
+# real git, so the rest of the pass is unaffected: the point is an UNANSWERABLE registry, not a broken
+# box. `claim_issue_preflight` maps a non-zero rc to INCOMPLETE, which the filter must treat as
+# `claim-unknown` (keep + count) and never as freedom.
+mk_git_fail() {
+  local real; real="$(command -v git)"
+  cat > "$1/bin/git" <<SH
+#!/bin/bash
+for a in "\$@"; do [ "\$a" = ls-remote ] && exit 128; done
+exec "$real" "\$@"
+SH
+  chmod +x "$1/bin/git"
+}
+# mk_mktemp_fail <dir> <token> — a `mktemp` that refuses ONLY templates containing <token> and
+# delegates every other argv to the REAL mktemp (the same shape as mk_git_fail for `git ls-remote`).
+# It is the deterministic way to reach "the helper could not be created": the shipped script calls
+# mktemp for the REST tempdir AND for the release sort, and only the second one is the state under
+# test. Without it that branch needs a read-only /tmp or a full disk, i.e. it is never graded.
+mk_mktemp_fail() {
+  local real; real="$(command -v mktemp)"
+  mkdir -p "$1/bin"
+  cat > "$1/bin/mktemp" <<SH
+#!/bin/bash
+for a in "\$@"; do
+  case "\$a" in *$2*) exit 1 ;; esac
+done
+exec "$real" "\$@"
+SH
+  chmod +x "$1/bin/mktemp"
+}
+# mk_tool_surface <path> <verdict> <surface-name> — a pre-flight that answers <verdict> and prints the
+# producer's own `INCOMPLETE SURFACES` block naming <surface-name>, plus an `ADVISORY SURFACES` line
+# that must NOT be mistaken for a failure. This is the vendored producer's documented stdout shape.
+mk_tool_surface() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<PY
+#!/usr/bin/env python3
+print("VERDICT: $2")
+print("INCOMPLETE SURFACES")
+print("  [$3] claim gate: the FLEET BOARD could not answer")
+print("ADVISORY SURFACES")
+print("  [open PRs] looked fine")
+PY
+  chmod +x "$1"
+}
 # mk_uv_ok <dir> — a `uv` stub that RECORDS its argv and produces a runnable interpreter.
 mk_uv_ok() {
   cat > "$1/bin/uv" <<EOF
@@ -868,7 +965,7 @@ echo; echo "── an unwritable state dir is refused, not absorbed ──"
 mk_case unwritable-o
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#' > "$D/state-file" # a REGULAR FILE where $O must be a directory
-OUT="$(env -u GH_HOST -u CELL_HOME HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
+OUT="$(env -u GH_HOST -u CELL_HOME -u OR HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
         O="$D/state-file" bash "$REFRESH" 2>&1)"; RC=$?
 [ "$RC" -eq 1 ] && ok "unwritable \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
                || bad "unwritable \$O: rc=$RC (want 1) — output: $OUT"
@@ -919,8 +1016,16 @@ mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_rest "$D" 42
 mkdir -p "$D/o/candidates.txt" # a DIRECTORY where the queue file must be
 rf "$D" refresh
-[ "$RC" -eq 1 ] && ok "queue unwritable: rc=1 (TRANSIENT — loud, and no permanent marker)" \
-               || bad "queue unwritable: rc=$RC (want 1) — output: $OUT"
+# ⛔ rc=3, NOT rc=1 (review E-P2, cycle 5). A `candidates.txt` that is a DIRECTORY cannot be appended
+# to on ANY pass, so the transient code meant a full pre-flight walk every cycle for ever with no
+# `.refresh-blocked` and no reason in `status` — and the fixture below IS that state. The permanent
+# channel is the one that stops the retry; the marker is what the loop greps to record why.
+[ "$RC" -eq 3 ] && ok "queue unwritable: rc=3 (NOT PROVISIONABLE — the retry stops, the reason is named)" \
+               || bad "queue unwritable: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE: cannot queue #42"*) ok "queue unwritable: the refusal carries the marker the loop greps" ;;
+  *) bad "queue unwritable: no NOT PROVISIONABLE marker — output: $OUT" ;;
+esac
 case "$OUT" in
   *"cannot queue #42"*) ok "queue unwritable: the abort names the write that failed AND the issue" ;;
   *) bad "queue unwritable: no refusal — output: $OUT" ;;
@@ -1307,6 +1412,101 @@ case "$OUT" in
   *) bad "rejected credential: the refusal does not name the 401 — output: $OUT" ;;
 esac
 
+# mk_gh_flaky <case-dir> <issue-number> <fail-first-N> — a gh whose `api rate_limit` PROBE call fails
+# the first <fail-first-N> times and SUCCEEDS afterwards (agent-infra#2830). Everything else is
+# `mk_gh_rest`'s answer, so a pass that gets past the probe really enumerates and queues the row.
+# ⛔ The counter lives in the case dir and NOT in the stub's memory: the probe is a separate process
+# per attempt, so a counter that reset per invocation would make every attempt "the first" and the
+# fix untestable.
+mk_gh_flaky() {
+  local d="$1" nums="${2:-}" fails="${3:-1}" rows='[]' n first=1
+  if [ -n "$nums" ]; then
+    rows='['
+    for n in ${nums//,/ }; do
+      [ "$first" -eq 1 ] || rows="$rows,"
+      first=0
+      rows="$rows{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"
+    done
+    rows="$rows]"
+  fi
+  cat > "$d/bin/gh.body" <<SH
+#!/bin/bash
+d="\$(cd "\$(dirname "\$0")" && pwd)"
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*)
+    c=0; [ -f "\$d/.rl-count" ] && c="\$(cat "\$d/.rl-count")"
+    c=\$(( c + 1 )); printf '%s\\n' "\$c" > "\$d/.rl-count"
+    if [ "\$c" -le $fails ]; then
+      echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2
+      exit 1
+    fi
+    printf '%s\\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":4321}}}'
+    ;;
+  *"/pulls?"*) printf '%s\\n' '[]' ;;
+  *"labels=P0-blocker"*) printf '%s\\n' '$rows' ;;
+  *"/issues?"*) printf '[]\\n' ;;
+  *) printf '[]\\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
+  mk_gh_wrapper "$d"
+}
+
+# ── 1l) ONE FLAKY PROBE CALL MUST NOT BLIND THE CYCLE (agent-infra#2830) ────────────────────────
+# MEASURED: `[refresh]` failed on 39% (305/764) of the local box's cycles and 70% (102/145) of
+# pi-cell-4's, and each of those cycles enumerated NOTHING — no candidates, no per-PR rows, no
+# dispatch — because the precondition probe gave up after a SINGLE attempt. Run by hand seconds
+# later, the same call answered rc=0 in 903-1872 ms on the same box (see the issue's table).
+# So the contract is: a first-attempt failure is RETRIED inside the cycle, and only the LAST
+# attempt's verdict counts — the same messages and the same exit code, so the fail-closed polarity
+# is untouched (the second case below pins that half, and it is the half a false PASS would break).
+mk_case probe-flaky-retry
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_flaky "$D" 42 1          # the probe's FIRST call fails, its SECOND answers
+rf "$D" refresh GH_PROBE_ATTEMPTS=3 GH_PROBE_BUDGET=15
+[ "$RC" -eq 0 ] && ok "flaky probe: rc=0 — one failed probe call no longer costs the whole cycle" \
+                || bad "flaky probe: rc=$RC (want 0 — the retry must absorb one failure) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "flaky probe: the cycle still ENUMERATED #42 into the backlog" ;;
+  *) bad "flaky probe: nothing queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# NON-VACUITY, half 1: the retry really ran. A single attempt would leave the counter at 1 (the
+# failing one) and the pass would have exited TRANSIENT before it ever succeeded.
+rl="$(cat "$D/bin/.rl-count" 2>/dev/null || echo 0)"
+[ "${rl:-0}" -ge 2 ] && ok "flaky probe: the probe was RE-TRIED (rate_limit calls=$rl, want >=2)" \
+                     || bad "flaky probe: the probe was not retried (rate_limit calls=$rl, want >=2)"
+case "$OUT" in
+  *TRANSIENT*) bad "flaky probe: the absorbed failure was still reported TRANSIENT — output: $OUT" ;;
+  *) ok "flaky probe: no TRANSIENT verdict once an attempt succeeded" ;;
+esac
+
+# The other arm — EVERY attempt fails. The polarity is the contract: the cycle must still refuse to
+# dispatch, with the same TRANSIENT verdict and exit code it had on one attempt, and it must have
+# SPENT its attempts before giving up (a probe that gives up early is the defect this pins).
+mk_case probe-dead-probe
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_flaky "$D" 42 99         # no attempt ever answers
+echo 99 > "$D/o/candidates.txt"   # a sentinel: "nothing queued" must be discriminating, not empty
+rf "$D" refresh GH_PROBE_ATTEMPTS=3 GH_PROBE_BUDGET=15
+[ "$RC" -eq 1 ] && ok "dead probe: rc=1 (TRANSIENT, unchanged from one attempt — a retry is not a verdict)" \
+               || bad "dead probe: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *TRANSIENT*) ok "dead probe: still reported TRANSIENT (fail-closed, not a swallowed failure)" ;;
+  *) bad "dead probe: no TRANSIENT verdict — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"did not answer with a 401"*) ok "dead probe: the refusal names the API non-answer (the same message)" ;;
+  *) bad "dead probe: the refusal message changed — output: $OUT" ;;
+esac
+rl="$(cat "$D/bin/.rl-count" 2>/dev/null || echo 0)"
+[ "${rl:-0}" -eq 3 ] && ok "dead probe: all 3 attempts were spent before giving up (rate_limit calls=$rl)" \
+                     || bad "dead probe: gave up after ${rl:-0} attempt(s) (want exactly 3)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "dead probe: DISPATCHED on a failed probe — the polarity is inverted" ;;
+  *) ok "dead probe: nothing was queued (the sentinel is untouched)" ;;
+esac
+
 # ── 1j) A CLEAN THAT IS DEGRADED IS NOT A VERDICT (agent-infra#1853 review P2) ──────────────────
 # The canonical producer never pairs `ALSO INCOMPLETE` with CLEAN, but `resolve_preflight` prefers
 # the repo's OWN copy — so a VENDORED producer could, and a degraded CLEAN counted as usable would
@@ -1432,6 +1632,24 @@ rf "$D" refresh TORTOISE_REPO=
 case "$OUT" in
   *"NOT PROVISIONABLE"*) ok "no tool anywhere: the refusal is LOUD and named" ;;
   *) bad "no tool anywhere: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+# ⛔ THE REFUSAL MUST NAME WHERE IT LOOKED (2026-10-24). "no pre-flight could be resolved" is true of
+# every possible cause, and each cause has a DIFFERENT fix, so an operator reading it has to guess
+# which of the five paths the resolver tried. Pinned: the serviced repo's own copy (scout, then main
+# checkout) AND every tortoise candidate are printed, in resolution order, with no fabricated path.
+case "$OUT" in
+  *"looked for (in this order):"*"$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"*)
+    ok "no tool anywhere: the refusal names the paths it searched, scout copy first" ;;
+  *) bad "no tool anywhere: the refusal does not name the searched paths — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"$D/home/Documents/GitHub/tortoise/tools/collision_preflight.py"*"$D/home/eldato/tortoise/tools/collision_preflight.py"*)
+    ok "no tool anywhere: both conventional tortoise checkouts are named in order" ;;
+  *) bad "no tool anywhere: the tortoise candidates are not both named — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"//tools/collision_preflight.py"*) bad "no tool anywhere: an empty candidate produced a fabricated path" ;;
+  *) ok "no tool anywhere: no fabricated path from an empty variable" ;;
 esac
 case "$OUT" in
   *"uv sync failed"*) bad "no tool anywhere: misreported as a uv failure" ;;
@@ -2998,9 +3216,16 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   "5001 5002 5003 5004 5005 5006 ") ok "slots-before-skip: the six CLEAN candidates filled the window (in tier order) and the pass STOPPED" ;;
   *) bad "slots-before-skip: candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)' (want the six CLEAN ones)" ;;
 esac
-case "$OUT" in
-  *"SKIPPED"*) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(printf '%s\n' "$OUT" | grep -c 'SKIPPED') line(s)" ;;
-  *) ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+# ⛔ THE ASSERTION IS THE WALK'S OWN MARKER, NOT THE WORD `SKIPPED` (review). The reaper prints
+# `[reap] SKIPPED (checked: the live-session list could not be read)` on a box whose session surface
+# cannot answer — and on such a box (CI: no `cmux` for the board's live-session store) this fixture
+# then counted ONE extra "skip line" that has nothing to do with the walk, reddening both arms below
+# while the ORDER they grade was correct. The stop-outranks-walk-past property is about `>#N SKIPPED`
+# lines, so that is what is counted.
+_slot_skip_lines() { printf '%s\n' "$OUT" | grep -cE '^\[refresh\] >#[0-9]+ SKIPPED'; }
+case "$(printf '%s\n' "$OUT" | grep -E '^\[refresh\] >#[0-9]+ SKIPPED')" in
+  "") ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+  *) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(_slot_skip_lines) line(s)" ;;
 esac
 [ "$(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ')" = 6 ] \
   && ok "slots-before-skip: exactly 6 pre-flight runs — the three recorded-held tail candidates cost nothing" \
@@ -3012,7 +3237,7 @@ mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
 _led_seed "$D"
 RF_LIMIT=9 rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-b"
-n_skip_lines="$(printf '%s\n' "$OUT" | grep -c 'SKIPPED')"
+n_skip_lines="$(_slot_skip_lines)"
 [ "${n_skip_lines:-0}" -eq 3 ] && ok "slots-skip-control: with a wider window the ledger walk-past IS reached (3 skip lines) — the assertion above is non-vacuous" \
                             || bad "slots-skip-control: $n_skip_lines skip line(s) with a wide window (want 3) — the previous case proves nothing about the ORDER"
 case "$OUT" in
@@ -3325,7 +3550,13 @@ rf "$D" check
 [ "$RC" -eq 3 ] && ok "--check: a scout worktree with no 'origin' is REFUSED (rc=3)" \
                 || bad "--check: rc=$RC (want 3) — $OUT"
 case "$OUT" in
-  *"no 'origin' remote"*) ok "--check: the refusal names the missing remote" ;;
+  # #1935: with `resolve_repo` in the shipped script, a checkout with NO readable `origin` is refused
+  # one layer EARLIER, by the resolver, and its refusal is the one that names the missing remote. The
+  # arm's intent is unchanged (no-origin is refused, and the reason NAMES it) — only the layer that
+  # answers is. `git remote remove` in a linked worktree edits the SHARED config, so $D/repo loses its
+  # origin too and the resolver cannot prove it against $OR either.
+  *"no readable 'origin' remote"*|*"no 'origin' remote"*)
+    ok "--check: the refusal names the missing remote" ;;
   *) bad "--check: no missing-origin reason — $OUT" ;;
 esac
 
@@ -3389,6 +3620,15 @@ rf "$D" check
                 || bad "--check: rc=$RC (want 0) — $OUT"
 
 # ⛔ COMMITS AHEAD IS A LOCAL QUESTION: the probe must fire without a fetch (review cycle 5, P2).
+# ⛔ AND A CONNECTED COUNT IS NOT AN ATTRIBUTION (#2956 review P2 — the other half of #2174's arm).
+# This arm plants a REAL local commit in a FULL checkout, and until #2956 it pinned a `--check` FAIL
+# reading "PROVEN on this checkout's own graph, so the refresh will refuse to move it". The run path
+# fetches FIRST, and on a STALE `refs/remotes/origin/main` those commits are the TRUNK's, not the
+# scout's — so the FAIL refused what the refresh itself accepts, and `cloud-cell-bringup.sh` `die`s on
+# any non-zero `--check`: a healthy cell could not START. Offline, "N local commits" and "N commits a
+# stale ref has not fetched" are the SAME reading (ahead>0, behind=0, connected), so this mode cannot
+# attribute them and WARNS. What it still refuses is pinned by the arms below (the stale-ref case that
+# made this a P2, and the unrelated history a fetch cannot connect).
 mk_case check-scout-ahead
 rm -rf "$D/repo/.worktrees/dispatch-scout"
 mk_scout_fixture "$D" answering
@@ -3396,20 +3636,146 @@ git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch
 echo '# committed in the scout' >> "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 git -C "$D/repo"/.worktrees/dispatch-scout commit -qam "scout: local commit"
 rf "$D" check
-[ "$RC" -eq 1 ] && ok "--check: commits ahead of origin/main are REFUSED (rc=1) with no network call" \
-                || bad "--check: rc=$RC (want 1) — $OUT"
+[ "$RC" -eq 0 ] && ok "--check: a commit in a FULL checkout WARNS instead of FAILing (rc=0) — the run path fetches before it decides" \
+                || bad "--check: rc=$RC (want 0) — a count it cannot attribute refused a cell start: $OUT"
 case "$OUT" in
-  *"commits that are NOT in origin/main"*) ok "--check: the refusal names the commits the move would orphan" ;;
-  *) bad "--check: no commits-ahead reason — $OUT" ;;
+  *"check: FAIL the scout"*) bad "--check: it FAILs on a count that reads IDENTICALLY for local work and a stale ref — $OUT" ;;
+  *) ok "--check: no 'check: FAIL the scout' line — the false block is gone" ;;
 esac
-# ⛔ THE PREFIX IS A CONTRACT WITH TWO CONSUMERS (review cycle 8, P2): `cloud-cell-supervisor.sh` and
-# `cloud-cell-bringup.sh` match `*"TRANSIENT: scout"*` to choose their diagnosis, and nothing pinned
-# that literal — so an edit to either side left the suite green while the operator got the wrong
-# remedy (which is exactly how the match became unreachable once already).
 case "$OUT" in
-  *"TRANSIENT: scout"*) ok "--check: the transient scout refusal carries the prefix the two consumers match on" ;;
-  *) bad "--check: no 'TRANSIENT: scout' prefix — the consumers would print the generic remedy — $OUT" ;;
+  # The count must still be REPORTED (the reading is downgraded, not dropped) and the verdict must be
+  # NAMED, so an operator can see which kind the count may be.
+  *"carries 1 commit(s)"*"local-or-unfetched"*) ok "--check: the WARN still carries the COUNT and names the verdict" ;;
+  *) bad "--check: the WARN drops the count or the verdict — $OUT" ;;
 esac
+case "$OUT" in
+  *"LOCAL commit(s)"*"STALE tracking ref"*) ok "--check: it names BOTH readings, so the operator is not told one is proven" ;;
+  *) bad "--check: the WARN names only one reading — $OUT" ;;
+esac
+
+# ── (p0-p1) THE STALE TRACKING REF: a CLEAN scout at the trunk's REAL tip, behind a stale ref ──────
+# THE MEASURED SHAPE, and the one the previous arm could not tell from local work: the trunk moved on,
+# this checkout has not fetched since, and the scout is a CLEAN copy of the NEW tip. `origin/main..HEAD`
+# reads 1 — the same number a local commit produces — while the run path's fetch resolves it to `none`.
+# ⛔ THE FIXTURE IS ASSERTED BEFORE THE RUN: every arm here would pass by measuring a tree that never
+# had the shape (a fresh ref reads `none`, and proves nothing about the WARN).
+mk_stale_ref_case() {   # <name> — sets $D, $SD, $STALE_N
+  mk_case "$1"
+  rm -rf "$D/repo/.worktrees/dispatch-scout"
+  mk_scout_fixture "$D" answering
+  git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+  SD="$D/repo/.worktrees/dispatch-scout"
+  git -C "$SD" checkout --quiet -B chore/dispatch-scout origin/main >/dev/null 2>&1
+  STALE_REF="$(git -C "$D/repo" rev-parse refs/remotes/origin/main)"
+  # THE TRUNK MOVES ON: this commit is really pushed to origin/main (the end state is identical whether
+  # another box advanced it or this one did), and only the LOCAL tracking ref is then set back — which
+  # is exactly what "this checkout has not fetched since" means. The tree stays CLEAN: this is not
+  # local work, and that is the whole point.
+  echo '# gate v3 (the trunk moved on)' >> "$SD/tools/collision_preflight.py"
+  git -C "$SD" -c user.email=t@t -c user.name=t commit -qam "gate v3"
+  git -C "$SD" push -q origin HEAD:refs/heads/main
+  git -C "$D/repo" update-ref refs/remotes/origin/main "$STALE_REF"
+  STALE_N="$(git -C "$SD" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null)"
+}
+SD=""; STALE_REF=""; STALE_N=""
+mk_stale_ref_case check-scout-stale-ref
+ck "(p0) the tracking ref IS stale — origin/main's real tip is not refs/remotes/origin/main" \
+    "$([ "$(git -C "$D/repo" ls-remote origin refs/heads/main | cut -f1)" != "$(git -C "$D/repo" rev-parse refs/remotes/origin/main)" ]; echo $?)"
+ck "(p0) the checkout is FULL, not shallow" \
+    "$([ "$(git -C "$D/repo" rev-parse --is-shallow-repository)" != true ]; echo $?)"
+ck "(p0) the histories are CONNECTED (a merge base exists — so this is the 'local' arm's shape)" \
+    "$(git -C "$SD" merge-base HEAD refs/remotes/origin/main >/dev/null 2>&1; echo $?)"
+ck "(p0) the count the guard reads is ${STALE_N} (want >0)" \
+    "$([ "${STALE_N:-0}" -gt 0 ]; echo $?)"
+ck "(p0) the scout tree is CLEAN — the state a cell was refused to START on" \
+    "$([ -z "$(git -C "$SD" status --porcelain --untracked-files=no)" ]; echo $?)"
+rf "$D" check
+ck "(p1) --check does NOT fail a stale-tracking-ref FULL checkout (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+case "$OUT" in
+  *"check: FAIL the scout"*) r=1 ;;
+  *) r=0 ;;
+esac
+ck "(p1) no 'check: FAIL the scout' line — the pre-#2956 false block" "$r"
+case "$OUT" in
+  *"check: WARN the scout"*"STALE tracking ref"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p1) it WARNS and names the stale tracking ref as one of the two readings" "$r"
+case "$OUT" in
+  *"carries ${STALE_N} commit(s)"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p1) the WARN carries the COUNT (${STALE_N}) — the reading is downgraded, not dropped" "$r"
+# ⛔ AND THE RUN PATH AGREES, on the SAME tree: this is the assertion that makes the downgrade right
+# rather than merely quieter. The fetch resolves the count to `none` and the pass proceeds.
+mk_gh_rest "$D" 5151
+rf "$D" refresh
+ck "(p1) the RUN PATH proceeds on that same tree (rc=$RC) — so the old FAIL refused what the refresh accepts" \
+    "$([ "$RC" -eq 0 ]; echo $?)"
+ck "(p1) the run path moved the scout to origin/main's REAL tip (the tracking ref it fetched)" \
+    "$(git -C "$SD" diff --quiet origin/main --; echo $?)"
+case "$OUT" in
+  *"LOCAL commit(s)"*) r=1 ;;
+  *) r=0 ;;
+esac
+ck "(p1) it never claimed these were LOCAL commits (the claim a fetch disproved)" "$r"
+
+# ── (p2) NON-VACUITY: restoring the old `local` verdict turns (p1) RED ───────────────────────────
+# A copy of the SHIPPED script with ONE line reverted — the `noconnect` attribution dropped, so the
+# verdict is `local` for a stale full checkout, exactly as before #2956. Nothing else differs, so a
+# difference in outcome is attributable to the verdict. It ALSO proves the `*)` arm (a verdict this
+# check has no reading for) is live rather than dead code.
+mk_stale_ref_case check-scout-stale-prefix
+MUTP="$T/refresh-noconnect-prefix.sh"
+mut "$MUTP" <<'PY5'
+import sys
+src = open(sys.argv[1]).read()
+needle = "      SCOUT_AHEAD_VERDICT=local-or-unfetched\n"
+if needle not in src:
+    sys.exit("the noconnect verdict is missing — the anchor moved; this control would be vacuous")
+out = src.replace(needle, "      SCOUT_AHEAD_VERDICT=local\n")
+if out == src:
+    sys.exit("the verdict revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
+PY5
+ck "(p2) the pre-#2956 control was actually produced (the noconnect verdict reverted to 'local')" "$([ -s "$MUTP" ]; echo $?)"
+if [ -s "$MUTP" ]; then
+OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUTP" --check 2>&1)"
+RC=$?
+ck "(p2) WITHOUT the fix --check FAILS the stale-tracking-ref checkout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$OUT" in
+  *"check: FAIL the scout"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p2) …and it is a 'check: FAIL the scout' line, so (p1)'s no-FAIL assertion reddens" "$r"
+fi
+
+# ── (p3) AN UNRELATED HISTORY STILL FAILS `--check` — the downgrade is not a blanket one ──────────
+# A count a fetch CANNOT change is still refused: the trunk resolving to a history that shares no
+# ancestor with the scout (an orphan branch / a rewritten trunk) refuses after any fetch, so `--check`
+# must refuse it too. This is also where the `TRANSIENT: scout` consumer contract lives now that the
+# commits-ahead arm above WARNS: `cloud-cell-supervisor.sh` and `cloud-cell-bringup.sh` match that
+# literal to choose their diagnosis, so it must remain pinned by an arm that really prints it.
+mk_case check-scout-unrelated
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+SD="$D/repo/.worktrees/dispatch-scout"
+git -C "$SD" checkout -q --orphan orphan-work
+git -C "$SD" -c user.email=t@t -c user.name=t commit -qm "orphan work"
+rf "$D" check
+ck "(p3) an orphan (unrelated) history is still REFUSED by --check (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$OUT" in
+  *"shares NO common ancestor"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p3) the refusal says a FETCH cannot connect it — the reason the FAIL survives the downgrade" "$r"
+case "$OUT" in
+  *"TRANSIENT: scout"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p3) the transient scout refusal carries the prefix the two consumers match on" "$r"
 
 # ⛔ THE UNTRACKED-GATE ARM: it sat ABOVE `resolve_preflight` once, where `PREFLIGHT` is empty, so it
 # could never fire and `--check` certified a tree whose every pass returns rc=3 (review cycle 4, P0).
@@ -3470,7 +3836,10 @@ rf "$D" refresh TOOL_LOG="$D/tool.log"
 [ "$RC" -eq 1 ] && ok "scout-ahead: rc=1 TRANSIENT (the operator saves or drops the commit, then re-runs)" \
                 || bad "scout-ahead: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
-  *"commit(s) not in origin/main"*) ok "scout-ahead: the refusal names the commits the move would orphan" ;;
+  # #2953: the wording now says WHICH difference it is — `LOCAL commit(s)` (preserve) vs `commit(s) the
+  # REMOTE-TRACKING REF HAS NOT FETCHED` (fetch). The arm's intent is unchanged: the refusal must NAME
+  # the commits the move would orphan, and for a genuine local commit that is the LOCAL spelling.
+  *"LOCAL commit(s) that origin/main does not have"*) ok "scout-ahead: the refusal names the commits the move would orphan" ;;
   *) bad "scout-ahead: no commits-ahead reason — output: $OUT" ;;
 esac
 [ "$(git -C "$D/repo"/.worktrees/dispatch-scout rev-parse HEAD 2>/dev/null)" = "$ahead" ] \
@@ -3480,7 +3849,628 @@ esac
                      || ok "scout-ahead: the pre-flight never ran"
 
 
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# A SUPPRESSION SURVIVES ONLY WHILE A RE-CHECKABLE FACT HOLDS (agent-infra#2183)
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# THE DEFECT THIS SECTION PROVES, END TO END. `checked.txt` short-circuits the walk BEFORE any network
+# call, so an entry in it is invisible to every later pass — and nothing revalidated it: the only
+# remover walked `dispatched.txt`, a different file. A candidate judged CLEAN but never dispatched was
+# therefore suppressed FOR EVER, and the dispatch line reported it as `N blacklisted (checked)` with
+# no reason recorded anywhere. Measured on cell-1 (2026-10-20): `195 candidates -> 0 queued …` with a
+# large `not reached` bucket and no cause for it.
+#
+# ⛔ THE HEADLINE CASE ASSERTS THAT THE QUEUE FILLS — `candidates.txt` must contain the candidate at
+# the end of a real pass. It is RED on the pre-fix script for the only reason it names (the entry is
+# skipped as checked, so the CLEAN arm is never reached), and it reads its evidence from a STATE
+# ARTIFACT (`state/checked-release`), never from a log line.
+echo; echo "── checked.txt releases only what no re-checkable fact justifies (agent-infra#2183) ──"
+
+mk_case checked-no-keepfact
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"                    # no live lane for 42
+printf '42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "release: the pass succeeds (rc=0)" || bad "release: rc=$RC — output: $OUT"
+if grep -qx 42 "$D/o/candidates.txt" 2>/dev/null; then
+  ok "release: a checked entry with NO keep-fact is RE-JUDGED and the QUEUE FILLS (#42 in candidates.txt)"
+else
+  bad "release: #42 never reached the queue — checked.txt still suppresses it, which is the defect — output: $OUT"
+fi
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *checked_released=1*) ok "release: the funnel records the release (checked_released=1)" ;;
+  *) bad "release: the release was not recorded in the funnel — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+if grep -qx 42 "$D/o/state/checked-release" 2>/dev/null; then
+  ok "release: the released number is published in state/checked-release (the artifact, not a log string)"
+else
+  bad "release: state/checked-release does not name #42 — file: $(cat "$D/o/state/checked-release" 2>/dev/null)"
+fi
+# ⛔ AND THE PASS IS NOT SUPPRESSED FROM ITS OWN RELEASE: after the release the walk pre-flights 42,
+# gets CLEAN and re-appends it to checked.txt — so the end state must ALSO have 42 there. Asserting
+# its ABSENCE would be red on the fixed script too (the CLEAN arm writes it back), which is exactly
+# the "assertion an implementer silently repairs into something weaker" shape this suite avoids.
+grep -qx 42 "$D/o/checked.txt" 2>/dev/null \
+  && ok "release: after being re-judged CLEAN, #42 is checked again (the release is not a permanent un-suppression)" \
+  || bad "release: #42 is absent from checked.txt after a CLEAN re-judge — the write-back is broken"
+
+# ── Control A — a PR head ref is a keep-fact: no release, no re-pre-flight ─────────────────────
+mk_case checked-pr
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42 'fix/42-thing'
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" in
+  *"42 pr "*) ok "pr keep-fact: a checked issue with a PR head ref is kept, and the reason is 'pr'" ;;
+  *) bad "pr keep-fact: 42 was not kept as 'pr' — kept: $(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" ;;
+esac
+grep -qx 42 "$D/o/checked.txt" 2>/dev/null && ok "pr keep-fact: it stays suppressed" \
+  || bad "pr keep-fact: 42 was released although it has a PR"
+[ ! -s "$D/o/candidates.txt" ] && ok "pr keep-fact: nothing was queued (it was never released)" \
+  || bad "pr keep-fact: 42 was queued although its PR exists — candidates: $(tr '\n' ' ' < "$D/o/candidates.txt")"
+
+# ── Control B — still queued is a keep-fact: never re-pre-flighted ─────────────────────────────
+mk_case checked-queued
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+printf '42\n' > "$D/o/candidates.txt"
+TOOL_LOG="$D/tool.log"; export TOOL_LOG
+rf "$D" refresh
+unset TOOL_LOG
+case "$(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" in
+  *"42 queued "*) ok "queued keep-fact: a checked issue still in candidates.txt is kept as 'queued'" ;;
+  *) bad "queued keep-fact: 42 was not kept as 'queued' — kept: $(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" ;;
+esac
+if [ -s "$D/tool.log" ]; then
+  bad "queued keep-fact: the pre-flight ran on a candidate that is already queued — $(tr '\n' ' ' < "$D/tool.log")"
+else
+  ok "queued keep-fact: the pre-flight was NOT re-run (the queue is the keep-fact)"
+fi
+[ "$(grep -cx 42 "$D/o/candidates.txt" 2>/dev/null)" = 1 ] \
+  && ok "queued keep-fact: the queue still holds exactly one #42 (no duplicate)" \
+  || bad "queued keep-fact: candidates.txt holds $(grep -cx 42 "$D/o/candidates.txt" 2>/dev/null) copies of 42"
+
+# ── Control C — a live lane-N is a keep-fact ───────────────────────────────────────────────────
+mk_case checked-lane
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D" 42
+printf '42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" in
+  *"42 lane "*) ok "lane keep-fact: a checked issue with a live lane-42 is kept as 'lane'" ;;
+  *) bad "lane keep-fact: 42 was not kept as 'lane' — kept: $(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" ;;
+esac
+
+# ── Control D — a LIVE cross-box claim is a keep-fact (the one fact that is not local) ─────────
+mk_case checked-claim
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+mk_issue_claim "$D" 42 3600 || bad "claimed keep-fact: could not seed the peer claim"
+rf "$D" refresh
+case "$(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" in
+  *"42 claim "*) ok "claim keep-fact: an issue a peer holds is kept as 'claim'" ;;
+  *) bad "claim keep-fact: 42 was not kept as 'claim' — kept: $(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" ;;
+esac
+grep -qx 42 "$D/o/checked.txt" 2>/dev/null && ok "claim keep-fact: it stays suppressed" \
+  || bad "claim keep-fact: 42 was released although a peer holds it"
+
+# ── Control E — an UNANSWERABLE registry keeps and COUNTS, never releases ──────────────────────
+mk_case checked-claim-unknown
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+mk_git_fail "$D"
+rf "$D" refresh
+case "$(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" in
+  *"42 claim-unknown "*) ok "unanswerable registry: the entry is kept as 'claim-unknown' (never released on a guess)" ;;
+  *) bad "unanswerable registry: 42 was not kept as 'claim-unknown' — kept: $(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" ;;
+esac
+grep -q 'unjustified=1' "$D/o/state/checked-reap" 2>/dev/null \
+  && ok "unanswerable registry: the suppression is COUNTED as unjustified=1 (a measured non-zero, not silence)" \
+  || bad "unanswerable registry: state/checked-reap does not report unjustified=1 — $(cat "$D/o/state/checked-reap" 2>/dev/null)"
+
+# ── Control F — an unreadable `.pr_brs` releases NOTHING, and a STALE candidate list is inert ──
+mk_case checked-no-prlist
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+mkdir -p "$D/o/state"
+printf '42\n' > "$D/o/state/checked-release-candidates"   # a PREVIOUS pass's candidate list
+cat > "$D/bin/gh.body" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  *"/pulls?"*) echo 'HTTP 500' >&2; exit 1 ;;          # the read FAILED, which is not "no PRs"
+  *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;;
+  *"/issues?"*) printf '[]\n' ;;
+  *) printf '[]\n' ;;
+esac
+SH
+chmod +x "$D/bin/gh.body"; mk_gh_wrapper "$D"
+rf "$D" refresh
+grep -qx 42 "$D/o/checked.txt" 2>/dev/null \
+  && ok "no PR listing: checked.txt is untouched (an unreadable listing releases nothing, #1705 polarity)" \
+  || bad "no PR listing: 42 was released although the PR listing could not be read"
+grep -q 'SKIPPED' <<<"$OUT" && ok "no PR listing: the pass says it skipped the classification" \
+  || bad "no PR listing: the skip is not reported — output: $OUT"
+[ ! -s "$D/o/candidates.txt" ] && ok "no PR listing: nothing was queued" \
+  || bad "no PR listing: something was queued — $(tr '\n' ' ' < "$D/o/candidates.txt")"
+
+# ── Control G — no registry installed: the documented LOUD fallback still releases ─────────────
+mk_case checked-no-registry
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+rm -f "$D/o/claims.sh"
+rf "$D" refresh
+grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
+  && ok "no registry: the documented fallback releases on local facts and the queue fills" \
+  || bad "no registry: nothing was queued although no registry exists to hold it — output: $OUT"
+case "$OUT" in
+  *"claim registry"*"NOT INSTALLED"*) ok "no registry: the fallback is LOUD (it names the missing registry)" ;;
+  *) bad "no registry: the fallback released silently — output: $OUT" ;;
+esac
+# ⛔ AND THE RECORD SAYS WHICH CHECK WAS MISSING (review). The fallback sets
+# `CHECKED_REFUSED=claim-registry-absent` so the dispatch line can distinguish a release made WITHOUT
+# the cross-box claim read from a fully claim-checked one — and until this assertion existed, nothing
+# wrote that value into `state/checked-reap` and the funnel's reader re-initialised it from there, so
+# the funnel published `checked_refused=none` for the one release that skipped the claim check. A
+# passing assertion here is the only thing that keeps the assignment from going dead again.
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *checked_refused=claim-registry-absent*) ok "no registry: the funnel records WHY the release skipped the claim read (checked_refused=claim-registry-absent)" ;;
+  *) bad "no registry: the funnel says checked_refused=$(sed -n 's/.*checked_refused=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a release made without the claim read is then indistinguishable from a claim-checked one" ;;
+esac
+
+# ── Control H — the release cap defers, and the CURSOR rotates past a permanently-held head ────
+# ⛔ TWO FIXTURES, because they prove different things and the first CANNOT prove the second: after a
+# deferral pass the released entries have LEFT checked.txt, so the next pass has too few candidates for
+# the cap to bind and even a missing cursor passes. The rotation fixture therefore holds the HEAD with
+# live claims (a claim is not a local keep-fact, so those entries stay candidates every pass).
+mk_case checked-cap
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 8,9,10,11
+mk_tmux "$D"
+printf '8\n9\n10\n11\n' > "$D/o/checked.txt"
+mk_issue_claim "$D" 8 3600 || bad "rotation: could not claim #8"
+mk_issue_claim "$D" 9 3600 || bad "rotation: could not claim #9"
+CHECKED_RELEASE_MAX=2 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=2 unjustified=0"*) ok "rotation pass 1: both asks are spent on the held head, so 0 released and 2 deferred" ;;
+  *) bad "rotation pass 1: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=0 deferred=2 unjustified=0)" ;;
+esac
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *skipped_checked_deferred=2*) ok "rotation pass 1: the WALK derives reason 'deferred' (skipped_checked_deferred=2) — the map is complete" ;;
+  *) bad "rotation pass 1: the walk did not derive the deferred reason — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *skipped_checked_claim=2*) ok "rotation pass 1: the walk derives reason 'claim' for the two held heads" ;;
+  *) bad "rotation pass 1: the claim reason was not derived — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+CHECKED_RELEASE_MAX=2 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=2 "*) ok "rotation pass 2: the cursor moved PAST the permanently-held head and released the tail" ;;
+  *) bad "rotation pass 2: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=2 — without the cursor the same two heads are re-asked for ever)" ;;
+esac
+for n in 10 11; do
+  grep -qx "$n" "$D/o/candidates.txt" 2>/dev/null || bad "rotation pass 2: #$n was released but not queued"
+done
+grep -qx 10 "$D/o/candidates.txt" 2>/dev/null && ok "rotation pass 2: the released tail reached the queue" \
+  || bad "rotation pass 2: candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt")'"
+
+# ── Control I — the cursor must WRAP past its own maximum, never freeze on it ──────────────────
+# ⛔ THE DEFECT THIS PINS (review P1). Storing the cursor as the numeric MAXIMUM froze the ring the
+# moment it reached the largest candidate: every later ask is smaller, so pass 1 always asked
+# nothing, pass 2 always re-asked the SAME first MAX entries, and everything beyond them was never
+# asked again — a suppression whose release no pass could ever re-check, i.e. #2183's own defect
+# re-created by its fix. Control H cannot see it (there the cursor is merely advanced, and the
+# entries beyond it are asked in the very next pass), so this fixture SEEDS the frozen state: the
+# cursor already sits on the maximum (11) while three held heads and one releasable tail remain.
+mk_case checked-cursor-rotate
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 8,9,10,11
+mk_tmux "$D"
+printf '8\n9\n10\n11\n' > "$D/o/checked.txt"
+mkdir -p "$D/o/state"
+printf '11\n' > "$D/o/state/checked-release-cursor"   # as if a previous pass had ended on the maximum
+mk_issue_claim "$D" 8 3600 || bad "cursor rotation: could not claim #8"
+mk_issue_claim "$D" 9 3600 || bad "cursor rotation: could not claim #9"
+mk_issue_claim "$D" 10 3600 || bad "cursor rotation: could not claim #10"
+CHECKED_RELEASE_MAX=2 rf "$D" refresh
+case "$(tr -dc '0-9' < "$D/o/state/checked-release-cursor" 2>/dev/null)" in
+  9) ok "cursor rotation pass 1: the cursor WRAPPED (11 -> 9) instead of freezing at the maximum" ;;
+  *) bad "cursor rotation pass 1: cursor is '$(cat "$D/o/state/checked-release-cursor" 2>/dev/null)' (want 9 — a frozen 11 means the entries past it are never asked again)" ;;
+esac
+CHECKED_RELEASE_MAX=2 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=1 "*) ok "cursor rotation pass 2: the entry BEYOND the old maximum (#11) was finally asked and released" ;;
+  *) bad "cursor rotation pass 2: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=1 — a frozen cursor never asks #11 again)" ;;
+esac
+grep -qx 11 "$D/o/candidates.txt" 2>/dev/null \
+  && ok "cursor rotation pass 2: the released entry reached the queue (the queue can fill again)" \
+  || bad "cursor rotation pass 2: #11 was released but not queued — candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt")'"
+
+# ── Control I-bis — the ring must keep ROTATING after it reaches the maximum ────────────────────
+# ⛔ THE DEFECT THIS PINS, ACROSS PASSES (review P1, #2183 — reported independently by all three
+# reviewers). Control I seeds a saturated cursor and needs one pass to escape it; it therefore checks
+# that the cursor WRAPS, not that the ring keeps going afterwards. The failure that survives a
+# one-pass fixture is the STEADY STATE: once the cursor has walked off the end of the list, the
+# forward half is empty on every later pass, so a cursor stored as the numeric maximum re-asks the
+# numerically SMALLEST `MAX` entries for ever. Band 2 (asked once, long ago) is then never re-asked —
+# and a claim is a LEASE: the holder finishes, the lease lapses, `checked.txt` still suppresses the
+# entry, and no pass ever looks again. That is #2183's own defect, one layer down.
+# The fixture is the one that can SEE it: two bands of held entries (band 1 = 8,9; band 2 = 10,11)
+# plus a releasable tail (12,13), `MAX=2`, five passes. Band 2's claims are DELETED after pass 3, so
+# from then on the entries are free and the only pass that can queue them is the one that re-asks
+# band 2. A frozen cursor re-asks band 1 for ever and the queue stays empty.
+mk_case checked-ring-rotates
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 8,9,10,11,12,13
+mk_tmux "$D"
+printf '8\n9\n10\n11\n12\n13\n' > "$D/o/checked.txt"
+for n in 8 9 10 11; do
+  mk_issue_claim "$D" "$n" 3600 || bad "ring rotation: could not claim #$n"
+done
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 1 asks band 1 (held)        -> cursor 9
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 2 asks band 2 (held)        -> cursor 11
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 3 asks the tail (free)      -> releases 2, cursor 13
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=2 "*) ok "ring rotation pass 3: the releasable tail was reached and released" ;;
+  *) bad "ring rotation pass 3: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=2)" ;;
+esac
+# the holders of band 2 finish and let go — the entries are free from here on
+git -C "$D/repo" push -q origin :refs/claims/issue-10 2>/dev/null || bad "ring rotation: could not drop the claim on #10"
+git -C "$D/repo" push -q origin :refs/claims/issue-11 2>/dev/null || bad "ring rotation: could not drop the claim on #11"
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 4 wraps to band 1 (still held) -> cursor 9
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 5 asks band 2 again: the ONLY pass that can free it
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=2 "*) ok "ring rotation pass 5: band 2 was RE-ASKED after the ring wrapped, and its freed entries were released" ;;
+  *) bad "ring rotation pass 5: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=2 — a cursor on the numeric maximum re-asks band 1 for ever, so band 2's lapsed claims are never noticed)" ;;
+esac
+for n in 10 11; do
+  grep -qx "$n" "$D/o/candidates.txt" 2>/dev/null \
+    && ok "ring rotation pass 5: #$n reached the queue (a released suppression that never queues is not a release)" \
+    || bad "ring rotation pass 5: #$n was released but never queued — candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt")'"
+done
+
+# ── Control J — an UNCREATABLE decision file is not "nothing was deferred" ───────────
+# ⛔ `awk 'NR==FNR{...}'` treats the FIRST record of the SECOND file as first-file input whenever the
+# first file is EMPTY, so with no decision lines the whole candidate list was consumed as if it were
+# the decision file and nothing was written: the pass published `deferred=0` while both entries had
+# never been asked, and the walk then counted them as `unknown`. The sum still closed, so
+# `reason_conflict` could not fire — an unasked entry reported as a measured zero.
+# ⛔ THE ROUTE IS A FAILED `mktemp`, NOT `CHECKED_RELEASE_MAX=0` (a claim-checked correction): the
+# cap coerces `0` to 24 at the top of the block ("a silent disable wearing the shape of a
+# measurement"), so a zero cap can never empty the decision file. `mk_mktemp_fail` reaches the state
+# the only way it is reachable — the release sort cannot be created, so no ask is made.
+# ⛔ AND THE ROWS ARE `unknown`, NOT `deferred`, WITH `sort_failed=1` (review E-P2, cycle 3). A failed
+# `mktemp`/`sort` used to land every candidate in `deferred`, which the operator line renders as
+# "CHECKED_RELEASE_MAX is too small for this cell" — the one knob that cannot help a release that never
+# ran. Both halves are asserted: the record names the sort, and the rows say `unknown`.
+mk_case checked-zero-decisions
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42,43
+mk_tmux "$D"
+mk_mktemp_fail "$D" ck-sorted
+printf '42\n43\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  # ⛔ `refused=` SITS BETWEEN `unjustified=` AND `sort_failed=` (review): the no-registry fallback's
+  # slug is published in this record, and this assertion pins the FIELD SET as well as the values — an
+  # exact match here is what keeps a future key from being added to the record without a reader.
+  "released=0 deferred=0 unjustified=0 refused=none sort_failed=1"*) ok "failed sort: the record says the RELEASE DID NOT RUN, not that the cap deferred anything" ;;
+  *) bad "failed sort: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want sort_failed=1 and no 'deferred' count — 'deferred=2' names the cap as the cause of a release that never ran)" ;;
+esac
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *skipped_checked_unknown=2*) ok "failed sort: the walk derives 'unknown' for both (they were never asked, so 'deferred' would promise a release)" ;;
+  *) bad "failed sort: the walk did not derive 'unknown' for both — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+case "$OUT" in
+  *"the checked release did NOT run this pass"*) ok "failed sort: the pass SAYS the release did not run" ;;
+  *) bad "failed sort: the failure is silent in the log — output: $OUT" ;;
+esac
+# the empty-decision arm must still not DROP the list when the release did run but asked nothing
+# (reachable when every published row is unparseable: `continue` in the ask loop, no decision lines)
+mk_case checked-empty-decisions
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42,43
+mk_tmux "$D"
+printf 'nonsense\nworse\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=0 unjustified=0 refused=none sort_failed=0"*) ok "empty decision file: nothing was claimed as deferred or released (an unparseable row cannot be asked)" ;;
+  *) bad "empty decision file: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=0 deferred=0 — a non-zero deferred would claim a later pass could ask a row that is not an issue number)" ;;
+esac
+
+# ── Control K — an UNDECODABLE listing must not abort every pass ───────────────────────────────
+# ⛔ THE DEFECT THIS PINS (review B-P2, cycle 2). `lines()` opened each listing with no error
+# handling, so ONE non-UTF-8 byte in `dispatched.txt`/`.pr_brs`/`.open_iss`/`checked.txt` raised out of
+# the reap heredoc; `reap_rc` then aborted the pass with EXIT_TRANSIENT on EVERY pass — a permanent
+# no-dispatch loop that presents as a RUNNING cell, which is the class #2183 exists to remove. The
+# trigger is ordinary data (a git ref name may legally carry bytes >= 0x80, and `.pr_brs` is built from
+# gh's `.[]|.head.ref`). The assertion is END TO END: the pass still runs and a candidate still reaches
+# the queue, which is the only thing that proves the abandon was contained.
+mk_case checked-undecodable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mk_tmux "$D"
+printf '5150\n\377broken\n' > "$D/o/dispatched.txt"    # invalid UTF-8: 0xff
+rf "$D" refresh
+case "$RC" in
+  0) ok "undecodable listing: the pass still EXITS 0 instead of aborting every cycle" ;;
+  *) bad "undecodable listing: the pass exited rc=$RC — one bad byte in dispatched.txt aborts the refresh for ever (output: $OUT)" ;;
+esac
+case "$OUT" in
+  *"dispatched.txt unreadable"*) ok "undecodable listing: the reap NAMES the unreadable listing instead of treating it as empty" ;;
+  *) bad "undecodable listing: the reap did not name the unreadable blacklist — output: $OUT" ;;
+esac
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=0 unjustified=-"*) ok "undecodable listing: the checked classification REFUSED (unjustified=-) rather than releasing on a file it could not read" ;;
+  *) bad "undecodable listing: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want a refusal: an unreadable blacklist is not an empty one)" ;;
+esac
+# ⛔ AND THE BLACKLIST IS UNTOUCHED. The first cut of this fix substituted an empty row list and let the
+# reap run, which REWROTE `dispatched.txt` as empty — silent destruction of the one fact that prevents a
+# duplicate lane, hidden behind a refusal that only looked right because the next reader saw a healthy
+# empty file. Byte equality is the only assertion that can tell "skipped" from "emptied".
+[ "$(wc -c < "$D/o/dispatched.txt" | tr -d ' ')" = "$(printf '5150\n\377broken\n' | wc -c | tr -d ' ')" ] \
+  && ok "undecodable listing: the unreadable blacklist was NOT rewritten (still $(wc -c < "$D/o/dispatched.txt" | tr -d ' ') bytes)" \
+  || bad "undecodable listing: dispatched.txt is now $(wc -c < "$D/o/dispatched.txt" | tr -d ' ') bytes — the reap emptied a file it could not read, destroying every blacklist entry"
+grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
+  && ok "undecodable listing: the pool still reached the queue (the abandon was contained to the reap)" \
+  || bad "undecodable listing: nothing was queued although the pool was readable — candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'"
+
+# ── Control L — a POISONED cursor must reset, not stall the ring for ever ───────────────────────
+# ⛔ THE DEFECT THIS PINS (review E-P2, cycle 2). The cursor was read with `tr -dc '0-9'`, so a file
+# holding TWO stamps produced a 20-digit value for which BOTH ring comparisons error to FALSE: pass 1
+# skipped every entry, pass 2 skipped every entry, nothing was asked, and the poisoned value was
+# re-persisted unchanged — a permanent stall that reported `unjustified=0`. A cursor this reader cannot
+# compare has to be reset to the one value it can defend: the head of the list.
+mk_case checked-poisoned-cursor
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 8,9,10
+mk_tmux "$D"
+printf '8\n9\n10\n' > "$D/o/checked.txt"
+mkdir -p "$D/o/state"
+# ⛔ THREE stamps, not two (review B-P2, cycle 5): a 20-digit value was still inside an ENUMERATED
+# 7..20 clamp, so the fixture could not see the hole ABOVE the list — and one more stamp moves a real
+# cursor into it. An issue number this harness can compare is 1..6 digits.
+printf '1712345678 1712345678 1712345678\n' > "$D/o/state/checked-release-cursor"
+CHECKED_RELEASE_MAX=3 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=3 "*) ok "poisoned cursor: the rotation restarted at the head and asked every entry" ;;
+  *) bad "poisoned cursor: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=3 — an incomparable cursor silently asks NOTHING and re-persists itself)" ;;
+esac
+case "$(tr -dc '0-9' < "$D/o/state/checked-release-cursor" 2>/dev/null | wc -c | tr -d ' ')" in
+  1|2|3) ok "poisoned cursor: the persisted cursor is a comparable issue number again" ;;
+  *) bad "poisoned cursor: the file still holds '$(cat "$D/o/state/checked-release-cursor" 2>/dev/null)' — the next pass would stall the same way" ;;
+esac
+
+# ── Control M — a cap past intmax must NOT disarm the bound ────────────────────────────────────
+# ⛔ THE DEFECT THIS PINS (review B-P3 / E-P3, cycle 2). The validator admitted any all-digit value, but
+# `[ "$_ck_asked" -ge 99999999999999999999 ]` errors to FALSE, so the cap never bound and every
+# candidate was asked in one pass — the same "an errored test is FALSE, and FALSE opens the gate" shape
+# the non-numeric guard had just closed. 26 free candidates with a huge cap must still spend exactly the
+# default 24 asks and DEFER the two it did not reach.
+mk_case checked-cap-overflow
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" $(seq -s, 8 33)
+mk_tmux "$D"
+seq 8 33 > "$D/o/checked.txt"
+CHECKED_RELEASE_MAX=99999999999999999999 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=24 deferred=2 "*) ok "cap overflow: the default 24 still binds (24 asked, 2 deferred)" ;;
+  *) bad "cap overflow: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=24 deferred=2 — 'released=26 deferred=0' means the cap was disarmed by an out-of-range value)" ;;
+esac
+
+# ── Control N — an UNANSWERABLE session list is not "no lanes" ─────────────────────────────────
+# ⛔ THE DEFECT THIS PINS (review E-P3, cycle 2). `tmux ls`'s exit status was discarded and every failure
+# collapsed into an empty string, which silently REMOVED the `lane` keep fact — moving a live lane toward
+# release, the duplicate-dispatch direction. Two readings are benign and named explicitly (no tmux
+# binary; tmux's own "no server running"); anything else must refuse the classification, exactly like an
+# unreadable `.pr_brs`.
+mk_case checked-tmux-unreadable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mkdir -p "$D/bin"
+cat > "$D/bin/tmux" <<'SH'
+#!/bin/bash
+echo "error connecting to /private/tmp/tmux-501/default (Permission denied)" >&2
+exit 1
+SH
+chmod +x "$D/bin/tmux"
+printf '42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=0 unjustified=-"*) ok "unanswerable tmux: the classification REFUSED rather than freeing entries on a missing lane fact" ;;
+  *) bad "unanswerable tmux: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want a refusal — an unreadable session list must not read as 'no lanes')" ;;
+esac
+case "$OUT" in
+  *"live-session list could not be read"*) ok "unanswerable tmux: the refusal names the session list" ;;
+  *) bad "unanswerable tmux: the refusal is silent about its cause — output: $OUT" ;;
+esac
+
+# ── the UNUSABLE SURFACE: parsed from the producer, never guessed, never 'none' on a failure ───
+# ⛔ The point is the P0's own question: on cell-1 the line said `12 unjudged (pre-flight)` and
+# nothing said whether that was ONE broken surface or twelve unrelated faults. The producer already
+# prints which; the funnel must carry it, and the `ADVISORY SURFACES` block must never be mistaken
+# for a failure (that would name a surface that is fine).
+mk_case unusable-surface
+mk_tool_surface "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" "INCOMPLETE" "issue assignee/holder"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+rf "$D" refresh
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *"unusable=issue-assignee-holder:1"*) ok "unusable surface: the funnel names the surface the PRODUCER reported" ;;
+  *) bad "unusable surface: funnel says unusable=$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) (want issue-assignee-holder:1)" ;;
+esac
+case "$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  "issue-assignee-holder:1")
+    ok "unusable surface: an ADVISORY surface is never counted as a failure (the field is EXACTLY the failing surface)" ;;
+  *)
+    # ⛔ THIS IS AN EXACT-FIELD ASSERTION ON PURPOSE (review P2, #2183). The previous form matched the
+    # substring `*open-prs*`, and the slug preserved the producer's casing (`[open PRs]` ->
+    # `open-PRs`), so a leak rendered `...,open-PRs:1` and the case still printed `ok`: the property
+    # was UNASSERTED. MUTATION THAT PROVES IT NOW FIRES: let the parser start at `ADVISORY SURFACES`
+    # too (`/^(INCOMPLETE|ADVISORY) SURFACES/ { ins = 1 }`) -> the field becomes
+    # `issue-assignee-holder:1,open-prs:1` and this case reddens.
+    bad "unusable surface: the field names more than the failing surface (an ADVISORY block leaked, or the slug is not canonical): $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+case "$OUT" in
+  *"1 of 1 pre-flight run(s) unusable — surface(s): issue-assignee-holder:1"*) ok "unusable surface: ONE aggregate line names it (the per-candidate line alone scrolls away)" ;;
+  *) bad "unusable surface: the aggregate line is missing or unnamed — output: $OUT" ;;
+esac
+mk_case unusable-novblock
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: INCOMPLETE")
+print("the producer printed no machine-readable surfaces block")
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+rf "$D" refresh
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *"unusable=unknown:1"*) ok "unusable surface: a run with NO block is 'unknown', never 'none' (a parse failure is not a clean reading)" ;;
+  *) bad "unusable surface: an unparsed block produced unusable=$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) (want unknown:1)" ;;
+esac
+mk_case unusable-verdict
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: SOMETHING_NEW")
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *"unusable=unrecognised-verdict:1"*) ok "unusable surface: a VERDICT this reader does not know is its OWN cause, not 'no verdict'" ;;
+  *) bad "unusable surface: an unrecognised verdict produced unusable=$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) (want unrecognised-verdict:1)" ;;
+esac
+
 echo
+# ── Control O — a row that is NOT a comparable issue number is `unknown`, never `deferred` ─────
+# ⛔ THE DEFECT THIS PINS (review B-P3, cycle 3). A 30-digit row passes the digit gate and then makes
+# BOTH ring comparisons error to FALSE (`integer expression expected`), so no pass can ever ask it. The
+# sweep called it `deferred`, which the operator line renders as "raise CHECKED_RELEASE_MAX" — an
+# instruction about a knob that cannot help. It is `unknown`, and the reader must not name the cap.
+mk_case checked-unaskable-row
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mk_tmux "$D"
+printf '42\n999999999999999999999999999999\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=1 deferred=0"*"sort_failed=0"*) ok "unaskable row: the real candidate was released and nothing was claimed as deferred" ;;
+  *) bad "unaskable row: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=1 deferred=0 — 'deferred=1' claims a later pass could ask a number no comparison can read)" ;;
+esac
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *checked_deferred=0*) ok "unaskable row: the funnel publishes deferred=0, so the reader cannot name the cap" ;;
+  *) bad "unaskable row: the funnel published a deferred residue for a row that can never be asked — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+
+# ── Control P — an unwritable state/ is PERMANENT, and says so with the marker ────────────────
+# ⛔ THE FIX THIS GRADES WAS ONCE CLAIMED AND ABSENT (review A-P3, cycle 5): rc=3 only populates
+# `.refresh-blocked` through `grep 'NOT PROVISIONABLE'` over the log tail, so a rc=3 refusal WITHOUT the
+# marker gives the operator a merge-only block whose "Reason and evidence" section is empty and whose
+# remedy list names unrelated settings. The other read-only fixture chmods `$O` itself and takes the
+# `$O` probe's rc=1 arm, so nothing graded THIS arm.
+mk_case readonly-state
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 77
+rf "$D" refresh                                    # a healthy first run, so state/ exists
+chmod a-w "$D/o/state"                             # $O stays writable: ONLY state/ refuses
+rf "$D" refresh
+chmod u+w "$D/o/state" 2>/dev/null || true
+[ "$RC" -eq 3 ] && ok "read-only state/: rc=3 (NOT PROVISIONABLE — the retry stops)" \
+              || bad "read-only state/: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE: "*"is not WRITABLE"*) ok "read-only state/: the refusal carries the marker the loop greps for .refresh-blocked" ;;
+  *) bad "read-only state/: no NOT PROVISIONABLE marker — the operator's durable record would be a merge-only block with an empty reason — output: $OUT" ;;
+esac
+
+# ── Control Q — a DUPLICATED checked.txt row is asked, spent and counted ONCE ─────────────────
+# ⛔ `sort -n` (not `-nu`) asks a repeated row twice, spends two slots of the release cap, and makes
+# `checked_released=` report two releases for one entry — the number the operator reads as "how many
+# suppressions were cleared". The duplicate is reachable: the walk appends to `checked.txt` with no
+# duplicate guard.
+mk_case checked-duplicate-row
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mk_tmux "$D"
+printf '42\n42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=1 "*) ok "duplicate row: one release, one count (a repeated row does not spend two slots)" ;;
+  *) bad "duplicate row: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=1 — 'released=2' reports one entry twice and burns release capacity)" ;;
+esac
+
+# ── Control R — TWO failing surfaces are BOTH named (the count is not allowed to hide the second) ──
+# ⛔ THE FUNNEL VALUE IS ONE WHITESPACE-TOKENISED `key=value` FIELD, so a SPACE-joined summary
+# (`surface-a:1 surface-b:1`) is read back as `unusable=surface-a:1` plus a stray `surface-b:1` token
+# that matches no key and is DROPPED — the operator then repairs the first surface and the cell keeps
+# failing while the record blames the surface that was already fixed. The documented shape is
+# `<slug>:<n>,…`, and this fixture is what makes the separator a graded property instead of a comment:
+# revert the join to a space and the second surface disappears from the record below.
+mk_case unusable-two-surfaces
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+n = sys.argv[1] if len(sys.argv) > 1 else ""
+surf = "surface-a" if n == "42" else "surface-b"
+print("VERDICT: INCOMPLETE")
+print("INCOMPLETE SURFACES")
+print("  [%s] the stub could not answer" % surf)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" "42,43"
+mk_tmux "$D"
+rf "$D" refresh
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *"unusable=surface-a:1,surface-b:1"*) ok "two surfaces: BOTH are named in the funnel (the separator is a comma, so the reader keeps the second)" ;;
+  *) bad "two surfaces: the funnel says unusable=$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a space-joined summary is truncated by the key=value reader and the second surface is silently dropped" ;;
+esac
+
+# ── Control S — a state record that CANNOT be published is a NAMED abort, not a traceback ────────
+# ⛔ `publish()` is the one write in the reaper block that was unguarded: `open()`/`os.replace()`
+# raising (ENOSPC mid-pass, EACCES, or a DIRECTORY where a state file belongs) escaped the heredoc,
+# made `reap_rc` non-zero and aborted the pass with EXIT_TRANSIENT — on EVERY later pass, i.e. the
+# permanent no-dispatch loop that presents as RUNNING, which is the class this change removes
+# elsewhere. The directory is the deterministic trigger (no full disk needed) and the assertion is the
+# NAMED refusal: revert the guard and this case reddens on the traceback, not on the rc (an uncaught
+# exception exits non-zero too, so rc alone would grade nothing).
+mk_case publish-unlandable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+mkdir -p "$D/o/state/checked-kept"      # a DIRECTORY: os.replace(file, dir) raises, and that is the point
+rf "$D" refresh
+case "$OUT" in
+  *"cannot publish checked-kept"*) ok "unlandable publish: the failure is a NAMED refusal (not a bare traceback)" ;;
+  *) bad "unlandable publish: no named refusal in the log — output: $OUT" ;;
+esac
+case "$OUT" in
+  *Traceback*) bad "unlandable publish: a Python traceback escaped the heredoc — the operator gets a stack trace instead of the cause" ;;
+  *) ok "unlandable publish: nothing escaped as a traceback" ;;
+esac
+[ "$RC" -eq 1 ] && ok "unlandable publish: the pass refuses TRANSIENT (1), the same rc the unguarded write produced" \
+                || bad "unlandable publish: rc=$RC (want 1 — the refusal must not change the retry class)"
+grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
+  && bad "unlandable publish: #42 was queued although no classification could be recorded" \
+  || ok "unlandable publish: nothing was released or queued on a classification that could not be persisted"
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }

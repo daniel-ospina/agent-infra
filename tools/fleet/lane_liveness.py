@@ -63,6 +63,28 @@ still REPORTED as lanes — nothing disappears — and the recency rule below ke
 them out of the issue. A lane with no store record at all is not enumerable
 (there is no session id to probe); reported as a residual in the unit report.
 
+THE POPULATION GAP, NOW DECLARED (#1777)
+---------------------------------------
+The population above is the **cmux population**, and it is the population that
+disappeared *silently*: an ORCHESTRATOR lane runs ``pi -p --no-session``
+(``lane.sh`` / ``fix-one.sh`` / ``merge-one.sh``), so it writes no transcript and
+no store record — it is in no population this report can build, however wide the
+escalation policy. Measured 2026-10-15: this report listed ``lanes=22`` and the
+live ``fix-<pr>`` lane was not among them, while a controller reading the empty
+session grep concluded CLEAN over a live writer. That is the defect class:
+**the surface never declared the read set it could not see**, so its silence read
+as a verdict. ``COVERAGE_GAPS`` (rendered into every report, and carried in
+``--json``) is that declaration, and it is the whole fix *at this layer*.
+
+What is deliberately NOT done here is widening the population: putting the
+process table in it is the defect #1178 exists to remove (a dead lane drops out
+of a live-process-derived population), and a network read from this job would sit
+behind launchd's TCC wall (see below) and be spent on every pass. Orchestrator
+lanes are instead covered by ``tools/fleet/claim_lanes.py``, which reads the
+holder-authored ``refs/claims/<pr>-<sha12>`` registry and supplies the ONE
+verdict function (``liveness.py``) with one more evidence axis — every claim
+verdict is an ABSTENTION, and an absent or unreadable claim is NOT freedom.
+
 THE ESCALATION POLICY
 ---------------------
 Escalate on **``dead``** only. ``wedged``/``idle``/``running-quiet``/``unknown``
@@ -144,7 +166,9 @@ except ImportError as _exc:  # pragma: no cover - env dependent
     sys.stderr.write(
         "lane-liveness: FATAL: cannot import the liveness classifier next to this "
         "driver (%s). The pi-bootstrap farm must copy liveness.py and "
-        "lane_liveness.py together, to ~/.pi/agent/scripts/fleet/ (never the "
+        "lane_liveness.py together — and, since #1777, claim_lanes.py beside "
+        "them (the sibling that reads the ref-claim registry) — to "
+        "~/.pi/agent/scripts/fleet/ (never the "
         "deprecated ~/.pi/agent/tools/, which blocks interactive pi boot, #1277).\n"
         % _exc
     )
@@ -191,6 +215,37 @@ DEAD_ESCALATE_WINDOW_MS = liveness.IDLE_MS
 
 # Report state order: worst first, so a human reading the log sees the signal.
 STATE_ORDER = ("dead", "wedged", "idle", "running-quiet", "unknown")
+
+# THE DECLARED POPULATION GAP (#1777). A report that lists a population without
+# naming what it CANNOT see lets its silence read as "nothing is running" — the
+# exact inference that produced a CLEAN verdict over a live orchestrator fixer on
+# 2026-10-15. These are rendered as a paragraph in every report (and carried in
+# `--json`) so the gap travels with the verdict rather than living in a doc nobody
+# reading the report has open.
+#
+# These strings are authored HERE, statically, and are NOT transcript-derived, so
+# they are rendered verbatim rather than through `_md_cell` (whose escaping
+# exists for values read out of the store/JSONL, #1272).
+COVERAGE_GAPS = (
+    "**Orchestrator lanes are ABSENT FROM THIS POPULATION BY CONSTRUCTION.** "
+    "`lane.sh` / `fix-one.sh` / `merge-one.sh` run `pi -p --no-session`, so they "
+    "write no transcript and no cmux store record — they have no session id to "
+    "enumerate and no JSONL to grow. A lane missing from this report is NOT a lane "
+    "that is not running (#1777).",
+    "**The remedy is not a wider population here.** Adding the process table would "
+    "make a dead lane drop out of the report (#1178), and this job runs behind "
+    "launchd's TCC wall, where a network read is not available every pass. "
+    "`tools/fleet/claim_lanes.py` reads the holder-authored "
+    "`refs/claims/<pr>-<sha12>` registry instead, through the SAME verdict "
+    "function (`liveness.py`): every claim verdict is an ABSTENTION, and an absent "
+    "or unreadable claim is NOT freedom.",
+    "**The harness's local durable state is NOT read here.** "
+    "`~/orchestrator/state/mergeclaim-<PR>.lock`, `fixbail-<PR>-<sha40>`, the "
+    "`fixcount-*` counters and the tmux `lane-*` / `fix-<PR>` sessions are a real "
+    "on-box population, but their layout is unversioned (#1552) and tmux is not "
+    "readable from launchd. Until that is versioned, a local-only lane is "
+    "invisible here — which is a declared gap, not a verdict of freedom.",
+)
 
 LOG_CAP_BYTES = 512 * 1024
 
@@ -452,6 +507,12 @@ def render_report(
         "Population: %s." % (host, len(lanes), summary or "none", population_source)
     )
     lines.append("")
+    # The declaration travels WITH the verdict (#1777): rendered verbatim, because
+    # these strings are repo-authored constants, not transcript-derived values.
+    if COVERAGE_GAPS:
+        lines.append("**Coverage gaps (declared).** Population: the cmux population. "
+                     + " ".join(COVERAGE_GAPS))
+        lines.append("")
     lines.append(
         "Escalation policy: **%s**, and only while the lane is still active "
         "(last activity within %.0fh — the reaper's own idle proof). "
@@ -643,6 +704,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        "escalatable": escalatable(v, ev), **v.to_dict()}
                       for lane, v, ev in pairs],
             "counts": counts,
+            "coverage_gaps": list(COVERAGE_GAPS),
         }, sort_keys=True))
 
     if not dead:
