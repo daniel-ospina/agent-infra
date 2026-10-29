@@ -5976,6 +5976,39 @@ function assembledMergeArgvAfter(scan: ScanTokens, i: number, command: string): 
 }
 
 /**
+ * Does a construct standing in the VERB slot take the ADMIN FLAG **immediately after it, with NO
+ * PR selector at all** — the argv of `gh pr merge --admin`, which merges the CURRENT BRANCH?
+ *
+ * ⛔ WITHOUT THIS ARM THAT SPELLING WAS A FAIL-OPEN, and it was measured at this head (review cycle
+ * 9, P0): `gh pr merge --admin` is a REAL admin merge (`extractMergePrNumber` returns null for it,
+ * and this file's own contract says a null answer must FAIL CLOSED), but every reading of it dropped
+ * out: `assembledMergeArgvAfter` requires a SELECTOR and this shape has none (the first word after
+ * the verb is `--admin`, which `isMergeSelectorToken` rejects), `isGitOp`'s `GH_PR_PATTERN` needs a
+ * literal `gh pr merge` (the verb here is a construct), and the text arm's conjunct
+ * (`hasBareGhWord ∨ MERGE_WORD`) is false because the `gh` word is itself a construct. So
+ * `isGitOp` answered false and the handler returned at `if (!isGitOp(command)) return undefined;`
+ * BEFORE the evidence gate and the registry gate — the gate never ran on a real admin merge.
+ * Measured at `X=gh; ${X} pr $M --admin` (and `"pr"`, `--squash`, `${M}` spellings):
+ * REFUSED at BOTH bases (`78d897fa1`, `04bc1dde`), ADMITTED at the cycle-8 head. A spelling that
+ * both bases refused and this one admits is a regression by this PR's own criterion.
+ *
+ * ⛔ AND IT IS GUARDED BY THE LITERAL `pr` WORD, which is what keeps it from widening the
+ * over-block this PR is about. The SELECTOR requirement is what separates an assembled merge from
+ * the construct RUNS (`node $A $B $C admin`, `git log $A $B $C --author=admin`, the evidence
+ * verifier's `"$PR" "$HEAD"`), and dropping it unguarded would re-open exactly that class: three
+ * consecutive constructs read as `gh`→`pr`→`merge` under the walk's over-approximation. A run has
+ * no literal `pr` in its GROUP slot, so requiring one keeps every one of those rows admitted while
+ * the group word here is the actual `gh pr` group. Measured over the suite: no `notInvocations` row
+ * carries a literal `pr` followed by a construct and a literal `--admin`.
+ */
+function assembledBareAdminAfter(scan: ScanTokens, i: number, command: string): boolean {
+  const verb = shellWordAt(scan, i);
+  if (!isVerbSlotConstruct(scan.tokens[i], verb.word)) return false;
+  const flag = nextWordStart(scan, verb.end + 1);
+  return flag >= 0 && isAdminFlagSlot(shellWordAt(scan, flag).word, command);
+}
+
+/**
  * The walk. `groupFirst` decides which reading wins for a construct at the group stage.
  *
  * ⛔ THE WORD TESTS ARE WHAT BOUND IT, NOT DISTANCE (see `isVerbSlotConstruct`, the ONE definition
@@ -5990,6 +6023,9 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
   const scan = scanTokens(command);
   // 0: looking for the command word, 1: for `pr`, 2: for `merge`.
   let stage = 0;
+  // Did the LITERAL word `pr` take us out of stage 1? Only then may the selector-less arm above
+  // read a construct in the verb slot as a merge (see `assembledBareAdminAfter`).
+  let groupWasLiteralPr = false;
   for (let i = 0; i < scan.tokens.length; i++) {
     const raw = scan.tokens[i];
     const w = shellWord(raw);
@@ -6026,6 +6062,11 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
       // SELECTOR and then the ADMIN flag — which is what separates the assembled merges from the
       // construct RUNS above; see its comment for why a selector alone does not.
       if (isConstructWord && assembledMergeArgvAfter(scan, i, command)) return true;
+      // ⛔ AND A CONSTRUCT VERB WITH NO SELECTOR AT ALL, when the GROUP was the literal `pr`: the
+      // `gh pr merge --admin` spelling (current branch), which had no arm at all — see
+      // `assembledBareAdminAfter`. Guarded by the literal `pr` so a three-construct RUN cannot
+      // reach it (`node $A $B $C admin` has no `pr` in the group slot).
+      if (groupWasLiteralPr && assembledBareAdminAfter(scan, i, command)) return true;
       // A pure-whitespace assignment (`CMD+=' '`) is a SEPARATOR being assembled, not a verb
       // slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge` read as
       // one invocation (measured as a real bypass).
@@ -6033,6 +6074,7 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
       // A word in the verb slot that is not the verb restarts the walk (a command word here can
       // begin a fresh sequence; anything else drops back to looking for one).
       stage = isCommandWord ? 1 : 0;
+      groupWasLiteralPr = false;
       continue;
     }
     if (stage === 1) {
@@ -6043,11 +6085,15 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
         // `$M`, flag = the URL). Nothing is widened: a stage-1 construct is already accepted as a
         // word here, and this only adds the argv reading to it.
         if (isConstructWord && assembledMergeArgvAfter(scan, i, command)) return true;
+        groupWasLiteralPr = verbWord === "pr";
         stage = 2;
         continue;
       }
     }
-    if (isCommandWord) stage = 1;
+    if (isCommandWord) {
+      stage = 1;
+      groupWasLiteralPr = false;
+    }
   }
   return false;
 }
