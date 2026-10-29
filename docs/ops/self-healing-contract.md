@@ -508,6 +508,12 @@ refusal it could not clear says so. **Operator knobs:** `WT_STATE_FREE_FLOOR_MB`
 `WT_STATE_INODE_PCT_FLOOR` (95), `WT_CMUX_SESSION` (`cloud`), `WT_SERVER_TIMEOUT` (10 s),
 `WT_SERVER_ENSURE_ATTEMPTS` (2 — the one recovery bound worth reaching for first),
 `WT_SERVER_ENSURE_SLEEP` (2 s), and `WT_SESSION_RECOVER=0` to disable probing and recovery entirely.
+⛔ `WT_CMUX_SESSION` is a **fixture seam, not a deployment knob**, and the CLI is why: the `server`
+verbs take `--session` but **`cmux layout apply` takes none** (measured on cell-4 2026-10-29 —
+`cmux layout apply --help` lists `--workspace/--name/--cwd/--json` and the create always dials
+`…/cloud.sock`). Set it to anything but `cloud` and the recovery ensures one session while the create
+tries another: the box keeps a stray durable owner and the create still fails. The defaults line up;
+a non-default value does not.
 
 **state.** cell-4: present (`prfix_hits=5`), workers live (2 `fix-*`, 2 `merge-*`).
 
