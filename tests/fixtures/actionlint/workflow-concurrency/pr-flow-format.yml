@@ -1,0 +1,11 @@
+# The same blind split refused a correct `format(...)` expression as a fragment. Quoted commas are
+# content, not separators (#2660 round 8).
+name: PR flow format
+on:
+  pull_request:
+concurrency: {group: "${{ format('{0}-{1}', github.workflow, github.ref) }}", cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
