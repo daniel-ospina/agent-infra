@@ -159,7 +159,8 @@
 #      POOL_PREFIX (default pi-runner-<host>) · RUNNER_START_SETTLE_S (5)
 #      RUNNER_MAX_SKEW_S (120) — the clock-skew bound a retirement is gated on (see `reclaim`)
 #      RUNNER_TMP_MAX_AGE_MIN (1440 = 24 h — the age bound of the per-instance private temp root
-#        `$instance/_tmp`, swept at every start; see agent-infra#7815 above)
+#        `$instance/_tmp`, swept at every START and NEVER on a live listener: mtime age is not a
+#        holder witness, and a self-hosted job may run 5 days; see agent-infra#7815 above)
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act — nothing changed, EXCEPT a registration
 #       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED,
@@ -326,7 +327,7 @@ validate_operands() {
   # effect on a live job is the same. A value below the floor is cannot-measure: nothing swept, and the
   # message names the relation rather than the number.
   if [ "$TMP_MAX_AGE_MIN" -lt "$TMP_MAX_AGE_FLOOR_MIN" ]; then
-    err "cannot-measure why=tmp-max-age-too-small value=${TMP_MAX_AGE_MIN}m floor=${TMP_MAX_AGE_FLOOR_MIN}m (RUNNER_TMP_MAX_AGE_MIN is what \`sweep_tmp_root\` deletes by, and the live-repair arms sweep while jobs may be in flight: a bound below the longest job deletes a RUNNING job's scratch, so it may not go below ${TMP_MAX_AGE_FLOOR_MIN} min — the GitHub-hosted job ceiling; a SELF-HOSTED job may run up to 5 days, so raise it above your longest job rather than lowering it)"; return 2
+    err "cannot-measure why=tmp-max-age-too-small value=${TMP_MAX_AGE_MIN}m floor=${TMP_MAX_AGE_FLOOR_MIN}m (RUNNER_TMP_MAX_AGE_MIN is what \`sweep_tmp_root\` deletes by, and the start path may follow a listener that died MID-JOB: a bound below the longest job deletes a RUNNING job's scratch, so it may not go below ${TMP_MAX_AGE_FLOOR_MIN} min — the GitHub-hosted job ceiling; a SELF-HOSTED job may run up to 5 days, so raise it above your longest job rather than lowering it)"; return 2
   fi
   # ⛔ THE REPO IS AN OPERAND TOO, and it now has TWO consumers: the `gh` token path
   # (`repos/$POOL_REPO/...`) and the registration URL (`https://github.com/$POOL_REPO`). A URL-form or
@@ -1070,17 +1071,23 @@ instance_tmpdir() {
 instance_tmp_root() { printf '%s' "${1%/}/_tmp"; }
 
 # sweep_tmp_root <dir> — keep the STABLE private root from growing without bound.
-# ⛔ THE BOUND IS AGE, NOT SIZE AND NOT "ON EVERY JOB". The claim it rests on is CONDITIONAL and stated
-# as such (#7815 review, N1): an entry older than `$RUNNER_TMP_MAX_AGE_MIN` cannot belong to a job that
-# runs SHORTER than the bound — which is what makes it safe to sweep a directory a live listener is
-# using, and safe on the LIVE-repair arms of `restart` and `reconcile` (they run while jobs may be in
-# flight). It is NOT safe against a job older than the bound: GitHub allows a self-hosted job to run up
-# to 5 days (`docs.github.com/en/actions/reference/limits`), so the bound has to exceed YOUR longest
-# job — `validate_operands` refuses anything below 360 min (the GitHub-hosted ceiling) precisely so the
-# value cannot be a typo-scale number that deletes a live job's scratch, and the operand's own message
-# says to raise it, never lower it, on a long-job box. Nothing in here is ever deleted on mtime ALONE
-# when the sweep cannot enumerate: a failed `find` removes nothing and claims nothing — the only
-# consequence is growth, and the next start retries. Dry runs REPORT, and remove nothing.
+# ⛔ MTIME AGE IS NOT A HOLDER WITNESS, SO THIS NEVER RUNS ON A LIVE LISTENER (review P2-1). The old
+# header claimed that an entry older than `$RUNNER_TMP_MAX_AGE_MIN` "cannot belong to a job that runs
+# SHORTER than the bound", and then swept on the LIVE-repair arms of `restart` and `reconcile`, which run
+# while jobs may be in flight. Read plainly, that sentence licenses deleting the scratch of every job
+# that runs LONGER than the bound — and GitHub allows a self-hosted job to run up to 5 days
+# (`docs.github.com/en/actions/reference/limits`), so on a box carrying the 24 h default a day-old JOB
+# is exactly what the age test matches. `docs/ops/disk-reaper.md` states the doctrine this file was
+# missing: "A live holder is never selected. The witnesses are mechanical and fail closed" — and an age
+# is not a witness. So this is called ONLY from the START path (`ensure_private_tmp` with NO live
+# listener), where the listener is DEAD and the root cannot belong to a running job. The LIVE-repair
+# arms create/verify the root and sweep nothing, and say so (`tmpdir-sweep skipped …`) instead of
+# leaving the operator to assume a sweep happened.
+# ⛔ THE BOUND IS STILL VALIDATED AND STILL FLOORED (`validate_operands`, 360 min): the start path can
+# follow a listener that died MID-JOB, so a typo-scale bound is still not a bound.
+# Nothing here is ever deleted on mtime ALONE when the sweep cannot enumerate: a failed `find` removes
+# nothing and claims nothing — the only consequence is growth, and the next start retries. Dry runs
+# REPORT, and remove nothing.
 # ⛔ THE WALK IS BOUNDED: one explicit start point, `-maxdepth 1` (the root's own entries; the root
 # itself is never a candidate), `-print0` so a name with a newline cannot be split into two deletions.
 sweep_tmp_root() {
@@ -1128,8 +1135,13 @@ tmp_owner_guard() {
   return 0
 }
 
-# ensure_private_tmp <dir> [live_listener_pid] — create (idempotently) and SWEEP the instance's own
-# private temp root, before the listener is exec'd. rc 0 = satisfiable · 2 = cannot-act, nothing started.
+# ensure_private_tmp <dir> [live_listener_pid] — create (idempotently) the instance's own private temp
+# root, and SWEEP it ONLY when no listener is live. rc 0 = satisfiable · 2 = cannot-act, nothing started.
+# ⛔ THE SWEEP IS GATED ON THE HOLDER, NOT ON THE AGE (review P2-1). A live listener's instance may be
+# running a job RIGHT NOW, and there is no witness in this file that can tell a 2-day-old job's scratch
+# from a 2-day-old abandoned file — so on the live arms (`cmd_restart`, `cmd_reconcile`, both of which
+# pass `$LISTENER_PID`) this function creates and verifies and sweeps NOTHING. It says so on stdout, so
+# a pass an operator reads cannot imply a sweep it did not perform.
 # ⛔ THIS IS THE SINGLE DEFINITION, CALLED FROM `ensure_tmpdir` — which `start_listener` (and therefore
 # `add`, `restart` and `reconcile`) and both LIVE-repair arms already go through. So an instance can be
 # DELETED AND RE-CREATED and the isolation comes back with no hand action: `add` re-copies the release
@@ -1170,6 +1182,13 @@ ensure_private_tmp() {
     err "cannot-act why=tmpdir-root-unwritable path=$t — this user needs WRITE and SEARCH (w=$([ -w "$t" ] && echo y || echo n) x=$([ -x "$t" ] && echo y || echo n)) on the instance's private temp root, and every job on it would otherwise die at mktemp"
     return 2
   }
+  # ⛔ NO HOLDER WITNESS ⇒ NO SWEEP (review P2-1). `live_pid` non-empty MEANS a listener is running on
+  # this instance, i.e. a job may be live in `$t` right now; the age bound would then be the only thing
+  # between a >bound job and `rm -rf` of its scratch. Create, verify, and leave the entries alone.
+  if [ -n "$live_pid" ]; then
+    log_line "tmpdir-sweep skipped tmpdir-root=$t reason=live-listener pid=$live_pid (mtime age is not a holder witness, so this pass creates and verifies the root and sweeps nothing; the next START sweeps it)"
+    return 0
+  fi
   sweep_tmp_root "$t"
   return 0
 }

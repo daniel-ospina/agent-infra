@@ -1721,31 +1721,53 @@ assert_dir "$root_a" "and the private temp root is back — with no hand action"
 assert_eq "$(mode_of "$root_a")" "700" "still 0700"
 assert_contains "$(cat "$ISOLOG")" "present $root_a" "and the re-installed listener is exec'd with it"
 
-# ── the STABLE root is BOUNDED: an age sweep at every start, not per-job cleanup ──────────
-# A stable root grows forever; the runner's per-job `_work/_temp` would not. The bound is mtime AGE, so
-# it cannot race a job (whose scratch is minutes old) and it is safe to run on a LIVE instance.
-echo "── private temp root: the age bound sweeps it, and keeps what a job may hold ──"
+# ── the STABLE root is BOUNDED — but ONLY where no job can be live ──────────────────────
+# A stable root grows forever; the runner's per-job `_work/_temp` would not. So it needs a bound — but
+# ⛔ THE BOUND IS AGE, AND AGE IS NOT A HOLDER WITNESS (review P2-1): `find -mmin +1440` on a LIVE
+#   instance matches a >24 h job's scratch, and GitHub runs a self-hosted job for up to 5 days. The two
+#   cases below are the pair that pins the correction: the LIVE repair sweeps NOTHING (and says so), and
+#   the SAME entries are swept by the START path, where the listener is dead.
+echo "── private temp root: a LIVE listener is never swept (mtime age is not a holder witness) ──"
 mkdir -p "$root_b/stale-dir"; : >"$root_b/stale-dir/x"; : >"$root_b/stale-file"
 touch -t 200001010000 "$root_b/stale-dir/x" "$root_b/stale-file" "$root_b/stale-dir"
 : >"$root_b/fresh-file"
 assert_file "$root_b/stale-file" "the stale entry exists before the sweep"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b)"
 assert_eq "$?" "0" "restart of the LIVE instance succeeds"
-assert_absent "$root_b/stale-file" "an entry older than RUNNER_TMP_MAX_AGE_MIN is swept"
+assert_file "$root_b/stale-file" \
+  "a stale entry SURVIVES a live repair — the job holding it may be older than the bound"
+assert_dir "$root_b/stale-dir" "and so does a stale DIRECTORY"
+assert_omits "$out" "swept tmpdir-root=" "the live-repair arm swept NOTHING"
+assert_contains "$out" "tmpdir-sweep skipped tmpdir-root=$root_b reason=live-listener pid=" \
+  "and it SAYS so — a pass that stays silent about a skipped sweep reads as a sweep that ran"
+
+# ⛔ THE CONTROL: the sweep still happens where it is safe, i.e. once the listener is DEAD (the START
+#   path). Without this half, deleting the sweep outright would pass the case above.
+echo "── private temp root: the START path (no live listener) does sweep ──"
+pkill -f -- "$RUNNER_ROOT/pi-runner-iso-b/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.5
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b)"
+assert_eq "$?" "0" "restart of the DEAD instance starts it again"
+assert_absent "$root_b/stale-file" "an entry older than RUNNER_TMP_MAX_AGE_MIN is swept on the start path"
 assert_absent "$root_b/stale-dir" "a stale DIRECTORY is swept too"
 assert_file "$root_b/fresh-file" "a fresh entry is KEPT — the bound cannot race a running job"
 assert_contains "$out" "swept tmpdir-root=$root_b removed=2" "the sweep prints what it removed (a bound nobody can see is a wish)"
 # ⛔ THE BOUND IS THE OPERAND, not a constant in the code. The file below is ~2 days old: the DEFAULT
 #   bound (1440 = 24 h) sweeps it, a 69-day bound keeps it — so this pair proves the sweep's threshold is
 #   what decides, in both directions. (`date -v-2d` is BSD, `date -d` is GNU; the first one that works is
-#   used, so the fixture ages identically on both lanes.)
+#   used, so the fixture ages identically on both lanes.) Both directions take the START path, because a
+#   LIVE instance is never swept at all (the case above).
 : >"$root_b/stale-2"
 two_days_ago="$(date -v-2d '+%Y%m%d%H%M' 2>/dev/null || date -d '2 days ago' '+%Y%m%d%H%M')"
 touch -t "$two_days_ago" "$root_b/stale-2"
+pkill -f -- "$RUNNER_ROOT/pi-runner-iso-b/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.5
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b)"
 assert_absent "$root_b/stale-2" "the default (24 h) bound sweeps an entry two days old"
 : >"$root_b/stale-2"
 touch -t "$two_days_ago" "$root_b/stale-2"
+pkill -f -- "$RUNNER_ROOT/pi-runner-iso-b/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.5
 out="$(RUNNER_TMP_MAX_AGE_MIN=100000 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b)"
 assert_omits "$out" "swept tmpdir-root=" "a wider RUNNER_TMP_MAX_AGE_MIN sweeps nothing"
 assert_file "$root_b/stale-2" "so the SAME file survives the wider bound — the operand is the threshold"
