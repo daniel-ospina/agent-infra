@@ -328,7 +328,8 @@ refuse_transient_target() {
     # The unit PINS the three delegates beside $REAPER, so a missing one is a class that fails
     # closed (exit 3, red) on every pass — name it at install time rather than after the fact.
     for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
-             reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/live-paths.sh; do
+             reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh \
+             lib/live-paths.sh; do
         # #2542 adds the two new owners AND the census library they share. The library is in this list
         # rather than in the REFUSING arm below because a missing library breaks TWO classes, not the
         # pass: a red unit that names them is a worse failure than a refusal, but a silent one is worse
