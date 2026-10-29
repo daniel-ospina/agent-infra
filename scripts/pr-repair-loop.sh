@@ -458,6 +458,13 @@ one_pass() { # <dry-run:0|1>
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
         3) err "dispatch: NOT DELIVERED (rc=3) — legible work, none of it out: no worker took an order that was placed, or a refusal stopped one before delivery. NOT an empty queue." ;;
+        # ⛔ 6 IS THIS SCRIPT'S OWN EXIT_DEFERRED, ONE LAYER DOWN (#2291). `pr-doctor` now exits 6 when
+        # the box's own spawn gate refused every order: nothing was consumed and (for load) it clears
+        # by itself. Before this arm it fell into `*)` below and was recorded as `refusing` /
+        # `dispatcher-refused` — i.e. this layer relabelled "no room" as "the chain is broken", the
+        # exact mislabel the code was added to end. It is the same fact as this script's own
+        # `cap-zero` DEFERRED verdict, so it lands on the same state and the same exit code.
+        6) err "dispatch: NO CAPACITY (rc=6) — the box's own gate refused the work; nothing was consumed and it clears by itself. Read the bound from pr-doctor's verdict." ;;
         # ⛔ A NON-VERDICT IS A FAILURE, AND IT IS NAMED AS ONE (ai#2922). `timeout` alone gives 124,
         # a signal gives 128+n, and `pr-doctor` gives 4 for an uncaught exception -- the code an
         # unreadable cwd produced under launchd. Calling any of them "a refusal" told an operator to
@@ -476,6 +483,7 @@ one_pass() { # <dry-run:0|1>
         # pins it) and renaming it mid-change would break a reader this lane cannot verify. The
         # KIND (`placed-undelivered`) is accurate for both, and the human line above names both.
         3) write_status placed-undelivered "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-worker-took-it"; return "$EXIT_UNDELIVERED" ;;
+        6) write_status deferred "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-capacity"; return "$EXIT_DEFERRED" ;;
         # ⛔ 2 IS WRITTEN EXPLICITLY, NOT VIA `*)` (ai#2922). The record arm never had a `2)` case: it
         # reached `refusing` through the catch-all, so the moment a catch-all had to mean "a crash"
         # (below), a genuine REFUSAL would have been recorded as `pass-failed` and returned 4 —
