@@ -16,3 +16,23 @@
 # path — both run fine under launchd.
 com.eldato.hub-state-check
 com.eldato.skill-lint-oracle
+#
+# ── CONTROLLER WATCHDOG (#2303) — RETIRED, NOT MERELY SUPERSEDED ──────────────────────────────────
+# com.eldato.orchestrator-watchdog was the Mac's HAND-PROVISIONED controller watchdog (`StartInterval`
+# 20 → /Users/danielospina/orchestrator/watchdog.sh, absolute home hardcoded; docs/ops/
+# ACTIVATION-MATRIX.md row 8 recorded it as "installed by no surface in this repo"). Its replacement
+# SHIPS now: templates/launchd/com.eldato.controller-watchdog.plist (`StartInterval` 300) →
+# scripts/orchestrator-harness/watchdog-loop.sh, which is the ship-able copy of the same intent and
+# the one the fleet's inventory can start, stop and read.
+#
+# ⛔ THIS ENTRY IS LOAD-BEARING, NOT TIDINESS: the two are NOT a redundant pair. The old job ran
+# `watchdog.sh` (check → load → log → exit, IDEMPOTENT); the new one takes a NON-idempotent
+# `launchctl kickstart -k`. Two loaded watchdogs would therefore be two MUTATING actors restarting one
+# controller, and the "both invoke the same idempotent script, so they cannot disagree" argument that
+# docs/ops/fleet-liveness.md used to justify the pair would no longer hold. Leaving both installed is
+# exactly the state this file exists to prevent.
+#
+# Nothing is INSTALLED by the change that adds this entry: retiring a job is the installer's job (the
+# `retire_pass` in install-launchd.sh unloads + removes it), and running the installer is a separate,
+# deliberate step.
+com.eldato.orchestrator-watchdog
