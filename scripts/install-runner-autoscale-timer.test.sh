@@ -525,11 +525,11 @@ assert_contains "$OUT" "exit 2" "and the consequence"
 # The guard lived only in --install, so `sudo … --arm` wrote a record in /root and installed an ARMEd
 # User=root unit over the correct one, and `sudo … --disarm` reported DISARMED while removing root's
 # record and leaving the user's intact.
-say_case "T20 --install, --arm and --disarm are all refused under a sudo-invoked root run"
+say_case "T20 every writer (--install, --arm, --disarm, --uninstall) is refused under sudo"
 printf '#!/usr/bin/env bash\ncase "$1" in -u) echo 0 ;; -un) echo root ;; *) echo root ;; esac\n' >"$T/bin/id"
 chmod +x "$T/bin/id"
 D="$T/c20"; fresh "$D"
-for verb in --install --arm --disarm; do
+for verb in --install --arm --disarm --uninstall; do
     rm -f "$ARM"
     ENVV=(PATH="$T/bin:$PATH" SUDO_USER=cmux)
     OUT="$(run_install Linux "$D" "$verb" --reason fixture)"; RC=$?; ENVV=()
@@ -620,7 +620,24 @@ assert_nofile "$ARM" "and writes no record"
 rm -f "$D/$UNIT_NAME.service.d/zz-override.conf"
 printf '[Service]\nNice=5\n' > "$D/$UNIT_NAME.service.d/harmless.conf"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
-assert_eq "$RC" 0 "a drop-in that does not set ExecStart= is not an override"
+assert_eq "$RC" 0 "a drop-in that does not assign ExecStart= is not an override"
+
+# T24b: a BARE `ExecStart=` is the RESET directive, not a comment — it CLEARS the exec list and
+# systemd then refuses the unit ("Service has no ExecStart= … Refusing") while the base file still
+# states one. Presence-detection on the VALUE missed it, so --install enabled and --arm signed a
+# record for a unit that cannot start.
+say_case "T24b a bare ExecStart= drop-in (the RESET directive) is an override"
+D="$T/c24b"; fresh "$D"
+run_install Linux "$D" --install >/dev/null 2>&1
+mkdir -p "$D/$UNIT_NAME.service.d"
+printf '[Service]\nExecStart=\n' > "$D/$UNIT_NAME.service.d/zz-reset.conf"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--status exits 1 for a drop-in that CLEARS the exec list"
+assert_contains "$OUT" "dropin_override=" "it names the drop-in"
+rm -f "$ARM"
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?
+assert_eq "$RC" 1 "--arm refuses it too"
+assert_nofile "$ARM" "and signs no dated record for a unit systemd would refuse to start"
 
 # ── T25: --status accepts the pass's real switch vocabulary ──────────────────────────────
 # The recogniser red anything that was not exactly --dry-run, so `--want 3` (which runner_autoscale.py
@@ -638,6 +655,28 @@ sed -i '/^ExecStart=/ s| --want 3 --json||; /^ExecStart=/ s|$| --apply|' "$D/$UN
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "an invented flag is still red"
 assert_contains "$OUT" "did not render" "and is named as such"
+
+# ── T26: a real switch's ABSOLUTE value is a value, not a token to discard ──────────────
+# The remainder was built by dropping any token starting with `/` (how the interpreter and script were
+# skipped). `--root`'s value is normally an absolute path, so the value was deleted, the orphaned
+# `--root` then swallowed the NEXT argument, and the mode came out ARMED for a unit that is disarmed —
+# or green for a unit carrying `--apply`.
+say_case "T26 an absolute --root value does not swallow the next argument"
+D="$T/c26"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1        # armed = no mode argument
+sed -i '/^ExecStart=/ s|$| --root /opt --apply|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--root /opt --apply is reported as broken (the pass exits 2 on --apply)"
+assert_contains "$OUT" "--apply" "and the invented flag is the one named"
+sed -i '/^ExecStart=/ s| --root /opt --apply||; /^ExecStart=/ s|$| --root /opt/x --dry-run|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "a disarmed unit with an absolute --root is not a broken schedule"
+assert_contains "$OUT" "DISARMED" "and its mode is read correctly (not ARMED)"
+sed -i '/^ExecStart=/ s| --root /opt/x --dry-run||; /^ExecStart=/ s|$| --dry-run --want|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a value-taking switch with NO value is refused (--want alone exits 2)"
+assert_contains "$OUT" "--want" "naming the dangling switch"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
