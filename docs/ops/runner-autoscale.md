@@ -102,7 +102,7 @@ Measured on **pi-cell-1** (Linux, 8 cores, systemd 255) on 2026-10-29:
 | ceiling derivation | `--status`: `by_cores=3 by_memory=9 by_disk=5 bound=cores ceiling=3` from `ncpu=8`, `mem_available_mb=8596` |
 | arm | record written with `ceiling=3`, `reading=ncpu=8 mem_available_mb=8316 ceiling=3` |
 | idempotence | a second `--install` printed `changed=1` only when the artifact was stale, kept the arming record, and left `drift_artifact=no` |
-| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 173 assertions, `PASS=173 FAIL=0`; case-by-case below |
+| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 185 assertions, `PASS=185 FAIL=0`; case-by-case below |
 
 **Not verified here (no macOS host in this lane):** `launchctl bootstrap` on a real Mac, the
 plist's `StartInterval` under `launchd`, and `gui/<uid>` behaviour on a logged-in GUI session. What
@@ -115,7 +115,7 @@ first `--install` to be the real test of that arm.
 ## The self-check, case by case
 
 `scripts/install-runner-autoscale-timer.test.sh` — hermetic (a mktemp fixture root, stub scheduler
-tools, a stub converger), 173 assertions, `PASS=173 FAIL=0`, no network, no real scheduler. What each
+tools, a stub converger), 185 assertions, `PASS=185 FAIL=0`, no network, no real scheduler. What each
 case pins, and why it exists:
 
 | case | what it proves |
@@ -146,7 +146,9 @@ case pins, and why it exists:
 | T23 | `--uninstall` LEAVES a valid arming record and says so, naming the date and the consequence (the next `--install` renders an ARMED unit). Measured: a bare uninstall + install re-armed from a record the operator believed was gone, while the `--status` remedy promised a DISARMED install. The record is not deleted by `--uninstall` — it is the operator's dated decision, and `--disarm` is the verb that revokes it |
 | T24 | an `ExecStart=` DROP-IN under `$UNIT.d/*.conf` is an override, not a detail: `--status` reports `dropin_override=` and exits 1, and `--arm` refuses BEFORE the record exists. A drop-in that assigns no `ExecStart=` (e.g. `Nice=5`) is not an override — no false block |
 | T24b | a BARE `ExecStart=` in a drop-in is the RESET directive, not a comment: it clears the exec list and systemd then refuses the unit ("Service has no ExecStart= … Refusing") while the base file still states one. Detecting the *value* missed it, so `--install` enabled and `--arm` signed a dated record for a unit that cannot start |
-| T26 | a real switch's ABSOLUTE value is a value: `--root /opt --apply` is reported broken (the pass exits 2 on `--apply`), `--root /opt/x --dry-run` reads DISARMED, and a value-taking switch with no value (`--want` last) is refused. The remainder used to be built by dropping every `/`-prefixed token, so `--root`'s value vanished and the orphaned flag swallowed the NEXT argument |
+| T26 | a real switch's ABSOLUTE value is a value: `--root /opt --apply` is reported broken (the pass exits 2 on `--apply`), `--root /opt/x --dry-run` reads DISARMED, and a value-taking switch with no value is refused — both when it is LAST (`--dry-run --want`) and when another FLAG follows it (`--want --json`, `--root --dry-run`), which argparse rejects as `expected one argument`. The remainder used to be built by dropping every `/`-prefixed token, so `--root`'s value vanished and the orphaned flag swallowed the NEXT argument |
+| T27 | the converger is read as TOKEN 2, not as "the argument ending in `.py`": a wrapper or console-script without the suffix installs (any executable regular file does), and the suffix rule then discarded every argument — reporting `mode=converge (ARMED)` over a DISARMED artifact while exiting 1 |
+| T28 | a launchd removal that FAILED is not reported as uninstalled: a plist surviving in `LaunchAgents` is loaded again at the next login, resuming the pass, and a failed `launchctl list` reads the same as "not loaded" |
 | T25 | `--status` accepts the pass's real switch vocabulary (`--status`, `--json`, `--want N`, `--root P`) and reds only an argument this installer never rendered. It used to red anything that was not exactly `--dry-run`, so a working `--want 3` schedule was reported as exiting 2 on every tick |
 | T21 | a RELATIVE interpreter pin is refused: a scheduler resolves it against its own working directory, so the unit would 203/EXEC every tick while `list-timers` showed it scheduled |
 
@@ -173,8 +175,10 @@ bash scripts/install-runner-autoscale-timer.sh --disarm        # stop acting, ke
 bash scripts/install-runner-autoscale-timer.sh --uninstall     # remove the artifact + disable
 ```
 
-`--uninstall` verifies the files are gone and refuses when they are not (it will not report a
-removal it could not perform). It deliberately does NOT delete the arming record: the record is a
+`--uninstall` verifies the files are gone on BOTH arms and refuses when they are not (it will not
+report a removal it could not perform) — on systemd by re-testing the unit paths, on launchd by
+testing the surviving plist as well as the loaded label, because launchd reloads a plist that
+survives in `LaunchAgents`. It deliberately does NOT delete the arming record: the record is a
 dated decision and `--disarm` is the verb that revokes one. So a box that was armed stays ARMED —
 `--uninstall` prints the record's date and says the next `--install` will render an armed unit. If
 you want the box to come back disarmed, run `--disarm` before (or after) the uninstall.

@@ -733,7 +733,17 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             '')                : ;;
             --dry-run)         disarmed=1 ;;
             --json|--status)   : ;;
-            --want|--root)     skipnext=1; lastflag="$l" ;;
+            --want|--root)
+                # ⛔ PEEK: a flag after a value-taking flag is a MISSING VALUE, not a value. The pass
+                # exits 2 on `--want --json`, so swallowing `--json` as the value made `--status`
+                # report ARMED exit 0 for a schedule that fails every tick (the T19 class, narrowed).
+                lastflag="$l"
+                if [ -z "$rest" ]; then out="$out $l"
+                else case "${rest%%$'\n'*}" in
+                         ''|-*) out="$out $l" ;;
+                         *)     skipnext=1 ;;
+                     esac
+                fi ;;
             *)                 out="$out $l" ;;
         esac
     done
@@ -1211,7 +1221,7 @@ do_status() {
     # `--root /opt/x --dry-run` classified as ARMED (the unit is disarmed).
     installed_rest="$(printf '%s\n' "$installed_args" | awk '
         { if (NF == 0) next
-          if (!seen_script) { if ($0 ~ /\.py$/) seen_script = 1; next }
+          if (++pos <= 2) next          # token 1 = interpreter, token 2 = the converger script
           if (skip) { skip = 0; next }
           if ($0 == "--repo") { skip = 1; next }
           print }')"
@@ -1246,7 +1256,12 @@ do_status() {
     else
         installed_args="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"')"
     fi
-    installed_script="$(args_first_matching "$installed_args" '/*.py')"
+    # ⛔ THE SCRIPT IS TOKEN 2, NOT "the first argument ending in .py". Both templates render
+    # `<interpreter> <script> …` and `resolve_script` accepts any executable regular file, so a
+    # suffix rule discarded EVERY argument (and every mode answer) for a wrapper or a console-script
+    # without the suffix — measured: a valid install reported `script=unreadable` and `mode=converge
+    # (ARMED)` over a DISARMED artifact, and `--status` exited 1 on a working schedule.
+    installed_script="$(printf '%s\n' "$installed_args" | awk 'NF { if (++pos == 2) { print; exit } }')"
     # ⛔ THE INTERPRETER IS PART OF THE ANSWER TOO, AND IT WAS THE HOLE. The pass runs as
     # `<interpreter> <script> …`, so an artifact whose pinned interpreter is gone starts nothing —
     # exactly like a missing script — while `script_present=yes` and the scheduler still lists the job
@@ -1387,6 +1402,14 @@ do_uninstall() {
         # still converging. Prove the label is gone (the same read the install path uses).
         $SC bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || $SC unload "$UNIT_DIR/$LABEL.plist" >/dev/null 2>&1 || true
         rm -f "$UNIT_DIR/$LABEL.plist"
+        # ⛔ THE REMOVAL IS VERIFIED TOO, not just the label. launchd reloads a plist that survives in
+        # LaunchAgents at the next login, so a `rm` that failed (a permission change, an immutable file)
+        # reported `uninstalled (not loaded)` while the job came back — and a "not loaded" answer is also
+        # what a FAILED `launchctl list` produces. The systemd arm has had this check all along.
+        if [ -e "$UNIT_DIR/$LABEL.plist" ]; then
+            err "NOT reporting this as uninstalled — $UNIT_DIR/$LABEL.plist is STILL PRESENT (the removal failed); launchd would load it again at the next login"
+            return 1
+        fi
         if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
             err "$LABEL is STILL LOADED after bootout — it will keep firing; log out or reboot, or bootout gui/$(id -u)/$LABEL by hand"
             return 1
