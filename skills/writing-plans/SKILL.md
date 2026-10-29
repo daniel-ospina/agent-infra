@@ -97,14 +97,14 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 |----------------|----------------|
 | All sub-files | No plan produced. No tasks. Nothing to execute. Implementation blocked. |
 | `workflow/01` | Plan drafted without verifying issue-scoping ran. Epic architecture contract not checked. Plan silently diverges from approved design. |
-| `workflow/02` | Third-party library versions not verified. Plan uses hallucinated API calls from training data. Perplexity gate skipped — no triangulation, stale syntax shipped. |
+| `workflow/02` | **(`task-workflow-standard`: Step B does not run — stage 1's `<!-- research: v1 -->` comment is the evidence; this row applies to epic/project.)** Third-party library versions not verified. Plan uses hallucinated API calls from training data. Perplexity gate skipped — no triangulation, stale syntax shipped. |
 | `workflow/03` | Integration boundaries untested. SQL business logic gets TypeScript mocks instead of pgTAP. Production bugs from untested cross-system interactions. |
 | `workflow/04` | Plan doc header missing research-path comment. Task structure not TDD. Micro/Standard/Complex tier path not selected. No bite-sized steps. |
-| `workflow/05` | Plan-review gate skipped entirely — plan ships with no quality check. No review cycles, no reviewer feedback. `planned` label not applied. Execution mode not selected — handoff fails. |
+| `workflow/05` | Plan-review gate skipped entirely — plan ships with no quality check. No review cycles, no reviewer feedback. Execution mode not selected — handoff fails. (`task-workflow-standard` lanes: PLAN-VERIFY writes the signature, so this file's gate is already satisfied — see `workflow/05`.) |
 
 ## Plan Review Gate — Human Approval
 
-The plan-review gate (`workflow/05-review-handoff.md`) runs the `plan-review` skill loop; its human point fires when the loop exits `capped` or `stalled`. A capped/stalled plan-review result is NOT clean — the plan must not proceed to Execution Handoff until the user fixes the remaining issues or explicitly approves the plan as-is.
+The plan-review gate (`workflow/05-review-handoff.md`) runs the `plan-review` skill loop; its human point fires when the loop exits `capped` or `stalled`. **For `task-workflow-standard` this section does not apply**: that pipeline's PLAN-VERIFY *is* the plan review, writes the `<!-- plan-review: cycles=… -->` signature itself, and does not dispatch `plan-review` (agent-infra#2861). The frontmatter's `plan_review: gate: verifier` step is satisfied by that same verifier dispatch — a step in the sequence, not a second round. A capped/stalled plan-review result is NOT clean — the plan must not proceed to Execution Handoff until the user fixes the remaining issues or explicitly approves the plan as-is.
 
 ### Approval Routing (inlined from human-input-framework v2.1.1)
 
