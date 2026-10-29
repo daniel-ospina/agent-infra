@@ -11,14 +11,18 @@
 #   1. lists the FAILING check runs for a selector (a PR head, a commit, or the
 #      last N runs on main);
 #   2. fetches each failing run's failed-step log (`gh run view --log-failed`);
-#   3. extracts `FAILED <nodeid>` lines AND attributable GUARD-STEP failures
+#   3. extracts `FAILED <nodeid>` lines, attributable GUARD-STEP failures
 #      (#4469 — a substantive GitHub Actions error annotation in a step the
 #      RUNNER marked failed, when the run's ROOT failing step also yields an
-#      identity and no step showed an UNCLASSIFIED pytest failure), and emits a
-#      sorted, unique, one-identity-per-line set.
+#      identity and no step showed an UNCLASSIFIED pytest failure), the other
+#      NON-NODEID families (#6798/#7131), JS/TS RUNNER aggregates, and
+#      `check-pipeline-compliance.sh` gate failures (#1185 — `❌ [<letter>] …`,
+#      keyed on the check letter plus the subject its first clause names), and
+#      emits a sorted, unique, one-identity-per-line set.
 #
-# Guard-step attribution exists so a guard failure is COMPARED against main like a
-# test nodeid instead of tripping the caller's fail-closed refusal. The refusal is
+# Guard-step and gate attribution exist so a non-pytest failure is COMPARED
+# against main like a test nodeid instead of tripping the caller's fail-closed
+# refusal. The refusal is
 # NOT weakened: the runner's own `Process completed with exit code <N>.` is never
 # an identity, an annotation from a step that did not fail the run is never one, a
 # sibling annotation may not stand in for an unparseable ROOT failure, and a step
@@ -51,18 +55,48 @@
 #   --exclude <sha>           (--main-union / --main-union-rates /
 #                             --main-union-signatures) drop runs whose headSha is
 #                             <sha> (full or short; matched against the run's headSha)
-#   --main-union-rates [N]    (#3756) per-id failure COUNTS over the last N runs:
+#
+#   ⚠️ WHAT [N] MEANS IN THE TWO WIDENED MAIN MODES (#9689) — `--main-union-rates`
+#   and `--main-union-signatures`, and NOT `--main-union` (see the next note). N is
+#   a STARTING WIDTH, not the size of the window: the listing is widened (doubling,
+#   bounded at 200 runs) until the window holds AT LEAST N runs that FINISHED A
+#   MEASUREMENT — so the doubling can OVERSHOOT N — and it can also stop EARLY,
+#   holding FEWER than N, when the listing is EMPTY, the history is exhausted
+#   (`--limit 2 → 4 → 8` on a 3-run main where fewer than N runs measured: the
+#   wider reads return no NEW run, so it stops at 8), or the 200-run bound is
+#   reached. The window is therefore never pinned to N: ≥ N when the sufficiency
+#   rule fires, < N on an early stop.
+#   Without the widening, a `completed/cancelled` run that never expanded a job
+#   spends one of the N, a push burst can spend all of them, and `tested=0` makes
+#   admin-merge.sh report "the lane never TESTED main" about a main that simply had
+#   not been READ deep enough. The widening says so on stderr.
+#   `tested` in `--runs-report` is the COLLECTORS' count over that window, not the
+#   criterion's: normally the two agree, but a `completed/failure|timed_out` whose
+#   job list turns out EMPTY is counted by the criterion and DEBITED by `tested`
+#   (#1482) — so `tested` can fall below N even when the window reached it, and a
+#   window that measured nothing still blocks. That asymmetry is stated in full at
+#   `list_main_baseline`.
+#   --main-union-rates [N]    (#3756) per-id failure COUNTS over the main window
+#                             widened TOWARD N MEASURED runs — it can OVERSHOOT N, and
+#                             it can stop short of it; read "WHAT [N] MEANS" above:
 #                             `<nodeid>\t<failures>\t<runs>`. The rate table the
 #                             exemption decision consumes — a union cannot express
 #                             `main 1/8` vs `PR 8/8`, which is why presence-based
 #                             subtraction excused an eight-fold regression. Emits
 #                             NOTHING when no run exercised the suite (fail-closed).
 #   --main-union-signatures [N]
-#                             (#3756) main's per-id stable SIGNATURE over the last
-#                             N runs: `<nodeid>\t<signature>`. The rate table alone
-#                             leaves `main_signatures` empty, so the decision's
-#                             subset rule fails CLOSED and nothing is ever exempt;
-#                             this is the other half of the same measurement.
+#                             (#3756) main's per-id stable SIGNATURE over the SAME
+#                             widened window as --main-union-rates (identical early
+#                             stops, so it can hold FEWER than N measured runs):
+#                             `<nodeid>\t<signature>`. The rate table alone leaves
+#                             `main_signatures` empty, so the decision's subset rule
+#                             fails CLOSED and nothing is ever exempt; this is the
+#                             other half of the same measurement.
+#   ⚠️ `--main-union` is NOT widened, deliberately: it is the POST-merge detector's
+#   window, which must read the width the merge was certified over rather than a
+#   wider one. Its dilution residual is therefore unchanged, and it is stated (with
+#   its direction) in the `list_main_baseline` block: over-alarm only, never a
+#   false clean.
 #   --per-run <file>          (--commit-rows) write one line per FAILING run with
 #                             that run's failing ids, whitespace-separated — the
 #                             per-run id sets `decide()` consumes for REQUIRED
@@ -77,8 +111,26 @@
 #                             bogus zero — use only when the test lane is the
 #                             repo's only failing surface)
 #   --provenance <file>       write the examined failing runs as `<sha>:<run-id>`
+#   --unattributed <file>     (#2610, --commit-rows) write ONLY the examined failing
+#                             runs that yielded NO identity, in the same
+#                             `<sha>:<run-id>` form. `--provenance` is every run the
+#                             collector LOOKED AT; this is the subset it could not
+#                             attribute — and it is written HERE because this is the
+#                             function that decides `extracted`. A caller deriving that
+#                             subset from `--provenance` would be re-running the parse,
+#                             and would label every run that DID yield ids as
+#                             unattributable.
 #   --runs-report <file>      write `examined=` / `extracted=` / `completed=` /
-#                             `tested=` / `pending=` counts for the lane runs
+#                             `tested=` / `pending=` counts for the lane runs.
+#                             ⛔ WRITTEN ON BOTH EXITS (#2569): a capture that
+#                             fails closed AFTER reading its window still writes
+#                             these counters plus `unreadable=log:<run-id>`, so a
+#                             refusal can name a MEASURED window instead of
+#                             reading like an empty one. A capture whose LISTING
+#                             failed writes NO report — a window that was never
+#                             listed must not be readable as a baseline, and the
+#                             report's ABSENCE is what tells the rail the window
+#                             itself could not be read.
 #
 # --exclude MATCHES the run's headSha, whatever the projection looks like. It is
 # compared against the PARSED sha field, never a blind awk `$1` — the listing's
@@ -90,8 +142,9 @@
 #
 # Exit codes:
 #   0  extracted (the set may legitimately be EMPTY — no failing runs, or
-#      failing runs whose failures carry no parseable identity: neither a
-#      `FAILED <nodeid>` line nor an attributable guard-step annotation)
+#      failing runs whose failures carry no parseable identity: none of a
+#      `FAILED <nodeid>` line, an attributable guard-step annotation, or a
+#      `❌ [<letter>]` gate line)
 #   1  the extraction itself failed (gh error, unreadable log) — the caller MUST
 #      treat this as "cannot certify", never as "no unique failures". A rail
 #      that reads an extraction error as an empty set is vacuously green.
@@ -126,7 +179,8 @@
 #              below — the SELECTION is corrected, so every counter reads it)
 #   extracted  failing runs that yielded at least one failure identity — a
 #              `FAILED <nodeid>` line OR (since #4469) an attributable guard-step
-#              error annotation from the run's ROOT failing step
+#              error annotation from the run's ROOT failing step, OR (since #1185)
+#              a `check-pipeline-compliance.sh` `❌ [<letter>] …` gate line
 #   completed  lane runs that FINISHED (any conclusion)
 #   tested     of `completed`, the runs that actually EXERCISED the code:
 #              `success`, `failure`, `timed_out`. NOT `cancelled`/`skipped`
@@ -182,11 +236,38 @@
 # Env seams (tests only):
 #   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
 #   CI_FAILURE_SET_WORKFLOW   the workflow filter (default: `python-ci.yml`)
+#   CI_FAILURE_SET_LOG_ATTEMPTS   attempts at a TRANSPORT-failed --log-failed
+#                             fetch, including the first (default: 3, #1574)
+#   CI_FAILURE_SET_LOG_BACKOFF_S  seconds of backoff before attempt N is
+#                             `N-1` times this (default: 2 → 2s then 4s)
 
 set -uo pipefail
 
 GH="${CI_FAILURE_SET_GH:-gh}"
 DEFAULT_MAIN_RUNS=10
+
+# #1574 — A TRANSPORT-FAILED LOG FETCH IS RETRIED, A PRUNED LOG IS NOT.
+# Measured on this defect, so the numbers are not a guess: one `--log-failed`
+# fetch of a 27-job run takes ~2.3 s and returns ~620 KB, and a widened baseline
+# pass fetches EVERY failing run in the window — the tortoise main window that hit
+# the defect held 15 failed runs, so a single pass makes 15 separate log fetches
+# and ANY ONE of them returning a transient error used to abort the whole rail
+# (`BLOCK … could not extract main's rate table`) and cost that PR an hour
+# (MERGE_RETRY_S=3600) with no defect in it.
+#
+# The retry is bounded and offline-safe: three attempts over ~6 s of backoff, and
+# only on the branch that is NOT proven-absent. `log not found` never retries —
+# that is GitHub saying the log does not exist, which the existing #7131
+# discrimination turns into a job-level attribution, not a refusal.
+LOG_FETCH_ATTEMPTS="${CI_FAILURE_SET_LOG_ATTEMPTS:-3}"
+LOG_FETCH_BACKOFF_S="${CI_FAILURE_SET_LOG_BACKOFF_S:-2}"
+case "$LOG_FETCH_ATTEMPTS" in ''|*[!0-9]*) LOG_FETCH_ATTEMPTS=3 ;; esac
+[ "$LOG_FETCH_ATTEMPTS" -ge 1 ] || LOG_FETCH_ATTEMPTS=1
+case "$LOG_FETCH_BACKOFF_S" in ''|*[!0-9]*) LOG_FETCH_BACKOFF_S=2 ;; esac
+#: The largest window the #9689 widening may read — the same 200-run ceiling
+#: admin-merge.sh applies to `--main-runs`, because every run in the window may
+#: cost one Jobs API read and, when it FAILED, one failed-log fetch.
+MAIN_RUNS_MAX=200
 DEFAULT_WORKFLOW="python-ci.yml"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
@@ -417,6 +498,154 @@ list_lane_runs() {
     --jq "$LANE_RUN_RAW_JQ" | drop_superseded_runs
 }
 
+# ── #9689: THE MAIN-SIDE WINDOW COUNTS MEASUREMENTS, NOT RUN OBJECTS ──────────
+#
+# `--main-runs N` is a STARTING WIDTH, and it used to be applied to the RAW
+# listing, so a run that measured NOTHING spent one of the N — and a push burst
+# spends all of them at once. Measured on daniel-ospina/tortoise main
+# (2026-10-23, default lane, default N=10): the 10 newest `python-ci.yml` runs
+# were 1 queued + 9 `completed/cancelled`, each with ZERO jobs (GitHub keeps ONE
+# pending run per concurrency group, so every new push to main cancels the
+# pending one and it never expands). `tested=0` followed, and admin-merge.sh
+# refused EVERY merge with "the lane never TESTED main, so there is no
+# baseline" — a statement about the WINDOW, not about the lane: the same query
+# read 20 runs wide found a measured run at position 14.
+#
+# So the listing WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until the
+# exclusion-filtered window holds AT LEAST the requested number of MEASURED runs
+# (a doubling step may OVERSHOOT it), or the listing is empty, or the history is
+# exhausted, or the bound is reached — an early stop can leave the window holding
+# FEWER than requested. This is the rule the rail's lane-coverage gate already
+# follows for its own reference window (#4844, #7734: "N is a STARTING WIDTH, not a
+# stopping rule"); the baseline pass was the one place still reading N as a
+# stopping rule.
+#
+# ⛔ THE WIDENING CRITERION IS NOT THE GATE. `measured_run_count` reads only the
+# listing's status/conclusion, so it cannot see a run's JOBS — but it decides only
+# whether to read MORE, never that a baseline exists. The gate stays
+# `collect_union_rates`/`collect_union_signatures`'s own `tested` counter (#1482).
+#
+# WHERE THE TWO AGREE, and where they do NOT (this asymmetry is the whole risk, so
+# it is stated precisely rather than waved at):
+#   · on a `completed/success` run they AGREE. The collectors credit `tested` for a
+#     success WITHOUT probing its jobs, so a zero-job success is credited by both.
+#   · on a `completed/failure|timed_out` run with an EMPTY job list they CAN
+#     DISAGREE: the collectors credit it, then take the credit BACK once the log
+#     fetch reports zero jobs, while the criterion has already counted it. In that
+#     shape the loop can stop one width EARLY, so the consequence is the SAME
+#     over-block this change exists to remove, reappearing one widening short — and
+#     never a false PASS: a window of zero-job failures still blocks, because the
+#     gate is what blocks. A false PASS would need the criterion to be the gate,
+#     and it is not.
+#
+# Why that residual is stated rather than fixed: making the criterion agree would
+# mean paying a job read for EVERY failing run in EVERY window (or widening until a
+# success appears, i.e. reading to the bound on any main that is currently red) —
+# on every merge, for a shape whose frequency is unmeasured. Over-blocking one
+# widening short is the cheap side of that trade, and it is visible: the block
+# message carries `tested` and the announced widening widths.
+#
+# ⚠️ STATED RESIDUAL, `--any-workflow` (#9689 follow-up): the criterion counts a
+# completed run of ANY workflow, exactly as the gate's `tested` credit does. So in
+# the union mode a chatty non-test lane can fill the requested width and keep a
+# test lane's deeper failures out of the baseline. Fixing that needs LANE
+# ATTRIBUTION the union listing does not carry (the workflow column is dropped by
+# `drop_superseded_runs`, and a trigger-split repo has no single lane name to
+# attribute to), so it is a design question and NOT part of this window fix. The
+# symptom this change does cure in that mode is the `completed=0, tested=0`
+# reading, where the width is spent on runs that never expanded at all.
+#
+# ⚠️ STATED RESIDUAL, `--main-union` (NOT widened, deliberately): that mode feeds
+# the POST-merge detector, whose window must be the width the merge was certified
+# over — a wider one would move what the detector considers pre-existing. So it
+# keeps the raw-width read (only its exclusion helper is shared), and its dilution
+# residual is unchanged: a window spent on `completed/cancelled` runs leaves main's
+# failing set EMPTY, so EVERY failure of the merged commit reads as UNIQUE. The
+# direction is an OVER-alarm — a redundant alert, never a false clean — which is
+# why it is left stated rather than fixed here.
+
+# measured_run_count <lane-file> → how many listed runs FINISHED A MEASUREMENT
+# (completed with conclusion success|failure|timed_out). A widening criterion
+# only — see the block above.
+measured_run_count() {
+  awk -F'\t' '$1 == "completed" && ($2 == "success" || $2 == "failure" || $2 == "timed_out") { n++ } END { print n + 0 }' "$1"
+}
+
+# exclude_runs <in> <sha|''> <out> → the listing minus runs whose headSha IS
+# <sha>, prefix-tolerant both ways (callers pass a full sha, the API may return
+# either). A line whose sha is EMPTY is KEPT: dropping runs we cannot identify
+# would shrink the baseline and manufacture "unique" failures.
+#
+# It reads the TAGGED projection's sha field ($3) — never a bare `$1`. `$1` of a
+# `status<TAB>conclusion<TAB>sha:id` line is `status<TAB>conclusion<TAB>sha`, so a
+# blind `-F: '$1 != x'` matches nothing and `--exclude` becomes a silent no-op:
+# the merged commit's own run stays in main's baseline, its failures equal the
+# PR's, and the post-merge detector can never fire (review P0, cycle 2). ONE
+# implementation, because the pre-merge and post-merge paths must not disagree
+# about what `--exclude` removed.
+exclude_runs() {
+  local in="$1" x="$2" out="$3"
+  if [ -n "$x" ]; then
+    awk -F'\t' -v x="$x" '
+      {
+        n = split($3, a, ":")
+        sha = a[1]
+        if (sha == "") print
+        else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
+      }' "$in" > "$out"
+  else
+    cp "$in" "$out"
+  fi
+}
+
+# list_main_baseline <requested-width> <exclude> <raw-out> <filtered-out>
+#
+# Lists main's lane runs at <requested-width> and WIDENS it (doubling, bounded
+# by $MAIN_RUNS_MAX) until the exclusion-filtered listing holds at least the
+# requested number of MEASURED runs — overshooting it by up to a doubling step — or
+# stops early (empty listing, exhausted history, the bound), holding FEWER. The
+# ORDINARY case — a requested window that already holds that many — reads exactly
+# ONE listing, byte-identical to before.
+# Returns 1 when a listing read fails (fail-closed: an unreadable run list must
+# never read as "nothing ran").
+list_main_baseline() {
+  local want="$1" exclude="$2" raw="$3" out="$4"
+  local width="$want" measured=0 listed=0 prev=0 read_once=0
+  while :; do
+    list_lane_runs --branch main "$width" > "$raw" || return 1
+    exclude_runs "$raw" "$exclude" "$out"
+    measured="$(measured_run_count "$out")"
+    listed="$(awk 'END { print NR + 0 }' "$raw")"
+    [ "$measured" -ge "$want" ] && break
+    # STOP when more width cannot help. An EMPTY listing stays empty at any
+    # width — main has no run of this lane at all — so there is nothing to widen
+    # into and the announcement below would be noise. The policy bound is the
+    # other hard stop.
+    [ "$listed" -eq 0 ] && break
+    [ "$width" -ge "$MAIN_RUNS_MAX" ] && break
+    # …and when the history is exhausted: this read listed no more runs than the
+    # last one, so a wider window would re-read the same runs forever. This is
+    # checked on the LISTING (post-supersede, pre-exclusion) rather than by
+    # comparing `listed` to `width`, because `drop_superseded_runs` may legitimately
+    # return fewer lines than the window asked for while the history goes on —
+    # stopping there would under-widen and re-create the very false block this
+    # fixes. The price is ONE LISTING READ PER DOUBLING STEP — two on a 3-run
+    # history, up to the bound on a long one, not the single extra read an earlier
+    # draft of this comment claimed — and that is the correct side of the trade: an
+    # extra listing read costs time, a premature stop costs a blocked merge.
+    { [ "$read_once" -gt 0 ] && [ "$listed" -le "$prev" ]; } && break
+    read_once=1; prev="$listed"
+    width=$((width * 2))
+    [ "$width" -gt "$MAIN_RUNS_MAX" ] && width="$MAIN_RUNS_MAX"
+    # NAME the numbers, not a cause: `listed` is counted BEFORE `--exclude` while
+    # `measured` is counted AFTER it, so "the rest measured nothing" would be a
+    # false statement on the ordinary rail path (which always excludes the PR's
+    # own head run).
+    say_err "ci-failure-set: · main's ${want}-run baseline window held ${measured} MEASURED run(s) of ${listed} listed — widening to ${width} (#9689)"
+  done
+  return 0
+}
+
 # extract_failed_tests <run-id> → sorted-unique nodeids, one per line.
 # A failing run whose failed-step log cannot be fetched is an EXTRACTION
 # FAILURE (exit 1), not an empty contribution: silently dropping it is exactly
@@ -598,6 +827,15 @@ run_failed_job_ids() {
 # because for those the log may well exist and a retry can recover it — treating
 # them as pruned would trade a recoverable refusal for a permanent one.
 #
+# ⛔ #1574 — THE RETRY ACTS ON THAT SPLIT, AND ONLY ON THAT SPLIT. A transport
+# failure is retried $LOG_FETCH_ATTEMPTS times (with backoff), because the split
+# above already ESTABLISHES that such a failure is recoverable; a PROVEN-ABSENT
+# log is never retried, because no amount of waiting creates it. Exhaustion is
+# unchanged: the refusal below still fires, so `unreadable ⇒ refuse` — which is
+# what stops a clipped baseline certifying a comparison — is NOT weakened. The
+# retry changes HOW LONG the rail tries to read, never WHETHER an unread read is
+# allowed to certify anything.
+#
 # ⚠ ONE MESSAGE PER RUN, EMITTED AFTER the discrimination. Printing the refusal
 # first and then the exemption made the rail say "the failure set is UNKNOWABLE,
 # refusing" and "contributing an EMPTY set" about the SAME run — the exact
@@ -608,11 +846,26 @@ run_failed_job_ids() {
 # auth/network for a run whose logs GitHub had simply pruned — so the natural
 # responses (re-auth, retry, wait out a rate limit) could not possibly work.
 fetch_failed_log() {
-  local run_id="$1" out="$2" err jobs
-  # shellcheck disable=SC2086
-  if err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
-    return 0
-  fi
+  local run_id="$1" out="$2" err jobs attempt=1 retry_note
+  while :; do
+    # shellcheck disable=SC2086
+    if err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
+      if [ "$attempt" -gt 1 ]; then
+        # NAME the recovery. A silent retry would hide a sick read surface for
+        # exactly as long as it keeps happening to work, and the operator's next
+        # question is always "was this baseline actually readable?".
+        say_err "ci-failure-set: · run $run_id — the failed-step log fetch failed $((attempt - 1)) attempt(s) with a TRANSIENT error and SUCCEEDED on attempt $attempt of ${LOG_FETCH_ATTEMPTS}; the log was read, so this is not a refusal (#1574)"
+      fi
+      return 0
+    fi
+    # PROVEN ABSENT is not a transient: GitHub said the log does not exist, so a
+    # retry cannot produce it. Break out and let the #7131 discrimination below
+    # attribute the run at job level.
+    case "$err" in *"log not found"*) break ;; esac
+    [ "$attempt" -lt "$LOG_FETCH_ATTEMPTS" ] || break
+    attempt=$((attempt + 1))
+    [ "$LOG_FETCH_BACKOFF_S" -gt 0 ] && sleep $(( LOG_FETCH_BACKOFF_S * (attempt - 1) ))
+  done
   # Discriminate BEFORE fail-closing. Only a run that HAS jobs can be hiding a
   # failure in an unreadable log; a run with none contributes nothing.
   if jobs="$(run_job_count "$run_id")" && [ "$jobs" = "0" ]; then
@@ -633,7 +886,17 @@ fetch_failed_log() {
       say_err "ci-failure-set: · run $run_id has NO LOG (GitHub pruned it); its job count $jobs_note — falling back to the JOB-LEVEL failure set (#7131): the test-level identity does not exist on any surface, so the run is attributed by failed JOB NAME and, carrying no signature, cannot be exempted"
       return 3 ;;
     *)
-      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error); its job count $jobs_note — refusing to read this as an empty failing set" ;;
+      # ⛔ THE REMEDY MUST BE TRUE. `CI_FAILURE_SET_LOG_ATTEMPTS=1` disables the
+      # retry, and a message that still says "a transient error is retried" then
+      # points the operator at a remedy that does not exist — the same misleading-
+      # remediation class this function's #1482/#7131 messaging exists to prevent
+      # (review cycle 1, P2). State which one applies.
+      if [ "$LOG_FETCH_ATTEMPTS" -gt 1 ]; then
+        retry_note="${attempt} attempt(s) made of ${LOG_FETCH_ATTEMPTS} — a TRANSIENT error is retried (#1574)"
+      else
+        retry_note="1 attempt made — the retry is DISABLED (CI_FAILURE_SET_LOG_ATTEMPTS=1), so no transient was outlasted"
+      fi
+      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error; ${retry_note}); its job count $jobs_note — refusing to read this as an empty failing set" ;;
   esac
   return 1
 }
@@ -696,6 +959,59 @@ extract_failed_signatures() {
 }
 
 # ── modes ─────────────────────────────────────────────────
+
+# write_runs_report <report> <examined> <extracted> <completed> <tested> <pending>
+#                   [unreadable]
+#
+# ONE writer for the `--runs-report` file, called on BOTH exits (#2569).
+#
+# ⛔ WHY THE FAIL-CLOSED PATH WRITES IT TOO. Every collector used to write the
+# report ONLY after its loop completed, so a capture that returned 1 wrote NO
+# report at all — and the rail, which prints `parser exit 1`, then had no counts
+# to say HOW FAR it got. Measured on the fleet's own refusals (2026-10-23):
+# `BLOCK — could not extract main's rate table (parser exit 1)` was the only line
+# an operator got, and it is the same line whether main was GREEN and the table
+# legitimately empty, or a single `gh` log fetch died. Those are opposite claims
+# and the evidence could not tell them apart. `unreadable=` is that missing
+# fourth state, and `tested=`/`completed=` are the measurement it was missing.
+#
+# ⛔ WHAT `unreadable` MAY AND MAY NOT SAY. Two labels, because two different
+# things can fail once the window HAS been listed, and an operator's remedy
+# differs (re-fetch the log vs fix/move the parser):
+#   `log:<run-id>`   — the run's failed-step LOG could not be FETCHED (checked at
+#                      the `fetch_failed_log` status, so this label is not a guess).
+#   `parse:<run-id>` — the run's log was read but no failure IDS could be
+#                      extracted from it: a missing/updated id parser, a moved log
+#                      format, or a job-level fallback that failed. This label also
+#                      covers the composite extractor (`extract_failed_tests`),
+#                      whose rc=1 does not say which of the two it was — claiming
+#                      `log:` there would name a remedy that cannot work.
+# Either label means the window was fully LISTED and partially measured, so the
+# counters are a real partial measurement of a real window, and nothing downstream
+# can mistake them for a shrunken baseline: the capture still exits 1, so no
+# consumer reads a table from it. Neither is written when the LISTING fails: a
+# window that was never listed has no counters to publish, and writing `tested=0`
+# there would let a partial window be read as a baseline — the assertion at the end
+# of `tests/admin-merge/run.sh` ("a failed widened listing still wrote a
+# runs-report") pins exactly that.
+write_runs_report() {
+  local report="$1" examined="$2" extracted="$3" completed="$4" tested="$5" pending="$6" unreadable="${7:-}"
+  [ -n "$report" ] || return 0
+  {
+    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
+      "$examined" "$extracted" "$completed" "$tested" "$pending"
+    if [ -n "$unreadable" ]; then
+      printf 'unreadable=%s\n' "$unreadable"
+    fi
+  } > "$report" 2>/dev/null || {
+    # ⛔ NOT SILENT (#2569 review). A swallowed write makes "the report is absent" —
+    # which the rail reads as "the LISTING failed" — also reachable from an unwritable
+    # path, i.e. a local disk problem would be reported as an unread GitHub listing
+    # and send triage at the wrong system. Say it out loud instead.
+    say_err "ci-failure-set: ✗ could not write the runs report at '$report' — the counters will not reach the caller"
+  }
+  return 0
+}
 
 # Sets a union of the FAILED nodeids across every FAILING run in <lane-file>,
 # and counts the lane's completion state from the SAME listing. Also writes
@@ -760,17 +1076,19 @@ collect_union() {
       # that actually exercised the revision" and is the main-side gate's signal,
       # so the credit is taken back rather than left to dilute the rate table.
       2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
-      *) rm -f "$tmp_set"; return 1 ;;
+      # #2569: the counters reached so far are PUBLISHED before failing closed, so
+      # the refusal can name a measured window instead of reading like an empty one.
+      # `parse:` — `extract_failed_tests` is COMPOSITE (fetch, then ids, then a
+      # job-level fallback for a pruned log), so its rc=1 does not say which step
+      # failed; see `write_runs_report`.
+      *) rm -f "$tmp_set"; write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"; return 1 ;;
     esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_set"
     fi
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   sort -u "$tmp_set"
   rm -f "$tmp_set"
 }
@@ -825,17 +1143,17 @@ collect_union_rates() {
     case "$rc" in
       0) ;;
       2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
-      *) rm -f "$tmp_all"; return 1 ;;
+      # #2569: publish the partial counters before failing closed — see
+      # `write_runs_report` for why this is not a shrunken baseline. `parse:`
+      # because `extract_failed_tests` is composite (fetch, ids, pruned fallback).
+      *) rm -f "$tmp_all"; write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"; return 1 ;;
     esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_all"
     fi
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   # No tested runs -> emit NOTHING. An empty rate table must never be read as
   # "main never fails anything", which would exempt every PR failure.
   if [ "$tested" -gt 0 ]; then
@@ -897,7 +1215,10 @@ collect_union_signatures() {
       continue
     fi
     if [ "$frc" -ne 0 ]; then
-      rm -f "$log_file" "$tmp_sigs"; return 1
+      # #2569: publish the partial counters before failing closed.
+      rm -f "$log_file" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "log:$run_id"
+      return 1
     fi
     # A failing run with NO failure identity contributes nothing to either table
     # (no `FAILED <nodeid>` line AND no attributable guard-step annotation, #4469).
@@ -906,18 +1227,23 @@ collect_union_signatures() {
     # for a run we already know carried no parseable failure (the
     # `extracted < examined` gate in admin-merge.sh owns that case).
     local ids="" one=""
-    ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
+    ids="$(failed_ids_from_log "$log_file")" || {
+      rm -f "$log_file" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+      return 1
+    }
     if [ -n "$ids" ]; then
       extracted=$((extracted + 1))
-      one="$(extract_failed_signatures "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
+      one="$(extract_failed_signatures "$log_file")" || {
+        rm -f "$log_file" "$tmp_sigs"
+        write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+        return 1
+      }
       [ -n "$one" ] && printf '%s\n' "$one" >> "$tmp_sigs"
     fi
     rm -f "$log_file"
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   # No tested run -> emit NOTHING. An empty signature table is not evidence; the
   # caller BLOCKS on it rather than exempting from it.
   if [ "$tested" -gt 0 ]; then
@@ -932,14 +1258,28 @@ collect_union_signatures() {
 # emitted, with a BLANK signature when the extractor produced none: an id that
 # vanished here would be an id the decision never sees, which is fail-OPEN.
 # `--per-run` writes the per-run id sets detect_rotating_identity() consumes.
+# `--unattributed` (#2610) writes the examined failing runs that yielded NO identity —
+# from THIS function, because it is the one that decides `extracted`. The arms below that
+# leave a run unextracted AND let the capture continue write the runref there: the
+# zero-job arm (#1482) and the ordinary empty-ids arm. `--provenance` cannot stand in: it
+# holds every examined run, including the ones that DID contribute.
+#
+# ⛔ THE PRUNED-LOG ARM (#7131) IS NOT ONE OF THEM, and the comment on it says so rather
+# than implying coverage: `run_failed_job_ids` returns 1 both for "the job list could not
+# be read" and for "read fine, no failed job", and this function treats 1 as fatal — so a
+# pruned log naming no failed job REFUSES THE WHOLE CAPTURE (the caller's extract gate),
+# and no named 1c refusal is reached for it. Making that arm live needs a distinguishable
+# status from `run_failed_job_ids` (2 = read, nothing failed), which is a behaviour change
+# in the capture with its own test; it is deliberately NOT bundled here.
 collect_union_rows() {
-  local lane_file="$1" provenance="$2" report="$3" per_run="$4"
+  local lane_file="$1" provenance="$2" report="$3" per_run="$4" unattr="${5:-}"
   local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
   tmp_ids="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_ids"; : > "$tmp_sigs"
   [ -n "$provenance" ] && : > "$provenance"
   [ -n "$per_run" ] && : > "$per_run"
+  [ -n "$unattr" ] && : > "$unattr"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     local status rest conclusion runref log_file ids one
@@ -972,6 +1312,7 @@ collect_union_rows() {
       # extracted` gate in admin-merge.sh still refuses this run — the PR side
       # stays fail-closed by construction, which is deliberate.
       [ "$credited" = "1" ] && tested=$((tested - 1))
+      [ -n "$unattr" ] && printf '%s\n' "$runref" >> "$unattr"
       rm -f "$log_file"
       continue
     fi
@@ -982,7 +1323,11 @@ collect_union_rows() {
       # run and the fallback buys nothing. NO signature is emitted, so the
       # decision's signature gate fails CLOSED and the key can never be exempted.
       rm -f "$log_file"
-      ids="$(run_failed_job_ids "$run_id")" || { rm -f "$tmp_ids" "$tmp_sigs"; return 1; }
+      ids="$(run_failed_job_ids "$run_id")" || {
+        rm -f "$tmp_ids" "$tmp_sigs"
+        write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+        return 1
+      }
       if [ -n "$ids" ]; then
         extracted=$((extracted + 1))
         printf '%s\n' "$ids" >> "$tmp_ids"
@@ -990,12 +1335,24 @@ collect_union_rows() {
           printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
         fi
       fi
+      # ⛔ NOTHING TO DO IN AN `else`, and the absent branch is stated rather than assumed:
+      # `run_failed_job_ids` cannot return 0 with empty output (both its paths end
+      # `[ -n … ] || return 1`), so a pruned log naming no failed job takes the `return 1`
+      # above and FAILS THE CAPTURE CLOSED. It therefore never reaches `--unattributed` —
+      # see the ⛔ block in this function's docblock.
       continue
     fi
     if [ "$frc" -ne 0 ]; then
-      rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1
+      # #2569: publish the partial counters before failing closed.
+      rm -f "$log_file" "$tmp_ids" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "log:$run_id"
+      return 1
     fi
-    ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
+    ids="$(failed_ids_from_log "$log_file")" || {
+      rm -f "$log_file" "$tmp_ids" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+      return 1
+    }
     if [ -n "$ids" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$ids" >> "$tmp_ids"
@@ -1012,15 +1369,19 @@ collect_union_rows() {
       # Only a run that CARRIED ids is fed to the signature extractor: the
       # `signatures` CLI exits 1 on a capture with no ids (correct for a capture
       # that proves nothing, wrong for a run already known to carry none).
-      one="$(extract_failed_signatures "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
+      one="$(extract_failed_signatures "$log_file")" || {
+        rm -f "$log_file" "$tmp_ids" "$tmp_sigs"
+        write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+        return 1
+      }
       [ -n "$one" ] && printf '%s\n' "$one" >> "$tmp_sigs"
+    else
+      # No ids from a readable log: THIS is the unattributable run (#2610).
+      [ -n "$unattr" ] && printf '%s\n' "$runref" >> "$unattr"
     fi
     rm -f "$log_file"
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   if [ "$tested" -gt 0 ]; then
     # Join per-id failure counts (and the id universe, so an UNSIGNED id still
     # gets a row) with the signature rows. awk only; no second signature parser.
@@ -1045,7 +1406,7 @@ collect_union_rows() {
 
 main() {
   local mode="" pr="" commit="" main_runs="$DEFAULT_MAIN_RUNS"
-  local exclude="" repo="" provenance="" report="" diff_a="" diff_b="" per_run=""
+  local exclude="" repo="" provenance="" report="" diff_a="" diff_b="" per_run="" unattr=""
   local workflow="${CI_FAILURE_SET_WORKFLOW:-$DEFAULT_WORKFLOW}" any_workflow=0
 
   while [ $# -gt 0 ]; do
@@ -1075,6 +1436,7 @@ main() {
         fi ;;
       --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --per-run) per_run="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --unattributed) unattr="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 2>/dev/null || shift $# ;;
       --exclude) exclude="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --repo) repo="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
@@ -1130,21 +1492,19 @@ main() {
       rm -f "$runs"
       ;;
     main-union-rates)
+      # ⛔ A LISTING FAILURE WRITES NO `--runs-report`, deliberately (#2569). A window
+      # that was never listed has no counters, and publishing `tested=0` for it would
+      # hand a consumer a report it could read as a baseline — the assertion at the
+      # end of `tests/admin-merge/run.sh` pins that no report exists on this path.
+      # So the report's ABSENCE is the signal the rail reads for "no read window".
+      # It is the most likely cause, not the only one: a capture killed mid-loop, or a
+      # report that could not be WRITTEN (which `write_runs_report` now says out
+      # loud), also leaves no report — which is why the rail's wording says "nothing
+      # was measured that could be read" rather than naming the network as the cause.
       local runs filtered
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-      list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
-      if [ -n "$exclude" ]; then
-        awk -F'\t' -v x="$exclude" '
-          {
-            n = split($3, a, ":")
-            sha = a[1]
-            if (sha == "") print
-            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
-          }' "$runs" > "$filtered"
-      else
-        cp "$runs" "$filtered"
-      fi
+      list_main_baseline "$main_runs" "$exclude" "$runs" "$filtered" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
       collect_union_rates "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
       rm -f "$runs" "$filtered"
       ;;
@@ -1154,7 +1514,7 @@ main() {
       local runs
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       list_lane_runs --commit "$commit" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $commit"; exit 1; }
-      collect_union_rows "$runs" "$provenance" "$report" "$per_run" || { rm -f "$runs"; exit 1; }
+      collect_union_rows "$runs" "$provenance" "$report" "$per_run" "$unattr" || { rm -f "$runs"; exit 1; }
       rm -f "$runs"
       ;;
     main-union-signatures)
@@ -1162,18 +1522,7 @@ main() {
       local runs filtered
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-      list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
-      if [ -n "$exclude" ]; then
-        awk -F'\t' -v x="$exclude" '
-          {
-            n = split($3, a, ":")
-            sha = a[1]
-            if (sha == "") print
-            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
-          }' "$runs" > "$filtered"
-      else
-        cp "$runs" "$filtered"
-      fi
+      list_main_baseline "$main_runs" "$exclude" "$runs" "$filtered" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
       collect_union_signatures "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
       rm -f "$runs" "$filtered"
       ;;
@@ -1182,26 +1531,12 @@ main() {
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
-      if [ -n "$exclude" ]; then
-        # Parse the TAGGED projection's sha field — never a bare `$1`. `$1` of a
-        # `status<TAB>conclusion<TAB>sha:id` line is `status<TAB>conclusion<TAB>sha`,
-        # so a blind `-F: '$1 != x'` matches nothing and `--exclude` becomes a
-        # silent no-op: the merged commit's own run stays in main's baseline, its
-        # failures equal the PR's, and the post-merge detector can never fire
-        # (review P0, cycle 2). Prefix-tolerant both ways: callers pass a full sha
-        # from an event payload, the API may return either. A line with an EMPTY
-        # sha is KEPT — dropping runs we cannot identify would shrink the baseline
-        # and manufacture "unique" failures (VGATE cycle 2).
-        awk -F'\t' -v x="$exclude" '
-          {
-            n = split($3, a, ":")
-            sha = a[1]
-            if (sha == "") print
-            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
-          }' "$runs" > "$filtered"
-      else
-        cp "$runs" "$filtered"
-      fi
+      # ONE exclusion rule for every main mode (exclude_runs). The rule itself is
+      # documented at its definition, and it is shared rather than re-written here
+      # so a correction cannot land on this side only: `--main-union` feeds the
+      # POST-merge detector while the widened modes feed the PRE-merge rail, and
+      # the two must not disagree about what `--exclude` removed.
+      exclude_runs "$runs" "$exclude" "$filtered"
       collect_union "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
       rm -f "$runs" "$filtered"
       ;;
