@@ -131,7 +131,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-say()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+log_line()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
 # ── bounded git ───────────────────────────────────────────────────────────────────────────
@@ -439,10 +439,10 @@ push_one() { # <key> <source-file>
     attempt=$((attempt + 1))
     push_decision "$key" "$f"
     case "$DEC" in
-      skip)   say "  · keep $key — $DEC_MSG; a record is never overwritten with an older one (#2374 rule 1)"
+      skip) log_line "  · keep $key — $DEC_MSG; a record is never overwritten with an older one (#2374 rule 1)"
               SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); return 0 ;;
-      same)   [ -n "$DEC_MSG" ] && say "  · $key — $DEC_MSG"; SAME=$((SAME + 1)); return 0 ;;
-      supersede) say "  · $key — $DEC_MSG; publishing it (a carry is a supersession, not a disagreement)" ;;
+      same)   [ -n "$DEC_MSG" ] && log_line "  · $key — $DEC_MSG"; SAME=$((SAME + 1)); return 0 ;;
+      supersede) log_line "  · $key — $DEC_MSG; publishing it (a carry is a supersession, not a disagreement)" ;;
       unreadable) warn "  ⚠️ skip $key — $DEC_MSG; refusing to overwrite it (#2374 rule 1)."
               UNREADABLE=$((UNREADABLE + 1)); return 0 ;;
       conflict) conflict "$key" "$lat" "$DEC_PEER_AT" "$f"; return 0 ;;
@@ -464,7 +464,7 @@ push_one() { # <key> <source-file>
     rc=$?
     if [ "$rc" -eq 0 ]; then
       git_b update-ref "refs/reviews/$key" "$commit" >/dev/null 2>&1
-      say "  ↑ pushed $key (reviewed_at=$cs)"
+      log_line "  ↑ pushed $key (reviewed_at=$cs)"
       PUSHED=$((PUSHED + 1)); WROTE=$((WROTE + 1)); return 0
     fi
     # A refusal means the state CHANGED under this attempt. Loop again so the DECISION is re-taken
@@ -536,7 +536,7 @@ pull_one() { # <key>
     same_bytes "$lf" "$tmp" && { SAME=$((SAME + 1)); rm -f "$tmp"; return 0; }
     lat="$(field "$lf" reviewed_at)"
     if [ -n "$lat" ] && [[ "$lat" > "$rat" ]]; then
-      say "  · keep $key — this box is NEWER ($lat > $rat); an older record never overwrites a newer one (#2374 rule 1)"
+      log_line "  · keep $key — this box is NEWER ($lat > $rat); an older record never overwrites a newer one (#2374 rule 1)"
       SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0
     fi
     if [ -z "$lat" ]; then
@@ -550,16 +550,16 @@ pull_one() { # <key>
       if supersedes "$tmp" "$lf"; then
         pull_reason="the peer's record CARRIES this box's (carried_from=$(field "$tmp" carried_from | cut -c1-12)…), same mint time; a carry is a supersession"
       elif supersedes "$lf" "$tmp"; then
-        say "  · keep $key — this box's record CARRIES the peer's (carried_from=$(field "$lf" carried_from | cut -c1-12)…), same mint time"
+        log_line "  · keep $key — this box's record CARRIES the peer's (carried_from=$(field "$lf" carried_from | cut -c1-12)…), same mint time"
         SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0
       else
         # Neither names the other's head: same verdict+head is provenance-only (the parallel carry
         # two boxes make onto one head); a different verdict is the real disagreement.
         case "$(same_stamp_relation "$tmp" "$lf")" in
           a) pull_reason="same mint time, same head, and the peer's record is the carried one; taking it as a supersession" ;;
-          b) say "  · keep $key — same mint time and THIS box's record is the carried one (same head, same verdict)"
+          b) log_line "  · keep $key — same mint time and THIS box's record is the carried one (same head, same verdict)"
              SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0 ;;
-          same) say "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
+          same) log_line "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
              SAME=$((SAME + 1)); rm -f "$tmp"; return 0 ;;
           *) conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0 ;;
         esac
@@ -567,7 +567,7 @@ pull_one() { # <key>
     fi
   fi
   if write_local "$key" "$tmp"; then
-    say "  ↓ pulled $key (reviewed_at=$rat)${pull_reason:+ — $pull_reason}"
+    log_line "  ↓ pulled $key (reviewed_at=$rat)${pull_reason:+ — $pull_reason}"
     WROTE=$((WROTE + 1))
   else
     warn "  ⚠️ FAILED $key — could not write $REG_DIR/$key.json"

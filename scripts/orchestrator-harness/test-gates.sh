@@ -208,10 +208,13 @@ _CLS_RULE="want=(os.environ.get('REQ') or '').split()"
 # its FIRST match, the upstream `grep -vE` takes SIGPIPE (141), and under `pipefail`
 # a FAILING drift guard reads as a pass (#864's class; the producer here writes the
 # whole non-comment stream, so it is a live window, not a shape flag).
-_ORCH_RULE_HITS="$(grep -vE '^[[:space:]]*#' "$ORCH" 2>/dev/null || true)"
+# ⛔ THE RULE MOVED WITH THE CLASSIFIER (agent-infra#2719): the split rule now ships inside
+# `check-class.py`, and the sweep runs THAT file. The pin reads BOTH, because a rule that survives in
+# one file while the other runs is precisely the drift this assertion exists to catch.
+_ORCH_RULE_HITS="$({ grep -vE '^[[:space:]]*#' "$ORCH" 2>/dev/null; grep -vE '^[[:space:]]*#' "$HERE/check-class.py" 2>/dev/null; } || true)"
 case "$_ORCH_RULE_HITS" in
   *"$_CLS_RULE"*) { echo "  ✅ the classifier still splits with Python .split() — the rule _normalise_set shares"; PASS=$((PASS+1)); } ;;
-  *) { echo "  ❌ the classifier's split rule changed in orch-loop.sh; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); } ;;
+  *) { echo "  ❌ the classifier's split rule is in NEITHER orch-loop.sh nor check-class.py; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); } ;;
 esac
 _agree() { # _agree <set> -> both readers' verdicts on the SAME string
   printf 'authority=%s classifier=%s' "$(merge_authority "${1:-}")" \
@@ -239,8 +242,10 @@ eqv "a TAB-separated OVERRIDE is normalised onto the space-joined contract" "a b
 
 # (d) the shipped classifier against BOTH shapes. Rendered from the measured surfaces:
 #     agent-infra PR #1763 = 22 checks, all non-red, NO ai-review-gate row.
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$ORCH" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+# ⛔ THE SHIPPED ARTIFACT IS NOW `check-class.py` (agent-infra#2719) — the classifier moved out of the
+# orch-loop.sh heredoc so the sweep and the NOCHECKS arm run ONE implementation. A missing file leaves
+# `$TMP/classify.py` empty and the block below reports its own "not extracted" red, as before.
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 if [ -s "$TMP/classify.py" ]; then
   clr() { printf '%s' "$2" | REQ="$1" REVIEW_GATE=ai-review-gate python3 "$TMP/classify.py" 2>/dev/null; }
   AISURF='[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]'
@@ -1401,10 +1406,13 @@ FAKE
   wpin "the fixer budget is derived from the UNOWNED count" "$ORCH" 'MF="$(fix_slots "$UPN")"'
   # …at EVERY fixer spawn site (a count, not a find: a partial revert that leaves one site on the
   # unraised MAX_FIX is exactly the asymmetry this change removes).
-  _mf_sites="$(grep -cF -- '-lt "$MF"' "$ORCH")"
+  # ⛔ COUNT CODE, NOT PROSE (#2762): two COMMENTS in orch-loop.sh quote the same predicate to explain
+  # the ceiling, so a raw `grep -c` counted 5 and redded main — a false RED on a correct tree, which
+  # is the same class as a false PASS: the arm stopped being evidence of the spawn sites.
+  _mf_sites="$(grep -F -- '-lt "$MF"' "$ORCH" | grep -vc '^[[:space:]]*#')"
   [ "${_mf_sites:-0}" = "3" ] \
     && { echo "  ✅ all 3 fixer spawn sites compare against the drain-aware budget"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ expected 3 fixer spawn sites on \$MF, found ${_mf_sites:-0} — some still use the unraised MAX_FIX"; FAIL=$((FAIL+1)); }
+    || { echo "  ❌ expected 3 fixer spawn sites on \$MF (code lines, comments excluded), found ${_mf_sites:-0} — some still use the unraised MAX_FIX"; FAIL=$((FAIL+1)); }
   if grep -qF -- '-lt "${MAX_FIX:-3}"' "$ORCH"; then
     echo "  ❌ a fixer spawn site still compares against the unraised MAX_FIX (the asymmetry is back)"; FAIL=$((FAIL+1))
   else
@@ -2639,6 +2647,12 @@ echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisa
   awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  # ⛔ THE SHARED (PR, head) REVIEW BUDGET IS PART OF THE PRODUCER NOW (agent-infra#2971): the
+  # verdict-less branch Spends `state/reviewdisp-<PR>` through these helpers instead of its own
+  # private counter, so an extraction without them leaves `rev_budget_spend` undefined (127) and the
+  # branch silently writes a marker but never counts or parks — the unbounded loop, wearing a green
+  # face. Extracted, never stubbed, for the same reason as the two functions above.
+  sed -n '/# \[revbudget:begin\]/,/# \[revbudget:end\]/p' "$MERGE" | sed '1d;$d'
 } > "$TMP/reviewstate.sh"
 ex review_gate_state > "$TMP/fn_review_gate_state.sh"
 # ⛔ NON-EMPTY AND DEFINED, not merely `bash -n`-clean (P2, first review round): `bash -n` on an EMPTY
@@ -2650,6 +2664,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
    && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
+   && grep -q '^rev_budget_spend() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_gate_state() {' "$TMP/fn_review_gate_state.sh" \
    && bash -n "$TMP/reviewstate.sh" 2>/dev/null && bash -n "$TMP/fn_review_gate_state.sh" 2>/dev/null; then
   RS="$TMP/rso"; mkdir -p "$RS/state"
@@ -2667,7 +2682,10 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
   # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
   _rc() { ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$1"; . "$TMP/reviewstate.sh"; review_state_clear ); }
-  _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS/parkreason"; : > "$RS/merge.log"; }
+  # ⛔ AND THE SHARED (PR, head) RECORD (agent-infra#2971): `reviewdisp-<PR>` is the ONE review budget
+# — the controller spends it on dispatch, merge-one.sh spends it on a verdict-less run — so a
+# leftover record here would make a later "one timeout" drive read as a cap that had been hit.
+_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
 
   eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
   eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
@@ -2764,18 +2782,18 @@ ISSUES 2')"
   # reviewed at a head that had been. Both resets are driven.
   _clean; _rs NO-VERDICT 9999aaaa; _rs NO-VERDICT 9999aaaa; _rc 9999aaaa
   _rs NO-VERDICT 9999aaaa
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a verified CLEAN resets the verdict-less counter (one timeout after it does not park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   _clean; _rs NO-VERDICT 7777bbbb; _rs NO-VERDICT 7777bbbb; _rs ISSUES 7777bbbb
   rm -f "$RS/state/needsfix-2132-7777bbbb"; : > "$RS/state/fixspend-2132-7777bbbb"
   _rs NO-VERDICT 7777bbbb
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a FINDINGS verdict resets it too (a fixer is the remedy, not a park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
@@ -3274,6 +3292,137 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   wpin "the collision-ledger walk-past increments SKIP_COLLIDED" "$REFRESH" 'SKIP_COLLIDED=$((SKIP_COLLIDED + 1))'
 else
   echo "  ❌ could not extract the funnel-record block from refresh-candidates.sh (or it is not valid shell) — the writer's arithmetic is ungraded"; FAIL=$((FAIL+1))
+fi
+
+# ── THE GATE VECTOR: every arm that fired, with the winner UNCHANGED (#2924 indicator (a), #2927) ──
+# ⛔ THE MEASURED DEFECT THIS GRADES. `GATE_WHY` is one string assigned by an `elif` chain, so the
+# first arm that fires MASKS every arm behind it — and the first is `merge-priority`, which is set
+# whenever any workable un-owned PR exists. Measured 2026-10-27: 349/384 cycles named merge-priority
+# with 25 free lane slots, 88.5% of those gated cycles ALSO had a capacity gate that would have
+# refused, and 64 were refused while `ci-queue=ok`. An operator reading the line could not tell
+# "waiting for the PR sweep" (healthy) from "throttled by a gate" (the defect).
+# The block is EXTRACTED from the live controller, never mirrored, so a reformat or a replaced arm
+# fails here instead of silently ungrading the suite.
+echo
+echo "══ the gate vector: EVERY arm that fired, and the winner is exactly what the old chain chose"
+GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
+if [ "$(printf '%s' "$GV" | grep -c .)" -lt 10 ]; then
+  echo "  ❌ could not extract the gate-vector block from $ORCH — the idle reason is ungraded"; FAIL=$((FAIL+1))
+else
+  gv() { # gv [VAR=value ...] -> "GATE_WHY<TAB>GATE_VEC"; sane defaults, then the caller's overrides
+    ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=0
+      FORK_STARVED=0; FORK_WHY=""; CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000
+      LANES_UNKNOWN=0; LANES=0; MAX_LANES=20; L=1; MAX_LOAD=12
+      CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none
+      CIQ=1; CIQ_RC=1; CIQ_VER="ok(queued=3 running=1 runners=20 ceiling=40)"
+      SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+      for _a in "$@"; do export "$_a"; done
+      eval "$GV"
+      printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" )
+  }
+  _t="$(gv)"; _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  [ "$_why" = "<open>" ] && echo "  ok (v1) a box with no gate reports NO winner" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v1) a clean box reported a winner: $_why"; FAIL=$((FAIL+1)); }
+  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Ten tokens is the arm count
+  # this block has; an arm DELETED from the vector while its predicate stays reddens here.
+  _missing=""
+  for _arm in 'merge-priority' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
+    case "$_vec" in *"$_arm"*) ;; *) _missing="$_missing $_arm" ;; esac
+  done
+  [ -z "$_missing" ] && echo "  ok (v2) every gate arm has its own verdict on the idle line" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v2) the vector does not name:$_missing"; FAIL=$((FAIL+1)); }
+  # ⛔ THE MEASURED CO-BINDING CASE (#2924 indicator (b)). merge-priority fires AND the queue is deep
+  # AND slots are free. The winner must STILL be merge-priority — the vector is additive, never a
+  # change of decision — while the queue arm is now VISIBLE beside it.
+  _t="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+           CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20)"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  case "$_why" in
+    merge-priority*) echo "  ok (v3) the winner is UNCHANGED (merge-priority still decides the cycle)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v3) the vector changed the DECISION (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'merge-priority('*) echo "  ok (v4) …and merge-priority is in the vector" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v4) merge-priority is missing from the vector: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'ci-queue=REFUSE('*) echo "  ok (v5) …and the capacity gate it MASKED is now visible too (the 2026-10-27 shape)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v5) the mask is back — a co-binding ci-queue refusal is invisible: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'slots=17 free of 20'*) echo "  ok (v6) …and the free lane slots it was throttled WITH (17 of 20)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v6) the free-slot count is not on the line: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ FIRST-WINS IS THE OLD CHAIN'S SEMANTICS, and it is the half a naive rewrite breaks: with the
+  # load arm and the lanes arm both firing, the winner must be the EARLIER one (load), not the last.
+  _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+  case "$_why" in
+    load=*) echo "  ok (v7) two arms firing ⇒ the EARLIER one wins, exactly as the elif chain did" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v7) the arm ORDER changed (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE DRIFT GUARD, and it is STRUCTURAL rather than prose: every arm that can ASSIGN `GATE_WHY`
+  # must also write its verdict to `GATE_VEC` in the SAME block, within three lines. A new arm added
+  # without its token reddens here — which is the only way this stays true as arms are added, and the
+  # exact defect that produced #2924 (a gate whose own report did not exist).
+  printf '%s\n' "$GV" > "$TMP/gv-block.sh"
+  if python3 - "$TMP/gv-block.sh" <<'ARMS'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+bad = []
+n = 0
+for i, ln in enumerate(lines):
+    if 'GATE_WHY="${GATE_WHY:-' in ln:
+        n += 1
+        window = " ".join(lines[i:i + 3])
+        if "GATE_VEC=" not in window:
+            bad.append(i + 1)
+print("ARMS=%d BAD=%s" % (n, ",".join(map(str, bad)) or "none"))
+sys.exit(1 if bad or n < 9 else 0)
+ARMS
+  then echo "  ok (v8) all $(grep -c 'GATE_WHY="\${GATE_WHY:-' <<<"$GV") GATE_WHY arms write a GATE_VEC verdict beside them" && PASS=$((PASS+1))
+  else echo "  ❌ (v8) an arm assigns GATE_WHY without a vector verdict — it can fire invisibly"; FAIL=$((FAIL+1)); fi
+  # ⛔ NO `elif AMONG THE VECTORED ARMS: a chain is how the mask comes back (#2924). The winner is
+  # chosen by `GATE_WHY="${GATE_WHY:-…}"`, which is order-preserving and chain-free.
+  if grep -qE '^[[:space:]]*elif ' <<<"$GV"; then
+    echo "  ❌ (v9) an \`elif\` is back inside the vector block — the first arm masks the rest again"; FAIL=$((FAIL+1))
+  else echo "  ok (v9) the arms are independent guards, not a masking chain"; PASS=$((PASS+1)); fi
+  # ── the two mutants ────────────────────────────────────────────────────────────────────────────
+  mut_gv() { # <name> <old> <new> -> path to the mutant block
+    printf '%s\n' "$GV" > "$TMP/gv-$1.in"
+    python3 - "$TMP/gv-$1.in" "$TMP/gv-$1.sh" "$2" "$3" <<'MUT'
+import sys
+src = open(sys.argv[1]).read(); old, new = sys.argv[3], sys.argv[4]
+assert old in src, "mutation target not found: " + old
+open(sys.argv[2], "w").write(src.replace(old, new))
+MUT
+    printf '%s' "$TMP/gv-$1.sh"
+  }
+  # (m1) RESTORE THE OLD BEHAVIOUR: the vector is not built at all (as a chain that only names its
+  # winner). (v5) is the arm that must redden.
+  _m="$(mut_gv novec 'GATE_VEC="$GATE_VEC ' 'GATE_VEC_UNUSED="${GATE_VEC:-}' 2>/dev/null)"
+  if [ -n "$_m" ] && [ -f "$_m" ]; then
+    GV="$(cat "$_m")"
+    _vec="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+               CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20 | cut -f2)"
+    case "$_vec" in
+      *'ci-queue=REFUSE('*) echo "  ❌ (m1) the no-vector mutant STILL reports the masked arm — (v5) is not load-bearing"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m1) FAILS when the vector is removed: a co-binding capacity refusal goes invisible again"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m1) could not build the no-vector mutant"; FAIL=$((FAIL+1)); fi
+  # (m2) RESTORE THE CHAIN: EVERY arm assigns unconditionally — which is exactly what a chain does —
+  # so the LAST arm that fires wins instead of the first. (v7) is the arm that must redden.
+  printf '%s\n' "$GV" > "$TMP/gv-lastwins.sh"
+  if python3 - "$TMP/gv-lastwins.sh" <<'MUT2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+n = s.count('GATE_WHY="${GATE_WHY:-')
+assert n >= 9, "only %d arms to rewrite" % n
+open(p, 'w').write(s.replace('GATE_WHY="${GATE_WHY:-', 'GATE_WHY="'))
+MUT2
+  then
+    GV="$(cat "$TMP/gv-lastwins.sh")"
+    _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+    case "$_why" in
+      load=*) echo "  ❌ (m2) the last-wins mutant still reports the EARLIER arm — (v7) does not test the order"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m2) FAILS when an arm stops honouring first-wins (winner became '$_why')"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m2) could not build the last-wins mutant"; FAIL=$((FAIL+1)); fi
+  GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
 fi
 
 echo
