@@ -2296,6 +2296,21 @@ case "$*" in
 esac
 SH
 chmod +x "$TMP/bin-shortdf/df"
+# ⛔ THE HEALTHY-VOLUME FIXTURE IS A READING TOO, AND IT MUST COME FROM THE FIXTURE (review round 1,
+# finding 3). R1/R2/R4/R5/R6/R7 pin WT_CMUX_STATE_DIR at a fixture, but only `shortdf` carried a `df`
+# STUB — so every "healthy volume" arm read the RUNNER'S OWN volume against the DEFAULT floors (1024 MB /
+# 95 %). A runner with <1 GB free in $TMP (or ≥95 % inodes) made WT_PROBE_SHORT=1, flipped the verdict to
+# `space`, and reddened a CORRECT tree: the arms were a function of CI's disk, not of their fixtures.
+# 4 GB free / 12 % inodes — unambiguously above both floors, on both the -Pk and -Pi shapes.
+scenario okdf
+cat > "$TMP/bin-okdf/df" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"-Pi"*|*" -i"*) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/x 8000000 1000000 7000000 12%% 1000 9000 12%% /\n' ;;
+  *) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 8000000 3819776 4194304 12%% /\n' ;;
+esac
+SH
+chmod +x "$TMP/bin-okdf/df"
 # The driver: the SHIPPED library, one spawn, the state dir pinned at a fixture so `df`/`du` ALWAYS
 # answer (an unpinned run reads the box's own $HOME and reports UNREADABLE, which would make the
 # measured-value assertions vacuous on a runner that has no ~/.cmux).
@@ -2311,7 +2326,7 @@ DISKFULL='workspace create failed: {"code":"operation.failed","details":{"operat
 # (R1) the cell-3 reading itself: volume healthy, owner ANSWERED `status running`, ensure did not help.
 rm -rf "$TMP/OR1" "$TMP/rstate1"; : > "$TMP/ensure1.log"
 out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure1.log" \
-  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR1" "$TMP/cmuxr1.log" "$TMP/rstate1" 2>&1)"
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR1" "$TMP/cmuxr1.log" "$TMP/rstate1" 2>&1)"
 case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R1: a create refused on a healthy box still refuses (the spawn is not silently retried into success)" $rc
 case "$out" in *"FALSE CAUSE"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
@@ -2331,7 +2346,7 @@ ck "R1: …and the refusal still reaches the controller's refusal record, under 
 # (R2) THE RECOVERY MUST EARN ITS PLACE: ensure answers on the retry, the re-attempted create succeeds.
 rm -rf "$TMP/OR2" "$TMP/rstate2"; : > "$TMP/ensure2.log"
 out="$(CMUX_LAYOUT_FAIL_ONCE="$TMP/r2.fail" CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure2.log" \
-  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR2" "$TMP/cmuxr2.log" "$TMP/rstate2" 2>&1)"
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR2" "$TMP/cmuxr2.log" "$TMP/rstate2" 2>&1)"
 rm -f "$TMP/r2.fail"
 case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R2: when the session is the fault, ONE ensure + ONE re-attempt SAVES the spawn (rc=0, not a refusal)" $rc
@@ -2354,7 +2369,7 @@ ck "R3: …and NO recovery is attempted on a short volume (restarting a session 
 # (R4) THE macOS HOST CLI: no `server` verb at all. That is not an outage, and must not be called one.
 rm -rf "$TMP/OR4" "$TMP/rstate4"; : > "$TMP/ensure4.log"
 out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_UNSUPPORTED=1 CMUX_ENSURE_LOG="$TMP/ensure4.log" \
-  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR4" "$TMP/cmuxr4.log" "$TMP/rstate4" 2>&1)"
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR4" "$TMP/cmuxr4.log" "$TMP/rstate4" 2>&1)"
 case "$out" in *"NO \`server\` verb"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R4: a CLI with no \`server\` verb says exactly that (a missing verb is not a dead session)" $rc
 [ ! -s "$TMP/ensure4.log" ] && rc=0 || rc=1
@@ -2362,21 +2377,42 @@ ck "R4: …and no ensure is attempted where the verb does not exist" $rc
 # (R5) the operator's off switch: no probe, no recovery, and NO invented readings.
 rm -rf "$TMP/OR5" "$TMP/rstate5"; : > "$TMP/ensure5.log"
 out="$(WT_SESSION_RECOVER=0 CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure5.log" \
-  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR5" "$TMP/cmuxr5.log" "$TMP/rstate5" 2>&1)"
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR5" "$TMP/cmuxr5.log" "$TMP/rstate5" 2>&1)"
 [ ! -s "$TMP/ensure5.log" ] && rc=0 || rc=1
 ck "R5: \$WT_SESSION_RECOVER=0 takes no probe and no recovery (the operator's stop switch works)" $rc
-case "$out" in *"probe could not run"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
-ck "R5: …and the refusal says the probe did not run instead of printing an empty 'MEASURED' claim" $rc
+case "$out" in *"no readings taken"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R5: …and the refusal says no reading was taken instead of printing an empty 'MEASURED' claim" $rc
+# ⛔ THE OFF SWITCH MUST NOT DESCRIBE A READ IT DID NOT ATTEMPT (review round 1, finding 2). The old text
+# said "NEITHER the session owner nor the state volume could be READ on this box" — a FAILED read, which
+# claims an attempt this branch deliberately skipped, inside the very message that exists to stop that.
+case "$out" in *"WT_SESSION_RECOVER=0"*"NO reading was taken"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R5: …and the READING states the probe was DISABLED, so no cause is asserted either way" $rc
+case "$out" in *"could be READ"*) rc=1 ;; *) rc=0 ;; esac
+ck "R5: …and it does NOT claim a read was attempted and failed (the false half the old arm passed over)" $rc
 # (R6) THE HAPPY PATH STAYS FREE: a create that answers must not pay for a probe or an ensure.
 rm -rf "$TMP/OR6" "$TMP/rstate6"; : > "$TMP/ensure6.log"
 out="$(CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure6.log" \
-  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/OR6" "$TMP/cmuxr6.log" "$TMP/rstate6" 2>&1)"
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR6" "$TMP/cmuxr6.log" "$TMP/rstate6" 2>&1)"
 case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R6: a spawn whose create answers succeeds as before (the probe is not on the happy path)" $rc
 [ ! -s "$TMP/ensure6.log" ] && rc=0 || rc=1
 ck "R6: …and it calls NO server verb at all (no cost, no risk on the 1,500-spawn path)" $rc
 grep -c '^CMUX server ' "$TMP/cmuxr6.log" | grep -qx '0' && rc=0 || rc=1
 ck "R6: …verified on the CLI's own call log, not on the module's prose" $rc
+# (R7) A STOPPED OWNER IS NOT A RUNNING ONE. `case` takes the FIRST matching pattern, and `not running`
+# CONTAINS `running` — so the positive pattern first made two of the five down signatures dead code and
+# printed FALSE CAUSE for a session that had just said it was down (review round 1, finding 1). Every
+# other R arm supplied only a running-shaped `server status`, so the whole owner-down verdict was
+# untested; this arm is the one that would have caught it.
+rm -rf "$TMP/OR7" "$TMP/rstate7"; : > "$TMP/ensure7.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status not running' CMUX_SERVER_STATUS_RC=0 CMUX_ENSURE_LOG="$TMP/ensure7.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR7" "$TMP/cmuxr7.log" "$TMP/rstate7" 2>&1)"
+case "$out" in *"did NOT answer"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R7: a rc=0 \`status not running\` is read as DOWN, not swallowed by \`*running*\`" $rc
+case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
+ck "R7: …so the refusal does NOT call the daemon a FALSE CAUSE on a box whose owner said it was down" $rc
+case "$out" in *"answers \`status running\`"*) rc=1 ;; *) rc=0 ;; esac
+ck "R7: …and it does not claim the owner answered \`status running\` when it answered the opposite" $rc
 
 echo
 echo "── P) the module INITIALISES under bash 3.2 — no heredoc inside a command substitution (#2248) ──"

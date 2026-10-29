@@ -252,7 +252,7 @@ wt_cmux_server() { # <verb> [args...] -> prints the answer
 
 # `wt_cmux_probe` — take the incident's own table, flat, and derive a VERDICT from it. Sets (no
 # subshell, because the caller DECIDES on the reading):
-#   WT_PROBE_VERDICT     space | owner-down | owner-running | unreadable
+#   WT_PROBE_VERDICT     space | owner-down | owner-running | unreadable | not-run
 #   WT_PROBE_LINE        `space free=… inodes=… state=… floor=…; server status=…` — the readings, verbatim
 #   WT_PROBE_SHORT       1 only when the volume was MEASURED at/below a floor (never on an unreadable)
 #   WT_PROBE_OWNER       running | down | unreadable | unsupported
@@ -285,9 +285,16 @@ wt_cmux_probe() {
     case "$?" in
       0)
         srvlow="$(printf '%s' "$srv" | tr '[:upper:]' '[:lower:]')"
+        # ⛔ THE NEGATIVE SIGNATURES ARE TESTED FIRST, AND THE ORDER IS THE WHOLE POINT. POSIX `case`
+        # takes the FIRST matching pattern (§2.9.4.2), and `not running` / `no server running` CONTAIN
+        # `running` — so with `*running*` ahead of the down list, two of the five down signatures were
+        # DEAD CODE and an owner that had just said it was not running was reported `owner-running`. The
+        # refusal then called the daemon's cause FALSE and the spawn ran an `ensure` + a re-attempt on a
+        # box whose owner was down: the same defect as #2404 with the polarity flipped — an instrument
+        # asserting a reading it does not have (review round 1, finding 1; pinned by arm R7).
         case "$srvlow" in
-          *running*) WT_PROBE_OWNER=running ;;
           *"cannot connect"*|*"connection refused"*|*"no server"*|*"not running"*|*"stopped"*) WT_PROBE_OWNER=down ;;
+          *running*) WT_PROBE_OWNER=running ;;
           *) WT_PROBE_OWNER=unreadable ;;
         esac ;;
       3) WT_PROBE_OWNER=unsupported ;;
@@ -334,6 +341,12 @@ wt_cmux_probe_reading() {
     *) sp=unreadable ;;
   esac
   case "${WT_PROBE_VERDICT:-unreadable}" in
+    not-run)
+      # ⛔ THE OFF SWITCH TAKES NO READING, SO THE READING MUST NOT DESCRIBE ONE. Without this arm the
+      # refusal printed "NEITHER the session owner nor the state volume could be READ on this box" for a
+      # probe that was deliberately never run — an attempted-read claim for a read nobody attempted, in
+      # the one message whose purpose is to stop exactly that (review round 1, finding 2).
+      printf 'the probe was DISABLED on this box (`WT_SESSION_RECOVER=0`), so NO reading was taken here and NO cause is stated — the daemon message below is its own claim, neither confirmed nor denied' ;;
     space)
       printf 'the state volume IS at or below the floor this probe measured against (see `space …` above), so the daemon message is CONSISTENT with a measurement of this box — and no recovery is attempted, because restarting a session frees no space' ;;
     owner-down)
@@ -1961,7 +1974,10 @@ PY
       #   * the CLI has no `server` verb at all (the macOS host CLI) — there is nothing to probe and
       #     nothing to ensure, and pretending otherwise would invent a cause on the box that has no
       #     durable session in the first place.
-      if [ "${WT_SESSION_RECOVER:-1}" != "0" ]; then
+      if [ "${WT_SESSION_RECOVER:-1}" = "0" ]; then
+        # ⛔ NOT-READ IS A VERDICT, NOT THE ABSENCE OF ONE — see `wt_cmux_probe_reading`'s `not-run` arm.
+        WT_PROBE_VERDICT=not-run
+      else
         wt_cmux_probe
         if [ "$WT_PROBE_OWNER" != "unsupported" ] && [ "$WT_PROBE_SHORT" != "1" ]; then
           wt_cmux_session_ensure || true
@@ -1982,7 +1998,7 @@ PY
         fi
       fi
       if [ "$_larc" -ne 0 ]; then
-        wt_warn "REFUSED $name: cmux layout apply failed: MEASURED on this box — ${WT_PROBE_LINE:-probe could not run}; READING: $(wt_cmux_probe_reading)$_recovered. The daemon's own message, which this probe did NOT verify as the cause: ${_lamsg:-no output, exit status only}"
+        wt_warn "REFUSED $name: cmux layout apply failed: MEASURED on this box — ${WT_PROBE_LINE:-no readings taken}; READING: $(wt_cmux_probe_reading)$_recovered. The daemon's own message, which this probe did NOT verify as the cause: ${_lamsg:-no output, exit status only}"
         rm -f "$envf" "$runf"; return 1
       fi
     fi
