@@ -269,7 +269,7 @@ fi
 ACCEPTED_VERDICTS="clean clean-micro clean-low"
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
-say()  { printf '%s\n' "$*"; }
+log_line()  { printf '%s\n' "$*"; }
 err()  { printf '%s\n' "$*" >&2; }
 stop() { err "⛔ atomic-land: STOP — $*"; exit 1; }
 
@@ -888,7 +888,7 @@ sync_review_registry() {
   local sync="${ATOMIC_LAND_REGISTRY_SYNC:-$SELF_DIR/registry-sync.sh}" out="" rc=0
   case "$sync" in
     off|none|0)
-      say "atomic-land: review-record registry union SKIPPED by request (ATOMIC_LAND_REGISTRY_SYNC=$sync)"
+      log_line "atomic-land: review-record registry union SKIPPED by request (ATOMIC_LAND_REGISTRY_SYNC=$sync)"
       return 0 ;;
   esac
   if [ ! -f "$sync" ]; then
@@ -897,12 +897,12 @@ sync_review_registry() {
     return 0
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    say "atomic-land: DRY RUN — skipping the cross-box registry union (it writes to the local registry)"
+    log_line "atomic-land: DRY RUN — skipping the cross-box registry union (it writes to the local registry)"
     return 0
   fi
   out="$(bash "$sync" union 2>&1)" || rc=$?
   case "$rc" in
-    0) say "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
+    0) log_line "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
        # A converged run can still carry per-record notices, and this arm used to drop every one of
        # them: a store holding a record this box could not use printed `ok … synced` with the warning
        # discarded, which is the SILENCE the #2349 ruling forbids. Say what the run flagged.
@@ -971,7 +971,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
     # queue does not re-establish — the #7230 non-termination the direct path already
     # records. 3 is the "nothing to do" code. This is #3016 Option 1, recorded in
     # `.mergify.yml`: the queue replaces the update-lock, so the author does nothing.
-    say "atomic-land: [1/4] update — the queue performs the update itself (#3016); the head is left exactly as reviewed"
+    log_line "atomic-land: [1/4] update — the queue performs the update itself (#3016); the head is left exactly as reviewed"
     return 3
   fi
   local before="$HEAD" after="" i t=0 behind="" stale_record=0 rec_rc=0
@@ -1051,7 +1051,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       # one; a state-gated skip it could not override would be an un-disableable
       # misfire.
       if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
-        say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
+        log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
       else
         local strict mergeable
         strict="$(strict_of)"
@@ -1065,15 +1065,15 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
             # places the rail decides a landable head needs no refresh, and a
             # drift-red head is not landable in either.
             if [ "$(drift_safe_of)" = 1 ]; then
-              say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
+              log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
               return 3
             fi
-            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #1565 skip would leave it unlandable with a misattributed refusal"
+            log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #1565 skip would leave it unlandable with a misattributed refusal"
           else
-            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
+            log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
           fi
         else
-          say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=${strict:-unreadable} (read live) — refreshing"
+          log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=${strict:-unreadable} (read live) — refreshing"
         fi
       fi ;;
     *)
@@ -1088,7 +1088,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # the BEHIND arm: skip only on a POSITIVE `false` strict AND a POSITIVE
         # `true` mergeable.
         if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
-          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
+          log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
         else
           local strict mergeable
           strict="$(strict_of)"
@@ -1100,7 +1100,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
               # drift gate measures and what this skip would leave in place forever.
               # Green predicate only.
               if [ "$(drift_safe_of)" = 1 ]; then
-                say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
+                log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
                 return 3
               fi
               # This is the ELSE of the drift check, not a fall-through: every path
@@ -1109,16 +1109,16 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
               # the "not positively mergeable" line below as well — true of the OTHER
               # arm, false here (mergeable IS true), and so a fresh misattribution in
               # the fix for a misattribution.
-              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #7230 skip would leave it unlandable with a misattributed refusal"
+              log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #7230 skip would leave it unlandable with a misattributed refusal"
             else
-              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
+              log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
             fi
           else
-            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE and strict=${strict:-unreadable} (read live) — refreshing"
+            log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE and strict=${strict:-unreadable} (read live) — refreshing"
           fi
         fi
       elif [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
-        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
+        log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
       elif [ "$MERGE_STATE" = "CLEAN" ]; then
         # #7727 — CLEAN IS NOT A STATEMENT ABOUT CONTENT, so this no-op may not be
         # taken on the state name. `behind` reaches this arm whenever the drift arm
@@ -1136,7 +1136,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # `[: : integer expression expected` on every such landing (round 4,
         # measured). An exact string test can do neither.
         if [ "${behind:-}" = "0" ]; then
-          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head is measured current (0 behind) — nothing to update"
+          log_line "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head is measured current (0 behind) — nothing to update"
           return 3
         fi
         # Either an UNREADABLE distance (the compare read failed) or a MEASURED
@@ -1144,10 +1144,10 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # assume away. Under `strict: false` a genuinely-behind head reports CLEAN,
         # so refusing to measure here is PR #7703's shape one unreadable read away.
         if [ "$(drift_safe_of)" = 1 ]; then
-          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN with the head/base distance ${behind:-unreadable}, but merging this head would keep $BASE's content — nothing to update"
+          log_line "atomic-land: [1/4] update — mergeStateStatus=CLEAN with the head/base distance ${behind:-unreadable}, but merging this head would keep $BASE's content — nothing to update"
           return 3
         fi
-        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING (the state name is not evidence about content)"
+        log_line "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING (the state name is not evidence about content)"
       elif [ -z "$behind" ]; then
         # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
         # current, and the silent "up to date" read is the exact defect this arm
@@ -1197,12 +1197,12 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # shell. Anything that is not exactly "0" goes to the predicate.
         if [ "${behind:-}" != "0" ]; then
           if [ "$(drift_safe_of)" = 1 ]; then
-            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
+            log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
             return 3
           fi
-          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, and the drift predicate is NOT positively green — REFRESHING on BASE DRIFT (#4174/#7727)"
+          log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, and the drift predicate is NOT positively green — REFRESHING on BASE DRIFT (#4174/#7727)"
         else
-          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured 0 commit(s) behind $BASE — nothing to update"
+          log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured 0 commit(s) behind $BASE — nothing to update"
           return 3
         fi
       fi ;;
@@ -1295,11 +1295,11 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   stale_record=0
   [ "$RECORD_HEAD" = "$HEAD" ] || stale_record=1
   if [ "$stale_record" -eq 1 ]; then
-    say "atomic-land: [1/4] update — the record is STALE (${RECORD_HEAD:0:12}… at ${HEAD:0:12}…) — asking the record step about the CURRENT head BEFORE moving it, so the update is one the carry can restore (#2369)"
+    log_line "atomic-land: [1/4] update — the record is STALE (${RECORD_HEAD:0:12}… at ${HEAD:0:12}…) — asking the record step about the CURRENT head BEFORE moving it, so the update is one the carry can restore (#2369)"
     do_record preflight
     rec_rc=$?
     if [ "$rec_rc" -eq 4 ]; then
-      say "atomic-land: [1/4] update — the record step refused on the CURRENT head's HEALTH (#1575 clause (E)), not on content: the artifact WAS proven unchanged and the head is measurably red. The refresh is the only remedy this rail has for a drift-caused red (#1533), so the update PROCEEDS; step [3/4] re-runs the same veto at the new head, and a red the head itself owns will be refused THERE."
+      log_line "atomic-land: [1/4] update — the record step refused on the CURRENT head's HEALTH (#1575 clause (E)), not on content: the artifact WAS proven unchanged and the head is measurably red. The refresh is the only remedy this rail has for a drift-caused red (#1533), so the update PROCEEDS; step [3/4] re-runs the same veto at the new head, and a red the head itself owns will be refused THERE."
     elif [ "$rec_rc" -eq 5 ]; then
       # #1362 D1, the other half. `do_record` reaches its B8 binding arms whenever the
       # producer EXITED 0 but left no record naming this head — `record-review.sh` fails
@@ -1319,9 +1319,9 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
     # take this line as "after a proceed the record already names HEAD". Tightening
     # step 3 on that reading would break the carry this proceed depends on.
   fi
-  say "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
+  log_line "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
   if [ "$DRY_RUN" -eq 1 ]; then
-    say "atomic-land:     (dry-run) would run: gh pr update-branch $PR"
+    log_line "atomic-land:     (dry-run) would run: gh pr update-branch $PR"
     WOULD_UPDATE=1
     return 3
   fi
@@ -1336,7 +1336,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   done
   [ -n "$after" ] && [ "$after" != "$before" ] \
     || stop "the update did not move the head (still ${before:0:12}…) — nothing to carry a record onto"
-  say "atomic-land:     updated: ${before:0:12}… → ${HEAD:0:12}…"
+  log_line "atomic-land:     updated: ${before:0:12}… → ${HEAD:0:12}…"
   return 0
 }
 
@@ -1358,14 +1358,14 @@ check_count() { # $1 = jq program applied to one page of check-runs
 
 wait_terminal() {
   if [ "$NO_WAIT" -eq 1 ]; then
-    say "atomic-land: [2/4] verify — --no-wait: admin-merge.sh's tested-head precondition decides"
+    log_line "atomic-land: [2/4] verify — --no-wait: admin-merge.sh's tested-head precondition decides"
     return 0
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    say "atomic-land: [2/4] verify — (dry-run) would wait up to ${WAIT_TIMEOUT}s for terminal checks"
+    log_line "atomic-land: [2/4] verify — (dry-run) would wait up to ${WAIT_TIMEOUT}s for terminal checks"
     return 0
   fi
-  say "atomic-land: [2/4] verify — waiting (≤${WAIT_TIMEOUT}s) for the checks at ${HEAD:0:12}… to be terminal"
+  log_line "atomic-land: [2/4] verify — waiting (≤${WAIT_TIMEOUT}s) for the checks at ${HEAD:0:12}… to be terminal"
   # B14 (#1395 item 1): the bound is WALL-CLOCK, not a poll count. The old
   # `elapsed=$((elapsed + POLL))` credited $POLL per iteration while each
   # iteration first spends TWO `gh api` round trips, so the rail outlived its own
@@ -1387,7 +1387,7 @@ wait_terminal() {
     pending="$(check_count '[.check_runs[] | select(.status != "completed")] | length')"
     completed="$(check_count '[.check_runs[] | select(.status == "completed")] | length')"
     if [ "$pending" = "0" ] && [ "$completed" != "0" ] && [ "$completed" != "?" ]; then
-      say "atomic-land:     checks terminal — $completed completed, 0 pending"
+      log_line "atomic-land:     checks terminal — $completed completed, 0 pending"
       return 0
     fi
     elapsed=$(( SECONDS - started ))
@@ -1424,15 +1424,15 @@ do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-hea
   if [ "${1:-}" = "preflight" ]; then label="[1/4] record-precheck"; headword="CURRENT head"; fi
   if [ "$RECORD_HEAD" = "$HEAD" ]; then
     if [ "$WOULD_UPDATE" -eq 1 ]; then
-      say "atomic-land: $label — (dry-run) the pending update moves the head, so the record would be re-derived there (carry-forward iff the reviewed diff is unchanged)"
+      log_line "atomic-land: $label — (dry-run) the pending update moves the head, so the record would be re-derived there (carry-forward iff the reviewed diff is unchanged)"
     else
-      say "atomic-land: $label — the record is already at ${HEAD:0:12}… (verdict=$RECORD_VERDICT); no re-record"
+      log_line "atomic-land: $label — the record is already at ${HEAD:0:12}… (verdict=$RECORD_VERDICT); no re-record"
     fi
     return 0
   fi
-  say "atomic-land: $label — record is at ${RECORD_HEAD:0:12}…, head is ${HEAD:0:12}…"
+  log_line "atomic-land: $label — record is at ${RECORD_HEAD:0:12}…, head is ${HEAD:0:12}…"
   if [ "$DRY_RUN" -eq 1 ]; then
-    say "atomic-land:     (dry-run) would run: record-review.sh $PR ${RECORD_HEAD:0:12}… $RECORD_VERDICT $REPO (carry-forward)"
+    log_line "atomic-land:     (dry-run) would run: record-review.sh $PR ${RECORD_HEAD:0:12}… $RECORD_VERDICT $REPO (carry-forward)"
     return 0
   fi
   local log rc prior="$RECORD_HEAD"
@@ -1750,11 +1750,11 @@ PY
 # Report the queue state observed for this head. One line, always the same shape,
 # so a log reader does not have to guess which fields were read.
 queue_report() { # <pr> <state> <queued_at> <rule> <unmet>
-  say "atomic-land: QUEUE #$1 — state=${2:-unreadable} rule=${4:-none} queued_at=${3:-none}"
+  log_line "atomic-land: QUEUE #$1 — state=${2:-unreadable} rule=${4:-none} queued_at=${3:-none}"
   if [ -n "${5:-}" ]; then
-    say "atomic-land: QUEUE #$1 — unmet entry conditions, as the queue reports them:"
+    log_line "atomic-land: QUEUE #$1 — unmet entry conditions, as the queue reports them:"
     printf '%s\n' "${5}" | tr ';' '\n' | while IFS= read -r c; do
-      [ -n "$c" ] && say "atomic-land:   • $c"
+      [ -n "$c" ] && log_line "atomic-land:   • $c"
     done
   fi
 }
@@ -1798,15 +1798,15 @@ do_queue_land() {
   # which is the failure mode a string match invites.
   case "$state" in
     *paused*|*Paused*|*suspend*|*Suspend*)
-      say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO reports state=$state."
-      say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+      log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO reports state=$state."
+      log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
       stop "the merge queue is PAUSED, so #$PR was NOT enqueued and nothing was merged. A pause is a deliberate stop and this rail will not route around it; re-run once the queue is resumed"
       ;;
   esac
   case "$meta" in
     *paused*|*Paused*|*suspend*|*Suspend*|*"⏸"*)
-      say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO is not accepting work."
-      say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+      log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO is not accepting work."
+      log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
       stop "the merge queue is PAUSED, so #$PR was NOT enqueued and nothing was merged. A pause is a deliberate stop and this rail will not route around it; re-run once the queue is resumed"
       ;;
   esac
@@ -1819,7 +1819,7 @@ do_queue_land() {
   case "$state" in
     queued|in_place|merged)
       queue_report "$PR" "$state" "$queued" "$rule" "$unmet"
-      say "atomic-land: the queue already holds #$PR — nothing to enqueue"
+      log_line "atomic-land: the queue already holds #$PR — nothing to enqueue"
       QUEUE_HANDED=1
       return 0 ;;
   esac
@@ -1831,18 +1831,18 @@ do_queue_land() {
   # command cannot merge a PR the queue refuses.
   if [ -n "$unmet" ]; then
     queue_report "$PR" "${state:-waiting}" "$queued" "$rule" "$unmet"
-    say "atomic-land: NOTE — the queue's PUBLISHED verdict above is its last evaluation; asking the queue is the only fresh read."
+    log_line "atomic-land: NOTE — the queue's PUBLISHED verdict above is its last evaluation; asking the queue is the only fresh read."
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
     queue_report "$PR" "${state:-waiting}" "$queued" "$rule" ""
-    say "atomic-land: (dry-run) would post '@Mergifyio queue' on #$PR and observe the queue state; nothing mutated"
+    log_line "atomic-land: (dry-run) would post '@Mergifyio queue' on #$PR and observe the queue state; nothing mutated"
     return 0
   fi
 
   # The documented enqueue command. A COMMENT is the whole action: no check is touched,
   # and the queue re-evaluates its own entry conditions server-side.
-  say "atomic-land: [4/4] land — enqueue #$PR into the merge queue (verdict before asking: ${state:-none-published})"
+  log_line "atomic-land: [4/4] land — enqueue #$PR into the merge queue (verdict before asking: ${state:-none-published})"
   gh_ pr comment "$PR" ${repo_args[@]+"${repo_args[@]}"} --body '@Mergifyio queue' >/dev/null \
     || stop "could not post the queue command on #$PR — nothing was enqueued"
 
@@ -1865,15 +1865,15 @@ do_queue_land() {
     # two fixes, and the second is nobody's to work around in this rail.
     case "$state" in
       *paused*|*Paused*|*suspend*|*Suspend*)
-        say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
-        say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+        log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
+        log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
         stop "the merge queue PAUSED during the hand-off, so #$PR was NOT enqueued and nothing was merged. Re-run once the queue is resumed; this rail does not route around a pause"
         ;;
     esac
     case "$meta" in
       *paused*|*Paused*|*suspend*|*Suspend*|*"⏸"*)
-        say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
-        say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+        log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
+        log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
         stop "the merge queue PAUSED during the hand-off, so #$PR was NOT enqueued and nothing was merged. Re-run once the queue is resumed; this rail does not route around a pause"
         ;;
     esac
@@ -1881,7 +1881,7 @@ do_queue_land() {
     case "$state" in
       queued|in_place|merged)
         queue_report "$PR" "$state" "$queued" "$rule" ""
-        say "atomic-land: ✅ #$PR handed to the merge queue at ${HEAD:0:12}… — the queue owns the merge from here (exit 0 means ENQUEUED, not merged; #1359)"
+        log_line "atomic-land: ✅ #$PR handed to the merge queue at ${HEAD:0:12}… — the queue owns the merge from here (exit 0 means ENQUEUED, not merged; #1359)"
         QUEUE_HANDED=1
         return 0 ;;
     esac
@@ -1910,7 +1910,7 @@ do_land() {
     do_queue_land
     return $?
   fi
-  say "atomic-land: [4/4] land — admin-merge.sh $PR ${MERGE_FLAGS[*]:-}"
+  log_line "atomic-land: [4/4] land — admin-merge.sh $PR ${MERGE_FLAGS[*]:-}"
   local flags=()
   if [ "$DRY_RUN" -eq 1 ]; then flags+=(--dry-run); fi
   if [ "${#MERGE_FLAGS[@]}" -gt 0 ]; then flags+=("${MERGE_FLAGS[@]}"); fi
@@ -1924,7 +1924,7 @@ confirm_merged() { # <max polls: 1 = a single immediate check>
   [ "$DRY_RUN" -eq 1 ] && return 0
   for i in $(seq 1 "$max"); do
     state="$(gh_ api "repos/$REPO/pulls/$PR" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null || echo OPEN)"
-    [ "$state" = "MERGED" ] && { say "atomic-land: ✅ merged PR #$PR"; return 0; }
+    [ "$state" = "MERGED" ] && { log_line "atomic-land: ✅ merged PR #$PR"; return 0; }
     [ "$max" -le 1 ] && break
     sleep 10
   done
@@ -1934,7 +1934,7 @@ confirm_merged() { # <max polls: 1 = a single immediate check>
 
 # ── main ─────────────────────────────────────────────────────────────────
 resolve_repo
-[ "$DRY_RUN" -eq 1 ] && say "atomic-land: DRY RUN — nothing will be mutated"
+[ "$DRY_RUN" -eq 1 ] && log_line "atomic-land: DRY RUN — nothing will be mutated"
 # Exclusive per-PR unit (B11). A dry run mutates nothing, so it takes no lock.
 [ "$DRY_RUN" -eq 0 ] && acquire_lock
 
@@ -1947,7 +1947,7 @@ fi
 # the record is missing would leave every freshly minted record local forever.
 sync_review_registry
 if ! read_record; then
-  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. If the review ran on ANOTHER box, \`scripts/registry-sync.sh status\` names what this box is missing and \`scripts/registry-sync.sh pull\` MAY make it reachable once that box has LANDED or booted (#2374)."
+  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. Before paying for that second review: if it ran on ANOTHER box, \`scripts/registry-sync.sh status\` names what this box is missing and \`scripts/registry-sync.sh pull\` MAY make it reachable once that box has LANDED or booted (#2374); and if the PR body carries a SIGNED marker, \`scripts/record-review.sh --recover-body $PR $REPO\` rebuilds this box's record from it, verifying the HMAC first so a body edit cannot mint one (#2872)."
 fi
 # ── DOES THE QUEUE PARTICIPATE AT ALL? (decided BEFORE anything is skipped) ──
 # This probe is what makes "fall back to the existing path" true rather than nominal.
@@ -1965,9 +1965,9 @@ fi
 if [ "$QUEUE_MODE" -eq 1 ]; then
   queue_declared; qd=$?
   case "$qd" in
-    0) say "atomic-land: --queue — $REPO declares a merge queue; the queue will own the merge" ;;
-    1) say "atomic-land: QUEUE-NOT-ARMED — $REPO declares NO merge queue in .mergify.yml"
-       say "atomic-land: falling back to the EXISTING land path (update → verify → record → the mandatory rail), unchanged; the queue does not participate"
+    0) log_line "atomic-land: --queue — $REPO declares a merge queue; the queue will own the merge" ;;
+    1) log_line "atomic-land: QUEUE-NOT-ARMED — $REPO declares NO merge queue in .mergify.yml"
+       log_line "atomic-land: falling back to the EXISTING land path (update → verify → record → the mandatory rail), unchanged; the queue does not participate"
        QUEUE_MODE=0 ;;
     *) stop "could not read $REPO's .mergify.yml, so whether a merge queue is armed is UNKNOWN — refusing to choose a land path on an unreadable instrument" ;;
   esac
@@ -1990,11 +1990,11 @@ if [ "$RECORD_HEAD" = "$HEAD" ] && [ -n "$RECORD_MB" ]; then
     stop "the record was certified against merge base ${RECORD_MB:0:12}… but this PR's base is ${live_mb:-unreadable} — the base was repointed BEFORE this unit (B10); re-review and re-record"
   fi
 fi
-say "atomic-land: PR #$PR  head=${HEAD:0:12}…  base=$BASE  state=$MERGE_STATE  record=${RECORD_VERDICT}@${RECORD_HEAD:0:12}…"
+log_line "atomic-land: PR #$PR  head=${HEAD:0:12}…  base=$BASE  state=$MERGE_STATE  record=${RECORD_VERDICT}@${RECORD_HEAD:0:12}…"
 
 round=1
 while :; do
-  say "atomic-land: ── round $round/$MAX_ROUNDS ──"
+  log_line "atomic-land: ── round $round/$MAX_ROUNDS ──"
   do_update
   # Capture the BASE the CHECKS are verified against, at the start of verification
   # (B10): the base branch name and its MERGE BASE. A move between here and the
@@ -2032,7 +2032,7 @@ while :; do
     # as a command substitution and silently lose its text (measured live: the line
     # printed "composition that lands ()" and emitted `merge_conditions: command not
     # found`). Quoting a config key is not worth a subshell.
-    say "atomic-land: [2/4] verify — skipped under --queue: the queue re-runs the required checks (merge_conditions) on the composition that lands, and gates entry on its own cheap conditions"
+    log_line "atomic-land: [2/4] verify — skipped under --queue: the queue re-runs the required checks (merge_conditions) on the composition that lands, and gates entry on its own cheap conditions"
   else
     wait_terminal
   fi
@@ -2058,7 +2058,7 @@ while :; do
       stop "the PR base was repointed ($CERT_BASE -> $q_now_base) after the record - the certified diff is no longer the diff that would be queued (B10); re-review and re-record against the new base"
     fi
     if [ "$q_now" != "$HEAD" ]; then
-      say "atomic-land: the head moved between the record (${HEAD:0:12}…) and the hand-off (${q_now:0:12}…) — the record no longer covers what would be queued"
+      log_line "atomic-land: the head moved between the record (${HEAD:0:12}…) and the hand-off (${q_now:0:12}…) — the record no longer covers what would be queued"
       resolve_state
       if [ "$round" -lt "$MAX_ROUNDS" ]; then
         HEAD="$q_now"
@@ -2085,10 +2085,10 @@ while :; do
       stop "could not re-resolve the head/base before landing — refusing to land unverified"
     fi
     if [ "$now" != "$HEAD" ]; then
-      say "atomic-land: the head moved between the record (${HEAD:0:12}…) and the land (${now:0:12}…) — the record no longer covers what would merge"
+      log_line "atomic-land: the head moved between the record (${HEAD:0:12}…) and the land (${now:0:12}…) — the record no longer covers what would merge"
       resolve_state
       if [ "$round" -lt "$MAX_ROUNDS" ]; then
-        say "atomic-land: re-deriving the record at the new head — another round"
+        log_line "atomic-land: re-deriving the record at the new head — another round"
         round=$((round + 1))
         continue
       fi
@@ -2113,7 +2113,7 @@ while :; do
         stop "could not re-read the base tip before landing — refusing to land unverified (B12)"
       fi
       if [ "$now_tip" != "$CERT_BASE_TIP" ]; then
-        say "atomic-land: the base ADVANCED after verification (${CERT_BASE_TIP:0:12}… → ${now_tip:0:12}…) — the checks did not cover the new base"
+        log_line "atomic-land: the base ADVANCED after verification (${CERT_BASE_TIP:0:12}… → ${now_tip:0:12}…) — the checks did not cover the new base"
         resolve_state
         if [ "$round" -lt "$MAX_ROUNDS" ]; then
           # The next round re-enters the whole unit, but it does NOT necessarily
@@ -2124,7 +2124,7 @@ while :; do
           # re-captures CERT_BASE_TIP at the advanced tip and the pre-land re-read
           # compares against THAT. Saying "the CHECK is re-run" here would assert a
           # measurement nobody took.
-          say "atomic-land: re-verifying against the advanced base — another round (the reviewed diff is unchanged and the review is reused; the base BINDING is re-established — the checks are re-run only if the head is actually moved)"
+          log_line "atomic-land: re-verifying against the advanced base — another round (the reviewed diff is unchanged and the review is reused; the base BINDING is re-established — the checks are re-run only if the head is actually moved)"
           round=$((round + 1))
           continue
         fi
@@ -2148,7 +2148,7 @@ while :; do
   # the carry-forward carries the same verdict — else stop and relay the reason.
   resolve_state
   if [ "$MERGE_STATE" = "BEHIND" ] && [ "$round" -lt "$MAX_ROUNDS" ]; then
-    say "atomic-land: the base advanced mid-unit (BEHIND again) — another round"
+    log_line "atomic-land: the base advanced mid-unit (BEHIND again) — another round"
     round=$((round + 1))
     continue
   fi
