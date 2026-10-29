@@ -156,7 +156,25 @@ case "${1:-}" in
   surface)
     [ "${CMUX_HOST:-0}" = "1" ] || { echo 'cmux: unknown resource scope "surface"' >&2; exit 1; }
     if [ "${2:-}" = "ls" ]; then exit 0; fi
-    if [ "${2:-}" = "new-terminal" ]; then printf 'surface:term_host42\n'; exit 0; fi
+    if [ "${2:-}" = "new-terminal" ]; then
+      # ⛔ `--machine` IS MANDATORY IN THE CURRENT CLI, AND ITS ABSENCE IS WHAT LOST EVERY SPAWN
+      # (`Error: surface new-terminal: --machine <id|local> is required`, measured 2026-10-29 — six
+      # refusals in one pass while the controller read healthy). A stub that answers regardless of
+      # argv is a PERMISSIVE stub, and a permissive stub is exactly why the default in
+      # worker-terminal.sh had no assertion: the old "add the flag only when WT_MACHINE is set" shape
+      # satisfied every arm here. Modelled faithfully, so the default is EXECUTED — and so a revert
+      # reproduces the OUTAGE (refusal, no record) instead of merely a missing word.
+      _mt=""; shift 2
+      while [ "$#" -gt 0 ]; do
+        case "${1:-}" in
+          --machine) _mt="${2:-}"; shift ;;
+          --) break ;;
+        esac
+        shift
+      done
+      [ -n "$_mt" ] || { echo 'Error: surface new-terminal: --machine <id|local> is required' >&2; exit 1; }
+      printf 'surface:term_host42\n'; exit 0
+    fi
     ;;
   layout)
     [ "${CMUX_LAYOUT_RC:-0}" = "0" ] || { echo "cmux: layout apply failed" >&2; exit "${CMUX_LAYOUT_RC}"; }
@@ -1330,6 +1348,27 @@ grep -q 'CMUX surface new-terminal --machine vm-abc --cwd /tmp --no-open -- /bin
 ck "…and spawns with the named primitive: --machine/--cwd/--no-open and the run script" $rc
 grep -qx 'grammar=surface' "$TMP/O8/state/worker-merge-5" && rc=0 || rc=1
 ck "…recording which grammar produced it" $rc
+
+# ⛔ THE DEFAULT IS THE WHOLE FIX, SO IT MUST BE EXECUTED BY SOMETHING (#2210). Before this arm,
+# every `grammar=surface` scenario set WT_MACHINE EXPLICITLY (G and I above), so the defaulted value
+# was dead code to the suite: restore `if [ -n "${WT_MACHINE:-}" ]` and every assertion still passed.
+# Driven with WT_MACHINE UNSET — precisely the box state that lost all six spawns — and against a
+# stub that now REFUSES the flag's absence, so the failure mode is the outage itself.
+cat > "$TMP/g1b.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_HOST=1 CMUX_LOG="$4"
+unset WT_MACHINE
+. "$1"
+wt_spawn "merge-5" "/tmp" 'bash /tmp/merge-one.sh --argv /tmp/a'; echo "rc=$?"
+SH
+out="$(bash "$TMP/g1b.sh" "$LIB" "$TMP/bin-host" "$TMP/O8b" "$TMP/cmux8b.log" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an UNSET WT_MACHINE still spawns (the current CLI refuses the flag's absence)" $rc
+grep -q 'CMUX surface new-terminal --machine local --cwd /tmp --no-open -- /bin/bash .*run-merge-5.sh' "$TMP/cmux8b.log" && rc=0 || rc=1
+ck "…and the default target is \`local\` — the machine this process runs on" $rc
+[ -f "$TMP/O8b/state/worker-merge-5" ] && rc=0 || rc=1
+ck "…and the worker is RECORDED, so it can be reaped (the outage left nothing to track)" $rc
 
 echo
 echo "── I) a surface-grammar worker is TRACKED BY ITS TERMINAL ID (it has no workspace name) ──"
