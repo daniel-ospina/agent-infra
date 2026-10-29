@@ -45,6 +45,10 @@ Environment=DISK_REAPER={{REAPER_DIR}}/disk-reaper.sh
 # query still cannot answer, the class FAILS CLOSED (a checkout with an open PR is never guessed at)
 # and the supervisor shows which class failed.
 Environment=REAP_WT_GH_TIMEOUT=120
+# #2542: the two owners of the classes that actually filled the cells (abandoned /tmp worktrees, and
+# surplus copies of the same runner install). Pinned for the same reason as the three above.
+Environment=ABANDONED_WT_REAPER={{REAPER_DIR}}/reap-abandoned-worktrees.sh
+Environment=DUP_INSTALL_REAPER={{REAPER_DIR}}/reap-duplicate-installs.sh
 # Never compete with a lane for CPU or I/O: the pass is a background sweep, not a deadline.
 Nice=10
 IOSchedulingClass=idle
