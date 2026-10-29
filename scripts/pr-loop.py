@@ -50,10 +50,112 @@ LOG_FILE = os.path.join(STATE, "pr-loop.log")
 
 
 def _objective():
+    # ⛔ THE REPO IS AN INPUT, AND IT MUST COME FROM THIS CHECKOUT (#2040/#1901).
+    # `objective.py` reads its repo from `OBJECTIVE_REPO` and DEFAULTS to
+    # daniel-ospina/tortoise. Nothing in this loop supplied it, so on ANY other repo the loop
+    # graded tortoise's PRs from ITS OWN checkout: every read succeeded, the classifier answered
+    # about the wrong queue, and the pass looked alive while acting on PRs this box does not own.
+    # That is the measured #2700 shape — `58 PR(s) had UNREADABLE checks … No commit found for SHA
+    # f75d30d3` (a 422 for every PR, because the SHAs were another repo's).
+    #
+    # ⛔ ONE DERIVER, NOT A SECOND PARSER: `scripts/orchestrator-harness/repo-slug.sh`'s
+    # `derive_or` is the fleet's single answer to "which owner/name is this checkout", shared with
+    # orch-loop.sh and refresh-candidates.sh. A python copy would be a THIRD derivation — the drift
+    # repo-slug.sh exists to end — so the slug is obtained by sourcing that file.
+    #
+    # ⚠️ THIS BINDS THE **REPO** INPUT ONLY, AND SAYS SO. `objective.py` has a SECOND
+    # repo-dependent input — its REQUIRED context set (`REQUIRED`, defaulting to tortoise's seven
+    # names) — which `repo-authority.sh` resolves for the controllers and which NOTHING supplies
+    # here. Binding it means one `gh` protection read per pass and changes the class of every
+    # dispatch this loop makes, so it belongs with the caller-side fix #2700 already names as C5's
+    # acceptance criterion; doing it inside a repo-binding fix would change the fleet's behaviour
+    # unreviewed. Stated, not silently assumed bound.
+    #
+    # ⛔ AND THE DERIVER MUST TRAVEL WITH THIS FILE. `_checkout_repo` sources
+    # `scripts/orchestrator-harness/repo-slug.sh`; a box that farms `pr-loop.py` WITHOUT that file
+    # gets the refusal below (fail-closed, never a guess) — so any future farm list carrying this
+    # script must carry the deriver too.
+    if not os.environ.get("OBJECTIVE_REPO"):
+        derived, why = _checkout_repo()
+        if not derived:
+            # ⛔ THREE CAUSES, THREE REMEDIES, NAMED SEPARATELY. Collapsing them made the operator
+            # apply the stated remedy ("run from the checkout you mean") forever on a box that is in
+            # fact MISSING the deriver — the loop stays dead and the message points elsewhere. The
+            # same collapse ate the THIRD cause too (ai#2922 review, P1): `cwd-unreadable` was
+            # computed by `_checkout_repo` and then reached the `underivable` branch below, which
+            # tells an operator holding a launchd cwd failure to debug their origin remote. Each
+            # branch below states the remedy for the cause it was actually given.
+            if why == "deriver-missing":
+                raise SystemExit(
+                    "pr-loop: cannot bind this checkout's repo — the ONE slug deriver is MISSING "
+                    "next to this script (looked for orchestrator-harness/repo-slug.sh and "
+                    "repo-slug.sh). Refusing to grade ANOTHER repo (the classifier's fallback is "
+                    "daniel-ospina/tortoise). Remedy: deploy scripts/orchestrator-harness/repo-slug.sh "
+                    "with this file, or export OBJECTIVE_REPO=<owner/name>.")
+            if why == "cwd-unreadable":
+                raise SystemExit(
+                    "pr-loop: cannot read this process's working directory — the OS refused "
+                    "(PermissionError/ENOENT; a sandboxed launcher with no Full Disk Access). "
+                    "Refusing to grade ANOTHER repo (the classifier's fallback is "
+                    "daniel-ospina/tortoise). Remedy: move the job's WorkingDirectory out of the "
+                    "protected tree, or export OBJECTIVE_REPO=<owner/name>.")
+            raise SystemExit(
+                "pr-loop: cannot derive this checkout's repo from its origin remote — refusing to "
+                "grade ANOTHER repo (the classifier's fallback is daniel-ospina/tortoise). Run from "
+                "the checkout you mean, or export OBJECTIVE_REPO=<owner/name>.")
+        os.environ["OBJECTIVE_REPO"] = derived
     spec = importlib.util.spec_from_file_location("objective_loop", HERE / "objective.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _safe_cwd():
+    """The process's cwd, or None when the OS REFUSES to say where the process is.
+
+    ⛔ `os.getcwd()` IS NOT A TOTAL FUNCTION (ai#2922) -- see the twin in `objective.py`'s
+    `_checkout_repo`, which this shim mirrors deliberately. Under launchd with no Full Disk Access
+    the call RAISES (`PermissionError`, or `FileNotFoundError` for a deleted `WorkingDirectory`)
+    instead of returning a path.
+    """
+    try:
+        return os.getcwd()
+    except OSError:                            # PermissionError, ENOENT, ENOENT-after-delete
+        return None
+
+
+def _checkout_repo(path=None):
+    """(slug, reason): `owner/name` of the checkout this loop acts on, or (None, why).
+
+    Sourced, never re-implemented — see the block above `_objective`. The reason is "deriver-missing"
+    when the script is deployed without repo-slug.sh, "cwd-unreadable" when the OS refuses to report
+    the working directory, else "underivable" — three different remedies, reported rather than
+    collapsed (ai#2922: a cwd failure used to reach the broad `except` below and be reported as
+    "underivable", whose remedy is to debug `git`/`bash`).
+    """
+    lib = None
+    for cand in (HERE / "orchestrator-harness" / "repo-slug.sh", HERE / "repo-slug.sh"):
+        if cand.is_file():
+            lib = cand
+            break
+    if lib is None:
+        return None, "deriver-missing"
+    # ⛔ RESOLVED OUTSIDE THE `try`: a cwd that cannot be read is a NAMED cause.
+    if not path:
+        path = _safe_cwd()
+        if path is None:
+            return None, "cwd-unreadable"
+    try:
+        res = subprocess.run(
+            ["bash", "-c", '. "$1" >/dev/null 2>&1; derive_or "$2"', "_", str(lib),
+             str(path)],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None, "underivable"
+    if res.returncode != 0:
+        return None, "underivable"
+    slug = (res.stdout or "").strip()
+    return (slug, "") if slug else (None, "underivable")
 
 
 def log(msg):
