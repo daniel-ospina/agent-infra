@@ -256,6 +256,9 @@ wt_cmux_server() { # <verb> [args...] -> prints the answer
 #   WT_PROBE_LINE        `space free=… inodes=… state=… floor=…; server status=…` — the readings, verbatim
 #   WT_PROBE_SHORT       1 only when the volume was MEASURED at/below a floor (never on an unreadable)
 #   WT_PROBE_OWNER       running | down | unreadable | unsupported
+#   WT_PROBE_SPACE_READ / WT_PROBE_INODE_READ / WT_PROBE_SIZE_READ   1 iff THAT reading answered.
+#                        Three flags, because a verdict is not a reading: `fine` says the volume is not
+#                        at a floor, it does NOT say all three were taken (review round 4, finding F1).
 # The verdict order is deliberate: SPACE WINS when it is short, because then the daemon's own message is
 # consistent with a measurement and no recovery is worth attempting (restarting a session frees no
 # space). `owner-running` is the cell-3 reading, and it is the one that must never be flattened into
@@ -263,7 +266,8 @@ wt_cmux_server() { # <verb> [args...] -> prints the answer
 # failure, not a dead process and not a full disk.
 wt_cmux_probe() {
   local dir fk space_u inode_u size_kb srv srvlow floor ino_floor
-  WT_PROBE_VERDICT=unreadable; WT_PROBE_SHORT=0; WT_PROBE_OWNER=unreadable; WT_PROBE_LINE=""; WT_PROBE_SPACE_READ=0
+  WT_PROBE_VERDICT=unreadable; WT_PROBE_SHORT=0; WT_PROBE_OWNER=unreadable; WT_PROBE_LINE=""
+  WT_PROBE_SPACE_READ=0; WT_PROBE_INODE_READ=0; WT_PROBE_SIZE_READ=0
   floor="${WT_STATE_FREE_FLOOR_MB:-1024}"; case "$floor" in ''|*[!0-9]*) floor=1024 ;; esac
   ino_floor="${WT_STATE_INODE_PCT_FLOOR:-95}"; case "$ino_floor" in ''|*[!0-9]*) ino_floor=95 ;; esac
 
@@ -314,7 +318,11 @@ wt_cmux_probe() {
     *) WT_PROBE_SPACE_READ=1; [ "$fk" -le "$((floor * 1024))" ] && WT_PROBE_SHORT=1 ;;
   esac
   case "${inode_u:-}" in
-    *%) [ "${inode_u%\%}" -ge "$ino_floor" ] 2>/dev/null && WT_PROBE_SHORT=1 ;;
+    *%) WT_PROBE_INODE_READ=1; [ "${inode_u%\%}" -ge "$ino_floor" ] 2>/dev/null && WT_PROBE_SHORT=1 ;;
+  esac
+  case "${size_kb:-}" in
+    ''|*[!0-9]*) : ;;
+    *) WT_PROBE_SIZE_READ=1 ;;
   esac
 
   if [ "$WT_PROBE_SHORT" = "1" ]; then WT_PROBE_VERDICT=space
@@ -326,6 +334,20 @@ wt_cmux_probe() {
   # ONE flat line, every value either MEASURED or explicitly UNREADABLE — the shape the refusal carries.
   WT_PROBE_LINE="space$( [ -n "$dir" ] && printf ' [%s]' "$dir" ) free=$( [ -n "${fk:-}" ] && printf '%sMB' "$((fk / 1024))" || printf UNREADABLE ) use=$( [ -n "${space_u:-}" ] && printf '%s' "$space_u" || printf UNREADABLE ) inodes=$( [ -n "${inode_u:-}" ] && printf '%s' "$inode_u" || printf UNREADABLE ) state=$( [ -n "${size_kb:-}" ] && printf '%sMB' "$((size_kb / 1024))" || printf UNREADABLE ) floor=${floor}MB/${ino_floor}%; server status=$( [ -n "$srv" ] && printf '%s' "$(printf '%s' "$srv" | tr '\n' ' ' | cut -c1-200)" || printf 'NOT READ (owner=%s)' "$WT_PROBE_OWNER" )"
   return 0
+}
+
+# Which of the three VOLUME readings the probe did NOT get, as one comma-joined phrase — EMPTY only
+# when all three answered. ⛔ IT EXISTS BECAUSE A VERDICT IS NOT A READING (review round 4, finding F1):
+# the `fine` arm used to say "free space, inodes and state size all measured" off `WT_PROBE_SPACE_READ`
+# alone, while the same refusal printed `inodes=UNREADABLE` a few words earlier — this file's own defect
+# class, reintroduced inside the one sentence that exists to remove it. An inode-less `df -Pi` (no `N%`
+# column) or a `du -sk` that hits its bound reaches that state without any exotic condition.
+wt_cmux_vol_unread() {
+  local u=""
+  [ "${WT_PROBE_SPACE_READ:-0}" = "1" ] || u="free space"
+  [ "${WT_PROBE_INODE_READ:-0}" = "1" ] || u="${u:+$u, }inodes"
+  [ "${WT_PROBE_SIZE_READ:-0}" = "1" ] || u="${u:+$u, }state size"
+  printf '%s' "$u"
 }
 
 # The READING of a probe, as one sentence for a refusal. ⛔ It states what the measurements show and
@@ -358,18 +380,34 @@ wt_cmux_probe_reading() {
     owner-running)
       case "$sp" in
         short) printf 'the durable session owner answers `status running` yet could not allocate a workspace, AND the state volume is short — BOTH readings are real, and the owner is the one that needs a human' ;;
-        fine)  printf 'the durable session owner answers `status running` and the state volume is NOT short (free space, inodes and state size all measured), so NEITHER of the causes this probe can measure is the failure — the create failed inside the SESSION OWNER, which is the one candidate left; the disk-full wording in the daemon message is a FALSE CAUSE' ;;
+        fine)
+          # ⛔ FALSE CAUSE IS A VERDICT ON A COMPLETE READING, AND IT IS ONLY SAYABLE THEN (review round 4,
+          # finding F1). Inode exhaustion IS a disk-full cause, so a volume read on free space alone
+          # cannot exonerate the disk: the incomplete arm states what it measured and no verdict.
+          if [ -z "$(wt_cmux_vol_unread)" ]; then
+            printf 'the durable session owner answers `status running` and the state volume is NOT short (free space, inodes and state size all measured), so NEITHER of the causes this probe can measure is the failure — the create failed inside the SESSION OWNER, which is the one candidate left; the disk-full wording in the daemon message is a FALSE CAUSE'
+          else
+            printf 'the durable session owner answers `status running` and the state volume is NOT short on free space, but this probe could NOT read %s (see `space …` above) — so the disk is NOT ruled out, no FALSE-CAUSE verdict is stated, and the one thing measured is that the owner answered and still could not allocate a workspace' "$(wt_cmux_vol_unread)"
+          fi ;;
         *)     printf 'the durable session owner answers `status running` yet could not allocate a workspace; the state volume could NOT be read, so the disk is not ruled out' ;;
       esac ;;
     *)
       if [ "$srvowner" = "unsupported" ]; then
         if [ "$sp" = "fine" ]; then
-          printf 'this CLI has NO `server` verb (`cmux server --help` answers Unknown command), so the session was NOT probed and nothing here claims to have read it; the volume readings above ARE this box, and they are not short — so no cause is established, and the daemon one is not repeated'
+          if [ -z "$(wt_cmux_vol_unread)" ]; then
+            printf 'this CLI has NO `server` verb (`cmux server --help` answers Unknown command), so the session was NOT probed and nothing here claims to have read it; the volume readings above ARE this box, and none of them is at a floor — so no cause is established, and the daemon one is not repeated'
+          else
+            printf 'this CLI has NO `server` verb (`cmux server --help` answers Unknown command), so the session was NOT probed and nothing here claims to have read it; the volume readings above ARE this box, though %s could not be read — so no cause is established, and the daemon one is not repeated' "$(wt_cmux_vol_unread)"
+          fi
         else
           printf 'this CLI has NO `server` verb, so the session was NOT probed, and the state volume could not be read either — NO cause is established here, and the daemon one is not repeated'
         fi
       elif [ "$sp" = "fine" ]; then
-        printf 'the session owner did not answer within the bound or answered something this probe cannot read, while the state volume is NOT short (measured) — so the daemon cause is NOT supported by any reading taken here'
+        if [ -z "$(wt_cmux_vol_unread)" ]; then
+          printf 'the session owner did not answer within the bound or answered something this probe cannot read, while the state volume is NOT short (free space, inodes and state size all measured) — so the daemon cause is NOT supported by any reading taken here'
+        else
+          printf 'the session owner did not answer within the bound or answered something this probe cannot read; free space is measured and NOT short, but %s could not be read — so the daemon cause is NOT supported by the readings taken, and it is not ruled out either' "$(wt_cmux_vol_unread)"
+        fi
       else
         printf 'NEITHER the session owner nor the state volume could be READ on this box, so this probe confirms NO cause — it does not repeat the daemon one either'
       fi ;;
@@ -1965,7 +2003,8 @@ PY
     out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
     if [ "$_larc" -ne 0 ]; then
       _lamsg="$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
-      WT_PROBE_VERDICT=unreadable; WT_PROBE_LINE=""; WT_PROBE_SHORT=0; WT_PROBE_OWNER=unreadable; WT_PROBE_SPACE_READ=0
+      WT_PROBE_VERDICT=unreadable; WT_PROBE_LINE=""; WT_PROBE_SHORT=0; WT_PROBE_OWNER=unreadable
+      WT_PROBE_SPACE_READ=0; WT_PROBE_INODE_READ=0; WT_PROBE_SIZE_READ=0
       WT_ENSURE_TRIES=0; WT_ENSURE_SEEN=""
       _recovered=""
       # The probe, and the recovery, are SKIPPED in exactly two cases, each for a reason:
@@ -1979,22 +2018,40 @@ PY
         WT_PROBE_VERDICT=not-run
       else
         wt_cmux_probe
-        if [ "$WT_PROBE_OWNER" != "unsupported" ] && [ "$WT_PROBE_SHORT" != "1" ]; then
-          wt_cmux_session_ensure || true
-          _larc=0
-          out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
-          if [ "$_larc" -eq 0 ]; then
-            # ⛔ A RECOVERY IS SAID OUT LOUD, because it is EVIDENCE ABOUT THE BOX: a spawn that needed
-            # the session ensured is a cell whose owner had stopped allocating, and the next cycle must
-            # be able to see that from the log rather than infer it from a spawn count.
-            wt_warn "RECOVERED $name: \`cmux layout apply\` failed once, \`cmux server ensure --session $(wt_cmux_session)\` answered on attempt $WT_ENSURE_TRIES, and the re-attempt SUCCEEDED — MEASURED: ${WT_PROBE_LINE}; READING: $(wt_cmux_probe_reading). The first failure's own message (NOT verified as a cause): ${_lamsg:-no output, exit status only}"
-          else
-            _recovered=" — recovery: \`cmux server ensure --session $(wt_cmux_session)\` tried $WT_ENSURE_TRIES time(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf ' (last answer: %s)' "$WT_ENSURE_SEEN" ) and the re-attempt FAILED TOO; the residual is that the session owner must be repaired out of band (\`server stop --force\` + \`ensure\` is the recorded lever, and it ends every terminal inside the owner, so this spawn path does not take it)"
-          fi
-        elif [ "$WT_PROBE_SHORT" = "1" ]; then
+        # ⛔ THE RECOVERY RUNS ONLY WHERE A READING NAMES THE SESSION (review round 4, finding F2).
+        # `WT_PROBE_VERDICT=unreadable` used to satisfy the gate below, so a daemon that did not answer
+        # within `WT_SERVER_TIMEOUT` — the very state this path runs in — bought up to
+        # `WT_SERVER_ENSURE_ATTEMPTS` ensure calls, a 2 s pause each, and a SECOND `cmux layout apply` on
+        # the controller's synchronous spawn path, for a box the probe could not read at all. That is a
+        # retry of a failure this file did not diagnose, which its own header and
+        # `docs/ops/self-healing-contract.md` §3.8 both deny. So the gate is the VERDICT, not the
+        # absence of a disqualifier: `owner-down` and `owner-running` are the two readings that put the
+        # session on the hook (a stopped owner, or the cell-3 owner that answered and still could not
+        # allocate); no reading, no retry.
+        if [ "$WT_PROBE_SHORT" = "1" ]; then
           _recovered=" — recovery: NOT attempted, because restarting a session frees no space; reclaim the volume (the recorded lever for the FULL-volume variant is agent-infra#2312)"
-        else
+        elif [ "$WT_PROBE_OWNER" = "unsupported" ]; then
           _recovered=" — recovery: NOT possible on this CLI (no \`server\` verb: \`cmux server --help\` answers 'Unknown command'), so nothing here could repair the surface and nothing here claims to have read it"
+        else
+          case "${WT_PROBE_VERDICT:-unreadable}" in
+            owner-down|owner-running)
+              wt_cmux_session_ensure || true
+              _larc=0
+              out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
+              if [ "$_larc" -eq 0 ]; then
+                # ⛔ A RECOVERY IS SAID OUT LOUD, because it is EVIDENCE ABOUT THE BOX: a spawn that needed
+                # the session ensured is a cell whose owner had stopped allocating, and the next cycle must
+                # be able to see that from the log rather than infer it from a spawn count.
+                wt_warn "RECOVERED $name: \`cmux layout apply\` failed once, \`cmux server ensure --session $(wt_cmux_session)\` answered on attempt $WT_ENSURE_TRIES, and the re-attempt SUCCEEDED — MEASURED: ${WT_PROBE_LINE}; READING: $(wt_cmux_probe_reading). The first failure's own message (NOT verified as a cause): ${_lamsg:-no output, exit status only}"
+              else
+                _recovered=" — recovery: \`cmux server ensure --session $(wt_cmux_session)\` tried $WT_ENSURE_TRIES time(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf ' (last answer: %s)' "$WT_ENSURE_SEEN" ) and the re-attempt FAILED TOO; the residual is that the session owner must be repaired out of band (\`server stop --force\` + \`ensure\` is the recorded lever, and it ends every terminal inside the owner, so this spawn path does not take it)"
+              fi ;;
+            *)
+              # ⛔ NO READING, NO RETRY (review round 4, finding F2). The refusal that says "no cause is
+              # established" must not then act as if one were: the message and the behaviour are the same
+              # claim, so this arm states the residual and leaves the box alone.
+              _recovered=" — recovery: NOT attempted, because the probe could not READ the session owner (\`server status\` did not answer within ${WT_SERVER_TIMEOUT:-10}s, or answered something this classifier cannot read), so NO reading here names the session as the finding — a retry on a guess is exactly what this path does not do; re-run the spawn or inspect the owner by hand" ;;
+          esac
         fi
       fi
       if [ "$_larc" -ne 0 ]; then

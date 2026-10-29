@@ -2427,6 +2427,56 @@ case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
 ck "R7: …so the refusal does NOT call the daemon a FALSE CAUSE on a box whose owner said it was down" $rc
 case "$out" in *"answers \`status running\`"*) rc=1 ;; *) rc=0 ;; esac
 ck "R7: …and it does not claim the owner answered \`status running\` when it answered the opposite" $rc
+# (R8) A VERDICT IS NOT A READING (review round 4, finding F1). `fine` is derived from
+# WT_PROBE_SPACE_READ alone, so a box whose `df -Pi` yields NO `N%` column (inodes reported `-`, the
+# ZFS-shaped home) reaches `fine` with `inodes=UNREADABLE` — and the arm used to print "free space,
+# inodes and state size all measured" in the same refusal that printed `inodes=UNREADABLE` a few words
+# earlier. That is this PR's own defect class inside the sentence that exists to end it, so it gets an
+# arm: a fixture whose free space is healthy and whose inode column is ABSENT.
+scenario partdf
+cat > "$TMP/bin-partdf/df" <<'SH'
+#!/usr/bin/env bash
+# Free space healthy; the inode column reports NO percentage at all (the `-` shape), so the probe's
+# `df -Pi` awk finds no `N%` field and inodes is UNREADABLE while `fk` is a real reading.
+case "$*" in
+  *"-Pi"*|*" -i"*) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/x 8000000 1000000 7000000 12 - - - /\n' ;;
+  *) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 8000000 3819776 4194304 12%% /\n' ;;
+esac
+SH
+chmod +x "$TMP/bin-partdf/df"
+rm -rf "$TMP/OR8" "$TMP/rstate8"; : > "$TMP/ensure8.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure8.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-partdf" "$TMP/OR8" "$TMP/cmuxr8.log" "$TMP/rstate8" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8: a partly-readable volume still refuses (the fixture drives the arm, not the runner's disk)" $rc
+case "$out" in *"inodes=UNREADABLE"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8: …and the reading line prints the unmeasured inode column as UNREADABLE (not as fine)" $rc
+case "$out" in *"free space, inodes and state size all measured"*) rc=1 ;; *) rc=0 ;; esac
+ck "R8: …so the READING does NOT claim all three were measured while the line above says UNREADABLE" $rc
+case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
+ck "R8: …and it does NOT issue a FALSE-CAUSE verdict on an incomplete volume reading (inode exhaustion IS a full-disk cause)" $rc
+case "$out" in *"could NOT read inodes"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8: …but it NAMES what it could not read, so the operator knows which reading is missing" $rc
+# (R9) NO READING, NO RETRY (review round 4, finding F2). The recovery used to be gated on the ABSENCE
+# of a disqualifier (`owner != unsupported`, `not short`), which `WT_PROBE_VERDICT=unreadable`
+# satisfies — so a daemon that did not answer within WT_SERVER_TIMEOUT, the very state this path runs
+# in, bought ensure calls plus a SECOND `cmux layout apply` on the controller's synchronous spawn path,
+# for a box the probe could not read at all. The file header and the operator doc both say the recovery
+# runs only "where the reading says the SESSION is the finding", so this arm pins the gate to the
+# VERDICT and asserts BOTH halves: nothing was ensured, and the create was attempted exactly once.
+rm -rf "$TMP/OR9" "$TMP/rstate9"; : > "$TMP/ensure9.log"; : > "$TMP/cmuxr9.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status: warmup pending' CMUX_SERVER_STATUS_RC=0 CMUX_ENSURE_LOG="$TMP/ensure9.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR9" "$TMP/cmuxr9.log" "$TMP/rstate9" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R9: an owner whose answer the classifier cannot read still refuses the spawn" $rc
+[ "$(grep -c 'ENSURE ' "$TMP/ensure9.log" 2>/dev/null)" = "0" ] && rc=0 || rc=1
+ck "R9: …and NO ensure is attempted, because no reading names the session as the finding" $rc
+[ "$(grep -c 'layout apply' "$TMP/cmuxr9.log" 2>/dev/null)" = "1" ] && rc=0 || { rc=1; cat "$TMP/cmuxr9.log"; }
+ck "R9: …and the create is attempted exactly ONCE (an undiagnosed failure is not retried on a guess)" $rc
+case "$out" in *"recovery: NOT attempted"*"could not READ the session owner"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R9: …and the refusal SAYS so, instead of leaving the residual to be inferred from an absent line" $rc
+case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
+ck "R9: …and it does not call the daemon's cause false on a probe that established no cause either" $rc
 
 echo
 echo "── P) the module INITIALISES under bash 3.2 — no heredoc inside a command substitution (#2248) ──"
