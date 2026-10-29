@@ -27,6 +27,8 @@ import {
   extractGhRepoEnv,
   extractPrNumber,
   unquotedMask,
+  commandSpellings,
+  collapseUnquotedWhitespace,
   GH_PR_MERGE_VERB,
 } from "./git-command-parse.js";
 import { ok, equal } from "node:assert/strict";
@@ -1081,6 +1083,144 @@ test("extractRepoFlag: the ATTACHED short form is a real gh spelling (#931/#993)
   // The flag is still a whole TOKEN: an embedded lookalike is not an identity.
   equal(extractRepoFlag("gh pr merge 1 --body=x--repo a/b"), null);
   equal(extractRepoFlag("gh pr merge 1 --body=see--repo x/y"), null);
+});
+
+// ── commandSpellings (#1329) ──────────────────────────
+// The gate is a regex over the command text, so the SPELLING decides whether a
+// rule fires. Every case below is MEASURED against the armed manifest: the
+// `git -C <dir>` family was ALLOWED before #1329 (its pattern is split), and the
+// raw-matched family (`/usr/bin/git commit` …) was always BLOCKED. The suite
+// pins the derivation, not the manifest.
+
+section("commandSpellings — git/gh GLOBAL options are removed (#1329)");
+
+test("a git/gh invocation's global options are removed, verb and tail kept verbatim", () => {
+  const cases: Array<[string, string]> = [
+    ["git -C /tmp/wt commit -m x", "git commit -m x"],
+    ["git --no-pager commit -m x", "git commit -m x"],
+    ["git -c user.name=a commit -m x", "git commit -m x"],
+    ["git --git-dir=/x/.git commit -m x", "git commit -m x"],
+    ["git --work-tree /x add .", "git add ."],
+    ["git -C /x stash pop", "git stash pop"],
+    ["git -C /x worktree add /tmp/w", "git worktree add /tmp/w"],
+    ["gh -R owner/name pr create --fill", "gh pr create --fill"],
+    ["gh --repo=owner/name pr merge 42", "gh pr merge 42"],
+    // Attached short form (`-C/x`), and the value-flag run at the very end.
+    ["git -C/x commit", "git commit"],
+    ["git --no-pager", "git"],
+  ];
+  for (const [input, expected] of cases) {
+    const variants = commandSpellings(input);
+    equal(variants[0], input, "the RAW command must be the first spelling (OR-ing can never lose a hit)");
+    equal(variants[1], expected, input);
+    equal(variants.length, 2, input);
+  }
+});
+
+test("nothing is fabricated: every spelling is the input with spans DELETED, but the declared normalisation", () => {
+  // ⛔ THE NAME USED TO CLAIM SUBSEQUENCE FOR EVERY SPELLING, AND THAT BECAME FALSE WHEN THE
+  // WHITESPACE-NORMALISED SPELLING WAS ADDED (#1329 review P2). A tab is not a space, so
+  // `git commit` is NOT a subsequence of `git<TAB>commit` -- it is the same tokens with the
+  // separator the shell does not distinguish. The test's own input list had no whitespace
+  // variants, so the stale name was the only thing wrong with it: a declaration that is
+  // false about its own subject is exactly what #1329 exists to remove. Both halves are now
+  // pinned by name, and the exception is asserted to be the LAST spelling and nothing else.
+  const inputs = [
+    "git -C /tmp/wt commit -m x", "gh -R owner/name pr create", "git -c a=b -c c=d push",
+    "cd /a && git --no-pager merge --no-ff origin/main", "true;git -C /x add -A",
+    "git -C /x commit && git -C /y push", "git -C '/tmp/my worktree' commit",
+  ];
+  const isSubsequence = (needle: string, haystack: string) => {
+    let i = 0;
+    for (const ch of haystack) if (i < needle.length && needle[i] === ch) i++;
+    return i === needle.length;
+  };
+  for (const input of inputs) {
+    for (const spelling of commandSpellings(input)) {
+      ok(isSubsequence(spelling, input), `${JSON.stringify(spelling)} is not a subsequence of ${JSON.stringify(input)}`);
+    }
+  }
+  // The quoted path is a whole token and is consumed as -C's value.
+  equal(commandSpellings("git -C '/tmp/my worktree' commit")[1], "git commit");
+  // THE DECLARED EXCEPTION, asserted rather than assumed. It bites only when the command has
+  // NO space character at all: `git -C /x<TAB>commit` still yields a subsequence, because the
+  // space before `-C` can be the one the normalised spelling needs (measured -- my first
+  // version of this assertion claimed otherwise and was wrong). `git<TAB>commit` has no space
+  // anywhere, so a one-space spelling cannot be a subsequence of it: that is the shape the
+  // header's CLOSED-list bullet names, and the only one where the exception is load-bearing.
+  const tabOnly = commandSpellings("git\tcommit -m x");
+  equal(tabOnly.length, 2, `expected [raw, normalised] for a tab-only separator: ${JSON.stringify(tabOnly)}`);
+  ok(!isSubsequence(tabOnly[1], "git\tcommit -m x"),
+     "the normalised spelling is the DECLARED exception -- if it were a subsequence here this test would be claiming the wrong property");
+  equal(tabOnly[1], collapseUnquotedWhitespace("git\tcommit -m x"));
+  // ...and the 3-spelling shape (option run deleted, then normalised) still ends in the
+  // normalisation of the middle spelling, never a third unspecified rewrite.
+  const tabbed = commandSpellings("git -C /x\tcommit -m x");
+  equal(tabbed.length, 3);
+  equal(tabbed[2], collapseUnquotedWhitespace(tabbed[1]));
+});
+
+test("the SEPARATOR the deletion leaves behind is normalised to one space (#1329 review P2)", () => {
+  // ⛔ THE DECLARED-CLOSED CLASS THAT WAS MEASURABLY OPEN. `git -C /x<TAB>commit -m x`
+  // derived the CORRECT spelling and then failed to match, because the rule is the
+  // literal `git commit` — ONE SPACE. The separator between the command word and the
+  // verb is not a token boundary: shell tokenisation makes a tab and a two-space run
+  // the same separator as one space.
+  const cases: Array<[string, string]> = [
+    ["git -C /x\tcommit -m x", "git commit -m x"],
+    ["git\tcommit -m x", "git commit -m x"],
+    ["git  commit -m x", "git commit -m x"],
+    ["git --no-pager  \t commit -m x", "git commit -m x"],
+  ];
+  for (const [input, expected] of cases) {
+    ok(commandSpellings(input).includes(expected),
+       `${JSON.stringify(input)} did not derive ${JSON.stringify(expected)}: ${JSON.stringify(commandSpellings(input))}`);
+  }
+  // A QUOTED payload keeps its own spacing: normalising it would turn a mention into a
+  // command (`rg -n 'git\t\tcommit'` is a search for a string, not a commit).
+  equal(collapseUnquotedWhitespace("rg -n 'git\t\tcommit'"), "rg -n 'git\t\tcommit'");
+  equal(collapseUnquotedWhitespace("git -C /x\tcommit"), "git -C /x commit");
+  // ...and the normalised spelling is ALWAYS the last one, so the raw-first OR-ing
+  // property (a caller can never lose a hit) is untouched.
+  const spellings = commandSpellings("git -C /x\tcommit -m x");
+  equal(spellings[0], "git -C /x\tcommit -m x");
+  equal(spellings[spellings.length - 1], collapseUnquotedWhitespace(spellings[1]));
+});
+
+test("a command with nothing to strip yields exactly ONE spelling (the raw command)", () => {
+  const untouched = [
+    "git commit -m x",            // no options: the raw match already fires
+    "git\ncommit -m x",            // newline is a SEPARATOR: `git` and `commit` are two commands
+    "rg -n 'git -C . commit'",    // a quoted mention: `git` is not a command WORD
+    "echo git commit > /tmp/note",
+    "", 
+  ];
+  for (const input of untouched) equal(commandSpellings(input).length, 1, JSON.stringify(input));
+  // A value flag with no value is still an option RUN to remove (it cannot swallow
+  // the end of the command into a fabricated verb).
+  equal(commandSpellings("git -C")[1], "git");
+  // The newline guard specifically: `git -C /x` ⏎ `commit` is TWO commands, and the
+  // derived spelling must not glue them into a `git commit` that never ran.
+  const newline = commandSpellings("git -C /x\ncommit -m x");
+  equal(newline.length, 2);
+  equal(newline[1], "git\ncommit -m x");
+  ok(!newline.some((s) => s.includes("git commit")), `a newline-separated pair must not become one command: ${JSON.stringify(newline)}`);
+});
+
+test("several invocations in one command are all normalised", () => {
+  equal(commandSpellings("git -C /x commit && git -C /y push")[1], "git commit && git push");
+  equal(commandSpellings("cd /a&&git -C /b commit")[1], "cd /a&&git commit");
+  // A value flag whose value is itself the word `git` must not derail the scan.
+  equal(commandSpellings("git -c alias=git commit")[1], "git commit");
+});
+
+test("an option is not mistaken for a verb, and a non-option word ends the run", () => {
+  // `--` ends option parsing; the word after it is not an option.
+  equal(commandSpellings("git --no-pager -- commit")[1], "git commit");
+  // A `-` alone is an OPERAND, not an option, so the run ends there.
+  equal(commandSpellings("git -C /x - commit")[1], "git - commit");
+  // Unknown options are treated as valueless (a RECALL cost, never a false block).
+  equal(commandSpellings("git --unknown commit")[1], "git commit");
 });
 
 // ── Results ───────────────────────────────────────────
