@@ -1,0 +1,13 @@
+# `github.event.number` IS the PR number on a `pull_request` event, so this group is per-PR-correct.
+# Refusing it told the author a SHA key cancels nothing — about a key that is not a SHA (#2660 round 5).
+name: PR event number
+on:
+  pull_request:
+concurrency:
+  group: pr-event-number-${{ github.event.number }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
