@@ -5563,6 +5563,46 @@ test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled com
      "a $VAR-supplied admin flag is still an assembled admin merge (the command spells --admin)");
   ok(!mergeInvocationInText(`node ${"$"}A ${"$"}B ${"$"}C ${"$"}D admin`),
      "…while a four-construct RUN with a bare `admin` word is still not one");
+
+  // ⛔ AND THE SELECTOR MAY BE ABSENT ENTIRELY — `gh pr merge --admin`, the spelling that merges the
+  // CURRENT BRANCH (review cycle 9, P0). `extractMergePrNumber` returns null for it and this file's
+  // own contract says a null answer must FAIL CLOSED, yet at `90859f471` EVERY reading of it dropped
+  // out: `assembledMergeArgvAfter` wants a SELECTOR (the word after the verb here is `--admin`, which
+  // `isMergeSelectorToken` rejects), `isGitOp`'s `GH_PR_PATTERN` needs a literal `gh pr merge` (the
+  // verb is a construct), and the text arm's conjunct (`hasBareGhWord ∨ MERGE_WORD`) is false because
+  // the `gh` WORD is a construct too. So `isGitOp` answered false and the handler returned at
+  // `if (!isGitOp(command)) return undefined;` BEFORE the evidence gate and the registry gate.
+  // Each row is REFUSED at BOTH bases (`78d897fa1`, `04bc1dde`) and ADMITTED at `90859f471`
+  // (measured), which is this PR's own fail-open criterion. Keep ONE word literal and the same
+  // command was already refused — which is why no existing row could see it:
+  // `X=gh; ${X} pr merge --admin` and `X=gh; ${X} pr $M 999 --admin` are both refused here.
+  const assembledNoSelector = [
+    `X=gh; ${"$"}{X} pr $M --admin`,
+    `X=gh; ${"$"}{X} "pr" $M --admin`,
+    `X=gh; ${"$"}{X} pr $M --admin --squash`,
+    // …and the `${M}` spelling, which is what forces the arm to read the WORD at the slot rather than
+    // the single token: `${M}` arrives as the pair `$` + `M}`, and that first token alone is not the
+    // verb (only `shellWordAt`'s pair branch makes it one).
+    `X=gh; ${"$"}{X} pr ${"$"}{M} --admin`,
+  ];
+  for (const cmd of assembledNoSelector) {
+    ok(mergeInvocationInText(cmd), `an assembled merge with NO selector (current branch) is a merge: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and the admin-merge gate decides it: ${cmd}`);
+    // ⛔ `isGitOp` IS THE ASSERTION THAT MATTERS (a P0 when it is false): the handler returns at
+    // `if (!isGitOp(command)) return undefined;`, so this is the difference between a gated merge and
+    // a gate that never runs. The bound is `assembledBareAdminAfter`, guarded by the LITERAL `pr`
+    // group word so the construct RUNS above cannot reach it (a run has no `pr` in its group slot).
+    ok(isGitOp(cmd), `…and the handler's own isGitOp gate is reached (a P0 when this is false): ${cmd}`);
+  }
+  // ⛔ THE RESIDUAL THAT GUARD LEAVES, RECORDED SO THE ASYMMETRY IS VISIBLE (not celebrated). The
+  // guard is "a LITERAL `pr` in the group slot", and the walk cannot tell a construct that IS `gh`
+  // from one that is not — so a read-only `<command> $A pr $B --admin` reads as a merge too. Its
+  // relation: GATED at `78d897fa1` (that head's unconditional verb-slot arm read it) and at this
+  // head, ADMITTED at `04bc1dde` (measured) — i.e. it stays inside the #2907 over-block class this
+  // PR does not own, and closing it would cost the four rows above. Pinned so a future narrowing is
+  // a deliberate act rather than an accident.
+  ok(mergeInvocationInText(`node ${"$"}A pr ${"$"}B --admin`),
+     "…while a NON-gh command with a literal `pr`, a construct verb and --admin is still read as one (declared residual)");
 });
 
 /**
