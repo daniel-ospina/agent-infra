@@ -1709,7 +1709,13 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
     # given machine, in the given cwd, no window. The id shape differs between cmux builds, so it is
     # PARSED and the failure is explicit — an untracked terminal cannot be reaped.
     set -- surface new-terminal
-    if [ -n "${WT_MACHINE:-}" ]; then set -- "$@" --machine "$WT_MACHINE"; fi
+    # ⛔ `--machine` IS MANDATORY IN CURRENT cmux, AND OMITTING IT REFUSES EVERY SPAWN.
+    # The flag used to be added only when WT_MACHINE was set, so a box that never set it got
+    # `cmux surface new-terminal: --machine <id|local> is required` on EVERY spawn — measured
+    # 2026-10-29 on the Mac: 6 spawns refused in one pass while the controller read healthy and
+    # simply never started a worker. `local` is the machine this process runs on, i.e. exactly
+    # what the omitted flag used to mean; an explicit WT_MACHINE still wins.
+    set -- "$@" --machine "${WT_MACHINE:-local}"
     set -- "$@" --cwd "$cwd" --no-open -- /bin/bash "$runf"
     out="$(cmux "$@" 2>&1)" || { wt_warn "REFUSED $name: cmux surface new-terminal failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; return 1; }
     id="$(printf '%s\n' "$out" | grep -oE 'term_[A-Za-z0-9]+|surface:[0-9]+' | head -1)"
