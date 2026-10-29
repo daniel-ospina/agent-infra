@@ -15,9 +15,25 @@ name: Harness single source
 # collides with a locked-file edit again. The job name is unchanged — `harness-single-source` — so
 # the check that branch protection and the fleet's logs already reference still appears.
 #
-# ⛔ AND IT IS NOT WIRED INTO run-bash-shards.sh's step list on purpose: this job runs the SAME suites
-# (`selftest.sh` is already a shard there, and this job exists so a RED names the harness in a
-# dedicated check instead of surfacing as one shard of a large job).
+# ⛔ AND IT IS NOT WIRED INTO run-bash-shards.sh's step list on purpose: this job exists so a RED names
+# the harness in a dedicated check instead of surfacing as one shard of a large job. The price of that
+# dedicated name is ONE run site for the suites it owns — NOT TWO. `selftest.sh` already runs as a
+# shard (scripts/run-bash-shards.sh, and therefore in BOTH lanes), so the step that re-ran it here was
+# a duplicate on the same commit (86 s of this job's 94 s, measured on #2385's head run 39879010111)
+# and was removed by agent-infra#2439. What keeps this workflow alive is the coverage that is NOT
+# elsewhere — name it precisely, because "nothing else runs them" would be FALSE for two of the three
+# non-vacuity steps: `selftest.sh` (itself a shard, so both lanes) already drives the divergent-copy
+# rc-1 arm (`selftest.sh:3916-3918`) and the checking-nothing rc-2 arm (`selftest.sh:3954-3956`).
+# The arms unique to this job are the PLANTED-FORK refusal (the "NON-VACUITY — a planted fork is
+# refused" step — `selftest.sh` pins three `--fork` refusals and every one of them is rc 2: an
+# existing-but-empty dir, `--fork == canonical`, and an unsearchable fork; none is a reappearing
+# dupe at rc 1) and the REAL-RUNNER `doctor` assertions (the "doctor reports the platform and the
+# supervisor it found" step — `selftest.sh` drives `doctor` only against stubs and temp trees).
+# Kept because those two have no other run site; the other two are pinned twice on purpose, so a
+# weakening at one site must be met by the other rather than read as "nothing to keep in sync".
+# ⛔ No line numbers for the steps above, deliberately: citing them made THIS comment stale the
+# moment it was inserted (its own 7 added lines moved both targets), which is the same defect the
+# fold fixed in ci.yml's "shard 192" pointer. A name survives an edit; a line number does not.
 
 on:
   pull_request:
@@ -77,13 +93,6 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/orchestrator-harness/check-single-source.sh
-      - name: the harness selftest suite passes (the ports' own discriminating checks)
-        # The pool-order / merge-priority / reaper checks are the ones that would stay green if a
-        # shipped function were gutted. ⛔ THIS STEP IS NOT THE ONLY RUNNER (review P2, cycle 5):
-        # `scripts/run-bash-shards.sh` already shards selftest.sh (job `bash-suites`, and
-        # ci-main.yml post-merge). Do not delete the shard line on the strength of this one — and do
-        # not delete this one either: it is the only place the non-vacuity steps below run.
-        run: bash scripts/orchestrator-harness/selftest.sh
       - name: a REAL comparison passes (deployed copy identical to canonical)
         run: |
           set -euo pipefail
