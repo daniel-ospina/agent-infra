@@ -2343,6 +2343,17 @@ case "$out" in *"tried 2 time(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R1: …and the refusal states how many recovery attempts were spent, so the residual is on the record" $rc
 grep -q '^lane-8	' "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null && rc=0 || rc=1
 ck "R1: …and the refusal still reaches the controller's refusal record, under the WORKER's name" $rc
+# (R1b) THE RETRY BOUND IS A KNOB, NOT A WORD IN A DOC (review round 3, finding 2). The operator doc
+# claimed the ensure runs "once"; the code runs it up to WT_SERVER_ENSURE_ATTEMPTS (default 2), and the
+# doc now says so. An implementation that had quietly hardcoded ONE attempt would still satisfy R1 —
+# the default happens to be 2 — while silently ignoring the knob. So this arm sets 3 and demands 3.
+rm -rf "$TMP/OR1b" "$TMP/rstate1b"; : > "$TMP/ensure1b.log"
+out="$(WT_SERVER_ENSURE_ATTEMPTS=3 CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure1b.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR1b" "$TMP/cmuxr1b.log" "$TMP/rstate1b" 2>&1)"
+[ "$(grep -c '^ENSURE server ensure --session cloud' "$TMP/ensure1b.log" 2>/dev/null)" = "3" ] && rc=0 || { rc=1; cat "$TMP/ensure1b.log"; }
+ck "R1b: the ensure retry bound is the KNOB (WT_SERVER_ENSURE_ATTEMPTS=3 → 3 attempts), not a hardcoded once" $rc
+case "$out" in *"tried 3 time(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1b: …and the refusal's own spent-attempt count matches the calls actually made" $rc
 # (R2) THE RECOVERY MUST EARN ITS PLACE: ensure answers on the retry, the re-attempted create succeeds.
 rm -rf "$TMP/OR2" "$TMP/rstate2"; : > "$TMP/ensure2.log"
 out="$(CMUX_LAYOUT_FAIL_ONCE="$TMP/r2.fail" CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure2.log" \

@@ -498,11 +498,16 @@ relay that message as THE REASON, so every reader went to `df` and the cell stay
 it already had, while its `[cap]` line read healthy. A refusal now carries
 `MEASURED on this box — space … free=… inodes=… state=…; server status=…`, names the daemon's text a
 claim it did not verify, and — where the reading says the SESSION is the finding — tries
-`cmux server ensure --session <s>` once (bounded) and re-attempts the create once. **Read the measured
+`cmux server ensure --session <s>` up to `WT_SERVER_ENSURE_ATTEMPTS` times (default **2**, matching the
+measured fail-once flake; it never runs when the volume is measured short, and every attempt goes
+through the bounded wrapper) and then re-attempts the create **once**. **Read the measured
 line before touching the volume**: if the volume is not short and the owner answers `status running`,
 the repair is the session owner, not the disk. The spawn path never runs `server stop --force` (it ends
 every terminal inside the owner, i.e. every live lane); that lever stays an operator action, and a
-refusal it could not clear says so. `WT_SESSION_RECOVER=0` disables probing and recovery entirely.
+refusal it could not clear says so. **Operator knobs:** `WT_STATE_FREE_FLOOR_MB` (1024),
+`WT_STATE_INODE_PCT_FLOOR` (95), `WT_CMUX_SESSION` (`cloud`), `WT_SERVER_TIMEOUT` (10 s),
+`WT_SERVER_ENSURE_ATTEMPTS` (2 — the one recovery bound worth reaching for first),
+`WT_SERVER_ENSURE_SLEEP` (2 s), and `WT_SESSION_RECOVER=0` to disable probing and recovery entirely.
 
 **state.** cell-4: present (`prfix_hits=5`), workers live (2 `fix-*`, 2 `merge-*`).
 
