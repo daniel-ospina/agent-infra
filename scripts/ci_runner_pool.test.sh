@@ -1839,6 +1839,18 @@ assert_file "$root_b/never-swept" "and NOTHING was swept on the refused pass"
 rm -f "$root_b/never-swept"
 out="$(RUNNER_TMP_MAX_AGE_MIN=0 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b 2>&1)"
 assert_eq "$?" "2" "and `0` (which `find -mmin +0` reads as \"everything older than a minute\") is refused too"
+# ⛔ AND THE BOUND HAS A FLOOR, because it is a DELETION threshold (#7815 review, N1). `is_uint` accepts
+#   `1`; `find -mmin +1` on the LIVE-repair arm matches a 3-minute-old entry, i.e. a RUNNING job's
+#   scratch, `rm -rf`'d silently (stderr is discarded). A self-hosted job may legally run 5 days, so the
+#   floor is the GitHub-hosted 6 h ceiling and the message tells an operator to RAISE the bound, never
+#   to lower it. Both halves asserted: the value is refused, and the live instance's scratch survives it.
+: >"$root_b/live-job-scratch"; touch -t 200001010000 "$root_b/live-job-scratch"
+out="$(RUNNER_TMP_MAX_AGE_MIN=1 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b 2>&1)"
+assert_eq "$?" "2" "a sweep bound below the floor is REFUSED (rc 2) rather than deleting a live job's scratch"
+assert_contains "$out" "cannot-measure why=tmp-max-age-too-small" "naming the operand"
+assert_contains "$out" "floor=360m" "and the floor it broke"
+assert_file "$root_b/live-job-scratch" "and the entry it would have deleted is STILL THERE"
+rm -f "$root_b/live-job-scratch"
 
 # ── MUTATION: removing the creation must break these cases ────────────────────────────────
 # ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. The copy below is the shipped script with the

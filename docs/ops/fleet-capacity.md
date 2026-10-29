@@ -331,15 +331,25 @@ ruling that there is no lane ceiling tied to cpu count.
   empties it per job, and it does not exist before the first job — where an ABSENT `$TMPDIR` makes
   `tempfile.gettempdir()` fall back to the SHARED temp dir with no error (measured), i.e. the isolation
   would vanish silently. `_tmp` is therefore STABLE, and is therefore **swept**: every start (and every
-  live repair) removes entries older than `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h), which cannot race
-  a running job. A `.env` that names a TMPDIR still wins — it is sourced after the export. `status`
-  reports a missing root as `defect tmpdir-missing` (rc 3) and the printed `restart` recreates it.
+  live repair) removes entries older than `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h). ⛔ The safety of
+  that sweep is **conditional and measured, not assumed**: an entry older than the bound cannot belong to
+  a job that runs *shorter* than the bound, and GitHub allows a **self-hosted job up to 5 days**
+  (`/en/actions/reference/limits`), so a bound below your longest job deletes a running job's scratch. The
+  tool therefore **refuses any value under 360 min** (the GitHub-hosted 6 h job ceiling) with
+  `cannot-measure why=tmp-max-age-too-small`, refusing nothing at or above it; on a long-job box you RAISE
+  the bound above your longest job, and `0`/`1` cannot reach `find -mmin`. A `.env` that names a TMPDIR
+  still wins — it is sourced after the export. `status` reports a missing root as `defect tmpdir-missing`
+  (rc 3) and the printed `restart` recreates it.
   ⛔ A listener that is ALREADY RUNNING keeps the env it was exec'd with, and **a bare unit restart does
-  not confer the private root**: the export lives only in `start_listener`, so a unit restart reproduces
-  a `.env`-named TMPDIR and, for an instance with no `.env`, hands the listener no TMPDIR at all — the
-  jobs silently fall back to the box's shared temp dir while `status` grades the layout and reads clean.
-  The remedies that work: start the listener through this tool (stop it, then `restart --name <n>` on the
-  now-dead listener, or `add`), or give the unit `Environment=TMPDIR=$instance/_tmp` (plus `TMP`/`TEMP`).
+  not confer the private root**: the export lives only in `start_listener`, so a unit restart carries
+  only what the unit's own environment (or an `export TMPDIR=…` line in `.env`) provides — and a BARE
+  `TMPDIR=…` line in `.env` reaches the listener *only* because `start_listener` exported it first, so a
+  unit restart drops it entirely (measured: sourcing a bare assignment sets it in the sourcing shell,
+  not in the child). For an instance with no `.env` the unit restart hands the listener no TMPDIR at
+  all — jobs silently fall back to the box's shared temp dir while `status` grades the layout and reads
+  clean. The remedies that work: start the listener through this tool (stop it, then `restart --name <n>`
+  on the now-dead listener — `add` is **not** one: an already-registered name is refused `rc 4 use
+  restart`), or give the unit `Environment=TMPDIR=$instance/_tmp` (plus `TMP`/`TEMP`).
 - **The pool is every LIVE runner ON THE BOX, not every directory under one root.** `RUNNER_ROOT` must be
 the directory that **CONTAINS** the instance dirs (one level above them) — its default
 `/tmp/actions-runner` is where this tool puts what it creates, and on a hand-provisioned box the
