@@ -2340,13 +2340,19 @@ mkdir -p "$TMP/gate-real"
 printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
 chmod +x "$TMP/gate-real/pi"
 rm -f "$TMP/gate-ran"
-HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
-_grc=$?
+# ⛔ THE REFUSAL IS EXPECTED, SO ITS NON-ZERO STATUS MUST NOT ABORT THE SUITE (#2387 fixer review).
+# This file runs `set -euo pipefail` (:23) and main guarded both invocations with `|| true` for exactly
+# that reason; the assertion added here REPLACED that guard with a bare command, so the first run
+# exited 76 and NOTHING BELOW RAN — the 76 assertion itself, the positive control, the drift-refresh
+# arm and the summary were all dead code on every host, Linux and macOS alike (measured: the suite
+# ended at this line with rc=76 and printed no summary). `|| _grc=$?` keeps the status AND the suite.
+_grc=0
+HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || _grc=$?
 if [ "$_grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
   echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 with the LOAD code 76 (the real pi never ran)"
 elif [ ! -e "$TMP/gate-ran" ]; then
   # ⛔ A REFUSAL FOR ANOTHER CAUSE IS NOT THIS ARM'S SUBJECT (review, P2). Without the code check a
-  # memory (72) or fork (73) refusal satisfied a LOAD assertion, and the positive control below then
+  # memory (82) or fork (73) refusal satisfied a LOAD assertion, and the positive control below then
   # failed — the suite reporting its own subject as broken on a box where nothing was wrong with it.
   fail "the installed gate refused at MAX_LOAD=0 for some OTHER cause (rc=$_grc, expected 76) — the load arm cannot be asserted over it"
 else
