@@ -94,9 +94,13 @@
 #   with the fleet's longest instance name, so `_tmp` keeps 7 more bytes of that budget. It was a
 #   TIE-BREAK, not the reason — the reason is the existence/residency argument above.
 #   A STABLE root must be BOUNDED, so every start (and every live repair) sweeps entries older than
-#   `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h): a job's own scratch is minutes old, so the bound
-#   cannot race a running job, and a day-old file in a runner's private temp dir is garbage by
-#   definition. `RUNNER_TEMP` itself is NOT touched — the runner owns it, its lifecycle is per job.
+#   `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h): a job's own scratch is minutes old in THIS fleet, so
+#   the default does not race a running job, and a day-old file in a runner's private temp dir is
+#   garbage by definition. ⛔ THAT IS WHY THE OPERAND HAS A FLOOR (360 min) rather than being free: a
+#   self-hosted job may legally run 5 days (`docs.github.com/en/actions/reference/limits`), so the
+#   safety of the sweep depends on the bound exceeding the longest job — the tool refuses values below
+#   the GitHub-hosted 6 h ceiling and says how to be safe on a long-job box. `RUNNER_TEMP` itself is
+#   NOT touched — the runner owns it, its lifecycle is per job.
 #
 # ⛔ THE LABEL DESCRIBES THE RUNNER. `ci_runner_gate.sh` selects the pool by `self-hosted-arm64` /
 #   `self-hosted-x64`, and its invariant is "a runner's labels must describe that runner". A runner
@@ -205,12 +209,15 @@
 # ⛔ AND A BARE **UNIT RESTART DOES NOT CONFER IT** (#7815 review, F2). The export lives in exactly one
 # place — `start_listener`'s `TMPDIR="$t" TMP="$t" TEMP="$t" exec "$d/run.sh"` — and nothing in this
 # repo renders a runner unit or an `Environment=TMPDIR=` for one, so a unit restart re-execs `run.sh`
-# with the UNIT's environment: it reproduces a `.env`-named TMPDIR, and for an instance with no `.env`
+# with the UNIT's environment: it carries only what the unit itself supplies (or an `export TMPDIR=…`
+# line in `.env`) — a BARE `TMPDIR=…` in `.env` is dropped (measured: sourcing a bare assignment sets it
+# in the sourcing shell, not in the child) — and for an instance with no `.env`
 # (the common shape) it hands the listener NO TMPDIR at all — every job then falls back to the box's
 # shared temp dir, silently, while `status` grades the LAYOUT and calls the row clean. The two remedies
 # that DO work: start the listener THROUGH this tool (stop it, then `restart --name <n>` on the now-dead
-# listener, or `add`), or give the unit `Environment=TMPDIR=$instance/_tmp` (with `TMP`/`TEMP` beside it)
-# so its own exec carries the root. `status` reports the layout, not a live process's env.
+# listener — `add` is not one: an already-registered name is refused `rc 4 use restart`), or give the
+# unit `Environment=TMPDIR=$instance/_tmp` (with `TMP`/`TEMP` beside it) so its own exec carries the root.
+# `status` reports the layout, not a live process's env.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -235,7 +242,16 @@ MAX_SKEW_S="${RUNNER_MAX_SKEW_S:-120}"
 CLOCK_PROBE_TIMEOUT_S="${RUNNER_CLOCK_PROBE_TIMEOUT_S:-10}"
 # ⛔ THE AGE BOUND OF THE PER-INSTANCE PRIVATE TEMP ROOT (#7815). `_tmp` is STABLE — it survives a job,
 # so it grows — and `$RUNNER_TMP_MAX_AGE_MIN` is what keeps that bounded at every start.
+# ⛔ AND IT IS THE ONE OPERAND HERE WHOSE VALUE IS A DELETION THRESHOLD, so it has a FLOOR (#7815
+# review, N1): `find -mmin +N` decides what `rm -rf` touches, and `N` is compared against a RUNNING job's
+# scratch on the live-repair arms of `restart`/`reconcile`. The floor is GitHub's own **GitHub-hosted**
+# job ceiling — 6 h (docs.github.com/en/actions/reference/limits) — because below it a legal-looking
+# number deletes an in-flight job's scratch silently. It is not a claim that no job can be longer:
+# `limits` documents **5 days** for a SELF-HOSTED job, so an operator on a long-job box must RAISE this
+# bound above their longest job; the default (24 h) sits above this fleet's jobs and the floor refuses
+# only values that are below any plausible one.
 TMP_MAX_AGE_MIN="${RUNNER_TMP_MAX_AGE_MIN:-1440}"   # 24 h: a job's scratch is minutes old, never a day
+TMP_MAX_AGE_FLOOR_MIN=360                            # 6 h — GitHub-hosted job ceiling; see above
 POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"
 GH_CMD="${RUNNER_POOL_GH:-gh}"
 POOL_LABEL_X64="self-hosted-x64"
@@ -302,6 +318,15 @@ validate_operands() {
   # this is the one home where no verb can reach the sweep unvalidated.
   if ! is_uint "$TMP_MAX_AGE_MIN"; then
     err "cannot-measure why=tmp-max-age-unreadable value=${TMP_MAX_AGE_MIN:-<empty>} (RUNNER_TMP_MAX_AGE_MIN must be a positive integer of minutes — the age bound of each instance's _tmp)"; return 2
+  fi
+  # ⛔ AND THE VALUE IS A DELETION THRESHOLD, SO IT HAS A FLOOR TOO (#7815 review, N1): `is_uint` alone
+  # accepts `1`, and `find -mmin +1` on the LIVE-repair arm matches a 3-minute-old entry — a RUNNING
+  # job's scratch, `rm -rf`'d silently (`2>/dev/null`). Measured on this box: `-mmin +1` matched a
+  # 3-minute-old file, `-mmin +1440` did not. `0` is already refused by `is_uint`; `1` was not, and its
+  # effect on a live job is the same. A value below the floor is cannot-measure: nothing swept, and the
+  # message names the relation rather than the number.
+  if [ "$TMP_MAX_AGE_MIN" -lt "$TMP_MAX_AGE_FLOOR_MIN" ]; then
+    err "cannot-measure why=tmp-max-age-too-small value=${TMP_MAX_AGE_MIN}m floor=${TMP_MAX_AGE_FLOOR_MIN}m (RUNNER_TMP_MAX_AGE_MIN is what \`sweep_tmp_root\` deletes by, and the live-repair arms sweep while jobs may be in flight: a bound below the longest job deletes a RUNNING job's scratch, so it may not go below ${TMP_MAX_AGE_FLOOR_MIN} min — the GitHub-hosted job ceiling; a SELF-HOSTED job may run up to 5 days, so raise it above your longest job rather than lowering it)"; return 2
   fi
   # ⛔ THE REPO IS AN OPERAND TOO, and it now has TWO consumers: the `gh` token path
   # (`repos/$POOL_REPO/...`) and the registration URL (`https://github.com/$POOL_REPO`). A URL-form or
@@ -1045,10 +1070,15 @@ instance_tmpdir() {
 instance_tmp_root() { printf '%s' "${1%/}/_tmp"; }
 
 # sweep_tmp_root <dir> — keep the STABLE private root from growing without bound.
-# ⛔ THE BOUND IS AGE, NOT SIZE AND NOT "ON EVERY JOB": a job's own scratch is minutes old at most, so
-# an entry older than `$RUNNER_TMP_MAX_AGE_MIN` cannot belong to a running job — which is what makes it
-# safe to sweep a directory a live listener is using, and safe on the LIVE-repair arms of `restart` and
-# `reconcile` (they run while jobs may be in flight). Nothing in here is ever deleted on mtime ALONE
+# ⛔ THE BOUND IS AGE, NOT SIZE AND NOT "ON EVERY JOB". The claim it rests on is CONDITIONAL and stated
+# as such (#7815 review, N1): an entry older than `$RUNNER_TMP_MAX_AGE_MIN` cannot belong to a job that
+# runs SHORTER than the bound — which is what makes it safe to sweep a directory a live listener is
+# using, and safe on the LIVE-repair arms of `restart` and `reconcile` (they run while jobs may be in
+# flight). It is NOT safe against a job older than the bound: GitHub allows a self-hosted job to run up
+# to 5 days (`docs.github.com/en/actions/reference/limits`), so the bound has to exceed YOUR longest
+# job — `validate_operands` refuses anything below 360 min (the GitHub-hosted ceiling) precisely so the
+# value cannot be a typo-scale number that deletes a live job's scratch, and the operand's own message
+# says to raise it, never lower it, on a long-job box. Nothing in here is ever deleted on mtime ALONE
 # when the sweep cannot enumerate: a failed `find` removes nothing and claims nothing — the only
 # consequence is growth, and the next start retries. Dry runs REPORT, and remove nothing.
 # ⛔ THE WALK IS BOUNDED: one explicit start point, `-maxdepth 1` (the root's own entries; the root
