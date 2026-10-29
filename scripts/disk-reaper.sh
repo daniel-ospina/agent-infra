@@ -36,6 +36,12 @@
 #                                                                 install (a runner family), removing
 #                                                                 only copies PROVEN idle, always
 #                                                                 keeping the newest, never the last
+#   runner-work scripts/reap-runner-work.sh   (this change)        the CI runners' `_work` checkout
+#                                                                 dirs (19 G measured on one cell at
+#                                                                 98%): an entry is removed ONLY when
+#                                                                 its newest CONTENT is older than the
+#                                                                 mtime floor, and `_work/_tool` /
+#                                                                 `_work/_actions` are retained
 #
 # ⛔ IT NEVER DELETES A SINK ITSELF. The only recursive delete in this file is its OWN lock dir — by the
 # pass that acquired it, or a lock whose recorded owner is provably GONE and which is older than the
@@ -77,7 +83,7 @@
 #   --dry-run        explicit dry-run (wins over DISK_REAPER_DRY_RUN=0)
 #   --apply          armed pass
 #   --repo PATH      a repo whose worktrees the venv/worktree classes scan (repeatable)
-#   --only LIST      comma list of uv,venv,worktree,duplicate-install (default: all four)
+#   --only LIST      comma list of uv,venv,worktree,duplicate-install,runner-work (default: all five)
 #   --aged-days N    worktree age floor passed to the owner (default 7; merged heads exempt)
 #   --min-age S      venv GC age floor passed to the owner (default 1800)
 #   --print-status   print the last pass record and exit (0 ok, 3 failed/stale/never, 2 usage)
@@ -99,6 +105,13 @@
 #   DISK_REAPER_DRY_RUN        0 supplies the default mode only (an explicit flag always wins)
 #   DISK_REAPER_WT_AGED_DAYS   worktree floor            (default 7)
 #   DISK_REAPER_VENV_MIN_AGE   venv floor in seconds     (default 1800)
+#   DISK_REAPER_RUNNER_GLOBS   space-separated globs naming the CI runners' `_work` roots, handed to
+#                              the runner-work owner (default: /opt/gh-runner*/_work,
+#                              $HOME/actions-runner*/_work, /tmp/actions-runner*/_work). A SET-but-EMPTY
+#                              value is a REFUSAL at startup, never "scan nothing": an emptied seam
+#                              would otherwise report a measured zero for a sink nothing looked at
+#   DISK_REAPER_RUNNER_MIN_AGE the runner-work mtime floor in seconds (default 3600): a `_work` entry
+#                              whose NEWEST content is older than this is reapable
 #   DISK_REAPER_CLASS_TIMEOUT  watchdog per class, secs  (default 1800)
 #   DISK_REAPER_DU_TIMEOUT     watchdog per dry-run `du`, secs (default 120)
 #   DISK_REAPER_STALE_SECONDS  a status older than this is STALE (default 7200)
@@ -165,10 +178,23 @@ LOCK_DIR="$STATE_DIR/disk-reaper.lock"
 LOCK_STALE_SECONDS="${DISK_REAPER_LOCK_STALE_SECONDS:-1800}"
 
 DRY_RUN="${DISK_REAPER_DRY_RUN:-1}"
-ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree,duplicate-install}"
+ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree,duplicate-install,runner-work}"
 ONLY_GIVEN=0      # 1 when --only was passed, so an EMPTY list is a refusal and not the default
 WT_AGED_DAYS="${DISK_REAPER_WT_AGED_DAYS:-7}"
 VENV_MIN_AGE="${DISK_REAPER_VENV_MIN_AGE:-1800}"
+# ── class=runner-work (the CI runners' `_work` sink) ─────────────────────────────────────────────
+# ⛔ `-` NOT `:-`, AND SET-BUT-EMPTY IS A REFUSAL (see the startup check below). `${X:-default}` would
+# substitute the DEFAULTS for an emptied seam, so an operator (or a rendered unit) that emptied the
+# glob list to "turn the class off" would instead get the WIDEST possible sweep — the delete direction.
+# This is the same rule BOUNDED_LIB gets: a set value is authoritative, and a wrong one is loud.
+RUNNER_GLOBS="${DISK_REAPER_RUNNER_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work}"
+RUNNER_GLOBS_EXPLICIT=0
+if [ -n "${DISK_REAPER_RUNNER_GLOBS+set}" ]; then RUNNER_GLOBS_EXPLICIT=1; fi
+# The floor: a `_work` entry whose NEWEST CONTENT is older than this is reapable. 3600 s is ~2x the
+# longest gap a writing job has been measured to leave, and the hand reap that validated the class on
+# the 98%-full cell used 120 min. It is a SEAM because a box running long quiet steps needs a higher
+# floor, and that is the intended response — never a process-check (see the owner's header).
+RUNNER_MIN_AGE="${DISK_REAPER_RUNNER_MIN_AGE:-3600}"
 CLASS_TIMEOUT="${DISK_REAPER_CLASS_TIMEOUT:-1800}"
 DU_TIMEOUT="${DISK_REAPER_DU_TIMEOUT:-120}"
 # One bound for the small non-delegate probes (git / ps). They are cheap; a hung mount is not.
@@ -226,6 +252,25 @@ FREED_DUP=0; RAW_DUP=0
 DF_DUP_OK=1
 WOULD_DUP=0; CAND_DUP=0
 WANT_DUP=0
+# ── class=runner-work (the CI runners' `_work` sink; record key `runner_work`) ───────────────────
+# MEASURED (2026-10-28, cell c1 `vm-efa6cc8fdb974e61b5c054acf41d8846`, 8 cores, 12 runners): `/` at
+# **98% used, 3.5 G free**, with **19 G** in `/opt/gh-runner-x64-{2,4,5,6,7,8}/_work` — checkout left
+# by jobs that finished or were killed. A runner cleans its own `_work` only on a NORMAL job end, so a
+# cancelled or OOM-killed job's tree stays for ever, and NO class matched it: not a cache (`uv`), not a
+# lane env (`venv`), not a tracked checkout (`worktree`), not a duplicate install. The hand reap of that
+# sink took the box 98% → 90% without disturbing a running job — that hand reap is the class's gate.
+# The record keys use `runner_work` (the class name is `runner-work`) for the same reason
+# `duplicate_install` does: a `sed` key with a hyphen is a footgun for every `s/^freed_mb_//p` reader.
+FREED_RW=0; RAW_RW=0
+DF_RW_OK=1
+WOULD_RW=0; CAND_RW=0
+WANT_RW=0
+# 1 = this pass MEASURED the candidate count (a lifted, fully-answered SUMMARY). 0 = it did not, and the
+# record must say `?` rather than the initialised 0 — the sentinel every other class already carries.
+HAVE_RW_CAND=0
+RC_RW=0
+VERDICT_RW="not-run"
+NOTE_RW=""
 # The worktree class's SECOND arm (abandoned scratch worktrees). It reports into the worktree class's
 # own keys — it is the same sink — and these are its accumulators.
 AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""
@@ -306,17 +351,17 @@ done
 # silently drops a sink, and an empty list means "reap nothing, forever" while the timer says ok.
 # ⛔ VALIDATE UNCONDITIONALLY. The guard used to be `if [ -n "$ONLY" ]`, so `--only ""` skipped it
 # entirely: ZERO classes ran and the pass exited 0 with `ok=1 classes=`. (Only the ARGV form can be
-# empty: `ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree,duplicate-install}"` substitutes the default for an empty env value.)
-if [ -z "$ONLY" ]; then die "--only was given an empty list (valid: uv, venv, worktree, duplicate-install)"; fi
+# empty: `ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree,duplicate-install,runner-work}"` substitutes the default for an empty env value.)
+if [ -z "$ONLY" ]; then die "--only was given an empty list (valid: uv, venv, worktree, duplicate-install, runner-work)"; fi
 ONLY_CLASSES=""
 for c in $(printf '%s' "$ONLY" | tr ',' ' '); do
     case "$c" in
-        uv|venv|worktree|duplicate-install) ;;
-        *) die "unknown --only class '$c' (valid: uv, venv, worktree, duplicate-install)" ;;
+        uv|venv|worktree|duplicate-install|runner-work) ;;
+        *) die "unknown --only class '$c' (valid: uv, venv, worktree, duplicate-install, runner-work)" ;;
     esac
     ONLY_CLASSES="${ONLY_CLASSES}${ONLY_CLASSES:+,}$c"
 done
-[ -n "$ONLY_CLASSES" ] || die "--only was given an empty list (valid: uv, venv, worktree)"
+[ -n "$ONLY_CLASSES" ] || die "--only was given an empty list (valid: uv, venv, worktree, duplicate-install, runner-work)"
 ONLY="$ONLY_CLASSES"
 # A class the operator did not select did not run: its reclaim is NOT a measured zero, and the record
 # must not present it as one (the supervisor renders these per-class values verbatim).
@@ -416,11 +461,13 @@ print_status() {
     log_line "freed_mb_venv=$(status_field freed_mb_venv)"
     log_line "freed_mb_worktree=$(status_field freed_mb_worktree)"
     log_line "freed_mb_duplicate_install=$(status_field freed_mb_duplicate_install)"
+    log_line "freed_mb_runner_work=$(status_field freed_mb_runner_work)"
     log_line "freed_mb_unmeasured=$(status_field freed_mb_unmeasured)"
     log_line "would_free_mb_uv=$(status_field would_free_mb_uv)"
     log_line "would_free_mb_venv=$(status_field would_free_mb_venv)"
     log_line "would_free_mb_worktree=$(status_field would_free_mb_worktree)"
     log_line "would_free_mb_duplicate_install=$(status_field would_free_mb_duplicate_install)"
+    log_line "would_free_mb_runner_work=$(status_field would_free_mb_runner_work)"
     log_line "candidates_uv=$(status_field candidates_uv)"
     log_line "candidates_venv=$(status_field candidates_venv)"
     log_line "candidates_worktree=$(status_field candidates_worktree)"
@@ -432,9 +479,13 @@ print_status() {
     log_line "main_proof=$(status_field main_proof)"
     log_line "pr_merged=$(status_field pr_merged)"
     log_line "candidates_duplicate_install=$(status_field candidates_duplicate_install)"
+    log_line "candidates_runner_work=$(status_field candidates_runner_work)"
+    log_line "cand_runner_work=$(status_field cand_runner_work)"
+    log_line "note_runner_work=$(status_field note_runner_work)"
     log_line "verdict_uv=$(status_field verdict_uv)"
     log_line "verdict_venv=$(status_field verdict_venv)"
     log_line "verdict_worktree=$(status_field verdict_worktree)"
+    log_line "verdict_runner_work=$(status_field verdict_runner_work)"
     # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST. `skipped_worktree=` is the whole point of
     # #2443 (WHICH repo was skipped and WHY); leaving it out of `--print-status` would repeat the
     # `classes=`/`repos=` defect this block already documents — written every pass, read by nobody.
@@ -493,6 +544,15 @@ if seam_too_large "$VENV_MIN_AGE"; then
         "$SCRIPT_NAME" "'$VENV_MIN_AGE'" >&2
     exit 3
 fi
+# ⛔ A SET-BUT-EMPTY GLOB LIST IS A REFUSAL, NOT "SCAN NOTHING" — and it is checked here, beside the
+# other seam checks, for the reason `BOUNDED_LIB` gives: an emptied value must never silently become a
+# DIFFERENT value (here, the widest default sweep, which deletes). The owner applies the same rule to
+# REAP_RW_GLOBS it is handed, so neither side can be emptied into a silent behaviour change.
+case "$RUNNER_GLOBS" in *[![:space:]]*) : ;; *)
+    printf '%s: ⛔ FAIL-CLOSED at startup — DISK_REAPER_RUNNER_GLOBS is EMPTY.\n' "$SCRIPT_NAME" >&2
+    printf '%s: an empty glob list would scan no runner `_work` root and report a measured zero for ever; unset it to take the defaults, or name the roots.\n' "$SCRIPT_NAME" >&2
+    exit 3 ;;
+esac
 # ⛔ THE ARMING SEAM IS NOT A BOOLEAN BY FAITH. `is_dry` tests for exactly "1", so DISK_REAPER_DRY_RUN=true
 # (or yes/01/a typo) used to run the pass ARMED — a deleted-file direction, one export away. Refuse a
 # value that is neither 0 nor 1; the explicit flags still win and always set a valid one here.
@@ -514,6 +574,7 @@ for _seam in "DISK_REAPER_WT_AGED_DAYS=$WT_AGED_DAYS" \
              "DISK_REAPER_CLASS_TIMEOUT=$CLASS_TIMEOUT" \
              "DISK_REAPER_DU_TIMEOUT=$DU_TIMEOUT" \
              "DISK_REAPER_DU_BUDGET=$DU_BUDGET" \
+             "DISK_REAPER_RUNNER_MIN_AGE=$RUNNER_MIN_AGE" \
              "DISK_REAPER_GIT_TIMEOUT=$GIT_TIMEOUT"; do
     case "${_seam#*=}" in
         ''|*[!0-9]*)
@@ -608,13 +669,13 @@ find_delegate() { # find_delegate <env-value> <basename>
     return 1
 }
 
-CACHE_REAPER_PATH=""; VENV_REAPER_PATH=""; WORKTREE_REAPER_PATH=""; ABANDONED_WT_REAPER_PATH=""; DUP_INSTALL_REAPER_PATH=""
+CACHE_REAPER_PATH=""; VENV_REAPER_PATH=""; WORKTREE_REAPER_PATH=""; ABANDONED_WT_REAPER_PATH=""; DUP_INSTALL_REAPER_PATH=""; RUNNER_WORK_REAPER_PATH=""
 CACHE_REAPER_PATH="$(find_delegate "${CACHE_REAPER:-}" pi-cache-reap.sh)" || CACHE_REAPER_PATH=""
 VENV_REAPER_PATH="$(find_delegate "${VENV_REAPER:-}" reap-lane-venvs.sh)" || VENV_REAPER_PATH=""
 WORKTREE_REAPER_PATH="$(find_delegate "${WORKTREE_REAPER:-}" pi-reap-worktrees.sh)" || WORKTREE_REAPER_PATH=""
 ABANDONED_WT_REAPER_PATH="$(find_delegate "${ABANDONED_WT_REAPER:-}" reap-abandoned-worktrees.sh)" || ABANDONED_WT_REAPER_PATH=""
 DUP_INSTALL_REAPER_PATH="$(find_delegate "${DUP_INSTALL_REAPER:-}" reap-duplicate-installs.sh)" || DUP_INSTALL_REAPER_PATH=""
-
+RUNNER_WORK_REAPER_PATH="$(find_delegate "${RUNNER_WORK_REAPER:-}" reap-runner-work.sh)" || RUNNER_WORK_REAPER_PATH=""
 # ── bounded probes ──────────────────────────────────────────────────────────────────────────────
 # Every subprocess that reads the filesystem runs under a watchdog: a reaper that HANGS the cell is
 # worse than the disk it was reclaiming. `du` is charged to the class watchdog, and a timeout is a
@@ -831,6 +892,11 @@ if [ -n "$STATE_DIR_PRIMARY_NOTE" ]; then
     export REAP_AW_LOG="${REAP_AW_LOG:-$STATE_DIR/reap-abandoned-worktrees.log}"
     export REAP_DI_STATE_DIR="${REAP_DI_STATE_DIR:-$STATE_DIR}"
     export REAP_DI_LOG="${REAP_DI_LOG:-$STATE_DIR/reap-duplicate-installs.log}"
+    # …and the runner `_work` owner, for the same reason. Without this it keeps its lock and log in
+    # `$HOME/.pi/agent/state` and reports `SKIP reason=lock-uncreatable` (rc 3, `candidates=?`) on
+    # EXACTLY the pass the fallback exists for, so the class would be inert on a full disk (#3043).
+    export REAP_RW_STATE_DIR="${REAP_RW_STATE_DIR:-$STATE_DIR}"
+    export REAP_RW_LOG="${REAP_RW_LOG:-$STATE_DIR/reap-runner-work.log}"
     # Scratch too: the bounded probes and the venv owner's `mktemp` would otherwise still target the
     # exhausted filesystem. `tb_bound_tmp` is lazy and idempotent, so the retry below only creates the
     # scratch that the earlier attempt could not.
@@ -2090,6 +2156,183 @@ reap_dup() {
     return 0
 }
 
+# ── class: runner-work (the CI runners' `_work` checkout dirs) ────────────────────────────────
+# MEASURED (2026-10-28, cell c1 `vm-efa6cc8fdb974e61b5c054acf41d8846`, 8 cores, 12 GitHub Actions
+# runners): `/` at **98% used, 3.5 G free**, and **19 G** in `/opt/gh-runner-x64-{2,4,5,6,7,8}/_work`
+# (2.6–4.7 G per runner) left by jobs that had finished or been killed. A runner cleans its own
+# `_work/<entry>` only on a NORMAL job end. Sizes were measured; the hand reap of exactly this sink took
+# the box 98% → 90% without disturbing a single running job, and `scripts/reap-runner-work.sh` owns that
+# rule. This class discovers nothing and deletes nothing: it resolves the globs, runs the owner per
+# pass, lifts the owner's own ledger and accounts per FILESYSTEM with a `df` delta — the same split
+# every other class uses, and why this file still contains no `rm` on a filesystem path (its suite pins
+# that with T6).
+#
+# ⛔ THE SAFETY GATE IS ONE SENTENCE: an entry is a candidate ONLY when its NEWEST CONTENT is older than
+# the floor (`DISK_REAPER_RUNNER_MIN_AGE`, default 3600 s). A running job writes into its entry
+# continuously, so mtime is the proof; there is no local busy-check on a runner to consult, and the
+# owner's header forbids inventing a `pgrep`-shaped one (it would keep every dead entry while ANY
+# runner is idle — always, on a 12-runner box — i.e. an inert class that reports healthy). The owner
+# re-probes the same question immediately before each removal, so a job that starts mid-pass survives.
+#
+# ⛔ `_work/_tool` AND `_work/_actions` ARE DELIBERATELY RETAINED: they are the runner's cross-job caches,
+# so removing them buys a re-download on the NEXT job rather than disk. The owner excludes them BEFORE
+# measuring and counts them (`retained=` on the class line), and its suite proves they survive even when
+# they are the oldest thing in the tree.
+
+# fs_dev <path> — the filesystem a path lives on (`df` field 1), for the per-filesystem dedupe.
+fs_dev() { tb_timeout "$DU_TIMEOUT" "$DF_BIN" -Pk "$1" 2>/dev/null | awk 'NR==2 {print $1}'; }
+
+# rw_df_targets — ONE existing directory per distinct filesystem the configured globs can land on.
+# ⛔ PER FILESYSTEM. A runner farm can straddle two: `/tmp` is a tmpfs on some boxes and part of `/` on
+# others, and a single delta taken on the first target would report 0MB for gigabytes reclaimed from the
+# second — the defect the venv/worktree classes fixed when `--repo` spanned mounts.
+# ⛔ NO GLOB EXPANSION HERE, ON PURPOSE: expanding could match twelve roots on one filesystem and
+# re-measure it twelve times. The STATIC prefix (everything before the first metacharacter), walked up to
+# something that exists, is the path whose filesystem the roots will live on.
+rw_df_targets() {
+    local g p dev seen=" "
+    for g in $RUNNER_GLOBS; do
+        p="${g%%[*?]*}"
+        [ -n "$p" ] || p="/"
+        # A prefix that is not absolute (a literal `$HOME/...` in the seam, unexpanded) cannot be walked
+        # up meaningfully: fall back to HOME, which is where such a glob would land.
+        case "$p" in /*) ;; *) p="${HOME:-/}" ;; esac
+        while [ -n "$p" ] && [ "$p" != "/" ] && [ ! -d "$p" ]; do p="$(dirname "$p")"; done
+        [ -d "$p" ] || p="${HOME:-}"
+        [ -d "$p" ] || p="/"
+        dev="$(fs_dev "$p")"
+        case "$seen" in *" ${dev:-?} "*) continue ;; esac
+        seen="$seen${dev:-?} "
+        printf '%s\n' "$p"
+    done
+}
+
+reap_runner_work() {
+    local out rc line path size why cands="" rows="" all_c=0 freed=0 raw=0 MEASURED=1 rec=""
+    local tgt before after d _rw_line="" _rw_cand="" _rw_roots="" _rw_census="" _rw_reaped=""
+    local _rw_retained="" _rw_failed="" _rw_kept="" _rw_why=""
+    if [ -z "$RUNNER_WORK_REAPER_PATH" ]; then
+        log_line "disk-reaper: ⛔ class=runner-work FAIL-CLOSED — reap-runner-work.sh not found (looked at \$RUNNER_WORK_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
+        NOTE_RW="reap-runner-work.sh not found"; RC_RW=3
+        MISCONFIG="${MISCONFIG}${MISCONFIG:+, }runner-work-delegate-missing"
+        WANT_RW=0; VERDICT_RW="misconfigured"; DF_RW_OK=1; return 3
+    fi
+    # df BEFORE, per distinct filesystem. Recorded as `<path>\t<kb>` because bash 3.2 has no associative
+    # array and the AFTER pass must be paired with the SAME path it measured.
+    while IFS= read -r tgt; do
+        [ -n "$tgt" ] || continue
+        before="$(free_kb_for_path "$tgt")"
+        if [ -n "$before" ]; then rec="${rec}${rec:+
+}${tgt}	${before}"; else MEASURED=0; fi
+    done <<<"$(rw_df_targets)"
+    # The globs travel as the OWNER's seam (REAP_RW_GLOBS) and the explicit-vs-default fact as
+    # REAP_RW_EXPLICIT, because that flag is what turns "this box has no runners" (a measured empty
+    # population) into "the operator asserted a layout that is not there" (a refusal). `env` keeps both
+    # per-invocation: the pass's own environment is never mutated by a class.
+    run_class env REAP_RW_GLOBS="$RUNNER_GLOBS" REAP_RW_EXPLICIT="$RUNNER_GLOBS_EXPLICIT" \
+              bash "$RUNNER_WORK_REAPER_PATH" "$(mode_flag)" --min-age "$RUNNER_MIN_AGE"
+    out="$CLASS_OUT"; rc="$CLASS_RC"
+    # df AFTER, paired with each BEFORE by path.
+    while IFS="	" read -r tgt before; do
+        [ -n "$tgt" ] || continue
+        after="$(free_kb_for_path "$tgt")"
+        if [ -n "$before" ] && [ -n "$after" ]; then
+            d=$(( (after - before) / 1024 )); raw=$((raw + d))
+            [ "$d" -lt 0 ] && d=0; freed=$((freed + d))
+        else
+            MEASURED=0
+        fi
+    done <<<"$rec"
+    log_line "$out"
+    rows="$out"
+    # ── the owner's own ledger, lifted (never re-derived) ───────────────────────────────────────
+    _rw_line="$(grep -F 'SUMMARY class=runner-work' <<<"$out" | tail -1)"
+    _rw_census="$(kv_field "$_rw_line" census)"
+    _rw_roots="$(kv_field "$_rw_line" roots)"
+    _rw_cand="$(kv_field "$_rw_line" candidates)"
+    _rw_reaped="$(kv_field "$_rw_line" reaped)"
+    _rw_retained="$(kv_field "$_rw_line" retained)"
+    _rw_kept="$(kv_field "$_rw_line" kept)"
+    _rw_failed="$(kv_field "$_rw_line" failed)"
+    case "${_rw_reaped:-}" in ''|*[!0-9]*) _rw_reaped=0 ;; esac
+    # ⛔ AN EXPLICIT GLOB LIST THAT MATCHED NOTHING IS `misconfigured`, NEVER A MEASURED ZERO — the same
+    # rule (and the same shape) as `venv-no-repo`: a class that scanned NOTHING is not a pass, and the
+    # remedy is different from "the delegate ran and could not work". The owner only reports this for a
+    # glob list an operator SET; the DEFAULT globs matching nothing is a box with no runners, which IS a
+    # measurement (`roots=0`) and must not paint an hourly alarm on a healthy box.
+    if [ "$_rw_census" = "no-roots" ]; then
+        log_line "disk-reaper: ⛔ class=runner-work FAIL-CLOSED — no directory matched DISK_REAPER_RUNNER_GLOBS ('$RUNNER_GLOBS'), and it was set EXPLICITLY; a class that scans nothing is NOT a pass"
+        NOTE_RW="no runner _work root matched DISK_REAPER_RUNNER_GLOBS"; RC_RW=3
+        MISCONFIG="${MISCONFIG}${MISCONFIG:+, }runner-work-no-root"
+        WANT_RW=0; VERDICT_RW="misconfigured"; DF_RW_OK=1; return 3
+    fi
+    # ⛔ THE COUNT IS A MEASUREMENT ONLY WHEN THE OWNER ANSWERED IT: `census=ok` AND a numeric
+    # `candidates=`. Anything else is `?` (a refusal, a killed sweep, a truncated SUMMARY) — never the
+    # initialised 0. The owner prints the SUMMARY in BOTH modes, so an ARMED pass answers a real count
+    # instead of the structural 0 the worktree arm had to fix (#4529).
+    if [ "$_rw_census" = "ok" ]; then
+        case "${_rw_cand:-}" in
+            ''|*[!0-9]*) : ;;
+            *) CAND_RW="$_rw_cand"; HAVE_RW_CAND=1 ;;
+        esac
+    fi
+    # ⛔ NOTHING REMOVED MEANS THE DELTA IS NOT OURS. Another lane (or a runner finishing a job, or the
+    # runner's own cleanup) moves `df` inside the window; crediting it would report a reclaim this class
+    # did not cause — the false credit `df`-instead-of-`du` was adopted to stop, arriving through the
+    # other door. The observation is still reported, AS an observation (`df_raw`), and named in the note.
+    if [ "$_rw_reaped" = 0 ] && ! is_dry; then
+        if [ "$raw" != 0 ]; then
+            _rw_why="nothing removed: the ${raw}MB df change belongs to another process (not attributed)"
+            NOTE_RW="${NOTE_RW}${NOTE_RW:+; }$_rw_why"
+        fi
+        freed=0
+    fi
+    RC_RW="$(worst_rc "$RC_RW" "$(delegate_rc runner-work "$rc")")"
+    if [ "$rc" -gt 0 ]; then
+        _rw_why="$(note_for reap-runner-work.sh "$rc")"
+        case "; ${NOTE_RW:-};" in *"; $_rw_why;"*) : ;; *) NOTE_RW="${NOTE_RW}${NOTE_RW:+; }$_rw_why" ;; esac
+    fi
+    VERDICT_RW="$(class_verdict "$RC_RW")"
+    DF_RW_OK="$MEASURED"; RAW_RW="$raw"
+    if is_dry; then FREED_RW=0; else FREED_RW="$freed"; fi
+    # The owner's `candidates=` is the count; the `REAP` rows carry the BYTES, so they are scanned for the
+    # would-free figure and the named list. ⛔ A row whose size the owner could not measure (`?`) is still
+    # a CANDIDATE — `continue`-ing on a non-numeric size is how a class with real work reports
+    # `candidates=0 ok=1`, the unmeasured-reads-as-nothing false PASS the venv arm already removed.
+    if is_dry; then
+        while IFS= read -r line; do
+            case "$line" in
+                "REAP "*)
+                    size="$(printf '%s' "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+MB$/) {print $i; exit}}')"
+                    # The path is the REMAINDER of the line after the verb, the reason and the size —
+                    # not `$NF`, which truncated a path containing a space (the worktree arm's defect).
+                    path="$(printf '%s' "$line" | sed -E 's/^ *REAP +[^ ]+ +[^ ]+ +//')"
+                    size="${size%MB}"
+                    all_c=$((all_c + 1))
+                    case "$size" in
+                        ''|*[!0-9]*) cands="${cands}${cands:+
+}disk-reaper: WOULD-REMOVE class=runner-work (? bytes unmeasured — the owner could not size it) ${path}" ;;
+                        *) WOULD_RW=$((WOULD_RW + size))
+                           cands="${cands}${cands:+
+}disk-reaper: WOULD-REMOVE class=runner-work ${size}MB ${path} (du estimate; no content written for >= ${RUNNER_MIN_AGE}s — _tool/_actions are retained whatever their age)" ;;
+                    esac ;;
+            esac
+        done <<<"$rows"
+        # The tally is authoritative when the owner answered; the row count is the fallback for a SUMMARY
+        # that did not (a truncated line). Never an invented 0.
+        [ "$HAVE_RW_CAND" = 1 ] || { CAND_RW="$all_c"; [ "$all_c" -gt 0 ] && HAVE_RW_CAND=1; }
+        [ -n "$cands" ] && log_line "$cands"
+        log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=dry-run candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") would_free_du=${WOULD_RW}MB (du estimate) freed_df=0MB min_age=${RUNNER_MIN_AGE}s retained=${_rw_retained:-?} kept=$(_tally_num "$HAVE_RW_CAND" "${_rw_kept:-?}") roots=${_rw_roots:-?}"
+    else
+        if [ "${DF_RW_OK:-0}" = 1 ]; then
+            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=${FREED_RW}MB df_raw=${RAW_RW}MB (df delta) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
+        else
+            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
+        fi
+    fi
+    return 0
+}
+
 # ── the pass ────────────────────────────────────────────────────────────────────────────────────
 MODE_TEXT=dry-run; is_dry || MODE_TEXT=apply
 acquire_lock
@@ -2114,8 +2357,8 @@ check_peer_locks
     # The fallback is said in the PASS LOG too, not only on stderr before it: the log is the artifact an
     # operator reads after the fact, and "which filesystem held this pass's lock" decides whether its
     # `df` deltas can be credited to it (agent-infra#2443).
-    [ -n "$STATE_DIR_PRIMARY_NOTE" ] && log_line "disk-reaper: ⚠ state dir fallback — configured $STATE_DIR_PRIMARY is unusable ($STATE_DIR_PRIMARY_NOTE); lock/log/scratch/record on $STATE_DIR, and the three delegates were given it too"
-    log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING} abandoned=${ABANDONED_WT_REAPER_PATH:-MISSING} dup-install=${DUP_INSTALL_REAPER_PATH:-MISSING}"
+    [ -n "$STATE_DIR_PRIMARY_NOTE" ] && log_line "disk-reaper: ⚠ state dir fallback — configured $STATE_DIR_PRIMARY is unusable ($STATE_DIR_PRIMARY_NOTE); lock/log/scratch/record on $STATE_DIR, and the delegates were given it too"
+    log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING} abandoned=${ABANDONED_WT_REAPER_PATH:-MISSING} dup-install=${DUP_INSTALL_REAPER_PATH:-MISSING} runner-work=${RUNNER_WORK_REAPER_PATH:-MISSING}"
 } | tee -a "$LOG"
 
 # Heartbeat after each class: a pass that is making progress must never be aged out of its own lock.
@@ -2126,6 +2369,11 @@ want_class worktree && { WANT_WT=1;   reap_worktree; heartbeat_lock; }
 # worktree arms free the most, and the duplicate-install owner is the one most likely to fail closed
 # (it refuses to act without an idle proof), so it must not be the reason the bigger arms never ran.
 want_class duplicate-install && { WANT_DUP=1; reap_dup; heartbeat_lock; }
+# runner-work is last of all for the same reason: it is the only class whose candidates live OUTSIDE the
+# fleet's own trees, and its mtime gate is the most conservative in the pass. It is in the DEFAULT list
+# because the measured box GAINED five runners in a week and nothing measured the sink — a class an
+# operator has to remember to enable is the hole this class closes.
+want_class runner-work && { WANT_RW=1; reap_runner_work; heartbeat_lock; }
 
 # Verdict. ⛔ ONE ordering, expressed ONCE: 3 fail-closed (a delegate's own 3, "could not run", or a
 # class that could not be SET UP at all — MISCONFIG) > 4 removal-failed > 6 deferred > 5 over-bound > 0.
@@ -2136,7 +2384,7 @@ verdict=0
 if [ -n "$MISCONFIG" ]; then
     verdict=3
 else
-    for rc in "$RC_UV" "$RC_VENV" "$RC_WT" "$RC_DUP"; do
+    for rc in "$RC_UV" "$RC_VENV" "$RC_WT" "$RC_DUP" "$RC_RW"; do
         # ⛔ 5 IN AN APPLY PASS RANKS WITH A FAIL-CLOSED CLASS (3). In a dry run, "over bound" is the
         # dry run doing its job; in an ARMED pass the same 5 means a class ended BELOW its owner's
         # stated floor and nothing was reclaimed — the condition the floor exists to surface, so it must
@@ -2145,17 +2393,18 @@ else
         verdict="$(worst_rc "$verdict" "$rc")"
     done
     if [ "$verdict" = 0 ] && is_dry \
-       && { [ "$CAND_UV" -gt 0 ] || [ "$CAND_VENV" -gt 0 ] || [ "$CAND_WT" -gt 0 ] || [ "$CAND_DUP" -gt 0 ]; }; then
+       && { [ "$CAND_UV" -gt 0 ] || [ "$CAND_VENV" -gt 0 ] || [ "$CAND_WT" -gt 0 ] || [ "$CAND_DUP" -gt 0 ] || [ "$CAND_RW" -gt 0 ]; }; then
         verdict=5
     fi
 fi
 
-TOTAL=$(( FREED_UV + FREED_VENV + FREED_WT + FREED_DUP ))
+TOTAL=$(( FREED_UV + FREED_VENV + FREED_WT + FREED_DUP + FREED_RW ))
 UNMEASURED=""
 [ "${DF_UV_OK:-0}"  = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }uv"
 [ "${DF_VENV_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }venv"
 [ "${DF_WT_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }worktree"
 [ "${DF_DUP_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }duplicate-install"
+[ "${DF_RW_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }runner-work"
 # ⛔ AN UNANSWERABLE TOTAL IS `?`, NOT THE INITIALISED ZERO. `CAND_*` are initialised to 0 and are
 # only lifted to a sentinel on the CLASS line, so a fail-closed class printed `candidates=?` on its own
 # line and the pass-end line then summed the zeroes into a confident `candidates=0` — the last line of
@@ -2164,9 +2413,10 @@ UNMEASURED=""
 # for the class line. One vocabulary: a class that was NOT SELECTED contributes nothing; a class that
 # ran with no tally makes the TOTAL unknown. Computed once, before either the line or the log uses it,
 # so the two surfaces cannot disagree again.
-CAND_TOTAL="$(( CAND_UV + CAND_VENV + CAND_WT + CAND_DUP ))"
+CAND_TOTAL="$(( CAND_UV + CAND_VENV + CAND_WT + CAND_DUP + CAND_RW ))"
 { [ "${WANT_VENV:-0}" != 1 ] || [ "${HAVE_VENV_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
 { [ "${WANT_WT:-0}" != 1 ] || [ "${HAVE_WT_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
+{ [ "${WANT_RW:-0}" != 1 ] || [ "${HAVE_RW_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
 # ⛔ A CLASS THAT MEASURED NOTHING CANNOT CONTRIBUTE A CONFIDENT `0` TO THE TOTAL — for ANY reason:
 # could not be SET UP (`misconfigured`), the delegate RAN and failed closed, or an armed pass with no
 # tally to lift. One rule over all five classes, so a sixth cannot be added and then forgotten here.
@@ -2180,19 +2430,19 @@ CAND_TOTAL="$(( CAND_UV + CAND_VENV + CAND_WT + CAND_DUP ))"
 #     back into the total — the very defect this loop exists to stop, one state over.
 # So "was selected" is `WANT=1` **or** `VERDICT=misconfigured`, and a selected class with no measurement
 # taints the sum. Polarity: deselected is silent, selected-but-unmeasured is `?`.
-for _cv in VENV WT UV DUP; do
+for _cv in VENV WT UV DUP RW; do
     eval "_cw=\${WANT_$_cv:-0}; _ch=\${HAVE_${_cv}_CAND:-0}; _cv_verdict=\${VERDICT_$_cv:-not-run}"
     { [ "$_cw" = 1 ] || [ "$_cv_verdict" = misconfigured ]; } || continue
     [ "$_ch" = 1 ] || CAND_TOTAL="?"
 done
 if is_dry; then
-    log_line "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT + WOULD_DUP ))MB candidates=$CAND_TOTAL — NOTHING was removed"
+    log_line "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT + WOULD_DUP + WOULD_RW ))MB candidates=$CAND_TOTAL — NOTHING was removed"
 else
     # third arg: was the class SELECTED at all? not-run is a third state, distinct from both
     # "measured zero" and "unmeasured".
     _pc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
             [ "${1:-0}" = 1 ] && printf '%sMB' "$2" || printf 'unmeasured'; }
-    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP"))${UNMEASURED:+ — df could not measure: $UNMEASURED (not a measured zero)}"
+    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner-work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW"))${UNMEASURED:+ — df could not measure: $UNMEASURED (not a measured zero)}"
 fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
@@ -2209,6 +2459,7 @@ DETAIL=""
 [ -n "$NOTE_VENV" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_VENV"
 [ -n "$NOTE_WT" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_WT"
 [ -n "$NOTE_DUP" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_DUP"
+[ -n "$NOTE_RW" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_RW"
 [ -n "$MISCONFIG" ] && DETAIL="${DETAIL}${DETAIL:+; }cannot run: ${MISCONFIG}"
 [ -n "$UNMEASURED" ] && DETAIL="${DETAIL}${DETAIL:+; }df could not measure the reclaim for: ${UNMEASURED} (not a measured zero)"
 # The fallback is part of the VERDICT, not a footnote beside it: a reader who sees a record must be
@@ -2238,10 +2489,12 @@ record_body() {
     printf 'freed_mb_venv=%s\n' "$(_rc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV")"
     printf 'freed_mb_worktree=%s\n' "$(_rc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT")"
     printf 'freed_mb_duplicate_install=%s\n' "$(_rc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP")"
+    printf 'freed_mb_runner_work=%s\n' "$(_rc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW")"
     printf 'would_free_mb_uv=%s\n' "$WOULD_UV"
     printf 'would_free_mb_venv=%s\n' "$WOULD_VENV"
     printf 'would_free_mb_worktree=%s\n' "$WOULD_WT"
     printf 'would_free_mb_duplicate_install=%s\n' "$WOULD_DUP"
+    printf 'would_free_mb_runner_work=%s\n' "$WOULD_RW"
     printf 'candidates_uv=%s\n' "$(_class_rec "${VERDICT_UV:-not-run}" "${WANT_UV:-0}" "${HAVE_UV_CAND:-0}" "$CAND_UV")"
     printf 'classified_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${CLASSIFIED_VENV:-}")"
     printf 'preserved_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${PRESERVED_VENV:-}")"
@@ -2264,10 +2517,23 @@ record_body() {
     printf 'main_proof=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PROOF_WT:-}")"
     printf 'pr_merged=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PRM_WT:-}")"
     printf 'candidates_duplicate_install=%s\n' "$(_class_rec "${VERDICT_DUP:-not-run}" "${WANT_DUP:-0}" "${HAVE_DUP_CAND:-0}" "$CAND_DUP")"
+    # ⛔ THIS CLASS'S COUNTER HAS TWO SPELLINGS, AND THEY ARE THE SAME NUMBER. Every sibling publishes
+    # `candidates_<key>`, and the brief that added this class names it `cand_runner_work`; both are written
+    # here from the SAME expression on adjacent lines, so they cannot disagree (the defect two surfaces of
+    # one pass can produce is a STALE or re-derived value, not an alias of one expression). Either name
+    # answers "how many candidates did runner-work see", which is the only reason the field exists.
+    printf 'candidates_runner_work=%s\n' "$(_class_rec "${VERDICT_RW:-not-run}" "${WANT_RW:-0}" "${HAVE_RW_CAND:-0}" "$CAND_RW")"
+    printf 'cand_runner_work=%s\n' "$(_class_rec "${VERDICT_RW:-not-run}" "${WANT_RW:-0}" "${HAVE_RW_CAND:-0}" "$CAND_RW")"
+    # The class's own cause channel. `detail=` still carries it joined with its siblings (the supervisor
+    # prints one line); this field exists so a reader can ask "why is runner-work not ok" without
+    # parsing a shared sentence — and `--print-status` prints it, because a field no reader prints does
+    # not exist.
+    printf 'note_runner_work=%s\n' "$NOTE_RW"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"
     printf 'verdict_venv=%s\n' "$VERDICT_VENV"
     printf 'verdict_worktree=%s\n' "$VERDICT_WT"
     printf 'verdict_duplicate_install=%s\n' "$VERDICT_DUP"
+    printf 'verdict_runner_work=%s\n' "$VERDICT_RW"
     # empty=no repo was skipped; otherwise `<repo>[<reason>], ...` — the subject the class verdict
     # never had (#2443).
     printf 'skipped_worktree=%s\n' "$SKIPPED_WT"
@@ -2311,6 +2577,6 @@ write_record "$RECORD_DIR" 2>/dev/null \
              # channel left, so any non-3 verdict becomes 4 (a filesystem problem) instead of exiting green
              # over an un-writable state dir.
              [ "$verdict" = 3 ] || verdict=4; }
-log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$TOTAL uv=$FREED_UV venv=$FREED_VENV worktree=$FREED_WT duplicate_install=$FREED_DUP candidates=$CAND_TOTAL ===="
+log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$TOTAL uv=$FREED_UV venv=$FREED_VENV worktree=$FREED_WT duplicate_install=$FREED_DUP runner_work=$FREED_RW candidates=$CAND_TOTAL ===="
 
 exit "$verdict"

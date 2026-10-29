@@ -97,6 +97,14 @@ T="$(cd "$T" && pwd -P)"
 REAP_AW_ROOTS="$T/scratch/absent"
 REAP_DI_ROOTS="$T/scratch/absent"
 export REAP_AW_ROOTS REAP_DI_ROOTS
+# ⛔ AND THE RUNNER `_work` CLASS, FOR THE SAME REASON (its own class is the newest). Its globs are the
+# one seam that can point at a REAL population outside the fixture — `/opt/gh-runner*/_work` on a cell
+# holds 19 G of live CI checkout, and several cases here run the DEFAULT class list with `--apply`. So
+# the seam is pinned at a fixture root that EXISTS and is EMPTY, which is a measured empty population
+# rather than an explicit-but-unmatched refusal (that distinction is the class's own policy).
+mkdir -p "$T/scratch/rw/gh-runner-fixture/_work"
+DISK_REAPER_RUNNER_GLOBS="$T/scratch/rw/gh-runner*/_work"
+export DISK_REAPER_RUNNER_GLOBS
 SLEEPERS=""
 cleanup() {
     local p

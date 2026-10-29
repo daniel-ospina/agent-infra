@@ -28,6 +28,7 @@ only code that deletes:
 | `venv` | `scripts/reap-lane-venvs.sh` (#1932 / #1949) | per-worktree `.venv`s whose lane is gone, proven by three liveness witnesses; fail-closed |
 | `worktree` | `scripts/pi-reap-worktrees.sh` (#1095) **+** `scripts/reap-abandoned-worktrees.sh` (#2542) | the first arm: clean, reachable, holder-free checkouts; merged heads are exempt from the 7-day floor. The second arm: abandoned LINKED worktree directories under a scratch root — age > 180 min **and** no live process's cwd/exe inside (see *The two classes that were missing* below) |
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
+| `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 3600 s), and `_work/_tool` / `_work/_actions` are deliberately retained |
 
 ## Why one entry point
 
@@ -237,6 +238,84 @@ has to publish a numeric `candidates=`; anything else is not an answer from that
 
 Both owners need no `--repo`: they run on a cell whose repo list is empty, which is the #2443 failure
 mode (the repo-scoped classes fail closed there while the disk keeps filling).
+
+### `class=runner-work` — the CI runners' `_work` sink
+
+**MEASURED (2026-10-28, cell c1 `vm-efa6cc8fdb974e61b5c054acf41d8846`, 8 cores, 12 GitHub Actions
+runners).** `/` at **98% used, 3.5 G free**, and **19 G** in
+`/opt/gh-runner-x64-{2,4,5,6,7,8}/_work` — 2.6–4.7 G per runner — of checkout left by jobs that had
+finished or been killed. A runner cleans its own `_work/<entry>` only on a NORMAL job end, so a
+cancelled/crashed/OOM-killed job's tree stays for ever. **No class matched it**: not a cache, not a lane
+env, not a tracked checkout, not a duplicate install — so the hourly pass reported healthy while a
+third of the box sat in none of the traffic classes. `scripts/disk-reaper-run.sh` had ZERO coverage of
+`gh-runner`/`_work` (grep proves it), so a box that GAINED five runners in a week silently lost its
+headroom.
+
+`scripts/reap-runner-work.sh` owns the rule; the class only runs it and accounts per filesystem.
+
+* **Discovery** is a bounded, documented glob list — `/opt/gh-runner*/_work`,
+  `$HOME/actions-runner*/_work`, `/tmp/actions-runner*/_work` — as `DISK_REAPER_RUNNER_GLOBS`
+  (space-separated, handed down as `REAP_RW_GLOBS`). A SET-but-EMPTY value is a **refusal at startup**
+  (exit 3), the rule `BOUNDED_LIB` already gets: `${X:-default}` would silently substitute the WIDEST
+  sweep for an emptied seam, which is the delete direction. A glob that matches nothing is ordinary; a
+  glob list set EXPLICITLY that matches NOTHING is `misconfigured` + `?` (see below).
+  ⚠️ Globs expand ONE level as written: a layout nesting the install one directory deeper
+  (`/tmp/actions-runner/<name>/_work`) needs `*/*` in the pattern.
+* **The gate is CONTENT mtime** — `DISK_REAPER_RUNNER_MIN_AGE` (default **3600 s**). A `_work` entry is a
+  candidate only when **nothing under it has been written for longer than the floor**; a running job
+  writes into its entry continuously (the checkout, `_work/_temp` step scripts, the command logs), so
+  mtime is a positive proof of death. The comparison set is everything under the entry **including the
+  entry's own top directory**, which is the conservative direction (a stray `touch`/`cp` over a dead
+  entry's top dir restores its floor). What the gate deliberately does NOT use is the top directory's
+  mtime **alone**: a killed job stamps that directory at the moment of the kill while its CONTENTS can
+  be hours older, so "the dir is old" is not on its own the proof. The
+  owner re-probes the same question immediately before each removal, so a job that starts mid-pass is
+  preserved (`reason=toctou`), and an unanswerable walk (permission error, vanished mount, watchdog
+  timeout) is **KEPT**, never read as dead (`reason=unreadable`).
+  ⛔ **There is no busy-check, and one must not be invented.** The listener is a child of the runner
+  service, the job worker's state lives inside that process, and `_work/<entry>` carries no owner pid,
+  no lock and no name-to-process mapping — so a `pgrep Runner.Listener`-shaped guess is both over-broad
+  (it keeps every dead entry while ANY runner is idle, which on a 12-runner box is always) and
+  under-broad (`--ephemeral` runners started by hand). That is an inert class reporting healthy, which
+  is the shape this whole reaper exists to remove.
+  ⚠️ **Residual, stated so it is not discovered:** a job that writes NOTHING for longer than the floor (a
+  single long quiet step) is indistinguishable from a dead entry by this test. Raise the floor for such
+  a box (`DISK_REAPER_RUNNER_MIN_AGE=7200`) — that is the intended response.
+* **`_work/_tool` and `_work/_actions` are DELIBERATELY RETAINED.** They are the runner's CROSS-JOB
+  caches (every downloaded action and every fetched toolchain), so removing them does not free dead
+  checkout — it forces a re-download on the NEXT job and makes every subsequent CI run slower. A
+  different trade from this class's, so they are excluded from the candidate set BEFORE anything is
+  measured, counted on the class line (`retained=`), and named per directory
+  (`RETAINED … reason=cross-job-cache`). `scripts/disk-reaper-runner-work.test.sh` case (c) proves they
+  survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling.
+* **`_work/_tool`/`_actions` are the only carve-out; whole entries are the only candidates.** A plain
+  file in `_work` is not a job's checkout, so it is left alone — the class removes directory entries.
+* **Accounting** is a `df` delta per distinct filesystem the globs can land on (`/tmp` is a tmpfs on
+  some boxes and part of `/` on others, so one reading would report 0MB for gigabytes freed from the
+  other), attributed only when the owner's own ledger says it removed something. A pass that removed
+  nothing reports `freed=0` and names the un-attributed `df` change in `detail=`, like every other class.
+* **The record** carries `freed_mb_runner_work=`, `candidates_runner_work=` (and the same number as
+  `cand_runner_work=`, the spelling this class's brief uses — both written from one expression so they
+  cannot disagree), `verdict_runner_work=` and `note_runner_work=` (the class's own cause channel; it
+  rides in `detail=` too). `--print-status` prints all of them (`freed_mb_`, `would_free_mb_`,
+  `candidates_`, `cand_`, `note_`, `verdict_`) — a field the reader does not print does not exist.
+* **A class that scanned NOTHING is not a pass.** With the globs set EXPLICITLY and no directory
+  matching, the owner reports `census=no-roots` and the class records `misconfigured` +
+  `candidates_runner_work=?`, exit 3 — the same rule (and shape) as `venv-no-repo`. With the DEFAULT
+  globs, a box that has no runners in the documented layouts is an EMPTY POPULATION, which IS a
+  measurement (`roots=0`, candidates `0`, exit 0): painting that red hourly is the alarm-fatigue shape
+  this family forbids, an alarm nobody reads.
+* **It is in the DEFAULT `--only` list**, and pinned in both scheduled artifacts
+  (`RUNNER_WORK_REAPER` in `templates/systemd/eldato-disk-reaper.service` and in the launchd plist)
+  and in the farm list, because a class an operator has to remember to enable is exactly the hole it
+  closes. It runs LAST, after `duplicate-install`: its candidates live outside the fleet's own trees
+  and its gate is the most conservative in the pass, so it must never be the reason a bigger arm did
+  not run.
+
+⛔ **The `/tmp` sink on the same box is NOT this class.** c1's `/tmp` held **148 826 entries older than
+24 h ≈ 15 G** (c4's `/tmp` measured 48 G). That needs its own class and it is harder — a live lane's cwd
+can BE under `/tmp` (measured: a running `pi` lane cwd'd in `/tmp/cell-t3/.worktrees/…`), so an mtime
+floor alone is not proof of death. Filed as **#3043**, not implemented here.
 
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
@@ -542,6 +621,7 @@ mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
 verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
 would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
+freed_mb_runner_work=not-run candidates_runner_work=not-run cand_runner_work=not-run verdict_runner_work=not-run note_runner_work=
 skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
 freed_mb_unmeasured=
 ```
@@ -602,11 +682,14 @@ scan: `want_class` was true and the record says `verdict_<class>=misconfigured` 
 setup-failure arms deselect it (`WANT_VENV=0`, because there is nothing left for it to measure), so
 its counters read `not-run` there. Neither token is a count — a refusal (`FAIL-CLOSED gh
 unavailable`) is not a measurement, and a measured zero beside an unknown classification is the
-false PASS this record exists to remove. Two of the five classes cannot answer the CANDIDATE count on
+false PASS this record exists to remove. Two of the FIVE classes cannot answer the CANDIDATE count on
 every pass and say so rather than guessing `0`: `uv` (its owner publishes no tally, so an ARMED pass —
 which has no `DRY-RUN` rows to count — records `candidates_uv=?`), and `duplicate-install` only when its
 own `SUMMARY … candidates=<n>` did not answer (that delegate prints it in BOTH modes, so an armed pass
-normally CAN answer).
+normally CAN answer). `runner-work` (the fifth, added 2026-10-28) is in that same position — its owner
+prints `SUMMARY class=runner-work … candidates=<n> … census=ok` in BOTH modes, so an armed pass answers
+a real count, and `census=no-roots` (an EXPLICIT glob list that matched nothing) is `misconfigured` +
+`?` rather than a `0`.
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable
@@ -753,6 +836,22 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | L | a live process that names the tree through a **symlinked** spelling still protects it — sub-path, alias-to-tree, and `--flag=<abs>` (argv tokens are canonicalised) | `_lp_rel "$_cand" "$path"` → `_lp_rel "" "$path"` |
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
+
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh`, also mutation-checked —
+run against the PRE-CHANGE tree (the base commit's `disk-reaper.sh` beside this owner) it reports
+**4 passed, 13 failed**, and against this tree **17 passed, 0 failed**: the discrimination is measured
+both ways, not asserted:
+
+| case | proves | mutant that must turn it red |
+|---|---|---|
+| (a) | a YOUNG `_work` entry is neither counted nor reaped — in `--dry-run` AND `--apply` | the floor reference becomes `now` |
+| (b) | an OLD entry is counted in dry-run and REMOVED by `--apply`, reported as a `df` delta with a numeric record field; a second pass claims no un-caused delta | the `-newer` test is dropped from the walk |
+| (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the `RETAINED_NAMES` table is emptied |
+| (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one | `want_class runner-work` → `true` |
+| (e) | an unknown `--only` value is refused, the valid list names `runner-work`, and a near-miss (`runner`) is refused too | the valid list is shortened in the refusal |
+| (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) | the `census=no-roots` arm is deleted |
+| (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
+| (h) | a SET-but-EMPTY glob list is a refusal at **both** layers (the entry point's seam and the owner's), never "scan nothing for ever" — `${X:-default}` would substitute the *widest* sweep for an emptied value, and this class's output is deletions | the entry point's empty-glob arm never matches; and, separately, the owner's |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
@@ -1023,6 +1122,14 @@ of that decision, not an optimisation.
   scheduled alongside them (`com.eldato.disk-reaper`), and retiring them is a follow-up
   that needs a measured window on a Mac — which the Linux cells this was built for
   cannot provide.
+* **The general stale `/tmp` population** (c1: **148 826 entries > 24 h ≈ 15 G**; c4's `/tmp`
+  measured 48 G) — filed as **#3043**, not implemented. It is a different trade from
+  `class=runner-work`: a live lane's cwd can BE under `/tmp` (measured, a running `pi` lane cwd'd in
+  `/tmp/cell-t3/.worktrees/…`), so an mtime floor is not proof of death, and a scratch copy is the only
+  artifact of an unfinished review. It needs a liveness witness (`scripts/lib/live-paths.sh`) plus an
+  owner ruling on what scratch counts as evidence — the same reversal-of-a-decision problem
+  `docs/ops/disk-consumers.md` G2 records. Do not "just add an age sweep": it would delete working
+  lanes' trees.
 
 ## Measured evidence (2026-10-18, cell-3, this box)
 
