@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <artifact>]
 #
+# record-review.sh --print-tier <pr> [owner/repo]
+#   READ-ONLY: print `<status>\t<tier>` for the PR's CURRENT head and exit
+#   WITHOUT writing a record. `<tier>` is the HIGHEST verdict tier the diff's
+#   SURFACES justify — `full`, `low` or `micro` (see review_tier_cap below);
+#   `<status>` is `ok` when the diff was read, otherwise `empty` (no changed
+#   files) | `too_large` (a possibly-truncated list) | `unclassified` (the API
+#   ANSWERED with a payload this classifier cannot certify — positive evidence,
+#   no tier) | `unavailable` (transport failure), and every non-ok status is
+#   paired with an EMPTY tier so a degraded read can never be mistaken for a
+#   selection.
+#   This is the SELECTOR the lane path reads: it answers "which tier does this
+#   diff earn?" from the changed paths alone, so review depth is chosen from
+#   WHAT THE CHANGE CAN BREAK rather than from how small it looks. `clean` is
+#   always permitted at any tier (a stronger claim is never false), so this caps
+#   the shallow tiers and never FORCES one.
+#
 # record-review.sh --print-diff-hash <pr> [owner/repo]
 #   READ-ONLY (#1351): compute the PR's live normalized three-dot diff digest
 #   and print `<status>\t<hash>` on stdout, then exit WITHOUT writing a record.
@@ -16,6 +32,89 @@
 #   classification the record path uses); ONLY `ok` carries a hash, and an
 #   empty or non-diff body NEVER does. Exit 0 — the status field carries the
 #   outcome, so a non-zero exit stays reserved for a usage/argument error.
+#
+# record-review.sh --check-carry <pr> [owner/repo]
+#   READ-ONLY, and the ONE way a lane asks "my record's head is stale — is the
+#   diff I reviewed still the diff that would merge?". It runs the SAME
+#   `diff_hash_for_pr` the record path and the GitHub gate use, compares that
+#   digest to the record's `diff_sha256` with the merge gate's own identity rule
+#   (full lowercase 64-hex, never the empty-body constant), and prints ONE
+#   tab-separated line `<verdict>\t<record digest|->\t<live digest|status>`.
+#   verdict, and exit code:
+#     head        0  the record is bound to the CURRENT head — nothing is stale
+#     carry       0  the reviewed DIFF is unchanged; the gate carries the record
+#     carry-patch 6  the RENDERED diff moved but the reviewed PATCH is
+#                    byte-identical (a rebase / base-move) — the gate will NOT
+#                    carry the record as-is, so RE-RECORD at the current head
+#                    and do NOT run a review cycle (#1377). Distinct from
+#                    `carry` because the record must be re-minted, and distinct
+#                    from exit 0 because no merge may be assumed.
+#     fresh       1  the DIFF changed; a fresh review is genuinely owed
+#     unreadable  3  the live diff could not be READ — RETRY, do NOT re-review
+#     norecord    4  no record for this PR/repo — there is no verdict to carry
+#                    (with no repo resolved: no unique `<owner>-<repo>-<pr>.json`
+#                    and no repo-less `<pr>.json` — pass owner/repo)
+#     nodigest    5  the record has no usable digest — re-run the recorder at the
+#                    head and let its carry arms decide (a CARRY, not a review)
+#   A usage/argument error is exit 2. ⛔ It is a PREDICTION, not an authorization:
+#   the merge gate re-decides on the live diff, and it never writes a record.
+#
+# record-review.sh --recover-body <pr> [owner/repo]
+#   REBUILD a MISSING record from the PR body's own SIGNED marker (#2872).
+#   The marker the recorder posts is signed (HMAC-SHA256 over the marker text,
+#   $AI_REVIEW_GATE_KEY, #2055), and it is the only copy of the verdict that
+#   TRAVELS with the PR — the record file is per-box. So a review minted on a
+#   cell, or on a box since recycled, leaves the rail saying NO-RECORD while the
+#   proof sits in the body, verifiable with a key this box already holds.
+#   Measured 2026-10-26: of 45 open PRs, 12 had a marker whose `diff=` equals the
+#   PR's live diff and no record file here; the registry covered 2 of them.
+#   It verifies the HMAC before minting (a body is attacker-writable, so a
+#   shape-only `sig=[0-9a-f]{64}` check would let `sig=<64 zeros>` be adopted and
+#   then RE-SIGNED by a later carry — the failure #784/#2055 closed), refuses to
+#   overwrite a record that exists, and stamps `"mint":"recovered-body"` plus
+#   the marker's `sig` so the provenance is readable.
+#   ⛔ `reviewed_at` IS A LOWER BOUND, NOT A MINT TIME. This box never saw the
+#   mint, and a marker carries no timestamp. The record's date is the HEAD
+#   COMMIT's committer date (a committer can move that with GIT_COMMITTER_DATE,
+#   so it bounds the mint from below and no more), and `recovered_at` records when
+#   the restoration happened. That is NOT tortoise#7391 satisfied — it is the
+#   honest version of an unknown, labelled as one. It also orders safely:
+#   `registry-sync.sh` compares records on `reviewed_at`, so a recovered record
+#   yields to a peer record with a later stamp instead of overwriting it.
+#   ⛔ A `clean-low` MARKER IS REFUSED (exit 3): that tier certifies the merge
+#   BASE, `merge_base_sha` is not in the marker, and a recovered clean-low would
+#   make the rail skip its base guard while the gate blocks the same record.
+#   Mint it again at the current head instead — a FRESH mint, not a carry (there
+#   is no prior record to carry from, and the clean-low content-shape guard still
+#   has to pass). Calling it a "carry" would name a `mint` state that will not
+#   appear in the record.
+#   It does NOT review and does NOT authorize a merge: the normal carry arms
+#   still decide whether the recovered digest covers what would merge.
+#     exit 0  minted (stdout: `recovered\t<head>\t<digest|->`)
+#     exit 2  usage — an unresolvable repo (a record is identified by PR *and*
+#             repo), a minting flag it must not take, or a second verb on the
+#             same command line (one verb per invocation: a silently-dropped
+#             `--recover-body` would look like a successful recovery)
+#     exit 3  NOTHING WRITTEN, and each cause is named on stderr:
+#               · no USABLE marker — absent, unsigned, bad signature, or one
+#                 naming a DIFFERENT repo
+#               · a `clean-low` marker (see above)
+#               · no AI_REVIEW_GATE_KEY, so a marker's signature cannot be
+#                 VERIFIED (and an unverified marker is a body edit)
+#               · the PR body could not be READ — TRANSIENT (RETRY) or PERMANENT
+#                 (a 404/422: the PR does not exist or is not visible to this
+#                 token — retrying cannot help), branched on gh's own message
+#               · the head commit's committer date could not be read, so even a
+#                 lower bound for `reviewed_at` cannot be stated — likewise
+#                 branched transient vs permanent (`No commit found` = a
+#                 force-pushed marker head, or a commit only on a fork)
+#     exit 5  recovery fills an ABSENCE and never replaces one: a record for this
+#             PR/repo already exists (including one that appeared WHILE this verb
+#             was reading the PR), the qualified file embeds ANOTHER repo — the
+#             identical-slug overwrite state, which the gate reads as absent but
+#             which this verb will not destroy — or an existing record is NOT
+#             usable (truncated/hand-edited), which is named with a move-aside
+#             remedy (do NOT read that as "a verdict already exists, do nothing")
 #
 # Records a code-review verdict for a PR into ~/.pi/agent/reviews/<PR>.json,
 # consumed by the review-enforcer merge registry gate
@@ -396,6 +495,223 @@ clean_low_shape_ok() {
   return 0
 }
 
+# ── The review-surface cap: the ALWAYS-FULL class ─────────────────────────
+# A verdict tier is a DEPTH choice for a diff whose blast radius is genuinely
+# smaller — that is what `proportional-gates` §Review Cycles decides and what
+# #1348 gives content-only diffs as `clean-low`. This is the CEILING on that
+# choice, and it is keyed on WHAT A CHANGE CAN BREAK, never on how small it
+# looks: a one-line edit to the merge rail is a high-blast change; a 300-line
+# prose rewrite is not. Diff SIZE is deliberately not an input — the fleet's own
+# measurement (2026-10-23) is that a reviewer's cost is FLAT in diff size (a
+# 5-line shell fix reviewed at 1.73M tokens vs 3.06M for a 36-line test fixture,
+# because the cost is context, not lines), so a "small diff, shallow review"
+# tier buys nothing while inviting a genuinely dangerous diff to look cheap.
+#
+# Declared ONCE here, and consumed by every tier below, so there is no second
+# list to drift. It is a HAND-MAINTAINED denylist on purpose: the surfaces that
+# can break the product are a short, stable, reviewable set, and a computed
+# dependency graph would be a second definition of "what this can affect" — the
+# exact class of drift `clean_low_path_ok` also refuses to inherit from a
+# sibling (see the class notes above). Surfaces:
+#   * the merge/land/repair rails — their correctness IS the product's gates, so
+#     a defect here is a false PASS at the last gate before main;
+#   * `record-review.sh` itself — the producer of the attestation this cap
+#     protects; leaving it out would be a one-line bypass — and
+#     `scripts/lib/diff-normalize.py`, the SINGLE implementation of the diff
+#     digest (`--print-diff-hash`'s contract). The same argument applies to it
+#     verbatim: the file's own #1362 note records that a normalizer which prints
+#     nothing yields `DIFF_HASH = sha256("")`, a constant that collides for
+#     every diff and lets the carry arm mint head-bound evidence for an
+#     unreviewed revision — a FALSE ACCEPT, which is what this class is for;
+#   * `scripts/check-*`, `.husky/**` — CI and pre-commit gate bodies: the same
+#     "correctness IS a gate" argument as the rails above. NOTE the BOUNDARY
+#     here, stated so the list does not grow without one: the class is the
+#     surfaces whose own correctness is a gate, NOT every script. `scripts/`
+#     outside those names is reviewed at its risk class like any other code;
+#   * CI workflow + action definitions — the `[skip ci]` / job-wiring surface;
+#   * `extensions/**` — every local enforcement gate (review-enforcer,
+#     verification-gate, sequence-enforcer);
+#   * `skills/**` and `templates/**` — AGENT-EXECUTABLE INSTRUCTIONS. `skills/`
+#     is the script an enforcement gate runs (a micro edit to
+#     `skills/code-review/SKILL.md` would rewrite what "reviewed" means, with no
+#     reviewer dispatched) and `templates/` materializes into every consumer
+#     repo's `AGENTS.md`. `clean_low_path_ok` already refuses to call this layer
+#     prose (it excludes root instruction files and any enforcement input); the
+#     cap must not be laxer than the class beneath it;
+#   * `enforcement/**` — the dangerous-ops manifest the skill enforcer reads.
+# Exact basenames under `scripts/` plus directory prefixes elsewhere: bash `case`
+# globs cross `/`, which is why the script files are enumerated EXACTLY rather
+# than as `scripts/*.sh` (that would put every script in the always-full class
+# and the cap would never fire).
+review_full_surface_path() { # <path> → rc0 = ALWAYS-FULL, rc1 = not, rc2 = unclassifiable
+  local p="$1"
+  [ -n "$p" ] || return 2
+  # Path hygiene first: a raw control character, an absolute path, a `~` path or
+  # a `.`/`..`/empty segment must never be CLASSIFIED here (a `docs/../scripts/…`
+  # would otherwise evade every arm below). Same posture as clean_low_path_ok,
+  # and the caller treats an unclassifiable path as full — so a malformed row
+  # can never certify a SHALLOWER tier.
+  case "$p" in
+    *[$'\n\r\t']*) return 2 ;;
+  esac
+  case "$p" in
+    /*|~*) return 2 ;;
+  esac
+  case "/$p/" in
+    *"//"*|*"/./"*|*"/../"*) return 2 ;;
+  esac
+  case "$p" in
+    scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh|scripts/lib/diff-normalize.py) return 0 ;;
+    # Rail-exec'd decision modules: `admin-merge.sh` execs BOTH of these to decide
+    # whether a red check blocks — `ci_exemption.py` makes the exemption call and
+    # `ci-workflow-pr-evaluable.sh` decides that such a red must stay BLOCKING.
+    # Matched by EXACT name, not by the `check-` shape: a defect here makes a
+    # genuinely failing check read as exempt, which is the false PASS this class
+    # exists to prevent.
+    scripts/ci_exemption.py|scripts/ci-workflow-pr-evaluable.sh|scripts/checkout_guard.sh|scripts/ci_runner_gate.sh) return 0 ;;
+    scripts/check-*|.github/workflows/*|.github/actions/*|.husky/*|extensions/*|skills/*|enforcement/*|templates/*) return 0 ;;
+  esac
+  return 1
+}
+
+# review_tier_cap — rows ("<status>\t<path>\t<old>") on stdin → echoes the
+# HIGHEST verdict tier the diff's surfaces justify: `full`, `low` or `micro`.
+#   full  — a path in the ALWAYS-FULL class is touched: neither clean-micro nor
+#           clean-low may be claimed; only `clean` is honest.
+#   low   — every path is in the clean-low content class: `clean-low` is honest
+#           (and `clean` stays permitted — a stronger claim is never false).
+#   micro — neither of the above: the micro EXEMPTION is the only one available,
+#           and it is further conditioned on the linked issue's label by the
+#           clean-micro guard below.
+# rc 1 (no rows) is a FAIL-CLOSED signal for callers: an empty diff has no
+# surface to certify.
+review_tier_cap() {
+  local paths p seen=0 rc=0
+  paths="$(LC_ALL=C awk -F '\t' 'NF >= 2 && $2 != "" { print $2; if ($3 != "") print $3 }' | LC_ALL=C sort -u)"
+  [ -n "$paths" ] || return 1
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    seen=1
+    # 0 = always-full, 2 = UNCLASSIFIABLE — both leave the diff with no claim to
+    # a shallower tier. Only 1 (classifiable, not full) may continue. Captured in
+    # `rc` rather than read from `$?` inside an `elif`, so the arm is explicit
+    # and cannot inherit an unrelated last-command status.
+    rc=0
+    review_full_surface_path "$p" || rc=$?
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+      printf 'full\n'; return 0
+    fi
+  done <<< "$paths"
+  [ "$seen" -eq 1 ] || return 1
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if ! clean_low_path_ok "$p"; then
+      printf 'micro\n'
+      return 0
+    fi
+  done <<< "$paths"
+  printf 'low\n'
+  return 0
+}
+
+# review_surface_rows <repo> <pr> <sha> — print the changed-file rows of
+# compare/<base>...<sha>, prefixed by one "mb\t<merge-base>\t<expected-count>"
+# line.
+#   rc 0 = rows printed (header + at least one row)
+#   rc 1 = TRANSPORT failure with nothing read — gh absent, the `pulls` read
+#          failed, or the compare failed for a reason that is NOT a refusal of
+#          this revision (403 rate-limit, 5xx, no route to host). Absent
+#          evidence; the callers warn loudly and proceed.
+#   rc 2 = the API answered: the PR has NO changed files.
+#   rc 3 = the API ANSWERED and REFUSED, or answered with a payload this
+#          classifier cannot certify: a `pulls` body with no base/count, a
+#          compare HTTP 404/422 (a fork head, a rewritten sha), a compare that
+#          exited 0 with no readable body, no merge base, no rows, a malformed
+#          row. POSITIVE evidence, so the callers REFUSE. It must never be
+#          confused with rc 1: that confusion was how one `copied` row, and
+#          separately a fork-head 404, turned the cap into a no-op and let a
+#          rail edit record `clean-micro`.
+#
+# An EXPLICIT <sha>, not pulls/<n>/files, for the reason the clean-low guard
+# gives above: pulls/<n>/files always describes the CURRENT head, so a push
+# landing between the read and the write would let one revision be certified
+# while another merges. A compare against an explicit sha has no such window.
+review_surface_rows() {
+  local repo="$1" pr="$2" sha="$3" meta head base count cmp mb first rest
+  command -v gh >/dev/null 2>&1 || return 1
+  meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null)" || return 1
+  head="$(printf '%s' "$meta" | cut -f1)"
+  base="$(printf '%s' "$meta" | cut -f2)"
+  count="$(printf '%s' "$meta" | cut -f3)"
+  [[ "$base" =~ ^[0-9a-f]{40}$ ]] || return 3
+  [[ "$count" =~ ^[0-9]+$ ]] || return 3
+  # Zero changed files is the `empty` status, not a truncation and not a tier.
+  [ "$count" -gt 0 ] || return 2
+  # An empty <sha> means "the PR's current head" (the --print-tier selector).
+  # Every recording caller passes an explicit sha (see the header note above).
+  if [ -z "$sha" ]; then
+    [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 3
+    sha="$head"
+  fi
+  # A non-2xx here is NOT transport. The pulls read SUCCEEDED, so the API is
+  # reachable and answered our first question; it REFUSED the second, which means
+  # this revision cannot be compared (the fork-head / unreachable-sha 404 this
+  # codebase documents as predictable, or a rewritten sha). That is POSITIVE
+  # evidence, so rc 3 — refusing — not rc 1. Classifying it as transport made the
+  # cap silently no-op on exactly the case the sibling clean-low guard hard-fails
+  # 60 lines later, leaving a fork PR that edits a rail free to record
+  # clean-micro (measured: rc 0, record written, one stderr line).
+  # A compare failure is only POSITIVE evidence when the API REFUSED this
+  # revision. `gh` exits 1 for a 404, a 403 rate-limit, a 502 and a dead socket
+  # alike, so the exit code alone cannot carry that distinction — and getting it
+  # wrong in either direction is a real cost:
+  #   * treating a refusal as transport let a fork-head 404 (documented here as
+  #     predictable) record clean-micro on a rail diff;
+  #   * treating transport as a refusal would strand a legitimate micro PR on a
+  #     rate-limit window or a blip, and tell it to go pay for a full review.
+  # So classify on the STATUS gh reported: an HTTP refusal of THIS revision
+  # (404 Not Found / 422 Unprocessable) is rc 3; everything else — 403, 5xx, no
+  # route to host, empty stderr — is rc 1 (nothing read, warn and proceed), the
+  # same posture the `pulls` read above already takes.
+  CMP_ERR="$(mktemp 2>/dev/null)" || CMP_ERR=""
+  if [ -n "$CMP_ERR" ]; then
+    cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>"$CMP_ERR")"
+  else
+    cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null)"
+  fi
+  if ! [[ "$cmp" =~ ^mb ]]; then
+    CMP_REFUSED=0
+    if [ -n "$CMP_ERR" ] && command grep -qE 'HTTP (404|422)\b' "$CMP_ERR" 2>/dev/null; then CMP_REFUSED=1; fi
+    [ -n "$CMP_ERR" ] && rm -f "$CMP_ERR"
+    [ "$CMP_REFUSED" -eq 1 ] || return 1
+    return 3
+  fi
+  [ -n "$CMP_ERR" ] && rm -f "$CMP_ERR"
+  # Split the header line in BASH, never `printf … | head -1 | cut`. This script
+  # runs `set -o pipefail`, and a `head` that exits after its one line sends
+  # SIGPIPE to the writer — the substitution then fails and, under `set -e`, the
+  # whole script aborts with NO output at all. Measured on this seam: 9 of 40
+  # identical runs produced empty stdout. The failure is SILENT (a caller reading
+  # a status finds nothing), which is the #2412 class this repo spent a change
+  # removing from lander.test.sh.
+  first="${cmp%%$'\n'*}"
+  if [[ "$cmp" == *$'\n'* ]]; then rest="${cmp#*$'\n'}"; else rest=""; fi
+  IFS=$'\t' read -r _tag mb _tail <<< "$first"
+  [[ "$mb" =~ ^[0-9a-f]{40}$ ]] || return 3
+  [ -n "$rest" ] || return 3
+  # FRAMING-AGNOSTIC validation: the cap only needs PATHS, so it must not inherit
+  # the clean-low attestation's status enum (`clean_low_rows` deliberately
+  # refuses `copied`, and reusing it here meant one unusual row discarded the
+  # whole read and the record PROCEEDED). Any non-empty path is accepted; a row
+  # with no path is rc 3, not silence.
+  if ! LC_ALL=C awk -F '\t' 'NF < 2 || $2 == "" { exit 1 }' <<< "$rest"; then
+    return 3
+  fi
+  printf 'mb\t%s\t%s\n' "$mb" "$count"
+  printf '%s\n' "$rest"
+  return 0
+}
+
 # ── tortoise#7391 — the review-artifact evidence gate (fresh `clean` records) ────
 # A `clean` record is the only verdict that asserts a review HAPPENED and
 # cannot be cross-checked from anything else on disk, so the caller must name
@@ -693,6 +1009,14 @@ EXPECT_HEAD=""
 # #1351 — set by --print-diff-hash (read-only consumer seam, see the header).
 # Initialised here so `set -u` is satisfied when the flag is absent.
 PRINT_DIFF_HASH=0
+# #1351 — the LANE's question, answered: "my record's head is stale; is the DIFF I
+# reviewed still the diff that would merge?" Set by --check-carry (read-only).
+CHECK_CARRY=0
+# Set by --print-tier: the READ-ONLY surface-cap selector (see the header).
+PRINT_TIER=0
+# #2872 — rebuild a missing record from the PR body's SIGNED marker. Mints, so it
+# is its own verb: `--check-carry` answers, `--recover-body` writes.
+RECOVER_BODY=0
 EVIDENCE=""
 # tortoise#7391: what the record carries. Set ONLY by the verification gate below, so a
 # record claims `evidence` only when this run actually read and accepted that
@@ -706,6 +1030,9 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
   _arg="${_argv[$_i]}"
   case "$_arg" in
     --print-diff-hash) PRINT_DIFF_HASH=1 ;;
+    --check-carry) CHECK_CARRY=1 ;;
+    --print-tier) PRINT_TIER=1 ;;
+    --recover-body) RECOVER_BODY=1 ;;
     --force-stale) FORCE_STALE=1 ;;
     --expect-head)
       _i=$((_i + 1))
@@ -739,21 +1066,58 @@ if [ "${#POSITIONAL[@]}" -gt 4 ]; then
   echo "record-review.sh: too many arguments (${#POSITIONAL[@]}) — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <review-artifact>] [--force-stale]" >&2
   exit 2
 fi
+# ⛔ THE ONE-VERB RULE COVERS POSITIONALS TOO (round 2, P2). `--recover-body 42 o/r
+# clean-low <sha>` passed the bound above, took REPO from $2, and silently DROPPED
+# the requested verdict and head — minting the MARKER's verdict with exit 0. The
+# read-only modes can ignore extra positionals harmlessly (they mint nothing); a
+# MINTING mode must not.
+if [ "$RECOVER_BODY" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]; then
+  echo "record-review.sh: --recover-body takes <pr> [owner/repo] and nothing else (got ${#POSITIONAL[@]} positional arguments) — a head/verdict here would be silently IGNORED, and this verb would mint the marker's verdict while you believed you had chosen one. Recover, then record a fresh verdict as a separate command if one is owed." >&2
+  exit 2
+fi
 if [ "${#POSITIONAL[@]}" -gt 0 ]; then
   set -- "${POSITIONAL[@]}"
 else
   set --
 fi
 PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale] [--evidence <artifact>]}"
-if [ "$PRINT_DIFF_HASH" -eq 1 ]; then
-  # #1351 — positional shape for the read-only mode: <pr> [owner/repo]. There
-  # is NO head_sha and NO verdict here: the caller is asking about a PR whose
-  # CURRENT head the record already disagrees with (that is why it is asking),
-  # and it wants the diff identity that decides whether the disagreement is a
-  # content change or a merge-only head move.
+# ⛔ ONE VERB PER INVOCATION (review, #2872 P2). The modes are mutually exclusive
+# answers, and the SILENT failure is the dangerous shape: with
+# `--recover-body --check-carry` the check-carry block exits first, so the caller
+# gets `head`/`carry` and a ZERO exit while NOTHING was written — the mirror image
+# of accepting a minting flag. It is refused HERE, above the mode dispatch, because
+# `--print-diff-hash` takes the FIRST branch and would otherwise never see it.
+if [ "$RECOVER_BODY" -eq 1 ] && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; }; then
+  echo "record-review.sh: --recover-body is a MINTING verb and cannot be combined with --check-carry/--print-diff-hash/--print-tier on one command line — the read-only mode answers and exits first, so a successful-looking exit would have written nothing. Run one verb at a time: recover, then ask." >&2
+  exit 2
+fi
+if [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; then
+  # Read-only positional shape: <pr> [owner/repo]. There is NO head_sha and NO
+  # verdict here — a selector that answers about the PR's current head must not
+  # also be handed the thing it is asked to choose.
   SHA=""
   VERDICT=""
   REPO="${2:-}"
+elif [ "$CHECK_CARRY" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ]; then
+  # Same shape, same reason. --check-carry answers the lane's question with the
+  # merge gate's own predicate instead of leaving it to inference; --recover-body
+  # takes <pr> [owner/repo] because a record is identified by BOTH.
+  SHA=""
+  VERDICT=""
+  REPO="${2:-}"
+  # ⛔ A FLAG THAT CANNOT AFFECT A READ-ONLY ANSWER IS REFUSED, NOT IGNORED.
+  # `--evidence`/`--force-stale`/`--expect-head` are RECORD-MINTING inputs; this
+  # mode writes nothing, so accepting them would make the caller believe it had
+  # recorded (or pinned) something it did not. Same posture as the removed
+  # --second-model flag above.
+  if [ -n "$EVIDENCE" ] || [ "$FORCE_STALE" -eq 1 ] || [ -n "$EXPECT_HEAD" ]; then
+    if [ "$RECOVER_BODY" -eq 1 ]; then
+      echo "record-review.sh: --recover-body restores a verdict that was ALREADY recorded, so it takes no --evidence/--force-stale/--expect-head — those describe a review to mint, and accepting them here would let a recovered record claim evidence no reviewer produced. Recover first, then record a fresh verdict separately if one is owed." >&2
+    else
+      echo "record-review.sh: --check-carry is READ-ONLY (it answers 'would this record carry?' and writes nothing), so it takes no --evidence/--force-stale/--expect-head — those describe a record to mint. Run the mode without them, then record separately if the answer is 'fresh'." >&2
+    fi
+    exit 2
+  fi
 else
   SHA="${2:?missing head_sha}"
   VERDICT="${3:-clean}"
@@ -766,7 +1130,9 @@ case "$VERDICT" in
     # record path is refused here. The arm is expressed this way — rather than
     # folding the case into the else above — so the mutation harness's
     # `sed 's#^  clean|clean-micro|clean-low) ;;#…#'` anchor keeps matching.
-    if [ "$PRINT_DIFF_HASH" -ne 1 ]; then
+    # --recover-body is here for the same reason (#2872): it takes its verdict
+    # from the SIGNED marker it verifies, never from the command line.
+    if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ] && [ "$RECOVER_BODY" -ne 1 ]; then
       echo "verdict must be 'clean', 'clean-micro' or 'clean-low'; refusing to record '$VERDICT'" >&2; exit 2
     fi ;;
 esac
@@ -787,7 +1153,7 @@ fi
 if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
   echo "PR number must be numeric; refusing to record '$PR'" >&2; exit 2
 fi
-if [ "$PRINT_DIFF_HASH" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+if [ "$PRINT_DIFF_HASH" -eq 0 ] && [ "$CHECK_CARRY" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && [ "$RECOVER_BODY" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "head_sha must be a full 40-char hex sha (got '${SHA:0:12}…'); refusing to record" >&2; exit 2
 fi
 # tortoise#7391: the sha the CALLER named, kept before any carry re-binds $SHA to the
@@ -1261,7 +1627,177 @@ diff_hash_for_pr() { # <pr>
   fi
   rm -f "$tmp" "$norm"
 }
-if [ -n "$REPO" ]; then
+
+# ══════════════════════════════════════════════════════════════════════════
+# #1377 — THE PATCH IDENTITY: "did the CHANGE move, or only the RENDERING?"
+#
+# The evidence binding above answers "is this the same artifact?" and is
+# deliberately STRICT: its `diff_sha256` keeps hunk CONTEXT, because #1362 D1
+# (owner ruling) refused the whitespace-blind `git patch-id` as a binding. That
+# strictness is correct for a binding and it is what makes a changed diff
+# impossible to carry — but it also means a REBASE onto a moved base is
+# invisible to it: when `main` lands work in the same file, every context line
+# around the reviewed change is rewritten, the normalized digest moves, and the
+# record goes stale with the REVIEWED LINES UNCHANGED. That is #1377: re-record
+# (mechanical), do NOT pay for a second review (the review is a review OF THE
+# DIFF, and the diff is the same change).
+#
+# So there are two questions, answered by two projections of the SAME bytes from
+# the SAME normalizer (scripts/lib/diff-normalize.py):
+#   * the BINDING projection (`diff=`, cross-repo contract) — unchanged here;
+#   * the PATCH projection (`--patch-only`) — drops exactly the three fields a
+#     rebase rewrites (blob ids, hunk line numbers, hunk CONTEXT) and keeps
+#     everything else BYTE-EXACT, including whitespace and the file PATH.
+#
+# ⛔ WHY NOT `git patch-id --stable`, which #1377's own text names: `--stable`
+# "ignores all whitespace within the patch" (git-patch-id(1)), so a
+# whitespace-only edit would match its parent — the exact false ACCEPT #1362 D1
+# ruled out. This projection carries both of D1's objections forward (sha256,
+# whitespace-exact, and paths included, which patch-id does not commit to)
+# instead of reversing the ruling.
+#
+# ⛔ THE ANCHOR IS WHAT MAKES IT SOUND. A patch match ALONE proves nothing: it
+# would let a body-supplied sha pair with any diff. So `patch_dimension_carry`
+# requires the reviewed diff it RECONSTRUCTS to normalize to the marker's own
+# signed `diff=` before it compares a single changed line. The marker is
+# HMAC-verified by the caller (#784) and the reconstruction must reproduce it —
+# so the bytes compared are the bytes that marker was minted over. Any mismatch
+# (a moved merge-base, a divergence between GitHub's renderings, a rewritten
+# reviewed commit) is a REFUSAL, never a guess.
+#
+# ⛔ IT CANNOT WEAKEN HEAD BINDING. Nothing here mints or accepts a marker: the
+# carry RE-RECORDS at the CURRENT head with that head's own `diff=`, exactly as
+# the #2982 arm does, so the gate still sees a marker bound to the revision that
+# would merge (#930 adversarial class 1). A stale marker over a DIFFERENT patch
+# stays refused by both the byte-identity arm and this one.
+diff_identity_pair() { # <diff-file> -> "<binding-digest>\t<patch-digest>" ; rc 1 = uncomputable
+  local f="$1" t="" a="" p=""
+  [ -s "$f" ] || return 1
+  # A body with no entry boundary is NOT a diff. Hashing it would mint an
+  # identity for bytes nobody reviewed — the same rule the API path applies
+  # (#1398). Tested FIRST, so a real diff is never demoted.
+  command grep -qE '^diff --git ' "$f" 2>/dev/null || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  command -v openssl >/dev/null 2>&1 || return 1
+  [ -f "$DIFF_NORMALIZER" ] && [ -s "$DIFF_NORMALIZER" ] || return 1
+  t="$(command mktemp 2>/dev/null)" || return 1
+  # `[ -s ]` on the projection OUTPUT, not just its exit status: a zero-byte
+  # normalizer exits 0 and prints nothing, and sha256("") is a CONSTANT that
+  # would make every diff identical (the #1362 fail-open this file already
+  # guards elsewhere). Empty output ⇒ refuse, never hash it.
+  a="$(command python3 "$DIFF_NORMALIZER" < "$f" 2>/dev/null > "$t" && [ -s "$t" ] \
+        && command openssl dgst -sha256 < "$t" | command awk '{print $NF}')" || a=""
+  p="$(command python3 "$DIFF_NORMALIZER" --patch-only < "$f" 2>/dev/null > "$t" && [ -s "$t" ] \
+        && command openssl dgst -sha256 < "$t" | command awk '{print $NF}')" || p=""
+  command rm -f "$t"
+  case "$a$p" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#a}" -eq 64 ] && [ "${#p}" -eq 64 ] || return 1
+  printf '%s\t%s\n' "$a" "$p"
+  return 0
+}
+# #1377 — carry across a head move whose PATCH is unchanged even though the
+# BINDING moved. Both sides are READ FRESH from the compare endpoint at the SAME
+# base, so the two renderings are the same generator's and the verdict cannot
+# depend on when the recorded side happened to be fetched (a TOCTOU the byte-
+# identity arm has by construction). This is the arm that carries a REBASE.
+patch_dimension_carry() { # <reviewed-sha> <reviewed-binding-digest> <current-head> -> 0 = patch unchanged
+  local reviewed="$1" anchor="$2" current="$3" base="" tmp="" pair="" on="" op=""
+  [ -n "$reviewed" ] && [ -n "$anchor" ] && [ -n "$current" ] || return 1
+  case "$reviewed$anchor$current" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#reviewed}" -eq 40 ] && [ "${#anchor}" -eq 64 ] && [ "${#current}" -eq 40 ] || return 1
+  [ -n "$REPO" ] && command -v gh >/dev/null 2>&1 || return 1
+  [ "$reviewed" != "$current" ] || return 1
+  # THE BASE IS THE API'S (as in lane_dimension_carry): a local ref can LIE about
+  # it, and a stale one would make a commit the review never saw look like base
+  # content. Same read, same reason, same authority.
+  base="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  case "$base" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#base}" -eq 40 ] || return 1
+  tmp="$(command mktemp 2>/dev/null)" || return 1
+  # ---- THE REVIEWED SIDE, reconstructed from the marker's own `@ <sha>` ----
+  # Three-dot, so the merge-base with the CURRENT base is what is diffed: for a
+  # head that was never itself rebased this reproduces the diff the review saw
+  # even after the base moved (which is why the ANCHOR below can match).
+  if ! command gh api -H "Accept: application/vnd.github.v3.diff" \
+         "repos/$REPO/compare/${base}...${reviewed}" > "$tmp" 2>/dev/null \
+     || [ ! -s "$tmp" ] \
+     || ! command grep -qE '^diff --git ' "$tmp" 2>/dev/null; then
+    command rm -f "$tmp"; return 1
+  fi
+  pair="$(diff_identity_pair "$tmp")" || { command rm -f "$tmp"; return 1; }
+  on="${pair%%$'\t'*}"
+  op="${pair#*$'\t'}"
+  # ---- THE ANCHOR (load-bearing): these bytes ARE the reviewed artifact ----
+  # A mismatch means the reconstruction is NOT what the marker was minted over
+  # (a moved merge-base, a rewritten reviewed commit, GitHub rendering the two
+  # endpoints differently). Refuse — never compare a patch against bytes of
+  # unknown provenance.
+  if [ "$on" != "$anchor" ]; then command rm -f "$tmp"; return 1; fi
+  # ---- THE LIVE SIDE, same base, same generator ----
+  if ! command gh api -H "Accept: application/vnd.github.v3.diff" \
+         "repos/$REPO/compare/${base}...${current}" > "$tmp" 2>/dev/null \
+     || [ ! -s "$tmp" ] \
+     || ! command grep -qE '^diff --git ' "$tmp" 2>/dev/null; then
+    command rm -f "$tmp"; return 1
+  fi
+  pair="$(diff_identity_pair "$tmp")" || { command rm -f "$tmp"; return 1; }
+  command rm -f "$tmp"
+  # ---- THE DECISION: every reviewed changed line, byte for byte, same paths ----
+  [ "${pair#*$'\t'}" = "$op" ] || return 1
+  return 0
+}
+# Tier selector, read-only seam. Exits BEFORE the diff-hash fetch and every
+# write, so asking "which tier does this diff earn?" costs one compare read and
+# can never mint, mutate or carry a record. `ok` is the only status a caller may
+# act on; every other status carries an EMPTY tier, so a degraded read is never
+# mistaken for a selection.
+if [ "$PRINT_TIER" -eq 1 ]; then
+  if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
+    printf 'unavailable\t\n'; exit 0
+  fi
+  TIER_RC_T=0
+  ROWS_T="$(review_surface_rows "$REPO" "$PR" "")" || TIER_RC_T=$?
+  case "$TIER_RC_T" in
+    0) ;;
+    2) printf 'empty\t\n'; exit 0 ;;
+    3) # The API ANSWERED with an unusable payload: positive evidence, no tier.
+       printf 'unclassified\t\n'; exit 0 ;;
+    *) printf 'unavailable\t\n'; exit 0 ;;
+  esac
+  TIER_HEAD_T="${ROWS_T%%$'\n'*}"
+  if [[ "$ROWS_T" == *$'\n'* ]]; then TIER_ROWS_T="${ROWS_T#*$'\n'}"; else TIER_ROWS_T=""; fi
+  IFS=$'\t' read -r _tag_t _mb_t TIER_COUNT_T <<< "$TIER_HEAD_T"
+  # Truncation guard, same ceiling and same reason as clean_low_shape_ok: the
+  # compare endpoint returns at most 300 entries and does NOT paginate, so AT the
+  # cap the list may be short — and a short list could be missing the one rail
+  # path that would have selected `full`. Report `too_large` (an EMPTY tier), not
+  # a tier chosen from a list that may be incomplete.
+  #
+  # The count is over the NEW path only, exactly as clean_low_shape_ok counts it
+  # (`:385`) — GitHub counts a rename as ONE changed file while the compare row
+  # carries the old path too, so counting both ends would report truncation for
+  # any diff containing a rename. The CLASSIFICATION below still reads BOTH ends
+  # (a rename out of a rail must not slip through); only the parity arithmetic is
+  # path-identity, not path-instance.
+  TIER_DISTINCT_T="$(LC_ALL=C awk -F '\t' 'NF>=2 && $2 != "" { print $2 }' <<< "$TIER_ROWS_T" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+  if [ -z "$TIER_DISTINCT_T" ] || [ "$TIER_DISTINCT_T" -eq 0 ]; then
+    printf 'empty\t\n'; exit 0
+  fi
+  if [ "$TIER_DISTINCT_T" -ge 300 ] || [ "$TIER_DISTINCT_T" != "$TIER_COUNT_T" ]; then
+    printf 'too_large\t\n'; exit 0
+  fi
+  if ! CAP_T="$(printf '%s\n' "$TIER_ROWS_T" | review_tier_cap)"; then
+    printf 'unclassified\t\n'; exit 0
+  fi
+  printf 'ok\t%s\n' "$CAP_T"
+  exit 0
+fi
+
+if [ -n "$REPO" ] && [ "$RECOVER_BODY" -eq 0 ]; then
+  # --recover-body (#2872) takes its diff digest from the SIGNED MARKER it
+  # verifies, so fetching the PR's live diff here would be a network call whose
+  # answer nothing reads — and a failed fetch would print a "could not compute"
+  # warning about a mode that does not compute it.
   diff_hash_for_pr "$PR"
   [[ "$DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || DIFF_HASH=""
   [[ "$LEGACY_DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || LEGACY_DIFF_HASH=""
@@ -1301,6 +1837,187 @@ if [ "$PRINT_DIFF_HASH" -eq 1 ]; then
   exit 0
 fi
 
+# ── --check-carry: THE LANE'S QUESTION, ANSWERED BY THE GATE'S OWN PREDICATE ──
+# #1351. `extensions/review-enforcer` already carries a record across a base move
+# when the recorded `diff_sha256` equals the PR's LIVE normalized three-dot diff.
+# Nothing told a LANE that, so lanes inferred "the branch moved, therefore the
+# review is stale" and paid for a fresh 20-40 minute review — re-minting records
+# after every base move, which is how a fleet reaches a dozen blocked PRs while
+# the content never changed.
+#
+# This is the ONE way to ask. It deliberately adds NO second definition of
+# "unchanged": it runs `diff_hash_for_pr` (the single normalizer the record path
+# and the GitHub gate share) and compares that digest to the record's field with
+# the same validity rule the local gate uses (full lowercase 64-hex, never the
+# empty-body constant). A second hashing path — or a second rule for what counts
+# as an identity — is exactly what this design avoids.
+#
+# ⛔ IT IS READ-ONLY AND IT CANNOT MAKE A RECORD VALID. It prints what the GATE
+# would decide; the gate re-decides at merge time, and an unreadable diff is
+# NEVER reported as a carry (see the status arm below).
+if [ "$CHECK_CARRY" -eq 1 ]; then
+  # The record path is the WRITER's own convention (see DIR/FILE below), so the
+  # reader cannot disagree with the writer. The legacy <pr>.json is honoured
+  # only when it names no repo or THIS repo — the #426 collision rule the local
+  # gate and admin-merge.sh both apply.
+  CC_DIR="$HOME/.pi/agent/reviews"
+  CC_FILE=""
+  CC_LEGACY=""
+  if [ -n "$REPO" ]; then
+    CC_FILE="$CC_DIR/${REPO%/*}-${REPO#*/}-$PR.json"
+    CC_LEGACY="$CC_DIR/$PR.json"
+  else
+    # NO REPO: the legacy <pr>.json is the ONLY name known in advance — a qualified
+    # record cannot be derived without the repo, so it is discovered by SCAN below
+    # (exactly what the gate does). Using CC_FILE for it made the no-repo path
+    # believe the legacy file WAS the qualified one.
+    CC_FILE=""
+    CC_LEGACY="$CC_DIR/$PR.json"
+  fi
+  # `|| true` is load-bearing: `head -1` closes the pipe, and under this script's
+  # `set -uo pipefail` a sed killed by SIGPIPE makes the whole pipeline 141 — which,
+  # under `set -e`, would abort the mode on a record it had merely finished reading
+  # (the same SIGPIPE flake class the test suite shows intermittently under load).
+  cc_field() { # <file> <field>
+    command sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p" "$1" 2>/dev/null | command head -1 || true
+  }
+  # ⛔ MIRROR THE GATE'S LOOKUP EXACTLY, INCLUDING ITS COLLISION RULE (review, #2353 P1).
+  # `extensions/review-enforcer::readReviewRecord` returns NULL when the QUALIFIED file
+  # exists but its embedded `repo` differs (the identical-slug overwrite class: PR
+  # numbers collide across repos), and it compares `repo` CASE-SENSITIVELY. Reading the
+  # qualified file unconditionally made this surface answer `carry … land it` for a
+  # record the gate treats as ABSENT — a divergent second definition of "the record",
+  # which is the very thing this mode exists to avoid. Both arms now use one predicate,
+  # and the comparison is exact: a differently-cased repo is a DIFFERENT key.
+  cc_names_this_repo() { # <file> -> 0 when its embedded repo is absent or exactly $REPO
+    local r
+    r="$(cc_field "$1" repo)"
+    [ -z "$r" ] || [ "$r" = "$REPO" ]
+  }
+  CC_REC=""
+  # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
+  # that lacks the file may still have the verdict in the registry (minted on a
+  # peer box) or in the PR body's SIGNED marker (minted anywhere, and the only
+  # copy that travels). Naming only the re-review made every cross-box review
+  # cost twice — a lane paying again for evidence the fleet already holds.
+  CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
+  if [ -n "$REPO" ]; then
+    if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
+      if cc_names_this_repo "$CC_FILE"; then CC_REC="$CC_FILE"; fi
+    elif [ -n "$CC_LEGACY" ] && [ -f "$CC_LEGACY" ]; then
+      if cc_names_this_repo "$CC_LEGACY"; then CC_REC="$CC_LEGACY"; fi
+    fi
+  else
+    # ⛔ THE NO-REPO BRANCH IS A DIFFERENT RULE, NOT A DEGENERATE ONE (review, #2353 P2).
+    # `readReviewRecord(pr)` with no repo context cannot derive a qualified name, so it
+    # TRUSTS A KEY THAT PROVES ITS REPO: a single uniquely-matching qualified file
+    # (<owner>-<repo>-<pr>.json), and NOTHING ELSE — an ambiguous set is a collision, and
+    # a legacy file that EMBEDS a repo is rejected (#426 review P0-2: it may be another
+    # repo's PR with the same number). This mode read only <pr>.json here, so in the very
+    # state it exists for — repo auto-detection failing under a contested gh gate, REPO
+    # empty — it told a lane "no record … run the review" about a record the gate reads
+    # and would carry: the 20-40 minute re-review, triggered BY the check meant to prevent it.
+    CC_MATCHES=()
+    for _f in "$CC_DIR"/*-"$PR".json; do
+      [ -f "$_f" ] || continue
+      CC_MATCHES+=("$_f")
+    done
+    if [ "${#CC_MATCHES[@]}" -eq 1 ]; then
+      CC_REC="${CC_MATCHES[0]}"
+    elif [ "${#CC_MATCHES[@]}" -gt 1 ]; then
+      CC_LOOKUP_HINT="More than one repo has a record for #$PR (${#CC_MATCHES[@]} files) and no repo was resolved, so the record CANNOT be identified — pass owner/repo: record-review.sh --check-carry $PR owner/repo. (The merge gate treats an ambiguous lookup as NO record, so nothing would carry.)"
+    elif [ -n "$CC_LEGACY" ] && [ -f "$CC_LEGACY" ]; then
+      if [ -z "$(cc_field "$CC_LEGACY" repo)" ]; then CC_REC="$CC_LEGACY"; fi
+    fi
+  fi
+  if [ -z "$CC_REC" ]; then
+    printf 'norecord\t-\t%s\n' "${DIFF_HASH:--}"
+    echo "record-review.sh --check-carry: no review record for ${REPO:-<no repo resolved>}#$PR — there is no verdict to carry. $CC_LOOKUP_HINT" >&2
+    exit 4
+  fi
+  CC_HEAD="$(cc_field "$CC_REC" head_sha)"
+  CC_DIFF="$(cc_field "$CC_REC" diff_sha256)"
+  # The gate's own identity rule (isDiffSha256 in extensions/review-enforcer):
+  # full lowercase 64-hex, and NEVER the sha256 of the empty body — that constant
+  # would make every record "match" every PR.
+  cc_is_identity() {
+    case "$1" in
+      *[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${#1}" -eq 64 ] || return 1
+    [ "$1" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ] || return 1
+    return 0
+  }
+  # The CURRENT head, read-only. A read failure is UNKNOWN, never a mismatch: the
+  # whole point of this mode is to stop rendering "could not read" as "changed".
+  # Same read (and same idiom) as the stale-sha guard below, so one fixture models
+  # both and the two can never disagree about which head is current.
+  CC_LIVE_HEAD="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
+  case "$CC_LIVE_HEAD" in
+    *[!0-9a-f]* | "") CC_LIVE_HEAD="" ;;
+  esac
+  if [ "${#CC_LIVE_HEAD}" -ne 40 ]; then CC_LIVE_HEAD=""; fi
+  # HEAD BINDING FIRST: a record at the CURRENT head is valid with no digest at
+  # all, and that is the commonest healthy case — it must not read as "carry".
+  if [ -n "$CC_LIVE_HEAD" ] && [ "$CC_HEAD" = "$CC_LIVE_HEAD" ]; then
+    printf 'head\t%s\t%s\n' "${CC_DIFF:--}" "${DIFF_HASH:--}"
+    echo "record-review.sh --check-carry: the record is bound to the CURRENT head (${CC_HEAD:0:12}…) — nothing is stale and nothing needs re-review." >&2
+    exit 0
+  fi
+  # ⛔ ORDER: THE ANSWER THAT NEEDS NO READ COMES FIRST (review, #2353 P2). A record
+  # with no usable digest can NEVER carry, and that is decidable from the record alone —
+  # so putting it after the diff-read arm made it unreachable exactly when the gate is
+  # contended (every attempt returned `unreadable`/RETRY forever, while the guidance
+  # that unsticks the lane needs no read at all). Neither branch is reachable from
+  # `carry`, so the swap weakens nothing.
+  if ! cc_is_identity "$CC_DIFF"; then
+    printf 'nodigest\t-\t%s\n' "${DIFF_HASH:--}"
+    # ⛔ THE REMEDY MUST BE RUNNABLE IN THE STATE THAT FIRES IT (review, #2353 round 4).
+    # Printing `… $REPO` with REPO empty promised a carry that CANNOT exist: the recorder's
+    # carry arms verify identity by computing the diff, which needs the repo, so the advised
+    # command refuses and names "→ Run the review" — the 20-40 minute path this mode exists
+    # to avoid — and re-running --check-carry answers `nodigest` again, so the advice cannot
+    # converge. With no repo the command is not merely incomplete, it is the wrong command,
+    # so say what is missing instead of printing an empty slot.
+    if [ -n "$REPO" ]; then
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… carries no usable diff digest (a legacy record, or one minted while the diff read was degraded), so it cannot carry on content identity. Re-run the recorder at the current head and let its carry arms decide: record-review.sh $PR <current head> <same verdict> $REPO — that is a CARRY, not a fresh review, and it refuses if the lane's commits changed." >&2
+    else
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… carries no usable diff digest (a legacy record, or one minted while the diff read was degraded), so it cannot carry on content identity — and NO repo was resolved here, so the recorder's carry arms cannot compute the identity that would let it. Pass it explicitly: record-review.sh $PR <current head> <same verdict> owner/repo — that is a CARRY, not a fresh review, and it refuses if the lane's commits changed." >&2
+    fi
+    exit 5
+  fi
+  # ⛔ AN UNREADABLE DIFF IS NEVER A CARRY. Every non-ok status means the diff
+  # could not be READ, and a failed read is not a matching read.
+  if [ "${DIFF_FETCH:-unavailable}" != "ok" ] || ! cc_is_identity "${DIFF_HASH:-}"; then
+    printf 'unreadable\t%s\t%s\n' "$CC_DIFF" "${DIFF_FETCH:-unavailable}"
+    echo "record-review.sh --check-carry: the PR's live diff could not be READ (status ${DIFF_FETCH:-unavailable}) — this is NOT a changed diff and NOT a carry. RETRY (a shared gh-gate queue, a rate-limit window or a transient API failure is far cheaper than a re-review)." >&2
+    exit 3
+  fi
+  if [ "$CC_DIFF" = "$DIFF_HASH" ]; then
+    printf 'carry\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
+    echo "record-review.sh --check-carry: the reviewed DIFF is UNCHANGED (diff_sha256 ${CC_DIFF:0:12}… matches the PR's live diff) — the merge gate CARRIES this record across the head move (${CC_HEAD:0:12}…). Do NOT re-review and do NOT mint a fresh record: land it." >&2
+    exit 0
+  fi
+  # ── #1377 — `carry-patch`: the BINDING moved, the PATCH did not ────────────
+  # The arm above is byte-identity of the rendered diff. A REBASE onto a moved
+  # base rewrites hunk context even when no reviewed line changed, so the
+  # binding moves and this mode used to answer `fresh` — the 20-40 minute
+  # re-review #1351 exists to prevent, demanded for work that did not change.
+  # The predicate is the RECORDER's own arm, not a second definition: if it
+  # says so, `record-review.sh <pr> <current head> <same verdict> <repo>`
+  # carries without a review. The token is DISTINCT from `carry` and exit is
+  # NOT 0 because the gate does not carry this one — the record must be
+  # re-minted, and a caller that read exit 0 as "merge it" would be wrong.
+  if patch_dimension_carry "$CC_HEAD" "$CC_DIFF" "$CC_LIVE_HEAD"; then
+    printf 'carry-patch\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
+    echo "record-review.sh --check-carry: the reviewed PATCH is unchanged (the rendered diff moved, so the merge gate will NOT carry this record as-is — but every reviewed line is byte-identical at ${CC_HEAD:0:12}… and ${CC_LIVE_HEAD:0:12}…). This is a rebase/base-move, NOT a changed artifact: re-record at the current head — record-review.sh $PR $CC_LIVE_HEAD <same verdict> ${REPO:-<owner/repo>} — do NOT run a review cycle." >&2
+    exit 6
+  fi
+  printf 'fresh\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
+  echo "record-review.sh --check-carry: the DIFF CHANGED (recorded ${CC_DIFF:0:12}… vs live ${DIFF_HASH:0:12}…) — the record genuinely does not cover what would merge. Run the code-review skill, post its verdict as a PR comment, then record clean with --evidence comment:<id>." >&2
+  exit 1
+fi
+
 # ── Stale-sha guard (#2133, extended by #2982): $SHA must be the CURRENT head
 # The ai-review-gate binds the recorded FULL sha into the signed marker. PR
 # #2074 recorded a stale-but-well-formed sha (…d329… vs real head …1ebe…,
@@ -1323,6 +2040,271 @@ fi
 # Normalize the key exactly like the workflow does (secrets arrive clean, but a
 # file/env key may carry stray whitespace).
 GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
+
+# ── --recover-body (#2872): rebuild a MISSING record from the SIGNED marker ──
+# The record file is per-box; the signed marker in the PR body is the only copy
+# of the verdict that travels. So an absence on THIS box is not evidence that no
+# review happened — and the rail's only named remedy ("run the review") makes a
+# lane pay a second time for a verdict the fleet already holds (#2872: 12 of 45
+# open PRs, of which the registry covered 2).
+#
+# ⛔ THE HMAC IS THE WHOLE SAFETY ARGUMENT. A PR body is attacker-writable, so a
+# marker is EVIDENCE only when its `sig=` verifies over its own text with the
+# gate key — the same check the carry-forward arm makes (#784/#2055) and for the
+# same reason: a shape-only `[0-9a-f]{64}` match accepts `sig=<64 zeros>`, which
+# a later carry would then RE-SIGN with the real key, minting a genuine
+# attestation for a diff nobody reviewed. Unsigned, forged, or foreign-repo
+# markers are REFUSED and named; nothing is written.
+#
+# This verb cannot loosen the gate. What it restores is (pr, head_sha,
+# diff_sha256, verdict) — the SAME fields a normal record holds — and every
+# downstream decision (`--check-carry`, the merge rail, the GitHub gate) re-reads
+# them the same way. A recovered record whose digest no longer matches the PR's
+# live diff still answers `fresh`, so a moved diff still owes a review.
+if [ "$RECOVER_BODY" -eq 1 ]; then
+  # REPO was auto-detected above (the recorder's ONE resolution path), so this
+  # mode never re-derives it: a second detector would be a second answer.
+  if [ -z "$REPO" ]; then
+    echo "record-review.sh --recover-body: no repo resolved. A record is identified by PR *and* repo (PR numbers collide across repos), so pass it: record-review.sh --recover-body $PR owner/repo" >&2
+    exit 2
+  fi
+  if [ -z "$GATE_KEY" ]; then
+    echo "record-review.sh --recover-body: AI_REVIEW_GATE_KEY is not configured (env or ~/.pi/agent/.ai-review-gate-key), so a marker's signature cannot be VERIFIED — and an unverified marker is a body edit, not evidence. Refusing rather than minting on trust." >&2
+    exit 3
+  fi
+  RB_FILE="$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$PR.json"
+  RB_LEGACY="$HOME/.pi/agent/reviews/$PR.json"
+  # ⛔ RECOVERY FILLS AN ABSENCE; IT NEVER REPLACES. An existing record may be
+  # NEWER than the marker (a later review, a carry already re-bound), and
+  # overwriting it with an older verdict would silently walk the gate backwards.
+  #
+  # WHICH FILES COUNT AS "A RECORD FOR THIS PR" is the GATE's rule, not a
+  # filename test (review, #2872 P2): `readReviewRecord` treats a file whose
+  # embedded `repo` DIFFERS as ABSENT — so a bare `[ -f ]` here would refuse on a
+  # file the rail does not see, and the caller would be told to run
+  # `--check-carry`, which answers `norecord` and points back here: a closed loop
+  # whose only exit is a paid re-review. An UNQUALIFIED (`<pr>.json`) or
+  # repo-less file is still refused, because there is no way to prove it is not
+  # this PR, and deleting/overwriting it could destroy another repo's only copy.
+  rb_names_this_repo() { # <file> -> 0 when its embedded repo is absent or exactly $REPO
+    local r
+    r="$(command sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | command head -1)"
+    [ -z "$r" ] || [ "$r" = "$REPO" ]
+  }
+  rb_existing_record() { # -> 0 when a record for THIS PR/repo already exists
+    [ -f "$RB_FILE" ] && rb_names_this_repo "$RB_FILE" && return 0
+    [ -f "$RB_LEGACY" ] && rb_names_this_repo "$RB_LEGACY" && return 0
+    return 1
+  }
+  # ⛔ "NOTHING TO REPAIR" IS A CLAIM ABOUT A PARSEABLE RECORD (round 2, P2). A
+  # TRUNCATED/corrupt file parses to no `repo` string, which rb_names_this_repo
+  # reads as "unowned" — so the refusal below would assert there is nothing to
+  # repair about a file the GATE calls `corrupt`/NO-RECORD (and whose own message
+  # now points here). That is the round-1 loop shape in a different state.
+  rb_record_usable() { # <file> -> 0 when it carries the fields a record is read by
+    # ⛔ FORMAT-AGNOSTIC, LIKE THE GATE (round 3, P2). This greps the COMPACT form
+    # the recorder writes; the gate JSON-parses the file, so a `jq .` round-trip
+    # (the literal "hand-edited file") is a VALID record to the gate. Reading it as
+    # unusable would then tell an operator to move aside a record the gate is
+    # honouring — and recovery would mint an OLDER verdict over it.
+    if command -v jq >/dev/null 2>&1; then
+      # ⛔ THE GATE REQUIRES STRINGS, NOT MERE PRESENCE (round 4, P3):
+      # `readRecordFile` tests `typeof === "string"`, so `"head_sha": null` is
+      # ABSENT to the gate. A bare `has()` would call that file a record here and
+      # answer "already exists, nothing to repair" for one the rail says NO-RECORD
+      # about — the round-2 loop, narrowed to a present-but-untyped key.
+      command jq -e '(.head_sha|type)=="string" and (.verdict|type)=="string"' "$1" >/dev/null 2>&1 && return 0
+      return 1
+    fi
+    grep -q '"head_sha"' "$1" 2>/dev/null && grep -q '"verdict"' "$1" 2>/dev/null
+  }
+  rb_foreign_repo_of() { # <file> -> the embedded repo, or empty
+    command sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | command head -1
+  }
+  rb_refuse_foreign() { # <file> — exit 5, naming the file and a NON-LOOPING remedy
+    echo "record-review.sh --recover-body: ${1/#$HOME/~} already exists but embeds repo $(rb_foreign_repo_of "$1") — the identical-slug overwrite state, which the merge gate reads as ABSENT. Refusing to overwrite another repo's verdict. Move that file aside (it lives outside any checkout: mv it, or let its owning repo's registry-sync restore it) and re-run this command; nothing was written." >&2
+    exit 5
+  }
+  rb_refuse_unusable() { # <file> — exit 5, naming it as not-a-record and a way out
+    echo "record-review.sh --recover-body: ${1/#$HOME/~} exists but is NOT a usable record — it carries no readable head_sha/verdict (a truncated or malformed file), so the merge gate treats it as ABSENT and 'there is nothing to repair here' would be false. If the gate CAN read it (a valid record some other writer formatted differently), LEAVE IT — this verb will not overwrite one; otherwise move it aside and re-run. Nothing was written." >&2
+    exit 5
+  }
+  if [ -f "$RB_FILE" ]; then
+    if ! rb_names_this_repo "$RB_FILE"; then rb_refuse_foreign "$RB_FILE"; fi
+    if ! rb_record_usable "$RB_FILE"; then rb_refuse_unusable "$RB_FILE"; fi
+  fi
+  if [ -f "$RB_LEGACY" ] && rb_names_this_repo "$RB_LEGACY" && ! rb_record_usable "$RB_LEGACY"; then
+    rb_refuse_unusable "$RB_LEGACY"
+  fi
+  if rb_existing_record; then
+    echo "record-review.sh --recover-body: a record for $REPO#$PR already exists ($( [ -f "$RB_FILE" ] && echo "${RB_FILE/#$HOME/~}" || echo "${RB_LEGACY/#$HOME/~}" )) — recovery fills an ABSENCE and will not replace it. There is nothing to repair here; land it, or if the diff has moved since, ask what the gate thinks: record-review.sh --check-carry $PR $REPO" >&2
+    exit 5
+  fi
+  # ⛔ A PERMANENT FAILURE IS NOT A TRANSIENT ONE (round 3, P2). Both reads below
+  # used to say "RETRY" for every non-zero exit — so a 404 (wrong PR number, or a
+  # repo this token cannot see) sent a lane round a loop that can never converge.
+  # The rest of this file is careful about exactly this (#1398: an operator sent
+  # chasing a phantom auth problem), so the error TEXT is captured and branched on.
+  rb_is_permanent_gh_error() { # <captured stderr/stdout> -> 0 when retrying cannot help
+    case "$1" in
+      *"Not Found"*|*"HTTP 404"*|*"status 404"*|*"HTTP 422"*|*"status 422"*|*"No commit found"*) return 0 ;;
+    esac
+    return 1
+  }
+  if ! RB_BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>&1)"; then
+    if rb_is_permanent_gh_error "$RB_BODY"; then
+      echo "record-review.sh --recover-body: the PR could not be read and retrying will NOT help — gh said: $(printf '%s' "$RB_BODY" | command head -1 | cut -c1-160). Check the owner/repo argument and the PR number (a PR this token cannot see reads exactly like a missing one). Nothing was written." >&2
+    else
+      echo "record-review.sh --recover-body: could not READ the PR body (transient API failure?) — that is not 'no marker'. RETRY; nothing was written." >&2
+    fi
+    exit 3
+  fi
+  [ "$RB_BODY" = "null" ] && RB_BODY=""
+  # The marker contract is fixed by the poster and read by the upstream required
+  # check (tortoise .github/workflows/ai-review-gate.yml): keep it EXACT — the
+  # verdict is one of the three record tiers, the head is a full 40-hex, and the
+  # optional `diff=` is a full 64-hex digest.
+  RB_LINE=""; RB_SIG=""; RB_TEXT=""; RB_NBAD=0; RB_NFOREIGN=0
+  while IFS= read -r _line; do
+    case "$_line" in
+      "review recorded: reviews/$PR.json verdict="*) ;;
+      *) continue ;;
+    esac
+    # `(<repo>) sig=<64hex>` — the sig covers EVERYTHING before ' sig=', which is
+    # why the split is on that exact token rather than on whitespace.
+    case "$_line" in
+      *" sig="*) ;;
+      *) RB_NBAD=$((RB_NBAD + 1)); continue ;;
+    esac
+    _text="${_line% sig=*}"
+    _sig="${_line##* sig=}"
+    [[ "$_sig" =~ ^[0-9a-f]{64}$ ]] || { RB_NBAD=$((RB_NBAD + 1)); continue; }
+    # ⛔ THE REGEX IS HELD IN A VARIABLE, NOT WRITTEN INLINE. Inside `[[ … ]]` a
+    # bare `(` starts a grouping expression, so an inline ERE with groups is a
+    # PARSE error the shell raises when it reaches the enclosing block — even on
+    # a run where RECOVER_BODY is 0 (measured: 214 assertions in the suite went
+    # red on one unescaped paren, because bash parses the whole `if … fi` when it
+    # reaches it). Expanded from a variable, the regex is an ordinary operand.
+    RB_RE="^review recorded: reviews/${PR}\.json verdict=(clean|clean-micro|clean-low) @ [0-9a-f]{40}( diff=[0-9a-f]{64})? \(([^)]+)\)$"
+    [[ "$_text" =~ $RB_RE ]] || { RB_NBAD=$((RB_NBAD + 1)); continue; }
+    [ "${BASH_REMATCH[3]}" = "$REPO" ] || { RB_NFOREIGN=$((RB_NFOREIGN + 1)); continue; }
+    # (the HMAC is verified below for THIS repo's marker only, so the foreign-arm
+    # message must not claim a signature was checked — see the wording there.)
+    _expect="$(printf '%s' "$_text" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+    if [ -z "$_expect" ] || [ "$_expect" != "$_sig" ]; then
+      RB_NBAD=$((RB_NBAD + 1)); continue
+    fi
+    # Keep the LAST verifying marker: the poster APPENDS, so the newest verdict
+    # is the final line appended for this repo ("keep the first" would resurrect
+    # a verdict the review itself superseded).
+    RB_LINE="$_line"; RB_SIG="$_sig"; RB_TEXT="$_text"
+  done <<<"$RB_BODY"
+  if [ -z "$RB_LINE" ]; then
+    if [ "$RB_NBAD" -gt 0 ]; then
+      echo "record-review.sh --recover-body: $REPO#$PR has $RB_NBAD marker line(s) for this PR but NONE whose signature verifies with this box's gate key — a marker whose HMAC does not verify is a body EDIT, not evidence, so nothing was written. (A wrong AI_REVIEW_GATE_KEY, a marker from a differently-keyed repo, or a forged line all present this way.)" >&2
+    elif [ "$RB_NFOREIGN" -gt 0 ]; then
+      echo "record-review.sh --recover-body: $REPO#$PR has a marker naming a DIFFERENT repo ($RB_NFOREIGN line(s)) and none for $REPO — PR numbers collide across repos, so this is refused rather than adopted. Check the owner/repo argument. (Its signature was NOT checked: this verb only verifies a marker that names the repo it was asked about.)" >&2
+    else
+      # ⛔ AN ABSENCE OF EVIDENCE IN THIS BODY IS NOT A VERDICT ABOUT THE REVIEW
+      # (review, #2872 P2). The evidence post is BEST-EFFORT — the recorder saves
+      # the record and skips the post on an API failure — and a body edit can
+      # remove a marker. Claiming "no review was ever recorded on any box" would
+      # send a lane to pay for a second review that #2872 exists to avoid.
+      echo "record-review.sh --recover-body: this PR's body carries no 'review recorded:' marker for $REPO#$PR, so there is nothing HERE to recover — that is not proof no review happened (the evidence post is best-effort, and a body edit removes one). If the review ran on another box, scripts/registry-sync.sh pull may hold it; otherwise run the review and record it." >&2
+    fi
+    exit 3
+  fi
+  RB_VERDICT="${RB_TEXT#*verdict=}"; RB_VERDICT="${RB_VERDICT%% *}"
+  RB_HEAD="$(printf '%s' "$RB_TEXT" | command sed -n 's/.* @ \([0-9a-f]\{40\}\).*/\1/p')"
+  # ⛔ A `clean-low` MARKER CANNOT BE RECOVERED HONESTLY (review, #2872 P0).
+  # That tier certifies the MERGE BASE the diff was taken from, and a normal
+  # clean-low record always carries `merge_base_sha`. The signed marker does NOT
+  # carry it, so a recovered clean-low would (a) claim a shape a normal record of
+  # that tier never has, and (b) diverge the two surfaces that read it: the
+  # harness rail skips its B10 base-repointing guard when the field is absent
+  # (atomic-land.sh — the #1348 hazard: `gh pr edit --base` after the review
+  # moves what merges while the head sha still matches), while the
+  # review-enforcer gate hard-blocks the same record with `base_unverifiable`.
+  # One record, two verdicts. Refuse, and name the remedy that IS available: mint
+  # it again at the current head — a FRESH mint, NOT a carry (this script's
+  # `carry` is a specific mint state, with `carried_from`/`carried_at` and an
+  # inherited reviewed_at, and there is no prior record here to carry from).
+  if [ "$RB_VERDICT" = "clean-low" ]; then
+    echo "record-review.sh --recover-body: $REPO#$PR's marker is a \`clean-low\` attestation, which certifies the MERGE BASE of the diff — and the signed marker does not carry \`merge_base_sha\`. A recovered clean-low would be a record of a shape that tier never has: the rail would skip its base-repointing guard while the gate refuses the same record as \`base_unverifiable\`. Nothing written. Mint it again at the current head instead — a FRESH mint (not a carry: nothing is stale), and the clean-low content-shape guard still has to pass: record-review.sh $PR <current head> clean-low $REPO" >&2
+    exit 3
+  fi
+  RB_DIFF=""
+  case "$RB_TEXT" in
+    *" diff="*) RB_DIFF="${RB_TEXT#* diff=}"; RB_DIFF="${RB_DIFF%% *}" ;;
+  esac
+  # reviewed_at: the MINT time is UNKNOWN to this box, and this verb must not
+  # pretend otherwise. It is NOT `now` (that is tortoise#7391: a carry/restore
+  # time masquerading as the review time), and it is not the head commit's date
+  # either — that is a LOWER BOUND (and a committer can set GIT_COMMITTER_DATE).
+  # The bound is still the most honest thing available, and it matters beyond
+  # labelling: `registry-sync.sh` orders records on `reviewed_at` alone, so a
+  # recovered record loses to any peer record with a later stamp — which is the
+  # safe direction (the peer keeps its verdict), and is why this field must never
+  # be inflated. `mint=recovered-body` + `recovered_at` say what it really is.
+  # `|| RB_AT_RC=$?` is load-bearing: this script runs under `set -e`, so a bare
+  # `VAR="$(cmd)"` whose command fails ABORTS the whole verb with the command's
+  # status (measured: exit 1 where this mode documents 3), skipping every branch
+  # below. The capture is what makes the permanent-vs-transient split reachable.
+  RB_AT_RC=0
+  RB_AT_RAW="$(command gh api "repos/$REPO/commits/$RB_HEAD" --jq .commit.committer.date 2>&1)" || RB_AT_RC=$?
+  RB_AT="$RB_AT_RAW"
+  case "$RB_AT" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) ;;
+    *)
+      if [ "$RB_AT_RC" -ne 0 ] && rb_is_permanent_gh_error "$RB_AT_RAW"; then
+        echo "record-review.sh --recover-body: the marker names head ${RB_HEAD:0:12}… but this repo has no such commit and retrying will NOT help — gh said: $(printf '%s' "$RB_AT_RAW" | command head -1 | cut -c1-160). A force-pushed marker head, or a commit that only exists on a fork, reads this way: re-record at the current head instead. Nothing was written." >&2
+      else
+        echo "record-review.sh --recover-body: could not read the committer date of ${RB_HEAD:0:12}… (got '${RB_AT:0:40}'), so even a LOWER BOUND for reviewed_at cannot be stated — and this verb will not stamp a time the review did not happen (tortoise#7391). RETRY; nothing was written." >&2
+      fi
+      exit 3 ;;
+  esac
+  mkdir -p "$HOME/.pi/agent/reviews"
+  RB_TMP="$RB_FILE.tmp.$$"
+  # ⛔ RE-CHECK IMMEDIATELY BEFORE THE WRITE (review, #2872 P1), AND RE-CHECK THE
+  # WHOLE RULE, NOT HALF OF IT (round 2, P2). `rb_existing_record` answers only
+  # for THIS repo, so a FOREIGN identical-slug record landing in the same window
+  # would still be destroyed by the `mv` below. Both arms are tested here, at the
+  # write, where no further network read follows.
+  if [ -f "$RB_FILE" ]; then
+    if ! rb_names_this_repo "$RB_FILE"; then
+      echo "record-review.sh --recover-body: a FOREIGN-repo record for $REPO#$PR appeared WHILE this recovery was reading the PR — refusing to destroy another repo's verdict. Nothing was written." >&2
+      exit 5
+    fi
+    echo "record-review.sh --recover-body: a record for $REPO#$PR appeared WHILE this recovery was reading the PR (a concurrent recorder?) — refusing to replace it with an older verdict. Nothing was written; re-run --check-carry to see which verdict now stands." >&2
+    exit 5
+  fi
+  if rb_existing_record; then
+    echo "record-review.sh --recover-body: a record for $REPO#$PR appeared WHILE this recovery was reading the PR (a concurrent recorder?) — refusing to replace it with an older verdict. Nothing was written; re-run --check-carry to see which verdict now stands." >&2
+    exit 5
+  fi
+  RB_DIFF_FIELD=""
+  [ -n "$RB_DIFF" ] && RB_DIFF_FIELD="\"diff_sha256\":\"$RB_DIFF\","
+  printf '{"pr":%d,"head_sha":"%s",%s"mint":"recovered-body","recovered_at":"%s","marker_sig":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$RB_HEAD" "$RB_DIFF_FIELD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RB_SIG" "$RB_VERDICT" "$REPO" "$RB_AT" > "$RB_TMP"
+  # ⛔ THE LAST STEP IS ATOMIC, NOT CHECK-THEN-RENAME (round 3, P2). The re-check
+  # above narrows the window to a couple of subprocesses; only a NO-CLOBBER CREATE
+  # closes it. `ln` in the SAME directory is the portable compare-and-swap: it
+  # fails with EEXIST rather than replacing, so a record that appears in the last
+  # instant is reported instead of silently destroyed.
+  if ! ln "$RB_TMP" "$RB_FILE" 2>/dev/null; then
+    rm -f "$RB_TMP"
+    if [ -f "$RB_FILE" ] && ! rb_names_this_repo "$RB_FILE"; then
+      echo "record-review.sh --recover-body: a FOREIGN-repo record for $REPO#$PR took the path in the last instant — refusing to destroy another repo's verdict. Nothing was written." >&2
+    else
+      echo "record-review.sh --recover-body: a record for $REPO#$PR appeared in the LAST INSTANT (the atomic create refused: it already exists) — refusing to replace it with an older verdict. Nothing was written; re-run --check-carry to see which verdict now stands." >&2
+    fi
+    exit 5
+  fi
+  rm -f "$RB_TMP"
+  printf 'recovered\t%s\t%s\n' "$RB_HEAD" "${RB_DIFF:--}"
+  echo "record-review.sh --recover-body: restored ${REPO}#$PR from the SIGNED marker in the PR body → ${RB_FILE/#$HOME/~} (verdict=${RB_VERDICT}, head=${RB_HEAD:0:12}…, mint=recovered-body). ⛔ reviewed_at is a LOWER BOUND, not the mint time: the review happened at or after the head commit's committer date ($RB_AT) — this box did not observe the mint, and recovered_at says when the restoration happened. This restores a verdict, it does not certify one: ask the gate whether it still covers what would merge — record-review.sh --check-carry $PR $REPO" >&2
+  exit 0
+fi
 
 # ── LANE-DIMENSION CARRY (#6072/#6213/#4823) ─────────────────────────────
 # The #2982 arm below asks whether the RENDERED patch is byte-identical. A base
@@ -1879,6 +2861,14 @@ target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red, 2 = the s
 # which is precisely what the gate needs — instead of refusing and deadlocking.
 # When no such marker exists the diff is genuinely unreviewed → still refuse.
 if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
+  # #1377 — initialised OUTSIDE the diff-read arm below: `set -u` makes a
+  # reference to an unset name a fatal error, and the patch arm's PREDICATE is
+  # named on the same line as the byte-identity arm, which runs even when the
+  # live diff could not be read (DIFF_HASH empty). Leaving these to be set only
+  # inside that arm aborted the whole record with rc 1 instead of reaching the
+  # guard's refusal.
+  PRIOR_PATCH_SHA=""
+  PRIOR_PATCH_NORM=""
   CURRENT_HEAD="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
   # gh api prints 4xx error bodies to stdout — only a well-formed 40-hex
   # sha counts as a successful fetch; anything else fails open.
@@ -1949,6 +2939,42 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
           echo "⚠️ #784: found prior evidence in the PR body with the right shape but a BAD SIGNATURE — ignoring it (the PR body is not a trust boundary)" >&2
         fi
       fi
+      # ── #1377 — THE PATCH ARM'S EVIDENCE ────────────────────────────────
+      # The arm above needs the prior marker's `diff=` to equal the LIVE
+      # normalized digest. A REBASE onto a moved base breaks that even when
+      # every reviewed line is identical: `main` landing work in the same file
+      # rewrites the hunk CONTEXT, and the binding keeps context (#1362 D1).
+      # This finds a VERIFIED marker at whatever head it names and hands the
+      # decision to `patch_dimension_carry`, which re-derives BOTH sides.
+      #
+      # ⛔ NOTHING IS TRUSTED FROM THE BODY HERE. The marker must HMAC-verify
+      # with the gate key (#784 — the same rule the arm above applies), and its
+      # `diff=` is then the ANCHOR the reconstructed reviewed diff must
+      # reproduce. So the bytes this arm compares are the bytes that marker was
+      # minted over, never bytes the body merely asserts.
+      if [ -n "$GATE_KEY" ]; then
+        # NEWEST FIRST: a body can carry several markers (each re-record appends
+        # one), and only the most recent describes the artifact up for merge.
+        # `awk` reversal, not `tac` — macOS does not ship `tac`.
+        PRIOR_SCAN="$(printf '%s\n' "$PRIOR_BODY" \
+          | command grep -E "^review recorded: reviews/${PR}\.json verdict=${VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(${REPO}\\) sig=[0-9a-f]{64}$" \
+          | command awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' || true)"
+        while IFS= read -r PP_LINE; do
+          [ -n "$PP_LINE" ] || continue
+          PP_TEXT="${PP_LINE% sig=*}"
+          PP_SIG="${PP_LINE##* sig=}"
+          PP_EXPECT="$(printf '%s' "$PP_TEXT" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | command awk '{print $NF}' || true)"
+          # A forged or corrupted line is SKIPPED, not fatal: the body may carry
+          # older markers this PR's own re-records produced.
+          [ -n "$PP_EXPECT" ] && [ "$PP_SIG" = "$PP_EXPECT" ] || continue
+          PP_SHA="$(printf '%s' "$PP_TEXT" | command sed -n 's/.* @ \([0-9a-f]\{40\}\) diff=.*/\1/p')"
+          PP_NORM="$(printf '%s' "$PP_TEXT" | command sed -n 's/.* diff=\([0-9a-f]\{64\}\).*/\1/p')"
+          [ "${#PP_SHA}" -eq 40 ] && [ "${#PP_NORM}" -eq 64 ] || continue
+          PRIOR_PATCH_SHA="$PP_SHA"
+          PRIOR_PATCH_NORM="$PP_NORM"
+          break
+        done <<< "$PRIOR_SCAN"
+      fi
     fi
     # Which carry arm applies? Decided FIRST so that clause (E) can veto a carry that
     # neither arm's own conditions can see: both arms prove the LANE's artifact is
@@ -1956,6 +2982,8 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     CARRY_ARM=""
     if [ -n "$PRIOR_DIFF" ]; then
       CARRY_ARM="diff"
+    elif [ "$FORCE_STALE" -ne 1 ] && patch_dimension_carry "$PRIOR_PATCH_SHA" "$PRIOR_PATCH_NORM" "$CURRENT_HEAD"; then
+      CARRY_ARM="patch"
     elif [ "$FORCE_STALE" -ne 1 ] && lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
       CARRY_ARM="lane"
     fi
@@ -1981,6 +3009,13 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       fi
       if [ "$CARRY_ARM" = "diff" ]; then
         echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
+      elif [ "$CARRY_ARM" = "patch" ]; then
+        # #1377 — the head moved AND the rendered diff moved, but every reviewed
+        # line is byte-identical: this is a rebase or a base move, not an edit.
+        # The review is a review OF THE DIFF, so the verdict stands and only the
+        # MECHANICAL re-record is owed. The binding is upgraded to the CURRENT
+        # head's own digest by the marker minted below — never inherited.
+        echo "#1377 patch carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff CHANGED (diff=${DIFF_HASH}) but the REVIEWED PATCH is byte-identical at both heads (verified against the prior signed marker's own diff=${PRIOR_PATCH_NORM:0:12}…; the reviewed side was ${PRIOR_PATCH_SHA:0:12}…) — a rebase/base-move, not an edit. Recording against the CURRENT head; NO new review cycle is owed" >&2
       else
         # The rendered patch moved (a base merge), but the LANE's artifact is
         # provably unchanged: the head only moved forward, no lane commit is in
@@ -2014,7 +3049,7 @@ fi
 # --expect-head would be silently ignored and a record written — the pin would
 # look enforced while enforcing nothing. A pin that cannot be verified is a
 # refusal, not a pass (the #784 fail-open is about an UNPINNED record).
-if [ -n "$EXPECT_HEAD" ] && [ "$PRINT_DIFF_HASH" -ne 1 ]; then
+if [ -n "$EXPECT_HEAD" ] && [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ]; then
   if ! [[ "${CURRENT_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || [ "${CURRENT_HEAD:-}" != "$EXPECT_HEAD" ]; then
     echo "⛔ --expect-head: could not verify the PR head against ${EXPECT_HEAD} — refusing to record (no record written, no marker posted)." >&2
     echo "   Resolved head: ${CURRENT_HEAD:-<unavailable: no \$REPO, or gh missing/failing>}. A pin exists only if it is checked; recording without checking it would make --expect-head decorative." >&2
@@ -2078,6 +3113,71 @@ if [ "$VERDICT" = "clean-micro" ]; then
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "⚠️ clean-micro tier guard: repo undetectable or gh missing — tier attestation UNVERIFIED (record proceeds; a non-micro linked issue should never be recorded clean-micro)" >&2
   else
+    # ── THE SURFACE CAP (arm a0) ──────────────────────────────────────
+    # Until this arm existed the micro tier was selected from the LINKED
+    # ISSUE'S LABEL alone and never looked at the diff, so a
+    # `complexity:micro` issue could record clean-micro for a one-line edit to
+    # `scripts/admin-merge.sh` and skip the code-review skill entirely — the
+    # micro flow dispatches no reviewers (03-code-review.md Step 2), so the
+    # rail change would reach main with no review at all. That is the tier
+    # being selected by how small the diff LOOKS, which is exactly what a
+    # blast-radius selector must refuse.
+    #
+    # Fail-CLOSED on POSITIVE evidence — a rail path in the diff, OR a payload the
+    # classifier cannot certify (rc 3: an unparseable row, no merge base, no
+    # rows) — and fail-OPEN only on a TRANSPORT failure (rc 1: gh absent, a
+    # non-2xx, an unreadable body), which is this guard's existing posture for
+    # arms (a)-(c). The split is load-bearing: reusing one code for both made the
+    # cap a NO-OP for any diff carrying a single row of an exotic status, which
+    # is the bypass this arm exists to close.
+    MICRO_RC=0
+    MICRO_ROWS="$(review_surface_rows "$REPO" "$PR" "$SHA")" || MICRO_RC=$?
+    if [ "$MICRO_RC" -eq 2 ]; then
+      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… has NO changed files, so there is no surface to certify. Refusing (exit 4, no record)." >&2
+      exit 4
+    fi
+    if [ "$MICRO_RC" -eq 3 ]; then
+      # The cause list names EVERY rc-3 arm, including the one this cap was
+      # written for: the compare 404 of an unreachable fork head. A message that
+      # omits it makes the next lane re-diagnose the same 404 from scratch — the
+      # exact failure the sibling clean-low guard's wording exists to prevent.
+      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… — the changed-path payload cannot be certified. Causes: the compare endpoint REFUSED this revision (HTTP 404/422 — an unreachable fork head or a rewritten sha), answered with no readable body, returned no merge base, returned no rows, or returned a malformed row. A diff whose surface cannot be read cannot be cleared for a tier that dispatches no reviewers. Refusing (exit 4, no record). A TRANSPORT failure (403 rate-limit / 5xx / network) does NOT take this arm — it warns and proceeds — so a retry after the window is worth one attempt before paying for a full review." >&2
+      echo "   → Run the code-review skill on the current head, then record clean with --evidence <artifact>." >&2
+      exit 4
+    fi
+    if [ "$MICRO_RC" -ne 0 ]; then
+      echo "⚠️ clean-micro surface cap: could not read the changed paths of $REPO#$PR at ${SHA:0:12}… (gh/API failure?) — the surface cap is UNVERIFIED (record proceeds; a micro issue whose diff touches a merge/land rail must never be recorded clean-micro)" >&2
+    else
+      MICRO_PATHS="${MICRO_ROWS#*$'\n'}"
+      IFS=$'\t' read -r _tag_m _mb_m MICRO_EXPECT <<< "${MICRO_ROWS%%$'\n'*}"
+      # NEW path only — see the parity note at the --print-tier seam: GitHub counts
+      # a rename as one changed file, so counting both ends would refuse every
+      # rename as "truncated". Classification still reads both ends.
+      MICRO_DISTINCT="$(LC_ALL=C awk -F '\t' 'NF>=2 && $2 != "" { print $2 }' <<< "$MICRO_PATHS" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+      if [ -z "$MICRO_DISTINCT" ] || [ "$MICRO_DISTINCT" -eq 0 ]; then
+        echo "❌ clean-micro surface cap: read no changed paths for $REPO#$PR at ${SHA:0:12}… — a diff with no readable surface cannot be certified micro. Refusing (exit 4, no record)." >&2
+        exit 4
+      fi
+      if [ "$MICRO_DISTINCT" -ge 300 ] || [ "$MICRO_DISTINCT" != "$MICRO_EXPECT" ]; then
+        echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… changes $MICRO_DISTINCT path(s) but GitHub reports $MICRO_EXPECT — the changed-path list is truncated or inconsistent, so the surface cap cannot be evaluated. Refusing (exit 4, no record); a diff that large is never micro." >&2
+        exit 4
+      fi
+      MICRO_CAP="$(printf '%s\n' "$MICRO_PATHS" | review_tier_cap || true)"
+      if [ "$MICRO_CAP" = "full" ]; then
+        echo "❌ clean-micro surface cap: $REPO#$PR touches an ALWAYS-FULL surface — clean-micro certifies the micro PROCESS (no code-review dispatch), and a merge/land rail, a CI workflow or an extension is where a defect becomes a FALSE PASS at the last gate before main. The tier is selected by what the change can BREAK, not by how small it looks. Refusing (exit 4, no record)." >&2
+        echo "   Offending paths:" >&2
+        while IFS=$'\t' read -r _st _p _old; do
+          [ -z "$_p" ] && continue
+          MICRO_HIT=0
+          review_full_surface_path "$_p" || MICRO_HIT=$?
+          if [ "$MICRO_HIT" -eq 0 ] || [ "$MICRO_HIT" -eq 2 ]; then echo "     $_p" >&2; fi
+        done <<< "$MICRO_PATHS"
+        echo "   → Run the code-review skill on the current head at FULL depth, then record:" >&2
+        echo "   →   record-review.sh $PR $SHA clean $REPO --evidence <artifact>" >&2
+        echo "   →   (<artifact> = the review comment the skill posted, e.g. comment:<id>.)" >&2
+        exit 4
+      fi
+    fi
     BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
     [ "$BODY" = "null" ] && BODY=""
     if [ -z "$BODY" ]; then
@@ -2186,8 +3286,17 @@ if [ "$VERDICT" = "clean-low" ]; then
   # only when the content can actually differ. Pinning the tip instead would
   # false-block every clean-low PR on the next unrelated merge to main.
   CMP="$(command gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
-  MB="$(printf '%s\n' "$CMP" | command head -1 | cut -f2)"
-  RAW="$(printf '%s\n' "$CMP" | command tail -n +2)"
+  # Same native split as review_surface_rows, and for the same measured reason
+  # (#2472 review): `printf … | head -1 | cut` under `set -o pipefail` lets a
+  # `head` exit after its one line, SIGPIPE the writer, fail the substitution and
+  # — under `set -e` — abort this script with NO output at all. That is a
+  # SILENTLY stranded `clean-low` record (9 of 40 identical runs, measured on the
+  # tier seam), so the idiom the new comment condemns is removed here too rather
+  # than left as the one surviving copy.
+  CMP_FIRST="${CMP%%$'\n'*}"
+  if [[ "$CMP" == *$'\n'* ]]; then CMP_REST="${CMP#*$'\n'}"; else CMP_REST=""; fi
+  MB="$(printf '%s' "$CMP_FIRST" | cut -f2)"
+  RAW="$CMP_REST"
   if ! [[ "$MB" =~ ^[0-9a-f]{40}$ ]]; then
     # Empty diff, a compare/API failure, a fork head not reachable from the
     # base repo (compare 404s there), or a response with no merge base. All are
@@ -2289,11 +3398,23 @@ if [ -n "$CARRY_ARM" ]; then
     PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
     PRIOR_AT="$(sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
   fi
-  if [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
+  # ⛔ A RECOVERED reviewed_at IS A LOWER BOUND, NOT A MINT TIME (#2872 review,
+  # round 3). Carrying it forward verbatim and printing "preserved as the ORIGINAL
+  # mint time" would launder a commit date into a mint time and drop the
+  # `recovered-body` label at the same moment — the tortoise#7391 corruption this
+  # whole arm exists to prevent. So a recovered predecessor falls into the honest
+  # branch below, which says the mint time is NOT recoverable.
+  PRIOR_RECOVERED=0
+  if [ -f "$FILE" ] && grep -q '"mint":"recovered-body"' "$FILE"; then PRIOR_RECOVERED=1; fi
+  if [ "$PRIOR_RECOVERED" -eq 0 ] && [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
     REVIEWED_AT="$PRIOR_AT"
     echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=carried, carried_from=${ORIG_SHA:0:12}…)" >&2
   else
-    echo "⚠️ tortoise#7391: CARRIED record for ${REPO:-<no-repo>}#$PR and the ORIGINAL mint time is not recoverable (no record on disk names ${ORIG_SHA:0:12}… with a reviewed_at) — reviewed_at is the CARRY time, not the mint time; \`mint\`/\`carried_at\` say so." >&2
+    if [ "$PRIOR_RECOVERED" -eq 1 ]; then
+      echo "⚠️ tortoise#7391 / #2872: CARRIED record for ${REPO:-<no-repo>}#$PR whose predecessor was RECOVERED from a marker — that record's reviewed_at was a LOWER BOUND (the head commit's date), not a mint time, so it is NOT inherited. reviewed_at is the CARRY time; \`mint\`/\`carried_at\` say so." >&2
+    else
+      echo "⚠️ tortoise#7391: CARRIED record for ${REPO:-<no-repo>}#$PR and the ORIGINAL mint time is not recoverable (no record on disk names ${ORIG_SHA:0:12}… with a reviewed_at) — reviewed_at is the CARRY time, not the mint time; \`mint\`/\`carried_at\` say so." >&2
+    fi
   fi
 fi
 if [ -n "$REPO" ]; then

@@ -1761,6 +1761,412 @@ else
 fi
 
 
+# ── 30. THE SURFACE CAP: the tier selector is selected by what a change can BREAK ─
+# The verdict vocabulary carried a depth tier long before anything SELECTED it
+# (`clean-micro` from the linked issue's label, `clean-low` from content shape),
+# and neither looked at the changed SURFACES. Measured 2026-10-23 over the live
+# queue: 173 of 178 recorded verdicts are `clean`, and the one mechanically
+# selected tier (clean-low) covers 1 of 70 open agent-infra PRs, because that
+# queue is rails, not prose. Worse, in the other direction the micro tier was
+# reachable for a rail edit: a `complexity:micro` issue whose PR touches
+# `scripts/admin-merge.sh` could record clean-micro, and the micro flow
+# dispatches NO reviewers — a merge-rail change would reach main unreviewed.
+#
+# These fixtures pin BOTH directions through the READ-ONLY seam the lane path
+# reads (`--print-tier`), so they fail if the selector is deleted, if it is
+# inverted, and if it ever starts keying on diff SIZE.
+T30="$TMP/t30"; rm -rf "$T30"; mkdir -p "$T30/bin"
+cat > "$T30/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# Serves the two reads review_surface_rows makes, with their --jq output already
+# rendered: `pulls/<n>` -> head/base/count, `compare/...` -> mb line + rows.
+for x in "$@"; do
+  case "$x" in
+    *"/pulls/"*)    printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
+    *"/compare/"*)  if [ "${FIX_COMPARE_RC:-0}" != "0" ]; then
+                       # The real `gh` prints its own diagnosis on STDERR, and the
+                       # recorder now classifies a compare failure by the HTTP
+                       # status on it (404/422 = the API refused THIS revision;
+                       # 403/5xx/network = nothing was read). A fixture that sets
+                       # only an exit code cannot model that — it was how the
+                       # earlier version pinned "every failure is a refusal".
+                       printf '%s\n' "${FIX_COMPARE_ERR:-}" >&2
+                       exit "$FIX_COMPARE_RC"
+                     fi
+                     printf 'mb\t%s\n' "${FIX_MB}"; printf '%s\n' "${FIX_ROWS}"; exit 0 ;;
+  esac
+done
+exit 1
+EOF
+chmod +x "$T30/bin/gh"
+HEX40="0123456789abcdef0123456789abcdef01234567"
+# HOME is ISOLATED here too: this seam writes nothing TODAY, and the assertion
+# below pins that. Without it a regression would mint owner-repo-42.json into the
+# LIVE ~/.pi/agent/reviews registry that the merge gate consumes — the same
+# defect class (30ix) exists to prevent, with a much worse blast radius.
+T30H="$T30/home"; rm -rf "$T30H"; mkdir -p "$T30H"
+tier_for() { # <changed_files_count> <rows...> → "<status>\t<tier>"
+  local count="$1"; shift
+  HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+    FIX_COUNT="$count" FIX_ROWS="$(printf '%s\n' "$@")" \
+    bash "$SRC" --print-tier 42 owner/repo 2>/dev/null
+}
+
+# (i) THE SHALLOW DIRECTION — a docs-only diff selects the Low tier.
+[ "$(tier_for 1 $'modified\tdocs/ops/fleet-liveness.md\t')" = "$(printf 'ok\tlow')" ] \
+  && pass "(30i) a docs-only diff SELECTS the shallow tier (ok/low) — the selector answers from surfaces, not from size" \
+  || fail "(30i) a docs-only diff did not select the shallow tier (got '$(tier_for 1 $'modified\tdocs/ops/fleet-liveness.md\t')')"
+
+# (ii) THE FULL DIRECTION — a ONE-LINE rail change selects FULL depth. This is
+# the assertion that makes diff size irrelevant by construction: same single
+# file, one line, and the tier is full.
+[ "$(tier_for 1 $'modified\tscripts/admin-merge.sh\t')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30ii) a ONE-LINE change to scripts/admin-merge.sh selects FULL depth (ok/full) — a rail is high-blast however small the diff" \
+  || fail "(30ii) a one-line scripts/admin-merge.sh change did NOT select full (got '$(tier_for 1 $'modified\tscripts/admin-merge.sh\t')')"
+
+# The rest of the ALWAYS-FULL class, and the inert class beside it.
+for f in scripts/ci-failure-set.sh scripts/atomic-land.sh scripts/check-pipeline-compliance.sh scripts/record-review.sh .github/workflows/ci-main.yml .github/actions/x/action.yml extensions/review-enforcer/index.ts skills/code-review/SKILL.md templates/AGENTS.base.md enforcement/dangerous-ops.txt; do
+  [ "$(tier_for 1 "$(printf 'modified\t%s\t' "$f")")" = "$(printf 'ok\tfull')" ] \
+    && pass "(30ii) $f is ALWAYS-FULL" \
+    || fail "(30ii) $f did NOT select full — the always-full class has a hole"
+done
+[ "$(tier_for 1 $'modified\ttests/ci-lane-parity/run.sh\t')" = "$(printf 'ok\tmicro')" ] \
+  && pass "(30iii) a test-only diff selects the micro CEILING (ok/micro) — the exemption is available, the label guard still decides it" \
+  || fail "(30iii) a test-only diff did not select micro (got '$(tier_for 1 $'modified\ttests/ci-lane-parity/run.sh\t')')"
+
+# A MIXED diff takes the HIGHEST surface: docs must never dilute a rail.
+[ "$(tier_for 2 $'modified\tscripts/admin-merge.sh\t' $'modified\tdocs/ops/x.md\t')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30iv) a docs+rail diff is full — a prose file cannot dilute the rail it ships with" \
+  || fail "(30iv) a docs+rail diff did not select full"
+
+# Path HYGIENE: a traversal path is UNCLASSIFIABLE, which must resolve to full —
+# otherwise `docs/../scripts/admin-merge.sh` would evade every prefix arm.
+[ "$(tier_for 1 $'modified\tdocs/../scripts/admin-merge.sh\t')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30v) a \`docs/../scripts/admin-merge.sh\` path is unclassifiable and resolves to FULL — traversal cannot evade the cap" \
+  || fail "(30v) a traversal path was classified rather than refused (got '$(tier_for 1 $'modified\tdocs/../scripts/admin-merge.sh\t')')"
+
+# FAIL-CLOSED framing: a truncated/inconsistent list, and an unreadable API,
+# both yield an EMPTY tier — a degraded read must never read as a selection.
+T30_TRUNC="$(tier_for 9 $'modified\tdocs/ops/x.md\t')"
+[ "$T30_TRUNC" = "$(printf 'too_large\t')" ] \
+  && pass "(30vi) an inconsistent changed-file count yields too_large and an EMPTY tier — a possibly-truncated list cannot clear a ceiling" \
+  || fail "(30vi) an inconsistent count was not refused (got '$T30_TRUNC')"
+mkdir -p "$T30/deadgh"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$T30/deadgh/gh"
+chmod +x "$T30/deadgh/gh"
+T30_DOWN="$(PATH="$T30/deadgh:$PATH" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+[ "$T30_DOWN" = "$(printf 'unavailable\t')" ] \
+  && pass "(30vii) a TRANSPORT failure (gh exits non-zero) yields unavailable and an EMPTY tier" \
+  || fail "(30vii) a transport failure did not yield unavailable/empty (got '$T30_DOWN')"
+
+# rc 3 vs rc 1 — the split that closes the review's P1.2: a payload the API
+# ANSWERED with but this classifier cannot certify is POSITIVE evidence and must
+# NOT read as "the network failed" (which proceeded to write the record).
+T30_UNCL="$(tier_for 1 $'modified\t\t')"
+[ "$T30_UNCL" = "$(printf 'unclassified\t')" ] \
+  && pass "(30xi) a row with no path yields unclassified + EMPTY tier — an uncertifiable payload is never a tier" \
+  || fail "(30xi) a pathless row was not reported unclassified (got '$T30_UNCL')"
+T30_EMPTY="$(tier_for 0)"
+[ "$T30_EMPTY" = "$(printf 'empty\t')" ] \
+  && pass "(30xii) a zero-file diff yields empty + EMPTY tier" \
+  || fail "(30xii) a zero-file diff did not yield empty (got '$T30_EMPTY')"
+
+# A RENAME carries the old path in column 3 while GitHub's changed_files counts
+# it as ONE file. Counting both ends (the review's P1.1) reported `too_large` for
+# every rename — a 1-file docs rename could not select `low`, and the recorder
+# refused `clean-micro` with a truncation message that was simply false.
+[ "$(tier_for 1 $'renamed\tdocs/b.md\tdocs/a.md')" = "$(printf 'ok\tlow')" ] \
+  && pass "(30xiii) a 1-file docs RENAME selects low, not too_large — the parity count is per new path, like clean_low_shape_ok" \
+  || fail "(30xiii) a docs rename was not classified low (got '$(tier_for 1 $'renamed\tdocs/b.md\tdocs/a.md')')"
+[ "$(tier_for 1 $'renamed\tdocs/b.md\tscripts/admin-merge.sh')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30xiv) a rename OUT of scripts/admin-merge.sh is FULL — both ends are classified even though only one is counted" \
+  || fail "(30xiv) a rename out of the rail was not full (got '$(tier_for 1 $'renamed\tdocs/b.md\tscripts/admin-merge.sh')')"
+
+# The diff-identity producer and the CI/pre-commit gate bodies (cycle-2 F1): the
+# recorder's own argument ("leaving it out would be a one-line bypass") applies
+# verbatim to the ONE implementation of the diff digest.
+for f in scripts/lib/diff-normalize.py scripts/check-no-sigpipe-grep.sh .husky/pre-commit scripts/ci_exemption.py scripts/ci-workflow-pr-evaluable.sh; do
+  [ "$(tier_for 1 "$(printf 'modified\t%s\t' "$f")")" = "$(printf 'ok\tfull')" ] \
+    && pass "(30xvi) $f is ALWAYS-FULL" \
+    || fail "(30xvi) $f did NOT select full — a gate body is outside the class"
+done
+
+# A compare that fails while the pulls read SUCCEEDS is positive evidence (the
+# API is reachable and refuses THIS revision — a fork head over 404), not
+# transport. Classifying it as transport let a fork PR editing a rail record
+# clean-micro with one stderr line (cycle-2 P1).
+T30_CMP_RC="$(FIX_COMPARE_RC=1 FIX_COMPARE_ERR='gh: Not Found (HTTP 404)' PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+  FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+  HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+[ "$T30_CMP_RC" = "$(printf 'unclassified\t')" ] \
+  && pass "(30xvii) a compare HTTP 404 (fork head / unreachable sha) is UNCLASSIFIED, not unavailable — the API REFUSED this revision" \
+  || fail "(30xvii) a compare HTTP 404 was read as transport (got '$T30_CMP_RC')"
+
+# ...and on the RECORD path the same response must refuse, like its clean-low
+# sibling does 60 lines later.
+rm -rf "$T30H/.pi/agent/reviews"
+FIX_COMPARE_RC=1 FIX_COMPARE_ERR='gh: Not Found (HTTP 404)' HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+  FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+  bash "$SRC" 42 "$HEX40" clean-micro owner/repo >/dev/null 2>&1
+T30_CMP_GUARD_RC=$?
+[ "$T30_CMP_GUARD_RC" -eq 4 ] && [ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30xviii) a compare HTTP 404 REFUSES the clean-micro record (exit 4, no record) — a fork PR cannot skip review on a rail" \
+  || fail "(30xviii) a compare HTTP 404 still minted a record (rc=$T30_CMP_GUARD_RC)"
+
+# THE OTHER DIRECTION, which the earlier version got WRONG: a 403 rate-limit,
+# a 5xx and a dead socket are NOT refusals of this revision. Treating them as
+# positive evidence stranded a legitimate micro lane on a transient failure and
+# told it to pay for a full review.
+for _cerr in 'gh: API rate limit exceeded for 1.2.3.4. (HTTP 403)' 'gh: Server Error (HTTP 502)' 'gh: Get "https://api.github.com/x": connection refused'; do
+  T30_TRANS="$(FIX_COMPARE_RC=1 FIX_COMPARE_ERR="$_cerr" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+    FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+    HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+  [ "$T30_TRANS" = "$(printf 'unavailable\t')" ] \
+    && pass "(30xvii-b) a non-refusal compare failure ('${_cerr:0:38}…') is TRANSPORT (unavailable), not a refusal" \
+    || fail "(30xvii-b) a non-refusal compare failure was classified as a refusal (got '$T30_TRANS')"
+done
+
+# THE SEAM IS READ-ONLY: drive the selector with an isolated HOME and no record
+# on disk, then assert nothing appeared. Order-independent — the directory is
+# cleared first, so a record left by the RECORD-path runs above can never be
+# mistaken for one the selector minted.
+#
+# COVERAGE LIMIT, stated rather than implied: this pins the OUTCOME, not the
+# mechanism. A mutant that deletes the seam's `exit 0` still leaves no record,
+# because the empty-`SHA` stale guard refuses before any write — measured. So
+# this assertion catches a regression where BOTH change, and cannot isolate the
+# seam's own exit; it is not load-bearing for the read-only claim on its own.
+rm -rf "$T30H/.pi/agent/reviews"
+tier_for 1 "$(printf 'modified\tdocs/ops/x.md\t')" >/dev/null
+[ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30xix) --print-tier wrote NOTHING: the seam is read-only (no record minted into the isolated HOME)" \
+  || fail "(30xix) --print-tier MINTED a record — the read-only seam is not read-only"
+
+# MUTATION: delete the rail from the always-full arm and (ii) must go RED — the
+# arm is load-bearing, not decoration.
+M30="$T30/mut-norail.sh"
+python3 - "$SRC" "$M30" <<'PYCAP'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+frag = "scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh"
+if src.count(frag) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(frag, "scripts/ci-failure-set.sh|scripts/atomic-land.sh"))
+PYCAP
+if bash -n "$M30" 2>/dev/null; then
+  M30_TIER="$(PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
+    FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" bash "$M30" --print-tier 42 owner/repo 2>/dev/null)"
+  [ "$M30_TIER" != "$(printf 'ok\tfull')" ] \
+    && pass "mutation NORAIL is caught: without the rail in the class, a rail diff no longer selects full (got '$M30_TIER')" \
+    || fail "mutation NORAIL SURVIVED — the rail entry is not load-bearing"
+else
+  fail "mutation NORAIL could not be built — the always-full arm was not found verbatim"
+fi
+
+# WIRING: the clean-micro record path must CONSULT the cap before writing. If the
+# guard call is deleted, a rail diff records clean-micro — the bypass this exists
+# to close. (The cap is read HERE, in the recorder, so every future lane inherits
+# it without touching the skill.)
+grep -q 'review_surface_rows "\$REPO" "\$PR" "\$SHA"' "$SRC" \
+  && pass "(30viii) the clean-micro guard reads the recorded revision's surfaces (the cap is WIRED, not merely defined)" \
+  || fail "(30viii) the clean-micro guard does not consult the surface cap — a rail diff could record clean-micro"
+
+# WIRING, END-TO-END: run the REAL record path and prove the cap actually refuses.
+# The assertion above only proves the call exists; these two prove its EFFECT and
+# its BOUNDARY — a rail diff refuses (exit 4, NO record written), and an inert
+# diff is NOT refused (the cap is a ceiling, not a blanket block on micro).
+T30H="$T30/home"; rm -rf "$T30H"; mkdir -p "$T30H"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'for x in "$@"; do' \
+  '  case "$x" in' \
+  '    *"/pulls/"*)' \
+  '      case "$*" in' \
+  '        *"@tsv"*) printf "%s\t%s\t%s\n" "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;' \
+  '        *".head.sha"*) printf "%s\n" "${FIX_HEAD}"; exit 0 ;;' \
+  '      esac' \
+  '      exit 1 ;;' \
+  '    *"/compare/"*)  printf "mb\t%s\n" "${FIX_MB}"; printf "%s\n" "${FIX_ROWS}"; exit 0 ;;' \
+  '    *"/diff"*)      exit 1 ;;' \
+  '  esac' \
+  'done' \
+  'exit 1' > "$T30/bin/gh"
+chmod +x "$T30/bin/gh"
+rec_micro() { # <rows> → runs the record path for clean-micro; sets REC_RC
+  HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
+    FIX_ROWS="$1" bash "$SRC" 42 "$HEX40" clean-micro owner/repo >/dev/null 2>&1
+  REC_RC=$?
+}
+rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t')"
+[ "$REC_RC" -eq 4 ] && [ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30ix) the RECORD PATH refuses clean-micro for a rail diff: exit 4 and NO record written (the bypass is closed end-to-end)" \
+  || fail "(30ix) clean-micro on a rail diff was NOT refused (rc=$REC_RC, reviews dir: $(ls -d "$T30H/.pi/agent/reviews" 2>/dev/null || echo absent))"
+rec_micro "$(printf 'modified\tdocs/ops/x.md\t')"
+T30_REC="$T30H/.pi/agent/reviews/owner-repo-42.json"
+[ "$REC_RC" -eq 0 ] && [ -f "$T30_REC" ] \
+  && pass "(30x) the cap does NOT refuse an inert diff — it is a ceiling on the tier, never a blanket block on the micro flow (rc=0 and the record EXISTS)" \
+  || fail "(30x) an inert docs diff was not recorded (rc=$REC_RC, record: $([ -f "$T30_REC" ] && echo present || echo absent))"
+
+# THE REVIEW'S P1.2, as a fixture: a rail diff that ALSO carries one row of an
+# exotic status. Reading the cap's paths through the clean-low attestation's
+# enum discarded the whole read (rc 1 = "API failed") and the record PROCEEDED —
+# the bypass this arm exists to close, still reachable by adding one `copied` row.
+rm -rf "$T30H/.pi/agent/reviews"
+rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t\ncopied\tdocs/copy.md\tdocs/orig.md')"
+[ "$REC_RC" -eq 4 ] && [ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30xv) a rail diff carrying an EXOTIC-status row is still refused (exit 4, no record) — an unusual row is positive evidence, never a transport failure" \
+  || fail "(30xv) a rail diff with a copied row was NOT refused (rc=$REC_RC) — the cap fails open on framing"
+
+echo "── 31. #1377: the PATCH identity against REAL git output ─────────"
+# The lane-dimension carry above is proven on fixture commits; this section proves
+# the PATCH predicate (`diff_identity_pair`) on what `git` itself renders. That
+# matters because the projection's whole claim — "a base move rewrites exactly the
+# blob ids, the hunk line numbers and the hunk CONTEXT, and nothing else" — is a
+# claim about GIT, not about our fixtures. A hand-written diff pair can agree with
+# a wrong projection; real `git diff` output after a real base move cannot.
+#
+# The fixture builds the shape #1377 names, using the operation the fleet actually
+# performs (`gh pr update-branch` merges the moved base into the PR branch):
+#   * the PR changes one line;
+#   * `main` lands a different change INSIDE the PR's hunk context;
+#   * the merge is clean (the two changes are on different lines), so the PR's
+#     contribution is untouched while the RENDERED context around it moves.
+# That is the case the byte-identity arm cannot see and #1377 exists for.
+awk '/^diff_identity_pair\(\) \{/,/^\}$/' "$SRC" > "$TMP/patchfn.sh"
+if grep -q 'diff_identity_pair()' "$TMP/patchfn.sh"; then
+  pass "(31) diff_identity_pair extracted from record-review.sh"
+else
+  fail "(31) could not extract diff_identity_pair from $SRC"
+fi
+export DIFF_NORMALIZER="$ROOT/scripts/lib/diff-normalize.py"
+pair_of() { # <diff-file> [normalizer] -> "<binding> <patch>" on one line (empty on failure)
+  local f="$1" norm="${2:-$DIFF_NORMALIZER}"
+  ( DIFF_NORMALIZER="$norm"; source "$TMP/patchfn.sh"; diff_identity_pair "$f" ) 2>/dev/null | tr '\t' ' '
+}
+P="$TMP/patchid"; rm -rf "$P"; mkdir -p "$P"
+Q="$TMP/patchdiffs"; rm -rf "$Q"; mkdir -p "$Q"
+( cd "$P" || exit 9
+  git init -q .; git config user.email t@t; git config user.name t
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+  printf 'untouched\n' > other.txt
+  git add -A; git commit -qm base; git branch -M main
+  git checkout -qb pr
+  printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+  git add -A; git commit -qm "the reviewed change" ) >/dev/null 2>&1 || true
+( cd "$P" && git rev-parse --verify -q HEAD >/dev/null 2>&1 ) \
+  && pass "(31) fixture repo built" || fail "(31) could not build the fixture repo"
+cd "$P" || exit 2
+REVIEWED31="$(git rev-parse HEAD)"
+# main lands a change INSIDE the PR's hunk context (3 lines around l6 → l4 is one
+# of them), on a DIFFERENT line, so the merge is clean and the PR's own change is
+# untouched.
+git checkout -q main
+printf 'l1\nl2\nl3\nMAIN-4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+git add -A; git commit -qm "main lands nearby work"
+git checkout -q pr
+git merge -q --no-edit main >/dev/null 2>&1 || true
+CURRENT31="$(git rev-parse HEAD)"
+[ "$REVIEWED31" != "$CURRENT31" ] \
+  && pass "(31) the base move really moved the head" || fail "(31) fixture is wrong: the head did not move"
+git diff --no-color --full-index "main...$REVIEWED31" > "$Q/a.diff"
+git diff --no-color --full-index "main...$CURRENT31"  > "$Q/b.diff"
+# PREMISE 1: the REVIEWED change is identical on both sides (context aside).
+REV_LINES="$(grep -E '^[+-]' "$Q/a.diff" | grep -vE '^(\+\+\+|---)' | LC_ALL=C sort)"
+CUR_LINES="$(grep -E '^[+-]' "$Q/b.diff" | grep -vE '^(\+\+\+|---)' | LC_ALL=C sort)"
+[ -n "$REV_LINES" ] && [ "$REV_LINES" = "$CUR_LINES" ] \
+  && pass "(31) the fixture's CHANGED LINES really are identical on both heads — the acceptance claim is not vacuous" \
+  || fail "(31) fixture is wrong: the base move changed the changed lines"
+# PREMISE 2: the CONTEXT really did move, or the pair would be byte-identical and
+# the acceptance would be testing the OLD arm, not this one.
+if grep -q 'MAIN-4' "$Q/b.diff" && ! grep -q 'MAIN-4' "$Q/a.diff"; then
+  pass "(31) the rendered CONTEXT really moved (b carries main's new line, a does not) — the pair is not byte-identical"
+else
+  fail "(31) fixture is wrong: the context did not move, so this pair tests nothing new"
+fi
+PA="$(pair_of "$Q/a.diff")"; PB="$(pair_of "$Q/b.diff")"
+[ -n "$PA" ] && [ -n "$PB" ] && pass "(31) the predicate read both real diffs" \
+  || fail "(31) the predicate could not read the real diffs"
+[ "${PA%% *}" != "${PB%% *}" ] \
+  && pass "(31) BINDING: a real base move MOVES the evidence digest (#1377's premise, measured on git output)" \
+  || fail "(31) the binding did not move — the premise is not exercised"
+[ "${PA##* }" = "${PB##* }" ] \
+  && pass "(31) PATCH: the same base move leaves the patch digest IDENTICAL — this is what the carry accepts" \
+  || fail "(31) the patch digest moved on an unchanged change — the arm would refuse a legitimate carry"
+
+# One changed LINE is not carried.
+printf 'l1\nl2\nl3\nl4\nl5\nl6-PR-CHANGED\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+git add -A; git commit -qm "an edit"
+EDIT31="$(git rev-parse HEAD)"
+git diff --no-color --full-index "main...$EDIT31" > "$Q/c.diff"
+PC="$(pair_of "$Q/c.diff")"
+[ "${PB##* }" != "${PC##* }" ] \
+  && pass "(31) a ONE-LINE change moves the patch digest — it must refuse (the refusal direction)" \
+  || fail "(31) a one-line change kept the same patch digest — FAIL-OPEN"
+
+# Whitespace only: the exact hole `git patch-id --stable` has.
+printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\t\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+git add -A; git commit -qm "whitespace only"
+WS31="$(git rev-parse HEAD)"
+git diff --no-color --full-index "main...$WS31" > "$Q/d.diff"
+PD="$(pair_of "$Q/d.diff")"
+[ "${PC##* }" != "${PD##* }" ] \
+  && pass "(31) a WHITESPACE-ONLY change moves the patch digest (patch-id --stable would not)" \
+  || fail "(31) a whitespace-only change kept the patch digest — the patch-id --stable hole is open"
+
+# Same lines at a different path.
+git checkout -q "$CURRENT31" 2>/dev/null || true
+printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\nl7\nl8\nl9\nl10\nl11\nl12\n' > moved.txt
+git rm -q f.txt >/dev/null 2>&1 || true
+git add -A; git commit -qm "move the change"
+MOVED31="$(git rev-parse HEAD)"
+git diff --no-color --full-index "main...$MOVED31" > "$Q/e.diff"
+PE="$(pair_of "$Q/e.diff")"
+[ "${PB##* }" != "${PE##* }" ] \
+  && pass "(31) the same lines at a DIFFERENT PATH move the patch digest (the path is part of the identity)" \
+  || fail "(31) a path move kept the patch digest — the identity ignores paths"
+
+# ── MUTATION PINS on real output ──────────────────────────────────────────
+# A mutant projection that KEEPS context must make the acceptance assertion
+# redden: otherwise the acceptance would pass for a projection that never
+# dropped anything.
+mkdir -p "$TMP/pmut-ctx"
+python3 - "$ROOT/scripts/lib/diff-normalize.py" "$TMP/pmut-ctx/diff-normalize.py" <<'INNERPY' || true
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+needle = '        if line.startswith(" "):\n'
+assert needle in src, "context-drop needle not found"
+i = src.index(needle)
+j = src.index("            continue\n", i) + len("            continue\n")
+open(sys.argv[2], "w", encoding="utf-8").write(src[:i] + src[j:])
+INNERPY
+if [ -s "$TMP/pmut-ctx/diff-normalize.py" ]; then
+  MA="$(pair_of "$Q/a.diff" "$TMP/pmut-ctx/diff-normalize.py")"
+  MB="$(pair_of "$Q/b.diff" "$TMP/pmut-ctx/diff-normalize.py")"
+  [ -n "$MA" ] && [ "${MA##* }" != "${MB##* }" ] \
+    && pass "(31) MUTATION: with context KEPT the real base move no longer matches — the acceptance assertion is load-bearing" \
+    || fail "(31) MUTATION SURVIVED: a context-keeping projection still matched the base move"
+else
+  fail "(31) could not build the context-keeping mutant"
+fi
+# A mutant that DROPS the +/- lines must make the refusal assertion redden.
+mkdir -p "$TMP/pmut-none"
+python3 - "$ROOT/scripts/lib/diff-normalize.py" "$TMP/pmut-none/diff-normalize.py" <<'INNERPY' || true
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+needle = '        out.append(line)\n    return out\n\n\ndef _normalize_entry'
+assert needle in src, "changed-lines needle not found"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(
+    needle, '        if line[:1] in ("+", "-"):\n            continue\n        out.append(line)\n    return out\n\n\ndef _normalize_entry', 1))
+INNERPY
+if [ -s "$TMP/pmut-none/diff-normalize.py" ]; then
+  MB2="$(pair_of "$Q/b.diff" "$TMP/pmut-none/diff-normalize.py")"
+  MC2="$(pair_of "$Q/c.diff" "$TMP/pmut-none/diff-normalize.py")"
+  [ -n "$MB2" ] && [ "${MB2##* }" = "${MC2##* }" ] \
+    && pass "(31) MUTATION: with the changed lines DROPPED the one-line edit matches — the refusal assertion is load-bearing" \
+    || fail "(31) mutation did not collapse the pair, so the refusal may pass vacuously"
+else
+  fail "(31) could not build the changed-lines-dropped mutant"
+fi
+cd "$TMP" || true
 # 138 -> 137 (round 36) -> 133 (round 37, PR #1554). The retired-mutant tails printed the SAME
 # "RETIRED" note from more than one place: the mutant BUILDER line itself carried a
 # `|| pass "NOTE ..."` (sections 24, 25 and 26) and section 26 had a bare
@@ -1775,7 +2181,7 @@ fi
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
-MIN_ASSERTIONS=133
+MIN_ASSERTIONS=183
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

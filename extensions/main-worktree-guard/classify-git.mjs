@@ -355,7 +355,7 @@ function _stripQuotes(s) { return String(s ?? "").replace(/^["']|["']$/g, ""); }
  *
  * @param {string} verb — "merge" | "pull" | "rebase" (the sync invocation)
  * @param {string[]} args — that invocation's argv (verb excluded)
- * @returns {{verb: string, ffOnly: boolean, rebaseEffect: boolean, leavesDirty: boolean, unverifiable: boolean}}
+ * @returns {{verb: string, positionals: string[], ffOnly: boolean, rebaseEffect: boolean, leavesDirty: boolean, unverifiable: boolean}}
  */
 
 /** Long options that are provably BOOLEAN for the sync verbs — safe to ignore
@@ -486,8 +486,22 @@ export function syncEffectOf(verb, args) {
     if (m) lastFfMode = m;
   }
   const optionAt = (f) => a.some((t, i) => !valueSlot[i] && t === f);
+  // #2277: the invocation's SOURCE ref(s) — every token that is neither an
+  // option nor another option's value. `git pull --ff-only` (no positional)
+  // integrates the checked-out branch's configured upstream; naming a ref
+  // explicitly (`git pull --ff-only origin main`) lets the caller target a
+  // commit that is NOT the upstream, so the foreign-checkout arm requires the
+  // no-positional form and the caller refuses any non-empty list.
+  const positionals = [];
+  for (let i = 0; i < a.length; i++) {
+    if (valueSlot[i] || a[i] === "--") continue;
+    if (a[i].startsWith("-") && a[i].length > 1) continue;
+    if (a[i] === "") continue;
+    positionals.push(a[i]);
+  }
   return {
     verb,
+    positionals,
     ffOnly: lastFfMode === "ff-only",
     // `-r` is `--rebase` for pull and `--rebase-merges` for rebase — both are
     // rewriting effects; a cluster containing `r` counts too (over-matching is
