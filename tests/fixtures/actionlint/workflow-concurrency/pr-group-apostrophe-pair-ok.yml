@@ -1,0 +1,13 @@
+# The safe direction of the same shape: a correct group whose trailing comment contains an apostrophe.
+# The comment must be stripped, not quoted back as the value (#2660 round 10).
+name: PR group apostrophe pair ok
+on:
+  pull_request:
+concurrency:
+  group: pr-group-apostrophe-pair-ok-team's-${{ github.ref }}   # do not add github.sha, won't help
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
