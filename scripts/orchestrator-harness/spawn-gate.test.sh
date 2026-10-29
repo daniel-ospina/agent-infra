@@ -706,6 +706,16 @@ cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/gate-po
 # the validator is the same class as its dependency on spawn-gate.sh.
 cp "$HERE/fix-one.sh" "$RIG/stale/"
 cp "$HERE/brief-gate.sh" "$RIG/stale/"
+# ⛔ AND THE DELIVERY RENDERER, FOR THE SAME REASON AND WITH EVIDENCE (#2981). fix-one.sh now
+# HARD-REQUIRES `reviewer-preflight.sh --delivery-brief` and resolves it from `$SELF`, then
+# `$AGENT_INFRA_PATH`, then `~/.pi/agent` — so a rig that seeds `fix-one.sh` without it does not
+# exercise the refund at all: it falls through to an AMBIENT home. Measured on a clean clone of main
+# (709dfb06): the ambient checkout answered `--delivery-brief` with a usage line and the arm read
+# `rc=78, fixcount=2` — a "STALE helper" red that is really a half-seeded rig. On a CI runner, whose
+# HOME and `$AGENT_INFRA_PATH` hold no harness scripts, the same rig returns 78 for a second reason.
+# Neither is the behaviour under test, so the renderer travels with the fixture and the arm can no
+# longer pass or fail on what the box happens to have installed.
+cp "$HERE/reviewer-preflight.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
     "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
@@ -1035,13 +1045,19 @@ export -f pi
 # this comment once left to luck are copied explicitly; the fallbacks `brief_gate_lib` also consults
 # (`$AGENT_INFRA_PATH`, `~/.pi/agent/scripts`) are NOT relied on, so the arm cannot pass on a dev box
 # and fail on a runner whose HOME has no harness scripts (same class as round 3's HOME fix).
+# ⛔ AND THE DELIVERY RENDERER TOO (#2981): `fix-one.sh` refuses (78) without
+# `reviewer-preflight.sh --delivery-brief`, and it resolves that helper from `$SELF` first and then
+# from AMBIENT homes (`$AGENT_INFRA_PATH`, `~/.pi/agent`). A rig that omits it therefore measures the
+# box, not the wrapper: on a dev box the ambient checkout may answer with a usage line (measured, rc=78)
+# and on a runner no ambient home has it (rc=78 for the other reason) — both read as "the wrapper does
+# not propagate the fixer's status". Seeded here for the same reason brief-gate.sh is.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$HERE/gate-policy.sh" \
-   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
+   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/reviewer-preflight.sh" "$RO/"
 # …and the arm must not be satisfiable by a rig that never reached the claim block: assert the
 # modules it needs are actually in $RO, so a future edit that drops one fails HERE, naming the
 # missing file, instead of resurfacing as a bogus 78 two assertions later.
 _rigmiss=""
-for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh; do
+for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh reviewer-preflight.sh; do
   [ -f "$RO/$_m" ] || { echo "❌ the §9 rig is missing $_m in \$RO — the cross-box arm below would exit 78 before its refusal"; _rigmiss="$_m"; }
 done
 [ -z "$_rigmiss" ]; rc=$?
@@ -1072,6 +1088,13 @@ cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-s
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
 cp "$HERE/brief-gate.sh" "$RO/"
+# ⛔ …and the delivery renderer, for the third time in this file and for the same class (#2981):
+# `fix-one.sh` exits 78 without `reviewer-preflight.sh --delivery-brief`, and it falls back to
+# `$AGENT_INFRA_PATH` / `~/.pi/agent` when `$O` has no copy — so a rig that omits it measures the
+# box's installed version instead of this tree (measured on a clean clone of main: `got 78` on all
+# eleven arms below, because the ambient checkout's copy answered with a usage line). Seeded, so the
+# arms below assert PROPAGATION and nothing else.
+cp "$HERE/reviewer-preflight.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
