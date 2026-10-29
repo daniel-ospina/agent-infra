@@ -2454,11 +2454,14 @@ def test_a_FORK_and_a_CAPABILITY_refusal_VOID_the_row_too(tmp_path, monkeypatch)
     """
     d = tmp_path / "orch"
     (d / "bg").mkdir(parents=True)
-    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
-                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
     monkeypatch.setattr(pr, "ORCH_DIR", str(d))
     for code, marker in ((73, "[fork-gate] REFUSED"),
                          (71, "[capability-gate] REFUSED")):
+        # ⛔ A FRESH ROW PER ITERATION: `void_refused_rows` DELETES the key it voids, so reusing one
+        # dict made the second pair assert `[] == ["9"]` — a vacuous failure that reported the
+        # capability gate as inert when the arm had already consumed the row itself.
+        st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                    "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
         assert code in pr.GATE_REFUSALS, code
         assert marker in pr.REFUSAL_MARKERS, marker
         (d / "bg" / "prd-9.rc").write_text("%d\n" % code)
