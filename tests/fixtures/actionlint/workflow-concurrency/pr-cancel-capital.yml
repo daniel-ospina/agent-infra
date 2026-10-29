@@ -1,0 +1,13 @@
+# `True` is what a YAML 1.1 / GitHub boolean looks like when a formatter or a human capitalises it.
+# The push arm already read it as cancelling, so refusing it on the PR arm was the same value
+# judged two ways (#2660 round 4).
+name: PR cancel capital
+on: pull_request
+concurrency:
+  group: pr-cancel-capital-${{ github.ref }}
+  cancel-in-progress: True
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
