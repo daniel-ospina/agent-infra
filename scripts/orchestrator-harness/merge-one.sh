@@ -836,13 +836,25 @@ REV_STARTED=1
 # is still SHORTER than the allowance (1800 < 2700), so a reviewer killed here is censored the same way
 # a lane was — `lane-bound.sh` says so on every review.
 #
-# It is not fixed here because the bound is not free to raise: `CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))`
-# below, and `claims.sh` CLAMPS any lease above `CLAIM_TTL_MAX - 1200` = 6000 s. Raising REVIEW_TIMEOUT
-# to the 7200 s backstop would therefore produce a 7200 s reviewer holding a claim that expires at 6000
-# — a second lane free to take the claim mid-review, which is the exact silent-park `claims.sh` guards
-# against. The two numbers are one decision: raise `CLAIM_TTL_MAX` with the reviewer bound, in one
-# change, with `claim-orphan.test.sh` re-derived. Tracked on agent-infra#2888 (comment), not as a peer
-# issue: same root cause, different call site.
+# It is not fixed here because the REVIEWER bound is not the lane's bound: it bounds ONE tool call, not
+# a lane's life, so the censoring this change removes for a lane (a working lane killed by elapsed time)
+# does not have a reviewer analogue — a reviewer that has not returned in 1800 s has not produced a
+# verdict, and re-dispatching it is bounded by `MAX_REVIEW_TRIES`.
+#
+# The ARITHMETIC THAT USED TO BE CITED HERE WAS STALE (agent-infra#2999 review, F2) and is corrected,
+# not restated: this same change raises `CLAIM_TTL_MAX` 7200 -> 9600 (`claims.sh:146`), and the clamp in
+# `_claim_acquire_at` applies only when `ttl > max` (`claims.sh:897`). So at `REVIEW_TIMEOUT=7200` the
+# lease below is `7200 + _gw(>=900) + 300 = 8400 <= 9600` — NOT clamped, and it covers the run it is
+# issued for. `CLAIM_TTL_MAX` becomes the binding constraint only ABOVE ~8400 s, i.e. the old
+# "raise the ceiling in the same change" blocker no longer binds at the 7200 s backstop.
+#
+# What DOES bind is the cost/ownership trade, and it is a decision rather than an arithmetic fact: a
+# 7200 s reviewer holds the LANDING claim for up to 2 h 20 m, during which no peer may take that head,
+# and a review that has not answered in 30 min is far more likely wedged than slow (measured reviewer
+# samples: 885 s / 963 s / 1142 s, `walltime.tsv`). Raising it is a one-line change that this change has
+# made SAFE (the claim now covers it), so it is a candidate for #2888's re-measure, not a blocker.
+# The remaining real coupling stays named: `fix-one.sh`'s 8400 s lease + the `CLAIM_ISSUE_TTL`
+# (18000 s) sum in `claim-orphan.test.sh` O7 are what move when the FIXER's bound moves.
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
 AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
