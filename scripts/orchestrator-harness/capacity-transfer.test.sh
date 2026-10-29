@@ -1044,8 +1044,14 @@ exit $_code
 STUB
   chmod +x "$O/merge-one.sh"
   acquire_claim 108
+  # ⛔ THE TWO WAITS MUST BE PINNED, OR THE ARM NEVER REACHES ITS SUBJECT (measured: BOUNDED_RC=124,
+  # both iterations). `chain-merge.sh:300` defaults `LANE_PHASE_GRACE=90` and `LANE_HANDOFF_WAIT=1800`,
+  # and this rig writes no merge-phase marker, so the chain sat out the FULL 90s grace waiting for a
+  # lane that does not exist while `run_bounded 30` killed it at 30 — the arm reported "the post-merge
+  # step does not name the code" over a chain that had never executed the post-merge step. The sibling
+  # suite pins both for exactly this reason (`chain-merge-verdict.test.sh:252`).
   run_bounded 30 env O="$O" CHAIN_POLLS=2 CHAIN_POLL_SECS=1 PATH="$TMP/bin-pr:$PATH" \
-    CHAIN_CLAIM_COMMIT="$(chain_gen 108)" \
+    LANE_PHASE_GRACE=0 LANE_HANDOFF_WAIT=2 CHAIN_CLAIM_COMMIT="$(chain_gen 108)" \
     bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 108 feat/108-tm
   { [ "$BOUNDED_RC" -eq "$_code" ] && grep -q "reviewer NOT started (${_word}" "$O/logs/chain-108.log"; }; rc=$?
   ck "§LB a merge-one rc=$_code is NAMED as the $_word gate refusal (exit $BOUNDED_RC) — the post-merge step reports what the code means" $rc
