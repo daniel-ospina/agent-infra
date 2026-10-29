@@ -80,7 +80,11 @@
 #                          A supplied-but-unreadable file REFUSES rather than running blind.
 #   O                      the orchestrator state dir, default $CELL_HOME/orchestrator
 #   PR_DOCTOR_REPO / GH_REPO        the repo slug to repair, default daniel-ospina/tortoise
-#   PR_DOCTOR_REPO_DIR     the checkout, default /tmp/cell-t3
+#   PR_DOCTOR_REPO_DIR     the checkout. ⛔ IT IS NOT AN INDEPENDENT DEFAULT (agent-infra#3007):
+#                          the `/tmp/cell-t3` fallback is the DEFAULT REPO's checkout and is
+#                          reachable only while the slug is still that default. A pass whose slug
+#                          and checkout are different repos REFUSES (rc=2) naming both -- it never
+#                          runs, and it never gets as far as fetching an order from the wrong origin.
 #   REPAIR_INTERVAL_S      seconds between passes in --loop, default 900
 #   REPAIR_TRIGGER_POLL_S      --trigger: the lead, in seconds (default 60)
 #   REPAIR_TRIGGER_DEBOUNCE_S  --trigger: the coalescing window, in seconds (default 90)
@@ -94,16 +98,49 @@
 # Exit codes (the `pr-doctor`/`disk-reaper` vocabulary, kept identical on purpose):
 #   0  a pass completed — it dispatched, or there was genuinely nothing to do
 #   2  REFUSING — a read a pass needs could not be taken (a miss is never "nothing to do")
-#   3  UNDELIVERED — the work was placed and no worker took it (pr-doctor's own 3, kept verbatim: a
-#      monitor keyed on this pass must not read green over work nobody accepted)
+#   3  UNDELIVERED — legible work, NONE of it out: the work was placed and no worker took it, OR a
+#      durable refusal (a dirty worktree, an order the transport will not take) stopped it before
+#      delivery (agent-infra#2710). pr-doctor's own 3, kept verbatim: a monitor keyed on this pass
+#      must not read green over work nobody accepted
 #   6  DEFERRED — the machine said not now; the status row carries which measurement said so
+#   4  PASS-FAILED — the dispatcher CRASHED (or exited with a code that is not a verdict above).
+#      ⛔ NEVER RECORDED AS `refusing` (ai#2922): a crash and a refusal are DIFFERENT facts with
+#      different remedies, and this loop used to write both into the same `decision` and return 2,
+#      so a dispatcher that died (an unreadable cwd under launchd, `EXIT_CRASH=4`) read exactly like
+#      "I could not read the world". 2 is a VERDICT — see `docs/ops/pr-repair-service.md`, "the
+#      pass's exit codes are the trigger's vocabulary" — so a laundered crash consumed the backstop
+#      window instead of retrying. 4 is the same code `pr-doctor` uses for an uncaught exception.
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 O="${O:-$CELL_HOME/orchestrator}"
 SCRIPTS="${PR_REPAIR_SCRIPTS:-$CELL_HOME/.pi/agent/scripts}"
-REPO_SLUG="${PR_DOCTOR_REPO:-${GH_REPO:-daniel-ospina/tortoise}}"
-REPO_PATH="${PR_DOCTOR_REPO_DIR:-/tmp/cell-t3}"
+# ⛔ THE REPO AND ITS CHECKOUT ARE ONE FACT, SO THEY ARE RESOLVED FROM ONE SEAM (agent-infra#3007).
+# They used to be TWO INDEPENDENT INPUTS WITH TWO INDEPENDENT DEFAULTS: the slug defaulted to
+# `daniel-ospina/tortoise` and the checkout to `/tmp/cell-t3` (that repo's cell checkout), and
+# NOTHING compared them. So the documented way to point the repair service at a second repo -- set
+# `PR_DOCTOR_REPO=owner/name` -- moved the API repo and left the checkout where it was. Measured on
+# the issue that filed this: `PR_DOCTOR_REPO=daniel-ospina/agent-infra` enumerated 18 agent-infra
+# orders and then failed every one with `origin/<branch> could not be fetched`, because the fetch
+# ran in a TORTOISE checkout where those branch names do not exist. The refs all existed; only the
+# pair was wrong. The remedy is not another default but the comparison the pair never had:
+#   * the `/tmp/cell-t3` fallback BELONGS to the default slug, so it is reachable only while the
+#     slug is still that default (the two defaults can no longer drift apart by construction), and
+#     an empty checkout is a named refusal for anyone else, never a silent pairing with tortoise's;
+#   * a supplied pair is PROVEN (`repo_target_slug`, this tree's one identity reader) and refused
+#     when the checkout reports a DIFFERENT repo, with both values printed.
+# ⛔ AN UNPROVABLE CHECKOUT IS STILL NOT A REFUSAL, and that is a deliberate boundary, not an
+# oversight: a plain directory, a mirror, or a launchd/TCC checkout that cannot be read proves
+# NOTHING about which repo it is, and `pr-doctor.py` already grades such a repo's queue read-only
+# rather than costing the fleet that measurement (its own `resolve_repo()` docstring owns that
+# decision). Only a checkout that PROVES a different repo -- the failure above -- is refused here.
+DEFAULT_REPO_SLUG="daniel-ospina/tortoise"
+DEFAULT_REPO_PATH="/tmp/cell-t3"
+REPO_SLUG="${PR_DOCTOR_REPO:-${GH_REPO:-$DEFAULT_REPO_SLUG}}"
+REPO_PATH="${PR_DOCTOR_REPO_DIR:-}"
+if [ -z "$REPO_PATH" ] && [ "$REPO_SLUG" = "$DEFAULT_REPO_SLUG" ]; then
+    REPO_PATH="$DEFAULT_REPO_PATH"
+fi
 INTERVAL_S="${REPAIR_INTERVAL_S:-900}"
 DISK_FLOOR_MB="${REPAIR_DISK_FLOOR_MB:-4096}"
 PER_WORKER_MB="${REPAIR_DISK_PER_WORKER_MB:-1024}"
@@ -128,11 +165,45 @@ STATUS="$STATE_DIR/pr-repair.status.json"
 
 EXIT_OK=0
 EXIT_REFUSING=2
-EXIT_UNDELIVERED=3   # placed, and no worker took it -- pr-doctor's own 3, kept verbatim
+EXIT_UNDELIVERED=3   # legible work, NONE of it out -- no worker took the order that was placed, or a
+                     # durable refusal stopped it before delivery (#2710). pr-doctor's own 3, kept verbatim
+EXIT_CRASH=4         # the dispatcher crashed / returned a non-verdict -- pr-doctor's own 4
 EXIT_DEFERRED=6
 
 log_line() { printf '[%s] pr-repair: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 err() { log_line "⛔ $*" >&2; }
+
+# ── the repo/checkout pair: ONE identity, proven before anything is measured or dispatched ────────
+_REPAIR_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# ⛔ ONE DEFINITION, NOT A FOURTH PARSER. `repo-target.sh` is this tree's owner of "which repo is
+# this checkout" (it already scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG_*`, reads `--local` so an
+# ambient `insteadOf` cannot re-attribute the origin, and refuses a local path or a non-GitHub host).
+# A hand-rolled URL match here would be a second parser that drifts from the one the dispatch gates
+# use -- the #2040 class, and the reason `repo_slug_from_remote` is shared in the first place.
+# Ranked the way the other modules rank it: beside this file's own generation (a checkout), the
+# deployed harness (`$O`), then the farmed scripts dir. All are tried before the check is called.
+_repo_target_lib() {
+    local c
+    for c in "$_REPAIR_HERE/orchestrator-harness/repo-target.sh" \
+             "$O/repo-target.sh" \
+             "$SCRIPTS/repo-target.sh" \
+             "$REPO_PATH/scripts/orchestrator-harness/repo-target.sh"; do
+        if [ -n "$c" ] && [ -f "$c" ]; then printf '%s\n' "$c"; return 0; fi
+    done
+    return 1
+}
+
+# checkout_repo_slug <path> -> the `owner/name` the checkout PROVES, rc 1 when it proves nothing.
+checkout_repo_slug() {
+    local lib slug
+    lib="$(_repo_target_lib)" || return 1
+    # shellcheck source=/dev/null
+    . "$lib" 2>/dev/null || return 1
+    command -v repo_target_slug >/dev/null 2>&1 || return 1
+    slug="$(repo_target_slug "$1" 2>/dev/null)" || return 1
+    [ -n "$slug" ] || return 1
+    printf '%s\n' "$slug"
+}
 
 # ── measurement ──────────────────────────────────────────────────────────────────────────────────
 # ⛔ `df` ON THE CHECKOUT, NOT ON `/`. A cell's checkout can be on a different filesystem (a bind
@@ -200,7 +271,8 @@ decision, cap, free_mb, load1, rc_reap, rc_dispatch, reason, slug, path = sys.ar
 row = {
     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "epoch": int(time.time()),
-    # dispatched | idle(dry-run) | deferred | refusing | placed-undelivered | skipped(own file)
+    # dispatched | idle(dry-run) | deferred | refusing | placed-undelivered | pass-failed
+    # | skipped(own file)
     "decision": decision,
     "reason": reason,
     "cap": int(cap) if cap.isdigit() else cap,
@@ -245,7 +317,7 @@ PY
 
 one_pass() { # <dry-run:0|1>
     local dry="$1"
-    local free_mb used_pct load1 nproc_ ceiling cap rc_reap=- rc_dispatch=-
+    local free_mb used_pct load1 nproc_ ceiling cap rc_reap=- rc_dispatch=- _co_slug=""
 
     # ⛔ ONE PASS AT A TIME, IN BOTH MODES (#2700: two repair loops on one cell against one repo
     # double-claim work). The lock lives here rather than in the `once` arm because the UNIT runs
@@ -283,9 +355,23 @@ one_pass() { # <dry-run:0|1>
         return "$EXIT_REFUSING"
     fi
 
+    # ⛔ THE PAIR IS PROVEN HERE, BEFORE THE MACHINE IS MEASURED AND BEFORE ANYTHING IS DISPATCHED
+    # (agent-infra#3007). Both refusals are CONFIGURATION faults: they cannot be cleared by waiting
+    # for disk or load, so measuring the box first would only print a number that decided nothing.
+    if [ -z "$REPO_PATH" ]; then
+        err "REFUSING: no checkout for $REPO_SLUG — PR_DOCTOR_REPO_DIR is unset, and the $DEFAULT_REPO_PATH fallback is $DEFAULT_REPO_SLUG's checkout, not $REPO_SLUG's. This pass would fetch every order from the wrong origin (agent-infra#3007)."
+        write_status refusing 0 - - - - "checkout-unresolved:$REPO_SLUG"
+        return "$EXIT_REFUSING"
+    fi
     if [ ! -d "$REPO_PATH" ]; then
         err "REFUSING: the checkout $REPO_PATH does not exist — a repair pass with no checkout would read nothing and report it as an empty queue (#1974)."
         write_status refusing 0 - - - - "checkout-missing:$REPO_PATH"
+        return "$EXIT_REFUSING"
+    fi
+    _co_slug="$(checkout_repo_slug "$REPO_PATH")" || _co_slug=""
+    if [ -n "$_co_slug" ] && [ "$_co_slug" != "$REPO_SLUG" ]; then
+        err "REFUSING: the API repo and the checkout are two different repos — PR_DOCTOR_REPO=$REPO_SLUG but $REPO_PATH is a checkout of $_co_slug. Nothing was dispatched: every order would be fetched from $_co_slug's origin, where $REPO_SLUG's branches do not exist (agent-infra#3007). Fix: point PR_DOCTOR_REPO_DIR at a $REPO_SLUG checkout."
+        write_status refusing 0 - - - - "repo-checkout-mismatch:$REPO_SLUG@$_co_slug"
         return "$EXIT_REFUSING"
     fi
     free_mb="$(measure_free_mb "$REPO_PATH")" || {
@@ -371,8 +457,12 @@ one_pass() { # <dry-run:0|1>
     case "$rc_dispatch" in
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
-        3) err "dispatch: UNDELIVERED (rc=3) — the work was placed and no worker took it." ;;
-        *) err "dispatch: unexpected rc=$rc_dispatch from pr-doctor." ;;
+        3) err "dispatch: NOT DELIVERED (rc=3) — legible work, none of it out: no worker took an order that was placed, or a refusal stopped one before delivery. NOT an empty queue." ;;
+        # ⛔ A NON-VERDICT IS A FAILURE, AND IT IS NAMED AS ONE (ai#2922). `timeout` alone gives 124,
+        # a signal gives 128+n, and `pr-doctor` gives 4 for an uncaught exception -- the code an
+        # unreadable cwd produced under launchd. Calling any of them "a refusal" told an operator to
+        # look for a broken read while the dispatcher was dead.
+        *) err "dispatch: PASS-FAILED (rc=$rc_dispatch) — the dispatcher did not return a verdict; this is a CRASH to diagnose, not a refusal and not an empty queue." ;;
     esac
     # ⛔ THE RECORD FOLLOWS THE DISPATCHER'S OWN VERDICT, not the fact that it returned. A pass whose
     # dispatcher REFUSED (rc=2, "could not read the world") recorded as `dispatched` is the exact
@@ -380,8 +470,25 @@ one_pass() { # <dry-run:0|1>
     # queue nobody could read. The exit code carries the same verdict the row does.
     case "$rc_dispatch" in
         0) write_status dispatched "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "pass-complete"; return "$EXIT_OK" ;;
+        # ⚠️ THE TOKEN `no-worker-took-it` IS KEPT AND ITS CAUSE IS NOT (agent-infra#2710): rc=3 now
+        # covers a durable refusal BEFORE delivery as well, so the token under-describes its own row.
+        # It is not renamed here because it is a shipped monitor vocabulary (`pr-repair-loop.test.sh`
+        # pins it) and renaming it mid-change would break a reader this lane cannot verify. The
+        # KIND (`placed-undelivered`) is accurate for both, and the human line above names both.
         3) write_status placed-undelivered "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-worker-took-it"; return "$EXIT_UNDELIVERED" ;;
-        *) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
+        # ⛔ 2 IS WRITTEN EXPLICITLY, NOT VIA `*)` (ai#2922). The record arm never had a `2)` case: it
+        # reached `refusing` through the catch-all, so the moment a catch-all had to mean "a crash"
+        # (below), a genuine REFUSAL would have been recorded as `pass-failed` and returned 4 —
+        # collapsing the two facts from the other side. Named here, the refusal keeps its own row and
+        # its own verdict code, and the catch-all is free to mean only what it says.
+        2) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
+        # ⛔ THE ROW AND THE EXIT CODE BOTH SAY `pass-failed` (ai#2922). This arm used to write
+        # `refusing` / `dispatcher-refused` and return 2 -- the VERDICT code -- so a crashed
+        # dispatcher produced a row and an exit byte-identical to a genuine "could not read the
+        # world" (measured: rc=4 and rc=2 both gave `decision='refusing' reason='dispatcher-refused'`,
+        # LOOP-EXIT=2). 2 is a verdict a caller acts on; 4 is not, so a later tick retries instead
+        # of waiting out the backstop window on a crash.
+        *) write_status pass-failed "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-crashed"; return "$EXIT_CRASH" ;;
     esac
 }
 

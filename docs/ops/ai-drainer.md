@@ -18,7 +18,7 @@ operator activates them on a box**, and both are in the fleet inventory so their
 | artefact | what it is | schedule |
 |---|---|---|
 | `scripts/orchestrator-harness/ai-drainer.sh` | fills the box to its **measured** lane capacity: each tick dispatches `target − alive` bounded lanes that make PRs mergeable and merge what goes green | 20 min (both platforms) |
-| `scripts/orchestrator-harness/multi-repo-controller.sh` | a SECOND controller bound to another repo, with its own state dir and pin | long-running (no timer) |
+| `scripts/orchestrator-harness/multi-repo-controller.sh` | a SECOND controller bound to another repo, with its own state dir and pin | 900 s **top-up** on macOS (it no-ops when the controller is alive); a **named SKIP on a cell** — the plist declares `FleetResident`, because its body never returns |
 | `templates/launchd/com.eldato.ai-drainer.plist`, `com.eldato.ai-multi-repo.plist` | macOS jobs | rendered by `scripts/install-launchd.sh` |
 | `templates/systemd/eldato-ai-drainer.{service,timer}` | the cell's clock | rendered by `scripts/orchestrator-harness/install-drainer-timer.sh` |
 
@@ -182,7 +182,10 @@ reaper's arming.
 
 The second controller on a cell is the cell supervisor's business (`cloud-cell-supervisor.sh start`
 with `OR`/`O` for that repo); it needs no timer at all, and its inventory row says so
-(`no launchctl` → SKIPPED on a cell) rather than pretending to check a launchd job.
+(`no launchctl` → SKIPPED on a cell) rather than pretending to check a launchd job. ⛔ That split is
+ENFORCED, not described: the plist carries `FleetResident`, so `fleet-schedule.py` reports it as a
+named SKIP on a cell even when an operator sets its three identity values there — the alternative was
+the tick loop starting it and killing it at `FLEET_SCHEDULE_JOB_TIMEOUT`, every ceiling.
 
 ## Verify
 
