@@ -544,7 +544,23 @@ exit 0
 STUB
 chmod +x "$TMP/userbin/sudo" "$TMP/userbin/pgrep" "$TMP/userbin/loginctl" "$TMP/userbin/systemctl"
 
-env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
+# ⛔ THE REPO/CHECKOUT PAIR IS A FIXTURE INPUT, NEVER THE BOX'S (measured 2026-10-29). The four arms
+# below expect a SUCCESSFUL install, so they must SUPPLY a matching slug + checkout. They did not, and
+# inherited the host's `REPO`/`CELL_HOME` instead — so after #3007's pair check each one refused at that
+# check and never reached the linger/census assertion it exists for: 6 inert arms, on an agent-infra cell
+# (`REPO` names an agent-infra checkout, the default slug is tortoise -> "two different repos") AND on
+# CI, where `REPO` is absent and the refusal is "no checkout for". Both directions were reproduced by
+# hand. `tgt()` further down already unsets `GH_REPO=`/`REPO=`, which is why ITS arms stayed honest; a
+# positive arm additionally needs a real checkout, hence the fixture below (git init + remote, nothing is
+# fetched). `CELL_HOME` is pinned too: unpinned it defaults to `/tmp/cell-home`, whose `keys.env` is what
+# re-supplies `REPO` and defeats the unset.
+install_pair=(CELL_HOME="$TMP/fakehome" GH_REPO= REPO=
+             PR_DOCTOR_REPO=daniel-ospina/tortoise PR_DOCTOR_REPO_DIR="$TMP/co-install")
+mkdir -p "$TMP/co-install"
+git -C "$TMP/co-install" init -q 2>/dev/null || true
+git -C "$TMP/co-install" remote add origin https://github.com/daniel-ospina/tortoise.git 2>/dev/null || true
+
+env "${install_pair[@]}" PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=no \
     "$INSTALLER" --install >"$TMP/linger-no.out" 2>&1
 check "a user-scope install without linger is REFUSED (rc≠0)" 1 "$?"
@@ -554,7 +570,7 @@ if grep -q 'loginctl enable-linger' "$TMP/linger-no.out" \
 else
     bad "the linger refusal is not discriminating (out: $(tr -d '\n' <"$TMP/linger-no.out" | cut -c1-220))"
 fi
-env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
+env "${install_pair[@]}" PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=yes \
     "$INSTALLER" --install >"$TMP/linger-yes.out" 2>&1
 check "the same install with linger=yes succeeds (rc=0)" 0 "$?"
@@ -578,7 +594,7 @@ chmod +x "$TMP/claimbin/pgrep"
 # ⛔ EXPLICIT SCOPE, NEVER THE BOX'S OWN (measured the hard way, round 8): `UNIT_DIR=` empty does NOT mean
 # "just render" — the installer then probes `sudo -n true`, and on a cell where that succeeds it writes
 # into /etc/systemd/system. This arm did exactly that once. An explicit UNIT_DIR pins the whole fixture.
-env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
+env "${install_pair[@]}" PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
     "$INSTALLER" --install >"$TMP/census.out" 2>&1
 check "a live foreign --loop REFUSES the install (rc≠0)" 1 "$?"
@@ -595,7 +611,7 @@ kill -TERM -- -"$FOREIGN_PID" 2>/dev/null || kill -TERM "$FOREIGN_PID" 2>/dev/nu
 wait "$FOREIGN_PID" 2>/dev/null || true
 sleep 0.3
 cp "$TMP/stubbin/pgrep" "$TMP/claimbin/pgrep"
-env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
+env "${install_pair[@]}" PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
     "$INSTALLER" --install >"$TMP/census-gone.out" 2>&1
 check "the same install succeeds with no foreign loop (rc=0)" 0 "$?"
