@@ -2343,6 +2343,17 @@ case "$out" in *"tried 2 time(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R1: …and the refusal states how many recovery attempts were spent, so the residual is on the record" $rc
 grep -q '^lane-8	' "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null && rc=0 || rc=1
 ck "R1: …and the refusal still reaches the controller's refusal record, under the WORKER's name" $rc
+# ⛔ THE VERDICT MUST SURVIVE THE RECORD'S 240-CHAR CUT (review #3031 round 6, finding F3).
+# `wt_refusal_record` bounds every reason (`cut -c1-240`) so a refusal storm cannot fill the volume, and
+# the MEASURED line alone can spend most of that on `server status=` — so with the READING last, the
+# verdict this change exists to deliver was truncated OUT of the row the controller folds into its
+# `[pr]`/`[dispatch]` lines (measured: the row ended `… retry; READI`, with `FALSE CAUSE` gone). A row
+# that merely EXISTS is not the property; the VERDICT being in it is.
+case "$(cat "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null)" in
+  *"verdict=owner-running"*) rc=0 ;;
+  *) rc=1; cut -c1-240 "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null ;;
+esac
+ck "R1c: …and the RECORDED reason carries the verdict itself, not only a row that survived the 240-char cut" $rc
 # (R1b) THE RETRY BOUND IS A KNOB, NOT A WORD IN A DOC (review round 3, finding 2). The operator doc
 # claimed the ensure runs "once"; the code runs it up to WT_SERVER_ENSURE_ATTEMPTS (default 2), and the
 # doc now says so. An implementation that had quietly hardcoded ONE attempt would still satisfy R1 —
@@ -2369,6 +2380,23 @@ case "$out" in *"REFUSED lane-8"*) rc=1 ;; *) rc=0 ;; esac
 ck "R2: …and NO refusal recorded for a spawn that succeeded" $rc
 [ "$(grep -c 'CMUX layout apply' "$TMP/cmuxr2.log")" = "2" ] && rc=0 || { rc=1; cat "$TMP/cmuxr2.log"; }
 ck "R2: …because the create really WAS attempted twice (the recovery is exercised, not decorative)" $rc
+# (R2b) …AND IT MUST NOT BE CREDITED WITH A RECOVERY IT DID NOT MAKE (review #3031 round 6, finding F2).
+# `wt_cmux_session_ensure || true` discarded the ensure's status while the RECOVERED line said it
+# "answered on attempt N" — so a box whose ensure failed BOTH attempts but whose re-attempted create
+# succeeded (the flake this path exists for) produced evidence line asserting the opposite of what
+# happened. An arm that only ever makes `ensure` succeed cannot reach that state, so this one fails it.
+rm -rf "$TMP/OR2b" "$TMP/rstate2b"; : > "$TMP/ensure2b.log"
+out="$(CMUX_LAYOUT_FAIL_ONCE="$TMP/r2b.fail" CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure2b.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR2b" "$TMP/cmuxr2b.log" "$TMP/rstate2b" 2>&1)"
+rm -f "$TMP/r2b.fail"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2b: a create that succeeds on the re-attempt is still a SPAWN (rc=0) even when the ensure never answered" $rc
+case "$out" in *"did NOT answer (rc=1 after 2 attempt(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2b: …and the RECOVERED line reports the ensure's FAILURE, with the attempts spent and its rc" $rc
+case "$out" in *"answered on attempt"*) rc=1 ;; *) rc=0 ;; esac
+ck "R2b: …and it does NOT claim the ensure 'answered' — the false half the discarded status used to print" $rc
+case "$out" in *"so the ensure did NOT clear it"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2b: …and it names WHICH fact it has: the re-attempt carried the spawn, not the repair" $rc
 # (R3) a volume that IS short: the daemon's message is consistent, and RESTARTING A SESSION FREES NOTHING.
 rm -rf "$TMP/OR3" "$TMP/rstate3"; : > "$TMP/ensure3.log"
 out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure3.log" \

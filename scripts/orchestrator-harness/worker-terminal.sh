@@ -384,8 +384,12 @@ wt_cmux_probe_reading() {
         printf 'the durable session owner did NOT answer (`server status` carried a connection/no-server failure); the state volume could NOT be read, so it is NOT ruled out — the daemon cause is unconfirmed in both directions'
       fi ;;
     owner-running)
+      # ⛔ NO `short)` ARM HERE, DELIBERATELY (review #3031 round 6, finding F4). `wt_cmux_probe` gives a
+      # MEASURED-SHORT volume precedence over the owner reading, so `owner-running` already implies
+      # `WT_PROBE_SHORT=0` and `sp` can never be `short` on this arm: the sentence that used to live here
+      # ("BOTH readings are real, and the owner is the one that needs a human") was UNREACHABLE, so a
+      # reader of this ladder believed a state could be reported that no run can produce.
       case "$sp" in
-        short) printf 'the durable session owner answers `status running` yet could not allocate a workspace, AND the state volume is short — BOTH readings are real, and the owner is the one that needs a human' ;;
         fine)
           # ⛔ FALSE CAUSE IS A VERDICT ON A COMPLETE READING, AND IT IS ONLY SAYABLE THEN (review round 4,
           # finding F1). Inode exhaustion IS a disk-full cause, so a volume read on free space alone
@@ -1809,7 +1813,7 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
 }
 
 wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (reason on stderr)
-  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val srv_pvar srv_pval pre_rc preout premsg pre_where spout spmsg _larc _lamsg _recovered
+  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val srv_pvar srv_pval pre_rc preout premsg pre_where spout spmsg _larc _lamsg _recovered _ensrc _ensclaim
   [ "$#" -ge 3 ] || { wt_warn "wt_spawn needs <name> <cwd> <command>"; return 1; }
   name="$1"; cwd="$2"; shift 2; cmd="$*"
   wt_name_ok "$name" || { wt_warn "refusing a worker name with anything but [A-Za-z0-9-]: '$name'"; return 1; }
@@ -2003,8 +2007,14 @@ PY
     # `df` while a three-day-old session owner stayed unable to allocate. So on failure: measure first,
     # name only what was measured, then (and only when the reading says the SESSION is the finding, and
     # never when the volume is short) recover the surface once and re-attempt the create once. The
-    # re-attempt is safe against a half-created workspace: that name is this worker's own, and the
-    # existing reap (`wt_close_named_surface`) already closes a `wt-<name>` workspace with no record.
+    # re-attempt is safe against a half-created workspace: the target name is this worker's own, and a
+    # workspace left by the FAILED attempt carries no record, so it cannot be confused with a tracked
+    # worker. ⛔ The earlier draft also claimed `wt_close_named_surface` had already reaped it — IT HAS
+    # NOT (review #3031 round 6, finding F5): that reap is reached only from `wt_close`'s tmux arm and
+    # from the no-terminal_id branch, so a `wt-<name>` workspace created by the failed attempt survives a
+    # successful re-attempt. Closing it here is deliberately NOT done: this path is reached without a
+    # liveness re-check, so an unconditional reap of `wt-<name>` could end a LIVE lane holding that name —
+    # the one thing this file never does. Recorded as a residual on #2404.
     _larc=0
     out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
     if [ "$_larc" -ne 0 ]; then
@@ -2045,14 +2055,27 @@ PY
         else
           case "${WT_PROBE_VERDICT:-unreadable}" in
             owner-down|owner-running)
-              wt_cmux_session_ensure || true
+              # ⛔ THE ENSURE'S OWN EXIT STATUS IS KEPT, BECAUSE THE RECOVERED LINE IS EVIDENCE (review
+              # #3031 round 6, finding F2). It used to be discarded (`|| true`) while the line said,
+              # unconditionally, "the ensure answered on attempt N" — so with BOTH ensure attempts failing
+              # and the re-attempted create succeeding anyway, the one line that exists to expose a box's
+              # session-owner instability asserted a recovery that never happened: this change's own
+              # defect class (an instrument stating a cause it did not check) inside the sentence that
+              # reports the repair.
+              wt_cmux_session_ensure; _ensrc=$?
               _larc=0
               out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
               if [ "$_larc" -eq 0 ]; then
+                if [ "$_ensrc" -eq 0 ]; then
+                  _ensclaim="`cmux server ensure --session $(wt_cmux_session)` answered on attempt $WT_ENSURE_TRIES"
+                else
+                  _ensclaim="`cmux server ensure --session $(wt_cmux_session)` did NOT answer (rc=$_ensrc after $WT_ENSURE_TRIES attempt(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf '; last answer: %s' "$WT_ENSURE_SEEN" )), so the ensure did NOT clear it"
+                fi
                 # ⛔ A RECOVERY IS SAID OUT LOUD, because it is EVIDENCE ABOUT THE BOX: a spawn that needed
                 # the session ensured is a cell whose owner had stopped allocating, and the next cycle must
-                # be able to see that from the log rather than infer it from a spawn count.
-                wt_warn "RECOVERED $name: \`cmux layout apply\` failed once, \`cmux server ensure --session $(wt_cmux_session)\` answered on attempt $WT_ENSURE_TRIES, and the re-attempt SUCCEEDED — MEASURED: ${WT_PROBE_LINE}; READING: $(wt_cmux_probe_reading). The first failure's own message (NOT verified as a cause): ${_lamsg:-no output, exit status only}"
+                # be able to see that from the log rather than infer it from a spawn count. It also says
+                # WHICH fact this is — the ensure answering, or the re-attempt carrying the spawn alone.
+                wt_warn "RECOVERED $name: \`cmux layout apply\` failed once, $_ensclaim; the re-attempt SUCCEEDED — MEASURED: ${WT_PROBE_LINE}; READING: $(wt_cmux_probe_reading). The first failure's own message (NOT verified as a cause): ${_lamsg:-no output, exit status only}"
               else
                 _recovered=" — recovery: \`cmux server ensure --session $(wt_cmux_session)\` tried $WT_ENSURE_TRIES time(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf ' (last answer: %s)' "$WT_ENSURE_SEEN" ) and the re-attempt FAILED TOO; the residual is that the session owner must be repaired out of band (\`server stop --force\` + \`ensure\` is the recorded lever, and it ends every terminal inside the owner, so this spawn path does not take it)"
               fi ;;
@@ -2065,7 +2088,14 @@ PY
         fi
       fi
       if [ "$_larc" -ne 0 ]; then
-        wt_warn "REFUSED $name: cmux layout apply failed: MEASURED on this box — ${WT_PROBE_LINE:-no readings taken}; READING: $(wt_cmux_probe_reading)$_recovered. The daemon's own message, which this probe did NOT verify as the cause: ${_lamsg:-no output, exit status only}"
+        # ⛔ THE VERDICT LEADS, BECAUSE THE RECORD THE CONTROLLER READS IS CUT AT 240 CHARS (review #3031
+        # round 6, finding F3). `wt_refusal_record` bounds each reason (`cut -c1-240`), and the MEASURED
+        # line alone can spend most of that on `server status=` — so with the READING second, the verdict
+        # this change exists to deliver was truncated OUT of `spawn-refused.tsv` (measured: the row ended
+        # `… retry; READI`, and neither `FALSE CAUSE` nor `not on the disk` survived). The line now opens
+        # with the machine-readable verdict and the reading; the readings follow. The 240 bound is
+        # deliberately NOT raised: it exists so a refusal storm cannot become the next full volume.
+        wt_warn "REFUSED $name: cmux layout apply failed [verdict=${WT_PROBE_VERDICT:-unreadable} short=${WT_PROBE_SHORT:-0} owner=${WT_PROBE_OWNER:-unreadable}]: READING: $(wt_cmux_probe_reading)$_recovered; MEASURED on this box — ${WT_PROBE_LINE:-no readings taken}. The daemon's own message, which this probe did NOT verify as the cause: ${_lamsg:-no output, exit status only}"
         rm -f "$envf" "$runf"; return 1
       fi
     fi
