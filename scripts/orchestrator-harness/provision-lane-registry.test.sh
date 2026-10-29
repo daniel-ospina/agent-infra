@@ -390,21 +390,28 @@ run_it --apply --force
 chk "L5 --force drops it and the drop is REPORTED, never silent" \
     '[ "$RC" -eq 0 ] && [ "$(grep -vc "^#" "$ROSTER")" -eq 1 ] && case "$OUT" in *"dropped:"*) true;; *) false;; esac'
 
+# ⛔ AND NONE OF THE WIRING ARMS MAY USE A PIPE INTO A QUIET GREP (#3032 review P1). Every arm in
+# this block used `<producer> | grep -q …`, which is exactly the false-negative idiom
+# `scripts/check-no-sigpipe-grep.sh` reds this repo for (`sigpipe-grep` is a required PR check) — and
+# it broke the arms in BOTH directions: `grep -q` exits at the FIRST match, the producer takes
+# SIGPIPE (141), `pipefail` makes the pipeline non-zero, so a POSITIVE arm (G1/G2) fails on a call
+# site that is present, and a NEGATIVE arm (G4-G6, A16) passes on the regression it exists to catch.
+# The producer is now redirected to a file and read back, so no pipeline is involved at all.
 chk "G1 cloud-cell-bringup.sh PROVISIONS the roster (COMMENTS FILTERED: prose cannot satisfy this)" \
-    'grep -v "^[[:space:]]*#" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -qF "provision-lane-registry.py\" --apply"'
+    'grep -v "^[[:space:]]*#" "$ROOT/scripts/cloud-cell-bringup.sh" > "$T/g1.body" 2>/dev/null; grep -qF "provision-lane-registry.py\" --apply" "$T/g1.body"'
 chk "G2 cloud-cell-supervisor.sh PROVISIONS the roster (COMMENTS FILTERED: prose cannot satisfy this)" \
-    'grep -v "^[[:space:]]*#" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -qF "provision-lane-registry.py\" --apply"'
+    'grep -v "^[[:space:]]*#" "$ROOT/scripts/cloud-cell-supervisor.sh" > "$T/g2.body" 2>/dev/null; grep -qF "provision-lane-registry.py\" --apply" "$T/g2.body"'
 # The rc arms are the highest-stakes part of the change. They are pinned on the `-eq 3` branch
 # ITSELF, not on the neighbouring `-ne 0` branch: cycle 1's version asserted the wrong arm, so
 # replacing the rc-3 `warn` with `die` (which would false-block EVERY cell) left the suite green —
 # measured by mutation in cycle 2. A comment cannot satisfy these either, because the arm's body is
 # a call to `warn`/`log_line`, which a comment never contains.
 chk "G4 the bring-up's rc-3 arm WARNS, and never dies (a die would false-block every cell)" \
-    'grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -q "warn " && ! grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -q "die "'
+    'grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" > "$T/g4.seg" 2>/dev/null; grep -q "warn " "$T/g4.seg" && ! grep -q "die " "$T/g4.seg"'
 chk "G5 the supervisor's rc-3 arm WARNS, and never dies" \
-    'grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "log_line \"warn" && ! grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "die "'
+    'grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" > "$T/g5.seg" 2>/dev/null; grep -q "log_line \"warn" "$T/g5.seg" && ! grep -q "die " "$T/g5.seg"'
 chk "G6 rc 3 and the crash arm NEVER print the ok line (only the rc-0 arm is 'provisioned')" \
-    '! grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "ok: lane roster" && ! grep -A3 "rvrc\" -ne 0" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "ok: lane roster"'
+    'grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" > "$T/g6a.seg" 2>/dev/null; grep -A3 "rvrc\" -ne 0" "$ROOT/scripts/cloud-cell-supervisor.sh" > "$T/g6b.seg" 2>/dev/null; ! grep -q "ok: lane roster" "$T/g6a.seg" && ! grep -q "ok: lane roster" "$T/g6b.seg"'
 chk "G3 this suite is WIRED into the shard list (an unwired suite reds bash-suites by design)" \
     'bash "$ROOT/scripts/run-bash-shards.sh" --list | grep -qx "scripts/orchestrator-harness/provision-lane-registry.test.sh"'
 
