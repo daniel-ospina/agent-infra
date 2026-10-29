@@ -987,16 +987,24 @@ case "$CC_RC:$CC_TOKEN" in
     else
       echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) says re-record rather than re-review, but the re-record at head=$HEAD did not produce a clean head-bound record — falling through to a review, which is then the only remaining way to cover this head (fail-closed, and still cheaper than the unconditional review this block replaces)" >> "$L.log"
     fi ;;
-  3:*)
-    # Still unreadable after the retry. ⛔ DO NOT PAY and DO NOT MERGE ON A GUESS. Recovery is still
-    # worth one try: `--recover-body` reads the PR BODY, not the diff, so it can resolve this state
-    # when the diff read is what is contended.
+  3:unreadable)
+    # Still unreadable after the retry, and the verb SAID SO (its own token). ⛔ DO NOT PAY and DO NOT
+    # MERGE ON A GUESS: the contract is explicit that a failed read is not a changed artifact.
+    # Recovery is still worth one try — `--recover-body` reads the PR BODY, not the diff, so it can
+    # resolve this state when the diff read is what is contended.
     if _cc_recover; then
       :
     else
       echo "[merge $PR] check-carry=unreadable after a retry and no verified body marker covers head=$HEAD — NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle (a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
       exit 0
     fi ;;
+  3:*)
+    # ⛔ rc 3 WITHOUT the verb's token is NOT the verb's answer. `unreadable` is a value the RECORDER
+    # chooses; a recorder that does not implement `--check-carry` at all — an old copy, a stub, a
+    # wrapper — can also exit 3, and honouring that as "do not review" would stall the PR for ever on
+    # a verb the box cannot answer (the whole point of the token check at 0:*). Fall through to the
+    # review path, which is the pre-#2872 behaviour and converges.
+    echo "[merge $PR] check-carry rc=3 with token [${CC_TOKEN:-<none>}], not the verb's own 'unreadable' — this box may not implement the verb at all, so a review is owed rather than a stall" >> "$L.log" ;;
   4:*)
     # No record anywhere on this box: the #2872 case. The verdict may still travel in the body.
     if _cc_recover; then
