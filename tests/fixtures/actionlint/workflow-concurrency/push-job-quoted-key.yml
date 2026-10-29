@@ -1,0 +1,9 @@
+# The flow-mapping job search accepted only a DOUBLE-quoted key, while the line-prefix test accepted
+# both quote styles — one character of quoting defeated R0, and a job-level block GitHub honours went
+# unreported (#2660 round 8).
+name: Push job quoted key
+on:
+  push:
+    branches: [main]
+jobs:
+  build: {runs-on: ubuntu-latest, steps: [{run: echo ok}], 'concurrency': {group: push-job-quoted-key, cancel-in-progress: true}}
