@@ -165,6 +165,10 @@ case " $* " in
     if [ -n "${FAKE_PS_SEQ_DIR:-}" ]; then
         N=0; [ -f "$FAKE_PS_SEQ_DIR/.n" ] && N="$(cat "$FAKE_PS_SEQ_DIR/.n")"
         N=$((N + 1)); printf '%s' "$N" >"$FAKE_PS_SEQ_DIR/.n"
+        # `N.fail` makes THIS reading FAIL, which the lsof shim could already express and this one
+        # could not. A failed re-probe is the removal path's own fail-closed branch (review round 10,
+        # P1/P2), and without a way to produce one on the ps side neither arm could exist.
+        if [ -f "$FAKE_PS_SEQ_DIR/$N.fail" ]; then exit 1; fi
         if [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
         last="$(ls "$FAKE_PS_SEQ_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
         if [ -n "$last" ] && [ -f "$FAKE_PS_SEQ_DIR/$last" ]; then cat "$FAKE_PS_SEQ_DIR/$last"; exit 0; fi
@@ -2448,6 +2452,63 @@ assert_contains "$(row_for "$OUT" "$WT_CAP")" "reason=live" \
     "G2721m a TRUNCATED holder scan PRESERVES the checkout (it is never read as unheld)"
 assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "STALE-SHELL-SCAN TRUNCATED" \
     "G2721m ...and the pass names the truncation, so the preservation is explainable"
+
+# ── G2721n: a FAILED ps re-probe must not weaken the pass's witness set (review round 10, P1) ──
+# `ps_load` reassigns `PS_OUT` BEFORE it can fail, so the pre-fix `holder_recheck` returned with
+# `PS_OUT` pointing at a NEW EMPTY table: the pass's good table was orphaned (leaked), and EVERY
+# LATER row of the pass was then classified against an empty one. `live_process_for` begins
+# `[ -s "$PS_OUT" ] || return 1`, so "empty" reads as "no argv holder" — the state `ps_load`'s own
+# header names a probe FAILURE and never "no live processes". Reading #1 carries a live argv holder
+# for the SECOND worktree; #2 (the FIRST worktree's re-probe) FAILS. The first checkout must be
+# preserved either way (that half already worked and is the control), and the SECOND must still come
+# back `reason=live` — pre-fix it reads `reclaimable`, because the table it needed was thrown away.
+ENV=G2721n; REPO="$(mk_repo $ENV)"
+WT_PF_FIRST="$(add_named_wt "$REPO" "$ENV-first" feat/g2721n-first)"
+WT_PF_LATER="$(add_named_wt "$REPO" "$ENV-later" feat/g2721n-later)"
+for w in "$WT_PF_FIRST" "$WT_PF_LATER"; do mkdir -p "$w/.venv"; printf 'x\n' >"$w/.venv/marker"; done
+mkdir -p "$T/seq-gn" "$T/seq-gn-tmp"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n9601 1 /usr/bin/python3 %s/.venv/bin/python\n' \
+    "${REAP_WT_SELF_PID:-1}" "$(cd "$WT_PF_LATER" && pwd -P)" >"$T/seq-gn/1"
+: >"$T/seq-gn/2.fail"
+rm -f "$T/seq-gn/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gn" TMPDIR="$T/seq-gn-tmp" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_dir "$WT_PF_FIRST" "G2721n (control) a re-probe that cannot read the process table PRESERVES its checkout"
+assert_contains "$OUT" "(live-probe-unavailable)" \
+    "G2721n …and names the lost probe, so the preservation is explainable"
+assert_contains "$(row_for "$OUT" "$WT_PF_LATER")" "reason=live" \
+    "G2721n …and the pass's own table is RESTORED, so the NEXT row still sees its argv holder"
+left="$(ls "$T/seq-gn-tmp" 2>/dev/null | grep -cE '^pi-reap-ps\.' || true)"
+assert_eq "$left" "0" "G2721n …and the abandoned table is not leaked into the volume (leaked: ${left})"
+
+# ── G2721o: a degraded cwd RE-READ still preserves, even after an earlier read SUCCEEDED ──────
+# `CWD_DEGRADED` was a LATCH: set by any failure, cleared NOWHERE. So `holder_recheck`'s "the pass HAD
+# a good cwd table and the re-read lost it" guard keyed on the flag's LIFETIME, not on the table in
+# hand — and after one transient failure it could never fire again. Reachable ordering, no execution
+# needed: (1) the pass-start `lsof` times out ⇒ flag=1; (2) the FIRST removal's re-read SUCCEEDS ⇒
+# the table is good but the flag stays 1, so its guard is skipped (correct, by luck); (3) the SECOND
+# removal's re-read FAILS ⇒ the guard is skipped because the flag is still 1, `holders_live` runs
+# ARGV-ONLY, and the checkout is deleted on a witness set the pass no longer has. That is verbatim the
+# round-2 P1 this file claims closed, in a second ordering. A lane's own `pi` has cwd = the worktree
+# and argv = the INSTALLED path, so cwd is that holder's ONLY witness.
+ENV=G2721o; REPO="$(mk_repo $ENV)"
+WT_LAT_OK="$(add_named_wt "$REPO" "$ENV-ok" feat/g2721o-ok)"
+WT_LAT_TRAP="$(add_named_wt "$REPO" "$ENV-trap" feat/g2721o-trap)"
+for w in "$WT_LAT_OK" "$WT_LAT_TRAP"; do mkdir -p "$w/.venv"; printf 'x\n' >"$w/.venv/marker"; done
+mkdir -p "$T/seq-go"
+: >"$T/seq-go/1.fail"                              # pass start: lsof times out → flag=1, empty table
+printf 'p9999\nn/usr/local\n' >"$T/seq-go/2"      # first removal's re-read SUCCEEDS → flag must clear
+cp "$T/seq-go/2" "$T/seq-go/3"                    # …and again immediately before its fork
+: >"$T/seq-go/4.fail"                              # second removal's re-read FAILS
+rm -f "$T/seq-go/.n"
+OUT="$(FAKE_LSOF_SEQ_DIR="$T/seq-go" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_nodir "$WT_LAT_OK" \
+    "G2721o (control) a GOOD re-read after a degraded pass start proceeds — the guard is not a blanket refusal"
+assert_dir "$WT_LAT_TRAP" \
+    "G2721o …but a LATER failed re-read still PRESERVES: one transient failure must not disarm the guard"
+assert_contains "$OUT" "(live-probe-unavailable)" \
+    "G2721o …and names the probe it lost, so the preservation is explainable"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
