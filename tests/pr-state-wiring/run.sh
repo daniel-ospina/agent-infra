@@ -82,8 +82,18 @@ ck "seam: an unreadable SHAPE from the router is 'unavailable', not an action (r
 # B. THE FIXER — pr-sickness.sh ps_decide
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # The driver sources the module and stubs the seams it declares overridable: the verdict (a RED at
-# this head), the claim (nobody holds it), liveness (nothing alive), the spawn (recorded, not run),
-# and the pass-scoped queue verdict (ok).
+# this head), the claim (nobody holds it), liveness (nothing alive), and the spawn (recorded, not
+# run).
+# ⛔ THE RIG STAYS AFTER #2927 EVEN THOUGH ITS QUEUE STUB IS GONE, because `ps_decide` is the seam
+# this suite exists for (agent-infra #2866, indicator (4)) and the queue was never what it drove. What
+# it exercises now is the ROUTER's answer reaching the FIXER: `WAIT:inherited-red` and `RERUN-FLAKE`
+# demoting to no spawn, `FIX-RED` still spawning, and `unavailable` fixing exactly as it did before.
+# None of those four depend on a queue reading, so none of them lost a dependency when the gate went.
+# The `PS_QV` / `PS_QRC` / `PS_QFIELDS` globals this driver used to set WERE the pass-scoped queue
+# verdict (`ps_queue_verdict`) — a seam that no longer exists: #2927 deleted the function and
+# `ps_decide` reads no queue depth by design. They were therefore DELETED rather than left looking
+# load-bearing, because a stub for a function that is gone reads as coverage that is not there. Do not
+# re-add them without re-adding the function they fed.
 FIXDRV="$T/fixdrv.sh"
 cat > "$FIXDRV" <<'EOS'
 #!/usr/bin/env bash
@@ -94,9 +104,6 @@ ps_claim_stub() { return 0; }
 ps_spawn_stub() { printf '%s\n' "$1" >> "$SPAWNED"; return 0; }
 ps_verdict() { printf 'RED\tci/unit\t404\t99\tfailure\tci/unit\n'; return 0; }
 PS_STATE_DIR="$FIXSTATE"; mkdir -p "$PS_STATE_DIR"
-PS_QV="$(printf 'ok\tq=0 r=5 ceiling=20 source=stub')"
-PS_QRC=0
-PS_QFIELDS="q=0 r=5 ceiling=20 source=stub"
 PS_DRY_RUN=0
 ps_decide "daniel-ospina/tortoise" 7 "$SHA" "b-7" 0
 exit $?

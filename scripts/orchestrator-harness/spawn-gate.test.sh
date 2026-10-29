@@ -15,6 +15,16 @@
 # retired/do-merge.sh, and it made three checks here pass on an empty file while writing this port.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ⛔ THE CAPABILITY GATE IS DISABLED FOR EVERY ARM EXCEPT ITS OWN (agent-infra#2935). `run_agent` now
+# measures the box — one bounded `pi` call — immediately before every launch. Most arms in this file
+# drive it with a stub `pi` (a sleeper, an echo, a fork storm) that never emits the probe's answer
+# token, so with the gate live those arms would spend up to 2 x LANE_PREFLIGHT_BOUND on a stub and then
+# be REFUSED 71 by a gate they are not testing — an arm about the LOAD/DISK/watchdog gate reporting a
+# capability refusal. The capability block re-enables it explicitly with `LANE_PREFLIGHT=1`, and its
+# arms are the assertion that the gate runs at all; delete this line and the whole file turns the gate
+# back on, which is how you prove the line is load-bearing rather than decorative.
+export LANE_PREFLIGHT=0
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
@@ -133,11 +143,25 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `LANE_MEM_MB` is 512, so the token pair matches. That made this shard RED on `main` for every PR
   # that rebased onto it (found while rebasing #2323: `got_pi` carried `ai-drainer.sh`). Excluded by
   # name, with its own non-launcher assertion below — the same ruling, not a second exception class.
+  # ⛔ `orphaned-harness.sh` IS THE THIRD OF THAT CLASS (#2867/#2871, `49115c1e6`). It is a READ-ONLY
+  # reporter ("never stops a unit, never kills a session, never deletes anything") that quotes
+  # `pi -p --no-session` when explaining why a lane leaves no transcript. Its only `-p` tokens in
+  # CODE are `ps -o comm= -p <pid>` and `systemctl show -p ExecStart`, and NEITHER co-occurs with
+  # `--no-session` — so the pair that matched is prose, exactly like `ai-drainer.sh`. It landed after
+  # this census and put the shard RED on `main` for every PR that rebased onto it. Excluded by name,
+  # with its own non-launcher assertion below.
+  # ⛔ `harness-refresh.sh` IS THE FOURTH OF THAT CLASS (landed on `main` in #2647/#2958, `0a3af0ced`/
+  # `191078ad4`). It restarts NOTHING pi-shaped: its only `-p` tokens in CODE are `ps -p <pid>` (five
+  # sites, including `ps -o etime= -p`), and every `--no-session` is prose explaining why a lane child
+  # leaves no trace in the session store (`harness-refresh.sh:749,751,894`). Found RED here while
+  # rebasing this branch onto current `main`: `got_pi` carried `harness-refresh.sh`, i.e. a fourth
+  # instance of the exact class this list exists for — a census that reddens on PROSE teaches the next
+  # lane to ignore it. Excluded by name, with its own non-launcher assertion below.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -159,7 +183,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # the #2163 launcher, which carries no wrapper BY DESIGN (see its own assertion below). The assertion
 # is deliberately an EQUALITY, so each residual is asserted rather than left silent, and a NEW
 # pi-invoker — or a regression in these — fails it.
-EXPECTED_PI="lane-exec.sh merge-one.sh spawn-gate.sh"
+EXPECTED_PI="cell-lane-preflight.sh lane-exec.sh merge-one.sh spawn-gate.sh"
 got_pi="$(scan_pi 'scripts/orchestrator-harness/*' | sed "s#scripts/orchestrator-harness/##g")"
 [ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
@@ -176,7 +200,7 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # load gate at the spawn point, and its rc=76 refusal is handled explicitly (exit 75, nothing
 # consumed) — but no load gate of its OWN, so it belongs in this list by name, not silently.
 # `scripts/orchestrator-harness/lane-exec.sh` (#2163) is the launcher that `exec`s pi (declared below).
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/cell-lane-preflight.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
@@ -201,8 +225,33 @@ ck "the excluded pi-done-not-exited.py is a NON-launcher (carries no spawn primi
 # puts the pair back and this arm goes RED — the exclusion cannot swallow one.
 _nl_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
 _nl_code="$(sed 's/#.*//' "$HERE/ai-drainer.sh" 2>/dev/null)"
-if printf '%s' "$_nl_code" | grep -qE -e "$_nl_flag" && printf '%s' "$_nl_code" | grep -qF -- '--no-session'; then rc=1; else rc=0; fi
+if grep -qE -e "$_nl_flag" <<<"$_nl_code" && grep -qF -- '--no-session' <<<"$_nl_code"; then rc=1; else rc=0; fi
 ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gated dispatchers; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+# …and the same proof for orphaned-harness.sh (#2867/#2871). Its `-p` tokens are `ps -p <pid>` and
+# `systemctl show -p ExecStart`, so WITH the comments stripped neither the flag nor its `--no-session`
+# partner survives as a pair. A real launch added to that file (in code) puts the pair back and this
+# arm goes RED — the exclusion cannot swallow one, and it is the detector's own predicate, not a list
+# of verbs this test hopes is complete. (`_oh_code`, not a reuse of `_nl_code`: the ai-drainer arm
+# above keeps its own captured code, so neither arm can be read as asserting the other's file.)
+_oh_code="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
+if grep -qE -e "$_nl_flag" <<<"$_oh_code" && grep -qF -- '--no-session' <<<"$_oh_code"; then rc=1; else rc=0; fi
+ck "the excluded orphaned-harness.sh is a NON-launcher in CODE (a read-only orphan REPORT whose -p tokens are ps/systemctl flags; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+
+# …and the same proof for orphaned-harness.sh, which this census found RED on `main` after #2871 and
+# which is the SAME false-positive class the detector's STATED LIMITS paragraph names: it carries `-p`
+# because it runs `ps -p <pid>` and `--no-session` because it EXPLAINS the lane invocation it looks for
+# in the process table. It launches nothing. Stripping the comments does not fix this one — the `-p` is
+# in CODE (`ps -p`), so the assertion is the detector's own named criterion (a SPAWN PRIMITIVE) rather
+# than the ai-drainer probe above: a real launcher added to this file brings `run_agent`/`nohup`/`&`
+# with it, and this arm goes RED.
+if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' "$HERE/orphaned-harness.sh" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded orphaned-harness.sh is a NON-launcher (no spawn primitive; its '-p' is 'ps -p'), so its census exclusion hides no launch path" $rc
+
+# ... and the same proof for harness-refresh.sh, the fourth file of that class (see the exclusion list).
+# It restarts a CONTROLLER through launchctl/systemctl, which is why the primitive list is the same one:
+# a real `pi` launch added to it brings `exec pi`/`run_agent`/`nohup` with it and this arm goes RED.
+if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' "$HERE/harness-refresh.sh" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded harness-refresh.sh is a NON-launcher (no spawn primitive; its '-p' is 'ps -p'), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -563,11 +612,16 @@ printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' 
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
-# `ci-queue.sh` now gates EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue defers
-# (fail-closed — an unreadable queue is not an empty one). The `gh` stub above FAILS every call by
-# design (the arms below need a failing `gh pr view`), so without a genuine reading every fixer arm
-# would be deferred before it ever reached the load/disk gate it exists to test: six "load-gate
-# regressions" that are not regressions. That is what these seven arms reported before this stub
+# ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
+# because `ci-queue.sh` gated EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue
+# defers (fail-closed — an unreadable queue is not an empty one), while the `gh` stub above FAILS
+# every call by design (the arms below need a failing `gh pr view`) — so without a genuine reading
+# every fixer arm was deferred before it reached the load/disk gate it exists to test. The fixer arms
+# no longer consult the module at all (a fixer is REPAIR), so this rig currently changes no verdict.
+# It stays because (a) `fix-one.sh`/`adopt-fix.sh` and the arms must still pass on a box where the
+# module IS installed and answering, which is the production shape, and (b) it is the seam that goes
+# live again the moment any arm re-acquires a read — and a future lane deleting it as "dead setup"
+# would be re-introducing exactly the six false "load-gate regressions" it was written to stop. That is what these seven arms reported before this stub
 # existed, on a tree where nothing was wrong with the load gate.
 # ⛔ THE READING IS SUPPLIED, NOT THE GATE SWITCHED OFF. `gh-queue` answers ONLY the three endpoints
 # `ci-queue.sh` reads, with a SHALLOW queue (1 queued, 0 running, 3 runners → ceiling 6) — the
@@ -1121,6 +1175,172 @@ ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load re
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the disk gate on a disk refusal" $rc
 
+# ── THE CAPABILITY GATE (agent-infra#2935) — the wiring, not the probe ───────────────────────
+# The probe's own arms live in `cell-lane-preflight.test.sh` (stub `pi`: answer+return, answer+never
+# return, never answer, …). What THIS arm pins is the half a unit test cannot see: that `run_agent`
+# asks the box at all, that a DETERMINISTIC verdict REFUSES with its own code, and that a verdict
+# which could be a transient does NOT. A box that answers and never returns is the shape that cost 12
+# of the fleet's 16 LLM-capable cores for a week; a box that merely failed to answer once is a
+# network blip, and refusing on that would stop the fleet.
+# ⛔ `run_agent` DIRECTLY, not through lane.sh: lane.sh is gated by the land-backlog ratio first
+# (`AGENT_LAND_BACKLOG`, 74) and this repo is genuinely over its ceiling, so a lane.sh route would
+# never reach the launch — the arm would be green (or red) for the wrong reason. The capability gate
+# is the LAST gate before the launch, which is exactly what sourcing the helper directly tests.
+cat > "$TMP/bin/pi" <<'PICAP'
+#!/bin/sh
+printf '%s\n' "$*" >> "${PI_LOG:-/dev/null}"
+exit 0
+PICAP
+chmod +x "$TMP/bin/pi"
+mkfake() { # mkfake <verdict-line> <exit>
+  { echo '#!/usr/bin/env bash'; echo "echo \"$1\""; echo "exit $2"; } > "$TMP/fake-preflight.sh"
+  chmod +x "$TMP/fake-preflight.sh"
+}
+cap_run() { # cap_run [VAR=value…] -> sets CRC; PI_LOG reflects what actually ran
+  # ⛔ `env`, NOT `VAR=… "$@" cmd`: an assignment that arrives through "$@" is an ARGV WORD, not an
+  # assignment, so the shell tries to exec `CELL_PREFLIGHT_SH=…` and exits 127 — which reads as "the
+  # gate refused" to anyone skimming. (Measured: rc=127 on all three arms before this note existed.)
+  : > "$PI_LOG"
+  env PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer "$@" \
+    bash -c '
+      . "$1"
+      LOG="$2"; PROMPT="$3"
+      load1() { printf "1"; }
+      run_agent 30 "$LOG" "$PROMPT" "capability test" >/dev/null 2>&1
+    ' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null
+  CRC=$?
+}
+# (a) answered-but-never-returned → REFUSED 71, and NO agent was started
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=exit-hang host=x answered_ms=2008 alive_at=30s' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "an answered-but-never-returned box is REFUSED with the capability code 71 and starts NO agent (rc=$CRC)" $rc
+grep -q 'LANE_CAPABILITY=refused why=exit-hang' "$LOG"; rc=$?
+ck "...and the lane log carries the READING it refused on (answered_ms … alive_at …)" $rc
+grep -q 'capability-gate. REFUSED' "$LOG"; rc=$?
+ck "...and NAMES the gate, so a refused spawn is not read as a cap kill or a load refusal" $rc
+# (b) no-answer → WARN and PROCEED (a transient must never arm a refusal)
+# ⛔ THE SHAPE MATTERS HERE, not just the word: `why=no-answer` means the process RETURNED, which is
+# the only shape a transient takes, so this fixture carries `returned_ms=` and `rc=`. The earlier
+# fixture was `alive_at=30s attempts=2` — a HANG wearing the WARN-side word — which the preflight can
+# no longer emit (a hang now reports `why=no-return`), so the arm was pinning a reading the probe does
+# not produce. A fixture that has drifted from the artifact tests the fixture.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=no-answer host=x returned_ms=1042 rc=1 attempts=2 bound=45s' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "an unanswered probe WARNS and still dispatches (rc=$CRC, never 71, agent ran) — a transient cannot arm a refusal" $rc
+grep -q 'capability-gate. WARN' "$LOG"; rc=$?
+ck "...and the WARN names the reading, so a stall that follows has a starting point" $rc
+# (c) the declared escape
+: > "$LOG"
+cap_run LANE_PREFLIGHT=0 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ] && ! grep -q 'capability-gate' "$LOG"; }; rc=$?
+ck "LANE_PREFLIGHT=0 is a real escape (rc=$CRC, no capability line written)" $rc
+# (d) A PERMANENT PRE-ANSWER HANG REFUSES. This is the arm the gate was vacuous for (review of #2991,
+# P1): a box that never produces the token could only ever emit `why=no-answer` and was dispatched
+# anyway, for ever.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=no-return host=x never_answered alive_at=45s attempts=2 bound=45s' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a box that hangs BEFORE the answer is REFUSED 71 and starts NO agent (rc=$CRC)" $rc
+grep -q 'LANE_CAPABILITY=refused why=no-return' "$LOG"; rc=$?
+ck "...and the log carries the pre-answer reading (never_answered alive_at …)" $rc
+# (e) rc=2 CANNOT MEASURE refuses too — the probe's own EXIT contract says so, and the caller ignored
+# it: an unreadable/empty keys.env was warned-and-dispatched, i.e. a lane started with no credential
+# burned the 3300 s cap and reported `(no response)` at the end.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=keys-unreadable host=x path=/home/cell/keys.env DEEPSEEK_API_KEY=unset' 2
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that CANNOT MEASURE (rc=2, keys unreadable) is REFUSED, not dispatched (rc=$CRC)" $rc
+grep -q 'credential could not be read' "$LOG"; rc=$?
+ck "...and the refusal names the remedy that applies (provision the key), not the extension set" $rc
+# (f) POLARITY: a reason THIS FILE HAS NEVER HEARD OF refuses. The first cut matched two substrings and
+# warned on everything else, so the fifth code arrived with no reader and a future reason would silently
+# inherit the permissive arm — the same defect class, one release later.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=some-future-verdict host=x attempts=1' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "an UNRECOGNISED refusal reason refuses (polarity, not an allow-list) (rc=$CRC)" $rc
+# (g) A VERDICT THAT NEVER CAME warns: a probe that could not run is not a verdict about the box.
+mkfake '' 1
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that produced NO verdict at all WARNS and dispatches (rc=$CRC, agent ran)" $rc
+# (h) A REFUSAL RESTORES THE CALLER'S JOB CONTROL. `set -m` is turned on above the gate and restored
+# after the launch, so the early return was the one path that left the caller with job control ON —
+# and with it on, an async command in the caller no longer gets its stdin from /dev/null (#2163).
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=exit-hang host=x answered_ms=2008 alive_at=45s' 3
+mstate="$(env PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh" \
+  bash -c '
+    . "$1"
+    LOG="$2"; PROMPT="$3"
+    load1() { printf "1"; }
+    set +m 2>/dev/null
+    run_agent 30 "$LOG" "$PROMPT" "jobctl test" >/dev/null 2>&1
+    case $- in *m*) echo MONITORING_ON ;; *) echo MONITORING_OFF ;; esac
+  ' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null)"
+[ "$mstate" = "MONITORING_OFF" ]; rc=$?
+ck "a capability refusal leaves the caller's job control as it found it (got '${mstate:-<empty>}')" $rc
+# (i) THE RESOLVER, RESOLVED THE WAY A REAL BOX DOES IT: `CELL_PREFLIGHT_SH` UNSET. Every arm above
+# pre-sets the cache, so they exercise the short-circuit and nothing else — which is why the first cut
+# of this gate shipped with `CELL_PREFLIGHT_SH` uninitialised under `set -u`: the resolver aborted
+# inside the command substitution, `run_agent` took the "not found" fail-open, and the gate never ran
+# on any box while this suite was green (review of #2991, P0).
+RES="$TMP/resolve"; mkdir -p "$RES/bin"
+cp "$HERE/spawn-gate.sh" "$RES/spawn-gate.sh"
+cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
+cat > "$RES/bin/pi" <<'PIHANG'
+#!/bin/sh
+case "$1" in --version) echo 9.9.9-stub; exit 0 ;; esac
+sleep 600
+PIHANG
+chmod +x "$RES/bin/pi"
+: > "$LOG"
+env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
+  LANE_PREFLIGHT_BOUND=2 \
+  bash -c '
+    . "$1"
+    LOG="$2"; PROMPT="$3"
+    load1() { printf "1"; }
+    # ⛔ THIS ARM MUST NOT INHERIT THE SUITE`S STUB. The fixture stubs `pi` as an exported bash FUNCTION
+    # (`export -f pi`, above), and a function outranks a PATH lookup in every descendant shell — so the
+    # probe resolved the suite`s echo-stub instead of $RES/bin/pi and reported an absent answer for a
+    # box the arm hung on purpose (measured: rc=0, the gate warned and dispatched). This is the only arm
+    # that runs the REAL probe, so it is the only one that has to drop the function; production has no
+    # such function, only the shim on PATH.
+    unset -f pi 2>/dev/null || true
+    run_agent 30 "$LOG" "$PROMPT" "resolver test" >/dev/null 2>&1
+  ' _ "$RES/spawn-gate.sh" "$LOG" "$PROMPT" 2>/dev/null
+rrc=$?
+{ [ "$rrc" -eq 71 ] && grep -q 'LANE_CAPABILITY=refused why=no-return' "$LOG"; }; rc=$?
+ck "the resolver finds the helper through the FILESYSTEM with CELL_PREFLIGHT_SH unset, and the probe RUNS (rc=$rrc)" $rc
+{ ! grep -q 'cell-lane-preflight.sh not found' "$LOG"; }; rc=$?
+ck "...and does not log the false 'not found' WARN that the unbound-variable abort produced" $rc
+
+# ── EVERY REFUSAL CODE MUST HAVE A READER (review of #2991, P1) ──────────────────────────────
+# A refusal code that no caller CLASSIFIES is worse than no gate: the box is refused correctly and the
+# operator is handed another gate's remedy. Measured on the first cut of #2935 — `AGENT_CAPABILITY_REFUSED`
+# (71) was defined here, returned here, and named by NOTHING else, so `lane.sh` fell through to
+# `_cap_gate=load` and published "load gate refused — issue returns to the queue" one line under this
+# file's own "This does NOT clear by waiting". `fix-one.sh` published "re-dispatched when 1-min load
+# falls", `chain-merge.sh` mapped it to 75 and `adopt-fix.sh` wrote no line at all.
+# This asserts the GENERAL property rather than the one instance: for every `AGENT_*_REFUSED=<code>`
+# this helper defines, some caller must name it. A sixth code added tomorrow without a reader is red
+# here, which is the only version of this guard worth having.
+_unread=""
+for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$HERE/spawn-gate.sh" | sort -u); do
+  grep -q "$_code" "$HERE/lane.sh" "$HERE/fix-one.sh" "$HERE/chain-merge.sh" \
+      "$HERE/adopt-fix.sh" "$HERE/nonblocking-dispatch.sh" 2>/dev/null || _unread="$_unread $_code"
+done
+[ -z "$_unread" ]; rc=$?
+ck "every AGENT_*_REFUSED code has a READER in its callers (unread:${_unread:- none})" $rc
+
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,
 # every git op failing) and 2026-10-16 05:13Z, when the controller died writing its own log
@@ -1575,6 +1795,19 @@ CWT="$CREPO/.worktrees/cap-1"
 # A linked worktree shares the repository config, so this origin is what `git -C "$CWT" remote`
 # answers for the arms' cwd.
 git -C "$CREPO" remote add origin https://github.com/owner/repo.git
+# ⛔ AND ITS TRANSPORT IS LOCAL (agent-infra#2834). The exit-path rescue now runs at the end of EVERY
+# `run_agent`, so the cap arms below — which leave the worktree DIRTY on purpose — would otherwise
+# attempt a real `git fetch`/`git push` against github.com from a test suite that promises to touch no
+# real state. `url.<bare>.insteadOf` rewrites the TRANSPORT only: `repo-slug.sh` reads
+# `git config --local --get remote.origin.url` and still sees the GitHub slug the creation gate needs
+# (a local `remote set-url` would be refused 74 by THAT gate), while the rescue's fetch and push land
+# in this bare repo. Hermetic, and it lets these arms exercise the rescue instead of skipping it.
+git init -q --bare -b main "$CAPRIG/origin.git"
+git -C "$CREPO" config url."$CAPRIG/origin.git".insteadOf https://github.com/owner/repo.git
+# The rescue builds its archive with `git commit-tree`, which needs an AUTHOR IDENTITY of its own; the
+# fixture's per-commit `-c user.email=…` would leave it with none, and the arm would then be measuring
+# a missing identity rather than the cap.
+git -C "$CREPO" config user.name t; git -C "$CREPO" config user.email t@t
 printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$CAPRIG/bin/gh"
 chmod +x "$CAPRIG/bin/gh"
 # A worker that never finishes inside the cap. (arm 6 replaces it with one that IGNORES SIGTERM;
