@@ -10,6 +10,8 @@
 #   OH5  a stock OS unit (dbus) is never read as an orphan
 #   OH6  a harness unit on an existing durable path is NOT named
 #   OH7  when NEITHER surface can be read, the report exits 2 (never a false "nothing to report")
+#   OH8  a just-spawned session (no `pi` descendant YET) is NOT named — the floor's too-young side
+#   OH9  a session 300 s old is NOT named — the floor is measured in MINUTES, not seconds
 #
 # Mutations (same shape as claim-action-proof.test.sh) revert each judgeable rule in a temp copy
 # and require the paired case to go RED, proving the rule is load-bearing.
@@ -91,6 +93,7 @@ run_report() {
 NOW="$("$REAL_DATE" +%s)"
 OLD=$((NOW - 1000))   # 1000 s old -> past MIN_SESSION_AGE_S (600): reportable
 NEW=$((NOW - 5))      # 5 s old -> still launching: must NOT be named
+MID=$((NOW - 300))    # 300 s old -> past a five-minute floor, well inside a ten-minute one
 
 # ── OH1/OH2: dead lane named with its PR, live lane not named ──────────────────────────────
 # sessions: "name created"; panes: "name pane_pid"; procs: "pid comm ppid".
@@ -127,6 +130,26 @@ if grep -q 'name=merge-10092' <<< "$OH8"; then
   bad "OH8 a just-spawned dead-looking session (younger than MIN_SESSION_AGE_S) is NOT named"
 else
   ok "OH8 a just-spawned dead-looking session (younger than MIN_SESSION_AGE_S) is NOT named"
+fi
+
+# ── OH9: THE FLOOR'S MAGNITUDE — 300 s is inside it, and a five-minute floor would break it ──
+# OH8 (5 s) and OH1 (1000 s) bracket the floor, but the bracket is a factor of 200 wide: a floor
+# lowered to 60 — still "a minute of grace", still green on both — would report every lane for its
+# first minute, which is the same unreadable-report failure at a smaller scale. MID (300 s) closes
+# that gap and is deliberately NOT the exact boundary: the report reads the WALL CLOCK, so a fixture
+# 599 s old is 600 s old one second later and could not pin an integer boundary without flaking. The
+# EXACT 600 is pinned by the registry's `value` field, in the `MIN_AGE` row's precedent
+# (agent-infra#2788).
+write_scen \
+  "merge-10093 $MID\n" \
+  "merge-10093 400\n" \
+  "400 bash 0\n" \
+  "" ""
+OH9="$(run_report)"
+if grep -q 'name=merge-10093' <<< "$OH9"; then
+  bad "OH9 a session 300 s old (well inside a ten-minute floor) is NOT named"
+else
+  ok "OH9 a session 300 s old (well inside a ten-minute floor) is NOT named"
 fi
 
 # ── OH3/OH4/OH5/OH6: unit signals ───────────────────────────────────────────────────────────
