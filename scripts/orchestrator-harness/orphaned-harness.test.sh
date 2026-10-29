@@ -116,8 +116,9 @@ fi
 # ── OH8: THE FLOOR IS A TRUE FLOOR — a just-spawned session is NEVER named ─────────────────
 # `NEW` (5 s old) is the shape of a worker that has been spawned and is still launching its agent: it
 # has no `pi` descendant YET. Naming requires BOTH `dead` (NO live `pi` descendant) AND age >= the
-# floor, so without a floor this LAUNCH window — seconds, not the whole 600 s — would be reported as an
-# orphan, exactly when an operator is hunting the real orphans. (A lane that HAS spawned `pi` is not
+# floor, so without a floor this LAUNCH window — from spawn until `pi` exists, not the whole 600 s —
+# would be reported as an orphan, exactly when an operator is hunting the real orphans. (A lane that HAS
+# spawned `pi` is not
 # named at any age: OH2's 1000 s-old live session is never named. The 600 s is a GRACE, and the other
 # window it covers is a session whose agent has already exited — that one is genuinely dead, merely
 # between incarnations.)
@@ -138,8 +139,11 @@ fi
 
 # ── OH9: THE FLOOR'S MAGNITUDE — a floor lowered to five minutes or less is caught ────────
 # OH8 (5 s) and OH1 (1000 s) bracket the floor by a factor of 200, so a floor lowered to 60 — still
-# "a minute of grace" — passed both and would report every lane for its first minute, the same
-# unreadable-report failure at a smaller scale. MID (300 s) closes that gap.
+# "a minute of grace" — passed both. What a small floor actually shortens is the GRACE: it names a
+# session with NO live `pi` from its 60th second instead of its 600th. The launch window — from spawn
+# until the agent exists — is OH8's territory (it is short, but not the floor's business); the window a
+# 60 s floor newly reports is the lane whose agent has already exited — genuinely dead, merely between
+# incarnations — the same unreadable-report failure at a smaller scale. MID (300 s) closes that gap.
 # ⛔ WHAT THIS CASE DOES AND DOES NOT PIN, stated because it is easy to over-claim: the fixture is armed
 # at `NOW - 300` from `$REAL_DATE`, while the report reads its OWN clock at read time (`session_age_s`
 # runs `date +%s`) — and BOTH truncate to whole seconds. So the age the report sees is `300` when the
@@ -240,8 +244,10 @@ PY
   # fixture and the old dead lane must stop being named. M1 shows the clause is load-bearing; M3 shows
   # the comparison is, with the clause intact. NEITHER mutant reads the default: a floor lowered to 0
   # or 60 leaves M3 green (measured, #2788). The registry's `value` fragment is what pins the NUMBER;
-  # this suite only BOUNDS it — OH9 reds at any floor of 300 or less, OH1 at any floor above 1000 — so
-  # a floor of 500 passes every arm (1000 >= 500 names OH1's lane, while 5 and 300 stay below it).
+  # this suite only BOUNDS it, and the UPPER bound moves with the clock: OH9 reds at any floor of 300
+  # or less, while OH1 reds only at a floor above `1000 + elapsed` (its 1000 s fixture is read at OH1's
+  # own clock — the same truncation as OH9) — so the bound is `(300, 1000 + elapsed]`, and a floor of
+  # 500 passes every arm (1000 + elapsed >= 500 names OH1's lane, while 5 and 300 stay below it).
   # Stated so the bound is not read as a value pin, matching the `MIN_AGE` row's precedent and this
   # row's own `guardedBy` at heartbeat-progress-edges.ts:1385.
   mut "M3-age-floor" \
