@@ -92,19 +92,27 @@ repo_slug_from_remote() {
   # passes a slash-count test and yields `acme/widget?tab=1`, which every `--repo` call then receives;
   # cloud-cell-supervisor.sh's own parser rejects it, so the two derivations disagreed on a shape an
   # operator can produce by copy-paste. Only the characters an owner/repo name can contain are
-  # accepted, in BOTH segments.
-  case "$slug" in
+  # accepted, in BOTH segments. The rule itself lives in `repo_slug_valid` (one owner).
+  repo_slug_valid "$slug" || return 1
+  printf '%s\n' "$slug"
+}
+
+# repo_slug_valid <owner/name> — the ONE shape rule for a slug. Used by repo_slug_from_remote and
+# derive_or below, and delegated to by orchestrator-harness/repo-target.sh (#2724 review, P2): a
+# second hand-copy of this rule drifted from the parser and could report `slug-mismatch` (the wrong
+# repo) for what is really a malformed target. GitHub slugs are CASE-INSENSITIVE; this validator
+# accepts both cases and the comparer folds them.
+repo_slug_valid() {
+  case "${1:-}" in
     ''|*/*/*|/*|*:*) return 1 ;;
     */*) : ;;
     *) return 1 ;;
   esac
-  case "${slug%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  case "${slug#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  printf '%s\n' "$slug"
+  case "${1%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${1#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  return 0
 }
 
-# derive_or <repo-path> [<explicit-or>] -> prints the `owner/name` to use; rc 1 when nothing could
-# be derived (the caller prints its own warning — silence here is what hid the original defect).
 derive_or() {
   local repo="${1:-}" explicit="${2:-}" url slug
   if [ -n "$explicit" ]; then
@@ -115,14 +123,18 @@ derive_or() {
     # nobody asked for, which is #2040 itself — while the warning quoted a perfectly parseable origin
     # as the thing it could not parse. rc 2 = "the operator's pin is wrong", which the callers refuse
     # by name; rc 1 = "no pin, and the origin does not name a repo", which may fall back loudly.
-    case "$explicit" in ''|*/*/*|*:*) return 2 ;; esac
-    case "$explicit" in */*) : ;; *) return 2 ;; esac
-    case "${explicit%%/*}" in ''|*[!A-Za-z0-9._-]*) return 2 ;; esac
-    case "${explicit#*/}"  in ''|*[!A-Za-z0-9._-]*) return 2 ;; esac
+    repo_slug_valid "$explicit" || return 2
     printf '%s\n' "$explicit"; return 0
   fi
   [ -n "$repo" ] && [ -d "$repo" ] || return 1
-  url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+  # ⛔ THE REPO'S OWN FILE, NOT THE MERGED CONFIG STACK (#2762 review, P1). `remote get-url` applies
+  # `url.*.insteadOf` rewrites, and `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject config at COMMAND
+  # scope that OUTRANKS the real origin — so an ambient environment could re-point the ORIGIN this
+  # derivation reads (and a legitimate mirror rewrite would make it unreadable). `--local` returns what
+  # the checkout was cloned from; the git env is scrubbed here too, so `GIT_DIR` cannot redirect the
+  # read — the same class repo-target.sh's `_repo_target_git` closes for the identity assertion.
+  url="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+    git -C "$repo" config --local --get remote.origin.url 2>/dev/null || true)"
   [ -n "$url" ] || return 1
   slug="$(repo_slug_from_remote "$url")" || return 1
   printf '%s\n' "$slug"
