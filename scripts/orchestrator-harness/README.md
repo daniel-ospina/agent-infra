@@ -1268,8 +1268,8 @@ nothing refused, logged or counted, and the box went to load 258 against its own
 refusal is loud (1-min load, ceiling, the item, and the calling process), counted in
 `~/.pi/agent/state/spawn-gate.tsv` (allowed runs too; bounded by a one-generation rotation at 5 MiB,
 because this is the highest-volume sink in the tree and a device that fills silently is #1765's
-defect), and exits 76 (a LOAD refusal) or 72 (a MEMORY refusal, #2387), which `run_agent` translates to
-the callers' usual `AGENT_LOAD_REFUSED` / `AGENT_MEM_REFUSED` with `AGENT_STARTED=0`. Its stated limits are in the file's header:
+defect), and exits 76 (a LOAD refusal) or 82 (a MEMORY refusal, #2387), which `run_agent` translates to
+the callers' usual `AGENT_LOAD_REFUSED` / `AGENT_MEM_REFUSED` (81) with `AGENT_STARTED=0`. Its stated limits are in the file's header:
 the real binary by ABSOLUTE path or a `PATH` reset is not gated (deliberately — that is the
 operator's rescue route when the box is over its ceiling, and the refusal message prints it), a
 caller that exports its own `MAX_LOAD` sets its own ceiling, and a box where neither installer has
