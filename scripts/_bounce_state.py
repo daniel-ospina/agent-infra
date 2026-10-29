@@ -2,7 +2,7 @@
 
 WHY THIS MODULE EXISTS (agent-infra#2844)
     `question-bounced` is a GitHub label, i.e. a mutable current-state projection of a
-    fact that the issue's TIMELINE already records durably. Two readers were treating the
+    fact that the issue's TIMELINE already records durably. THREE readers were treating the
     projection as authority without ever looking at the record it projects:
 
       * `undelivered-answers.py` turned "the label is present" into the flat claim
@@ -13,9 +13,15 @@ WHY THIS MODULE EXISTS (agent-infra#2844)
         `main()` reads as `used_protocol`, which SUPPRESSES the `question_no_protocol`
         nudge. A stale label therefore silences the nudge for a lane asking a FRESH
         question, and the question stays in a conversation and never reaches the queue.
+      * `turn-end.py` carried its own `lanes_with_open_question()` with the same
+        presence-only rule, and `SKIP_IF_QUESTION = True` turned a stale label into a
+        SILENTLY WITHHELD `WIP-IDLE` continue-nudge — in the fallback nudger that runs
+        exactly when `turn-classify.py` does not (it is the heartbeat's other path).
 
     So the drift is not "the label is written twice" (see THE WRITER, below — it is not).
-    It is that a projection was read as the record. This module reads the record.
+    It is that a projection was read as the record. This module reads the record, and all
+    three readers consume it — so the sentence below is now true of the whole tree, which
+    is the only form in which it is worth asserting.
 
 THE WRITER, NAMED (item 3 of the issue, and the half of its framing that was right)
     Exactly ONE writer exists in this tree: `scripts/ask-owner.py`. Its two bounce paths —
@@ -38,7 +44,7 @@ THE WRITER, NAMED (item 3 of the issue, and the half of its framing that was rig
     The other reader, `ask-owner.py::owner_answered_at`, keys the WRITE predicate on the
     same label (`bounced -> ""`). That rule is agent-infra#1969's *declared* gap and is
     deliberately NOT changed here: `answer-delivered` is a permanent skip, and widening when
-    the gate may write it is a different blast radius from making two readers honest. It is
+    the gate may write it is a different blast radius from making three readers honest. It is
     named in the comment there, not silently fixed here.
 
 THE RULE (one line)
@@ -92,6 +98,11 @@ SUPERSEDED = "superseded"   # something in the thread is NEWER than that event
 UNKNOWN = "unknown"         # the timeline could not be read — the caller must not claim
 
 # ── ONE fetch, ONE parse: no reader re-derives this filter (R3) ────────────────
+# "No reader" is a claim about the WHOLE tree, and it is kept true mechanically in one
+# direction (the writer scan) and by enumeration in the other: the three readers of this
+# label are `undelivered-answers.py`, `turn-classify.py` and `turn-end.py`, and all three
+# call `bounce_view` rather than filtering a timeline themselves. A FOURTH reader is a
+# change to this sentence, not an addition beside it.
 # Emits one line per event of interest. ⛔ Never `|length` — under `--paginate`, `--jq`
 # runs PER PAGE, so a count would come back as one number per page and the caller cannot
 # sum it (it would land in the UNKNOWN branch and silently disarm the check). One line
@@ -151,7 +162,7 @@ class View:
         # bounce" on an issue whose bounce was hours old.
         self.removals_after_bounce = removals_after_bounce
 
-    # both readers only ever ask these two questions, so they get names
+    # all THREE readers only ever ask these two questions, so they get names
     @property
     def read(self):
         return self.state != UNKNOWN
@@ -225,13 +236,14 @@ def bounce_view(repo, number, run):
     """Fetch + parse one issue's bounce state. `run(argv) -> (rc, stdout)`.
 
     `run` is injected rather than imported so each caller keeps its OWN `gh` resolution:
-    these two readers sit behind different rate-limit layers (`$O/gh-limit` in
-    `undelivered-answers.py`, `_gh_layer()` in `turn-classify.py`), and quietly
-    re-pointing either at the other's wrapper would change which process serialises the
-    shared account — a side effect nobody reading this change would expect from it.
+    the three readers sit behind different rate-limit layers (`$O/gh-limit` in
+    `undelivered-answers.py`, `_gh_layer()` in `turn-classify.py` and `turn-end.py`), and
+    quietly re-pointing any of them at another's wrapper would change which process
+    serialises the shared account — a side effect nobody reading this change would expect
+    from it.
 
     A failed read is `UNKNOWN`, never `ABSENT` and never `CURRENT`: the whole point of the
-    two readers is that a broken read must not read as a verdict.
+    readers is that a broken read must not read as a verdict.
     """
     try:
         rc, out = run(["gh", "api",

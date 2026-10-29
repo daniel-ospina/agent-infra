@@ -42,6 +42,7 @@ def _load(name, filename):
 bs = _load("bounce_state_under_test", "_bounce_state.py")
 ua = _load("undelivered_answers_under_test", "undelivered-answers.py")
 tc = _load("turn_classify_bounce_under_test", "turn-classify.py")
+te = _load("turn_end_bounce_under_test", "turn-end.py")
 
 
 # ── fixtures: the real incident, and the shapes around it ─────────────────────────────
@@ -176,18 +177,40 @@ def test_a_nonzero_rc_is_unknown():
 
 # ── item 3 of the issue: ONE writer, named, and enforced ─────────────────────────────
 _BOUNCE_REFS = ("BOUNCE_LABEL", "BOUNCE", "_bounce_state.BOUNCE")
-_CODE = (".py", ".sh", ".mjs", ".cjs", ".js", ".ts", ".bash")
-_SKIP_DIRS = ("tests/", "node_modules/", ".worktrees/", "skills/", "docs/")
+# ⛔ THE SCAN'S POPULATION IS PART OF THE GUARANTEE, SO IT IS THE WIDE ONE. The claim is
+# "a second writer ANYWHERE IN THE TREE fails the suite" — and this fleet has two writer
+# surfaces that are not `.py`/`.sh`:
+#   * a WORKFLOW STEP (`run: gh issue edit … --add-label …`) in a `.yml`/`.yaml` file, and
+#   * a SKILL INSTRUCTION — `skills/**/*.md` is a live label-writing surface here
+#     (`skills/issue-creation/SKILL.md`, `skills/issue-scoping/SKILL.md`,
+#     `skills/commit-workflow/workflow/02-commit-pr.md` all tell a lane to run
+#     `gh issue edit … --add-label`).
+# Both were outside the pre-fix population, so a writer added there passed the very guard
+# the module cites as mechanical enforcement (a false PASS in a new gate). Markdown has no
+# AST, so it takes the LINE scan — which is the right reading anyway: a skill that tells a
+# lane to write the label IS a writer of the label.
+_CODE = (".py", ".sh", ".mjs", ".cjs", ".js", ".ts", ".bash", ".yml", ".yaml")
+# `skills/` is NOT skipped: its prose is scanned as calls (see `_CODE`). `docs/` stays out —
+# it is a record of what was decided, never an instruction a lane executes.
+_SKILL_DOCS = ("skills/",)
+_SKIP_DIRS = ("tests/", "node_modules/", ".worktrees/", "docs/")
 
 
 def _tracked_code_files():
+    """Every tracked file a `question-bounced` write could plausibly live in.
+
+    Three classes, and all three are load-bearing: code (`.py`/`.sh`/`.mjs`/`.js`/`.ts`/
+    `.bash`), workflows (`.yml`/`.yaml`), and skill instructions (`skills/**/*.md`).
+    """
     out = subprocess.run(["git", "-C", ROOT, "ls-files"], capture_output=True,
                          text=True, timeout=60).stdout
     for rel in out.splitlines():
-        if not rel.endswith(_CODE) or rel.startswith(_SKIP_DIRS) or "/test_" in rel \
-                or rel.startswith("test_") or "_test." in rel or ".test." in rel:
+        skill_doc = rel.startswith(_SKILL_DOCS) and rel.endswith(".md")
+        if rel.startswith(_SKIP_DIRS) or "/test_" in rel or rel.startswith("test_") \
+                or "_test." in rel or ".test." in rel:
             continue
-        yield rel
+        if rel.endswith(_CODE) or skill_doc:
+            yield rel
 
 
 def _argv_literal(node):
@@ -300,10 +323,10 @@ def test_one_writer_is_named():
     authoritative, its single writer is NAMED. Naming it in prose is a note; this is the
     enforcement — a second writer appearing anywhere in the tree fails the suite.
 
-    Scans tracked code (tests excluded — this file necessarily contains what it searches
-    for) and reads CALLS for Python sources, so a constant-based write
-    (`--add-label, BOUNCE_LABEL`) is caught while the documentation that names the writer
-    is not mistaken for one.
+    Scans tracked code, workflows AND skill instructions (tests excluded — this file
+    necessarily contains what it searches for), and reads CALLS for Python sources, so a
+    constant-based write (`--add-label, BOUNCE_LABEL`) is caught while the documentation
+    that names the writer is not mistaken for one.
     """
     writers = {}
     for rel in _tracked_code_files():
@@ -312,14 +335,14 @@ def test_one_writer_is_named():
                 src = fh.read()
         except OSError:
             continue
-        hits = _py_write_lines(src) if rel.endswith(".py") else _shell_write_lines(src)
+        hits = _scan(rel, src)
         if hits:
             writers[rel] = hits
     assert set(writers) == {"scripts/ask-owner.py"}, (
         "`question-bounced` must have exactly ONE writer (scripts/ask-owner.py); found %s. "
         "A second writer of this label is the defect class agent-infra#2844 is about — if "
         "the new write is deliberate, the shared derivation in scripts/_bounce_state.py and "
-        "both its readers have to be widened with it" % sorted(writers))
+        "all THREE of its readers have to be widened with it" % sorted(writers))
     # ...and the writer must really be the gate's TWO BOUNCE PATHS — STEP 1 (no
     # declaration) and STEP 2 (failed marks) — not one write that happens to satisfy the
     # set. ⛔ A bare COUNT is not enough: the PASS path also names the label (it REMOVES
@@ -389,6 +412,58 @@ def test_the_writer_scan_catches_the_missing_STEP_1_write():
     assert len(_py_write_lines(mutant)) == 1, (
         "deleting STEP 1's bounce write must leave ONE writer, not two — a removal is not "
         "a writer")
+
+
+def _scan(rel, src):
+    """The ONE dispatch `test_one_writer_is_named`'s loop uses — AST for Python, the line
+    scan for everything else (shell, workflows, skill instructions).
+
+    Factored out so the file-class coverage can be exercised directly: a class the loop
+    never yields is a class the guarantee does not reach, and that is exactly what was
+    wrong before FINDING 2.
+    """
+    return _py_write_lines(src) if rel.endswith(".py") else _shell_write_lines(src)
+
+
+def test_the_writer_scan_reaches_a_WORKFLOW_step_and_a_SKILL_instruction():
+    """⛔ FINDING 2. The docstring above says a second writer "anywhere in the tree" fails
+    the suite, but the pre-fix population was code extensions only and `skills/` was
+    skipped — so the TWO writer surfaces this fleet has outside code sat outside the guard:
+    a workflow `run:` step, and a skill telling a lane to run `gh issue edit … --add-label`
+    (three skills do exactly that today, for other labels). A second writer added there
+    passed the very check the module cites as mechanical enforcement — a false PASS in a
+    new gate."""
+    assert _scan(".github/workflows/ci.yml",
+                 "      - run: gh issue edit 1 --repo o/r --add-label question-bounced\n") == [1]
+    assert _scan("skills/issue-creation/SKILL.md",
+                 "```\ngh issue edit 12 --add-label question-bounced "
+                 "--remove-label owner-decision\n```\n") == [2]
+    # ...and the anti-over-fix half: a REMOVAL in either class is not a writer, and a
+    # non-bounce add is not a bounce writer.
+    assert _scan(".github/workflows/ci.yml",
+                 "      - run: gh issue edit 1 --add-label owner-decision "
+                 "--remove-label question-bounced\n") == []
+    assert _scan("skills/x/SKILL.md",
+                 "gh issue edit 1 --remove-label question-bounced\n") == []
+    assert _scan("skills/x/SKILL.md",
+                 "gh issue edit 1 --add-label needs-triage\n") == []
+
+
+def test_the_scanned_population_includes_workflows_and_skills():
+    """...and the population the loop actually WALKS must contain those classes.
+
+    Without this leg the leg above is only a unit test of a helper, and a future narrowing
+    of `_CODE`/`_SKIP_DIRS` would silently shrink the guarantee back to code files while
+    `test_one_writer_is_named` stayed green — the failure mode FINDING 2 named."""
+    paths = set(_tracked_code_files())
+    assert any(p.endswith((".yml", ".yaml")) for p in paths), \
+        "no workflow file is in the writer scan's population"
+    assert any(p.startswith("skills/") and p.endswith(".md") for p in paths), \
+        "no skill instruction is in the writer scan's population (skills/ is skipped)"
+    assert "scripts/ask-owner.py" in paths
+    assert not any(p.startswith("docs/") for p in paths), \
+        "docs/ is a RECORD of decisions, never an instruction a lane executes — it must " \
+        "stay out or every plan doc quoting the write becomes a false writer"
 
 
 def test_the_shell_scan_applies_the_same_operand_rule():
@@ -590,6 +665,189 @@ def test_a_current_bounce_still_silences_the_nudge(monkeypatch, tmp_path):
     same turn — only the bounce's currency differs. The owner's class-2 lane (a question that
     used the protocol) must still be left alone."""
     assert _drive(monkeypatch, tmp_path, bs.parse(INCIDENT[:9])) == []
+
+
+# ── reader 3: turn-end.py — a stale bounce may not silence the FALLBACK nudge ─────────
+# This is the reader the harness reviewer found still on the presence-only rule (FINDING 1):
+# `SKIP_IF_QUESTION = True` + `issue_label in holds_question` → the lane is never nudged, in
+# the nudger that runs exactly when `turn-classify.py` does not.
+_TE_ISSUES = [{"number": 7, "labels": [{"name": "lane:L1"},
+                                        {"name": "question-bounced"}]}]
+
+
+def _wire_turn_end(monkeypatch, issues, view, owner=None):
+    """Serve turn-end's issue-list reads and the shared view; nothing else runs.
+
+    `issues` answers the `question-bounced` query and `owner` the `owner-decision` one, so a
+    leg can target either branch without the other leaking its lane into the set.
+    """
+    def fake_sh(argv, timeout=120):
+        argv = [str(a) for a in argv]
+        label = argv[argv.index("--label") + 1] if "--label" in argv else ""
+        payload = (owner or []) if label == "owner-decision" else \
+            (issues if label == bs.BOUNCE else [])
+        return 0, __import__("json").dumps(payload)
+    monkeypatch.setattr(te, "REPOS", ("fake/repo",))
+    monkeypatch.setattr(te, "sh", fake_sh)
+    monkeypatch.setattr(te, "log", lambda *a, **k: None)
+    # ⛔ PATCH THE MODULE TURN-END HOLDS, not the one this test loaded (same file, different
+    # module object under `importlib`) — otherwise the code under test reads the real API.
+    monkeypatch.setattr(te.bs, "bounce_view", lambda _r, _n, _run: view)
+
+
+def test_turn_end_does_not_treat_a_SUPERSEDED_bounce_as_a_held_question(monkeypatch):
+    """THE DEFECT. Pre-fix the label's PRESENCE returned the lane and `main()` skipped its
+    `WIP-IDLE` continue-nudge, so a bounce the thread had overtaken silenced the fallback
+    nudger for a lane holding NO question — 22 of the 26 measured label-carriers were stale."""
+    _wire_turn_end(monkeypatch, _TE_ISSUES, bs.parse(INCIDENT))
+    assert "lane:L1" not in te.lanes_with_open_question()
+
+
+def test_turn_end_still_skips_a_CURRENT_bounce(monkeypatch):
+    """Control that makes the leg above mean something: same harness, same lane, only the
+    bounce's currency differs. The owner's rule — do not nudge a lane that HOLDS a question
+    — still applies, and this change must not weaken it."""
+    _wire_turn_end(monkeypatch, _TE_ISSUES, bs.parse(INCIDENT[:9]))
+    assert "lane:L1" in te.lanes_with_open_question()
+
+
+def test_turn_end_keeps_the_label_when_the_timeline_could_not_be_read(monkeypatch):
+    """A nudger that messages on a read it could not perform is asserting state it does not
+    have. UNKNOWN behaves exactly like CURRENT, as it does in the other readers."""
+    _wire_turn_end(monkeypatch, _TE_ISSUES, bs.View(bs.UNKNOWN))
+    assert "lane:L1" in te.lanes_with_open_question()
+
+
+def test_turn_end_treats_owner_decision_as_membership_not_a_projection(monkeypatch):
+    """`owner-decision` is the queue's LIVE MEMBERSHIP — the thread moving on does not
+    contradict it — so it is reported on presence and spends no timeline read. Only
+    `question-bounced` is a projection that needs re-validating."""
+    read = []
+    _wire_turn_end(monkeypatch, [], bs.parse(INCIDENT),
+                   owner=[{"number": 9, "labels": [{"name": "lane:L2"},
+                                                    {"name": "owner-decision"}]}])
+    monkeypatch.setattr(te, "bounce_still_current", lambda r, n: read.append(n) or False)
+    assert te.lanes_with_open_question() == {"lane:L2"}
+    assert read == [], "owner-decision spent a timeline read"
+
+
+def test_turn_end_bounds_its_timeline_reads_by_count(monkeypatch):
+    """The cost bound. One read per bounced issue is affordable at today's 26, but the
+    heartbeat's `run_bounded` allowance is 90 s for the whole tick, so the count is capped —
+    and an issue past the cap is treated as CURRENT (fail CLOSED), never dropped, because
+    this set is also the log line that says a question is queued."""
+    issues = [{"number": n, "labels": [{"name": "lane:L%d" % n},
+                                        {"name": "question-bounced"}]}
+              for n in range(1, 6)]
+    read = []
+    _wire_turn_end(monkeypatch, issues, bs.parse(INCIDENT))
+    monkeypatch.setattr(te, "MAX_BOUNCE_READS", 2)
+    monkeypatch.setattr(te, "bounce_still_current", lambda r, n: read.append(n) or False)
+    holds = te.lanes_with_open_question()
+    # read ⇒ STALE ⇒ excluded (the fix working); past the cap ⇒ kept, fail closed.
+    assert read == [1, 2], read
+    assert holds == {"lane:L3", "lane:L4", "lane:L5"}, holds
+
+
+def test_turn_end_bounds_its_timeline_reads_by_WALL_CLOCK(monkeypatch):
+    """...the other bound, which the count alone cannot supply: a gh that HANGS spends the
+    tick even at 40 reads. A spent budget therefore reads nothing at all, and every lane
+    keeps the label's authority."""
+    issues = [{"number": 1, "labels": [{"name": "lane:L1"},
+                                        {"name": "question-bounced"}]}]
+    read = []
+    _wire_turn_end(monkeypatch, issues, bs.parse(INCIDENT))
+    monkeypatch.setattr(te, "BOUNCE_BUDGET_S", -1)          # deadline already spent
+    monkeypatch.setattr(te, "bounce_still_current", lambda r, n: read.append(n) or False)
+    assert te.lanes_with_open_question() == {"lane:L1"}
+    assert read == [], read
+
+
+def test_turn_end_actually_NUDGES_a_lane_whose_bounce_went_stale(monkeypatch, tmp_path,
+                                                                 capsys):
+    """THE END-TO-END LEG, on the behaviour the finding is about: does the message go out?
+
+    `main()` in `--dry-run` over one `WIP-IDLE` lane carrying a stale bounce. Pre-fix this
+    printed nothing at all — the lane was skipped as "holds a question" from the label's
+    presence. The control directly below reverses only the bounce's currency."""
+    def sh(argv, timeout=120):
+        argv = [str(a) for a in argv]
+        if any(str(a).endswith("lane-status.py") for a in argv):
+            return 0, __import__("json").dumps([{
+                "lane": "L1", "ws": "WS1", "sid": "sid-1", "size": 10,
+                "verdict": "WIP-IDLE", "stale_s": 3600,
+                "issue_label": "lane:L1"}])
+        label = argv[argv.index("--label") + 1] if "--label" in argv else ""
+        return 0, __import__("json").dumps(_TE_ISSUES if label == bs.BOUNCE else [])
+    monkeypatch.setattr(te, "REPOS", ("fake/repo",))
+    monkeypatch.setattr(te, "sh", sh)
+    monkeypatch.setattr(te, "log", lambda *a, **k: None)
+    monkeypatch.setattr(te, "NUDGE_KILL", str(tmp_path / "LANE-NUDGE-OFF-nope"))
+    monkeypatch.setattr(te, "read_marker", lambda _lane: {})
+    monkeypatch.setattr(te, "session_path", lambda _sid: None)
+    monkeypatch.setattr(te.bs, "bounce_view",
+                        lambda _r, _n, _run: bs.parse(INCIDENT))
+    assert te.main(["--dry-run"]) == 0
+    assert "WOULD NUDGE L1" in capsys.readouterr().out
+
+
+def test_turn_end_still_withholds_the_nudge_for_a_CURRENT_bounce(monkeypatch, tmp_path,
+                                                                capsys):
+    """...and the control for the leg above: only the bounce's currency differs, and the
+    owner's rule (skip a lane that holds a question) must still hold."""
+    def sh(argv, timeout=120):
+        argv = [str(a) for a in argv]
+        if any(str(a).endswith("lane-status.py") for a in argv):
+            return 0, __import__("json").dumps([{
+                "lane": "L1", "ws": "WS1", "sid": "sid-1", "size": 10,
+                "verdict": "WIP-IDLE", "stale_s": 3600,
+                "issue_label": "lane:L1"}])
+        label = argv[argv.index("--label") + 1] if "--label" in argv else ""
+        return 0, __import__("json").dumps(_TE_ISSUES if label == bs.BOUNCE else [])
+    monkeypatch.setattr(te, "REPOS", ("fake/repo",))
+    monkeypatch.setattr(te, "sh", sh)
+    monkeypatch.setattr(te, "log", lambda *a, **k: None)
+    monkeypatch.setattr(te, "NUDGE_KILL", str(tmp_path / "LANE-NUDGE-OFF-nope"))
+    monkeypatch.setattr(te, "read_marker", lambda _lane: {})
+    monkeypatch.setattr(te, "session_path", lambda _sid: None)
+    monkeypatch.setattr(te.bs, "bounce_view",
+                        lambda _r, _n, _run: bs.parse(INCIDENT[:9]))
+    assert te.main(["--dry-run"]) == 0
+    assert "WOULD NUDGE" not in capsys.readouterr().out
+
+
+def test_turn_end_reads_the_timeline_through_ITS_OWN_gh_layer(monkeypatch):
+    """⛔ #1988 AT THE THIRD READER. `_bounce_state.bounce_view` emits `["gh", "api", …]`
+    and its docstring says the CALLER owns the resolution. Passing that argv through
+    unchanged would run the bare `gh` from PATH — past the seeded shims, unserialised,
+    against the account four boxes share — and this is a per-tick, per-bounced-issue path.
+    The sibling reader's slip of exactly this kind was an earlier review finding."""
+    seen = []
+
+    def fake(argv, timeout=None):
+        seen.append(list(argv))
+        return 0, ("commented\t\t2026-10-11T22:00:00Z\n"
+                   "labeled\tquestion-bounced\t2026-10-11T22:00:05Z\n")
+
+    monkeypatch.setattr(te, "GH", "/opt/orch/gh-limit/gh")
+    monkeypatch.setattr(te, "sh", lambda *_a, **_k: pytest.fail(
+        "the bare-name path was taken — `bounce_view`'s argv must be rebound to GH"))
+    monkeypatch.setattr(te, "sh_stdout", fake)
+    monkeypatch.setattr(te, "log", lambda *a, **k: None)
+    assert te.bounce_still_current("o/r", 7) is True
+    assert seen == [[
+        "/opt/orch/gh-limit/gh", "api",
+        "repos/o/r/issues/7/timeline?per_page=100",
+        "--paginate", "--jq", bs.TIMELINE_JQ]], seen
+
+
+def test_turn_end_sh_stdout_keeps_stderr_out_of_the_parse():
+    """`turn-end.sh` merges stderr (right for diagnostics, wrong for a parser): a warning
+    gh wrote to stderr would be handed to the reduction as if it were a row. This is the
+    leg that says the bounce read uses the STDOUT-ONLY variant."""
+    rc, out = te.sh_stdout(["/bin/sh", "-c", "echo out; echo err >&2"])
+    assert rc == 0
+    assert out.strip() == "out", out
 
 
 # ── the gh seam at reader 2 (#1988), and the jq filter nothing exercised ──────────────
