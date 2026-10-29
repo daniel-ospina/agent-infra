@@ -621,11 +621,16 @@ unit_dropin_execfiles() { # .conf drop-ins that would override ExecStart, one pa
     # `ExecStart=` REPLACES the base one — so every read-back below is otherwise answering about a file
     # the scheduler does not run. This is not hypothetical for this unit: the base ExecStart is the thing
     # an operator would edit to arm by hand.
+    # ⛔ PRESENCE, NOT NON-EMPTINESS. A drop-in carrying a bare `ExecStart=` is not "no ExecStart here"
+    # — it is the RESET directive: it CLEARS the exec list, and systemd then refuses the unit with
+    # "Service has no ExecStart= … Refusing" even though the base file still states one. Testing the
+    # value (`unit_exec_line`) missed exactly that, so this installer enabled and ARMED a unit the
+    # scheduler would refuse to start.
     local d="$UNIT_DIR/$UNIT_NAME.service.d" f
     [ -d "$d" ] || return 0
     for f in "$d"/*.conf; do
         [ -f "$f" ] || continue
-        [ -n "$(unit_exec_line "$f")" ] && printf '%s\n' "$f"
+        [ -n "$(sed -n 's/^[[:space:]]*ExecStart[[:space:]]*=.*/x/p' "$f")" ] && printf '%s\n' "$f"
     done
     return 0
 }
@@ -719,7 +724,7 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
     # readiness verb that reds on them reports a working schedule as broken — with a stated consequence
     # ("every tick exits 2") that is simply false. Only arguments outside that vocabulary are red, and
     # only `--dry-run` makes the artifact disarmed. Anything left over is named, never assumed.
-    local rest="$1" l out="" disarmed=0 skipnext=0
+    local rest="$1" l out="" disarmed=0 skipnext=0 lastflag=""
     while [ -n "$rest" ]; do
         l="${rest%%$'\n'*}"
         case "$rest" in *$'\n'*) rest="${rest#*$'\n'}" ;; *) rest="" ;; esac
@@ -728,10 +733,13 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             '')                : ;;
             --dry-run)         disarmed=1 ;;
             --json|--status)   : ;;
-            --want|--root)     skipnext=1 ;;
+            --want|--root)     skipnext=1; lastflag="$l" ;;
             *)                 out="$out $l" ;;
         esac
     done
+    # ⛔ A VALUE-TAKING SWITCH WITH NO VALUE IS NOT SATISFIED — the pass exits 2 on `--want` alone, so it
+    # is an argument this installer did not render, and it must be reported rather than swallowed.
+    [ "$skipnext" = 1 ] && out="$out $lastflag"
     out="${out# }"
     if [ -n "$out" ]; then printf 'other:%s' "$out"
     elif [ "$disarmed" = 1 ]; then printf 'disarmed'
@@ -1196,12 +1204,17 @@ do_status() {
     fi
     # Drop the leading interpreter + script, then the `--repo <value>` pair (that is configuration, not
     # a mode), and what remains is the mode the pass is actually invoked with.
+    # ⛔ THE INTERPRETER AND SCRIPT ARE DROPPED BY POSITION — up to and including the first `*.py` — NOT
+    # by `starts with /`. The old rule deleted ANY absolute token, which deletes the VALUE of a
+    # legitimate `--root /opt` (its own default is absolute): the orphaned `--root` then swallowed the
+    # NEXT argument, so `--root /opt --apply` classified as ARMED exit 0 (the pass exits 2) and
+    # `--root /opt/x --dry-run` classified as ARMED (the unit is disarmed).
     installed_rest="$(printf '%s\n' "$installed_args" | awk '
-        { if ($0 ~ /^\//) { abs++; next }
-          if (abs < 2) next
+        { if (NF == 0) next
+          if (!seen_script) { if ($0 ~ /\.py$/) seen_script = 1; next }
           if (skip) { skip = 0; next }
           if ($0 == "--repo") { skip = 1; next }
-          if (NF) print }')"
+          print }')"
     installed_kind="$(classify_exec_args "$installed_rest")"
     case "$installed_kind" in
         armed)     log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
@@ -1362,6 +1375,11 @@ do_uninstall() {
         log_line "dry-run: would disable and remove the installed schedule (nothing was changed)"
         return 0
     fi
+    # ⛔ A WRITER LIKE THE OTHER THREE. Under `sudo`, HOME resolves to /root, so the removal runs against
+    # root's unit dir while `report_surviving_arm_record` reads /root's (absent) record and says nothing —
+    # the operator is told the box is uninstalled, the user's dated record survives, and the next routine
+    # `--install` re-arms from it. Measured: every other verb refused, this one exited 0 unguarded.
+    refuse_root_invocation || return 1
     choose_target || { err "no scheduler available"; return 1; }
     if [ "$TARGET" = "launchd" ]; then
         # ⛔ A DISARM IS NOT DONE BECAUSE `bootout` RETURNED. The plist can be gone while the LOADED job
