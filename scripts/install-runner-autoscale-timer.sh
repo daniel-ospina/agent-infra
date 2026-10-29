@@ -669,22 +669,27 @@ with open(sys.argv[1],"rb") as fh:
 # which is why a correct plist was refused roughly one run in ten. These helpers read a here-string:
 # grep is not in the picture and no process of ours can take SIGPIPE.
 args_has_line() { # args_has_line <newline-separated values> <exact line>
-    local want="$2" l
-    while IFS= read -r l; do [ "$l" = "$want" ] && return 0; done <<< "$1"
-    return 1
-}
-
-args_first_matching() { # args_first_matching <newline-separated values> <GLOB pattern>
-    local pat="$2" l
-    while IFS= read -r l; do
-        case "$l" in $pat) printf '%s' "$l"; return 0 ;; esac
-    done <<< "$1"
-    return 0
+    # ⛔ PURE BASH: no grep, no pipe, no here-string. Each of those was tried and each is a hazard:
+    # the pipeline dies of SIGPIPE when the last stage exits early (measured: 83 of 3000 iterations
+    # reported a SUCCESSFUL match as a failure), and a `<<<` here-string is flagged unverifiable by the
+    # repo's own working-tree guard, which then refuses to execute the installer at all.
+    [[ $'\n'"$1"$'\n' == *$'\n'"$2"$'\n'* ]]
 }
 
 args_first() { # args_first <newline-separated values>
-    local l
-    while IFS= read -r l; do printf '%s' "$l"; return 0; done <<< "$1"
+    printf '%s' "${1%%$'\n'*}"
+}
+
+args_first_matching() { # args_first_matching <newline-separated values> <GLOB pattern>
+    local pat="$2" rest="$1" l
+    while [ -n "$rest" ]; do
+        l="${rest%%$'\n'*}"
+        case "$l" in $pat) printf '%s' "$l"; return 0 ;; esac
+        case "$rest" in
+            *$'\n'*) rest="${rest#*$'\n'}" ;;
+            *) rest="" ;;
+        esac
+    done
     return 0
 }
 
@@ -911,7 +916,9 @@ except ET.ParseError as e:
 mode_meaning() {
     case "$(mode_flag)" in
         --dry-run) printf '%s' "  (DISARMED — measures, classifies and prints the plan only; arm with --arm)" ;;
-        *)         printf '%s' "  (ARMED by $(sed -n 's/^armed-date=//p;q' "$ARM_FILE" 2>/dev/null) — repairs dead runners and grows toward the measured ceiling)" ;;
+        # ⛔ NO `;q` HERE: the record's FIRST line is `armed-by=`, so a quit-on-first-line sed printed an
+        # EMPTY date in the one summary that exists to answer "when was this armed?" (measured).
+        *)         printf '%s' "  (ARMED by $(sed -n 's/^armed-date=//p' "$ARM_FILE" 2>/dev/null) — repairs dead runners and grows toward the measured ceiling)" ;;
     esac
 }
 
@@ -931,7 +938,7 @@ do_arm() {
     resolve_script || return 1
     resolve_python || return 1
     if arm_record_valid; then
-        log_line "  runner-autoscale: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p;q' "$ARM_FILE")"
+        log_line "  runner-autoscale: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p' "$ARM_FILE")"
         log_line "    record: $ARM_FILE (not re-dated: the date is the audit datum)"
         # Still converge the artifact: a record may exist while the installed unit predates it.
         if [ "${DRY_RUN:-0}" = "1" ]; then return 0; fi
@@ -963,9 +970,12 @@ do_arm() {
             return 1
             ;;
     esac
-    ceiling="$(sed -n 's/.*"ceiling": *\([0-9][0-9]*\).*/\1/p;q' <<< "$json")"
-    ncpu="$(sed -n 's/.*"ncpu": *\([0-9][0-9]*\).*/\1/p;q' <<< "$json")"
-    mem="$(sed -n 's/.*"mem_available_mb": *\([0-9][0-9]*\).*/\1/p;q' <<< "$json")"
+    # ⛔ READ TO EOF, NOT `;q`/`head -1`: an early-exiting reader SIGPIPEs the writer and `pipefail`
+    # turns a SUCCESSFUL parse into a failed one (the class that refused correct artifacts elsewhere in
+    # this file). `found` makes the awk take the first match without closing the pipe.
+    ceiling="$(printf '%s' "$json" | awk '!f && match($0, /"ceiling": *[0-9]+/) { v = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); print v; f = 1 }')"
+    ncpu="$(printf '%s' "$json" | awk '!f && match($0, /"ncpu": *[0-9]+/) { v = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); print v; f = 1 }')"
+    mem="$(printf '%s' "$json" | awk '!f && match($0, /"mem_available_mb": *[0-9]+/) { v = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); print v; f = 1 }')"
     rm -f "$rec_tmp"
     [ -n "$ceiling" ] || {
         err "REFUSING to arm: the preflight answered (rc=$rc) but its record carries NO ceiling, so this box's"
@@ -999,7 +1009,9 @@ do_arm() {
         # the one state the design forbids — whenever the forced disarmed render fails too (a full
         # disk, a permission change, a broken template).
         if FORCE_MODE_FLAG="--dry-run" do_install_reinstall_only; then
-            rm -f "$ARM_FILE"
+            rm -f "$ARM_FILE" || {
+                err "the artifact is back to --dry-run BUT the record REMAINS ($ARM_FILE) — the next routine --install would arm from it, so this is NOT a clean disarm. Remove it by hand or fix the permissions."
+                return 1; }
             err "NOT ARMED: the armed re-render failed, and the artifact is back to --dry-run, so the record was removed — the box is NOT converging"
         else
             err "STILL ARMED: the armed re-render failed AND the disarmed re-render failed, so the record was KEPT on purpose — it is the only on-disk statement that this box is converging. Fix the refusal above, then re-run --disarm."
@@ -1334,6 +1346,19 @@ done
 # would see a disarmed box, and the NEXT routine `--install` (a bring-up, a sync, an operator re-running
 # it) would silently re-arm from the record that is still there. So it refuses and names the verb that
 # actually disarms.
+# ⛔ AND IT IS ONLY A RENDER FLAG FOR `--install`. On any other verb it used to be silently ignored by
+# the verb's own logic and honoured by the render inside it, which produced two measured lies:
+#   * `--arm --report-only` minted a dated arming record, then rendered the FORCED disarmed artifact,
+#     verified it AS the forced mode (so the check passed) and printed `ARMED` over a `--dry-run` unit —
+#     after which the next routine `--install` armed from that record with no dated step at that moment;
+#   * `--uninstall --report-only` performed a real removal.
+# A preview flag that a writer ignores is worse than no flag.
+if [ -n "$FORCE_MODE_FLAG" ] && [ "$MODE" != "--install" ]; then
+    err "REFUSING --report-only with $MODE: it is a render flag for --install only. On $MODE it would either"
+    err "be ignored by the verb while its render honoured it (a record written and 'ARMED' printed over a"
+    err "disarmed artifact) or let a real removal run under a preview flag."
+    exit 1
+fi
 if [ -n "$FORCE_MODE_FLAG" ] && arm_record_valid; then
     err "REFUSING --report-only: $ARM_FILE still arms this box, so the next --install would re-arm it and"
     err "you would believe it was disarmed. Use --disarm (it removes the record AND reinstalls)."

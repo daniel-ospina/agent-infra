@@ -244,6 +244,7 @@ assert_nofile "$ARM" "no record is written for an unread ceiling"
 # …and the good shape really arms, with the measured ceiling IN the record.
 OUT="$(run_install Linux "$D" --arm --reason 'unit test')"
 assert_eq "$?" 0 "--arm exits 0 on a measurable box"
+assert_contains "$OUT" "ARMED by 2" "the armed summary names the DATE it was armed (the audit datum)"
 assert_file "$ARM" "the arming record was written"
 assert_contains "$(cat "$ARM")" "ceiling=3" "the record carries the MEASURED ceiling"
 assert_contains "$(cat "$ARM")" "armed-date=" "the record is dated"
@@ -465,7 +466,7 @@ assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "--dry-run" \
 # ── T16: a FAILED armed render leaves the box NOT armed ───────────────────────────────────
 # A record that outlives a failed --arm is an armed box the operator was told was not armed: the next
 # routine --install would silently re-arm from it. The record must be dropped, fail-closed.
-say_case "T16 a failed armed re-render removes the record (no armed box with no record)"
+say_case "T16 a failed armed re-render never leaves an armed artifact without a record"
 mkdir -p "$T/tpl16"
 cp "$REPO/templates/systemd/$UNIT_NAME.timer" "$T/tpl16/"
 sed 's|{{PYTHON}}|{{UNRESOLVED_16}}|; s|{{SCRIPT}}|{{ALSO_16}}|' \
@@ -552,6 +553,28 @@ assert_eq "$RC" 1 "a relative pin is REFUSED"
 # that no artifact is written.
 assert_contains "$OUT" "REFUSING" "the refusal is named"
 assert_nofile "$D/$UNIT_NAME.service" "nothing was installed with a relative interpreter"
+
+# ── T22: --report-only cannot ride along with a WRITER ──────────────────────────────────
+# Measured lies this pins: `--arm --report-only` minted a dated record, rendered the FORCED disarmed
+# artifact, verified it as the forced mode, and printed ARMED over a --dry-run unit — after which the
+# next routine --install armed from that record on the strength of an output that said it already had.
+# `--uninstall --report-only` performed a REAL removal under a preview flag.
+say_case "T22 --report-only is refused with --arm, --disarm and --uninstall"
+D="$T/c22"; fresh "$D"
+run_install Linux "$D" --install >/dev/null 2>&1
+for verb in --arm --disarm --uninstall; do
+    rm -f "$ARM"
+    ENVV=()
+    OUT="$(run_install Linux "$D" "$verb" --report-only --reason fixture)"; RC=$?; ENVV=()
+    assert_eq "$RC" 1 "$verb --report-only is refused"
+    assert_contains "$OUT" "render flag for --install only" "$verb says why"
+    assert_nofile "$ARM" "$verb --report-only writes no arming record"
+    assert_file "$D/$UNIT_NAME.service" "$verb --report-only removed nothing"
+done
+# and the flag still works where it belongs
+OUT="$(run_install Linux "$D" --install --report-only)"; RC=$?
+assert_eq "$RC" 0 "--install --report-only still renders the disarmed artifact"
+assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "--dry-run" "and the artifact it wrote really is disarmed"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
