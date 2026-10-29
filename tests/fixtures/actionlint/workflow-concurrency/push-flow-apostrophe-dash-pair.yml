@@ -1,0 +1,16 @@
+# A dash is a value position in the line-oriented caller (`- run:` is a block sequence entry) but has no
+# structural meaning inside a flow collection, so an apostrophe after the dash is ordinary text. Reusing
+# the line rule here opened a phantom string AND a second apostrophe closed it, so the unclosed-quote
+# fallback never fired: the separating comma stayed inside the "string", the cancelling pair was never
+# read, and R2's absent-key arm took the non-cancelling default — GREEN on a main-branch workflow that
+# cancels (#2660 round 14). The flow splitter now uses a value-position test without the dash.
+name: push flow apostrophe dash pair
+on:
+  push:
+    branches: [main]
+concurrency: {group: v5-don-'t, cancel-in-progress: true, note: don't}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

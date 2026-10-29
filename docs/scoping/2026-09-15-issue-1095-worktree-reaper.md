@@ -272,7 +272,7 @@ Real git (not a shim) is used for every git probe: the gates *are* git semantics
 | The allowlisted-ephemeral pre-delete blocks (huge / locked `.venv`) | `REMOVE-FAILED` + `FAILED=1` + `exit 4`; the checkout and its admin record stay | `A16` |
 | The end-of-pass `git worktree prune` blocks | `PRUNE-FAIL` + `FAILED=1` + `exit 4`; the gone-checkout record stays registered | `A17` |
 | A branch ref was force-deleted but `worktree list` still prints it | NOT reported as `branch-retained`; PRESERVE + record not pruned (dir present and gone) | `A18a`, `A18b` |
-| The origin-remote slug probe fails (open-PR gate unverifiable) | `exit 3` with nothing removed — never read as "no GitHub remote" (which silently disabled the veto) | `A19`, `A19b` |
+| The origin-remote slug probe fails (PR-state gate unverifiable) | `exit 3` with nothing removed — never read as "no GitHub remote" (which silently disabled the veto) | `A19`, `A19b` |
 | A detached HEAD held ONLY by `refs/remotes/*` | Preserved with `remote-only-ref`; the revocable ref named; the commit proven to reach *no* ref after `fetch --prune` | `A20` |
 | A detached HEAD held ONLY by a local tag | Preserved with `revocable-ref`; the tag named; `fetch.pruneTags=true` proven to delete the tag and take the commit to no ref | `A22` |
 | A commit held only by a remote-tracking `MAIN_REF` | Still `refs=merged` — the merged fast path is not disqualified by the revocable-ref rejection | `A20c` |
