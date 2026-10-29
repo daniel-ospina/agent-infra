@@ -43,6 +43,13 @@
 #   * CAPACITY, NOT DIRECTORIES: two installs carrying one `agentName` are one slot (measured: 47 and
 #     35, both `pi-runner-cell4-x64-1`), and a box whose root is a MIXED directory (`/opt` with
 #     `/opt/containerd` in it) must still be measurable when a non-member is provably not an install.
+#   * THE PRIVATE TEMP ROOT (#7815): a self-hosted runner hands every job the box's SHARED `/tmp`, so a
+#     suite that guards its temp dir by OWNERSHIP fails on other people's files — a tortoise shard died
+#     with `SharedTmpdirScanError: os.scandir('/tmp')` while one unrelated fixture had written 337 GB into
+#     `/private/tmp` (#3003). `RUNNER_TEMP` cannot be that root (per job, absent before the first job, and
+#     an ABSENT `$TMPDIR` makes Python silently fall back to the shared dir), so every instance gets its OWN
+#     stable `$instance/_tmp` (0700) exported as TMPDIR/TMP/TEMP before `exec`, bounded by an mtime sweep —
+#     and the sweep must NOT run on a live-listener path, because mtime age is not a holder witness.
 #   * FAIL-CLOSED: every unreadable reading is `cannot-measure` (rc 2) and changes nothing.
 #   * the MUTATION case at the end proves the floor assertion is LIVE: a copy with the floor
 #     comparison removed must stop refusing. A suite that passes against the mutant pins nothing.
@@ -72,6 +79,9 @@ assert_omits() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present
 mode_of() { if stat -c '%a' "$1" >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi; }
 assert_absent() { if [ -e "$1" ]; then bad "$2 (exists: $1)"; else ok "$2"; fi; }
 assert_file() { if [ -f "$1" ]; then ok "$2"; else bad "$2 (absent: $1)"; fi; }
+# ⛔ A DIRECTORY IS NOT A FILE: `assert_file` is `[ -f ]`, which is FALSE for the private temp roots
+#   this suite asserts on, so using it there reports "absent" for a directory that exists.
+assert_dir() { if [ -d "$1" ]; then ok "$2"; else bad "$2 (not a directory: $1)"; fi; }
 count_lines() { local n; n="$(wc -l <"$1" 2>/dev/null)" || n=0; printf '%s' "$((n))"; }
 # listeners_for <dir> — how many live listeners GitHub would see for that instance dir.
 # ⛔ pgrep, not `ps | grep`: a `grep -F <path>` command line CONTAINS the path it searches for, so it
@@ -333,6 +343,21 @@ export RUNNER_MEM_FLOOR_MB=3584 RUNNER_CORES_PER_SLOT=3 RUNNER_START_SETTLE_S=1
 export RUNNER_POOL_REPO="daniel-ospina/tortoise"
 export RUNNER_LABELS=self-hosted-x64
 export PATH="$BIN:$PATH"
+
+# ⛔ THE SHIPPED FUNCTION BODIES, VERBATIM (never a re-typed copy) — `main` runs only at the bottom of
+#   the script, so extracting a function is how a unit-level arm is asserted. ⛔ THE SED SCRIPT IS
+#   SINGLE-QUOTED ON PURPOSE: bash 3.2 (macOS's /bin/bash) brace-expands the `{/,/^}` range inside a
+#   DOUBLE-quoted sed script that reaches it through `eval`, which split the expression into two nonsense
+#   words and made every assertion in the owner-guard case below pass vacuously on that host.
+shipped_fns() { # <pool> <fn>…
+  local pool="$1" fn; shift
+  for fn in "$@"; do sed -n '/^'"$fn"'() {/,/^}/p' "$pool"; done
+}
+# ⛔ THE FULL SET THE OWNER GUARD NEEDS: `ensure_tmpdir` delegates the private root to
+#   `ensure_private_tmp`, which delegates the owner comparison to `tmp_owner_guard` and the age bound to
+#   `sweep_tmp_root` — extracting only the entry point would leave those undefined and every assertion
+#   would then be measuring a command-not-found instead of the guard.
+TMPDIR_FNS=(instance_tmpdir instance_tmp_root sweep_tmp_root tmp_owner_guard ensure_private_tmp ensure_tmpdir)
 
 run()      { bash "$POOL" "$@" 2>&1; }
 rc_of()    { bash "$POOL" "$@" >/dev/null 2>&1; printf '%s' "$?"; }
@@ -826,10 +851,18 @@ assert_contains "$out" "ceiling=unmeasured" "the summary discloses that the add 
 
 # A prefix that would mint an invalid name must not spin the add loop. Own pool: at the ceiling no
 # add is attempted at all, so the pass would exit 0 for the wrong reason.
+# ⛔ `timeout(1)` is GNU coreutils and macOS has no such binary (rc 127 reads as "the pass failed" when
+# nothing ran at all), so on such a host the case is SKIPPED and NAMED rather than reported as a red.
 fresh_pool prefix
-out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 POOL_PREFIX='nested/x' timeout 20 bash "$POOL" reconcile 2>&1)"; rc=$?
-assert_eq "$rc" "2" "a prefix that cannot name a valid runner ends the pass (rc 2), it does not spin"
-assert_absent "$RUNNER_ROOT/nested" "an invalid prefix created nothing"
+if command -v timeout >/dev/null 2>&1; then
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 POOL_PREFIX='nested/x' timeout 20 bash "$POOL" reconcile 2>&1)"; rc=$?
+  assert_eq "$rc" "2" "a prefix that cannot name a valid runner ends the pass (rc 2), it does not spin"
+  assert_absent "$RUNNER_ROOT/nested" "an invalid prefix created nothing"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 POOL_PREFIX='nested/x' bash "$POOL" reconcile 2>&1)"
+  assert_eq "$?" "2" "a prefix that cannot name a valid runner ends the pass (rc 2), it does not spin (no timeout(1) here to bound a regression)"
+  assert_absent "$RUNNER_ROOT/nested" "an invalid prefix created nothing"
+fi
 
 # ⛔ A NAME COLLISION MUST NOT END THE PASS: six stale dirs occupy -1..-6 and the next free name is
 # -7. Ending on the first collision would leave the box BELOW its ceiling with exit 0.
@@ -1250,13 +1283,19 @@ assert_eq "$?" "0" "restart succeeds when the TMPDIR already exists"
 assert_eq "$(mode_of "$RUNNER_ROOT/pi-runner-keep/tmp")" "755" "a pre-existing directory keeps its mode (no chmod)"
 assert_omits "$out" "created tmpdir=" "and it does NOT claim to have created anything"
 
-# ── (2) an instance whose .env names NO TMPDIR is untouched ────────────────────────────────
+# ── (2) an instance whose .env names NO TMPDIR still gets its own PRIVATE root (#7815) ──────
+# This is the COMMON shape (an `add`-provisioned instance ships no `.env`), and it used to be the one
+# that inherited the BOX's shared temp dir. "Nothing is invented for `.env`" still holds; the private
+# root is a separate, deliberate subject — inside the instance dir, created before the listener starts.
 echo "── tmpdir: an instance that names none ──"
 fresh_pool tmpnone; reset_logs
 register pi-runner-none
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-none)"
 assert_eq "$?" "0" "restart of an instance with no .env is unaffected"
-assert_omits "$out" "created tmpdir=" "no directory is invented"
+assert_omits "$out" "created tmpdir=" "no `.env`-named directory is invented"
+assert_contains "$out" "created tmpdir-root=$RUNNER_ROOT/pi-runner-none/_tmp" \
+  "but the instance's OWN private temp root is created, and printed"
+assert_eq "$(mode_of "$RUNNER_ROOT/pi-runner-none/_tmp")" "700" "mode 0700"
 
 # ── (3) a RELATIVE value is REFUSED, because no directory here could be the one a job uses ──
 # ⛔ `run.sh` `cd`s to the instance dir before the listener READS TMPDIR — but the listener hands that
@@ -1581,21 +1620,20 @@ if [ "$(id -u)" -eq 0 ]; then
 elif [ "$(PATH=/usr/bin:/bin:/usr/sbin:/sbin ps -o user= -p 1 2>/dev/null | tr -d '[:space:]')" = "$(id -un)" ]; then
   skip "an owner mismatch (pid 1 in this container already runs as $(id -un))"
 else
-  # Reach the shipped functions directly, EXTRACTED VERBATIM (never a re-typed copy): `main` runs only
-  # at the bottom of the script, so extracting the two functions is how a unit-level arm is asserted.
+  FNS="$T/shipped-fns.sh"; export FNS
+  shipped_fns "$POOL" "${TMPDIR_FNS[@]}" >"$FNS"
+  # shellcheck disable=SC2016
   own_out="$(POOL="$POOL" ROOT="$RUNNER_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c '
-    eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
-    eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
-    err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+    err() { echo "$*" >&2; }; log_line() { echo "$*"; }; DRY=0 TMP_MAX_AGE_MIN=1440
+    . "$FNS"
     ensure_tmpdir "$ROOT/pi-runner-own" 1
   ' 2>&1)"
   assert_contains "$own_out" "cannot-measure why=tmpdir-owner-mismatch" "the live arm refuses an owner whose access it cannot measure"
   assert_contains "$own_out" "pid=1 runs as user=" "naming the live listener it compared"
   assert_absent "$RUNNER_ROOT/pi-runner-own/tmp" "and it created nothing under the wrong owner"
   POOL="$POOL" ROOT="$RUNNER_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c '
-    eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
-    eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
-    err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+    err() { echo "$*" >&2; }; log_line() { echo "$*"; }; DRY=0 TMP_MAX_AGE_MIN=1440
+    . "$FNS"
     ensure_tmpdir "$ROOT/pi-runner-own"
   ' >/dev/null 2>&1
   if [ -d "$RUNNER_ROOT/pi-runner-own/tmp" ]; then ok "the START path (no live listener) still creates it"; else bad "the start path stopped creating the directory"; fi
@@ -1604,14 +1642,189 @@ fi
 # table), the live repair still has to go through — the false block this guard would otherwise create
 # on every box whose `ps` is not a real one.
 own_shim="$(POOL="$POOL" ROOT="$RUNNER_ROOT" bash -c '
-  eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
-  eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
-  err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+  err() { echo "$*" >&2; }; log_line() { echo "$*"; }; DRY=0 TMP_MAX_AGE_MIN=1440
+  . "$FNS"
   ensure_tmpdir "$ROOT/pi-runner-own-shim" 1
 ' 2>&1)"
 assert_omits "$own_shim" "tmpdir-owner-mismatch" "a shim-shaped ps reading is NOT turned into a refusal"
 if [ -d "$RUNNER_ROOT/pi-runner-own-shim/tmp" ]; then ok "and the live repair still creates the directory under it"; else bad "a shim-shaped ps blocked the repair"; fi
 
+
+# ══ PRIVATE TEMP ROOT: EVERY INSTANCE HAS ITS OWN (agent-infra#7815) ════════════════════════
+# A CI shard died with `SharedTmpdirScanError: os.scandir('/tmp')` in tortoise's
+# `tests/_tmpdir_hygiene.py`: that guard scans the HOST temp dir and refuses entries it does not own, so
+# on a self-hosted runner with no `.env`-named TMPDIR every job inherited the BOX's `/tmp` — shared with
+# every other runner install on that machine, every peer lane, and one unrelated fixture that had
+# written 337 GB there (agent-infra#3003). A shared temp dir makes that guard unpassable for reasons no
+# PR controls. These cases pin the two halves that can each silently disappear:
+#   the DIRECTORY (0700, inside the instance, re-created by every start), and
+#   the EXPORT    (the listener — and therefore every job — is exec'd with TMPDIR/TMP/TEMP in it).
+# Both are observed from INSIDE the listener stub, at the instant the real `run.sh` would hand that env
+# to a job, so a launcher that merely created a directory cannot pass.
+echo "── private temp root: one per instance, 0700, inside its own instance dir ──"
+fresh_pool tmpiso; reset_logs
+register pi-runner-iso-a
+register pi-runner-iso-b
+ISOLOG="$T/iso.log"; : >"$ISOLOG"
+root_a="$RUNNER_ROOT/pi-runner-iso-a/_tmp"
+root_b="$RUNNER_ROOT/pi-runner-iso-b/_tmp"
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$ISOLOG" run restart --name pi-runner-iso-a >/dev/null
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$ISOLOG" run restart --name pi-runner-iso-b >/dev/null
+assert_dir "$root_a" "instance A has a private temp root"
+assert_dir "$root_b" "instance B has a private temp root"
+assert_eq "$(mode_of "$root_a")" "700" "A's root is 0700 (a private per-runner temp dir)"
+assert_eq "$(mode_of "$root_b")" "700" "B's root is 0700"
+assert_ne "$root_a" "$root_b" "the two instances get DIFFERENT temp roots"
+assert_ne "$root_a" "/tmp" "A's root is not the machine-wide /tmp"
+assert_ne "$root_b" "/tmp" "B's root is not the machine-wide /tmp either"
+case "$root_a" in
+  "$RUNNER_ROOT/pi-runner-iso-a/"*) ok "A's root is INSIDE A's own instance dir" ;;
+  *) bad "A's root is not inside its own instance dir (got: $root_a)" ;;
+esac
+case "$root_b" in
+  "$RUNNER_ROOT/pi-runner-iso-b/"*) ok "B's root is INSIDE B's own instance dir" ;;
+  *) bad "B's root is not inside its own instance dir (got: $root_b)" ;;
+esac
+# ⛔ THE LISTENER'S OWN ENV, not the directory's existence: this is the assertion that goes red when the
+#   export is removed, and it is why the stub records what it inherited rather than what exists after.
+assert_contains "$(cat "$ISOLOG")" "present $root_a" "A's listener was exec'd with A's root as TMPDIR"
+assert_contains "$(cat "$ISOLOG")" "present $root_b" "B's listener was exec'd with B's root as TMPDIR"
+assert_eq "$(grep -cF -- "present $root_a" "$ISOLOG")" "1" "exactly one start recorded A's root (no cross-wiring)"
+# ⛔ COMPARED AS RESOLVED PATHS: `tempfile.gettempdir()` normalises (`//`→`/`, and a symlinked base
+#   such as macOS's /var → /private/var is a DIFFERENT spelling of the same directory), so a raw string
+#   comparison would go red over a purely cosmetic difference and prove nothing about isolation.
+tmpdir_of() { env TMPDIR="$1" python3 -c 'import os,tempfile;print(os.path.realpath(tempfile.gettempdir()))'; }
+assert_eq "$(tmpdir_of "$root_a")" "$(cd "$root_a" && pwd -P)" \
+  "inside A's environment tempfile.gettempdir() IS A's root — the HOST temp dir the tortoise hygiene guard scans"
+assert_eq "$(tmpdir_of "$root_b")" "$(cd "$root_b" && pwd -P)" \
+  "and inside B's environment it is B's root"
+assert_ne "$(tmpdir_of "$root_a")" "$(tmpdir_of "$root_b")" \
+  "so two runners on one box cannot see each other's temp files"
+assert_ne "$(tmpdir_of "$root_a")" "$(cd /tmp && pwd -P)" \
+  "and neither resolves to the machine-wide /tmp (the shared root this change removes)"
+assert_absent "$RUNNER_ROOT/pi-runner-iso-a/_work/_temp" \
+  "RUNNER_TEMP is NOT created or moved here — the runner owns it, per job"
+
+# ── a RE-INSTALLED instance gets the root back with no hand action ─────────────────────────
+# The invariant: `reconcile`/`add` can recreate an instance and the isolation returns. `add` copies the
+# release and calls `start_listener`, which is the same path that creates `_tmp` — so nothing has to
+# remember the property separately.
+echo "── private temp root: a re-installed instance gets it back ──"
+pkill -f -- "$RUNNER_ROOT/pi-runner-iso-a/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.3
+rm -rf "$RUNNER_ROOT/pi-runner-iso-a"     # the instance dir is GONE (a /tmp wipe, an operator rm -rf)
+assert_absent "$root_a" "the instance dir — and with it the private root — is gone"
+: >"$ISOLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$ISOLOG" run add --name pi-runner-iso-a)"
+assert_eq "$?" "0" "add re-creates the instance (rc 0)"
+assert_dir "$root_a" "and the private temp root is back — with no hand action"
+assert_eq "$(mode_of "$root_a")" "700" "still 0700"
+assert_contains "$(cat "$ISOLOG")" "present $root_a" "and the re-installed listener is exec'd with it"
+
+# ── the STABLE root is BOUNDED: an age sweep at every start, not per-job cleanup ──────────
+# A stable root grows forever; the runner's per-job `_work/_temp` would not. The bound is mtime AGE, so
+# it cannot race a job (whose scratch is minutes old) and it is safe to run on a LIVE instance.
+echo "── private temp root: the age bound sweeps it, and keeps what a job may hold ──"
+mkdir -p "$root_b/stale-dir"; : >"$root_b/stale-dir/x"; : >"$root_b/stale-file"
+touch -t 200001010000 "$root_b/stale-dir/x" "$root_b/stale-file" "$root_b/stale-dir"
+: >"$root_b/fresh-file"
+assert_file "$root_b/stale-file" "the stale entry exists before the sweep"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b)"
+assert_eq "$?" "0" "restart of the LIVE instance succeeds"
+assert_absent "$root_b/stale-file" "an entry older than RUNNER_TMP_MAX_AGE_MIN is swept"
+assert_absent "$root_b/stale-dir" "a stale DIRECTORY is swept too"
+assert_file "$root_b/fresh-file" "a fresh entry is KEPT — the bound cannot race a running job"
+assert_contains "$out" "swept tmpdir-root=$root_b removed=2" "the sweep prints what it removed (a bound nobody can see is a wish)"
+# ⛔ THE BOUND IS THE OPERAND, not a constant in the code. The file below is ~2 days old: the DEFAULT
+#   bound (1440 = 24 h) sweeps it, a 69-day bound keeps it — so this pair proves the sweep's threshold is
+#   what decides, in both directions. (`date -v-2d` is BSD, `date -d` is GNU; the first one that works is
+#   used, so the fixture ages identically on both lanes.)
+: >"$root_b/stale-2"
+two_days_ago="$(date -v-2d '+%Y%m%d%H%M' 2>/dev/null || date -d '2 days ago' '+%Y%m%d%H%M')"
+touch -t "$two_days_ago" "$root_b/stale-2"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b)"
+assert_absent "$root_b/stale-2" "the default (24 h) bound sweeps an entry two days old"
+: >"$root_b/stale-2"
+touch -t "$two_days_ago" "$root_b/stale-2"
+out="$(RUNNER_TMP_MAX_AGE_MIN=100000 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b)"
+assert_omits "$out" "swept tmpdir-root=" "a wider RUNNER_TMP_MAX_AGE_MIN sweeps nothing"
+assert_file "$root_b/stale-2" "so the SAME file survives the wider bound — the operand is the threshold"
+rm -f "$root_b/stale-2"
+
+# ── a MISSING private root is a DEFECT (rc 3) and the printed remedy restores it ──────────
+# ⛔ The shape that does the damage: LIVE listener, GitHub says `online`, and the TMPDIR it hands to
+#   every job does not exist. `status` tested only a `.env`-named path, so an instance naming none — the
+#   common one — read as a HEALTHY row over exactly this state.
+echo "── private temp root: a missing one is a source-reported defect, with a runnable remedy ──"
+rm -rf "$root_b"                            # deleted UNDER the live listener
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "3" "a missing private root is a defect (rc 3), not a healthy report"
+assert_contains "$out" "defect tmpdir-missing name=pi-runner-iso-b path=$root_b" "the defect names the instance and the path"
+assert_contains "$out" "summary live=2 dead=0" "and it is NOT a dead-listener verdict (the listener is live)"
+assert_contains "$out" "tmpdir_defects=1" "the summary counts it, so a caller need not parse the table"
+remedy="$(sed -n 's/.*run: \(.*restart --name pi-runner-iso-b\)$/\1/p' <<<"$out")"
+assert_contains "$remedy" "restart --name pi-runner-iso-b" "the remedy is parsed out of the report (not restated)"
+# shellcheck disable=SC2086
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash $remedy 2>&1)"
+assert_eq "$?" "0" "the PRINTED REMEDY runs and exits 0"
+assert_dir "$root_b" "and it restores the private root"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "0" "the report is clean again"
+assert_contains "$out" "tmpdir_defects=0" "with the count back at zero"
+
+# ── a PREVIEW may not mutate the root (and must tell the truth about it) ─────────────────
+pkill -f -- "$RUNNER_ROOT/pi-runner-iso-a/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.3
+rm -rf "$root_a"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-a --dry-run)"
+assert_eq "$?" "0" "a preview of a start with a missing private root succeeds"
+assert_contains "$out" "dry-run: would create tmpdir-root=$root_a" "naming the root it would create"
+assert_absent "$root_a" "and the preview MUTATED nothing"
+: >"$ISOLOG"
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$ISOLOG" run restart --name pi-runner-iso-a >/dev/null
+assert_dir "$root_a" "the real start then creates it"
+assert_contains "$(cat "$ISOLOG")" "present $root_a" "and hands it to the listener"
+
+# ── MUTATION: removing the EXPORT takes the isolation with it ──────────────────────────────
+# ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. This copy deletes ONLY the export, leaving the
+#   directory creation (and the sweep) intact — so it proves the listener assertions above are reading
+#   the EXPORT and not the directory's existence.
+echo "── private temp root: mutation — without the export the job gets the box's temp dir ──"
+fresh_pool tmpmutex; reset_logs
+register pi-runner-mut-env
+MUTENV="$T/mutant-tmp-export.sh"
+python3 - "$POOL" "$MUTENV" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+# BOTH halves of the handover: the exported variables AND the line that announces them. Removing only
+# the exec-line would leave the announcement printing a path the listener never got.
+announce = '  log_line "env name=$(basename "$d") TMPDIR=$t TMP=$t TEMP=$t (RUNNER_TEMP is the runner\'s own)"\n'
+export_line = '    TMPDIR="$t" TMP="$t" TEMP="$t" exec "$d/run.sh"\n'
+for needle in (announce, export_line):
+    assert text.count(needle) == 1, "the listener's temp export moved: update the mutation target"
+text = text.replace(announce, '').replace(export_line, '    exec "$d/run.sh"\n')
+open(dst, "w", encoding="utf-8").write(text)
+PY
+assert_file "$MUTENV" "the export mutation copy was produced"
+root_m="$RUNNER_ROOT/pi-runner-mut-env/_tmp"
+: >"$ISOLOG"
+mut_out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$ISOLOG" bash "$MUTENV" restart --name pi-runner-mut-env 2>&1)"
+assert_omits "$mut_out" "env name=" "the MUTANT never announces the env it hands over"
+assert_dir "$root_m" "the mutant still CREATES the directory (the two halves are separable)"
+assert_omits "$(cat "$ISOLOG")" "present $root_m" \
+  "and its listener is exec'd WITHOUT it — the job then writes to whatever the box gave it, i.e. the shared temp dir this change removes"
+pkill -f -- "$RUNNER_ROOT/pi-runner-mut-env/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.3
+# … and the SHIPPED launcher, on the SAME fixture, does hand it over — so the assertion is two-sided.
+: >"$ISOLOG"
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$ISOLOG" run restart --name pi-runner-mut-env >/dev/null
+assert_contains "$(cat "$ISOLOG")" "present $root_m" "the SHIPPED launcher gives the same instance its private root (the assertion is live)"
+
+# ── the sweep's bound is a VALIDATED operand (a typo must not disable it silently) ───────
+out="$(RUNNER_TMP_MAX_AGE_MIN=08 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "2" "a zero-padded RUNNER_TMP_MAX_AGE_MIN is cannot-measure (rc 2), never a fatal sweep"
+assert_contains "$out" "cannot-measure why=tmp-max-age-unreadable" "and it names the operand"
 
 # ── MUTATION: removing the creation must break these cases ────────────────────────────────
 # ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. The copy below is the shipped script with the
@@ -1733,10 +1946,18 @@ assert_eq "$(rc_of add)" "1" "add with no --name exits 1"
 # instead of the documented rc 1, and `--name --dry-run` consumed the FLAG as a name, leaving DRY at 0
 # so a preview installed a runner for real.
 fresh_pool argv; reset_logs
-assert_eq "$(timeout 10 bash "$POOL" add --name >/dev/null 2>&1; echo $?)" "1" \
-  "'add --name' with no value exits 1 (it used to loop forever)"
-assert_eq "$(timeout 10 bash "$POOL" restart --name >/dev/null 2>&1; echo $?)" "1" \
-  "'restart --name' with no value exits 1"
+# ⛔ `timeout(1)` IS GNU COREUTILS AND macOS HAS NO SUCH BINARY: without it these two cases were `rc 127`
+#   (command not found) — a RED that says nothing about the shipped script, on every macOS run, and the
+#   loop guard they exist for was never measured there. The comparison is an exit code, so a host without
+#   the binary must SKIP (and say so) rather than report a red nobody can act on; both bash lanes run it.
+if command -v timeout >/dev/null 2>&1; then
+  assert_eq "$(timeout 10 bash "$POOL" add --name >/dev/null 2>&1; echo $?)" "1" \
+    "'add --name' with no value exits 1 (it used to loop forever)"
+  assert_eq "$(timeout 10 bash "$POOL" restart --name >/dev/null 2>&1; echo $?)" "1" \
+    "'restart --name' with no value exits 1"
+else
+  skip "the no-value-argument loop guards ('add --name' / 'restart --name' would HANG, not fail, without a timeout(1) binary on this host)"
+fi
 assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name --dry-run)" "1" \
   "the preview FLAG is not consumed as the name"
 assert_absent "$RUNNER_ROOT/--dry-run" "an 'add --name --dry-run' installed nothing"
