@@ -200,8 +200,17 @@
 # is one, `$instance/_tmp` otherwise — rather than reading as healthy while every job dies at `mktemp`.
 # ⚠️ LIMIT, stated rather than implied: a listener that is ALREADY RUNNING keeps the environment it was
 # exec'd with, and this tool never re-execs a live listener (that is the double-start it exists to
-# prevent) — so `restart` restores the LAYOUT for the next start, and only a unit restart makes a
-# running listener pick the private root up. `status` reports the layout, not a live process's env.
+# prevent) — so `restart` restores the LAYOUT, and the NEXT start through `start_listener` is what
+# carries the private root into a listener's env.
+# ⛔ AND A BARE **UNIT RESTART DOES NOT CONFER IT** (#7815 review, F2). The export lives in exactly one
+# place — `start_listener`'s `TMPDIR="$t" TMP="$t" TEMP="$t" exec "$d/run.sh"` — and nothing in this
+# repo renders a runner unit or an `Environment=TMPDIR=` for one, so a unit restart re-execs `run.sh`
+# with the UNIT's environment: it reproduces a `.env`-named TMPDIR, and for an instance with no `.env`
+# (the common shape) it hands the listener NO TMPDIR at all — every job then falls back to the box's
+# shared temp dir, silently, while `status` grades the LAYOUT and calls the row clean. The two remedies
+# that DO work: start the listener THROUGH this tool (stop it, then `restart --name <n>` on the now-dead
+# listener, or `add`), or give the unit `Environment=TMPDIR=$instance/_tmp` (with `TMP`/`TEMP` beside it)
+# so its own exec carries the root. `status` reports the layout, not a live process's env.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -279,6 +288,21 @@ validate_operands() {
   if ! is_uint "$MAX_SKEW_S"; then
     err "cannot-measure why=skew-bound-unreadable value=${MAX_SKEW_S:-<empty>} (RUNNER_MAX_SKEW_S must be a positive integer of seconds)"; return 2
   fi
+  # ⛔ THE SWEEP'S BOUND IS AN OPERAND TOO, AND IT LIVES HERE — NOT IN `readings()` (#7815 review, F1).
+  # `readings()` runs on `status`, `add` and `reconcile`'s ADD arm only; `restart` — the verb the new
+  # `defect tmpdir-missing` remedy PRINTS, and the verb a scheduler drives — never calls it, so a check
+  # that lived there was absent on exactly the path that sweeps. Measured on this box:
+  #   RUNNER_TMP_MAX_AGE_MIN=24h  -> `find -mmin +24h` is rc 1 with NO output, so nothing is ever swept,
+  #                                 `removed=0`, no `swept …` line, `restart` exits 0 — the one property
+  #                                 the private root is bounded by is silently disabled;
+  #   RUNNER_TMP_MAX_AGE_MIN=0    -> `-mmin +0` matches EVERY entry older than a minute, i.e. a RUNNING
+  #                                 job's scratch on a live listener (the live-repair arm sweeps while
+  #                                 jobs may be in flight), silently deleted.
+  # `validate_operands` runs in `main` for EVERY verb before dispatch (`--help` still returns first), so
+  # this is the one home where no verb can reach the sweep unvalidated.
+  if ! is_uint "$TMP_MAX_AGE_MIN"; then
+    err "cannot-measure why=tmp-max-age-unreadable value=${TMP_MAX_AGE_MIN:-<empty>} (RUNNER_TMP_MAX_AGE_MIN must be a positive integer of minutes — the age bound of each instance's _tmp)"; return 2
+  fi
   # ⛔ THE REPO IS AN OPERAND TOO, and it now has TWO consumers: the `gh` token path
   # (`repos/$POOL_REPO/...`) and the registration URL (`https://github.com/$POOL_REPO`). A URL-form or
   # multi-slash value produces `https://github.com/https://github.com/o/r`; config.sh then fails at
@@ -304,11 +328,9 @@ readings() {
   if ! is_uint "$CORES_PER_SLOT"; then
     err "cannot-measure why=cores-per-slot-unreadable value=${CORES_PER_SLOT:-<empty>}"; return 2
   fi
-  # ⛔ THE SWEEP'S BOUND IS AN OPERAND TOO: `find -mmin +0x` and `find -mmin +` are both errors or
-  # surprises, and a --dry-run/real asymmetry here would make the preview lie about what it removes.
-  if ! is_uint "$TMP_MAX_AGE_MIN"; then
-    err "cannot-measure why=tmp-max-age-unreadable value=${TMP_MAX_AGE_MIN:-<empty>} (RUNNER_TMP_MAX_AGE_MIN must be a positive integer of minutes — the age bound of each instance's _tmp)"; return 2
-  fi
+  # ⛔ THE SWEEP'S BOUND IS VALIDATED IN `validate_operands`, NOT HERE (#7815 review, F1): this function
+  # is not on the `restart` path, and `restart` is the verb that sweeps. A check here was absent where
+  # it mattered.
   MEM_MB="$(cap_mem_free_mb 2>/dev/null)" || MEM_MB=""
   if ! is_uint "$MEM_MB"; then
     MEM_MB=""; err "cannot-measure why=mem-unreadable (cap_mem_free_mb gave no usable value)"; return 2

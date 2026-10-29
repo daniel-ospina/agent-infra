@@ -1825,6 +1825,20 @@ assert_contains "$(cat "$ISOLOG")" "present $root_m" "the SHIPPED launcher gives
 out="$(RUNNER_TMP_MAX_AGE_MIN=08 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
 assert_eq "$?" "2" "a zero-padded RUNNER_TMP_MAX_AGE_MIN is cannot-measure (rc 2), never a fatal sweep"
 assert_contains "$out" "cannot-measure why=tmp-max-age-unreadable" "and it names the operand"
+# ⛔ AND IT IS VALIDATED ON THE VERB THAT SWEEPS (#7815 review, F1). The check used to live in
+#   `readings()`, which `restart` never calls — so `RUNNER_TMP_MAX_AGE_MIN=abc` reached
+#   `find -mmin +abc` (rc 1, no output) and quietly swept NOTHING, i.e. the bound was disabled on the
+#   very path the `defect tmpdir-missing` remedy prints. Both directions are asserted: the operand is
+#   refused, and the stale entry it would have judged is still there (a refusal that still swept would
+#   make the rc a lie).
+: >"$root_b/never-swept"; touch -t 200001010000 "$root_b/never-swept"
+out="$(RUNNER_TMP_MAX_AGE_MIN=abc FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b 2>&1)"
+assert_eq "$?" "2" "restart REFUSES an unreadable RUNNER_TMP_MAX_AGE_MIN (rc 2) instead of sweeping on it"
+assert_contains "$out" "cannot-measure why=tmp-max-age-unreadable" "naming the operand on the sweeping verb too"
+assert_file "$root_b/never-swept" "and NOTHING was swept on the refused pass"
+rm -f "$root_b/never-swept"
+out="$(RUNNER_TMP_MAX_AGE_MIN=0 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b 2>&1)"
+assert_eq "$?" "2" "and `0` (which `find -mmin +0` reads as \"everything older than a minute\") is refused too"
 
 # ── MUTATION: removing the creation must break these cases ────────────────────────────────
 # ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. The copy below is the shipped script with the

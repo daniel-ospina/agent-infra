@@ -333,9 +333,13 @@ ruling that there is no lane ceiling tied to cpu count.
   would vanish silently. `_tmp` is therefore STABLE, and is therefore **swept**: every start (and every
   live repair) removes entries older than `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h), which cannot race
   a running job. A `.env` that names a TMPDIR still wins — it is sourced after the export. `status`
-  reports a missing root as `defect tmpdir-missing` (rc 3) and the printed `restart` recreates it; a
-  listener that is ALREADY RUNNING keeps the env it was exec'd with, so a **unit restart** is what makes
-  a long-lived listener pick the private root up.
+  reports a missing root as `defect tmpdir-missing` (rc 3) and the printed `restart` recreates it.
+  ⛔ A listener that is ALREADY RUNNING keeps the env it was exec'd with, and **a bare unit restart does
+  not confer the private root**: the export lives only in `start_listener`, so a unit restart reproduces
+  a `.env`-named TMPDIR and, for an instance with no `.env`, hands the listener no TMPDIR at all — the
+  jobs silently fall back to the box's shared temp dir while `status` grades the layout and reads clean.
+  The remedies that work: start the listener through this tool (stop it, then `restart --name <n>` on the
+  now-dead listener, or `add`), or give the unit `Environment=TMPDIR=$instance/_tmp` (plus `TMP`/`TEMP`).
 - **The pool is every LIVE runner ON THE BOX, not every directory under one root.** `RUNNER_ROOT` must be
 the directory that **CONTAINS** the instance dirs (one level above them) — its default
 `/tmp/actions-runner` is where this tool puts what it creates, and on a hand-provisioned box the
