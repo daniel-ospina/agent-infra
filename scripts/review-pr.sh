@@ -74,14 +74,25 @@
 #      marker — agent-infra#1224).
 #
 # EXIT CODES (each names its cause on stderr). NO RECORD is written on exits 2-8 and 10. Exit 9
-# is the record/artifact arm, and it covers FOUR cases that need DIFFERENT remedies (a table
+# is the record/artifact arm, and it covers SIX cases that need DIFFERENT remedies (a table
 # that described it as "the one that can leave a record behind" pointed two of them at a
-# remedy that cannot work — P3, fresh review of #2288):
+# remedy that cannot work — P3, fresh review of #2288; the pin's two refusals were the fifth and
+# sixth, and merging them — P2, fresh review of PR #2988 — ordered a fresh PAID review where the
+# remedy was to re-run the recorder):
 #   * the recorder RAN and FAILED (non-zero) — nothing was recorded, and re-running the recorder is
 #     the remedy (the review comment already exists and is nameable);
 #   * the recorder SUCCEEDED but the artifact check (c) reads is not right (no record bound to
 #     the head, no body marker, or a marker posted unsigned) — the remedy IS to re-run the
 #     recorder, not to re-review, and a record may already exist;
+#   * the recorder RAN and REFUSED the `--expect-head` pin (rc=3), and that refusal has TWO forms
+#     with OPPOSITE remedies, so each is named separately (P2, fresh review of PR #2988 — keying on
+#     the flag's presence merged them): the PR head MOVED between the review and the record (a fresh
+#     review at the new head is owed: the verdict is intact and its subject moved), versus the pin
+#     could NOT BE CHECKED because the recorder could not read the PR's live head (a gh/API
+#     transport failure — the head did not move, so the remedy is to RE-RUN THE RECORDER, and buying
+#     a fresh review would be paying for a review of a head nobody disputed). Both stay on exit 9
+#     rather than exit 8 because exit 8's documented invariant is that NOTHING was posted, and by
+#     this point the review COMMENT is posted and is what the record would name as its evidence;
 #   * the recorder was never REACHED (not found / not a regular executable, before any review
 #     was paid for) — nothing was consumed and there is nothing to re-run against;
 #   * the notes or the verdict COMMENT could not be posted — no comment id exists to name as
@@ -345,7 +356,7 @@ if record_at_head "$HEAD"; then
   err "$PROG: a clean record ALREADY EXISTS at head ${HEAD:0:12}… for $REPO#$PR ($MATCHED_RECORD) — refusing to review and re-record an unchanged head."
   err "  A second record at the same head dilutes the audit trail instead of adding evidence, so this is a refusal, not a no-op."
   err "  If that record's marker is missing from the PR body (its evidence post is best-effort), the documented remedy is to re-run the recorder — its same-head write is idempotent and its marker append is too:"
-  err "    $RECORDER $PR $HEAD clean $REPO --evidence comment:<id>"
+  err "    $RECORDER $PR $HEAD clean $REPO --evidence comment:<id> --expect-head $HEAD"
   exit "$E_ALREADY"
 fi
 
@@ -2356,11 +2367,51 @@ if [ ! -d "$RUN_DIR" ]; then
   err "review-pr: the run directory VANISHED mid-run ($RUN_DIR) — recreating it to capture the recorder's output. This is a defence, not an explanation; the review and the comment are unaffected."
   mkdir -p "$RUN_DIR" 2>/dev/null || true
 fi
-"$RECORDER" "$PR" "$HEAD" clean "$REPO" --evidence "comment:$CID" >"$RUN_DIR/record.out" 2>&1
+# ⛔ #2572 — THE RECORD IS PINNED TO THE HEAD THAT WAS REVIEWED, NOT TO WHATEVER HEAD THE PR IS AT.
+# `--expect-head` is the recorder's ONLY defence against its #2982 carry arm re-pointing a record at
+# a live head this run did not review: given a positional sha and a live head that differ, the carry
+# arm re-binds the verdict to the LIVE head whenever the reviewed DIFF is unchanged — a true statement
+# about the PR head, and NOT an answer to "record this sha" (tortoise#9492). Every check above this
+# line (the §G post-review head re-read included) is a statement about `$HEAD`; without the pin the
+# one call that MINTS the record is free to attest a different revision, so the seam's advertised
+# guarantee ("bound to the head it actually reviewed") held everywhere except at the chokepoint.
+# ⛔ HONEST SCOPE, the same shape as the repo-conflict branch in read_meta: `$HEAD` is validated as
+# full 40-hex at the META read, so on today's code this guard cannot fire. It stays because it IS the
+# executable statement of the invariant the pin depends on — a pin can only be STATED for a sha, and
+# a future loosening of that validation must fail HERE (nothing recorded) rather than mint a record
+# with an unstated pin. This is the fail-closed arm for "the head cannot be pinned", not decoration.
+if ! [[ "${HEAD:-}" =~ ^[0-9a-f]{40}$ ]]; then
+  die "$E_RECORD" "the reviewed head '${HEAD:-<empty>}' is not a full 40-hex sha, so --expect-head cannot be stated — refusing to call the recorder UNPINNED: a record minted here binds to whatever head the PR happens to be at (#2572), which is not the revision this run reviewed. NOTHING was recorded; the review comment (comment:$CID) is an artifact for the reviewed head only."
+fi
+"$RECORDER" "$PR" "$HEAD" clean "$REPO" --evidence "comment:$CID" --expect-head "$HEAD" >"$RUN_DIR/record.out" 2>&1
 REC_RC=$?
 sed 's/^/    /' "$RUN_DIR/record.out" >&2 || true
-[ "$REC_RC" -eq 0 ] \
-  || die "$E_RECORD" "record-review.sh FAILED rc=$REC_RC at head ${HEAD:0:12}… — no record was minted, so check (c) stays red. Its output is above; the review comment (comment:$CID) stands and can be recorded by hand once the cause is fixed."
+# ⛔ THE RECORDER HAS **TWO** EXIT-3 REFUSALS THAT NAME THE PIN, WITH OPPOSITE REMEDIES (P2, fresh
+# review of PR #2988). Keying the classification on the FLAG's presence — `grep -q -- '--expect-head'`,
+# which is what shipped — merges them, because both arms print the flag:
+#   * record-review.sh:2884 `--expect-head: the PR head is <live>, NOT the <pin> you named`
+#     ⇒ the head genuinely MOVED. Remedy: a fresh review at the new head (the verdict is intact, its
+#       subject moved, so the refused record is the only one that would have been honest).
+#   * record-review.sh:3029 `--expect-head: could not verify the PR head against <pin>`
+#     ⇒ the pin could not be CHECKED — a transient gh/API failure (403 secondary rate limit, 5xx,
+#       expired token; the #784 population) leaving CURRENT_HEAD unreadable. THE HEAD DID NOT MOVE.
+#       Remedy: RE-RUN THE RECORDER once the transport is healthy. Ordering a fresh review here buys a
+#       second PAID run (REVIEW_TIMEOUT = 1800 s) for a head nobody disputed.
+# So classify on the PRODUCER'S OWN WORDS. `tests/review-pr/run.sh` §A3(5) greps record-review.sh for
+# both literals, so a reword on either side turns CI RED instead of silently re-grading the refusal.
+PIN_MOVED_LIT='--expect-head: the PR head is '
+PIN_UNCHECKABLE_LIT='could not verify the PR head against'
+if [ "$REC_RC" -ne 0 ]; then
+  if [ "$REC_RC" -eq 3 ] && grep -qF -- "$PIN_MOVED_LIT" "$RUN_DIR/record.out" 2>/dev/null; then
+    die "$E_RECORD" "the PR head MOVED between the review and the record: the recorder REFUSED the --expect-head pin (rc=3) rather than bind this clean verdict to ${HEAD:0:12}…, and its refusal above names both shas. NOTHING was recorded — a record minted now would attest the live head, which this run did not review. Re-run this command at the new head: a fresh review is owed, not a carry."
+  fi
+  if [ "$REC_RC" -eq 3 ] && grep -qF -- "$PIN_UNCHECKABLE_LIT" "$RUN_DIR/record.out" 2>/dev/null; then
+    die "$E_RECORD" "record-review.sh could NOT CHECK the --expect-head pin at head ${HEAD:0:12}… (rc=3, its refusal is above): the recorder could not READ the PR's live head, which is a gh/API TRANSPORT failure — not a moved head, and not a defect in the review. ⛔ THE HEAD DID NOT MOVE: comment:$CID is still the artifact for ${HEAD:0:12}…, so NO fresh review is owed and none should be bought. NOTHING was recorded. Retry the RECORD once gh is healthy — \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID --expect-head $HEAD\` — which is idempotent at this head."
+  fi
+  # The residual arm: rc≠0 with neither pin refusal named — a genuine recorder fault, or an rc=3 the
+  # producer raised for another reason. Deliberately NOT a catch-all for the two arms above.
+  die "$E_RECORD" "record-review.sh FAILED rc=$REC_RC at head ${HEAD:0:12}… — no record was minted, so check (c) stays red. Its output is above; the review comment (comment:$CID) stands and can be recorded by hand once the cause is fixed."
+fi
 
 # rc=0 is NOT proof the artifact landed (merge-one.sh's #1717 rule: the recorder has
 # reachable rc=0 paths where the PR-body marker was never posted).
@@ -2449,9 +2500,9 @@ MARKER_STATE="$(marker_state "$BODY_AFTER")"
 case "$MARKER_STATE" in
   signed) ;;
   unsigned)
-    die "$E_RECORD" "the record is written and an UNSIGNED marker is in the PR body, but no signature could be minted — AI_REVIEW_GATE_KEY is not configured (env or ~/.pi/agent/.ai-review-gate-key), so the ai-review-gate required check will stay RED at this head and the merge will be refused. Nothing to re-review: fix the key, then re-run \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` (its same-head write is idempotent) to re-post a signed marker." ;;
+    die "$E_RECORD" "the record is written and an UNSIGNED marker is in the PR body, but no signature could be minted — AI_REVIEW_GATE_KEY is not configured (env or ~/.pi/agent/.ai-review-gate-key), so the ai-review-gate required check will stay RED at this head and the merge will be refused. Nothing to re-review: fix the key, then re-run \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID --expect-head $HEAD\` (its same-head write is idempotent) to re-post a signed marker." ;;
   *)
-    die "$E_RECORD" "record-review.sh rc=0 and the record file exists, but the PR BODY carries no marker bound to $REPO#$PR at ${HEAD:0:12}… — check (c) reads the body, not the record store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). Re-run the recorder to retry the post: \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` (its append is idempotent)." ;;
+    die "$E_RECORD" "record-review.sh rc=0 and the record file exists, but the PR BODY carries no marker bound to $REPO#$PR at ${HEAD:0:12}… — check (c) reads the body, not the record store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). Re-run the recorder to retry the post: \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID --expect-head $HEAD\` (its append is idempotent)." ;;
 esac
 # ⛔ THE RECORD'S OWN DIFF MUST BE THE DIFF THE REVIEWER READ (P2, third fresh review of #2288 —
 # MEASURED, a signed record minted over a diff nobody reviewed). The pre-post DIFF_AFTER check reads
@@ -2499,7 +2550,7 @@ if [ -n "${MARKER_DIFFS//[[:space:]]/}" ]; then
     if [ "$_md" = "$DIFF_RAW_HASH" ] || { [ -n "$DIFF_NORM_HASH" ] && [ "$_md" = "$DIFF_NORM_HASH" ]; }; then _dok=1; fi
   done <<<"$MARKER_DIFFS"
   if [ "$_dok" != "1" ]; then
-    die "$E_MOVED" "the SIGNED record's diff ($(printf '%s' "$MARKER_DIFFS" | tr '\n' ' ')) is NOT the diff the reviewer read (raw $DIFF_RAW_HASH, normalized ${DIFF_NORM_HASH:-n/a}) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. ⛔ THE REMEDY IS THE RECORDER, NOT A RE-RUN OF THIS SEAM (P3, sixth fresh review of #2288): this run already wrote the record, so re-running the seam would exit at the unchanged-head guard. Re-run it by hand — \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` — which appends a marker for the diff on disk now, and a same-head marker that matches CLEARS this check."
+    die "$E_MOVED" "the SIGNED record's diff ($(printf '%s' "$MARKER_DIFFS" | tr '\n' ' ')) is NOT the diff the reviewer read (raw $DIFF_RAW_HASH, normalized ${DIFF_NORM_HASH:-n/a}) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. ⛔ THE REMEDY IS THE RECORDER, NOT A RE-RUN OF THIS SEAM (P3, sixth fresh review of #2288): this run already wrote the record, so re-running the seam would exit at the unchanged-head guard. Re-run it by hand — \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID --expect-head $HEAD\` — which appends a marker for the diff on disk now, and a same-head marker that matches CLEARS this check."
   fi
 else
   DIFF_SIGNED="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" \
