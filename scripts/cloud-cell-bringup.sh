@@ -715,6 +715,13 @@ check_dispatch() {
   #     issue assignee/holder INCOMPLETE … the roster was NEVER PROVISIONED in this cell
   #     [refresh] ABORT: none of the 12 candidate(s) … judged NOTHING
   # Provisioned HERE, from this box's OWN population, so "never provisioned" cannot recur.
+  # ⛔ THIS `--check` PATH WRITES, DELIBERATELY AND IN THE OPEN (#3032 review F7). A `--check` that
+  # silently mutated state would be a contract change; this one is stated instead: the roster is a
+  # PREREQUISITE of dispatch, `--check` is the last gate before a cell is started, and a check that
+  # only REPORTED an unprovisioned roster would leave the cell dispatching nothing — the defect
+  # (#1935) this whole change removes. The write is idempotent (a second run writes nothing) and
+  # non-destructive (a hand-maintained roster is never replaced, and an existing derived roster is
+  # never shrunk by an arm that measured nothing).
   # ⛔ rc=3 is a WARNING, not a death: it means the population could not be MEASURED on this box,
   # and the harness's reduced-surface path (refresh-candidates.sh, #2848) can still dispatch by
   # handing the holder question to the cross-box claim registry. Killing a cell over an

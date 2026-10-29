@@ -70,12 +70,15 @@ Usage
 
 Exit codes
 ----------
-    0  provisioned — the roster now states this box's truth (written, already current, or a
-       hand-maintained roster left in place)
+    0  provisioned — the roster states this box's truth: written, already current, or a
+       HAND-MAINTAINED roster LEFT IN PLACE (another box's curation, not this tool's to
+       replace — a bring-up is not failed over it, because the file exists and is usable)
     2  ACTION NEEDED — the roster is absent or stale and this invocation was not allowed to
-       write it (`--check`, or a hand-maintained roster without `--force`)
-    3  REFUSED — the population could not be MEASURED, or the roster EXISTS and the read of it
-       failed; nothing was written, and the reason is printed (the caller must not read this as
+       write it (`--check`, i.e. no `--apply`). ALSO a USAGE error: `--force` without `--apply`
+       (argparse's own exit code for bad arguments)
+    3  REFUSED — the population could not be MEASURED; the roster EXISTS and the read of it
+       failed; or this run would have SHRUNK a derived roster on an arm that measured NOTHING.
+       Nothing was written, and the reason is printed (the caller must not read this as
        "provisioned")
 """
 from __future__ import annotations
@@ -86,6 +89,11 @@ import os
 import subprocess
 import sys
 import tempfile
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — Windows has no flock; the lock is a courtesy there
+    fcntl = None  # type: ignore[assignment]
 
 #: The marker that says "this file was derived by this script", so a refresh can tell its own
 #: output from a hand-maintained roster. It is a COMMENT in the reader's grammar
@@ -318,20 +326,23 @@ def lane_label(cwd: str) -> str:
 
 
 def issue_label(label: str) -> str:
-    """The row's third column: `lane:<N>` when the lane's own name carries a work-item number.
+    """The row's third column: the lane's own `lane:` annotation, or EMPTY.
 
-    The reader treats this column as the lane's OWN `lane:` annotation (`fleet_state` prefers
-    the last non-empty value per label), and a number in the lane's name is the same mechanical
-    evidence `attribute_claims` uses — never a title or a comment (#8175). No number ⇒ EMPTY,
-    not a guess.
+    ⛔ THE THIRD COLUMN IS WRITTEN EMPTY, DELIBERATELY (#3032 review F4). This used to publish
+    `lane:<the first digit run in the lane's name>`, and that is a MANUFACTURED label, not an
+    annotation. The fleet's real grammar is a SLUG — `lane:c1-capture`, `lane:c5-9-mcp-sdk`,
+    `lane:w0-test-substrate` — and a `gh label list` over both repos holds ZERO `lane:<digits>`
+    labels. A worktree named `docs-2026-10-17` produced `lane:2026`, which is a REAL (closed)
+    issue number; `scripts/turn-end.py` then hands this column to the lane as "Your lane label is
+    `lane:2026` — its open issues are `gh issue list --label lane:2026`", i.e. an empty set. A
+    date or a PR number published as the lane's work-item attribution is the #8177
+    fabricated-holder class, in the one file whose whole purpose is attribution.
+
+    Nothing in a workspace's cwd knows its GitHub label, so this column says exactly that: EMPTY.
+    That is also what the sanctioned writer does (`scripts/turn-classify.py` writes `""` when it
+    does not know), so the two writers agree instead of one of them guessing.
     """
-    digits = ""
-    for ch in label:
-        if ch.isdigit():
-            digits += ch
-        elif digits:
-            break
-    return f"lane:{digits}" if digits else ""
+    return ""
 
 
 def derive_rows(workspaces: list[dict]) -> tuple[list[tuple[str, str, str]], list[str]]:
@@ -344,6 +355,7 @@ def derive_rows(workspaces: list[dict]) -> tuple[list[tuple[str, str, str]], lis
     rows: list[tuple[str, str, str]] = []
     excluded: list[str] = []
     seen: set[str] = set()
+    seen_labels: set[str] = set()
     for ws in workspaces:
         wsid = ws.get("id") or ws.get("workspaceId") or ws.get("uuid")
         cwd = ws.get("current_directory") or ws.get("currentDirectory") or ws.get("cwd")
@@ -381,7 +393,17 @@ def derive_rows(workspaces: list[dict]) -> tuple[list[tuple[str, str, str]], lis
         if key in seen:
             excluded.append(f"{label}: duplicate row for workspace {wsid[:8]}")
             continue
+        # ⛔ THE SAME LANE FROM TWO CHECKOUTS IS ONE LANE (#3032 review F5). The reader keys its
+        # rows by LABEL (`by_title`, last-non-empty-wins), so two rows for one label collapse
+        # THERE — silently, and whatever the second row said wins. Deduping only on the workspace
+        # uuid rostered both and left the collapse to the reader, which is the silent direction.
+        if label.lower() in seen_labels:
+            excluded.append(
+                f"{label}: duplicate row for lane {label!r} (workspace {wsid[:8]}) — the reader"
+                " keys lanes by label, so only the first row is effective")
+            continue
         seen.add(key)
+        seen_labels.add(label.lower())
         rows.append((label, wsid.upper(), issue_label(label)))
     rows.sort(key=lambda r: (r[0].lower(), r[1]))
     return rows, excluded
@@ -400,8 +422,10 @@ def render(rows: list[tuple[str, str, str]], arm: str, note: str) -> str:
         f"# {note}",
         "#",
         "# label<TAB>workspace-uuid<TAB>issue-label — one row per cmux-workspace lane. Derived from",
-        "# this box's own lane population; edit by hand only if you mean to override the derivation",
-        "# (a hand-edited file loses the marker, and this script will then never replace it).",
+        "# this box's own lane population. A hand edit that REMOVES the marker line above makes",
+        "# this file hand-maintained and this script will never replace it. APPENDING a row does",
+        "# NOT remove the marker, so an appended row is reported as dropped when a later run",
+        "# cannot reproduce it (never silently), and such rows are best left to turn-classify.py.",
     ]
     for label, wsid, lane in rows:
         out.append("\t".join([label, wsid, lane]))
@@ -462,16 +486,25 @@ def write_atomic(path: str, text: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(add_help=True, description=__doc__.splitlines()[0])
-    ap.add_argument("--check", action="store_true", help="report only (the default)")
-    ap.add_argument("--apply", action="store_true", help="write the roster")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="report only (the default)")
+    mode.add_argument("--apply", action="store_true", help="write the roster")
     ap.add_argument("--force", action="store_true",
-                    help="replace a HAND-MAINTAINED roster (never implied by --apply)")
+                    help="MODIFIER of --apply: allow replacing a HAND-MAINTAINED roster, and allow "
+                         "a derived roster to shrink. NEVER implies --apply")
     ap.add_argument("--print", dest="print_rows", action="store_true",
                     help="print the rows that would be written")
     ap.add_argument("--roster", default=None, help="roster path (test seam)")
     args = ap.parse_args(argv)
+    # ⛔ `--force` IS A MODIFIER, NEVER A SUBSTITUTE FOR `--apply` (#3032 review F2). It used to
+    # set `apply = True`, so a bare `--force` — or `--check --force`, the "report, but with force
+    # armed" an operator reaches for — REPLACED a hand-maintained roster and returned 0. The
+    # documented usage is `--apply --force`; the file's central promise is that a roster it has
+    # never seen is never replaced; and an invocation that never said "write" must not write.
     if args.force and not args.apply:
-        args.apply = True
+        print("REFUSED: --force is a MODIFIER of --apply, never a substitute — this invocation did "
+              "not ask to write, so nothing was written. Re-run as `--apply --force`.")
+        return 2
 
     path = roster_path(args.roster)
     try:
@@ -569,12 +602,79 @@ def main(argv: list[str] | None = None) -> int:
         print("  (this is a deliberate non-destructive rule: the file is another box-wide "
               "attribution, and a bring-up must not overwrite it to satisfy a form)")
         return 0
+
+    # ⛔ F1 (#3032 review): NEVER SHRINK A DERIVED ROSTER ON AN ARM THAT MEASURED NOTHING.
+    # `arm=not-applicable` is decided from the CURRENT probe alone — the daemon is silent and no
+    # layout file exists — and one 45 s daemon timeout lands there. Its zero rows are therefore an
+    # UNMEASURED population, which is the same datum the refuse arm calls "not an empty fleet".
+    # Overwriting a roster this very script filled would publish "0 cmux lanes" for a box that
+    # HAS lanes, and the board reads it as `measured=True, 0 rows` — a fact, not a gap. `rows_now`
+    # is evidence this tool already holds; refusing beats trusting one probe over it.
+    if present and ours and arm == "not-applicable" and rows_now and not args.force:
+        print(f"REFUSED: the roster at {path} carries {len(rows_now)} row(s) that THIS SCRIPT "
+              "wrote, and this run measured NO population to replace them with")
+        print("  arm=not-applicable MEASURES NOTHING: the cmux daemon does not answer and no "
+              "workspace layout was ever persisted, so a zero-row result is an UNREAD population, "
+              "not an empty one")
+        print("  nothing was written — re-run when the daemon answers, or say `--apply --force` to "
+              "declare those rows stale")
+        return 3
+
+    current = ""
     if present and ours:
+        # ── F3: READ-MODIFY-WRITE UNDER THE LOCK THE OTHER WRITERS HONOUR ────────────────
+        # `scripts/turn-classify.py` APPENDS rows to this exact file under `fcntl.flock`, and its
+        # own comment says it is "a read-modify-write on a file shared with lane-status.py /
+        # lane-actions.py". So re-read under that same lock instead of trusting the `existing()`
+        # snapshot: a row that arrived in between must be SEEN, or this rewrite deletes it.
+        # RESIDUAL, stated rather than hidden: `write_atomic` ends in `os.replace`, which swaps
+        # the inode, so an `a+` holder cannot follow it — the exposure is the instant between this
+        # read and the replace, and `turn-classify` re-adopts its own rows on its next pass.
         try:
             with open(path, errors="ignore") as fh:
-                current = fh.read()
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX)
+                    except OSError:
+                        pass
+                try:
+                    current = fh.read()
+                finally:
+                    if fcntl is not None:
+                        try:
+                            fcntl.flock(fh, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
         except OSError:
             current = ""
+
+        # ── F3: A ROW THIS DERIVATION DOES NOT PRODUCE IS NAMED, NEVER DROPPED IN SILENCE ──
+        # The comment this replaced claimed "a hand-edited file loses the marker, and this script
+        # will then never replace it". APPENDING A ROW is the common hand edit and it KEEPS the
+        # marker, so that promise was false and the row vanished without a word. Every existing
+        # row this run does not reproduce is now reported, with the evidence that justifies
+        # removing it — the measurement is the justification, not this tool's convenience.
+        if arm == "derive":
+            live = {str(ws.get("id") or ws.get("workspaceId") or ws.get("uuid") or "").upper()
+                    for ws in workspaces}
+            produced = {(r[1].upper(), r[0].lower()) for r in rows}
+            for ln in current.splitlines():
+                if not ln.strip() or ln.startswith("#") or "\t" not in ln:
+                    continue
+                parts = ln.split("\t")
+                label_old = parts[0]
+                wsid_old = parts[1].upper() if len(parts) > 1 else ""
+                if (wsid_old, label_old.lower()) in produced:
+                    continue
+                if not wsid_old:
+                    print(f"  dropped: {label_old} — the row carries no workspace uuid, so "
+                          "nothing here can attribute it to a live lane")
+                elif wsid_old not in live:
+                    print(f"  dropped: {label_old} ({wsid_old[:8]}) — the workspace is not in "
+                          "this run's live cmux answer, so its row is superseded")
+                else:
+                    print(f"  dropped: {label_old} ({wsid_old[:8]}) — the workspace is live but "
+                          "the lane is no longer a fleet worktree this run can roster")
         if current == text:
             print(f"CURRENT: {path} ({len(rows)} row(s), arm={arm})")
             return 0

@@ -114,10 +114,18 @@ run_it --apply
 chk "A3 --apply provisions the roster (rc 0)" '[ "$RC" -eq 0 ]'
 chk "A4 the roster EXISTS" '[ -f "$ROSTER" ]'
 chk "A5 two fleet lanes are rostered" '[ "$(grep -vc "^#" "$ROSTER")" -eq 2 ]'
-chk "A6 the linked worktree row carries label/uuid/lane:77" \
-    'grep -q "lane-77	C2C97E96-0CBC-4DFE-BC91-FEF44F09B5BD	lane:77" "$ROSTER"'
+chk "A6 the linked worktree row carries label/uuid" \
+    'grep -q "lane-77	C2C97E96-0CBC-4DFE-BC91-FEF44F09B5BD" "$ROSTER"'
 chk "A7 the wt- lane row is rostered with the wt- prefix removed" \
-    'grep -q "lane-88	AA11BB22-CC33-DD44-EE55-FF6677889900	lane:88" "$ROSTER"'
+    'grep -q "lane-88	AA11BB22-CC33-DD44-EE55-FF6677889900" "$ROSTER"'
+# ⛔ #3032 review F4: the third column used to be `lane:<first digit run in the lane name>`, which
+# published `lane:2026` for a worktree named `docs-2026-10-17` — a REAL (closed) issue number. The
+# fleet's grammar is a SLUG (`lane:c1-capture`, `lane:c5-9-mcp-sdk`) and zero `lane:<digits>` labels
+# exist in either repo, while `turn-end.py` hands this column to the lane as
+# `gh issue list --label <it>`. So the column is EMPTY unless something actually knows the label,
+# and nothing in a cwd does.
+chk "A16 no row carries a FABRICATED lane:<digits> label (#3032 F4)" \
+    '! grep -v "^#" "$ROSTER" | grep -q "lane:"'
 chk "A8 the OWNER's project is NOT rostered (#8177 attribution)" \
     '! grep -qi "deadbeef" "$ROSTER"'
 chk "A9 the shared checkout is NOT rostered" '! grep -q "11112222" "$ROSTER"'
@@ -192,6 +200,25 @@ rm -f "$CASE/home/Library/Application Support/cmux/session-com.cmuxterm.app.json
 run_it --apply
 chk "D8 the SAME daemon failure provisions once ONLY the layout is gone (the discriminator is the layout)" \
     '[ "$RC" -eq 0 ] && [ -f "$ROSTER" ]'
+# ⛔ #3032 review F1: this arm is decided from the CURRENT probe alone (daemon silent + no layout),
+# and one 45 s daemon timeout lands here. Its zero rows are therefore an UNMEASURED population —
+# the same datum the refuse arm calls "not an empty fleet" — so it must never overwrite a roster
+# this very script already filled. `rows_now` is evidence the tool holds; refusing beats
+# publishing "0 cmux lanes" for a box that HAS lanes (the board reads that as measured fact).
+mk_case shrink; mk_stub 1 junk; tmux_path
+printf '%s\n' "# provisioned-by: provision-lane-registry.py" "# arm: derive" \
+    "lane-77	C2C97E96-0CBC-4DFE-BC91-FEF44F09B5BD	" > "$ROSTER"
+cp "$ROSTER" "$T/shrink.first"
+run_it --apply
+chk "D9 an arm that MEASURED NOTHING refuses to shrink a derived roster to zero (rc 3)" \
+    '[ "$RC" -eq 3 ]'
+chk "D10 …the roster is byte-identical afterwards (nothing was written)" \
+    'cmp -s "$ROSTER" "$T/shrink.first"'
+chk "D11 …and the refusal names the disagreement, not a generic error" \
+    'case "$OUT" in *"measured NO population"*) true;; *) false;; esac'
+run_it --apply --force
+chk "D12 --force is how an operator declares those rows stale (rc 0, zero rows)" \
+    '[ "$RC" -eq 0 ] && [ "$(grep -vc "^#" "$ROSTER")" -eq 0 ]'
 
 echo
 echo "== E. HAND-MAINTAINED: never replaced, not even by --apply =="
@@ -204,6 +231,18 @@ chk "E2 the file is byte-identical (a bring-up must not overwrite attribution)" 
     'cmp -s "$ROSTER" "$T/hand.first"'
 chk "E3 the report SAYS it left the authored file alone" \
     'case "$OUT" in *"HAND-MAINTAINED"*) true;; *) false;; esac'
+# ⛔ #3032 review F2: `--force` used to imply `--apply`, so these two invocations — a bare
+# `--force`, and `--check --force` (the "report, but with force armed" an operator reaches for) —
+# REPLACED the curated roster and returned 0. `--force` is a MODIFIER; a call that never said
+# "write" must not write.
+run_it --force
+chk "E5 --force WITHOUT --apply is a usage error (rc 2), never a write" '[ "$RC" -eq 2 ]'
+chk "E6 …and the curated roster is byte-identical (#3032 F2)" 'cmp -s "$ROSTER" "$T/hand.first"'
+chk "E7 …and it says --force is a modifier, never a substitute" \
+    'case "$OUT" in *"MODIFIER of --apply"*) true;; *) false;; esac'
+run_it --check --force
+chk "E8 --check --force writes NOTHING either (a report never mutates) (#3032 F2)" \
+    '[ "$RC" -ne 0 ] && cmp -s "$ROSTER" "$T/hand.first"'
 run_it --apply --force
 chk "E4 --force replaces it with the derived roster" \
     '[ "$RC" -eq 0 ] && grep -qx "# provisioned-by: provision-lane-registry.py" "$ROSTER" && [ "$(grep -vc "^#" "$ROSTER")" -eq 2 ]'
@@ -256,7 +295,7 @@ JSON
       python3 "$SCRIPT" --apply --roster "$ROSTER" >"$T/abs.out" 2>&1
 )
 chk "H4 …while the SAME directory spelled absolutely IS rostered (the discriminator is the SPELLING)" \
-    'grep -q "lane-88	AAAA1111-2222-3333-4444-555566667777	lane:88" "$ROSTER"'
+    'grep -q "lane-88	AAAA1111-2222-3333-4444-555566667777" "$ROSTER"'
 
 echo
 echo "== I. EMPTY WORKSPACE LIST: a live daemon's zero is an UNREAD population, not an empty fleet =="
@@ -313,13 +352,49 @@ else
 fi
 
 echo
-echo "== G. WIRING: the bring-up and the supervisor both call it =="
-chk "G1 cloud-cell-bringup.sh provisions the roster" \
-    'grep -q "provision-lane-registry.py" "$ROOT/scripts/cloud-cell-bringup.sh"'
-chk "G2 cloud-cell-supervisor.sh provisions the roster" \
-    'grep -q "provision-lane-registry.py" "$ROOT/scripts/cloud-cell-supervisor.sh"'
+echo
+echo "== G. WIRING: the bring-up and the supervisor both call it, and classify its rc =="
+# ⛔ #3032 review F6: these two used to grep for the FILENAME only, which a COMMENT satisfies. They
+# now require the actual `--apply` invocation, so deleting the call and leaving the prose behind
+# reds the suite.
+chk "G1 cloud-cell-bringup.sh PROVISIONS the roster (the --apply call, not a mention)" \
+    'grep -qF "provision-lane-registry.py\" --apply" "$ROOT/scripts/cloud-cell-bringup.sh"'
+chk "G2 cloud-cell-supervisor.sh PROVISIONS the roster (the --apply call, not a mention)" \
+    'grep -qF "provision-lane-registry.py\" --apply" "$ROOT/scripts/cloud-cell-supervisor.sh"'
+# The rc arms are the highest-stakes part of the change and used to be pinned by nothing. A
+# regression to `die` on rc 3 would false-block EVERY cell, and it would pass the rest of this
+# suite; a regression that fell through to the `ok` arm on rc 1 is the false-PASS the call sites'
+# own comments say they fix. These are STRUCTURAL pins (the branch shape), which is weaker than
+# driving the functions: that would need the callers to be sourceable, and they run `main` on
+# source. Stated plainly rather than dressed up as behavioural coverage.
+chk "G4 the bring-up treats rc 3 as a WARNING, not a die (a die would false-block every cell)" \
+    'grep -qE "elif \[ .*provrc.*-ne 0" "$ROOT/scripts/cloud-cell-bringup.sh"'
+chk "G5 the supervisor treats rc 3 as a WARNING, not a die" \
+    'grep -qE "elif \[ .*rvrc.*-ne 0" "$ROOT/scripts/cloud-cell-supervisor.sh"'
+chk "G6 the supervisor reports ok ONLY in the rc-0 arm (rc 1/127 is never provisioned)" \
+    'grep -qF "ok: lane roster" "$ROOT/scripts/cloud-cell-supervisor.sh"'
 chk "G3 this suite is WIRED into the shard list (an unwired suite reds bash-suites by design)" \
     'bash "$ROOT/scripts/run-bash-shards.sh" --list | grep -qx "scripts/orchestrator-harness/provision-lane-registry.test.sh"'
+
+echo
+echo "== K. ONE LANE, TWO CHECKOUTS: a duplicate LABEL is excluded and NAMED =="
+# ⛔ #3032 review F5: dedupe was keyed on the workspace uuid only, so two checkouts of the SAME
+# lane rostered TWO rows for one label — which the reader then collapses silently (`by_title`,
+# last-non-empty-wins). The second row's attribution would win with nothing said.
+mk_case dup
+mkdir -p "$CASE/repo2/.worktrees/lane-77" "$CASE/repo2/.git/worktrees/lane-77"
+printf 'gitdir: %s\n' "$CASE/repo2/.git/worktrees/lane-77" > "$CASE/repo2/.worktrees/lane-77/.git"
+mk_stub 0 payload
+cat > "$CASE/list.json" <<JSON
+{"window_ref":"window:1","workspaces":[
+ {"id":"c2c97e96-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77 A","current_directory":"$CASE/repo/.worktrees/lane-77"},
+ {"id":"d3d3d3d3-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77 B","current_directory":"$CASE/repo2/.worktrees/lane-77"}
+]}
+JSON
+run_it --apply
+chk "K1 only ONE row is rostered for the shared label" '[ "$(grep -vc "^#" "$ROSTER")" -eq 1 ]'
+chk "K2 the duplicate is NAMED as excluded, never silently collapsed" \
+    'case "$OUT" in *"duplicate row for lane"*) true;; *) false;; esac'
 
 echo
 echo "==> $PASS passed, $FAIL failed"

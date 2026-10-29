@@ -2271,6 +2271,11 @@ cmd_check() {
   # cell had none and EVERY candidate came back INCOMPLETE while the controller reported RUNNING
   # (measured on cell 1, 2026-10-28). `check` is the last gate before a cell is started, so the
   # roster is provisioned HERE, from the box's own lane population, and the arm it took is printed.
+  # ⛔ THIS `check` VERB WRITES, DELIBERATELY AND IN THE OPEN (#3032 review F7). It is the last gate
+  # before a cell is started, so a check that only REPORTED an unprovisioned roster would leave the
+  # cell dispatching nothing — the #1935 defect. The write is idempotent and non-destructive (a
+  # hand-maintained roster is never replaced; an existing derived roster is never shrunk by an arm
+  # that measured nothing) — the provisioner's own rules, pinned in its suite.
   # ⛔ Idempotent and non-destructive: a hand-maintained roster is never replaced, and a second run
   # on an unchanged box writes nothing (the provisioner's own rules, pinned in its suite).
   # ⛔ A REFUSAL (rc 3) is REPORTED, not fatal: it means this box's population could not be
