@@ -286,7 +286,10 @@ bash scripts/ci_runner_pool.sh status  --all        # rows + readings (--all is 
                                                    # default already lists every runner on THIS box)
 bash scripts/ci_runner_pool.sh add     --name <n>   # floor- and ceiling-gated
 bash scripts/ci_runner_pool.sh restart --name <n>   # bring a dead listener back
+bash scripts/ci_runner_pool.sh reclaim [--name <n>] [--dry-run]
+                                                   # RETIRE a registration GitHub deleted
 bash scripts/ci_runner_pool.sh reconcile            # the pass (idempotent; NOT yet scheduled)
+                                                   # restart -> reclaim -> add, one pass, that order
 ```
 
 Rules, each measured rather than preferred:
@@ -354,6 +357,29 @@ above) and the same box reports its real slots and can restart its real registra
   registered, advertised, idle. The marker is derived from the host's arch by default; an arch we
   cannot name is `cannot-measure`, not a jobless runner. Runner **names** are unique per repo, so the
   prefix defaults to `pi-runner-<host>` — two boxes' passes must not mint the same name.
+- **`slots=` is CAPACITY, not a directory count, and `reclaim` is the verb that repairs a
+  registration GitHub deleted.** Measured on `pi-cell-4` (2026-10-27): `slots=5` against `ceiling=3`
+  on a box with two live listeners — the other three "slots" were a registration GitHub had deleted
+  server-side, a directory with no registration in it, and `/opt/containerd` — so the ADD arm could
+  never run and the box sat one runner short of its own ceiling. `status`/`reconcile` now print
+  `registrations=` (directories), `orphaned=` and `quarantine=` beside `slots=`, and `slots = live +
+  revivable + uninspectable`, DEDUPED BY `agentName` (two directories carrying one `agentName` are one
+  registration, so starting both is not twice the capacity). A registration GitHub deleted is neither
+  capacity nor a startable slot — `restart` starts a listener, the session is refused, and it exits
+  **rc 6** — which is why the repair is `reclaim`: it verifies the refusal IN THIS PASS (under a clock
+  it measured, bounded by `RUNNER_MAX_SKEW_S`) and only then renames the install to
+  `<name>.retired-<stamp>` and removes it. ⛔ **Rename-then-delete is not tidiness**: a bare `rm -rf`
+  that fails halfway has already unlinked `.runner`, leaving bytes no verb can see (measured: 6.9 GB
+  named by nothing), so the pool loses the registration in one step and the leftover keeps a name —
+  `status` reports it as `QUARANTINE` (and `LIVE-QUAR` if a listener is somehow running on it) until
+  the bytes are gone, and `.retired-` is a RESERVED suffix `add` refuses. ⛔ **rc 6 is not rc 2**: "this
+  registration is gone server-side, run `reclaim`" and "I could not act, re-run" lead an operator to
+  opposite next steps, so the code is passed through rather than folded. ⛔ And the evidence `reclaim`
+  acts on is a refusal it dated itself, **never an old log line** — a skewed clock prints the same
+  "registration has been deleted" text and exits permanently (actions/runner#4648), so an install can
+  be DEAD with a HEALTHY registration. An `ORPHANED` row in `status` therefore means "the newest
+  evidence says deleted, a blind restart cannot be assumed to clear it", not "proven gone", and the
+  exit code routes the caller to `reclaim`, the one verb that settles it.
 - **`reconcile` is the point, not the one-shot verbs.** It starts every dead listener, adds only
   above the floor and below the ceiling, and a gate verdict ENDS the pass (the verdict is a
   measurement of the box, not a per-name accident) — while a taken **name** is skipped, because one
@@ -386,11 +412,14 @@ registration for that name under `RUNNER_ROOT`, or something that is not a usabl
 the state and the action that clears it: "clear it, or pick another name" — and, for the "no
 registration" arm, that the reading is the **process table**, so an instance dir outside `RUNNER_ROOT`
 whose listener is DEAD is invisible there) · 3 `status`: the
-report contains a DEAD listener · 4 name not available (that name is taken; try another) · 5 this
+report contains a DEAD listener, an ORPHANED registration, or a `defect tmpdir-missing` row · 4 name
+not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
 local `.runner` while GitHub keeps every registration, and the first name minted after a reboot is
-always taken). ⛔ **4 is checked before 3**: a name that is already taken reports 4 even on a box that
+always taken) · 6 PROVABLY ORPHANED — the listener started and GitHub refused the session because the
+registration no longer exists server-side (`restart`, `reconcile`); nothing was measured wrongly and no
+gate refused it, so a scheduler can branch on "repair with `reclaim`". ⛔ **4 is checked before 3**: a name that is already taken reports 4 even on a box that
 is also at a gate, because the name condition is a fact about the request, not about the box — a
 caller that branches on 4 to try another name must be able to see it. `status`
 exits 3 when a listener is DEAD (the verdict a caller branches on) and 2 — never 0, never 3 — when it

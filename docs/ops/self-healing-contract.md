@@ -328,10 +328,23 @@ fix the red).
 deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doctor.status.json` with
 `rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
-worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `4` crash;
-`64` the command line is unusable (**not** 2, so a launchd typo cannot masquerade as a refusal).
-⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's `ok` stands
-and *"a failure only `launchctl list` can witness is a silent failure"*.
+worktree holding uncommitted work, a refusing transport) stopped the order before delivery, so an
+operator must repair the chain; `6` **NO-CAPACITY** — the box's own spawn gate refused every order,
+**nothing was consumed**, and the sidecar also carries `verdict`, `refusal_bound`
+(`<axis>=<count>[,…]`, e.g. `load=1` or `disk=2,load=1`) and
+`room` (the `capacity.sh probe` record measured at decision time); the reason is a PREFIX —
+`VERDICT=… next=<token> bound=… room=<the few figures>; <the remedy sentence>` — because both readers
+cut the tail (110 chars in the beat), so the remedy must not sit past the cut; `4` crash; `64` the command line is
+unusable (**not** 2, so a launchd typo cannot masquerade as a refusal). ⛔ `3` and `6` are SEPARATE
+because their remedies are opposite — wait vs repair — and a caller that merges them sends an operator
+to the wrong one with full confidence (#2291, measured: `EXIT rc=3 -- 1 order(s) no worker accepted`
+for both). `6` is a pass for `fleet-inventory`'s table (state `WAITING`) **only on the LOAD axis** and is
+**never** rendered `ok`: the queue is not moving while the box has no room, and the other three axes
+(`disk`, `fork`, `land-backlog`) do not clear by waiting — the gate itself says so per code — so those
+render `FAILING`, and a `6` whose bound cannot be read renders `UNKNOWN` (an abstention is never a
+pass). ⛔ The sidecar **must** be overwritten by a
+refusing pass — otherwise the previous pass's
+`ok` stands and *"a failure only `launchctl list` can witness is a silent failure"*.
 `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
 ⛔ **AND `0` IS NOT REACHABLE FROM A PASS THAT REFUSED AN ORDER** (#2710, measured 2026-10-27). A
 worktree refusal that will not clear by waiting (uncommitted work, commits the PR head does not have)
