@@ -1410,14 +1410,42 @@ ck "...and does not log the false 'not found' WARN that the unbound-variable abo
 #
 # Tested in BOTH directions, and the mutations say which half each one kills:
 #   M1  drop `capability` from `cap_refusal_gate`'s normaliser  → 3 red (equality, distinctness, remedy)
-#   M2a delete the `capability) _cap_rc=71` ARM, keep the comment → same 3 red. The USE is what is
-#                                                                    tested; the comment proves nothing.
+#   M2a delete the `capability) _cap_rc=71` ARM, keep the comment → **2 red** (equality, distinctness),
+#                                                                    measured: `capability` falls to the
+#                                                                    `*` arm and exits 75 (equality
+#                                                                    red), `load` also exits 75 so the
+#                                                                    two codes collide (distinctness
+#                                                                    red) — and the REMEDY assertion
+#                                                                    still passes, because the log line
+#                                                                    it reads (`refused at the
+#                                                                    capability gate`) comes from the
+#                                                                    NORMALISER's value, not from the
+#                                                                    arm. The USE is what is tested; the
+#                                                                    comment proves nothing. (This line
+#                                                                    said "same 3 red" before the follow-up
+#                                                                    review measured it — a mutation
+#                                                                    count that no run had produced is
+#                                                                    the claim-without-an-artifact class
+#                                                                    the review gate exists to delete.)
 #   M2b delete the COMMENT only, keep the arm                      → 0 red (the guard is not
 #                                                                    comment-dependent — the exact
 #                                                                    inverse of the old one)
-# (M2c — every caller's code mention replaced by a literal, the comment left in place — used to be
-# GREEN; under the union it stays GREEN only because the ARM still behaves, which is the honest
-# verdict: the name is not the guarantee, the classification is.)
+#   M2c replace every caller's code mention by a literal, comments left in place → **RED**, `unread:
+#                                                                    AGENT_BRIEF_REFUSED`. Measured by
+#                                                                    re-running this guard's own
+#                                                                    `strip_comments` union over a copy of
+#                                                                    the five callers with each mention
+#                                                                    literalled: `_named` becomes EMPTY,
+#                                                                    and the table only ever exercises
+#                                                                    capability/fork/load/land/disk/skew —
+#                                                                    `BRIEF` is the one code the table
+#                                                                    cannot reach, so removing the names
+#                                                                    uncovers it. (This line said the
+#                                                                    opposite — "stays GREEN" — which is
+#                                                                    the more dangerous direction of the
+#                                                                    same defect: it told the next reader
+#                                                                    the union tolerates losing half of
+#                                                                    itself.)
 #
 # ⛔ TWO `s///` EXPRESSIONS, NOT ONE `\|` ALTERNATION: BSD sed (macOS — the box that dispatches to
 # the cells, where this suite is run by hand) has no `\|`, so the compact form
