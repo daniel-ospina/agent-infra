@@ -45,6 +45,8 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 
 ## When to Use
 
+> **`task-workflow-standard` (agent-infra#2861): this skill is NOT dispatched.** `PLAN-VERIFY` writes the `<!-- plan-review: cycles=…, status=…, version=… -->` marker this skill defines, and dispatching it again would be the second blocking pre-code round the redesign removed. It stays mandatory for the epic/project pipelines that `writing-plans` drives.
+
 - Invoked automatically by `writing-plans` after saving a Standard or Complex plan doc
 - Can also be invoked manually: `plan-review docs/plans/<plan>.md`
 - **Skip for Micro tier** — micro plans are inline issue comments, not docs
@@ -68,7 +70,7 @@ Reviewer counts and cycle caps: `proportional-gates` §Review Cycles — never r
 
 **Proportional dispatch:** the tier sets the count; the agent decides whether the plan's size and novelty justify reporting up a tier, notes the decision, and a reviewer sub-agent validates it.
 
-**Adversarial domain — declared threat surface (bound: 2 cycles, orthogonal to the rows above).** When the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), the plan review is bounded by that surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is a **clean exit** for this domain — a literal `NO ISSUES FOUND` is not required, and when the merge rests on threat-list coverage the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
+**Adversarial domain — declared threat surface (bound: 2 cycles, orthogonal to the rows above).** When the change declares a threat surface — a `**Threat classes**` sub-block of a `### Review Scope Contract` (`task-workflow-standard`'s shape) or a scoping comment carrying a legacy `### Adversarial Threat Surface` declaration — for gate/enforcement code whose correctness is "an attacker cannot make it fail open" — the plan review is bounded by that surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is a **clean exit** for this domain — a literal `NO ISSUES FOUND` is not required, and when the merge rests on threat-list coverage the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
 
 ## Input Resolution
 
@@ -463,6 +465,8 @@ Write the updated plan to disk. If the fixer introduced substantial new content 
 
 ### Phase 4 — Gate Loop — MANDATORY
 
+> **Not dispatched by `task-workflow-standard`** — its PLAN-VERIFY is the plan review and writes the marker (see §When to Use).
+
 Each review cycle dispatches FRESH `task` sub-agents. The reviewers have no memory
 of prior cycles, no investment in defending prior fixes. This prevents confirmation bias.
 
@@ -547,7 +551,7 @@ Append a summary line to the plan comment when double-gate runs:
 On exit, append to the bottom of the plan doc:
 
 ```markdown
-<!-- plan-review: cycles=N, status=clean|capped|stalled, version=2.3.0 -->
+<!-- plan-review: cycles=N, status=clean|threat-surface-covered|capped|stalled, version=2.3.0 -->
 ```
 
 **Clean exit:** Return control to writing-plans for Execution Handoff. **Do NOT pause or ask the user for confirmation.** The review cycle IS the quality gate — if it passed, proceed immediately.
