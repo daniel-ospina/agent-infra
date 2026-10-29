@@ -102,7 +102,7 @@ Measured on **pi-cell-1** (Linux, 8 cores, systemd 255) on 2026-10-29:
 | ceiling derivation | `--status`: `by_cores=3 by_memory=9 by_disk=5 bound=cores ceiling=3` from `ncpu=8`, `mem_available_mb=8596` |
 | arm | record written with `ceiling=3`, `reading=ncpu=8 mem_available_mb=8316 ceiling=3` |
 | idempotence | a second `--install` printed `changed=1` only when the artifact was stale, kept the arming record, and left `drift_artifact=no` |
-| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 140 assertions, `PASS=140 FAIL=0`; case-by-case below |
+| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 160 assertions, `PASS=160 FAIL=0`; case-by-case below |
 
 **Not verified here (no macOS host in this lane):** `launchctl bootstrap` on a real Mac, the
 plist's `StartInterval` under `launchd`, and `gui/<uid>` behaviour on a logged-in GUI session. What
@@ -115,7 +115,7 @@ first `--install` to be the real test of that arm.
 ## The self-check, case by case
 
 `scripts/install-runner-autoscale-timer.test.sh` — hermetic (a mktemp fixture root, stub scheduler
-tools, a stub converger), 140 assertions, `PASS=140 FAIL=0`, no network, no real scheduler. What each
+tools, a stub converger), 160 assertions, `PASS=160 FAIL=0`, no network, no real scheduler. What each
 case pins, and why it exists:
 
 | case | what it proves |
@@ -143,6 +143,9 @@ case pins, and why it exists:
 | T19 | `--status` exits 1 and NAMES an unrecognised mode argument (`--apply`), instead of reporting `mode=converge (ARMED)` for an artifact the pass would reject on every tick |
 | T20 | `--install`, `--arm` AND `--disarm` all refuse a sudo-invoked root run — the guard used to live in `--install` only, so `sudo … --arm` wrote a record in `/root` and installed an ARMEd `User=root` unit over the correct one. The guard now runs before each verb's FIRST write, so no record is written either |
 | T22 | `--report-only` is refused with `--arm`, `--disarm` and `--uninstall` — it is a render flag for `--install` only, and with a writer it was measured minting a dated record and printing `ARMED` over a `--dry-run` unit, and performing a REAL removal under a preview flag |
+| T23 | `--uninstall` LEAVES a valid arming record and says so, naming the date and the consequence (the next `--install` renders an ARMED unit). Measured: a bare uninstall + install re-armed from a record the operator believed was gone, while the `--status` remedy promised a DISARMED install. The record is not deleted by `--uninstall` — it is the operator's dated decision, and `--disarm` is the verb that revokes it |
+| T24 | an `ExecStart=` DROP-IN under `$UNIT.d/*.conf` is an override, not a detail: `--status` reports `dropin_override=` and exits 1, and `--arm` refuses BEFORE the record exists. A drop-in that sets no `ExecStart=` is not an override (no false block) |
+| T25 | `--status` accepts the pass's real switch vocabulary (`--status`, `--json`, `--want N`, `--root P`) and reds only an argument this installer never rendered. It used to red anything that was not exactly `--dry-run`, so a working `--want 3` schedule was reported as exiting 2 on every tick |
 | T21 | a RELATIVE interpreter pin is refused: a scheduler resolves it against its own working directory, so the unit would 203/EXEC every tick while `list-timers` showed it scheduled |
 
 The case list lives here, not in the suite's header: the working-tree guard tokenises a script's
@@ -169,4 +172,23 @@ bash scripts/install-runner-autoscale-timer.sh --uninstall     # remove the arti
 ```
 
 `--uninstall` verifies the files are gone and refuses when they are not (it will not report a
-removal it could not perform).
+removal it could not perform). It deliberately does NOT delete the arming record: the record is a
+dated decision and `--disarm` is the verb that revokes one. So a box that was armed stays ARMED —
+`--uninstall` prints the record's date and says the next `--install` will render an armed unit. If
+you want the box to come back disarmed, run `--disarm` before (or after) the uninstall.
+
+## Why this pass, when #2403 names `ci_runner_pool.sh reconcile`
+
+The issue names `ci_runner_pool.sh reconcile`, but the pass that states the capacity contract —
+measure the box, derive a ceiling from cores/memory/disk, classify the pool against it, repair dead
+runners and grow toward it — and that is reviewed and tested is
+`scripts/orchestrator-harness/runner_autoscale.py` (#2877, #2900). This timer schedules THAT.
+
+The two are not interchangeable, and they are not both safe to run on the same box:
+`ci_runner_pool.sh` derives its own ceiling (cores plus a memory floor, no disk term) while the
+converger's is `min(cores, memory, disk)`. On a box the converger now ticks every 9 minutes, a hand
+`reconcile`/`add` can put the pool above the converger's measured ceiling and the next tick reports
+`over-ceiling` — it will not kill anything (busy runners are never touched), but the two answers
+disagree. So: **`runner_autoscale.py` is the scheduled capacity authority; `ci_runner_pool.sh` is
+the manual/incumbent tool — do not hand-run `reconcile` on a converged box.** Reconciling the two
+for good is filed as a follow-up (#3056), not resolved here.

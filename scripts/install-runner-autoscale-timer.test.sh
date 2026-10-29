@@ -31,6 +31,7 @@ assert_eq()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', ex
 assert_contains() { case "${1:-}" in *"$2"*) ok "$3" ;; *) bad "$3 (missing: $2)"; echo "--- output ---" >&2; printf '%s\n' "${1:-}" | sed 's/^/    /' >&2 ;; esac; }
 assert_absent()   { case "${1:-}" in *"$2"*) bad "$3 (found: $2)"; printf '%s\n' "${1:-}" | sed 's/^/    /' >&2 ;; *) ok "$3" ;; esac; }
 assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1)"; fi; }
+assert_not_contains() { case "${1:-}" in *"$2"*) bad "$3 (unexpected: $2)"; echo "--- output ---" >&2; printf '%s\n' "${1:-}" | sed 's/^/    /' >&2 ;; *) ok "$3" ;; esac; }
 assert_nofile()   { if [ -e "$1" ]; then bad "$2 (unexpected file: $1)"; else ok "$2"; fi; }
 say_case()        { echo; echo "── $* ──"; }
 
@@ -575,6 +576,68 @@ done
 OUT="$(run_install Linux "$D" --install --report-only)"; RC=$?
 assert_eq "$RC" 0 "--install --report-only still renders the disarmed artifact"
 assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "--dry-run" "and the artifact it wrote really is disarmed"
+
+# ── T23: --uninstall leaves the arming record, and SAYS the next --install will re-arm ──
+# Measured: --arm then --uninstall then --install re-rendered the box ARMED from the pre-uninstall
+# record while the remedy text handed to the operator promised a DISARMED install.
+say_case "T23 --uninstall reports a surviving arming record instead of implying a clean slate"
+D="$T/c23"; fresh "$D"
+run_install Linux "$D" --install >/dev/null 2>&1
+run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1
+assert_file "$ARM" "precondition: the box is armed"
+OUT="$(run_install Linux "$D" --uninstall)"; RC=$?
+assert_eq "$RC" 0 "--uninstall still succeeds"
+assert_file "$ARM" "the record survives (it is a dated decision, not ours to revoke)"
+assert_contains "$OUT" "SURVIVES this uninstall" "and the verb says so"
+assert_contains "$OUT" "NEXT --install will render an ARMED unit" "naming the consequence"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--status on a box with no artifact exits 1"
+assert_contains "$OUT" "when no arming record exists" "the --install remedy no longer promises DISARMED unconditionally"
+
+# ── T24: an ExecStart= DROP-IN makes the base file's mode a lie ──────────────────────────
+# systemd merges $UNIT.d/*.conf and a drop-in ExecStart= REPLACES the base one, so every read-back
+# answered DISARMED about a unit that in fact converges.
+say_case "T24 an ExecStart= drop-in is reported, not mistaken for the unit's command"
+D="$T/c24"; fresh "$D"
+run_install Linux "$D" --install >/dev/null 2>&1
+mkdir -p "$D/$UNIT_NAME.service.d"
+cat > "$D/$UNIT_NAME.service.d/zz-override.conf" <<CONF
+[Service]
+ExecStart=
+ExecStart=/usr/bin/true --dry-run
+CONF
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--status exits 1 when a drop-in overrides ExecStart"
+assert_contains "$OUT" "dropin_override=" "it names the drop-in"
+assert_contains "$OUT" "zz-override.conf" "by path"
+rm -f "$ARM"                                        # the record is $T-wide; T23 left one armed
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?
+assert_eq "$RC" 1 "--arm REFUSES to arm a unit whose command it cannot verify"
+assert_contains "$OUT" "DROP-IN" "saying why"
+assert_contains "$OUT" "Nothing was armed" "and that the refusal came BEFORE the record existed"
+assert_nofile "$ARM" "and writes no record"
+# a drop-in with no ExecStart= is not an override and must not red
+rm -f "$D/$UNIT_NAME.service.d/zz-override.conf"
+printf '[Service]\nNice=5\n' > "$D/$UNIT_NAME.service.d/harmless.conf"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "a drop-in that does not set ExecStart= is not an override"
+
+# ── T25: --status accepts the pass's real switch vocabulary ──────────────────────────────
+# The recogniser red anything that was not exactly --dry-run, so `--want 3` (which runner_autoscale.py
+# accepts) was reported as a schedule that exits 2 on every tick.
+say_case "T25 --status accepts --want/--json/--root/--status, and still reds an invented flag"
+D="$T/c25"; fresh "$D"
+rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+sed -i '/^ExecStart=/ s|$| --want 3 --json|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "a real switch is not reported as a broken schedule"
+assert_contains "$OUT" "mode=--dry-run (DISARMED" "and the mode is still read correctly"
+assert_not_contains "$OUT" "did not render" "no invented-argument complaint"
+sed -i '/^ExecStart=/ s| --want 3 --json||; /^ExecStart=/ s|$| --apply|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an invented flag is still red"
+assert_contains "$OUT" "did not render" "and is named as such"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
