@@ -1105,6 +1105,33 @@ ck "(j2) …and never calls the queue predicate" \
    "$( grep -q 'ciq_ci_allowed' "$FIX"; [ $? -ne 0 ]; echo $? )"
 ck "(j3) …while the LOAD/disk spawn gate it IS bounded by is still sourced (the bound was narrowed, not removed)" \
    "$( grep -q 'spawn-gate.sh' "$FIX"; echo $? )"
+# ⛔ AND NO SURFACE MAY STILL *READ* A DEFERRAL THIS MODULE CAN NO LONGER PRODUCE (#2928's review, P2).
+# #2927 removed `fix-one.sh`'s WRITE of this token, but the READERS outlived the writer: `adopt-fix.sh`
+# kept a 79 arm that could never fire again — its operator message told a manual operator to "re-run
+# when the queue drains" for a refusal that no longer exists, while a real PR-owner deferral fell
+# through the `… && next` chain that arm was meant to stop — and two `ARCHITECTURE.md` rows still
+# counted the deferral among `fix-one.sh`'s pre-agent deferrals. That is invisible to every other arm
+# here (none of them reads a reader), so pin the population at ZERO.
+# ⛔ A COMMENT IS NOT A READER on purpose: the history belongs where the next editor looks, and a
+# comment cannot mis-route an operator. Comments are therefore excluded and prose about the removal
+# stays legal. The scan is over the harness directory and skips this suite + `selftest.sh` (both
+# legitimately SPELL the token to police it).
+# Measured pre-fix: 2 readers (`adopt-fix.sh`, `ARCHITECTURE.md`). Post-fix: 0.
+_cq_ghost='DEFERRED by the CI-queue'" gate"          # split so this line is not its own hit
+ghost_scan() { # <path> -> how many NON-COMMENT occurrences the shipped corpus carries
+  grep -rnF "$_cq_ghost" "$1" 2>/dev/null \
+    | grep -v -e '\.test\.sh:' -e '/selftest\.sh:' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | wc -l | tr -d ' '
+}
+ghost_readers=$(ghost_scan "$HERE")
+ck "(j4) NO surface reads a CI-queue deferral fix-one.sh can no longer write (found $ghost_readers, expected 0)" \
+   "$( [ "$ghost_readers" = "0" ]; echo $? )"
+# The 0 above is only a measurement if the scan can see a reader at all — otherwise a typo'd path or a
+# dropped flag reads exactly like a clean census. Plant one and require it to be counted.
+printf 'ghost reader: %s\n' "$_cq_ghost" > "$T/planted-reader.sh"
+ghost_planted=$(ghost_scan "$T/planted-reader.sh")
+ck "(j4b) …and the scan SEES a planted reader (so that 0 is a measurement, not a broken grep; found $ghost_planted, expected 1)" \
+   "$( [ "$ghost_planted" = "1" ]; echo $? )"
 # ⛔ (m) THE CI-RERUN GATE — the one SWEEP act that ADDS queue (#2333 review round 4, P2). The PR
 # names it as "the only other surface in the sweep that ADDS queue", and it was pinned by NOTHING:
 # (e6) counts the `ci-queue(...)` token, and pr-dispatch.test.sh's T3 cycle never reaches this block
