@@ -81,13 +81,34 @@ step "seeded $O with $(ls "$O"/*.sh 2>/dev/null | wc -l | tr -d ' ') scripts (cl
 # 5. Start exactly one controller.
 step "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 if [ -n "$SW" ]; then
+  # ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THIS CALLER IS NOT THE SERVICE MANAGER (review P1 round 19,
+  # #2402 / C). The unit exports `ORCH_FOREGROUND=1` and every lane shell inherits it through the tmux server
+  # the controller created; quiesce is the LAST unpinned `start` caller. It is also the worst one to leave
+  # unpinned: quiesce STOPS the unit a few lines above, so `foreground_handover` has nothing to wait for and
+  # `start` execs `orch-loop.sh` inside quiesce's own child — a dispatcher OUTSIDE the unit's cgroup while the
+  # enabled unit is stopped. Quiesce's own "exactly one orch-loop" assertions then pass and it prints DONE:
+  # the cell is left unsupervised with a green report, which is #2402 restored silently.
   CELL_HOME="$CELL_HOME" ENV_FILE="$ENV_FILE" REPO="$REPO" O="$O" OR="$OR" \
-    SCOPE="$SCOPE" MAX_LANES="$MAX_LANES" \
+    SCOPE="$SCOPE" MAX_LANES="$MAX_LANES" ORCH_FOREGROUND=0 \
     bash "$SW" start >/dev/null 2>&1 || true
 else
   # Direct start, mirroring the supervisor's launch line.
+  #
+  # ⛔ `unset GH_REPO` AFTER `set +a`, the same two-token strip the supervisor's session command
+  # carries: `$ENV_FILE` is re-sourced INSIDE the session, so a global `export GH_REPO=…` in it
+  # answers every `gh` call that omits `--repo` from this controller onward — the #2235 fail-open
+  # (a rail printing '✅ PR #2232 is ALREADY MERGED' for a tortoise PR while grading agent-infra).
+  # This path builds its OWN session instead of going through the supervisor, so it needs its own
+  # strip; `cloud-cell-supervisor.test.sh` §12 pins the supervisor's two and cannot see this one.
+  #
+  # ⛔ WHY THESE COMMENTS ARE HERE AND NOT INSIDE THE CONTINUATION BELOW (#2235 review P1): a
+  # backslash-newline is joined LEXICALLY, so a `#` line placed between `tmux new-session … \` and
+  # the command string ENDS THE COMMAND — tmux then starts a bare default shell named `orch` with
+  # NO command argument, the string runs as a separate command (127, swallowed by `2>/dev/null ||
+  # true`), and the script reports success having started nothing. Verified by the reviewer with a
+  # stub `tmux` recording `new-session -d -s orch -c <dir>` and no argv[7].
   tmux new-session -d -s orch -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; \
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; \
      HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
      bash '$O/orch-loop.sh' >> '$O/logs/orch-loop.log' 2>&1" >/dev/null 2>&1 || true
 fi
