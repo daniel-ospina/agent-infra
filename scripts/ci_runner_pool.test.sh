@@ -33,7 +33,7 @@
 #     name is `cannot-measure` rather than a jobless runner.
 #   * the RECONCILIATION pass: idempotent, restarts dead listeners, adds to the ceiling, stops on a
 #     gate verdict, and a `cannot-act` is rc 2 — never a pass reported as success.
-#   * AN ORPHANED REGISTRATION (#2620) — one GitHub deleted server-side. Measured on `pi-cell-4`
+#   * AN ORPHANED REGISTRATION (#2892) — one GitHub deleted server-side. Measured on `pi-cell-4`
 #     2026-10-27: the listener appears and then exits **rc 0** at +4 s with
 #     "The runner registration has been deleted from the server", `config.sh --replace` refuses
 #     ("already configured"), and NOTHING could retire it. So: `restart` must report rc 6 (not a false
@@ -310,7 +310,7 @@ cat >"$TEMPLATE/bin/Runner.Listener" <<'STUB'
 #!/usr/bin/env bash
 # ⛔ argv must STAY "<dir>/bin/Runner.Listener run" — the real binary never execs anything else, so a
 # stub that did would let a broken argv matcher pass. Hence a CHILD sleep, killed on TERM/EXIT.
-# ⛔ THE `.orphan` MARKER MODELS A REGISTRATION GITHUB DELETED (#2620), and it must reproduce BOTH
+# ⛔ THE `.orphan` MARKER MODELS A REGISTRATION GITHUB DELETED (#2892), and it must reproduce BOTH
 # halves of the measured shape: the process APPEARS (so a start reads as successful) and then goes
 # away ~0.6 s later, AFTER printing GitHub's own line — with **rc 0**, which is exactly what the box
 # did (`DIED rc=0 after 4s`, pi-cell-4 2026-10-27T04:19Z). A stub that exited non-zero would let an
@@ -1708,6 +1708,15 @@ out="$(bash "$POOL" --help 2>&1)"
 assert_eq "$?" "0" "--help exits 0"
 assert_contains "$out" "ci_runner_pool.sh add      --name <name>" "--help prints the VERBS (not the WHY prose)"
 assert_contains "$out" "EXIT: 0 ok" "--help prints the exit-code contract"
+# ⛔ THE rc-3 CLAUSE MAY NOT NAME A CONDITION THE CODE RETURNS 2 FOR (#2899 review round 6, P3). The
+# legend claimed `status` exits 3 for "a quarantine whose liveness could not be measured" while
+# `cmd_status` returns 2 for exactly that row (`UNPROBED`) — and the body says so twice. The legend is
+# the ONLY exit contract an operator or scheduler is meant to read, so a clause matching no code path
+# mis-routes the caller on the one signal (cannot-measure) it exists to branch on.
+assert_omits "$out" "or a quarantine whose liveness could not be measured" \
+  "the status rc-3 clause does NOT claim an UNPROBED quarantine (that is rc 2)"
+assert_contains "$out" 'quarantined install whose listener could not be probed (`UNPROBED`)' \
+  "the rc-2 paragraph names the unmeasured quarantine instead"
 assert_contains "$out" "RUNNER_TEMPLATE" "--help prints the env seams"
 assert_contains "$out" "every runner on THIS box" "--help scopes --all to this box (no cross-box read here)"
 assert_eq "$(rc_of bogus-verb)" "1" "an unknown verb exits 1"
@@ -2058,7 +2067,7 @@ assert_eq "$(grep -cF 'pool-root-incomplete' <<<"$out")" "0" "RUNNER_ROOT=/ does
 # (rc is NOT asserted here: a listener whose instance dir was deleted under it is legitimately
 #  `instance-dir-unresolvable`, and earlier cases leave such fixtures behind.)
 
-# ══ (#2620) ORPHANED REGISTRATIONS — the state no verb could leave ═════════════════════════
+# ══ (#2892) ORPHANED REGISTRATIONS — the state no verb could leave ═════════════════════════
 # Every arm below is a measured fact from `pi-cell-4` (2026-10-27T03:30–04:20Z), where two installs
 # whose registrations GitHub had deleted sat unusable while the "self-healing" pass reported them
 # restarted, and the one slot that COULD be revived stayed dead for lack of a scheduled pass.
@@ -2087,9 +2096,18 @@ printf 'Failed to create a session. The runner registration has been deleted fro
   >"$RUNNER_ROOT/pi-runner-orph/listener.log"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
 assert_eq "$?" "3" "an ORPHANED registration fails the report (rc 3), like a DEAD one"
-assert_contains "$out" "ORPHANED" "and it is its OWN state — a restart can never recover it"
+assert_contains "$out" "ORPHANED" "and it is its OWN state — a bare restart is not the verb that settles it"
 assert_contains "$out" "slots=0 ceiling=3" "an orphaned registration is NOT capacity"
 assert_contains "$out" "orphaned=1" "and the summary counts it"
+# ⛔ THIS ARM PINS A RECORDED TRADE-OFF, NOT A PROOF (#2899 review round 6, P1/R1). The classifier
+# reads a LOG LINE, and a skew-era line survives a clock later corrected (actions/runner#4648) — so on
+# that shape the install is `orphaned` here and yet `restart` recovers it (see the `skewline` arm).
+# Counting such an install back into `slots` would close the over-add window and RE-OPEN the measured
+# `pi-cell-4` failure (an unretired orphan taking a slot on a box whose real capacity is one short).
+# The owner's direction (R3: an orphaned registration is not capacity) therefore stands, and every
+# branch that needs a verified verdict goes through `reclaim` / `reconcile` (rc 6). Overturning it is a
+# REOPEN of R3 with the owner — if this assertion is ever the thing in your way, that is the route,
+# not an edit here.
 
 # ── restart MUST NOT CALL AN ORPHAN RESTARTED (the lie that hid this for days) ───────────────
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-orph)"
@@ -2359,8 +2377,14 @@ assert_contains "$out" "orphaned name=pi-runner-att" "control: and it names the 
 echo "── add: the quarantine SUFFIX is reserved ──"
 fresh_pool suffix; reset_logs
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-x.retired-20260101T000000Z)"
-assert_ne "$?" "0" "a name carrying the quarantine suffix is REFUSED"
+assert_eq "$?" "1" "a name carrying the quarantine suffix is REFUSED as a usage error"
 assert_absent "$RUNNER_ROOT/pi-runner-x.retired-20260101T000000Z" "and nothing was provisioned"
+# ⛔ THE REFUSAL NAMES THE RULE THE NAME ACTUALLY BROKE (#2899 review round 6, P2). The generic text
+# recited `[A-Za-z0-9._-]` / no leading dot / no `/` — every one of which THIS name satisfies — so the
+# operator was told it broke a rule it obeys and given no way to discover the reserved suffix.
+assert_contains "$out" "refused: carries the RESERVED quarantine suffix '.retired-'" \
+  "the refusal names the suffix it broke, not a character rule the name obeys"
+assert_contains "$out" "must be [A-Za-z0-9._-]" "and still prints the general contract after the reason"
 echo "── status: a RUNNING listener under a retired name is never reported as deletable ──"
 fresh_pool livequar; reset_logs
 register pi-runner-lq
@@ -2369,6 +2393,23 @@ QZ="$RUNNER_ROOT/pi-runner-lq.retired-20260101T000000Z"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="424242 $QZ/bin/Runner.Listener run" run status --all)"
 assert_contains "$out" "LIVE-QUAR" "the row says LIVE, not QUARANTINE"
 assert_contains "$out" "do NOT rm -rf" "and the remedy is the opposite of deleting a working runner"
+# ⛔ THE PRESERVE ADVICE MUST EXIST FOR THE NAME IT IS PRINTED ABOUT (#2899 review round 6, P3).
+# `reclaim --name <quarantine>` is reachable — the name is refused only for ''/'.'/'..'/'-*'/'*/*' — and
+# the pass used to end with "use: restart --name <quarantine>". `restart` starts a listener on a
+# retired-named install (it refuses none of those names), i.e. the tool's own advice re-created the
+# LIVE-QUAR row above. A retired-named install is never capacity and never startable on purpose, so
+# that basename gets the bytes' owner instead. The listener here is already proven DEAD, which is why
+# pointing at `rm -rf` cannot delete a running registration.
+echo "── reclaim: a NO-EVIDENCE quarantine is not sent to 'restart' ──"
+fresh_pool qpres; reset_logs
+register pi-runner-qp
+mv "$RUNNER_ROOT/pi-runner-qp" "$RUNNER_ROOT/pi-runner-qp.retired-20260101T000000Z"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim --name pi-runner-qp.retired-20260101T000000Z)"
+assert_eq "$?" "0" "a no-evidence quarantine is PRESERVED (rc 0)"
+assert_contains "$out" "preserve name=pi-runner-qp.retired-20260101T000000Z" "naming the install it declined to retire"
+assert_omits "$out" "restart --name pi-runner-qp.retired-20260101T000000Z" \
+  "and it is NOT sent to 'restart', which would re-create a LIVE-QUAR row"
+assert_contains "$out" "rm -rf it as its owner" "it names the remedy that actually clears those bytes"
 
 # ── THE PASS THAT MAKES IT SELF-HEALING: restart → retire → add, then idempotent ────────────
 echo "── reconcile: revives, retires, provisions — and changes nothing on a second pass ──"
@@ -2583,7 +2624,7 @@ assert_contains "$mut_out" "preserve name=pi-runner-mut-orph" "the mutant calls 
 assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of reclaim)" "0" "the SHIPPED script retires it"
 assert_absent "$RUNNER_ROOT/pi-runner-mut-orph" "and the fixture the mutant preserved is gone"
 
-# ══ (#2620) A MIXED RUNNER ROOT: a non-member that is PROVABLY not an install ─════════════════
+# ══ (#2892) A MIXED RUNNER ROOT: a non-member that is PROVABLY not an install ─════════════════
 # Measured on `pi-cell-4`: every install lives under `/opt`, and `/opt/containerd` is
 # `drwx--x--x root` — unreadable to the runner user, searchable. "Cannot inspect" was one condition
 # and turned the only usable root on the box into a permanent `cannot-measure` (rc 2), so the repair
