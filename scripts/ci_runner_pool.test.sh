@@ -1713,7 +1713,14 @@ assert_contains "$out" "EXIT: 0 ok" "--help prints the exit-code contract"
 # `cmd_status` returns 2 for exactly that row (`UNPROBED`) — and the body says so twice. The legend is
 # the ONLY exit contract an operator or scheduler is meant to read, so a clause matching no code path
 # mis-routes the caller on the one signal (cannot-measure) it exists to branch on.
-assert_omits "$out" "or a quarantine whose liveness could not be measured" \
+# ⛔ AND THE MATCH SUBJECT MUST BE WHITESPACE-FLATTENED (#2899 review round 6, P3 — this assertion was
+# VACUOUS when first written). `usage()` prints the header VERBATIM, so a clause that wraps in the
+# source never appears contiguously in `$out`: the pre-fix head `fd1a300a9` prints "…or a quarantine
+# whose liveness could not\n      be measured (see below)", and an `assert_omits` on the single-line
+# phrase therefore passed against the very code it was written to catch. Measured both ways: joined,
+# the guard reports the phrase unexpectedly present at `fd1a300a9`; unjoined, it reports nothing.
+help_flat="$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ')"
+assert_omits "$help_flat" "quarantine whose liveness could not be measured" \
   "the status rc-3 clause does NOT claim an UNPROBED quarantine (that is rc 2)"
 assert_contains "$out" 'quarantined install whose listener could not be probed (`UNPROBED`)' \
   "the rc-2 paragraph names the unmeasured quarantine instead"
