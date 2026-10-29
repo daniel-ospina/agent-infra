@@ -143,51 +143,14 @@ BASE_LABEL="com.eldato.orchestrator-loop"
 # therefore a SEPARATE line.
 LABEL="com.eldato.orchestrator-loop"
 [ -n "${LABEL_OVERRIDE:-}" ] && LABEL="$LABEL_OVERRIDE"
-# The OTHER production label: the recovery agent PR #1986 ships (`watchdog.plist.template`). It is
-# listed here so `label_guard` treats it as production too — the guard's rule is about the LIVE jobs,
-# and a second production label that the guard did not know about would be installable from a sandbox.
+# The OTHER production label: `com.eldato.orchestrator-watchdog`, the hand-provisioned controller
+# watchdog RETIRED by agent-infra#2303 (`templates/launchd/RETIRED` — `install-launchd.sh`'s
+# `retire_pass` unloads and removes it). It has no plist template any more, and it is still listed
+# here so `label_guard` treats it as PRODUCTION: the guard's rule is about the labels launchd may
+# still resolve on a live box, and a retired label a sandbox did not know about would still be
+# addressable from one.
 PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-# wa_state [label] — a job's launchd state, read the way the rest of this harness reads state.
-# Defaults to the watchdog; the LOOP uses it too, because `lc_probe` is `gui/`-scoped and a loop loaded
-# from an SSH session lives in `user/` (the measurement in watchdog.sh: a `print gui/501/...` says "Could
-# not find service" while `launchctl list <same label>` succeeds) — so a removal proved only in `gui/`
-# can print ✅ over a job launchd still holds.
-# ⛔ `launchctl print <domain>/<label>`, NOT `launchctl list <label>`. Two shipped files disagree about
-# `list <label>`'s output shape (launchd-cycle.sh:283 says it "prints nothing structural on current"
-# macOS), and this installer would be building a ✓/warn on the disputed side — the same defect class the
-# watchdog's own read was moved off. `print` is the read whose `pid = N` / `last exit code = N` lines are
-# pinned against a captured real block by the durability suite.
-# ⛔ AND IT IS DOMAIN-SCOPED, so both domains are tried: a `-w`-free `load <plist>` from an SSH session
-# puts the agent in `user/`, and a `gui/`-only read would call a RUNNING watchdog "not loaded".
-# ⛔ AND A DOMAIN-LEVEL REJECTION (`Bad request.` + `Could not find domain …`) is not a failed read of the
-# service — it means that domain does not exist for this user. Continue to the next one.
-# Returns: 0 = loaded (block in _WA_BLOCK), 1 = absent from every domain, 2 = UNKNOWN (unreadable).
-_WA_BLOCK=""; _WA_RC=1
-wa_state() {
-  local lbl="${1:-$WATCHDOG_LABEL}" d out rc unknown="" diag=""
-  _WA_BLOCK=""; _WA_RC=1
-  for d in "gui/$(id -u)" "user/$(id -u)"; do
-    out="$(launchctl print "$d/$lbl" 2>&1)"; rc=$?
-    if [ "$rc" -eq 0 ]; then _WA_BLOCK="$out"; _WA_RC=0; return 0; fi
-    case "$out" in
-      *"Could not find service"*|*"not find service"*|*"service not found"*) continue ;;
-      # ⛔ ONLY THE LINE THAT NAMES A MISSING DOMAIN IS THE "this domain cannot hold the job" answer.
-      # A BARE `Bad request.` is launchd rejecting the REQUEST, and the repo pins it as UNKNOWN
-      # (launchd-cycle.sh's lc_probe returns 2 for it; the durability suite asserts it). Folding a
-      # bare rejection into the domain-missing arm would make an unreadable state read as ABSENT,
-      # and then issue enable/bootstrap on it — a mutation decided from an error message.
-      *"Could not find domain"*) continue ;;
-      *"pid = "*|*"= {"*) _WA_BLOCK="$out"; _WA_RC=0; return 0 ;;
-      # ⛔ A FLAG, NOT THE DATUM — a non-zero read with NO output would otherwise leave the flag empty and
-      # report "definitively absent", which here deletes the watchdog plist and tells the operator the box
-      # is stopped over a read that established nothing.
-      *) unknown=1; diag="$out" ;;
-    esac
-  done
-  if [ -n "$unknown" ]; then _WA_BLOCK="$diag"; _WA_RC=2; return 2; fi
-  _WA_RC=1; return 1
-}
 TEMPLATE="$HERE/launchd.plist.template"
 # The invoking user's REAL home, from the passwd database rather than $HOME — that is the whole point
 # of the comparison, and `~user` expansion (not "$HOME") is what supplies it.
@@ -210,15 +173,6 @@ START_TIMEOUT="${START_TIMEOUT:-30}"
 # LC_HB_STALE overrides it for a cell whose cycles are unusually long.
 # ELDATO_ALLOW_TEST_HOME=1 is the test-only opt-in to the #446 temp-HOME guard in launchd-cycle.sh —
 # without it, a run whose $HOME is not the real home refuses to touch launchd at all.
-# The watchdog that recovers a REMOVED controller. Its label is its own, and its plist is a SEPARATE
-# file: the loop was measured removed five times on 2026-10-17 (`Setting service … to disabled` →
-# `removing service`) with no error anywhere, so a second agent has to put the loop back. See
-# watchdog.sh for the contract and the stop sentinel. ⛔ It is loaded and removed with the SAME verbs as
-# the loop (enable + bootstrap, and bootout) and for the same measured reason: the -w forms write a
-# PERSISTENT Disabled override, which is the state it exists to repair (#1975).
-WATCHDOG_LABEL="com.eldato.orchestrator-watchdog"
-WATCHDOG_PLIST="$HOME/Library/LaunchAgents/$WATCHDOG_LABEL.plist"
-WATCHDOG_TEMPLATE="$HERE/watchdog.plist.template"
 
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
@@ -292,34 +246,6 @@ label_guard "$LABEL" "$HOME" "$REAL_HOME" || exit 1
 
 # ── uninstall ────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = uninstall ]; then
-  # ⛔ THE WATCHDOG GOES FIRST, and the order is not cosmetic. It exists to reload the loop plist, so
-  # booting out the LOOP while the watchdog is still armed is a race the watchdog wins 60 seconds
-  # later: the operator would be told the box was stopped while an autonomous merge loop came back
-  # under them. Removed through `lc_bootout` — NOT a `-w` verb, this file's whole discipline (#1975):
-  # it proves the label is gone before the loop is touched and writes no persistent disable.
-  lc_bootout "$WATCHDOG_LABEL" "$WATCHDOG_PLIST" || exit 1
-  # ⛔ `lc_bootout` PROVES THE LABEL IS GONE *FROM `gui/`* — and `launchctl print` is DOMAIN-SCOPED while
-  # this agent may have been loaded from an SSH session into `user/` (both domains are tried by the
-  # watchdog's own action verbs, and install.sh documents that split). A removal that cannot see that
-  # domain would report success, delete the plist, and leave the WATCHDOG RUNNING — reloading the loop a
-  # minute after the operator was told the box was stopped, which is precisely the race the ordering
-  # above exists to prevent. So the proof is completed with the DOMAIN-AGNOSTIC read, and a survivor is
-  # fatal: the plist is kept (it is the only handle a retry has, exactly as the loop's own removal keeps
-  # it) and the message names the domain to remove by hand.
-  # ⛔ AND IT SETTLES, for the reason the loop's own removal settles (see below): `bootout` is
-  # ASYNCHRONOUS, so launchd can still print the label for a moment after a removal that DID work. A
-  # single read turned that lag into `die … is STILL loaded` — aborting the documented handoff after the
-  # watchdog was in fact gone and before the loop was touched, with a message wrong in both directions.
-  # The verdict is the LAST observation, not the first.
-  for _ in 1 2 3 4 5 6 7 8; do
-    wa_state || true
-    [ "$_WA_RC" -eq 1 ] && break
-    sleep 1
-  done
-  if [ "$_WA_RC" -ne 1 ]; then
-    die "$WATCHDOG_LABEL is STILL loaded (or its state could not be read: ${_WA_BLOCK:-no output}) after 'launchctl bootout' — found outside $(lc_domain), most likely user/ (a job loaded from an SSH session). NOT removed, and the plist is kept at $WATCHDOG_PLIST. Next: launchctl bootout user/$(id -u) '$WATCHDOG_PLIST', then re-run this --uninstall"
-  fi
-  rm -f "$WATCHDOG_PLIST"
   # NO `unload -w`: `bootout` removes the job and writes NO persistent Disabled override, so a later
   # re-install is a plain start rather than a start that has to fight a sticky disable first. A
   # deliberate removal still leaves the job NOT RUNNING — which is the point — and the next
@@ -408,14 +334,6 @@ if [ "$ACTION" = uninstall ]; then
   done
   if [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null; then
     die "the controller is STILL running (pid $_cp, recorded in $O/.orch.lock) after removing $LABEL — NOT removed, and the plist is kept at $PLIST. Next: tmux kill-session -t =${CONTROLLER_SESSION:-orch-controller} (or kill $_cp), then re-run --uninstall"
-  fi
-  # ⛔ AND "GONE FROM gui/" IS NOT "GONE". The read-back above uses `lc_probe`, which is domain-scoped;
-  # a loop loaded from an SSH session lives in `user/`, so that read says absent while the job keeps
-  # running — the false ✅ this whole block exists to prevent, one domain over. Prove it everywhere, and
-  # keep the plist (the only handle a retry has) if it survives.
-  wa_state "$LABEL" || true
-  if [ "$_WA_RC" -ne 1 ]; then
-    die "$LABEL is STILL loaded (or its state could not be read: ${_WA_BLOCK:-no output}) outside $(lc_domain) — most likely user/ (a job loaded from an SSH session). NOT removed, and the plist is kept at $PLIST. Next: launchctl bootout user/$(id -u) '$PLIST', then re-run this --uninstall"
   fi
   rm -f "$PLIST"
   rm -f "$O/state/launchd-loaded.sha256"
@@ -1364,103 +1282,6 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # off the pin's line) is the WRONG reference: it would report drift on a perfectly consistent box and,
 # worse, stay silent when `$O` lags the tree that is actually running.
 SHIPPED="${HARNESS:-$HERE}"
-
-# ── watchdog: recover a controller that has been REMOVED (not merely crashed) ────
-# ⛔ KeepAlive cannot restart a service that is no longer in the domain: a persistent-disable verb, and a
-# `bootout` whose `bootstrap` then fails, both leave a flag that takes the loop out of the domain, the
-# loop simply stops dispatching, and nothing logs an error the fleet can see (measured five times on
-# 2026-10-17). The watchdog is a second launchd agent that puts it back: it proved itself on the live
-# box, where ~/orchestrator/logs/watchdog.log holds five recoveries from 2026-10-17 (e.g. `21:26:40Z
-# ABSENT from launchctl — reloading` / `21:26:48Z recovered: pid=54673`).
-#
-# The script is SEEDED into $O because launchd executes $O/watchdog.sh — the same reason every other
-# harness script lives there. ⛔ THE COPY BELOW IS UNCONDITIONAL, so a stale `$O` copy is REPLACED —
-# and the drift list further down cannot report it afterwards (the copy has already made the two
-# identical); the WARNING on the copy is therefore the only signal, and it is a loud one — which is why
-# this file has no `watchdog.sh` entry in the drift list below: it could never fire (the copy that runs
-# first guarantees the two are identical). The plist is rendered from the shipped template with the SAME
-# escaping,
-# plutil and surviving-token checks as the loop's, because an unrendered or mis-escaped watchdog plist
-# fails exactly as the loop's did on the cells: launchd starts nothing and says nothing.
-[ -f "$HERE/watchdog.sh" ] || die "watchdog.sh missing from the shipped set — a removed controller would never come back"
-[ -f "$WATCHDOG_TEMPLATE" ] || die "watchdog.plist.template missing from the shipped set"
-# gh-rest's precedent applies here for the same reason: $O is the operator's surface and may hold a
-# hand-patched copy (a rescue during an incident). Overwriting it silently destroys that work AND
-# erases the evidence — the drift check below runs AFTER this copy, so it can never report the
-# difference. Say so, and keep going (install must not be blocked by it).
-if [ -f "$O/watchdog.sh" ] && ! diff -q "$HERE/watchdog.sh" "$O/watchdog.sh" >/dev/null 2>&1; then
-  warn "replacing a DIFFERENT $O/watchdog.sh — the installed copy was stale or hand-patched"
-fi
-# ⛔ STAGE THEN RENAME, never a plain `cp` — this file's own rule two screens up, for a sharper reason
-# here: launchd EXECUTES $O/watchdog.sh every 60 s, and `cp` truncates before it writes. An exec landing
-# in that window runs a partial file: a parse error (the pass does nothing AND writes no log line, so the
-# silence is indistinguishable from a healthy box) or — per the same rationale — a valid prefix that
-# prints nothing and exits 0, which is what the banner would then read as "last run exited 0" and print
-# ✓ over. `mv` is atomic within a directory, so no exec can ever see a partial file.
-_WA_SEED="$O/.seed-watchdog.sh.$$"
-cp "$HERE/watchdog.sh" "$_WA_SEED" || { rm -f "$_WA_SEED"; die "cannot stage $_WA_SEED"; }
-chmod +x "$_WA_SEED" || { rm -f "$_WA_SEED"; die "cannot chmod $_WA_SEED"; }
-mv -f "$_WA_SEED" "$O/watchdog.sh" || { rm -f "$_WA_SEED"; die "cannot install $O/watchdog.sh"; }
-WA_RENDER="$WATCHDOG_PLIST.new.$$"
-trap 'rm -f "$RENDER" "$WA_RENDER"' EXIT
-sed \
-  -e "s|__O__|$(esc "$O")|g" \
-  -e "s|__HOME__|$(esc "$HOME")|g" \
-  "$WATCHDOG_TEMPLATE" > "$WA_RENDER"
-plutil -lint "$WA_RENDER" >/dev/null || { rm -f "$WA_RENDER"; die "rendered watchdog plist is invalid"; }
-if grep -q '__[A-Z_]*__' "$WA_RENDER"; then
-  _toks="$(grep -o '__[A-Z_]*__' "$WA_RENDER" | sort -u | tr '\n' ' ')— the watchdog template has a token with no substitution rule"
-  rm -f "$WA_RENDER"; die "rendered watchdog plist still contains ${_toks}"
-fi
-mv -f "$WA_RENDER" "$WATCHDOG_PLIST"
-ok "watchdog plist valid → $WATCHDOG_PLIST"
-# ⛔ A DECLARED STOP SURVIVES A RE-INSTALL, by design (`touch $O/.watchdog-off` is what a deliberate
-# stop writes, and it must not be silently cleared). The trap is the opposite direction: an operator
-# who stopped the fleet weeks ago re-installs, believes the watchdog is protecting the box, and it is
-# inert. Nothing revalidates that flag, so say it HERE, where a human is watching. See README §6.
-if [ -e "$O/.watchdog-off" ]; then
-  warn "$O/.watchdog-off EXISTS — the watchdog is DISARMED by a declared stop; it will not recover a removed controller"
-  warn "  if that stop is over: rm -f '$O/.watchdog-off'  (README §6)"
-fi
-# ⛔ AND REPORT THE MEASURED STATE OF THE SAFETY NET, NOT AN INFERENCE FROM THE FILE JUST WRITTEN. This
-# run installs FILES; it has never loaded an agent (it prints the load command instead). So "armed"
-# from the sentinel's absence alone is a claim about a service nobody checked — and it is FALSE on a
-# box whose plist exists but whose label is not in the domain (measured 2026-10-17: the plist on disk,
-# `launchctl print gui/$(id -u)/com.eldato.orchestrator-watchdog` → rc=113, i.e. no watchdog at all). Same
-# class as
-# report.sh's substring match: a ✓ on the thing that is supposed to catch the failure (round 2).
-# ⛔ AND "LOADED" IS NOT "WORKING" (review finding). The label being in the domain says launchd is
-# polling it; it says NOTHING about whether the poll succeeds — which is the state a missing, unreadable
-# or stale `$O/watchdog.sh` produces, i.e. exactly the drift this run just copied the file to prevent.
-# The answer is IN the block we are already reading (`"LastExitStatus" = N;`), so read it instead of
-# discarding it, and never print ✓ over a safety net that fails every minute.
-if command -v launchctl >/dev/null 2>&1; then
-  wa_state || true
-  case "$_WA_RC" in
-    1)
-      warn "watchdog installed but NOT LOADED — a removed controller would stay down until you load it:"
-      warn "  launchctl enable \"gui/\$(id -u)/$WATCHDOG_LABEL\" && launchctl bootstrap \"gui/\$(id -u)\" \"$WATCHDOG_PLIST\"" ;;
-    0)
-      # ⛔ BOTH SPELLINGS, because two launchd surfaces print this datum differently and no captured real
-      # block in this repo pins either: `launchctl print` reports `last exit code = N` at the block's top
-      # level, while the `launchctl list <label>` dict spells it `"LastExitStatus" = N;`. Accepting only
-      # one would make this branch silently inert on the other shape — and an inert check here prints a ✓
-      # over a safety net that fails every minute, which is the defect this branch exists to prevent.
-      _wa_exit="$(awk '/^[[:space:]]*last exit code = [0-9-]+/ { v=$0; sub(/.*= /, "", v); print v; exit }
-                       /"LastExitStatus" = [0-9-]+/     { v=$0; sub(/.*= /, "", v); sub(/[^0-9-].*/, "", v); print v; exit }' <<<"$_WA_BLOCK")"
-      if [ -n "$_wa_exit" ] && [ "$_wa_exit" != "0" ]; then
-        warn "watchdog LOADED but its last run exited $_wa_exit — launchd IS polling it and it is FAILING every minute, so a removed controller would NOT come back. Read $O/logs/watchdog.log, then check \$O/watchdog.sh (this installer seeds it on every run — a hand-patched copy is REPLACED, with a warning)"
-      elif [ -n "$_wa_exit" ]; then
-        ok "watchdog loaded — launchd polls $WATCHDOG_LABEL every 60 s, and its last run exited 0"
-      else
-        # ⛔ NO EXIT FIELD IS NOT "HEALTHY". Saying ✓ here would be the same claim without the datum, so
-        # the word that is withheld is the one an operator relies on.
-        warn "watchdog LOADED, but this launchd does not report an exit status in the read (${_WA_BLOCK:-no output}) — it is being polled, whether it WORKS is unproven. Read $O/logs/watchdog.log (ABSENT/recovered/RECOVERY FAILED)"
-      fi ;;
-    *)
-      warn "watchdog's launchd state could NOT be read (${_WA_BLOCK:-no output}) — whether the safety net is armed is UNKNOWN. Next: launchctl print \"gui/\$(id -u)/$WATCHDOG_LABEL\" | head -20" ;;
-  esac
-fi
 # claims.sh is in this list because it is SOURCED by orch-loop.sh and merge-one.sh, so the daemon
 # executes it — leaving it out let a fix to the claim CAS sit in the repo while $O ran the old one
 # (the same silent-drift failure this list exists to name). repo-authority.sh is here for the SAME
@@ -1501,10 +1322,6 @@ DRIFTED=""
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
-# `report.sh` is here because an operator runs it by hand — nothing else would notice a stale copy
-# going unreported, and it is the file an operator trusts to describe the box.
-# (`watchdog.sh` is NOT: it is copied unconditionally above, so by the time this list runs the two are
-# identical and the entry could never fire — its replacement warning is the signal.)
 # brief-gate.sh (#2258) is the same class, one step sharper: it is the RESEARCH validator that
 # `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh` and `orch-send.sh`/`safe-send.sh`
 # all execute, and a $O copy that predates it makes every one of those refuse (78 = cannot verify) —
@@ -1513,9 +1330,6 @@ DRIFTED=""
 # merge-reminder.py + box-status.sh arrive from main's side of this merge for the same reason: both are
 # executed by the controller, so a stale $O copy must be DETECTED (the list's whole job) rather than
 # discovered later as a mystery.
-# BOTH SETS ARE ENTRIES IN THE ONE LIST BELOW (this branch's report.sh and main's
-# brief-gate.sh/check-class.py/nochk-resolve.py): the two comment blocks argue about different rows of
-# the same array, so the merge keeps both rather than picking a side.
 # ⛔ launchd-controller.sh IS IN THIS LIST BECAUSE ITS STALE BYTES **ARE** THE DEFECT (agent-infra#2098).
 # The installed plist on a Mac runs `/bin/bash $O/launchd-controller.sh`, and that file used
 # `new-session -A -d`, which ATTACHES — impossible for a launchd job — so the job crash-looped for
@@ -1537,8 +1351,6 @@ for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh l
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
-  warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
-  warn "  the box executes \$O/<script> (the daemon, launchd's watchdog, or you) — sync them or the fixes here are not in effect:"
   # ⛔ NOT A BARE `cp` ANY MORE (review P2). That line is the depth-1, unverified copy
   # #2041 measured as a false PASS — and it was the MOST operator-visible remedy in the harness, the one
   # README §4.1 tells the operator to run right after a verified redeploy. The helper copies every
@@ -1695,9 +1507,8 @@ pin_dirty() {
 write_provenance() {
   local commit rel dirty_word payload tmp drc _depf _depb dep_why
   # ⛔ `relation`/`commit` describe the SOURCE checkout, and `payloadSha256` describes the DEPLOYED
-  # `$O/*.sh` — this installer copies only THREE files into `$O` (the gh REST adapter,
-  # `gh-limit.py`, and `watchdog.sh`); every other harness script is synced by the operator, and the
-  # verified path for that `*.sh` payload is `deploy-harness.sh` — see the DRIFTED warning
+  # `$O/*.sh` — this installer seeds only `$O/gh-rest/gh` and `$O/gh-limit.py` (the `*.sh` payload is
+  # the operator's copy, and the verified path for it is `deploy-harness.sh` — see the DRIFTED warning
   # above), so the two can genuinely disagree: an install run from a newer checkout while `$O` still
   # holds older bytes records `commit: <new tip>, relation: "current"` over a payload from a different
   # commit. Measured: `$O` at C1 bytes + writer at C2 → stamp `commit C2 / relation current /
@@ -1977,26 +1788,6 @@ if [ "$ACTION" = "none" ] && [ "$PLIST_CHANGED" = "1" ] && [ "$LC_STATE" = "load
 fi
 
 cat <<EOF
-
-Watchdog — installed at $WATCHDOG_PLIST, it puts a REMOVED controller back
-(a persistent-disable verb, or a \`bootout\` whose \`bootstrap\` then fails, takes the service out of the
-domain where KeepAlive cannot reach it; measured five times on 2026-10-17). It does not touch a
-controller that is already running, and it does nothing at all while $O/.watchdog-off exists. Loading it
-asserts "this box should always be running the controller" — use the same verbs as the loop, never the
--w forms:
-
-    launchctl enable "gui/\$(id -u)/$WATCHDOG_LABEL"
-    launchctl bootstrap "gui/\$(id -u)" "$WATCHDOG_PLIST"
-
-⛔ STOPPING BY HAND: declare the stop FIRST (touch $O/.watchdog-off). That is needed when you stop the
-controller IN PLACE — an undeclared hand-stop is exactly the state the watchdog recovers from, so it
-would be running again within a minute, under a human who had just been told the machine was safe. The
-command below removes the watchdog as well, so it needs no declaration.
-
-STARTING: re-arm as well, or the watchdog stays inert after the next handoff:
-
-    rm -f "$O/.watchdog-off"
-
 Watch it (the first line of the decision log each cycle):
 
     tail -f "$O/logs/orch-loop.log"

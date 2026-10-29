@@ -4481,34 +4481,6 @@ else
   ck "sweep-quota.test.sh: the #1762 suite is present" 1
 fi
 
-# ── O2) the controller is RECOVERED when launchd REMOVES it, not merely when it crashes ──────────
-# KeepAlive cannot restart a service that is no longer in the domain, and `launchctl unload -w` (or a
-# `bootout` whose `bootstrap` fails) leaves a persistent disabled flag — measured five times on
-# 2026-10-17: `Setting service … to disabled` → `removing service` → dead controller, no error
-# anywhere. The full contract — a running controller is left ALONE, a removed one is reloaded exactly
-# once, a declared stop (`$O/.watchdog-off`) is never reversed, install.sh renders an install-relative
-# plist and its --uninstall stops the watchdog BEFORE the loop — lives in its own hermetic suite,
-# driven against the shipped script with a stubbed `launchctl`. Run it here so `./selftest.sh` stays
-# the one command that pins the harness.
-if [ -f "$HERE/watchdog.test.sh" ]; then
-  if bash "$HERE/watchdog.test.sh" > "$TMP/watchdog.out" 2>&1; then
-    ck "watchdog.test.sh: a REMOVED controller is recovered; a healthy one is untouched" 0
-    # ⛔ A SKIP INSIDE THE CHILD IS NOT A PASS HERE. The suite's install.sh half is Darwin-only, so off
-    # macOS it reports `SKIPPED=<n>` and still exits 0 — scoring that as a bare pass would print ✅ for
-    # a group that did not run, which is the false PASS this file's platform gate (:3140) forbids. The
-    # child's skip count is carried up so the summary can never say "all passed" over it.
-    _wskip="$(sed -n 's/.*SKIPPED=\([0-9][0-9]*\).*/\1/p' "$TMP/watchdog.out" | tail -1)"
-    if [ "${_wskip:-0}" -gt 0 ] 2>/dev/null; then
-      skipd "watchdog.test.sh: ${_wskip} install.sh assertion(s) inside it — macOS-only (launchd); skipped on $PLATFORM"
-    fi
-  else
-    ck "watchdog.test.sh: a REMOVED controller is recovered; a healthy one is untouched" 1
-    grep -E '❌|Summary|PASS=' "$TMP/watchdog.out" | sed 's/^/      /' | tail -20
-  fi
-else
-  ck "watchdog.test.sh: the controller-removal suite is present" 1
-fi
-
 # ── 21) deployed-harness provenance and drift (#1745) ────────────────────────────
 # The cloud cells got a provenance layer in #1790; the LAPTOP stayed uncovered —
 # `cd ~/orchestrator && git rev-parse --show-toplevel` printed "fatal: not a git repository", so
@@ -4778,41 +4750,6 @@ LC
   esac
   [ "$rc" -eq 0 ] || echo "      $(printf '%s' "$rout5" | tr '\n' '|')"
   ck "report.sh: ANOTHER repo's orchestrator job is never this box's controller (no false UP)" $rc
-  # ⛔ AND THE RECOVERY AGENT IS NOT THE CONTROLLER EITHER (agent-infra#1986). `install.sh` ships a
-  # SECOND label — `com.eldato.orchestrator-watchdog` — which the anchored pattern above MATCHES
-  # (`orchestrator` + `[-.]`). A `StartInterval` agent holds a real pid exactly while it runs, so the
-  # false-UP this arm exists to close returns one label over: pre-fix, a box whose loop is LOADED with
-  # no process and whose watchdog is RUNNING printed `UP (pid 4242)`. ⛔ Driven HERE, in `selftest.sh`,
-  # because the equivalent arm in `watchdog.test.sh` sits inside its `uname = Darwin` branch — on the
-  # Linux lane that gates merges it could never see this regression.
-  mk_report_lc_wd() { # <loop pid> <recovery pid> — the RECOVERY label is listed FIRST on purpose
-    cat > "$RB/launchctl" <<LC
-#!/bin/bash
-[ "\$1" = list ] || exit 1
-printf 'PID\tStatus\tLabel\n'
-printf '%s\t0\tcom.eldato.orchestrator-watchdog\n' '$2'
-printf '%s\t0\tcom.eldato.orchestrator-loop\n' '$1'
-exit 0
-LC
-    chmod +x "$RB/launchctl"
-  }
-  mk_report_lc_wd '-' 4242
-  rout6="$(PATH="$RB:$PATH" O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
-  case "$rout6" in
-    *"pid 4242"*) rc=1 ;;
-    *"NOT RUNNING"*) rc=0 ;;
-    *) rc=1 ;;
-  esac
-  [ "$rc" -eq 0 ] || echo "      $(printf '%s' "$rout6" | tr '\n' '|')"
-  ck "report.sh: the recovery agent's pid is never this box's controller (a stopped loop stays NOT RUNNING)" $rc
-  # …and the positive control: with BOTH running, the pid NAMED must be the loop's.
-  mk_report_lc_wd 777 4242
-  rout7="$(PATH="$RB:$PATH" O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
-  case "$rout7" in
-    *"UP (pid 777)"*) rc=0 ;;
-    *) rc=1; echo "      $(printf '%s' "$rout7" | tr '\n' '|')" ;;
-  esac
-  ck "report.sh: with both jobs loaded the CONTROLLER's pid is named, never the recovery agent's" $rc
   # ⛔ TWO COPIES OF ONE ANCHORED PATTERN, SO ASSERT THEY AGREE. `HARNESS_UNIT_RE` is duplicated on
   # purpose (bin/harness ships from bin/, these scripts ship to $O, so a sourced file would not reach
   # both) — which means it can DRIFT, and a loosening on one side would silently reopen the very

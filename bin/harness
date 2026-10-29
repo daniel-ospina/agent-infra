@@ -336,13 +336,6 @@ elif command -v sysctl >/dev/null 2>&1; then NCPU="$(sysctl -n hw.ncpu 2>/dev/nu
 # label is a constant `install.sh` renders (`com.eldato.orchestrator-loop`), so the darwin arm uses
 # the SAME anchored pattern the systemd arm uses rather than a second, looser guess.
 HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
-# ⛔ THE RECOVERY AGENT IS NOT THE CONTROLLER (agent-infra#1986). The anchored pattern also matches
-# `com.eldato.orchestrator-watchdog`, and a `StartInterval` agent holds a real pid precisely while it
-# runs — so without this exclusion doctor reads the watchdog as this box's supervisor and prints a
-# confident `supervisor: launchd` over a controller that is not running. Same narrow, by-name
-# exclusion as `report.sh` (the pattern literal itself stays byte-identical, which `selftest.sh`
-# asserts); the collision is driven in `selftest.sh` from any platform.
-RECOVERY_UNIT='com.eldato.orchestrator-watchdog'
 SUP="none"; SUP_EVIDENCE=""; SUP_INSTALLER=""; SUP_UNKNOWN=0
 case "$PLATFORM" in
   darwin)
@@ -363,8 +356,7 @@ case "$PLATFORM" in
       # this box but real in the spec): a `-v` assignment is ESCAPE-PROCESSED by awk, so on gawk/BSD
       # awk `\.` becomes a bare `.` and the anchor degrades to a wildcard — the exact "a label that
       # merely looks like ours" class this pattern closes. `ENVIRON` is read verbatim.
-      _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" WD="$RECOVERY_UNIT" \
-               awk '$3 ~ ENVIRON["RE"] && $3 != ENVIRON["WD"] { print $1" "$3 }' || true)"
+      _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" awk '$3 ~ ENVIRON["RE"] { print $1" "$3 }' || true)"
       _run="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print; exit }')"
       _any="$(printf '%s\n' "$_ll" | awk 'NF { print; exit }')"
       if [ -n "$_run" ]; then
