@@ -4562,9 +4562,17 @@ def run_all_repos(args, explicit) -> int:
         rows.append(row)
         print(row, flush=True)
         log(row)
+        # ⛔ THE SET CARRIES THE PASS'S OWN CAPACITY DATUM, NOT ONLY ITS COUNTS (review P2, #2291).
+        # The aggregate below has to answer the same question a single pass answers -- "did this
+        # box refuse this work, and on WHICH axis does it clear?" -- and the per-repo pass already
+        # produced it. Dropping it here is what made the AGGREGATE record (`pr-doctor.status.json`,
+        # the file `lib/fleet-inventory.sh` reads) answer `refusal_bound` with nothing at all.
         results.append({"repo": slug, "rc": rc, "reason": LAST_PASS.get("reason", ""),
                         "open_prs": LAST_PASS.get("open_prs"),
-                        "unplaced": _unplaced(LAST_PASS)})
+                        "unplaced": _unplaced(LAST_PASS),
+                        "no_capacity": LAST_PASS.get("no_capacity") or 0,
+                        "refusal_bound": LAST_PASS.get("refusal_bound") or "",
+                        "room": LAST_PASS.get("room") or ""})
     # The AGGREGATE record belongs in the canonical file: each repo's own pass already wrote its
     # per-repo record, and leaving STATUS on the last repo would publish that repo's verdict as the
     # machine's. `repos` carries the per-repo rows so a reader can see WHICH one is red.
@@ -4580,9 +4588,35 @@ def run_all_repos(args, explicit) -> int:
                        for r in ordered)
     log("all-repos: %d repo(s) graded, %d non-clean%s -- %s"
         % (len(results), len(dirty), (" (%s)" % ",".join(dirty)) if dirty else "", summary[:400]))
+    # ⛔ THE AGGREGATE RECORD MUST CARRY THE CAPACITY DATUM A PASS DOES, OR THE FLEET TABLE ABSTAINS
+    # (review P2, #2291). `record_exit` writes the CANONICAL `$STATE/pr-doctor.status.json`, and
+    # `lib/fleet-inventory.sh::_fleet_pr_doctor_bound` reads `rc`, `verdict` AND `refusal_bound` out of
+    # it before it will call a `6` a `WAITING` (load) row: it requires the record to be the pass it is
+    # explaining (`rc == 6`) and to name the axis. Passing none of them here meant a loaded box in
+    # `--all-repos` mode printed `UNKNOWN`/exit 2 from the table while `heartbeat-loop.sh` and
+    # `objective.py` printed `WAITING (no capacity)` from the SAME file -- three readers, one record,
+    # two stories, which is the exact class this issue exists to end.
+    #
+    # The union of the per-repo bounds (counts SUMMED, the grammar `_finish` writes: `disk=2,load=3`)
+    # rather than the last repo's, because the row is explaining the SET; the room is the first
+    # measurement a non-clean repo took (one box, and `capacity.sh probe` is the one primitive).
+    # Only when the aggregate's own code is 6: a set whose worst pass is 3 is NOT a capacity verdict,
+    # and claiming `NO-CAPACITY` there would be a new mislabel in place of the old one.
+    _extra = {}
+    if rc == EXIT_NO_CAPACITY:
+        _axes: dict[str, int] = {}
+        for _r in results:
+            for _kv in (_r.get("refusal_bound") or "").split(","):
+                _k, _, _v = _kv.partition("=")
+                if _k and _v.isdigit():
+                    _axes[_k] = _axes.get(_k, 0) + int(_v)
+        _extra = {"verdict": "NO-CAPACITY",
+                  "refusal_bound": ",".join("%s=%d" % _kv for _kv in sorted(_axes.items())),
+                  "no_capacity": sum(r.get("no_capacity") or 0 for r in results),
+                  "room": next((r.get("room") for r in ordered if r.get("room")), "")}
     return record_exit(rc, "all-repos: %d of %d repo(s) non-clean -- %s"
                        % (len(dirty), len(results), summary),
-                       repo=",".join(r["repo"] for r in ordered), repos=results)
+                       repo=",".join(r["repo"] for r in ordered), repos=results, **_extra)
 
 
 def dispatcher_kind_support() -> str:

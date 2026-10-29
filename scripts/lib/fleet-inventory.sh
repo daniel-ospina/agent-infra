@@ -766,6 +766,10 @@ _fleet_row_launchd_job() { # <name> <label> <script-path-to-count-or-empty> <wha
   # had produced no output for longer than 2×StartInterval+slack read WAITING — a PASS for the table's
   # exit code — for ever. That is the state this file's own header says must never be green.
   local _capwait="" _capdetail=""
+  # ⛔ `local`, LIKE EVERY OTHER VARIABLE IN THIS FUNCTION (review P3, #2291). These two are the axis
+  # read and the non-clearing axis list; undeclared they leaked into the caller's scope, so a caller
+  # that happened to use either name got this row's value.
+  local _fdb="" _fhard=""
   local plist; plist="$(fleet_plist "$label")"
   [ -n "$requires" ] || requires="$script"
   if [ ! -f "$plist" ]; then

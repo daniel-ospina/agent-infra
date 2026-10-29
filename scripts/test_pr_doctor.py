@@ -6009,6 +6009,79 @@ def test_the_per_repo_row_speaks_every_exit_codes_own_vocabulary():
     assert "unplaced=?" in pr.repo_row("o/r", pr.EXIT_NO_CAPACITY, {})
 
 
+def test_an_all_repos_box_refusal_records_the_BOUND_the_axis_and_the_measurement(monkeypatch,
+                                                                                 tmp_path):
+    """(v) The SET's aggregate record carries the capacity datum a single pass carries.
+
+    Review P2/#2291 (`--all-repos`): every per-PASS writer gained `verdict`, `refusal_bound` and
+    `room`, and the SET's aggregate did not. `record_exit` here writes the CANONICAL
+    `pr-doctor.status.json` -- the file `lib/fleet-inventory.sh::_fleet_pr_doctor_bound` reads before
+    it will render a `6` as `WAITING` on the load axis -- and that reader requires ALL THREE: the
+    record's own `rc` equal to the exit being explained, `verdict` in {"", "NO-CAPACITY"}, and a
+    non-empty `refusal_bound`. Without them the row takes its abstention arm, so a box that answered
+    "no room" printed `UNKNOWN`/exit 2 from the table while `heartbeat-loop.sh` and `objective.py`
+    printed `WAITING (no capacity)` from the SAME file: three readers, one record, two stories.
+
+    NON-VACUOUS: pre-fix the aggregate record has no `verdict` and no `refusal_bound` at all, so the
+    assertions below raise/compare against absent keys rather than passing on a different cause.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "%s=%s,%s=%s" % (_REPO_A, co_a, _REPO_B, co_b))
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+
+    def fake_run_pass(args, set_note):
+        # A REAL-shaped no-capacity pass: `_finish` records exactly these fields and returns 6. The
+        # two repos refuse on DIFFERENT axes, so the union below is not a single-name passthrough --
+        # a fix that just copied the LAST repo's bound would fail on the first assertion.
+        if pr.REPO == _REPO_B:
+            return pr.record_exit(pr.EXIT_NO_CAPACITY, "VERDICT=NO-CAPACITY next=prune",
+                                  queued=2, dispatched=0, open_prs=4, verdict="NO-CAPACITY",
+                                  no_capacity=2, refusal_bound="disk=2",
+                                  room="host=box load1=0.4 disk_free_mb=12")
+        return pr.record_exit(pr.EXIT_NO_CAPACITY, "VERDICT=NO-CAPACITY next=wait",
+                              queued=3, dispatched=0, open_prs=5, verdict="NO-CAPACITY",
+                              no_capacity=3, refusal_bound="load=3",
+                              room="host=box load1=31 lpc=8")
+
+    monkeypatch.setattr(pr, "run_pass", fake_run_pass)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    assert pr.main() == pr.EXIT_NO_CAPACITY, "\n".join(logs)
+    import json as _json
+    with open(pr.STATUS) as fh:
+        agg = _json.load(fh)
+    # ⛔ THE THREE THINGS `_fleet_pr_doctor_bound` DEMANDS, or the row abstains (`UNKNOWN`, exit 2).
+    assert agg["rc"] == pr.EXIT_NO_CAPACITY, agg
+    assert agg.get("verdict") == "NO-CAPACITY", agg
+    assert agg.get("refusal_bound") == "disk=2,load=3", agg     # the UNION, counts summed
+    assert agg.get("no_capacity") == 5, agg                     # summed, not the last repo's
+    # The box's own measurement survives into the canonical record (the row quotes it): the FIRST
+    # non-clean repo's, which is the deterministic order `ordered` already produces.
+    assert agg.get("room") == "host=box load1=31 lpc=8", agg
+    # Each per-repo entry carries its own datum, so a reader keyed on `repos` can say WHICH repo.
+    by = {r["repo"]: r for r in agg["repos"]}
+    assert by[_REPO_B]["refusal_bound"] == "disk=2", by[_REPO_B]
+    assert by[_REPO_A]["refusal_bound"] == "load=3", by[_REPO_A]
+    # ⛔ A SET WHOSE WORST PASS IS NOT 6 IS NOT A CAPACITY VERDICT (the control): claiming
+    # NO-CAPACITY over a transport refusal would be a new mislabel in place of the old one.
+    monkeypatch.setattr(
+        pr, "run_pass",
+        lambda args, set_note: pr.record_exit(pr.EXIT_UNDELIVERED, "VERDICT=UNDELIVERED",
+                                             queued=1, dispatched=0, open_prs=1,
+                                             verdict="UNDELIVERED", undeliverable=1))
+    assert pr.main() == pr.EXIT_UNDELIVERED, "\n".join(logs)
+    with open(pr.STATUS) as fh:
+        agg2 = _json.load(fh)
+    assert agg2["rc"] == pr.EXIT_UNDELIVERED, agg2
+    assert "refusal_bound" not in agg2, agg2
+    assert agg2.get("verdict") != "NO-CAPACITY", agg2
+
+
 def test_all_repos_without_a_named_set_refuses(monkeypatch, tmp_path):
     """No configured set is a REFUSAL, not "grade everything" and not "grade nothing quietly"."""
     _neutral_cwd(monkeypatch, tmp_path)
