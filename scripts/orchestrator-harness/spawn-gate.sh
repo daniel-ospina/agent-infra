@@ -1519,6 +1519,16 @@ AGENT_FORK_REFUSED=73
 # dispatch elsewhere — is as distinct as the others. 80+ is taken by the brief gate and adopt-fix.sh,
 # so this one sits beside the fork refusal at 71.
 AGENT_CAPABILITY_REFUSED=71
+# The HARNESS-MISMATCH refusal (follow-up review of #2991, P1+P2, measured). NOT a reading about the
+# box, which is exactly why it cannot share 71: the probe RAN and either rejected the arguments it was
+# handed (`why=usage` — a caller passing a flag the deployed copy of the helper predates) or died
+# without printing a verdict at all (rc=2 — a truncated/partial `cp`, which `bash <file>` reports as a
+# syntax error). Both are properties of the HELPER PAIR, identical on every box that runs it, so the
+# remedy is to sync that pair. Reporting them as 71 sent the operator to "repair this box's installed
+# pi/extension set or provider credential" and then to "dispatch the issue to another box" — where the
+# same skewed pair refuses identically. 81 because 71-80 are all taken (79 is adopt-fix.sh's deferral,
+# 80 the brief gate), and a code that is unique is what lets every caller publish the sync remedy.
+AGENT_HARNESS_SKEW_REFUSED=81
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
@@ -1953,7 +1963,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # which the preflight emits ONLY when the process RETURNED without answering — that is its contract,
   # stated in its own header), and EVERY other named refusal refuses. A verdict line with no
   # recogniseable verdict at all warns, because a probe that could not run is not a verdict about the
-  # box.
+  # box — `rc=1` (no such probe, a helper that could not start) is that case. The one exception is
+  # `rc=2`, which the probe's own EXIT table means "CANNOT MEASURE — every caller must refuse too":
+  # a probe that RAN and reported cannot-measure has measured something about the PAIR, and it refuses
+  # with the harness-mismatch code below (follow-up review of #2991, P1).
   #
   # ⛔ IT DOES NOT SPEND THE SLOT IT IS PROTECTING: one bounded call, ~5-25 s measured on a healthy box,
   # and the attempt is abandoned the moment the process exits. `LANE_PREFLIGHT=0` is the declared
@@ -1961,7 +1974,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # default, not a tighter number: a healthy box measured 25 s worst case, so a 30 s bound left ~1 s of
   # slack for the post-answer exit and could refuse a working box on one slow sample).
   if [ "${LANE_PREFLIGHT:-1}" != "0" ]; then
-    local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy="" _pf_reason="" _pf_rest=""
+    local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy="" _pf_reason="" _pf_rest="" _pf_code=""
     if _pf_sh="$(cell_preflight_path)"; then
       _pf_line="$(bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
                     --provider "$lane_provider" --model "$lane_model" 2>>"$log")"
@@ -2007,25 +2020,50 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
               _pf_remedy="This does NOT clear by waiting: the lane's model/provider PAIR is empty, so no box could run it — fix the dispatch, not the box." ;;
             usage)
               # Version skew, not a property of the box: the probe rejected an argument it was handed.
-              _pf_remedy="This does NOT clear by waiting: the probe REJECTED its own arguments (the usage-error in the line above), which is a helper/consumer VERSION SKEW rather than a reading about this box — sync it: cp scripts/orchestrator-harness/*.sh \$O/ ." ;;
+              # ⛔ AND IT IS NOT A CAPACITY REFUSAL, WHICH IS WHY IT EXITS 81 (follow-up review of
+              # #2991, P2, measured): every reader maps 71 to a BOX property (`lane.sh` mints a
+              # `capacity-refused-<N>` record from it, so the item is yielded to a peer), and a skewed
+              # pair is identical on that peer. The remedy below is the only correct one, and the code
+              # is what makes the readers publish it instead of "repair the box / dispatch elsewhere".
+              _pf_remedy="This does NOT clear by waiting and it is NOT a property of this box: the probe REJECTED its own arguments (the usage-error in the line above), which is a helper/consumer VERSION SKEW — the same pair refuses identically on every other box, so do NOT dispatch the item elsewhere. Sync the helper pair: cp scripts/orchestrator-harness/*.sh \$O/ ." ;;
             *)  _pf_remedy="This does NOT clear by waiting: the reading above names the refusal." ;;
           esac
           if [ "$_pf_reason" = "no-answer" ]; then
             echo "[capability-gate] WARN $label: the probe RETURNED without an answer (rc=$_pf_rc) — PROCEEDING, because a transient cannot arm a refusal and this is the only shape a transient takes. If lanes on this box stall, the line above is the reading to start from." >> "$log"
           else
             AGENT_STARTED=0
-            echo "[capability-gate] REFUSED $label: LANE_CAPABILITY (exit $_pf_rc) — no agent was started, so nothing was consumed and no 3300s slot is spent on a box that cannot complete one call and return. $_pf_remedy Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
+            # ⛔ THE CODE FOLLOWS THE REMEDY (follow-up review of #2991, P2). `usage` is the one reason
+            # in this block whose cause is the helper pair rather than the box, so it leaves under its
+            # own code and every caller can publish the sync remedy instead of a capacity one.
+            _pf_code="$AGENT_CAPABILITY_REFUSED"
+            [ "$_pf_reason" = "usage" ] && _pf_code="$AGENT_HARNESS_SKEW_REFUSED"
+            echo "[capability-gate] REFUSED $label: LANE_CAPABILITY (exit $_pf_rc, refusal $_pf_code) — no agent was started, so nothing was consumed and no 3300s slot is spent on a box that cannot complete one call and return. $_pf_remedy Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
             # ⛔ JOB CONTROL IS RESTORED BEFORE THE EARLY RETURN (review P2). `set -m` was turned on
             # above for the launch, and the restore line lives after it — so this return is the one path
             # that used to leave the CALLER with job control ON when it did not have it. With `set -m`
             # on, bash stops redirecting an async command's stdin from /dev/null, so a later background
             # command in the caller can inherit the pane's pty or a CLOSED fd 0 (#2163).
             [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
-            return "$AGENT_CAPABILITY_REFUSED"
+            return "$_pf_code"
           fi ;;
         *LANE_CAPABILITY=ok*) : ;;
         *)
-          echo "[capability-gate] WARN $label: the capability probe produced no verdict at all (rc=$_pf_rc) — PROCEEDING, because a probe that cannot run is not a verdict about the box. If lanes on this box stall, start from the absence of a LANE_CAPABILITY line above." >> "$log" ;;
+          # ⛔ `rc=2` IS A VERDICT, AND IT IS THE ONE THE PROBE'S OWN EXIT TABLE SAYS EVERY CALLER MUST
+          # REFUSE ON (`cell-lane-preflight.sh`: "2 CANNOT MEASURE — EVERY caller must refuse too").
+          # Taking the generic WARN arm here left the probe's CONTRACT unread: `_pf_rc` was captured and
+          # never consulted (follow-up review of #2991, P1). Reachable exactly where the damage is
+          # worst — a NEW caller against an OLD deployed helper (the version-skew direction this PR
+          # names as the production cause: an argument the old copy rejects exits 2 printing nothing),
+          # or a corrupt/truncated copy, where `bash <file>` exits 2 with no stdout. Both are the helper
+          # pair, not the box, so they REFUSE under 81 and say so. `rc=1` (no helper, could not start)
+          # still warns: that is the absence of a probe, not a reading from one.
+          if [ "${_pf_rc:-0}" -eq 2 ]; then
+            AGENT_STARTED=0
+            echo "[capability-gate] REFUSED $label: LANE_CAPABILITY rc=2 with NO verdict line — the probe RAN and reported CANNOT MEASURE, which its own EXIT table says every caller must refuse too. This is a helper/consumer VERSION SKEW (a caller passing a flag the deployed copy predates) or a corrupt/truncated copy ($_pf_sh), NOT a reading about this box: every box running the same pair refuses identically, so do NOT dispatch the item elsewhere. Sync it: cp scripts/orchestrator-harness/*.sh \$O/ . Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
+            [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
+            return "$AGENT_HARNESS_SKEW_REFUSED"
+          fi
+          echo "[capability-gate] WARN $label: the capability probe produced no verdict at all (rc=$_pf_rc) — PROCEEDING, because a probe that cannot run (rc=1: absent or unable to start) is not a verdict about the box. If lanes on this box stall, start from the absence of a LANE_CAPABILITY line above." >> "$log" ;;
       esac
     else
       echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"

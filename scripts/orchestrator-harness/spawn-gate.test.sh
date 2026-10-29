@@ -1266,12 +1266,14 @@ mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=some-future-verdict ho
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "an UNRECOGNISED refusal reason refuses (polarity, not an allow-list) (rc=$CRC)" $rc
-# (g) A VERDICT THAT NEVER CAME warns: a probe that could not run is not a verdict about the box.
+# (g) A VERDICT THAT NEVER CAME warns: a probe that could not RUN is not a verdict about the box.
+# ⛔ `rc=1` IS THE NO-PROBE CASE — the file could not be started at all. `rc=2` is a different
+# reading and is arm (g4) below.
 mkfake '' 1
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
-ck "a probe that produced NO verdict at all WARNS and dispatches (rc=$CRC, agent ran)" $rc
+ck "a probe that produced NO verdict at all with rc=1 WARNS and dispatches (rc=$CRC, agent ran)" $rc
 # (g2) THE USAGE PATH MUST FAIL CLOSED (follow-up to #2991, P2, measured). This is the REAL probe, not
 # a fixture: `LANE_PREFLIGHT_BOUND=45s` made `die_usage` exit 2 with a stderr line and no stdout
 # verdict, the "no verdict" arm above took it, and the measured result was `rc=0, agent launched` —
@@ -1280,10 +1282,12 @@ ck "a probe that produced NO verdict at all WARNS and dispatches (rc=$CRC, agent
 # CALLER refuses on it, so the two halves cannot drift apart in either direction.
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 LANE_PREFLIGHT_BOUND=45s CELL_PREFLIGHT_SH="$HERE/cell-lane-preflight.sh"
-{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "an UNREADABLE usage path (bad \$LANE_PREFLIGHT_BOUND) is REFUSED, not dispatched (rc=$CRC)" $rc
 grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and the remedy names what a usage error actually is — helper/consumer skew, not the extension set" $rc
+grep -q 'do NOT dispatch the item elsewhere' "$LOG"; rc=$?
+ck "...and says the refusal is NOT a box property, so a peer must not be handed the item" $rc
 # (g3) A REFUSAL'S READING IS NOT ITS VERDICT (follow-up to #2991, P3, measured). `why=no-return` and
 # `why=call-failed` end in `tail=<last 240 bytes of pi's own output>`, and the arms above were chosen
 # by a substring test over the WHOLE line — so a deterministic refusal whose tail happened to embed
@@ -1303,6 +1307,24 @@ mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=no-answer host=x retur
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
 ck "a GENUINE why=no-answer still WARNS and dispatches (rc=$CRC) even with a hostile tail" $rc
+# (g4) A PROBE THAT RAN AND SAID "CANNOT MEASURE" MUST REFUSE (follow-up review of #2991, P1, measured).
+# `_pf_rc` was captured and NEVER CONSULTED, so this shape took the `*)` WARN arm and dispatched: the
+# probe exited 2 with empty stdout — which its own EXIT table defines as "CANNOT MEASURE, every caller
+# must refuse too" — and an agent was launched by a probe that had measured nothing, burning the exact
+# 3300 s slot this gate exists to protect. Reachable in the version-skew direction the probe's own
+# header names as the production cause (a NEW caller against an OLD deployed helper: a rejected
+# `--bound` exits 2 printing nothing) and from a truncated/corrupt copy (`bash <file>` on broken syntax
+# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 81 (not 71: 71 sends the
+# operator to repair the BOX and then to dispatch the item to a peer that runs the same pair).
+mkfake '' 2
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that RAN and exited 2 with NO verdict is REFUSED 81 and starts NO agent (rc=$CRC)" $rc
+grep -q 'rc=2 with NO verdict' "$LOG"; rc=$?
+ck "...and the log names the rc=2 reading, so the operator is not left with an unexplained refusal" $rc
+grep -q 'VERSION SKEW' "$LOG"; rc=$?
+ck "...and names the pair as the cause (skew/corrupt copy), not the box's pi or credential" $rc
 # (h) A REFUSAL RESTORES THE CALLER'S JOB CONTROL. `set -m` is turned on above the gate and restored
 # after the launch, so the early return was the one path that left the caller with job control ON —
 # and with it on, an async command in the caller no longer gets its stdin from /dev/null (#2163).
@@ -1425,7 +1447,7 @@ chain_probe() { # <gate-word> -> sets CHAIN_RC and CHAIN_REMEDY (the gate the ch
 }
 # `<gate-word>:<CONSTANT-NAME>` — the value is read from the helper, so a RENUMBER here is followed
 # rather than pinned twice, and an absent constant shows up as an empty `want` (red), not as a pass.
-_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED"
+_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED"
 _seen=""; _exercised=""
 for _pair in $_gate_expected; do
   _g="${_pair%%:*}"; _c="${_pair##*:}"

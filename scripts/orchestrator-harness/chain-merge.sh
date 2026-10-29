@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `fork|load|disk|land` and returns 0 iff THIS dispatch was refused by a gate
+cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -132,6 +132,7 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land` and returns 0 iff THIS di
     fork) printf 'fork' ;;
     land) printf 'land' ;;
     capability) printf 'capability' ;;
+    skew) printf 'skew' ;;
     *) printf 'load' ;;
   esac
   return 0
@@ -272,10 +273,20 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
       # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
+      # 81 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
+      # and either rejected its own arguments (a usage/version skew between the caller and the deployed
+      # helper) or died without a verdict (`rc=2` on a corrupt copy). ⛔ IT MUST NOT BE 71: every reader
+      # treats 71 as a property of THIS box, so the operator is told to repair the box's pi/extension
+      # set or hand the item to a peer — and the peer runs the SAME helper pair and refuses identically.
+      # The chain still stops here (no PR can appear), and the EXIT trap still releases
+      # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
+      skew) _cap_rc=81 ;;
       *)    _cap_rc=75 ;;
     esac
     if [ "$_cap_gate" = "land" ]; then
       echo "[chain $N] land-backlog: lane-$N was refused because the repo's open-PR backlog is over its own landing ceiling (#2409), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This is NOT a capacity transfer: the backlog is repo-wide, so handing the issue to a peer box would not clear it — the remedy is to LAND the open queue (or dispatch a P0-blocker / base-red repair, which are exempt)" >> "$LOG"
+    elif [ "$_cap_gate" = "skew" ]; then
+      echo "[chain $N] harness mismatch: lane-$N was refused because the lane's caller and the deployed cell-lane-preflight.sh disagree (a usage/version skew, or a corrupt copy), so the capability probe measured nothing — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: every box running the same helper pair refuses identically, so handing the issue to a peer would only circulate it — the remedy is to sync the pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever lanes run" >> "$LOG"
     else
       echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"
     fi
