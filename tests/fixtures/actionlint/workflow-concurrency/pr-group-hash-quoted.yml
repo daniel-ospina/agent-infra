@@ -1,0 +1,13 @@
+# A `#` inside a QUOTED value is content, not a comment. The strip truncated the group at the `#`, so a
+# correct workflow was refused and the refusal quoted text that is not the value (#2660 round 8).
+name: PR group hash quoted
+on:
+  pull_request:
+concurrency:
+  group: "${{ github.workflow }} # ${{ github.ref }}"
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
