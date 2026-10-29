@@ -8139,6 +8139,99 @@ grep -qF "window DID carry were: changes | lint." "$SCEN/err" \
   && pass "…while still naming the executed job names it saw" \
   || fail "the at-the-bound refusal dropped the job names: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
 
+# ── (g3) #2842: THE REFUSAL MUST CARRY A VALUE THAT WORKS ───────────────────
+# The refusal has named ADMIN_MERGE_LANE_JOB_PREFIX since #4844 and the executed
+# names since #7734 — and a lane still paid a full extra cycle (DMeer #1394,
+# 2026-10-25), because a knob plus a name list leaves the operator to GUESS the
+# value and the obvious guess is refuted by the matcher: the family is a
+# case-SENSITIVE prefix, so the lowercase `unit` the rail's own example teaches
+# selects NOTHING when the job is `Unit tests`. The operator follows the printed
+# remedy, is refused again, and the only other door the same message names is
+# AGENT_ADMIN_MERGE_OVERRIDE=1 — the bypass steer #2842 exists to remove.
+#
+# Three assertions, and the SECOND is the one that matters: the value the refusal
+# derives is one the rail then ACCEPTS — a suggestion that does not land is a
+# longer version of the same defect.
+echo "== 22d. #2842: a differently-NAMED test job — the refusal derives the retry value =="
+new_scen familynamed
+HEAD_UN="beef000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UN" > "$SCEN/head"
+printf '%s\n' "$(lane_line completed success "$HEAD_UN" 7101)" > "$SCEN/runs-$HEAD_UN"
+lane_jobset 7101 success 'Unit tests' 'changes'
+printf '%s\n' "$(lane_line completed success mainab 7102)" > "$SCEN/runs-main"
+lane_jobset 7102 success 'Unit tests' 'changes'
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a job named 'Unit tests' under the default family → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — a family that matched nothing certified"
+# THE HEADER MUST BE TRUE. Both job lists were readable, so the unreadable-list
+# wording (which the operator reads FIRST, before the WHY line) mis-describes the
+# condition as unmeasurable coverage when it was measured and misnamed.
+grep -q "shard lists are not" "$SCEN/err" \
+  && fail "the refusal claims the shard lists are UNREADABLE, but they were read and named 'Unit tests'" \
+  || pass "…and does NOT claim an unreadable list when the lists were read"
+grep -q "NOT an unreadable list and NOT a red check" "$SCEN/err" \
+  && pass "…naming the condition that held: a NAMING mismatch, not a red PR" \
+  || fail "the refusal does not separate a naming mismatch from a red check"
+grep -qF "ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests'" "$SCEN/err" \
+  && pass "…and DERIVES the retry value from the names the window executed" \
+  || fail "the refusal names the knob but no value that works with 'Unit tests': $(grep -o 'THE RETRY.*' "$SCEN/err" | head -c 200)"
+grep -q "CASE-SENSITIVE" "$SCEN/err" && pass "…stating that the match is case-sensitive (the trap the example set)" \
+  || fail "the refusal does not say the family match is case-sensitive"
+# THE DISCRIMINATOR: the value the refusal printed must LAND. Same fixtures, that
+# one variable exported — parity holds, evidence is posted, the merge proceeds.
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests' \
+  bash "$ADM" 42 --main-runs 1 >"$SCEN/out-prefixed" 2>"$SCEN/err-prefixed"
+rc=$?
+[ "$rc" -eq 0 ] && pass "…and exporting it CERTIFIES the same tree (exit 0) — the printed value lands" \
+  || { fail "the derived value did not land (exit $rc)"; sed 's/^/      /' "$SCEN/err-prefixed" | head -8; }
+grep -q "lane parity: PR ⊇ main" "$SCEN/comment" 2>/dev/null \
+  && pass "…with the parity the certificate rests on stated (family: Unit tests*)" \
+  || fail "no parity line in the posted evidence for the derived family"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge actually issued" \
+  || fail "no merge issued although the derived prefix made the lanes comparable"
+# THE TRAP ITSELF, pinned: the lowercase guess the old text taught is REFUTED by
+# the matcher. Asserted so the case-sensitivity claim above is measured and not
+# asserted — and so a future "helpful" lowercasing of either side fails here.
+new_scen familynamedlower
+printf '%s\n' "$HEAD_UN" > "$SCEN/head"
+printf '%s\n' "$(lane_line completed success "$HEAD_UN" 7101)" > "$SCEN/runs-$HEAD_UN"
+lane_jobset 7101 success 'Unit tests' 'changes'
+printf '%s\n' "$(lane_line completed success mainab 7102)" > "$SCEN/runs-main"
+lane_jobset 7102 success 'Unit tests' 'changes'
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  ADMIN_MERGE_LANE_JOB_PREFIX='unit' \
+  bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "the lowercase 'unit' the old example taught does NOT select 'Unit tests' (exit $rc)" \
+  || fail "'unit' matched 'Unit tests' — the match is not the case-sensitive prefix this file documents"
+grep -qF "ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests'" "$SCEN/err" \
+  && pass "…and the refusal hands back the value that DOES select it" \
+  || fail "a wrong guess is refused without naming the value that works"
+# THE SAME DEFECT ON THE OTHER SIDE. main's family matches and this head's does
+# not (a rename in flight): the useful names are the PR's, and a remedy that names
+# only the knob leaves the value to be guessed against the same case-sensitive match.
+new_scen familynamedpr
+printf '%s\n' "$HEAD_UN" > "$SCEN/head"
+printf '%s\n' "$(lane_line completed success "$HEAD_UN" 7301)" > "$SCEN/runs-$HEAD_UN"
+lane_jobset 7301 success 'Unit tests' 'changes'
+printf '%s\n' "$(lane_line completed success mainb1 7302)" > "$SCEN/runs-main"
+lane_jobset 7302 success 'test (a)' 'changes'
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "main runs 'test (a)' and this head runs 'Unit tests' → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty PR family certified"
+grep -qF "ADMIN_MERGE_LANE_JOB_PREFIX='Unit tests'" "$SCEN/err" \
+  && pass "…and the PR-side mismatch is handed ITS retry value, not just the knob" \
+  || fail "the PR-side mismatch names no value: $(grep -o 'retry value(s).*' "$SCEN/err" | head -c 200)"
+
 # The parity key exists ONCE, in `lane_parity_check`, and it is not a second
 # `comm -23`: the one `comm` in this rail belongs to the parser's `--diff` (test
 # 9's parity invariant), and a reader must not have to guess which subtraction a
