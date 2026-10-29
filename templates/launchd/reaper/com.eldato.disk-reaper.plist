@@ -79,11 +79,22 @@
         <string>{{REAPER_DIR}}/reap-lane-venvs.sh</string>
         <key>WORKTREE_REAPER</key>
         <string>{{REAPER_DIR}}/pi-reap-worktrees.sh</string>
-        <!-- The worktree owner asks GitHub which PRs are open before it may delete anything; a
-             busy box shares one account with every other box and the gh shim backs off. Above that
-             backoff window, and IN THE PLIST because a launchd job inherits no shell rc files. -->
+        <!-- ⛔ THE WRAPPER CANNOT SEE ITS OWN PATH HERE. The launcher pipes this script to
+             `/bin/bash -s` (that is why BOUNDED_LIB is pinned above), and under `bash -s`
+             `BASH_SOURCE` is UNSET — so `disk-reaper-run.sh` cannot resolve `disk-reaper.sh`
+             beside itself and would refuse on every tick. Pin it, exactly like the other
+             delegates: the wrapper validates it with `-f`, so a wrong pin is a loud refusal
+             rather than a silently different copy. -->
+        <key>DISK_REAPER</key>
+        <string>{{REAPER_DIR}}/disk-reaper.sh</string>
+        <!-- The worktree owner asks GitHub which PRs are open before it may delete anything. The
+             scheduled entry point is disk-reaper-run.sh, which resolves the REAL gh binary by
+             absolute path and sets AGENT_GH_GATE_NO_WAIT=1, so the shim's shared-account backoff is
+             no longer on this path (only an interposer would park here). 120 s is then a generous
+             bound for one read-only query, and it matches the systemd unit — the two artifacts were
+             300/120 apart, with the 300 comment describing a code path that no longer runs. -->
         <key>REAP_WT_GH_TIMEOUT</key>
-        <string>300</string>
+        <string>120</string>
     </dict>
     <key>StartInterval</key>
     <integer>3600</integer>
