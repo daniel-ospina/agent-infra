@@ -927,6 +927,14 @@ _cc_ask() {
   # operator "the diff changed" from "gh was contended" from "this was a rebase".
   out="${out//$'\n'/ }"
   [ -n "$out" ] && echo "[merge $PR] check-carry rc=$CC_RC token=[${CC_TOKEN:-<none>}] says: ${out:0:400}" >> "$L.log"
+  # ⛔ A READABLE ANSWER BREAKS THE UNREADABLE STREAK (fresh review of #3037, P3-1). The cap in the
+  # `3:unreadable` arm is head-keyed, so without this a box that recovered on cycle 2 and then hit a
+  # single contended read on cycle 4 at the SAME head would inherit a count nobody can explain. The
+  # streak means CONSECUTIVE failed reads, so every answer that is not `unreadable` clears it —
+  # INCLUDING the retry inside that arm, which is the whole point of retrying.
+  if [ "$CC_RC:$CC_TOKEN" != "3:unreadable" ]; then
+    rm -f "$O/state/diffreadcount-$PR" 2>/dev/null || true
+  fi
 }
 
 # _cc_rerecord — re-mint THIS record's OWN verdict at the CURRENT head, via the recorder's carry arm
@@ -1064,7 +1072,34 @@ case "$CC_RC:$CC_TOKEN" in
     if _cc_recover; then
       :
     else
-      echo "[merge $PR] check-carry=unreadable after a retry and no verified body marker covers head=$HEAD — NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle (a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
+      # ⛔ BOUNDED, AND IT PARKS AT THE CAP (fresh review of #3037, P3-1). The retry above is
+      # per-CYCLE, so on a DURABLE unreadable state — the measured 2026-10-22 shape this file records
+      # at :70-76, where the gh wrapper chain resolved to itself, every `gh` call returned EMPTY and
+      # the worker refused EVERY merge for the life of the condition — `exit 0` loops each sweep
+      # forever: three recorder calls, one log line, nothing that ever fires and nothing in-band that
+      # names the gh layer. Every other repeated state in this file is bounded (`RAIL_TRIES` +
+      # `parked-<PR>`, `MAX_REVIEW_TRIES` + `reviewdisp-*`, the gate poll window), so this one is too.
+      # ⛔ HEAD-KEYED, with `RAIL_TRIES`'s own shape (a new head resets the count — the budget belongs
+      # to the HEAD) and its `is_limit` guard (`[ -ge ]`/`$(( +1 ))` on a huge digit string errors FALSE
+      # on bash 3.2 and the cap is silently missed). ⛔ BELOW the cap it still exits 0 and parks
+      # NOTHING: one contended read is a transport blip and parking on it would blame the PR for it.
+      DR_TRIES="${DIFFREAD_TRIES:-3}"
+      if ! is_limit "$DR_TRIES"; then
+        echo "[merge $PR] DIFFREAD_TRIES='$DR_TRIES' is not an integer in range — using 3" >> "$L.log"
+        DR_TRIES=3
+      fi
+      DR_F="$O/state/diffreadcount-$PR"; DR_H=""; DR_N=0
+      if [ -f "$DR_F" ]; then read -r DR_H DR_N < "$DR_F" 2>/dev/null || true; fi
+      is_limit "${DR_N:-}" || DR_N=0
+      [ "${DR_H:-}" = "${HEAD:-}" ] || DR_N=0
+      DR_N=$((DR_N + 1))
+      printf '%s %s\n' "${HEAD:-}" "$DR_N" > "$DR_F" 2>/dev/null || true
+      if [ "$DR_N" -ge "$DR_TRIES" ]; then
+        park "the PR's DIFF could not be READ at head=$HEAD for $DR_N consecutive cycle(s) — check-carry answered 'unreadable' and no verified body marker covers this head. A failed READ is not a changed artifact, so nothing was paid for and nothing was merged; a durable unreadable diff is a gh-layer fault on THIS box (a wrapper chain resolving to itself, an expired/unreadable token, a hard 5xx), not a fault of the PR. Fix the gh layer (bin/harness status reports gh=CANNOT-REACH-REAL-GH for exactly this), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$DR_F'"
+        echo "[merge $PR] ABORT: the diff was UNREADABLE $DR_N time(s) at head=$HEAD (cap $DR_TRIES) — parked with the gh layer named, because an unbounded exit-0 loop never surfaces itself" >> "$L.log"
+        exit 3
+      fi
+      echo "[merge $PR] check-carry=unreadable after a retry and no verified body marker covers head=$HEAD — NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle ($DR_N/$DR_TRIES — a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
       exit 0
     fi ;;
   4:*)
@@ -1431,11 +1466,6 @@ case "$LAST" in
     # ⛔ INITIALISED AT THE TOP OF THE ARM, because the park remedies below expand both under
     # `set -u` and one of the two paths now reaches them without a reviewer comment at all.
     URL=""; CID=""
-    # ⛔ THE GUARD'S REMEDY CITES THE REVIEWER'S COMMENT, and on the carry path NO REVIEWER RAN, so
-    # `CID` is empty by construction. Substituting it raw printed `--evidence comment:` — a command
-    # that cannot work — in the one park a human is meant to act on. The comment that the carried
-    # record was minted FROM still exists on the PR, so name the placeholder instead.
-    CIDHINT="${CID:-<the reviewer comment id on PR #$PR>}"
     if [ "${CC_OWED:-0}" = "1" ]; then
       # ── 2) NOTHING TO MINT: the record (and its signed marker) ALREADY exist at this head ──
       # The block at 0b re-bound the record to the CURRENT head before choosing this path, so the
@@ -1522,6 +1552,16 @@ case "$LAST" in
     # refusal can be classified without a stale match from an earlier cycle.
     rec_out_cleanup
     fi  # ── step 2 only (the evidence-comment read + the record mint) ────────────────────────────
+    # ⛔ THE GUARD'S REMEDY CITES THE REVIEWER'S COMMENT, AND IT IS COMPUTED **AFTER** THE BRANCH
+    # (fresh review of #3037, P2). `CID` is populated INSIDE the paid arm above, so the first version
+    # — which computed this at the top of the `CLEAN*)` arm — froze it to the placeholder on BOTH
+    # arms: the paid path printed `--evidence comment:<the reviewer comment id on PR #N>` while the
+    # real id sat in `$CID` two lines further down, turning a pasteable remedy into one that cannot
+    # work on exactly the arm (#1717's best-effort marker post) a human hits most. Here the paid path
+    # has `$CID` and the carry path has none by construction — NO REVIEWER RAN, so there is no
+    # comment to cite and the placeholder names what to look for instead. ⛔ ONE definition for both
+    # arms: two definitions is how a value and its guarantee drift apart.
+    CIDHINT="${CID:-<the reviewer comment id on PR #$PR>}"
     # ⛔⛔ THE SIGNED-MARKER GUARD BELOW IS **OUTSIDE** THE `CC_OWED` BRANCH, AND THAT IS LOAD-BEARING
     # (fresh review of #3037, P1-4). The recovery block at 0b may skip exactly ONE step — the PAID
     # review — and it says so in three places (the 0b block header, the 1b block header, and this

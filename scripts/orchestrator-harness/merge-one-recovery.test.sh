@@ -415,6 +415,58 @@ out="$(run_merge FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 \
 rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls) — a recovered record over a CHANGED diff skipped the review"; }
 ck "…and a recovered record over a genuinely CHANGED diff still orders the review" $rc
 
+# ══ 13) AN UNREADABLE DIFF IS BOUNDED, AND IT PARKS AT THE CAP (fresh review of #3037, P3-1) ═══
+# `unreadable` is the ONE arm that ends the worker with `exit 0`, and the retry above it is per-CYCLE.
+# On a DURABLE unreadable state — the measured 2026-10-22 shape where the gh wrapper chain resolved to
+# itself and every `gh` call returned EMPTY — that loop runs forever: three recorder calls and one log
+# line per sweep, nothing that ever fires, nothing in-band naming the gh layer. Below the cap it must
+# STILL exit 0 and park nothing (one contended read is a blip, and blaming the PR for it is wrong).
+mkmrg; mkrecorder; write_record "$OLDH" clean
+for cyc in 1 2; do
+  out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3 DIFFREAD_TRIES=3)"
+  rc=0; no_park || { rc=1; note "cycle $cyc parked BELOW the cap: $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+  ck "the unreadable cap is not reached at cycle $cyc/3 — nothing parks on a single contended read" $rc
+done
+out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3 DIFFREAD_TRIES=3)"
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "cycle 3 did NOT park — the arm is unbounded again (tail: $(tail -3 "$MRG/o/logs/merge-$PR.log"))"; }
+ck "RED→GREEN: the THIRD consecutive unreadable read at one head PARKS (exit 0 is not the only outcome)" $rc
+rc=0; grep -qiE 'gh layer|gh-layer|gh=' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and the reason names the gh LAYER, so the human is sent at the right surface" $rc
+rc=0; grep -qF 'DIFF could not be READ' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and it says a READ failed — never that the diff changed" $rc
+# NON-VACUITY of the counter's head key: a NEW head resets the streak, so a push re-arms the worker.
+# Same fixture, another cycle at the SAME head is parked (guard), so assert the counter file's key.
+rc=0; awk '{print $1}' "$MRG/o/state/diffreadcount-$PR" 2>/dev/null | grep -qxF "$HEAD" || { rc=1; note "diffreadcount=$(cat "$MRG/o/state/diffreadcount-$PR" 2>/dev/null)"; }
+ck "…and the budget is keyed on the HEAD (a push re-arms it, RAIL_TRIES' own shape)" $rc
+# …and a READABLE answer clears the streak, so a recovered box does not inherit a count.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3 DIFFREAD_TRIES=2)"
+out="$(run_merge FAKE_CC_TOKEN=fresh FAKE_CC_RC=1 DIFFREAD_TRIES=2)"
+rc=0; [ -e "$MRG/o/state/diffreadcount-$PR" ] && { rc=1; note "the streak survived a READABLE answer: $(cat "$MRG/o/state/diffreadcount-$PR")"; }
+ck "a readable answer CLEARS the streak (the cap counts CONSECUTIVE failures, not lifetime ones)" $rc
+
+# ══ 14) THE PAID PATH'S PARK REMEDY CARRIES THE REAL COMMENT ID (fresh review of #3037, P2) ══════
+# `CIDHINT` began life at the TOP of the `CLEAN*)` arm, before the branch that sets `CID`, so it froze
+# to the placeholder on BOTH arms: the paid path printed `--evidence comment:<the reviewer comment id
+# on PR #N>` while the real id sat in `$CID` two lines below. `parkreason-<PR>` is documented in the
+# worker as "the only remedy a human sees in-band", and this is the guard the fleet hits most (#1717).
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=fresh FAKE_CC_RC=1 FAKE_MINT_MARKER=0)"
+rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls) — this arm must be the PAID path"; }
+ck "…(setup) the paid path ran and reached the signed-marker guard" $rc
+rc=0; no_park && { rc=1; note "nothing parked, so the guard was never reached"; }
+ck "…(setup) with no marker in the body it parks" $rc
+rc=0; grep -qF -- '--evidence comment:12345' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "RED→GREEN: the PAID path's remedy names the reviewer's REAL comment id (a pasteable command)" $rc
+rc=0; grep -qF -- 'comment:<the reviewer comment id' "$MRG/o/state/parkreason-$PR" 2>/dev/null && { rc=1; note "the paid path printed the placeholder instead of the id it already holds"; }
+ck "…and never the placeholder on the arm that HAS an id" $rc
+# The carry path has NO reviewer comment by construction, so it must still name the placeholder rather
+# than print a bare `comment:` (a command that cannot work) — the reason the placeholder exists.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0 FAKE_MINT_MARKER=0)"
+rc=0; grep -qF -- 'comment:<the reviewer comment id' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and the CARRY path names the placeholder (no reviewer ran, so it must not print a bare 'comment:')" $rc
+
 echo
 echo "==> $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
