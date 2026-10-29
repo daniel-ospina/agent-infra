@@ -63,6 +63,41 @@
 #   about to hand over (create it, idempotently, before exec) and `status` reports a missing target as
 #   a DEFECT rather than leaving the next job to discover it.
 #
+# ⛔ EACH INSTANCE GETS ITS OWN PRIVATE TEMP ROOT, AND THE LISTENER IS STARTED WITH IT
+#   (agent-infra#7815). `.env` above can name a TMPDIR, but nothing required it to — so an instance with
+#   no `.env` inherited the BOX's temp dir, i.e. the machine-wide `/tmp` that every other runner install,
+#   every peer lane and every unrelated process on that box writes into. Measured: a CI shard died in
+#   `tests/_tmpdir_hygiene.py` with `SharedTmpdirScanError: os.scandir('/tmp')` — that suite's hygiene
+#   guard protects the HOST temp dir and refuses entries it does not own, so on a shared `/tmp` it fires
+#   on other people's files (one unrelated fixture had written 337 GB into /private/tmp; agent-infra#3003)
+#   and every job's `mktemp`/`tmp_path` lands among them. So the private root is `$instance/_tmp`, mode
+#   700, created by the same user that execs `run.sh` — the layout real multi-runner installs use (one
+#   scratch dir per runner, precisely so runners stop competing for one `/tmp`) and the reason GitHub's
+#   own `RUNNER_TEMP` is per JOB rather than per machine.
+#   ⛔ THE ROOT IS STABLE AND SWEPT, NOT THE RUNNER'S PER-JOB `_work/_temp`. `RUNNER_TEMP` is the
+#   runner's to own and to empty; two facts decided against reusing its path as the listener's TMPDIR.
+#   (1) EXISTENCE IS THE WHOLE POINT: on a fresh install `_work/_temp` does not exist until the first
+#   job, and Python — the tortoise suite included — resolves an ABSENT `$TMPDIR` by SILENTLY FALLING
+#   BACK to the shared temp dir (measured on this box: `TMPDIR=/tmp/absent` →
+#   `gettempdir()=='/tmp'`), i.e. the isolation would disappear with no error anywhere. `_tmp` is
+#   created before `exec` and nothing else removes it, so the path a job inherits always exists.
+#   ⛔ MEASURED ON THIS BOX (2026-10-28), because the shape of the win matters more than the claim: with
+#   no private TMPDIR, `tempfile.gettempdir()` inside a job is `/tmp`, which carried **8,968 entries**
+#   (foreign `tt_*` trees, `.tortoise`, `.transfer.chunks`, …) — with `$instance/_tmp` it resolves to a
+#   tree with **1** entry, owned by that instance, and the neighbour is not visible at all. The tortoise
+#   suite then treats THAT tree as its host temp dir (`HOST_TMPDIR`), so its cross-run bookkeeping is per
+#   runner. (Its session root is still built under the SHORTEST base it can find — `/private/tmp`, 12
+#   chars — by its own AF_UNIX rule, so socket paths stay short; that is tortoise's decision and this
+#   tool must not fight it.)
+#   ⛔ LENGTH, for consumers that DO build directly under the temp dir (macOS, `sun_path` ≈104 bytes):
+#   `…/<instance>/_tmp` is 46 and `…/<instance>/_work/_temp` is 53 for `RUNNER_ROOT=/tmp/actions-runner`
+#   with the fleet's longest instance name, so `_tmp` keeps 7 more bytes of that budget. It was a
+#   TIE-BREAK, not the reason — the reason is the existence/residency argument above.
+#   A STABLE root must be BOUNDED, so every start (and every live repair) sweeps entries older than
+#   `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h): a job's own scratch is minutes old, so the bound
+#   cannot race a running job, and a day-old file in a runner's private temp dir is garbage by
+#   definition. `RUNNER_TEMP` itself is NOT touched — the runner owns it, its lifecycle is per job.
+#
 # ⛔ THE LABEL DESCRIBES THE RUNNER. `ci_runner_gate.sh` selects the pool by `self-hosted-arm64` /
 #   `self-hosted-x64`, and its invariant is "a runner's labels must describe that runner". A runner
 #   registered with no pool marker is invisible to that gate forever and matches no `runs-on:` job —
@@ -119,6 +154,8 @@
 #      RUNNER_LABELS (overrides the derived self-hosted-<arch> marker; must still contain it)
 #      POOL_PREFIX (default pi-runner-<host>) · RUNNER_START_SETTLE_S (5)
 #      RUNNER_MAX_SKEW_S (120) — the clock-skew bound a retirement is gated on (see `reclaim`)
+#      RUNNER_TMP_MAX_AGE_MIN (1440 = 24 h — the age bound of the per-instance private temp root
+#        `$instance/_tmp`, swept at every start; see agent-infra#7815 above)
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act — nothing changed, EXCEPT a registration
 #       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED,
@@ -157,6 +194,14 @@
 # `reconcile` all start through — now creates the directory (`mkdir -p`, mode 700, owner = the
 # listener's own user) before it execs `run.sh`, so a reboot cannot leave the listener without it and
 # no systemd drop-in has to be remembered per instance.
+# ⛔ AND THE SAME ARM COVERS THE INSTANCE'S OWN PRIVATE TEMP ROOT (#7815): `$instance/_tmp` is created
+# and swept by the same call, so a row whose private root has vanished is reported `defect
+# tmpdir-missing` on the path the listener is ACTUALLY started with — the `.env`-named path when there
+# is one, `$instance/_tmp` otherwise — rather than reading as healthy while every job dies at `mktemp`.
+# ⚠️ LIMIT, stated rather than implied: a listener that is ALREADY RUNNING keeps the environment it was
+# exec'd with, and this tool never re-execs a live listener (that is the double-start it exists to
+# prevent) — so `restart` restores the LAYOUT for the next start, and only a unit restart makes a
+# running listener pick the private root up. `status` reports the layout, not a live process's env.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -179,6 +224,9 @@ SETTLE_S="${RUNNER_START_SETTLE_S:-5}"        # how long a just-started listener
 # far below the interval at which a session is refused for skew.
 MAX_SKEW_S="${RUNNER_MAX_SKEW_S:-120}"
 CLOCK_PROBE_TIMEOUT_S="${RUNNER_CLOCK_PROBE_TIMEOUT_S:-10}"
+# ⛔ THE AGE BOUND OF THE PER-INSTANCE PRIVATE TEMP ROOT (#7815). `_tmp` is STABLE — it survives a job,
+# so it grows — and `$RUNNER_TMP_MAX_AGE_MIN` is what keeps that bounded at every start.
+TMP_MAX_AGE_MIN="${RUNNER_TMP_MAX_AGE_MIN:-1440}"   # 24 h: a job's scratch is minutes old, never a day
 POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"
 GH_CMD="${RUNNER_POOL_GH:-gh}"
 POOL_LABEL_X64="self-hosted-x64"
@@ -255,6 +303,11 @@ readings() {
   fi
   if ! is_uint "$CORES_PER_SLOT"; then
     err "cannot-measure why=cores-per-slot-unreadable value=${CORES_PER_SLOT:-<empty>}"; return 2
+  fi
+  # ⛔ THE SWEEP'S BOUND IS AN OPERAND TOO: `find -mmin +0x` and `find -mmin +` are both errors or
+  # surprises, and a --dry-run/real asymmetry here would make the preview lie about what it removes.
+  if ! is_uint "$TMP_MAX_AGE_MIN"; then
+    err "cannot-measure why=tmp-max-age-unreadable value=${TMP_MAX_AGE_MIN:-<empty>} (RUNNER_TMP_MAX_AGE_MIN must be a positive integer of minutes — the age bound of each instance's _tmp)"; return 2
   fi
   MEM_MB="$(cap_mem_free_mb 2>/dev/null)" || MEM_MB=""
   if ! is_uint "$MEM_MB"; then
@@ -960,6 +1013,115 @@ instance_tmpdir() {
   return 2
 }
 
+# instance_tmp_root <dir> — the instance's OWN private temp root (agent-infra#7815).
+# ⛔ NOT THE RUNNER'S `_work/_temp`. `RUNNER_TEMP` is created, emptied and owned by the runner, and it
+# does not exist before the first job — where an ABSENT `$TMPDIR` makes `tempfile.gettempdir()` fall
+# back to the SHARED temp dir with no error (measured: `TMPDIR=/tmp/absent` → `gettempdir()=='/tmp'`),
+# i.e. the isolation would vanish silently. So the root here is created before `exec`, is never emptied
+# by anyone else, and therefore always exists when a job resolves it. It is BOUNDED by the age sweep
+# below instead of by the runner's per-job cleanup.
+instance_tmp_root() { printf '%s' "${1%/}/_tmp"; }
+
+# sweep_tmp_root <dir> — keep the STABLE private root from growing without bound.
+# ⛔ THE BOUND IS AGE, NOT SIZE AND NOT "ON EVERY JOB": a job's own scratch is minutes old at most, so
+# an entry older than `$RUNNER_TMP_MAX_AGE_MIN` cannot belong to a running job — which is what makes it
+# safe to sweep a directory a live listener is using, and safe on the LIVE-repair arms of `restart` and
+# `reconcile` (they run while jobs may be in flight). Nothing in here is ever deleted on mtime ALONE
+# when the sweep cannot enumerate: a failed `find` removes nothing and claims nothing — the only
+# consequence is growth, and the next start retries. Dry runs REPORT, and remove nothing.
+# ⛔ THE WALK IS BOUNDED: one explicit start point, `-maxdepth 1` (the root's own entries; the root
+# itself is never a candidate), `-print0` so a name with a newline cannot be split into two deletions.
+sweep_tmp_root() {
+  local t="$1" removed=0 victim
+  [ -d "$t" ] || return 0
+  while IFS= read -r -d '' victim; do
+    if [ "$DRY" = 1 ]; then removed=$((removed + 1)); continue; fi
+    rm -rf -- "$victim" 2>/dev/null && removed=$((removed + 1))
+  done < <(find "$t" -mindepth 1 -maxdepth 1 -mmin +"$TMP_MAX_AGE_MIN" -print0 2>/dev/null)
+  [ "$removed" -gt 0 ] || return 0
+  if [ "$DRY" = 1 ]; then
+    log_line "dry-run: would sweep tmpdir-root=$t removed=$removed older_than=${TMP_MAX_AGE_MIN}m"
+  else
+    log_line "swept tmpdir-root=$t removed=$removed older_than=${TMP_MAX_AGE_MIN}m"
+  fi
+  return 0
+}
+
+# tmp_owner_guard <path> <live_listener_pid> <label> — rc 0 = this process may create/verify `path` as
+# the listener's env · 2 = the LIVE listener belongs to ANOTHER user, so nothing here can establish
+# whether that user can write it.
+# ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1), and that is true whether or
+# not the directory already exists (#3004 review round 4, P2). Everything in `ensure_private_tmp`
+# measures access as THIS process: for the START path that is the right subject, because
+# `start_listener` execs `run.sh` as the same user. For a LIVE listener it is not — so a wrong-owner
+# directory reported "satisfiable" by a `-w` test that is trivially true for root is the false PASS the
+# #2937 arm exists to refuse. A mismatch is cannot-measure: this tool cannot establish another user's
+# access, and saying "fine" is what the issue is about. It applies to BOTH directories this tool
+# manages — a `.env`-named TMPDIR and the instance's own `_tmp` — so it has one definition.
+# ⛔ ONLY A READING THAT LOOKS LIKE A USER MAY REFUSE. `ps` is a READ this file already treats as
+# fallible, and this repo's own suite replaces it (`$BIN/ps` models the process table), so a garbage
+# line must degrade to "no mismatch proven" — NOT to a refusal that would block a legal repair on every
+# box whose `ps` is a shim.
+tmp_owner_guard() {
+  local t="$1" live_pid="${2:-}" label="${3:-}" lu
+  [ -n "$live_pid" ] || return 0
+  lu="$(ps -o user= -p "$live_pid" 2>/dev/null | tr -d '[:space:]')"
+  case "$lu" in
+    ''|*[!A-Za-z0-9_.-]*) lu="" ;;
+  esac
+  if [ -n "$lu" ] && [ "$lu" != "$(id -un 2>/dev/null)" ]; then
+    err "cannot-measure why=tmpdir-owner-mismatch path=$t ($label) — the live listener pid=$live_pid runs as user=$lu and this pass runs as user=$(id -un 2>/dev/null), so this process cannot establish whether that user can write the directory, and every job on it dies at mktemp if it cannot; run this pass as $lu (or as the listener's own user) so the check measures the right process"
+    return 2
+  fi
+  return 0
+}
+
+# ensure_private_tmp <dir> [live_listener_pid] — create (idempotently) and SWEEP the instance's own
+# private temp root, before the listener is exec'd. rc 0 = satisfiable · 2 = cannot-act, nothing started.
+# ⛔ THIS IS THE SINGLE DEFINITION, CALLED FROM `ensure_tmpdir` — which `start_listener` (and therefore
+# `add`, `restart` and `reconcile`) and both LIVE-repair arms already go through. So an instance can be
+# DELETED AND RE-CREATED and the isolation comes back with no hand action: `add` re-copies the release
+# and calls `start_listener`, which lands here, which recreates `_tmp`. Nothing else has to remember it.
+# ⛔ MODE 700, CREATED BY THE USER THAT WILL RUN THE LISTENER, and `mkdir -p` leaves an EXISTING
+# directory's mode alone — so a hand-repaired box is not silently tightened, and the owner can only be
+# the right one because `start_listener` execs `run.sh` as this same process's user.
+# ⛔ A CREATION THAT FAILED IS A REFUSAL, NOT A WARNING: a listener that comes up under a TMPDIR which
+# does not exist is the #2937 incident (jobs die at `mktemp` while GitHub says `online`).
+ensure_private_tmp() {
+  local d="$1" live_pid="${2:-}" t p
+  t="$(instance_tmp_root "$d")"
+  tmp_owner_guard "$t" "$live_pid" "the instance's private temp root" || return 2
+  if [ ! -d "$t" ]; then
+    # ⛔ A PREVIEW MAY NOT MUTATE (#3004 review, P2): in DRY mode the same satisfiability question is
+    # asked WITHOUT creating — `mkdir -p` succeeds over any missing ancestors, so the test is the first
+    # ancestor that EXISTS.
+    if [ "$DRY" = 1 ]; then
+      p="$t"
+      while [ ! -e "$p" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do p="$(dirname "$p")"; done
+      if ! { [ -d "$p" ] && [ -w "$p" ] && [ -x "$p" ]; }; then
+        err "cannot-act why=tmpdir-root-uncreatable path=$t — nothing started: the listener would inherit a TMPDIR that does not exist and every job on it would die at mktemp; check the parent directory's permissions and that no FILE sits on the path"
+        return 2
+      fi
+      log_line "dry-run: would create tmpdir-root=$t (the instance's private TMPDIR)"
+      return 0
+    fi
+    mkdir -p -m 700 "$t" 2>/dev/null || true
+    [ -d "$t" ] || {
+      err "cannot-act why=tmpdir-root-uncreatable path=$t — nothing started: the listener would inherit a TMPDIR that does not exist and every job on it would die at mktemp; check the parent directory's permissions and that no FILE sits on the path"
+      return 2
+    }
+    log_line "created tmpdir-root=$t (the instance's private TMPDIR; nothing else creates it)"
+  fi
+  # WRITE is not enough — `mktemp` needs SEARCH too (the `-w`-only false PASS this file already paid for
+  # once, on the `.env` arm).
+  [ -w "$t" ] && [ -x "$t" ] || {
+    err "cannot-act why=tmpdir-root-unwritable path=$t — this user needs WRITE and SEARCH (w=$([ -w "$t" ] && echo y || echo n) x=$([ -x "$t" ] && echo y || echo n)) on the instance's private temp root, and every job on it would otherwise die at mktemp"
+    return 2
+  }
+  sweep_tmp_root "$t"
+  return 0
+}
+
 # ensure_tmpdir <dir> [live_listener_pid] — create the TMPDIR the instance's `.env` names,
 # IDEMPOTENTLY, before the listener is exec'd. rc 0 = satisfiable (created, or already there) ·
 # 2 = cannot-act, nothing started. The optional pid is the LIVE listener the caller is repairing
@@ -975,44 +1137,26 @@ instance_tmpdir() {
 # the verdict either (the `-p` arm can succeed while the target is still not a directory) — the test
 # is that the directory EXISTS and this user can write it, which is what `mktemp` will do next.
 ensure_tmpdir() {
-  local d="$1" live_pid="${2:-}" t created=0 rc=0 p lu
+  local d="$1" live_pid="${2:-}" t created=0 rc=0 p
   t="$(instance_tmpdir "$d")" || rc=$?
   # cannot-measure (`tmpdir-unreadable`) and a non-literal value are BOTH cannot-act here: the reason
   # was already named by `instance_tmpdir`, so this arm does not invent a second one. Starting the
   # listener anyway is the defect — the env it would inherit is unknown.
   [ "$rc" -eq 0 ] || return 2
+  # ⛔ THE INSTANCE'S OWN PRIVATE TEMP ROOT IS SATISFIED FIRST AND ALWAYS (#7815) — it is the TMPDIR the
+  # listener is started with whenever `.env` names none, and this call is also the INSTALL-TIME and
+  # REINSTALL path: `add` -> `start_listener` -> here recreates it after an instance dir was deleted.
+  # It runs after the `.env` read so that an unreadable `.env` still mutates nothing.
+  ensure_private_tmp "$d" "$live_pid" || return 2
   [ -n "$t" ] || return 0
   # ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1), AND THAT IS TRUE WHETHER
-  # OR NOT THE DIRECTORY ALREADY EXISTS (#3004 review round 4, P2). Everything below measures access as
-  # THIS process: for the START path that is the right subject, because `start_listener` execs `run.sh`
-  # as the same user. For a LIVE listener it is not — so a wrong-owner directory that ALREADY exists
-  # (a hand `sudo mkdir -m 700`, or an earlier root pass) was reported "satisfiable" by a `-w` test
-  # that is trivially true for root, which is the same false PASS the create branch refuses. The
-  # comparison therefore runs first, for both branches, and a mismatch is cannot-measure — this tool
-  # cannot establish another user's access, and saying "fine" is what the issue is about.
-  if [ -n "$live_pid" ]; then
-    lu="$(ps -o user= -p "$live_pid" 2>/dev/null | tr -d '[:space:]')"
-    # ⛔ ONLY A READING THAT LOOKS LIKE A USER MAY REFUSE. `ps` is a READ this file already treats as
-    # fallible, and this repo's own suite replaces it (`$BIN/ps` models the process table), so a
-    # garbage line must degrade to "no mismatch proven" — NOT to a refusal that would block a legal
-    # repair on every box whose `ps` is a shim. A refusal is only ever minted from a name-shaped read.
-    case "$lu" in
-      ''|*[!A-Za-z0-9_.-]*) lu="" ;;
-    esac
-    if [ -n "$lu" ] && [ "$lu" != "$(id -un 2>/dev/null)" ]; then
-      err "cannot-measure why=tmpdir-owner-mismatch path=$t (named by $d/.env) — the live listener pid=$live_pid runs as user=$lu and this pass runs as user=$(id -un 2>/dev/null), so this process cannot establish whether that user can write the directory, and every job on it dies at mktemp if it cannot; run this pass as $lu (or as the listener's own user) so the check measures the right process"
-      return 2
-    fi
-  fi
+  # OR NOT THE DIRECTORY ALREADY EXISTS (#3004 review round 4, P2). The comparison runs first, for both
+  # branches, and a mismatch is cannot-measure; the guard itself is `tmp_owner_guard` (one definition,
+  # shared with the private root above).
+  tmp_owner_guard "$t" "$live_pid" "named by $d/.env" || return 2
   if [ ! -d "$t" ]; then
-    # ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1). The owner claim below
-    # holds for the START path: `start_listener` execs `run.sh` as this same process's user. The LIVE
-    # arms are different — they repair a listener that is ALREADY RUNNING, possibly started by a
-    # systemd unit as another user, which is exactly the post-reboot state. A mode-700 directory
-    # created there by an operator running this as root would belong to root: the runner could not
-    # write it, its jobs would still die (EACCES instead of ENOENT), and every instrument in this file
-    # would call the row clean — `[ -w ]` is trivially true for root and `status` tests existence only.
-    # This tool cannot create a directory in another user's name, so it REFUSES and names both users.
+    # The owner question is settled ABOVE, by `tmp_owner_guard`, before either branch — so what remains
+    # here is only creation (and its preview).
     # ⛔ A PREVIEW MAY NOT MUTATE, AND IT MAY NOT LIE (#3004 review, P2). `--dry-run` used to skip this
     # check entirely (it sat downstream of the DRY return), so an uncreatable target previewed as
     # "would start the listener" (rc 0) and then refused for real (rc 2) — the lying preview this file
@@ -1067,7 +1211,7 @@ ensure_tmpdir() {
 # still alive → success; gone with GitHub's `registration has been deleted` line in the log → rc 6;
 # gone for any other reason → cannot-act (2), naming the log the operator has to read.
 start_listener() {
-  local d="$1" i=0 rc log before="0" started=0 ev=""
+  local d="$1" i=0 rc log before="0" started=0 ev="" t
   [ -x "$d/run.sh" ] || { err "cannot-act why=runner-not-installed path=$d/run.sh"; return 2; }
   log="$d/listener.log"
   # The pre-start length, so "this attempt's" evidence can be told apart from a previous one's.
@@ -1085,8 +1229,27 @@ start_listener() {
   # the only place a listener RUNS, though: a listener that SURVIVED the reboot is never started again,
   # so `cmd_restart` and `cmd_reconcile` also repair their LIVE arms (#3004 review, P1). `--dry-run`
   # cannot reach here, but `ensure_tmpdir` is DRY-aware anyway so no future caller can mutate a preview.
+  # It is also what creates (and sweeps) the instance's own private temp root (#7815).
   ensure_tmpdir "$d" || return 2
-  ( cd "$d" && exec "$d/run.sh" ) >>"$log" 2>&1 &
+  # ⛔ THE TEMP ROOT IS THE PRIVATE ONE, AND IT IS EXPORTED (#7815). GitHub's `run.sh` sources `.env` and
+  # then starts the listener, which hands ITS OWN environment to every job step — so these three
+  # variables are what decides where `mktemp`, `tempfile.gettempdir()` and every other temp consumer in
+  # a job land. Without them an instance with no `.env` wrote into the BOX's shared temp dir, which is
+  # what made the tortoise hygiene guard fire on other people's files (agent-infra#7815 / #3003).
+  # `TMP` and `TEMP` travel with `TMPDIR` because toolchains read them by different names — moving only
+  # `TMPDIR` leaves npm/node-style consumers still writing in the shared dir.
+  # A `.env` that names a TMPDIR still WINS: `run.sh` sources it AFTER this and overwrites the value,
+  # which is the documented precedence (an explicit operator setting beats a default) — and the export
+  # here uses that same value in that case, so all three variables agree either way.
+  t="$(instance_tmpdir "$d")" || return 2
+  [ -n "$t" ] || t="$(instance_tmp_root "$d")"
+  # PRINT THE PATHS, as the memory floor prints its reading: an env an operator cannot see is one they
+  # cannot audit, and this is the line that proves two instances of one box are isolated.
+  log_line "env name=$(basename "$d") TMPDIR=$t TMP=$t TEMP=$t (RUNNER_TEMP is the runner's own)"
+  (
+    cd "$d" || exit 2
+    TMPDIR="$t" TMP="$t" TEMP="$t" exec "$d/run.sh"
+  ) >>"$log" 2>&1 &
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
@@ -1116,7 +1279,7 @@ start_listener() {
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 orph=0 qn=0 qunprobed=0 tmpdir_defects=0 d rc qrc dirs outside qdirs t rownote
+  local dead=0 live=0 orph=0 qn=0 qunprobed=0 tmpdir_defects=0 d rc qrc dirs outside qdirs t rownote rt
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -1173,7 +1336,21 @@ cmd_status() {
     # that owns the runner, so a `-w` test here would report a defect on a healthy box. The launcher
     # runs as the listener's own user and DOES refuse an unwritable target.
     t="$(instance_tmpdir "$d")" || return 2   # cannot measure: never publish tmpdir_defects=0 over it
-    if [ -n "$t" ] && [ ! -d "$t" ]; then
+    # ⛔ THE EFFECTIVE TEMP ROOT IS WHAT MUST EXIST (#7815): the `.env`-named path when there is one,
+    # otherwise the instance's own `_tmp` — which `start_listener` creates and nothing else does. The
+    # old arm returned clean for an instance naming none, so a runner whose private root had been
+    # deleted read as a HEALTHY row while every job started from then on would die at `mktemp`. That is
+    # the same false PASS #2937 refuses, arrived at through the other branch.
+    if [ -z "$t" ]; then
+      rt="$(instance_tmp_root "$d")"
+      if [ ! -d "$rt" ]; then
+        # The clause claims only what it measured: this tool creates the root at every START, so its
+        # absence is a fact about the LAYOUT — never a claim about the env of a listener this tool did
+        # not start (that one keeps whatever its unit gave it).
+        err "defect tmpdir-missing name=$(basename "$d") path=$rt — the instance's private temp root is missing (this tool creates it at every start; nothing else does), so a listener started from now on inherits a TMPDIR that does not exist and its jobs die at mktemp; run: $SELF restart --name $(basename "$d")"
+        tmpdir_defects=$((tmpdir_defects + 1))
+      fi
+    elif [ ! -d "$t" ]; then
       # ⛔ THE CLAUSE MUST MATCH THE ROW IT IS UNDER (#3004 review, P2): this arm runs for DEAD rows
       # too, where "report it healthy" is false — the row says DEAD and GitHub says offline — and only
       # the missing-TMPDIR half is true. `rc` is the state this loop already measured.
