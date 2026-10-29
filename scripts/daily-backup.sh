@@ -279,17 +279,45 @@ fi
 
 # ── Step 2: Query graph metadata (point counts) ───────────────────
 echo "[$(date '+%H:%M:%S')] Querying graph point counts..."
-GRAPHS=$(docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" GRAPH.LIST 2>/dev/null || echo "")
+# ⛔ NOT `GRAPHS=$(… || echo "")` (agent-infra#2121, empty-as-pass). `|| echo ""` rewrites a FAILED
+# read into an EMPTY one, so the loop below iterates ZERO times, step 4 then writes `"graphs": {}` /
+# `"total_points": 0`, and the run announces a complete backup whose manifest cannot be told from a
+# backup of an EMPTY database — the two states the manifest exists to distinguish. This is the same
+# read that scripts/restore-smoke.sh already refuses on (`[ -z "$GRAPHS" ] && FAIL exit 1`), so read
+# the status and refuse for the same reason: an inventory we could not read is UNKNOWN, not zero.
+# Cost: no backup directory is left (the EXIT trap removes one with no manifest), so the next run
+# redoes it — cheaper than a manifest that lies about what it captured.
+GRAPHS=$(docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" GRAPH.LIST 2>/dev/null) || GRAPH_LIST_RC=$?
+if [ "${GRAPH_LIST_RC:-0}" -ne 0 ]; then
+    echo "ERROR: GRAPH.LIST read FAILED (rc=$GRAPH_LIST_RC) on container '$CONTAINER'." >&2
+    echo "       The graph inventory is UNKNOWN, not empty — refusing to write a manifest that would" >&2
+    echo "       report 0 graphs / 0 points as if it had verified them. Nothing was kept." >&2
+    exit 1
+fi
 
 # Collect graph:count pairs into a plain file (bash 3.2 compat — no associative arrays)
 GRAPH_COUNTS_FILE="$BACKUP_DIR/.graph_counts"
 rm -f "$GRAPH_COUNTS_FILE"
 
 for graph in $GRAPHS; do
+    # ⛔ THE SAME LAUNDERING, ONE READ DOWN (agent-infra#2121 review, found independently by two
+    # reviewers). `… | grep -E '^[0-9]+$' | head -1 || echo "0"` binds the `||` to `head`, which
+    # SUCCEEDS on empty input — so a failed GRAPH.QUERY left COUNT="" and the `[ -z … ] && COUNT=0`
+    # below wrote that failure into the manifest as "this graph holds 0 points". A graph with genuinely
+    # zero points returns a numeric row, so an empty result is ALWAYS a failed read: refuse it rather
+    # than certify a count nothing observed. (The old `TOTAL_POINTS -lt 100` gate cannot catch it —
+    # one masked count among healthy graphs keeps the total above the floor.)
     COUNT=$(docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" \
         GRAPH.QUERY "$graph" "MATCH (p:Point) RETURN count(p)" 2>/dev/null | \
-        grep -E '^[0-9]+$' | head -1 || echo "0")
-    if [ -z "$COUNT" ]; then COUNT=0; fi
+        grep -E '^[0-9]+$' | head -1) || COUNT=""
+    case "$COUNT" in
+        ''|*[!0-9]*)
+            echo "ERROR: point count read FAILED for graph '$graph' (got '${COUNT:-<empty>}')." >&2
+            echo "       The count is UNKNOWN, not zero — refusing to write a manifest that would" >&2
+            echo "       report it as 0 points. Nothing was kept." >&2
+            exit 1
+            ;;
+    esac
     echo "$graph $COUNT" >> "$GRAPH_COUNTS_FILE"
     echo "  $graph: $COUNT points"
 done

@@ -1,0 +1,24 @@
+[Unit]
+# Every 10 minutes, the same cadence as the macOS LaunchAgent (com.eldato.objective-reminder,
+# StartInterval 600) so both platforms carry ONE reminder policy and a doc does not have to say
+# "10 minutes on a Mac, something else on a cell".
+#
+# ⛔ NOT `OnCalendar=*:0/10` (wall-clock aligned). A cell's controller and lanes wake in a 240 s cycle;
+# an aligned minute puts this pass on top of whatever else fired there. `OnUnitActiveSec` measures from
+# the last pass, which is what "every 10 minutes" means for a reminder.
+#
+# ⛔ Persistent=false ON PURPOSE. A reminder is only useful while an agent is alive to read it: replaying
+# one on boot would deliver a stale objective into a box that has not yet started a lane, and the pass
+# would log UNSENT for a surface that does not exist yet. (The disk reaper sets Persistent=true for the
+# opposite reason: its work is cumulative and must not be skipped.)
+Description=eldato objective reminder every 10 minutes
+
+[Timer]
+OnUnitActiveSec=10min
+AccuracySec=30s
+RandomizedDelaySec=60
+Persistent=false
+Unit=eldato-objective-reminder.service
+
+[Install]
+WantedBy=timers.target
