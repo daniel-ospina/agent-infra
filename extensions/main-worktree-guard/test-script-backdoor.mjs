@@ -40,7 +40,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-script-backdoor.mjs
 import { execSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -94,7 +94,19 @@ const ghBinary = [process.env.GH_BIN, "/Users/danielospina/bin/gh", "/opt/homebr
 let ghOnPath = null;
 try { ghOnPath = execSync("command -v gh", { encoding: "utf-8" }).trim(); } catch { /* not installed */ }
 
-const REPO = execSync("git rev-parse --show-toplevel", { cwd: HERE, encoding: "utf-8" }).trim();
+// ⛔ The repo root is derived from THIS FILE'S LOCATION, not from `git rev-parse
+// --show-toplevel` (2026-10-24). The git read is a measurement of the BOX, not of the code: on a
+// clone whose git config carries a stale `core.worktree` (this box had `core.worktree=/tmp`, so
+// every worktree reported `/tmp` as its top level) it returns the wrong root and every fixture
+// path derived from it points at a file that does not exist — `bash /tmp/scripts/gh-shim/gh`
+// is then not a script at all, nothing refuses it, and the "ALLOWED" arms pass VACUOUSLY while
+// looking exactly like coverage. The file lives at `<repo>/extensions/main-worktree-guard/`, so
+// two levels up IS the root; the existence assertion below turns a wrong root into a loud
+// failure instead of a silent false green.
+const REPO = realpathSync(join(HERE, "..", ".."));
+if (!existsSync(join(REPO, "manifest.json"))) {
+  throw new Error(`repo root resolved to ${REPO}, which is not the framework checkout`);
+}
 const RAIL = join(REPO, "scripts", "admin-merge.sh");
 
 // ── Part A: opaque executables, NULs, and the rejected content exemption ──
@@ -352,19 +364,80 @@ async function partB() {
     expectTrue("B5b (b): the SAME content at another path → BLOCKED (the exemption is path-keyed, never content-keyed)",
       blocked(await bash("bash scripts/rail.sh", hub)), "was allowed");
     // The gh shim is a listed entry, so the check is the SAME one as the rail's:
-    // the checkout's own copy runs. The copy PATH resolves to belongs to the HUB,
-    // which in a worktree-rooted test says nothing about the list — and a hub copy
-    // that is out of sync with this checkout must stay refused (fail closed), so
-    // it is only asserted when the two are byte-identical.
+    // the CHECKOUT's own copy runs, addressed by its own absolute path.
+    //
+    // ⛔ `command -v gh` IS NOT PART OF THIS ASSERTION (2026-10-24). It used to be: the
+    // arm ran only when the `gh` on PATH was BYTE-IDENTICAL to this checkout's shim, and
+    // silently SKIPPED otherwise. That made the verdict a property of the BOX rather than
+    // of the code — green wherever `gh` resolves elsewhere (a deployment shim, a real
+    // `gh` binary), red on CI where it resolves to this file — which is how a REAL false
+    // block (the shim's own `head -c 8192 … < "$1"` line read as a runtime-expanded
+    // script path, so every path-spelled invocation was refused) survived on main: the
+    // arm that pins it was skipped on most boxes and red only on the runner. The command
+    // below spells `${shim}` explicitly, so what PATH holds cannot change what is
+    // asserted, and a hub-side copy that is out of sync is the NEXT arm's job (B5c2).
     const shim = join(REPO, "scripts", "gh-shim", "gh");
-    if (ghOnPath && readFileSync(ghOnPath, "utf-8") === readFileSync(shim, "utf-8")) {
-      expectTrue("B5c (b): the gh shim (named entry `scripts/gh-shim/gh`) is runnable",
-        allowed(await bash(`${shim} issue list --repo o/r --limit 1`, hub)), "was blocked");
-    } else {
-      skipped("B5c (b): the gh shim", ghOnPath
-        ? "the shim on PATH is a different (out-of-sync) copy from this checkout"
-        : "no gh on PATH");
-    }
+    expectTrue("B5c (b): the gh shim (named entry `scripts/gh-shim/gh`) is runnable",
+      allowed(await bash(`${shim} issue list --repo o/r --limit 1`, hub)), "was blocked");
+    // ⛔ AN ARM PER READER IT CAN ACTUALLY DISCRIMINATE ON — and a MEASURED statement of which
+    // readers those are. The 2026-10-24 fix stands the #1228 arm down at NINE sites that read a
+    // script file's body: the two command-position walks (they call `_isAuditedSanctionedScript`
+    // directly) and SEVEN `_expRefusalForBody` sites — the `eval` payload file, the `-c` payload
+    // file, the `$(cat …)` file, the compound-`-c` payload file, the assignment-value file and
+    // the two eval-substitution readers (cycle-5 review counted them: the first cut of this
+    // comment said seven and named five, an under-counted inventory — which is exactly the defect
+    // this block exists to prevent). Two arms below pin two of the seven, mutation-verified: with
+    // `_expRefusalForBody`'s body replaced by `_expRefusal` (so THE SEVEN HELPER SITES lose the
+    // body-aware stand-down — the two walks keep it, which is why B5c stays green) BOTH go red
+    // and nothing else changes.
+    //
+    // ⛔ The `eval`-payload and payload-VARIABLE spellings were written as a third and fourth arm
+    // and then REMOVED, because they are TAUTOLOGICAL on this box and would have been an inert
+    // arm — the exact defect cycle 2 found in the first cut of B5c2/B5c3. Measured: with the
+    // predicate disabled they stay GREEN, because the #1484 hub-state arm evaluates an
+    // unresolvable payload BEFORE the body reader and refuses it for its own reason ("the shared
+    // main checkout is OFF-MAIN or DIRTY"), which is a decision of that gate and not of this
+    // fix (#2775). An assertion that cannot fail for its claimed reason is worse than no
+    // assertion: it reads as coverage. What remains here is coverage that was PROVEN to red.
+    const SHIM_ARGV = "issue list --repo o/r --limit 1";
+    expectTrue("B5c-ii (b): the shim named inside a `-c` payload → ALLOWED (pins the -c payload reader)",
+      allowed(await bash(`bash -c 'bash ${shim} ${SHIM_ARGV}'`, hub)), "was blocked");
+    expectTrue("B5c-iii (b): the shim read through a cat-substitution payload → ALLOWED (pins the cat reader)",
+      allowed(await bash(`bash -c "$(cat ${shim})" -- ${SHIM_ARGV}`, hub)), "was blocked");
+    // ⛔ B5c2'S FIXTURE MUST BE WRITTEN IN THE SAME BLOCK AS ITS ASSERTION. An intermediate
+    // edit to this file (2026-10-24) dropped the `writeFileSync` that mints the copy while
+    // keeping the invocation, and the arm then passed for a reason with nothing to do with its
+    // name: `bash scripts/shim-copy` was not a script at all, so nothing refused it and an
+    // unreadable-path refusal (#1484 hub-state) was the only thing between it and a green. The
+    // fixture is written immediately above the invocation for that reason — splitting them is
+    // how the arm stopped asserting anything — and the assertion is that the refusal is a
+    // CONTENT/IDENTITY refusal and NOT the hub-state gate, so it can only pass by refusing the
+    // copy for what it is.
+    writeFileSync(join(hub, "scripts", "shim-copy"), readFileSync(shim));
+    const copyRes = await bash(`bash scripts/shim-copy issue list --repo o/r --limit 1`, hub);
+    // The reason is asserted as "a CONTENT/IDENTITY refusal, NOT the hub-state gate" rather than
+    // as one exact arm: the shim's body trips the #1484 content walk (measured: "script content
+    // contains a blocked git operation") before the #709 expansion arm can be reached, and which
+    // of the two speaks first is the guard's business, not this arm's. What must hold is that
+    // the copy is refused for what it IS. Paired with B5c's ALLOWED above, the two together are
+    // what proves the exemption is IDENTITY-keyed: same bytes, different identity, opposite
+    // verdicts.
+    const copyWhy = String((copyRes && copyRes.reason) || "");
+    expectTrue("B5c2 (b): the SAME shim bytes at a non-sanctioned path → BLOCKED (identity-keyed, not content-keyed)",
+      blocked(copyRes) && /#1484|#709/.test(copyWhy) && !/Hub-state gate|OFF-MAIN or DIRTY/.test(copyWhy),
+      `reason=${copyWhy.split("\n")[0]}`);
+    // ⛔ B5c3 — the #1228 arm still exists for NON-sanctioned bodies: a readable script whose
+    // content carries a runtime-expanded operand, at a path that is not on the sanctioned
+    // list, must still be refused BY THAT ARM (asserted on `#709` + the expansion wording,
+    // so it cannot pass for the wrong reason). It does NOT pin the DIGEST key of the
+    // sanctioned stand-down — a non-sanctioned path is never exempt — that is (b3)/M6 in
+    // test-sanctioned-identity.mjs. Measured reason: #709 script-indirection.
+    const shapeCopy = join(hub, "scripts", "shim-shape");
+    writeFileSync(shapeCopy, '#!/bin/bash\ngrep -qa m <(head -c 10 "$HOME/x")\n');
+    const shapeRes = await bash("bash scripts/shim-shape", hub);
+    expectTrue("B5c3 (b): a NON-sanctioned body with the same expanded-operand shape → BLOCKED (#709), so the arm is still live",
+      blocked(shapeRes) && /#709/.test(String(shapeRes.reason)) && /shell-expansion form/.test(String(shapeRes.reason)),
+      `reason=${String(shapeRes && shapeRes.reason).split("\n")[0]}`);
     // The #1129 adversarial-review P0 boundary: a committed git-DESTRUCTIVE
     // framework helper is NOT on the list and must stay refused.
     expectTrue("B5d (b): `scripts/cleanup-worktree.sh` (committed, destructive) is still refused",
