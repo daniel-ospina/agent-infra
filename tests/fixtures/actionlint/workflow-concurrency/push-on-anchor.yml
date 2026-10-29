@@ -1,0 +1,13 @@
+# An anchor DECLARATION on the `on:` value is not a trigger name. It was recorded as one, so
+# onparsed was 1 with no real trigger in the set and every rule went vacuous — a cancelling push
+# workflow read GREEN (#2660 round 6).
+name: Push on anchor
+on: &trig [push]
+concurrency:
+  group: push-on-anchor-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
