@@ -117,15 +117,20 @@
 #                                cache) / probe FAILS / probe TIMES OUT => reason stays
 #                                remote-only-ref, nothing removed, and the pass is not
 #                                vacuously "nothing to do")
-#   remote-holds prunes      A26c (a remote-holds row BLOCKS the path-filterless prune —
-#                                its survival evidence is one network read; A23 is the
-#                                mirror: remote-only-ref must NOT block)
-#   pass verdict             A27  (an armed pass that decides a population, removes NONE
+#   remote-holds prunes      A26c (a remote-holds row does NOT block the path-filterless prune —
+#                                the tracking ref still holds the commit, F7/A23; pinned for BOTH
+#                                the REMOVE row (`reason=`) and the PRESERVE row (`refs=`), the
+#                                second of which blocks the `prunable` reclaim for a whole
+#                                aged-days floor if the reason alone is allowed to gate it)
+#   pass verdict             A27  (an armed pass that EXAMINES a population, removes NONE
 #                                and sits under the disk floor RECORDS
 #                                $STATE_DIR/reap-ineffective + verdict=reap-ineffective;
 #                                above the floor / small population / dry run /
-#                                unmeasurable disk each read their own verdict, and the
-#                                stale file is cleared by any pass that clears the condition)
+#                                unmeasurable disk each read their own verdict, a
+#                                deferral-heavy pass still reads reap-ineffective (it
+#                                examined the population even though it decided little), and
+#                                the stale file is cleared by any pass that clears the
+#                                condition)
 
 set -uo pipefail
 
@@ -3524,27 +3529,55 @@ OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
     "A26b remote sha MISMATCH => PRESERVE (a branch name is not proof of the commit)"
 # (3) the probe FAILS. (4) the probe HANGS past its watchdog.
+#     ⛔ THE REMOTE IS RESTORED FIRST (#3041 review, P2). While the remote points at a DIFFERENT
+#     sha, a perfectly working `ls-remote` already yields `remote-only-ref` at the awk's `$1 == sha`
+#     test — so the two arms below would pass with the `rc != 0` path INVERTED or DELETED. With the
+#     remote pointing at THIS HEAD again, the ONLY thing left that can produce `remote-only-ref` is
+#     the failure/timeout arm, so each leg discriminates its own path.
+"$REAL_GIT" -C "$BARE" update-ref refs/heads/feat/a26b "$A26B_SHA"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26b)" "$A26B_SHA" \
+    "A26b precondition: the remote holds this HEAD again (a working probe WOULD now claim proof)"
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-lsremote-fail" run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
     "A26b a FAILING probe => PRESERVE (fail-closed, never a removal)"
-OUT="$(REAP_WT_GIT_TIMEOUT=1 GIT_BIN_OVERRIDE="$T/bin/git-lsremote-hang" \
+# The hang leg also measures that the WATCHDOG is what ended the probe: the shim sleeps 30 s, so a
+# pass that returned in under 20 s cannot have waited for it. Without this the leg is satisfied by a
+# probe that hangs and is then ignored — the property is "bounded", not "unbounded but correct".
+A26B_T0=$SECONDS
+OUT="$(FAKE_LSREMOTE_SLEEP=30 REAP_WT_GIT_TIMEOUT=1 GIT_BIN_OVERRIDE="$T/bin/git-lsremote-hang" \
     run_reaper $ENV --dry-run --repo "$REPO")"
+A26B_HANG_S=$((SECONDS - A26B_T0))
 assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
     "A26b a TIMED-OUT probe => PRESERVE"
+if [ "$A26B_HANG_S" -lt 20 ]; then
+    ok "A26b …and the WATCHDOG ended it (${A26B_HANG_S}s, the shim sleeps 30) — an unbounded probe would hang the pass"
+else
+    bad "A26b the probe was not bounded by REAP_WT_GIT_TIMEOUT (${A26B_HANG_S}s elapsed, the shim sleeps 30)"
+fi
 # NON-VACUITY: the pass must not have collapsed into "nothing to do" — the record is
 # really examined and classified.
 assert_contains "$OUT" "examined=2 classified=2" \
     "A26b non-vacuity: the record WAS examined and classified (not silently skipped)"
+# The ARMED pass must not remove it either — so put the remote back in the state the fail-closed
+# arms were proved in (the branch is gone), not the one the discrimination step needed. Without this
+# the probe SUCCEEDS and the armed pass removes the checkout, which is the A26a direction, not this
+# fixture's claim.
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a26b
 OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A26b --apply exits 0 (a preserve is not a failure)"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A26b --apply removed nothing"
 assert_dir "$WT_A26B" "A26b the checkout is still on disk"
 
-# ── A26c: a remote-holds row BLOCKS the end-of-pass prune, and must ─────
-# F17's class, for the one reason whose survival evidence is not a local ref: a record
-# PRESENT at snapshot time and GONE at prune time carries no `prunable` flag, so only the
-# REASON can stop the path-filterless prune from deregistering it. A23 is the mirror image
-# (`remote-only-ref` must NOT block), so the DISTINCTION is pinned, not just one side.
+# ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
+# This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:
+#   · block it, and a long-lived PRESERVE row (`no-pr`/`too-recent`/`too-young` rows carry
+#     `refs=remote-holds:` too, for up to the whole aged-days floor) disables the `prunable` reclaim
+#     path on every pass — F7's "a reaper that silently never reaps";
+#   · don't block it, and the F17 window (a record that becomes prunable MID-PASS, after a snapshot
+#     that saw it present) could be swept — except that window is closed for EVERY reason by the
+#     reason-independent pre-prune RE-READ (A25), which is the mechanism that is supposed to cover it.
+# So both legs below must hold in the SAME fixture family: the REMOVE row (`reason=`) and the
+# PRESERVE row (`refs=`). The second is the arm a fixture never reached before this review.
 ENV=A26c; REPO="$(mk_repo $ENV)"
 BARE="$T/$ENV/remote.git"
 "$REAL_GIT" init -q --bare "$BARE"
@@ -3558,8 +3591,8 @@ A26C_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
 "$REAL_GIT" -C "$REPO" fetch -q upstream
 WT_A26C="$T/$ENV-det"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26C" "$A26C_SHA"
-# a second, GONE-dir record: it is a `remove/prunable` row, i.e. it ARMS the prune this
-# record must block.
+# a second, GONE-dir record: it is a `remove/prunable` row, i.e. it ARMS the prune that a
+# blocking remote-holds row would have suppressed.
 WT_A26C_GONE="$(add_named_wt "$REPO" "$ENV-gone" feat/a26c-gone)"
 rm -rf "$WT_A26C_GONE"
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
@@ -3569,12 +3602,44 @@ assert_contains "$(row_for "$OUT" "$WT_A26C_GONE")" "reason=prunable" \
     "A26c precondition: the gone-dir row arms the prune"
 OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A26c --apply exits 0"
-assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" \
-    "A26c a remote-holds row sets PRUNE_BLOCKED (its evidence is ONE network read)"
-assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A26c the global prune did not run"
-assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A26C_GONE" \
-    "A26c the gone-dir record is still registered — nothing was deregistered unclassified"
-assert_nodir "$WT_A26C" "A26c …and the proved-reclaimable checkout was still removed"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=0" \
+    "A26c a REMOVE remote-holds row does NOT block the prune (its tracking ref still holds the commit)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNED " \
+    "A26c …so the global prune RAN (the F7 defect is not re-opened one reason class over)"
+assert_absent "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A26C_GONE" \
+    "A26c …and the gone-dir record was deregistered as intended"
+assert_nodir "$WT_A26C" "A26c …and the proved-reclaimable checkout was removed"
+# leg 2 — a PRESERVE row carrying `refs=remote-holds:` (the arm no fixture reached): the age floor
+# keeps it, so the checkout STAYS, and a prune-blocking implementation would suppress the prune for
+# the whole floor's duration. `--aged-days 3650` makes the HEAD "not old enough" => too-recent.
+ENV=A26c2; REPO2="$(mk_repo $ENV)"
+BARE2="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE2"
+"$REAL_GIT" -C "$REPO2" remote add upstream "$BARE2"
+"$REAL_GIT" -C "$REPO2" checkout -q -b tmp-a26c2
+commit_in_wt "$REPO2" "$OLD_DATE" a26c2
+A26C2_SHA="$("$REAL_GIT" -C "$REPO2" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO2" push -q upstream tmp-a26c2:refs/heads/feat/a26c2
+"$REAL_GIT" -C "$REPO2" checkout -q main
+"$REAL_GIT" -C "$REPO2" branch -D tmp-a26c2 >/dev/null
+"$REAL_GIT" -C "$REPO2" fetch -q upstream
+WT_A26C2="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO2" worktree add -q --detach "$WT_A26C2" "$A26C2_SHA"
+WT_A26C2_GONE="$(add_named_wt "$REPO2" "$ENV-gone" feat/a26c2-gone)"
+rm -rf "$WT_A26C2_GONE"
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=3650 run_reaper $ENV --dry-run --repo "$REPO2")"
+assert_contains "$(row_for "$OUT" "$WT_A26C2")" "refs=remote-holds:upstream/feat/a26c2" \
+    "A26c2 precondition: a PRESERVE row carries refs=remote-holds: (the arm a stale test never reached)"
+assert_absent "$(row_for "$OUT" "$WT_A26C2")" "reason=remote-holds:" \
+    "A26c2 precondition: …and it is not a removal (the age floor keeps it)"
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=3650 run_reaper $ENV --apply --repo "$REPO2")"; RC=$?
+assert_eq "$RC" "0" "A26c2 --apply exits 0"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=0" \
+    "A26c2 a PRESERVE remote-holds row does NOT block the prune (F7: one long-lived row must not disable it)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNED " "A26c2 …and the prune ran on the same pass"
+assert_absent "$("$REAL_GIT" -C "$REPO2" worktree list --porcelain)" "$WT_A26C2_GONE" \
+    "A26c2 …the gone-dir record was deregistered"
+assert_dir "$WT_A26C2" "A26c2 …while the age-floored checkout is still on disk"
 
 # ── A27: the pass RECORDS a verdict when it is ineffective (#3041, part 2) ──
 # The measured failure was not a bug in any single row: it was a pass that examined a large
@@ -3640,6 +3705,26 @@ SUM_A27="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO")"
 assert_contains "$SUM_A27" "pr_merged=" "A27g the SUMMARY still carries the fields the disk-reaper lifts"
 assert_eq "$(printf '%s\n' "$SUM_A27" | grep -c '^SUMMARY ')" "1" \
     "A27g …and exactly ONE SUMMARY line per pass"
+# (h) ⛔ A DEFERRAL-HEAVY PASS IS NOT IDLE (#3041 review, P1). The gate is EXAMINED, not
+# CLASSIFIED: a budget-starved pass decides a handful and defers the rest, so gating on
+# `classified` reported the benign `idle` for a pass that scanned the whole population, removed
+# nothing and sat under the floor — the exact shape that starved pi-cell-4. This leg FORCES
+# deferral: a real clock (a pinned epoch makes `elapsed` a constant 0), a 1s budget, and a status
+# probe that sleeps 2s on the 1st call. With the old gate `classified` would be 1 < 10 => `idle`.
+ENV=A27h; REPO_H="$(mk_dirty_pop $ENV 11)"
+VERDICT_FILE_H="$T/$ENV/state/reap-ineffective"
+OUT_H="$(REAP_WT_NOW_EPOCH_OVERRIDE= REAP_WT_FREE_MB_OVERRIDE=100 REAP_WT_BUDGET_SECONDS=1 \
+    FAKE_STATUS_COUNTER="$T/$ENV/cnt" FAKE_SLOW_STATUS_ON=1 FAKE_STATUS_SLEEP=2 \
+    GIT_BIN_OVERRIDE="$T/bin/git-slow-nth-status" run_reaper $ENV --apply --repo "$REPO_H")"; RC=$?
+assert_eq "$RC" "0" "A27h a deferral-heavy pass still exits 0"
+DEF_H="$(printf '%s\n' "$OUT_H" | sed -n 's/.* deferred=\([0-9][0-9]*\) .*/\1/p' | tail -1)"
+case "${DEF_H:-}" in ''|*[!0-9]*) bad "A27h the SUMMARY did not carry a deferred count (non-vacuity: the fixture did not defer)" ;; *)
+    if [ "$DEF_H" -ge 8 ]; then ok "A27h the fixture really deferred ${DEF_H} of 12 records (non-vacuity)"
+    else bad "A27h the fixture did not defer enough to test the gate (deferred=${DEF_H}, want >= 8)"; fi ;;
+esac
+assert_contains "$OUT_H" "verdict=reap-ineffective" \
+    "A27h EXAMINED >= the floor with 0 removals under the floor => reap-ineffective, NOT the benign idle"
+assert_file "$VERDICT_FILE_H" "A27h …and it is recorded"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

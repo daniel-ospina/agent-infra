@@ -3063,6 +3063,55 @@ assert_contains "$ST60" "classified_venv=?" \
 assert_contains "$(grep -F 'class=venv' <<<"$OUT")" "candidates=1" \
     "T60 the class LINE agrees with the record about the candidate count"
 
+# ── T61: the delegate's OWN verdict is lifted, and does NOT move the class verdict (#3041) ────────
+# `verdict_worktree=` is derived from the delegate's EXIT CODE, and an ineffective reap exits 0 BY
+# DESIGN — so the status file said `verdict_worktree=ok` for a pass that reclaimed nothing on a box at
+# 0 bytes free. The delegate's own `verdict=` is now carried alongside it in a SEPARATE field, with
+# the same `?` / `not-run` / `mixed` polarity as `main_proof=`/`pr_merged=`. Both properties matter:
+# the answer must be reachable at the surface the fleet reads, and lifting it must not change a verdict
+# that operators and wrappers already key on.
+ENVNAME=t61
+REPO_D1="$(mk_repo t61a)"
+REPO_D2="$(mk_repo t61b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=12 classified=12 remove=0 preserved=12 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:12 main_proof=local pr_merged=na verdict=reap-ineffective"' \
+    'exit 0' >"$T/t61-delegate.sh"
+chmod +x "$T/t61-delegate.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-delegate.sh" run_reaper --apply --repo "$REPO_D1" --only worktree 2>&1)"
+ST61="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST61" "delegate_verdict_worktree=reap-ineffective" \
+    "T61 the delegate's own verdict reaches the STATUS FILE, not just the echoed text"
+assert_contains "$ST61" "verdict_worktree=ok" \
+    "T61 ... beside an UNCHANGED class verdict (the exit code still decides it)"
+assert_contains "$ST61" "classified_worktree=12" "T61 ... and the tally it came with"
+# ⛔ AND IT MUST BE REACHABLE FROM THE READER, not merely present in the file (the rule at
+# `disk-reaper.sh`'s print_status: "a field the reader does not print does not exist"). Asserting the
+# raw file alone let the field be written and unreadable from `--print-status`, which is the surface
+# the fleet's supervisor reads.
+PST61="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$PST61" "delegate_verdict_worktree=reap-ineffective" \
+    "T61 ... and \`--print-status\` PRINTS it (a written field the reader cannot see does not exist)"
+assert_contains "$PST61" "verdict_worktree=ok" "T61 ... beside the unchanged exit-code verdict"
+# A delegate that does not print the field (an older farmed copy) answers NOTHING: `?`, never `idle`.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=2 classified=2 remove=0 preserved=2 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:2 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t61-old.sh"
+chmod +x "$T/t61-old.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-old.sh" run_reaper --apply --repo "$REPO_D1" --only worktree 2>&1)"
+ST61B="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST61B" "delegate_verdict_worktree=?" \
+    "T61 an absent field is \`?\` — never a benign \`idle\`"
+# Two repos that DISAGREE read `mixed`, exactly like main_proof/pr_merged.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in */t61b) echo "SUMMARY examined=1 classified=1 remove=0 preserved=1 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:1 main_proof=local pr_merged=na verdict=idle"; exit 0 ;; esac; done' \
+    'echo "SUMMARY examined=12 classified=12 remove=0 preserved=12 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:12 main_proof=local pr_merged=na verdict=reap-ineffective"' \
+    'exit 0' >"$T/t61-mixed.sh"
+chmod +x "$T/t61-mixed.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-mixed.sh" run_reaper --apply --repo "$REPO_D1" --repo "$REPO_D2" --only worktree 2>&1)"
+ST61C="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST61C" "delegate_verdict_worktree=mixed" \
+    "T61 two repos that disagree read \`mixed\`, not last-answer-wins"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
