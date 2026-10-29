@@ -11,7 +11,7 @@
 #   OH6  a harness unit on an existing durable path is NOT named
 #   OH7  when NEITHER surface can be read, the report exits 2 (never a false "nothing to report")
 #   OH8  a just-spawned session (no `pi` descendant YET) is NOT named — the floor's too-young side
-#   OH9  a session 300 s old is NOT named — the floor is measured in MINUTES, not seconds
+#   OH9  a session 300 s old is NOT named — a floor lowered to five minutes or less is caught
 #
 # Mutations (same shape as claim-action-proof.test.sh) revert each judgeable rule in a temp copy
 # and require the paired case to go RED, proving the rule is load-bearing.
@@ -93,7 +93,7 @@ run_report() {
 NOW="$("$REAL_DATE" +%s)"
 OLD=$((NOW - 1000))   # 1000 s old -> past MIN_SESSION_AGE_S (600): reportable
 NEW=$((NOW - 5))      # 5 s old -> still launching: must NOT be named
-MID=$((NOW - 300))    # 300 s old -> past a five-minute floor, well inside a ten-minute one
+MID=$((NOW - 300))    # 300 s old -> not named unless the floor drops to 5 min or less
 
 # ── OH1/OH2: dead lane named with its PR, live lane not named ──────────────────────────────
 # sessions: "name created"; panes: "name pane_pid"; procs: "pid comm ppid".
@@ -132,13 +132,16 @@ else
   ok "OH8 a just-spawned dead-looking session (younger than MIN_SESSION_AGE_S) is NOT named"
 fi
 
-# ── OH9: THE FLOOR'S MAGNITUDE — 300 s is inside it, and a five-minute floor would break it ──
-# OH8 (5 s) and OH1 (1000 s) bracket the floor, but the bracket is a factor of 200 wide: a floor
-# lowered to 60 — still "a minute of grace", still green on both — would report every lane for its
-# first minute, which is the same unreadable-report failure at a smaller scale. MID (300 s) closes
-# that gap and is deliberately NOT the exact boundary: the report reads the WALL CLOCK, so a fixture
-# 599 s old is 600 s old one second later and could not pin an integer boundary without flaking. The
-# EXACT 600 is pinned by the registry's `value` field, in the `MIN_AGE` row's precedent
+# ── OH9: THE FLOOR'S MAGNITUDE — a floor lowered to five minutes or less is caught ────────
+# OH8 (5 s) and OH1 (1000 s) bracket the floor by a factor of 200, so a floor lowered to 60 — still
+# "a minute of grace" — passed both and would report every lane for its first minute, the same
+# unreadable-report failure at a smaller scale. MID (300 s) closes that gap.
+# ⛔ WHAT THIS CASE DOES AND DOES NOT PIN, stated because it is easy to over-claim: the report derives
+# the age from the wall clock and the fixture's reported age is exactly `age_s=300`, so OH9 catches a
+# floor of 300 or less ONLY because the comparison is `-ge` — a floor of 301 would leave OH9 GREEN.
+# It pins the floor's MAGNITUDE (> 5 min), never the exact 600; the exact value is pinned by the
+# registry's `value` field, in the `MIN_AGE` row's precedent. A fixture 599 s old could not pin an
+# integer boundary without flaking, because the clock moves between arming and reading
 # (agent-infra#2788).
 write_scen \
   "merge-10093 $MID\n" \
