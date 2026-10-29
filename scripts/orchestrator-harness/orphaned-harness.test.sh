@@ -115,11 +115,15 @@ fi
 
 # ── OH8: THE FLOOR IS A TRUE FLOOR — a just-spawned session is NEVER named ─────────────────
 # `NEW` (5 s old) is the shape of a worker that has been spawned and is still launching its agent: it
-# has no `pi` descendant YET, so a report that judged it dead would name EVERY lane for its first
-# MIN_SESSION_AGE_S (600 s) — and would do it exactly when an operator is hunting the real orphans.
+# has no `pi` descendant YET. Naming requires BOTH `dead` (NO live `pi` descendant) AND age >= the
+# floor, so without a floor this LAUNCH window — seconds, not the whole 600 s — would be reported as an
+# orphan, exactly when an operator is hunting the real orphans. (A lane that HAS spawned `pi` is not
+# named at any age: OH2's 1000 s-old live session is never named. The 600 s is a GRACE, and the other
+# window it covers is a session whose agent has already exited — that one is genuinely dead, merely
+# between incarnations.)
 # ⛔ WHY THIS ARM EXISTS: `NEW` was computed and documented from the day this suite landed, but no
 # case ever drove it, so only the PAST-the-floor direction was asserted and a floor lowered to 0 —
-# which reports every freshly-spawned lane — stayed green (agent-infra#2788).
+# which reports a freshly-spawned lane during that launch window — stayed green (agent-infra#2788).
 write_scen \
   "merge-10092 $NEW\n" \
   "merge-10092 300\n" \
@@ -235,8 +239,11 @@ PY
   # M3: the COMPARISON, not the default's value — replace the floor OPERAND with a literal past every
   # fixture and the old dead lane must stop being named. M1 shows the clause is load-bearing; M3 shows
   # the comparison is, with the clause intact. NEITHER mutant reads the default: a floor lowered to 0
-  # or 60 leaves M3 green (measured, #2788). The default's value is pinned by the registry's `value`
-  # fragment, in the `MIN_AGE` row's precedent — and, in this suite, by OH8 (0) and OH9 (<= 300).
+  # or 60 leaves M3 green (measured, #2788). The registry's `value` fragment is what pins the NUMBER;
+  # this suite only BOUNDS it — OH9 reds at any floor of 300 or less, OH1 at any floor above 1000 — so
+  # a floor of 500 passes every arm (1000 >= 500 names OH1's lane, while 5 and 300 stay below it).
+  # Stated so the bound is not read as a value pin, matching the `MIN_AGE` row's precedent and this
+  # row's own `guardedBy` at heartbeat-progress-edges.ts:1385.
   mut "M3-age-floor" \
       '"$age" -ge "${MIN_SESSION_AGE_S}"' \
       '"$age" -ge 1000000000' \
