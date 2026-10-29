@@ -41,11 +41,12 @@ Research is embedded at **every level × stage** of the planning pipeline, with 
 | Epic | epic-scope | Complexity axis rated medium+ AND brief too broad for boundary decisions | `### Axis Research Notes`, deduped against brief | ≤ 4 total |
 | Project/Task (standard+) | issue-scoping Phase 1.5 | Activation rule (axis medium+ = necessary; low axes may fire on demonstrated gap) | `### Axis Research` + `### Integration Docs` (persisted) | 8/14 caps (post-dedup) |
 | Project/Task (standard+) | writing-plans Step B | Third-party deps / novel patterns in the concrete plan | `### Pattern Research` (sole author) + `> **Findings date:**` | 3+ per bucket (existing) |
+| **`task-workflow-standard`** (agent-infra#2861) | stage 1 RESEARCH | Everything the two rows above cover, at the declared axis depth | the one `<!-- research: v1 -->` comment's `### Targeted Research Findings` + `> **Findings date:**` | `issue-scoping` §Tier Scaling (8 standard / 14 complex). **Step B is not run and no `### Pattern Research` is written.** |
 | Task (micro) | task-workflow Research | Third-party deps or novel pattern (no in-repo precedent) | Inline `> Research note:` line, findings-date + provenance | 1–2 |
 
 **Granularity rule (P2+P3 reconciliation):** P3 governs *whether* to fire — a demonstrated gap (new third-party dep, novel pattern, medium+ axis, new detail not covered by the parent brief). P2 governs *what* to do when firing — fresh queries at that level's granularity, inherited findings as context only. Later stages may displace earlier findings as documented updates (never silent rewrites — see `## Raw Notes`).
 
-**Authorship boundary (D5):** `### Pattern Research` is reserved **exclusively** for writing-plans Step B (consumed by executing-plans' dependency-coverage rule). Scoping emits `### Axis Research` + `### Integration Docs`. Epic-brief headings (`### UX Pattern Research`, `### Tech Stack Research`) are PRIOR_RESEARCH context and never satisfy dependency coverage.
+**Authorship boundary (D5):** `### Pattern Research` is reserved **exclusively** for writing-plans Step B (consumed by executing-plans' dependency-coverage rule). **Under `task-workflow-standard` the equivalent role is played by `### Targeted Research Findings`** in the `<!-- research: v1 -->` comment: one block, both granularities, and `executing-plans` reads it (agent-infra#2861). Scoping emits `### Axis Research` + `### Integration Docs`. Epic-brief headings (`### UX Pattern Research`, `### Tech Stack Research`) are PRIOR_RESEARCH context and never satisfy dependency coverage.
 
 ---
 

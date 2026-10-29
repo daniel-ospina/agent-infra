@@ -47,6 +47,20 @@ idempotent: renders → diffs vs the
 installed plist → skips when identical, reloads on change. Run
 `scripts/install-launchd.sh --status` to inspect; `--uninstall` to remove.
 
+**The orchestrator harness (macOS) — a SECOND, separate step.** `setup.sh` installs this Mac's config
+and the launchd template set, and it installs NEITHER the orchestrator controller NOR the harness-apply
+clock. Run, once, from the checkout:
+
+```bash
+scripts/harness-up up        # preflight -> install the roles this box should run -> start them
+scripts/harness-up status    # one MEASURED line per role; NEVER-INSTALLED / DANGLING / FAILED with the reason
+```
+
+`up` is idempotent and refuses before writing anything if a role's program or working directory is
+missing. Which roles have a unit on which platform — and which components are current — is the table in
+`scripts/orchestrator-harness/README.md` §6.1. The Linux cells get the same two commands; the install
+half is systemd there instead of launchd.
+
 **Session checks (macOS):** hub-state-check (repo drift) + skill-lint-oracle
 (skill-lint drift lock) can't run under launchd — macOS TCC blocks
 launchd-spawned processes from reading ~/Documents, and both checks read the

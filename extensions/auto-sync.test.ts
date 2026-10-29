@@ -6,14 +6,39 @@
  * exercised against genuine git semantics, not mocks.
  */
 import { execSync, execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
 import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode, currentBranch } from "./auto-sync.js";
 import { repoKey } from "./shared/branch-ownership.mjs";
+
+// ⛔ `sync.sh` is resolved from the CHECKOUT, never from the working directory
+// (#1509). A fleet child runs this suite with a cwd inside some other repo's
+// lane worktree, where a cwd-relative `cat sync.sh` fails, the fixture
+// assertions go red, and the suite's output replaces that child's answer — which
+// is how a test fixture came to hijack every dispatch on this box.
+function findSyncSh(): string {
+  const candidates: string[] = [];
+  const infra = process.env.AGENT_INFRA_PATH;
+  if (infra) candidates.push(join(infra, "sync.sh"));
+  for (let dir = process.cwd(); ; dir = dirname(dir)) {
+    candidates.push(join(dir, "sync.sh"));
+    if (dir === dirname(dir)) break;
+  }
+  for (let dir = dirname(fileURLToPath(import.meta.url)); ; dir = dirname(dir)) {
+    candidates.push(join(dir, "sync.sh"));
+    if (dir === dirname(dir)) break;
+  }
+  candidates.push(join(homedir(), "Documents", "GitHub", "agent-infra", "sync.sh"));
+  for (const candidate of candidates) if (existsSync(candidate)) return candidate;
+  throw new Error(`sync.sh not found — set AGENT_INFRA_PATH to an agent-infra checkout`);
+}
+const SYNC_SH = findSyncSh();
+const syncShSource = (): string => readFileSync(SYNC_SH, "utf-8");
 
 let passed = 0, failed = 0;
 async function test(name: string, fn: () => void | Promise<void>) {
@@ -436,7 +461,7 @@ async function main() {
     const repo = makeClone(o);
     git(repo, "checkout -q -b feature/xyz");
     const headBefore = git(repo, "rev-parse HEAD").trim();
-    writeFileSync(join(repo, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    writeFileSync(join(repo, "sync.sh"), syncShSource(), { mode: 0o755 });
     const out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1 || true`, { encoding: "utf-8" });
     ok(out.includes("refusing to pull"), `expected guard message, got: ${out}`);
     ok(out.includes("branch-ownership guard, #265"), `expected #265 reference, got: ${out}`);
@@ -506,7 +531,7 @@ async function main() {
 
   await test("sync.sh exits 1 on a stuck index and names the paths + remedy", () => {
     const stuck = makeStuckConflict();
-    writeFileSync(join(stuck, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    writeFileSync(join(stuck, "sync.sh"), syncShSource(), { mode: 0o755 });
     let code = 0;
     let out = "";
     try {
@@ -540,7 +565,7 @@ async function main() {
     git(repo, "fetch -q origin");
     try { git(repo, "merge origin/main"); } catch { /* expected conflict */ }
     ok(git(repo, "ls-files -u").trim().length > 0, "fixture must have an unmerged newline path");
-    writeFileSync(join(repo, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    writeFileSync(join(repo, "sync.sh"), syncShSource(), { mode: 0o755 });
     let out = "";
     try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
     catch (e: any) { out = String(e.stdout ?? e.message); }
@@ -605,7 +630,7 @@ async function main() {
 
   await test("sync.sh in a git-am conflict → names am, not rebase, exits 1", () => {
     const am = makeAmConflict();
-    writeFileSync(join(am, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    writeFileSync(join(am, "sync.sh"), syncShSource(), { mode: 0o755 });
     let code = 0;
     let out = "";
     try {
@@ -726,7 +751,7 @@ async function main() {
 
   await test("sync.sh in an active merge → names the merge, not the index-only diagnosis, exits 1", () => {
     const merging = makeStuckConflict(true);
-    writeFileSync(join(merging, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    writeFileSync(join(merging, "sync.sh"), syncShSource(), { mode: 0o755 });
     let code = 0;
     let out = "";
     try {
