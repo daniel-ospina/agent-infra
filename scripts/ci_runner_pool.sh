@@ -1276,10 +1276,16 @@ ensure_tmpdir() {
     else
       log_line "tmpdir-root skipped tmpdir-root=$rt reason=env-names-tmpdir tmpdir=$t (the .env-named TMPDIR wins at run.sh, so the private root is neither used nor created for this instance)"
     fi
-    return 0
+  else
+    # ⛔ THIS ARM IS THE ONLY `ensure_private_tmp` CALL SITE, AND SKIPPING IT FOR A `.env` INSTANCE MUST
+    # NOT SKIP WHAT FOLLOWS (the P3-3 fix first shipped as a `return 0` here, which also skipped the
+    # `.env`-named directory creation BELOW this block — measured: 36 assertions red, every one of them
+    # in the `.env` arm, because no `.env`-named TMPDIR was ever created again). The two subjects are
+    # independent: this call is about the INSTANCE's private root, the rest of the function is about the
+    # directory the operator named. So the skip is scoped to THIS branch, not to the function.
+    ensure_private_tmp "$d" "$live_pid" || return 2
   fi
-  ensure_private_tmp "$d" "$live_pid" || return 2
-  return 0
+  [ -n "$t" ] || return 0
   # ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1), AND THAT IS TRUE WHETHER
   # OR NOT THE DIRECTORY ALREADY EXISTS (#3004 review round 4, P2). The comparison runs first, for both
   # branches, and a mismatch is cannot-measure; the guard itself is `tmp_owner_guard` (one definition,
