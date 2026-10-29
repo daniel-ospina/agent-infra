@@ -73,6 +73,39 @@ DOMAIN="gui/$(id -u)"
 # exactly as it did before the {{PATH}} note above was added.
 usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
+# ── THE PLACEHOLDER CONTRACT ──────────────────────────────────────────────────────────────────
+# ONE list, TWO consumers: `render` substitutes every name here, and `install_job` SKIPS a template
+# whose name resolves empty. Before this array existed those were two hand-kept lists in this file,
+# and `scripts/fleet-schedule.py` (the cell/Linux renderer) held a third — so a name added here and
+# not there turned the same shipped template into a hard ERROR on every cell.
+#
+# ⛔ THAT IS NOT HYPOTHETICAL. #2639 added AI_DRAINER_* / AI_MULTI_REPO_* to this file only. On
+# 2026-10-27 cell4 (vm-ce2c2fc9fd844a32851d46c3723b903e) refused to start a scheduler at all —
+# `systemctl start eldato-orchestrator` → active (activating), MainPID=0, no controller, no reap,
+# no liveness, no canary — because the shipped ai-drainer template carried two names the cell
+# runtime did not know.
+#
+# The tuple in scripts/fleet-schedule.py is the other half of the contract, and
+# `scripts/fleet-schedule.test.sh` COMPARES the two (plus the {{NAME}} tokens actually present in
+# templates/launchd/*.plist) so drift reddens. Add a name in BOTH files, or the suite fails.
+PLIST_PLACEHOLDERS=(
+    HOME
+    PATH
+    AGENT_INFRA_PATH
+    TORTOISE_REPO
+    SWARM_ROOT
+    SWARM_ENV_FILE
+    PYTHON_BIN
+    PI_BIN_DIR
+    WORKTREE_HYGIENE_MODE
+    REAP_ORPHAN_MODE
+    AI_DRAINER_O
+    AI_DRAINER_STATE
+    AI_MULTI_REPO_SLUG
+    AI_MULTI_REPO_REPO
+    AI_MULTI_REPO_STATE
+)
+
 # Resolve this repo's MAIN checkout (not a worktree) so installed jobs point
 # at a stable path that survives worktree teardown. `git worktree list
 # --porcelain` lists the main checkout first.
@@ -401,22 +434,19 @@ disarm_orphan_reaper() {
 
 render() {
     # $1 = template path → stdout rendered plist
-    sed -e "s|{{HOME}}|$(sed_repl "$HOME")|g" \
-        -e "s|{{PATH}}|$(sed_repl "$(launchd_path)")|g" \
-        -e "s|{{AGENT_INFRA_PATH}}|$(sed_repl "$AGENT_INFRA_PATH")|g" \
-        -e "s|{{TORTOISE_REPO}}|$(sed_repl "$TORTOISE_REPO")|g" \
-        -e "s|{{SWARM_ROOT}}|$(sed_repl "$SWARM_ROOT")|g" \
-        -e "s|{{SWARM_ENV_FILE}}|$(sed_repl "$SWARM_ENV_FILE")|g" \
-        -e "s|{{PYTHON_BIN}}|$(sed_repl "$PYTHON_BIN")|g" \
-        -e "s|{{PI_BIN_DIR}}|$(sed_repl "$PI_BIN_DIR")|g" \
-        -e "s|{{WORKTREE_HYGIENE_MODE}}|$(sed_repl "$WORKTREE_HYGIENE_MODE")|g" \
-        -e "s|{{REAP_ORPHAN_MODE}}|$(sed_repl "$REAP_ORPHAN_MODE")|g" \
-        -e "s|{{AI_DRAINER_O}}|$(sed_repl "$AI_DRAINER_O")|g" \
-        -e "s|{{AI_DRAINER_STATE}}|$(sed_repl "$AI_DRAINER_STATE")|g" \
-        -e "s|{{AI_MULTI_REPO_SLUG}}|$(sed_repl "$AI_MULTI_REPO_SLUG")|g" \
-        -e "s|{{AI_MULTI_REPO_REPO}}|$(sed_repl "$AI_MULTI_REPO_REPO")|g" \
-        -e "s|{{AI_MULTI_REPO_STATE}}|$(sed_repl "$AI_MULTI_REPO_STATE")|g" \
-        "$1"
+    # ⛔ BOTH THIS AND install_job()'s unset-placeholder check read PLIST_PLACEHOLDERS, so a name can
+    # no longer be rendered here and forgotten there (or vice versa). {{PATH}} is rendered through
+    # the launchd_path transform, not the raw env value — see the TCC note above launchd_path().
+    local -a args=()
+    local ph
+    for ph in "${PLIST_PLACEHOLDERS[@]}"; do
+        if [ "$ph" = PATH ]; then
+            args+=(-e "s|{{PATH}}|$(sed_repl "$(launchd_path)")|g")
+        else
+            args+=(-e "s|{{$ph}}|$(sed_repl "${!ph:-}")|g")
+        fi
+    done
+    sed "${args[@]}" "$1"
 }
 
 version_of() {
@@ -477,8 +507,7 @@ install_job() {
     # Unresolved placeholder → legitimate skip (e.g. no swarm root), loud.
     # Checked on the TEMPLATE against resolved env values (not the rendered
     # output — sed would substitute the empty string and hide the gap).
-    for ph in HOME PATH AGENT_INFRA_PATH TORTOISE_REPO SWARM_ROOT SWARM_ENV_FILE PYTHON_BIN PI_BIN_DIR WORKTREE_HYGIENE_MODE REAP_ORPHAN_MODE \
-              AI_DRAINER_O AI_DRAINER_STATE AI_MULTI_REPO_SLUG AI_MULTI_REPO_REPO AI_MULTI_REPO_STATE; do
+    for ph in "${PLIST_PLACEHOLDERS[@]}"; do
         if grep -q "{{$ph}}" "$template" && [ -z "${!ph:-}" ]; then
             unset_ph="$unset_ph {{$ph}}"
         fi

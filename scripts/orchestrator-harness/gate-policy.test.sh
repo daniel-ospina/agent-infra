@@ -75,7 +75,7 @@ out="$(HOME="$NH" GP_REPO="$FIX" GP_LOG="$TMP/enforced.jsonl" GP_QUIET=0 bash -c
   apply_gate_policy test-carrier
   printf "skip_review=%s skip_vgate=%s mode=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_MODE"
 ' _ "$POLICY" 2>&1)"
-if printf '%s' "$out" | grep -q 'skip_review=none skip_vgate=none mode=enforced'; then
+if grep -q 'skip_review=none skip_vgate=none mode=enforced' <<<"$out"; then
   ok "satisfiable: BOTH gates stay ON (nothing exported) — the removal arrives with the satisfier"
 else
   bad "satisfiable: expected no export + mode=enforced, got: $out"
@@ -100,7 +100,7 @@ out="$(GP_REPO="$FAKE" GP_LOG="$TMP/fake.jsonl" GP_QUIET=0 bash -c '
   apply_gate_policy test-carrier
   printf "skip_review=%s skip_vgate=%s mode=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_MODE"
 ' _ "$POLICY" 2>&1)"
-if printf '%s' "$out" | grep -q 'skip_review=1 skip_vgate=1 mode=bypass-audited'; then
+if grep -q 'skip_review=1 skip_vgate=1 mode=bypass-audited' <<<"$out"; then
   ok "decoy: files that EXIST but cannot work do NOT enforce the gates (existence is not capability)"
 else
   bad "decoy: a name-only satisfier flipped the probe to enforced — that stops every lane: $out"
@@ -118,7 +118,7 @@ out="$(HOME="$NH" AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 GP_REPO="$FIX" GP
   apply_gate_policy test-carrier
   printf "skip_review=%s skip_vgate=%s ambient_cleared=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_AMBIENT_CLEARED"
 ' _ "$POLICY" 2>&1)"
-if printf '%s' "$out" | grep -q 'skip_review=none skip_vgate=none ambient_cleared=1'; then
+if grep -q 'skip_review=none skip_vgate=none ambient_cleared=1' <<<"$out"; then
   ok "ambient: an INHERITED skip flag is removed from the carrier's environment (the stale hatch cannot outlive its reason)"
 else
   bad "ambient: an inherited skip flag survived the enforced decision: $out"
@@ -146,7 +146,7 @@ printf '#!/usr/bin/env bash\necho review-pr\n' > "$VA/scripts/review-pr.sh"; chm
 printf '#!/usr/bin/env bash\n# TODO: add --record <ref> support (see #2313)\ncase "$1" in status) : ;; esac\n' > "$VA/scripts/vgate.sh"
 chmod +x "$VA/scripts/vgate.sh"
 probe_a="$(HOME="$NH" GP_REPO="$VA" bash "$POLICY" --probe 2>&1)"
-printf '%s' "$probe_a" | grep -q 'review_satisfiable=1 vgate_satisfiable=0' \
+grep -q 'review_satisfiable=1 vgate_satisfiable=0' <<<"$probe_a" \
   && ok "isolating-A: a vgate.sh whose only 'record' is a COMMENT does NOT count as a recorder (review=1, vgate=0)" \
   || bad "isolating-A: expected review=1 vgate=0, got: $probe_a"
 
@@ -154,7 +154,7 @@ VB="$TMP/isorepo-b"; mkdir -p "$VB/scripts"
 printf '#!/usr/bin/env bash\ncase "$1" in\n  record) : ;;\nesac\n' > "$VB/scripts/vgate.sh"; chmod +x "$VB/scripts/vgate.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$VB/scripts/record-review.sh"; chmod +x "$VB/scripts/record-review.sh"
 probe_b="$(HOME="$NH" GP_REPO="$VB" bash "$POLICY" --probe 2>&1)"
-printf '%s' "$probe_b" | grep -q 'review_satisfiable=0 vgate_satisfiable=1' \
+grep -q 'review_satisfiable=0 vgate_satisfiable=1' <<<"$probe_b" \
   && ok "isolating-B: a real record arm counts, and a MISSING seam still holds review at 0 (the halves are independent)" \
   || bad "isolating-B: expected review=0 vgate=1, got: $probe_b"
 
@@ -163,7 +163,7 @@ VC="$TMP/isorepo-c"; mkdir -p "$VC/scripts"
 : > "$VC/scripts/record-review.sh"
 printf '#!/usr/bin/env bash\necho review-pr\n' > "$VC/scripts/review-pr.sh"; chmod +x "$VC/scripts/review-pr.sh"
 probe_c="$(HOME="$NH" GP_REPO="$VC" bash "$POLICY" --probe 2>&1)"
-printf '%s' "$probe_c" | grep -q 'review_satisfiable=0' \
+grep -q 'review_satisfiable=0' <<<"$probe_c" \
   && ok "isolating-C: a zero-byte record-review.sh does not count (existence is not capability, on BOTH halves)" \
   || bad "isolating-C: a zero-byte recorder satisfied the review half: $probe_c"
 
@@ -173,7 +173,7 @@ VE="$TMP/isorepo-e"; mkdir -p "$VE/scripts"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$VE/scripts/record-review.sh"; chmod +x "$VE/scripts/record-review.sh"
 printf '#!/usr/bin/env bash\necho review-pr\n' > "$VE/scripts/review-pr.sh"   # deliberately NOT executable
 probe_e="$(HOME="$NH" GP_REPO="$VE" bash "$POLICY" --probe 2>&1)"
-printf '%s' "$probe_e" | grep -q 'review_satisfiable=0' \
+grep -q 'review_satisfiable=0' <<<"$probe_e" \
   && ok "isolating-D: a review-pr.sh that exists but cannot be EXECUTED does not count" \
   || bad "isolating-D: a non-executable review seam satisfied the review half: $probe_e"
 
@@ -186,10 +186,10 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$VD/record-review.sh"; chmod +x "$VD/r
 printf '#!/usr/bin/env bash\necho review-pr\n' > "$VD/review-pr.sh"; chmod +x "$VD/review-pr.sh"
 printf '#!/usr/bin/env bash\ncase "$1" in\n  record) : ;;\nesac\n' > "$VD/vgate.sh"; chmod +x "$VD/vgate.sh"
 probe_flat="$(bash "$VD/gate-policy.sh" --probe 2>&1)"
-printf '%s' "$probe_flat" | grep -q 'review_satisfiable=1 vgate_satisfiable=1' \
+grep -q 'review_satisfiable=1 vgate_satisfiable=1' <<<"$probe_flat" \
   && ok "flat-deploy: satisfiers seeded BESIDE the carrier (the Mac's \$O shape, no git root) make both gates satisfiable" \
   || bad "flat-deploy: expected both satisfiable from \$base alone, got: $probe_flat"
-printf '%s' "$probe_flat" | grep -q 'note=repo-root-unresolved' \
+grep -q 'note=repo-root-unresolved' <<<"$probe_flat" \
   && ok "flat-deploy: and the unresolved repo root is RECORDED (note=repo-root-unresolved), not silently searched" \
   || bad "flat-deploy: the unresolved repo root is not reported: $probe_flat"
 
@@ -207,13 +207,13 @@ printf '%s' "$probe_flat" | grep -q 'note=repo-root-unresolved' \
 # half regresses), this arm fails and sends the author to README §5.4's table. That coupling is
 # deliberate — the table is the change's measured claim, and the flip is exactly when it must change.
 probe_live="$(HOME="$NH" GP_REPO="$REPO" bash "$POLICY" --probe 2>&1)"
-printf '%s' "$probe_live" | grep -q 'review_satisfiable=1 vgate_satisfiable=0' \
+grep -q 'review_satisfiable=1 vgate_satisfiable=0' <<<"$probe_live" \
   && ok "live-tree: this checkout SATISFIES the review half (record-review.sh + review-pr.sh #2288) — the README §5.4 table's measured claim" \
   || bad "live-tree: README §5.4 says the review half is satisfied; the probe says otherwise (update the table WITH the change): $probe_live"
-printf '%s' "$probe_live" | grep -q 'review-pr.sh(#2288)' \
+grep -q 'review-pr.sh(#2288)' <<<"$probe_live" \
   && bad "live-tree: the probe still names review-pr.sh(#2288) as missing — that file is in this tree (9b80ee4c), so the seam search is what is broken: $probe_live" \
   || ok "live-tree: the review seam is NOT reported missing (the doc's old claim is now falsifiable in one assertion)"
-printf '%s' "$probe_live" | grep -q 'vgate-record(#2313)' \
+grep -q 'vgate-record(#2313)' <<<"$probe_live" \
   && ok "live-tree: the bypass is carried by the VGATE half ALONE, and the reason names it (#2313) — deleting the review half first would have stopped every lane at its first push" \
   || bad "live-tree: expected the VGATE half to be the only unsatisfied one, got: $probe_live"
 
@@ -226,7 +226,7 @@ out="$(GP_REPO="$EMPTY" GP_LOG="$TMP/bypass.jsonl" GP_QUIET=0 bash -c '
   apply_gate_policy test-carrier
   printf "skip_review=%s skip_vgate=%s mode=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_MODE"
 ' _ "$POLICY" 2>&1)"
-if printf '%s' "$out" | grep -q 'skip_review=1 skip_vgate=1 mode=bypass-audited'; then
+if grep -q 'skip_review=1 skip_vgate=1 mode=bypass-audited' <<<"$out"; then
   ok "unsatisfiable: the flags ARE exported — deliberately, so the fleet keeps running"
 else
   bad "unsatisfiable: expected the audited bypass, got: $out"
@@ -236,7 +236,7 @@ if [ -f "$TMP/bypass.jsonl" ] && grep -q 'agent-infra#2319' "$TMP/bypass.jsonl" 
 else
   bad "unsatisfiable: no audit line naming #2319 / the carrier"
 fi
-if printf '%s' "$out" | grep -q 'review-pr.sh(#2288)'; then
+if grep -q 'review-pr.sh(#2288)' <<<"$out"; then
   ok "unsatisfiable: the reason names the absent satisfier (review-pr.sh / #2288) rather than 'policy'"
 else
   bad "unsatisfiable: the refusal does not name what is missing: $out"

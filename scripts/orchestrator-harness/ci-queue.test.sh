@@ -574,7 +574,10 @@ ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per P
    "$( { [ "$(grep -cF 'ciq_read "${OR:-}"' "$LOOP")" -eq 2 ] \
         && [ "$(grep -cF 'ciq_read "${OR:-}" >/dev/null 2>&1 || true' "$LOOP")" -eq 1 ] \
         && [ "$(grep -cF 'CIQ_VER="$(ciq_eval)"; CIQ_RC=$?' "$LOOP")" -eq 2 ]; } ; echo $? )"
-grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
+# ⛔ THE SHIPPED FORM, NOT THE RENDERED VALUE (#2927): the gate VECTOR made every arm assign through
+# `${GATE_WHY:-…}` so a later arm cannot overwrite the first one that fired. The rendered `GATE_WHY`
+# is unchanged — `ci-queue($CIQ_VER)` — so this pin follows the assignment the module actually performs.
+grep -F -q 'GATE_WHY="${GATE_WHY:-ci-queue($CIQ_VER)}"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -cF 'if ciq_push_ok; then' "$LOOP")"
 # ⛔ THE THREE FIXER SPAWN ARMS NO LONGER CONSULT THE QUEUE AT ALL (#2927). They are REPAIR — they act
@@ -825,11 +828,19 @@ ck "(h5) an UNREADABLE queue DEFERS through the shipped predicate (rc=$rc) — f
 # driven in four states, the way (h0)/(h0b) drive the predicate and its reset.
 printf '\n── (h6) the ISSUE-path gate ARM, EXTRACTED and driven in both polarities ──────\n'
 ARM_RAW="$T/gatearm.raw"
-awk '/^  elif \[ "\$\{CIQ:-0}" = "1" \] && \[ "\$\{CIQ_RC:-1}" != "1" \]; then/{print; exit}' "$LOOP" > "$ARM_RAW"
+# ⛔ EXTRACTED BY ITS OWN BOUNDARIES, NOT BY AN `elif` LINE (#2927). The arm was one `elif … then`
+# before the gate VECTOR; it is a nested guard now (the outer `if` closes on its `else …; fi` line, so
+# a `/^  fi$/` range would still be right — but an `elif` anchor matches NOTHING and this rig then
+# graded an EMPTY file: (h6) and its three sisters went red while (h6a)/(h6d)/(h6f) passed vacuously
+# on nothing, which is the shape a polarity pin must never have. The range is now the arm's OWN
+# markers: this file's other `if [ "${CIQ:-0}" = "1" ]` is the READ, not the gate, so a bare pattern
+# anchor cannot tell the two apart.
+sed -n '/# \[ciq-arm:begin\]/,/# \[ciq-arm:end\]/p' "$LOOP" | sed '1d;$d' > "$ARM_RAW"
 ck "(h6) the ISSUE-path ci-queue arm was EXTRACTED from orch-loop.sh (not a restatement)" \
-   "$( { [ -s "$ARM_RAW" ] && grep -q 'CIQ_RC' "$ARM_RAW" && grep -qF 'ci-queue($CIQ_VER)' "$ARM_RAW"; } ; echo $? )"
-mkarm() { # <raw elif line> <out> — wrap the shipped line in a drivable if/elif chain
-  { printf 'GATE_WHY=""\nif false; then :\n'; sed 's/^ *elif /elif /' "$1"; printf 'fi\nprintf "%%s" "$GATE_WHY"\n'; } > "$2"
+   "$( { [ -s "$ARM_RAW" ] && grep -q 'CIQ_RC' "$ARM_RAW" && grep -qF 'ci-queue($CIQ_VER)' "$ARM_RAW" \
+        && grep -qF 'GATE_VEC=' "$ARM_RAW"; } ; echo $? )"
+mkarm() { # <raw arm block> <out> — run the shipped block with GATE_WHY pre-set empty
+  { printf 'GATE_WHY=""\nGATE_VEC=""\n'; cat "$1"; printf '\nprintf "%%s" "$GATE_WHY"\n'; } > "$2"
 }
 ARM="$T/gatearm.sh"; mkarm "$ARM_RAW" "$ARM"
 gaw() { # <arm-file> <CIQ> <CIQ_RC> -> GATE_WHY as the arm renders it
@@ -1094,6 +1105,33 @@ ck "(j2) …and never calls the queue predicate" \
    "$( grep -q 'ciq_ci_allowed' "$FIX"; [ $? -ne 0 ]; echo $? )"
 ck "(j3) …while the LOAD/disk spawn gate it IS bounded by is still sourced (the bound was narrowed, not removed)" \
    "$( grep -q 'spawn-gate.sh' "$FIX"; echo $? )"
+# ⛔ AND NO SURFACE MAY STILL *READ* A DEFERRAL THIS MODULE CAN NO LONGER PRODUCE (#2928's review, P2).
+# #2927 removed `fix-one.sh`'s WRITE of this token, but the READERS outlived the writer: `adopt-fix.sh`
+# kept a 79 arm that could never fire again — its operator message told a manual operator to "re-run
+# when the queue drains" for a refusal that no longer exists, while a real PR-owner deferral fell
+# through the `… && next` chain that arm was meant to stop — and two `ARCHITECTURE.md` rows still
+# counted the deferral among `fix-one.sh`'s pre-agent deferrals. That is invisible to every other arm
+# here (none of them reads a reader), so pin the population at ZERO.
+# ⛔ A COMMENT IS NOT A READER on purpose: the history belongs where the next editor looks, and a
+# comment cannot mis-route an operator. Comments are therefore excluded and prose about the removal
+# stays legal. The scan is over the harness directory and skips this suite + `selftest.sh` (both
+# legitimately SPELL the token to police it).
+# Measured pre-fix: 2 readers (`adopt-fix.sh`, `ARCHITECTURE.md`). Post-fix: 0.
+_cq_ghost='DEFERRED by the CI-queue'" gate"          # split so this line is not its own hit
+ghost_scan() { # <path> -> how many NON-COMMENT occurrences the shipped corpus carries
+  grep -rnF "$_cq_ghost" "$1" 2>/dev/null \
+    | grep -v -e '\.test\.sh:' -e '/selftest\.sh:' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | wc -l | tr -d ' '
+}
+ghost_readers=$(ghost_scan "$HERE")
+ck "(j4) NO surface reads a CI-queue deferral fix-one.sh can no longer write (found $ghost_readers, expected 0)" \
+   "$( [ "$ghost_readers" = "0" ]; echo $? )"
+# The 0 above is only a measurement if the scan can see a reader at all — otherwise a typo'd path or a
+# dropped flag reads exactly like a clean census. Plant one and require it to be counted.
+printf 'ghost reader: %s\n' "$_cq_ghost" > "$T/planted-reader.sh"
+ghost_planted=$(ghost_scan "$T/planted-reader.sh")
+ck "(j4b) …and the scan SEES a planted reader (so that 0 is a measurement, not a broken grep; found $ghost_planted, expected 1)" \
+   "$( [ "$ghost_planted" = "1" ]; echo $? )"
 # ⛔ (m) THE CI-RERUN GATE — the one SWEEP act that ADDS queue (#2333 review round 4, P2). The PR
 # names it as "the only other surface in the sweep that ADDS queue", and it was pinned by NOTHING:
 # (e6) counts the `ci-queue(...)` token, and pr-dispatch.test.sh's T3 cycle never reaches this block
