@@ -1813,7 +1813,7 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
 }
 
 wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (reason on stderr)
-  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val srv_pvar srv_pval pre_rc preout premsg pre_where spout spmsg _larc _lamsg _recovered _ensrc _ensclaim
+  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val srv_pvar srv_pval pre_rc preout premsg pre_where spout spmsg _larc _lamsg _recovered _ensrc _ensclaim _enscmd
   [ "$#" -ge 3 ] || { wt_warn "wt_spawn needs <name> <cwd> <command>"; return 1; }
   name="$1"; cwd="$2"; shift 2; cmd="$*"
   wt_name_ok "$name" || { wt_warn "refusing a worker name with anything but [A-Za-z0-9-]: '$name'"; return 1; }
@@ -2063,13 +2063,23 @@ PY
               # defect class (an instrument stating a cause it did not check) inside the sentence that
               # reports the repair.
               wt_cmux_session_ensure; _ensrc=$?
+              # ⛔ THE COMMAND NAME HERE IS QUOTED, NOT RUN (review #3031 round 7, finding P1). These two
+              # assignments used UNESCAPED backticks inside a double-quoted string, so the shell performed
+              # COMMAND SUBSTITUTION instead of printing the command: every recovered spawn issued a
+              # SECOND, UNBOUNDED `cmux server ensure` on the controller's synchronous path (bypassing
+              # `wt_bounded`, the one thing this file never does) and `_ensclaim` became that call's STDOUT
+              # — `status started` — so the evidence line read `RECOVERED lane-8: ... status started
+              # answered on attempt 1`, losing the fact the commit exists to add. Every sibling line in
+              # this block escapes its backticks; these two did not. R2 pins the single call AND the
+              # command name so it cannot come back.
+              _enscmd="cmux server ensure --session $(wt_cmux_session)"
               _larc=0
               out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
               if [ "$_larc" -eq 0 ]; then
                 if [ "$_ensrc" -eq 0 ]; then
-                  _ensclaim="`cmux server ensure --session $(wt_cmux_session)` answered on attempt $WT_ENSURE_TRIES"
+                  _ensclaim="\`$_enscmd\` answered on attempt $WT_ENSURE_TRIES"
                 else
-                  _ensclaim="`cmux server ensure --session $(wt_cmux_session)` did NOT answer (rc=$_ensrc after $WT_ENSURE_TRIES attempt(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf '; last answer: %s' "$WT_ENSURE_SEEN" )), so the ensure did NOT clear it"
+                  _ensclaim="\`$_enscmd\` did NOT answer (rc=$_ensrc after $WT_ENSURE_TRIES attempt(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf '; last answer: %s' "$WT_ENSURE_SEEN" )), so the ensure did NOT clear it"
                 fi
                 # ⛔ A RECOVERY IS SAID OUT LOUD, because it is EVIDENCE ABOUT THE BOX: a spawn that needed
                 # the session ensured is a cell whose owner had stopped allocating, and the next cycle must
@@ -2077,7 +2087,7 @@ PY
                 # WHICH fact this is — the ensure answering, or the re-attempt carrying the spawn alone.
                 wt_warn "RECOVERED $name: \`cmux layout apply\` failed once, $_ensclaim; the re-attempt SUCCEEDED — MEASURED: ${WT_PROBE_LINE}; READING: $(wt_cmux_probe_reading). The first failure's own message (NOT verified as a cause): ${_lamsg:-no output, exit status only}"
               else
-                _recovered=" — recovery: \`cmux server ensure --session $(wt_cmux_session)\` tried $WT_ENSURE_TRIES time(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf ' (last answer: %s)' "$WT_ENSURE_SEEN" ) and the re-attempt FAILED TOO; the residual is that the session owner must be repaired out of band (\`server stop --force\` + \`ensure\` is the recorded lever, and it ends every terminal inside the owner, so this spawn path does not take it)"
+                _recovered=" — recovery: \`$_enscmd\` tried $WT_ENSURE_TRIES time(s)$( [ -n "$WT_ENSURE_SEEN" ] && printf ' (last answer: %s)' "$WT_ENSURE_SEEN" ) and the re-attempt FAILED TOO; the residual is that the session owner must be repaired out of band (\`server stop --force\` + \`ensure\` is the recorded lever, and it ends every terminal inside the owner, so this spawn path does not take it)"
               fi ;;
             *)
               # ⛔ NO READING, NO RETRY (review round 4, finding F2). The refusal that says "no cause is

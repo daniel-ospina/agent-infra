@@ -185,10 +185,18 @@ case "${1:-}" in
         printf '%s\n' "$CMUX_SERVER_STATUS"; exit "${CMUX_SERVER_STATUS_RC:-0}" ;;
       ensure)
         printf '%s\n' "ENSURE $*" >> "${CMUX_ENSURE_LOG:-/dev/null}"
+        # ⛔ THE REAL CLI ANSWERS ON STDOUT — `status started` (measured on cell-4, the PR's own
+        # artifact). A stub that printed NOTHING made the command-substitution defect at
+        # `worker-terminal.sh`'s `_ensclaim` invisible: the substitution yielded an EMPTY string instead
+        # of the real answer, so the mangled evidence line looked merely terse rather than self-
+        # contradictory (review #3031 round 7, finding P1). Faithful stdout is what makes R2's new
+        # "it does not relay the CLI's answer as its own claim" arm discriminating.
         # FAIL-ONCE models the measured flake on cell-3: `ensure` failed once and succeeded on retry.
         if [ -n "${CMUX_ENSURE_FAIL_ONCE:-}" ]; then
           if [ -f "$CMUX_ENSURE_FAIL_ONCE" ]; then rm -f "$CMUX_ENSURE_FAIL_ONCE"; else : > "$CMUX_ENSURE_FAIL_ONCE"; echo 'the detached session owner did not become ready' >&2; exit 1; fi
         fi
+        if [ "${CMUX_ENSURE_RC:-0}" = "0" ]; then printf '%s\n' "${CMUX_ENSURE_SAY:-status started}"; exit 0; fi
+        echo "the detached session owner did not become ready" >&2
         exit "${CMUX_ENSURE_RC:-0}" ;;
       *) exit 0 ;;
     esac
@@ -2380,6 +2388,16 @@ case "$out" in *"REFUSED lane-8"*) rc=1 ;; *) rc=0 ;; esac
 ck "R2: …and NO refusal recorded for a spawn that succeeded" $rc
 [ "$(grep -c 'CMUX layout apply' "$TMP/cmuxr2.log")" = "2" ] && rc=0 || { rc=1; cat "$TMP/cmuxr2.log"; }
 ck "R2: …because the create really WAS attempted twice (the recovery is exercised, not decorative)" $rc
+# ⛔ …AND THE EVIDENCE LINE IS BUILT FROM THE ENSURE IT MEASURED, NOT FROM A SECOND CALL IT RAN
+# (review #3031 round 7, finding P1). `_ensclaim`'s backticks were UNESCAPED inside a double-quoted
+# string, so the shell COMMAND-SUBSTITUTED them: one extra, UNBOUNDED `cmux server ensure` per recovered
+# spawn (bypassing `wt_bounded`), and the line reported that call's STDOUT as the ensure's answer.
+[ "$(grep -c '^ENSURE server ensure --session cloud' "$TMP/ensure2.log" 2>/dev/null)" = "1" ] && rc=0 || { rc=1; cat "$TMP/ensure2.log"; }
+ck "R2: …and the recovery makes EXACTLY ONE bounded ensure call — the evidence line does not issue a second, unbounded one" $rc
+case "$out" in *'`cmux server ensure --session cloud` answered on attempt 1'*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2: …and the RECOVERED line NAMES the command it ensured, so the claim is about a call that happened" $rc
+case "$out" in *"status started"*) rc=1; echo "      $out" ;; *) rc=0 ;; esac
+ck "R2: …and it does NOT relay the CLI's own stdout (\`status started\`) as the ensure's answer" $rc
 # (R2b) …AND IT MUST NOT BE CREDITED WITH A RECOVERY IT DID NOT MAKE (review #3031 round 6, finding F2).
 # `wt_cmux_session_ensure || true` discarded the ensure's status while the RECOVERED line said it
 # "answered on attempt N" — so a box whose ensure failed BOTH attempts but whose re-attempted create
