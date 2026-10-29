@@ -3,10 +3,13 @@
 # tests/ci-lane-parity/run.sh (8n, 8q, 8ac7).
 #
 # WHY THIS FILE EXISTS
-#   Those pins replace every `run_shard` line with ONE cheap target so they can exercise the
-#   runner's own self-checks — the listed==executed arithmetic, the sweep arm, the
-#   failure-recording sentinel — without running the sixty real suites. The stand-in must
-#   therefore answer with a FIXED rc that depends on nothing but itself.
+#   Those pins point the runner's DISCOVERY at this ONE cheap target (they rewrite `SUITE_GLOBS`
+#   in a copy of the runner) so they can exercise the runner's own self-checks — the
+#   listed==executed arithmetic, the sweep arm, the failure-recording sentinel — without running
+#   the real suites. Before the list was derived (#2609) the same fixture rewrote the 79
+#   `run_shard` lines, i.e. it ran this file 79 times per fixture execution; a derived list makes it
+#   run ONCE, and the pins only need a non-empty list. The stand-in must therefore answer with a
+#   FIXED rc that depends on nothing but itself.
 #
 # WHY IT IS NOT A REPO-WIDE GUARD
 #   Until 2026-10-23 the stand-in was `scripts/check-no-sigpipe-grep.sh`. That guard's rc is a
