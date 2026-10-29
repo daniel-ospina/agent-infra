@@ -6,13 +6,17 @@
 #   ./deploy-harness.sh --repo <checkout>  --o <runtime> [...]     # --src defaults to the checkout's
 #                                                                  # scripts/orchestrator-harness
 #   ./deploy-harness.sh ... --no-notify                            # verdict printed, no notification
+#   ./deploy-harness.sh ... --accept-discard                       # proceed even though $O carries an
+#                                                                  # edit this deploy would OVERWRITE
+#                                                                  # (it is named before the copy)
 #
 # Exit: 0 = DEPLOYED AND VERIFIED   (every file the source ships was copied by THIS run and is
 #                                    byte-identical to its source, and the source ships ≥1 file)
 #       1 = the copy or the verification failed — partial, drifted or empty; a failure notification
 #           was emitted and NOTHING was announced as success
 #      78 = refused BEFORE touching the target (bad invocation, source absent, source is not a
-#           harness, source ships nothing, target is not a directory)
+#           harness, source ships nothing, target is not a directory, or $O carries an UNCOMMITTED
+#           EDIT this run would overwrite and --accept-discard was not given)
 #
 # WHY THIS EXISTS (agent-infra#2041). `bg/finish.sh` — the live-only autonomous endgame — deployed
 # with a bare `cp -R "$R"/scripts/orchestrator-harness/. "$O"/` and then, on the NEXT line and
@@ -59,6 +63,11 @@ PROG="$(basename "${BASH_SOURCE[0]}")"
 usage() { awk 'NR>1 && /^set -uo pipefail$/{exit} NR>1{sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"; }
 
 SRC="" ; NOTIFY="" ; LEDGER="" ; DO_NOTIFY=1 ; QUIET=0
+# ⛔ THE ONE OVERRIDE, and it is OPT-IN BY NAME. A deploy that overwrites an uncommitted edit in `$O`
+# must be TOLD to (see preflight (c)); the flag exists so the refusal is never the last word for an
+# operator who has read what is about to be lost, and never the default for one who has not.
+ACCEPT_DISCARD="${ACCEPT_DISCARD:-0}"
+case "$ACCEPT_DISCARD" in 1|true|yes) ACCEPT_DISCARD=1 ;; *) ACCEPT_DISCARD=0 ;; esac
 # ⛔ `O` is NOT initialised here — not even to "". Setting `O=""` on this line CLEARED an env
 # `O=<dir>` before the assignment below could read it, so the "honour the convention" comment was
 # false and an explicit `O=<dir> ...` silently addressed the default runtime — the measured
@@ -81,6 +90,7 @@ while [ $# -gt 0 ]; do
     --o)        [ $# -ge 2 ] || { echo "$PROG: --o needs a path" >&2; exit 78; }; O="$2"; shift 2 ;;
     --notify)   [ $# -ge 2 ] || { echo "$PROG: --notify needs a path" >&2; exit 78; }; NOTIFY="$2"; shift 2 ;;
     --no-notify) DO_NOTIFY=0; shift ;;
+    --accept-discard) ACCEPT_DISCARD=1; shift ;;
     --ledger)   [ $# -ge 2 ] || { echo "$PROG: --ledger needs a path" >&2; exit 78; }; LEDGER="$2"; shift 2 ;;
     --quiet)    QUIET=1; shift ;;
     -h|--help)  usage; exit 0 ;;
@@ -327,6 +337,54 @@ if [ -n "$SYMLINK_DIR" ]; then
   exit 78
 fi
 
+# ── (c) THE MEASURED INCIDENT: a deploy that silently DISCARDS a hand patch ────────────────────
+# 2026-10-28 (measured): a hand-applied fix to `$O/merge-one.sh` was REVERTED TWICE by redeploys — the
+# file's mtime moved at 20:02 and again at 20:15, after the patch — so the box ran unpatched code and a
+# production fix looked like it had "stopped working". Nothing printed what was about to be lost, and
+# nothing refused. `$O`'s own provenance record says which bytes the LAST deploy wrote; a file that
+# differs from that record is an edit NO deploy made, and overwriting it destroys work that exists
+# nowhere else. So this refuses, names every file, and says which side is newer.
+# ⛔ THE EXIT CODE IS 78 (refused before touching the target) because NOTHING is written on this path —
+# not even the ledger. The override is a FLAG, not an env default: `--accept-discard`.
+# ⛔ SET AS A FLAG, NOT AS A ROW. `detail` is RESET below, just before the copy loop, so a row appended
+# here was discarded before any `write_ledger` call ever saw it — measured: the three warnings printed,
+# the run verified 6/6, and the durable ledger carried no DISCARD-UNKNOWN line at all. The ledger is
+# the record the NEXT operator reads; a warning that exists only in this run's scrollback is not one.
+DISCARD_UNKNOWN=0
+if [ "$ACCEPT_DISCARD" -eq 1 ]; then
+  log_line "$PROG: --accept-discard — an uncommitted edit in $O (if any) WILL be overwritten by this run"
+elif [ -f "$SRC/harness-provenance.sh" ]; then
+  # The checker is the SOURCE's copy: the `$O` copy may be the very thing under suspicion, and an
+  # older source that predates the record simply has no checker to run (that case is announced below).
+  DISC_OUT="$(bash "$SRC/harness-provenance.sh" check --o "$O" --src "$SRC" 2>&1)"; DISC_RC=$?
+  case "$DISC_RC" in
+    0) : ;;
+    1)
+      fatal "REFUSING: $O carries UNCOMMITTED EDITS that this deploy would OVERWRITE — nothing was copied"
+      printf '%s\n' "$DISC_OUT" >&2
+      fatal "  those bytes exist nowhere else: copy them aside (or land them in the repo) first."
+      fatal "  to discard them deliberately, re-run with --accept-discard."
+      notify "orchestrator: harness deploy REFUSED" "Nothing was copied: $O carries uncommitted edits this deploy would overwrite, and nothing else holds them (see stderr / --accept-discard). (#2041)" high
+      exit 78 ;;
+    *)  # CANNOT-VERIFY (no readable record): the refusal cannot fire, but SILENCE about it is how the
+        # next redeploy quietly reverts a patch. Said out loud, once, on the path that will overwrite.
+      log_line "  ⚠ UNKNOWN whether $O carries uncommitted edits: no readable provenance record there."
+      log_line "    Files this run overwrites are NOT recoverable, and nothing can tell you which they are."
+      # ⛔ NO `write --o $O --src $SRC` REMEDY HERE, and it is not an oversight: the writer refuses a
+      # SOURCE that ships a file $O does not have ("the deploy is not complete"), which is exactly the
+      # state a behind-or-half-deployed box is in — the one this branch is printed for. Measured: the
+      # advice exited 1 and wrote nothing. The instrument that DOES answer is this run: it records the
+      # box at the end. So the honest lever is the flag that proceeds.
+      log_line "    Proceed deliberately with --accept-discard: this run then records the box"
+      log_line "    (.harness-provenance), and every later deploy can tell an edit from its own bytes."
+      log_line "    Or record the box while it is still the ref it IS, before redeploying across it."
+      DISCARD_UNKNOWN=1 ;;
+  esac
+else
+  log_line "  ⚠ the source ships no harness-provenance.sh, so this deploy cannot tell whether $O carries"
+  log_line "    uncommitted edits. Files it overwrites are NOT recoverable."
+fi
+
 # The ledger lives in the runtime, beside the bytes it describes, unless the caller names a path.
 [ -n "$LEDGER" ] || LEDGER="$O/.deploy-ledger.tsv"
 
@@ -354,6 +412,9 @@ MADE_DIRS=0
 LEDGER_WRITTEN=0
 copy_fail=()
 detail=()
+if [ "$DISCARD_UNKNOWN" -eq 1 ]; then
+  detail+=("DISCARD-UNKNOWN	.harness-provenance	(no readable record — cannot tell which files this run would discard)")
+fi
 for rel in "${REL[@]}"; do
   dst="$O/$rel"
   dstdir="$(dirname "$dst")"
@@ -605,13 +666,52 @@ if [ "$MODE_UNSET" -gt 0 ]; then
   log_line "$PROG: ⚠️  mode NOT set from the source for $MODE_UNSET file(s) (no usable 'stat' on this host) — only the executable bit was restored; do not read this verdict as 'the mode is the source's'"
 fi
 
-# ── 3b. THE IDENTITY RECORD — the bytes are right, but is the box's OWN record still about them? ─
+# ── 3a. THE PROVENANCE RECORD — WHICH COMMIT this tree is, and WHICH BYTES this run wrote ───────
+# The deploy is the only thing that knows both, so the deploy records both: `$O/.harness-provenance`
+# (commit + ref + a sha256 per file the source shipped). That is what makes "which commit is this box
+# running?" answerable WITHOUT a checkout, and what lets the NEXT deploy tell a hand patch from its own
+# last run — `check-deployed-drift.sh` prefers this record and falls back to install.sh's stamp.
+# ⛔ IT IS WRITTEN ONLY HERE, AFTER THE CONJUNCTION ABOVE HOLDS: a record describing a half-copied tree
+# would be a claim about bytes that are not all there.
+PROV_WRITTEN=0
+if [ -f "$SRC/harness-provenance.sh" ]; then
+  PROV_COMMIT="$( git -C "$SRC" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null )" || PROV_COMMIT=""
+  PROV_REPO="$( git -C "$SRC" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}' )" || PROV_REPO=""
+  # ⛔ AN ARRAY, NOT A JOINED STRING. The sha cannot contain whitespace; the CHECKOUT PATH absolutely
+  # can — `git worktree list --porcelain` yields whatever the user named it. A joined string passed
+  # unquoted word-splits into `--repo /tmp/repo` + a stray `with` + `space`, which the writer refuses as
+  # an unknown argument and NO record is written — measured: `unknown argument: with`, exit 78, on a
+  # checkout path with a space (the run then reports PROVENANCE-FAILED and the box stays unrecorded).
+  # Bash 3.2 has indexed arrays, so this needs no portability shim.
+  PROV_ARGS=()
+  [ -n "$PROV_COMMIT" ] && PROV_ARGS+=(--commit "$PROV_COMMIT")
+  [ -n "$PROV_REPO" ] && PROV_ARGS+=(--repo "$PROV_REPO")
+  # ⛔ THE `+` IDIOM IS REQUIRED, NOT DECORATION: this script runs under `set -u`, and bash 3.2
+  # treats `"${PROV_ARGS[@]}"` on an EMPTY array as an unbound-variable ERROR — so a source tree that
+  # is not a git checkout (no --commit, no --repo) would abort the deploy AT THE RECORD instead of
+  # writing commit=UNKNOWN. `${arr[@]+"…"}` expands to nothing when the array is empty and to the
+  # quoted elements when it is not, on every bash from 3.2 up.
+  if bash "$SRC/harness-provenance.sh" write --o "$O" --src "$SRC" ${PROV_ARGS[@]+"${PROV_ARGS[@]}"}; then
+    PROV_WRITTEN=1
+    detail+=("PROVENANCE	.harness-provenance	(commit ${PROV_COMMIT:-UNKNOWN})")
+  else
+    log_line "  ⚠ the provenance record could NOT be written at $O/.harness-provenance."
+    log_line "    The bytes above are still verified, but this run did not record which commit they came from."
+    detail+=("PROVENANCE-FAILED	.harness-provenance	(could not record the commit and manifest)")
+  fi
+else
+  log_line "  ⚠ no harness-provenance.sh in $SRC — this deploy cannot record the commit it came from."
+  log_line "    Redeploy from a checkout that ships it; until then only install.sh's stamp describes this box."
+fi
+
+# ── 3b. THE IDENTITY RECORD — the bytes are right, but is the box's OWN LEGACY record about them? ─
 # `install.sh` folds this deployment's `$O/*.sh` into `.agent-infra-stamp.json` (`payloadSha256`), and
 # `check-deployed-drift.sh` reports a mismatch as "a post-install hand edit" — its top-severity alarm.
-# Nothing re-stamped after a redeploy, so EVERY legitimate redeploy turned into that alarm and the
-# alarm stopped meaning anything. The stamp is not this helper's to write (install.sh owns the
-# provenance record), so the verdict NAMES the staleness instead of hiding it: the deploy's own
-# evidence is still true, and the operator is told the one command that re-records it.
+# This helper does NOT write that stamp (install.sh owns it). It writes the deploy's OWN record above
+# (`.harness-provenance`, commit + manifest), which the check prefers; a stamp left stale by a redeploy
+# is then SUPERSEDED rather than an alarm — said here, in the verdict, so neither silence nor a remedy
+# that cannot clear it is printed. When the provenance write failed, the stamp's staleness IS the
+# operator's problem again, and the verdict says the one command that re-records it.
 STAMP_NOTE=""
 STAMP="$O/.agent-infra-stamp.json"
 if [ -f "$STAMP" ]; then
@@ -651,10 +751,22 @@ if [ -f "$STAMP" ]; then
       log_line "    The bytes above are still verified; the stamp at $STAMP was NOT compared. Fix the unreadable file, then re-run install.sh."
       detail+=("STAMP-UNCHECKED	.agent-infra-stamp.json	(cannot hash the deployed *.sh — unreadable file, or no sha256 tool)")
     elif [ "$REC" != "$LIVE" ]; then
-      STAMP_NOTE="; identity record STALE — run install.sh to re-stamp"
-      log_line "  ⚠ identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
-      log_line "    Re-run install.sh to re-record it; check-deployed-drift.sh will otherwise call this deploy a hand edit."
-      detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12})")
+      if [ "$PROV_WRITTEN" -eq 1 ]; then
+        # ⛔ THIS RUN JUST RECORDED THE BOX. The legacy stamp is stale, and saying "re-run install.sh
+        # or the drift gate will call this a hand edit" would now be FALSE — the gate prefers
+        # .harness-provenance, which this run wrote. A remedy that cannot clear the alarm is how the
+        # alarm stops being read.
+        STAMP_NOTE="; legacy identity record STALE — this run recorded .harness-provenance, which supersedes it"
+        log_line "  ⚠ legacy identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
+        log_line "    SUPERSEDED by $O/.harness-provenance, which this run recorded (commit + per-file manifest);"
+        log_line "    check-deployed-drift.sh reads that record first, so this deploy is NOT reported as a hand edit."
+        detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12}; superseded by .harness-provenance)")
+      else
+        STAMP_NOTE="; identity record STALE — run install.sh to re-stamp"
+        log_line "  ⚠ identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
+        log_line "    Re-run install.sh to re-record it; check-deployed-drift.sh will otherwise call this deploy a hand edit."
+        detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12})")
+      fi
     fi
   fi
 fi

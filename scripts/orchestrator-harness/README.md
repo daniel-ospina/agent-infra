@@ -975,7 +975,9 @@ checkout:
 #
 #    ⛔ PREFER THE VERSIONED SHAPE — this is §11's rule, applied to the install step (§11 is why the
 #    three-way fork happened: `~/orchestrator` was 8 of 8 files with NO git). Two supported routes:
-#      * macOS:  bash scripts/deploy-mac-orchestrator.sh   (copies the harness, stamps the commit)
+#      * macOS:  bash scripts/deploy-mac-orchestrator.sh   (copies the harness and RECORDS the commit
+#                 + a per-file manifest in $O/.harness-provenance — §4.3; add --dry-run to see the plan
+#                 and what it would overwrite without writing anything)
 #      * any box: make $O a symlink farm into a git clone, so "which commit is this?" has an answer —
 #                 bin/harness doctor reports that as kind=linked-checkout
 #
@@ -1148,14 +1150,21 @@ said the shim had "no comparator on any path" (false — `check-single-source.sh
 above, not by a count). An unverified claim in a file about unverified claims is this issue, so both are
 stated here.
 
-**And re-run `install.sh` afterwards if you want the box to stay attributable.** `install.sh` folds
-`$O/*.sh` into `$O/.agent-infra-stamp.json` (`payloadSha256`), and `check-deployed-drift.sh` reports
-a mismatch as *"a post-install hand edit"*. A redeploy changes those bytes and does not re-stamp —
-this helper will not write the provenance record (install.sh owns it) — so the verdict says
-`identity record STALE — run install.sh to re-stamp` and records `STALE-STAMP` in the ledger. Without
-that step every legitimate redeploy turns the drift gate's top-severity alarm into its normal state,
-and a real hand edit stops standing out. `orchestrator-bringup.sh` already does this
-(`deploy_harness`, then `install.sh`).
+**AND THIS HELPER NOW RECORDS THE BOX'S OWN PROVENANCE (`agent-infra`, 2026-10-29).** At the end of a
+verified deploy it writes `$O/.harness-provenance` — the source commit, the ref, and a sha256 for
+every file the source shipped — through the shipped `harness-provenance.sh`. That record is what makes
+*"which commit is this box running?"* answerable **with no checkout present**, and what lets the NEXT
+deploy tell a hand patch from its own last run. `check-deployed-drift.sh` reads it FIRST and falls back
+to `install.sh`'s `.agent-infra-stamp.json`, so a box that was attributable before this record existed
+still is. §4.3 is the operator's page for it.
+
+Because the record is now written by the deploy, a stamp left stale by a redeploy is **superseded**
+rather than an alarm: the verdict says `legacy identity record STALE … superseded by
+.harness-provenance` and records `STALE-STAMP` in the ledger, but `check-deployed-drift.sh` will no
+longer call this deploy *"a post-install hand edit"* — the newer record describes the bytes it just
+verified. If the provenance write FAILS, the old advice stands and is printed with it: re-run
+`install.sh` to re-record the stamp. `orchestrator-bringup.sh` still does `deploy_harness`, then
+`install.sh`.
 
 ⛔ **A stamp is only compared when the fold over `$O/*.sh` actually completed.** If any `*.sh` in the
 runtime is unreadable (a root-owned `0600` leftover, a script the repo no longer ships) or no
@@ -1273,6 +1282,119 @@ the real binary by ABSOLUTE path or a `PATH` reset is not gated (deliberately �
 operator's rescue route when the box is over its ceiling, and the refusal message prints it), a
 caller that exports its own `MAX_LOAD` sets its own ceiling, and a box where neither installer has
 run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the installed copy.
+
+### 4.3 "Which commit is this box running?" — ask it, and read the answer
+
+`$O` is **not a checkout**, so `git` cannot answer this (`cd ~/orchestrator && git rev-parse --show-toplevel`
+→ `fatal: not a git repository`). The deploy path therefore leaves a record beside the bytes —
+`$O/.harness-provenance`, written by `harness-provenance.sh` at the end of a **complete** deploy
+(`deploy-harness.sh`, and `deploy-mac-orchestrator.sh` phase B). Plain text, one `sha256  path` line per
+file the deploy wrote, so a box answers with no checkout, no network and no `jq`.
+
+```bash
+# THE ONE-LINE ANSWER — works on a box with no checkout at all
+bash ~/orchestrator/harness-provenance.sh show --o ~/orchestrator
+#   harness commit 5712e52776c8   ref origin/main   recorded 2026-10-29T10:02:11Z   78 file(s)
+
+# HAS ANYTHING IN $O CHANGED SINCE THAT DEPLOY? (question (a) — names the file, and which side is newer)
+bash ~/orchestrator/harness-provenance.sh check --o ~/orchestrator
+
+# IS THE BOX THE CHECKOUT AT $REF RIGHT NOW? (question (b) — needs the checkout; also answers (a))
+bash ~/orchestrator/check-deployed-drift.sh --o ~/orchestrator --repo <agent-infra checkout>
+```
+
+**The two questions are different, and the report never conflates them.** This was the 2026-10-29
+defect: a box printed `harness=diverged:5712e52776c8` for a state the two questions describe
+differently, so a diagnosis made against the checkout described code the box was not running.
+
+A box that answers **both** questions cleanly carries **no `harness=` token at all** — its token is
+`[current]` inside the `OK:` line. Only a box that does NOT match gets one, because a token in a
+dispatch row is a claim that something is wrong:
+
+| summary token | question | what it means | what to do |
+|---|---|---|---|
+| *(none — `OK: … [current]`)* | (a)+(b) | the record names this commit AND `$O` holds exactly those bytes | nothing |
+| `harness=behind:<sha12>` | (a) | the box is recorded from `<sha12>`, an **ancestor** of the ref: a known, deliberate state | redeploy when you mean to adopt the new tip |
+| `harness=diverged:<sha12>` | (a) | `<sha12>` is **not an ancestor** of the ref — the box runs code main does not carry | find out why before redeploying |
+| `harness=uncommitted-edit:<file>` | (a) | `$O` holds bytes **no deploy wrote** (`<file>` differs from the record) — a hand patch | **recover the patch first**: a redeploy destroys it (§4.1 refusal) |
+| `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
+| `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
+| `harness=surface` | neither — another dir | `$O` itself is clean; a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) differs from `$REF` | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it |
+
+The refusal has **two directions**, and both matter: a file whose bytes differ from the record, and a
+file `$O` carries that the record never saw — *when the incoming source ships that name*, because that is
+the file the copy overwrites. (A hand-placed file the source does not ship is merely reported; the deploy
+does not delete it.) `harness-provenance.sh check` refuses a record that cannot describe itself — no
+record, an unreadable one, `files=0`, or a `files=` count that disagrees with the manifest below it — so a
+damaged record can never be the gate's "clean". Two more states are ROUTINE, not edits, and both are
+named as such so nobody goes looking for a patch that does not exist: a **`STALE-RECORD`** byte (the
+check) or a **`PENDING`** file (the writer) is `$O` already holding the *ref's / source's* bytes while the
+record predates them — what `deploy-mac-orchestrator.sh`'s phase-A-only run deliberately leaves behind;
+the remedy is a completed deploy, and nothing you wrote is discarded. And a record written from a
+checkout with uncommitted changes says **`sourceDirty=true`** instead of implying the commit owns those
+bytes — `show` prints `(SOURCE WAS DIRTY …)` beside the commit, and the check reports it as an identity
+problem (the legacy stamp called the same fact `agentInfraDirty`, and the better record used to MASK it).
+Two rules keep the gate honest in both directions:
+`--src` narrows the check to the files that deploy would actually WRITE (`--skip <relpath>` for a partial
+deploy such as `deploy-mac-orchestrator.sh`'s phase A, which never writes `orch-loop.sh`), and a `--src`
+that ships no files is **UNKNOWN**, not "nothing to discard". And `write` itself **refuses** to record a
+tree whose bytes differ from the source: a record may only ever describe a deploy, never bless a patch.
+
+`check-deployed-drift.sh` prints the question beside each line (`DRIFT(record):`, `DRIFT(identity):`,
+`DRIFT(checkout):`), and **a missing or unreadable record is exit 2 — UNKNOWN, never "clean"**. An
+unnameable alarm is weak, but silence is what lost the fix: with only `install.sh`'s legacy stamp there
+is no per-file manifest, so the report fails the run and *says* it cannot name the file.
+
+**A redeploy REFUSES to overwrite an uncommitted edit.** Measured 2026-10-28: a hand-applied fix to
+`$O/merge-one.sh` was reverted **twice** by redeploys (the file's mtime moved at 20:02 and again at
+20:15, after the patch), the box ran unpatched code, and a production fix looked like it had
+"stopped working". Both deploy paths now compare `$O` against its own record **before copying**, print
+every file they would discard with which side is newer, and exit **78 with nothing written**:
+
+```bash
+bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator
+#   REFUSING: /Users/me/orchestrator carries UNCOMMITTED EDITS that this deploy would OVERWRITE
+#   UNCOMMITTED-EDIT   merge-one.sh — … edited AFTER the record …
+#   → copy the patch aside (or land it in the repo), or re-run with --accept-discard
+
+bash scripts/deploy-mac-orchestrator.sh --dry-run     # the plan, and the refusal, writing nothing
+bash scripts/deploy-mac-orchestrator.sh --accept-discard   # discard them deliberately
+```
+
+`--dry-run` prints the **plan** (`new` / `unchanged` / `overwrite` per file) *before* the gate runs, so
+a run that would refuse shows both the refusal and the exact list `--accept-discard` would destroy; it
+exits `0` when the deploy would proceed and **`78` when it would refuse** (a dry run that reports a
+refusal with `0` would be the same silence in a new place). A ref that predates
+`harness-provenance.sh` ships no checker: the deploy then says **it cannot tell** what it would
+discard — it does not read as clean.
+
+A box with **no record at all** cannot prove what it would discard, so the deploy says so out loud
+instead of assuming it is safe — and it names the lever that works: **`--accept-discard`** proceeds and
+writes the record at the end, so every *later* deploy can tell an edit from its own bytes. (Writing a
+record by hand onto a box that is behind or half-deployed does NOT work — the writer refuses to describe
+bytes `$O` does not have, which is why neither deploy prints that as its remedy. A box that still holds
+exactly the ref it was deployed from can be recorded with
+`harness-provenance.sh write --o $O --src <checkout>/scripts/orchestrator-harness`.)
+
+**The alternative, and its price — a symlink farm.** `$O` may instead be symlinks into a git clone
+(`bin/harness doctor` reports that as `kind=linked-checkout`), which makes the commit answerable **by
+construction**: `$O/orch-loop.sh → <clone>/scripts/orchestrator-harness/orch-loop.sh`, so there is
+nothing to record and nothing to drift. The price is paid by anything that **writes into `$O`**, and
+the two shipped writers do NOT agree about it — measured on a farm-shaped target:
+
+* `deploy-harness.sh` **refuses** a symlink at the destination, per file, by name (`-L` leaf guard),
+  exit `1` — the farm is safe from it and its deploys simply never land;
+* `scripts/deploy-mac-orchestrator.sh` installs *stage-then-rename* (`cp` to a temp path in the same
+  directory, then `mv -f`), and a rename over a symlink **replaces the LINK**, so the same deploy
+  silently converts the farm entry into a regular copy of the ref and exits `0`. Nothing fails and
+  nothing warns: the farm is unwound one file at a time, and the next `doctor` no longer says
+  `kind=linked-checkout`.
+
+So the farm is a **choice about who owns the bytes**, not a free upgrade: it suits a box that tracks
+one clone exactly, and it must be paired with a discipline that never runs a copying deploy into `$O`
+— including `--dry-run`-first habits, because the macOS route will not tell you. A fix applied "in
+place" on a farm also edits the checkout itself (its own, different, blast radius). The record +
+manifest path above is what a box that is copied into every deploy should use.
 
 ### Tuning (10-core / 32 GB box — the values that were actually used)
 
