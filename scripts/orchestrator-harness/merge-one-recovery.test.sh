@@ -128,7 +128,16 @@ printf '%s\n' "\$*" >> '$MRG/recorder-calls'
 # comment runs as COMMAND SUBSTITUTION here.
 case "\$1" in
   --check-carry)
+    # ⛔ STDERR BEFORE THE TOKEN, ON PURPOSE (fresh review of #3037, P1/P2). The real verb writes its
+    # diagnosis to STDERR and its answer to STDOUT — and on the degraded paths it writes a STDERR
+    # line BEFORE the token (`record-review.sh:1596` the #1398 local-digest notice, `:1802-1826` the
+    # #2982 could-not-compute block). A replica that only ever printed the token made the suite GREEN
+    # over a worker that read line 1 of the MERGED streams as the token, which turned `3:unreadable`
+    # into `3:<warning text>`, matched no arm, and bought the review. The knob exists so that
+    # population is DRIVEN, not assumed.
+    [ -n "\${FAKE_CC_STDERR:-}" ] && printf '%s\n' "\$FAKE_CC_STDERR" >&2
     if [ -f '$MRG/recovered' ] && [ -n "\${FAKE_CC_TOKEN_AFTER:-}" ]; then
+      [ -n "\${FAKE_CC_STDERR_AFTER:-}" ] && printf '%s\n' "\$FAKE_CC_STDERR_AFTER" >&2
       printf '%s\t-\t-\n' "\$FAKE_CC_TOKEN_AFTER"; exit "\${FAKE_CC_RC_AFTER:-0}"
     fi
     printf '%s\t-\t-\n' "\${FAKE_CC_TOKEN:-unknown}"; exit "\${FAKE_CC_RC:-0}" ;;
@@ -202,6 +211,7 @@ run_merge() {
         PI_COUNT="$MRG/pi-count" FAKE_PR="$PR" FAKE_HEAD="$HEAD" \
         FAKE_BODY_FILE="$MRG/pr-body" \
         FAKE_CC_TOKEN="${FAKE_CC_TOKEN:-unknown}" FAKE_CC_RC="${FAKE_CC_RC:-0}" \
+        FAKE_CC_STDERR="${FAKE_CC_STDERR:-}" \
         REQ="pipeline-compliance" \
         FAKE_CC_TOKEN_AFTER="${FAKE_CC_TOKEN_AFTER:-}" FAKE_CC_RC_AFTER="${FAKE_CC_RC_AFTER:-0}" \
         FAKE_RECOVER_RC="${FAKE_RECOVER_RC:-1}" FAKE_RERECORD_RC="${FAKE_RERECORD_RC:-0}" \
@@ -257,7 +267,7 @@ rc=0; rail_ran || { rc=1; note "the rail NEVER RAN after a successful --recover-
 ck "RED→GREEN(exit-0): a record RESTORED from the signed body marker is merged (not just restored)" $rc
 rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
 ck "RED→GREEN: …with no paid review" $rc
-rc=0; recorder_saw "--recover-body $PR" || { rc=1; note "calls: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
+rc=0; recorder_saw "--recover-body $PR $OR" || { rc=1; note "calls: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
 ck "…asked --recover-body for THIS PR and repo" $rc
 
 # ══ 4) `nodigest` / `carry-patch` say RE-RECORD, never RE-REVIEW ═════════════════════════════════
@@ -466,6 +476,76 @@ mkmrg; mkrecorder; write_record "$OLDH" clean
 out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0 FAKE_MINT_MARKER=0)"
 rc=0; grep -qF -- 'comment:<the reviewer comment id' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
 ck "…and the CARRY path names the placeholder (no reviewer ran, so it must not print a bare 'comment:')" $rc
+
+# ══ 15) THE PRODUCER WRITES STDERR BEFORE THE TOKEN ON THE DEGRADED PATHS (fresh review, P1) ══════
+# `record-review.sh` answers on STDOUT and diagnoses on STDERR, and on exactly the population this
+# block exists for it writes the diagnosis FIRST: `:1596` (the #1398 local-digest notice — a HEALTHY
+# `carry` on a >300-file PR) and `:1802-1826` (the #2982 could-not-compute block, i.e. `unreadable`).
+# Reading line 1 of the MERGED streams as the token turned `3:unreadable` into `3:<warning text>` — an
+# answer no `case` pattern matches — so every degraded read fell to the "a fresh review is owed" arm
+# and bought the 20-40 minute review this block exists to prevent, while the DIFFREAD_TRIES bound went
+# inert in the one population it was added for.
+WARN='⚠️ #2982: could not compute this PR diff hash — the API could not be reached (transient: gh auth/network)'
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3 FAKE_CC_STDERR="$WARN")"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a STDERR diagnosis before the token made 'unreadable' unreadable, and a PAID review was ordered"; }
+ck "RED→GREEN: a producer that warns on STDERR before answering 'unreadable' still pays for NO review" $rc
+rc=0; rail_ran && { rc=1; note "the rail ran on an unreadable read"; }
+ck "…and still merges nothing" $rc
+rc=0; log_has "check-carry stderr:" || { rc=1; note "the recorder's diagnosis never reached the log: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and its STDERR diagnosis is still logged (separating the streams must not swallow it)" $rc
+# The same warning shape on the HEALTHY `carry` answer (the #1398 >300-file population) must carry.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0 \
+                 FAKE_CC_STDERR='ℹ️ #1398: the API cannot render this PR diff (it exceeds the 300-file cap); the review digest was computed from the LOCAL checkout')"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a leading #1398 notice turned a HEALTHY 'carry' into a paid review"; }
+ck "RED→GREEN: a leading '#1398' notice does not turn a healthy 'carry' into a paid review" $rc
+rc=0; rail_ran || { rc=1; note "the rail NEVER RAN on a warned 'carry'"; }
+ck "…and the carry still reaches the MERGE" $rc
+# …and the bound still fires when the diagnosis is on stderr every cycle.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+for cyc in 1 2; do
+  out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3 FAKE_CC_STDERR="$WARN" DIFFREAD_TRIES=3)"
+done
+out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3 FAKE_CC_STDERR="$WARN" DIFFREAD_TRIES=3)"
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "the cap did NOT fire with a stderr diagnosis present (tail: $(tail -3 "$MRG/o/logs/merge-$PR.log"))"; }
+ck "RED→GREEN: the diff-read cap still fires on the warned population (the bound is not bypassed by stderr)" $rc
+
+# ══ 16) AN UNWRITABLE COUNTER PARKS — IT MUST NOT LOOP 'exit 0' FOR EVER (fresh review, P2) ═══════
+# With `|| true` on the counter write, a read-only $O/state (or a stray DIRECTORY named
+# diffreadcount-<pr> — the shape this file already records for `reviewdisp-<pr>`) meant the count was
+# never persisted: DR_N was 1 every cycle, the cap could never fire, and the log said '(1/3)' for ever
+# while the worker looped `exit 0`. An INERT ENFORCER. `rev_budget_spend` (:1298) is the neighbour that
+# gets this right — its caller parks instead of assuming a budget it does not have.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+mkdir -p "$MRG/o/state/diffreadcount-$PR"          # a DIRECTORY cannot be written as a file
+out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3 DIFFREAD_TRIES=3)"
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "an unwritable counter did NOT park — the bound is best-effort and the loop is unbounded"; }
+ck "RED→GREEN: an UNWRITABLE diff-read counter parks instead of looping 'exit 0' for ever" $rc
+rc=0; grep -qF 'CANNOT BE WRITTEN' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and the reason says the counter could not be written, so the human is not told to wait" $rc
+
+# ══ 17) THE CARRY PATH'S REMEDY NAMES NO COMMENT IT CANNOT HAVE (fresh review, P3-4) ═════════════
+# `marker_how` said "If the reviewer's comment exists, record it by hand (… --evidence comment:…)" on
+# BOTH paths, but on the carry path NO REVIEWER RAN, so that premise is false and the remedy sends a
+# human hunting a comment id that cannot exist — the #2132 class this file names at :1651-:1654
+# ("a park whose reason names a call that was never made sends the human at the wrong tool").
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0 FAKE_MINT_MARKER=0)"
+rc=0; grep -qF 'no review was ordered this cycle' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "RED→GREEN: the CARRY path's remedy says NO review was ordered (the true precondition)" $rc
+rc=0; grep -qF "If the reviewer's comment exists" "$MRG/o/state/parkreason-$PR" 2>/dev/null && { rc=1; note "the carry path still prescribes a reviewer comment it cannot have"; }
+ck "…and never prescribes a reviewer comment on the arm where no reviewer ran" $rc
+rc=0; grep -qF 'AI_REVIEW_GATE_KEY' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and names the remedy that CAN work there (provision the key, or run a review)" $rc
+
+# ══ 18) §3's LABEL IS TRUE: the recover call carries the REPO too ══════════════════════════════
+# `recorder_saw` is a substring grep, so '--recover-body 7' passed with the repo argument deleted;
+# `record-review.sh:2061` refuses without it. Pinned as the full argv shape.
+mkmrg; mkrecorder
+out="$(run_merge FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=head)"
+rc=0; recorder_saw "--recover-body $PR $OR" || { rc=1; note "calls: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
+ck "RED→GREEN: --recover-body is asked for THIS PR AND THIS REPO (the recorder refuses without it)" $rc
 
 echo
 echo "==> $pass passed, $fail failed"
