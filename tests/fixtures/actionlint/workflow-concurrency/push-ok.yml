@@ -1,0 +1,11 @@
+# FAILURE-CLASS FIXTURE (positive): a push-triggered workflow with NO concurrency block — the
+# default-branch run is never cancelled, which is exactly what R2 requires.
+name: push-ok
+on:
+  push:
+    branches: [main]
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

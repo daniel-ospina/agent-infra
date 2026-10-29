@@ -1,0 +1,12 @@
+# A `pull_request` group keyed on the PR number is correct: the number is per-PR and stable across
+# heads, so a superseded head lands in the same group. Refusing it was a false red (#2660 round 4).
+name: PR number key
+on: pull_request
+concurrency:
+  group: pr-number-key-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
