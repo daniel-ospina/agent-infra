@@ -497,9 +497,9 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
 # at all). Declared here so the reference is accounted for; the broader class is named in the STATED
 # LIMIT below rather than silently believed to be covered.
-# ⛔ FOUR ENTRIES ARRIVED AFTER THIS LIST DID, AND THE CENSUS WAS RED FOR THEM ON main (measured
+# ⛔ FIVE ENTRIES ARRIVED AFTER THIS LIST DID, AND THE CENSUS WAS RED FOR THEM ON main (measured
 # here at the merge onto main, 2026-10-28 — the equality is right, the list had simply fallen behind
-# the files: all four reference `brief-gate.sh`, none is a dispatch path):
+# the files: all five reference `brief-gate.sh`, none is a dispatch path):
 #   ai-drainer.sh            — a WORKER-shaped dispatch; it names the gate as the reason its role is
 #                              `worker` and not `prfix` (the #2910 note).
 #   ai-drainer.test.sh       — the suite that drives it.
