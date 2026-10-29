@@ -73,7 +73,7 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    | `dispatched` | the dispatcher ran and returned 0 — work was placed, or the queue was genuinely empty |
    | `deferred` | the machine said not now; the reason carries the measurement (`disk-floor:3481<4096`, `load-ceiling:…`, `cap-zero`) |
    | `refusing` | a read a pass needs could not be taken, or the dispatcher itself refused (rc=2) — **never** "nothing to do" |
-   | `placed-undelivered` | the work was placed and no worker took it (pr-doctor rc=3) — the pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted |
+   | `placed-undelivered` | legible work, **none of it out** (pr-doctor rc=3): no worker took an order that was placed, **or** a durable refusal stopped the order before delivery (`agent-infra#2710` — a dirty worktree, a queue parked under the 45-min cooldown the refusal created; measured for #2708). The pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted. ⚠️ The `reason` token on this row is still `no-worker-took-it` for both causes; the human line on stderr names both, and renaming the token is left to a change that can verify every reader |
    | `idle` | a `--dry-run` pass: measured and derived, dispatched nothing |
    | `skipped` | another pass held the lock, so this one attempted nothing. Written to its **own** file (`pr-repair.skip.json`) so a skipping process can never replace the lock holder's verdict; `--status` prints both |
 
