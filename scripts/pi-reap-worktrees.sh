@@ -2382,15 +2382,21 @@ run() {
         REAP_WT_LOCK_STALE_NOTE="REAP_WT_LOCK_STALE_SECONDS=$REAP_WT_LOCK_STALE_SECONDS did not exceed REAP_WT_BUDGET_SECONDS=$REAP_WT_BUDGET_SECONDS (a live owner's lock is broken by an age test that ignores the budget) — RAISED to $REAP_WT_LOCK_STALE_CLAMPED (4x the budget)"
         REAP_WT_LOCK_STALE_SECONDS="$REAP_WT_LOCK_STALE_CLAMPED"
     fi
+    # ⛔ A clamped lock horizon is REPORTED, never applied silently: it is an operator
+    # misconfiguration being corrected, and the artifact must say so. It is emitted
+    # HERE — before the lock is taken, not after it — because the clamp is applied
+    # BEFORE `lock_acquire` decides whether the lock is stale (that order is what
+    # keeps a live owner protected). A pass that then ABORTS on the lock would
+    # otherwise be corrected invisibly: the abort is about the lock, not the clamp,
+    # and a reader must still be able to see that the horizon in force was not the
+    # one configured.
+    [ -n "${REAP_WT_LOCK_STALE_NOTE:-}" ] && log_line "WARN $REAP_WT_LOCK_STALE_NOTE"
     if ! lock_acquire; then
         echo "FAIL-CLOSED abort: lock held ($LOCK_DIR) (exit 3)" >&2
         exit 3
     fi
 
     log "==== pi-reap-worktrees pass: MODE=$MODE repo=$REPO_CANON aged=${REAP_WT_AGED_DAYS}d main=${MAIN_CANON} now=$now ===="
-    # A clamped lock horizon is REPORTED, never applied silently: it is an
-    # operator misconfiguration being corrected, and the artifact must say so.
-    [ -n "${REAP_WT_LOCK_STALE_NOTE:-}" ] && log_line "WARN $REAP_WT_LOCK_STALE_NOTE"
     WT_TOTAL="$(printf '%s\n' "$WT_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 
     # ROTATION — see rotate_records(). The offset lives in the state dir so it
@@ -2405,8 +2411,15 @@ run() {
     # pass consume and overwrite its neighbour's cursor (offset_A % n_B). The
     # cursor then indexes an unrelated list on every alternation, and a repo whose
     # offset keeps landing near the head reintroduces the exact same-tail
-    # starvation this rotation exists to remove. Key it by REPO_CANON — the same
-    # invariant the per-repo lock already assumes.
+    # starvation this rotation exists to remove. Key it by REPO_CANON.
+    #
+    # ⛔ THE KEY IS THE OFFSET'S ALONE — it does NOT imply a per-repo LOCK, and the
+    # lock is NOT per-repo (review note, #2541). `LOCK_DIR="$STATE_DIR/pi-reap-worktrees.lock"`
+    # carries no repo component and disk-reaper.sh hands every repo the same state
+    # dir, so two repos' passes DO contend: a young or unverifiable lock fail-closes
+    # the next pass at `lock_acquire`. An earlier draft of this comment cited the
+    # lock as the precedent for the keying; that was wrong, and a reader would have
+    # concluded that per-repo passes never block one another.
     OFFSET_FILE="$STATE_DIR/pi-reap-worktrees$(printf '%s' "$REPO_CANON" | cksum | cut -d' ' -f1).offset"
     WT_OFFSET="$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)"
     case "$WT_OFFSET" in ''|*[!0-9]*) WT_OFFSET=0 ;; esac

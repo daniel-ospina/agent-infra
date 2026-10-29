@@ -475,7 +475,7 @@ run_reaper() {
     # disk-reaper suite (T3), against a LOCAL bare origin.
     HOME="$T/$envname/home" \
     PATH="$T/bin:$PATH" \
-    REAP_WT_STATE_DIR="$T/$envname/state" \
+    REAP_WT_STATE_DIR="${REAP_WT_STATE_DIR_OVERRIDE:-$T/$envname/state}" \
     REAP_WT_LOG="${REAP_WT_LOG_OVERRIDE:-$T/$envname/reap.log}" \
     REAP_WT_NOW_EPOCH="$nowval" \
     REAP_WT_DRY_RUN="${REAP_WT_DRY_RUN_OVERRIDE:-1}" \
@@ -593,6 +593,13 @@ ANCHORS = {
     "no-stash-unverifiable-arm": (
         "        unreadable)\n            printf \x27preserve\\tstranded-stash-unverifiable",
         "        __mutant_arm_removed__)\n            printf \x27preserve\\tstranded-stash-unverifiable",
+    ),
+    # the ROTATION cursor per-repo key: drop the REPO_CANON component, i.e. return
+    # to the repo-agnostic filename the ⛔ comment in the script says was a real
+    # defect. R4 drives the crossover this restores (two repos, ONE state dir).
+    "no-per-repo-offset-key": (
+        "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees$(printf \x27%s\x27 \"$REPO_CANON\" | cksum | cut -d\x27 \x27 -f1).offset\"",
+        "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees.offset\"   # MUTANT: the per-repo key dropped",
     ),
 }
 s = open(src).read()
@@ -2613,6 +2620,128 @@ case "$_adv_tot" in ''|*[!0-9]*|0)
     fi ;;
 esac
 
+# ── R4: the rotation cursor's KEY is per-repo — DRIVEN, not asserted ─────
+# ⛔ (review P1, #2541) R2 drives exactly ONE repo, so a REPO-AGNOSTIC filename
+# (`$STATE_DIR/pi-reap-worktrees.offset`) also matches `*.offset` EXACTLY ONCE and
+# R2 passes UNCHANGED on the pre-fix shape it claims to discriminate. The crossover
+# the script's ⛔ comment describes exists only when TWO repos share ONE state dir —
+# which is exactly what disk-reaper.sh does (it drives one reaper per repo and hands
+# every one the SAME `REAP_WT_STATE_DIR`). So this fixture drives repo A and repo B
+# through ONE shared state dir, in that order, and asserts (i) two cursors exist,
+# (ii) repo B's pass leaves repo A's cursor UNTOUCHED, and (iii) each pass's
+# artifact NAMES the file it wrote. The last leg re-runs both passes against a
+# MUTANT with the key dropped: the crossover MUST reappear there, which is what
+# makes (i)-(iii) discriminating instead of decorative.
+ENV=R4; SHARED_R4="$T/$ENV/state"; mkdir -p "$SHARED_R4"
+REPO_R4A="$(mk_repo R4a)"; REPO_R4B="$(mk_repo R4b)"
+add_named_wt "$REPO_R4A" R4a-1 feat/r4a-1 >/dev/null
+add_named_wt "$REPO_R4A" R4a-2 feat/r4a-2 >/dev/null
+add_named_wt "$REPO_R4A" R4a-3 feat/r4a-3 >/dev/null
+add_named_wt "$REPO_R4B" R4b-1 feat/r4b-1 >/dev/null
+add_named_wt "$REPO_R4B" R4b-2 feat/r4b-2 >/dev/null
+add_named_wt "$REPO_R4B" R4b-3 feat/r4b-3 >/dev/null
+# r4_pass <state-dir> <repo> <log> <env> [reaper] — one budget-limited pass.
+# Budget 2s vs the 3s/record status shim, so the pass consumes ONE record and
+# defers the rest: that is the only shape in which the cursor MOVES.
+r4_pass() {
+    REAPER_OVERRIDE="${5:-$REAPER}" \
+    REAP_WT_STATE_DIR_OVERRIDE="$1" REAP_WT_NOW_EPOCH_OVERRIDE="" \
+        GIT_BIN_OVERRIDE="$T/bin/git-slow-status" REAP_WT_STATUS_TIMEOUT=30 \
+        REAP_WT_ROTATE=1 REAP_WT_BUDGET_SECONDS=2 \
+        REAP_WT_LOG_OVERRIDE="$3" run_reaper "$4" --dry-run --repo "$2" >/dev/null 2>&1
+}
+# the cursor files present in a state dir — a shell glob, so "no match" is EMPTY
+# rather than a literal path that `-f` would silently reject
+r4_cursors() { local f; for f in "$1"/pi-reap-worktrees*.offset; do [ -f "$f" ] && printf '%s\n' "$f"; done; }
+# the cursor file a pass's OWN artifact names (from its `OFFSET advanced` line)
+r4_named() { sed -n 's/.*offset-file=\(.*\))$/\1/p' "$1" 2>/dev/null | tail -1; }
+
+r4_pass "$SHARED_R4" "$REPO_R4A" "$T/$ENV/a.log" R4a
+R4_A_FILE="$(r4_cursors "$SHARED_R4")"
+R4_A_CUR="$(cat "$R4_A_FILE" 2>/dev/null || echo MISSING)"
+assert_eq "$(printf '%s\n' "$R4_A_FILE" | grep -c .)" "1" \
+    "R4 precondition: repo A's pass wrote EXACTLY ONE cursor into the shared state dir"
+r4_pass "$SHARED_R4" "$REPO_R4B" "$T/$ENV/b.log" R4b
+R4_B_FILES="$(r4_cursors "$SHARED_R4")"
+R4_A_NAMED="$(r4_named "$T/$ENV/a.log")"; R4_B_NAMED="$(r4_named "$T/$ENV/b.log")"
+assert_eq "$(printf '%s\n' "$R4_B_FILES" | grep -c .)" "2" \
+    "R4 two repos through ONE shared state dir leave TWO cursors (a repo-agnostic filename leaves one — that IS the crossover)"
+assert_eq "$(cat "$R4_A_FILE" 2>/dev/null || echo MISSING)" "$R4_A_CUR" \
+    "R4 repo B's pass did NOT consume or overwrite repo A's cursor (offset_A % n_B)"
+assert_file "$R4_A_NAMED" "R4 repo A's artifact names the cursor file it wrote"
+assert_file "$R4_B_NAMED" "R4 repo B's artifact names the cursor file it wrote"
+if [ -n "$R4_A_NAMED" ] && [ -n "$R4_B_NAMED" ] && [ "$R4_A_NAMED" != "$R4_B_NAMED" ]; then
+    ok "R4 each pass writes its OWN cursor (A=$(basename "$R4_A_NAMED") B=$(basename "$R4_B_NAMED")) — the key, not the pass order"
+else
+    bad "R4 both passes name the SAME cursor file (A='$R4_A_NAMED' B='$R4_B_NAMED') — the filename is repo-agnostic, so repo B consumes repo A's cursor"
+fi
+# Mutation: drop the REPO_CANON component from the filename. The crossover the
+# key exists to remove must reappear — otherwise R4 proves nothing.
+MUT6="$T/mutant-no-per-repo-offset-key.sh"
+mutate_reaper_anchored "$MUT6" no-per-repo-offset-key
+SHARED_R4M="$T/$ENV/state-mutant"; mkdir -p "$SHARED_R4M"
+r4_pass "$SHARED_R4M" "$REPO_R4A" "$T/$ENV/ma.log" R4a "$MUT6"
+r4_pass "$SHARED_R4M" "$REPO_R4B" "$T/$ENV/mb.log" R4b "$MUT6"
+assert_eq "$(r4_cursors "$SHARED_R4M" | grep -c .)" "1" \
+    "R4 MUTATION: with the per-repo key dropped both repos collapse onto ONE cursor — the fixture DOES see the crossover"
+if [ -n "$(r4_named "$T/$ENV/ma.log")" ] && [ "$(r4_named "$T/$ENV/ma.log")" = "$(r4_named "$T/$ENV/mb.log")" ]; then
+    ok "R4 MUTATION: ... and repo B's pass names repo A's file, i.e. it consumed A's cursor (offset_A % n_B)"
+else
+    bad "R4 MUTATION: the mutant did not reproduce the crossover (A='$(r4_named "$T/$ENV/ma.log")' B='$(r4_named "$T/$ENV/mb.log")') — R4 is not discriminating"
+fi
+
+# ── L1: the LOCK_STALE > BUDGET clamp is DRIVEN, in three directions ────
+# ⛔ (review P1, #2541) That clamp MUTATES operator configuration at runtime, and it
+# had NO fixture: every budget in this suite was below 1800, so the branch never
+# executed — deleting the block, or flipping `-le` to `-ge`, kept all assertions
+# green. Three legs, because no single leg can pin both the branch and its
+# direction:
+#   (a) BUDGET 600 / LOCK_STALE 60, NO lock → the pass still CLASSIFIES, and the
+#       artifact REPORTS the raise by name AND value (the operator is told, never
+#       silently corrected) — the reviewer's (a)+(b).
+#   (b) the SAME config with a lock aged 120s: OLDER than the operator's 60s,
+#       YOUNGER than the clamped 2400s → the lock is still HELD (exit 3). This is
+#       the clamp's EFFECT and it also pins the ORDER (a clamp applied AFTER
+#       lock_acquire would read the 60s horizon, break the lock, and let two passes
+#       run concurrently). Delete the clamp or flip `-le`→`-ge` and 120 ≥ 60 reads
+#       as stale, so this leg returns 0.
+#   (c) LOCK_STALE 5000 > BUDGET 600 with a lock aged 3000s → HELD, and NOTHING is
+#       reported as raised: the clamp is conditional, so an operator horizon above
+#       the budget is honoured as given (an unconditional clamp to 4x would read
+#       3000 ≥ 2400 as stale and proceed).
+ENV=L1; REPO="$(mk_repo $ENV)"
+WT_L1="$(add_named_wt "$REPO" "$ENV-wt" feat/l1-wt)"
+OUT="$(REAP_WT_BUDGET_SECONDS=600 REAP_WT_LOCK_STALE_SECONDS=60 \
+    REAP_WT_LOG_OVERRIDE="$T/$ENV/clamp.log" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "L1a LOCK_STALE below the budget does not abort the pass"
+assert_contains "$(row_for "$OUT" "$WT_L1")" "reason=" \
+    "L1a ... the pass still CLASSIFIES (the clamp corrects a horizon, it never refuses)"
+assert_contains "$(cat "$T/$ENV/clamp.log" 2>/dev/null)" "REAP_WT_LOCK_STALE_SECONDS=60 did not exceed REAP_WT_BUDGET_SECONDS=600" \
+    "L1a the clamp is REPORTED in the pass artifact and NAMES both operands (not a silent rewrite)"
+assert_contains "$(cat "$T/$ENV/clamp.log" 2>/dev/null)" "RAISED to 2400" \
+    "L1a ... with the value it raised the horizon to (4x the budget)"
+ENV=L2; REPO="$(mk_repo $ENV)"
+mkdir -p "$T/$ENV/state/pi-reap-worktrees.lock"
+printf '%s\n' "$(( NOW - 120 ))" >"$T/$ENV/state/pi-reap-worktrees.lock/started"
+OUT="$(REAP_WT_BUDGET_SECONDS=600 REAP_WT_LOCK_STALE_SECONDS=60 \
+    REAP_WT_LOG_OVERRIDE="$T/$ENV/clamp.log" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" \
+    "L1b a lock aged 120s (past the operator's 60s, inside the clamped 2400s) is still HELD — the clamp's EFFECT, applied BEFORE the lock is taken"
+assert_contains "$(cat "$T/$ENV/clamp.log" 2>/dev/null)" "LOCK held (owner=" \
+    "L1b ... held as unverifiable-owner, never broken as stale"
+assert_contains "$(cat "$T/$ENV/clamp.log" 2>/dev/null)" "RAISED to 2400" \
+    "L1b the aborting pass still RECORDED the clamp it applied (a corrected horizon is never invisible, even on the abort path)"
+ENV=L3; REPO="$(mk_repo $ENV)"
+mkdir -p "$T/$ENV/state/pi-reap-worktrees.lock"
+printf '%s\n' "$(( NOW - 3000 ))" >"$T/$ENV/state/pi-reap-worktrees.lock/started"
+OUT="$(REAP_WT_BUDGET_SECONDS=600 REAP_WT_LOCK_STALE_SECONDS=5000 \
+    REAP_WT_LOG_OVERRIDE="$T/$ENV/ok.log" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "L1c LOCK_STALE above the budget is NOT clamped: a 3000s lock stays HELD under a 5000s horizon"
+assert_contains "$(cat "$T/$ENV/ok.log" 2>/dev/null)" "LOCK held (owner=" \
+    "L1c precondition: the leg really took the lock path (so the absence below is not empty-output vacuity)"
+assert_absent "$(cat "$T/$ENV/ok.log" 2>/dev/null)" "RAISED to" \
+    "L1c ... and nothing is reported as raised — the clamp is conditional, not universal"
+
 # ── M3/M4: the #2541 gates are load-bearing too ───────────────────────
 # A gate with no mutation is a gate nobody has proved is connected to the
 # decision. M4 proves E5 discriminates.
@@ -2629,9 +2758,12 @@ MUT4="$T/mutant-no-stash-gate.sh";  mutate_reaper_anchored "$MUT4" no-stash-gate
 
 # fail-closed: an UNEVALUABLE remote probe is NOT the decidable "no remotes"
 # answer (rc 0, empty output) — that is the fail-OPEN reading this path exists to
-# avoid. Deliberately a SEPARATE, remote-less fixture: with the two remotes the
-# M3 fixture carries, the shimmed probe interacts with the open-PR slug probe and
-# the fixture stops isolating gate 3.
+# avoid. Deliberately a SEPARATE, remote-less fixture: a repo that DOES carry a
+# GitHub `origin` would let the shimmed probe interact with the open-PR slug probe
+# and the fixture would stop isolating gate 3. (The M3 fixture this note used to
+# cite was removed with the unpushed-commit VETO — see the M3 note above — so the
+# requirement is stated on its own, not by cross-reference to a fixture that is
+# deliberately gone.)
 ENV=M3b; REPO="$(mk_repo $ENV)"
 WT_M3B="$(add_named_wt "$REPO" "$ENV-wt" feat/m3b)"
 commit_in_wt "$WT_M3B" "$OLD_DATE" m3b
