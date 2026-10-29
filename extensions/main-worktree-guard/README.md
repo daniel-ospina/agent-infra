@@ -102,6 +102,17 @@ SHELL expands at runtime — `$`/backtick, glob (`*`, `?`, `[...]`), brace
 command word (`~/undo.sh`, `sub/undo.sh` is READ instead), inside an
 interpreter `-c` payload / `eval` payload / a nested script, or as a piped
 producer (`cat ./undo*.sh | bash`, `F=./undo.sh; cat $F | bash`; #1228),
+**except in a SANCTIONED script's own body** — `SANCTIONED_SCRIPT_RELPATHS`
+entries are exempted from the whole content walk, path-keyed for the guard's own
+module root (the #1129 anchor, unchanged) and digest-plus-closure-keyed inside
+any other framework checkout (#2332 arm 2). **This (#1228) arm is now
+digest-keyed on BOTH arms**, because it is raised while READING the file:
+`scripts/gh-shim/gh` carries
+`grep -qa '<marker>' <(head -c 8192 2>/dev/null < "$1")`, whose process
+substitution matches the expansion predicate, so path-spelled invocations of the
+shim were refused as an unreadable script (measured 2026-10-24). So arbitrary
+bytes at a sanctioned relpath no longer stand down the expansion refusal — the
+shipped bytes do — and the `#1228` arm still fires for every unaudited script,
 a command-position `$NAME` whose assignment in effect at that point is
 path-shaped but not statically readable (`S=$(pwd)/undo.sh; $S`, `+=` onto a base
 it cannot read), or whose parameter expansion uses a SUBSTRING operator
@@ -265,21 +276,125 @@ The exemption is applied to the harvested **set**, never to the command:
 `sets[0]` (the command's own argv) always carries `script: null` and is always
 gated, and a script reached through a second hop keeps its own set — so
 `bash …/hub-worktree.sh && git checkout -- <dirty>` is still blocked. It reuses
-`_sanctionedScriptExemption` (`SANCTIONED_SCRIPT_RELPATHS` realpath'd under the
-guard's own checkout — one list, one anchor) and writes an
+`_sanctionedScriptExemption` (`SANCTIONED_SCRIPT_RELPATHS` — see the #2332
+section below for how it is identified: the module's own checkout OR a
+sanctioned relpath inside any framework checkout whose bytes match the pin) and
+writes an
 `m5_script_exemption` audit row **only when a set was actually dropped**,
 aggregated **by realpath** (the same sanctioned file can be pushed as two sets in
 one command, and summing the push sites double-counted — the count is folded with
 `max` per file, since one realpath always yields the same discard list), and the
 row records `sets_exempted` / `discards_dropped` / `discard_forms` — a row that
 says only "an exemption fired" cannot answer "did this exemption suppress a
-block?". **A file at the same relpath in another
-checkout — a linked worktree's own `scripts/` copy included — is a different
-realpath and stays gated**: a linked-worktree copy is agent-WRITABLE, so
-exempting it would hand an unhatched `pi -p` fixer a silent way to discard the
-very mutant M5 exists to protect. Sessions that need the helper from a linked
-worktree address the framework checkout's own path (the anchor is the file's
-realpath, not the invoking cwd).
+block?". **A file at the same relpath in a tree that is NOT a framework
+checkout stays gated** (the #1129 boundary, `(c)`/`(c3)` in the suite) — that
+includes a linked worktree's own `scripts/` copy **once its bytes or its
+delegates differ from the pin**; a framework tree at the pinned bytes is
+exempt by design (see the #2332 section). Sessions that need the helper from a
+linked worktree address the framework checkout's own path.
+
+**#2332 — the exemption is keyed on the script's IDENTITY, not on one literal
+path (#2332, third instance of the #1141 class).** The check used to be a
+realpath STRING EQUALITY against `resolve(_frameworkRoot, rel)`, where
+`_frameworkRoot` is the directory the guard MODULE was loaded from. That is
+correct only where the guard and the scripts live in one tree, and pi's
+deployment does not guarantee it: on a copy-deployed box the module root is
+`~/.pi/agent`, whose `scripts/` is a PARTIAL surface that does **not** contain
+`admin-merge.sh` (#2176), while the rail's real home is
+`$AGENT_INFRA_PATH/scripts/`. Measured 2026-10-22 from a hub-rooted session:
+
+```
+⛔ Script execution blocked — script content contains a blocked git operation (#1484).
+   /tmp/cell-ai/scripts/admin-merge.sh
+   (script location: the shared main checkout)
+```
+
+— i.e. the chokepoint that computes the failing set before an `--admin` merge
+was unrunnable, and the only routes left were the hatch or a bare `gh pr merge`
+that skips every comparison the rail makes. **Fixing it by trusting a path
+would not be a fix** (a path is purchasable: `git init` + the two fingerprint
+files, or a ref it can repoint), and fixing it by trusting CONTENT alone is the
+rule #1485 rejected (the same bytes at any path). So the exemption verifies the
+PROGRAM, in three parts, and names exactly one artifact:
+
+| part | what it rules out |
+|---|---|
+| the file IS at a `SANCTIONED_SCRIPT_RELPATHS` entry, inside a directory carrying the framework's two fingerprint files (`manifest.json`, `pi-bootstrap/setup.sh`) | a relpath that is not sanctioned, and a directory that is not a framework tree at all — this is the part that confines the exemption (`(c3)` in the suite) |
+| its sha256 EQUALS the value pinned in `sanctioned-scripts.pin.json` | any script merely RENAMED to `admin-merge.sh` — the "arbitrary script pretending to be the rail" case a filename rule cannot see |
+| **every file it executes BY ITS OWN LOCATION** (`$SELF_DIR/x`, `$(dirname "$0")/x`) also hashes to its pin | the pinned leaf used as a LAUNCHER: the rail runs `$SELF_DIR/ci_exemption.py` — its own grader — and the shim runs `$SELF_DIR/../verify-admin-merge-evidence.sh`, while the walk is skipped for the whole invocation, so a leaf-only pin let a forged root run arbitrary content (reproduced at review, now `(d)` in the suite) |
+
+⚠️ **What this does NOT claim.** The ingredients are each purchasable — a
+repo, its two fingerprint files, and the audited bytes themselves (they are
+shipped, so they can be copied). The property that survives is about the
+PROGRAM, not the path: with the closure pinned, a forged tree must reproduce the
+audited rail **and** every helper it executes, so the program that runs is the
+sanctioned one. That is also why the exemption is deliberately
+root-agnostic among framework trees — a linked worktree of this framework
+holding the submitted bytes IS exempt (measured), and pretending otherwise
+would be the more dangerous kind of doc error. What is refused is any tree whose
+executed program deviates by one byte from the pin, and any file whose
+delegates are not the audited ones.
+
+⚠️ **Recorded residual (pre-existing, identical under arm 1):** the audited
+scripts honour their own environment seams — `admin-merge.sh` reads
+`ADMIN_MERGE_FAILURE_SET_SH`, `ADMIN_MERGE_GH` and `BASH` — so a caller that
+EXPORTS one of those still redirects audited code at an agent-chosen program.
+This exemption neither creates nor widens that seam (arm 1 on the `~/.pi/agent`
+farm has it too, today); it is filed separately rather than silently implied to
+be closed.
+
+⚠️ **Recorded residual (this arm's own, #2365):** the pinned set is a NAMED set,
+not an EXACT set, so an EXTRA file dropped beside a pinned delegate and loaded
+IMPLICITLY is neither pinned nor noticed — reproduced at review with a
+`scripts/re.py` next to `scripts/ci_exemption.py` (`python3 <path>/ci_exemption.py`
+puts that directory first on `sys.path`, so `import re` ran the injected module).
+The exemption still never admits a tree that ships exactly the pinned program;
+what it does NOT yet refuse is a tree that ships the pinned program **plus** an
+unpinned file the program picks up by name. Closing it needs the pin to
+enumerate every file under the closed directories — a pin-format change, filed
+as agent-infra #2365 and deliberately not attempted here.
+
+The pin is data read by the code that enforces it, so it is **read at module
+load** — not on the first exemption check: on a copy-deployed box the module tree
+is writable, and a lazily-populated cache would accept a pin the session rewrote
+BEFORE that first check ran. Reading at load puts the pin on the same footing as
+the code that enforces it: forging the pin now needs the same restart an
+`index.ts` edit needs, instead of merely happening before the first use. (The
+pre-start window — rewrite, THEN restart — is the declared successor in #2365: a
+digest of the pin compiled into `index.ts`.) The pre-existing
+module-root arm is kept UNCHANGED, so nothing that ran before stops running —
+the new arm only adds the case the old one could not match. The pin is re-cut by
+
+```
+node extensions/main-worktree-guard/test-sanctioned-identity.mjs --cut
+```
+
+in the SAME commit that changes a listed script **or anything it executes by its
+own location** (the closure is recomputed from the script text, so a new
+`$SELF_DIR/helper.sh` appears automatically); `test-sanctioned-identity.mjs`
+reds when the pin is stale, when a listed script is DELETED without re-cutting,
+and when the closure is incomplete — so none of those can reach main silently.
+
+**Freshness is a property of a COMMIT (#2818).** The pin and the sanctioned
+surface it pins are read from ONE tree: the working tree by default (a push to
+`main`, or a checkout of the change itself) or the commit named by
+`--ref <rev>`, which is what the PR job passes (the PR head). It must NOT be
+judged on GitHub's synthetic merge of head onto the base tip — a merge result
+takes each file from whichever side changed it, so a branch that re-cut its pin
+beside its OWN sanctioned-script edit ended up carrying that pin next to scripts
+an unrelated merge had changed on `main`. The verdict then tracked how far `main`
+had moved, and every merge re-opened the failure on every other open PR. The
+polarity is unchanged — untouched surface ⇒ pass however far the base moved;
+edited surface without a re-cut ⇒ fail; edited + re-cut ⇒ pass — and is pinned,
+together with the merged-tree inversion that proves the fix is load-bearing, by
+`test-sanctioned-pin-merge-base.mjs`.
+
+Every failure path (no pin, no framework root, unreadable file, hash mismatch,
+missing or changed delegate, empty closure) returns "not exempt" — the content
+walk then runs exactly as before, so the guard's fail-closed direction is
+untouched. The `m4_script_exemption` audit row now carries
+`sanctioned_via: module-root | identity`, because "which arm granted this" is
+the question this issue is made of.
 
 Two adjacent defects were fixed in the same pass, both found by the fresh-context
 review of this change. (1) The pipe-seed walk kept the shell **quotes**: the
