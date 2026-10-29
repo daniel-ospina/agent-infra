@@ -1,0 +1,15 @@
+# Two DIFFERENT workflows spelling the group with the canonical format() idiom are disjoint at runtime
+# (Alpha-<ref> vs pr-workflow-format-b-<ref>) and must not be refused as sharing a group. The identity
+# hides behind `format('{0}-{1}', github.workflow, …)`, where a template-level sed cannot resolve it
+# because the `}` inside '{0}' closes its pattern first (#2660 round 11). Pairs with -b.
+name: pr-workflow-format-a
+on:
+  pull_request:
+concurrency:
+  group: ${{ format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
