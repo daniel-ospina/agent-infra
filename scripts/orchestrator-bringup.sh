@@ -82,7 +82,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 LABEL="com.eldato.orchestrator-loop"
 
-say()  { printf '%s\n' "$*"; }
+log_line()  { printf '%s\n' "$*"; }
 ok()   { printf 'ok: %s\n' "$*"; }
 warn() { printf 'warn: %s\n' "$*" >&2; }
 # A refusal is ONE line: the actionable sentence, on stderr, with rc=1. Anything the operator needs
@@ -159,6 +159,28 @@ if [ "$PLATFORM" = "cell" ]; then
 else
   ENV_FILE="${ENV_FILE:-$HOME/.config/orchestrator/bringup.env}"
   O="${O:-$HOME/orchestrator}"
+  # ── THE MAC'S PIN RECORDS (agent-infra#2231, mac pin parity) ────────────────────────────────────
+  # These were CELL-ONLY, and that is the whole divergence this closes: `harness_ctl_path()` below
+  # prefers `HARNESS_PIN_FILE` when it is set, so on a Mac it always fell back to
+  # `$HARNESS_BRINGUP` — the checkout the operator happened to run this from — and `deploy_harness`
+  # seeded `$O` from THAT. So the Mac had no pin record to read, reported `harness: <checkout>` in
+  # `status`, and answered "which commit is this box on?" differently from every cell.
+  # The same three spellings the cells use, under the Mac's own home: `~/.pi/agent/state/HARNESS-PIN`
+  # (sha), `~/.harness-path` (the dir the controller execs) and `~/harness` (the per-commit worktrees).
+  # ⛔ `~/harness`, NOT a path under `~/Documents`: launchd's bash is TCC-blocked from reading
+  # ~/Documents (the recorded reason setup.sh COPIES instead of symlinking, #427), so a pin root there
+  # would be unreadable by the very job that must exec it.
+  HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$HOME/harness}"
+  HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}"
+  # What `deploy_harness` seeds `$O` FROM. A pin that exists and can be read wins, because the
+  # controller execs THAT tree and the two surfaces must be one commit. An absent or unreadable record
+  # is NOT a rebind: `deploy_harness` then falls back to `$HARNESS_BRINGUP` exactly as before, so a
+  # box that has not been pinned yet still starts (and install.sh is what creates the pin).
+  HARNESS_SEED=""
+  if [ -f "$HARNESS_PIN_FILE" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+    _seed_pin="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+    if [ -n "$_seed_pin" ] && [ -d "$_seed_pin" ]; then HARNESS_SEED="$_seed_pin"; fi
+  fi
   SUPERVISOR=""
 fi
 # Which harness directory to consult. Defaults to the sibling `orchestrator-harness/` of this
@@ -353,7 +375,7 @@ reseed_candidates() {
 }
 
 cmd_reseed() {
-  say "==> reseed: deriving the machine-local config from the checkouts on this disk"
+  log_line "==> reseed: deriving the machine-local config from the checkouts on this disk"
   local found="" d n=0 want="${OR:-}"
   # An explicit REPO wins when it is genuinely usable here; discovery is the repair for the case where
   # nobody has a usable value (the measured one). Discovery is BOUNDED — a fixed list plus one
@@ -424,15 +446,15 @@ EOF
   REPO="$repo_path"; REPO_SRC="config file $ENV_FILE (reseeded)"
   OR="$derived";    OR_SRC="config file $ENV_FILE (reseeded)"
   ok "config $ENV_FILE now names REPO=$repo_path OR=$derived O=$O"
-  [ -z "$bak" ] || say "   previous config preserved at $bak"
-  say "   untouched: $O/.orch.lock, $O/state, the candidate files, and the repo's claim refs"
+  [ -z "$bak" ] || log_line "   previous config preserved at $bak"
+  log_line "   untouched: $O/.orch.lock, $O/state, the candidate files, and the repo's claim refs"
 }
 
 # ── check ──────────────────────────────────────────────────────────────────────────────────────
 # Every arm answers ONE question, and every arm that cannot answer says so with rc=2 rather than
 # letting the next line pass. Nothing here starts, writes or signals anything.
 cmd_check() {
-  say "==> check ($PLATFORM) — repo=${REPO:-<unset>} (${REPO_SRC:-<unset>})  state=$O"
+  log_line "==> check ($PLATFORM) — repo=${REPO:-<unset>} (${REPO_SRC:-<unset>})  state=$O"
 
   # 1. the configured repo path exists on THIS machine — the measured cell failure (see header).
   if [ -z "${REPO:-}" ]; then
@@ -516,8 +538,8 @@ cmd_check() {
   # 6. the per-repo registry: at most ONE live controller per (machine, repo).
   check_registry
 
-  say ""
-  say "BRINGUP CHECK OK — this machine can run a controller for $SLUG_REPO"
+  log_line ""
+  log_line "BRINGUP CHECK OK — this machine can run a controller for $SLUG_REPO"
   return 0
 }
 
@@ -638,28 +660,35 @@ RESOLVERS
 # performed, the resolver set is kept, and this returns non-zero naming what it refused to delete.
 # Returns 1 only in that state — a plain deploy (or one with nothing to remove) returns 0.
 deploy_harness() {
-  [ -d "$HARNESS_BRINGUP" ] || unknown "no harness at $HARNESS_BRINGUP — nothing to deploy into $O"
+  # ⛔ SEED FROM THE PINNED TREE, NOT FROM THE CHECKOUT THIS WAS RUN FROM (agent-infra#2231). The
+  # controller execs the pinned harness; the workers exec `$O`. Seeding `$O` from the operator's
+  # checkout made those two DIFFERENT COMMITS on the Mac — the same version skew `--pin-only` exists
+  # to avoid on a cell (`cloud-cell-supervisor.sh`'s `seed_and_stamp` seeds from `$HARNESS`, the pin).
+  # `HARNESS_SEED` is set on the Mac branch of the platform block above; on a cell it stays empty and
+  # this function is not the seeder at all (the supervisor's `seed_and_stamp` is).
+  local SRC_HARNESS="${HARNESS_SEED:-$HARNESS_BRINGUP}"
+  [ -d "$SRC_HARNESS" ] || unknown "no harness at $SRC_HARNESS — nothing to deploy into $O"
   mkdir -p "$O/logs" "$O/state" "$O/wip" || refuse "cannot create the state dir $O"
   local src f b tmp n=0 changed="" stale="" keep="" why conflict=0
   # ── THE PLAN, before anything is written ────────────────────────────────────────────────────────
   # Two halves, because they are two different risks: a shipped file whose bytes DIFFER is about to be
   # overwritten (a hand edit in $O is lost), and a file $O carries and the checkout does not is what
   # the mirror used to delete. An operator reading a plan can stop it; nobody reads an `rm` in a loop.
-  for src in "$HARNESS_BRINGUP"/*.sh; do
+  for src in "$SRC_HARNESS"/*.sh; do
     [ -f "$src" ] || continue
     b="$(basename "$src")"
     [ -f "$O/$b" ] || continue
     cmp -s "$src" "$O/$b" || changed="$changed $b"
   done
-  [ -z "$changed" ] || say "deploy: plan — replacing $(printf '%s' "$changed" | wc -w | tr -d ' ') file(s) in $O whose bytes differ from the checkout:$changed"
+  [ -z "$changed" ] || log_line "deploy: plan — replacing $(printf '%s' "$changed" | wc -w | tr -d ' ') file(s) in $O whose bytes differ from the checkout:$changed"
   for f in "$O"/*.sh; do
     [ -f "$f" ] || continue
     b="$(basename "$f")"
-    [ -f "$HARNESS_BRINGUP/$b" ] && continue
+    [ -f "$SRC_HARNESS/$b" ] && continue
     why="$(resolver_reason "$b")"
     if [ -n "$why" ]; then keep="$keep $b"; else stale="$stale $b"; fi
   done
-  for src in "$HARNESS_BRINGUP"/*.sh; do
+  for src in "$SRC_HARNESS"/*.sh; do
     [ -f "$src" ] || continue
     f="$(basename "$src")"; tmp="$O/.seed-$f.$$"
     cp -p "$src" "$tmp" || { rm -f "$tmp"; refuse "cannot stage $f into $O — check free space"; }
@@ -670,10 +699,10 @@ deploy_harness() {
   # ── the removal policy ─────────────────────────────────────────────────────────────────────────
   if [ -n "$stale" ]; then
     if [ "$PRUNE" = 1 ]; then
-      say "deploy: plan — --prune: removing $(printf '%s' "$stale" | wc -w | tr -d ' ') unshipped file(s) from $O:$stale"
-      for b in $stale; do rm -f "$O/$b" && say "deploy: removed $b"; done
+      log_line "deploy: plan — --prune: removing $(printf '%s' "$stale" | wc -w | tr -d ' ') unshipped file(s) from $O:$stale"
+      for b in $stale; do rm -f "$O/$b" && log_line "deploy: removed $b"; done
     else
-      say "deploy: $(printf '%s' "$stale" | wc -w | tr -d ' ') file(s) in $O are not shipped by the harness and are LEFT IN PLACE — a deploy does not delete from the live tree; 'start --prune' removes them:$stale"
+      log_line "deploy: $(printf '%s' "$stale" | wc -w | tr -d ' ') file(s) in $O are not shipped by the harness and are LEFT IN PLACE — a deploy does not delete from the live tree; 'start --prune' removes them:$stale"
     fi
   fi
   if [ -n "$keep" ]; then
@@ -684,13 +713,13 @@ deploy_harness() {
       warn "deploy: CONFLICT — --prune asked for a mirror, and a mirror would delete the resolver set named above; that removal was NOT performed. Retire one of those files by changing the resolver that names it, not by pruning $O"
     fi
   fi
-  if [ -f "$HARNESS_BRINGUP/gh-rest/gh" ]; then
+  if [ -f "$SRC_HARNESS/gh-rest/gh" ]; then
     mkdir -p "$O/gh-rest" || refuse "cannot create $O/gh-rest"
     tmp="$O/gh-rest/.gh.$$"
-    cp -p "$HARNESS_BRINGUP/gh-rest/gh" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$O/gh-rest/gh" \
+    cp -p "$SRC_HARNESS/gh-rest/gh" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$O/gh-rest/gh" \
       || { rm -f "$tmp"; refuse "cannot install $O/gh-rest/gh"; }
   fi
-  ok "deployed $n harness script(s) into $O from $HARNESS_BRINGUP"
+  ok "deployed $n harness script(s) into $O from $SRC_HARNESS"
   return "$conflict"
 }
 
@@ -774,7 +803,7 @@ cmd_start() {
   # exists to avoid).
   cmd_check >/dev/null || { local rc=$?; release_pending; return "$rc"; }
 
-  say "==> starting $PLATFORM controller for $SLUG_REPO"
+  log_line "==> starting $PLATFORM controller for $SLUG_REPO"
   local pid
   case "$PLATFORM" in
     cell) start_cell ;;
@@ -810,7 +839,7 @@ cmd_start() {
     || refuse "the controller is RUNNING as pid $pid but the registry record at $f could not be written — a second start for $SLUG_REPO would not be refused; fix the permissions on $(dirname "$f")"
   PENDING_FILE=""
   ok "controller RUNNING pid $pid ($PLATFORM, state dir $O)"
-  say "   stop it with: $0 stop"
+  log_line "   stop it with: $0 stop"
 
   # ── the REST of the fleet ────────────────────────────────────────────────────────────────────
   # Start is defined as "make every MISSING component present", driven by the same inventory the
@@ -818,8 +847,8 @@ cmd_start() {
   # cadence timer and the reapers are silently absent. A LATE component is left alone (it is alive;
   # killing a live process to "fix" lateness is a lane-killer) and a DUPLICATE is reported, never
   # reconciled by a kill.
-  say ""
-  say "==> ensuring the rest of the fleet"
+  log_line ""
+  log_line "==> ensuring the rest of the fleet"
   fleet_ensure_components "$(harness_ctl_path)"; local frc=$?
   # ⛔ A DEPLOY THAT COULD NOT HONOUR --prune IS A FACT ABOUT THE EXIT CODE. The conflict is about $O's
   # resolver set, not about the controller (which is up), so this reports rather than unwinds — but a
@@ -903,7 +932,12 @@ start_cell() {
     # and the real cause (apply failed) is never stated. Measured by review of #1856.
     refuse "the harness could not be pinned to ${HARNESS_REF:-the configured ref} in ${HARNESS_REPO:-this checkout} (see the apply output above) — no controller was started"
   fi
-  if ! bash "$SUPERVISOR" start; then
+  # ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THIS CALLER IS NOT THE SERVICE MANAGER (review P1 round 18,
+  # #2402). The unit exports `ORCH_FOREGROUND=1`, and a bring-up run from a lane shell inherits it through the
+  # tmux server the controller created; without this pin the exec branch fires and `exec`s the loop INSIDE
+  # this process — outside the unit's cgroup, so `systemctl stop` cannot end it, and the registry entry below
+  # is never recorded because the process was replaced. `harness-up` carries the same fence.
+  if ! env ORCH_FOREGROUND=0 bash "$SUPERVISOR" start; then
     refuse "cloud-cell-supervisor.sh start failed (see its output above) — no registry entry was recorded"
   fi
   STARTED_PID="$(await_pid roster_pid_from_status)"
@@ -962,15 +996,42 @@ launchd_job_for_state_dir() {
     args="$(printf '%s' "$flat" | sed -n 's:.*<key>ProgramArguments</key>[[:space:]]*<array>\(.*\)</array>.*:\1:p')"
     # The LAST <string> of the array is the program: every job in this fleet is `/bin/bash <script>`,
     # and a job with no ProgramArguments is not one of ours.
-    prog="$(printf '%s' "$args" | sed -n 's:.*<string>\([^<]*\)</string>.*:\1:p')"
-    case "$prog" in "$O"/*) ;; *) continue ;; esac
+    # ⛔ THE FIRST non-interpreter token (agent-infra#2231 follow-up): the program is now
+    # `<pin>/<entry>`, which is NOT under $O, so a `case "$prog" in "$O"/*)` filter made the installer's
+    # own job INVISIBLE to this scan — and the two-jobs ambiguity refusal below then never fired, so
+    # `start` adopted the stack job and left the pin-programmed loop job loaded (a second controller).
+    prog="$(printf '%s' "$args" | sed -n 's:.*<string>\([^<]*\)</string>.*:\1:p' \
+      | awk 'BEGIN{FS=OFS=" "} {for(i=1;i<=NF;i++){ if ($i ~ /^-/) continue; if ($i ~ /(^|\/)(ba|z|k)?sh$/ || $i ~ /\/env$/) continue; print $i; exit }}')"
+    # The ownership question is asked FIRST: a job that DECLARES this state dir (`O`) is this state
+    # dir's job wherever its program lives. A job that merely lives under $O is not (the stack
+    # supervisor, heartbeat, nightwatch, pr-doctor all do) — see the comment below.
+    job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
+    # ⛔ AN AUXILIARY IS NEVER THIS STATE DIR'S CONTROLLER, WHATEVER IT DECLARES. The shipped watchdog
+    # template declares EXACTLY this state dir (`templates/launchd/com.eldato.controller-watchdog.plist`
+    # `O` = `{{HOME}}/orchestrator`, which IS the Mac's `$O`) while its program lives under
+    # AGENT_INFRA_PATH — outside `$O`. So before this line, the `O` question alone counted the WATCHDOG
+    # as a controller, and on a box where the documented activation path had installed it
+    # (`install-launchd.sh`, ACTIVATION-MATRIX row 8) the scan returned TWO jobs and `start` refused
+    # "TWO launchd jobs" — `harness-up up` could not run on the very box this pin work exists for, and
+    # a watchdog is not a second controller (#2231 review).
+    # ⛔ AND IT IS AN EXCLUSION LIST, NOT AN ALLOW-LIST OF CONTROLLER NAMES: the box's controller shapes
+    # are open-ended — the stack supervisor (`$O/supervisor.sh`), an operator's renamed loop — and an
+    # allow-list makes them stop owning their OWN state dir, which silently turns a duplicate-controller
+    # refusal (#1761) into an adoption. The marker still has to be read from the DECLARATION (that is
+    # what makes a PIN-programmed loop visible at all, #2231), so what this narrows is which PROGRAMS
+    # may claim it.
+    case "$(basename "${prog:-}")" in
+      watchdog-loop.sh|orchestrator-heartbeat.sh|heartbeat-loop.sh|nightwatch.sh|pr-doctor.py) continue ;;
+    esac
+    if [ "$job_o" != "$O" ]; then
+      case "$prog" in "$O"/*) ;; *) continue ;; esac
+    fi
     # ⛔ A JOB THAT MERELY LIVES IN $O IS NOT THIS STATE DIR'S CONTROLLER JOB. On this box FOUR plists
     # run a program under $O — the stack supervisor, the heartbeat, `bg/nightwatch.sh`, pr-doctor — and
     # counting them all as owners made `start` refuse for ambiguity on the one box it has to work on
     # (measured 2026-10-21; the first version of this function did exactly that). The ownership marker
     # is the one the controller's own templates write: the job DECLARES this state dir (`O`), or it runs
     # the loop itself. An auxiliary installed under $O declares neither.
-    job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
     [ "$job_o" = "$O" ] || [ "$prog" = "$O/orch-loop.sh" ] || continue
     label="$(printf '%s' "$flat" | sed -n 's:.*<key>Label</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
     [ -n "$label" ] || continue
@@ -1047,7 +1108,7 @@ start_mac() {
   if [ -n "$ACTIVE_LABEL" ] && [ "$ACTIVE_LABEL" != "$LABEL" ]; then
     # ── ADOPT the job this box already runs ───────────────────────────────────────────────────────
     [ -f "$ACTIVE_PROG" ] || unknown "the launchd job $ACTIVE_LABEL runs $ACTIVE_PROG, and that file is not in $O after the deploy — starting it would exec a missing program; restore the file (it is in this box's resolver set, so the deploy never removes it) or fix the job, then re-run: $0 start"
-    say "==> launchd job $ACTIVE_LABEL already owns $O ($ACTIVE_PLIST) — starting THAT job; NOT rendering $LABEL, which would be a second job (and a second controller) for one state dir"
+    log_line "==> launchd job $ACTIVE_LABEL already owns $O ($ACTIVE_PLIST) — starting THAT job; NOT rendering $LABEL, which would be a second job (and a second controller) for one state dir"
     local state
     launchd_job_state "$ACTIVE_LABEL"; state="$JOB_STATE"
     case "$state" in
@@ -1136,7 +1197,7 @@ cmd_stop() {
         lowned="$(owned_pids)" || unknown "cannot verify whether the agent is still running (ps/etime unreadable) — refusing to report 'stopped' from an unreadable read"
         live="$(printf '%s\n%s\n' "$lpid" "$lowned" | awk 'NF && !s[$0]++')"
         [ -z "$live" ] || refuse "launchctl unload returned success but the agent is STILL RUNNING (pid $(pids_join "$live")) — check: launchctl print gui/$(id -u)/$LABEL"
-        say "controller stopped (launchd $LABEL)"
+        log_line "controller stopped (launchd $LABEL)"
       else
         # No agent file does NOT mean no controller: a controller started outside launchd (or whose
         # plist was removed by hand) is still live, and #1761's contradiction 2 is exactly that
@@ -1145,7 +1206,7 @@ cmd_stop() {
         if [ -n "$live" ]; then
           refuse "no launchd agent at $plist, but a controller IS running for this state dir (pid $(pids_join "$live")) — stop it by hand (kill $(pids_join "$live")), or give it an agent: $0 start"
         fi
-        say "not running (no agent at $plist, no controller process for $O)"
+        log_line "not running (no agent at $plist, no controller process for $O)"
       fi
       ;;
   esac
@@ -1178,7 +1239,7 @@ cmd_stop() {
   # `orchestrator-harness/launchd-cycle.sh`, the repo's one implementation of
   # stop/enable/(re)start that never writes a disable (#1975). Do not read this file's `bootout`
   # discipline as covering the controller's agent.
-  say ""
+  log_line ""
   fleet_stop_all "$(harness_ctl_path)" || warn "one or more fleet components could not be stopped (see above)"
   return 0
 }
@@ -1188,7 +1249,7 @@ cmd_stop() {
 # restarted under a stale environment. It is a composition of the two verbs above, deliberately: a
 # third implementation of start would be the fourth copy this entry point exists to prevent.
 cmd_restart() {
-  say "==> restarting the $PLATFORM fleet"
+  log_line "==> restarting the $PLATFORM fleet"
   # The stop runs in a SUBSHELL: `cmd_stop` owns an EXIT-path (`unknown …` exits 2) and must not be
   # able to end the restart before the start has been attempted. Its verdict is reported, not obeyed:
   # a controller that was not running is not a reason to skip starting it.
@@ -1209,7 +1270,7 @@ cmd_restart() {
     sleep 0.2; i=$(( i + 1 ))
   done
   [ -z "${alive:-}" ] || warn "a fleet process was still alive after the stop (pid $alive) — starting anyway; if both old and new are live, 'status' reports a DUPLICATE row"
-  say ""
+  log_line ""
   cmd_start
 }
 
@@ -1233,17 +1294,17 @@ cmd_status() {
       ident_err="$IDENTITY_MSG"; SLUG_REPO=""
     fi
   fi
-  say "platform:  $PLATFORM"
-  say "repo:      ${SLUG_REPO:-<unresolved>}  @ ${REPO:-<unset>}${REPO_SRC:+  (${REPO_SRC})}"
-  [ -z "$ident_err" ] || say "identity:  UNRESOLVED — $ident_err"
-  say "state dir: $O"
-  say "config:    $ENV_FILE$([ -f "$ENV_FILE" ] && printf ' (present)' || printf ' (absent)')"
+  log_line "platform:  $PLATFORM"
+  log_line "repo:      ${SLUG_REPO:-<unresolved>}  @ ${REPO:-<unset>}${REPO_SRC:+  (${REPO_SRC})}"
+  [ -z "$ident_err" ] || log_line "identity:  UNRESOLVED — $ident_err"
+  log_line "state dir: $O"
+  log_line "config:    $ENV_FILE$([ -f "$ENV_FILE" ] && printf ' (present)' || printf ' (absent)')"
   if [ "$PLATFORM" = "cell" ]; then
     local recorded=""; [ -f "$HARNESS_PIN_FILE" ] && recorded="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
-    say "harness:   ${recorded:-$(harness_ctl_path) (not pinned — running from the checkout)}"
-    [ -f "$O/.agent-infra-stamp.json" ] && say "stamp:     commit $(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1) relation $(sed -n 's/.*"relation": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
+    log_line "harness:   ${recorded:-$(harness_ctl_path) (not pinned — running from the checkout)}"
+    [ -f "$O/.agent-infra-stamp.json" ] && log_line "stamp:     commit $(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1) relation $(sed -n 's/.*"relation": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
   else
-    [ -f "$O/.agent-infra-stamp.json" ] && say "harness:   $(sed -n 's/.*"harness": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
+    [ -f "$O/.agent-infra-stamp.json" ] && log_line "harness:   $(sed -n 's/.*"harness": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
   fi
   local lp live own foreign undet=0 lp_set=0
   # ⛔ ONE UNREADABLE DATUM MUST NOT SUPPRESS THE WHOLE DELIVERABLE. `unknown` EXITS 2, and these three
@@ -1255,17 +1316,17 @@ cmd_status() {
   # datum — `_fleet_lock_owner` now abstains too, so both surfaces answer alike.)
   lp_set=0
   if ! lp="$(lock_pid)"; then
-    say "lock:      CANNOT DETERMINE (ps/etime unreadable)"
+    log_line "lock:      CANNOT DETERMINE (ps/etime unreadable)"
     undet=1; lp=""
   else
     lp_set=1
   fi
   if ! live="$(local_controller_pids)"; then
-    say "controller: CANNOT DETERMINE (the process table could not be read — see the table below)"
+    log_line "controller: CANNOT DETERMINE (the process table could not be read — see the table below)"
     undet=1; live=""
   fi
   if ! own="$(owned_pids)"; then
-    say "controller: CANNOT DETERMINE (which controllers belong to this state dir — see the table below)"
+    log_line "controller: CANNOT DETERMINE (which controllers belong to this state dir — see the table below)"
     undet=1; own=""
   fi
   foreign="$(comm -23 <(printf '%s\n' "$live" | awk 'NF' | sort -u) <(printf '%s\n' "$own" | awk 'NF' | sort -u))"
@@ -1278,12 +1339,12 @@ cmd_status() {
   if [ "$undet" = 1 ]; then
     :   # reported above; the table below carries the inventory's own UNKNOWN row
   elif [ -n "$own" ]; then
-    say "controller: RUNNING  pid $(pids_join "$own")  (lock: $lptxt)"
+    log_line "controller: RUNNING  pid $(pids_join "$own")  (lock: $lptxt)"
   elif [ -n "$foreign" ]; then
     # ⛔ SEEN IS NOT OWNED: this machine's harness is shared by every repo on it, so this pid may be
     # the other repo's controller. Naming it as this state dir's owner is the misattribution the
     # review reproduced (#1856).
-    say "controller: RUNNING  pid $(pids_join "$foreign") — NOT attributable to this state dir (the harness path is shared per box, so this may be another repo's controller; lock: $lptxt)"
+    log_line "controller: RUNNING  pid $(pids_join "$foreign") — NOT attributable to this state dir (the harness path is shared per box, so this may be another repo's controller; lock: $lptxt)"
   elif tmux has-session -t "=${SESSION:-orch}" 2>/dev/null; then
     # ⛔ NOT "RUNNING". Reviewer C measured this exact screen carrying `controller: RUNNING` beside the
     # fleet table's `controller … MISSING` — two answers to one question, in one command. The table's
@@ -1292,9 +1353,9 @@ cmd_status() {
     # controller, and saying RUNNING here is how a reader concludes the table is broken instead of the
     # controller. `-t =name` forces an exact match: plain `-t orch` PREFIX-matched, and on this box it
     # was satisfied by a session called `orch-controller`.
-    say "controller: NOT RUNNING  (tmux session ${SESSION:-orch} exists with no orch-loop.sh under it — see the table below; a supervisor that died can leave this)"
+    log_line "controller: NOT RUNNING  (tmux session ${SESSION:-orch} exists with no orch-loop.sh under it — see the table below; a supervisor that died can leave this)"
   else
-    say "controller: STOPPED"
+    log_line "controller: STOPPED"
   fi
   # ⛔ AND REPORT THE OTHER REPO EVEN WHEN THIS ONE OWNS A CONTROLLER. The `elif` above published the
   # foreign population only when this state dir owned nothing, so on a two-repo machine B's `status` —
@@ -1302,36 +1363,36 @@ cmd_status() {
   # read had it. `check` prints both; two answers to one question is the defect, and an unreported
   # population is how a reader over-reads a verdict (#1856 review; docs/ops/fleet-liveness.md §5).
   [ -z "$own" ] || [ -z "$foreign" ] \
-    || say "also seen:  pid $(pids_join "$foreign") — NOT attributable to this state dir (the harness path is shared per box); reported, never signalled"
+    || log_line "also seen:  pid $(pids_join "$foreign") — NOT attributable to this state dir (the harness path is shared per box); reported, never signalled"
   if [ -n "${SLUG:-}" ]; then
     local f v; f="$(registry_file "$SLUG_REPO")"; v="$(registry_verdict "$f" | tr '\t' ' ')"
-    say "registry:   $v$([ -f "$f" ] && printf '  (%s)' "$f")"
+    log_line "registry:   $v$([ -f "$f" ] && printf '  (%s)' "$f")"
   else
-    say "registry:   not consulted (repo identity unresolved)"
+    log_line "registry:   not consulted (repo identity unresolved)"
   fi
   if [ -f "$O/candidates.txt" ]; then
     local n mt age
     n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
     mt="$(date -r "$O/candidates.txt" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$(stat -c %Y "$O/candidates.txt" 2>/dev/null || echo 0)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
     age=$(( $(date +%s) - $(date -r "$O/candidates.txt" +%s 2>/dev/null || stat -c %Y "$O/candidates.txt" 2>/dev/null || date +%s) ))
-    say "candidates: ${n:-0} line(s), mtime ${mt:-?} (${age}s ago)"
+    log_line "candidates: ${n:-0} line(s), mtime ${mt:-?} (${age}s ago)"
     # ⛔ The read that catches "alive but dispatching nothing": refresh aborts leave this file at 0
     # lines, and the controller's cycle line keeps being fresh. Reported, never auto-repaired.
     if [ "${n:-0}" -eq 0 ]; then
       warn "the candidate file is EMPTY — a running controller with an empty backlog is the measured 'alive but dispatching nothing' state; check $O/logs/orch-loop.log for a refresh abort"
     fi
   else
-    say "candidates: <no file at $O/candidates.txt>"
+    log_line "candidates: <no file at $O/candidates.txt>"
   fi
-  [ -f "$O/heartbeat" ] && say "heartbeat:  $(( $(date +%s) - $(cat "$O/heartbeat" 2>/dev/null || echo 0) ))s ago"
+  [ -f "$O/heartbeat" ] && log_line "heartbeat:  $(( $(date +%s) - $(cat "$O/heartbeat" 2>/dev/null || echo 0) ))s ago"
 
   # ── THE FLEET TABLE ──────────────────────────────────────────────────────────────────────────
   # The screen above answers "is THE CONTROLLER alive". This answers the question the owner asked
   # and no surface answered: is EVERY fleet component alive, exactly once, and on this box at all.
   # The exit code is the worst row, so `status` stops being advice and becomes a verdict — the
   # controller can be perfectly healthy while `pr-doctor` has exited 2 for hours and no lander lands.
-  say ""
-  say "fleet components (declared in scripts/lib/fleet-inventory.sh):"
+  log_line ""
+  log_line "fleet components (declared in scripts/lib/fleet-inventory.sh):"
   local fleet_rc
   fleet_rows "$(harness_ctl_path)" | fleet_render_table
   fleet_rc=$?

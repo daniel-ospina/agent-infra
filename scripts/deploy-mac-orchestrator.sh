@@ -91,6 +91,7 @@ git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness | tar -x -C "$
 H="$STAGE/scripts/orchestrator-harness"
 [ -f "$H/claims.sh" ] || { log "FATAL: $SRC_REF has no claims.sh — refusing to deploy"; exit 1; }
 [ -f "$H/orch-loop.sh" ] || { log "FATAL: $SRC_REF has no orch-loop.sh"; exit 1; }
+# verified: $STAGE was `rm -rf`d and re-created one statement above and the archive was extracted into it, so the listing counts only what THIS run extracted — a per-file precondition already failed closed above it (#2121)
 log "staged $REV: $(ls "$H" | wc -l | tr -d ' ') entries"
 log "  claims.sh $(wc -c < "$H/claims.sh" | tr -d ' ') bytes, sha256 $(shasum -a 256 "$H/claims.sh" | cut -c1-16)"
 

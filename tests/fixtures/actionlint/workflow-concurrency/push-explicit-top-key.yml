@@ -1,0 +1,16 @@
+# A DOCUMENT-level explicit key. The refusal existed but sat after the column-0 branch, which skips
+# every line it cannot match — so the whole block was invisible and a cancelling push workflow read
+# GREEN, with R0 silent about a shape it could not read (#2660 round 7).
+name: Push explicit top key
+on:
+  push:
+    branches: [main]
+? concurrency
+:
+    group: push-explicit-top-key-${{ github.ref }}
+    cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
