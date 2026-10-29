@@ -1271,8 +1271,27 @@ case "$LAST" in
       marker_why="openssl IS NOT INSTALLED on this box, so the recorder here could not have signed a marker and no marker on this PR body can be verified"
       marker_how="Install openssl (a hard dependency of this path — the recorder signs with it and this worker verifies with it), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
     elif [ -z "$MARK_CAND" ]; then
-      marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body"
-      marker_how="the recorder's evidence post is best-effort and skips silently when the body read or PATCH fails, or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      # ⛔ THIS ARM HAS **TWO** CAUSES AND ONLY ONE OF THEM IS SERVED BY A HAND RE-RECORD (P3, fresh
+      # review of PR #2988). `marker_why` names `$LIVE_HEAD` — the head the GATE reads — but the
+      # remedy below records at `$HEAD`, the head this lane REVIEWED. Those are the same head when the
+      # post simply failed, and they are NOT when the head moved between the mint (`$HEAD`, the sha
+      # record-review.sh was handed) and the `LIVE_HEAD` read a few lines above:
+      #   * same head  ⇒ the recorder's best-effort evidence post did not land. The comment exists and
+      #     a hand re-record at `$HEAD` IS the remedy — and the `--expect-head "$HEAD"` pin verifies,
+      #     because the PR's live head is that same sha.
+      #   * head moved ⇒ the marker is absent for `$LIVE_HEAD` because it was minted for `$HEAD`. The
+      #     old remedy cannot work: it names `$HEAD`, and the pinned recorder now REFUSES it (rc=3,
+      #     "the PR head is <live>, NOT the <pin> you named") — the pin turned a working instruction
+      #     into one that provably fails, and re-recording at `$LIVE_HEAD` instead would attest a head
+      #     no review has read. A FRESH review at `$LIVE_HEAD` is owed, exactly as the two rc=3 arms
+      #     above reason. Discriminated rather than reworded, because one remedy cannot serve both.
+      if [ "${HEAD}" != "${LIVE_HEAD}" ]; then
+        marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body — the head MOVED after this run's mint: the record was minted for head=$HEAD, which is no longer the PR head"
+        marker_how="the record this lane paid for is for head=$HEAD and can never satisfy a gate that reads head=$LIVE_HEAD. Re-recording it by hand CANNOT work: the --expect-head pin refuses it (record-review.sh: 'the PR head is $LIVE_HEAD, NOT the $HEAD you named'), and minting at head=$LIVE_HEAD instead would attest a revision no review has read. So a FRESH review at head=$LIVE_HEAD is owed, not a carry — run the merge again for this PR once head=$LIVE_HEAD is the tree to land, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      else
+        marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body"
+        marker_how="the recorder's evidence post is best-effort and skips silently when the body read or PATCH fails, or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      fi
     elif printf '%s\n' "$MARK_CAND" | verify_any_marker "$MARK_KEY"; then
       marker_ok=1
     else
