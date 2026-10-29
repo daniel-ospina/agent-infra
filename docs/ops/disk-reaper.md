@@ -395,6 +395,31 @@ patch-ids against all of main's history (a reverted change still matches, and
 whitespace is ignored) and says nothing about whether any ref still holds the
 commit. Multi-commit squash merges do not match either, so they stay on the floor.
 
+**The survival allowlist has exactly ONE remove-eligible exception: `remote-holds` (#3041).**
+Survival is an **allowlist** — only `refs/heads/*` counts — because a remote-tracking,
+tag, stash or bisect ref is revocable by routine commands (`fetch --prune`,
+`fetch --prune-tags`, `stash drop`, `bisect reset`) and the commit would then be on
+nothing. That rule is right, and on its own it is **over-conservative against the remote
+itself**: a tip that was pushed and whose branch still exists on the remote is
+restorable with one `git fetch`, yet the allowlist preserved it for ever. The measured
+cost (pi-cell-4, 2026-10-29): `examined=52 classified=52 remove=0 preserved=52`, the box
+at **0 bytes free**, both repair loops at `cap: 0`, no cell able to dispatch for ~13 h;
+an operator then reclaimed 62 clean checkouts (7.7 GB) by hand, losing no commits.
+
+So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when a
+bounded `git ls-remote --heads <remote> refs/heads/<branch>` answers with **exactly this
+HEAD sha**. The advertised refname is matched literally (exactly once — `ls-remote`'s
+pattern argument fnmatches, so `?`/`[` in a branch name would otherwise widen it), and the
+remote is the **longest configured remote name** prefixing the ref, not the first path
+segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
+refname or different sha leaves the verdict where it was — `remote-only-ref`, PRESERVE — and a
+TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one timeout,
+not one per candidate. The row is `remote-holds:<remote>/<branch>`, and — unlike
+`remote-only-ref` — it **blocks the end-of-pass prune**: its evidence is one network read,
+not a local ref, so it sits in the same class as `detached-unreachable` (a record PRESENT at
+snapshot time and GONE at prune time carries no `prunable` flag, and the path-filterless
+prune would sweep its admin `HEAD`, the commit's last durable handle).
+
 A lane **scratch** checkout — a directory whose basename matches
 `REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
 `REAP_WT_SCRATCH_AGE_DAYS` (default `1`): a dead lane's throwaway dir is not a
@@ -573,7 +598,29 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
         removed=<n> failed=<n> late_preserved=<n> prune_blocked=<0|1> reasons=<reason>:<n>,…
         main_proof=<auto|local|unavailable|auto-unfetched|ambiguous>
         main_ref=<refs/heads/…|refs/remotes/…|?> pr_merged=<ok|na|unavailable>
+        verdict=<dry-run|reclaimed|idle|reap-ineffective|unmeasured>
 ```
+
+⛔ **`verdict=` is the pass's own ANSWER, and the counters alone cannot supply it (#3041).** A pass
+can be perfectly self-consistent (`examined=52 classified=52 remove=0 preserved=52`) while reclaiming
+NOTHING on a box at 0 bytes free — pi-cell-4, 2026-10-29: that pass was the whole incident, and every
+number in it was true. So the pass must also say what its numbers MEAN:
+
+| `verdict=` | condition |
+|---|---|
+| `dry-run` | the pass was not armed — nothing may be removed, and that is the correct answer |
+| `reclaimed` | armed, and at least one checkout was removed |
+| `idle` | armed, removed nothing, and the **reason** is benign: free space is at or above the floor, or too few records were classified for the ratio to mean anything |
+| `reap-ineffective` | armed, examined `>= REAP_WT_INEFFECTIVE_MIN_EXAMINED` (default 10) records, removed NONE, and free space is UNDER `REAP_WT_DISK_FLOOR_MB` (default 4096 MiB) — a reaper that cannot reclaim on a full box |
+| `unmeasured` | the condition depended on free space and `df` could not answer — **never** read as `idle` |
+
+⛔ **`reap-ineffective` also writes a durable record**, `$STATE_DIR/reap-ineffective`, atomically
+(tmp + `mv`), carrying `verdict=`, `epoch=`, `repo=`, `mode=`, the counters, `free_mb=`, `floor_mb=`,
+`reasons=` and a one-line `remedy=`. A **summary line is not a verdict**: the line is gone when the
+next pass prints, and the incident is only visible afterwards if something durably said so. Any pass
+that does NOT hold the condition REMOVES the file, so the record's presence means *the condition holds
+now* — not *it once held*. `REAP_WT_FREE_MB` (a witness) and `DF_BIN` are the test seams; the measured
+paths are `df -Pm <repo>` under `REAP_WT_DF_TIMEOUT`.
 
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
 `classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=` and
