@@ -575,8 +575,11 @@ if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   # path, so the argv shape matches perfectly. `lock_controller_pid` carries the age for exactly this
   # reason ("A controller always writes $LOCK after it starts, so a process that BEGAN after the lock
   # was written cannot be its owner"); without it a stale lock buys `relation=current`, and it also
-  # feeds the ahead/diverged refusals — while the pre-existing `CONTROLLER_LIVE` use of the same pid
-  # could only ever DOWNGRADE `current`, which is why the same weak evidence was safe there.
+  # feeds the ahead/diverged refusals — while the pre-existing `CONTROLLER_LIVE` use of the same pid was
+  # safe with that weak evidence for a DIFFERENT reason: NOT that the flag is downgrade-only (it is not —
+  # `CONTROLLER_LIVE=1` opens `controller_identity` and the process-tree census, so it can end
+  # `restart-pending` as `current`; see the flag's own block above), but that every stage it opens
+  # re-proves OWNERSHIP by age. Take the age check below away and this read would need it just as much.
   if [ -n "$_ctrl_pid" ] && kill -0 "$_ctrl_pid" 2>/dev/null \
      && _began_before_lock "${O:-}/.orch.lock" "$_ctrl_pid"; then
     # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a tty,
@@ -1466,10 +1469,11 @@ _rel=restart-pending
 # ⛔ THE SAME CANNOT-VERIFY DOWNGRADE THE CURRENT-PIN PATH MAKES, MADE HERE TOO. This is the branch where
 # the pin has just moved, and `RUNNING` here can be the stamp's CLAIM naming the NEW tip while the
 # controller still executes the OLD tree. ⛔ AND DO NOT EXPLAIN THAT BY "apply rewrites the stamp": the
-# DEFAULT advance is `apply --force --pin-only` (:1422-1423), which deliberately leaves `$O` — and so the
-# stamp — alone (`cloud-cell-supervisor.sh` returns before `seed_and_stamp` on `--pin-only`). A stamp that
-# already names the tip comes from `start`'s `seed_and_stamp`, from a `--re-seed` advance, or from a hand
-# seed, and it remains only a CLAIM about what was SEEDED, never proof of what is EXECUTING.
+# DEFAULT advance is `apply --force --pin-only` (the `_mat_args` ternary just above — cited by NAME,
+# not by line, because a line number here was already one commit stale), which deliberately leaves `$O`
+# — and so the stamp — alone (`cloud-cell-supervisor.sh` returns before `seed_and_stamp` on `--pin-only`).
+# A stamp that already names the tip comes from `start`'s `seed_and_stamp`, from a `--re-seed` advance, or
+# from a hand seed, and it remains only a CLAIM about what was SEEDED, never proof of what is EXECUTING.
 # `[ "$RUNNING" = "$TIP" ]` then reads that claim as agreement and reports `current`: the exact false PASS
 # this job exists to end, with no `pending=` on the spawn line and no request recorded. A live controller
 # whose identity comes only from the stamp cannot be certified, so it is restart-pending — and
