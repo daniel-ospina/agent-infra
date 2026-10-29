@@ -19,9 +19,12 @@ carrying `question-bounced`, 22 had thread activity NEWER than the label's own e
 Every leg states the behaviour it would have had before the fix, so the guard is not
 vacuous.
 """
+import ast
 import importlib.util
 import os
+import re
 import subprocess
+import warnings
 
 import pytest
 
@@ -96,12 +99,58 @@ def test_the_lane_clearing_the_label_also_supersedes_it():
 def test_removals_are_counted_only_after_the_newest_bounce():
     """`agent-infra#1903`: a bounce removes `owner-decision`, so a removal BEFORE the newest
     bounce is the gate's own and is not an answer. The count the old reader computed locally
-    is preserved here — it is the ATTRIBUTION that changed, not the arithmetic."""
+    is preserved here — it is the ATTRIBUTION that changed, not the arithmetic.
+
+    ⛔ THE STATE ASSERTION IS NOT DECORATION. This fixture is the shape the review (finding
+    2) showed the guard silently accepting as SUPERSEDED: it asserted only the count, so a
+    derivation that read the gate's own removal as movement passed unnoticed."""
     rows = [("unlabeled", "owner-decision", "2026-10-01T09:00:00Z"),   # earlier: not ours
             ("labeled", "question-bounced", "2026-10-01T10:00:00Z"),
             ("unlabeled", "owner-decision", "2026-10-01T11:00:00Z"),   # after: candidate
             ("unlabeled", "owner-decision", "2026-10-01T12:00:00Z")]
-    assert bs.parse(rows).removals_after_bounce == 2
+    v = bs.parse(rows)
+    assert v.removals_after_bounce == 2
+    assert v.state == bs.CURRENT, (
+        "two `unlabeled owner-decision` events and NOTHING else newer than the bounce: "
+        "that is the gate's own write, and it cannot supersede the bounce (%r)" % (v,))
+    assert v.stale is False
+
+
+# tortoise#7988, verbatim from `gh api .../timeline` — the case that exposed finding 2.
+GATE_OWN_WRITE = [
+    ("commented", "", "2026-10-11T22:55:49Z"),
+    ("labeled", "question-bounced", "2026-10-11T22:55:51Z"),
+    ("unlabeled", "owner-decision", "2026-10-11T22:56:28Z"),   # 37 s LATER — the gate
+]
+
+
+def test_the_gates_own_bounce_write_cannot_supersede_the_bounce():
+    """⛔ FINDING 2. `ask-owner.py` writes both bounce paths as ONE `gh issue edit`
+    (`--add-label question-bounced --remove-label owner-decision`), but gh applies the add
+    and the remove as SEPARATE mutations, so the removal can land AFTER the label it
+    belongs to. Measured on `tortoise#7988`: label 22:55:51, removal 22:56:28, nothing in
+    between.
+
+    Pre-fix this returned SUPERSEDED with moved_by "a `unlabeled` event on
+    `owner-decision`" — the gate's own write reported as a candidate owner answer (the
+    #1903 mis-attribution), and the lane dropped out of `holds`, i.e. the false
+    `question_no_protocol` nudge this PR exists to remove."""
+    v = bs.parse(GATE_OWN_WRITE)
+    assert v.state == bs.CURRENT, (v,)
+    assert v.stale is False
+    # ...and the removal is still COUNTED: the number is evidence, only the supersession
+    # claim needs authorship the timeline cannot supply.
+    assert v.removals_after_bounce == 1
+
+
+def test_a_comment_still_supersedes_when_a_queue_removal_is_also_newer():
+    """The other half of finding 2: excluding the queue removal must not weaken the rule.
+    A real movement still supersedes, and it is the comment — not the unattributable
+    removal — that is cited as the reason."""
+    v = bs.parse(GATE_OWN_WRITE + [("commented", "", "2026-10-11T23:10:00Z")])
+    assert v.state == bs.SUPERSEDED, (v,)
+    assert v.moved_by == "a comment", v.moved_by
+    assert v.moved_at == "2026-10-11T23:10:00Z", v.moved_at
 
 
 def test_a_malformed_row_cannot_make_a_label_look_current():
@@ -141,16 +190,79 @@ def _tracked_code_files():
         yield rel
 
 
+def _argv_literal(node):
+    """The string a positional argv element denotes, when it is STATICALLY knowable.
+
+    Three shapes appear in real call sites: a plain Constant (`"--add-label"`), a NAME
+    (`BOUNCE_LABEL` — returned as its identifier, which is how the guard recognises the
+    label without importing the gate), and a `+` of those
+    (`ANSWERED_LABEL + "," + DELIVERED_LABEL`). Anything else is None: unknown is not a
+    hit, and the guard must never guess a write into existence.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _argv_literal(node.left), _argv_literal(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _argv_sequences(node):
+    """Every argument sequence this call could be passing, as element lists.
+
+    A call site builds its argv either as ONE list/tuple literal (`sh(["gh", …])` — every
+    site in this tree) or as separate positional args (`sh("gh", …)`), so both are
+    scanned. Nested literals are included, so a `sh(base + ["--add-label", X])` shape is
+    read element-wise too.
+    """
+    seqs = [list(sub.elts) for sub in ast.walk(node)
+            if isinstance(sub, (ast.List, ast.Tuple))]
+    if not seqs:
+        seqs = [list(node.args)]
+    return seqs
+
+
+def _is_bounce_write_call(node):
+    """True iff this call ADDS the bounce label — i.e. the ref is the `--add-label`
+    OPERAND, not merely somewhere in the call.
+
+    ⛔ THE OPERAND TEST IS THE WHOLE POINT. `ask-owner.py`'s PASS path writes
+    `--add-label owner-decision --remove-label BOUNCE_LABEL` — it REMOVES the bounce, and
+    a scan over "any atom in the call" counted it as a bounce WRITER. That inflated the
+    count to 3, so the `>= 2` assertion still passed with STEP 1's real write deleted:
+    the guard was vacuous against the exact regression it names (#2844 review, finding 3).
+    """
+    for seq in _argv_sequences(node):
+        for i, arg in enumerate(seq):
+            flag = _argv_literal(arg)
+            if flag is None:
+                continue
+            if flag.startswith("--add-label="):
+                operand = flag.split("=", 1)[1]
+            elif flag == "--add-label":
+                operand = _argv_literal(seq[i + 1]) if i + 1 < len(seq) else None
+            else:
+                continue
+            if operand and ("question-bounced" in operand
+                            or any(r in operand for r in _BOUNCE_REFS)):
+                return True
+    return False
+
+
 def _py_write_lines(src):
-    """Line numbers of CALLS that pass `--add-label` together with a bounce reference.
+    """Line numbers of CALLS whose `--add-label` OPERAND is the bounce label.
 
     Parsed, not grepped: `scripts/_bounce_state.py` DOCUMENTS the gate's write
     ("`gh issue edit --add-label question-bounced`") in the paragraph that names the
     single writer, and a text scan would read that required sentence as a second
     writer. Only a CALL can write a label, so only a call is scanned.
+
+    A call counts only when the bounce ref is added — see `_is_bounce_write_call`; a call
+    that only REMOVES it is the opposite of a writer.
     """
-    import ast
-    import warnings
     hits = []
     with warnings.catch_warnings():
         # ask-owner.py carries `"\(...)"` jq filters in plain strings (a pre-existing
@@ -158,33 +270,28 @@ def _py_write_lines(src):
         warnings.simplefilter("ignore", SyntaxWarning)
         tree = ast.parse(src)
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        atoms = set()
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-                atoms.add(sub.value)
-            elif isinstance(sub, ast.Name):
-                atoms.add(sub.id)
-            elif isinstance(sub, ast.Attribute):
-                atoms.add(sub.attr)
-        if not any("--add-label" in a for a in atoms):
-            continue
-        if any(ref in a or "question-bounced" in a for a in atoms for ref in _BOUNCE_REFS):
+        if isinstance(node, ast.Call) and _is_bounce_write_call(node):
             hits.append(node.lineno)
     return hits
 
 
 def _shell_write_lines(src):
-    """Same question for non-Python sources, on non-comment lines only."""
+    """Same question for non-Python sources, on non-comment lines only.
+
+    Same operand rule as the Python scan: `--add-label` must be followed by the bounce
+    ref on that line, so `--add-label owner-decision --remove-label question-bounced`
+    (a REMOVAL) is not miscounted as a write.
+    """
     hits = []
     for i, line in enumerate(src.splitlines(), 1):
         s = line.strip()
         if s.startswith("#") or s.startswith("//") or s.startswith("*"):
             continue
-        if "--add-label" in s and ("question-bounced" in s
-                                    or any(r in s for r in _BOUNCE_REFS)):
-            hits.append(i)
+        for m in re.finditer(r"--add-label(?:=|\s+)(\S*)", s):
+            operand = m.group(1)
+            if "question-bounced" in operand or any(r in operand for r in _BOUNCE_REFS):
+                hits.append(i)
+                break
     return hits
 
 
@@ -213,9 +320,84 @@ def test_one_writer_is_named():
         "A second writer of this label is the defect class agent-infra#2844 is about — if "
         "the new write is deliberate, the shared derivation in scripts/_bounce_state.py and "
         "both its readers have to be widened with it" % sorted(writers))
-    # ...and the writer must really be the gate's TWO bounce paths, not one write that
-    # happens to satisfy the set. STEP 1 (no declaration) and STEP 2 (failed marks).
-    assert len(writers["scripts/ask-owner.py"]) >= 2, writers
+    # ...and the writer must really be the gate's TWO BOUNCE PATHS — STEP 1 (no
+    # declaration) and STEP 2 (failed marks) — not one write that happens to satisfy the
+    # set. ⛔ A bare COUNT is not enough: the PASS path also names the label (it REMOVES
+    # it), so under a "ref anywhere in the call" scan this read 3 and survived STEP 1's
+    # deletion. Count AND region, so a lost write cannot hide behind a removal.
+    hits = writers["scripts/ask-owner.py"]
+    assert len(hits) == 2, ("ask-owner.py must carry exactly TWO bounce writes (STEP 1 and "
+                            "STEP 2); the PASS path REMOVES the label and is not a writer. "
+                            "Found hits at %s" % hits)
+    step1, step2 = _bounce_region_bounds()
+    assert [1 for h in hits if step1 <= h < step2] == [1], (
+        "STEP 1 must own exactly one bounce write; hits at %s, STEP 1 region is "
+        "lines %d-%d" % (hits, step1, step2 - 1))
+    assert [1 for h in hits if h >= step2] == [1], (
+        "STEP 2 must own exactly one bounce write; hits at %s, STEP 2 region starts at "
+        "line %d" % (hits, step2))
+
+
+def _bounce_region_bounds():
+    """ask-owner.py's (STEP 1 start, STEP 2 start) line numbers, read from the source.
+
+    The regions are located by the gate's own STEP markers rather than by hardcoded line
+    numbers, so the assertion survives ordinary edits above them and still fails if a
+    whole path's write disappears.
+    """
+    with open(os.path.join(ROOT, "scripts", "ask-owner.py"), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    def _marker(name):
+        hit = [i for i, ln in enumerate(lines, 1) if ln.strip().startswith(name)]
+        assert len(hit) == 1, ("ask-owner.py must carry exactly one %r marker (the regions "
+                              "this guard reads); found %s" % (name, hit))
+        return hit[0]
+    step1, step2 = _marker("# STEP 1"), _marker("# STEP 2")
+    assert step1 < step2, (step1, step2)
+    return step1, step2
+
+
+def test_the_writer_scan_ignores_a_call_that_only_REMOVES_the_label():
+    """NON-VACUITY, proven against a synthetic call site. This is the PASS path's exact
+    shape; the pre-fix scan (any bounce ref anywhere in the call) counted it as a WRITER,
+    which is how `>= 2` survived deleting a real write."""
+    assert _py_write_lines(
+        'sh(["gh", "issue", "edit", "--add-label", "owner-decision",'
+        ' "--remove-label", BOUNCE_LABEL])') == []
+    # ...and the write it must count, in both shapes the gate actually uses.
+    assert _py_write_lines(
+        'sh(["gh", "issue", "edit", "--add-label", BOUNCE_LABEL, '
+        '"--remove-label", "owner-decision"])') == [1]
+    assert _py_write_lines(
+        'sh(["gh", "issue", "edit", "--add-label=question-bounced"])') == [1]
+    # a NON-bounce add is not a bounce writer either
+    assert _py_write_lines(
+        'sh(["gh", "issue", "edit", "--add-label", ANSWERED_LABEL])') == []
+
+
+def test_the_writer_scan_catches_the_missing_STEP_1_write():
+    """NON-VACUITY, replayed against the REAL file — the exact regression the assertion
+    names. Deleting STEP 1's bounce write leaves PASS (a removal) and STEP 2; the pre-fix
+    scan still returned 2 hits and the `>= 2` assertion passed (measured: [1598, 1578])."""
+    with open(os.path.join(ROOT, "scripts", "ask-owner.py"), encoding="utf-8") as fh:
+        lines = fh.read().splitlines(True)
+    step1, step2 = _bounce_region_bounds()
+    hits = _py_write_lines("".join(lines))
+    victim = next(h for h in hits if step1 <= h < step2)
+    assert victim + 1 < step2, "the STEP 1 write must be a two-line call for this replay"
+    mutant = "".join(ln for i, ln in enumerate(lines, 1) if i not in (victim, victim + 1))
+    assert len(_py_write_lines(mutant)) == 1, (
+        "deleting STEP 1's bounce write must leave ONE writer, not two — a removal is not "
+        "a writer")
+
+
+def test_the_shell_scan_applies_the_same_operand_rule():
+    """The shell half had the identical hole: `--add-label owner-decision
+    --remove-label question-bounced` matched on "both strings are on the line"."""
+    assert _shell_write_lines(
+        'gh issue edit 1 --add-label owner-decision --remove-label question-bounced\n') == []
+    assert _shell_write_lines(
+        'gh issue edit 1 --add-label question-bounced --remove-label owner-decision\n') == [1]
 
 
 # ── reader 1: undelivered-answers.py — report the contradiction, do not resolve it ────
@@ -408,3 +590,77 @@ def test_a_current_bounce_still_silences_the_nudge(monkeypatch, tmp_path):
     same turn — only the bounce's currency differs. The owner's class-2 lane (a question that
     used the protocol) must still be left alone."""
     assert _drive(monkeypatch, tmp_path, bs.parse(INCIDENT[:9])) == []
+
+
+# ── the gh seam at reader 2 (#1988), and the jq filter nothing exercised ──────────────
+def test_turn_classify_reads_the_timeline_through_ITS_OWN_gh_layer(monkeypatch):
+    """⛔ FINDING 1. `_bounce_state.bounce_view` emits `["gh", "api", …]` and its docstring
+    says the CALLER owns the resolution — `turn-classify.py`'s ⛔ #1988 header states the
+    rule for this very file. Passing the argv through unchanged runs the bare `gh` from
+    PATH, which `heartbeat-loop.sh`'s pinned PATH resolves to the REAL gh, past the
+    seeded shims: this file's only unserialised call, on a per-tick, per-bounced-issue
+    path, against the account four boxes share."""
+    seen = []
+
+    def fake(argv, timeout=None):
+        seen.append(list(argv))
+        return 0, ("commented\t\t2026-10-11T22:00:00Z\n"
+                   "labeled\tquestion-bounced\t2026-10-11T22:00:05Z\n")
+
+    monkeypatch.setattr(tc, "GH", "/opt/orch/gh-limit/gh")
+    monkeypatch.setattr(tc, "sh", fake)          # the bare-name path must not be taken
+    monkeypatch.setattr(tc, "sh_stdout", fake)
+    assert tc.bounce_still_current("o/r", 7) is True
+    assert seen == [[
+        "/opt/orch/gh-limit/gh", "api",
+        "repos/o/r/issues/7/timeline?per_page=100",
+        "--paginate", "--jq", bs.TIMELINE_JQ]], seen
+
+
+def test_sh_stdout_keeps_stderr_out_of_the_parse():
+    """The second facet of finding 1: `sh` returns stdout+stderr, which is right for the
+    diagnostics that print it and wrong for a parser — a warning on stderr would be handed
+    to the reduction as a row. `sh_stdout` returns stdout only, and NOTHING on failure."""
+    assert tc.sh_stdout(["/bin/sh", "-c", "echo out; echo err >&2"]) == (0, "out\n")
+    assert tc.sh_stdout(["/bin/sh", "-c", "exit 3"]) == (3, "")
+    assert tc.sh_stdout(["/nonexistent-binary-for-2844"]) == (1, "")
+
+
+def test_the_real_timeline_jq_filter_still_produces_rows_the_parser_can_read():
+    """`TIMELINE_JQ` is a string nobody executes in the suite: `bounce_view` was only ever
+    driven with a raising or `rc != 0` fake `run`, so a filter break (a wrong label, a lost
+    tab, `|length` coming back) would have been INVISIBLE. Executed here under the real `jq`
+    against a real timeline — the same shape `gh api …/timeline` returns."""
+    import json
+    import shutil
+    if not shutil.which("jq"):                                   # pragma: no cover
+        pytest.skip("jq not installed")
+    timeline = [
+        {"event": "commented", "created_at": "2026-10-11T22:55:49Z",
+         "body": "has\ta raw tab\tand a %"},
+        {"event": "labeled", "label": {"name": "question-bounced"},
+         "created_at": "2026-10-11T22:55:51Z"},
+        {"event": "labeled", "label": {"name": "lane:L5"},
+         "created_at": "2026-10-11T22:55:52Z"},          # not of interest
+        {"event": "closed", "created_at": "2026-10-11T22:55:53Z"},   # not of interest
+        {"event": "unlabeled", "label": {"name": "owner-decision"},
+         "created_at": "2026-10-11T22:56:28Z"},
+    ]
+    p = subprocess.run(["jq", "-r", bs.TIMELINE_JQ], input=json.dumps(timeline),
+                       capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, p.stderr
+    out = p.stdout
+    # one line per event of interest, real tabs, `label=""` for a comment — exactly what
+    # `bounce_view` splits on
+    assert out.splitlines() == [
+        "commented\t\t2026-10-11T22:55:49Z",
+        "labeled\tquestion-bounced\t2026-10-11T22:55:51Z",
+        "unlabeled\towner-decision\t2026-10-11T22:56:28Z",
+    ], repr(out)
+
+    # ...and through `bounce_view` end to end: the parse of REAL jq output is CURRENT,
+    # i.e. the gate's own removal landing 37 s after its label does not supersede it.
+    v = bs.bounce_view("o/r", 7988, lambda _a: (0, out))
+    assert v.state == bs.CURRENT, (v,)
+    assert v.bounce_at == "2026-10-11T22:55:51Z"
+    assert v.removals_after_bounce == 1

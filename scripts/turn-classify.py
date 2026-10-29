@@ -288,6 +288,21 @@ def sh(argv: list[str], timeout: int = 120) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def sh_stdout(argv: list[str], timeout: int = 120) -> tuple[int, str]:
+    """`sh`, but STDOUT ONLY — for callers that PARSE the output.
+
+    `sh` merges stderr into the returned text, which is right for the diagnostics that
+    print it and wrong for a parser: a warning gh wrote to stderr would be handed to the
+    reduction as if it were a row. On failure this returns an empty payload rather than
+    the exception text, for the same reason — a caller that cannot read must get nothing
+    to read, never a message that looks like data.
+    """
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "")
+    except Exception:                                            # noqa: BLE001
+        return 1, ""
+
 def tail_text(path: str, nbytes: int = TURN_BYTES) -> str:
     try:
         size = os.path.getsize(path)
@@ -429,7 +444,14 @@ def bounce_still_current(repo: str, n: int) -> bool | None:
     (`tortoise#2944`) was bounced 2026-09-29 and last commented 2026-10-14.
     """
     def run(argv):
-        return sh(argv, timeout=BOUNCE_READ_TIMEOUT_S)
+        # ⛔ #1988, and the reason `_bounce_state` takes `run` as an ARGUMENT at all.
+        # `bounce_view` emits `["gh", "api", …]` — a bare name that resolves through
+        # PATH, where `heartbeat-loop.sh`'s pinned PATH lets the real gh OUTRANK the
+        # seeded shims. Passing that straight to `sh` would make this file's only
+        # unserialised gh call, on a per-tick, per-bounced-issue path, against the
+        # account four boxes share. The sibling reader rebinds it the same way.
+        rc, out = sh_stdout([GH] + list(argv[1:]), timeout=BOUNCE_READ_TIMEOUT_S)
+        return rc, out
 
     try:
         view = bs.bounce_view(repo, n, run)
@@ -492,15 +514,21 @@ def lanes_with_open_question(known_lanes=None) -> tuple[set, bool]:
     # so a failed timeline read can only ever ADD a lane to `holds` — never remove one
     # and never make this scan report `ok=False`, which would stop classification
     # entirely for a surface that is merely slow.
-    for i, (repo, number, lane_names) in enumerate(bounce_issues):
+    # `reads` counts READS, not loop positions: the registry bound above `continue`s
+    # without spending one, so an index-based cap both over-counts what was read and prints
+    # a number that is not the number of issues skipped (`len(...) - MAX` is a constant,
+    # emitted once per over-cap issue). The behaviour — over-cap ⇒ CURRENT, never dropped —
+    # is unchanged; only the claim it logs is now true.
+    reads = capped = 0
+    for repo, number, lane_names in bounce_issues:
         if known_lanes is not None and not (set(lane_names) & known_lanes):
             out.update(lane_names)     # unclassifiable lane: keep the label's answer
             continue
-        if i >= MAX_BOUNCE_READS:
-            log(f"CAP bounce-state reads at {MAX_BOUNCE_READS}: "
-                f"{len(bounce_issues) - MAX_BOUNCE_READS} issue(s) treated as CURRENT")
+        if reads >= MAX_BOUNCE_READS:
+            capped += 1
             out.update(lane_names)
             continue
+        reads += 1
         current = bounce_still_current(repo, number)
         if current is None:
             log(f"WARN bounce state unreadable for {repo}#{number} — "
@@ -511,6 +539,9 @@ def lanes_with_open_question(known_lanes=None) -> tuple[set, bool]:
         else:
             log(f"bounce label SUPERSEDED on {repo}#{number} — not counted as "
                 f"`protocol used` (the thread moved after the bounce)")
+    if capped:
+        log(f"CAP bounce-state reads at {MAX_BOUNCE_READS}: {capped} issue(s) treated "
+            f"as CURRENT (never dropped)")
     return out, ok
 
 

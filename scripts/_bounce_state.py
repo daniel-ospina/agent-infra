@@ -49,6 +49,21 @@ THE RULE (one line)
     on a guess would be a second writer of the same state, which is the class of defect
     this whole module exists to end (and §item 2 of the issue asks for exactly that).
 
+    ⛔ ONE EXCEPTION, AND IT IS THE GATE'S OWN WRITE: an `unlabeled owner-decision` event
+    newer than the bounce is NOT movement and cannot supersede it on its own.
+    `ask-owner.py` writes both bounce paths as a single `gh issue edit`
+    (`--add-label question-bounced --remove-label owner-decision`), but gh issues the add
+    and the remove as SEPARATE mutations, so the timeline can carry the removal AFTER the
+    label — the gate's own write, arriving last. Measured live on `tortoise#7988`
+    (2026-10-11): bounce labelled 22:55:51, `unlabeled owner-decision` 22:56:28, 37 s
+    later, nothing else in between. Reading that as "the thread moved on" declares the
+    gate's own bounce stale and drops the lane out of `holds`, i.e. it fabricates exactly
+    the #1903 mis-attribution this module exists to stop — and the false
+    `question_no_protocol` nudge #2844 exists to remove. The event is therefore still
+    COUNTED (`removals_after_bounce`, which is the old reader's number) but can never be
+    the reason a bounce is superseded; a comment / label clear / re-queue / receipt must
+    be the movement.
+
     Outside evidence for reading the log rather than the projection: Fowler, *Event
     Sourcing* (2005) — "all changes to application state are stored as a sequence of
     events … we can also use the event log to reconstruct past states". And the recorded
@@ -101,6 +116,15 @@ _MOVED_BY = {
     ("labeled", ANSWERED): "an `owner-answered` receipt",
     ("labeled", DELIVERED): "an `answer-delivered` receipt",
 }
+
+# The ONE event that is never movement. `ask-owner.py`'s bounce writes
+# `--add-label question-bounced --remove-label owner-decision` in a single edit, but gh
+# applies the two mutations separately, so the REMOVAL can land after the label — the
+# gate's own write, recorded last. Its authorship is not recoverable from the timeline
+# (an owner clearing the queue label produces the identical event), so it cannot be read
+# as evidence that the bounce was overtaken. It stays counted in
+# `removals_after_bounce`; it just cannot be the thing that supersedes. See THE RULE.
+_NOT_MOVEMENT = {("unlabeled", QUEUE)}
 
 
 class View:
@@ -156,6 +180,10 @@ def parse(rows):
     GitHub's fixed `%Y-%m-%dT%H:%M:%SZ` shape. Rows with no readable timestamp are
     DROPPED, not treated as "now": a malformed line is the pagination/format bug this
     whole layer has been bitten by, and it must not be able to make a label look current.
+
+    One event is deliberately NOT symmetric with `removals_after_bounce`: see
+    `_NOT_MOVEMENT` for why the gate's own `unlabeled owner-decision` is counted as a
+    removal but can never be the movement that supersedes.
     """
     bounce_ats, removals, events = [], [], []
     for row in rows or ():
@@ -177,7 +205,11 @@ def parse(rows):
 
     bounce_at = max(bounce_ats)
     removals_after = len([at for at in removals if at > bounce_at])
-    moved = [(at, ev, lab) for (at, ev, lab) in events if at > bounce_at]
+    # `_NOT_MOVEMENT` is excluded HERE, not from `removals_after`: that number is evidence
+    # for a human, while supersession is a claim about the thread — and only the second
+    # one needs an authorship the timeline cannot supply.
+    moved = [(at, ev, lab) for (at, ev, lab) in events
+             if at > bounce_at and (ev, lab) not in _NOT_MOVEMENT]
     if not moved:
         return View(CURRENT, bounce_at=bounce_at,
                     removals_after_bounce=removals_after)
