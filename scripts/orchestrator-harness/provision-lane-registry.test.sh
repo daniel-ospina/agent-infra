@@ -215,7 +215,7 @@ chk "D9 an arm that MEASURED NOTHING refuses to shrink a derived roster to zero 
 chk "D10 …the roster is byte-identical afterwards (nothing was written)" \
     'cmp -s "$ROSTER" "$T/shrink.first"'
 chk "D11 …and the refusal names the disagreement, not a generic error" \
-    'case "$OUT" in *"measured NO population"*) true;; *) false;; esac'
+    'case "$OUT" in *"NOT reproduced"*) true;; *) false;; esac'
 run_it --apply --force
 chk "D12 --force is how an operator declares those rows stale (rc 0, zero rows)" \
     '[ "$RC" -eq 0 ] && [ "$(grep -vc "^#" "$ROSTER")" -eq 0 ]'
@@ -357,30 +357,56 @@ echo "== G. WIRING: the bring-up and the supervisor both call it, and classify i
 # ⛔ #3032 review F6: these two used to grep for the FILENAME only, which a COMMENT satisfies. They
 # now require the actual `--apply` invocation, so deleting the call and leaving the prose behind
 # reds the suite.
-chk "G1 cloud-cell-bringup.sh PROVISIONS the roster (the --apply call, not a mention)" \
-    'grep -qF "provision-lane-registry.py\" --apply" "$ROOT/scripts/cloud-cell-bringup.sh"'
-chk "G2 cloud-cell-supervisor.sh PROVISIONS the roster (the --apply call, not a mention)" \
-    'grep -qF "provision-lane-registry.py\" --apply" "$ROOT/scripts/cloud-cell-supervisor.sh"'
-# The rc arms are the highest-stakes part of the change and used to be pinned by nothing. A
-# regression to `die` on rc 3 would false-block EVERY cell, and it would pass the rest of this
-# suite; a regression that fell through to the `ok` arm on rc 1 is the false-PASS the call sites'
-# own comments say they fix. These are STRUCTURAL pins (the branch shape), which is weaker than
-# driving the functions: that would need the callers to be sourceable, and they run `main` on
-# source. Stated plainly rather than dressed up as behavioural coverage.
-chk "G4 the bring-up treats rc 3 as a WARNING, not a die (a die would false-block every cell)" \
-    'grep -qE "elif \[ .*provrc.*-ne 0" "$ROOT/scripts/cloud-cell-bringup.sh"'
-chk "G5 the supervisor treats rc 3 as a WARNING, not a die" \
-    'grep -qE "elif \[ .*rvrc.*-ne 0" "$ROOT/scripts/cloud-cell-supervisor.sh"'
-chk "G6 the supervisor reports ok ONLY in the rc-0 arm (rc 1/127 is never provisioned)" \
-    'grep -qF "ok: lane roster" "$ROOT/scripts/cloud-cell-supervisor.sh"'
+echo
+echo "== L. A PARTIAL WINDOW ANSWER: absence from ONE window is not proof a lane ended =="
+# ⛔ #3032 cycle 2: the same argument that justifies refusing a ZERO-workspace answer applies to a
+# MISSING ROW. The file's own refusal says "the workspace list is per-window, so absence is not
+# evidence" — if that is true for an empty list it is true for one row, so a partial answer must not
+# delete a live lane's row (the roster is the board's only source, so a missing row makes a live
+# lane read as unheld — the false-COLLISION direction).
+mk_case partial; mk_stub 0 payload; mk_payload
+run_it --apply
+chk "L1 pre-state: two rows rostered" '[ "$(grep -vc "^#" "$ROSTER")" -eq 2 ]'
+cp "$ROSTER" "$T/partial.first"
+cat > "$CASE/list.json" <<JSON
+{"window_ref":"window:1","workspaces":[
+ {"id":"c2c97e96-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77","current_directory":"$CASE/repo/.worktrees/lane-77"}
+]}
+JSON
+run_it --apply
+chk "L2 a PARTIAL answer refuses to delete the missing lane's row (rc 3)" '[ "$RC" -eq 3 ]'
+chk "L3 …and nothing was written" 'cmp -s "$ROSTER" "$T/partial.first"'
+chk "L4 …and it NAMES the row it would have removed" \
+    'case "$OUT" in *"would REMOVE: lane-88"*) true;; *) false;; esac'
+run_it --apply --force
+chk "L5 --force drops it and the drop is REPORTED, never silent" \
+    '[ "$RC" -eq 0 ] && [ "$(grep -vc "^#" "$ROSTER")" -eq 1 ] && case "$OUT" in *"dropped:"*) true;; *) false;; esac'
+
+chk "G1 cloud-cell-bringup.sh PROVISIONS the roster (COMMENTS FILTERED: prose cannot satisfy this)" \
+    'grep -v "^[[:space:]]*#" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -qF "provision-lane-registry.py\" --apply"'
+chk "G2 cloud-cell-supervisor.sh PROVISIONS the roster (COMMENTS FILTERED: prose cannot satisfy this)" \
+    'grep -v "^[[:space:]]*#" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -qF "provision-lane-registry.py\" --apply"'
+# The rc arms are the highest-stakes part of the change. They are pinned on the `-eq 3` branch
+# ITSELF, not on the neighbouring `-ne 0` branch: cycle 1's version asserted the wrong arm, so
+# replacing the rc-3 `warn` with `die` (which would false-block EVERY cell) left the suite green —
+# measured by mutation in cycle 2. A comment cannot satisfy these either, because the arm's body is
+# a call to `warn`/`log_line`, which a comment never contains.
+chk "G4 the bring-up's rc-3 arm WARNS, and never dies (a die would false-block every cell)" \
+    'grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -q "warn " && ! grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -q "die "'
+chk "G5 the supervisor's rc-3 arm WARNS, and never dies" \
+    'grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "log_line \"warn" && ! grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "die "'
+chk "G6 rc 3 and the crash arm NEVER print the ok line (only the rc-0 arm is 'provisioned')" \
+    '! grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "ok: lane roster" && ! grep -A3 "rvrc\" -ne 0" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "ok: lane roster"'
 chk "G3 this suite is WIRED into the shard list (an unwired suite reds bash-suites by design)" \
     'bash "$ROOT/scripts/run-bash-shards.sh" --list | grep -qx "scripts/orchestrator-harness/provision-lane-registry.test.sh"'
 
 echo
 echo "== K. ONE LANE, TWO CHECKOUTS: a duplicate LABEL is excluded and NAMED =="
 # ⛔ #3032 review F5: dedupe was keyed on the workspace uuid only, so two checkouts of the SAME
-# lane rostered TWO rows for one label — which the reader then collapses silently (`by_title`,
-# last-non-empty-wins). The second row's attribution would win with nothing said.
+# lane rostered TWO rows for one label — and a duplicated label is the ONE shape the board's
+# reader refuses to adjudicate (`fleet_state.load_registry` gives it its own arms, and
+# `collision_preflight` then reads the label as HOLDER_UNMEASURED → INCOMPLETE fleet-wide, i.e. the
+# silent-idle defect this whole change removes).
 mk_case dup
 mkdir -p "$CASE/repo2/.worktrees/lane-77" "$CASE/repo2/.git/worktrees/lane-77"
 printf 'gitdir: %s\n' "$CASE/repo2/.git/worktrees/lane-77" > "$CASE/repo2/.worktrees/lane-77/.git"
