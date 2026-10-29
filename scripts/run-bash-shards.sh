@@ -201,6 +201,27 @@ if [ "${1:-}" = "--list-sweeps" ]; then
   exit 0
 fi
 
+# ⛔ THE PLACEMENT GUARD (agent-infra#3011) RUNS BEFORE ANY WORK, not merely before the shard loop.
+# This is the ONE seam every suite passes through (both lanes call this script), so the guard lives
+# here instead of in 70-odd copies of the same check — and it must fire BEFORE the syntax sweeps or a
+# live cell pays for a full `bash -n` sweep before being told it should not be running suites at all.
+# A CELL IS A CAPACITY RESOURCE: its load is the fleet's own busy signal, and suites run there leaked
+# 145 fixture controllers onto `pi-cell-4` (load 39 on 8 cores) because nothing refused. It is a no-op
+# on a laptop/CI (no controller executes from a cell root) and refuses with EX_CONFIG (78) — a
+# REFUSAL, not a test failure — unless HARNESS_SUITE_ALLOW_LIVE_CELL=1 is set. `--list`/`--list-sweeps`
+# above exit before this point on purpose: they execute nothing, so they stay readable everywhere.
+# shellcheck source=orchestrator-harness/fixture-hermetic.sh
+. "$SHARD_ROOT/scripts/orchestrator-harness/fixture-hermetic.sh"
+# ⛔ FAIL CLOSED ON THE SOURCE ITSELF. A `command not found` here would exit 127 once and then let
+# every suite run anyway — a guard that cannot fire is the failure class #3011 belongs to ("an
+# enforcer that cannot fire"), and `bash -n` cannot see it. If the helper is not loadable this driver
+# refuses rather than running the whole population unguarded.
+command -v fixture_guard_placement >/dev/null 2>&1 || {
+  echo "❌ cannot load scripts/orchestrator-harness/fixture-hermetic.sh — refusing to run shards with the #3011 placement guard inert" >&2
+  exit 2
+}
+fixture_guard_placement "run-bash-shards.sh"
+
 # run_shard <path> — one shard. `shard_ran` is what makes the list SELF-CHECKING at runtime: the
 # counters are compared against the derived count at the end, so a neutered helper (executing
 # nothing while the list still reads its full count) fails loudly instead of reporting "all bash
