@@ -260,7 +260,7 @@ EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; log "$*"; }
+log_line() { printf '%s\n' "$*"; log "$*"; }
 log() { [ -n "$REAP_VENV_LOG" ] && printf '%s\n' "$*" >>"$REAP_VENV_LOG" 2>/dev/null; return 0; }
 
 now_epoch() {
@@ -945,11 +945,11 @@ remove_one() {
     # The same gc-only self rule classify() applies (never a second, weaker one): in `--worktree` mode
     # the caller's cwd IS the worktree, so applying it there would make exit-mode reaping impossible.
     if [ "$mode" = gc ] && [ -n "$SELF_CWD_CANON" ] && inside "$canon" "$SELF_CWD_CANON"; then
-        say "SKIP $canon/.venv — the reaper's own cwd is inside it"
+        log_line "SKIP $canon/.venv — the reaper's own cwd is inside it"
         return 2
     fi
     if [ -L "$canon/.venv" ] || [ ! -d "$canon/.venv" ]; then
-        say "SKIP $canon/.venv — no longer a real directory"
+        log_line "SKIP $canon/.venv — no longer a real directory"
         return 2
     fi
     # A fresh read of ALL THREE witnesses: the pass table may be minutes old on a large estate.
@@ -958,19 +958,19 @@ remove_one() {
         # The SAME policy as the pass-level probe (never a second, weaker one): a degraded cwd read is
         # abortive unless the operator has explicitly accepted tmux+argv-only evidence.
         if [ "$REAP_VENV_ALLOW_DEGRADED_CWD" = "1" ]; then
-            say "warn: cwd probe DEGRADED at removal time — tmux+argv evidence only (REAP_VENV_ALLOW_DEGRADED_CWD=1)"
+            log_line "warn: cwd probe DEGRADED at removal time — tmux+argv evidence only (REAP_VENV_ALLOW_DEGRADED_CWD=1)"
         else
-            say "FAIL-CLOSED: cwd probe unavailable before removal of $canon/.venv"; return 1
+            log_line "FAIL-CLOSED: cwd probe unavailable before removal of $canon/.venv"; return 1
         fi
     fi
-    tmux_load || { say "FAIL-CLOSED: tmux probe failed before removal of $canon/.venv"; return 1; }
-    ps_load || { say "FAIL-CLOSED: ps unavailable before removal of $canon/.venv"; return 1; }
+    tmux_load || { log_line "FAIL-CLOSED: tmux probe failed before removal of $canon/.venv"; return 1; }
+    ps_load || { log_line "FAIL-CLOSED: ps unavailable before removal of $canon/.venv"; return 1; }
     self_load
     if live="$(live_witness "$canon")"; then
-        say "SKIP $canon/.venv — went live before removal: ${live//$TAB/ }"
+        log_line "SKIP $canon/.venv — went live before removal: ${live//$TAB/ }"
         return 2
     fi
-    out="$(bound_file rmout)" || { say "SKIP $canon/.venv — no scratch dir"; return 1; }
+    out="$(bound_file rmout)" || { log_line "SKIP $canon/.venv — no scratch dir"; return 1; }
     # ⛔ THE REMOVAL SUBSHELL MUST NOT INHERIT THE EXIT TRAP EITHER (review of PR #1949): `cleanup`
     # deletes the SHARED `$SCRATCH`, and on a bash that runs an inherited EXIT trap in a subshell (3.2 —
     # exactly the bash where cleanup()'s BASHPID guard cannot fire) that would delete the parent's
@@ -983,10 +983,10 @@ remove_one() {
         rc=$?
     fi
     if [ -d "$canon/.venv" ] || [ -L "$canon/.venv" ]; then
-        say "REMOVE-FAILED $canon/.venv (rc=$rc) $(head -2 "$out" 2>/dev/null | tr '\n' ' ')"
+        log_line "REMOVE-FAILED $canon/.venv (rc=$rc) $(head -2 "$out" 2>/dev/null | tr '\n' ' ')"
         return 1
     fi
-    say "REAPED $canon/.venv"
+    log_line "REAPED $canon/.venv"
     return 0
 }
 
@@ -1171,7 +1171,7 @@ run_exit() {
     DF_BEFORE="$(df_free_kb "$canon")"
     row="$(classify "$canon" exit)"
     if [ -z "$row" ]; then
-        say "[$SCRIPT_NAME] no .venv in $canon — nothing to reap"
+        log_line "[$SCRIPT_NAME] no .venv in $canon — nothing to reap"
         return 0
     fi
     report_row "$row"
@@ -1215,8 +1215,8 @@ report_capacity() { # report_capacity <free_kb_after>
             [ "$free_mb" -gt "$floor" ] && headroom=$(( (free_mb - floor) / per_lane_mb ))
         fi
     fi
-    say "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
-    [ -n "$why" ] && say "[$SCRIPT_NAME] capacity: $why"
+    log_line "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
+    [ -n "$why" ] && log_line "[$SCRIPT_NAME] capacity: $why"
     log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
         "$LANES_LIVE" "${per_lane_mb:-}" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
     CAPACITY_FLOOR_OK="$floor_ok"
@@ -1240,12 +1240,12 @@ main() {
 
     probes_ready || exit 3
 
-    say "[$SCRIPT_NAME] mode=$mode_label apply=$APPLY repo=${REPO:-$PWD} worktree=${WORKTREE:--}"
+    log_line "[$SCRIPT_NAME] mode=$mode_label apply=$APPLY repo=${REPO:-$PWD} worktree=${WORKTREE:--}"
     case "$TMUX_STATE" in
-        ok)     say "[$SCRIPT_NAME] witnesses: tmux panes + process cwd + process argv" ;;
-        absent) say "[$SCRIPT_NAME] witnesses: process cwd + process argv (no tmux server on this host)" ;;
+        ok) log_line "[$SCRIPT_NAME] witnesses: tmux panes + process cwd + process argv" ;;
+        absent) log_line "[$SCRIPT_NAME] witnesses: process cwd + process argv (no tmux server on this host)" ;;
     esac
-    [ "$CWD_STATE" = "ok" ] || say "[$SCRIPT_NAME] warn: cwd witness DEGRADED (see above)"
+    [ "$CWD_STATE" = "ok" ] || log_line "[$SCRIPT_NAME] warn: cwd witness DEGRADED (see above)"
 
     if [ "$MODE" = exit ]; then run_exit; else run_gc; fi
 
@@ -1258,14 +1258,14 @@ main() {
     reclaimed_mb="?"
     is_pos_int "${freed_kb:-}" && reclaimed_mb=$((freed_kb / 1024))
 
-    say "[$SCRIPT_NAME] venvs_found=$FOUND reapable=$REAPABLE reaped=$REAPED kept=$KEPT recheck_kept=$RECHECK_KEPT failed=$FAILED"
+    log_line "[$SCRIPT_NAME] venvs_found=$FOUND reapable=$REAPABLE reaped=$REAPED kept=$KEPT recheck_kept=$RECHECK_KEPT failed=$FAILED"
     # The two numbers answer different questions — see the header. `du` is the APPARENT size: it
     # counts blocks shared with the uv cache once per link, so it over-states ONLY on a box where
     # such sharing exists (hardlink OR clonefile — measured PER MACHINE; the old universal hardlink
     # claim was falsified 2026-10-16, #1851). `df` is what the filesystem actually got back.
-    say "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du counts blocks SHARED with the uv cache once per link and over-counts only where that sharing exists — per machine, measure it with the sibling worktree-disk-probe.sh (beside this script); df is the real figure)"
+    log_line "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du counts blocks SHARED with the uv cache once per link and over-counts only where that sharing exists — per machine, measure it with the sibling worktree-disk-probe.sh (beside this script); df is the real figure)"
     report_capacity "${df_after:-}"
-    [ "$APPLY" = 1 ] || say "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
+    [ "$APPLY" = 1 ] || log_line "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
 
     # Severity order matches disk-reaper.sh's own INTENT (3 abort > 4 removal failed > 5 over-bound),
     # so the fleet entry point's worst-code rule keeps the most severe verdict instead of this pass
@@ -1279,7 +1279,7 @@ main() {
     # operator cannot find because a removal failed first is a silent breach. The EXIT CODE order is
     # unchanged (4 still wins); only the record's survival is fixed.
     if [ "$CAPACITY_FLOOR_OK" = "no" ]; then
-        say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5, or exit 4 if a removal also failed — a failed removal outranks a breach)"
+        log_line "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5, or exit 4 if a removal also failed — a failed removal outranks a breach)"
         log "over-bound\tfree_below_floor_mb=${CAPACITY_FLOOR_MB:-$REAP_VENV_FREE_FLOOR_MB}"
     fi
     [ "$FAILED" -gt 0 ] && exit 4
