@@ -124,6 +124,12 @@ drive_gate() {
 # to run unscrubbed). `env -i` plus an explicit allowlist, so a knob this repo adds tomorrow cannot
 # leak a cell's real configuration into the sandbox, and an operator's exported SCOUT_*/GH_* cannot
 # turn a suite failure into a mystery.
+#
+# ⛔ THE CHECKOUT'S `origin` IS A URL, AND THE BARE REPO IS A SEPARATE REMOTE (agent-infra#1935).
+# `resolve_repo` in the shipped script refuses a DECLARED queue target whose checkout can only prove a
+# LOCAL-PATH `origin` (a bare `$D/origin.git`), because a path cannot be shown to be that repo — and
+# this suite wants `$OR` declared, because arms below assert that `GH_REPO` is derived from it. A URL
+# origin satisfies the resolver without changing what any arm measures: nothing here fetches.
 run_env() {
   local dir="$1"; shift
   env -i \
@@ -140,7 +146,9 @@ mk_case() {
   mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout/tools" "$D/tmp"
   git init -q --bare "$D/origin.git"
   git init -q "$D/repo"
-  git -C "$D/repo" remote add origin "$D/origin.git"
+  # A URL `origin`: `resolve_repo` must be able to PROVE the checkout is the declared $OR, and a
+  # local path cannot prove it (#1935). The bare repo below stays for the write-scope arm.
+  git -C "$D/repo" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
   cp "$HERE/claims.sh" "$D/o/claims.sh"
   # A REAL BOX HAS A REFRESH SCRIPT. "No refresh script at all" is its OWN state (rc=1, tested in
   # section 10); a fixture without one would be a box that cannot originate, and the gate would
@@ -164,7 +172,7 @@ mk_gh_rest() {
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 case "\$1 \$2" in
-  "auth token") exit 0 ;;
+  "auth token") [ -n "\${GH_AUTH_TOKEN_SIG:-}" ] && kill -"\${GH_AUTH_TOKEN_SIG}" \$\$; [ -n "\${GH_AUTH_TOKEN_HANG:-}" ] && sleep 300; exit 0 ;;
   *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
   *"/pulls?"*) printf '[]\n' ;;
   *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
@@ -177,7 +185,10 @@ SH
   chmod +x "$d/bin/gh.body"
   cat > "$d/bin/gh" <<'SH'
 #!/bin/bash
+# GHCALLS: every argv the shipped pass handed to gh, so a check can assert WHICH question was asked
+# (the presence short-circuit is "gh auth token was never invoked", which no output line can prove).
 d="$(cd "$(dirname "$0")" && pwd)"
+[ -n "${GHCALLS:-}" ] && printf '%s\n' "$*" >> "$GHCALLS"
 if [ "$1" = api ] && [ "$2" = -i ]; then
   shift 2
   out="$("$d/gh.body" api "$@" 2>/dev/null)"; rc=$?
@@ -215,6 +226,19 @@ esac
 SH
   chmod +x "$d/bin/gh.body"
 }
+# ⛔ TWO unreadable surfaces, and that is load-bearing (agent-infra#1935). The holder surface ALONE is
+# no longer a failure on the merged tree: `refresh-candidates.sh` re-routes a HOLDER-ONLY `INCOMPLETE`
+# to the cross-box claim registry (a live claim refuses, an empty one is CLEAN), so a one-surface
+# fixture made every "the failed refresh is NAMED" arm below green on a pass that now SUCCEEDS.
+# These arms grade the failure path, so the fixture must fail for a reason the harness cannot
+# re-route: with a second unreadable surface the re-route is correctly refused (only the holder-SOLE
+# case is substituted). #1935's own selftest arms cover the re-route.
+# ⛔ …AND EVERY FIXTURE BELOW THAT MUST REACH THE FAILURE PATH CARRIES THE SAME TWO-SURFACE SHAPE (see
+# `mk_tool_mixed`, `mk_tool_stderr_report`, `mk_tool_stderr_chatty`, `mk_tool_silent_then_surface`,
+# `mk_tool_degraded_then_hard`). Holding this shape in ONE fixture was not enough: the others stayed
+# holder-SOLE and every arm that grades `the failed refresh is NAMED` went red on a pass that had
+# become CLEAN — which is the re-route WORKING, caught only because those arms assert the failure
+# datum rather than the verdict. A new failure-path fixture needs the second surface too.
 # mk_tool_incomplete <dir> [block|table] — the pre-flight answer that broke the fleet: a bare
 # INCOMPLETE whose failing surface is the fleet board's lane registry. `block` (default) prints the
 # canonical INCOMPLETE SURFACES block; `table` prints ONLY the SURFACE table (the shapes the producer
@@ -238,11 +262,201 @@ if shape == "block":
     print("INCOMPLETE SURFACES")
     print("  [issue assignee/holder] " + why)
     print("")
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("  [open PRs] gh: could not reach api.github.com")
+print("")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
 sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
+# mk_tool_stderr <dir> — the SAME failure as `mk_tool_incomplete`, plus the one thing a real
+# pre-flight adds when it cannot answer: a DIAGNOSTIC LINE ON STDERR, and its own non-zero exit. The
+# harness used to merge stderr into the report (`2>&1`) and to keep the tool's rc only for its `-eq 3`
+# guard, so neither could reach the record (#2401). This fixture is what makes that reachable and
+# assertable end to end.
+mk_tool_stderr() {
+  local d="$1"
+  mk_tool_incomplete "$1"
+  # Append the stderr write WITHOUT touching the fixture above (so the two cannot drift apart).
+  python3 - "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+src = src.replace(
+    'sys.exit(2)',
+    'sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\\n")\nsys.exit(2)',
+)
+open(path, "w").write(src)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_mixed <dir> <fail-n> — TWO candidates, only the FIRST of which fails. The second answers
+# a DEGRADED CLEAN (rc 0, no stderr) — the shape that exposed a real defect in the first draft of
+# #2401: `PRE_RC`/`PRE_ERR_LINE` were overwritten per candidate, so the recorded datum described the
+# LAST run (`rc=0`, `stderr=none`) while `first cause` quoted the FIRST run's refusal — a record that
+# contradicted itself and asserted a healthy tool.
+mk_tool_mixed() {
+  local d="$1" fail_n="$2"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<PY
+#!/usr/bin/env python3
+import sys
+n = int(sys.argv[1])
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read "
+       "(FileNotFoundError: /tmp/cell-home/.pi/agent/state/lane-registry.tsv)")
+if n == $fail_n:
+    print("issue assignee/holder           INCOMPLETE  0     " + why)
+    print("INCOMPLETE SURFACES")
+    print("  [issue assignee/holder] " + why)
+    print("  [open PRs] gh: could not reach api.github.com")
+    print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
+    sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\\n")
+    sys.exit(2)
+# THE SECOND CANDIDATE ALSO RECORDS UNUSABLE, AND WITH A DIFFERENT DATUM ON PURPOSE (review of
+# #2401, R2). A verdict-less run (no VERDICT line, rc 0) exercises the record_unusable arm that
+# names 'preflight-no-verdict', so "re-snapshot on every record" is graded: it would leave
+# tool_rc=0 / tool_issue=<this one> beside the FIRST candidate's refusal. A degraded CLEAN would
+# NOT grade that - it bumps V_UNJUDGED without recording anything (mutation-proved green).
+# WARNING: NO BACKTICKS IN THIS BODY. The heredoc is UNQUOTED (it interpolates fail_n), so a
+# backticked span here is executed by the SHELL on every suite run - measured: five
+# 'command not found' lines on stderr while the suite still exited 0 (review of #2401).
+sys.exit(0)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_stderr_report <dir> — the whole report, INCLUDING the INCOMPLETE SURFACES block and the
+# VERDICT, written to STDERR only. This is what makes the fold-back graded (#2401 review): a producer
+# whose report arrives on stderr must still be PARSED, and removing the fold-back must turn the suite
+# red instead of silently degrading the record to `unusable=unknown`.
+mk_tool_stderr_report() {
+  local d="$1"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read "
+       "(FileNotFoundError: /tmp/cell-home/.pi/agent/state/lane-registry.tsv)")
+out = sys.stderr
+# ⛔ A HARMLESS FIRST LINE ON PURPOSE. Folding back only the FIRST stderr line would then keep a
+# diagnostic and drop the report — which is exactly the regression this fixture grades. (A fixture
+# whose first line already carried the surface row passed under that regression: measured.)
+out.write("FLEET BOARD: probing the live-session store\n")
+out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
+out.write("INCOMPLETE SURFACES\n")
+out.write("  [issue assignee/holder] " + why + "\n")
+out.write("  [open PRs] gh: could not reach api.github.com\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)\n")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_stderr_chatty <dir> — the whole report on stderr FOLLOWED BY 60 more stderr lines. This is
+# the #1716-class hazard a bounded fold introduced (review of #2401, second round): with `tail -40`
+# the report is dropped, the run falls out of the INCOMPLETE arm into the verdict-less one, and that
+# arm INCREMENTS `retry-<N>` — at RETRY_MAX a still-valid issue is appended to `checked.txt` and
+# suppressed forever, with the log reading "marked checked after 3 verdict-less attempts".
+mk_tool_stderr_chatty() {
+  local d="$1"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read")
+out = sys.stderr
+out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
+out.write("INCOMPLETE SURFACES\n")
+out.write("  [issue assignee/holder] " + why + "\n")
+out.write("  [open PRs] gh: could not reach api.github.com\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)\n")
+for i in range(60):
+    out.write("noise line %d\n" % i)
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_silent_then_surface <dir> <fail-n> — the FIRST candidate is silent (rc 0, no output, so its
+# record's REASON is empty) and the SECOND fails on a surface. The datum and the "first cause" must
+# name the SAME record — the first one (review of #2401, second round): otherwise the record says
+# `tool_rc=0` beside a refusal, i.e. a healthy tool next to a failure.
+mk_tool_silent_then_surface() {
+  local d="$1" fail_n="$2"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<PY
+#!/usr/bin/env python3
+import sys
+n = int(sys.argv[1])
+if n == $fail_n:
+    sys.exit(0)          # silent: no VERDICT, no output
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read")
+print("issue assignee/holder           INCOMPLETE  0     " + why)
+print("INCOMPLETE SURFACES")
+print("  [issue assignee/holder] " + why)
+print("  [open PRs] gh: could not reach api.github.com")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+
+# mk_tool_stderr_bracket <dir> — a normal report on stdout, plus a stderr line that BEGINS WITH `[`.
+# This is the phantom-surface-row shape (review of #2401, fourth round): the block parser's only
+# terminator is a line matching `^[A-Z][A-Z ]+ — `, so folding stderr straight after the report left
+# the block OPEN and parsed this line as a surface the producer never reported.
+mk_tool_stderr_bracket() {
+  local d="$1"
+  mk_tool_incomplete "$1"
+  python3 - "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+src = src.replace(
+    'sys.exit(2)',
+    'sys.stderr.write("[preflight] live-session store probe failed\\n")\nsys.exit(2)',
+)
+open(path, "w").write(src)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+
+# mk_tool_degraded_then_hard <dir> <degraded-n> — the DEGRADED verdict first (rc 0, no stderr) and a
+# hard INCOMPLETE second (rc 2, with a stderr diagnostic). The degraded arms record no surface row, so
+# they are the weakest reason to hold a datum: a snapshot taken there reported the HEALTHY first run
+# while the first cause quoted the second (review of #2401, sixth round).
+mk_tool_degraded_then_hard() {
+  local d="$1" deg_n="$2"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<PY
+#!/usr/bin/env python3
+import sys
+n = int(sys.argv[1])
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read")
+if n == $deg_n:
+    print("open PRs                        CLEAN       0     0 PR(s) enumerated")
+    print("ALSO INCOMPLETE: 1 surface(s) could not be queried (issue assignee/holder)")
+    print("VERDICT: CLEAN (exit 0) — a DEGRADED clean")
+    sys.exit(0)
+print("issue assignee/holder           INCOMPLETE  0     " + why)
+print("INCOMPLETE SURFACES")
+print("  [issue assignee/holder] " + why)
+print("  [open PRs] gh: could not reach api.github.com")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
+sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\n")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_incomplete_norow <dir> — an INCOMPLETE verdict whose surface block yields NO parseable row
+# (the parser's own documented "emits nothing" path), with a stderr diagnostic and rc 2. That arm
+# records no unusable row, so it used to abort with tool_rc=unrecorded / tool_err=none while both
+# were in hand (review of #2401, sixth round).
+mk_tool_incomplete_norow() {
+  local d="$1"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+print("SURFACE                         STATUS      HITS  NOTE")
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried")
+sys.stderr.write("PREFLIGHT: cannot resolve the target repository\n")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+
 # mk_tool_clean <dir> — a CLEAN verdict that also RECORDS the GH_REPO it ran under ($GHRELOG), the
 # only way to prove the pin reached the child — and, when `$TOMBREC`/`$TOMBLOG` are set, the state of the
 # outcome record AT THE MOMENT IT RUNS. That snapshot is how the tombstone is proved to be written
@@ -316,6 +530,254 @@ case "$(rec "$D" cmd)" in
   *collision_preflight*) ok "fail: the record names the command that failed" ;;
   *) bad "fail: the record's cmd does not name the pre-flight — '$(rec "$D" cmd)'" ;;
 esac
+
+# ── 1c) THE DATUM: WHICH COMMAND RAN, WHAT IT RETURNED, AND ITS OWN EXIT (#2401) ─
+# ⛔ WHY THIS SECTION EXISTS. §1 pins the SURFACE and the producer's prose. On cell-4 that was not
+# enough: the prose is a sentence, the harness bounded it at 320/400 characters, and the one datum that
+# would have ended a 12-hour cell-wide dispatch stop — a pre-flight exiting 2 because two live pids sat
+# in REAPED worktrees — appeared nowhere. Measured:
+#
+#   [dispatch] BLOCKED: refresh failed — stage=preflight: none of the 12 judged candidate(s) produced a
+#   usable verdict … failing surface(s): issue-assignee-holder:12 — first cause: claim gate: the FLEET
+#   BOARD could not answer — … (tried: `cmux sessi          <- the datum was cut mid-word
+#
+# and `state/refresh-last` carried no `rc=` of the TOOL at all (its `rc=1` is the PASS's own exit).
+# So: the tool's rc, the tool's command and the tool's own stderr line must be in the RECORD (where a
+# controller reads them) and inside the first 400 characters of `why=` (where the beat prints them).
+mk_case fail-datum 42
+mk_tool_stderr "$D"
+rf "$D"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "datum: the record carries the PRE-FLIGHT's own rc (2), not the pass's" \
+  || bad "datum: tool_rc='$(rec "$D" tool_rc)' (want 2) — the tool's exit was thrown away"
+case "$(rec "$D" tool_cmd)" in
+  "collision_preflight.py --repo .") ok "datum: the record names the exact command that ran" ;;
+  *) bad "datum: tool_cmd='$(rec "$D" tool_cmd)' does not name the pre-flight invocation" ;;
+esac
+case "$(rec "$D" tool_err)" in
+  *"FLEET BOARD: cannot answer"*) ok "datum: the record carries the tool's FIRST STDERR LINE" ;;
+  *) bad "datum: tool_err='$(rec "$D" tool_err)' lost the stderr diagnostic" ;;
+esac
+# THE BOUND IS THE POINT: whatever the beat prints must contain the datum. `refresh_cause_brief` cuts
+# `why=` at 400 characters, so the assertion is made on that cut — not on the whole record.
+_why400="$(rec "$D" why | cut -c1-400)"
+case "$_why400" in
+  *"pre-flight issue=#42 cmd=collision_preflight.py --repo . rc=2 stderr=FLEET BOARD: cannot answer"*)
+    ok "datum: the QUOTABLE 400 characters carry issue, command, rc and stderr — not just prose" ;;
+  *) bad "datum: the datum is outside the beat's 400-char cut, so it is invisible — '$_why400'" ;;
+esac
+# …and it survives the LAST bound, the one the caller applies to the record it prints.
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  *"rc=2"*) ok "datum: the BLOCKED line carries the pre-flight's rc" ;;
+  *) bad "datum: the BLOCKED line has no rc=2 — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"collision_preflight.py"*) ok "datum: the BLOCKED line names the command that ran" ;;
+  *) bad "datum: the BLOCKED line names no command — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"FLEET BOARD: cannot answer"*) ok "datum: the BLOCKED line carries the tool's own stderr line" ;;
+  *) bad "datum: the BLOCKED line carries no stderr diagnostic — $OUT_DRIVE" ;;
+esac
+
+# ── 1d) THE DATUM FOLLOWS THE FAILING RUN, NOT THE LAST ONE JUDGED ──────────────
+# ⛔ MEASURED DEFECT IN THE FIRST DRAFT (review of #2401): `PRE_RC`/`PRE_ERR_LINE` are overwritten by
+# every candidate, so a pool of `#42 INCOMPLETE (rc 2)` then `#43 degraded CLEAN (rc 0)` recorded
+# `tool_rc=0 stderr=none` beside `first cause: … could not answer` — the record CONTRADICTED its own
+# first cause, asserting a healthy tool where the failing run exited 2. The snapshot must be taken at
+# the first UNUSABLE record, which is the same arm `unusable_cause` quotes.
+mk_case fail-mixed 42 43
+mk_tool_mixed "$D" 42
+rf "$D"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "mixed: the datum follows the FIRST failing run (rc 2), not the last (rc 0)" \
+  || bad "mixed: tool_rc='$(rec "$D" tool_rc)' (want 2) — the record contradicts its own first cause"
+[ "$(rec "$D" tool_issue)" = "42" ] \
+  && ok "mixed: and it names the candidate it belongs to (#42)" \
+  || bad "mixed: tool_issue='$(rec "$D" tool_issue)' (want 42)"
+[ "$(rec "$D" tool_arm)" = "issue-assignee-holder" ] \
+  && ok "mixed: and the ARM that recorded it, so the datum cannot be read as another arm's" \
+  || bad "mixed: tool_arm='$(rec "$D" tool_arm)' (want issue-assignee-holder)"
+case "$(rec "$D" why)" in
+  *"issue=#42"*"rc=2"*) ok "mixed: the persisted cause names #42 and its rc" ;;
+  *) bad "mixed: the cause does not name the failing candidate — '$(rec "$D" why)'" ;;
+esac
+# ── 1e) THE FOLD-BACK IS GRADED (a report on stderr still parses) ───────────────
+# De-merging stderr must not change what the PARSERS see. A producer that writes its whole report —
+# the INCOMPLETE SURFACES block and the VERDICT — to stderr must still be read; without the fold-back
+# the surface would be lost and the record would degrade to `unusable=unknown`.
+mk_case fail-stderr-report 42
+mk_tool_stderr_report "$D"
+rf "$D"
+case "$(rec "$D" unusable)" in
+  *"issue-assignee-holder"*) ok "stderr-report: the surface is still parsed from a stderr-only report" ;;
+  *) bad "stderr-report: the fold-back lost the report — unusable='$(rec "$D" unusable)'" ;;
+esac
+case "$(rec "$D" why)" in
+  *"issue-assignee-holder"*) ok "stderr-report: and it reaches the persisted cause" ;;
+  *) bad "stderr-report: the cause names no surface — '$(rec "$D" why)'" ;;
+esac
+
+# ── 1g) A CHATTY PRODUCER MUST NOT LOSE ITS VERDICT (#1716's class) ────────────
+# The fold must be PARITY with the `2>&1` it replaces, not a narrower slice: a bounded `tail -40`
+# drops the report of a producer that writes more than 40 stderr lines AFTER it, and the verdict-less
+# arm that follows INCREMENTS `retry-<N>` — the silent permanent suppression #1716 removed.
+mk_case fail-stderr-chatty 42
+mk_tool_stderr_chatty "$D"
+rf "$D"
+case "$(rec "$D" unusable)" in
+  *"issue-assignee-holder"*) ok "chatty: the report survives 60 trailing stderr lines" ;;
+  *) bad "chatty: a bounded fold lost the report — unusable='$(rec "$D" unusable)' (this is the #1716 retry/checked.txt path)" ;;
+esac
+[ -e "$D/o/state/pretry-42" ] \
+  && bad "chatty: the run fell into the verdict-less arm and INCREMENTED pretry-42 (it would be retired after RETRY_MAX)" \
+  || ok "chatty: and it never reaches the verdict-less arm that retires an issue"
+
+# ── 1h) THE DATUM AND THE FIRST CAUSE NAME THE SAME RECORD ─────────────────────
+mk_case fail-silent-first 42 43
+mk_tool_silent_then_surface "$D" 42
+rf "$D"
+[ "$(rec "$D" tool_issue)" = "42" ] \
+  && ok "same-record: the datum names the FIRST record (#42)" \
+  || bad "same-record: tool_issue='$(rec "$D" tool_issue)' (want 42)"
+case "$(rec "$D" why)" in
+  *"claim gate"*) bad "same-record: the first cause is #43's prose while the datum is #42's — the record contradicts itself" ;;
+  *) ok "same-record: and the first cause does not quote a LATER record" ;;
+esac
+
+# ── 1i) A `[`-LEADING STDERR LINE IS NOT A SURFACE ROW ─────────────────────────
+# The fold puts stderr AFTER the report (the old merged stream put it first), so the block parser's
+# terminator is what keeps a diagnostic from being read as a surface the producer never reported.
+mk_case fail-stderr-bracket 42
+mk_tool_stderr_bracket "$D"
+rf "$D"
+case "$(rec "$D" unusable)" in
+  *"preflight:"*) bad "bracket: a stderr line beginning with '[' was parsed as a SURFACE ROW — unusable='$(rec "$D" unusable)'" ;;
+  *) ok "bracket: a '['-leading stderr line is not a surface row" ;;
+esac
+case "$(rec "$D" unusable)" in
+  *"issue-assignee-holder"*) ok "bracket: and the REAL surface is still named" ;;
+  *) bad "bracket: the real surface was lost — '$(rec "$D" unusable)'" ;;
+esac
+[ "$(rec "$D" tool_arm)" = "issue-assignee-holder" ] \
+  && ok "bracket: the datum's arm is the real surface, never a fabricated one" \
+  || bad "bracket: tool_arm='$(rec "$D" tool_arm)' (want issue-assignee-holder)"
+
+# ── 1j) A BLANK STDERR IS NOT FOLDED (the label must never become a cause) ──────
+# ⛔ THE FIXTURE MUST BE VERDICT-LESS (review of #2401, fifth round). The first version used the
+# INCOMPLETE fixture, whose parseable surface row makes `record_unusable` fire from the SURFACE, so
+# `why` was the claim-gate prose whether or not the label was folded — deleting the whitespace gate
+# left the suite GREEN. The label can only become a cause through the VERDICT-LESS arm's
+# `tail -1`, so this fixture produces no stdout at all and whitespace-only stderr: with the gate the
+# pass folds nothing and records an empty reason; without it, the label IS the last non-blank line
+# and becomes the cause. Both halves are asserted, so a do-nothing fixture cannot pass.
+mk_case fail-stderr-blank 42
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stderr.write("   \n\n")   # whitespace only: says nothing, so nothing may be folded
+sys.exit(0)                    # …and NO verdict line, so the record's reason comes from tail -1
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D"
+case "$(rec "$D" why)" in
+  *"STDERR —"*) bad "blank-stderr: the label itself became the first cause — '$(rec "$D" why)'" ;;
+  *) ok "blank-stderr: a whitespace-only stderr contributes no cause" ;;
+esac
+case "$(rec "$D" unusable)" in
+  *"preflight-no-verdict"*) ok "blank-stderr: and the verdict-less arm still names the record (the fixture is not vacuous)" ;;
+  *) bad "blank-stderr: unusable='$(rec "$D" unusable)' — the fixture did not reach the arm under test" ;;
+esac
+
+# ── 1k) A DEGRADED SNAPSHOT MUST YIELD TO A LATER HARD FAILURE ──────────────────
+mk_case fail-degraded-first 42 43
+mk_tool_degraded_then_hard "$D" 42
+rf "$D"
+[ "$(rec "$D" tool_issue)" = "43" ] \
+  && ok "degraded-first: the datum is the HARD failure (#43), not the earlier healthy run" \
+  || bad "degraded-first: tool_issue='$(rec "$D" tool_issue)' (want 43) — the degraded arm's rc 0 won"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "degraded-first: and its rc (2), not the degraded run's 0" \
+  || bad "degraded-first: tool_rc='$(rec "$D" tool_rc)' (want 2)"
+case "$(rec "$D" tool_err)" in
+  *"FLEET BOARD: cannot answer"*) ok "degraded-first: and its stderr diagnostic" ;;
+  *) bad "degraded-first: tool_err='$(rec "$D" tool_err)' lost the diagnostic" ;;
+esac
+
+# ── 1l) AN INCOMPLETE ARM WITH NO ROW STILL CARRIES THE DATUM ──────────────────
+mk_case fail-norow 42
+mk_tool_incomplete_norow "$D"
+rf "$D"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "no-row: the INCOMPLETE arm records the pre-flight's rc even with no surface row" \
+  || bad "no-row: tool_rc='$(rec "$D" tool_rc)' (want 2) — the datum was available and dropped"
+[ "$(rec "$D" tool_arm)" = "preflight-incomplete" ] \
+  && ok "no-row: and names the arm, so its datum cannot be read as another arm's" \
+  || bad "no-row: tool_arm='$(rec "$D" tool_arm)' (want preflight-incomplete)"
+
+# ── 1m) THE SURFACE MUST SURVIVE A LONG STDERR (the datum must not crowd it out) ─
+# The inline stderr is cut to 80 characters so the surface clause and the datum both fit
+# `refresh_cause_brief`'s 400-char cut. Measured before that: a 200-char stderr pushed the BLOCKED
+# line to 566 characters and left `issue-assignee-ho` — the surface, cut mid-word.
+mk_case fail-longstderr 42
+mk_tool_stderr "$D"
+python3 - "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+src = src.replace(
+    'FLEET BOARD: cannot answer — no live-session store on this box',
+    'FLEET BOARD: cannot answer — no live-session store on this box; probe=/tmp/cell-home/.pi/'
+    'agent/state/live-sessions.json absent; RegistryUnreadable(FileNotFoundError: /tmp/cell-home/'
+    '.pi/agent/state/lane-registry.tsv)',
+)
+open(path, "w").write(src)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D"
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+# The beat prints `why=` cut at 400 (refresh_cause_brief), so the window that matters is the line's
+# first ~450 characters — not the whole line. Asserting on the untruncated line grades nothing.
+_window="$(printf '%s' "$OUT_DRIVE" | cut -c1-450)"
+case "$_window" in
+  *"failing surface(s): issue-assignee-holder"*) ok "longstderr: the surface survives intact inside the printed window" ;;
+  *) bad "longstderr: the surface was crowded out of the printed window — $_window" ;;
+esac
+case "$_window" in
+  *"rc=2"*) ok "longstderr: and the datum's rc still survives" ;;
+  *) bad "longstderr: the datum's rc was crowded out — $_window" ;;
+esac
+# ⛔ AND THE INLINE STDERR IS BOUNDED (80), while the RECORD keeps the whole line (review of #2401,
+# sixth round). Without this pair the shortening was ungraded: the full 200-char diagnostic reached
+# the printed line and ate the budget the surface and the datum both need.
+case "$_window" in
+  *"RegistryUnreadable"*) bad "longstderr: the UNBOUNDED diagnostic reached the printed line — the inline stderr is not being shortened" ;;
+  *) ok "longstderr: the inline diagnostic is bounded, so the surface and rc keep their room" ;;
+esac
+case "$(rec "$D" tool_err)" in
+  *"RegistryUnreadable"*) ok "longstderr: while the RECORD still carries the whole diagnostic" ;;
+  *) bad "longstderr: the record lost the full diagnostic — tool_err='$(rec "$D" tool_err)'" ;;
+esac
+
+# ── 1f) AND THE DATUM DOES NOT DISPLACE ITS PRE-EXISTING VOCABULARY ─────────────
+# ⛔ ASSERTED WHERE IT CAN FAIL (review of #2401). The first draft asserted on `$OUT` — the pass's own
+# stdout echo at the abort site, which contains `judged NOTHING` unconditionally — so a regression that
+# swapped the prose for the datum inside the PERSISTED cause (the artifact the controller actually
+# prints) left the suite green. The assertion belongs on the record and on the driven line.
+# ⛔ AND `$OUT_DRIVE` MUST BE RE-DRIVEN HERE, NOT INHERITED (review of #2401, R3): §1d/§1e never call
+# `drive_gate`, so the first draft graded §1c's case under this section's label — a passing assertion
+# attached to the wrong fixture.
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$(rec "$D" why)" in
+  *"produced a usable verdict"*) ok "datum: the persisted cause still says the pass judged nothing usable" ;;
+  *) bad "datum: the persisted cause lost 'produced a usable verdict' — '$(rec "$D" why)'" ;;
+esac
+case "$OUT_DRIVE" in
+  *"produced a usable verdict"*) ok "datum: and the BLOCKED line still carries it" ;;
+  *) bad "datum: the BLOCKED line lost it — $OUT_DRIVE" ;;
+esac
+
 
 # ── 1b) THE TABLE-ONLY SHAPE STILL NAMES THE SURFACE (the parser's fallback) ────
 mk_case fail-table 42
@@ -777,7 +1239,13 @@ mk_case fail-persist 42
 mk_tool_clean "$D"
 mkdir -p "$D/o/candidates.txt"      # a DIRECTORY where the queue file must be: the append cannot succeed
 rf "$D"
-[ "$RC" -eq 1 ] && ok "persist: the queue-append failure is TRANSIENT (rc=1)" || bad "persist: rc=$RC (want 1) — $OUT"
+# ⛔ rc=3, NOT 1 (review): this branch reclassified a `candidates.txt` that cannot be appended to on
+# ANY pass (a directory, or root-owned 444) from TRANSIENT to NOT PROVISIONABLE — the transient code
+# meant a full-cost pass every cycle for ever with no `.refresh-blocked`, i.e. the "cell reports
+# RUNNING and dispatches nothing" shape the patch refuses one file over. This assertion still pinned
+# the old class, so it is updated to the code's deliberate (and documented at the refusal) change.
+[ "$RC" -eq 3 ] && ok "persist: an unwritable queue file is NOT PROVISIONABLE (rc=3), so the retry stops instead of costing a pass per cycle" \
+                || bad "persist: rc=$RC (want 3 — a candidates.txt no pass can append to must stop the retry, not be re-attempted every cycle) — $OUT"
 [ "$(rec "$D" stage)" = "persist" ] && ok "persist: the record names the persist stage" \
   || bad "persist: record stage='$(rec "$D" stage)' (want persist)"
 case "$(rec "$D" cmd)" in
@@ -1004,7 +1472,133 @@ else
   bad "wiring: could not resolve the [origination:begin]/[origination:end] range"
 fi
 
-# ── 10) THE RECORD'S WRITER AND ITS READER MUST BE THE SAME GENERATION (agent-infra#2308) ──
+# ── 10) THE PRESENCE PROBE IS BOUNDED — AND AN ENV TOKEN COSTS NO gh CALL (TOKEN_HANG_FIX) ────────
+# MEASURED 2026-10-21 on these cell images: `gh auth token` does not fail, it HANGS (rc=142 under an
+# alarm, stdin closed, GH_TOKEN unset). The presence probe captured it UNBOUNDED, so this pass stalled
+# forever at stage=provision: every pass recorded `STALE(800m)` and ORIGINATION NEVER RAN all session.
+# Both halves are pinned here, because fixing only one of them leaves the outage:
+#   (a) a token in the ENVIRONMENT is presence, answered WITHOUT invoking gh — so the hanging probe is
+#       never reached and the pass COMPLETES (the negative assertion is the gh-call ledger, not prose:
+#       no output line can distinguish "asked and got an answer" from "never asked");
+#   (b) with no env token the probe is BOUNDED and a probe that cannot answer is PRESENCE UNKNOWN +
+#       TRANSIENT — never the permanent marker, and never a stall. The bound is asserted by WALL CLOCK
+#       (the defect is an unbounded wait, so a line-matching check would have passed on the broken copy
+#       in 5 minutes instead of failing), and the positive half (`auth token` WAS attempted) is asserted
+#       so a pass that skipped the probe entirely cannot read green.
+mk_case token-env 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$SECONDS
+OUT="$(run_env "$D" GH_TOKEN=fake-token GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED=$((SECONDS - T0))
+case "$OUT" in
+  *"PRESENCE UNKNOWN"*) bad "token-env: the pass reported PRESENCE UNKNOWN although GH_TOKEN is in the environment — the env token is being ignored, so a hanging gh is still consulted" ;;
+  *"FAILED stage=provision"*) bad "token-env: the pass refused at stage=provision with an env token present — $OUT" ;;
+  *) ok "token-env: an ENV token is accepted as presence (no refusal, no PRESENCE UNKNOWN)" ;;
+esac
+if [ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" = "0" ]; then
+  ok "token-env: 'gh auth token' was NEVER invoked (the presence question cost no gh call at all)"
+else
+  bad "token-env: 'gh auth token' was invoked $(grep -c 'auth token' "$GHCALLS") time(s) despite GH_TOKEN — that is the call that hangs on these images"
+fi
+[ "$ELAPSED" -lt 25 ] && ok "token-env: the pass completed in ${ELAPSED}s (the hanging probe cannot reach the clock)" \
+  || bad "token-env: the pass took ${ELAPSED}s with a hanging gh stub — the env short-circuit did not short-circuit"
+[ "$RC" -eq 0 ] && ok "token-env: the pass exits 0 (a provisionable box is not refused)" \
+  || bad "token-env: rc=$RC (want 0) — $OUT"
+
+mk_case token-hang 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$SECONDS
+OUT="$(run_env "$D" GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=3 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED=$((SECONDS - T0))
+# THE POSITIVE HALF FIRST: the probe WAS attempted (a pass that never probed cannot prove a bound).
+[ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" -ge 1 ] \
+  && ok "token-hang: the presence probe was ATTEMPTED (the bound is exercised, not skipped)" \
+  || bad "token-hang: 'gh auth token' was never invoked — this case proves nothing about a bound"
+case "$OUT" in
+  *"PRESENCE UNKNOWN"*) ok "token-hang: a probe that did not answer is reported as PRESENCE UNKNOWN, not as 'no credential'" ;;
+  *) bad "token-hang: no 'PRESENCE UNKNOWN' line — a hang is being read as an absent credential: $OUT" ;;
+esac
+[ "$ELAPSED" -lt 25 ] && ok "token-hang: the pass was BOUNDED at ${ELAPSED}s (GH_PROBE_TIMEOUT=3)" \
+  || bad "token-hang: the pass took ${ELAPSED}s against a 3s bound — the probe is unbounded, which is the outage"
+[ "$RC" -eq 1 ] && ok "token-hang: exits the TRANSIENT code (1), so the next cycle retries" \
+  || bad "token-hang: rc=$RC (want 1 TRANSIENT) — $OUT"
+[ "$(rec "$D" stage)" = "provision" ] && ok "token-hang: the record names stage=provision (the pass records an outcome instead of stalling)" \
+  || bad "token-hang: record stage='$(rec "$D" stage)' (want provision)"
+[ -e "$D/o/.refresh-blocked" ] \
+  && bad "token-hang: the PERMANENT marker .refresh-blocked was written for a probe that merely could not answer — a human-only-clear latch on a transient fault" \
+  || ok "token-hang: the permanent marker is NOT written (presence-unknown is transient by construction)"
+
+
+# ── A PROBE KILLED BY A SIGNAL IS NOT A SUCCESS (review findings on this PR, mutation-proved below) ──
+# Two defects, one class ("a non-answer read as a verdict"):
+#   * the bound forks and reaps, and perl puts a SIGNAL DEATH in the LOW byte of `$?`, so a bare
+#     `exit($? >> 8)` reported 0 for a killed child — an OOM-killed `gh` read as "credential present and
+#     the API answered";
+#   * re-spelling it as 128+N only helps if the CONSUMER treats the whole class as a non-answer; a list
+#     of {142,124,137} sent SIGTERM/SEGV/ABRT to the "no credential STORED" arm and latched the
+#     human-only-clear MERGE-ONLY marker.
+# So two signals are driven: SIGKILL (the OOM shape) and SIGTERM (the service-manager shape).
+for _sig in KILL TERM; do
+  mk_case "token-sig$_sig" 42
+  mk_tool_clean "$D"
+  OUT="$(run_env "$D" GH_AUTH_TOKEN_SIG="$_sig" GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+  case "$OUT" in
+    *"PRESENCE UNKNOWN"*) ok "token-sig$_sig: a probe KILLED BY SIG$_sig reads as PRESENCE UNKNOWN, not as success" ;;
+    *"NOT PROVISIONABLE"*) bad "token-sig$_sig: a kill by SIG$_sig was read as 'no credential STORED' — a kill is a non-answer, not an absence: $OUT" ;;
+    *) bad "token-sig$_sig: a signal-killed probe was read as a SUCCESS (the exit-status-shift defect): $OUT" ;;
+  esac
+  [ "$RC" -ne 0 ] && ok "token-sig$_sig: the pass does not report success off a killed probe (rc=$RC)" \
+                  || bad "token-sig$_sig: rc=0 — a probe killed by SIG$_sig blessed the box"
+done
+
+# ── THE PROBE'S ERROR FILE CLEANUP CANNOT DELETE A DEVICE (review finding, cycle 3) ──────────────────
+# When ${TMPDIR} is unwritable the error path falls back to `/dev/null`, so an unguarded
+# `rm -f "$GH_PROBE_ERR"` on an exit path deletes the DEVICE NODE (refused for an unprivileged user,
+# destructive for root). ONE guarded cleanup point, and no other `rm -f` of that variable anywhere.
+# comment lines are excluded (the block above QUOTES the pattern it warns about)
+_n_rm="$(grep -v '^[[:space:]]*#' "$REFRESH" | grep -c 'rm -f "\$GH_PROBE_ERR"' || true)"
+[ "${_n_rm:-0}" = "1" ] && ok "probe-error cleanup: exactly ONE code-level rm of \$GH_PROBE_ERR (a single guarded point)" \
+                       || bad "probe-error cleanup: ${_n_rm:-0} code-level rm sites for \$GH_PROBE_ERR — each must remember the /dev/null guard"
+if grep -q 'gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in .*|/dev/null)' "$REFRESH"; then
+  ok "probe-error cleanup: the sentinel /dev/null is GUARDED, so the device node is never removed"
+else
+  bad "probe-error cleanup: nothing guards the /dev/null fallback — a root run could delete /dev/null"
+fi
+# …and the fallback really happens: an unwritable TMPDIR must not fail the pass or remove the device.
+mk_case token-badtmp 42
+mk_tool_clean "$D"
+OUT="$(run_env "$D" GH_TOKEN=fake-token TMPDIR=/nonexistent-refresh-$$ GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+# ⛔ OBSERVED THROUGH A STUB `rm`, NOT THROUGH `[ -c /dev/null ]` (review P3 on this PR): an unprivileged
+# runner's `rm -f /dev/null` is silently REFUSED, so the device-exists assertion cannot go red on the
+# broken code in the environment this suite actually runs in — a vacuous check. A stub `rm` that only
+# RECORDS is privilege-independent, and it is paired with its positive half so neither direction is
+# vacuous: /dev/null must invoke `rm` ZERO times, a real temp path must invoke it ONCE.
+_stub="$D/bin-norm"; mkdir -p "$_stub"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "${RMLOG:-/dev/null}"\n' > "$_stub/rm"
+chmod +x "$_stub/rm"
+eval "$(sed -n 's/^\(gh_probe_err_cleanup() {.*\)$/\1/p' "$REFRESH")"
+if command -v gh_probe_err_cleanup >/dev/null 2>&1; then
+  RMLOG="$D/rm.log"; : > "$RMLOG"
+  GH_PROBE_ERR=/dev/null RMLOG="$RMLOG" PATH="$_stub:$PATH" gh_probe_err_cleanup
+  [ -s "$RMLOG" ] \
+    && bad "probe-error cleanup: the cleanup invoked \`rm\` for the /dev/null SENTINEL ($(cat "$RMLOG")) — the guard is gone" \
+    || ok "probe-error cleanup: /dev/null is never handed to rm (observed through a recording stub, not through the device)"
+  printf 'stderr\n' > "$D/probe.err"
+  GH_PROBE_ERR="$D/probe.err" RMLOG="$RMLOG" PATH="$_stub:$PATH" gh_probe_err_cleanup
+  [ -s "$RMLOG" ] \
+    && ok "probe-error cleanup: a REAL probe file IS removed (the cleanup is not disabled)" \
+    || bad "probe-error cleanup: a real probe file was not removed — the cleanup does nothing at all"
+else
+  bad "probe-error cleanup: could not extract gh_probe_err_cleanup from the shipped script — the guard is unproven"
+fi
+case "$OUT" in
+  *"FAILED stage=provision"*) bad "probe-error cleanup: an unwritable TMPDIR refused the pass at stage=provision (the probe path must not depend on it)" ;;
+  *) ok "probe-error cleanup: an unwritable TMPDIR does not turn a provisionable box into a refusal" ;;
+esac
+
+# ── 11) THE RECORD'S WRITER AND ITS READER MUST BE THE SAME GENERATION (agent-infra#2308) ──
 # The measured defect this section exists for: a live cell's beat printed `BLOCKED: … so the pass
 # DIED` on every cycle for 16 hours. The pass had not died — the controller executes
 # `$O/refresh-candidates.sh` (the SEEDED copy) and THAT copy predated the pass record, so it could not
