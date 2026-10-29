@@ -1,0 +1,10 @@
+# FAILURE-CLASS FIXTURE (R1): a pull_request entry point with NO concurrency block — every
+# superseded head runs to completion and holds the queue.
+name: pr-no-concurrency
+on:
+  pull_request:
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
