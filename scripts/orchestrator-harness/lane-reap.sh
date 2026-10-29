@@ -169,9 +169,17 @@ WINDOW="${LANE_REAP_WINDOW:-30}"
 CPU_TOL_CS="${LANE_REAP_CPU_TOL_CS:-10}"
 # NOT `IDLE_MIN`: that name is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh`
 # (its 9-minute "spinner absent ⇒ finished" classification bound). This is a different bound with
-# a different value (2 h), so sharing the name would read as one authority and hide the divergence
+# a different value (3 h), so sharing the name would read as one authority and hide the divergence
 # the registry exists to surface. The env seam keeps its documented `LANE_REAP_` prefix.
-LANE_IDLE_MIN="${LANE_REAP_IDLE_MIN:-120}"
+# ⛔ THE SHIPPED DEFAULT IS DELIBERATELY ABOVE **TWO** OTHER BOUNDS, and both orderings are pinned by
+# `lane-bound.test.sh` (i0) so the next edit cannot re-invert them (agent-infra#2888 review, F4):
+#   1. `LIVE_MIN` (the capacity census's "this lane's log moved, so it is live" window). LIVE_MIN must
+#      sit ABOVE the backstop (a lane may legitimately run that long), and the idle window must sit
+#      ABOVE LIVE_MIN — otherwise a lane in the band between them is counted LIVE for capacity AND is
+#      a reap CANDIDATE, two shipped instruments disagreeing about the same lane. 125 < 180.
+#   2. `LANE_BACKSTOP_S` (7200 s = 120 min). At 120 the reaper could declare a lane finished at the
+#      exact instant its own backstop still allows it to run, with no evidence but log silence.
+LANE_IDLE_MIN="${LANE_REAP_IDLE_MIN:-180}"
 NO_LOG_H="${LANE_REAP_NO_LOG_H:-12}"
 LIVE_MIN="${LANE_REAP_LIVE_MIN:-125}"
 READ_TIMEOUT="${LANE_REAP_READ_TIMEOUT:-60}"
