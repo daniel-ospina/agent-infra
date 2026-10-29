@@ -4062,24 +4062,48 @@ function verdictLine(token: "PASS" | "FAIL"): RegExp {
  * #10219: the line the gate TESTED as a verdict, so a refusal says WHY it was refused.
  * The finding's third ask was that a lane not have to bisect by re-dispatching: a reply
  * rendered as `[16:42] PASS` was refused with no statement about the line that was read.
- * Only a line that already mentions PASS/FAIL is echoed (so the echo is verdict-ish content,
- * never the verifier's prose or a file it quoted), bounded to 120 chars, and it is the LINE
- * the gate tested — never the whole reply.
+ *
+ * The candidate line is the FIRST non-empty line of the reply that mentions PASS/FAIL — a
+ * line-anchored verdict line OR ordinary prose that mentions the token (`The PASS criteria are
+ * met by f.py`). It is deliberately NOT a filter for "the verifier's prose or a file it quoted":
+ * the gate cannot tell an unread verdict from prose, so the bound is 120 chars on a SINGLE line,
+ * and it is the LINE the gate tested — never the whole reply.
+ *
+ * ⛔ The note is filed under the DISPATCH that wrote it (`verdictLineDispatchSeq`). A stale note
+ * must never be rendered as if it described a LATER reply: `empty-content` / `no-text` return
+ * BEFORE the parse, so they write no note, and a leftover one rendered under their ceremony
+ * would contradict the ceremony above it and point the lane at the wrong remedy ("re-shape this
+ * line") for a line the gate had already read — and blocked on (review r1 P2). A correlation id
+ * on the record is the convergent shape: OpenTelemetry's Logs Data Model carries `SpanId` on a
+ * log record precisely so a diagnostic is attributable to the operation that produced it
+ * (data-model, "Field: SpanId").
  */
 let lastVerdictLineTested: string | null = null;
 let lastVerdictLineKnown = false;
+/** Monotonic id of the current [VGATE] dispatch — the identity a tested-line note is filed under. */
+let verdictLineDispatchSeq = 0;
+let lastVerdictLineSeq = -1;
+/** Bumped at the START of every [VGATE] dispatch, before any outcome is recorded. */
+function beginVerdictDispatch(): void {
+  verdictLineDispatchSeq++;
+}
 function noteVerdictText(text: string): void {
   const line = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0 && /PASS|FAIL/i.test(l));
   lastVerdictLineTested = line ? line.slice(0, 120) : null;
   lastVerdictLineKnown = true;
+  lastVerdictLineSeq = verdictLineDispatchSeq;
 }
 function clearVerdictLine(): void {
   lastVerdictLineTested = null;
   lastVerdictLineKnown = false;
+  lastVerdictLineSeq = -1;
 }
 /** The #10219 diagnostic appended to a block whose last dispatch was a FORMAT failure. */
 export function verdictLineDiagnostics(): string {
   if (!lastVerdictLineKnown) return "";
+  // A note filed under an EARLIER dispatch belongs to THAT reply, not to the one the ceremony
+  // above describes — suppress it rather than misattribute the line.
+  if (lastVerdictLineSeq !== verdictLineDispatchSeq) return "";
   if (lastVerdictLineTested === null) {
     return "\n  ⚠️ No line of the last verifier reply mentioned PASS or FAIL — there was no verdict to read.";
   }
@@ -4868,6 +4892,8 @@ export default function (pi: ExtensionAPI) {
     const isVerifier = agent === "verifier" || prompt.includes("[VGATE]");
     if (!isVerifier) return undefined;
     lastVerifierNote = null; // #1660: the disposition always reflects the LATEST verifier dispatch (a stale zero-merge note must not outlive the dispatch that supersedes it)
+    beginVerdictDispatch(); // #10219: a tested-line note is filed under THIS dispatch, so one that never
+    // reaches the parse (empty-content / no-text / background) cannot resurrect its predecessor's line
 
     // #1662 — a `task({ background: true })` dispatch returns a RETURNS-EARLY
     // notice AT DISPATCH, not a verifier verdict. Its content is deliberately

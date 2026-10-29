@@ -20,16 +20,24 @@
  *       fall through every FAIL arm and fail-open (the prompt's files blessed with no verdict read).
  *   (d) a refused reply NAMES THE LINE IT TESTED (the finding's third ask), so a lane does not have
  *       to bisect by re-dispatching.
+ *   (d2) that note belongs to the DISPATCH that wrote it — a later reply that never reached the parse
+ *       (`empty-content`, `no-text`) must not inherit the previous reply's line as if it were its own.
  *
- * MUTATIONS (each was RUN against this file on the pre-fix tree; 10 of the 22 assertions went red):
+ * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 26 cases that
+ * went red under that single mutation, not an estimate — an unmeasured count here was review r1's
+ * second finding):
  *   M1 revert the `verdictLine` helper to the pre-#10219 bare-token hasPass
- *      → (a) labelled/quoted/bracketed cases + the non-standard-prompt case
+ *      → 8 red: (a)'s 7 labelled/quoted/bracketed cases + the non-standard-prompt case
  *   M2 revert hasFail to its pre-#10219 arms
- *      → (c)'s interactive leg ONLY. ⚠ The print-mode (c) legs pass either way — in print mode a
+ *      → 1 red: (c)'s interactive leg ONLY. ⚠ The print-mode (c) legs pass either way — in print mode a
  *        FAIL the arms miss is refused as `unparseable`, so the assertion holds for the wrong
  *        reason. That is why (c) carries an explicit INTERACTIVE leg: it is the one that
  *        discriminates, and it was verified red on the pre-fix tree.
- *   M3 drop the `noteVerdictText` call → both (d) cases
+ *   M3 drop the `noteVerdictText` call → 3 red: both (d) cases + (d2)'s positive control
+ *   M4 drop the note's per-dispatch attribution (render it for any FORMAT class) → 2 red: both (d2)
+ *      stale-note cases. That is the discriminator for review r1's first finding: pre-fix, the note
+ *      survives a dispatch that never reached the parse, so a refusal quotes the PREVIOUS reply's
+ *      line, calls it the last one, and points the lane at a line the gate had already read.
  *   NOT mutation-pinned: the line anchor and the `\b` are pinned by (b) as PRE-EXISTING behavior
  *   (they passed before the fix and must keep passing) — they are regressions guards, not
  *   discriminators, and are stated here rather than implied.
@@ -97,11 +105,20 @@ async function runAll() {
 }
 
 let repoSeq = 0;
+/** The content block shapes a verifier dispatch can actually deliver — both non-parse outcomes are real. */
+type Reply = { text: string } | { emptyContent: true } | { noTextBlock: true };
+function replyContent(r: Reply): any {
+  if ("emptyContent" in r) return [];
+  if ("noTextBlock" in r) return [{ type: "image", data: "x" }];
+  return [{ type: "text", text: r.text }];
+}
 /**
- * Stage one file in a fresh repo, let the gate block it, fire the verifier reply, and return the
- * verdict of the retried commit: `undefined` = ALLOWED, an object = BLOCKED (with its reason).
+ * Stage one file in a fresh repo, let the gate block it, fire every verifier reply in order, and
+ * return the verdict of the retried commit: `undefined` = ALLOWED, an object = BLOCKED (with its
+ * reason). The SEQUENCE matters for #10219's tested-line note: a note is only ever rendered for the
+ * dispatch that wrote it, so a case has to be able to deliver a second, non-parsing reply.
  */
-async function verdictFor(reply: string, promptKind: "standard" | "nonstandard" = "standard", mode: "lane" | "interactive" = "lane"): Promise<any> {
+async function verdictAfter(replies: Reply[], promptKind: "standard" | "nonstandard" = "standard", mode: "lane" | "interactive" = "lane"): Promise<any> {
   const laneMode = { PI_MODE: process.env.PI_MODE, TASK_HEARTBEAT: process.env.TASK_HEARTBEAT };
   if (mode === "interactive") { delete process.env.PI_MODE; delete process.env.TASK_HEARTBEAT; }
   else { process.env.PI_MODE = "print"; process.env.TASK_HEARTBEAT = "1"; }
@@ -121,15 +138,21 @@ async function verdictFor(reply: string, promptKind: "standard" | "nonstandard" 
   const prompt = promptKind === "standard"
     ? `[VGATE] verify files: f.py. Classification: backend. Project root: ${repo}`
     : `[VGATE] confirm the staged change. Classification: backend. Project root: ${repo}`;
-  await fire("tool_result", {
-    toolName: "task", input: { prompt }, content: [{ type: "text", text: reply }],
-  });
+  for (const r of replies) {
+    await fire("tool_result", {
+      toolName: "task", input: { prompt }, content: replyContent(r),
+    });
+  }
   const res = await fire("tool_call", {
     type: "tool_call", toolName: "bash", input: { command: "git commit -m 'c'", cwd: repo },
   });
   await fire("session_start", {});
   for (const [k, v] of Object.entries(laneMode)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   return res;
+}
+
+async function verdictFor(reply: string, promptKind: "standard" | "nonstandard" = "standard", mode: "lane" | "interactive" = "lane"): Promise<any> {
+  return verdictAfter([{ text: reply }], promptKind, mode);
 }
 
 async function main() {
@@ -219,6 +242,35 @@ async function main() {
     ok(res && res.block === true, "no-verdict prose must block");
     const reason = String(res.reason ?? "");
     ok(/No line of the last verifier reply mentioned PASS or FAIL/.test(reason), `expected the no-verdict line; got: ${reason.slice(-400)}`);
+  });
+
+  // ⛔ The note is filed under the DISPATCH that wrote it (review r1 P2). `empty-content` and
+  // `no-text` return BEFORE the parse, so they write NO note — and pre-fix the leftover one from the
+  // PREVIOUS reply was rendered under their ceremony: a false "the last verifier reply mentioned a
+  // verdict…" (it was not the last reply) about a line the gate had already READ and blocked on,
+  // pointing the lane at the wrong remedy while contradicting the ceremony above it.
+  console.log("\n(d2) a note belongs to its OWN dispatch — a later non-parsing reply must not inherit it:");
+
+  test("(d2) after a FAIL, an `empty-content` dispatch does not resurrect the FAIL line", async () => {
+    const res = await verdictAfter([{ text: "FAILED: hashes mismatch" }, { emptyContent: true }]);
+    ok(res && res.block === true, "an empty-content dispatch must still block");
+    const reason = String(res.reason ?? "");
+    ok(/empty-content/.test(reason), `the empty-content ceremony itself must still render; got: ${reason.slice(-500)}`);
+    ok(!/mentioned a verdict on this line/.test(reason), `the stale tested-line note must NOT be rendered under a LATER dispatch's ceremony; got: ${reason.slice(-500)}`);
+    ok(!reason.includes("FAILED: hashes mismatch"), "the previous reply's line must not be echoed as if it were this reply's");
+  });
+  test("(d2) after a FAIL, a `no-text` dispatch does not resurrect the FAIL line either", async () => {
+    const res = await verdictAfter([{ text: "FAIL: two tests are broken" }, { noTextBlock: true }]);
+    ok(res && res.block === true, "a no-text dispatch must still block");
+    const reason = String(res.reason ?? "");
+    ok(/no-text/.test(reason), `the no-text ceremony itself must still render; got: ${reason.slice(-500)}`);
+    ok(!/mentioned a verdict on this line/.test(reason), `the stale tested-line note must NOT be rendered; got: ${reason.slice(-500)}`);
+    ok(!reason.includes("FAIL: two tests are broken"), "the previous reply's line must not be echoed");
+  });
+  test("(d2) a note IS still rendered for the dispatch that wrote it (the positive control)", async () => {
+    const res = await verdictFor("My verdict is PASS, everything looks good.");
+    ok(res && res.block === true, "a mid-line verdict must not clear the gate");
+    ok(/mentioned a verdict on this line/.test(String(res.reason ?? "")), "the note must still render for its OWN dispatch");
   });
 
   await runAll();
