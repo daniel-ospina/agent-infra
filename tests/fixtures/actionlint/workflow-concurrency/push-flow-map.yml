@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (R2, readability): the cancellation is declared in a FLOW MAPPING
+# (`concurrency: {…}`) — valid YAML, one line, and invisible to a reader that only looks for indented
+# children beneath `concurrency:`. Consequently `cancel-in-progress` reads as ABSENT, which R2 accepts
+# as GitHub's default, and a cancelling push workflow reports GREEN (round-3 P0).
+name: push-flow-map
+on:
+  push:
+    branches: [main]
+concurrency: {group: "push-flow-map-${{ github.ref }}", cancel-in-progress: true}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
