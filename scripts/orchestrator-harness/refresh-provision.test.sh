@@ -36,6 +36,22 @@
 #   (c3) the "comparison could not be performed" arm still refuses when the two form guards
 #        are deleted in a copy — so the third guard is live, not dead code.
 #
+# #2953 — A SHALLOW GRAFT IS NOT LOCAL WORK, one arm each (the fixture is the CELL's shape:
+# `--depth 2` so the trunk tip's parent becomes a graft root while the objects below it remain):
+#   (s0) the fixture IS the defect shape — shallow, SEVERED (no merge base), count>1, tree CLEAN;
+#   (s1) a CLEAN shallow scout PROCEEDS, reaches origin/main, and the log names the discarded number;
+#   (s2) NON-VACUITY: with the old inference restored (one line), (s1) goes RED — a clean scout refused
+#        with the false PRESERVE remedy;
+#   (s3) a REAL local commit is STILL REFUSED, says "1 LOCAL commit(s)", and the commit survives;
+#   (s4) an UNRELATED history (orphan branch, not shallow) is REFUSED and NOT reported as unfetched —
+#        the arm that stops the new "fetch" wording becoming a hole for local work;
+#   (s5) a scout whose `.git` link does not resolve is STILL rc=3 (#2217's refused shape);
+#   (s6) `.git` REMOVED entirely is a DECLARED RESIDUAL (#2217): pinned as it IS (announced, proceeds),
+#        not as it might be hoped to be;
+#   (s7) `--check` does NOT fail a clean shallow scout — `cloud-cell-bringup.sh` DIES on a non-zero
+#        `--check`, so that second copy of the comparison was a cell that could not START;
+#   (s8) NON-VACUITY for (s7): the old `--check` arm still FAILS the same tree.
+#
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
 # and no network is touched. `gh` is a stub, the pre-flight tool is a stub python file TRACKED at
@@ -50,6 +66,26 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+# mut <out-path> — produce a MUTATION COPY of the shipped script by running the Python program on stdin
+# (`python3 - "$REFRESH" <out-path>`), and say cleanly when it could not:
+#   * the copy was WRITTEN  ⇒ 0;
+#   * the anchor DRIFTED, the revert was a NO-OP, or anything else failed ⇒ print ONE line and remove
+#     the partial file.
+# ⛔ WHY THIS EXISTS (#2956 review, cosmetic). These controls used to guard themselves with bare
+# `assert` statements, so a control whose anchor had moved died with a PYTHON TRACEBACK — and, worse, a
+# `src.replace()` that matched nothing produced a copy IDENTICAL to the shipped script, i.e. a control
+# that proves nothing while the suite still prints `ok`. A traceback is not a diagnosis, and a vacuous
+# control is not a control: both now come out as one ❌ on the arm's own `ck` line.
+mut() {
+  local out="$1" err
+  if err="$(python3 - "$REFRESH" "$out" 2>&1)"; then
+    [ -s "$out" ] && return 0
+    err="the mutation program wrote nothing"
+  fi
+  rm -f "$out"
+  echo "  (control not produced: ${err//$'\n'/ })"
+  return 1
+}
 # ⛔ RESOLVED, not the raw mktemp string: $TMPDIR on macOS ends in `/`, so `mktemp -d "$TMPDIR/x.XXXXXX"`
 # yields a path with a DOUBLED slash (`…/T//refresh-provision.X`). git answers `--absolute-git-dir`
 # with its own normalised form, so a raw-$T comparison of the lock path against the script's own
@@ -85,10 +121,16 @@ PY
   printf 'new\n' > "$D/repo/README.md"
   git -C "$D/repo" add -A; git -C "$D/repo" commit -qm two
   git -C "$D/repo" push -q origin main
-  # a `gh` that answers every box-level precondition: a stored credential, a healthy core bucket, and
-  # READABLE EMPTY collections (so the pool is empty but never unreadable).
-  # ⛔ `gh api -i` MUST ANSWER IN THE RESPONSE SHAPE THE SHIPPED HELPER PARSES (headers + body), or the
-  # listing stage reads an empty body as UNREADABLE and the arm measures the wrong stage (measured).
+  mk_gh_stub "$D"
+}
+
+# mk_gh_stub <case-dir> — the `gh` every arm's box-level preconditions are answered by.
+# a `gh` that answers every box-level precondition: a stored credential, a healthy core bucket, and
+# READABLE EMPTY collections (so the pool is empty but never unreadable).
+# ⛔ `gh api -i` MUST ANSWER IN THE RESPONSE SHAPE THE SHIPPED HELPER PARSES (headers + body), or the
+# listing stage reads an empty body as UNREADABLE and the arm measures the wrong stage (measured).
+mk_gh_stub() {
+  local D="$1"
   cat > "$D/bin/gh" <<'SH'
 #!/bin/bash
 case "$1 $2" in
@@ -101,6 +143,35 @@ case "$1 $2" in
 esac
 SH
   chmod +x "$D/bin/gh"
+}
+
+# ── #2953: mk_shallow_case <name> — the CELL's shape, not a healthy tree ──────────────────────────────
+# cell4's scout is a worktree of a HUB whose object database is SHALLOW: `.git/shallow` listed the trunk
+# tip's OWN PARENT, so the walk from `origin/main` stopped one commit in while the walk from the scout's
+# HEAD ran down every object the box held — and `origin/main..HEAD` answered 1634 for a CLEAN scout with
+# zero local commits. A `--depth 2` fetch reproduces exactly that: the tip's parent becomes a graft root
+# while the objects it used to connect to are still present below it.
+# ⛔ THE SCOUT IS PARKED FIVE COMMITS INSIDE THE BODY, deliberately: the severed count is then 5, so no
+# arm can confuse it with the ONE local commit arm (s3) plants — the two numbers an operator has to tell
+# apart. And the trunk still ADDS the pre-flight tool (as in mk_case), so `scout_verify_tool` has a real
+# blob and this fixture can measure the WHOLE provision stage rather than a shortened one.
+mk_shallow_case() {
+  local i
+  D="$T/$1"
+  mkdir -p "$D/home" "$D/bin" "$D/o"
+  git init -q --bare "$D/origin.git"
+  git init -q -b main "$D/repo"
+  mkdir -p "$D/repo/.git/info"; printf '.worktrees/\n' > "$D/repo/.git/info/exclude"
+  git -C "$D/repo" config user.email t@t; git -C "$D/repo" config user.name t
+  git -C "$D/repo" remote add origin "$D/origin.git"
+  mkdir -p "$D/repo/tools"
+  printf '#!/usr/bin/env python3\nimport sys\nprint("VERDICT: CLEAN")\n' > "$D/repo/tools/collision_preflight.py"
+  for i in 1 2 3 4 5; do echo "$i" > "$D/repo/f$i.txt"; git -C "$D/repo" add -A; git -C "$D/repo" commit -qm "body$i"; done
+  git -C "$D/repo" worktree add -q "$D/repo/.worktrees/dispatch-scout" -b chore/dispatch-scout
+  for i in 6 7 8 9 10; do echo "$i" > "$D/repo/f$i.txt"; git -C "$D/repo" add -A; git -C "$D/repo" commit -qm "c$i"; done
+  git -C "$D/repo" push -q origin main
+  mk_gh_stub "$D"
+  git -C "$D/repo" fetch -q --depth 2 origin "+refs/heads/main:refs/remotes/origin/main"
 }
 
 # rp <case-dir> — run the SHIPPED script; $OUT/$RC. Provisioning knobs are cleared so an operator's
@@ -286,20 +357,31 @@ mk_case status-arm
 LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
 : > "$LOCK"
 MUT="$D/refresh-no-guards.sh"
-python3 - "$REFRESH" "$MUT" <<'PY2'
+mut "$MUT" <<'PY2'
 import sys
 src = open(sys.argv[1]).read()
 canon = "    ''|*[!0-9]*|0*)"
-assert canon in src, "canonical-form arm missing — this control would be vacuous"
-src = src.replace(canon, "    ''|*[!0-9]*|0)")
-i = src.index('  if [ "${#SCOUT_LOCK_STALE_SECS}" -gt 9 ]; then')
-j = src.index('  fi\n', i) + len('  fi\n')
-src = src[:i] + src[j:]
-assert 'SCOUT_LOCK_STALE_SECS}" -gt 9' not in src, "length guard still present — control vacuous"
-assert '0*)' not in src, "canonical arm still present — control vacuous"
-open(sys.argv[2], "w").write(src)
+if canon not in src:
+    sys.exit("canonical-form arm missing — this control would be vacuous")
+out = src.replace(canon, "    ''|*[!0-9]*|0)")
+if out == src:
+    sys.exit("the canonical-form revert was a NO-OP — this control would prove nothing")
+start = '  if [ "${#SCOUT_LOCK_STALE_SECS}" -gt 9 ]; then'
+if start not in out:
+    sys.exit("the length guard is missing — this control would be vacuous")
+i = out.index(start)
+end = out.find('  fi\n', i)
+if end < 0:
+    sys.exit("the length guard's 'fi' was not found — this control would be vacuous")
+out = out[:i] + out[end + len('  fi\n'):]
+if 'SCOUT_LOCK_STALE_SECS}" -gt 9' in out:
+    sys.exit("length guard still present — control vacuous")
+if '0*)' in out:
+    sys.exit("canonical arm still present — control vacuous")
+open(sys.argv[2], "w").write(out)
 PY2
 ck "(c3) the no-guards control was actually produced" "$([ -s "$MUT" ]; echo $?)"
+if [ -s "$MUT" ]; then
 OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
         SCOUT_LOCK_STALE_SECS=9223372036854775808 \
         HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" \
@@ -311,6 +393,7 @@ case "$(rec why)" in *"could not be compared"*) r=0 ;; *) r=1 ;; esac
 ck "(c3) the cause says the comparison could not be performed (why=$(rec why | cut -c1-90))" "$r"
 case "$OUT" in *"REPAIR: removed"*) r=1 ;; *) r=0 ;; esac
 ck "(c3) no REPAIR line was printed on the uncomparable bound" "$r"
+fi
 
 # ── (d) NON-VACUITY: revert the cause-recording, and (a) MUST go red ────────────────────────────────
 # A copy of the SHIPPED script with ONE line reverted to the pre-fix shape (`|| exit "$SCOUT_REFUSE_RC"`
@@ -318,14 +401,19 @@ ck "(c3) no REPAIR line was printed on the uncomparable bound" "$r"
 # attributable to the cause-recording itself.
 mk_case nonvacuity
 PRE="$T/refresh-candidates.prefix.sh"
-python3 - "$REFRESH" "$PRE" <<'PY'
+mut "$PRE" <<'PY'
 import sys
 src = open(sys.argv[1]).read()
 needle = 'scout_sync || provision_fail "$SCOUT_REFUSE_RC" "sub-step=scout-sync: ${SCOUT_REFUSE_WHY:-scout_sync refused without a recorded reason}"'
-assert needle in src, "the cause-recording line is missing — this control would be vacuous"
-open(sys.argv[2], "w").write(src.replace(needle, 'scout_sync || exit "$SCOUT_REFUSE_RC"'))
+if needle not in src:
+    sys.exit("the cause-recording line is missing — this control would be vacuous")
+out = src.replace(needle, 'scout_sync || exit "$SCOUT_REFUSE_RC"')
+if out == src:
+    sys.exit("the cause-recording revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
 PY
 ck "(d) the pre-fix control was actually produced (one line reverted)" "$([ -s "$PRE" ]; echo $?)"
+if [ -s "$PRE" ]; then
 LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
 : > "$LOCK"
 rp "$D" "$PRE"
@@ -334,6 +422,176 @@ case "$WHY" in *"recorded no cause"*) r=0 ;; *) r=1 ;; esac
 ck "(d) WITHOUT the fix the record says 'recorded no cause' (why=${WHY:0:100})" "$r"
 case "$WHY" in *"sub-step=scout-sync"*) r=1 ;; *) r=0 ;; esac
 ck "(d) WITHOUT the fix the sub-step is NOT named" "$r"
+fi
+
+# ══ #2953: A SHALLOW GRAFT IS NOT LOCAL WORK ═══════════════════════════════════════════════════════
+# MEASURED on cell4, 2026-10-27: a CLEAN scout with ZERO local commits was refused on every pass —
+#     scout HEAD=fadb6334  dirty=0  local-only commits: 1634
+# — while `refs/remotes/origin/main` was the FRESH trunk tip, TWO COMMITS AHEAD of HEAD. `.git/shallow`
+# listed the tip's own parent, so the walk from origin/main stopped one commit in: the 1 634 were the
+# checkout's OWN history. The guard could not say WHICH difference it had found (preserve vs fetch), so
+# it printed an unactionable PRESERVE remedy — and nothing on a box moves a shallow boundary, so the
+# refusal was a transient that could never clear. Every arm below runs against that shape.
+
+# ── (s0) THE FIXTURE IS THE DEFECT SHAPE, NOT A HEALTHY TREE ─────────────────────────────────
+# Asserted BEFORE the run: without this, every arm below would pass by measuring a tree that never had
+# the defect (the fixture is the whole test here).
+mk_shallow_case shallow-clean
+SD="$D/repo/.worktrees/dispatch-scout"
+SEVERED="$(git -C "$SD" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null)"
+if git -C "$SD" merge-base HEAD refs/remotes/origin/main >/dev/null 2>&1; then r=1; else r=0; fi
+ck "(s0) the fixture hub IS shallow" "$([ "$(git -C "$D/repo" rev-parse --is-shallow-repository)" = true ]; echo $?)"
+ck "(s0) the scout's history is SEVERED from origin/main (no merge base)" "$r"
+ck "(s0) the count the guard would read is ${SEVERED} (want >1, so it cannot be mistaken for (s3)'s ONE)" \
+   "$([ "${SEVERED:-0}" -gt 1 ]; echo $?)"
+ck "(s0) the scout tree is CLEAN — exactly the state cell4 refused" \
+   "$([ -z "$(git -C "$SD" status --porcelain --untracked-files=no)" ]; echo $?)"
+
+# ── (s1) A CLEAN SHALLOW SCOUT PROCEEDS ───────────────────────────────────────────────────────────
+# THE ACCEPT CRITERION. The pass must repair the graph (deepen) and move the gate, and the log must NAME
+# the number it discarded — an operator reading "scout STALE" for a tree that was never ahead has to be
+# able to see why.
+rp "$D"
+ck "(s1) a CLEAN shallow scout PROCEEDS (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+ck "(s1) the pass recorded an outcome PAST provision (stage=$(rec stage))" \
+   "$([ -n "$(rec stage)" ] && [ "$(rec stage)" != provision ]; echo $?)"
+ck "(s1) the scout was actually moved to origin/main" \
+   "$(git -C "$SD" diff --quiet origin/main --; echo $?)"
+case "$OUT" in *"REPAIR:"*"read ${SEVERED} "*) r=0 ;; *) r=1 ;; esac
+ck "(s1) the repair NAMES the discarded number (${SEVERED}), so the log distinguishes the two readings" "$r"
+case "$OUT" in *"carries ${SEVERED} commit(s) not in origin/main"*) r=1 ;; *) r=0 ;; esac
+ck "(s1) the old 'carries N commit(s) not in origin/main' refusal is NOT printed" "$r"
+
+# ── (s2) NON-VACUITY: with the OLD inference restored, (s1) goes RED ─────────────────────────────────
+# A copy of the SHIPPED script with ONE line changed — the verdict call replaced by the pre-fix
+# behaviour (read the raw count and call it local work). Nothing else differs, so any difference in the
+# outcome is attributable to the verdict itself.
+mk_shallow_case shallow-prefix
+MUT="$T/refresh-ahead-prefix.sh"
+mut "$MUT" <<'PY3'
+import sys
+src = open(sys.argv[1]).read()
+needle = ('    scout_ahead_verdict refs/remotes/origin/main connect\n'
+          '    case "$SCOUT_AHEAD_VERDICT" in')
+if needle not in src:
+    sys.exit("the verdict call is missing — this control would be vacuous")
+pre = ('    SCOUT_AHEAD_COUNT="$(git -C "$SC" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null || echo 0)"\n'
+       '    SCOUT_AHEAD_VERDICT=local\n'
+       '    case "$SCOUT_AHEAD_VERDICT" in')
+out = src.replace(needle, pre)
+if out == src:
+    sys.exit("the verdict revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
+PY3
+ck "(s2) the pre-fix control was actually produced (one line reverted)" "$([ -s "$MUT" ]; echo $?)"
+if [ -s "$MUT" ]; then
+rp "$D" "$MUT"
+ck "(s2) WITHOUT the fix the CLEAN shallow scout is REFUSED (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$(rec why)" in *"LOCAL commit(s)"*) r=0 ;; *) r=1 ;; esac
+ck "(s2) WITHOUT the fix the cause calls the artifact 'LOCAL commit(s)' — the false PRESERVE remedy" "$r"
+ck "(s2) and the scout was NOT moved (the refusal is the blocker)" \
+   "$(git -C "$D/repo/.worktrees/dispatch-scout" diff --quiet origin/main -- 2>/dev/null; [ $? -ne 0 ]; echo $?)"
+fi
+
+# ── (s3) A REAL LOCAL COMMIT IS STILL REFUSED — the arm that must never weaken ───────────────────────
+# The scout is the same severed shape, plus ONE commit of its own. After the repair the graph is
+# connected, so the count is 1 and it MEANS 1: the refusal must say LOCAL and the commit must survive.
+mk_shallow_case shallow-local
+SD="$D/repo/.worktrees/dispatch-scout"
+printf 'local work\n' > "$SD/local.txt"
+git -C "$SD" add local.txt
+git -C "$SD" -c user.email=t@t -c user.name=t commit -qm "local work"
+LOCAL_SHA="$(git -C "$SD" rev-parse HEAD)"
+rp "$D"
+ck "(s3) a REAL local commit still REFUSES (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$(rec why)" in *"1 LOCAL commit(s)"*) r=0 ;; *) r=1 ;; esac
+ck "(s3) the cause says '1 LOCAL commit(s)' — the PRESERVE wording (why=$(rec why | cut -c1-110))" "$r"
+case "$(rec why)" in *"HAS NOT FETCHED"*) r=1 ;; *) r=0 ;; esac
+ck "(s3) the cause does NOT offer the FETCH remedy for real local work" "$r"
+ck "(s3) the local commit SURVIVED (HEAD unchanged)" \
+   "$([ "$(git -C "$SD" rev-parse HEAD)" = "$LOCAL_SHA" ]; echo $?)"
+
+# ── (s4) AN UNRELATED HISTORY IS NOT 'UNFETCHED' EITHER (the new arm is not a hole for (b)) ─────────────
+# A scout on an ORPHAN branch is NOT shallow and shares no ancestor with the trunk, so "nothing needs
+# preserving" would be a lie over commits that exist nowhere else. The prototype for this change DID
+# fold it into the fetch arm; this arm is why `unrelated` exists.
+mk_shallow_case unrelated
+SD="$D/repo/.worktrees/dispatch-scout"
+git -C "$SD" checkout -q --orphan orphan-work
+git -C "$SD" -c user.email=t@t -c user.name=t commit -qm "orphan work"
+ORPHAN_SHA="$(git -C "$SD" rev-parse HEAD)"
+rp "$D"
+ck "(s4) an unrelated (orphan) history still REFUSES (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$(rec why)" in *"NO common ancestor"*) r=0 ;; *) r=1 ;; esac
+ck "(s4) the cause says the histories share NO common ancestor (why=$(rec why | cut -c1-110))" "$r"
+case "$(rec why)" in *"HAS NOT FETCHED"*) r=1 ;; *) r=0 ;; esac
+ck "(s4) it is NOT reported as unfetched history — the operator is told to PRESERVE" "$r"
+ck "(s4) the orphan commit SURVIVED" "$([ "$(git -C "$SD" rev-parse HEAD)" = "$ORPHAN_SHA" ]; echo $?)"
+
+# ── (s5) A SCOUT WHOSE .git LINK NO LONGER RESOLVES STILL REFUSES (#2217's shape) ─────────────────────
+# The fix must not buy (s1) by loosening what the pass will judge. A pruned/stale worktree record is
+# NOT PROVISIONABLE (rc=3) and must stay that way.
+mk_shallow_case broken-link
+rm -rf "$D/repo/.git/worktrees/dispatch-scout"
+rp "$D"
+ck "(s5) a scout whose .git link does not resolve REFUSES with rc=3 (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$(rec why)" in *"does not resolve"*) r=0 ;; *) r=1 ;; esac
+ck "(s5) the cause names the unresolvable .git link (why=$(rec why | cut -c1-110))" "$r"
+
+# ── (s6) DECLARED RESIDUAL: `.git` REMOVED ENTIRELY IS STILL NOT REFUSED (#2217) ──────────────────────
+# ⛔ THIS ARM PINS THE OPPOSITE OF WHAT #2953 MIGHT BE READ TO PROMISE, and it is here so the state is
+# RECORDED rather than assumed: with `.git` deleted the directory is no longer a worktree, so the pass
+# announces it as unversioned and proceeds. That is #2217's known, declared residual — this change does
+# not alter it in either direction, and an arm claiming it refuses would be asserting something false.
+mk_shallow_case git-gone
+rm -rf "$D/repo/.worktrees/dispatch-scout/.git"
+rp "$D"
+case "$OUT" in *"is not a worktree of"*) r=0 ;; *) r=1 ;; esac
+ck "(s6) with .git REMOVED the pass ANNOUNCES the unversioned scout (#2217 residual, unchanged)" "$r"
+ck "(s6) …and does not refuse it (rc=$RC — the residual is that it proceeds)" "$([ "$RC" -eq 0 ]; echo $?)"
+
+# ── (s7) THE SECOND COPY: `--check` MUST NOT FAIL A CLEAN SHALLOW SCOUT ──────────────────────────────
+# `cloud-cell-bringup.sh` DIES on a non-zero `--check`, so a false FAIL here refuses to START a cell.
+# That mode is offline by design and cannot connect a severed history, so it must WARN, not FAIL.
+mk_shallow_case check-shallow
+OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$REFRESH" --check 2>&1)"
+RC=$?
+ck "(s7) --check does NOT fail a CLEAN shallow scout (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+case "$OUT" in *"check: WARN the scout"*"SHALLOW"*) r=0 ;; *) r=1 ;; esac
+ck "(s7) it WARNS and names the shallow history as the reason it cannot judge" "$r"
+case "$OUT" in *"check: FAIL the scout"*) r=1 ;; *) r=0 ;; esac
+ck "(s7) it prints no 'check: FAIL the scout' line" "$r"
+
+# ── (s8) NON-VACUITY FOR (s7): the OLD check arm still FAILS that same tree ─────────────────────────
+# The same fixture, the same mode, and a copy whose `--check` arm is reverted to the pre-fix count. This
+# is the arm that proves the second copy was a real blocker rather than a cosmetic edit.
+mk_shallow_case check-prefix
+MUT2="$T/refresh-check-prefix.sh"
+mut "$MUT2" <<'PY4'
+import sys
+src = open(sys.argv[1]).read()
+needle = ('        scout_ahead_verdict refs/remotes/origin/main noconnect\n'
+          '        case "$SCOUT_AHEAD_VERDICT" in')
+if needle not in src:
+    sys.exit("the --check verdict call is missing — this control would be vacuous")
+pre = ('        SCOUT_AHEAD_VERDICT=local\n'
+       '        SCOUT_AHEAD_COUNT="$(git -C "$SC" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null || echo 0)"\n'
+       '        case "$SCOUT_AHEAD_VERDICT" in')
+out = src.replace(needle, pre)
+if out == src:
+    sys.exit("the --check revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
+PY4
+ck "(s8) the pre-fix --check control was actually produced" "$([ -s "$MUT2" ]; echo $?)"
+if [ -s "$MUT2" ]; then
+OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUT2" --check 2>&1)"
+RC=$?
+ck "(s8) WITHOUT the fix --check FAILS the clean shallow scout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$OUT" in *"check: FAIL the scout"*) r=0 ;; *) r=1 ;; esac
+ck "(s8) …and it is that FAIL line, so a cell would refuse to START" "$r"
+fi
 
 echo
 echo "==> $PASS passed, $FAIL failed"

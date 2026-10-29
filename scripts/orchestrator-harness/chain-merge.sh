@@ -244,6 +244,13 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # anything. The exit code must differ for the same reason 75 and 77 differ from each other —
       # the remedy is different — and it must be a STOP here for the same reason: no PR can appear.
       land) _cap_rc=74 ;;
+      # 71 is spawn-gate.sh's AGENT_CAPABILITY_REFUSED (#2935): the box could not complete one model
+      # call and RETURN. Distinct from 75 for the usual reason — the remedy differs — and it lands in
+      # the SAME yield path as load, deliberately: a capability refusal is a property of THIS box, so
+      # handing the issue to a peer box is exactly right (unlike `land`, which follows the item, or a
+      # brief refusal, which no peer can clear). Without this arm the chain exited 75 and told the
+      # operator to look at a LOAD reading for a refusal that load cannot explain.
+      capability) _cap_rc=71 ;;
       *)    _cap_rc=75 ;;
     esac
     if [ "$_cap_gate" = "land" ]; then
