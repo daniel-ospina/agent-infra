@@ -313,10 +313,26 @@ resolve_python() {
     # if it were a pipe, so `… || true` whose neighbour is an interpreter reads as a pipeline into a
     # program and the whole installer becomes unexecutable from a worktree (#709, measured). Two
     # separate lookups have the same effect and no such shape.
+    # ⛔ A NAMED PIN IS THE WHOLE LIST — the rule resolve_script and resolve_provisioner already
+    # follow, and the one this function used to break in the worst direction: a pinned interpreter
+    # that failed the version check was SKIPPED and the artifact silently pinned a DIFFERENT one, so
+    # an operator who pinned a venv to get a specific `gh`/module set got neither their interpreter
+    # nor an error. A pin that cannot be used is a refusal, never a substitution.
+    if [ -n "${RUNNER_AUTOSCALE_PYTHON:-}" ]; then
+        python_ok "$RUNNER_AUTOSCALE_PYTHON" || {
+            err "REFUSING: RUNNER_AUTOSCALE_PYTHON is pinned to '$RUNNER_AUTOSCALE_PYTHON' and it did not pass the >= 3.12 check above — a named pin is the whole list, so it is not silently replaced by another interpreter. Point it at a 3.12+ interpreter, or unset it."
+            return 1; }
+        PYTHON="$RUNNER_AUTOSCALE_PYTHON"; return 0
+    fi
+    if [ -n "${ELDATO_LAUNCHER_PY:-}" ]; then
+        python_ok "$ELDATO_LAUNCHER_PY" || {
+            err "REFUSING: ELDATO_LAUNCHER_PY is pinned to '$ELDATO_LAUNCHER_PY' and it did not pass the >= 3.12 check above — a named pin is the whole list, so it is not silently replaced by another interpreter."
+            return 1; }
+        PYTHON="$ELDATO_LAUNCHER_PY"; return 0
+    fi
     py312="$(type -P python3.12 2>/dev/null)" || py312=""
     py3="$(type -P python3 2>/dev/null)" || py3=""
-    for cand in "${RUNNER_AUTOSCALE_PYTHON:-}" "${ELDATO_LAUNCHER_PY:-}" \
-                "$py312" \
+    for cand in "$py312" \
                 "${HOME:-}/.pi/agent/.venv/bin/python" \
                 "$py3"; do
         [ -n "$cand" ] || continue
@@ -543,6 +559,15 @@ refuse_systemd_unsafe_values() {
              "REPO=$REPO" "PROVISIONER=$PROVISIONER"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so the job would never run"; return 1 ;;
+            # ⛔ `%` IS A SYSTEMD SPECIFIER, TWICE OVER. systemd expands it at load time (`%h`, `%i`,
+            # `%n`, and `%%` for a literal), so a rendered path containing one points somewhere the
+            # installer never wrote — the SAME false PASS as whitespace, one class over: the unit is
+            # installed, enabled, listed and starts NOTHING (203/EXEC), and `--status` cannot see it
+            # because it compares the file text, not the expansion. Measured with HOME="…/pc%h":
+            # exit 0, ExecStart pointing at a path that expands to /root. A plist <string> is not
+            # specifier-expanded, so this rule is systemd-only — refusing it on the Mac would be a
+            # false block.
+            *%*) err "REFUSING: ${v%%=*} contains '%' — systemd expands it as a specifier at load time (%h, %i, %n), so the rendered path would silently differ from the real one and every tick would fail to start"; return 1 ;;
         esac
     done
     return 0
@@ -916,26 +941,60 @@ do_arm() {
         printf 'reason=%s\n' "$reason"
     } > "$ARM_FILE" || {
         err "cannot write $ARM_FILE — refusing to arm"; rm -f "$ARM_FILE"; return 1; }
-    log_line "  runner-autoscale: ARMED ($ARM_FILE) — ceiling=$ceiling from ncpu=$ncpu mem_available_mb=$mem"
     # ⛔ RE-RENDER, DO NOT PATCH THE FLAG. The artifact is rewritten from scratch with the mode the
     # record now implies (armed = NO mode argument, because converging is the pass's default and the
     # only switch it accepts is --dry-run). Patching the existing artifact is how the two copies drift
     # while both look right.
-    do_install_reinstall_only || return 1
+    # ⛔ AND IF THE RE-RENDER FAILS, THE RECORD GOES WITH IT. A record that outlives a failed `--arm`
+    # is an armed box the operator was told was not armed: the verb exits 1, the artifact still reads
+    # --dry-run, and the NEXT routine `--install` (a bring-up, a sync, setup.sh) re-renders ARMED from
+    # that record — silently. That is the same hazard `--report-only` is hardened against, so a failed
+    # arm fails CLOSED: drop the record, put the artifact back to disarmed, and say so.
+    if ! do_install_reinstall_only; then
+        rm -f "$ARM_FILE"
+        FORCE_MODE_FLAG="--dry-run" do_install_reinstall_only >/dev/null 2>&1 \
+            || err "  ⛔ the artifact could NOT be re-rendered disarmed either — CHECK IT BY HAND ($UNIT_DIR): an armed artifact with no record is the state this installer exists to prevent"
+        err "NOT ARMED: the armed re-render failed, so the record was removed — the box is NOT converging"
+        return 1
+    fi
+    log_line "  runner-autoscale: ARMED ($ARM_FILE) — ceiling=$ceiling from ncpu=$ncpu mem_available_mb=$mem"
     return 0
 }
 
 do_disarm() {
-    if [ -f "$ARM_FILE" ]; then
-        log_line "  runner-autoscale: disarming — the record being removed:"
-        sed 's/^/    /' "$ARM_FILE"
-        rm -f "$ARM_FILE" || { err "cannot remove $ARM_FILE — the job is STILL ARMED"; return 1; }
-        log_line "  runner-autoscale: DISARMED — the installed artifact goes back to --dry-run"
-    else
-        log_line "  runner-autoscale: not armed (no $ARM_FILE)"
+    # ⛔ NOTHING IS MUTATED BEFORE A DRY RUN RETURNS, AND NOTHING IS DELETED BEFORE THE ARTIFACT
+    # PROVES IT IS DISARMED. Both orders were wrong here once, and the failure is the one state the
+    # whole design forbids — an ARMED box with no record on disk:
+    #   * `--disarm --dry-run` used to `rm` the record and then return at the DRY_RUN check: the
+    #     operator was told DISARMED, the artifact still converged, and the audit datum (armed-by,
+    #     armed-date, ceiling, reading, reason) was gone for good.
+    #   * a failed re-render deleted the record FIRST, leaving the same state with exit 1.
+    # So: preview prints and exits; a real disarm re-renders DISARMED FIRST (forced, so it does not
+    # depend on the record being gone), and only a render that the verification step accepted earns
+    # the record's removal.
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        if [ -f "$ARM_FILE" ]; then
+            log_line "  runner-autoscale: dry-run — WOULD disarm; the record being kept:"
+            sed 's/^/    /' "$ARM_FILE"
+            log_line "  runner-autoscale: dry-run — nothing was changed (no record removed, no artifact rewritten)"
+        else
+            log_line "  runner-autoscale: dry-run — not armed (no $ARM_FILE); nothing to do"
+        fi
+        return 0
     fi
-    if [ "${DRY_RUN:-0}" = "1" ]; then return 0; fi
-    do_install_reinstall_only || return 1
+    if [ -f "$ARM_FILE" ]; then
+        log_line "  runner-autoscale: disarming — re-rendering the artifact DISARMED first; the record being removed:"
+        sed 's/^/    /' "$ARM_FILE"
+        if ! FORCE_MODE_FLAG="--dry-run" do_install_reinstall_only; then
+            err "STILL ARMED: the artifact could not be re-rendered disarmed, so the record was NOT removed — fix the refusal above and re-run"
+            return 1
+        fi
+        rm -f "$ARM_FILE" || { err "cannot remove $ARM_FILE — the artifact IS disarmed but the record remains, so a later --install would re-arm it"; return 1; }
+        log_line "  runner-autoscale: DISARMED — the artifact is --dry-run and the record is gone"
+        return 0
+    fi
+    log_line "  runner-autoscale: not armed (no $ARM_FILE) — re-rendering the DISARMED artifact anyway"
+    FORCE_MODE_FLAG="--dry-run" do_install_reinstall_only || return 1
     return 0
 }
 
@@ -1022,6 +1081,30 @@ do_status() {
         installed_script="$(plist_program_args "$installed_path" | grep -E '^/.*\.py$' | head -1)"
     else
         installed_script="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"' | grep -E '^/.*\.py$' | head -1)"
+    fi
+    # ⛔ THE INTERPRETER IS PART OF THE ANSWER TOO, AND IT WAS THE HOLE. The pass runs as
+    # `<interpreter> <script> …`, so an artifact whose pinned interpreter is gone starts nothing —
+    # exactly like a missing script — while `script_present=yes` and the scheduler still lists the job
+    # as scheduled. This is not hypothetical: the installer pins an ABSOLUTE interpreter path
+    # precisely so a login-shell change cannot move it, which is also what makes a Python upgrade that
+    # retires `python3.12` turn every tick into 203/EXEC. `--status` is the verb that exists to say so.
+    if [ "$TARGET" = "launchd" ]; then
+        installed_python="$(plist_program_args "$installed_path" | head -1)"
+    else
+        installed_python="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"' | head -1)"
+    fi
+    case "$installed_python" in
+        /*) : ;;
+        *) installed_python="" ;;
+    esac
+    if [ -n "$installed_python" ] && [ -x "$installed_python" ]; then
+        log_line "python=${installed_python}"
+        log_line "python_present=yes"
+    else
+        log_line "python=${installed_python:-unreadable}"
+        log_line "python_present=no"
+        err "the artifact's interpreter ${installed_python:-is unreadable} is absent or not executable — every tick would fail to start (203/EXEC) while the scheduler still lists the job as scheduled"
+        rc=1
     fi
     log_line "script=${installed_script:-unreadable}"
     if [ -n "$installed_script" ] && [ -f "$installed_script" ] && [ -r "$installed_script" ]; then
