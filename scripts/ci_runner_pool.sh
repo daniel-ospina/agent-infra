@@ -206,18 +206,19 @@
 # exec'd with, and this tool never re-execs a live listener (that is the double-start it exists to
 # prevent) — so `restart` restores the LAYOUT, and the NEXT start through `start_listener` is what
 # carries the private root into a listener's env.
-# ⛔ AND A BARE **UNIT RESTART DOES NOT CONFER IT** (#7815 review, F2). The export lives in exactly one
-# place — `start_listener`'s `TMPDIR="$t" TMP="$t" TEMP="$t" exec "$d/run.sh"` — and nothing in this
-# repo renders a runner unit or an `Environment=TMPDIR=` for one, so a unit restart re-execs `run.sh`
-# with the UNIT's environment: it carries only what the unit itself supplies (or an `export TMPDIR=…`
-# line in `.env`) — a BARE `TMPDIR=…` in `.env` is dropped (measured: sourcing a bare assignment sets it
-# in the sourcing shell, not in the child) — and for an instance with no `.env`
-# (the common shape) it hands the listener NO TMPDIR at all — every job then falls back to the box's
-# shared temp dir, silently, while `status` grades the LAYOUT and calls the row clean. The two remedies
-# that DO work: start the listener THROUGH this tool (stop it, then `restart --name <n>` on the now-dead
-# listener — `add` is not one: an already-registered name is refused `rc 4 use restart`), or give the
-# unit `Environment=TMPDIR=$instance/_tmp` (with `TMP`/`TEMP` beside it) so its own exec carries the root.
-# `status` reports the layout, not a live process's env.
+# ⛔ AND A BARE **UNIT RESTART DOES NOT CONFER IT** (#7815 review, F2; mechanism corrected in round 3).
+# The export lives in exactly one place — `start_listener`'s `TMPDIR="$t" TMP="$t" TEMP="$t" exec
+# "$d/run.sh"` — and nothing in this repo renders a runner unit or an `Environment=TMPDIR=` for one, so
+# a unit restart carries ONLY what the unit's own environment, or a `.env` line the LISTENER itself
+# applies, provides. ⛔ THAT MAKES THE FORM IN `.env` DECISIVE (`LoadAndSetEnv`, key = everything before
+# the first `=`): a BARE `TMPDIR=/x` line IS honoured by a unit-started listener, while an
+# `export TMPDIR=/x` line sets a variable literally named `export TMPDIR` and leaves TMPDIR unset — on a
+# unit path that means every job falls back to the box's shared temp dir, silently, while `status` grades
+# the LAYOUT and calls the row clean. For an instance with NO TMPDIR in `.env` the unit restart likewise
+# hands the listener nothing. The remedies that DO work: start the listener THROUGH this tool (stop it,
+# then `restart --name <n>` on the now-dead listener — `add` is not one: an already-registered name is
+# refused `rc 4 use restart`), or give the unit `Environment=TMPDIR=$instance/_tmp` (with `TMP`/`TEMP`
+# beside it) so its own exec carries the root. `status` reports the layout, not a live process's env.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -975,10 +976,17 @@ instance_tmpdir() {
   # An EXISTING but unreadable `.env` is cannot-measure. `-r` is the read this function actually does
   # (and it is FALSE for a mode-000 file, which `-f` alone happily accepts).
   [ -r "$d/.env" ] || { err "cannot-measure why=tmpdir-unreadable path=$d/.env"; return 2; }
-  # LAST assignment wins, which is what a shell sourcing the file would do. `export TMPDIR=…` is
-  # honoured too — `. ./.env` accepts it, so requiring a bare `TMPDIR=` made a legal .env invisible to
-  # BOTH the creation and the detection. The `2>/dev/null` is gone on purpose: a read that failed must
-  # be visible, not silently equal to "names none".
+  # LAST assignment wins. ⛔ NEITHER FORM IS "SOURCED" BY THE RUNNER (#7815 review, round 3): `run.sh`
+  # and `run-helper.sh` never read `.env`; `Runner.Listener`'s `LoadAndSetEnv()` reads it in-process and
+  # sets each line whose key is everything before the FIRST `=`. So `TMPDIR=/x` (bare) IS a TMPDIR to the
+  # listener, while `export TMPDIR=/x` sets a variable literally named `export TMPDIR` and leaves TMPDIR
+  # alone. BOTH are accepted here deliberately: this tool also EXPORTS the parsed value to the listener it
+  # starts (`start_listener`), so the directory it creates is the one that listener hands to every job
+  # either way — refusing the `export` form would make a legal .env invisible to BOTH the creation and
+  # the detection. ⚠️ LIMIT: on a UNIT-started listener (not started by this tool) the `export` form
+  # confers nothing and that listener's jobs use the box's shared temp dir; the operational remedy is in
+  # the header's UNIT RESTART note. The `2>/dev/null` is gone on purpose: a read that failed must be
+  # visible, not silently equal to "names none".
   raw="$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}TMPDIR=//p' "$d/.env" | tail -n 1)" || return 2
   raw="${raw%$'\r'}"   # a `.env` edited on a CRLF host would otherwise name a path with a CR in it
   # ⛔ ANY SHELL SYNTAX THIS PARSER DOES NOT MODEL IS REFUSED UP FRONT, because truncating at it would
@@ -1084,17 +1092,27 @@ instance_tmp_root() { printf '%s' "${1%/}/_tmp"; }
 # ⛔ THE WALK IS BOUNDED: one explicit start point, `-maxdepth 1` (the root's own entries; the root
 # itself is never a candidate), `-print0` so a name with a newline cannot be split into two deletions.
 sweep_tmp_root() {
-  local t="$1" removed=0 victim
+  local t="$1" removed=0 failed=0 victim
   [ -d "$t" ] || return 0
   while IFS= read -r -d '' victim; do
     if [ "$DRY" = 1 ]; then removed=$((removed + 1)); continue; fi
-    rm -rf -- "$victim" 2>/dev/null && removed=$((removed + 1))
+    if rm -rf -- "$victim" 2>/dev/null; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
   done < <(find "$t" -mindepth 1 -maxdepth 1 -mmin +"$TMP_MAX_AGE_MIN" -print0 2>/dev/null)
-  [ "$removed" -gt 0 ] || return 0
+  # ⛔ A DELETION THAT FAILED IS NAMED, NOT DISCARDED (#7815 review, round 3). `rm -rf … || true` used to
+  # drop the miss entirely: measured on this box, a `chmod 555` victim is selected by `find`, `rm -rf`
+  # returns 1, the line prints `removed=1` over it — and when EVERY victim fails, `removed=0` printed
+  # NOTHING at all, so the operator saw a clean start while the root grew without bound. Ownership and
+  # permissions inside a runner's temp dir (a job that ran `sudo`) do not repair themselves, so the
+  # `find`-failed arm's "the next start retries" does not cover this one. It is REPORTED and the start
+  # still succeeds: one undeletable entry is not a reason to leave a box without a listener.
+  [ "$removed" -gt 0 ] || [ "$failed" -gt 0 ] || return 0
   if [ "$DRY" = 1 ]; then
-    log_line "dry-run: would sweep tmpdir-root=$t removed=$removed older_than=${TMP_MAX_AGE_MIN}m"
+    log_line "dry-run: would sweep tmpdir-root=$t removed=$removed failed=$failed older_than=${TMP_MAX_AGE_MIN}m"
   else
-    log_line "swept tmpdir-root=$t removed=$removed older_than=${TMP_MAX_AGE_MIN}m"
+    log_line "swept tmpdir-root=$t removed=$removed failed=$failed older_than=${TMP_MAX_AGE_MIN}m"
+  fi
+  if [ "$failed" -gt 0 ]; then
+    err "cannot-measure why=tmpdir-sweep-incomplete root=$t failed=$failed — $failed entr(y/ies) older than ${TMP_MAX_AGE_MIN}m could NOT be removed (their ownership or permissions are not this user's), so this root is NOT bounded and will keep growing; fix those permissions as their owner, or the growth is silent from here on"
   fi
   return 0
 }
@@ -1283,16 +1301,24 @@ start_listener() {
   # cannot reach here, but `ensure_tmpdir` is DRY-aware anyway so no future caller can mutate a preview.
   # It is also what creates (and sweeps) the instance's own private temp root (#7815).
   ensure_tmpdir "$d" || return 2
-  # ⛔ THE TEMP ROOT IS THE PRIVATE ONE, AND IT IS EXPORTED (#7815). GitHub's `run.sh` sources `.env` and
-  # then starts the listener, which hands ITS OWN environment to every job step — so these three
-  # variables are what decides where `mktemp`, `tempfile.gettempdir()` and every other temp consumer in
-  # a job land. Without them an instance with no `.env` wrote into the BOX's shared temp dir, which is
-  # what made the tortoise hygiene guard fire on other people's files (agent-infra#7815 / #3003).
+  # ⛔ THE TEMP ROOT IS THE PRIVATE ONE, AND IT IS EXPORTED (#7815). The listener hands ITS OWN
+  # environment to every job step, so these three variables are what decides where `mktemp`,
+  # `tempfile.gettempdir()` and every other temp consumer in a job land. Without them an instance with
+  # no `.env` wrote into the BOX's shared temp dir, which is what made the tortoise hygiene guard fire
+  # on other people's files (agent-infra#7815 / #3003).
   # `TMP` and `TEMP` travel with `TMPDIR` because toolchains read them by different names — moving only
   # `TMPDIR` leaves npm/node-style consumers still writing in the shared dir.
-  # A `.env` that names a TMPDIR still WINS: `run.sh` sources it AFTER this and overwrites the value,
-  # which is the documented precedence (an explicit operator setting beats a default) — and the export
-  # here uses that same value in that case, so all three variables agree either way.
+  # ⛔ AND A `.env` THAT NAMES A TMPDIR STILL WINS — but the mechanism is the LISTENER's own parser, not
+  # `run.sh` sourcing it (this file said "sources" for two rounds; corrected in round 3). Neither
+  # `run.sh` nor `run-helper.sh.template` reads `.env`: `Runner.Listener`'s `LoadAndSetEnv()`
+  # (src/Runner.Listener/Program.cs) reads it in-process and sets every line whose key is everything
+  # before the FIRST `=`. Two consequences this file must not get wrong:
+  #   · `TMPDIR=/x` (BARE)  → `TMPDIR=/x` in the listener, inherited by every job step — the operator's
+  #     explicit setting beats this default, on a unit-started listener too.
+  #   · `export TMPDIR=/x`  → a variable literally NAMED `export TMPDIR`; `TMPDIR` is left as inherited.
+  #     On THIS path that is still `/x`, because it is the value exported below; on a unit-started
+  #     listener the line confers nothing at all (see the UNIT RESTART note in the header).
+  # So the export here uses the `.env`-named value when there is one, and all three variables agree.
   t="$(instance_tmpdir "$d")" || return 2
   [ -n "$t" ] || t="$(instance_tmp_root "$d")"
   # PRINT THE PATHS, as the memory floor prints its reading: an env an operator cannot see is one they
