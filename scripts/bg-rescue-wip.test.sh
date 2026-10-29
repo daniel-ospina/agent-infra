@@ -718,7 +718,7 @@ live_rescue_calls() {
       sub(/^[[:space:]]+/, "", line)
       if (line ~ /^#/) next                                   # comment
       if (line ~ /^_rescue[[:space:]]*\(\)/) next             # the definition itself
-      if (line ~ /(^|[^_[:alnum:]_])(echo|printf|say|log)[[:space:]]/) next   # a usage/message line
+      if (line ~ /(^|[^_[:alnum:]_])(echo|printf|log_line|log)[[:space:]]/) next   # a usage/message line
       if (line ~ /if[[:space:]]+(false|0)[[:space:]]*;/) next   # a dead branch (mid-line too)
       n = gsub(/(^|[^_[:alnum:]])_rescue([^_[:alnum:]]|$)/, "&", line)
       total += n }
@@ -730,7 +730,7 @@ live_rescue_before() {
     { line = $0
       sub(/^[[:space:]]+/, "", line)
       if (line ~ /^#/) next
-      if (line ~ /(^|[^_[:alnum:]_])(echo|printf|say|log)[[:space:]]/) next
+      if (line ~ /(^|[^_[:alnum:]_])(echo|printf|log_line|log)[[:space:]]/) next
       if (line ~ /if[[:space:]]+(false|0)[[:space:]]*;/) next
       r = index(line, "_rescue"); k = index(line, "kill -" sig)
       if (r > 0 && k > r) found = 1 }

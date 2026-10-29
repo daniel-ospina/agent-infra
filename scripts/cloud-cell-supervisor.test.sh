@@ -34,25 +34,88 @@
 
 set -uo pipefail
 
+# #2235: the suite must not inherit an ambient repo selector. gh gives `GH_REPO` precedence over the
+# checkout for every call that omits `--repo`, so a value exported by the developer's shell (or by a
+# cell's keys.env) would be compared against every fixture checkout's origin and redden unrelated arms
+# — and would let this harness carry the very defect the new conformance arm exists to catch.
+unset GH_REPO
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # SUP may be OVERRIDDEN so the suite can be run against another copy of the supervisor — that is how
 # a new refusal is shown to be NON-VACUOUS (run the suite against the PRE-fix script and watch the new
 # arms, and only the new arms, go red). Default is the shipped script.
 SUP="${SUP:-$HERE/cloud-cell-supervisor.sh}"
+# ⛔ THE WORKER SET IS DERIVED FROM THE SHIPPED SUPERVISOR, ONCE, AND EVERY FIXTURE SEEDS *THIS* LIST.
+# Four fixtures used to mirror the list by hand, so adding two workers (#2029) produced 52 unrelated
+# `start` failures — and a parity CHECK over hand-written copies was itself a false PASS (it silently
+# skipped the §7 fixture, which authored orch-loop.sh separately, and drift there still reddened 16
+# start arms while the check stayed green — proven by measurement). Deriving the list makes the drift
+# IMPOSSIBLE rather than detected.
+SEED_WORKERS="$(sed -n 's/^  for w in \(.*\); do$/\1/p' "$SUP" | head -1)"
+if [ -z "$SEED_WORKERS" ]; then
+  echo "FATAL: cannot parse cmd_check's required-worker list out of $SUP — the fixtures below would"
+  echo "       seed NOTHING and every start arm would pass vacuously."
+  exit 1
+fi
+# Each seed site calls this; it records the SITE (not a counter) because several sites run inside a
+# `( … )` subshell — the #1989 arms — where an incremented variable would be discarded on exit.
+seed_site() { printf '%s\n' "${BASH_SOURCE[0]}:$1" >> "$SEED_LOG" 2>/dev/null || true; }
 BRINGUP="$HERE/cloud-cell-bringup.sh"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
+# ⛔ EVERY MODULE A CARRIER HARD-REQUIRES MUST BE IN THE SUPERVISOR'S REQUIRED-WORKER LIST (review
+# round 6, P1 — the defect was live and the comment claiming it fixed was not). `lane.sh:75/79/97/134`,
+# `fix-one.sh:54/69/73`, `merge-one.sh`, `adopt-fix.sh` and `dispatch-merge.sh` each `. "$SELF/<mod>"`
+# and `exit 78` when it is missing — so a deployment WITHOUT that module dies at the first lane start.
+# `cmd_check` is the box's own answer to "can this cell run a controller", and a module missing from
+# its list made it answer YES about a box where every lane refuses: a FALSE PASS of exactly the kind
+# this file exists to prevent. The list had `gate-policy.sh` added while `spawn-gate.sh` — same class,
+# added by the same change — was left out, and no arm connected the two, so the comment above the
+# loop asserted a requirement the loop did not carry.
+# ⛔ THE EXPECTED SIDE IS DERIVED, BOTH WAYS: the carriers are read for what they source (never
+# re-typed here), and the shipped list is parsed out of $SUP — so neither copy can drift silently.
+# It is an INCLUSION, not an equality: a worker that no carrier sources (a controller-owned script)
+# belongs in the list and must not be reddened by this arm.
+# NB: the carriers live one directory down from $SUP, so the two sides are read from DIFFERENT paths on
+# purpose — `$SUP` is the script under test (overridable), the carriers are always this tree's.
+_CARRIERS="$HERE/orchestrator-harness"
+_REQ=""
+for _c in lane fix-one merge-one adopt-fix dispatch-merge nonblocking-dispatch; do
+  [ -f "$_CARRIERS/$_c.sh" ] || continue
+  while IFS= read -r _m; do
+    [ -n "$_m" ] || continue
+    case " $_REQ " in *" $_m "*) ;; *) _REQ="$_REQ $_m" ;; esac
+  done < <(sed -n 's/^\. "\$SELF\/\([A-Za-z0-9._-]*\.sh\)".*/\1/p' "$_CARRIERS/$_c.sh")
+done
+_REQ="${_REQ# }"
+_REQMISS=""
+for _m in $_REQ; do
+  case " $SEED_WORKERS " in *" $_m "*) ;; *) _REQMISS="$_REQMISS $_m" ;; esac
+done
+[ -n "$_REQ" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "the carriers' hard-required modules were read from lane/fix-one/merge-one/adopt-fix/dispatch-merge ($_REQ) — the parity arm below is not vacuous" \
+  || bad "could not read ANY \`. \$SELF/<mod>\` source from the carriers — the parity arm below would pass on nothing"
+[ -z "$_REQMISS" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "every module a carrier HARD-REQUIRES is in cmd_check's required-worker list (${_REQ// /, }) — a box missing one cannot read as 'CELL CAN RUN A CONTROLLER'" \
+  || bad "cmd_check's required-worker list is MISSING a module a carrier exits 78 without:${_REQMISS} — the box would pass check and every lane would refuse at startup"
+
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
+SEED_LOG="$T/seed-sites"; : > "$SEED_LOG"
 # ⛔ HERMETIC means the CALLER's environment must not decide a fixture. agent-infra#1901 makes `OR`
 # (the queue's owner/repo) a VALIDATED INPUT — derived from the checkout unless declared — so an
 # ambient `OR` in a developer's shell would be judged against every fixture checkout (which carries a
 # tortoise remote) and turn unrelated arms red. (Measured: an ambient `OR=daniel-ospina/agent-infra`
 # reddened 46 arms of §7–§11 that have nothing to do with the queue.) `TORTOISE_REPO`/`TORTOISE` are
 # cleared for the same reason: §8's arms set them EXPLICITLY per call, so only those cases see them.
-unset OR TORTOISE_REPO TORTOISE
+# #2235 ADDS `GH_REPO` TO THIS LINE for exactly the same reason, one selector over: gh gives an
+# ambient `GH_REPO` precedence over the checkout for every call that omits `--repo`, so an inherited
+# value from the developer's shell (a cell's keys.env exported one) would be compared against every
+# fixture checkout's origin — turning the new conformance arm red on arms that have nothing to do
+# with the repo, and, worse, letting the harness carry the very defect under test.
+unset OR TORTOISE_REPO TORTOISE GH_REPO
 # §7's optional real-tmux half starts private servers (`tmux -L <socket>`); they are killed here so
 # no server survives the suite. The stub half needs no cleanup beyond $T.
 AI1711_SOCKS=""
@@ -127,9 +190,14 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
-    : > "$AI/scripts/orchestrator-harness/$w"
+  seed_site "$LINENO"; for f in $SEED_WORKERS; do
+    : > "$AI/scripts/orchestrator-harness/$f"
   done
+  # $SEED_WORKERS is parsed from the SHIPPED supervisor at the top of this file, so this fixture
+  # cannot silently fall behind cmd_check's required set the way it did when #2029 added two workers
+  # (52 `start` arms died with "worker scripts missing from $O" instead of ONE assertion naming the
+  # drift). The check near the summary pins that no fixture reintroduces a hand-written list.
+
   # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
   # prune asks it for the worker census, and an empty copy can only answer "unknown" — which makes
   # that arm skip the prune in BOTH cases and tests nothing.
@@ -361,7 +429,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -641,10 +709,7 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-# `harness-refresh.sh` joined the set in agent-infra#2215 (the loop spawns it from $O every cycle), for
-# the same reason — and the same failure mode is what a fixture gap produces: the FATAL upstream of the
-# assertions decides them, so the probe under test is never reached.
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+seed_site "$LINENO"; for f in $SEED_WORKERS; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -755,7 +820,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+seed_site "$LINENO"; for f in $SEED_WORKERS; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -1007,6 +1072,50 @@ case "$PROV_OUT" in
   *"self-refresh STALE"*) ok "status flags a verdict older than two of the LOOP's cycles (CYC default 240)" ;;
   *) bad "status did not flag a 1000s-old self-refresh verdict: $PROV_OUT" ;;
 esac
+# (e3b) THE RESTART DECISION IS READABLE FROM `status` (agent-infra#2641). `restart-pending` used to be
+# a word with no transition, and on a cell it was PERMANENT (the running identity was unreadable there),
+# so `status` printed `harness: …[current]` and `self-refresh: restart-pending` about the same box for
+# ever. The per-cycle record now carries the pending REASON and a request; `status` must print it,
+# because an operator acts from this verb and a recorded decision nobody can read is not a decision.
+printf 'restart request=pending requested_at=%s waited=12s requested_by=harness-refresh.sh@abc running=abc123 pin=def456 pending=deferred actuation=blocked blocked=lanes lanes=2 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 12 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"request=pending"*"pending=deferred"*) ok "status prints the restart REQUEST (the state, not just the word)" ;;
+  *) bad "status does not surface the restart request: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"actuation=blocked"*"blocked=lanes"*) ok "…including what would be interrupted (blocked=lanes)" ;;
+  *) bad "status hides what blocks the restart: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
+  *) bad "status prints the record but not what it means: $PROV_OUT" ;;
+esac
+# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". `harness-refresh.sh`
+# writes `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
+# is a CLAIM, and NOTHING was measured busy there — so the generic blocked sentence named a cause that
+# does not exist and told the operator to wait for a population that may never exist. The identity cause
+# needs its own arm, and it must come first.
+printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=unknown checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 9 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"cannot be PROVEN"*) ok "…an unprovable IDENTITY is explained as such, on its own arm" ;;
+  *) bad "status does not explain an unprovable identity: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — nothing was measured busy, so the message names a cause that does not exist: $PROV_OUT" ;;
+  *) ok "…and does NOT claim an interruption that was never measured" ;;
+esac
+# An ABSENT record is not "nothing pending": no cycle has ever recorded one.
+rm -f "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"NO REQUEST RECORD"*) ok "…and an absent record is reported as absent, not as 'nothing pending'" ;;
+  *) bad "an absent request record was silent: $PROV_OUT" ;;
+esac
+
 prov apply >/dev/null 2>&1   # leave the record and the seed consistent for the cases below
 
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
@@ -1779,7 +1888,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -2019,6 +2128,26 @@ case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
+# ⛔ NO CHECKOUT IS ITS OWN STATE, NOT AN "UNREADABLE ORIGIN" (#1977 review, P2). With `REPO` unset
+# there is no checkout and therefore no origin remote to be unreadable, and rendering it as one sends
+# the operator hunting an origin problem on a repo that does not exist — while the path printed empty
+# (`@ — origin <none>`). `status` is the very verb that must DISCOVER this, so it names the cause and
+# the missing value. rc stays 0: the verb reports, it does not refuse.
+qsup status "" "$Q/st-status-nocheckout"
+[ "$Q_RC" -eq 0 ] && ok "status: an UNSET REPO still answers (rc=0) — it is the verb an operator discovers it with" \
+                  || bad "status exited $Q_RC with no checkout, so nothing answers the discovery question"
+case "$Q_OUT" in
+  *"@ <unset>"*) ok "status: names the missing checkout value (<unset>) instead of printing an empty path" ;;
+  *) bad "status printed no <unset> placeholder for a missing REPO — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"NO CHECKOUT"*) ok "status: says NO CHECKOUT when REPO is unset" ;;
+  *) bad "status did not name the missing checkout as the cause — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"no origin remote"*) bad "status blamed a missing origin remote on a checkout that does not exist — $Q_OUT" ;;
+  *) ok "status: does not misattribute the missing checkout to an unreadable origin" ;;
+esac
 # ── (l) THE SESSION'S ENV IS CARRIED INSIDE THE COMMAND STRING — AND GH_REPO IS NOT ──────────────
 # MEASURED 2026-10-21, two failures with one root: a tmux session is served the TMUX SERVER's
 # environment, not the caller's, so an ambient export silently vanishes when a server already exists —
@@ -2030,10 +2159,19 @@ esac
 # final controller exec replaced by a probe. Nothing else is rewritten, so an `export` moved back out
 # of the string fails here even though the string still mentions the name.
 say_case "the session env lives INSIDE the command string, and GH_REPO is neutralised (#2216 class)"
-printf 'export GH_REPO=daniel-ospina/tortoise\n' > "$Q/keys.env"
+# ⛔ THIS ARM PROVES NEUTRALISATION, SO ITS keys.env MUST AGREE WITH THE CHECKOUT — THE SPLIT IS NOW
+# DECIDED AND THIS IS THE HALF THAT MAY STILL PROCEED (#2235). A global export naming a DIFFERENT repo
+# is a STOP-WORK REFUSAL in the supervisor (`assert_gh_repo_conformance`, §12 below), so leaving the
+# old `GH_REPO=daniel-ospina/tortoise` line here made this arm and §12 assert opposite outcomes for the
+# same input: §12 demanded a refusal, and this arm demanded rc 0. It reddened as 4 cascading failures
+# on CI at b3830ff — the refusal fired, no session was created, and the three stmts below that read the
+# recorded argv all reported 'could not recover' as knock-ons. The value here is $Q/agent-repo's OWN
+# repo, which is the only shape that reaches the launch; what is still asserted (and is the point of the
+# #2216/#2235 leak) is that an AGREEING export is not a licence to deliver the value into the session.
+printf 'export GH_REPO=daniel-ospina/agent-infra\n' > "$Q/keys.env"
 qsup start "$Q/agent-repo" "$Q/st-env"
-[ "$Q_RC" -eq 0 ] && ok "start proceeds with a keys.env that exports a GLOBAL GH_REPO (it is neutralised, not refused)" \
-                  || bad "start refused a cell merely because its keys.env carries GH_REPO: $Q_OUT"
+[ "$Q_RC" -eq 0 ] && ok "start proceeds with a keys.env that exports a GLOBAL GH_REPO naming THIS checkout (agreeing is neutralised, not refused)" \
+                  || bad "start refused a cell merely because its keys.env carries an agreeing GH_REPO: $Q_OUT"
 # ⛔ THE COMMAND UNDER TEST IS THE CONTROLLER'S, NOT THE DOCTOR'S. The stub records a single `cmd`
 # file and the LAST session launched is the doctor (`bash cell-doctor.sh loop`), so reading that file
 # graded the WRONG command string — this check then reported "unproven" rather than red, which is the
@@ -2721,6 +2859,72 @@ else
 fi
 
 
+# ── §(p3) THE PIN-CLEANLINESS PREDICATE MUST NOT DRIFT (#2319 review, round 4) ────────────────────
+# `pin_dirty` answers "is the pinned harness dir the bytes the commit carries". THREE files read it: the
+# runtime resolver (scripts/harness-exec.sh, which sources scripts/lib/box.sh), this supervisor's DRIFT
+# check + provenance stamp, and the installer's provenance stamp. Round 4 found the supervisor and the
+# installer still asking the WEAKER question (`git status --porcelain`), so an IGNORED file inside the
+# pin made `check` report no drift and `apply` take "unchanged" over a tree `harness-exec.sh` refuses to
+# start — an instrument certifying the exact state it exists to catch. The bodies are compared with
+# comments excluded (the duplication IS text), and the semantics are then RUN, not assumed.
+say_case "the pin-cleanliness predicate is ONE body in three files, and it still answers the same way (§p3)"
+PINLIB="$(dirname "$SUP")/lib/box.sh"
+PINSH="$(dirname "$SUP")/orchestrator-harness/install.sh"
+extract_pin() { awk 'index($0, "pin_dirty() {")==1 {p=1} p{print} p && /^}$/{exit}' "$1"; }
+strip_c() { sed -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d'; }
+if [ -f "$PINLIB" ] && [ -f "$PINSH" ]; then
+  LP="$(extract_pin "$PINLIB" | strip_c)"
+  SP="$(extract_pin "$SUP" | strip_c)"
+  IP="$(extract_pin "$PINSH" | strip_c)"
+  if [ -n "$LP" ] && [ -n "$SP" ] && [ -n "$IP" ] && [ "$LP" = "$SP" ] && [ "$LP" = "$IP" ]; then
+    ok "pin_dirty: the supervisor's and the installer's mirrors are IDENTICAL to scripts/lib/box.sh"
+  else
+    bad "pin_dirty has DRIFTED between lib/box.sh, cloud-cell-supervisor.sh and install.sh"
+    diff <(printf '%s\n' "$LP") <(printf '%s\n' "$SP") | sed 's/^/      sup: /' | head -10
+    diff <(printf '%s\n' "$LP") <(printf '%s\n' "$IP") | sed 's/^/      ins: /' | head -10
+  fi
+  # BEHAVIOUR, not just text. The SUPERVISOR's copy is written to a file and sourced in a subshell —
+  # never by sourcing the supervisor itself, which would run its entry point inside this arm.
+  if [ -n "$SP" ]; then
+    PD="$T/pin-dirty-mirror.sh"; printf '%s\n' "$SP" > "$PD"
+    PD_TREE="$T/pdtree"; ai_init_repo "$PD_TREE"
+    printf 'tmp/\n' > "$PD_TREE/.gitignore"
+    printf 'keep\n' > "$PD_TREE/tracked.sh"
+    git -C "$PD_TREE" add .gitignore tracked.sh >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m pinned >/dev/null 2>&1
+    pd_run() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD"; }
+    pd_run_c() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD" "$PD_TREE" .; }
+    pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a clean pin is CLEAN" ;; *) bad "pin_dirty (supervisor copy): a clean pin was not CLEAN" ;; esac
+    mkdir -p "$PD_TREE/tmp"; printf 'hotfix\n' > "$PD_TREE/tmp/x.sh"
+    pd_run_c >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a GITIGNORED hotfix is DIRTY (the state `apply` used to call unchanged)" ;; *) bad "pin_dirty (supervisor copy): a gitignored hotfix did not read as DIRTY" ;; esac
+    rm -rf "$PD_TREE/tmp"; printf 'x\n' > "$PD_TREE/.DS_Store"
+    pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store dropping is TOLERATED (one Finder visit must not brick a cell)" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store refused the pin" ;; esac
+    rm -f "$PD_TREE/.DS_Store"
+    # ⛔ THE PRODUCTION CONVENTION: both instruments pass the harness SUBDIR, not the toplevel, and
+    # porcelain prints TOP-relative paths — so the tolerance must be tested through a subdir call too,
+    # or it can be dead in the instruments while alive in the runtime (review round 5: it WAS).
+    mkdir -p "$PD_TREE/scripts/orchestrator-harness"
+    : > "$PD_TREE/scripts/orchestrator-harness/.gitkeep"
+    git -C "$PD_TREE" add scripts/orchestrator-harness/.gitkeep >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m subdir >/dev/null 2>&1
+    printf 'x\n' > "$PD_TREE/scripts/orchestrator-harness/.DS_Store"
+    pd_run_sub() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD" "$PD_TREE/scripts/orchestrator-harness" .; }
+    pd_run_sub >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store in the HARNESS SUBDIR is tolerated — the callers' real convention" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store in the harness subdir refused the pin — the tolerance is dead where it is needed" ;; esac
+    rm -f "$PD_TREE/scripts/orchestrator-harness/.DS_Store"
+    # ⛔ A TRACKED file named like a dropping IS part of the pin: modifying it must read DIRTY. Tolerating
+    # by NAME alone made a rewritten tracked `._x` read CLEAN (review round 5).
+    printf 'tracked\n' > "$PD_TREE/scripts/orchestrator-harness/._x"
+    git -C "$PD_TREE" add scripts/orchestrator-harness/._x >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m dropping-name >/dev/null 2>&1
+    printf 'MUTATED\n' > "$PD_TREE/scripts/orchestrator-harness/._x"
+    pd_run_sub >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a MODIFIED tracked '._x' is DIRTY (the name is not the property)" ;; *) bad "pin_dirty (supervisor copy): a modified tracked '._x' read CLEAN" ;; esac
+    git -C "$PD_TREE" checkout -- scripts/orchestrator-harness/._x >/dev/null 2>&1 || true
+  fi
+else
+  bad "§(p3): $PINLIB or $PINSH is missing, so the pin_dirty mirrors cannot be compared"
+fi
+
+
 # ── §(p2) AN OCTAL-LOOKING AGE AND A SECOND OWNERSHIP PREDICATE (#1856 review) ────────────────────
 # (a) etime ZERO-PADS, and `$((08 * 3600))` is a bash ERROR — "value too great for base". A live
 #     controller's age hits an 08/09 field a few percent of the time, and a failed age used to read as
@@ -3331,6 +3535,56 @@ qcheck_pin "$HL"
 [ "$QQ_RC" -ne 0 ] && ok "check still REFUSES a dangling symlink in the pin root (droppings tolerance is file-only)" \
                    || bad "check certified a root holding a dangling symlink — $QQ_OUT"
 
+# (i-g2) ⛔ A SIBLING COMPONENT OF OURS WRITES INTO THE PIN ROOT (#2812). `harness-apply` records the
+# commit it converged this box to INSIDE `HARNESS_PIN_DIR` (`.agent-infra-version`), so `apply` refused
+# on the delete side for ever AND the entry returned on every 10-minute tick — which makes the guard's
+# own remedy ("remove it by hand") unavailable, because the file is ours. Measured on pi-cell-3,
+# 2026-10-25: the orchestrator was `active` for days, then never came back once the applier was enabled.
+# ⛔ THE POLARITY IS THE CONTRACT, so all three arms below are required: the harness's own NAMED records
+# are tolerated, an UNKNOWN entry is still refused (a fix that tolerates any file would let `apply`
+# silently destroy someone's data — worse than the defect), and a SYMLINK of an allowed NAME does not
+# qualify (the `[ ! -L ]` condition). ⛔ Mutation caught: deleting the new case arm reddens (a).
+say_case "harness metadata in the pin root is TOLERATED, an unknown entry still REFUSED (#2812)"
+HM="$T/pinharnessmeta"; mkdir -p "$HM/pin/a1b2c3d4e5f6"
+printf 'a1b2c3d4e5f6\n' > "$HM/pin/.agent-infra-version"
+qcheck_pin "$HM/pin"
+[ "$QQ_RC" -eq 0 ] && ok "(a) check ACCEPTS a pin root holding 'a1b2c3d4e5f6/' plus '.agent-infra-version'" \
+                   || bad "(a) check REFUSED a pin root whose only extra entry is the harness's own version record — enabling the applier makes the cell permanently unstartable: $QQ_OUT"
+# The DELETE side is the one that actually bricked the cell, so it is asked too (`apply` on this root
+# must not reach the "not a pin directory" refusal). Any other outcome is allowed: this arm pins the
+# CONFORMANCE answer, not apply's re-pin work.
+HA_OUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai1852-ha-$$" \
+          O="$Q/o" REPO="$Q/repo" HARNESS="$QH" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$QREF" \
+          HARNESS_PIN_DIR="$HM/pin" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" apply 2>&1)"
+case "$HA_OUT" in
+  *"not a pin directory"*) bad "(a) apply's delete-side guard STILL refuses the harness's own version record — the shipped applier bricks the controller: $HA_OUT" ;;
+  *) ok "(a) apply does not refuse the pin root over the harness's own version record (delete side agrees with check)" ;;
+esac
+# (b) AN UNKNOWN ENTRY IS STILL REFUSED. This is the arm that keeps the tolerance from becoming "any
+# file is fine": the guard exists because `apply` deletes and re-materialises the root.
+HU="$T/pinunknown"; mkdir -p "$HU/pin/a1b2c3d4e5f6"
+printf 'a1b2c3d4e5f6\n' > "$HU/pin/.agent-infra-version"
+printf 'not ours\n' > "$HU/pin/someone-elses-notebook.txt"
+qcheck_pin "$HU/pin"
+[ "$QQ_RC" -ne 0 ] && ok "(b) check still REFUSES an UNKNOWN entry beside the same pin dir and the version record" \
+                   || bad "(b) check CERTIFIED a root holding an unknown file — the tolerance degenerated into \"any entry is fine\": $QQ_OUT"
+case "$QQ_OUT" in
+  *"someone-elses-notebook.txt"*) ok "(b) the refusal NAMES the unknown entry" ;;
+  *) bad "(b) the refusal does not name the unknown entry — $QQ_OUT" ;;
+esac
+# (c) A SYMLINK IS NOT A RECORD. `harness-apply` writes a regular file; a link named like it is an
+# UNKNOWN indirection in a directory `apply` is about to `rm -rf`, so it stays refused.
+HS="$T/pinmetasymlink"; mkdir -p "$HS/pin/a1b2c3d4e5f6"
+printf 'elsewhere\n' > "$HS/target"
+ln -s "$HS/target" "$HS/pin/.agent-infra-version"
+qcheck_pin "$HS/pin"
+[ "$QQ_RC" -ne 0 ] && ok "(c) check still REFUSES a SYMLINK named '.agent-infra-version'" \
+                   || bad "(c) check certified a root whose version record is a symlink — the [ ! -L ] condition was dropped: $QQ_OUT"
+case "$QQ_OUT" in
+  *".agent-infra-version"*) ok "(c) the refusal names the symlinked entry" ;;
+  *) bad "(c) the refusal does not name the symlinked entry — $QQ_OUT" ;;
+esac
+
 # (i-h) ⛔ THE CONTENT TEST IS THE DELETE SIDE'S ALONE. If the shared CONFORMANCE predicate consulted it,
 # an unresolved `$HARNESS_REPO` would make `check` refuse a legitimate pin root — a false block. So the
 # predicate does NOT consult it (0 = conforms), while the delete authority fails CLOSED (2 = cannot
@@ -3522,6 +3776,64 @@ else
   fi
 fi
 
+# (10) A DERIVED $REPO IS VALIDATED BEFORE IT REACHES THE TMUX COMMAND STRING (#1935 review).
+# `cmd_start` runs its metacharacter guard BEFORE `assert_repo` derives the checkout (`start` calls
+# `cmd_check`, which is where the derivation happens) — and that guard SKIPS an empty value. So a
+# derived path was the one interpolated value that reached `new-session "… REPO='$REPO' …"`
+# unvalidated: a checkout directory whose name carries a quote closes the quote and the remainder is
+# parsed as shell. The fix mirrors the `$HARNESS` re-check that exists for exactly this class (a value
+# that CHANGES after the guard). Driven through the shipped `check`, because that is the path a real
+# `start` takes.
+say_case "a DERIVED REPO is validated before it reaches the tmux command string (#1935)"
+# ⛔ THE ARM MUST BE HERMETIC IN BOTH DIRECTIONS (#1935 review, P2 ×2).
+#  1. The fixture repos carry a UNIQUE origin slug and `OR` is DECLARED to match it. With `OR` unset
+#     the resolver applies NO origin filter (cloud-cell-supervisor.sh: the comparison lives inside
+#     `if [ -n "${OR:-}" ]`), so EVERY provisioning candidate that is a checkout counts — and the
+#     candidate list hardcodes `/tmp/cell` and `$CELL_HOME/cell`, precisely where bring-up clones on
+#     a real cell. On such a box this control arm refused with "2 candidate checkouts match" and the
+#     quote arm reded on its second assertion ("an UNRELATED reason"), so the section proved nothing
+#     there and failed there.
+#  2. Every path literal is compared against the resolver's `pwd -P` form (it prints the value AFTER
+#     `cd … && pwd -P`), so the expected side is canonicalized too — macOS `/var` -> `/private/var`
+#     rewrites `$TMPDIR`, and a raw `$T`-spelled expectation then matches nowhere.
+#     (Same rule the claim-cwd/refresh-scout suites state.)
+# ⛔ $Q IS NOT THE QUEUE FIXTURE AT THIS POINT, AND IT IS NOT ONE ON main EITHER (#1935 review).
+# `Q` is re-assigned by LATER sections for their own private fixtures (the pin-check section sets
+# `Q="$T/pincheck"`), so aliasing this section through `Q` made it depend on SECTION ORDER: after that
+# section landed, `$Q/harness` became a checkout with no root-level worker scripts and `check` died
+# "…/orch-loop.sh missing" BEFORE the derived-REPO guard — the quote arm then "passed" for an unrelated
+# reason (a false PASS this arm's own second assertion exists to forbid) and the control reded. The
+# queue fixture is therefore referenced by ITS OWN path, captured where it is built.
+D3Q="$T/queue"
+D3="$T/derived"; mkdir -p "$D3/o" "$D3/st" "$D3/we'ird"
+ai_init_repo "$D3/we'ird"
+# The unique slug is what makes the origin filter bind to EXACTLY these fixtures: no real box has a
+# checkout whose origin is acme/widget, so a stray /tmp/cell cannot join the candidate set.
+git -C "$D3/we'ird" remote set-url origin https://github.com/acme/widget.git
+D3_OUT=''; D3_RC=0
+D3_OUT="$(env -u REPO Q_STATE="$D3/st" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
+         OR=acme/widget SESSION="ai1935-$$" O="$D3/o" WORKDIR="$D3/we'ird" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D3_RC=$?
+[ "$D3_RC" -ne 0 ] && ok "check REFUSED a DERIVED checkout path carrying a quote" \
+                   || bad "check ACCEPTED a derived REPO carrying a quote — it would be interpolated into the tmux command string: $D3_OUT"
+case "$D3_OUT" in
+  *"must not contain a quote or shell metacharacter"*) ok "the refusal names the metacharacter guard (not an unrelated failure)" ;;
+  *) bad "check refused for an UNRELATED reason, so the derived-REPO guard is unproven: $D3_OUT" ;;
+esac
+# …and the control: the SAME shape with a safe directory name DERIVES and proceeds, so the arm above
+# proves the guard rather than "a WORKDIR-derived repo never works".
+mkdir -p "$D3/fine" "$D3/st2"; ai_init_repo "$D3/fine"
+git -C "$D3/fine" remote set-url origin https://github.com/acme/widget.git
+D4_OUT=''; D4_RC=0
+D4_OUT="$(env -u REPO Q_STATE="$D3/st2" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
+         OR=acme/widget SESSION="ai1935b-$$" O="$D3/o2" WORKDIR="$D3/fine" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D4_RC=$?
+D3F_REAL="$(cd "$D3/fine" && pwd -P)"
+case "$D4_OUT" in
+  *"REPO was not set — using $D3F_REAL"*) ok "the control case DERIVES a quote-free checkout (the guard is not a general refusal)" ;;
+  *) bad "a quote-free derived checkout was NOT adopted, so the arm above proves nothing — $D4_OUT" ;;
+esac
+
 echo
 # ── §7b) agent-infra#1989: the stop/start fence, the verb path's configuration, and doctor
 # idempotency. A PRIVATE fixture (its own repo, harness and cell home): every assertion here is about
@@ -3533,7 +3845,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF
@@ -3720,6 +4032,181 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
   && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
 
+# ── the fixture's worker seed must not drift from the supervisor's requirement ─────────────────
+# Adding two workers (#2029: lane-merge.sh, merge-rate.sh) to cmd_check's required list surfaced as 52
+# unrelated `start` failures instead of ONE assertion naming the drift. This is that assertion: it
+# reads the list out of the SHIPPED supervisor and compares it with the fixture's seed above.
+# Every fixture seeds $SEED_WORKERS (derived at the top from the SHIPPED supervisor), so the drift is
+# impossible by construction. Two things can still go wrong, and both are asserted here:
+#   (a) a NEW fixture hand-writes its own list instead of using $SEED_WORKERS — caught by the literal
+#       grep below (a `for … in <names>` line that mentions a worker);
+#   (b) the number of sites that actually ran is not the number we expect — so a site that stops
+#       executing (an early `return`, a moved block) is noticed rather than silently unvisited.
+# ⛔ ANY hand-written worker list, not just one that happens to name orch-loop.sh/claims.sh: an
+# allow-list of two names is dodgeable by a list that omits both (reviewer finding, P2, verified) —
+# `for f in lane.sh chain-merge.sh …; do` slipped through while this guard reported green. The signature
+# of a seed list is TWO OR MORE literal `*.sh` names on one `for … in` line; globs (`"$HERE"/*.sh`) and
+# the derived form cannot match it. ⛔ NOT line-anchored: a maintainer copying the house style writes
+# `seed_site "$LINENO"; for f in lane.sh chain-merge.sh; do` — anchored, that read as CLEAN (the count
+# half still matched, so the guard was green over a fixture seeding 2 of 12 workers). Verified by the
+# verifier's mutation; unanchored it is caught.
+# (comments are stripped first: this guard's own explanation quotes the shape it forbids, and a
+# `\`-continuation is joined so a list wrapped across lines cannot hide.) ⛔ THE SHAPE FILTER WAS
+# DODGEABLE THREE MORE WAYS — an UPPERCASE loop variable, a QUOTED list, and a list wrapped across
+# lines all read as clean (reviewer finding, measured against the shipped regex). So the test is now
+# "does any `for … in` line outside a comment name two or more `*.sh` files", which covers all three and
+# does not depend on the variable's name or on quoting.
+NOCOMMENT_SEEDS="$(grep -vE '^[[:space:]]*#' "${BASH_SOURCE[0]}" \
+                   | sed -e ':a' -e '/\\$/N; s/\\\n//' -e 'ta')"
+LITERAL_SEEDS="$(printf '%s\n' "$NOCOMMENT_SEEDS" | awk '
+  /for [A-Za-z_][A-Za-z0-9_]* in / && $0 !~ /\$SEED_WORKERS/ {
+    if (gsub(/\.sh/, ".sh") >= 2) c++
+  } END { print c + 0 }')"
+# The expected site count is READ from this file, not written down: a hardcoded number would false-block
+# the next section that adds a fixture (a category-B cost), while the occurrence count still catches
+# the failure that matters — a site that exists but did not RUN (early return, moved block).
+SEED_DECLARED="$(grep -c 'for f in \$SEED_WORKERS' "${BASH_SOURCE[0]}")"
+SEED_RAN="$(sort -u "$SEED_LOG" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$LITERAL_SEEDS" -eq 0 ] && [ "$SEED_RAN" -eq "$SEED_DECLARED" ]; then
+  ok "all $SEED_DECLARED worker-seed sites ran and seeded the set DERIVED from the shipped supervisor"
+else
+  bad "a fixture hand-writes its own worker list ($LITERAL_SEEDS literal seed line(s)) or a site did not run (ran=$SEED_RAN, declared $SEED_DECLARED) — seed \$SEED_WORKERS instead"
+fi
+# ── 12) #2235 — a global `GH_REPO` must not reach the controller ────────────────────────────────
+# THE DEFECT. gh's resolution is flag > `GH_REPO` > the local checkout, and `gh help environment`
+# says of `GH_REPO`: "specify the GitHub repository … for commands that otherwise operate on a local
+# repository" — it REPLACES the checkout's answer for every call that omits `--repo`. Measured twice
+# in one session (2026-10-20/21) on cells whose keys.env exported `GH_REPO=daniel-ospina/tortoise`:
+#
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+#
+# a September tortoise PR, exit 0, over an OPEN agent-infra one; four PRs looked "already merged"
+# while unmerged on origin/main.
+#
+# WHAT IS PINNED HERE, and why both halves:
+#   (i) DISAGREEMENT IS A REFUSAL that names both repos. A cell must not start on a config whose every
+#       rail verdict would be about a repo nobody is looking at.
+#   (ii) AGREEMENT IS NOT A LICENCE TO DELIVER IT. The value is stripped inside the CONTROLLER'S OWN
+#       command string (where `$ENV_FILE` is re-sourced), because the check alone is bypassed by any
+#       path that creates a session without calling it — and because a global export buys nothing
+#       once the rails resolve their own repo by evidence.
+say_case "#2235: GH_REPO in the cell env — a foreign repo is refused, a matching one is stripped"
+GH2235="$T/gh2235-repo"
+# A real checkout fixture: the conformance subject is `git remote get-url origin` of the tree the
+# controller runs in, which `ai_init_repo` gives a tortoise origin (the family every fixture uses).
+ai_init_repo "$GH2235"
+printf 'DEEPSEEK_API_KEY=x\n' > "$T/keys.env"
+sup_gh2235() { # <gh-repo-value>
+  SUP_OUT="$(CELL_HOME="$T/home" ENV_FILE="$T/keys.env" SESSION="ai2235-test-$$" O="$T/o2235" \
+             REPO="$GH2235" HARNESS_REPO="$AI" HARNESS_FETCH=0 GH_REPO="$1" \
+             bash "$SUP" start 2>&1)"
+  SUP_RC=$?
+}
+sup_gh2235 "daniel-ospina/agent-infra"
+[ "$SUP_RC" -ne 0 ] \
+  && ok "start: a GH_REPO naming ANOTHER repo is refused (rc=$SUP_RC)" \
+  || bad "start: a foreign GH_REPO was accepted (rc=$SUP_RC) — output: $(printf '%s' "$SUP_OUT" | tail -2 | tr '\n' ' ')"
+case "$SUP_OUT" in
+  *"DIFFERENT repository"*) ok "start: …and the refusal says the repos differ" ;;
+  *) bad "start: …but the refusal does not name the disagreement — output: $(printf '%s' "$SUP_OUT" | tail -2 | tr '\n' ' ')" ;;
+esac
+case "$SUP_OUT" in
+  *daniel-ospina/agent-infra*) : ;; *) bad "start: …does not name GH_REPO's value" ;; esac
+case "$SUP_OUT" in
+  *daniel-ospina/tortoise*) ok "start: …and names the checkout's repo too" ;;
+  *) bad "start: …does not name the checkout's repo — output: $(printf '%s' "$SUP_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+
+sup_gh2235 "daniel-ospina/tortoise"
+case "$SUP_OUT" in
+  *"DIFFERENT repository"*) bad "start: a GH_REPO naming the SAME repo was refused (case-insensitive match required)" ;;
+  *) ok "start: a GH_REPO naming the SAME repo is not refused for that reason" ;;
+esac
+case "$SUP_OUT" in
+  *"names this checkout's repo"*) ok "start: …and the redundant export is REPORTED, not silently accepted" ;;
+  *) bad "start: …but a redundant global export passes silently — output: $(printf '%s' "$SUP_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+# (ii) THE STRIP LIVES IN THE SESSION COMMAND STRING. A source-level pin is the honest instrument
+# here: the alternative is asserting through a live tmux server, which this suite only does behind its
+# optional real-tmux half. BOTH session creators (controller + doctor) must carry it, so the count is
+# pinned at 2 — a strip added to one and forgotten in the other is the half-fix this catches.
+# ⛔ THE MATCH IS ANCHORED TO A QUOTED COMMAND STRING (`^\s*"set -a;`), NOT A BARE SUBSTRING (#2235
+# review P2). A bare `grep -c 'set +a; unset GH_REPO'` is satisfied by a COMMENT: a mutated copy with
+# the doctor's strip removed and one comment line added still passed, and it reported ✅ for
+# `cloud-cell-quiesce.sh` whose session command had become EMPTY (a comment inside a `\`-continuation
+# ends the command). Anchorless counts measure spelling, not effect.
+# ⛔ WHAT IS MATCHED IS THE ORDER OF TWO EFFECTS, NOT TOKEN ADJACENCY: `set +a;` before `unset GH_REPO`.
+# A `.*` sits between them because other re-asserts legitimately land there — main's
+# `set +a; export ORCH_FOREGROUND=0; unset GH_REPO` (#2402) inserted one, and a pattern pinned to
+# `set +a; unset GH_REPO` contiguously then read the doctor's strip as ABSENT and reddened this arm
+# on a correct merge. The anchor that defeats the comment hazard is the START of the line (the quoted
+# command string), which is unchanged; the tokens in between are not the property under test.
+GH_STRIP_RE='^[[:space:]]*"set -a;.*set \+a;.*unset GH_REPO'
+GH_STRIPS="$(grep -cE "$GH_STRIP_RE" "$SUP" 2>/dev/null || true)"
+[ "${GH_STRIPS:-0}" = "2" ] \
+  && ok "the controller AND the doctor session strip GH_REPO after re-sourcing \$ENV_FILE (2 quoted command strings)" \
+  || bad "only ${GH_STRIPS:-0} session creator(s) carry the strip in a QUOTED COMMAND STRING (want 2) — the leak survives in the other"
+# (ii-b) THE THIRD SESSION CREATOR. Counting $SUP alone was BLIND to the path that does not go
+# through the supervisor at all: `cloud-cell-quiesce.sh` builds its own `tmux new-session` and
+# re-sources $ENV_FILE in it, so a global export re-armed there exactly as it did here. The leak
+# is per-session, so every place that CREATES a session must carry the strip — not just the one
+# whose file this suite happens to grep.
+QUIESCE="$(dirname "$SUP")/cloud-cell-quiesce.sh"
+if [ -f "$QUIESCE" ]; then
+  Q_STRIPS="$(grep -cE '^[[:space:]]*"set -a;.*set \+a; unset GH_REPO' "$QUIESCE" 2>/dev/null || true)"
+  [ "${Q_STRIPS:-0}" -ge 1 ] \
+    && ok "cloud-cell-quiesce.sh strips GH_REPO in the session it builds itself" \
+    || bad "cloud-cell-quiesce.sh re-sources \$ENV_FILE into a new session with NO GH_REPO strip — the leak survives on that path"
+  # A COMMENT between `tmux new-session … \` and the command string ENDS THE COMMAND (a
+  # backslash-newline is joined lexically), so tmux starts a bare shell with no argv at all. Pin
+  # the shape: the line that opens the session must be followed by a line that STARTS with the
+  # quoted command — an indented `#` in between is the regression this catches.
+  if awk '/tmux new-session -d -s orch/{getline nxt; if (nxt ~ /^[[:space:]]*"/) ok=1; else ok=0; exit} END{exit !ok}' "$QUIESCE" 2>/dev/null; then
+    ok "cloud-cell-quiesce.sh: the session command is the IMMEDIATE continuation of tmux new-session"
+  else
+    bad "cloud-cell-quiesce.sh: a line sits between 'tmux new-session' and its command string — the command is cut off and tmux starts a BARE SHELL"
+  fi
+else
+  bad "cloud-cell-quiesce.sh not found beside the supervisor — the third session creator cannot be checked"
+fi
+# (ii-c) EVERY SESSION CREATOR IN THE REPO, NOT THE ONES THIS TEST KNOWS BY NAME. Naming files is
+# how `deploy-crossbox.sh` was missed: it creates the controller session and re-sources keys.env
+# under `set -a` too (it is SHIPPED — `pi-bootstrap/setup.sh`'s fleet_srcs — and on that path the
+# leak turns every `merge-one.sh` attempt into a REFUSAL, so PRs PARK). So the sweep is by
+# PROPERTY: any non-test script that opens a tmux session and sources keys.env in it must carry
+# the strip once per such command string. A fifth creator cannot be forgotten this way.
+CREATORS="$(grep -rlE 'tmux new-session' --include='*.sh' "$(dirname "$SUP")" 2>/dev/null \
+  | grep -v '\.test\.sh$' | xargs grep -lE 'keys\.env|ENV_FILE' 2>/dev/null || true)"
+MISSING=""; NCREATORS=0
+for _c in $CREATORS; do
+  # ⛔ THE TWO PATTERNS MUST MATCH THE SAME POPULATION (#2235 review round 3). The first cut
+  # counted `keys.env` on the left and the strip on the right, so every creator that sources
+  # `$ENV_FILE` (the supervisor and quiesce do) had `sessions=0` and could NEVER pass — a
+  # permanently-red gate, which is worse than none: a real regression would hide inside it. And a
+  # file that has no session command string at all (a mention in a comment) has nothing to
+  # require, so it is SKIPPED, not failed.
+  _want="$(grep -cE '^[[:space:]]*"set -a;.*(\$ENV_FILE|keys\.env)' "$_c" 2>/dev/null || true)"
+  [ "${_want:-0}" -ge 1 ] || continue
+  NCREATORS=$((NCREATORS + 1))
+  _got="$(grep -cE "$GH_STRIP_RE" "$_c" 2>/dev/null || true)"
+  if [ "${_got:-0}" -lt "${_want:-0}" ]; then
+    MISSING="$MISSING $(basename "$_c")(strip=${_got:-0}/sessions=${_want:-0})"
+  fi
+done
+if [ "$NCREATORS" -ge 3 ] && [ -z "$MISSING" ]; then
+  ok "every session creator in scripts/ that re-sources keys.env/\$ENV_FILE strips GH_REPO ($NCREATORS files)"
+else
+  bad "session creator(s) without the GH_REPO strip:$MISSING (session creators scanned: $NCREATORS) — gh would answer for the leaked repo in each"
+fi
+
+# NOTE: `cloud-cell-bringup.sh::check_repo` carries the same rule for the CHECK path (it is where
+# `--check` prints CELL READY). ⛔ IT IS NOT EXERCISED BY THE BRING-UP SUITE: that suite's fixture
+# clone is `mkdir -p "$T/cell/.git"` with NO origin remote, so `[ -n "${GH_REPO:-}" ]` inside the
+# check can never be true there — the `unset GH_REPO` this suite added makes certain of it. The
+# block is covered by reading only, which is why it is kept minimal (one `git remote get-url origin`,
+# one slug compare, one `die`); a test would need a git stub that shadows the very command the check
+# reads. Stated as a residual rather than claimed as covered (#2235 review P1).
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # keys.env cannot override a bound the INSTALLER validated (review P1, #2402)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -3755,19 +4242,42 @@ grep -q 'CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"' "$SUP" \
   && ok 'env-file override: CONTROLLER_INVOKER_HOME is re-asserted after the source' \
   || bad 'env-file override: CONTROLLER_INVOKER_HOME is not restored after source_env_file — keys.env can re-point the directory every unit reader uses'
 
-# ⛔ THE UNIT'S DIRECTORY IS SEARCHED, NOT GUESSED FROM THE CALLER'S HOME (review P1 round 18, #2402).
+# ⛔ THE UNIT'S DIRECTORY IS SEARCHED, NOT GUESSED FROM THE CALLER'S HOME (review P1 round 18/19, #2402).
 # `$HOME` at read time is the INVOKER's; the doctor's session forces `HOME=$CELL_HOME`, while an operator's
 # standalone install wrote the unit under the OPERATOR's home. With `CELL_HOME != $HOME` the doctor found
 # nothing, skipped the service branch and launched a tmux controller BESIDE the enabled unit (#1761).
-grep -q 'controller_user_unit_dirs' "$SUP" && grep -q '^passwd_home()' "$SUP" \
-  && ok 'unit lookup: the user-scope search carries the passwd-home candidates, not only the invoker HOME' \
-  || bad 'unit lookup: the user-scope unit is resolved from a single HOME guess again — a CELL_HOME != HOME cell loses its unit (and its NOT-ACTIVE fence)'
+# ⛔ THE PIN MUST NAME THE CANDIDATES, NOT THE FUNCTIONS (review P1 round 19, #2402 / D). The first version
+# grepped `controller_user_unit_dirs` and `passwd_home` — strings that survive deletion of every passwd
+# candidate, because the functions remain. Mutation-verified by the reviewer: deleting both passwd lines left
+# this suite at PASS=481 FAIL=0, a pin with no state in which it fails. These greps name the assignments, so
+# deleting either candidate reds its arm.
+grep -q 'h="\$(passwd_home "\$(id -u)")"' "$SUP" \
+  && ok 'unit lookup: the invoking uid passwd home is a candidate (the directory systemctl --user reads)' \
+  || bad 'unit lookup: the invoking uid passwd home is GONE from the candidate list — a doctor running under HOME=$CELL_HOME cannot see the operator install again'
+grep -q 'h="\$(passwd_home "\${SUDO_USER:-}")"' "$SUP" \
+  && ok 'unit lookup: SUDO_USER passwd home is a candidate (so sudo does not hide the operator unit)' \
+  || bad 'unit lookup: the SUDO_USER passwd home is GONE from the candidate list — sudo bash … --status goes back to answering over root home'
 grep -q 'getent passwd "\$1"' "$SUP" \
   && ok 'unit lookup: passwd_home reads the database, so neither `export HOME=$CELL_HOME` nor sudo can re-point it' \
   || bad 'unit lookup: passwd_home does not read the passwd database — the caller environment decides again'
 grep -q 'dirname "\$_UNIT_PATH")" != ' "$SUP" \
   && ok 'unit lookup: the manager scope is taken from the resolved copy (any user dir), not one guessed path' \
   || bad 'unit lookup: the scope is decided by comparing against one guessed user directory — a unit found in another candidate would be addressed on the SYSTEM manager'
+# ⛔ THE FENCE ON THE TWO UNIT DIRECTORIES MUST BE UNCONDITIONAL (review P1 round 19, #2402 / B). The
+# timeout siblings keep `[ -z "$_IN" ] ||` because an unset timeout legitimately comes from the env file; a
+# DIRECTORY has no such reading (its default is computed downstream), so the conditional form restored
+# nothing when nobody supplied a value — which is every production caller. The fence was inert.
+grep -qE '^CONTROLLER_SYSTEM_UNIT_DIR="\$CONTROLLER_SYSTEM_UNIT_DIR_IN"$' "$SUP" && grep -qE '^CONTROLLER_USER_UNIT_DIR="\$CONTROLLER_USER_UNIT_DIR_IN"$' "$SUP" \
+  && ok 'env-file override: the two unit DIRECTORIES are re-asserted UNCONDITIONALLY, so keys.env cannot re-point the search' \
+  || bad 'env-file override: the unit directories are re-asserted only when the caller supplied one — a keys.env line still hides the installed unit (the fence is inert)'
+# ⛔ AND `PS_BIN` DECIDES WHICH PIDS `stop` MAY SIGNAL (review P1 round 19, #2402 / B): its age answer feeds
+# `lock_controller_pid`, so a keys.env stub makes a recycled pid that merely looks like the controller look
+# like the lock owner and get TERM/KILL. RED on revert: the snapshot or the restore is deleted.
+if grep -q '^PS_BIN_IN="\${PS_BIN:-}"' "$SUP" && grep -qE '^PS_BIN="\$PS_BIN_IN"$' "$SUP"; then
+  ok 'env-file override: PS_BIN is snapshotted and restored, so keys.env cannot forge the process-age rule behind stop'
+else
+  bad 'env-file override: PS_BIN is unfenced — a keys.env stub can forge the age rule and have stop signal a pid that is not the controller'
+fi
 # ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THESE CALLERS ARE NOT THE SERVICE MANAGER (review P1 round 18,
 # #2402). The unit exports =1 and every lane shell inherits it through the tmux server it created, so an
 # unpinned `start` either parks against the handover bound and reports a false failure (`harness up`) or
@@ -3778,6 +4288,17 @@ grep -q 'ORCH_FOREGROUND=0 hu_run' "$HERE/harness-up" \
 grep -q 'env ORCH_FOREGROUND=0 bash "\$SUPERVISOR" start' "$HERE/orchestrator-bringup.sh" \
   && ok 'caller pin: orchestrator-bringup.sh starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
   || bad 'caller pin: orchestrator-bringup.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 execs the loop outside the unit cgroup'
+# ⛔ AND THE LAST TWO CALLERS (review P1 round 19, #2402 / C, and P2 / D). `cloud-cell-quiesce.sh` is the
+# worst one to leave unpinned — it STOPS the unit a few lines before this `start`, so the foreground branch
+# has nothing to hand over to and execs the loop inside quiesce's own child, outside the unit's cgroup, while
+# quiesce's own "exactly one orch-loop" assertions still pass and it prints DONE. `watchdog-loop.sh` carries
+# the pin already; it had no arm, so deleting it left every suite green.
+grep -q 'ORCH_FOREGROUND=0 \\' "$HERE/cloud-cell-quiesce.sh" \
+  && ok 'caller pin: cloud-cell-quiesce.sh starts the supervisor with ORCH_FOREGROUND=0 (it stops the unit first, so an inherited =1 would exec a dispatcher outside the cgroup)' \
+  || bad 'caller pin: cloud-cell-quiesce.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 leaves an unsupervised dispatcher behind a DONE report'
+grep -q 'ORCH_FOREGROUND=0' "$HERE/orchestrator-harness/watchdog-loop.sh" \
+  && ok 'caller pin: watchdog-loop.sh starts the supervisor with ORCH_FOREGROUND=0' \
+  || bad 'caller pin: watchdog-loop.sh lost its ORCH_FOREGROUND=0 pin — an inherited =1 changes what its start does'
 # ⏱ THE ANTI-ROT PIN FOR THE SERVICE-MANAGED AUTOMATED RESTART (review P1, #2402). The doctor's restart arm
 # sets ORCH_AUTOMATED_RESTART=1; `cmd_start` refuses to re-arm a unit the manager reports not active under
 # it and answers rc 4 — its own outcome, which the doctor records as NOT LAUNCHED rather than as a failure.
@@ -3818,6 +4339,44 @@ _ar_bad="$(awk '
 [ -z "$_ar_bad" ] \
   && ok 'service mode: no "already running" answer is reachable after a completed handover' \
   || bad "service mode: an \"already running\" answer sits on the handover path (lines: $_ar_bad) — after the handover the controller is GONE, so this reports a dead pid and exits 0 without launching"
+
+# ── the scheduled layer's PLACEMENT (agent-infra#1864) ───────────────────────────────────────
+# ⛔ POSITION, NOT PRESENCE. `scheduler_ensure` must run inside cmd_start and BEFORE the
+# already-running early return: `start` is the cell's own "the cell is now alive" signal, and the
+# common start-after-stop path hits that return — so a loop that died while the controller lived is
+# revived ONLY because this call sits above it. Putting the call back below the return (the shape
+# this PR's own header warns about) would leave every assertion above green, which is why the
+# invariant is pinned here by line position rather than left to the reader of a comment.
+# It must also come AFTER assert_queue_target: --start clears the OFF switch, so running it before
+# the queue-target gate meant a start that then REFUSED had already un-stopped a deliberate --stop.
+say_case "start revives the scheduled layer, from the right place in cmd_start (#1864)"
+START_BODY="$(sed -n '/^cmd_start()/,/^}/p' "$SUP")"
+[ -n "$START_BODY" ] && ok "cmd_start was found in the supervisor" \
+  || bad "could not locate cmd_start in $SUP — this case would otherwise pass vacuously"
+# Line numbers WITHIN cmd_start's own body, so nothing outside the function can satisfy them.
+sched_ln="$(printf '%s\n' "$START_BODY" | grep -n '^  scheduler_ensure$' | head -1 | cut -d: -f1)"
+return_ln="$(printf '%s\n' "$START_BODY" | grep -n 'if tmux has-session -t "\$SESSION"' | head -1 | cut -d: -f1)"
+queue_ln="$(printf '%s\n' "$START_BODY" | grep -n '^  assert_queue_target$' | head -1 | cut -d: -f1)"
+[ -n "$sched_ln" ] && ok "start calls scheduler_ensure" \
+  || bad "cmd_start never calls scheduler_ensure — nothing revives the schedule on a running cell"
+[ -n "$return_ln" ] && ok "the already-running early return is still in cmd_start" \
+  || bad "the early return this case is about is gone from cmd_start — re-derive this assertion"
+# ⛔ ITS OWN PRESENCE GUARD, like the other two. Without it a cmd_start that no longer contains
+# `assert_queue_target` made the ordering block below skip BOTH its ok and its bad — no assertion
+# ran, and the case still reported success. A gate whose anchor can vanish silently is not a gate.
+[ -n "$queue_ln" ] && ok "cmd_start still gates on the queue target before it starts anything" \
+  || bad "assert_queue_target is gone from cmd_start — the ordering assertion below would skip vacuously"
+if [ -n "$sched_ln" ] && [ -n "$return_ln" ]; then
+  [ "$sched_ln" -lt "$return_ln" ] \
+    && ok "scheduler_ensure runs BEFORE the already-running early return (a dead loop is revived by start)" \
+    || bad "scheduler_ensure is BELOW the already-running early return (line $sched_ln vs $return_ln) — a cell whose loop died while the controller lived would stay dead"
+fi
+if [ -n "$sched_ln" ] && [ -n "$queue_ln" ]; then
+  [ "$queue_ln" -lt "$sched_ln" ] \
+    && ok "scheduler_ensure runs AFTER assert_queue_target (a refused start cannot un-stop the schedule)" \
+    || bad "scheduler_ensure runs BEFORE assert_queue_target (line $sched_ln vs $queue_ln) — a start that then refuses would already have cleared a deliberate --stop"
+fi
+
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
