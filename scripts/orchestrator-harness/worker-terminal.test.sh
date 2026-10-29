@@ -2397,7 +2397,10 @@ case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "R6: a spawn whose create answers succeeds as before (the probe is not on the happy path)" $rc
 [ ! -s "$TMP/ensure6.log" ] && rc=0 || rc=1
 ck "R6: …and it calls NO server verb at all (no cost, no risk on the 1,500-spawn path)" $rc
-grep -c '^CMUX server ' "$TMP/cmuxr6.log" | grep -qx '0' && rc=0 || rc=1
+# ⛔ HERE-STRING-FREE ON PURPOSE: `producer | grep -q` lets grep exit on first match, the producer
+# takes SIGPIPE, and under `pipefail` a MATCH then reads as a failure (#841/#864,
+# scripts/check-no-sigpipe-grep.sh). Command substitution, not a pipe.
+[ "$(grep -c '^CMUX server ' "$TMP/cmuxr6.log" 2>/dev/null)" = "0" ] && rc=0 || rc=1
 ck "R6: …verified on the CLI's own call log, not on the module's prose" $rc
 # (R7) A STOPPED OWNER IS NOT A RUNNING ONE. `case` takes the FIRST matching pattern, and `not running`
 # CONTAINS `running` — so the positive pattern first made two of the five down signatures dead code and
