@@ -208,10 +208,13 @@ _CLS_RULE="want=(os.environ.get('REQ') or '').split()"
 # its FIRST match, the upstream `grep -vE` takes SIGPIPE (141), and under `pipefail`
 # a FAILING drift guard reads as a pass (#864's class; the producer here writes the
 # whole non-comment stream, so it is a live window, not a shape flag).
-_ORCH_RULE_HITS="$(grep -vE '^[[:space:]]*#' "$ORCH" 2>/dev/null || true)"
+# ⛔ THE RULE MOVED WITH THE CLASSIFIER (agent-infra#2719): the split rule now ships inside
+# `check-class.py`, and the sweep runs THAT file. The pin reads BOTH, because a rule that survives in
+# one file while the other runs is precisely the drift this assertion exists to catch.
+_ORCH_RULE_HITS="$({ grep -vE '^[[:space:]]*#' "$ORCH" 2>/dev/null; grep -vE '^[[:space:]]*#' "$HERE/check-class.py" 2>/dev/null; } || true)"
 case "$_ORCH_RULE_HITS" in
   *"$_CLS_RULE"*) { echo "  ✅ the classifier still splits with Python .split() — the rule _normalise_set shares"; PASS=$((PASS+1)); } ;;
-  *) { echo "  ❌ the classifier's split rule changed in orch-loop.sh; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); } ;;
+  *) { echo "  ❌ the classifier's split rule is in NEITHER orch-loop.sh nor check-class.py; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); } ;;
 esac
 _agree() { # _agree <set> -> both readers' verdicts on the SAME string
   printf 'authority=%s classifier=%s' "$(merge_authority "${1:-}")" \
@@ -239,8 +242,10 @@ eqv "a TAB-separated OVERRIDE is normalised onto the space-joined contract" "a b
 
 # (d) the shipped classifier against BOTH shapes. Rendered from the measured surfaces:
 #     agent-infra PR #1763 = 22 checks, all non-red, NO ai-review-gate row.
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$ORCH" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+# ⛔ THE SHIPPED ARTIFACT IS NOW `check-class.py` (agent-infra#2719) — the classifier moved out of the
+# orch-loop.sh heredoc so the sweep and the NOCHECKS arm run ONE implementation. A missing file leaves
+# `$TMP/classify.py` empty and the block below reports its own "not extracted" red, as before.
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 if [ -s "$TMP/classify.py" ]; then
   clr() { printf '%s' "$2" | REQ="$1" REVIEW_GATE=ai-review-gate python3 "$TMP/classify.py" 2>/dev/null; }
   AISURF='[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]'
@@ -576,10 +581,11 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
       LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
       sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
-      # ⛔ THE SPAWN IS A DURABLE TERMINAL NOW (worker-terminal.sh): a tmux window is the measured
-      # 21-line death on a cell. The spy records the SPAWN ARGV, so every assertion below still reads
-      # "what actually ran" — and the carried REQ/REVIEW_GATE land in it unchanged, because they are
-      # part of the command the worker is started with.
+      # ⛔ THE SPAWN IS A DURABLE TERMINAL WHERE THE DAEMON ANSWERS (worker-terminal.sh); on a box
+      # without one it is tmux with an explicit HOME+keys.env contract — the `~21 log lines` death was
+      # the missing environment, not tmux (agent-infra#2210, reopened). The spy records the SPAWN ARGV,
+      # so every assertion below still reads "what actually ran" — and the carried REQ/REVIEW_GATE land
+      # in it unchanged, because they are part of the command the worker is started with.
       WT_DIR="$O/state"; WT_TABLE_TTL=0
       . "$HERE/worker-terminal.sh"
       cmux() {
@@ -1400,10 +1406,13 @@ FAKE
   wpin "the fixer budget is derived from the UNOWNED count" "$ORCH" 'MF="$(fix_slots "$UPN")"'
   # …at EVERY fixer spawn site (a count, not a find: a partial revert that leaves one site on the
   # unraised MAX_FIX is exactly the asymmetry this change removes).
-  _mf_sites="$(grep -cF -- '-lt "$MF"' "$ORCH")"
+  # ⛔ COUNT CODE, NOT PROSE (#2762): two COMMENTS in orch-loop.sh quote the same predicate to explain
+  # the ceiling, so a raw `grep -c` counted 5 and redded main — a false RED on a correct tree, which
+  # is the same class as a false PASS: the arm stopped being evidence of the spawn sites.
+  _mf_sites="$(grep -F -- '-lt "$MF"' "$ORCH" | grep -vc '^[[:space:]]*#')"
   [ "${_mf_sites:-0}" = "3" ] \
     && { echo "  ✅ all 3 fixer spawn sites compare against the drain-aware budget"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ expected 3 fixer spawn sites on \$MF, found ${_mf_sites:-0} — some still use the unraised MAX_FIX"; FAIL=$((FAIL+1)); }
+    || { echo "  ❌ expected 3 fixer spawn sites on \$MF (code lines, comments excluded), found ${_mf_sites:-0} — some still use the unraised MAX_FIX"; FAIL=$((FAIL+1)); }
   if grep -qF -- '-lt "${MAX_FIX:-3}"' "$ORCH"; then
     echo "  ❌ a fixer spawn site still compares against the unraised MAX_FIX (the asymmetry is back)"; FAIL=$((FAIL+1))
   else
@@ -1446,11 +1455,20 @@ FAKE
     grep -E '^is_num\(\) \{' "$ORCH"
     sed -n '/^file_mtime_epoch() {/,/^}/p' "$ORCH"
     sed -n '/^mp_recent_land() {/,/^}/p' "$ORCH"
+    # ⛔ THE LABEL HELPER BELONGS HERE TOO (review 3-P2): the shipped stall arm derives its
+    # `drain=<label>` from `drain_stall_label`. A harness that extracted the block without it got a
+    # 127 inside the substitution and an empty label, so every driven arm read UNMEASURED while the
+    # shipped code was correct — the unextracted-helper trap, in the other direction.
+    sed -n '/^drain_stall_label() {/,/^}/p' "$ORCH"
   } > "$TMP/drain_helpers.sh"
   DO="$TMP/drainO"; mkdir -p "$DO/state"
-  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN]
+  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP]
     ( set -u
       O="$DO"; LOG="$TMP/drain.log"; : > "$LOG"; UPN_WORK=50
+      PRDISP_ACTS=3
+      PRDISP_TOP=""
+      if [ "${3+x}" = x ]; then PRDISP_SPAWNS="$3"; fi
+      if [ "${4+x}" = x ]; then PRDISP_TOP="$4"; fi
       . "$TMP/drain_helpers.sh"
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
@@ -1490,6 +1508,199 @@ PYEOF
     *"drain alive"*|*"DRAIN STALLED"*) echo "  ok a NON-NUMERIC MERGE_STALL_MIN falls back to 180 and still decides"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ a non-numeric MERGE_STALL_MIN produced no verdict: $_out"; FAIL=$((FAIL+1)) ;;
   esac
+  # ── THE DRAIN'S PROMISE IS VERIFIED, AND A STALL ESCALATES (agent-infra#2590) ────────────────
+  # ⛔ THE DEFECT: the issue path closes on the PR path working, and a stall only printed a log line
+  # — 8 of them on a live box at `lanes=0` with 9 un-owned and nothing landing for 3.4h, which read as
+  # normal. These drives pin the three readings apart, and pin that the escalation SURVIVES the pass.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain 200 180 0)"
+  case "$_out" in
+    *"DRAIN DEADLOCK"*"STARTED NO WORKER"*) echo "  ok a stalled drain that spawned NOTHING escalates as a DEADLOCK (the policy's promise failed)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a stall with 0 spawns did not escalate: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *"issues stays CLOSED"*|*"issue path stays CLOSED"*) echo "  ok …and it does NOT reopen the issue path (owner ruling 2026-10-18 preserved)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the escalation lost the closed issue path: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if [ -s "$DO/state/drain-stall" ] && grep -q '^passes=1$' "$DO/state/drain-stall"; then
+    echo "  ok …and the escalation is RECORDED (it outlives the pass, so the next cycle still knows)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the escalation left no artifact: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
+  _out="$(_drain 200 180 0)"
+  grep -q '^passes=2$' "$DO/state/drain-stall" \
+    && { echo "  ok …and a second stalled pass COUNTS itself (pass 2) rather than restarting at 1"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the pass counter did not advance: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1)); }
+  _out="$(_drain 200 180 4)"
+  case "$_out" in
+    *"DRAIN STALLED"*"spawned 4 worker(s)"*) echo "  ok a stall that DID spawn workers names them (a LAND problem, not an idle one)"; PASS=$((PASS+1)) ;;
+    *"DRAIN DEADLOCK"*) echo "  ❌ a stall with 4 spawns was reported as a deadlock: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a stall with 4 spawns lost the spawn count: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *"UNMEASURED"*) echo "  ❌ a MEASURED 4 spawns was rendered UNMEASURED: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok …and a measured count is never rendered as UNMEASURED"; PASS=$((PASS+1)) ;;
+  esac
+  # An UNMEASURED spawn count must not manufacture a deadlock claim — a claim from no measurement.
+  _out="$(_drain 200 180 '')"
+  case "$_out" in
+    *"DRAIN DEADLOCK"*) echo "  ❌ an UNMEASURED spawn count produced a deadlock claim: $_out"; FAIL=$((FAIL+1)) ;;
+    *"UNMEASURED"*) echo "  ok an unreadable spawn count says UNMEASURED and claims no deadlock"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unreadable spawn count produced no verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ THE LAND POPULATION IS NOT "THE QUEUE" (MEASURED 2026-10-23). `state/merged-*.done` is written by
+  # merge-one.sh ONLY, i.e. by THIS box's own merge workers, so the age says "when did this box last
+  # land" — not "when did the queue last move". On a live box 7 PRs merged in 69 minutes while this
+  # line printed "no PR merged in 264m", because a PEER box held the landing claims. An escalation that
+  # names a land/capacity problem on a box that is merely not the lander is one an operator ignores.
+  _out="$(_drain 200 180 0 'no arm: no red check in this class is in this repo')"
+  case "$_out" in
+    *"THIS box's own merge-one successes only"*) echo "  ok the stall NAMES its land population (a peer box's merges are invisible here)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the stall presented this box's land age as the queue's: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *'dominant named wait: "no arm: no red check in this class is in this repo"'*) echo "  ok …and it quotes the dominant NAMED wait the ledger already held (the reason nothing spawned)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the deadlock did not quote the pass's own dominant wait: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # No named wait -> no empty quote (an invented citation is worse than none).
+  _out="$(_drain 200 180 0 '')"
+  case "$_out" in
+    *'dominant named wait'*) echo "  ❌ an ABSENT wait reason was rendered as a quote: $_out"; FAIL=$((FAIL+1)) ;;
+    *"THIS box's own merge-one successes only"*) echo "  ok …while an absent wait reason is left out (no invented quote)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the stall lost its population note with no wait reason: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # A LAND CLEARS IT. A marker that outlives its condition is the stale-flag class this harness hunts.
+  _out="$(_drain 5 180 0)"
+  if [ -e "$DO/state/drain-stall" ]; then
+    echo "  ❌ a fresh land left the escalation marker behind (a stale flag): $(cat "$DO/state/drain-stall")"; FAIL=$((FAIL+1))
+  else
+    echo "  ok a fresh land CLEARS the escalation marker"; PASS=$((PASS+1))
+  fi
+  # …and the status-line token reads that marker, so the stall cannot be silent.
+  _tk() { ( set -u; O="$DO"; . "$TMP/drain_helpers.sh"; . "$TMP/dt.sh"; drain_stall_token ); }
+  # ⛔ THE LABEL HELPER IS EXTRACTED WITH THE TOKEN (review c-1). The token calls
+  # `drain_stall_label`; a suite that extracted only the token would get a 127 inside the command
+  # substitution, an EMPTY label, and the `UNMEASURED` fallback would keep every assertion below
+  # green while the shipped label was broken — the same unextracted-helper trap `spawns_since` has
+  # in pr-dispatch.test.sh.
+  { sed -n '/^drain_stall_token() {/,/^}/p' "$ORCH"; sed -n '/^drain_stall_label() {/,/^}/p' "$ORCH"; } > "$TMP/dt.sh"
+  grep -qF 'drain_stall_label() {' "$TMP/dt.sh" \
+    || { echo "  ❌ drain_stall_label() is missing — the token cannot derive its label"; FAIL=$((FAIL+1)); }
+  if [ -s "$TMP/dt.sh" ]; then
+    _g="$(_tk)"; [ -z "$_g" ] \
+      && { echo "  ok no marker -> the status line carries NO drain token"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ a deleted marker still produced a token: $_g"; FAIL=$((FAIL+1)); }
+    printf 'at=%s\npasses=3\nage=240\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"drain=DEADLOCK(passes=3"*"no_land=240m"*"spawns=0"*) echo "  ok the cycle status line carries the escalation (passes, land age, spawns)"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the status token lost its evidence: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ THE LABEL IS THE MARKER'S OWN MEASUREMENT, NOT ITS EXISTENCE (review c-1, P1). BOTH stall arms
+    # write this file: the DEADLOCK arm records `spawns=0`, and the STALLED arm records the workers it
+    # DID start. A token keyed on the file existing printed `drain=DEADLOCK(…,spawns=4)` over a pass that
+    # started four workers — the claim-without-a-measurement class this change deletes, on the one line
+    # every reader parses.
+    printf 'at=%s\npasses=4\nage=240\nunowned=9\nspawns=4\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"drain=DEADLOCK"*) echo "  ❌ a marker recording 4 spawned workers was reported as a DEADLOCK: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"drain=STALLED("*"spawns=4"*) echo "  ok a marker recording spawned workers reads STALLED, never DEADLOCK"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the token lost the spawns>0 reading: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # …and an UNREADABLE count is neither a deadlock nor a stall: it is unmeasured.
+    printf 'at=%s\npasses=5\nage=240\nunowned=9\nspawns=UNMEASURED\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"drain=DEADLOCK"*) echo "  ❌ an UNMEASURED spawn count produced a DEADLOCK label: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"drain=UNMEASURED("*) echo "  ok an unmeasurable marker reads UNMEASURED — a deadlock claim needs a measurement"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ an unmeasurable marker produced no honest label: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ ONE DEFINITION, TWO READERS: the cycle record's `drain=` field must go through the same helper,
+    # or the status line and the durable record can disagree about what the box is in.
+    wpin "the cycle record's drain= field is the SAME helper the status token reads" "$ORCH" '_cr_drain="$(drain_stall_label)"'
+    wpin "…and a PR cycle with NO marker says 'draining', not an empty field" "$ORCH" '_cr_drain="draining"'
+    # ⛔ A LAND NEWER THAN THE MARKER CLEARS IT, and the token must not need the writer to remember.
+    # ⛔ THE MARKER IS STAMPED IN THE PAST, ON PURPOSE. The real ordering is "pass N writes the marker
+    # at T, a later pass lands a PR at T+n" — so the land is STRICTLY newer. Stamping both `at` and the
+    # land in the same wall-clock second made this drive a coin flip on a strict `-gt` (measured: it
+    # failed on a same-second run), and the shipped comparison is deliberately strict: a land at the
+    # exact second the marker was written cannot be shown to postdate it, and an escalation that
+    # survives one extra pass is fail-closed, while deleting on an unprovable land is fail-open.
+    : > "$DO/state/merged-8888.done"
+    printf 'at=%s\npasses=3\nage=240\nunowned=9\nspawns=0\nacts=2\n' "$(( $(date +%s) - 5 ))" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    if [ -z "$_g" ] && [ ! -e "$DO/state/drain-stall" ]; then
+      echo "  ok a land newer than the marker deletes it (self-healing, not a stale flag)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a land did not clear the escalation: token='$_g' marker=$([ -e "$DO/state/drain-stall" ] && echo present || echo gone)"; FAIL=$((FAIL+1))
+    fi
+    rm -f "$DO/state/merged-8888.done" "$DO/state/drain-stall"
+  else
+    echo "  ❌ drain_stall_token() is missing — the escalation can be silent again"; FAIL=$((FAIL+1))
+  fi
+  # ── THE TOKEN DERIVES ITS LABEL, SO THE LOG AND THE ARTIFACT AGREE (review 3-P2) ─────────────
+  # `_esc` hard-coded "carries drain=DEADLOCK" in BOTH stall arms, so a STALLED pass (spawns=4)
+  # promised a DEADLOCK token that `drain_stall_label` would never print. Pin the derivation, not a
+  # hard-coded token: the log line must interpolate the label the status token reads.
+  wpin "the escalation names the label its own marker yields (never a hard-coded DEADLOCK)" "$ORCH" \
+       '_escl="$(drain_stall_label)"'
+  if grep -qF 'carries drain=DEADLOCK until a PR lands' "$ORCH"; then
+    echo "  ❌ a hard-coded drain=DEADLOCK survives in the escalation — the STALLED arm would name a token that is not there"; FAIL=$((FAIL+1))
+  else
+    echo "  ok the escalation interpolates the derived label (no hard-coded DEADLOCK)"; PASS=$((PASS+1))
+  fi
+  # ── AN UNMEASURED SPAWN COUNT CARRIES NO POSITIVE DIAGNOSIS (review 2-P2) ──────────────────
+  # "the workers run and nothing lands" is a claim ABOUT SPAWNS. On an UNMEASURED count the STALLED
+  # arm must not print it — that is the claim-without-a-measurement defect sign-reversed.
+  _u="$(_drain 200 180 '')"   # PRDISP_SPAWNS set-but-empty => UNMEASURED
+  case "$_u" in
+    *"the workers run"*) echo "  ❌ an UNMEASURED spawn count still asserted 'the workers run': $_u"; FAIL=$((FAIL+1)) ;;
+    *"cannot say whether any worker was started"*) echo "  ok an UNMEASURED count says so instead of asserting the workers run"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the UNMEASURED stall arm produced no honest tail: $_u"; FAIL=$((FAIL+1)) ;;
+  esac
+  # …while a MEASURED positive still gets the land-problem diagnosis.
+  _p="$(_drain 200 180 4)"
+  case "$_p" in
+    *"the workers run and nothing lands"*) echo "  ok a MEASURED positive count keeps the land-problem diagnosis"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a measured positive count lost its land-problem diagnosis: $_p"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ── THE MARKER CANNOT OUTLIVE THE DRAIN (review 1-P1, the stale-flag class) ────────────────
+  # The whole drain-health block is gated on `LO_CHOICE=pr`, so its "drain alive" clear never runs
+  # once the last un-owned PR is merged by a PEER box: `drain_stall_token` kept printing
+  # `drain=DEADLOCK(passes=7,unowned=9,…)` forever — a false deadlock, and a false deadlock is how an
+  # operator learns to ignore a real one. DRIVEN, not pinned: the block is extracted by its markers.
+  _CLEAR_BLOCK="$(sed -n '/^ *# \[drain-clear:begin\]/,/^ *# \[drain-clear:end\]/p' "$ORCH")"
+  if grep -q 'drain-stall' <<<"$_CLEAR_BLOCK"; then
+    echo "  ok the drain-clear block was extracted from the controller"; PASS=$((PASS+1))
+  else
+    echo "  ❌ could not extract the drain-clear block (markers moved?) — the marker can go stale again"; FAIL=$((FAIL+1))
+  fi
+  _clearcase() { # _clearcase <UPN_WORK>  -> 'gone' | 'present'
+    ( set -u
+      O="$DO"; mkdir -p "$DO/state"
+      printf 'at=%s\npasses=7\nage=240\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+      UPN_WORK="$1"
+      eval "$_CLEAR_BLOCK"
+      [ -e "$DO/state/drain-stall" ] && echo present || echo gone )
+  }
+  _c="$(_clearcase 0)";  [ "$_c" = "gone" ] \
+    && { echo "  ok a measured ZERO un-owned PRs clears the escalation marker (no false DEADLOCK survives the drain)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a measured zero un-owned PR left the marker behind — the status line keeps lying: $_c"; FAIL=$((FAIL+1)); }
+  _c="$(_clearcase 9)";  [ "$_c" = "present" ] \
+    && { echo "  ok un-owned PRs REMAIN => the marker is kept (the drain is still stalled)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a still-stalled drain lost its marker: $_c"; FAIL=$((FAIL+1)); }
+  # ⛔ FAIL-CLOSED: an UNREADABLE count is not "no un-owned PRs" and must never clear the escalation.
+  _c="$(_clearcase '?')"; [ "$_c" = "present" ] \
+    && { echo "  ok an UNREADABLE un-owned count does NOT clear the marker (fail-closed, not fail-open)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ an unreadable un-owned count cleared the escalation — a fail-open clear: $_c"; FAIL=$((FAIL+1)); }
+  rm -f "$DO/state/drain-stall"
+  # ── THE FUNNEL IS ACTUALLY HANDED THE SPAWN COUNT (review 7-P2) ─────────────────────────────
+  # `lo_select` and `spawns_since` are each driven in isolation, so deleting the 11th argument at the
+  # SHIPPED call site would keep every suite green while the funnel silently reverted to the
+  # pre-#2590 acted-based wording — the exact regression this change removes.
+  wpin "the funnel is handed the PR sweep's spawn count (the 11th argument is wired)" "$ORCH" \
+       '"${PRDISP_REC:-unknown}" "${PRDISP_SPAWNS:-}"'
   # ⛔ A FUTURE LAND STAMP IS UNMEASURABLE, NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N`
   # passes a future-stamped file, so clamping the negative age to 0 rendered a clock step-back as
   # "drain alive" — and after the release valve was removed this line is a stall's only signal.
@@ -1572,6 +1783,8 @@ PYEOF
   # landing* into *dispatch more issues*, which hides the stall behind fresh activity. The PR queue IS
   # the work, so the correct response to "nothing has landed in 4h" is to say so beside the gate.
   wpin "a long stall is NAMED beside the gate it explains" "$ORCH" '[dispatch] DRAIN STALLED — no PR merged in ${_lage}m'
+  wpin "the PR sweep's terminal line is SCOPED to the PR sweep (issue lanes are spawned later)" "$ORCH" \
+       'the PR sweep started no worker this pass'
   # ⛔ ABSENCE PIN against the release arm returning: no function here may take an AGE and return
   # "not held". `mp_reason`'s arguments are inputs to a HOLD; nothing in the selection path may read a
   # land age to decide that the gate should stop holding.
@@ -1638,7 +1851,12 @@ PYEOF
   wpin "…and a cycle with no record says UNKNOWN rather than naming a cause it cannot know" "$ORCH" 'PR actions are UNKNOWN, not zero'
   wpin "…and a zero row count names BOTH of its causes instead of asserting one" "$ORCH" 'either the listing returned no rows, or the record could not be written'
   wpin "…and the funnel is told whether the ledger was written at all" "$ORCH" '"${PRDISP_REC:-unknown}"'
-  wpin "…and the parent names every counted PR the sweep never saw" "$ORCH" 'no per-PR read this cycle (the open-PR listing was unchanged'
+  # ⛔ THE REASON NOW NAMES THE CAUSE (#2601): the old pin asserted the generic "unchanged — 304 — or
+  # unreadable" string, which collapsed a bounded cache-skip, a failed listing and a cache-less 304
+  # into one sentence an operator could not act on. The pin asserts the SUBSTITUTION — the cause is
+  # interpolated — so a build that hard-codes one cause again fails here.
+  wpin "…and the parent names every counted PR the sweep never saw" "$ORCH" 'no per-PR read this cycle (${SWEEP_CACHE_NOTE:-'
+  wpin "…and the restorable actable set is persisted on every FULL sweep" "$ORCH" 'state/sweep-rows.tsv'
   wpin "…and the cycle states the PR path's outcome in one line" "$ORCH" '[pr] PR path:'
   wpin "…and a cycle that spawned NOTHING says so instead of implying work" "$ORCH" 'NO UNIT SPAWNED this cycle'
   wpin "the acting case has a catch-all arm (no class falls through silently)" "$ORCH" "no acting arm for class '"
@@ -2219,11 +2437,11 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
     "[dispatch] "*) echo "  ok exactly one [dispatch] prefix (the call sites no longer add their own)"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL the line is not prefixed [dispatch]: $out"; FAIL=$((FAIL+1)) ;; esac
   # (2) a REAL record decomposes: listed -> per-reason counts -> dispatched, and names the held gate.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   printf '1\n2\n3\n' > "$FO/candidates.txt"
   out="$(_funnel 2 "READ(223)(9m)" "load=9>=max_load=8" 1000000000)"
   case "$out" in
-    "[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 2 dispatched | held: load=9>=max_load=8"*)
+    "[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (slot limit: 6 slot(s) filled) -> 2 dispatched | held: load=9>=max_load=8"*)
       echo "  ok the funnel decomposes the pool and names the held gate"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL unexpected funnel line: $out"; FAIL=$((FAIL+1)) ;;
   esac
@@ -2241,26 +2459,26 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
     *UNRECONCILED*) echo "  FAIL a reconciled record with skipped_landed was flagged UNRECONCILED"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok …and a reconciled record carrying it is not flagged UNRECONCILED"; PASS=$((PASS+1)) ;; esac
   # (3) an UNRECONCILED record is labelled, never rendered as a clean decomposition.
-  printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   case "$(_funnel 0 "READ(223)" "" 1000000000)" in *UNRECONCILED*) echo "  ok a record whose parts do not sum is labelled UNRECONCILED"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL an unreconciled record was rendered as clean"; FAIL=$((FAIL+1)) ;; esac
   # (4) AGE-BOUNDED: an old record is REPLACED by its age, never presented as this cycle's numbers.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' $(( 1000000000 - 3600 )) > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' $(( 1000000000 - 3600 )) > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)")"
   case "$out" in *STALE*) echo "  ok a stale funnel record reads STALE(<age>), not as a fresh decomposition"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a one-hour-old record printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
   # (5) A record with NO age field is not "fresh" either — unverifiable is STALE (review round 5).
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1\n' > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1\n' > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)")"
   case "$out" in *"STALE(age unknown"*) echo "  ok a record with no usable at= reads STALE(age unknown)"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a record with no at= printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
   # (6) …and a FUTURE at= (a clock step-back) is unverifiable too, never "0m old".
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000009999 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' 1000009999 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *"STALE(age unknown"*) echo "  ok a FUTURE at= is unverifiable (STALE), not a fresh 0m-old decomposition"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a future at= was read as fresh: $out"; FAIL=$((FAIL+1)) ;; esac
   # (7) ABSENT reconciled= is not "reconciled" — only a writer that recorded 1 has shown the sum.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *UNRECONCILED*) echo "  ok a record with no reconciled= field is UNRECONCILED (unverified, not clean)"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a record with no reconciliation was rendered as clean: $out"; FAIL=$((FAIL+1)) ;; esac
@@ -2274,17 +2492,128 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   # existed it was counted nowhere, so the DERIVED `not_reached` bucket absorbed it — and that bucket
   # is the one rendered as "N not reached (limit)", i.e. "raise LIMIT", beside a `limit=` printed at
   # its real value. The record below is the ordinary four-box case: 40 held, 4 judged, 179 remainder.
-  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_collided=40 not_reached=179 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_collided=40 not_reached=179 limit=24 stop=limit reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
   case "$out" in
-    *"40 peer-held (ledger skip)"*"179 not reached (limit)"*)
-      echo "  ok peer-held work is its own part, and not_reached stays the LIMIT remainder"; PASS=$((PASS+1)) ;;
-    *"179 not reached (limit)"*) echo "  FAIL peer-held rows were absorbed into not reached (limit): $out"; FAIL=$((FAIL+1)) ;;
+    *"40 peer-held (ledger skip)"*"179 not reached (slot limit: 24 slot(s) filled)"*)
+      echo "  ok peer-held work is its own part, and not_reached names the SLOT budget that stopped it"; PASS=$((PASS+1)) ;;
+    *"179 not reached (slot limit"*) echo "  FAIL peer-held rows were absorbed into not reached: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  FAIL the funnel did not render the peer-held part: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ── agent-infra#2183: THE LARGEST BUCKET MUST CARRY A MEASURED CAUSE ────────────────────────
+  # `not_reached` is DERIVED, so before `stop=` existed this line asserted `(limit)` — "raise LIMIT" —
+  # about a pass whose `limit=` it printed at its real value in the same sentence, and whose actual
+  # stop was usually the RUN BUDGET (pre-flight runs, a different budget). Measured on cell-1,
+  # 2026-10-20: 183 of 195 candidates "not reached (limit)" where twelve pre-flight runs could not
+  # answer. Each case below drives THE SHIPPED READER over a record written by THE SHIPPED WRITER's
+  # key set, so a reader that keeps printing `(limit)` reddens.
+  printf 'listed=195 judged=12 queued=0 collision=0 landed=0 unjudged=12 skipped_checked=0 skipped_dispatched=0 skipped_collided=0 not_reached=183 limit=6 reconciled=1 stop=run_budget unusable=issue-assignee-holder:12 checked_released=3 checked_unjustified=5 stop_conflict=0 reason_conflict=0 skipped_checked_claim_unknown=5 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"183 not reached (run budget: 12 pre-flight run(s) spent, 12 unjudged)"*)
+      echo "  ok the not-reached bucket names the RUN BUDGET and the runs it spent (not '(limit)')"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the not-reached bucket still does not name its measured cause: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"(limit)"*) echo "  ❌ the line still asserts '(limit)' beside a pass stopped on the run budget: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok no invented '(limit)' cause is printed"; PASS=$((PASS+1)) ;; esac
+  case "$out" in
+    *"— failing surface: issue-assignee-holder:12"*)
+      echo "  ok the failing SURFACE is named with its occurrence count"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the record does not say WHICH surface could not be read: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"— 3 released from checked"*"— UNPROVEN suppression: 5 checked entr(ies) with no proven fact"*)
+      echo "  ok the release and the UNPROVEN suppression are both shown, not folded into the totals"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the release/unproven facts are missing from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ A FAILED REWRITE IS NOT "NOTHING WAS RELEASED" (review P2, #2183). The writer publishes
+  # `checked_released=-` when the atomic `checked.txt` rewrite failed — the entries ARE still
+  # suppressed and their number is unknown. Rendering that as nothing made a failed release
+  # indistinguishable from a quiet pass on the one line an operator reads; the only contradicting
+  # evidence was a WARN in the refresh log, which the dispatch reader never sees.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=- at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"— released from checked: UNKNOWN (the count was not recorded"*)
+      echo "  ok a failed release rewrite is rendered UNKNOWN, never as a quiet pass"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a failed release rewrite was silently dropped from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"0 released from checked"*) echo "  FAIL an unknown release count was rendered as 0: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok an unknown release count is never rendered as a number"; PASS=$((PASS+1)) ;; esac
+  # ⛔ A BOUND THAT BINDS EVERY CYCLE IS A MEASUREMENT, NOT SILENCE (review E-P2, cycle 2). The reaper
+  # published `deferred=` in `state/checked-reap` and NOTHING read it, so a cell whose release cap was
+  # too small for its `checked.txt` looked exactly like a cell with nothing to release — the one reading
+  # that says "raise CHECKED_RELEASE_MAX" was measurable and unshown.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=24 checked_unjustified=0 checked_deferred=6 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"— 6 checked entr(ies) deferred by the release cap"*)
+      echo "  ok a cap-deferred residue is SHOWN (the number the reaper published is finally read)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the release cap's deferred residue is still unreadable from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ A REFUSED CLASSIFICATION IS A STATEMENT, NOT AN ABSENT TAIL (review E-P2, cycle 3). Every
+  # refusal records `unjustified=-`, and `-` rendered as nothing — so a permanently undecodable
+  # `.pr_brs`, whose refusal repeats BY DESIGN, produced a line byte-for-byte identical to a healthy
+  # quiet pass: #2183's own defect one layer in. The refusal names the fact it could not read.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=0 checked_unjustified=- checked_refused=pr-brs-unreadable at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"checked classification REFUSED this pass (pr-brs-unreadable)"*)
+      echo "  ok a refused classification NAMES the fact it could not read"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a refused classification is still silent on the operator line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AND THE NEGATIVE DIRECTION: a healthy record must NOT grow the refusal tail (review A-P3,
+  # cycle 4). Without this, weakening the `''|none) : ;;` arm renders REFUSED on every line and the
+  # suite stays green — the overclaim the cycle-3 log made about "both directions".
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=0 checked_unjustified=0 checked_refused=none checked_sort_failed=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"REFUSED"*) echo "  ❌ a healthy pass (checked_refused=none) grew an invented refusal: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a healthy pass never renders a refusal (the sentinel is read, not just carried)"; PASS=$((PASS+1)) ;; esac
+  case "$out" in
+    *"DID NOT RUN"*) echo "  ❌ a healthy pass (checked_sort_failed=0) grew an invented release failure: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a healthy pass never renders a failed release"; PASS=$((PASS+1)) ;; esac
+  # ⛔ AND A RELEASE THAT COULD NOT RUN IS NOT A CAP THAT BOUND (review E-P2, cycle 3): the failed sort
+  # left every row `unknown`, and the only line an operator reads named CHECKED_RELEASE_MAX.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=0 checked_unjustified=0 checked_sort_failed=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"checked release DID NOT RUN (the release sort failed)"*)
+      echo "  ok a release that could not run says so, instead of blaming the cap"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a failed release sort is still invisible (or blamed on the cap): $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"deferred by the release cap"*) echo "  ❌ a failed release sort was rendered as a binding cap: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a failed release sort never renders as a cap measurement"; PASS=$((PASS+1)) ;; esac
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=3 checked_unjustified=0 checked_deferred=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"deferred by the release cap"*) echo "  ❌ a quiet pass (deferred=0) grew an invented cap warning: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a quiet pass (deferred=0) says nothing about the cap"; PASS=$((PASS+1)) ;; esac
+  # a record that predates `stop=` must not be handed an invented cause
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in
+    *"217 not reached (cause not recorded)"*) echo "  ok a record with no stop= says the cause was NOT RECORDED (no invented reason)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a record with no stop= was given a cause it never recorded: $out"; FAIL=$((FAIL+1)) ;; esac
+  # the CHECKED breakdown: the suppression finally says why it suppressed
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=40 skipped_dispatched=0 skipped_collided=0 not_reached=155 limit=6 reconciled=1 stop=limit skipped_checked_queued=7 skipped_checked_dispatched=20 skipped_checked_pr=3 skipped_checked_lane=2 skipped_checked_claim=5 skipped_checked_claim_unknown=1 skipped_checked_deferred=1 skipped_checked_unknown=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"40 blacklisted (checked: queued 7, dispatched 20, pr 3, lane 2, claim 5, claim-unknown 1, deferred 1, unknown 1)"*)
+      echo "  ok the checked suppression publishes the keep-fact breakdown (it sums to 40)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the checked bucket still hides WHY it suppressed: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"UNPROVEN suppression"*) echo "  FAIL a record with checked_unjustified unset grew an invented unproven count: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a record with no checked_unjustified= invents no unproven count"; PASS=$((PASS+1)) ;; esac
+  # ⛔ A CAUSE/RESIDUE CONTRADICTION IS ITS OWN STATEMENT, never "the parts do not sum".
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=183 limit=6 reconciled=1 stop=none stop_conflict=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"— STOP CONTRADICTION (the recorded cause and the residue disagree)"*)
+      echo "  ok a stop/residue contradiction is named as a CAUSE disagreement"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a contradiction was not reported: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *UNRECONCILED*) echo "  ❌ a pass whose parts DO sum was accused of an arithmetic failure: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok the contradiction does not change the reconciled= wording (the parts did sum)"; PASS=$((PASS+1)) ;; esac
   # (9b) A RECORD WITHOUT THE KEY INVENTS NO ZERO: an older writer's record must not grow a part it
   # never counted, because "0 peer-held" beside 217 not-reached would be a claim about a pass that
   # could not make it. The part is simply absent.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *"peer-held (ledger skip)"*) echo "  FAIL a record with no skipped_collided= grew an invented peer-held part: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok a record predating skipped_collided= renders no peer-held part (no invented zero)"; PASS=$((PASS+1)) ;; esac
@@ -2293,10 +2622,13 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   # that took either side alone would drop one arm, and the parts would print SHORT of `listed`
   # beside `reconciled=1` — the measured listed=20/parts=17 shape. 3 landed + 40 collided + 4 judged
   # leaves 176 against a pool of 223, so this fixture ONLY renders cleanly when BOTH arms exist.
-  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 skipped_collided=40 not_reached=176 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  # ⛔ `stop=limit` IS PART OF THIS FIXTURE TOO, for the same reason the writer fixtures set it: the
+  # reader's #2183 cause map has no bare `(limit)` arm at all, so a record without `stop=` renders
+  # `(cause not recorded)` and this decomposition assertion would fail on a green writer.
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 skipped_collided=40 not_reached=176 limit=24 reconciled=1 stop=limit at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
   case "$out" in
-    *"3 already landed (skipped)"*"40 peer-held (ledger skip)"*"176 not reached (limit)"*)
+    *"3 already landed (skipped)"*"40 peer-held (ledger skip)"*"176 not reached (slot limit: 24 slot(s) filled)"*)
       echo "  ok the reader keeps BOTH skip buckets, so a merged record decomposes in full"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a record carrying both skip buckets did not decompose: $out"; FAIL=$((FAIL+1)) ;; esac
 else
@@ -2315,6 +2647,12 @@ echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisa
   awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  # ⛔ THE SHARED (PR, head) REVIEW BUDGET IS PART OF THE PRODUCER NOW (agent-infra#2971): the
+  # verdict-less branch Spends `state/reviewdisp-<PR>` through these helpers instead of its own
+  # private counter, so an extraction without them leaves `rev_budget_spend` undefined (127) and the
+  # branch silently writes a marker but never counts or parks — the unbounded loop, wearing a green
+  # face. Extracted, never stubbed, for the same reason as the two functions above.
+  sed -n '/# \[revbudget:begin\]/,/# \[revbudget:end\]/p' "$MERGE" | sed '1d;$d'
 } > "$TMP/reviewstate.sh"
 ex review_gate_state > "$TMP/fn_review_gate_state.sh"
 # ⛔ NON-EMPTY AND DEFINED, not merely `bash -n`-clean (P2, first review round): `bash -n` on an EMPTY
@@ -2326,6 +2664,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
    && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
+   && grep -q '^rev_budget_spend() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_gate_state() {' "$TMP/fn_review_gate_state.sh" \
    && bash -n "$TMP/reviewstate.sh" 2>/dev/null && bash -n "$TMP/fn_review_gate_state.sh" 2>/dev/null; then
   RS="$TMP/rso"; mkdir -p "$RS/state"
@@ -2343,7 +2682,10 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
   # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
   _rc() { ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$1"; . "$TMP/reviewstate.sh"; review_state_clear ); }
-  _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS/parkreason"; : > "$RS/merge.log"; }
+  # ⛔ AND THE SHARED (PR, head) RECORD (agent-infra#2971): `reviewdisp-<PR>` is the ONE review budget
+# — the controller spends it on dispatch, merge-one.sh spends it on a verdict-less run — so a
+# leftover record here would make a later "one timeout" drive read as a cap that had been hit.
+_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
 
   eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
   eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
@@ -2440,18 +2782,18 @@ ISSUES 2')"
   # reviewed at a head that had been. Both resets are driven.
   _clean; _rs NO-VERDICT 9999aaaa; _rs NO-VERDICT 9999aaaa; _rc 9999aaaa
   _rs NO-VERDICT 9999aaaa
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a verified CLEAN resets the verdict-less counter (one timeout after it does not park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   _clean; _rs NO-VERDICT 7777bbbb; _rs NO-VERDICT 7777bbbb; _rs ISSUES 7777bbbb
   rm -f "$RS/state/needsfix-2132-7777bbbb"; : > "$RS/state/fixspend-2132-7777bbbb"
   _rs NO-VERDICT 7777bbbb
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a FINDINGS verdict resets it too (a fixer is the remedy, not a park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
@@ -2810,12 +3152,18 @@ GHFAIL2
     # (12h) ⛔ A NAME OUTSIDE THE FAMILIES IS SPARED (review round 10 final pass): `sed` without `-n`
     # echoed every non-matching basename as if it were a PR id, so such a file was DELETED as an
     # orphan — a delete-direction bug in the one function that is supposed to fail closed.
-    rm -f "$PO/state/"*; : > "$PO/state/needsfix-note.txt"; : > "$PO/state/reviewcount-6999"; sleep 1; : > "$PO/state/last-open-prs"
+    # ⛔ AND THE FAMILIES MUST BE ONE EDIT IN TWO PLACES (review of #2664, P3): the `for mf in …` glob and
+    # the `sed -En` alternation are TWO halves of one predicate. Adding only the glob yields `mp=""` →
+    # `continue` → the file is never removed, and one stale file per abandoned PR accumulates silently
+    # for ever — the exact leak the reviewcount pin was added for. So every family is seeded here.
+    rm -f "$PO/state/"*; : > "$PO/state/needsfix-note.txt"; : > "$PO/state/reviewcount-6999"
+    : > "$PO/state/reviewdisp-6999"; : > "$PO/state/reviewathead-6999"; sleep 1; : > "$PO/state/last-open-prs"
     ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
-    if [ -e "$PO/state/needsfix-note.txt" ] && [ ! -e "$PO/state/reviewcount-6999" ]; then
-      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount IS pruned"; PASS=$((PASS+1))
+    if [ -e "$PO/state/needsfix-note.txt" ] && [ ! -e "$PO/state/reviewcount-6999" ] \
+       && [ ! -e "$PO/state/reviewdisp-6999" ] && [ ! -e "$PO/state/reviewathead-6999" ]; then
+      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount AND the review budgets (reviewdisp/reviewathead) are pruned"; PASS=$((PASS+1))
     else
-      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted))"; FAIL=$((FAIL+1))
+      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted) reviewdisp=$( [ -e "$PO/state/reviewdisp-6999" ] && echo kept || echo deleted) reviewathead=$( [ -e "$PO/state/reviewathead-6999" ] && echo kept || echo deleted))"; FAIL=$((FAIL+1))
     fi
     # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
     # present means "this repo has no open PRs", where every marker is orphaned — the drained state.
@@ -2865,10 +3213,14 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   # the 40 nowhere, so it published not_reached=219 — the number the operator reads as "raise LIMIT".
   # ⛔ BOTH SKIP BUCKETS ARE SET EXPLICITLY, because the extraction starts AT `FUNNEL_LISTED=` and so
   # does not carry the initialiser block above it — under this file's `set -u` an unset bucket is an
-  # unbound variable that aborts the record write. `skipped_landed` (this branch) and
-  # `skipped_collided` (main) are INDEPENDENT counters in the sum, so both are named here.
+  # unbound variable that aborts the record write. `skipped_landed` (main) and `skipped_collided` are
+  # INDEPENDENT counters in the sum, so both are named here.
+  # ⛔ `STOP=limit` IS PART OF THE FIXTURE, not decoration: without it the writer would see the
+  # DEFAULT `stop=none` beside a non-zero residue and fire the new cause/residue falsifier, turning
+  # this arithmetic assertion into a false red. The fixture describes a pass stopped on its SLOT
+  # budget, which is exactly what `not_reached=179` beside `limit=24` means.
   _funnel_write() { ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=40 \
-      judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
+      judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=limit;
       . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 ) ; }
   _funnel_write
   rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
@@ -2902,11 +3254,175 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   case "$rec" in
     *skipped_collided=0*) echo "  ❌ skipped_collided published as 0 after 40 rows were given to the walk-past arm"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok the walk-past arm feeds the bucket it publishes"; PASS=$((PASS+1)) ;; esac
+  # ── agent-infra#2183: THE TWO NEW FALSIFIERS, EACH ON ITS OWN KEY ────────────────────────────
+  # ⛔ `stop=none` beside a non-zero residue means the walk claims it reached the END of the pool and
+  # also that candidates were left unreached. That is a CAUSE disagreement; the parts still sum, so
+  # `reconciled` must be left ALONE — an operator told "the parts do not sum" would go looking for an
+  # arithmetic bug that is not there.
+  ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=40;
+    judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=none;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec" in
+    *reconciled=1*stop_conflict=1*) echo "  ok a cause/residue contradiction sets stop_conflict=1 and leaves reconciled alone"; PASS=$((PASS+1)) ;;
+    *reconciled=0*) echo "  ❌ a cause/residue contradiction was published as a PARTS-SUM failure (reconciled=0): [$rec]"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ the cause/residue contradiction was not recorded: [$rec]"; FAIL=$((FAIL+1)) ;; esac
+  # …and with `stop=none` and NO residue there is no contradiction at all (the falsifier is not a
+  # constant).
+  ( O="$WFO"; POOL_ROWS=4; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=0;
+    judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=none;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec" in
+    *reconciled=1*stop_conflict=0*) echo "  ok a walk that reached the end published no contradiction (the falsifier is not constant)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a clean end-of-pool pass was flagged: [$rec]"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ A BROKEN CHECKED BREAKDOWN IS ALSO NOT A POOL-SUM FAILURE: eight reason counters that do not
+  # add up to skipped_checked is a hole in THIS accounting, and the pool's parts still sum.
+  ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=5; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=0;
+    judged=0; V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=limit;
+    SKIP_CHECKED_QUEUED=1; SKIP_CHECKED_UNKNOWN=0;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec" in
+    *reconciled=1*reason_conflict=1*) echo "  ok a checked breakdown that does not sum sets reason_conflict=1, not reconciled=0"; PASS=$((PASS+1)) ;;
+    *reconciled=0*) echo "  ❌ a broken checked breakdown was published as a POOL parts-sum failure: [$rec]"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a broken checked breakdown went unreported: [$rec]"; FAIL=$((FAIL+1)) ;; esac
   # …and the ARM ITSELF is pinned at the source, because a writer can be correct while the arm that
   # matters still bypasses it (add a new `continue` above `judged++` and nothing here would notice).
   wpin "the collision-ledger walk-past increments SKIP_COLLIDED" "$REFRESH" 'SKIP_COLLIDED=$((SKIP_COLLIDED + 1))'
 else
   echo "  ❌ could not extract the funnel-record block from refresh-candidates.sh (or it is not valid shell) — the writer's arithmetic is ungraded"; FAIL=$((FAIL+1))
+fi
+
+# ── THE GATE VECTOR: every arm that fired, with the winner UNCHANGED (#2924 indicator (a), #2927) ──
+# ⛔ THE MEASURED DEFECT THIS GRADES. `GATE_WHY` is one string assigned by an `elif` chain, so the
+# first arm that fires MASKS every arm behind it — and the first is `merge-priority`, which is set
+# whenever any workable un-owned PR exists. Measured 2026-10-27: 349/384 cycles named merge-priority
+# with 25 free lane slots, 88.5% of those gated cycles ALSO had a capacity gate that would have
+# refused, and 64 were refused while `ci-queue=ok`. An operator reading the line could not tell
+# "waiting for the PR sweep" (healthy) from "throttled by a gate" (the defect).
+# The block is EXTRACTED from the live controller, never mirrored, so a reformat or a replaced arm
+# fails here instead of silently ungrading the suite.
+echo
+echo "══ the gate vector: EVERY arm that fired, and the winner is exactly what the old chain chose"
+GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
+if [ "$(printf '%s' "$GV" | grep -c .)" -lt 10 ]; then
+  echo "  ❌ could not extract the gate-vector block from $ORCH — the idle reason is ungraded"; FAIL=$((FAIL+1))
+else
+  gv() { # gv [VAR=value ...] -> "GATE_WHY<TAB>GATE_VEC"; sane defaults, then the caller's overrides
+    ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=0
+      FORK_STARVED=0; FORK_WHY=""; CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000
+      LANES_UNKNOWN=0; LANES=0; MAX_LANES=20; L=1; MAX_LOAD=12
+      CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none
+      CIQ=1; CIQ_RC=1; CIQ_VER="ok(queued=3 running=1 runners=20 ceiling=40)"
+      SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+      for _a in "$@"; do export "$_a"; done
+      eval "$GV"
+      printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" )
+  }
+  _t="$(gv)"; _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  [ "$_why" = "<open>" ] && echo "  ok (v1) a box with no gate reports NO winner" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v1) a clean box reported a winner: $_why"; FAIL=$((FAIL+1)); }
+  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Ten tokens is the arm count
+  # this block has; an arm DELETED from the vector while its predicate stays reddens here.
+  _missing=""
+  for _arm in 'merge-priority' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
+    case "$_vec" in *"$_arm"*) ;; *) _missing="$_missing $_arm" ;; esac
+  done
+  [ -z "$_missing" ] && echo "  ok (v2) every gate arm has its own verdict on the idle line" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v2) the vector does not name:$_missing"; FAIL=$((FAIL+1)); }
+  # ⛔ THE MEASURED CO-BINDING CASE (#2924 indicator (b)). merge-priority fires AND the queue is deep
+  # AND slots are free. The winner must STILL be merge-priority — the vector is additive, never a
+  # change of decision — while the queue arm is now VISIBLE beside it.
+  _t="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+           CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20)"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  case "$_why" in
+    merge-priority*) echo "  ok (v3) the winner is UNCHANGED (merge-priority still decides the cycle)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v3) the vector changed the DECISION (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'merge-priority('*) echo "  ok (v4) …and merge-priority is in the vector" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v4) merge-priority is missing from the vector: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'ci-queue=REFUSE('*) echo "  ok (v5) …and the capacity gate it MASKED is now visible too (the 2026-10-27 shape)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v5) the mask is back — a co-binding ci-queue refusal is invisible: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'slots=17 free of 20'*) echo "  ok (v6) …and the free lane slots it was throttled WITH (17 of 20)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v6) the free-slot count is not on the line: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ FIRST-WINS IS THE OLD CHAIN'S SEMANTICS, and it is the half a naive rewrite breaks: with the
+  # load arm and the lanes arm both firing, the winner must be the EARLIER one (load), not the last.
+  _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+  case "$_why" in
+    load=*) echo "  ok (v7) two arms firing ⇒ the EARLIER one wins, exactly as the elif chain did" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v7) the arm ORDER changed (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE DRIFT GUARD, and it is STRUCTURAL rather than prose: every arm that can ASSIGN `GATE_WHY`
+  # must also write its verdict to `GATE_VEC` in the SAME block, within three lines. A new arm added
+  # without its token reddens here — which is the only way this stays true as arms are added, and the
+  # exact defect that produced #2924 (a gate whose own report did not exist).
+  printf '%s\n' "$GV" > "$TMP/gv-block.sh"
+  if python3 - "$TMP/gv-block.sh" <<'ARMS'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+bad = []
+n = 0
+for i, ln in enumerate(lines):
+    if 'GATE_WHY="${GATE_WHY:-' in ln:
+        n += 1
+        window = " ".join(lines[i:i + 3])
+        if "GATE_VEC=" not in window:
+            bad.append(i + 1)
+print("ARMS=%d BAD=%s" % (n, ",".join(map(str, bad)) or "none"))
+sys.exit(1 if bad or n < 9 else 0)
+ARMS
+  then echo "  ok (v8) all $(grep -c 'GATE_WHY="\${GATE_WHY:-' <<<"$GV") GATE_WHY arms write a GATE_VEC verdict beside them" && PASS=$((PASS+1))
+  else echo "  ❌ (v8) an arm assigns GATE_WHY without a vector verdict — it can fire invisibly"; FAIL=$((FAIL+1)); fi
+  # ⛔ NO `elif AMONG THE VECTORED ARMS: a chain is how the mask comes back (#2924). The winner is
+  # chosen by `GATE_WHY="${GATE_WHY:-…}"`, which is order-preserving and chain-free.
+  if grep -qE '^[[:space:]]*elif ' <<<"$GV"; then
+    echo "  ❌ (v9) an \`elif\` is back inside the vector block — the first arm masks the rest again"; FAIL=$((FAIL+1))
+  else echo "  ok (v9) the arms are independent guards, not a masking chain"; PASS=$((PASS+1)); fi
+  # ── the two mutants ────────────────────────────────────────────────────────────────────────────
+  mut_gv() { # <name> <old> <new> -> path to the mutant block
+    printf '%s\n' "$GV" > "$TMP/gv-$1.in"
+    python3 - "$TMP/gv-$1.in" "$TMP/gv-$1.sh" "$2" "$3" <<'MUT'
+import sys
+src = open(sys.argv[1]).read(); old, new = sys.argv[3], sys.argv[4]
+assert old in src, "mutation target not found: " + old
+open(sys.argv[2], "w").write(src.replace(old, new))
+MUT
+    printf '%s' "$TMP/gv-$1.sh"
+  }
+  # (m1) RESTORE THE OLD BEHAVIOUR: the vector is not built at all (as a chain that only names its
+  # winner). (v5) is the arm that must redden.
+  _m="$(mut_gv novec 'GATE_VEC="$GATE_VEC ' 'GATE_VEC_UNUSED="${GATE_VEC:-}' 2>/dev/null)"
+  if [ -n "$_m" ] && [ -f "$_m" ]; then
+    GV="$(cat "$_m")"
+    _vec="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+               CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20 | cut -f2)"
+    case "$_vec" in
+      *'ci-queue=REFUSE('*) echo "  ❌ (m1) the no-vector mutant STILL reports the masked arm — (v5) is not load-bearing"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m1) FAILS when the vector is removed: a co-binding capacity refusal goes invisible again"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m1) could not build the no-vector mutant"; FAIL=$((FAIL+1)); fi
+  # (m2) RESTORE THE CHAIN: EVERY arm assigns unconditionally — which is exactly what a chain does —
+  # so the LAST arm that fires wins instead of the first. (v7) is the arm that must redden.
+  printf '%s\n' "$GV" > "$TMP/gv-lastwins.sh"
+  if python3 - "$TMP/gv-lastwins.sh" <<'MUT2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+n = s.count('GATE_WHY="${GATE_WHY:-')
+assert n >= 9, "only %d arms to rewrite" % n
+open(p, 'w').write(s.replace('GATE_WHY="${GATE_WHY:-', 'GATE_WHY="'))
+MUT2
+  then
+    GV="$(cat "$TMP/gv-lastwins.sh")"
+    _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+    case "$_why" in
+      load=*) echo "  ❌ (m2) the last-wins mutant still reports the EARLIER arm — (v7) does not test the order"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m2) FAILS when an arm stops honouring first-wins (winner became '$_why')"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m2) could not build the last-wins mutant"; FAIL=$((FAIL+1)); fi
+  GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
 fi
 
 echo

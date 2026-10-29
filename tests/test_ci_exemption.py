@@ -26,6 +26,7 @@ import pytest
 
 import importlib.util
 import itertools
+import re
 import sys
 from pathlib import Path
 
@@ -2436,27 +2437,10 @@ def test_6798_a_KILL_does_not_excuse_a_NAMED_test_failure():
 # dicts by hand and never exercise the row parsers. Hence these.
 
 
-def test_6798_the_row_door_admits_the_non_nodeid_families():
-    """F5: the predicates that gate the row/rate doors must admit them."""
-    for key in ("watchdog-kill::pytest", "collect-error::tests/test_a.py"):
-        assert is_failure_key(key), f"parse_rates would DROP main's row for {key}"
-        assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
 
 
-def test_6798_the_row_door_still_rejects_junk():
-    """FAIL-CLOSED: the widened predicate must not become a wildcard.
 
-    `is_failure_key` gates MAIN's rate table — the exemption allowlist. Admitting
-    a loose string there is a false-exemption vector, not a formatting nicety.
-    """
-    for junk in (
-        "random-string",
-        "watchdog-kill::OTHER",          # not the one identity we emit
-        "collect-error::notapyfile",     # must be a .py path
-        "collect-error::",               # empty path
-        "collect-error::tests/a.py::x",  # a nodeid is NOT a collect-error key
-    ):
-        assert not is_failure_key_loose(junk), f"{junk!r} must NOT buy a failure key"
+
 
 
 def test_6798_a_kill_only_PR_row_is_NOT_silently_dropped():
@@ -2479,13 +2463,28 @@ def test_6798_a_kill_only_PR_row_is_NOT_silently_dropped():
 
 
 def test_6798_main_rates_admit_the_non_nodeid_families():
-    """F6: main's rate row must survive, or main reads empty and always BLOCKS."""
-    parsed = parse_rates("watchdog-kill::pytest\t1\t3\n")
+    """F6: main's rate row must survive, or main reads empty and always BLOCKS.
 
-    assert "watchdog-kill::pytest" in parsed.rates, (
-        f"main's rate row was dropped (rejected={parsed.rejected}) — with main "
-        f"empty, the COMPARISON half cannot work in either direction"
+    ⛔ AND EVERY PRODUCED FAMILY IS COVERED (#2648 review). `runner::` and `bash-shard::`
+    were both produced by this module and rejected here, so main's row vanished and the PR
+    read uniquely red — measured on the real CLI, for a shape this vector already existed
+    for.
+    """
+    parsed = parse_rates(
+        "watchdog-kill::pytest\t1\t3\n"
+        "runner::python-ci\t3\t8\n"
+        "bash-shard::scripts/a.test.sh\t2\t8\n"
     )
+
+    for key in (
+        "watchdog-kill::pytest",
+        "runner::python-ci",
+        "bash-shard::scripts/a.test.sh",
+    ):
+        assert key in parsed.rates, (
+            f"main's rate row was dropped for {key!r} (rejected={parsed.rejected}) — with "
+            f"main empty, the COMPARISON half cannot work in either direction"
+        )
     assert parsed.rejected == []
 
 
@@ -2499,11 +2498,17 @@ def test_6798_a_collection_error_rate_row_survives_main_side():
 
 def test_6798_main_signature_rows_admit_the_non_nodeid_families():
     """The main-side signature table is a separate door and needs it too."""
-    sigs = parse_signature_rows("watchdog-kill::pytest\twatchdog-kill\n")
+    sigs = parse_signature_rows(
+        "watchdog-kill::pytest\twatchdog-kill\n"
+        "runner::python-ci\trunner-aggregate\n"
+        "bash-shard::scripts/a.test.sh\tbash-shard\n"
+    )
 
     assert sigs.get("watchdog-kill::pytest") == frozenset({"watchdog-kill"}), (
         "a dropped main signature fails `_signatures_overlap` closed"
     )
+    assert sigs.get("runner::python-ci") == frozenset({"runner-aggregate"}), sigs
+    assert sigs.get("bash-shard::scripts/a.test.sh") == frozenset({"bash-shard"}), sigs
 
 
 # ==========================================================================
@@ -2596,3 +2601,1024 @@ def test_runner_aggregate_reads_the_real_actions_capture_shape():
     assert ci_exemption.runner_aggregate_failures(
         "job\tstep\t2026-10-19T09:31:07Z ✅ **test-ok**: 5 passed, 0 failed, 0 skipped"
     ) == ([], {})
+
+
+# ==========================================================================
+# Pass 6 — BASH SHARD attribution (#2643)
+#
+# `scripts/run-bash-shards.sh` printed only `❌ N bash shard(s) failed`. Four shards were red on main
+# on 2026-10-24 and every PR slice printed `❌ 1 bash shard(s) failed`, so the rail refused with
+# "yielded NO parseable failure identity" — a red no instrument could name. The runner now emits
+# `❌ failed shard: <path>` per failing listed shard; these pin that the rail turns it into an
+# identity, through BOTH doors, and that it does NOT turn a passing shard into one.
+
+_BASH_SHARD_FAIL = "❌ failed shard: scripts/orchestrator-harness/worker-terminal.test.sh"
+
+
+def test_bash_shard_line_yields_an_identity():
+    ids, sigs = ci_exemption.bash_shard_failures(_BASH_SHARD_FAIL)
+    assert ids == ["bash-shard::scripts/orchestrator-harness/worker-terminal.test.sh"]
+    assert sigs[ids[0]] == frozenset({ci_exemption._BASH_SHARD_SIG})
+
+
+def test_bash_shard_ids_door_and_signatures_door_agree():
+    """§4.6 compares signatures; an id signed by one door only would fail closed and BLOCK."""
+    log = "\n".join([_BASH_SHARD_FAIL, "  ▸    18s  scripts/other.test.sh"])
+    parsed_ids = ci_exemption.parse_failed_ids(log, raw_log=True)
+    parsed_sigs = ci_exemption.parse_pr_failure_text(log)
+    assert parsed_ids.bash_shard == parsed_ids.ids == [
+        "bash-shard::scripts/orchestrator-harness/worker-terminal.test.sh"
+    ]
+    assert parsed_sigs.bash_shard == parsed_sigs.ids == parsed_ids.ids
+    assert parsed_sigs.signatures[parsed_ids.ids[0]] == frozenset(
+        {ci_exemption._BASH_SHARD_SIG}
+    )
+
+
+def test_bash_shard_timeline_and_verdict_rows_are_not_identities():
+    """⛔ THE FALSE-ATTRIBUTION DIRECTION, and the reason the pattern is anchored on `failed shard:`.
+
+    `shard_note` prints `▸ <secs> <path>` for EVERY listed shard — passing ones included — and the
+    verdict block repeats the failing path as an indented bare row. Keying on either would make a
+    green shard a "failure identity", inflating the PR's failing set until nothing could certify.
+    """
+    log = "\n".join([
+        "  ▸    55s  scripts/pi-reap-idle.test.sh",
+        "  ▸    18s  scripts/orchestrator-harness/worker-terminal.test.sh",
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s):",
+        "❌   scripts/orchestrator-harness/worker-terminal.test.sh",
+    ])
+    assert ci_exemption.bash_shard_failures(log) == ([], {})
+    assert ci_exemption.parse_failed_ids(log, raw_log=True).bash_shard == []
+
+
+def test_bash_shard_identity_never_contains_the_slice_or_a_count():
+    """The identity must be stable: the same shard red in slice 1/8 and in the unsharded lane is
+    ONE identity, or main's baseline could never match the PR's."""
+    sliced = "bash-suites (1)\tBash shards\t2026-10-24T03:57:16Z " + _BASH_SHARD_FAIL
+    unsharded = "script-validate\tUNKNOWN STEP\t2026-10-24T02:00:55Z " + _BASH_SHARD_FAIL
+    a, _ = ci_exemption.bash_shard_failures(sliced)
+    b, _ = ci_exemption.bash_shard_failures(unsharded)
+    assert a == b and len(a) == 1
+
+
+def test_bash_shard_bold_rendering_matches_its_sibling_parser():
+    """⛔ THE RENDERING RULE IS SHARED, and a divergence is silent.
+
+    The measured Actions capture bolds the bullet as ``❌ ** **label**: …`` — each ``**`` pair its
+    own token — so `runner_aggregate_failures` strips the pairs WHOLESALE and then matches. This
+    parser originally tolerated ONE optional pair, which matches the plain form the runner prints
+    today and matches NOTHING against the bold form: the identity would vanish the day the line is
+    bolded, and #2643's refusal would come back with no diagnostic. Both `❌`-keyed parsers must
+    agree about what a bullet looks like.
+
+    (Latent when written — `run-bash-shards.sh` uses `printf`, not markdown source — which is
+    exactly why it needs a vector rather than a comment.)
+    """
+    bold = "❌** **failed shard: scripts/orchestrator-harness/worker-terminal.test.sh"
+    plain_ids, _ = ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/orchestrator-harness/worker-terminal.test.sh"
+    )
+    assert ci_exemption.bash_shard_failures(bold)[0] == plain_ids, (
+        "the bold rendering stopped matching — the two ❌-keyed parsers now disagree"
+    )
+    # …and the sibling still agrees with itself on the same capture.
+    assert ci_exemption.runner_aggregate_failures(
+        "❌** **test-discard-gate**: 470 passed, 1 failed"
+    )[0] == ["runner::test-discard-gate"]
+
+
+# ── THE RECAP SHAPE (#2700) — `❌ failing shard(s): <a>, <b>` ─────────────
+#
+# A second, independent spelling of the SAME failure set, measured on agent-infra run 40122825361
+# (PR #2534, job `bash-suites (6)`) and kept as `tests/fixtures/rail/bash-suites-shard-recap.txt`.
+# `ci_exemption.py ids` reads that EXCERPT as `ids=0` on `main` because the tail carries neither the
+# per-shard line nor the step-prefixed `##[error]bash shard failed:` annotation — the generic
+# `##[error]Process completed with exit code 1.` it DOES carry (its last line) is deliberately never
+# an identity. That is an artifact of the excerpt, not of the run: the run's own annotation
+# attributes this shard on `main` (guard-step pass, predates #2648), and #2648's per-shard
+# `bash-shard::` family — the base of this commit — is a second read of it. The recap arm is
+# therefore REDUNDANCY, as the module's `#: THE RUNNER'S RECAP LINE` note states.
+
+_RECAP_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "rail" / "bash-suites-shard-recap.txt"
+)
+
+
+def test_bash_shard_recap_fixture_yields_the_named_shard():
+    """THE MEASURED CAPTURE: the recap line alone must produce the shard's identity.
+
+    MUTATION: drop `_BASH_SHARD_RECAP_RE` (keep only the per-shard pattern) → `ids=[]` and
+    `ok is False` → RED, and admin-merge.sh is back to "yielded NO parseable failure identity"
+    for a log that names its shard in plain text.
+    """
+    parsed = parse_failed_ids(_RECAP_FIXTURE.read_text(), raw_log=True)
+
+    assert parsed.ids == [
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh"
+    ]
+    assert parsed.bash_shard == parsed.ids
+    assert parsed.ok is True, "a capture that names its shard is not an unreadable one"
+    # …and the SIBLING door agrees about the id AND its signature, or §4.6's subset rule
+    # fails closed and the identity would BLOCK instead of compare.
+    signatures = parse_pr_failure_text(_RECAP_FIXTURE.read_text())
+    assert signatures.ids == parsed.ids
+    assert signatures.signatures[parsed.ids[0]] == frozenset(
+        {ci_exemption._BASH_SHARD_SIG}
+    )
+
+
+def test_bash_shard_recap_lists_every_failing_shard():
+    """"If several shards fail, all of them are identities" — not only the first.
+
+    MUTATION: take `group('names')` as one label → a single key encoding BOTH paths, which can
+    never match either shard on main; every multi-shard failure blocks forever.
+    """
+    ids, sigs = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/orchestrator-harness/refresh-quota.test.sh, "
+        "scripts/orchestrator-harness/refresh-spend.test.sh"
+    )
+    assert ids == [
+        "bash-shard::scripts/orchestrator-harness/refresh-quota.test.sh",
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh",
+    ]
+    assert all(sigs[i] == frozenset({ci_exemption._BASH_SHARD_SIG}) for i in ids)
+
+
+def test_bash_shard_recap_and_per_shard_line_are_one_identity():
+    """The two shapes name the SAME failure, so a capture carrying both yields ONE id each.
+
+    They are printed from the same accumulator (`shard_failed_list`) at different points of the
+    step, so both appear in an untruncated log. The cost of NOT collapsing them is a second
+    identity for one shard — and an identity main's baseline may carry under only one spelling,
+    which is a permanent false BLOCK (the id is absent from main, so it can never be exempted).
+    (It is not a `failures > runs` risk: `parse_failed_ids` returns `sorted(set(...))`, so one
+    run emits each id at most once, and two DISTINCT ids are two rows at 1/k.)
+    """
+    log = "\n".join([
+        "❌ failed shard: scripts/orchestrator-harness/refresh-spend.test.sh",
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s): scripts/orchestrator-harness/refresh-spend.test.sh",
+    ])
+    assert ci_exemption.bash_shard_failures(log)[0] == [
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh"
+    ]
+    assert parse_failed_ids(log, raw_log=True).ids == [
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh"
+    ]
+
+
+def test_bash_shard_recap_splits_on_comma_space_only():
+    """The separator is the emitter's `", "` — so a comma INSIDE a path survives as one id.
+
+    `_shard_token` percent-encodes a comma (`%2C`), which is what keeps the path injective. A
+    bare-`,` split would cut every comma-bearing path whether or not a space follows; pinning
+    this with a no-space comma is the only form that is unambiguous for both shapes.
+
+    DECLARED RESIDUAL (not pinned as desirable): a path containing `", "` IS ambiguous in the
+    recap and yields two phantom ids — a false block on that shard, never a fail-open — which is
+    documented at `_BASH_SHARD_RECAP_RE`. The per-shard line is separator-free and authoritative.
+
+    MUTATION: `.split(", ")` → `.split(",")` → this REDs.
+    """
+    ids, _ = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/a,b.test.sh, scripts/c.test.sh"
+    )
+    assert ids == [
+        "bash-shard::scripts/a%2Cb.test.sh",
+        "bash-shard::scripts/c.test.sh",
+    ]
+
+
+def test_bash_shard_recap_pattern_requires_at_least_one_name():
+    r"""Pin the PATTERN, not only the resulting id set — the accumulator form must match NOTHING.
+
+    `❌ failing shard(s):` with an empty accumulator is NOT something this runner prints — the echo
+    is gated on a non-empty list (`run-bash-shards.sh`'s `[ -n "$shard_failed_list" ]`) — but a
+    partial capture or a future emitter could carry it. A pattern that accepts it turns "no
+    failing shard" into a candidate whose names list is empty; today the label filter drops it, but
+    a later refactor of that filter must not be able to mint an identity from an empty list.
+    Asserting the regex closes the gap the id-set assertion cannot see.
+
+    MUTATION: `(?P<names>\S.*?)` → `(?P<names>.*?)` → REDs here (and would RED the id-set
+    assertion only if the label filter were also removed).
+    """
+    assert ci_exemption._BASH_SHARD_RECAP_RE.match("❌ failing shard(s):") is None
+    assert ci_exemption._BASH_SHARD_RECAP_RE.match("❌ failing shard(s):   ") is None
+    assert ci_exemption.bash_shard_failures("❌ failing shard(s):") == ([], {})
+
+
+def test_a_label_that_encodes_to_nothing_is_not_an_identity():
+    """⛔ THE PRODUCED-BUT-REJECTED FAIL-OPEN (#2648 review, cycle 1).
+
+    `bash-shard::` (empty token) is admitted by NEITHER door. Emitting it would make the `ids`
+    door report an id — so the rail's per-run `examined > extracted` refusal does NOT fire —
+    while `parse_failure_rows` drops the row, leaving `decide` an EMPTY failure set and so a
+    `CLEAN blocked=0` verdict on a red PR. The emitter is checked for every label it can produce.
+
+    MUTATION: drop the `if not token: continue` (and let `_shard_token` strip `./` unguarded) →
+    the `ids` list becomes `['bash-shard::']`, which the ROW door rejects → RED.
+    """
+    for log in (
+        "❌ failing shard(s): ./",
+        "❌ FAILED SHARD: .//",
+        "❌ failing shard(s): ./ , ./.",
+        "❌ failing shard(s): ./, ./scripts/x.sh",
+    ):
+        ids, _ = ci_exemption.bash_shard_failures(log)
+        assert "bash-shard::" not in ids, ids
+        # THE PROPERTY THAT MATTERS: every id the producer emits is one the ROW door accepts,
+        # so `decide` cannot be handed an empty set by a rejected row.
+        for key in ids:
+            assert ci_exemption.is_failure_key_loose(key), key
+            assert parse_failure_rows(f"{key}\t1\t1\tbash-shard\n").rejected == [], key
+
+
+def test_shard_token_never_collides_a_relative_path_with_an_absolute_one():
+    r"""`.//x` (relative `x`) and `/x` (absolute) are DIFFERENT paths — one token would merge them.
+
+    The leading-`./` strip is lookahead-guarded so it cannot rewrite `.//x` into the absolute
+    form. A collision here is the #2648 injectivity class: one identity, two files, so a shard
+    that never ran could inherit another's baseline.
+
+    MUTATION: `^(?:\./)+(?=[^/])` → `^(?:\./)+` → the two tokens become equal → RED.
+    """
+    rel = ci_exemption._shard_token(".//scripts/x.test.sh")
+    absolute = ci_exemption._shard_token("/scripts/x.test.sh")
+    assert rel != absolute, f"relative {rel!r} collided with absolute {absolute!r}"
+
+
+def test_bash_shard_recap_is_normalised_to_the_repo_relative_path():
+    r"""`./scripts/x.sh` and `scripts/x.sh` are ONE shard, hence ONE identity.
+
+    Both spellings come from the same shell variable but from different capture sources; left
+    un-normalised the second can never match the baseline the first measured, which is a
+    permanent false block. It cannot merge two DIFFERENT files: they name the same path.
+
+    MUTATION: drop the `^(?:\./)+` strip in `_shard_token` → two ids → RED.
+    """
+    bare, _ = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/x/y.test.sh"
+    )
+    dotted, _ = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): ./scripts/x/y.test.sh"
+    )
+    assert bare == dotted == ["bash-shard::scripts/x/y.test.sh"]
+
+
+def test_bash_shard_recap_is_not_credited_with_a_count_or_prose():
+    """⛔ THE FALSE-ATTRIBUTION DIRECTION for the new shape.
+
+    A red slice prints several `❌` lines and only some name a shard: `❌ FAILED SHARD: <path>`
+    names ONE, the recap names EVERY failing shard at once, and `❌ N bash shard(s) failed` is a
+    COUNT while `❌ every failure above is a syntax-sweep failure…` and `❌ no shard is named,
+    and …` are prose. Keying on any of the latter would make a count or a sentence a failure
+    identity — an id that matches nothing on main, i.e. a permanent false block.
+
+    The bare `❌ failing shard(s):` (no names, the empty-accumulator form) must match NOTHING,
+    or a capture with no failing shard would mint an identity.
+    """
+    log = "\n".join([
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s):",
+        "❌ every failure above is a syntax-sweep failure, named at its own 'bash -n' line",
+        "❌ no shard is named, and 1 of the 1 failure(s) is/are NOT a syntax sweep — the",
+        "   naming arm is not wired for them. This is a defect in scripts/run-bash-shards.sh,",
+    ])
+    assert ci_exemption.bash_shard_failures(log) == ([], {})
+    assert parse_failed_ids(log, raw_log=True).bash_shard == []
+
+
+def test_the_runner_exit_annotation_alone_still_refuses():
+    """THE NEGATIVE CASE: no identity line still refuses — the new pass widens NOTHING.
+
+    `##[error]Process completed with exit code 1.` is the runner's own wrapper: it names no
+    failure, so it is never an identity (#4469). A capture carrying only it must yield an EMPTY
+    id set that READS as empty (`ok is False`) — the rail's step-1c `examined > extracted` gate
+    is what turns that into the refusal, and an empty-but-OK set would be the vacuous pass.
+
+    MUTATION: make the recap pattern optional / fall back to "unknown" for an unnamed failure
+    → `ids` gains a key and the refusal disappears → RED.
+    """
+    log = (
+        "bash-suites (6)\tBash shards — the ONE list both lanes run (#1369)\t"
+        "2026-10-24T19:22:55.0894601Z ##[error]Process completed with exit code 1.\n"
+    )
+    parsed = parse_failed_ids(log, raw_log=True)
+
+    assert parsed.ids == [], "the runner's exit annotation is NOT an identity"
+    assert parsed.bash_shard == []
+    assert parsed.ok is False, "an unreadable failure set must still read as such"
+    assert parse_failed_ids(log, raw_log=True).ok is False
+
+
+def test_bash_shard_recap_identity_is_compared_not_dropped():
+    """END TO END: a recap identity reaches the DECISION and is graded on main's evidence.
+
+    This is the whole point of the shape: a shard that ALSO fails on main at a measured rate is
+    EXEMPT (visible), and a shard main never failed still BLOCKS. The failure mode this pins is
+    the #6798/#2193 one — an id PRODUCED by a parser and REJECTED by the row/rate door, so
+    `decide` sees no failure and reports `CLEAN blocked=0` on a red PR.
+    """
+    key = ci_exemption.bash_shard_failures(_RECAP_FIXTURE.read_text())[0][0]
+    sig = ci_exemption._BASH_SHARD_SIG
+
+    # The producer's own wire row, through the door the rail actually reads it by.
+    rows = parse_failure_rows(f"{key}\t1\t1\t{sig}\n")
+    assert rows.rejected == [], "a produced id must not be rejected by the row door"
+    assert key in rows.failures
+
+    main_rates = parse_rates(f"{key}\t3\t8\n")
+    assert main_rates.rejected == []
+    assert main_rates.rates[key] == Rate(3, 8)
+
+    decision = decide(
+        rows.failures,
+        main_rates.rates,
+        main_signatures={key: frozenset({sig})},
+        k_pr=1,
+    )
+    assert not decision.any_blocked
+    assert decision.visible_exemptions(), "a shard exemption must be RECORDED, never silent"
+    assert key in decision.visible_exemptions()[0]
+
+    # …and the other direction: a shard main never failed is NOT exempt.
+    blocked = decide(
+        rows.failures, {}, main_signatures={}, k_pr=1
+    )
+    assert blocked.blocked and blocked.blocked[0].nodeid == key
+
+
+# ── THE ROW DOOR, DERIVED FROM THE PRODUCERS (#6798, raised in #2648 review) ─
+#
+# `_NON_NODEID_KEY_RE` is hand-enumerated, and that enumeration went stale TWICE in the
+# same way: `runner::` was produced by `runner_aggregate_failures` and rejected by the row
+# door, and `bash-shard::` was about to repeat it. The failure mode is NOT a formatting
+# bug — a produced-and-rejected id is dropped by `parse_failure_rows` (so `decide` sees an
+# EMPTY PR set and reports `CLEAN blocked=0`) and by `parse_rates` (so main's row
+# vanishes). Review of #2648 measured both, on the real CLI.
+#
+# Hand-listing the families in a vector reproduces the bug, because the list is what went
+# stale. So the vector DERIVES the set from the module's own producers: every
+# `*_KEY_PREFIX` / `_KEY_PREFIX` constant must be admitted. A new producer without an
+# admitted key reddens here instead of disappearing one layer down.
+
+
+def test_6798_the_row_door_admits_the_non_nodeid_families():
+    """F5: the predicates that gate the row/rate doors must admit them."""
+    for key in ("watchdog-kill::pytest", "collect-error::tests/test_a.py"):
+        assert is_failure_key(key), f"parse_rates would DROP main's row for {key}"
+        assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
+
+
+
+
+def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
+    """Every family this module PRODUCES must be a key the row/rate doors ACCEPT.
+
+    Derived from the module's own constants, so adding a parser without admitting its key
+    reddens HERE rather than silently converting a red PR into `VERDICT CLEAN blocked=0`
+    (measured in #2648 review for `bash-shard::`, and live for `runner::` before it).
+
+    ⛔ THE DERIVATION IS "any module constant whose value ENDS IN `::`", not "any constant
+    named `*_KEY_PREFIX`". The first version of this vector filtered on the suffix and was
+    40% blind, exactly as #2648's second review measured: this module's own producers are
+    NOT uniformly named that way — `_COLLECT_ERROR_PREFIX` (`:1006`) is a producer with the
+    other naming style, and `watchdog-kill::pytest` is a bare literal. A guard that only
+    sees the suffix cannot see the style the module itself used once already.
+
+    Each family's KEY SHAPE is declared, not guessed: `guard-step::` carries TWO parts and a
+    one-part key is correctly rejected, so the map is asserted to cover the derived set
+    EXACTLY — a new family must state its shape here, which is the point.
+    """
+    shapes = {
+        "guard-step::": "guard-step::tests-a.py::test-x",
+        "collect-error::": "collect-error::tests/test_a.py",
+        "runner::": "runner::tests-a.test.sh",
+        "bash-shard::": "bash-shard::tests/a.test.sh",
+        # #1185 — this family is main's; it landed while this branch was open. The guard
+        # is this branch's, so the vector must carry it or the merge silently drops a
+        # family the row/rate doors already accept.
+        "pipeline-compliance::": "pipeline-compliance::c::some-subject",
+    }
+    producers = {
+        v for k, v in vars(ci_exemption).items()
+        if isinstance(v, str) and re.fullmatch(r"[a-z][a-z0-9-]*::", v)
+    }
+    assert producers == set(shapes), (
+        "the producer set and this vector disagree — a family was added or renamed without "
+        f"admitting its key: only-in-module={sorted(producers - set(shapes))}, "
+        f"only-in-vector={sorted(set(shapes) - producers)}"
+    )
+    for prefix, key in sorted(shapes.items()):
+        assert is_failure_key(key), (
+            f"`parse_rates` DROPS main's row for {key!r} ({prefix}): main would look green "
+            "for a family this module produces, so every such PR failure reads as PR-unique"
+        )
+        assert is_failure_key_loose(key), (
+            f"`parse_failure_rows` DROPS the PR's own row for {key!r} ({prefix}): `decide` "
+            "then sees an EMPTY PR set and emits `CLEAN blocked=0` for a RED PR — the #6798 "
+            "false PASS"
+        )
+    # The one family with NO prefix constant at all (a bare literal id), kept explicit and
+    # called out so a reader knows it is the residual of the derivation, not an oversight.
+    assert is_failure_key("watchdog-kill::pytest"), "watchdog-kill:: is emitted as a literal"
+    assert is_failure_key_loose("watchdog-kill::pytest"), "watchdog-kill:: is emitted as a literal"
+
+
+def test_shard_token_is_in_the_row_doors_alphabet_for_every_hostile_path():
+    """⛔ THE PRODUCER'S ALPHABET MUST BE INSIDE THE DOOR'S, or the identity is silently dropped.
+
+    This is the property that keeps a red PR from certifying `CLEAN blocked=0`: `bash_shard_failures`
+    emits an id, and `parse_failure_rows`/`parse_rates` REJECT it unless `is_failure_key` admits it —
+    a produced-and-rejected id makes `decide` see an EMPTY PR set. Measured twice in #2648 review:
+    first for the family itself (cycle 2), then because `quote()` never escapes `~`, so
+    `scripts/lib/a~b.sh` emitted `bash-shard::scripts/lib/a~b.sh` which the door rejects (cycle 4).
+
+    The earlier fix named a test that pinned the alphabet equality and then never wrote it — the
+    docstring asserted a pin that did not exist (cycle 5). This is that pin, asserted on the
+    PROPERTY rather than on two constants, so it holds through any change of encoder.
+    """
+    hostile = [
+        "scripts/lib/a~b.sh",          # `~` — quote()'s always-safe set, the cycle-4 silent drop
+        "scripts/a b.test.sh",          # whitespace — the rate table is `uniq -c | awk`
+        "scripts/a\tb.sh",              # a tab, which would also break the capture's field split
+        "scripts/a%41.sh",             # a literal escape: must be RE-escaped, not passed through
+        "scripts/a@b#c.sh",            # characters `_slug` would fold away
+        "scripts/ü.sh",                 # multi-byte UTF-8
+        "\U0001F600",                    # a non-BMP code point (the cycle-5 collision source)
+        "scripts/x/y.sh",               # a plain path — must stay VERBATIM
+    ]
+    seen = {}
+    for label in hostile:
+        ids, _sigs = ci_exemption.bash_shard_failures(f"❌ failed shard: {label}")
+        assert len(ids) == 1, f"{label!r} produced {ids!r}"
+        token = ids[0][len(ci_exemption._BASH_SHARD_KEY_PREFIX):]
+        assert ci_exemption._SHARD_TOKEN_RE.match(token), (
+            f"{label!r} produced a token outside the encoder's own alphabet: {token!r}"
+        )
+        assert ci_exemption.is_failure_key(ids[0]), (
+            f"{label!r} -> {ids[0]!r} is REJECTED by the row door: the id would be produced, "
+            "printed, and silently dropped, so `decide` would see an empty PR set and emit "
+            "`CLEAN blocked=0` for a RED PR"
+        )
+        assert ci_exemption.is_failure_key_loose(ids[0]), label
+        seen.setdefault(ids[0], []).append(label)
+    collisions = {k: v for k, v in seen.items() if len(v) > 1}
+    assert not collisions, f"two different labels share one identity: {collisions}"
+    # …and a plain path is still the path, so main and the PR compare on the real shard name.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/x/y.sh"
+    )[0] == ["bash-shard::scripts/x/y.sh"]
+    # ⛔ THE ENCODER'S EXACT OUTPUT, not merely "inside the alphabet" (#2648 cycle-6): the `%`
+    # RE-ESCAPE is what stops a path from FORGING an escape, and it was asserted nowhere — passing
+    # `%` through left the suite green while `scripts/a,b.sh` and `scripts/a%2Cb.sh` collapsed onto
+    # one identity. Both directions are pinned, by exact token.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a%41.sh"
+    )[0] == ["bash-shard::scripts/a%2541.sh"]
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a,b.sh"
+    )[0] == ["bash-shard::scripts/a%2Cb.sh"]
+    # …including `**`, which the bold-stripping must NOT touch when it is part of a path: stripping
+    # it from the whole line (the sibling parser's rule) made `scripts/a**b.sh` and `scripts/ab.sh`
+    # one identity, and a swept filename can carry `**` through `for f in $pattern` literally.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a**b.sh"
+    )[0] == ["bash-shard::scripts/a%2A%2Ab.sh"]
+    for a, b in (
+        ("scripts/a,b.sh", "scripts/a%2Cb.sh"),   # `%` passthrough would fold these
+        ("scripts/a b.sh", "scripts/a-b.sh"),     # a `-` fallback would fold these
+        ("scripts/a**b.sh", "scripts/ab.sh"),     # whole-line `**` stripping would fold these
+    ):
+        ka, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {a}")
+        kb, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {b}")
+        assert ka != kb, f"{a!r} and {b!r} share one identity: {ka!r}"
+    # …and the BOLD rendering still parses, since the pairs are consumed in the bullet position.
+    assert ci_exemption.bash_shard_failures(
+        "❌** **failed shard: scripts/x/y.sh"
+    )[0] == ["bash-shard::scripts/x/y.sh"]
+    # The two labels that collided under the cycle-5 per-character fallback (`%%%02X` has no fixed
+    # width): they must stay distinct.
+    a = ci_exemption.bash_shard_failures("❌ failed shard: \U0001F600")[0]
+    b = ci_exemption.bash_shard_failures("❌ failed shard: \x1f600")[0]
+    assert a != b, f"the encoder is not injective: {a!r} == {b!r}"
+
+
+def test_bash_shard_identity_is_injective_over_the_listed_shards():
+    """⛔ TWO DIFFERENT SHARDS MUST NOT SHARE ONE IDENTITY (#2648 reviews 2 and 3).
+
+    An identity is what the rail compares against main's baseline, so a collision lets a shard
+    nobody has ever run be exempted on the strength of an unrelated shard's history — measured:
+    with the identity slugged, `scripts/a-b.test.sh` and `scripts/a/b.test.sh` both produced
+    `bash-shard::scripts-a-b.test.sh`, and `decide` returned `exempt` for the colliding key.
+    The constant `bash-shard` signature cannot save it, because EVERY shard carries it.
+
+    Reads the REAL list (not a fixture), and asserts the token IS the path verbatim — the
+    earlier version of this vector fed `path` + its trailing `# comment` (every listed line has
+    one), so all 80 took the old slug fallback and the vector stayed green while asserting a
+    token nobody would ever compare. Caught in #2648 review cycle 3.
+    """
+    src = (Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh").read_text()
+    listed = []
+    for line in src.splitlines():
+        line = line.strip()
+        if not line.startswith("run_shard "):
+            continue
+        # The runner's own `--list` derives the path with `\([^ ]*\.sh\)`, i.e. the first
+        # space-free token ending in `.sh`. Match that, so a trailing `# comment` is never
+        # part of the path this vector tests.
+        m = re.search(r"(\S+\.sh)\b", line.split(None, 1)[1])
+        if m is None or m.group(1).startswith("$"):
+            continue  # an interpolated or sentinel call, not a listed path
+        listed.append(m.group(1))
+    assert len(listed) >= 60, (
+        f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
+        "would pass vacuously"
+    )
+    ids = {}
+    for path in listed:
+        got, _sigs = ci_exemption.bash_shard_failures(f"❌ failed shard: {path}")
+        assert len(got) == 1, f"{path!r} produced {got!r}"
+        # ⛔ THE ASSERTION THAT MAKES THIS VECTOR LOAD-BEARING: for a listed path the identity
+        # is the PATH, not a transformation of it. It fails the moment a slug (or any lossy
+        # fold) is re-introduced.
+        assert got[0] == "bash-shard::" + path, (
+            f"the identity is not the path verbatim for {path!r}: {got[0]!r} — a lossy token "
+            "can fold two shards onto one identity"
+        )
+        ids.setdefault(got[0], []).append(path)
+        # …and the key must carry no whitespace (the rate table is `uniq -c | awk`).
+        assert re.search(r"\s", got[0]) is None, got[0]
+    collisions = {k: v for k, v in ids.items() if len(v) > 1}
+    assert not collisions, f"distinct shards share one identity: {collisions}"
+    assert len(ids) == len(set(listed)), "the count drifted from the list"
+
+    # ⛔ AND THE PAIRS THAT DO COLLIDE under a lossy token — the reason injectivity is a
+    # REQUIREMENT, not a nicety. Each pair is one character apart; a slug, a whitespace fold,
+    # or any `_slug`-style fallback collapses one of them.
+    for a, b in (
+        ("scripts/a-b.test.sh", "scripts/a/b.test.sh"),      # `/` and `-` under `_slug`
+        ("scripts/a b.test.sh", "scripts/a_b.test.sh"),      # whitespace fold
+        ("scripts/a@b/c.test.sh", "scripts/a-b@c.test.sh"),  # `_slug` charset fold
+    ):
+        ka, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {a}")
+        kb, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {b}")
+        assert ka != kb, (
+            f"two different shards collapsed onto one identity ({ka!r}): the token is lossy, "
+            "so a shard main never ran can be exempted on an unrelated shard's baseline"
+        )
+        assert ci_exemption.is_failure_key(ka[0]), (
+            f"{ka[0]!r} is not in the row door's universe — the identity would be dropped"
+        )
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a-b.test.sh"
+    )[0] == ["bash-shard::scripts/a-b.test.sh"]
+
+
+def test_6798_the_row_door_still_rejects_junk():
+    """FAIL-CLOSED: the widened predicate must not become a wildcard.
+
+    `is_failure_key` gates MAIN's rate table — the exemption allowlist. Admitting
+    a loose string there is a false-exemption vector, not a formatting nicety.
+    """
+    for junk in (
+        "random-string",
+        "watchdog-kill::OTHER",          # not the one identity we emit
+        "collect-error::notapyfile",     # must be a .py path
+        "collect-error::",               # empty path
+        "collect-error::tests/a.py::x",  # a nodeid is NOT a collect-error key
+        "bash-shard::",                  # empty shard path
+        "bash-shard::a b",               # whitespace defeats the rate table's uniq|awk
+        "runner::",                      # empty job slug
+        "bash-shard::x::y",              # a nodeid is not a shard key
+    ):
+        assert not is_failure_key_loose(junk), f"{junk!r} must NOT buy a failure key"
+
+
+# ── #9331 · a MEASURED value is not a different failure ───────────────────
+#
+# THE DEFECT (tortoise #9331). `normalize_signature` masks addresses, UUIDs, hex
+# run ids, `team_*` tenants and `host:port`, but NOT a measured DURATION. A test
+# whose assertion message interpolates its own measurement therefore has a
+# per-run signature, and `_signatures_overlap`'s SUBSET rule can never hold — an
+# id main measures red at 25% is BLOCKed forever as "a DIFFERENT failure":
+#
+#   BLOCK : tests/test_ep_local_395.py::test_ac5_interactive_latency_zone
+#           signature differs from main's (1/1 (100%) vs 1/4 (25%))
+#           — same id, a DIFFERENT failure is not exempt
+#
+# A duration is ENVIRONMENTAL substrate (the machine's load changed), not the
+# data the assertion is about — the same axis the mask list already excludes ids
+# by. A COMPARISON-OPERATOR bound is the one exception honoured (see the module
+# comment); a fractional bound written as a noun phrase is a DECLARED residual,
+# pinned below, because this repo also uses those nouns to LABEL measurements
+# ("probe exceeded its bound: 1.21s"), so a noun list fails both ways at once.
+
+_EP_LATENCY_MSG_A = "local EP took 1.21s — interactive budget is ≤1s"
+_EP_LATENCY_MSG_B = "local EP took 1.47s — interactive budget is ≤1s"
+
+
+def test_9331_two_measured_durations_of_one_assertion_are_one_signature():
+    """RED before the fix: the two texts normalise to themselves and never match."""
+    a = ci_exemption.normalize_signature(_EP_LATENCY_MSG_A)
+    b = ci_exemption.normalize_signature(_EP_LATENCY_MSG_B)
+
+    # …and the mask is APPLIED, not merely absent from both sides (equality alone
+    # would pass on an unfixed tree where both stayed raw).
+    assert "<MEAS1:s>" in a and "1.21s" not in a, a
+    assert a == b, (
+        "a measured duration must not be part of the signature — main's\n"
+        f"{_EP_LATENCY_MSG_A!r} and the PR's {_EP_LATENCY_MSG_B!r} are ONE failure"
+    )
+
+    # The shapes this repo actually renders, incl. a noun LABEL (which a bound-noun
+    # allowlist would have treated as a bound and left volatile — review cycle 4).
+    for left, right in [
+        ("probe exceeded its bound: 1.21s", "probe exceeded its bound: 1.47s"),
+        ("probe overran its bound: 1.21s", "probe overran its bound: 1.99s"),
+        ("took 1.21s and the budget is ≤1s", "took 1.47s and the budget is ≤1s"),
+        ("assert elapsed < 1.2, took 1.21s", "assert elapsed < 1.2, took 1.47s"),
+        ("the budget was exceeded, took 1.21s", "the budget was exceeded, took 1.47s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"a measurement stayed volatile: {left!r} vs {right!r}"
+
+
+def test_9331_the_measured_duration_case_is_EXEMPT_end_to_end():
+    """The acceptance the issue asks for: the rail's own decision, not just the mask.
+
+    main measured this id red 1/4 with a signature carrying ITS run's elapsed
+    value; the PR's run carries a different elapsed value. Same id, same
+    assertion — the exemption must be available.
+    """
+    main_sig = ci_exemption.normalize_signature(f"AssertionError: {_EP_LATENCY_MSG_A}")
+    pr_sig = ci_exemption.normalize_signature(f"AssertionError: {_EP_LATENCY_MSG_B}")
+
+    decision = decide(
+        {ID: _f(1, 1, pr_sig)},
+        {ID: Rate(1, 4)},
+        main_signatures={ID: frozenset({main_sig})},
+        k_pr=1,
+    )
+
+    assert not decision.any_blocked, (
+        "same id + same assertion + main's own measurement must EXEMPT; got "
+        f"{[b.reason for b in decision.blocked]}"
+    )
+    assert len(decision.exempt) == 1
+
+
+def test_9331_an_operator_bound_stays_SIGNAL_and_a_moved_one_BLOCKs():
+    """A comparison-operator bound is a LIMIT: moving it is a different failure.
+
+    This is the one bound marker honoured, because it is unambiguous — a noun
+    phrase cannot be told apart from a measurement label (see the module comment).
+    """
+    for left, right in [
+        ("assert local EP ≤1.5s", "assert local EP ≤9.5s"),
+        ("assert elapsed < 0.1s", "assert elapsed < 0.5s"),
+        ("assert waited <= 2.5s", "assert waited <= 7.5s"),
+        # The other three branches of _BOUND_OPERATOR_RE, each pinned because a moved
+        # LOWER bound that stopped being recognised would be MASKED and would then
+        # inherit main's exemption — the fail-OPEN direction (review cycle 7), plus
+        # the bare `≥` member of the character class that no other case exercises.
+        ("assert took >= 2.5s", "assert took >= 7.5s"),
+        ("assert took > 2.5s", "assert took > 7.5s"),
+        ("assert budget == 1.5s", "assert budget == 9.5s"),
+        ("assert waited ≤ 2.5s", "assert waited ≥ 7.5s"),
+        # A bound that FOLLOWS an earlier `<`/`<=` in the same message: the masked-token
+        # strip must not read that ``<`` … ``>`` span as a mask and free the bound.
+        # Cycles 8 and 9 each measured a form of this collapsing into ONE signature
+        # (fail-OPEN); the SPACED and the UNSPACED form are both pinned because the
+        # first fix ("the inner text starts with a name") only closed the spaced one —
+        # ``<b and p99 >`` starts with a letter, so the strip ate the operator.
+        ("assert waited <= 2.5s and p99 > 7.5s", "assert waited <= 2.5s and p99 > 9.5s"),
+        ("assert elapsed < 1.2 and took >= 2.5s", "assert elapsed < 1.2 and took >= 7.5s"),
+        ("assert a<b and p99 >= 2.5s", "assert a<b and p99 >= 9.5s"),
+        ("cost<budget: took >= 2.5s", "cost<budget: took >= 9.5s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) != (
+            ci_exemption.normalize_signature(right)
+        ), f"an operator bound was masked: {left!r} vs {right!r}"
+
+    main_sig = ci_exemption.normalize_signature("AssertionError: budget is ≤1.5s at 40 claims")
+    pr_sig = ci_exemption.normalize_signature("AssertionError: budget is ≤9.5s at 40 claims")
+    decision = decide(
+        {ID: _f(1, 1, pr_sig)},
+        {ID: Rate(1, 4)},
+        main_signatures={ID: frozenset({main_sig})},
+        k_pr=1,
+    )
+    assert decision.any_blocked, "a moved operator bound must not inherit the exemption"
+    assert "signature differs" in decision.blocked[0].reason
+
+
+def test_9331_slot_ordinals_are_one_left_to_right_pass():
+    """The slot is the duration's ORDINAL among its siblings, on a dense line too.
+
+    The slot table is precomputed in a single pass (review cycle 7: the per-match
+    prefix recount was O(n × k), 4.9 s on a 60 KB duration-dense line). The risk of
+    that change is an off-by-one in the ordinals, so the ordinals are pinned here
+    exactly — including a bound (left RAW) sitting BETWEEN two masked measurements,
+    which must still consume its ordinal and must not shift the ones after it.
+    """
+    dense = "timings " + " ".join(f"{i}.5s" for i in range(1, 41))
+    assert ci_exemption.normalize_signature(dense) == "timings " + " ".join(
+        f"<MEAS{i}:s>" for i in range(1, 41)
+    )
+
+    interleaved = "a 1.5s b >= 2.5s c 3.5s"
+    # 1.5s → slot 1; '>= 2.5s' is a BOUND → stays raw but is still ordinal 2;
+    # 3.5s → slot 3. A counter that only advanced on MASKED matches would emit
+    # <MEAS2:s> here and make two different assertions collide.
+    assert ci_exemption.normalize_signature(interleaved) == (
+        "a <MEAS1:s> b >= 2.5s c <MEAS3:s>"
+    )
+
+    # A bare `=` is an INTERPOLATION, not a bound (``elapsed=1.21s``), so that value
+    # is masked like any other measurement — the exclusion of ``=`` from
+    # _BOUND_OPERATOR_RE, documented but previously untested.
+    assert ci_exemption.normalize_signature("elapsed=1.21s") == "elapsed=<MEAS1:s>"
+
+    # Same message twice must be identical, INCLUDING across an interleaved call on a
+    # different text, and the slot table must be BOUND TO THE TEXT it was built from —
+    # asserted directly on the cache contract, because "call the pure function twice"
+    # cannot fail on a leak (cycle 9).
+    ci_exemption._duration_slot_table.cache_clear()
+    first = ci_exemption.normalize_signature(dense)
+    ci_exemption.normalize_signature("unrelated 2.5s and 3.5s text")
+    assert ci_exemption.normalize_signature(dense) == first
+    assert ci_exemption._duration_slot_table.cache_info().hits >= 1, (
+        "the slot table was rebuilt for the same text — the cache is not keyed on it"
+    )
+    assert set(
+        ci_exemption._duration_slot_table("unrelated 2.5s and 3.5s text").values()
+    ) == {1, 2}, "a slot table carries ordinals from a DIFFERENT text"
+
+
+def test_9331_an_arrow_is_not_a_bound_operator():
+    """``->`` / ``=>`` end in an operator character but are not comparisons.
+
+    Cycle 9: ``_BOUND_OPERATOR_RE`` accepted any trailing ``>``/``=``, so
+    ``phase collect -> 1.21s`` left the measurement RAW and the #9331 signature
+    stayed volatile — and ``this test 9.07s -> 0.73s CPU`` (this repo's own
+    wording) masked only the FIRST value, leaving the second volatile forever.
+    """
+    for left, right in [
+        ("phase collect -> 1.21s", "phase collect -> 1.47s"),
+        ("this test 9.07s -> 0.73s CPU", "this test 8.11s -> 1.29s CPU"),
+        ("took => 2.5s", "took => 7.5s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"an arrow was read as a bound: {left!r} vs {right!r}"
+
+
+def test_9331_every_declared_unit_masks_and_the_unit_rides_the_token():
+    """All 13 declared units mask, and the UNIT stays in the token.
+
+    The unit is load-bearing signal: ``1.21ms`` and ``1.21s`` are different
+    measurements. Cycle 9 found that only ``s`` and ``ms`` were exercised, so
+    dropping ``µs``/``μs``/``secs``/``mins`` … from the alternation would have
+    reddened nothing while silently re-opening #9331 for those units.
+    """
+    for unit in (
+        "ns", "us", "µs", "μs", "ms", "seconds", "second", "secs", "sec",
+        "minutes", "minute", "mins", "min", "s",
+    ):
+        one = ci_exemption.normalize_signature(f"took 1.5{unit} here")
+        two = ci_exemption.normalize_signature(f"took 7.5{unit} here")
+        assert one == two, f"unit {unit!r} was not masked: {one!r} vs {two!r}"
+        assert f"<MEAS1:{unit}>" in one, (
+            f"unit {unit!r} did not ride the token: {one!r}"
+        )
+    # SCALE stays signal: same number, different unit → different signature.
+    assert ci_exemption.normalize_signature("took 1.21ms") != (
+        ci_exemption.normalize_signature("took 1.21s")
+    )
+
+
+def test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual():
+    """A duration emitted immediately BEFORE an id needs TWO passes — declared, pinned.
+
+    The id masks are anchored on a left non-word boundary, and a duration's unit
+    letter is a word character, so ``1.5s746b295c`` masks the duration on pass 1 and
+    only then exposes the hex id to the ``\b``-anchored ``<HEX>`` rule. Pytest text
+    does not produce this shape, but a producer that stores a RAW signature column
+    would read a different signature than the writer wrote (writer≠reader ⇒ the
+    subset rule blocks forever), so the two-pass result is pinned here rather than
+    left to be rediscovered as a permanent block (review cycle 8 finding 2).
+    """
+    once = ci_exemption.normalize_signature("took 1.5s746b295c")
+    assert once == "took <MEAS1:s>746b295c", once
+    assert ci_exemption.normalize_signature(once) == "took <MEAS1:s><HEX>"
+    # The other reachable member of the family named in the module comment.
+    assert ci_exemption.normalize_signature("took 1.5s0x1f") == "took <MEAS1:s>0x1f"
+    assert ci_exemption.normalize_signature(
+        "took <MEAS1:s>0x1f"
+    ) == "took <MEAS1:s><ADDR>"
+
+
+def test_9331_a_meaningful_number_stays_SIGNAL():
+    """The other direction: numbers that ARE the assertion must never be masked."""
+    pairs = [
+        ("AssertionError: expected status 403, got 404", "AssertionError: expected status 403, got 403"),
+        ("orphaned redislite servers after suite: 16 (threshold: 12)",
+         "orphaned redislite servers after suite: 12 (threshold: 12)"),
+        ("reach rate 91.2% is below the 95% floor", "reach rate 88.4% is below the 95% floor"),
+        ("coverage of the closure was 12/40 nodes", "coverage of the closure was 9/40 nodes"),
+        # a written-byte count is data, not substrate
+        ("wrote 4096 bytes", "wrote 8192 bytes"),
+        # SCALE rides the token: three orders of magnitude must not collapse
+        ("local EP took 1.21ms — interactive budget", "local EP took 1.21s — interactive budget"),
+        # INTEGER durations are declared bounds in practice (≤1s, after 30s): signal
+        ("local EP took 1.21s — interactive budget is ≤1s",
+         "local EP took 1.21s — interactive budget is ≤9s"),
+        ("the probe overran after 30s", "the probe overran after 300s"),
+        ("timeout was 30s not 5s", "timeout was 5s not 30s"),
+        ("slept 0s vs 5s", "slept 3s vs 9s"),
+    ]
+    for left, right in pairs:
+        assert ci_exemption.normalize_signature(left) != ci_exemption.normalize_signature(right), (
+            f"masking became a fail-OPEN: {left!r} and {right!r} collapsed"
+        )
+
+
+def test_9331_a_fractional_noun_phrase_bound_is_a_declared_residual():
+    """DECLARED residual (review cycle 4): a noun-phrase fractional bound is masked.
+
+    Four review cycles proved a bound-NOUN allowlist cannot work: this repo labels
+    MEASUREMENTS with the same nouns ("probe exceeded its bound: 1.21s"), so every
+    wording added to the list left the #9331 signature volatile for real messages.
+    The residual is therefore accepted, and the exemption still has to clear the
+    independent backstops (`min_runs`, main-present, rate comparison, #5250).
+
+    If a future cut narrows this, THIS test reds — make the change deliberately.
+    """
+    for left, right in [
+        ("the caller was held for 1.2s on a 0.1s bound", "the caller was held for 1.2s on a 0.5s bound"),
+        ("the probe exceeded (budget 3.0s)", "the probe exceeded (budget 30.0s)"),
+        ("the leg ran over its 1.50s timeout", "the leg ran over its 2.50s timeout"),
+        ("the budget is 3.0s", "the budget is 30.0s"),
+        ("a limit of 1.5s", "a limit of 9.5s"),
+        ("on a bound of 0.1s", "on a bound of 0.5s"),
+        ("with a 0.1s offload bound", "with a 0.05s offload bound"),
+        ("an acquisition bounded at 0.05s", "an acquisition bounded at 5.0s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"the residual was narrowed — re-derive it: {left!r} vs {right!r}"
+
+
+def test_9331_the_two_signature_doors_agree_on_a_measured_duration():
+    """`ids` and `signatures` must sign the same id the same way (§4.6 coupling)."""
+    log = "\n".join([
+        "job\tstep\t2026-10-21T09:45:00.0Z == FAILURES ==",
+        "job\tstep\t2026-10-21T09:45:00.0Z ____ test_ac5_interactive_latency_zone ____",
+        f"job\tstep\t2026-10-21T09:45:00.0Z E       AssertionError: {_EP_LATENCY_MSG_A}",
+        "job\tstep\t2026-10-21T09:45:00.0Z E       assert 1.21 < 1.2",
+        "job\tstep\t2026-10-21T09:45:00.0Z FAILED tests/test_ep_local_395.py::test_ac5_interactive_latency_zone",
+    ])
+    parsed = ci_exemption.parse_pr_failure_text(log)
+    sigs = parsed.signatures["tests/test_ep_local_395.py::test_ac5_interactive_latency_zone"]
+
+    (sig,) = sigs
+    assert "<MEAS1:s>" in sig and "1.21s" not in sig, (
+        f"the door stored the raw measurement instead of masking it: {sig!r}"
+    )
+
+
+def test_9331_the_guard_shape_gets_the_same_mask():
+    """The mask feeds guard-step IDENTITIES too — declared, and pinned."""
+    shape_a = ci_exemption.normalize_guard_error("the slow leg ran over, 1.50s in total")
+    shape_b = ci_exemption.normalize_guard_error("the slow leg ran over, 2.25s in total")
+    assert "<MEAS1:s>" in shape_a, f"the guard shape did not get the mask: {shape_a}"
+    assert ci_exemption.guard_step_key("Slow leg", shape_a) == ci_exemption.guard_step_key(
+        "Slow leg", shape_b
+    )
+    # …and an INTEGER duration stays SIGNAL in the guard door too — uniformly with
+    # the signature door (`_GUARD_INT_RE`'s \b\d+\b does not match `90s`).
+    int_a = ci_exemption.normalize_guard_error("the leg exceeded its 90s budget")
+    int_b = ci_exemption.normalize_guard_error("the leg exceeded its 900s budget")
+    assert int_a == "the leg exceeded its 90s budget", int_a
+    assert int_a != int_b, "an integer duration became masked — re-derive the fail-OPEN guard"
+
+
+def test_9331_the_unitless_assert_expansion_is_a_declared_residual():
+    """A message-less elapsed assertion stays volatile — pinned THROUGH the parser."""
+    assert ci_exemption.normalize_signature("assert 1.47 < 1.2") != (
+        ci_exemption.normalize_signature("assert 1.21 < 1.2")
+    ), "if this now matches, the mask was widened — re-derive the fail-OPEN guard"
+    log = "\n".join([
+        "job\tstep\t2026-10-21T09:45:00.0Z == FAILURES ==",
+        "job\tstep\t2026-10-21T09:45:00.0Z ____ test_bare ____",
+        "job\tstep\t2026-10-21T09:45:00.0Z E       assert 1.47 < 1.2",
+        "job\tstep\t2026-10-21T09:45:00.0Z FAILED tests/test_bare.py::test_bare",
+    ])
+    sigs = ci_exemption.parse_pr_failure_text(log).signatures["tests/test_bare.py::test_bare"]
+    assert sigs == frozenset({"assert 1.47 < 1.2"}), (
+        f"the residual changed shape — re-derive the mask: {sigs}"
+    )
+
+
+def test_9331_a_duration_used_as_data_is_a_declared_residual():
+    """DECLARED residual: a value in a non-bound DATA slot is still masked."""
+    a = ci_exemption.normalize_signature("measured 10.36 s of the control's 10.85 s")
+    b = ci_exemption.normalize_signature("measured 12.50 s of the control's 19.75 s")
+    assert a == b, "if this now differs, the mask was narrowed — re-derive the residual"
+    assert a == "measured <MEAS1:s> of the control's <MEAS2:s>", a
+
+
+def test_9331_out_of_list_units_stay_volatile():
+    """DECLARED residuals: units the mask does not cover stay volatile (fail-CLOSED)."""
+    for text in ("took 1.5m", "took 1.5h", "waited 3 days", "took 1.2S"):
+        assert ci_exemption.normalize_signature(text) == text, (
+            f"{text!r} is now masked — that is a new mask axis, re-derive the residuals"
+        )
+
+
+def test_9331_normalisation_is_idempotent_and_never_empties_a_signature():
+    """The row readers re-normalise what the writer normalised (§4.6 writer=reader).
+
+    A non-idempotent step makes writer≠reader, and the subset rule then fails
+    CLOSED — a permanent block. And an empty signature is a REJECTION, so the mask
+    must never reduce a non-empty text to ``''``.
+    """
+    for text in [
+        "1.5s1.7s", "took 1.21s", "took1.21s", "admin 1.2s", "1.5s max",
+        _EP_LATENCY_MSG_A, "probe exceeded its bound: 1.21s", "assert elapsed < 0.1s",
+        "<MEAS1:s>", "took <MEAS1:s> and <MEAS2:ms>",
+    ]:
+        once = ci_exemption.normalize_signature(text)
+        assert ci_exemption.normalize_signature(once) == once, f"not idempotent: {text!r}"
+        assert once, f"normalisation emptied a non-empty text: {text!r}"
+    for text in ("1.5s1.7s", "admin 1.2s"):
+        assert "<MEAS1:s>" in ci_exemption.normalize_signature(text), text
+
+
+def test_9331_a_masked_token_closing_angle_is_not_a_bound_operator():
+    """A `<ADDR>`/`<HOSTPORT>` mask ENDS IN `>` — that is not a comparison.
+
+    Review cycle 6: the operator test read the closing `>` of an earlier mask as a
+    bound operator, leaving the following measurement RAW — the #9331 block back,
+    for any message where a masked id precedes the timer.
+    """
+    for left, right in [
+        ("0x1f 1.21s", "0x1f 1.47s"),
+        ("127.0.0.1:8080 1.21s", "127.0.0.1:8080 1.47s"),
+        ("team_x 1.21s", "team_x 1.47s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"a mask-closing '>' freed the measurement: {left!r} vs {right!r}"
+    # …while a real operator is still a bound, and still raw.
+    assert ci_exemption.normalize_signature("≤1.5s") != ci_exemption.normalize_signature("≤9.5s")
+
+
+def test_a_shard_label_is_never_DROPPED_even_when_it_looks_like_source():
+    """⛔ THE DIRECTION THAT MUST NEVER INVERT: this pass only ADDS identities (#2700, cycle 3 P1).
+
+    A filter dropping labels containing `$`/backtick/`<`/`>` was written and REVERTED: those are
+    legal POSIX filename characters, so the filter also dropped the per-shard arm's REAL identity
+    (`❌ FAILED SHARD: scripts/evil$a.sh` — attributed by the parent commit), and `sweep_file()`
+    reaches `shard_named_failure` without the listed-shard gate. With any other id present the run
+    still advances `extracted`, so `admin-merge.sh`'s `examined > extracted` refusal never fires
+    and `decide` then certifies a red PR with `blocked=[]` — the #6798/#2193 fail-open.
+
+    So a label that merely LOOKS unexpanded is an identity like any other: it encodes to a token
+    that cannot be in main's rate table, which BLOCKS (over-block, the safe direction). The
+    residual — a capture carrying this file's own source verbatim would block forever on
+    `bash-shard::%24shard_failed_list` — is declared in the module; the runner prints the expanded
+    value, and the per-shard arm has had the same property on `main`.
+
+    MUTATION: reintroduce any label filter over `labels` → the kept-identity assertions RED.
+    """
+    # The real-path case that the reverted filter broke, on BOTH shapes.
+    real = ["❌ FAILED SHARD: scripts/evil$a.sh", "❌ failing shard(s): scripts/evil$a.sh"]
+    for log in real:
+        assert ci_exemption.bash_shard_failures(log)[0] == [
+            "bash-shard::scripts/evil%24a.sh"
+        ], log
+        assert parse_failed_ids(log, raw_log=True).ok is True, log
+    # …and it survives both doors, so it reaches `decide` and BLOCKS instead of vanishing.
+    key = "bash-shard::scripts/evil%24a.sh"
+    assert ci_exemption.is_failure_key_loose(key)
+    assert ci_exemption.is_failure_key(key)
+    # Echoed-source / placeholder labels are ALSO kept — over-blocking is the safe direction — and
+    # they can never be exempted, because no rate row can carry them.
+    for log in (
+        "❌ failing shard(s): $shard_failed_list",
+        "❌ FAILED SHARD: <path>",
+        "❌ failing shard(s): $(pwd)/x.test.sh",
+        "❌ FAILED SHARD: `echo x`.test.sh",
+    ):
+        ids = ci_exemption.bash_shard_failures(log)[0]
+        assert len(ids) == 1 and ids[0].startswith("bash-shard::"), log
+        assert parse_failed_ids(log, raw_log=True).ok is True, log
+    # …and a normal multi-shard recap is unchanged.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/x.test.sh, ./scripts/y.test.sh"
+    )[0] == ["bash-shard::scripts/x.test.sh", "bash-shard::scripts/y.test.sh"]
