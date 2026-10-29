@@ -765,40 +765,56 @@ echo "== 13. the fleet courtesy gate: bounded concurrency, spacing, 403/429 hand
 gate_dir() { local d="$TMP/gate-$1"; rm -rf "$d"; mkdir -p "$d"; printf '%s' "$d"; }
 
 # (a) BOUNDED CONCURRENCY. The fake gh holds a marker file for 0.4 s so overlap is
-#     measurable; a sampler records the highest count seen. 4 lanes, cap 2 → 2, never 4.
+#     measurable. 4 lanes, cap 2 → 2, never 4.
+#     ⛔ EACH CHILD RECORDS THE COUNT IT SAW AT ITS OWN START — DETERMINISTICALLY (#1910 run).
+#     The wall-clock sampler this replaced read the marker dir on a 50 ms timer and published its
+#     running max into a file; on a loaded runner the arm failed with `saw  in flight` — an EMPTY
+#     sample, not a violation — i.e. the SURFACE for the assertion had vanished and the arm reported
+#     it as a broken cap. A measurement artifact was printed as a finding. Admission is what this arm
+#     is about: an over-admitted child is the one that SEES the extra sibling, so asking every child
+#     "how many were active when you started?" observes every admission with no timer to miss it.
+#     (Same shape as 16's NO_WAIT slot arm: "a sampler that runs after `wait` reads 0 and would pass
+#     with the cap wide open (it did)".)
 GDIR="$(gate_dir conc)"; GACTIVE="$TMP/gate-conc-active"; rm -rf "$GACTIVE"; mkdir -p "$GACTIVE"
-GREAL="$TMP/gate-real-conc"
+GREAL="$TMP/gate-real-conc"; GSEEN="$TMP/gate-conc-seen"; : > "$GSEEN"
 cat > "$GREAL" <<'GHEOF'
 #!/usr/bin/env bash
 : > "$GACTIVE/$$"
+echo "$(ls "$GACTIVE" | wc -l | tr -d ' ')" >> "$GSEEN"
 sleep 0.4
 rm -f "$GACTIVE/$$"
 exit 0
 GHEOF
 chmod +x "$GREAL"
-(
-  maxc=0; i=0
-  while [ "$i" -lt 60 ]; do
-    n=$(ls "$GACTIVE" 2>/dev/null | wc -l)
-    [ "$n" -gt "$maxc" ] && maxc="$n"
-    printf '%s' "$maxc" > "$TMP/gate-conc-max"
-    sleep 0.05; i=$(( i + 1 ))
-  done
-) &
-sampler=$!
 gpids=""
 for _lane in 1 2 3 4; do
-  GACTIVE="$GACTIVE" AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+  GACTIVE="$GACTIVE" GSEEN="$GSEEN" AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
     AGENT_GH_GATE_MAX_INFLIGHT=2 AGENT_GH_GATE_INTERVAL_MS=0 \
     bash "$SHIM" api user >/dev/null 2>&1 &
   gpids="$gpids $!"
 done
 for p in $gpids; do wait "$p"; done
-kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
-maxc="$(cat "$TMP/gate-conc-max" 2>/dev/null || echo 0)"
-[ "${maxc:-0}" -le 2 ] && [ "${maxc:-0}" -ge 1 ] \
-  && pass "4 parallel lanes with MAX_INFLIGHT=2 → at most 2 gh processes in flight (saw $maxc)" \
-  || fail "the concurrency bound did not hold: saw $maxc in flight with a cap of 2"
+maxc=0; seen=0
+while read -r _n; do
+  case "$_n" in ''|*[!0-9]*) continue ;; esac
+  seen=$(( seen + 1 ))
+  [ "$_n" -gt "$maxc" ] && maxc="$_n"
+done < "$GSEEN"
+# An EMPTY observation set proves nothing and must not be graded as a violation of the cap: it is a
+# different fault (nothing ran, or nothing recorded) and it says so in its own words.
+# ⛔ AND A PARTIAL SET IS NOT AN OBSERVATION OF THIS ARM'S PREMISE EITHER (#1881 review P2). Each of
+# the four children writes exactly one line at its own admission, so `seen` is the number that
+# REACHED the gate. Grading `seen == 1` as a pass let three lanes be refused — or silently never
+# start — and still report "4 parallel lanes … at most 2 in flight": the arm would be green over a
+# population one quarter the size of the one it names. `seen` must therefore be all four; a smaller
+# count is its own fault, named as such, not a cap verdict.
+if [ "$seen" -lt 4 ]; then
+  fail "only $seen of 4 gh children reached the gate, so this sample does not contain the four admissions the arm claims to observe"
+elif [ "$maxc" -le 2 ] && [ "$maxc" -ge 1 ]; then
+  pass "4 parallel lanes with MAX_INFLIGHT=2 → at most 2 gh processes in flight (saw $maxc, $seen child observation(s))"
+else
+  fail "the concurrency bound did not hold: saw $maxc in flight with a cap of 2"
+fi
 [ -z "$(ls "$GDIR/slots" 2>/dev/null | head -1)" ] \
   && pass "  …and every slot was released (no leak to wedge the next lane)" \
   || fail "  …but slots were left behind: $(ls "$GDIR/slots")"
