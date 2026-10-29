@@ -61,8 +61,8 @@ mk_case() {
   mkdir -p "$CASE/repo/.git/worktrees/lane-77"
   # the box's other shapes. ⛔ THE `wt-` LANE ROOT IS A REAL LINKED WORKTREE UNDER A FLEET ROOT
   # (HOME here): a name-only `wt-*` directory must NOT be rostered (review finding 1).
-  mkdir -p "$CASE/home/fleet/wt-lane-88" "$CASE/repo/.git/worktrees/wt-lane-88"
-  printf 'gitdir: %s\n' "$CASE/repo/.git/worktrees/wt-lane-88" > "$CASE/home/fleet/wt-lane-88/.git"
+  mkdir -p "$CASE/home/wt-lane-88" "$CASE/repo/.git/worktrees/wt-lane-88"
+  printf 'gitdir: %s\n' "$CASE/repo/.git/worktrees/wt-lane-88" > "$CASE/home/wt-lane-88/.git"
   mkdir -p "$CASE/home/wt-notaworktree"  # a NAME-only wt- root — must never be rostered
   mkdir -p "$CASE/owner/Personal website"  # the OWNER's project — must never be rostered
   mkdir -p "$CASE/repo/.git"               # a main checkout — not a lane either
@@ -83,7 +83,7 @@ mk_payload() { # workspaces from the fixture dirs
   cat > "$CASE/list.json" <<JSON
 {"window_ref":"window:1","workspaces":[
  {"id":"c2c97e96-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77","current_directory":"$CASE/repo/.worktrees/lane-77"},
- {"id":"aa11bb22-cc33-dd44-ee55-ff6677889900","custom_title":"LANE 88","current_directory":"$CASE/home/fleet/wt-lane-88"},
+ {"id":"aa11bb22-cc33-dd44-ee55-ff6677889900","custom_title":"LANE 88","current_directory":"$CASE/home/wt-lane-88"},
  {"id":"bbbb0000-0000-0000-0000-00000000000b","custom_title":"NAME ONLY","current_directory":"$CASE/home/wt-notaworktree"},
  {"id":"deadbeef-0000-0000-0000-000000000000","custom_title":"Personal website","current_directory":"$CASE/owner/Personal website"},
  {"id":"11112222-3333-4444-5555-666677778888","custom_title":"SHARED","current_directory":"$CASE/repo"},
@@ -93,7 +93,7 @@ JSON
 }
 run_it() { # run_it <args...>  — stub PATH + fixture HOME, capture output and rc
   OUT="$(env -u TMUX HOME="$CASE/home" PATH="$CASE/bin:$(dirname "$(command -v python3)"):/usr/bin:/bin" \
-        python3 "$SCRIPT" "${@:-}" --roster "$ROSTER" 2>&1)"
+        python3 "$SCRIPT" "$@" --roster "$ROSTER" 2>&1)"
   RC=$?
 }
 no_cmux_no_tmux_path() { # PATH with python3 only — no cmux, no tmux
@@ -106,8 +106,9 @@ tmux_path() { # a PATH with a tmux stub but no cmux answer
 
 echo "== A. DERIVE: one row per demonstrable fleet worktree, exclusions NAMED =="
 mk_case derive; mk_stub 0 payload; mk_payload
-run_it            # report-only by default
-chk "A1 --check on an ABSENT roster is ACTION NEEDED (rc 2)" '[ "$RC" -eq 2 ]'
+run_it --check    # report-only (explicit: an empty argument would be argparse rc 2)
+chk "A1 --check on an ABSENT roster is ACTION NEEDED (rc 2)" \
+    '[ "$RC" -eq 2 ] && case "$OUT" in *"ACTION NEEDED"*) true;; *) false;; esac'
 chk "A2 …and it writes NOTHING" '[ ! -e "$ROSTER" ]'
 run_it --apply
 chk "A3 --apply provisions the roster (rc 0)" '[ "$RC" -eq 0 ]'
@@ -164,8 +165,9 @@ echo
 echo "== D. NOT-APPLICABLE: no daemon, no layout, tmux — the truthful roster is ZERO ROWS =="
 mk_case cell; mk_stub 1 junk; tmux_path
 chk "D0 pre-state: no roster" '[ ! -e "$ROSTER" ]'
-run_it
-chk "D1 --check on an unprovisioned cell is ACTION NEEDED (rc 2)" '[ "$RC" -eq 2 ]'
+run_it --check
+chk "D1 --check on an unprovisioned cell is ACTION NEEDED (rc 2)" \
+    '[ "$RC" -eq 2 ] && case "$OUT" in *"ACTION NEEDED"*) true;; *) false;; esac'
 run_it --apply
 chk "D2 --apply provisions it (rc 0)" '[ "$RC" -eq 0 ]'
 chk "D3 the roster EXISTS — an absent file is what the board refuses" '[ -f "$ROSTER" ]'

@@ -266,10 +266,18 @@ def is_fleet_worktree(cwd: str) -> bool:
         return False
     if ".worktrees" in parts and linked_worktree(p):
         return True
-    if parts[-1].startswith("wt-"):
-        for root in fleet_roots():
-            if p == root or p.startswith(root.rstrip("/") + "/"):
-                return linked_worktree(p)
+    for root in fleet_roots():
+        rp = root.rstrip("/")
+        if not (p == rp or p.startswith(rp + "/")):
+            continue
+        # ⛔ `<$FLEET_ROOT>/wt-<slug>` — the `wt-` component must be the FIRST one under the root,
+        # exactly as `lane-actions.py::_is_fleet_wt_dir` requires ("`<$FLEET_ROOT>/wt-<slug>` (or
+        # below)"). Accepting a `wt-` basename anywhere BELOW a fleet root would roster
+        # `$HOME/fleet/wt-notes`, a shape that file classifies as the OWNER's, so the two
+        # subsystems would disagree about what a lane is.
+        rel = p[len(rp):].strip("/").split("/")
+        if rel and rel[0].startswith("wt-"):
+            return linked_worktree(p)
     return False
 
 
