@@ -135,21 +135,48 @@ GH_LAYER_ENV = ({"GH_REST_REAL_GH": _PIN, "GH_LIMIT_REAL_GH": _PIN}
 os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 
+# The MERGE-RATE READ'S OWN BUDGET, AND WHY IT IS 100 s (#2227). `gh` calls are serialised PER BOX
+# (#2005, deliberate: one shared account, and GitHub's secondary limit is triggered by concurrency).
+# MEASURED 2026-10-20 on three cloud cells: one `gh pr view` cost **63.0 s at 13 lanes** and 0.676 s
+# at 3, while a raw `curl` to api.github.com answered in 0.091 s -- the network and the account are
+# fine, the time is OUR queue. The old 120 s child timeout was above that number, so this read was
+# not the one manufacturing false absences; the missing half was HONESTY, not a bound:
+# `merged_24h=?` + `VERDICT=UNKNOWN (merge-rate read failed)` named no wait and no age, so a read
+# that sat 110 s in the box's own queue was indistinguishable from an instant 403. Kept as a named
+# constant with the measurement above it rather than a literal at the call site.
+MERGE_RATE_TIMEOUT_S = 100
+# Anything above this is reported as SLOW beside the ANSWERED value (same 5 s rationale as
+# objective.py's `SLOW_READ_S`: 0.676 s measured on a quiet box, ~7x that is still ordinary jitter).
+SLOW_READ_S = 5.0
+# Books set by the LAST `merged_24h()` call, so a refusal can name itself. Never a value, never a
+# count -- an AGE and a DURATION only (see the #1869 note in `merged_24h`).
+LAST_RATE_READ = {}
+
+
 def gh(*args):
     """Return parsed JSON, or None on ANY failure. None means UNKNOWN, never empty."""
     try:
-        r = subprocess.run([GH, *args], capture_output=True, text=True, timeout=120,
+        r = subprocess.run([GH, *args], capture_output=True, text=True,
+                           timeout=MERGE_RATE_TIMEOUT_S,
                            env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
-    except Exception:
+    except subprocess.TimeoutExpired:
+        LAST_RATE_READ["cause"] = f"TimeoutExpired after {MERGE_RATE_TIMEOUT_S}s"
+        return None
+    except Exception as e:
+        LAST_RATE_READ["cause"] = f"{type(e).__name__}: {str(e)[:80]}"
         return None
     if r.returncode != 0:
+        LAST_RATE_READ["cause"] = ("rc=%d: %s" % (r.returncode,
+                                                   ((r.stderr or "").strip() or "no stderr")[:120]))
         return None
     out = (r.stdout or "").strip()
     if not out:
+        LAST_RATE_READ["cause"] = "rc=0 with an empty body"
         return None
     try:
         return json.loads(out)
-    except Exception:
+    except Exception as e:
+        LAST_RATE_READ["cause"] = f"unparseable body: {type(e).__name__}"
         return None
 
 
@@ -232,18 +259,37 @@ def count_merge_lanes():
 
 
 def merged_24h():
-    """Merge rate over a real 24h window, cached. beta-progress.json counts 'today'
-    (since UTC midnight), which at 01:00 reads 8 and makes a healthy fleet look
-    stalled. The window that answers 'is the queue draining' is a rolling 24h."""
+    """Merge rate over a real 24h window, or `(value, read)`. See `main()` for the two facts.
+
+    beta-progress.json counts 'today' (since UTC midnight), which at 01:00 reads 8 and makes a
+    healthy fleet look stalled. The window that answers 'is the queue draining' is a rolling 24h.
+
+    ⛔ A REFUSAL MUST BE ABLE TO DESCRIBE ITSELF (#2227). This used to return a bare `None`, which
+    discarded the one thing that separates the two causes of a failed read: a LATE answer (the box
+    serialises `gh`, measured 63.0 s at 13 lanes -- #2005) and an ABSENT one (a refusal) demand
+    opposite responses, and the beat printed `merged_24h=?` for both. So the duration, the cause and
+    the AGE of the last good cached value are recorded in `LAST_RATE_READ` on every path.
+
+    ⛔ AND THE CACHE'S AGE IS NOT THE CACHE'S VALUE (#1869). `LAST_RATE_READ["cache"]` carries the
+    last good rate ONLY so `main()` can print it as `last_good_rate=` WITH its age -- it is never
+    returned as the answer and never reaches `drain_days` or the verdict. A stale number standing
+    where an unread one belongs is the exact fail-open #1869 closed, and this function must not
+    reopen it.
+    """
+    LAST_RATE_READ.clear()
     try:
         with open(CACHE) as fh:
             c = json.load(fh)
+        LAST_RATE_READ["cache"] = c.get("merged_24h")
+        LAST_RATE_READ["cache_age"] = int(max(0, time.time() - float(c.get("ts") or 0)))
         if time.time() - c.get("ts", 0) < TTL:
             return c.get("merged_24h")
     except Exception:
         pass
+    _t0 = time.monotonic()
     rows = gh("pr", "list", "--repo", REPO, "--state", "merged", "--limit", "200",
               "--json", "mergedAt")
+    LAST_RATE_READ["waited_s"] = round(time.monotonic() - _t0, 1)
     if rows is None:
         return None
     cutoff = time.time() - 86400
@@ -274,10 +320,38 @@ def main():
     have, present = count_merge_lanes()
 
     if rate is None:
-        # Unknown rate must NOT be read as zero. Say so; do not invent a verdict.
+        # Unknown rate must NOT be read as zero, and must not be read as a refusal either.
+        # ⛔ SAY WHAT WAS TRIED, HOW LONG IT WAITED, AND HOW OLD THE LAST GOOD SAMPLE IS (#2227).
+        # `merged_24h=?` + "(merge-rate read failed)" is the same sentence for a 100 s serialisation
+        # delay and for an instant 403 -- and the fleet's response should be opposite ones. The wait
+        # is the discriminator, so it is printed, and `last_good_rate=` gives the reader the last
+        # known rate WITH ITS AGE. It is deliberately a SEPARATE token from `merged_24h=`, and the
+        # verdict below is still UNKNOWN: a stale rate may be shown, never adopted (#1869).
+        _w = LAST_RATE_READ.get("waited_s")
+        _wait = f"waited={_w:.1f}s" if isinstance(_w, (int, float)) else "waited=?"
+        _cause = str(LAST_RATE_READ.get("cause") or "no cause recorded")[:110]
+        _age = LAST_RATE_READ.get("cache_age")
+        _stale = "last_good=none"
+        if _age is not None:
+            _cached = LAST_RATE_READ.get("cache")
+            # ⛔ THE TOKEN MUST NOT CONTAIN `merged_24h=`, AND THAT IS NOT COSMETIC (#2227).
+            # Every consumer of this line parses `merged_24h=(\d+)`, and a substring match does not
+            # care about the prefix -- a token spelled `stale_merged_24h=23` IS a match for that
+            # pattern, so a six-hour-old rate would be read back as the CURRENT one by the very
+            # readers this label exists to protect. Name it `last_good_rate=` instead.
+            _stale = (f"last_good={_age}s last_good_rate={_cached}(aged {_age}s, NOT current)"
+                      if _cached is not None else f"last_good={_age}s")
         print("QUEUE: open=%d merged_24h=? have=%d need=? VERDICT=UNKNOWN "
-              "(merge-rate read failed)" % (open_prs, have))
+              "(merge-rate read failed: %s, %s, tried gh pr list --state merged; %s)"
+              % (open_prs, have, _wait, _stale, _cause))
         return 0
+
+    # ⛔ A READ THAT ANSWERED LATE IS REPORTED AS DATA, WITH ITS LATENCY (#2227). The rate is real
+    # -- it is the ANSWER -- and calling it a failure because it took 40 s would be the same
+    # false-absence this file just stopped printing, one step further along.
+    _w = LAST_RATE_READ.get("waited_s")
+    _slow = (" read=SLOW(waited=%.1fs) -- the merge rate is DATA, read late" % _w
+             if isinstance(_w, (int, float)) and _w >= SLOW_READ_S else "")
 
     per_lane = PER_LANE_DAY          # fixed assumption — NOT rate/have (see note above)
     need = max(1, int(math.ceil(open_prs / (per_lane * TARGET_DAYS))))
@@ -293,10 +367,10 @@ def main():
         verdict = "OK"
 
     print("QUEUE: open=%d merged_24h=%d drain_days=%s have=%d need=%d "
-          "VERDICT=%s lanes=[%s]"
+          "VERDICT=%s lanes=[%s]%s"
           % (open_prs, rate,
              ("%.1f" % drain_days) if drain_days != float("inf") else "inf",
-             have, need, verdict, ",".join(present) or "NONE"))
+             have, need, verdict, ",".join(present) or "NONE", _slow))
     return 0
 
 if __name__ == "__main__":
