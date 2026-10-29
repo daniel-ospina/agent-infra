@@ -1157,6 +1157,103 @@ case "$OUT" in *com.eldato.orchestrator-old*) OK_OLD=1 ;; esac
   && ok "start (ambiguous): rendered nothing while refusing" \
   || bad "start (ambiguous): rendered a third job while refusing"
 
+say_case "§12b2 a job whose PROGRAM is the PINNED tree still OWNS \$O (agent-infra#2231)"
+# ⛔ THE PROGRAM MOVED OUT OF $O, SO THE OWNERSHIP SCAN MUST NOT KEY ON "$O"/* ANY MORE. With the pin
+# program, the scan's `case "$prog" in "$O"/*)` skipped the installer's own job, so on this box's measured
+# two-job shape only ONE row survived — and the ambiguity refusal below (the #1761 duplicate-controller
+# protection) never fired, letting `start` adopt the stack job and leave a SECOND controller loaded.
+JC2="$T/jc2"; mk_bin "$JC2/bin" mac; mk_clone "$JC2/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JC2/home/Library/LaunchAgents" "$JC2/O" "$JC2/harness"; mk_render_harness "$JC2/harness"
+# job 1: the CONTROLLER, whose program is the PINNED tree (not under $O), declaring O.
+cat > "$JC2/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC2/harness/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC2/O</string></dict>
+</dict></plist>
+PLIST
+# job 2: the stack supervisor under $O, also declaring this state dir.
+printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$JC2/O/supervisor.sh"
+chmod +x "$JC2/O/supervisor.sh"
+cat > "$JC2/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC2/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC2/O</string></dict>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JC2/home" "$JC2/bin" "$JC2/harness" REPO="$JC2/repo" O="$JC2/O" ENV_FILE="$JC2/home/keys.env"
+[ "$RC" = 1 ] && ok "start: TWO jobs naming one \$O are still REFUSED when one program is the pin (rc=1)" \
+              || bad "start: rc=$RC — the pin-programmed job was invisible to the ownership scan"
+case "$OUT" in
+  *"TWO launchd jobs"*) ok "…the refusal names the conflict (the duplicate-controller protection still fires)" ;;
+  *) bad "start: no ambiguity refusal — $OUT" ;;
+esac
+OK_LOOP=0; OK_STACK=0
+case "$OUT" in *com.eldato.orchestrator-loop*) OK_LOOP=1 ;; esac
+case "$OUT" in *com.eldato.orchestrator-stack*) OK_STACK=1 ;; esac
+[ "$OK_LOOP$OK_STACK" = 11 ] && ok "…and names BOTH jobs, so the operator can pick the stale one" \
+                            || bad "start: does not name both jobs (loop=$OK_LOOP stack=$OK_STACK) — $OUT"
+
+say_case "§12b3 the WATCHDOG declaring \$O is NOT a controller: pin loop + watchdog ADOPTS (#2231 review)"
+# ⛔ THE REAL SHIPPED WATCHDOG, RENDERED FROM THE TRACKED TEMPLATE — not a hand-written lookalike,
+# which is how the gap survived the first review. `templates/launchd/com.eldato.controller-watchdog.plist`
+# declares `O` = `{{HOME}}/orchestrator` — which IS the Mac's `$O` — while its program is
+# `{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/watchdog-loop.sh`, OUTSIDE `$O`. So this
+# fixture's `$O` IS `{{HOME}}/orchestrator`: with any other $O the rendered job would declare a
+# DIFFERENT state dir, the bug would not reproduce, and the arm would pass for the wrong reason.
+# The failure it prevents is a FALSE BLOCK on the one box the pin work exists for: before the fix the
+# scan counted the watchdog as a co-owner, so `start` — hence `harness-up up` — refused with
+# "TWO launchd jobs" on every box where `install-launchd.sh` (ACTIVATION-MATRIX row 8) had installed
+# the documented watchdog.
+JC3="$T/jc3"; mk_bin "$JC3/bin" mac; mk_clone "$JC3/repo" "daniel-ospina/agent-infra"
+JC3O="$JC3/home/orchestrator"
+mkdir -p "$JC3/home/Library/LaunchAgents" "$JC3O" "$JC3/harness"; mk_render_harness "$JC3/harness"
+# job 1: the CONTROLLER — its program is the PINNED tree (outside $O), declaring O.
+cat > "$JC3/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC3/harness/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC3O</string></dict>
+</dict></plist>
+PLIST
+# job 2: the REAL shipped watchdog, rendered from the template that ships — only the three tokens it
+# declares are substituted — so its program lives under AGENT_INFRA_PATH, never under $O.
+sed -e "s|{{HOME}}|$JC3/home|g" -e "s|{{AGENT_INFRA_PATH}}|$HERE/..|g" -e "s|{{PATH}}|/usr/bin:/bin|g" \
+    "$HERE/../templates/launchd/com.eldato.controller-watchdog.plist" \
+    > "$JC3/home/Library/LaunchAgents/com.eldato.controller-watchdog.plist"
+# The fixture only reproduces the bug if the rendered job really does declare THIS $O.
+grep -q "<key>O</key>" "$JC3/home/Library/LaunchAgents/com.eldato.controller-watchdog.plist" \
+  && grep -q "<string>$JC3O</string>" "$JC3/home/Library/LaunchAgents/com.eldato.controller-watchdog.plist" \
+  && ok "watchdog fixture: the rendered job DECLARES this \$O and its program is outside it (the bug's shape)" \
+  || bad "watchdog fixture does not declare $JC3O — the arm could not reproduce the bug it exists for"
+mk_controller "$JC3O"
+JC3_PID="$(start_controller "$JC3O")"; sleep 0.4; printf '%s\n' "$JC3_PID" > "$JC3O/.orch.lock"
+# A launchctl stub that answers BOTH jobs — `list` is what the fleet inventory reads, and an empty
+# answer there is UNREADABLE (not "absent"), which would fail this arm for a reason that has nothing
+# to do with ownership. `print` supplies the pid the adopt path records.
+cat > "$JC3/bin/launchctl" <<LAUNCHCTL
+#!/bin/bash
+printf '%s\n' "\$*" >> "$JC3/bin/lc-called"
+case "\${1:-}" in
+  list) printf '%s\t-\tcom.eldato.orchestrator-loop\n%s\t-\tcom.eldato.controller-watchdog\n' "$JC3_PID" "$JC3_PID" ;;
+  print) printf '\tpid = %s\n' "$JC3_PID" ;;
+  *) exit 0 ;;
+esac
+LAUNCHCTL
+chmod +x "$JC3/bin/launchctl"
+BRINGUP_ARGS=start bringup "$JC3/home" "$JC3/bin" "$JC3/harness" REPO="$JC3/repo" O="$JC3O" ENV_FILE="$JC3/home/keys.env"
+[ "$RC" = 0 ] && ok "start: pin-programmed loop + the WATCHDOG is ONE controller — adopted (rc=0)" \
+              || bad "start: rc=$RC — the watchdog declaring \$O was counted as a second controller (false block) — $OUT"
+case "$OUT" in
+  *"TWO launchd jobs"*) bad "start: refused with TWO launchd jobs — a watchdog is not a second controller — $OUT" ;;
+  *) ok "…and did not claim two jobs own \$O" ;;
+esac
+kill -9 "$JC3_PID" 2>/dev/null
+
 say_case "§12c adopt an INSTALLED-but-not-loaded job: load ITS plist, never \$LABEL"
 JC="$T/jc"; mk_bin "$JC/bin" mac; mk_launchctl_absent "$JC/bin"; mk_clone "$JC/repo" "daniel-ospina/agent-infra"
 mkdir -p "$JC/home/Library/LaunchAgents" "$JC/O" "$JC/harness"; mk_render_harness "$JC/harness"
