@@ -233,7 +233,7 @@ _lord="$(grep -n '^[[:space:]]*done < "\$ORDER_FILE"' "$LOOP" | head -1 | cut -d
 _lrep="$(grep -n 'AN UNMET FLOOR LOGS AND DEGRADES' "$LOOP" | head -1 | cut -d: -f1)"
 case "$_lord$_lrep" in ''|*[!0-9]*) P6L=1 ;; *) P6L=0 ;; esac
 ck "P6 (setup) the order read and the reporting block are locatable (order=$_lord report=$_lrep)" $P6L
-_between="$(awk -v s="${_lord:-1}" -v e="${_lrep:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
+_between="$(awk -v s="${_lord:-1}" -v e="${_lrep:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit([[:space:];]|$)/) {print NR": "$0}' "$LOOP")"
 [ -z "$_between" ]
 ck "P6 [RED→GREEN] nothing between the order read and the report can truncate the batch, reset K, exit, or make dispatch depend on PB (got '${_between:-'<none>'}')" $?
 # ⛔ AND THE BATCH IS DISPATCHED ON `.batch` ALONE (review cycle 8, P1). The window above stops at the
@@ -265,9 +265,55 @@ ck "P6 (setup) the dispatch body's closing fi is locatable (disp=$_disp end=$_de
 case "$_repend" in ''|*[!0-9]*) P6W=1 ;; *) P6W=$(( ${_dend:-0} - _repend )) ;; esac
 [ "${P6W:-0}" -gt 1 ]
 ck "P6 (setup) the report→dispatch window is non-empty, so the scan below is not vacuous (width=${P6W:-?})" $?
-_body="$(awk -v s="${_repend:-1}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
+# ⛔ THE WINDOW IS SPLIT AT THE DISPATCH CALL (#2333 cycle 6 review, P1). Its stated purpose (cycle 15)
+# is to catch "a gate spliced in before the dispatch condition" and "a floor gate as the body's first
+# statement" — BOTH BEFORE the call. Scanning the whole body with one uniform pattern set also made the
+# window reject a POST-CALL state reset: the CI-queue deferral's `K=0; : > "$O/.batch"` is a fact about
+# a call that already returned 3, not a mutation of what the call is about to do. Splitting is not a
+# loosening — the pre-call half keeps the FULL pattern set (batch truncation, K reset, exit, floor
+# terms), the post-call half keeps the floor terms AND `exit` (measured, #2333 review: dropping `exit`
+# here was a real loosening — an `exit 0` inserted between the call and the body's closing `fi` (e.g.
+# right after the call, before `heartbeat` and the cycle record) left this suite 213/0 GREEN where the
+# pre-split window red'd it; the three `exit` tokens in that region today are all in comments, so
+# re-adding the term costs nothing and re-arms the arm), and it gains a STRICTER rule: a reset there is
+# admissible only inside the exit-code contract's arm, which is asserted to EXIST (deleting the arm
+# leaves `dispatch-merge.sh`'s exit 3 unhandled, and that now reds instead of passing silently).
+_dcall="$(grep -n '^[[:space:]]*bash "\$O/dispatch-merge.sh"' "$LOOP" | head -1 | cut -d: -f1)"
+case "$_dcall" in ''|*[!0-9]*) P6C=1 ;; *) P6C=0 ;; esac
+ck "P6 (setup) the dispatch CALL is locatable (call=${_dcall:-?})" $P6C
+_body="$(awk -v s="${_repend:-1}" -v e="${_dcall:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit([[:space:];]|$)/ || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
 [ -z "$_body" ]
-ck "P6 [RED→GREEN] from the end of the report through the dispatch BODY nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
+ck "P6 [RED→GREEN] from the end of the report to the DISPATCH CALL nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
+# ⛔ `exit` IS MATCHED IN EVERY SPELLING — `exit 0`, `exit "$rc"`, a BARE `exit` and `exit;` (#2333
+# review, P2). The restored term first read `/^[[:space:]]*exit /`, one space required, so a bare `exit`
+# — which bash accepts and which exits with the LAST status, i.e. "stop the controller right after
+# dispatching" — still read 213/0 GREEN while this arm's own label said it was caught. Both halves use
+# the widened form. The three `exit` TOKENS in this window today are all inside comments, and the
+# anchored form cannot match a `#` line, so the widening costs no false red.
+_post="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /FLOOR_N/ || /^[[:space:]]*exit([[:space:];]|$)/) {print NR": "$0}' "$LOOP")"
+[ -z "$_post" ]
+ck "P6 [RED→GREEN] …and AFTER the call nothing refreshes the product batch, reads the floor, or EXITS (got '${_post:-'<none>'}')" $?
+_guard="$(grep -nF 'if [ "$_dmrc" = "3" ]; then' "$LOOP" | head -1 | cut -d: -f1)"
+_resets="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/) {print NR}' "$LOOP")"
+# ⛔ MEMBERSHIP IN THE ARM, NOT ORDER AFTER ITS OPENING LINE (#2333 review, P2). Requiring only
+# `_rl > _guard` let an UNCONDITIONAL `K=0; : > "$O/.batch"` inserted just PAST the arm's `fi` pass
+# this check — it truncates every batch (and reports dispatched=0 for batches that really dispatched)
+# while the label below claims the reset "sits ONLY inside the rc=3 deferral arm". The arm ENDS at the
+# next line whose indentation equals the guard's and which is exactly `fi`; a reset must fall inside
+# that window.
+_pad="$(sed -n "${_guard:-0}p" "$LOOP" | sed -e 's/[^ ].*//')"
+_armend="$(awk -v g="${_guard:-0}" -v pad="$_pad" 'NR>g && $0 == pad "fi" {print NR; exit}' "$LOOP")"
+_unguarded=""
+for _rl in ${_resets:-}; do
+  case "${_guard:-}" in ''|*[!0-9]*) _unguarded="$_unguarded $_rl(no-guard)"; continue ;; esac
+  case "${_armend:-}" in ''|*[!0-9]*) _unguarded="$_unguarded $_rl(no-arm-end)"; continue ;; esac
+  { [ "$_rl" -gt "$_guard" ] && [ "$_rl" -lt "$_armend" ]; } \
+    || _unguarded="$_unguarded $_rl(outside-arm@$_guard..$_armend)"
+done
+# A post-call reset is admissible, but the arm that carries it is not optional: `dispatch-merge.sh`
+# exits 3 on a deferral, and an unhandled 3 is a batch the controller counts as dispatched.
+[ -n "${_guard:-}" ] && [ -n "${_armend:-}" ] && [ -n "${_resets:-}" ] && [ -z "$_unguarded" ]
+ck "P6 [RED→GREEN] the post-call batch reset exists and sits ONLY inside the rc=3 deferral arm (guard=${_guard:-?} arm-end=${_armend:-?} resets=[${_resets:-none}] unguarded=[${_unguarded:-none}])" $?
 grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}"' "$LOOP"
 ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob), not from a literal" $?
 grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
