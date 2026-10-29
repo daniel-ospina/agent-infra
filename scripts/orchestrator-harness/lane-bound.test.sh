@@ -279,6 +279,25 @@ ck "(i0) the BACKSTOP default (${WALL_DEF:-?}s) sits ABOVE the allowance (${IDLE
 SEAM="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$GATE" | head -1)"
 [ -n "${SEAM:-}" ] && [ "$SEAM" -gt "${IDLE_DEF:-0}" ]; rc=$?
 ck "(i0) the shipped lane BACKSTOP (LANE_BACKSTOP_S=${SEAM:-?}s) is above the allowance, so a wedged lane dies by PROGRESS, never by the wall" $rc
+# ⛔ AND THE TWO BACKSTOP LITERALS ARE THE SAME ONE (agent-infra#2999 review, P2-4). `lane-bound.sh`
+# resolves its own default (`num_or "${LANE_BOUND_WALL_S:-}" 7200`) while `spawn-gate.sh` declares the
+# seam (`LANE_BACKSTOP_S`) — two copies of one decision, and the same block pins the derived forms
+# (`ai-drainer`, `chain-merge`, `pr-doctor`) to the seam. Pinned here rather than deduped through
+# `${LANE_BACKSTOP_S:-7200}` so the helper stays standalone (it is also run with `run`, by launchers
+# that never source spawn-gate.sh): the pair cannot drift unnoticed either way.
+[ "${WALL_DEF:-x}" = "${SEAM:-y}" ]; rc=$?
+ck "(i0) lane-bound's BACKSTOP default (${WALL_DEF:-?}s) IS the harness seam (LANE_BACKSTOP_S=${SEAM:-?}s) — one number, two files, no drift" $rc
+# ⛔ THE CONTROLLER'S STALE-WORKER REAPER MUST NOT PRE-EMPT THAT SAME ALLOWANCE (agent-infra#2999
+# review, P1). `reap_stale_workers` closes a worker on LOG SILENCE alone — it reads no CPU subtree and
+# no lane-bound verdict — so at its old 40 min (2400 s) it was the SAME flat cap #2888 retired from the
+# lane itself, one layer up: a fixer working silently past 40 min was closed with no `[lane-bound]
+# VERDICT`, no `walltime.tsv` row and no cap snapshot (the censoring MOVED, not removed). The floor is
+# enforced at runtime too (`_stale_floor_raise`), but this pins the shipped pair so a future edit to
+# either number reddens here instead of at 3 a.m.
+LOOP="$HERE/orch-loop.sh"
+STALE_DEF="$(sed -n 's/^STALE_MIN="${STALE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$LOOP" | head -1)"
+[ -n "${STALE_DEF:-}" ] && [ $(( STALE_DEF * 60 )) -gt "${IDLE_DEF:-0}" ]; rc=$?
+ck "(i0) the reaper's STALE_MIN (${STALE_DEF:-?} min = $(( ${STALE_DEF:-0} * 60 ))s) is ABOVE the progress allowance (${IDLE_DEF:-?}s), so a working-but-quiet lane is not closed by the controller" $rc
 PRD="$HERE/../pr-doctor.py"
 PRD_DEF="$(sed -n 's/^DEFAULT_SPAWN_BACKSTOP_S = \([0-9][0-9]*\).*/\1/p' "$PRD" | head -1)"
 [ -n "${PRD_DEF:-}" ] && [ "$PRD_DEF" = "$SEAM" ]; rc=$?
@@ -286,6 +305,16 @@ ck "(i0) pr-doctor's backstop default (${PRD_DEF:-?}s) equals the harness seam (
 REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
 [ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
 ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc
+# ⛔ AND THE TWO REAP WINDOWS MUST NOT OVERLAP (agent-infra#2999 review, F4). `LIVE_MIN` is the
+# capacity census's "this lane's log moved, so it is live" window; `LANE_IDLE_MIN` is the reap
+# candidate gate. With 125 > 120 a lane idle 121-125 min was counted LIVE for capacity AND was a reap
+# CANDIDATE — two shipped instruments disagreeing about the same lane in the same band. The fix moved
+# the idle window to 180; this pins the ordering so neither number can be edited back into overlap.
+REAP_IDLE="$(sed -n 's/^LANE_IDLE_MIN="${LANE_REAP_IDLE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
+[ -n "${REAP_IDLE:-}" ] && [ "${REAP_LIVE:-0}" -lt "$REAP_IDLE" ]; rc=$?
+ck "(i0) the reaper's IDLE window (${REAP_IDLE:-?} min) is ABOVE its LIVE window (${REAP_LIVE:-?} min), so no lane is live-for-capacity and a reap candidate at once" $rc
+[ -n "${REAP_IDLE:-}" ] && [ $(( REAP_IDLE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
+ck "(i0) …and ABOVE the BACKSTOP (${SEAM:-?}s), so the reaper cannot call a lane finished while its own backstop still lets it run" $rc
 
 # ⛔ THE TWO CONSUMERS THAT OUTLIVE THE LANE, AND THEREFORE READ ITS CLOCK THEMSELVES (agent-infra#2888).
 # Neither sources spawn-gate.sh, so each carries the seam as a literal fallback — which is exactly the
