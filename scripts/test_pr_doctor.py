@@ -2570,9 +2570,10 @@ def test_a_MEMORY_refusal_VOIDS_the_row(tmp_path, monkeypatch):
     pass -- a 45-min cooldown and a 90-min budget slot each time, for a worker that never started.
     Both halves again: the code must be in GATE_REFUSALS and the marker must be the gate's own line.
 
-    ⛔ 81, NOT 73: 73 is the FORK code, and sharing it made every caller mislabel one of the two --
-    the exact collision main's `spawn-gate.sh` comment records (`81 was claimed FIRST by
-    AGENT_MEM_REFUSED (#2387)`).
+    ⛔ 81, NOT 73: the memory pair was renumbered when this branch met main, because 73 is
+    `AGENT_FORK_REFUSED` there and 72 is `REPO_TARGET_REFUSED` -- so this test pins the number the
+    gate actually returns, not the one the first draft chose (main's `spawn-gate.sh` comment records
+    the reservation: "81 was claimed FIRST by AGENT_MEM_REFUSED (#2387)").
     """
     assert 81 in pr.GATE_REFUSALS
     d = tmp_path / "orch"
@@ -2594,6 +2595,34 @@ def test_a_MEMORY_refusal_VOIDS_the_row(tmp_path, monkeypatch):
     assert pr.refusal_axis(81) == "memory"
     assert pr.GATE_NEXT_TOKEN["memory"] != "wait"
 
+
+
+def test_a_FORK_and_a_CAPABILITY_refusal_VOID_the_row_too(tmp_path, monkeypatch):
+    """The other two codes that arrived after GATE_REFUSALS did (agent-infra#2293, #2935).
+
+    ⛔ A CODE WITHOUT ITS MARKER IS INERT, and that is the shape this file keeps producing: the
+    predicate demands BOTH, so a code added to the tuple without the marker leaves the row booked
+    `launched` -- the accounting failure the 74/81 arms exist to prevent, one gate over. Asserted as
+    a loop over both pairs so a third one cannot be added half-way either.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    for code, marker in ((73, "[fork-gate] REFUSED"),
+                         (71, "[capability-gate] REFUSED")):
+        assert code in pr.GATE_REFUSALS, code
+        assert marker in pr.REFUSAL_MARKERS, marker
+        (d / "bg" / "prd-9.rc").write_text("%d\n" % code)
+        (d / "bg" / "prd-9.log").write_text(
+            "%s bg prd-9: no agent was started, nothing was consumed\n" % marker)
+        assert pr.gate_refused("prd-9", code) is True, (code, marker)
+        assert pr.void_refused_rows(st) == ["9"], (code, marker)
+        # …and the cooldown-KEEPING direction for each: a `pi` that exits it itself is not a refusal.
+        (d / "bg" / "prd-9.log").write_text(
+            "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=%d\n" % code)
+        assert pr.gate_refused("prd-9", code) is False, code
 
 
 def test_the_refusal_markers_are_the_gates_own_lines():
