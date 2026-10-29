@@ -6,7 +6,7 @@
 
 1. Run `gh issue view <number> --comments` and check for either `<!-- issue-scoping:` or `<!-- issue-planning:` in the output using: `grep -E '<!-- issue-(scoping|planning):'`
    <!-- backwards-compat: also accepts issue-planning:* signatures from pre-rename planned issues -->
-2. If the signature is **absent**: stop and prompt the user —
+2. If the signature is **absent**: **`task-workflow-standard`:** the `<!-- issue-scoping: merged scope+plan -->` comment **is this stage's output**, so absence means *not posted yet* — draft the plan and post it per `task-workflow-standard` §2b. Never send the lane to `issue-scoping`, which that pipeline does not dispatch (agent-infra#2861). For the epic/project pipelines, stop and prompt the user —
    > "This issue hasn't been processed by `issue-scoping` yet. Run the `issue-scoping` skill first to define requirements, priorities, and scope. Then return here for implementation planning."
 3. If the signature is **present**: proceed. The requirements, priorities, and needs are already captured. This skill focuses on **design decisions and implementation steps** not already covered there.
 
