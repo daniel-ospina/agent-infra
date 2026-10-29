@@ -3744,7 +3744,7 @@ if true; then
   mutate_and_expect_fail Q2  's/^      queued\|in_place\|merged\)$/      queued|in_place|merged|waiting)/m'
   # Q3: the absent-queue verdict must be NAMED. Silencing it makes the direct path
   # indistinguishable from the queue having worked — 17h-C reddens.
-  mutate_and_expect_fail Q3  's/^    1\) say "atomic-land: QUEUE-NOT-ARMED/    1) : "atomic-land: QUEUE-NOT-ARMED/m'
+  mutate_and_expect_fail Q3  's/^    1\) log_line "atomic-land: QUEUE-NOT-ARMED/    1) : "atomic-land: QUEUE-NOT-ARMED/m'
   # Q4: a pause in the DECODED state must stop. Neutralising that arm (the `)` is kept
   # so the mutant still PARSES — a corrupt mutant "reddens" for the wrong reason and
   # reports a covered class that is not covered) lets 17h-J's state-level pause proceed

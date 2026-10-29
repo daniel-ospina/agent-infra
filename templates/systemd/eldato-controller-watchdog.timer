@@ -1,0 +1,23 @@
+[Unit]
+# Every 5 minutes, the same cadence as the macOS LaunchAgent (com.eldato.controller-watchdog,
+# StartInterval 300) — one watchdog policy on both platforms.
+#
+# ⛔ 5 MINUTES, NOT 30 SECONDS. The datum the pass reads (`$O/heartbeat`) only moves once per controller
+# cycle (240 s), so a tighter timer re-reads the same instant and can only add noise. At this cadence a
+# wedge is detected within ~13-18 minutes of starting, which is bounded by the supervisor's own 780 s
+# staleness limit plus one pass.
+#
+# ⛔ Persistent=false. A pass missed while the box was down is not work to replay: on the next tick the
+# heartbeat's age is already the answer, and replaying a pass from before a reboot would date the
+# controller from a state that no longer exists.
+Description=eldato controller watchdog every 5 minutes
+
+[Timer]
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=45
+Persistent=false
+Unit=eldato-controller-watchdog.service
+
+[Install]
+WantedBy=timers.target
