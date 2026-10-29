@@ -414,11 +414,15 @@ remote is the **longest configured remote name** prefixing the ref, not the firs
 segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
 refname or different sha leaves the verdict where it was — `remote-only-ref`, PRESERVE — and a
 TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one timeout,
-not one per candidate. The row is `remote-holds:<remote>/<branch>`, and — unlike
-`remote-only-ref` — it **blocks the end-of-pass prune**: its evidence is one network read,
-not a local ref, so it sits in the same class as `detached-unreachable` (a record PRESENT at
-snapshot time and GONE at prune time carries no `prunable` flag, and the path-filterless
-prune would sweep its admin `HEAD`, the commit's last durable handle).
+not one per candidate. The row is `remote-holds:<remote>/<branch>`, and — like
+`remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
+only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref),
+so the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that
+becomes prunable mid-pass, after a snapshot that saw it present) is closed for **every** reason by the
+reason-independent pre-prune re-read. Blocking on the reason instead would disable the `prunable`
+reclaim path for as long as ONE preserve row lives — `no-pr`, `too-recent` and `too-young` rows carry
+`refs=remote-holds:` too, for up to the whole aged-days floor — which is the F7 defect one reason
+class over. A26c pins both arms (the `reason=` REMOVE row and the `refs=` PRESERVE row).
 
 A lane **scratch** checkout — a directory whose basename matches
 `REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
@@ -610,7 +614,7 @@ number in it was true. So the pass must also say what its numbers MEAN:
 |---|---|
 | `dry-run` | the pass was not armed — nothing may be removed, and that is the correct answer |
 | `reclaimed` | armed, and at least one checkout was removed |
-| `idle` | armed, removed nothing, and the **reason** is benign: free space is at or above the floor, or too few records were classified for the ratio to mean anything |
+| `idle` | armed, removed nothing, and the **reason** is benign: free space is at or above the floor, or fewer than `REAP_WT_INEFFECTIVE_MIN_EXAMINED` records were **examined** (not *classified* — a budget-starved pass defers the rest, and deciding two of fifty-two while removing none on a full box is the incident, not an idle pass) |
 | `reap-ineffective` | armed, examined `>= REAP_WT_INEFFECTIVE_MIN_EXAMINED` (default 10) records, removed NONE, and free space is UNDER `REAP_WT_DISK_FLOOR_MB` (default 4096 MiB) — a reaper that cannot reclaim on a full box |
 | `unmeasured` | the condition depended on free space and `df` could not answer — **never** read as `idle` |
 
@@ -618,13 +622,21 @@ number in it was true. So the pass must also say what its numbers MEAN:
 (tmp + `mv`), carrying `verdict=`, `epoch=`, `repo=`, `mode=`, the counters, `free_mb=`, `floor_mb=`,
 `reasons=` and a one-line `remedy=`. A **summary line is not a verdict**: the line is gone when the
 next pass prints, and the incident is only visible afterwards if something durably said so. Any pass
-that does NOT hold the condition REMOVES the file, so the record's presence means *the condition holds
-now* — not *it once held*. `REAP_WT_FREE_MB` (a witness) and `DF_BIN` are the test seams; the measured
-paths are `df -Pm <repo>` under `REAP_WT_DF_TIMEOUT`.
+that **evaluated** the condition and found it not held REMOVES the file — so the record's presence
+means *the condition holds now*, not *it once held*; `unmeasured` deletes it too (a disk we could not
+read is not a disk we proved healthy). A fail-closed abort evaluated nothing, so it neither writes nor
+deletes the file, and its footer prints `VERDICT=?` — never an empty field. ⛔ **A record that could
+not be WRITTEN says so** (log `record=NOT-WRITTEN`, and the pass states that the verdict exists only
+on its own line): this branch fires when free space is under the floor, i.e. exactly when `ENOSPC` is
+live, so a missing file is never evidence that the condition cleared. `REAP_WT_FREE_MB` (a witness)
+and `DF_BIN` are the test seams; the measured paths are `df -Pm <repo>` under `REAP_WT_DF_TIMEOUT`.
 
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
-`classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=` and
-`pr_merged=`. `examined = classified + deferred` and `classified = remove + preserved` are the two
+`classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=`,
+`pr_merged=` and `delegate_verdict_worktree=` (the delegate's own `verdict=`, with the same
+`?`/`not-run`/`mixed` polarity; it is printed by `--print-status` and is deliberately SEPARATE from
+`verdict_worktree=`, which stays the exit-code reading — an ineffective reap exits 0 by design, so
+without this field the fleet's record said `worktree=ok` for it). `examined = classified + deferred` and `classified = remove + preserved` are the two
 identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict
 was already `remove`, so folding it into `deferred` would deflate `preserved` and make the line
 contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote

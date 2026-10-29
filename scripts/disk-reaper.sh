@@ -435,6 +435,11 @@ print_status() {
     log_line "verdict_uv=$(status_field verdict_uv)"
     log_line "verdict_venv=$(status_field verdict_venv)"
     log_line "verdict_worktree=$(status_field verdict_worktree)"
+    # ⛔ AND THE DELEGATE'S OWN VERDICT (#3041), on the same rule: `verdict_worktree=` above is the
+    # EXIT-CODE reading, and an ineffective reap exits 0 by design — so a reader that saw only that
+    # field reported `worktree=ok` for a pass that reclaimed nothing on a full box. Written every pass,
+    # so it must be printable, or it does not exist (the rule two paragraphs down).
+    log_line "delegate_verdict_worktree=$(status_field delegate_verdict_worktree)"
     # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST. `skipped_worktree=` is the whole point of
     # #2443 (WHICH repo was skipped and WHY); leaving it out of `--print-status` would repeat the
     # `classes=`/`repos=` defect this block already documents — written every pass, read by nobody.
@@ -1617,7 +1622,7 @@ reap_worktree() {
     # The delegate's own tally, summed across repos. `reasons` is joined; a proof value that DIFFERS
     # between repos is reported as `mixed` rather than letting the last repo answer for all of them.
     local sum_classified=0 sum_preserved=0 sum_remove=0 sum_reasons="" sum_removed=0 sum_failed=0
-    local sum_deferred=0 sum_late=0 proof="" prm="" f_classified f_preserved f_remove f_reasons _sum _n _v
+    local sum_deferred=0 sum_late=0 proof="" prm="" dverdict="" f_classified f_preserved f_remove f_reasons _sum _n _v
     # have_tally separates the two UNANSWERABLE cases from a measured zero: the class never ran
     # (`not-run`), or it ran and its delegate printed no SUMMARY (`?`). Both are recorded, neither is
     # reported as 0 — a `classified=0` beside `verdict=not-run` is a self-contradicting record, and it
@@ -1725,6 +1730,15 @@ reap_worktree() {
             if [ -n "$_v" ]; then if [ -z "$proof" ]; then proof="$_v"; elif [ "$proof" != "$_v" ]; then proof="mixed"; fi; fi
             _v="$(kv_field "$_sum" pr_merged)"
             if [ -n "$_v" ]; then if [ -z "$prm" ]; then prm="$_v"; elif [ "$prm" != "$_v" ]; then prm="mixed"; fi; fi
+            # ⛔ THE DELEGATE'S OWN VERDICT (#3041). `verdict_worktree=` above is derived from the
+            # delegate's EXIT CODE, and an ineffective reap exits 0 BY DESIGN (it is a diagnosis, not a
+            # failure), so the fleet's status file said `verdict_worktree=ok` for a pass that reclaimed
+            # nothing on a box at 0 bytes free. This field carries the delegate's ANSWER alongside it;
+            # it does not change the class verdict or any exit code, so nothing that reads those moves.
+            # Same `?`/`not-run`/`mixed` polarity as `main_proof=`/`pr_merged=`: accumulated over the
+            # repos that ANSWERED, `mixed` when two of them disagree.
+            _v="$(kv_field "$_sum" verdict)"
+            if [ -n "$_v" ]; then if [ -z "$dverdict" ]; then dverdict="$_v"; elif [ "$dverdict" != "$_v" ]; then dverdict="mixed"; fi; fi
         fi
         log_line "$out"
         rows="${rows}${rows:+$'\n'}$out"
@@ -1817,7 +1831,7 @@ reap_worktree() {
     # — which routes them through `_tally_rec`/`HAVE_WT_TALLY` — printed `main_proof=?`: two surfaces of
     # ONE pass contradicting each other, which is the defect this arm exists to remove, on the fields
     # that answer "how was the merge proved". Decided ONCE here so both surfaces read the same value.
-    [ "$have_tally" = 1 ] || { proof="?"; prm="?"; }
+    [ "$have_tally" = 1 ] || { proof="?"; prm="?"; dverdict="?"; }
     # Fold `reason count` rows into one histogram, descending by count — the delegate's own shape.
     sum_reasons="$(printf '%s\n' "$REASON_ROWS" | awk 'NF==2 { c[$1] += $2 }
         END { for (k in c) printf "%d\t%s\n", c[k], k }' | sort -rn -k1,1 \
@@ -1941,6 +1955,7 @@ reap_worktree() {
     # only here repaired the record while the class line still said `?`).
     CLASSIFIED_WT="$sum_classified"; PRESERVED_WT="$sum_preserved"; REASONS_WT="$sum_reasons"
     PROOF_WT="$proof"; PRM_WT="$prm"; HAVE_WT_TALLY="$have_tally"
+    DELEGATE_VERDICT_WT="$dverdict"
     DEFERRED_REMOVE_WT="$sum_deferred_remove"
     return 0
 }
@@ -2263,6 +2278,10 @@ record_body() {
     printf 'deferred_remove_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${DEFERRED_REMOVE_WT:-}")"
     printf 'main_proof=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PROOF_WT:-}")"
     printf 'pr_merged=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PRM_WT:-}")"
+    # The delegate's OWN answer (#3041): `verdict_worktree=` is the exit-code reading and stays what it
+    # was; this is what the reaper said about ITSELF, so "reclaimed nothing on a full box" is visible in
+    # the status file instead of only inside the echoed delegate text.
+    printf 'delegate_verdict_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${DELEGATE_VERDICT_WT:-}")"
     printf 'candidates_duplicate_install=%s\n' "$(_class_rec "${VERDICT_DUP:-not-run}" "${WANT_DUP:-0}" "${HAVE_DUP_CAND:-0}" "$CAND_DUP")"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"
     printf 'verdict_venv=%s\n' "$VERDICT_VENV"

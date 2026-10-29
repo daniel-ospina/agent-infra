@@ -221,7 +221,15 @@
 #   * `git ls-remote` (#3041) is the ONE probe that can cross a network: it is
 #     watchdosed by REAP_WT_GIT_TIMEOUT, runs at most once per candidate, and a
 #     TRANSPORT failure is remembered per remote for the rest of the pass (a dead
-#     remote must not spend the whole budget on N candidates)
+#     remote must not spend the whole budget on N candidates). ⛔ IT IS CHARGED TO
+#     THE BUDGET, so it is NOT free: a remote that answers slowly spends up to one
+#     timeout per candidate that reaches it, which can DEFER the rest of the
+#     listing — and a deferred pass removed nothing, which is exactly what the
+#     pass verdict judges (`reap-ineffective` counts EXAMINED records, not decided
+#     ones, so a deferral-heavy pass on a full box cannot read as `idle`). The
+#     population that reaches the probe is small by construction (only records
+#     whose sole holder is a remote-tracking ref), and the dead-remote cache
+#     collapses a transport failure to ONE timeout.
 #   * no `find`, `rg -r`, `du`, `lsof +D`, or recursive glob is executed
 #   * the removal path re-runs the clean gate TWICE (remove_one): both runs are
 #     `status` probes bounded by REAP_WT_STATUS_TIMEOUT, so the TOCTOU re-check
@@ -285,15 +293,18 @@
 #   `git ls-remote --heads` says the REMOTE still points its own `refs/heads/<branch>`
 #   at this HEAD. It is a REMOVE reason, so it appears on a removal row (`reason=`)
 #   and, as `refs=remote-holds:…`, on the preserve rows the age floor still keeps.
-#   ⚠️ IT BLOCKS THE END-OF-PASS PRUNE — the F17 class — and the reason is NOT
-#   tidiness: its survival evidence is ONE network read taken at classification,
-#   where every other survival proof is a local REF that the prune cannot revoke.
-#   A path-filterless `git worktree prune` must therefore never be the thing that
-#   deregisters a record this pass relied on that read for (a record PRESENT at
-#   snapshot time and GONE at prune time carries no `prunable` flag, so only the
-#   reason can stop it). `remote-only-ref` does NOT block (F7/A23): there the
-#   commit is held by a REF, and blocking made one long-lived row disable the
-#   whole `prunable` class on every later pass. The distinction is the point.
+#   ⛔ IT DOES **NOT** BLOCK THE END-OF-PASS PRUNE, exactly like `remote-only-ref`
+#   (F7/A23) — and the distinction is the point, so it is pinned from both sides
+#   (A26c). A `remote-holds` row is reached ONLY when `commits_survive` found the
+#   commit held by `refs/remotes/<r>/<b>` (the probe runs on that very ref), so the
+#   admin HEAD is NOT the commit's last durable handle — the tracking ref still
+#   holds it and the remote is a second handle. The F17 window (a record that
+#   becomes prunable mid-pass, after a snapshot that saw it present) is closed for
+#   EVERY reason by the reason-independent pre-prune RE-READ, not by a reason list;
+#   blocking on the reason instead would disable the whole `prunable` reclaim path
+#   for as long as one PRESERVE row lives — `no-pr`/`too-recent`/`too-young` rows
+#   carry `refs=remote-holds:` too, and they live up to the aged-days floor. That is
+#   precisely the F7 defect one reason class over.
 #   unparseable-path       the record could not be framed safely (tab/newline)
 #   live-process/live-cwd  a process holds the path
 #   dirty                  tracked/unparseable changes
@@ -315,10 +326,15 @@
 # worker for ~13 hours. An armed pass that decides many records, removes NONE,
 # and sits under a disk-pressure floor now RECORDS a verdict — the file
 # $STATE_DIR/reap-ineffective, plus a `verdict=` field on the SUMMARY — instead of
-# printing a tally the reader has to interpret. The file is written on every pass
-# that holds the condition and REMOVED otherwise, because a verdict that outlives
-# its condition is a stale flag that reads as live. Exit codes are unchanged: the
-# condition is a diagnosis, not a failure of the pass.
+# printing a tally the reader has to interpret. ⛔ ONLY A PASS THAT REACHED THE
+# VERDICT IS ENTITLED TO CHANGE THE FILE: a pass that held the condition writes it,
+# and a pass that EVALUATED the condition and did not hold it REMOVES it (as does
+# `unmeasured` — a disk we could not read is not a disk we proved healthy, and
+# presence must keep meaning "the condition holds now"). A FAIL-CLOSED ABORT (an
+# unusable `ps`, a dead `gh`, an unwritable log) evaluated nothing, so it writes
+# NOTHING and deletes NOTHING — and its footer prints `VERDICT=?`, never an empty
+# field, because an absent value is not a verdict either. Exit codes are unchanged:
+# the condition is a diagnosis, not a failure of the pass.
 #
 # OPERATOR NOTE — this script's git target is resolved at runtime, so the
 # main-worktree-guard extension's static script-content walker (#1484) blocks
@@ -519,15 +535,16 @@ START_EPOCH=0
 # operator asked us to leave alone). Any such record blocks the prune.
 PRUNE_BLOCKED=0
 PRUNE_WANTED=0
-# ── the #3041 remote-holds probe, and its per-pass caches ───────────────────────────────────
-# REMOTES_LIST/REMOTES_LOADED: `git remote` once per pass (lazily — a pass with no
-# refs/remotes/* holder never pays for it). REMOTE_DEAD: remotes whose `ls-remote` failed at the
-# TRANSPORT level this pass, so N candidates against a dead remote cost one timeout, not N.
-# Both are space-separated strings, not arrays: bash 3.2 (macOS) has no associative arrays and the
-# fleet runs this file on both platforms.
-REMOTES_LIST=""
-REMOTES_LOADED=0
-REMOTE_DEAD=" "
+# ── the #3041 remote-holds probe ──────────────────────────────────────────────────────────
+# There is NO `git remote` cache: `remote_holds_probe` runs ONE bounded `git remote` per
+# CANDIDATE (not per pass), because it must resolve the LONGEST configured remote name prefixing
+# `refs/remotes/<remote>/<branch>` — splitting at the first path segment probes the wrong remote
+# when a remote name itself contains a slash. Both calls are watchdosed by
+# `REAP_WT_GIT_TIMEOUT`, and `git remote` is local (no network). The expensive call is the
+# `ls-remote`; the TRANSPORT-failure cache that makes N candidates cost ONE timeout lives in a
+# FILE (`REMOTE_DEAD_FILE`), not in a variable — see the ⛔ note on `remote_holds_probe`.
+# A variable would not survive the call: the probe runs inside a command substitution, so an
+# in-process cache would be a cache that never hits while looking exactly like one.
 # The pass's own verdict (#3041): one of dry-run|reclaimed|idle|reap-ineffective|unmeasured.
 PASS_VERDICT=""
 FREE_MB=""
@@ -572,10 +589,11 @@ remove/preserved/deferred/removed/reasons/main_proof/pr_merged/verdict).
 \`verdict=\` is the PASS's own answer, not a counter: \`reclaimed\` (it removed
 something), \`idle\` (nothing to do), \`dry-run\`, \`unmeasured\` (it decided work
 and removed none, but free space could not be read), or \`reap-ineffective\` —
-decided >= REAP_WT_INEFFECTIVE_MIN_EXAMINED records, removed NONE, and free
+EXAMINED >= REAP_WT_INEFFECTIVE_MIN_EXAMINED records, removed NONE, and free
 space is below REAP_WT_DISK_FLOOR_MB. The last one is also RECORDED in
-\$STATE_DIR/reap-ineffective, and the file is removed by any pass that does
-not hold the condition.
+\$STATE_DIR/reap-ineffective; any pass that EVALUATES the condition removes that
+file when it does not hold, and a pass that never reached the verdict (a
+fail-closed abort) neither writes nor deletes it.
 
 `git worktree remove` deletes the CHECKOUT, never the branch — named-branch
 worktrees lose no commits, and this script never runs \`git branch -D\`.
@@ -2276,7 +2294,7 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE VERDICT=$PASS_VERDICT FREE_MB=${FREE_MB:-?}"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE VERDICT=${PASS_VERDICT:-?} FREE_MB=${FREE_MB:-?}"
 }
 
 # ── THE PASS VERDICT (#3041) ───────────────────────────────────────────────────────────────────
@@ -2314,11 +2332,17 @@ reap_verdict() {
     local vfile="$STATE_DIR/$REAP_VERDICT_FILE_NAME"
     PASS_VERDICT=""
     FREE_MB=""
+    local RECORD_OK=1
     if [ "$MODE" != apply ]; then PASS_VERDICT=dry-run; fi
     if [ -z "$PASS_VERDICT" ]; then
         if [ "$REMOVED" -gt 0 ]; then
             PASS_VERDICT=reclaimed
-        elif [ "$CLASSIFIED_C" -lt "$REAP_WT_INEFFECTIVE_MIN_EXAMINED" ]; then
+        elif [ "$WT_TOTAL" -lt "$REAP_WT_INEFFECTIVE_MIN_EXAMINED" ]; then
+            # ⛔ EXAMINED, not CLASSIFIED (#3041 review, P1). A budget-starved pass classifies a
+            # handful and DEFERS the rest, so gating on CLASSIFIED_C reads a pass that examined 52
+            # records, decided 2 and removed none as `idle` — the benign verdict, on the exact pass
+            # shape that starved pi-cell-4. `examined` is the length of git's own listing, so a
+            # deferral-heavy pass is judged on the population it really scanned.
             PASS_VERDICT=idle
         else
             FREE_MB="$(measure_free_mb "$REPO_CANON")"
@@ -2351,18 +2375,28 @@ reap_verdict() {
         printf 'free_mb=%s\n' "$FREE_MB"
         printf 'floor_mb=%s\n' "$REAP_WT_DISK_FLOOR_MB"
         printf 'reasons=%s\n' "$(summary_reasons)"
-        printf 'remedy=%s\n' "an armed pass decided $CLASSIFIED_C record(s) and removed none while only ${FREE_MB}MB is free (< ${REAP_WT_DISK_FLOOR_MB}MB): read the preserve reasons above — a correct preserve and a defect look identical in a summary line, and this file exists because on pi-cell-4 that silence cost 13 hours and every cell's dispatch capacity"
+        printf 'remedy=%s\n' "an armed pass examined $WT_TOTAL record(s), decided $CLASSIFIED_C and removed none while only ${FREE_MB}MB is free (< ${REAP_WT_DISK_FLOOR_MB}MB): read the preserve reasons above — a correct preserve and a defect look identical in a summary line, and this file exists because on pi-cell-4 that silence cost 13 hours and every cell's dispatch capacity"
     } >"$tmp" 2>/dev/null; then
-        mv -f "$tmp" "$vfile" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+        # ⛔ A SWALLOWED WRITE IS NOT A RECORD. This branch fires when free space is under the floor —
+        # the one state where ENOSPC is live — so the failure is not hypothetical: `mv` failing here
+        # used to fall through to a line claiming the verdict HAD been recorded.
+        if mv -f "$tmp" "$vfile" 2>/dev/null; then :; else rm -f "$tmp" 2>/dev/null; RECORD_OK=0; fi
     else
         rm -f "$tmp" 2>/dev/null
+        RECORD_OK=0
     fi
-    log "VERDICT reap-ineffective repo=$REPO_CANON classified=$CLASSIFIED_C removed=$REMOVED free_mb=$FREE_MB floor_mb=$REAP_WT_DISK_FLOOR_MB"
+    log "VERDICT reap-ineffective repo=$REPO_CANON examined=$WT_TOTAL classified=$CLASSIFIED_C removed=$REMOVED free_mb=$FREE_MB floor_mb=$REAP_WT_DISK_FLOOR_MB record=$([ "$RECORD_OK" = 1 ] && printf '%s' "$vfile" || printf 'NOT-WRITTEN')"
     log_line ""
-    log_line "⛔ VERDICT: reap-ineffective — this armed pass decided ${CLASSIFIED_C} record(s) that survive it and"
-    log_line "   removed NONE, while ${FREE_MB}MB is free on $REPO_CANON (< ${REAP_WT_DISK_FLOOR_MB}MB floor)."
+    log_line "⛔ VERDICT: reap-ineffective — this armed pass examined ${WT_TOTAL} record(s), decided ${CLASSIFIED_C} that"
+    log_line "   survive it, and removed NONE, while ${FREE_MB}MB is free on $REPO_CANON (< ${REAP_WT_DISK_FLOOR_MB}MB floor)."
     log_line "   A preserve is not a success: the reasons below are the whole of what blocked reclamation."
-    log_line "   Recorded at $vfile — a pass that keeps printing this line is a reaper defect, not a healthy pass."
+    if [ "$RECORD_OK" = 1 ]; then
+        log_line "   Recorded at $vfile — a pass that keeps printing this line is a reaper defect, not a healthy pass."
+    else
+        log_line "   ⛔ The record could NOT be written to $vfile (the write failed — likely the same full disk)."
+        log_line "   This line and SUMMARY are then the ONLY statement of the verdict; a missing file is NOT"
+        log_line "   evidence that the condition has cleared."
+    fi
     return 0
 }
 
@@ -2738,24 +2772,24 @@ run() {
                 # test above — a present-dir row of either must not block.
             esac
         fi
-        # ⛔ THE F17 CLASS, FOR THE ONE REASON WHOSE EVIDENCE IS NOT A LOCAL REF (#3041).
-        # Every other survival proof is a ref the prune cannot revoke; a `remote-holds` row's
-        # proof is ONE bounded `ls-remote` taken at classification. A record that was PRESENT at
-        # snapshot time and is GONE at prune time carries no `prunable` flag, so nothing above
-        # stops the path-filterless prune from deregistering it — and for this class nothing local
-        # would then hold the commit. So the block is placed on the MARKER, in BOTH verdict arms,
-        # because the outcome of a `remove` row is not known yet when this decides (the budget can
-        # defer it, and the removal-time clean re-check can turn it into a late PRESERVE).
-        # COST: the end-of-pass prune is skipped for THIS pass when such a row exists, so any
-        # `prunable` record waits one pass; it is re-classified next pass and nothing is lost.
-        # That cost is transient BY CONSTRUCTION: a `remote-holds` row is the one this change makes
-        # REMOVE-eligible, so the population drains as the fix does its job. `remote-only-ref` does
-        # NOT block (F7/A23) — the flag test above is deliberately the only path for it.
+        # ⛔ `remote-holds` DOES NOT BLOCK THE PRUNE — and that is a decision, not an omission (#3041
+        # review, P2). The tempting argument is F17's: its proof is ONE bounded `ls-remote`, not a
+        # local ref, so a record PRESENT at snapshot time and GONE at prune time carries no `prunable`
+        # flag and the path-filterless prune could sweep its admin HEAD. But by CONSTRUCTION a
+        # `remote-holds` row is reached only when the commit is held by `refs/remotes/<r>/<b>` — the
+        # probe runs on exactly the ref `commits_survive` found — so the admin HEAD is NOT the last
+        # handle (the same reason `remote-only-ref` does not block, F7/A23); the remote is a second
+        # handle. And the F17 WINDOW ITSELF IS ALREADY CLOSED for every reason, `remote-holds`
+        # included, by the reason-independent pre-prune RE-READ below (`PRUNE-NEWLY` blocks unless the
+        # now-prunable path ALREADY carried the flag at classification).
+        # Blocking here instead cost what F7 measured: a PRESERVE row (`no-pr`, `too-recent`,
+        # `too-young`) carries `refs=remote-holds:` too, and those rows are long-lived — up to the
+        # whole `REAP_WT_AGED_DAYS` floor — so one of them would disable the `prunable` reclaim path on
+        # every pass for a week. Pinned from BOTH sides by A26c.
         case "$reason" in remote-holds:*) REMOTE_HOLDS_ROW=1 ;; esac
         case "$detail" in *"refs=remote-holds:"*) REMOTE_HOLDS_ROW=1 ;; esac
-        if [ "$REMOTE_HOLDS_ROW" = 1 ] && [ "$PRUNE_BLOCKED" = 0 ]; then
-            PRUNE_BLOCKED=1
-            log "PRUNE-BLOCK $p reason=$reason — a remote-holds row's survival evidence is ONE network read; a path-filterless prune must not deregister this record (F17)"
+        if [ "$REMOTE_HOLDS_ROW" = 1 ]; then
+            log "REMOTE-HOLDS $p reason=$reason — remove-eligible on the remote's own answer; it does NOT block the prune (the tracking ref holds the commit, F7/A23)"
         fi
         REMOTE_HOLDS_ROW=0
     done <<<"$WT_LIST"
