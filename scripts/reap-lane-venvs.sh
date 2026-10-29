@@ -258,7 +258,7 @@ EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; log "$*"; }
+log_line() { printf '%s\n' "$*"; log "$*"; }
 log() { [ -n "$REAP_VENV_LOG" ] && printf '%s\n' "$*" >>"$REAP_VENV_LOG" 2>/dev/null; return 0; }
 
 now_epoch() {
@@ -613,11 +613,167 @@ tmux_witness_for() {
 }
 
 # live_witness <canon> — "<witness>\t<evidence>" when a live holder exists, nothing when none.
+#
+# ── THE IDLE-SHELL RULE (agent-infra#2721) ───────────────────────────────────────────────────
+# WHY. The cwd and tmux-pane witnesses answer "is a process sitting in this worktree?" — and a shell
+# that `cd`'d in and never exited answers YES for ever. That is not a hypothetical: the reclaim logs
+# quoted in #2721 recorded `KEEP … (a live process has it as cwd)` for nearly every worktree on a
+# wedged cell while 59 checkouts carrying a lane env each (5-6 GB `du`) accumulated and the box lost
+# its disk. A shell at a prompt is not a lane: the lane's agent is the shell's CHILD, so a shell with
+# no children is a process nobody is using.
+#
+# THE RULE, and it is deliberately narrow:
+#   a cwd / tmux-pane holder is LIVE EVIDENCE unless it is a SHELL whose START TIME is before the
+#   worktree's HEAD commit AND which has no child process.
+# "Started before the last commit" is the brief's own phrasing of "never did anything here": a lane
+# between turns still holds its `pi`/test child, so it does not match; a lane that finished and left
+# its pane or its `cd` behind does. Every OTHER gate is untouched — `dirty`/`ignored-artifact`/`open-pr`/
+# `too-recent`/`detached-unreachable` and the shared-store rule all still KEEP — so the blast radius of
+# a wrong reading here is a re-created environment, never uncommitted or unpushed work.
+# ⛔ FAIL CLOSED ON EVERY UNKNOWABLE: a pid missing from the process table, a start time that cannot be
+# read, a HEAD that cannot be dated, or any probe that cannot answer all leave the witness LIVE.
+# ⛔ AND IT IS SWITCHABLE (`REAP_VENV_IDLE_SHELL=0`) so an operator can restore the strict reading
+# without editing a shipped script; when it demotes a holder it NAMES it in the pass log.
+IDLE_SHELL="${REAP_VENV_IDLE_SHELL:-1}"
+
+# proc_start_epoch <pid> -> epoch seconds the process started ("" when unreadable).
+# Linux needs no fork: the `/proc/<pid>` DIRECTORY's mtime is set at process creation (measured).
+# Elsewhere fall back to `ps -o etimes=` (elapsed seconds) and then to `ps -o etime=`'s
+# `[[dd-]hh:]mm:ss` form, which BSD ps has. An unreadable value is "" — never 0, which would compare
+# as "started at the epoch" and mis-classify every holder as stale.
+proc_start_epoch() {
+    local pid="${1:-}" v e rest
+    [ -n "$pid" ] && is_pos_int "$pid" || return 1
+    if [ -r "/proc/$pid" ]; then
+        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+        case "$v" in ''|*[!0-9]*) v="" ;; esac
+        [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+    fi
+    v="$("$PS_BIN" -o etimes= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    case "$v" in ''|*[!0-9]*) v="" ;; esac
+    [ -n "$v" ] && { printf '%s\n' "$(( $(now_epoch) - v ))"; return 0; }
+    e="$("$PS_BIN" -o etime= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    [ -n "$e" ] || return 1
+    case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
+    v=0
+    case "$e" in
+        *-*) v=$(( ${e%%-*} * 86400 )); e="${e#*-}" ;;
+    esac
+    local f1 f2 f3 rest
+    case "$e" in
+        *:*:*) f1="${e%%:*}"; rest="${e#*:}"; f2="${rest%%:*}"; f3="${rest#*:}" ;;
+        *:*)   f1=0; f2="${e%%:*}"; f3="${e#*:}" ;;
+        *)     f1=0; f2=0; f3="$e" ;;
+    esac
+    is_pos_int "$f1" && is_pos_int "$f2" && is_pos_int "$f3" || return 1
+    v=$(( v + f1 * 3600 + f2 * 60 + f3 ))
+    printf '%s\n' "$(( $(now_epoch) - v ))"
+}
+
+# is_shell_pid <pid> — the process's COMMAND WORD is a shell (its argv[0], from the ps table).
+is_shell_pid() {
+    local pid="${1:-}" cmd base
+    [ -n "$pid" ] && [ -s "${PS_TABLE:-}" ] || return 1
+    cmd="$(awk -v p="$pid" '$1==p { $1=""; $2=""; sub(/^[ \t]+/, ""); print; exit }' "$PS_TABLE" 2>/dev/null)"
+    [ -n "$cmd" ] || return 1
+    cmd="${cmd%% *}"
+    base="${cmd##*/}"
+    base="${base#-}"
+    case "$base" in bash|sh|dash|zsh|ksh|ksh93|mksh|ash|fish) return 0 ;; esac
+    return 1
+}
+
+# has_child <pid> — a pid with a live child in the table is DOING something (a prompt has none).
+# The reaper's own probe tree is excluded, the same way every other witness excludes it: the reaper
+# forks from the shell it is called by, and that shell's cwd may well be the worktree it is reaping.
+has_child() {
+    local pid="${1:-}"
+    [ -n "$pid" ] && [ -s "${PS_TABLE:-}" ] || return 1
+    awk -v p="$pid" -v self=" ${SELF_PIDS:-} " '
+        $2==p { if (index(self, " " $1 " ") == 0) { found=1; exit } }
+        END { exit !found }' "$PS_TABLE" 2>/dev/null
+}
+
+# head_epoch_for <worktree> -> epoch of the worktree's HEAD commit ("" when git cannot date it).
+# Bounded like every other git call in this script, and cached per pass: the same worktree is probed
+# at classification and again at removal.
+HEAD_EPOCH_CACHE=""
+head_epoch_for() {
+    local wt="${1:-}" out rc v k
+    [ -n "$wt" ] || return 1
+    while IFS="$TAB" read -r k v; do
+        [ "$k" = "$wt" ] && [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+    done <<<"$HEAD_EPOCH_CACHE"
+    out="$(bound_file headep)" || return 1
+    run_bounded "$REAP_VENV_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$wt" log -1 --format=%ct
+    rc=$?
+    v="$(head -1 "$out" 2>/dev/null | tr -d ' \t')"
+    rm -f "$out"
+    [ "$rc" = 0 ] || return 1
+    is_pos_int "$v" || return 1
+    HEAD_EPOCH_CACHE="$HEAD_EPOCH_CACHE$wt$TAB$v"$'\n'
+    printf '%s\n' "$v"
+}
+
+# stale_shell_holder <pid> <worktree-canon> — 0 when this holder is an IDLE SHELL predating HEAD.
+# Fail-closed in every branch: anything we cannot prove leaves the holder LIVE.
+stale_shell_holder() {
+    local pid="${1:-}" canon="${2:-}" head start
+    [ "$IDLE_SHELL" = 1 ] || return 1
+    [ -n "$pid" ] && is_pos_int "$pid" || return 1
+    is_shell_pid "$pid" || return 1
+    has_child "$pid" && return 1
+    head="$(head_epoch_for "$canon")" || return 1
+    start="$(proc_start_epoch "$pid")" || return 1
+    [ "$start" -lt "$head" ] || return 1
+    return 0
+}
+
+# demote_row <table-var-name> <pid> — drop that holder's row from a probe TABLE FILE, so the witness
+# scan moves on to the NEXT holder instead of stopping at the first one. It mutates the shared file on
+# purpose: the witness readers run inside `$( )` subshells, so a shell variable holding "already
+# demoted pids" could not cross that boundary, while the file can (measured: without this, ONE idle
+# shell + one busy lane in the same worktree demoted the idle shell and then never looked at the busy
+# one — the env was reaped under a live lane, which is the exact failure this reaper exists to avoid).
+demote_row() { # demote_row <table-var-name> <pid>
+    local var="${1:-}" pid="${2:-}" f
+    [ -n "$var" ] && [ -n "$pid" ] && is_pos_int "$pid" || return 0
+    f="${!var:-}"
+    [ -n "$f" ] && [ -s "$f" ] || return 0
+    awk -v p="$pid" -F"$TAB" '$1 != p' "$f" >"$f.demoted" 2>/dev/null && mv -f "$f.demoted" "$f" 2>/dev/null
+    return 0
+}
+
 live_witness() {
-    local canon="$1" hit
-    if hit="$(tmux_witness_for "$canon")"; then printf 'live-tmux-pane\t%s\n' "$hit"; return 0; fi
-    if hit="$(cwd_witness_for "$canon")"; then printf 'live-cwd\t%s\n' "$hit"; return 0; fi
+    local canon="$1" hit pid note=""
+    # EVERY holder is examined, not just the first (see demote_row): a worktree routinely holds an idle
+    # shell left over from an earlier lane AND a live lane's own shell, and taking the first hit would
+    # decide the verdict for the whole worktree from whichever pid the probe happened to list first.
+    while hit="$(tmux_witness_for "$canon")"; do
+        pid="$(printf '%s' "$hit" | sed -n 's/^pane_pid=\([0-9][0-9]*\).*/\1/p')"
+        if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
+            note="$note pid=$pid(tmux-pane)"
+            demote_row TMUX_TABLE "$pid"
+        else
+            printf 'live-tmux-pane\t%s\n' "$hit"; return 0
+        fi
+    done
+    while hit="$(cwd_witness_for "$canon")"; do
+        pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
+        if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
+            note="$note pid=$pid(cwd)"
+            demote_row CWD_TABLE "$pid"
+        else
+            printf 'live-cwd\t%s\n' "$hit"; return 0
+        fi
+    done
     if hit="$(argv_witness_for "$canon")"; then printf 'live-argv\t%s\n' "$hit"; return 0; fi
+    # A DEMOTED HOLDER IS NAMED, never silent: the pass log is where an operator decides whether a
+    # stale-cwd reading was right, and a demotion nobody can see is the same defect as a KEEP nobody
+    # can explain (#2721).
+    if [ -n "$note" ]; then
+        log "stale-shell:$note — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
+    fi
     return 1
 }
 
@@ -738,11 +894,11 @@ remove_one() {
     # The same gc-only self rule classify() applies (never a second, weaker one): in `--worktree` mode
     # the caller's cwd IS the worktree, so applying it there would make exit-mode reaping impossible.
     if [ "$mode" = gc ] && [ -n "$SELF_CWD_CANON" ] && inside "$canon" "$SELF_CWD_CANON"; then
-        say "SKIP $canon/.venv — the reaper's own cwd is inside it"
+        log_line "SKIP $canon/.venv — the reaper's own cwd is inside it"
         return 2
     fi
     if [ -L "$canon/.venv" ] || [ ! -d "$canon/.venv" ]; then
-        say "SKIP $canon/.venv — no longer a real directory"
+        log_line "SKIP $canon/.venv — no longer a real directory"
         return 2
     fi
     # A fresh read of ALL THREE witnesses: the pass table may be minutes old on a large estate.
@@ -751,19 +907,19 @@ remove_one() {
         # The SAME policy as the pass-level probe (never a second, weaker one): a degraded cwd read is
         # abortive unless the operator has explicitly accepted tmux+argv-only evidence.
         if [ "$REAP_VENV_ALLOW_DEGRADED_CWD" = "1" ]; then
-            say "warn: cwd probe DEGRADED at removal time — tmux+argv evidence only (REAP_VENV_ALLOW_DEGRADED_CWD=1)"
+            log_line "warn: cwd probe DEGRADED at removal time — tmux+argv evidence only (REAP_VENV_ALLOW_DEGRADED_CWD=1)"
         else
-            say "FAIL-CLOSED: cwd probe unavailable before removal of $canon/.venv"; return 1
+            log_line "FAIL-CLOSED: cwd probe unavailable before removal of $canon/.venv"; return 1
         fi
     fi
-    tmux_load || { say "FAIL-CLOSED: tmux probe failed before removal of $canon/.venv"; return 1; }
-    ps_load || { say "FAIL-CLOSED: ps unavailable before removal of $canon/.venv"; return 1; }
+    tmux_load || { log_line "FAIL-CLOSED: tmux probe failed before removal of $canon/.venv"; return 1; }
+    ps_load || { log_line "FAIL-CLOSED: ps unavailable before removal of $canon/.venv"; return 1; }
     self_load
     if live="$(live_witness "$canon")"; then
-        say "SKIP $canon/.venv — went live before removal: ${live//$TAB/ }"
+        log_line "SKIP $canon/.venv — went live before removal: ${live//$TAB/ }"
         return 2
     fi
-    out="$(bound_file rmout)" || { say "SKIP $canon/.venv — no scratch dir"; return 1; }
+    out="$(bound_file rmout)" || { log_line "SKIP $canon/.venv — no scratch dir"; return 1; }
     # ⛔ THE REMOVAL SUBSHELL MUST NOT INHERIT THE EXIT TRAP EITHER (review of PR #1949): `cleanup`
     # deletes the SHARED `$SCRATCH`, and on a bash that runs an inherited EXIT trap in a subshell (3.2 —
     # exactly the bash where cleanup()'s BASHPID guard cannot fire) that would delete the parent's
@@ -776,10 +932,10 @@ remove_one() {
         rc=$?
     fi
     if [ -d "$canon/.venv" ] || [ -L "$canon/.venv" ]; then
-        say "REMOVE-FAILED $canon/.venv (rc=$rc) $(head -2 "$out" 2>/dev/null | tr '\n' ' ')"
+        log_line "REMOVE-FAILED $canon/.venv (rc=$rc) $(head -2 "$out" 2>/dev/null | tr '\n' ' ')"
         return 1
     fi
-    say "REAPED $canon/.venv"
+    log_line "REAPED $canon/.venv"
     return 0
 }
 
@@ -964,7 +1120,7 @@ run_exit() {
     DF_BEFORE="$(df_free_kb "$canon")"
     row="$(classify "$canon" exit)"
     if [ -z "$row" ]; then
-        say "[$SCRIPT_NAME] no .venv in $canon — nothing to reap"
+        log_line "[$SCRIPT_NAME] no .venv in $canon — nothing to reap"
         return 0
     fi
     report_row "$row"
@@ -1008,8 +1164,8 @@ report_capacity() { # report_capacity <free_kb_after>
             [ "$free_mb" -gt "$floor" ] && headroom=$(( (free_mb - floor) / per_lane_mb ))
         fi
     fi
-    say "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
-    [ -n "$why" ] && say "[$SCRIPT_NAME] capacity: $why"
+    log_line "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
+    [ -n "$why" ] && log_line "[$SCRIPT_NAME] capacity: $why"
     log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
         "$LANES_LIVE" "${per_lane_mb:-}" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
     CAPACITY_FLOOR_OK="$floor_ok"
@@ -1033,12 +1189,12 @@ main() {
 
     probes_ready || exit 3
 
-    say "[$SCRIPT_NAME] mode=$mode_label apply=$APPLY repo=${REPO:-$PWD} worktree=${WORKTREE:--}"
+    log_line "[$SCRIPT_NAME] mode=$mode_label apply=$APPLY repo=${REPO:-$PWD} worktree=${WORKTREE:--}"
     case "$TMUX_STATE" in
-        ok)     say "[$SCRIPT_NAME] witnesses: tmux panes + process cwd + process argv" ;;
-        absent) say "[$SCRIPT_NAME] witnesses: process cwd + process argv (no tmux server on this host)" ;;
+        ok) log_line "[$SCRIPT_NAME] witnesses: tmux panes + process cwd + process argv" ;;
+        absent) log_line "[$SCRIPT_NAME] witnesses: process cwd + process argv (no tmux server on this host)" ;;
     esac
-    [ "$CWD_STATE" = "ok" ] || say "[$SCRIPT_NAME] warn: cwd witness DEGRADED (see above)"
+    [ "$CWD_STATE" = "ok" ] || log_line "[$SCRIPT_NAME] warn: cwd witness DEGRADED (see above)"
 
     if [ "$MODE" = exit ]; then run_exit; else run_gc; fi
 
@@ -1051,14 +1207,14 @@ main() {
     reclaimed_mb="?"
     is_pos_int "${freed_kb:-}" && reclaimed_mb=$((freed_kb / 1024))
 
-    say "[$SCRIPT_NAME] venvs_found=$FOUND reapable=$REAPABLE reaped=$REAPED kept=$KEPT recheck_kept=$RECHECK_KEPT failed=$FAILED"
+    log_line "[$SCRIPT_NAME] venvs_found=$FOUND reapable=$REAPABLE reaped=$REAPED kept=$KEPT recheck_kept=$RECHECK_KEPT failed=$FAILED"
     # The two numbers answer different questions — see the header. `du` is the APPARENT size: it
     # counts blocks shared with the uv cache once per link, so it over-states ONLY on a box where
     # such sharing exists (hardlink OR clonefile — measured PER MACHINE; the old universal hardlink
     # claim was falsified 2026-10-16, #1851). `df` is what the filesystem actually got back.
-    say "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du counts blocks SHARED with the uv cache once per link and over-counts only where that sharing exists — per machine, measure it with the sibling worktree-disk-probe.sh (beside this script); df is the real figure)"
+    log_line "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du counts blocks SHARED with the uv cache once per link and over-counts only where that sharing exists — per machine, measure it with the sibling worktree-disk-probe.sh (beside this script); df is the real figure)"
     report_capacity "${df_after:-}"
-    [ "$APPLY" = 1 ] || say "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
+    [ "$APPLY" = 1 ] || log_line "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
 
     # Severity order matches disk-reaper.sh's own INTENT (3 abort > 4 removal failed > 5 over-bound),
     # so the fleet entry point's worst-code rule keeps the most severe verdict instead of this pass
@@ -1072,7 +1228,7 @@ main() {
     # operator cannot find because a removal failed first is a silent breach. The EXIT CODE order is
     # unchanged (4 still wins); only the record's survival is fixed.
     if [ "$CAPACITY_FLOOR_OK" = "no" ]; then
-        say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5, or exit 4 if a removal also failed — a failed removal outranks a breach)"
+        log_line "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5, or exit 4 if a removal also failed — a failed removal outranks a breach)"
         log "over-bound\tfree_below_floor_mb=${CAPACITY_FLOOR_MB:-$REAP_VENV_FREE_FLOOR_MB}"
     fi
     [ "$FAILED" -gt 0 ] && exit 4
