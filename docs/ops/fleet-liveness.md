@@ -31,10 +31,14 @@ The artifacts, one authority:
 | `tools/fleet/lane_liveness.py` | the **scheduled** driver: enumerates lanes, calls `gather`+`evaluate`, escalates a `dead` lane to a deduped issue. A driver, never a second opinion |
 | `tools/fleet/claim_lanes.py` | the **ref-claim registry reader** (#1777): reads `refs/claims/<pr>-<sha12>` from a remote (or a `claim_snapshot` file) into `liveness.ClaimRead`, and renders `liveness.evaluate` at its CLI. Acquisition only — it emits **no state** of its own |
 | `scripts/lib/pid-identity.sh` | the one **process-identity rule** — sourced by the kill-path reaper (Bash), forked as a CLI by the classifier (Python) |
+| `scripts/orphan-reap.py` | the `pi` **pool's owner**: enumerates it, binds pid↔transcript with the fence above, and authorises only the canon's `idle` (24 h). Four states, dry-run by default; `AUTHORISE_HOSTLESS_CHAINS` keeps a hostless chain report-only (#1207/#1297 option A) |
+| `scripts/orchestrator-harness/pi-done-not-exited.py` | a **launcher-contract** reaper, not a liveness verdict: it asks whether a `pi` FINISHED its turn and never exited, leaving its launcher blocked so `<tag>.rc` was never written (#2163). It imports `turn_from_jsonl`/`jsonl_state`, the pool owner's session binding, gate 2, and CPU gate/tolerance READ AT RUNTIME; the one predicate it adds is launcher ownership in two named rungs — `tag` (the launcher names the `TAG` in the process's `environ`: as a whole argument on its OWN ARGV — the shipped `lane.sh <N>` shape — by assigning it, writing `<tag>.rc`, or redirecting to the log this process holds) and `launcher` (no TAG, launcher text redirects into the held log). It also requires PRINT MODE in the launcher's text (`pi -p`/`--print`/`run_agent`), because an agent at a human's prompt reaches the same turn-ended/frozen-CPU state; a TAG neither rung ties is `weak-owner` and report-only. `/proc` is Linux-only, and every read abstains elsewhere. ⚠️ It SIGNALS nothing by default: a cell lane's chain is `hostless`, which #1207/#1297 option A keeps report-only, and the reopen agent-infra#2391 is still open — a pass that finds DONE rows without `--authorise-hostless` exits 4 |
 
 The kill path (`scripts/pi-reap-idle.sh`) is a *consumer of the same identity rule*, not a second
-liveness rule: it is documented in `docs/ops/pi-idle-repl-reaper-policy.md`. **A wrong verdict here
-cannot kill anything** — `lane_liveness.py` never calls `os.kill`.
+liveness rule: it is documented in `docs/ops/pi-idle-repl-reaper-policy.md`. **A wrong verdict
+here cannot kill anything** — `lane_liveness.py` never calls `os.kill`. The kill path is the separate,
+own-account reaper `scripts/orchestrator-harness/pi-done-not-exited.py` (see the table above): it is
+gated on the recorded host decision and signals nothing unless `--authorise-hostless` is passed.
 
 **Whose session is it? (§2a).** Liveness is not the same question as **ownership**: a lane can be
 provably alive and still be the OWNER's, which is what decides whether a dispatcher may type into
@@ -980,6 +984,66 @@ The procfs is a **hermetic fixture** in the suite (`--proc-root`), so the `/proc
 exercised by a leg rather than assumed — including the two shapes that must abstain (a refused
 `cwd`) and the one that is a real answer (a pid that is gone).
 
+### 10.4 The dispatch-yield preflight — is there anything to LAND? (#2747)
+
+§10 asks *"is the predecessor still ALIVE"*. The complementary question is about the WORKTREE:
+*"does a dispatch there have anything to land?"* Measured 2026-10-18: 14 live `pi` lanes, **12 with
++0 commits**, and every one of those 12 sat on a HEAD `origin/main` already contained. The lane ran
+to completion, stood down, and the fleet read as "busy but unproductive" — so the expensive thing is
+the DISPATCH, not the lane.
+
+`tools/fleet/dispatch_preflight.py <worktree>` answers it locally (no network, no ref moved):
+
+| exit | verdict | meaning |
+|---|---|---|
+| `0` | `HAS-WORK` | dispatch may proceed |
+| `3` | `NO-WORK` | refuse — landing HEAD would not change the base |
+| `4` | `UNREADABLE` | refuse — the git state could not be read, **or the invocation was malformed** |
+
+The predicate is a **three-way merge**, not a tree comparison: `would_change_base` is
+`merge-tree --write-tree <base> <head>` compared against `tree(base)` (git **≥ 2.38**; an older git
+is `UNREADABLE` with the version named, never a guess). A tree comparison answers this wrongly in
+the most common lifecycle shape of all — branch squash-merged, base then advanced: `tree(HEAD) !=
+tree(base)` while every byte HEAD carries is already in the base.
+
+And the merge is **not trusted on its own**: a repo-declared merge driver
+(`.gitattributes: *.lock merge=ours`) makes the merge keep the BASE side, so it reports "nothing
+changes" for a branch that really does carry unlanded work. Whenever the merge says nothing changes,
+the tool also asks the path-level question — for every path HEAD changed, is the base's content
+identical? — and a disagreement is `UNREADABLE` ("already landed" cannot be certified), never
+`NO-WORK`. **Dirty worktrees are `HAS-WORK` unconditionally** (uncommitted/untracked content is work
+to land, and a false refusal destroys it — the dirty read short-circuits before anything that needs
+the base), and the target must be **its own work-tree root** — `git -C` walks upward, so a stale
+`.worktrees/x/` would otherwise be answered from the main checkout.
+
+**Boundary, stated:** squash-merged and then the base **rewrote the same path**. HEAD's bytes are not
+the base's bytes, so every read available here says "this path differs" and the verdict is
+`HAS-WORK` — conservative (a wasted lane at worst). The `NO-WORK` rule is about an advance on
+**other** paths.
+
+⛔ **What is NOT wired, stated plainly (#1890).** Nothing calls this today: not `lane.sh`,
+`fix-one.sh`, `spawn-gate.sh`, `nonblocking-dispatch.sh`, `pr-doctor.py` or `merge-one.sh`. Merging
+the tool does **not** by itself stop a lane being spawned into a `NO-WORK` worktree — it is
+**operator-run** until the call site lands, and issue #2747 stays open for it (the call site belongs
+beside the gates in §10, honouring exit `3` as *refuse and yield* and exit `4` as *refuse, different
+reason* — a gate that changes fleet-wide dispatch behaviour gets its own change and its own review).
+
+Run the pinned suite after any change (the red control proves each leg fails without its fix):
+
+```bash
+python3 tools/fleet/dispatch_preflight.test.py               # 31 legs
+python3 tools/fleet/dispatch_preflight.test.py --red-control # 16 mutations, each must go RED
+```
+
+The suite is hermetic by pinning **this process's** git environment (`GIT_CONFIG_GLOBAL`/`SYSTEM`
+neutralised, and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY` **cleared** — a
+leaked one redirects every fixture git call into the caller's repo; measured: an exported `GIT_DIR`
+not only errored 26 setUps, it WROTE into the ambient checkout). Every verdict is computed
+in-process, so pinning only the fixtures leaves the result depending on the box (a global
+`core.excludesFile` matching `*.md` reddened the untracked-file leg). `--red-control` runs the
+unmutated suite FIRST and refuses if it is red: otherwise a broken suite reports every mutation as
+"caught by its paired leg" and certifies itself.
+
 ---
 
 ## 11. `idle` must pass through Step 2, and a stale binding is never verified (#1867)
@@ -1235,3 +1299,238 @@ Regression contract: `bash scripts/fleet-inventory.test.sh` (its header carries 
 recipe that proves each arm goes red when its predicate is neutered — including the read paths, the
 `stop`/`start` verb paths, and the exit-code contract). It is registered in
 `scripts/run-bash-shards.sh`, so both CI lanes run it.
+
+---
+
+## 11. A FINISHED lane is a distinct state — and it is reaped from EVIDENCE (#2163)
+
+§§1–10 decide whether a lane's **process incarnation** is alive. They deliberately do not answer the
+next question: *the incarnation is alive, the turn is over, so why is it still resident?* Measured
+2026-10-19 while orchestrating the fleet: the Mac carried ~76 `pi`-shaped processes; the truth was
+**14 working lanes and ~60 finished/blocked zombies**. The counting command
+(`ps -eo command | grep -c 'pi --model'`) counted the **wrapper bash**, not `pi` — a number wrong in
+both directions, and cells were filled on it (agent-infra#2159: cell-2 OOM-killed 37 processes and
+its tmux server).
+
+### 11.1 The state, in the vocabulary of §1
+
+A lane is **finished** when its turn ended and its process tree is still resident. That is not one of
+§1's five states: `dead` is "every incarnation gone", `running-quiet` is "a live holder with no open
+turn". A finished lane is `running-quiet` **that should not be running at all** — and the fix has two
+halves, because a reaper alone turns a leak into a nightly sweep:
+
+1. **The launch leaves nothing behind.** `lane-exec.sh` `exec`s `pi`, so the launcher's pid *is* the
+   agent and a completed turn leaves no wrapper. Where a wrapper must persist (`lane.sh`: teardown
+   trap, post-run status) it `wait`s and exits on child exit, and `spawn-gate.sh::run_agent` runs the
+   agent in its own process group and reaps the group after the turn — so a tool child cannot be
+   orphaned by a finished agent.
+2. **What already leaked is reaped from evidence.** `scripts/orchestrator-harness/lane-reap.sh`.
+
+### 11.2 The three gates (all required), and the one that is a rule about ABSENCE
+
+A lane is reaped only when ALL hold:
+
+| gate | reading | why it is the gate |
+|---|---|---|
+| 1. zero CPU | cumulative CPU summed over the **whole tree** (wrapper + `pi` + descendants), two samples a real window apart, tolerance stated (`LANE_REAP_CPU_TOL_CS`, 0.10 s) | a sub-0.1 s twitch is indistinguishable from a parked fork child, a human's prompt redraw, or a timer wake |
+| 2. **positive fleet ancestry** | ancestry walked nearest-first; the FIRST recognised host application decides (`Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`WezTerm`/`Ghostty`/`xterm`/`gnome-terminal`/`konsole`/`foot`/VS Code ⇒ human, never touched; `cmux.app` ⇒ fleet). **`unknown` REFUSES**, and so does an ancestry the walk could not COMPLETE (a missing ppid row). `login`/`zsh` alone are NOT human — every cmux lane is `pi → -zsh → login → cmux.app`, so treating them as human makes the reaper inert. `ppid 1` proves nothing. ⛔ **A MULTIPLEXER (`tmux`, `screen`) IS NOT A HUMAN**: it is the fleet's own LAUNCH SURFACE (`worker-terminal.sh` selects tmux as THE launcher on macOS whenever `cmux tree --json` cannot answer), so the walk goes **through** the server — to the human terminal above it, or to `unknown`, which refuses | the near-miss in #1244's own history: a correct-as-written rule pointed at a human's shell — and its inverse, which shipped: `unknown` used to PERMIT, so every host app outside the marker set, and every truncated process table, sent TERM to a live tree. In the other direction, naming `tmux` human made the armed reaper **inert on the fleet's own macOS launcher** (every tmux-hosted lane ⇒ `human-ancestor`, every `tmux: server` root ⇒ `unknown`) while the declared consequence named only Linux cells |
+| 3. staleness | the log **THIS LANE's own `pi`** holds open (stdout/stderr, read from the kernel — never a slug parsed out of a command line; a `tee` beside it counts as its writer **only when that tee's stdin IS that `pi`'s stdout** — one kernel fact, compared as a **per-pipe** identity: `/proc`'s `pipe:[N]`, or an lsof address `->0x…` that BOTH sides reproduce. Where the platform prints only a **generic** pipe name (`lsof 4.95` prints the literal `pipe` for both ends of every anonymous pipe; `->0x0` is its unresolved placeholder) there is no identity to compare, so the pass **ABSTAINS** — `pipe-identity-unusable` / `unidentifiable=`, exit 3 — it neither accepts the tee nor refuses the lane, and it is never reported as a failed read): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND **the process holding it** has been up ≥ 12 h (`LANE_REAP_NO_LOG_H`). **Two distinct lane logs in one tree ⇒ `ambiguous-log-evidence`, refused** | a lane's silence is not proof; a stale ARTEFACT is — and an artefact borrowed from a SIBLING is a trap (below). The age bound is read from the HOLDER, not the wrapper: a wrapper up 28 h around a `pi` started 10 minutes ago must not make a freshly-rotated log "old" |
+
+**⛔ GATE 3 IS ALSO A RULE ABOUT ABSENCE: `no-log-evidence` IS A REFUSAL, NEVER STALENESS.** The first
+dry run flagged 69 lanes and would have killed one that was **7 minutes old**: the worktree slug was
+parsed from the shell command text, which contains escapes (`ciwatch\012[`), the slug matched no log,
+and "no log found" was read as "stale". The population and the log are therefore derived from the
+kernel (the process table, and the file descriptors the process holds) — and when no log can be
+resolved at all, the lane is *reported*, never reaped.
+
+**⛔ AND THE ARTEFACT MUST BELONG TO THE LANE IT JUDGES — not to a sibling.** Measured: root 500
+`bash lane.sh`, child 501 a backgrounded `tee` holding a 3 h-old `fix-9.log`, child 502 the LIVE `pi`
+holding `L-live.log` written 30 s ago. Taking "the first fd in the tree whose basename matches" judged
+the lane on 501's file and `--apply` TERMed 502 — the working agent. The evidence set is now the
+lane's `pi` (the root when it is `pi`, else the root's direct `pi` child) plus a `tee` child **whose
+stdin is that `pi`'s stdout**; nothing else, and two distinct lane logs is ambiguity, not a choice.
+
+**⛔ "ITS STDIN IS A PIPE" IS NOT "IT IS THIS LANE'S WRITER".** Measured on this review: root 500,
+child 501 `tee …/fix-9.log` fed by child 503 `cat brief`, child 502 the LIVE 5-minute-old `pi` with
+fd 1 on `/dev/null` ⇒ `REAP root=500 log-idle=10800s` + `-TERM 502` + `-KILL 502`. The tee was
+accepted because its stdin was *some* pipe. It is accepted now only when its stdin **is** this
+lane's `pi`'s stdout.
+
+**⛔ AND THAT COMPARISON NEEDS A PER-PIPE NAME, WHICH NOT EVERY PLATFORM PRINTS.** The r3 fix
+compared (kind, name) and assumed the name identified a pipe; it does not. `/proc` gives
+`pipe:[<inode>]` — the pipe itself, identical at both ends — but **lsof 4.95 prints the literal
+`pipe` for both ends of every anonymous pipe** (measured), and `->0x0` is lsof's placeholder when it
+cannot resolve an address. Comparing that spelling re-ran the r3 kill on the lsof branch: root 500,
+child 501 `tee …/fix-9.log` fed by 503 `cat brief` (pipe B), child 502 the LIVE 5-minute-old `pi`
+piped to a logger (pipe A) ⇒ `REAP root=500`, `-TERM 502`, `-KILL 502` — and lsof is the ONLY branch
+macOS has, the only platform where `fleet` ancestry exists. So a name is accepted only when it is an
+identity (`pipe:[N]`, or an address both sides must reproduce — two live pipes never share one); a
+generic spelling makes the tee **unidentifiable**, and the tree abstains. Both wrong answers are
+closed: accepting the generic spelling borrows another pipe's file, while *refusing* it outright
+would drop the documented `pi | tee L-x.log` shape on a generic-spelling platform — the
+`no-log-evidence` ⇒ census `lanes=0/N` capacity fail-open this file closes elsewhere.
+
+**Residual it states rather than hides:** if macOS's `->0x…` is a **peer** address (the far end's,
+not the pipe's own), the two ends of ONE pipe print two different strings, so the documented
+`pi | tee L-x.log` shape would resolve `no-log-evidence` there — an under-count of capacity, never a
+kill. That is the conservative side of the trade (borrowing another pipe's file is what kills a live
+lane), it is undetermined without a macOS measurement, and the abstention path above is where a
+platform that cannot name a pipe at all lands. **That abstention has its own name and its own
+counter** — it is `pipe-identity-unusable` and it counts into `unidentifiable=`, never into
+`abstained=` and never as `log-evidence-unreadable`: the reads succeeded, so reporting a failed read
+would send an operator after an lsof/permissions fault that does not exist.
+
+### 11.3 Reading it
+
+```text
+lane-reap.sh count                  lanes=<live>/<total> zombie=<n>     # the `[cap]` census
+lane-reap.sh reap [--dry-run]       report what WOULD be reaped (the default)
+lane-reap.sh reap --apply           signal the lanes that pass all three gates
+```
+
+**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (45 min — above
+`lane.sh`'s 2400 s wall limit, so a long silent tool call is not read as death), OR its log was
+deleted while the tree lives (a prune can do that to a working lane; a possibly-live lane must not
+count `0` against a capacity gate). The `[cap]` line also carries `lanes_src=census|terminals|unknown`,
+so a lower-bound terminal count (a `$O` that predates the tool) is never printed as a census. **total** = every
+resident tree the census can ATTRIBUTE: a `pi` tree whose **own `pi`** (or a pipe-fed `tee` beside
+it) holds a fleet-namespace log open. The namespace is the files the shipped writers actually create
+— `lane-<n>.log` (`lane.sh`), `L-<slug>.log` (the launcher), `chain-<n>.log` (`chain-merge.sh`),
+`fix-<n>.log` (`fix-one.sh`) and `merge-<n>.log` (`merge-one.sh`); a `fix-`/`merge-`/`chain-` wrapper
+is a WORKER and is counted by `workers=`, not by `lanes=`. `count` and `reap` share that population
+predicate and the same evidence set; `reap` alone adds the ancestry gate. `lanes=?/?` means the
+census could not be read and is never rendered as `0/0`; a `?` live numerator with readable totals is
+the same abstention one lane at a time. An unreadable census makes the controller REFUSE to add work
+(`lanes_unknown`) — the gate is capacity, so an under-count must not dispatch more — on **both**
+add-work paths: the issue batch's dispatch gate AND the PR path's `merge-`/`fix-`/review spawns,
+whose `can_spawn()` carries the same abstention beside the load gate. (It used to close only the
+ISSUE batch, so a box whose census was `?/?` was still handed workers on the PR side; a merge lane is
+a `pi` like any other, so abstaining on one path is abstaining on neither.) `--apply` is the
+operator's decision, like every other deletion tool in this tree.
+
+**⛔ A CENSUS WITH NO EYES SAYS `?`, NOT `0/0`.** The POPULATION comes from the process table; every
+lane's LIVENESS comes from a descriptor it holds. When the box cannot read descriptors at all (no
+`/proc` and no `lsof`, `lsof -p` denied), every tree used to fall out of BOTH `live` and `total` and
+the census printed `lanes=0/0 zombie=<n>` with exit 0 — which `orch-loop.sh` reads as a clean `0`:
+`LANES_UNKNOWN` stays 0, the `lanes_unknown` refusal never fires, `MAX_LANES` is never reached, and
+the controller **dispatches more** onto a box whose capacity it cannot see (the #2163/#2159 OOM
+direction). Two distinct facts are now kept apart: a tree whose descriptors **could not be read** may
+be a lane, so the census abstains (`?/?`, exit 3); a tree whose descriptors **were read** and hold no
+fleet log is simply not a lane, and `0/0` is then a real answer. A third cause abstains for the same
+reason: the reads **succeeded** but the platform prints no per-pipe name (`pipe`, `->0x0`), so a `tee`
+beside the tree cannot be shown to be its own writer — it is counted in `unidentifiable=` and the
+census abstains (exit 3), which is *not* a failed read.
+
+The reap summary is `trees=<working>/<judged> zombie=<n> candidates=<n> reaped=<n> refused=<n>
+inert=<n> unidentifiable=<n> abstained=<n> mode=…`. `trees=` accounts for **every** judged tree
+(working = judged −
+candidates, so an idle-but-not-stale lane is never lost), `refused=` is the trees never judged
+(no/unreadable/ambiguous/unidentifiable evidence, a human or unknown ancestry), and **`abstained=` is the trees where
+a SAFETY read failed** (descriptors, ancestry, CPU delta, log age) — the field that makes `reaped=0
+refused=0` over an unreadable box distinguishable from an idle one. **`inert=` is the subset of
+`refused=` that is a POLICY decision over a REAL lane** (a resolved lane log under a human or
+unclassifiable ancestry): it is the field that makes *"this reaper judged nothing"* sayable, because
+`trees=0/0 … refused=1 abstained=0` used to be a clean pass. **`unidentifiable=` is the subset of
+`refused=` whose descriptors were READ SUCCESSFULLY but whose pipe has no per-pipe name on this
+platform** (`pipe-identity-unusable`: `lsof 4.95` prints the literal `pipe`, and `->0x0` is its
+unresolved placeholder), so a `tee` beside the tree can be neither accepted (that borrows another
+pipe's file) nor refused (that drops a real lane's own writer). It is an **abstention — exit 3 — but
+NOT `abstained=`**: it shares rc 2 with a blind read no longer, because a readable tree reported as
+"the descriptors could not be read" sends the operator after an lsof/permissions fault that does not
+exist, and the two causes need different fixes. A pass with any abstention **exits 3**,
+and **a pass that judged no tree while refusing lanes by policy exits 4** — an instrument that is
+inert (a cell, by design; §11.4) must not record itself as healthy, but neither is its refusal a
+READ FAILURE. Those are the reaper's TWO broken shapes, and `inert=` alone is neither of them: a pass
+that judged lanes and refused a human-owned one beside them is CLEAN (exit 0), because the refusal is
+a policy decision and not a failure to look. `cloud-cell-doctor.sh` therefore records the **inert-pass
+SHAPE** — `inert` non-zero **together with `trees=0/0`**, the same `total == 0` the reaper tests — as
+its own verdict (`rc=4`, printed as `INERT`), and not the field on its own; it counts an abstention
+the same way — including `unidentifiable=`, which it escalates on its own field and whose logged cause
+line names identity, not a blind read — and logs the **first** per-tree refusal beside the summary, so
+`[reap]` names a cause. (Escalating every non-zero `inert=` wrote `reap FAILED`
+every pass over a pass the reaper calls clean, on any box with one human-owned or
+`ancestry-unknown` lane; escalating the inert PASS to `3` did the same for the cell's health verb —
+see §11.4.)
+
+### 11.4 Boundaries, stated
+
+- **The armed reaper is INERT on a Linux cell — a product decision, not a silent behaviour.** Gate 2
+  now requires POSITIVE fleet evidence, and the only host application this tool recognises as the
+  fleet is `cmux.app`, a Mac application. A cell lane's ancestry is `pi → bash → systemd → init`:
+  `unknown`, refused, every time. `--apply` therefore judges nothing on a cell; the census and
+  `--dry-run` are its instruments, and every refusal is named (`ancestry-unknown`). Making it act on a
+  cell needs an evidence source a cell can actually supply — the supervisor's unit/cgroup
+  (`/proc/<pid>/cgroup` naming e.g. `cloud-cell-supervisor.service`) or a marker the supervisor writes
+  into `/proc/<pid>/environ` at spawn — which is a design change with a cell-side component. It is
+  recorded here as a DECISION FOR THE PR AUTHOR, deliberately not inferred, because the alternative
+  (accepting `unknown`) is the fail-open that TERMed live trees. Because such a pass judges NOTHING
+  while refusing every lane, it carries `inert=<n>` and **exits 4 — a POLICY verdict, not `3`
+  (cannot-verify)**: the pass COMPLETED and judged nothing, which on a cell is the steady state, not
+  a read that failed. The distinction is load-bearing in both directions:
+  * `cloud-cell-doctor.sh` records it as `rc=4`, and the `status` verb prints the role as
+    **`INERT`** — NAMED, never a silent green — while the verb stays **green** (the staleness bound
+    still applies, so a reaper that stopped passing reads `STALE`). Recording it as `3` made
+    `cloud-cell-supervisor.sh status`, the operator's health verb, exit 1 on every healthy cell
+    carrying a lane, and an alarm that can never clear is trained-to-be-ignored.
+  * a supervision FAILURE keeps its own rc: "the controller is away and the restart FAILED" is
+    `doctor` **rc=1** whatever the nested reap recorded. It used to be `rrc=3` beside a
+    cannot-verify reap, which made "controller is down" inexpressible.
+  The inertness is therefore visible to the doctor and named on the cell's own health line, not
+  recorded as a healthy reaper and not reported as a fault nobody can act on.
+  **Residual, stated:** on a cell the armed reaper still judges nothing, so a wedged cell lane is
+  ended by the operator or by the session pass, not by this gate, until the evidence source above
+  exists.
+- **A lane whose launcher has EXITED is never reaped — the orphan boundary, stated.** When the
+  `bash -c '… nohup pi … &'` wrapper finishes (or is killed), the surviving `pi` is reparented to
+  `init`: its only ancestor is `/sbin/init`, `host_verdict` reads `unknown`, and `cmd_reap` refuses it
+  as `ancestry-unknown` for ever, however stale its log and however long its zero CPU window. **This
+  is the residue #2163 exists to remove**, and it survives on any box without a fleet marker above the
+  orphan — including a Mac whose `cmux.app` pane died with the wrapper. Reaping it needs a positive
+  fleet marker that SURVIVES reparenting — the supervisor's unit/cgroup (`/proc/<pid>/cgroup`), a
+  marker written into `/proc/<pid>/environ` at spawn, or a lane-written identity file — which is the
+  same design change the cell bullet above names, NOT a loosened gate: letting `unknown` permit is the
+  fail-open that TERMed live trees. Until that marker exists the orphan is counted (`lanes=<live>/<total>`)
+  and refused by name. Pinned by `lane-reap.test.sh`'s `ORPHAN-PARENTLESS` leg.
+- **`tmux`/`screen` are NOT human markers — a product decision, stated.** They are the fleet's own
+  launch surface: `worker-terminal.sh` selects tmux as THE launcher on macOS whenever
+  `cmux tree --json` cannot answer (the launchd controller, measured in
+  `tools/fleet/lane_liveness.py`), and a pane's processes descend from the tmux server. Listing them
+  as humans made the armed reaper inert on every tmux-hosted lane on that surface — a consequence the
+  earlier text did not declare, and the test suite asserted as correct. The walk now continues
+  through the server: it refuses on the human terminal above it, or reaches `unknown`, which refuses.
+  **Residual it widens, stated:** a human's interactive `pi` inside a cmux pane has a tmux server under
+  `cmux.app` and therefore reads `fleet` — the SAME #1207/#1244 residual already named below (a human
+  `pi` inside cmux with a lane-shaped log), bounded by the zero-CPU window and the 2 h idle proof and
+  named per candidate in the dry run.
+- The owner's own interactive `pi` **inside cmux** with stdout redirected to a lane-shaped log is not
+  separated from a fleet lane by ancestry alone (the residual #1207 and #1244 both name). The
+  zero-CPU window and the 2 h idle proof bound it, and the dry run names every candidate so a human
+  sees it before arming.
+- A lane whose log was deleted and whose age is under 12 h is **reported, not reaped** — the
+  conservative side of the trap above. On the measured box that is the 1 h 20 m cluster, which is
+  why the reap population is old lanes.
+- A leaked lane whose stdout is a **pty or pipe** and whose log name is outside the fleet namespace
+  is outside the population entirely (no artefact to judge): it is invisible to both `lanes=` and the
+  reaper by the same rule that makes `no-log-evidence` a refusal. Terminating such a tree is the
+  operator's call, from the process table.
+- The human marker set is matched on the ancestor's **argv** (anywhere for the distinctive names —
+  `Terminal.app`, WezTerm, Ghostty, `gnome-terminal`, `konsole`, `code-server`, `sshd`) and on the
+  executable **basename** for the names that are also `TERM=` spellings (`xterm`, `uxterm`, `foot`),
+  so a mere mention over-refuses — which is the safe direction, because `unknown` now refuses too. A
+  terminal missing from the list costs a refusal, not a kill. `tmux`/`screen` are deliberately absent
+  (see the multiplexer boundary above).
+- `lane-reap.sh` is **not** `lane-watchdog.py`: that one reaps a *frozen dispatched child* so a
+  lane's tool call returns; this one reaps a *finished lane*. They share the identity fence and the
+  ancestry vocabulary, not the population.
+
+Regression contract: `bash scripts/orchestrator-harness/lane-reap.test.sh` (hermetic: fake
+`ps`/`kill`/`sleep`, fake `/proc`, pinned clock). It pins LIVE-never-reaped and FINISHED-always-reaped
+in both directions (TERM then KILL), the `no-log-evidence` refusal, the deleted-log 12 h bound (**measured
+on the log's HOLDER, not the wrapper**), the human refusal
+(`HUMAN`/`HUMAN-WIDENED`/`HUMAN-UNKNOWN`/`ANCESTRY-INCOMPLETE`) and the multiplexer exception
+(`SURFACE-TMUX`: the tmux launcher is walked THROUGH, never refused as human), the evidence scope
+(`EVIDENCE-SIBLING`/`EVIDENCE-AMBIGUOUS`/`EVIDENCE-TEE`/`EVIDENCE-TEE-ALIEN`/`EVIDENCE-TEE-LSOF`/
+`EVIDENCE-TEE-LSOF-ALIEN`/`EVIDENCE-TEE-LSOF-GENERIC`), the
+working-subtree skip, the evidence census and its blind-box abstention (`COUNT`/`COUNT-NO-EVIDENCE`),
+the abstention counter (`ABSTAINED`), the policy-refusal counter and its zero-judged exit
+(`INERT`/`INERT-MIXED`), and the `?`/exit-3 unreadable read.
