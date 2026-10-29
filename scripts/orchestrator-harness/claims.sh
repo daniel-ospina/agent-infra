@@ -97,24 +97,30 @@ esac
 # duplicate dispatch this file exists to prevent happens anyway. The arithmetic, from the shipped
 # defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
 #
-#   lane (LANE_TIMEOUT)            2400s   (~40 min — spawn-gate.sh's wall clock)
+#   lane (LANE_TIMEOUT)            3300s   (~55 min — spawn-gate.sh's wall clock; raised from 2400
+#                                            when a lane took ownership of its merge, #2029)
 #   chain-merge.sh waits for the PR 5400s  (90 x 60s) — it exits AT ONCE when the lane recorded a
 #                                           capacity refusal, releasing this claim within a poll
 #                                           interval (agent-infra#1909), so the ceiling below is a
 #                                           ceiling and no longer the normal cost of a refused lane
+#   chain-merge.sh merge-phase wait 1890s  (LANE_PHASE_GRACE 90 + LANE_HANDOFF_WAIT 1800, #2029)
 #   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
 #                                 ------  =======
-#                                 10800s  (3 h)
+#                                 13590s  -> 14400s (4 h)
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
-# box dies mid-lane. Raising LANE_TIMEOUT without raising this leaves a claim that expires before
-# the lane finishes — override CLAIM_ISSUE_TTL (env, or the cell's keys.env) at the same time.
+# box dies mid-lane. ⛔ RAISING ANY TERM OF THIS SUM WITHOUT RAISING THIS LEAVES A CLAIM THAT EXPIRES
+# BEFORE THE LANE FINISHES — a peer then reads the claim as free and reclaims it, which is the
+# DUPLICATE DISPATCH this file exists to prevent (agent-infra#1850). #2029 raised TWO terms
+# (LANE_TIMEOUT +900s, and the new merge-phase wait +1890s) and this default moved with them in the
+# same commit; any future change to one of the four must do the same, or override CLAIM_ISSUE_TTL
+# (env, or the cell's keys.env).
 # The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
-CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-10800}"
+CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-14400}"
 case "${CLAIM_ISSUE_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=10800 ;;
-  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=10800 ;;
+  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=14400 ;;
+  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=14400 ;;
 esac
 
 # ── THE LEASE CEILING (agent-infra#2094) ──────────────────────────────────────────────────────
@@ -183,6 +189,10 @@ export GIT_TERMINAL_PROMPT=0
 # Outputs of the last call. Globals, not stdout capture, because `$(claim_acquire …)` would run
 # it in a subshell and every one of these would be discarded by the caller.
 CLAIM_RESULT=""; CLAIM_COMMIT=""; CLAIM_REF=""; CLAIM_OWNER=""
+# Set by _claim_commit: the sha it built (also echoed, for the test seams that hand-build a lease)
+# and, when it could not, WHY. Globals for the same subshell reason as CLAIM_RESULT above — and a
+# REASON is the whole point: an empty string is what turned this into a weeks-long mystery.
+CLAIM_COMMIT_OUT=""; CLAIM_COMMIT_ERR=""
 
 # Deterministic author so claim commits do not depend on global git identity.
 #
@@ -208,13 +218,41 @@ CLAIM_RESULT=""; CLAIM_COMMIT=""; CLAIM_REF=""; CLAIM_OWNER=""
 #     for this one command keeps the resolution local; `--` stops a leading `-` being read as an
 #     OPTION — `cd -P`/`cd -L` with no operand would otherwise SUCCEED and go to $HOME (measured),
 #     so a bare-option CLAIM_REPO could claim into whatever repo $HOME happens to be.
-# NB the failure text stays the generic "could not build claim commit": making it name the repo and
-# the reason is #1990's scope (it captures stderr and validates the sha), and duplicating that here
-# would only collide with it. These guards fail CLOSED; they do not make the message better.
+# The failure TEXT is no longer generic: `_claim_repo_problem` below names the repo, the cwd and the
+# git error, and `_claim_commit` returns it to the caller (agent-infra#1990). These guards fail CLOSED
+# and now also fail LEGIBLY.
 _git() {
   ( [ -n "${CLAIM_REPO:-}" ] || return 1
     CDPATH= cd -- "${CLAIM_REPO}" 2>/dev/null || return 1
     git "$@" )
+}
+
+# _claim_repo_problem -> ONE actionable line when CLAIM_REPO cannot serve as a git work tree,
+# else the empty string. Exists because the failure it explains used to be reported as nothing at
+# all: `_claim_commit` swallowed stderr and returned an empty sha, so the caller logged
+# "could not build claim commit" with no repo, no cwd and no git error to act on.
+_claim_repo_problem() {
+  # ⛔ THIS DIAGNOSIS MUST APPLY THE SAME TWO RESOLUTION GUARDS AS `_git`, or it re-opens the hazards
+  # measured directly above (and pinned by `claim-cwd.test.sh` C9): `cd` without `CDPATH=` follows the
+  # caller's CDPATH into a foreign repo, and `cd` without `--` reads a bare `-P`/`-L` as an OPTION and
+  # SUCCEEDS into $HOME — so the line said "readable" about a directory nobody named. And a
+  # SET-BUT-EMPTY CLAIM_REPO must not be reported as `.`: `_git` refuses that value, so printing `.`
+  # here would name a repo the caller never selected.
+  local repo="${CLAIM_REPO-}" cwd
+  cwd="${PWD:-?}"
+  if [ -z "$repo" ]; then
+    printf 'CLAIM_REPO is SET BUT EMPTY (cwd=%s) — set CLAIM_REPO (or REPO) to the checkout of the repo being claimed' "$cwd"
+    return 0
+  fi
+  if ! ( CDPATH= cd -- "$repo" 2>/dev/null ); then
+    printf 'not a readable directory: CLAIM_REPO=%s (cwd=%s) — set CLAIM_REPO (or REPO) to the checkout of the repo being claimed' "$repo" "$cwd"
+    return 0
+  fi
+  if ! _git rev-parse --git-dir >/dev/null 2>&1; then
+    printf 'not a git work tree: CLAIM_REPO=%s (cwd=%s) — set CLAIM_REPO (or REPO) to the checkout of the repo being claimed' "$repo" "$cwd"
+    return 0
+  fi
+  printf ''
 }
 _cg() { _git -c user.name="fleet-claim" -c user.email="claims@localhost" "$@"; }
 
@@ -695,8 +733,34 @@ claim_pr_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_pr_key "$1")"; }
 # is by the same sha), but it makes cross-box atomicity untestable, so test-claims.sh's headline
 # assertion was flaky and must not be trusted as the cross-box proof. A unique object per
 # acquisition turns the loser's push into a genuine non-fast-forward rejection.
+# ⛔ IT NEVER RETURNS 0 WITH NO EXPLANATION. The old body was
+#   _cg commit-tree … 2>/dev/null
+# so EVERY failure mode — no repo, unreadable cwd, a git that is a shim, an unset EMPTY_TREE —
+# arrived at the caller as an empty string, and the caller could only say "could not build claim
+# commit". stderr is captured now and the sha is VALIDATED (a 40-hex line), so a warning on stderr
+# cannot be mistaken for a commit.
+# Emits the sha on stdout (the test seams hand-build leases with `$( _claim_commit … )`) and also
+# records it in CLAIM_COMMIT_OUT/CLAIM_COMMIT_ERR, because a caller that needs the REASON must call
+# this NOT in a command substitution — see _claim_acquire_at.
+# ⛔ THE FAILURE PATH RETURNS 2, NOT 0 (review catch, 2026-10-18). The globals are set INSIDE the
+# substitution's subshell, so a `$( )` caller only ever sees stdout + the exit status — with `return
+# 0` it saw "success, empty string", and two seams then chained `git push "$c:$ref"` on it, where an
+# empty source is a REFSPEC THAT DELETES the ref. The direct caller ignores the status and reads the
+# globals, so returning 2 changes nothing for it.
 _claim_commit() {
-  _cg commit-tree "$EMPTY_TREE" -m "claim owner=$1 lease_until=$2 nonce=$RANDOM$RANDOM$$-$(date +%s%N)" 2>/dev/null
+  local out rc sha why
+  out="$(_cg commit-tree "$EMPTY_TREE" -m "claim owner=$1 lease_until=$2 nonce=$RANDOM$RANDOM$$-$(date +%s%N)" 2>&1)"; rc=$?
+  sha="$(printf '%s\n' "$out" | grep -E '^[0-9a-f]{40}$' | head -1)"
+  if [ "$rc" -eq 0 ] && [ -n "$sha" ]; then
+    CLAIM_COMMIT_OUT="$sha"; CLAIM_COMMIT_ERR=""
+    printf '%s\n' "$sha"
+    return 0
+  fi
+  CLAIM_COMMIT_OUT=""
+  why="$(_claim_repo_problem)"
+  # Prefer the repo diagnosis (it names the fix); otherwise report git's own words.
+  CLAIM_COMMIT_ERR="${why:-git commit-tree exited $rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)}"
+  return 2
 }
 
 # _lease_of <ref> -> "owner lease_until" parsed from the claim commit message ("" if absent)
@@ -842,8 +906,16 @@ _claim_acquire_at() {
   # always means "the commit THIS attempt may have pushed".
   CLAIM_COMMIT=""
   now="$(date +%s)"; until=$(( now + ttl ))
-  commit="$(_claim_commit "$CLAIM_OWNER" "$until")"
-  if [ -z "$commit" ]; then CLAIM_RESULT="could not build claim commit"; echo "$CLAIM_RESULT"; return 2; fi
+  # ⛔ NOT `commit="$(_claim_commit …)"`: that runs in a SUBSHELL, so the reason this function sets
+  # would be discarded and the caller would be back to an empty explanation. Called directly, the
+  # globals survive; `>/dev/null` drops the echoed sha we already have in CLAIM_COMMIT_OUT.
+  CLAIM_COMMIT_OUT=""; CLAIM_COMMIT_ERR=""
+  _claim_commit "$CLAIM_OWNER" "$until" >/dev/null
+  commit="${CLAIM_COMMIT_OUT:-}"
+  if [ -z "$commit" ]; then
+    CLAIM_RESULT="could not build claim commit — ${CLAIM_COMMIT_ERR:-unknown failure building a claim commit object}"
+    echo "$CLAIM_RESULT"; return 2
+  fi
 
   # --- attempt 1: atomic create. Fails if the ref exists — and every claim commit is a ROOT
   #     commit, so a different claim can never fast-forward it, whatever the timing.
@@ -1049,9 +1121,38 @@ _claim_status_at() {
 #                  merge is not refused by a network blip): there, refusing costs one PR's merge;
 #                  here, certifying a free issue costs duplicated work on two boxes.
 # Sets CLAIM_RESULT; echoes it, so a caller in a subshell still sees the reason.
+# claim_pr_preflight <repo> <pr> — the SAME pre-flight read, keyed by the coarse PR claim
+# (agent-infra#1952's `pr-<N>` key, the one merge-one.sh takes for LANDING). The PR SICKNESS QUEUE
+# (pr-sickness.sh) uses it as its holder read: the question it asks is "does a lane already own this
+# PR?", and the answer must carry a registry's polarity rather than a local pid's — rc=2
+# (INCOMPLETE) is NOT FREE, because an abstention is not permission.
+#  0 CLEAN / 1 COLLISION / 2 INCOMPLETE. Sets CLAIM_RESULT exactly as the issue-keyed sibling does.
+claim_pr_preflight() {
+  _claim_preflight_at "$(claim_pr_ref "$2")" "PR #$2"
+}
+
+# claim_head_preflight <repo> <pr> <sha> — the PER-HEAD question, and the one a FIXER/reviewer asks.
+# ⛔ THE COARSE `pr-<N>` KEY ANSWERS A DIFFERENT QUESTION: claims.sh documents it as taken ONLY by the
+# landing path (merge-one.sh). A peer fixing head H holds `refs/claims/<PR>-<sha12>` (claim_acquire),
+# which claim_pr_preflight never looks at — so a two-box fleet read CLEAN for a head another box was
+# already fixing, and only fix-one.sh's own CAS stopped the duplicate AFTER the attempt was booked.
+claim_head_preflight() {
+  _claim_preflight_at "$(claim_ref "$2" "$3")" "PR #$2 at $(printf '%s' "${3:-}" | cut -c1-12)"
+}
+
 claim_issue_preflight() {
-  local issue="$1" ref out rc cur tmp lease owner until now
-  ref="$(claim_issue_ref "$issue")"
+  _claim_preflight_at "$(claim_issue_ref "$1")" "#$1"
+}
+
+# _claim_preflight_at <ref> <label> — ONE polarity for every keying (per-head, issue, landing).
+# `label` is what the line says ("#123" / "PR #123"). Two copies of this decision is exactly how a
+# reader and a writer of the same datum drift.
+# `_why` carries agent-infra#1990's repo diagnosis into the UNREADABLE branch: an empty reason is
+# what turned a broken CLAIM_REPO into a weeks-long mystery, so the local belongs here with the
+# body that reads it (main's refactor of this function split the header off, and the two must list
+# the same locals — a var read but not declared is a global, i.e. a leak between pre-flights).
+_claim_preflight_at() {
+  local ref="$1" label="$2" out rc cur tmp lease owner until now _why
   # ⛔ THE EXIT STATUS IS THE DISTINCTION THAT MATTERS HERE. `git ls-remote <ref>` exits 0 with
   # EMPTY output when the ref simply does not exist, and NON-ZERO only when the remote itself could
   # not be consulted (measured: rc=128 for an unreachable remote). Collapsing the two — which is
@@ -1059,18 +1160,21 @@ claim_issue_preflight() {
   # false CLEAN this gate exists to remove.
   out="$(_git ls-remote origin "$ref" 2>/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ]; then
-    CLAIM_RESULT="the claim registry is UNREADABLE ($ref: git ls-remote exited $rc) — INCOMPLETE, never CLEAN"
+    # Name the repo when the repo itself is the reason: a controller pointed at a non-repo refuses
+    # EVERY issue identically, and "the registry is unreadable" alone reads as a network blip.
+    _why="$(_claim_repo_problem)"
+    CLAIM_RESULT="the claim registry is UNREADABLE ($ref: git ls-remote exited $rc)${_why:+ — $_why} — INCOMPLETE, never CLEAN"
     echo "$CLAIM_RESULT"; return 2
   fi
   cur="$(printf '%s\n' "$out" | awk '{print $1}')"
   if [ -z "$cur" ]; then
-    CLAIM_RESULT="no claim on #$issue"
+    CLAIM_RESULT="no claim on $label"
     echo "$CLAIM_RESULT"; return 0
   fi
   tmp="$CLAIM_TMP_NS/pre-$RANDOM$$"
   if ! _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
     _git update-ref -d "$tmp" 2>/dev/null
-    CLAIM_RESULT="a claim ref exists for #$issue but its lease could not be read — INCOMPLETE, never CLEAN"
+    CLAIM_RESULT="a claim ref exists for $label but its lease could not be read — INCOMPLETE, never CLEAN"
     echo "$CLAIM_RESULT"; return 2
   fi
   lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
@@ -1086,7 +1190,7 @@ claim_issue_preflight() {
   # answer, which is the one direction this gate must never fail in (it duplicates the work).
   now="$(date +%s)"
   if _lease_unparseable "$until"; then
-    CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} (lease unreadable — treated as live; held-by-live)"
+    CLAIM_RESULT="a claim on $label is held by ${owner:-?} (lease unreadable — treated as live; held-by-live)"
     echo "$CLAIM_RESULT"; return 1
   fi
   case "${now:-}" in
@@ -1103,13 +1207,13 @@ claim_issue_preflight() {
     local orph
     orph="$(claim_orphan_reason "$owner" "$ref")" || orph=""
     if [ -n "$orph" ]; then
-      CLAIM_RESULT="the only claim on #$issue is ORPHANED (${owner:-?}: $orph; held-by-orphan) — free to reclaim"
+      CLAIM_RESULT="the only claim on $label is ORPHANED (${owner:-?}: $orph; held-by-orphan) — free to reclaim"
       echo "$CLAIM_RESULT"; return 0
     fi
-    CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} until $until ($(( until - now ))s left; held-by-live)"
+    CLAIM_RESULT="a claim on $label is held by ${owner:-?} until $until ($(( until - now ))s left; held-by-live)"
     echo "$CLAIM_RESULT"; return 1
   fi
-  CLAIM_RESULT="the only claim on #$issue EXPIRED at $until (was ${owner:-?}) — free to reclaim"
+  CLAIM_RESULT="the only claim on $label EXPIRED at $until (was ${owner:-?}) — free to reclaim"
   echo "$CLAIM_RESULT"; return 0
 }
 
@@ -1191,10 +1295,24 @@ claim_snapshot() {
   local out="${1:-$HOME/orchestrator/state/claims-snapshot}"
   local tmp="$out.$$"
   : > "$tmp"
+  # ⛔ A FAILED FETCH MUST NOT REPLACE A GOOD SNAPSHOT WITH AN EMPTY ONE, AND MUST SAY SO (review
+  # catch, 2026-10-18). The old shape was `fetch … || true` and then an unconditional `mv`, so ANY
+  # fetch failure — a 30 s network blip, or the unreadable cwd of the 2026-10-18 incident — wrote an
+  # EMPTY file over the last good one, and `claim_live()` reads "absent from the snapshot" as "free".
+  # Measured: 3 claims on origin, 0 snapshot lines, nothing logged anywhere, while ARCHITECTURE said
+  # this path "fail-open on an unreachable store (logs it)". The prior snapshot is now KEPT (its
+  # leases are self-dating, so a stale one can only make the sweep abstain, never grant a claim), and
+  # the reason is written where the operator reads it.
   # --prune so a claim DELETED on another box (released, or pruned) does not linger here.
   # ⛔ It prunes by DESTINATION pattern, so worker-side temp refs must live in CLAIM_TMP_NS, never
   # under CLAIM_CACHE_NS — a snapshot must not delete a concurrent lease read (P2).
-  _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null || true
+  if ! _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null; then
+    rm -f "$tmp"
+    local why; why="$(_claim_repo_problem)"
+    printf 'claim_snapshot: registry refresh FAILED — %s (previous snapshot kept: %s)\n' \
+      "${why:-git fetch exited non-zero}" "$out" >&2
+    return 1
+  fi
   _git for-each-ref --format='%(refname)' "$CLAIM_CACHE_NS" 2>/dev/null | while read -r ref; do
     [ -n "$ref" ] || continue
     local lease owner until
@@ -1275,4 +1393,133 @@ claim_prune() {
       _git update-ref -d "$ref" 2>/dev/null && echo "pruned leaked temp ref $ref"
     fi
   done
+}
+
+# ── THE HOLD-PROOF AT THE ACTION SITE (agent-infra#2867) ─────────────────────────────
+# The claim registry fences DISPATCH (the pre-flight read and the acquire CAS). It does NOT
+# fence ACTION: a dead or duplicated harness that still holds a stale claim commit — or that
+# never took one — reaches the acting tool (`gh pr merge`) with nothing refusing it. This
+# function is the fence AT the action site. The acting tool calls it with the PR, the head it
+# is about to act on, and the claim commit it believes it holds, and it REFUSES unless ALL of
+# these hold:
+#
+#   (i)   a claim ref `refs/claims/<pr>-<sha12>` EXISTS on the remote;
+#   (ii)  the ref's tip IS the actor's own commit — the FENCING TOKEN. A peer that reclaimed
+#         the claim moved the ref, so a stale actor's token no longer matches and its action
+#         is refused (Kleppmann's fencing token, enforced by the registry's own CAS);
+#   (iii) the claim's owner names THIS box (the running host or one of its former names) — a
+#         claim minted by another box is not this actor's;
+#   (iv)  the holder is not ORPHANED — for a local PR claim, the pid that took it must still
+#         be alive (claim_orphan_reason's local rule). A dead holder's claim is expired by
+#         code, so its actor is refused.
+#
+# ⛔ NEVER GUESSES, NEVER FALLS OPEN. An unreadable registry, an absent ref, a mismatched tip,
+# an unparseable owner, or a dead holder all REFUSE (rc != 0). rc 0 is returned ONLY when the
+# proof positively holds. rc 1 (refused) and rc 2 (unreadable) are BOTH refusals — the rc
+# distinguishes "I read it and you are not the holder" from "I could not read it", and neither
+# is ever a pass.
+#
+# ⛔ LEASE-AS-DATA, NOT LIVENESS, IS UNCHANGED (#1709 rec 3). This proof does NOT re-derive,
+# renew, or re-key the lease: it reads the claim's owner (for the actor check) and the holder's
+# pid (for the orphan check), exactly as claim_acquire / claim_prune already do. The wall-clock
+# lease's EXPIRY is decided by claim_prune ("released by code"), which deletes the ref — so a
+# dead harness whose claim was pruned fails check (i). Session liveness (transcript growth) is
+# the ORPHAN REPORT's question (scripts/orchestrator-harness/orphaned-harness.sh), answered by
+# tools/fleet/liveness.py — the single verdict function — never by a second opinion here.
+#
+# claim_action_proof <pr> <head-sha> <own-commit>
+#   Sets CLAIM_ACTION_RESULT to a machine-readable one-line reason and echoes it (so a caller
+#   in a command substitution still sees the reason). Returns 0 (held) / 1 (refused) / 2
+#   (unreadable — also a refusal).
+claim_action_proof() {
+  local pr="${1:-}" head="${2:-}" own="${3:-}"
+  local ref cur tmp lease owner until now orph host held_owner
+  # ⛔ VALIDATE AT THE DOOR — an unreadable input is a REFUSAL (rc 2), never a pass.
+  case "$pr" in ''|*[!0-9]*)
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=<unreadable> reason=non-numeric-pr"
+    echo "$CLAIM_ACTION_RESULT"; return 2 ;; esac
+  case "$head" in ''|*[!0-9a-fA-F]*)
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=<unreadable> reason=non-hex-head"
+    echo "$CLAIM_ACTION_RESULT"; return 2 ;; esac
+  if [ "${#head}" -ne 40 ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} reason=head-not-40-hex"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+  case "$own" in ''|*[!0-9a-f]*)
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} reason=non-hex-token"
+    echo "$CLAIM_ACTION_RESULT"; return 2 ;; esac
+  if [ "${#own}" -ne 40 ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} reason=token-not-40-hex"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+
+  ref="$(claim_ref "$pr" "$head")"
+  # (i) the claim must EXIST. An absent ref (released, pruned, or never taken) is a refusal —
+  #     an actor that cannot show a claim does not hold this PR/head. ⛔ THE EXIT STATUS IS THE
+  #     DISTINCTION: `git ls-remote <ref>` exits 0 with EMPTY output when the ref simply does not
+  #     exist, and NON-ZERO only when the remote itself could not be consulted (the same split
+  #     `_claim_preflight_at` makes). Collapsing the two reads an outage as "no claim", which is
+  #     the one direction this gate must never fail in.
+  local lrc=0 lout
+  lout="$(_git ls-remote origin "$ref" 2>/dev/null)"; lrc=$?
+  if [ "$lrc" -ne 0 ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=<unreadable> reason=registry-unreadable"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+  cur="$(printf '%s\n' "$lout" | awk '{print $1}')"
+  if [ -z "$cur" ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=<none> reason=no-claim"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  # (ii) FENCING — the tip must be the actor's own commit. A peer that reclaimed the claim
+  #      moved the ref, so a stale token belongs to a DIFFERENT holder's claim.
+  if [ "$cur" != "$own" ]; then
+    held_owner="?"
+    tmp="$CLAIM_TMP_NS/proof-$RANDOM$$"
+    if _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
+      lease="$(_lease_of "$tmp")"; held_owner="${lease%%$'\t'*}"
+      _git update-ref -d "$tmp" 2>/dev/null
+    fi
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=$held_owner reason=fence-mismatch"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  # Read the lease/owner of the ACTOR'S OWN claim (the tip IS the actor's commit).
+  tmp="$CLAIM_TMP_NS/proof-$RANDOM$$"
+  if ! _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
+    _git update-ref -d "$tmp" 2>/dev/null
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=<unreadable> reason=claim-unreadable"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+  lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
+  owner="${lease%%$'\t'*}"; until="${lease##*$'\t'}"
+  host="${owner%%:*}"
+  # (iii) the claim must name THIS box (the running host or a former name).
+  if ! claim_host_is_local "$host"; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=${owner:-?} reason=foreign-holder"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  # (iv) the holder must not be ORPHANED — a dead pid on this box cannot be the acting lane.
+  orph="$(claim_orphan_reason "$owner" "$ref")" || orph=""
+  if [ -n "$orph" ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=${owner:-?} reason=orphaned-holder detail=$(printf '%s' "$orph" | tr ' ' '_')"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  CLAIM_ACTION_RESULT="claim-action-proof: HELD pr=$pr head=${head:0:12} holder=${owner:-?}"
+  echo "$CLAIM_ACTION_RESULT"; return 0
+}
+
+# claim_host_is_local <host> -> 0 when the host IS this box (running host or a former name),
+# 1 otherwise. The same "local" computation claim_orphan_reason uses for its pid rule, factored
+# out for the hold-proof's "names this actor" check (agent-infra#2867). A probe that cannot
+# answer (empty or the fleet-wide `box` sentinel) ABSTAINS — it is not local.
+claim_host_is_local() {
+  local h="${1:-}" me real
+  [ -n "$h" ] || return 1
+  [ "$h" = "box" ] && return 1
+  me="$(claim_host)"
+  real="$(hostname -s 2>/dev/null)" || real=""
+  if [ -n "$me" ] && [ "$h" = "$me" ]; then return 0; fi
+  if [ -n "$real" ] && [ "$h" = "$real" ]; then return 0; fi
+  case " $(claim_former_hosts) " in *" $h "*) return 0 ;; esac
+  return 1
 }
