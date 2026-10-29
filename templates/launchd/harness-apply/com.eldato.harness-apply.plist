@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- eldato harness apply, the SAME pass the Linux cells run on a systemd timer (#2416).
+         Scheduled here by scripts/install-harness-apply-timer.sh, which renders this file and
+         bootstraps it. ONE install verb, the platform's own scheduler (#2058).
+
+         WHY THIS FILE IS NOT IN templates/launchd/. scripts/install-launchd.sh installs EVERY
+         templates/launchd/*.plist with NO arguments and a different substitution set, and
+         pi-bootstrap/setup.sh runs it on every Darwin box. A copy there would render with its
+         placeholders unresolved, be SKIPPED with a warning, and the box would silently have no
+         scheduled pass while the installer printed nothing wrong. The subdirectory keeps it out of
+         that glob and out of templates/launchd/RETIRED (which errors on a label that has both).
+
+         NO PLACEHOLDER MAY APPEAR INSIDE AN XML COMMENT. This comment is XML text: a doubled dash
+         is forbidden in it, so a placeholder that renders an option flag would make the installed
+         plist not parse, launchd would refuse it, and the box would silently have no pass. That is
+         why this block names placeholders without braces, and why do_install_launchd refuses a
+         rendered plist that does not parse.
+
+         WHY THE ENTRY POINT IS THE CHECKOUT'S OWN PYTHON, NOT bash. macOS TCC is per-binary: a
+         launchd-spawned bash cannot read a script under ~/Documents and a launchd-spawned git
+         cannot read a repo there, so a pass whose whole job is git against that checkout would
+         fail closed every ten minutes while launchctl list showed a healthy job. The interpreter
+         that holds the access reads the script and hands it to bash on stdin (the same launcher
+         install-disk-reaper-timer.sh uses). No usable interpreter is a REFUSAL at install time.
+
+         TEN MINUTES, matching the systemd timer. The pass is a NO-OP when the pin already equals
+         the ref tip, so a converged box pays one fetch per tick.
+
+         No StandardOutPath/StandardErrorPath: the pass writes its own record and log under
+         HARNESS_APPLY_STATE_DIR, and an unbounded launchd-captured log is the symlink-truncation
+         surface the reapers already guard. -->
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PY_BIN}}</string>
+        <string>{{LAUNCHER}}</string>
+        <string>--script</string>
+        <string>{{PASS}}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <!-- ONE record, one path: the scheduled pass and an operator's status verb read the same
+             file. (An option flag is spelled without its dashes here on purpose: a doubled dash is
+             forbidden inside an XML comment, and writing one makes this plist unparseable.) -->
+        <key>HARNESS_APPLY_STATE_DIR</key>
+        <string>{{STATE_DIR}}</string>
+        <!-- The checkout is PINNED, never resolved from the job's environment: a launchd job inherits
+             none of a login shell's rc files, so leaving it ambient would converge a different tree
+             and say so nowhere. -->
+        <key>HARNESS_APPLY_REPO</key>
+        <string>{{PASS_REPO}}</string>
+        <key>HARNESS_APPLY_REF</key>
+        <string>{{PASS_REF}}</string>
+        <!-- An empty value is meaningful: the pass decides pin-vs-sync from the box's own posture. -->
+        <key>HARNESS_APPLY_MODE</key>
+        <string>{{PASS_MODE}}</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>{{INTERVAL_SEC}}</integer>
+    <!-- A pass AT LOAD as well as on the interval, so a freshly installed agent has a record within
+         seconds instead of after the first interval. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- A background convergence, never a deadline: it must not compete with a lane for CPU or I/O. -->
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

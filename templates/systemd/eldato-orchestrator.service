@@ -1,0 +1,131 @@
+[Unit]
+# eldato orchestrator controller — the cell's dispatcher, owned by a service manager (agent-infra#2402).
+#
+# WHY THIS UNIT EXISTS. `cloud-cell-supervisor.sh start` handed the controller to a tmux session, and a
+# tmux session has NOTHING above it: when the box empties and the last session closes, the server exits
+# and no surface restarts the controller. The cell then sits idle with no dispatcher and reads as a
+# healthy idle box. MEASURED 2026-10-23 on cell-1: at 02:20Z `tmux ls` printed "no server running on
+# /tmp/tmux-1000/default" and `pgrep -fc "[o]rch-loop.sh"` printed 0, while landings on that box had
+# completed normally at 01:56/02:10/02:16 — the lanes finished and exited. Nothing crashed, which is
+# exactly why nothing reported it. This unit is the supervisor that was missing.
+#
+# Rendered by scripts/install-controller-service.sh (the same installer pattern the disk reaper's timer
+# uses): one verb that renders, installs and converges, and fails loudly rather than skipping.
+Description=eldato orchestrator controller — the cell's dispatcher (agent-infra#2402)
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/controller-service.md
+# The controller's first cycle reads GitHub and the candidate board, and `start` runs those reads as a
+# PRE-FLIGHT: offline, `cmd_check` fails and `start` exits non-zero BEFORE the loop ever runs, so the
+# ordering is load-bearing rather than cosmetic.
+# ⛔ AND IT BINDS ONLY IN THE SYSTEM SCOPE (review P1, #2402). `network-online.target` lives in the SYSTEM
+# manager only (`/usr/lib/systemd/system/`); a per-user manager ships default/basic/graphical-session/timers
+# and no network target, so a USER-scope unit's dependency is DROPPED by systemd rather than honoured. Both
+# scopes render these two lines (one template, one owner for the property), and the installer SAYS so when
+# it installs into the user scope: there a boot without network can spend all three attempts and converge
+# to `failed`, which nothing re-arms automatically by design — re-arm with `--install` or `start`.
+After=network-online.target
+Wants=network-online.target
+# ⛔ THE START LIMIT IS NAMED EXPLICITLY, because systemd's DEFAULT CANNOT FIRE HERE — leaving it
+# implicit made the intent below false. systemd's default window is 10 s (`DefaultStartLimitIntervalSec`),
+# and at most one start per RestartSec (15 s) can ever occur, so the default 5-in-10 s burst is
+# unreachable: a box that cannot start a controller for a CONFIGURATION reason (no key, a foreign
+# controller, a bad pin) would restart every 15 s forever, re-running cmd_check's network reads on every
+# attempt with the failure living only in a journal. 3 failures inside 5 minutes is not a transient — it
+# is a configuration fault — and it must converge to `failed`, which is what `--status` prints and what an
+# operator can act on. (A deliberate `systemctl stop` never counts: systemd does not restart on a stop.)
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=CELL_HOME={{CELL_HOME}}
+Environment=ENV_FILE={{ENV_FILE}}
+Environment=PATH={{PATH}}
+# The controller's state dir, carried EXPLICITLY for the same reason the tmux session string carries it
+# (`O='$O'`): the supervisor derives it from $ENV_FILE when that file sets it, and a unit that omitted it
+# would leave the installer's own read-backs (`--status`, the heartbeat) watching one directory while the
+# controller used another.
+Environment=O={{O}}
+# ⛔ THE UNIT NAME THE VERBS ADDRESS IS CARRIED TOO (review P1, #2402). `install-controller-service.sh`
+# honours a `CONTROLLER_UNIT` override for the FILE name, and the supervisor's `start`/`stop`/`status`
+# default it to `eldato-orchestrator.service`: an install under any other name was invisible to every
+# cooperating verb — `stop` killed pids and printed "stopped" over a unit `Restart=always` revived within
+# RestartSec, `status` printed `supervision: NONE`, and `start` could take the tmux path beside an enabled
+# unit (#1761's two dispatchers). Rendering it makes the name ONE fact, read by whoever runs the verb.
+Environment=CONTROLLER_UNIT={{UNIT_NAME}}
+# ⛔ THE CONTROLLER IS THIS UNIT'S MAIN PROCESS, NOT A CHILD IN A SESSION. `start` sees this variable and
+# `exec`s the loop instead of creating a tmux session, so the unit's cgroup owns the controller's
+# lifetime. Every other verb cooperates with that: `stop` stops the UNIT (a pid kill is undone by
+# Restart=always within RestartSec) and `start` starts the unit when one is enabled (a tmux controller
+# beside an enabled unit is two dispatchers on one queue, #1761).
+Environment=ORCH_FOREGROUND=1
+ExecStart=/bin/bash {{SUPERVISOR}} start
+# ⛔ `always`, NOT `on-failure`. The measured case is an ORDERLY exit: the lanes finish, the controller
+# returns 0, and nothing came back — `on-failure` reproduces that defect byte for byte. `Restart=always`
+# restarts on a crash, a kill AND a clean exit, which is the whole requirement.
+Restart=always
+RestartSec={{RESTART_SEC}}
+# ⛔ `process`, NOT `mixed` (review P1, #2402). `mixed` SIGKILLs "all remaining processes of the
+# unit's control group" after the main process exits — and this unit's cgroup does NOT contain only
+# this controller. In the foreground branch `start_doctor_loop` creates the doctor's tmux session, and
+# when no tmux server is running (the MEASURED #2402 shape: "no server running on /tmp/tmux-1000/default")
+# the `tmux` client forks the SERVER as a child of this process, so the server is BORN in this cgroup
+# and keeps that membership after it detaches. A `systemctl stop`/`restart` would therefore SIGKILL
+# the whole per-user tmux server and every session on it — this cell's lanes, a peer repo's controller,
+# an operator's shell — silently, mid-flight, and BEFORE `cmd_stop`'s ownership proof runs. That proof
+# is the discipline that lets `stop` kill a session only once it has shown the session is this state
+# dir's (#1856); a cgroup kill cannot make that distinction and does not try.
+# `orch-loop.sh` traps TERM and exits in ~0.1s (agent-infra#1715), so `process` signals the controller
+# and nothing else, and `cmd_stop` stays the ONE place that tears sessions down. The old `mixed`
+# rationale — "a stop must not orphan a half-spawned worker" — does not survive contact with the
+# measured shape: a LANE lives in a tmux session on the shared server, which `mixed` kills wholesale
+# rather than selectively, and the helpers that are genuine children are short-lived `gh`/`git` clients.
+KillMode=process
+TimeoutStopSec=30
+# ⛔ THE START BOUND IS THE PROCESS'S, NOT THIS DIRECTIVE (review P1, #2402). `ExecStart` runs the WHOLE of
+# `start`, and in service mode `start` WAITS for a controller that is already running before it takes over.
+# For `Type=simple` the start job is finished the moment the main process is forked (systemd.service(5)), so
+# `TimeoutStartSec=` CANNOT bound that wait. An earlier revision of this file, the installer, the supervisor
+# and the doc all claimed it did — and the claim was INERT: the real bound was the supervisor's own 3600 s
+# default, so a handover that could never complete parked `ExecStart` for an hour, with the unit reading
+# `active (running)` and `--status` reading supervised. The wait is bounded by the SUPERVISOR, and BOTH of
+# its bounds are rendered into its environment here, where an operator can read them:
+#   CONTROLLER_HANDOVER_TIMEOUT  a controller this state dir OWNS is still running. That is the migration
+#                                path and it is LANDING WORK, so the wait is legitimately long.
+#   CONTROLLER_ORPHAN_TIMEOUT    the session outlived its loop. An orphan never exits, so this start can
+#                                NEVER succeed: it must be short enough that StartLimitBurst of those attempts
+#                                FIT INSIDE StartLimitIntervalSec (`burst × (orphan + RestartSec) < interval`),
+#                                which is what makes the burst fill and the unit converge to `failed`. At one
+#                                start per `orphan + RestartSec`, "below the interval" is NOT enough — the
+#                                installer enforces the arithmetic for exactly that reason.
+#                                ⛔ AND THE INSTALLER RESERVES SLACK INSIDE THAT RELATION (review P2 round 16,
+#                                #2402): it subtracts the 5 s poll quantum and 5 s of supervisor startup, so
+#                                the ORPHAN CEILING it accepts is `(interval-1)/burst - RestartSec - 5 - 5` —
+#                                74 s at these defaults, not the 84 s the plain relation suggests. (The
+#                                quantum is a reserve, not an overrun: `foreground_handover` tests the NEXT
+#                                step. Both allowances are owned by scripts/install-controller-service.sh.)
+#                                ⛔ AND THE WINDOW IS NECESSARY, NOT SUFFICIENT (review P1 round 17, #2402): a
+#                                CONFIGURATION fault does not wait on the orphan ceiling — it dies in
+#                                `cmd_check`/`harness_apply`, whose cost NOTHING bounds (no `timeout` wraps the
+#                                pre-flight, so a hung credential or network read can outlast this window). A
+#                                slow-enough pre-flight therefore restarts for ever while `--status` reads
+#                                supervised. Bounding that phase is a separate change; it is not claimed here.
+# `TimeoutStartSec=` is kept as the systemd-side counterpart of the orphan bound — it keeps the pair true if
+# this unit ever changes `Type=` — but it is not what enforces either bound today.
+TimeoutStartSec={{START_TIMEOUT_SEC}}
+Environment=CONTROLLER_HANDOVER_TIMEOUT={{HANDOVER_TIMEOUT_SEC}}
+Environment=CONTROLLER_ORPHAN_TIMEOUT={{START_TIMEOUT_SEC}}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# ⛔ THE TARGET DIFFERS BY SCOPE, AND THE USER SCOPE'S IS NOT multi-user.target. `multi-user.target` does
+# not exist in a per-user manager (`systemd-analyze unit-paths --user` lists only the user dirs, and
+# `/usr/lib/systemd/user/` ships default/basic/graphical-session/timers — no multi-user), so `enable` in
+# the USER scope would write a `multi-user.target.wants/` symlink for a target that is never loaded: the
+# unit runs because the installer starts it now, and NOTHING brings it back at next boot — the #2402
+# defect one layer down, on the very scope whose linger gate exists to survive a logout. The installer
+# renders this line per target (`multi-user.target` system, `default.target` user) and refuses a render
+# that names the wrong one.
+WantedBy={{WANTED_BY}}

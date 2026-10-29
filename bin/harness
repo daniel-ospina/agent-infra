@@ -26,7 +26,7 @@
 #   bin/harness status --json     # machine-readable
 #
 # EXIT: doctor — 0 healthy · 1 drift · 2 UNKNOWN (cannot verify — never a pass)
-#       status — 0 HEALTHY · 1 DEGRADED · 2 ABSENT/UNREADABLE (no answer is never a pass)
+#       status — 0 HEALTHY · 1 DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (no answer is never a pass)
 #
 # ── `status`: THE SELF-DISPATCH PROOF (measured 2026-10-21) ─────────────────────────────────────
 # MEASURED: the controller log on cell-1 was 37h STALE and on the other two cells no log was found
@@ -36,6 +36,10 @@
 # and this verb grades the NEWEST of them:
 #   HEALTHY     the newest record is younger than TWO of the box's own cycles
 #   DEGRADED    it is older than that — the controller is not cycling (rc 1)
+#   FORK-STARVED the controller is alive and fresh, and its own fork reading says the box could not
+#               spawn (rc 1). Added for agent-infra#2293: measured 2026-10-21 a box at 0.32x load could
+#               not fork at all, and this verb could previously only answer "alive" or "not cycling" —
+#               neither of which describes a box that is alive and cannot start anything.
 #   ABSENT      there is no record at all — never healthy, never "nothing to do" (rc 2)
 #   UNREADABLE  the record cannot be parsed or the clock cannot be read (rc 2)
 # A live pane is not evidence of a dispatch; a fresh record is.
@@ -101,10 +105,110 @@ if [ "$cmd" = "status" ]; then
   declare -f cycle_verdict >/dev/null 2>&1 || { echo "harness status: ABSENT — cycle-record.sh is present but defines no cycle_verdict"; exit 2; }
   _out="$(cycle_verdict "$O_DIR" "$INTERVAL")"; _rc=$?
   _verdict="${_out%% *}"
+
+  # ── THE LANDING READ (agent-infra#2320) ──────────────────────────────────────────────────
+  # "Is this box able to LAND anything at all?" — a question the cycle record CANNOT answer, and
+  # the one whose silence cost hours: on 2026-10-22 a Mac's gh chain resolved to itself, every gh
+  # call returned EMPTY, and the merge contract therefore read UNREADABLE while the box looked
+  # merely "not dispatching". Both halves are answered by ONE module (`repo-authority.sh`, the
+  # module that already owns the merge contract), sourced from the SAME two homes as
+  # `cycle-record.sh`, and gated on the INTERFACE so a stale `$O` copy is NAMED instead of crashing.
+  # ⛔ DISTINGUISHED FROM LOAD, DELIBERATELY AND IN THE OUTPUT. The cycle record's `nothing=`/`bound=`
+  # fields already name a load/capacity refusal (`bound=load_per_cpu`); a landing blocker is a
+  # DIFFERENT failure with a DIFFERENT remedy, so it is its own dimension with its own consequence
+  # line — never folded into the cycle verdict, which would make an idle box and an unable-to-land
+  # box read alike.
+  _ramod=""
+  for _d in "$O_DIR" "$CANON"; do
+    [ -n "$_ramod" ] && break
+    [ -f "$_d/repo-authority.sh" ] && _ramod="$_d/repo-authority.sh"
+  done
+  # ⛔ ONE WORD FOR ONE STATE. The "could not answer" value is `UNVERIFIABLE` everywhere — the same
+  # word `gh_chain_read` prints and the doctor's own fork arm already uses in this file. Two spellings
+  # (`UNVERIFIED` beside `UNVERIFIABLE`) is how a reader ends up testing for the wrong one.
+  LAND_GH="UNVERIFIABLE"; LAND_GH_PATH=""; LAND_GH_DETAIL=""; LAND_GH_VER=""; LAND_GH_SOURCE=""
+  LAND_CON="UNVERIFIABLE"; LAND_REPO=""; LAND_REQ=""; LAND_CON_WHY=""
+  if [ -n "$_ramod" ]; then
+    # shellcheck source=/dev/null
+    . "$_ramod"
+  fi
+  if ! declare -f gh_chain_read merge_contract_read >/dev/null 2>&1; then
+    # ⛔ ONE BRANCH PER FACT. `"${x:+at $x}${x:-is MISSING}"` CONCATENATES both arms when x is set
+    # (fresh review P2): on a pre-#2320 `$O` — the state every deployed box is in until it is re-seeded —
+    # the operator's one diagnostic named `<path><path>`, a file that cannot exist.
+    if [ -n "$_ramod" ]; then
+      LAND_GH_DETAIL="repo-authority.sh at $_ramod defines no gh_chain_read/merge_contract_read — the landing read is UNVERIFIABLE (a stale \$O copy; re-seed it). An unanswered read is not a pass"
+    else
+      LAND_GH_DETAIL="no repo-authority.sh in \$O or beside this command — the landing read is UNVERIFIABLE (an absent module is not a pass)"
+    fi
+  else
+    _ghline="$(gh_chain_read 2>/dev/null)"; _ghrc=$?
+    case "$_ghline" in
+      'GH=OK'*)
+        # `path=` IS LAST in the protocol, so it is taken to end-of-line and a path containing a SPACE
+        # survives (fresh review P2: with the old order `/Volumes/My Passport/…` truncated at the
+        # space, so the printed remedy path and `landing.ghPath` named a file that does not exist).
+        LAND_GH="OK"
+        LAND_GH_SOURCE="$(printf '%s\n' "$_ghline" | sed -n 's/.* source=\([^ ]*\) .*/\1/p')"
+        LAND_GH_VER="$(printf '%s\n' "$_ghline" | sed -n 's/.* ver=\(.*\) path=.*/\1/p')"
+        LAND_GH_PATH="$(printf '%s\n' "$_ghline" | sed -n 's/.* path=//p')" ;;
+      'GH=CANNOT-REACH-REAL-GH'*)
+        LAND_GH="CANNOT-REACH-REAL-GH"
+        LAND_GH_DETAIL="$(printf '%s\n' "$_ghline" | sed -n 's/^GH=CANNOT-REACH-REAL-GH msg=//p')" ;;
+      'GH=UNVERIFIABLE'*)
+        LAND_GH="UNVERIFIABLE"
+        LAND_GH_DETAIL="$(printf '%s\n' "$_ghline" | sed -n 's/^GH=UNVERIFIABLE //p')" ;;
+      *)  LAND_GH="UNVERIFIABLE"; LAND_GH_DETAIL="gh_chain_read returned an unrecognised answer (rc=$_ghrc): ${_ghline:-<empty>}" ;;
+    esac
+    # WHICH REPO'S CONTRACT: the operator's pin (`OR`) when it is a real slug, else the checkout
+    # this command lives in — `repo-slug.sh` is the ONE parser (`derive_or`), never a third one.
+    _rsmod=""
+    for _d in "$O_DIR" "$CANON"; do
+      [ -n "$_rsmod" ] && break
+      [ -f "$_d/repo-slug.sh" ] && _rsmod="$_d/repo-slug.sh"
+    done
+    [ -n "$_rsmod" ] && . "$_rsmod"
+    if declare -f derive_or >/dev/null 2>&1; then
+      LAND_REPO="$(derive_or "$REPO_ROOT" "${OR:-}" 2>/dev/null)" || LAND_REPO=""
+    fi
+    # ⛔ ASKED THROUGH `gh` (the box's chain), NOT the resolved absolute path — see the note on
+    # `merge_contract_read`. No pin is exported for this call: `ensure_agent_gh_real` is the ONLY
+    # place that exports `AGENT_GH_REAL`, and it exports only a COMPILED BINARY (fresh review P1: an
+    # unconditional export here handed a script-valued resolution to the chain, which is exactly the
+    # #2266 re-entry this change exists to prevent). A chain that gets here answered `gh version`, so
+    # it needs no pin to answer the protection read.
+    _congh=""
+    if [ "$LAND_GH" = "OK" ]; then _congh="gh"; fi
+    _conline="$(merge_contract_read "$LAND_REPO" "$_congh" 2>/dev/null)"
+    case "$_conline" in
+      'CONTRACT=OK'*)
+        LAND_CON="OK"
+        LAND_REQ="$(printf '%s\n' "$_conline" | sed -n 's/.* required=\(.*\) repos=.*/\1/p')" ;;
+      'CONTRACT=UNREADABLE'*)
+        # ⛔ THE `why=` TOKEN IS THE DIAGNOSIS, NOT DECORATION (fresh review P2). `no_real_gh` means the
+        # chain could not ASK — no protection read was ever made — while `empty_or_unreadable` means the
+        # read was made and came back empty. Rendering both as "an EMPTY read" told the operator to go
+        # look at branch protection on a box whose actual blocker is the gh chain named one line above.
+        LAND_CON="UNREADABLE"
+        LAND_CON_WHY="$(printf '%s\n' "$_conline" | sed -n 's/^CONTRACT=UNREADABLE why=\([^ ]*\).*/\1/p')" ;;
+      *)  LAND_CON="UNVERIFIABLE" ;;
+    esac
+  fi
+
   if [ "$JSON" -eq 1 ]; then
     _h="$(cycle_history "$O_DIR" "$LAST" 2>/dev/null)"
-    printf '{\n  "verdict": "%s",\n  "detail": "%s",\n  "stateDir": "%s",\n  "cycles": [' \
+    # ⛔ `landing.ok` IS A REAL BOOLEAN and it is FALSE for anything that is not a positive OK —
+    # UNVERIFIABLE included. A consumer that reads only `verdict` must not be able to mistake a box
+    # that cannot land for a healthy one; `landing` is the field that says so.
+    _land_ok=false
+    if [ "$LAND_GH" = "OK" ] && [ "$LAND_CON" = "OK" ]; then _land_ok=true; fi
+    printf '{\n  "verdict": "%s",\n  "detail": "%s",\n  "stateDir": "%s",\n' \
       "$(_json "$_verdict")" "$(_json "$_out")" "$(_json "$O_DIR")"
+    printf '  "landing": { "ok": %s, "gh": "%s", "ghPath": "%s", "ghSource": "%s", "ghDetail": "%s",\n' \
+      "$_land_ok" "$(_json "$LAND_GH")" "$(_json "$LAND_GH_PATH")" "$(_json "$LAND_GH_SOURCE")" "$(_json "$LAND_GH_DETAIL")"
+    printf '               "contract": "%s", "contractWhy": "%s", "contractRepo": "%s", "required": "%s" },\n' \
+      "$(_json "$LAND_CON")" "$(_json "$LAND_CON_WHY")" "$(_json "$LAND_REPO")" "$(_json "$LAND_REQ")"
+    printf '  "cycles": ['
     _first=1
     printf '%s\n' "$_h" | while IFS= read -r _line; do
       [ -n "$_line" ] || continue
@@ -129,13 +233,63 @@ if [ "$cmd" = "status" ]; then
       echo "  NO CYCLE RECORD in $O_DIR/state — nothing to show, and that is NOT a healthy box."
     fi
     echo
+    # ── the landing dimension (agent-infra#2320) ───────────────────────────────────────────
+    if [ "$LAND_GH" = "OK" ]; then
+      echo "  landing       gh=OK path=${LAND_GH_PATH:-?} (source=${LAND_GH_SOURCE:-?})  ${LAND_GH_VER:-}"
+    else
+      echo "  landing       gh=$LAND_GH"
+      [ -n "$LAND_GH_DETAIL" ] && echo "                $LAND_GH_DETAIL"
+      if [ "$LAND_GH" = "CANNOT-REACH-REAL-GH" ]; then
+        echo "                ⛔ CONSEQUENCE: a box whose gh chain cannot reach a real binary cannot LAND"
+        echo "                anything — every merge is refused — so every lane it runs is wasted work."
+        echo "                This is a LANDING blocker, NOT a load/capacity one: the cycle record's"
+        echo "                nothing=/bound= fields above answer a different question and are not the cause."
+        echo "                REMEDY: point AGENT_GH_REAL at this box's real gh (discovered, never hardcoded)."
+      fi
+    fi
+    case "$LAND_CON" in
+      OK)
+        echo "  landing       contract=OK repos=${LAND_REPO:-?} required=[${LAND_REQ:-}]" ;;
+      UNREADABLE)
+        echo "  landing       contract=UNREADABLE${LAND_CON_WHY:+ why=$LAND_CON_WHY} repos=${LAND_REPO:-?}"
+        # ⛔ ONE BRANCH PER FACT (fresh review P2). "the chain could not ask" and "the read came back
+        # empty" have DIFFERENT remedies and were printed as ONE sentence — the EMPTY-read text on a box
+        # where no read was made, sending the operator at branch protection instead of the gh chain.
+        if [ "$LAND_CON_WHY" = "no_real_gh" ]; then
+          echo "                the chain could NOT ASK — there is no real gh on this box, so the protection"
+          echo "                read was never made. The merge contract is UNKNOWN here, and it is UNKNOWN"
+          echo "                because of the landing blocker above: fix that, and this line follows."
+        elif [ "$LAND_CON_WHY" = "empty_or_unreadable" ]; then
+          echo "                an EMPTY required-checks read is UNREADABLE, never \"this repo requires nothing\":"
+          echo "                the merge contract falls back and every merge is REFUSED (merge-one.sh exit 5)."
+        else
+          echo "                the contract read came back UNREADABLE${LAND_CON_WHY:+ (why=$LAND_CON_WHY)} — an"
+          echo "                unread contract is never \"this repo requires nothing\": every merge is REFUSED."
+        fi ;;
+      *)
+        echo "  landing       contract=$LAND_CON${LAND_REPO:+ repos=$LAND_REPO}" ;;
+    esac
+    echo
     case "$_verdict" in
       HEALTHY)  echo "  The controller wrote a record within its last two cycles: it is self-dispatching." ;;
+      FORK-STARVED)
+                echo "  The controller is ALIVE but this box could not FORK: it is not dispatching, and no" ;
+                echo "  amount of waiting for load will change that (agent-infra#2293). Restart or drain the" ;
+                echo "  BOX from outside — it cannot be repaired from inside, which is exactly why the" ;
+                echo "  controller keeps cycling and recording instead of exiting (a relaunch needs the same fork)." ;;
       DEGRADED) echo "  The newest record is older than two cycles — the controller is NOT cycling." ;
                 echo "  Start it (cloud-cell-supervisor.sh start / install.sh) and read its own log for the last stage it reached." ;;
       *)        echo "  No usable record: the controller may never have run on this box, or \$O is not the state" ;
                 echo "  directory it writes to. An absent record is never evidence that it is fine." ;;
     esac
+    # A landing blocker does NOT change the exit code: that code is the CYCLE verdict's contract
+    # (HEALTHY/DEGRADED/ABSENT), and re-purposing it would make the two dimensions disagree about
+    # one number — the defect this section exists to avoid. It is stated here instead, in the one
+    # line a reader cannot miss, and it is `landing.ok=false` on the machine surface.
+    if [ "$LAND_GH" = "CANNOT-REACH-REAL-GH" ] || [ "$LAND_CON" = "UNREADABLE" ]; then
+      echo
+      echo "  ⛔ LANDING BLOCKED — this box cannot land a PR right now (see the landing lines above)."
+    fi
   fi
   exit "$_rc"
 fi
