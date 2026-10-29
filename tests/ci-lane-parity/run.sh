@@ -544,10 +544,23 @@ else
   $FIXTURE_BOUND bash "$FIX/scripts/runner-norecord.sh" >"$TMP/runner-norecord.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-norecord.out")"
-  if [ "$RC" -eq 1 ] && grep -qE '(failure-recording|sweep) arm is broken' <<<"$OUT"; then
-    pass "a runner that cannot record failures FAILS its own sentinel (rc 1)"
+  # ⛔ THE TWO CLAUSES ARE REPORTED SEPARATELY (#2838). This arm asserted a CONJUNCTION and then
+  # reported only the rc — so when the rc clause was the one that HELD it printed
+  # `returned rc 1 (want 1)`, a message describing a satisfied clause and never naming the grep
+  # that failed. It read as a shard outage; the actual diagnosis was "the sentinel text is absent",
+  # which has a different cause and a different fix (measured 2026-10-29: the runner's coverage
+  # guard exited 1 at `executed 104 of 1 listed shard(s)` before the sentinel at the end of the file
+  # was reachable, because the tree still carried an enumerated `run_shard` block — #2838).
+  # ⛔ AND ONLY THE TAIL OF `$OUT` IS PUBLISHED. The whole capture was 213 lines of this fixture's
+  # own `No such file or directory` spray, carrying `::error::`/`##[error]` strings that GitHub
+  # turns into CHECK-RUN ANNOTATIONS — one failed assertion put a page of fabricated shard failures
+  # on a PR's check surface. A message is a diagnosis, not a transcript.
+  if [ "$RC" -ne 1 ]; then
+    fail "a runner with no failure-recording arm returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -3 | tr '\n' '|')"
+  elif ! grep -qE '(failure-recording|sweep) arm is broken' <<<"$OUT"; then
+    fail "the mutated runner exited 1, but NOT on its sentinel: no '(failure-recording|sweep) arm is broken' line in $(wc -l <<<"$OUT" | tr -d ' ') line(s) of output — the exit came from somewhere else (often the coverage guard's 'executed N of M listed shard(s)', which exits before the sentinel is reachable); tail: $(printf '%s' "$OUT" | tail -3 | tr '\n' '|')"
   else
-    fail "a runner with no failure-recording arm returned rc $RC (want 1): $OUT"
+    pass "a runner that cannot record failures FAILS its own sentinel (rc 1)"
   fi
 fi
 
@@ -1110,9 +1123,9 @@ awk 'BEGIN { done = 0 }
   "$PR" >"$TMP/ci-pr-gateif.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-gateif.yml"
 if [ "$RC" -eq 2 ]; then
-  pass "an `if:` on the guard-covering job's first step is refused (the guard cannot be switched off)"
+  pass "an 'if:' on the guard-covering job's first step is refused (the guard cannot be switched off)"
 else
-  fail "an `if:` on bash-suites-gate's step returned rc $RC (want 2): $OUT"
+  fail "an 'if:' on bash-suites-gate's step returned rc $RC (want 2): $OUT"
 fi
 
 # A sibling `push:` block that filters paths must not be read as narrowing pull_request.

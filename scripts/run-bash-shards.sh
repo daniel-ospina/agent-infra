@@ -469,11 +469,18 @@ for pattern in "${SWEEP_GLOBS[@]}"; do
 done
 
 echo "── hermetic suites ────────────────────────────────────────────────"
-# Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network).
+# Every suite the list below runs is hermetic (temp repos / temp HOME / stubbed tools, no network).
 #
-# PROVENANCE: these lines were moved out of ci-main.yml's `script-validate`, so each keeps the
-# note that workflow carried. A line that is ALSO run by a dedicated per-PR job or step in ci.yml
-# still carries its "(also a per-PR … in ci.yml)" note.
+# ⛔ THERE IS NO PER-SUITE ROW IN THIS SECTION, AND THAT IS THE COMMITMENT (#2838). `1d56cc10`
+# (#2614) made this list a DERIVATION; an older branch's 103 enumerated `run_shard <path>` rows
+# landed back on top of it in `718a0874` (#2035) and were never removed — so every suite ran TWICE,
+# once from each list, and this file's own `executed + skipped == listed` self-check could never
+# hold (measured when #2838 was filed: "executed 212 of 108 listed"). The rows are deleted and must
+# not come back: a suite is wired by the FILE matching SUITE_GLOBS, and `tests/ci-lane-parity/run.sh`
+# assertion 11 fails on any literal `run_shard <path>` row. The one-sentence notes those rows
+# carried (what a suite pins, which incident added it) live in git history on this commit and in
+# each suite's own header — and see the note at the end of this file for why they are likewise not
+# reproduced here as prose.
 #
 # ⛔ #2439 FOLDED THE DUPLICATE RUN SITES — this paragraph used to say the opposite, deliberately.
 # It read: "That duplication is deliberate here … the PR lane runs those twice … Dropping them
@@ -492,6 +499,7 @@ echo "── hermetic suites ─────────────────
 # The fold assumes this step actually EXECUTES — a sibling step failing ahead of it skips the whole
 # list, which is why agent-infra#2417 (the lane-parity self-test's live-gate control fixture) is a
 # coverage hole for every shard, not just the folded five.
+# ⛔ #1997 OWNS, AND NOTHING HERE PINS: the supervisor's classified-read invariant — `sup_session_list` answers 0 present / 1 absent / 3 cannot-verify, every tmux target is EXACT (`=name`), a session name carrying `:`/`.` is refused rather than resolved, and `TMUX_READ_TIMEOUT` is validated > 0. Its suite (`scripts/cloud-cell-supervisor.hardening.test.sh`) was DROPPED at ba5ba770 because the implementation it pinned was never landed on this branch, so these invariants are currently UNPINNED in this tree — they must return BESIDE the implementation (#1997's land), not as a suite added ahead of it.
 # ── the run — ONE loop over the DERIVED list ──────────────────────────────────────────────────
 # There is no per-suite line here any more, on purpose: a suite is wired by the FILE it lives in
 # matching SUITE_GLOBS, so two harness PRs adding two suites no longer conflict in this file.
