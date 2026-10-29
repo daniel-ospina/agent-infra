@@ -1070,6 +1070,13 @@ instance_tmpdir() {
 # below instead of by the runner's per-job cleanup.
 instance_tmp_root() { printf '%s' "${1%/}/_tmp"; }
 
+# dir_mode <path> — the permission bits as `stat` spells them (`700`, `755`, …), or EMPTY when the host
+# offers neither form (review P2-2 reads this). `stat -c` is GNU and `stat -f` is BSD/macOS; this file already carries that exact
+# pair for mtime (`.runner` age) and for inode identity, so this is the same portable reading rather than
+# a new dependency. ⛔ EMPTY IS NOT 700: an unreadable mode is `cannot-measure`, and a caller must not
+# read it as "the mode is fine" — the same fail-closed shape the rest of this file uses.
+dir_mode() { local m; m="$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null)" || m=""; printf '%s' "$m"; }
+
 # sweep_tmp_root <dir> — keep the STABLE private root from growing without bound.
 # ⛔ MTIME AGE IS NOT A HOLDER WITNESS, SO THIS NEVER RUNS ON A LIVE LISTENER (review P2-1). The old
 # header claimed that an entry older than `$RUNNER_TMP_MAX_AGE_MIN` "cannot belong to a job that runs
@@ -1091,8 +1098,27 @@ instance_tmp_root() { printf '%s' "${1%/}/_tmp"; }
 # ⛔ THE WALK IS BOUNDED: one explicit start point, `-maxdepth 1` (the root's own entries; the root
 # itself is never a candidate), `-print0` so a name with a newline cannot be split into two deletions.
 sweep_tmp_root() {
-  local t="$1" removed=0 victim
+  local t="$1" removed=0 victim phys
   [ -d "$t" ] || return 0
+  # ⛔ A SYMLINKED ROOT IS WALKED PHYSICALLY, NEVER SILENTLY SKIPPED (review P2-3). `find` does not
+  # descend a start point that is a SYMLINK (default `-P`, on both BSD and GNU find), so
+  # `find "$t" -maxdepth 1 …` over a symlinked `_tmp` printed NOTHING: `removed` stayed 0, the sweep
+  # printed nothing (`[ "$removed" -gt 0 ] || return 0`), and every reading said the root was bounded
+  # while it grew forever. MEASURED on this host (macOS 15/arm64, bash 3.2.57): the same directory with
+  # the same stale entry yields **0** entries through the link and **1** through `pwd -P`. A symlinked
+  # `_tmp` is a legal layout — instances on one volume, scratch on another, which is exactly the
+  # footprint this whole change is about — so the start point is resolved and the pass NAMES what it
+  # resolved: a sweep an operator cannot see is not a sweep they can trust.
+  if [ -L "$t" ]; then
+    phys="$(cd "$t" 2>/dev/null && pwd -P)" || phys=""
+    if [ -n "$phys" ]; then
+      log_line "tmpdir-root is a SYMLINK tmpdir-root=$t target=$phys (walked PHYSICALLY: find does not descend a symlink start point, so a logical walk here would report removed=0 over a root that only grows)"
+      t="$phys"
+    else
+      err "cannot-measure why=tmpdir-root-unresolvable path=$t — the private temp root is a symlink that could not be resolved, and a logical walk of a symlink removes nothing while claiming nothing, so the root would grow unbounded; nothing was swept"
+      return 0
+    fi
+  fi
   while IFS= read -r -d '' victim; do
     if [ "$DRY" = 1 ]; then removed=$((removed + 1)); continue; fi
     rm -rf -- "$victim" 2>/dev/null && removed=$((removed + 1))
@@ -1152,7 +1178,7 @@ tmp_owner_guard() {
 # ⛔ A CREATION THAT FAILED IS A REFUSAL, NOT A WARNING: a listener that comes up under a TMPDIR which
 # does not exist is the #2937 incident (jobs die at `mktemp` while GitHub says `online`).
 ensure_private_tmp() {
-  local d="$1" live_pid="${2:-}" t p
+  local d="$1" live_pid="${2:-}" t p created=0 mode=""
   t="$(instance_tmp_root "$d")"
   tmp_owner_guard "$t" "$live_pid" "the instance's private temp root" || return 2
   if [ ! -d "$t" ]; then
@@ -1175,6 +1201,7 @@ ensure_private_tmp() {
       return 2
     }
     log_line "created tmpdir-root=$t (the instance's private TMPDIR; nothing else creates it)"
+    created=1
   fi
   # WRITE is not enough — `mktemp` needs SEARCH too (the `-w`-only false PASS this file already paid for
   # once, on the `.env` arm).
@@ -1182,6 +1209,21 @@ ensure_private_tmp() {
     err "cannot-act why=tmpdir-root-unwritable path=$t — this user needs WRITE and SEARCH (w=$([ -w "$t" ] && echo y || echo n) x=$([ -x "$t" ] && echo y || echo n)) on the instance's private temp root, and every job on it would otherwise die at mktemp"
     return 2
   }
+  # ⛔ THE MODE *IS* THE ISOLATION, SO A LOOSE ONE IS REPORTED — AND NEVER CHMOD'ED (review P2-2).
+  # `mkdir -p` deliberately leaves an EXISTING directory's mode alone (a hand-repaired box is not
+  # silently tightened), which is right — but it also meant a `_tmp` carrying 0755 was accepted in total
+  # silence: every other user on the box can read and write every job's scratch, `status` published
+  # `tmpdir_defects=0`, and no reading anywhere said so. MEASURED on this host: `mkdir -p -m 700` over
+  # an existing 0755 leaves it **755**, and both existing guards pass it (`-w` and `-x` are true for the
+  # owner). So the mode is named, in the operator's face, on the START path — and the directory is left
+  # EXACTLY as the operator set it, because the mode is their decision to make, not this tool's to
+  # quietly override. A reading that refuses nothing is still a reading that must be published.
+  if [ "$created" = 0 ]; then
+    mode="$(dir_mode "$t")"
+    if [ -n "$mode" ] && [ "$mode" != "700" ]; then
+      err "tmpdir-mode-loose path=$t mode=$mode expected=700 — the instance's private temp root already existed with permissions wider than 0700, so every job's scratch inside it is readable and writable by other users on this box; this pass LEAVES IT AS IT IS (it never chmods a directory an operator set) — run: chmod 700 $t"
+    fi
+  fi
   # ⛔ NO HOLDER WITNESS ⇒ NO SWEEP (review P2-1). `live_pid` non-empty MEANS a listener is running on
   # this instance, i.e. a job may be live in `$t` right now; the age bound would then be the only thing
   # between a >bound job and `rm -rf` of its scratch. Create, verify, and leave the entries alone.
@@ -1208,18 +1250,36 @@ ensure_private_tmp() {
 # the verdict either (the `-p` arm can succeed while the target is still not a directory) — the test
 # is that the directory EXISTS and this user can write it, which is what `mktemp` will do next.
 ensure_tmpdir() {
-  local d="$1" live_pid="${2:-}" t created=0 rc=0 p
+  local d="$1" live_pid="${2:-}" t created=0 rc=0 p rt
   t="$(instance_tmpdir "$d")" || rc=$?
   # cannot-measure (`tmpdir-unreadable`) and a non-literal value are BOTH cannot-act here: the reason
   # was already named by `instance_tmpdir`, so this arm does not invent a second one. Starting the
   # listener anyway is the defect — the env it would inherit is unknown.
   [ "$rc" -eq 0 ] || return 2
-  # ⛔ THE INSTANCE'S OWN PRIVATE TEMP ROOT IS SATISFIED FIRST AND ALWAYS (#7815) — it is the TMPDIR the
-  # listener is started with whenever `.env` names none, and this call is also the INSTALL-TIME and
-  # REINSTALL path: `add` -> `start_listener` -> here recreates it after an instance dir was deleted.
-  # It runs after the `.env` read so that an unreadable `.env` still mutates nothing.
+  # ⛔ THE INSTANCE'S OWN PRIVATE TEMP ROOT IS SATISFIED FIRST WHENEVER IT IS THE ROOT THAT IS USED
+  # (#7815) — it is the TMPDIR the listener is started with when `.env` names none, and this call is
+  # also the INSTALL-TIME and REINSTALL path: `add` -> `start_listener` -> here recreates it after an
+  # instance dir was deleted. It runs after the `.env` read so that an unreadable `.env` still mutates
+  # nothing.
+  # ⛔ AN INSTANCE WHOSE `.env` NAMES A TMPDIR DOES NOT USE IT AT ALL (review P3-3). `run.sh` sources
+  # `.env` AFTER the export, so the named value WINS and `$d/_tmp` is a directory no job ever touches:
+  # creating it asserted an isolation that does not exist, and sweeping it spent work on a directory
+  # nothing writes. So it is NOT created here. A LEFTOVER one (an instance that used to name none, or
+  # a `.env` added later) is still swept — but only on the START path, where no listener can hold a
+  # job — because those bytes are provably unused and nothing else would ever bound them. Either way
+  # the pass SAYS which it did: a root that is silently neither created nor swept reads as both.
+  if [ -n "$t" ]; then
+    rt="$(instance_tmp_root "$d")"
+    if [ -d "$rt" ] && [ -z "$live_pid" ]; then
+      log_line "tmpdir-root unused tmpdir-root=$rt reason=env-names-tmpdir tmpdir=$t (the .env-named TMPDIR wins at run.sh, so this root holds no job's scratch: it is NOT re-created, and the LEFTOVER is swept here on the start path)"
+      sweep_tmp_root "$rt"
+    else
+      log_line "tmpdir-root skipped tmpdir-root=$rt reason=env-names-tmpdir tmpdir=$t (the .env-named TMPDIR wins at run.sh, so the private root is neither used nor created for this instance)"
+    fi
+    return 0
+  fi
   ensure_private_tmp "$d" "$live_pid" || return 2
-  [ -n "$t" ] || return 0
+  return 0
   # ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1), AND THAT IS TRUE WHETHER
   # OR NOT THE DIRECTORY ALREADY EXISTS (#3004 review round 4, P2). The comparison runs first, for both
   # branches, and a mismatch is cannot-measure; the guard itself is `tmp_owner_guard` (one definition,
@@ -1350,7 +1410,7 @@ start_listener() {
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 orph=0 qn=0 qunprobed=0 tmpdir_defects=0 d rc qrc dirs outside qdirs t rownote rt
+  local dead=0 live=0 orph=0 qn=0 qunprobed=0 tmpdir_defects=0 d rc qrc dirs outside qdirs t rownote rt m
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -1415,11 +1475,25 @@ cmd_status() {
     if [ -z "$t" ]; then
       rt="$(instance_tmp_root "$d")"
       if [ ! -d "$rt" ]; then
-        # The clause claims only what it measured: this tool creates the root at every START, so its
-        # absence is a fact about the LAYOUT — never a claim about the env of a listener this tool did
-        # not start (that one keeps whatever its unit gave it).
-        err "defect tmpdir-missing name=$(basename "$d") path=$rt — the instance's private temp root is missing (this tool creates it at every start; nothing else does), so a listener started from now on inherits a TMPDIR that does not exist and its jobs die at mktemp; run: $SELF restart --name $(basename "$d")"
+        # ⛔ THE CLAUSE MAY NOT OVERCLAIM WHAT DIES (review P3-1). It used to say "so a listener started
+        # from now on inherits a TMPDIR that does not exist and its jobs die at mktemp" — which is wrong
+        # on BOTH halves: a start FROM NOW ON recreates this root (that is this tool's whole job here),
+        # and an instance this tool NEVER started was given no TMPDIR by us at all, so its jobs do not
+        # die — they silently fall back to the box's SHARED temp dir, which is the quieter and more
+        # dangerous shape, and the one #7815 exists for. The remedy is unchanged; only the claim is.
+        err "defect tmpdir-missing name=$(basename "$d") path=$rt — the instance's private temp root is missing (this tool creates it at every START, and nothing else does). The consequence depends on WHO started the listener, and both halves are named because they differ: a job on a listener THIS TOOL started dies at mktemp (its TMPDIR names this path, which is gone), while a listener this tool NEVER started carries no TMPDIR from us at all — its jobs fall back to the box's SHARED temp dir with NO error, which is the silent isolation loss #7815 exists to prevent. A start from now on recreates the root; run: $SELF restart --name $(basename "$d")"
         tmpdir_defects=$((tmpdir_defects + 1))
+      else
+        # ⛔ A ROOT THAT EXISTS BUT IS NOT 0700 IS A DEFECT THE REPORT MUST NAME (review P2-2). The
+        # directory is the isolation, and `mkdir -p` leaves an existing mode alone (deliberately — this
+        # tool never tightens a mode an operator set), so a hand-repaired `_tmp` at 0755 used to read as
+        # a perfectly healthy row: `tmpdir_defects=0`, rc 0, and every job's scratch readable by every
+        # other user on the box. Reported, never chmod'ed — the remedy is printed for the operator.
+        m="$(dir_mode "$rt")"
+        if [ -n "$m" ] && [ "$m" != "700" ]; then
+          err "defect tmpdir-mode=$m name=$(basename "$d") path=$rt — the instance's private temp root exists but carries mode $m instead of 0700, so every job's scratch inside it is readable and writable by other users on this box, and the isolation this tool promises is not in force; this tool NEVER chmods a directory an operator set — run: chmod 700 $rt"
+          tmpdir_defects=$((tmpdir_defects + 1))
+        fi
       fi
     elif [ ! -d "$t" ]; then
       # ⛔ THE CLAUSE MUST MATCH THE ROW IT IS UNDER (#3004 review, P2): this arm runs for DEAD rows
