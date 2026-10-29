@@ -470,6 +470,17 @@ fi
 # instead. It is registered on the trap that always runs, and it is named before the claims are
 # released so a hung release can never be what swallows it.
 trap 'review_abandoned_record; release_claim_bounded; release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
+# ⛔ THE TRAP'S HANDLER IS DEFINED AT ~995, THE TRAP AT ~472 — so EVERY `exit` above :995 fires the
+# trap with `review_abandoned_record` UNDEFINED, printing "command not found" on a path that is
+# otherwise clean (measured: the line still runs, the rest of the trap still runs and the status is
+# preserved, so claims are still released and this is noise, not a bug). Stub it HERE, at the
+# registration, so every early exit is quiet — not at the one block that used to exit early, which
+# left :749 (unresolvable head), :757 (already parked) and the four RECORDER guards noisy. The real
+# definition below simply replaces the stub. ⛔ KEEP IT INLINE (not at line start):
+# pr-review-order.test.sh extracts the real function with `awk '/^review_abandoned_record\(\) \{/…'`,
+# anchored at column 0, so a line-start stub would SHADOW the extraction and the suite would drive
+# `:` instead of the recorder it exists to test.
+if ! declare -F review_abandoned_record >/dev/null 2>&1; then review_abandoned_record() { :; }; fi
 
 # ── the repo's merge authority (agent-infra#1764) ─────────────────────────────
 # Resolved HERE, from branch protection, not assumed. On a repo that requires the review gate the
@@ -538,6 +549,58 @@ record_at_head() {
     sha="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | command head -1)"
     [ -n "$sha" ] && [ "$sha" = "$HEAD" ] && return 0
   done
+  return 1
+}
+
+# ── the record STORE, read the way the CONTROLLER reads it (agent-infra#2872) ───────────────────
+# `record_at_head` answers ONE question (is there a record at this head). Deciding whether a review
+# is still OWED needs two more, and both must answer from the SAME candidate list — a second
+# definition of "the record" is the divergence record-review.sh's own `--check-carry` refuses.
+review_record_file_for_pr() { # -> the record FILE for this PR, whatever head it names (qualified
+                              #    first, then legacy: a CARRIED record is at an OLDER head by
+                              #    definition, so this one must NOT filter on the head)
+  local dir="$HOME/.pi/agent/reviews" f
+  [ -n "${OR:-}" ] && [ -n "${PR:-}" ] || return 1
+  for f in "$dir/${OR%/*}-${OR#*/}-$PR.json" "$dir/$PR.json"; do
+    [ -f "$f" ] || continue
+    printf '%s\n' "$f"; return 0
+  done
+  return 1
+}
+review_record_file_at_head() { # -> the record FILE bound to THIS head, else nothing
+  local dir="$HOME/.pi/agent/reviews" f sha
+  [ -n "${OR:-}" ] && [ -n "${PR:-}" ] && [ -n "${HEAD:-}" ] || return 1
+  for f in "$dir/${OR%/*}-${OR#*/}-$PR.json" "$dir/$PR.json"; do
+    [ -f "$f" ] || continue
+    sha="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | command head -1)"
+    [ -n "$sha" ] && [ "$sha" = "$HEAD" ] || continue
+    printf '%s\n' "$f"; return 0
+  done
+  return 1
+}
+review_verdict_of() { # review_verdict_of <record-file> -> its verdict token (the record's own —
+                      #    nothing in this file may INVENT a verdict, because a carry re-mints
+                      #    exactly the claim the reviewer made and no stronger one)
+  [ -f "${1:-}" ] || return 1
+  sed -n 's/.*"verdict":"\([a-z-]*\)".*/\1/p' "$1" 2>/dev/null | command head -1
+}
+# review_clean_at_head — "a review already happened at this head", the predicate the CONTROLLER
+# uses for the same question (`orch-loop.sh::review_disp_decide`, its AT-HEAD arm): a record whose
+# `head_sha` is THIS head AND whose verdict is clean. Reused rather than re-derived, so the worker
+# and the dispatcher can never disagree about whether this head has evidence.
+# ⛔ IT IS NARROWER THAN THE CONTROLLER'S, ON PURPOSE AND IN ONE DIRECTION (fail-closed). The
+# controller accepts the whole clean family (`"verdict":"clean` matches clean-micro/clean-low too);
+# THIS function requires the full `clean` tier, because the merge path's own signed-marker guard
+# (~:1280) matches the marker text `verdict=clean @ <live head>` and nothing else — a clean-micro
+# record would take the no-review path here and then PARK at that guard, which is a regression
+# against paying for a review. Shallow-tier records therefore fall through to today's behaviour
+# (a paid review that records `clean`). Named residual, not an accident.
+review_clean_at_head() {
+  local f
+  f="$(review_record_file_at_head)" || return 1
+  case "$(review_verdict_of "$f")" in
+    clean) return 0 ;;
+  esac
   return 1
 }
 
@@ -789,7 +852,7 @@ if [ ! -x "$RECORDER" ]; then
   exit 3
 fi
 
-# ── 0) RECOVER BEFORE PAYING (agent-infra#2872 record recovery / #1377 carry rule) ──────────────
+# ── 0b) RECOVER BEFORE PAYING (agent-infra#2872 record recovery / #1377 carry rule) ──────────
 # The record file is PER-BOX; the SIGNED marker in the PR body is the only copy of a verdict that
 # travels with the PR. So a review minted on a cell reads as NO-RECORD on the box that merges, and
 # the same review gets bought again. Both verbs below exist for this and were consumed by NOTHING:
@@ -797,30 +860,165 @@ fi
 # missing record from the signed marker, refusing an unverifiable one).
 # Measured 2026-10-28: #10255 was clean at 3cccad7d0, the live diff was UNCHANGED (carry), and a
 # fourth paid review was about to be ordered for a diff nobody had changed.
-# ⛔ EXIT 0 ONLY WHEN THE RECORD COVERS THIS HEAD. Every other outcome falls through to the review
-# path below, unchanged — so a box without the signing key degrades to the old behaviour, never to a
-# false CLEAN. The recovery is not a certification: the gate re-decides on the live diff.
-# ⛔ THE EXIT TRAP IS REGISTERED EARLY (line ~472) BUT ITS HANDLER IS DEFINED LATE (~991), so an
-# early `exit 0` fires the trap before `review_abandoned_record` exists and prints
-# "command not found". Stub it, so exiting here is quiet and the claim release still runs.
-if ! declare -F review_abandoned_record >/dev/null 2>&1; then review_abandoned_record() { :; }; fi
-_cc_rc=1
-"$RECORDER" --check-carry "$PR" "$OR" >/dev/null 2>&1 && _cc_rc=0
-if [ "$_cc_rc" = "0" ]; then
-  echo "[merge $PR] CARRY — the record already covers this head (check-carry rc 0); no review cycle ordered, nothing paid" >> "$L.log"
-  exit 0
+#
+# ⛔⛔ WHAT THIS BLOCK MAY AND MAY NOT DECIDE (review of #3037, P0-1). It may skip exactly ONE step:
+# the PAID fresh-context review. It may NOT end the worker. `exit 0` in this file means "this worker
+# is done", and the two steps that actually LAND the PR live BELOW this block (step 3a's
+# `rail_attempt`, step 4's `gh pr merge`). The first version exited 0 on both of its success arms,
+# so a carried record skipped the review AND the merge, and the state was unchanged on exit:
+#   · rail repo (agent-infra): nothing re-bound the record to the moved head, so `pipeline-
+#     compliance` check (c) — which demands a marker at the CURRENT head — stayed red, the
+#     controller spawned `merge-<PR>` again next cycle, got CARRY again, until REVIEW-CAP parked the
+#     head with the false reason "the reviewer never produced a usable verdict at this head". No
+#     reviewer was ever spawned: a cause that never happened, and a human sent at the wrong tool.
+#   · gate repo: step 4 is the merge and it was skipped; `railcount`/`reviewdisp` bound nothing, so
+#     the GREEN arm re-spawned the worker every cycle with a log line that read like success.
+# The block therefore sets CC_OWED=1 and lets the run CONTINUE with LAST=CLEAN — the verdict the
+# record itself states — so the ordinary merge path (marker verification, gate wait, rail, merge)
+# runs unchanged. It never merges blind: the signed marker at this head is still verified below.
+#
+# ⛔ rc 0 IS NOT AN AUTHORIZATION — THE VERB'S OWN ANSWER IS (review of #3037, P1). `--check-carry`
+# answers with rc 0 for `head` and `carry` and publishes the token as field 1 of stdout. Keying on rc
+# alone made ANY recorder that answers 0 — a stub, a test replica, a box not yet re-provisioned, a
+# wrapper that ignores unknown flags — read as "the record covers this head", which is how this
+# block turned its own CI suite red and, in production, would end the worker on a recorder that does
+# not implement the verb at all. So the token must ALSO be one this caller may act on, and the
+# authorisation is finally re-checked against the STORE (`review_clean_at_head`), not against the
+# recorder's word.
+#
+# ⛔ A HEAD-BOUND ANSWER IS NOT A CLEAN ONE (review of #3037, P1-2). `--check-carry` never looks at
+# the verdict: a record saying `issues` bound to this head answers `head`/rc 0. Treating that as
+# "no review is owed" converted the remedy for FINDINGS (the `needsfix-<PR>-<head>` marker that
+# authorises a fixer) into silence, and the head then parked on the review cap. Only a clean record
+# skips; any other verdict falls through to today's path, so the fixer marker is still written.
+#
+# ⛔ AND rc IS CARRIED, NOT COLLAPSED (review of #3037, P1-3). `3` unreadable / `5` nodigest / `6`
+# carry-patch each come with the recorder's own remedy, and none of them is "buy a review". The
+# pre-fix block tested `&& _cc_rc=0` and then logged `rc=$_cc2`, which is only ever 0 or 1 — so every
+# non-zero answer was reported as "the diff changed" and as "no recoverable marker (or no signing
+# key)", on states where a record DOES exist and no marker was ever looked at. The rc and the token
+# are now logged verbatim and each arm runs its own remedy.
+CC_OWED=0      # 1 = a CLEAN record already covers this head: the REVIEW is not owed (the MERGE is)
+CC_RC=1        # the last `--check-carry` exit code, kept for the log line (never collapsed)
+CC_TOKEN=""    # …and its answer (field 1 of stdout: head|carry|carry-patch|fresh|unreadable|…)
+CC_VERDICT=""  # the record's OWN verdict, the only value a carry re-mint may use
+CC_RETRY_SECS="${CC_RETRY_SECS:-10}"
+is_limit "$CC_RETRY_SECS" || CC_RETRY_SECS=10
+
+# _cc_ask — one `--check-carry`, keeping BOTH the exit code and the answer. ⛔ stdout AND stderr are
+# CAPTURED, not discarded: the token is the contract and the recorder's diagnosis is the only thing
+# that tells an operator "the diff changed" from "gh was contended" from "this was a rebase".
+_cc_ask() {
+  local out
+  out="$("$RECORDER" --check-carry "$PR" "$OR" 2>&1)"; CC_RC=$?
+  CC_TOKEN="${out%%$'\n'*}"; CC_TOKEN="${CC_TOKEN%%$'\t'*}"
+  out="${out#*$'\n'}"
+  # ⛔ NO PIPE (#841/#864: a producer into a quiet reader can take SIGPIPE and read as failure): the
+  # newlines are flattened by parameter expansion, and the recorder's own diagnosis is what tells an
+  # operator "the diff changed" from "gh was contended" from "this was a rebase".
+  out="${out//$'\n'/ }"
+  [ -n "$out" ] && echo "[merge $PR] check-carry rc=$CC_RC token=[${CC_TOKEN:-<none>}] says: ${out:0:400}" >> "$L.log"
+}
+
+# _cc_rerecord — re-mint THIS record's OWN verdict at the CURRENT head, via the recorder's carry arm
+# (its documented remedy for `carry`, `carry-patch` and `nodigest`: "do NOT run a review cycle").
+# ⛔ IT REFUSES TO INVENT A VERDICT: the token comes from the record, and only a clean-family value
+# is a value the recorder accepts (anything else would be re-signed as a claim no reviewer made).
+_cc_rerecord() {
+  local v
+  v="$(review_verdict_of "$(review_record_file_for_pr)")"
+  case "$v" in clean*) ;; *) return 1 ;; esac
+  CC_VERDICT="$v"
+  # ⛔ PINNED TO THE HEAD THIS WORKER READ (#2572/#2988). A carry re-mint is still a MINT, and the
+  # recorder's own carry arms re-bind to the LIVE head — so without the pin a push that lands between
+  # this worker's head read and this call would mint a record for a revision nobody read here. The
+  # recorder refuses rather than record an unverifiable pin, and the caller then falls through to the
+  # review path: fail-closed, and the only cost of the race.
+  "$RECORDER" "$PR" "$HEAD" "$v" "$OR" --expect-head "$HEAD" >> "$L.log" 2>&1
+}
+
+# _cc_recover — rebuild a MISSING record from the PR body's SIGNED marker (#2872). The recorder
+# verifies the HMAC itself and refuses an unverifiable or foreign marker, so a body edit cannot mint
+# one; the store check afterwards is what turns "the recorder said ok" into "this head is covered".
+_cc_recover() {
+  "$RECORDER" --recover-body "$PR" "$OR" >> "$L.log" 2>&1 || return 1
+  review_clean_at_head || return 1
+  echo "[merge $PR] RECOVERED — the PR body's SIGNED marker verified and the record was rebuilt at head=$HEAD; no review ordered (the MERGE still runs below)" >> "$L.log"
+  CC_OWED=1
+  return 0
+}
+
+_cc_ask
+if [ "$CC_RC" -eq 3 ]; then
+  # ⛔ AN UNREADABLE DIFF IS NOT A CHANGED ONE, and the verb's own text asks for a RETRY. One inline
+  # retry, because the alternative — reading a contended gh queue as "a review is owed" — is the
+  # 20-40 minute purchase this whole block exists to prevent.
+  echo "[merge $PR] check-carry=unreadable — RETRYING once in ${CC_RETRY_SECS}s (a failed read is not a changed artifact)" >> "$L.log"
+  sleep "$CC_RETRY_SECS"
+  _cc_ask
 fi
-if "$RECORDER" --recover-body "$PR" "$OR" >> "$L.log" 2>&1; then
-  _cc2=1
-  "$RECORDER" --check-carry "$PR" "$OR" >/dev/null 2>&1 && _cc2=0
-  if [ "$_cc2" = "0" ]; then
-    echo "[merge $PR] RECOVERED — the signed body marker covers this head; record restored, no review ordered, nothing paid" >> "$L.log"
-    exit 0
-  fi
-  echo "[merge $PR] recovery restored a record that does NOT cover this head (check-carry rc=$_cc2) — a fresh review is owed" >> "$L.log"
-else
-  echo "[merge $PR] no recoverable marker for this head (or no signing key on this box) — a fresh review is owed" >> "$L.log"
-fi
+
+case "$CC_RC:$CC_TOKEN" in
+  0:head)
+    # The record is bound to THIS head. It still has to SAY clean (P1-2) — `--check-carry` answers
+    # head-binding, never verdict quality.
+    if review_clean_at_head; then
+      CC_OWED=1
+      echo "[merge $PR] CARRY — a CLEAN record is bound to head=$HEAD (check-carry rc=0 token=head); no review cycle ordered, and the merge proceeds below" >> "$L.log"
+    else
+      echo "[merge $PR] a record is bound to head=$HEAD but its verdict is [$(review_verdict_of "$(review_record_file_at_head)")], not full 'clean' — a HEAD-BOUND answer is not a CLEAN one, so a review is owed and the fixer/no-verdict handling below is unchanged" >> "$L.log"
+    fi ;;
+  0:carry)
+    # The head MOVED and the reviewed diff did not. The recorder's own guidance is "do NOT re-review
+    # … land it", and landing needs the record re-bound to the CURRENT head (rail check (c) reads a
+    # marker at the current head, and `record_at_head` is what makes step 3a reachable).
+    if _cc_rerecord && review_clean_at_head; then
+      CC_OWED=1
+      echo "[merge $PR] CARRY — the reviewed diff is unchanged across the head move; re-recorded $CC_VERDICT at head=$HEAD, no review ordered, and the merge proceeds below" >> "$L.log"
+    else
+      echo "[merge $PR] check-carry=carry, but re-recording $CC_VERDICT at head=$HEAD did not produce a clean head-bound record — a review is owed" >> "$L.log"
+    fi ;;
+  5:*|6:*)
+    # nodigest (5) / carry-patch (6): both say RE-RECORD AT THE CURRENT HEAD, do NOT run a review
+    # cycle (#1377 — a rebase whose every reviewed line is byte-identical).
+    if _cc_rerecord && review_clean_at_head; then
+      CC_OWED=1
+      echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) — its own remedy is a re-record, not a review: re-recorded $CC_VERDICT at head=$HEAD, no review ordered, merge proceeds below" >> "$L.log"
+    else
+      echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) says re-record rather than re-review, but the re-record at head=$HEAD did not produce a clean head-bound record — falling through to a review, which is then the only remaining way to cover this head (fail-closed, and still cheaper than the unconditional review this block replaces)" >> "$L.log"
+    fi ;;
+  3:*)
+    # Still unreadable after the retry. ⛔ DO NOT PAY and DO NOT MERGE ON A GUESS. Recovery is still
+    # worth one try: `--recover-body` reads the PR BODY, not the diff, so it can resolve this state
+    # when the diff read is what is contended.
+    if _cc_recover; then
+      :
+    else
+      echo "[merge $PR] check-carry=unreadable after a retry and no verified body marker covers head=$HEAD — NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle (a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
+      exit 0
+    fi ;;
+  4:*)
+    # No record anywhere on this box: the #2872 case. The verdict may still travel in the body.
+    if _cc_recover; then
+      :
+    else
+      echo "[merge $PR] no record and no verified body marker for head=$HEAD on this box — a fresh review is owed" >> "$L.log"
+    fi ;;
+  0:*)
+    # rc 0 with an answer this caller may not act on. ⛔ THIS IS THE FAIL-OPEN THE TOKEN CLOSES: a
+    # recorder that does not implement the verb (a stub, a replica, a box not yet re-provisioned, a
+    # wrapper that ignores unknown flags) exits 0 with its own output, and keying on rc alone read
+    # that as "the record already covers this head". It is NO ANSWER, not an authorisation.
+    echo "[merge $PR] --check-carry answered rc=0 with [${CC_TOKEN:-<empty>}], which is not 'head'|'carry' — a recorder that does not implement the verb answers 0 too, so rc alone is NOT an authorization; treating it as NO answer" >> "$L.log"
+    if _cc_recover; then :; else
+      echo "[merge $PR] …and no verified body marker covers head=$HEAD — a fresh review is owed" >> "$L.log"
+    fi ;;
+  *)
+    # 1 fresh (the diff genuinely changed), 2 usage, or anything unrecognised: the pre-#2872
+    # behaviour, unchanged. An unknown rc is treated as "no answer" — an allow-list, never a deny
+    # list, so a value nobody anticipated cannot become an authorization.
+    echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN:-<none>}) — a fresh review is owed (nothing here may skip one)" >> "$L.log" ;;
+esac
 
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 # ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound inside this prompt.
@@ -861,6 +1059,16 @@ EOF
 # below this line can end the process without a verdict — the cap kill, a TERM from the reaper, an
 # `exit` on a path this file has not foreseen — and `review_abandoned_record` (EXIT trap) is what
 # turns each of those into a COUNTED failed attempt with its reason instead of a log that just stops.
+if [ "${CC_OWED:-0}" = "1" ]; then
+  # ── 1b) NO REVIEW IS OWED — AND THE MERGE STILL IS (review of #3037, P0-1) ─────────────────
+  # ⛔ THIS IS THE WHOLE POINT OF THE BLOCK ABOVE: skip the 20-40 minute PAID step, not the run.
+  # LAST=CLEAN is not a synthesised verdict — it is the verdict the record itself carries, and the
+  # signed marker behind it is VERIFIED below (~:1280) before anything merges. REV_RECORDED=1 keeps
+  # the EXIT recorder inert: this run did not abandon a review, it did not order one.
+  LAST="CLEAN"
+  REV_RECORDED=1
+  echo "[merge $PR] NO REVIEW ORDERED — a clean record already covers head=$HEAD; continuing to the merge path with the recorded verdict (the signed marker is verified below)" >> "$L.log"
+else
 REV_STARTED=1
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
 AGENT_RC=$?
@@ -902,6 +1110,7 @@ fi
 # producer can never deliver is an inert guard; the suite pinned only the helper, so it stayed green.
 # (Both halves are pinned now: this expression is driven by the suite against every accepted form.)
 LAST="$(grep -aE '^(CLEAN|ISSUES)([[:space:]]|:|-)' "$L.log" | tail -1 | tr -d '\r')"
+fi
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 
 # ── the VERDICT → STATE mapping (agent-infra#2132) ────────────────────────────────────────────
@@ -1146,6 +1355,19 @@ review_state_clear() {
 
 case "$LAST" in
   CLEAN*)
+    # ⛔ INITIALISED AT THE TOP OF THE ARM, because the park remedies below expand both under
+    # `set -u` and one of the two paths now reaches them without a reviewer comment at all.
+    URL=""; CID=""
+    if [ "${CC_OWED:-0}" = "1" ]; then
+      # ── 2) NOTHING TO MINT: the record (and its signed marker) ALREADY exist at this head ──
+      # The block at 0b re-bound the record to the CURRENT head before choosing this path, so the
+      # recorder has already posted the marker this check exists to protect, and there is no
+      # reviewer comment to cite (no reviewer ran). Step 2 is therefore SKIPPED — but the marker
+      # guard BELOW is not: a record on this box is not what the rail/gate reads, and the whole
+      # point of the guard is not to trust a local file.
+      echo "[merge $PR] no reviewer comment to cite and no record to mint — the record at head=$HEAD is the evidence, and its SIGNED body marker is verified next" >> "$L.log"
+      REV_RECORDED=1
+    else
     URL="$(printf '%s' "$LAST" | grep -oE 'https?://[^ ]+' | head -1)"
     CID="$(printf '%s' "$URL" | grep -oE '[0-9]+$')"
     echo "[merge $PR] evidence comment id=${CID:-?} url=$URL" >> "$L.log"
@@ -1339,6 +1561,7 @@ case "$LAST" in
     # body and that its signature verifies), so the controller's stale-evidence state for it is no
     # longer true — and report.sh counts exactly those (agent-infra#2132). This call MUST stay BELOW
     # the guard: a clear above it would let a bare rc=0 read as a satisfied head.
+    fi
     review_state_clear
     REV_RECORDED=1   # a terminal record exists for this run; the EXIT recorder must stay inert
     # ── 3a) RAIL MODE: there is no review gate to wait for (agent-infra#1825) ──
