@@ -2416,29 +2416,60 @@ def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
 
 
 def test_a_MEMORY_refusal_VOIDS_the_row(tmp_path, monkeypatch):
-    """Exit 73 is a gate refusal, not a launch (agent-infra#2387).
+    """Exit 81 is a gate refusal, not a launch (agent-infra#2387).
 
     Same accounting failure as the 74 arm above, and on a box at its memory floor it is not a rare
-    one: EVERY pr-doctor spawn is refused, so an unrecognised 73 records a "launched" row on every
+    one: EVERY pr-doctor spawn is refused, so an unrecognised code records a "launched" row on every
     pass -- a 45-min cooldown and a 90-min budget slot each time, for a worker that never started.
     Both halves again: the code must be in GATE_REFUSALS and the marker must be the gate's own line.
+    ⛔ 81, NOT 73: the memory pair was renumbered when this branch met main, because 73 is
+    `AGENT_FORK_REFUSED` there and 72 is `REPO_TARGET_REFUSED` -- so this test pins the number the
+    gate actually returns, not the one the first draft chose.
     """
-    assert 73 in pr.GATE_REFUSALS
+    assert 81 in pr.GATE_REFUSALS
     d = tmp_path / "orch"
     (d / "bg").mkdir(parents=True)
-    (d / "bg" / "prd-9.rc").write_text("73\n")
+    (d / "bg" / "prd-9.rc").write_text("81\n")
     (d / "bg" / "prd-9.log").write_text(
         "[mem-gate] REFUSED bg prd-9: LOW MemAvailable=653M < mem_min_avail_mb=2048M "
         "(= mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2) -- no agent was started\n")
     monkeypatch.setattr(pr, "ORCH_DIR", str(d))
-    assert pr.gate_refused("prd-9", 73) is True
+    assert pr.gate_refused("prd-9", 81) is True
     st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
                 "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
     assert pr.void_refused_rows(st) == ["9"]
-    # The cooldown-KEEPING direction: an agent that exits 73 itself is not a gate refusal.
+    # The cooldown-KEEPING direction: an agent that exits 81 itself is not a gate refusal.
     (d / "bg" / "prd-9.log").write_text(
-        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=73\n")
-    assert pr.gate_refused("prd-9", 73) is False
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=81\n")
+    assert pr.gate_refused("prd-9", 81) is False
+
+
+def test_a_FORK_and_a_CAPABILITY_refusal_VOID_the_row_too(tmp_path, monkeypatch):
+    """The other two codes that arrived after GATE_REFUSALS did (agent-infra#2293, #2935).
+
+    ⛔ A CODE WITHOUT ITS MARKER IS INERT, and that is the shape this file keeps producing: the
+    predicate demands BOTH, so a code added to the tuple without the marker leaves the row booked
+    `launched` -- the accounting failure the 74/81 arms exist to prevent, one gate over. Asserted as
+    a loop over both pairs so a third one cannot be added half-way either.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    for code, marker in ((73, "[fork-gate] REFUSED"),
+                         (71, "[capability-gate] REFUSED")):
+        assert code in pr.GATE_REFUSALS, code
+        assert marker in pr.REFUSAL_MARKERS, marker
+        (d / "bg" / "prd-9.rc").write_text("%d\n" % code)
+        (d / "bg" / "prd-9.log").write_text(
+            "%s bg prd-9: no agent was started, nothing was consumed\n" % marker)
+        assert pr.gate_refused("prd-9", code) is True, (code, marker)
+        assert pr.void_refused_rows(st) == ["9"], (code, marker)
+        # …and the cooldown-KEEPING direction for each: a `pi` that exits it itself is not a refusal.
+        (d / "bg" / "prd-9.log").write_text(
+            "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=%d\n" % code)
+        assert pr.gate_refused("prd-9", code) is False, code
 
 
 def test_the_refusal_markers_are_the_gates_own_lines():
