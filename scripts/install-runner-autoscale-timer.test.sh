@@ -24,7 +24,10 @@ PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
-assert_eq()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', expected '$2')"; fi; }
+# ⛔ A FAILING EXIT-STATUS ASSERTION MUST PRINT WHAT IT CAPTURED. Without this, a red `assert_eq "$RC" 0`
+# shows only `got 1` and throws away the very message that names the cause — which is what made a
+# 1-in-10 environmental transient in the launchd arm undiagnosable across three attempts.
+assert_eq()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', expected '$2')"; if [ -n "${OUT:-}" ]; then echo "--- output ---" >&2; printf '%s\n' "$OUT" | sed 's/^/    /' >&2; fi; fi; }
 assert_contains() { case "${1:-}" in *"$2"*) ok "$3" ;; *) bad "$3 (missing: $2)"; echo "--- output ---" >&2; printf '%s\n' "${1:-}" | sed 's/^/    /' >&2 ;; esac; }
 assert_absent()   { case "${1:-}" in *"$2"*) bad "$3 (found: $2)"; printf '%s\n' "${1:-}" | sed 's/^/    /' >&2 ;; *) ok "$3" ;; esac; }
 assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1)"; fi; }
@@ -290,6 +293,20 @@ assert_nofile "$D/$UNIT_NAME.service" "nothing was installed with a substituted 
 assert_absent "$(grep '^ExecStart=' "$D/$UNIT_NAME.service" 2>/dev/null)" "oldpy" \
     "the artifact NEVER pins an interpreter older than 3.12"
 
+# ── T6b: a VALID pin is HONOURED, not quietly replaced ───────────────────────────────────
+# Pinning exists so an operator can name a venv (a specific gh/module set). Refusing a bad pin while
+# ignoring a good one would be the same substitution one direction over, and no other case pins a
+# non-default interpreter, so a regression here would stay green.
+say_case "T6b a pinned interpreter is used verbatim"
+printf '#!/usr/bin/env bash\ncase "$*" in *version_info*) echo "3.12" ;; *) exec %s "$@" ;; esac\n' "$GOOD_PY" >"$T/bin/pin312"
+chmod +x "$T/bin/pin312"
+D="$T/c6b"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PYTHON="$T/bin/pin312")
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a valid pin installs"
+assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "$T/bin/pin312" \
+    "the artifact pins the interpreter the operator NAMED, not the one the default resolver would pick"
+
 # ── T7: whitespace — refused on systemd, allowed on launchd ────────────────────────────────
 say_case "T7 whitespace is a SYSTEMD rule, not a launchd one"
 SP="$T/home/my home"; mkdir -p "$SP"; cp "$T/home/converger.py" "$SP/"
@@ -442,7 +459,8 @@ assert_eq "$BEFORE" "$(cat "$D/$UNIT_NAME.service")" "the artifact is byte-ident
 OUT="$(run_install Linux "$D" --disarm)"; RC=$?
 assert_eq "$RC" 0 "a real disarm exits 0"
 assert_nofile "$ARM" "the record is gone after a real disarm"
-assert_absent "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "ARMED" "the artifact carries no armed flag"
+assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "--dry-run" \
+    "the re-rendered artifact is provably DISARMED (--dry-run present), not merely missing a word"
 
 # ── T16: a FAILED armed render leaves the box NOT armed ───────────────────────────────────
 # A record that outlives a failed --arm is an armed box the operator was told was not armed: the next
@@ -457,12 +475,17 @@ rm -f "$ARM"
 ENVV=(TEMPLATES_DIR="$T/tpl16")
 OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "a failed armed render exits 1"
-assert_contains "$OUT" "NOT ARMED" "it says NOT ARMED rather than leaving it implied"
-assert_nofile "$ARM" "the record does not survive a failed arm"
+assert_contains "$OUT" "STILL ARMED" "when the disarmed re-render ALSO fails it says STILL ARMED, not NOT ARMED"
+assert_file "$ARM" "and it KEEPS the record — an armed artifact with no record is the state the design forbids"
+# The complementary path (armed render fails while the DISARMED render succeeds) is not constructed
+# here on purpose: both renders share one template set, so a fixture that breaks one breaks the other.
+# An assertion that cannot fail the way it claims is worse than none - this suite shipped one (the
+# "no armed flag" line T15 used to carry). T4, T15 and T16 cover the three reachable states.
 
 # ── T17: '%' is a systemd specifier, never a launchd one ──────────────────────────────────
 say_case "T17 '%' is refused on the systemd arm and allowed on the launchd arm"
 PC="$T/home/pc%h"; mkdir -p "$PC"; cp "$T/home/converger.py" "$PC/"
+rm -f "$ARM"                       # no state carried over from T16: this case renders DISARMED
 ENVV=(HOME="$PC" RUNNER_AUTOSCALE_SCRIPT="$PC/converger.py")
 D="$T/c17"; fresh "$D"
 OUT="$(run_install Linux "$D" --install)"; RC=$?
@@ -481,6 +504,54 @@ OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "--status exits 1 when the artifact's interpreter is gone (203/EXEC every tick)"
 assert_contains "$OUT" "python_present=no" "it reports the interpreter it could not find"
 assert_contains "$OUT" "installed=yes" "while still reporting the artifact as installed (the two are different questions)"
+
+# ── T19: --status notices an UNRECOGNISED mode argument ──────────────────────────────────
+# The verb used to grep for the literal --dry-run, so an artifact carrying --apply (the exact pi-cell-1
+# artifact that made every tick exit 2) was reported `mode=converge (ARMED)` and exit 0. A readiness
+# gate keying on this exit code called a schedule that fails every tick healthy.
+say_case "T19 --status reports an unrecognised mode argument (the inert-artifact class)"
+D="$T/c19"; fresh "$D"
+rm -f "$ARM"                                       # a record would render ARMED, with no flag to find
+run_install Linux "$D" --install >/dev/null 2>&1
+sed -i '/^ExecStart=/ s|$| --apply|' "$D/$UNIT_NAME.service"   # the measured pi-cell-1 defect
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--status exits 1 for an artifact the converger would reject on every tick"
+assert_contains "$OUT" "--apply" "it names the argument it found"
+assert_contains "$OUT" "exit 2" "and the consequence"
+
+# ── T20: EVERY writer refuses a sudo-invoked root run ────────────────────────────────────
+# The guard lived only in --install, so `sudo … --arm` wrote a record in /root and installed an ARMEd
+# User=root unit over the correct one, and `sudo … --disarm` reported DISARMED while removing root's
+# record and leaving the user's intact.
+say_case "T20 --install, --arm and --disarm are all refused under a sudo-invoked root run"
+printf '#!/usr/bin/env bash\ncase "$1" in -u) echo 0 ;; -un) echo root ;; *) echo root ;; esac\n' >"$T/bin/id"
+chmod +x "$T/bin/id"
+D="$T/c20"; fresh "$D"
+for verb in --install --arm --disarm; do
+    rm -f "$ARM"
+    ENVV=(PATH="$T/bin:$PATH" SUDO_USER=cmux)
+    OUT="$(run_install Linux "$D" "$verb" --reason fixture)"; RC=$?; ENVV=()
+    assert_eq "$RC" 1 "$verb is refused when invoked through sudo"
+    assert_contains "$OUT" "REFUSING to run as root" "$verb says why"
+    assert_nofile "$ARM" "$verb writes NO arming record under a refused root run"
+done
+assert_nofile "$D/$UNIT_NAME.service" "nothing was installed as root"
+
+# ── T21: a RELATIVE interpreter pin is refused ───────────────────────────────────────────
+# A scheduler resolves a relative command against ITS working directory, not the installer's, so
+# `./venv/bin/python` renders a unit that 203/EXECs on every tick while list-timers shows it scheduled.
+say_case "T21 a relative interpreter pin is refused (the scheduler does not share our cwd)"
+cp "$GOOD_PY" "$T/bin/relpy"; chmod +x "$T/bin/relpy"
+D="$T/c21"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PYTHON="./relpy" PATH="$T/bin:$PATH")
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a relative pin is REFUSED"
+# Which line refuses is deliberately not pinned: a relative pin fails the version probe first (the probe
+# runs it from THIS script dir, where it is not present) and the absolute-path rule in
+# refuse_unusable_target is the backstop behind it. Both are refusals, and the property that matters is
+# that no artifact is written.
+assert_contains "$OUT" "REFUSING" "the refusal is named"
+assert_nofile "$D/$UNIT_NAME.service" "nothing was installed with a relative interpreter"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
