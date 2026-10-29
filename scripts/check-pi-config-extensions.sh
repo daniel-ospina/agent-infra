@@ -306,7 +306,15 @@ else
   # as "dir/"; the tree lists bare basenames). One row per line; empty when
   # the entries array is missing/empty (fail-closed on the tree→manifest loop
   # below).
-  manifest_rows="$(python3 - "$MANIFEST" <<'PYEOF'
+  # ⛔ THE PRODUCER IS A FUNCTION, never a here-doc inside `$( )`. bash 3.2's substitution scanner does
+  # not skip a here-doc body: it walks the body as code, so an apostrophe in it (this body carries
+  # "this dir's" and "subdirectory's") desynchronises the parse for the REST OF THE FILE and the file
+  # fails `bash -n` — which is how #2930 made `install.sh` refuse to install the harness on a stock
+  # Mac, with the error reported ~80 lines below the defect (#2248 is the same class, one step worse).
+  # scripts/check-bash32-parse.sh enforces the shape; scripts/orchestrator-harness/merge-reminder.test.sh
+  # and tests/actionlint/run.sh were rewritten to it in the same change.
+  _manifest_rows() {
+    python3 - "$MANIFEST" <<'PYEOF'
 import json, sys
 
 try:
@@ -318,7 +326,8 @@ except (OSError, ValueError):
 for e in (m.get("files") or {}).get("extensions/", {}).get("entries") or []:
     print(str(e).rstrip("/"))
 PYEOF
-)" || {
+  }
+  manifest_rows="$(_manifest_rows)" || {
     echo "❌ cannot parse $MANIFEST — malformed JSON or missing files.extensions.entries"
     FAILURES=$((FAILURES + 1))
     parse_ok=0
@@ -477,7 +486,11 @@ if [ -d "$LIVE_FARM" ]; then
   #              NOT loaded (`existsSync` in `resolveExtensionEntries`), so inditing
   #              it would be the #2425 false-block class.
   if command -v python3 >/dev/null 2>&1; then
-    loader_rows="$(python3 - "$LIVE_FARM" <<'PYEOF' 2>/dev/null
+    # ⛔ Function-wrapped for the same reason as `_manifest_rows` above: no here-doc inside `$( )`
+    # (#2930). The body below is Python, so a quote in it is DATA — and under 3.2 the scanner cannot
+    # tell that, which is exactly the defect this shape removes.
+    _loader_rows() {
+      python3 - "$LIVE_FARM" <<'PYEOF' 2>/dev/null
 import json, os, sys
 
 root = sys.argv[1]
@@ -547,7 +560,8 @@ for name in names:
             print('executed\t%s\t%s: pi.extensions row -> %s'
                   % (target, sub, os.path.relpath(target, sub)))
 PYEOF
-)"
+    }
+    loader_rows="$(_loader_rows)"
     while IFS=$'\t' read -r kind lpath disp; do
       case "$kind" in
         short) short_circuit=1 ;;
@@ -559,7 +573,7 @@ PYEOF
       esac
     done <<< "$loader_rows"
   else
-    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's `pi.extensions` row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
+    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's \`pi.extensions\` row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
   fi
   # (a) top-level entries: the loader's own scan, spelled the same way — the glob
   #     skips dot-named names exactly as `collectAutoExtensionEntries` does, and
@@ -611,7 +625,10 @@ PYEOF
     inert="$inert$lap"$'\n'
   done <<< "$(find "$LIVE_FARM" -mindepth 2 -maxdepth 3 -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) 2>/dev/null | grep -v '/node_modules/' | head -10)"
   if [ -n "$inert" ]; then
-    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json `pi.extensions` row/index.ts entry, so this file is never loaded):"
+    # ⛔ The backticks are ESCAPED: inside double quotes an unescaped `\`` is a command substitution, so
+    # this message used to report its own failure on stderr (`pi.extensions: command not found`, seen on
+    # a live run) and print WITHOUT the quoted words it was quoting (#2976).
+    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json \`pi.extensions\` row/index.ts entry, so this file is never loaded):"
     printf '%s' "$inert" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
     echo "   → \`pi-bootstrap/setup.sh\` sweeps these on the next sync; nothing here executes today."
   fi

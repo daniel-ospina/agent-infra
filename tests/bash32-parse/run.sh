@@ -20,6 +20,10 @@
 #      tag would silently measure bash 5 while printing a green line;
 #   7. MUTATIONS: deleting the parse-failure branch, or the interpreter-version guard, must make a
 #      named arm go green — a pin that cannot fail is not a pin.
+#   8. the POPULATION is DERIVED, not hand-kept (#2976): a suffixless bash program in a throwaway repo
+#      is NAMED when it fails to parse (pre-fix the gate could not see it at all), an UNTRACKED copy is
+#      not a shipped surface, a python program is not swept, and a derivation that sees nothing REDS
+#      and names the file it lost instead of passing over it.
 #
 # The arms drive whichever interpreter path THIS host resolves (CI: the docker image; macOS: the
 # system /bin/bash 3.2), so each platform exercises the half it will actually use. The half not
@@ -125,7 +129,8 @@ if [ "$host_major" = "3" ]; then
   skip "this host's bash is 3.x, so the fixtures cannot be shown clean under a NEWER parser here (CI's bash 5 arm covers it)"
 else
   bad=0; nfx=0
-  for fx in "$FIXDIR"/*.sh; do
+  for fx in "$FIXDIR"/*; do
+    [ -f "$fx" ] || continue
     nfx=$((nfx + 1))
     if ! "$BASH" -n "$fx" 2>/dev/null; then
       bad=$((bad + 1))
@@ -163,6 +168,9 @@ echo "── 7. mutations: the pins are load-bearing ─────────
 # mutant <needle> <replacement> <label> <expected-exit-of-the-mutant> [args...]
 # The substitution must land EXACTLY once: a gate whose text moved would silently measure something
 # else, and an unapplied mutation is an arm that reads green while proving nothing.
+# MUTANT_ENV (optional, and cleared by every arm that does not set it) is applied to the mutant run: a
+# mutant copy lives in $TMPD, so a run with no explicit files would otherwise resolve ITS tree from
+# that location (SELF_DIR/..) instead of the repo's.
 mutant() {
   local needle="$1" repl="$2" label="$3" want="$4"; shift 4
   local copy="$TMPD/mutant$(printf '%s' "$label" | cksum | cut -d' ' -f1).sh"
@@ -180,7 +188,11 @@ PY
     return 0
   fi
   chmod +x "$copy"
-  bash "$copy" "$@" >"$OUT" 2>&1
+  if [ -n "${MUTANT_ENV:-}" ]; then
+    env "$MUTANT_ENV" bash "$copy" "$@" >"$OUT" 2>&1
+  else
+    bash "$copy" "$@" >"$OUT" 2>&1
+  fi
   local rc=$?
   if [ "$rc" -eq "$want" ]; then
     pass "$label (mutant exit $rc)"
@@ -226,6 +238,42 @@ then
 else
   fail "M2: the mutation could not be applied (the gate's text moved) — the arm is NOT evidence"
 fi
+
+echo "── 8. the population is DERIVED from the index, not hand-kept (#2976) ────────────────"
+# #2976: the suffixless half of the population was a HAND-KEPT list, and it had drifted to 4 of this
+# tree's 9 suffixless bash entry points — so a defect introduced in `bin/harness`, `sync`, `sync-all`,
+# `scripts/gh-shim/gh` or `scripts/orchestrator-harness/gh-limit/gh` would still have shipped GREEN.
+# The gate derives that half from the index + shebang now; these arms drive the derivation on a
+# THROWAWAY git repo, so what is under test is the derivation, not this tree's file list.
+DREPO="$TMPD/derived-repo"
+mkdir -p "$DREPO/ops"
+# A suffixless bash program carrying the 3.2 defect (the file the old list could not see), a CLEAN
+# suffixless bash program, one tracked *.sh (so this is not the empty-population case), and a PYTHON
+# program whose body also fails a bash parse — if the shebang test were a substring match that file
+# would be swept and named, which is the false block this arm rules out.
+cp "$FIXDIR/heredoc-quote-in-body" "$DREPO/ops/broken-tool"
+cp "$FIXDIR/clean-function-wrapped.sh" "$DREPO/ops/clean-tool"
+cp "$FIXDIR/clean-function-wrapped.sh" "$DREPO/ops/clean.sh"
+printf '#!/usr/bin/env python3\n# not bash, and not parseable as bash either\ndef f(x): return (1\n' >"$DREPO/ops/tool.py"
+chmod +x "$DREPO/ops/broken-tool" "$DREPO/ops/clean-tool"
+git -C "$DREPO" init -q
+git -C "$DREPO" add -- ops/broken-tool ops/clean-tool ops/clean.sh ops/tool.py
+env_guard 1 "a suffixless bash program IS in the population (the file the hand list missed)" "CHECK_BASH32_ROOT=$DREPO"
+expect_out "ops/broken-tool"
+expect_not_out "ops/clean-tool"
+expect_not_out "ops/tool.py"
+# The INDEX is the source of the population: the same file, untracked, is not a shipped surface — and
+# the clean suffixless program still parses, so the derivation did not simply stop seeing files.
+git -C "$DREPO" rm -q --cached ops/broken-tool
+env_guard 0 "an UNTRACKED file is not a shipped surface, and the clean suffixless program still counts" "CHECK_BASH32_ROOT=$DREPO"
+if grep -q '2 script(s) parse' "$OUT"; then pass "   ↳ it counted the .sh + the suffixless program, and nothing else"; else fail "   ↳ expected exactly 2 files in the derived population"; sed 's/^/      /' "$OUT"; fi
+# M3: the `MUST_DERIVE` assertion is load-bearing — with the derivation returning nothing, the gate
+# must say "cannot measure" and NAME the file it lost, never print a green line over it.
+MUTANT_ENV="CHECK_BASH32_ROOT=$ROOT"
+mutant 'suffixless="$(derive_suffixless)"' 'suffixless=""' \
+  "M3: a derivation that sees nothing REDS and names the file, instead of passing over it" 2
+expect_out "does not cover"
+MUTANT_ENV=""
 
 echo
 if [ "$failures" -eq 0 ]; then

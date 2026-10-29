@@ -43,8 +43,18 @@
 # (#2248's shape: the body's words run as commands). This gate is a parse leg; the runtime half of
 # that class is pinned textually elsewhere (scripts/orchestrator-harness/worker-terminal.test.sh).
 #
+# THE POPULATION IS DERIVED FROM THE INDEX, NEVER HAND-KEPT. Both halves of it — the `*.sh` sweep and
+# the suffixless bash entry points — are read from `git ls-files`, and the suffixless half is selected
+# by the only property that makes a file a bash PROGRAM: its shebang names bash. A hand-kept list is
+# what drifted (#2976): it named 4 of the tree's 9 suffixless bash entry points, so the same defect
+# introduced later in `bin/harness`, `sync`, `sync-all`, `scripts/gh-shim/gh` or
+# `scripts/orchestrator-harness/gh-limit/gh` would still have shipped GREEN — the exact false PASS
+# this gate exists to remove. The named list survives only as an ASSERTION (`MUST_DERIVE`): if the
+# derivation ever stops seeing a file this repo knows it ships, the gate REDS instead of quietly
+# shrinking its population.
+#
 # Usage:
-#   scripts/check-bash32-parse.sh                 # every tracked *.sh (minus tests/fixtures) + bash entry points
+#   scripts/check-bash32-parse.sh                 # every tracked *.sh (minus tests/fixtures) + every tracked suffixless bash program
 #   scripts/check-bash32-parse.sh FILE...         # explicit files (fixture tests)
 #   BASH32=/opt/bash-3.2/bin/bash scripts/check-bash32-parse.sh   # pin the interpreter
 #   BASH32_IMAGE=<ref> scripts/check-bash32-parse.sh               # override the pinned image (tests)
@@ -58,13 +68,50 @@ ROOT="${CHECK_BASH32_ROOT:-$(cd "$SELF_DIR/.." && pwd)}"
 # Pinned by DIGEST: `bash:3.2` is a moving tag, and a tag that later resolved to bash 4/5 would make
 # this leg measure the wrong platform while still printing a green line.
 IMAGE="${BASH32_IMAGE:-bash:3.2@sha256:b6252c62fc86114f93f02104a486c71e6569371d95950ea7479a2ffd6b47f16a}"
-# Bash programs that carry no `.sh` suffix (the operator types them). Named here for the same reason
-# scripts/run-bash-shards.sh adds them to SWEEP_GLOBS: a `*.sh`-only sweep covers none of them, and
-# install.sh's own gate checks gh-rest/gh explicitly for the same reason.
-EXTRA=(scripts/harness-up scripts/harness-down scripts/harness-status
-       scripts/orchestrator-harness/gh-rest/gh)
+# ⛔ THIS IS NOT THE POPULATION — the population is derived (see `derive_suffixless`). These are the
+# suffixless bash programs this repo KNOWS it ships, kept only so the derivation cannot fail QUIETLY:
+# a shebang lost in an edit, a file moved out of the index, or a broken derivation would otherwise
+# shrink the sweep while still printing a green line. Each entry is checked against the derived set
+# and a miss exits 2 ("cannot measure") rather than passing over a file nobody parsed.
+MUST_DERIVE=(bin/harness scripts/gh-shim/gh scripts/harness-up scripts/harness-down
+             scripts/harness-status scripts/orchestrator-harness/gh-rest/gh
+             scripts/orchestrator-harness/gh-limit/gh sync sync-all)
 
 die() { printf '❌ check-bash32-parse: %s\n' "$*" >&2; exit 2; }
+
+# The suffixless bash programs, read out of the INDEX (the same source as the `*.sh` sweep, so an
+# untracked scratch file is not a shipped surface) and selected by the shebang. Reads ONE line per
+# tracked file, so it is bounded by the index and never walks the tree (docs/ops/load-policy.md).
+# Covered shapes: `#!/bin/bash`, `#!/usr/local/bin/bash -eu`, `#!/usr/bin/env bash`,
+# `#!/usr/bin/env -S bash -eu`. Bash versions are matched by the interpreter WORD — the `env` wrapper
+# and its flags are skipped — never by a substring, so a `#!/usr/bin/python3` file that merely
+# mentions bash is not pulled into a bash parse sweep.
+derive_suffixless() {
+  local rel first nb tok
+  while IFS= read -r rel; do
+    case "$rel" in
+      *.sh) continue ;;             # already swept by the `*.sh` half above
+      tests/fixtures/*) continue ;; # the deliberate 3.2-hostile fixtures (same carve-out, same reason)
+    esac
+    first=""
+    IFS= read -r first <"$ROOT/$rel" 2>/dev/null || continue
+    case "$first" in '#!'*) : ;; *) continue ;; esac
+    nb="${first:2}"
+    # Word splitting IS the tokeniser: a shebang line carries no quoting (SC2086 is intended here).
+    # shellcheck disable=SC2086
+    set -- $nb
+    [ "$#" -gt 0 ] || continue
+    [ "${1##*/}" = env ] && shift
+    tok=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -*) shift ;; # an `env` flag (`-S`, `-i`), not the interpreter
+        *) tok="$1"; break ;;
+      esac
+    done
+    [ "${tok##*/}" = bash ] && printf '%s\n' "$rel"
+  done < <(git -C "$ROOT" ls-files 2>/dev/null | LC_ALL=C sort)
+}
 
 # ── the file list ────────────────────────────────────────────────────────────────────────────────
 FILES=()
@@ -87,8 +134,23 @@ else
     FILES+=("$ROOT/$rel")
   done < <(git -C "$ROOT" ls-files '*.sh' 2>/dev/null | LC_ALL=C sort)
   [ "${#FILES[@]}" -gt 0 ] || die "git ls-files returned no *.sh under $ROOT — that is not a repository with shipped scripts"
-  for rel in "${EXTRA[@]}"; do
-    [ -f "$ROOT/$rel" ] && FILES+=("$ROOT/$rel")
+
+  # ⛔ DERIVED, not listed (#2976). A hand-kept list had already drifted to 4 of 9 files.
+  suffixless="$(derive_suffixless)"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    FILES+=("$ROOT/$rel")
+  done <<< "$suffixless"
+  # ...and the derivation is CHECKED against the known set, so a loss is loud. A path that is no
+  # longer in the index is skipped: it is not a file that the derivation failed to see, it is a file
+  # that is no longer shipped (`git ls-files --error-unmatch` is the "is it tracked?" test).
+  for rel in "${MUST_DERIVE[@]}"; do
+    git -C "$ROOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 || continue
+    case "
+$suffixless
+" in *"
+$rel
+"*) : ;; *) die "the derived suffixless-bash population does not cover '$rel', which is tracked — the derivation is broken, so this sweep would report OK over a file it never parsed" ;; esac
   done
 fi
 [ "${#FILES[@]}" -gt 0 ] || die "no files to check — an empty population must not read as a pass"
