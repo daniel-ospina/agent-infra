@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# merge-one-recovery.test.sh — #3036: a carry skips the REVIEW, never the MERGE.
+#
+# WHY THIS SUITE EXISTS. The record-recovery block in `merge-one.sh` shipped with two failures that
+# nothing in the tree could see (review of #3037, P2-5): its first version `exit 0`'d on both success
+# arms — and `exit 0` in that file means "this worker is done", so the steps that LAND the PR (step
+# 3a's `rail_attempt`, step 4's `gh pr merge`) never ran — and its second version pinned the carry
+# re-mint, which the recorder REFUSES, so the block bought the very review it exists to prevent. Both
+# are invisible to inspection and neither had a test. This suite is that test.
+#
+# HOW THESE CHECKS ARE WRITTEN. Every one drives the SHIPPED `merge-one.sh` end to end on RAIL
+# authority (the only branch the block is reachable from — on a rail repo a record already at this
+# head short-circuits at the earlier `record_at_head` branch), with a recorder REPLICA that honours
+# the verbs' real contract: `--check-carry` answers a TOKEN and its own rc, `--recover-body` fills an
+# ABSENCE, and a positional mint writes a record AND posts the signed marker, exactly as
+# `record-review.sh` does. `pi`, `gh` and `git` are exported shell FUNCTIONS, not file stubs:
+# `merge-one.sh` prepends /opt/homebrew/bin:/usr/local/bin to PATH itself, so a file stub could be
+# shadowed — and a real `pi` here would be a live, paid model call.
+#
+# ⛔ THE CENTRAL ASSERTION IS THAT THE RAIL RAN, not that the worker exited 0. `rail_attempt`
+# executes `$REPO/scripts/admin-merge.sh`, so the fixture installs a SPY there. A test that asserted
+# the log line a broken block writes would pass on the broken block — the defect class this suite
+# exists to stop repeating.
+#
+# LABELLING RULE, measured rather than asserted:
+#   `RED→GREEN`        fails on `origin/main` (9a3cf06e0), which has no recovery block at all.
+#   `RED→GREEN(exit-0)` passes on `origin/main` and fails only on the exit-0 version of the block —
+#                      the one this PR's own history shipped. Main never had that defect, so it
+#                      cannot be red there.
+#   no label           a REGRESSION or COVERAGE pin.
+#
+#   bash scripts/orchestrator-harness/merge-one-recovery.test.sh
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MERGE="$HERE/merge-one.sh"
+BASH_BIN="$(command -v bash)"
+[ -x "$MERGE" ] || { echo "❌ missing $MERGE"; exit 1; }
+
+pass=0; fail=0
+ck() { # ck <name> <0|1>
+  if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1))
+  else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); fi
+}
+note() { printf '      %s\n' "$*"; }
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+echo "==> #3036 merge-one record recovery ($HERE)"
+
+# ── the stub toolchain ────────────────────────────────────────────────────────
+# PATH is replaced with this directory for every driven worker, so nothing on the host can make a
+# negative case pass and no real `gh` can reach the network.
+COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps mktemp tee"
+STUBS="$TMP/stubs"
+mkdir -p "$STUBS"
+for b in $COREUTILS; do
+  p="$(command -v "$b" 2>/dev/null)" && ln -sf "$p" "$STUBS/$b"
+done
+ln -sf "$BASH_BIN" "$STUBS/bash"
+# python3 real: step 3 parses `gh pr checks --json` THROUGH it, and an `exit 0` stub makes json.load
+# never run, the gate read EMPTY, and the worker wait the whole 30 x 30 s loop.
+p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$STUBS/python3"
+# openssl real: the worker VERIFIES the marker's HMAC, so a matching-digest stub would make the
+# fixture unfaithful — it would pass whether or not the worker really verified anything.
+p="$(command -v openssl 2>/dev/null)" && ln -sf "$p" "$STUBS/openssl"
+printf '#!/bin/bash\nexit 0\n' > "$STUBS/pi";  chmod +x "$STUBS/pi"
+printf '#!/bin/bash\nexit 0\n' > "$STUBS/jq";  chmod +x "$STUBS/jq"
+printf '#!/bin/bash\nexit 0\n' > "$STUBS/git"; chmod +x "$STUBS/git"
+printf '#!/bin/bash\nexit 0\n' > "$STUBS/gh";  chmod +x "$STUBS/gh"
+
+# ── the fixture ───────────────────────────────────────────────────────────────
+HEAD="0123456789abcdef0123456789abcdef01234567"     # the LIVE head
+OLDH="89abcdef0123456789abcdef0123456789abcdef"     # the REVIEWED head a carried record names
+PR=7
+OR="acme/widget"
+TEST_GATE_KEY="test-gate-key-3036"
+MRG="$TMP/mrg"
+
+mkmrg() { # mkmrg — a fresh merge fixture: repo (with a rail SPY), HOME, state dirs
+  rm -rf "$MRG"
+  mkdir -p "$MRG/home/.pi/agent/scripts" "$MRG/home/.pi/agent/reviews" \
+           "$MRG/repo/scripts" "$MRG/o/logs" "$MRG/o/state"
+  : > "$MRG/pi-count"
+  : > "$MRG/recorder-calls"
+  : > "$MRG/pr-body"
+  : > "$MRG/rail-ran"
+  : > "$MRG/merged"
+  # THE SPY, at exactly the path `rail_attempt` executes.
+  cat > "$MRG/repo/scripts/admin-merge.sh" <<'SH'
+#!/bin/bash
+printf 'rail ran pr=%s\n' "${1:-}" >> "$RAIL_SPY"
+exit 0
+SH
+  chmod +x "$MRG/repo/scripts/admin-merge.sh"
+}
+
+marker_line() { # marker_line <head> <verdict> — the SIGNED line record-review.sh posts into the body
+  local txt sig
+  txt="review recorded: reviews/$PR.json verdict=$2 @ $1 (acme/widget)"
+  sig="$(printf '%s' "$txt" | command openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+  printf '%s sig=%s\n' "$txt" "$sig"
+}
+
+write_record() { # write_record <head> <verdict> — a record AND the signed marker behind it
+  mkdir -p "$MRG/home/.pi/agent/reviews"
+  printf '{"pr":%s,"repo":"%s","head_sha":"%s","verdict":"%s","diff_sha256":"%s","reviewed_at":"2026-10-29T00:00:00Z"}\n' \
+    "$PR" "$OR" "$1" "$2" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    > "$MRG/home/.pi/agent/reviews/acme-widget-$PR.json"
+  marker_line "$1" "$2" >> "$MRG/pr-body"
+}
+
+# A recorder REPLICA that honours the verbs' ACTUAL contract. Knobs:
+#   FAKE_CC_TOKEN / FAKE_CC_RC  what `--check-carry` answers (a TOKEN on stdout, its own rc)
+#   FAKE_CC_TOKEN_AFTER         the answer AFTER a successful `--recover-body` (stateful, like the
+#                               real verb: a runner that kept answering `norecord` would pin the
+#                               fall-through branch while looking like it pinned the recovery one)
+#   FAKE_RECOVER_RC             whether `--recover-body` restores a head-bound record
+#   FAKE_RERECORD_RC            whether a positional mint (re-record) writes a record
+# Every invocation is logged to $MRG/recorder-calls, so the assertions can read the ARGV the worker
+# actually chose — that is what pins "the re-mint names the REVIEWED head", which is the whole
+# difference between a carry that works and a fresh mint the recorder refuses.
+mkrecorder() {
+  cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> '$MRG/recorder-calls'
+# NO BACKTICKS IN THIS HEREDOC: it is unquoted (the fixture paths must expand), so a backtick in a
+# comment runs as COMMAND SUBSTITUTION here.
+case "\$1" in
+  --check-carry)
+    if [ -f '$MRG/recovered' ] && [ -n "\${FAKE_CC_TOKEN_AFTER:-}" ]; then
+      printf '%s\t-\t-\n' "\$FAKE_CC_TOKEN_AFTER"; exit "\${FAKE_CC_RC_AFTER:-0}"
+    fi
+    printf '%s\t-\t-\n' "\${FAKE_CC_TOKEN:-unknown}"; exit "\${FAKE_CC_RC:-0}" ;;
+  --recover-body)
+    if [ "\${FAKE_RECOVER_RC:-1}" = "0" ]; then
+      printf '{"pr":%s,"repo":"%s","head_sha":"%s","verdict":"clean","diff_sha256":"%s"}\n' \\
+        $PR "$OR" "\${FAKE_HEAD:?}" \\
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \\
+        > '$MRG/home/.pi/agent/reviews/acme-widget-$PR.json'
+      : > '$MRG/recovered'
+      exit 0
+    fi
+    exit 3 ;;
+  --print-diff-hash|--print-tier) exit 2 ;;
+esac
+# a positional MINT: <pr> <head> <verdict> <repo> [--evidence …] [--expect-head …]
+if [ "\${FAKE_RERECORD_RC:-0}" = "0" ]; then
+  printf '{"pr":%s,"repo":"%s","head_sha":"%s","verdict":"%s","diff_sha256":"%s","mint":"carried"}\n' \\
+    "\$1" "\$4" "\${FAKE_HEAD:?}" "\$3" \\
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \\
+    > '$MRG/home/.pi/agent/reviews/acme-widget-$PR.json'
+  txt="review recorded: reviews/\$1.json verdict=\$3 @ \${FAKE_HEAD} (acme/widget)"
+  sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+  printf '%s sig=%s\n' "\$txt" "\$sig" >> '$MRG/pr-body'
+fi
+exit "\${FAKE_RERECORD_RC:-0}"
+EOF
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+
+# run_merge [env…] — drive the SHIPPED worker on RAIL authority (the branch the block is reachable
+# from). `REQ` is the documented operator override and is what makes the authority `rail` without a
+# branch-protection read; `CC_RETRY_SECS=0` keeps the unreadable retry out of the wall clock.
+run_merge() {
+  (
+    # ⛔ THESE FUNCTION BODIES MUST NOT READ THE FIXTURE'S SHELL VARIABLES. bash imports an exported
+    # function into the DRIVEN script, so `$MRG`, `$HEAD`, `$PR` there are the SCRIPT's globals — and
+    # `merge-one.sh` runs `set -u`, so an unset one aborts the function and the read returns EMPTY.
+    # The first draft used `${FAKE_HEAD_OVERRIDE:-$HEAD}`; every arm then read `head=` empty and died
+    # at the empty-head refusal. Dedicated names only, all arriving through the environment.
+    pi() { echo x >> "${PI_COUNT}"; printf 'CLEAN https://github.com/acme/widget/pull/%s#issuecomment-12345\n' "${FAKE_PR}"; }
+    gh() {
+      case "$*" in
+        *"pr view"*headRefOid*) printf '%s\n' "${FAKE_HEAD}"; return 0 ;;
+        *"pr view"*body*)       cat "${FAKE_BODY_FILE}" 2>/dev/null; return 0 ;;
+        *"pr checks"*)          printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n'; return 0 ;;
+        *required_status_checks*) printf 'ai-review-gate\n'; return 0 ;;
+        *"pr merge"*)           printf 'merged pr=%s\n' "${FAKE_PR}" >> "${MERGE_SPY}"; return 0 ;;
+        *) return 0 ;;
+      esac
+    }
+    git() { return 0; }
+    export -f pi gh git
+    env PATH="$STUBS" HOME="$MRG/home" O="$MRG/o" \
+        RAIL_SPY="$MRG/rail-ran" MERGE_SPY="$MRG/merged" CC_RETRY_SECS="${CC_RETRY_SECS:-0}" \
+        AI_REVIEW_GATE_KEY="$TEST_GATE_KEY" \
+        PI_COUNT="$MRG/pi-count" FAKE_PR="$PR" FAKE_HEAD="$HEAD" \
+        FAKE_BODY_FILE="$MRG/pr-body" \
+        FAKE_CC_TOKEN="${FAKE_CC_TOKEN:-unknown}" FAKE_CC_RC="${FAKE_CC_RC:-0}" \
+        REQ="pipeline-compliance" \
+        FAKE_CC_TOKEN_AFTER="${FAKE_CC_TOKEN_AFTER:-}" FAKE_CC_RC_AFTER="${FAKE_CC_RC_AFTER:-0}" \
+        FAKE_RECOVER_RC="${FAKE_RECOVER_RC:-1}" FAKE_RERECORD_RC="${FAKE_RERECORD_RC:-0}" \
+        "$@" \
+        "$BASH_BIN" "$MERGE" "$MRG/repo" "$OR" "$PR" fix/x
+  ) 2>&1
+}
+pi_calls() { local n=0; [ -f "$MRG/pi-count" ] && n="$(grep -c x "$MRG/pi-count" 2>/dev/null)"; printf '%s' "${n:-0}"; }
+rail_ran() { [ -s "$MRG/rail-ran" ]; }
+recorder_saw() { grep -qF -- "$1" "$MRG/recorder-calls" 2>/dev/null; }
+remints() { local n; n="$(grep -c '^7 ' "$MRG/recorder-calls" 2>/dev/null)"; printf '%s' "${n:-0}"; }
+log_has() { grep -qF -- "$1" "$MRG/o/logs/merge-$PR.log" 2>/dev/null; }
+no_park() { [ ! -s "$MRG/o/state/parked-$PR" ]; }
+merged() { [ -s "$MRG/merged" ]; }
+
+# ══ 1) THE CENTRAL PROPERTY: `carry` RE-BINDS THE RECORD AND THE MERGE IS REACHED ════════════════
+# The measured shape (#10255): a clean record at a STALE head, the live diff unchanged. The exit-0
+# version logged `CARRY — nothing paid` and ended the worker; the pinned version could not re-mint at
+# all, so it paid for the review it exists to prevent.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0)"
+rc=0; rail_ran || { rc=1; note "the rail NEVER RAN — the worker ended without a merge (the P0)"; }
+ck "RED→GREEN(exit-0): on 'carry' the rail is REACHED (a carry skips the review, never the merge)" $rc
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a PAID review was ordered despite the carry"; }
+ck "RED→GREEN: …and no paid review is ordered" $rc
+# The re-mint must name the head the RECORD describes. Naming the LIVE head makes SHA == CURRENT_HEAD,
+# so record-review.sh never enters its carry arms and :3043 refuses a `clean` verdict for having no
+# --evidence — exit 3, nothing written, and the review is bought anyway.
+rc=0; recorder_saw "$PR $OLDH clean" || { rc=1; note "recorder argv were: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
+ck "RED→GREEN: the carry re-mint names the REVIEWED head (the live head is a FRESH mint, refused)" $rc
+rc=0; recorder_saw "$PR $HEAD clean" && { rc=1; note "the re-mint named the LIVE head — refused at record-review.sh:3043 without --evidence"; }
+ck "RED→GREEN: …and never the live head" $rc
+rc=0; recorder_saw "--expect-head" && { rc=1; note "the carry passed --expect-head, which record-review.sh:2873 refuses on every head move (#1362 D1)"; }
+ck "RED→GREEN: the carry passes no --expect-head (#1362 D1: a pin refuses every base-only move)" $rc
+rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "a satisfied record parks nothing (it still has to merge)" $rc
+
+# ══ 2) `head` — already bound to this head: merge reached, and nothing is re-minted ══════════════
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge FAKE_CC_TOKEN=head FAKE_CC_RC=0)"
+rc=0; rail_ran || { rc=1; note "the rail NEVER RAN on 'head'"; }
+ck "RED→GREEN(exit-0): on 'head' the rail is REACHED and nothing is paid" $rc
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
+ck "…and no paid review is ordered" $rc
+rc=0; [ "$(remints)" = "0" ] || { rc=1; note "an unnecessary re-mint ran: $(grep '^7 ' "$MRG/recorder-calls")"; }
+ck "…and a record already at this head is not re-minted" $rc
+
+# ══ 3) `norecord` + a verifiable marker: RESTORED, and the merge still runs ═══════════════════════
+mkmrg; mkrecorder
+out="$(run_merge FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=head)"
+rc=0; rail_ran || { rc=1; note "the rail NEVER RAN after a successful --recover-body"; }
+ck "RED→GREEN(exit-0): a record RESTORED from the signed body marker is merged (not just restored)" $rc
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
+ck "RED→GREEN: …with no paid review" $rc
+rc=0; recorder_saw "--recover-body $PR" || { rc=1; note "calls: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
+ck "…asked --recover-body for THIS PR and repo" $rc
+
+# ══ 4) `nodigest` / `carry-patch` say RE-RECORD, never RE-REVIEW ═════════════════════════════════
+# Both are NON-ZERO rcs. Keying on `rc == 0` treated them as "a fresh review is owed" and bought a
+# full paid review (REVIEW_TIMEOUT = 1800 s) on a rebase — the exact #1377 case.
+for pair in "nodigest:5" "carry-patch:6"; do
+  tok="${pair%%:*}"; tokrc="${pair##*:}"
+  mkmrg; mkrecorder; write_record "$OLDH" clean
+  out="$(run_merge FAKE_CC_TOKEN="$tok" FAKE_CC_RC="$tokrc")"
+  rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — rc=$tokrc was read as 'review owed', which the verb's own contract forbids"; }
+  ck "RED→GREEN: '$tok' (rc=$tokrc) does NOT buy a paid review" $rc
+  rc=0; rail_ran || { rc=1; note "the rail NEVER RAN on '$tok'"; }
+  ck "RED→GREEN(exit-0): …'$tok' re-binds the record and reaches the rail" $rc
+done
+
+# ══ 5) `fresh` — the ONE answer that owes a review: it IS paid for ═══════════════════════════════
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=fresh FAKE_CC_RC=1)"
+rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls) — a genuinely changed diff must still be reviewed"; }
+ck "'fresh' (the reviewed diff CHANGED) still orders the review" $rc
+
+# ══ 6) `unreadable` — a TRANSPORT failure: pay nothing, merge nothing, park nothing ══════════════
+# The live diff could not be READ (secondary rate limit / 5xx / expired token — the #784
+# population). Paying for a review over a failed API read is the treadmill the block exists to stop,
+# and a park would blame the PR for a transport fault.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=unreadable FAKE_CC_RC=3)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
+ck "RED→GREEN: 'unreadable' pays for NO review (it is not a changed diff)" $rc
+rc=0; rail_ran && { rc=1; note "the rail ran on an unreadable read"; }
+ck "…and merges nothing" $rc
+rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "RED→GREEN(exit-0): …and parks nothing (a transport fault is not the PR's fault)" $rc
+rc=0; log_has "check-carry=unreadable" || { rc=1; note "the log does not name the transport cause: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and SAYS the read failed, so the remedy is a retry and not a re-review" $rc
+
+# ══ 7) A HEAD-BOUND ANSWER IS NOT A CLEAN ONE (P1-2, both reviews) ════════════════════════════════
+# `--check-carry` never looks at the verdict: a record saying `issues` bound to this head answers
+# `head`/rc 0. Treating that as "no review is owed" converts the remedy for FINDINGS into silence.
+# ⛔ ON GATE AUTHORITY, DELIBERATELY. The `head` answer's verdict check is reached only when
+# `record_at_head` was false at the earlier rail branch — and on a RAIL repo a record bound to this
+# head short-circuits there and the block never runs at all. Gate authority is where the arm is live,
+# so that is where it must be pinned (and where the merge is a raw `gh pr merge`, hence MERGE_SPY).
+mkmrg; mkrecorder; write_record "$HEAD" issues
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=head FAKE_CC_RC=0)"
+rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls) — an ISSUES record was read as 'no review owed'; the fixer marker is never written"; }
+ck "RED→GREEN(exit-0): a HEAD-BOUND record whose verdict is 'issues' does NOT satisfy the run" $rc
+rc=0; log_has "not full 'clean'" || { rc=1; note "the log does not name the verdict it refused: $(tail -8 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the log names the non-clean verdict it refused" $rc
+# ⛔ NOT "nothing is merged": a review is ordered and THAT review's clean verdict may legitimately
+# merge the PR. The property is that the ISSUES record did not take the no-review path, which is the
+# line the exit-0 block would have written instead of ordering a review.
+rc=0; log_has "NO REVIEW ORDERED" && { rc=1; note "the ISSUES record took the no-review path"; }
+ck "…and it does NOT take the no-review path" $rc
+# The same gate-authority path on a CLEAN record MUST reach the merge — the residual arm, so the one
+# above cannot pass by the merge being unreachable in gate mode at all.
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=head FAKE_CC_RC=0)"
+rc=0; merged || { rc=1; note "gate authority never reached the merge even on a clean record (the arm above would be vacuous): $(tail -8 "$MRG/o/logs/merge-$PR.log")"; }
+ck "RED→GREEN(exit-0): …and a CLEAN head-bound record DOES reach the raw merge in gate mode" $rc
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
+ck "RED→GREEN: …with no paid review" $rc
+
+# ══ 8) A RECORDER THAT DOES NOT IMPLEMENT THE VERB AUTHORIZES NOTHING ═════════════════════════════
+# A stub, a replica, a box not yet re-provisioned, a wrapper that ignores unknown flags: all exit 0
+# having printed something else entirely. This is also what turned `merge-gate-read.test.sh` red —
+# its replica ignores argv and exits 0, so every driven arm short-circuited at CARRY.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN='review' FAKE_CC_RC=0)"
+rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls) — an unimplemented verb's rc 0 read as an authorization"; }
+ck "RED→GREEN(exit-0): an unrecognised answer authorizes nothing (falls through to the review path)" $rc
+rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…and parks nothing" $rc
+
+# ══ 9) A REFUSED RE-RECORD FALLS THROUGH, AND NAMES THE PRODUCER'S OWN RC ═════════════════════════
+# A stale patch or a red target head (#1575 clause E) makes the recorder refuse the carry. The
+# worker must then cover the head the only other way — a review — and it must SAY why, with the
+# producer's rc, instead of "did not produce a clean head-bound record" and no cause.
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge FAKE_CC_TOKEN=carry FAKE_CC_RC=0 FAKE_RERECORD_RC=3)"
+rc=0; [ "$(pi_calls)" = "1" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
+ck "a REFUSED carry re-mint falls through to the review path (never to a stale-head record)" $rc
+rc=0; log_has "re-mint rc=3" || { rc=1; note "the log does not carry the producer's rc: $(tail -8 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the log carries the recorder's OWN rc, not a collapsed cause" $rc
+
+echo
+echo "==> $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

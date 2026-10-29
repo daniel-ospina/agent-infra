@@ -584,6 +584,13 @@ review_verdict_of() { # review_verdict_of <record-file> -> its verdict token (th
   [ -f "${1:-}" ] || return 1
   sed -n 's/.*"verdict":"\([a-z-]*\)".*/\1/p' "$1" 2>/dev/null | command head -1
 }
+review_head_of() { # review_head_of <record-file> -> the head that record NAMES (the head a REVIEWER
+                   #    read). A carry re-mint must name THIS one, never the live head: see
+                   #    `_cc_rerecord` for why the difference decides whether the call re-binds the
+                   #    verdict or is refused outright.
+  [ -f "${1:-}" ] || return 1
+  sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | command head -1
+}
 # review_clean_at_head — "a review already happened at this head", the predicate the CONTROLLER
 # uses for the same question (`orch-loop.sh::review_disp_decide`, its AT-HEAD arm): a record whose
 # `head_sha` is THIS head AND whose verdict is clean. Reused rather than re-derived, so the worker
@@ -902,6 +909,8 @@ CC_OWED=0      # 1 = a CLEAN record already covers this head: the REVIEW is not 
 CC_RC=1        # the last `--check-carry` exit code, kept for the log line (never collapsed)
 CC_TOKEN=""    # …and its answer (field 1 of stdout: head|carry|carry-patch|fresh|unreadable|…)
 CC_VERDICT=""  # the record's OWN verdict, the only value a carry re-mint may use
+CC_RE_RC=""    # the re-record's exit code, kept for the log line: "it did not work" without the
+               # producer's own rc is the same collapsed-cause defect this review named (P1-3)
 CC_RETRY_SECS="${CC_RETRY_SECS:-10}"
 is_limit "$CC_RETRY_SECS" || CC_RETRY_SECS=10
 
@@ -925,16 +934,39 @@ _cc_ask() {
 # ⛔ IT REFUSES TO INVENT A VERDICT: the token comes from the record, and only a clean-family value
 # is a value the recorder accepts (anything else would be re-signed as a claim no reviewer made).
 _cc_rerecord() {
-  local v
-  v="$(review_verdict_of "$(review_record_file_for_pr)")"
+  local v f rec_head
+  f="$(review_record_file_for_pr)" || return 1
+  v="$(review_verdict_of "$f")"
   case "$v" in clean*) ;; *) return 1 ;; esac
+  rec_head="$(review_head_of "$f")"
+  [ -n "${rec_head:-}" ] || return 1
   CC_VERDICT="$v"
-  # ⛔ PINNED TO THE HEAD THIS WORKER READ (#2572/#2988). A carry re-mint is still a MINT, and the
-  # recorder's own carry arms re-bind to the LIVE head — so without the pin a push that lands between
-  # this worker's head read and this call would mint a record for a revision nobody read here. The
-  # recorder refuses rather than record an unverifiable pin, and the caller then falls through to the
-  # review path: fail-closed, and the only cost of the race.
-  "$RECORDER" "$PR" "$HEAD" "$v" "$OR" --expect-head "$HEAD" >> "$L.log" 2>&1
+  # ⛔ THE POSITIONAL HEAD IS THE **REVIEWED** ONE, AND THERE IS NO `--expect-head` HERE. Both are
+  # load-bearing, and the first draft of THIS fix got both wrong — it passed `$HEAD` (the live head
+  # this worker just read) plus `--expect-head "$HEAD"`, which reads as the careful choice and is a
+  # guaranteed no-op. Verified against the producer, not assumed:
+  #   · `record-review.sh:2892` enters its CARRY arms only under `[ "$CURRENT_HEAD" != "$SHA" ]`.
+  #     With `SHA == CURRENT_HEAD` no carry arm runs, `CARRY_ARM` stays empty, and `:3043`
+  #     (`[ "$VERDICT" = clean ] && [ -z "$CARRY_ARM" ]`) then REFUSES for a missing `--evidence`
+  #     (tortoise#7391) — exit 3, nothing written.
+  #   · `--expect-head` cannot be carried onto this call AT ALL: `:2873` refuses whenever the PR head
+  #     is not the pin, and a carry is precisely the case where it is not. That is the same reason
+  #     `atomic-land.sh` documents this as the one call site that must not pin (recorded decision
+  #     #1362 D1).
+  # So the unpinned call was the ONLY thing that could ever work, and the pinned one bought the very
+  # review this block exists to prevent — on `clean` records, which is the population #10255 and
+  # #10188 are in. The log then said "did not produce a clean head-bound record" and named no cause.
+  #
+  # The race a pin would have covered is covered instead by the CALLER: the recorder re-reads
+  # `CURRENT_HEAD` itself, re-binds only after proving the reviewed artifact unchanged, and applies
+  # the target-head-red veto (#1575 clause E) before writing; `review_clean_at_head` then checks the
+  # STORE against `$HEAD`. A push landing mid-call therefore leaves no clean record AT THIS HEAD and
+  # the caller falls through to a review — fail-closed, without asking the recorder to do something
+  # it refuses by design.
+  "$RECORDER" "$PR" "$rec_head" "$v" "$OR" >> "$L.log" 2>&1
+  CC_RE_RC=$?
+  echo "[merge $PR] carry re-mint: record-review.sh $PR ${rec_head:0:12}… $v — rc=$CC_RE_RC (its own words are in the log above; an unchanged-head call is a FRESH mint and a 'clean' one is refused without --evidence, tortoise#7391)" >> "$L.log"
+  [ "$CC_RE_RC" -eq 0 ]
 }
 
 # _cc_recover — rebuild a MISSING record from the PR body's SIGNED marker (#2872). The recorder
@@ -976,7 +1008,7 @@ case "$CC_RC:$CC_TOKEN" in
       CC_OWED=1
       echo "[merge $PR] CARRY — the reviewed diff is unchanged across the head move; re-recorded $CC_VERDICT at head=$HEAD, no review ordered, and the merge proceeds below" >> "$L.log"
     else
-      echo "[merge $PR] check-carry=carry, but re-recording $CC_VERDICT at head=$HEAD did not produce a clean head-bound record — a review is owed" >> "$L.log"
+      echo "[merge $PR] check-carry=carry (rc=$CC_RC), but the carry re-mint did not produce a clean head-bound record (re-mint rc=${CC_RE_RC:-not attempted}) — a review is owed" >> "$L.log"
     fi ;;
   5:*|6:*)
     # nodigest (5) / carry-patch (6): both say RE-RECORD AT THE CURRENT HEAD, do NOT run a review
@@ -985,7 +1017,7 @@ case "$CC_RC:$CC_TOKEN" in
       CC_OWED=1
       echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) — its own remedy is a re-record, not a review: re-recorded $CC_VERDICT at head=$HEAD, no review ordered, merge proceeds below" >> "$L.log"
     else
-      echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) says re-record rather than re-review, but the re-record at head=$HEAD did not produce a clean head-bound record — falling through to a review, which is then the only remaining way to cover this head (fail-closed, and still cheaper than the unconditional review this block replaces)" >> "$L.log"
+      echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) says re-record rather than re-review, but the re-record did not produce a clean head-bound record (re-mint rc=${CC_RE_RC:-not attempted}) — falling through to a review, which is then the only remaining way to cover this head (fail-closed, and still cheaper than the unconditional review this block replaces)" >> "$L.log"
     fi ;;
   3:*)
     # Still unreadable after the retry. ⛔ DO NOT PAY and DO NOT MERGE ON A GUESS. Recovery is still
