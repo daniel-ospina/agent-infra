@@ -5979,8 +5979,9 @@ function assembledMergeArgvAfter(scan: ScanTokens, i: number, command: string): 
  * Does a construct standing in the VERB slot take the ADMIN FLAG **immediately after it, with NO
  * PR selector at all** — the argv of `gh pr merge --admin`, which merges the CURRENT BRANCH?
  *
- * ⛔ WITHOUT THIS ARM THAT SPELLING WAS A FAIL-OPEN, and it was measured at this head (review cycle
- * 9, P0): `gh pr merge --admin` is a REAL admin merge (`extractMergePrNumber` returns null for it,
+ * ⛔ WITHOUT THIS ARM THAT SPELLING WAS A FAIL-OPEN, and it was measured at the cycle-8 head
+ * `90859f471` (review cycle 9, P0): `gh pr merge --admin` is a REAL admin merge (`extractMergePrNumber`
+ * returns null for it,
  * and this file's own contract says a null answer must FAIL CLOSED), but every reading of it dropped
  * out: `assembledMergeArgvAfter` requires a SELECTOR and this shape has none (the first word after
  * the verb is `--admin`, which `isMergeSelectorToken` rejects), `isGitOp`'s `GH_PR_PATTERN` needs a
@@ -5998,8 +5999,8 @@ function assembledMergeArgvAfter(scan: ScanTokens, i: number, command: string): 
  * verifier's `"$PR" "$HEAD"`), and dropping it unguarded would re-open exactly that class: three
  * consecutive constructs read as `gh`→`pr`→`merge` under the walk's over-approximation. A run has
  * no literal `pr` in its GROUP slot, so requiring one keeps every one of those rows admitted while
- * the group word here is the actual `gh pr` group. Measured over the suite: no `notInvocations` row
- * carries a literal `pr` followed by a construct and a literal `--admin`.
+ * the group word here is the actual `gh pr` group. Measured: the suite stays green, i.e. no row in
+ * `notInvocations` or `overBlocks` became a merge when this arm was added.
  */
 function assembledBareAdminAfter(scan: ScanTokens, i: number, command: string): boolean {
   const verb = shellWordAt(scan, i);
