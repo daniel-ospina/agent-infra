@@ -79,6 +79,10 @@
         <string>{{REAPER_DIR}}/reap-lane-venvs.sh</string>
         <key>WORKTREE_REAPER</key>
         <string>{{REAPER_DIR}}/pi-reap-worktrees.sh</string>
+        <!-- The runner `_work` sink (19 G of dead job checkout on a box at 98%, 2026-10-28). Pinned
+             for the same reason as the three above. -->
+        <key>RUNNER_WORK_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-runner-work.sh</string>
         <!-- ⛔ THE WRAPPER CANNOT SEE ITS OWN PATH HERE. The launcher pipes this script to
              `/bin/bash -s` (that is why BOUNDED_LIB is pinned above), and under `bash -s`
              `BASH_SOURCE` is UNSET — so `disk-reaper-run.sh` cannot resolve `disk-reaper.sh`
