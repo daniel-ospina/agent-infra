@@ -49,9 +49,22 @@ echo "==> capacity-placement self-test ($HERE)"
 
 # ── the model: ONE record per box, in the shipped grammar ────────────────────────────────────────
 # rec <host> <ncpu> <load1-x100> <lanes> <disk_mb> <mem_mb> <at>
+# …in the shipped grammar INCLUDING the fork fields (agent-infra#2293). The defaults describe a healthy
+# box (400 procs against a 15041 ceiling, probe ok), so every arm written before that change keeps the
+# meaning it was written with; arms that need a starved box use `recf` explicitly.
+BOOT=1700000000   # a fixed boot epoch: one box cannot have two, which is what §12's detector reads
 rec() {
-  printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s' \
-    "$1" "$2" "$3" "$(awk -v l="$3" -v n="$2" 'BEGIN{printf "%d", l/n}')" "$4" "$5" "$6" "$7"
+  recf "$1" "$2" "$3" "$4" "$5" "$6" "$7" 400 15041 1
+}
+# recf <host> <ncpu> <load1-x100> <lanes> <disk_mb> <mem_mb> <at> <procs> <procs_max> <fork>
+# ⛔ `boxid=` IS PART OF THE SHIPPED RECORD NOW (#2707) and the default here is DERIVED FROM THE HOST,
+# so every arm keeps its meaning (one box per fixture host) — while §12 drives the REAL derivation from
+# the box's own network identity. A fixture that omitted it would make its box `box_unknown`, which is
+# correct behaviour and would silently turn every arm below into a test of that one bound.
+recf() {
+  printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s procs=%s procs_max=%s fork=%s boxid=%s boot=%s' \
+    "$1" "$2" "$3" "$(awk -v l="$3" -v n="$2" 'BEGIN{printf "%d", l/n}')" "$4" "$5" "$6" "$7" \
+    "$8" "$9" "${10}" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')" "$BOOT"
 }
 NOW=1792598400   # fixed clock for the whole suite (the record age is part of every assertion)
 
@@ -64,7 +77,7 @@ CAP_NOW="$NOW"; export CAP_NOW
 CAP_HOST="cell-1"; export CAP_HOST
 P="$(cap_probe_local "$PWD" 7)" || P=""
 ck "the probe returns a record" "$([ -n "$P" ] && echo 0 || echo 1)"
-for k in host ncpu load1 lpc lanes disk_free_mb mem_free_mb at; do
+for k in host ncpu load1 lpc lanes disk_free_mb mem_free_mb at procs procs_max fork; do
   v="$(cap_kv "$P" "$k")"
   case "$v" in ''|*[!0-9A-Za-z._-]*) r=1 ;; *) r=0 ;; esac
   ck "  …carrying $k=${v:-<empty>}" "$r"
@@ -240,6 +253,14 @@ ck "an UNWRITABLE state dir makes the writer FAIL LOUDLY (rc 1), never silently 
 # ── §7 the verb a human/agent actually reads: bin/harness status ─────────────────────────────────
 echo
 echo "── §7 bin/harness status: the answer, with the exit code that cannot lie ──"
+# ⛔ THE LANDING READ (agent-infra#2320) IS ONE OF `status`'S DIMENSIONS, and it makes TWO external
+# calls: `gh --version` and the branch-protection read. Without a stub this section stops being
+# hermetic — it would reach GitHub from a unit suite, on whatever `OR` the host happens to export —
+# and it would grade the operator's box instead of the fixture. The stub answers both calls.
+STUBGH="$TMP/stubgh"; mkdir -p "$STUBGH"
+printf '#!/usr/bin/env bash\ncase "$*" in\n  *--version*) printf "gh version 9.9.9 (test-stub)\\n" ;;\n  *protection/required_status_checks*) printf "pipeline-compliance\\n" ;;\n  *) printf "stub: %%s\\n" "$*" >&2; exit 1 ;;\nesac\n' > "$STUBGH/gh"
+chmod +x "$STUBGH/gh"
+PATH="$STUBGH:$PATH"; export PATH
 O="$TMP/O7"; mkdir -p "$O/state"
 cycle_record_write "$O" start=$(( NOW - 240 )) end="$NOW" cycle=1 interval=240 selected="pr:#2244" \
   selected_n=3 dispatched=2 ids="#2216,#2232" nothing=none placement=place placed_on=cell-4 bound=none \
@@ -284,6 +305,11 @@ ck "--last is honoured (asking for 1 shows one cycle, not the whole history)" \
    "$(_n="$(O="$TMP/O7" CR_NOW="$NOW" bash "$HARNESS_BIN" status --last 1 2>&1 | grep -c '^ *age=')"; [ "${_n:-0}" -eq 1 ] && echo 0 || echo 1)"
 
 # ── §8 the transport: publish/read over a LOCAL bare origin (real pushes, real ls-remote) ────────
+# ⛔ EACH SIMULATED BOX GETS ITS OWN `CAP_STATE_DIR`, BECAUSE THE SHIPPED LEDGER'S PREMISE IS ONE
+# FILESYSTEM PER BOX (#2707). `cap_publish` proves authorship by what THIS box recorded at publish time,
+# so two `pub` calls standing in for two boxes must not share that record — on the fleet they cannot
+# (each cell has its own disk), and a test that let them share would be asserting the opposite of the
+# property (it would "prove" one box may delete another's ref whenever their /tmp coincides).
 echo
 echo "── §8 the fleet channel: records published as refs, read back with ONE ls-remote ──"
 ORIGIN="$TMP/origin.git"; WORK="$TMP/work"
@@ -294,11 +320,11 @@ git init -q "$WORK" >/dev/null 2>&1
   && git push -q origin HEAD:main ) >/dev/null 2>&1
 ck "the harness repo (a local bare origin) is ready" "$([ -d "$ORIGIN" ] && echo 0 || echo 1)"
 CAP_NOW="$NOW"
-PUB="$(CAP_NOW="$NOW" CAP_HOST="cell-4" cap_publish "$WORK" "$(rec cell-4 8 56 0 120000 14000 $NOW)")"; RC=$?
+PUB="$(CAP_NOW="$NOW" CAP_STATE_DIR="$TMP/state-cell-4" CAP_HOST="cell-4" cap_publish "$WORK" "$(rec cell-4 8 56 0 120000 14000 $NOW)")"; RC=$?
 ck "a box PUBLISHES its record (rc 0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
-ck "  …under refs/boxes/<host>/<reading> (the reading rides the ref name: no fetch per box)" \
+ck "  …under refs/boxes/<host>/<boxid>/<reading> (the reading rides the ref name: no fetch per box)" \
    "$(q 'ref=refs/boxes/cell-4/' "$PUB" && echo 0 || echo 1)"
-CAP_HOST="cell-1" cap_publish "$WORK" "$(rec cell-1 8 2982 5 90000 3000 $NOW)" >/dev/null 2>&1
+CAP_NOW="$NOW" CAP_STATE_DIR="$TMP/state-cell-1" CAP_HOST="cell-1" cap_publish "$WORK" "$(rec cell-1 8 2982 5 90000 3000 $NOW)" >/dev/null 2>&1
 READ="$(cap_read_fleet "$WORK")"; RC=$?
 ck "a PEER reads the whole fleet with one ls-remote (rc 0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 ck "  …and both boxes are in it, with their readings intact" \
@@ -307,13 +333,13 @@ PL="$(printf '%s\n' "$READ" | cap_place cell-1)"
 ck "placement over the REAL channel picks the idle box" \
    "$(q '^place=cell-4 ' "$PL" && echo 0 || echo 1)"
 # A second reading from the SAME box must supersede the first, and must not delete a peer's.
-CAP_HOST="cell-4" cap_publish "$WORK" "$(rec cell-4 8 6100 3 120000 14000 $(( NOW + 60 )))" >/dev/null 2>&1
+CAP_NOW="$NOW" CAP_STATE_DIR="$TMP/state-cell-4" CAP_HOST="cell-4" cap_publish "$WORK" "$(rec cell-4 8 6100 3 120000 14000 $(( NOW + 60 )))" >/dev/null 2>&1
 READ2="$(cap_read_fleet "$WORK")"
 ck "a newer reading supersedes the old one for that box (one record per box, newest wins)" \
    "$(q 'host=cell-4 .*lpc=762 ' "$READ2" && echo 0 || echo 1)"
 ck "  …and only ONE cell-4 ref survives (the publisher prunes its own old record)" \
    "$([ "$(printf '%s' "$READ2" | grep -c 'host=cell-4 ')" -eq 1 ] && echo 0 || echo 1)"
-ck "  …and the peer's record is UNTOUCHED by that prune (host-scoped, never fleet-wide)" \
+ck "  …and the peer's record is UNTOUCHED by that prune (authorship-scoped, never host- or fleet-wide)" \
    "$(q 'host=cell-1 ' "$READ2" && echo 0 || echo 1)"
 PL2="$(printf '%s\n' "$READ2" | cap_place cell-1)"
 ck "…and placement MOVES OFF the now-saturated box (cell-4 at lpc=762 is no longer idle)" \
@@ -373,7 +399,10 @@ ck "…which exits non-zero for DEGRADED (a status verb that always exits 0 is a
    "$(grep -q 'exit "\$_rc"' "$HARNESS_BIN" && echo 0 || echo 1)"
 # ⛔ MUTATION CONTROL: remove the record write from a COPY of the loop and the assertion above must
 # FAIL. Without this, §9 could be satisfied by a comment.
-sed 's/^    cycle_record_write "\$O" \\$/    : cycle_record_write-disabled \\/' "$LOOP" > "$TMP/orch-no-record.sh"
+# ⛔ INDENT-AGNOSTIC, AND THAT IS THE POINT (agent-infra#2293): the loop now has TWO record-write call
+# sites (the ordinary cycle and the fork-starved path, different indents). A mutation that removes only
+# the first leaves the other matching the wiring check, so it would prove nothing about the assertion.
+sed 's/^\( *\)cycle_record_write "\$O" \\$/\1: cycle_record_write-disabled \\/' "$LOOP" > "$TMP/orch-no-record.sh"
 grep -q 'cycle_record_write "\$O"' "$TMP/orch-no-record.sh" && r=1 || r=0
 ck "mutation control: a loop with the record write REMOVED no longer satisfies the wiring check" "$r"
 sed 's/^      if \[ "${CAP_STATE:-unavailable}" = "place" \]/      if false; then #/' "$LOOP" > "$TMP/orch-no-place.sh"
@@ -384,12 +413,566 @@ if [ -n "${_pl:-}" ]; then
 fi
 ck "mutation control: a loop whose placement arm is disabled FAILS the arm assertion" "$r"
 
+# ── §11 FORK HEADROOM: THE FIRST READ, AND THE ONE THAT STOPS A BOX ────────────────────────────
+echo
+echo "── §11 fork headroom is read BEFORE load, and a faked ceiling REFUSES by name (agent-infra#2293) ──"
+# MEASURED 2026-10-21: cloud cell-4 (8 vCPU) could not spawn at all — `fork: Resource temporarily
+# unavailable`, EAGAIN, rc 128 — at load 2.54/8 = 0.32x, 11 lanes, 16 `pi` procs. Placement read LOAD
+# and would have placed a 12th lane there. Every arm below drives the SHIPPED `cap_place`/`cap_bound_hit`.
+
+# THE FAKED CEILING: 15600 live procs against the box's own 15641 per-uid ceiling = 41 spare, which is
+# under CAP_MIN_FORK_HEADROOM. Load and disk are HEALTHY on purpose — nothing but the fork read refuses.
+EXH="$(recf cell-4 8 56 11 90000 3000 "$NOW" 15600 15641 1)"
+# …and the SAME box with headroom: only the fork fields differ.
+OKR="$(recf cell-4 8 56 11 90000 3000 "$NOW" 400 15641 1)"
+PL_EXH="$(printf '%s\n' "$EXH" | cap_place cell-4)"; RC=$?
+ck "a faked CEILING makes placement REFUSE (rc=1, not a silent place) [$PL_EXH]" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "  …and the refusal NAMES the read that refused: bound=fork_headroom" "$(q 'bound=fork_headroom' "$PL_EXH" && echo 0 || echo 1)"
+ck "  …naming the box and the bound in detail= (a refusal an operator can act on)" \
+   "$(q 'cell-4:fork_headroom' "$PL_EXH" && echo 0 || echo 1)"
+PL_OK="$(printf '%s\n' "$OKR" | cap_place cell-4)"; RC=$?
+ck "the SAME box with headroom places (the refusal is the fork read, not the test's fixtures) [$PL_OK]" \
+   "$([ "$RC" -eq 0 ] && q '^place=cell-4 ' "$PL_OK" && echo 0 || echo 1)"
+# ⛔ DISTINGUISHABLE FROM HIGH LOAD — the whole point of a NAMED bound. Same box, same fixtures, one
+# number changed: load above the ceiling refuses `load_per_cpu`, and the two refusals cannot be confused.
+PL_HOT="$(printf '%s\n' "$(recf cell-4 8 9000 11 90000 3000 "$NOW" 400 15641 1)" | cap_place cell-4)"
+ck "a LOAD-saturated box refuses by its OWN name (bound=load_per_cpu), never fork_headroom" \
+   "$(q 'bound=load_per_cpu' "$PL_HOT" && [ "$(printf '%s' "$PL_HOT" | grep -c fork_headroom)" -eq 0 ] && echo 0 || echo 1)"
+PL_PRB="$(printf '%s\n' "$(recf cell-4 8 56 11 90000 3000 "$NOW" 400 15641 0)" | cap_place cell-4)"
+ck "a box whose two-fork PROBE refused is refused as fork_probe (a different read, a different remedy)" \
+   "$(q 'bound=fork_probe' "$PL_PRB" && echo 0 || echo 1)"
+# ⛔ THE ORDER, ASSERTED ON THE SHIPPED FUNCTION: a record that is out of headroom AND over the load
+# ceiling AND under the disk floor must report the FORK bound first (fork -> disk -> load).
+PL_ALL="$(printf '%s\n' "$(recf cell-4 8 9000 11 100 3000 "$NOW" 15600 15641 1)" | cap_place cell-4)"
+ck "ORDER: out of fork headroom AND over load AND under disk floor => fork_headroom is reported" \
+   "$(q 'bound=fork_headroom' "$PL_ALL" && echo 0 || echo 1)"
+PL_DL="$(printf '%s\n' "$(recf cell-4 8 9000 11 100 3000 "$NOW" 400 15641 1)" | cap_place cell-4)"
+ck "ORDER: healthy fork + under disk floor + over load => DISK is reported (disk before load)" \
+   "$(q 'bound=disk' "$PL_DL" && echo 0 || echo 1)"
+# A record with no fork reading (a peer on a pre-#2293 tree) is `fork_unknown`, never eligible.
+LEGACY="$(rec cell-4 8 56 11 90000 3000 "$NOW" | sed 's/ procs=.* boxid=/ boxid=/')"
+ck "a LEGACY record (no fork fields) is refused as fork_unknown, not read as healthy" \
+   "$(printf '%s\n' "$LEGACY" | cap_place cell-4 | grep -q 'bound=fork_unknown' && echo 0 || echo 1)"
+ck "  …and cap_valid_record rejects it while cap_valid_base_record accepts it (a named cause, not a blanket one)" \
+   "$( ( cap_valid_record "$LEGACY"; [ $? -eq 1 ] && cap_valid_base_record "$LEGACY" ) && echo 0 || echo 1)"
+# ⛔ IDENTITY COMES BEFORE FORK, and this is the arm that pins the order (#2707): a record that names
+# no box must be refused for THAT reason even though it also lacks a fork reading.
+NOBOX="$(rec cell-4 8 56 11 90000 3000 "$NOW" | sed 's/ boxid=[^ ]*//')"
+ck "a record naming NO box is refused as box_unknown — identity is the FIRST bound, before fork" \
+   "$(printf '%s\n' "$NOBOX" | cap_place cell-4 | grep -q 'bound=box_unknown' && echo 0 || echo 1)"
+# The arithmetic, on both adapters (ONE implementation): the record path and the in-process path agree.
+_h_rec="$(cap_fork_headroom "$(recf x 8 56 0 90000 3000 "$NOW" 400 15641 1)")"
+cap_h_for_vars 400 15641 _h; RC=$?
+ck "headroom is procs_max - procs (both adapters agree: record=$_h_rec in-process=$_h)" \
+   "$([ "$_h_rec" = "$_h" ] && [ "$_h" = "15241" ] && echo 0 || echo 1)"
+ck "an UNBOUNDED ceiling (procs_max=0) is 'unbounded', never 'zero headroom'" \
+   "$([ "$(cap_fork_headroom "$(recf x 8 56 0 90000 3000 "$NOW" 400 0 1)")" = "unbounded" ] && echo 0 || echo 1)"
+ck "cap_procs_pair_vars returns a NUMERIC pair on this box (the read itself works)" \
+   "$(cap_procs_pair_vars _pp _mm _ss && case "$_pp:$_mm" in *[!0-9:]*|:*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AND THE **SHIPPED CALLER** IS DRIVEN TOO (verification gate, P0). `cap_procs_pair_vars` writes
+# CALLER-NAMED variables using `printf -v`, and bash `local` is DYNAMIC — so a caller whose out-vars
+# collide with the callee's working locals reads EMPTY strings. That happened twice in this very
+# change (first the spawn gate's `p m src`, then this file's own `_cp_p _cp_m`), and both times every
+# record published with an empty `procs=`/`procs_max=` while the suites stayed green because they only
+# drove NON-colliding names. This arm drives the shipped caller, so a future rename on either side is
+# caught here rather than in the fleet.
+_pair="$(cap_procs_pair)"; RC=$?
+_pnf="$(printf '%s' "$_pair" | awk '{print NF}' 2>/dev/null)"
+ck "the SHIPPED caller cap_procs_pair returns THREE non-empty fields (dynamic scoping cannot empty it) [$_pair]" \
+   "$([ "$RC" -eq 0 ] && [ "${_pnf:-0}" -eq 3 ] && [ -n "${_pair// /}" ] && echo 0 || echo 1)"
+_p0="${_pair%% *}"; _p0="${_p0// /}"
+ck "  …and its procs field is a real count, not the empty string that made every record invalid" \
+   "$(case "$_p0" in ''|*[!0-9]*) echo 1 ;; *) [ "$_p0" -ge 1 ] && echo 0 || echo 1 ;; esac)"
+# …and the RECORD the probe publishes must carry them (the caller chain, end to end).
+_rp="$(cap_probe_local "$PWD" 0)"
+ck "the published RECORD carries non-empty procs=/procs_max= (an empty field makes it fork_unknown to every peer)" \
+   "$(case "$(cap_kv "$_rp" procs)" in ''|*[!0-9]*) echo 1 ;; *) case "$(cap_kv "$_rp" procs_max)" in ''|*[!0-9]*) echo 1 ;; *) echo 0 ;; esac ;; esac)"
+# ⛔ THE TWO-FORK PROBE'S REFUSAL IS ITS OWN SIGNAL, measured rather than assumed: under a faked
+# per-uid ceiling of 1 no fork can be made, and bash terminates the shell that tried (rc 254 — the
+# contract `cap_cli probe` and the controller both key on). This is the ONE arm that needs no fixtures.
+( ulimit -u 1 2>/dev/null; cap_fork_probe ) >/dev/null 2>&1; RC=$?
+ck "a box that cannot fork returns 254 from the probe (the signal the controller reads as starved) [rc=$RC]" \
+   "$([ "$RC" -eq 254 ] && echo 0 || echo 1)"
+
+# ── §11b THE MUTATION CONTROL: delete the headroom read and the test above must FAIL ─────────────
+# A gate whose test passes with the gate removed is not a test. The mutant is the SHIPPED file with ONE
+# statement replaced (the bound is never read), and the SAME faked-exhausted record must then PLACE.
+sed 's/^  forkb="\$(cap_fork_bound "\$r")"$/  forkb=""/' "$CAP" > "$TMP/cap-no-forkread.sh"
+ck "mutation control: the mutant really lost the headroom read (no cap_fork_bound call in cap_bound_hit)" \
+   "$([ "$(grep -c 'forkb="$(cap_fork_bound' "$TMP/cap-no-forkread.sh")" -eq 0 ] && echo 0 || echo 1)"
+PL_MUT="$( ( . "$TMP/cap-no-forkread.sh"; printf '%s\n' "$EXH" | cap_place cell-4 ) 2>/dev/null )"; RC=$?
+ck "mutation control: WITHOUT the read the fake-exhausted box is PLACED (the assertion discriminates) [rc=$RC $PL_MUT]" \
+   "$([ "$RC" -eq 0 ] && q '^place=cell-4 ' "$PL_MUT" && echo 0 || echo 1)"
+
+# ── §11c THE CONTROLLER SURVIVES IT: the gate runs BEFORE the first fork, and the state is NAMED ──
+ck "orch-loop.sh defines fork_gate and calls it at the top of the cycle" \
+   "$(grep -q '^fork_gate() {' "$LOOP" && grep -q '^  fork_gate$' "$LOOP" && echo 0 || echo 1)"
+_g_line="$(grep -n '^  fork_gate$' "$LOOP" | head -1 | cut -d: -f1)"
+_first_fork="$(grep -n 'CYCLE_T0="$(date +%s)"' "$LOOP" | head -1 | cut -d: -f1)"
+ck "  …and the gate sits BEFORE the cycle's first fork (gate=$_g_line, date=$_first_fork)" \
+   "$([ -n "${_g_line:-}" ] && [ -n "${_first_fork:-}" ] && [ "$_g_line" -lt "$_first_fork" ] && echo 0 || echo 1)"
+ck "the STARVED cycle naps on the fork-free timer (a \`sleep\` would spawn and kill it)" \
+   "$(grep -qF -- 'fork_free_sleep $(( 10#${CYC}' "$LOOP" && echo 0 || echo 1)"
+ck "  …and the timer is a \`read -t\` on a pre-opened FIFO, not a child process" \
+   "$(grep -q 'read -t "$secs" -r -u 9' "$LOOP" && echo 0 || echo 1)"
+_n_line="$(grep -n 'nothing="$_cr_why"' "$LOOP" | head -1 | cut -d: -f1)"
+_l_line="$(grep -n 'fork="$_cr_fork"' "$LOOP" | head -1 | cut -d: -f1)"
+ck "  …and the starved cycle still WRITES A RECORD (a starved box with no record is silent)" \
+   "$([ -n "${_n_line:-}" ] && [ -n "${_l_line:-}" ] && echo 0 || echo 1)"
+ck "  …carrying the STATE, not a generic skip: fork_exhausted on a failed probe, fork_headroom when low" \
+   "$(grep -q -- '_cr_why="fork_exhausted"' "$LOOP" && grep -q -- '_cr_why="fork_headroom"' "$LOOP" && echo 0 || echo 1)"
+ck "  …and it writes the HEARTBEAT with a builtin, so no supervisor concludes the controller is gone" \
+   "$(grep -qF -- "printf '%s\\n' \"\${_ft0}\" > \"\$O/heartbeat\"" "$LOOP" && echo 0 || echo 1)"
+ck "the probe's rc=254 is read as fork_exhausted, not as 'no numbers from the probe'" \
+   "$(grep -q 'CAP_RC:-0}" -eq 254' "$LOOP" && echo 0 || echo 1)"
+# THE LOCAL GATE ORDER: the fork arm must be evaluated BEFORE the load arm.
+# ⛔ ANCHORED INSIDE THE GATE BLOCK, AND REQUIRING A UNIQUE MATCH (#2927 verification). Each arm
+# stopped being an `elif` line and became its own guard, so an `elif` pattern matched NOTHING and this
+# order assertion went red on an empty reading — but the obvious repair, anchoring on ``^  if [
+# "${FORK_STARVED:-0}" = "1" ]; then``, matched THREE lines (the FORK-STARVED cycle block, the gate arm
+# and the sleep block) and `head -1` silently took the FIRST, an unrelated one. That is a false pass of
+# exactly the class this suite exists to prevent: deleting the gate-chain fork arm altogether still
+# read `fork=3263 < load=5601` and PASSED. So the anchors are resolved INSIDE the vector's own markers,
+# and each must match EXACTLY ONE line there — a non-unique anchor reddens instead of taking a guess.
+GUARD_BLOCK="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$LOOP")"
+_fk_pat='  if [ "${FORK_STARVED:-0}" = "1" ]; then'
+_ld_pat='  if [ "$L" -ge "$MAX_LOAD" ]; then'
+_fk_n="$(printf '%s\n' "$GUARD_BLOCK" | grep -cxF "$_fk_pat")"
+_ld_n="$(printf '%s\n' "$GUARD_BLOCK" | grep -cxF "$_ld_pat")"
+_fk_line="$(printf '%s\n' "$GUARD_BLOCK" | grep -nxF "$_fk_pat" | head -1 | cut -d: -f1)"
+_ld_line="$(printf '%s\n' "$GUARD_BLOCK" | grep -nxF "$_ld_pat" | head -1 | cut -d: -f1)"
+ck "the controller's OWN chain checks fork BEFORE load (offsets in the gate block: fork=$_fk_line load=$_ld_line)" \
+   "$([ -n "${_fk_line:-}" ] && [ -n "${_ld_line:-}" ] && [ "${_fk_n:-0}" -eq 1 ] && [ "${_ld_n:-0}" -eq 1 ] \
+       && [ "$_fk_line" -lt "$_ld_line" ] && echo 0 || echo 1)"
+ck "  …and each anchor is UNIQUE in that block (fork×$_fk_n load×$_ld_n), so neither can resolve to a look-alike" \
+   "$([ "${_fk_n:-0}" -eq 1 ] && [ "${_ld_n:-0}" -eq 1 ] && echo 0 || echo 1)"
+ck "the cycle record carries the fork reading (fork= fork_procs= fork_max=)" \
+   "$(grep -q 'fork="$_cr_fork" fork_procs=' "$LOOP" && echo 0 || echo 1)"
+# THE VERDICT: a fresh record that says fork=starved is FORK-STARVED, rc 1 — driven, not grepped.
+VO="$TMP/verdict-o"; mkdir -p "$VO/state"
+printf 'start=%s end=%s cycle=7 interval=240 nothing=fork_exhausted placement=fork_exhausted bound=fork_probe fork=starved fork_procs=15600 fork_max=15641\n' \
+  "$NOW" "$NOW" > "$VO/state/cycles"
+VOUT="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "a FRESH record with fork=starved is the NAMED non-zero state FORK-STARVED (rc=$RC) [$VOUT]" \
+   "$([ "$RC" -eq 1 ] && q '^FORK-STARVED ' "$VOUT" && echo 0 || echo 1)"
+ck "  …and the verdict NAMES the reads (procs=/procs_max=), not just an adjective" \
+   "$(q 'procs=15600 procs_max=15641' "$VOUT" && echo 0 || echo 1)"
+printf 'start=%s end=%s cycle=7 interval=240 nothing=fork_exhausted fork=starved\n' \
+  "$(( NOW - 100000 ))" "$(( NOW - 100000 ))" > "$VO/state/cycles"
+VOUT2="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "  …but a STALE starved record is DEGRADED (a dead controller is not a live starved one)" \
+   "$([ "$RC" -eq 1 ] && q '^DEGRADED ' "$VOUT2" && echo 0 || echo 1)"
+printf 'start=%s end=%s cycle=7 interval=240 nothing=none fork=ok\n' "$NOW" "$NOW" > "$VO/state/cycles"
+VOUT3="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "  …and a healthy record is still HEALTHY (the new arm did not swallow the ordinary case)" \
+   "$([ "$RC" -eq 0 ] && q '^HEALTHY ' "$VOUT3" && echo 0 || echo 1)"
+# ⛔ `fork=low` IS HELD TOO (review P2, driven). The writer records `fork=low` on the SAME path that
+# records `placement=fork_held` and `dispatched=0`; grading that HEALTHY said "it is self-dispatching"
+# about a cycle that dispatched NOTHING — the false PASS this verdict exists to close. There was no
+# `fork=low` arm at all, so the gap could not be seen.
+printf 'start=%s end=%s cycle=7 interval=240 nothing=fork_headroom placement=fork_held bound=fork_headroom fork=low fork_procs=15620 fork_max=15641\n' \
+  "$NOW" "$NOW" > "$VO/state/cycles"
+VOUTL="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "a FRESH record with fork=low (placed on the HELD path, dispatched=0) is FORK-STARVED, never HEALTHY (rc=$RC) [$VOUTL]" \
+   "$([ "$RC" -eq 1 ] && q '^FORK-STARVED ' "$VOUTL" && q 'why=fork_headroom' "$VOUTL" && echo 0 || echo 1)"
+ck "  …and it is DISTINGUISHED from the failed-probe case by its own why= (low headroom, not 'cannot fork')" \
+   "$(! q 'why=fork_exhausted' "$VOUTL" && echo 0 || echo 1)"
+# ⛔ AN UNSTAMPED RECORD IS NOT A STALE ONE (review P1, driven). The writer stamps 0 when it could not
+# read a clock without a fork; aged against epoch 0 that record is "infinitely old", so `harness status`
+# told the operator to START a controller that had just written the record — the wrong remedy on the
+# bash-3.2 box the fork work exists for. UNREADABLE (rc 2) is "cannot answer", which is never a pass.
+printf 'start=0 end=0 cycle=7 interval=240 nothing=fork_headroom placement=fork_held bound=fork_headroom fork=low\n' > "$VO/state/cycles"
+VOUTU="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "an UNSTAMPED record (start=0) is UNREADABLE rc 2 — not DEGRADED, and never HEALTHY (rc=$RC) [$VOUTU]" \
+   "$([ "$RC" -eq 2 ] && q '^UNREADABLE ' "$VOUTU" && q 'newest_record_unstamped' "$VOUTU" && echo 0 || echo 1)"
+# ── THE STARVED WRITE REALLY SPENDS NO FORK (review P1, DRIVEN — the arm that reproduces the defect) ──
+# Under `ulimit -u 1` no process can be created, so ANY `$( )` on the writer's path TERMINATES the
+# shell (bash retries the fork four times, then exits 254) — and the record the starved box needs is
+# never written. Measured on the pre-change writer: rc=254 and NO file. `cap_san`'s per-field
+# substitution was the second offender, found by driving this arm, not by reading the diff.
+SW="$TMP/starved-write"; mkdir -p "$SW/state"
+SWOUT="$( ( ulimit -u 1 2>/dev/null
+  . "$CR"
+  cycle_record_write "$SW" start=1792598400 end=1792598400 cycle=9 nothing=fork_exhausted placement=fork_held bound=fork_probe fork=starved 2>/dev/null
+  printf 'rc=%s' "$?" ) 2>/dev/null )"
+ck "the STARVED write path survives a box that cannot fork at all — no \$( ) anywhere in it (got '${SWOUT:-<the shell died>}')" \
+   "$([ "$SWOUT" = 'rc=0' ] && echo 0 || echo 1)"
+ck "  …and the record is really ON DISK, carrying the fork reading the verdict needs" \
+   "$(q 'fork=starved' "$(cat "$SW/state/cycles" 2>/dev/null)" && q 'placement=fork_held' "$(cat "$SW/state/cycles" 2>/dev/null)" && echo 0 || echo 1)"
+ck "  …and the sanitiser still normalises a hostile value (quotes, spaces and backticks stripped by PARAMETER EXPANSION, not by tr)" \
+   "$([ "$(. "$CR"; cr_san "a b\"c'd\`e")" = 'a_bcde' ] && echo 0 || echo 1)"
+# THE SPAWN POINT: fork before disk before load, with its own refusal code.
+SG="$HERE/spawn-gate.sh"
+# ⛔ 73 — and the LABEL must carry the same number the assertion greps. It read "(74)" after the
+# renumber, so the suite printed a green line naming the exact collision (#2293 x #2409: two gates
+# on 74 with opposite remedies) that the renumber exists to remove. A green label that states the
+# defect is worse than a red arm: operators and lanes read the label, not the grep.
+ck "the spawn gate declares its OWN fork refusal code (73), distinct from land (74), disk (77) and load (75)" \
+   "$(grep -q '^AGENT_FORK_REFUSED=73$' "$SG" && echo 0 || echo 1)"
+_sf="$(grep -n 'spawn_fork_state _fstate _fdetail' "$SG" | head -1 | cut -d: -f1)"
+_sd="$(grep -n 'dpath="${DISK_GATE_PATH:-$PWD}"' "$SG" | head -1 | cut -d: -f1)"
+_sl="$(grep -n 'if ! can_spawn "$l"; then' "$SG" | head -1 | cut -d: -f1)"
+ck "  …and run_agent evaluates FORK before DISK before LOAD (f=$_sf d=$_sd l=$_sl)" \
+   "$([ -n "${_sf:-}" ] && [ -n "${_sd:-}" ] && [ -n "${_sl:-}" ] && [ "$_sf" -lt "$_sd" ] && [ "$_sd" -lt "$_sl" ] && echo 0 || echo 1)"
+
+# ── THE CALLER'S OWN CGROUP, NOT ONLY THE MOUNT ROOT (review P2, DRIVEN) ────────────────────────
+# Reading only /sys/fs/cgroup/pids.max left the arm DEAD wherever processes live in a slice: measured
+# on a fleet cell the root has no pids.max at all, while /proc/self/cgroup names
+# /system.slice/<svc>.service and THAT directory's pids.max is 4692 — so the binding ceiling was never
+# seen and the arm always answered src=uid. Fixture trees drive both hierarchies and the ancestor walk.
+CGF="$TMP/cgfix"; mkdir -p "$CGF/cg/system.slice/anvil.service" "$CGF/cg/pids/docker/abc"
+printf '9999\n' > "$CGF/cg/pids.max";          printf '1\n'  > "$CGF/cg/pids.current"
+printf '50\n'   > "$CGF/cg/system.slice/anvil.service/pids.max"
+printf '40\n'   > "$CGF/cg/system.slice/anvil.service/pids.current"
+printf '0::/system.slice/anvil.service\n' > "$CGF/self2"
+printf '4:pids:/docker/abc\n1:name=systemd:/docker/abc\n' > "$CGF/self1"
+printf '20\n' > "$CGF/cg/pids/docker/abc/pids.max"; printf '5\n' > "$CGF/cg/pids/docker/abc/pids.current"
+CG_M=""; CG_C=""
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self2" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "the caller's OWN cgroup dir is read (cgroup v2 fixture: ${CG_M:-?}/${CG_C:-?} = 50/40, NOT the root's 9999/1)" \
+   "$([ "$RC" -eq 0 ] && [ "$CG_M" = 50 ] && [ "$CG_C" = 40 ] && echo 0 || echo 1)"
+# An ANCESTOR slice: the ceiling is as often set on the slice above the service as on its own dir.
+rm -f "$CGF/cg/system.slice/anvil.service/pids.max" "$CGF/cg/system.slice/anvil.service/pids.current"
+printf '77\n' > "$CGF/cg/system.slice/pids.max"; printf '3\n' > "$CGF/cg/system.slice/pids.current"
+CG_M=""; CG_C=""
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self2" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "  …and an ANCESTOR slice is walked to when the service dir carries no ceiling (${CG_M:-?}/${CG_C:-?} = 77/3)" \
+   "$([ "$RC" -eq 0 ] && [ "$CG_M" = 77 ] && [ "$CG_C" = 3 ] && echo 0 || echo 1)"
+CG_M=""; CG_C=""
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self1" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "  …and cgroup v1 is handled (pids hierarchy under its own mount point: ${CG_M:-?}/${CG_C:-?} = 20/5)" \
+   "$([ "$RC" -eq 0 ] && [ "$CG_M" = 20 ] && [ "$CG_C" = 5 ] && echo 0 || echo 1)"
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/absent" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "  …and an unreadable /proc/self/cgroup returns rc 1, so the root-only fallback arms still answer" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+# Fork-free: the resolver runs on a box that cannot fork, because a `$( )` here would be the fork that
+# kills the reader it exists for.
+CG_M=""; CG_C=""
+CGRC="$( ( ulimit -u 1 2>/dev/null
+  CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self1" cap_cgroup_pair_vars CG_M CG_C
+  printf 'rc=%s pair=%s/%s' "$?" "$CG_M" "$CG_C" ) 2>/dev/null )"
+ck "  …and the resolver spawns NOTHING: it answers under \`ulimit -u 1\` ($CGRC)" \
+   "$([ "$CGRC" = 'rc=0 pair=20/5' ] && echo 0 || echo 1)"
+
 # ── §10 self-registration ───────────────────────────────────────────────────────────────────────
 echo
 echo "── §10 this suite is EXECUTED by CI, not merely named ──"
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (agent-infra#2609). The list
+# is DERIVED from the tree now, so the driver's text names no suite at all — a `grep` of the driver
+# file would read 1 for `git show HEAD:…` and 0 here, i.e. it asserted the OLD enumeration and went
+# red the moment the list became a derivation. `--list` is the runner's own oracle (the same one the
+# CI lane reads), exactly as spawn-gate.test.sh asserts its own membership.
 SHARDS="$ROOT/scripts/run-bash-shards.sh"
-ck "capacity-placement.test.sh is registered in run-bash-shards.sh (the ONE list both lanes run)" \
-   "$(grep -q 'capacity-placement.test.sh' "$SHARDS" && echo 0 || echo 1)"
+ck "capacity-placement.test.sh is EXECUTED by run-bash-shards.sh --list (the ONE list both lanes run)" \
+   "$(bash "$SHARDS" --list 2>/dev/null | grep -qx 'scripts/orchestrator-harness/capacity-placement.test.sh' && echo 0 || echo 1)"
+
+# ── §12 THE FLEET VIEW (#2707): three boxes named `cmux`, one origin, NO CAP_HOST ───────────────
+echo
+echo "── §12 the fleet view does not collapse: one hostname, distinct identities, every record survives ──"
+# MEASURED 2026-10-28 on the three cloud cells, read from each box:
+#   hostname /etc/machine-id dbus-machine-id /proc/…/boot_id btime cgroup-slice  => ALL IDENTICAL
+#   global IPv4 10.238.144.{4,3,2}                                              => UNIQUE
+# So the identity the fleet keys on CANNOT be the hostname (the old defect) and cannot be machine-id
+# or a per-boot uuid (both cloned with the image — which is why machine-id is not even a fallback:
+# see capacity.sh's header). The suite therefore stubs the DERIVATION and nothing else — no
+# `CAP_HOST=cell-N`, no `CAP_BOXID`: that is exactly the hole the issue found in §8, whose fixtures
+# supplied the uniqueness production lacks.
+O2="$TMP/origin2707.git"; W2="$TMP/work2707"; HB="$TMP/bin2707"
+git init -q --bare "$O2" >/dev/null 2>&1
+git init -q "$W2" >/dev/null 2>&1
+( cd "$W2" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O2" && git push -q origin HEAD:main ) >/dev/null 2>&1
+mkdir -p "$HB"; printf '#!/bin/sh\necho cmux\n' > "$HB/hostname"; chmod +x "$HB/hostname"
+# pub <netid> <ncpu> <at> <boot> <load1> — ONE box publishes through the SHIPPED probe + publish.
+# Both boxes report `hostname` = `cmux` (the same /etc/hostname, measured) and differ only in the
+# identity a derivation can actually find.
+# ⛔ EACH BOX GETS ITS OWN `CAP_STATE_DIR`. The authorship ledger is per-BOX state (capacity.sh proves a
+# prune by what THIS box recorded), and on the fleet each cell has its own filesystem. Two simulated
+# boxes sharing one ledger would be a DIFFERENT scenario — one state store, two writers — and §13 drives
+# that one explicitly rather than letting it leak into every arm here.
+pub() {
+  # ⛔ THE ARGS GO INTO NAMED VARIABLES FIRST: a bash function's `$1` is ITS OWN, so an override that
+  # reads `$1` inside `cap_probe_local` would read the CALLEE's (empty) positional params and silently
+  # publish `ncpu=` — a record every peer refuses.
+  _p_id="$1"; _p_ncpu="$2"; _p_at="$3"; _p_boot="$4"; _p_load="$5"
+  # ⛔ NO IDENTITY SEAM AT ALL: §1 exported `CAP_HOST=cell-1`, and inheriting it here would hide the
+  # very defect #2707 measures. Both seams are cleared, so the ONLY identity is the derived one.
+  ( PATH="$HB:$PATH" CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-$_p_id"
+    cap_hw_uuid()   { return 1; }
+    cap_boxid_net() { printf '%s' "$_p_id"; }
+    cap_ncpu()      { printf '%s' "$_p_ncpu"; }
+    cap_boot_epoch(){ printf '%s' "$_p_boot"; }
+    cap_load1_100() { printf '%s' "$_p_load"; }
+    CAP_NOW="$_p_at" cap_probe_local "$W2" 0 2>/dev/null > "$TMP/rec2707"
+    CAP_NOW="$_p_at" cap_publish "$W2" "$(cat "$TMP/rec2707")" )
+}
+A_BOOT=$(( NOW - 600 )); B_BOOT=$(( NOW - 300 ))
+POUT1="$(pub 10.238.144.2 4 "$NOW" "$A_BOOT" 56)"; RC=$?
+ck "box A (4-core, hostname cmux) publishes under its OWN derived identity — no CAP_HOST, no CAP_BOXID (rc=$RC)" \
+   "$([ "$RC" -eq 0 ] && qF 'ref=refs/boxes/cmux/10.238.144.2/' "$POUT1" && echo 0 || echo 1)"
+ck "  …the DEFAULT-path probe names the box and its boot epoch (an empty boxid is refused at publish)" \
+   "$([ -n "$(cap_kv "$(cat "$TMP/rec2707")" boxid)" ] && [ "$(cap_kv "$(cat "$TMP/rec2707")" boot)" = "$A_BOOT" ] && echo 0 || echo 1)"
+ck "  …and the publish RECORDED what it wrote, so a later prune can be proven rather than guessed" \
+   "$(qF 'ledger=ok' "$POUT1" && echo 0 || echo 1)"
+POUT2="$(pub 10.238.144.3 8 "$(( NOW + 60 ))" "$B_BOOT" 6100)"; RC=$?
+ck "box B (8-core, the SAME hostname) publishes 60 s later (rc=$RC)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+_refs="$(git -C "$W2" ls-remote --refs origin 'refs/boxes/*' | awk '{print $2}')"
+ck "  …and BOTH refs survive: a publish prunes its OWN key, never a peer's (got $(printf '%s\n' "$_refs" | grep -c .) refs)" \
+   "$([ "$(printf '%s\n' "$_refs" | grep -c .)" -eq 2 ] && echo 0 || echo 1)"
+FLEET2="$(cap_read_fleet "$W2")"; RC=$?
+ck "a peer READS TWO boxes, not one (rc=$RC) — the collapse is gone" \
+   "$([ "$RC" -eq 0 ] && [ "$(printf '%s\n' "$FLEET2" | grep -c '^host=cmux ')" -eq 2 ] && echo 0 || echo 1)"
+ck "  …each carrying the identity that distinguishes it" \
+   "$(q 'host=cmux .*boxid=10\.238\.144\.2' "$FLEET2" && q 'host=cmux .*boxid=10\.238\.144\.3' "$FLEET2" && echo 0 || echo 1)"
+PL2="$(printf '%s\n' "$FLEET2" | cap_place cmux)"; RC=$?
+ck "PLACEMENT COMPARES AGAINST A FLEET OF TWO and picks the idle 4-core box (not 'place here') [$PL2]" \
+   "$([ "$RC" -eq 0 ] && q '^place=cmux ' "$PL2" && q 'evaluated=2 eligible=2' "$PL2" && q 'boxid=10.238.144.2' "$PL2" && echo 0 || echo 1)"
+POUT3="$(pub 10.238.144.3 8 "$(( NOW + 180 ))" "$B_BOOT" 7600)"
+ck "B's next reading supersedes B's own old one and leaves A's key alone (2 refs, one per box)" \
+   "$([ "$(git -C "$W2" ls-remote --refs origin 'refs/boxes/cmux/*' | grep -c .)" -eq 2 ] && echo 0 || echo 1)"
+ck "  …B holds exactly ONE ref (a box DOES prune its own superseded readings — via its ledger)" \
+   "$([ "$(git -C "$W2" ls-remote --refs origin 'refs/boxes/cmux/10.238.144.3/*' | grep -c .)" -eq 1 ] && echo 0 || echo 1)"
+ck "  …and a publish under a key nothing else holds reports foreign=0 (a reading, not silence)" \
+   "$(qF 'foreign=0' "$POUT3" && echo 0 || echo 1)"
+# A legacy two-segment ref (pre-#2707) under the shared hostname: visible, named, NEVER chosen.
+git -C "$W2" push -q origin "$(git -C "$W2" rev-parse HEAD):refs/boxes/cmux/$NOW-8-56-0-120000-14000-400-15641-1" 2>/dev/null
+FLEET3="$(cap_read_fleet "$W2")"
+ck "a LEGACY ref (no boxid) is read as an unattributable box, not silently dropped" \
+   "$([ "$(printf '%s\n' "$FLEET3" | grep -c '^host=cmux ')" -eq 3 ] && echo 0 || echo 1)"
+PL3="$(printf '%s\n' "$FLEET3" | cap_place cmux)"
+ck "  …and placement REFUSES to choose it, naming the bound: ineligible=[cmux:box_unknown]" \
+   "$(qF 'cmux:box_unknown' "$PL3" && echo 0 || echo 1)"
+# ── fail-closed identity: no name, no record ─────────────────────────────────────────────────────
+# (a function whose BODY is a subshell: bash 3.2 cannot carry nested double quotes inside "$( … )")
+noidpub() (
+  PATH="$HB:$PATH" CAP_STATE_DIR="$TMP/state-none"
+  cap_hw_uuid() { return 1; }
+  cap_boxid_net() { return 1; }
+  cap_publish "$W2" \
+    "host=cmux ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=$NOW procs=400 procs_max=15641 fork=1 boot=$NOW"
+)
+POUT6="$(noidpub 2>&1)"; RC=$?
+ck "a box with NO derivable identity REFUSES to publish (why=no-box-identity) — machine-id is NOT a fallback (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && qF 'why=no-box-identity' "$POUT6" && echo 0 || echo 1)"
+ck "  …so a cloned image cannot manufacture a false attribution under a key another box holds" \
+   "$([ "$(git -C "$W2" ls-remote --refs origin 'refs/boxes/cmux/*' | grep -c .)" -eq 3 ] && echo 0 || echo 1)"
+# ── the token is a path segment: it cannot be made to name a PEER's key ──────────────────────────
+_TOK="$( ( . "$CAP"; cap_ref_token 'x/../../10.0.0.9' ) )"
+ck "the identity token cannot carry a slash (a 'x/../../peer' identity must not become a peer's ref)" \
+   "$([ "$_TOK" = "x....10.0.0.9" ] && echo 0 || echo 1)"
+( . "$CAP"; cap_boxid_ok "$(cap_ref_token '..')" ) >/dev/null 2>&1; RC=$?
+ck "  …and a token of dots is not a valid identity (git refuses it too; it is the one walking shape) (rc=$RC)" \
+   "$([ "$RC" -ne 0 ] && echo 0 || echo 1)"
+for _bad in 'a..b' 'x.lock' 'a b'; do
+  ( . "$CAP"; cap_boxid_ok "$_bad" ) >/dev/null 2>&1; RC=$?
+  ck "  …and '$_bad' is refused before git sees it (git check-ref-format would reject it: a named reason, not push-refused) (rc=$RC)" \
+     "$([ "$RC" -ne 0 ] && echo 0 || echo 1)"
+done
+( . "$CAP"; cap_ref_for "host=.. ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=$NOW procs=400 procs_max=15641 fork=1 boxid=10.0.0.1 boot=$NOW" ) >/dev/null 2>&1; RC=$?
+ck "  …and a record whose HOST is '..' cannot produce a ref at all (the host is a path segment too) (rc=$RC)" \
+   "$([ "$RC" -ne 0 ] && echo 0 || echo 1)"
+# ── CAP_HOST survives as the EXPLICIT override (the issue requires it stay) ──────────────────────
+hostov() ( PATH="$HB:$PATH"; CAP_HOST="pi-cell-4" cap_probe_local "$W2" 0 )
+_HOV="$(hostov 2>/dev/null)"
+ck "CAP_HOST is still the explicit override (a deploy may name the box pi-cell-4)" \
+   "$(q '^host=pi-cell-4 ' "$_HOV" && echo 0 || echo 1)"
+
+# ── §13 THE PRUNE'S PROOF (review round 2): authorship is a FACT, never an inference ─────────────
+echo
+echo "── §13 the prune proves authorship: a mis-keyed PEER is never deleted, and the ledger is the proof ──"
+# ⛔ THE FIRST DRAFT OF THIS FIX WAS WRONG HERE, AND THIS IS THE ARM THAT PINS IT. It deleted a ref when
+# it shared our key AND our `boot` epoch ("this machine wrote it since it booted"). Both facts are shared
+# on a mis-keyed fleet — measured, two cells share a btime — so the second publisher deleted the first
+# box's LIVE ref and reported `foreign=0`: the #2707 collapse, restored, silently. Reproduced before the
+# fix, on this suite's shape: A (ncpu 4) published, B (ncpu 8, same key, same boot) published 60 s later,
+# refs=1, reader saw one box, `place=cmux`. The two boxes below differ ONLY in their ledger — which is
+# exactly the fact a peer cannot forge.
+O4="$TMP/origin-c1.git"; W4="$TMP/work-c1"
+git init -q --bare "$O4" >/dev/null 2>&1; git init -q "$W4" >/dev/null 2>&1
+( cd "$W4" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O4" && git push -q origin HEAD:main ) >/dev/null 2>&1
+pubc() { _c_state="$1"; _c_id="$2"; _c_ncpu="$3"; _c_at="$4"; _c_boot="$5"; _c_load="$6"
+  ( PATH="$HB:$PATH" CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$_c_state"
+    cap_hw_uuid() { return 1; }; cap_boxid_net() { printf '%s' "$_c_id"; }
+    cap_ncpu() { printf '%s' "$_c_ncpu"; }; cap_boot_epoch() { printf '%s' "$_c_boot"; }
+    cap_load1_100() { printf '%s' "$_c_load"; }
+    CAP_NOW="$_c_at" cap_probe_local "$W4" 0 2>/dev/null > "$TMP/recc"
+    CAP_NOW="$_c_at" cap_publish "$W4" "$(cat "$TMP/recc")" ) }
+SHARED_BOOT=$(( NOW - 600 ))
+P1="$(pubc "$TMP/state-c1a" 10.238.144.2 4 "$NOW" "$SHARED_BOOT" 56)"; RC=$?
+ck "§13 box A (4-core) publishes under the shared key (rc=$RC)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+P2="$(pubc "$TMP/state-c1b" 10.238.144.2 8 "$(( NOW + 60 ))" "$SHARED_BOOT" 6100)"; RC=$?
+ck "§13 box B publishes under the SAME key AND the SAME boot epoch — the case the first draft deleted (rc=$RC)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "  …and A's LIVE ref SURVIVES: a shared (key, boot) is NOT authorship proof (got $(git -C "$W4" ls-remote --refs origin 'refs/boxes/*' | grep -c .) refs)" \
+   "$([ "$(git -C "$W4" ls-remote --refs origin 'refs/boxes/*' | grep -c .)" -eq 2 ] && echo 0 || echo 1)"
+ck "  …and the publish SAYS another writer is under its key (foreign=1), instead of a clean foreign=0 [$P2]" \
+   "$(qF 'foreign=1' "$P2" && echo 0 || echo 1)"
+FLEETC="$(cap_read_fleet "$W4")"
+ck "  …the reader marks that key collide=1, so the ambiguity is visible, not 'newest wins'" \
+   "$(q 'boxid=10\.238\.144\.2 .*collide=1' "$FLEETC" && echo 0 || echo 1)"
+PLC="$(printf '%s\n' "$FLEETC" | cap_place cmux)"; RC=$?
+ck "  …and cap_place REFUSES the whole decision rather than placing on a box it cannot name (rc=$RC) [$PLC]" \
+   "$([ "$RC" -eq 1 ] && q '^refuse bound=identity_collision' "$PLC" && q 'detail=cmux/10.238.144.2' "$PLC" && echo 0 || echo 1)"
+# ── the ledger still prunes: a box is allowed to delete what IT wrote ─────────────────────────────
+P3="$(pubc "$TMP/state-c1a" 10.238.144.2 4 "$(( NOW + 120 ))" "$SHARED_BOOT" 56)"
+ck "§13 a box still supersedes its OWN previous reading — deleting what its ledger proves it wrote" \
+   "$([ "$(git -C "$W4" ls-remote --refs origin 'refs/boxes/cmux/10.238.144.2/*' | grep -c .)" -eq 2 ] &&
+      qF "ref=refs/boxes/cmux/10.238.144.2/$(( NOW + 120 ))-" "$P3" && echo 0 || echo 1)"
+# ⛔ THE INDISTINGUISHABLE RESIDUAL, asserted rather than hidden: two boxes sharing key AND ncpu AND
+# boot carry no fourth fact that differs, so the channel cannot tell them apart. What MUST hold is that
+# neither DESTROYS the other (the defect), even though the reader keeps the newest of that key.
+O5="$TMP/origin-c2.git"; W5="$TMP/work-c2"
+git init -q --bare "$O5" >/dev/null 2>&1; git init -q "$W5" >/dev/null 2>&1
+( cd "$W5" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O5" && git push -q origin HEAD:main ) >/dev/null 2>&1
+pubc5() { _c_state="$1"; _c_at="$2"
+  ( PATH="$HB:$PATH" CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$_c_state"
+    cap_hw_uuid() { return 1; }; cap_boxid_net() { printf '10.238.144.7'; }
+    cap_ncpu() { printf '8'; }; cap_boot_epoch() { printf '%s' "$SHARED_BOOT"; }
+    cap_load1_100() { printf '56'; }
+    CAP_NOW="$_c_at" cap_probe_local "$W5" 0 2>/dev/null > "$TMP/recc5"
+    CAP_NOW="$_c_at" cap_publish "$W5" "$(cat "$TMP/recc5")" ) }
+pubc5 "$TMP/state-c2a" "$NOW" >/dev/null 2>&1
+pubc5 "$TMP/state-c2b" "$(( NOW + 60 ))" >/dev/null 2>&1
+ck "§13 two boxes sharing key AND ncpu AND boot: NEITHER record is destroyed (no silent collapse at the writer)" \
+   "$([ "$(git -C "$W5" ls-remote --refs origin 'refs/boxes/*' | grep -c .)" -eq 2 ] && echo 0 || echo 1)"
+ck "  …the reader keeps the newest of that key (the stated residual: no fourth fact distinguishes them)" \
+   "$([ "$(cap_read_fleet "$W5" | grep -c '^host=cmux ')" -eq 1 ] && echo 0 || echo 1)"
+# ── boot=0 is UNKNOWN, not a different machine (no false fleet-wide refusal) ─────────────────────
+O6="$TMP/origin-c3.git"; W6="$TMP/work-c3"
+git init -q --bare "$O6" >/dev/null 2>&1; git init -q "$W6" >/dev/null 2>&1
+( cd "$W6" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O6" && git push -q origin HEAD:main ) >/dev/null 2>&1
+git -C "$W6" push -q origin "$(git -C "$W6" rev-parse HEAD):refs/boxes/cmux/10.238.144.8/$NOW-8-56-0-120000-14000-400-15641-1-0" 2>/dev/null
+git -C "$W6" push -q origin "$(git -C "$W6" rev-parse HEAD):refs/boxes/cmux/10.238.144.8/$(( NOW + 60 ))-8-56-0-120000-14000-400-15641-1-$SHARED_BOOT" 2>/dev/null
+ck "§13 a boot=0 reading beside a real one is ONE box with an unknown boot, NOT a collision" \
+   "$([ "$(cap_read_fleet "$W6" | grep -c 'collide=1')" -eq 0 ] && echo 0 || echo 1)"
+PL6="$(cap_read_fleet "$W6" | cap_place cmux)"; RC=$?
+ck "  …so a transient boot-read failure does not refuse the whole fleet's placement (rc=$RC) [$PL6]" \
+   "$([ "$RC" -eq 0 ] && q '^place=cmux ' "$PL6" && echo 0 || echo 1)"
+# ⛔ …BUT AN UNREADABLE `boot` MUST NOT DISABLE THE DETECTOR (review round 3, B1). `ncpu` is always
+# comparable: a box cannot change core count inside one boot, and an unreadable clock says nothing about
+# how many cores it has. Dropping the whole record when `boot` was 0 let a 4-core and an 8-core box under
+# ONE key read as one box, and `cap_place` placed — measured before the fix (0 collide marks, rc 0).
+O7b="$TMP/origin-c4.git"; W7b="$TMP/work-c4"
+git init -q --bare "$O7b" >/dev/null 2>&1; git init -q "$W7b" >/dev/null 2>&1
+( cd "$W7b" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O7b" && git push -q origin HEAD:main ) >/dev/null 2>&1
+git -C "$W7b" push -q origin "$(git -C "$W7b" rev-parse HEAD):refs/boxes/cmux/10.238.144.9/$NOW-4-5600-0-120000-14000-400-15641-1-0" 2>/dev/null
+git -C "$W7b" push -q origin "$(git -C "$W7b" rev-parse HEAD):refs/boxes/cmux/10.238.144.9/$(( NOW + 60 ))-8-6100-0-120000-14000-400-15641-1-0" 2>/dev/null
+ck "§13 two boxes under ONE key with boot UNREADABLE on both are still detected from ncpu (collide=1)" \
+   "$([ "$(cap_read_fleet "$W7b" | grep -c 'collide=1')" -eq 1 ] && echo 0 || echo 1)"
+PL7="$(cap_read_fleet "$W7b" | cap_place cmux)"; RC=$?
+ck "  …so an unreadable clock cannot turn a real key collision into 'place here' (rc=$RC) [$PL7]" \
+   "$([ "$RC" -eq 1 ] && q '^refuse bound=identity_collision' "$PL7" && echo 0 || echo 1)"
+# ── a ledger that cannot be written is a LEAK, never a delete ────────────────────────────────────
+noledger() ( CAP_STATE_DIR=/dev/null/nope
+  PATH="$HB:$PATH" CAP_HOST="" CAP_BOXID=""
+  cap_hw_uuid() { return 1; }; cap_boxid_net() { printf '10.238.144.9'; }
+  cap_ncpu() { printf '8'; }; cap_boot_epoch() { printf '%s' "$B_BOOT"; }
+  cap_load1_100() { printf '56'; }
+  CAP_NOW="$NOW" cap_probe_local "$W2" 0 2>/dev/null > "$TMP/recnl"
+  CAP_NOW="$NOW" cap_publish "$W2" "$(cat "$TMP/recnl")" )
+POUTNL="$(noledger 2>&1)"; RC=$?
+ck "§13 an unwritable ledger still PUBLISHES and says so (ledger=unavailable), it never fails a dispatch (rc=$RC)" \
+   "$([ "$RC" -eq 0 ] && qF 'ledger=unavailable' "$POUTNL" && echo 0 || echo 1)"
+ck "  …and it deletes NOTHING it cannot prove: the three peer refs are all still there" \
+   "$([ "$(git -C "$W2" ls-remote --refs origin 'refs/boxes/cmux/*' | grep -c .)" -eq 4 ] && echo 0 || echo 1)"
+# ── the predicate itself, driven directly (the loop is not the only thing that must be right) ────
+_probe_del() { ( . "$CAP"; cap_ref_deletable "$1" "$2" "$3" "$4" ) >/dev/null 2>&1; echo $?; }
+_LED="$TMP/probe.ledger"; printf '%s\n' "refs/boxes/cmux/10.0.0.1/1-8-56-0-1-1-1-1-1-1" > "$_LED"
+_REC="$(recf cmux 8 56 0 120000 14000 "$NOW" 400 15641 1)"
+ck "§13 cap_ref_deletable: a ref this box's LEDGER names is deletable (rc=$(_probe_del "$_REC" refs/boxes/cmux/10.0.0.1/1-8-56-0-1-1-1-1-1-1 "$_LED" "$NOW"))" \
+   "$([ "$(_probe_del "$_REC" refs/boxes/cmux/10.0.0.1/1-8-56-0-1-1-1-1-1-1 "$_LED" "$NOW")" -eq 0 ] && echo 0 || echo 1)"
+ck "  …a FRESH ref under our own key that the ledger does NOT name is NOT deletable (the round-2 defect)" \
+   "$([ "$(_probe_del "$_REC" refs/boxes/cmux/10.0.0.1/999-8-56-0-1-1-1-1-1-1 "$_LED" "$NOW")" -ne 0 ] && echo 0 || echo 1)"
+ck "  …a STALE ref is deletable whatever the ledger says (the only cleanup an unattributable ref can get)" \
+   "$([ "$(_probe_del "$(recf cmux 8 56 0 120000 14000 "$(( NOW - 5000 ))" 400 15641 1)" refs/boxes/cmux/old "$_LED" "$NOW")" -eq 0 ] && echo 0 || echo 1)"
+ck "  …and NO ledger at all (a wiped /tmp) proves nothing, so a fresh ref is kept" \
+   "$([ "$(_probe_del "$_REC" refs/boxes/cmux/10.0.0.1/999-8-56-0-1-1-1-1-1-1 "$TMP/missing.ledger" "$NOW")" -ne 0 ] && echo 0 || echo 1)"
+
+# ── §12m MUTATION CONTROLS: each new assertion must go RED when its mechanism is removed ─────────
+echo
+echo "── §12m mutation controls: remove the mechanism, watch the arm above go red ──"
+# (m1) restore the PRE-CHANGE prune (delete every fresh ref under our hostname) => box B eats box A.
+sed 's/^cap_ref_deletable() {$/cap_ref_deletable() { return 0  # MUTANT: pre-#2707 host-scoped prune/' \
+  "$CAP" > "$TMP/cap-hostprune.sh"
+grep -q 'MUTANT' "$TMP/cap-hostprune.sh" && r=0 || r=1
+ck "m1: the mutant really lost the authorship test (every fresh ref under the hostname is deletable)" "$r"
+O3="$TMP/origin-m1.git"; W3="$TMP/work-m1"
+git init -q --bare "$O3" >/dev/null 2>&1; git init -q "$W3" >/dev/null 2>&1
+( cd "$W3" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O3" && git push -q origin HEAD:main ) >/dev/null 2>&1
+m1pub() { _m_mod="$1"; _m_id="$2"; _m_ncpu="$3"; _m_boot="$4"; _m_load="$5"; _m_at="$6"
+  ( . "$_m_mod"; PATH="$HB:$PATH" CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/m1state-$_m_id"
+    cap_hw_uuid() { return 1; }; cap_boxid_net() { printf '%s' "$_m_id"; }
+    cap_ncpu() { printf '%s' "$_m_ncpu"; }; cap_boot_epoch() { printf '%s' "$_m_boot"; }
+    cap_load1_100() { printf '%s' "$_m_load"; }
+    CAP_NOW="$_m_at" cap_probe_local "$W3" 0 2>/dev/null > "$TMP/m1rec"
+    CAP_NOW="$_m_at" cap_publish "$W3" "$(cat "$TMP/m1rec")" ) >/dev/null 2>&1; }
+m1pub "$CAP" 10.238.144.2 4 "$A_BOOT" 56 "$NOW"
+m1pub "$TMP/cap-hostprune.sh" 10.238.144.3 8 "$B_BOOT" 6100 "$(( NOW + 60 ))"
+ck "m1: with the OLD host-scoped prune, two boxes collapse back to ONE ref (so the arm above discriminates)" \
+   "$([ "$(git -C "$W3" ls-remote --refs origin 'refs/boxes/*' | grep -c .)" -eq 1 ] && echo 0 || echo 1)"
+# (m2) restore the PRE-CHANGE reader grouping (one record per HOSTNAME) => two boxes read as one.
+sed 's|^      key = h "/" bid$|      key = h   # MUTANT|' "$CAP" > "$TMP/cap-hostgroup.sh"
+grep -q 'MUTANT' "$TMP/cap-hostgroup.sh" && r=0 || r=1
+ck "m2: the mutant really lost the (host, boxid) key (the reader groups by hostname again)" "$r"
+M2IN="$(printf 'aaa\trefs/boxes/cmux/10.238.144.2/%s-4-56-0-120000-14000-400-15641-1-%s\nbbb\trefs/boxes/cmux/10.238.144.3/%s-8-6100-0-120000-14000-400-15641-1-%s\n' "$NOW" "$A_BOOT" "$NOW" "$B_BOOT")"
+_n_mut="$( ( . "$TMP/cap-hostgroup.sh"; printf '%s\n' "$M2IN" | cap_parse_lsremote ) | grep -c '^host=cmux ' )"
+_n_fix="$( ( . "$CAP";                 printf '%s\n' "$M2IN" | cap_parse_lsremote ) | grep -c '^host=cmux ' )"
+ck "m2: the MUTANT reader collapses two cmux boxes to 1 record ($_n_mut), the fix reads 2 ($_n_fix)" \
+   "$([ "$_n_mut" -eq 1 ] && [ "$_n_fix" -eq 2 ] && echo 0 || echo 1)"
+# (m3) drop the collision arm from cap_place => a marked record is PLACED instead of refused.
+sed 's|^  if \[ "\$coll" -gt 0 \]; then$|  if false; then   # MUTANT|' "$CAP" > "$TMP/cap-nocollision.sh"
+grep -q 'MUTANT' "$TMP/cap-nocollision.sh" && r=0 || r=1
+ck "m3: the mutant really lost the collision refusal (cap_place ignores the reader mark)" "$r"
+MARKED="host=cmux ncpu=4 load1=56 lpc=14 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=$NOW procs=400 procs_max=15641 fork=1 boxid=10.238.144.2 boot=$A_BOOT collide=1"
+_rc_mut="$( ( . "$TMP/cap-nocollision.sh"; printf '%s\n' "$MARKED" | cap_place cmux ) >/dev/null 2>&1; echo $? )"
+_rc_fix="$( ( . "$CAP";                 printf '%s\n' "$MARKED" | cap_place cmux ) >/dev/null 2>&1; echo $? )"
+ck "m3: the MUTANT places on a collided record (rc=$_rc_mut), the fix REFUSES it (rc=$_rc_fix)" \
+   "$([ "$_rc_mut" -eq 0 ] && [ "$_rc_fix" -eq 1 ] && echo 0 || echo 1)"
+# (m4) restore the ROUND-2 inference (`same key => mine`) => the §13 peer ref is deleted again.
+# ⛔ THIS IS THE MOST IMPORTANT CONTROL IN THE FILE: it re-creates the exact defect review round 2
+# found, so the §13 arm is measured against the bug rather than against itself. The mutant is the
+# SHIPPED file with the ledger clause replaced by the inference the first draft actually shipped.
+sed 's|^  cap_ledger_has "\$ledger" "\$oref" && return 0.*$|  [ "$(cap_kv "$orec" boxid)" = "${CAP_MUT_BOXID:-}" ] \&\& return 0   # MUTANT: round-2 inference|' \
+  "$CAP" > "$TMP/cap-infer.sh"
+ck "m4: the mutant really lost the ledger proof (same key => deletable again; the round-2 shape)" \
+   "$([ "$(grep -c 'MUTANT: round-2 inference' "$TMP/cap-infer.sh")" -eq 1 ] && echo 0 || echo 1)"
+O7="$TMP/origin-m4.git"; W7="$TMP/work-m4"
+git init -q --bare "$O7" >/dev/null 2>&1; git init -q "$W7" >/dev/null 2>&1
+( cd "$W7" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O7" && git push -q origin HEAD:main ) >/dev/null 2>&1
+m4pub() { _m_mod="$1"; _m_state="$2"; _m_ncpu="$3"; _m_at="$4"
+  ( . "$_m_mod"; PATH="$HB:$PATH" CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$_m_state" CAP_MUT_BOXID=10.238.144.2
+    cap_hw_uuid() { return 1; }; cap_boxid_net() { printf '10.238.144.2'; }
+    cap_ncpu() { printf '%s' "$_m_ncpu"; }; cap_boot_epoch() { printf '%s' "$SHARED_BOOT"; }
+    cap_load1_100() { printf '56'; }
+    CAP_NOW="$_m_at" cap_probe_local "$W7" 0 2>/dev/null > "$TMP/m4rec"
+    CAP_NOW="$_m_at" cap_publish "$W7" "$(cat "$TMP/m4rec")" ) >/dev/null 2>&1; }
+m4pub "$TMP/cap-infer.sh" "$TMP/state-m4a" 4 "$NOW"
+m4pub "$TMP/cap-infer.sh" "$TMP/state-m4b" 8 "$(( NOW + 60 ))"
+_n_m4="$(git -C "$W7" ls-remote --refs origin 'refs/boxes/*' | grep -c .)"
+# the SAME two publishes against the SHIPPED file, on its own origin (a fresh repo, so the mutant's
+# leftover ref cannot be counted as the fix's work).
+O8="$TMP/origin-m4fix.git"; W8="$TMP/work-m4fix"
+git init -q --bare "$O8" >/dev/null 2>&1; git init -q "$W8" >/dev/null 2>&1
+( cd "$W8" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$O8" && git push -q origin HEAD:main ) >/dev/null 2>&1
+m4pubx() { _m_mod="$1"; _m_state="$2"; _m_ncpu="$3"; _m_at="$4"
+  ( . "$_m_mod"; PATH="$HB:$PATH" CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$_m_state" CAP_MUT_BOXID=10.238.144.2
+    cap_hw_uuid() { return 1; }; cap_boxid_net() { printf '10.238.144.2'; }
+    cap_ncpu() { printf '%s' "$_m_ncpu"; }; cap_boot_epoch() { printf '%s' "$SHARED_BOOT"; }
+    cap_load1_100() { printf '56'; }
+    CAP_NOW="$_m_at" cap_probe_local "$W8" 0 2>/dev/null > "$TMP/m4recc"
+    CAP_NOW="$_m_at" cap_publish "$W8" "$(cat "$TMP/m4recc")" ) >/dev/null 2>&1; }
+m4pubx "$CAP" "$TMP/state-m4c" 4 "$NOW"
+m4pubx "$CAP" "$TMP/state-m4d" 8 "$(( NOW + 60 ))"
+_n_fix4="$(git -C "$W8" ls-remote --refs origin 'refs/boxes/*' | grep -c .)"
+ck "m4: the MUTANT collapses a shared-key peer to 1 ref ($_n_m4), the fix keeps 2 ($_n_fix4)" \
+   "$([ "$_n_m4" -eq 1 ] && [ "$_n_fix4" -eq 2 ] && echo 0 || echo 1)"
 
 echo
 echo "───────────────────────────────────────────────────────────────────────────────"

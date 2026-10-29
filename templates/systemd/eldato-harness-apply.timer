@@ -1,0 +1,28 @@
+[Unit]
+# Every ten minutes, measured from the last pass (`OnUnitActiveSec`) rather than from the wall clock.
+#
+# WHY A MONOTONIC TIMER AND NOT `OnCalendar=*:0/10`. The cadence is a seam the installer validates
+# (HARNESS_APPLY_INTERVAL_MIN, 1..1440). `OnCalendar` can only express a value that divides the hour:
+# 10 is fine and 7 renders `*:0/7`, which fires at :00 :07 :14 … :56 and then waits FOUR minutes for
+# the next hour — a cadence the unit states and does not keep. A monotonic interval is exactly the
+# number the operator asked for, whatever it is.
+#
+# ⛔ `Persistent=` IS DELIBERATELY ABSENT. It only means anything for `OnCalendar=` timers (run the
+# missed passes after a suspension); on a monotonic timer it is ignored, and writing it would claim a
+# catch-up behaviour that does not happen. The reboot case is covered by `OnBootSec` below: a box that
+# was off for a day runs one pass two minutes after it comes back, which is the same intent.
+#
+# ⛔ AND THE PASS IS A NO-OP WHEN IT IS ALREADY CURRENT (exit 0, `action=none`), so the cadence costs
+# one `git fetch` per tick on a converged box — that is what makes a 10-minute interval honest rather
+# than a deploy every 10 minutes.
+Description=eldato harness apply every {{INTERVAL_MIN}} minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec={{INTERVAL_MIN}}min
+# Spread the fleet's ticks so four boxes do not fetch at the same second.
+RandomizedDelaySec=60
+Unit=eldato-harness-apply.service
+
+[Install]
+WantedBy=timers.target

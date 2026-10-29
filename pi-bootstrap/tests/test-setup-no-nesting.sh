@@ -30,9 +30,11 @@ DEST="$HOME_DIR/.pi/agent"
 RUNS_LOG="$TMP/runs.log"
 FAILURES=0
 SRC_MARKER=""                     # set later; guarded in cleanup
+SPEC_FIXTURE=""                   # #2841: a temporary pi-config/extensions entry, guarded in cleanup
 
 cleanup() {
   [ -n "$SRC_MARKER" ] && rm -f "$SRC_MARKER"
+  [ -n "$SPEC_FIXTURE" ] && rm -f "$SPEC_FIXTURE"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -113,13 +115,21 @@ check_content_matches() {
     [ -e "$e" ] || continue
     base="$(basename "$e")"
     case "$base" in
-      *.test.ts) continue ;;
+      *.test.ts|*.spec.ts|*.test.js|*.spec.js) continue ;;
     esac
     for s in "$@"; do
       [ "$s" = "$base" ] && continue 2
     done
     [ -e "$dest_ext/$base" ] || { fail "$label: installed $base missing"; continue; }
-    if diff -rq "$e" "$dest_ext/$base" >/dev/null 2>&1; then
+    # ⛔ The installed copy is EXPECTED to differ from the source in exactly one way:
+    # `setup.sh` sweeps test files OUT of the farm (#1509/#2841), so a nested
+    # `*.test.ts` exists in `extensions/<dir>/` and not in the farm copy. Diffing
+    # without excluding those names indicted a CORRECT copy — measured 2026-10-28,
+    # 34 of this suite's 36 failures were this assertion and every one of them was
+    # false, from the day #2849's sweep landed. The exclusion list is `setup.sh`'s own
+    # executable-test set: one definition, used by the writer and by this assertion.
+    if diff -rq -x '*.test.ts' -x '*.spec.ts' -x '*.test.js' -x '*.spec.js' \
+         "$e" "$dest_ext/$base" >/dev/null 2>&1; then
       echo "ok: $label installed $base == extensions/$base"
     else
       fail "$label: installed $base differs from extensions/$base (stale copy!)"
@@ -137,19 +147,43 @@ check_fix_markers() {
     || fail "$label: installed builtin-tools missing #36 PATH augmentation"
 }
 
-# #562 — merge-gate scripts farm parity: record-review.sh must be farmed to
+# #562 — merge-gate scripts farm parity: EVERY entry of `merge_gate_srcs` must be farmed to
 # $DEST/scripts/ and byte-match the repo copy (the repo copy is CI-tested;
 # production mints execute the ~/.pi copy — drift is a silent partial
 # deployment of an enforcement-critical script).
+# ⛔ THE ARRAY IS THE LIST, NOT THIS FUNCTION (P3, fresh review of #2288): this used to hard-code
+# `record-review.sh`, so the SECOND member of the farm it was extended for (`review-pr.sh`, the seam
+# that mints every `clean` record) drifted undetected by the very suite that exists to catch it.
+# `farm_array_entries` is the one reader of a declared array (#1872), so a third member is covered
+# the day it is declared.
 check_record_review_farmed() {
   local label="$1"
-  local dest="$DEST/scripts/record-review.sh"
-  [ -f "$dest" ] \
-    || { fail "$label: record-review.sh not farmed into scripts/ (merge-gate farm missing)"; return; }
-  if diff -q "$ROOT/scripts/record-review.sh" "$dest" >/dev/null 2>&1; then
-    echo "ok: $label farmed record-review.sh == repo copy (#562)"
-  else
-    fail "$label: farmed record-review.sh differs from scripts/record-review.sh (stale copy!)"
+  local entry dest declared=0 checked=0
+  local line
+  line="$(farm_array_entries merge_gate_srcs)"
+  [ -n "$line" ] \
+    || { fail "$label: could not read the merge_gate_srcs array from setup.sh (wrapped across lines?) — 0 declared entries must never read as clean"; return; }
+  for entry in $line; do
+    declared=$((declared+1))
+    dest="$DEST/scripts/$entry"
+    [ -f "$ROOT/scripts/$entry" ] \
+      || { fail "$label: merge_gate_srcs declares '$entry' but scripts/$entry does not exist"; continue; }
+    [ -f "$dest" ] \
+      || { fail "$label: $entry not farmed into scripts/ (merge-gate farm missing or silently skipped)"; continue; }
+    # ⛔ THE BIT IS PART OF THE CONTRACT (P3, fresh review of #2288): the lane brief and the
+    # code-review skill tell a lander to TYPE this path, so a farmed-but-not-executable copy is a
+    # seam nobody can invoke — and existence + byte-equality alone reported it clean, while
+    # setup.sh discarded a failing `chmod +x` with `|| true`.
+    [ -x "$dest" ] \
+      || fail "$label: $entry is farmed but NOT EXECUTABLE ($dest) — a lander cannot type it"
+    if diff -q "$ROOT/scripts/$entry" "$dest" >/dev/null 2>&1; then
+      checked=$((checked+1))
+    else
+      fail "$label: farmed $entry differs from scripts/$entry (stale copy!)"
+    fi
+  done
+  if [ "$checked" -eq "$declared" ] && [ "$checked" -gt 0 ]; then
+    echo "ok: $label merge_gate_srcs farm byte-identical for $checked/$declared declared entries (#562)"
   fi
   # #1362 D1 — record-review.sh resolves its diff normalizer from a SIBLING
   # directory (`<script dir>/lib/diff-normalize.py`). Farming the producer
@@ -483,17 +517,39 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence-nudge.sh script:fleet-cost-report.sh
+script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:disk-reaper-run.sh script:cadence-nudge.sh script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
 script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py
 script:pi-reap-worktrees.sh script:pr-doctor.py
 script:publish-live-workspaces.py
 script:session-postmortem.sh
+script:record-review.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
+script:harness-apply-pass.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
+# `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
+# its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
+# producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
+# which is what makes the timer able to run on a cell at all — so this is a re-pin of the derived
+# population, not an exemption. Verified against the CODE, not the diff (#1899): the exec site is
+# `templates/systemd/eldato-harness-apply.service` + `templates/launchd/harness-apply/*.plist`, both
+# naming `$HOME/.pi/agent/scripts/harness-apply-pass.sh`.
+# `script:disk-reaper-run.sh` joined on 2026-10-24 (#2354, PR #2361): the scheduled wrapper the
+# timer unit execs, ADDED to `fleet_srcs` in the same landing (a fresh $DEST/scripts otherwise gets
+# `install-disk-reaper-timer.sh` + `disk-reaper.sh` without the entry point the unit calls — the exact
+# #1552/#1899 shape). It is DELIVERED — `fleet_srcs` is what puts it at $DEST/scripts/disk-reaper-run.sh
+# — so this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry.
+#
+# `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
+# the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
+# for the first time. It is DELIVERED — that array is what puts it at $DEST/scripts/record-review.sh
+# (and that is why `review-pr.sh` could ever find its recorder) — so this is a re-pin of the derived
+# population, NOT a `LANE_PRODUCERS_EXEMPT` entry: an exemption would claim a deliverable producer is
+# withheld, which is the opposite of what the farm does.
+#
 # `script:pi-reap-worktrees-launchd.py` joined on 2026-10-20 (PR #2173): the consolidated disk
 # reaper's macOS LaunchAgent execs it (a launchd-spawned `bash` cannot read a repo under ~/Documents,
 # so the checkout's interpreter reads the script and hands it to bash on stdin). It is DELIVERED —
@@ -1493,6 +1549,14 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed map-sessions.py differs from (or is missing vs) tools/fleet/map-sessions.py"
   fi
+  # #1777 — the ref-claim reader. It imports the sibling liveness.py, so farming it
+  # without the classifier is the same loud exit-2 abort, and a stale copy means an
+  # operator reads a DIFFERENT claim polarity than the repo's.
+  if diff -q "$ROOT/tools/fleet/claim_lanes.py" "$DEST/scripts/fleet/claim_lanes.py" >/dev/null 2>&1; then
+    echo "ok: $label farmed claim_lanes.py == repo copy (#1777)"
+  else
+    fail "$label: farmed claim_lanes.py differs from (or is missing vs) tools/fleet/claim_lanes.py"
+  fi
   # The farmed driver must actually start from the farmed layout: it imports its
   # sibling classifier and forks the shared identity library. `--help` is the
   # read-only mode (no cmux call, no store read, no issue); the pinned
@@ -1788,6 +1852,38 @@ run_setup_expect_guard_fail() {
 }
 
 # --- run 1: fresh install -------------------------------------------------
+# ── #2841 — the farm must never hold a test file pi would EXECUTE ────────────────
+# Seeded BEFORE the first run because setup.sh's farm is copy-only: what a PREVIOUS
+# run (or any other writer) left behind stays there until the sweep removes it — and
+# pi EXECUTES every top-level `.ts`/`.js` in the farm
+# (`collectAutoExtensionEntries`), so a stale one runs its suite at every session
+# start. The seed covers setup.sh's whole set, not just `*.test.ts`: the pre-#2841
+# guard matched that name alone, while `.spec.ts`, `.test.js` and `.spec.js` are
+# loaded by the same loader.
+#  • leak-nest/inner.test.ts is NESTED: inert to the loader (a subdirectory is
+#    resolved through package.json/index), but still farm junk — the sweep removes it.
+#  • local-testkit.ts is the OVER-DELETE CONTROL: a name that CONTAINS "test" and is
+#    not a test file must SURVIVE. A sweep keyed on `*test*` would pass every removal
+#    assertion below while deleting real local extras from the farm.
+#  • leak-nest/node_modules/dep/parse.test.js is the WALK's over-delete control: a
+#    THIRD-PARTY test inside an installed dependency. `npm install` put it there and
+#    never re-extracts it, and the loader skips `node_modules` (so does check 6's
+#    nested arm), so the sweep must PRUNE it rather than delete it. Measured
+#    2026-10-28: 169 of this farm's 232 name-matching files sat under `/node_modules/`.
+mkdir -p "$DEST/extensions/leak-nest" "$DEST/extensions/leak-nest/node_modules/dep"
+for leak in stale.test.ts stale.spec.ts stale.test.js stale.spec.js leak-nest/inner.test.ts; do
+  : > "$DEST/extensions/$leak"
+done
+: > "$DEST/extensions/local-testkit.ts"
+: > "$DEST/extensions/leak-nest/node_modules/dep/parse.test.js"
+
+# Same defect through the COPY-LOOP half (not just the sweep): a farm-source entry
+# named `*.spec.ts` must never be copied into $DEST. `pi-config/extensions` ships no
+# spec file today, so this is the only way to exercise that arm — a temporary REAL
+# file there (the #93 marker below uses the same trick) removed by the trap.
+SPEC_FIXTURE="$ROOT/pi-bootstrap/pi-config/extensions/zz-setup-test-2841.spec.ts"
+: > "$SPEC_FIXTURE"
+
 echo "== run 1: fresh install"
 run_setup
 
@@ -1806,6 +1902,32 @@ fi
   || fail "single-file extension not copied (audit-logger.ts missing)"
 check_no_nesting "$DEST" "dest"
 check_no_nesting "$ROOT/extensions" "repo-extensions"
+
+# #2841 — neither half of the guard left a test file in the farm, and neither removed
+# a non-test file (the over-delete control). Asserted on the REAL setup.sh run above,
+# not on the pattern's text.
+for leak in stale.test.ts stale.spec.ts stale.test.js stale.spec.js leak-nest/inner.test.ts \
+            zz-setup-test-2841.spec.ts; do
+  if [ -e "$DEST/extensions/$leak" ]; then
+    fail "#2841: $leak survived setup.sh — pi EXECUTES a top-level .ts/.js in the farm as an extension, so a test file there runs its suite at every session start"
+  else
+    echo "ok: #2841 setup.sh left no $leak in the farm"
+  fi
+done
+if [ -f "$DEST/extensions/local-testkit.ts" ]; then
+  echo "ok: #2841 the over-delete control (local-testkit.ts) SURVIVED — the sweep keys on test-file names, not on 'test'"
+else
+  fail "#2841: local-testkit.ts was deleted from the farm — the sweep over-deletes (a name containing 'test' is not a test file)"
+fi
+# The WALK's over-delete control: a third-party test inside an installed dependency.
+# `node_modules` is not the farm's to sweep — the loader skips it, check 6's nested arm
+# skips it, and npm never re-extracts an already-installed package, so a delete here is
+# permanent damage to the tree (#2841 review).
+if [ -f "$DEST/extensions/leak-nest/node_modules/dep/parse.test.js" ]; then
+  echo "ok: #2841 node_modules is PRUNED — a dependency's own parse.test.js SURVIVED the sweep"
+else
+  fail "#2841: the sweep deleted a test file out of a farm dependency's node_modules — npm will not re-extract it, and the loader never executes it"
+fi
 if [ -L "$DEST/extensions/mcp-client" ]; then
   echo "ok: farm link mcp-client kept"
 else
@@ -1845,8 +1967,34 @@ check_orphan_reaper_farmed "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
-grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
-  || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
+# ⛔ DERIVED FROM `merge_gate_srcs`, for the same reason as the lib-farm pin below (#1897):
+# this assertion used to pin the literal `1 copied (record-review.sh, #562)`, so farming a
+# legitimate SECOND merge-gate script (review-pr.sh, #2287) turned a correct farm into a CI
+# red — caught by the seam's own fresh-context review of PR #2288, not by CI. Read the count
+# and names FROM the array, so a red here means what it exists to mean: a sibling that landed
+# undeclared, or a summary that lies about what it farmed.
+merge_decl="$(farm_array_entries merge_gate_srcs | tr '\n' ' ')"
+merge_n="$(printf '%s\n' "$merge_decl" | wc -w | tr -d ' ')"
+if [ -z "${merge_n:-}" ] || [ "$merge_n" -eq 0 ]; then
+  fail "run 1: could not read the merge_gate_srcs array from setup.sh — the merge-gate farm assertion cannot be derived (#562)"
+else
+  # ⛔ `|| true`: this file runs `set -euo pipefail`, so an UNGUARDED `grep -m1` in a command
+  # substitution ABORTS THE SUITE when the line is absent — which is exactly the case the assertion
+  # exists for: the `*)` branch never prints its diagnostic, and every assertion after this block
+  # (the lib farm, identity-lib, fleet-tools, runs 1b/2) is silently skipped. Red for the wrong
+  # reason, with the evidence gone. The `lib_line` block below carried the same latent shape.
+  merge_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
+  case "$merge_line" in
+    *"scripts merge-gate farm: $merge_n copied"*) ;;
+    *) fail "run 1 did not report the merge-gate scripts farm copies (expected $merge_n copied, #562/#984): ${merge_line:-<no merge-gate-farm line at all>}" ;;
+  esac
+  for merge_base in $merge_decl; do
+    case "$merge_line" in
+      *"$merge_base"*) ;;
+      *) fail "run 1: the merge-gate farm summary does not NAME the declared script '$merge_base' — a summary that omits a script it farmed misreports the farm (#1897/#562)" ;;
+    esac
+  done
+fi
 # ⛔ DERIVED FROM `lib_srcs`, NOT HARD-CODED (#1897). This used to pin the literal string `2 copied
 # (pid-identity.sh + diff-normalize.py)` — so adding a legitimate THIRD lib (beat-pair.sh, the
 # recap/beat rule both readers share) turned a correct farm into a CI red. Read the expected count and
@@ -1857,7 +2005,7 @@ lib_n="$(printf '%s\n' "$lib_decl" | wc -w | tr -d ' ')"
 if [ -z "${lib_n:-}" ] || [ "$lib_n" -eq 0 ]; then
   fail "run 1: could not read the lib_srcs array from setup.sh — the lib-farm assertion cannot be derived"
 else
-  lib_line="$(grep -m1 'scripts lib farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  lib_line="$(grep -m1 'scripts lib farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
   case "$lib_line" in
     *"scripts lib farm: $lib_n copied"*) ;;
     *) fail "run 1 did not report the shared-library farm copies (expected $lib_n copied, #1178/#1362): ${lib_line:-<no lib-farm line at all>}" ;;
@@ -1869,8 +2017,28 @@ else
     esac
   done
 fi
-grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
+# SAME DERIVATION for the fleet-tools farm (#1777 adds claim_lanes.py to it): the count comes from the
+# ARRAY, so a declared sixth tool cannot turn a correct farm into a red, and a summary that lies about
+# how many it copied is still caught.
+tools_decl="$(farm_array_entries fleet_tools | tr '\n' ' ')"
+tools_n="$(printf '%s\n' "$tools_decl" | wc -w | tr -d ' ')"
+if [ -z "${tools_n:-}" ] || [ "$tools_n" -eq 0 ]; then
+  fail "run 1: could not read the fleet_tools array from setup.sh — the fleet-tools farm assertion cannot be derived"
+else
+  tools_line="$(grep -m1 'scripts/fleet farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  case "$tools_line" in
+    *"scripts/fleet farm: $tools_n copied"*) ;;
+    *) fail "run 1 did not report the fleet-tools farm copy (expected $tools_n copied, #1178/#1777): ${tools_line:-<no fleet-tools farm line at all>}" ;;
+  esac
+  for tool_base in $tools_decl; do
+    # The summary spells the tools with HYPHENS (`lane-liveness`), the array with underscores.
+    tool_norm="$(printf '%s' "${tool_base%.py}" | tr '_' '-')"
+    case "$tools_line" in
+      *"$tool_norm"*) ;;
+      *) fail "run 1: the fleet-tools summary does not NAME the declared tool '$tool_base' — a summary that omits a tool it farmed misreports the farm (#1777)" ;;
+    esac
+  done
+fi
 check_tools_dir_clean "run1-final"
 
 # --- run 1b: #1277 legacy migration + durable regression guard -----------------
@@ -1883,7 +2051,7 @@ check_tools_dir_clean "run1-final"
 # the farm FAIL LOUD rather than recreate one.
 echo "== run 1b: legacy tools/fleet migration + tools/ regression guard (#1277)"
 mkdir -p "$DEST/tools/fleet"
-for f in lane_liveness.py liveness.py fleet-health.py map-sessions.py; do
+for f in lane_liveness.py liveness.py claim_lanes.py fleet-health.py map-sessions.py; do
   echo "# legacy farm replica (the pi boot-blocker)" > "$DEST/tools/fleet/$f"
 done
 if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
@@ -1941,6 +2109,7 @@ rm -rf "$DEST/tools"
 echo "== run 2: re-run refresh"
 echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
 echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
+echo "# stale farm mutation" >> "$DEST/scripts/review-pr.sh"       # #562 farm refresh (the seam, P3 #2288)
 if [ -f "$DEST/scripts/ci_runner_gate.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/ci_runner_gate.sh"  # #1719 farm refresh
 fi
@@ -2030,6 +2199,11 @@ if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else
   echo "ok: farmed record-review.sh refreshed on re-run (#562)"
+fi
+if grep -q "stale farm mutation" "$DEST/scripts/review-pr.sh"; then
+  fail "stale farm mutation survived re-run (farmed review-pr.sh was not refreshed)"
+else
+  echo "ok: farmed review-pr.sh refreshed on re-run (#562, #2288)"
 fi
 if [ ! -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   : # already reported by check_identity_lib_farmed "run2" (missing file is not "refreshed")
