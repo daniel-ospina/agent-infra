@@ -315,6 +315,15 @@ is_limit "${MEM_LANE_RESERVE_MB:-}" || MEM_LANE_RESERVE_MB=1024
 MEM_SPAWN_RESERVE_LANES="${MEM_SPAWN_RESERVE_LANES:-2}"
 is_limit "${MEM_SPAWN_RESERVE_LANES:-}" || MEM_SPAWN_RESERVE_LANES=2
 [ "${MEM_SPAWN_RESERVE_LANES:-0}" -ge 1 ] || MEM_SPAWN_RESERVE_LANES=2
+# ⛔ AND THE UPPER GUARD, WHICH THIS PAIR WAS MISSING (review, P2). The reserve above carries one and
+# the LANE FACTOR did not, so the absurd input the guard exists for was only caught one level down: a
+# 9-digit factor produced a 13-digit floor, `is_limit` rejected THAT, and the floor was repaired to
+# 2048 — while the plist/`$ENV_FILE` an operator reads still stated a lane factor of 999999999, i.e.
+# "a value this installer accepts must be the value the gate uses" broken in the other direction. Both
+# factors are now repaired at SOURCE time by the same bound, so the derivation stays expressible
+# (249999999 x 249999999 is still too wide, which is why the FLOOR keeps its own `is_limit` net
+# below — the two guards are complementary, not redundant).
+[ "${MEM_SPAWN_RESERVE_LANES:-0}" -le 249999999 ] || MEM_SPAWN_RESERVE_LANES=2
 # The FLOOR, in MB, and it is the number the refusal prints. An operator who wants a different floor
 # sets THIS (one knob, no arithmetic to get wrong); the two factors above exist so the default can be
 # audited against the measurement rather than appearing from nowhere.
