@@ -80,6 +80,18 @@ The bar for each indicator:
 - Lighthouse score ≥ 90
 ```
 
+### Body lint — three assertions, run before you file (agent-infra#2861)
+
+O/I/T is a **body lint at creation**, not a workflow stage: nothing downstream can decide what the issue meant to achieve, so the check belongs where the fields are authored. Assert, against the body you are about to create:
+
+Assert on the shape **§1 above actually emits** — an `##`/`###` heading (`Objective`, `Indicators`, `Targets`), not a `**Bold:**` field, which §1 does not produce:
+
+1. The `Objective` heading is present and its body is non-empty — one sentence, a problem or a function.
+2. `Indicators` has **≥ 2** list items, and each names something observable (a test, a count, a measured value) rather than a mood.
+3. `Targets` has **≥ 1** list item, and every indicator has one.
+
+Any failure = do not file; fix the body. 1 and 3 are decidable mechanically; **2's "observable" is a judgement, and is stated as one** — the count is the mechanical half, the quality of the item is the author's. An automated equivalent (`check-pipeline-compliance.sh`, sequence step 2 of #2861) can only check presence and counts, and a *stage* would have to invent the judgement it does not have.
+
 ---
 
 ## Section 2 — Affiliation (Team / Role)
@@ -173,7 +185,7 @@ Before creating the issue, verify nothing was forgotten from the parent. This ca
 ### Research
 Two independent questions — an issue body must answer both without conflating them:
 
-1. **Investigation** — does implementation need external knowledge or codebase research first? If yes, say what (and link any brief via `**Research:**`). For standard+complex issues this feeds `issue-scoping` Phase 1.5's `### Axis Research` matrix (external best-practice research per axis). For micro issues, skip.
+1. **Investigation** — does implementation need external knowledge or codebase research first? If yes, say what (and link any brief via `**Research:**`). For standard+complex issues this feeds `issue-scoping` Phase 1.5's `### Axis Research` matrix (`task-workflow-standard` merges both granularities into its one `<!-- research: v1 -->` block instead — agent-infra#2861) (external best-practice research per axis). For micro issues, skip.
 2. **Open decisions** — which design choices must the Scope stage resolve? List them explicitly under `### Research Needed`. This is independent of question 1: "no investigation needed" says nothing about whether decisions are still open.
 
 **Never write "None — scope is clear" in `### Research Needed`:** "no research needed" answers only the investigation question — scope is not "clear" by default, and the Scope stage re-derives the approach regardless. An issue body that asserts a fix ("the fix is X") states the author's **hypothesis**, never a settled plan — `issue-scoping` treats it as a hypothesis to verify in the double diamond.
