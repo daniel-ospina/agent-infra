@@ -1,0 +1,17 @@
+# The block is declared, but its group and cancel arrive through a YAML merge key, which the reader
+# does not model — so it read as "declared, no cancellation" and R2 accepted it while GitHub cancels
+# (#2660 round 7). A declared-but-unreadable block is R0, never the safe default.
+x-defaults: &conc
+  group: push-concurrency-merge-key
+  cancel-in-progress: true
+name: Push concurrency merge key
+on:
+  push:
+    branches: [main]
+concurrency:
+  <<: *conc
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
