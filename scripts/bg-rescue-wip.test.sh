@@ -1,0 +1,765 @@
+#!/usr/bin/env bash
+# bg-rescue-wip.test.sh — the regression contract for agent-infra#2045.
+#
+# ⛔ WHY THIS EXISTS. `bg-rescue-wip.sh` runs at the WORST possible moment: a lane is being killed,
+# the process may still be writing, and the only copy of the work is that working tree. A rescuer that
+# "usually works" is worse than none, because it converts "I have a backup" into a false belief. So
+# every case here is driven against a REAL bare remote, and the properties that matter are pinned
+# separately:
+#
+#   1. the work reaches `origin` as `refs/wip/<slug>` — and its CONTENT is the content that was dirty
+#      (a ref that exists but does not carry the work is vacuous, so the case reads the blob back);
+#   2. the branch does NOT move and the working tree is NOT touched — a rescue must not change the
+#      state it is rescuing, because the lane it is rescuing may still be running;
+#   3. a rescue that is called TWICE — the real sequence, before the TERM and after the grace period —
+#      ACCUMULATES: the second snapshot reaches origin and the first stays REACHABLE. The only arm
+#      that can prove that is `merge-base --is-ancestor`; the others assert weaker facts and are named
+#      for what they actually check, so a reader is not shown four greens for one property;
+#   4. a failure is never reported as "nothing at risk": an unreadable status (including one that
+#      prints NOTHING), an unborn HEAD, a nested repo with no commit, and a wrong path each have
+#      their own required outcome.
+#
+# ⛔ TWO TRAPS THIS FILE ITSELF FELL INTO, both fixed and both worth keeping in mind:
+#   - `git rev-parse <ref>` on a MISSING ref ECHOES THE ARGUMENT to stdout (rc=128), so it looks like a
+#     successful lookup. Every lookup here is `rev-parse -q --verify`, and a bare-repo arm checks the
+#     remote EXISTS before concluding "no refs were pushed".
+#   - a witness computed through a missing tool (`shasum`) compares "" to "" and passes. Witnesses are
+#     skipped loudly when their tool is absent.
+#
+# Run:  bash scripts/bg-rescue-wip.test.sh
+#       BG_DISPATCH=<path> bash scripts/bg-rescue-wip.test.sh   # also run the 3 wiring arms
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RR="$HERE/bg-rescue-wip.sh"
+[ -x "$RR" ] || { echo "❌ missing $RR"; exit 1; }
+
+PASS=0; FAIL=0; SKIP=0
+ok()   { PASS=$((PASS+1)); echo "  ✅ $1"; }
+bad()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
+# A skip is LOUD and counted separately from PASS. It must never inflate the pass count: the arms it
+# covers simply cannot run here, and a reader has to be able to see that from the summary alone.
+skip() { SKIP=$((SKIP+1)); echo "  ⏭  SKIP: $1"; }
+
+T="$(mktemp -d "${TMPDIR:-/tmp}/bg-rescue.XXXXXX")"
+trap 'rm -rf "$T"' EXIT
+echo "==> bg-rescue-wip contract ($HERE)"
+echo "    scratch: $T"
+
+# ⛔ SIGPIPE SAFE: `git show <blob> | grep -q …` is the shape scripts/check-no-sigpipe-grep.sh exists
+# to keep out of the tree. `grep -q` exits at its first match while the producer is still writing, so
+# under `set -o pipefail` the PIPELINE returns 141 and a MATCHING blob reports as missing. Capture
+# first, then match against a here-string.
+has_blob() { # has_blob <bare-repo> <rev> <path> <needle>
+  local got; got="$(git -C "$1" show "$2:$3" 2>/dev/null)"
+  grep -q -- "$4" <<<"$got"
+}
+# ref_of <repo> <ref> — the sha, or "" — never the echoed argument.
+ref_of() { git -C "$1" rev-parse -q --verify "$2" 2>/dev/null; }
+# n_refs <bare-repo> — the count, but only after proving the remote is there (an absent repo also
+# yields 0, which would make "did not push" vacuous).
+n_refs() {
+  [ -d "$1" ] || { echo "NO_REPO"; return 1; }
+  git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || { echo "NO_REPO"; return 1; }
+  # ⛔ `grep -c` PRINTS 0 and EXITS 1 on empty input — `|| echo 0` appended a second 0 ("0\n0") and
+  # broke every comparison. `|| true` keeps the single printed count.
+  git -C "$1" for-each-ref refs/wip --format=x 2>/dev/null | grep -c '' 2>/dev/null || true
+}
+
+# mk_repo <name> — a bare "origin" plus a clone with one commit on branch fix/lane-one.
+# Returns NON-ZERO if any step failed: with `set -uo pipefail` and no `-e`, a silent fixture failure
+# would otherwise degrade an arm into a green assertion about nothing.
+mk_repo() {
+  local n="$1" d="$T/$1"
+  mkdir -p "$d" || return 1
+  git init -q --bare "$d/origin.git" || return 1
+  git clone -q "$d/origin.git" "$d/wt" 2>/dev/null || return 1
+  git -C "$d/wt" config user.email t@t || return 1
+  git -C "$d/wt" config user.name t || return 1
+  printf 'base\n' > "$d/wt/base.txt" || return 1
+  git -C "$d/wt" add base.txt || return 1
+  git -C "$d/wt" commit -qm "base" || return 1
+  git -C "$d/wt" checkout -q -b fix/lane-one || return 1
+  git -C "$d/wt" push -q -u origin fix/lane-one 2>/dev/null || return 1
+}
+
+echo; echo "── a CLEAN worktree has nothing at risk, and the rescue says so ──"
+mk_repo clean || { echo "❌ fixture failed (clean)"; exit 1; }
+OUT="$(bash "$RR" "$T/clean/wt" "test" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "clean: exit 0" || bad "clean: exit $RC (want 0)"
+case "$OUT" in
+  *"nothing at risk"*) ok "clean: reported as nothing at risk (not as a rescue)" ;;
+  *) bad "clean: did not say nothing at risk — got: $OUT" ;;
+esac
+[ "$(n_refs "$T/clean/origin.git")" = "0" ] \
+  && ok "clean: no ref pushed for a clean tree (and the remote was proven present, so 0 means 0)" \
+  || bad "clean: pushed a ref for a clean tree, or the remote is missing"
+
+echo; echo "── a CLEAN tree whose commit was never pushed says so, instead of implying it is safe ──"
+printf 'committed but never pushed\n' > "$T/clean/wt/local-only.txt"
+git -C "$T/clean/wt" add local-only.txt && git -C "$T/clean/wt" commit -qm "local only"
+OUT="$(bash "$RR" "$T/clean/wt" "test" 2>&1)"
+case "$OUT" in
+  *"NOT archived"*|*"only locally"*)
+    ok "unpushed: a clean tree with an UNPUSHED commit is named as NOT archived (not a bare 'nothing at risk')" ;;
+  *) bad "unpushed: an unpushed commit was reported as nothing to worry about — $OUT" ;;
+esac
+[ "$(n_refs "$T/clean/origin.git")" = "0" ] \
+  && ok "unpushed: no ref manufactured for committed-but-unpushed work (out of scope, and said so)" \
+  || bad "unpushed: pushed a ref for work this tool does not claim to cover"
+
+echo; echo "── a DIRTY worktree is archived with its CONTENT, and the branch does not move ──"
+mk_repo dirty || { echo "❌ fixture failed (dirty)"; exit 1; }
+D="$T/dirty"
+printf 'the fix that would have been lost\n' >> "$D/wt/base.txt"     # unstaged edit
+printf 'brand new file\n' > "$D/wt/untracked.txt"                    # untracked
+BEFORE="$(ref_of "$D/wt" fix/lane-one)"; [ -n "$BEFORE" ] || { echo "❌ fixture: branch does not resolve"; exit 1; }
+WT_BEFORE="$(git -C "$D/wt" status --porcelain | sort | tr '\n' '|')"
+if command -v shasum >/dev/null 2>&1; then IDX_BEFORE="$(shasum "$D/wt/.git/index" | cut -d' ' -f1)"; else IDX_BEFORE=""; fi
+OUT="$(bash "$RR" "$D/wt" "lane hit its 60s cap" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "dirty: exit 0 (rescued)" || bad "dirty: exit $RC (want 0) — $OUT"
+case "$OUT" in
+  *"refs/wip/fix-lane-one"*) ok "dirty: names the pushed ref (the recovery handle)" ;;
+  *) bad "dirty: did not name the ref — $OUT" ;;
+esac
+case "$OUT" in
+  *"(2 changed/untracked path(s))"*)
+    ok "dirty: the reported path count is EXACTLY 2 (an off-by-one that said 1 for 2 paths is not green)" ;;
+  *"path(s)"*) bad "dirty: the path count is wrong (2 dirty paths; the off-by-one and the '0' both fail here) — $OUT" ;;
+  *) bad "dirty: no path count reported — $OUT" ;;
+esac
+
+# (1) the work reached ORIGIN — read it back from the bare remote, not from the local ref.
+SHA="$(ref_of "$D/origin.git" refs/wip/fix-lane-one)"
+[ -n "$SHA" ] && ok "dirty: refs/wip/fix-lane-one exists on ORIGIN (verified, not echoed)" \
+               || bad "dirty: no refs/wip/fix-lane-one on origin (the rescue did not travel)"
+if [ -n "$SHA" ]; then
+  has_blob "$D/origin.git" "$SHA" base.txt 'the fix that would have been lost' \
+    && ok "dirty: the UNSTAGED edit is in the archived tree (content, not just a ref)" \
+    || bad "dirty: the archived tree is missing the unstaged edit"
+  has_blob "$D/origin.git" "$SHA" untracked.txt 'brand new file' \
+    && ok "dirty: the UNTRACKED file is in the archived tree" \
+    || bad "dirty: the archived tree is missing the untracked file"
+fi
+
+# (2) the branch did not move and the working tree is untouched.
+[ "$(ref_of "$D/wt" fix/lane-one)" = "$BEFORE" ] \
+  && ok "dirty: the BRANCH did not move (a rescue must not commit to the lane's branch)" \
+  || bad "dirty: the branch moved — the rescue changed the state it was rescuing"
+[ "$(git -C "$D/wt" status --porcelain | sort | tr '\n' '|')" = "$WT_BEFORE" ] \
+  && ok "dirty: the WORKING TREE is unchanged (safe to run under a live lane)" \
+  || bad "dirty: the working tree changed — the throwaway index leaked"
+if [ -n "$IDX_BEFORE" ]; then
+  [ "$(shasum "$D/wt/.git/index" | cut -d' ' -f1)" = "$IDX_BEFORE" ] \
+    && ok "dirty: the REAL index is byte-identical (the same lane's next 'git commit' is not disturbed)" \
+    || bad "dirty: the real .git/index was rewritten — a live lane would see it"
+else
+  skip "dirty: real-index witness needs shasum (absent here) — not asserting index bytes"
+fi
+
+# (3) ⛔ THE REAL SEQUENCE: the rescue is called AGAIN after the grace period, on a CHANGED tree.
+# This is the arm whose absence let a shipped defect through — every other case rescued once.
+printf 'written while the lane was dying\n' > "$D/wt/during-grace.txt"
+OUT2="$(bash "$RR" "$D/wt" "second rescue, after the 20s grace period" 2>&1)"; RC2=$?
+[ "$RC2" -eq 0 ] && ok "twice: the SECOND rescue exits 0 (with no chain it would be a rejected non-fast-forward)" \
+                 || bad "twice: second rescue exit $RC2 (want 0) — $OUT2"
+SHA2="$(ref_of "$D/origin.git" refs/wip/fix-lane-one)"
+[ -n "$SHA2" ] && [ -n "$SHA" ] && [ "$SHA2" != "$SHA" ] \
+  && ok "twice: origin's ref ADVANCED to the second snapshot" \
+  || bad "twice: origin's ref did not advance"
+has_blob "$D/origin.git" "$SHA2" during-grace.txt 'written while the lane was dying' \
+  && ok "twice: the WORK WRITTEN DURING THE GRACE PERIOD is on origin (the whole point of the 2nd call)" \
+  || bad "twice: grace-period work never reached origin"
+has_blob "$D/origin.git" "$SHA2" untracked.txt 'brand new file' \
+  && ok "twice: the second snapshot is COMPLETE (it still carries the earlier untracked file)" \
+  || bad "twice: the second snapshot lost the earlier untracked file"
+# ⛔ THE ONLY ARM THAT PROVES ACCUMULATION. Everything above is satisfied by a force-replacement too.
+git -C "$D/origin.git" merge-base --is-ancestor "$SHA" "$SHA2" 2>/dev/null \
+  && ok "twice: the FIRST snapshot is still REACHABLE from origin's ref (accumulate, never replace)" \
+  || bad "twice: the first snapshot was ORPHANED by the second rescue"
+
+# (3b) a THIRD rescue, and one after the branch gets a new commit (HEAD moves) — the chain must hold.
+printf 'third\n' > "$D/wt/third.txt"
+bash "$RR" "$D/wt" "third rescue" >/dev/null 2>&1; RC3=$?
+printf 'a real commit between rescues\n' > "$D/wt/moved.txt"
+git -C "$D/wt" add moved.txt >/dev/null 2>&1 && git -C "$D/wt" commit -qm "moved head" >/dev/null 2>&1
+printf 'fourth\n' > "$D/wt/fourth.txt"
+bash "$RR" "$D/wt" "rescue after the branch moved" >/dev/null 2>&1; RC4=$?
+SHA_N="$(ref_of "$D/origin.git" refs/wip/fix-lane-one)"
+[ "$RC3" -eq 0 ] && [ "$RC4" -eq 0 ] && [ -n "$SHA_N" ] \
+  && git -C "$D/origin.git" merge-base --is-ancestor "$SHA" "$SHA_N" 2>/dev/null \
+  && ok "chain: rescues 3 and 4 also succeed and the FIRST snapshot is still reachable after HEAD moved" \
+  || bad "chain: a later rescue (rc3=$RC3 rc4=$RC4) broke the chain or orphaned the first snapshot"
+
+# (3c) ⛔ THE CROSS-CLONE CASE — the one a FORCE push destroys. A second clone of the same origin has no
+# local refs/wip-local/<slug>, so a forced push would replace the first clone's snapshot; a bare remote
+# keeps no reflog, so the overwritten commit is gone at the next gc. Both must survive.
+mk_repo xclone || { echo "❌ fixture failed (xclone)"; exit 1; }
+X="$T/xclone"
+printf 'from clone A\n' > "$X/wt/a-work.txt"
+bash "$RR" "$X/wt" "clone A" >/dev/null 2>&1
+A_SHA="$(ref_of "$X/origin.git" refs/wip/fix-lane-one)"
+git clone -q "$X/origin.git" "$X/wt2" 2>/dev/null
+git -C "$X/wt2" config user.email t@t; git -C "$X/wt2" config user.name t
+git -C "$X/wt2" checkout -q -b fix/lane-one 2>/dev/null
+printf 'from clone B\n' > "$X/wt2/b-work.txt"
+OUTXB="$(bash "$RR" "$X/wt2" "clone B" 2>&1)"; RCXB=$?
+B_SHA="$(ref_of "$X/origin.git" refs/wip/fix-lane-one)"
+[ "$RCXB" -eq 0 ] && [ -n "$B_SHA" ] \
+  && ok "xclone: a rescue from a SECOND clone succeeds (chained onto origin's snapshot)" \
+  || bad "xclone: the second clone's rescue failed (rc=$RCXB) — $OUTXB"
+[ -n "$A_SHA" ] && [ -n "$B_SHA" ] && git -C "$X/origin.git" merge-base --is-ancestor "$A_SHA" "$B_SHA" 2>/dev/null \
+  && ok "xclone: clone A's snapshot is still reachable (a FORCE push here would have destroyed it)" \
+  || bad "xclone: clone A's snapshot was DESTROYED by clone B's rescue"
+
+# (4b) and now the SECOND rescue from each clone — the dispatcher's real sequence, interleaved.
+printf 'A grace-period work\n' > "$X/wt/a2-grace.txt"
+OUT_A2="$(bash "$RR" "$X/wt" "clone A post-grace" 2>&1)"; RC_A2=$?
+# A's grace-period content is reachable from the ref AS IT STANDS NOW. Once B rescues, the tip carries
+# B's tree and A's work is reachable through the CHAIN — so assert it here, before B runs, and assert
+# ancestry afterwards. Checking the final tip's tree for A's file would be asserting the wrong thing.
+TIP_A="$(ref_of "$X/origin.git" refs/wip/fix-lane-one)"
+[ "$RC_A2" -eq 0 ] && [ -n "$TIP_A" ] && has_blob "$X/origin.git" "$TIP_A" a2-grace.txt 'A grace-period work' \
+  && ok "xclone-twice: A's grace-period work reached origin" \
+  || bad "xclone-twice: A's grace-period work never left the disk"
+printf 'B grace-period work\n' > "$X/wt2/b2-grace.txt"
+OUT_B2="$(bash "$RR" "$X/wt2" "clone B post-grace" 2>&1)"; RC_B2=$?
+[ "$RC_A2" -eq 0 ] \
+  && ok "xclone-twice: clone A's POST-GRACE rescue exits 0 (with the chain gated on 'no local ref', this was a permanent non-fast-forward)" \
+  || bad "xclone-twice: clone A's post-grace rescue exit $RC_A2 — the chain is gated, so it wedged — $OUT_A2"
+[ "$RC_B2" -eq 0 ] \
+  && ok "xclone-twice: clone B's POST-GRACE rescue also exits 0" \
+  || bad "xclone-twice: clone B's post-grace rescue exit $RC_B2 — $OUT_B2"
+TIP2="$(ref_of "$X/origin.git" refs/wip/fix-lane-one)"
+[ -n "$TIP2" ] && has_blob "$X/origin.git" "$TIP2" b2-grace.txt 'B grace-period work' \
+  && ok "xclone-twice: B's grace-period work reached origin" \
+  || bad "xclone-twice: B's grace-period work never left the disk"
+[ -n "$A_SHA" ] && [ -n "$TIP2" ] && git -C "$X/origin.git" merge-base --is-ancestor "$A_SHA" "$TIP2" 2>/dev/null \
+  && ok "xclone-twice: every earlier snapshot is still reachable from the final tip" \
+  || bad "xclone-twice: an earlier snapshot was orphaned"
+
+echo; echo "── a worktree that does not exist, or is not a worktree ROOT, is refused ──"
+OUT="$(bash "$RR" "$T/nope" 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] && ok "missing: exit 1" || bad "missing: exit $RC (want 1)"
+case "$OUT" in
+  *"not a worktree"*) ok "missing: says why" ;;
+  *) bad "missing: no diagnosis — $OUT" ;;
+esac
+mkdir -p "$T/dirty/wt/sub/deeper"
+OUT="$(bash "$RR" "$T/dirty/wt/sub/deeper" "misrouted" 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] \
+  && ok "subdir: a path INSIDE a worktree is refused with exit 1 (would otherwise push the enclosing repo and report success)" \
+  || bad "subdir: exit $RC (want 1) — a misrouted path archived the wrong repo"
+
+echo; echo "── an UNREADABLE status is AT RISK, never 'nothing at risk' ──"
+mk_repo corrupt || { echo "❌ fixture failed (corrupt)"; exit 1; }
+K="$T/corrupt"
+printf 'precious uncommitted work\n' > "$K/wt/precious.txt"
+printf 'garbage-not-an-index' > "$K/wt/.git/index"          # e.g. a lane SIGKILLed mid git operation
+OUT="$(bash "$RR" "$K/wt" "corrupt index" 2>&1)"; RC=$?
+case "$OUT" in
+  *"nothing at risk"*) bad "corrupt: reported 'nothing at risk' on an unreadable status — the one false success" ;;
+  *) ok "corrupt: did NOT claim there was nothing at risk" ;;
+esac
+KSHA="$(ref_of "$K/origin.git" refs/wip/fix-lane-one)"
+[ "$RC" -eq 0 ] && [ -n "$KSHA" ] \
+  && ok "corrupt: still ARCHIVED and pushed (a failed read is not a reason to skip the rescue)" \
+  || bad "corrupt: exit $RC and ref '${KSHA:-none}' — the work was not rescued"
+[ -n "$KSHA" ] && { has_blob "$K/origin.git" "$KSHA" precious.txt 'precious uncommitted work' \
+  && ok "corrupt: the content is on origin despite the unreadable index" \
+  || bad "corrupt: the archived tree lacks the work"; }
+
+# ⛔ A status that fails and prints NOTHING. This is the arm that distinguishes "the exit code is
+# checked" from "some error text happened to land on stdout" — without it the fail-open gate passed.
+mk_repo silent || { echo "❌ fixture failed (silent)"; exit 1; }
+SL="$T/silent"
+printf 'the only copy\n' > "$SL/wt/precious2.txt"
+mkdir -p "$T/silent/shim"
+# ⛔ The shim must INTERCEPT and then exec the REAL git with the environment INTACT. An earlier version
+# used `env -i`, which dropped GIT_INDEX_FILE — so the arm silently wrote the lane's REAL index,
+# violating the invariant asserted three sections above, and could not detect a regression to
+# staging into the real index.
+REALGIT="$(command -v git)"
+cat > "$T/silent/shim/git" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do [ "\$a" = status ] && exit 137; done
+exec "$REALGIT" "\$@"
+SHIM
+chmod +x "$T/silent/shim/git"
+if command -v shasum >/dev/null 2>&1; then SL_IDX_BEFORE="$(shasum "$SL/wt/.git/index" | cut -d' ' -f1)"; else SL_IDX_BEFORE=""; fi
+OUT="$(PATH="$T/silent/shim:$PATH" bash "$RR" "$SL/wt" "silent status failure" 2>&1)"; RC=$?
+case "$OUT" in
+  *"nothing at risk"*)
+    bad "silent: a status that fails with NO output was reported as 'nothing at risk' — the exit code is not being checked" ;;
+  *) ok "silent: did NOT claim there was nothing at risk on a silent status failure" ;;
+esac
+if [ -n "${SL_IDX_BEFORE:-}" ]; then
+  [ "$(shasum "$SL/wt/.git/index" | cut -d' ' -f1)" = "$SL_IDX_BEFORE" ] \
+    && ok "silent: the REAL index is untouched on this path too (the shim no longer hides GIT_INDEX_FILE)" \
+    || bad "silent: the real .git/index was rewritten on the silent-failure path"
+else
+  skip "silent: real-index witness needs shasum (absent here)"
+fi
+SSHA="$(ref_of "$SL/origin.git" refs/wip/fix-lane-one)"
+[ -n "$SSHA" ] && has_blob "$SL/origin.git" "$SSHA" precious2.txt 'the only copy' \
+  && ok "silent: the work was still ARCHIVED (a silent failure is treated as AT RISK)" \
+  || bad "silent: rc=$RC and nothing archived — the fail-open gate is still live"
+
+echo; echo "── an UNREADABLE path is AT RISK and makes the archive PARTIAL, never 'clean' ──"
+mk_repo unreadable || { echo "❌ fixture failed (unreadable)"; exit 1; }
+U="$T/unreadable"
+mkdir -p "$U/wt/secret"
+printf 'the only copy of this file\n' > "$U/wt/secret/only-copy.txt"
+chmod 000 "$U/wt/secret" 2>/dev/null
+printf 'visible work\n' > "$U/wt/visible.txt"
+OUT="$(bash "$RR" "$U/wt" "unreadable dir" 2>&1)"; RC=$?
+chmod 755 "$U/wt/secret" 2>/dev/null
+case "$OUT" in
+  *"nothing at risk"*)
+    bad "unreadable: a directory git could not read was reported as 'nothing at risk' — the listing was incomplete" ;;
+  *) ok "unreadable: did NOT claim the worktree was clean with an unreadable directory present" ;;
+esac
+[ "$RC" -eq 2 ] \
+  && ok "unreadable: exits 2 (a path was NOT archived, so the contract says work remains at risk)" \
+  || bad "unreadable: rc=$RC (want 2) — the unreadable path was silently dropped"
+# The ISOLATED case: nothing else is dirty, so the ONLY reason to act is the unreadable directory.
+# Without this arm, a script that ignores the warning still passes the block above (another dirty file
+# keeps it at risk), which is exactly how the warning-blind version stayed green.
+mk_repo unreadonly || { echo "❌ fixture failed (unreadonly)"; exit 1; }
+UO="$T/unreadonly"
+mkdir -p "$UO/wt/secret"
+printf 'the only copy, in an unreadable dir\n' > "$UO/wt/secret/only.txt"
+chmod 000 "$UO/wt/secret" 2>/dev/null
+OUTO="$(bash "$RR" "$UO/wt" "only an unreadable dir" 2>&1)"; RCO=$?
+chmod 755 "$UO/wt/secret" 2>/dev/null
+case "$OUTO" in
+  *"nothing at risk"*)
+    bad "unreadable-only: a CLEAN listing plus an unreadable dir read as 'nothing at risk' — the warning was ignored" ;;
+  *) ok "unreadable-only: an incomplete listing is NOT reported as a clean worktree" ;;
+esac
+[ "$RCO" -eq 2 ] \
+  && ok "unreadable-only: exits 2 (the unreadable path was not archived)" \
+  || bad "unreadable-only: rc=$RCO (want 2) — the unreadable path was treated as nothing to save"
+USHA2="$(ref_of "$U/origin.git" refs/wip/fix-lane-one)"
+[ -n "$USHA2" ] && has_blob "$U/origin.git" "$USHA2" visible.txt 'visible work' \
+  && ok "unreadable: the READABLE work is still archived and pushed (a partial rescue beats none)" \
+  || bad "unreadable: rc=$RC — the readable work was not archived either — $OUT"
+
+echo; echo "── a lane that has NEVER COMMITTED is still rescued (the #2045 modal case) ──"
+mkdir -p "$T/unborn"; git init -q --bare "$T/unborn/origin.git"
+git clone -q "$T/unborn/origin.git" "$T/unborn/wt" 2>/dev/null
+git -C "$T/unborn/wt" config user.email t@t; git -C "$T/unborn/wt" config user.name t
+printf 'work from a lane that committed NOTHING\n' > "$T/unborn/wt/only-work.txt"
+git -C "$T/unborn/wt" checkout -q -b fix/lane-unborn 2>/dev/null
+OUT="$(/bin/bash "$RR" "$T/unborn/wt" "lane hit its cap" 2>&1)"; RC=$?
+USHA="$(ref_of "$T/unborn/origin.git" refs/wip/fix-lane-unborn)"
+[ "$RC" -eq 0 ] && [ -n "$USHA" ] \
+  && ok "unborn: an unborn HEAD is archived under bash 3.2 (no 'cannot read HEAD tree' dead end)" \
+  || bad "unborn: exit $RC, ref '${USHA:-none}' — a lane with no commits cannot be rescued — $OUT"
+[ -n "$USHA" ] && { has_blob "$T/unborn/origin.git" "$USHA" only-work.txt 'committed NOTHING' \
+  && ok "unborn: its content reached origin" || bad "unborn: content missing from the archive"; }
+
+echo; echo "── ONE nested repo that cannot be staged must not abort the WHOLE rescue ──"
+mk_repo nested || { echo "❌ fixture failed (nested)"; exit 1; }
+N2="$T/nested"
+printf 'top-level work that must survive\n' > "$N2/wt/top.txt"
+mkdir -p "$N2/wt/extra"; git -C "$N2/wt/extra" init -q 2>/dev/null   # nested repo, unborn HEAD
+printf 'inner\n' > "$N2/wt/extra/inner.txt"
+OUT="$(bash "$RR" "$N2/wt" "nested repo" 2>&1)"; RC=$?
+NSHA="$(ref_of "$N2/origin.git" refs/wip/fix-lane-one)"
+[ -n "$NSHA" ] && has_blob "$N2/origin.git" "$NSHA" top.txt 'top-level work that must survive' \
+  && ok "nested: the superproject work IS archived (a nested repo no longer aborts everything)" \
+  || bad "nested: rc=$RC — the whole rescue was abandoned over one nested repo — $OUT"
+# ⛔ THE EXIT CODE, not just the message: a partial archive leaves a path only on this disk, which the
+# script's own contract calls exit 2. This arm previously never looked at $RC, so a partial rescue
+# that returned 0 was green.
+[ "$RC" -eq 2 ] \
+  && ok "nested: the PARTIAL rescue exits 2 (the contract's 'work remains at risk'), not 0" \
+  || bad "nested: rc=$RC (want 2) — a partial archive was reported as a complete rescue"
+case "$OUT" in
+  *"could NOT be archived"*) ok "nested: the loud 'could NOT be archived' line is present" ;;
+  *) bad "nested: no 'could NOT be archived' line — $OUT" ;;
+esac
+# ⛔ `*"extra/"*` was satisfied by GIT'S OWN echoed "error: 'extra/' does not have a commit checked
+# out", so a script that named nothing still passed. Match the line the SCRIPT composes for a path.
+case "$OUT" in
+  *"bg-rescue-wip:    extra/"*) ok "nested: the SKIPPED path is NAMED on the script's own loud line (not git's echoed error)" ;;
+  *) bad "nested: the skipped path is not named by the script — $OUT" ;;
+esac
+
+echo; echo "── a push that CANNOT happen exits 2 and refuses to read as success ──"
+mk_repo nopush || { echo "❌ fixture failed (nopush)"; exit 1; }
+N="$T/nopush"
+printf 'work that cannot leave\n' > "$N/wt/stranded.txt"
+git -C "$N/wt" remote set-url origin "$T/nopush/does-not-exist.git"   # unreachable
+OUT="$(bash "$RR" "$N/wt" "test" 2>&1)"; RC=$?
+[ "$RC" -eq 2 ] && ok "nopush: exit 2 (the loud failure)" || bad "nopush: exit $RC (want 2) — $OUT"
+case "$OUT" in
+  *"STILL ONLY ON THIS DISK"*) ok "nopush: says the work is still only on this disk" ;;
+  *) bad "nopush: did not warn that the work is still local — $OUT" ;;
+esac
+NP_SHA="$(ref_of "$N/wt" refs/wip-local/fix-lane-one)"
+[ -n "$NP_SHA" ] && ok "nopush: still recorded LOCALLY, so the work is reachable in the repo" \
+  || bad "nopush: no local ref either — the work is unreachable"
+# the printed recovery handle must actually work once the remote is repaired
+git -C "$N/wt" remote set-url origin "$T/nopush/origin.git"
+if [ -n "$NP_SHA" ] && git -C "$N/wt" push -q origin "$NP_SHA:refs/wip/fix-lane-one" 2>/dev/null; then
+  ok "nopush: the recorded local ref pushes cleanly once the remote is back (the retry path works)"
+else
+  bad "nopush: the local ref could not be pushed even after the remote was repaired"
+fi
+
+echo; echo "── a WORKFLOW-SCOPE refusal is retried ONCE with the credential that can push (#2292) ──"
+# ⛔ THE DEFECT (agent-infra#2292): a fine-grained PAT without `Workflows: write` is refused by
+# github.com for any snapshot touching `.github/workflows/`, so the rescue exited 2 "STILL ONLY ON THIS
+# DISK" for EXACTLY the lanes whose work touches CI — while the osxkeychain credential on the same host
+# could push the same ref. Measured: one snapshot stranded this way, and 52 branches blocked fleet-wide.
+#
+# The arms below run a stub `git` that models each refusal the REAL remote can give, because the whole
+# question is a PREDICATE: which refusal justifies selecting a different credential, and which must go
+# straight to the loud failure. Asserting "it retries" alone would pass a blanket retry, and a blanket
+# retry turns an auth outage, a hook rejection or a network stall into a push attempted twice with the
+# wrong credential — and, when the second attempt happens to succeed, into a GREEN run that hid the
+# first cause. So each arm pins attempts, exit code, whether the ref landed, and the message.
+REALGIT="$(command -v git)"
+# mk_pushshim <dir> <mode> — a `git` that intercepts ONLY `push`; everything else execs real git with
+# the environment intact (an `env -i` shim once hid GIT_INDEX_FILE and silently wrote the real index).
+# It records every attempt's argv and which credential it selected, so "was it retried, and with what"
+# is read from EVIDENCE, not from the message the script prints.
+# Generated from a QUOTED heredoc with __TOKEN__ placeholders: an unquoted one turned `$(cat …)` into a
+# generation-time substitution and `"$@"` into shell-quoting soup, i.e. the stub itself was broken.
+mk_pushshim() { # mk_pushshim <dir> <mode>
+  local d="$1" mode="$2" slug="$3"
+  mkdir -p "$d" || return 1
+  cat > "$d/git" <<'SHIM'
+#!/usr/bin/env bash
+REAL="__REALGIT__"
+MODE="__MODE__"
+SHDIR="__SHDIR__"
+SLUG="__SLUG__"
+ispush=0; iskey=0
+for a in "$@"; do
+  [ "$a" = push ] && ispush=1
+  [ "$a" = credential.helper=osxkeychain ] && iskey=1
+done
+# The real github.com refusal, verbatim (backticks included) — so the matcher is tested on the text
+# that actually arrives, not on a simplified version written to fit the regex.
+wf_reject() {
+  printf '%s\n' \
+    "remote: error: GH013: refusing to allow a Personal Access Token to create or update workflow \`.github/workflows/ci.yml\` without \`workflow\` scope" \
+    " ! [remote rejected] aaaaaaa -> refs/wip/$SLUG (pre-receive hook declined)" >&2
+}
+# A generic hook rejection that ECHOES the ref name. The trap for a `grep workflow` matcher: a branch
+# merely NAMED "workflow" must not look like a scope refusal.
+other_reject() {
+  printf '%s\n' " ! [remote rejected] aaaaaaa -> refs/wip/$SLUG (pre-receive hook declined)" >&2
+}
+auth_reject() {
+  printf '%s\n' "fatal: Authentication failed for 'https://github.com/example/repo.git/'" >&2
+}
+if [ "$ispush" -eq 1 ]; then
+  n=0; [ -f "$SHDIR/attempts" ] && n=$(cat "$SHDIR/attempts")
+  n=$((n+1))
+  echo "$n" > "$SHDIR/attempts"
+  printf '%s\n' "$@" > "$SHDIR/argv.$n"
+  echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}" >> "$SHDIR/attempts.env.$n"
+  if [ "$iskey" -eq 1 ]; then echo keychain >> "$SHDIR/attempts.who"; else echo plain >> "$SHDIR/attempts.who"; fi
+  case "$MODE" in
+    wf_then_ok)   [ "$iskey" -eq 1 ] || { wf_reject; exit 1; } ;;
+    wf_always)    wf_reject; exit 1 ;;
+    wf_then_auth) if [ "$iskey" -eq 1 ]; then auth_reject; exit 1; else wf_reject; exit 1; fi ;;
+    plain_ok)     : ;;
+    other)        [ "$iskey" -eq 1 ] || { other_reject; exit 1; } ;;
+    authfail)     auth_reject; exit 1 ;;
+  esac
+fi
+exec "$REAL" "$@"
+SHIM
+  [ -f "$d/git" ] || return 1
+  # Placeholders are substituted with awk (a value containing '/' or '&' must not corrupt the stub).
+  awk -v real="$REALGIT" -v mode="$mode" -v d="$d" -v slug="$slug" '
+    { gsub(/__REALGIT__/, real); gsub(/__MODE__/, mode); gsub(/__SHDIR__/, d); gsub(/__SLUG__/, slug); print }
+  ' "$d/git" > "$d/git.new" && mv "$d/git.new" "$d/git" || return 1
+  chmod +x "$d/git" || return 1
+  # The stub must be syntactically valid BEFORE an arm depends on it: a broken stub fails as "not a
+  # worktree", which reads like a rescue bug and hides the real one (measured in this file's own
+  # development — a mangled heredoc produced five confident reds about the wrong thing).
+  bash -n "$d/git" 2>/dev/null || { echo "❌ generated stub is not valid bash: $d/git"; return 1; }
+  return 0
+}
+# try_rescue <fixture> <mode> — build a worktree that touches .github/workflows, run the rescue under
+# the stub, and export RC/OUT/ATTEMPTS/WHO for the assertions.
+try_rescue() { # try_rescue <name> <mode> <branch>
+  local n="$1" mode="$2" br="${3:-fix/lane-one}" d="$T/$1"
+  mk_repo "$n" || { echo "❌ fixture failed ($n)"; return 1; }
+  if [ "$br" != "fix/lane-one" ]; then git -C "$d/wt" checkout -q -b "$br"; fi
+  mkdir -p "$d/wt/.github/workflows"
+  printf 'name: ci\non: push\n' > "$d/wt/.github/workflows/ci.yml"
+  printf 'the work the rescue exists for\n' > "$d/wt/lane-work.txt"
+  # The stub embeds the ref slug it refuses, so its rejection text echoes the REAL ref name — that is
+  # what makes the "workflow-NAMED branch" arm a genuine test of the matcher.
+  local slug; slug="$(printf '%s' "$br" | tr '/' '-')"
+  mk_pushshim "$d/shim" "$mode" "$slug" || { echo "❌ shim failed ($n)"; return 1; }
+  CFG_BEFORE="$(git -C "$d/wt" config --list --show-origin 2>/dev/null | sort)"
+  OUT="$(PATH="$d/shim:$PATH" bash "$RR" "$d/wt" "workflow-bearing lane killed" 2>&1)"; RC=$?
+  ATTEMPTS=0; [ -f "$d/shim/attempts" ] && ATTEMPTS="$(cat "$d/shim/attempts")"
+  WHO=""; [ -f "$d/shim/attempts.who" ] && WHO="$(tr '\n' ' ' < "$d/shim/attempts.who")"
+  return 0
+}
+
+# (1) THE DEFECT ITSELF: a workflow-scope refusal, a keychain credential that works.
+try_rescue wfretry wf_then_ok
+WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
+[ "$RC" -eq 0 ] \
+  && ok "wfretry: exit 0 — a workflow-bearing snapshot is RESCUED, not degraded to local-only" \
+  || bad "wfretry: exit $RC (want 0) — the credential that can push was never tried — $OUT"
+[ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfretry: exactly TWO push attempts (one plain, one with the keychain credential)" \
+  || bad "wfretry: ${ATTEMPTS:-0} push attempt(s) (want exactly 2) — no retry, or a retry storm"
+[ "${WHO:-}" = "plain keychain " ] \
+  && ok "wfretry: the retry used the KEYCHAIN credential (sameness of the two attempts is not enough)" \
+  || bad "wfretry: the retry did not select the keychain credential — attempts were: ${WHO:-none}"
+[ -n "$WSHA" ] && has_blob "$T/wfretry/origin.git" "$WSHA" .github/workflows/ci.yml 'name: ci' \
+  && ok "wfretry: the WORKFLOW FILE ITSELF reached origin (the content that used to strand the snapshot)" \
+  || bad "wfretry: origin has no snapshot carrying the workflow file (ref: ${WSHA:-none})"
+[ -n "$WSHA" ] && has_blob "$T/wfretry/origin.git" "$WSHA" lane-work.txt 'the work the rescue exists for' \
+  && ok "wfretry: the lane's other work is in the same snapshot" \
+  || bad "wfretry: the lane's work is missing from the published snapshot"
+# ⛔ A rescue may never FORCE, and may never write credential config. Both are asserted on the
+# recorded argv and on the repo's own config, not on the message that claims it.
+# ⛔ THE ORDERED PAIR, NOT THE PRESENCE OF EACH FLAG. `-c credential.helper=` CLEARS the configured
+# helper list and `-c credential.helper=osxkeychain` then names the one to use; the order is the whole
+# mechanism. This arm had two `ok` branches, so deleting the clear (the retry then re-uses the SAME
+# scope-less PAT and #2292 is unchanged) and reversing the pair (the retry ends with an EMPTY helper
+# list) both stayed GREEN — found by two independent fresh reviewers, each by mutation. Every shape
+# except clear-then-name is now a failure.
+# ⛔ NO FORCE, ON EITHER ATTEMPT, CHECKED PER ARGUMENT. The old pattern `*"+refs/"*` is DEAD for this
+# script's refspec: its source side is a raw sha, so the force form is `+<sha>:refs/wip/<slug>`, which
+# contains no `+refs/`. A fresh reviewer's mutation (`"+$C:refs/wip/$SLUG"`) was GREEN — and a forced
+# push is the one thing that can destroy a peer clone's snapshot, so this is the arm that must not be
+# vacuous. Every recorded argument is checked, on both attempts, and the two attempts must carry the
+# IDENTICAL refspec: a retry that publishes a different refspec than the first push is not a retry.
+wf_force=0
+for _n in 1 2; do
+  _p="$T/wfretry/shim/argv.$_n"
+  if [ -f "$_p" ] && grep -qE '^(\+|--force$|-f$)' "$_p" 2>/dev/null; then
+    wf_force=1; bad "wfretry: attempt $_n used a FORCE form (a forced rescue can overwrite a peer clone's snapshot): $(tr '\n' ' ' < "$_p")"
+  fi
+done
+[ "$wf_force" -eq 0 ] && ok "wfretry: NEITHER attempt carries a force form (per-argument, so a '+<sha>:refs/…' force is caught)"
+RS1="$(tail -1 "$T/wfretry/shim/argv.1" 2>/dev/null)"
+RS2="$(tail -1 "$T/wfretry/shim/argv.2" 2>/dev/null)"
+[ -n "$RS1" ] && [ "$RS1" = "$RS2" ] \
+  && ok "wfretry: both attempts push the SAME refspec (the retry cannot publish something the first would not)" \
+  || bad "wfretry: the retry's refspec differs from the first push's ('${RS1:-none}' vs '${RS2:-none}')"
+case "$RS2" in
+  [0-9a-f][0-9a-f]*) ok "wfretry: the refspec's source is a commit sha (not a ref or a force ref)" ;;
+  *) bad "wfretry: the retry's refspec does not start with a commit sha — $RS2" ;;
+esac
+if [ -f "$T/wfretry/shim/argv.2" ]; then
+  ARGV2="$(tr '\n' ' ' < "$T/wfretry/shim/argv.2")"
+  case "$ARGV2" in
+    *"-c credential.helper= -c credential.helper=osxkeychain"*)
+      ok "wfretry: the retry CLEARS the configured helpers and then names the keychain one, in that order (no config write)" ;;
+    *) bad "wfretry: the retry does not clear-then-name the helper (no clear re-uses the scope-less token; a reversed pair leaves an EMPTY helper list) — $ARGV2" ;;
+  esac
+else
+  bad "wfretry: no recorded argv for the second attempt — the retry cannot be inspected"
+fi
+# ⛔ THE RETRY MAY NOT PROMPT: it runs in the second before a cap kill, so an absent keychain entry must
+# FAIL rather than wait on a terminal nobody is watching. The script's own comment promises this; without
+# this arm, deleting the `export GIT_TERMINAL_PROMPT=0` was green (a fresh reviewer's mutation).
+grep -qx 'GIT_TERMINAL_PROMPT=0' "$T/wfretry/shim/attempts.env.2" 2>/dev/null \
+  && ok "wfretry: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
+  || bad "wfretry: the retry did not disable the terminal prompt — a missing keychain entry could hang the rescue"
+# ⛔ ALL SCOPES, not `--local`: a write to `$HOME/.gitconfig` would be invisible to `--local` and would
+# also PERSIST on the machine that ran the suite. `--show-origin` names the file it came from.
+[ "$(git -C "$T/wfretry/wt" config --list --show-origin 2>/dev/null | sort)" = "$CFG_BEFORE" ] \
+  && ok "wfretry: git config is byte-identical at EVERY scope after the retry (read-only rescue, global included)" \
+  || bad "wfretry: the rescue WROTE git config (any scope) — a rescue must not change the state it is rescuing"
+case "$OUT" in
+  *OSXKEYCHAIN*|*osxkeychain*) ok "wfretry: says WHICH credential published it (a clean run must not imply the PAT worked)" ;;
+  *) bad "wfretry: the success message does not name the credential used — $OUT" ;;
+esac
+# ⛔ THE SHA IN THE MESSAGE IS THE SHA THAT WAS PUSHED. A message printing a re-chained or shortened sha
+# hands the operator a handle that does not resolve — and the failure hint recommends exactly that retry.
+# awk reads the input to EOF and takes the FIRST match itself: a `sed … | head -1` pipeline relies on a
+# short write, and under `set -o pipefail` an early-exiting consumer turns a MATCHING line into rc=141 —
+# the same SIGPIPE false negative `scripts/check-no-sigpipe-grep.sh` exists to keep out of the tree.
+CLAIMED="$(printf '%s\n' "$OUT" | awk '
+  found == "" && match($0, /refs\/wip\/[^ ]* \([0-9a-f]+\)/) {
+    t = substr($0, RSTART, RLENGTH); if (match(t, /\([0-9a-f]+\)/)) found = substr(t, RSTART+1, RLENGTH-2) }
+  END { print found }')"
+[ -n "$CLAIMED" ] && [ "$CLAIMED" = "$WSHA" ] \
+  && ok "wfretry: the sha the message claims is the sha origin's ref actually holds (a usable recovery handle)" \
+  || bad "wfretry: the claimed sha '${CLAIMED:-none}' is not origin's '${WSHA:-none}' — the message names a handle that does not resolve"
+
+# (1b) ⛔ THE OPPOSITE DIRECTION OF THE SUCCESS MESSAGE. A plain first-attempt push must NOT be reported
+# as a keychain push: an implementation that prints the keychain claim on BOTH success branches passed
+# the arm above, and would tell an operator the scope-less token works on a run where it was never used.
+try_rescue plainok plain_ok
+[ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "plainok: a first-attempt success is one attempt, exit 0" \
+  || bad "plainok: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 1)"
+case "$OUT" in
+  *OSXKEYCHAIN*|*osxkeychain*) bad "plainok: a push that was NEVER retried claims the keychain credential — $OUT" ;;
+  *) ok "plainok: a non-retried push does not claim the keychain credential (the claim is evidence, not decoration)" ;;
+esac
+
+# (2) ⛔ A NON-WORKFLOW rejection is NOT retried. The stub would SUCCEED on the keychain attempt, so a
+# blanket retry reports a false GREEN here — and the branch is named "workflow-scope" so the rejection
+# text echoes the word, which is what a `grep workflow` matcher would trip over.
+try_rescue noscopeblind other fix/workflow-scope
+NSHA="$(ref_of "$T/noscopeblind/origin.git" refs/wip/fix-workflow-scope)"
+[ "$RC" -eq 2 ] \
+  && ok "noscopeblind: a hook rejection of a workflow-NAMED branch exits 2 (not retried into a green run)" \
+  || bad "noscopeblind: exit $RC (want 2) — a non-workflow rejection was retried — $OUT"
+[ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "noscopeblind: exactly ONE attempt (only a workflow-SCOPE refusal may select a credential)" \
+  || bad "noscopeblind: ${ATTEMPTS:-0} attempts — the retry is gated on \"the push failed\", not on the refusal"
+[ -z "$NSHA" ] \
+  && ok "noscopeblind: nothing was published, so the exit 2 is true (a retry here WOULD have pushed a ref)" \
+  || bad "noscopeblind: a ref landed on origin while the run reported failure — a false success"
+case "$OUT" in
+  *"STILL ONLY ON THIS DISK"*) ok "noscopeblind: still names the work as at risk" ;;
+  *) bad "noscopeblind: the at-risk warning is missing — $OUT" ;;
+esac
+case "$OUT" in
+  *"cause: REMOTE REJECTED THE UPDATE"*) ok "noscopeblind: names the CAUSE as a remote rejection (not a bare 'push failed')" ;;
+  *) bad "noscopeblind: the failure does not name its cause — $OUT" ;;
+esac
+
+# (3) the retry is tried ONCE, and a second refusal is reported as a failure with BOTH causes — never as
+# a success, and never as an endless loop.
+try_rescue wfalways wf_always
+WASHA="$(ref_of "$T/wfalways/origin.git" refs/wip/fix-lane-one)"
+[ "$RC" -eq 2 ] \
+  && ok "wfalways: exit 2 when even the keychain credential is refused (no false success)" \
+  || bad "wfalways: exit $RC (want 2) — a refused retry was reported as a rescue — $OUT"
+[ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfalways: exactly ONE retry (a refused retry must not loop)" \
+  || bad "wfalways: ${ATTEMPTS:-0} attempt(s) (want exactly 2)"
+[ -z "$WASHA" ] \
+  && ok "wfalways: no ref reached origin, consistent with the exit code" \
+  || bad "wfalways: a ref landed on origin while the run reported failure"
+case "$OUT" in
+  *"cause: WORKFLOW SCOPE"*) ok "wfalways: names WORKFLOW SCOPE as the first cause" ;;
+  *) bad "wfalways: does not name the workflow-scope cause — $OUT" ;;
+esac
+case "$OUT" in
+  *"ALSO failed"*) ok "wfalways: reports the retry's own outcome instead of hiding it" ;;
+  *) bad "wfalways: says nothing about the retry's own failure — $OUT" ;;
+esac
+case "$OUT" in
+  *"rescued"*) bad "wfalways: claimed a rescue that did not happen — $OUT" ;;
+  *) ok "wfalways: does not claim a rescue it did not perform" ;;
+esac
+
+# (3b) ⛔ THE FIRST CAUSE SURVIVES THE RETRY. The stub refuses the first attempt for WORKFLOW SCOPE and
+# the retry for AUTHENTICATION — a different reason. Reporting only the LAST cause sends the operator
+# after a keychain entry that is fine while the real blocker (the token's scope) goes unnamed; that
+# implementation passed the `wfalways` arm, where both attempts fail for the SAME reason.
+try_rescue wfthenauth wf_then_auth
+[ "$RC" -eq 2 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfthenauth: exit 2 after exactly one retry" \
+  || bad "wfthenauth: rc=$RC attempts=${ATTEMPTS:-0} (want 2 and 2)"
+case "$OUT" in
+  *"cause: WORKFLOW SCOPE"*) ok "wfthenauth: the FIRST cause (workflow scope) is still named" ;;
+  *) bad "wfthenauth: the first cause was overwritten by the retry's — $OUT" ;;
+esac
+case "$OUT" in
+  *"ALSO failed"*AUTHENTICATION*|*AUTHENTICATION*"ALSO failed"*)
+    ok "wfthenauth: the retry's DIFFERENT cause is reported separately (both reasons reachable to the operator)" ;;
+  *) bad "wfthenauth: the retry's own cause is not reported alongside the first — $OUT" ;;
+esac
+[ -z "$(ref_of "$T/wfthenauth/origin.git" refs/wip/fix-lane-one)" ] \
+  && ok "wfthenauth: nothing published, consistent with the failure" \
+  || bad "wfthenauth: a ref landed while the run reported failure"
+
+# (4) the cause is NAMED for the ordinary failures too (#2292, item 2) — 'the push failed' is what sent a
+# diagnosis cycle after the wrong cause.
+try_rescue authbad authfail
+[ "$RC" -eq 2 ] && ok "authbad: exit 2" || bad "authbad: exit $RC (want 2)"
+[ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "authbad: an AUTH failure is not retried (a different credential would not be the fix)" \
+  || bad "authbad: ${ATTEMPTS:-0} attempts — an auth failure took the workflow-scope retry path"
+case "$OUT" in
+  *"cause: AUTHENTICATION"*) ok "authbad: names AUTHENTICATION as the cause" ;;
+  *) bad "authbad: does not name the auth cause — $OUT" ;;
+esac
+
+echo; echo "── a dispatcher that CALLS the rescue before it kills ──"
+# The contract that matters in production: the watchdog must rescue, not just the rescuer work.
+#
+# ⛔ THE TARGET IS NOT IN THIS REPO. `scripts/bg-dispatch.sh` is unversioned (it exists in no commit)
+# and this PR deliberately does not add it — the shipped harness already has a dispatch path, and
+# agent-infra#2169 is the open fix in THAT path. So the arms below are pointed at whatever dispatcher
+# the caller names, defaulting to the repo-relative path that #2169 is expected to version:
+#
+#   BG_DISPATCH=/path/to/bg-dispatch.sh bash scripts/bg-rescue-wip.test.sh   # run the 3 arms
+#   BG_DISPATCH=/Users/home/orchestrator/bg/bg-dispatch.sh ...              # the live overlay
+#
+# When no dispatcher is present the arms SKIP — loudly, with the reason named, and NOT counted as
+# passes. They are not dropped: they light up the moment a dispatcher is available.
+#
+# ⛔ THESE ARE TEXTUAL WIRING CHECKS AND NO STRONGER — read the ✅ as "a live-looking call is present",
+# never as "the rescue runs". They accept a call with ARGUMENTS (`_rescue "$wt"`, which an earlier
+# regex rejected) and ignore comments, `echo`/`printf` usage lines, and an `if false` dead branch
+# (each of which satisfied an earlier, narrower regex while proving nothing). Two known FALSE PASSES
+# remain and are NOT claimed away: a dispatcher whose `_rescue()` body is empty, and a call inside a
+# dead branch that is not spelled `if false`. Proving the watchdog actually rescues needs a behavioural
+# fixture with a stubbed `pi` and kill path, which is agent-infra#2169's surface (the shipped
+# dispatcher), not this file's. What IS proven behaviourally here is the primitive itself — the
+# `twice`, `chain` and `xclone` arms drive real rescues through a real bare remote.
+# live_rescue_calls <file> — count `_rescue` occurrences that are actual calls.
+live_rescue_calls() {
+  awk '
+    { line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^#/) next                                   # comment
+      if (line ~ /^_rescue[[:space:]]*\(\)/) next             # the definition itself
+      if (line ~ /(^|[^_[:alnum:]_])(echo|printf|log_line|log)[[:space:]]/) next   # a usage/message line
+      if (line ~ /if[[:space:]]+(false|0)[[:space:]]*;/) next   # a dead branch (mid-line too)
+      n = gsub(/(^|[^_[:alnum:]])_rescue([^_[:alnum:]]|$)/, "&", line)
+      total += n }
+    END { print total + 0 }' "$1" 2>/dev/null
+}
+# live_rescue_before <file> <signal> — a live line calling _rescue before `kill -SIG`.
+live_rescue_before() {
+  awk -v sig="$2" '
+    { line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^#/) next
+      if (line ~ /(^|[^_[:alnum:]_])(echo|printf|log_line|log)[[:space:]]/) next
+      if (line ~ /if[[:space:]]+(false|0)[[:space:]]*;/) next
+      r = index(line, "_rescue"); k = index(line, "kill -" sig)
+      if (r > 0 && k > r) found = 1 }
+    END { exit(found ? 0 : 1) }' "$1" 2>/dev/null
+}
+DISPATCH="${BG_DISPATCH:-$HERE/bg-dispatch.sh}"
+if [ ! -f "$DISPATCH" ]; then
+  skip "no dispatcher at $DISPATCH — 3 wiring arms not run (set BG_DISPATCH to run them; #2169 versions the dispatcher)"
+  skip "dispatch: the rescue is CALLED, not merely defined (not run)"
+  skip "dispatch: rescue before the TERM / after the grace period (not run)"
+else
+  echo "    dispatcher: $DISPATCH"
+  NCALLS="$(live_rescue_calls "$DISPATCH")"
+  [ "${NCALLS:-0}" -ge 2 ] \
+    && ok "dispatch: the watchdog CALLS the rescue ($NCALLS call sites: a definition that is never called is not a rescue)" \
+    || bad "dispatch: the rescue is defined but called ${NCALLS:-0} time(s) — it never runs (#2045 unfixed)"
+  live_rescue_before "$DISPATCH" TERM \
+    && ok "dispatch: a LIVE call runs before the TERM (comments, usage strings and dead branches are not rescues)" \
+    || bad "dispatch: no live rescue before TERM"
+  live_rescue_before "$DISPATCH" KILL \
+    && ok "dispatch: a second live call covers whatever was written during the grace period" \
+    || bad "dispatch: no live rescue after the grace period"
+fi
+
+echo; echo "── Summary ───────────────────────────────────────────────────────"
+echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
+[ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
+if [ "$SKIP" -gt 0 ]; then
+  echo "  ✅ contract holds — but $SKIP arm(s) SKIPPED (not passed). Re-run with BG_DISPATCH=<path> for the full set."
+else
+  echo "  ✅ contract holds (all $PASS arms ran, nothing skipped)"
+fi
