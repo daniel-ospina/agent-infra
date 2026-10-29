@@ -282,8 +282,11 @@ printf '#!/usr/bin/env bash\ncase "$*" in *version_info*) echo "3.11" ;; *) exit
 chmod +x "$T/bin/oldpy"
 D="$T/c6"; fresh "$D"
 ENVV=(RUNNER_AUTOSCALE_PYTHON="$T/bin/oldpy")
-OUT="$(run_install Linux "$D" --install)"; ENVV=()
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a PINNED old interpreter is REFUSED (a named pin is the whole list, never a fallback)"
 assert_contains "$OUT" "requires >= 3.12" "the old interpreter is REFUSED with the requirement quoted"
+assert_contains "$OUT" "a named pin is the whole list" "the refusal names WHY it was not replaced"
+assert_nofile "$D/$UNIT_NAME.service" "nothing was installed with a substituted interpreter"
 assert_absent "$(grep '^ExecStart=' "$D/$UNIT_NAME.service" 2>/dev/null)" "oldpy" \
     "the artifact NEVER pins an interpreter older than 3.12"
 
@@ -420,6 +423,64 @@ assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "runner_autoscal
     "the ExecStart names runner_autoscale.py"
 assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "$GOOD_PY" \
     "the ExecStart names the resolved interpreter, absolutely"
+
+# ── T15: a DISARM PREVIEW changes nothing ────────────────────────────────────────────────
+# Measured defect this pins: --disarm --dry-run removed the record and THEN returned at the dry-run
+# check, so the operator was told DISARMED while the artifact still converged and the audit datum was
+# destroyed. The record must survive a preview, and the artifact must be untouched.
+say_case "T15 --disarm --dry-run keeps the record and the artifact ARMED"
+D="$T/c15"; fresh "$D"
+printf 'armed-by=someone\narmed-date=2026-10-29T00:00:00Z\nreason=fixture\n' >"$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+BEFORE="$(cat "$D/$UNIT_NAME.service")"
+OUT="$(run_install Linux "$D" --disarm --dry-run)"; RC=$?
+assert_eq "$RC" 0 "the preview exits 0"
+assert_contains "$OUT" "WOULD disarm" "the preview says what it WOULD do"
+assert_file "$ARM" "the arming record SURVIVES a preview"
+assert_eq "$BEFORE" "$(cat "$D/$UNIT_NAME.service")" "the artifact is byte-identical after a preview"
+# and a REAL disarm does the opposite, in the right order
+OUT="$(run_install Linux "$D" --disarm)"; RC=$?
+assert_eq "$RC" 0 "a real disarm exits 0"
+assert_nofile "$ARM" "the record is gone after a real disarm"
+assert_absent "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "ARMED" "the artifact carries no armed flag"
+
+# ── T16: a FAILED armed render leaves the box NOT armed ───────────────────────────────────
+# A record that outlives a failed --arm is an armed box the operator was told was not armed: the next
+# routine --install would silently re-arm from it. The record must be dropped, fail-closed.
+say_case "T16 a failed armed re-render removes the record (no armed box with no record)"
+mkdir -p "$T/tpl16"
+cp "$REPO/templates/systemd/$UNIT_NAME.timer" "$T/tpl16/"
+sed 's|{{PYTHON}}|{{UNRESOLVED_16}}|; s|{{SCRIPT}}|{{ALSO_16}}|' \
+    "$REPO/templates/systemd/$UNIT_NAME.service" >"$T/tpl16/$UNIT_NAME.service"
+D="$T/c16"; fresh "$D"
+rm -f "$ARM"
+ENVV=(TEMPLATES_DIR="$T/tpl16")
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a failed armed render exits 1"
+assert_contains "$OUT" "NOT ARMED" "it says NOT ARMED rather than leaving it implied"
+assert_nofile "$ARM" "the record does not survive a failed arm"
+
+# ── T17: '%' is a systemd specifier, never a launchd one ──────────────────────────────────
+say_case "T17 '%' is refused on the systemd arm and allowed on the launchd arm"
+PC="$T/home/pc%h"; mkdir -p "$PC"; cp "$T/home/converger.py" "$PC/"
+ENVV=(HOME="$PC" RUNNER_AUTOSCALE_SCRIPT="$PC/converger.py")
+D="$T/c17"; fresh "$D"
+OUT="$(run_install Linux "$D" --install)"; RC=$?
+assert_eq "$RC" 1 "a '%' path is REFUSED on the systemd arm (systemd expands it at load time)"
+assert_contains "$OUT" "specifier" "the refusal names the specifier expansion"
+assert_nofile "$D/$UNIT_NAME.service" "nothing was installed with a path systemd would rewrite"
+OUT="$(run_install Darwin "$T/c17d" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "the same '%' path is ACCEPTED on the launchd arm (a plist string is not expanded)"
+
+# ── T18: --status notices a MISSING INTERPRETER ──────────────────────────────────────────
+say_case "T18 --status reports a missing interpreter, not a healthy schedule"
+D="$T/c18"; fresh "$D"
+run_install Linux "$D" --install >/dev/null 2>&1
+sed -i 's|^ExecStart="[^"]*"|ExecStart="/nonexistent/python9.99"|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--status exits 1 when the artifact's interpreter is gone (203/EXEC every tick)"
+assert_contains "$OUT" "python_present=no" "it reports the interpreter it could not find"
+assert_contains "$OUT" "installed=yes" "while still reporting the artifact as installed (the two are different questions)"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
