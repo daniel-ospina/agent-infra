@@ -1341,8 +1341,9 @@ DRIFTED=""
 # worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
 # verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
 # (a census that reads 0 workers, a reap that cannot prove a kill).
-# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by THREE
-# daemons (`orch-loop.sh`, `fix-one.sh`, `dispatch-merge.sh`), each of which only checks that the
+# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by the
+# controller `orch-loop.sh` and by `dispatch-merge.sh` (#2927 removed `fix-one.sh`'s copy — repair does
+# not read the queue), each of which only checks that the
 # verbs exist — so a stale `$O/ci-queue.sh` passes every interface guard and the box keeps deriving
 # its ceiling with the pre-review runner-count read (the 3x over-permissive one). A sourced module
 # that is not in this list is the drift the list exists to catch.
@@ -1373,7 +1374,7 @@ DRIFTED=""
 # startup warning. That is exactly the partial-reseed drift this list exists to catch.
 # gate-policy.sh (#2319) is the same class and is REQUIRED now: every pi-spawning carrier sources it
 # and `exit 78`s without it, so a $O copy predating it stops every lane and every merge on the box.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

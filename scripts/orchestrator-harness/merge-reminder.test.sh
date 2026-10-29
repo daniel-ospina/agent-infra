@@ -2581,7 +2581,7 @@ import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-# candidate 3 is this script's own checkout: the resolution must find it even with nothing exported
+# candidate 3 is the checkout THIS script lives in: the resolution must find it even with nothing exported
 got = m.harness_repo_of(Path("/nonexistent-o"))
 here = Path(sys.argv[1]).resolve().parents[2]
 print(0 if got is not None and Path(got) == here.resolve() else 1)
@@ -2682,7 +2682,7 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 plain = Path(sys.argv[2]).resolve()
 here = Path(sys.argv[1]).resolve().parents[2]
 # A checkout that does NOT carry the harness must be SKIPPED: the resolution may fall through to the
-# script's own checkout (which does carry it), but it must never RETURN the plain repo.
+# checkout THIS script lives in (which does carry it), but it must never RETURN the plain repo.
 got_o = m.harness_repo_of(plain)
 # ...and the same for the conventional "$HOME/orchestrator" location.
 hdir = plain.parent / "homeplain"

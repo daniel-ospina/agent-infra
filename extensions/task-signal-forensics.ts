@@ -71,8 +71,10 @@
  * ⛔ WHY THIS IS NOT A CALL TO `scripts/bg-rescue-wip.sh` (the repo's existing
  * rescue, #2045) — the one line the #2934 review asked for, with the numbers:
  * that tool's guarantee is "reachable from `refs/wip/<slug>` on ORIGIN", and its
- * own bounds are `bounded 25 git fetch` + `bounded 45 git push`. It runs in the
- * DISPATCHER, before the TERM, on a harness lane (`lane.sh` / `fix-one.sh`); it
+ * own bounds are `bounded 25 git fetch` + `bounded 45 git push`. Since agent-infra#2834
+ * it is called at the END of `spawn-gate.sh`'s `run_agent`, at every terminal
+ * transition of a harness lane (`lane.sh` / `fix-one.sh` / `nonblocking-dispatch.sh`)
+ * — so it is reached only after the agent has STOPPED; it
  * also refuses any path that is not a worktree ROOT. Inside a victim whose parent
  * escalates `SIGTERM` → **5 s** → `SIGKILL`, a 25 s + 45 s tool cannot finish, and
  * the parent's `SIGKILL` would take arm 1's append with it. The other existing

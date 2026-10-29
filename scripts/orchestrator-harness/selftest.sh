@@ -1159,6 +1159,271 @@ VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (open PRs)')"
 VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
   holder_run "$D9" f4
   if [ "$(holder_queued "$D9")" = 1 ]; then ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 0; else ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 1; fi
+
+  # ── 5l-bis) THE PRODUCER'S WORDING IS NOT PART OF THE CONTRACT (agent-infra#2952) ──────────────
+  # THE DEFECT, MEASURED. The surface set was read with the literal phrase `could not be queried (`.
+  # tortoise fa7b27b66 (#9423, 2026-10-21) reworded that sentence to `could not be FULLY queried (`,
+  # and from that commit the parse returned an EMPTY set for EVERY verdict — so `HOLDER_ONLY` was 0
+  # for every candidate, the #1935 substitution above could never fire, and cell4 spent six days
+  # reporting `0 dispatched` / `unusable=issue-assignee-holder:12` while THIS SUITE stayed green,
+  # because every fixture above still rendered the wording shipped on the day it was written. A test
+  # that only ever replays yesterday's wording cannot fail for a producer reword — which is exactly
+  # the "guard that cannot fail" this arm exists to remove. So these arms render the producer's REAL
+  # line, and one of them renders an adverb it has never used, to pin the CONTRACT ("the surfaces are
+  # named in the parenthetical after `queried (`") instead of a phrase of the day.
+  #
+  # The body below is cell4's own report for #9889, copied VERBATIM (the board note is abridged in its
+  # middle, marked `…`) from `python3 tools/collision_preflight.py 9889 --repo .` on the cell's own
+  # checkout, 2026-10-27. It is the shape that MUST be re-routed: ONE unreadable surface, the fleet
+  # board, every other surface clean.
+  # ⛔ THE REPORT IS WRITTEN TO A FILE, NOT CAPTURED THROUGH `$(cat <<'REPORT' …)`: bash 3.2 (macOS's
+  # /bin/bash, the shell this suite gets via `env bash` on a stock runner) quote-scans the body of a
+  # heredoc that lives inside a command substitution, so a line with ONE apostrophe (`the board's …`)
+  # aborts the WHOLE suite with `unexpected EOF while looking for matching` — measured here, and the
+  # real report has three such lines. A plain `cat > file <<'REPORT'` is not scanned, and the variable
+  # is then filled from the file.
+  cat > "$TMP/cell2952.report" <<'REPORT'
+collision-preflight: issue #9889
+repo: daniel-ospina/tortoise   [resolved from: --repo PATH (git remote)]
+
+title: measure(extractor-v4): E1's before arm and E2a's 14-unit denominator are producible
+keyword gate: none — the lexical arm is deleted (#3504).
+
+SURFACE                         STATUS      HITS  NOTE
+issue landed                    CLEAN       0     issue state=OPEN; 7 timeline event(s), 1 merged cross-reference(s), none naming #9889 in its title
+merged PRs naming an OPEN issue ADVISORY    0
+open PRs                        CLEAN       0     25 PR(s) enumerated (complete, cap 1000)
+recently-closed PRs             ADVISORY    1     ⚠ PARTIAL — advisory sample, cannot block
+local branches                  CLEAN       0     17 ref(s) enumerated; 2 already merged into main
+remote branches                 CLEAN       0     1858 ref(s) enumerated
+local worktrees                 CLEAN       0     15 worktree(s) enumerated (untruncated)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv') — the lane roster is UNKNOWN, not empty … (comment prose is not read, #8175)
+
+HITS
+  [recently-closed PRs] PR #10069 docs(5333): G5's destructive half — the design DECISION recorded — prose mention of #9889 in body — not a closing reference (non-blocking) (weak) (advisory — cannot block)
+
+WEAK SIGNALS (reported, non-blocking — these do NOT block)
+  1 a prose-only cross-reference(s) of #9889; no title / branch / worktree / closing-reference match.
+  These do NOT block a dispatch.
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv') — the lane roster is UNKNOWN, not empty … (comment prose is not read, #8175)
+
+ADVISORY SURFACES — reported only; these cannot block a dispatch
+  [recently-closed PRs] 1 hit(s) — sampled the most recent 100 of ~4100 closed PR(s)
+  NOTE: a match here is on a TERMINAL PR — immutable history, not in-flight work.
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be FULLY queried (issue assignee/holder); this is NOT clean for #9889 in daniel-ospina/tortoise — the LANE ROSTER is UNKNOWN (not empty) — no lane can be attributed to this issue until it is readable
+REPORT
+  CELL2952_REPORT="$(cat "$TMP/cell2952.report")"
+  # The registry answers the way a would-be dispatcher needs it to: CLEAN, nothing claimed.
+  CELL2952="$(holder_report x "$CELL2952_REPORT")"
+  holder_run "$CELL2952" b1
+  # ⛔ `holder_queued` returns 1 for QUEUED ("1 = queued = FAIL code", its own doc) because it was
+  # written for arms that assert a refusal. Both polarities appear below, so each one is spelled out:
+  # a check that reads the raw helper value would be asserting the OPPOSITE of what its name says.
+  r2952_is_queued() { [ "$(holder_queued "$1")" = 1 ]; }   # rc 0 = the candidate WAS queued
+  # ⛔ BOTH directions, or a no-op re-route reads green: the candidate must be QUEUED **and** the
+  # queue must be the SUBSTITUTION's doing (the echo names the board+registry path). Pre-fix, this
+  # arm reds on the first assertion — the parse returned nothing, so the candidate was refused.
+  if r2952_is_queued "$CELL2952"; then rc=0; else rc=1; fi
+  ck "(2952a) the producer's REAL verdict wording ('could not be FULLY queried') is RE-ROUTED — the board is unreadable, the registry answers" $rc
+  case "$(cat "$TMP/holder-b1.out")" in
+    *"the pre-flight's HOLDER surface could not answer"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952a) …and it is the HOLDER substitution that queued it (not a silently different CLEAN path)" $rc
+  case "$(cat "$TMP/holder-b1.out")" in
+    *"+#10 CLEAN -> backlog"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952a) …and the queue entry was actually written (the positive half of the pair)" $rc
+  # ── (2952b) THE REGISTRY IS THE ONLY AUTHORITY LEFT, SO AN UNREADABLE ONE STILL REFUSES ────────
+  # Polarity, unchanged: the substitution moves the requirement from "a local board must answer" to
+  # "the cross-box registry must answer". rc=2 is claims.sh's UNREADABLE verdict; it is INCOMPLETE,
+  # never CLEAN, and the candidate must be neither queued nor retired.
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="the registry could not be read (stub)"; return 2; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  CELL2952B="$(holder_report x "$CELL2952_REPORT")"
+  r2952_run() { # <dir> <name>
+    O="$1" LIMIT=5 SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" \
+      bash "$TMP/refreshloop-2952.sh" > "$TMP/2952-$2.out" 2>&1
+  }
+  r2952_run "$CELL2952B" b2
+  if r2952_is_queued "$CELL2952B"; then rc=1; else rc=0; fi
+  ck "(2952b) an UNREADABLE claims registry is still INCOMPLETE — not queued" $rc
+  case "$(tr '\n' ' ' < "$CELL2952B/checked.txt")" in *10*) rc=1 ;; *) rc=0 ;; esac
+  ck "(2952b) …and not retired: the claim is a window, so the candidate is re-attempted next pass" $rc
+  case "$(cat "$TMP/2952-b2.out")" in
+    *"?#10 INCOMPLETE — the registry could not be read"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952b) …and the refusal names the REGISTRY as the reason (not the board, which was substituted)" $rc
+  # …and the OTHER form of "unreadable": the registry is not INSTALLED at all. Nothing has answered the
+  # holder question then, so a CLEAN here would mean "no registry, therefore nobody holds it" — the
+  # fail-open this whole substitution is shaped to avoid. (The pre-#2952 arm `(ii-b)` pins the same
+  # wiring on the OLD wording; this one pins it on the producer's real one.)
+  CELL2952B2="$(holder_report x "$CELL2952_REPORT")"
+  rm -f "$CELL2952B2/claims.sh"
+  r2952_run "$CELL2952B2" b2b
+  if r2952_is_queued "$CELL2952B2"; then rc=1; else rc=0; fi
+  ck "(2952b) an ABSENT claims registry is still INCOMPLETE — not queued (no registry is not a free issue)" $rc
+  case "$(cat "$TMP/2952-b2b.out")" in
+    *"is NOT INSTALLED"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952b) …and the refusal names the MISSING registry (the substituted authority is required, not optional)" $rc
+  # ── (2952c) A SECOND GENUINELY-UNREADABLE SURFACE STILL REFUSES ───────────────────────────────
+  # The other half of the same defect class: `issue landed` is answerable on a cell (gh reads the
+  # issue's state and timeline fine), so it must NOT be swept into the substitution — and it is not,
+  # because the surrogate is the CAUSE (the board), never a surface COUNT. A landed surface that
+  # cannot answer for its OWN reason is work the tool could not judge. Report abridged from cell4's
+  # `collision_preflight.py 2218` (same day, same box); its verdict line names BOTH surfaces.
+  CELL2952C="$(holder_report x "issue landed                    INCOMPLETE  0     issue-state-uninterpretable: state='MERGED' is neither OPEN nor CLOSED, so whether this work item is still live cannot be established — refusing to read it as free (NOT clean)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: /home/cmux/.pi/agent/state/lane-registry.tsv)
+
+INCOMPLETE SURFACES
+  [issue landed] issue-state-uninterpretable: state='MERGED' is neither OPEN nor CLOSED, so whether this work item is still live cannot be established — refusing to read it as free (NOT clean)
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read (FileNotFoundError: /home/cmux/.pi/agent/state/lane-registry.tsv)
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean for #2218 in daniel-ospina/tortoise — PART of this is the LANE ROSTER is UNKNOWN (not empty)")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952C" b3
+  if r2952_is_queued "$CELL2952C"; then rc=1; else rc=0; fi
+  ck "(2952c) a SECOND unreadable surface (issue landed, its own cause) is NOT re-routed — the work itself is unjudged" $rc
+  case "$(cat "$TMP/2952-b3.out")" in
+    *"?#10 INCOMPLETE from the pre-flight"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952c) …and it is the pre-flight's INCOMPLETE arm that refused it (the guard fired, it did not no-op)" $rc
+  # ── (2952d) A DIFFERENT ADVERB IS STILL THE SAME CONTRACT ────────────────────────────────────
+  # This is the arm that makes the fix a CONTRACT rather than a widened literal: the producer is not
+  # vendored, so the next reword must not silently re-break the re-route. Any `could not be … queried`
+  # renders the set; a verdict line with NO parenthetical at all renders nothing, and then the pass
+  # REFUSES **loudly** (the drift echo) instead of returning to a silent `0 dispatched`.
+  CELL2952D="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be PARTIALLY queried (issue assignee/holder); this is NOT clean')"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952D" b4
+  if r2952_is_queued "$CELL2952D"; then ck "(2952d) an adverb the producer has NOT used yet keeps the re-route alive (the anchor is 'queried (', not the phrase)" 0; else ck "(2952d) an adverb the producer has NOT used yet keeps the re-route alive (the anchor is 'queried (', not the phrase)" 1; fi
+  # (2952e) …and the DRIFT case is REFUSED **and ANNOUNCED**: no parenthetical → nothing to re-route
+  # on, plus a WARN naming the drift. Silence here is what cost six days on cell4.
+  CELL2952E="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) is unreadable; this is NOT clean')"
+  r2952_run "$CELL2952E" b5
+  if r2952_is_queued "$CELL2952E"; then rc=1; else rc=0; fi
+  ck "(2952e) a verdict line with NO surface list is NOT re-routed (drift fails CLOSED)" $rc
+  case "$(cat "$TMP/2952-b5.out")" in
+    *"WARN: #10 the pre-flight's VERDICT LINE carried no readable surface list"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952e) …and the drift is ANNOUNCED, not swallowed (a silent no-op is what must not recur)" $rc
+
+  # ── (2952f–i) THE CELL'S REAL SHAPE: TWO SURFACES, ONE CAUSE (agent-infra#2952) ─────────────────
+  # ⛔ (2952a)–(2952e) ABOVE PINNED THE *PARSER* — they all carry a verdict line naming ONE surface,
+  # which is NOT the shape a cell produces. #2952's headline defect is the one they cannot see: the
+  # claim gate ABORTS the whole issue scan on a cell, so the producer records ONE inability as TWO
+  # unreadable surfaces, both carrying the SAME board note:
+  #   `2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder)`
+  # #1935 required the holder surface to be named ALONE, so `HOLDER_ONLY` was 0 for every cell
+  # candidate and the substitution could never fire — measured as `12 unjudged`, `227 not reached`,
+  # `0 dispatched`, every pass, with the whole pre-flight budget spent refusing candidates the box
+  # could have judged. The condition is the CAUSE, so these arms key on it:
+  #   (f) every named surface's cause is the unanswerable board + the holder is named → JUDGED;
+  #   (g) …and an UNREADABLE registry is still INCOMPLETE (the substitution moves the requirement,
+  #       it does not remove it) — the same report, only the registry's verdict changed;
+  #   (h) a board-caused set that does NOT name the holder surface → refused (nothing to substitute);
+  #   (i) a surface the verdict line NAMES but the parser cannot read a cause for → refused,
+  #       because "no cause" must never satisfy "every cause is the board".
+  # ⛔ (g) IS THE POLARITY ARM AND IT IS DELIBERATELY THE *SAME FIXTURE* AS (f): if the two ever
+  # disagree the difference is the registry's answer and nothing else, so a mutant that drops the
+  # registry requirement reds (g) while (f) stays green — which is what makes (f) non-vacuous.
+  cat > "$TMP/cell2952-multi.report" <<'REPORT'
+issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv')
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read (FileNotFoundError: [Errno 2] No such file or directory: '/home/cmux/.pi/agent/state/lane-registry.tsv')
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean for #2218 in daniel-ospina/tortoise — PART of this is the LANE ROSTER is UNKNOWN (not empty)
+REPORT
+  CELL2952F="$(holder_report x "$(cat "$TMP/cell2952-multi.report")")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952F" f1
+  if r2952_is_queued "$CELL2952F"; then rc=0; else rc=1; fi
+  ck "(2952f) the CELL's real verdict (TWO surfaces, ONE board cause) is JUDGED — the registry answers the one open question" $rc
+  case "$(cat "$TMP/2952-f1.out")" in
+    *"the pre-flight's HOLDER surface could not answer"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(2952f) …and it was the HOLDER substitution that judged it (not a silently different CLEAN path)" $rc
+  # (2952g) THE POLARITY, ON THE SAME REPORT: the substitution moves the requirement from "a local
+  # board must answer" to "the cross-box registry must answer". An unreadable registry answers
+  # nothing, so the candidate is INCOMPLETE and is neither queued nor retired.
+  CELL2952G="$(holder_report x "$(cat "$TMP/cell2952-multi.report")")"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="the registry could not be read (stub)"; return 2; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952.sh"
+  r2952_run "$CELL2952G" f2
+  if r2952_is_queued "$CELL2952G"; then rc=1; else rc=0; fi
+  ck "(2952g) …with an UNREADABLE registry the SAME report is still INCOMPLETE — the cause keys the arm, not the count" $rc
+  case "$(tr '\n' ' ' < "$CELL2952G/checked.txt")" in *10*) rc=1 ;; *) rc=0 ;; esac
+  ck "(2952g) …and not retired (a claim is a window, so the candidate is re-attempted next pass)" $rc
+  # ⛔ A READABLE REGISTRY IS WHAT MAKES (h) AND (i) FALSIFIABLE (review P1, this round). (g) leaves
+  # the shared stub at rc 2, and with an UNREADABLE registry EVERY candidate below is refused by the
+  # registry requirement ALONE — so both arms read green even with the whole cause-set condition
+  # deleted, and the membership test they are recorded as pinning had NO assertion that could turn
+  # red (measured: the mutant queues neither, on either stub). Re-stub it READABLE: the refusal must
+  # then come from the membership test and nothing else, or the two arms are decoration.
+  {
+    printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'
+    cat "$TMP/refreshloop.sh"
+  } > "$TMP/refreshloop-2952.sh"
+  # (2952h) A BOARD-CAUSED SET WITHOUT THE HOLDER SURFACE. The cause matches, so the cause alone would
+  # re-route it — but there is no holder answer to substitute, so nothing may be judged.
+  # ⛔ WHAT THIS ARM DOES *NOT* PIN (review P1, this round): it cannot red from the cause-set condition
+  # alone. With the condition DELETED the candidate is still refused, because the substitution's own
+  # downstream requirement — a parsed `issue assignee/holder` ROW whose note is the board's (the
+  # `holder_note` gate below, #1935/#1977) — has nothing to match. So this arm is a pin on the
+  # COMPOSITE refusal (defence in depth: it reds only if BOTH that gate and the condition are gone),
+  # and it is NOT the assertion that condition 3 is live. (2952i) is, and was rebuilt to be.
+  CELL2952H="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be FULLY queried (issue landed); this is NOT clean')"
+  r2952_run "$CELL2952H" f3
+  if r2952_is_queued "$CELL2952H"; then rc=1; else rc=0; fi
+  ck "(2952h) a board-caused INCOMPLETE that does NOT name the holder surface is REFUSED (nothing to substitute)" $rc
+  # (2952i) A SURFACE THE VERDICT LINE NAMES, WITH NO CAUSE THIS READER CAN FIND. The cause test is
+  # SET MEMBERSHIP over the parsed rows, so an unparsed surface has no cause at all — and "no cause"
+  # must never read as "the board's cause", or the arm fails OPEN on a parser miss.
+  # ⛔ THE HOLDER ROW *IS* PARSED HERE, DELIBERATELY (review P1, this round). The earlier fixture named
+  # the holder in the verdict line and left its row out, which meant the downstream `holder_note` gate
+  # refused the candidate whatever this condition did — the arm read green with the whole condition
+  # deleted (measured, M4), so it pinned nothing. The absent surface is therefore a THIRD one (`open
+  # PRs`, a real slug — see the D5 fixture above) while BOTH board-caused rows are present: the holder
+  # answer exists and the registry is READABLE, so the ONLY thing between this candidate and the
+  # registry is the membership test. That is what makes the arm able to fail, and it is the FAIL-OPEN
+  # it now pins: a surface the tool could not read is queued as verified.
+  CELL2952I="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+INCOMPLETE SURFACES
+  [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 3 surface(s) could not be FULLY queried (issue landed, issue assignee/holder, open PRs); this is NOT clean')"
+  r2952_run "$CELL2952I" f4
+  if r2952_is_queued "$CELL2952I"; then rc=1; else rc=0; fi
+  ck "(2952i) a surface NAMED by the verdict line but ABSENT from the parsed set is REFUSED (no cause is not the board's)" $rc
 fi
 
 # ── 5m) REPO has NO path default — required, or derived from a checkout of the QUEUE's repo ─────
@@ -1648,7 +1913,12 @@ mem_def="$(dval MIN_MEM_FREE_MB)"
 swp_def="$(dval MIN_SWAP_FREE)"
 [ "$mem_def" = "512" ] && rcd=0 || { rcd=1; echo "      MIN_MEM_FREE_MB resolves to '$mem_def' -- README documents 512"; }
 ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped files" $rcd
-GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
+# ⛔ BY THE MARKERS, NOT BY `^  fi$` (agent-infra#2924/#2927). The chain's closing `fi` used to be the
+# only bare `  fi` after the entry line, so the extraction could stop there; the gate VECTOR put each
+# arm in its own guard, and several of those guards close on a bare `  fi` — the first one truncated
+# the block to the merge-priority arm, ELEVEN assertions still passed and the three below went red.
+# A marker is the range the code itself declares, so adding an arm cannot silently shorten the test.
+GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/# \[gatevec:end\]/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
 mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]
@@ -3172,35 +3442,39 @@ fi
 # NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
-# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
-# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
-# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
-# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
-# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
-# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
-# With nesting, the two populations are disjoint by construction, so each is counted directly. The
-# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
-# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
-# ⛔ THREE fixer defer arms, in TWO spellings (#2333 review, P2). Two sites write the predicate as
-# the WHOLE condition (`if ciq_push_ok; then`, counted by `fixer_defer_sites`); the REVIEW-GATE site
-# SHARES the condition with its own eligibility (`if [ "$_fix_eligible" = "1" ] && ciq_push_ok;
-# then`), which the literal pattern cannot see — so without `fixer_defer_shared`, deleting that
-# `&& ciq_push_ok` left this check green while the site stopped deferring. (The fourth CI-queue
-# defer, the #PR CI RERUN, is not a fixer spawn and is pinned by ci-queue.test.sh's wiring arms.)
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY, AND IN BOTH DIRECTIONS.
+# ⛔ THE FIXER DEFER COUNT IS NOW ZERO ON PURPOSE (#2927). The three fixer spawn sites used to nest a
+# `ciq_push_ok` deferral inside their own eligibility. They no longer do: a fixer is REPAIR — it acts
+# on a PR that already exists — so the class rule in ci-queue.sh's header excludes it from queue
+# gating. ⛔ NOT because "its pass is already spent" (a repair push DOES start a fresh run): the basis
+# is #2927's decision plus the measurement that the NUMBER was demand read as supply. Measured 2026-10-27 on cell 4, that gate skipped 41
+# consecutive repair dispatches while 8 self-hosted runners and ~11 lane slots sat idle, against a
+# queue depth that belonged to GitHub-HOSTED concurrency and to NEW-PR work.
+# So `fixer_defer_sites`/`fixer_defer_shared` are pinned at 0: a gate RE-ADDED to any fixer arm
+# reddens this line, and `fixer_sites` still pins the load gate each one carries. The one CI-queue
+# defer that survives is the #PR CI RERUN (`! ciq_push_ok`), which genuinely ADDS a run to the queue;
+# it is not a fixer spawn and is pinned both here and by ci-queue.test.sh's wiring arms.
 fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
 fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
+rerun_gate=$(grep -cF '! ciq_push_ok' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
-merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
+# ⛔ AND THE REVIEW ORDER IS ITS OWN SPAWN SITE (agent-infra#2971). The re-record arm used to spawn
+# under the `merge-<PR>` tag and compare against `wt_count merge-)`; it now dispatches `review-<PR>`
+# and compares against `wt_count review- merge-)` (one review-lane budget across both tag families,
+# the semantics the ceiling always had). Without this the literal pattern above would stop seeing the
+# site — the count would read 1 and this check would be pinning half of what it names.
+merge_site=$(grep -E 'wt_count (review- )?merge-\)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
-[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
-ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
-[ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
-ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
+[ "$fixer_defer_sites" = "0" ] && rc=0 || rc=1
+ck "NO fixer spawn arm is CI-queue-gated (#2927 — a fixer is REPAIR; found $fixer_defer_sites, expected 0)" $rc
+[ "$fixer_defer_shared" = "0" ] && rc=0 || rc=1
+ck "…and the review-gate fixer's eligibility no longer shares a queue gate either (found $fixer_defer_shared, expected 0)" $rc
+[ "$rerun_gate" = "1" ] && rc=0 || rc=1
+ck "…while the one act that ADDS a run to the queue — the CI rerun — is still gated (found $rerun_gate, expected 1)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
-ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
+ck "both merge spawn sites (the review order review-<PR> + rail-mode GREEN merge-<PR>) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1

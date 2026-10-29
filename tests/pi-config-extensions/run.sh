@@ -60,6 +60,26 @@
 #      .ts files load) and bin/agent-infra.js farms a dot-named manifest row
 #      verbatim, so exempting it would make this suite bless a false PASS. The
 #      furniture exemption is narrowed to dot names with no extension shape
+#  24. a *.test.ts in the LIVE farm (check 6, #1509)                       → BLOCK
+#  25. a *.spec.ts in the LIVE farm (check 6, #2841)                      → BLOCK
+#      The pre-#2841 check matched `*.test.ts` only, so the other three names pi
+#      EXECUTES (`*.spec.ts`, `*.test.js`, `*.spec.js` — the loader loads a
+#      top-level `.ts` OR `.js`) passed a gate whose whole subject is "pi must not
+#      execute a test from this farm": a false PASS, not a cosmetic miss.
+#  26. a *.test.js in the LIVE farm (check 6, #2841)                      → BLOCK
+#  27. a test file NESTED in a live farm SUBDIRECTORY (check 6, #2841)     → PASS
+#      pi never loads it: `collectAutoExtensionEntries` resolves a subdirectory
+#      through its `pi.extensions` rows, else index.ts/index.js, and
+#      never recurses. The pre-#2841 check failed it anyway — 62 such files on the
+#      reporting box, none reachable by the loader, and because `sync.sh` runs this
+#      gate under `set -e` that red aborted every `./sync.sh` there. Pinned in BOTH
+#      directions: exit 0 AND the ⏭️ line still NAMES it (never a silent skip).
+#  28. a live farm subdirectory whose `pi.extensions` row names a test
+#      file (check 6, #2841)                                             → BLOCK
+#      `resolveExtensionEntries` executes those rows verbatim, so this IS loaded;
+#      no filename glob can see it, which is why check 6 reads package.json.
+#      ⛔ The key is `pi.extensions`: `readPiManifest` returns null without a `pi`
+#      object, so a TOP-LEVEL `extensions` key is ignored by pi (case 31).
 #
 # Fixture trees mirror the real farm: relative symlinks ../../../extensions/<e>
 # from pi-bootstrap/pi-config/extensions/ into extensions/, plus a manifest.json
@@ -114,7 +134,9 @@ write_manifest() {
 #       live-dangling | ignored-node-modules | mixed-ignored | no-git |
 #       all-untracked | nested-git | newline-name | dash-name |
 #       dangling-ext | dotfile-ext | dot-extension | dotdot-untracked |
-#       live-test-file
+#       live-test-file | live-spec-file | live-test-js | live-nested-test |
+#       live-pkg-row-test | live-root-pkg-row-test | live-root-short-circuit |
+#       live-top-level-ext-key | live-dir-named-like-test
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -227,14 +249,89 @@ build_farm() {
     live-healthy)  mkdir -p "$TMP/live-extensions"
                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts" ;;
     # #1509 — a *.test.ts in the LIVE materialised dir. pi's extension loader
-    # executes every `.ts` it finds there, so this is not a test: it runs its
-    # suite at session start and that output becomes the session's answer.
+    # executes every top-level `.ts`/`.js` it finds there, so this is not a test:
+    # it runs its suite at session start and that output becomes the session's answer.
     live-test-file) ln -s ../../../extensions/b.ts "$FARM/b.ts"   # farm otherwise fine, like live-healthy, so exit 1 is attributable to check 6 ALONE
                     mkdir -p "$TMP/live-extensions"
                     ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
                     touch "$TMP/live-extensions/leaked.test.ts" ;;
+    # #2841 — the names the pre-fix check could not see, each LOADED at top level
+    # by pi's loader (`.ts` OR `.js` → an extension).
+    live-spec-file) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    touch "$TMP/live-extensions/leaked.spec.ts" ;;
+    live-test-js)   ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    touch "$TMP/live-extensions/leaked.test.js" ;;
+    # #2841 — a test file NESTED in a farm subdirectory. pi resolves the subdirectory
+    # through package.json/index and never recurses, so this is INERT: it must not
+    # fail the gate (the measured 62-file false block) and must not be skipped
+    # silently either.
+    live-nested-test) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions/pkg"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/pkg/index.ts"
+                    : > "$TMP/live-extensions/pkg/leaked.test.ts" ;;
+    # #2841 — the third load path: `resolveExtensionEntries` executes a subdirectory's
+    # `pi.extensions` rows verbatim, so a row naming a test file IS loaded while
+    # every filename-glob check is blind to it. ⛔ The key is `pi.extensions` —
+    # `readPiManifest` returns null without a `pi` object, so a top-level
+    # `extensions` key would be ignored by pi and case 31 pins that inversion.
+    live-pkg-row-test) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions/pkg"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/pkg/index.test.ts"
+                    printf '{\n  "name": "pkg",\n  "pi": { "extensions": ["index.test.ts"] }\n}\n' \
+                      > "$TMP/live-extensions/pkg/package.json" ;;
     live-dangling) mkdir -p "$TMP/live-extensions"
                    ln -s "$TMP/extensions/gone.ts" "$TMP/live-extensions/a.ts" ;;
+    # #2841 review — the FIRST branch of the loader the gate quotes: the farm
+    # ROOT's own `pi.extensions` rows are returned by `resolveExtensionEntries(dir)`
+    # and `collectAutoExtensionEntries` returns THERE, skipping the whole directory
+    # scan. A root row naming a test file is therefore executed by pi while every
+    # filename glob — and the subdirectory arm — is blind to it (the top-level
+    # entry's basename is the SUBDIRECTORY, `pkg`, not the row's target).
+    live-root-pkg-row-test) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions/pkg"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/pkg/leaked.test.ts"
+                    printf '{\n  "name": "farm-root",\n  "pi": { "extensions": ["pkg/leaked.test.ts"] }\n}\n' \
+                      > "$TMP/live-extensions/package.json" ;;
+    # #2841 review — the OTHER side of the root short-circuit: when the root
+    # resolves entries, the loader never runs its directory scan, so a TOP-LEVEL
+    # test-shaped entry is inert. Failing on it would be the #2425 false-block
+    # class this PR exists to stop; naming it keeps the skip honest.
+    live-root-short-circuit) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/leaked.test.ts"
+                    printf '{\n  "name": "farm-root",\n  "pi": { "extensions": ["a.ts"] }\n}\n' \
+                      > "$TMP/live-extensions/package.json" ;;
+    # #2841 review (round 2) — the INVERSION GUARD. pi's `readPiManifest` requires a
+    # `pi` object and reads `pi.extensions`; a TOP-LEVEL `extensions` key is ignored
+    # entirely, so the loader falls through to its directory scan and DOES execute
+    # the top-level test file. A gate that read the top-level key would call this
+    # farm short-circuited and stay GREEN over a file pi runs — the exact regression
+    # this case exists to make impossible to reintroduce.
+    live-top-level-ext-key) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/leaked.test.ts"
+                    printf '{\n  "name": "farm-root",\n  "extensions": ["a.ts"]\n}\n' \
+                      > "$TMP/live-extensions/package.json" ;;
+    # #2841 review (round 2) — the loader's `isFile` branch: a DIRECTORY named
+    # `*.test.ts` is routed to `resolveExtensionEntries`, never executed AS A FILE,
+    # so the top-level arm must not indite it (a false block, #2425 class). The
+    # fixture RESOLVES an entry (`index.ts`) on purpose: an EMPTY directory is
+    # routed to the same branch and returns null, so it cannot tell "the loader
+    # skips it" from "the loader runs what it resolves" — and the second claim is
+    # the one the arm's comment is written against.
+    live-dir-named-like-test) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions/weird.test.ts"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/weird.test.ts/index.ts" ;;
   esac
 
   # #2425 — checks 3/4a read the GIT INDEX, so every fixture is a real repo with
@@ -456,6 +553,94 @@ run_gate 1 "test file in the live farm" live-test-file \
   "test file(s) in the live extension farm" \
   "leaked.test.ts" \
   "!symlink farm into extensions/"
+
+echo ""
+echo "25. #2841 — a *.spec.ts in the LIVE farm is EXECUTED too (the pre-fix check was green over it)"
+run_gate 1 "spec file in the live farm" live-spec-file \
+  "test file(s) in the live extension farm" \
+  "leaked.spec.ts" \
+  "!symlink farm into extensions/"
+
+echo ""
+echo "26. #2841 — a *.test.js in the LIVE farm is EXECUTED too (the loader loads '.js', not just '.ts')"
+run_gate 1 "js test file in the live farm" live-test-js \
+  "test file(s) in the live extension farm" \
+  "leaked.test.js" \
+  "!symlink farm into extensions/"
+
+echo ""
+echo "27. #2841 — a test file NESTED in a farm subdirectory is INERT: not fatal, but NAMED"
+# The negative half is the pin: this case exists because the old `-maxdepth 3`
+# `find` failed 62 files the loader cannot reach and thereby aborted every
+# `./sync.sh` on the reporting box. A future "just widen the find again" edit
+# reddens this case, and the named-note assertion keeps the skip honest.
+run_gate 0 "nested test copy is inert" live-nested-test \
+  "symlink farm into extensions/" \
+  "not gated (test copy NESTED in a farm subdirectory" \
+  "pkg/leaked.test.ts" \
+  "!test file(s) in the live extension farm"
+
+echo ""
+echo "28. #2841 — a farm subdir's package.json pi.extensions row naming a test file IS loaded"
+# ⛔ The key is `pi.extensions` (readPiManifest requires a `pi` object). Case 31
+# pins the inversion: a top-level `extensions` key is IGNORED by pi, so reading it
+# here would both green a loaded file and red an unloaded one.
+run_gate 1 "pi.extensions row names a test file" live-pkg-row-test \
+  "test file(s) in the live extension farm" \
+  "pkg: pi.extensions row" \
+  "-> index.test.ts" \
+  "!symlink farm into extensions/"
+
+echo ""
+echo "29. #2841 review — the farm ROOT's pi.extensions row naming a test file IS loaded"
+# The root short-circuit is the FIRST branch of the loader the header quotes. A
+# gate that models only the top-level and subdirectory rows exits 0 here while
+# telling the reader "nothing here executes today" about a file pi runs at every
+# session start — a false PASS over the exact condition this check exists for.
+run_gate 1 "root pi.extensions row names a test file" live-root-pkg-row-test \
+  "test file(s) in the live extension farm" \
+  "pi.extensions row" \
+  "-> pkg/leaked.test.ts" \
+  "!symlink farm into extensions/" \
+  "!not gated"
+
+echo ""
+echo "30. #2841 review — a ROOT that resolves entries makes a top-level test file INERT (named, not fatal)"
+# The other direction of case 29, and the reason it is not a one-line widening:
+# `collectAutoExtensionEntries` returns the root's entries BEFORE its directory
+# scan, so `leaked.test.ts` cannot load. Failing it would re-create the measured
+# #2425 false block (a red that aborts every `./sync.sh` under set -e).
+run_gate 0 "root short-circuit makes a top-level test file inert" live-root-short-circuit \
+  "symlink farm into extensions/" \
+  "not gated (the farm ROOT resolves extension entries" \
+  "leaked.test.ts" \
+  "!test file(s) in the live extension farm"
+
+echo ""
+echo "31. #2841 review round 2 — a TOP-LEVEL \`extensions\` key is IGNORED by pi, so the scan still runs"
+# `readPiManifest` returns null unless the package.json carries a `pi` OBJECT and
+# reads `pi.extensions`; a top-level `extensions` key never reaches
+# `resolveExtensionEntries`, which falls back to index.ts/index.js (absent here),
+# so `collectAutoExtensionEntries` runs its directory scan and EXECUTES
+# `leaked.test.ts`. A gate reading the top-level key would call this farm
+# short-circuited and stay GREEN over a file pi runs at every session start.
+run_gate 1 "top-level extensions key does not suppress the directory scan" live-top-level-ext-key \
+  "test file(s) in the live extension farm" \
+  "leaked.test.ts" \
+  "!not gated (the farm ROOT resolves extension entries" \
+  "!symlink farm into extensions/"
+
+echo ""
+echo "32. #2841 review round 2 — a DIRECTORY named *.test.ts is not a test FILE (no false block)"
+# The loader's top-level branch requires `isFile`; a directory is routed to
+# `resolveExtensionEntries`. This fixture RESOLVES one (`index.ts`), so the arm is
+# exercised against the loader's real isDir behaviour rather than against a directory
+# that happens to return null — while the directory's NAME is still not a test file,
+# so inditing it would be the gate's own #2425-class false block.
+run_gate 0 "a directory named like a test is not a test file" live-dir-named-like-test \
+  "symlink farm into extensions/" \
+  "!test file(s) in the live extension farm" \
+  "!weird.test.ts"
 
 echo ""
 if [ "$failures" -gt 0 ]; then

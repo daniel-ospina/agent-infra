@@ -51,6 +51,14 @@ State lives under `${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}/<rep
 joined into a
 path; a directory with neither a `log` nor a `repo` — e.g. the `.starting` claim — is not a run). Knobs: `RAIL_RUN_DIR`, `RAIL_RUN_RAIL` (the rail, default `admin-merge.sh` beside
 this script), `RAIL_RUN_REPO_SLUG` (pin the repo identity instead of resolving `origin`),
+`RAIL_RUN_GH_HOST` (pin the **web host** the artifact URL must name — for a checkout whose `origin`
+names a mirror, an ssh alias, or a transport port that the web URL never carries. The host is RECORDED
+with the run at `start` and a poll only reads that record, so this knob takes effect on the NEXT run,
+not on a re-poll of a live one. Precedence at `start`: the host comes from **the same value the slug
+came from** — `--repo` when it is given, otherwise `RAIL_RUN_REPO_SLUG`, otherwise `origin`. A value that
+names no host (a bare `owner/repo`) falls back to this knob, then `origin`; `github.com` when none of them
+names one. ⛔ `--repo` PRE-EMPTS the pin, so a bare `--repo owner/repo` falls back to this knob (then
+`origin`) even when `RAIL_RUN_REPO_SLUG` names a host — the pin is read only when it supplied the slug),
 `RAIL_RUN_CLAIM_MAX` (60 s) and `RAIL_RUN_RECORD_MAX` (24 h). **Both must be positive integers**: an
 unreadable value is refused at load (`exit 2`, naming the knob) rather than silently used, because an
 erroring `[ -le ]` answers "not young", which would judge a live claim stale and let a second rail
@@ -114,8 +122,12 @@ load-bearing distinctions honest:
   (`a/b-c` and `a-b/c` share one).
   **The host comes from the same value as the slug.** When `--repo` — or the checkout-wide
   `RAIL_RUN_REPO_SLUG` pin, which is spelled the same way — is given as `[HOST/]OWNER/REPO`, the host
-  it names is recorded; only a bare `owner/repo` (or no identity argument at all) falls back to
-  `origin`. Reading the host from `origin` while the slug came from `--repo` (or from the pin, which is
+  it names is recorded; a value that names no host (a bare `owner/repo`, or no identity argument at
+  all) falls back to `RAIL_RUN_GH_HOST` and then to `origin`. ⛔ **The pin's host is used only when the
+  pin supplied the slug**: a bare `--repo owner/repo` takes the slug from argv, so the host falls back
+  to the knob and then `origin` even when `RAIL_RUN_REPO_SLUG` names a host (`start`: `raw_slug` is not
+  re-resolved from the pin once `--repo` is present).
+  Reading the host from `origin` while the slug came from `--repo` (or from the pin, which is
   the seam for a checkout whose `origin` does *not* name its repo) recorded a `github.com/<slug>` pair
   for a target on another host, so the artifact check demanded a URL that host never serves and
   `landed` was unreachable — fail-closed, but a run nobody could land.
@@ -174,7 +186,7 @@ Three stated residuals:
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
 ```
 
-**207 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; the only number asserted anywhere is the pass/fail line). The suite is mostly
+**249 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; the only number asserted anywhere is the pass/fail line). The suite is mostly
 negative — `running` must never read as landed or refused, `rc=0` is not a landing when the artifact
 disagrees, `gone-without-verdict` is never a landing *or* claimed over an unread artifact, an
 unreadable liveness or PR read abstains, a live pid with the wrong incarnation is not "running", a

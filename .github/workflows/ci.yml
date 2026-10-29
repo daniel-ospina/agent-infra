@@ -817,6 +817,27 @@ jobs:
         # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
         # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/reviewer-preflight.test.ts
+      - name: Headless-lane contract suite (#2965, zero-dep)
+        # #2965 — a guard must judge what the process IS, not who launched it. `lane.sh` exports
+        # SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless `pi -p` started any other way (a
+        # cloud-cell dispatch, a hand-run "pi -p … --no-session") got the gates and none of the
+        # affordances, so its `git commit` was refused and the lane exited with ZERO commits —
+        # measured 2026-10-27, and silent, because nothing fails loudly when a gate simply says no.
+        # This suite builds a REAL hub and REAL linked worktrees with git and pins BOTH arms: a
+        # derived lane acts, the hub stays guarded. Both halves matter — a suite that only pinned
+        # the worktree arm would accept a change that lifted the hub gate (what #618/#621 measured).
+        # Zero-dep (`node:*`, ./headless-lane.js, ../skill-enforcer.js, the `git` binary), so it runs
+        # in THIS job (no `npm ci`); the BLOCKING backstop is the post-merge ci-main.yml
+        # `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/headless-lane.test.ts
+      - name: Headless-lane contract MUTATION evidence (#2965, zero-dep)
+        # The suite above is only a pin if it can FAIL. Mutations reintroduce each arm's defect —
+        # the derivation reverted so a linked worktree no longer derives a lane, and the historical
+        # path-insensitive fail-open that treats EVERY checkout as a linked worktree (#618/#621) —
+        # into a TEMP copy of the module, and into the wiring through the contract seam, requiring
+        # each paired assertion to go RED and printing it verbatim. Its own step so neither verdict
+        # can suppress the other (the rule every sibling suite here follows).
+        run: npx tsx extensions/shared/headless-lane.test.ts --mutations
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
