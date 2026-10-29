@@ -233,6 +233,11 @@ export SYSTEMD_UNIT_DIR="$T/systemd-units"
 # directory is derived from it.
 export CONTROLLER_SYSTEM_UNIT_DIR="$T/systemd-units"
 export HOME="$T/home"
+# The one-home check (#2916) refuses a cell-state path under a volatile root that is NOT under
+# CELL_HOME. This fixture's home IS under the host's temp dir, so the shipped default (`/tmp:/var/tmp`)
+# would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
+# SYSTEMD_UNIT_DIR above; the shipped default is what cloud-cell-bringup.verify.test.sh's red arms use.
+export CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root
 export SYSTEMCTL="$STUB/systemctl"
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
