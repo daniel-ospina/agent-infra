@@ -1,0 +1,14 @@
+# `github.workflow_ref` is `{owner}/{repo}/.github/workflows/{file}@{ref}` — distinct per PR and stable
+# across heads, so a group keyed on it ALONE is per-PR. The four-spelling key list refused it, which also
+# contradicted the round-12 message that called it compliant (#2660 round 14).
+name: pr group workflow ref alone
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow_ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
