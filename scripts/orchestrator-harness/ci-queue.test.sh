@@ -196,10 +196,16 @@ ck "(b6b2) …it takes the documented 1-runner floor (got: ${v})" "$?"
 feed 5 499999999 -
 ciq_read "$OR" >/dev/null 2>&1
 v="$(ciq_eval)"
+# ⛔ THE ORDER CONSTRAINT IS PART OF THIS ARM (#2969 review cycle 2, P2), carried onto #2927's
+# VALUES. Two independent `has()` calls accept `ceiling=2 runners=~1` — the derivation BEFORE its
+# input, which `ciq_eval` never emits (`runners=%s ceiling=%s`, input first) — where a single
+# ordered glob refuses it. `[[ ]]`, not `case`, because this file must never reintroduce the
+# `case`-in-`$( )` shape it exists to catch.
 has "$v" 'ceiling=2'
 ck "(b6c) an absurd \`running\` is never made the ceiling (got: ${v})" "$?"
 has "$v" 'runners=~1'
 ck "(b6c2) …and it is never made the FLEET either" "$?"
+ck "(b6c1) …and the two tokens appear in DERIVATION order: input \`runners=\` before \`ceiling=\` (got: ${v})" "$( [[ $v == *'runners=~1'*'ceiling=2'* ]]; echo $? )"
 # ⛔ THE MEASURED DEFECT, ARMS (b6d)/(b6e) — 2026-10-27, cell 4 (#2927). The live line was
 # `runners=~2 => ceiling=4 => DEEP` with `queued=33 running=2` on a repo whose 8-registered fleet was
 # all online and idle: the ceiling was derived from the jobs EXECUTING, so the gate read the box's own
@@ -1299,6 +1305,330 @@ else
   mline="$(grep -F 'actions/runners' "$args_f" | tail -1)"
   ck "(o2) MUTANT — without the flag the invocation loses it (recorded: ${mline:-<no such call>}), so (o1) is not always-green" \
      "$( has "$mline" 'actions/runners --paginate'; [ $? -ne 0 ]; echo $? )"
+fi
+
+# ── (p) THE SHAPE `bash -n` CANNOT SEE: a `case` INSIDE `$( )` (#2969) ───────────────────────
+# ⛔ WHY A `bash -n` ARM WOULD HAVE PROVED NOTHING. `bash -n` parses the OUTER script only, so it
+# answered rc 0 on a module that could not run: the substitution is re-parsed at EXECUTION, and on
+# bash 3.2 — macOS's `/bin/bash`, which is the interpreter `launchd` starts the controller with
+# (`com.eldato.orchestrator-loop.plist` → `/bin/bash …/launchd-controller.sh`) — the `)` that closes
+# a `case` PATTERN is read as the closer of the `$( )`. Measured on the box that filed the defect:
+#
+#   $ /bin/bash ci-queue.sh status --repo daniel-ospina/agent-infra
+#   deep(queued=55 running=5 runners=2 busy=2 ceiling=4 derived=ceil(2*20/10) state=fresh)
+#   ci-queue.sh: command substitution: line 596: syntax error near unexpected token `newline'
+#   ci-queue.sh: command substitution: line 596: ` case "${CIQ_STATE}" in fresh'
+#   repo=… state=fresh source= printf 'gh' ;; cache) printf 'record(cache)' ;; … esac ) age=0s
+#   rc=0      ← a CORRUPTED field under a GREEN exit
+#
+# ⛔ AND WHY THE OBVIOUS FIX IS NOT A FIX, which is why this arm forbids the CONSTRUCT rather than one
+# spelling of it. Every shape below measured with /bin/bash 3.2.57, the box's own interpreter:
+#   in fresh)                  → the substitution closes at `fresh)`; `source=` is literal leftovers
+#   in *fr*)                   → same
+#   in (fresh) … *) …          → STILL FAILS: `(` shields only its own pattern, and the `*)`
+#                                catch-all's `)` closes the substitution
+#   in (fresh) … (*) …         → parses — but only while EVERY pattern stays parenthesised, which is
+#                                a trap for the next editor rather than a rule
+#   if/then/else, or hoisted   → parses, because no `)` in the text terminates a pattern
+# A `case` is therefore allowed DIRECTLY in a shell script and NOT allowed inside a command
+# substitution: hoist it into a variable first. (bash 4.4+ parse every shape above correctly, which
+# is exactly why the defect could not be seen on the machine that wrote it — the failing population
+# is bash 3.2, the version the controller actually runs.)
+# ⛔ WHAT THIS ARM CAN AND CANNOT FIRE, DECLARED RATHER THAN IMPLIED: the DETECTOR (p1)-(p2) is
+# portable and carries the red-proof on EVERY host, including CI's bash 5 where the runtime shape
+# parses fine. The RUNTIME arm (p3)-(p4) needs a bash 3.x interpreter to fire, and on a box whose
+# only bash is 4.4+ it reports a DECLARED notice instead of a pass — a runtime arm that silently
+# cannot run is the same lie as a gate that cannot run.
+
+# cis_in_comsub <file> -> "<file>:<line>" for every `case` that sits inside a `$( )`.
+# THE RULE, PRECISELY: scan each line CHARACTER by character, keeping a running DEPTH of open `$(`
+# substitutions, and report a line on which the `case` keyword appears while depth > 0.
+# ⛔ DEPTH, NOT "is there a `)` before the `case` on this line" (review cycle 1, P2). The earlier
+# LINE-SCOPED spelling — walk each `$(` on the line, report if no `)` precedes the `case` — had two
+# blind spots, and BOTH are the defect this arm exists to catch, so it advertised a rule it did not
+# enforce:
+#   * MULTI-LINE: `x="$(` / `  case "$s" in` / `  esac` / `)"` — the line holding the `case` has no
+#     `$(`, so nothing was reported. bash 3.2's paren counting is line-agnostic; the detector was not.
+#   * NESTED: `$(printf %s "$(date)"; case "$s" in a) : ;; esac)` — the inner substitution's `)` was
+#     consumed by the `*')'*` guard, so a genuinely broken `case` after it was skipped.
+# Both were measured real in this repo, not hypothesised: the depth scanner reports 3 sites in
+# scripts/harness-surface.test.sh that the line-scoped form missed — :1160 is
+# `"$(if …; then case … esac; else … fi)"`, and :1287/:1307 are `"$(cmd; case … esac)"` — and 0 sites
+# the line-scoped form found are lost. ⛔ NAMED EXACTLY, because the CHARACTERISATION is what a future
+# editor acts on (#2969 review cycle 2, P2): calling all three "the if/then shape" told a reader that
+# only `$(if … then case …)` is caught, when the missed class also includes the `$(cmd; case …)`
+# spelling they would think safe to keep.
+# ⛔ DECLARED LIMITS, not silently assumed: it skips FULL-LINE comments (prose here discusses `case`
+# and `$( )`, and flagging prose would be a false positive) and it skips SINGLE-QUOTED SPANS, because
+# bash substitutes nothing there — a `$( )` in them can never be a substitution, and a `)` in them can
+# never close one.
+# ⛔ THE SKIP IS CONTEXT-AWARE, AND THAT IS NOT COSMETIC (#2969 review cycle 5, P2). bash reads a `'`
+# inside `"…"` as LITERAL TEXT, so a scanner that opened a single-quoted span at EVERY `'` swallowed
+# the rest of the line. Measured on the cycle-4 detector —
+#   x="$( printf "don't" ; case "$s" in a) : ;; esac )"
+# printed NOTHING, while the identical line without the apostrophe reported :1; the same bytes are a
+# genuine #2969-class defect on bash 3.2 (`syntax error near unexpected token 'newline'`), so (p1)
+# certified a broken module. `indq` (`"…"`) and `esc` (`\`) are tracked so `inq` opens only at a REAL
+# delimiter — and `$( )`/`case` inside `"…"` are still counted, because bash DOES substitute there.
+# Both flags are per-line, and an embedded `awk '…'`/heredoc body is still scanned as shell: that
+# over-reports (red, fail-closed) rather than claiming a skip it cannot see.
+# ⛔ THAT SECOND SKIP IS NOT COSMETIC — ITS ABSENCE WAS A FALSE PASS (#2969 review cycle 4, P2). The
+# earlier comment claimed "an unbalanced `)` inside a string … Neither shape exists in this module".
+# Measured: it does, three times. ci-queue.sh's multi-line reads close their `$( )` on a LATER line,
+# and the sed BRE sitting between the two halves carries `\(…\)` — e.g. the `queued=` read…
+#   :297  queued="$(ciq_gh … \
+#   :298              | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || queued=""
+# The scanner counted only `)` (a bare `(` is never counted), so the BRE's `\)` took depth 1 → 0 on
+# :298, one line BEFORE the substitution really closed: depth_at_EOL 297=1, 298=0, 299=1, 300=0. A
+# `case` added after that sed — a realistic recurrence of exactly this bug, since that is where
+# `ciq_gh`'s answer is post-processed — was therefore INVISIBLE: measured, a module with that `case`
+# reported `(p1) … (none)` and the whole suite went CLEAN at 133/0, while the same bytes on bash 3.2
+# printed `syntax error near unexpected token 'newline'` and reddened 34 arms.
+# ⛔ REMAINING LIMIT, stated because it is still real: a `)` that is literal TEXT inside `"…"` at
+# the level it closes is not distinguished from a substitution close, so it decrements depth early
+# (under-report, fail-open), and the reverse — a literal `$(` inside `"…"` — is counted as a
+# substitution, which over-reports and reds (fail-closed). The quote state is also PER LINE and reset
+# on every `$( )` boundary, so a `'` opened on one line is not carried into the next. None of these
+# shapes exists in this module today; the single-quoted case is handled, which is where every BRE in
+# this file lives.
+cis_in_comsub() {
+  local f="$1" n=0 depth=0 line i len ch prev nxt first found inq indq esc
+  while IFS= read -r line; do
+    n=$((n + 1)); found=0; inq=0; indq=0; esc=0
+    first="${line#"${line%%[![:space:]]*}"}"
+    case "$first" in '#'*) continue ;; esac
+    len=${#line}; i=0
+    while [ "$i" -lt "$len" ]; do
+      ch="${line:$i:1}"
+      # A single-quoted span is literal text to bash: nothing in it opens a `$( )` or closes one.
+      # Skipping it is what keeps a sed BRE's `\)` from closing the tracked depth early (see above).
+      if [ "$inq" -eq 1 ]; then
+        [ "$ch" = "'" ] && inq=0
+        i=$((i + 1)); continue
+      fi
+      # A backslash escapes the NEXT character. Inside `"…"` that is what stops `\"` from closing
+      # the span; outside any quote it is what stops `\$( ` from opening a substitution.
+      if [ "$esc" -eq 1 ]; then esc=0; i=$((i + 1)); continue; fi
+      case "$ch" in
+        '\\')
+          esc=1
+          ;;
+        '"')
+          if [ "$indq" -eq 1 ]; then indq=0; else indq=1; fi
+          ;;
+        "'")
+          # ⛔ ONLY A REAL DELIMITER OPENS A SPAN. Inside `"…"` an apostrophe is literal text, so
+          # opening a span here would swallow the rest of the line and hide a real `case` (#2969
+          # review cycle 5, P2) — the fail-open direction this whole arm exists to close.
+          [ "$indq" -eq 1 ] || inq=1
+          ;;
+        '$')
+          nxt="${line:$((i + 1)):1}"
+          if [ "$nxt" = '(' ]; then
+            depth=$((depth + 1))
+            # ⛔ QUOTING RESTARTS INSIDE A SUBSTITUTION. bash parses `$( … )` as a FRESH shell
+            # context, so `x="$( printf "don't" … )"` is not one long double-quoted span: the
+            # outer `"` is suspended for the length of the substitution and the inner quotes belong
+            # to it. Carrying the outer state in would swallow the inner `'` and hide a real `case`
+            # (measured, #2969 review cycle 5, P2).
+            indq=0; esc=0
+            i=$((i + 2)); continue
+          fi
+          ;;
+        ')')
+          if [ "$depth" -gt 0 ]; then depth=$((depth - 1)); indq=0; esc=0; fi
+          ;;
+        'c')
+          if [ "$depth" -gt 0 ] && [ "${line:$i:4}" = case ]; then
+            # whole-word only: `discase`/`casey` are not the keyword
+            prev=""; [ "$i" -gt 0 ] && prev="${line:$((i - 1)):1}"
+            nxt="${line:$((i + 4)):1}"
+            case "$prev" in ''|[!A-Za-z0-9_]) case "$nxt" in ''|[!A-Za-z0-9_]) found=1 ;; esac ;; esac
+          fi
+          ;;
+      esac
+      i=$((i + 1))
+    done
+    [ "$found" -eq 1 ] && printf '%s:%s\n' "$f" "$n"
+  done < "$f"
+}
+
+hits="$(cis_in_comsub "$MOD")"
+ck "(p1) the module carries NO \`case\` inside a \`\$( )\` (${hits:-none}) — the shape bash 3.2 re-parses at execution (DEPTH-scanned: the wrapped and nested spellings are pinned by (p1d)/(p1e), and the declared blind spot is a literal \`)\` inside a \"…\" closing the tracked depth early — stated, not assumed)" \
+   "$( [ -z "$hits" ]; echo $? )"
+
+# ⛔ THE APOSTROPHE-IN-A-DOUBLE-QUOTED-STRING SHAPE (#2969 review cycle 5, P2), and it is a PAIR so
+# the arm cannot pass on the fixture rather than on the quote state: the first line carries a real
+# `case` inside `$( )` AND an apostrophe in a `"…"` span (bash reads it as literal, so the `case`
+# really is substituted and really does break 3.2); its twin is the same bytes WITHOUT the apostrophe,
+# which the pre-fix scanner also reported — so a difference between them is the quote state alone.
+# The third is the TRUE NEGATIVE: a `case` in a genuinely single-quoted span is never substituted, so
+# reporting it would red the arm on a module that is fine, and the skip must not be over-applied.
+cqf="$T/comsub-quotes"; mkdir -p "$cqf"
+printf '%s\n' 'x="$( printf "don'\''t" ; case "$s" in a) : ;; esac )"' > "$cqf/apostrophe.sh"
+printf '%s\n' 'x="$( printf "dont" ; case "$s" in a) : ;; esac )"' > "$cqf/control.sh"
+printf '%s\n' 'x='\''$( case "$s" in a) : ;; esac )'\''' > "$cqf/single.sh"
+dqh="$(cis_in_comsub "$cqf/apostrophe.sh")"
+cth="$(cis_in_comsub "$cqf/control.sh")"
+sqh="$(cis_in_comsub "$cqf/single.sh")"
+ck "(p1a) a real \`case\` inside \`\$( )\` AFTER an apostrophe inside a \"…\" span IS reported (${dqh:-<missed>}) — that apostrophe is literal text to bash, so the code after it still runs" \
+   "$( [ -n "$dqh" ]; echo $? )"
+ck "(p1b) control: the SAME line without the apostrophe is reported too (${cth:-<missed>}) — so (p1a) measures the quote state, not the fixture" \
+   "$( [ -n "$cth" ]; echo $? )"
+ck "(p1c) a \`case\` inside a genuinely SINGLE-QUOTED span is NOT reported (${sqh:-none}) — the skip is still applied where bash really substitutes nothing" \
+   "$( [ -z "$sqh" ]; echo $? )"
+
+# ⛔ THE MULTI-LINE AND NESTED SHAPES — the two blind spots the LINE-SCOPED detector had (review
+# cycle 1, P2; #2969). These fixtures are what make the depth rule LOAD-BEARING rather than prose:
+# the line carrying the `case` in `wrapped.sh` holds no `$( ` at all, and in `nested.sh` the inner
+# substitution's `)` sits before it. Both are a genuine #2969-class defect on bash 3.2
+# (`command substitution: … syntax error near unexpected token 'newline'`, corrupted value, rc 0).
+# ⛔ MEASURED, not hypothesised: the pre-fix line-scoped function — replayed verbatim from
+# 604bd21e8 — answers NOTHING for both files, while the same bytes in one-line spelling are reported
+# ((p1a)/(p1b)). So without these arms a REVERT to line-scoped scanning leaves every other (p1) arm
+# fully GREEN and silently restores the blind spot; with them the revert reds here.
+printf '%s\n' 'x="$(' '  case "$X" in fresh) printf gh ;; *) printf no ;; esac' ')"' > "$cqf/wrapped.sh"
+printf '%s\n' 'x="$(printf %s "$(date)"; case "$s" in a) : ;; esac)"' > "$cqf/nested.sh"
+wrh="$(cis_in_comsub "$cqf/wrapped.sh")"
+neh="$(cis_in_comsub "$cqf/nested.sh")"
+ck "(p1d) a \`case\` inside a substitution WRAPPED ACROSS LINES is reported (${wrh:-<missed>}) — the line holding it carries no \`\$( \`, so a LINE-SCOPED detector answers (none) on genuinely broken bytes" \
+   "$( [ -n "$wrh" ]; echo $? )"
+ck "(p1e) a \`case\` AFTER a NESTED \`\$( )\` is reported (${neh:-<missed>}) — the inner substitution's \`)\` must not be read as the close of the outer one, or a broken \`case\` after it is skipped" \
+   "$( [ -n "$neh" ]; echo $? )"
+
+# ⛔ MUTANT: reinstate the CONSTRUCT by DERIVING it from the module's own hoisted block — the
+# patterns and the values are READ OUT of the module, not restated here, so the control cannot drift
+# from the code it guards. The relocation is exactly the pre-fix semantics: the same `case`, its same
+# patterns and the same values, moved back inside the substitution as `printf`.
+# ⛔ THE EARLIER SPELLING OF THIS ARM CLAIMED THAT AND DID NOT DO IT (review cycle 1, P2): its awk
+# matched only the block's HEADER line and then emitted a hard-coded body, so changing the module's
+# real `fresh) src='gh-live'` still produced a mutant saying `printf 'gh'`. The comment asserted a
+# no-drift guarantee the code did not provide. Now the derivation is real: every `pattern) src='VALUE'`
+# row is parsed, so a changed value changes the mutant, and a reindent no longer breaks it.
+mutp="$T/mut-comsub"
+mkdir -p "$mutp"
+# ⛔ awk, NOT python3: this arm must not go RED on a host that merely lacks an interpreter, and the
+# siblings that use python3 all live outside the bash suites. RULE: wherever the hoisted `case` block
+# starts, emit the SAME case back inside a `$( )` and drop the block — the pre-fix semantics exactly.
+awk '
+  rebuilding {
+    if ($0 ~ /^[[:space:]]*esac[[:space:]]*$/) { out = out " esac )\""; print out; rebuilding = 0; next }
+    # a row of the hoisted block, e.g.   fresh) src=\047gh\047 ;;
+    if (match($0, /^[[:space:]]*[^)]*\)[[:space:]]*src=\047[^\047]*\047[[:space:]]*;;[[:space:]]*$/)) {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      pat = line; sub(/\).*/, "", pat)
+      rest = line; sub(/^[^)]*\)[[:space:]]*src=\047/, "", rest)
+      val = rest; sub(/\047.*/, "", val)
+      out = out pat ") printf \047" val "\047 ;; "
+      next
+    }
+    bad = 1; exit 3
+  }
+  /^[[:space:]]*case "\$\{CIQ_STATE\}" in[[:space:]]*$/ {
+    rebuilding = 1
+    out = "      src=\"$( case \"${CIQ_STATE}\" in "
+    next
+  }
+  { print }
+  END { if (rebuilding || bad) exit 3 }
+' "$MOD" > "$mutp/ci-queue.sh" 2>/dev/null
+if [ $? -ne 0 ]; then
+  bad "(p2) the mutant could not be DERIVED from the module's own hoisted block — its shape changed, so update this arm TOGETHER with the block (the control must not be restated here: a hand-written body drifts from the code it guards)"
+elif cmp -s "$MOD" "$mutp/ci-queue.sh"; then
+  bad "(p2) the shape mutation did not apply — (p1) would prove nothing"
+elif ! bash -n "$mutp/ci-queue.sh" 2>/dev/null; then
+  bad "(p2) the mutant does not pass \`bash -n\` — it must, because THAT blindness is the finding"
+else
+  mhits="$(cis_in_comsub "$mutp/ci-queue.sh")"
+  ck "(p2) MUTANT — reinstating the construct is CAUGHT (${mhits:-<missed>}) while \`bash -n\` still exits 0, so (p1) is not always-green and is not a re-run of the parse gate" \
+     "$( [ -n "$mhits" ]; echo $? )"
+fi
+
+# ── (p3)-(p4) the RUNTIME arm: the same bytes, on an interpreter that has the defect ─────────────
+# Find a bash 3.x. `/bin/bash` is 3.2 on macOS (the affected population) and 5.x on the CI runners
+# (where the shape parses, so the arm cannot fire there — declared, below).
+# ⛔ `CIQ_BASH3` IS THE OVERRIDE, and it exists because a fixed path list makes these arms inert
+# ANYWHERE ELSE: measured on this repo's own harness, a bash 3.2.57 built in a container reports
+# "no bash 3.x on this host" unless the binary happens to sit at one of the four paths below. An arm
+# that cannot run is not a passing arm (#2969's own lesson) — so the path is settable, and the arms
+# can then be exercised anywhere, including CI.
+B3=""
+for c in ${CIQ_BASH3:-} /bin/bash /usr/bin/bash /usr/local/bin/bash /opt/homebrew/bin/bash; do
+  [ -x "$c" ] || continue
+  case "$($c -c 'printf %s "$BASH_VERSION"' 2>/dev/null)" in 3.*) B3="$c"; break ;; esac
+done
+legal_source() { [ "${1:-}" = gh ] || [ "${1:-}" = 'record(cache)' ] || [ "${1:-}" = unknown ]; }
+cli_source() { # <interpreter> <module> <state-dir> [<ttl>] [<gh>] -> the `source=` field of the status line, as printed
+  mkdir -p "$3"
+  CIQ_GH="${5:-$STUB}" CIQ_TEST_QUEUED=1 CIQ_TEST_RUNNING=0 CIQ_TEST_RUNNERS=5 CIQ_TEST_BUSY=true \
+  CIQ_TEST_OFFLINE=0 CIQ_TEST_NOTOTAL=0 CIQ_TTL="${4:-0}" CIQ_STALE_MAX=0 \
+    "$1" "$2" status --repo "$OR" --state-dir "$3" 2>/dev/null \
+    | sed -n 's/.*source=\(.*\) age=[^ ]*$/\1/p' | head -1
+}
+# ⛔ THE VALUE ASSERTION IS NOT VERSION-GATED (review cycle 1, P2). `legal_source`/`cli_source` need no
+# 3.x interpreter: the field this bug corrupted must be a DERIVED `source=` on ANY bash, and on a 4.4+
+# host a regression of the hoisted block would still print something illegal. The earlier spelling hid
+# this assertion inside `else` of `if [ -z "$B3" ]`, so on every CI runner (all bash 5) NOTHING asserted
+# the `source=` value — only (p1)'s grep of the file ran. Only (p4)'s 3.2 corruption CONTROL is
+# genuinely version-gated, because it needs an interpreter that has the defect.
+gotp="$(cli_source "${B3:-bash}" "$MOD" "$T/rt-fixed")"
+# ⛔ EXACT VALUE, NOT `legal_source` (#2969 review cycle 3, P2). `legal_source` asks "is this a MEMBER of
+# {gh, record(cache), unknown}" — a set test, not the row's answer — so a `fresh)` row that returned
+# `unknown`, or a `fresh) src='gh'` row DELETED entirely (the likely refactor accident: the catch-all
+# then answers), certified as ✅ on every host: measured, both mutants green at 133/0 and 135/0 while
+# the arm's own message printed ('unknown'). The field this bug corrupted is pinned to its ONE correct
+# value on the state that corrupted it; `legal_source` stays only where (p4) asks the set question.
+ck "(p3a) the CLI reports source=gh ('${gotp:-<none>}') on $(basename "${B3:-bash}") — never the literal remainder of the printf, never another state's value" \
+   "$( [ "${gotp:-}" = gh ]; echo $? )"
+# ⛔ ALL THREE VALUES THE HOIST MOVED, NOT ONE (#2969 review cycle 2, P2). (p3a) drove the CLI with
+# CIQ_TTL=0 against an EMPTY state dir — i.e. state=fresh — so `src` was ALWAYS 'gh', and the hoisted
+# `record(cache)` and `unknown` branches were executed by NO arm in this file: a typo in either would
+# have been caught by nothing, in the one arm that exists to assert the VALUE of the field this bug
+# corrupted. The two arms below drive the other two branches. They need no 3.x interpreter, for the
+# same reason (p3a) does not: the value is version-independent even where the corruption is not.
+seed_record() { # <state-dir> -> an in-TTL record the module serves as `cache` (no live read happens)
+  mkdir -p "$1"
+  printf 'repo=%s\nqueued=2\nrunning=1\nrunners=5\nbusy=1\nat=%s\n' \
+    "$OR" "$(date +%s)" > "$1/ci-queue-daniel-ospina_agent-infra"
+}
+seed_record "$T/rt-cache"
+gotc="$(cli_source "${B3:-bash}" "$MOD" "$T/rt-cache" 300)"
+ck "(p3b) a TTL hit reports source=record(cache) ('${gotc:-<none>}') — the second value the hoist moved" \
+   "$( [ "${gotc:-}" = 'record(cache)' ]; echo $? )"
+gotu="$(cli_source "${B3:-bash}" "$MOD" "$T/rt-unknown" 0 /nonexistent-ciq-gh)"
+ck "(p3c) a failed read reports source=unknown ('${gotu:-<none>}') — the catch-all the hoist moved" \
+   "$( [ "${gotu:-}" = unknown ]; echo $? )"
+if [ -z "$B3" ]; then
+  printf '  ⚠️  (p3) DECLARED, NOT SKIPPED — no bash 3.x on this host (%s); bash 4.4+ parse this shape\n' \
+    "$(bash --version 2>/dev/null | head -1)"
+  printf '      correctly, so the 3.2 runtime CONTROL (p4) cannot fire here — it needs an interpreter\n'
+  printf '      that HAS the defect. The detector (p1)/(p2) carries the red-proof on every host, and\n'
+  printf '      (p3a) above asserts the source= VALUE on whatever bash this is.\n'
+else
+  got="$(cli_source "$B3" "$MOD" "$T/rt-fixed3")"
+  ck "(p3) on bash 3.2 ($B3) the CLI reports source=gh ('${got:-<none>}')" \
+     "$( [ "${got:-}" = gh ]; echo $? )"
+  # ⛔ THE CONTROL NEEDS A MUTANT TO DRIVE. When (p2) could not build one — which is what a REVERTED
+  # module looks like, since there is no hoisted block to relocate — this arm must go RED, not pass
+  # because an absent file's empty output happens to be "not a legal source". Measured on the
+  # reverted bytes: the earlier spelling of this arm reported ✅ for a mutant that did not exist.
+  if [ ! -f "$mutp/ci-queue.sh" ] || cmp -s "$MOD" "$mutp/ci-queue.sh"; then
+    bad "(p4) there is no mutant to drive — the runtime control would prove nothing (measured on a reverted module: this arm used to pass VACUOUSLY)"
+  else
+    mgot="$(cli_source "$B3" "$mutp/ci-queue.sh" "$T/rt-mut")"
+    # ⛔ NO OUTPUT IS NOT A CORRUPTION (#2969 review cycle 2, P2 — a FALSE PASS). `legal_source` refuses
+    # the EMPTY string, so the earlier spelling `{ legal_source "$mgot"; } ; [ $? -ne 0 ]` printed ✅ for
+    # a mutant that emitted NOTHING: the arm certified "the construct CORRUPTS source=" while having
+    # measured nothing at all, and the message even read ('<none>'). That is the same fail-closed
+    # polarity the ABSENT-mutant guard above was added for, and the same one (p2)/(o1b) already use.
+    if [ -z "$mgot" ]; then
+      bad "(p4) the mutant produced NO status line, so the runtime control proves nothing — an empty value is not a corruption"
+    else
+      ck "(p4) MUTANT — on bash 3.2 the reinstated construct CORRUPTS source= ('${mgot}'), so (p3) is not always-green" \
+         "$( { legal_source "$mgot"; } ; [ $? -ne 0 ]; echo $? )"
+    fi
+  fi
 fi
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'

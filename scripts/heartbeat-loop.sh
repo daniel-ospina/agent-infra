@@ -228,7 +228,7 @@ report_detached_rc() {
   # see the local `a`: the shell expands every word BEFORE it runs the `local` builtin, so `b` gets
   # the GLOBAL (here: empty) value and the drain returns early on `[ -f "" ]` — measured: the whole
   # suite went to 14 failures because `_src` was empty and NOTHING was ever reported.
-  local label="$1" rcfile="$2" errfile="$3" rc2_label="${4:-}" rc="" _reported=0 _src="" _tail="" _word=""
+  local label="$1" rcfile="$2" errfile="$3" rc2_label="${4:-}" rc6_label="${5:-}" rc="" _reported=0 _src="" _tail="" _word=""
   _src="$rcfile"
   # ⛔ A PENDING CARRIER OUTRANKS THIS RUN'S SIDECAR (review P3-2, MEASURED). Gating the unlink is
   # not enough on its own: the next LAUNCH writes the same path, so a value retained through a log
@@ -267,7 +267,18 @@ report_detached_rc() {
       fi
       # ⛔ THE WORD IS CHOSEN BY THE RC (review P1, #1954). `REFUSED` for rc=2 only; anything else
       # is RED, matching the record reader's vocabulary for the same pass.
-      if [ "$rc" = 2 ] && [ -n "$rc2_label" ]; then _word="$rc2_label"; else _word="$label"; fi
+      # ⛔ AND `6` IS ITS OWN WORD (review P1, #2291): `pr-doctor` exits 6 when the box's own gate
+      # refused every order -- nothing consumed, and (for load) it clears by itself. Draining that
+      # as `PR-DOCTOR RED rc=6` put the pre-fix mislabel on this log one line ABOVE the new
+      # `PR-DOCTOR WAITING (no capacity)` record line, so one heartbeat said both. Measured shape:
+      # this is the path that reports a DETACHED run (the launchd job's status is the arm below).
+      if [ "$rc" = 2 ] && [ -n "$rc2_label" ]; then
+        _word="$rc2_label"
+      elif [ "$rc" = 6 ] && [ -n "$rc6_label" ]; then
+        _word="$rc6_label"
+      else
+        _word="$label"
+      fi
       printf '%s %s rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$_word" "$rc" "$_tail" \
         2>/dev/null >> "$LOG" && _reported=1 ;;
   esac
@@ -743,8 +754,9 @@ while :; do
   # a report line outlives its step only as a claim that the step can still fail, and this step
   # cannot be launched any more. The surviving line is still pinned by `scripts/heartbeat-loop.test.sh`.
   # rc=2 -> `PR-DOCTOR REFUSED` (#1933's vocabulary); any other non-zero rc -> `PR-DOCTOR RED rc=N`,
-  # never a refusal claim.
-  report_detached_rc "PR-DOCTOR RED"   "$STATE/pr-doctor.rc"      "$STATE/pr-doctor.stderr" "PR-DOCTOR REFUSED"
+  # never a refusal claim. rc=6 -> `PR-DOCTOR WAITING (no capacity)`: the box refused, nothing was
+  # consumed (#2291 -- the third word, because it is the third fact).
+  report_detached_rc "PR-DOCTOR RED"   "$STATE/pr-doctor.rc"      "$STATE/pr-doctor.stderr" "PR-DOCTOR REFUSED" "PR-DOCTOR WAITING (no capacity)"
 
 
   # ---------------------------------------------------------------------------------------
@@ -853,15 +865,32 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
       # ⛔ A STALE VERDICT IS NOT `ok` (2026-10-18, review). The whole point of reading a record is
       # to notice when nothing is writing it; printing `ok` from a week-old file reproduces exactly
       # the failure this block was added to end. Bound = two 1200s dispatch intervals.
-      if [ "${_prc:-0}" -ne 0 ]; then
+      # ⛔ AND THE STALE ARM OUTRANKS EVERY RC ARM (review P1, #2291). The rc arms used to be tested
+      # FIRST, so the stale branch was unreachable for ANY non-zero rc -- pre-existing, but #2291 is
+      # what made it reachable with a BENIGN token: a `6` whose `at_epoch` was six hours old printed
+      # `PR-DOCTOR WAITING (no capacity) rc=6 (21600s ago)`, i.e. "the box has no room, wait" for a
+      # dispatcher that had written NO verdict at all in six hours. `objective.pr_doctor_last_run()`
+      # deliberately orders it the other way (`age > 2400` -> UNREPORTED, BEFORE `waiting`), so the
+      # two readers of one record disagreed about the same file on the one screen an operator reads.
+      # A stale record is UNREPORTED whatever it says, so the age test comes first here too.
+      if [ "${_page:-0}" -gt 2400 ]; then
+        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) rc=%s :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_page" "${_prc:-?}" "$_pwhy" >> "$LOG"
+      # ⛔ AND "NO CAPACITY" IS NEITHER `ok` NOR RED (#2291). `pr-doctor` exits 6 when the box's own
+      # spawn gate refused every order: nothing was consumed and (for load) it clears by itself. The
+      # heartbeat printed that as `PR-DOCTOR RED rc=6`, i.e. the same line a broken dispatcher
+      # produces — so the one screen an operator reads could not tell "wait" from "repair". It gets
+      # its own token, and it is never `ok`: the queue is not moving while the box has no room.
+      # (Reached only when the record is FRESH — see the age arm above.)
+      elif [ "${_prc:-0}" -eq 6 ]; then
+        printf '%s PR-DOCTOR WAITING (no capacity) rc=%s (%ss ago) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
+      elif [ "${_prc:-0}" -ne 0 ]; then
         printf '%s PR-DOCTOR RED rc=%s (%ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
       elif [ "${_pdry:-0}" = "1" ]; then
         printf '%s PR-DOCTOR DRY RUN (not a pass verdict, %ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"
-      elif [ "${_page:-0}" -gt 2400 ]; then
-        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) :: %s\n' \
-          "$(date '+%m-%d %H:%M:%S')" "$_page" "$_pwhy" >> "$LOG"
       else
         printf '%s PR-DOCTOR ok rc=0 (%ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"
@@ -878,15 +907,31 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
   fi
   # The SCHEDULED job is a separate component: its verdict is final only when it is NOT running
   # (a live pid's second column is the PREVIOUS run's status, so it is not a verdict yet).
-  _plline=$(launchctl list 2>/dev/null | awk -v l=com.tortoise.pr-doctor '$3==l {print $1" "$2}')
+  # ⛔ THE BINARY IS A SEAM (`HEARTBEAT_LAUNCHCTL`), not a bare `launchctl` (#2291 review). The PATH
+  # this file pins (:341) is hardcoded, so a test cannot reach a stub through PATH — and the arm
+  # below is one of the three pr-doctor verdict surfaces, so leaving it undrivable is how it kept
+  # printing `LAUNCHD RED (last exit 6)` while the record said WAITING. `fleet-inventory.sh` already
+  # resolves its launchctl from `FLEET_LAUNCHCTL` for the same reason; this is the same seam, not a
+  # new pattern. Default is unchanged: the real binary on PATH.
+  _plline=$("${HEARTBEAT_LAUNCHCTL:-launchctl}" list 2>/dev/null | awk -v l=com.tortoise.pr-doctor '$3==l {print $1" "$2}')
   _plpid=${_plline%% *}
   _plcode=${_plline#* }
   # `-` in the status column means "not running and NO last-exit code recorded", which is not a
   # failure to report as one -- an earlier version printed `LAUNCHD RED (last exit -)`.
   if [ -n "$_plline" ] && [ "$_plpid" = "-" ] && [ -n "$_plcode" ] && [ "$_plcode" != "0" ] \
      && [ "$_plcode" != "-" ] && [ "$_plcode" != "$_plline" ]; then
-    printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
-      "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
+    # ⛔ `6` IS THE THIRD VERDICT, NOT A FAILURE (review P1, #2291). `com.tortoise.pr-doctor` runs
+    # `pr-doctor.py` directly, so a NO-CAPACITY pass lands here as LastExitStatus=6 and the arm
+    # printed `LAUNCHD RED (last exit 6) -- the scheduled job is failing` -- the exact sentence #2291
+    # exists to remove, on the third of this file's pr-doctor surfaces. The bound and the box
+    # measurement reach the operator through the `status.json` line above.
+    if [ "$_plcode" = 6 ]; then
+      printf '%s PR-DOCTOR LAUNCHD WAITING (no capacity, last exit 6) -- the box refused the work and nothing was consumed; the bound and the measurement are on the status line above, stdout is %s\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$STATE/pr-doctor.launchd.log" >> "$LOG"
+    else
+      printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
+    fi
   fi
   EL=$(elapsed); SLP=$(( TARGET - EL )); [ "$SLP" -lt 5 ] && SLP=5
   printf '%s PASS done in %ss (target %ss) sleeping %ss\n' \
