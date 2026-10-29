@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (R1): pull_request_target keyed on github.ref — that ref is the BASE
+# branch, so every PR lands in ONE group and they cancel each other.
+name: pr-target-group-ref
+on:
+  pull_request_target:
+    types: [opened]
+concurrency:
+  group: pr-target-group-ref-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
