@@ -616,9 +616,29 @@ unit_exec_line() { # unit_exec_line <file> — the last ExecStart= (the one syst
         | sed -n 's/^ExecStart[[:space:]]*=[[:space:]]*//p' | tail -1
 }
 
+unit_dropin_execfiles() { # .conf drop-ins that would override ExecStart, one path per line
+    # ⛔ THE BASE FILE IS NOT ALWAYS THE COMMAND. systemd merges `$UNIT.d/*.conf`, and a drop-in carrying
+    # `ExecStart=` REPLACES the base one — so every read-back below is otherwise answering about a file
+    # the scheduler does not run. This is not hypothetical for this unit: the base ExecStart is the thing
+    # an operator would edit to arm by hand.
+    local d="$UNIT_DIR/$UNIT_NAME.service.d" f
+    [ -d "$d" ] || return 0
+    for f in "$d"/*.conf; do
+        [ -f "$f" ] || continue
+        [ -n "$(unit_exec_line "$f")" ] && printf '%s\n' "$f"
+    done
+    return 0
+}
+
 verify_installed_unit() { # verify the ARTIFACT at $UNIT_DIR, not the bytes we hoped for
     local svc="$UNIT_DIR/$UNIT_NAME.service" line
     [ -f "$svc" ] || { err "REFUSING to arm: $svc is not there after the install"; return 1; }
+    local dropins
+    dropins="$(unit_dropin_execfiles)"
+    [ -z "$dropins" ] || {
+        err "REFUSING: this unit has an ExecStart= DROP-IN that overrides what this installer wrote, so the mode verified below is not the mode systemd runs: $(printf '%s ' $dropins). Remove it (or move its content into the unit) and re-install."
+        return 1
+    }
     line="$(unit_exec_line "$svc")"
     [ -n "$line" ] || {
         err "REFUSING to arm: the installed $svc carries no ExecStart= — systemd would fail it with 'Service has no ExecStart', so this box would have no converger while looking installed"
@@ -691,6 +711,31 @@ args_first_matching() { # args_first_matching <newline-separated values> <GLOB p
         esac
     done
     return 0
+}
+
+classify_exec_args() { # classify_exec_args <newline-separated args AFTER interpreter/script/repo>
+    # ⛔ "NOT --dry-run" IS NOT THE SAME AS "NOT A MODE". The pass's own switches (`--json`, `--status`,
+    # `--want N`, `--root P`) are legitimate and change nothing about whether a tick CONVERGES, so a
+    # readiness verb that reds on them reports a working schedule as broken — with a stated consequence
+    # ("every tick exits 2") that is simply false. Only arguments outside that vocabulary are red, and
+    # only `--dry-run` makes the artifact disarmed. Anything left over is named, never assumed.
+    local rest="$1" l out="" disarmed=0 skipnext=0
+    while [ -n "$rest" ]; do
+        l="${rest%%$'\n'*}"
+        case "$rest" in *$'\n'*) rest="${rest#*$'\n'}" ;; *) rest="" ;; esac
+        if [ "$skipnext" = 1 ]; then skipnext=0; continue; fi
+        case "$l" in
+            '')                : ;;
+            --dry-run)         disarmed=1 ;;
+            --json|--status)   : ;;
+            --want|--root)     skipnext=1 ;;
+            *)                 out="$out $l" ;;
+        esac
+    done
+    out="${out# }"
+    if [ -n "$out" ]; then printf 'other:%s' "$out"
+    elif [ "$disarmed" = 1 ]; then printf 'disarmed'
+    else printf 'armed'; fi
 }
 
 verify_installed_artifact_plist() {
@@ -928,7 +973,7 @@ mode_meaning() {
 # read-only verb and refuses when it cannot answer. The measured reading goes INTO the record, so the
 # arming is auditable without re-running anything.
 do_arm() {
-    local reason="${1:-<none given>}" json rc ceiling ncpu mem rec_tmp
+    local reason="${1:-<none given>}" json rc ceiling ncpu mem rec_tmp dp
     # ⛔ FIRST STATEMENT, BEFORE THE PREFLIGHT AND BEFORE THE RECORD IS WRITTEN. This verb's first write
     # is the arming record, not the artifact, so a guard that only ran inside the re-render refused the
     # UNIT while leaving an `armed-by=root` record behind — the operator was told the record-in-/root was
@@ -937,6 +982,19 @@ do_arm() {
     refuse_root_invocation || return 1
     resolve_script || return 1
     resolve_python || return 1
+    # ⛔ A DROP-IN OVERRIDE IS A PREFLIGHT FACT, SO IT IS REFUSED BEFORE THE RECORD EXISTS. Verified only
+    # inside the re-render, it wrote the record, then failed both renders (the drop-in breaks the armed
+    # AND the forced-disarmed verification), which correctly lands in "STILL ARMED — the record was KEPT"
+    # for a refusal a retry cannot clear: a record left behind by a refusal of the OPERATOR'S override.
+    choose_target || return 1
+    if [ "$TARGET" != "launchd" ]; then
+        dp="$(unit_dropin_execfiles)"
+        [ -z "$dp" ] || {
+            err "REFUSING to arm: an ExecStart= DROP-IN overrides the unit this installer manages, so the command it would verify is not the command systemd runs: $(printf '%s ' $dp)"
+            err "  Remove that drop-in (or move its content into the unit) and re-run --arm. Nothing was armed."
+            return 1
+        }
+    fi
     if arm_record_valid; then
         log_line "  runner-autoscale: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p' "$ARM_FILE")"
         log_line "    record: $ARM_FILE (not re-dated: the date is the audit datum)"
@@ -1109,6 +1167,7 @@ sha_of() { # sha_of <file> — portable digest
 
 do_status() {
     local installed_mode installed_script drift_artifact enabled active next last
+    local installed_args installed_rest installed_kind installed_dropins
     local rc=0 installed_path
     resolve_script || return 1
     resolve_python || { rc=1; }
@@ -1118,7 +1177,7 @@ do_status() {
     if [ ! -f "$installed_path" ]; then
         log_line "installed=no"
         log_line "note=no artifact at $installed_path — this box has NO scheduled converger"
-        log_line "remedy=bash $(basename "$0") --install   (installs it DISARMED; --arm is a separate dated step)"
+        log_line "remedy=bash $(basename "$0") --install   (installs it DISARMED when no arming record exists; --arm is a separate dated step, and an existing record is honoured — run --disarm to revoke it)"
         return 1
     fi
     log_line "installed=yes artifact=$installed_path"
@@ -1137,17 +1196,32 @@ do_status() {
     fi
     # Drop the leading interpreter + script, then the `--repo <value>` pair (that is configuration, not
     # a mode), and what remains is the mode the pass is actually invoked with.
-    installed_mode="$(printf '%s\n' "$installed_args" | awk '
+    installed_rest="$(printf '%s\n' "$installed_args" | awk '
         { if ($0 ~ /^\//) { abs++; next }
           if (abs < 2) next
           if (skip) { skip = 0; next }
           if ($0 == "--repo") { skip = 1; next }
-          if (NF) print }' | tr '\n' ' ' | sed 's/ *$//')"
-    case "$installed_mode" in
-        '')           log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
-        --dry-run)    log_line "mode=--dry-run (DISARMED — the pass measures and prints its plan only)" ;;
-        *)            log_line "mode=$installed_mode"; err "the installed artifact carries arguments the converger does not accept ('$installed_mode') — it accepts only --dry-run, because converging is its default, so every tick would exit 2 (unrecognized arguments). Re-install with this installer."; rc=1 ;;
+          if (NF) print }')"
+    installed_kind="$(classify_exec_args "$installed_rest")"
+    case "$installed_kind" in
+        armed)     log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
+        disarmed)  log_line "mode=--dry-run (DISARMED — the pass measures and prints its plan only)" ;;
+        other:*)   installed_mode="${installed_kind#other:}"
+                   log_line "mode=$installed_mode"
+                   err "the installed artifact carries arguments this installer did not render ('$installed_mode') — the pass accepts --dry-run, --status, --json, --want <n> and --root <path>; anything else makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
+                   rc=1 ;;
     esac
+    # ⛔ AND THE MODE ABOVE IS THE BASE FILE'S. A `$UNIT.d/*.conf` carrying ExecStart= silently replaces
+    # it, so the answer above can be `DISARMED` about a unit that is converging.
+    if [ "$TARGET" != "launchd" ]; then
+        installed_dropins="$(unit_dropin_execfiles | tr '\n' ' ')"
+        installed_dropins="${installed_dropins% }"
+        if [ -n "$installed_dropins" ]; then
+            log_line "dropin_override=$installed_dropins"
+            err "an ExecStart= DROP-IN overrides this unit's command, so the mode reported above is NOT what systemd runs: $installed_dropins — read it (systemctl cat $UNIT_NAME.service) and re-install once it is gone"
+            rc=1
+        fi
+    fi
     log_line "arm_record=$([ -f "$ARM_FILE" ] && printf 'present' || printf 'absent') ($ARM_FILE)"
     # ⛔ THE TARGET IS PART OF THE ANSWER. An artifact whose script is gone starts nothing (203/EXEC on
     # every tick) while the scheduler still lists it as scheduled and healthy.
@@ -1271,6 +1345,18 @@ do_status() {
 }
 
 # ── uninstall ───────────────────────────────────────────────────────────────────────────────
+report_surviving_arm_record() { # ⛔ an uninstall that leaves the record RE-ARMS on the next --install
+    # Measured: `--arm` → `--uninstall` → `--install` re-rendered the box ARMED from a record the operator
+    # believed the uninstall had cleared, printing the pre-uninstall date — and the `--status` remedy they
+    # are handed says "installs it DISARMED", i.e. the opposite. The record is NOT deleted here: it is the
+    # operator's dated decision, and revoking it silently is exactly what `--arm`'s own step forbids.
+    if [ -f "$ARM_FILE" ] && arm_record_valid; then
+        err "note: the arming record at $ARM_FILE SURVIVES this uninstall, so the NEXT --install will render an ARMED unit (by $(sed -n 's/^armed-by=//p' "$ARM_FILE" || true), $(sed -n 's/^armed-date=//p' "$ARM_FILE" || true))."
+        err "      the box has no scheduled converger until then; to revoke the decision first, run --disarm, or delete that file."
+    fi
+    return 0
+}
+
 do_uninstall() {
     if [ "${DRY_RUN:-0}" = "1" ]; then
         log_line "dry-run: would disable and remove the installed schedule (nothing was changed)"
@@ -1288,6 +1374,7 @@ do_uninstall() {
             return 1
         fi
         log_line "uninstalled $LABEL from $UNIT_DIR (not loaded)"
+        report_surviving_arm_record
         return 0
     fi
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
@@ -1321,6 +1408,7 @@ do_uninstall() {
         fi
     done
     log_line "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
+    report_surviving_arm_record
     return 0
 }
 
