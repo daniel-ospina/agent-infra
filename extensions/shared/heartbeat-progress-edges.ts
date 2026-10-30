@@ -136,6 +136,13 @@ export const OUT_OF_FAMILY_TERMS = [
   // above and its BEHAVIOUR pinned by origination-funnel.test.sh §5c (young ⇒ in flight, past the
   // bound ⇒ BLOCKED, unreadable `at=` ⇒ BLOCKED).
   "RUNNING_STALE_MIN",
+  // agent-infra#2888 review (P1): the controller's own STALE-WORKER reaper bound (`orch-loop.sh`).
+  // `STALE_MIN` carries no family token and no `_S`/`_MS` suffix, so the name scan cannot see it —
+  // registered rather than left to the reverse scan, because it is the SECOND flat silence cap in the
+  // tree and the one that re-pre-empted the progress allowance (40 min < 45 min). Its value is pinned
+  // by the registration above, its ORDERING (STALE_MIN × 60 > the allowance) by `lane-bound.test.sh`
+  // (i0), and its coercion by `selftest.sh` (`stale=50` on every malformed value).
+  "STALE_MIN",
   "DEFAULT_MAX_DISPATCH_MS",
   // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
   // carry no stall-family token (the STALLED threshold is now the DERIVED
@@ -794,6 +801,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "how old a reaper lock must be before a DEAD owner's lock is broken; a LIVE owner holds it outright whatever the directory age",
   },
   {
+    name: "STALE_MIN",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '${STALE_MIN:-50}',
+    overrides: ["STALE_MIN=50", 'STALE_MIN="$_floor"'],
+    axis: "kill",
+    guardedBy:
+      "scripts/orchestrator-harness/lane-bound.test.sh (i0) — STALE_MIN x 60 is strictly ABOVE the lane PROGRESS allowance AND above it at the shipped defaults, so the reaper cannot pre-empt the bound that decides wedged-vs-slow; selftest.sh drives the coercion (`stale=50` on every malformed value)",
+    note: "agent-infra#2888 review, P1 — the controller's STALE-WORKER reaper: `reap_stale_workers` closes a `lane-*|fix-*|merge-*` worker whose own log has not grown for this many minutes, and it does so with NO CPU-subtree signal and NO consultation of `lane-bound.sh`'s verdict — so it is a flat silence cap, one layer up from the one #2888 retired. Registered because at 40 min (2400 s) it sat BELOW the 2700 s progress allowance and re-pre-empted exactly the population this change exists to spare (a fixer working silently past 40 min of log silence was closed with no `[lane-bound] VERDICT`, no `walltime.tsv` row and no cap snapshot). 50 min = 3000 s clears the allowance plus its two confirming samples, and `_stale_floor_raise()` derives a floor from the SAME seam `lane-bound.sh` resolves (`LANE_BOUND_IDLE_S`, else the shipped default read out of that file — never a second 2700 in this tree) and RAISES a configured value below it, loudly. The third declaration is that raise, which is why it is registered as an override rather than left to read as an unmodelled shadow.",
+  },
+  {
     name: "LANE_BACKSTOP_S",
     owners: ["scripts/orchestrator-harness/spawn-gate.sh"],
     value: "${LANE_BACKSTOP_S:-7200}",
@@ -833,12 +850,12 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   {
     name: "LANE_IDLE_MIN",
     owners: ["scripts/orchestrator-harness/lane-reap.sh"],
-    value: "${LANE_REAP_IDLE_MIN:-120}",
+    value: "${LANE_REAP_IDLE_MIN:-180}",
     axis: "reap",
     guardedBy:
-      "scripts/orchestrator-harness/lane-reap.test.sh §idle — a lane whose log has not advanced past the bound is a reap candidate, and one that HAS keeps it; the value is asserted by THIS registry's forward check, since the suite drives its own LANE_REAP_IDLE_MIN in the environment",
-    overrides: ["LANE_IDLE_MIN=120"],
-    note: "#2163 — how long a lane's own activity log must have gone untouched before the reaper treats the lane as finished (2 h), in MINUTES. Deliberately NOT named `IDLE_MIN`: that symbol is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh` (a 9-minute spinner-absent classification bound, declared-not-read), and sharing the name made one authority out of two unrelated numbers — exactly the divergence this registry exists to surface. This one is READ (it decides a kill), and it is the log-evidence gate that outranks age: a lane with no log takes the 12 h `NO_LOG_H` path instead, and a lane whose log advanced inside this window is never signalled.",
+      "scripts/orchestrator-harness/lane-reap.test.sh §idle — a lane whose log has not advanced past the bound is a reap candidate, and one that HAS keeps it; the value is asserted by THIS registry's forward check, since the suite drives its own LANE_REAP_IDLE_MIN in the environment. The TWO orderings it must keep (above LIVE_MIN, above LANE_BACKSTOP_S) are pinned by lane-bound.test.sh (i0)",
+    overrides: ["LANE_IDLE_MIN=180"],
+    note: "#2163 — how long a lane's own activity log must have gone untouched before the reaper treats the lane as finished (3 h, 180 min), in MINUTES. Deliberately NOT named `IDLE_MIN`: that symbol is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh` (a 9-minute spinner-absent classification bound, declared-not-read), and sharing the name made one authority out of two unrelated numbers — exactly the divergence this registry exists to surface. This one is READ (it decides a kill), and it is the log-evidence gate that outranks age: a lane with no log takes the 12 h `NO_LOG_H` path instead, and a lane whose log advanced inside this window is never signalled. ⛔ 120 -> 180 in #2888: at 120 min this bound SAT ON `LANE_BACKSTOP_S` (7200 s) and BELOW the 125-min capacity `LIVE_MIN`, so the reaper could call a lane finished at the instant its own backstop still permitted it to run, and a lane idle 121-125 min was simultaneously `live` and a reap candidate.",
   },
   {
     name: "MAX_AGE",
@@ -1381,10 +1398,10 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     name: "IDLE_S",
     owners: ["scripts/orchestrator-harness/lane-bound.sh"],
     value: "IDLE_S=\"\"",
-    overrides: ['IDLE_S="$2"', "LANE_BOUND_IDLE_S:-"],
+    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 2700)"'],
     axis: "kill",
     guardedBy: NONE,
-    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 1200 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
+    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 2700 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. ⛔ THE ENV-SEAM OVERRIDE IS PINNED AS THE WHOLE RESOLUTION LINE, NOT ITS PREFIX (#2888 review, cross-PR): the fragment used to be the bare `LANE_BOUND_IDLE_S:-`, which `declared-surface.ts`'s `carriesValue()` accepts as a SUBSTRING — so it matched BOTH the old 1200 and the new 2700 line and the drift was invisible (a false PASS). While it stayed a prefix, the number could move without the registry noticing; the whole line makes the 1200 -> 2700 move a RED rather than a silent one (agent-infra#3039 restores the full fragment on the other side of the same interaction). `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
   },
   {
     name: "MIN_SESSION_AGE_S",
