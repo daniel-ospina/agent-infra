@@ -301,8 +301,19 @@ ck "…and no shell error leaked into the report" "$(qF "unbound variable" "$OUT
 
 echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
-ck "run-bash-shards.sh carries this suite as a run_shard line" \
-   "$(q 'run_shard scripts/orchestrator-harness/check-deployed-drift.test.sh' "$(cat "$SHARDS")" && echo 0 || echo 1)"
+# ⭐ MEMBERSHIP IS READ FROM THE DERIVED LIST, NEVER FROM THE DRIVER'S TEXT (#2609). This assertion
+# used to grep run-bash-shards.sh for its own `run_shard` row. That only worked while the list was
+# ENUMERATED, and it is the exact shape tests/ci-lane-parity §11 now forbids: the migration to
+# derivation deletes the rows, so a text-grep membership check goes RED and tells the next lane to
+# hand-edit the driver — re-introducing #2838. `--list` is the source the CI floor itself reads, so
+# asserting against it is both correct and stronger: the suite is listed iff it would actually run.
+SHARDLIST="$(bash "$SHARDS" --list 2>/dev/null || true)"
+ck "run-bash-shards.sh --list carries this suite (the list CI actually executes)" \
+   "$(printf '%s\n' "$SHARDLIST" | grep -qx 'scripts/orchestrator-harness/check-deployed-drift.test.sh' && echo 0 || echo 1)"
+# ⛔ …AND THE COMPLEMENT: derivation means the DRIVER NAMES NO SUITE. Pinning both halves makes a
+# re-added `run_shard` row (the #2838 regression) go red HERE, not only in tests/ci-lane-parity.
+ck "…and the driver carries NO enumerated run_shard row for it (derivation, not enumeration)" \
+   "$(grep -qE '^[[:space:]]*run_shard[[:space:]]+scripts/orchestrator-harness/check-deployed-drift\.test\.sh' "$SHARDS" && echo 1 || echo 0)"
 
 echo
 printf 'check-deployed-drift delta self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
