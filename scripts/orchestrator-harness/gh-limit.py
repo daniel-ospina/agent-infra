@@ -4278,7 +4278,9 @@ def _named_floor_refusal(remaining, floor, reset, dated):
 
 
 def _dispatch(real_gh, gh_argv):
-    """Run, back off, retry — holding the single-flight lock for each ATTEMPT and NOT for the wait.
+    """Run, back off, retry — holding the single-flight lock for each ATTEMPT THAT ISSUES A REQUEST
+    (see `makes_no_request_strictly`: a provably local form skips the lock entirely, because a call
+    that makes no request cannot overlap one) and NOT for the wait.
 
     ⛔ THE LOCK IS RELEASED DURING A WAIT, deliberately. The invariant is "one gh request in flight
     per box", not "one caller in the queue": holding it through a 60/120/240 s backoff would park

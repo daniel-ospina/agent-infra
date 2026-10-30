@@ -987,7 +987,7 @@ rm -rf "$TMP/home-guard" "$TMP/O4t9"; gh_hosts_fixture "$TMP/home-guard"
 printf 'EXTRA=1\n' > "$TMP/home-guard/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t9" "$TMP/home-guard" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-case "$pfx" in *"*) false || exit 98"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *'*) false; exit 97'*) rc=1 ;; *) rc=1 ;; esac
+case "$pfx" in *"*) false; exit 97"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *) rc=1 ;; esac
 ck "…the guard never credits a file the worker's own gh could not spend (no gh => REFUSED, not blessed)" $rc
 if command -v perl >/dev/null 2>&1; then
   # ⛔ THE `; exit 93` IS PART OF THE PIN (#3099 review): perl's failed `exec` returns FALSE and the
@@ -1043,12 +1043,43 @@ if command -v perl >/dev/null 2>&1; then
   # command -v bash'` is satisfied by the `pi-keys.env` arm ALONE, so reverting the `keys.env` arm to 98
   # — the exact mis-attribution this arm was written for, restored on the other half — stayed green.
   # The count is pinned at 2 so a revert of EITHER arm reddens.
+  # ⛔ LITERALS, NOT SUBSTRINGS (review finding, 2026-10-30): `grep -q 'exit 93'` is satisfied by the
+  # COMMENT above the guard and by the SIBLING arm, so deleting the real emitter `93) exit 93` or the
+  # `_guard="false; exit 93"` arm left the suite at 300/0 while a non-executable gh was reported as
+  # "the GH CREDENTIAL is absent" and a box with no `perl` got the same wrong remedy. Each emission is
+  # now pinned by the comment-free literal around it.
   _94n="$(grep -c 'exit 94; if command -v bash' "$LIB")"
-  [ "$_94n" = "2" ] && grep -q 'exit 95 ;; esac' "$LIB" \
-    && grep -q 'exit 93' "$LIB" && grep -q "exec @ARGV; exit 93" "$LIB" \
+  [ "$_94n" = "2" ] && grep -qF '142|124) exit 96 ;; 93) exit 93 ;; *) exit 98' "$LIB" \
+    && grep -qF '_guard="false; exit 93"' "$LIB" && grep -qF 'exec @ARGV; exit 93' "$LIB" \
+    && grep -qF 'this lane could not authenticate a single model call" >&2; exit 95 ;; esac' "$LIB" \
     && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
-  ck "…and BOTH env-file arms emit 94 (this arm's own count: $_94n) plus 93/95/98 above" $rc
-  ck "…and the 93/94/95 arms really EXIT those codes (an env-file or model-key fault cannot pose as the gh one)" $rc
+  ck "…and BOTH env-file arms emit 94 (count: $_94n) and the 93/95/98 EMISSIONS are pinned literally" $rc
+  # ⛔ AND 93 IS PROVEN BEHAVIOURALLY, which no grep can do: build the launch line with a resolvable
+  # gh, then make that gh NON-EXECUTABLE before the pane runs it. perl's failed `exec` returns FALSE and
+  # ends the one-liner with status 0 — so without the `; exit 93` tail this arm sees rc=0, i.e. a BLESSED
+  # worker with no credential, which is the fail-open direction the guard exists to close.
+  rm -rf "$TMP/bin-noexec" "$TMP/home-noexec" "$TMP/O4noexec"; mkdir -p "$TMP/bin-noexec"; gh_hosts_fixture "$TMP/home-noexec"
+  printf '#!/usr/bin/env bash\nprintf %%s\\n gho_never_used\n' > "$TMP/bin-noexec/gh"
+  chmod +x "$TMP/bin-noexec/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-noexec/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-noexec" "$TMP/O4noexec" "$TMP/home-noexec" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  chmod -x "$TMP/bin-noexec/gh"
+  env -i PATH="$TMP/bin-noexec:/usr/bin:/bin" HOME="$TMP/home-noexec" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "93" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 93: the resolved gh could not be executed)"; }
+  ck "…and a gh that cannot be EXECUTED at pane time exits 93 — never 0 (perl's failed exec would bless)" $rc
+  # 97 HAD NO COVERAGE AT ALL: the only line that looked like a pin was unreachable (`bin-absent` still
+  # resolves a gh). Driven with a PATH carrying NO gh, the way `bin-storenogh` drives the spawn arm.
+  rm -rf "$TMP/bin-nogharm" "$TMP/home-nogharm" "$TMP/O4nogharm"; mkdir -p "$TMP/bin-nogharm"; gh_hosts_fixture "$TMP/home-nogharm"
+  for _u in bash env grep mkdir date rm sed cat perl; do
+    _p="$(command -v "$_u" 2>/dev/null)" && ln -sf "$_p" "$TMP/bin-nogharm/$_u"
+  done
+  printf 'EXTRA=1\n' > "$TMP/home-nogharm/keys.env"
+  out="$(env -i PATH="$TMP/bin-nogharm" bash "$TMP/c8.sh" "$LIB" "$TMP/bin-nogharm" "$TMP/O4nogharm" "$TMP/home-nogharm" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-nogharm" HOME="$TMP/home-nogharm" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "97" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 97: no gh anywhere on this box)"; }
+  ck "…and a box with NO gh anywhere exits 97 (its own code — the 98 remedy sends you after a credential that is not the fault)" $rc
 fi
 # ⛔ AND THE GATE-SIDE PROBE IS BOUNDED TOO (recorded rule, README §"Two platform rules …": a plain
 # `gh auth token` can hang for the life of the shell, rc=142 measured — and `wt_spawn` runs on the
