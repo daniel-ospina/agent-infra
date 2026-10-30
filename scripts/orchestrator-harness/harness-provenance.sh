@@ -252,21 +252,49 @@ write)
   SRC_DIRTY="${DIRTY_ARG:-unknown}"
   if [ -z "$DIRTY_ARG" ] && git -C "$SRC" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
     # ⛔ `.` IS THE SOURCE DIRECTORY, AND A PATHSPEC IS READ RELATIVE TO `git -C`'s DIRECTORY. Passing
-    # `rev-parse --show-prefix` here (a path relative to the REPO ROOT) from inside the subdirectory
-    # matched nothing, so a genuinely dirty source recorded as clean — the one signal this field exists
-    # to carry, silently absent. `.` asks about exactly the tree being recorded.
-    # ⛔ AND AN UNTRACKED FILE IS DIRTINESS (measured 2026-10-30, review of #3053). `--untracked-files=no`
-    # excluded exactly the files this field is most wrong about: the deploy ships everything `find`
-    # returns, untracked included, so a brand-new uncommitted `wip.sh` was hashed into the manifest
-    # UNDER the deploy's commit while `sourceDirty` said false — and `check-deployed-drift.sh` then
-    # printed `identity: ok` for a box whose bytes are not in the named commit. That is the same defect
-    # this field was added to carry, re-masked: the legacy stamp (install.sh:1482) counts untracked
-    # entries, so the record was WEAKER than the stamp it supersedes on this one input.
-    # The default (`normal`) is deliberate, not an oversight: it respects .gitignore, so a checkout with
-    # `node_modules/` or `__pycache__/` is not permanently "dirty" — an alarm that always fires is an
-    # alarm nobody reads. Files git ignores are outside every deploy's provenance claim.
-    if _st="$(git -C "$SRC" status --porcelain -- . 2>/dev/null)"; then
-      if [ -n "$_st" ]; then SRC_DIRTY="true"; else SRC_DIRTY="false"; fi
+    # `rev-parse --show-prefix` here AS A PATHSPEC (a path relative to the REPO ROOT) from inside the
+    # subdirectory matched nothing, so a genuinely dirty source recorded as clean — the one signal this
+    # field exists to carry, silently absent. `.` asks about exactly the tree being recorded.
+    #
+    # ⛔ AND THE DIRTY SET MUST BE THE SAME SET AS THE WRITE SET (measured 2026-10-30, review of #3053).
+    # `git status` over the whole directory made `start` — whose write set is depth-1 `*.sh` only, and
+    # which states that with `--skip` — record `sourceDirty=true` for an untracked scratch file it never
+    # ships. Downstream that is not a warning: `check-deployed-drift.sh` turns a dirty record into a
+    # `DRIFT(identity)` line and exit 1, and with the commit current the report falls through to
+    # `harness=payload-differs` — a false statement about `$O`'s bytes whose stated remedy ("redeploy to
+    # adopt") cannot clear it, stamped into dispatch rows. So a status path THIS CALLER declared it does
+    # not write (`--skip`) is not dirtiness FOR THIS RECORD: a record must not contradict itself, and
+    # one that lists `files=` for the write set cannot take its dirty answer from a wider set.
+    # `-uall` expands an untracked DIRECTORY into the files inside it, because `start` skips non-depth-1
+    # paths one FILE at a time — collapsing a skipped subdirectory into a single `dir/` entry would read
+    # as one unskippable entry and redden the record again. Anything left over is dirty, which is the
+    # fail-closed direction: a staged rename or a quote-escaped path cannot silently read as clean.
+    #
+    # ⛔ RESIDUAL, STATED RATHER THAN IMPLIED. Git-IGNORED files are not listed here, and the deploy's
+    # `find` IS ignore-blind, so a `.pyc`/log in the source is copied, hashed into the manifest and
+    # counted under this commit while this field says clean. That is deliberate: an ignored file is a
+    # regenerable artifact OF those bytes rather than a divergent byte, and `--ignored=matching` (what
+    # `install.sh:1482`'s legacy stamp uses) would make every checkout carrying a `__pycache__`
+    # permanently dirty — an alarm that always fires is an alarm nobody reads. The manifest's own
+    # hashes are the precise answer for those files; this field answers the commit question.
+    if _st="$(git -C "$SRC" status --porcelain -uall -- . 2>/dev/null)"; then
+      # ⛔ `--show-prefix` IS USED HERE TO STRIP, NOT TO SCOPE — the opposite of the bug above. Porcelain
+      # prints paths relative to the REPO ROOT even when `git -C` moved us into `$SRC`, so the recorded
+      # write set (relative to `$SRC`) only lines up after the prefix is removed. It is empty (length 0)
+      # when `$SRC` IS the root, which is why the strip is guarded rather than assumed.
+      _PRE="$(git -C "$SRC" rev-parse --show-prefix 2>/dev/null)"
+      _PLEN="${#_PRE}"
+      SRC_DIRTY="false"
+      while IFS= read -r _ln; do
+        [ -n "$_ln" ] || continue
+        _p="${_ln:3}"
+        case "$_p" in *" -> "*) _p="${_p##* -> }" ;; esac   # porcelain v1 renders a rename `old -> new`
+        if [ "$_PLEN" -gt 0 ]; then
+          case "$_p" in "$_PRE"*) _p="${_p:$_PLEN}" ;; esac
+        fi
+        if [ -n "$SKIPS" ] && grep -qxF -- "$_p" <<<"$SKIPS"; then continue; fi
+        SRC_DIRTY="true"; break
+      done <<<"$_st"
     fi
   fi
 
@@ -558,15 +586,25 @@ check)
       # ⛔ THE CROSS-WRITER CASE, AND WHY IT IS NOT A REFUSAL (measured 2026-10-30, review of #3053). The
       # three writers of $O have DIFFERENT write sets: `start` records depth-1 `*.sh` only, while
       # `deploy-harness.sh` and `deploy-mac-orchestrator.sh` (phase B) pass no `--skip` and write the
-      # whole staged tree. So a `start`-recorded box — the verb operators actually run — is read back by
-      # a BROADER gate, and every install.sh-seeded doc came out an UNCOMMITTED-EDIT: reproduced with
-      # the shipped tool, `check --o $O --src $SRC` (exactly deploy-harness.sh:366's call) returned 1 on
-      # `README.md` and `retired/old.sh` whose bytes were IDENTICAL to the source's. The deploy turns
+      # whole staged tree. Each `write` REPLACES `$O/.harness-provenance`, so the manifest always
+      # describes the LAST writer: a broad deploy records the docs and `start` then re-records the box
+      # WITHOUT them, leaving `$O` holding files no record claims. (`install.sh` is not the source of
+      # those docs — it seeds only `$O/gh-rest/gh` and `$O/gh-limit.py`, by its own comment at
+      # `install.sh:1507`.) So a `start`-recorded box — the verb operators actually run — is read back by
+      # a BROADER gate, and every doc the earlier deploy wrote came out an UNCOMMITTED-EDIT: reproduced
+      # with the shipped tool, `check --o $O --src $SRC` (exactly deploy-harness.sh:366's call) returned 1
+      # on `README.md` and `retired/old.sh` whose bytes were IDENTICAL to the source's. The deploy turns
       # that 1 into `exit 78` + "those bytes exist nowhere else: copy them aside".
       # The gate's question is "would this run DISCARD bytes?" — and overwriting a file with its own
       # contents discards nothing. Compared against --src (the bytes THIS deploy writes), because that
       # is the comparison that decides it. A file whose $O bytes DIFFER still refuses below: that is
       # the hand patch, and it is the arm that must never go quiet.
+      # ⛔ "NOTHING IS DISCARDED" IS A CLAIM ABOUT BYTES, AND ONLY BYTES. `cmp` cannot see a mode change,
+      # so a file whose CONTENT matches the source but whose permissions were relaxed here reads
+      # SAME-AS-SOURCE and is republished with the source's mode. No bytes are lost, and a RECORDED
+      # file's mode change was never visible either (the manifest hashes content, not mode), so this
+      # widens an existing blind spot by one file class rather than opening a new one — stated because
+      # the sentence above would otherwise be read as covering it.
       if cmp -s "$SRC/$_r" "$O/$_r"; then
         say "SAME-AS-SOURCE   $_r — in $O and ABSENT from the record, but $O already holds the SOURCE's bytes, so this deploy would overwrite them with themselves: nothing is discarded and there is no patch to recover"
         SAMESRC=$((SAMESRC + 1)); continue

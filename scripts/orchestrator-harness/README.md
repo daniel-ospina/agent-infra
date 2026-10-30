@@ -1330,11 +1330,17 @@ file `$O` carries that the record never saw — *when the incoming source ships 
 the file the copy overwrites. (A hand-placed file the source does not ship is merely reported; the deploy
 does not delete it.) `harness-provenance.sh check` refuses a record that cannot describe itself — no
 record, an unreadable one, `files=0`, or a `files=` count that disagrees with the manifest below it — so a
-damaged record can never be the gate's "clean". Two more states are ROUTINE, not edits, and both are
+damaged record can never be the gate's "clean". Three more states are ROUTINE, not edits, and all are
 named as such so nobody goes looking for a patch that does not exist: a **`STALE-RECORD`** byte (the
 check) or a **`PENDING`** file (the writer) is `$O` already holding the *ref's / source's* bytes while the
 record predates them — what `deploy-mac-orchestrator.sh`'s phase-A-only run deliberately leaves behind;
-the remedy is a completed deploy, and nothing you wrote is discarded. And a record written from a
+the remedy is a completed deploy, and nothing you wrote is discarded. A **`SAME-AS-SOURCE`** file is `$O`
+carrying a name the record never saw *with the source's own bytes*, which happens routinely because each
+`write` REPLACES the record: a broad deploy records the docs, then `orchestrator-bringup.sh start`
+re-records the box with its narrower write set and those names drop out of the manifest. Overwriting them
+with themselves discards nothing, so they are reported and **not** counted — there is no patch to hunt,
+and the deploy does not refuse. (A file whose bytes **differ** from the source still refuses, naming it an
+`UNCOMMITTED-EDIT`: that one is a real patch, and it is the arm that must never go quiet.) And a record written from a
 checkout with uncommitted changes says **`sourceDirty=true`** instead of implying the commit owns those
 bytes — `show` prints `(SOURCE WAS DIRTY …)` beside the commit, and the check reports it as an identity
 problem (the legacy stamp called the same fact `agentInfraDirty`, and the better record used to MASK it).
