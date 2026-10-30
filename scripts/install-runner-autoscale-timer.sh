@@ -510,28 +510,44 @@ note_repo_change() {
 # ⛔ ONLY THE FIRST `--repo` PAIR IS CONFIGURATION. argparse `store`s it, so the LAST one wins: an artifact
 # carrying `--repo "o/r" --repo "evil/pool"` converges `evil/pool` while `artifact_repo_value` (and so
 # `note_repo_change` and `drift_inputs=repo`) report `o/r` from the FIRST — a silent re-point of the pool
-# that nothing compared. A second pair is therefore RE-EMITTED as a bare `--repo` for the classifier to
-# report, and only a first pair carrying a real value is dropped.
+# that nothing compared. A second pair is therefore RE-EMITTED for the classifier to report, and only a
+# first pair carrying a real value is dropped.
+# ⛔ AND THE SECOND PAIR IS COMPARED, NOT JUST COUNTED. Re-emitting every second pair made an EQUAL
+# duplicate (`--repo "o/r" --repo "o/r"` — the same pool twice, which argparse resolves to the pool the
+# artifact declares) read as a re-point: red, with two statements that were both false about it, the
+# "unrecognized arguments / every tick exit 2" text and "converge a DIFFERENT pool". A false block on a
+# working schedule is the class this file exists to remove, so the value decides: EQUAL is configuration
+# and is dropped, DIFFERENT is re-emitted as `--repo-dup=<value>` so the operator is told the one true
+# consequence (argparse keeps the LAST, so the ticks converge that pool).
 # ⛔ AND A VALUELESS `--repo` IS NOT CONFIGURATION either: this strip used to remove the flag plus whatever
 # token followed, unconditionally, so a TRAILING `--repo` was dropped for having no value and
 # `--repo --dry-run` had its `--dry-run` EATEN as if it were the value. argparse rejects both (measured:
 # rc=2, "argument --repo: expected one argument"). `pending` buffers the flag one token so the next line
-# is judged rather than assumed.
+# is judged rather than assumed; the same rule applies to the SECOND pair, whose value is buffered in
+# `duppending`.
 exec_remainder_after_script() {
     printf '%s\n' "${1:-}" | awk '
         { if (NF == 0) next
           if (++pos <= 2) next
+          if (duppending) {                     # the token after a SECOND --repo pair
+              duppending = 0
+              if ($0 != "" && $0 !~ /^-/) {
+                  if ($0 != first) print "--repo-dup=" $0   # a REAL re-point
+                  next                                      # equal to the first: configuration
+              }
+              print "--repo"; next              # the SECOND pair has no value either
+          }
           if (pending) {
               pending = 0
-              if ($0 != "" && $0 !~ /^-/) next   # a real value: configuration, dropped with its flag
+              if ($0 != "" && $0 !~ /^-/) { first = $0; next }   # a real value: configuration, dropped
               print "--repo"                      # NO value: report the flag, then judge this token too
           }
           if ($0 == "--repo") {
-              if (repopairs++) { print "--repo"; next }   # a SECOND pair is a re-point, not configuration
+              if (repopairs++) { duppending = 1; next }   # a SECOND pair: its VALUE decides
               pending = 1; next
           }
           print }
-        END { if (pending) print "--repo" }'
+        END { if (pending) print "--repo"; if (duppending) print "--repo" }'
 }
 
 # artifact_is_armed() — does the INSTALLED artifact actually CONVERGE? Used by `--arm`'s failure path,
@@ -1183,7 +1199,18 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             # Dropping it unconditionally certified exactly the state this verb exists to refuse —
             # ARMED exit 0 over a schedule that is RED every nine minutes — so it follows the
             # `--want=`/`--root=` rule: an EMPTY value is reported, a real slug is configuration.
-            --workdir=*)       [ -n "${l#*=}" ] || out="$out $l" ;;
+            --workdir=*)       : ;;
+            # ⛔ AN EMPTY `--workdir=` IS NOT AN EXIT-2 CASE, AND REPORTING IT WAS A FALSE BLOCK WITH A
+            # FALSE REASON. This arm copied the `--want=`/`--root=`/`--repo=` rule, but `--workdir` does
+            # not share their premise: it is consumed ONLY by `--install-unit` (the converge path never
+            # receives it), the writers VALIDATE the value rather than trusting it, and an EMPTY value is
+            # a documented, meaningful input — `unit_workdir_problem` maps `None`, `""` and `%h` alike to
+            # the account home. So `--workdir=` parses (measured: `rc=0` on the pass's own command line)
+            # and every tick converges, while this classified it `other:` and the `other:` arm told the
+            # operator it was an argument the installer "did not render" that makes "every tick exit 2"
+            # — both false, about the one switch the SAME arm's comment calls "a legitimate converge and
+            # is now benign". A real value (and the empty one) is accepted here; a `--workdir` with NO
+            # value is still refused by the space-form arm above, which is the shape argparse rejects.
             --want=*)          want_value_ok "${l#*=}" || out="$out $l" ;;
             --root=*|--repo=*) [ -n "${l#*=}" ] || out="$out $l" ;;
             *)                 out="$out $l" ;;
@@ -1857,19 +1884,42 @@ do_status() {
                    # switches the same message then listed as accepted (and about `--workdir`, which is a
                    # legitimate converge and is now benign). A stated reason that is false is the class
                    # this whole block exists to remove.
-                   unrecognised="$installed_mode"
-                   for known in --install-unit --check-units; do
-                       unrecognised="${unrecognised//$known/}"
+                   # ⛔ TOKEN-WISE, NEVER A SUBSTRING DELETION. This filtered with
+                   # `${unrecognised//$known/}`, which removes the NAME wherever it appears inside a
+                   # larger token: a hand-edited `--install-unit--check-units` (argparse: unrecognized)
+                   # had BOTH names deleted, `unrecognised` came out EMPTY, the generic line was
+                   # suppressed, and neither specific pattern below matches a token with no surrounding
+                   # space — so the verb exited 1 with NO DIAGNOSTIC AT ALL about a red artifact, and
+                   # `--check-unitsx` was reported as `('x')`, the wrong argument named. Only the exact
+                   # tokens this block gives its OWN line to are removed now; everything else is named
+                   # verbatim.
+                   unrecognised=""
+                   for tok in $installed_mode; do
+                       case "$tok" in
+                           --install-unit|--check-units) ;;          # recognised ACTION: own line below
+                           --repo|--repo-dup|--repo-dup=*) ;;        # recognised --repo SHAPE: own lines below
+                           *) unrecognised="$unrecognised $tok" ;;
+                       esac
                    done
-                   unrecognised="$(printf '%s' "$unrecognised" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
+                   unrecognised="${unrecognised# }"
                    [ -z "$unrecognised" ] || err "the installed artifact carries arguments this installer did not render ('$unrecognised'). The pass accepts --repo, --root <path>, --want <n>, --status, --dry-run, --json, --install-unit, --check-units and --workdir <path>; anything OUTSIDE that set makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
                    # ⛔ ONE OF THOSE OUTSIDE-THE-SET CASES IS A RECOGNISED SWITCH THE PASS CANNOT TAKE AS
-                   # WRITTEN — with no value, with a value of the wrong SHAPE (`--want` is an int), or as a
-                   # SECOND `--repo` (argparse keeps the LAST, so the pass converges a pool that is not the
-                   # one on disk). It reaches this arm because the classifier refuses the VALUE, so say
-                   # that, or the operator is told an argument the pass plainly accepts is unrecognised.
+                   # WRITTEN — with no value, or with a value of the wrong SHAPE (`--want` is an int). It
+                   # reaches this arm because the classifier refuses the VALUE, so say THAT, or the
+                   # operator is told an argument the pass plainly accepts is unrecognised.
                    case " $installed_mode " in
-                       *" --want "*|*" --root "*|*" --repo "*|*" --want= "*|*" --root= "*|*" --repo= "*) err "  one of $installed_mode is a switch the pass cannot take as written. NO VALUE or a value of the wrong shape makes argparse fail every tick (\"--want\" needs a whole number of 0 or more; \"--repo\" with no value is \"expected one argument\"; an empty \"--repo=\" reads the pool as repos//actions/runners, a 404). And a SECOND \"--repo\" pair is not configuration — argparse keeps the LAST, so every tick would converge a DIFFERENT pool than the one this artifact declares. Give it a value, drop the duplicate, or re-install with this installer." ;;
+                       *" --want "*|*" --root "*|*" --workdir "*|*" --want= "*|*" --root= "*|*" --repo= "*) err "  one of $installed_mode is a switch the pass cannot take as written. NO VALUE makes argparse fail every tick (\"--want\" needs a whole number of 0 or more; \"--root\", \"--workdir\" and \"--repo\" need a value; an empty \"--repo=\" reads the pool as repos//actions/runners, a 404). Give it a value or remove the argument." ;;
+                   esac
+                   # ⛔ `--repo` GETS ITS OWN TWO LINES, BECAUSE ITS TWO FAILURES ARE DIFFERENT. A
+                   # VALUELESS one is argparse's "expected one argument" (exit 2, every tick). A SECOND
+                   # PAIR is not a syntax error at all — the pass accepts it — but argparse keeps the
+                   # LAST, so the ticks converge a pool other than the one this artifact declares. Both
+                   # used to share one sentence that opened with "every tick exits 2", which is FALSE
+                   # for the second pair, and that sentence also claimed the pool "would change" for a
+                   # duplicate whose values are EQUAL (which the classifier now drops as configuration).
+                   case " $installed_mode " in
+                       *" --repo "*) err "  --repo: the artifact carries this switch with NO value, so argparse exits 2 (\"expected one argument\") on every tick. Give it a value or remove the argument." ;;
+                       *" --repo-dup="*) err "  --repo: the artifact carries a SECOND \"--repo\" pair whose value DIFFERS from the first. argparse keeps the LAST, so every tick converges a different pool than this artifact declares (and than --status reports, which reads the first). Drop the duplicate or re-install with this installer." ;;
                    esac
                    # ⛔ AND A RECOGNISED ACTION IS NOT AN UNKNOWN ONE — SAY WHAT IT ACTUALLY DOES. The
                    # switches above are accepted, so the "exit 2" reason is FALSE for them, and their real

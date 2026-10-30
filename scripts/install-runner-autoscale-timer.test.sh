@@ -1646,6 +1646,105 @@ OUT="$(run_install Darwin "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "the launchd arm refuses an ARMED plist with NO record too"
 rm -f "$ARM"
 
+# ── T59: `--workdir` is a converge argument, and an EMPTY `--workdir=` is not an exit-2 case ──
+# The inline arm copied the `--want=`/`--root=`/`--repo=` rule ("an EMPTY value is reported"), but
+# `--workdir` does not share their premise: it is consumed ONLY by `--install-unit`, the writers VALIDATE
+# the value, and `unit_workdir_problem` maps `None`, `""` and `%h` alike to the account home — so
+# `--workdir=` parses (measured rc=0 on the pass's own command line) and every tick converges. Reported,
+# it reddened a working schedule with the false "did not render … every tick exits 2" reason, about the
+# one switch the same arm's comment calls "a legitimate converge and is now benign".
+say_case "T59 --workdir converges, and an EMPTY inline value is not the exit-2 case"
+D="$T/c59"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1            # DISARMED, no record: coherent
+box_sed_i '/^ExecStart=/ s|$| --workdir=|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "an EMPTY --workdir= is not a broken schedule (the pass parses it; '' is the account home)"
+assert_contains "$OUT" "mode=--dry-run (DISARMED" "and the mode is still read correctly"
+assert_absent "$OUT" "did not render" "…and it is NOT called an argument the installer never rendered"
+box_sed_i '/^ExecStart=/ s| --workdir=||' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --workdir /srv/wd|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "the SPACE form with a path is a legitimate converge too"
+assert_absent "$OUT" "did not render" "…and is not reported either"
+box_sed_i '/^ExecStart=/ s| --workdir /srv/wd||' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --workdir|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "but --workdir with NO value IS refused (argparse: expected one argument)"
+assert_contains "$OUT" "--workdir" "naming the dangling switch"
+
+# ── T60: a DUPLICATE `--repo` is judged by its VALUE, not by its presence ───────────────
+# Re-emitting every second pair red an EQUAL duplicate — the same pool twice, which argparse resolves to
+# the pool the artifact declares — and said two false things about it ("every tick exits 2", and
+# "converge a DIFFERENT pool"). A false block on a working schedule is the class this file exists to
+# remove. The value decides now: EQUAL is configuration and is dropped; DIFFERENT is a real re-point and
+# gets the one true consequence.
+say_case "T60 an equal duplicate --repo is configuration, a different one is a re-point"
+D="$T/c60"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+SLUG="$(sed -n 's/.*--repo "\([^"]*\)".*/\1/p' "$D/$UNIT_NAME.service" | head -1)"
+[ -n "$SLUG" ] || bad "precondition: the rendered artifact carries a --repo pair"
+box_sed_i '/^ExecStart=/ s|$| --repo "'"$SLUG"'"|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "the SAME pool twice is configuration — the pass converges the declared pool"
+assert_absent "$OUT" "did not render" "…so it is not reported as an argument the installer never rendered"
+box_sed_i '/^ExecStart=/ s| --repo "'"$SLUG"'"$| --repo "evil/pool"|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a SECOND pair naming a DIFFERENT pool is red (argparse keeps the LAST)"
+assert_contains "$OUT" "DIFFERS from the first" "naming the real consequence"
+assert_absent "$OUT" "every tick exit 2" "…and NOT the false 'every tick exits 2' reason: the pass accepts this"
+assert_absent "$OUT" "unrecognized arguments" "…nor 'unrecognized arguments'"
+
+# ── T61: the KEPT-RECORD test is the SHARED classifier, not a substring ────────────────
+# `artifact_is_armed` decides whether a dated record is KEPT over a failed re-render, and it asked the
+# line for the `--dry-run`/`--status` SUBSTRING. Pinned by nothing: T16's fixture has NO artifact (it
+# fails on `[ -f ]` before the classifier runs) and T42's two fixtures are the states the old substring
+# test answered correctly, so reverting to the substring body kept the suite at PASS=397 FAIL=0 — the
+# half that decides whether a record SURVIVES could regress to keeping it over an artifact that cannot
+# converge. This case is that artifact: `--apply` converges nothing and carries neither substring.
+say_case "T61 a failed arm does NOT keep the record over an artifact that cannot converge"
+D="$T/c61"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1                          # DISARMED artifact, no record
+# ⛔ THE RECORD MUST NOT EXIST WHEN THE FAILING ARM RUNS, or the verb takes its ALREADY-ARMED early return
+# and never consults `artifact_is_armed` at all (measured: the first draft of this case did exactly that
+# and proved nothing). A FRESH arm writes the record, then the failed re-renders drive the KEEP/DROP
+# decision — so the artifact is made converged-SHAPED by hand here and the arm signs its own record.
+box_sed_i '/^ExecStart=/ s| --dry-run||' "$D/$UNIT_NAME.service"         # no mode argument: would converge
+box_sed_i '/^ExecStart=/ s|$| --apply|' "$D/$UNIT_NAME.service"         # ...except --apply converges nothing
+assert_nofile "$ARM" "precondition: no record, so the arm runs the fresh path"
+ENVV=(TEMPLATES_DIR="$T/tpl16")                                         # make BOTH re-renders fail
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a failed arm over a non-converging artifact exits 1"
+assert_contains "$OUT" "NOT ARMED" "and says NOT ARMED — an --apply artifact converges nothing"
+assert_nofile "$ARM" "so the dated record is DROPPED (the substring test KEPT it: 'STILL ARMED')"
+
+# ── T62: a RELATIVE script path is refused, not read as present ─────────────────────────
+say_case "T62 an artifact naming the script RELATIVELY is refused"
+D="$T/c62"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+box_sed_i 's|"[^"]*converger\.py"|"converger.py"|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a relative script is red: a scheduler resolves it against ITS cwd (203/EXEC every tick)"
+assert_contains "$OUT" "NOT AN ABSOLUTE PATH" "saying which rule it breaks"
+assert_contains "$OUT" "script_present=no" "and not claiming the script is present"
+
+# ── T63: the recognition filter is TOKEN-wise, so nothing is silently swallowed ────────
+# The filter deleted the NAMES as SUBSTRINGS, so a merged token lost both and the verb exited 1 with no
+# diagnostic at all, while a suffixed one was reported as the wrong argument ('x').
+say_case "T63 a merged or suffixed token is named verbatim, never silently dropped"
+D="$T/c63"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+box_sed_i '/^ExecStart=/ s|$| --check-unitsx|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a SUFFIXED switch is red"
+assert_contains "$OUT" "--check-unitsx" "and named in full, not as the leftover 'x'"
+box_sed_i '/^ExecStart=/ s| --check-unitsx||' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --install-unit--check-units|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a MERGED token is red"
+assert_contains "$OUT" "did not render" "and still gets a diagnostic (the substring filter deleted both names and printed NOTHING)"
+assert_contains "$OUT" "--install-unit--check-units" "naming the token it could not read"
+rm -f "$ARM"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
