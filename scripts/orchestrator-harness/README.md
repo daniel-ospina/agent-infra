@@ -4333,8 +4333,11 @@ Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired i
 `run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work
 (fail-closed, because the alternative makes a `gh` outage indistinguishable from an empty queue),
 and every deferral emits ONE line naming the depth, the runners, the ceiling and WHAT was deferred —
-silence is what makes a deferral look like a bug. A deferral writes the same bail marker the
-cross-box refusal writes, so it consumes no attempt and is re-decided from a fresh read next cycle.
+silence is what makes a deferral look like a bug. A deferral consumes no attempt: the ISSUE-batch
+arm releases its claims and drops its rows, and the CI-rerun arm withholds the rerun and records why
+(`state/rerun-<PR>-<RID>` is not written). The `fixbail-*` marker is NOT written by either — it
+belongs to `fix-one.sh`'s own two pre-agent deferrals (the cross-box refusal and the PR-OWNER lock),
+which is where it is written.
 
 
 ### 7.3 The harness is unversioned (this directory is the remedy)

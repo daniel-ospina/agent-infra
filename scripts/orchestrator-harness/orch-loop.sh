@@ -1064,12 +1064,15 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 }
 
 # refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
-# fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
-# already owns this head) — OR when the CI-queue gate DEFERS the push before any work (fix-one.sh's
-# `ciq_ci_allowed` arm, #2296). Both are "no agent work was done", which is the only property this
-# marker asserts; the LOG LINE below names both causes, because a deferral logged as a cross-box
-# refusal sends an operator hunting for a lease that never existed (the #1720 "the log names the
-# wrong cause" class). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# fix-one.sh writes $O/state/fixbail-<pr>-<head> on any of its THREE pre-agent deferrals: the
+# cross-box CAS refusal (another box already owns this head), the PR-OWNER lock
+# (`mergeclaim-<PR>.lock` held by a live pid, #2576), and a PR-owner takeover that could not complete.
+# Every one is "no agent work was done", which is the only property this marker asserts; the LOG LINE
+# below names the cause it was given, because a deferral logged as a cross-box refusal sends an
+# operator hunting for a lease that never existed (the #1720 "the log names the wrong cause" class).
+# ⛔ THERE IS NO CI-QUEUE ARM HERE OR IN fix-one.sh (#2927): a repair path reads no CI queue, so it
+# can never write a `DEFERRED by the CI-queue gate` line — the arm that used to sit here was
+# unreachable, and naming it sent a manual operator to wait for a deferral that cannot happen. The controller books the attempt at SPAWN (fixcount+1) and, on the
 # reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
 # used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
 # refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
