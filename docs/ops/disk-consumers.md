@@ -91,12 +91,17 @@ that GAINED five runners in a week silently lost its headroom and nothing measur
   `/tmp/actions-runner*/_work` (`DISK_REAPER_RUNNER_GLOBS`);
 * **the gate is mtime over the entry and its content**: an entry is a candidate only when **nothing in
   it has been written for longer than `DISK_REAPER_RUNNER_MIN_AGE`** (default 3600 s), the entry's own
-  top directory included — the conservative direction, since any write there restores the floor. A
-  running job writes into its entry
-  continuously, so mtime is a positive proof of death; there is no local busy-check on a runner to
+  top directory included — the conservative direction, since any write there restores the floor. The
+  in-entry witness is the checkout's OWN writes; `_work/_temp` (step scripts, command logs) is a SIBLING
+  of `_work/<repo>` at the runner root (`actions/runner` `WellKnownDirectory`), so writes there do not
+  refresh the checkout's floor. So mtime is a positive proof of death for that entry; there is no local
+  busy-check on a runner to
   consult, and a `pgrep`-shaped guess would keep every dead entry while ANY runner is idle. ⚠️ Residual:
-  a job that writes NOTHING for longer than the floor (one long quiet step) is indistinguishable from a
-  dead entry by that test — raise the floor for such a box (`DISK_REAPER_RUNNER_MIN_AGE=7200`), which is
+  a job that writes NOTHING inside its checkout for longer than the floor is indistinguishable from a
+  dead entry by that test — a whole-job exposure for a job whose artefacts land in `$TMPDIR`,
+  `~/.cache` or `_work/_temp`, not just one quiet step. Raise the floor for such a box
+  (`DISK_REAPER_RUNNER_MIN_AGE=7200`, the only empirically validated value; the shipped default is
+  3600 s), which is
   the intended response;
 * **`_work/_tool` and `_work/_actions` are DELIBERATELY RETAINED**: they are the runner's cross-job
   caches (downloaded actions, fetched toolchains), so reaping them does not free dead checkout — it
