@@ -767,6 +767,14 @@ if [ -f "$STAMP" ]; then
         log_line "  ⚠ legacy identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
         log_line "    SUPERSEDED by $O/.harness-provenance, which this run recorded (commit + per-file manifest);"
         log_line "    check-deployed-drift.sh reads that record first, so this deploy is NOT reported as a hand edit."
+        # ⛔ BUT NOT EVERY READER MOVED WITH IT, and silence about that is the same "one fact, several
+        # consumers" defect this record exists to remove. `bin/harness doctor`, `harness-up` and this
+        # family's `status` still answer "which commit is this box running?" from the STAMP, so after
+        # this run THEY are the stale ones — and the line above, alone, leaves the operator with no
+        # remedy for the answer they were just given. Named, with the one command that refreshes it,
+        # rather than a bare "SUPERSEDED" that reads as "nothing to do".
+        log_line "    ⚠ readers still on the stamp (bin/harness doctor, harness-up, bringup status) will report the OLD commit:"
+        log_line "      re-run install.sh if you need THAT answer current; the drift check and every deploy do not."
         detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12}; superseded by .harness-provenance)")
       else
         STAMP_NOTE="; identity record STALE — run install.sh to re-stamp"

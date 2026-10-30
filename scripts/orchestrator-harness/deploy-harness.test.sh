@@ -1038,6 +1038,25 @@ printf '{"payloadSha256":"%s"}\n' "$STAMP_LIVE" > "$O19/.agent-infra-stamp.json"
 notify_reset; deploy "$SRC19" "$O19"
 grep -qi "identity record STALE" <<< "$OUT" && bad "a CURRENT stamp was reported as stale (false alarm)" || ok "a current identity record is not flagged"
 
+# ── 19b. WHEN THIS RUN RECORDED THE BOX, the stamp's readers are named — not left with no remedy ───
+# ⛔ The `SUPERSEDED` line is TRUE for the drift gate (it prefers .harness-provenance) and was, on its
+# own, an operator dead end: `bin/harness doctor`, `harness-up` and `bringup status` still answer
+# "which commit is this box running?" from the STAMP, so after this run THEY report the old commit.
+# A verdict that says "superseded" and stops reads as "nothing to do"; the one command that refreshes
+# the answer they give has to be in the same breath.
+say_case "19b. a superseded stamp NAMES the readers still on it, and their remedy"
+SRC19p="$T/src19p"; O19p="$T/o19p"; make_src "$SRC19p"; make_target "$O19p"
+cp "$HERE/harness-provenance.sh" "$SRC19p/"; chmod +x "$SRC19p/harness-provenance.sh"
+printf '{"payloadSha256":"deadbeefdeadbeef"}\n' > "$O19p/.agent-infra-stamp.json"
+notify_reset; deploy "$SRC19p" "$O19p"
+[ -f "$O19p/.harness-provenance" ] && ok "19b: this run recorded .harness-provenance" \
+                                 || bad "19b: no provenance record after a deploy from a source that ships the writer"
+grep -qi "SUPERSEDED by" <<< "$OUT" && ok "19b: the verdict says the record supersedes the stale stamp" \
+                                     || bad "19b: the stale stamp was not explained — $OUT"
+grep -qi "bin/harness doctor" <<< "$OUT" && grep -qi "re-run install.sh" <<< "$OUT" \
+  && ok "19b: …and NAMES the readers still on the stamp plus the command that refreshes them" \
+  || bad "19b: 'superseded' with no remedy for the answers that are still stale — $OUT"
+
 # ── 19c. AN UNREADABLE STAMP IS "CANNOT CHECK", NOT "NO RECORD" ──────────────────────────────────
 # Review P3 (cycle 8), REPRODUCED before this case existed: the stamp is read with
 # `REC="$(sed … 2>/dev/null | head -1)"` and the assignment's status was never read, so a present but

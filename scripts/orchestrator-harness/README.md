@@ -1288,7 +1288,8 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 `$O` is **not a checkout**, so `git` cannot answer this (`cd ~/orchestrator && git rev-parse --show-toplevel`
 → `fatal: not a git repository`). The deploy path therefore leaves a record beside the bytes —
 `$O/.harness-provenance`, written by `harness-provenance.sh` at the end of a **complete** deploy
-(`deploy-harness.sh`, and `deploy-mac-orchestrator.sh` phase B). Plain text, one `sha256  path` line per
+(`deploy-harness.sh`, `deploy-mac-orchestrator.sh` phase B, and `orchestrator-bringup.sh start` — the
+three writers of `$O/*.sh`). Plain text, one `sha256  path` line per
 file the deploy wrote, so a box answers with no checkout, no network and no `jq`.
 
 ```bash
@@ -1357,8 +1358,10 @@ is no per-file manifest, so the report fails the run and *says* it cannot name t
 **A redeploy REFUSES to overwrite an uncommitted edit.** Measured 2026-10-28: a hand-applied fix to
 `$O/merge-one.sh` was reverted **twice** by redeploys (the file's mtime moved at 20:02 and again at
 20:15, after the patch), the box ran unpatched code, and a production fix looked like it had
-"stopped working". Both deploy paths now compare `$O` against its own record **before copying**, print
-every file they would discard with which side is newer, and exit **78 with nothing written**:
+"stopped working". All three writers of `$O/*.sh` now compare `$O` against its own record **before
+copying**, print every file they would discard with which side is newer, and exit **78 with nothing
+written** (`orchestrator-bringup.sh start` refuses with its own rc=1 and the same file list, because
+its contract is `0 ok · 1 refused · 2 cannot-determine`):
 
 ```bash
 bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator
@@ -1368,7 +1371,14 @@ bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator
 
 bash scripts/deploy-mac-orchestrator.sh --dry-run     # the plan, and the refusal, writing nothing
 bash scripts/deploy-mac-orchestrator.sh --accept-discard   # discard them deliberately
+bash scripts/orchestrator-bringup.sh start --accept-discard # the same, on the verb operators run
 ```
+
+`--accept-discard` is a **flag on every one of them**. `deploy-mac-orchestrator.sh` also reads
+`ACCEPT_DISCARD=1` from the environment (its `PHASE`/`WAIT`/`DRY_RUN` are env too);
+`deploy-harness.sh` and `orchestrator-bringup.sh` deliberately do **not**, because an export set for the
+mac path used to silently disarm the gate on the two scripts that protect the same live patch — the gate
+that stops a patch being destroyed is not reachable through ambient environment.
 
 `--dry-run` prints the **plan** (`new` / `unchanged` / `overwrite` per file) *before* the gate runs, so
 a run that would refuse shows both the refusal and the exact list `--accept-discard` would destroy; it
