@@ -220,7 +220,15 @@ printf '#!/usr/bin/env bash\necho v1\n' > "$O2b/extra.sh"          # hand-placed
 bash "$PROV" write --o "$O2b" --src "$OLDSRC" >/dev/null 2>&1         # the record never saw extra.sh
 printf '#!/usr/bin/env bash\necho FROM-THE-REF\n' > "$SRC/extra.sh"  # the NEW source ships that name
 OUT="$(bash "$PROV" check --o "$O2b" 2>&1)"; RC=$?
-ck "a hand-placed file is an edit for a plain check (1)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ AND THE PLAIN CHECK IS NOT THE GATE, which is why it must not carry the gate's verdict. The
+# record was written from a source that does NOT ship `extra.sh`, and a deploy writes only what its
+# source ships — so no deploy of this tree can overwrite it, and calling it UNCOMMITTED-EDIT made the
+# documented question ("has anything in $O changed since that deploy?") answer RED on a healthy box
+# for every box-carried script (on a Mac that is the whole resolver set: supervisor.sh,
+# disk-reaper.sh, pi-cache-reap.sh … — kept by the deploy on purpose). Reported, not counted.
+ck "a plain check REPORTS an unshipped file, and does NOT call it an edit (0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…naming it as PRESENT and saying the record's source does not ship that name" \
+  "$(qF "PRESENT          extra.sh" "$OUT" && echo 0 || echo 1)"
 OUT="$(bash "$PROV" check --o "$O2b" --src "$SRC" 2>&1)"; RC=$?
 ck "…and STILL one when the source ships that name (the deploy would overwrite it)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 ck "…named, with the reason it matters" "$(qF "UNCOMMITTED-EDIT   extra.sh" "$OUT" && echo 0 || echo 1)"

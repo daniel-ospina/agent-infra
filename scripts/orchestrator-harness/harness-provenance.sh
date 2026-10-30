@@ -371,6 +371,8 @@ check)
   EDITS=0
   MISS=0
   PEND=0
+  PRESENT=0
+  UNSHIPPED=0
   # ⛔ THE RECORD NAMES THE TREE IT WAS WRITTEN FROM (`source=`), SO A PLAIN `check` HAS A SOURCE TOO.
   # Classification used `$SRC` only, which is set only by `--src` — so the DOCUMENTED call
   # (`check --o $O`, no `--src`) still labelled a `PHASE=A` leftover "UNCOMMITTED-EDIT … recover the edit",
@@ -478,7 +480,29 @@ check)
       [ -f "$_f" ] || continue
       _b="${_f##*/}"
       grep -qxF -- "$_b" <<<"$SEEN" && continue
-      bad "UNCOMMITTED-EDIT   $_b — present in $O and ABSENT from the record (hand-placed, or written by a path that does not record)"
+      # ⛔ AN UNDESCRIBED FILE IS NOT AUTOMATICALLY AN EDIT, and calling it one is a false alarm on
+      # the box class this record was built for. `$O` legitimately carries scripts no deploy ships —
+      # on a Mac, the whole resolver set (`supervisor.sh`, `disk-reaper.sh`, `pi-cache-reap.sh`, … is
+      # the ProgramArguments of an armed schedule and ships from `scripts/`, one directory over), and
+      # `deploy_harness` KEEPS them on purpose. With every one of those labelled UNCOMMITTED-EDIT,
+      # the documented question ("has anything in $O changed since that deploy?") answered RED on a
+      # perfectly healthy box, permanently — the same "go hunt a patch that does not exist" defect
+      # this file already fixed for STALE-RECORD and PENDING.
+      # The distinction is what a deploy can DESTROY: a deploy writes only what its source ships, so
+      # a file the record's own source does not ship cannot be overwritten by any deploy of this tree.
+      # It is REPORTER, not counted, and not a finding — while a file the source DOES ship is exactly
+      # the `--src` arm's case, and stays a refusal (the gate both deploys call uses --src).
+      if [ -n "$CSRC" ] && [ ! -f "$CSRC/$_b" ]; then
+        say "PRESENT          $_b — in $O and ABSENT from the record; the record's source ($CSRC) does not ship that name, so no deploy of this tree would overwrite it. Not an edit."
+        PRESENT=$((PRESENT + 1)); continue
+      fi
+      if [ -z "$CSRC" ]; then
+        # CANNOT-VERIFY, and it stays a failure: with no source to ask, this file COULD be one a
+        # deploy overwrites, and "could be" is not a clean answer here.
+        bad "UNSHIPPED-UNKNOWN $_b — in $O and ABSENT from the record, and the record names no source that exists on this box, so whether a deploy would overwrite that name CANNOT be checked"
+        UNSHIPPED=$((UNSHIPPED + 1)); EDITS=$((EDITS + 1)); continue
+      fi
+      bad "UNCOMMITTED-EDIT   $_b — present in $O and ABSENT from the record (hand-placed, or written by a path that does not record), and the record's source ships that name, so a deploy would OVERWRITE it"
       EDITS=$((EDITS + 1))
     done
   else
@@ -505,6 +529,9 @@ check)
   fi
   if [ "$MISS" -gt 0 ]; then
     say "note: $MISS file(s) the record names are ABSENT from $O — a redeploy would create them; that is not a discard, so it is not a refusal"
+  fi
+  if [ "$PRESENT" -gt 0 ]; then
+    say "note: $PRESENT file(s) in $O are carried by the box and NOT shipped by the record's source — no deploy of this tree writes them, so they are reported and not counted as edits"
   fi
   [ "$EDITS" -eq 0 ] || exit 1
   exit 0
