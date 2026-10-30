@@ -262,8 +262,8 @@
 #   unparseable-path (poisoned record) > bare > main-checkout > self-checkout >
 #   worktree-locked > unreadable-path | prunable > live-process > live-cwd >
 #   dirty | ignored-artifact | status-timeout | status-error >
-#   detached-unreachable > open-pr > stranded-stash-unverifiable | stranded-stash >
-#   unpushed-unverifiable > too-recent > reclaimable
+#   detached-unreachable > open-pr > too-recent > too-young >
+#   stranded-stash-unverifiable | stranded-stash > unpushed-unverifiable > reclaimable
 #
 # ⛔ EVERY TOKEN ABOVE IS ONE THE CODE CAN EMIT (agent-infra#2541 review), and the
 # order is the order `abstain_gate` actually runs: the STASH arm first, then the
