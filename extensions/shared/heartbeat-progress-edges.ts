@@ -980,6 +980,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_WT_LOCK_STALE_SECONDS:-1800}",
     axis: "retention",
     guardedBy: NONE,
+    overrides: ['REAP_WT_LOCK_STALE_SECONDS="$REAP_WT_LOCK_STALE_CLAMPED"'],
+    note: "#2541 (review P2) — the SECOND declaration is the pre-lock clamp, and it is registered as an override rather than left as an unrecorded reassignment: when this horizon does NOT exceed REAP_WT_BUDGET_SECONDS the reaper RAISES it to 4x the budget before `lock_acquire` decides whether the lock is stale, because a live owner's lock is broken by an age test that ignores the budget. It is emitted as `REAP_WT_LOCK_STALE_NOTE` (a WARN on the run log), never applied silently — a pass that then aborts on the lock must still show that the horizon in force was not the one configured.",
   },
   {
     name: "VENV_MIN_AGE",
