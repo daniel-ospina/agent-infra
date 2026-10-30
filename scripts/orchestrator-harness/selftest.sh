@@ -5350,9 +5350,12 @@ if [ -f "$LC_LIB" ] && [ -f "$SUP_CELL" ]; then
   # (d) CALL SITES. A correct function nobody invokes reports nothing, so the two verbs that must
   # report are asserted by extracting their OWN bodies — not by trusting that they were edited.
   for _lcverb in cmd_start cmd_status; do
-    sed -n "/^${_lcverb}() {/,/^}/p" "$SUP_CELL" | grep -q 'lane_ceiling_report' \
+    # ⛔ A NON-COMMENT LINE, not a substring match: commenting the call out is exactly how a call
+    # site gets "removed" in practice, and a bare `grep -q lane_ceiling_report` finds the comment
+    # and calls that a PASS (measured while mutation-proving this arm).
+    sed -n "/^${_lcverb}() {/,/^}/p" "$SUP_CELL" | grep -qE '^[[:space:]]*lane_ceiling_report([[:space:];]|$)' \
       && ck "lane ceiling: $_lcverb REPORTS it (the one line, at the box's start and status)" 0 \
-      || { ck "lane ceiling: $_lcverb REPORTS it (the one line, at the box's start and status)" 1; echo "      $_lcverb does not call lane_ceiling_report"; }
+      || { ck "lane ceiling: $_lcverb REPORTS it (the one line, at the box's start and status)" 1; echo "      $_lcverb does not CALL lane_ceiling_report"; }
   done
 else
   ck "lane ceiling: scripts/lib/lane-ceiling.sh + cloud-cell-supervisor.sh present" 1
