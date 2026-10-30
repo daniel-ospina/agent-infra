@@ -569,7 +569,7 @@ degraded, exclusion holds only against passes that resolved the same state dir.
 ```
 mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
-verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
+verdict_uv=deferred verdict_venv=ok verdict_worktree=ok delegate_verdict_worktree=reap-ineffective
 would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
 skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
 freed_mb_unmeasured=
@@ -618,14 +618,34 @@ number in it was true. So the pass must also say what its numbers MEAN:
 | `reap-ineffective` | armed, examined `>= REAP_WT_INEFFECTIVE_MIN_EXAMINED` (default 10) records, removed NONE, and free space is UNDER `REAP_WT_DISK_FLOOR_MB` (default 4096 MiB) — a reaper that cannot reclaim on a full box |
 | `unmeasured` | the condition depended on free space and `df` could not answer — **never** read as `idle` |
 
-⛔ **`reap-ineffective` also writes a durable record**, `$STATE_DIR/reap-ineffective`, atomically
+⛔ **`reap-ineffective` also writes a durable record**, `$STATE_DIR/reap-ineffective.<repo>`, atomically
 (tmp + `mv`), carrying `verdict=`, `epoch=`, `repo=`, `mode=`, the counters, `free_mb=`, `floor_mb=`,
 `reasons=` and a one-line `remedy=`. A **summary line is not a verdict**: the line is gone when the
 next pass prints, and the incident is only visible afterwards if something durably said so. Any pass
 that **evaluated** the condition and found it not held REMOVES the file — so the record's presence
 means *the condition holds now*, not *it once held*; `unmeasured` deletes it too (a disk we could not
-read is not a disk we proved healthy). A fail-closed abort evaluated nothing, so it neither writes nor
-deletes the file, and its footer prints `VERDICT=?` — never an empty field. ⛔ **A record that could
+read is not a disk we proved healthy).
+
+⛔ **ONE RECORD PER REPO, not one per state dir.** `disk-reaper.sh` runs the worktree delegate once per
+repo **with the same state dir**, so a single fixed filename is last-writer-wins ACROSS repos: an
+ineffective repo followed by any repo with room had its alarm erased by a pass that never looked at
+it — measured in a fixture. The path therefore carries the checkout's basename (readable) plus a
+`cksum` of its canonical path (unique, so two checkouts named alike cannot collide), and each record
+is owned by that repo's own pass. Presence means *THIS repo's condition holds, as of its `epoch=`*;
+sum the records to read the box. The residual, stated: dropping a repo from `DISK_REAPER_REPOS`
+leaves its last record behind, so compare `epoch=` rather than assuming the newest pass rewrote every
+file.
+
+⛔ **A `--dry-run` never touches the record.** It removes nothing by construction, so it has evaluated
+none of the live condition and cannot say whether the condition holds. This matters because
+`disk-reaper.sh` **defaults** to `DISK_REAPER_DRY_RUN=1`, so a "delete unless the verdict is
+reap-ineffective" rule let a routine dry run on a full cell erase the armed pass's alarm.
+
+A fail-closed abort evaluated nothing, so it neither writes nor deletes the file. ⚠️ **Not every abort
+prints a footer**: the `git worktree list` failure, the empty-list refusal, the unwritable-log refusal
+and the lock-held refusal exit 3 before a footer is reachable (the unwritable-log one cannot log
+anything at all), while the `gh` and `ps` aborts do print one — and where a footer is printed it
+carries `VERDICT=?`, never an empty field. ⛔ **A record that could
 not be WRITTEN says so** (log `record=NOT-WRITTEN`, and the pass states that the verdict exists only
 on its own line): this branch fires when free space is under the floor, i.e. exactly when `ENOSPC` is
 live, so a missing file is never evidence that the condition cleared. `REAP_WT_FREE_MB` (a witness)
@@ -634,7 +654,10 @@ and `DF_BIN` are the test seams; the measured paths are `df -Pm <repo>` under `R
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
 `classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=`,
 `pr_merged=` and `delegate_verdict_worktree=` (the delegate's own `verdict=`, with the same
-`?`/`not-run`/`mixed` polarity; it is printed by `--print-status` and is deliberately SEPARATE from
+`?`/`not-run`/`mixed` polarity; it is printed by `--print-status` **and** on the cell health verb's
+per-class line (`scripts/cloud-cell-supervisor.sh`, `delegate=`) — a field the reader does not print
+does not exist, so a status channel that showed only `worktree=ok` for an ineffective reap was
+publishing the incident's own misleading sentence — and it is deliberately SEPARATE from
 `verdict_worktree=`, which stays the exit-code reading — an ineffective reap exits 0 by design, so
 without this field the fleet's record said `worktree=ok` for it). `examined = classified + deferred` and `classified = remove + preserved` are the two
 identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict

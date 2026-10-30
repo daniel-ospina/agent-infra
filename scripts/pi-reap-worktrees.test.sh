@@ -529,8 +529,8 @@ chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh
          "$T/bin/df-low" "$T/bin/df-roomy" "$T/bin/df-fail"
 
 # ── fixture builders ───────────────────────────────────────────────────
-mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
-    local envname="$1" d="$T/$1/repo"
+mk_repo() { # <env-name> [<subdir>] -> prints the repo path (one OLD commit on `main`)
+    local envname="$1" d="$T/$1/${2:-repo}"
     mkdir -p "$d" "$T/$1/home" "$T/$1/state"
     "$REAL_GIT" init -q -b main "$d"
     "$REAL_GIT" -C "$d" config user.email t@t
@@ -764,6 +764,18 @@ register_stash() {
         "$("$REAL_GIT" -C "$1" rev-parse "refs/heads/$2")"
 }
 footer() { tail -1 "$T/$1/reap.log" 2>/dev/null; }
+
+# verdict_path <env> <repo> — the per-repo record `reap_verdict_path()` computes in the reaper.
+# ⛔ IT MIRRORS THE SCRIPT, so every fixture also asserts the reaper's own `record=<path>` log line
+# against it — a drift between this copy and the script then fails loudly instead of quietly testing a
+# path nothing writes (the #3041 review found the record was ONE fixed filename, i.e. last-writer-wins
+# across the repos `disk-reaper.sh` feeds it; this helper is what makes that testable).
+verdict_path() {
+    local base sum
+    base="$(basename "$2" | tr -c 'A-Za-z0-9._-' '_')"
+    sum="$(printf '%s' "$2" | cksum | awk '{ print $1 }')"
+    printf '%s/%s/state/reap-ineffective.%s.%s\n' "$T" "$1" "${base:-repo}" "${sum:-0}"
+}
 
 echo "── pi-reap-worktrees.test.sh ─────────────────────────────────────"
 echo "gate fixtures (each drives ONE gate to its fail path)"
@@ -3641,6 +3653,70 @@ assert_absent "$("$REAL_GIT" -C "$REPO2" worktree list --porcelain)" "$WT_A26C2_
     "A26c2 …the gone-dir record was deregistered"
 assert_dir "$WT_A26C2" "A26c2 …while the age-floored checkout is still on disk"
 
+# ── A26e: a GONE-dir record is NEVER probed — pinned, because probing it is the fail-open ─
+# `commits_survive` is called WITHOUT the probe on the gone-directory path (`classify_one`), and the
+# reason is security-relevant: for a gone dir the admin HEAD is the commit's LAST DURABLE handle, so
+# a `remote-holds` verdict there would turn `preserve remote-only-ref` into `remove prunable` and
+# deregister the only handle to a commit whose local cache can be pruned away. Nothing pinned it —
+# A26c's gone row holds a BRANCH, so it reaches `remove prunable` legitimately and cannot tell the
+# two apart. This leg is the discriminator: the remote DOES advertise the sha, so the probe would
+# say yes — the row must read `remote-only-ref` anyway.
+ENV=A26e; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26e
+commit_in_wt "$REPO" "$OLD_DATE" a26e
+A26E_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a26e:refs/heads/feat/a26e
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26e >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A26E="$T/$ENV-gone"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26E" "$A26E_SHA"
+rm -rf "$WT_A26E"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26e)" "$A26E_SHA" \
+    "A26e precondition: the REMOTE advertises this sha (so a probe here would answer YES — non-vacuous)"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26E")" "reason=remote-only-ref" \
+    "A26e ⛔ a GONE-dir record held only by a remote-tracking ref still PRESERVES (its admin HEAD is the last handle)"
+assert_absent "$(row_for "$OUT" "$WT_A26E")" "remote-holds:" \
+    "A26e …and the probe is NOT consulted for it (a `remote-holds` here would deregister the last handle)"
+assert_absent "$(row_for "$OUT" "$WT_A26E")" "reason=prunable" \
+    "A26e …so it is never a `remove` row"
+
+# ── A26f: a remote name may contain a SLASH — the longest prefix wins, not the first segment ─
+# `refs/remotes/origin/sub/feat` is remote `origin/sub` + branch `feat`, OR remote `origin` +
+# branch `sub/feat`. Only the first is true here, and the two readings give DIFFERENT verdicts, so
+# this fixture fails if the code ever splits at the first path segment: it would query `origin` for
+# `refs/heads/sub/feat`, get nothing, and PRESERVE a checkout whose remote does hold the commit.
+ENV=A26f; REPO="$(mk_repo $ENV)"
+BARE_ORIGIN="$T/$ENV/origin.git"
+BARE_SUB="$T/$ENV/sub.git"
+"$REAL_GIT" init -q --bare "$BARE_ORIGIN"
+"$REAL_GIT" init -q --bare "$BARE_SUB"
+"$REAL_GIT" -C "$REPO" remote add origin "$BARE_ORIGIN"
+"$REAL_GIT" -C "$REPO" remote add origin/sub "$BARE_SUB"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26f
+commit_in_wt "$REPO" "$OLD_DATE" a26f
+A26F_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q origin/sub tmp-a26f:refs/heads/feat
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26f >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q origin/sub
+assert_contains "$("$REAL_GIT" -C "$REPO" remote)" "origin/sub" "A26f precondition: the slashed remote is configured"
+assert_contains "$("$REAL_GIT" -C "$REPO" for-each-ref --format='%(refname)' refs/remotes/origin/sub)" \
+    "refs/remotes/origin/sub/feat" "A26f precondition: the only local holder is refs/remotes/origin/sub/feat"
+assert_absent "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26F_SHA" --format='%(refname)')" \
+    "refs/heads/" "A26f precondition: no LOCAL branch holds it (otherwise the probe is bypassed)"
+assert_eq "$("$REAL_GIT" -C "$BARE_SUB" rev-parse refs/heads/feat)" "$A26F_SHA" \
+    "A26f precondition: remote 'origin/sub' advertises branch 'feat' at this sha"
+WT_A26F="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26F" "$A26F_SHA"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26F")" "reason=remote-holds:origin/sub/feat" \
+    "A26f the LONGEST remote name prefixes the ref ('origin/sub' + 'feat'), not the first segment"
+
 # ── A27: the pass RECORDS a verdict when it is ineffective (#3041, part 2) ──
 # The measured failure was not a bug in any single row: it was a pass that examined a large
 # population, removed nothing, sat under a disk floor, and printed a summary line that read
@@ -3660,13 +3736,19 @@ mk_dirty_pop() { # <env> <n> -> repo path; n worktrees that all PRESERVE (reason
     printf '%s\n' "$d"
 }
 ENV=A27; REPO="$(mk_dirty_pop $ENV 11)"
-VERDICT_FILE="$T/$ENV/state/reap-ineffective"
+VERDICT_FILE="$(verdict_path $ENV "$REPO")"
 # (a) under the floor, >= the population floor, zero removals => the verdict is RECORDED.
 OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A27a exit code is UNCHANGED (a diagnosis, not a failed pass)"
 assert_contains "$OUT" "verdict=reap-ineffective" "A27a the SUMMARY carries verdict=reap-ineffective"
 assert_contains "$OUT" "VERDICT: reap-ineffective" "A27a the pass SAYS it, out loud"
-assert_file "$VERDICT_FILE" "A27a the verdict is RECORDED at \$STATE_DIR/reap-ineffective"
+assert_file "$VERDICT_FILE" "A27a the verdict is RECORDED at \$STATE_DIR/reap-ineffective.<repo>"
+# ⛔ NON-VACUITY for the path itself: the reaper's own log must name the SAME file this fixture expects,
+# or the assertions below are testing a path nothing writes (the mirror-drift class).
+assert_contains "$(cat "$T/$ENV/reap.log")" "record=$VERDICT_FILE" \
+    "A27a …and the reaper's own log names that exact path (no mirror drift)"
+assert_contains "$(cat "$VERDICT_FILE" 2>/dev/null)" "repo=$REPO" \
+    "A27a the record names the repo it belongs to"
 if [ -f "$VERDICT_FILE" ]; then
     V="$(cat "$VERDICT_FILE")"
     assert_contains "$V" "verdict=reap-ineffective" "A27a the record states the verdict"
@@ -3691,10 +3773,24 @@ assert_nofile "$VERDICT_FILE" "A27c …with the verdict cleared"
 OUT="$(REAP_WT_FREE_MB_OVERRIDE= DF_BIN_OVERRIDE="$T/bin/df-fail" run_reaper $ENV --apply --repo "$REPO")"
 assert_contains "$OUT" "verdict=unmeasured" "A27d an unmeasurable disk => verdict=unmeasured"
 assert_nofile "$VERDICT_FILE" "A27d …and NO ineffective verdict is claimed on no measurement"
-# (e) a DRY run removes nothing by definition, so it must not be called ineffective.
-OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --dry-run --repo "$REPO")"
+# (e) ⛔ A DRY RUN MUST NOT DISTURB THE RECORD (#3041 review, P1). It removes nothing by
+# definition, so it has evaluated none of the live condition — and `disk-reaper.sh` DEFAULTS to
+# DRY_RUN=1, so a dry run that deleted the record made the entry point's own default mode the thing
+# that erases the armed pass's alarm. The order matters and is the point: arm (file present) FIRST,
+# then dry-run, then assert it is STILL there — the earlier revision asserted `nofile` after leg (d)
+# had already removed it, so it passed whatever the dry run did.
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=reap-ineffective" "A27e precondition: an armed pass under the floor records"
+assert_file "$VERDICT_FILE" "A27e precondition: the record is on disk"
+V_BEFORE="$(cat "$VERDICT_FILE" 2>/dev/null)"
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --dry-run --repo "$REPO")"; RC=$?
 assert_contains "$OUT" "verdict=dry-run" "A27e a dry run is 'dry-run', never 'reap-ineffective'"
-assert_nofile "$VERDICT_FILE" "A27e …and records nothing"
+assert_file "$VERDICT_FILE" "A27e ⛔ …and a DRY RUN does NOT delete an armed pass's record (it evaluated nothing)"
+assert_eq "$(cat "$VERDICT_FILE" 2>/dev/null)" "$V_BEFORE" \
+    "A27e …and it left the record BYTE-IDENTICAL (a rewrite would be an unevaluated claim)"
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=999999 run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=idle" "A27e …while an ARMED pass with room DOES clear it"
+assert_nofile "$VERDICT_FILE" "A27e …so 'cleared' remains the armed pass's own verdict to give"
 # (f) a small population reclaims nothing legitimately: no verdict, or the alarm is noise.
 OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 REAP_WT_INEFFECTIVE_MIN_EXAMINED_OVERRIDE=50 \
     run_reaper $ENV --apply --repo "$REPO")"
@@ -3712,7 +3808,7 @@ assert_eq "$(printf '%s\n' "$SUM_A27" | grep -c '^SUMMARY ')" "1" \
 # deferral: a real clock (a pinned epoch makes `elapsed` a constant 0), a 1s budget, and a status
 # probe that sleeps 2s on the 1st call. With the old gate `classified` would be 1 < 10 => `idle`.
 ENV=A27h; REPO_H="$(mk_dirty_pop $ENV 11)"
-VERDICT_FILE_H="$T/$ENV/state/reap-ineffective"
+VERDICT_FILE_H="$(verdict_path $ENV "$REPO_H")"
 OUT_H="$(REAP_WT_NOW_EPOCH_OVERRIDE= REAP_WT_FREE_MB_OVERRIDE=100 REAP_WT_BUDGET_SECONDS=1 \
     FAKE_STATUS_COUNTER="$T/$ENV/cnt" FAKE_SLOW_STATUS_ON=1 FAKE_STATUS_SLEEP=2 \
     GIT_BIN_OVERRIDE="$T/bin/git-slow-nth-status" run_reaper $ENV --apply --repo "$REPO_H")"; RC=$?
@@ -3725,6 +3821,32 @@ esac
 assert_contains "$OUT_H" "verdict=reap-ineffective" \
     "A27h EXAMINED >= the floor with 0 removals under the floor => reap-ineffective, NOT the benign idle"
 assert_file "$VERDICT_FILE_H" "A27h …and it is recorded"
+
+# (i) ⛔ THE RECORD IS PER REPO, NOT PER STATE DIR (#3041 review, P1). `disk-reaper.sh` runs this
+# script ONCE PER REPO with the SAME `REAP_WT_STATE_DIR`, so one fixed filename made the record
+# LAST-WRITER-WINS ACROSS REPOS: measured, an ineffective 12-record repo followed by any repo with
+# room reported `idle` and DELETED the first repo's record — the silence restored by the multi-repo
+# loop production actually runs. Both halves are pinned: the dangerous ORDER, and that two checkouts
+# with the SAME basename still get distinct records (which a bare basename would not give).
+ENV=A27i; REPO_I1="$(mk_dirty_pop $ENV 11)"
+REPO_I2="$(mk_repo $ENV x/same)"
+REPO_I3="$(mk_repo $ENV y/same)"
+VFILE_I1="$(verdict_path $ENV "$REPO_I1")"
+VFILE_I2="$(verdict_path $ENV "$REPO_I2")"
+VFILE_I3="$(verdict_path $ENV "$REPO_I3")"
+OUT_I="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO_I1")"
+assert_contains "$OUT_I" "verdict=reap-ineffective" "A27i precondition: repo #1 is ineffective and records"
+assert_file "$VFILE_I1" "A27i precondition: repo #1's own record is on disk"
+OUT_I="$(REAP_WT_FREE_MB_OVERRIDE=999999 run_reaper $ENV --apply --repo "$REPO_I2")"
+assert_contains "$OUT_I" "verdict=idle" "A27i repo #2 (one checkout) is legitimately idle"
+assert_file "$VFILE_I1" \
+    "A27i ⛔ repo #2's benign pass does NOT erase repo #1's alarm (the state dir is SHARED)"
+assert_nofile "$VFILE_I2" "A27i …and repo #2 does not inherit one it never earned"
+if [ "$VFILE_I2" != "$VFILE_I3" ]; then
+    ok "A27i two checkouts with the SAME basename get DIFFERENT records (the checksum, not the basename, decides)"
+else
+    bad "A27i two checkouts named 'same' collapsed onto one record path: $VFILE_I2"
+fi
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
