@@ -468,8 +468,12 @@ ck "no assertion description contains a backtick (it would run as a command)" \
 # hand-edit the driver — re-introducing #2838. `--list` is the source the CI floor itself reads, so
 # asserting against it is both correct and stronger: the suite is listed iff it would actually run.
 SHARDLIST="$(bash "$SHARDS" --list 2>/dev/null || true)"
+# ⛔ a here-string, never a pipe (#841): under `pipefail` a quiet `grep -qx` exits at its first
+# match while the writer is still pushing bytes, the writer takes SIGPIPE (141), and the pipeline
+# status turns non-zero — so the membership assertion would report "not listed" for a suite that IS
+# listed. Caught by `scripts/check-no-sigpipe-grep.sh` on this very file before it reached main.
 ck "run-bash-shards.sh --list carries this suite (the list CI actually executes)" \
-   "$(printf '%s\n' "$SHARDLIST" | grep -qx 'scripts/orchestrator-harness/harness-provenance.test.sh' && echo 0 || echo 1)"
+   "$(grep -qx 'scripts/orchestrator-harness/harness-provenance.test.sh' <<<"$SHARDLIST" && echo 0 || echo 1)"
 # ⛔ …AND THE COMPLEMENT: derivation means the DRIVER NAMES NO SUITE. Pinning both halves makes a
 # re-added `run_shard` row (the #2838 regression) go red HERE, not only in tests/ci-lane-parity.
 ck "…and the driver carries NO enumerated run_shard row for it (derivation, not enumeration)" \
