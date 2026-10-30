@@ -76,11 +76,23 @@
 # swap" there means ABSENT, never "no capacity" (the defect that made every cell tick skip: cells ship
 # with no swap at all).
 #
+# ⛔ **OVERRIDES:** the "a swap floor is a capacity signal everywhere" default — on **Darwin it is
+# not one**, and there is NO free-swap floor there: macOS grows its swap files on demand, so
+# `free = total − used` is low because the kernel grew the file, and `used` is a high-water mark it
+# does not release; a floor on that is a LATCH that refuses a healthy box forever (measured
+# 2026-10-29: `free=412M/3072M` refused while the kernel's own
+# `kern.memorystatus_vm_pressure_level` read **1 = normal** and `memory_pressure -Q` read **52%
+# free**). Darwin refuses on THAT level instead, which is the number the kernel acts on; Linux keeps
+# the `SwapFree` floor, where it is real. Same root as agent-infra#2016, which corrected the same
+# reading in `orch-loop.sh`'s `[cap]` gate — do not "restore symmetry" by porting the Linux floor
+# back to a Mac.
+#
 # ── ALL FOUR GUARDS ────────────────────────────────────────────────────────────────────────────
 #   * LOCK — one tick's critical section at a time; never held for a lane's lifetime (see above).
-#   * CAPACITY — the formula above, plus the swap floor where a box HAS swap, plus fail-closed
-#     handling of an unreadable probe (a guard that could not be evaluated must not look like an idle
-#     box — `docs/ops/fleet-liveness.md`'s abstention doctrine).
+#   * CAPACITY — the formula above, plus the swap arm **where swap is a capacity signal**: the
+#     `SwapFree` floor on Linux, the kernel's pressure level on Darwin (see the OVERRIDES block), plus
+#     fail-closed handling of an unreadable probe (a guard that could not be evaluated must not look
+#     like an idle box — `docs/ops/fleet-liveness.md`'s abstention doctrine).
 #   * SLICE — a rotating window over the open list that advances PER LANE, so N lanes in one tick work
 #     N DISJOINT windows. Rotation is capped at the number of distinct slices
 #     (`SLICE_TOTAL/SLICE_WIDTH`), because a 13th lane on 7 windows would land on lane 6's: fewer
@@ -107,7 +119,13 @@
 #   LANE_MEM_MB       resident budget per lane (MB)                  default: 512  (see above)
 #   MEM_BUDGET_PCT    share of the available pool the target may use  default: 75
 #   MIN_MEM_FREE_MB   memory floor a lane may not eat into (MB)       default: 512
-#   MIN_SWAP_MB       swap floor, applied only where swap EXISTS (MB) default: 700
+#   MIN_SWAP_MB       free-SWAP floor — **LINUX ONLY**, and only where swap EXISTS (MB) default: 700
+#                     (a Darwin box has no such floor: its swap file is grown on demand, so `free` is
+#                     not headroom — see the DARWIN block at the capacity guard)
+#   MAX_MEM_PRESSURE_LEVEL  **Darwin only** — refuse at or above this kernel pressure level default: 2
+#                     valid: 2 (warning), 3, 4 (critical). **1 is REJECTED** — it is the kernel's NORMAL
+#                     level, so it would refuse EVERY box silently; a deliberate stop is MAX_LANES=0.
+#                     An unusable value warns and falls back to 2, never silently.
 #   LPC_CEILING       load-per-cpu at which no lane is added          default: 8
 #   LANE_TIMEOUT      the lane's BACKSTOP (seconds) — the absolute ceiling, not the primary bound
 #                                                            default: $LANE_BACKSTOP_S (7200)
@@ -119,6 +137,10 @@
 #
 # TEST SEAMS (read-only overrides; production sets none of them):
 #   NCPU LOAD1_100 MEM_AVAIL_MB SWAP_TOTAL_MB SWAP_FREE_MB   skip the platform probes
+#   DRAINER_OS        the platform whose swap semantics apply: Darwin | Linux  default: `uname -s`
+#                     (the suite's seam — the Darwin arm must be exercisable on a Linux cell, which
+#                     has no `sysctl`, and the Linux arm on the operator's Mac)
+#   MEM_PRESSURE_LEVEL  the Darwin pressure level to assume (1|2|4); "unreadable" fails the tick
 #   PROC_MEMINFO      the meminfo file the memory/swap probes read  default: /proc/meminfo
 #                     (unreadable ⇒ the macOS `vm_stat`/`vm.swapusage` probes — this is how the LINUX
 #                     branch, the one every cell runs, is exercised from a macOS developer box)
@@ -151,6 +173,7 @@ LANE_MEM_MB="${LANE_MEM_MB:-512}"
 MEM_BUDGET_PCT="${MEM_BUDGET_PCT:-75}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 MIN_SWAP_MB="${MIN_SWAP_MB:-700}"
+MAX_MEM_PRESSURE_LEVEL="${MAX_MEM_PRESSURE_LEVEL:-2}"
 LPC_CEILING="${LPC_CEILING:-8}"
 # ⛔ THIS IS THE BACKSTOP, NOT THE LANE'S PRIMARY BOUND (agent-infra#2888), and it takes the harness
 # seam rather than a literal of its own. Two things read it, and a flat 3000 broke BOTH once the wall
@@ -194,6 +217,23 @@ _num() { # <name> <value> <default>
   esac
 }
 MIN_SWAP_MB="$(_num MIN_SWAP_MB "$MIN_SWAP_MB" 700)"
+# ⛔ THE DARWIN THRESHOLD IS VALIDATED BY VOCABULARY, NOT BY CLAMPING A NUMBER — because a clamp has
+# two traps and only one of them is visible.
+#   * `1` IS THE KERNEL'S NORMAL LEVEL, so "refuse at >= 1" is TRUE ON EVERY POSSIBLE READING: a seam
+#     mistuned to 1 (and `MAX_…_LEVEL=1` reads like "be lenient" to anyone who has not checked which
+#     direction the comparison runs) shuts the drainer PERMANENTLY while every tick exits 0 — exactly
+#     the silent latch this change removed from the swap arm, re-created one layer up. A deliberate
+#     stop has its own documented knob (`MAX_LANES=0` / `TARGET_LANES=0`), so a threshold can never be
+#     the right way to say "dispatch nothing".
+#   * anything above `4` names a level the kernel does not publish, so the arm could never fire — the
+#     inert enforcer, the mirrored failure.
+# So an unusable value falls back to the SHIPPED DEFAULT and says which value it saw — the `_num`
+# contract, minus the arithmetic: the raw string is compared as a STRING first, so a 20-digit value
+# cannot overflow into a negative one and be reported as a number nobody typed.
+case "$MAX_MEM_PRESSURE_LEVEL" in
+  2|3|4) : ;;
+  *) log_line "WARN: MAX_MEM_PRESSURE_LEVEL='${MAX_MEM_PRESSURE_LEVEL}' is not a threshold this arm can refuse at (2 = warning, 3, 4 = critical; 1 = normal would refuse EVERY box) — using 2. To stop dispatch deliberately use MAX_LANES=0 or TARGET_LANES=0"; MAX_MEM_PRESSURE_LEVEL=2 ;;
+esac
 MIN_MEM_FREE_MB="$(_num MIN_MEM_FREE_MB "$MIN_MEM_FREE_MB" 512)"
 LANE_MEM_MB="$(_num LANE_MEM_MB "$LANE_MEM_MB" 512)"
 [ "$LANE_MEM_MB" -ge 1 ] || { log_line "WARN: LANE_MEM_MB=0 — using 1"; LANE_MEM_MB=1; }
@@ -382,6 +422,53 @@ _swap_pair_mb() { # prints "<total_mb> <free_mb>"
   fi
 }
 
+# ⛔ WHICH PLATFORM'S SWAP SEMANTICS APPLY — asked ONCE, because the two `free` numbers are different
+# quantities and one gate cannot honestly use both.
+#   Linux  — swap is a fixed partition/volume: `SwapFree` IS headroom, and a floor on it is meaningful.
+#   Darwin — the swap file is grown ON DEMAND by the kernel (`com.apple.dynamic_pager`), and
+#            `vm.swapusage` reports total/used/free over the files that exist RIGHT NOW. MEASURED on
+#            this box 2026-10-29: three 1 GiB swapfiles under `/System/Volumes/VM/`, created at
+#            26 Oct 13:55, 26 Oct 14:28 and 28 Oct 19:29, and `total` = their sum EXACTLY (3072M). So
+#            `free = total − used` is low BECAUSE the kernel grew the file to meet a past spike, and
+#            `used` is a high-water mark macOS does not release (`scripts/objective.py` measured it
+#            drifting 90.1% → 86.8% across 18 beats on a calm box). A floor on that number is a
+#            LATCH, not a capacity reading: it refuses a healthy box and can never reopen.
+# `DRAINER_OS` is the SEAM, following `harness-roles.sh`'s `HARNESS_UP_OS` precedent: the Darwin arm
+# has to be exercisable on a Linux cell (no `sysctl`) and the Linux arm on the operator's Mac.
+_platform() { # prints darwin | linux | unknown
+  local v
+  if [ -n "${DRAINER_OS:-}" ]; then
+    case "$DRAINER_OS" in
+      Darwin|darwin|macOS|macos|MacOS|Mac) printf 'darwin'; return 0 ;;
+      Linux|linux) printf 'linux'; return 0 ;;
+      *) log_line "WARN: DRAINER_OS='${DRAINER_OS}' is not a platform this gate knows (Darwin|Linux) — falling back to uname -s" ;;
+    esac
+  fi
+  v="$(uname -s 2>/dev/null)" || v=""
+  case "$v" in
+    Darwin) printf 'darwin' ;;
+    Linux) printf 'linux' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+PLATFORM="$(_platform)"
+# ⛔ THE SIGNAL A DARWIN BOX ACTUALLY PUBLISHES, READ RATHER THAN INFERRED. `kern.memorystatus_vm_
+# pressure_level` is the verdict macOS itself acts on when it starts killing processes: 1 = normal,
+# 2 = warning, 4 = critical. It is a CURRENT reading, which is exactly what the free-swap figure on
+# this platform is not — so it is the arm that replaces the floor there, and a box that IS sick still
+# refuses. `memory_pressure -Q` ("System-wide memory free percentage") is the corroborating reading and
+# is deliberately NOT a second gate: two numbers that can disagree must not both be able to refuse.
+_pressure_level() { # prints the kernel's level; absent or not a number ⇒ return 1 (fail closed)
+  local v
+  v="$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$((10#$v))"
+}
+_pressure_name() { case "$1" in 1) printf 'normal' ;; 2) printf 'warning' ;; 4) printf 'critical' ;; *) printf 'level-%s' "$1" ;; esac; }
+# The GATE is the numeric comparison, not a vocabulary check, and that is deliberate: a level macOS adds
+# later (a 3, say) REFUSES rather than sneaking through a case-statement gap — the same allow-list
+# polarity the merge rail adopted after an unrecognised conclusion slipped past a name list.
+
 lo100="${LOAD1_100:-}"
 [ -n "$lo100" ] || lo100="$(_load1_100)"
 case "$lo100" in
@@ -409,6 +496,25 @@ case "$sw_pair" in
 esac
 swap_total="${sw_pair% *}"
 swap_free="${sw_pair#* }"
+# ── THE SWAP ARM'S PLATFORM READING ────────────────────────────────────────────────────────────
+# Read here, with the other probes, so a probe that cannot answer fails the tick BEFORE any guard is
+# evaluated — and so the SKIP/START line can NAME it (`docs/ops/fleet-capacity.md` §5).
+pressure_level=""
+if [ "$PLATFORM" = "darwin" ]; then
+  pressure_level="${MEM_PRESSURE_LEVEL:-}"
+  if [ -z "$pressure_level" ]; then pressure_level="$(_pressure_level)" || pressure_level=""; fi
+  case "$pressure_level" in
+    ''|*[!0-9]*) log_line "FAIL: memory pressure could not be read on this Darwin box (no kern.memorystatus_vm_pressure_level, no numeric MEM_PRESSURE_LEVEL) — free swap is NOT a substitute for it (the kernel grows the swap file on demand), so the swap arm cannot be evaluated"; exit 1 ;;
+  esac
+  pressure_level="$((10#$pressure_level))"
+elif [ "$PLATFORM" = "unknown" ]; then
+  # ⛔ FAIL CLOSED ON AN UNKNOWN PLATFORM, BY NAME. A `SwapFree` floor and a pressure level are
+  # DIFFERENT gates, so choosing one for a box whose platform was never identified picks a gate on a
+  # guess — and the wrong guess is the latch this file just removed.
+  log_line "FAIL: this is neither a Darwin nor a Linux box (uname -s='$(uname -s 2>/dev/null || printf unknown)', DRAINER_OS unset) — the swap arm differs per platform, so it cannot be chosen on a guess"; exit 1
+else
+  [ -z "${MEM_PRESSURE_LEVEL:-}" ] || log_line "WARN: MEM_PRESSURE_LEVEL is set but this is a Linux box — the Darwin pressure arm does not apply here (the SwapFree floor does)"
+fi
 
 # ── SETTLE: THE OUTCOME OF LANES AN EARLIER TICK DISPATCHED ────────────────────────────────────
 # ⛔ THE LANE'S OWN EXIT STATUS IS STILL THE VERDICT — it is just read by the NEXT tick instead of by
@@ -741,7 +847,22 @@ alive_src="dispatcher=$disp_alive"
 
 # ⛔ THE HARD GUARDS COME FIRST AND EACH NAMES ITSELF. A guard that refuses without saying which read
 # refused sends an operator to fix the wrong resource (`docs/ops/fleet-capacity.md` §5).
-if [ "$swap_total" -eq 0 ]; then
+if [ "$PLATFORM" = "darwin" ]; then
+  # ⛔ NO FREE-SWAP FLOOR ON DARWIN — see `_platform` and the OVERRIDES block. The floor that used to
+  # live here refused THIS box at `swap_free=412MB < 700MB (of 3072MB)` while
+  # `kern.memorystatus_vm_pressure_level` read 1 = normal and `memory_pressure -Q` read 52% free: it
+  # was reading the size the kernel had already grown the swap FILE to, not the room this box has.
+  # What refuses instead is the kernel's own pressure verdict, which is a CURRENT reading.
+  if [ "$swap_total" -eq 0 ]; then
+    swap_note="swap=none (no swap on this box) pressure=$(_pressure_name "$pressure_level")"
+  else
+    swap_note="swap=${swap_free}MB/${swap_total}MB (darwin: kernel-grown on demand, not a floor) pressure=$(_pressure_name "$pressure_level")"
+  fi
+  if [ "$pressure_level" -ge "$MAX_MEM_PRESSURE_LEVEL" ]; then
+    log_line "SKIP: memory pressure $(_pressure_name "$pressure_level") (kern.memorystatus_vm_pressure_level=${pressure_level}) >= ${MAX_MEM_PRESSURE_LEVEL} — the box is under pressure NOW, so no lane is added; $swap_note"
+    finish 0
+  fi
+elif [ "$swap_total" -eq 0 ]; then
   # ⛔ NO SWAP IS NOT ZERO CAPACITY (see OVERRIDES in the header): the cells ship with none, and
   # folding "absent" into "0 MB free" made every tick on every cell skip — a permanently inert job
   # that exited 0 and looked idle.
