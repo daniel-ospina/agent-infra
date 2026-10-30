@@ -806,6 +806,14 @@ if [ "$problems" -gt 0 ]; then
     else HTOKEN="uncommitted-edit:<unnamed: the record carries no manifest>"; fi
   elif [ "$Q_IDENT" -eq 1 ] && [ "$RELATION" != "current" ]; then
     HTOKEN="$RELATION:${HAS:0:12}"
+  elif [ "$DIRTY" = true ]; then
+    # ⛔ A DIRTY-SOURCE RECORD ON THE TIP IS NOT `payload-differs` (measured 2026-10-30, review of
+    # #3053). It fell through to the else below — but README §4.3 defines that token as "the bytes
+    # differ from the checkout but the record STILL DESCRIBES $O", which is precisely what a
+    # `sourceDirty=true` record does not do: it names a commit whose bytes are not on the box. A token
+    # that sends an operator to "redeploy to adopt" without saying the box was never identifiable is
+    # the same false reassurance the summary sentence below used to give.
+    HTOKEN="source-dirty:${HAS:0:12}"
   elif [ "$MISSING_N" -gt 0 ]; then
     # A THIRD STATE, NAMED. `payload-differs` would be false (the bytes that ARE there match the
     # record) and `uncommitted-edit` would be false (nothing was edited) — it is an INCOMPLETE tree.
@@ -830,7 +838,15 @@ if [ "$problems" -gt 0 ]; then
     bad "      bash '$HERE/harness-provenance.sh' show --o '$O'   &&   bash '$HERE/harness-provenance.sh' check --o '$O'"
   fi
   if [ "$Q_IDENT" -eq 1 ]; then
-    bad "  (a) identity: the box is recorded from ${HAS:0:12} — $RELATION $REF ($TIP_SHORT). A box deliberately BEHIND a known commit is a known state, not a defect; DIVERGED means it runs code main does not carry."
+    # ⛔ THE ROUTINE-STATE SENTENCE IS ONLY TRUE FOR A CLEAN-SOURCE RECORD (measured 2026-10-30, review
+    # of #3053). Printed under a `sourceDirty=true` record it read "the box is recorded from <sha> —
+    # current main … a known state, not a defect" DIRECTLY BENEATH the line saying that commit does
+    # not describe the deployed bytes. Two sentences, opposite conclusions, one report.
+    if [ "$DIRTY" = true ]; then
+      bad "  (a) identity: the record names ${HAS:0:12} ($RELATION $REF, $TIP_SHORT) but its SOURCE WAS DIRTY, so that commit does not describe the bytes on this box — it was never identifiable. Redeploy from a CLEAN checkout; only then does a commit name these bytes."
+    else
+      bad "  (a) identity: the box is recorded from ${HAS:0:12} — $RELATION $REF ($TIP_SHORT). A box deliberately BEHIND a known commit is a known state, not a defect; DIVERGED means it runs code main does not carry."
+    fi
   fi
   if [ "$Q_BYTES" -eq 1 ]; then
     bad "  (b) checkout: \$O's bytes differ from the checkout at $REF — redeploy to adopt it:"

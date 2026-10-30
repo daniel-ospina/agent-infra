@@ -279,6 +279,19 @@ ck "the record says sourceDirty=true" "$(qF "sourceDirty=true" "$(cat "$O/.harne
 ck "rc is 1 (a commit name that does not describe these bytes is drift)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 ck "…and the report says the record's source was DIRTY" "$(qF "source was DIRTY" "$OUT" && echo 0 || echo 1)"
 ck "…and it does NOT read the identity as ok" "$(qF "identity: ok" "$OUT" && echo 1 || echo 0)"
+# ⛔ THE SUMMARY MUST NOT CONTRADICT THE LINE ABOVE IT (measured 2026-10-30, review of #3053). The record's
+# commit IS the ref tip here, so `Q_IDENT=1` with `RELATION=current` fell through to `payload-differs` —
+# a token README §4.3 defines as "the bytes differ from the checkout but the record STILL DESCRIBES $O",
+# the one thing a `sourceDirty=true` record does not do — and then printed "the box is recorded from
+# <sha> — current main … a known state, not a defect" directly beneath "does not describe the deployed
+# bytes". Both arms below redden if the fall-through or the routine-state sentence comes back.
+ck "…the token is harness=source-dirty:<sha12>" "$(qF "harness=source-dirty:" "$OUT" && echo 0 || echo 1)"
+ck "…and NOT payload-differs (which claims the record describes \$O)" \
+   "$(qF "harness=payload-differs" "$OUT" && echo 1 || echo 0)"
+ck "…and it does NOT print the routine-state sentence under a DIRTY record" \
+   "$(qF "known state, not a defect" "$OUT" && echo 1 || echo 0)"
+ck "…it says the box was never identifiable, and how to make it so" \
+   "$(qF "never identifiable" "$OUT" && echo 0 || echo 1)"
 cp "$TMP/a.sh.committed" "$SRCDIR/a.sh"                                        # leave the fixture clean again
 deploy
 bash "$PROVW" write --o "$O" --src "$SRCDIR" >/dev/null 2>&1
