@@ -263,6 +263,53 @@ ck "the dirty-source warning is printed, not silent" \
    "$(qF "UNCOMMITTED changes" "$(PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$DREPO/scripts/orchestrator-harness" --o "$DO" --no-notify --accept-discard 2>&1)" && echo 0 || echo 1)"
 
 echo
+echo "── §2e a STAGED deploy states sourceDirty and source= for itself (the mac path's two facts) ──"
+# ⛔ THE BOX CLASS THIS FEATURE EXISTS FOR IS THE MAC, AND ITS DEPLOY STAGES THROUGH A THROWAWAY
+# `git archive` DIR. Neither field can be derived from it: it is not a checkout (so dirtiness came out
+# `unknown`) and it is deleted before anyone reads the record (so `source=` named a dead path). The
+# reader REFUSES `sourceDirty=unknown`, so the record — which is PREFERRED over install.sh's stamp —
+# made a box that was attributable UNKNOWN, on the one population #3049 measured. `--source-dirty` and
+# `--origin` are the deploy's own statement of the two facts only it knows.
+STG="$TMP/staged"; rm -rf "$STG"; mkdir -p "$STG/src" "$STG/O" "$STG/live"
+cp -R "$SRC"/. "$STG/src"/          # what `git archive <ref> | tar -x` produces
+cp -R "$SRC"/. "$STG/O"/            # the bytes the deploy wrote there
+cp -R "$SRC"/. "$STG/live"/         # the LIVE tree a redeploy would read
+bash "$PROV" write --o "$STG/O" --src "$STG/src" --commit 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1
+S_REC="$(cat "$STG/O/.harness-provenance" 2>/dev/null)"
+ck "underived, a staged source says sourceDirty=unknown (it is not a checkout — never a guess)" \
+   "$(qF "sourceDirty=unknown" "$S_REC" && echo 0 || echo 1)"
+bash "$PROV" write --o "$STG/O" --src "$STG/src" --commit 0123456789abcdef0123456789abcdef01234567 \
+     --source-dirty false --origin "$STG/live" >/dev/null 2>&1; RC=$?
+S_REC="$(cat "$STG/O/.harness-provenance" 2>/dev/null)"
+ck "…and the deploy's own --source-dirty false IS recorded (a git archive payload is committed bytes)" \
+   "$([ "$RC" -eq 0 ] && qF "sourceDirty=false" "$S_REC" && echo 0 || echo 1)"
+ck "…and source= names the LIVE tree, not the staging dir the deploy deletes" \
+   "$(qF "source=$(cd "$STG/live" && pwd -P)" "$S_REC" && echo 0 || echo 1)"
+ck "…and the manifest is still hashed from --src (the bytes actually deployed)" \
+   "$(qF "  gh-rest/gh" "$S_REC" && echo 0 || echo 1)"
+bash "$PROV" write --o "$STG/O" --src "$STG/src" --source-dirty bogus >/dev/null 2>&1; RC=$?
+ck "--source-dirty is VALIDATED (bogus -> 78, never silently recorded)" "$([ "$RC" -eq 78 ] && echo 0 || echo 1)"
+bash "$PROV" write --o "$STG/O" --src "$STG/src" --origin "$STG/no-such-dir" >/dev/null 2>&1; RC=$?
+ck "--origin must be a real directory (a reader has to be able to look at it) -> 78" "$([ "$RC" -eq 78 ] && echo 0 || echo 1)"
+
+echo
+echo "── §2f a manifest line with NO PATH is CANNOT-VERIFY, never a file named after its hash ──"
+# ⛔ `${line%%  *}` AND `${line#*  }` BOTH RETURN THE WHOLE LINE when the two-space run is absent. On a
+# pathless `<64 hex>` line, REL therefore became the DIGEST: the emptiness guard could never fire, the
+# entry counted as a file whose name was its own hash, and a hand edit to that nested file answered
+# CLEAN on the documented `check --o $O` call — the one direction this tool exists to close.
+MP="$TMP/pathless"; rm -rf "$MP"; mkdir -p "$MP/O"; cp -R "$SRC"/. "$MP/O"/
+bash "$PROV" write --o "$MP/O" --src "$SRC" --commit 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1
+MPR="$MP/O/.harness-provenance"
+MP_GH="$(sed -n 's/^\([0-9a-f]\{64\}\)  gh-rest\/gh$/\1/p' "$MPR" 2>/dev/null | head -1)"
+ck "the fixture record carries a nested entry to strip" "$([ -n "$MP_GH" ] && echo 0 || echo 1)"
+grep -vF "  gh-rest/gh" "$MPR" > "$MPR.tmp" 2>/dev/null && printf '%s\n' "$MP_GH" >> "$MPR.tmp" && mv "$MPR.tmp" "$MPR"
+printf '#!/usr/bin/env bash\necho HAND-PATCHED\n' > "$MP/O/gh-rest/gh"   # a real edit the record cannot name
+MP_OUT="$(bash "$PROV" check --o "$MP/O" 2>&1)"; RC=$?
+ck "a pathless manifest line is UNKNOWN (2), never a clean answer over an unrecorded edit" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "…and it says the line has NO PATH (a reason an operator can act on)" "$(qF "no path" "$MP_OUT" && echo 0 || echo 1)"
+
+echo
 echo "── §3 THE MEASURED INCIDENT: a deploy onto a dirty \$O REFUSES and names what it would discard ──"
 # 1) a clean deploy, so the box has an honest record of its own bytes
 PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$SRC" --o "$O" --no-notify >/dev/null 2>&1; RC=$?

@@ -3,7 +3,8 @@
 # and a deploy can ask, before it overwrites anything, whether it is about to discard someone's patch.
 #
 #   harness-provenance.sh write --o <runtime> --src <harness-src> [--commit <sha>] [--ref <ref>]
-#                               [--repo <checkout>]
+#                               [--repo <checkout>] [--source-dirty <true|false|unknown>]
+#                               [--origin <harness-live-dir>]
 #   harness-provenance.sh check --o <runtime> [--src <harness-src>] [--skip <relpath>]...
 #   harness-provenance.sh show  --o <runtime>
 #
@@ -46,9 +47,16 @@
 #     commit=<40-hex|UNKNOWN>        the SOURCE commit the deploy came from
 #     ref=origin/main                 the ref that commit was resolved against
 #     refCommit=<40-hex|UNKNOWN>      that ref's tip AT DEPLOY TIME (a LATER move is "behind")
-#     source=<path>                   the harness directory that was deployed
+#     source=<path>                  the LIVE harness directory a redeploy would read (see
+#                                   `--origin`: a deploy that stages through a temporary dir
+#                                   records the live tree, because `source=` is what a plain
+#                                   `check` classifies a phase-A leftover against)
 #     recordedAt=<UTC ISO-8601>
 #     files=<n>
+#     sourceDirty=<true|false|unknown> whether the SOURCE could carry bytes `commit` does not
+#                                   (`--source-dirty` states it for a staged deploy: a
+#                                   `git archive` staging dir cannot be asked, and its payload is
+#                                   committed bytes by construction, so it is `false`)
 #     <sha256>  <relpath>             one line per regular file the source shipped
 #
 # ⛔ `commit=UNKNOWN` IS AN ANSWER, A MISSING RECORD IS NOT: an explicit UNKNOWN makes the reader
@@ -107,7 +115,7 @@ MODE="${1:-}"
 case "$MODE" in -h|--help) usage; exit 0 ;; esac
 shift
 
-O=""; SRC=""; COMMIT_ARG=""; REF_ARG=""; REPO_ARG=""
+O=""; SRC=""; COMMIT_ARG=""; REF_ARG=""; REPO_ARG=""; DIRTY_ARG=""; ORIGIN_ARG=""
 SKIPS=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -116,6 +124,24 @@ while [ $# -gt 0 ]; do
     --commit) [ $# -ge 2 ] || die "--commit needs a sha";    COMMIT_ARG="$2"; shift 2 ;;
     --ref)    [ $# -ge 2 ] || die "--ref needs a git ref";   REF_ARG="$2"; shift 2 ;;
     --repo)   [ $# -ge 2 ] || die "--repo needs a path";     REPO_ARG="$2"; shift 2 ;;
+    # ⛔ THE TWO FIELDS A STAGED DEPLOY CANNOT DERIVE FOR ITSELF (`write` only). `deploy-mac-orchestrator.sh`
+    # stages `git archive <ref>` into a throwaway directory and deletes it, so neither field can be asked of
+    # `--src`: the staging dir is not a checkout (dirtiness is UNKNOWABLE there) and it is gone by the time
+    # anyone reads the record (the `source=` PENDING arm was dead on every mac box). Left underived, the
+    # record said `sourceDirty=unknown` — which `check-deployed-drift.sh` REFUSES — so the box the record was
+    # built for went UNKNOWN, and because the record is preferred over install.sh's stamp it lost the
+    # attribution it already had. See `--origin` for `source=`.
+    #
+    # `--source-dirty` is the deploy's own statement and is VALIDATED: a `git archive` payload is committed
+    # bytes by construction, so `false` is the truthful answer there — not `true`, and never a guess.
+    --source-dirty)
+              [ $# -ge 2 ] || die "--source-dirty needs true|false|unknown"
+              case "$2" in true|false|unknown) ;; *) die "--source-dirty must be true, false or unknown (got '$2')" ;; esac
+              DIRTY_ARG="$2"; shift 2 ;;
+    # `--origin` is what gets RECORDED as `source=`: the LIVE harness directory a redeploy would read. The
+    # manifest is still hashed from `--src` (the bytes that were actually deployed), so a staged deploy keeps
+    # a truthful inventory AND leaves the reader something that exists.
+    --origin) [ $# -ge 2 ] || die "--origin needs a path";   ORIGIN_ARG="$2"; shift 2 ;;
     # ⛔ `--skip <relpath>` (repeatable, `check` only): THE FILES THIS CALLER DOES NOT WRITE. A partial
     # deploy must not refuse over a file it never touches — measured: `deploy-mac-orchestrator.sh` with
     # `PHASE=A` deliberately leaves `$O/orch-loop.sh` alone (phase B owns it), yet the gate asked the
@@ -147,6 +173,17 @@ write)
   # hashed from the same tree it describes, and the record would then bless whatever `$O` holds —
   # including the runtime state that is not part of any deploy. Refused rather than half-answered.
   [ "$SRC_REAL" != "$O_REAL" ] || die "refusing to record $O from itself — pass --src <the harness directory that was deployed>"
+
+  # `source=` is what a plain `check --o $O` classifies a phase-A leftover against, so it must name a tree
+  # that will still EXIST when the record is read. A staged deploy passes `--origin` for that; every other
+  # caller's `--src` already is a live directory. It is a SEPARATE variable from SRC_REAL on purpose: the
+  # manifest is hashed from `--src` (the bytes actually deployed), and the self-manifest refusal above must
+  # keep comparing THAT tree with `$O`, never the origin.
+  SOURCE_REC="$SRC_REAL"
+  if [ -n "$ORIGIN_ARG" ]; then
+    [ -d "$ORIGIN_ARG" ] || die "--origin $ORIGIN_ARG is not a directory (it is recorded as source=, which a reader must be able to look at)"
+    SOURCE_REC="$(cd "$ORIGIN_ARG" && pwd -P)" || die "--origin $ORIGIN_ARG cannot be resolved"
+  fi
 
   W="$(mktemp -d "$O/.harness-prov.XXXXXX" 2>/dev/null)" || die "cannot create a work dir in $O (not writable?)"
   # A refusal from here on must not leave a half-written record behind.
@@ -188,8 +225,8 @@ write)
   # legacy stamp carried this (`agentInfraDirty`) but the record did not, so the better record MASKED the
   # only dirtiness signal the codebase had. `unknown` is its own answer: a `git archive` staging dir is
   # not a checkout and cannot be asked.
-  SRC_DIRTY="unknown"
-  if git -C "$SRC" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
+  SRC_DIRTY="${DIRTY_ARG:-unknown}"
+  if [ -z "$DIRTY_ARG" ] && git -C "$SRC" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
     # ⛔ `.` IS THE SOURCE DIRECTORY, AND A PATHSPEC IS READ RELATIVE TO `git -C`'s DIRECTORY. Passing
     # `rev-parse --show-prefix` here (a path relative to the REPO ROOT) from inside the subdirectory
     # matched nothing, so a genuinely dirty source recorded as clean — the one signal this field exists
@@ -245,7 +282,7 @@ write)
     printf 'commit=%s\n' "$COMMIT"
     printf 'ref=%s\n' "$REF"
     printf 'refCommit=%s\n' "$REFCOMMIT"
-    printf 'source=%s\n' "$SRC_REAL"
+    printf 'source=%s\n' "$SOURCE_REC"
     printf 'recordedAt=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'files=%s\n' "$N"
     printf 'sourceDirty=%s\n' "$SRC_DIRTY"
@@ -364,6 +401,15 @@ check)
       *[!0-9a-f]*) bad "UNKNOWN: the record at $REC has a manifest line this reader cannot parse: '$line'"; exit 2 ;;
     esac
     [ "${#H_REC}" -eq 64 ] || { bad "UNKNOWN: the record at $REC has a manifest line whose hash is not 64 hex chars: '$line'"; exit 2; }
+    # ⛔ THE SEPARATOR IS ITS OWN TEST, BECAUSE `%%` AND `#` BOTH RETURN THE WHOLE LINE WHEN IT IS ABSENT:
+    # on a pathless `<64 hex>` line, `${line%%  *}` and `${line#*  }` are the SAME string, so `REL` became the
+    # DIGEST, the emptiness guard below could never fire, and the entry counted as a file whose name was its
+    # own hash. `files=` still agreed, so the record looked self-consistent while a hand edit to a nested file
+    # answered CLEAN on the documented `check --o $O` call — the one direction this tool exists to close.
+    case "$line" in
+      *'  '*) ;;
+      *) bad "UNKNOWN: the record at $REC has a manifest line with no path: '$line'"; exit 2 ;;
+    esac
     [ -n "$REL" ] || { bad "UNKNOWN: the record at $REC has a manifest line with no path: '$line'"; exit 2; }
     NSEEN=$((NSEEN + 1))
     SEEN="$SEEN$REL

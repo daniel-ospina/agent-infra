@@ -455,7 +455,20 @@ log "  snapshot path: $O/state/claims-snapshot"
 # patch from its own last run instead of silently reverting it.
 REVFULL="$(git -C "$AI_MAIN" rev-parse --verify --quiet "$SRC_REF^{commit}" 2>/dev/null)"
 if [ -f "$H/harness-provenance.sh" ]; then
-  if bash "$H/harness-provenance.sh" write --o "$O" --src "$H" --commit "${REVFULL:-$REV}" --ref "$SRC_REF" --repo "$AI_MAIN"; then
+  # ⛔ THE TWO FIELDS THIS PATH MUST STATE FOR ITSELF, because `$H` is a `git archive` extraction in
+  # `$STAGE` that this script deletes four lines below:
+  #   --source-dirty false  the payload IS a commit's tree — `git archive` cannot carry uncommitted
+  #                         bytes — so the truthful answer is `false`, not the `unknown` the writer
+  #                         derives from a staging dir that is not a checkout. Left underived, the
+  #                         record said `sourceDirty=unknown`, which `check-deployed-drift.sh` REFUSES,
+  #                         and since this record is PREFERRED over install.sh's stamp the box lost the
+  #                         attribution it already had — on the very box class (#3049) this feature is for.
+  #   --origin <checkout>   what gets recorded as `source=`. The PENDING arm of a plain `check --o $O`
+  #                         compares `$O` against `source=`, so recording the deleted `$STAGE` made that
+  #                         arm dead and reported a routine phase-A leftover as a hand edit to recover.
+  if bash "$H/harness-provenance.sh" write --o "$O" --src "$H" \
+       --commit "${REVFULL:-$REV}" --ref "$SRC_REF" --repo "$AI_MAIN" \
+       --source-dirty false --origin "$AI_MAIN/scripts/orchestrator-harness"; then
     log "provenance: $O/.harness-provenance records commit ${REVFULL:-$REV} ($SRC_REF) + one sha256 per deployed file"
   else
     log "WARN: could NOT write $O/.harness-provenance — the bytes deployed above are unrecorded, so"

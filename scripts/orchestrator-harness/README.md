@@ -1334,6 +1334,15 @@ the remedy is a completed deploy, and nothing you wrote is discarded. And a reco
 checkout with uncommitted changes says **`sourceDirty=true`** instead of implying the commit owns those
 bytes — `show` prints `(SOURCE WAS DIRTY …)` beside the commit, and the check reports it as an identity
 problem (the legacy stamp called the same fact `agentInfraDirty`, and the better record used to MASK it).
+A deploy that **stages through a temporary directory** (`deploy-mac-orchestrator.sh` extracts
+`git archive <ref>`) cannot derive either of two fields from that directory — it is not a checkout, and
+the deploy deletes it — so it states both: `--source-dirty false` (a `git archive` payload is a commit's
+tree, so the commit DOES own those bytes) and `--origin <live harness dir>` (what is recorded as
+`source=`, which a plain `check` classifies a phase-A leftover against). ⛔ Underived, such a record said
+`sourceDirty=unknown`, which the check **refuses** — and since this record is preferred over the legacy
+stamp, a mac box that was attributable *lost* its attribution. ⛔ And a manifest line that lost its
+`<sha256>  <path>` separator is **UNKNOWN**, never a file named after its digest: `%%` and `#` both
+return the whole line when the separator is absent, so the two readers now test for it explicitly.
 Two rules keep the gate honest in both directions:
 `--src` narrows the check to the files that deploy would actually WRITE (`--skip <relpath>` for a partial
 deploy such as `deploy-mac-orchestrator.sh`'s phase A, which never writes `orch-loop.sh`), and a `--src`
@@ -4784,10 +4793,13 @@ the `$HARNESS` this box was handed) and compares every `*.sh` basename against `
 dir, and files main ships that a deployed dir is **missing** — and it exits **2 (BROKEN)** when a
 candidate cannot be examined (unreadable, unlistable, an unsearchable ancestor, an unresolvable link),
 when the pin DIR record it would read cannot be examined, or when no candidate directory exists at all.
-With `--surface` and **no record on the box** — no `$O`, or a `$O` without a readable
-`.agent-infra-stamp.json` — the record-based halves print `SKIPPED` and the surface answer still
-arrives; that is the point, because a box with no record is exactly the class whose harness may have
-diverged. (`--o` still selects the deployed dir; the default is `$HOME/orchestrator`.)
+With `--surface` and **no usable record on the box** — no `$O`, a `$O` with no readable
+`.harness-provenance` **and** no readable `.agent-infra-stamp.json` — the record-based halves print
+`SKIPPED` and the surface answer still arrives; that is the point, because a box with no record is
+exactly the class whose harness may have diverged. A record that is present but *unusable* is not a
+reason to skip the surface pass either: a readable stamp answers the record halves instead (and the run
+says so), and only when neither record can be read does the identity half abstain.
+(`--o` still selects the deployed dir; the default is `$HOME/orchestrator`.)
 It is runnable from any box (it reads `origin/main` from the hub checkout it is given, never from the
 box it inspects) and `scripts/harness-status` runs it as its fifth row.
 

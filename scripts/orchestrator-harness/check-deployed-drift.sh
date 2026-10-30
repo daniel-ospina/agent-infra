@@ -264,12 +264,24 @@ if [ "$SURFACE" -eq 1 ] && [ "$O_ABSENT" -eq 0 ]; then
     RECORD="$PROV"; RECORD_KIND=prov
   elif [ -f "$STAMP" ] && [ -r "$STAMP" ]; then
     RECORD="$STAMP"; RECORD_KIND=stamp
+    # ⛔ SAY SO. A record that exists and cannot be used is exactly what an operator needs to hear when the
+    # run falls back past it — silence here would read as "the preferred record was never written".
+    if [ -e "$PROV" ]; then
+      note "identity: the provenance record at $PROV exists but is not a readable regular file — falling back to the install.sh stamp at $STAMP for the record-based halves (the surface pass is unaffected)"
+    fi
   else
     O_ABSENT=1
     note "identity: SKIPPED — no harness record at $PROV and none at $STAMP, readable or otherwise (the deploy path writes the first, install.sh the second); the surface pass below still answers what this box carries"
   fi
 fi
-if [ "$O_ABSENT" -eq 0 ]; then
+# ⛔ ONLY WHEN `--surface` DID NOT ALREADY RESOLVE ONE. This block used to run UNCONDITIONALLY, so an
+# unreadable `.harness-provenance` exited 2 here even in the one mode whose comment above promises that
+# "a missing/unreadable record is NOT a reason to skip the surface pass" — the fallback the block above had
+# just selected was discarded, and the surface pass never ran on the exact population it exists for.
+# WITHOUT `--surface` the old contract is untouched, because `$RECORD_KIND` is still empty here.
+# ⛔ Polarities kept: no flag + unreadable prov → UNKNOWN (unchanged); `--surface` + NOTHING usable → UNKNOWN
+# for the record halves and the surface pass still answers (unchanged).
+if [ "$O_ABSENT" -eq 0 ] && [ -z "$RECORD_KIND" ]; then
 # ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE, and both are UNKNOWN: `-f` alone cannot tell them
 # apart, and reading an unreadable record as "no record" is the same fail-open one line over.
 if [ -e "$PROV" ]; then
@@ -478,7 +490,16 @@ case "$RECORD_KIND" in
       H_REC="${line%%  *}"
       case "$H_REC" in ''|*[!0-9a-f]*) continue ;; esac
       [ "${#H_REC}" -eq 64 ] || continue
+      # ⛔ THE SEPARATOR IS ITS OWN TEST: `${line%%  *}` and `${line#*  }` both return the WHOLE line when the
+      # two-space run is absent, so a pathless `<64 hex>` line set `rel` to the DIGEST and this reader
+      # printed `MISSING <the hash>` — a file it fabricated from a field it could not actually parse.
+      # A record with a line this reader cannot read is CANNOT-VERIFY, never a drift named after a hash.
+      case "$line" in
+        *'  '*) ;;
+        *) unknown "the provenance record at $PROV has a manifest line with no path: '$line' — this reader cannot say which file it describes, and unknown is never a pass" ;;
+      esac
       rel="${line#*  }"
+      [ -n "$rel" ] || unknown "the provenance record at $PROV has a manifest line with an EMPTY path: '$line' — this reader cannot say which file it describes"
       if [ ! -f "$O/$rel" ]; then
         # ⛔ NOT `Q_RECORD`. Nothing at $O differs from the record — there is nothing there. Reading
         # this as "an UNCOMMITTED EDIT … RECOVER the edit before redeploying: a deploy OVERWRITES it"

@@ -300,6 +300,80 @@ ck "…and the run still produces its one-line summary" "$(qF "harness=" "$OUT" 
 ck "…and no shell error leaked into the report" "$(qF "unbound variable" "$OUT" && echo 1 || echo 0)"
 
 echo
+echo "── §9d the MAC deploy's record shape is NOT an identity failure (sourceDirty=false, source= live) ──"
+# ⛔ THE BOX CLASS THE RECORD EXISTS FOR. `deploy-mac-orchestrator.sh` stages `git archive` into a
+# throwaway dir and (before this arm) recorded `sourceDirty=unknown` — which THIS reader REFUSES — plus a
+# `source=` pointing at the `$STAGE` it deletes. A record is PREFERRED over install.sh's stamp, so the box
+# lost the attribution it already had: attributable before, UNKNOWN after. The deploy now states both.
+MACLIVE="$TMP/mac-live/scripts/orchestrator-harness"; rm -rf "$TMP/mac-live"; mkdir -p "$MACLIVE"
+MACSTAGE="$TMP/mac-stage"; rm -rf "$MACSTAGE"; mkdir -p "$MACSTAGE"
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$MACLIVE"/
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$MACSTAGE"/
+deploy
+# The suite advances $REPO (§8), so the tip is read NOW — a record naming $HEAD1 here would be a
+# deliberately-BEHIND box, and this arm is about the record's SHAPE, not about being behind.
+TIP_NOW="$(git -C "$REPO" rev-parse HEAD)"
+bash "$PROVW" write --o "$O" --src "$MACSTAGE" --commit "$TIP_NOW" --ref main --repo "$REPO" \
+  --source-dirty false --origin "$MACLIVE" >/dev/null 2>&1
+grep -qF "sourceDirty=false" "$O/.harness-provenance" || echo "    (record did not carry sourceDirty=false)"
+run
+ck "rc is 0 — a staged mac record answers (a) instead of UNKNOWN" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and the run does NOT claim the record cannot say whether its source was clean" \
+   "$(qF "does not say whether its source was clean" "$OUT" && echo 1 || echo 0)"
+ck "…and the provenance record is still what answered" "$(qF ".harness-provenance" "$OUT" && echo 0 || echo 1)"
+# ⛔ THE POLARITY — this is the P1 REPRODUCED, and it must stay refuse-don't-guess: the SAME staged
+# record without the deploy's statement still carries sourceDirty=unknown, and this reader still answers
+# UNKNOWN (2). The flag is what makes the box attributable; its absence must never default to "clean".
+bash "$PROVW" write --o "$O" --src "$MACSTAGE" --commit "$TIP_NOW" --ref main --repo "$REPO" >/dev/null 2>&1
+run
+ck "without --source-dirty the same staged record is still UNKNOWN (2) — never assumed clean" \
+   "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "…and the reason names sourceDirty, so an operator knows what the deploy must state" \
+   "$(qF "does not say whether its source was clean" "$OUT" && echo 0 || echo 1)"
+
+echo
+echo "── §9e --surface still answers when the provenance record is UNREADABLE and a stamp exists ──"
+# The block that resolves the record says a missing/unreadable record is NOT a reason to skip the surface
+# pass; an unconditional block below it then DISCARDED that fallback and exited 2 — so the surface pass
+# never ran on the exact population it was written for (a box whose record is unusable).
+deploy
+extra_surface_fixture="$TMP/extra3"; rm -rf "$extra_surface_fixture"; mkdir -p "$extra_surface_fixture"
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$extra_surface_fixture"/
+printf '#!/usr/bin/env bash\necho hand-placed\n' > "$extra_surface_fixture/c.sh"
+bash "$PROVW" write --o "$O" --src "$SRCDIR" --commit "$(git -C "$REPO" rev-parse HEAD)" --ref main --repo "$REPO" >/dev/null 2>&1
+chmod 000 "$O/.harness-provenance" 2>/dev/null || true
+OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$extra_surface_fixture" HARNESS_PIN_DIR="" \
+        HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
+        bash "$DRIFT" --o "$O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+chmod 644 "$O/.harness-provenance" 2>/dev/null || true
+ck "the surface pass ANSWERED (rc 1 — the extra dir differs), it did not exit 2 on the record" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "…and the surface pass actually RAN and named its hit (c.sh, hand-placed in the extra dir)" \
+   "$(qF "c.sh — exists ONLY in" "$OUT" && echo 0 || echo 1)"
+ck "…and it SAYS the preferred record was unusable (the fallback is never silent)" \
+   "$(qF "falling back to the install.sh stamp" "$OUT" && echo 0 || echo 1)"
+
+echo
+echo "── §9f a pathless manifest line is CANNOT-VERIFY here too, not a MISSING named after a hash ──"
+# ⛔ `%%` and `#` BOTH RETURN THE WHOLE LINE when the two-space run is absent, so a pathless `<64 hex>`
+# line set `rel` to the DIGEST and this reader printed `MISSING <the hash>` — a file it fabricated from a
+# field it could not parse. A record line this reader cannot read is CANNOT-VERIFY, never a drift.
+deploy
+bash "$PROVW" write --o "$O" --src "$SRCDIR" --commit "$(git -C "$REPO" rev-parse HEAD)" --ref main --repo "$REPO" >/dev/null 2>&1
+H_A2="$(sed -n 's/^\([0-9a-f]\{64\}\)  a\.sh$/\1/p' "$O/.harness-provenance" 2>/dev/null | head -1)"
+ck "the fixture record carries the entry to strip" "$([ -n "$H_A2" ] && echo 0 || echo 1)"
+grep -vF "  a.sh" "$O/.harness-provenance" > "$O/.hp.tmp" 2>/dev/null && printf '%s\n' "$H_A2" >> "$O/.hp.tmp" && mv "$O/.hp.tmp" "$O/.harness-provenance"
+# `files=` must stay self-consistent, or the self-description arm answers first and the pathless line is
+# never reached — the arm would then grade the wrong reader.
+NMAN2="$(sed -n '/^[0-9a-f]\{64\}  /p' "$O/.harness-provenance" 2>/dev/null | wc -l | tr -d ' ')"
+sed "s/^files=.*/files=$NMAN2/" "$O/.harness-provenance" > "$O/.hp.tmp" 2>/dev/null && mv "$O/.hp.tmp" "$O/.harness-provenance"
+run
+ck "rc is 2 — the record cannot be read, so nothing about it can be claimed" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "…and it does NOT fabricate a MISSING file named after the digest" "$(qF "MISSING $H_A2" "$OUT" && echo 1 || echo 0)"
+ck "…and it names the real reason (a manifest line with no path)" \
+   "$(qF "manifest line with no path" "$OUT" && echo 0 || echo 1)"
+
+echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
 # ⭐ MEMBERSHIP IS READ FROM THE DERIVED LIST, NEVER FROM THE DRIVER'S TEXT (#2609). This assertion
 # used to grep run-bash-shards.sh for its own `run_shard` row. That only worked while the list was
