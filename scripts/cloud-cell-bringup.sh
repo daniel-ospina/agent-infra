@@ -712,6 +712,55 @@ check_dispatch() {
   local out outrc
   out=""
   outrc=0
+  # ── THE LANE ROSTER (agent-infra#1935) ─────────────────────────────────────────────────────
+  # The pre-flight's holder surface is built FROM `$HOME/.pi/agent/state/lane-registry.tsv`
+  # (tortoise `tools/fleet_state.py`), and the only thing that ever wrote it was the RETIRED cmux
+  # dispatcher — so a cell has no roster, `load_registry` reports `measured=False`, the board
+  # cannot answer, and EVERY candidate is INCOMPLETE. Measured on cell 1, 2026-10-28:
+  #     issue assignee/holder INCOMPLETE … the roster was NEVER PROVISIONED in this cell
+  #     [refresh] ABORT: none of the 12 candidate(s) … judged NOTHING
+  # Provisioned HERE, from this box's OWN population, so "never provisioned" cannot recur.
+  # ⛔ THIS `--check` PATH WRITES, DELIBERATELY AND IN THE OPEN (#3032 review F7). A `--check` that
+  # silently mutated state would be a contract change; this one is stated instead: the roster is a
+  # PREREQUISITE of dispatch, `--check` is the last gate before a cell is started, and a check that
+  # only REPORTED an unprovisioned roster would leave the cell dispatching nothing — the defect
+  # (#1935) this whole change removes. The write is idempotent (a second run writes nothing) and
+  # non-destructive (a hand-maintained roster is never replaced, and an existing derived roster is
+  # never shrunk by an arm that measured nothing).
+  # ⛔ rc=3 is a WARNING, not a death: it means the population could not be MEASURED on this box,
+  # and the harness's reduced-surface path (refresh-candidates.sh, #2848) can still dispatch by
+  # handing the holder question to the cross-box claim registry. Killing a cell over an
+  # unmeasurable roster would be a false block; refusing to write an empty one is the rule that
+  # matters (#8175), and that lives in the provisioner.
+  if [ -f "$harness/provision-lane-registry.py" ] && command -v python3 >/dev/null 2>&1; then
+    local provout provrc
+    provout=""; provrc=0
+    provout="$(HOME="${CELL_HOME:-$HOME}" python3 "$harness/provision-lane-registry.py" --apply 2>&1)" || provrc=$?
+    printf '%s\n' "$provout" | sed 's/^/    /'
+    if [ "$provrc" -eq 3 ]; then
+      warn "the LANE ROSTER could not be provisioned (the population was unmeasurable — see above);"
+      warn "  the pre-flight's holder surface stays INCOMPLETE until it can be (agent-infra#1935)"
+    elif [ "$provrc" -ne 0 ]; then
+      # ⛔ A CRASH IS NOT A PROVISION (review finding 2): the provisioner's documented exits are
+      # 0/2/3, so any other non-zero is a failure of the tool itself, never "provisioned".
+      warn "the LANE ROSTER provisioning FAILED (rc=$provrc — not the tool's own refusal, so it crashed);"
+      warn "  the roster is in an UNKNOWN state and the holder surface may stay INCOMPLETE (agent-infra#1935)"
+    else
+      ok "lane roster: this box's own population (agent-infra#1935)"
+    fi
+  else
+    # ⛔ TWO CAUSES, TWO DIAGNOSES. The guard above has two halves (the tool is present AND an
+    # interpreter exists), and naming only the first made an absent `python3` read as a missing
+    # harness file — sending the operator to re-pull a file that is already there (review round 2,
+    # minor). The supervisor needs no twin here: its `cmd_check` dependency loop
+    # (cloud-cell-supervisor.sh:2101) dies on a missing python3 before this line is reached.
+    if [ ! -f "$harness/provision-lane-registry.py" ]; then
+      warn "provision-lane-registry.py not found at $harness — the lane roster is not provisioned here;"
+    else
+      warn "python3 is not on PATH — the lane roster provisioner cannot run here;"
+    fi
+    warn "  the pre-flight's holder surface will refuse every candidate (agent-infra#1935)"
+  fi
   out="$(REPO="$WORKDIR" OR="$REPO_SLUG" O="$CELL_HOME/orchestrator" bash "$harness/refresh-candidates.sh" --check 2>&1)" || outrc=$?
   if [ "$outrc" -ne 0 ]; then
     printf '%s\n' "$out" >&2
