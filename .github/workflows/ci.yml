@@ -153,10 +153,17 @@ jobs:
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
     # checks 1–5 (materialized copy / mistargeted link / unwired entry /
     # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
-    # exclusion. Check 5 is the ONE machine-local check: it aims at
-    # ${PI_EXTENSIONS_DIR:-$HOME/.pi/agent/extensions}, so on a runner it prints
-    # an explicit ⏭️ skip and the CI verdict stays repo-tree-only; its
-    # fail/pass behaviour is pinned here by the fixture suite's cases 10–12.
+    # exclusion. Check 5/6 are the machine-local ones — they read a live farm,
+    # never the repo tree — so the site they read must not be the RUNNER BOX's
+    # own ~/.pi (measured on #3002: a self-hosted pi box with stale test-file
+    # copies in its farm reddened this job over a diff that touched neither
+    # extensions/ nor the farm — a host-dependent required check). The job
+    # therefore NAMES the farm, and names it at the one this repo SHIPS:
+    # deterministic across runners, and still load-bearing, because a test-file
+    # entry or a dangling link added to the shipped farm reds here. The gate
+    # refuses the ambient farm in CI even if this env is removed (cases 33-34).
+    env:
+      PI_EXTENSIONS_DIR: ${{ github.workspace }}/pi-bootstrap/pi-config/extensions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
