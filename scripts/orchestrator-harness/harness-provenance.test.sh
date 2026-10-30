@@ -563,6 +563,24 @@ ck "…and pointing at the deliberate override" "$(qF "--accept-discard" "$OUT" 
 ck "…and the patched bytes survive the refusal" "$(qF "hand-patched" "$(cat "$MO/claims.sh")" && echo 0 || echo 1)"
 ck "…and the PLAN is printed WITH the refusal (it is what --accept-discard would destroy)" \
    "$(qF "overwrite    claims.sh" "$OUT" && echo 0 || echo 1)"
+# ⛔ THE CANNOT-VERIFY ARM ON THE macOS PATH WAS GRADED BY NOTHING (review of #3090). `deploy-harness.sh`
+# and `check-deployed-drift.sh` each carry a mutation-proven arm; this one was reached by no assertion at
+# all, so reverting it to "no readable provenance record there" reddened nothing. The state under test is
+# a record that is PRESENT and READABLE but cannot describe itself (`files=0`) — one of the many codes
+# `*)` swallows, and precisely the one the old sentence was FALSE about.
+M4="$TMP/mac4"; cp -R "$MO"/. "$M4"/                                    # a COPY: later rigs in §4 reuse $MO
+cp "$SRC/claims.sh" "$M4/claims.sh"                                    # drop the hand patch — the record,
+sed 's/^files=.*/files=0/' "$M4/.harness-provenance" > "$TMP/r6"          # not an edit to $O, is what this
+mv "$TMP/r6" "$M4/.harness-provenance"                                   # arm is about
+OUT="$(AI_MAIN="$R" SRC_REF=main O="$M4" PHASE=A STAGE="$TMP/stage3b" bash "$MACDEP" --dry-run 2>&1)"; RC=$?
+ck "a record that cannot describe itself does NOT block the mac dry run (rc 0)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and the CHECKER'S verdict is printed, not discarded (“EMPTY manifest”)" \
+   "$(qF "EMPTY manifest" "$OUT" && echo 0 || echo 1)"
+ck "…and the arm does NOT claim the record is unreadable" \
+   "$(qF "no readable provenance record" "$OUT" && echo 1 || echo 0)"
+ck "…and it claims only what is known: the record could not be USED" \
+   "$(qF "could not be USED" "$OUT" && echo 0 || echo 1)"
 # ⛔ A REF THAT PREDATES THE CHECKER. `DISC_RC` starts at 0 in the old code and is only reassigned when
 # the staged harness ships the checker, so this arm read as a CLEAN deploy over a box nobody inspected —
 # the 2026-10-28 silence, on the ref most likely to produce it.
