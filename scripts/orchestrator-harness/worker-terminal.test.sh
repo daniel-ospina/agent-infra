@@ -990,7 +990,11 @@ pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 case "$pfx" in *"*) false || exit 98"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *'*) false; exit 97'*) rc=1 ;; *) rc=1 ;; esac
 ck "…the guard never credits a file the worker's own gh could not spend (no gh => REFUSED, not blessed)" $rc
 if command -v perl >/dev/null 2>&1; then
-  case "$pfx" in *"perl -e 'alarm 10; exec @ARGV' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
+  # ⛔ THE `; exit 93` IS PART OF THE PIN (#3099 review): perl's failed `exec` returns FALSE and the
+  # one-liner ends with status 0, so without it the guard BLESSES a worker whose gh could not be run —
+  # the fail-open direction. The bound and the absolute path are pinned here; the fail-closed tail is
+  # pinned by the same string.
+  case "$pfx" in *"perl -e 'alarm 10; exec @ARGV; exit 93' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
   ck "…and its gh call is BOUNDED and ABSOLUTE (a hung gh would freeze the controller's whole cycle)" $rc
   case "$pfx" in *"|| gh auth token"*|*"|gh auth token"*) rc=1 ;; *) rc=0 ;; esac
   ck "…and no bare gh lookup survives in the guard (it is the build-time absolute path)" $rc
@@ -1028,14 +1032,17 @@ if command -v perl >/dev/null 2>&1; then
   # (c) THE REFUSAL TEXT CARRIES THE REMEDY, NOT JUST THE NUMBER. Asserted at the SOURCE because producing
   # a real `wt_spawn` refusal for each arm costs a tmux surface; the decoder is a pure `case` on $pre_rc.
   grep -q 'the credential PROBE could not answer in time' "$LIB" \
-    && grep -q 'rc=98 IS NOT UNIQUE TO THE gh PROBE' "$LIB" && rc=0 || rc=1
+    && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
   ck "…and the refusal text distinguishes them with a remedy each (probe-timing vs the credential arms)" $rc
   # (d) THE OTHER ARMS GET THEIR OWN CODES TOO, so a `keys.env` that will not parse cannot be reported
-  # as an absent gh credential — the opposite conflation, and the one review caught.
-  case "$pfx" in *"auth token"*) : ;; esac
-  grep -q 'exit 94; if command -v bash' "$LIB" && grep -q 'is blank in the worker' "$LIB" \
-    && grep -q 'NOT the gh credential' "$LIB" && rc=0 || rc=1
-  ck "…and an env-file / model-key fault cannot be reported as the gh credential (94 / 95, named)" $rc
+  # as an absent gh credential — the opposite conflation, and the one review caught. ⛔ THE CODES ARE
+  # PINNED, NOT JUST THE MESSAGE TEXT (review finding, 2026-10-30): the first version grepped prose that
+  # is emitted regardless of the status, so reverting `exit 95` to `exit 98` — the exact P1 it was
+  # supposed to guard — left the suite at 299/0.
+  grep -q 'exit 94; if command -v bash' "$LIB" && grep -q 'exit 95 ;; esac' "$LIB" \
+    && grep -q 'exit 93' "$LIB" && grep -q "exec @ARGV; exit 93" "$LIB" \
+    && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
+  ck "…and the 93/94/95 arms really EXIT those codes (an env-file or model-key fault cannot pose as the gh one)" $rc
 fi
 # ⛔ AND THE GATE-SIDE PROBE IS BOUNDED TOO (recorded rule, README §"Two platform rules …": a plain
 # `gh auth token` can hang for the life of the shell, rc=142 measured — and `wt_spawn` runs on the
@@ -1050,7 +1057,7 @@ fi
 # which fault it hit, and that string must not be read as an unbounded probe — the predicate is about
 # INVOCATIONS. So the operator-facing message lines (`pre_fault=` / `wt_warn`) are excluded; every line
 # that can actually EXECUTE the read must still arrive through `wt_bounded` or the pane's own `alarm`.
-n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -v 'pre_fault=\|wt_warn' | grep -vc 'alarm')"
+n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -vE '^[0-9]+:[[:space:]]+9[0-9]\) pre_fault=' | grep -vc 'alarm')"
 [ "$n_unbounded" = "0" ] && rc=0 || rc=1
 ck "every non-comment 'gh auth token' in the library is BOUNDED (through the helper, or the pane's own alarm)" $rc
 awk '/^wt_bounded\(\) \{/,/^}/' "$LIB" | grep -q "alarm shift; exec @ARGV" && rc=0 || rc=1

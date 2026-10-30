@@ -1115,7 +1115,7 @@ wt_launcher_env() {
   # decodes them into its refusal text:
   #   96 = THE PROBE COULD NOT ANSWER IN TIME — the store may be fine; re-run, and fix the local read
   #   97 = NO gh RESOLVABLE at build time (nothing could ask the question at all)
-  #   98 = A credential-contract arm refused (NOT uniquely the gh probe — see `wt_spawn`'s decoder)
+  #   98 = THE GH CREDENTIAL is absent/unreadable (the ONLY emitter of 98 in this file)
   #   94/95 = the env-file delivery arms / the model-credential guard, so that a refusal cannot claim
   #           "`gh auth token` answered with no token" about a `keys.env` that failed to PARSE
   # ⛔ THAT IS WHY THESE ARE DISTINCT CODES: the same mis-attribution the change removes, one arm over.
@@ -1125,12 +1125,17 @@ wt_launcher_env() {
   _guard="false; exit 97"
   _ghbin="$(command -v gh 2>/dev/null || true)"
   if [ -n "$_ghbin" ] && command -v perl >/dev/null 2>&1; then
-    _guard="env -u GH_TOKEN -u GITHUB_TOKEN perl -e 'alarm 10; exec @ARGV' $(wt_q "$_ghbin") auth token >/dev/null 2>&1"
+    # ⛔ `; exit 93` AFTER THE `exec` IS LOAD-BEARING (review finding, 2026-10-30, MEASURED): perl's
+    # failed `exec` returns FALSE and the one-liner ENDS WITH STATUS 0, so a build-time-resolved gh that
+    # is not executable at pane time used to make this guard exit 0 and BLESS a credential-less worker —
+    # the fail-open direction, and the same "dead lane reported provisioned" the pre-check exists to
+    # remove (measured: `perl -e 'alarm 10; exec @ARGV' /definitely/not/here auth token` -> rc 0).
+    _guard="env -u GH_TOKEN -u GITHUB_TOKEN perl -e 'alarm 10; exec @ARGV; exit 93' $(wt_q "$_ghbin") auth token >/dev/null 2>&1"
   elif [ -n "$_ghbin" ]; then
     # gh IS here, the TIMER is not — its own code, because "put gh on the PATH" cannot fix it.
     _guard="false; exit 93"
   fi
-  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s; _wtgrc=$?; case "$_wtgrc" in 0) : ;; 142|124) exit 96 ;; *) exit 98 ;; esac ;; esac' "$_guard"
+  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s; _wtgrc=$?; case "$_wtgrc" in 0) : ;; 142|124) exit 96 ;; 93) exit 93 ;; *) exit 98 ;; esac ;; esac' "$_guard"
   # ── AND THE MODEL CREDENTIAL IS VERIFIED WHERE THE gh ONE IS — AFTER every source, against the
   # environment the worker will actually run with. This is the question a static grep cannot answer: did
   # the delivery LAND?
@@ -1959,11 +1964,10 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         # 9-hour merge stall this change comes from was a probe TIMEOUT reported as a failed credential
         # contract. The codes are set by the launch line's own guard (see `wt_launcher_env`).
         case "$pre_rc" in
-          92) pre_fault="the worker's CD into its cwd FAILED (rc=92) — the checkout is gone or unreadable, and nothing credential-related was tested. Remedy: check the cwd this spawn was given" ;;
-          93) pre_fault="gh resolved at build time but there is NO timer (`perl`) to bound the credential read (rc=93), so the question was never asked. Remedy: install perl on the harness box — the bound is perl's alarm, and `timeout` is absent on macOS" ;;
+          93) pre_fault="the credential read NEVER RAN (rc=93): either gh resolved at build time but there is no `perl` timer to bound it, or the resolved gh could not be EXECUTED when the pane ran it (perl's failed `exec` would otherwise return 0 and bless a credential-less worker). Remedy: install `perl` on the harness box (the bound is perl's alarm; `timeout` is absent on macOS) and check the gh path this launch line carries" ;;
           96) pre_fault="the credential PROBE could not answer in time (rc=96: the LOCAL \`gh auth token\` read was still running when its 10 s bound expired) — a PROBE/TIMING fault, NOT an absent credential; the store may be perfectly good. Remedy: re-run this lane, and if it repeats, check that the local credential read is not being serialised behind API traffic (the gh-limit layer's no-request fast path, agent-infra#3099)" ;;
           97) pre_fault="NO gh BINARY could be resolved when this launch line was built (rc=97), so nothing was ever asked for a token. Remedy: put gh on the harness PATH" ;;
-          98) pre_fault="a CREDENTIAL-CONTRACT arm refused, and its two sub-faults are NOT both this one (rc=98). ⛔ rc=98 IS NOT UNIQUE TO THE gh PROBE: the env-file delivery arms (keys.env / pi-keys.env) and the MODEL-credential guard exit the same code, so this number alone cannot say WHICH credential failed — the pane-side message above does. When that message is \`gh auth token\`'s silence, the gh credential is absent/unreadable for that HOME and the remedy is to provision it (hosts.yml / keyring via \`gh auth login\`, or a GH_TOKEN line in keys.env); when it is the model arm's own REFUSED line, the missing key is pi's, not GitHub's" ;;
+          98) pre_fault="the GH CREDENTIAL is absent or unreadable (rc=98): the worker's environment carries no GH_TOKEN/GITHUB_TOKEN value AND \`gh auth token\` did not answer for that HOME. This is the gh credential and nothing else — the env-file arms are 94 and the model key is 95, so a 98 never means a bad keys.env. Remedy: provision the gh credential for that HOME (hosts.yml / keyring via \`gh auth login\`, or a GH_TOKEN line in keys.env)" ;;
           94) pre_fault="an ENVIRONMENT FILE the launch line sources is unreadable, does not parse, or failed to source (rc=94) — keys.env / pi-keys.env, NOT the gh credential. Remedy: fix that file (\`bash -n <file>\` reproduces it); the credential was never tested" ;;
           95) pre_fault="the MODEL credential is blank in the worker (rc=95: the provider's env name pi needs is empty after every delivery arm), so the lane would die at its first model call. Remedy: deliver the model key (pi-keys.env / keys.env); the gh credential is unaffected" ;;
           *)  pre_fault="the launch line exited rc=$pre_rc" ;;
