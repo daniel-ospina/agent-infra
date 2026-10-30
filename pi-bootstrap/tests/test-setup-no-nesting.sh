@@ -459,7 +459,6 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # held back only because `lane-status.py` is. #1553 declares both in `lane_root_srcs`; when it lands
 # both take the membership branch and this list becomes STALE, which the stale check below FAILS —
 # delete the entries then, so the exemption cannot outlive its reason.
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 repo-target.sh:#3174"
 # `repo-target.sh` joined on 2026-11-01 (#3174) — a DISCLOSED GAP, not a delivery, and the reason is a
 # DERIVATION defect rather than a farm one. A farmed consumer names it through the ORCHESTRATOR payload
 # (`install-repair-service.sh`: `"$HERE/orchestrator-harness/repo-target.sh"` then `"$O/repo-target.sh"`),
@@ -470,6 +469,20 @@ LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 repo-target.
 # keeps the gap NAMED (DECLARED-GAP, never a silent delivery) until #3174 decides between modelling `$O`
 # as its own kind in `derive_lane_producers` and adding an `harness_srcs` farm array. It cannot outlive
 # its reason: the stale-disclosure check FAILS the moment it becomes delivered.
+#
+# `install-ci-runner-x64.sh` and `runner_autoscale.py` joined on 2026-10-30 (#2403), because THIS PR
+# farms a NEW consumer that reaches both: `fleet_srcs` now carries `install-runner-autoscale-timer.sh`,
+# which resolves the pass it schedules and the provisioner that pass fills with. NO farm array can
+# deliver them as declared today — `fleet_srcs` sources FLAT `scripts/<base>` while the pass lives at
+# `scripts/orchestrator-harness/runner_autoscale.py`, and the provisioner lives in `tools/`. They are
+# therefore WITHHELD, not re-pinned: every box resolves the pass from a checkout first
+# (`$INFRA_ROOT/scripts/orchestrator-harness/`, `$AGENT_INFRA_PATH/...`), and the `${HOME}/.pi/agent/
+# scripts/` candidate is the last resort — the same shape as `lane-status.py` above, where farming a
+# repo copy would overwrite a live one. #2403 owns whether the pass is farmed; until it is decided, an
+# undeclared entry here would grow the `DELIVERED BY NOTHING` set by two names while the PR reported
+# itself clean (measured: this landing adds exactly `script:install-ci-runner-x64.sh` and
+# `script:runner_autoscale.py` to it).
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174"
 # A ROOT of the derivation rather than a producer found by it: `heartbeat-loop.sh` is run by a launchd job
 # on the owner's box (no plist template in this repo names it; the label `com.tortoise.heartbeat-loop`
 # appears only in a comment at scripts/lane-status.py:41) and NO farmed consumer execs it (measured at
@@ -529,11 +542,11 @@ check_farm_arrays() { # <repo-root> <label>
 LANE_PRODUCERS_CANONICAL="
 script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
 script:disk-reaper.sh script:fleet-cost-report.sh script:goal-state.py script:harness-apply-pass.sh
-script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
+script:install-ci-runner-x64.sh script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
 script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
 script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
 script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py
-script:record-review.sh script:repo-target.sh script:session-postmortem.sh script:tortoise_graph_client.py
+script:record-review.sh script:repo-target.sh script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
 script:turn-classify.py
 script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
