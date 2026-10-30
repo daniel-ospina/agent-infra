@@ -230,13 +230,15 @@ elif [ "$DISC_RC" -ne 0 ]; then
     # ⛔ "NO READABLE RECORD THERE" WAS A GUESS, AND A FALSE ONE ON MOST OF THIS ARM (measured
     # 2026-10-30, review of #3053): this branch takes every code that is neither 0 nor 1 — `files=0`,
     # a `files=` count that disagrees with the manifest, an unparseable manifest line, an unreadable
-    # file, `commit=UNKNOWN` (all rc 2 with a record that is PRESENT and READABLE) and `die`'s 78. The
-    # checker printed the reason; this branch used to discard it and assert a cause instead. Claim only
-    # what is known — no answer was produced — and print the checker's own verdict above it.
+    # file (all rc 2 with a record that is PRESENT and READABLE) and `die`'s 78. ⛔ NOT `commit=UNKNOWN`:
+    # `check` never reads the commit field (only `show` does) — measured, a `commit=UNKNOWN` record exits
+    # 0 clean and 1 after an edit, never 2 (review of #3090). The checker printed the reason; this branch
+    # used to discard it and assert a cause instead. Claim only what is known — no answer was produced —
+    # and print the checker's own verdict above it.
     printf '%s\n' "$DISC_OUT" >&2
     log "WARN: cannot tell whether $O carries uncommitted edits — the provenance record could not be USED"
-    log "      (the checker's own verdict is above). Every file this run overwrites is UNRECOVERABLE, and"
-    log "      nothing here can tell you which they are."
+    log "      (the checker's own verdict is above). The files this run overwrites may include bytes no"
+    log "      deploy wrote — those are NOT recoverable, and nothing here can tell you which they are."
     if [ "$PHASE" = "A" ]; then
       log "      Proceed deliberately with --accept-discard. NOTE: a PHASE=A run does NOT write the record"
       log "      (it exits before phase B); run the full deploy to record the box, and until then this"

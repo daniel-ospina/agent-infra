@@ -762,7 +762,7 @@ deploy_harness() {
         # unreadable file (all rc 2 over a record that is PRESENT and READABLE) and `die`'s 78. The
         # checker printed the reason and this arm discarded it. Print it, and claim only what is known.
         printf '%s\n' "$dout" >&2
-        warn "deploy: UNKNOWN whether $O carries uncommitted edits — the provenance record could not be USED (the checker's own verdict is above); files this run overwrites are NOT recoverable; this run records the box, so later deploys can name an edit"
+        warn "deploy: UNKNOWN whether $O carries uncommitted edits — the provenance record could not be USED (the checker's own verdict is above); files this run overwrites may include bytes no deploy wrote, and those are NOT recoverable; this run records the box, so later deploys can name an edit"
         ;;
     esac
   else
