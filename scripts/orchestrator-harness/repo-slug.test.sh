@@ -152,17 +152,17 @@ RO="$T/report-o"; mkdir -p "$RO/state" "$RO/logs"; printf '1\n' > "$RO/candidate
 if [ -f "$REPORT" ]; then
   # B1 ABSENT: the old default is GONE, and nothing plausible is substituted for it.
   rout="$(env -u REPO O="$RO" bash "$REPORT" 1 2>&1)"; rrc=$?
-  { [ "$rrc" -eq 2 ] && printf '%s' "$rout" | grep -q 'REPO is unset' && ! printf '%s' "$rout" | grep -q 'eldato/tortoise'; }
+  { [ "$rrc" -eq 2 ] && grep -q 'REPO is unset' <<<"$rout" && ! grep -q 'eldato/tortoise' <<<"$rout"; }
   ck "B1  report.sh, REPO unset: rc 2, refuses — never \$HOME/eldato/tortoise (rc=$rrc)" $?
   # B2 BOGUS: refused by value. (The grep is for the OLD DEFAULT PATH, not the word `eldato` — the
   # refusal's own remedy names `com.eldato.orchestrator-loop.plist`, so the loose form would red a
   # correct run: measured while writing this arm.)
   rout="$(env REPO="$NOPE" O="$RO" bash "$REPORT" 1 2>&1)"; rrc=$?
-  { [ "$rrc" -eq 2 ] && printf '%s' "$rout" | grep -q 'not a git checkout' && ! printf '%s' "$rout" | grep -q 'eldato/tortoise'; }
+  { [ "$rrc" -eq 2 ] && grep -q 'not a git checkout' <<<"$rout" && ! grep -q 'eldato/tortoise' <<<"$rout"; }
   ck "B2  report.sh, REPO bogus: rc 2, names it (rc=$rrc)" $?
   # B3 AND THE READ-ONLY CONTRACT SURVIVES: on a real checkout it still exits 0 while the loop works.
   rout="$(env REPO="$REAL" O="$RO" bash "$REPORT" 1 2>&1)"; rrc=$?
-  { [ "$rrc" -eq 0 ] && printf '%s' "$rout" | grep -q 'sessions:'; }
+  { [ "$rrc" -eq 0 ] && grep -q 'sessions:' <<<"$rout"; }
   ck "B3  report.sh on a real checkout still runs read-only, rc 0 (rc=$rrc)" $?
 else
   bad "B1-B3 report.sh is shipped (absent: $REPORT)"
@@ -173,24 +173,24 @@ if [ -f "$REAPER" ]; then
   # (it IS a directory) and died later with "not a git repository: /"; this arm fails if that message
   # is what we get, so it cannot pass by the refusal merely happening somewhere.
   reaper_out="$(cd / && env -u REPO -u AGENT_INFRA_PATH REAP_WT_REPO_SLUG_LIB="$LIB" bash "$REAPER" --list 2>&1)"; reaper_rc=$?
-  { [ "$reaper_rc" -eq 2 ] && printf '%s' "$reaper_out" | grep -q 'REPO is unset' \
-    && ! printf '%s' "$reaper_out" | grep -q 'not a git repository'; }
+  { [ "$reaper_rc" -eq 2 ] && grep -q 'REPO is unset' <<<"$reaper_out" \
+    && ! grep -q 'not a git repository' <<<"$reaper_out"; }
   ck "B4  pi-reap-worktrees.sh, REPO unset with PWD=/ (launchd): REFUSES, no \$PWD default (rc=$reaper_rc)" $?
   # B5 THE BOX'S REPO. The documented fallback is the inherited environment value, so a bogus one must
   # be refused BY VALUE — this is the arm that reddens if a top-level `REPO=""` clobbers the operator's
   # value before the resolver reads it (measured: that assignment made this answer "REPO is unset").
   reaper_out="$(env -u REPO -u AGENT_INFRA_PATH REPO="$NOPE" REAP_WT_REPO_SLUG_LIB="$LIB" bash "$REAPER" --list 2>&1)"; reaper_rc=$?
-  { [ "$reaper_rc" -eq 2 ] && printf '%s' "$reaper_out" | grep -q "$NOPE" && printf '%s' "$reaper_out" | grep -q 'not a git checkout'; }
+  { [ "$reaper_rc" -eq 2 ] && grep -q "$NOPE" <<<"$reaper_out" && grep -q 'not a git checkout' <<<"$reaper_out"; }
   ck "B5  pi-reap-worktrees.sh, a bogus BOX \$REPO is refused by value (rc=$reaper_rc)" $?
   # B6 --repo BOGUS. The flag arm goes through the SAME resolver (a second path would be a second source).
   reaper_out="$(env -u REPO -u AGENT_INFRA_PATH REAP_WT_REPO_SLUG_LIB="$LIB" bash "$REAPER" --repo "$PLAIN" --list 2>&1)"; reaper_rc=$?
-  { [ "$reaper_rc" -eq 2 ] && printf '%s' "$reaper_out" | grep -q 'not a git checkout'; }
+  { [ "$reaper_rc" -eq 2 ] && grep -q 'not a git checkout' <<<"$reaper_out"; }
   ck "B6  pi-reap-worktrees.sh --repo <non-checkout> is refused by the same resolver (rc=$reaper_rc)" $?
   # B7 AND IT STILL WORKS: a named real checkout lists its worktrees, rc 0. (Compared against the
   # CANONICAL path: macOS `mktemp` hands out `/var/...` while `pwd -P` — and therefore the reaper's own
   # `$REPO_CANON` — says `/private/var/...`, so the raw `$T` prefix would never match.)
   reaper_out="$(env -u REPO -u AGENT_INFRA_PATH REAP_WT_REPO_SLUG_LIB="$LIB" bash "$REAPER" --repo "$REAL" --list 2>&1)"; reaper_rc=$?
-  { [ "$reaper_rc" -eq 0 ] && printf '%s' "$reaper_out" | grep -q "$RREAL"; }
+  { [ "$reaper_rc" -eq 0 ] && grep -q "$RREAL" <<<"$reaper_out"; }
   ck "B7  pi-reap-worktrees.sh --repo <real checkout> still lists, rc 0 (rc=$reaper_rc)" $?
 else
   bad "B4-B7 pi-reap-worktrees.sh is shipped (absent: $REAPER)"
@@ -205,13 +205,13 @@ if [ -f "$CROSSBOX" ]; then
     cb_out="$(env AI="$CELL/cell-ai" CELL_HOME="$CELL/cell-home" "$@" bash "$CROSSBOX" 2>&1)"; cb_rc=$?
   }
   cbrun REPO="$NOPE"
-  { [ "$cb_rc" -eq 2 ] && printf '%s' "$cb_out" | grep -q "$NOPE" && printf '%s' "$cb_out" | grep -q 'not a git checkout'; }
+  { [ "$cb_rc" -eq 2 ] && grep -q "$NOPE" <<<"$cb_out" && grep -q 'not a git checkout' <<<"$cb_out"; }
   ck "B8  deploy-crossbox.sh refuses a bogus REPO by value, never /tmp/cell-ai (rc=$cb_rc)" $?
   # A CELL WHOSE HARNESS PREDATES THE RESOLVER: refused BY NAME. The alternative — falling back to a
   # path default — is the defect, so a stale cell must stop the deploy rather than guess.
   rm -f "$CELL/cell-ai/scripts/orchestrator-harness/repo-slug.sh"
   cbrun REPO="$REAL"
-  { [ "$cb_rc" -eq 1 ] && printf '%s' "$cb_out" | grep -q 'repo-slug.sh missing'; }
+  { [ "$cb_rc" -eq 1 ] && grep -q 'repo-slug.sh missing' <<<"$cb_out"; }
   ck "B9  deploy-crossbox.sh: a cell with no repo-slug.sh dies BY NAME instead of guessing (rc=$cb_rc)" $?
 else
   bad "B8-B9 deploy-crossbox.sh is shipped (absent: $CROSSBOX)"
@@ -241,7 +241,7 @@ open(p, "w").write(s.replace(old, new))
     mut_name="$1"; mut_expect="$2"
     mut_out="$(env RR_TEST_NO_MUT=1 bash "$MUTDIR/orchestrator-harness/repo-slug.test.sh" 2>&1)"; mut_rc=$?
     mut_red="$(printf '%s\n' "$mut_out" | grep '❌' | head -3)"
-    { [ "$mut_rc" -ne 0 ] && [ -n "$mut_red" ] && printf '%s' "$mut_out" | grep -q -- "$mut_expect"; }
+    { [ "$mut_rc" -ne 0 ] && [ -n "$mut_red" ] && grep -q -- "$mut_expect" <<<"$mut_out"; }
     ck "M $mut_name REDDENS (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | sed 's/^ *//')" $?
   }
   mut_copy() { rm -rf "$T/mut"; mkdir -p "$T/mut"; cp -a "${SLUGDIR}." "$T/mut/"; MUTDIR="$T/mut"; }

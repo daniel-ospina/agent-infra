@@ -5029,7 +5029,7 @@ if [ -f "$CSS" ]; then
   # on the next line must.
   printf '#!/bin/bash\n# REPO="${REPO:-/some/path}" is the shape this arm forbids\nREPO="$HOME/x"\n' > "$TMP/rpdef/h/zz-holdout.sh"
   out="$(bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
-  { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'zz-holdout.sh:3'; } && rc=0 \
+  { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:3' <<<"$out"; } && rc=0 \
     || { rc=1; echo "      a private REPO path default exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') (a comment mentioning one must NOT be the hit: the reported line is the assignment's)"; }
   ck "check-single-source: a private REPO path default is refused, naming file AND line (rc 1)" $rc
   # Non-vacuity in the other direction: the shapes the whole harness is converging ON must not red.
@@ -5052,7 +5052,7 @@ if [ -f "$CSS" ]; then
   cp "$HERE/../pi-reap-worktrees.sh" "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
   printf 'REPO="${REPO:-$PWD}"\n' >> "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
   out="$(bash "$TMP/rpdef/repo scripts/orchestrator-harness/check-single-source.sh" 2>&1)"; rc=$?
-  { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'pi-reap-worktrees.sh:[0-9]'; } && rc=0 \
+  { [ "$rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$out"; } && rc=0 \
     || { rc=1; echo "      a default in scripts/ (the reaper) exited $rc: $(printf '%s\n' "$out" | grep -iE 'PRIVATE|nothing to scan' || echo '<not named>') — the arm is scanning ONE directory again (or word-split the parent path)"; }
   ck "check-single-source: a REPO path default in scripts/*.sh (not just the harness dir) is refused" $rc
   rm -rf "$TMP/rpdef"
