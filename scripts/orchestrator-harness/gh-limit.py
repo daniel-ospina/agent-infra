@@ -2844,6 +2844,34 @@ def reaches_api(argv):
     return argv[0] not in NO_REQUEST
 
 
+def makes_no_request_strictly(argv):
+    """The BOX-LOCK exemption. ⛔ DELIBERATELY NARROWER THAN `makes_request()` — they answer different
+    questions and only one of them is safe here.
+
+    `makes_request()` answers "can this call spend the ACCOUNT's budget?", and it is CORRECTLY
+    fail-OPEN about a few shapes that still reach the network: `gh api rate_limit` is exempt from the
+    limit yet is a real request, an `gh api` argv it cannot attribute is called "no evidence" rather
+    than "no request", and `NO_REQUEST_ANY` matches a help-looking token ANYWHERE in argv (`gh issue
+    create -t help` is a mutation with a title). Using that predicate for the LOCK — whose invariant is
+    the much stricter "one gh REQUEST in flight per box" — serialised nothing for those shapes:
+    measured in review, `api rate_limit` and `api --unknown-flag repos/o/r` went from peak 1 in flight
+    to peak 6, i.e. the fix would have traded a starved credential read for an UNSERIALISED fleet
+    (the exact failure #1988/#2005 exists to prevent), and a `gh issue create -t help` would have run
+    `pace_mutation`/`mark_mutation` outside the lock.
+
+    So this predicate is an exact allow-list of forms whose argv is PROVABLY local, and everything
+    else — including every form `makes_request()` merely cannot attribute — keeps the lock. The cost
+    of a MISS here is one serialised local read (a queue, i.e. today's behaviour); the cost of a
+    false POSITIVE is an unserialised API call."""
+    if not argv:
+        return True                      # bare `gh` prints help
+    if argv[0] in NO_REQUEST:
+        return True                      # --version/version/help/--help/-h/completion/alias/config
+    # `gh auth token [--hostname H] [-s]` reads hosts.yml or the keyring; nothing else under `auth` is
+    # exempt (`auth status` VALIDATES the token against the API — it takes the lock).
+    return len(argv) >= 2 and argv[0] == "auth" and argv[1] == "token"
+
+
 def bucket_for(argv):
     if not argv:
         return "graphql"
@@ -4474,7 +4502,22 @@ def _dispatch(real_gh, gh_argv):
                         log_event("account budget: %s still at its share after waiting %ds — proceeding "
                                   "OVER the partition (recorded, not silent)" % (bucket, int(w0)))
         attempt += 1
-        lock = acquire_lock()
+        # ⛔ THE SINGLE-FLIGHT LOCK IS FOR REQUESTS, NOT FOR CALLS (#3099). Its invariant is "one gh
+        # REQUEST in flight per box" — and a call that makes NO request cannot overlap anyone. Taking
+        # the lock anyway made a purely LOCAL read queue behind every API call on the box, and the
+        # measured consequence was not slow: it was a REFUSED WORKER. `wt_gh_token` / the launch-line
+        # guard run `gh auth token` (an OFFLINE hosts.yml/keyring read — `makes_request()` is False)
+        # under a 10 s alarm, through the `gh-rest` PATH shim, i.e. through THIS function — so on a
+        # busy box the credential read waited its turn and the alarm fired first. Measured on the mac
+        # 2026-10-30 (uncontended): `gh-rest/gh auth token` 4.1 s vs the real binary's 0.009 s; 8
+        # concurrent shim calls on a cell: 436/571/691/858/1052/1259/1395/1529 ms — strictly linear,
+        # which is a queue, not work. `worker-terminal.sh` then reported rc=98 ("the credential
+        # contract FAILS") and agent-infra merged 0 PRs for 9 hours while the controller classified
+        # correctly. ⛔ THE PREDICATE IS `makes_no_request_strictly`, NOT `counts_budget`: the budget
+        # predicate is fail-OPEN for shapes that DO reach the network (`api rate_limit`, an
+        # unattributable `api` argv, a help-looking flag VALUE) and using it here unserialised them
+        # (review finding, measured: peak 1 -> peak 6). See that function's own note.
+        lock = None if makes_no_request_strictly(gh_argv) else acquire_lock()
         try:
             if mutating:
                 w = pace_mutation()

@@ -987,7 +987,7 @@ wt_launcher_env() {
     # non-zero status: `exit 0` IS success) is the signal — and only then sourced for real. The file is
     # evaluated more than once; like the cell supervisor's own `source_env_file`, it must be a plain
     # assignment file.
-    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; _p="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai1713_env_sourced__ )"; case "$_p" in *__ai1713_env_sourced__) unset _p ;; *) exit 98 ;; esac; set -a; . %s; set +a' \
+    printf '; [ -r %s ] || exit 94; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 94; else sh -n %s || exit 94; fi; _p="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai1713_env_sourced__ )"; case "$_p" in *__ai1713_env_sourced__) unset _p ;; *) exit 94 ;; esac; set -a; . %s; set +a' \
       "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")"
   fi
   # ⛔ THE DELIVERY OF THE MODEL CREDENTIAL WHEN IT LIVES IN A BOX-LOCAL FILE (`~/pi-keys.env`, the file
@@ -996,7 +996,7 @@ wt_launcher_env() {
   # FINISHED (a `keys.env` carrying `exit 0` parsed, then ended the worker's shell before anything ran).
   # Emitted BEFORE the HOME/PATH pins below, so the file cannot repoint either of them.
   if [ -n "$pkeys" ] && [ "$pkeys" != "$keys" ]; then
-    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; _pm="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai_provider_env_sourced__ )"; case "$_pm" in *__ai_provider_env_sourced__) unset _pm ;; *) exit 98 ;; esac; set -a; . %s; set +a' \
+    printf '; [ -r %s ] || exit 94; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 94; else sh -n %s || exit 94; fi; _pm="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai_provider_env_sourced__ )"; case "$_pm" in *__ai_provider_env_sourced__) unset _pm ;; *) exit 94 ;; esac; set -a; . %s; set +a' \
       "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")"
   fi
   # ⛔ A BROKEN `keys.env` MUST NOT RUN A HALF-PROVISIONED WORKER, AND AN ORDINARY ONE MUST NOT BE FATAL
@@ -1107,12 +1107,30 @@ wt_launcher_env() {
   # with no gh anywhere cannot run a lane at all, and refusing loudly — before the session starts, via
   # `wt_spawn`'s caller-side pre-flight — is the documented fail-closed policy for that shape, not a
   # file credit the worker's own gh could never spend.
-  _guard="false"
+  # ⛔ THE GUARD NAMES WHICH FAULT IT HIT (#3099). `exit 98` used to mean EVERYTHING — an absent
+  # credential, an unreadable store, AND "the local read had not finished when its 10 s bound expired" —
+  # so the operator's only signal was one opaque number, and the log read `the credential contract this
+  # launch line carries FAILS (rc=98)` for a credential that was PRESENT and a probe that was QUEUED.
+  # Those are different faults with different remedies, so they get different exit codes and `wt_spawn`
+  # decodes them into its refusal text:
+  #   96 = THE PROBE COULD NOT ANSWER IN TIME — the store may be fine; re-run, and fix the local read
+  #   97 = NO gh RESOLVABLE at build time (nothing could ask the question at all)
+  #   98 = A credential-contract arm refused (NOT uniquely the gh probe — see `wt_spawn`'s decoder)
+  #   94/95 = the env-file delivery arms / the model-credential guard, so that a refusal cannot claim
+  #           "`gh auth token` answered with no token" about a `keys.env` that failed to PARSE
+  # ⛔ THAT IS WHY THESE ARE DISTINCT CODES: the same mis-attribution the change removes, one arm over.
+  # ⛔ 142/124 ARE THE ONLY CODES ADMITTED AS A TIMEOUT: SIGALRM (128+14, what perl's `alarm` raises) and
+  # `timeout`'s 124. Any other non-zero is a real answer, and calling it a timeout would send the
+  # operator to the wrong fault — the same conflation in the other direction.
+  _guard="false; exit 97"
   _ghbin="$(command -v gh 2>/dev/null || true)"
   if [ -n "$_ghbin" ] && command -v perl >/dev/null 2>&1; then
     _guard="env -u GH_TOKEN -u GITHUB_TOKEN perl -e 'alarm 10; exec @ARGV' $(wt_q "$_ghbin") auth token >/dev/null 2>&1"
+  elif [ -n "$_ghbin" ]; then
+    # gh IS here, the TIMER is not — its own code, because "put gh on the PATH" cannot fix it.
+    _guard="false; exit 93"
   fi
-  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s || exit 98 ;; esac' "$_guard"
+  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s; _wtgrc=$?; case "$_wtgrc" in 0) : ;; 142|124) exit 96 ;; *) exit 98 ;; esac ;; esac' "$_guard"
   # ── AND THE MODEL CREDENTIAL IS VERIFIED WHERE THE gh ONE IS — AFTER every source, against the
   # environment the worker will actually run with. This is the question a static grep cannot answer: did
   # the delivery LAND?
@@ -1125,7 +1143,7 @@ wt_launcher_env() {
   # literal apiKey, a provider pi authenticates itself) nothing is emitted and nothing refuses — our own
   # blindness must never become a refusal loop (#2210).
   if [ -n "$pvar" ]; then
-    printf '; case "${%s:-}" in *[![:space:]]*) : ;; *) echo "[worker-terminal] REFUSED: the model credential \$%s is blank in the worker (%s) — this lane could not authenticate a single model call" >&2; exit 98 ;; esac' \
+    printf '; case "${%s:-}" in *[![:space:]]*) : ;; *) echo "[worker-terminal] REFUSED: the model credential \$%s is blank in the worker (%s) — this lane could not authenticate a single model call" >&2; exit 95 ;; esac' \
       "$pvar" "$pvar" "$pdeliv"
   fi
   return 0
@@ -1804,8 +1822,8 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
   {
     printf '#!/usr/bin/env bash\n# worker %s, launched %s by worker-terminal.sh — the exact command this worker runs\n' \
       "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-    printf 'cd %s || exit 97\n' "$(wt_q "$2")"
-    printf 'set -a; . %s || exit 98; set +a\n' "$(wt_q "$3")"
+    printf 'cd %s || exit 92\n' "$(wt_q "$2")"
+    printf 'set -a; . %s || exit 94; set +a\n' "$(wt_q "$3")"
     printf '%s\n' "$4"
   } > "$f" 2>/dev/null || return 1
   chmod 700 "$f" 2>/dev/null || true
@@ -1813,7 +1831,7 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
 }
 
 wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (reason on stderr)
-  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val srv_pvar srv_pval pre_rc preout premsg pre_where spout spmsg _larc _lamsg _recovered _ensrc _ensclaim _enscmd
+  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val srv_pvar srv_pval pre_rc preout premsg pre_fault pre_where spout spmsg _larc _lamsg _recovered _ensrc _ensclaim _enscmd
   [ "$#" -ge 3 ] || { wt_warn "wt_spawn needs <name> <cwd> <command>"; return 1; }
   name="$1"; cwd="$2"; shift 2; cmd="$*"
   wt_name_ok "$name" || { wt_warn "refusing a worker name with anything but [A-Za-z0-9-]: '$name'"; return 1; }
@@ -1936,7 +1954,21 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
             *) pre_where=" (this caller's environment; the tmux server did NOT answer within ${WT_PROBE_TIMEOUT:-15}s, so what it carries is UNKNOWN — not established as absent)" ;;
           esac
         fi
-        wt_warn "REFUSED $name: the credential contract this launch line carries FAILS when it is executed (rc=$pre_rc), so the worker would die at once and be recorded as a started lane. The pre-check ran with the environment the PANE would inherit$pre_where — so this is not a caller-side artefact, and the pane-side line carried below names the credential and every source it checked: ${premsg:0:300}"
+        # ⛔ AND IT NAMES WHICH FAULT IT HIT, NOT JUST THE NUMBER (#3099). "the credential is absent" and
+        # "the probe could not answer in time" produce the SAME refusal and DIFFERENT remedies, and the
+        # 9-hour merge stall this change comes from was a probe TIMEOUT reported as a failed credential
+        # contract. The codes are set by the launch line's own guard (see `wt_launcher_env`).
+        case "$pre_rc" in
+          92) pre_fault="the worker's CD into its cwd FAILED (rc=92) — the checkout is gone or unreadable, and nothing credential-related was tested. Remedy: check the cwd this spawn was given" ;;
+          93) pre_fault="gh resolved at build time but there is NO timer (`perl`) to bound the credential read (rc=93), so the question was never asked. Remedy: install perl on the harness box — the bound is perl's alarm, and `timeout` is absent on macOS" ;;
+          96) pre_fault="the credential PROBE could not answer in time (rc=96: the LOCAL \`gh auth token\` read was still running when its 10 s bound expired) — a PROBE/TIMING fault, NOT an absent credential; the store may be perfectly good. Remedy: re-run this lane, and if it repeats, check that the local credential read is not being serialised behind API traffic (the gh-limit layer's no-request fast path, agent-infra#3099)" ;;
+          97) pre_fault="NO gh BINARY could be resolved when this launch line was built (rc=97), so nothing was ever asked for a token. Remedy: put gh on the harness PATH" ;;
+          98) pre_fault="a CREDENTIAL-CONTRACT arm refused, and its two sub-faults are NOT both this one (rc=98). ⛔ rc=98 IS NOT UNIQUE TO THE gh PROBE: the env-file delivery arms (keys.env / pi-keys.env) and the MODEL-credential guard exit the same code, so this number alone cannot say WHICH credential failed — the pane-side message above does. When that message is \`gh auth token\`'s silence, the gh credential is absent/unreadable for that HOME and the remedy is to provision it (hosts.yml / keyring via \`gh auth login\`, or a GH_TOKEN line in keys.env); when it is the model arm's own REFUSED line, the missing key is pi's, not GitHub's" ;;
+          94) pre_fault="an ENVIRONMENT FILE the launch line sources is unreadable, does not parse, or failed to source (rc=94) — keys.env / pi-keys.env, NOT the gh credential. Remedy: fix that file (\`bash -n <file>\` reproduces it); the credential was never tested" ;;
+          95) pre_fault="the MODEL credential is blank in the worker (rc=95: the provider's env name pi needs is empty after every delivery arm), so the lane would die at its first model call. Remedy: deliver the model key (pi-keys.env / keys.env); the gh credential is unaffected" ;;
+          *)  pre_fault="the launch line exited rc=$pre_rc" ;;
+        esac
+        wt_warn "REFUSED $name: the credential contract this launch line carries FAILS when it is executed — $pre_fault. The worker would die at once and be recorded as a started lane. The pre-check ran with the environment the PANE would inherit$pre_where — so this is not a caller-side artefact, and the pane-side line carried below names the credential and every source it checked: ${premsg:0:300}"
         return 1
       fi
       # ⛔ THE SHELL-COMMAND MUST BE ONE ARGUMENT (P0 review finding, 2026-10-23, MEASURED). tmux runs

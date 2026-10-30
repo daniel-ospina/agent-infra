@@ -572,6 +572,67 @@ ck "single flight: the /rate_limit PROBE is serialised too (it runs outside the 
 ck "single flight: … and that measurement really saw the probe (the leader's 4 attempts + 3 probes)" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -gt 4 ] && echo 0 || echo 1)"
 
+# ── G1b. A NO-REQUEST CALL NEVER TAKES THE BOX LOCK (#3099) ────────────────────────────────────
+# ⛔ WHAT THIS PINS. The single-flight lock's invariant is "one gh REQUEST in flight per box". A call
+# that makes NO request cannot overlap anyone, so it must not QUEUE for the lock either — and taking it
+# anyway is what starved the review actuator: `worker-terminal.sh` runs `gh auth token` (offline
+# hosts.yml/keyring read) under a 10 s alarm through the `gh-rest` shim, so on a busy box the local
+# credential read waited behind API traffic and the alarm fired first. The probe then REFUSED the
+# worker (rc=98) and no attestation was minted, i.e. 0 merges for 9 h on a controller that had
+# diagnosed the PRs correctly. Measured on the mac 2026-10-30: 4.1 s shim vs 0.009 s real binary.
+# The assertion is WALL TIME under 6 concurrent lock-holders (the stub sleeps 0.6 s per invocation):
+# with the lock, six `auth token` calls serialise into >= 3.6 s; without it they overlap and land in
+# well under a second. Both directions are measured — the CONTROL below re-pins that a request DOES
+# still serialise, so deleting the fast path is the only way this pair can both stay green.
+reset_env coalesce
+: >"$STUB_LOG"
+_t0="$(date +%s%N)"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- auth token >"$TMP/g1b-$i" 2>&1 ) &
+done
+wait
+_t1="$(date +%s%N)"
+_tms=$(( (_t1 - _t0) / 1000000 ))
+# ⛔ THE DISCRIMINATOR IS `max_inflight`, NOT the wall clock: wall time on a loaded cell is the flake
+# surface (measured here 1.1 s post-fix against a 2.5 s bound, while the pre-fix floor is 3.6 s), and
+# the overlap the stub itself logs is load-insensitive. The measured milliseconds are still REPORTED.
+ck "no-request: 6 concurrent \`gh auth token\` calls do NOT queue on the box lock [${_tms}ms, peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -gt 1 ] && echo 0 || echo 1)"
+ck "no-request: … and every caller still got its own answer (nothing swallowed) [$(( $(calls) ))]" \
+   "$([ "$(calls)" -eq 6 ] && [ "$(cat "$TMP"/g1b-* | grep -c 'ok')" -ge 6 ] && echo 0 || echo 1)"
+# ⛔ THE OTHER DIRECTION, IN THE SAME SUITE RUN: a REQUEST still takes the lock. If the fast path were
+# implemented as "skip the lock for everything" this stays green while the serialisation invariant
+# (#1988/#2005 — one request in flight) is destroyed, which is the failure the lock exists to prevent.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api "repos/o/r/pulls/7$i" >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: … while 6 concurrent API READS are still SERIALISED (never 2 in flight) [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ AND THE TWO SHAPES A FAIL-OPEN PREDICATE WOULD HAVE UNSERIALISED (review finding, measured: peak 6
+# before this arm existed). `makes_request()` answers False for BOTH — `api rate_limit` is exempt from
+# the limit but is a real request, and `-t help` is a flag VALUE that the help matcher mistakes — so a
+# lock keyed on the BUDGET predicate would have let them overlap. The lock is keyed on
+# `makes_no_request_strictly`, whose whole purpose is that these two keep it.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api rate_limit >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: the EXEMPT \`api rate_limit\` still takes the box lock (exempt from the LIMIT, not from the lock) [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- issue create -t help -b x >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: a help-LOOKING flag VALUE (\`issue create -t help\`) still takes the box lock [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+
 # ── G2. COALESCING: identical concurrent READS share ONE load (agent-infra#2243) ────────────────
 # ⛔ WHAT THIS SECTION IS FOR. Serialisation (#1988/#2005) decides WHO GOES NEXT; it does not decide
 # whether the work is worth doing twice. Thirteen lanes asking for the SAME read queued thirteen

@@ -715,8 +715,8 @@ printf 'GH_TOKEN=ghp_ok\nBADLINE ( (\n' > "$TMP/home-badkeys/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t" "$TMP/home-badkeys" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 env -i PATH=/usr/bin:/bin "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
-[ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
-ck "a keys.env that fails to source EXITS 98 (the worker's own shell dies before it runs the command)" $rc
+[ "$rcs" = "94" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
+ck "a keys.env that fails to source EXITS 94, an ENV-FILE fault not a credential one (the worker's own shell dies before it runs the command)" $rc
 # ⛔ THAT GUARD IS NOW ENFORCED BEFORE ANY SESSION EXISTS (P1 review finding, 2026-10-23, MEASURED).
 # This note used to say only that `tmux new-session -d` returns 0 as soon as the session object exists,
 # so a worker that exits 98 in its first millisecond is still recorded as started — true, and filed as
@@ -788,8 +788,8 @@ printf 'GH_TOKEN=ghp_ok\nexit 0\n' > "$TMP/home-exit/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t1x" "$TMP/home-exit" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-exit" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"; rcs=$?
-[ "$reach" = "" ] && [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
-ck "a keys.env with a top-level 'exit 0' exits 98 (the file terminated its shell, so the token check never ran)" $rc
+[ "$reach" = "" ] && [ "$rcs" = "94" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
+ck "a keys.env with a top-level 'exit 0' exits 94 (the file terminated its shell, so the token check never ran)" $rc
 # ⛔ …AND A FILE THAT PARSES BUT ABORTS **BEFORE** THE TOKEN IS STILL FATAL (the other half, measured):
 # `return 1` is legal in a sourced file and `sh -n` accepts it, so a syntax pre-check alone would let the
 # source stop before the token assignment and run the worker credential-less on an rc=0 spawn. The guard
@@ -987,13 +987,55 @@ rm -rf "$TMP/home-guard" "$TMP/O4t9"; gh_hosts_fixture "$TMP/home-guard"
 printf 'EXTRA=1\n' > "$TMP/home-guard/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t9" "$TMP/home-guard" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-case "$pfx" in *"*) false || exit 98"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *) rc=1 ;; esac
+case "$pfx" in *"*) false || exit 98"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *'*) false; exit 97'*) rc=1 ;; *) rc=1 ;; esac
 ck "…the guard never credits a file the worker's own gh could not spend (no gh => REFUSED, not blessed)" $rc
 if command -v perl >/dev/null 2>&1; then
   case "$pfx" in *"perl -e 'alarm 10; exec @ARGV' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
   ck "…and its gh call is BOUNDED and ABSOLUTE (a hung gh would freeze the controller's whole cycle)" $rc
   case "$pfx" in *"|| gh auth token"*|*"|gh auth token"*) rc=1 ;; *) rc=0 ;; esac
   ck "…and no bare gh lookup survives in the guard (it is the build-time absolute path)" $rc
+fi
+# ── THE GUARD NAMES WHICH FAULT IT HIT (#3099) ──────────────────────────────────
+# ⛔ WHAT THIS PINS, AND WHY THE POLARITY MATTERS. `exit 98` used to mean BOTH "no credential" and "the
+# local read had not finished when the alarm fired". The second is not a credential fault at all — it is
+# a probe that could not answer — and on 2026-10-30 the conflation is what read as `the credential
+# contract FAILS (rc=98)` for a credential that was present, on a controller that had diagnosed the PR
+# queue correctly: the mac's review worker was REFUSED every cycle and agent-infra merged 0 PRs for 9 h.
+# The two arms below are the DISCRIMINATION: the same absent-credential fixture, the only difference
+# being the exit status gh itself produced.
+if command -v perl >/dev/null 2>&1; then
+  # (a) THE PROBE COULD NOT ANSWER — SIGALRM is what perl's `alarm` raises on the exec'd child, and the
+  # stub reproduces exactly that status, so the mapping (and not just the string) is pinned.
+  rm -rf "$TMP/bin-alarm" "$TMP/home-alarm" "$TMP/O4alarm"; mkdir -p "$TMP/bin-alarm"; gh_hosts_fixture "$TMP/home-alarm"
+  printf '#!/usr/bin/env bash\nkill -ALRM $$ 2>/dev/null || exit 142\nsleep 5\n' > "$TMP/bin-alarm/gh"
+  chmod +x "$TMP/bin-alarm/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-alarm/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-alarm" "$TMP/O4alarm" "$TMP/home-alarm" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-alarm:/usr/bin:/bin" HOME="$TMP/home-alarm" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "96" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 96: the PROBE could not answer)"; }
+  ck "…a PROBE that could not answer in time exits 96 (a TIMING fault, not an absent credential)" $rc
+  # (b) THE CREDENTIAL IS ABSENT — gh ran and answered with nothing. Same fixture, different status.
+  rm -rf "$TMP/bin-notoken" "$TMP/home-notoken" "$TMP/O4notoken"; mkdir -p "$TMP/bin-notoken"; gh_hosts_fixture "$TMP/home-notoken"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin-notoken/gh"
+  chmod +x "$TMP/bin-notoken/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-notoken/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-notoken" "$TMP/O4notoken" "$TMP/home-notoken" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-notoken:/usr/bin:/bin" HOME="$TMP/home-notoken" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 98: credential absent)"; }
+  ck "…and a credential that is ABSENT/UNREADABLE still exits 98 (the fail-closed direction, unchanged)" $rc
+  # (c) THE REFUSAL TEXT CARRIES THE REMEDY, NOT JUST THE NUMBER. Asserted at the SOURCE because producing
+  # a real `wt_spawn` refusal for each arm costs a tmux surface; the decoder is a pure `case` on $pre_rc.
+  grep -q 'the credential PROBE could not answer in time' "$LIB" \
+    && grep -q 'rc=98 IS NOT UNIQUE TO THE gh PROBE' "$LIB" && rc=0 || rc=1
+  ck "…and the refusal text distinguishes them with a remedy each (probe-timing vs the credential arms)" $rc
+  # (d) THE OTHER ARMS GET THEIR OWN CODES TOO, so a `keys.env` that will not parse cannot be reported
+  # as an absent gh credential — the opposite conflation, and the one review caught.
+  case "$pfx" in *"auth token"*) : ;; esac
+  grep -q 'exit 94; if command -v bash' "$LIB" && grep -q 'is blank in the worker' "$LIB" \
+    && grep -q 'NOT the gh credential' "$LIB" && rc=0 || rc=1
+  ck "…and an env-file / model-key fault cannot be reported as the gh credential (94 / 95, named)" $rc
 fi
 # ⛔ AND THE GATE-SIDE PROBE IS BOUNDED TOO (recorded rule, README §"Two platform rules …": a plain
 # `gh auth token` can hang for the life of the shell, rc=142 measured — and `wt_spawn` runs on the
@@ -1004,7 +1046,11 @@ fi
 # module, so it cannot call the helper. Anything with NEITHER is an unbounded probe, which is the
 # defect. The helper is then separately pinned: a name without the alarm would be a gate that reads
 # correct and enforces nothing.
-n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -vc 'alarm')"
+# ⛔ A MESSAGE IS NOT A CALL SITE (#3099). The refusal text now names `gh auth token` when it explains
+# which fault it hit, and that string must not be read as an unbounded probe — the predicate is about
+# INVOCATIONS. So the operator-facing message lines (`pre_fault=` / `wt_warn`) are excluded; every line
+# that can actually EXECUTE the read must still arrive through `wt_bounded` or the pane's own `alarm`.
+n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -v 'pre_fault=\|wt_warn' | grep -vc 'alarm')"
 [ "$n_unbounded" = "0" ] && rc=0 || rc=1
 ck "every non-comment 'gh auth token' in the library is BOUNDED (through the helper, or the pane's own alarm)" $rc
 awk '/^wt_bounded\(\) \{/,/^}/' "$LIB" | grep -q "alarm shift; exec @ARGV" && rc=0 || rc=1
