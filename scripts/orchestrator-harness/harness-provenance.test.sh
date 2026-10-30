@@ -283,8 +283,14 @@ ck "the fixture source is now CLEAN of tracked edits (so the arm grades untracke
    "$([ -z "$($G -C "$DREPO" status --porcelain --untracked-files=no 2>/dev/null)" ] && echo 0 || echo 1)"
 printf '#!/usr/bin/env bash\necho WIP-NEVER-COMMITTED\n' > "$DREPO/scripts/orchestrator-harness/wip.sh"
 cp "$DREPO/scripts/orchestrator-harness/wip.sh" "$DO/wip.sh"
+# ⛔ THE `cp` ABOVE IS NOT INCIDENTAL: without it the deploy refuses for the §2g (P1) reason — a `$O`
+# file the source ships with DIFFERENT bytes — and this arm would then fail with a message about
+# patches instead of about `sourceDirty`. This arm is about P2 ONLY, so `$O` gets the source's bytes and
+# the deploy's gate has nothing to refuse. (`$G -C … | grep -q` is also avoided: a here-string keeps
+# `git status` from being a producer for the #864 SIGPIPE class, which the suite's own header forbids.)
+WIP_ST="$($G -C "$DREPO" status --porcelain 2>/dev/null)"
 ck "the fixture source really is untracked (the arm grades an untracked file, not a modified one)" \
-   "$($G -C "$DREPO" status --porcelain 2>/dev/null | grep -qF '?? scripts/orchestrator-harness/wip.sh' && echo 0 || echo 1)"
+   "$(qF '?? scripts/orchestrator-harness/wip.sh' "$WIP_ST" && echo 0 || echo 1)"
 PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$DREPO/scripts/orchestrator-harness" --o "$DO" --no-notify >/dev/null 2>&1; RC=$?
 ck "a deploy that SHIPS an untracked source file still completes (0 — the gate does not refuse it)" \
    "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
@@ -292,7 +298,39 @@ ck "…and the record says sourceDirty=true — the commit does not own those by
    "$(qF "sourceDirty=true" "$(cat "$DO/.harness-provenance" 2>/dev/null)" && echo 0 || echo 1)"
 ck "…and wip.sh IS in the manifest (the deploy did ship it — so the field had to see it)" \
    "$(qF "  wip.sh" "$(cat "$DO/.harness-provenance" 2>/dev/null)" && echo 0 || echo 1)"
-rm -f "$DREPO/scripts/orchestrator-harness/wip.sh" "$DO/wip.sh"    # leave the shared fixture as found
+# ⛔ THE OTHER DIRECTION, AND THE ONE THAT WAS SHIPPED BROKEN: a file the caller DECLARED it does not
+# write is not dirtiness FOR THIS RECORD. `start` states its write set with `--skip`; measuring dirtiness
+# over the whole source directory made an untracked scratch file it never ships record
+# `sourceDirty=true`, and `check-deployed-drift.sh` turns that into DRIFT(identity) + exit 1 — with the
+# commit current, reporting `harness=payload-differs`, a false statement whose remedy cannot clear it.
+# A record must not contradict itself: `files=` describes the write set, so the dirty answer comes from
+# the same set. Measured before this fix: clean fixture + one untracked, skipped `NOTES.txt` →
+# `files=` excluded it and `sourceDirty=true`.
+printf 'scratch notes this caller never writes\n' > "$DREPO/scripts/orchestrator-harness/NOTES.txt"
+rm -f "$DREPO/scripts/orchestrator-harness/wip.sh" "$DO/wip.sh"   # the unskipped untracked file is graded above
+# model `start` exactly: its skip list is built by walking FILES (see orchestrator-bringup.sh's
+# `skip_args` loop), so every NESTED file is skipped by its full relative path and every depth-1 file
+# that is not a `*.sh` is skipped by name — a DIRECTORY name in the skip list would skip nothing,
+# because `--skip` is a literal relpath match.
+CW_SRC="$DREPO/scripts/orchestrator-harness"
+SKIP_FLAGS=""
+for _f in "$CW_SRC"/*; do
+  case "${_f##*/}" in *.sh) continue ;; esac
+  SKIP_FLAGS="$SKIP_FLAGS --skip ${_f##*/}"
+done
+for _f in "$CW_SRC"/*/*; do
+  [ -f "$_f" ] || continue
+  SKIP_FLAGS="$SKIP_FLAGS --skip ${_f#"$CW_SRC"/}"
+done
+SKIP_O="$TMP/skip-o"; rm -rf "$SKIP_O"; mkdir -p "$SKIP_O"
+for _s in "$CW_SRC"/*.sh; do cp "$_s" "$SKIP_O/"; done
+bash "$PROV" write --o "$SKIP_O" --src "$CW_SRC" $SKIP_FLAGS >/dev/null 2>&1; RC=$?
+ck "a record whose write set EXCLUDES an untracked file is still written (0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and NOTES.txt is NOT in its manifest (the write set, not the source tree)" \
+   "$(qF "  NOTES.txt" "$(cat "$SKIP_O/.harness-provenance" 2>/dev/null)" && echo 1 || echo 0)"
+ck "…and sourceDirty stays FALSE: a file this caller never writes is not its dirtiness" \
+   "$(qF "sourceDirty=false" "$(cat "$SKIP_O/.harness-provenance" 2>/dev/null)" && echo 0 || echo 1)"
+rm -f "$DREPO/scripts/orchestrator-harness/NOTES.txt"    # leave the shared fixture as found
 
 echo
 echo "── §2e a STAGED deploy states sourceDirty and source= for itself (the mac path's two facts) ──"
@@ -363,8 +401,11 @@ echo "── §2g the record is read back by a BROADER writer than wrote it, and
 # ⛔ THE THREE WRITERS OF $O HAVE DIFFERENT WRITE SETS, AND NOTHING CROSSED THEM (measured 2026-10-30,
 # review of #3053). `orchestrator-bringup.sh start` records depth-1 `*.sh` only (it passes `--skip` for
 # the rest); `deploy-harness.sh` and `deploy-mac-orchestrator.sh` (phase B) pass NO `--skip` and write
-# the whole staged tree. `install.sh` seeds the WHOLE tree into $O, so on the ordinary Mac `README.md`,
-# `retired/*.sh` and `gh-rest/gh` sit in $O outside a `start` record with the SOURCE's exact bytes.
+# the whole staged tree. Each `write` REPLACES `$O/.harness-provenance`, so the manifest always answers
+# for the LAST writer: a broad deploy records the docs, then `start` re-records the box WITHOUT them, and
+# `$O` is left holding files no record claims. (`install.sh` is NOT the source of those docs — it seeds
+# only `$O/gh-rest/gh` and `$O/gh-limit.py`, by its own comment at `install.sh:1507`; saying otherwise
+# would describe a mechanism that does not exist and invite a later lane to delete a correct gate.)
 # Reproduced with the shipped tool before this arm: `check --o $O --src $SRC` — deploy-harness.sh:366's
 # own call — returned 1 naming README.md an UNCOMMITTED-EDIT, and the deploy turned that into `exit 78`
 # plus "those bytes exist nowhere else: copy them aside": a false statement about the repo's own docs,
@@ -376,7 +417,7 @@ CW="$TMP/cross-writer"; rm -rf "$CW"; mkdir -p "$CW/src" "$CW/O"
 cp -R "$SRC"/. "$CW/src"/
 printf '# the docs a real harness ships beside its scripts\n' > "$CW/src/README.md"
 mkdir -p "$CW/src/retired"; printf '#!/usr/bin/env bash\ntrue\n' > "$CW/src/retired/old.sh"
-cp -R "$CW/src"/. "$CW/O"/                     # install.sh seeds the whole tree: IDENTICAL bytes
+cp -R "$CW/src"/. "$CW/O"/                     # the bytes an earlier BROAD deploy wrote: IDENTICAL
 CW_WRITE() { bash "$PROV" write --o "$CW/O" --src "$CW/src" --commit 0123456789abcdef0123456789abcdef01234567 \
                --skip README.md --skip retired/old.sh >/dev/null 2>&1; }
 CW_WRITE; RC=$?
