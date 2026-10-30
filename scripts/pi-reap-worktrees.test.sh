@@ -499,6 +499,33 @@ cat >"$T/bin/git-lsremote-hang" <<'SHIM'
 for a in "$@"; do [ "$a" = "ls-remote" ] && { sleep "${FAKE_LSREMOTE_SLEEP:-8}"; exit 0; }; done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+# ⛔ `ls-remote` COUNTERS for A26g — the dead-remote cache (#3041) is load-bearing and had NO
+# fixture (review of #3058, P2). The cache is a FILE because the probe runs inside a command
+# substitution, so no in-process variable survives; and it only matters when a pass has MORE THAN
+# ONE candidate that reaches the probe. Counting the shims' invocations is what discriminates
+# "one timeout per remote per pass" from "one per candidate": with the same fixture and a WORKING
+# `ls-remote` both candidates are counted (2), and with a FAILING one the second is suppressed (1).
+for _shim in git-lsremote-count git-lsremote-fail-count; do
+cat >"$T/bin/$_shim" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26g: count each `ls-remote` and then either answer it for
+# real (git-lsremote-count) or fail it the way a dead transport does
+# (git-lsremote-fail-count). COUNTING is the point — the verdict is identical
+# either way, so only the invocation count can tell the cache apart from
+# "no cache" (which costs one REAP_WT_GIT_TIMEOUT per candidate).
+for a in "$@"; do
+    if [ "$a" = "ls-remote" ]; then
+        c=0
+        [ -n "${FAKE_LSREMOTE_COUNTER:-}" ] && [ -f "$FAKE_LSREMOTE_COUNTER" ] && c="$(cat "$FAKE_LSREMOTE_COUNTER")"
+        c=$((c + 1))
+        [ -n "${FAKE_LSREMOTE_COUNTER:-}" ] && printf '%s\n' "$c" >"$FAKE_LSREMOTE_COUNTER"
+        case "$0" in *fail-count) exit 128 ;; esac
+        break
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+done
 # DF_BIN shims for the pass-verdict fixtures (#3041). `df -Pm` prints a POSIX
 # table whose second line's 4th field is Available; these pin BOTH the parse and
 # the two branches it feeds, without depending on the host's real free space.
@@ -526,6 +553,7 @@ chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh
          "$T/bin/git-list-fail-after-probes" "$T/bin/git-empty-list" "$T/bin/comm" \
          "$T/bin/git-fail-stash-log" \
          "$T/bin/git-lsremote-fail" "$T/bin/git-lsremote-hang" \
+         "$T/bin/git-lsremote-count" "$T/bin/git-lsremote-fail-count" \
          "$T/bin/df-low" "$T/bin/df-roomy" "$T/bin/df-fail"
 
 # ── fixture builders ───────────────────────────────────────────────────
@@ -636,6 +664,7 @@ run_reaper() {
     FAKE_LATE_COUNTER="${FAKE_LATE_COUNTER:-}" \
     FAKE_LATE_ON="${FAKE_LATE_ON:-1}" \
     FAKE_STATUS_COUNTER="${FAKE_STATUS_COUNTER:-}" \
+    FAKE_LSREMOTE_COUNTER="${FAKE_LSREMOTE_COUNTER:-}" \
     FAKE_SLOW_STATUS_ON="${FAKE_SLOW_STATUS_ON:-2}" \
     FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-3}" \
     DU_CANARY="${DU_CANARY:-}" \
@@ -3585,6 +3614,69 @@ OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A26b --apply exits 0 (a preserve is not a failure)"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A26b --apply removed nothing"
 assert_dir "$WT_A26B" "A26b the checkout is still on disk"
+
+# ── A26g: the DEAD-REMOTE CACHE — load-bearing, and until now pinned by NOTHING (#3058 review, P2)
+# `remote_is_dead`/`remote_mark_dead` had ZERO fixture coverage. A26b cannot supply it, and its own ⛔
+# note says why: its fixture has exactly TWO records, the main checkout (preserved by the
+# main-checkout gate BEFORE `commits_survive`) and ONE detached worktree — so exactly one record ever
+# reaches the probe, and "one timeout per remote per pass" is behaviourally IDENTICAL to "one per
+# candidate" there. The cache is the difference between a dead transport costing ONE
+# REAP_WT_GIT_TIMEOUT (20 s) and one PER CANDIDATE: on the 52-candidate population this PR was written
+# from, 52 x 20 s blows the 300 s REAP_WT_BUDGET_SECONDS, the tail defers, `PRUNE_BLOCKED=1`, and the
+# pass reclaims nothing — the F7 "a reaper that silently never reaps" state #3041 exists to end.
+# So this fixture is the smallest one that can tell the two implementations apart: TWO probe-reaching
+# candidates, and a COUNTING `ls-remote` whose invocation count is the verdict. The rows are the same
+# in both legs by design — only the count moves.
+ENV=A26g; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+WT_A26G1=""; WT_A26G2=""
+for _g in 1 2; do
+    "$REAL_GIT" -C "$REPO" checkout -q -b "tmp-a26g$_g"
+    commit_in_wt "$REPO" "$OLD_DATE" "a26g$_g"
+    _gsha="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+    "$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g$_g:refs/heads/feat/a26g$_g"
+    "$REAL_GIT" -C "$REPO" checkout -q main
+    "$REAL_GIT" -C "$REPO" branch -D "tmp-a26g$_g" >/dev/null
+    "$REAL_GIT" -C "$REPO" fetch -q upstream
+    "$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det$_g" "$_gsha"
+    # the remote branch is GONE, so the tip is held only by `refs/remotes/upstream/feat/a26g$_g`:
+    # this is the `remote-only-ref` class, and the probe is the ONLY thing that runs for it.
+    "$REAL_GIT" -C "$BARE" update-ref -d "refs/heads/feat/a26g$_g"
+    if [ "$_g" = 1 ]; then WT_A26G1="$T/$ENV-det$_g"; else WT_A26G2="$T/$ENV-det$_g"; fi
+done
+assert_eq "$("$REAL_GIT" -C "$REPO" worktree list | wc -l | tr -d ' ')" "3" \
+    "A26g precondition: main checkout + TWO detached worktrees"
+assert_eq "$("$REAL_GIT" -C "$BARE" for-each-ref refs/heads | wc -l | tr -d ' ')" "0" \
+    "A26g precondition: the remote advertises NO branch (both tracking refs are stale)"
+# (1) NON-VACUITY, and it has to come first: with a WORKING counting `ls-remote` every candidate that
+#     reaches the probe is counted. A cache that is never reached cannot be told apart from one that
+#     suppresses a call the fixture never made — this leg is what makes leg (2)'s `1` mean something.
+A26G_CNT_ALIVE="$T/$ENV/cnt-alive"; rm -f "$A26G_CNT_ALIVE"
+OUT="$(FAKE_LSREMOTE_COUNTER="$A26G_CNT_ALIVE" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-count" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(cat "$A26G_CNT_ALIVE" 2>/dev/null)" "2" \
+    "A26g non-vacuity: BOTH probe-reaching candidates really do call ls-remote (a working remote costs one call each)"
+assert_contains "$(row_for "$OUT" "$WT_A26G1")" "reason=remote-only-ref" \
+    "A26g candidate 1 PRESERVEs (stale tracking ref, remote branch gone)"
+assert_contains "$(row_for "$OUT" "$WT_A26G2")" "reason=remote-only-ref" \
+    "A26g candidate 2 PRESERVEs"
+assert_contains "$OUT" "examined=3 classified=3" \
+    "A26g non-vacuity: all three records were examined and classified (not silently skipped)"
+# (2) THE CACHE. Same fixture, same two candidates, a FAILING transport: the first probe marks the
+#     remote dead for the rest of the pass and the second candidate must not pay for another timeout.
+A26G_CNT_DEAD="$T/$ENV/cnt-dead"; rm -f "$A26G_CNT_DEAD"
+OUT="$(FAKE_LSREMOTE_COUNTER="$A26G_CNT_DEAD" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-fail-count" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(cat "$A26G_CNT_DEAD" 2>/dev/null)" "1" \
+    "A26g the dead-remote cache makes a FAILING remote cost ONE ls-remote for the WHOLE pass, not one per candidate (52 x 20s would exceed REAP_WT_BUDGET_SECONDS and reclaim nothing)"
+assert_contains "$(row_for "$OUT" "$WT_A26G1")" "reason=remote-only-ref" \
+    "A26g a FAILING probe => PRESERVE (fail-closed, never a removal)"
+assert_contains "$(row_for "$OUT" "$WT_A26G2")" "reason=remote-only-ref" \
+    "A26g …and candidate 2 PRESERVEs off the CACHED verdict rather than its own call"
+assert_contains "$OUT" "examined=3 classified=3" \
+    "A26g the cached verdict does not shrink the population (all three still examined)"
 
 # ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
 # This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:
