@@ -1473,6 +1473,60 @@ grep -q 'SHIPPED-A' "$GS/O/worker-a.sh" && ! grep -q 'HAND-PATCHED' "$GS/O/worke
 kill -9 "$GS_PID" 2>/dev/null
 
 
+# ── §15b the record describes the WRITE SET, on a source that also ships non-.sh files ────────────
+# ⛔ MEASURED 2026-10-30 (review of PR #3053), reproduced with the shipped tool before the fix: `write`
+# inventories `--src` RECURSIVELY and calls a source file missing from `$O` a FAILED deploy, while `start`
+# copies only depth-1 `*.sh`. A real harness directory also ships `README.md`, `ARCHITECTURE.md`, `*.py`,
+# `retired/`, `gh-rest/gh` — so on every real box `write` refused ("the source ships README.md but `$O`
+# has no such file"), NO record was written by the verb operators actually run, and §15's own refusal
+# then sat on `drc=2` CANNOT-TELL forever: a gate with no witness, on the population it was added for.
+# Every fixture was `.sh`-only, which is exactly why §15 was green. This arm gives the source the shape
+# the real harness has, and pins BOTH halves: the record is written (files= counts what was written), and
+# an edit to a file this deploy does NOT write neither refuses the run nor enters the manifest.
+say_case "§15b the record covers what the deploy WROTE, on a source that also ships non-.sh files"
+GW="$T/gw"; mk_bin "$GW/bin" mac; mk_clone "$GW/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GW/home/Library/LaunchAgents" "$GW/O" "$GW/harness"; mk_render_harness "$GW/harness"
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GW/harness/"
+printf '# the docs a real harness ships beside its scripts\n' > "$GW/harness/README.md"
+mkdir -p "$GW/harness/retired"; printf '#!/bin/bash\ntrue\n' > "$GW/harness/retired/old.sh"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GW/home/keys.env"
+mk_controller "$GW/O"
+GW_PID="$(start_controller "$GW/O")"; sleep 0.4; printf '%s\n' "$GW_PID" > "$GW/O/.orch.lock"
+mk_launchctl_pid "$GW/bin" "$GW_PID"
+# The box already carries a `README.md` whose bytes no deploy wrote — `install.sh` seeds the whole tree, so
+# this is the ordinary state of a real Mac, not a contrived one. `start` does not write it, so it must not
+# refuse over it (and must not then claim it in the manifest).
+printf 'locally edited docs — not a file start writes\n' > "$GW/O/README.md"
+GW_SHIPPED="$(ls "$GW/harness"/*.sh | wc -l | tr -d ' ')"
+BRINGUP_ARGS=start bringup "$GW/home" "$GW/bin" "$GW/harness" REPO="$GW/repo" O="$GW/O" ENV_FILE="$GW/home/keys.env"
+[ "$RC" != 1 ] && ok "§15b an edit to a file this deploy does NOT write is not a refusal" \
+  || bad "§15b a non-.sh edit in \$O refused the run — the check is told the source tree, not the write set — rc=$RC $OUT"
+[ -f "$GW/O/.harness-provenance" ] \
+  && ok "§15b a source that ships non-.sh files still RECORDS the box" \
+  || bad "§15b NO record over a source that ships README.md — every real harness box stays unrecorded, and the §15 refusal is inert there — $OUT"
+if [ -f "$GW/O/.harness-provenance" ]; then
+  grep -q "^files=$GW_SHIPPED\$" "$GW/O/.harness-provenance" \
+    && ok "§15b the record's files= counts the $GW_SHIPPED file(s) this run WROTE" \
+    || bad "§15b the record's files= is not the write set — $(grep '^files=' "$GW/O/.harness-provenance" 2>/dev/null) (want $GW_SHIPPED)"
+  grep -q '  README.md$' "$GW/O/.harness-provenance" \
+    && bad "§15b the record claims a file this deploy never wrote — a manifest of the SOURCE TREE is not a record of the run" \
+    || ok "§15b the record does not claim the non-.sh file it never wrote"
+  grep -q 'retired/old.sh$' "$GW/O/.harness-provenance" \
+    && bad "§15b the record claims a NESTED file this deploy never wrote" \
+    || ok "§15b the record does not claim the nested file it never wrote"
+fi
+# …and the half that must still bite: an edit to a file it DOES write is still a refusal, with the record
+# present (so this arm cannot pass by the record being absent — the state that made §15 blind).
+printf '#!/bin/bash\necho HAND-PATCHED\n' > "$GW/O/worker.sh"
+BRINGUP_ARGS=start bringup "$GW/home" "$GW/bin" "$GW/harness" REPO="$GW/repo" O="$GW/O" ENV_FILE="$GW/home/keys.env"
+[ "$RC" = 1 ] && ok "§15b an edit to a file it DOES write is STILL a refusal" \
+  || bad "§15b rc=$RC over a hand-patched \$O/worker.sh with a record present, want 1 — the gate is blind — $OUT"
+grep -q 'HAND-PATCHED' "$GW/O/worker.sh" \
+  && ok "§15b …and the refusal preserved the patch" \
+  || bad "§15b the patch was overwritten — the 2026-10-28 incident, reproduced through the .sh path"
+kill -9 "$GW_PID" 2>/dev/null
+
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

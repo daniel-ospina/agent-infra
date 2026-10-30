@@ -4,7 +4,7 @@
 #
 #   harness-provenance.sh write --o <runtime> --src <harness-src> [--commit <sha>] [--ref <ref>]
 #                               [--repo <checkout>] [--source-dirty <true|false|unknown>]
-#                               [--origin <harness-live-dir>]
+#                               [--origin <harness-live-dir>] [--skip <relpath>]...
 #   harness-provenance.sh check --o <runtime> [--src <harness-src>] [--skip <relpath>]...
 #   harness-provenance.sh show  --o <runtime>
 #
@@ -142,7 +142,7 @@ while [ $# -gt 0 ]; do
     # manifest is still hashed from `--src` (the bytes that were actually deployed), so a staged deploy keeps
     # a truthful inventory AND leaves the reader something that exists.
     --origin) [ $# -ge 2 ] || die "--origin needs a path";   ORIGIN_ARG="$2"; shift 2 ;;
-    # ⛔ `--skip <relpath>` (repeatable, `check` only): THE FILES THIS CALLER DOES NOT WRITE. A partial
+    # ⛔ `--skip <relpath>` (repeatable, `check` AND `write`): THE FILES THIS CALLER DOES NOT WRITE. A partial
     # deploy must not refuse over a file it never touches — measured: `deploy-mac-orchestrator.sh` with
     # `PHASE=A` deliberately leaves `$O/orch-loop.sh` alone (phase B owns it), yet the gate asked the
     # writer about the whole staged tree, so an edit to `orch-loop.sh` alone refused a run that would
@@ -206,6 +206,24 @@ write)
   # and this loop's zero-iteration case would write an empty manifest that reads as "no files".
   if ! printf '%s\n' "$INV" | sed 's|^\./||' | LC_ALL=C sort > "$W/inv" 2>/dev/null; then
     die "could not normalise the source inventory under $SRC — nothing recorded"
+  fi
+  # ⛔ `--skip` IS THE PARTIAL DEPLOY'S STATEMENT OF ITS WRITE SET, AND `write` MUST HONOUR IT TOO (measured
+  # 2026-10-30, review of #3053). `orchestrator-bringup.sh start` is the THIRD writer of `$O/*.sh` and it
+  # copies only the depth-1 `*.sh`; told `--src` = the whole harness directory, the inventory below found
+  # `README.md`, `ARCHITECTURE.md`, `retired/…` and `gh-rest/gh` in the SOURCE and no copy in `$O`, so every
+  # `write` refused ("the source ships README.md but $O has no such file — the deploy is not complete"), no
+  # record was ever written by the verb operators actually run, and the refusal gate beside it sat on
+  # `drc=2` CANNOT-TELL forever — an inert enforcer on exactly the population it was added for. Reproduced
+  # with a two-file source and a one-file `$O`: rc 1, no record. `check`'s own `--skip` is checked literally;
+  # this one excludes the same relpaths from the manifest, so `files=` describes what the deploy WROTE.
+  if [ -n "$SKIPS" ]; then
+    printf '%s' "$SKIPS" > "$W/skips" || die "cannot stage the --skip list in $W — nothing recorded"
+    mv "$W/inv" "$W/inv.all" || die "cannot stage the source inventory in $W — nothing recorded"
+    # `grep -v` exits 1 when it emitted nothing (every source file skipped) — that is not an error here;
+    # the zero-file guard below turns it into its own named refusal. Any status above 1 is an I/O failure.
+    grep -vxF -f "$W/skips" "$W/inv.all" > "$W/inv"; _GSKIP=$?
+    [ "$_GSKIP" -le 1 ] || die "could not apply the --skip list under $SRC — nothing recorded"
+    rm -f "$W/inv.all" "$W/skips" 2>/dev/null || true
   fi
 
   # ── the commit the deploy came from ──────────────────────────────────────────────────────────

@@ -707,6 +707,27 @@ deploy_harness() {
     why="$(resolver_reason "$b")"
     if [ -n "$why" ]; then keep="$keep $b"; else stale="$stale $b"; fi
   done
+  # ── WHAT THIS FUNCTION WRITES, STATED TO THE CHECKER — the write set, not the source tree ─────
+  # ⛔ `harness-provenance.sh` inventories `--src` RECURSIVELY and treats "the source ships it, `$O` does
+  # not" as a FAILED deploy. This function copies ONLY depth-1 `*.sh`, while a real harness directory
+  # also ships `README.md`, `ARCHITECTURE.md`, `*.py`, `retired/`, `gh-rest/gh`, `gh-limit/gh` — so told
+  # the whole directory, every `write` below refused ("the source ships README.md but $O has no such
+  # file"), NO box was ever recorded by the verb operators actually run, and the refusal right below sat
+  # on `drc=2` CANNOT-TELL forever — the gate was inert on exactly the population it was added for.
+  # (`--skip` is the writer's own seam for this; `check` already had it, `write` now honours it too.)
+  # A `find` that fails here collapses to "skip nothing", so the worst case is the old refusal, never a
+  # manifest describing bytes this run did not write.
+  local skip_args=()
+  if [ -f "$SRC_HARNESS/harness-provenance.sh" ]; then
+    while IFS= read -r _rel; do
+      [ -n "$_rel" ] || continue
+      case "$_rel" in
+        */*) ;;          # nested — this function copies no subdirectory, so it writes none of these
+        *.sh) continue ;; # depth-1 *.sh — exactly the set the copy loop below installs
+      esac
+      skip_args+=(--skip "$_rel")
+    done < <( cd "$SRC_HARNESS" 2>/dev/null && find . -type f -print 2>/dev/null | sed 's|^\./||' )
+  fi
   # ── THE REFUSAL, before anything is written ────────────────────────────────────────────────────
   # ⛔ THIS FUNCTION IS A THIRD WRITER OF `$O/*.sh`, and it was the only one with no gate. The two
   # deploy paths (`deploy-harness.sh`, `deploy-mac-orchestrator.sh`) refuse to overwrite a file whose
@@ -719,7 +740,7 @@ deploy_harness() {
     warn "deploy: --accept-discard — an uncommitted edit in $O (if any) WILL be overwritten by this run"
   elif [ -f "$SRC_HARNESS/harness-provenance.sh" ]; then
     # The checker is the SOURCE's copy: the `$O` copy may be the very thing under suspicion.
-    dout="$(bash "$SRC_HARNESS/harness-provenance.sh" check --o "$O" --src "$SRC_HARNESS" 2>&1)" || drc=$?
+    dout="$(bash "$SRC_HARNESS/harness-provenance.sh" check --o "$O" --src "$SRC_HARNESS" ${skip_args[@]+"${skip_args[@]}"} 2>&1)" || drc=$?
     case "$drc" in
       0) : ;;
       1)
@@ -757,7 +778,7 @@ deploy_harness() {
     # ⛔ `${arr[@]+…}` IS REQUIRED under `set -u` on bash 3.2: an EMPTY array expands to an unbound-
     # variable error there, so a source that is not a git checkout would abort the deploy AT THE
     # RECORD instead of writing commit=UNKNOWN.
-    if bash "$SRC_HARNESS/harness-provenance.sh" write --o "$O" --src "$SRC_HARNESS" ${ppargs[@]+"${ppargs[@]}"}; then
+    if bash "$SRC_HARNESS/harness-provenance.sh" write --o "$O" --src "$SRC_HARNESS" ${ppargs[@]+"${ppargs[@]}"} ${skip_args[@]+"${skip_args[@]}"}; then
       log_line "deploy: recorded $O/.harness-provenance (commit ${pcommit:-UNKNOWN}) — every later deploy can now tell an edit from its own bytes"
     else
       warn "deploy: could NOT write $O/.harness-provenance — the bytes above are deployed, but this run did not record which commit they came from, so the NEXT deploy cannot tell an edit from its own bytes"

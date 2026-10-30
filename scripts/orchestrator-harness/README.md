@@ -1290,7 +1290,10 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 `$O/.harness-provenance`, written by `harness-provenance.sh` at the end of a **complete** deploy
 (`deploy-harness.sh`, `deploy-mac-orchestrator.sh` phase B, and `orchestrator-bringup.sh start` — the
 three writers of `$O/*.sh`). Plain text, one `sha256  path` line per
-file the deploy wrote, so a box answers with no checkout, no network and no `jq`.
+file the deploy wrote, so a box answers with no checkout, no network and no `jq`. The manifest is the
+**write set**, not the source tree: `start` installs only the depth-1 `*.sh`, so it records only those
+(it passes `--skip` for every file it does not write) — a `README.md` that a full deploy put in `$O` is
+therefore neither claimed by `start`'s record nor able to refuse a `start` that never touches it.
 
 ```bash
 # THE ONE-LINE ANSWER — works on a box with no checkout at all
@@ -1377,8 +1380,9 @@ bash scripts/orchestrator-bringup.sh start --accept-discard # the same, on the v
 `--accept-discard` is a **flag on every one of them**. `deploy-mac-orchestrator.sh` also reads
 `ACCEPT_DISCARD=1` from the environment (its `PHASE`/`WAIT`/`DRY_RUN` are env too);
 `deploy-harness.sh` and `orchestrator-bringup.sh` deliberately do **not**, because an export set for the
-mac path used to silently disarm the gate on the two scripts that protect the same live patch — the gate
-that stops a patch being destroyed is not reachable through ambient environment.
+mac path used to silently disarm the gate on the two scripts that protect the same live patch. So on
+these two the gate is **not reachable through ambient environment**; on `deploy-mac-orchestrator.sh` it
+is, by that script's own documented env seam — pass the flag there too if you want the same guarantee.
 
 `--dry-run` prints the **plan** (`new` / `unchanged` / `overwrite` per file) *before* the gate runs, so
 a run that would refuse shows both the refusal and the exact list `--accept-discard` would destroy; it
