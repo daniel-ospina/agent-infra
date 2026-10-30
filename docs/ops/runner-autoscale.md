@@ -45,8 +45,16 @@ be serving is ever touched (`OTHER-REPO` → `BUSY` → `ORPHANED` → `SERVING`
 > · over-ceiling: 5 live against a measured ceiling of 3 — … ; nothing removed (a runner that may
 > be serving is never removed)
 
-So a box that is above the ceiling **converges as its runners go idle** (a `SERVING` runner is
-removable, a `BUSY` one is not), and a box below it grows through the provisioner
+⛔ **OVER-CEILING IS REPORT-ONLY, AND IT NEVER CONVERGES DOWN.** The pass has exactly three actions
+— `restart`, `repair`/re-register and `add` — and **no removal path of any kind**: no `stop`, no
+deregister, no `DELETE /actions/runners/<id>`. Its own header states it (*"nothing here relabels,
+removes, or re-ranks an existing runner"*, *"restart, relabel or remove a runner that is serving (or
+may be serving) a job"*), and its over-ceiling branch ends `nothing removed`. So a box above its
+ceiling — pi-cell-1 measured `live=5` against `ceiling=3` — prints `over-ceiling` every nine minutes
+**for ever** and stays at 5 until a human removes the surplus by hand. A `SERVING` runner is **not**
+removable either; that sentence used to appear here and was false about the code this timer
+schedules. There is no convergence to wait for: arming the timer is not a remedy for an
+over-ceiling box. Below the ceiling it grows through the provisioner
 (`tools/install-ci-runner-x64.sh`, pinned into the unit when present). Without a provisioner the
 pass still repairs and re-registers, and reports `no provisioner` (exit 3) rather than pretending
 it grew.
@@ -102,7 +110,7 @@ Measured on **pi-cell-1** (Linux, 8 cores, systemd 255) on 2026-10-29:
 | ceiling derivation | `--status`: `by_cores=3 by_memory=9 by_disk=5 bound=cores ceiling=3` from `ncpu=8`, `mem_available_mb=8596` |
 | arm | record written with `ceiling=3`, `reading=ncpu=8 mem_available_mb=8316 ceiling=3` |
 | idempotence | a second `--install` printed `changed=1` only when the artifact was stale, kept the arming record, and left `drift_artifact=no` |
-| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 228 assertions, `PASS=228 FAIL=0`; case-by-case below |
+| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 244 assertions, `PASS=244 FAIL=0`; case-by-case below |
 
 **Not verified here (no macOS host in this lane):** `launchctl bootstrap` on a real Mac, the
 plist's `StartInterval` under `launchd`, and `gui/<uid>` behaviour on a logged-in GUI session. What
@@ -115,7 +123,7 @@ first `--install` to be the real test of that arm.
 ## The self-check, case by case
 
 `scripts/install-runner-autoscale-timer.test.sh` — hermetic (a mktemp fixture root, stub scheduler
-tools, a stub converger), 228 assertions, `PASS=228 FAIL=0`, no network, no real scheduler. What each
+tools, a stub converger), 244 assertions, `PASS=244 FAIL=0`, no network, no real scheduler. What each
 case pins, and why it exists:
 
 | case | what it proves |
@@ -155,6 +163,8 @@ case pins, and why it exists:
 | T30 | on a USER target `--status` re-checks `linger`, because lingering can be cleared after the install by an operator or an image rebuild: without it the readiness verb certified a timer that stops firing at logout. (Reaching the user target in the suite needs two fixture facts: `SUDO=false` is the documented "skip the sudo probe" seam, and the `systemctl` shim has to model `systemctl --user <verb>`) |
 | T31 | the launchd provisioner pin round-trips a shell-hostile path (`&`, `<`) and names a file that EXISTS. It used to be escaped twice — `provisioner_env_for` sed-escaped its value and `render` sed-escaped the composed `{{PROVISIONER_ENV}}` again — so the installed plist pinned `/…/inst\&x.sh`, literal backslashes on a path that does not exist; the plist still parsed and nothing compared the value, so the pass would have found no provisioner and exited 3 on every capacity tick. The same case asserts BOTH arms pin the identical path |
 | T32 | `--status` reports `drift_artifact=no` on an untouched USER-scope artifact. The install path drops `User=` for that target (systemd rejects it there) and the drift render did not, so the two files could never match and the drift signal fired on every run — a signal that always fires is a signal nobody reads, and it came from the very `--status` the install hands the operator as its remedy |
+| T37 | the drift comparison covers the artifact that carries the CADENCE. `--install` writes `…service` **and** `…timer`, and `--status` rendered and compared ONE (`…service`); the timer is where `OnBootSec=`/`OnUnitActiveSec=` live, and `{{INTERVAL_SEC}}` is rendered into the PLIST only, so the timer template is static text that nothing else compares. A hand-edited, foreign, or older-cadence timer fired at the wrong interval while the verb whose comment promises to catch "a changed interval" printed `drift_artifact=no` and exited 0 — and a timer that is MISSING (so nothing fires at all) printed the same. `drift_parts=service=… timer=…` attributes it, and `drift_artifact` is `no` only when BOTH were compared and matched and `unknown` when a render failed (a render failure is evidence of neither drift nor cleanliness) |
+| T38 | `--status` scans the SECOND scope and scopes its own claim. `choose_target` resolves the scope from sudo availability at THIS invocation, so a box installed into `/etc/systemd/system` by the bring-up answers a later `--status` run — where `sudo -n` fails — from the USER scope, and printed `installed=no` plus "this box has NO scheduled converger" over a box that IS converging, then handed the operator `--install`: the one action that creates the duplicate schedule T36 exists to report. The three writers always scanned; the readiness verb — the one an operator runs FIRST — did not. The note is advisory like theirs (a second scope can be legitimate, and removing it is the operator's call), the claim is now scoped (`no scheduled converger in THIS scope`) and the remedy is labelled scope-specific. The control asserts the note is ABSENT when no other scope carries the unit |
 | T33 | exit 4 (STARVATION) is RED in `--status` on BOTH platforms, as the service unit renders it. `4` sat in the green set, so the readiness verb certified the one state the unit is best placed to catch; it has its own arm because "the pass completed and reported starvation" is a different fact from "the pass is not completing" |
 | T34 | an interpreter that is present and executable but older than 3.12 is NOT a usable schedule: the pass refuses itself below 3.12 and the install path refuses such an interpreter, while `--status` checked only presence. The trigger is realistic — the installer pins an ABSOLUTE path and the resolver's own candidate list includes a per-lane venv, so a venv recreated on an older interpreter changes the version under a unit that never moved |
 | T35 | `--status` refuses a sudo-invoked root run, like the four writers. Under `sudo` HOME is `/root`, so the ARMING RECORD and the last-tick log were read from /root's state dir beside an artifact whose absolute paths are the user's — an armed, ticking box reported `arm_record=absent (/root/…)` and `last_tick=none` |
