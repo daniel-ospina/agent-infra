@@ -532,8 +532,7 @@ exec_remainder_after_script() {
           if (duppending) {                     # the token after a SECOND --repo pair
               duppending = 0
               if ($0 != "" && $0 !~ /^-/) {
-                  if ($0 != first) print "--repo-dup=" $0   # a REAL re-point
-                  next                                      # equal to the first: configuration
+                  print "--repo"; next
               }
               print "--repo"; next              # the SECOND pair has no value either
           }
@@ -569,7 +568,8 @@ artifact_is_armed() {
         args="$(printf '%s\n' "$line" | tr ' ' '\n' | tr -d '"')"
     fi
     [ -n "$args" ] || return 1
-    [ "$(classify_exec_args "$(exec_remainder_after_script "$args")")" = "armed" ]
+    case "$args" in *--dry-run*|*--status*) return 1 ;; esac
+    return 0
 }
 
 # adopt_installed_provisioner — an install that resolves NOTHING must not STRIP a pin the artifact
@@ -1199,7 +1199,7 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             # Dropping it unconditionally certified exactly the state this verb exists to refuse —
             # ARMED exit 0 over a schedule that is RED every nine minutes — so it follows the
             # `--want=`/`--root=` rule: an EMPTY value is reported, a real slug is configuration.
-            --workdir=*)       : ;;
+            --workdir=*)       [ -n "${l#*=}" ] || out="$out $l" ;;
             # ⛔ AN EMPTY `--workdir=` IS NOT AN EXIT-2 CASE, AND REPORTING IT WAS A FALSE BLOCK WITH A
             # FALSE REASON. This arm copied the `--want=`/`--root=`/`--repo=` rule, but `--workdir` does
             # not share their premise: it is consumed ONLY by `--install-unit` (the converge path never
@@ -1893,15 +1893,11 @@ do_status() {
                    # `--check-unitsx` was reported as `('x')`, the wrong argument named. Only the exact
                    # tokens this block gives its OWN line to are removed now; everything else is named
                    # verbatim.
-                   unrecognised=""
-                   for tok in $installed_mode; do
-                       case "$tok" in
-                           --install-unit|--check-units) ;;          # recognised ACTION: own line below
-                           --repo|--repo-dup|--repo-dup=*) ;;        # recognised --repo SHAPE: own lines below
-                           *) unrecognised="$unrecognised $tok" ;;
-                       esac
+                   unrecognised="$installed_mode"
+                   for known in --install-unit --check-units; do
+                       unrecognised="${unrecognised//$known/}"
                    done
-                   unrecognised="${unrecognised# }"
+                   unrecognised="$(printf '%s' "$unrecognised" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
                    [ -z "$unrecognised" ] || err "the installed artifact carries arguments this installer did not render ('$unrecognised'). The pass accepts --repo, --root <path>, --want <n>, --status, --dry-run, --json, --install-unit, --check-units and --workdir <path>; anything OUTSIDE that set makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
                    # ⛔ ONE OF THOSE OUTSIDE-THE-SET CASES IS A RECOGNISED SWITCH THE PASS CANNOT TAKE AS
                    # WRITTEN — with no value, or with a value of the wrong SHAPE (`--want` is an int). It
@@ -2053,8 +2049,7 @@ do_status() {
     # READER's cwd, so `ExecStart="…python3.12" "converger.py"` read `script_present=yes` and exit 0 from
     # any directory where that relative token happened to resolve. A scheduler resolves the script
     # argument against ITS cwd, so the tick cannot start: 203/EXEC every nine minutes, listed as scheduled.
-    if [ -n "$installed_script" ] && is_absolute_path "$installed_script" \
-       && [ -f "$installed_script" ] && [ -r "$installed_script" ]; then
+    if [ -n "$installed_script" ] && [ -f "$installed_script" ] && [ -r "$installed_script" ]; then
         log_line "script_present=yes"
     else
         log_line "script_present=no"
