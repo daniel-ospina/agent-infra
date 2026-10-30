@@ -17,9 +17,14 @@
 #
 # ── THE SAFETY GATE, AND IT IS THE WHOLE POLICY ────────────────────────────────────────────────
 # A `_work` entry is reapable ONLY when its **newest content is older than the floor**
-# (`--min-age`, default 3600 s). A running job writes into its entry CONTINUOUSLY — the checkout, the
-# step scripts under `_work/_temp`, the command logs — so "nothing under this entry has been written
-# for N seconds" is a positive fact about a dead entry. The comparison set is everything under the
+# (`--min-age`, default 3600 s). The IN-ENTRY witness is the checkout's OWN writes — the outputs, build
+# artefacts, `.venv`/`node_modules` and any file a step creates under the checkout — so "nothing under
+# this entry has been written for N seconds" is a positive fact about a dead entry. ⛔ `_work/_temp`
+# (the step scripts and the command logs) is a SIBLING of `_work/<repo>`, not a child of it — the vendor
+# creates `_temp`/`_tool`/`_actions`/`_work` at the runner root (`actions/runner`
+# `src/Runner.Common/Constants.cs` `WellKnownDirectory`, and the checkout is
+# `Path.Combine(_workDirectory, trackingConfig.PipelineDirectory)` in `JobExecution`), so a write there
+# does NOT refresh the checkout's floor and it is NOT an in-entry witness. The comparison set is everything under the
 # entry INCLUDING the entry's own top directory (a `find -newer` walk naturally covers it), which is
 # the CONSERVATIVE direction: a stray `touch`/`cp` over a dead entry's top dir restores its floor
 # rather than leaving it removable. What the gate deliberately does NOT use is the top directory's
@@ -36,10 +41,13 @@
 # this whole reaper exists to remove. mtime is the proof because the runner's own I/O is the evidence;
 # the FLOOR is the dial, and it is the operator's (`REAP_RW_MIN_AGE` / `--min-age`).
 # Measured: a 120-minute hand reap on a box with 12 live runners lost no job. The default here is the
-# briefer 60 minutes. ⚠️ RESIDUAL, stated so it is not discovered: a job that writes NOTHING for longer
-# than the floor (a single long quiet step) is indistinguishable from a dead entry by this test. If a box
-# runs such jobs, raise the floor (`DISK_REAPER_RUNNER_MIN_AGE=7200`) — that is the intended response,
-# not a busy-check.
+# briefer 60 minutes — and because the floor is what prices this trade, a box whose jobs write only
+# OUTSIDE the checkout should use the validated 7200 s (`DISK_REAPER_RUNNER_MIN_AGE=7200`), not the
+# shipped 3600 s. ⚠️ RESIDUAL, stated so it is not discovered: a job that writes NOTHING **INSIDE ITS
+# CHECKOUT** for longer than the floor is indistinguishable from a dead entry by this test. That is a
+# whole-job exposure for any job whose artefacts land in `$TMPDIR`, `~/.cache` or `_work/_temp` (every
+# step after checkout), not merely "one long quiet step". If a box runs such jobs, raise the floor —
+# that is the intended response, not a busy-check.
 #
 # ⛔ DELIBERATELY RETAINED: `_work/_tool` AND `_work/_actions`. They are the runner's CROSS-JOB caches —
 # every downloaded action (`_actions`) and every toolchain it fetched (`_tool`) — so removing them does
@@ -79,7 +87,9 @@
 #   REAP_RW_EXPLICIT    1 when the caller's glob list came from an EXPLICIT operator seam rather than
 #                       the defaults. It changes ONE outcome: a sweep that matches no root at all is then
 #                       a REFUSAL (the operator asserted a layout that is not there) instead of a
-#                       measured empty population. `disk-reaper.sh` sets it.
+#                       measured empty population. `disk-reaper.sh` sets it, and so does `--glob` — an
+#                       operator who names the layout with this script's own flag is making exactly the
+#                       same assertion, so the flag must not be the one spelling that fails open.
 #   BOUNDED_LIB         the bounded-execution helper (default: lib/bounded.sh beside this script, then
 #                       $HOME/.pi/agent/scripts/lib/). A SET-but-missing value, or none at all, is a
 #                       REFUSAL at startup — the rule `disk-reaper.sh` already applies (#2046): without
@@ -146,6 +156,13 @@ while [ $# -gt 0 ]; do
         --apply)   DRY_RUN=0; shift ;;
         --glob)    [ $# -ge 2 ] || die "--glob needs a pattern"
                    [ -n "$2" ] || die "--glob was given an empty pattern"
+                   # ⛔ `--glob` IS an explicit assertion, so it MUST set the flag the census reads.
+                   # Without this the seam's two spellings disagreed: `REAP_RW_GLOBS=<no-match>` was a
+                   # refusal (rc 3, `census=no-roots`) while `--glob <no-match>` was a measured empty
+                   # population (rc 0, `census=ok`) — a false PASS, through the spelling `--help`
+                   # recommends. Not reachable from `disk-reaper.sh`, which hands the seams down as env
+                   # and never passes `--glob`; the exposure is a hand-run or a future caller.
+                   EXPLICIT=1
                    if [ "$GLOB_ARGS_GIVEN" = 1 ]; then GLOBS="$GLOBS $2"; else GLOBS="$2"; GLOB_ARGS_GIVEN=1; fi
                    shift 2 ;;
         --min-age) [ $# -ge 2 ] || die "--min-age needs a number"
