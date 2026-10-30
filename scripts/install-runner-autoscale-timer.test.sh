@@ -92,6 +92,11 @@ ONEC
 cat >"$T/bin/systemctl" <<SYSTEMCTL_SHIM
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$T/systemctl.log"
+# ⛔ A USER-TARGET INSTALL CALLS `systemctl --user <verb>`, so the shim has to model the flag: the
+# verb is the first argument THAT IS NOT `--user`. Without this the user arm answered every verb with
+# the `*` fallback's silence, which read as `enabled=` / `timer_active=` (empty) — a fixture that
+# cannot represent the target the installer supports.
+[ "\${1:-}" = "--user" ] && shift
 case "\$1" in
   is-enabled)   printf '%s\n' "\${SHIM_ENABLED:-enabled}"; exit 0 ;;
   is-active)    printf '%s\n' "\${SHIM_ACTIVE:-active}"; exit 0 ;;
@@ -162,6 +167,14 @@ plist_args() {
 d = plistlib.load(open(sys.argv[1],"rb"))
 for a in d["ProgramArguments"]:
     print(a)' "$1" 2>/dev/null
+}
+# plist_env <plist> <key> — one EnvironmentVariables value, read by the test's own parser. Needed
+# because a plist that PARSES is not a plist that carries a USABLE value: the provisioner pin was
+# escaped twice and pinned a path with literal backslashes while the plist still parsed cleanly.
+plist_env() {
+    python3 -c 'import plistlib,sys
+d = plistlib.load(open(sys.argv[1],"rb"))
+print(d.get("EnvironmentVariables",{}).get(sys.argv[2],""))' "$1" "$2" 2>/dev/null
 }
 
 echo "install-runner-autoscale-timer.test.sh — agent-infra#2403"
@@ -719,6 +732,112 @@ OUT="$(run_install Darwin "$D" --uninstall)"; RC=$?
 chmod 700 "$D"
 assert_eq "$RC" 1 "--uninstall exits 1 when the plist cannot be removed"
 assert_contains "$OUT" "STILL PRESENT" "saying the artifact survived"
+
+# ── T29: `--status` GATES on `enabled`, not just prints it ──────────────────────────────
+# The install path refuses a not-enabled timer ("the converger will not run unattended"); the STATUS
+# path only printed `enabled=…`. A timer that is active now but not enabled does not come back at the
+# next boot, so the readiness verb an operator (and the health sweep) calls LATER certified a box whose
+# converger stops at the first restart — the lenient of two readers of one fact.
+say_case "T29 --status refuses a timer that is active but NOT enabled"
+D="$T/c29"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+ENVV=(SHIM_ENABLED=disabled)
+OUT="$(run_install Linux "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a disabled timer is NOT a green schedule"
+assert_contains "$OUT" "enabled=disabled" "the row still states the raw value (the gate is not a lie about it)"
+assert_contains "$OUT" "will not survive a reboot" "naming the consequence, not just the value"
+ENVV=(SHIM_ENABLED=static)
+OUT="$(run_install Linux "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "'static' fails too — no [Install] section means nothing links it into timers.target"
+OUT="$(run_install Linux "$D" --status)"; RC=$?          # control: SHIM_ENABLED defaults to enabled
+assert_eq "$RC" 0 "control: an ENABLED timer on the same artifact is still green (the gate is discriminating)"
+
+# ── T30/T32: the USER target — lingering is re-checked, and drift compares the right file ─
+# Reaching TARGET=user needs `systemctl` on PATH (choose_target probes `systemctl --user
+# show-environment`) and the sudo probes to decline — `SUDO=false` is the installer's documented seam
+# for "skip the sudo probe", and setting it (not leaving it unset) is what makes the probe decline
+# rather than pass straight to the SYSTEM target.
+cat >"$T/bin/loginctl" <<LOGINCTL_SHIM
+#!/usr/bin/env bash
+case "\$1" in
+  show-user) printf '%s\n' "\${SHIM_LINGER:-yes}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+LOGINCTL_SHIM
+chmod +x "$T/bin/loginctl"
+# ── T30: a user timer without lingering stops converging at logout ──────────────────────
+say_case "T30 --status re-checks lingering on a USER timer (the install path is not the last word)"
+rm -rf "$T/home/.config"; rm -f "$ARM"
+ENVV=(SUDO=false PATH="$T/bin:$PATH")
+OUT="$(run_install Linux - --install)"; RC=$?
+assert_eq "$RC" 0 "precondition: a lingering user install succeeds"
+assert_contains "$OUT" "target=user" "precondition: the target really is USER (the seam works)"
+envv_status_user() { ENVV=(SUDO=false PATH="$T/bin:$PATH" SHIM_LINGER="$1"); }
+envv_status_user no
+OUT="$(run_install Linux - --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a user timer with linger=no is NOT green — it dies with the session"
+assert_contains "$OUT" "linger=no" "the row names the value it gated on"
+assert_contains "$OUT" "after this session ends" "naming the consequence"
+envv_status_user yes
+OUT="$(run_install Linux - --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "control: linger=yes is green (the gate is discriminating)"
+# ── T32: drift must compare the artifact the install path would actually write ──────────
+# The install path DROPS `User=` for a user target (systemd rejects it there); the status render did
+# not, so the two files could never match and a freshly installed, untouched artifact reported
+# `drift_artifact=yes`. A signal that fires always is a signal nobody reads — and it was reported by
+# the very --status the install hands the operator as its remedy.
+say_case "T32 --status reports drift_artifact=no on an untouched USER-scope artifact"
+envv_status_user yes
+OUT="$(run_install Linux - --status)"; RC=$?; ENVV=()
+assert_contains "$OUT" "target=user" "precondition: the status read the USER target, not the host's system one"
+assert_eq "$RC" 0 "an untouched user artifact is healthy"
+assert_contains "$OUT" "drift_artifact=no" "and is not reported as drifted against itself"
+assert_file "$T/home/.config/systemd/user/$UNIT_NAME.service" "the user artifact is where --status looked for it"
+
+# ── T31: the launchd provisioner pin round-trips a shell-hostile path ───────────────────
+# `provisioner_env_for launchd` sed-escaped its value AND `render` sed-escaped the composed
+# `{{PROVISIONER_ENV}}` again, so the pin came out with literal backslashes (`…/inst\&x.sh`) — a path
+# that does not exist. The plist still parsed, nothing compared the value, and the pass would have
+# found no provisioner and exited 3 on every tick that should have added capacity.
+say_case "T31 the launchd provisioner pin survives '&' and '<' and names a REAL path"
+D="$T/c31"; fresh "$D"; rm -f "$ARM"
+PROV="$T/inst&<x>.sh"; printf '#!/bin/sh\n' >"$PROV"; chmod +x "$PROV"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV")
+run_install Darwin "$D" --install >/dev/null 2>&1; ENVV=()
+assert_file "$D/$LABEL.plist" "precondition: the Darwin artifact is installed"
+assert_eq "$(plist_env "$D/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$PROV" "the pinned value IS the path (no doubled escape)"
+assert_not_contains "$(plist_env "$D/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" '\' "and carries no literal backslash"
+assert_file "$(plist_env "$D/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "and that value resolves to a file that exists"
+# Control: the systemd arm rendered the same path correctly all along — assert both arms agree, so a
+# future divergence between them is a failure here rather than a bug found on a box.
+D2="$T/c31b"; fresh "$D2"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV")
+run_install Linux "$D2" --install >/dev/null 2>&1; ENVV=()
+assert_contains "$(cat "$D2/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV" "both arms pin the identical path"
+
+# ── T33: exit 4 (STARVATION) is RED in --status, as the unit renders it ─────────────────
+# The service template's exit table says "0 is the ONLY green … greening 4 would silently retire the
+# alarm #2875 exists for", and the --status gate had `4` in its green set — so the readiness verb
+# certified the one state the unit is best placed to catch. The message is its own arm, because "the
+# pass completed and reported starvation" is a different fact from "the pass is not completing".
+say_case "T33 --status treats the converger's exit 4 (STARVATION) as RED, on both platforms"
+D="$T/c33"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+ENVV=(SHIM_LAST=4)
+OUT="$(run_install Linux "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "systemd: last_run=4 is not a green tick"
+assert_contains "$OUT" "STARVATION" "naming starvation, not 'not completing'"
+ENVV=(SHIM_LAST=0)
+OUT="$(run_install Linux "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "systemd control: last_run=0 is green"
+D="$T/c33d"; fresh "$D"; run_install Darwin "$D" --install >/dev/null 2>&1
+ENVV=(SHIM_LAST_EXIT=4)
+OUT="$(run_install Darwin "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "launchd: last_exit=4 is not a green tick"
+assert_contains "$OUT" "STARVATION" "launchd names starvation too"
+ENVV=(SHIM_LAST_EXIT=0)
+OUT="$(run_install Darwin "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "launchd control: last_exit=0 is green"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
