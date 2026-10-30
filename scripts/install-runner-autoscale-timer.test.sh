@@ -138,6 +138,7 @@ chmod +x "$T/bin/systemctl" "$T/bin/launchctl"
 # make the pin itself the host dependency this suite exists to remove.
 cat >"$T/bin/loginctl" <<LOGINCTL_SHIM
 #!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$T/loginctl.log"
 case "\$1" in
   show-user) printf '%s\n' "\${SHIM_LINGER:-yes}"; exit 0 ;;
   *) exit 0 ;;
@@ -804,10 +805,16 @@ assert_eq "$RC" 0 "control: an ENABLED timer on the same artifact is still green
 # ── T30: a user timer without lingering stops converging at logout ──────────────────────
 say_case "T30 --status re-checks lingering on a USER timer (the install path is not the last word)"
 rm -rf "$T/home/.config"; rm -f "$ARM"
-ENVV=(SUDO=false PATH="$T/bin:$PATH")
+# ⛔ NO `PATH` OVERRIDE, DELIBERATELY. The probe and the lingering calls both go through the pinned
+# seams now, so the seam is the ONLY route to the shim. With `$T/bin` on PATH a reverted bare
+# `loginctl`/`systemctl` resolves to the SAME shim and answers the SAME — measured: reverting the linger
+# seam left this suite at `PASS=322 FAIL=0`, so the install half of that fix was unprovable here.
+: >"$T/loginctl.log"
+ENVV=(SUDO=false)
 OUT="$(run_install Linux - --install)"; RC=$?
 assert_eq "$RC" 0 "precondition: a lingering user install succeeds"
 assert_contains "$OUT" "target=user" "precondition: the target really is USER (the seam works)"
+assert_contains "$(cat "$T/loginctl.log")" "show-user" "the install path read lingering through the LOGINCTL seam, not the bare binary"
 envv_status_user() { ENVV=(SUDO=false PATH="$T/bin:$PATH" SHIM_LINGER="$1"); }
 envv_status_user no
 OUT="$(run_install Linux - --status)"; RC=$?; ENVV=()
@@ -829,6 +836,28 @@ assert_contains "$OUT" "target=user" "precondition: the status read the USER tar
 assert_eq "$RC" 0 "an untouched user artifact is healthy"
 assert_contains "$OUT" "drift_artifact=no" "and is not reported as drifted against itself"
 assert_file "$T/home/.config/systemd/user/$UNIT_NAME.service" "the user artifact is where --status looked for it"
+
+# ── T51: the INSTALL path refuses a user timer it cannot make survive logout ─────────────
+# The refusal is the reason the lingering block exists at all (`REFUSING to report this as installed: a
+# USER timer cannot fire after your session ends`), and NOTHING exercised it: `SHIM_LINGER` was set only
+# by `envv_status_user`, which only drives `--status`. So the writer's own gate — the one that stops the
+# inert enforcer at CREATE time rather than a day later at read time — was asserted nowhere, and the
+# `LOGINCTL` seam this case pins was therefore unprovable (reverting it kept the suite green).
+say_case "T51 --install REFUSES a USER timer that cannot survive logout"
+rm -rf "$T/home/.config"; rm -f "$ARM"; ENVV=(); : >"$T/loginctl.log"
+ENVV=(SUDO=false SHIM_LINGER=no)
+OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "an install whose linger cannot be enabled REFUSES rather than reporting success"
+assert_contains "$OUT" "REFUSING to report this as installed" "naming the refusal in its own words"
+assert_contains "$OUT" "without lingering" "and the fact that makes it inert"
+assert_absent "$OUT" "linger: enabled" "it does not claim a linger it did not get"
+LOG_TXT="$(cat "$T/loginctl.log" 2>/dev/null || true)"
+assert_contains "$LOG_TXT" "show-user" "the linger read went through the LOGINCTL seam"
+assert_contains "$LOG_TXT" "enable-linger" "and so did the enable attempt"
+ENVV=(SUDO=false SHIM_LINGER=yes)
+OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "control: the same install with lingering available succeeds (the gate is discriminating)"
+assert_contains "$OUT" "linger: enabled" "and says the timer will survive logout"
 
 # ── T31: the launchd provisioner pin round-trips a shell-hostile path ───────────────────
 # `provisioner_env_for launchd` sed-escaped its value AND `render` sed-escaped the composed
@@ -1230,11 +1259,17 @@ rm -f "$ARM"
 # host, and the probe honours the pinned `SYSTEMCTL` seam, so the shim is what answers it.
 say_case "T47 --arm with no resolvable scheduler explains itself"
 D="$T/c47"; fresh "$D"; rm -f "$ARM"
+: >"$T/systemctl.log"
 ENVV=(SUDO=false SHIM_USER_MANAGER=no)
 OUT="$(run_install Linux - --arm --reason fixture)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "an unresolvable target refuses"
 assert_contains "$OUT" "no scheduler available" "and says which dependency is missing"
 assert_contains "$OUT" "NOT silently skipping" "naming the failure this guard exists to prevent"
+# ⛔ THE ASSERTION THAT MAKES THE FIX PROVABLE ON EVERY HOST. `SHIM_USER_MANAGER=no` alone is not
+# enough: on a box with no user manager at all, a REVERTED bare probe also fails, so the case would pass
+# either way and could not tell the fix from the defect. The shim logs every call, so this asserts the
+# probe itself went through the seam — a reverted probe never reaches the pinned binary and fails here.
+assert_contains "$(cat "$T/systemctl.log")" "--user show-environment" "the probe went through the SYSTEMCTL seam, not the bare binary"
 assert_nofile "$ARM" "with no arming record written"
 rm -f "$ARM"
 

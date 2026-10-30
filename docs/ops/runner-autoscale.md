@@ -110,7 +110,7 @@ Measured on **pi-cell-1** (Linux, 8 cores, systemd 255) on 2026-10-29:
 | ceiling derivation | `--status`: `by_cores=3 by_memory=9 by_disk=5 bound=cores ceiling=3` from `ncpu=8`, `mem_available_mb=8596` |
 | arm | record written with `ceiling=3`, `reading=ncpu=8 mem_available_mb=8316 ceiling=3` |
 | idempotence | a second `--install` printed `changed=1` only when the artifact was stale, kept the arming record, and left `drift_artifact=no` |
-| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 322 assertions, `PASS=322 FAIL=0`; case-by-case below |
+| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 332 assertions, `PASS=332 FAIL=0`; case-by-case below |
 
 **Not verified here (no macOS host in this lane):** `launchctl bootstrap` on a real Mac, the
 plist's `StartInterval` under `launchd`, and `gui/<uid>` behaviour on a logged-in GUI session. What
@@ -123,7 +123,7 @@ first `--install` to be the real test of that arm.
 ## The self-check, case by case
 
 `scripts/install-runner-autoscale-timer.test.sh` — hermetic (a mktemp fixture root, stub scheduler
-tools, a stub converger), 322 assertions, `PASS=322 FAIL=0`, no network, no real scheduler. What each
+tools, a stub converger), 332 assertions, `PASS=332 FAIL=0`, no network, no real scheduler. What each
 case pins, and why it exists:
 
 | case | what it proves |
