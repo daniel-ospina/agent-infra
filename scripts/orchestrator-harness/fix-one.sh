@@ -687,7 +687,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
   elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
     why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
-    why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
+    # ⛔ CODE 77 IS TWO CONDITIONS (review round 1, P2): below the floor, and above it without the
+    # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
+    # operator a full filesystem was the cause when it was not.
+    why="disk gate: either below DISK_MIN_FREE_MB, or no headroom for one lane's dependency tree (DISK-NOHEADROOM) — the '[disk-gate] REFUSED' line above names which, with both terms; reclaim space (cloud-cell-supervisor.sh prune --caches) — this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi

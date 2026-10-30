@@ -27,6 +27,7 @@ import pytest
 import importlib.util
 import itertools
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -3120,19 +3121,19 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     one), so all 80 took the old slug fallback and the vector stayed green while asserting a
     token nobody would ever compare. Caught in #2648 review cycle 3.
     """
-    src = (Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh").read_text()
-    listed = []
-    for line in src.splitlines():
-        line = line.strip()
-        if not line.startswith("run_shard "):
-            continue
-        # The runner's own `--list` derives the path with `\([^ ]*\.sh\)`, i.e. the first
-        # space-free token ending in `.sh`. Match that, so a trailing `# comment` is never
-        # part of the path this vector tests.
-        m = re.search(r"(\S+\.sh)\b", line.split(None, 1)[1])
-        if m is None or m.group(1).startswith("$"):
-            continue  # an interpolated or sentinel call, not a listed path
-        listed.append(m.group(1))
+    # ⛔ THE LIST IS NOT IN THE SOURCE ANY MORE. `run-bash-shards.sh` DERIVES its list from
+    # `SUITE_GLOBS` + `shard_discover` (agent-infra#2609), and a merge had left a second, enumerated
+    # copy of 103 rows behind — which this vector used to parse, and which doubled every suite's
+    # execution (#3060/#3067 removed it). Parsing `^run_shard <path>` now finds only the loop's
+    # `"$shard"`, so a source-only parse is structurally vacuous. Ask the runner for the list it will
+    # actually run: `--list` exits before the placement guard and executes nothing.
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(["bash", "scripts/run-bash-shards.sh", "--list"], cwd=str(root),
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, (
+        f"the runner could not list its own shards (rc={proc.returncode}): {proc.stderr.strip()[:400]}"
+    )
+    listed = [p.strip() for p in proc.stdout.splitlines() if p.strip()]
     assert len(listed) >= 60, (
         f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
         "would pass vacuously"

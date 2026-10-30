@@ -530,7 +530,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then
     echo "[lane $N] NOT started: FORK gate refused — this box is out of PROCESSES (agent-infra#2293). Waiting cannot clear it and this box cannot start the retry: restart or drain it from OUTSIDE, or let its lanes finish and the issue be re-dispatched elsewhere." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
-    echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+    # ⛔ TWO CONDITIONS SHARE CODE 77 (review round 1, P2): below `DISK_MIN_FREE_MB`, AND above it but
+    # without the headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). This line used to
+    # claim only the first, so the operator grepping it was told the filesystem was full when the floor
+    # had been MET — a false cause, and the same #1765 class (a remedy for the wrong condition) this
+    # block exists to prevent. Both are named, and the refusing line above carries the numbers.
+    echo "[lane $N] NOT started: DISK gate refused — either the filesystem is below DISK_MIN_FREE_MB, or it is above the floor but has no headroom for one lane's dependency tree (DISK-NOHEADROOM, agent-infra#2721). The '[disk-gate] REFUSED' line above says which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches; --scratch for /tmp) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is
