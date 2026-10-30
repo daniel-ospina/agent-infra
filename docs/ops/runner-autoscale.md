@@ -102,7 +102,7 @@ Measured on **pi-cell-1** (Linux, 8 cores, systemd 255) on 2026-10-29:
 | ceiling derivation | `--status`: `by_cores=3 by_memory=9 by_disk=5 bound=cores ceiling=3` from `ncpu=8`, `mem_available_mb=8596` |
 | arm | record written with `ceiling=3`, `reading=ncpu=8 mem_available_mb=8316 ceiling=3` |
 | idempotence | a second `--install` printed `changed=1` only when the artifact was stale, kept the arming record, and left `drift_artifact=no` |
-| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 185 assertions, `PASS=185 FAIL=0`; case-by-case below |
+| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 228 assertions, `PASS=228 FAIL=0`; case-by-case below |
 
 **Not verified here (no macOS host in this lane):** `launchctl bootstrap` on a real Mac, the
 plist's `StartInterval` under `launchd`, and `gui/<uid>` behaviour on a logged-in GUI session. What
@@ -115,7 +115,7 @@ first `--install` to be the real test of that arm.
 ## The self-check, case by case
 
 `scripts/install-runner-autoscale-timer.test.sh` — hermetic (a mktemp fixture root, stub scheduler
-tools, a stub converger), 185 assertions, `PASS=185 FAIL=0`, no network, no real scheduler. What each
+tools, a stub converger), 228 assertions, `PASS=228 FAIL=0`, no network, no real scheduler. What each
 case pins, and why it exists:
 
 | case | what it proves |
@@ -151,6 +151,14 @@ case pins, and why it exists:
 | T28 | a launchd removal that FAILED is not reported as uninstalled: a plist surviving in `LaunchAgents` is loaded again at the next login, resuming the pass, and a failed `launchctl list` reads the same as "not loaded" |
 | T25 | `--status` accepts the pass's real switch vocabulary (`--status`, `--json`, `--want N`, `--root P`) and reds only an argument this installer never rendered. It used to red anything that was not exactly `--dry-run`, so a working `--want 3` schedule was reported as exiting 2 on every tick |
 | T21 | a RELATIVE interpreter pin is refused: a scheduler resolves it against its own working directory, so the unit would 203/EXEC every tick while `list-timers` showed it scheduled |
+| T29 | `--status` GATES on `enabled` instead of only printing it, and `static` fails too (no `[Install]` section ⇒ nothing links the timer into `timers.target`): an active-but-not-enabled timer does not come back at the next boot, so the readiness verb — the one an operator and the health sweep call LATER — was the lenient of two readers of one fact, while the install path already refused that state |
+| T30 | on a USER target `--status` re-checks `linger`, because lingering can be cleared after the install by an operator or an image rebuild: without it the readiness verb certified a timer that stops firing at logout. (Reaching the user target in the suite needs two fixture facts: `SUDO=false` is the documented "skip the sudo probe" seam, and the `systemctl` shim has to model `systemctl --user <verb>`) |
+| T31 | the launchd provisioner pin round-trips a shell-hostile path (`&`, `<`) and names a file that EXISTS. It used to be escaped twice — `provisioner_env_for` sed-escaped its value and `render` sed-escaped the composed `{{PROVISIONER_ENV}}` again — so the installed plist pinned `/…/inst\&x.sh`, literal backslashes on a path that does not exist; the plist still parsed and nothing compared the value, so the pass would have found no provisioner and exited 3 on every capacity tick. The same case asserts BOTH arms pin the identical path |
+| T32 | `--status` reports `drift_artifact=no` on an untouched USER-scope artifact. The install path drops `User=` for that target (systemd rejects it there) and the drift render did not, so the two files could never match and the drift signal fired on every run — a signal that always fires is a signal nobody reads, and it came from the very `--status` the install hands the operator as its remedy |
+| T33 | exit 4 (STARVATION) is RED in `--status` on BOTH platforms, as the service unit renders it. `4` sat in the green set, so the readiness verb certified the one state the unit is best placed to catch; it has its own arm because "the pass completed and reported starvation" is a different fact from "the pass is not completing" |
+| T34 | an interpreter that is present and executable but older than 3.12 is NOT a usable schedule: the pass refuses itself below 3.12 and the install path refuses such an interpreter, while `--status` checked only presence. The trigger is realistic — the installer pins an ABSOLUTE path and the resolver's own candidate list includes a per-lane venv, so a venv recreated on an older interpreter changes the version under a unit that never moved |
+| T35 | `--status` refuses a sudo-invoked root run, like the four writers. Under `sudo` HOME is `/root`, so the ARMING RECORD and the last-tick log were read from /root's state dir beside an artifact whose absolute paths are the user's — an armed, ticking box reported `arm_record=absent (/root/…)` and `last_tick=none` |
+| T36 | `--install` and `--arm` REPORT a unit pair already installed in another scope. The mutual exclusion the service template describes ("systemd will not start a second instance of an active oneshot") is PER-UNIT, not per-account, so a user-scope copy plus a system-scope copy are two different units and two passes race to restart and add the same runners. `--uninstall` always scanned for this; the writers did not, and the second install is reachable whenever sudo availability changes between invocations. `RUNNER_AUTOSCALE_SCOPE_SCAN` pins the scan list so the suite never reads the host's real unit dirs, and the control asserts the note is ABSENT when no other scope carries the unit |
 
 The case list lives here, not in the suite's header: the working-tree guard tokenises a script's
 text, and a long prose header ahead of the code made it read the suite body as an unverifiable
