@@ -819,7 +819,14 @@ choose_target() {
         TARGET="system"; UNIT_DIR="/etc/systemd/system"; SC="${SYSTEMCTL:-${SUDO:+$SUDO }systemctl}"
         return 0
     fi
-    if systemctl --user show-environment >/dev/null 2>&1; then
+    # ⛔ THE PROBE IS SEAMED TOO, NOT JUST THE VERB. The line below assigns `SC` through
+    # `${SYSTEMCTL:-systemctl}` while the PROBE that decides whether to reach it called the BARE binary —
+    # two binaries reading one fact, the exact class `--status` was corrected for in this same file. The
+    # header documents the seam as "the tools to call / probe (tests: shims)", and a probe that ignores it
+    # makes the user target reachable only on a host that happens to OWN a user manager: measured,
+    # this branch was a property of the machine running the suite, so the same suite was green on a box
+    # without `systemctl` and red on `ubuntu-latest`, which has one.
+    if ${SYSTEMCTL:-systemctl} --user show-environment >/dev/null 2>&1; then
         TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="${SYSTEMCTL:-systemctl} --user"
         return 0
     fi
@@ -1207,10 +1214,14 @@ do_install_systemd() {
     # logged into. `enable --now` succeeds, `--status` says active, the session ends, and the timer
     # never fires again.
     if [ "$TARGET" = "user" ]; then
-        linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+        # ⛔ THROUGH THE SEAM, like the reader that gates it. `--status` reads this same fact through
+        # `${LOGINCTL:-loginctl}` (see the linger gate below); the install path called the bare binary, so
+        # the two readers of one fact resolved it differently under a pinned/seamed loginctl — and on a
+        # test host the real `loginctl enable-linger` was invoked instead of the fixture's shim.
+        linger="$(${LOGINCTL:-loginctl} show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
         if [ "$linger" != "yes" ]; then
-            loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
-            linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+            ${LOGINCTL:-loginctl} enable-linger "$(id -un)" >/dev/null 2>&1 || true
+            linger="$(${LOGINCTL:-loginctl} show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
         fi
         if [ "$linger" != "yes" ]; then
             err "REFUSING to report this as installed: a USER timer cannot fire after your session ends"

@@ -113,6 +113,11 @@ case "\$1" in
   is-active)    printf '%s\n' "\${SHIM_ACTIVE:-active}"; exit 0 ;;
   list-timers)  printf 'Thu 2026-10-29 15:36:43 UTC  8min left  n/a  now  $UNIT_NAME.timer $UNIT_NAME.service\n'; exit 0 ;;
   show)         printf '%s\n' "\${SHIM_LAST:-0}"; exit 0 ;;
+  # `choose_target` probes the user manager with `--user show-environment` (through the SYSTEMCTL seam,
+  # so this shim answers it). ⛔ WITHOUT A FAILURE MODE THE PROBE COULD NOT BE EXPRESSED, which is why
+  # T47 used to depend on the HOST: it needed a box with no user manager, so it was green on a Mac and
+  # red on `ubuntu-latest`. `SHIM_USER_MANAGER=no` is "no user manager here", on any host.
+  show-environment) [ "\${SHIM_USER_MANAGER:-yes}" = "no" ] && exit 1; exit 0 ;;
   cat)          cat "$T/sysd/\$2" 2>/dev/null; exit \$? ;;
   *)            exit 0 ;;
 esac
@@ -127,6 +132,18 @@ case "\$1" in
 esac
 LAUNCHCTL_SHIM
 chmod +x "$T/bin/systemctl" "$T/bin/launchctl"
+# The loginctl shim: answers the linger probe, and `enable-linger` succeeds. Created HERE with the other
+# shims (not lazily at the first user-target case) so `run_install` can pin `LOGINCTL` for EVERY case —
+# the install path reads lingering through `${LOGINCTL:-loginctl}`, and a pinned-but-absent shim would
+# make the pin itself the host dependency this suite exists to remove.
+cat >"$T/bin/loginctl" <<LOGINCTL_SHIM
+#!/usr/bin/env bash
+case "\$1" in
+  show-user) printf '%s\n' "\${SHIM_LINGER:-yes}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+LOGINCTL_SHIM
+chmod +x "$T/bin/loginctl"
 
 # Resolve the interpreter WITHOUT a helper whose own words resemble a git prefix: the working-tree
 # guard treats a `command`-prefixed word with an unresolvable verb as an unverifiable git anchor and
@@ -165,7 +182,7 @@ run_install() {
         RUNNER_AUTOSCALE_ARM_FILE="$ARM" \
         RUNNER_AUTOSCALE_REPO="o/r" \
         ELDATO_PLATFORM="$plat" \
-        SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" \
+        SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" LOGINCTL="$T/bin/loginctl" \
         RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes" \
         ${dirmap[@]+"${dirmap[@]}"} ${ENVV[@]+"${ENVV[@]}"} \
         bash ./install-runner-autoscale-timer.sh "$@" 2>&1
@@ -779,18 +796,11 @@ OUT="$(run_install Linux "$D" --status)"; RC=$?          # control: SHIM_ENABLED
 assert_eq "$RC" 0 "control: an ENABLED timer on the same artifact is still green (the gate is discriminating)"
 
 # ── T30/T32: the USER target — lingering is re-checked, and drift compares the right file ─
-# Reaching TARGET=user needs `systemctl` on PATH (choose_target probes `systemctl --user
-# show-environment`) and the sudo probes to decline — `SUDO=false` is the installer's documented seam
-# for "skip the sudo probe", and setting it (not leaving it unset) is what makes the probe decline
-# rather than pass straight to the SYSTEM target.
-cat >"$T/bin/loginctl" <<LOGINCTL_SHIM
-#!/usr/bin/env bash
-case "\$1" in
-  show-user) printf '%s\n' "\${SHIM_LINGER:-yes}"; exit 0 ;;
-  *) exit 0 ;;
-esac
-LOGINCTL_SHIM
-chmod +x "$T/bin/loginctl"
+# Reaching TARGET=user needs the user-manager probe to answer (`SYSTEMCTL --user show-environment`) and
+# the sudo probes to decline — `SUDO=false` is the installer's documented seam for "skip the sudo probe",
+# and setting it (not leaving it unset) is what makes the probe decline rather than pass straight to the
+# SYSTEM target. Both the probe and lingering now go through the pinned seams, so `PATH` is no longer
+# what decides which binary answers (the shims stay on it for the verbs that are spelled by name).
 # ── T30: a user timer without lingering stops converging at logout ──────────────────────
 say_case "T30 --status re-checks lingering on a USER timer (the install path is not the last word)"
 rm -rf "$T/home/.config"; rm -f "$ARM"
@@ -1212,10 +1222,15 @@ rm -f "$ARM"
 # The arm called `choose_target || return 1` bare, so the one verb an operator runs to make a box GROW
 # exited 1 with ZERO bytes of output — indistinguishable from a crash. Every other call site names it.
 # Reached the way a box really reaches it: no passwordless sudo (`SUDO=false` is the documented seam) and
-# no systemd user manager (`systemctl --user show-environment` fails).
+# no systemd user manager.
+# ⛔ THE MISSING USER MANAGER IS NOW THE FIXTURE'S, NOT THE HOST'S. This case used to rely on the host
+# simply not having one: `choose_target` probed the BARE `systemctl`, so the real binary answered — no
+# user manager on a Mac (green), a live one on `ubuntu-latest` (red: `--arm` installed a USER unit pair
+# into the fixture HOME and wrote an arming record). `SHIM_USER_MANAGER=no` expresses the premise on any
+# host, and the probe honours the pinned `SYSTEMCTL` seam, so the shim is what answers it.
 say_case "T47 --arm with no resolvable scheduler explains itself"
 D="$T/c47"; fresh "$D"; rm -f "$ARM"
-ENVV=(SUDO=false)
+ENVV=(SUDO=false SHIM_USER_MANAGER=no)
 OUT="$(run_install Linux - --arm --reason fixture)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "an unresolvable target refuses"
 assert_contains "$OUT" "no scheduler available" "and says which dependency is missing"
