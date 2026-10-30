@@ -57,23 +57,41 @@
 #       suite goes from ~35s to ~5min: the wall clock is the symptom the arm pins)
 #   (s) nest the cell-identity test back inside "supervisor script missing" → §9p + §4 (a Linux dev
 #       box / CI runner reads MISSING again: the entry point's supervisor path always EXISTS)
+#   (u) drop the `waiting-exits` arm of `_fleet_row_launchd_job` (pr-doctor's 6 → the FAILING arm)
+#       → §6's "exit (6) … reads WAITING" arm ONLY. Measured: it reddens that one arm and leaves the
+#       exit-7 control green, which is the proof the allowance is narrow rather than generic.
+#   (v) add 6 to `fleet_state_severity`'s "not OK" side (WAITING fails the table)   → §6's "WAITING
+#       is a PASS for the table's exit code" arm only
+#   (w2) treat EVERY bound as self-clearing (drop the axis split)                   → §6's "a DISK
+#       refusal reads FAILING" + "it FAILS the table's exit code" arms AND the UNKNOWN arm
+#   (x) read the axis but default an unreadable one to WAITING                     → §6's UNKNOWN arm
+#       only (the fail-open direction: "cannot tell" became a pass)
+#   (x2) return on the capacity arm BEFORE the freshness arms (the pre-review shape) → §6's "a STALE
+#       exit 6 is LATE" + "it fails the table's exit code" arms only. The fresh-arm controls
+#       ("WAITING is a PASS", "never rendered OK") stay GREEN by design: they pin the OPPOSITE
+#       direction, so a mutation that removes the freshness check cannot redden them.
+#   (x3) read `refusal_bound` WITHOUT checking the record is the pass being explained → §6's
+#       "a record from a DIFFERENT pass is UNKNOWN" arm only.
+#       ⛔ THE LABELS ABOVE ARE SUFFIXED `2`/`3` RATHER THAN RE-LETTERED (review P3, #2291): `(w)`
+#       below is a PRE-EXISTING entry (the §9r mutation), and one fixer must be able to name ONE
+#       mutation and get ONE reddened arm. Leave the pre-existing letters alone; suffix the new ones.
 #   (t) do not clear a pidfile the row has PROVEN stale                        → §9q (2 arms: start
 #       cannot repair the row, and the row stays FAILING afterwards)
-#   (u) have the caller assume it started something                          → §9r only
-#   (v) accept any non-empty FLEET_CELL_HOME as cell identity                → §9p only (a defaulted
+#   (w) have the caller assume it started something                          → §9r only
+#   (y) accept any non-empty FLEET_CELL_HOME as cell identity                → §9p only (a defaulted
 #       path made every Linux box a "cell": the entry point defaults CELL_HOME)
-#   (w) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
+#   (z) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
 #       manufactured a duplicate, then read OK over two live loops)
-#   (x) refuse the repair entirely                                         → §9q (2 arms)
-#   (aa) render a STALE lander-drain record as OK (delete the LATE verdict)    → §9u only (2 arms)
-#   (y) hard-code the heartbeat loop's bound instead of reading
+#   (aa) refuse the repair entirely                                         → §9q (2 arms)
+#   (ab) render a STALE lander-drain record as OK (delete the LATE verdict)    → §9u only (2 arms)
+#   (ac) hard-code the heartbeat loop's bound instead of reading
 #       `FLEET_HEARTBEAT_LATE_S`                                           → §9t's LATE arm only
-#   (z) hard-code the cadence row's bound instead of reading
+#   (ad) hard-code the cadence row's bound instead of reading
 #       `FLEET_CADENCE_LATE_S`                                             → §9t's LATE arm only
-#   (aa) drop `+ $FLEET_JOB_SLACK_S` from the launchd freshness bound       → §9t's job-slack OK arm
-#   (ab) hard-code the controller's bound instead of reading
+#   (ae) drop `+ $FLEET_JOB_SLACK_S` from the launchd freshness bound       → §9t's job-slack OK arm
+#   (af) hard-code the controller's bound instead of reading
 #       `FLEET_CONTROLLER_LATE_S`                                           → §9t's controller LATE arm
-#   (ac) restore the zero-tolerance fence (drop the shared 5 s slack)            → §9v (deterministic
+#   (ag) restore the zero-tolerance fence (drop the shared 5 s slack)            → §9v (deterministic
 #       on EVERY platform). §9k's owner arm and §9u's fresh-lock arm assert the same property but are
 #       only probabilistic: they redden when the two clock sources disagree (the Linux-only accident
 #       that produced the bug), and stayed GREEN on macOS — which is why §9v was added
@@ -516,6 +534,87 @@ ROWS="$(run_rows 'fleet_rows ""')"
 st="$(state_of "$ROWS" pr-doctor)"
 [ "$st" = "OK" ] && ok "§6 the same job with last exit 0 reads OK (so §6 is not 'always FAILING')" \
                  || bad "§6 last exit 0 should read OK, got [$st]"
+# ⛔ #2291: `pr-doctor`'s OWN exit 6 is the dispatcher saying "the box's gate refused every order,
+# nothing was consumed". It is neither a failure (the pre-#2291 reading, which sent operators to
+# repair a healthy busy box) nor OK (the queue is not moving). WAITING, and a PASS for the code —
+# ⛔ BUT ONLY FOR THE AXIS THAT SELF-CLEARS (review P2, #2291). The severity follows the `refusal_bound`
+# in the component's OWN record, because `spawn-gate.sh` says per axis whether waiting clears it: load
+# does (`:1399`), disk (`:1392`), fork (`:1344`) and land-backlog (`:1461`) explicitly do not. All
+# three arms below are driven from that record, and the absence of one is an abstention, never a pass.
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+printf 'PID\tStatus\tLabel\n-\t6\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "WAITING" ] && ok "§6 pr-doctor's NO-CAPACITY exit (6) on the LOAD axis reads WAITING — no room, nothing failed" \
+                      || bad "§6 last exit 6 with bound=load should read WAITING, got [$st]"
+# ⛔ `severity_of_row`, NOT `severity_of` (the helper exists for exactly this): a whole-fixture table
+# answers a different question — this box leaves `second-controller` UNKNOWN, so `severity_of` returns
+# 2 whatever this row says and the arm could not redden for its own behaviour (measured here: it did
+# not, on a green WAITING row).
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=0" ] && ok "§6 …and WAITING is a PASS for the table's exit code" \
+                                        || bad "§6 WAITING must not fail the table, got $(severity_of_row "$ROWS" pr-doctor)"
+case "$(printf '%s\n' "$ROWS" | awk -F'\t' '$1=="pr-doctor"{print $4}')" in
+  OK) bad "§6 …but it must NEVER render OK — the queue is not moving while the box has no room" ;;
+  *)  ok "§6 …and it is never rendered OK (a distinct state, like SKIPPED)" ;;
+esac
+# ⛔ A NON-CLEARING BOUND IS NOT A PASS. A full disk, fork exhaustion and a land-backlog hold all
+# refuse the same way and NONE of them clears by waiting; counting them as a pass would make the
+# table's exit code go green on a stall that can never self-clear (the signal
+# `orchestrator-bringup.sh:1394` exists to keep). FAILING, with the axis named.
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "refusal_bound": "disk=4"}\n' > "$STATE/pr-doctor.status.json"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "FAILING" ] && ok "§6 …but a DISK refusal (waiting does not clear it) reads FAILING, not WAITING" \
+                       || bad "§6 a disk-bound exit 6 should read FAILING, got [$st]"
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=1" ] && ok "§6 …and it FAILS the table's exit code (a non-clearing stall is not green)" \
+                                                  || bad "§6 a disk-bound exit 6 must not pass the table, got $(severity_of_row "$ROWS" pr-doctor)"
+case "$(detail_of "$ROWS" pr-doctor)" in
+  *disk*) ok "§6 …and the detail names the axis that has to be cleared by hand" ;;
+  *)      bad "§6 the disk refusal's detail does not name the axis: $(detail_of "$ROWS" pr-doctor)" ;;
+esac
+# ⛔ AND AN UNREADABLE BOUND IS AN ABSTENTION: exit 6 with no `refusal_bound` (an older record, or an
+# unreadable one) cannot say whether it self-clears, and "cannot tell" is never a pass.
+printf '{"rc": 6, "verdict": "NO-CAPACITY"}\n' > "$STATE/pr-doctor.status.json"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "UNKNOWN" ] && ok "§6 …and exit 6 with NO readable bound is UNKNOWN — an abstention, never a pass" \
+                       || bad "§6 exit 6 without a readable bound should read UNKNOWN, got [$st]"
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=2" ] && ok "§6 …which is the table's fail-closed code" \
+                                                 || bad "§6 UNKNOWN must exit 2, got $(severity_of_row "$ROWS" pr-doctor)"
+# ⛔ AND A CAPACITY PASS IS NOT EXEMPT FROM FRESHNESS (review P1, #2291). The `6` arm used to `return`
+# BEFORE every freshness arm, so a LOADED job that had produced no output for longer than
+# 2×StartInterval+slack read WAITING — a PASS for the table's exit code — for ever. That is exactly
+# the "a job that stopped running cannot be distinguished from a healthy one" state this file's own
+# header says must never be green.
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+printf 'PID\tStatus\tLabel\n-\t6\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+touch -t 202001010000 "$STATE/pr-doctor.out"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "LATE" ] && ok "§6 …and a STALE exit 6 is LATE, not WAITING — 'wait' is not the answer to 'nothing is running'" \
+                   || bad "§6 a stale exit 6 should read LATE, got [$st]"
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=1" ] && ok "§6 …which fails the table's exit code (a dead job is not green)" \
+                                                   || bad "§6 a stale exit 6 must not pass the table, got $(severity_of_row "$ROWS" pr-doctor)"
+# ⛔ AND THE AXIS MUST COME FROM THE SAME PASS (review P1, #2291). Both launchers write the one record
+# and EVERY pass that had any gate refusal writes `refusal_bound` — `rc 0` and `rc 3` passes included —
+# so a `6` explaining a DISK refusal could have been rendered WAITING from a later load-bound pass's
+# record: the exact "waiting does not clear a full disk" mislabel the axis split exists to prevent.
+# A record whose `rc`/`verdict` disagree with the exit this row is explaining is UNREADABLE, and an
+# unreadable read is an abstention — never a pass.
+touch "$STATE/pr-doctor.out"     # fresh again: the AXIS, not the clock, is under test here
+printf '{"rc": 3, "verdict": "UNDELIVERED", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "UNKNOWN" ] && ok "§6 …and a record from a DIFFERENT pass (rc=3 against the row's exit 6) is UNKNOWN, not WAITING" \
+                      || bad "§6 a mismatched record should read UNKNOWN, got [$st]"
+# ⛔ CONTROL: the allowance is for 6 ALONE. A different non-zero exit on the same row is FAILING —
+# otherwise this arm would be "every exit is WAITING", the false-PASS direction.
+printf 'PID\tStatus\tLabel\n-\t7\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "FAILING" ] && ok "§6 …but exit 7 on the same row is still FAILING (the allowance is narrow)" \
+                       || bad "§6 exit 7 should still be FAILING, got [$st]"
+rm -f "$STATE/pr-doctor.status.json"
 # A job that is declared but NOT in the launchd domain will never run — MISSING, not OK.
 printf 'PID\tStatus\tLabel\n' > "$LC_LIST"
 ROWS="$(run_rows 'fleet_rows ""')"

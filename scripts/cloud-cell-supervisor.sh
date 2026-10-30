@@ -2265,6 +2265,48 @@ cmd_check() {
   # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
   [ -f "$HARNESS/refresh-candidates.sh" ] \
     || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
+  # ── the LANE ROSTER, provisioned from THIS box's own population (agent-infra#1935) ────────
+  # The probe below answers "can this repo be pre-flighted?" and its holder surface is built FROM
+  # `$HOME/.pi/agent/state/lane-registry.tsv` — written only by the RETIRED cmux dispatcher, so a
+  # cell had none and EVERY candidate came back INCOMPLETE while the controller reported RUNNING
+  # (measured on cell 1, 2026-10-28). `check` is the last gate before a cell is started, so the
+  # roster is provisioned HERE, from the box's own lane population, and the arm it took is printed.
+  # ⛔ THIS `check` VERB WRITES, DELIBERATELY AND IN THE OPEN (#3032 review F7). It is the last gate
+  # before a cell is started, so a check that only REPORTED an unprovisioned roster would leave the
+  # cell dispatching nothing — the #1935 defect. The write is idempotent and non-destructive (a
+  # hand-maintained roster is never replaced; an existing derived roster is never shrunk by an arm
+  # that measured nothing) — the provisioner's own rules, pinned in its suite.
+  # ⛔ Idempotent and non-destructive: a hand-maintained roster is never replaced, and a second run
+  # on an unchanged box writes nothing (the provisioner's own rules, pinned in its suite).
+  # ⛔ A REFUSAL (rc 3) is REPORTED, not fatal: it means this box's population could not be
+  # MEASURED, which the harness's reduced-surface path (#2848) can still dispatch through. Failing
+  # the cell here would be a false block; writing an empty roster instead would be the fail-open
+  # that #8175 exists to prevent, and the provisioner refuses to do it.
+  # ⛔ NO INTERPRETER GUARD HERE, and that is not an omission: `cmd_check`'s dependency loop above
+  # (`for dep in git python3 pi`) has already died when `python3` is missing, so a `127` from the
+  # provisioner at this point can only mean the tool itself failed — which is what the arm below
+  # says. The BRING-UP site needs the guard because its check_dispatch has no such loop.
+  if [ -f "$HARNESS/provision-lane-registry.py" ]; then
+    local rv rvrc
+    rv=""; rvrc=0
+    rv="$(HOME="$CELL_HOME" python3 "$HARNESS/provision-lane-registry.py" --apply 2>&1)" || rvrc=$?
+    printf '%s\n' "$rv" | sed 's/^/    /'
+    if [ "$rvrc" -eq 3 ]; then
+      log_line "warn: lane roster NOT provisioned — the population is unmeasurable on this box (see above); the pre-flight's holder surface will refuse candidates until it is (agent-infra#1935)"
+    elif [ "$rvrc" -ne 0 ]; then
+      # ⛔ A CRASH IS NOT A PROVISION (review finding 2). The provisioner's documented exits are
+      # 0/2/3; anything else (rc 1 from an uncaught OSError in the atomic write on a full disk or
+      # a read-only $HOME — exactly what MIN_FREE_MB exists for, a traceback, rc 127) used to land
+      # in the arm below and print `ok: provisioned`, i.e. a false PASS on the one line this
+      # change adds to the start gate. Same shape as scheduler_ensure below: rc 3 is the tool's
+      # OWN refusal, any other non-zero is reported as what it is.
+      log_line "warn: lane roster provisioning FAILED (rc=$rvrc — not the tool's own refusal, so it crashed); the roster is in an UNKNOWN state and the pre-flight's holder surface may stay INCOMPLETE (agent-infra#1935)"
+    else
+      log_line "ok: lane roster — provisioned from this box's own population (agent-infra#1935)"
+    fi
+  else
+    log_line "warn: $HARNESS/provision-lane-registry.py missing — the lane roster cannot be provisioned, so the pre-flight's holder surface will refuse every candidate (agent-infra#1935)"
+  fi
   local pv pvrc
   pv=""
   pvrc=0
@@ -3494,13 +3536,14 @@ cmd_status() {
     log_line "restart: $(sed 's/^restart //' "$_rq" 2>/dev/null)"
     case "$(cat "$_rq" 2>/dev/null)" in
       # ⛔ `blocked=identity` IS ITS OWN CAUSE, AND IT COMES FIRST. The generic blocked arm below says
-      # "something this box can see would be interrupted" — but `harness-refresh.sh` writes
-      # `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
-      # is a CLAIM. Nothing was measured busy there, so the generic sentence names a cause that does not
-      # exist and tells the operator to wait for a population that may never exist — the misdirection this
-      # change exists to remove.
+      # "something this box can see would be interrupted" — but on the `blocked=identity` path
+      # `harness-refresh.sh` returns from `set_pending` BEFORE `inflight_gate` is ever consulted, so no
+      # population was measured as the BLOCKER: the record's `lanes=` is still written (it is measured
+      # separately and may be non-zero) but it is not why the request is blocked. The identity is. So the
+      # generic sentence names a cause that does not exist and tells the operator to wait for a population
+      # that may never be the thing holding the restart back — the misdirection this change exists to remove.
       *'request=pending'*'blocked=identity'*)
-        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. Nothing is interrupted and nothing is waiting: re-check once the controller's argv/lock is readable." ;;
+        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. The block is the IDENTITY, not a busy population: nothing was measured as the blocker, and no population is waiting on this. Re-check once the controller's argv/lock is readable." ;;
       *'request=pending'*'actuation=blocked'*)
         log_line "⛔ a restart is PENDING and was NOT applied — something this box can see would be interrupted (named in blocked=/lanes= above). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm, once that population is idle." ;;
       *'request=pending'*'actuation=safe'*)
