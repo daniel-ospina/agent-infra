@@ -3590,8 +3590,16 @@ assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
 # The hang leg also measures that the WATCHDOG is what ended the probe: the shim sleeps 30 s, so a
 # pass that returned in under 20 s cannot have waited for it. Without this the leg is satisfied by a
 # probe that hangs and is then ignored — the property is "bounded", not "unbounded but correct".
+# ⛔ `REAP_WT_GIT_TIMEOUT` IS GLOBAL FOR THE PASS, NOT PER-PROBE (#3058 review, P2). This leg used to
+# set it to 1 s, which also bounded EVERY other git call the same record makes (`for-each-ref
+# --contains`, `merge-base`, `log -1`, `cherry`) — so on a loaded box any ONE of them returning 124
+# made `commits_survive` answer "" and the row read `detached-unreachable`, failing the assertion below
+# for a reason that has nothing to do with the probe (a plausible contributor to the "load-sensitive,
+# no mechanism established" runs this PR's body records). 5 s still ends the 30 s shim by the watchdog,
+# and is enough headroom that only a genuinely wedged git call can hit it. The elapsed bound (20 s)
+# keeps the two implementations apart: 5 < 20 < 30.
 A26B_T0=$SECONDS
-OUT="$(FAKE_LSREMOTE_SLEEP=30 REAP_WT_GIT_TIMEOUT=1 GIT_BIN_OVERRIDE="$T/bin/git-lsremote-hang" \
+OUT="$(FAKE_LSREMOTE_SLEEP=30 REAP_WT_GIT_TIMEOUT=5 GIT_BIN_OVERRIDE="$T/bin/git-lsremote-hang" \
     run_reaper $ENV --dry-run --repo "$REPO")"
 A26B_HANG_S=$((SECONDS - A26B_T0))
 assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
@@ -3945,6 +3953,53 @@ if [ "$VFILE_I2" != "$VFILE_I3" ]; then
 else
     bad "A27i two checkouts named 'same' collapsed onto one record path: $VFILE_I2"
 fi
+# (j) ⛔ A SWALLOWED RECORD WRITE MUST SAY SO (#3058 review, P2). This is the branch that fires when
+# free space is under the floor — i.e. exactly when ENOSPC is live — and until now NOTHING pinned it:
+# a regression here (an `mv` that returns 0 on a failed rename, or the `{ …; } >"$tmp"` group's status
+# becoming the last `printf` rather than the first failure) would silently restore the "a missing file
+# means the condition cleared" reading that this whole record exists to remove.
+# ⛔ THE FIXTURE IS A `mv` SHIM, NOT `chmod` AND NOT A DIRECTORY AT THE RECORD PATH. Two drafts that
+# look right and are not:
+#   · `chmod 500` on the state dir — the suites run as ROOT on the Linux cells, and root writes into a
+#     0500 directory, so the write would SUCCEED and this leg would assert the opposite of what it ran;
+#   · a DIRECTORY standing at `$vfile` — `mv -f <file> <dir>` SUCCEEDS by moving the file INTO the
+#     directory, so RECORD_OK stayed 1 and the leg's first draft reported `record=<path>` and
+#     `Recorded at` (measured: four red assertions, and the "no tmp left behind" one passed for the
+#     wrong reason because the tmp file had been moved INSIDE the directory).
+# The shim fails exactly ONE call — `mv -f <tmp> <$STATE_DIR/reap-ineffective.…>` — and passes every
+# other move through to the real binary, so the fixture cannot mask an unrelated failure.
+REAL_MV="$(command -v mv)"
+mkdir -p "$T/failmv"
+printf '%s\n' '#!/usr/bin/env bash' \
+    '# Fails ONLY the verdict record.s own move (see the A27j note above); every other move is real.' \
+    'for _a in "$@"; do case "$_a" in *reap-ineffective*) exit 1 ;; esac; done' \
+    "exec $(printf '%q' "$REAL_MV") \"\$@\"" >"$T/failmv/mv"
+chmod +x "$T/failmv/mv"
+ENV=A27j; REPO_J="$(mk_dirty_pop $ENV 11)"
+VFILE_J="$(verdict_path $ENV "$REPO_J")"
+assert_nofile "$VFILE_J" "A27j precondition: no record yet (the leg must create the only one it fails to write)"
+OUT_J="$(PATH="$T/failmv:$PATH" REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO_J")"; RC_J=$?
+assert_eq "$RC_J" "0" "A27j an unwritable record still exits 0 (the condition is a diagnosis, not a failure)"
+assert_contains "$OUT_J" "verdict=reap-ineffective" \
+    "A27j the pass still STATES its verdict when the record could not be written"
+# ⛔ THE `VERDICT …record=` LINE IS A `log` LINE, so it lands in the LOG FILE and not on stdout — the
+# same reason A27a reads the log for `record=<path>`. Asserting it against stdout (the first draft)
+# failed on correct behaviour, which is exactly the kind of red that gets "fixed" by weakening the
+# subject instead of the assertion.
+RW_LOGJ="$T/$ENV/reap.log"
+assert_contains "$(cat "$RW_LOGJ" 2>/dev/null)" "record=NOT-WRITTEN" \
+    "A27j ⛔ the log line says the record was NOT written (never the path it failed to write)"
+assert_absent "$(cat "$RW_LOGJ" 2>/dev/null)" "record=$VFILE_J" \
+    "A27j …and it does NOT name a path as if it had been written there"
+assert_absent "$OUT_J" "Recorded at" \
+    "A27j …nor does the out-loud block claim 'Recorded at'"
+assert_contains "$OUT_J" "could NOT be written" \
+    "A27j …and it says so in words, so the verdict's only remaining home is stated"
+assert_contains "$OUT_J" "a missing file is NOT" \
+    "A27j …including that a missing file is never evidence the condition cleared"
+assert_nofile "$VFILE_J" "A27j nothing landed at the record path either (a shim that halves the write is not a pass)"
+assert_eq "$(find "$T/$ENV/state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "A27j no \`.tmp.<pid>\` is left behind by the failed move"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

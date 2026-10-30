@@ -3132,7 +3132,12 @@ esac
 # so a ⛔ on a healthy cell is exactly what trains the operator to skip the one line that must be read.
 # Both polarities are pinned here: benign => silent, alarm-or-unrecognised => ⛔ (fail-loud, so a NEW
 # verdict added to the reaper and not taught to this reader is surfaced rather than swallowed).
-for _dv_benign in dry-run idle reclaimed ok '?' not-run; do
+# ⛔ `mixed-benign` IS IN THE BENIGN LOOP AND MUST STAY THERE (#3058 review, P1): it is the entry
+# point's spelling for "two repos with ORDINARY answers that differ" (one reclaimed, one idle) — the
+# everyday shape of a multi-repo cell — and the aggregator has already lifted any alarm answer out of
+# it before the token exists. `mixed` is the alarm spelling (two answers of the alarm class) and stays
+# in the alarm loop below.
+for _dv_benign in dry-run idle reclaimed ok '?' not-run mixed-benign; do
   printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=%s\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
     "$(date +%s)" "$([ "$_dv_benign" = dry-run ] && printf dry-run || printf apply)" "$_dv_benign" \
     >"$DR/home/.pi/agent/state/disk-reaper.status"

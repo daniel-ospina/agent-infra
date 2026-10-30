@@ -1665,10 +1665,17 @@ remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>
         remote_mark_dead "$best"
         return 0
     fi
-    # EXACT MATCH, or nothing. `ls-remote <remote> <pattern>` fnmatches the tail and a ref may
-    # legally contain `?`/`[`, so the advertised refname is compared LITERALLY (exactly once) and
-    # its sha must be this HEAD. A remote branch pointing somewhere else is the STALE-CACHE case
-    # — the local tracking ref lied — and it PRESERVES.
+    # EXACT MATCH, or nothing — and the reason is the TAIL, not a glob (#3058 review, P2).
+    # `ls-remote <remote> <pattern>` matches the pattern against the TAIL of each refname, from the
+    # start of the ref OR from a slash separator (git-ls-remote(1) <patterns>, gitglossary(7) "glob"),
+    # so the pattern `refs/heads/foo` ALSO selects an advertised ref `refs/heads/x/refs/heads/foo` —
+    # measured: `git ls-remote --heads origin refs/heads/foo` returns exactly that ref, and the branch
+    # `refs/heads/foo` itself does not exist. That is why the advertised refname is compared
+    # LITERALLY, in full, exactly once. ⛔ A refname can never carry a glob metacharacter to widen the
+    # match with (check-ref-format rule 5 forbids `?`, `*`, `[` and `\\`), so the widening this guards
+    # is the SLASH-TAIL one — do not "simplify" the literal compare away after checking the impossible
+    # premise. Its sha must also be this HEAD: a remote branch pointing somewhere else is the
+    # STALE-CACHE case — the local tracking ref lied — and it PRESERVES.
     out="$(awk -v want="refs/heads/$branch" -v sha="$sha" '
         NF >= 2 && $2 == want { n++; if ($1 == sha) hit = 1 }
         END { if (n == 1 && hit == 1) print "yes" }' "$GIT_OUT" 2>/dev/null)"
@@ -3106,8 +3113,13 @@ run() {
     START_EPOCH="$(now_epoch)"
     while IFS=$'\t' read -r p h b f; do
         [ -n "$p" ] || continue
-        # Reset per record: the marker is set from THIS row (see the PRUNE_BLOCK arm below) and a
-        # value left over from the previous record would block the prune for the wrong reason.
+        # Reset per record: the marker exists ONLY to decide whether this row gets its own
+        # `REMOTE-HOLDS …` audit line below (it is assigned from the row's reason/detail and read
+        # there, then reset). ⛔ It does NOT gate the prune and must not: A26c pins BOTH arms of that
+        # decision — a `remote-holds` row does NOT set PRUNE_BLOCKED, exactly like `remote-only-ref`
+        # — so a stale value here could only corrupt an audit line, never a reclaim. (#3058 review,
+        # P2: this comment used to point at a "PRUNE_BLOCK arm below" that does not exist, which read
+        # as a prune gate that is not there and invited either a wrong conclusion or a wrong removal.)
         REMOTE_HOLDS_ROW=0
         elapsed="$(( $(now_epoch) - START_EPOCH ))"
         if [ "$REAP_WT_BUDGET_SECONDS" -gt 0 ] && [ "$elapsed" -ge "$REAP_WT_BUDGET_SECONDS" ]; then

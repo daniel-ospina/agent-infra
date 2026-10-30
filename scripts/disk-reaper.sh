@@ -379,6 +379,17 @@ kv_field() {
     printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1
 }
 
+# _dclass <verdict> -> `B` (an ordinary reading of a pass, or an abstention) | `A` (the ALARM class).
+# ⛔ The BENIGN side is an ALLOW-LIST, so a verdict the reaper gains later and this reader was never
+# taught classifies as an ALARM and is PRINTED. An unrecognised spelling must never become silence —
+# that is the whole fail-loud property the `⛔ worktree-delegate=` line depends on (#3058 review, P1).
+_dclass() {
+    case "${1:-}" in
+        ''|ok|'?'|not-run|dry-run|reclaimed|idle|mixed-benign) printf 'B' ;;
+        *) printf 'A' ;;
+    esac
+}
+
 print_status() {
     local epoch mode ok rc freed iso age status
     if [ ! -f "$STATUS" ]; then
@@ -1735,10 +1746,31 @@ reap_worktree() {
             # failure), so the fleet's status file said `verdict_worktree=ok` for a pass that reclaimed
             # nothing on a box at 0 bytes free. This field carries the delegate's ANSWER alongside it;
             # it does not change the class verdict or any exit code, so nothing that reads those moves.
-            # Same `?`/`not-run`/`mixed` polarity as `main_proof=`/`pr_merged=`: accumulated over the
-            # repos that ANSWERED, `mixed` when two of them disagree.
+            # ⛔ BUT NOT `main_proof=`'s POLARITY (#3058 review, P1). That one is read by nothing; THIS
+            # one feeds an ⛔ alarm line, and a plain "any disagreement => mixed" rule makes `mixed`
+            # mean BOTH "repo A was ineffective, repo B was idle" (the alarm) and "repo A reclaimed,
+            # repo B was idle" (two ordinary readings). On the multi-repo shape a HEALTHY cell would
+            # then print `⛔ worktree-delegate=mixed`, and `⛔ worktree-delegate=reap-ineffective` would
+            # never be reachable at all — one repo `reap-ineffective` + one `idle` is exactly the pair
+            # that collapses. The alarm class therefore WINS, and the two kinds of disagreement get
+            # DIFFERENT spellings:
+            #   · an alarm-class answer (reap-ineffective/unmeasured, or a spelling this reader has
+            #     never seen — fail-loud) is carried as ITSELF; `mixed` is reserved for the one case
+            #     where the cell genuinely cannot say, i.e. TWO DIFFERENT alarm answers;
+            #   · benign answers that disagree (`reclaimed` + `idle`) read `mixed-benign`, which the
+            #     reader keeps SILENT: two ordinary readings of two healthy passes are not an
+            #     abstention, and a ⛔ there is the alarm-fatigue defect this field exists to avoid.
             _v="$(kv_field "$_sum" verdict)"
-            if [ -n "$_v" ]; then if [ -z "$dverdict" ]; then dverdict="$_v"; elif [ "$dverdict" != "$_v" ]; then dverdict="mixed"; fi; fi
+            if [ -n "$_v" ]; then
+                if [ -z "$dverdict" ]; then dverdict="$_v"
+                elif [ "$dverdict" != "$_v" ]; then
+                    if [ "$(_dclass "$dverdict")" = "B" ]; then
+                        if [ "$(_dclass "$_v")" = "B" ]; then dverdict="mixed-benign"; else dverdict="$_v"; fi
+                    else
+                        if [ "$(_dclass "$_v")" = "B" ]; then :; else dverdict="mixed"; fi
+                    fi
+                fi
+            fi
         fi
         log_line "$out"
         rows="${rows}${rows:+$'\n'}$out"
