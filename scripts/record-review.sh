@@ -120,13 +120,24 @@
 # consumed by the review-enforcer merge registry gate
 # (extensions/review-enforcer/index.ts, issue #138).
 #
-# ONE MINT, TWO ARTIFACTS — AND THEY ARE NOT INTERCHANGEABLE (#1224).
+# ONE MINT, THREE ARTIFACTS — AND THEY ARE NOT INTERCHANGEABLE (#1224).
 #   1. the RECORD FILE, ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json, which is
 #      head-bound (`head_sha`) and which the PR itself cannot edit. The gate
 #      reads it FIRST.
 #   2. a MARKER LINE appended to the PR BODY, signed, so a human can see the
 #      attestation on the PR. It is the gate's FALLBACK, used only when no
 #      record covers the head.
+#   3. a PR COMMENT carrying that SAME signed marker line
+#      (post_review_evidence_comment below). This is the copy that TRAVELS: the
+#      record store is per-box, so the required `pipeline-compliance` runner has
+#      none, while `gh pr edit` cannot reach a comment. It is a USER-VISIBLE
+#      effect — every recorded review adds at most one comment to its PR.
+#      ⛔ It is a WIDER field than the body: commenting needs no permission on a
+#      public repo, while editing the body needs write access. So the GATE's
+#      reader admits a comment only from an OWNER/MEMBER/COLLABORATOR AND
+#      verifies its `sig=` wherever a gate key is resolvable — see
+#      check-pipeline-compliance.sh::has_comment_review_record, which is the
+#      contract this producer's marker must satisfy.
 # The order matters and must not be reversed. The body is one `gh pr edit` away
 # from anybody — an unrelated typo fix, a corrected claim, the closing keyword
 # the compliance gate demands — and that edit used to destroy the only copy,
@@ -1039,10 +1050,14 @@ record_sig_for() { # <pr> <head> <verdict> <repo>
 # source plus (b) as the source that travels: `gh pr edit` rewrites the body and
 # cannot reach a comment.
 #
-# ⛔ It is NOT a new trust anchor. The comment carries the SAME signed marker line
-# the body already carries, so it is exactly as forgeable as the body marker was
-# and no more — but unlike the private record file it is PUBLIC, so it leaves an
-# audit trail where a human and `gh` can see it. Idempotent (a marker already
+# ⛔ It is NOT "as forgeable as the body and no more" — that claim was FALSE (review
+# finding): a PR body needs write access, a comment needs none, so on a public
+# repo the field is wider. The gate therefore pairs the SAME signed marker with an
+# AUTHOR admission (author_association ∈ OWNER/MEMBER/COLLABORATOR) and verifies
+# the `sig=` wherever a gate key is resolvable; with no key (the CI runner) the
+# forger set is exactly the set that could already edit the body. Unlike the
+# private record file the comment is PUBLIC, so it also leaves an audit trail
+# where a human and `gh` can see it. Idempotent (a marker already
 # present is not re-posted) and best-effort: a failed comment NEVER fails the
 # record, exactly like the body post.
 post_review_evidence_comment() { # <marker> <repo> <pr>
