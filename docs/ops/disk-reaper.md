@@ -655,7 +655,7 @@ and `DF_BIN` are the test seams; the measured paths are `df -Pm <repo>` under `R
 `classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=`,
 `pr_merged=` and `delegate_verdict_worktree=` (the delegate's own `verdict=`, with the same
 `?`/`not-run`/`mixed` polarity; it is printed by `--print-status` **and** on the cell health verb's
-per-class line (`scripts/cloud-cell-supervisor.sh`, `delegate=`) — a field the reader does not print
+per-class line (`scripts/cloud-cell-supervisor.sh`, `⛔ worktree-delegate=`) — a field the reader does not print
 does not exist, so a status channel that showed only `worktree=ok` for an ineffective reap was
 publishing the incident's own misleading sentence — and it is deliberately SEPARATE from
 `verdict_worktree=`, which stays the exit-code reading — an ineffective reap exits 0 by design, so
