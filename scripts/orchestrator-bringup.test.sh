@@ -1401,6 +1401,78 @@ else
 fi
 
 
+# ── §15 the deploy REFUSES to overwrite an uncommitted edit in $O — and RECORDS what it wrote ────
+# ⛔ MEASURED 2026-10-28: a hand-applied fix to `$O/merge-one.sh` was reverted TWICE by redeploys. The
+# two deploy paths learned to refuse (exit 78) and to record `$O/.harness-provenance`; `start` — the Mac
+# verb operators actually run — is a THIRD writer of `$O/*.sh` and kept copying over the patch after a
+# warning. A refusal present in two of three writers is a gate with a door beside it, and a box written
+# by the ungated one carried bytes no record described. Both halves are pinned here, in order: the
+# record (so an edit is even distinguishable), the refusal, and the deliberate override.
+say_case "§15 a deploy REFUSES to overwrite an uncommitted edit in \$O, and RECORDS what it wrote"
+GS="$T/gs"; mk_bin "$GS/bin" mac; mk_clone "$GS/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GS/home/Library/LaunchAgents" "$GS/O" "$GS/harness"; mk_render_harness "$GS/harness"
+# The source ships the real checker/writer, so the arm grades the shipped instrument, not a stub.
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GS/harness/"
+printf '#!/bin/bash\necho SHIPPED-A\n' > "$GS/harness/worker-a.sh"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GS/home/keys.env"
+mk_controller "$GS/O"
+GS_PID="$(start_controller "$GS/O")"; sleep 0.4; printf '%s\n' "$GS_PID" > "$GS/O/.orch.lock"
+mk_launchctl_pid "$GS/bin" "$GS_PID"
+GS_SHIPPED="$(ls "$GS/harness"/*.sh | wc -l | tr -d ' ')"
+BRINGUP_ARGS=start bringup "$GS/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$GS/home/keys.env"
+# ⛔ NOT `[ $RC = 0 ]`. `start` ends with the FLEET table, which on a host whose components cannot be
+# read returns 2 for reasons that have nothing to do with this deploy (the same pre-existing arm colour
+# as `deploy:`/`start (adopt)` above). What this arm is about is that the deploy RAN and was not
+# refused, and that is asserted directly: the deploy line, the record, and the manifest.
+[ "$RC" != 1 ] && grep -q 'deployed [0-9]* harness script' <<<"$OUT" \
+  && ok "§15 start (mac): a clean deploy RUNS and is not refused" \
+  || bad "§15 start (mac): the clean deploy did not run / was refused — rc=$RC $OUT"
+[ -f "$GS/O/.harness-provenance" ] \
+  && ok "§15 the deploy RECORDED \$O's provenance (the box is attributable, not inferred)" \
+  || bad "§15 the deploy wrote NO .harness-provenance — the next deploy is blind again, which is the incident"
+if [ -f "$GS/O/.harness-provenance" ]; then
+  grep -q "^files=$GS_SHIPPED\$" "$GS/O/.harness-provenance" \
+    && ok "§15 the record's files= count matches the $GS_SHIPPED file(s) the source shipped" \
+    || bad "§15 the record does not describe what was shipped — $(grep '^files=' "$GS/O/.harness-provenance" 2>/dev/null)"
+  grep -q " worker-a.sh\$" "$GS/O/.harness-provenance" \
+    && ok "§15 the record carries a sha256 for the shipped worker" \
+    || bad "§15 the record has no manifest line for worker-a.sh"
+fi
+# THE INCIDENT: a hand patch to a file the deploy ships.
+printf '#!/bin/bash\necho HAND-PATCHED\n' > "$GS/O/worker-a.sh"
+G2="$T/gs2"; mkdir -p "$G2/home" "$G2/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$G2/home/keys.env"
+BRINGUP_ARGS=start bringup "$G2/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$G2/home/keys.env"
+[ "$RC" = 1 ] && ok "§15 start: an uncommitted edit in \$O is a REFUSAL (rc=1), not a warning" \
+              || bad "§15 start: rc=$RC over a hand-patched \$O, want 1 — the patch is not protected — $OUT"
+case "$OUT" in
+  # ⛔ BOTH HALVES, because either alone is satisfiable without a refusal: the deploy's own plan line
+  # also names the file, and the `refuse` line is generic by contract. The DIAGNOSIS is the pair.
+  *"UNCOMMITTED-EDIT"*worker-a.sh*) case "$OUT" in
+      *"REFUSED"*) ok "§15 the refusal NAMES the file it would have overwritten, and refuses" ;;
+      *) bad "§15 the edit was diagnosed but nothing refused it — $OUT" ;;
+    esac ;;
+  *) bad "§15 the refusal named no file — an operator cannot act on that — $OUT" ;;
+esac
+grep -q 'HAND-PATCHED' "$GS/O/worker-a.sh" \
+  && ok "§15 the patched bytes are STILL THERE (a refusal copies nothing)" \
+  || bad "§15 the patch was OVERWRITTEN anyway — this is the 2026-10-28 incident, reproduced"
+# …and the override is opt-in BY NAME, on the command line.
+G3="$T/gs3"; mkdir -p "$G3/home" "$G3/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$G3/home/keys.env"
+BRINGUP_ARGS="start --accept-discard" bringup "$G3/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$G3/home/keys.env"
+[ "$RC" != 1 ] && ok "§15 start --accept-discard: proceeds — the refusal is never the last word" \
+  || bad "§15 start --accept-discard: STILL refused (rc=1) after a deliberate override — $OUT"
+case "$OUT" in
+  *"--accept-discard"*) ok "§15 the override is announced, so the discard is never silent" ;;
+  *) bad "§15 the override discarded an edit and said nothing — $OUT" ;;
+esac
+grep -q 'SHIPPED-A' "$GS/O/worker-a.sh" && ! grep -q 'HAND-PATCHED' "$GS/O/worker-a.sh" \
+  && ok "§15 --accept-discard did deploy the shipped bytes (the flag means discard, not abort)" \
+  || bad "§15 --accept-discard left the patch in place — the flag is a no-op"
+kill -9 "$GS_PID" 2>/dev/null
+
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
