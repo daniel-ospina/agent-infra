@@ -1325,6 +1325,16 @@ dispatch row is a claim that something is wrong:
 | `harness=source-dirty:<sha12>` | (a) | the record names `<sha12>` — **this** commit — but its own `sourceDirty=true` says the deploy was staged from a checkout with uncommitted changes, so `<sha12>` does **not** describe the bytes on the box | redeploy from a **clean** checkout: that is what makes the box identifiable at all |
 | `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
 | `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
+### Precedence when more than one state is true
+
+`uncommitted-edit:<file>` › `behind:`/`diverged:` › `incomplete:<file>` › `source-dirty:<sha12>` ›
+`surface` › `payload-differs`. The token is ONE line, so the order is the answer to "which fact does
+an operator act on first": unrecoverable bytes, then where the box sits, then code that is missing,
+then a record that cannot describe the box at all, then a hit in another directory, then a plain byte
+difference. It is stated here rather than left to the `if` order in the code, and
+`check-deployed-drift.test.sh` §9b grades the `incomplete` over `source-dirty` case, which is the one a
+combined state actually produces.
+
 | `harness=surface` | neither — another dir | `$O` itself is clean; a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) differs from `$REF` | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it |
 
 The refusal has **two directions**, and both matter: a file whose bytes differ from the record, and a

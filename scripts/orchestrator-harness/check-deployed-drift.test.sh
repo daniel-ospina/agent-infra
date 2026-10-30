@@ -292,6 +292,18 @@ ck "…and it does NOT print the routine-state sentence under a DIRTY record" \
    "$(qF "known state, not a defect" "$OUT" && echo 1 || echo 0)"
 ck "…it says the box was never identifiable, and how to make it so" \
    "$(qF "never identifiable" "$OUT" && echo 0 || echo 1)"
+# ⛔ A DIRTY RECORD **AND** A MISSING FILE ARE TWO FACTS, and the token must carry the actionable one
+# (review of #3090). The absent shipped script is what README gives its own row and remedy ("a redeploy
+# CREATES it"); `source-dirty` says the record cannot describe the box, which is true but is not what
+# breaks the runtime. Measured: with the DIRTY arm placed FIRST this state reported
+# `harness=source-dirty:<sha>` and the `incomplete:` signal disappeared from the token.
+rm -f "$O/b.sh"
+run
+ck "…a DIRTY record with a MISSING file still says harness=incomplete:b.sh" \
+   "$(qF "harness=incomplete:b.sh" "$OUT" && echo 0 || echo 1)"
+ck "…and NOT source-dirty (the absent script is the runtime signal)" \
+   "$(qF "harness=source-dirty" "$OUT" && echo 1 || echo 0)"
+ck "…while still naming the DIRTY source in the body" "$(qF "source was DIRTY" "$OUT" && echo 0 || echo 1)"
 cp "$TMP/a.sh.committed" "$SRCDIR/a.sh"                                        # leave the fixture clean again
 deploy
 bash "$PROVW" write --o "$O" --src "$SRCDIR" >/dev/null 2>&1

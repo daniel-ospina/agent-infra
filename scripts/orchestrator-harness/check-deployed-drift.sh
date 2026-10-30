@@ -806,18 +806,24 @@ if [ "$problems" -gt 0 ]; then
     else HTOKEN="uncommitted-edit:<unnamed: the record carries no manifest>"; fi
   elif [ "$Q_IDENT" -eq 1 ] && [ "$RELATION" != "current" ]; then
     HTOKEN="$RELATION:${HAS:0:12}"
-  elif [ "$DIRTY" = true ]; then
-    # ⛔ A DIRTY-SOURCE RECORD ON THE TIP IS NOT `payload-differs` (measured 2026-10-30, review of
-    # #3053). It fell through to the else below — but README §4.3 defines that token as "the bytes
-    # differ from the checkout but the record STILL DESCRIBES $O", which is precisely what a
-    # `sourceDirty=true` record does not do: it names a commit whose bytes are not on the box. A token
-    # that sends an operator to "redeploy to adopt" without saying the box was never identifiable is
-    # the same false reassurance the summary sentence below used to give.
-    HTOKEN="source-dirty:${HAS:0:12}"
   elif [ "$MISSING_N" -gt 0 ]; then
     # A THIRD STATE, NAMED. `payload-differs` would be false (the bytes that ARE there match the
     # record) and `uncommitted-edit` would be false (nothing was edited) — it is an INCOMPLETE tree.
     HTOKEN="incomplete:$(head -1 "$TMPD/missing-names" 2>/dev/null)"
+  elif [ "$DIRTY" = true ]; then
+    # ⛔ A DIRTY-SOURCE RECORD ON THE TIP IS NOT `payload-differs` (measured 2026-10-30, review of
+    # #3053/#3090). It fell through to the else below — but README §4.3 defines that token as "the
+    # bytes differ from the checkout but the record STILL DESCRIBES $O", which is precisely what a
+    # `sourceDirty=true` record does not do: it names a commit whose bytes are not on the box. A token
+    # that sends an operator to "redeploy to adopt" without saying the box was never identifiable is
+    # the same false reassurance the summary sentence below used to give.
+    # ⛔ AND IT IS PLACED BELOW `incomplete:` ON PURPOSE (review of #3090): a record can be dirty AND
+    # name a file `$O` no longer has, and the absent script — the runtime-breakage signal README gives
+    # its own row and its own remedy ("a redeploy CREATES it") — is the more actionable of the two.
+    # Measured: putting this arm first narrowed `incomplete:b.sh` to `source-dirty:<sha>` for a
+    # dirty-source record with a missing file. Precedence, stated rather than implied:
+    # uncommitted-edit > behind/diverged > incomplete > source-dirty > surface > payload-differs.
+    HTOKEN="source-dirty:${HAS:0:12}"
   elif [ "$SURF_HIT" -eq 1 ] && [ "$Q_RECORD" -eq 0 ] && [ "$Q_IDENT" -eq 0 ] && [ "$Q_BYTES" -eq 0 ]; then
     # $O answered clean; the hit is in another harness dir this box carries. `payload-differs` would be
     # a false statement about $O and would prescribe a redeploy that cannot clear it.
