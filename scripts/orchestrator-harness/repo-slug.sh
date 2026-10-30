@@ -185,9 +185,25 @@ resolve_repo() {
   # call would read the repo the ENVIRONMENT named. Fail-closed means the validation closes that too.
   if ! top="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
         git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || [ -z "$top" ]; then
-    echo "REPO=$repo is not a git checkout (git -C $repo rev-parse --show-toplevel failed)." >&2
-    _resolve_repo_remedy
-    return 2
+    # ⛔ A BARE REPO IS A REPO, NOT A WRONG PATH (#3054 review, P2). `--show-toplevel` has no answer in
+    # a bare repository, so the probe above refused one — and `pi-reap-worktrees.sh` reaps the linked
+    # worktrees of a bare repo on purpose (its `BARE` row, `rule=P proof=worktree-list`). Measured: the
+    # same `--repo <bare> --list` was rc 0 on the pre-change tree and rc 2 here, i.e. the test that
+    # refusal added was not "is this a repo" but "is this a CHECKOUT", and the narrowing was silent —
+    # the reaper's own comment even claimed its `--git-common-dir` probe "proves strictly more", which
+    # is true only if this probe accepts what that one does.
+    # The scrub is repeated here for the same reason it is applied above: an ambient `GIT_DIR` makes
+    # `rev-parse --git-dir` answer for a directory that is not a repo at all, so the bare proof has to
+    # be taken with the SAME environment the toplevel proof is taken in, or it certifies the wrong
+    # thing. `--is-bare-repository` is the predicate, not "no toplevel": a directory INSIDE a bare
+    # repo also has no toplevel, and accepting it blindly would certify a path nobody proved.
+    _is_bare="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+        git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)" || _is_bare=""
+    if [ "$_is_bare" != "true" ]; then
+      echo "REPO=$repo is not a git checkout (git -C $repo rev-parse --show-toplevel failed)." >&2
+      _resolve_repo_remedy
+      return 2
+    fi
   fi
   # The value printed is the path the OPERATOR NAMED, not the toplevel git reports: a caller given a
   # subdirectory keeps it (each caller validates what it uses itself), so `$REPO` never silently

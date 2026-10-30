@@ -146,6 +146,24 @@ rr REPO="$PLAIN" GIT_WORK_TREE="$REAL"
 { [ "$rr_rc" -eq 2 ] && err_has 'not a git checkout'; }
 ck "A9b an ambient GIT_WORK_TREE cannot forge one either (rc=$rr_rc)" $?
 
+# A10 A BARE REPO IS A REPO, NOT A WRONG PATH (#3054 review, P2). `--show-toplevel` has no answer in a
+# bare repository, so the first cut of this resolver refused one — which made `pi-reap-worktrees.sh`'s
+# deliberate `BARE` classification (it reaps the linked worktrees of a bare repo) unreachable, i.e. the
+# refusal was testing "is this a CHECKOUT" while claiming "is this a repo". The PREMISE is asserted, so
+# this arm cannot pass vacuously if `--show-toplevel` ever starts answering here.
+BARE="$T/bare.git"; git init -q --bare "$BARE" || { echo "repo-slug.test.sh: cannot git init -q --bare a fixture" >&2; exit 2; }
+bare_top="$(git -C "$BARE" rev-parse --show-toplevel 2>/dev/null)"; bare_top_rc=$?
+[ "$bare_top_rc" -ne 0 ] && [ -z "$bare_top" ]
+ck "A10p premise: 'rev-parse --show-toplevel' has NO answer in a bare repo (rc=$bare_top_rc) — so A10 is a real decision" $?
+rr REPO="$BARE"
+{ [ "$rr_rc" -eq 0 ] && one_line "$rr_out" && [ "$rr_out" = "$(canon "$BARE")" ]; }
+ck "A10 a BARE repo resolves (rc=$rr_rc) — the reaper's BARE row is reachable again" $?
+# …and the acceptance is not a hole: a directory that is NOT a repo is still refused even when an
+# ambient `GIT_DIR` points at a BARE repo, so the scrub covers the new probe too.
+rr REPO="$PLAIN" GIT_DIR="$BARE"
+{ [ "$rr_rc" -eq 2 ] && err_has 'not a git checkout'; }
+ck "A10b an ambient GIT_DIR aimed at a BARE repo cannot forge one either (rc=$rr_rc)" $?
+
 echo
 echo "== B. the three wrong call sites resolve through it, and still refuse loudly =="
 
@@ -196,8 +214,14 @@ if [ -f "$REAPER" ]; then
   reaper_out="$(env -u REPO -u AGENT_INFRA_PATH REAP_WT_REPO_SLUG_LIB="$LIB" bash "$REAPER" --repo "$REAL" --list 2>&1)"; reaper_rc=$?
   { [ "$reaper_rc" -eq 0 ] && grep -q "$RREAL" <<<"$reaper_out"; }
   ck "B7  pi-reap-worktrees.sh --repo <real checkout> still lists, rc 0 (rc=$reaper_rc)" $?
+  # B7b A BARE REPO STILL REAPS (#3054 review, P2) — the end-to-end half of A10. The reaper has a
+  # deliberate `BARE` row (`rule=P proof=worktree-list bare repository`) and this arm is what keeps it
+  # reachable: measured, this exact command was rc 0 before the resolver and rc 2 with the first cut.
+  reaper_out="$(env -u REPO -u AGENT_INFRA_PATH REAP_WT_REPO_SLUG_LIB="$LIB" bash "$REAPER" --repo "$BARE" --list 2>&1)"; reaper_rc=$?
+  { [ "$reaper_rc" -eq 0 ] && grep -q 'BARE' <<<"$reaper_out"; }
+  ck "B7b pi-reap-worktrees.sh --repo <bare repo> still lists its worktrees (rc=$reaper_rc)" $?
 else
-  bad "B4-B7 pi-reap-worktrees.sh is shipped (absent: $REAPER)"
+  bad "B4-B7b pi-reap-worktrees.sh is shipped (absent: $REAPER)"
 fi
 
 if [ -f "$CROSSBOX" ]; then
@@ -243,7 +267,11 @@ if [ -f "$CROSSBOX" ]; then
     bash "$CROSSBOX" --repo "$REAL" 2>&1)"; cb_rc=$?
   { [ "$cb_rc" -ne 0 ] && ! grep -q 'REPO is unset' <<<"$cb_out" && grep -q 'git fetch failed' <<<"$cb_out"; }
   ck "B12 deploy-crossbox.sh: --repo <real checkout> is ACCEPTED with REPO unset — it reaches the fast-forward (rc=$cb_rc)" $?
-  rm -rf "$CELL/bin" $?
+  # ⛔ `rm -rf "$CELL/bin" $?` is NOT quoted (#3054 review, P2): `$?` is expanded BEFORE the command
+  # runs, so it entered the operand list as the literal `0` — `rm -rf "$CELL/bin" 0`. `-f` hid the
+  # missing operand today, but the suite runs from the repo root, so the stray operand resolves to
+  # `<repo-root>/0`: a shipped `rm -rf` aimed at a path in the caller's tree.
+  rm -rf "$CELL/bin"
 else
   bad "B8-B9 deploy-crossbox.sh is shipped (absent: $CROSSBOX)"
 fi
