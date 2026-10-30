@@ -610,7 +610,11 @@ footer() { tail -1 "$T/$1/reap.log" 2>/dev/null; }
 # across the repos `disk-reaper.sh` feeds it; this helper is what makes that testable).
 verdict_path() {
     local base sum
-    base="$(basename "$2" | tr -c 'A-Za-z0-9._-' '_')"
+    # ⛔ STRIP THE NEWLINE FIRST — `basename | tr -c … '_'` maps the newline itself to `_`, so the
+    # obvious one-liner produces `repo_` while the reaper produces `repo`, and every assertion then
+    # tests a path nothing writes. The reaper's derivation is two steps for exactly this reason.
+    base="$(basename "$2")"
+    base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
     sum="$(printf '%s' "$2" | cksum | awk '{ print $1 }')"
     printf '%s/%s/state/reap-ineffective.%s.%s\n' "$T" "$1" "${base:-repo}" "${sum:-0}"
 }
