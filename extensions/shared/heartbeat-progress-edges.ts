@@ -848,6 +848,28 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["SWEEP_MAX_AGE=600"],
     note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
+  // — hygiene axis: the claim snapshot's FRESHNESS bound (#2466) —
+  //
+  // A cache-freshness bound, not a kill bound: `$O/state/claims-snapshot` is rewritten each cycle
+  // so `claim_live()` pays no per-PR network call, and this is how long a read may be believed
+  // before the file is refused as `claim-unreadable`. Without it the cache is an unfalsifiable
+  // answer — a claim published since the last good fetch would be INVISIBLE, and two cells would
+  // select the same PR. The reverse scan caught its absence here: a new stall-family declaration
+  // that nobody classified is exactly how an unbounded bound reappears, so it is registered on
+  // introduction rather than after the first incident.
+  {
+    name: "CLAIM_SNAPSHOT_MAX_AGE",
+    owners: ["scripts/orchestrator-harness/claims.sh"],
+    value: '"${CLAIM_SNAPSHOT_MAX_AGE:-900}"',
+    axis: "hygiene",
+    guardedBy:
+      "scripts/orchestrator-harness/test-gates.sh — \"a snapshot OLDER than the age bound is NOT ownership (a claim published since would be invisible)\" drives the shipped reader with a snapshot 100000 s old and asserts UNOWNED; the value itself is asserted by THIS registry's forward check, not by the suite, because the suite ages the FILE rather than setting the bound",
+    overrides: [
+      "''|*[!0-9]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
+      "[ \"${#CLAIM_SNAPSHOT_MAX_AGE}\" -le 9 ] || CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
+    ],
+    note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). THREE shapes reach `claim-unreadable` and the bound governs only the third: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because that test is the `if` and the age test only the `elif` — the bound must never be read as re-admitting a failed read), and an `ok` header older than this bound. The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed.",
+  },
   // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
   //
   // These are not kill bounds. They are the two readings the bounded
@@ -1365,13 +1387,13 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "REPAIR_TRIGGER_BACKSTOP_S:-1800",
     axis: "gate",
     guardedBy: NONE,
-    note: "the repair actuator's BACKSTOP: the demoted timer that fires a `--trigger` pass when the event-driven front end has not run for 30 minutes (#2732). Both owners declare it from ONE env var with the same default — the installer writes the systemd unit that sets the timer, and the loop reads it — so they are registered as co-owners rather than exempted as a duplicate: a divergence between them is exactly the drift the reverse scan exists to catch. Registered rather than exempted because a 0 here would make the backstop fire continuously and a huge value would retire the sweep silently.",
+    note: "the repair actuator's BACKSTOP: the demoted timer that fires a `--trigger` pass when the event-driven front end has not run for 30 minutes (#2732). Both owners declare it from ONE env var with the same default — the installer writes the systemd unit that sets the timer, and the loop reads it — so they are registered as co-owners rather than exempted as a duplicate: a divergence between them is exactly the drift the reverse scan exists to catch. Registered rather than exempted because a 0 here would make the backstop fire continuously and a huge value would retire the sweep silently. DISCLOSED, not modelled: `scripts/pr-doctor-trigger.py:257` holds a THIRD copy of the number as the `--backstop` argparse default, and the declaration scan cannot see it AT ALL — its corpus is `extensions/**/*.{ts,mjs}` plus `scripts/**/*.{sh,ts,mjs}` (`stallScanFiles`), so no Python declaration is ever read, in any form (`BACKSTOP_S = 1800` would be equally invisible); the loop always passes the value explicitly, so a drift there is observable only when something runs the trigger without a backstop.",
   },
   {
     name: "IDLE_S",
     owners: ["scripts/orchestrator-harness/lane-bound.sh"],
     value: "IDLE_S=\"\"",
-    overrides: ['IDLE_S="$2"', "LANE_BOUND_IDLE_S:-"],
+    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 1200)"'],
     axis: "kill",
     guardedBy: NONE,
     note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 1200 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
@@ -1381,8 +1403,9 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     owners: ["scripts/orchestrator-harness/orphaned-harness.sh"],
     value: "MIN_SESSION_AGE_S:-600",
     axis: "reap",
-    guardedBy: "scripts/orchestrator-harness/orphaned-harness.test.sh — the 600 s floor as the fixture's age arithmetic and the age comparison it drives (a session past it is reapable, one below it is not)",
-    note: "the orphan reaper's AGE FLOOR: a dead harness session younger than ten minutes is reported but never reaped, so a session that is merely between incarnations cannot be collected. Caught by the reverse scan by SHAPE (`_AGE_S`) — the name carries no family token — which is why it was invisible to a family-token search. A value of 0 would make every dead session instantly reapable, so the default is a real safety margin rather than a tuning knob.",
+    guardedBy:
+      "scripts/orchestrator-harness/orphaned-harness.test.sh — OH1/OH2 (a dead harness lane PAST the floor is named with its PR; a live one is not), OH8 (a just-spawned session with no `pi` descendant YET is NOT named — the too-young direction, which NOTHING drove before: `NEW` was computed and documented 'must NOT be named' from the day the suite landed, so a floor lowered to 0 stayed GREEN), and OH9 (a session armed at `NOW - 300` is NOT named, so any floor lowered to five minutes or less is caught — because the comparison is `-ge`, a 300 s floor names it and OH9 reds; the report reads its own clock at read time, so what it sees is `300 + elapsed` and a 301 s floor reds OH9 as soon as one second has elapsed rather than leaving it reliably green). What the three cases do NOT pin is the exact `600`: OH8 and OH1 bracket it by a factor of 200 and OH9 pins only its magnitude, so the exact value is pinned by `value` above, in the `MIN_AGE` row's precedent, and NOT by a boundary case — the report reads the wall clock, so a fixture 599 s old is 600 s old one second later and cannot pin an integer boundary without making the suite flaky. The two MUTANTS: M1 deletes the `dead && age >= floor` clause and turns OH1 RED; M3 replaces the floor OPERAND with a literal past every fixture and turns OH1 RED with the clause intact — i.e. M3 pins the COMPARISON, not the default's value, and is not a `Constant Replacement` mutant.",
+    note: "the orphan REPORT's AGE FLOOR: a harness session whose panes hold NO live `pi` descendant is 'dead', and naming requires BOTH that AND age >= the floor. A worker that has just been spawned holds no `pi` YET, so without this floor a lane would be reported as an orphan during its LAUNCH window — from spawn until the agent exists, which is short but is not the floor's business — and the report would be unreadable exactly when an operator is hunting the real ones. The 600 s is a GRACE, not the length of that exposure: a lane that HOLDS a live `pi` is never named at any age (OH2's 1000 s-old live session is not named), so the coverage the floor actually adds past the launch window is a session whose agent has already exited — genuinely dead, merely between incarnations. It decides REPORTABILITY only, and the script is READ-ONLY (`orphaned-harness.sh` stops nothing, kills nothing, deletes nothing). ⚠️ NO ACTUATOR CONSUMES THIS FLOOR TODAY, stated so the row does not read as remediated: `scripts/orphan-reap.py` reaps a different class (ppid-1 test/tooling orphans) and its gate 2 lists `tmux` among the KEEP-HUMAN ancestors, so it refuses a dead `merge-*` session outright and never touches the unit surface at all, and nothing else reads this report's output. A 0 here therefore names a freshly-spawned lane during its launch window; it does not cause any reaping. Caught by the reverse scan by SHAPE (`_AGE_S`) — the name carries no family token. The age is the session's own `session_created` delta, so an UNREADABLE age is 'cannot tell' and is never named — the absence of a reading is not a verdict.",
   },
 ];
 
