@@ -1295,10 +1295,10 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `PRODUCT_FLOOR` | `1` | how many slots of each batch are filled from `candidates.product.txt` FIRST (§2 "State files (`$O/`)" `candidates.txt` row, agent-infra#2054). Clamped to `[0, BATCH]`; `0` **disables** the floor and is a legitimate setting. A missing or non-numeric value falls back to the default `1` — never to `0`, which would silently switch the guarantee off. An UNMET floor LOGS AND DEGRADES (`product-floor unmet … queue=<state>`), and it never refuses a batch or caps the fleet, because a floor is not a quota. The report names its verdict either way — `product-floor MET product=<n> batch=<n> floor=<n>` on a batch that met it, `product-floor unmet (product=… batch=… floor=…) queue=<state>` on one that did not, `product-floor N/A` where no product channel exists — so "the floor worked" is never inferred from silence. ⛔ **THE FLOOR YIELDS TO AN EMERGENCY, AND SAYS SO.** Before it reorders, `floor_emergency` asks two questions of state already on disk: is a `P0-blocker` candidate inside the batch window (`candidates.emergency.txt`, derived from the item's own label), and is there a `red-tree` rail refusal for a PR that is not parked? Either one — or an emergency class that could not be read (`p0-unknown`) — stands the floor down for that cycle and logs `product-floor OVERRIDDEN emergency=<reason>` with the counts the batch actually got. The floor reorders a SEVERITY-ordered queue, so this is the one failure it must never cause; a missed product slot re-asserts itself next cycle, a P0 delayed behind a share target does not. Its intake side (`refresh-candidates.sh` → `write_product_queues`) classifies by PRODUCT_REPOS + the `harness` LABEL and records what it decided in `state/product-class`, which the dispatch line repeats: `NOT-A-PRODUCT-REPO` / `BUDGET-SKIPPED` / `LISTING-FAILED` / `LISTING-TRUNCATED` / `WRITE-FAILED` / `OK product=<n> harness=<m>`. ⛔ THE RECORD DESCRIBES THE TWO QUEUE FILES, so only the function that WRITES them invalidates it: `write_product_queues` writes `PENDING …` as its first action and every arm below overwrites it, while a pass that refuses before reaching the writer (the environment check, the budget, the pool read) or SKIPS because the pool is unchanged (#1984) leaves the previous record alone — it is still true, because neither queue file changed. `PENDING` therefore means *a split started and did not record a class*, and the loop reports it as an UNKNOWN class, never as `the split RAN and found none`. A SHORTFALL is unmet too — `PB < PRODUCT_FLOOR`, not only `PB = 0` — so a floor of 2 that fills one slot still logs `product-floor unmet … queue=<state>` |
 | `PRODUCT_REPOS` | `daniel-ospina/tortoise` | **comma-separated** `owner/repo` list (no spaces, matched as an element — `$(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ')` then `*" $repo "*`), read by `refresh-candidates.sh` and deciding **which repo counts as PRODUCT**: an issue is product work when its repo is in this list AND it does not carry the `harness` label. ⛔ **TODAY ONLY THE ENTRY EQUAL TO `$OR` CAN EVER MATCH**: the backlog is read from `$OR` alone, and the intake is called with `$OR`, so every other element in the list is inert until a pass spans more than one repo. The list form is kept because that is the shape the decision has; it is not a multi-repo queue. If `$OR` is absent from the list, EVERY candidate is harness and the loop prints `product-floor N/A` — which is how a box says "no product channel here", not an error. This is the single input the whole floor rests on, so it is documented here rather than only in `ARCHITECTURE.md`: a repo **outside** the list reports `NOT-A-PRODUCT-REPO` and the loop prints `product-floor N/A`, which is **not** an unmet floor and **not** a finding about product work. ⛔ **`$ENV_FILE`-only: `install.sh` neither renders nor validates it** (its numeric `[`-based validator would reject a list, so a `__PRODUCT_REPOS__` placeholder is deliberately absent), which means exporting it and re-running `install.sh` has no effect, and a hand-added plist key is overwritten by the next render — set it in `$ENV_FILE` on a cell, or edit the `PRODUCT_REPOS=` default in `refresh-candidates.sh` (search the assignment, not a line number — it moved once already) |
 | `CYC` | `240` | seconds between cycles |
-| `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
-| `LANE_TIMEOUT` | `3300` | wall-clock limit on a lane's `pi` run (s). Raised from 2400 when a lane took ownership of its merge (#2029) — the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
-| `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
-| `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
+| `STALE_MIN` | `50` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6). ⛔ **50, not 40, since #2888**: at 40 (2400 s) this reaper sat BELOW lane's own 2700 s PROGRESS allowance and killed a WORKING-but-quiet lane on log silence alone — the same flat cap #2888 retired from the lane itself, one layer up. The floor is derived at runtime from that allowance (`_stale_floor_raise`: `LANE_BOUND_IDLE_S`, else the default read out of `lane-bound.sh`), so a lower config is raised loudly, and `lane-bound.test.sh` (i0) pins the shipped pair |
+| `LANE_TIMEOUT` | `7200` (the `LANE_BACKSTOP_S` seam) | the ABSOLUTE wall-clock **backstop** on a lane's `pi` run (s) — not its primary bound, which is `LANE_BOUND_IDLE_S`'s progress rule. `lane.sh` passes `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}`, so the seam is the default; the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits — see `claims.sh`'s arithmetic block |
+| `REVIEW_TIMEOUT` | `1800` | wall-clock limit on ONE reviewer `pi` run (s) — deliberately below the progress allowance, because it bounds a single tool call rather than a lane's life (see `merge-one.sh`'s block) |
+| `FIX_TIMEOUT` | `7200` (the `LANE_BACKSTOP_S` seam) | wall-clock **backstop** on a fixer `pi` run (s); `fix-one.sh` passes `${FIX_TIMEOUT:-$LANE_BACKSTOP_S}` |
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 | `SWEEP_ROWS_PER_CYCLE` | `8` | the sweep's per-cycle **window**: how many swept PRs are read per cycle, rotating via `state/sweep-cursor`. A full 70-row pass costs minutes (≥2 `gh pr view` per row) and the controller is relaunched every 12–45 s, so an unbounded pass was torn down before the arms at its end — measured: 0 dispatches in 555 cycles (#2640). The cursor advances AFTER the pass, by the rows that actually produced a disposition, so an interrupted window resumes at its unfinished row instead of stepping over its tail |
@@ -1662,8 +1662,8 @@ and the exit code **is** the next action (0 MERGED · 10 FIX_REQUIRED · 15 FIX_
 NAMES → fix, push, repeat; when green, launch the harness's per-PR chain **detached** and supervise it with
 `--watch` (short chunks — a lane blocked for 20 minutes inside one shell call reads as wedged to every
 liveness instrument we have). Supervision is **bounded and sized to what the lane can actually spend**:
-`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (1500 + 7 × 120 + 900 = 3240 of the 3300 s
-clock), so the merge phase can never consume the implementation time the same clock pays for — a bound
+`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (1500 + 40 × 120 + 900 = 7200 of the 7200 s
+backstop), so the merge phase can never consume the implementation time the same clock pays for — a bound
 the lane itself reaches before its own kill, not one only a later lane could inherit.
 
 **The cap is 3 fix rounds, enforced by the tool**, not by the brief: a lane that would start round 4 is
@@ -1730,7 +1730,7 @@ of a previous run:
 | `exec` | which sha is **EXECUTING** (not which is pinned) | the RUNNING controller's own argv → the tree that path lives in → that tree's `HEAD`, compared with the pin |
 | `loop` | is the loop alive | the process census (ARGV-shape match) + `$O/heartbeat` age |
 | `capacity` | is **placement** healthy | fork headroom → free disk → load, in that order (below), each printed with the number it contributed and the one that BOUND |
-| `lanes` | how many lanes, and are they **advancing** | the launcher's own live worker records (`$O/state/run-*.sh`, removed by `wt_close`) × their `$O/logs/<name>.log` mtime, against the controller's own `STALE_MIN` (40 min). Finished logs are counted and IGNORED, never judged |
+| `lanes` | how many lanes, and are they **advancing** | the launcher's own live worker records (`$O/state/run-*.sh`, removed by `wt_close`) × their `$O/logs/<name>.log` mtime, against the controller's own `STALE_MIN` (50 min). Finished logs are counted and IGNORED, never judged |
 | `selftest` | does this tree survive its own probes | `bash -n` over the live `$HARNESS/*.sh`, plus each platform probe in the shim called NOW |
 | `next` | what would it do next | the controller's own `[select]` decision line, with the log's age (LATE rather than "the current plan") |
 | `launchd` / `supervisor` / `refresh` / `claims` / `drift` | the supporting components | each component's own authority, or `SKIPPED` with its reason when the platform has no such component |
@@ -1994,7 +1994,7 @@ done | sort -k4 -n -r | head
 ladder in `orch-loop.sh`, and the order matters — GNU `stat -f` writes a filesystem listing to **stdout**
 before exiting 1, so a BSD-first ladder is the bug itself. See §4's "capacity probes are portable".)
 
-`orch-loop.sh` now reaps these itself (`STALE_MIN`, default 40): the session is killed and the PR
+`orch-loop.sh` now reaps these itself (`STALE_MIN`, default 50): the session is killed and the PR
 is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's claim.
 
 ⛔ **That is ONE signal over ONE population** — the controller's own workers (`wt-*` workspaces where
@@ -2158,7 +2158,7 @@ it), and the controller's own `reap_stale_workers()` — which runs only while t
 the two in-tree reapers disagree; the doctor is the one this MUST is being met by.**
 `reap_stale_workers()` reaps only the controller's OWN
 `lane|merge|fix` workers — through the launcher's census, so they are `wt-*` workspaces where the cmux
-daemon answers and tmux sessions where it does not (§2.1) — on log-mtime staleness past `STALE_MIN` (default 40) —
+daemon answers and tmux sessions where it does not (§2.1) — on log-mtime staleness past `STALE_MIN` (default 50) —
 one signal, one population, and only while a controller is alive. The fleet-level reapers are
 launchd jobs (`templates/launchd/com.tortoise.worktree-reaper.plist`,
 `com.eldato.pi-session-reaper.plist`), i.e. **absent on a Linux cell** (agent-infra#1864, #1927).
@@ -2245,8 +2245,8 @@ measurements behind it**, never inferred from an exit status.
 
 | limit | default | what it is | what it is NOT |
 |---|---|---|---|
-| wall clock | `LANE_TIMEOUT`, 3300 s | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
-| **silence** | `LANE_BOUND_IDLE_S`, **1200 s** (20 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs |
+| wall clock | `LANE_BACKSTOP_S`, **7200 s** (the `LANE_TIMEOUT` default) | a hard **backstop** on the lane's total duration — it sits ABOVE the progress allowance, so it can only end a lane that never went quiet | not a progress signal: it cannot tell SLOW from STALLED, so as a *primary* bound it either kills a lane mid-merge or holds a corpse — the 2400 < 2700 inversion #2888 removed |
+| **silence** | `LANE_BOUND_IDLE_S`, **2700 s** (45 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs |
 
 **Why (measured 2026-10-27).** Nine lanes across two cloud cells parked with **0 bytes** of output and
 **`00:00:00` CPU**, the oldest for **3 h 32 m** — every one a `pi` in `ep_poll`, an event-loop wait
@@ -2275,8 +2275,8 @@ stalled fleet and a human reading a report.
 `<lane log>.lanebound`):
 
 ```text
-[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=1204s wall_bound=3300s
-  idle_bound=1200s silent=1204s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2712s wall_bound=7200s
+  idle_bound=2700s silent=2712s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
   cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
 ```
 
@@ -2295,23 +2295,38 @@ truncated on rerun and the CPU counter dies with the process.
 **Two observations, and when to expect the kill.** A lane is judged on the sample interval
 `--poll`, default `min(60 s, idle/4)` — ~3 `ps` calls a minute per lane, because on this box the FLEET
 is the load. The silence limit needs **two consecutive confirming samples**, so it fires between
-`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (20–22 min at the defaults); the wall ceiling is
+`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (45–47 min at the defaults); the wall ceiling is
 exact to the sample interval it is not allowed to overrun. One sample is never enough: a single reading
 cannot tell a freeze from a missed measurement, which is the same rule §6.5.1 states for the outside
 reapers.
 
-**Operating it.** `LANE_BOUND_IDLE_S=0` disables the silence limit (and `LANE_BOUND_WALL_S=0` the
-ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT, because an
-`LANE_BOUND_IDLE_S="${UNSET}"` in a launcher must not disarm the bound, and a typo must never read as
-"off". Both off prints an `UNBOUNDED by construction` WARN. The same contract as `task`'s
-`getCpuStallMs`. Tuning is per dispatch: a lane class that legitimately sits silent for longer (a long
-model call with no tool activity) raises `LANE_BOUND_IDLE_S` rather than removing the limit.
+**Operating it.** `LANE_BOUND_IDLE_S=0` disables the silence limit — an explicit `0` only: a blank or
+malformed value takes the DEFAULT, because an `LANE_BOUND_IDLE_S="${UNSET}"` in a launcher must not
+disarm the bound, and a typo must never read as "off". Both axes off prints an `UNBOUNDED by
+construction` WARN. The same contract as `task`'s `getCpuStallMs`. Tuning is per dispatch: a lane class
+that legitimately sits silent for longer (a long model call with no tool activity) raises
+`LANE_BOUND_IDLE_S` rather than removing the limit.
 
-⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
-no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
-(`TASK_STREAM_STALL_MS` = 20 min) and the same window a human used by hand (5–15 min) — but it IS a
-bound on a legitimate-but-pathological case, and the verdict line says so instead of hiding it, because
-`silent=1204s bytes=0 cpu_delta_cs=0` is exactly what a 20-minute model call looks like from outside.
+⛔ **`LANE_BOUND_WALL_S` may only TIGHTEN a lane's bound (agent-infra#2999 review, F1/P2-2).** Through
+`run_agent` the env seam is resolved as tighten-only: a value ABOVE the caller's own bound is CLAMPED
+to it and named in the lane log, and a bare `0`/`0*` or a non-numeric value is treated as a TYPO that
+leaves the caller's bound standing (a fleet-wide off switch must not be reachable by a typo). The
+reason is the lease: every caller sizes its cross-box claim lease from the bound it passes
+(`FIX_LEASE = FIX_BOUND + 1200`, `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300`) and nothing re-derives
+from this seam — so a lane allowed to run past its own lease lets a peer read the head as free and run
+a SECOND lane on it (the duplicate dispatch #2888 removed from `fix-one.sh`, back on a new path). To
+EXTEND a lane, raise the CALLER's knob (`LANE_TIMEOUT` / `FIX_TIMEOUT` / `REVIEW_TIMEOUT`, or
+`LANE_BACKSTOP_S`, which the callers default to) — that re-derives the lease too. `--wall 0` from a
+caller remains the explicit, per-caller off switch.
+
+⛔ **STATED RESIDUAL.** A lane whose model call takes longer than `LANE_BOUND_IDLE_S` (45 min) with no
+output and no tool CPU is killed as `stalled`. That is the fleet's declared no-progress allowance for a
+`task` child as well (`TASK_PROGRESS_AGE_MS` = 45 min — `docs/ops/load-policy.md` §3; the lane's rule is
+stricter than the child's, because it requires **both** signals quiet, so it can only fire later) — and
+it IS a bound on a legitimate-but-pathological case. The verdict line says so instead of hiding it,
+because `silent=2712s bytes=0 cpu_delta_cs=0` is exactly what a 45-minute model call looks like from
+outside. (This paragraph cited `TASK_STREAM_STALL_MS` = 20 min and a 1204 s example until #2888 moved
+the allowance to 2700 s: the residual is one number, and it has to be the number that ships.)
 
 ### 6.5.2 The instrument that decides must itself be bounded
 
