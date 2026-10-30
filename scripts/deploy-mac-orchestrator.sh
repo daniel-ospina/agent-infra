@@ -195,10 +195,13 @@ elif [ "$DISC_RC" -eq 1 ]; then
   exit 78
 elif [ "$DISC_RC" -ne 0 ]; then
   # CANNOT-VERIFY: the refusal cannot fire, but silence about it is how the next redeploy quietly
-  # reverts a patch. Said out loud, once, on the path that will overwrite — and the two reasons are
-  # NAMED apart: "this ref ships no checker" is a DIFFERENT problem (deploy from a ref that has one)
-  # from "the box carries no record" (record it). Handing an operator the wrong one sends them to a
-  # remedy that cannot work.
+  # reverts a patch. Said out loud, once, on the path that will overwrite — and the states are NAMED
+  # apart: "nothing is there yet" is the strongest fact; "this ref ships no checker" is a DIFFERENT
+  # problem (deploy from a ref that has one); and the third takes EVERY other code, so it names only
+  # that NO ANSWER was produced and prints the checker's own verdict. ⛔ This preamble used to say the
+  # third one meant "the box carries no record" (record it) — the same guess the arm itself carried,
+  # which was false on most of it (#3089). Handing an operator the wrong remedy sends them to one
+  # that cannot work, and a comment that re-states the guess reintroduces it for the next reader.
   if [ ! -d "$O" ]; then
     # ORDER MATTERS: "nothing is there" is the strongest fact, and it is true regardless of which
     # checker the ref ships. Nested under either other branch it produced a false alarm about files
