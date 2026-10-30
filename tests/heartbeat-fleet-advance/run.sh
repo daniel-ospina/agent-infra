@@ -53,7 +53,17 @@
 #       and a state where the PRIMARY send returns non-zero so the recovery egress executes.
 #       Each must carry the four sentences exactly once. NOT covered, and said rather than implied:
 #       gates that send NOTHING (kill file, no registry, PULSE_MIN, DRY, the liveness and idle
-#       guards) and the TRIAGE_*/RL families, whose fixture inputs are permanently empty here.
+#       guards, and the single-instance lock below) and the TRIAGE_*/RL families, whose fixture
+#       inputs are permanently empty here.
+#       ⛔ THE SINGLE-INSTANCE LOCK IS ONE OF THOSE GATES, AND IT IS NAMED HERE BECAUSE IT IS NEW.
+#       agent-infra#2890 (`5ae03cea`, 2026-10-27) put a `$STATE/heartbeat.lock` claim above the
+#       whole pass, so a tick that loses the race now sends NOTHING at all. That is the feature,
+#       in the same class as the kill file and PULSE_MIN — not a defect this suite must catch —
+#       and it is covered by its own suite (`scripts/orchestrator-harness/heartbeat-lock.test.sh`,
+#       37 assertions). What this suite still guarantees about it is the property that matters for
+#       the order: the lock adds NO `send` token, no MSG read, and no block depth at the send or at
+#       the last MSG= statement (all pinned below, and all unmoved by that commit), so it cannot be
+#       used to compose or gate the order *within* a beat that does run.
 #     * ordering is checked where the comment claims it: in the capacity state the order is
 #       immediately followed by the CAPACITY clause, and in the plain pulse states the order
 #       is the LAST thing in the beat;
@@ -301,12 +311,23 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # That direction is the SAFE one — the digest cannot go stale silently — so the lint is UPDATED
 # rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
 # place to hide a gate).
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "32193281534949"
+# ⛔ RE-PINNED A THIRD TIME 2026-10-30, DELIBERATELY, WITH THE DIFF CHECKED — and this one is an
+# ADDED BLOCK, not the rewrite the 2026-10-19 note describes. `5ae03cea` (#2898, 2026-10-27) added
+# the SINGLE-INSTANCE GUARD to `scripts/orchestrator-heartbeat.sh` (+232 lines, one hunk, at the top
+# of the file) and did NOT re-cut either pin here, so main went red on both. Verified when
+# re-pinning, rather than assumed: the diff of the MATCHED lines is `0a1,21` — 21 lines INSERTED at
+# the head of the sequence, 0 rewritten, 0 deleted, so no existing keyword line moved or changed;
+# the byte count half of the digest reconciles exactly (4949 → 5712, and the 763 added bytes are the
+# 21 added lines character for character); and the +83 executable lines are the same additive hunk,
+# not a change somewhere else (the commit's only other edit is a renumbered header comment). The
+# shipped egress is untouched by it: `send` token = 6, MSG reads outside the appends = 0, block
+# depth at the last MSG= = 25 and at the send = 24 — all pinned above and all unmoved.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "16972079405712"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 506
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 589
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
