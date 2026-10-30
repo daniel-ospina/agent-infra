@@ -26,6 +26,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRAINER="${DRAINER:-$HERE/ai-drainer.sh}"
 LAUNCHER="$HERE/multi-repo-controller.sh"
 [ -f "$DRAINER" ] || { echo "ai-drainer.test: no drainer at $DRAINER" >&2; exit 2; }
+# ⛔ THE PLATFORM IS PINNED, NOT INHERITED. The swap arm is a DIFFERENT GATE per platform (a `SwapFree`
+# floor on Linux, a kernel pressure level on Darwin), so an arm that let `uname -s` decide would test a
+# different gate on the operator's Mac than on a cell — and would read the LIVE box's pressure on the
+# way. Linux is the default because that is the branch every cell runs and the one the swap-floor arms
+# are about; the Darwin arms set `DRAINER_OS=Darwin` explicitly. An explicit value in the caller's env
+# still wins.
+DRAINER_OS="${DRAINER_OS:-Linux}"; export DRAINER_OS
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS + 1)); printf 'ok   %s\n' "$*"; }
@@ -90,6 +97,11 @@ chmod +x "$DISPATCH"
 #   RUN_MEM         available memory (MB) the formula sees        default 8192
 #   RUN_LOAD        1-min load ×100 the formula sees              default 100 (= 1.00)
 #   RUN_SWAP        free swap MB   ·  RUN_SWAP_TOTAL  total swap MB (0 = this box has NO swap)
+#   RUN_DRAINER_OS  the platform arm to exercise          default: Linux (the CELLS' arm, and the one
+#                   this suite's swap-floor arms are about). Set `Darwin` for the Darwin arm — the
+#                   seam exists so NO arm depends on the box it runs on, in either direction.
+#   RUN_PRESSURE    the Darwin `kern.memorystatus_vm_pressure_level` to assume (1|2|4|unreadable)
+#   RUN_MAX_PRESSURE  MAX_MEM_PRESSURE_LEVEL (the Darwin refuse-at threshold)
 #   RUN_WT_MOD      worker-terminal.sh for the launcher census     default: a path that does not exist
 _drainer_env() { # <tag> → echoes the env assignments, one per line (callers use `env`)
   local o="$ROOT/o-$1" ai="$ROOT/ai-$1"
@@ -99,6 +111,8 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
     "TARGET_LANES=${RUN_TARGET:-}" "MAX_LANES=${RUN_MAX_LANES:-}" \
     "NCPU=${RUN_NCPU:-4}" "MEM_AVAIL_MB=${RUN_MEM:-8192}" "LOAD1_100=${RUN_LOAD:-100}" \
     "SWAP_TOTAL_MB=${RUN_SWAP_TOTAL:-9999}" "SWAP_FREE_MB=${RUN_SWAP:-9999}" \
+    "DRAINER_OS=${RUN_DRAINER_OS:-Linux}" "MEM_PRESSURE_LEVEL=${RUN_PRESSURE:-}" \
+    "MAX_MEM_PRESSURE_LEVEL=${RUN_MAX_PRESSURE:-}" \
     "WT_MOD=${RUN_WT_MOD:-$ROOT/no-such-worker-terminal.sh}" \
     "LANE_TIMEOUT=${RUN_LANE_TIMEOUT:-60}" "PS=${RUN_PS:-ps}" \
     "SLICE_WIDTH=${RUN_SLICE_WIDTH:-10}" "SLICE_TOTAL=${RUN_SLICE_TOTAL:-70}" \
@@ -142,6 +156,7 @@ dispatched() { # <log> → the number of DISPATCHED lines (0 when the log does n
 reset_run() {
   RUN_TARGET=; RUN_MAX_LANES=; RUN_NCPU=; RUN_MEM=; RUN_LOAD=; RUN_SWAP=; RUN_SWAP_TOTAL=
   RUN_LANE_TIMEOUT=; RUN_SLICE_WIDTH=; RUN_SLICE_TOTAL=; RUN_RC_GRACE=; RUN_WT_MOD=; RUN_PS=
+  RUN_DRAINER_OS=; RUN_PRESSURE=; RUN_MAX_PRESSURE=
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
 }
 # A lane-shaped live process in $O/bg, so the CENSUS sees it. A pidfile alone is not enough (the
@@ -258,12 +273,91 @@ check "(e) …and the log NAMES the reading (swap=none, floor not applicable)" \
   'grep -q "swap=none (this box has no swap — the floor does not apply)" "$LAST_AI/logs/ai-drainer.log"'
 
 reset_run
-# ── (e2) SWAP THAT EXISTS AND IS BELOW THE FLOOR STILL REFUSES ──────────────────────────────
-RUN_TARGET=2 RUN_SWAP_TOTAL=4096 RUN_SWAP=100
+# ── (e2) SWAP THAT EXISTS AND IS BELOW THE FLOOR STILL REFUSES — **THE LINUX ARM** ──────────
+# This is the arm the floor is FOR, and it must survive: a Linux box has a fixed swap partition, where
+# `SwapFree` IS headroom. ⛔ IT RUNS THE **MEASURED** DARWIN NUMBERS ON PURPOSE (412MB of 3072MB, the
+# 2026-10-29 reading) so that it and (e2b) are a CONTROLLED PAIR: same fixtures, same target, and the
+# ONLY difference between the two runs is `DRAINER_OS`. A pair with different fixtures would not be
+# evidence that the PLATFORM is what moved the verdict — only that two unrelated arms disagree.
+RUN_DRAINER_OS=Linux RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
 run_drainer_fg e2
-check "(e2) swap 100MB of 4096MB < the 700MB floor → SKIP, exit 0, nothing dispatched" \
-  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "SKIP: swap 100MB < 700MB floor (of 4096MB)" "$LAST_AI/logs/ai-drainer.log"' \
+check "(e2) LINUX: the measured 412MB of 3072MB < the 700MB floor → SKIP, exit 0, nothing dispatched" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "SKIP: swap 412MB < 700MB floor (of 3072MB)" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep -E "SKIP|DISPATCHED" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (e2b) THE DARWIN ARM: A LOW FREE-SWAP FIGURE DOES NOT REFUSE (the measured false refusal) ─
+# MEASURED 2026-10-29 on the operator's Mac: `sysctl vm.swapusage` read
+# `total = 3072.00M used = 2659.94M free = 412.06M` while `kern.memorystatus_vm_pressure_level` read
+# **1 = normal** and `memory_pressure -Q` read **52%** free — and the OLD floor skipped every tick on
+# that reading. Darwin's `total` is the SUM of the swap FILES the kernel has grown so far (three 1 GiB
+# files, created 26 Oct 13:55, 26 Oct 14:28 and 28 Oct 19:29), so `free = total − used` is low because
+# the kernel GREW the file, not because the box cannot take a lane. (e2) and (e2b) run THESE SAME
+# NUMBERS at the same target, and the ONLY difference is `DRAINER_OS`.
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=1 RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
+run_drainer_fg e2b
+check "(e2b) DARWIN: free swap 412MB/3072MB with pressure=NORMAL dispatches (no swap floor)" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && ! grep -q "SKIP: swap" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC · $(grep -E "SKIP|START" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(e2b) …and it NAMES the Darwin reading instead of the floor" \
+  'grep -q "swap=412MB/3072MB (darwin: kernel-grown on demand, not a floor) pressure=normal" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (e2c) THE DARWIN ARM IS A GATE, NOT A DELETION — the kernel's verdict must still refuse ──
+# Removing a false refusal must not remove the refusal: a box the KERNEL says is critical takes no new
+# lane, however much free memory the arithmetic claims.
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=4 RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412 RUN_MEM=32768
+run_drainer_fg e2c
+check "(e2c) DARWIN: CRITICAL pressure refuses even with 32 GB free" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "SKIP: memory pressure critical" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC · $(grep -E "SKIP|START" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (e2d) THE THRESHOLD: the shipped default refuses at WARNING, and the seam moves it ───────
+# MAX_MEM_PRESSURE_LEVEL=2 (default) is "refuse at warning and above"; 4 is "only at critical".
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=2 RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
+run_drainer_fg e2d
+check "(e2d) DARWIN: WARNING at the default threshold (2) refuses" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "SKIP: memory pressure warning .* >= 2 " "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E "SKIP" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=2 RUN_MAX_PRESSURE=4 RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
+run_drainer_fg e2e
+check "(e2e) DARWIN: …and MAX_MEM_PRESSURE_LEVEL=4 lets that same WARNING through (seam honoured)" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ]' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+# An out-of-range threshold must not silently disable the arm, and the LOW end is the dangerous one: an
+# accepted `1` would be "refuse at NORMAL pressure", i.e. a permanently closed gate that exits 0 — the
+# exact latch this change removes. Both ends fall back to the shipped default and say so.
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=4 RUN_MAX_PRESSURE=9 RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
+run_drainer_fg e2f
+check "(e2f) DARWIN: MAX_MEM_PRESSURE_LEVEL=9 (above critical) is REFUSED as a value, not obeyed" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "MAX_MEM_PRESSURE_LEVEL=.9. is not a threshold this arm can refuse at" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E "WARN|SKIP" "$LAST_AI/logs/ai-drainer.log" | head -2 | tr '\n' ' ')"
+# ⛔ THE LOW END IS THE ONE THAT MATTERS: `1` is the kernel's NORMAL level, so accepting it would refuse
+# every box for ever while exiting 0. It must be rejected LOUDLY and the gate must still open.
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=1 RUN_MAX_PRESSURE=1 RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
+run_drainer_fg e2f2
+check "(e2f2) DARWIN: MAX_MEM_PRESSURE_LEVEL=1 is REJECTED (it would refuse every box) — the gate still opens" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -ge 1 ] && grep -q "MAX_MEM_PRESSURE_LEVEL=.1. is not a threshold this arm can refuse at" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log") · $(grep -E "WARN" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+# …and the same seam value on a box that IS critical must still refuse: rejecting the VALUE must not
+# have disabled the arm (the ordered reading: the value fell back to 2, the level did the refusing).
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=4 RUN_MAX_PRESSURE=1 RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
+run_drainer_fg e2f3
+check "(e2f3) DARWIN: …and a REJECTED threshold still leaves a CRITICAL box refused" \
+  '[ "$LAST_RC" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && grep -q "SKIP: memory pressure critical .* >= 2 " "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E "SKIP" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (e2g) THE DARWIN ARM FAILS CLOSED WHEN ITS SIGNAL IS UNREADABLE ─────────────────────────
+# A swap floor cannot stand in for the pressure level (that is the whole defect), so an unreadable
+# level is NOT a skip and NOT an OK: it fails the tick and names itself.
+RUN_DRAINER_OS=Darwin RUN_PRESSURE=unreadable RUN_TARGET=2 RUN_SWAP_TOTAL=3072 RUN_SWAP=412
+run_drainer_fg e2g
+check "(e2g) DARWIN: an unreadable pressure read FAILS the tick (no swap-floor fallback)" \
+  '[ "$LAST_RC" -ne 0 ] && grep -q "memory pressure could not be read on this Darwin box" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "DISPATCHED:" "$LAST_AI/logs/ai-drainer.log"' \
+  "rc=$LAST_RC · $(grep -E "FAIL" "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
 # ── (e3) AN UNREADABLE PROBE FAILS CLOSED ───────────────────────────────────────────────────
@@ -504,7 +598,8 @@ fi
 reset_run
 # ── ARM (o): A LIVE LANE'S WINDOW IS NEVER REUSED BY A LATER TICK ───────────────────────────
 # ⛔ THE DEFECT THIS ARM EXISTS FOR: the ring clamp bounds ONE tick's fan-out but not disjointness
-# ACROSS ticks. A lane keeps its window for up to LANE_TIMEOUT (3000s ≈ 2.5 ticks), so with target 3
+# ACROSS ticks. A lane keeps its window for up to LANE_TIMEOUT (the 7200s backstop ≈ 6 ticks at the
+# shipped 20 m cadence), so with target 3
 # and SLICE_TOTAL=30/SLICE_WIDTH=10 (3 windows), tick 2 walks the ring back to the offsets tick 1's
 # still-running lanes hold and hands them to NEW lanes — two lanes per window, two reviews per head.
 # ⛔ TARGET 6 ON A 3-WINDOW RING, ON PURPOSE: with target == 3 the second tick has nothing to add
