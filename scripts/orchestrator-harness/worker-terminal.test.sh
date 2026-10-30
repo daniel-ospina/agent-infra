@@ -1039,9 +1039,15 @@ if command -v perl >/dev/null 2>&1; then
   # PINNED, NOT JUST THE MESSAGE TEXT (review finding, 2026-10-30): the first version grepped prose that
   # is emitted regardless of the status, so reverting `exit 95` to `exit 98` — the exact P1 it was
   # supposed to guard — left the suite at 299/0.
-  grep -q 'exit 94; if command -v bash' "$LIB" && grep -q 'exit 95 ;; esac' "$LIB" \
+  # ⛔ EACH ENV-FILE ARM SEPARATELY (review finding, 2026-10-30): a single `grep -q 'exit 94; if
+  # command -v bash'` is satisfied by the `pi-keys.env` arm ALONE, so reverting the `keys.env` arm to 98
+  # — the exact mis-attribution this arm was written for, restored on the other half — stayed green.
+  # The count is pinned at 2 so a revert of EITHER arm reddens.
+  _94n="$(grep -c 'exit 94; if command -v bash' "$LIB")"
+  [ "$_94n" = "2" ] && grep -q 'exit 95 ;; esac' "$LIB" \
     && grep -q 'exit 93' "$LIB" && grep -q "exec @ARGV; exit 93" "$LIB" \
     && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
+  ck "…and BOTH env-file arms emit 94 (this arm's own count: $_94n) plus 93/95/98 above" $rc
   ck "…and the 93/94/95 arms really EXIT those codes (an env-file or model-key fault cannot pose as the gh one)" $rc
 fi
 # ⛔ AND THE GATE-SIDE PROBE IS BOUNDED TOO (recorded rule, README §"Two platform rules …": a plain

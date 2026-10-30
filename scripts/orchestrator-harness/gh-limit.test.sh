@@ -580,10 +580,13 @@ ck "single flight: … and that measurement really saw the probe (the leader's 4
 # credential read waited behind API traffic and the alarm fired first. The probe then REFUSED the
 # worker (rc=98) and no attestation was minted, i.e. 0 merges for 9 h on a controller that had
 # diagnosed the PRs correctly. Measured on the mac 2026-10-30: 4.1 s shim vs 0.009 s real binary.
-# The assertion is WALL TIME under 6 concurrent lock-holders (the stub sleeps 0.6 s per invocation):
-# with the lock, six `auth token` calls serialise into >= 3.6 s; without it they overlap and land in
-# well under a second. Both directions are measured — the CONTROL below re-pins that a request DOES
-# still serialise, so deleting the fast path is the only way this pair can both stay green.
+# ⛔ THE ASSERTION IS PEAK OVERLAP, NOT WALL TIME (corrected after review, 2026-10-30 — this header
+# used to describe a wall-clock bound the arm no longer carries): `max_inflight` is computed from the
+# stub's own `start|`/`end|` rows, so it is load-insensitive. The measured milliseconds are REPORTED in
+# the assertion text as evidence and are never asserted — the pre-fix floor is >= 3.6 s for six 0.6 s
+# holders, which is exactly why overlap (peak 6 vs peak 1) is the discriminator that cannot flake.
+# The CONTROLs below re-pin the other direction — API reads, `api rate_limit` and a help-looking flag
+# VALUE all still measure peak 1 — so deleting the fast path is the only way this pair stays green.
 reset_env coalesce
 : >"$STUB_LOG"
 _t0="$(date +%s%N)"
@@ -594,8 +597,8 @@ wait
 _t1="$(date +%s%N)"
 _tms=$(( (_t1 - _t0) / 1000000 ))
 # ⛔ THE DISCRIMINATOR IS `max_inflight`, NOT the wall clock: wall time on a loaded cell is the flake
-# surface (measured here 1.1 s post-fix against a 2.5 s bound, while the pre-fix floor is 3.6 s), and
-# the overlap the stub itself logs is load-insensitive. The measured milliseconds are still REPORTED.
+# surface, and the overlap the stub itself logs is load-insensitive. The measured milliseconds are
+# still REPORTED (never asserted).
 ck "no-request: 6 concurrent \`gh auth token\` calls do NOT queue on the box lock [${_tms}ms, peak $(max_inflight)]" \
    "$([ "$(max_inflight)" -gt 1 ] && echo 0 || echo 1)"
 ck "no-request: … and every caller still got its own answer (nothing swallowed) [$(( $(calls) ))]" \
