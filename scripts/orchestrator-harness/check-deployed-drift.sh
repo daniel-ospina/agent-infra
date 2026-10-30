@@ -822,7 +822,12 @@ if [ "$problems" -gt 0 ]; then
     # its own row and its own remedy ("a redeploy CREATES it") — is the more actionable of the two.
     # Measured: putting this arm first narrowed `incomplete:b.sh` to `source-dirty:<sha>` for a
     # dirty-source record with a missing file. Precedence, stated rather than implied:
-    # uncommitted-edit > behind/diverged > incomplete > source-dirty > surface > payload-differs.
+    # uncommitted-edit > behind/diverged > incomplete > source-dirty > (surface | payload-differs).
+    # ⛔ THE LAST TWO ARE ALTERNATIVES, NOT A CHAIN (review of #3090, on this PR's own comment): the
+    # `surface` arm below requires `Q_BYTES=0`, so a surface hit that coincides with `$O`'s own bytes
+    # differing falls through to `payload-differs`. A stated chain ending `surface > payload-differs`
+    # described an order the `if` below does not implement — the exact class of claim this PR exists
+    # to remove. The other-directory fact is carried by the report body's surface-hit line.
     HTOKEN="source-dirty:${HAS:0:12}"
   elif [ "$SURF_HIT" -eq 1 ] && [ "$Q_RECORD" -eq 0 ] && [ "$Q_IDENT" -eq 0 ] && [ "$Q_BYTES" -eq 0 ]; then
     # $O answered clean; the hit is in another harness dir this box carries. `payload-differs` would be
