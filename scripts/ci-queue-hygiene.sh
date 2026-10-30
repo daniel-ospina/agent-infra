@@ -156,7 +156,15 @@ for p in prs:
     if full and full.count("/") != 1:
         full = ""
     if not full or full == "/":
-        print("%s\tUNKEYABLE\t%d" % (br, num))
+        # ⛔ THE SENTINEL IS FIELD 1 — NEVER THE BRANCH (review P0). A key is `repo`+"/"+`branch`
+        # with NO escaping, so a branch literally named `<owner>/<repo>/<branch>` prints the SAME
+        # field 1 as another PR's key. Unkeyable rows are emitted BEFORE the keyed rows, and the
+        # lookup below takes the first match and exits — so an UNKEYABLE row written into the key
+        # column SHADOWS the real row, `pr_sha` becomes the literal "UNKEYABLE", every decision-table
+        # arm misses, and the run falls through to CANCEL. Measured on the pre-fix script: a run whose
+        # head WAS the open PR's head was cancelled. The branch goes to field 2, so this row can
+        # never occupy the key column.
+        print("__UNKEYABLE__\t%s\t%d" % (br, num))
         continue
     seen[(full, br)].add((sha, num))
 print("__COUNT__\t%d" % len(prs))
@@ -285,7 +293,7 @@ while IFS=$'\t' read -r id status branch sha created repo_full; do
   fi
   # ⛔ BEFORE the empty-lookup arm: an unkeyable PR row cannot yield a sha, so testing it later
   # would report "no open PR on this branch" while an open PR exists (round-3 finding D).
-  if awk -F'\t' -v b="$branch" '$1==b && $2=="UNKEYABLE"{found=1} END{exit !found}' "$work/prs.raw"; then
+  if awk -F'\t' -v b="$branch" '$1=="__UNKEYABLE__" && $2==b{found=1} END{exit !found}' "$work/prs.raw"; then
     kept_unknown=$((kept_unknown+1))
     printf '%s\tKEEP\tunkeyable-pr-head-repo(%s)\n' "$id" "$branch" >>"$work/decisions.tsv"; continue
   fi
@@ -294,10 +302,18 @@ while IFS=$'\t' read -r id status branch sha created repo_full; do
     kept_nopr=$((kept_nopr+1))
     printf '%s\tKEEP\tno-open-pr-on-branch(%s)\n' "$id" "$branch" >>"$work/decisions.tsv"; continue
   fi
-  if [ "$pr_sha" = "AMBIGUOUS" ]; then
-    kept_ambiguous=$((kept_ambiguous+1))
-    printf '%s\tKEEP\tambiguous-branch-two-open-prs(%s)\n' "$id" "$branch" >>"$work/decisions.tsv"; continue
-  fi
+  # ⛔ A SENTINEL IS NOT A SHA (review P0, belt and braces). The key-column fix above makes an
+  # UNKEYABLE row unreachable here, but "unreachable" is a claim about today's row shapes rather
+  # than a structural guard — and the failure direction of getting this wrong is cancelling live
+  # work, so a sentinel in the head column is refused explicitly instead of being compared.
+  case "$pr_sha" in
+    AMBIGUOUS)
+      kept_ambiguous=$((kept_ambiguous+1))
+      printf '%s\tKEEP\tambiguous-branch-two-open-prs(%s)\n' "$id" "$branch" >>"$work/decisions.tsv"; continue ;;
+    UNKEYABLE|__UNKEYABLE__)
+      kept_unknown=$((kept_unknown+1))
+      printf '%s\tKEEP\tunkeyable-pr-head-repo(%s)\n' "$id" "$branch" >>"$work/decisions.tsv"; continue ;;
+  esac
   if [ -z "$sha" ]; then
     kept_unresolved=$((kept_unresolved+1))
     printf '%s\tKEEP\tunknown-head(no head_sha on the run)\n' "$id" >>"$work/decisions.tsv"; continue

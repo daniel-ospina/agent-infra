@@ -106,7 +106,11 @@ run() {
         HOME="$WORK" /bin/bash "$SCRIPT" --repo o/r "$@" 2>&1)"; RC=$?
 }
 posts() { wc -l <"$WORK/posts" | tr -d ' '; }
-has()   { printf '%s' "$OUT" | grep -qF -- "$1"; }
+# ⛔ HERE-STRING, NEVER `printf … | grep -q` (#841/#864): `grep -q` exits at the first match while
+# `printf` is still writing, `printf` takes SIGPIPE (141), and under `pipefail` the pipeline returns
+# non-zero — so this assertion would report a string as MISSING when it is present, deciding the
+# suite's verdict by a race. In a negated call site it would silently PASS instead.
+has()   { grep -qF -- "$1" <<<"$OUT"; }
 
 echo "ci-queue-hygiene suite — $SCRIPT"
 
@@ -245,11 +249,16 @@ eq "posts" "$(posts)" 0
 has "INCOMPLETE" && ok "names incompleteness" || bad "incompleteness not named"
 
 echo "(f5b) the guard is symmetric: more rows read than the search total also aborts"
-fixture "o/r:feat/dead:hhh999o:feat/other:iii999" "721 feat/dead hhh001 3600"
+# ⛔ ONE QUOTED ARGUMENT HOLDS BOTH PRs (review P2). The old arm passed a SINGLE whitespace-free
+# token, so `item.split(":")` yielded 5 fields, the fixture python died with ValueError BEFORE
+# writing any file, `$WORK/fx` stayed empty, and the arm passed on an unrelated "could not read the
+# open-PR surfaces" exit 2 while printing a traceback — the `n > total` direction was untested.
+fixture "o/r:feat/dead:hhh999 o/r:feat/other:iii999" "721 feat/dead hhh001 3600"
 printf '1' >"$WORK/fx/search_total"
 run --apply
 eq "exit (fail-closed)" "$RC" 2
 eq "posts" "$(posts)" 0
+has "INCOMPLETE" && ok "symmetric guard names incompleteness (read > total)" || bad "symmetric guard did not name incompleteness: $(printf '%s' "$OUT" | grep FAIL-CLOSED)"
 
 echo "(f6) ⛔ an unreadable search total aborts the pass, naming the SEARCH surface"
 fixture "o/r:feat/dead:iii999" "730 feat/dead iii000 3600"
@@ -359,6 +368,18 @@ fixture "o/r/feat:x:head9" "150 x y 86400"
 run --apply
 eq "posts (3-segment repo)" "$(posts)" 0
 has "unkeyable-pr-head-repo(x)" && ok "3-segment name refused as unkeyable" || bad "3-segment name was keyed"
+
+echo "(a3h) ⛔ a UNKEYABLE branch that SPELLS another PR's key cannot shadow it (review P0)"
+# A key is `repo`+"/"+`branch` with no escaping. A fork PR whose branch is literally `o/r/feat`
+# and whose head repository cannot be named used to print `o/r/feat` into the KEY column, shadow the
+# real open PR `o/r`+`feat`, read the literal "UNKEYABLE" as that PR's head, and CANCEL a run whose
+# head was in fact that PR's current head. Measured on the pre-fix script: `cancelled 2001`.
+fixture ":o/r/feat:fff000 o/r:feat:aaa111" "2001 feat aaa111 3600"
+run --apply
+eq "posts (unkeyable-shadowed key)" "$(posts)" 0
+eq "exit (unkeyable-shadowed key)" "$RC" 0
+has "keep_current_head=1" && ok "the shadowed run is KEPT as the open PR's head" || bad "live head decided wrongly: $OUT"
+has "CANCEL 2001" && bad "a run at the open PR's head was CANCELLED" || ok "no CANCEL emitted for the live head"
 
 echo "(l2b) ⛔ other query separators are refused too (tab, paren)"
 for bad_repo in "o/r)is:open" "$(printf 'o/r\tis:closed')" "o/r/r" "o/" "/r"; do
