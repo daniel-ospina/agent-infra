@@ -281,6 +281,7 @@ drive_route() {
   # proves the block ACTED ON the guard rather than merely calling it — see the (2c) arms. Seeded here,
   # AFTER the `rm -rf`, so a wiping drive still starts with it.
   [ "${PL_LOCK_PIDLESS:-0}" = "1" ] && : > "$TMP/rO/state/mergeclaim-4242.lock"
+  [ -n "${PL_LOCK_DEAD:-}" ] && printf '%s\n' "$PL_LOCK_DEAD" > "$TMP/rO/state/mergeclaim-4242.lock"
   (
     PR=4242; BR=fix/thing; OR=daniel-ospina/agent-infra; REPO=/nonexistent
     O="$TMP/rO"; LOG="$TMP/d.log"; HEAD_N="${3:-}"
@@ -495,6 +496,12 @@ PL_LOCK_PIDLESS=1 ROUTE_PL_MOD=1 drive_route red-tree deadbeefdeadbeefdeadbeefde
 [ "$(spawns)" = "0" ] \
   && ok "(2c) a pid-less lock under PL_MOD=1 reads OWNED to the SHIPPED predicate, and the block ACTED on it: it suppressed instead of spawning on a claim mid-creation" \
   || bad "(2c) spawns=$(spawns) — the block did not act on the shipped guard's answer: with a pid-less lock the shipped arm 3 says OWNED and an inline \`claim_live\` says free, so a SPAWN means the answer was DISCARDED (a decorative call is not a decision)"
+( exit 0 ) & _dp=$!; sleep 0.5
+kill -0 "$_dp" 2>/dev/null && { echo "FATAL: probe pid $_dp is still alive"; exit 1; }
+PL_LOCK_DEAD="$_dp" ROUTE_PL_MOD=1 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
+[ "$(spawns)" = "1" ] && [ ! -f "$TMP/rO/state/mergeclaim-4242.lock" ] \
+  && ok "(2c-probe) a lock naming a PROVEN-DEAD pid RELEASES and is reaped, and the block spawns on it" \
+  || bad "(2c-probe) spawns=$(spawns) lock=$( [ -f "$TMP/rO/state/mergeclaim-4242.lock" ] && echo kept || echo gone ) — a dead-pid lock was NOT released (an inline lock-existence predicate suppresses forever)"
 ROUTE_PL_MOD=1 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
 [ "$(spawns)" = "1" ] \
   && ok "(2c) ...and with NO lock the same drive SPAWNS (pl_verdict RELEASES) — so the arm above grades the guard's ANSWER, not suppression in general" \
