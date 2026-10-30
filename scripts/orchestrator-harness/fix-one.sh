@@ -334,6 +334,39 @@ prlock_stale_owner() { # prints the pid and returns 0 ONLY when staleness is MEA
   kill -0 "$p" 2>/dev/null && return 1
   printf '%s\n' "$p"; return 0
 }
+# ⛔ AN ORPHANED RECORD NAMES NO PID, SO NEITHER LIVENESS TEST CAN EVER RESOLVE IT — AND THAT IS THE
+# DRAIN STALL. `prlock_live_owner` needs a pid > 0 that is alive, and `prlock_stale_owner` needs a pid
+# > 0 that is dead, so a record whose content is EMPTY is BOTH "not live" and "not stale": it falls
+# through `prlock_take` (the path exists, so the `ln` CAS refuses) into the "treated as LIVE" defer
+# below, and stays there FOREVER. Measured 2026-10-30 on the three Linux cells: 4 of cell-1's 5 records
+# and 4 of cell-4's 8 were 0-byte, unheld, and 1278-1286 / 2309-2314 MINUTES old, and every fixer that
+# touched those PRs bailed on that sentence; `orch-loop.sh` then REFUNDED the attempt
+# ("was not an attempt — budget refunded"), so the budget never parked them and the cycle re-spawned the
+# same no-op fixer forever. Those PRs could never be pushed or merged, so the un-owned count never fell,
+# so `merge-priority` held the ISSUE path shut — a controller that runs, logs loudly and yields no lane.
+# The empty state is REAL but INSTANT: `prlock_take` writes the pid to a private file and `ln`s it into
+# place precisely so the create and the content are one atomic step. A record that is STILL empty after
+# the create window has outlived the explanation, so AGE is the missing third measurement — the same
+# shape `prlock_stale_owner` uses (a measurement, not an inference), applied to the state it cannot see.
+# ⛔ The grace is bounded WELL ABOVE the window (microseconds) and WELL BELOW the observed ages (hours),
+# so an honest claim read mid-create is still treated as LIVE and never displaced.
+PRLOCK_NO_OWNER_GRACE_MIN="${PRLOCK_NO_OWNER_GRACE_MIN:-2}"
+prlock_no_owner_abandoned() { # returns 0 ONLY when the record names NO owner AND has outlived the create window
+  local p
+  [ -f "$PRLOCK" ] || return 1
+  [ -L "$PRLOCK" ] && return 1
+  p="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  # Empty, whitespace-only or 0 = no owner was ever written. A NON-numeric body is a different defect and
+  # stays out of this arm: only "nothing was ever written here" is provable from the content alone.
+  case "${p//[[:space:]]/}" in ''|0) : ;; *) return 1 ;; esac
+  # `find -mmin` is the ONE age primitive that is POSIX-shaped on both this box's GNU userland and the
+  # macOS harness hosts (GNU `stat -c` and BSD `stat -f` disagree), so the test is portable by construction.
+  [ -n "$(find "$PRLOCK" -maxdepth 0 -mmin +"$PRLOCK_NO_OWNER_GRACE_MIN" 2>/dev/null)" ] || return 1
+  # ⛔ NO SENTINEL ON STDOUT: the caller tests this function's EXIT STATUS (`elif ...; then`), and the
+  # takeover re-reads the live record itself, so a printed value would only leak a blank line into the
+  # cycle's stdout — the `prlock_stale_owner` sentinel is a COMMAND SUBSTITUTION and this one is not.
+  return 0
+}
 prlock_takeover() { # $1 = the pid we MEASURED stale; 0 = we own it · 1 = nothing displaced · 2 = a claim was LOST
   # ⛔ FOUR STEPS, AND EACH ONE IS A CAS OR A VERIFICATION. (1) the record must still be the pid we
   # measured — a re-read before the steal, so a peer that reclaimed while we were deciding is not
@@ -421,6 +454,18 @@ elif PL_STALE="$(prlock_stale_owner)"; then
     case $? in
       2) prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) named pid $PL_STALE (not alive), and a peer's claim that appeared while this lane was taking it over was DISPLACED AND COULD NOT BE RESTORED — the WARNING line above names that pid. Nothing was pushed by this lane; REPAIR: confirm no worker is live (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh') and re-run, and treat any worker that lost its claim as having lost it" ;;
       *) prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) named pid $PL_STALE, which is NOT alive (measured with kill -0), but the takeover LOST a race with a peer that reclaimed it first — this lane displaced nothing; the peer now holds it. REPAIR only if this repeats with NO live worker and nothing dispatching this PR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh'), then rm -f state/mergeclaim-$PR.lock" ;;
+    esac
+  fi
+elif prlock_no_owner_abandoned; then
+  # The record names no owner and is older than the create window: an abandoned claim, not a lander
+  # mid-claim. It goes through the SAME detach-verify-restore CAS as a dead-pid takeover (empty is the
+  # sentinel it re-reads), so a peer that claimed it in the meantime is still never displaced.
+  if prlock_takeover ""; then
+    echo "[fix $PR] PR-owner lock: RECLAIMED an ORPHANED claim — state/mergeclaim-$PR.lock held NO pid (empty record) and was older than ${PRLOCK_NO_OWNER_GRACE_MIN}m, so no create window explains it; this lane took the claim over instead of refusing the PR" >> "$L.log"
+  else
+    case $? in
+      2) prlock_defer "state/mergeclaim-$PR.lock held NO pid (empty) and outlived the create window, and a peer's claim that appeared while this lane was taking it over was DISPLACED AND COULD NOT BE RESTORED — the WARNING line above names that pid. Nothing was pushed by this lane; REPAIR: confirm no worker is live (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh') and re-run" ;;
+      *) prlock_defer "state/mergeclaim-$PR.lock held NO pid (empty) and outlived the create window, but the takeover LOST a race with a peer that reclaimed it first — this lane displaced nothing; the peer now holds it" ;;
     esac
   fi
 elif prlock_take; then
