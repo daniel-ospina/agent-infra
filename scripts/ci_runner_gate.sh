@@ -56,8 +56,9 @@
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act (fail-closed: changes nothing)
 #
 # OUTPUT A SCHEDULER CAN BRANCH ON: `$STATE_DIR/ci-runner-gate.verdict`, one `key=value` line per
-# run — `verdict=`, `capacity=`, the per-runner counts, `capability=`, `reason=` (last). The mode
-# file (`ci-runner-gate.state`) keeps its single-word shape, so existing readers are unaffected.
+# run — `verdict=`, `capacity=`, the per-runner counts, `capability=`, `held=`, `streak=`,
+# `engagement_lost=`, `reason=` (last). The mode file (`ci-runner-gate.state`) keeps its single-word
+# shape, so existing readers are unaffected.
 set -uo pipefail
 
 REPO="${CI_GATE_REPO:-daniel-ospina/tortoise}"
@@ -166,8 +167,20 @@ POOL_LABEL_X64="self-hosted-x64"
 # cannot be set or removed through it. They are the ONLY trustworthy statement of a runner's arch.
 HOST_LABEL_ARM64="ARM64"
 HOST_LABEL_X64="X64"
-# Never managed here: the scheduler's own automatic labels, and the one label this gate owns.
-AUTO_LABELS=" self-hosted Linux $FALLBACK_LABEL "
+# ⛔ THE READ-ONLY LABELS — ONE DEFINITION, USED BY *BOTH* SIDES OF THE VERIFY (review P2, #3060).
+# GitHub derives these from the host and re-adds them to every PUT, so they must never enter a body
+# this gate writes and must always be excluded from the observed set it compares against. Two copies
+# drifted apart: the OBSERVED set was filtered (`grep -v`) while the EXPECTED set, built from the body,
+# was not — and `labels_for` treated `macOS`/`Windows`/`ARM` as CUSTOM, so a managed macOS or Windows
+# runner emitted them into the body. The verify then compared `[macOS,self-hosted-arm64,ubuntu-latest]`
+# against `[self-hosted-arm64,ubuntu-latest]`, scored the write REJECTED, took the `relabel FAILED`
+# path (exit 2, state file untouched) and blamed the API for a write that had succeeded. Latent only
+# while the live pool is Linux-only; on a mixed pool it freezes the instrument in BOTH directions.
+READONLY_LABELS=" self-hosted Linux macOS Windows X64 ARM64 ARM "
+# Built FROM the list above, never written twice — an ERE for `grep -E`.
+READONLY_LABEL_RE="^($(printf '%s\n' $READONLY_LABELS | paste -sd'|' -))$"
+# Never managed here: every label GitHub owns (read-only) and the one label this gate owns.
+AUTO_LABELS="$READONLY_LABELS$FALLBACK_LABEL "
 
 # Set by `evaluate` for the reason line (a leg that fails must be NAMED, not just counted).
 UNHEALTHY_LEG=""
@@ -990,9 +1003,11 @@ set_labels() { # $1 = on|off
         local wid="${wantline%%=*}" wbody="${wantline#*=}" have wl expected
         have="$(printf '%s\n' "$after_rows" | awk -F'\t' -v i="$wid" '$1==i{print $2}' | tr '\n' ',')"
         # the body is a JSON label array; the host-owned labels the body deliberately omits are added
-        # back by GitHub, so compare only the labels the gate claims to write.
-        expected="$(printf '%s' "$wbody" | sed 's/^.*\[//; s/\].*$//' | tr ',' '\n' | tr -d '" ' | sort | tr '\n' ',')"
-        wl="$(printf '%s' "$have" | tr ',' '\n' | grep -v '^\(self-hosted\|Linux\|macOS\|Windows\|X64\|ARM64\|ARM\)$' | sort | tr '\n' ',')"
+        # back by GitHub, so compare only the labels the gate claims to write — the SAME read-only
+        # filter on BOTH sides (review P2: filtering only the observed side scored every managed
+        # macOS/Windows runner REJECTED on a write that succeeded).
+        expected="$(printf '%s' "$wbody" | sed 's/^.*\[//; s/\].*$//' | tr ',' '\n' | tr -d '" ' | grep -vE "$READONLY_LABEL_RE" | sort | tr '\n' ',')"
+        wl="$(printf '%s' "$have" | tr ',' '\n' | grep -vE "$READONLY_LABEL_RE" | sort | tr '\n' ',')"
         if [ "$expected" = "$wl" ]; then
           verified=$((verified+1))
         else
@@ -1302,9 +1317,10 @@ write_verdict() { # $1 = the verdict word (want); $2 held, $3 streak, $4 engagem
 }
 
 prev="$(cat "$STATE_FILE" 2>/dev/null || echo unknown)"
-# `carriers` is what the pool ADVERTISES right now (mode=local means at least one runner carries the
-# fallback label). It is re-measured on every pass, so a label that evaporated after a previous tick's
-# write is visible HERE and nowhere earlier.
+# `mode` is what the pool ADVERTISES right now (mode=local means at least one runner carries the
+# fallback label), re-read on EVERY pass by `current_mode` — so a label that evaporated after a
+# previous tick's write is visible here and nowhere earlier. (It is a measurement only when
+# `MODE_SOURCE=runners`; see the durability block below, which refuses to claim one otherwise.)
 DUR_FILE="$STATE_DIR/ci-runner-gate.engagement-durability"
 ENGAGEMENT_LOST=0
 

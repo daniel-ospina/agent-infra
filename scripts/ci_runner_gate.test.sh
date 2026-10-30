@@ -675,6 +675,21 @@ assert_contains "$OUT" "-> local" "(v4) …into local"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(v5) mode=local is written"
 # the POSITIVE CONTROL for the write itself: the API received a body carrying the label for each runner
 assert_contains "$(put_body_for 101)" "ubuntu-latest" "(v5) the API received the fallback label for runner 101"
+# ⛔ (v6) A READ-ONLY HOST LABEL IS NEITHER EMITTED NOR COMPARED (review P2). A managed macOS runner
+# really serves `self-hosted, ARM64, macOS, self-hosted-arm64`: GitHub owns `macOS` and re-adds it to
+# every PUT. `labels_for` treated it as a CUSTOM label and emitted it, while the verify filtered it out
+# of the OBSERVED side only — so `expected` carried `macOS`, `observed` did not, the write was scored
+# REJECTED, and `relabel FAILED` (exit 2, state file untouched) blamed the API for a write that
+# succeeded. On a mixed-arch pool that freezes the instrument in BOTH directions: engage never lands,
+# disengage never lands, and every pass reports a lie about the cause.
+MACROWS="$T/rows-macos.tsv"
+printf '101\tself-hosted\n101\tLinux\n101\tARM64\n101\tmacOS\n101\tself-hosted-arm64\n' > "$MACROWS"
+run_gate readonly-host GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 GH_RUNNER_ROWS_FILE="$MACROWS" --
+assert_eq "$RC" "0" "(v6) a read-only host label does not fail the pass (the write did succeed)"
+assert_contains "$OUT" "set_labels accepted=1 rejected=0" "(v6) the write is VERIFIED, not scored REJECTED"
+assert_not_contains "$(put_body_for 101)" "macOS" "(v6) the read-only label is never emitted into the body"
+assert_contains "$(put_body_for 101)" "self-hosted-arm64" "(v6) …while the label the gate DOES own is still written"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(v6) …and the transition is recorded"
 
 echo "── #3060 durability: the label evaporates 60-120s later, so the NEXT pass must catch it ──"
 # THE MEASURED DEFECT (VGATE P1). The writing pass re-reads milliseconds later and legitimately sees
@@ -696,6 +711,41 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d5) t
 KEEP_STATE=1
 run_gate dur GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 --
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=0" "(d6) a pass that finds the carrier present clears the flag"
+# ⛔ (d8) AND WHEN THE AGENT WIPES THE **RE-APPLY** TOO, THE GATE KEEPS MEASURING (#3060 review P2).
+# `(d6)` above is the recovery case: the carrier is back and the flag clears. It must not be the ONLY
+# modelled case, because #3060's own measurement is that the agent re-asserts its own set on every
+# runner with no local writer running — i.e. the re-apply is ALSO wiped 60-120 s later. Production then
+# looks like this: `state=local`, a PUT every pass, and `engagement_lost` climbing. Without this arm the
+# suite can only certify a convergence the mechanism it models may never deliver.
+run_gate dur-repeat GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d8) the engaging pass records local (its own engagement is then wiped)"
+KEEP_STATE=1
+run_gate dur-repeat GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_contains "$OUT" "ENGAGEMENT LOST" "(d8) the wipe is MEASURED, not assumed away"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=1" "(d8) the counter is 1 after the first loss"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d8) …and the pass re-applies rather than disengaging"
+KEEP_STATE=1
+# the RE-APPLY is wiped too (the drop is armed again on the pass above), so the next pass must report
+# a SECOND loss — this is the arm that distinguishes a recurring wipe from a one-off.
+run_gate dur-repeat GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_contains "$OUT" "ENGAGEMENT LOST" "(d8) a SECOND wipe is measured again, not accepted as a one-off"
+# `engagement_lost=` in the verdict is a FLAG (0/1), not the count — the durable recurrence lives in
+# `ci-runner-gate.engagement-durability`, so that is what "this keeps happening" must be read from.
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.engagement-durability" 2>/dev/null)" "2" \
+  "(d8) …the DURABLE counter ADVANCES, so a reader can see this is recurring"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=1" \
+  "(d8) …and this pass reports the loss it measured"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=0" \
+  "(d8) …a repeated wipe is never quietly cleared"
+KEEP_STATE=1
+run_gate dur-repeat GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_contains "$OUT" "ENGAGEMENT LOST" "(d8) the last armed wipe lands on this pass (the window is one pass long)"
+KEEP_STATE=1
+run_gate dur-repeat GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=0" \
+  "(d8) …and once the wiping STOPS the flag clears, so the counter is not monotonic by accident"
+KEEP_STATE=0
+
 # ⛔ (d7) AN INFERRED MODE IS NOT A MEASUREMENT OF THE POOL (#3060 review P2). The durability block
 # tests `mode`, and `mode` is not always a reading: when the inventory 403s the gate infers it from the
 # jobs endpoint (`MODE_SOURCE=jobs-inference`), and `mode_from_jobs` returning `github` is its NORMAL
