@@ -351,20 +351,28 @@ prlock_stale_owner() { # prints the pid and returns 0 ONLY when staleness is MEA
 # ⛔ The grace is bounded WELL ABOVE the window (microseconds) and WELL BELOW the observed ages (hours),
 # so an honest claim read mid-create is still treated as LIVE and never displaced.
 PRLOCK_NO_OWNER_GRACE_MIN="${PRLOCK_NO_OWNER_GRACE_MIN:-2}"
-prlock_no_owner_abandoned() { # returns 0 ONLY when the record names NO owner AND has outlived the create window
+prlock_no_owner_abandoned() { # prints the record's measured content; rc 0 ONLY when it names NO owner AND has outlived the create window
   local p
   [ -f "$PRLOCK" ] || return 1
   [ -L "$PRLOCK" ] && return 1
-  p="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  # ⛔ `cat`'s OWN exit status, never a `|| echo 0` fallback: an UNREADABLE record is not evidence of
+  # anything. The fallback turned it into the literal `0`, which the arm below ADMITS — so the caller
+  # passed "0" as the pid it had measured and the takeover re-read the file, got the same "0", and
+  # detached a record nobody had proven dead (review of #3096, P2).
+  p="$(cat "$PRLOCK" 2>/dev/null)" || return 1
   # Empty, whitespace-only or 0 = no owner was ever written. A NON-numeric body is a different defect and
   # stays out of this arm: only "nothing was ever written here" is provable from the content alone.
   case "${p//[[:space:]]/}" in ''|0) : ;; *) return 1 ;; esac
   # `find -mmin` is the ONE age primitive that is POSIX-shaped on both this box's GNU userland and the
   # macOS harness hosts (GNU `stat -c` and BSD `stat -f` disagree), so the test is portable by construction.
   [ -n "$(find "$PRLOCK" -maxdepth 0 -mmin +"$PRLOCK_NO_OWNER_GRACE_MIN" 2>/dev/null)" ] || return 1
-  # ⛔ NO SENTINEL ON STDOUT: the caller tests this function's EXIT STATUS (`elif ...; then`), and the
-  # takeover re-reads the live record itself, so a printed value would only leak a blank line into the
-  # cycle's stdout — the `prlock_stale_owner` sentinel is a COMMAND SUBSTITUTION and this one is not.
+  # ⛔ IT PRINTS THE CONTENT IT MEASURED, AND THE CALLER MUST PASS IT BACK TO `prlock_takeover` (review of
+  # #3096, P2). The takeover's first CAS compares the record on disk against the value it was given;
+  # called with a hard-coded `""` it matched ONLY a 0-byte record, so a whitespace-only or `0` body — both
+  # admitted above — failed that compare and the arm deferred with "the takeover LOST a race with a peer
+  # that reclaimed it first", a race that never happened and a claim about a process with no artifact
+  # behind it. Printing what was measured is what makes the compare meaningful.
+  printf '%s\n' "$p"
   return 0
 }
 prlock_takeover() { # $1 = the pid we MEASURED stale; 0 = we own it · 1 = nothing displaced · 2 = a claim was LOST
@@ -456,11 +464,12 @@ elif PL_STALE="$(prlock_stale_owner)"; then
       *) prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) named pid $PL_STALE, which is NOT alive (measured with kill -0), but the takeover LOST a race with a peer that reclaimed it first — this lane displaced nothing; the peer now holds it. REPAIR only if this repeats with NO live worker and nothing dispatching this PR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh'), then rm -f state/mergeclaim-$PR.lock" ;;
     esac
   fi
-elif prlock_no_owner_abandoned; then
+elif PL_ORPHAN="$(prlock_no_owner_abandoned)"; then
   # The record names no owner and is older than the create window: an abandoned claim, not a lander
-  # mid-claim. It goes through the SAME detach-verify-restore CAS as a dead-pid takeover (empty is the
-  # sentinel it re-reads), so a peer that claimed it in the meantime is still never displaced.
-  if prlock_takeover ""; then
+  # mid-claim. It goes through the SAME detach-verify-restore CAS as a dead-pid takeover, handed the
+  # exact content that was MEASURED — an empty string matches only a 0-byte record, so the whitespace/`0`
+  # shapes this arm admits would fail the takeover's first CAS and mis-report a peer race (review P2).
+  if prlock_takeover "$PL_ORPHAN"; then
     echo "[fix $PR] PR-owner lock: RECLAIMED an ORPHANED claim — state/mergeclaim-$PR.lock held NO pid (empty record) and was older than ${PRLOCK_NO_OWNER_GRACE_MIN}m, so no create window explains it; this lane took the claim over instead of refusing the PR" >> "$L.log"
   else
     case $? in
