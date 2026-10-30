@@ -685,6 +685,10 @@ WIP_SNAPSHOT_KEEP=10   # newest N snapshot directories kept. Bounded ON PURPOSE:
 WIP_SNAPSHOT_DIR=""    # set by cap_wip_snapshot(); the caller (a launcher) publishes it
 WIP_SNAPSHOT_RESULT=""
 AGENT_CAP_HIT=0        # like AGENT_STARTED: a callers' signal, never an inference from an exit code
+# ⛔ WHICH BOUND ENDED IT (#2888 review, P2-5): the wall the watchdog actually armed, or the elapsed
+# time at which the PROGRESS rule fired. Empty until a bound ends a lane, and reset at arm time by
+# `run_agent` so a caller reusing this shell can never read a previous lane's bound.
+AGENT_CAP_BOUND=""
 
 # cap_wip_record <label> <cap> <elapsed> <rc> <result> <dir> — ONE append-only row per cap kill.
 # ⛔ ON EVERY RETURN PATH, INCLUDING THE ONES THAT WRITE NO DIRECTORY (review finding, P2). The row
@@ -2062,16 +2066,37 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ⛔ `LANE_BOUND_WALL_S` IS CONSULTED HERE, BECAUSE OTHERWISE IT IS AN INERT KNOB (agent-infra#2888).
   # lane-bound resolves flag → env → default, so `--wall "$t"` always being passed made its own
   # documented env seam unreachable on every path that goes through `run_agent` — an operator setting
-  # it would have changed nothing, which is the "knob that does nothing" shape. When it is set it WINS
-  # (an operator escape outranks a caller's default) and the override is named in the log, so the
-  # bound that ran and the bound that was reported cannot silently disagree.
+  # it would have changed nothing, which is the "knob that does nothing" shape.
+  # ⛔ BUT IT MAY ONLY **TIGHTEN** (agent-infra#2999 review, F1/P2-2), for two independent reasons:
+  #   * A LANE MAY NOT OUTLIVE THE BOUND ITS LEASE WAS DERIVED FROM. Every caller sizes its cross-box
+  #     claim lease from the `$t` it passes here (`fix-one.sh` FIX_LEASE = FIX_BOUND + 1200;
+  #     `merge-one.sh` CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300), and nothing re-derives from this env
+  #     seam. An override ABOVE `$t` (README presents the knob for exactly that) would run the lane past
+  #     its own claim, a peer would read the head as free and run a SECOND lane on it — the duplicate
+  #     dispatch #2888 removed from fix-one, re-introduced on the new path.
+  #   * `0` MUST NOT DISARM EVERY LANE'S BACKSTOP. A bare `0`/`0*` is a TYPO, exactly as it is for
+  #     `LANE_BACKSTOP_S` two contexts away ("a typo must never silently disarm it"); before this
+  #     change the knob was inert, so this change is what made it reachable. `--wall 0` from a CALLER
+  #     remains the explicit, per-caller off switch.
+  # Both refusals are LOUD in the lane log — the bound that ran and the bound reported must never
+  # silently disagree.
   AGENT_BOUND_VERDICT=""
+  AGENT_CAP_BOUND=""
   rm -f "$log.lanebound" 2>/dev/null || true
   _lb_wall="$t"
   case "${LANE_BOUND_WALL_S:-}" in
-    ''|*[!0-9]*) : ;;
-    *) _lb_wall="$LANE_BOUND_WALL_S"
-       echo "[lane-bound] NOTE $label: backstop OVERRIDDEN by LANE_BOUND_WALL_S=$_lb_wall (caller asked for ${t}s) — the PROGRESS allowance is unchanged (agent-infra#2888)" >> "$log" ;;
+    '') : ;;
+    0*)
+       echo "[lane-bound] WARN $label: LANE_BOUND_WALL_S=${LANE_BOUND_WALL_S} is treated as a TYPO, not an off switch — a bare 0 must never disarm the backstop of every lane on the box; the caller asked for ${t}s (agent-infra#2888). Pass '--wall 0' from a caller to disable ONE axis deliberately." >> "$log" ;;
+    *[!0-9]*)
+       echo "[lane-bound] WARN $label: LANE_BOUND_WALL_S='${LANE_BOUND_WALL_S}' is not a whole number — IGNORED, so the caller's ${t}s bound stands (agent-infra#2888)" >> "$log" ;;
+    *)
+       if [ "$LANE_BOUND_WALL_S" -gt "$t" ]; then
+         echo "[lane-bound] WARN $label: LANE_BOUND_WALL_S=${LANE_BOUND_WALL_S}s is ABOVE the caller's own bound (${t}s) and is CLAMPED to it: a lane may not outlive the bound its claim lease was derived from, or a peer reads the head as free and runs a SECOND lane on it (agent-infra#2888 review F1). Raise the CALLER's knob (LANE_TIMEOUT / FIX_TIMEOUT / REVIEW_TIMEOUT, or LANE_BACKSTOP_S) to extend a lane — that re-derives the lease too." >> "$log"
+       else
+         _lb_wall="$LANE_BOUND_WALL_S"
+         echo "[lane-bound] NOTE $label: backstop OVERRIDDEN by LANE_BOUND_WALL_S=$_lb_wall (caller asked for ${t}s) — TIGHTENED; the PROGRESS allowance is unchanged (agent-infra#2888)" >> "$log"
+       fi ;;
   esac
   _lb_sh="$(lane_bound_path)"
   if [ -n "$_lb_sh" ]; then
@@ -2172,6 +2197,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   fi
   if [ -n "$AGENT_BOUND_VERDICT" ] || { [ "$_lb_wall" -ge 1 ] && [ "$elapsed" -ge "$_lb_wall" ]; }; then
     AGENT_CAP_HIT=1
+    # ⛔ THE KILLING BOUND IS A CALLER SIGNAL TOO (agent-infra#2999 review, P2-5). `AGENT_CAP_HIT` now
+    # fires on a PROGRESS kill (~45 min, verdict=stalled) as well as on the wall, so a worker's `.cap`
+    # marker that restated its own `$T` published a false statement about WHICH bound ended it — the
+    # same defect class this change fixed in `[timeout]` and `walltime.tsv`. `_cap_bound` is that
+    # bound; a caller that cannot see it can only guess.
+    AGENT_CAP_BOUND="$_cap_bound"
     cap_wip_snapshot "$label" "$_cap_bound" "$elapsed" "$rc" "$log" || true
   fi
   # ── THE EXIT PATH (#2834) — the COMMONER termination, and until now the uncovered one ──────
