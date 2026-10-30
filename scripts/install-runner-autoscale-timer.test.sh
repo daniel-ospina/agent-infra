@@ -4,7 +4,7 @@
 #
 # Run: bash scripts/install-runner-autoscale-timer.test.sh   (exits 0 when every assertion passes)
 #
-# What each case proves — T0 to T14, and why each one exists — is in docs/ops/runner-autoscale.md
+# What each case proves — T0 onwards, and why each one exists — is in docs/ops/runner-autoscale.md
 # under the heading: the self-check, case by case. It is kept OUT of this file on purpose: the
 # working-tree guard tokenises a script text, and a prose header ahead of the code glues lines
 # together until the body reads as an unverifiable heredoc, so the suite cannot be executed at all
@@ -18,6 +18,17 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 INST="$HERE/install-runner-autoscale-timer.sh"
+# ⛔ `sed -i` IS NOT PORTABLE, AND THIS SUITE MUTATES A RENDERED ARTIFACT IN TEN PLACES TO SET UP THE
+# CASES THAT CAN ONLY BE VALIDATED ON A MAC. The repo owns this hazard and pins it (`lib/box.sh`'s own
+# header, and `lib/box.test.sh`'s darwin arm asserting the GNU spelling is SILENT there: no edit, exit
+# 0). Hand-rolling it here made the suite a false RED on the one platform it exists to validate — the
+# mutation did nothing, the artifact stayed healthy, `--status` correctly exited 0, and the case then
+# failed its own `assert_eq "$RC" 1`. The installer beside it already uses a portable form, so the two
+# files disagreed about the same platform. Every mutation below goes through the shim.
+BOX="$HERE/lib/box.sh"
+[ -f "$BOX" ] || { echo "missing $BOX — the portability shim this suite's mutations depend on"; exit 1; }
+# shellcheck source=scripts/lib/box.sh
+. "$BOX"
 UNIT_NAME="eldato-runner-autoscale"
 LABEL="com.eldato.runner-autoscale"
 PASS=0
@@ -519,7 +530,7 @@ assert_eq "$RC" 0 "the same '%' path is ACCEPTED on the launchd arm (a plist str
 say_case "T18 --status reports a missing interpreter, not a healthy schedule"
 D="$T/c18"; fresh "$D"
 run_install Linux "$D" --install >/dev/null 2>&1
-sed -i 's|^ExecStart="[^"]*"|ExecStart="/nonexistent/python9.99"|' "$D/$UNIT_NAME.service"
+box_sed_i 's|^ExecStart="[^"]*"|ExecStart="/nonexistent/python9.99"|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "--status exits 1 when the artifact's interpreter is gone (203/EXEC every tick)"
 assert_contains "$OUT" "python_present=no" "it reports the interpreter it could not find"
@@ -533,7 +544,7 @@ say_case "T19 --status reports an unrecognised mode argument (the inert-artifact
 D="$T/c19"; fresh "$D"
 rm -f "$ARM"                                       # a record would render ARMED, with no flag to find
 run_install Linux "$D" --install >/dev/null 2>&1
-sed -i '/^ExecStart=/ s|$| --apply|' "$D/$UNIT_NAME.service"   # the measured pi-cell-1 defect
+box_sed_i '/^ExecStart=/ s|$| --apply|' "$D/$UNIT_NAME.service"   # the measured pi-cell-1 defect
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "--status exits 1 for an artifact the converger would reject on every tick"
 assert_contains "$OUT" "--apply" "it names the argument it found"
@@ -664,12 +675,13 @@ say_case "T25 --status accepts --want/--json/--root/--status, and still reds an 
 D="$T/c25"; fresh "$D"
 rm -f "$ARM"
 run_install Linux "$D" --install >/dev/null 2>&1
-sed -i '/^ExecStart=/ s|$| --want 3 --json|' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --want 3 --json|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 0 "a real switch is not reported as a broken schedule"
 assert_contains "$OUT" "mode=--dry-run (DISARMED" "and the mode is still read correctly"
 assert_not_contains "$OUT" "did not render" "no invented-argument complaint"
-sed -i '/^ExecStart=/ s| --want 3 --json||; /^ExecStart=/ s|$| --apply|' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s| --want 3 --json||' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --apply|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "an invented flag is still red"
 assert_contains "$OUT" "did not render" "and is named as such"
@@ -683,15 +695,17 @@ say_case "T26 an absolute --root value does not swallow the next argument"
 D="$T/c26"; fresh "$D"; rm -f "$ARM"
 run_install Linux "$D" --install >/dev/null 2>&1
 run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1        # armed = no mode argument
-sed -i '/^ExecStart=/ s|$| --root /opt --apply|' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --root /opt --apply|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "--root /opt --apply is reported as broken (the pass exits 2 on --apply)"
 assert_contains "$OUT" "--apply" "and the invented flag is the one named"
-sed -i '/^ExecStart=/ s| --root /opt --apply||; /^ExecStart=/ s|$| --root /opt/x --dry-run|' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s| --root /opt --apply||' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --root /opt/x --dry-run|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 0 "a disarmed unit with an absolute --root is not a broken schedule"
 assert_contains "$OUT" "DISARMED" "and its mode is read correctly (not ARMED)"
-sed -i '/^ExecStart=/ s| --root /opt/x --dry-run||; /^ExecStart=/ s|$| --dry-run --want|' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s| --root /opt/x --dry-run||' "$D/$UNIT_NAME.service"
+box_sed_i '/^ExecStart=/ s|$| --dry-run --want|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "a value-taking switch with NO value is refused (--want alone exits 2)"
 assert_contains "$OUT" "--want" "naming the dangling switch"
@@ -699,11 +713,12 @@ assert_contains "$OUT" "--want" "naming the dangling switch"
 # argument"), and swallowing the flag as the value reported ARMED exit 0 for a schedule that fails
 # every tick.
 for pair in "--want --json" "--root --dry-run"; do
-    sed -i '/^ExecStart=/ s| --dry-run --want||; /^ExecStart=/ s|$| '"$pair"'|' "$D/$UNIT_NAME.service"
+    box_sed_i '/^ExecStart=/ s| --dry-run --want||' "$D/$UNIT_NAME.service"
+    box_sed_i '/^ExecStart=/ s|$| '"$pair"'|' "$D/$UNIT_NAME.service"
     OUT="$(run_install Linux "$D" --status)"; RC=$?
     assert_eq "$RC" 1 "'$pair' is refused (the flag after it is not its value)"
     assert_contains "$OUT" "${pair%% *}" "naming the dangling switch"
-    sed -i "/^ExecStart=/ s| $pair||" "$D/$UNIT_NAME.service"
+    box_sed_i "/^ExecStart=/ s| $pair||" "$D/$UNIT_NAME.service"
 done
 
 # ── T27: the script is TOKEN 2, not "the argument ending in .py" ─────────────────────────
@@ -857,7 +872,7 @@ OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 0 "control: the freshly installed artifact's interpreter is green"
 printf '#!/usr/bin/env bash\ncase "$1" in -c) echo 3.11 ;; *) exit 0 ;; esac\n' >"$T/bin/oldpy"
 chmod +x "$T/bin/oldpy"
-sed -i "s|^ExecStart=\"[^\"]*\"|ExecStart=\"$T/bin/oldpy\"|" "$D/$UNIT_NAME.service"
+box_sed_i "s|^ExecStart=\"[^\"]*\"|ExecStart=\"$T/bin/oldpy\"|" "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "an old-but-present interpreter is NOT a green schedule"
 assert_contains "$OUT" "python_present=yes" "it is present — that is the whole point"
@@ -1050,6 +1065,63 @@ assert_contains "$OUT" "no scheduled converger in THIS scope" "and the claim sta
 assert_absent "$OUT" "this box has NO scheduled converger" "the false box-level claim is gone"
 rm -rf "$T/scopes/status-other"
 rm -rf "$T/home/.config"; rm -f "$ARM"
+
+# ── T40: a SECOND ExecStart= in the BASE file — Type=oneshot runs every one of them ──────
+# The read-back took `tail -1`, described as "the one systemd runs". That is true of the default
+# `Type=simple` and FALSE of the `Type=oneshot` this template renders, where systemd.service(5) permits
+# several ExecStart= and runs them IN SEQUENCE. So a hand-edited base file read as ARMED from the last
+# line while the FIRST command was a foreign binary — `drift_artifact=yes` is advisory (rc unchanged), so
+# `--status` certified it green. The drop-in arm cannot see this: the multiplicity is in the base file.
+say_case "T40 a second ExecStart= in the base unit is not a schedule --status certifies"
+D="$T/c40"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: the freshly installed unit carries exactly one ExecStart= and is green"
+assert_absent "$OUT" "exec_start_count=" "and the count line is not printed when there is nothing to report"
+# Append the second command a hand-edit would leave behind. `exec_start_count` reads the BASE file, so
+# this must be reported even though the last line is still the managed command.
+printf 'ExecStart="/usr/local/bin/old-converger"\n' >>"$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a base unit with TWO ExecStart= is NOT a green schedule"
+assert_contains "$OUT" "exec_start_count=2" "naming how many commands systemd would actually run"
+assert_contains "$OUT" "IN SEQUENCE" "and naming the consequence, not just the count"
+# ⛔ AND THE ARM-TIME VERIFIER REFUSES IT TOO — reached the way it really happens. `--arm` re-renders the
+# unit, so a hand-edit is normally CONVERGED AWAY (which is correct, and is why the naive case above
+# cannot reach `verify_installed_unit`). The reachable route is the one `unit_exec_line`'s own comment
+# names as MEASURED: `install(1)` can leave a pre-existing file in place on some failures while the
+# installer still reports success. So the install step is stubbed to change nothing, the render succeeds,
+# and the artifact the verifier reads is still the two-command one. Without the count guard the unit arms.
+STUBI="$T/stub-c40"; mkdir -p "$STUBI"
+# `override` copies with `cp -f`, `user`/`system` write with `install` — both are stubbed, because the
+# hazard is that EITHER reports success over a file it did not replace.
+printf '#!/bin/sh\nexit 0\n' >"$STUBI/install"; chmod +x "$STUBI/install"
+printf '#!/bin/sh\nexit 0\n' >"$STUBI/cp"; chmod +x "$STUBI/cp"
+rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+printf 'ExecStart="/usr/local/bin/old-converger"\n' >>"$D/$UNIT_NAME.service"
+ENVV=(PATH="$STUBI:$PATH")     # the write step becomes a no-op that reports success
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?
+ENVV=()
+assert_eq "$RC" 1 "--arm REFUSES when the artifact it would attest carries more than one ExecStart="
+# ⛔ ASSERT THE GUARD'S OWN TEXT, not the word REFUSING: a stub that breaks the render would also exit 1,
+# and "it refused" would then be satisfied by a refusal of something else entirely.
+assert_contains "$OUT" "IN SEQUENCE" "and the refusal names the oneshot multiplicity it found"
+assert_nofile "$ARM" "with no arming record written"
+rm -f "$ARM" "$STUBI/install" "$STUBI/cp"
+
+# ── T41: this suite does not hand-roll `sed -i` — the macOS false-RED class ────────────
+# On BSD sed the GNU spelling consumes the script as the backup suffix and edits NOTHING while reporting
+# success, so every mutation in this file would be a silent no-op on the platform the Darwin arm exists
+# to validate: the artifact stays healthy, `--status` correctly exits 0, and the case fails its own
+# `assert_eq "$RC" 1`. `lib/box.sh` owns this hazard (box_sed_i) and `lib/box.test.sh`'s darwin arm pins
+# it as live. This asserts the suite keeps using the shim rather than re-deriving the hazard.
+say_case "T41 the suite mutates artifacts through box_sed_i, never a hand-rolled sed -i"
+# Match only a real INVOCATION — `sed -i` at the start of a line after optional indentation. A prose
+# mention (this case's own title, the comment above) is not a call, and a guard that counts those reds
+# itself. Comments are excluded structurally rather than by a `#` test on the matched text.
+bare="$(grep -nE '^[[:space:]]*sed[[:space:]]+-i' "$HERE/install-runner-autoscale-timer.test.sh" || true)"
+assert_eq "$bare" "" "no bare sed -i invocation (it is silent on BSD and edits nothing)"
+assert_eq "$(command -v box_sed_i >/dev/null 2>&1 && echo yes)" "yes" "and the shim is really loaded, so the guard is not vacuous"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

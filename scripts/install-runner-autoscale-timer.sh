@@ -744,9 +744,25 @@ choose_target() {
 # place on some failures while the installer still reports success. MEASURED (2026-10-18): the installed
 # unit executed a path from a deleted mktemp tree and exited 127 every hour while `list-timers` showed
 # it healthy. So the artifact is read back BEFORE the clock is armed.
-unit_exec_line() { # unit_exec_line <file> — the last ExecStart= (the one systemd runs), normalised
+unit_exec_line() { # unit_exec_line <file> — the LAST ExecStart=, normalised
     sed -E 's/^[[:space:]]+//' "$1" 2>/dev/null \
         | sed -n 's/^ExecStart[[:space:]]*=[[:space:]]*//p' | tail -1
+}
+
+# ⛔ `tail -1` ANSWERS ABOUT ONE COMMAND, AND THIS UNIT RUNS ALL OF THEM. The read-back above used to
+# carry the comment "the one systemd runs" — true for the default `Type=simple`, and FALSE for the
+# `Type=oneshot` this template renders: systemd.service(5) permits SEVERAL `ExecStart=` for oneshot and
+# runs them SEQUENTIALLY. So a base file an operator hand-edited to try something (this file IS ordinary
+# text, and that is the case the read-back exists for) carrying
+#     ExecStart="<interp>" "<script>"        <- what the installer wrote
+#     ExecStart="/usr/local/bin/old-converger" <- appended by hand
+# read as ARMED from the last line alone, `drift_artifact=yes` was advisory only (rc unchanged), and
+# `--status` exited 0 certifying a schedule whose FIRST command is a foreign binary. The drop-in arm
+# cannot see this: the multiplicity is in the BASE file, which is exactly the class no reader here could
+# reach. Both the arm-time verifier and the readiness verb require exactly one, below.
+unit_exec_count() { # how many ExecStart= assignments the BASE file carries (a bare reset counts: it clears the list)
+    sed -E 's/^[[:space:]]+//' "$1" 2>/dev/null \
+        | sed -n 's/^ExecStart[[:space:]]*=.*/x/p' | wc -l | tr -d ' '
 }
 
 unit_dropin_execfiles() { # .conf drop-ins that would override ExecStart, one path per line
@@ -811,6 +827,14 @@ verify_installed_unit() { # verify the ARTIFACT at $UNIT_DIR, not the bytes we h
     dropins="$(unit_dropin_timerfiles)"
     [ -z "$dropins" ] || {
         err "REFUSING: this timer has a DROP-IN that overrides the cadence this installer wrote, so the schedule it would verify is not the schedule systemd runs: $(printf '%s ' $dropins). Remove it (or move its content into the template) and re-install."
+        return 1
+    }
+    # ⛔ EXACTLY ONE, BECAUSE Type=oneshot RUNS THEM ALL (see `unit_exec_count`). Checked before the mode
+    # read below, so an armed install over a two-command base cannot verify as armed while two run.
+    local exec_count
+    exec_count="$(unit_exec_count "$svc")"
+    [ "$exec_count" = "1" ] || {
+        err "REFUSING to arm: the installed $svc carries $exec_count ExecStart= directives. This unit is Type=oneshot, and systemd runs EVERY ExecStart= of a oneshot unit IN SEQUENCE — so the mode verified here would not be the only mode the scheduler runs. Leave exactly the one ExecStart= this installer renders, then re-install."
         return 1
     }
     line="$(unit_exec_line "$svc")"
@@ -1201,6 +1225,21 @@ do_arm() {
             err "  Remove that drop-in (or move its content into the template) and re-run --arm. Nothing was armed."
             return 1
         }
+        # ⛔ AND THE BASE FILE'S MULTIPLICITY, FOR THE SAME REASON: this is a fact about the artifact on
+        # disk, so it belongs AHEAD of the first write. Checked only in the post-render verifier it left an
+        # arming record behind for a box whose artifact had already been refused — the operator is then
+        # 'ARMED' with no working schedule, which is the state this whole installer exists to remove.
+        # ⛔ ONLY WHEN AN ARTIFACT EXISTS: `--arm` on a box that was never installed is the legitimate
+        # first install (the render creates the file, and the post-render verifier reads it back). A miss
+        # here is "nothing to judge yet", which is not the same as "zero commands", and refusing it would
+        # break the fresh-box arm path that T16 exercises.
+        if [ -f "$UNIT_DIR/$UNIT_NAME.service" ]; then
+            dp="$(unit_exec_count "$UNIT_DIR/$UNIT_NAME.service")"
+            [ "$dp" = "1" ] || {
+                err "REFUSING to arm: the installed unit carries $dp ExecStart= directives. It is Type=oneshot, so systemd runs ALL of them IN SEQUENCE and the mode this would attest is the last command only. Leave exactly one ExecStart= (re-run --install to converge it) and re-run --arm. Nothing was armed."
+                return 1
+            }
+        fi
     fi
     if arm_record_valid; then
         log_line "  runner-autoscale: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p' "$ARM_FILE")"
@@ -1374,7 +1413,7 @@ sha_of() { # sha_of <file> — portable digest
 
 do_status() {
     local installed_mode installed_script drift_artifact enabled active next last linger
-    local installed_args installed_rest installed_kind installed_dropins installed_timer_dropins
+    local installed_args installed_rest installed_kind installed_dropins installed_timer_dropins installed_exec_count
     local drift_service drift_timer
     local rc=0 installed_path
     # ⛔ `--status` IS THE FIFTH READER OF THE SAME RECORD, AND IT WAS THE ONE VERB THAT SKIPPED THIS
@@ -1437,6 +1476,17 @@ do_status() {
         installed_args="$(plist_program_args "$installed_path")"
     else
         installed_args="$(unit_exec_line "$installed_path" | tr ' ' '\n' | tr -d '"')"
+        # ⛔ THE MULTIPLICITY IS IN THE BASE FILE, AND Type=oneshot RUNS EVERY ONE OF THEM. The read above
+        # answers about the LAST ExecStart=; for this `Type=oneshot` unit that is not "the command systemd
+        # runs" but "one of them". A base file a hand-edit left carrying two read as ARMED from the last
+        # line, `drift_artifact=yes` is advisory (rc unchanged), and this verb exited 0 over a schedule
+        # whose FIRST command was a foreign binary. Reported here, where the mode is certified.
+        installed_exec_count="$(unit_exec_count "$installed_path")"
+        if [ "$installed_exec_count" != "1" ]; then
+            log_line "exec_start_count=$installed_exec_count"
+            err "the installed unit carries $installed_exec_count ExecStart= directives. It is Type=oneshot, so systemd runs ALL of them IN SEQUENCE — the mode reported above is the LAST command only, not the whole schedule. Leave exactly the one ExecStart= this installer renders, then re-install."
+            rc=1
+        fi
     fi
     # Drop the leading interpreter + script, then the `--repo <value>` pair (that is configuration, not
     # a mode), and what remains is the mode the pass is actually invoked with.
