@@ -108,8 +108,17 @@ ck "rc is 0 again" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 
 echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
-ck "run-bash-shards.sh carries this suite as a run_shard line" \
-   "$(q 'run_shard scripts/orchestrator-harness/check-deployed-drift.test.sh' "$(cat "$SHARDS")" && echo 0 || echo 1)"
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (#2838). This check used to
+# grep the runner's SOURCE for its own `run_shard` row — the text of a list that no longer exists:
+# #2838 deleted the enumerated block, because every suite ran twice beside the derived loop and the
+# runner's own `executed + skipped == listed` self-check could never hold. A text grep now fails on a
+# suite that IS wired (a false red) and passes on a COMMENTED-OUT row that executes nothing, so it
+# reads `--list` — the runner's own oracle, the same one `spawn-gate.test.sh` and both lanes use.
+LIST="$(bash "$SHARDS" --list 2>/dev/null)"; rc=$?
+ck "run-bash-shards.sh --list is READABLE (an unreadable list must not pass the membership check vacuously)" \
+   "$([ "$rc" -eq 0 ] && [ -n "$LIST" ] && echo 0 || echo 1)"
+grep -qxF 'scripts/orchestrator-harness/check-deployed-drift.test.sh' <<<"$LIST"
+ck "run-bash-shards.sh EXECUTES this suite (--list), not merely names it in its text" $?
 
 echo
 printf 'check-deployed-drift delta self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
