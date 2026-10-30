@@ -389,10 +389,13 @@ resolve_python() {
 }
 
 # ── resolve the provisioner, and SAY when there is none ──────────────────────────────────────
-# The FILL half of the pass creates a new install only through tools/install-ci-runner-x64.sh. A
-# scheduled pass runs with `WorkingDirectory=%h`, so the pass's `$PWD/tools/…` candidate cannot resolve
-# and the install is the ONE moment the path can be measured (the operator is standing in a checkout
-# that has it). ⛔ WARNED, NOT REFUSED: a repair-only schedule is still worth having, and refusing would
+# The FILL half of the pass creates a new install only through tools/install-ci-runner-x64.sh. The unit
+# carries NO `WorkingDirectory=` — deliberately, and that is a MEASURED fix (see the service template's
+# own note: `%h` is the home of the account running the SERVICE MANAGER, and this unit is normally
+# installed into /etc/systemd/system, where the first install of this very pair failed `200/CHDIR`).
+# With no directive systemd's cwd is `/`, which kills the pass's `$PWD/tools/…` candidate, so the
+# install is the ONE moment the path can be measured (the operator is standing in a checkout that has
+# it). ⛔ WARNED, NOT REFUSED: a repair-only schedule is still worth having, and refusing would
 # make this installer unusable on the boxes it exists for (no cell carries that installer today —
 # measured on pi-cell-1). The consequence is named, not implied.
 PROVISIONER=""
@@ -1070,6 +1073,15 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
                          *)     skipnext=1 ;;
                      esac
                 fi ;;
+            # ⛔ THE INLINE SPELLING IS THE SAME ARGUMENT. argparse accepts `--want=3`, `--root=/opt/x`
+            # and `--repo=o/r` exactly as it accepts the space form, so classifying ONLY the space form
+            # reported a schedule the pass runs happily as "arguments this installer did not render",
+            # with the false consequence "every tick exits 2" — a readiness verb reddening a working
+            # unit and handing the operator a remedy (strip the argument) that removes a legitimate
+            # switch. `--want=` IS the exit-2 case (the int conversion fails) and `--root=` leaves the
+            # pass nothing to measure, so an EMPTY value stays reported; a non-empty one does not.
+            --want=*|--root=*) [ -n "${l#*=}" ] || out="$out $l" ;;
+            --repo=*)          : ;;
             *)                 out="$out $l" ;;
         esac
     done
@@ -1725,7 +1737,7 @@ do_status() {
                    case " $installed_mode " in
                        *" --install-unit "*) err "  --install-unit: every tick WRITES AND ENABLES this tool's own unit pair instead of converging, and exits — so the pool is never repaired, while a second unit pair competes with the one this installer manages." ;;
                        *" --check-units "*)  err "  --check-units: every tick AUDITS the installed units and exits (5 when one is unusable) instead of converging — a schedule that reports on the pool and never repairs it." ;;
-                       *" --workdir "*)      err "  --workdir only parameterises --install-unit; on its own it changes no tick and is refused by the pass when it has no value." ;;
+                       *" --workdir "*|*" --workdir="*) err "  --workdir only parameterises --install-unit; on its own it changes no tick and is refused by the pass when it has no value." ;;
                    esac
                    rc=1 ;;
     esac

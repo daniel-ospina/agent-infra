@@ -1245,6 +1245,24 @@ OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "--install-unit in ExecStart is red"
 assert_contains "$OUT" "WRITES AND ENABLES" "naming its real consequence (a competing unit pair)"
 assert_contains "$OUT" "--check-units" "and the message lists the pass's full vocabulary"
+# ⛔ THE INLINE SPELLING IS THE SAME ARGUMENT. argparse accepts `--want=3` / `--root=<path>` / `--repo=<slug>`
+# exactly as it accepts the space form, so a classifier that matched only the space form reported a
+# schedule the pass runs happily as "arguments this installer did not render … every tick exits 2" — a
+# false block, and one whose remedy (strip the argument) removes a legitimate switch. The space form and
+# the inline form must read the same, and the gate must still discriminate the value that really fails.
+box_sed_i '/^ExecStart=/ s| --install-unit| --want=3 --json|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "--want=<n> in the inline spelling is the SAME argument, so the unit is not red"
+assert_absent "$OUT" "did not render" "…and it does not get the 'this installer did not render' text"
+# Control 1: an EMPTY value is NOT the same argument — the pass exits 2 on `--want=`, so it stays red.
+box_sed_i '/^ExecStart=/ s| --want=3 --json| --want=|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an EMPTY inline value is still a value the pass cannot take, so the gate reds it"
+assert_contains "$OUT" "--want=" "and names the argument it refused"
+# Control 2: `--repo=<slug>` is CONFIGURATION, not a mode — the space pair is dropped, so is this one.
+box_sed_i '/^ExecStart=/ s| --want=| --repo=o/r|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "--repo=<slug> is configuration, and the inline spelling is dropped like the space form"
 rm -f "$ARM"
 
 # ── T47: `--arm` NAMES why it cannot resolve a target, like every other verb ─────────────
