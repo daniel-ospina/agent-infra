@@ -906,6 +906,63 @@ assert_contains "$OUT" "ALSO installed in" "and --arm also reports the other sco
 rm -rf "$T/scopes/other"
 rm -f "$ARM"
 
+# ── T37: the drift comparison covers the artifact that carries the CADENCE ───────────────
+# `--install` writes TWO systemd artifacts and `--status` compared ONE. The `.timer` is where
+# `OnBootSec=`/`OnUnitActiveSec=` live, and `{{INTERVAL_SEC}}` is rendered into the PLIST only — the
+# timer template is static text, so nothing else ever compares it. A hand-edited, foreign, or
+# older-cadence timer therefore fired at the wrong interval while the verb whose own comment promises
+# to catch "a changed interval" printed `drift_artifact=no` and exited 0: a box converging hourly
+# instead of every nine minutes, certified healthy by the readiness gate. Same class as T32 — compare
+# everything the install path would write.
+say_case "T37 --status compares the TIMER too, not just the service"
+D="$T/c37"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "precondition: a freshly installed box is healthy"
+assert_contains "$OUT" "drift_artifact=no" "and reports no drift"
+assert_contains "$OUT" "drift_parts=service=no timer=no" "naming BOTH artifacts it compared"
+# A hand-edit of the TIMER alone — the cadence artifact, and the one the pre-fix code never opened.
+printf '\n# hand edit\n' >>"$D/$UNIT_NAME.timer"
+OUT="$(run_install Linux "$D" --status)"
+assert_contains "$OUT" "drift_artifact=yes" "a hand-edited TIMER is reported as drift"
+assert_contains "$OUT" "drift_parts=service=no timer=yes" "and the attribution names the TIMER, not the service"
+# A timer that is GONE is drift too, and it is the one drift where nothing fires at all.
+D="$T/c37b"; fresh "$D"
+run_install Linux "$D" --install >/dev/null 2>&1
+rm -f "$D/$UNIT_NAME.timer"
+OUT="$(run_install Linux "$D" --status)"
+assert_contains "$OUT" "drift_artifact=yes" "a MISSING timer is drift, not silence"
+assert_contains "$OUT" "drift_parts=service=no timer=yes" "and the attribution says which artifact is absent"
+rm -f "$ARM"
+
+# ── T38: --status scans the OTHER scope, and scopes the claim it makes ───────────────────
+# `choose_target` resolves the scope from SUDO AVAILABILITY AT THIS INVOCATION. A box installed into
+# /etc/systemd/system by the bring-up therefore answers a later `--status` run — where `sudo -n` fails —
+# from the USER scope, and printed `installed=no` plus "this box has NO scheduled converger" over a box
+# that IS converging, then handed the operator `--install`: the one action that creates the duplicate
+# schedule T36 exists to report. The three writers always scanned; the readiness verb did not, and it is
+# the verb an operator runs first.
+say_case "T38 --status scans the second scope and scopes its own claim"
+mkdir -p "$T/scopes/status-other"
+printf 'placeholder\n' >"$T/scopes/status-other/$UNIT_NAME.service"
+rm -rf "$T/home/.config"; rm -f "$ARM"
+ENVV=(SUDO=false PATH="$T/bin:$PATH")          # control: the pinned-empty $T/scopes reports nothing
+OUT="$(run_install Linux - --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "control: nothing installed anywhere in the scan exits 1"
+assert_not_contains "$OUT" "ALSO installed in" "and the control is silent about other scopes"
+assert_contains "$OUT" "no scheduled converger in THIS scope" "the note is SCOPED to what was actually read"
+assert_absent "$OUT" "NO scheduled converger" "so the unscoped box-level claim is gone"
+rm -rf "$T/home/.config"; rm -f "$ARM"
+ENVV=(SUDO=false PATH="$T/bin:$PATH" RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes/status-other")
+OUT="$(run_install Linux - --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "--status still exits 1 (there is nothing in THIS scope)"
+assert_contains "$OUT" "ALSO installed in" "a converging box in ANOTHER scope is REPORTED, not denied"
+assert_contains "$OUT" "$T/scopes/status-other" "naming the directory an operator has to look at"
+assert_contains "$OUT" "no scheduled converger in THIS scope" "and the claim stays scoped to this one"
+assert_absent "$OUT" "this box has NO scheduled converger" "the false box-level claim is gone"
+rm -rf "$T/scopes/status-other"
+rm -rf "$T/home/.config"; rm -f "$ARM"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

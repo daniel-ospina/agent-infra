@@ -627,7 +627,7 @@ other_scope_dirs() {
 # ⛔ SYSTEMD ONLY. The launchd arm installs to ~/Library/LaunchAgents and this installer models no second
 # launchd scope, so scanning systemd's dirs on Darwin would report a scope that cannot fire.
 report_other_scope_installs() {
-    local d found=0
+    local d
     [ "$TARGET" = "override" ] && return 0
     [ "$TARGET" = "launchd" ] && return 0
     while IFS= read -r d; do
@@ -636,7 +636,6 @@ report_other_scope_installs() {
             err "note: $UNIT_NAME is ALSO installed in $d (another scope) — ${1:-this is a second schedule}"
             err "      that copy fires the SAME pass at the SAME pool, and the per-unit mutual exclusion"
             err "      does not reach across scopes; remove the copy you do not want"
-            found=1
         fi
     done < <(other_scope_dirs)
     return 0
@@ -1265,6 +1264,7 @@ sha_of() { # sha_of <file> — portable digest
 do_status() {
     local installed_mode installed_script drift_artifact enabled active next last linger
     local installed_args installed_rest installed_kind installed_dropins
+    local drift_service drift_timer
     local rc=0 installed_path
     # ⛔ `--status` IS THE FIFTH READER OF THE SAME RECORD, AND IT WAS THE ONE VERB THAT SKIPPED THIS
     # GUARD. Under `sudo` HOME resolves to /root, so the ARMING RECORD and the pass's LAST-TICK log are
@@ -1278,11 +1278,26 @@ do_status() {
     resolve_python || { rc=1; }
     choose_target || { err "no scheduler available"; return 1; }
     log_line "target=$TARGET dir=$UNIT_DIR"
+    # ⛔ THE READINESS VERB WAS THE ONE READER THAT NEVER SCANNED THE SECOND SCOPE, AND IT MADE A
+    # BOX-LEVEL CLAIM FROM A SCOPE-LEVEL READ. `choose_target` resolves the scope from SUDO AVAILABILITY
+    # AT THIS INVOCATION, so a box installed into /etc/systemd/system by the bring-up answers a later
+    # `--status` run where `sudo -n` fails from the USER scope — and printed "installed=no" plus "this box
+    # has NO scheduled converger" over a box that IS converging. The remedy it hands out (`--install`) is
+    # the one action that creates the duplicate schedule the writers warn about only AFTER creating it.
+    # `--install`, `--arm` and `--uninstall` have always scanned; `--status` — the verb an operator runs
+    # FIRST and the verb `cloud-cell-bringup.sh --check`-shaped callers gate on — did not. Advisory, not
+    # fatal, exactly like the writers: a second scope can be legitimate and removing it is the operator's
+    # call. The scan list is the pinned (`RUNNER_AUTOSCALE_SCOPE_SCAN`) seam, and the helper no-ops under
+    # TARGET=override and on the launchd arm, so no case reads the host's real unit dirs.
+    report_other_scope_installs "both fire the SAME pass at the SAME pool"
     if [ "$TARGET" = "launchd" ]; then installed_path="$UNIT_DIR/$LABEL.plist"; else installed_path="$UNIT_DIR/$UNIT_NAME.service"; fi
     if [ ! -f "$installed_path" ]; then
         log_line "installed=no"
-        log_line "note=no artifact at $installed_path — this box has NO scheduled converger"
-        log_line "remedy=bash $(basename "$0") --install   (installs it DISARMED when no arming record exists; --arm is a separate dated step, and an existing record is honoured — run --disarm to revoke it)"
+        # ⛔ THE CLAIM IS SCOPED TO WHAT WAS ACTUALLY READ. The scan above can have just named a converger
+        # in another scope, so an unscoped "this box has NO scheduled converger" is false on exactly the
+        # box this verb is asked about — and the operator would install a SECOND schedule to fix it.
+        log_line "note=no artifact at $installed_path — no scheduled converger in THIS scope ($TARGET)"
+        log_line "remedy=bash $(basename "$0") --install   (installs it into THIS scope, $TARGET, DISARMED when no arming record exists; --arm is a separate dated step, and an existing record is honoured — run --disarm to revoke it. If the scan above named another scope, remove the copy you do not want FIRST — installing here does not replace it)"
         return 1
     fi
     log_line "installed=yes artifact=$installed_path"
@@ -1398,6 +1413,8 @@ do_status() {
     if [ -n "$installed_script" ]; then
         local tmpd
         drift_artifact="unknown"
+        drift_service="unknown"
+        drift_timer="unknown"
         tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-drift.XXXXXX")" 2>/dev/null || tmpd=""
         if [ -n "$tmpd" ]; then
             if [ "$TARGET" = "launchd" ]; then
@@ -1415,12 +1432,38 @@ do_status() {
                     if [ "$TARGET" = "user" ]; then
                         sed -i.bak '/^User=/d' "$tmpd/$UNIT_NAME.service" && rm -f "$tmpd/$UNIT_NAME.service.bak"
                     fi
-                    cmp -s "$tmpd/$UNIT_NAME.service" "$installed_path" && drift_artifact=no || drift_artifact=yes
+                    cmp -s "$tmpd/$UNIT_NAME.service" "$installed_path" && drift_service=no || drift_service=yes
                 fi
+                # ⛔ THE INSTALL PATH WRITES TWO ARTIFACTS AND THE DRIFT CHECK COMPARED ONE. `--install`
+                # writes `$UNIT_NAME.service` AND `$UNIT_NAME.timer` (do_install_systemd renders both), and
+                # the systemd TIMER is the artifact that carries the CADENCE: `OnBootSec=`/`OnUnitActiveSec=`
+                # live there, and `{{INTERVAL_SEC}}` is rendered into the plist ONLY, so the timer template
+                # is static text with nothing else comparing it. A hand-edited, foreign, or older-cadence
+                # timer therefore fired at the wrong interval while the verb whose own comment promises to
+                # catch "a changed interval" printed `drift_artifact=no` and exited 0 — an artifact that
+                # fires hourly instead of every 9 minutes, certified healthy by the readiness gate. Same
+                # class the `User=` arm above fixed: compare everything the install path would write.
+                # ⛔ AND A MISSING TIMER IS DRIFT, NOT AN ERROR: a service installed without its timer fires
+                # nothing, so `cmp` against an absent file must read `yes` (that is the useful signal here,
+                # and `is-enabled`/`is-active` on the absent timer red the same box independently).
+                if render "$TEMPLATES_DIR/$UNIT_NAME.timer" "$tmpd/$UNIT_NAME.timer" systemd 2>/dev/null; then
+                    cmp -s "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" && drift_timer=no || drift_timer=yes
+                fi
+                # One verdict, no attribution lost: `yes` if EITHER artifact drifted, `no` only when BOTH
+                # were compared and matched, `unknown` when a render failed for one of them (a render
+                # failure is not evidence of drift, and it is not evidence of cleanliness either).
+                if [ "$drift_service" = "yes" ] || [ "$drift_timer" = "yes" ]; then drift_artifact=yes
+                elif [ "$drift_service" = "no" ] && [ "$drift_timer" = "no" ]; then drift_artifact=no
+                else drift_artifact=unknown; fi
             fi
             rm -rf "$tmpd"
         fi
         log_line "drift_artifact=$drift_artifact"
+        # Which artifact drifted, so an operator re-rendering by hand does not have to guess. Omitted on
+        # the launchd arm, which installs one file.
+        if [ "$TARGET" != "launchd" ]; then
+            log_line "drift_parts=service=${drift_service:-unknown} timer=${drift_timer:-unknown}"
+        fi
     fi
     # repo-copy drift: is the copy the timer RUNS the copy this checkout carries? The converger's own
     # header records the hazard — a cell keeps running whatever was last hand-placed in
