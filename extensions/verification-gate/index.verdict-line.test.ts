@@ -22,6 +22,10 @@
  *       to bisect by re-dispatching.
  *   (d2) that note belongs to the DISPATCH that wrote it — a later reply that never reached the parse
  *       (`empty-content`, `no-text`) must not inherit the previous reply's line as if it were its own.
+ *   (d3) the note is for a PARSE failure only. A JUDGMENT class (`fail-verdict`) must not tell the lane
+ *       "the gate did NOT read this line" about a line the gate DID read and block on — that redirects
+ *       the operator from "fix the files" to "re-shape this line", i.e. a re-dispatch of the same
+ *       block-attempt shape (#7591).
  *
  * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 26 cases that
  * went red under that single mutation, not an estimate — an unmeasured count here was review r1's
@@ -38,6 +42,10 @@
  *      stale-note cases. That is the discriminator for review r1's first finding: pre-fix, the note
  *      survives a dispatch that never reached the parse, so a refusal quotes the PREVIOUS reply's
  *      line, calls it the last one, and points the lane at a line the gate had already read.
+ *   M5 widen the note's guard from `FORMAT_CLASSES.has(lastDispatchClass)` to any non-null class
+ *      → 1 red: (d3). Review r2's finding: the guard was load-bearing and NOTHING pinned it, so a
+ *      `fail-verdict` (a judgment) rendered "the gate did NOT read it as one" directly under the
+ *      ceremony that had just read it and blocked on it.
  *   NOT mutation-pinned: the line anchor and the `\b` are pinned by (b) as PRE-EXISTING behavior
  *   (they passed before the fix and must keep passing) — they are regressions guards, not
  *   discriminators, and are stated here rather than implied.
@@ -271,6 +279,28 @@ async function main() {
     const res = await verdictFor("My verdict is PASS, everything looks good.");
     ok(res && res.block === true, "a mid-line verdict must not clear the gate");
     ok(/mentioned a verdict on this line/.test(String(res.reason ?? "")), "the note must still render for its OWN dispatch");
+  });
+
+  // ⛔ A JUDGMENT IS NOT A PARSE FAILURE (review r2 P2). `fail-verdict` is what the gate records when a
+  // verifier RENDERED a FAIL it read and acted on — so the tested-line note, whose whole message is
+  // "the gate did not read this line as a verdict", is both false and misdirecting there: it points the
+  // operator at the SHAPE of a line that was fine instead of at the failures the verifier listed, i.e.
+  // at a re-dispatch of the same block-attempt shape (#7591). The guard is
+  // `FORMAT_CLASSES.has(lastDispatchClass)` in index.ts, and until this case existed nothing pinned it:
+  // widening it to any non-null class left this suite 26/26 GREEN.
+  console.log("\n(d3) the tested-line note is for a PARSE failure — a JUDGMENT class must not claim one:");
+
+  test("(d3) a plain-text FAIL (a judgment) blocks WITHOUT claiming its line was unread", async () => {
+    // A plain-text FAIL takes the `!result` path, which DOES call noteVerdictText — so the note is
+    // present in state and only the FORMAT guard suppresses it. That is what makes this a
+    // discriminator rather than a case that passes because there was nothing to render.
+    const res = await verdictAfter([{ text: "FAIL: two tests are broken" }]);
+    ok(res && res.block === true, "a FAIL judgment must block");
+    const reason = String(res.reason ?? "");
+    // The class WAS recorded — so the note's absence is the guard's doing, not a missing dispatch state.
+    ok(/fail-verdict/.test(reason), `the fail-verdict ceremony must render, proving the class was recorded; got: ${reason.slice(-500)}`);
+    ok(!/did NOT read it as one|mentioned a verdict on this line/.test(reason), `a JUDGMENT must never be reported as an unread verdict line; got: ${reason.slice(-500)}`);
+    ok(/address the failures it listed/.test(reason), "the remedy must stay 'fix the files it listed', not 're-shape the line'");
   });
 
   await runAll();
