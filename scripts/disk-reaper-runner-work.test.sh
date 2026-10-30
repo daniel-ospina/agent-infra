@@ -147,6 +147,24 @@ run_pass() {
 }
 status_of() { cat "$1/disk-reaper.status" 2>/dev/null; }
 
+# has_real_runner_root — is ANY of the documented DEFAULT globs present on this box?
+# ⛔ IT MUST BE "ANY", NOT "ALL". `ls -d A B` exits non-zero when ANY ONE pattern fails to match, so the
+# first version of the (f) skip — `ls -d /opt/gh-runner*/_work /tmp/actions-runner*/_work` — read a CELL
+# (which HAS `/opt/gh-runner*/_work` and has no `/tmp/actions-runner*/_work`) as a box with NO runner
+# roots. The arm then scanned that cell's REAL population and failed on `pass rc = 5`, which is a correct
+# measurement (`verdict=5` = candidates found + nothing removed in --dry-run) while the class's own
+# record was `verdict_runner_work=ok` — i.e. the suite reddened on exactly the box class it exists for,
+# and only there: neither pattern matches on a developer laptop, so the AND-vs-OR bug was invisible.
+# Measured on the cell (Linux bash 5.2, non-root): 16 passed / 1 failed before this guard, 17 / 0 after.
+# `compgen -G` is a builtin (bash 3.2 included) and each pattern is probed ALONE, so one present root is
+# enough to take the documented skip.
+has_real_runner_root() {
+    compgen -G '/opt/gh-runner*/_work'       >/dev/null 2>&1 && return 0
+    compgen -G "$HOME/actions-runner*/_work" >/dev/null 2>&1 && return 0
+    compgen -G '/tmp/actions-runner*/_work'  >/dev/null 2>&1 && return 0
+    return 1
+}
+
 # ── (a) a YOUNG entry is neither counted nor reaped ────────────────────────────────────────────
 case_a() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work out rc st young1 young2 s1 s2
@@ -308,7 +326,7 @@ case_f() { # <entry-point> <owner>
     # that HAS real runner roots (a cell: `/opt/gh-runner*/_work` holds ~19 G of live checkout) the arm
     # is SKIPPED by name and the documented defaults are asserted from the source instead. `--dry-run`
     # either way, so even the skipped-on-a-cell version could remove nothing.
-    if ls -d /opt/gh-runner*/_work /tmp/actions-runner*/_work >/dev/null 2>&1; then
+    if has_real_runner_root; then
         case_check 0 "default-glob arm SKIPPED — this box has REAL runner roots (/opt or /tmp); asserting the documented default list from the source instead"
         case_check "$(grep -qF '/opt/gh-runner*/_work' "$pass" && grep -qF 'actions-runner*/_work' "$pass" && echo 0 || echo 1)" \
                    "… the entry point's DEFAULT glob list still names the documented /opt and actions-runner roots"
