@@ -456,6 +456,22 @@ grep -q '\[mem-gate\] REFUSED .*spawn point refused the launch for MEMORY' "$TMP
 # one surface that reaches merge-one's reviewers and hand-written runners.
 # Reachability differs by platform: the probe prefers /proc/meminfo, so on Linux UNREADABLE cannot be
 # produced from PATH and the arm SKIPS LOUDLY rather than pretending to have exercised it.
+# ⛔ AND THE CODE THE ARM ASSERTS IS READ FROM THE SHIPPED GATE, NOT RESTATED (#2387 review P1/P2), so
+# the expectation is checked on EVERY platform — including the Linux CI cells where the arm itself
+# skips. This arm asserted the branch's DRAFT `72`, which the shim no longer returns (`72` is
+# `REPO_TARGET_REFUSED`, #2694): on the only platform where it runs (macOS, where /proc/meminfo is
+# absent) it failed against the shim's real code and its message blamed the gate for "fail-OPEN" when
+# the gate had refused. Deriving it makes a future renumbering redden here, wherever this suite runs,
+# instead of leaving it asserting a code another gate owns.
+mem_refused_code="$(sed -n 's/^PI_GATE_MEM_REFUSED=\([0-9][0-9]*\)$/\1/p' "$GATE" 2>/dev/null | head -1)"
+checks=$((checks + 1))
+case "$mem_refused_code" in
+  ''|*[!0-9]*)
+    fail "could not read PI_GATE_MEM_REFUSED from $GATE — the §12b expectation would be vacuous, so this is a FAILURE, not a skip"
+    mem_refused_code=82 ;;
+  *)
+    pass "the §12b expectation is the gate's OWN memory code ($mem_refused_code), not a restated literal" ;;
+esac
 if [ -r /proc/meminfo ]; then
   checks=$((checks + 1)); echo "   ⏭  SKIPPED the UNREADABLE-remedy arm: /proc/meminfo is readable here, so the probe cannot be forced unreadable from PATH (run this suite on macOS to exercise it)"
 else
@@ -469,9 +485,9 @@ else
   err="$(PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" TAG=mem-unreadable MAX_LOAD=999999999 \
     PATH="$TMP/unreadshim:$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
     bash -c 'pi -p x' 2>&1 >/dev/null)"; rc=$?
-  [ "$rc" -eq 72 ] \
-    && pass "an UNREADABLE probe REFUSES (rc=$rc) — fail-closed, not fail-open like the disk gate" \
-    || fail "an unreadable memory probe returned $rc instead of refusing with 72 (fail-OPEN)"
+  [ "$rc" -eq "$mem_refused_code" ] \
+    && pass "an UNREADABLE probe REFUSES (rc=$rc) — fail-closed with the gate's own code ($mem_refused_code), not fail-open like the disk gate" \
+    || fail "an unreadable memory probe returned $rc instead of refusing with $mem_refused_code (the code spawn-gate.sh declares for a memory refusal)"
   [ ! -s "$TMP/probe" ] \
     && pass "…and the real pi did NOT start on it" \
     || fail "an unreadable probe still started pi: $(tr '\n' ' ' < "$TMP/probe")"
