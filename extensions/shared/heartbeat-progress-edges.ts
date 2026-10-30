@@ -848,6 +848,28 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["SWEEP_MAX_AGE=600"],
     note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
+  // — hygiene axis: the claim snapshot's FRESHNESS bound (#2466) —
+  //
+  // A cache-freshness bound, not a kill bound: `$O/state/claims-snapshot` is rewritten each cycle
+  // so `claim_live()` pays no per-PR network call, and this is how long a read may be believed
+  // before the file is refused as `claim-unreadable`. Without it the cache is an unfalsifiable
+  // answer — a claim published since the last good fetch would be INVISIBLE, and two cells would
+  // select the same PR. The reverse scan caught its absence here: a new stall-family declaration
+  // that nobody classified is exactly how an unbounded bound reappears, so it is registered on
+  // introduction rather than after the first incident.
+  {
+    name: "CLAIM_SNAPSHOT_MAX_AGE",
+    owners: ["scripts/orchestrator-harness/claims.sh"],
+    value: '"${CLAIM_SNAPSHOT_MAX_AGE:-900}"',
+    axis: "hygiene",
+    guardedBy:
+      "scripts/orchestrator-harness/test-gates.sh — \"a snapshot OLDER than the age bound is NOT ownership (a claim published since would be invisible)\" drives the shipped reader with a snapshot 100000 s old and asserts UNOWNED; the value itself is asserted by THIS registry's forward check, not by the suite, because the suite ages the FILE rather than setting the bound",
+    overrides: [
+      "''|*[!0-9]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
+      "[ \"${#CLAIM_SNAPSHOT_MAX_AGE}\" -le 9 ] || CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
+    ],
+    note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). THREE shapes reach `claim-unreadable` and the bound governs only the third: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because that test is the `if` and the age test only the `elif` — the bound must never be read as re-admitting a failed read), and an `ok` header older than this bound. The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed.",
+  },
   // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
   //
   // These are not kill bounds. They are the two readings the bounded
