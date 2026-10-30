@@ -34,15 +34,22 @@ echo "[adopt-fix $PR] worktree=$WT branch=$BR $(date)" >> "$O/logs/adopt-$PR.log
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
 # 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate
-# refused it (#1765). 73 = the MEMORY gate refused it (#2387). Name ALL THREE here: the fixer's own
-# line is inside fix-$PR.log, and this is the log a manual operator reads (#1720). They are not
-# interchangeable — a load refusal is cleared by the box quietening, a memory refusal by resident
-# lanes FINISHING, and a disk refusal only by reclaiming space — so reporting one as another sends the
-# operator to wait for a remedy that cannot arrive. ⛔ 73 is the one that would silently be reported as
-# a LOAD refusal by omission (it matches neither branch below), which is the exact false-cause class
-# this block exists to fix; the memory branch therefore sits ABOVE the load one.
-if [ "$rc" = "73" ]; then
+# refused it (#1765). 81 = the MEMORY gate refused it (#2387), and 73 = the FORK gate (#2293). Name ALL
+# FOUR here: the fixer's own line is inside fix-$PR.log, and this is the log a manual operator reads
+# (#1720). They are not interchangeable — a load refusal is cleared by the box quietening, a memory
+# refusal by resident lanes FINISHING, a disk refusal only by reclaiming space, and a fork refusal only
+# by restarting/draining the BOX from OUTSIDE — so reporting one as another sends the operator to a
+# remedy that cannot arrive.
+# ⛔ 81, NOT 73 (review P1, #2387): this arm was written at the branch's DRAFT code, and 73 has been
+# `AGENT_FORK_REFUSED` since #2293, while the memory gate is 81. At 73 the arm was wrong in BOTH
+# directions — a real memory refusal (81) matched NO arm and reached the operator's log as silence (the
+# #1720 shape), and a real fork refusal (73) was reported as a MEMORY one whose stated remedy, "this
+# clears when resident lanes finish", CANNOT CLEAR a box that is out of PROCESSES. So the fork arm is
+# added WITH the corrected memory code rather than left to fall through as it did before.
+if [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then
   echo "[adopt-fix $PR] fixer NOT started (MEMORY gate) — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes finish, NOT by waiting for load; the reading and the floor are in fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then
+  echo "[adopt-fix $PR] fixer NOT started (FORK gate) — this box is out of PROCESSES (#2293). Restart or drain the BOX from outside: waiting for load to fall cannot clear it, resident lanes finishing cannot clear it, and this box cannot start the retry at all. The '[fork-gate] REFUSED' line is in fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "71" ]; then
