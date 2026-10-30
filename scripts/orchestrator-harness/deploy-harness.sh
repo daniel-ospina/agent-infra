@@ -63,11 +63,18 @@ PROG="$(basename "${BASH_SOURCE[0]}")"
 usage() { awk 'NR>1 && /^set -uo pipefail$/{exit} NR>1{sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"; }
 
 SRC="" ; NOTIFY="" ; LEDGER="" ; DO_NOTIFY=1 ; QUIET=0
-# ⛔ THE ONE OVERRIDE, and it is OPT-IN BY NAME. A deploy that overwrites an uncommitted edit in `$O`
-# must be TOLD to (see preflight (c)); the flag exists so the refusal is never the last word for an
-# operator who has read what is about to be lost, and never the default for one who has not.
-ACCEPT_DISCARD="${ACCEPT_DISCARD:-0}"
-case "$ACCEPT_DISCARD" in 1|true|yes) ACCEPT_DISCARD=1 ;; *) ACCEPT_DISCARD=0 ;; esac
+# ⛔ THE ONE OVERRIDE, and it is OPT-IN BY NAME — ON THE COMMAND LINE, NOT IN THE ENVIRONMENT.
+# A deploy that overwrites an uncommitted edit in `$O` must be TOLD to (see preflight (c)); the flag
+# exists so the refusal is never the last word for an operator who has read what is about to be lost,
+# and never the default for one who has not.
+# ⛔ AND IT IS NOT READ FROM THE ENVIRONMENT — this comment said "a FLAG, not an env default" while the
+# line beneath it read `${ACCEPT_DISCARD:-0}`, so the comment was false. `deploy-mac-orchestrator.sh`
+# DOES document `ACCEPT_DISCARD=1` as an env seam (its PHASE/WAIT/DRY_RUN are env too), so an operator
+# — or a wrapper, or a profile — carrying that variable for the mac path silently disarmed THIS gate as
+# well: measured, deploy, hand-edit `$O/claims.sh`, re-run with the variable merely exported and no
+# flag → rc 0 and the patch gone. Under `--quiet` even the notice is suppressed, and this is the gate
+# that stops a live patch from being destroyed, so it may not be reachable through ambient environment.
+ACCEPT_DISCARD=0
 # ⛔ `O` is NOT initialised here — not even to "". Setting `O=""` on this line CLEARED an env
 # `O=<dir>` before the assignment below could read it, so the "honour the convention" comment was
 # false and an explicit `O=<dir> ...` silently addressed the default runtime — the measured

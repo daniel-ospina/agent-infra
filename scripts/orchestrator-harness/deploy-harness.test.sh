@@ -1500,6 +1500,51 @@ else
   bad "install.sh is missing — producer/checker agreement cannot be asserted"
 fi
 
+# ── THE REFUSAL GATE: a deploy that would discard a live patch REFUSES, and no env can disarm it ──
+# ⛔ THIS GATE HAD NO ARM AT ALL. `deploy-harness.sh`'s preflight (c) is the code that exists to stop
+# the measured 2026-10-28 loss (a hand fix to `$O/merge-one.sh` reverted twice), and neither this suite
+# nor `selftest.sh` named `--accept-discard` anywhere — so the gate could have been deleted, or made
+# unreachable, with every suite green. The three shapes are pinned in the order that matters: the
+# refusal exists, it PRESERVES the patch, and the override is a flag rather than an ambient variable.
+say_case "R. an uncommitted edit in \$O is REFUSED (78), preserved, and only a FLAG may discard it"
+SRCR="$T/srcR"; OR="$T/oR"; make_src "$SRCR"; make_target "$OR"
+# The record is what makes an edit distinguishable from a deploy, so the source must ship the writer.
+cp "$HERE/harness-provenance.sh" "$SRCR/"; chmod +x "$SRCR/harness-provenance.sh"
+notify_reset; deploy "$SRCR" "$OR"
+[ "$RC" -eq 0 ] && ok "R: a first deploy still succeeds (the gate does not block the healthy path)" \
+                || bad "R: a first deploy exited $RC — $OUT"
+[ -f "$OR/.harness-provenance" ] && ok "R: the deploy RECORDED \$O (so the next run can tell an edit)" \
+                                 || bad "R: no .harness-provenance after a successful deploy"
+printf '#!/bin/bash\necho HAND PATCH\n' > "$OR/claims.sh"
+PATCH_HASH="$(sha256_of "$OR/claims.sh")"
+notify_reset; deploy "$SRCR" "$OR"
+[ "$RC" -eq 78 ] && ok "R: an uncommitted edit -> exit 78 (refused before touching the target)" \
+                || bad "R: exit $RC over a hand-patched \$O, want 78 — the patch is not protected — $OUT"
+grep -q "UNCOMMITTED-EDIT.*claims.sh" <<< "$OUT" && ok "R: the refusal NAMES the file and its verdict" \
+                                               || bad "R: the refusal named no file — $OUT"
+[ "$(sha256_of "$OR/claims.sh")" = "$PATCH_HASH" ] && ok "R: the patch is STILL THERE (a refusal copies nothing)" \
+                                                   || bad "R: the patch was overwritten by a refused deploy"
+notify_has "deploy REFUSED" && ok "R: a refusal notifies REFUSED (a distinct verdict, not silence)" \
+  || bad "R: a refusal notified nothing — $(notify_last)"
+notify_success && bad "R: a refused deploy notified SUCCESS" || ok "R: a refusal emits no success notification"
+# ⛔ THE AMBIENT-ENV ARM. `ACCEPT_DISCARD` exported for `deploy-mac-orchestrator.sh` (which documents
+# it as an env seam) used to disarm THIS script's refusal too. The variable is exported into the deploy
+# exactly as a wrapper or a profile would, and the refusal must still fire.
+export ACCEPT_DISCARD=1
+notify_reset; deploy "$SRCR" "$OR"
+unset ACCEPT_DISCARD
+[ "$RC" -eq 78 ] && ok "R: an exported ACCEPT_DISCARD does NOT disarm the refusal (a flag, not an env default)" \
+                || bad "R: exported ACCEPT_DISCARD=1 disarmed the refusal (rc=$RC) — the gate is reachable from ambient env"
+[ "$(sha256_of "$OR/claims.sh")" = "$PATCH_HASH" ] && ok "R: the patch survived the ambient-variable attempt too" \
+                                                   || bad "R: the ambient variable let the patch be discarded"
+# …and the deliberate override does what it says.
+notify_reset; deploy "$SRCR" "$OR" --accept-discard
+[ "$RC" -eq 0 ] && ok "R: --accept-discard proceeds (exit 0) — the refusal is never the last word" \
+                || bad "R: --accept-discard exited $RC — $OUT"
+[ "$(sha256_of "$OR/claims.sh")" != "$PATCH_HASH" ] && ok "R: --accept-discard really did discard the edit (not a no-op)" \
+                                                   || bad "R: --accept-discard left the patch — the flag is a no-op"
+
+
 echo
 echo "════════════════════════════════════════"
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
