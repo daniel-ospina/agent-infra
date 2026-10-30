@@ -233,6 +233,16 @@ shard_errors=0
 shard_ran=0
 shard_skipped=0
 shard_listed=0
+# ── CALLS ALLOWED PAST THE END OF THE LIST (#2838) ──────────────────────────────────────────────
+# `slice_skips` counts EVERY call, so `executed + skipped == listed` only holds when the calls made
+# are the calls the list describes. `run_shard` has TWO call sites: the derived loop ($listed calls,
+# 0 … listed-1) and the runtime sentinel (position `listed`, which must always execute so a slice
+# cannot leave the failure-recording arm untested). `shard_past_list=1` marks that ONE call BY NAME;
+# `slice_skips` refuses any other call past the end.
+shard_past_list=0
+slice_calls=0
+past_list_calls=0
+past_list_budget=1
 shard_time=0
 shard_slowest_secs=0
 shard_slowest=""
@@ -349,9 +359,27 @@ shard_fail() { shard_record_failure "$1"; }
 slice_skips() {
   slice_pos=$shard_listed
   shard_listed=$((shard_listed + 1))
+  slice_calls=$((slice_calls + 1))
   # Whether this call is a LIST line or one of the sentinels below (used by the timing report).
   if [ "$slice_pos" -lt "$listed" ]; then shard_is_listed=1; else shard_is_listed=0; fi
+  # ⛔ A POSITION PAST THE DERIVED COUNT IS AN ERROR, NOT EXTRA WORK TO RUN (#2838). This used to
+  # answer "past the list, RUN it", which hid the one thing the arithmetic at the end of this file
+  # exists to catch: the #2838 enumerated block sat at positions `listed`..`listed+103`, so ~104 rows
+  # ran in EVERY slice (measured: all 8 shards died at 70.3-70.4 min). A caller past the end must now
+  # DECLARE itself (`shard_past_list=1`, the sentinel) and only `past_list_budget` may do so.
+  if [ "$slice_pos" -ge "$listed" ]; then
+    if [ "$shard_past_list" -ne 1 ]; then
+      echo "❌ call #$((slice_pos + 1)) to run_shard is PAST the derived list ($listed listed shard(s)) and did not DECLARE itself — the list and the execution disagree, so 'executed + skipped == listed' cannot hold. The likely cause is a second, enumerated list of suites in this file (#2838). Refusing: extra work is not a repair for two lists that disagree. Already ran $shard_ran and skipped $shard_skipped of $listed."
+      exit 1
+    fi
+    past_list_calls=$((past_list_calls + 1))
+    if [ "$past_list_calls" -gt "$past_list_budget" ]; then
+      echo "❌ $past_list_calls call(s) past the derived list ($listed listed shard(s)); the declared budget is $past_list_budget — the runtime failure-recording sentinel alone. Refusing (#2838)."
+      exit 1
+    fi
+  fi
   [ "$slice_count" -gt 0 ] || return 1
+  # A DECLARED sentinel always runs: a slice must not leave the failure arm untested.
   [ "$slice_pos" -lt "$listed" ] || return 1
   [ $((slice_pos % slice_count)) -eq "$slice_index" ] && return 1
   shard_skipped=$((shard_skipped + 1))
@@ -469,11 +497,18 @@ for pattern in "${SWEEP_GLOBS[@]}"; do
 done
 
 echo "── hermetic suites ────────────────────────────────────────────────"
-# Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network).
+# Every suite the list below runs is hermetic (temp repos / temp HOME / stubbed tools, no network).
 #
-# PROVENANCE: these lines were moved out of ci-main.yml's `script-validate`, so each keeps the
-# note that workflow carried. A line that is ALSO run by a dedicated per-PR job or step in ci.yml
-# still carries its "(also a per-PR … in ci.yml)" note.
+# ⛔ THERE IS NO PER-SUITE ROW IN THIS SECTION, AND THAT IS THE COMMITMENT (#2838). `1d56cc10`
+# (#2614) made this list a DERIVATION; an older branch's 103 enumerated `run_shard <path>` rows
+# landed back on top of it in `718a0874` (#2035) and were never removed — so every suite ran TWICE,
+# once from each list, and this file's own `executed + skipped == listed` self-check could never
+# hold (measured when #2838 was filed: "executed 212 of 108 listed"). The rows are deleted and must
+# not come back: a suite is wired by the FILE matching SUITE_GLOBS, and `tests/ci-lane-parity/run.sh`
+# assertion 11 fails on any literal `run_shard <path>` row. The one-sentence notes those rows
+# carried (what a suite pins, which incident added it) live in git history on this commit and in
+# each suite's own header — and see the note at the end of this file for why they are likewise not
+# reproduced here as prose.
 #
 # ⛔ #2439 FOLDED THE DUPLICATE RUN SITES — this paragraph used to say the opposite, deliberately.
 # It read: "That duplication is deliberate here … the PR lane runs those twice … Dropping them
@@ -492,6 +527,7 @@ echo "── hermetic suites ─────────────────
 # The fold assumes this step actually EXECUTES — a sibling step failing ahead of it skips the whole
 # list, which is why agent-infra#2417 (the lane-parity self-test's live-gate control fixture) is a
 # coverage hole for every shard, not just the folded five.
+# ⛔ #1997 OWNS, AND NOTHING HERE PINS: the supervisor's classified-read invariant — `sup_session_list` answers 0 present / 1 absent / 3 cannot-verify, every tmux target is EXACT (`=name`), a session name carrying `:`/`.` is refused rather than resolved, and `TMUX_READ_TIMEOUT` is validated > 0. Its suite (`scripts/cloud-cell-supervisor.hardening.test.sh`) was DROPPED at ba5ba770 because the implementation it pinned was never landed on this branch, so these invariants are currently UNPINNED in this tree — they must return BESIDE the implementation (#1997's land), not as a suite added ahead of it.
 # ── the run — ONE loop over the DERIVED list ──────────────────────────────────────────────────
 # There is no per-suite line here any more, on purpose: a suite is wired by the FILE it lives in
 # matching SUITE_GLOBS, so two harness PRs adding two suites no longer conflict in this file.
@@ -510,6 +546,15 @@ echo "────────────────────────�
 # was traversed end to end: a slice cannot quietly stop early.
 if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
   echo "❌ executed $shard_ran of $listed listed shard(s) ($shard_skipped skipped) — the list and the execution disagree"
+  exit 1
+fi
+# ⛔ THE CALL COUNT IS CHECKED TOO, NOT ONLY THE TALLY (#2838). `ran + skipped` uses the same
+# counters the loop increments, so it cannot see how many times the loop was ENTERED (a second list
+# appended to `$shard_paths` moves both sides together). `slice_calls - past_list_calls` is the
+# number of calls the LIST accounts for, and it is the arm that survives the refusal above being
+# downgraded to a skip.
+if [ $((slice_calls - past_list_calls)) -ne "$listed" ]; then
+  echo "❌ the shard loop entered run_shard $((slice_calls - past_list_calls)) time(s) for a list of $listed shard(s) — the list and the execution disagree (a second list, or a re-read of the same one)"
   exit 1
 fi
 
@@ -584,7 +629,11 @@ before_err=$shard_errors
 before_ran=$shard_ran
 before_skip=$shard_skipped
 before_listed=$shard_listed
+# ⛔ THE ONE CALL PAST THE LIST, DECLARED BY NAME (#2838): `slice_skips` refuses an undeclared call
+# past the end, and a second sentinel must raise `past_list_budget` deliberately.
+shard_past_list=1
 run_shard "$sentinel"
+shard_past_list=0
 rm -f "$sentinel"
 if [ "$shard_errors" -ne $((before_err + 1)) ]; then
   echo "❌ the failure-recording arm is broken — a failing shard would not fail this run"

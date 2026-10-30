@@ -399,18 +399,20 @@ ck "…and it names the real reason (a manifest line with no path)" \
 
 echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
-# ⭐ MEMBERSHIP IS READ FROM THE DERIVED LIST, NEVER FROM THE DRIVER'S TEXT (#2609). This assertion
-# used to grep run-bash-shards.sh for its own `run_shard` row. That only worked while the list was
-# ENUMERATED, and it is the exact shape tests/ci-lane-parity §11 now forbids: the migration to
-# derivation deletes the rows, so a text-grep membership check goes RED and tells the next lane to
-# hand-edit the driver — re-introducing #2838. `--list` is the source the CI floor itself reads, so
-# asserting against it is both correct and stronger: the suite is listed iff it would actually run.
-SHARDLIST="$(bash "$SHARDS" --list 2>/dev/null || true)"
-ck "run-bash-shards.sh --list carries this suite (the list CI actually executes)" \
-   "$(printf '%s\n' "$SHARDLIST" | grep -qx 'scripts/orchestrator-harness/check-deployed-drift.test.sh' && echo 0 || echo 1)"
-# ⛔ …AND THE COMPLEMENT: derivation means the DRIVER NAMES NO SUITE. Pinning both halves makes a
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (#2838). This check used to
+# grep the runner's SOURCE for its own `run_shard` row — the text of a list that no longer exists:
+# #2838 deleted the enumerated block, because every suite ran twice beside the derived loop and the
+# runner's own `executed + skipped == listed` self-check could never hold. A text grep now fails on a
+# suite that IS wired (a false red) and passes on a COMMENTED-OUT row that executes nothing, so it
+# reads `--list` — the runner's own oracle, the same one `spawn-gate.test.sh` and both lanes use.
+LIST="$(bash "$SHARDS" --list 2>/dev/null)"; rc=$?
+ck "run-bash-shards.sh --list is READABLE (an unreadable list must not pass the membership check vacuously)" \
+   "$([ "$rc" -eq 0 ] && [ -n "$LIST" ] && echo 0 || echo 1)"
+grep -qxF 'scripts/orchestrator-harness/check-deployed-drift.test.sh' <<<"$LIST"
+ck "run-bash-shards.sh EXECUTES this suite (--list), not merely names it in its text" $?
+# ⛔ …AND THE COMPLEMENT: derivation means the RUNNER NAMES NO SUITE. Pinning both halves makes a
 # re-added `run_shard` row (the #2838 regression) go red HERE, not only in tests/ci-lane-parity.
-ck "…and the driver carries NO enumerated run_shard row for it (derivation, not enumeration)" \
+ck "…and the runner carries NO enumerated run_shard row for it (derivation, not enumeration)" \
    "$(grep -qE '^[[:space:]]*run_shard[[:space:]]+scripts/orchestrator-harness/check-deployed-drift\.test\.sh' "$SHARDS" && echo 1 || echo 0)"
 
 echo
