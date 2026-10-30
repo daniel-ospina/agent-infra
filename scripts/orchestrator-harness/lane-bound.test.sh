@@ -295,6 +295,22 @@ ck "(i0) the shipped lane BACKSTOP (LANE_BACKSTOP_S=${SEAM:-?}s) is above the al
 # that never source spawn-gate.sh): the pair cannot drift unnoticed either way.
 [ "${WALL_DEF:-x}" = "${SEAM:-y}" ]; rc=$?
 ck "(i0) lane-bound's BACKSTOP default (${WALL_DEF:-?}s) IS the harness seam (LANE_BACKSTOP_S=${SEAM:-?}s) — one number, two files, no drift" $rc
+# ⛔ NO CONSUMER MAY READ THE SEAM **BARE** (agent-infra#2999 review, P2). `set -u` is on in the
+# callers, and `${X:-$LANE_BACKSTOP_S}` does NOT guard its own default: `$O` is seeded FILE BY FILE, so a
+# new caller beside an older `$O/spawn-gate.sh` aborts with `LANE_BACKSTOP_S: unbound variable` before
+# the agent starts — nothing in the lane log names the skew, and the controller re-dispatches into the
+# same abort. This tree has MEASURED that class once already (`fix-one.sh`'s "TOLERANT REFERENCE"
+# block). `spawn-gate.sh` is exempt: it DECLARES and exports the seam, so its own `case "$LANE_BACKSTOP_S"`
+# coercion is the definition, not a read of it. Comments are stripped first (they quote the shapes).
+BARE_SEAM=""
+for _f in lane.sh fix-one.sh nonblocking-dispatch.sh ai-drainer.sh chain-merge.sh lane-merge.sh \
+          install-drainer-timer.sh claims.sh merge-one.sh lane-reap.sh pr-doctor.py; do
+  [ -f "$HERE/$_f" ] || continue
+  _hit="$(sed 's/#.*//' "$HERE/$_f" 2>/dev/null | grep -n -E '\$\{LANE_BACKSTOP_S\}|\$LANE_BACKSTOP_S([^:]|$)' | head -1)"
+  [ -n "$_hit" ] && BARE_SEAM="$BARE_SEAM $_f($_hit)"
+done
+[ -z "$BARE_SEAM" ]; rc=$?
+ck "(i0) every consumer reads the seam with a fallback, never bare, so a stale \$O/spawn-gate.sh cannot abort a lane under set -u${BARE_SEAM:+ — BARE:${BARE_SEAM}}" $rc
 # ⛔ THE CONTROLLER'S STALE-WORKER REAPER MUST NOT PRE-EMPT THAT SAME ALLOWANCE (agent-infra#2999
 # review, P1). `reap_stale_workers` closes a worker on LOG SILENCE alone — it reads no CPU subtree and
 # no lane-bound verdict — so at its old 40 min (2400 s) it was the SAME flat cap #2888 retired from the

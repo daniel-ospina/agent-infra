@@ -132,7 +132,7 @@ esac
 # merge/fix paths lease a PR claim for MORE than `CLAIM_TTL` on purpose, because the lease must cover
 # the review+merge the claim is taken for:
 #     merge-one.sh   CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))  -> 3000s
-#     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 )) -> 8400s
+#     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-${LANE_BACKSTOP_S:-7200}} + 1200 )) -> 8400s
 #                    (3600s before agent-infra#2888: the fixer ran 2400 s, now the 7200 s backstop)
 # So a clamp at 1800 would expire a claim MID-MERGE and hand the same head to a peer — the duplicate
 # work this registry exists to prevent. But before this bound there was no ceiling at ALL: the only
@@ -149,6 +149,26 @@ case "${CLAIM_TTL_MAX:-}" in
   *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=9600 ;;
 esac
 [ "$CLAIM_TTL_MAX" -ge "$CLAIM_TTL" ] || CLAIM_TTL_MAX="$CLAIM_TTL"
+
+# ── HOW OLD MAY A SNAPSHOT BE AND STILL BE BELIEVED? (agent-infra#2466) ─────────────────────────
+# `claim_snapshot` is refreshed once per controller cycle, and every PR/issue SELECTION
+# reads it instead of paying a network round trip per key. Before this bound there was no age at
+# ALL: a snapshot written before a peer's claim still read as current, so a claim published since
+# the last successful fetch was invisible — the exact duplicate the registry exists to prevent, and
+# indistinguishable from "nobody holds it".
+# ⛔ THE CYCLE IS 240 s, NOT 120 s (review, P2): `CYC="${CYC:-240}"` in `orch-loop.sh` and in
+# `install.sh`, and README §"the loop" states the floor. So 900 s is ≈3.75 cycles, ~1 cycle of a
+# suspended laptop — NOT the ~7 this line used to claim. The corrected margin is the point: a cycle
+# whose body overruns 15 min goes stale WITHIN the cycle, and the sweep then acts on nothing for the
+# remainder. Long enough that an ordinary slow cycle or a long dispatch never FALSE-BLOCKS selection,
+# short enough that a wedged or dead refresh cannot hide a peer's claim for anywhere near its lease
+# (CLAIM_TTL 1800 s).
+# The same digit clamp as every other tunable here: an unparseable bound is worse than the default.
+CLAIM_SNAPSHOT_MAX_AGE="${CLAIM_SNAPSHOT_MAX_AGE:-900}"
+case "${CLAIM_SNAPSHOT_MAX_AGE:-}" in
+  ''|*[!0-9]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;
+  *) [ "${#CLAIM_SNAPSHOT_MAX_AGE}" -le 9 ] || CLAIM_SNAPSHOT_MAX_AGE=900 ;;
+esac
 # The repository every git call runs against. Resolution order:
 #   1. an explicit CLAIM_REPO — used exactly as given, SET-AND-EMPTY included: an empty claim repo is
 #      a caller bug, and `_git` REFUSES it rather than defaulting to something (see the empty-value
@@ -793,9 +813,12 @@ _lease_unparseable() {
 # claim_live — and a divergence between them is not a cosmetic defect: on 2026-10-14 a disagreement
 # about exactly this datum made the controller re-spawn a refused fixer EVERY cycle, indefinitely,
 # on a PR no box could work. claim_acquire already carried a note saying the bound must not be
-# re-derived; three copies of it were still there. These three sites now share this one. (The
-# fourth, orch-loop.sh's claim_live, reads the SNAPSHOT rather than a ref and is extracted
-# standalone by selftest.sh, so it keeps its own copy deliberately — see its comment.)
+# re-derived; three copies of it were still there. These three sites share this one. ⛔ AND SINCE
+# agent-infra#2466 SO DOES THE FOURTH: `orch-loop.sh`'s snapshot reader no longer re-derives the
+# polarity either — its `claim_lease_live` calls `claim_snapshot_verdict`, which calls THIS function.
+# (The older note here said that reader "keeps its own copy deliberately because selftest.sh extracts
+# it standalone"; that is no longer true of the code, and the suites now source this file alongside
+# the extraction, so the exception it described is gone.)
 #
 # ⛔ AN UNPARSEABLE LEASE IS LIVE, NEVER FREE. An absent value, the `0` sentinel, any non-digit (a
 # negative collapses to `0` in _lease_of, whose `[0-9]*` cannot match a minus sign) and a 19+-digit
@@ -1287,36 +1310,201 @@ claim_issue_release_record() {
   claim_issue_release "$repo" "$issue" "$own"
 }
 
+# ── THE SNAPSHOT VERDICT (agent-infra#2466) ──────────────────────────────────────────────────
+# ONE reader for "does the durable registry say this key is free?", shared by every caller that
+# SELECTS work (`orch-loop.sh`'s `pr_owned` / `claim_live` / the sweep's printed decision). It adds
+# NO second verdict path: the lease polarity is `_lease_is_live` and the orphan rule is
+# `claim_orphan_reason` — the same two functions `claim_acquire`, `claim_issue_preflight` and
+# `claim_prune` use.
+#
+# ⛔ WHY IT EXISTS. Selection used to read the snapshot with a bare `awk` and fall back to "not
+# owned" whenever the FILE was missing — so every way a registry READ can fail reported as "nobody
+# holds it": no registry provisioned at all, a snapshot written from a FAILED fetch (the fetch's
+# `|| true` leaves the previous cache in place, so the file is a stale read presented as current),
+# and a snapshot older than the cycle reading it. Those are the exact states in which two cells
+# disagree, and the disagreement duplicates work.
+#
+# ⛔ AN UNREADABLE REGISTRY IS NEVER FREEDOM (rc=2). Failing closed costs a beat of delay; failing
+# open duplicates live work, and this is the only signal the boxes share.
+#
+# Published verdict words (an abstention carries a NAMED reason, per docs/ops/fleet-liveness.md §4):
+#   claim-absent      rc 0  the registry was READ, is FRESH, and has no entry for this key -> free
+#   claim-expired     rc 0  an entry whose lease window has passed -> free
+#   claim-orphaned    rc 0  a live window whose HOLDER cannot be a live lane (claim_orphan_reason)
+#   claim-held        rc 1  a live, non-orphaned window -> SKIP (owner in CLAIM_SNAPSHOT_OWNER)
+#   claim-unreadable  rc 2  the registry could not answer. NOT free: no spawn, no merge, no arm.
+# Globals: CLAIM_VERDICT, CLAIM_VERDICT_WHY, CLAIM_SNAPSHOT_OWNER, CLAIM_SNAPSHOT_UNTIL.
+# ⛔ GLOBALS, NOT ONLY STDOUT: the caller idiom is `claim_snapshot_verdict …; rc=$?` — a `$( )`
+# capture would run it in a SUBSHELL and discard the globals (the trap `claim_acquire` documents).
+CLAIM_VERDICT=""; CLAIM_VERDICT_WHY=""; CLAIM_SNAPSHOT_OWNER=""; CLAIM_SNAPSHOT_UNTIL=""
+
+# claim_file_mtime <file> -> epoch seconds, or "" when no `stat` can answer (BSD is tried second).
+claim_file_mtime() {
+  stat -c '%Y' "${1:-}" 2>/dev/null || stat -f '%m' "${1:-}" 2>/dev/null || printf ''
+}
+
+claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
+  local f="${1:-}" ref="${2:-}" hdr read_at fetch now age entry owner until_or_0 why=""
+  CLAIM_VERDICT=""; CLAIM_VERDICT_WHY=""; CLAIM_SNAPSHOT_OWNER=""; CLAIM_SNAPSHOT_UNTIL=""
+  # No key -> nothing was asked. Callers pass a ref built from a PR + head sha; an empty one cannot
+  # address any claim, so this is the ABSENT case rather than an abstention.
+  if [ -z "$ref" ]; then
+    CLAIM_VERDICT="claim-absent"; CLAIM_VERDICT_WHY="no claim key was derived (no head sha)"
+    echo "$CLAIM_VERDICT"; return 0
+  fi
+  if [ ! -f "$f" ]; then
+    why="no claim snapshot at $f — the registry has never been read on this box, so its silence is not evidence of freedom"
+  elif ! hdr="$(head -n 1 "$f" 2>/dev/null)"; then
+    # ⛔ A SNAPSHOT THAT EXISTS BUT CANNOT BE READ IS UNREADABLE, NOT ABSENT (review, P1). `[ -f ]` is
+    # a STAT, so it passes on a file this process cannot OPEN (mode 000, an ownership change from a
+    # `sudo` deploy or a restore) — and the old `head … || true` turned that EACCES/EIO into an EMPTY
+    # `hdr`, which the `case` below read as "a writer older than this reader" and answered from mtime
+    # (stat needs no read permission) → `claim-absent` → rc 0 → THE SWEEP ACTS. Measured: a mode-000
+    # snapshot whose ref WAS held read `claim-absent … no entry … read 0s ago`, a reason that is not
+    # merely empty but confidently wrong. Fail closed on the read itself: the direction that costs a
+    # beat of delay, never a duplicate dispatch.
+    why="the claim snapshot at $f could not be READ (this process cannot open it — permissions or an I/O error) — an unreadable file is not an empty registry"
+  else
+    case "$hdr" in
+      '#claim-snapshot'*)
+        read_at="$(printf '%s' "$hdr" | cut -f2)"
+        fetch="$(printf '%s' "$hdr" | cut -f3)"
+        # ⛔ A HEADER THAT CANNOT STATE ITS OWN READ INSTANT IS UNREADABLE, NOT OLD (review, P2). The
+        # mtime fallback exists for a writer that predates the header — a first line that is NOT a
+        # header at all. A line that IS the header with a missing/non-numeric instant is a writer
+        # this reader cannot parse, and falling back to mtime would believe it on the strength of the
+        # copy that carried it. Say so instead.
+        case "${read_at:-}" in
+          ''|*[!0-9]*) why="the claim snapshot at $f carries a '#claim-snapshot' header with no usable read instant ('${read_at:-}') — the writer is not one this reader can parse" ;;
+        esac ;;
+      *) read_at=""; fetch="" ;;   # a writer older than this reader: mtime is the only age available
+    esac
+    [ -n "$why" ] || [ -n "$read_at" ] || read_at="$(claim_file_mtime "$f")"
+    now="$(date +%s 2>/dev/null || true)"
+    case "${now:-}" in ''|*[!0-9]*) [ -n "$why" ] || why="the local clock is unreadable (date +%s -> '${now:-}')" ;; esac
+    case "${read_at:-}" in
+      ''|*[!0-9]*) [ -n "$why" ] || why="the snapshot's read instant could not be read (header and mtime both unusable)" ;;
+    esac
+    if [ -z "$why" ]; then
+      age=$(( now - read_at ))
+      # ⛔ A FUTURE STAMP IS DROPPED, NEVER TRUSTED (review, P2; the same one-sided-age rule AGENTS.md
+      # records for `skill-reads.json`, now applied here because this is the fleet's cross-box
+      # duplicate signal). The old arm CLAMPED a stamp ahead of the local clock to fresh (`age=0`),
+      # i.e. the further ahead the stamp, the longer it was believed — with NO age bound at all.
+      # A snapshot whose read instant is in the future was written by a clock this box cannot
+      # reconcile with its own, so its age is unknown: unreadable, not eternally fresh.
+      if [ "$age" -lt 0 ]; then
+        why="the snapshot's read instant is ${read_at}, ${age#-}s AHEAD of this box's clock — its age cannot be established, and a future stamp is dropped rather than trusted"
+      elif [ "$fetch" = "failed" ]; then
+        # ⛔ THE FETCH ITSELF DID NOT ANSWER: the entries below are the LAST GOOD read, so a claim
+        # published (or released) since then is invisible. That is a stale read, not a snapshot.
+        why="the snapshot was written from a FAILED fetch (its entries are the last good read, ${age}s old)"
+      elif [ "$age" -gt "$CLAIM_SNAPSHOT_MAX_AGE" ]; then
+        why="the snapshot was read ${age}s ago (> the ${CLAIM_SNAPSHOT_MAX_AGE}s bound)"
+      fi
+    fi
+  fi
+  if [ -n "$why" ]; then
+    CLAIM_VERDICT="claim-unreadable"; CLAIM_VERDICT_WHY="$why"
+    echo "$CLAIM_VERDICT"; return 2
+  fi
+  # ⛔ THE ENTRY READ'S OWN STATUS IS THE ANSWER TOO (review, P1). `awk` exits 2 on an unreadable file
+  # and the old `|| true` threw that away, so a failed read degraded to the ABSENT verdict — the one
+  # verdict that licenses a spawn. Keep it.
+  if ! entry="$(awk -F'\t' -v r="$ref" '$1==r{print; exit}' "$f" 2>/dev/null)"; then
+    CLAIM_VERDICT="claim-unreadable"
+    CLAIM_VERDICT_WHY="the claim snapshot at $f could not be READ for $ref (the entry lookup failed) — a failed read is not an absent entry"
+    echo "$CLAIM_VERDICT"; return 2
+  fi
+  if [ -z "$entry" ]; then
+    CLAIM_VERDICT="claim-absent"; CLAIM_VERDICT_WHY="no entry for $ref in a snapshot read ${age}s ago"
+    echo "$CLAIM_VERDICT"; return 0
+  fi
+  owner="$(printf '%s' "$entry" | cut -f2)"
+  until_or_0="$(printf '%s' "$entry" | cut -f3)"
+  CLAIM_SNAPSHOT_OWNER="${owner:-?}"; CLAIM_SNAPSHOT_UNTIL="${until_or_0:-0}"
+  # ⛔ AN UNPARSEABLE LEASE IS LIVE AND IS NEVER RE-EXAMINED FOR ORPHANHOOD (agent-infra#2094,
+  # pinned by claim-orphan.test.sh O16). The orphan rules are a reason to STOP TRUSTING A TERM; they
+  # are not evidence about the HOLDER. A lease this reader cannot parse must keep its existing
+  # polarity, or the orphan arm becomes a new way to reclaim a claim whose term simply arrived from a
+  # foreign or older writer. This ordering came from `claim_acquire`, and it is reproduced here rather
+  # than re-derived: unparseable/absent → HELD, before any orphan consult.
+  if _lease_unparseable "$until_or_0"; then
+    CLAIM_VERDICT="claim-held"; CLAIM_VERDICT_WHY="held by ${owner:-?} (lease unreadable — treated as live, never re-examined for orphanhood)"
+    echo "$CLAIM_VERDICT"; return 1
+  fi
+  # THE ONE LEASE POLARITY — never a fifth derivation of it.
+  if _lease_is_live "$until_or_0" "$now"; then
+    local orph
+    # The call may be undefined when this runs outside claims.sh; 127 is non-zero, so the `||`
+    # leaves `orph` empty and control falls through to HELD — the fail-closed direction.
+    orph="$(claim_orphan_reason "$owner" "$ref" 2>/dev/null)" || orph=""
+    if [ -n "$orph" ]; then
+      CLAIM_VERDICT="claim-orphaned"; CLAIM_VERDICT_WHY="its holder ${owner:-?} cannot be a live lane ($orph)"
+      echo "$CLAIM_VERDICT"; return 0
+    fi
+    CLAIM_VERDICT="claim-held"; CLAIM_VERDICT_WHY="held by ${owner:-?} until ${until_or_0:-0}"
+    echo "$CLAIM_VERDICT"; return 1
+  fi
+  CLAIM_VERDICT="claim-expired"; CLAIM_VERDICT_WHY="the window of ${owner:-?} closed at ${until_or_0:-0}"
+  echo "$CLAIM_VERDICT"; return 0
+}
+
 # claim_snapshot [<outfile>]
 # Refresh EVERY claim ref locally in ONE round trip, and write one line per claim:
 #     <ref>\t<owner>\t<lease_until>
+# after a HEADER line that records WHEN this snapshot was read and WHETHER the fetch answered:
+#     #claim-snapshot\t<read_at>\t<ok|failed>\t<refs>
+# ⛔ THE HEADER IS THE FIX FOR agent-infra#2466, NOT DECORATION. Without it a snapshot written from a
+# FAILED fetch is byte-identical in shape to a good one (the fetch's `|| true` leaves the previous
+# fetch's CACHE in place, so the file is a stale read presented as current), and a snapshot read
+# hours ago is indistinguishable from one read a second ago. Every reader used to treat both as
+# "the registry says nothing is free-but-blocked" -> i.e. as evidence of freedom, on the ONE signal
+# two boxes share. With the header, `claim_snapshot_verdict` can answer `claim-unreadable` instead of
+# guessing. Consumers that key on field 1 (`awk -F'\t' '$1==ref'`) ignore the header by construction.
 # The sweep then answers "is anyone working on this PR?" from a local file. Without this the
 # controller would pay two network round trips per PR per cycle (24 PRs x 2 = 48 calls).
+# ⛔ `CLAIM_SNAPSHOT_FETCH` / `CLAIM_SNAPSHOT_REFS` are set for the CALLER (the controller prints
+# them on its cycle line): globals because `$(claim_snapshot …)` would run it in a subshell.
+# `CLAIM_SNAPSHOT_WRITE` is a THIRD, separate answer: whether the snapshot could be PUBLISHED. A failed
+# FETCH and a failed PUBLISH have different consequences (the first publishes a header that says so;
+# the second publishes nothing, leaving the PREVIOUS read in place with its OWN header — believed only
+# while that header says `ok` AND it is inside CLAIM_SNAPSHOT_MAX_AGE, `claim-unreadable` otherwise: a
+# prior `failed` header, or no previous snapshot at all), so a caller that collapses them logs the
+# wrong cause AND the wrong consequence (review, P2).
+CLAIM_SNAPSHOT_FETCH=""; CLAIM_SNAPSHOT_REFS=""; CLAIM_SNAPSHOT_WRITE=""
 claim_snapshot() {
   # `$1` is OPTIONAL and `set -u` is on, so the temp name must NOT be built from it directly:
   # `local out="${1:-…}" tmp="$1.$$"` dereferences the unset `$1` and aborts the whole fetch with
   # "unbound variable" (exit 127) instead of falling back to the default (P2, 2026-10-14 export
   # review). Derive the temp name from the RESOLVED output path.
   local out="${1:-$HOME/orchestrator/state/claims-snapshot}"
-  local tmp="$out.$$"
-  : > "$tmp"
-  # ⛔ A FAILED FETCH MUST NOT REPLACE A GOOD SNAPSHOT WITH AN EMPTY ONE, AND MUST SAY SO (review
-  # catch, 2026-10-18). The old shape was `fetch … || true` and then an unconditional `mv`, so ANY
-  # fetch failure — a 30 s network blip, or the unreadable cwd of the 2026-10-18 incident — wrote an
-  # EMPTY file over the last good one, and `claim_live()` reads "absent from the snapshot" as "free".
-  # Measured: 3 claims on origin, 0 snapshot lines, nothing logged anywhere, while ARCHITECTURE said
-  # this path "fail-open on an unreachable store (logs it)". The prior snapshot is now KEPT (its
-  # leases are self-dating, so a stale one can only make the sweep abstain, never grant a claim), and
-  # the reason is written where the operator reads it.
+  local tmp="$out.$$" body="$out.body.$$" fetch now n write
+  : > "$body"
   # --prune so a claim DELETED on another box (released, or pruned) does not linger here.
   # ⛔ It prunes by DESTINATION pattern, so worker-side temp refs must live in CLAIM_TMP_NS, never
   # under CLAIM_CACHE_NS — a snapshot must not delete a concurrent lease read (P2).
-  if ! _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null; then
-    rm -f "$tmp"
+  if _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null; then
+    fetch=ok
+  else
+    # ⛔ A FAILED FETCH MUST NOT REPLACE A GOOD SNAPSHOT WITH AN EMPTY ONE, AND MUST SAY SO
+    # (agent-infra#2466; the 2026-10-18 catch). The old shape was `fetch … || true` followed by an
+    # unconditional `mv`, so ANY fetch failure — a 30 s network blip, or an unreadable cwd — wrote an
+    # EMPTY file over the last good one and every key then read "free" (measured: 3 claims on origin,
+    # 0 snapshot lines, nothing logged). Two independent mechanisms now hold, and BOTH are needed:
+    #   • the BODY is not truncated: a failed fetch leaves the cache alone, so what is published is
+    #     the LAST GOOD read rather than an empty file (main's #2466 arm, kept); and
+    #   • the HEADER says `failed`, so `claim_snapshot_verdict` refuses the snapshot at ANY age
+    #     instead of trusting a read it knows did not answer (this PR's arm). Keeping the last good
+    #     body with an `ok` header would be the same fail-open one step later: a claim acquired since
+    #     that read is simply not in it, and its absence reads as freedom.
+    # The reason goes to STDERR, which the controller redirects into $LOG: it runs in a detached tmux
+    # pane, so an unredirected stderr reaches no file at all — a refresh that failed for ever would
+    # be silent while the sweep decided from a frozen snapshot. Same idiom as `claim_prune`.
+    fetch=failed
     local why; why="$(_claim_repo_problem)"
-    printf 'claim_snapshot: registry refresh FAILED — %s (previous snapshot kept: %s)\n' \
+    printf 'claim_snapshot: registry refresh FAILED — %s (publishing a FAILED header over the last good read: %s)\n' \
       "${why:-git fetch exited non-zero}" "$out" >&2
-    return 1
   fi
   _git for-each-ref --format='%(refname)' "$CLAIM_CACHE_NS" 2>/dev/null | while read -r ref; do
     [ -n "$ref" ] || continue
@@ -1326,8 +1514,42 @@ claim_snapshot() {
     # Emit the CLAIM namespace, not the cache namespace the fetch landed in, so a lookup with
     # claim_ref() matches. (Measured: emitting the cache ref made every lookup miss silently.)
     printf '%s\t%s\t%s\n' "${CLAIM_NS}/${ref#"$CLAIM_CACHE_NS"/}" "${owner:-?}" "${until:-0}"
-  done > "$tmp"
-  mv -f "$tmp" "$out" 2>/dev/null || true
+  done > "$body"
+  n="$(wc -l < "$body" 2>/dev/null | tr -d ' ')"
+  case "${n:-}" in ''|*[!0-9]*) n=0 ;; esac
+  now="$(date +%s 2>/dev/null || true)"
+  case "${now:-}" in ''|*[!0-9]*) now=0 ;; esac
+  # A read instant of 0 is NOT a fresh read: the reader treats it as unreadable (0 is in the past by
+  # every clock), which is the fail-closed direction on a box whose `date` cannot answer.
+  # ⛔ A FAILED WRITE MUST NOT PUBLISH AN EMPTY SNAPSHOT (review, P2). The brace below used to
+  # discard its own exit status and the `mv` was `|| true`, so a failed write (ENOSPC/EIO under
+  # `$O/state`) still created `$tmp` and replaced the last GOOD read with a 0-byte file — and a
+  # header-less snapshot falls back to a fresh mtime, so every key then read `claim-absent` (FREE)
+  # while the cycle log printed `read=ok refs=0`. That is the "an empty one reads UNOWNED" state
+  # this header exists to refuse, reached from the write side. Fail closed instead: publish nothing,
+  # keep the previous (age-guarded) snapshot, and report the failure as a WRITE failure
+  # (`CLAIM_SNAPSHOT_WRITE=failed`) — NOT as a fetch failure, because the fetch may well have
+  # answered, and the caller logs the two differently.
+  if { printf '#claim-snapshot\t%s\t%s\t%s\n' "$now" "$fetch" "$n"; cat "$body"; } > "$tmp" 2>/dev/null \
+     && mv -f "$tmp" "$out" 2>/dev/null; then
+    write=ok
+    rm -f "$body" 2>/dev/null || true
+  else
+    # ⛔ A FAILED PUBLISH IS NOT A FAILED FETCH (review, P2). `fetch` keeps the FETCH's own answer;
+    # `write` records this failure. On a failed FETCH the published header itself says `failed`, so
+    # the reader refuses it at any age. On a failed PUBLISH nothing is published, so the PREVIOUS
+    # snapshot survives with its OWN header — and that header decides, not this function: the reader
+    # believes it only while the header says `ok` AND it is inside CLAIM_SNAPSHOT_MAX_AGE, and answers
+    # `claim-unreadable` for a prior `failed` header or for no prior snapshot at all. (An earlier
+    # draft of this very comment said the snapshot was believed "until it ages out", which the reader
+    # falsifies in two of those three cases — do not reintroduce the unqualified form.) Collapsing the
+    # two made the cycle log assert a stand-down that did not happen, and pointed an auditor at the
+    # network when the cause was the disk.
+    write=failed; n=0
+    rm -f "$tmp" "$body" 2>/dev/null || true
+  fi
+  CLAIM_SNAPSHOT_FETCH="$fetch"; CLAIM_SNAPSHOT_REFS="$n"; CLAIM_SNAPSHOT_WRITE="$write"
+  return 0
 }
 
 # claim_prune — delete EXPIRED and ORPHANED-HOST claim refs (git refs are unbounded), and reap
