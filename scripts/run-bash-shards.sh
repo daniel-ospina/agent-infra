@@ -318,8 +318,31 @@ fi
 # correct COUNT (10 each) and print ✅ while 10 of the 80 shards never run at all. The list grows, so
 # that decay is scheduled rather than hypothetical. The set is compared at the end.
 shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
+# ⛔ THE SKIPPED PATHS ARE RECORDED TOO, WITH THEIR REASON (agent-infra#3084). `shard_skipped` was a
+# bare counter, so a slice could SAY it had skipped 31 shards and name none of them — and the
+# `ran + skipped == listed` check had no way to tell "this slice skipped 31 by design" from "31
+# shards vanished and the counter drifted to the same number". One line per skip, `<path>\t<reason>`.
+shard_skip_log="${shard_ran_log}.skipped"
 : > "$shard_ran_log" 2>/dev/null || true
-trap 'rm -f "$shard_ran_log"' EXIT
+: > "$shard_skip_log" 2>/dev/null || true
+trap 'rm -f "$shard_ran_log" "$shard_skip_log"' EXIT
+
+# shard_unaccounted — the listed shards this run neither EXECUTED nor SKIPPED, one path per line.
+# ⛔ DERIVED FROM THE LIST, never from the counters (agent-infra#3084). `executed + skipped == listed`
+# on its own can be satisfied while a specific shard is missing — the counters are what the loop
+# writes, and a loop that never reached a shard writes neither. This compares the derived list
+# against the two logs, so the answer is `which shards`, not `how many`.
+shard_unaccounted() {
+  local all="${shard_ran_log}.all" acct="${shard_ran_log}.acct"
+  printf '%s\n' "$shard_paths" | awk 'NF' | LC_ALL=C sort -u > "$all" 2>/dev/null || return 0
+  { cat "$shard_ran_log"; cut -f1 "$shard_skip_log"; } 2>/dev/null | awk 'NF' | LC_ALL=C sort -u > "$acct"
+  comm -23 "$all" "$acct" 2>/dev/null
+  rm -f "$all" "$acct"
+  return 0
+}
+# shard_count_lines <text> — the non-empty line count of a string (a COUNT that cannot be satisfied
+# by an empty string is the point: `wc -l` on a value without a trailing newline reports 0).
+shard_count_lines() { awk 'NF { n++ } END { print n + 0 }' <<<"$1"; }
 
 # ── NAMING THE FAILING SHARD (#2643) ──────────────────────────────────────────────────────────
 # The count alone is UNATTRIBUTABLE. `❌ 4 bash shard(s) failed` names no suite, so nobody reading
@@ -383,6 +406,7 @@ slice_skips() {
   [ "$slice_pos" -lt "$listed" ] || return 1
   [ $((slice_pos % slice_count)) -eq "$slice_index" ] && return 1
   shard_skipped=$((shard_skipped + 1))
+  printf '%s\tslice %s/%s\n' "$1" "$((slice_index + 1))" "$slice_count" >> "$shard_skip_log" 2>/dev/null || true
   return 0
 }
 
@@ -435,7 +459,7 @@ shard_note() {
 # parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
 # of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
 # a PR-unique failure and still blocks.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" </dev/null || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -533,19 +557,59 @@ echo "── hermetic suites ─────────────────
 # matching SUITE_GLOBS, so two harness PRs adding two suites no longer conflict in this file.
 # The order is the list's (LC_ALL=C sort -u) — see DERIVATION: every suite is hermetic, so no
 # suite depends on running before or after another.
+#
+# ⛔ THE LIST IS READ INTO MEMORY BEFORE THE FIRST SHARD RUNS (agent-infra#3084). It used to be
+# `while read shard; do run_shard "$shard"; done <<<"$shard_paths"`, and that loop's stdin WAS the
+# list: every shard inherited it, so a shard that read stdin consumed the lines the driver had not
+# reached yet and the loop simply ENDED — no error, no name. Measured on main's `script-validate`
+# job (2026-10-30): `executed 107 of 139 listed shard(s) (0 skipped)`, the last timing row being
+# `▸ 60s scripts/pi-reap-idle.test.sh` — that suite reads stdin (see `run_shard`'s `</dev/null`),
+# drained the remaining 32 lines, and 32 shards silently never ran on main or on any PR for as long
+# as the count was tolerated as "a mismatch". An ARRAY cannot be drained by a child, so the list is
+# now consumed by the driver alone; `run_shard` additionally hands every shard `</dev/null` so the
+# hermetic contract is stated rather than inherited.
+shard_array=()
 while IFS= read -r shard; do
   [ -n "$shard" ] || continue
-  run_shard "$shard"
+  shard_array+=("$shard")
 done <<<"$shard_paths"
+# The array is built from the same variable the count came from, so a truncated read (a blank line,
+# a partial list) is caught HERE, before any shard is executed, and named as its own defect.
+if [ "${#shard_array[@]}" -ne "$listed" ]; then
+  echo "❌ the list reads $listed shard(s) but only ${#shard_array[@]} could be read into the run — refusing to start (the list and the checkout disagree)"
+  exit 1
+fi
+for shard in ${shard_array[@]+"${shard_array[@]}"}; do
+  run_shard "$shard"
+done
 echo "───────────────────────────────────────────────────────────────────"
-# Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
-# a helper whose execution was disabled — a text-only floor would still see the same listed count.
 # Runtime self-check 1: every listed shard must have been EXECUTED or DELIBERATELY SKIPPED for
 # this slice. This is the arm that catches a helper whose execution was disabled — a text-only
 # floor would still see the same listed count. `executed + skipped == listed` also means the list
 # was traversed end to end: a slice cannot quietly stop early.
+#
+# ⛔ AND IT NAMES WHAT IS MISSING (agent-infra#3084). The count alone is the defect that hid this
+# for 32 shards: `executed 107 of 139 listed shard(s)` says a number is wrong and nothing else, so
+# the reader cannot tell which suites never ran, and the merge rail cannot tell "this shard is red"
+# from "this shard did not run". The set difference below is computed from the LIST and the two logs
+# the loop itself writes, so it reports every listed shard that is neither executed nor skipped —
+# by path — and a mismatch whose missing set is EMPTY is reported as the different defect it is
+# (a shard executed twice, i.e. a second list), never as the same message.
 if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
   echo "❌ executed $shard_ran of $listed listed shard(s) ($shard_skipped skipped) — the list and the execution disagree"
+  unaccounted="$(shard_unaccounted)"
+  if [ -n "$unaccounted" ]; then
+    echo "❌ LISTED BUT NEITHER EXECUTED NOR SKIPPED — $(shard_count_lines "$unaccounted") shard(s) this run never reached:"
+    while IFS= read -r _u; do [ -n "$_u" ] && printf '   ❌ NEVER RAN: %s\n' "$_u"; done <<<"$unaccounted"
+    echo "   (a short COUNT is not a short LIST: each path above is in the derived list and was never handed to a shard — fix the driver, do not lower the number)"
+  else
+    echo "❌ …yet every listed shard IS accounted for — so a shard was executed MORE than once: $(sort "$shard_ran_log" | uniq -d | tr '\n' ' ')"
+    echo "   (a duplicated run is not extra coverage: check for a second list fed into this loop, #2838's class)"
+  fi
+  if [ "$shard_skipped" -gt 0 ]; then
+    echo "   ⏭  $shard_skipped shard(s) were DELIBERATELY skipped, with the reason recorded:"
+    while IFS="$(printf '\t')" read -r _p _why; do [ -n "$_p" ] && printf '   ⏭  SKIPPED: %s (%s)\n' "$_p" "$_why"; done < "$shard_skip_log"
+  fi
   exit 1
 fi
 # ⛔ THE CALL COUNT IS CHECKED TOO, NOT ONLY THE TALLY (#2838). `ran + skipped` uses the same
