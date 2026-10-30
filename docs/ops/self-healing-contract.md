@@ -328,10 +328,23 @@ fix the red).
 deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doctor.status.json` with
 `rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
-worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `4` crash;
-`64` the command line is unusable (**not** 2, so a launchd typo cannot masquerade as a refusal).
-⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's `ok` stands
-and *"a failure only `launchctl list` can witness is a silent failure"*.
+worktree holding uncommitted work, a refusing transport) stopped the order before delivery, so an
+operator must repair the chain; `6` **NO-CAPACITY** — the box's own spawn gate refused every order,
+**nothing was consumed**, and the sidecar also carries `verdict`, `refusal_bound`
+(`<axis>=<count>[,…]`, e.g. `load=1` or `disk=2,load=1`) and
+`room` (the `capacity.sh probe` record measured at decision time); the reason is a PREFIX —
+`VERDICT=… next=<token> bound=… room=<the few figures>; <the remedy sentence>` — because both readers
+cut the tail (110 chars in the beat), so the remedy must not sit past the cut; `4` crash; `64` the command line is
+unusable (**not** 2, so a launchd typo cannot masquerade as a refusal). ⛔ `3` and `6` are SEPARATE
+because their remedies are opposite — wait vs repair — and a caller that merges them sends an operator
+to the wrong one with full confidence (#2291, measured: `EXIT rc=3 -- 1 order(s) no worker accepted`
+for both). `6` is a pass for `fleet-inventory`'s table (state `WAITING`) **only on the LOAD axis** and is
+**never** rendered `ok`: the queue is not moving while the box has no room, and the other three axes
+(`disk`, `fork`, `land-backlog`) do not clear by waiting — the gate itself says so per code — so those
+render `FAILING`, and a `6` whose bound cannot be read renders `UNKNOWN` (an abstention is never a
+pass). ⛔ The sidecar **must** be overwritten by a
+refusing pass — otherwise the previous pass's
+`ok` stands and *"a failure only `launchctl list` can witness is a silent failure"*.
 `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
 ⛔ **AND `0` IS NOT REACHABLE FROM A PASS THAT REFUSED AN ORDER** (#2710, measured 2026-10-27). A
 worktree refusal that will not clear by waiting (uncommitted work, commits the PR head does not have)
@@ -489,6 +502,31 @@ census. ⛔ **Liveness is the worker's own exit-status file, never `%CPU`** (`%C
 **What repairs it.** `exit 78` → reinstall the harness (§3.14). `kind not bg|prfix` → the deployed `$O`
 copy predates the kind: refresh `$O`. A `.rc` that never appears → the worker died before its wrapper
 wrote it; the ledger row is the only trace.
+
+⛔ **A create refusal carries a MEASUREMENT, not the daemon's guess (#2404).** On a cell, worker
+spawning goes through the guest CLI's `workspace create`, and when the durable session owner can no
+longer allocate, it fails with `{"reason":"database or disk is full"}` — measured on cell-3
+2026-11-02 while `/` had 28 G free, inodes were 25 % used and `~/.cmux` was 37 M. `wt_spawn` used to
+relay that message as THE REASON, so every reader went to `df` and the cell stayed capped at the lanes
+it already had, while its `[cap]` line read healthy. A refusal now carries
+`MEASURED on this box — space … free=… inodes=… state=…; server status=…`, names the daemon's text a
+claim it did not verify, and — where the reading says the SESSION is the finding — tries
+`cmux server ensure --session <s>` up to `WT_SERVER_ENSURE_ATTEMPTS` times (default **2**, matching the
+measured fail-once flake; it never runs when the volume is measured short, and every attempt goes
+through the bounded wrapper) and then re-attempts the create **once**. **Read the measured
+line before touching the volume**: if the volume is not short and the owner answers `status running`,
+the repair is the session owner, not the disk. The spawn path never runs `server stop --force` (it ends
+every terminal inside the owner, i.e. every live lane); that lever stays an operator action, and a
+refusal it could not clear says so. **Operator knobs:** `WT_STATE_FREE_FLOOR_MB` (1024),
+`WT_STATE_INODE_PCT_FLOOR` (95), `WT_CMUX_SESSION` (`cloud`), `WT_SERVER_TIMEOUT` (10 s),
+`WT_SERVER_ENSURE_ATTEMPTS` (2 — the one recovery bound worth reaching for first),
+`WT_SERVER_ENSURE_SLEEP` (2 s), and `WT_SESSION_RECOVER=0` to disable probing and recovery entirely.
+⛔ `WT_CMUX_SESSION` is a **fixture seam, not a deployment knob**, and the CLI is why: the `server`
+verbs take `--session` but **`cmux layout apply` takes none** (measured on cell-4 2026-10-29 —
+`cmux layout apply --help` lists `--workspace/--name/--cwd/--json` and the create always dials
+`…/cloud.sock`). Set it to anything but `cloud` and the recovery ensures one session while the create
+tries another: the box keeps a stray durable owner and the create still fails. The defaults line up;
+a non-default value does not.
 
 **state.** cell-4: present (`prfix_hits=5`), workers live (2 `fix-*`, 2 `merge-*`).
 

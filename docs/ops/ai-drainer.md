@@ -53,11 +53,32 @@ nothing, and it exits 0):
    cannot disagree; `MEM_BUDGET_PCT` (75) stops the target at the boundary instead of consuming the
    last megabyte; `LANE_MEM_MB` (512) is the measured resident budget of one lane (a `pi -p` host idles
    at 77–85 MB; the fleet measures ~250–400 MB per working pass). Two arms refuse to *add* work on top
-   of the target: **load ≥ 8 × ncpu** (`LPC_CEILING`, the fleet's "do not place here" line) and **swap
-   below `MIN_SWAP_MB` — only where swap EXISTS**. A cell ships with no swap, so `SwapFree = 0` there
-   means *absent*, never *exhausted*: folding the two made every tick on every cell skip, i.e. an
-   installed job that dispatched nothing and exited 0. An unreadable **load / memory / swap** probe
-   **fails closed** — a guard that could not be evaluated must not look like an idle box. The **cores**
+   of the target: **load ≥ 8 × ncpu** (`LPC_CEILING`, the fleet's "do not place here" line) and the
+   **swap arm** — which is a *different gate on each platform*, because the two `free` numbers are
+   different quantities:
+
+   * **Linux** — swap is a fixed partition/volume, so `SwapFree` **is** headroom: `swap_free <
+     MIN_SWAP_MB` (700) refuses. Only where swap EXISTS: a cell ships with no swap, so `SwapFree = 0`
+     there means *absent*, never *exhausted*: folding the two made every tick on every cell skip, i.e.
+     an installed job that dispatched nothing and exited 0.
+   * **Darwin** — there is **no free-swap floor**, and the kernel's own verdict refuses instead:
+     `kern.memorystatus_vm_pressure_level` (1 normal, 2 warning, 4 critical) at or above
+     `MAX_MEM_PRESSURE_LEVEL` (default 2). Only 2, 3 and 4 are accepted: **`1` is rejected**, because
+     it is the kernel's NORMAL level and the comparison is `>=`, so a threshold of 1 would refuse
+     every box — for ever — while each tick exited 0. A deliberate stop is `MAX_LANES=0` /
+     `TARGET_LANES=0`, never a threshold; an unusable value warns and falls back to the shipped
+     default. macOS grows its swap files **on demand**, so `total` is the sum of
+     the files the kernel has created so far and `free = total − used` is low *because the kernel grew
+     the file*, not because the box cannot take a lane; `used` is a high-water mark it does not
+     release. Measured 2026-10-29: `free = 412 MB of 3072 MB` refused every tick while the pressure
+     level read **1 = normal** and `memory_pressure -Q` read **52 % free** — a latch that can never
+     reopen. (Same root as agent-infra#2016, which corrected the identical reading in `orch-loop.sh`'s
+     `[cap]` gate.)
+
+   An unreadable **load / memory / swap / Darwin-pressure** probe **fails closed** — a guard that
+   could not be evaluated must not look like an idle box. A box whose platform cannot be identified is
+   one of those cases: the two swap arms are different gates, so choosing one on a guess is refused by
+   name (`DRAINER_OS` overrides `uname -s`; it is the suite's seam). The **cores**
    probe is the one exception, and it does not fail closed: it is the CPU *ceiling* only, so an
    unreadable one warns and assumes 4 cores, which under-reports the ceiling (the conservative
    direction) instead of stopping the job.
@@ -120,7 +141,10 @@ proving nothing; the lock is re-run with the lock block deleted and two ticks mu
 A second lock arm drives the *reclaim* path directly (three ticks racing over one STALE lock dispatch
 from exactly one), which is the arm that catches a non-atomic reclaim. The capacity formula is
 asserted on injected probes (cpu binds / memory binds / load refuses / **no swap still dispatches** /
-an unreadable probe fails closed), the census is asserted against a stubbed launcher module and against
+the **swap arm per platform** — the measured `412MB/3072MB` reading REFUSES on Linux and DISPATCHES on
+Darwin at normal pressure while critical pressure refuses there too, and the threshold's own two bad
+ends, `9` and the never-open `1`, are both rejected loudly / an unreadable probe fails closed), the
+census is asserted against a stubbed launcher module and against
 an unreadable `ps` (unknown is ALIVE), the generated brief is piped through the dispatcher's own
 `brief-gate.sh` (plus a non-vacuity arm in which the stripped brief MUST be refused), a lane's window is
 never re-issued while it is live (paired with a mutation that ignores the held set and must then
