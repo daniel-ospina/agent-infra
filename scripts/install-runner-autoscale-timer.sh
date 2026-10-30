@@ -244,6 +244,27 @@ xml_escape_only() {
     printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+# repl_for <systemd|launchd> <value> — the escaper for ONE ARM, because the two artifacts are not the
+# same language and the same escaping is therefore not correct for both.
+# ⛔ `render` used `xml_sed_repl` — the XML-entity escape PLUS the sed-replacement escape — for every
+# placeholder on BOTH arms. The sed half is required on both (the value lands in a `s|…|…|`
+# replacement); the XML half is correct only where the value lands in an XML text node, i.e. the plist.
+# On the systemd arm it wrote the ENTITY into the unit — `HOME=/home/a&b` rendered
+# `Environment=HOME=/home/a&amp;b` — a path that is not the one the installer resolved, and nothing
+# downstream could see it: `refuse_unusable_target` refuses only a backslash,
+# `refuse_systemd_unsafe_values` refuses only whitespace and `%`, and BOTH renders of one value produce
+# the same entity, so the drift `cmp` and `--status` report `drift_artifact=no` while every tick points
+# at a directory that does not exist. The asymmetry is the fix and is asserted in both directions (T48):
+# the systemd arm renders the literal value, the plist still entity-escapes it (a raw `&` there is a
+# malformed XML document launchd refuses). This also makes the PLACEHOLDER family agree with the
+# COMPOSED `{{PROVISIONER_ENV}}` family, which has always been sed-only on systemd (T31 pins it).
+repl_for() {
+    case "$1" in
+        launchd) xml_sed_repl "$2" ;;
+        *)       sed_escape_repl "$2" ;;
+    esac
+}
+
 # ── resolve the converger ─────────────────────────────────────────────────────────────────────
 # ⛔ A FARMED INSTALLER HAS NO CHECKOUT BESIDE IT, AND THE CONVERGER IS NOT FARMED AT ALL. The farm
 # (`pi-bootstrap/setup.sh`'s fleet_srcs) copies flat `scripts/<name>` entries, a shape that cannot even
@@ -570,14 +591,14 @@ provisioner_env_for() { # provisioner_env_for systemd|launchd
 
 render() { # render <template> <dest> <systemd|launchd>
     local tpl="$1" dest="$2" flavour="$3"
-    sed -e "s|{{USER}}|$(xml_sed_repl "$(id -un)")|g" \
-        -e "s|{{HOME}}|$(xml_sed_repl "$HOME")|g" \
-        -e "s|{{PATH}}|$(xml_sed_repl "$PATH")|g" \
-        -e "s|{{STATE_DIR}}|$(xml_sed_repl "$STATE_DIR")|g" \
-        -e "s|{{PYTHON}}|$(xml_sed_repl "$PYTHON")|g" \
-        -e "s|{{PY_BIN}}|$(xml_sed_repl "$PYTHON")|g" \
-        -e "s|{{SCRIPT}}|$(xml_sed_repl "$SCRIPT")|g" \
-        -e "s|{{REPO}}|$(xml_sed_repl "$REPO")|g" \
+    sed -e "s|{{USER}}|$(repl_for "$flavour" "$(id -un)")|g" \
+        -e "s|{{HOME}}|$(repl_for "$flavour" "$HOME")|g" \
+        -e "s|{{PATH}}|$(repl_for "$flavour" "$PATH")|g" \
+        -e "s|{{STATE_DIR}}|$(repl_for "$flavour" "$STATE_DIR")|g" \
+        -e "s|{{PYTHON}}|$(repl_for "$flavour" "$PYTHON")|g" \
+        -e "s|{{PY_BIN}}|$(repl_for "$flavour" "$PYTHON")|g" \
+        -e "s|{{SCRIPT}}|$(repl_for "$flavour" "$SCRIPT")|g" \
+        -e "s|{{REPO}}|$(repl_for "$flavour" "$REPO")|g" \
         -e "s|{{MODE_FLAG}}|$(mode_flag)|g" \
         -e "s|{{MODE_ARG}}|$(sed_escape_repl "$(mode_arg_for)")|g" \
         -e "s|{{INTERVAL_SEC}}|$INTERVAL_SEC|g" \
@@ -653,8 +674,11 @@ refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
     fi
     # ⛔ AND THE RENDERER ITSELF. Every substituted value goes through `sed -e "s|{{X}}|$v|g"`, so a
     # BACKSLASH in a value is a sed ESCAPE: the rendered path would silently differ from the real one,
-    # with no `{{` left for the post-render guard to catch. `&` and `|` are refused by construction
-    # (`xml_sed_repl` escapes them); the backslash is the silent one.
+    # with no `{{` left for the post-render guard to catch. `&`, `|` and `&`/`<`/`>` on a plist are
+    # made literal by the escapers (`sed_escape_repl` on the systemd arm, `xml_sed_repl` on launchd —
+    # see `repl_for`), so the backslash is the one left that survives escaping and is then re-consumed
+    # by the SCHEDULER's own parser: systemd treats a trailing backslash as a line continuation and
+    # applies C-style escapes in `Environment=`, so the value the pass sees would not be this one.
     for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "SCRIPT=$SCRIPT" "PYTHON=$PYTHON" \
              "REPO=$REPO" "PROVISIONER=$PROVISIONER"; do
         case "${v#*=}" in
