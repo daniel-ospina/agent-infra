@@ -429,6 +429,63 @@ print(v if isinstance(v, str) else "")' "$art" "$key" 2>/dev/null && return 0
         }' "$art"
 }
 
+# artifact_repo_value <artifact> — the `--repo` value the ARTIFACT's own command line carries.
+# ⛔ `--repo` IS NOT AN ENVIRONMENT KEY, SO THE ENV READ-BACK CANNOT SEE IT. Both templates carry the repo
+# as a COMMAND-LINE argument (`ExecStart=… --repo "{{REPO}}"` / a `ProgramArguments` element), which is why
+# `artifact_env_value … RUNNER_AUTOSCALE_REPO` returned empty on every box: `drift_inputs=repo` was dead
+# code, the drift render used the READER's repo, and an untouched artifact on a non-default-repo box
+# reported `drift_artifact=yes` on every read — the "a signal that always fires is a signal nobody reads"
+# class this block exists to remove. The command line is the record, so the command line is read.
+artifact_repo_value() { # artifact_repo_value <artifact>
+    local art="$1" line
+    [ -f "$art" ] || return 0
+    if [ "$TARGET" = "launchd" ]; then
+        line="$(plist_program_args "$art")"
+    else
+        line="$(unit_exec_line "$art" | tr ' ' '\n' | tr -d '"')"
+    fi
+    printf '%s\n' "$line" | awk 'found { print; exit } $0 == "--repo" { found = 1 }'
+}
+
+# note_repo_change — an install must not SILENTLY repoint the pool an installed artifact converges.
+# ⛔ MEASURED HARM (the same class as `adopt_installed_provisioner`, one argument over): `--repo` defaults
+# to agent-infra's own repo when `RUNNER_AUTOSCALE_REPO` is unset, so a routine `--install` from a shell
+# that does not export it rewrites a box converged from a NON-default pool to the default — and the pass
+# then grows the wrong pool every 9 minutes, with `changed=1` and exit 0. Unlike the provisioner there is
+# no "unresolved" state to fall back on (a default is always resolvable), so this REPORTS rather than
+# adopts: the operator may well mean it, and blocking that would be a false block.
+note_repo_change() {
+    local art declared
+    art="$(artifact_path_for_target)"
+    [ -f "$art" ] || return 0
+    declared="$(artifact_repo_value "$art")"
+    [ -n "$declared" ] || return 0
+    [ "$declared" = "$REPO" ] && return 0
+    err "note: the installed artifact converges repo '$declared' and this invocation resolves '$REPO', so THIS install repoints the capacity pass to '$REPO'."
+    err "      If that is not intended, re-run with:  RUNNER_AUTOSCALE_REPO='$declared' $0 $MODE"
+    return 0
+}
+
+# artifact_is_armed() — does the INSTALLED artifact actually CONVERGE? Used by `--arm`'s failure path,
+# which must not keep a dated record over an artifact that does not exist or would measure only.
+# ⛔ THE QUESTION IS "IS ANYTHING CONVERGING", NOT "DID THE REPORT SAY SO". The record is the only on-disk
+# statement that this box converges, so it is worth keeping exactly when an armed artifact backs it.
+artifact_is_armed() {
+    local art line args
+    art="$(artifact_path_for_target)"
+    [ -f "$art" ] || return 1
+    if [ "$TARGET" = "launchd" ]; then
+        args="$(plist_program_args "$art")"
+        args_has_line "$args" "--dry-run" && return 1
+        args_has_line "$args" "--status" && return 1
+        return 0
+    fi
+    line="$(unit_exec_line "$art")"
+    [ -n "$line" ] || return 1
+    case "$line" in *--dry-run*|*--status*) return 1 ;; esac
+    return 0
+}
+
 # adopt_installed_provisioner — an install that resolves NOTHING must not STRIP a pin the artifact
 # already carries.
 # ⛔ MEASURED, AND IT DESTROYS THE FILL HALF SILENTLY. `resolve_provisioner` correctly treats a named pin
@@ -799,14 +856,20 @@ unit_dropin_timerfiles() { # .conf drop-ins that would override the timer's CADE
     [ -d "$d" ] || return 0
     for f in "$d"/*.conf; do
         [ -f "$f" ] || continue
-        # ⛔ EVERY `On*` ELAPSE KEY COUNTS, NOT THE THREE THE BASE TEMPLATE HAPPENS TO USE. systemd fires a
-        # timer at EVERY elapse point it finds, and a drop-in assignment ADDS one (`OnActiveSec=` and
-        # `OnStartupSec=` and `OnUnitInactiveSec=` are independent of `OnBootSec=`/`OnUnitActiveSec=`), so
-        # a list of the base template's own keys let `OnActiveSec=1min` fire the pass every minute and still
-        # report a clean box. `RandomizedDelaySec=` moves every fire, and `Unit=` decides what it fires.
+        # ⛔ EVERY `On*` ELAPSE KEY COUNTS, AND THAT INCLUDES THE ONES WITHOUT A `Sec` SUFFIX. systemd
+        # fires a timer at EVERY elapse point it finds, and a drop-in assignment ADDS one (`OnActiveSec=`,
+        # `OnStartupSec=`, `OnUnitInactiveSec=`, `OnCalendar=`, `OnClockChange=`, `OnTimezoneChange=` are
+        # all independent of `OnBootSec=`/`OnUnitActiveSec=`), so a list of the base template's own keys let
+        # `OnActiveSec=1min` fire the pass every minute and still report a clean box. `RandomizedDelaySec=`
+        # moves every fire, and `Unit=` decides what it fires.
+        # ⛔ `OnCalendar=` IS ITS OWN KEY, NOT AN `…Sec`, so the first version of this list missed it while
+        # its comment claimed "EVERY `On*` ELAPSE KEY". A `…timer.d/*.conf` carrying `OnCalendar=hourly`
+        # adds an hourly fire, leaves the base timer byte-identical, and both the readiness verb AND the
+        # writers certified a 9-minute cadence the box does not have — the same false PASS, the one key
+        # the timer template names as a deliberate design property (it carries no `OnCalendar=`).
         # ⛔ AND `Persistent=` IS NOT IN THE LIST: it applies to `OnCalendar=` only, this unit deliberately
         # carries none (see the timer template's own comment), so flagging it would be a false block.
-        [ -n "$(sed -n -E 's/^[[:space:]]*(On[A-Za-z]*Sec|RandomizedDelaySec|Unit)[[:space:]]*=.*/x/p' "$f")" ] && printf '%s\n' "$f"
+        [ -n "$(sed -n -E 's/^[[:space:]]*(On[A-Za-z]*Sec|OnCalendar|OnClockChange|OnTimezoneChange|RandomizedDelaySec|Unit)[[:space:]]*=.*/x/p' "$f")" ] && printf '%s\n' "$f"
     done
     return 0
 }
@@ -856,6 +919,10 @@ verify_installed_unit() { # verify the ARTIFACT at $UNIT_DIR, not the bytes we h
     else
         case "$line" in
             *--dry-run*) err "REFUSING: the installed ExecStart still carries --dry-run although this install is ARMED — the record and the artifact disagree: $line"; return 1 ;;
+            # ⛔ AND `--status` IS THE SAME STATE BY ANOTHER NAME. The pass builds its run as
+            # `dry_run=opts.status or opts.dry_run`, so an armed artifact carrying `--status` measures and
+            # repairs nothing on every tick — the `--apply` class, in a word the pass DOES accept.
+            *--status*) err "REFUSING: the installed ExecStart carries --status although this install is ARMED. The pass runs with dry_run=opts.status or opts.dry_run, so --status makes every tick MEASURE AND CHANGE NOTHING — the record and the artifact disagree: $line"; return 1 ;;
         esac
     fi
     return 0
@@ -912,12 +979,18 @@ args_first_matching() { # args_first_matching <newline-separated values> <GLOB p
 }
 
 classify_exec_args() { # classify_exec_args <newline-separated args AFTER interpreter/script/repo>
-    # ⛔ "NOT --dry-run" IS NOT THE SAME AS "NOT A MODE". The pass's own switches (`--json`, `--status`,
-    # `--want N`, `--root P`) are legitimate and change nothing about whether a tick CONVERGES, so a
-    # readiness verb that reds on them reports a working schedule as broken — with a stated consequence
-    # ("every tick exits 2") that is simply false. Only arguments outside that vocabulary are red, and
-    # only `--dry-run` makes the artifact disarmed. Anything left over is named, never assumed.
-    local rest="$1" l out="" disarmed=0 skipnext=0 lastflag=""
+    # ⛔ "NOT --dry-run" IS NOT THE SAME AS "NOT A MODE". The pass's own switches (`--json`, `--want N`,
+    # `--root P`) are legitimate and change nothing about whether a tick CONVERGES, so a readiness verb
+    # that reds on them reports a working schedule as broken — with a stated consequence ("every tick
+    # exits 2") that is simply false. Only arguments outside that vocabulary are red, and anything left
+    # over is named, never assumed.
+    # ⛔ AND `--status` IS **NOT** ONE OF THE BENIGN ONES — IT IS A MODE, AND IT DOWNGRADES EVERY TICK TO A
+    # MEASURE. `runner_autoscale.py` builds the run with `dry_run=opts.status or opts.dry_run`, so a unit
+    # whose ExecStart carries `--status` reports and changes nothing, for ever. Classified benign, it left
+    # `mode=converge (ARMED)` and exit 0 over exactly the class this PR exists to remove (`--apply`): a
+    # schedule that never converges, certified by the verb callers gate on. It is grouped with `--dry-run`
+    # because it IS a dry run in every way that matters here.
+    local rest="$1" l out="" disarmed=0 skipnext=0 lastflag="" measure=0
     while [ -n "$rest" ]; do
         l="${rest%%$'\n'*}"
         case "$rest" in *$'\n'*) rest="${rest#*$'\n'}" ;; *) rest="" ;; esac
@@ -925,7 +998,8 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
         case "$l" in
             '')                : ;;
             --dry-run)         disarmed=1 ;;
-            --json|--status)   : ;;
+            --status)          disarmed=1; measure=1 ;;
+            --json)            : ;;
             --want|--root)
                 # ⛔ PEEK: a flag after a value-taking flag is a MISSING VALUE, not a value. The pass
                 # exits 2 on `--want --json`, so swallowing `--json` as the value made `--status`
@@ -945,6 +1019,7 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
     [ "$skipnext" = 1 ] && out="$out $lastflag"
     out="${out# }"
     if [ -n "$out" ]; then printf 'other:%s' "$out"
+    elif [ "$measure" = 1 ]; then printf 'measure'
     elif [ "$disarmed" = 1 ]; then printf 'disarmed'
     else printf 'armed'; fi
 }
@@ -965,6 +1040,11 @@ verify_installed_artifact_plist() {
         }
     elif args_has_line "$args" "--dry-run"; then
         err "REFUSING: the installed plist still carries --dry-run although this install is ARMED — the record and the artifact disagree: $(printf '%s ' $args)"
+        return 1
+    elif args_has_line "$args" "--status"; then
+        # ⛔ THE SAME STATE BY ANOTHER NAME, ON THE OTHER PLATFORM. `dry_run=opts.status or opts.dry_run`
+        # is platform-independent, so an armed plist carrying `--status` measures and repairs nothing.
+        err "REFUSING: the installed plist carries --status although this install is ARMED. The pass runs with dry_run=opts.status or opts.dry_run, so --status makes every tick MEASURE AND CHANGE NOTHING — the record and the artifact disagree: $(printf '%s ' $args)"
         return 1
     fi
     return 0
@@ -1024,6 +1104,7 @@ do_install_systemd() {
     choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. Install by hand, or give the box sudo. NOT silently skipping — a converger that never runs is the failure this exists to remove."; return 1; }
     refuse_systemd_unsafe_values || return 1
     adopt_installed_provisioner
+    note_repo_change
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src_svc" "$tmpd/$UNIT_NAME.service" systemd || { rm -rf "$tmpd"; return 1; }
@@ -1115,6 +1196,7 @@ do_install_launchd() {
     [ -f "$src_plist" ] || { err "plist template missing: $src_plist (set LAUNCHD_TEMPLATES_DIR)"; return 1; }
     choose_target || { err "no scheduler available"; return 1; }
     adopt_installed_provisioner
+    note_repo_change
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src_plist" "$tmpd/$LABEL.plist" launchd || { rm -rf "$tmpd"; return 1; }
     # ⛔ A PLIST THAT DOES NOT PARSE IS NOT INSTALLED. Measured on this family: a placeholder inside an
@@ -1209,7 +1291,22 @@ do_arm() {
     # inside the re-render, it wrote the record, then failed both renders (the drop-in breaks the armed
     # AND the forced-disarmed verification), which correctly lands in "STILL ARMED — the record was KEPT"
     # for a refusal a retry cannot clear: a record left behind by a refusal of the OPERATOR'S override.
-    choose_target || return 1
+    # ⛔ AND THE PREFLIGHT BELONGS HERE, BEFORE THE RECORD, NOT ONLY INSIDE THE RE-RENDER. Every input
+    # `refuse_unusable_target` judges (SCRIPT/HOME/STATE_DIR/PYTHON, and whether any of them is transient
+    # scratch) is fixed by THIS invocation — the same test this verb already applied to drop-ins and to the
+    # ExecStart multiplicity, for the same reason. Run only from the re-render, a refusal (measured: HOME,
+    # SCRIPT and STATE_DIR under a mktemp tree, `SUDO=true`) wrote the dated record first, then failed both
+    # renders, and landed in "STILL ARMED — the record was KEPT" for a box with NO artifact at all. The
+    # next routine `--install` then armed it from that record: a per-box capacity decision taken silently.
+    # Same order as `do_install`, which runs this guard BEFORE target selection so a transient-scratch box
+    # is told THAT rather than "no scheduler available".
+    refuse_unusable_target scheduled || return 1
+    choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. NOT silently skipping — a converger that never runs is the failure this exists to remove."; return 1; }
+    if [ "$TARGET" = "system" ] || [ "$TARGET" = "user" ]; then
+        # Once the target is known: a value the scheduler would corrupt (`%` specifiers, a stray backslash)
+        # is a preflight fact too, and the re-render is where it used to be found.
+        refuse_systemd_unsafe_values || return 1
+    fi
     if [ "$TARGET" != "launchd" ]; then
         dp="$(unit_dropin_execfiles)"
         [ -z "$dp" ] || {
@@ -1318,7 +1415,19 @@ do_arm() {
                 return 1; }
             err "NOT ARMED: the armed re-render failed, and the artifact is back to --dry-run, so the record was removed — the box is NOT converging"
         else
-            err "STILL ARMED: the armed re-render failed AND the disarmed re-render failed, so the record was KEPT on purpose — it is the only on-disk statement that this box is converging. Fix the refusal above, then re-run --disarm."
+            # ⛔ THE RECORD IS ONLY DEFENSIBLE IF AN ARMED ARTIFACT ACTUALLY EXISTS. This branch asserted
+            # "it is the only on-disk statement that this box is converging" unconditionally — FALSE in the
+            # measured case, where the refusal (transient scratch) fired before any artifact was written, so
+            # nothing was converging at all and the record existed only to arm the box on the next routine
+            # `--install`. Kept when an armed artifact really backs it; dropped otherwise, fail-closed.
+            if artifact_is_armed; then
+                err "STILL ARMED: the armed re-render failed AND the disarmed re-render failed, so the record was KEPT on purpose — it is the only on-disk statement that this box is converging. Fix the refusal above, then re-run --disarm."
+            else
+                rm -f "$ARM_FILE" || {
+                    err "the artifact is NOT armed but the record REMAINS ($ARM_FILE) — the next routine --install would arm from it. Remove it by hand or fix the permissions."
+                    return 1; }
+                err "NOT ARMED: the armed re-render failed, the disarmed re-render failed, and the installed artifact is not an armed one — so nothing was converging, and the record was REMOVED. The next routine --install cannot arm this box."
+            fi
         fi
         return 1
     fi
@@ -1505,9 +1614,29 @@ do_status() {
     case "$installed_kind" in
         armed)     log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
         disarmed)  log_line "mode=--dry-run (DISARMED — the pass measures and prints its plan only)" ;;
+        # ⛔ NOT A THIRD FLAVOUR OF DISARMED: this installer NEVER renders `--status` into ExecStart, so an
+        # artifact that carries it was hand-edited or foreign — and the pass runs it as
+        # `dry_run=opts.status or opts.dry_run`, so the box converges nothing on any tick. Reporting it as
+        # ARMED (the old classification, which treated `--status` as a benign switch) was a false PASS on
+        # a recognised argument; reporting it as DISARMED would understate it. It is red and it says why.
+        measure)   log_line "mode=--status (MEASURE ONLY — never converges)"
+                   err "the installed artifact carries --status, which this installer never renders. The pass runs with dry_run=opts.status or opts.dry_run, so EVERY tick measures and changes nothing: this box never repairs a dead runner and never grows toward its ceiling. Re-install with this installer (arm renders no mode argument; disarm renders --dry-run)."
+                   rc=1 ;;
         other:*)   installed_mode="${installed_kind#other:}"
                    log_line "mode=$installed_mode"
-                   err "the installed artifact carries arguments this installer did not render ('$installed_mode') — the pass accepts --dry-run, --status, --json, --want <n> and --root <path>; anything else makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
+                   err "the installed artifact carries arguments this installer did not render ('$installed_mode'). The pass accepts --repo, --root <path>, --want <n>, --status, --dry-run, --json, --install-unit, --check-units and --workdir <path>; anything OUTSIDE that set makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
+                   # ⛔ AND A RECOGNISED ACTION IS NOT AN UNKNOWN ONE — SAY WHAT IT ACTUALLY DOES. The
+                   # switches above are accepted, so the "exit 2" reason is FALSE for them, and their real
+                   # consequences are different from each other: --install-unit writes and enables a
+                   # COMPETING unit pair and then exits (converging nothing), --check-units audits and
+                   # exits 5 on an unusable unit, --workdir only parameterises --install-unit. Folding
+                   # them into the unknown-argument text sent the operator hunting a failure that never
+                   # appears, and hid the consequence that matters: each tick installs a second unit pair.
+                   case " $installed_mode " in
+                       *" --install-unit "*) err "  --install-unit: every tick WRITES AND ENABLES this tool's own unit pair instead of converging, and exits — so the pool is never repaired, while a second unit pair competes with the one this installer manages." ;;
+                       *" --check-units "*)  err "  --check-units: every tick AUDITS the installed units and exits (5 when one is unusable) instead of converging — a schedule that reports on the pool and never repairs it." ;;
+                       *" --workdir "*)      err "  --workdir only parameterises --install-unit; on its own it changes no tick and is refused by the pass when it has no value." ;;
+                   esac
                    rc=1 ;;
     esac
     # ⛔ AND THE MODE ABOVE IS THE BASE FILE'S. A `$UNIT.d/*.conf` carrying ExecStart= silently replaces
@@ -1621,7 +1750,9 @@ do_status() {
             d_home="$(artifact_env_value "$installed_path" HOME)"
             d_path="$(artifact_env_value "$installed_path" PATH)"
             d_state="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_STATE_DIR)"
-            d_repo="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_REPO)"
+            # ⛔ READ FROM THE COMMAND LINE, NOT THE ENVIRONMENT — `--repo` is an ARGUMENT in both
+            # templates, so the env read-back was empty on every box and this line did nothing.
+            d_repo="$(artifact_repo_value "$installed_path")"
             d_prov="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_PROVISIONER)"
             # A key the artifact does not declare keeps the reader's value: the render must not be fed an
             # EMPTY path to make the comparison match (that would bless the missing line). Reporting the
@@ -1633,10 +1764,10 @@ do_status() {
             [ -n "$d_prov" ]  && PROVISIONER="$d_prov"
             [ -n "$installed_python" ] && PYTHON="$installed_python"
             [ -n "$installed_script" ] && SCRIPT="$installed_script"
-            # ⛔ ONLY A KEY THE ARTIFACT ACTUALLY DECLARES CAN DISAGREE. The template carries `HOME`, `PATH`,
-            # `RUNNER_AUTOSCALE_STATE_DIR` and the whole-line `RUNNER_AUTOSCALE_PROVISIONER` pin — it carries
-            # no `RUNNER_AUTOSCALE_REPO`, so a missing key must not read as "the reader resolves something
-            # else" (that would print a permanent `drift_inputs=repo` on every box).
+            # ⛔ ONLY A VALUE THE ARTIFACT ACTUALLY DECLARES CAN DISAGREE. The template carries `HOME`, `PATH`,
+            # `RUNNER_AUTOSCALE_STATE_DIR`, the whole-line `RUNNER_AUTOSCALE_PROVISIONER` pin and the
+            # `--repo` argument; a value it does not carry must not read as "the reader resolves something
+            # else" (that would print a permanent `drift_inputs=` on every box).
             [ -n "$d_home" ] && [ "$save_home" != "$d_home" ] && inputs_differ="${inputs_differ:+$inputs_differ }home"
             [ -n "$d_path" ] && [ "$save_path" != "$d_path" ] && inputs_differ="${inputs_differ:+$inputs_differ }path"
             [ -n "$d_state" ] && [ "$save_state" != "$d_state" ] && inputs_differ="${inputs_differ:+$inputs_differ }state_dir"
