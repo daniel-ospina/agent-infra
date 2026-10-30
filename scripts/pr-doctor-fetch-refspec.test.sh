@@ -13,10 +13,13 @@
 # and was retried on every pass for weeks (`27 order(s) no worker accepted -> VERDICT=UNDELIVERED`).
 # rung 2 of the cascade had never delivered a single order.
 #
-# ⛔ THIS TEST MUST FAIL WHEN THE ACTUATOR IS DISARMED. The actuator is ONE string: the refspec the
-# fetch is given. The mutant is `_fetch_refspec(name) -> name` (the pre-fix behaviour). Section M
-# runs that mutant against the SAME single-branch fixture and REQUIRES it to produce the failure —
-# a test that passes under the mutant does not test anything.
+# ⛔ THIS TEST MUST FAIL WHEN THE ACTUATOR IS DISARMED. The actuator is the REFSPEC the fetch is
+# given, and it reaches git from two places: the function `_fetch_refspec`, and the TWO CALL SITES
+# that pass its result (`materialise`, `_ensure_head`). Sections U/R/M exercise the function against
+# a real single-branch fixture and REQUIRE the bare refspec to reproduce the measured `fatal: invalid
+# reference`; section P pins the call sites on the shipped file. Both halves are needed: measured
+# (review P1), reverting JUST the call sites left this suite 9 passed / 0 failed / rc=0 — every
+# function-level section stayed green over a delete of the fix's only effect.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +30,15 @@ FAIL=0
 ok()   { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$1"; }
 die()  { printf 'FAIL (fatal) %s\n' "$1"; exit 1; }
+# The source-assertion idiom is `scripts/ci_runner_gate.test.sh`'s (#3060 (h0)/(h7)): a FIXED-string
+# grep against the shipped file's own text, with a `bad` arm that fires when the pin is absent. Reused
+# verbatim rather than invented, so a reader meets one spelling of "pin the source" in this tree.
+assert_contains() { # <haystack> <needle> <label>
+    if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
+}
+assert_not_contains() { # <haystack> <needle> <label>
+    if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi
+}
 
 [ -f "$SRC" ] || die "pr-doctor.py not found at $SRC"
 command -v git >/dev/null 2>&1 || die "git is required for the fixture"
@@ -74,6 +86,24 @@ line3="$(printf '%s\n' "$out" | sed -n 3p)"
 [ "$line3" = "+refs/heads/main:refs/remotes/origin/main" ] \
     && ok "the default branch takes the same explicit treatment" \
     || bad "default-branch refspec wrong: '$line3'"
+
+# ── section P: THE CALL SITES — the defect lived HERE, so pin the shipped source ────────────────
+# ⛔ MEASURED (review P1, 2026-10-30): reverting BOTH call sites to their pre-fix form while leaving
+# `_fetch_refspec` fully intact left this suite at 9 passed / 0 failed / rc=0. `_fetch_refspec` is
+# only the ACTUATOR — an actuator nothing calls delivers nothing, and every section above exercises
+# the function in isolation, so all of them stay green over a delete. The measured bug was a CALL
+# SITE (`git fetch origin <branch>`), which means the call sites are the behaviour under test.
+#
+# The haystack is $SRC — `pr-doctor.py` ON DISK, the file CI ships — never a copy this test writes.
+# That is what makes the pin falsifiable: a mutant that EDITS pr-doctor.py must redden it.
+assert_contains "$(cat "$SRC")" '"fetch", "origin", _fetch_refspec(branch)' \
+    "P1 materialise() fetches through _fetch_refspec, not the bare branch"
+assert_contains "$(cat "$SRC")" 'fetch_ref or _fetch_refspec(branch)' \
+    "P2 _ensure_head() fetches 'fetch_ref or _fetch_refspec(branch)'"
+assert_not_contains "$(cat "$SRC")" '["fetch", "origin", branch' \
+    "P3 the pre-fix bare-branch fetch is gone from materialise()"
+assert_not_contains "$(cat "$SRC")" 'fetch_ref or branch' \
+    "P4 the pre-fix bare-branch fallback is gone from _ensure_head()"
 
 # ── section F: the fixture — a SINGLE-BRANCH clone, the shape that broke ────────────────────────
 build_fixture() { # <dir> -> a single-branch clone at <dir>/sb with origin/fix/some-branch on the remote
