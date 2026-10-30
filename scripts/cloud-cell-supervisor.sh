@@ -3593,8 +3593,23 @@ cmd_status() {
     # records the real answer as `delegate_verdict_worktree=`; a field the reader does not print does
     # not exist. Printed WHENEVER IT CARRIES INFORMATION (`ok`/`?`/`not-run`/absent stay silent, so a
     # genuinely healthy cell gains no noise).
+    #
+    # ⛔ THE SILENT SET IS THE BENIGN SET, NOT "OK-LIKE" SPELLINGS (#3058 review, P2). The delegate's
+    # vocabulary is the pass verdict this file's own sibling defines — `dry-run|reclaimed|idle|`
+    # `reap-ineffective|unmeasured` (pi-reap-worktrees.sh:642) plus `mixed` at the entry point when two
+    # repos disagree (disk-reaper.sh:1730). Only THREE of those are the alarm and every one of them is
+    # reprinted by a headline above: `reap-ineffective` (an armed pass that reclaimed nothing), and
+    # `unmeasured`/`mixed` (the cell cannot say). `dry-run`, `reclaimed` and `idle` are the ORDINARY
+    # readings of a healthy pass — `dry-run` is even the shipped default (disk-reaper.sh:167), so a
+    # `ok`-only silent set painted ⛔ worktree-delegate=dry-run onto every pass of every cell that has
+    # not armed the reaper, and `idle` onto every armed pass with nothing to reclaim.
+    # ⛔ The ⛔ is the operator's alarm channel, and the defect it creates is the one this same file
+    # names ten lines below for the ⏸ symbol: a glyph seen on healthy cells is a glyph the operator has
+    # been trained to skip, so the one line that MUST be read — `⛔ worktree-delegate=reap-ineffective`
+    # — is exactly what gets skipped. Polarity is therefore FAIL-LOUD: an unrecognised spelling (a new
+    # verdict added to the reaper and not taught to this reader) is printed, never swallowed.
     _dr_del="$(printf '%s\n' "$_drs" | sed -n 's/^delegate_verdict_worktree=//p' | head -1)"
-    _dr_del_note() { case "${_dr_del:-}" in ''|ok|'?'|not-run) printf '' ;; *) printf ' ⛔ worktree-delegate=%s' "$_dr_del" ;; esac; }
+    _dr_del_note() { case "${_dr_del:-}" in ''|ok|'?'|not-run|dry-run|reclaimed|idle) printf '' ;; *) printf ' ⛔ worktree-delegate=%s' "$_dr_del" ;; esac; }
     if [ "$_drc" -eq 0 ]; then
             # ⛔ THE UNIT IS CONDITIONAL. A per-class field may read `unmeasured` (df could not answer),
             # and the old format appended a hardcoded MB to it — `uv=unmeasuredMB` reads as a byte count

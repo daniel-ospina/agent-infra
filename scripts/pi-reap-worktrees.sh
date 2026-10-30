@@ -2414,8 +2414,10 @@ classify_one() {
     abstain_gate "$path" "$branch" "$refs" 0 && return 0
     # ⛔ THE ROW NAMES ITS OWN SURVIVAL EVIDENCE (#3041). A `remote-holds` row's proof lives in ONE
     # bounded network read, so `reclaimable` would hide the only fact that warrants the removal:
-    # the local ref is a cache and the REMOTE still advertises this head. The reason is therefore
-    # the marker itself (and the classify loop keys the end-of-pass prune block on it).
+    # the local ref is a cache and the REMOTE still advertises this head. The reason is therefore the
+    # marker itself — and it deliberately does NOT block the end-of-pass prune: see the classify
+    # loop's ⛔ block, which argues the opposite (blocking made one long-lived row disable the whole
+    # `prunable` reclaim path, i.e. F7) and is pinned from BOTH sides by A26c/A26c2. (#3058 review)
     local rm_reason="reclaimable"
     case "$refs" in remote-holds:*) rm_reason="$refs" ;; esac
     printf 'remove\t%s\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s\n' \

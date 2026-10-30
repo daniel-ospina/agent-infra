@@ -3123,6 +3123,36 @@ case "$OUT" in
   *"worktree-delegate="*) bad "status: a healthy delegate verdict still grew a note — $OUT" ;;
   *) ok "status: a healthy cell gains no delegate note (the field is printed only when it informs)" ;;
 esac
+# (3d) ⛔ THE SILENT SET MUST BE THE BENIGN SET, NOT AN "OK-LIKE" SET (#3058 review, P2). The delegate
+# vocabulary is `dry-run|reclaimed|idle|reap-ineffective|unmeasured` (pi-reap-worktrees.sh:642) plus
+# `mixed` at the entry point. THREE of those are a healthy pass and NONE of them may carry the ⛔:
+# `dry-run` is the SHIPPED DEFAULT (disk-reaper.sh:167) — so an ok-like silent set painted
+# `⛔ worktree-delegate=dry-run` onto every pass of every cell that had not armed the reaper — and
+# `idle` is the ordinary reading of an armed pass with nothing to reclaim. The ⛔ is the alarm channel,
+# so a ⛔ on a healthy cell is exactly what trains the operator to skip the one line that must be read.
+# Both polarities are pinned here: benign => silent, alarm-or-unrecognised => ⛔ (fail-loud, so a NEW
+# verdict added to the reaper and not taught to this reader is surfaced rather than swallowed).
+for _dv_benign in dry-run idle reclaimed ok '?' not-run; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=%s\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$([ "$_dv_benign" = dry-run ] && printf dry-run || printf apply)" "$_dv_benign" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"worktree-delegate="*) bad "status: the BENIGN delegate verdict '$_dv_benign' grew a ⛔ note — $OUT" ;;
+    *"disk reaper: last pass"*) ok "status: the BENIGN delegate verdict '$_dv_benign' prints no ⛔ note, and the pass line is still there" ;;
+    *) bad "status: the healthy pass line vanished for delegate verdict '$_dv_benign' — $OUT" ;;
+  esac
+done
+for _dv_alarm in reap-ineffective unmeasured mixed unlisted-new-verdict; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$_dv_alarm" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"⛔ worktree-delegate=$_dv_alarm"*) ok "status: the ALARM delegate verdict '$_dv_alarm' is printed with the ⛔ (fail-loud)" ;;
+    *) bad "status: the ALARM delegate verdict '$_dv_alarm' was swallowed — $OUT" ;;
+  esac
+done
 # ⛔ THE PAIRED ASSERTION LIVES ABOVE, IMMEDIATELY AFTER BLOCK (3)'s OWN `OUT`, and it must stay
 # there: blocks (3b)/(3c) each REWRITE `disk-reaper.status` and reassign `OUT`, so an assertion left
 # down here reads (3c)'s healthy record — which never prints `verdict_worktree=` at all — and the

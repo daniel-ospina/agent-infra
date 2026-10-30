@@ -1995,10 +1995,12 @@ assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A22_SHA" --format=
 # disable the whole `prunable` reclaim path on every later pass.
 # ⛔ #3041 KEEPS THIS PROPERTY AND SHARPENS IT. The remote branch is deleted
 # before the pass so the row stays `remote-only-ref` (a remote that still
-# advertised the sha would make it `remote-holds` — which DOES block, pinned by
-# A26f). The two fixtures together are the whole distinction: same local refs,
-# same prune armed, opposite verdict, and the deciding fact is whether an
-# `ls-remote` could prove the remote holds the commit.
+# advertised the sha would make it `remote-holds` — which does NOT block either:
+# #3041 keeps the reason-independent decision, and A26c/A26c2 pin BOTH the REMOVE
+# (`reason=`) and the PRESERVE (`refs=`) row as non-blocking. A26f is the
+# slashed-remote-NAME leg, not this one). The two fixtures together are the whole
+# distinction: same local refs, same prune armed, opposite verdict, and the deciding
+# fact is whether an `ls-remote` could prove the remote holds the commit.
 ENV=A23; REPO="$(mk_repo $ENV)"
 BARE="$T/$ENV/remote.git"
 "$REAL_GIT" init -q --bare "$BARE"
