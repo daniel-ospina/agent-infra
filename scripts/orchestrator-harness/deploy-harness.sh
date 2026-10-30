@@ -367,11 +367,16 @@ elif [ -f "$SRC/harness-provenance.sh" ]; then
   case "$DISC_RC" in
     0) : ;;
     1)
-      fatal "REFUSING: $O carries UNCOMMITTED EDITS that this deploy would OVERWRITE — nothing was copied"
+      fatal "REFUSING: $O carries UNRECORDED EDITS that this deploy would OVERWRITE — nothing was copied"
       printf '%s\n' "$DISC_OUT" >&2
-      fatal "  those bytes exist nowhere else: copy them aside (or land them in the repo) first."
+      # ⛔ "NOWHERE ELSE" WAS A FABRICATED FACT (measured 2026-10-30, review of #3053): a phase-A
+      # landing at an INTERMEDIATE commit then a moved ref reproduces this refusal over bytes that came
+      # from a real deploy and are in git. The refusal stays (fail-closed); the claim does not.
+      fatal "  no completed deploy records those bytes: copy them aside first. If they came from a partial"
+      fatal "  deploy (PHASE=A writes no record), they are the commit THAT run deployed — copy them aside"
+      fatal "  too, rather than land them in the repo as though they were new work."
       fatal "  to discard them deliberately, re-run with --accept-discard."
-      notify "orchestrator: harness deploy REFUSED" "Nothing was copied: $O carries uncommitted edits this deploy would overwrite, and nothing else holds them (see stderr / --accept-discard). (#2041)" high
+      notify "orchestrator: harness deploy REFUSED" "Nothing was copied: $O carries unrecorded edits this deploy would overwrite and no completed deploy records them (see stderr / --accept-discard). (#2041)" high
       exit 78 ;;
     *)  # CANNOT-VERIFY (no readable record): the refusal cannot fire, but SILENCE about it is how the
         # next redeploy quietly reverts a patch. Said out loud, once, on the path that will overwrite.

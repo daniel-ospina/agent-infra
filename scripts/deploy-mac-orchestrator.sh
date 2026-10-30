@@ -181,9 +181,14 @@ fi
 if [ "$ACCEPT_DISCARD" -eq 1 ]; then
   log "ACCEPT_DISCARD=1 — an uncommitted edit in $O (if any) WILL be overwritten by this run"
 elif [ "$DISC_RC" -eq 1 ]; then
-  log "REFUSING: $O carries UNCOMMITTED EDITS this deploy would OVERWRITE — nothing was copied"
+  log "REFUSING: $O carries UNRECORDED EDITS this deploy would OVERWRITE — nothing was copied"
   printf '%s\n' "$DISC_OUT" >&2
-  log "  those bytes exist nowhere else: copy them aside (or land them in the repo) first."
+  # ⛔ "NOWHERE ELSE" WAS A FABRICATED FACT (measured 2026-10-30, review of #3053): a phase-A landing at
+  # an INTERMEDIATE commit then a moved ref reproduces this refusal over bytes a real deploy wrote, which
+  # are in git. The refusal stays (fail-closed); the claim does not.
+  log "  no completed deploy records those bytes: copy them aside first. If they came from a partial"
+  log "  deploy (PHASE=A writes no record), they are the commit THAT run deployed — copy them aside too,"
+  log "  rather than land them in the repo as though they were new work."
   log "  to discard them deliberately, re-run with --accept-discard. It would do this:"
   printf '%s\n' "$PLAN"
   rm -rf "$STAGE"

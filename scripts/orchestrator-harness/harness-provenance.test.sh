@@ -96,7 +96,10 @@ printf '#!/usr/bin/env bash\necho PATCHED\n' > "$O/claims.sh"
 OUT="$(bash "$PROV" check --o "$O" 2>&1)"; RC=$?
 ck "rc is 1 when one file differs from the record" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 ck "…and the report NAMES claims.sh" "$(qF "UNCOMMITTED-EDIT   claims.sh" "$OUT" && echo 0 || echo 1)"
-ck "…and says which side is newer (edited after the record)" "$(qF "edited AFTER the record" "$OUT" && echo 0 || echo 1)"
+ck "…and says which side is newer (its mtime is newer than the record's)" "$(qF "its mtime is NEWER than the record's" "$OUT" && echo 0 || echo 1)"
+# ⛔ …AND DOES NOT TURN THAT MTIME INTO A CAUSE. A newer mtime is what a hand edit AND an unrecorded
+# phase-A deploy both leave; only the second is in git, and only the record's silence is knowable.
+ck "…and does NOT claim a hand edit the mtime cannot establish" "$(qF "edited AFTER" "$OUT" && echo 1 || echo 0)"
 OUT="$(bash "$PROV" check --o "$O" --src "$SRC" 2>&1)"; RC=$?
 ck "narrowed to a source, that edit is still reported (the deploy WOULD overwrite it)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 rm -f "$O/.harness-provenance"
@@ -173,10 +176,21 @@ OUT="$(bash "$PROV" check --o "$OO" 2>&1)"; RC=$?
 ck "plain check: bytes equal to the record's own source are PENDING (0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 ck "…and the plain report says PENDING, not UNCOMMITTED-EDIT" \
    "$(qF "PENDING   claims.sh" "$OUT" && qF "UNCOMMITTED-EDIT" "$OUT" && echo 1 || qF "PENDING   claims.sh" "$OUT" && echo 0 || echo 1)"
-# an actual edit (bytes matching NEITHER side) is still an edit
+# an actual edit (bytes matching NEITHER side) is still an edit — AND THE RECORD MUST NOT ASSERT A CAUSE
+# IT CANNOT KNOW. Those same bytes are what a PHASE=A landing at an INTERMEDIATE commit leaves: `$O`
+# differs from the record AND from this source, so a hand patch and an unrecorded deploy of C2 are
+# byte-wise IDENTICAL to this reader. The refusal is right either way (fail-closed); a message that
+# says "edited AFTER the record" or "exists nowhere else" is not, because the intermediate version is
+# in git (measured 2026-10-30, review of #3053). These arms are the mutation grade for that wording.
 printf '#!/usr/bin/env bash\necho HAND-PATCH\n' > "$OO/claims.sh"
 OUT="$(bash "$PROV" check --o "$OO" --src "$SRC" 2>&1)"; RC=$?
 ck "…while bytes matching neither side are still an edit (1)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "…and they are named UNRECORDED, which is what the record actually knows" \
+   "$(qF "UNRECORDED" "$OUT" && echo 0 || echo 1)"
+ck "…and the report does NOT assert a hand edit it cannot know ('edited AFTER')" \
+   "$(qF "edited AFTER" "$OUT" && echo 1 || echo 0)"
+ck "…and it names BOTH live possibilities, so nobody hunts the wrong one" \
+   "$(qF "a hand edit, OR a deploy that wrote" "$OUT" && echo 0 || echo 1)"
 cp "$SRC/claims.sh" "$OO/claims.sh"
 
 # ⛔ `cmp` EXITS 2 ON AN I/O ERROR, AND THAT IS NOT "DIFFERS". Reporting it as a difference told an
@@ -443,8 +457,10 @@ CW_WRITE
 printf 'locally hand-edited docs — these bytes exist nowhere else\n' > "$CW/O/README.md"
 OUT="$(bash "$PROV" check --o "$CW/O" --src "$CW/src" 2>&1)"; RC=$?
 ck "…but a doc whose bytes DIFFER is still an UNCOMMITTED-EDIT (1)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
-ck "…named with the reason it matters: this deploy would OVERWRITE it, bytes that exist nowhere else" \
-   "$(qF "UNCOMMITTED-EDIT   README.md" "$OUT" && qF "would OVERWRITE it, and those bytes exist nowhere else" "$OUT" && echo 0 || echo 1)"
+ck "…named with the reason it matters: this deploy would OVERWRITE it, and no completed deploy records it" \
+   "$(qF "UNCOMMITTED-EDIT   README.md" "$OUT" && qF "would OVERWRITE it. No completed deploy this record describes wrote them" "$OUT" && echo 0 || echo 1)"
+ck "…and does NOT assert the bytes 'exist nowhere else' — an earlier WIDER deploy can have written them" \
+   "$(qF "exist nowhere else" "$OUT" && echo 1 || echo 0)"
 BEFORE_CW="$($SHA_CMD "$CW/O/README.md" | awk '{print $1}')"
 PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$CW/src" --o "$CW/O" --no-notify >/dev/null 2>&1; RC=$?
 AFTER_CW="$($SHA_CMD "$CW/O/README.md" | awk '{print $1}')"

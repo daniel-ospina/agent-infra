@@ -747,7 +747,10 @@ deploy_harness() {
         # ⛔ PRINT THE FILE LIST BEFORE REFUSING. `refuse` is one line by contract, and the one line
         # cannot hold which files, which side is newer, and what to do — that is the whole diagnosis.
         printf '%s\n' "$dout" >&2
-        refuse "the deploy would OVERWRITE uncommitted edits in $O that exist nowhere else — nothing was copied; land them in the repo (or copy them aside), then re-run, or re-run with 'start --accept-discard' to discard them deliberately"
+        # ⛔ "EXIST NOWHERE ELSE" WAS A FABRICATED FACT (measured 2026-10-30, review of #3053): a phase-A
+        # landing at an INTERMEDIATE commit then a moved ref reproduces this refusal over bytes a real
+        # deploy wrote, which are in git. The refusal stays (fail-closed); the claim does not.
+        refuse "the deploy would OVERWRITE unrecorded edits in $O that no completed deploy describes — nothing was copied; copy them aside (if they came from a partial deploy, they are the commit THAT run deployed), then re-run, or re-run with 'start --accept-discard' to discard them deliberately"
         ;;
       *)
         # CANNOT-VERIFY (no readable record). The refusal cannot fire, but silence is how the next

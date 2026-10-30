@@ -1074,7 +1074,7 @@ the same overclaim this file exists to remove. The others, named with the gap ea
 | Path | What it still does |
 |---|---|
 | `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:539`) and `$O/gh-limit.py` (`install.sh:556`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:822`, `:1003`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
-| `deploy-mac-orchestrator.sh` phase A (`:113-121`, with `install_file` at `:76-80`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
+| `deploy-mac-orchestrator.sh` phase A (`:274-278`, with `install_file` at `:106-110`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
 | `deploy-crossbox.sh` step 3 (`:57-92`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
 | `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:1281`; called at `:1872`, `:2523`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
 | `cloud-cell-quiesce.sh` step 4 (`scripts/cloud-cell-quiesce.sh:74-79`) | the cell-recovery redeploy: `cp "$HARNESS"/*.sh "$O"/ 2>/dev/null || true` — depth-1, **rc discarded**, then `seeded $O with $(ls "$O"/*.sh | wc -l)` read from the **target**, and a controller started on it (`:89-92`). That is all three mechanisms #2041 names, verbatim; it is listed here rather than quietly omitted |
@@ -1289,7 +1289,8 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 → `fatal: not a git repository`). The deploy path therefore leaves a record beside the bytes —
 `$O/.harness-provenance`, written by `harness-provenance.sh` at the end of a **complete** deploy
 (`deploy-harness.sh`, `deploy-mac-orchestrator.sh` phase B, and `orchestrator-bringup.sh start` — the
-three writers of `$O/*.sh`). Plain text, one `sha256  path` line per
+three writers that also refuse-to-overwrite and record; the OTHER paths that write `$O/*.sh` are named,
+with the gap each still carries, in the coverage table earlier in this section). Plain text, one `sha256  path` line per
 file the deploy wrote, so a box answers with no checkout, no network and no `jq`. The manifest is the
 **write set**, not the source tree: `start` installs only the depth-1 `*.sh`, so it records only those
 (it passes `--skip` for every file it does not write) — a `README.md` that a full deploy put in `$O` is
@@ -1367,10 +1368,13 @@ is no per-file manifest, so the report fails the run and *says* it cannot name t
 **A redeploy REFUSES to overwrite an uncommitted edit.** Measured 2026-10-28: a hand-applied fix to
 `$O/merge-one.sh` was reverted **twice** by redeploys (the file's mtime moved at 20:02 and again at
 20:15, after the patch), the box ran unpatched code, and a production fix looked like it had
-"stopped working". All three writers of `$O/*.sh` now compare `$O` against its own record **before
+"stopped working". Those three writers compare `$O` against its own record **before
 copying**, print every file they would discard with which side is newer, and exit **78 with nothing
 written** (`orchestrator-bringup.sh start` refuses with its own rc=1 and the same file list, because
-its contract is `0 ok · 1 refused · 2 cannot-determine`):
+its contract is `0 ok · 1 refused · 2 cannot-determine`). ⛔ They are NOT every path that writes
+`$O/*.sh`: a cell's `deploy-crossbox.sh` step 3, `cloud-cell-supervisor.sh seed_and_stamp` and
+`cloud-cell-quiesce.sh` step 4 still copy with neither the refusal nor the record — the coverage table
+earlier in this section names each, and routing them through this helper is #2041's remaining work:
 
 ```bash
 bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator

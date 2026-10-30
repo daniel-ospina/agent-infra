@@ -515,10 +515,21 @@ check)
       # ⛔ THREE ANSWERS, NOT TWO. On a filesystem with one-second mtime resolution an edit and the
       # record that describes it routinely land in the SAME second, and `-nt` is then false — calling
       # that "older than the record" would be a fabricated fact about which side changed.
-      if [ "$O/$REL" -nt "$REC" ]; then WHEN="edited AFTER the record (its mtime is newer than the record's)"
-      elif [ "$O/$REL" -ot "$REC" ]; then WHEN="OLDER than the record — the record was written after this file's last change"
+      if [ "$O/$REL" -nt "$REC" ]; then WHEN="its mtime is NEWER than the record's, so something wrote it after the record was taken"
+      elif [ "$O/$REL" -ot "$REC" ]; then WHEN="it is OLDER than the record — the record was written after this file's last change"
       else WHEN="same timestamp as the record (this filesystem cannot order the two)"; fi
-      bad "UNCOMMITTED-EDIT   $REL — the deployed copy differs from the record (live ${H_LIVE:0:12}, recorded ${H_REC:0:12}); $WHEN"
+      # ⛔ NAME WHAT THE RECORD KNOWS, NOT WHAT IT GUESSES (measured 2026-10-30, review of #3053).
+      # The PENDING arms above recognise "an unrecorded deploy" ONLY while `$O` still holds the CURRENT
+      # source's bytes. The moment the ref advances, a phase-A landing at an INTERMEDIATE commit is
+      # byte-wise indistinguishable from a hand edit: `$O` differs from the record AND from this source.
+      # Reproduced with the shipped tools — record at C1, a PHASE=A-style landing of C2 into `$O` (no
+      # record, by design), source at C3 → `check --src` returned 1 and the deploy printed "those bytes
+      # exist nowhere else: copy them aside", which is FALSE: they are C2's, and C2 is in git. The
+      # refusal is still correct (fail-closed: never overwrite bytes no record describes), but the CAUSE
+      # and the "nowhere else" claim are not knowable from the record, and a fabricated certainty sends
+      # an operator hunting a patch that does not exist — the exact defect the PENDING arms removed.
+      # So the diagnosis states the two live possibilities and which one it cannot rule out.
+      bad "UNCOMMITTED-EDIT   $REL — the deployed copy differs from the record (live ${H_LIVE:0:12}, recorded ${H_REC:0:12}) and from the source; $WHEN. These bytes are UNRECORDED, and the record cannot say by whom: a hand edit, OR a deploy that wrote $O without recording it (PHASE=A writes no record by design, and a run that dies before its own record write leaves the same shape). Treat them as unrecorded — not necessarily as yours"
     fi
   done < "$REC"
 
@@ -609,7 +620,11 @@ check)
         say "SAME-AS-SOURCE   $_r — in $O and ABSENT from the record, but $O already holds the SOURCE's bytes, so this deploy would overwrite them with themselves: nothing is discarded and there is no patch to recover"
         SAMESRC=$((SAMESRC + 1)); continue
       fi
-      bad "UNCOMMITTED-EDIT   $_r — present in $O and ABSENT from the record (hand-placed, or written by a path that does not record), and the source ships this name with DIFFERENT bytes, so this deploy would OVERWRITE it, and those bytes exist nowhere else"
+      # ⛔ "EXIST NOWHERE ELSE" IS NOT KNOWABLE HERE EITHER (same measurement). The file is absent from
+      # the record and the source ships the name with different bytes, so these bytes are UNRECORDED —
+      # but an earlier BROAD deploy (a wider write set than this caller's, or a phase-A landing at an
+      # intermediate commit) can have written them, and that version is in git. Say what is true.
+      bad "UNCOMMITTED-EDIT   $_r — present in $O and ABSENT from the record (hand-placed, OR written by a path that does not record — an earlier deploy with a WIDER write set, or an unrecorded partial one), and the source ships this name with DIFFERENT bytes, so this deploy would OVERWRITE it. No completed deploy this record describes wrote them, so copy them aside before overwriting"
       EDITS=$((EDITS + 1))
     done < "$SRCLIST"
   fi
