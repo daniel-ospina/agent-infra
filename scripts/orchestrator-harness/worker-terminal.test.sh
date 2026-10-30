@@ -1049,7 +1049,7 @@ if command -v perl >/dev/null 2>&1; then
   # "the GH CREDENTIAL is absent" and a box with no `perl` got the same wrong remedy. Each emission is
   # now pinned by the comment-free literal around it.
   _94n="$(grep -c 'exit 94; if command -v bash' "$LIB")"
-  [ "$_94n" = "2" ] && grep -qF '142|124) exit 96 ;; 93) exit 93 ;; *) exit 98' "$LIB" \
+  [ "$_94n" = "2" ] && grep -qF '126|127|13[0-9]|14[0-9]|15[0-9]) exit 93 ;; *) exit 98' "$LIB" \
     && grep -qF '_guard="false; exit 93"' "$LIB" && grep -qF 'exec @ARGV; exit 93' "$LIB" \
     && grep -qF 'this lane could not authenticate a single model call" >&2; exit 95 ;; esac' "$LIB" \
     && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1

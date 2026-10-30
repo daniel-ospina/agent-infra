@@ -2865,8 +2865,19 @@ def makes_no_request_strictly(argv):
     false POSITIVE is an unserialised API call."""
     if not argv:
         return True                      # bare `gh` prints help
+    if argv[0] in ("alias", "config"):
+        # ⛔ NOT THE WHOLE `NO_REQUEST` SET (review finding, 2026-10-30): `gh config set`, `gh alias
+        # set`/`delete` do a LOAD-MODIFY-WRITE of `~/.config/gh/config.yml` — the same file for both —
+        # and the box lock was their ONLY serialiser (no pacing predicate covers them: `MUTATING_PAIRS`
+        # has no config/alias pair). Exempting them wholesale would let two concurrent `gh config set`
+        # calls lose one setting, and a concurrent reader see a half-written file. The exemption claims
+        # to be about REQUESTS; these forms make none but they do WRITE, so only the read-only forms
+        # are exempt and every writer keeps the lock.
+        return len(argv) >= 2 and (argv[0], argv[1]) in (
+            ("alias", "list"), ("alias", ""),
+            ("config", "get"), ("config", "list"), ("config", "clear-cache"))
     if argv[0] in NO_REQUEST:
-        return True                      # --version/version/help/--help/-h/completion/alias/config
+        return True                      # --version/version/help/--help/-h/completion
     # `gh auth token [--hostname H] [-s]` reads hosts.yml or the keyring; nothing else under `auth` is
     # exempt (`auth status` VALIDATES the token against the API — it takes the lock).
     return len(argv) >= 2 and argv[0] == "auth" and argv[1] == "token"

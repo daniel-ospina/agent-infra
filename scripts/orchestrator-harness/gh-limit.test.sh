@@ -636,6 +636,38 @@ wait
 ck "CONTROL: a help-LOOKING flag VALUE (\`issue create -t help\`) still takes the box lock [peak $(max_inflight)]" \
    "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
 
+# ⛔ THE `auth` CLAUSE IS ITS OWN FAIL-OPEN BOUNDARY (review finding, 2026-10-30): the predicate exempts
+# `auth token` and NOTHING else under `auth`, because `gh auth status` VALIDATES the token against the
+# API. Measured with the predicate widened to every `auth` form: this arm drops to peak 6. Without it,
+# moving `auth status` onto the fast path left the suite green.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- auth status >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: auth status VALIDATES the token against the API, so it still takes the box lock [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ AND THE WRITE FORMS OF `config`/`alias`: they rewrite ~/.config/gh/config.yml, and the box lock was
+# their ONLY serialiser (no pacing predicate covers them). `config set` keeps it although it makes no
+# request; `config get` is read-only and stays on the fast path.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- config set editor vim >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: config set REWRITES config.yml with no request — it still takes the box lock [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- config get editor >/dev/null 2>&1 ) &
+done
+wait
+ck "...while the READ-ONLY config get is exempt and overlaps [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -gt 1 ] && echo 0 || echo 1)"
+
 # ── G2. COALESCING: identical concurrent READS share ONE load (agent-infra#2243) ────────────────
 # ⛔ WHAT THIS SECTION IS FOR. Serialisation (#1988/#2005) decides WHO GOES NEXT; it does not decide
 # whether the work is worth doing twice. Thirteen lanes asking for the SAME read queued thirteen

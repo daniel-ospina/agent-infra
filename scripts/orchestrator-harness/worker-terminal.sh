@@ -1135,7 +1135,7 @@ wt_launcher_env() {
     # gh IS here, the TIMER is not — its own code, because "put gh on the PATH" cannot fix it.
     _guard="false; exit 93"
   fi
-  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s; _wtgrc=$?; case "$_wtgrc" in 0) : ;; 142|124) exit 96 ;; 93) exit 93 ;; *) exit 98 ;; esac ;; esac' "$_guard"
+  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s; _wtgrc=$?; case "$_wtgrc" in 0) : ;; 142|124) exit 96 ;; 93) exit 93 ;; 126|127|13[0-9]|14[0-9]|15[0-9]) exit 93 ;; *) exit 98 ;; esac ;; esac' "$_guard"
   # ── AND THE MODEL CREDENTIAL IS VERIFIED WHERE THE gh ONE IS — AFTER every source, against the
   # environment the worker will actually run with. This is the question a static grep cannot answer: did
   # the delivery LAND?
@@ -1964,7 +1964,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         # 9-hour merge stall this change comes from was a probe TIMEOUT reported as a failed credential
         # contract. The codes are set by the launch line's own guard (see `wt_launcher_env`).
         case "$pre_rc" in
-          93) pre_fault="the credential read NEVER RAN (rc=93): either gh resolved at build time but there is no `perl` timer to bound it, or the resolved gh could not be EXECUTED when the pane ran it (perl's failed `exec` would otherwise return 0 and bless a credential-less worker). Remedy: install `perl` on the harness box (the bound is perl's alarm; `timeout` is absent on macOS) and check the gh path this launch line carries" ;;
+          93) pre_fault="the credential read NEVER RAN or was KILLED (rc=93): either gh resolved at build time but there is no `perl` timer to bound it, the resolved gh could not be EXECUTED when the pane ran it (perl's failed `exec` would otherwise return 0 and bless a credential-less worker), or the reader was signalled / could not be started (126/127/13x/14x/15x — SIGKILL is 137, SIGTERM 143). Remedy: install `perl` on the harness box (the bound is perl's alarm; `timeout` is absent on macOS), check the gh path this launch line carries, and read the pane line's own message" ;;
           96) pre_fault="the credential PROBE could not answer in time (rc=96: the LOCAL \`gh auth token\` read was still running when its 10 s bound expired) — a PROBE/TIMING fault, NOT an absent credential; the store may be perfectly good. Remedy: re-run this lane, and if it repeats, check that the local credential read is not being serialised behind API traffic (the gh-limit layer's no-request fast path, agent-infra#3099)" ;;
           97) pre_fault="NO gh BINARY could be resolved when this launch line was built (rc=97), so nothing was ever asked for a token. Remedy: put gh on the harness PATH" ;;
           98) pre_fault="the GH CREDENTIAL is absent or unreadable (rc=98): the worker's environment carries no GH_TOKEN/GITHUB_TOKEN value AND \`gh auth token\` did not answer for that HOME. This is the gh credential and nothing else — the env-file arms are 94 and the model key is 95, so a 98 never means a bad keys.env. Remedy: provision the gh credential for that HOME (hosts.yml / keyring via \`gh auth login\`, or a GH_TOKEN line in keys.env)" ;;
