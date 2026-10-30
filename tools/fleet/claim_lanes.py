@@ -738,10 +738,32 @@ def _select(claims: Sequence[liveness.Claim], pr: Optional[str], sha: Optional[s
     return targets, sibs, note
 
 
+SNAPSHOT_HEADER = "#claim-snapshot"
+
+
 def read_snapshot(path: str, *, max_age_s: float, ns: str = DEFAULT_NS,
                   pr: Optional[str] = None, sha: Optional[str] = None,
                   host: Optional[str] = None, now: Optional[int] = None) -> liveness.ClaimRead:
-    """Read a ``claim_snapshot`` file. A caller-stated ``max_age_s`` is REQUIRED."""
+    """Read a ``claim_snapshot`` file. A caller-stated ``max_age_s`` is REQUIRED.
+
+    ⛔ TWO WRITERS, ONE READER (agent-infra#2534 review, P1). ``claims.sh`` publishes a HEADER as
+    the snapshot's first line — ``#claim-snapshot\\t<read_at>\\t<ok|failed>\\t<refs>`` — because
+    a snapshot with no statement of WHEN and HOW it was read cannot distinguish "the registry
+    answered and holds nothing" from "the registry was never read". This driver knew only the
+    pre-header three-field body, so from the first cycle after deploy EVERY real snapshot hit
+    ``len(parts) != 3`` → ``claims-unreadable`` for ever: the documented offline way to answer
+    "who holds this head?" stopped answering at all. That is the mirror of the defect the change
+    fixes (a phantom FREE became a phantom UNREADABLE), and it was invisible in CI because every
+    fixture here was header-less — a shape the writer no longer produces.
+
+    So the header IS the contract now, and this reader honours it exactly as ``claims.sh``'s own
+    ``claim_snapshot_verdict`` does: its ``read_at`` (not the mtime) is the snapshot's age; a
+    ``failed`` fetch is refused at ANY age (its rows are the last good read, not this read); and a
+    read instant AHEAD of this box's clock is refused rather than clamped to fresh, because the
+    age test is one-sided and a future stamp would otherwise be believed for ever. A first line
+    that is not the header at all is a writer older than the header, and keeps the mtime fallback
+    — that fallback is for an OLD WRITER, never for a header this reader could not parse.
+    """
     host = short_host() if host is None else host
     now = int(time.time()) if now is None else int(now)
     source = "snapshot %s" % sanitize(path)
@@ -753,12 +775,7 @@ def read_snapshot(path: str, *, max_age_s: float, ns: str = DEFAULT_NS,
     except OSError as exc:
         return liveness.ClaimRead(readable=False, present=False, claims=(), source=source,
                                   detail="snapshot unreadable: %s" % sanitize(exc))
-    age = now - int(st.st_mtime)
-    if age > float(max_age_s):
-        return liveness.ClaimRead(
-            readable=False, present=False, claims=(), source=source,
-            detail="snapshot STALE: age=%ds > max-age-s=%.0fs (an old snapshot is not a "
-                   "fresh read)" % (age, float(max_age_s)))
+    mtime_age = now - int(st.st_mtime)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
@@ -766,20 +783,69 @@ def read_snapshot(path: str, *, max_age_s: float, ns: str = DEFAULT_NS,
         return liveness.ClaimRead(readable=False, present=False, claims=(), source=source,
                                   detail="snapshot unreadable: %s" % sanitize(exc))
 
+    def _unreadable(detail: str) -> liveness.ClaimRead:
+        return liveness.ClaimRead(readable=False, present=False, claims=(), source=source,
+                                  detail=detail)
+
     claims: List[liveness.Claim] = []
+    header_seen = False
     for lineno, raw in enumerate(text.splitlines(), 1):
         if not raw.strip():
+            continue
+        if raw.startswith(SNAPSHOT_HEADER):
+            if lineno != 1:
+                return _unreadable(
+                    "snapshot SHAPE DRIFT at line %d: a '%s' header is only valid as the "
+                    "snapshot's FIRST line" % (lineno, SNAPSHOT_HEADER))
+            header_seen = True
+            parts = raw.split("\t")
+            if len(parts) != 4:
+                return _unreadable(
+                    "snapshot HEADER DRIFT at line %d: '%s' carries <read_at>\\t<ok|failed>"
+                    "\\t<refs> (4 tab-separated fields), got %d"
+                    % (lineno, SNAPSHOT_HEADER, len(parts)))
+            raw_read_at, fetch = parts[1], parts[2]
+            # A header that cannot state its OWN read instant is a writer this reader cannot
+            # parse — NOT an old writer. Falling back to mtime here would believe the snapshot
+            # on the strength of the copy that carried it, which is the defect `claims.sh`
+            # refuses in exactly this arm.
+            if not raw_read_at.isdigit():
+                return _unreadable(
+                    "snapshot HEADER DRIFT at line %d: no usable read instant (%r) — the "
+                    "writer is not one this reader can parse"
+                    % (lineno, sanitize(raw_read_at)))
+            read_at = int(raw_read_at)
+            age = now - read_at
+            if age < 0:
+                return _unreadable(
+                    "snapshot read instant is %ds AHEAD of this box's clock — its age cannot "
+                    "be established, and a future stamp is dropped rather than trusted" % -age)
+            if fetch == "failed":
+                # ⛔ THE FETCH ITSELF DID NOT ANSWER: the rows below are the LAST GOOD read, so a
+                # claim published or released since then is invisible. Stale, not a snapshot.
+                return _unreadable(
+                    "snapshot was written from a FAILED fetch (its rows are the last good "
+                    "read, %ds old)" % age)
+            if age > float(max_age_s):
+                return _unreadable(
+                    "snapshot STALE: age=%ds > max-age-s=%.0fs (an old snapshot is not a "
+                    "fresh read)" % (age, float(max_age_s)))
             continue
         parts = raw.split("\t")
         if len(parts) != 3:
             # Shape drift is an UNREADABLE read, never a partial one: a partially
             # parsed registry would silently drop the claims it mis-read.
-            return liveness.ClaimRead(
-                readable=False, present=False, claims=(), source=source,
-                detail="snapshot SHAPE DRIFT at line %d: expected 3 tab-separated "
-                       "fields, got %d" % (lineno, len(parts)))
+            return _unreadable(
+                "snapshot SHAPE DRIFT at line %d: expected 3 tab-separated "
+                "fields, got %d" % (lineno, len(parts)))
         ref, owner, raw_until = parts
         claims.append(_row(ref.strip(), owner.strip(), raw_until.strip(), ns, host, now))
+    if not header_seen and mtime_age > float(max_age_s):
+        # The pre-header writer: mtime is the only age it has, and it keeps the SAME polarity it
+        # always had. Reached only when line 1 is not the header at all.
+        return _unreadable(
+            "snapshot STALE: age=%ds > max-age-s=%.0fs (an old snapshot is not a "
+            "fresh read)" % (mtime_age, float(max_age_s)))
     if not claims:
         return liveness.ClaimRead(readable=True, present=False, claims=(), source=source)
     targets, siblings, note = _select(claims, pr, sha)

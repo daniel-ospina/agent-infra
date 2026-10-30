@@ -63,20 +63,49 @@ jobs:
         # asserted here is what is true of a fresh runner, plus a consistency check that cannot pass
         # on a broken read: the reported commit must BE this run's head, and the exit code must agree
         # with the published verdict.
+        # ⛔ AND THE `deployed` SECTION IS CROSS-CHECKED AGAINST THE BOX, NOT ASSUMED (#3001). It used
+        # to assert `d["deployed"]["kind"] == "absent"` under the comment "nothing is installed on a
+        # runner" — and that is FALSE on this fleet's own runners. Measured at #3001's head, run
+        # 40765771180: the job landed on self-hosted `ai-runner-cell3-x64-3` (machine `cmux`), whose
+        # `$HOME/orchestrator` IS a deployment, so doctor honestly answered
+        # `{"path":"/home/cmux/orchestrator","kind":"stamp","commit":"5cc38e3b…","bytes":"unchecked+bytes=DIFFERS"}`
+        # and this step REDDED a correct read — while the same head passed on a GitHub-hosted runner.
+        # An arm that reds one runner and greens another grades the RUNNER, not `bin/harness`. What
+        # replaces it is the stronger question, and it is environment-independent: the reported kind
+        # must be one of doctor's OWN documented states (`bin/harness` DEPLOY_KIND), and it must
+        # agree with what is on disk — `absent` only where nothing is there, any other kind only
+        # where something is (`unreadable` makes no claim, so it is not cross-checked). The
+        # NON-VACUITY block at the end of this step reds if that cross-check ever stops refusing a
+        # fabricated answer, so the repair cannot decay into a green no-op.
         run: |
           set -euo pipefail
           rc=0
           out="$(bin/harness doctor --json)" || rc=$?
           printf '%s\n' "$out"
-          python3 - "$out" "$GITHUB_SHA" "$rc" <<'PY'
-          import json, sys
+          # ONE checker, kept in a file so the NON-VACUITY arm below runs the SAME program instead of
+          # a restatement of it — a second copy is a copy that can drift silently green.
+          chk="$(mktemp)"
+          cat >"$chk" <<'PY'
+          import json, os, sys
           d = json.loads(sys.argv[1])
           sha, rc = sys.argv[2], int(sys.argv[3])
           assert d["platform"] == "linux", d
           # A commit that cannot be read is reported as "UNKNOWN" — never as a plausible value.
           assert d["canonical"]["commit"] == sha, ("canonical.commit", d["canonical"], sha)
-          # Nothing is installed on a runner, and that is the DOCUMENTED kind for it.
-          assert d["deployed"]["kind"] == "absent", d["deployed"]
+          # The deployed section is doctor's own CLOSED vocabulary; an unrecognised kind would mean
+          # the arm invented an answer instead of choosing one of its documented states.
+          dep = d["deployed"]
+          KINDS = ("absent", "unreadable", "dangling", "checkout", "linked-checkout", "stamp", "orphan")
+          assert dep["kind"] in KINDS, dep
+          # … and it must AGREE WITH THIS MACHINE. This is the arm `== "absent"` used to make by
+          # assuming a bare runner: `lexists` so a dangling symlink (kind `dangling`, `-e` false)
+          # and a non-directory (kind `unreadable`) are not read as "nothing is there".
+          if dep["kind"] == "unreadable":
+              pass          # doctor's own word for "could not read it" — it makes no claim to check
+          elif dep["kind"] == "absent":
+              assert not os.path.lexists(dep["path"]), ("deployed.absent-but-present", dep)
+          else:
+              assert os.path.lexists(dep["path"]), ("deployed.present-but-absent", dep)
           # No fork paths are configured here, and the machine surface must SAY so rather than let a
           # consumer read "OK" as "forks verified".
           assert d["forksChecked"] is False, d
@@ -87,8 +116,30 @@ jobs:
           # Exit code and verdict must agree: 0 OK, 1 DRIFT, 2 UNKNOWN.
           want = {"OK": 0, "DRIFT": 1, "UNKNOWN": 2}[d["verdict"]]
           assert rc == want, ("verdict", d["verdict"], "rc", rc, "want", want)
-          print("doctor ok:", d["verdict"], d["platform"], d["supervisor"], "forksChecked=", d["forksChecked"])
+          print("doctor ok:", d["verdict"], d["platform"], d["supervisor"], "deployedKind=", dep["kind"], "forksChecked=", d["forksChecked"])
           PY
+          check() { python3 "$chk" "$1" "$GITHUB_SHA" "$2"; }
+          check "$out" "$rc"
+
+          # NON-VACUITY — the cross-check above must REFUSE a deployed answer this box contradicts.
+          # The mutation flips the kind to the one REALITY denies (present → `absent`, absent →
+          # `stamp`), so it is the degenerate always-one-value doctor that this arm catches, on
+          # whichever runner the job lands on.
+          mut="$(mktemp)"
+          cat >"$mut" <<'PY'
+          import json, os, sys
+          d = json.load(sys.stdin)
+          dep = d["deployed"]
+          present = bool(dep["path"]) and os.path.lexists(dep["path"])
+          dep["kind"] = "absent" if present else "stamp"
+          sys.stdout.write(json.dumps(d))
+          PY
+          mutated="$(printf '%s\n' "$out" | python3 "$mut")"
+          if check "$mutated" "$rc" >/dev/null 2>&1; then
+            echo "❌ NON-VACUITY: the doctor cross-check ACCEPTED a deployed kind this box contradicts: $mutated"
+            exit 1
+          fi
+          echo "✅ non-vacuity: a fabricated deployed answer is refused"
       - name: canonical copy is complete (the source of truth has all shared files)
         run: |
           set -euo pipefail
