@@ -973,17 +973,15 @@ gh_env_verdict() {
 # being wrong differs: refusing costs one PR's merge, certifying a free issue costs duplicated work
 # on two boxes.
 #
-# ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
-# through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
-# seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
-# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT the bare `cp` this comment used
-# to prescribe: depth-1 `*.sh` leaves `gh-limit/gh`, `gh-limit.py` and `retired/*` behind, which is the
-# #2041 shape. `install.sh` is not the answer either — it REPORTS drift rather than installing, and the
-# remedy it prints is now this same helper), so a deployed cell has it; a
-# box without it cannot take the claim either, and refusing to queue on a missing FILE would make
-# every such box merge-only — a bigger, less reversible failure than the state being removed.
-# Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a
-# provisioning failure (rc=3 below), because that one is local, permanent, and fixable in seconds.
+# MISSING IS REFUSED TOO — agent-infra#2466 REVERSED THE OLD "loud fallthrough" (2026-10-23). The old
+# rule let a box with NO registry file keep dispatching, unclaimed, on the argument that making a
+# missing file refuse would turn such a box merge-only. Two things changed that: (a) the PR path now
+# abstains on an unreadable registry as well, so the cell is not "merge-only" — it is silent, and this
+# change makes the silence announced with the one-line remedy; and (b) the fallthrough was not loud in
+# the place that matters: `issue_claim_verdict` ALREADY returned INCOMPLETE for a missing file, and the
+# call site simply did not ask it. So missing, unreadable and PRESENT-BUT-STALE are one polarity
+# (refuse), and `--check` refuses them up front. The migration cost is one command, named in the log
+# line and in `--check`'s output; the cost of the old behaviour was two lanes on one issue.
 # ⛔ THE REGISTRY PATH IS NOT READ FROM THE ENVIRONMENT (2026-10-16 review). `CLAIMS_SH` was a
 # regression-test seam, but three production callers had begun to honour it, which let an ambient
 # value resolve a DIFFERENT registry in each of them — a gate half-disabled by the environment, the
@@ -1084,11 +1082,41 @@ cmd_check() {
       # network, and a fetch only ADVANCES origin/main, so this probe can never false-block. Left
       # unprobed, `--check` blessed a tree the run path refuses with `TRANSIENT: … carries 1 commit(s)
       # not in origin/main` — #2174's shape behind a CHECK OK.
-      if [ -n "$sc_main" ] && [ "$sc_head" != "$sc_main" ] \
-         && [ "$(git -C "$SC" rev-list --count "refs/remotes/origin/main..HEAD" 2>/dev/null || echo 0)" != 0 ]; then
-        echo "[refresh] check: FAIL the scout at $SC carries commits that are NOT in origin/main, so the refresh will refuse to move it"
-        echo "[refresh] TRANSIENT: scout commits ahead — the move would orphan those commits; save them (git -C $SC branch scout-work-<date> or push them), then re-run"
-        return "$EXIT_TRANSIENT"
+      # ⛔ THE SECOND HALF OF THAT SENTENCE WAS WRONG, AND IT IS #2953 (measured on cell4, 2026-10-27).
+      # A fetch does not make this probe safe in a SHALLOW checkout: a `shallow` graft makes the walk from
+      # origin/main stop early, so `origin/main..HEAD` counted 1634 for a CLEAN scout with zero local
+      # commits — and `--check` FAILing here is `cloud-cell-bringup.sh` REFUSING TO START a cell. With no
+      # fetch allowed in this mode the history cannot be connected, so an UNPROVABLE count is a WARN
+      # naming both readings; the RUN PATH fetches/deepens and refuses only when the commits are genuinely
+      # local (PROVEN by a merge base). One derivation, both paths — see `scout_ahead_verdict`.
+      # ⛔ THE OTHER HALF OF "STALE TRACKING REF vs LOCAL WORK" IS THE FULL CHECKOUT (#2956 review P2).
+      # The shallow arm above was only one arm: on a FULL checkout whose `refs/remotes/origin/main` is
+      # STALE, `n>0` plus a merge base reads `local`, and this check FAILed with "PROVEN on this
+      # checkout's own graph, so the refresh will refuse to move it" — while the run path fetches FIRST
+      # and then finds HEAD already AT the (advanced) trunk tip and proceeds. Same false block, same
+      # consequence: `cloud-cell-bringup.sh` `die`s on any non-zero `--check`, so a healthy cell could
+      # not START. The attribution is what is unprovable offline, not the count: a merge base proves
+      # HEAD carries N commits the LOCAL ref does not have, and a stale ref produces exactly the same
+      # local reading as a local commit (measured: both are ahead>0, behind=0, connected). Only a fetch
+      # separates them, and this mode may not fetch — so the verdict is `local-or-unfetched` and this
+      # check WARNS. What it still FAILs is what a fetch cannot change: an `unrelated` history (a fetch
+      # of the trunk cannot connect a disjoint one) and a verdict it has no reading for.
+      if [ -n "$sc_main" ] && [ "$sc_head" != "$sc_main" ]; then
+        scout_ahead_verdict refs/remotes/origin/main noconnect
+        case "$SCOUT_AHEAD_VERDICT" in
+          none) ;;
+          unrelated)
+            echo "[refresh] check: FAIL the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) on a history that shares NO common ancestor with refs/remotes/origin/main ($SCOUT_AHEAD_VERDICT — a FETCH cannot connect a disjoint history, so the refresh will refuse to move it)"
+            echo "[refresh] TRANSIENT: scout commits ahead — the move would orphan those commits; save them (git -C $SC branch scout-work-<date> or push them), then re-run"
+            return "$EXIT_TRANSIENT" ;;
+          unfetched)
+            echo "[refresh] check: WARN the scout at $SC is ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) off refs/remotes/origin/main and this checkout CANNOT SAY WHICH KIND: it is a SHALLOW checkout whose history does not connect to the trunk (or its tracking ref is stale), so these may be commit(s) the ref has not fetched rather than local work. The run path fetches (and deepens a shallow checkout) before deciding, and refuses only if they are genuinely local — it is NOT refusible here without the network (#2953)" ;;
+          local-or-unfetched)
+            echo "[refresh] check: WARN the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) that refs/remotes/origin/main does not have, and this checkout CANNOT SAY WHICH KIND ($SCOUT_AHEAD_VERDICT): the count is PROVEN on this checkout's own graph, but a CONNECTED count is not an ATTRIBUTION — these are either LOCAL commit(s) or commit(s) a STALE tracking ref has not fetched, and the two read IDENTICALLY offline (ahead=$SCOUT_AHEAD_COUNT, behind=0, connected). The run path fetches first and refuses only if they are genuinely local, so a FAIL here would refuse a healthy cell without the network to prove it — this is NOT refusible in this mode (#2956)" ;;
+          *)
+            echo "[refresh] check: FAIL the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) off refs/remotes/origin/main and this check has NO READING for them ('$SCOUT_AHEAD_VERDICT') — REFUSING TO CERTIFY a verdict it does not understand rather than blessing a cell on it"
+            return "$EXIT_TRANSIENT" ;;
+        esac
       fi
       # ⛔ AN UNANSWERABLE PROBE IS NAMED, NOT SILENT (review cycle 7, P2). With no local
       # `refs/remotes/origin/main` this check cannot run — and the run path WILL refuse after its
@@ -1191,9 +1219,15 @@ cmd_check() {
     fi
     echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
   else
-    # NOT a failure: the documented loud fallthrough (issue_claim_verdict's STATED LIMIT). The box
-    # dispatches, without the cross-box gate, and says so — the same verdict the refresh reaches.
-    echo "[refresh] check: claim registry=$O/claims.sh absent — the refresh will WARN per issue and dispatch without a cross-box claim"
+    # ⛔ A MISSING REGISTRY IS NOT A PASS (agent-infra#2466). This arm used to certify the cell and say
+    # the refresh would "WARN per issue and dispatch without a cross-box claim" — a check blessing the
+    # exact state the run now refuses, i.e. a false PASS. The run path (`issue_claim_verdict`) answers
+    # INCOMPLETE for a missing file, and `--check` must refuse what the run refuses, so both name the
+    # same one-line remedy.
+    echo "[refresh] check: FAIL $O/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
+    echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE (claim-unreadable), so a cell on this repo would dispatch NOTHING"
+    echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
+    return "$EXIT_NOT_PROVISIONABLE"
   fi
   # ⛔ JUDGE THE INTERPRETER THE REFRESH WILL ACTUALLY USE. `--check` must not create the scout
   # worktree, but the venv it reads must be the one the run will find there. Reading
@@ -1287,6 +1321,127 @@ scout_is_worktree() {
   top="$(git -C "$SC" rev-parse --show-toplevel 2>/dev/null)" || return 1
   here="$(cd "$SC" 2>/dev/null && pwd -P)" || return 1
   [ -n "$top" ] && [ "$(cd "$top" 2>/dev/null && pwd -P)" = "$here" ]
+}
+
+# ══ "COMMITS AHEAD" IS ONLY EVIDENCE ON A CONNECTED HISTORY (agent-infra#2953) ══════════════════════
+# ⛔ MEASURED, cell4 (`vm-ce2c2fc9fd844a32851d46c3723b903e`), 2026-10-27 — a CLEAN scout with ZERO local
+# commits, refused on every pass:
+#     scout HEAD=fadb6334  dirty=0  local-only commits: 1634
+#     refs/remotes/origin/main = 1e0516ffd = the FRESH upstream tip, TWO COMMITS AHEAD of HEAD
+#     git rev-list --count origin/main..HEAD  →  1634      (the number the refusal quoted)
+#     git merge-base HEAD origin/main         →  none      (that is the whole defect)
+#     .git/shallow                            →  91a3b29be = the tip's OWN PARENT
+# A `shallow` graft makes the listed commit PARENTLESS, so the walk from origin/main stops one commit in
+# while the walk from HEAD runs down every object the box holds. The 1 634 "commits not in origin/main"
+# were therefore the checkout's OWN history, below a line the walk was forbidden to cross — not work the
+# scout authored. The guard could not tell those apart, so it refused a transient BY CONSTRUCTION: the
+# message was unactionable (there was nothing to preserve), and nothing on the box moves a shallow
+# boundary, so it could never clear.
+# ⛔ AND THE OBVIOUS CURE DOES NOT WORK, which is why this helper exists rather than "fetch first".
+# `scout_sync` ALREADY fetches (with an explicit destination) one arm above, and the ref was already
+# fresh; measured on the fixture below: 28 before the fetch, 28 after it, and 28 after `--deepen=1`.
+# Only a deepen that passes HEAD, or `--unshallow`, connects the graph (measured: 0 / ancestor=YES).
+# ⛔ SO THE COUNT IS READ ONLY WHEN IT MEANS SOMETHING. With a merge base between HEAD and the ref, the
+# number is what the message claims (local work → PRESERVE). Without one, the checkout cannot answer at
+# all, and the repair is to CONNECT the history (deepen cheapest-first, then unshallow) rather than to
+# read a graph artifact as authorship. One derivation, used by BOTH the run path and `--check` mode: a
+# second copy of this inference is how the fix would look green while `--check` still blocked cells
+# (`cloud-cell-bringup.sh` DIES on a non-zero `--check`, so a false FAIL there refuses to start a cell).
+SCOUT_AHEAD_COUNT=""
+SCOUT_AHEAD_RAW=""
+SCOUT_AHEAD_TARGET=""
+# 0 = the histories are CONNECTED (a merge base exists), so `rev-list --count` is trustworthy.
+# 1 = still severed (not shallow, or every deepening step failed) — the count is an artifact.
+scout_connect_history() {   # <ref>
+  local ref="$1" step
+  git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1 && return 0
+  [ "$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ] || return 1
+  # ⛔ A LADDER, CHEAPEST FIRST, BECAUSE THE REPAIR, NOT THE COUNT, IS THE POINT. The measured shape sits
+  # ONE commit below the graft, so the first rung costs a handful of objects while `--unshallow` on
+  # agent-infra would download its entire history on a cell that already has a disk floor (#2850).
+  for step in 2 20 200; do
+    git -C "$SC" fetch --quiet --deepen="$step" origin "+refs/heads/main:$ref" >/dev/null 2>&1 || return 1
+    git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1 && return 0
+    [ "$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ] || return 1
+  done
+  # Last rung: tear the boundary out. This is a ONE-TIME repair of the box — once the checkout is
+  # complete, every later pass is exact and this class of false refusal cannot recur.
+  git -C "$SC" fetch --quiet --unshallow origin "+refs/heads/main:$ref" >/dev/null 2>&1 || return 1
+  git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1
+}
+
+# Prints ONE word, and publishes SCOUT_AHEAD_COUNT / SCOUT_AHEAD_RAW / SCOUT_AHEAD_TARGET:
+#   none      — HEAD is reachable from <ref>: there is nothing to lose, so the gate may move.
+#   local     — HEAD carries N commits <ref> does not have, PROVEN on a connected history → PRESERVE.
+#   unrelated — the histories share NO common ancestor and the checkout is NOT shallow (a rewritten
+#               trunk, an orphan branch, or local work on a history main never had) → PRESERVE.
+#   unfetched — the checkout is SHALLOW and deepening could NOT connect it, so N counts "commit(s) the
+#               remote-tracking ref has not fetched" and says NOTHING about local work → FETCH/retry.
+#   local-or-unfetched — `noconnect` ONLY: the count is PROVEN on a connected graph (a merge base), but
+#               a CONNECTED COUNT IS NOT AN ATTRIBUTION — HEAD carrying N commits the LOCAL ref lacks is
+#               the same reading for "N local commits" and for "N commits a STALE ref has not fetched"
+#               (ahead>0, behind=0, connected, in both). Only a fetch separates them, and `noconnect` may
+#               not fetch, so this is WARNed, never refused (#2956 review, the other half of #2174's arm;
+#               the reviewer's suggested name was `unfetched-full` — named for BOTH readings instead,
+#               because the token is read by operators in the message and neither reading is proven).
+# ⛔ `unrelated` EXISTS SO THAT (b) CANNOT LEAK THROUGH THE NEW ARM (measured in this change's own
+# prototype): a scout on an ORPHAN branch is not shallow and has no merge base, and folding it into
+# `unfetched` would have printed "nothing needs preserving" over commits that exist in no other place.
+# `unfetched` is therefore gated on the shallow test, not on "no merge base".
+# `connect` may use the network (the run path, which is about to check out anyway); `noconnect` may not
+# (`--check`, which is deliberately offline: a check that needs egress would refuse a healthy cell on a
+# train). On `noconnect` a shallow checkout is `unfetched`, never `local`.
+# ⛔ THE VERDICT CROSSES IN A VARIABLE, NOT ON STDOUT (measured in this very change): called as
+# `case "$(scout_ahead_verdict …)"`, the function runs in a COMMAND-SUBSTITUTION SUBSHELL and its
+# SCOUT_AHEAD_* assignments die with it — the caller then read an EMPTY count and printed
+# "carries  LOCAL commit(s)" while the number it had just computed sat one subshell away. A multi-value
+# return is a global, not a string.
+SCOUT_AHEAD_VERDICT=""
+scout_ahead_verdict() {   # <ref> <connect|noconnect>; sets SCOUT_AHEAD_VERDICT, always returns 0
+  local ref="$1" mode="$2" n shallow
+  SCOUT_AHEAD_COUNT=""; SCOUT_AHEAD_RAW=""
+  shallow="$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)"
+  SCOUT_AHEAD_TARGET="$(git -C "$SC" rev-parse -q --verify "$ref" 2>/dev/null)" || SCOUT_AHEAD_TARGET=""
+  if [ -n "$SCOUT_AHEAD_TARGET" ] && git -C "$SC" merge-base --is-ancestor HEAD "$SCOUT_AHEAD_TARGET" >/dev/null 2>&1; then
+    SCOUT_AHEAD_VERDICT=none; return 0
+  fi
+  n="$(git -C "$SC" rev-list --count "$ref..HEAD" 2>/dev/null)" || n=""
+  case "$n" in ''|*[!0-9]*) n="" ;; esac
+  SCOUT_AHEAD_RAW="$n"
+  # ⛔ THE REPAIR MAY MOVE THE REF (the deepen fetches it) AND MAY UNSHALLOW, so re-read both.
+  if [ "$mode" = connect ]; then
+    scout_connect_history "$ref" || :
+    SCOUT_AHEAD_TARGET="$(git -C "$SC" rev-parse -q --verify "$ref" 2>/dev/null)" || SCOUT_AHEAD_TARGET=""
+    shallow="$(git -C "$SC" rev-parse --is-shallow-repository 2>/dev/null)"
+  fi
+  n="$(git -C "$SC" rev-list --count "$ref..HEAD" 2>/dev/null)" || n=""
+  case "$n" in ''|*[!0-9]*) n="" ;; esac
+  SCOUT_AHEAD_COUNT="$n"
+  # Ancestry first: a count of 0 IS "HEAD is contained in the ref", and reading it that way keeps the
+  # verdict immune to the graph artifact this helper exists for.
+  [ -n "$n" ] && [ "$n" -eq 0 ] 2>/dev/null && { SCOUT_AHEAD_VERDICT=none; return 0; }
+  if [ -n "$n" ] && git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1; then
+    # ⛔ THE COUNT IS PROVEN; ITS ATTRIBUTION IS NOT — AND `noconnect` CANNOT BUY ONE (#2956 review P2).
+    # Measured shape: a FULL checkout whose `refs/remotes/origin/main` is STALE (the trunk moved on, this
+    # checkout has not fetched since) has HEAD carrying exactly the commits the ref lacks — which is the
+    # SAME local reading a genuinely-local commit produces. The run path fetches first (so this resolves
+    # to `none` or to `local` there); `--check` may not, so it must not claim what only a fetch can
+    # prove. Refusing on it refused a healthy cell at `cloud-cell-bringup.sh --check`.
+    if [ "$mode" = noconnect ]; then
+      SCOUT_AHEAD_VERDICT=local-or-unfetched
+    else
+      SCOUT_AHEAD_VERDICT=local
+    fi
+    return 0
+  fi
+  # ⛔ NO MERGE BASE: shallow ⇒ the graph is severed (the artifact this change exists for); not shallow
+  # ⇒ the histories really are disjoint, which is WORK OR A REWRITE and must be preserved.
+  if [ "$shallow" = "true" ]; then
+    SCOUT_AHEAD_VERDICT=unfetched
+  else
+    SCOUT_AHEAD_VERDICT=unrelated
+  fi
+  return 0
 }
 
 # 0 = the scout IS origin/main (or is a vendored copy that cannot hide a versioned gate);
@@ -1507,11 +1662,40 @@ scout_sync() {
     # and abandons whatever HEAD was, so a commit not in origin/main becomes unreachable — and the
     # dirty guard above cannot see it, because a commit leaves the worktree clean. Count against HEAD,
     # not against the branch name: a DETACHED scout would otherwise count 0 while losing its commits.
-    commits="$(git -C "$SC" rev-list --count "$target..HEAD" 2>/dev/null || echo 0)"
-    case "${commits:-0}" in
-      ''|0) ;;
-      *) # same defect as the arm above: RC without WHY (#2688 review cycle 2, P2).
-         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries $commits commit(s) not in origin/main — moving the gate would orphan them. Keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
+    # ⛔ AND THE COUNT IS ONLY EVIDENCE ON A CONNECTED HISTORY (agent-infra#2953, measured on cell4):
+    # across a `shallow` graft it counts the checkout's OWN history and refuses a clean scout forever.
+    # The verdict distinguishes PRESERVE (`local`) from FETCH (`unfetched`) — opposite operator actions
+    # that the old single message could not tell apart, which was half the defect.
+    scout_ahead_verdict refs/remotes/origin/main connect
+    case "$SCOUT_AHEAD_VERDICT" in
+      none)
+         # The repair may have ADVANCED the ref; use the sha it left, not the pre-deepen one.
+         target="${SCOUT_AHEAD_TARGET:-$target}"
+         # Name the repair when it happened: an operator reading "scout STALE at … refreshing" for a
+         # tree that was never ahead must be able to see WHY a count was discarded.
+         case "${SCOUT_AHEAD_RAW:-0}" in
+           ''|0) ;;
+           *) echo "[refresh] REPAIR: $SC is a SHALLOW checkout whose history did not connect to origin/main, so 'commits ahead' read ${SCOUT_AHEAD_RAW} — that was this checkout's OWN history below the shallow boundary, not local work; deepened the history, and the scout is now a clean ancestor of origin/main (#2953)" ;;
+         esac ;;
+      local)
+         # same defect as the arm above: RC without WHY (#2688 review cycle 2, P2).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries $SCOUT_AHEAD_COUNT LOCAL commit(s) that origin/main does not have — moving the gate would orphan them. Keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
+         return 1 ;;
+      unrelated)
+         # ⛔ NOT FOLDED INTO `unfetched` (#2953 review of this same change): these histories share NO
+         # ancestor and the checkout is NOT shallow, so this is local work (or a rewrite) — the one
+         # shape where "nothing needs preserving" would be a lie over commits that exist nowhere else.
+         # The count can be UNREADABLE on this arm (it is reached when `rev-list` failed, not only when it
+         # answered), so it prints a WORD rather than `carries  commit(s)` (#2956 review, cosmetic).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) on a history that shares NO common ancestor with origin/main — moving the gate would orphan them. That is either local work or a rewritten trunk, and deciding between those is an operator call, not a scheduled one. Inspect them (git -C $SC log --oneline --graph origin/main..HEAD), save anything real with: git -C $SC branch scout-work-$(date +%s)"
+         return 1 ;;
+      *)
+         # REFUSED, and it says WHICH kind of difference this is — FETCH, not preserve. A deepening that
+         # failed (no egress) lands here too, which is why this is TRANSIENT and retried next cycle.
+         # ⛔ IT MAKES NO CLAIM ABOUT PRESERVATION: the pass could not connect the history, so it does not
+         # know whether these commits are local. "Nothing needs preserving" is only allowed where it was
+         # PROVEN (the `none` arm above).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC is a SHALLOW checkout whose history does not connect to origin/main, so its ${SCOUT_AHEAD_COUNT:-unreadable} commit(s) are commit(s) the REMOTE-TRACKING REF HAS NOT FETCHED as far as this pass can tell — REFUSING TO JUDGE; nothing was moved and nothing was discarded. The operator action here is FETCH, not preserve: git -C $SC fetch --unshallow origin, then re-run (the next cycle retries too)"
          return 1 ;;
     esac
     echo "[refresh] scout STALE at $before, refreshing to origin/main ${target:0:9} (#2174)"
@@ -2661,20 +2845,22 @@ _ck_tmp="$O/.checked-decided.$$"
 : > "$_ck_tmp" || { echo "[refresh] ABORT: cannot write $_ck_tmp — the checked classification could not be persisted (#2183)"; exit "$EXIT_TRANSIENT"; }
   if [ ! -s "$O/state/checked-release-candidates" ]; then
     : # the classification ran and found EVERY entry justified: nothing to ask, nothing to release
-  elif [ ! -f "$O/claims.sh" ]; then
-    # ⛔ A BOX WITHOUT THE REGISTRY IS THE DOCUMENTED LOUD FALLTHROUGH (issue_claim_verdict's STATED
-    # LIMIT): it cannot take a claim either, so refusing to release would leave a suppression no
-    # reader on that box could ever justify. No network read happens here, so the cap does not apply.
-    echo "[reap] the claim registry ($O/claims.sh) is NOT INSTALLED — releasing on local facts only (documented fallback)"
-    # ⛔ AND THE LINE SAYS SO (review E, cycle 5): the claim read is the one fact this pass cannot
-    # answer locally, and a release made without it is indistinguishable on the operator line from a
-    # fully claim-checked one. `none` means "nothing was refused"; this uses its own value.
-    CHECKED_REFUSED="claim-registry-absent"
-    while IFS= read -r _n; do
-      case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
-      printf '%s\treleased\n' "$_n" >> "$_ck_tmp"
-    done < "$O/state/checked-release-candidates"
   else
+    # ⛔ A MISSING REGISTRY IS NOT A LICENCE TO RELEASE (agent-infra#2466, review P2). This branch used
+    # to hold an `elif [ ! -f "$O/claims.sh" ]` arm that released every candidate "on local facts
+    # only" and called it the documented loud fallthrough — citing `issue_claim_verdict`'s STATED
+    # LIMIT, a section the same change DELETED and replaced with "MISSING IS REFUSED TOO". So the arm
+    # acted on a policy that no longer existed anywhere, while the one-polarity rule it broke is
+    # stated three other places in this file (the `--check` arm, the walk's ICR=2 arm, the dispatch
+    # arm): missing, unreadable and stale are ONE polarity — refuse.
+    # The refusal is already implemented one branch below by the ask loop, which calls
+    # `issue_claim_verdict` unconditionally and maps its 2 (INCOMPLETE, the answer for a missing
+    # file) to `claim-unknown` → the suppression is KEPT and COUNTED. The arm above pre-empted it.
+    # ⛔ BUT THE OPERATOR LINE STILL SAYS IT (kept from that arm, review E cycle 5): the claim read is
+    # the one fact this pass cannot answer locally, so a pass that could not consult the registry
+    # must not be byte-identical on the line to one that did. `none` means "nothing was refused";
+    # this uses its own value. It records a REFUSAL now, which is what the slug always described.
+    [ -f "$O/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
     _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
     # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
     # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the
@@ -2879,12 +3065,13 @@ _ck_tmp="$O/.checked-decided.$$"
     # an operator to a field that never moves.
     echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — every entry it did not record is counted as skipped_checked_unknown (the breakdown still sums, so reason_conflict cannot show this) rather than name a reason nobody verified"
   fi
-  # ⛔ `refused=` IS PUBLISHED HERE (review): the no-registry fallback above sets
-  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say a release was made WITHOUT the
-  # cross-box claim read — and nothing ever wrote it here, while the funnel's reader re-initialises the
-  # variable from THIS record. Measured before this line existed: `checked_refused=none` on a box with no
-  # `$O/claims.sh`, i.e. the one release that skipped the claim check was byte-identical on the operator
-  # line to a fully claim-checked one — the "a fact with no statement" defect this change exists to end.
+  # ⛔ `refused=` IS PUBLISHED HERE (review): the absent-registry arm above sets
+  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say this pass could not consult
+  # the cross-box registry — and nothing ever wrote it here, while the funnel's reader re-initialises
+  # the variable from THIS record. Measured before this line existed: `checked_refused=none` on a box
+  # with no `$O/claims.sh`, i.e. a pass that never read the claim registry was byte-identical on the
+  # operator line to a fully claim-checked one — the "a fact with no statement" defect this change
+  # exists to end.
   if printf 'released=%s deferred=%s unjustified=%s refused=%s sort_failed=%s at=%s\n' \
        "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${CHECKED_REFUSED:-none}" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
        > "$O/state/.checked-reap.$$" 2>/dev/null \
@@ -3978,30 +4165,30 @@ while read -r N; do
         # the block's own rule is that neither line may claim an action this script did not take. The
         # reset makes the guarantee local: an empty reason can only come from THIS candidate.
         CLAIM_RESULT=''
+        # ⛔ A MISSING REGISTRY IS `ICR=2` (INCOMPLETE, never CLEAN) — agent-infra#2466. This call used
+        # to sit behind `if [ -f "$O/claims.sh" ]`, so an UNPROVISIONED box left `ICR=0` and QUEUED the
+        # issue: the one case the old note called a "documented loud fallthrough" was in fact a silent
+        # fail-open in the only place this block declares it never fails open, and it is the shape a
+        # second cell hits when it was never provisioned — the exact duplicate dispatch the issue claim
+        # exists for. `issue_claim_verdict` already answers 2 for a missing file, so the fix is to ASK
+        # it rather than to decide for it: one verdict, no second path. The cost is that an
+        # unprovisioned box queues nothing until the one-line remedy in `--check` is run.
+        #
         # ⛔ NO "MISSING READER" GUARD IS NEEDED HERE, and a guard was removed rather than kept (review,
         # F1): this loop body is also driven STANDALONE by selftest.sh, where `issue_claim_verdict` is
         # not defined and the call returns 127 — but the `case` below NAMES its CLEAN arm and sends
-        # every unrecognised code to `*)`, which is INCOMPLETE and queues nothing. The removed guard
-        # claimed that 127 "therefore QUEUES"; the `*)` arm forbids exactly that (#1853 review: "only
+        # every unrecognised code to its default, which is INCOMPLETE and queues nothing. The removed
+        # guard claimed that 127 "therefore QUEUES"; that arm forbids exactly that (#1853 review: "only
         # an explicit 0 queues"). It changed the log text only, so it is not restored: a line that
         # claims an invariant the adjacent code already holds is the class this file refuses.
-        # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE on the ordinary CLEAN path — the documented loud
-        # fallthrough (see issue_claim_verdict's STATED LIMIT), and the only case in which a box
-        # without the registry keeps dispatching. It is NOT a verdict: the branch below announces it
-        # every time. It is NOT tolerated when the registry is the ONLY authority left: if the board
-        # could not answer either, nothing has answered the holder question (HOLDER_BY_CLAIMS), so the
-        # fallback below turns it into ICR=2 instead.
-        if [ -f "$O/claims.sh" ]; then
-          # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
-          # condition's status surviving into the else branch.
-          # (A reader that does not exist is the `*)` arm's job, not a special case: 127 is an
-          # unrecognised verdict, so it is INCOMPLETE and never queues.)
-          issue_claim_verdict "$N"; ICR=$?
-        elif [ "${HOLDER_BY_CLAIMS:-0}" = 1 ]; then
-          ICR=2; CLAIM_RESULT="the pre-flight's holder surface could not answer and the cross-box claim registry ($O/claims.sh) is NOT INSTALLED"
-        else
-          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)"
-        fi
+        #
+        # ⛔ AND IT SUBSUMES THE `HOLDER_BY_CLAIMS` ARM THAT STOOD HERE (merge of main's #1853 work with
+        # #2466): that arm spelled the same refusal out by hand (`[ -f "$O/claims.sh" ]` … `elif
+        # HOLDER_BY_CLAIMS=1` … else). One unconditional call reaches all three outcomes from ONE
+        # verdict — a present registry answers, a missing file answers 2, a missing READER answers 127
+        # and falls to the default — so the hand-written arm was a second path to the same answer and
+        # is deleted rather than kept beside it.
+        issue_claim_verdict "$N"; ICR=$?
         # ⛔ THE CLEAN ARM IS NAMED, NOT THE WILDCARD (2026-10-16 review). `case 1) … 2) … *) CLEAN`
         # read EVERY other code — 127 from a missing function, and any code a foreign or future
         # registry might return — as CLEAN and queued the issue: fail-OPEN, in the one place this

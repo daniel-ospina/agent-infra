@@ -153,10 +153,17 @@ jobs:
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
     # checks 1–5 (materialized copy / mistargeted link / unwired entry /
     # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
-    # exclusion. Check 5 is the ONE machine-local check: it aims at
-    # ${PI_EXTENSIONS_DIR:-$HOME/.pi/agent/extensions}, so on a runner it prints
-    # an explicit ⏭️ skip and the CI verdict stays repo-tree-only; its
-    # fail/pass behaviour is pinned here by the fixture suite's cases 10–12.
+    # exclusion. Check 5/6 are the machine-local ones — they read a live farm,
+    # never the repo tree — so the site they read must not be the RUNNER BOX's
+    # own ~/.pi (measured on #3002: a self-hosted pi box with stale test-file
+    # copies in its farm reddened this job over a diff that touched neither
+    # extensions/ nor the farm — a host-dependent required check). The job
+    # therefore NAMES the farm, and names it at the one this repo SHIPS:
+    # deterministic across runners, and still load-bearing, because a test-file
+    # entry or a dangling link added to the shipped farm reds here. The gate
+    # refuses the ambient farm in CI even if this env is removed (cases 33-34).
+    env:
+      PI_EXTENSIONS_DIR: ${{ github.workspace }}/pi-bootstrap/pi-config/extensions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -234,7 +241,10 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q
+        # #1187 — scripts/test_cmux_payload.py: the cmux sender's payload-TAIL checker
+        # (scripts/lib/cmux_payload.py) is exec'd by orch-send.sh, so a suite CI never
+        # runs is a suite the repo does not have.
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -783,6 +793,27 @@ jobs:
         # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
         # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/reviewer-preflight.test.ts
+      - name: Headless-lane contract suite (#2965, zero-dep)
+        # #2965 — a guard must judge what the process IS, not who launched it. `lane.sh` exports
+        # SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless `pi -p` started any other way (a
+        # cloud-cell dispatch, a hand-run "pi -p … --no-session") got the gates and none of the
+        # affordances, so its `git commit` was refused and the lane exited with ZERO commits —
+        # measured 2026-10-27, and silent, because nothing fails loudly when a gate simply says no.
+        # This suite builds a REAL hub and REAL linked worktrees with git and pins BOTH arms: a
+        # derived lane acts, the hub stays guarded. Both halves matter — a suite that only pinned
+        # the worktree arm would accept a change that lifted the hub gate (what #618/#621 measured).
+        # Zero-dep (`node:*`, ./headless-lane.js, ../skill-enforcer.js, the `git` binary), so it runs
+        # in THIS job (no `npm ci`); the BLOCKING backstop is the post-merge ci-main.yml
+        # `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/headless-lane.test.ts
+      - name: Headless-lane contract MUTATION evidence (#2965, zero-dep)
+        # The suite above is only a pin if it can FAIL. Mutations reintroduce each arm's defect —
+        # the derivation reverted so a linked worktree no longer derives a lane, and the historical
+        # path-insensitive fail-open that treats EVERY checkout as a linked worktree (#618/#621) —
+        # into a TEMP copy of the module, and into the wiring through the contract seam, requiring
+        # each paired assertion to go RED and printing it verbatim. Its own step so neither verdict
+        # can suppress the other (the rule every sibling suite here follows).
+        run: npx tsx extensions/shared/headless-lane.test.ts --mutations
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets

@@ -65,7 +65,25 @@ THREE MEASUREMENT TRAPS THIS SCRIPT EXISTS TO AVOID, all hit for real:
      declared, and a queue that never settles is still reported BLIND (#1869).
 
 Usage:  objective.py [--json] [--max-age 240]
-Output: OBJECTIVE VERDICT=... prs_waiting=N ... main=RED|GREEN|UNKNOWN@sha ...
+Output: OBJECTIVE VERDICT=... repo=<owner/name> repo_src=env|checkout|default ... main=RED|GREEN|UNKNOWN@sha ...
+
+EXIT (agent-infra#2710 -- a refusal is a verdict, and UNKNOWN is never a pass):
+  0  a READABLE verdict about the tree/queue: `AT-TARGET`, `ADVANCING`, `REGRESSING`, `FIX-MAIN`.
+     `FIX-MAIN` is a finding about main, not a failure of this read -- it exits 0 like the rest.
+  2  REFUSING -- the world could not be read, or the repo this process would read is not the one
+     its checkout is. Two ways to reach it, and the SECOND outranks the first: a verdict that is
+     not in `READABLE_VERDICTS` (an allow-list, so a word this file has never seen refuses too),
+     and any line carrying a `BLINDNESS_TOKENS` fact (`queue=UNREADABLE`, `gh=UNREADABLE`,
+     `main=UNKNOWN@?`, `error=`) whatever word it also carries -- `build()`'s ladder puts
+     `FIX-MAIN` above the blind-queue arm, so without that rule a RED main beside an unreadable
+     queue printed a readable word over an unread world. The reason is on the SAME line
+     (`error=…` / `repo_mismatch(...)`) and the next action is named there. 2 is the fleet's
+     cannot-verify code (`check-deployed-drift.sh`, `cycle-record.sh`, `pr-doctor.py`), so a caller
+     that reads only exit codes can tell a refusal from a healthy read.
+⛔ BEFORE #2710 THIS FILE ALWAYS EXITED 0. Measured: `OBJECTIVE_REPO` naming a repo that does not
+   exist printed `VERDICT=UNKNOWN … queue=UNREADABLE` and exited 0, so the ONE state that means
+   "the read did not happen" was indistinguishable, to any launcher, from `AT-TARGET`. Never a
+   crash (the heartbeat calls this every tick): a refusal is a printed line AND a code.
 """
 from __future__ import annotations
 import json, os, re, subprocess, sys, time
@@ -91,7 +109,261 @@ from datetime import datetime, timedelta, timezone
 # `lane-scan-fallback.sh:76`. Fixing those, and the required-set half of the same seam, is the open
 # work on **#2518** (the live root -- #1989 is CLOSED and its P1s were carried to #2518).
 # Naming them here is so the next lane can find them from the file that knows.
-REPO = os.environ.get("OBJECTIVE_REPO") or "daniel-ospina/tortoise"
+#
+# ⛔ AND THE REPO READ MUST MATCH THE CHECKOUT THIS PROCESS STANDS IN (agent-infra#2710, the
+# contract's §3.7 "C6" row). The fallback above was SILENT, so a process standing in agent-infra
+# answered about tortoise with full confidence -- measured 2026-10-24: a doctor on a cell read
+# tortoise's check-runs for agent-infra's SHAs, GitHub replied `422 No commit found for SHA` for
+# EVERY PR, and every pass refused to dispatch while the log looked like a quiet queue. The
+# mismatch control already existed for the SUPERVISOR's `OR` (`cloud-cell-supervisor.sh`, the repo
+# derived from the checkout's origin, an explicit value must match it); this applies the SAME rule
+# here, in the ONE classifier, instead of inventing a second one.
+#
+# THE CONTRACT, DECIDED ONCE (agent-infra#2710's scope, item 1) -- `resolve_repo()` is the code:
+#   1. a DECLARED repo (`OBJECTIVE_REPO`, then `OR`)   -> read it, `repo_src=env`. If this process
+#                                                      stands in a checkout that derives a DIFFERENT
+#                                                      slug, that is a NAMED REFUSAL, not a read; if
+#                                                      the checkout cannot be derived at all, the
+#                                                      line says `repo_check=uncompared:<why>` so an
+#                                                      inert comparison cannot read as a satisfied one.
+#   2. nothing declared, checkout derivable          -> read the checkout's own `owner/name`,
+#                                                      `repo_src=checkout`. A process standing in a
+#                                                      repo cannot silently read another one.
+#   3. nothing declared, nothing derivable          -> `REPO_DEFAULT`, `repo_src=default`. Kept, and
+#                                                      MADE LOUD: the source is on every line, so a
+#                                                      reader can never again mistake it for an answer
+#                                                      about the repo it is standing in. (Removing it
+#                                                      outright would blind `heartbeat-loop.sh` on the
+#                                                      Mac, whose farm copy `~/.pi/agent/scripts/` is
+#                                                      not a git checkout and carries no deriver --
+#                                                      named as a gap in the contract, not papered over
+#                                                      with a refusal that breaks the primary box.)
+# ⛔ AND `OR` IS A DECLARATION TOO (review round 1, P2). `orch-loop.sh` EXPORTS `OR` -- the repo the
+# controller GRADES and dispatches for -- into every child it starts. Taking the cwd as authoritative
+# when nothing else is set would let a controller bound to tortoise, whose pass happens to run with a
+# cwd inside ANOTHER checkout (a lane worktree, a second checkout on the box), publish that other
+# repo's queue into `objective.last` under the arm this contract presents as trustworthy. So a
+# declared repo outranks the cwd, and a declaration that DISAGREES with the checkout is the same
+# named refusal as an explicit `OBJECTIVE_REPO` disagreement -- the supervisor's own rule for `OR`.
+# `--res` / `--gate-clause` return before any of this, so they resolve nothing. `--json` does NOT
+# return early (it only disables the cache), so it resolves like any other read.
+REPO_DEFAULT = "daniel-ospina/tortoise"
+# The declared-repo variables, in precedence order. `OBJECTIVE_REPO` is this file's own input
+# (agent-infra#1989); `OR` is the fleet's grading repo, exported by `orch-loop.sh`.
+DECLARED_ENVS = ("OBJECTIVE_REPO", "OR")
+
+
+def _safe_cwd():
+    """The process's cwd, or None when the OS REFUSES to say where the process is.
+
+    ⛔ `os.getcwd()` IS NOT A TOTAL FUNCTION (ai#2922). Under launchd with no Full Disk Access the
+    call RAISES (`PermissionError`, or `FileNotFoundError` for a deleted `WorkingDirectory`) instead
+    of returning a path, so a bare `os.getcwd()` inside a `try` is not a resolution -- it is a
+    failure that lands in whatever `except` happens to be nearest. Measured on this box: a deleted
+    cwd raises `FileNotFoundError`, an unreadable one raises `PermissionError`.
+    """
+    try:
+        return os.getcwd()
+    except OSError:                            # PermissionError, ENOENT, ENOENT-after-delete
+        return None
+
+
+def _checkout_repo(path=None):
+    """(slug, reason): the `owner/name` of the checkout this process stands in, or (None, why).
+
+    ⛔ SOURCED, NEVER RE-IMPLEMENTED: `scripts/orchestrator-harness/repo-slug.sh`'s `derive_or` is
+    the fleet's ONE answer to "which owner/name is this checkout" (shared with `orch-loop.sh`,
+    `refresh-candidates.sh` and `pr-loop.py`). A python copy of the parse would be a THIRD
+    derivation -- the drift that file exists to end -- so the slug is obtained by sourcing it, with
+    the same 10-line shim `pr-loop.py::_checkout_repo` uses (a shim, not a parser: the rules live in
+    the shell file). `why` is "deriver-missing" when this script was deployed without it (the farm
+    copy `~/.pi/agent/scripts/` is such a box today) and "underivable" otherwise -- two causes, two
+    remedies, and the difference is reported rather than collapsed.
+
+    ⛔ THREE CAUSES NOW, AND THE THIRD IS THE CWD (ai#2922). "cwd-unreadable" is the launcher's
+    working directory being unreadable to the OS -- under launchd, TCC denying a `WorkingDirectory`
+    under `~/Documents`. It used to be swallowed by the broad `except` below and reported as
+    "underivable", whose remedy is to go and debug `git`/`bash`; the actual remedy is to move the
+    job's `WorkingDirectory` out of the protected tree or to declare `REPO`. Collapsing it sent an
+    operator to the wrong remedy for ever, which is the failure this whole resolution exists to end.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    lib = None
+    for cand in (os.path.join(here, "orchestrator-harness", "repo-slug.sh"),
+                 os.path.join(here, "repo-slug.sh")):
+        if os.path.isfile(cand):
+            lib = cand
+            break
+    if lib is None:
+        return None, "deriver-missing"
+    # ⛔ RESOLVED OUTSIDE THE `try`: a cwd that cannot be read is a NAMED cause, never a neighbour
+    # of whatever exception the subprocess happened to raise.
+    if not path:
+        path = _safe_cwd()
+        if path is None:
+            return None, "cwd-unreadable"
+    try:
+        res = subprocess.run(
+            ["bash", "-c", '. "$1" >/dev/null 2>&1; derive_or "$2"', "_", lib,
+             str(path)],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None, "underivable"
+    if res.returncode != 0:
+        return None, "underivable"
+    slug = (res.stdout or "").strip()
+    if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", slug or ""):
+        return None, "underivable"
+    return slug, ""
+
+
+def declared_repo():
+    """(slug, variable): the first DECLARED repo in `DECLARED_ENVS` order, or (None, '')."""
+    for var in DECLARED_ENVS:
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            return val, var
+    return None, ""
+
+
+def resolve_repo(env=None, checkout=None, checkout_why=None):
+    """(slug, src, refusal, check): WHICH repo this read is about, WHERE that came from, and
+    whether the answer could be CHECKED.
+
+    `src` is `env` (a declared variable), `checkout` or `default` -- the third is the silent
+    fallback this function exists to end, and it is reported on every line so it can never be
+    silent again. `refusal` is a complete, machine-parseable reason naming both slugs when a
+    DECLARED repo disagrees with the checkout this process stands in -- the 2026-10-24 measurement,
+    made loud.
+
+    ⛔ `check` IS NOT DECORATION (review round 1, P2). When `_checkout_repo()` cannot answer -- the
+    deriver is missing from this deployment, or `git`/`bash` cannot be run -- the comparison is
+    IMPOSSIBLE, and returning `("", "env")` would let a declared repo pass as if it had been
+    verified: an inert guard that reads as a satisfied one, which is the shape this whole issue is
+    about. `check` therefore carries the reason (`uncompared:deriver-missing` /
+    `uncompared:underivable` / `uncompared:cwd-unreadable`) so the line can say so; and it is empty
+    when the comparison either happened or was not needed (nothing declared, or nothing to compare
+    against anyway).
+
+    `checkout` and `checkout_why` are injectable so the mismatch rule is testable without a git
+    fixture; production callers pass nothing and the real cwd is used.
+    """
+    if env is None:
+        env, _var = declared_repo()
+    env = (env or "").strip()
+    if checkout is None:
+        checkout, checkout_why = _checkout_repo()
+    if env:
+        if checkout:
+            if checkout.lower() != env.lower():
+                return (env, "env",
+                        "repo_mismatch(read=%s, checkout=%s) next=unset-OBJECTIVE_REPO-or-run-from-%s"
+                        % (env, checkout, env), "")
+            return env, "env", "", ""
+        # Nothing to compare against: say WHICH of the two causes, or a reader applies the wrong
+        # remedy for ever (the same two-causes rule `_checkout_repo` already follows).
+        return env, "env", "", "uncompared:%s" % (checkout_why or "underivable")
+    if checkout:
+        return checkout, "checkout", "", ""
+    return REPO_DEFAULT, "default", "", "uncompared:%s" % (checkout_why or "underivable")
+
+
+_env_repo = (os.environ.get("OBJECTIVE_REPO") or "").strip()
+# The MODULE-LEVEL default, unchanged for importers (`pr-doctor.py`, `pr-loop.py`, the test suite):
+# both shipped importers supply `OBJECTIVE_REPO` before they exec this file, and resolving a repo
+# here would put a `bash` subprocess on every import AND let a test's cwd silently choose its repo.
+# The CLI (`main()`) resolves properly -- see `resolve_repo()` -- because that is the path every
+# shell caller in the fleet takes.
+REPO, REPO_SRC = ((_env_repo, "env") if _env_repo else (REPO_DEFAULT, "default"))
+# Empty unless the CLI could not CHECK the repo it was told to read -- see `resolve_repo`.
+REPO_CHECK = ""
+
+# The two codes this file emits. `2` is the fleet's cannot-verify code, deliberately the same one
+# `check-deployed-drift.sh` (0 OK / 1 DRIFT / 2 UNKNOWN), `cycle-record.sh` (2 ABSENT/UNREADABLE) and
+# `pr-doctor.py` (2 REFUSING) use: a reader that has learned one of them has learned all three.
+EXIT_READABLE = 0
+EXIT_REFUSING = 2
+
+# ⛔ THE BLINDNESS TOKENS, IN ONE PLACE, BECAUSE THEY DECIDE THE EXIT CODE TOO (review round 1, P2).
+# `main()`'s cache guard and `_exit_for()` must agree on "the world could not be read", or a line can
+# print a failed read and exit 0. It happened: `build()`'s ladder puts `FIX-MAIN` ABOVE the
+# blind-queue arm, so a RED main beside an unreadable queue emitted `VERDICT=FIX-MAIN … 
+# queue=UNREADABLE` -- a readable word over an unread world. `_exit_for()` therefore refuses on any
+# of these tokens WHATEVER the verdict word says: the word cannot outrank the read.
+BLINDNESS_TOKENS = ("gh=UNREADABLE", "main=UNKNOWN@?", "queue=UNREADABLE", "error=",
+                    # ⛔ THE QUEUE'S OWN BLINDNESS WORD WAS MISSING FROM ITS OWN INVENTORY (review
+                    # round 2, reproduced). `_queue_read_is_blind` calls `BLIND` "this file's word
+                    # for 'the QUEUE read did not answer'" and `build()` emits
+                    # `queue_read=BLIND(4/4 unread …) -- the QUEUE counts are NOT a clearance`,
+                    # while `AT-TARGET` (the IDLE word) is derived from exactly those counts. So a
+                    # line that disowns its own numbers exited 0 and read as a clearance. Both
+                    # spellings: the `BLIND(` arm above and the `UNREADABLE(` arm
+                    # (`queue_read=UNREADABLE(waited=…)`, the spent-deadline path).
+                    # NOT `queue_read=REST(`: that arm is a DECIDED non-blind degradation (the
+                    # count is still usable and the line says so), so refusing on it would be the
+                    # over-block this list must not become.
+                    "queue_read=BLIND", "queue_read=UNREADABLE")
+
+
+# ⛔ `error=` IS MATCHED STRUCTURALLY, NOT AS A SUBSTRING (review round 2, reproduced). `build()`
+# interpolates THIRD-PARTY text into the line — check names (`failing_required=…`), a doctor's
+# `reason`, a PR title — so a CI job legitimately named `pytest (error=timeout)` made a fully
+# READABLE line refuse. That is fail-closed so it cannot ship a wrong answer, but a permanent
+# over-block on someone else's job name is its own defect. `error=` is only blindness where it is a
+# FIELD: at the start of the line or after whitespace.
+_ERROR_FIELD = re.compile(r"(?:^|\s)error=")
+
+
+def is_blind_line(line):
+    """True when an OBJECTIVE line says the world could not be read (see BLINDNESS_TOKENS)."""
+    line = line or ""
+    if any(tok in line for tok in BLINDNESS_TOKENS if tok != "error="):
+        return True
+    return bool(_ERROR_FIELD.search(line))
+
+
+def repo_seg():
+    """The repo segment: WHICH repo was read, WHERE that answer came from, and whether it was
+    CHECKED.
+
+    ⛔ `repo_src` IS THE POINT (#2710). `default` is the fallback that read tortoise's check-runs
+    for agent-infra's SHAs for hours: the value is still allowed, but it can no longer be SILENT --
+    every line says which repo it is about and which input chose it, on the same stdout line a
+    non-terminal reader parses. `repo_check` appears whenever the comparison could NOT be made —
+    a declared repo with no derivable checkout, **or** a fallback to `REPO_DEFAULT` that could not
+    be compared against anything (review round 2: this sentence stated a narrower rule than the
+    code and than this change's own test) — so an inert guard is visible instead of implied.
+    """
+    seg = "repo=%s repo_src=%s" % (REPO, REPO_SRC)
+    return seg + (" repo_check=%s" % REPO_CHECK if REPO_CHECK else "")
+
+
+# The verdicts that ARE an answer. An ALLOW-LIST on purpose: `_exit_for()` returns 0 only for a
+# word in here, so a verdict nobody has taught this file yet is a refusal rather than a pass.
+READABLE_VERDICTS = ("AT-TARGET", "ADVANCING", "REGRESSING", "FIX-MAIN")
+
+
+def verdict_of(line):
+    """The verdict word on an OBJECTIVE line, or "" when the line carries no recognisable token.
+
+    ⛔ IT READS THE LINE, NOT AN IN-PROCESS VARIABLE. `main()` has six exit paths (cached serve,
+    exception, build, the mismatch refusal) and the code must agree with the line a reader SEES --
+    deriving it from anything else is how two readers of one verdict start disagreeing.
+    """
+    m = re.search(r"\bVERDICT=([A-Za-z-]+)", line or "")
+    return m.group(1) if m else ""
+
+
+def _exit_for(line):
+    """EXIT_READABLE for a verdict this file knows to be readable, else EXIT_REFUSING.
+
+    ⛔ BLINDNESS OUTRANKS THE WORD. A verdict word is a statement about the queue; a blindness token
+    is a statement that the queue was not read, and no word may outrank it -- `FIX-MAIN` beside
+    `queue=UNREADABLE` is a readable claim about an unread world.
+    """
+    if is_blind_line(line):
+        return EXIT_REFUSING
+    return EXIT_READABLE if verdict_of(line) in READABLE_VERDICTS else EXIT_REFUSING
 STATE = os.path.expanduser("~/.pi/agent/state")
 CACHE = os.path.join(STATE, "objective.last")
 
@@ -149,6 +421,21 @@ def _required_from_env():
 
 
 REQUIRED = _required_from_env()
+# ⛔ THE REPO THE BUNDLED SET WAS READ FROM (review round 2, P1 — reproduced, and it nearly broke the
+# primary box). `REQUIRED_DEFAULT` is tortoise's branch-protection contexts, read and verified there.
+# The foreign-rubric guard below may NOT be expressed as "no required name appears on the surface",
+# because that is transport-dependent and, on tortoise itself, FALSE: measured on main `ef02b7acd`, the
+# REST surface publishes the five reusable-workflow gates as `main-health / docs`, … and GraphQL's
+# `statusCheckRollup.contexts` returned a SEVEN-name list containing none of them. A presence test
+# would therefore have answered UNKNOWN for ever on the one repo the rubric describes — converting a
+# silent false pass into a loud permanent refusal with no shipped remedy. The guard is about WHICH
+# REPO, so it asks that question directly instead of inferring it from a name list.
+REQUIRED_REPO = "daniel-ospina/tortoise"
+# ⛔ READ AT IMPORT, WITH `REQUIRED` (review round 2). The guard asks "was this set SUPPLIED?", and
+# reading that answer at CALL time while `REQUIRED` was bound at IMPORT time made the two disagree: a
+# caller (or a test) that exports `OBJECTIVE_REQUIRED` after import gets `from_env=True` beside the
+# still-bundled `REQUIRED`. One binding, one answer.
+REQUIRED_SUPPLIED = bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip())
 
 GREEN = {"success", "neutral", "skipped"}
 NON_RED = {"cancelled", "stale"}          # not green, but not evidence of failure
@@ -490,6 +777,30 @@ def main_sha():
     return None
 
 
+def _req_leaves(names):
+    """`names` plus the reusable-workflow LEAF of each (`main-health / docs` -> `docs`).
+
+    ⛔ REQUIREMENT NAMES DO NOT EQUAL CHECK-RUN NAMES (review round 2, P1 — measured). Branch
+    protection names a required CONTEXT (`docs`); when that context is produced by a reusable
+    workflow, the check-run GitHub publishes is `<caller> / <job>` (`main-health / docs`). A bare
+    `c in red` therefore could not see a RED required gate at all — measured on tortoise main
+    `ef02b7acd`: the surface carries `main-health / docs`, `main-health / legal-e2e`,
+    `main-health / license-surface`, `main-health / pricing-artifact`, `main-health / test-isolation`,
+    and the required contexts are the leaves. So `main=GREEN` has been able to sit over a red
+    required gate: a false PASS of exactly the class #2710 exists to remove, pre-existing this
+    change and fixed by the same helper. Matching only ADDS names (exact match is included), so it
+    cannot turn a RED into a GREEN.
+    """
+    out = set()
+    for n in names or ():
+        n = (n or "").strip()
+        if not n:
+            continue
+        out.add(n)
+        out.add(n.rsplit(" / ", 1)[-1].strip())
+    return out
+
+
 def main_health(sha):
     """(state, failing_required) judged by polarity on the newest attempt per group."""
     global GH_BLOCKED
@@ -511,10 +822,30 @@ def main_health(sha):
         _note_gh_failure(GH_LAST_ERROR, "main", transport=None)
         return "UNKNOWN", []
     red, flight = rollup_checks(cr)
-    req_red = [c for c in REQUIRED if c in red]
+    # ⛔ AND A FOREIGN RUBRIC IS NOT A GREEN MAIN (review round 2, P1 — reproduced, and it is the
+    # WORST shape this issue names: a false PASS). `REQUIRED` is TORTOISE's set by default, and #2710
+    # made `REPO` follow the checkout/`OR` — so on any OTHER repo those gates are not the ones being
+    # run: `req_red` is empty, nothing is in flight, and the answer was GREEN. Measured on this
+    # worktree with the bundled set and three ALL-RED checks: `main_health() -> ('GREEN', [])`. The
+    # repo half of the seam landed in round 1; this is the half that says "I cannot judge this repo
+    # with another repo's gates". CANNOT-VERIFY IS NEVER A PASS, so the answer is UNKNOWN (which
+    # `_exit_for()` also refuses on).
+    #
+    # ⛔ IT IS ASKED OF THE REPO, NOT OF THE NAME LIST (see `REQUIRED_REPO`): a presence test is
+    # transport-dependent and answers UNKNOWN on tortoise itself.
+    #
+    # ⚠️ A SUPPLIED SET IS NOT RE-CHECKED THIS WAY, deliberately, and the residual is named: a
+    # supplied set whose names have gone stale (a renamed job) still answers GREEN, because "absent
+    # from this surface" cannot distinguish a stale declaration from a transport that renders names
+    # differently — measured above: GraphQL returned 7 names, REST returned 22, same sha. Refusing on
+    # absence would be a permanent over-block on a correct configuration; a stale supplied set is a
+    # seam to repair, tracked on #2518 with the rest of the rubric seam.
+    if not REQUIRED_SUPPLIED and (REPO or "").lower() != REQUIRED_REPO.lower():
+        return "UNKNOWN", []
+    req_red = [c for c in REQUIRED if _req_leaves([c]) & _req_leaves(red)]
     if req_red:
         return "RED", req_red
-    if any(c in flight for c in REQUIRED):
+    if any(_req_leaves([c]) & _req_leaves(flight) for c in REQUIRED):
         return "FLIGHT", []
     return "GREEN", []
 
@@ -2953,6 +3284,14 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
         # A DRY RUN IS NOT A PASS: it stamps no fleet-visible verdict (pr-doctor skips the write),
         # and if an older one ever carries the flag it must never read as production.
         return "PR-DOCTOR(last run): DRY RUN (not a pass)"
+    # ⛔ "NO CAPACITY" IS NEITHER `ok` NOR `RED` (#2291). The dispatcher exits 6 when the box's own
+    # spawn gate refused every order: nothing was consumed, and (for a load refusal) it clears by
+    # itself. Before this, the beat printed `PR-DOCTOR(last run): RED rc=6` -- the same token a broken
+    # dispatcher produces -- so the operator's next move (wait vs repair) had to be guessed from prose
+    # that the beat then truncates at 110 chars. The verdict FIELD wins over the code when present
+    # (an older record has none), and the code is the fallback so a 6 can never read as ok.
+    verdict = str(d.get("verdict") or "")
+    waiting = (rc == 6) or (verdict == "NO-CAPACITY")
     # ⛔ A VERDICT THAT STOPPED BEING WRITTEN IS *UNREPORTED*, NOT `ok` (2026-10-18, review).
     # The failure this whole segment exists to expose is "a dead dispatcher reads healthy"; an
     # unbounded age reproduces it one level up -- kill the launchd job, or touch
@@ -2961,6 +3300,9 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
     if age > 2400:
         return "PR-DOCTOR(last run): UNREPORTED (verdict is STALE, %dm old: %s)" % (
             age // 60, reason)
+    if waiting:
+        return "PR-DOCTOR(last run): WAITING (no capacity) rc=%d %dm ago — %s" % (
+            rc, age // 60, reason)
     return "PR-DOCTOR(last run): %s rc=%d %dm ago — %s" % (
         "RED" if rc else "ok", rc, age // 60, reason)
 
@@ -3215,7 +3557,7 @@ def build(prev=None):
         # steady or shrinking. (Named ADVANCING since 2026-09-29; the word is kept for
         # interface stability.)
         verdict = "ADVANCING"
-    return f"OBJECTIVE VERDICT={verdict} " + " ".join(parts)
+    return f"OBJECTIVE VERDICT={verdict} " + " ".join(parts) + " " + repo_seg()
 
 
 # ⛔ A VERDICT MAY NOT BE SERVED STALER THAN THIS (measured 2026-10-06, #4844).
@@ -3579,6 +3921,22 @@ def main():
     if "--json" in args:
         max_age = 0
 
+    # ⛔ WHICH REPO THIS READ IS ABOUT IS DECIDED BEFORE ANYTHING IS READ (#2710). The order and the
+    # three sources are documented once, above `REPO_DEFAULT`; this is the only place the CLI binds
+    # them. A MISMATCH REFUSES BEFORE THE FIRST `gh` CALL: reading the wrong repo and then reporting
+    # the 422s was the measured cost (every PR `unreadable`, hours of it), and a named refusal costs
+    # one line instead.
+    global REPO, REPO_SRC, REPO_CHECK
+    _slug, _src, _mismatch, REPO_CHECK = resolve_repo()
+    REPO, REPO_SRC = _slug, _src
+    if _mismatch:
+        # ⛔ THE REFUSAL LINE CARRIES THE SAME SEGMENT AS EVERY OTHER (#2710 review round 1): the one
+        # line that reports a failed read is exactly where "which repo was this about" matters most,
+        # and a reader keyed on `repo=` must not get nothing from it.
+        line = "OBJECTIVE VERDICT=UNKNOWN error=%s %s" % (_mismatch, repo_seg())
+        print(line)
+        return EXIT_REFUSING
+
     # self-cache: the heartbeat calls this every tick; recompute at most once per window
     _serve_max = min(max_age, VERDICT_SERVE_MAX_S) if max_age else 0
     try:
@@ -3608,14 +3966,16 @@ def main():
                     _serve = False          # cannot PROVE liveness → do not serve
                 if _serve:
                     print(_cached)
-                    return
+                    return _exit_for(_cached)
     except Exception:
         pass
 
     try:
         line = build(_previous_sample())
     except Exception as e:                      # never break the heartbeat
-        line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]}"
+        # ⛔ AND THIS LINE NAMES THE REPO TOO. It is the line a failed read produces, so it is the
+        # one place a reader cannot otherwise tell a tortoise read from an agent-infra one.
+        line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]} {repo_seg()}"
     # `RES:` GOES ON ITS OWN LINE -- and NOT because the objective line is too long for the cut
     # (#1872 review round 18: that sentence was false the moment the cut reached 900, and MEASURED
     # an objective line is ~300 chars; the sibling comment in `cadence-nudge.sh` says the same).
@@ -3641,14 +4001,13 @@ def main():
     # The retry in _gh_retry absorbs the blip at source; this stops a surviving one from being
     # frozen. Both are the same rule this file's header already states in another form: an
     # empty read and an absent thing must never share a word -- and must never share a cache.
-    blind = ("gh=UNREADABLE" in line or "main=UNKNOWN@?" in line or "error=" in line
-             # ⛔ AND AN UNREAD QUEUE IS A FAILED READ EVEN WHEN NO SURFACE CLAIMED BLINDNESS
-             # (#2138 r5, A/P2). A payload the primary could not use AND no second source is a
-             # non-transport failure -- correctly not a claim (`transport=False`: GitHub answered,
-             # we mangled it) -- but the line then says `queue=UNREADABLE` with no `gh=` token, so
-             # this guard matched nothing and FROZE the blind line for the whole serve window. The
-             # guard keys on the FACT (the queue could not be read), not on which token said so.
-             or "queue=UNREADABLE" in line)
+    # ⛔ AND AN UNREAD QUEUE IS A FAILED READ EVEN WHEN NO SURFACE CLAIMED BLINDNESS (#2138 r5,
+    # A/P2). A payload the primary could not use AND no second source is a non-transport failure --
+    # correctly not a claim (`transport=False`: GitHub answered, we mangled it) -- but the line then
+    # says `queue=UNREADABLE` with no `gh=` token, so the guard would match nothing and FREEZE the
+    # blind line for the whole serve window. The guard keys on the FACT (the queue could not be
+    # read), not on which token said so -- hence ONE predicate, shared with `_exit_for()`.
+    blind = is_blind_line(line)
     try:
         if not blind:
             os.makedirs(STATE, exist_ok=True)
@@ -3658,7 +4017,13 @@ def main():
     except Exception:
         pass
     print(line)
+    # ⛔ THE EXIT CODE IS THE SECOND MACHINE SURFACE, AND IT MUST AGREE WITH THE LINE (#2710).
+    # Before this, every path exited 0 -- a wrong/unreadable world (`VERDICT=UNKNOWN`) was
+    # indistinguishable, to any launcher keying on the code, from `AT-TARGET`. POLARITY, not
+    # vocabulary: only a verdict this file KNOWS to be readable exits 0; anything else -- including
+    # one it has never seen -- is a refusal. A missing check is not a green check.
+    return _exit_for(line)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

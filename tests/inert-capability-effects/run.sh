@@ -363,13 +363,17 @@ REAP_LOG="$WORK/reap.log"
 # ⛔ THE SCRIPT PATH IS LITERAL (#709's script-content gate): a reaper invoked through a variable
 # path is a script the guard cannot statically read, and it fails closed — correctly, since an
 # unreadable script could discard any checkout.
-# ⛔ `REAP_WT_MIN_AGE_MINUTES=0` IS LOAD-BEARING AND WAS MISSING (#2708, measured 2026-10-28). Rule 7
-# — "nothing younger than REAP_WT_MIN_AGE_MINUTES (45) is removable", added by #2756 — reads the
-# WORKTREE's ctime, and both fixture trees are created seconds before the pass. So both were
-# `preserve reason=too-young`, the "twin is removed" arm was red on main, and the suite that exists to
-# prove this gate DISCRIMINATES could not discriminate at all: it had been left behind by a change to
-# the capability it grades. The floor is exactly the kind of default a fixture must pin, like the age
-# floors it already pinned two lines up.
+# ⛔ REAP_WT_MIN_AGE_MINUTES=0 IS PART OF THE FIXTURE, NOT A CONVENIENCE (#2721, found while
+# landing #2708). These trees are created SECONDS before the pass, so under rule 7 — the 45-minute
+# hard floor, applied ON TOP of the two age knobs above — the REMOVABLE ones are `too-young` and
+# nothing is deleted (the live holder's own row is `live-cwd`, which is exactly why the preserve arm
+# passed while the removal arms failed). Measured on a clean box:
+# `reasons=too-young:2,main-checkout:1,live-cwd:1` and both §3 removal arms red — i.e. this section could never PASS anywhere, so the live-cwd gate it exists to
+# pin had no working test at all while the suite reported covering it. The floor is not what §3 is
+# about (it is pinned by `scripts/pi-reap-worktrees.test.sh` G6e and G6f, `:974-1000` — G6f drives
+# it through `--apply` and asserts the footer's `MIN_AGE_MINUTES=45`; there is no arm labelled `R7`,
+# which is a dangling reference in that file's own `:1173` comment); the same override, with the same
+# rationale, is what that suite uses in its own A7 fixture.
 ( cd "$ROOT" && REAP_WT_STATE_DIR="$WORK/reap-state" REAP_WT_AGED_DAYS=0 \
     REAP_WT_MERGED_AGE_DAYS=0 REAP_WT_MIN_AGE_MINUTES=0 \
     PS_BIN=/bin/ps LSOF_BIN="$STUB_LSOF" GH_BIN="$STUB/gh" \

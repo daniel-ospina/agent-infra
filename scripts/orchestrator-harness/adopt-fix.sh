@@ -40,12 +40,21 @@ rc=$?
 # operator to wait for a remedy that cannot arrive.
 if [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "71" ]; then
+  # ⛔ THE CAPABILITY REFUSAL (#2935) IS THE ONE THIS SCRIPT COULD NOT NAME AT ALL (review of #2991,
+  # P1): `fix-one.sh` propagates the gate's own code, so 71 reached the manual operator's log as NO
+  # LINE — a run that did nothing, silently. Waiting does not clear it, so it must not be folded into
+  # the load arm above.
+  echo "[adopt-fix $PR] fixer NOT started (CAPABILITY gate) — this box could not complete one model call and RETURN (#2935); see the [capability-gate] REFUSED line in $O/logs/fix-$PR.log for which reading refused. Waiting will not clear it: repair the box (installed pi/extension set, provider credential) or dispatch the PR elsewhere." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "72" ]; then
   # A worktree that exists but is the wrong repo (or a branch the target repo does not have) is
   # refused by fix-one.sh with 72. Name it in the log the manual operator reads (#1720/#2694).
   echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the worktree/branch is not $OR; nothing pushed, no attempt consumed. See $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "77" ]; then
-  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
+  # ⛔ CODE 77 IS TWO CONDITIONS (review round 1, P2): below the floor, and above it without the
+  # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
+  # operator a full filesystem was the cause when it was not.
+  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — either the filesystem is below DISK_MIN_FREE_MB, or it has no headroom for one lane's dependency tree (DISK-NOHEADROOM). The '[disk-gate] REFUSED' line in the spawn log names which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
 # ⛔ AND THE CI-QUEUE GATE IS THE THIRD REFUSAL, NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6
 # review, P2). `fix-one.sh` exits 0 here ON PURPOSE — a deferral is not an error the controller should
 # retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` returned

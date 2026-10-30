@@ -1072,6 +1072,57 @@ case "$PROV_OUT" in
   *"self-refresh STALE"*) ok "status flags a verdict older than two of the LOOP's cycles (CYC default 240)" ;;
   *) bad "status did not flag a 1000s-old self-refresh verdict: $PROV_OUT" ;;
 esac
+# (e3b) THE RESTART DECISION IS READABLE FROM `status` (agent-infra#2641). `restart-pending` used to be
+# a word with no transition, and on a cell it was PERMANENT (the running identity was unreadable there),
+# so `status` printed `harness: …[current]` and `self-refresh: restart-pending` about the same box for
+# ever. The per-cycle record now carries the pending REASON and a request; `status` must print it,
+# because an operator acts from this verb and a recorded decision nobody can read is not a decision.
+printf 'restart request=pending requested_at=%s waited=12s requested_by=harness-refresh.sh@abc running=abc123 pin=def456 pending=deferred actuation=blocked blocked=lanes lanes=2 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 12 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"request=pending"*"pending=deferred"*) ok "status prints the restart REQUEST (the state, not just the word)" ;;
+  *) bad "status does not surface the restart request: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"actuation=blocked"*"blocked=lanes"*) ok "…including what would be interrupted (blocked=lanes)" ;;
+  *) bad "status hides what blocks the restart: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
+  *) bad "status prints the record but not what it means: $PROV_OUT" ;;
+esac
+# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". On that path
+# `harness-refresh.sh` returns from `set_pending` BEFORE `inflight_gate` is consulted, so no population is
+# ever evaluated as the BLOCKER. The record's `lanes=` is still written — it is measured separately, before
+# `set_pending`, and may legitimately be a NON-ZERO number (measured: a live `$O/lane.sh` gives
+# `blocked=identity lanes=1`) — but it is not why the restart is blocked. The identity is. So the generic
+# blocked sentence named a cause that does not exist and told the operator to wait for a population that
+# may never be the thing holding the restart back. The identity cause needs its own arm, and it comes first.
+# ⛔ AND THE SPECIMEN CARRIES A NON-ZERO lanes= ON PURPOSE: it is the HARDEST case for this arm. A record
+# with `blocked=identity lanes=1` has a lane population the operator can SEE, so the generic "wait for that
+# population to go idle" advice looks plausible — yet `inflight_gate` was never consulted on this path, so
+# lanes= is not the blocker and waiting would never clear it. If the arm ever regresses to the generic one,
+# this specimen is what catches it.
+printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 9 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"cannot be PROVEN"*) ok "…an unprovable IDENTITY is explained as such, on its own arm" ;;
+  *) bad "status does not explain an unprovable identity: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — on this path inflight_gate is never consulted, so no population is the blocker and the message names a cause that does not exist: $PROV_OUT" ;;
+  *) ok "…and does NOT claim an interruption that was never established" ;;
+esac
+# An ABSENT record is not "nothing pending": no cycle has ever recorded one.
+rm -f "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"NO REQUEST RECORD"*) ok "…and an absent record is reported as absent, not as 'nothing pending'" ;;
+  *) bad "an absent request record was silent: $PROV_OUT" ;;
+esac
+
 prov apply >/dev/null 2>&1   # leave the record and the seed consistent for the cases below
 
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.

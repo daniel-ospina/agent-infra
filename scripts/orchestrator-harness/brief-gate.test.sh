@@ -23,6 +23,17 @@
 # Run: bash scripts/orchestrator-harness/brief-gate.test.sh
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ⛔ THE CAPABILITY GATE IS DISABLED FOR THE ARMS IN THIS FILE, BY NAME AND ON PURPOSE (agent-infra#2935).
+# `run_agent` measures the box — one bounded `pi` call — immediately before every launch, and these
+# arms drive `run_agent` with a STUB `pi` that never emits the probe's answer token. With the gate live
+# here, each arm would spend up to 2 x LANE_PREFLIGHT_BOUND on a stub and then be REFUSED by a gate
+# this file is not testing, so an arm about the LOAD or DISK gate would report a capability refusal.
+# The capability gate has its own arms (`cell-lane-preflight.test.sh`, and the capability block in
+# `spawn-gate.test.sh`, which re-enables it with LANE_PREFLIGHT=1). This is the documented operator
+# escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
+# these arms go red, which is the assertion that the line is load-bearing rather than decorative.
+export LANE_PREFLIGHT=0
 ROOT="$(cd "$HERE/../.." && pwd)"
 GATE="$HERE/brief-gate.sh"
 PASS=0; FAIL=0
@@ -173,10 +184,18 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…the stub pi really ran (the refusal above 
 # an isolated HOME, so the search cannot reach a real installed copy. 78 = cannot verify, and the log
 # must say so — a gate that silently passes when it cannot find its rules is the failure mode this
 # whole layer exists to prevent.
+# ⛔ AND AN ISOLATED `$HOME` IS NOT ENOUGH — `$AGENT_INFRA_PATH` IS A FIFTH SEARCH ROOT (#1881 LANE,
+# measured on a cell). `spawn-gate.sh`/`lane.sh` also resolve the validator under
+# `\$AGENT_INFRA_PATH/scripts/orchestrator-harness`, and `AGENTS.md` makes exporting that variable a
+# PREREQUISITE of this repo — so on every dev box and every cell these arms found the REAL checkout's
+# validator, ran it, and reported `rc=0 started=1`, i.e. they reddened exactly where the variable is
+# set and passed on a clean runner. Same class as the suite-side defect this lane fixed in
+# `scripts/test_cmux_payload.py`: a fixture that inherits ambient env cannot make a claim about
+# isolation. `env -u` is the isolation the arm already claimed.
 mkdir -p "$TMP/nolib"
 cp "$HERE/spawn-gate.sh" "$TMP/nolib/"
 : > "$PI_LOG"
-res="$( cd "$FIXREPO" && PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+res="$( cd "$FIXREPO" && env -u AGENT_INFRA_PATH PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
   bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "no validator" >/dev/null 2>&1
            printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$TMP/nolib/spawn-gate.sh" "$TMP/nolib.log" "$CANON" )"
 [ "$res" = "rc=78 started=0" ]; ck $? "a MISSING validator is 78/cannot-verify, not a pass ($res)"
@@ -228,13 +247,107 @@ grep -q 'RESEARCH FIRST' <<<"$out"; ck $? "…and the teaching message reached t
 [ ! -f "$TMP/bg-o/bg/bgtest.pid" ]; ck $? "…and NO worker was started (no pid file, so no launch to report)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and no agent ran"
+# ⛔ ITS OWN COPY OF THE FIXTURE, not `$CANON`. The dispatch below APPENDS the COMMIT-AS-YOU-GO
+# section (#2981) to whatever brief it is handed — so handing it the shared `$CANON` mutated the
+# suite's own canonical fixture mid-run, which is the kind of hidden coupling that makes a later
+# arm's precondition true for a reason nobody chose. One brief, one test.
+OKNB="$TMP/nonblocking-ok.txt"; cp "$CANON" "$OKNB"
 out="$( cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
-       bash "$NB" bgok "$TMP/wt" "$CANON" 20 2>&1 )"; rc=$?
+       bash "$NB" bgok "$TMP/wt" "$OKNB" 20 2>&1 )"; rc=$?
 [ "$rc" -eq 0 ]; ck $? "POSITIVE CONTROL: nonblocking-dispatch.sh LAUNCHES for a valid brief ($(printf '%s' "$out" | tail -1))"
 # The worker is backgrounded; wait for its durable verdict rather than sleeping a guess.
 for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgok.rc" ] && break; sleep 0.1; done
 [ "$(cat "$TMP/bg-o/bg/bgok.rc" 2>/dev/null)" = "0" ]; ck $? "…and the worker reached a SUCCESSFUL durable exit status (a 74 refusal also produces a file, so existence alone proves nothing)"
 grep -q 'PI_RAN' "$PI_LOG"; ck $? "…with the stub pi actually invoked"
+
+# ── §D.2 #2981 — the AUTHORED brief gets COMMIT AS YOU GO APPENDED, idempotently.
+# The measured batch behind #2981 was five `prfix` workers dispatched through THIS path, and every one
+# held its single commit for the end and was killed at its cap with 0 commits. The research contract
+# above is REFUSED when absent (80) because a worker that never looked first is that gate's defect;
+# this one is APPENDED, because an otherwise complete authored brief must not become a dead dispatch
+# over one missing sentence — so the assertion is on the FILE the worker receives, not the source.
+DELIVERY_HEAD="$(bash "$HERE/reviewer-preflight.sh" --delivery-brief bg | head -1)"
+[ -n "$DELIVERY_HEAD" ]; ck $? "the delivery section renders a heading ($(printf '%.40s' "$DELIVERY_HEAD"))"
+AUTH="$TMP/authored.txt"; cp "$CANON" "$AUTH"
+grep -qF -- "$DELIVERY_HEAD" "$AUTH"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "fixture: the authored brief does NOT already carry the section (so the append is what puts it there)"
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery "$TMP/wt" "$AUTH" 20 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a dispatch through nonblocking-dispatch.sh still LAUNCHES (rc=$rc)"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery.rc" ] && break; sleep 0.1; done
+grep -qF -- "$DELIVERY_HEAD" "$AUTH"; ck $? "…and the brief the worker received CARRIES it (appended, never refused)"
+[ "$(grep -cF -- "$DELIVERY_HEAD" "$AUTH")" -eq 1 ]; ck $? "…exactly once"
+# ⛔ IDEMPOTENCE IS THE POINT: a re-dispatch on the same brief file must not grow it. Without this arm
+# an append that concatenated the section on every attempt would pass every assertion above.
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery2 "$TMP/wt" "$AUTH" 20 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && [ "$(grep -cF -- "$DELIVERY_HEAD" "$AUTH")" -eq 1 ]; ck $? "…and a SECOND dispatch does NOT append a second copy (idempotent, rc=$rc)"
+# ⛔ THE ROLE IS THE KIND'S, NOT A HARDCODED ONE (this PR's review, cycle 1 — P2). This dispatch passes
+# FOUR arguments, so `$WK` is the documented `bg` default and the role must be `bg`. It used to render
+# `prfix` unconditionally, which told an `ai-drainer.sh` hygiene lane "Your PR is ALREADY OPEN" — a
+# false statement about a worker that owns no PR. Asserted BOTH ways so neither sentence can be
+# silently swapped back: the `bg` claim is absent, and the conditional one is present.
+case "$(cat "$AUTH")" in *"Your PR is ALREADY OPEN"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…and a 4-arg (bg) dispatch does NOT get the prfix claim 'Your PR is ALREADY OPEN'"
+grep -qF 'already has an open PR, commit and push onto it' "$AUTH"; ck $? "…it gets the bg role's CONDITIONAL PR sentence instead"
+# …and the other side of the same arm: a declared `prfix` dispatch DOES get the prfix sentence. Without
+# this, a regression that rendered `bg` for everything would pass every assertion above.
+AUTH_PRFIX="$TMP/authored-prfix.txt"; cp "$CANON" "$AUTH_PRFIX"
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery3 "$TMP/wt" "$AUTH_PRFIX" 20 prfix >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a DECLARED prfix dispatch still LAUNCHES (rc=$rc)"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery3.rc" ] && break; sleep 0.1; done
+grep -qF 'Your PR is ALREADY OPEN' "$AUTH_PRFIX"; ck $? "…and IT gets the prfix role (the role follows \$WK, both directions)"
+case "$(cat "$AUTH_PRFIX")" in *"already has an open PR, commit and push onto it"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…never the bg sentence (so the two arms cannot both pass on one hardcoded role)"
+# ⛔ THE COLLISION THE ROLE-INVARIANT HEADING COULD NOT SEE (this PR's review, cycle 2 — P2). The
+# heading is IDENTICAL in all three roles, so a heading-only idempotency test declares a brief complete
+# when it carries ANOTHER role's copy. This is the reachable instance, not a hypothetical: the controller
+# template is pinned to the `lane` render, a controller authors its brief by copying it, and
+# `pr-doctor.py` dispatches that same file as `prfix` — so before the fix the heading matched, nothing
+# was appended, and the worker was ordered to open a PR it ALREADY HAS (#2148/#2325's exact class).
+# Build the fixture FROM the real template so the arm cannot drift away from the artifact it describes.
+AUTH_TMPL="$TMP/authored-from-template.txt"; cp "$ROOT/templates/LANE-BRIEF.md" "$AUTH_TMPL"
+grep -qF 'Open the PR as soon as the first commit is pushed' "$AUTH_TMPL"; ck $? "template fixture: the controller template carries the LANE PR sentence (that is what makes the collision reachable)"
+case "$(cat "$AUTH_TMPL")" in *"Your PR is ALREADY OPEN"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "template fixture: …and NOT the prfix one"
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery4 "$TMP/wt" "$AUTH_TMPL" 20 prfix >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a prfix dispatch over a template-derived (lane) brief still LAUNCHES (rc=$rc)"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery4.rc" ] && break; sleep 0.1; done
+grep -qF 'Your PR is ALREADY OPEN' "$AUTH_TMPL"; ck $? "⛔ …and the brief the worker received NOW carries the prfix sentence (a role-invariant heading would have skipped the append)"
+# ⛔ AND THE STALE ORDER IS MARKED SUPERSEDED, IN THAT ORDER (this PR's review, cycle 3 — P2). The arm
+# above proves the CORRECT sentence ARRIVED; it cannot see the FALSE one still sitting above it
+# ("Open the PR as soon as the first commit is pushed"). Asserting only arrival is half an assertion:
+# append-only left the worker holding both, relying on a reading-order assumption nothing enforced.
+# The append policy is NOT reversed — the author's bullet stays where its author put it — so what must
+# now be true is that the worker meets the notice and THEN the true order, last.
+grep -qF 'SUPERSEDES ANY COPY ABOVE THIS LINE' "$AUTH_TMPL"; ck $? "⛔ …and the stale lane order is MARKED SUPERSEDED (arrival alone cannot see the false order still above it)"
+awk '/SUPERSEDES ANY COPY ABOVE THIS LINE/{m=NR} /Your PR is ALREADY OPEN/{if(!p)p=NR} END{exit !(m && p && p>m)}' "$AUTH_TMPL"
+ck $? "…and the notice lands BEFORE the true sentence, so the last word the worker reads is the true one"
+# The already-correct case must NOT gain a notice — its brief has no stale copy, so a notice there
+# would be a false claim of its own (and it would break the byte-for-byte promise above).
+case "$(cat "$AUTH_PRFIX")" in *"SUPERSEDES ANY COPY ABOVE THIS LINE"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "…and a brief that was ALREADY role-correct gets NO supersession notice (idempotent, no false claim)"
+# ── §D.3 #2981 — THE HELPER IS RESOLVED LIKE EVERYTHING ELSE IN THIS FILE, NOT FROM `$SELF` ALONE.
+# ⛔ THIS IS THE BOX-WIDE-STANDSTILL CLASS THE DISPATCHER ITSELF DOCUMENTS, ONE SCREEN ABOVE THE CODE
+# UNDER TEST: "`$O` is seeded file by file, so a NEW dispatcher can run against an OLD
+# `$O/spawn-gate.sh`" — and its brief-gate resolver searches FOUR homes for exactly that reason. A
+# `$SELF`-only pin on `reviewer-preflight.sh` turns a half-seeded `$O` into "every dispatch on this
+# box exits 78": the fleet stops dispatching, which is the outcome #2981 exists to prevent, caused by
+# the rule that prevents it (`install.sh` names the same failure for `brief-gate.sh`). The fixture is
+# the skew faithfully — every harness script seeded into one directory EXCEPT the helper, which is
+# reachable only through `$AGENT_INFRA_PATH` — so a pin that only looks beside itself goes red here.
+SKEW="$TMP/skew"; mkdir -p "$SKEW"
+cp "$HERE"/*.sh "$SKEW"/ 2>/dev/null; cp "$HERE"/*.py "$SKEW"/ 2>/dev/null
+rm -f "$SKEW/reviewer-preflight.sh"
+[ -f "$SKEW/nonblocking-dispatch.sh" ] && [ ! -f "$SKEW/reviewer-preflight.sh" ]; ck $? "fixture: a seeded harness dir WITHOUT reviewer-preflight.sh (the half-synced \$O shape)"
+SKEWBRIEF="$TMP/skew-brief.txt"; cp "$CANON" "$SKEWBRIEF"
+out="$( cd "$FIXREPO" && O="$TMP/bg-o" AGENT_INFRA_PATH="$ROOT" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+       bash "$SKEW/nonblocking-dispatch.sh" bgskew "$TMP/wt" "$SKEWBRIEF" 20 prfix 2>&1 )"; rc=$?
+[ "$rc" -eq 0 ]; ck $? "⛔ …and the skew copy still LAUNCHES: the helper is found through the fallback homes, not \$SELF alone (rc=$rc: $(printf '%s' "$out" | tail -1))"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgskew.rc" ] && break; sleep 0.1; done
+grep -qF -- "$DELIVERY_HEAD" "$SKEWBRIEF"; ck $? "…and the worker's brief CARRIES the section, rendered by the helper it resolved (the fallback is not an empty pass)"
 
 # ── orch-send.sh + safe-send.sh: the pane-order paths. Stub `cmux` records every call, so "refused"
 # is again proven by absence.
@@ -248,7 +361,12 @@ PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
 [ -s "$CMUX_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and cmux was never called (the refusal precedes target resolution — the defect is the brief, not the pane)"
 : > "$CMUX_LOG"
-PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
+# ⛔ THE STUB NEVER SUBMITS, SO WITHOUT A WINDOW THIS ARM WAITS ONE OUT (#1881 review P2). The stub
+# `cmux` records calls and never names a session, so nothing can ever verify: `orch-send.sh` polls
+# `read-screen` to its deadline (90 s default + the helper's two 2 s sleeps ≈ 95 s of a CI shard) and
+# the assertion below — satisfied by the footer probe — uses none of it. `ORCH_SEND_VERIFY_TIMEOUT=0`
+# is what the Python suite sets for the same reason: it changes WHAT the arm costs, not what it proves.
+PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" ORCH_SEND_VERIFY_TIMEOUT=0 \
   bash "$ROOT/scripts/orch-send.sh" 00000000-0000-0000-0000-000000000000 test "@$CANON" >/dev/null 2>&1
 [ -s "$CMUX_LOG" ]; ck $? "POSITIVE CONTROL: a compliant @file order passes the gate and reaches cmux"
 : > "$CMUX_LOG"
@@ -333,7 +451,10 @@ bash "$GATE" --check "$TMP/lane-o/logs/prompt-2258.txt" lane >/dev/null 2>&1; rc
 grep -q '## RESEARCH FIRST' "$TMP/lane-o/logs/prompt-2258.txt"; ck $? "…and carries the section, not just the pre-flight line"
 grep -q '#2258 research-first' "$TMP/lane-o/logs/lane-2258.log"; ck $? "…and the one-line pre-flight is in the lane LOG (what an operator greps)"
 mv "$GATE" "$GATE.moved"
-( cd "$TMP" && O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+# ⛔ `env -u AGENT_INFRA_PATH`: see the note at the §"MISSING validator" arm — the variable is a
+# documented fifth search root and is exported on every cell, so without this the "missing validator"
+# fixture finds the REAL one and the arm refuses 72 (the worktree precondition) instead of 78.
+( cd "$TMP" && env -u AGENT_INFRA_PATH O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/x daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
 mv "$GATE.moved" "$GATE"
 [ "$rc" -eq 78 ]; ck $? "a MISSING validator refuses the LANE with 78 (fail-closed: never a lane nobody asked to look first) (rc=$rc)"
@@ -370,7 +491,24 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
 # at all). Declared here so the reference is accounted for; the broader class is named in the STATED
 # LIMIT below rather than silently believed to be covered.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# the at all). Declared here so the reference is accounted for; the broader class is named in the STATED
+# LIMIT below rather than silently believed to be covered.
+#
+# ⛔ AND A SUITE THAT BUILDS ITS OWN FIXTURES FROM THIS VALIDATOR IS A MEMBER TOO (#1881 review P2).
+# `scripts/test_cmux_payload.py` asks `brief-gate.sh --section lane` for the RESEARCH contract its
+# dispatch fixtures must carry (the same construction `capacity-transfer.test.sh` uses, and for the
+# same reason: a hard-coded block would drift from the gate and the suite would pin a brief no
+# dispatcher accepts). It reaches the gate through `orch-send.sh`, which this census already counts,
+# so it is a deliberate NAMER of the gate rather than a new dispatch path — but it is a REFERENCER,
+# and an undeclared one reddens this equality. Measured: unregistered, this arm fails with
+# `ADDED: scripts/test_cmux_payload.py`, which is exactly the attributable red the census exists for.
+# ⛔ AND THE LIST IS AN EQUALITY, SO IT MUST BE KEPT CURRENT BY WHOEVER MOVES THE SCAN (#1881 LANE,
+# measured). The five `orchestrator-harness` entries without a comment above arrived on `main` after
+# the last time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the
+# four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
+# superset), independently of any branch. Declared here because an equality that is red on its own
+# base stops being a signal: every PR inherits the same red and nobody can attribute it.
+EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

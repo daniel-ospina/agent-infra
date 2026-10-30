@@ -69,7 +69,15 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # UNION of both sides of this merge — neither list is a superset. This branch adds lane-merge.sh and
 # merge-rate.sh (#2029); origin/main adds brief-gate.sh (#2258) and repo-target.sh (#2724/#2694). A file
 # executed from the installed $O that is absent from this list is a divergence nothing byte-compares.
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh"
+# …`harness-provenance.sh` joins the OPERATOR-SURFACE half of this list on the same test as
+# `check-deployed-drift.sh`: nothing on the daemon runs it, and the operator is told to run it from the
+# DEPLOYED tree — `bash ~/orchestrator/harness-provenance.sh show --o ~/orchestrator` is README §4.3's
+# one-line answer to "which commit is this box running?". So a `$O` that was deployed by a ref
+# predating it has NO way to answer that question, and the only two instruments that could say so are
+# this presence arm and `check-deployed-drift.sh` (which byte-compares a copy that is PRESENT, so an
+# ABSENT one is silent). "The tool that answers the question is missing" is the fail-open direction:
+# the operator's command fails to resolve while every gate stays green.
 # …`lane-merge.sh` and `merge-rate.sh` are presence-required because install.sh seeds BOTH into `$O`
 # (the DRIFTED list) and a lane's brief EXECUTES `$O/lane-merge.sh` from the tree the daemon installed —
 # so a `$O` missing it makes every lane's merge phase exit 127. merge-rate.sh is carried for the same
@@ -95,8 +103,9 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-ga
 # arm — the same "no record of the file that is gone" shape check-deployed-drift.sh's shipped-surface
 # half exists to close, reproduced one instrument over. Presence is about EXECUTION, so the test is
 # "does the daemon source/run it", not "did anyone think of it".
-# `ci-queue.sh` (#2296) is here on exactly that test: orch-loop.sh, fix-one.sh AND dispatch-merge.sh all
-# source `$O/ci-queue.sh`, so a box without it loses the CI-queue gate on all three surfaces at once —
+# `ci-queue.sh` (#2296) is here on exactly that test: orch-loop.sh AND dispatch-merge.sh source
+# `$O/ci-queue.sh` (#2927 removed `fix-one.sh`'s — repair does not read the queue), so a box without it
+# loses the CI-queue gate on both remaining surfaces at once —
 # and every one of their interface guards would treat the missing module as "inert" rather than broken.
 # ⛔ `lane-bound.sh` IS HERE ON THE SAME TEST, AND ITS ABSENCE IS THE DEGRADED-BUT-SILENT CASE (2026-10-27).
 # `run_agent` executes `$O/lane-bound.sh` for EVERY lane's lifetime bound; a `$O` without it does not

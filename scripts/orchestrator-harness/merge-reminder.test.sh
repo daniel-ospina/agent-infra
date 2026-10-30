@@ -2556,6 +2556,9 @@ ck "§27b ...and goal 2 is NOT-MEASURED for that reason, never compared against 
    "$(qF 'the harness repo could not be resolved' "$MDF" && nq 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
 # ...and the SUT DOES resolve its own checkout (the case the fix exists for): no copy is made, because
 # the script under test is ALREADY inside a checkout and running the copy would test the copy's location.
+# ⛔ NO APOSTROPHE (or any unbalanced quote) IN THE PYTHON BELOW: bash 3.2 — `/bin/bash` on macOS, what
+# `install.sh` runs — does not skip a heredoc body when it scans `$( )` for quotes, so one apostrophe
+# here reads as an unterminated string, the file fails `bash -n`, and the harness cannot re-stamp (#2976).
 out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" <<'PYMOD'
@@ -2563,7 +2566,7 @@ import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-# candidate 3 is this script's own checkout: the resolution must find it even with nothing exported
+# candidate 3 is the checkout THIS script lives in: the resolution must find it even with nothing exported
 got = m.harness_repo_of(Path("/nonexistent-o"))
 here = Path(sys.argv[1]).resolve().parents[2]
 print(0 if got is not None and Path(got) == here.resolve() else 1)
@@ -2662,7 +2665,7 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 plain = Path(sys.argv[2]).resolve()
 here = Path(sys.argv[1]).resolve().parents[2]
 # A checkout that does NOT carry the harness must be SKIPPED: the resolution may fall through to the
-# script's own checkout (which does carry it), but it must never RETURN the plain repo.
+# checkout THIS script lives in (which does carry it), but it must never RETURN the plain repo.
 got_o = m.harness_repo_of(plain)
 # ...and the same for the conventional "$HOME/orchestrator" location.
 hdir = plain.parent / "homeplain"
