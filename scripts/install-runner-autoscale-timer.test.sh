@@ -1263,6 +1263,15 @@ assert_contains "$OUT" "--want=" "and names the argument it refused"
 box_sed_i '/^ExecStart=/ s| --want=| --repo=o/r|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 0 "--repo=<slug> is configuration, and the inline spelling is dropped like the space form"
+# Control 3: an EMPTY `--repo=` is NOT configuration. `--repo=` reaches the pass as the empty string, its
+# pool read becomes `repos//actions/runners` and it exits 2 UNMEASURABLE on every tick — measured at this
+# head (`rc=2`, "gh: Not Found (HTTP 404)"). Dropping it unconditionally certified ARMED exit 0 over a
+# schedule that is RED every nine minutes: the same false PASS controls 1 and 2 close for
+# `--want=` and `--root=`, so the empty value follows the same rule.
+box_sed_i '/^ExecStart=/ s| --repo=o/r| --repo=|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an EMPTY --repo= is a value the pass cannot read, so the gate reds it"
+assert_contains "$OUT" "--repo=" "and names the argument it refused"
 rm -f "$ARM"
 
 # ── T47: `--arm` NAMES why it cannot resolve a target, like every other verb ─────────────

@@ -1080,8 +1080,14 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             # unit and handing the operator a remedy (strip the argument) that removes a legitimate
             # switch. `--want=` IS the exit-2 case (the int conversion fails) and `--root=` leaves the
             # pass nothing to measure, so an EMPTY value stays reported; a non-empty one does not.
-            --want=*|--root=*) [ -n "${l#*=}" ] || out="$out $l" ;;
-            --repo=*)          : ;;
+            # ⛔ AND `--repo=` IS THE SAME RULE, NOT AN EXCEPTION TO IT. An empty slug is not
+            # configuration: `--repo=` reaches the pass as the empty string, its pool read becomes
+            # `repos//actions/runners` and it exits 2 UNMEASURABLE on every tick (measured at this
+            # head: `rc=2`, "gh api repos//actions/runners exited 1: gh: Not Found (HTTP 404)").
+            # Dropping it unconditionally certified exactly the state this verb exists to refuse —
+            # ARMED exit 0 over a schedule that is RED every nine minutes — so it follows the
+            # `--want=`/`--root=` rule: an EMPTY value is reported, a real slug is configuration.
+            --want=*|--root=*|--repo=*) [ -n "${l#*=}" ] || out="$out $l" ;;
             *)                 out="$out $l" ;;
         esac
     done
@@ -1727,6 +1733,13 @@ do_status() {
         other:*)   installed_mode="${installed_kind#other:}"
                    log_line "mode=$installed_mode"
                    err "the installed artifact carries arguments this installer did not render ('$installed_mode'). The pass accepts --repo, --root <path>, --want <n>, --status, --dry-run, --json, --install-unit, --check-units and --workdir <path>; anything OUTSIDE that set makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
+                   # ⛔ ONE OF THOSE OUTSIDE-THE-SET CASES IS A RECOGNISED FLAG WITH AN EMPTY VALUE
+                   # (`--want=`, `--root=`, `--repo=`), which reaches this arm because the classifier
+                   # refuses the empty value rather than the flag — so say THAT, or the operator is told
+                   # an argument the pass plainly accepts is unrecognised.
+                   case " $installed_mode " in
+                       *" --want= "*|*" --root= "*|*" --repo= "*) err "  one of $installed_mode is a recognised switch with an EMPTY value (--want= / --root= / --repo=). argparse accepts the flag and then the pass fails on the value: --want= and --repo= exit 2 on every tick, and --root= leaves the pass nothing to measure. Give it a value or remove the argument." ;;
+                   esac
                    # ⛔ AND A RECOGNISED ACTION IS NOT AN UNKNOWN ONE — SAY WHAT IT ACTUALLY DOES. The
                    # switches above are accepted, so the "exit 2" reason is FALSE for them, and their real
                    # consequences are different from each other: --install-unit writes and enables a
