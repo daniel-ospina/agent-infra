@@ -686,8 +686,30 @@ python3 tools/fleet/claim_lanes.py --snapshot ~/orchestrator/state/claims-snapsh
     --max-age-s 600 --pr 1525
 ```
 
-**The two drivers, one contract.** The normalized record is exactly the three fields
-`claim_snapshot` already writes — `<ref>\t<owner>\t<lease_until>`:
+**The two drivers, one contract.** The normalized record is exactly the three fields the body of
+`claim_snapshot` writes — `<ref>\t<owner>\t<lease_until>` — and it is preceded by a **header line**
+(`#2534`):
+
+```
+#claim-snapshot\t<read_at>\t<ok|failed>\t<refs>
+<ref>\t<owner>\t<lease_until>
+…
+```
+
+The header is what makes "the registry answered and holds nothing" distinguishable from "the registry
+was never read": `<read_at>` is the read instant, `ok|failed` is the **fetch**'s own answer, and
+`<refs>` is how many claims that read returned. Both FILE readers (`claims.sh`'s
+`claim_snapshot_verdict` and this driver's `read_snapshot`) honour it with the same polarity:
+
+- `<read_at>` — **not the file's mtime** — is the snapshot's age, so a fresh header on a copied file is
+  believed while an old header on a just-written file is refused.
+- `failed` — refused at **any** age: its rows are the *last good* read, so a claim published or released
+  since then is invisible.
+- a `read_at` **ahead** of the reader's clock is refused, never clamped to fresh — the age test is
+  one-sided, so trusting a future stamp believes it for ever.
+- a malformed header (wrong field count, non-numeric instant, not on line 1) is `claims-unreadable`, not
+  an old writer. The **mtime** fallback belongs only to a first line that is not a header at all, which
+  is what a writer predating the header produces.
 
 - **PULL** — `git ls-remote <remote> "<ns>/*"` is the authority on **presence**. A non-zero rc is
   `claims-unreadable` and is **never** "no claims"; rc 0 with zero refs is a *readable* empty
@@ -695,8 +717,11 @@ python3 tools/fleet/claim_lanes.py --snapshot ~/orchestrator/state/claims-snapsh
   read with `cat-file`, so a hostile registry can neither write nor delete a local ref. A
   per-claim metadata failure keeps `present=True` with `owner="?"` — presence alone refutes
   freedom.
-- **FILE** — `--snapshot PATH` with a caller-stated `--max-age-s`. Missing, stale, or
-  shape-drifted is `claims-unreadable`; a 0-byte file is a *readable* empty read.
+- **FILE** — `--snapshot PATH` with a caller-stated `--max-age-s`. Missing, unreadable, stale, a
+  `failed`-fetch header, or shape-drifted is `claims-unreadable`; a header stating `…\tok\t0` is a
+  *readable* empty read. `L27`/`L28` pin both readers to the shape the writer actually produces —
+  `L28` by running the shipped `claim_snapshot` and reading its output back, so the two drivers
+  cannot diverge again (a hand-written fixture can drift; the writer's bytes cannot).
 
 The read is bound to the target: `--repo PATH` (its `origin`) or `--remote-url URL`, never the
 current directory (the controller runs from launchd with cwd `$HOME`, which is how `claim_snapshot`
@@ -1200,11 +1225,27 @@ COMPONENT   EXPECTED   ACTUAL   STATE
 | `DUPLICATE` | more than one live instance | 1 |
 | `FAILING` | present but reporting failure (non-zero last exit, a pidfile naming the wrong process) | 1 |
 | `SKIPPED` | NOT APPLICABLE here — always with a reason; never rendered as `OK` | 0 |
+| `WAITING` | it ran, and its verdict is "no room right now, nothing was consumed **and the axis that refused self-clears**" (`pr-doctor`'s own exit 6 on the LOAD axis only) — never rendered as `OK` | 0 |
 | `UNKNOWN` | the check itself could not run (unreadable `ps`, unparseable job) | 2 |
 
 `SKIPPED` is a PASS for the exit code *and* a distinct state, because "not checked" and "checked and
-healthy" are different answers, and a Mac is not broken for having no cell supervisor. `UNKNOWN` is
-the abstention doctrine of §4 applied to this surface: an unreadable read is never a pass.
+healthy" are different answers, and a Mac is not broken for having no cell supervisor. `WAITING` is the
+same shape for the opposite reason: the instrument ran and answered *"there is no room; nothing was
+consumed and it clears by itself"*, which is neither a failure (the pre-#2291 reading, and the false
+alarm that teaches operators to ignore this screen) nor `OK` (the queue is not moving while it waits).
+⛔ **Only the LOAD axis qualifies, and the row reads the axis** (`refusal_bound` in
+`pr-doctor.status.json`, whose grammar is **`<axis>=<count>[,…]`** — `load=1`, `disk=2,load=1` — NOT a
+bare axis name; a consumer written from a bare-name reading matches nothing): `spawn-gate.sh` gives
+four refusal codes because their remedies differ, and it
+states per axis whether waiting clears it — load does (`:1399` *"the controller re-dispatches when load
+falls"*), while disk (`:1392` *"This is NOT a load refusal: waiting does not clear it"*), fork (`:1344`
+*"a fork refusal does NOT clear by waiting"*) and land-backlog (`:1461`) explicitly do not. Counting
+those as a pass would turn a full disk or fork exhaustion from `FAILING`/exit 1 into `WAITING`/exit **0**
+— the machine-readable signal `orchestrator-bringup.sh` reads would go green on a stall that can never
+clear itself. So a **non-clearing** bound is `FAILING` (with the axis named in the detail), and a
+`6` whose bound cannot be read is `UNKNOWN` — because "cannot tell whether it clears" is an abstention,
+never a pass. `UNKNOWN` is the abstention doctrine of §4 applied to this surface: an unreadable read is
+never a pass.
 
 **Each predicate is derived from the component's OWN behaviour** — never "pid exists":
 
@@ -1213,7 +1254,7 @@ the abstention doctrine of §4 applied to this surface: an unreadable read is ne
 | `controller` | lock owner cross-checked against an `orch-loop.sh` invocation, plus `$O/heartbeat` age (a live pid with a frozen heartbeat is *wedged*, not healthy) |
 | `controller-watchdog` | at least one of the launchd watchdog job / `watchdog-loop.sh` is live, and if the JOB is present its last exit is still read: a failing job is `FAILING` ("the plain loop is still covering, which is why this is not fatal") even though the pair is fine. **The pair is NOT a duplicate**, and the reason is not the one this line used to give. Before #2303 BOTH mechanisms ran the same idempotent `watchdog.sh` (check → load → log → exit) and could not disagree about the desired state; the TRACKED launchd job (`com.eldato.controller-watchdog`) now runs `watchdog-loop.sh`, whose restart is a NON-idempotent `launchctl kickstart -k`. What bounds the pair is therefore the SHARED ON-DISK RESTART BUDGET (`$HOME/.pi/agent/state/controller-watchdog.streak`): both runners spend the same cap, so the restarts per episode stay within `MAX_CONSEC` — never a tight loop. ⛔ The one job that COULD disagree — the hand-provisioned `com.eldato.orchestrator-watchdog`, a *different* script (`~/orchestrator/watchdog.sh`) on its own 20 s timer — is listed in `templates/launchd/RETIRED`, so the installer unloads it and **this watchdog's restarts disabled**: the pair is never two mutating watchdogs (see `docs/ops/ACTIVATION-MATRIX.md` row 8). The row says so in its ACTUAL column ("redundant by design"). `DUPLICATE` is reserved for the same mechanism twice — two `watchdog-loop.sh` processes, which really do run every action twice |
 | `heartbeat-loop`, `cadence-timer` | the pid its OWN pidfile names, cross-checked against a process whose argv is that script (a recycled pid is `FAILING`, not alive), plus that loop's **own** freshness signal — and "own" is load-bearing: the cadence timer used to be judged by `orchestrator-heartbeat.log`, which the *heartbeat loop* appends to every pass, so its `LATE` branch could only fire if BOTH loops stopped. It now writes `cadence-timer.beat` per tick, and that beacon is what the row reads. A copy of the script installed **before** the beacon (farmed copies lag the repo) logs `CADENCE-TIMER started pid=…` and no beacon, and the row says so — `LATE`, with the stale copy named and the re-sync named, rather than a permanent red whose reason blames a healthy loop |
-| `pr-doctor`, the reapers | **loaded** in the domain + **last exit 0** + a freshness file within 2× their OWN `StartInterval` (a 6 h reaper is not judged by a 20-min reaper's clock). Between runs `pid` is legitimately `-`, so "pid exists" is the wrong predicate — and "last exit status" is the readable datum nobody was reading. The freshness file is the job's declared `StandardOutPath`/`StandardErrorPath` when it declares one, otherwise **the log the component's own script writes** (the four reaper templates deliberately declare no output path, so for them it is always the own-log) (`pi-reap-worktrees.sh:190`, `cleanup-stale-branches.sh:2411`, and the session reaper's/lane-liveness's own logs). A job with NEITHER is `UNKNOWN`, never `OK` — a job launchd stops scheduling is otherwise indistinguishable from a healthy one |
+| `pr-doctor`, the reapers | **loaded** in the domain + **last exit 0** + a freshness file within 2× their OWN `StartInterval` (a 6 h reaper is not judged by a 20-min reaper's clock). Between runs `pid` is legitimately `-`, so "pid exists" is the wrong predicate — and "last exit status" is the readable datum nobody was reading. The freshness file is the job's declared `StandardOutPath`/`StandardErrorPath` when it declares one, otherwise **the log the component's own script writes** (the four reaper templates deliberately declare no output path, so for them it is always the own-log) (`pi-reap-worktrees.sh:190`, `cleanup-stale-branches.sh:2411`, and the session reaper's/lane-liveness's own logs). A job with NEITHER is `UNKNOWN`, never `OK` — a job launchd stops scheduling is otherwise indistinguishable from a healthy one. ⛔ **`pr-doctor`'s OWN exit 6 is `WAITING` on the LOAD axis, and `FAILING` on the other three** (#2291): that code is the dispatcher saying *the box's own gate refused every order and nothing was consumed*, and only a load refusal clears by itself. The row reads `refusal_bound` from `$STATE/pr-doctor.status.json` — **grammar `<axis>=<count>[,…]`, e.g. `load=1` or `disk=2,load=1`**, alongside `verdict` and the `capacity.sh probe` record in `room` — and decides from it: every axis named is `load` → `WAITING` (a pass for the table's exit code, never `OK` — the queue is not moving while it waits), any other axis present → `FAILING` with that axis named, an unreadable bound → `UNKNOWN`. ⛔ **And a `WAITING` row is still subject to this row's freshness arms** (#2291 review): a stale `6` is `LATE`, not a pass, and a record whose own `rc`/`verdict` do not describe the exit being explained is `UNKNOWN` — both launchers write the one status file, so the axis must be read from the pass it explains |
 | `cell-supervisor` | applicable on a cell ONLY (`SKIPPED` on a Mac with the reason; `UNKNOWN` when the platform is *unset*, because "cannot answer" is not a pass); the process plus its tmux session, because an OOM-killed `cmux-tui` leaves a live supervisor with a gone session. A **cell** is a box that carries a cell's identity that was **provisioned**, not defaulted: an explicit `$STATE/.cell` marker, or a cell home that actually holds one (`keys.env`, `.harness-path`). `bringup` defaults `CELL_HOME=/tmp/cell-home`, so "the variable is set" is not evidence — and the kernel alone certainly is not, since `uname -s = Linux` is what `bringup` maps to `PLATFORM=cell`; keying on either would make every Linux dev box and CI runner permanently red for a supervisor it does not have |
 | `landers` | demand-driven, so 0 live is normal — the failure is a waiter OLDER than its own bound (90 min wait plus the rail), which is the "expired silently" state |
 
