@@ -26,8 +26,8 @@ H="$AI/scripts/orchestrator-harness"
 # is not there; the controller then starts with `REPO=/tmp/cell-ai` (line 106 passes it through to the
 # tmux command below), and the failure arrives one generation later as a dispatch path that resolves
 # nothing. `REPO` is the operator's, set ONCE per box, and `repo-slug.sh`'s `resolve_repo` is the ONE
-# place that reads it — it refuses by name rather than guessing. Resolved below, once `$H` and `die`
-# exist.
+# place that reads it — it refuses by name rather than guessing. Resolved below in TWO passes: a
+# pre-flight when `$H` can already answer, and again once the fast-forward has put `$AI` on main.
 OR="${OR:-daniel-ospina/agent-infra}"
 SCOPE="${SCOPE:-broad}"
 MAX_LANES="${MAX_LANES:-3}"
