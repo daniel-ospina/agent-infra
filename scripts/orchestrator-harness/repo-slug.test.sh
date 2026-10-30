@@ -121,7 +121,11 @@ ck "A6  a real checkout resolves to one canonical path ($rr_out)" $?
 # silently widened `$REPO` to the toplevel would rewrite an operator's value behind their back.
 rr REPO="$REAL/sub"
 { [ "$rr_rc" -eq 0 ] && [ "$rr_out" = "$(canon "$REAL/sub")" ]; }
-ck "A7  a subdirectory is kept, never widened to the toplevel ("$(basename "$rr_out")")" $?
+# ⛔ `$?` IS CAPTURED BEFORE ANY SUBSTITUTION (#3054 review, P1). Word expansions happen BEFORE the
+# command runs and left to right, so a `$(…)` in the message runs FIRST and leaves ITS status in `$?`.
+# `ck "… $(…)" $?` therefore reported the substitution's 0 and this arm passed UNCONDITIONALLY.
+_a7_st=$?
+ck "A7  a subdirectory is kept, never widened to the toplevel ($(basename "${rr_out:-}"))" "$_a7_st"
 
 # A8 A SYMLINKED CHECKOUT IS ONE PATH (the same reason refresh-candidates.sh stores `pwd -P`).
 rr REPO="$LINK"
@@ -213,6 +217,33 @@ if [ -f "$CROSSBOX" ]; then
   cbrun REPO="$REAL"
   { [ "$cb_rc" -eq 1 ] && grep -q 'repo-slug.sh missing' <<<"$cb_out"; }
   ck "B9  deploy-crossbox.sh: a cell with no repo-slug.sh dies BY NAME instead of guessing (rc=$cb_rc)" $?
+  # ⛔ THE SHAPE EVERY EXISTING CELL IS IN AT MERGE TIME (#3054 review, P1-2): `repo-slug.sh` PRESENT
+  # but WITHOUT `resolve_repo`. `$H` is `$AI/scripts/orchestrator-harness` — INSIDE the clone step 2
+  # fast-forwards — so refusing here refuses before the one step that supplies the resolver, and the
+  # remedy the old message printed (`deploy-harness.sh --o $O`) re-seeds `$O` FROM `$H`, so it cannot
+  # put the resolver INTO `$H`. It must be DEFERRED, and the run must reach the fast-forward instead.
+  # `tmux` IS STUBBED because the script kills the `orch` session — a test must never reach a live one
+  # — and the fixture is deliberately not a git repo, so the run stops at `git fetch` (before any cp).
+  mkdir -p "$CELL/bin"
+  printf '#!/bin/bash\nexit 0\n' > "$CELL/bin/tmux"; chmod +x "$CELL/bin/tmux"
+  printf '#!/bin/bash\nrepo_slug_from_remote() { :; }\n' > "$CELL/cell-ai/scripts/orchestrator-harness/repo-slug.sh"
+  cbrun PATH="$CELL/bin:$PATH" REPO="$REAL"
+  { [ "$cb_rc" -ne 0 ] && ! grep -q 'resolve_repo' <<<"$cb_out" && grep -q 'git fetch failed' <<<"$cb_out"; }
+  ck "B10 deploy-crossbox.sh: a STALE harness is DEFERRED, not refused — it reaches the fast-forward (rc=$cb_rc)" $?
+  # ⛔ `--repo PATH` IS THE ONE INPUT AN SSH CALLER HAS ON A CELL (#3054 review, P1-2): the two
+  # documented surfaces reach the CONTROLLER, not the pushing shell. It is still PROVEN — but only if
+  # it actually REACHES the resolver, so both directions are pinned, with `REPO` UNSET (`env -u`) so
+  # the value can only have come from the flag.
+  cp "$LIB" "$CELL/cell-ai/scripts/orchestrator-harness/repo-slug.sh"
+  cb_out="$(env -u REPO AI="$CELL/cell-ai" CELL_HOME="$CELL/cell-home" PATH="$CELL/bin:$PATH" \
+    bash "$CROSSBOX" --repo "$NOPE" 2>&1)"; cb_rc=$?
+  { [ "$cb_rc" -eq 2 ] && grep -q "$NOPE" <<<"$cb_out"; }
+  ck "B11 deploy-crossbox.sh: --repo <bogus> is refused BY VALUE with REPO unset (rc=$cb_rc)" $?
+  cb_out="$(env -u REPO AI="$CELL/cell-ai" CELL_HOME="$CELL/cell-home" PATH="$CELL/bin:$PATH" \
+    bash "$CROSSBOX" --repo "$REAL" 2>&1)"; cb_rc=$?
+  { [ "$cb_rc" -ne 0 ] && ! grep -q 'REPO is unset' <<<"$cb_out" && grep -q 'git fetch failed' <<<"$cb_out"; }
+  ck "B12 deploy-crossbox.sh: --repo <real checkout> is ACCEPTED with REPO unset — it reaches the fast-forward (rc=$cb_rc)" $?
+  rm -rf "$CELL/bin" $?
 else
   bad "B8-B9 deploy-crossbox.sh is shipped (absent: $CROSSBOX)"
 fi
@@ -241,8 +272,12 @@ open(p, "w").write(s.replace(old, new))
     mut_name="$1"; mut_expect="$2"
     mut_out="$(env RR_TEST_NO_MUT=1 bash "$MUTDIR/orchestrator-harness/repo-slug.test.sh" 2>&1)"; mut_rc=$?
     mut_red="$(printf '%s\n' "$mut_out" | grep '❌' | head -3)"
-    { [ "$mut_rc" -ne 0 ] && [ -n "$mut_red" ] && grep -q -- "$mut_expect" <<<"$mut_out"; }
-    ck "M $mut_name REDDENS (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | sed 's/^ *//')" $?
+    { [ "$mut_rc" -ne 0 ] && [ -n "$mut_red" ] && grep -q -- "$mut_expect" <<<"$mut_red"; }
+    # ⛔ CAPTURE THE VERDICT FIRST — see A7 (#3054 review, P1). Passing `$?` beside a `$(…)` in the
+    # message made the substitution's status the verdict, so M1–M3 passed whether or not the mutation
+    # reddened anything. This is the anti-vacuity gate; an inert one is worse than none.
+    mut_st=$?
+    ck "M $mut_name REDDENS (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | sed 's/^ *//')" "$mut_st"
   }
   mut_copy() { rm -rf "$T/mut"; mkdir -p "$T/mut"; cp -a "${SLUGDIR}." "$T/mut/"; MUTDIR="$T/mut"; }
 
@@ -272,7 +307,8 @@ open(p, "w").write(s.replace(old, new))
   mut_out="$(bash "$MUTDIR/orchestrator-harness/check-single-source.sh" 2>&1)"; mut_rc=$?
   mut_red="$(printf '%s\n' "$mut_out" | grep -i 'PRIVATE' | head -2)"
   { [ "$mut_rc" -eq 1 ] && [ -n "$mut_red" ]; }
-  ck "M4 a planted private REPO default in scripts/ reddens check-single-source.sh (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | cut -c1-100)" $?
+  m4_st=$?   # captured before the `$(…)` below — see A7 (#3054 review, P1)
+  ck "M4 a planted private REPO default in scripts/ reddens check-single-source.sh (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | cut -c1-100)" "$m4_st"
   rm -rf "$T/mut"
 elif [ "${1:-}" = "--mutation-proof" ]; then
   echo

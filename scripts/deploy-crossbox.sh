@@ -35,14 +35,48 @@ MAX_LANES="${MAX_LANES:-3}"
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { log_line "FATAL: $*" >&2; exit 1; }
 
+# ── how REPO arrives ──────────────────────────────────────────────────────
+# `--repo PATH` is the ONE explicit way an ssh caller can hand this box its repo. On a cell the two
+# documented surfaces (the launchd plist, the cell's keys.env) reach the CONTROLLER — cloud-cell-
+# supervisor.sh sources keys.env with `set -a` before starting the loop — NOT the shell that pushes and
+# runs this script, so without an argument a cell had no way in at all and the value the removed
+# `/tmp/cell-ai` default used to supply could not be supplied explicitly either (#3054 review, P1-2).
+# An argument is still PROVEN by `resolve_repo`: this adds an INPUT, never a default. Any other
+# argument is ignored, exactly as every argument was before this option existed — automation invokes
+# this script and a stricter parser would be a behaviour change nobody asked for.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo)   [ "$#" -ge 2 ] || die "--repo needs a PATH"; REPO="$2"; shift 2 ;;
+    --repo=*) REPO="${1#--repo=}"; shift ;;
+    --)       shift; break ;;
+    *)        shift ;;
+  esac
+done
+
 # ⛔ SOURCED FROM `$H`, THE CELL'S OWN CHECKOUT: that copy is on main (keeping it there is this
 # deploy's job), so the resolver that runs is the shipped one. A `$H` predating `resolve_repo` is
 # REFUSED BY NAME rather than silently falling back to a path default — that fallback is the defect.
+#
+# ⛔ BUT THAT REFUSAL MUST NOT COME BEFORE THE STEP THAT CAN SUPPLY IT (#3054 review, P1-2). `$H` is
+# `$AI/scripts/orchestrator-harness` — INSIDE the clone that step 2 fast-forwards — so on every
+# existing cell (whose `/tmp/cell-ai` predates this change) a stale `$H` died HERE, before the
+# `git merge --ff-only` that brings `resolve_repo` in; and the remedy the old message printed could not
+# break it either, because `deploy-harness.sh --o $O` re-seeds `$O` FROM `$H` and so cannot put the
+# resolver INTO `$H`. The only real unblock was a hand-run fast-forward of `$AI` — i.e. step 2.
+# So the resolver is PRE-FLIGHTED here and PERFORMED once `$AI` is on main:
+#   * a MISSING `repo-slug.sh` still dies here — it is not the stale shape, and no fast-forward is
+#     needed for a file every current checkout already ships;
+#   * a stale one (present, no `resolve_repo`) is DEFERRED, not refused;
+#   * a usable one resolves here, so a WRONG `REPO` still refuses BEFORE the controller is stopped —
+#     the property that makes this script safe to run while the loop is working.
 [ -f "$H/repo-slug.sh" ] || die "repo-slug.sh missing from $H — cannot resolve REPO, and this script will not guess one"
-# shellcheck source=scripts/orchestrator-harness/repo-slug.sh
-. "$H/repo-slug.sh" || die "cannot source $H/repo-slug.sh — cannot resolve REPO"
-command -v resolve_repo >/dev/null 2>&1 || die "$H/repo-slug.sh is stale (no resolve_repo) — re-seed the cell's harness first: bash $H/deploy-harness.sh --src <agent-infra checkout> --o $O"
-REPO="$(resolve_repo)" || exit $?
+if grep -q '^resolve_repo()' "$H/repo-slug.sh" 2>/dev/null; then
+  # shellcheck source=scripts/orchestrator-harness/repo-slug.sh
+  . "$H/repo-slug.sh" || die "cannot source $H/repo-slug.sh — cannot resolve REPO"
+  # Subshell: this pass only needs the VERDICT (a refusal already went to stderr), and discarding stdout
+  # means no message can be mistaken for a path. The value the controller gets comes from the pass below.
+  ( resolve_repo >/dev/null ) || exit $?
+fi
 
 export HOME="$CELL_HOME"
 cd "$AI" || die "no $AI"
@@ -65,6 +99,16 @@ git fetch -q origin main || die "git fetch failed"
 BEFORE="$(git rev-parse --short HEAD)"
 git merge --ff-only origin/main >/dev/null 2>&1 || die "cannot fast-forward to main (local changes in $AI?)"
 log_line "clone -> $(git rev-parse --short HEAD) (was $BEFORE)"
+
+# ── REPO is resolved HERE, from main's resolver (#3054 review, P1-2) ──────
+# This is the pass whose value the controller gets, and it runs AFTER the fast-forward on purpose: it
+# is what repairs a cell whose `$H` predated `resolve_repo`. A resolver that is STILL missing now is a
+# genuine refusal — the clone did not end up on main — and it names that, instead of the old dead end.
+[ -f "$H/repo-slug.sh" ] || die "repo-slug.sh missing from $H even after fast-forwarding $AI to main — $AI is not a usable agent-infra checkout"
+# shellcheck source=scripts/orchestrator-harness/repo-slug.sh
+. "$H/repo-slug.sh" || die "cannot source $H/repo-slug.sh — cannot resolve REPO"
+command -v resolve_repo >/dev/null 2>&1 || die "$H/repo-slug.sh still has no resolve_repo after fast-forwarding $AI to main — $AI is not ON main (a local commit, or a tree that cannot fast-forward); fix the clone, then re-run"
+REPO="$(resolve_repo)" || exit $?
 
 [ -f "$H/claims.sh" ]               || die "claims.sh missing on main — is the registry merged?"
 [ -f "$H/test-claims.sh" ]          || die "test-claims.sh missing on main"

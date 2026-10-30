@@ -5055,6 +5055,17 @@ if [ -f "$CSS" ]; then
   { [ "$rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$out"; } && rc=0 \
     || { rc=1; echo "      a default in scripts/ (the reaper) exited $rc: $(printf '%s\n' "$out" | grep -iE 'PRIVATE|nothing to scan' || echo '<not named>') — the arm is scanning ONE directory again (or word-split the parent path)"; }
   ck "check-single-source: a REPO path default in scripts/*.sh (not just the harness dir) is refused" $rc
+  # ⛔ THE SPELLING WAS A WAY AROUND THE ARM (#3054 review, P2). `pathish` matched the LITERAL `$HOME`
+  # and `$PWD`, so writing the exact default this PR removes ONE BRACE AWAY — `${HOME}/eldato/tortoise`,
+  # `${PWD}` — passed the gate untouched: the "a PR or an agent can defeat it" class. Both spellings are
+  # fixtures here, in the same throwaway copy, so a rewrite back to a bare-only match reds.
+  for _bshape in '${HOME}/eldato/tortoise' '${PWD}'; do
+    printf '#!/bin/bash\nREPO="${REPO:-%s}"\n' "$_bshape" > "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
+    out="$(bash "$TMP/rpdef/repo scripts/orchestrator-harness/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      the brace spelling $_bshape exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') — pathish matches only the BARE \$HOME/\$PWD"; }
+    ck "check-single-source: the brace spelling REPO=\"\${REPO:-$_bshape}\" is refused too" $rc
+  done
   rm -rf "$TMP/rpdef"
 else
   ck "check-single-source.sh is shipped" 1

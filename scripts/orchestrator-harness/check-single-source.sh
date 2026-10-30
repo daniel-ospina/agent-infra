@@ -385,7 +385,13 @@ repo_path_default_hits() {
   awk '
     BEGIN { q39 = sprintf("%c", 39) }                     # a single quote, without one in this program
     function pathish(v) {
-      if (v ~ /\$HOME/ || v ~ /\$PWD/) return 1          # $HOME/…, ${HOME}/…, $PWD
+      # ⛔ BOTH SPELLINGS ARE CHECKED (#3054 review, P2). `\$HOME` is the LITERAL `$HOME`; it does not
+      # match `${HOME}`, so matching only the bare form let the exact default this PR removes be
+      # re-written one brace away and pass the gate — the "a PR or an agent can defeat it" class.
+      # `index()` is used rather than an ERE `\$\{?HOME\}?` because `{` is an interval expression in
+      # POSIX awk and BSD/GNU awk differ on escaping it; a substring test cannot be mis-parsed.
+      if (v ~ /\$HOME/ || v ~ /\$PWD/) return 1     # $HOME/…, $PWD
+      if (index(v, "${HOME}") || index(v, "${PWD}")) return 1   # ${HOME}/…, ${PWD}
       if (v ~ /^\// || v ~ /^~/ || v ~ /^\.\//) return 1  # an absolute, home-relative or ./ path
       return 0
     }
