@@ -587,7 +587,14 @@ check_harness_pin() {
       # launches (see deploy_harness), so drift is the state `start` exists to repair; refusing it
       # here would false-block the only command that fixes it. What is NOT mendable is an identity
       # nobody can read — that is the rc=2 arm below.
-      warn "the deployed harness at $O has drifted from $src_repo ($(printf '%s' "$out" | grep -c '^DRIFT:' ) finding(s); first: $(printf '%s' "$out" | head -1)) — 'start' redeploys $O from $src_repo before launching"
+      # ⛔ THE COUNT PATTERN CARRIES NO COLON, and that is the whole point: the checker labels each
+      # finding with the QUESTION it failed — `DRIFT(identity):` / `DRIFT(record):` / `DRIFT(checkout):`
+      # — since the two-question split. A pattern anchored on `^DRIFT:` matched only the unlabelled
+      # remainder (`MISSING`, `STALE-RECORD`, the surface arms), so on exactly the box this warning
+      # exists for (the deployed copy DIFFERS from the checkout — the common repair case, on the verb
+      # that redeploys it) it printed `0 finding(s)` beside a live drift report. A count that
+      # contradicts its own first line is worse than no count.
+      warn "the deployed harness at $O has drifted from $src_repo ($(printf '%s' "$out" | grep -c '^DRIFT' ) finding(s); first: $(printf '%s' "$out" | head -1)) — 'start' redeploys $O from $src_repo before launching"
       ;;
     *)
       # ⛔ ABSENT AND UNREADABLE ARE DIFFERENT FACTS, and only one of them is this run's to refuse.

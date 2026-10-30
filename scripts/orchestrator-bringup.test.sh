@@ -129,6 +129,12 @@ LC
 
 # A stub harness: the two scripts the entry point consults, and a marker each so a case can assert
 # that a verb did (or did NOT) call one.
+# ⛔ THE rc=1 ARM SPEAKS THE PRODUCER'S OWN FORMAT, and that is load-bearing, not cosmetic. A fixture
+# that prints `DRIFT: …` re-implements a format the shipped checker no longer emits, so it agrees with
+# the consumer while the consumer disagrees with reality — the arm passed green over a count that read
+# `0 finding(s)` on a real box. Three lines, one of each shape the checker can produce: two LABELLED
+# (the question each failed) and one unlabelled (the record/surface remainders), so a consumer that
+# counts only one shape is caught here instead of on the box.
 mk_harness() { # <dir> <drift-rc>
   mkdir -p "$1"
   cat > "$1/check-deployed-drift.sh" <<EOF
@@ -136,7 +142,10 @@ mk_harness() { # <dir> <drift-rc>
 rc=$2
 case "\$rc" in
   2) echo "UNKNOWN: no harness record at \$O/.agent-infra-stamp.json"; exit 2 ;;
-  1) echo "DRIFT: the deployed harness is recorded from deadbeef, which is BEHIND origin/main"; exit 1 ;;
+  1) echo "DRIFT(identity): the deployed harness is recorded from deadbeef, which is BEHIND origin/main"
+     echo "DRIFT(record): a.sh — UNCOMMITTED EDIT in \$O: the deployed copy differs from what the record says was deployed"
+     echo "DRIFT: MISSING b.sh — the record says the deploy wrote it, and it is not there now"
+     exit 1 ;;
   *) echo "MATCH: deployed harness at \$O == the repo"; exit 0 ;;
 esac
 EOF
@@ -1362,6 +1371,34 @@ printf '{ not json' > "$SA/O/.agent-infra-stamp.json"
 BRINGUP_ARGS=check bringup "$SA/home" "$SA/bin" "$SA/harness" REPO="$SA/repo" O="$SA/O" ENV_FILE="$SA/home/keys.env"
 [ "$RC" = 2 ] && ok "check: an UNREADABLE stamp is still rc=2 — cannot-verify is never a pass" \
               || bad "check: rc=$RC over a stamp nobody can parse, want 2 — $OUT"
+
+
+# ── §14 the drift report's COUNT must count every drift, labelled included ──────────────────────
+# ⛔ The checker labels each finding with the QUESTION it failed (`DRIFT(identity|record|checkout):`) and
+# leaves the record/surface remainders bare (`DRIFT:`). The bringup's warning counted with `^DRIFT:`,
+# which matched only the bare shape — so on the box this verb exists for (the deployed copy DIFFERS,
+# the labelled case) it printed `0 finding(s)` beside a drift report it had just received. This arm
+# grades the count against the producer's real vocabulary: 3 lines in, 3 findings reported.
+say_case "§14 the drift warning counts LABELLED findings too — a count that contradicts its own report is a lie"
+DD="$T/dd"; mk_bin "$DD/bin" mac; mk_harness "$DD/harness" 1; mk_clone "$DD/repo" "daniel-ospina/agent-infra"
+mkdir -p "$DD/home"
+BRINGUP_ARGS=check bringup "$DD/home" "$DD/bin" "$DD/harness" REPO="$DD/repo" O="$DD/O" ENV_FILE="$DD/home/keys.env"
+[ "$RC" = 0 ] && ok "§14 check: drift is REPORTED, not refused (start is the verb that redeploys \$O)" \
+              || bad "§14 check: rc=$RC over a drifted \$O, want 0 — drift must not block the repair — $OUT"
+case "$OUT" in
+  *"3 finding(s)"*) ok "§14 the warning counts all 3 DRIFT lines — the two labelled ones included" ;;
+  *"finding(s)"*)   bad "§14 the warning MISCOUNTS the drift report (want 3) — $OUT" ;;
+  *)                bad "§14 the warning reported no finding count at all — $OUT" ;;
+esac
+# The behavioural arm above needs the fixture; this one is the SOURCE-level guard that survives a
+# fixture regression. Reverting the pattern to `^DRIFT:` reddens it on any checkout, which is the arm
+# a future lane editing the warning needs: the count is a reader of the checker's vocabulary, so it may
+# not hard-code one shape of it.
+if grep -q "grep -c '\^DRIFT:'" "$BRINGUP"; then
+  bad "§14 the finding count is anchored on '^DRIFT:' — it cannot match DRIFT(<question>): lines"
+else
+  ok "§14 the finding count does not anchor on the colon (it matches the labelled shape too)"
+fi
 
 
 echo
