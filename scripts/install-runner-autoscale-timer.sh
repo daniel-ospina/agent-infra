@@ -703,6 +703,26 @@ unit_dropin_execfiles() { # .conf drop-ins that would override ExecStart, one pa
     return 0
 }
 
+unit_dropin_timerfiles() { # .conf drop-ins that would override the timer's CADENCE, one path per line
+    # ⛔ THE SAME RULE AS `unit_dropin_execfiles`, ONE UNIT OVER. systemd merges `$UNIT.d/*.conf` for EVERY
+    # unit type, and the TIMER is where the cadence lives: `OnBootSec=`, `OnUnitActiveSec=`, `OnCalendar=`,
+    # `Persistent=` (and `Unit=`, which decides what it fires). So a `$UNIT_NAME.timer.d/*.conf` carrying
+    # `OnUnitActiveSec=1h` makes this pass fire hourly with the base artifact untouched — and the drift
+    # `cmp` cannot see it, because the base file really IS what this installer would write. Without this
+    # arm the readiness verb answered `drift_artifact=no` and exited 0 over exactly the wrong-cadence box
+    # the drift comparison exists for: the false PASS would have moved from the base file into a drop-in.
+    # ⛔ NAMED KEYS, NOT "any file here". A drop-in in this directory can only affect THIS timer, but one
+    # touching `[Unit] Description=` or `[Install] WantedBy=` changes no cadence, and red-ing it would be
+    # a false block — the control in the suite pins that.
+    local d="$UNIT_DIR/$UNIT_NAME.timer.d" f
+    [ -d "$d" ] || return 0
+    for f in "$d"/*.conf; do
+        [ -f "$f" ] || continue
+        [ -n "$(sed -n -E 's/^[[:space:]]*(OnBootSec|OnUnitActiveSec|OnCalendar|Persistent|Unit)[[:space:]]*=.*/x/p' "$f")" ] && printf '%s\n' "$f"
+    done
+    return 0
+}
+
 verify_installed_unit() { # verify the ARTIFACT at $UNIT_DIR, not the bytes we hoped for
     local svc="$UNIT_DIR/$UNIT_NAME.service" line
     [ -f "$svc" ] || { err "REFUSING to arm: $svc is not there after the install"; return 1; }
@@ -1263,7 +1283,7 @@ sha_of() { # sha_of <file> — portable digest
 
 do_status() {
     local installed_mode installed_script drift_artifact enabled active next last linger
-    local installed_args installed_rest installed_kind installed_dropins
+    local installed_args installed_rest installed_kind installed_dropins installed_timer_dropins
     local drift_service drift_timer
     local rc=0 installed_path
     # ⛔ `--status` IS THE FIFTH READER OF THE SAME RECORD, AND IT WAS THE ONE VERB THAT SKIPPED THIS
@@ -1276,8 +1296,21 @@ do_status() {
     refuse_root_invocation || return 1
     resolve_script || return 1
     resolve_python || { rc=1; }
+    # ⛔ THE DRIFT RENDER IS ONLY MEANINGFUL IF IT RESOLVES WHAT THE INSTALL PATH RESOLVED. The provisioner
+    # is baked into the artifact as a whole line (`{{PROVISIONER_ENV}}`, present in BOTH templates), and
+    # `resolve_provisioner` is what decides between a pin and nothing — `do_install` (and
+    # `do_install_reinstall_only`) call it, and `--status` did NOT, so `PROVISIONER` stayed empty and the
+    # status render emitted `Environment=""` while the installed file carried the resolved pin. On every
+    # box that HAS `tools/install-ci-runner-x64.sh` — i.e. exactly the boxes the FILL half exists for — the
+    # two files could never match: `--status` printed `drift_artifact=yes` on an untouched artifact and
+    # handed out `--install` as the remedy, and that `--install` printed `changed=0` and left the verdict
+    # unchanged. A signal that fires always is a signal nobody reads (the class the `User=` arm below was
+    # fixed for), and here it was worse than noise: it hid REAL drift on those boxes.
+    resolve_provisioner
     choose_target || { err "no scheduler available"; return 1; }
     log_line "target=$TARGET dir=$UNIT_DIR"
+    # The pin is part of what the artifact carries, so the readiness report names it (or says why not).
+    log_line "provisioner=${PROVISIONER:-absent} ($PROVISIONER_WHY)"
     # ⛔ THE READINESS VERB WAS THE ONE READER THAT NEVER SCANNED THE SECOND SCOPE, AND IT MADE A
     # BOX-LEVEL CLAIM FROM A SCOPE-LEVEL READ. `choose_target` resolves the scope from SUDO AVAILABILITY
     # AT THIS INVOCATION, so a box installed into /etc/systemd/system by the bring-up answers a later
@@ -1344,6 +1377,15 @@ do_status() {
         if [ -n "$installed_dropins" ]; then
             log_line "dropin_override=$installed_dropins"
             err "an ExecStart= DROP-IN overrides this unit's command, so the mode reported above is NOT what systemd runs: $installed_dropins — read it (systemctl cat $UNIT_NAME.service) and re-install once it is gone"
+            rc=1
+        fi
+        # ⛔ THE CADENCE HAS A DROP-IN ROUTE TOO, and the drift `cmp` cannot see it: a timer drop-in leaves
+        # the base artifact byte-identical to what this installer would write while changing when it fires.
+        installed_timer_dropins="$(unit_dropin_timerfiles | tr '\n' ' ')"
+        installed_timer_dropins="${installed_timer_dropins% }"
+        if [ -n "$installed_timer_dropins" ]; then
+            log_line "timer_dropin=$installed_timer_dropins"
+            err "a [Timer] DROP-IN overrides this unit's CADENCE, so the schedule reported above is NOT what systemd runs: $installed_timer_dropins — read it (systemctl cat $UNIT_NAME.timer) and re-install once it is gone"
             rc=1
         fi
     fi
