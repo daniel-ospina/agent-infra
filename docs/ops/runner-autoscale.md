@@ -110,7 +110,7 @@ Measured on **pi-cell-1** (Linux, 8 cores, systemd 255) on 2026-10-29:
 | ceiling derivation | `--status`: `by_cores=3 by_memory=9 by_disk=5 bound=cores ceiling=3` from `ncpu=8`, `mem_available_mb=8596` |
 | arm | record written with `ceiling=3`, `reading=ncpu=8 mem_available_mb=8316 ceiling=3` |
 | idempotence | a second `--install` printed `changed=1` only when the artifact was stale, kept the arming record, and left `drift_artifact=no` |
-| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 302 assertions, `PASS=302 FAIL=0`; case-by-case below |
+| hermetic suite | `scripts/install-runner-autoscale-timer.test.sh` — 310 assertions, `PASS=310 FAIL=0`; case-by-case below |
 
 **Not verified here (no macOS host in this lane):** `launchctl bootstrap` on a real Mac, the
 plist's `StartInterval` under `launchd`, and `gui/<uid>` behaviour on a logged-in GUI session. What
@@ -123,7 +123,7 @@ first `--install` to be the real test of that arm.
 ## The self-check, case by case
 
 `scripts/install-runner-autoscale-timer.test.sh` — hermetic (a mktemp fixture root, stub scheduler
-tools, a stub converger), 302 assertions, `PASS=302 FAIL=0`, no network, no real scheduler. What each
+tools, a stub converger), 310 assertions, `PASS=310 FAIL=0`, no network, no real scheduler. What each
 case pins, and why it exists:
 
 | case | what it proves |
@@ -144,7 +144,7 @@ case pins, and why it exists:
 | T13 | a second install of an unchanged tree changes nothing (bring-ups run this repeatedly) |
 | T14 | an unpinned install resolves the repo's OWN converger, not a stub |
 | T15 | `--disarm --dry-run` mutates NOTHING — the record survives and the artifact stays byte-identical (a preview that deletes the audit datum and leaves the pass converging is the one state the design forbids) |
-| T16 | a FAILED armed re-render NEVER leaves an armed artifact with no record: when the disarmed re-render also fails the record is KEPT and the verb says `STILL ARMED` (the one state the design forbids), because that record is the only on-disk statement that the box is converging. The complementary branch — disarmed render succeeds, so the record is removed and the verb says `NOT ARMED` — is not covered by a case: both renders share one template set, so a fixture cannot break one without the other |
+| T16 | a FAILED armed re-render NEVER leaves an armed artifact with no record, and the record survives ONLY when an armed artifact backs it: the `--arm` failure branch asks `artifact_is_armed` — backed, the record is KEPT and the verb says `STILL ARMED` (T42); NOT backed, the record is DROPPED and the verb says `NOT ARMED`, because a record with nothing converging exists only to arm the box on the next routine `--install`. The one branch with no case is *disarmed render succeeds*: both renders share one template set, so a fixture cannot break one without the other |
 | T17 | `%` is refused on the systemd arm (systemd expands it as a specifier at load time, so the rendered path silently differs and every tick 203/EXECs) and allowed on the launchd arm (a plist `<string>` is not expanded) |
 | T6b | a VALID pinned interpreter is used verbatim — refusing a bad pin while quietly ignoring a good one is the same substitution one direction over |
 | T18 | `--status` exits 1 when the artifact's INTERPRETER is gone, reporting `python_present=no` while still reporting `installed=yes` — the two are different questions |
@@ -178,6 +178,7 @@ case pins, and why it exists:
 | T45 | `OnCalendar=` is an elapse point too. `On[A-Za-z]*Sec` contains no `Sec` in `OnCalendar`, `OnClockChange` or `OnTimezoneChange`, so a `…timer.d/*.conf` adding `OnCalendar=hourly` left the base timer byte-identical and was certified a clean 9-minute box by both the readiness verb and the writers — the T39 false PASS, one key over, and the one key the timer template names as a deliberate design property. `Persistent=` stays out (it applies to `OnCalendar=` only, and the false-block control is unaffected) |
 | T46 | a RECOGNISED non-converging action gets its own consequence instead of the "unrecognized arguments" text. The refusal listed five of the pass's nine switches and told the operator every other argument makes every tick exit 2 — false for `--install-unit` (which writes and enables a competing unit pair and exits, converging nothing) and for `--check-units` (which audits and exits 5). The message now names the full vocabulary and gives those actions their real consequence; hunting a failure that never appears is not a diagnosis |
 | T47 | `--arm` NAMES why it cannot resolve a target. It called `choose_target \|\| return 1` bare, so the one verb an operator runs to make a box GROW exited 1 with zero bytes of output — indistinguishable from a crash. Every other call site (install, status, uninstall) already named the missing dependency; the arm now does too |
+| T48 | the XML escaper is a LAUNCHD rule, never a systemd one. `render` put every placeholder through `xml_sed_repl` — the XML-entity escape PLUS the sed-replacement escape — on BOTH arms, and the XML half is correct only where the value lands in an XML text node (the plist). On the systemd arm it wrote the ENTITY into the unit, so `HOME=/home/a&b` rendered `Environment=HOME=/home/a&amp;b`, a path the installer never resolved. Nothing caught it: `refuse_unusable_target` refuses only a backslash, `refuse_systemd_unsafe_values` refuses only whitespace and `%`, and BOTH renders of one value produce the same entity, so the drift `cmp` and `--status` report `drift_artifact=no` while every tick resolves a directory that does not exist. The escape is now chosen per ARM (`repl_for`), which also makes the placeholder family agree with the composed `{{PROVISIONER_ENV}}` family that T31 pins as sed-only on systemd. Both directions are asserted, so the asymmetry cannot collapse: the systemd unit carries the real value, the plist still entity-escapes it (a raw `&` there is malformed XML launchd refuses) and its PARSED value round-trips |
 
 
 The case list lives here, not in the suite's header: the working-tree guard tokenises a script's
