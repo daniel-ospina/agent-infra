@@ -100,9 +100,25 @@ else
 fi
 # ...and the block must still ASK it. A block that grew its own inline liveness test would be a second
 # predicate for one question (the two-predicates-for-two-questions split #2831 exists to keep).
-grep -q 'pr_owner_live "\$PR"' "$TMP/redfix.sh" \
-  && ok "the router still asks the SHIPPED ownership guard (no inline re-implementation of 'who owns this PR')" \
-  || bad "the [redfix] block no longer calls pr_owner_live — its ownership guard was replaced, not driven"
+# ⛔ COMMENTS ARE STRIPPED FIRST, and the matcher is proved to DISCRIMINATE on the spot. A bare
+# `grep -q 'pr_owner_live "$PR"'` over the extracted text is a PROSE test — precisely the failure this
+# file's own header names ("a prose test passes on the sentence and on its absence alike"). Measured
+# 2026-10-30 (#3095 review P1): a block whose guard had been replaced by an inline
+# `pr_owned || sess || claim_live` chain, with `# was pr_owner_live "$PR" "$HEAD_N"` trailing on the
+# same line, SATISFIED that arm and the suite stayed 122/0 — a false PASS on the one invariant the arm
+# exists to hold. It is not cosmetic: under `PL_MOD=1` the inline arm 3 (`claim_live`) treats a pid-less
+# lock as free where the shipped arm 3 (`pl_verdict`) treats it as OWNED, so the un-caught replacement
+# spawns a second worker onto a live claim — the two-lanes-one-branch direction this file exists to red.
+asks_shipped_guard() { sed 's/#.*//' "$1" | grep -qE '(^|[[:space:];])pr_owner_live[[:space:]]+"\$PR"'; }
+printf '%s\n' 'elif x; then :; fi  # was pr_owner_live "$PR" "$HEAD_N" "${BR:-}"' > "$TMP/guard-comment-only.sh"
+if asks_shipped_guard "$TMP/redfix.sh"; then
+  ok "the router still asks the SHIPPED ownership guard (no inline re-implementation of 'who owns this PR')"
+else
+  bad "the [redfix] block no longer calls pr_owner_live — its ownership guard was replaced, not driven"
+fi
+asks_shipped_guard "$TMP/guard-comment-only.sh" \
+  && bad "the 'still asks' arm is a PROSE test — a COMMENT mentioning pr_owner_live \"\$PR\" satisfies it (the #3095 review P1 false PASS)" \
+  || ok "...and that arm is not a prose test: a comment-only mention of pr_owner_live is NOT a call"
 # [railrefusal] is a plain statement block inside a function in merge-one.sh; at FILE scope the
 # function-local `local`s it does not use are fine, but `tail`/`wc` are external on purpose.
 [ -s "$TMP/isnum.sh" ] || { echo "FATAL: is_num/is_limit not found in orch-loop.sh"; exit 1; }
@@ -431,8 +447,13 @@ OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
   claim_live() { return 1; }
   H="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
   # A REAL worker: a live child holding this PR's lock, exactly as `fix-one.sh` does for a whole run.
-  sleep 300 &
+  sleep 60 &
   _pid=$!
+  # ⛔ A LEAKED WORKER IS A SUITE DEFECT, not just untidiness: the suite-level `trap 'rm -rf "$TMP"' EXIT`
+  # removes the fixture but cannot kill this child, so an interrupted run used to leave a `sleep 300`
+  # running well past the suite. Reaped on EVERY exit path of this subshell, and the child is bounded
+  # (60 s) so an interrupt costs at most a minute. #3095 review P2.
+  trap 'kill "$_pid" 2>/dev/null' EXIT
   printf '%s\n' "$_pid" > "$OL/state/mergeclaim-4242.lock"
   if pr_owner_live 4242 "$H" ""; then echo 'LIVE=owned'; else echo 'LIVE=not-owned'; fi
   kill "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null
