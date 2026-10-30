@@ -162,6 +162,26 @@ mkdir -p "$T/lib"
 cp "$SCRIPT_DIR/lib/bounded.sh" "$T/lib/bounded.sh"
 cat >"$T/bin/ps" <<'SHIM'
 #!/usr/bin/env bash
+# ── SEQUENCED MODE (review round 1): the removal-time live re-probe must be able to observe a table
+# that CHANGED since classification — otherwise "re-read the probes" and "re-run the rule over the old
+# snapshot" are indistinguishable, and the re-probe would be an inert gate. Only the full enumeration
+# advances the sequence; any other ps call keeps the static behaviour below.
+case " $* " in
+  *" -o etimes="*) [ -n "${FAKE_ETIMES:-}" ] && { printf '%s\n' "$FAKE_ETIMES"; exit 0; }; exit 1 ;;
+  *" -o etime="*)  [ -n "${FAKE_ETIME:-}" ]  && { printf '%s\n' "$FAKE_ETIME";  exit 0; }; exit 1 ;;
+  *"-axo"*)
+    if [ -n "${FAKE_PS_SEQ_DIR:-}" ]; then
+        N=0; [ -f "$FAKE_PS_SEQ_DIR/.n" ] && N="$(cat "$FAKE_PS_SEQ_DIR/.n")"
+        N=$((N + 1)); printf '%s' "$N" >"$FAKE_PS_SEQ_DIR/.n"
+        # `N.fail` makes THIS reading FAIL, which the lsof shim could already express and this one
+        # could not. A failed re-probe is the removal path's own fail-closed branch (review round 10,
+        # P1/P2), and without a way to produce one on the ps side neither arm could exist.
+        if [ -f "$FAKE_PS_SEQ_DIR/$N.fail" ]; then exit 1; fi
+        if [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
+        last="$(ls "$FAKE_PS_SEQ_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
+        if [ -n "$last" ] && [ -f "$FAKE_PS_SEQ_DIR/$last" ]; then cat "$FAKE_PS_SEQ_DIR/$last"; exit 0; fi
+    fi ;;
+esac
 echo "1 0 /sbin/launchd"
 # The ANCESTOR LINK FOR THE REAPER ITSELF. `self_pid_tree_load` walks `pid -> ppid` through this
 # table starting at the reaper's own pid, so without a row for it SELF_PIDS holds the reaper alone
@@ -184,6 +204,21 @@ exit 0
 SHIM
 cat >"$T/bin/lsof" <<'SHIM'
 #!/usr/bin/env bash
+# ── SEQUENCED MODE (review round 2): the cwd re-read at removal time must be able to FAIL after a good
+# pass-start read — that is the case where the witness set silently weakens and the removal would go
+# ahead on argv-only evidence. Only the cwd probe advances this sequence.
+case " $* " in
+  *"-d cwd"*)
+    if [ -n "${FAKE_LSOF_SEQ_DIR:-}" ]; then
+        N=0; [ -f "$FAKE_LSOF_SEQ_DIR/.n" ] && N="$(cat "$FAKE_LSOF_SEQ_DIR/.n")"
+        N=$((N + 1)); printf '%s' "$N" >"$FAKE_LSOF_SEQ_DIR/.n"
+        if [ -f "$FAKE_LSOF_SEQ_DIR/$N.fail" ]; then exit 1; fi
+        if [ -f "$FAKE_LSOF_SEQ_DIR/$N" ]; then cat "$FAKE_LSOF_SEQ_DIR/$N"; exit 0; fi
+        last="$(ls "$FAKE_LSOF_SEQ_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
+        if [ -n "$last" ] && [ -f "$FAKE_LSOF_SEQ_DIR/$last" ]; then cat "$FAKE_LSOF_SEQ_DIR/$last"; exit 0; fi
+        exit 1
+    fi ;;
+esac
 printf 'p9999\nn/usr/local\n'
 if [ -n "${FAKE_LSOF_CWD:-}" ]; then
     printf 'p%s\nn%s\n' "${FAKE_LSOF_CWD_PID:-4243}" "$FAKE_LSOF_CWD"
@@ -1746,7 +1781,7 @@ rm -f "$T/$ENV/cnt-a"
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATE/.env" \
     FAKE_LATE_COUNTER="$T/$ENV/cnt-a" FAKE_LATE_ON=1 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A21a a late ignored file is a PRESERVE (exit 0, never exit 4)"
-assert_contains "$OUT" "PRESERVED — removal-time clean re-check not clean (ignored-artifact)" \
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (ignored-artifact)" \
     "A21a the late change is surfaced on stdout with the re-check's actual verdict"
 assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21a the footer counts the late preserve"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A21a nothing was removed"
@@ -1795,7 +1830,7 @@ OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-slow-nth-status" FAKE_STATUS_COUNTER="$T/$EN
     FAKE_SLOW_STATUS_ON=2 FAKE_STATUS_SLEEP=3 REAP_WT_STATUS_TIMEOUT=1 \
     run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A21d a timing-out removal-time re-check is a PRESERVE, not a failure"
-assert_contains "$OUT" "removal-time clean re-check not clean (status-timeout)" \
+assert_contains "$OUT" "removal-time re-check kept it (status-timeout)" \
     "A21d the banner names status-timeout"
 assert_absent "$OUT" "the checkout changed" \
     "A21d an unevaluable probe is NOT reported as a checkout change"
@@ -2930,6 +2965,277 @@ for m in re.finditer(r"<!--.*?-->", s, re.S):
 else
     bad "P2 python3 is unavailable: the launchd template parse check could not run (an unrun check is not a green one)"
 fi
+# ── G2721g: THE HOLDER RULE IS ASKED AGAIN AT REMOVAL TIME (review round 1) ───────────────────
+# `remove_one` re-reads the probe tables and re-applies the SAME rule before the first delete, because
+# a shell demoted as idle can pick up a child (i.e. start working) while the pass is still running.
+# Without the re-read the check would be inert — PS_OUT/CWD_OUT are one snapshot, so re-running the
+# rule over them can never observe a change — and the log would claim a check that never happened.
+# The sequenced ps shim is what makes the two readings differ: #1 has no holder (classified
+# `reclaimable`), #2 shows a live `python3` whose argv holds the checkout (a lane that came back).
+ENV=G2721g; REPO="$(mk_repo $ENV)"
+WT_TOU="$(add_named_wt "$REPO" "$ENV-tou" feat/g2721g-tou)"
+mkdir -p "$WT_TOU/.venv"; printf 'x\n' >"$WT_TOU/.venv/marker"
+mkdir -p "$T/seq-g7"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g7/1"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n9401 1 /usr/bin/python3 %s/.venv/bin/python\n' \
+    "${REAP_WT_SELF_PID:-1}" "$(cd "$WT_TOU" && pwd -P)" >"$T/seq-g7/2"
+rm -f "$T/seq-g7/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g7" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (live-refound)" \
+    "G2721g a holder that is live AGAIN at removal time STOPS the delete"
+assert_dir "$WT_TOU" "G2721g …the checkout survives, with the live lane still in it"
+assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "live AGAIN (live-process" \
+    "G2721g …and the log names the holder that was re-found, not just a code"
+# The NEGATIVE control: the same fixture with no holder at either reading still removes — otherwise the
+# arm above would pass on a reaper that simply never deletes anything.
+WFINAL="$(add_named_wt "$REPO" "$ENV-clean" feat/g2721g-clean)"
+mkdir -p "$WFINAL/.venv"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g7-gone" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_nodir "$WFINAL" "G2721g …and a checkout with no holder at either reading is still removed (the control)"
+
+# ── G2721h: a cwd re-read that FAILS after a good pass-start read PRESERVES (review round 2, P1) ──
+# `cwd_probe_load` always returns 0 and always reassigns the table, so a failed re-read used to leave
+# the removal running on ARGV-ONLY evidence and to clobber the pass's good table for every later row.
+# A lane's own `pi` has cwd = the worktree and argv = the installed path, so cwd is its ONLY witness:
+# proceeding deletes a live lane's checkout. The pass-start lsof here SUCCEEDS (a table that simply
+# does not match), the re-read FAILS, and the checkout must survive; the pre-fix tree removes it.
+ENV=G2721h; REPO="$(mk_repo $ENV)"
+WT_CWDF="$(add_named_wt "$REPO" "$ENV-fail" feat/g2721h-fail)"
+mkdir -p "$WT_CWDF/.venv"; printf 'x\n' >"$WT_CWDF/.venv/marker"
+mkdir -p "$T/seq-g8"
+printf 'p9999\nn/usr/local\n' >"$T/seq-g8/1"
+: >"$T/seq-g8/2.fail"
+OUT="$(FAKE_LSOF_SEQ_DIR="$T/seq-g8" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (live-probe-unavailable)" \
+    "G2721h a cwd re-read that degrades after a good pass-start read STOPS the delete"
+assert_dir "$WT_CWDF" "G2721h …the checkout survives (it would have gone on argv-only evidence)"
+assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "cwd re-probe degraded" \
+    "G2721h …and the log says WHICH probe was lost, so the weakened witness set is visible"
+
+# ── G2721i: the holder rule is asked as the LAST step before the fork (review round 3, P2) ──
+# The first fix ran the re-probe FIRST, then two `git status` calls and the ephemeral deletions (up to
+# REAP_WT_REMOVE_TIMEOUT each) before `git worktree remove` — while the comment called it "right before
+# the delete". That tail is the largest part of the window by this file's own reasoning for re-check #2.
+# Reading #1 is the classification, #2 the early check, #3 the late one: the holder appears ONLY on the
+# third, so a tree that stopped at the early check removes a checkout that came back to life.
+ENV=G2721i; REPO="$(mk_repo $ENV)"
+WT_TAIL="$(add_named_wt "$REPO" "$ENV-tail" feat/g2721i-tail)"
+mkdir -p "$WT_TAIL/.venv"; printf 'x\n' >"$WT_TAIL/.venv/marker"
+mkdir -p "$T/seq-g9"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g9/1"
+cp "$T/seq-g9/1" "$T/seq-g9/2"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n9402 1 /usr/bin/python3 %s/.venv/bin/python\n' \
+    "${REAP_WT_SELF_PID:-1}" "$(cd "$WT_TAIL" && pwd -P)" >"$T/seq-g9/3"
+: >"$T/seq-g9/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g9" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (live-refound)" \
+    "G2721i a holder that appears in the TAIL window (after the early check) STOPS the delete"
+assert_dir "$WT_TAIL" "G2721i …the checkout survives"
+
+# ── G2721j: the re-probe must not LEAK its process table into the volume being reclaimed ──────
+# `ps_load` mints a fresh table per call and the EXIT trap removes only the CURRENT one, so each
+# re-check leaked a `pi-reap-ps.*` file into /tmp — measured 19 in one suite run. On a cell where /tmp
+# is the volume the reaper exists to reclaim, that is the reaper feeding its own problem.
+ENV=G2721j; REPO="$(mk_repo $ENV)"
+WT_LEAK="$(add_named_wt "$REPO" "$ENV-leak" feat/g2721j-leak)"
+mkdir -p "$WT_LEAK/.venv"
+mkdir -p "$T/leaktmp"
+OUT="$(TMPDIR="$T/leaktmp" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_nodir "$WT_LEAK" "G2721j (fixture) the checkout was removed, so the removal path really ran"
+left="$(ls "$T/leaktmp" 2>/dev/null | grep -cE '^pi-reap-(ps|cwd)\.' || true)"
+assert_eq "$left" "0" "G2721j no probe table is left behind in TMPDIR (leaked: ${left})"
+# AND THE HOLDER SCAN WAS NOT TRUNCATED (review round 3). `holders_live`'s cap must exceed the number of
+# DISTINCT holders any probe can report, so it counts EVERY table plus 4; a cap that counts only the cwd
+# table collapses on a host whose cwd probe is degraded and then reads "no holder" for a worktree that
+# has one - the silent-destruction class. The pass log is the only observable (a truncated scan prints a
+# live verdict for the boundary holder, byte-identical to reaching it), so its ABSENCE is the claim.
+if grep -q 'STALE-SHELL-SCAN TRUNCATED' "$T/$ENV/reap.log" 2>/dev/null; then
+    bad "but the holder scan WAS truncated (reap.log names it) - the cap cut the witness list short"
+else
+    ok "and the holder scan was not truncated, so the cap cannot hide a holder behind a lucky verdict"
+fi
+
+# ── G2721k: the cap counts EVERY table, so a five-holder checkout is not read as UNHELD ─────────
+# The worktree reaper's cap must exceed the number of DISTINCT holders any probe can report. Counting
+# only the cwd table collapses on a host whose cwd probe is degraded (or whose holders live in argv),
+# and a scan cut short at the boundary returns "no live holder" — the silent-destruction class. Four
+# idle shells (demoted) and a working `python3` (never demotable) put the verdict on the FIFTH row, so
+# the arm is only green when the scan reaches it. Reverting the cap to a cwd-only count prints the
+# `STALE-SHELL-SCAN TRUNCATED` line, which is what the assertion after it reads.
+ENV=G2721k; REPO="$(mk_repo $ENV)"
+WT_FIVE="$(add_named_wt "$REPO" "$ENV-five" feat/g2721k-five)"
+mkdir -p "$WT_FIVE/.venv"; printf 'x\n' >"$WT_FIVE/.venv/marker"
+# HEAD AFTER the holders sit down: the rule reads the COMMIT's own time, so the fixture stamps it ahead
+# by a stated margin rather than lie about a process start (only the kernel sets that).
+commit_in_wt "$WT_FIVE" "@$(( $(date +%s) + 600 ))" five
+FIVE_CANON="$(cd "$WT_FIVE" && pwd -P)"
+mkdir -p "$T/seq-gk"
+{
+    printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}"
+    # EIGHT idle shells, not four: the default cwd shim contributes two rows of its own, so the
+    # malformed cap (cwd rows + 4 = 6) only truncates a scan with MORE than six holders. The point of
+    # the arm is that a cut-short scan must be observable, so the fixture has to out-run the bad cap.
+    i=0
+    while [ "$i" -lt 8 ]; do
+        i=$((i + 1)); printf '%s 1 /bin/bash -c cd %s idle-%s\n' "$((6000 + i))" "$FIVE_CANON" "$i"
+    done
+    printf '6100 1 /usr/bin/python3 %s/.venv/bin/python\n' "$FIVE_CANON"
+} >"$T/seq-gk/1"
+: >"$T/seq-gk/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gk" FAKE_ETIMES=600 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_FIVE")" "reason=live" \
+    "G2721k the scan reaches the FIFTH holder (argv) and keeps the checkout"
+if grep -q 'STALE-SHELL-SCAN TRUNCATED' "$T/$ENV/reap.log" 2>/dev/null; then
+    bad "G2721k but the holder scan WAS truncated - the cap cut the witness list short"
+else
+    ok "G2721k and it was not truncated: the cap counts every table, not just the cwd one"
+fi
+
+# ── G2721l: a ZERO-PADDED `ps -o etime` parses as DECIMAL, so the BSD fallback can demote at all ─
+# `ps -o etime` prints zero-padded fields (`1:08:30`) and bash rejects `08` as a bad OCTAL constant: the
+# expansion ABORTS, the start time comes back EMPTY, and the holder stays LIVE for ever — an inert
+# rule, silently, on every host that reaches this fallback (macOS is the primary one). No arm reached
+# this branch before this one (`FAKE_ETIMES` takes the `etimes` path, which has no zero padding), so
+# reverting `10#` left all 329 assertions green. The HOURS component is what makes it discriminating:
+# HEAD is 1,000s in the past and elapsed is 1:08:30, so a parse that DROPS the hours reads the shell as
+# YOUNGER than HEAD and keeps it. HERMETIC by `REAP_WT_PROC_ROOT`: a real `/proc` read would take
+# precedence and decide the arm on whatever process owns the fixture pid on the machine running it.
+echo ""
+echo "── G2721l: the zero-padded \`etime\` fallback (hermetic, no /proc) ─────────────────────"
+ENV=G2721l; REPO="$(mk_repo $ENV)"
+WT_ETIME="$(add_named_wt "$REPO" "$ENV-etime" feat/g2721l-etime)"
+mkdir -p "$WT_ETIME/.venv"; printf 'x\n' >"$WT_ETIME/.venv/marker"
+# HEAD 1,000s in the PAST, and "now" after it by more than the 7-day floor: the shell (start = now-4110)
+# predates HEAD, so the schedule gate (REAP_WT_AGED_DAYS_OVERRIDE=0) would allow removal and the HOLDER
+# rule is the only thing under test.
+# `now` is the REAL clock here: the suite's fixed fixture date would put HEAD 39 days in the FUTURE,
+# and a start-before-HEAD comparison against a future HEAD can never hold. Only the AGE floor is
+# overridden, so the schedule gate allows the removal and the HOLDER rule is the only thing under test.
+# ⛔ AND RULE 7 IS PINNED OFF TOO (`REAP_WT_TREE_TS` + `MIN_AGE=0`), because main's #2721 second
+# witness landed under this fixture: `path_ctime` of a checkout the fixture created SECONDS ago wins
+# over the HEAD-commit witness, so the demotion succeeded and the row came back `too-young
+# (witness=worktree-ctime)` — the arm then read as a HOLDER failure when the holder rule had actually
+# demoted. Same fixture discipline main's own arms use (`REAP_WT_TREE_TS=1 MIN_AGE=0`), stated here
+# rather than copied silently: a witness the fixture does not control can make any arm pass for the
+# wrong reason.
+RNOW="$(date +%s)"
+ETIME_TS=$(( RNOW - 1000 ))
+commit_in_wt "$WT_ETIME" "@$ETIME_TS" etime
+ETIME_CANON="$(cd "$WT_ETIME" && pwd -P)"
+mkdir -p "$T/seq-gl"
+{ printf '1 0 /sbin/launchd\n'; printf '65000 1 /bin/bash -c cd %s idle\n' "$ETIME_CANON"; } >"$T/seq-gl/1"
+# CONTROL FIRST: with `ps` unable to report a start time at all, the holder is UNPROVABLE and must stay
+# LIVE. Without this arm a gate that demoted every shell would pass the assertion below.
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gl" REAP_WT_PROC_ROOT="$T/no-proc" FAKE_ETIMES= REAP_ETIME=\
+    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    REAP_WT_TREE_TS="$ETIME_TS" REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_ETIME")" "reason=live" \
+    "G2721l a holder whose start time cannot be read at all stays LIVE (unprovable is not stale)"
+# ...and with `1:08:30`, the pre-fix parse ABORTS (bash: 08: value too great for base) and prints the
+# SAME live verdict — the mutation is invisible above. `10#` is what makes the demotion possible.
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gl" REAP_WT_PROC_ROOT="$T/no-proc" FAKE_ETIME='1:08:30' \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    REAP_WT_TREE_TS="$ETIME_TS" REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_ETIME")" "reason=reclaimable" \
+    "G2721l ...and a 1:08:30 idle shell that predates HEAD is DEMOTED (the hours component is parsed)"
+assert_contains "$(row_for "$OUT" "$WT_ETIME")" "unref=stale-shell: pid=65000(argv)" \
+    "G2721l ...and the row names the demoted pid, so the fallback is provably the path taken"
+
+# ── G2721m: a TRUNCATED holder scan keeps the checkout (never "no live holder") ─────────────
+# The cap is a runaway guard whose exhaustion branch is unreachable in a healthy pass (the default
+# exceeds any holder count, and each iteration consumes a distinct pid), so its POLARITY had no arm:
+# reverting `HL_VERDICT=...; return 0` to `return 1` kept all 332 assertions green while a truncated scan
+# would read as "every holder was demoted" — and `remove_one` would then delete the checkout out from
+# under a live lane (review round 8, P2). `REAP_WT_SCAN_CAP` (a test seam; production never sets it)
+# makes it reachable: three demotable idle shells and a cap of two.
+echo ""
+echo "── G2721m: the cap-exhaustion backstop (truncated => LIVE) ────────────────────"
+ENV=G2721m; REPO="$(mk_repo $ENV)"
+WT_CAP="$(add_named_wt "$REPO" "$ENV-caps" feat/g2721m-caps)"
+mkdir -p "$WT_CAP/.venv"; printf 'x\n' >"$WT_CAP/.venv/marker"
+CAP_TS=$(( $(date +%s) - 1000 ))
+commit_in_wt "$WT_CAP" "@$CAP_TS" caps
+CAP_CANON="$(cd "$WT_CAP" && pwd -P)"
+mkdir -p "$T/seq-gm"
+{
+  printf '1 0 /sbin/launchd\n'
+  i=0
+  while [ "$i" -lt 3 ]; do
+    i=$((i + 1)); printf '%s 1 /bin/bash -c cd %s idle-%s\n' "$((63000 + i))" "$CAP_CANON" "$i"
+  done
+} >"$T/seq-gm/1"
+RNOW_CAP="$(date +%s)"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gm" FAKE_ETIME='10:00:00' REAP_WT_PROC_ROOT="$T/no-proc" \
+    REAP_WT_SCAN_CAP=2 REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW_CAP" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_CAP")" "reason=live" \
+    "G2721m a TRUNCATED holder scan PRESERVES the checkout (it is never read as unheld)"
+assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "STALE-SHELL-SCAN TRUNCATED" \
+    "G2721m ...and the pass names the truncation, so the preservation is explainable"
+
+# ── G2721n: a FAILED ps re-probe must not weaken the pass's witness set (review round 10, P1) ──
+# `ps_load` reassigns `PS_OUT` BEFORE it can fail, so the pre-fix `holder_recheck` returned with
+# `PS_OUT` pointing at a NEW EMPTY table: the pass's good table was orphaned (leaked), and EVERY
+# LATER row of the pass was then classified against an empty one. `live_process_for` begins
+# `[ -s "$PS_OUT" ] || return 1`, so "empty" reads as "no argv holder" — the state `ps_load`'s own
+# header names a probe FAILURE and never "no live processes". Reading #1 carries a live argv holder
+# for the SECOND worktree; #2 (the FIRST worktree's re-probe) FAILS. The first checkout must be
+# preserved either way (that half already worked and is the control), and the SECOND must still come
+# back `reason=live` — pre-fix it reads `reclaimable`, because the table it needed was thrown away.
+ENV=G2721n; REPO="$(mk_repo $ENV)"
+WT_PF_FIRST="$(add_named_wt "$REPO" "$ENV-first" feat/g2721n-first)"
+WT_PF_LATER="$(add_named_wt "$REPO" "$ENV-later" feat/g2721n-later)"
+for w in "$WT_PF_FIRST" "$WT_PF_LATER"; do mkdir -p "$w/.venv"; printf 'x\n' >"$w/.venv/marker"; done
+mkdir -p "$T/seq-gn" "$T/seq-gn-tmp"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n9601 1 /usr/bin/python3 %s/.venv/bin/python\n' \
+    "${REAP_WT_SELF_PID:-1}" "$(cd "$WT_PF_LATER" && pwd -P)" >"$T/seq-gn/1"
+: >"$T/seq-gn/2.fail"
+rm -f "$T/seq-gn/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gn" TMPDIR="$T/seq-gn-tmp" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_dir "$WT_PF_FIRST" "G2721n (control) a re-probe that cannot read the process table PRESERVES its checkout"
+assert_contains "$OUT" "(live-probe-unavailable)" \
+    "G2721n …and names the lost probe, so the preservation is explainable"
+assert_contains "$(row_for "$OUT" "$WT_PF_LATER")" "reason=live" \
+    "G2721n …and the pass's own table is RESTORED, so the NEXT row still sees its argv holder"
+left="$(ls "$T/seq-gn-tmp" 2>/dev/null | grep -cE '^pi-reap-ps\.' || true)"
+assert_eq "$left" "0" "G2721n …and the abandoned table is not leaked into the volume (leaked: ${left})"
+
+# ── G2721o: a degraded cwd RE-READ still preserves, even after an earlier read SUCCEEDED ──────
+# `CWD_DEGRADED` was a LATCH: set by any failure, cleared NOWHERE. So `holder_recheck`'s "the pass HAD
+# a good cwd table and the re-read lost it" guard keyed on the flag's LIFETIME, not on the table in
+# hand — and after one transient failure it could never fire again. Reachable ordering, no execution
+# needed: (1) the pass-start `lsof` times out ⇒ flag=1; (2) the FIRST removal's re-read SUCCEEDS ⇒
+# the table is good but the flag stays 1, so its guard is skipped (correct, by luck); (3) the SECOND
+# removal's re-read FAILS ⇒ the guard is skipped because the flag is still 1, `holders_live` runs
+# ARGV-ONLY, and the checkout is deleted on a witness set the pass no longer has. That is verbatim the
+# round-2 P1 this file claims closed, in a second ordering. A lane's own `pi` has cwd = the worktree
+# and argv = the INSTALLED path, so cwd is that holder's ONLY witness.
+ENV=G2721o; REPO="$(mk_repo $ENV)"
+WT_LAT_OK="$(add_named_wt "$REPO" "$ENV-ok" feat/g2721o-ok)"
+WT_LAT_TRAP="$(add_named_wt "$REPO" "$ENV-trap" feat/g2721o-trap)"
+for w in "$WT_LAT_OK" "$WT_LAT_TRAP"; do mkdir -p "$w/.venv"; printf 'x\n' >"$w/.venv/marker"; done
+mkdir -p "$T/seq-go"
+: >"$T/seq-go/1.fail"                              # pass start: lsof times out → flag=1, empty table
+printf 'p9999\nn/usr/local\n' >"$T/seq-go/2"      # first removal's re-read SUCCEEDS → flag must clear
+cp "$T/seq-go/2" "$T/seq-go/3"                    # …and again immediately before its fork
+: >"$T/seq-go/4.fail"                              # second removal's re-read FAILS
+rm -f "$T/seq-go/.n"
+OUT="$(FAKE_LSOF_SEQ_DIR="$T/seq-go" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_nodir "$WT_LAT_OK" \
+    "G2721o (control) a GOOD re-read after a degraded pass start proceeds — the guard is not a blanket refusal"
+assert_dir "$WT_LAT_TRAP" \
+    "G2721o …but a LATER failed re-read still PRESERVES: one transient failure must not disarm the guard"
+assert_contains "$OUT" "(live-probe-unavailable)" \
+    "G2721o …and names the probe it lost, so the preservation is explainable"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

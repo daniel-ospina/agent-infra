@@ -328,6 +328,9 @@
 #   REAP_WT_BUDGET_SECONDS REAP_WT_ROTATE REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
 #   REAP_WT_MAIN_PROOF (auto|local) REAP_WT_MAIN_PUSH_URL
+#   REAP_WT_PROC_ROOT
+#   REAP_WT_SCAN_CAP (test seam: pins the runaway-guard exhaustion branch, which is unreachable with
+#   the derived cap)
 # Exit codes: 0 pass completed with nothing failed, 2 usage, 3 fail-closed
 # abort (nothing trusted), 4 pass completed but >=1 removal FAILED.
 # (`remove_one`'s internal 2 — "the checkout changed since classification, it
@@ -341,6 +344,9 @@ ISSUE_REF="#1095"
 GIT_BIN="${GIT_BIN:-git}"
 GH_BIN="${GH_BIN:-gh}"
 PS_BIN="${PS_BIN:-/bin/ps}"
+# REAP_WT_PROC_ROOT — where the process table lives (`/proc`). A seam for the suites, and for an
+# exotic host that mounts proc elsewhere; it is read by `proc_start_epoch` ONLY.
+REAP_WT_PROC_ROOT="${REAP_WT_PROC_ROOT:-/proc}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
 # Only the ephemeral pre-delete in remove_one uses this; the script's own
 # scratch/log cleanup keeps the real `rm` (it must not be defeated by a seam).
@@ -1005,6 +1011,18 @@ live_process_for() { # <canon> <recorded> [<exclude-pids>] -> matching pid ("" w
 # walk, which would be unbounded). Best-effort by design: a missing or slow
 # lsof sets CWD_DEGRADED and the pass falls back to the argv probe — reported in
 # the footer and the log, never a silent pass.
+#
+# ⛔ CWD_DEGRADED DESCRIBES THE TABLE THAT IS IN `CWD_OUT` NOW, NOT THE PASS'S HISTORY (review
+# round 10, P2). It was a LATCH: set to 1 by any failure and cleared NOWHERE, so `holder_recheck`'s
+# "the pass HAD a good cwd table and the re-read lost it" guard read the flag's lifetime instead of
+# the current table. Reachable ordering with no execution: (a) the pass-start `lsof` times out ⇒
+# flag=1; (b) worktree A's re-read SUCCEEDS ⇒ the table in hand is good but the flag stays 1, so the
+# guard is skipped — correct by luck; (c) worktree B's re-read FAILS ⇒ the guard is skipped because
+# the flag is still 1, `holders_live` runs argv-only, and a checkout whose only witness is its cwd is
+# deleted under a live lane — verbatim the round-2 P1 this file claims is closed, in a second
+# ordering. Clearing on a successful NON-EMPTY read fixes it and leaves the no-lsof host unchanged:
+# that host degrades on EVERY call, so it keeps the documented argv-only behaviour. The footer then
+# finally reports the state of the table it names.
 cwd_probe_load() {
     CWD_OUT="$(mktemp "${TMPDIR:-/tmp}/pi-reap-cwd.XXXXXX")" || { CWD_OUT=""; CWD_DEGRADED=1; return 0; }
     if ! command -v "$LSOF_BIN" >/dev/null 2>&1; then
@@ -1013,6 +1031,8 @@ cwd_probe_load() {
     run_bounded "$REAP_WT_CWD_TIMEOUT" "$CWD_OUT" "$LSOF_BIN" -a -d cwd -Fpn
     if [ $? != 0 ] || [ ! -s "$CWD_OUT" ]; then
         CWD_DEGRADED=1; log "CWD probe degraded: lsof failed/empty — argv-only live-reference check"
+    else
+        CWD_DEGRADED=0
     fi
     return 0
 }
@@ -1080,8 +1100,12 @@ IDLE_SHELL="${REAP_WT_IDLE_SHELL:-1}"
 proc_start_epoch() {
     local pid="${1:-}" v e f1 f2 f3 rest
     is_pos_int "$pid" || return 1
-    if [ -r "/proc/$pid" ]; then
-        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+    # ⛐ THE ROOT IS `$REAP_WT_PROC_ROOT`, NOT A LITERAL `/proc` (review round 5, P2): the same seam
+    # `REAP_VENV_PROC_ROOT` gives the venv reaper, for the same reason — pinning this read to `/proc`
+    # makes the fallback untestable on a Linux host (a live fixture pid takes THIS branch, so an arm for
+    # the `10#` parse decides on whatever process owns that pid). Default `/proc`: production unchanged.
+    if [ -r "$REAP_WT_PROC_ROOT/$pid" ]; then
+        v="$(stat -c '%Y' "$REAP_WT_PROC_ROOT/$pid" 2>/dev/null)"
         case "$v" in ''|*[!0-9]*) v="" ;; esac
         [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
     fi
@@ -1091,15 +1115,21 @@ proc_start_epoch() {
     e="$("$PS_BIN" -o etime= -p "$pid" 2>/dev/null | tr -d ' \t')"
     [ -n "$e" ] || return 1
     case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
+    # ⛔ EVERY FIELD IS FORCED TO BASE 10 (review round 1, P2): `ps -o etime` prints zero-padded
+    # components, so an ordinary `1:08:30` reaches the arithmetic as `08` and bash rejects it as a bad
+    # OCTAL constant and the expansion ABORTED: `proc_start_epoch` returned NOTHING, the rule could not
+    # prove the holder predated HEAD, and the holder stayed LIVE — an INERT enforcer, never a false
+    # reap, on every host that reaches this fallback (on macOS it is the PRIMARY path). `10#` makes the
+    # parse literal decimal.
     v=0
-    case "$e" in *-*) v=$(( ${e%%-*} * 86400 )); e="${e#*-}" ;; esac
+    case "$e" in *-*) v=$(( 10#${e%%-*} * 86400 )); e="${e#*-}" ;; esac
     case "$e" in
         *:*:*) f1="${e%%:*}"; rest="${e#*:}"; f2="${rest%%:*}"; f3="${rest#*:}" ;;
         *:*)   f1=0; f2="${e%%:*}"; f3="${e#*:}" ;;
         *)     f1=0; f2=0; f3="$e" ;;
     esac
     is_pos_int "$f1" && is_pos_int "$f2" && is_pos_int "$f3" || return 1
-    printf '%s\n' "$(( $(now_epoch) - (v + f1 * 3600 + f2 * 60 + f3) ))"
+    printf '%s\n' "$(( $(now_epoch) - (v + 10#$f1 * 3600 + 10#$f2 * 60 + 10#$f3) ))"
 }
 
 # is_shell_pid <pid> — the process's COMMAND WORD is a shell (its argv[0], from the ps table).
@@ -1730,6 +1760,66 @@ abstain_gate() {
 # Emits one row: "<verdict>\t<reason>\t<ephemeral>\t<detail>" (ephemeral is
 # third so the free-text detail, which may embed a path containing a tab, is
 # absorbed by cut -f4-).
+# holders_live <canon> <recorded-path> <sha> -> 0 when a holder that is NOT a demoted idle shell
+# exists (HL_VERDICT/HL_DETAIL name it), 1 when every holder was demoted (HL_STALE lists them) or
+# there was none.
+#
+# ⛔ EVERY HOLDER IS EXAMINED, NOT JUST THE FIRST (agent-infra#2721): a worktree routinely holds an
+# idle shell left over from an earlier lane AND a live lane's own process, so taking the first hit
+# decides the whole checkout from whichever pid the probe happened to list first (reproduced while
+# writing this: one stale shell masked a busy lane's shell). The scan carries a per-record EXCLUDE
+# LIST rather than rewriting the probe output, so one verdict cannot change the evidence the next
+# one sees, and the cap makes a probe that keeps returning the same pid terminate instead of spin.
+holders_live() {
+    local canon="$1" recorded="$2" sha="$3" pid seen="" n=0 cap
+    HL_VERDICT=""; HL_DETAIL=""; HL_STALE=""; HL_PROOF=""
+    cap=$(( $(wc -l <"${PS_OUT:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${CWD_OUT:-/dev/null}" 2>/dev/null || echo 0) + 4 ))
+    [ "$cap" -ge 4 ] || cap=4
+    # ⛐ THE CAP HAS A TEST SEAM (`REAP_WT_SCAN_CAP`) for the same reason as its venv twin: the default
+    # exceeds any reachable holder count, so the exhaustion branch is unreachable in a healthy pass and
+    # its POLARITY (`truncated => LIVE`, never "no holder") was unpinned — reverting it kept the suite
+    # green while a truncated scan would read as unheld and the checkout deleted (review round 8, P2).
+    if is_pos_int "${REAP_WT_SCAN_CAP:-}" && [ "${REAP_WT_SCAN_CAP}" -ge 1 ]; then cap="$REAP_WT_SCAN_CAP"; fi
+    while pid="$(live_process_for "$canon" "$recorded" "$seen")"; do
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            # ⛔ FAIL CLOSED ON EXHAUSTION (review round 3, P2): `break` fell through to `return 1`,
+            # which BOTH callers read as "every holder was demoted, or there was none" — so a holder
+            # the scan could not reach was reported as no holder and its checkout deleted. The
+            # sibling venv reaper has always treated this as LIVE; same rule, same polarity here.
+            log "STALE-SHELL-SCAN TRUNCATED at $cap holders — treating pid $pid as LIVE (fail-closed); report it"
+            HL_VERDICT="live-process"; HL_DETAIL="$pid"
+            HL_PROOF="proof=ps-argv:pid=$pid holds the path"; return 0
+        fi
+        seen="$seen $pid"
+        if stale_shell_for "$pid" "$sha"; then
+            HL_STALE="$HL_STALE pid=$pid(argv)"
+            log "STALE-SHELL pid=$pid (argv) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
+        HL_VERDICT="live-process"; HL_DETAIL="$pid"
+        HL_PROOF="proof=ps-argv:pid=$pid holds the path"; return 0
+    done
+    seen=""; n=0
+    while pid="$(live_cwd_for "$canon" "$recorded" "$seen")"; do
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            log "STALE-SHELL-SCAN TRUNCATED at $cap holders — treating pid $pid as LIVE (fail-closed); report it"
+            HL_VERDICT="live-cwd"; HL_DETAIL="$pid"
+            HL_PROOF="proof=lsof-cwd-prefix:pid=$pid has cwd inside the path"; return 0
+        fi
+        seen="$seen $pid"
+        if stale_shell_for "$pid" "$sha"; then
+            HL_STALE="$HL_STALE pid=$pid(cwd)"
+            log "STALE-SHELL pid=$pid (cwd) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
+        HL_VERDICT="live-cwd"; HL_DETAIL="$pid"
+        HL_PROOF="proof=lsof-cwd-prefix:pid=$pid has cwd inside the path"; return 0
+    done
+    return 1
+}
+
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf proof_txt=""
@@ -1794,30 +1884,19 @@ classify_one() {
     # (reproduced while writing this: one stale shell masked a busy lane's shell, and the rule then
     # demoted the wrong way). A holder that IS an idle shell predating HEAD is NAMED in the log and
     # the scan moves to the next one; the other gates (clean/reachable/open-pr/age) still decide.
-    local _stale="" _seen=""
-    while detail="$(live_process_for "$canon" "$path" "$_seen")"; do
-        _seen="$_seen $detail"
-        if stale_shell_for "$detail" "$sha"; then
-            _stale="$_stale pid=$detail(argv)"
-            log "STALE-SHELL pid=$detail (argv) — an idle shell predating HEAD is not a live lane (#2721)"
-            continue
-        fi
-        printf 'preserve\tlive-process\t\trule=1 proof=ps-argv:pid=%s holds the path\n' "$detail"; return 0
-    done
-    _seen=""
-    while detail="$(live_cwd_for "$canon" "$path" "$_seen")"; do
-        _seen="$_seen $detail"
-        if stale_shell_for "$detail" "$sha"; then
-            _stale="$_stale pid=$detail(cwd)"
-            log "STALE-SHELL pid=$detail (cwd) — an idle shell predating HEAD is not a live lane (#2721)"
-            continue
-        fi
-        printf 'preserve\tlive-cwd\t\trule=1 proof=lsof-cwd-prefix:pid=%s has cwd inside the path\n' "$detail"; return 0
-    done
+    # ⛔ THE SAME EVIDENCE IS CONSULTED AT REMOVAL TIME (review round 1, P3). `classify_one` decides
+    # from holders that existed minutes ago on a big box, so a demoted shell that got a child in the
+    # meantime — i.e. started working again — must be able to STOP the removal, not just have been
+    # right once. `holders_live` is shared by both call sites for exactly that reason.
+    # The row keeps main's `rule=1 proof=…` convention: `holders_live` names the evidence it returned
+    # (ps-argv or lsof-cwd-prefix), so a reader can tell which probe convicted the holder.
     # A demoted holder is carried into the row, so a reader can see WHY a checkout that looked live
     # was reclaimed — and can tell a genuine idle-shell demotion from a lane that was still working.
     local stale_txt=""
-    [ -n "$_stale" ] && stale_txt="stale-shell:$_stale"
+    if holders_live "$canon" "$path" "$sha"; then
+        printf 'preserve\t%s\t\trule=1 %s\n' "$HL_VERDICT" "$HL_PROOF"; return 0
+    fi
+    [ -n "$HL_STALE" ] && stale_txt="stale-shell:$HL_STALE"
 
     crumb="$(clean_gate "$path")"
     cverdict="${crumb%%$'\t'*}"
@@ -2092,7 +2171,70 @@ classify_one() {
 }
 
 # ── removal ────────────────────────────────────────────────────────────
-# remove_one <path>
+# holder_recheck <path> -> 0 when the deletion may proceed, 2 when it must be preserved.
+# Re-reads the ps and cwd tables (the pass's are ONE snapshot — re-running the rule over them could
+# never observe a change, so it would be an inert gate claiming a check it never ran) and re-applies
+# `holders_live`. Sets REMOVE_SKIP_VERDICT and logs on every preserve path.
+holder_recheck() {
+    local path="$1" rcanon ps_prev cwd_prev cwd_prev_degraded
+    rcanon="$(canonicalize "$path")"
+    # ⛔ AND THE PREDECESSOR TABLE IS RELEASED (review round 3, P2): `ps_load` mints a NEW table and
+    # never removes the old one, and the EXIT trap only removes whatever PS_OUT holds at exit — so
+    # every re-check leaked one `pi-reap-ps.*` file (measured 19 in a single suite run) into the very
+    # volume this reaper exists to reclaim. The cwd predecessor was already released; this is the pair.
+    ps_prev="$PS_OUT"
+    if ! ps_load; then
+        # ⛔ A FAILED RE-PROBE MUST NOT WEAKEN THE PASS'S WITNESS SET (review round 10, P1).
+        # `ps_load` assigns PS_OUT BEFORE it can fail (it mints the new table first, then returns 1 on
+        # a timeout or an empty read), so returning here with PS_OUT pointing at the NEW EMPTY table
+        # left `ps_prev` — the pass's good table — orphaned, and every LATER row of the pass was then
+        # classified against an empty one. `live_process_for` begins `[ -s "$PS_OUT" ] || return 1`, so
+        # "empty" reads as "no argv holder": a checkout whose only holder is argv-visible is deleted
+        # under a live lane. The file's own loader states the rule this broke (`ps_load` header: an
+        # empty table is a probe FAILURE, not "no live processes"). The cwd arm below already restores
+        # its predecessor; this is the missing pair, and it also stops the leak of the new table into
+        # the volume this reaper exists to reclaim. Reachable, not theoretical: `REAP_WT_PS_TIMEOUT` is
+        # operator-settable and `ps -axo` on a cell carrying ~59 checkouts and 20 lanes is exactly the
+        # probe that times out — and the pass continues afterwards, by design.
+        if [ -n "${PS_OUT:-}" ] && [ "${PS_OUT:-}" != "$ps_prev" ]; then rm -f "$PS_OUT"; fi
+        PS_OUT="$ps_prev"
+        REMOVE_SKIP_VERDICT="live-probe-unavailable"
+        log "REMOVE-SKIP $path the live-holder re-probe could not read the process table — nothing removed, preserved (fail-closed)"
+        return 2
+    fi
+    self_pid_tree_load
+    [ -n "$ps_prev" ] && [ "$ps_prev" != "$PS_OUT" ] && rm -f "$ps_prev"
+    # ⛔ A DEGRADED CWD RE-READ MUST NOT SILENTLY WEAKEN THE WITNESS SET (review round 2, P1).
+    # `cwd_probe_load` ALWAYS returns 0 and ALWAYS reassigns CWD_OUT, setting CWD_DEGRADED when lsof
+    # fails — so a failed re-read here would (a) leave `live_cwd_for` reading an empty table, i.e. the
+    # removal would proceed on ARGV-ONLY evidence, and (b) clobber the pass's good table for every
+    # subsequent classification. A lane's own `pi` has cwd = the worktree and argv = the INSTALLED
+    # path, so cwd is that holder's ONLY witness: proceeding would delete a live lane's checkout.
+    # The distinction that matters is WHEN it degraded. `CWD_DEGRADED` describes the table in hand
+    # NOW (review round 10, P2 — it used to be a latch that was never cleared, so after one transient
+    # failure this guard could never fire again), so `cwd_prev_degraded = 0` really does mean "the
+    # table we are about to replace is good". A host with NO lsof degrades on every call, so its
+    # removal path stays argv-only BY DOCUMENTED DESIGN and the footer says so; a pass that started
+    # degraded but has since read a good table is NOT such a host, and this guard stays armed for it.
+    cwd_prev="$CWD_OUT"; cwd_prev_degraded="$CWD_DEGRADED"
+    cwd_probe_load
+    if [ "$cwd_prev_degraded" = 0 ] && { [ "$CWD_DEGRADED" != 0 ] || [ ! -s "${CWD_OUT:-}" ]; }; then
+        [ -n "${CWD_OUT:-}" ] && rm -f "$CWD_OUT"
+        CWD_OUT="$cwd_prev"; CWD_DEGRADED="$cwd_prev_degraded"
+        REMOVE_SKIP_VERDICT="live-probe-unavailable"
+        log "REMOVE-SKIP $path the cwd re-probe degraded (lsof failed or returned nothing) AFTER a good pass-start read — nothing removed, preserved (fail-closed)"
+        return 2
+    fi
+    [ -n "$cwd_prev" ] && [ "$cwd_prev" != "$CWD_OUT" ] && rm -f "$cwd_prev"
+    if holders_live "$rcanon" "$path" "${2:-}"; then
+        REMOVE_SKIP_VERDICT="live-refound"
+        log "REMOVE-SKIP $path a holder is live AGAIN (${HL_VERDICT} pid=${HL_DETAIL}) — nothing removed, preserved"
+        return 2
+    fi
+    return 0
+}
+
+# remove_one <path> <sha>
 # Never --force. Deletes the declared-ephemeral ROOT names first, whether
 # UNTRACKED (`??`, which git DOES refuse on) or IGNORED (`!!`) — clean_gate's
 # root branch collects both, so both are pre-deleted here. NESTED ignored
@@ -2126,8 +2268,15 @@ classify_one() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local path="$1" eph entry target out rc crumb cverdict cpay
+    local path="$1" sha="$2" eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
+
+    # Re-check #0 — THE HOLDER RULE, again (review round 1), and AGAIN as the LAST step before the
+    # fork (review round 3, P2): this early call avoids the deletions when a holder is already back,
+    # but the window that matters is the TAIL — two `git status` calls and the ephemeral deletions
+    # (up to REAP_WT_REMOVE_TIMEOUT each) sit between here and `git worktree remove`, and a shell
+    # demoted as idle can pick up a child inside it. That is exactly "started working again".
+    holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
 
     # Re-check #1 — before ANY deletion. Without this, a checkout that grew an
     # ignored artifact since classification would lose its ephemerals to the
@@ -2177,6 +2326,12 @@ remove_one() {
         log "REMOVE-SKIP $path removal-time re-check not clean ($cverdict: $cpay) — nothing removed, preserved"
         rm -f "$out"; return 2
     fi
+
+    # Re-check #3 — THE HOLDER RULE, as the LAST thing before the fork (review round 3, P2). The
+    # comment on re-check #0 called it "right before the delete" while it actually ran first, leaving
+    # the two `git status` calls and the ephemeral deletions (up to REAP_WT_REMOVE_TIMEOUT each)
+    # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
+    holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
 
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
     rc=$?
@@ -2577,7 +2732,7 @@ run() {
                     log_line "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
                     log "PRUNE-PENDING $p"
                 else
-                    remove_one "$p"; rc=$?
+                    remove_one "$p" "$h"; rc=$?
                     case "$rc" in
                         0)
                             log_line "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
@@ -2592,7 +2747,7 @@ run() {
                             # `ignored-artifact` mean the checkout changed,
                             # while `status-*` means the probe could not be
                             # evaluated — different operator actions.
-                            log_line "         PRESERVED — removal-time clean re-check not clean (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
+                            log_line "         PRESERVED — removal-time re-check kept it (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
                             LATE_PRESERVE=$((LATE_PRESERVE + 1))
                             log "PRESERVED-LATE $p" ;;
                         *)
