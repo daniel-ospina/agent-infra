@@ -39,8 +39,11 @@
 #      links this repo does not ship are not this gate's business, so it cannot
 #      false-block on someone else's half-installed farm. An absent farm prints
 #      an explicit STOP line and passes, and an absent link for a row is simply
-#      not inspected; PI_EXTENSIONS_DIR overrides the farm root for
-#      tests/pi-config-extensions/run.sh.
+#      not inspected. The farm ROOT is resolved by the rule below: an explicit
+#      PI_EXTENSIONS_DIR always wins; in CI the ambient `$HOME/.pi` farm is
+#      REFUSED (a repo-level verdict must not be decided by the runner box's own
+#      state — measured on #3002); otherwise it is the machine-local farm, which
+#      is what makes this check meaningful on the box itself.
 #
 # Because each entry IS the extensions/ file/dir (via symlink), content can
 # never drift between the two trees; checks 1-3 close every farm drift mode:
@@ -364,15 +367,46 @@ if [ "$parse_ok" -eq 1 ]; then
   done <<< "$manifest_rows"
 fi
 
-# --- check 5: live-farm liveness (machine-local; CI has no ~/.pi) ------------
+# --- the live-farm ROOT, and when it may be read at all (#3002) --------------
+# ⛔ A REPO-LEVEL VERDICT MUST NOT BE DECIDED BY THE RUNNER BOX'S OWN ~/.pi FARM.
+# Measured 2026-10-28 on PR #3002: this job reddened on runner
+# `ai-runner-cell3-x64-3` — a SELF-HOSTED pi box whose ~/.pi/agent/extensions
+# held 12 stale top-level `*.test.ts` COPIES (the #1509 shape, materialized
+# before #2849 stopped farming test files; #1465 is why nothing pruned them) —
+# over a diff that touched neither extensions/ nor the farm. A PR whose job
+# landed on that box was red for a BOX defect and one landing elsewhere was
+# green: a host-dependent required check, and the shape the suite header already
+# forbids ("this suite's verdict never depends on the developer's own ~/.pi
+# state"). The old comment here said "CI has no ~/.pi" — FALSE for this repo,
+# whose CI runs on self-hosted pi boxes by design.
+# So the ambient farm is read ONLY where it means something: on the box itself
+# (sync.sh, pre-commit, a session). In CI the root must be NAMED via
+# PI_EXTENSIONS_DIR — .github/workflows/ci.yml aims it at the farm THIS REPO
+# SHIPS, so the CI verdict is deterministic AND still load-bearing (a test-file
+# entry or a dangling link added to the shipped farm reds; cases 33-34 pin both
+# halves). Neither set in CI -> a NAMED skip, never a guess about the box.
+if [ -n "${PI_EXTENSIONS_DIR:-}" ]; then
+  LIVE_FARM="$PI_EXTENSIONS_DIR"
+  FARM_WHY="named by PI_EXTENSIONS_DIR"
+elif [ "${GITHUB_ACTIONS:-}" = "true" ] || [ -n "${CI:-}" ]; then
+  # Empty on purpose: nothing below may read it, and `[ -d "" ]` is false.
+  LIVE_FARM=""
+  FARM_WHY="CI — the runner box's ambient ~/.pi farm is not this repo's verdict"
+else
+  LIVE_FARM="${HOME:-}/.pi/agent/extensions"
+  FARM_WHY="machine-local farm"
+fi
+
+# --- check 5: live-farm liveness (machine-local; see the ROOT rule above) ----
 # See the header. Only manifest-listed entries are inspected, and only when they
 # are present as symlinks: an absent live link is not this gate's business (the
 # machine may simply not be bootstrapped for that row), and a link this repo
 # does not ship is somebody else's state. Guarded by parse_ok because
 # manifest_rows only exists once the manifest parsed.
 if [ "$parse_ok" -eq 1 ]; then
-  LIVE_FARM="${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"
-  if [ ! -d "$LIVE_FARM" ]; then
+  if [ -z "$LIVE_FARM" ]; then
+    echo "⏭️  live extension farm NOT READ ($FARM_WHY) — checks 5/6 (dangling shipped links, executed test files) skipped: set PI_EXTENSIONS_DIR to aim them at a farm the repo controls"
+  elif [ ! -d "$LIVE_FARM" ]; then
     echo "⏭️  live extension farm not found at $LIVE_FARM — check 5 (dangling shipped links) skipped; set PI_EXTENSIONS_DIR to aim it at a farm"
   else
     while IFS= read -r row; do
@@ -462,7 +496,7 @@ fi
 # modelled here. A test file filtered by such a list is still reported — the file
 # should not be in the farm at all, and a hand-rolled ignore parser would be a new
 # false-PASS surface.
-if [ -d "$LIVE_FARM" ]; then
+if [ -n "$LIVE_FARM" ] && [ -d "$LIVE_FARM" ]; then
   executed=""         # display lines: what pi WOULD execute (the failure block)
   executed_paths=""   # the same files as absolute paths — keeps the inert list honest
   inert_short=""      # top-level test-shaped entries the ROOT short-circuit hides
@@ -611,7 +645,7 @@ PYEOF
     inert="$inert$lap"$'\n'
   done <<< "$(find "$LIVE_FARM" -mindepth 2 -maxdepth 3 -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) 2>/dev/null | grep -v '/node_modules/' | head -10)"
   if [ -n "$inert" ]; then
-    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json `pi.extensions` row/index.ts entry, so this file is never loaded):"
+    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json \`pi.extensions\` row/index.ts entry, so this file is never loaded):"
     printf '%s' "$inert" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
     echo "   → \`pi-bootstrap/setup.sh\` sweeps these on the next sync; nothing here executes today."
   fi
