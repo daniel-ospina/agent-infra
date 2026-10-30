@@ -688,6 +688,12 @@ assert_nofile "$ARM" "and writes no record"
 # a drop-in with no ExecStart= is not an override and must not red
 rm -f "$D/$UNIT_NAME.service.d/zz-override.conf"
 printf '[Service]\nNice=5\n' > "$D/$UNIT_NAME.service.d/harmless.conf"
+# ⛔ THE RECORD MUST EXIST FOR THIS CASE TO MEASURE THE DROP-IN. The `--arm` above refused, so it wrote
+# no record, while the artifact is still the ARMED render from T23's install — and an ARMED artifact
+# with NO record is now refused in its own right (the artifact/record agreement gate), so this case
+# would red for a reason that has nothing to do with the harmless drop-in. Re-arm first: `--arm`
+# re-renders the artifact and signs the record, leaving the drop-in as the ONLY variable.
+run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 0 "a drop-in that does not assign ExecStart= is not an override"
 
@@ -741,6 +747,11 @@ assert_eq "$RC" 1 "--root /opt --apply is reported as broken (the pass exits 2 o
 assert_contains "$OUT" "--apply" "and the invented flag is the one named"
 box_sed_i '/^ExecStart=/ s| --root /opt --apply||' "$D/$UNIT_NAME.service"
 box_sed_i '/^ExecStart=/ s|$| --root /opt/x --dry-run|' "$D/$UNIT_NAME.service"
+# ⛔ THE EDIT ABOVE MAKES THE ARTIFACT DISARMED WHILE THE RECORD FROM `--arm` IS STILL VALID, which is
+# now refused in its own right (the artifact/record agreement gate) — so the record is revoked here or
+# this case measures the disagreement instead of the absolute `--root` value it names. DISARMED with no
+# record is the coherent state a `--disarm` leaves, and it is what the rest of T26 varies.
+rm -f "$ARM"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 0 "a disarmed unit with an absolute --root is not a broken schedule"
 assert_contains "$OUT" "DISARMED" "and its mode is read correctly (not ARMED)"
@@ -1260,13 +1271,29 @@ box_sed_i '/^ExecStart=/ s|$| --install-unit|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "--install-unit in ExecStart is red"
 assert_contains "$OUT" "WRITES AND ENABLES" "naming its real consequence (a competing unit pair)"
-assert_contains "$OUT" "--check-units" "and the message lists the pass's full vocabulary"
+# ⛔ NO "EVERY TICK EXITS 2" TEXT AND NO VOCABULARY LIST HERE, DELIBERATELY. `--install-unit` is an
+# argument the pass ACCEPTS, so the generic message is false about it — it is now printed only when an
+# argument REMAINS that the pass does not accept at all, and the specific consequence above is the whole
+# of what this operator needs. The vocabulary assertion moves to the control below, where the generic
+# message really does print (an invented flag), so the claim is checked where it is true.
+assert_absent "$OUT" "every tick exits 2" "…and the false 'exit 2 on every tick' text is not printed about it"
 # ⛔ THE INLINE SPELLING IS THE SAME ARGUMENT. argparse accepts `--want=3` / `--root=<path>` / `--repo=<slug>`
 # exactly as it accepts the space form, so a classifier that matched only the space form reported a
 # schedule the pass runs happily as "arguments this installer did not render … every tick exits 2" — a
 # false block, and one whose remedy (strip the argument) removes a legitimate switch. The space form and
 # the inline form must read the same, and the gate must still discriminate the value that really fails.
-box_sed_i '/^ExecStart=/ s| --install-unit| --want=3 --json|' "$D/$UNIT_NAME.service"
+# ⛔ THE VOCABULARY BELONGS ON THE MESSAGE THAT MAKES THE CLAIM. The generic "arguments this installer
+# did not render … every tick exits 2" text is the one that enumerates the pass's switches, so it is
+# asserted here — on an argument the pass really does not accept — and NOT on the `--install-unit` case
+# above, where that text is deliberately suppressed because it would be false.
+box_sed_i '/^ExecStart=/ s| --install-unit| --apply|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an invented flag is still refused"
+assert_contains "$OUT" "did not render" "naming it as an argument the installer never rendered"
+assert_contains "$OUT" "--check-units" "and the message lists the pass's full vocabulary"
+# ⛔ THE INLINE SPELLING IS THE SAME ARGUMENT (restored — this control is what #2403's `--want=` fix
+# turns on): `--want=3` must read exactly as `--want 3` does, and the chain below then empties its value.
+box_sed_i '/^ExecStart=/ s| --apply| --want=3 --json|' "$D/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 0 "--want=<n> in the inline spelling is the SAME argument, so the unit is not red"
 assert_absent "$OUT" "did not render" "…and it does not get the 'this installer did not render' text"
@@ -1573,6 +1600,51 @@ else
     ok "naming the consequence the writers already refuse (skipped: root)"
 fi
 rm -f "$ST7/runner-autoscale.armed" "$ARM"
+
+# ── T58: the ARTIFACT and the RECORD must agree, in BOTH directions ────────────────────────
+# Both WRITERS refuse to create the disagreement (`verify_installed_unit`, and the plist arm's own), which
+# is exactly when a readiness verb has to catch it: `--status` is what an operator runs AFTER a hand-edit,
+# a partial restore or a foreign artifact, and pre-fix it exited 0 in BOTH directions — an artifact
+# hand-stripped of `--dry-run` with NO record (a box growing capacity with no dated owner decision, the
+# one state this design exists to forbid) and a hand-reverted artifact beside a VALID record (every tick
+# measures and repairs nothing while the box reads armed). The ABSENT case is strictly WEAKER than the
+# INVALID record this verb already reds, so the old verdict was incoherent as well as lenient.
+# ⛔ THE CONTROL IS WHAT MAKES THE PAIR MEANINGFUL: each red is produced by removing/adding ONE fact from
+# a state that is otherwise green, so neither direction can pass by redding everything.
+say_case "T58 --status refuses an artifact that disagrees with the record, in both directions"
+D="$T/c58"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: DISARMED artifact with NO record is coherent, and green"
+assert_contains "$OUT" "arm_record=absent" "…with the absence shown, not implied"
+run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: an ARMED artifact WITH its record is coherent, and green"
+assert_contains "$OUT" "arm_record=present" "…with the record shown"
+# Direction 1: ARMED artifact, record GONE — the state a hand-strip or a foreign artifact leaves.
+rm -f "$ARM"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an ARMED artifact with NO record is refused (nothing dates the decision to grow)"
+assert_contains "$OUT" "NO valid arming record" "naming the missing artifact"
+assert_contains "$OUT" "--disarm" "and offering the remedy that does not widen the box"
+# Direction 2: record VALID, artifact hand-reverted to DISARMED — the state a bad restore leaves.
+rm -f "$ARM"; run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1
+box_sed_i '/^ExecStart=/ s|$| --dry-run|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a VALID record beside a DISARMED artifact is refused (the box reads armed, repairs nothing)"
+assert_contains "$OUT" "DISAGREE" "naming the disagreement rather than the artifact alone"
+# …and the LAUNCHD arm answers the same question, so the two platforms cannot drift apart here.
+D="$T/c58b"; fresh "$D"; rm -f "$ARM"
+run_install Darwin "$D" --install >/dev/null 2>&1
+run_install Darwin "$D" --arm --reason fixture >/dev/null 2>&1
+run_install Darwin "$D" --disarm >/dev/null 2>&1
+OUT="$(run_install Darwin "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: a real launchd --disarm leaves a coherent DISARMED pair"
+rm -f "$ARM"; run_install Darwin "$D" --arm --reason fixture >/dev/null 2>&1
+rm -f "$ARM"
+OUT="$(run_install Darwin "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "the launchd arm refuses an ARMED plist with NO record too"
+rm -f "$ARM"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
