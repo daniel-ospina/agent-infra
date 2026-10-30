@@ -748,10 +748,11 @@ drive 'FAILED:ai-review-gate' rail 0 1
 if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-STUCK 4/3' "$TMP/d.log" \
    && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
    && grep -q 'record-review.sh 4242 abc1234 clean daniel-ospina/agent-infra' "$TMP/d.log" \
+   && grep -q -- '--expect-head abc1234' "$TMP/d.log" \
    && grep -q 'LIFT THIS PARK' "$TMP/d.log"; then
-  ok "(b5) AT-HEAD at the bound PARKS with REVIEW-AT-HEAD-STUCK, the exact re-record command, AND the park-lift (a re-record alone is provably inert)"
+  ok "(b5) AT-HEAD at the bound PARKS with REVIEW-AT-HEAD-STUCK, the exact re-record command AND its --expect-head pin, AND the park-lift (a re-record alone is provably inert)"
 else
-  bad "(b5) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates, or its command was eaten by a backtick substitution"
+  bad "(b5) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates, its command was eaten by a backtick substitution, or the printed remedy mints UNPINNED"
 fi
 clear_store; mv "$TMP/O/state/reviewathead-4242" "$TMP/athead.spent.$RANDOM" 2>/dev/null || true
 
