@@ -1223,6 +1223,40 @@ assert_contains "$OUT" "NOT silently skipping" "naming the failure this guard ex
 assert_nofile "$ARM" "with no arming record written"
 rm -f "$ARM"
 
+# ── T48: the XML escaper is a LAUNCHD rule, never a systemd one ──────────────────────────
+# `render` put every placeholder through `xml_sed_repl` on BOTH arms. That helper is deliberately two
+# layers — the XML-entity escape PLUS the sed-replacement escape — and the XML half is correct only
+# where the value lands in an XML text node, i.e. the plist. On the systemd arm it wrote the ENTITY
+# into the unit: `HOME=/home/a&b` rendered `Environment=HOME=/home/a&amp;b`, a path the installer never
+# resolved. Nothing downstream could see it — `refuse_unusable_target` refuses only a backslash,
+# `refuse_systemd_unsafe_values` refuses only whitespace and `%`, and both renders of one value produce
+# the same entity, so the drift `cmp` and `--status` both report `drift_artifact=no` while every tick
+# resolves a directory that does not exist (the pass does not complete, and the schedule is installed,
+# enabled and listed). The escape is chosen per ARM now (`repl_for`), which also makes the placeholder
+# family agree with the COMPOSED `{{PROVISIONER_ENV}}` family — that one has always been sed-only on
+# systemd, and T31 pins it.
+say_case "T48 an '&' and a '<' are LITERAL in the systemd unit and escaped in the plist"
+AMPC="$T/home/a&b<c"; mkdir -p "$AMPC"; cp "$T/home/converger.py" "$AMPC/"
+rm -f "$ARM"
+D="$T/c48"; fresh "$D"
+ENVV=(HOME="$AMPC" RUNNER_AUTOSCALE_SCRIPT="$AMPC/converger.py" RUNNER_AUTOSCALE_STATE_DIR="$AMPC/state")
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "the systemd arm installs a HOME carrying '&' and '<'"
+UNIT_TXT="$(cat "$D/$UNIT_NAME.service" 2>/dev/null || true)"
+assert_contains "$UNIT_TXT" "Environment=HOME=$AMPC" "the unit carries the REAL path, not an entity"
+assert_contains "$UNIT_TXT" "RUNNER_AUTOSCALE_STATE_DIR=$AMPC/state" "and so does the state dir"
+assert_absent "$UNIT_TXT" "&amp;" "no '&' entity was written into the unit"
+assert_absent "$UNIT_TXT" "&lt;" "and no '<' entity either"
+# Control, and the reason this is an ASYMMETRY and not a blanket relaxation: the plist IS an XML
+# document, so the same value must still be entity-escaped there or launchd refuses to parse it. Both
+# directions are asserted, so a future divergence between the arms fails here rather than on a box.
+D2="$T/c48d"; fresh "$D2"
+ENVV=(HOME="$AMPC" RUNNER_AUTOSCALE_SCRIPT="$AMPC/converger.py" RUNNER_AUTOSCALE_STATE_DIR="$AMPC/state")
+OUT="$(run_install Darwin "$D2" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "the launchd arm installs the same path"
+assert_contains "$(cat "$D2/$LABEL.plist" 2>/dev/null || true)" "&amp;" "the plist is XML, so it still entity-escapes the '&'"
+assert_eq "$(plist_env "$D2/$LABEL.plist" HOME)" "$AMPC" "and the PARSED value is the real path (the entity round-trips)"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
