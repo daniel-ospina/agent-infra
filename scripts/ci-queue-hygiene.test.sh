@@ -50,7 +50,14 @@ case "$all" in
     echo "$id" >>"$POSTS"; exit 0 ;;
 esac
 case "$all" in
-  *"--jq .default_branch"*) printf '%s\n' "${FIXTURE_DEFAULT:-main}"; exit 0 ;;
+  *"--jq .default_branch"*)
+    # `${FIXTURE_DEFAULT-main}`, NOT `${FIXTURE_DEFAULT:-main}` (review cycle 1, F2): the `:-` form
+    # substitutes `main` when the variable is set-but-EMPTY, so no arm could ever express an EMPTY
+    # default branch — which is exactly the reading the script's `[ -n "$default_branch" ]` guard
+    # exists to refuse. Every default-branch guard was therefore untestable: deleting them left the
+    # suite green while a `main` run was cancelled.
+    [ -f "$FX/default.fail" ] && { echo "gh: HTTP 502 (default branch stub)" >&2; exit 1; }
+    printf '%s\n' "${FIXTURE_DEFAULT-main}"; exit 0 ;;
 esac
 echo "gh stub: unhandled args: $all" >&2; exit 1
 STUB
@@ -182,6 +189,28 @@ fixture "o/r:main:zzz999" "300 main zzz000 3600"
 run --apply
 eq "posts" "$(posts)" 0
 has "keep_default_branch=1" && ok "counted" || bad "not counted"
+
+echo "(c2) ⛔ an EMPTY default branch is FAIL-CLOSED — 'an absence is not a verdict' (F2)"
+# Both guards below were UNTESTABLE before the stub learned to express empty: `${FIXTURE_DEFAULT:-main}`
+# replaced a set-but-empty value with `main`, so nothing could make the surface read empty, and
+# deleting either guard left the suite 92/0 green while a `main` run was cancelled.
+fixture "o/r:main:aaa111" "3000 main zzz000 3600"
+: >"$WORK/posts"
+OUT="$(PATH="$WORK/bin:$PATH" FIXTURE_DIR="$WORK/fx" POSTS_FILE="$WORK/posts" HOME="$WORK" \
+      FIXTURE_DEFAULT="" /bin/bash "$SCRIPT" --repo o/r --apply 2>&1)"; RC=$?
+eq "exit (empty default branch)" "$RC" 2
+eq "posts (empty default branch)" "$(posts)" 0
+has "default branch came back empty" && ok "names the empty default branch" || bad "empty default branch not named: $OUT"
+has "CANCEL 3000" && bad "a main-branch run was CANCELLED on an empty default-branch read" || ok "no main run cancelled"
+
+echo "(c3) ⛔ an UNREADABLE default branch is FAIL-CLOSED, naming that surface (F2)"
+fixture "o/r:main:aaa111" "3001 main zzz001 3600"
+: >"$WORK/fx/default.fail"
+run --apply
+eq "exit (unreadable default branch)" "$RC" 2
+eq "posts (unreadable default branch)" "$(posts)" 0
+has "could not read the default branch" && ok "names the default-branch surface" || bad "wrong surface named: $OUT"
+rm -f "$WORK/fx/default.fail"
 
 echo; echo "(d) a run inside the grace window is kept"
 fixture "o/r:feat/fresh:newsha" "400 feat/fresh bbb000 5"
@@ -362,6 +391,28 @@ done
 OUT="$(PATH="$WORK/bin:$PATH" FIXTURE_DIR="$WORK/fx" POSTS_FILE="$WORK/posts" HOME="$WORK" \
       CI_HYGIENE_MAX=notanumber /bin/bash "$SCRIPT" 2>&1)"; RC=$?
 eq "exit for CI_HYGIENE_MAX=notanumber" "$RC" 2
+
+echo "(l2d) ⛔ an ALL-DIGIT but UNREPRESENTABLE bound is FAIL-CLOSED, never a silent CANCEL (F1)"
+# `test` compares INTEGERS: on an operand it cannot represent it fails rc=2, so
+# `[ "$age" -lt "$GRACE_S" ]` is FALSE and the run drops THROUGH the grace arm and is cancelled.
+# Measured before the fix: a run 6 s old was cancelled by `--grace 99999999999999999999`.
+fixture "o/r:feat/fresh:newsha" "4000 feat/fresh bbb000 6"
+for pair in "--grace 99999999999999999999" "--max 99999999999999999999"; do
+  : >"$WORK/posts"
+  # shellcheck disable=SC2086
+  OUT="$(PATH="$WORK/bin:$PATH" FIXTURE_DIR="$WORK/fx" POSTS_FILE="$WORK/posts" HOME="$WORK" \
+        /bin/bash "$SCRIPT" --repo o/r --apply $pair 2>&1)"; RC=$?
+  eq "exit for '$pair'" "$RC" 2
+  eq "posts for '$pair'" "$(posts)" 0
+  case "$OUT" in *"out of range"*) ok "'$pair' names the range defect" ;; *) bad "'$pair' did not name it: $OUT" ;; esac
+done
+# PR_LIMIT has no flag — it is env-only.
+: >"$WORK/posts"
+OUT="$(PATH="$WORK/bin:$PATH" FIXTURE_DIR="$WORK/fx" POSTS_FILE="$WORK/posts" HOME="$WORK" \
+      CI_HYGIENE_PR_LIMIT=99999999999999999999 /bin/bash "$SCRIPT" --repo o/r --apply 2>&1)"; RC=$?
+eq "exit for CI_HYGIENE_PR_LIMIT (out of range)" "$RC" 2
+eq "posts for CI_HYGIENE_PR_LIMIT (out of range)" "$(posts)" 0
+case "$OUT" in *"out of range"*) ok "CI_HYGIENE_PR_LIMIT names the range defect" ;; *) bad "CI_HYGIENE_PR_LIMIT did not name it: $OUT" ;; esac
 
 echo "(a3g) ⛔ a head repository that is not exactly owner/name is UNKEYABLE (no key can collide)"
 fixture "o/r/feat:x:head9" "150 x y 86400"

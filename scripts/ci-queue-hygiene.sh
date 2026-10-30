@@ -106,9 +106,25 @@ case "$REPO" in
   */*) : ;;
   *) echo "--repo must be owner/name (got '$REPO')" >&2; exit 64 ;;
 esac
-case "$MAX_CANCEL" in ''|*[!0-9]*) fail_closed "MAX '$MAX_CANCEL' is not a number" ;; esac
-case "$GRACE_S" in ''|*[!0-9]*) fail_closed "GRACE '$GRACE_S' is not a number" ;; esac
-case "$PR_LIMIT" in ''|*[!0-9]*) fail_closed "PR_LIMIT '$PR_LIMIT' is not a number" ;; esac
+case "$MAX_CANCEL"  in ''|*[!0-9]*) fail_closed "MAX '$MAX_CANCEL' is not a number" ;; esac
+case "$GRACE_S"   in ''|*[!0-9]*) fail_closed "GRACE '$GRACE_S' is not a number" ;; esac
+case "$PR_LIMIT"  in ''|*[!0-9]*) fail_closed "PR_LIMIT '$PR_LIMIT' is not a number" ;; esac
+# ⛔ AN ALL-DIGIT STRING CAN STILL BE UNREPRESENTABLE (review cycle 1, F1). `test` compares integers,
+# and on an operand it cannot represent it FAILS with rc=2 — which makes `[ "$age" -lt "$GRACE_S" ]`
+# FALSE and drops the run through to the CANCEL arm. Measured:
+#   GRACE=99999999999999999999, age=6  ->  [: …: integer expression expected  ->  CANCEL
+# So an out-of-range --grace silently INVERTS the arm whose whole job is 'a second commit racing the PR
+# head update is not a supersession', and a seconds-old run is cancelled. The bound is checked by
+# STRING LENGTH because a length comparison cannot itself overflow; 9 digits is ~31 years of seconds
+# and is far beyond any value these bounds can mean. Every numeric bound gets it, not just the one
+# that was demonstrated.
+_numeric_bound() {  # <name> <value> <max-digits>
+  [ "${#2}" -le "$3" ] \
+    || fail_closed "$1 '$2' is out of range (at most $3 digits; a longer value cannot be compared as an integer, so the guard around it would silently fail open)"
+}
+_numeric_bound MAX      "$MAX_CANCEL" 9
+_numeric_bound GRACE    "$GRACE_S"    9
+_numeric_bound PR_LIMIT "$PR_LIMIT"   9
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/ciqhyg.XXXXXX")" || { echo "mktemp failed" >&2; exit 2; }
 trap 'rm -rf "$work"' EXIT
