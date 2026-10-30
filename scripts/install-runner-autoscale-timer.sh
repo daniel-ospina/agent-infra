@@ -391,6 +391,71 @@ resolve_provisioner() {
     return 0
 }
 
+artifact_path_for_target() { # the single artifact this target installs (the plist, or the .service)
+    if [ "$TARGET" = "launchd" ]; then printf '%s' "$UNIT_DIR/$LABEL.plist"
+    else printf '%s' "$UNIT_DIR/$UNIT_NAME.service"; fi
+}
+
+# artifact_env_value <artifact> <KEY> — one Environment value, as the ARTIFACT declares it.
+# ⛔ THIS IS THE ONLY HONEST INPUT FOR A COMPARISON-AFTER-THE-FACT. Every value in the rendered artifact
+# is resolved from the environment of the invocation that rendered it (`$PATH`, the interpreter found on
+# it, the script under INFRA_ROOT, the provisioner under `$PWD`), so re-deriving them from the READER and
+# calling the difference "drift" reports the operator's shell, not the artifact. The artifact is the
+# record of what was resolved at install time; this reads it back.
+artifact_env_value() { # artifact_env_value <artifact> <KEY>
+    local art="$1" key="$2"
+    [ -f "$art" ] || return 0
+    if [ "$TARGET" = "launchd" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c 'import plistlib,sys
+with open(sys.argv[1],"rb") as fh:
+    d = plistlib.load(fh).get("EnvironmentVariables", {})
+v = d.get(sys.argv[2], "")
+print(v if isinstance(v, str) else "")' "$art" "$key" 2>/dev/null && return 0
+        fi
+        /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$key" "$art" 2>/dev/null
+        return 0
+    fi
+    # `Environment="KEY=value"` (both templates quote the assignment) or the unquoted form. The value is
+    # everything after the FIRST `=`, so a value that itself contains `=` survives.
+    awk -v want="$key" '
+        /^[[:space:]]*Environment[[:space:]]*=/ {
+            v = $0
+            sub(/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*/, "", v)
+            if (substr(v, 1, 1) == "\"") v = substr(v, 2)
+            if (substr(v, length(v), 1) == "\"") v = substr(v, 1, length(v) - 1)
+            k = v; sub(/=.*/, "", k)
+            if (k == want) { sub(/^[^=]*=/, "", v); print v; exit }
+        }' "$art"
+}
+
+# adopt_installed_provisioner — an install that resolves NOTHING must not STRIP a pin the artifact
+# already carries.
+# ⛔ MEASURED, AND IT DESTROYS THE FILL HALF SILENTLY. `resolve_provisioner` correctly treats a named pin
+# as the whole list, but it resolves from THIS invocation's cwd (plus INFRA_ROOT) — and on the boxes this
+# exists for the provisioner is found ONLY through `$PWD/tools/…` (agent-infra does not ship it). So a
+# routine `--install` from another directory — including the very remedy `--status` prints — re-rendered
+# the unit WITHOUT the `RUNNER_AUTOSCALE_PROVISIONER=` line, reported `changed=1` and exit 0 with one
+# WARNING line, and the box could never ADD capacity again. The artifact is the record of what was
+# resolved at install time, so it is the fallback. A declared path that is NOT a readable file is NOT
+# adopted (that would bake in a path that cannot run) — that case keeps the resolve failure.
+adopt_installed_provisioner() {
+    [ -n "$PROVISIONER" ] && return 0
+    local art declared
+    art="$(artifact_path_for_target)"
+    [ -f "$art" ] || return 0
+    declared="$(artifact_env_value "$art" RUNNER_AUTOSCALE_PROVISIONER)"
+    [ -n "$declared" ] || return 0
+    if [ -f "$declared" ] && [ -r "$declared" ]; then
+        PROVISIONER="$declared"; PROVISIONER_WHY="preserved from the installed artifact"
+        err "note: no provisioner resolved from THIS directory, so the pin the installed artifact already carries is kept: $declared"
+        err "      (a re-install that cannot resolve one must not silently drop the FILL half — the pass could never add capacity again)"
+    else
+        err "note: the installed artifact pins RUNNER_AUTOSCALE_PROVISIONER=$declared, which is NOT a readable file — not carrying it forward."
+    fi
+    return 0
+}
+
 # ── the arming record ────────────────────────────────────────────────────────────────────────
 # ⛔ BOTH LINES OR NOTHING: a half-written record (truncated write, an editor buffer flushed early) must
 # render DISARMED. That is the fail-closed direction, and it is the same rule install-launchd.sh applies
@@ -718,7 +783,14 @@ unit_dropin_timerfiles() { # .conf drop-ins that would override the timer's CADE
     [ -d "$d" ] || return 0
     for f in "$d"/*.conf; do
         [ -f "$f" ] || continue
-        [ -n "$(sed -n -E 's/^[[:space:]]*(OnBootSec|OnUnitActiveSec|OnCalendar|Persistent|Unit)[[:space:]]*=.*/x/p' "$f")" ] && printf '%s\n' "$f"
+        # ⛔ EVERY `On*` ELAPSE KEY COUNTS, NOT THE THREE THE BASE TEMPLATE HAPPENS TO USE. systemd fires a
+        # timer at EVERY elapse point it finds, and a drop-in assignment ADDS one (`OnActiveSec=` and
+        # `OnStartupSec=` and `OnUnitInactiveSec=` are independent of `OnBootSec=`/`OnUnitActiveSec=`), so
+        # a list of the base template's own keys let `OnActiveSec=1min` fire the pass every minute and still
+        # report a clean box. `RandomizedDelaySec=` moves every fire, and `Unit=` decides what it fires.
+        # ⛔ AND `Persistent=` IS NOT IN THE LIST: it applies to `OnCalendar=` only, this unit deliberately
+        # carries none (see the timer template's own comment), so flagging it would be a false block.
+        [ -n "$(sed -n -E 's/^[[:space:]]*(On[A-Za-z]*Sec|RandomizedDelaySec|Unit)[[:space:]]*=.*/x/p' "$f")" ] && printf '%s\n' "$f"
     done
     return 0
 }
@@ -730,6 +802,15 @@ verify_installed_unit() { # verify the ARTIFACT at $UNIT_DIR, not the bytes we h
     dropins="$(unit_dropin_execfiles)"
     [ -z "$dropins" ] || {
         err "REFUSING: this unit has an ExecStart= DROP-IN that overrides what this installer wrote, so the mode verified below is not the mode systemd runs: $(printf '%s ' $dropins). Remove it (or move its content into the unit) and re-install."
+        return 1
+    }
+    # ⛔ THE CADENCE HAS THE SAME DROP-IN ROUTE, AND THIS IS THE PATH THAT CREATES THE SCHEDULE. The
+    # `--status` arm alone left the guard unreachable at the moment the box is installed and ARMED: a
+    # `…timer.d/*.conf` retuning the interval let `--install` print `cadence=9min` and `--arm` sign a dated
+    # record for a box that fires hourly. Same refusal, one unit over.
+    dropins="$(unit_dropin_timerfiles)"
+    [ -z "$dropins" ] || {
+        err "REFUSING: this timer has a DROP-IN that overrides the cadence this installer wrote, so the schedule it would verify is not the schedule systemd runs: $(printf '%s ' $dropins). Remove it (or move its content into the template) and re-install."
         return 1
     }
     line="$(unit_exec_line "$svc")"
@@ -918,6 +999,7 @@ do_install_systemd() {
     [ -f "$src_svc" ] && [ -f "$src_tim" ] || { err "templates missing under $TEMPLATES_DIR (expected $UNIT_NAME.service + $UNIT_NAME.timer)"; return 1; }
     choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. Install by hand, or give the box sudo. NOT silently skipping — a converger that never runs is the failure this exists to remove."; return 1; }
     refuse_systemd_unsafe_values || return 1
+    adopt_installed_provisioner
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src_svc" "$tmpd/$UNIT_NAME.service" systemd || { rm -rf "$tmpd"; return 1; }
@@ -1008,6 +1090,7 @@ do_install_launchd() {
     local tmpd changed=0 loaded=0
     [ -f "$src_plist" ] || { err "plist template missing: $src_plist (set LAUNCHD_TEMPLATES_DIR)"; return 1; }
     choose_target || { err "no scheduler available"; return 1; }
+    adopt_installed_provisioner
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src_plist" "$tmpd/$LABEL.plist" launchd || { rm -rf "$tmpd"; return 1; }
     # ⛔ A PLIST THAT DOES NOT PARSE IS NOT INSTALLED. Measured on this family: a placeholder inside an
@@ -1108,6 +1191,14 @@ do_arm() {
         [ -z "$dp" ] || {
             err "REFUSING to arm: an ExecStart= DROP-IN overrides the unit this installer manages, so the command it would verify is not the command systemd runs: $(printf '%s ' $dp)"
             err "  Remove that drop-in (or move its content into the unit) and re-run --arm. Nothing was armed."
+            return 1
+        }
+        # The same preflight fact for the CADENCE: a record signed under a drop-in-tuned interval would
+        # attest a schedule nothing verified.
+        dp="$(unit_dropin_timerfiles)"
+        [ -z "$dp" ] || {
+            err "REFUSING to arm: a [Timer] DROP-IN overrides the cadence this installer manages, so the schedule it would attest is not the schedule systemd runs: $(printf '%s ' $dp)"
+            err "  Remove that drop-in (or move its content into the template) and re-run --arm. Nothing was armed."
             return 1
         }
     fi
@@ -1450,15 +1541,59 @@ do_status() {
         rc=1
     fi
     # ── drift, both directions, REPORTED (issue #2403 clause 5) ──────────────────────────────
-    # artifact drift: the installed file is not what THIS installer would write now (a changed interval,
-    # repo or mode, or a hand-edit). Not fatal: it is information, and the next `--install` converges it.
+    # artifact drift: the installed file is not what THIS installer would write (a changed interval, repo
+    # or mode, or a hand-edit). Not fatal: it is information, and the next `--install` converges it.
+    # ⛔ THE RENDER BELOW IS DRIVEN BY THE VALUES THE ARTIFACT DECLARES, NOT BY THE READER'S ENVIRONMENT.
+    # Every substituted value — `{{PATH}}`, `{{PYTHON}}` (found ON that PATH), `{{SCRIPT}}` (resolved from
+    # INFRA_ROOT), `{{PROVISIONER_ENV}}` (resolved from `$PWD`), `{{REPO}}`, `{{HOME}}`, `{{STATE_DIR}}` —
+    # is an input of the invocation that rendered the artifact. Re-deriving them from the `--status`
+    # process and calling the difference "drift" reports the OPERATOR'S SHELL, not the file: measured, an
+    # untouched artifact reported `drift_artifact=yes` when `--status` ran from a login shell with a
+    # different PATH, or from any other directory (the provisioner resolves through `$PWD` alone on the
+    # boxes this exists for). The artifact is the record of what was resolved at install time, so the
+    # comparison reads those values back out of it — the verdict is then about the FILE (hand-edits,
+    # foreign artifacts, a record/artifact mode disagreement), which is what the word means.
+    # ⛔ AND WHERE THEY DIFFER, THAT IS STILL REPORTED — as `drift_inputs=`, named, not as drift and not
+    # silently: "a re-install from here would rewrite these" is the actionable fact, and the `--install`
+    # remedy must not be run to "fix" a file that is already right.
     if [ -n "$installed_script" ]; then
         local tmpd
+        local save_home save_path save_state save_repo save_prov save_py save_script
+        local inputs_differ=""
         drift_artifact="unknown"
         drift_service="unknown"
         drift_timer="unknown"
         tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-drift.XXXXXX")" 2>/dev/null || tmpd=""
         if [ -n "$tmpd" ]; then
+            save_home="$HOME"; save_path="$PATH"; save_state="$STATE_DIR"; save_repo="$REPO"
+            save_prov="$PROVISIONER"; save_py="$PYTHON"; save_script="$SCRIPT"
+            local d_home d_path d_state d_repo d_prov
+            d_home="$(artifact_env_value "$installed_path" HOME)"
+            d_path="$(artifact_env_value "$installed_path" PATH)"
+            d_state="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_STATE_DIR)"
+            d_repo="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_REPO)"
+            d_prov="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_PROVISIONER)"
+            # A key the artifact does not declare keeps the reader's value: the render must not be fed an
+            # EMPTY path to make the comparison match (that would bless the missing line). Reporting the
+            # difference is what surfaces it.
+            [ -n "$d_home" ]  && HOME="$d_home"
+            [ -n "$d_path" ]  && PATH="$d_path"
+            [ -n "$d_state" ] && STATE_DIR="$d_state"
+            [ -n "$d_repo" ]  && REPO="$d_repo"
+            [ -n "$d_prov" ]  && PROVISIONER="$d_prov"
+            [ -n "$installed_python" ] && PYTHON="$installed_python"
+            [ -n "$installed_script" ] && SCRIPT="$installed_script"
+            # ⛔ ONLY A KEY THE ARTIFACT ACTUALLY DECLARES CAN DISAGREE. The template carries `HOME`, `PATH`,
+            # `RUNNER_AUTOSCALE_STATE_DIR` and the whole-line `RUNNER_AUTOSCALE_PROVISIONER` pin — it carries
+            # no `RUNNER_AUTOSCALE_REPO`, so a missing key must not read as "the reader resolves something
+            # else" (that would print a permanent `drift_inputs=repo` on every box).
+            [ -n "$d_home" ] && [ "$save_home" != "$d_home" ] && inputs_differ="${inputs_differ:+$inputs_differ }home"
+            [ -n "$d_path" ] && [ "$save_path" != "$d_path" ] && inputs_differ="${inputs_differ:+$inputs_differ }path"
+            [ -n "$d_state" ] && [ "$save_state" != "$d_state" ] && inputs_differ="${inputs_differ:+$inputs_differ }state_dir"
+            [ -n "$d_repo" ] && [ "$save_repo" != "$d_repo" ] && inputs_differ="${inputs_differ:+$inputs_differ }repo"
+            [ -n "$d_prov" ] && [ "$save_prov" != "$d_prov" ] && inputs_differ="${inputs_differ:+$inputs_differ }provisioner"
+            [ "$save_py" != "$installed_python" ] && inputs_differ="${inputs_differ:+$inputs_differ }python"
+            [ "$save_script" != "$installed_script" ] && inputs_differ="${inputs_differ:+$inputs_differ }script"
             if [ "$TARGET" = "launchd" ]; then
                 if render "$LAUNCHD_TEMPLATES_DIR/$LABEL.plist" "$tmpd/$LABEL.plist" launchd 2>/dev/null; then
                     cmp -s "$tmpd/$LABEL.plist" "$installed_path" && drift_artifact=no || drift_artifact=yes
@@ -1498,6 +1633,11 @@ do_status() {
                 elif [ "$drift_service" = "no" ] && [ "$drift_timer" = "no" ]; then drift_artifact=no
                 else drift_artifact=unknown; fi
             fi
+            # ⛔ RESTORED BEFORE ANYTHING ELSE READS THEM. The values above are the ARTIFACT's, and every
+            # later line of this verb (`last_tick`, the repo-copy digest, the message text) must speak in
+            # the reader's own paths again.
+            HOME="$save_home"; PATH="$save_path"; STATE_DIR="$save_state"; REPO="$save_repo"
+            PROVISIONER="$save_prov"; PYTHON="$save_py"; SCRIPT="$save_script"
             rm -rf "$tmpd"
         fi
         log_line "drift_artifact=$drift_artifact"
@@ -1505,6 +1645,12 @@ do_status() {
         # the launchd arm, which installs one file.
         if [ "$TARGET" != "launchd" ]; then
             log_line "drift_parts=service=${drift_service:-unknown} timer=${drift_timer:-unknown}"
+        fi
+        # Reported, not drifted: the artifact is not what a re-install from HERE would write, because THIS
+        # invocation resolved different inputs. Named so the operator knows an install would rewrite them
+        # (and, with `adopt_installed_provisioner`, that it will not silently drop a pin it cannot resolve).
+        if [ -n "$inputs_differ" ]; then
+            log_line "drift_inputs=$inputs_differ (this invocation resolves different values than the artifact was written with — informational: an --install from here would rewrite these, and the artifact itself is not hand-edited)"
         fi
     fi
     # repo-copy drift: is the copy the timer RUNS the copy this checkout carries? The converger's own

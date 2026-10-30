@@ -933,12 +933,15 @@ rm -f "$D/$UNIT_NAME.timer"
 OUT="$(run_install Linux "$D" --status)"
 assert_contains "$OUT" "drift_artifact=yes" "a MISSING timer is drift, not silence"
 assert_contains "$OUT" "drift_parts=service=no timer=yes" "and the attribution says which artifact is absent"
-# ⛔ AND THE RENDER MUST RESOLVE WHAT THE INSTALL PATH RESOLVED. The provisioner is baked into the
-# artifact as a WHOLE LINE ({{PROVISIONER_ENV}} is in both templates) and `resolve_provisioner` decides
-# between a pin and nothing. `--install` called it; `--status` did not, so the status render emitted no
-# Environment= line while the installed file carried the pin — permanent `drift_artifact=yes` on every
-# box that HAS a provisioner, with the `--install` remedy answering `changed=0` and changing nothing.
-# ENVV pins the same value to both verbs here, so the only variable is the missing resolution.
+# ⛔ AND THE RENDER IS DRIVEN BY THE ARTIFACT'S OWN DECLARED VALUES, NOT BY THE READER'S ENVIRONMENT.
+# Every substituted value (`{{PATH}}`, `{{PYTHON}}` found on it, `{{SCRIPT}}`, `{{PROVISIONER_ENV}}`
+# resolved from `$PWD`, `{{REPO}}`, `{{HOME}}`, `{{STATE_DIR}}`) is an input of the invocation that
+# RENDERED the artifact, so re-deriving them from the `--status` process reports the operator's shell as
+# "drift". Measured: an untouched artifact read `drift_artifact=yes` from a login shell with a different
+# PATH, or from any other directory (the provisioner resolves through `$PWD` alone on the boxes this
+# exists for) — and the remedy it printed, `--install`, then rewrote the unit WITHOUT the pin, `changed=1`,
+# exit 0, permanently removing the FILL half. So: the artifact's declared values drive the comparison, and
+# any difference from what THIS invocation resolves is named in `drift_inputs=` instead.
 PROV2="$T/home/prov2.sh"; printf '#!/bin/sh\n' >"$PROV2"; chmod +x "$PROV2"
 D="$T/c37c"; fresh "$D"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV2")
@@ -951,11 +954,25 @@ assert_contains "$OUT" "drift_artifact=no" \
     "--status resolves the SAME provisioner, so a pinned artifact is not reported as permanent drift"
 assert_contains "$OUT" "drift_parts=service=no timer=no" "…both artifacts match what this installer would write now"
 assert_contains "$OUT" "provisioner=$PROV2" "and the readiness report names the pin the artifact carries"
-# The control: WITHOUT the pin the artifact really does differ from what an install would write, so the
-# signal must still fire — the fix must not make drift unconditionally green.
+assert_absent "$OUT" "drift_inputs=" "with nothing to report when the reader resolves the same values"
+# The reader's environment differs (no pin resolvable from here): the artifact is NOT drifted, but the
+# difference is NAMED — this is the control against "make drift unconditionally green".
 OUT="$(run_install Linux "$D" --status)"
-assert_contains "$OUT" "drift_parts=service=yes" "without the pin the same artifact IS reported as drifted (the fix is not a blanket green)"
-assert_contains "$OUT" "provisioner=absent" "and the reason is named"
+assert_contains "$OUT" "drift_artifact=no" "a reader that cannot resolve the pin does not turn the artifact into drift"
+assert_contains "$OUT" "drift_inputs=provisioner" "…and the difference is named, not swallowed"
+assert_contains "$OUT" "provisioner=absent" "the resolution failure has its own reason line"
+# ⛔ AND THE RE-INSTALL MUST NOT STRIP IT — the destructive half of the same defect. The remedy
+# `--status` hands out is `--install`, and on the boxes this exists for the provisioner resolves through
+# `$PWD` alone, so a re-install from any other directory dropped the pin, reported `changed=1` and exit 0.
+OUT="$(run_install Linux "$D" --install)"; RC=$?
+assert_eq "$RC" 0 "a re-install that cannot resolve a provisioner still succeeds"
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV2" \
+    "and KEEPS the pin the artifact already carried (no silent loss of the FILL half)"
+# A pin that is gone from disk is NOT carried forward — that would bake in a path that cannot run.
+rm -f "$PROV2"
+run_install Linux "$D" --install >/dev/null 2>&1
+assert_absent "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=" \
+    "a pin whose file no longer exists is NOT carried forward (it cannot run)"
 rm -f "$ARM"
 
 # ── T39: the timer's cadence has a DROP-IN route that drift cannot see ─────────────────
@@ -980,6 +997,30 @@ assert_eq "$RC" 1 "a [Timer] drop-in that changes the cadence exits 1"
 assert_contains "$OUT" "timer_dropin=$D/$UNIT_NAME.timer.d/cadence.conf" "naming the drop-in systemd actually reads"
 assert_contains "$OUT" "CADENCE" "and naming the fact it overrides"
 assert_contains "$OUT" "drift_artifact=no" "the base artifact is untouched — the drop-in is the whole defect"
+# ⛔ EVERY `On*` ELAPSE KEY, NOT THE THREE THE BASE TEMPLATE HAPPENS TO USE. systemd fires at every elapse
+# point it finds and a drop-in assignment ADDS one, so keying on the base template's own names let
+# `OnActiveSec=1min` fire the pass every minute and still report a clean box.
+printf '[Timer]\nOnActiveSec=1min\n' >"$D/$UNIT_NAME.timer.d/cadence.conf"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an extra elapse key (OnActiveSec=) added beside the template's own is caught too"
+assert_contains "$OUT" "timer_dropin=" "and named"
+# ⛔ AND `Persistent=` IS NOT A FALSE BLOCK: it applies to `OnCalendar=` only, and this unit deliberately
+# carries none — so a `Persistent=` drop-in changes nothing about when the pass fires.
+printf '[Timer]\nPersistent=true\n' >"$D/$UNIT_NAME.timer.d/cadence.conf"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "a Persistent= drop-in is NOT a failure (it changes nothing on an OnUnitActiveSec timer)"
+assert_absent "$OUT" "timer_dropin=" "and is not reported as a cadence override"
+# ⛔ THE GUARD MUST BE REACHABLE WHERE THE SCHEDULE IS CREATED, NOT ONLY WHERE IT IS READ. `--install` and
+# `--arm` refused a service drop-in from the start; a timer drop-in let them print `cadence=9min` and sign
+# a dated record for a box that fires hourly.
+printf '[Timer]\nOnUnitActiveSec=1h\n' >"$D/$UNIT_NAME.timer.d/cadence.conf"
+OUT="$(run_install Linux "$D" --install)"; RC=$?
+assert_eq "$RC" 1 "--install REFUSES rather than install/verify a unit pair whose cadence a drop-in overrides"
+assert_contains "$OUT" "REFUSING" "and says so"
+rm -f "$ARM"
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?
+assert_eq "$RC" 1 "--arm refuses BEFORE the dated record exists"
+assert_nofile "$ARM" "no arming record was written"
 rm -f "$ARM"
 
 # ── T38: --status scans the OTHER scope, and scopes the claim it makes ───────────────────
