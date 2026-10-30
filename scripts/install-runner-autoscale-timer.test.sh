@@ -496,6 +496,12 @@ assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "--dry-run" \
 # ── T16: a FAILED armed render leaves the box NOT armed ───────────────────────────────────
 # A record that outlives a failed --arm is an armed box the operator was told was not armed: the next
 # routine --install would silently re-arm from it. The record must be dropped, fail-closed.
+# ⚠️ CORRECTED (review finding P1): this case used to assert the record was KEPT, on the rationale that
+# "an armed artifact with no record is the state the design forbids" — but there IS NO artifact in this
+# fixture, so nothing was converging and the record existed only to arm the box on the next --install.
+# The assertion contradicted this case's own header, which already said "the record must be dropped,
+# fail-closed". The guard is precise now: the record survives only when an ARMED artifact backs it
+# (T42 covers that arm; before the fix, that state was reachable from BOTH branches).
 say_case "T16 a failed armed re-render never leaves an armed artifact without a record"
 mkdir -p "$T/tpl16"
 cp "$REPO/templates/systemd/$UNIT_NAME.timer" "$T/tpl16/"
@@ -506,12 +512,12 @@ rm -f "$ARM"
 ENVV=(TEMPLATES_DIR="$T/tpl16")
 OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "a failed armed render exits 1"
-assert_contains "$OUT" "STILL ARMED" "when the disarmed re-render ALSO fails it says STILL ARMED, not NOT ARMED"
-assert_file "$ARM" "and it KEEPS the record — an armed artifact with no record is the state the design forbids"
+assert_contains "$OUT" "NOT ARMED" "with no armed artifact to back it, the verb says NOT ARMED"
+assert_nofile "$ARM" "and the record is DROPPED, so the next routine --install cannot arm from it"
 # The complementary path (armed render fails while the DISARMED render succeeds) is not constructed
 # here on purpose: both renders share one template set, so a fixture that breaks one breaks the other.
 # An assertion that cannot fail the way it claims is worse than none - this suite shipped one (the
-# "no armed flag" line T15 used to carry). T4, T15 and T16 cover the three reachable states.
+# "no armed flag" line T15 used to carry). T4, T15, T16 and T42 cover the four reachable states.
 
 # ── T17: '%' is a systemd specifier, never a launchd one ──────────────────────────────────
 say_case "T17 '%' is refused on the systemd arm and allowed on the launchd arm"
@@ -1122,6 +1128,100 @@ say_case "T41 the suite mutates artifacts through box_sed_i, never a hand-rolled
 bare="$(grep -nE '^[[:space:]]*sed[[:space:]]+-i' "$HERE/install-runner-autoscale-timer.test.sh" || true)"
 assert_eq "$bare" "" "no bare sed -i invocation (it is silent on BSD and edits nothing)"
 assert_eq "$(command -v box_sed_i >/dev/null 2>&1 && echo yes)" "yes" "and the shim is really loaded, so the guard is not vacuous"
+
+# ── T42: an armed artifact DOES back a kept record — the other half of T16 ─────────────────
+# T16 proves the record is dropped when nothing is converging. The rule is not "always drop it": a record
+# may only be KEPT when an ARMED artifact backs it, because deleting it then would create the one state
+# the design forbids (an armed artifact with no record). Before the guard, BOTH branches kept it.
+say_case "T42 a kept arming record is backed by an actually-armed artifact"
+D="$T/c42"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+# the artifact is DISARMED here, so the failed-arm path must DROP the record (the T16 arm, re-proved)
+ENVV=(TEMPLATES_DIR="$T/tpl16")
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a failed arm over a DISARMED artifact exits 1"
+assert_nofile "$ARM" "and drops the record — nothing armed is converging"
+# now make the artifact genuinely ARMED by hand, then fail the arm again
+box_sed_i '/^ExecStart=/ s| --dry-run||' "$D/$UNIT_NAME.service"
+ENVV=(TEMPLATES_DIR="$T/tpl16")
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a failed arm over an ARMED artifact still exits 1"
+assert_contains "$OUT" "STILL ARMED" "and says STILL ARMED, because something IS armed"
+assert_file "$ARM" "keeping the record — an armed artifact with NO record is the state the design forbids"
+rm -f "$ARM"
+
+# ── T43: `--status` in ExecStart is a MEASURE mode, not a benign switch ──────────────────
+# The classifier listed `--status` as a switch that "changes nothing about whether a tick CONVERGES".
+# `runner_autoscale.py` builds the run as `dry_run=opts.status or opts.dry_run`, so it DOES: every tick
+# measures and repairs nothing — the `--apply` class in a word the pass accepts, certified ARMED exit 0.
+say_case "T43 an ExecStart carrying --status is not a green ARMED schedule"
+D="$T/c43"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1     # armed = no mode argument
+box_sed_i '/^ExecStart=/ s|$| --status|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--status in ExecStart is red, not certified ARMED"
+assert_contains "$OUT" "MEASURE ONLY" "naming what the tick actually does"
+assert_contains "$OUT" "dry_run=opts.status" "and the pass's own expression, so the operator can check it"
+assert_absent "$OUT" "mode=converge (ARMED" "the false ARMED verdict is gone"
+rm -f "$ARM"
+
+# ── T44: `--repo` is read back from the artifact's COMMAND LINE, not its environment ──────
+# Both templates pass the repo as an argument, so `artifact_env_value RUNNER_AUTOSCALE_REPO` was always
+# empty: `drift_inputs=repo` was dead code and an untouched artifact on a non-default pool reported
+# `drift_artifact=yes` for ever.
+say_case "T44 a non-default --repo is not permanent drift, and the difference is named"
+D="$T/c44"; fresh "$D"; rm -f "$ARM"
+ENVV=(RUNNER_AUTOSCALE_REPO="other/pool")
+run_install Linux "$D" --install >/dev/null 2>&1
+ENVV=()
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "--repo \"other/pool\"" "the artifact really converge another pool"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "the untouched artifact is not reported as drift"
+assert_contains "$OUT" "drift_artifact=no" "explicitly not drift"
+assert_contains "$OUT" "drift_inputs=repo" "and the reader/artifact difference is NAMED, not swallowed"
+
+# ── T45: `OnCalendar=` is an elapse point too ─────────────────────────────────────────────
+# `On[A-Za-z]*Sec` has no `Sec` in `OnCalendar`, so an added calendar fire left the base timer
+# byte-identical and got certified clean — the T39 false PASS, one key over.
+say_case "T45 an OnCalendar= drop-in is a cadence override, not a clean 9-minute box"
+D="$T/c45"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+mkdir -p "$D/$UNIT_NAME.timer.d"
+printf '[Timer]\nOnCalendar=hourly\n' >"$D/$UNIT_NAME.timer.d/calendar.conf"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a calendar fire added beside the template's own is caught"
+assert_contains "$OUT" "timer_dropin=" "and named"
+assert_contains "$OUT" "CADENCE" "as a cadence override"
+rm -f "$D/$UNIT_NAME.timer.d/calendar.conf"
+
+# ── T46: the unrecognised-argument message names the vocabulary the pass REALLY has ──────
+# It listed five of nine switches and claimed every other argument exits 2. `--install-unit` does not:
+# it writes and enables a competing unit pair and exits, which is a different consequence.
+say_case "T46 a recognised non-converging action gets its own consequence, not 'exit 2'"
+D="$T/c46"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+box_sed_i '/^ExecStart=/ s|$| --install-unit|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--install-unit in ExecStart is red"
+assert_contains "$OUT" "WRITES AND ENABLES" "naming its real consequence (a competing unit pair)"
+assert_contains "$OUT" "--check-units" "and the message lists the pass's full vocabulary"
+rm -f "$ARM"
+
+# ── T47: `--arm` NAMES why it cannot resolve a target, like every other verb ─────────────
+# The arm called `choose_target || return 1` bare, so the one verb an operator runs to make a box GROW
+# exited 1 with ZERO bytes of output — indistinguishable from a crash. Every other call site names it.
+# Reached the way a box really reaches it: no passwordless sudo (`SUDO=false` is the documented seam) and
+# no systemd user manager (`systemctl --user show-environment` fails).
+say_case "T47 --arm with no resolvable scheduler explains itself"
+D="$T/c47"; fresh "$D"; rm -f "$ARM"
+ENVV=(SUDO=false)
+OUT="$(run_install Linux - --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "an unresolvable target refuses"
+assert_contains "$OUT" "no scheduler available" "and says which dependency is missing"
+assert_contains "$OUT" "NOT silently skipping" "naming the failure this guard exists to prevent"
+assert_nofile "$ARM" "with no arming record written"
+rm -f "$ARM"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
