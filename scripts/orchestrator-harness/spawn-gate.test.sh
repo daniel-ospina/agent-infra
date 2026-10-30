@@ -2397,8 +2397,33 @@ case "$st" in
   *)              stfail=1 ;;
 esac
 ck "nonblocking-dispatch --status reports a cap-killed lane as FAILED, never as finished ($st)" $stfail
-grep -q 'cap 1s hit' <<<"$st"; rc=$?
-ck "…and NAMES the cap and the preserved snapshot, so the loss is visible in the fleet's accounting" $rc
+grep -q 'WALL backstop (verdict=exceeded-wallclock)' <<<"$st"; rc=$?
+ck "…and NAMES the bound (and the preserved snapshot), so the loss is visible in the fleet's accounting" $rc
+# ⛔ THE MARKER MUST NAME THE BOUND THAT FIRED, NOT THE LAUNCHER'S OWN CAP (#2888 review, P2-5).
+# `AGENT_CAP_HIT` now fires on a PROGRESS kill too (verdict=stalled, at ~the 2700 s allowance), so a
+# marker built from `$T` published `cap 7200s hit` over a worker the PROGRESS rule ended — a false
+# statement about WHICH bound ended it, the same defect class this change fixed in `[timeout]` and
+# `walltime.tsv`. Driven through the launcher's OWN worker exit path with a rig `$O/spawn-gate.sh`
+# whose `run_agent` plays that kill: the production surface is that exit path, and no suite may wait
+# for a real 45-minute progress kill. Written so it FAILS on the pre-fix code, which had no signal
+# to read and therefore always restated `$T`.
+PRG="$CAPRIG/prog"; mkdir -p "$PRG/state" "$PRG/logs"
+PWT="$CAPRIG/progwt"; mkdir -p "$PWT"
+cat > "$PRG/spawn-gate.sh" <<'RIG'
+LANE_BACKSTOP_S=7200
+run_agent() { # <cap> <log> <prompt> <label> — plays a PROGRESS kill at 2700 s, NOT the 7200 s cap
+  AGENT_CAP_HIT=1; AGENT_BOUND_VERDICT=stalled; AGENT_CAP_BOUND=2700
+  WIP_SNAPSHOT_RESULT=NOTHING-LOST; WIP_SNAPSHOT_DIR=""
+  return 143
+}
+RIG
+( cd "$PWT" && O="$PRG" bash "$HERE/nonblocking-dispatch.sh" prog "$PWT" "$BG/prompt" 7200 >"$PRG/dispatch.out" 2>&1 )
+n=0; while [ ! -s "$PRG/bg/prog.rc" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n+1)); done
+pst="$(O="$PRG" bash "$HERE/nonblocking-dispatch.sh" --status prog 2>&1)"
+grep -q 'PROGRESS bound (verdict=stalled) at 2700s' <<<"$pst"; rc=$?
+ck "…and a PROGRESS kill NAMES the progress bound it died on, not the launcher's 7200 s cap ($pst)" $rc
+grep -q 'cap 7200s hit' <<<"$pst"; rc=$?
+ck "…and it does NOT restate the caller's cap as though the cap were what fired ($pst)" $((1 - rc))
 # ⛔ AND IT MUST NOT SOFTEN A FAILED SNAPSHOT (VGATE cycle 3, F2, end to end). Same dispatch, but the
 # snapshot cannot be taken, so the status must say WORK NOT PRESERVED — never "nothing was lost".
 # ⛔ THE ARM'S PREMISE IS CORRECTED FOR #2409, NOT THE ASSERTION. "A cap kill OUTSIDE a git worktree"
