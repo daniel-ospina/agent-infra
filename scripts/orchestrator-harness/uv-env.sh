@@ -66,7 +66,19 @@ UV_ENV_COLD_CACHE_MB_DEFAULT=1024
 # `$CELL_HOME`, and resolving the cache under the ambient `$HOME` pinned `/root/.cache/uv` for a box
 # whose lanes then ran under `/tmp/cell-home` — two caches, no cross-sharing, every venv a full copy
 # (review finding). XDG_CACHE_HOME still wins, and a pinned UV_CACHE_DIR always wins.
-uv_env_cache_dir() { printf '%s\n' "${UV_CACHE_DIR:-${XDG_CACHE_HOME:-${1:-${HOME:-}}/.cache}/uv}"; }
+# ⛔ A PASSED BASE HOME OUTRANKS AN AMBIENT `XDG_CACHE_HOME` (review round 2, measured):
+# `XDG_CACHE_HOME=/root/.cache uv_env_apply /tmp/cell-home` pinned `/root/.cache/uv` — the very two-
+# cache defect the base-home parameter was added to remove, one variable over. On a cell, XDG can only
+# be an ambient leftover (nothing normalises it the way `setup_home` normalises `$HOME`), while a base
+# home is a statement about the home the lanes will run under. With NO base home passed, uv's own
+# precedence stands: `$XDG_CACHE_HOME/uv`, else `$HOME/.cache/uv`.
+uv_env_cache_dir() { # [base-home]
+  if [ -n "${1:-}" ]; then
+    printf '%s\n' "${UV_CACHE_DIR:-$1/.cache/uv}"
+  else
+    printf '%s\n' "${UV_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-}/.cache}/uv}"
+  fi
+}
 uv_env_link_mode() { printf '%s\n' "${UV_LINK_MODE:-hardlink}"; }
 
 # shell single-quote: the one quoting that is identical in bash 3.2 and 5.x.
@@ -81,9 +93,12 @@ uv_env_export_lines() {
 # `UV_ENV_DEFAULTED` records what this call supplied ("cache", "link", "cache link", or "none") so a
 # caller can SAY it defaulted instead of silently pinning a box — the #2159 defect was invisible.
 uv_env_apply() { # [base-home] — the home the CACHE default resolves under (defaults to $HOME)
-  local d="" base="${1:-${HOME:-}}"
+  local d="" base="${1:-}"
   case "${UV_CACHE_DIR:-}" in
-    '') UV_CACHE_DIR="$(uv_env_cache_dir "$base")"; d="cache" ;;
+    # An ABSENT argument is not an empty one: with no base home named, uv's own precedence applies
+    # (XDG_CACHE_HOME first). Passing `$HOME` unconditionally would have silently retired that knob.
+    '') if [ -n "$base" ]; then UV_CACHE_DIR="$(uv_env_cache_dir "$base")"; else UV_CACHE_DIR="$(uv_env_cache_dir)"; fi
+        d="cache" ;;
   esac
   case "${UV_LINK_MODE:-}" in
     '') UV_LINK_MODE="hardlink"; d="${d:+$d }link" ;;
@@ -92,15 +107,25 @@ uv_env_apply() { # [base-home] — the home the CACHE default resolves under (de
   # report that says "cache 0MB" for a directory nobody made is indistinguishable from a box whose
   # cache was deleted. The distinction is carried by `uv_env_report`, never by a fabricated `mkdir`.
   export UV_CACHE_DIR UV_LINK_MODE
-  # ⛔ RECORDED ONCE, NEVER OVERWRITTEN. Delivery paths apply this TWICE (the cell bring-up pins
-  # early so its children inherit, then re-applies after keys.env so an operator pin wins). If the
-  # second call recomputed the record it would see both variables now set — by the FIRST call's own
-  # default — and report `none` ("operator-set") for a pin the box defaulted itself, which is the
-  # exact mis-report this variable exists to prevent (review finding, measured: apply twice =>
-  # "cache link" then "none").
-  case "${UV_ENV_DEFAULTED:-}" in
-    '') UV_ENV_DEFAULTED="${d:-none}" ;;
+  # ⛔ PROVENANCE IS RECORDED BY VALUE, NOT ONCE-AND-FROZEN — both simpler rules are wrong, and both
+  # were measured on this file (review rounds 1 and 2):
+  #   * recomputing from "is it set now" reported `none` on the SECOND apply, because the FIRST call's
+  #     own default made it set: a cell that defaulted its cache was announced as operator-pinned;
+  #   * freezing the first record was the mirror image: a `keys.env` that pins the cache AFTER the
+  #     early apply (the bring-up's own order) kept reading `defaulted: cache link`, so every
+  #     operator-pinned cell got a false `warn:` and advice to do what it had already done.
+  # So each half we supply is remembered with the value we supplied, and a half counts as DEFAULTED
+  # only while the box still holds exactly that value.
+  case "$d" in
+    *cache*) [ -n "${UV_ENV_SUPPLIED_CACHE:-}" ] || UV_ENV_SUPPLIED_CACHE="$UV_CACHE_DIR" ;;
   esac
+  case "$d" in
+    *link*)  [ -n "${UV_ENV_SUPPLIED_LINK:-}" ] || UV_ENV_SUPPLIED_LINK="$UV_LINK_MODE" ;;
+  esac
+  d=""
+  if [ -n "${UV_ENV_SUPPLIED_CACHE:-}" ] && [ "$UV_CACHE_DIR" = "$UV_ENV_SUPPLIED_CACHE" ]; then d="cache"; fi
+  if [ -n "${UV_ENV_SUPPLIED_LINK:-}" ] && [ "$UV_LINK_MODE" = "$UV_ENV_SUPPLIED_LINK" ]; then d="${d:+$d }link"; fi
+  UV_ENV_DEFAULTED="${d:-none}"
   return 0
 }
 
@@ -277,19 +302,36 @@ uv_env_report() { # [--estate DIR]
 #   distinct_mb what `du -sk -c WT1 WT2 …` says             (the bytes actually held)
 #   shared_mb   the difference — bytes held by more than one name
 uv_env_distinct_bytes() { # <dir>...
-  local sum_kb=0 line kb d total="" all
+  local sum_kb=0 kb d total="" raw rc all unmeasured=0
   local -a dirs=()
   for d in "$@"; do
     [ -n "$d" ] && [ -e "$d" ] || continue
     dirs[${#dirs[@]}]="$d"
-    if kb="$(uv_env_du_kb "$d")"; then sum_kb=$(( sum_kb + kb )); fi
+    if kb="$(uv_env_du_kb "$d")"; then sum_kb=$(( sum_kb + kb )); else unmeasured=$(( unmeasured + 1 )); fi
   done
-  [ "${#dirs[@]}" -gt 0 ] || { printf 'du_sum_mb=0 distinct_mb=0 shared_mb=0 (no readable directory)\n'; return 1; }
-  all="$(du -skc "${dirs[@]}" 2>/dev/null | awk 'END{print $1}')"
-  case "${all:-}" in ''|*[!0-9]*) printf 'du_sum_mb=%s distinct_mb=? shared_mb=? (one-invocation du failed)\n' "$(uv_env_mb "$sum_kb")"; return 1 ;; esac
+  [ "${#dirs[@]}" -gt 0 ] || { printf 'du_sum_kb=0 distinct_kb=0 shared_kb=0 (no readable directory)\n'; return 1; }
+  # ⛔ THE WALK'S STATUS IS READ, NOT THE PIPELINE'S (review round 2, measured). `${PIPESTATUS[0]}` /
+  # an awk tail reports awk's status, so `du` exiting 1 on an unreadable subtree was invisible while it
+  # still printed a PARTIAL total; the per-dir sum then dropped that directory and the subtraction
+  # published `du_sum_mb=2 distinct_mb=8 shared_mb=0` — an IMPOSSIBLE result (distinct <= sum by
+  # construction), clamped to a "nothing is shared" that reads as measured and supports the deleted-venv
+  # remedy. A partial or unmeasurable read is reported as PARTIAL, never as a number.
+  raw="$(du -skc "${dirs[@]}" 2>/dev/null)"; rc=$?
+  all="$(printf '%s\n' "$raw" | awk 'END{print $1}')"
+  if [ "$rc" -ne 0 ] || [ "$unmeasured" -gt 0 ]; then
+    printf 'du_sum_mb=%s distinct_mb=? shared_mb=? (PARTIAL walk: %s unmeasurable dir(s), du rc=%s — fix the unreadable subtree, never read this as "nothing is shared")\n' \
+      "$(uv_env_mb "$sum_kb")" "$unmeasured" "$rc"
+    return 1
+  fi
+  case "${all:-}" in
+    ''|*[!0-9]*) printf 'du_sum_mb=%s distinct_mb=? shared_mb=? (one-invocation du gave no total)\n' "$(uv_env_mb "$sum_kb")"; return 1 ;;
+  esac
   local shared_kb=$(( sum_kb - all ))
-  [ "$shared_kb" -ge 0 ] || shared_kb=0
-  printf 'du_sum_mb=%s distinct_mb=%s shared_mb=%s\n' "$(uv_env_mb "$sum_kb")" "$(uv_env_mb "$all")" "$(uv_env_mb "$shared_kb")"
+  [ "$shared_kb" -ge 0 ] || { printf 'du_sum_kb=%s distinct_kb=%s (INCONSISTENT: distinct > per-dir sum, which cannot happen — refusing to report a shared figure)\n' "$sum_kb" "$all"; return 1; }
+  # MB for reading, KiB for the sub-megabyte case: `uv_env_mb` truncates, so a real 52 KiB gap printed
+  # as `shared_mb=0` — a measured zero from a rounded number (review round 2).
+  printf 'du_sum_mb=%s distinct_mb=%s shared_mb=%s du_sum_kb=%s distinct_kb=%s shared_kb=%s\n' \
+    "$(uv_env_mb "$sum_kb")" "$(uv_env_mb "$all")" "$(uv_env_mb "$shared_kb")" "$sum_kb" "$all" "$shared_kb"
 }
 
 uv_env_usage() {

@@ -51,6 +51,17 @@ ck "apply: XDG_CACHE_HOME is honoured, not overridden (the standard knob)" \
    '[ "$(env -u UV_CACHE_DIR -u UV_LINK_MODE XDG_CACHE_HOME=/xdg bash -c ". \"\$1\"; uv_env_apply; printf %s \"\$UV_CACHE_DIR\"" _ "$LIB")" = "/xdg/uv" ]'
 ck "apply: a pinned cache dir and link mode WINS, and the record says nothing was defaulted" \
    '[ "$(UV_CACHE_DIR=/big/uv UV_LINK_MODE=copy bash -c ". \"\$1\"; uv_env_apply; printf \"%s|%s|%s\" \"\$UV_CACHE_DIR\" \"\$UV_LINK_MODE\" \"\$UV_ENV_DEFAULTED\"" _ "$LIB")" = "/big/uv|copy|none" ]'
+ck "apply: an explicit BASE HOME outranks an ambient XDG_CACHE_HOME (a cell's ambient XDG is a leftover)" \
+   '[ "$(env -u UV_CACHE_DIR -u UV_LINK_MODE XDG_CACHE_HOME=/root/.cache bash -c ". \"\$1\"; uv_env_apply /tmp/cell-home; printf %s \"\$UV_CACHE_DIR\"" _ "$LIB")" = "/tmp/cell-home/.cache/uv" ]'
+ck "...and with NO base home, XDG_CACHE_HOME still wins (uv own precedence is preserved)" \
+   '[ "$(env -u UV_CACHE_DIR -u UV_LINK_MODE XDG_CACHE_HOME=/xdg bash -c ". \"\$1\"; uv_env_apply; printf %s \"\$UV_CACHE_DIR\"" _ "$LIB")" = "/xdg/uv" ]'
+# An operator pin applied AFTER our default (the bring-up order: default first, keys.env second) must
+# flip the record to operator-set. Freezing the first record got this wrong in the other direction
+# (a pinned cell was reported "defaulted: cache link"), so the record is kept BY VALUE.
+ck "provenance: a later operator pin flips the record (a defaulted cache is not reported as operator-set)" \
+   '[ "$(env -u UV_CACHE_DIR -u UV_LINK_MODE bash -c ". \"\$1\"; uv_env_apply /tmp/h1; UV_CACHE_DIR=/data/uv; uv_env_apply /tmp/h1; printf %s \"\$UV_ENV_DEFAULTED\"" _ "$LIB")" = "link" ]'
+ck "provenance: re-applying with nothing changed keeps the honest defaulted record" \
+   '[ "$(env -u UV_CACHE_DIR -u UV_LINK_MODE bash -c ". \"\$1\"; uv_env_apply /tmp/h1; uv_env_apply /tmp/h1; printf %s \"\$UV_ENV_DEFAULTED\"" _ "$LIB")" = "cache link" ]'
 ck "apply: only the UNSET half is defaulted (a pinned cache with no link mode)" \
    '[ "$(env -u UV_LINK_MODE UV_CACHE_DIR=/big/uv bash -c ". \"\$1\"; uv_env_apply; printf \"%s|%s\" \"\$UV_CACHE_DIR\" \"\$UV_ENV_DEFAULTED\"" _ "$LIB")" = "/big/uv|link" ]'
 ck "export lines are shell-parseable and round-trip (a path with a space survives)" \
@@ -134,6 +145,19 @@ noShare="$(bash "$LIB" distinct "$T/estate2/wt1" "$T/estate2/wt2")"
 case "$noShare" in *shared_mb=0*) ck "no hardlinks => shared_mb=0 (the figure is not a constant)" true ;; *) bad "no hardlinks must report shared_mb=0 (got: $noShare)";; esac
 out="$(UV_CACHE_DIR="$T/cold-cache" bash "$LIB" distinct "$T/does-not-exist")"
 case "$out" in *"no readable directory"*) ck "an unreadable path is NAMED, not reported as 0 bytes" true ;; *) bad "an unreadable path must be named (got: $out)";; esac
+# A PARTIAL walk must never be published as a number: "du_sum_mb=2 distinct_mb=8" (distinct > sum) was
+# an impossible, clamped-to-0 result that read as "nothing is shared" (review round 2).
+mkdir -p "$T/partial/a" "$T/partial/b/locked"
+head -c 2900000 /dev/zero > "$T/partial/a/ok.bin"
+head -c 5900000 /dev/zero > "$T/partial/b/locked/big.bin"; chmod 000 "$T/partial/b/locked" 2>/dev/null
+pout="$(bash "$LIB" distinct "$T/partial/a" "$T/partial/b" 2>&1)"; prc=$?
+chmod 755 "$T/partial/b/locked" 2>/dev/null
+case "$pout" in *"PARTIAL walk"*) ck "a PARTIAL walk is reported as PARTIAL, not as a measured shared figure" true ;; *) bad "a partial walk must be reported as PARTIAL (got: $pout)";; esac
+ck "...and it returns non-zero (a caller must not read a partial walk as a measurement)" '[ "$prc" -ne 0 ]'
+# ...and a sub-megabyte gap is still visible in the tool own output (MB truncation hid a real 52 KiB).
+mkdir -p "$T/small/a" "$T/small/b"; head -c 100000 /dev/zero > "$T/small/a/x.bin"; ln -f "$T/small/a/x.bin" "$T/small/b/x.bin"
+sout="$(bash "$LIB" distinct "$T/small/a" "$T/small/b")"
+case "$sout" in *shared_kb=*) ok "a sub-megabyte gap is visible in KiB beside the rounded MB ($sout)" ;; *) bad "distinct output shape (got: $sout)";; esac
 
 echo
 echo "── (6) THE DELIVERY PATHS (asserted on the shipped files) ──"
@@ -167,7 +191,7 @@ case "$mut_out" in *verdict=COLD-CACHE*) bad "mutation: the cold-cache fixture m
 # (5) mutated: distinct computed per DIR (the defect) instead of one invocation. The hardlinked pair
 # must then show shared_mb=0 — i.e. the accounting fix is what produces the gap.
 MUT2="$T/uv-env.nodistinct.sh"
-awk '{ if ($0 ~ /all="\$\(du -skc/) print "  all=\"$sum_kb\""; else print }' "$LIB" > "$MUT2"
+awk '{ if ($0 ~ /all="\$\(printf/) print "  all=\"$sum_kb\""; else print }' "$LIB" > "$MUT2"
 mut2="$(bash "$MUT2" distinct "$T/estate/wt1" "$T/estate/wt2")"
 case "$mut2" in *shared_mb=0*) ok "mutation: with distinct computed as a per-dir sum, shared_mb collapses to 0 (the fix is what measures the gap)" ;; *) bad "mutation: the per-dir-sum mutation should report shared_mb=0 (got: $mut2)";; esac
 
