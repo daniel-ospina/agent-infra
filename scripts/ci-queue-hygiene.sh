@@ -209,6 +209,15 @@ PY
   case "${total:-}" in
     ''|*[!0-9]*) printf 'open-PR TOTAL is not a number (%s)' "$total" >"$work/prs.err"; return 1 ;;
   esac
+  # ⛔ THE COMPLETENESS GATE'S OWN OPERAND IS A NUMBER TOO (review cycle 2, finding 1). `test -ne`
+  # compares INTEGERS: on an operand it cannot represent it fails rc=2, the `if` below is never taken,
+  # and this returns 0 on a PROVABLY INCOMPLETE list — so runs whose open PR was not in the short list
+  # are cancelled. That is the identical mechanism to the `--grace` inversion fixed in the previous
+  # commit, left in the one gate whose whole job is "its truncation CANCELS live work". Bounded the
+  # same way, by string LENGTH, because a length comparison cannot itself overflow.
+  # (Latent, stated honestly: GitHub cannot report a 19-digit total_count today. It is hardened anyway,
+  # because the guard's cost is one line and its failure direction is destroying work.)
+  _numeric_bound TOTAL "$total" 9
   printf '%s' "$total" >"$work/prs.total" || return 1
   if [ "$n" -ne "$total" ]; then
     printf 'open PRs read=%s but search reports total=%s (limit %s)' "$n" "$total" "$PR_LIMIT" \
@@ -260,7 +269,7 @@ for st in queued pending waiting; do
   case "$?" in
     0) ;;
     2) fail_closed "the '$st' queue read is INCOMPLETE (total_count reports more runs than the rows returned) — refusing to reason about a partial queue; re-read or raise the page size" ;;
-    *) fail_closed "could not read the '$st' run list ($(head -c 300 "$work/runs-$st.err" 2>/dev/null))" ;;
+    *) fail_closed "could not read the QUEUE '$st' run list ($(head -c 300 "$work/runs-$st.err" 2>/dev/null))" ;;
   esac
 done
 
