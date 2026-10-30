@@ -933,6 +933,53 @@ rm -f "$D/$UNIT_NAME.timer"
 OUT="$(run_install Linux "$D" --status)"
 assert_contains "$OUT" "drift_artifact=yes" "a MISSING timer is drift, not silence"
 assert_contains "$OUT" "drift_parts=service=no timer=yes" "and the attribution says which artifact is absent"
+# ⛔ AND THE RENDER MUST RESOLVE WHAT THE INSTALL PATH RESOLVED. The provisioner is baked into the
+# artifact as a WHOLE LINE ({{PROVISIONER_ENV}} is in both templates) and `resolve_provisioner` decides
+# between a pin and nothing. `--install` called it; `--status` did not, so the status render emitted no
+# Environment= line while the installed file carried the pin — permanent `drift_artifact=yes` on every
+# box that HAS a provisioner, with the `--install` remedy answering `changed=0` and changing nothing.
+# ENVV pins the same value to both verbs here, so the only variable is the missing resolution.
+PROV2="$T/home/prov2.sh"; printf '#!/bin/sh\n' >"$PROV2"; chmod +x "$PROV2"
+D="$T/c37c"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV2")
+run_install Linux "$D" --install >/dev/null 2>&1; ENVV=()
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV2" \
+    "precondition: the install baked the provisioner pin into the artifact"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV2")
+OUT="$(run_install Linux "$D" --status)"; ENVV=()
+assert_contains "$OUT" "drift_artifact=no" \
+    "--status resolves the SAME provisioner, so a pinned artifact is not reported as permanent drift"
+assert_contains "$OUT" "drift_parts=service=no timer=no" "…both artifacts match what this installer would write now"
+assert_contains "$OUT" "provisioner=$PROV2" "and the readiness report names the pin the artifact carries"
+# The control: WITHOUT the pin the artifact really does differ from what an install would write, so the
+# signal must still fire — the fix must not make drift unconditionally green.
+OUT="$(run_install Linux "$D" --status)"
+assert_contains "$OUT" "drift_parts=service=yes" "without the pin the same artifact IS reported as drifted (the fix is not a blanket green)"
+assert_contains "$OUT" "provisioner=absent" "and the reason is named"
+rm -f "$ARM"
+
+# ── T39: the timer's cadence has a DROP-IN route that drift cannot see ─────────────────
+# The drift `cmp` reads the BASE artifact, so a `$UNIT_NAME.timer.d/*.conf` carrying
+# `OnUnitActiveSec=1h` makes the pass fire hourly while the base file stays byte-identical to what
+# this installer would write — `drift_artifact=no`, `drift_parts=… timer=no`, exit 0. The service side
+# has had this arm all along (T24); the cadence side did not, so the false PASS T37 closes on the base
+# file simply moved one directory over.
+say_case "T39 a [Timer] drop-in is an override, and a harmless one is not"
+D="$T/c39"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+# Control first: a timer drop-in that changes NO cadence must not red the verb (a false block).
+mkdir -p "$D/$UNIT_NAME.timer.d"
+printf '[Unit]\nDescription=a harmless annotation\n' >"$D/$UNIT_NAME.timer.d/note.conf"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "a timer drop-in that sets no cadence key is NOT a failure (no false block)"
+assert_absent "$OUT" "timer_dropin=" "and it is not reported as an override"
+# Now the real thing: the cadence itself, exactly as an operator would retune it by hand.
+printf '[Timer]\nOnUnitActiveSec=1h\n' >"$D/$UNIT_NAME.timer.d/cadence.conf"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a [Timer] drop-in that changes the cadence exits 1"
+assert_contains "$OUT" "timer_dropin=$D/$UNIT_NAME.timer.d/cadence.conf" "naming the drop-in systemd actually reads"
+assert_contains "$OUT" "CADENCE" "and naming the fact it overrides"
+assert_contains "$OUT" "drift_artifact=no" "the base artifact is untouched — the drop-in is the whole defect"
 rm -f "$ARM"
 
 # ── T38: --status scans the OTHER scope, and scopes the claim it makes ───────────────────
