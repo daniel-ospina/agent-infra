@@ -717,9 +717,15 @@ O16="$T/cl16"; mkdir -p "$O16/state"
   sed -n '/^claim_lease_live() {/,/^}/p' "$LOOP"
   sed -n '/^_this_host() {/,/^}/p' "$LOOP"
   sed -n '/^claim_live() {/,/^}/p' "$LOOP"
+  sed -n '/^claim_selection_verdict() {/,/^}/p' "$LOOP"
   sed -n '/^claim_foreign_live() {/,/^}/p' "$LOOP"
 } > "$O16/claimlive.sh"
+# agent-infra#2466: `claim_foreign_live` is now a mapping over `claim_selection_verdict`, which in turn
+# calls claims.sh's `claim_snapshot_verdict`. Extracting the outer function without the middle one made
+# the middle call exit 127 — which is fail-closed in the predicate, so every case read OWNED and the
+# assertions graded a missing extraction rather than the rule.
 [ -s "$O16/claimlive.sh" ] && grep -q 'claim_lease_live()' "$O16/claimlive.sh" \
+  && grep -q 'claim_selection_verdict()' "$O16/claimlive.sh" \
   && grep -q 'claim_foreign_live()' "$O16/claimlive.sh"
 ck "O16 (setup) the readers are extractable from the shipped orch-loop.sh" $?
 printf '%s\n' "boxOldName" > "$O16/state/claim-hosts"
