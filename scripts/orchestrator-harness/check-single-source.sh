@@ -422,6 +422,19 @@ repo_path_default_hits() {
       val = ln
       sub(/^REPO=/, "", val)                              # the value, without the assignment
       sub(/[ \t]+$/, "", val)
+      # ⛔ A TRAILING COMMENT IS NOT PART OF THE VALUE (#3054 review, P1). `REPO="/tmp/cell-ai" # a
+      # cell path` is exactly how someone re-introduces this defect WITH an explanation, and it walked
+      # through: the comment stops the value ending in a quote, so the quote-strip below never ran and
+      # the value never looked like a path. Strip the comment — but only when what remains is
+      # QUOTE-BALANCED, because `REPO="/x # y"` is ONE path that happens to contain a hash and
+      # cutting it there would hide it instead.
+      vnc = val
+      if (sub(/[ \t]+#.*$/, "", vnc)) {
+        nq = 0
+        for (i = 1; i <= length(vnc); i++)
+          if (substr(vnc, i, 1) == "\"" || substr(vnc, i, 1) == q39) nq++
+        if (nq % 2 == 0) val = vnc
+      }
       # One layer of MATCHING quotes off, so `${REPO:-…}` is seen as the expansion it is (and not as a
       # string that happens to start with a quote). A value quoted only on one side is left alone.
       q = substr(val, 1, 1)
