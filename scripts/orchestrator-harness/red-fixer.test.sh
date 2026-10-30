@@ -477,11 +477,19 @@ OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
   O="$OL"; LOG="$OL/log"; PL_MOD=1
   . "$HERE/pr-owner-liveness.sh"
   . "$TMP/ownerlive.sh"
-  # arm 1 must still be ASKED with the shipped argument order, even though it is stubbed out here: the
-  # marker line makes a wrong-argument call OBSERVABLE (a silent `return 1` would let `pr_owner_live`
-  # reach arm 3 for the wrong reason and this arm would grade a coincidence). #3095 review, cycle 2.
+  # arm 1 must still be ASKED with the shipped argument order, even though it is stubbed out here. Two
+  # things make that real, and NEITHER is optional (#3095 review, cycle 3):
+  #   * a wrong-argument call leaves a marker (`ARM1=wrong-args`); and
+  #   * the branch argument is driven NON-EMPTY. Driven as `""` — which is how this fixture used to call
+  #     it — `[ "$3" = "" ]` is satisfied by a TWO-argument call too, so the assertion could not see a
+  #     dropped `br`, which is the one argument the live-cwd arm of the shipped `pr_owned` is gated on.
+  #   * and the call must HAPPEN at all: a stub that is never called proves nothing, so the count is
+  #     asserted below against the number of drives. Measured before this: with the shipped arm-1 call
+  #     DELETED from `pr_owner_live`, this fixture still printed the ✅ line.
+  _a1_calls=0
   pr_owned() {
-    { [ "$1" = "4242" ] && [ "$2" = "$H" ] && [ "$3" = "" ]; } || echo 'ARM1=wrong-args'
+    _a1_calls=$((_a1_calls + 1))
+    { [ "$1" = "4242" ] && [ "$2" = "$H" ] && [ "$3" = "fix/thing" ]; } || echo 'ARM1=wrong-args'
     return 1
   }
   sess() { return 1; }
@@ -496,15 +504,17 @@ OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
   # (60 s) so an interrupt costs at most a minute. #3095 review P2.
   trap 'kill "$_pid" 2>/dev/null' EXIT
   printf '%s\n' "$_pid" > "$OL/state/mergeclaim-4242.lock"
-  if pr_owner_live 4242 "$H" ""; then echo 'LIVE=owned'; else echo 'LIVE=not-owned'; fi
+  if pr_owner_live 4242 "$H" fix/thing; then echo 'LIVE=owned'; else echo 'LIVE=not-owned'; fi
   kill "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null
-  if pr_owner_live 4242 "$H" ""; then echo 'DEAD=owned'; else echo 'DEAD=released'; fi
+  if pr_owner_live 4242 "$H" fix/thing; then echo 'DEAD=owned'; else echo 'DEAD=released'; fi
   [ -f "$OL/state/mergeclaim-4242.lock" ] && echo 'LOCK=kept' || echo 'LOCK=gone'
   kill "$_pid" 2>/dev/null
+  echo "ARM1_CALLS=$_a1_calls"
 ) > "$OL/out" 2>&1
 case "$(cat "$OL/out")" in
   *'ARM1=wrong-args'*) bad "(2b) the shipped predicate called arm 1 with the WRONG arguments: $(tr '\n' ' ' < "$OL/out")" ;;
-  *) ok "(2b) arm 1 is asked with the shipped argument order (stubbed out, but not argument-blind)" ;;
+  *'ARM1_CALLS=2'*) ok "(2b) arm 1 is asked twice with the shipped argument order (pr, head, and a NON-EMPTY branch — stubbed out, but not argument-blind)" ;;
+  *) bad "(2b) arm 1 was asked $(sed -n 's/.*ARM1_CALLS=//p' "$OL/out" | head -1) time(s), not 2 — `pr_owner_live` dropped or reordered the arm-1 call, and a stub that is never called proves nothing: $(tr '\n' ' ' < "$OL/out")" ;;
 esac
 case "$(cat "$OL/out")" in
   *'LIVE=owned'*) ok "(2b) a REAL live worker holding the PR's lock reads OWNED — a red-fixer sees the fixer that is actually running" ;;
