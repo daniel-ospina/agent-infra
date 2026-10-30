@@ -233,11 +233,19 @@ UNIT_LANE=8
 # (i1) PINNED: with the allowance governing and a backstop above it, the lane finishes uncensored.
 # (Not a pre-fix detector — see the label note above; `--wall 12` also means the old flat cap is never
 # crossed here, so "survives past the old cap" would be an over-claim for this fixture.)
-res="$(drive "$BOUND" i1 2 12 "$TMP/logs/i1.log" "$TMP/bin/units.sh" "$TMP/logs/i1.log" "$UNIT_LANE")"
+# ⛔ THE WALL IS NOT THE SUBJECT OF THIS ARM, SO IT MUST NOT BE A FUNCTION OF BOX LOAD: 8 units at
+# `sleep 1` each nominally take 8 s, but MEASURED on a loaded box (load average 22–39) the same fixture
+# took 17 s, so a 12 s wall made this PINNED case red for a reason that has nothing to do with the
+# bound — a timing flake, not a defect. 24 s keeps the ceiling well clear of the fixture at both
+# loads while still being above the allowance, which is the only ordering this case depends on.
+res="$(drive "$BOUND" i1 2 24 "$TMP/logs/i1.log" "$TMP/bin/units.sh" "$TMP/logs/i1.log" "$UNIT_LANE")"
 [ "$res" = "rc=0 verdict=finished" ]; ck "(i1) [PINNED] a lane that keeps COMPLETING units finishes with the bound silent → $res" $?
 sil_i1="$(nfield "$TMP/logs/i1.log" silent)"
-[ -n "$sil_i1" ] && [ "$sil_i1" -lt 2 ]; rc=$?
-ck "(i1) …and it really was progressing the whole way (silent=${sil_i1:-?}s < 2s, elapsed=$(nfield "$TMP/logs/i1.log" elapsed)s)" $rc
+# ⛔ `-le 2`, NOT `< 2`: under a loaded box the unit loop stretches (MEASURED: 8 units × `sleep 1`
+# took 17 s at load average 22–39), so the last quiet gap before a final unit lands can reach the
+# 2 s sample interval. `> 2` would still mean the live bound should have killed the lane.
+[ -n "$sil_i1" ] && [ "$sil_i1" -le 2 ]; rc=$?
+ck "(i1) …and it really was progressing the whole way (silent=${sil_i1:-?}s <= 2s, elapsed=$(nfield "$TMP/logs/i1.log" elapsed)s)" $rc
 
 # (i2) PINNED: the same working lane IS killed when the backstop sits below its work (the shipped
 # 2400 < 2700 shape, armed explicitly). Asserted on the verdict AND on `silent`, because "killed at the
@@ -279,6 +287,25 @@ ck "(i0) the BACKSTOP default (${WALL_DEF:-?}s) sits ABOVE the allowance (${IDLE
 SEAM="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$GATE" | head -1)"
 [ -n "${SEAM:-}" ] && [ "$SEAM" -gt "${IDLE_DEF:-0}" ]; rc=$?
 ck "(i0) the shipped lane BACKSTOP (LANE_BACKSTOP_S=${SEAM:-?}s) is above the allowance, so a wedged lane dies by PROGRESS, never by the wall" $rc
+# ⛔ AND THE TWO BACKSTOP LITERALS ARE THE SAME ONE (agent-infra#2999 review, P2-4). `lane-bound.sh`
+# resolves its own default (`num_or "${LANE_BOUND_WALL_S:-}" 7200`) while `spawn-gate.sh` declares the
+# seam (`LANE_BACKSTOP_S`) — two copies of one decision, and the same block pins the derived forms
+# (`ai-drainer`, `chain-merge`, `pr-doctor`) to the seam. Pinned here rather than deduped through
+# `${LANE_BACKSTOP_S:-7200}` so the helper stays standalone (it is also run with `run`, by launchers
+# that never source spawn-gate.sh): the pair cannot drift unnoticed either way.
+[ "${WALL_DEF:-x}" = "${SEAM:-y}" ]; rc=$?
+ck "(i0) lane-bound's BACKSTOP default (${WALL_DEF:-?}s) IS the harness seam (LANE_BACKSTOP_S=${SEAM:-?}s) — one number, two files, no drift" $rc
+# ⛔ THE CONTROLLER'S STALE-WORKER REAPER MUST NOT PRE-EMPT THAT SAME ALLOWANCE (agent-infra#2999
+# review, P1). `reap_stale_workers` closes a worker on LOG SILENCE alone — it reads no CPU subtree and
+# no lane-bound verdict — so at its old 40 min (2400 s) it was the SAME flat cap #2888 retired from the
+# lane itself, one layer up: a fixer working silently past 40 min was closed with no `[lane-bound]
+# VERDICT`, no `walltime.tsv` row and no cap snapshot (the censoring MOVED, not removed). The floor is
+# enforced at runtime too (`_stale_floor_raise`), but this pins the shipped pair so a future edit to
+# either number reddens here instead of at 3 a.m.
+LOOP="$HERE/orch-loop.sh"
+STALE_DEF="$(sed -n 's/^STALE_MIN="${STALE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$LOOP" | head -1)"
+[ -n "${STALE_DEF:-}" ] && [ $(( STALE_DEF * 60 )) -gt "${IDLE_DEF:-0}" ]; rc=$?
+ck "(i0) the reaper's STALE_MIN (${STALE_DEF:-?} min = $(( ${STALE_DEF:-0} * 60 ))s) is ABOVE the progress allowance (${IDLE_DEF:-?}s), so a working-but-quiet lane is not closed by the controller" $rc
 PRD="$HERE/../pr-doctor.py"
 PRD_DEF="$(sed -n 's/^DEFAULT_SPAWN_BACKSTOP_S = \([0-9][0-9]*\).*/\1/p' "$PRD" | head -1)"
 [ -n "${PRD_DEF:-}" ] && [ "$PRD_DEF" = "$SEAM" ]; rc=$?
@@ -286,6 +313,16 @@ ck "(i0) pr-doctor's backstop default (${PRD_DEF:-?}s) equals the harness seam (
 REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
 [ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
 ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc
+# ⛔ AND THE TWO REAP WINDOWS MUST NOT OVERLAP (agent-infra#2999 review, F4). `LIVE_MIN` is the
+# capacity census's "this lane's log moved, so it is live" window; `LANE_IDLE_MIN` is the reap
+# candidate gate. With 125 > 120 a lane idle 121-125 min was counted LIVE for capacity AND was a reap
+# CANDIDATE — two shipped instruments disagreeing about the same lane in the same band. The fix moved
+# the idle window to 180; this pins the ordering so neither number can be edited back into overlap.
+REAP_IDLE="$(sed -n 's/^LANE_IDLE_MIN="${LANE_REAP_IDLE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
+[ -n "${REAP_IDLE:-}" ] && [ "${REAP_LIVE:-0}" -lt "$REAP_IDLE" ]; rc=$?
+ck "(i0) the reaper's IDLE window (${REAP_IDLE:-?} min) is ABOVE its LIVE window (${REAP_LIVE:-?} min), so no lane is live-for-capacity and a reap candidate at once" $rc
+[ -n "${REAP_IDLE:-}" ] && [ $(( REAP_IDLE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
+ck "(i0) …and ABOVE the BACKSTOP (${SEAM:-?}s), so the reaper cannot call a lane finished while its own backstop still lets it run" $rc
 
 # ⛔ THE TWO CONSUMERS THAT OUTLIVE THE LANE, AND THEREFORE READ ITS CLOCK THEMSELVES (agent-infra#2888).
 # Neither sources spawn-gate.sh, so each carries the seam as a literal fallback — which is exactly the
@@ -475,6 +512,64 @@ want "$res" "bound=exceeded-wallclock"; rc=$?
 ck "(h3) LANE_BOUND_WALL_S reaches the bound through run_agent (it used to be an inert knob) ($res)" $rc
 grep -q 'backstop OVERRIDDEN by LANE_BOUND_WALL_S=3' "$TMP/logs/h3.log"; rc=$?
 ck "(h3) …and the override is NAMED in the lane log, so the bound that ran and the bound reported cannot disagree" $rc
+
+# ⛔ (h4) THE SEAM MAY ONLY **TIGHTEN** (agent-infra#2999 review, F1). The knob is documented as an
+# operator override, but the bound that RUNS must never exceed the bound the caller sized its claim
+# LEASE from: `fix-one.sh` issues `FIX_LEASE = FIX_BOUND + 1200` and `merge-one.sh`
+# `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300`, and NOTHING re-derives from this env seam. An override
+# ABOVE the caller's `$t` would therefore run a lane past its own claim, a peer would read the head as
+# free and dispatch a SECOND lane on it — the duplicate-dispatch class #2888 removed from `fix-one.sh`,
+# back on a new path. Driven on the TIMING, not on the wording: caller 3 s, knob 9 s, idle axis off, so
+# the lane's end time IS the resolved backstop. Pre-fix (`LANE_BOUND_WALL_S` simply WINS) this arm dies
+# at ~9 s; post-fix it dies at ~3 s.
+# A silent, long-running stub: the wall is the only axis that can end it.
+printf '#!/bin/sh\necho PI_STARTED >> "$PI_LOG"\nsleep 60\n' > "$TMP/bin/pi"; chmod +x "$TMP/bin/pi"
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+        DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=0 LANE_BOUND_WALL_S=9 \
+        bash "$TMP/bin/drive_ra.sh" "$GATE" 3 "$TMP/logs/h4.log" "$TMP/brief.txt")"
+want "$res" "bound=exceeded-wallclock"; rc=$?
+ck "(h4) a LANE_BOUND_WALL_S ABOVE the caller's bound cannot extend the run past it ($res)" $rc
+# ⛔ ASSERT THE BOUND THAT ARMED, NOT `elapsed`: `run_agent`'s own overhead (capability probe, wip
+# rescue, group reap) is tens of seconds on a loaded box, so a wall-clock assertion on `elapsed`
+# measures the box instead of the bound. `wall_limit` is the value the helper was really handed, and
+# pre-fix it reads 9s — that is the discrimination.
+grep -q '\[timeout\] .*wall_limit=3s' "$TMP/logs/h4.log"; rc=$?
+ck "(h4) …the helper is HANDED the caller's 3s, not the knob's 9s" $rc
+grep -q 'CLAMPED to it' "$TMP/logs/h4.log"; rc=$?
+ck "(h4) …and the clamp is NAMED in the lane log, so the bound that ran and the bound asked for cannot disagree" $rc
+! grep -q 'OVERRIDDEN by LANE_BOUND_WALL_S=9' "$TMP/logs/h4.log"; rc=$?
+ck "(h4) …and it is NOT reported as an honoured override" $rc
+[ "$(nfield "$TMP/logs/h4.log.lanebound" wall_bound)" = "3" ]; rc=$?
+ck "(h4) …and the VERDICT line records the bound that really armed (wall_bound=3s, not 9s)" $rc
+
+# ⛔ (h5) A BARE `0` IS A TYPO, NOT A FLEET-WIDE OFF SWITCH (agent-infra#2999 review, P2-2). The same
+# hunk refuses `0` for `LANE_BACKSTOP_S` two contexts away ("a typo must never silently disarm it");
+# before this change the knob was inert through `run_agent`, so honouring it is what made a bare `0`
+# reachable — and one stray character in an env file would disarm the absolute backstop of every lane
+# on the box. `--wall 0` from a CALLER stays the explicit, per-caller switch (that is (i)-class
+# behaviour, already covered). Driven the same way: caller 3 s, knob 0, idle off. Pre-fix the wall is
+# genuinely 0 and the lane runs to its own end; post-fix the caller's 3 s still governs.
+printf '#!/bin/sh\necho PI_STARTED >> "$PI_LOG"\nsleep 12\n' > "$TMP/bin/pi"; chmod +x "$TMP/bin/pi"
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+        DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=0 LANE_BOUND_WALL_S=0 \
+        bash "$TMP/bin/drive_ra.sh" "$GATE" 3 "$TMP/logs/h5.log" "$TMP/brief.txt")"
+want "$res" "bound=exceeded-wallclock"; rc=$?
+ck "(h5) LANE_BOUND_WALL_S=0 does NOT disarm the backstop of every lane on the box ($res)" $rc
+grep -q '\[timeout\] .*wall_limit=3s' "$TMP/logs/h5.log"; rc=$?
+ck "(h5) …the caller's 3s bound still governs (wall_limit=3s, not 0s)" $rc
+grep -q 'treated as a TYPO, not an off switch' "$TMP/logs/h5.log"; rc=$?
+ck "(h5) …and the typo is NAMED, so an operator sees why the lane still ended" $rc
+# …and a NON-NUMERIC value is refused the same way (the other typo shape).
+printf '#!/bin/sh\necho PI_STARTED >> "$PI_LOG"\nsleep 12\n' > "$TMP/bin/pi"; chmod +x "$TMP/bin/pi"
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+        DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=0 LANE_BOUND_WALL_S=10m \
+        bash "$TMP/bin/drive_ra.sh" "$GATE" 3 "$TMP/logs/h5b.log" "$TMP/brief.txt")"
+want "$res" "bound=exceeded-wallclock"; rc=$?
+ck "(h5) …and a malformed value ('10m') leaves the caller's bound standing too ($res)" $rc
+grep -q "is not a whole number" "$TMP/logs/h5b.log"; rc=$?
+ck "(h5) …naming the malformed value rather than silently ignoring it" $rc
+# Restore the suite's canonical silent stub for any arm below that drives the wiring.
+printf '#!/bin/sh\necho PI_STARTED >> "$PI_LOG"\nsleep 60\n' > "$TMP/bin/pi"; chmod +x "$TMP/bin/pi"
 
 # ── (k) THE VERDICT SURVIVES A TERM→KILL ESCALATION (review finding, NEW — MEASURED) ──────────
 # `emit_line` wrote the verdict file with `>`, so each line REPLACED the last: on a KILL escalation the
