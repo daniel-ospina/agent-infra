@@ -325,16 +325,36 @@
 # repair loops dropped to `cap: 0`, so no cell on the fleet could dispatch a
 # worker for ~13 hours. An armed pass that decides many records, removes NONE,
 # and sits under a disk-pressure floor now RECORDS a verdict — the file
-# $STATE_DIR/reap-ineffective, plus a `verdict=` field on the SUMMARY — instead of
-# printing a tally the reader has to interpret. ⛔ ONLY A PASS THAT REACHED THE
-# VERDICT IS ENTITLED TO CHANGE THE FILE: a pass that held the condition writes it,
-# and a pass that EVALUATED the condition and did not hold it REMOVES it (as does
-# `unmeasured` — a disk we could not read is not a disk we proved healthy, and
-# presence must keep meaning "the condition holds now"). A FAIL-CLOSED ABORT (an
-# unusable `ps`, a dead `gh`, an unwritable log) evaluated nothing, so it writes
-# NOTHING and deletes NOTHING — and its footer prints `VERDICT=?`, never an empty
-# field, because an absent value is not a verdict either. Exit codes are unchanged:
-# the condition is a diagnosis, not a failure of the pass.
+# $STATE_DIR/reap-ineffective.<repo>, plus a `verdict=` field on the SUMMARY —
+# instead of printing a tally the reader has to interpret. ⛔ ONLY A PASS THAT
+# REACHED THE VERDICT IS ENTITLED TO CHANGE THE FILE: a pass that held the
+# condition writes it, and a pass that EVALUATED the condition and did not hold it
+# REMOVES it (as does `unmeasured` — a disk we could not read is not a disk we
+# proved healthy, and presence must keep meaning "the condition holds now").
+#
+# ⛔ TWO WAYS THAT RULE IS NARROWER THAN IT LOOKS, both of them review findings
+# because getting either wrong restores the silence this file exists to end:
+#   * ONE RECORD PER REPO, not one per state dir. `disk-reaper.sh` runs this
+#     script ONCE PER REPO with the same `REAP_WT_STATE_DIR`
+#     (`run_class bash "$WORKTREE_REAPER_PATH" … --repo "$repo"`), so a single
+#     fixed filename is last-writer-wins ACROSS REPOS: an ineffective repo
+#     followed by any repo with room had its alarm erased by a pass that never
+#     looked at it. The path is therefore keyed by the repo (see
+#     reap_verdict_path), and each record is owned by that repo's own pass.
+#     Presence means "THIS repo's condition holds, as of its `epoch=`".
+#   * A DRY RUN NEVER TOUCHES THE FILE. It removes nothing by construction, so it
+#     has evaluated none of the live condition. `disk-reaper.sh` DEFAULTS to
+#     DRY_RUN=1 (`DISK_REAPER_DRY_RUN:-1`), so a "delete on any pass that is not
+#     reap-ineffective" rule let a routine dry run on a full cell erase the armed
+#     pass's alarm — the alarm destroyed by the entry point's own default mode.
+#
+# A FAIL-CLOSED ABORT evaluated nothing, so it writes NOTHING and deletes NOTHING.
+# ⚠️ NOT EVERY ABORT PRINTS A FOOTER: the `wt_list_load` failure, the empty-list
+# refusal, the unwritable-log refusal and the lock-held refusal exit 3 from before
+# `print_footer` is reachable (the unwritable-log one cannot log anything at all),
+# while the `gh` and `ps` aborts do print one. Where a footer IS printed it carries
+# `VERDICT=?`, never an empty field — an absent value is not a verdict either.
+# Exit codes are unchanged: the condition is a diagnosis, not a failure of the pass.
 #
 # OPERATOR NOTE — this script's git target is resolved at runtime, so the
 # main-worktree-guard extension's static script-content walker (#1484) blocks
@@ -417,7 +437,7 @@ REAP_WT_DF_TIMEOUT="${REAP_WT_DF_TIMEOUT:-15}"
 # ⛔ THE PASS VERDICT (#3041). An armed pass that decides at least
 # REAP_WT_INEFFECTIVE_MIN_EXAMINED records, removes NONE, and reports less than
 # REAP_WT_DISK_FLOOR_MB free on the checkout's filesystem is INEFFECTIVE, and says so
-# in $STATE_DIR/reap-ineffective instead of in a summary line that reads as healthy.
+# in $STATE_DIR/reap-ineffective.<repo> instead of in a summary line that reads as healthy.
 # 10 is the floor because a repo with a handful of worktrees legitimately reclaims
 # nothing on a given pass; the measured failure had 52 candidates and zero removals
 # under 0 bytes free. The FLOOR is the same number REPAIR_DISK_FLOOR_MB uses
@@ -2328,8 +2348,34 @@ measure_free_mb() {
 # it into a failure code would make every wrapper treat "the reaper cannot find anything to reclaim"
 # as a fail-closed abort, which it is not.
 REAP_VERDICT_FILE_NAME="reap-ineffective"
+
+# reap_verdict_path <state-dir> <repo-canon> -> the record THAT REPO's pass owns.
+#
+# ⛔ NOT ONE FIXED FILENAME (#3041 review, P1). `disk-reaper.sh` invokes this script once per repo
+# with the SAME state dir, so a single `$STATE_DIR/reap-ineffective` is LAST-WRITER-WINS across
+# repos: measured in a fixture, an ineffective 12-record repo followed by any repo with room
+# reported `verdict=idle` and DELETED the first repo's record — the exact silence this verdict
+# exists to end, reintroduced by the multi-repo loop that production runs. A repo's alarm must not
+# be another repo's to clear.
+#
+# The token is readable AND unique: the checkout's basename (so an operator sees which repo) plus a
+# checksum of the CANONICAL PATH (so two checkouts named `app` on one box cannot collide, which a
+# bare basename would allow). `cksum` is POSIX; `tr -c` keeps the basename filesystem-safe. The
+# residual this accepts, stated rather than implied: dropping a repo from `DISK_REAPER_REPOS`
+# leaves its last record behind, so the reader compares the record's `epoch=` instead of assuming
+# the newest pass rewrote every file.
+reap_verdict_path() { # <state-dir> <repo-canon> -> path ("" when there is no state dir)
+    local dir="$1" canon="$2" base sum
+    [ -n "$dir" ] || return 0
+    base="$(basename "$canon" 2>/dev/null)"
+    base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
+    sum="$(printf '%s' "$canon" | cksum 2>/dev/null | awk '{ print $1 }')"
+    printf '%s/%s.%s.%s\n' "$dir" "$REAP_VERDICT_FILE_NAME" "${base:-repo}" "${sum:-0}"
+}
+
 reap_verdict() {
-    local vfile="$STATE_DIR/$REAP_VERDICT_FILE_NAME"
+    local vfile
+    vfile="$(reap_verdict_path "$STATE_DIR" "$REPO_CANON")"
     PASS_VERDICT=""
     FREE_MB=""
     local RECORD_OK=1
@@ -2355,9 +2401,29 @@ reap_verdict() {
             fi
         fi
     fi
-    # The stale-flag half: an `idle` or `reclaimed` pass must not leave yesterday's verdict behind.
+    # ⛔ A DRY RUN NEVER TOUCHES THE RECORD (#3041 review, P1). It removes nothing BY DEFINITION, so
+    # it has evaluated none of the live condition and cannot say whether the condition holds — and
+    # `disk-reaper.sh` DEFAULTS to DRY_RUN=1 (`DISK_REAPER_DRY_RUN:-1`, `mode_flag`), so the
+    # "delete unless the verdict is reap-ineffective" arm below let a ROUTINE dry run on a full cell
+    # erase the armed pass's alarm (measured: armed 11-dirty-repo fixture under the floor wrote the
+    # file; an immediate `--dry-run` over the same repo removed it). Silence restored by the entry
+    # point's own default mode is the defect this verdict exists to remove.
+    if [ "$PASS_VERDICT" = dry-run ]; then return 0; fi
+    # The stale-flag half: an `idle`, `reclaimed` or `unmeasured` pass must not leave yesterday's
+    # verdict behind — each of them DID evaluate the condition and found it not held.
     if [ "$PASS_VERDICT" != reap-ineffective ]; then
         [ -n "$vfile" ] && rm -f "$vfile" 2>/dev/null
+        return 0
+    fi
+    # Reached only for `reap-ineffective`. No state dir means no place to put the record: say so
+    # instead of writing `.tmp.<pid>` into the CURRENT DIRECTORY (the empty-vfile shape the old
+    # `tmp="$vfile.tmp.$$"` produced), and touch nothing else.
+    if [ -z "$vfile" ]; then
+        log "VERDICT reap-ineffective repo=$REPO_CANON examined=$WT_TOTAL classified=$CLASSIFIED_C removed=$REMOVED free_mb=$FREE_MB floor_mb=$REAP_WT_DISK_FLOOR_MB record=NO-STATE-DIR"
+        log_line ""
+        log_line "⛔ VERDICT: reap-ineffective — this armed pass examined ${WT_TOTAL} record(s), decided ${CLASSIFIED_C} that"
+        log_line "   survive it, and removed NONE, while ${FREE_MB}MB is free on $REPO_CANON (< ${REAP_WT_DISK_FLOOR_MB}MB floor)."
+        log_line "   ⛔ No state dir was configured, so NO record was written; this line and SUMMARY are the ONLY statement."
         return 0
     fi
     local tmp

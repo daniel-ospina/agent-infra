@@ -3096,6 +3096,26 @@ case "$OUT" in
   *"DISK REAPER NOT HEALTHY"*"worktree"*) ok "status: a failed pass is a ⛔ that names the failed class" ;;
   *) bad "status: a failed pass is not surfaced — $OUT" ;;
 esac
+# (3b) ⛔ THE INCIDENT SHAPE: an ineffective reap EXITS 0 by design, so `ok=1 rc=0 verdict_worktree=ok`
+# is the CORRECT exit-code reading of the exact pass #3041 was read from — `worktree=<MB>` and nothing
+# else was that pass's misleading sentence. The reaper records the real answer separately as
+# `delegate_verdict_worktree=`, and a field the reader does not print does not exist.
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=reap-ineffective\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"worktree=24MB"*"worktree-delegate=reap-ineffective"*) \
+    ok "status: the HEALTHY line carries the delegate's verdict beside the exit-code reading" ;;
+  *) bad "status: an ineffective reap on a healthy pass still reads as plain ok — $OUT" ;;
+esac
+# (3c) …and it does NOT bolt the note onto a genuinely healthy cell (no noise for `ok`/absent).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"worktree-delegate="*) bad "status: a healthy delegate verdict still grew a note — $OUT" ;;
+  *) ok "status: a healthy cell gains no delegate note (the field is printed only when it informs)" ;;
+esac
 case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
