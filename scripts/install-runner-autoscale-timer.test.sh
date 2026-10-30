@@ -1488,6 +1488,92 @@ assert_eq "$RC" 1 "a declared --repo the writers would REFUSE is not certified g
 assert_contains "$OUT" "not a plain owner/name" "the refusal names the rule the writers apply"
 rm -f "$ARM"
 
+# ── T55: a VALUELESS `--repo` is not configuration, and the strip used to eat the next token ────────
+# The `--repo` strip runs BEFORE classification and removed the flag plus whatever token followed it,
+# unconditionally — so `--repo` as the LAST token was dropped for having no value, and `--repo --dry-run`
+# had its `--dry-run` EATEN as if it were the value. argparse rejects both (measured: rc=2, "argument
+# --repo: expected one argument") while `--status` reported `mode=converge (ARMED)` exit 0 — and
+# `artifact_is_armed`, which tests the `--dry-run` SUBSTRING, said the opposite about the same line. Two
+# readers of one command line disagreeing, with the readiness verb on the wrong side.
+say_case "T55 a --repo with NO value is reported, in both shapes"
+D="$T/c55"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: the installer's own --repo pair is configuration and stays green"
+# Shape 2: `--repo` followed by a FLAG — the flag is not a value, and must not be swallowed as one.
+box_sed_i 's|--repo "o/r"|--repo|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "--repo followed by a FLAG is not certified green"
+assert_contains "$OUT" "--repo" "and it names --repo there too"
+assert_absent "$OUT" "mode=converge (ARMED" "the flag that came after it is NOT eaten as a value"
+# Shape 1: `--repo` LAST — nothing follows it, so it has no value at all. (The unit is disarmed, so the
+# `--dry-run` it carries is removed to leave the flag genuinely trailing.)
+box_sed_i 's| --dry-run||' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a TRAILING --repo with no value is not certified green"
+assert_contains "$OUT" "--repo" "and the refusal names the argument"
+rm -f "$ARM"
+
+# ── T56: `--want` is argparse `type=int`, so "non-empty" is not the rule ────────────────────────────
+# The classifier tested EMPTINESS, and the docs asserted the reason ("an EMPTY value is precisely what
+# the pass exits 2 on"). Measured: `--want=abc`, `--want abc`, `--want=3x` and `--want 3x` ALL exit 2
+# ("argument --want: invalid int value"), while `--status` certified each ARMED exit 0. A whole number is
+# the only shape the flag accepts, so the ordinary `--want 3` must stay green (T25 pins that intent).
+say_case "T56 a --want value that is not a whole number is reported, in both shapes"
+D="$T/c56"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+box_sed_i 's| --repo "o/r"| --repo "o/r" --want 3|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: --want 3 (a whole number) is a legitimate switch and stays green"
+box_sed_i 's| --want 3| --want abc|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "the SPACE form with a non-integer is not certified green"
+assert_contains "$OUT" "--want" "and the refusal names the argument"
+box_sed_i 's| --want abc| --want=3x|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "the INLINE form with a non-integer is not certified green either"
+assert_contains "$OUT" "--want=3x" "naming the exact argument it refused"
+rm -f "$ARM"
+
+# ── T57: the reader applies the WRITERS' value rules to what it reads back ────────────────────────
+# `refuse_systemd_unsafe_values` ('%' and whitespace) and `refuse_unusable_target`'s writability probe
+# run in `do_install_systemd`/`do_arm` and NOWHERE in `do_status`, while the drift `cmp` structurally
+# cannot catch either (the render is fed the artifact's OWN values, so it compares the file to itself).
+# So the readiness verb certified green on facts its own writers refuse — including the one the writers'
+# own comment says `--status` "cannot see", which was true only because it never looked.
+say_case "T57 --status applies the writers' value rules to the artifact it reads back"
+D="$T/c57"; fresh "$D"; rm -f "$ARM"
+ST7="$D/state7"
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$ST7" RUNNER_AUTOSCALE_ARM_FILE="$ST7/runner-autoscale.armed")
+run_install Linux "$D" --install >/dev/null 2>&1; ENVV=()
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: the untouched artifact is green"
+box_sed_i 's|^Environment=PATH=.*|Environment=PATH=/usr/bin%h|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a declared PATH containing '%' is not certified green"
+assert_contains "$OUT" "SPECIFIER" "naming it as the systemd specifier it is"
+box_sed_i 's|^Environment=PATH=.*|Environment=PATH=/usr/bin|' "$D/$UNIT_NAME.service"
+box_sed_i 's|--repo "o/r"|--repo "nope"|' "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a declared --repo that is not owner/name is not certified green"
+assert_contains "$OUT" "not a plain owner/name" "naming the rule the writers apply"
+box_sed_i 's|--repo "nope"|--repo "o/r"|' "$D/$UNIT_NAME.service"
+# …and the writers' writability probe, on the fact `last_tick=` depends on: a state dir the pass cannot
+# write means that line can NEVER become positive, while the verb stays green. Skipped as root, where a
+# 0500 directory is still writable and the premise cannot be expressed — the pass/fail pair is emitted
+# either way so the suite's assertion count does not move between hosts.
+if [ "$(id -u)" != "0" ]; then
+    chmod 500 "$ST7"
+    OUT="$(run_install Linux "$D" --status)"; RC=$?
+    chmod 700 "$ST7"
+    assert_eq "$RC" 1 "a declared state dir that is NOT WRITABLE is not certified green"
+    assert_contains "$OUT" "NOT writable" "naming the consequence the writers already refuse"
+else
+    ok "a declared state dir that is NOT WRITABLE is not certified green (skipped: running as root, where a 0500 dir stays writable)"
+    ok "naming the consequence the writers already refuse (skipped: root)"
+fi
+rm -f "$ST7/runner-autoscale.armed" "$ARM"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

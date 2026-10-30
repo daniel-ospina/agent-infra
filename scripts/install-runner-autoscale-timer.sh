@@ -1073,6 +1073,20 @@ args_first_matching() { # args_first_matching <newline-separated values> <GLOB p
     return 0
 }
 
+# want_value_ok <v> — is <v> a value `--want` can take AT ALL?
+# ⛔ THE PASS DECLARES `--want` AS `type=int` (`runner_autoscale.py:3775-3780`), so the set of values it
+# accepts is "a non-empty run of digits" and nothing else. Measured at this head, all four of these exit 2
+# with "argument --want: invalid int value": `--want=abc`, `--want abc`, `--want=3x`, `--want 3x`. The
+# classifier used to test EMPTINESS only, so each of them was called benign and `--status` certified
+# `mode=converge (ARMED)` exit 0 over a unit that fails every tick — and the docs asserted the reason
+# ("an EMPTY value is precisely what the pass exits 2 on"), which was false. A value at or above 0 is
+# NOT judged here: `--want` above the ceiling is a REFUSAL (exit 1) that only a measurement can decide,
+# and T25 pins `--want 3` as a legitimate switch on a fixture — this predicate answers "can the pass
+# parse it", nothing more.
+want_value_ok() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
 classify_exec_args() { # classify_exec_args <newline-separated args AFTER interpreter/script/repo>
     # ⛔ "NOT --dry-run" IS NOT THE SAME AS "NOT A MODE". The pass's own switches (`--json`, `--want N`,
     # `--root P`) are legitimate and change nothing about whether a tick CONVERGES, so a readiness verb
@@ -1103,7 +1117,18 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
                 if [ -z "$rest" ]; then out="$out $l"
                 else case "${rest%%$'\n'*}" in
                          ''|-*) out="$out $l" ;;
-                         *)     skipnext=1 ;;
+                         # ⛔ AND `--want`'s VALUE IS AN `int`, SO "NON-EMPTY" IS NOT THE RULE. The pass
+                         # declares `--want` with `type=int` and its own guard refuses a negative, so
+                         # `--want abc`, `--want=abc`, `--want 3x` and `--want=3x` all exit 2
+                         # (measured: "argument --want: invalid int value") — while a classifier that
+                         # checked only emptiness called them benign and certified ARMED exit 0 over a
+                         # unit that fails every tick. The documented claim that "an EMPTY value is
+                         # precisely what the pass exits 2 on" was therefore FALSE, and it is the same
+                         # false PASS one more value-shape over. `--root` is a path, so any non-flag
+                         # value is one it can take.
+                         *)
+                             if [ "$l" = "--want" ] && ! want_value_ok "${rest%%$'\n'*}"; then out="$out $l"
+                             else skipnext=1; fi ;;
                      esac
                 fi ;;
             # ⛔ THE INLINE SPELLING IS THE SAME ARGUMENT. argparse accepts `--want=3`, `--root=/opt/x`
@@ -1120,7 +1145,8 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             # Dropping it unconditionally certified exactly the state this verb exists to refuse —
             # ARMED exit 0 over a schedule that is RED every nine minutes — so it follows the
             # `--want=`/`--root=` rule: an EMPTY value is reported, a real slug is configuration.
-            --want=*|--root=*|--repo=*) [ -n "${l#*=}" ] || out="$out $l" ;;
+            --want=*)          want_value_ok "${l#*=}" || out="$out $l" ;;
+            --root=*|--repo=*) [ -n "${l#*=}" ] || out="$out $l" ;;
             *)                 out="$out $l" ;;
         esac
     done
@@ -1761,12 +1787,26 @@ do_status() {
     # legitimate `--root /opt` (its own default is absolute): the orphaned `--root` then swallowed the
     # NEXT argument, so `--root /opt --apply` classified as ARMED exit 0 (the pass exits 2) and
     # `--root /opt/x --dry-run` classified as ARMED (the unit is disarmed).
+    # ⛔ A VALUELESS `--repo` IS NOT CONFIGURATION, AND DROPPING IT BLIND WAS A FALSE PASS. This strip
+    # used to remove `--repo` and WHATEVER TOKEN FOLLOWED, unconditionally — so `--repo` as the LAST
+    # token was dropped for having no value, and `--repo --dry-run` had its `--dry-run` EATEN as if it
+    # were the value. argparse rejects both (measured: `rc=2`, "argument --repo: expected one
+    # argument"), while `--status` reported `mode=converge (ARMED)` exit 0 — and `artifact_is_armed`,
+    # which tests the `--dry-run` SUBSTRING, said the opposite about the same line. So the value is
+    # required before the pair may be treated as configuration: a real value is dropped with its flag
+    # (the T44 rule), and no value RE-EMITS the flag for the classifier to report. `pending` buffers it
+    # one token so the next line can be judged rather than assumed.
     installed_rest="$(printf '%s\n' "$installed_args" | awk '
         { if (NF == 0) next
           if (++pos <= 2) next          # token 1 = interpreter, token 2 = the converger script
-          if (skip) { skip = 0; next }
-          if ($0 == "--repo") { skip = 1; next }
-          print }')"
+          if (pending) {
+              pending = 0
+              if ($0 != "" && $0 !~ /^-/) next   # a real value: configuration, dropped with its flag
+              print "--repo"                      # NO value: report the flag, then judge this token too
+          }
+          if ($0 == "--repo") { pending = 1; next }
+          print }
+        END { if (pending) print "--repo" }')"
     installed_kind="$(classify_exec_args "$installed_rest")"
     case "$installed_kind" in
         armed)     log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
@@ -1787,7 +1827,7 @@ do_status() {
                    # refuses the empty value rather than the flag — so say THAT, or the operator is told
                    # an argument the pass plainly accepts is unrecognised.
                    case " $installed_mode " in
-                       *" --want= "*|*" --root= "*|*" --repo= "*) err "  one of $installed_mode is a recognised switch with an EMPTY value (--want= / --root= / --repo=). argparse accepts the flag and then the pass fails on the value: --want= and --repo= exit 2 on every tick, and --root= leaves the pass nothing to measure. Give it a value or remove the argument." ;;
+                       *" --want= "*|*" --root= "*|*" --repo= "*|*" --repo "*) err "  one of $installed_mode is a recognised switch with NO VALUE, or with a value the pass cannot take (--want needs a whole number of 0 or more; --root and --repo need a real value). argparse accepts the FLAG and then the pass exits 2 on the VALUE, on every tick: `--repo` is a case in point — a missing one makes every tick exit 2 ("expected one argument") and an empty one makes the pool read `repos//actions/runners`, a 404. Give it a value or remove the argument." ;;
                    esac
                    # ⛔ AND A RECOGNISED ACTION IS NOT AN UNKNOWN ONE — SAY WHAT IT ACTUALLY DOES. The
                    # switches above are accepted, so the "exit 2" reason is FALSE for them, and their real
@@ -1956,7 +1996,9 @@ do_status() {
             # `mode=converge (ARMED)`, `drift_artifact=no` and exit 0, over a unit whose repo systemd expands
             # to something else at load time — every tick then exits 2. The T49 class, one key over: the
             # writers refuse to create this state, so a hand-edited or foreign artifact is HOW it is reached.
-            for dv in "HOME=$d_home" "STATE_DIR=$d_state" "REPO=$d_repo" "PROVISIONER=$d_prov"; do
+            for dv in "HOME=$d_home" "PATH=$d_path" "STATE_DIR=$d_state" "SCRIPT=$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_SCRIPT)" \
+                      "PYTHON=$(artifact_env_value "$installed_path" PYTHON)" \
+                      "REPO=$d_repo" "PROVISIONER=$d_prov"; do
                 [ -n "${dv#*=}" ] || continue
                 case "${dv#*=}" in
                     *\\*) err "the installed artifact declares ${dv%%=*} with a BACKSLASH, which no render here can reproduce (the artifact is rendered with sed, where a backslash is an escape) — the artifact is not the one this installer would write"; rc=1 ;;
@@ -1970,6 +2012,19 @@ do_status() {
             done
             if [ -n "$d_repo" ] && ! [[ "$d_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
                 err "the installed artifact declares --repo '$d_repo', which is not a plain owner/name (letters, digits, dot, dash, underscore). The writers REFUSE to render this, so the artifact is hand-edited or foreign; the pass would read a pool that is not the one on disk."
+                rc=1
+            fi
+            # ⛔ AND THE WRITERS' WRITABILITY PROBE, ON THE SAME FACT THEY TEST. `refuse_unusable_target`
+            # refuses a state dir that EXISTS and is not writable ("every pass would fail to record"), and
+            # the readiness verb judged nothing — so a box whose state dir became read-only (a re-imaged
+            # image, a `sudo chown`, a read-only mount) was certified green while the pass could never
+            # write the log `last_tick=` reads: the report is `last_tick=none` for ever, which reads as
+            # "nothing has ticked YET" rather than "nothing CAN be recorded". A state dir that does not
+            # exist is NOT a finding here — the writers create it, so its absence is either a box that was
+            # never installed from this artifact or one the reclaim removed, and the schedules' own
+            # failure is loud enough; only the writer's own rule is mirrored.
+            if [ -n "$d_state" ] && [ -e "$d_state" ] && [ ! -w "$d_state" ]; then
+                err "the installed artifact's state dir '$d_state' exists and is NOT writable by $(id -un) — the writers refuse to create this, and every pass fails to record there, so this verb's own last_tick and arm_record facts can never become positive. Fix the permissions (the unit runs as this user)."
                 rc=1
             fi
             # A key the artifact does not declare keeps the reader's value: the render must not be fed an
