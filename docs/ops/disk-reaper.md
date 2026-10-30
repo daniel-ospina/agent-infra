@@ -262,9 +262,11 @@ headroom.
   ⚠️ Globs expand ONE level as written: a layout nesting the install one directory deeper
   (`/tmp/actions-runner/<name>/_work`) needs `*/*` in the pattern.
 * **The gate is CONTENT mtime** — `DISK_REAPER_RUNNER_MIN_AGE` (default **3600 s**). A `_work` entry is a
-  candidate only when **nothing under it has been written for longer than the floor**; a running job
-  writes into its entry continuously (the checkout, `_work/_temp` step scripts, the command logs), so
-  mtime is a positive proof of death. The comparison set is everything under the entry **including the
+  candidate only when **nothing under it has been written for longer than the floor**. The in-entry
+  witness is the **checkout's own writes** (outputs, build artefacts, `.venv`/`node_modules`, any file a
+  step creates under the checkout) — NOT `_work/_temp`: the runner creates `_temp`/`_tool`/`_actions` as
+  SIBLINGS of `_work/<repo>` at the runner root, so step scripts and command logs written there do not
+  refresh the checkout's floor. So mtime is a positive proof of death for the entry being reaped. The comparison set is everything under the entry **including the
   entry's own top directory**, which is the conservative direction (a stray `touch`/`cp` over a dead
   entry's top dir restores its floor). What the gate deliberately does NOT use is the top directory's
   mtime **alone**: a killed job stamps that directory at the moment of the kill while its CONTENTS can
@@ -278,9 +280,14 @@ headroom.
   (it keeps every dead entry while ANY runner is idle, which on a 12-runner box is always) and
   under-broad (`--ephemeral` runners started by hand). That is an inert class reporting healthy, which
   is the shape this whole reaper exists to remove.
-  ⚠️ **Residual, stated so it is not discovered:** a job that writes NOTHING for longer than the floor (a
-  single long quiet step) is indistinguishable from a dead entry by this test. Raise the floor for such
-  a box (`DISK_REAPER_RUNNER_MIN_AGE=7200`) — that is the intended response.
+  ⚠️ **Residual, stated so it is not discovered:** a job that writes NOTHING **inside its checkout** for
+  longer than the floor is indistinguishable from a dead entry by this test. That is a whole-job
+  exposure for any job whose artefacts land in `$TMPDIR`, `~/.cache` or `_work/_temp` (i.e. every step
+  after checkout), not merely "one long quiet step". Raise the floor for such a box
+  (`DISK_REAPER_RUNNER_MIN_AGE=7200`) — that is the intended response. The only empirically validated
+  floor is **7200 s** (the 120-minute hand reap that took c1 98 % → 90 % with no job disturbed); the
+  shipped **3600 s** is deliberately more aggressive, so price the difference before adopting it on a
+  box whose jobs write outside the checkout.
 * **`_work/_tool` and `_work/_actions` are DELIBERATELY RETAINED.** They are the runner's CROSS-JOB
   caches (every downloaded action and every fetched toolchain), so removing them does not free dead
   checkout — it forces a re-download on the NEXT job and makes every subsequent CI run slower. A

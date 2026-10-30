@@ -23,6 +23,8 @@
 #   (h) a SET-but-EMPTY glob list is a REFUSAL at BOTH layers (the entry point's seam and the owner's),
 #       never "scan nothing for ever". `${X:-default}` would silently substitute the WIDEST sweep for an
 #       emptied value, and the widest sweep is the DELETE direction — the same rule BOUNDED_LIB gets.
+#   (i) the owner's OWN `--glob` flag is an EXPLICIT assertion too: an unmatched `--glob` is a refusal,
+#       never a measured empty population — the same verdict the `REAP_RW_GLOBS` env spelling gives.
 #
 # ⛔ EVERY CASE IS MUTATION-CHECKED (`expect_pass` then `expect_fail` against a mutated copy): a test that
 # passes against a script with the arm deleted proves nothing. A mutation that cannot be applied — the
@@ -406,6 +408,36 @@ case_h() { # <entry-point> <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (i) the owner's OWN `--glob` flag is an explicit assertion too ──────────────────────────────
+# ⛔ THE SEAM HAS TWO SPELLINGS AND THEY MUST AGREE. `REAP_RW_GLOBS=<no-match>` was a refusal (rc 3,
+# `census=no-roots`) while the script's OWN documented `--glob <no-match>` reported `census=ok`, exit 0 —
+# a measured empty population for a sink nothing looked at. `EXPLICIT` (the flag the census reads) was set
+# only from the env seam, and `--glob` set `GLOB_ARGS_GIVEN`, which is read one line later and NOWHERE
+# else. Measured before the fix: `bash scripts/reap-runner-work.sh --glob '/typo/*/_work' --dry-run` ->
+# `roots=0 … census=ok`, exit 0 — the false PASS this class's explicit-vs-default rule exists to remove,
+# reached through the spelling `--help` recommends.
+case_i() { # <owner>
+    local owner="$1" base out rc s1 s2
+    base="$T/i.$$.$RANDOM"; mkdir -p "$base"
+    s1="$(uniqstate i1)"; s2="$(uniqstate i2)"
+    out="$(REAP_RW_STATE_DIR="$s1" BOUNDED_LIB="$HERE/lib/bounded.sh" \
+           bash "$owner" --glob "$base/nope-*/_work" --dry-run 2>&1)"; rc=$?
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "an unmatched --glob is a REFUSAL (rc=$rc, expected 3) — not a measured 0"
+    case_check "$(grep -q 'census=no-roots' <<<"$out" && echo 0 || echo 1)" \
+               "… the summary says census=no-roots, so no caller can read it as an empty population"
+    # THE CONTROL: the SAME assertion through the env seam AS `disk-reaper.sh` SPELLS IT must agree —
+    # `REAP_RW_GLOBS` alone is NOT explicit (`EXPLICIT` defaults to 0, so those globs are the caller's
+    # defaults-equivalent); the explicit fact travels in `REAP_RW_EXPLICIT`, which the entry point sets.
+    # With only one spelling asserted the case could not tell which of the two is the defect, so both are
+    # required to refuse — and the env spelling is spelled exactly as the hourly pass spells it.
+    out="$(REAP_RW_STATE_DIR="$s2" REAP_RW_GLOBS="$base/nope-*/_work" REAP_RW_EXPLICIT=1 \
+           BOUNDED_LIB="$HERE/lib/bounded.sh" bash "$owner" --dry-run 2>&1)"; rc=$?
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "the ENV spelling of the same assertion (REAP_RW_GLOBS + REAP_RW_EXPLICIT=1) agrees (rc=$rc, expected 3)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
@@ -418,6 +450,12 @@ MUT_F2='s/^    if \[ "\$_rw_census" = "no-roots" \]; then/    if false; then/'
 MUT_G='s/^    export REAP_RW_STATE_DIR=.*$/    : REAP_RW_STATE_DIR deliberately NOT relayed/'
 MUT_H1='s/^case "\$RUNNER_GLOBS" in \*\[!\[:space:\]\]\*) : ;; \*)/case "$RUNNER_GLOBS" in *[![:space:]]*) : ;; __never__)/'
 MUT_H2='s/^case "\$GLOBS" in \*\[!\[:space:\]\]\*) : ;; \*)/case "$GLOBS" in *[![:space:]]*) : ;; __never__)/'
+
+# ⛔ THE `--glob` ARM'S OWN FLAG. `EXPLICIT=1` is a line of its own so this single-token edit is
+# unambiguous: no other line in the owner is exactly `EXPLICIT=1`, and the env-seam assignment
+# (`EXPLICIT="${REAP_RW_EXPLICIT-0}"`) does not match the anchor. The mutant replaces the assertion with a
+# no-op — which is exactly the defect that shipped (the `--glob` arm marking nothing the census reads).
+MUT_I='s/^\( *\)EXPLICIT=1$/\1:/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -499,6 +537,13 @@ if apply_mutation "$OWNER" "$T/mut-h2/reap-runner-work.sh" "$MUT_H2"; then
     expect_fail "h mutation: removing the OWNER's empty-glob refusal turns the case RED" case_h "$REAPER" "$T/mut-h2/reap-runner-work.sh"
 else
     bad "h mutation could not be applied (the owner's empty-glob arm moved) — the case is not checking it any more"
+fi
+
+expect_pass "i the owner's own --glob flag is an explicit assertion, never a measured empty population" case_i "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-i/reap-runner-work.sh" "$MUT_I"; then
+    expect_fail "i mutation: dropping the --glob arm's EXPLICIT=1 turns the case RED" case_i "$T/mut-i/reap-runner-work.sh"
+else
+    bad "i mutation could not be applied (the --glob arm moved) — the case is not checking it any more"
 fi
 
 printf '\n  %s passed, %s failed\n' "$PASS" "$FAIL"
