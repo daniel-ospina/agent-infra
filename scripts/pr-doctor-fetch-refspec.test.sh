@@ -17,9 +17,16 @@
 # given, and it reaches git from two places: the function `_fetch_refspec`, and the TWO CALL SITES
 # that pass its result (`materialise`, `_ensure_head`). Sections U/R/M exercise the function against
 # a real single-branch fixture and REQUIRE the bare refspec to reproduce the measured `fatal: invalid
-# reference`; section P pins the call sites on the shipped file. Both halves are needed: measured
+# reference`; section P pins the call sites on the shipped file by SPELLING, and section PA re-pins the
+# EFFECTIVE ARGV structurally (comments, spacing and aliases cannot satisfy that one). Both halves are needed: measured
 # (review P1), reverting JUST the call sites left this suite 9 passed / 0 failed / rc=0 — every
 # function-level section stayed green over a delete of the fix's only effect.
+#
+# ⛔ ACCEPTED FALSE-RED (deliberate — do not "fix"): P3's `assert_not_contains` reds when a COMMENT
+# quotes the pre-fix argv, even though behaviour is untouched (measured at this head: 14 passed / 1
+# failed; section PA — the structural arm — stays GREEN, which is the proof that PA is judging behaviour
+# and not text). That is the safe direction — an over-block, one word to reword — and it is accepted.
+# Leave P3 alone.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,16 +58,25 @@ trap 'rm -rf "$WORK"' EXIT
 # scope, and importing it would also drag in REPO_DIR resolution and its own refusals — so a test
 # that imported it would fail for reasons unrelated to the refspec. `ast` pulls out exactly the one
 # definition under test (and its docstring), which is the whole behaviour being pinned.
+# ⛔ EXACTLY ONE DEFINITION, OR A HARD, SELF-DESCRIBING STOP (measured 2026-10-30, review round 3).
+# This used to take `next(...)` — the FIRST def in the file. Python binds the LAST one, so APPENDING
+# `def _fetch_refspec(name): return name` left the pre-fix bare refspec LIVE in the module while every
+# section below exec'd a definition the interpreter would never call: 13 passed / 0 failed, rc=0.
+# So the selector refuses ambiguity instead of silently picking a side — `sys.exit(3)` is turned into a
+# red by `die`, and the other direction (no def) is refused the same way.
 extract_refspec() { # <path-to-py> -> prints the refspec for each of ARGV names
     python3 - "$SRC" "$@" <<'PY'
 import ast, sys
 path, names = sys.argv[1], sys.argv[2:]
 tree = ast.parse(open(path).read())
-node = next((n for n in tree.body
-             if isinstance(n, ast.FunctionDef) and n.name == "_fetch_refspec"), None)
-if node is None:
-    sys.stderr.write("no _fetch_refspec in %s\n" % path)
+defs = [n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_fetch_refspec"]
+if len(defs) != 1:
+    sys.stderr.write(("%d definitions of _fetch_refspec in %s (want exactly 1) -- Python binds "
+                      "the LAST, so a shadowing def would silently disarm the fix\n")
+                     % (len(defs), path))
     sys.exit(3)
+node = defs[0]
 mod = ast.Module(body=[node], type_ignores=[])
 ns = {}
 exec(compile(mod, path, "exec"), ns)
@@ -104,6 +120,119 @@ assert_not_contains "$(cat "$SRC")" '["fetch", "origin", branch' \
     "P3 the pre-fix bare-branch fetch is gone from materialise()"
 assert_not_contains "$(cat "$SRC")" 'fetch_ref or branch' \
     "P4 the pre-fix bare-branch fallback is gone from _ensure_head()"
+
+# ── section PA: THE EFFECTIVE ARGV — the call sites pinned STRUCTURALLY, not by spelling ────────────
+# ⛔ MEASURED (fresh-context review of 364808e9d, 2026-10-30). The four text pins above are SPELLING
+# pins, and they were defeated twice with this suite at 13 passed / 0 failed, rc=0:
+#   (1) SPELLING. `_git(["fetch","origin",branch,"--quiet"])` in materialise -- the bare-branch
+#       fetch, live again -- with the pinned literal retained in a COMMENT above it. P1 was satisfied by
+#       the comment, and P3's needle (`["fetch", "origin", branch`) never matched the spacing.
+#   (2) A comment cannot change behaviour, and neither can whitespace or an alias, so TEXT is the wrong
+#       thing to pin. (The shadowing mutant -- a second, later `_fetch_refspec` def, which Python binds
+#       -- is refused separately: `extract_refspec` hard-stops unless the shipped file defines it exactly
+#       once, 13/0 before that fix, measured.)
+# So these parse the shipped file and assert about the ARGV EXPRESSION at each `fetch origin <ref>` site.
+# A structural pin cannot be satisfied by a comment, spacing, or a rename of the local variable, and it
+# reds on the mutant that reverts the CALL SITE (the measured bug) whichever way it is spelled.
+# Rule enforced, stated so a reader can check it: at every `fetch origin <expr>` site the ref operand
+# must be a CALL to `_fetch_refspec`, OR an `A or _fetch_refspec(...)` whose RIGHT side is that call,
+# OR a name holding a fully-qualified `refs/...` ref (a fork's `refs/pull/<n>/head` needs no refspec).
+pin_struct() { # <check-id> <label>
+    local reason
+    if reason="$(python3 - "$SRC" "$1" 2>&1 <<'PY'
+import ast, sys
+
+path, check = sys.argv[1], sys.argv[2]
+tree = ast.parse(open(path).read())
+
+
+def refuse(msg):
+    sys.stdout.write(msg)
+    raise SystemExit(3)
+
+
+def find_fn(name):
+    ns = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+    if len(ns) != 1:
+        refuse("expected exactly one def of %s(), found %d" % (name, len(ns)))
+    return ns[0]
+
+
+def fetch_operands(fn):
+    """Every `[... "fetch", "origin", <expr> ...]` literal inside fn -> [(expr, lineno)]."""
+    out = []
+    for node in ast.walk(fn):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        elts = node.elts
+        for i in range(len(elts) - 2):
+            if (isinstance(elts[i], ast.Constant) and elts[i].value == "fetch"
+                    and isinstance(elts[i + 1], ast.Constant) and elts[i + 1].value == "origin"):
+                out.append((elts[i + 2], elts[i + 2].lineno))
+    return out
+
+
+def is_helper(expr):
+    return (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
+            and expr.func.id == "_fetch_refspec")
+
+
+def holds_qualified_ref(fn, name):
+    """<name> is assigned in fn to a value carrying a fully-qualified `refs/...` string."""
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            continue
+        for sub in ast.walk(node.value):
+            if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                    and sub.value.startswith("refs/")):
+                return True
+    return False
+
+
+def ok_expr(fn, expr):
+    """The ref operand DECIDES BEHAVIOUR -- judge it as an expression, never as text."""
+    if is_helper(expr):
+        return True
+    if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.Or):
+        return ok_expr(fn, expr.values[-1])      # `fetch_ref or _fetch_refspec(branch)`
+    if isinstance(expr, ast.Name):
+        return holds_qualified_ref(fn, expr.id)
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value.startswith("refs/")
+    return False
+
+
+fn = find_fn("materialise_worktree" if check == "materialise" else "_ensure_head")
+ops = fetch_operands(fn)
+if not ops:
+    refuse("no `fetch origin <ref>` argv found in %s()" % fn.name)
+wrong = [(e, ln) for e, ln in ops if not ok_expr(fn, e)]
+if wrong:
+    expr, lineno = wrong[0]
+    try:
+        spelling = ast.unparse(expr)
+    except Exception:
+        spelling = type(expr).__name__
+    refuse("line %d fetches `%s`, which is not a _fetch_refspec() call -- the bare-branch form is "
+           "live again (%s)" % (lineno, spelling, fn.name))
+if check == "materialise" and not any(is_helper(e) for e, _ in ops):
+    refuse("no fetch in materialise_worktree() goes through _fetch_refspec()")
+raise SystemExit(0)
+PY
+)"; then
+        ok "$2"
+    else
+        reason="${reason//$'\n'/ }"
+        bad "$2 (${reason:-structural check could not run})"
+    fi
+}
+
+pin_struct materialise \
+    "P5 materialise() fetches through _fetch_refspec(branch) — STRUCTURAL, so spelling/comments/aliases cannot satisfy it"
+pin_struct ensure-head \
+    "P6 _ensure_head() fetches 'fetch_ref or _fetch_refspec(branch)' — STRUCTURAL, the fallback that decides a base-repo PR"
 
 # ── section F: the fixture — a SINGLE-BRANCH clone, the shape that broke ────────────────────────
 build_fixture() { # <dir> -> a single-branch clone at <dir>/sb with origin/fix/some-branch on the remote
