@@ -4336,8 +4336,8 @@ and every deferral emits ONE line naming the depth, the runners, the ceiling and
 silence is what makes a deferral look like a bug. A deferral consumes no attempt: the ISSUE-batch
 arm releases its claims and drops its rows, and the CI-rerun arm withholds the rerun and records why
 (`state/rerun-<PR>-<RID>` is not written). The `fixbail-*` marker is NOT written by either — it
-belongs to `fix-one.sh`'s own two pre-agent deferrals (the cross-box refusal and the PR-OWNER lock),
-which is where it is written.
+belongs to `fix-one.sh`'s own three pre-agent deferrals (the cross-box refusal, the PR-OWNER lock, and a
+PR-owner takeover that could not complete), which is where it is written.
 
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
