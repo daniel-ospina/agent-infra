@@ -18,7 +18,8 @@
 # that pass its result (`materialise`, `_ensure_head`). Sections U/R/M exercise the function against
 # a real single-branch fixture and REQUIRE the bare refspec to reproduce the measured `fatal: invalid
 # reference`; section P pins the call sites on the shipped file by SPELLING, and section PA re-pins the
-# EFFECTIVE ARGV structurally (comments, spacing and aliases cannot satisfy that one). Both halves are needed: measured
+# EFFECTIVE ARGV structurally AND pins how many sites there are (comments, spacing and aliases cannot
+# satisfy it, and a DECOY site cannot license it — see the count pin below). Both halves are needed: measured
 # (review P1), reverting JUST the call sites left this suite 9 passed / 0 failed / rc=0 — every
 # function-level section stayed green over a delete of the fix's only effect.
 #
@@ -137,6 +138,30 @@ assert_not_contains "$(cat "$SRC")" 'fetch_ref or branch' \
 # Rule enforced, stated so a reader can check it: at every `fetch origin <expr>` site the ref operand
 # must be a CALL to `_fetch_refspec`, OR an `A or _fetch_refspec(...)` whose RIGHT side is that call,
 # OR a name holding a fully-qualified `refs/...` ref (a fork's `refs/pull/<n>/head` needs no refspec).
+#
+# ⛔ AND THE NUMBER OF SITES IS PINNED, BECAUSE `any(...)` OVER A LIST IS NOT A PROPERTY OF THE FILE
+# (measured 2026-10-30, review round 4). The last guard here was `any(is_helper(e) for e, _ in ops)`,
+# and it judged the SURVIVORS of a per-site filter — so it asked "does SOME site look right", which a
+# site that contributes nothing to the behaviour satisfies. Measured, at this head: rewriting the base
+# arm's operand to `_ref2 = "refs/heads/%s" % branch` (a plain name holding a bare `refs/heads/...`
+# string — the bare-refspec DISEASE, and `ok_expr` cannot tell it from a fork's `refs/pull/<n>/head`)
+# gave 13 passed / 2 failed (P1, P5): RED, so the guard did work. ADDING ONE DEAD SITE —
+# `if False: _git(["fetch", "origin", _fetch_refspec(branch)])` — gave 15 passed / 0 failed, rc=0:
+# GREEN, over a file whose measured bug was fully live. That is the fail-open this pin closes, and it is
+# the shape that matters: a decoy is CHEAPER than a fix, so "some site is right" is not falsifiable by a
+# revert.
+#
+# So the enumeration itself is asserted: `materialise_worktree()` has exactly TWO `fetch origin` argv
+# sites (the fork arm and the base arm) and `_ensure_head()` exactly ONE. A surplus site is refused BY
+# NAME as a decoy, before any per-site verdict is read. This is the file's own idiom, not a new one
+# (`extract_refspec` above and `find_fn` below both refuse "not exactly one"), and it is the direction
+# the industry pattern points: an assertion that quantifies over sites is worth what its enumeration is
+# worth, so the run must state and check the size of that enumeration.
+# ⛔ ACCEPTED OVER-BLOCK (deliberate, same class as P3 below): a legitimate THIRD `fetch origin` site in
+# either function reddens this with the function's NAME and BOTH counts: 'materialise_worktree() has 3
+# `fetch origin` argv site(s), expected 2'. That is one line to update and it is the safe direction —
+# the alternative (infer the count from the file) is the fail-open. Named here so the next reviewer
+# does not re-open it.
 pin_struct() { # <check-id> <label>
     local reason
     if reason="$(python3 - "$SRC" "$1" 2>&1 <<'PY'
@@ -208,6 +233,15 @@ fn = find_fn("materialise_worktree" if check == "materialise" else "_ensure_head
 ops = fetch_operands(fn)
 if not ops:
     refuse("no `fetch origin <ref>` argv found in %s()" % fn.name)
+# ⛔ THE COUNT PIN — FIRST, so a surplus site is reported as a surplus site rather than as whatever the
+# per-site filter happens to say about the survivors. Without this, `any(is_helper(...))` below is
+# licensed by one dead `if False:` site and the whole section is green over a live revert (measured:
+# 15/0, rc=0).
+EXPECTED = {"materialise": 2, "ensure-head": 1}[check]
+if len(ops) != EXPECTED:
+    refuse("%s() has %d `fetch origin` argv site(s), expected %d -- a decoy site must not license a "
+           "fetch that names no destination (a legitimate new site is a one-line update to the "
+           "EXPECTED map above)" % (fn.name, len(ops), EXPECTED))
 wrong = [(e, ln) for e, ln in ops if not ok_expr(fn, e)]
 if wrong:
     expr, lineno = wrong[0]
