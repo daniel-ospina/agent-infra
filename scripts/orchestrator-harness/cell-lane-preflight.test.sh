@@ -265,5 +265,27 @@ OUT="$(bash "$TARGET" --model "" --bound 5 2>&1)"; RC=$?
 assert_has "A14 names the misconfiguration" "why=misconfigured" "$OUT"
 assert_not_has "A14 is never reported as a network arm" "why=no-answer" "$OUT"
 
+# ── A15: a USAGE error must EMIT A VERDICT, because the caller decides from the line (follow-up to
+# #2991, P2, measured). `die_usage` used to exit 2 with a stderr message and NOTHING on stdout, so
+# the caller's "no verdict" arm WARNed and proceeded: `LANE_PREFLIGHT_BOUND=45s` measured
+# `probe rc=2 stdout=<>` and then `run_agent rc=0, agent launched`. Against this file's own EXIT
+# table ("2 CANNOT MEASURE — EVERY caller must refuse too"). A refusal that cannot be read is an
+# inert refusal, so the assertion is on the LINE, not on the exit code: the code was always 2.
+OUT="$(bash "$TARGET" --quiet --bound 45s 2>/dev/null)"; RC=$?
+[ "$RC" -eq 2 ] && ok "A15 a non-numeric --bound still exits 2 (CANNOT MEASURE)" || bad "A15 expected exit 2, got $RC: $OUT"
+assert_has "A15 ...but it now carries a READABLE verdict on stdout" "LANE_CAPABILITY=refused why=usage" "$OUT"
+assert_has "A15 ...with the reading that caused it, not a bare 'invalid'" "usage-error=--bound" "$OUT"
+assert_not_has "A15 ...and it is never confused with the transient arm" "why=no-answer" "$OUT"
+# The unknown-argument path is the one PRODUCTION hits: a consumer newer than this helper passes a flag
+# this copy predates. It must be readable for the same reason.
+OUT="$(bash "$TARGET" --quiet --line 2>/dev/null)"; RC=$?
+[ "$RC" -eq 2 ] && ok "A15 an unknown argument exits 2" || bad "A15 expected exit 2, got $RC: $OUT"
+assert_has "A15 ...and is readable as a refusal too (helper/consumer skew)" "why=usage" "$OUT"
+assert_has "A15 ...naming the argument it rejected" "usage-error=unknown argument: --line" "$OUT"
+# `-h` must NOT become a refusal: it is the one path that exits before measuring on purpose.
+OUT="$(bash "$TARGET" --help 2>/dev/null)"; RC=$?
+[ "$RC" -eq 0 ] && ok "A15 --help still exits 0 and is not a refusal" || bad "A15 --help exited $RC"
+assert_not_has "A15 ...emitting no verdict at all" "LANE_CAPABILITY" "$OUT"
+
 printf '\ncell-lane-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
