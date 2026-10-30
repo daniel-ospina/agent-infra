@@ -118,13 +118,16 @@ echo "── A8: an unparseable file is reported as SOURCED WITH ERRORS, never a
 # on a syntax error — that is the honest signal, and it is used here.
 printf 'LANE_CANARY_A="unclosed\nLANE_CANARY_B=b8\n' > "$T/broken.env"
 out="$(logprobe "$T/broken.env")"
-if printf '%s' "$out" | grep -q 'SOURCED WITH ERRORS'; then ok "(A8) an unparseable file reports SOURCED WITH ERRORS"
-elif printf '%s' "$out" | grep -q 'env: sourced'; then bad "(A8) an unparseable file was reported as a clean 'sourced': $out"
+# ⛔ HERE-STRINGS, NOT PIPES INTO A QUIET GREP (#841/#864). Under `pipefail`, `grep -q` exiting at its
+# first match leaves the `printf` writer to take SIGPIPE (141), and the pipeline status becomes non-zero
+# — so these assertions take the `else` branch and fail a verdict that IS in the output.
+if grep -q 'SOURCED WITH ERRORS' <<<"$out"; then ok "(A8) an unparseable file reports SOURCED WITH ERRORS"
+elif grep -q 'env: sourced' <<<"$out"; then bad "(A8) an unparseable file was reported as a clean 'sourced': $out"
 else bad "(A8) no verdict at all for an unparseable file: $out"; fi
 # a file whose only assignment shares a name with the INHERITED environment must still be judged on its own
 printf 'PATH="/unclosed\n' > "$T/broken-path.env"
 out="$(logprobe "$T/broken-path.env")"
-if printf '%s' "$out" | grep -q 'SOURCED WITH ERRORS'; then ok "(A8b) …including when the only name it sets is one the environment already exports"
+if grep -q 'SOURCED WITH ERRORS' <<<"$out"; then ok "(A8b) …including when the only name it sets is one the environment already exports"
 else bad "(A8b) an unparseable PATH-only file reported success: $out"; fi
 
 echo "── A9: the log never carries a VALUE ──"
