@@ -1510,10 +1510,15 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    it); any other value is fatal, so a typo cannot silently pick a scope. In a multi-box fleet
    **exactly one box takes `broad` and the rest pin `SCOPE=own`** (measured 2026-10-13: a freshly
    started cell logged `[scope] open=14 -> BROAD` and auto-armed #8425/#8420 within ~25s).
-   ⛔ **This is a partition, not coordination.** Ownership is still inferred from *local*
-   branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
-   the same PR (§7.2b, tortoise#5052) — the pin must not be mistaken for a claim registry.
-   ⛔ **And it is not the cross-box barrier for any operation.** It selects PR branches by naming
+   ⛔ **This is a partition, not coordination.** `SCOPE` decides which *names* a box looks at; it says
+   nothing about who is working them, so on its own two `own`-pinned boxes can still race the same PR
+   (§7.2b, tortoise#5052). What excludes a concurrent holder is the **claim registry, consulted by
+   selection** (agent-infra#2466): `pr_owned()` / `claim_live()` read ONE snapshot verdict, and the
+   sweep prints the decision for every PR — `claim-held` → skipped, `claim-absent` → free,
+   `claim-unreadable` → nothing acted on. Since that landed a second and third controller are safe by
+   COUNTER, not by permission: two cells may see the same candidate, and exactly one wins the CAS. The
+   pin remains the cheapest way to avoid paying twice for the same verdict.
+   ⛔ **And it is not the cross-box barrier for any operation.** `SCOPE` selects PR branches by naming
    convention, which every box shares; what excludes a concurrent holder is the claim registry, now
    measured per operation in **§7.2d** (agent-infra#1908). That measurement retires the pin's
    *safety* role for dispatch and review and keeps an exclusion requirement on the landing row.
@@ -3296,6 +3301,46 @@ cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network ca
 **data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
 reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
 
+#### Selection consults the registry, and an unreadable registry is not freedom (agent-infra#2466)
+
+The registry alone does not make two cells safe: what a cell *selects* has to consult it. Before #2466 the sweep read the snapshot with a bare `awk` and answered "not owned" whenever the file was
+**absent**, so every way a registry READ can fail reported as "nobody holds it" — no registry
+provisioned, a snapshot written from a failed fetch (the fetch's `|| true` leaves the previous cache in
+place, so the file is a stale read presented as current), or a snapshot older than the cycle reading it.
+Those are exactly the states in which two cells disagree. Measured 2026-10-23 with the registry's own
+writer (`CLAIM_OWNER_HOST=cell-2`, `refs/claims/9777-abc123def456`, live 1800 s lease): a fresh snapshot
+read OWNED; an **absent** snapshot and an **empty** one both read UNOWNED.
+
+One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `_lease_is_live` and
+`claim_orphan_reason` (no second verdict path). It publishes five words:
+
+| verdict | rc | meaning for SELECTION |
+|---|---|---|
+| `claim-absent` | 0 | the registry was READ, is FRESH, and holds nothing for this key → free |
+| `claim-expired` | 0 | an entry whose lease window has passed → free |
+| `claim-orphaned` | 0 | a live window whose holder cannot be a live lane (agent-infra#2094) → free |
+| `claim-held` | 1 | a live, non-orphaned window → **skip** (owner + `until` in the log line) |
+| `claim-unreadable` | 2 | the registry could not answer → **nothing is spawned, armed or merged** |
+
+Freshness is part of the verdict, not a separate guard: `claim_snapshot` writes a
+`#claim-snapshot\t<read_at>\t<ok|failed>\t<refs>` header, and a snapshot older than
+`CLAIM_SNAPSHOT_MAX_AGE` (900 s, ≈3.75 cycles at the shipped `CYC=240`) or written from a failed
+fetch reads `claim-unreadable`. A snapshot whose WRITE failed is never published at all: the
+previous one is left in place **with its own header**, so it keeps answering only while that header
+says `ok` and it is inside `CLAIM_SNAPSHOT_MAX_AGE` — and it is `claim-unreadable` otherwise, or
+when there is no previous snapshot at all. A failed publish is therefore not automatically a
+stand-down, and it is reported separately (`CLAIM_SNAPSHOT_WRITE`) from a failed fetch. Publishing a 0-byte
+snapshot instead would read as "nothing is claimed", which is why that is refused.
+
+**Two signals, merged, never intersected.** Selection keeps the LOCAL evidence it always had — a live
+process whose cwd is the head's checkout, a live merge lock — and adds the registry. Either one can
+BLOCK; neither can cancel the other. Conflict resolution is therefore a **union**: a local live holder
+with no claim blocks (that is the #4256 class — work the registry cannot see, e.g. a branch never
+pushed), and a foreign live claim blocks even where no local process exists (the cross-box case).
+The one asymmetry is deliberate and pre-existing: a claim held by THIS box does not by itself count as
+ownership for selection — a live process must prove it (`claim-own` is free for selection, HELD for the
+spawn guard). And `SCOPE` is untouched: it decides which names a box looks at, not who owns them.
+
 **A claim can also be DEAD while its term is not (#2094).** Renaming a machine used to orphan every
 lease it held: `claim_owner()` stamped `$(hostname -s):$$`, liveness was "`lease_until` is in the
 future", and `claim_prune` reaped by expiry alone — so the old host name never matched again and a
@@ -3554,13 +3599,19 @@ reap. The decisions that are not obvious:
   persistent condition is visible rather than a silent no-queue. rc=2 does **not** write that marker —
   it is transient by construction, so the pass exits 1 and the cycle is logged `FAILED rc=1` and
   retried; the marker would make a network blip look like a broken cell. This
-  is the opposite polarity from the PR claim's fail-open, and it was applied to **every** exit, not
-  just the obvious one: an unrecognised status is treated as INCOMPLETE, so no future code path can
-  widen the CLEAN arm by accident. The one limit is stated rather than hidden — a box where
-  `claims.sh` is **not installed at all** falls through to the pre-registry behaviour **loudly**,
-  because making a missing file refuse would turn such a box merge-only, a bigger and less
-  reversible failure. (The file reaches `$O` by `cp -p "$H"/*.sh "$O"/` in
-  `scripts/deploy-crossbox.sh` — `install.sh` itself only diffs and reports drift; it does not copy.)
+  is the opposite polarity from the PR claim's ACQUISITION fail-open, and it was applied to **every**
+  exit, not just the obvious one: an unrecognised status is treated as INCOMPLETE, so no future code
+  path can widen the CLEAN arm by accident.
+  ⛔ **A MISSING registry file REFUSES TOO (agent-infra#2466, reversing the earlier "loud fallthrough").**
+  The old rule let an unprovisioned box keep dispatching unclaimed, on the argument that refusing would
+  make it merge-only. Two things invalidated that: the PR path now also abstains on an unreadable
+  registry (so such a box is not "merge-only", it is SILENT), and the fallthrough was never loud where
+  it mattered — `issue_claim_verdict` already answered INCOMPLETE for a missing file and the call site
+  simply did not ask it. Missing, unreadable and stale are therefore ONE polarity: refuse, publish
+  `claim-unreadable`, and name the one-line remedy (`deploy-harness.sh`); `refresh-candidates.sh
+  --check` refuses the same state up front, because a check that blesses what the run refuses is a
+  false PASS. (The file reaches `$O` by `cp -p "$H"/*.sh "$O"/` in `scripts/deploy-crossbox.sh` —
+  `install.sh` itself only diffs and reports drift; it does not copy.)
 
 Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
 under `set -u`, so a caller with no commit to fence on aborted with
