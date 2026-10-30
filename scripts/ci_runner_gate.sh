@@ -1228,7 +1228,12 @@ if [ "$healthy" = 2 ]; then
       # reason` while the success line also carried `runners online_idle online_busy offline
       # demanding_idle demanding_busy label_ambiguity demand`). A census that was not read is
       # `unmeasured` — recorded, never assumed, and never absent.
-      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — capacity was not read\n' \
+      # …and the three ENGAGEMENT keys, added for #3060 (review P2): `write_verdict` gained
+      # `held= streak= engagement_lost=` and neither unknown writer did, so the writer that runs
+      # exactly when the pass could NOT evaluate engagement was the one that reported the keys as
+      # ABSENT rather than `unmeasured` — reintroducing, for the PR's own new machine-readable
+      # fields, the defect the paragraph above was minted to close.
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s held=unmeasured streak=unmeasured engagement_lost=unmeasured reason=cannot measure — capacity was not read\n' \
         "$mode" "$MODE_SOURCE" "$CENSUS_KV_UNMEASURED" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" \
         > "$VERDICT_FILE" 2>/dev/null || true
     fi
@@ -1245,7 +1250,7 @@ if [ "$healthy" = 2 ]; then
     if [ "$DRY" = 1 ]; then
       log "verdict NOT updated: --dry-run reports and changes nothing (the previous verdict file is left untouched; this pass measured nothing it could stand behind)"
     else
-      printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — a leg could not be read, so this pass changed nothing (the FAIL-CLOSED line in the log names which)\n' \
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s held=unmeasured streak=unmeasured engagement_lost=unmeasured reason=cannot measure — a leg could not be read, so this pass changed nothing (the FAIL-CLOSED line in the log names which)\n' \
         "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
         "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" \
         > "$VERDICT_FILE" 2>/dev/null || true
@@ -1356,9 +1361,24 @@ fi
 # wrote the labels and the state file recorded engagement. `mode` is re-measured from the API on THIS
 # pass. If the pool now advertises nothing, the label evaporated between the two passes — the measured
 # 60-120s re-assertion — and every synchronous check we can do on the writing pass will have said
-# "accepted". Record it, count it, re-apply, and let the exit status carry the failure: a gate that
-# reports `local` while the pool carries nothing is the exact instrument defect this issue is about.
-if [ "$prev" = "local" ] && [ "$mode" != "local" ] && [ "$want" = "local" ]; then
+# "accepted". Record it, count it, and re-apply: a gate that reports `local` while the pool carries
+# nothing is the exact instrument defect this issue is about. (It does NOT fail closed: the re-apply
+# is verified like any other write, and a verified re-apply exits 0. `engagement_lost=` in the verdict
+# is the signal; the exit status is the pre-existing one. Review P2 — the comment used to promise
+# "let the exit status carry the failure", which nothing implemented.)
+#
+# ⛔ AND ONLY WHEN THE POOL WAS ACTUALLY READ (review P2). `mode` is not always a measurement: when
+# the runner inventory cannot be counted it comes from `mode_from_jobs` (`MODE_SOURCE=jobs-inference`,
+# :1149) or is `unknown` (`MODE_SOURCE=none`, :1152), and the script says so in as many words — "the
+# inventory was not read, so capacity is not claimed from it". Asserting "this pass measures NO
+# carrier" from either would be the distinguishing-unknown-from-zero defect this file fixes
+# everywhere else (`queued=unmeasured`, `capacity=unknown`), and `mode_from_jobs` returning `github`
+# is its NORMAL success case. So a non-runner read reports the third state and leaves the durable
+# counter ALONE: a pass that did not read the pool must not clear a loss another pass did measure.
+if [ "$MODE_SOURCE" != "runners" ]; then
+  ENGAGEMENT_LOST="unmeasured"
+  log "engagement durability NOT evaluated: this pass did not read the runner inventory (source=$MODE_SOURCE mode=$mode prev=$prev) — an inferred mode is not a measurement of what the pool carries"
+elif [ "$prev" = "local" ] && [ "$mode" != "local" ] && [ "$want" = "local" ]; then
   lost="$(cat "$DUR_FILE" 2>/dev/null)"; case "$lost" in ''|*[!0-9]*) lost=0 ;; esac
   if [ ${#lost} -gt 9 ]; then lost=0; fi
   lost=$((lost+1))

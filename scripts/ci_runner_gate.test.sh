@@ -441,7 +441,13 @@ run_gate() {
   KEEP_STATE_NEXT=0
   if [ "$KEEP_STATE" = 1 ]; then KEEP_STATE=0; KEEP_STATE_NEXT=1; else mkdir -p "$STATE_DIR" "$home"; fi
   : > "$GH_LOG"
-  [ "$KEEP_STATE_NEXT" = 1 ] || rm -f "$GH_ROWS_STATE"
+  # ⛔ RESET BOTH HALVES OF THE DOUBLE'S INVENTORY (review P2): clearing only the rows state left a
+  # `.drop.pending` marker behind, and a pending drop whose rows file is gone cannot be applied on this
+  # call — so it SURVIVED and landed on the next `KEEP_STATE` arm, dropping `ubuntu-latest` from a pool
+  # state that arm never created. That is a false-pass shape in the harness itself: an arm could read
+  # "no carrier" for a reason unrelated to its own setup. Latent today (the `dur` sequence consumes the
+  # marker on its own `KEEP_STATE` pass), and one line to keep latent.
+  [ "$KEEP_STATE_NEXT" = 1 ] || rm -f "$GH_ROWS_STATE" "$GH_ROWS_STATE.drop.pending"
   # a re-assertion pending from the PREVIOUS pass lands now: the runner agent overwrote the label set in
   # the 60-120 s between ticks, so this pass must find it gone (that is the defect being pinned).
   if [ -f "$GH_ROWS_STATE.drop.pending" ] && [ -f "$GH_ROWS_STATE" ]; then
@@ -673,7 +679,9 @@ assert_contains "$(put_body_for 101)" "ubuntu-latest" "(v5) the API received the
 echo "── #3060 durability: the label evaporates 60-120s later, so the NEXT pass must catch it ──"
 # THE MEASURED DEFECT (VGATE P1). The writing pass re-reads milliseconds later and legitimately sees
 # the label, so a synchronous check CANNOT close it. The drop is deferred to the next rows read (the
-# 60-120 s window). The pass after that must (a) notice, (b) say so, (c) re-apply, (d) fail closed.
+# 60-120 s window). The pass after that must (a) notice, (b) say so, (c) re-apply, (d) record the loss
+# in the verdict — it does NOT fail closed, and the arm below pins exactly that (review P2: this line
+# used to say "fail closed", which neither the code nor `(d1)`-`(d6)` implements).
 run_gate dur GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 \
   GH_PUT_DROP_LABEL=ubuntu-latest --
 assert_contains "$OUT" "set_labels accepted=2 rejected=0" "(d1) the writing pass sees the label — synchronously it is honest"
@@ -688,6 +696,25 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d5) t
 KEEP_STATE=1
 run_gate dur GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 --
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=0" "(d6) a pass that finds the carrier present clears the flag"
+# ⛔ (d7) AN INFERRED MODE IS NOT A MEASUREMENT OF THE POOL (#3060 review P2). The durability block
+# tests `mode`, and `mode` is not always a reading: when the inventory 403s the gate infers it from the
+# jobs endpoint (`MODE_SOURCE=jobs-inference`), and `mode_from_jobs` returning `github` is its NORMAL
+# success case. The reachable shape is exactly this one — inventory unreadable, queue EMPTY → inferred
+# `github` → hysteresis holds `local` → `prev=local, mode=github, want=local` fires the durability
+# branch. Pre-fix that logs "this pass measures NO carrier" about a pool nothing read, and records
+# `engagement_lost=1` in the verdict file the PR advertises as the machine-readable signal.
+run_gate dur-inferred GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d7) the engaging pass records local"
+KEEP_STATE=1
+# `CI_GATE_DISENGAGE_TICKS=3` pins the shipped default so the hold is taken on THIS reading — with a
+# leaked 1 from a neighbouring arm the pass would disengage before the durability block and the arm
+# would prove nothing.
+run_gate dur-inferred GH_QUEUED=0 GH_FALLBACK_N=' ' CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_DISENGAGE_TICKS=3 --
+assert_contains "$OUT" "mode INFERRED from recent jobs" "(d7) this pass really took the inferred-mode path (the inventory was not read)"
+assert_contains "$OUT" "hysteresis: holding local" "(d7) …and hysteresis holds the pool on that one reading"
+assert_not_contains "$OUT" "measures NO carrier" "(d7) an inferred mode is never reported as a measurement of what the pool carries"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=unmeasured" \
+  "(d7) the verdict records the third state rather than a claim it did not make"
 KEEP_STATE=0
 echo "── #3060: disengage needs 3 consecutive github readings (the shipped default) ──"
 assert_contains "$(cat "$GATE")" 'DISENGAGE_TICKS="${CI_GATE_DISENGAGE_TICKS:-3}"' \
@@ -1418,6 +1445,12 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand
   "(11b) …including the demand key"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "label_ambiguity=unmeasured" \
   "(11b) …and the ambiguity key: parity is a property of the surface, not of a comment"
+# ⛔ (11c) THE THREE ENGAGEMENT KEYS WERE STILL MISSING ON THIS PATH (#3060 review P2). `write_verdict`
+# gained `held= streak= engagement_lost=` and neither `verdict=unknown` writer did, so the writer that
+# runs precisely when engagement could NOT be evaluated was the one reporting the PR's own new fields
+# as ABSENT rather than `unmeasured` — the same defect (11)/(11b) exist to close, for the new keys.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(11c) the engagement keys are RECORDED as unmeasured on a blind pass, not omitted"
 
 # ⛔ (12) `--dry-run` DOCUMENTS "change nothing" AND USED TO MUTATE. `evaluate` runs BEFORE the DRY
 # gate, so a blind dry-run sent a real alarm, wrote the stamp file and overwrote the verdict — and the
@@ -1453,6 +1486,8 @@ assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "ve
   "(16) the old bug, pinned: a green from a previous pass readable as the CURRENT answer"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "runners=unmeasured" \
   "(16) FIELD PARITY: a census that was never read is unmeasured, not absent"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "held=unmeasured streak=unmeasured engagement_lost=unmeasured" \
+  "(16) …and so are the three engagement keys (the second unknown writer, #3060 review P2)"
 KEEP_STATE=1
 run_gate stale-verdict DryRun GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=null -- --dry-run
 assert_eq "$RC" "2" "(16b) --dry-run still reports the refusal"
