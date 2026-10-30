@@ -127,12 +127,15 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # phase can start; the merge phase must never be sized out of it. MAX_WATCH is DERIVED from what that
 # leaves (never a literal), so raising LANE_TIMEOUT buys supervision and lowering it cannot silently
 # eat the implementation time again. Shipped defaults:
-#     3300 - 1500 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
-# i.e. the merge phase is bounded at 3240s of the 3300s clock, and a lane that implements within its
+#     7200 - 1500 (check wait) - 900 (implementation reserve) = 4800s / 120s = 40 chunks (4800s)
+# i.e. the merge phase is bounded at 7200s of the 7200s clock, and a lane that implements within its
 # reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
 # WAITING_* (exit 11) and the next invocation resumes the SAME counter.
+# (This block said `3300 - … = 7 chunks (840s) … 3240s of the 3300s clock` until agent-infra#2888
+#  moved the lane's own bound. It is re-derived below; a stated default that the code no longer
+#  computes is the exact defect the next paragraph is about.)
 # ⛔ AND THE CLOCK ITSELF IS THE LANE'S, READ FROM THE SAME SEAM (#2888 review, P2/P3 — verified). It
-# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}` = 7200 s
+# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` = 7200 s
 # — and `lane.sh` does not export `LANE_TIMEOUT`, so the merge phase permanently spent ~45% of the clock
 # the lane now owns. That is the opposite of what the paragraph above claims ("DERIVED from the lane's own
 # wall clock"). `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so this child reads the lane's real bound:
