@@ -408,8 +408,10 @@ an operator then reclaimed 62 clean checkouts (7.7 GB) by hand, losing no commit
 
 So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when a
 bounded `git ls-remote --heads <remote> refs/heads/<branch>` answers with **exactly this
-HEAD sha**. The advertised refname is matched literally (exactly once — `ls-remote`'s
-pattern argument fnmatches, so `?`/`[` in a branch name would otherwise widen it), and the
+HEAD sha**. The advertised refname is matched literally and exactly once (⚠️ because `ls-remote`
+matches a pattern against the ref's **tail, from any slash separator**, so `refs/heads/<b>` also selects
+an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metacharacters: `check-ref-format`
+rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
 remote is the **longest configured remote name** prefixing the ref, not the first path
 segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
 refname or different sha leaves the verdict where it was — `remote-only-ref`, PRESERVE — and a
@@ -653,13 +655,34 @@ and `DF_BIN` are the test seams; the measured paths are `df -Pm <repo>` under `R
 
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
 `classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=`,
-`pr_merged=` and `delegate_verdict_worktree=` (the delegate's own `verdict=`, with the same
-`?`/`not-run`/`mixed` polarity; it is printed by `--print-status` **and** on the cell health verb's
+`pr_merged=` and `delegate_verdict_worktree=` (the delegate's own `verdict=`; it carries the same
+`?`/`not-run` vocabulary, but **not** `main_proof=`'s disagreement polarity — see below; it is printed
+by `--print-status` **and** on the cell health verb's
 per-class line (`scripts/cloud-cell-supervisor.sh`, `⛔ worktree-delegate=`) — a field the reader does not print
 does not exist, so a status channel that showed only `worktree=ok` for an ineffective reap was
 publishing the incident's own misleading sentence — and it is deliberately SEPARATE from
 `verdict_worktree=`, which stays the exit-code reading — an ineffective reap exits 0 by design, so
-without this field the fleet's record said `worktree=ok` for it). `examined = classified + deferred` and `classified = remove + preserved` are the two
+without this field the fleet's record said `worktree=ok` for it).
+
+⛔ **A DISAGREEMENT IS NOT ONE THING, because this field feeds an ALARM.** `main_proof=` and
+`pr_merged=` collapse any disagreement to `mixed` and nothing reads that token. This field is printed
+with a ⛔ for every value outside the benign allow-list, so the same rule would mean two opposite
+things at once on the multi-repo shape (`DISK_REAPER_REPOS`, or `--repo` repeated):
+`reap-ineffective` + `idle` (**the alarm**) and `reclaimed` + `idle` (**two ordinary readings**) would
+both read `mixed`, painting a ⛔ onto healthy cells and making `⛔ worktree-delegate=reap-ineffective`
+unreachable. The aggregation therefore gives the **alarm class precedence** and spells the two cases
+differently (`scripts/disk-reaper.sh`, `_dclass`):
+
+| answers across repos | record | cell health verb |
+|---|---|---|
+| all agree | that answer | `ok`/`?`/`not-run`/`dry-run`/`reclaimed`/`idle` are silent; anything else prints ⛔ |
+| ordinary readings disagree (`reclaimed` + `idle`) | `mixed-benign` | silent |
+| an alarm answer, alone or beside any benign answer | **that alarm**, e.g. `reap-ineffective` | `⛔ worktree-delegate=reap-ineffective` |
+| two DIFFERENT alarm answers (`reap-ineffective` + `unmeasured`) | `mixed` | `⛔ worktree-delegate=mixed` — the only case where the cell cannot say |
+| a spelling this reader has not been taught | itself — the benign side is an allow-list | ⛔ (fail-loud) |
+
+The class is an ALLOW-LIST and not a deny-list for that last row: a verdict added to the reaper later
+must be SURFACED by a reader that was never taught it, never silently swallowed by one. `examined = classified + deferred` and `classified = remove + preserved` are the two
 identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict
 was already `remove`, so folding it into `deferred` would deflate `preserved` and make the line
 contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote
