@@ -3121,22 +3121,25 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     one), so all 80 took the old slug fallback and the vector stayed green while asserting a
     token nobody would ever compare. Caught in #2648 review cycle 3.
     """
-    # ⛔ THE LIST IS NOT IN THE SOURCE ANY MORE. `run-bash-shards.sh` DERIVES its list from
-    # `SUITE_GLOBS` + `shard_discover` (agent-infra#2609), and a merge had left a second, enumerated
-    # copy of 103 rows behind — which this vector used to parse, and which doubled every suite's
-    # execution (#3060/#3067 removed it). Parsing `^run_shard <path>` now finds only the loop's
-    # `"$shard"`, so a source-only parse is structurally vacuous. Ask the runner for the list it will
-    # actually run: `--list` exits before the placement guard and executes nothing.
-    root = Path(__file__).resolve().parent.parent
-    proc = subprocess.run(["bash", "scripts/run-bash-shards.sh", "--list"], cwd=str(root),
-                          capture_output=True, text=True)
-    assert proc.returncode == 0, (
-        f"the runner could not list its own shards (rc={proc.returncode}): {proc.stderr.strip()[:400]}"
+    # ⛔ THE ORACLE IS `--list`, NOT THE RUNNER'S OWN TEXT (#2838). This vector used to parse
+    # `run_shard <path>` rows out of `scripts/run-bash-shards.sh` — a SECOND copy of the list, which
+    # #2838 deleted: the enumerated rows ran every suite twice beside the derived loop, so the two
+    # lists disagreed by construction (`executed 212 of 108 listed`) and this vector asserted against
+    # the half that was wrong. Reading `--list` asserts against the list the lanes ACTUALLY execute,
+    # and it is also the shape that cannot pass vacuously: a file-text grep decomposes the moment the
+    # runner stops enumerating, whereas a broken `--list` fails the rc assertion below by name.
+    runner = Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh"
+    proc = subprocess.run(
+        ["bash", str(runner), "--list"], capture_output=True, text=True, timeout=120
     )
-    listed = [p.strip() for p in proc.stdout.splitlines() if p.strip()]
+    assert proc.returncode == 0, (
+        f"`{runner.name} --list` failed (rc {proc.returncode}): {proc.stderr[-2000:]}"
+    )
+    listed = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    assert listed, "`--list` printed nothing — this vector would pass vacuously"
     assert len(listed) >= 60, (
-        f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
-        "would pass vacuously"
+        f"`--list` printed only {len(listed)} listed shards — the list shrank below the floor this "
+        "vector needs to be more than a coincidence"
     )
     ids = {}
     for path in listed:
