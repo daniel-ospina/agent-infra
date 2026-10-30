@@ -280,24 +280,29 @@ eq "$(sed -n '1p' "$KILL_LOG")" "-TERM 601" "FINISHED: the CHILD is signalled fi
 eq "$(sed -n '2p' "$KILL_LOG")" "-TERM 600" "FINISHED: the wrapper root is signalled second"
 hasnt "$(cat "$KILL_LOG")" "-KILL" "FINISHED: both die on TERM (no escalation needed)"
 
-# ── the shipped bound and its seam: LANE_IDLE_MIN = 120 min ─────────────────────────────────────
+# ── the shipped bound and its seam: LANE_IDLE_MIN = 180 min ────────────────────────────────────
 # The registry pins the DECLARATION; this pins the BEHAVIOUR, because the number is what decides a
-# kill. A 90-minute-idle log sits BETWEEN the 60 and 120 minute candidates, so the pair of legs
-# below proves the shipped default is 2 h (not "any staleness") AND that the env seam still moves
+# kill. A 150-minute-idle log sits BETWEEN the 60 and 180 minute candidates, so the pair of legs
+# below proves the shipped default is 3 h (not "any staleness") AND that the env seam still moves
 # it — a default that silently became 60 would make the first leg reap a lane it must spare.
-echo "== DEFAULT (LANE_IDLE_MIN is 2 h, and LANE_REAP_IDLE_MIN moves it)"
-MID_LOG="$(newlog L-mid.log $((90 * 60)))"
+echo "== DEFAULT (LANE_IDLE_MIN is 3 h, and LANE_REAP_IDLE_MIN moves it)"
+MID_LOG="$(newlog L-mid.log $((150 * 60)))"
 : > "$T/t-mid"; psinit >> "$T/t-mid"
-psrow 700 400 Ss 00:00:00 01:30:00 "bash -c cd /repo; pi -p \"\$(cat brief)\" > $MID_LOG 2>&1 &" >> "$T/t-mid"
-psrow 701 700 Sl 00:00:05 01:30:00 pi >> "$T/t-mid"
+psrow 700 400 Ss 00:00:00 02:30:00 "bash -c cd /repo; pi -p \"\$(cat brief)\" > $MID_LOG 2>&1 &" >> "$T/t-mid"
+psrow 701 700 Sl 00:00:05 02:30:00 pi >> "$T/t-mid"
 fdlink 701 1 "$MID_LOG"; fdlink 701 2 "$MID_LOG"
 out="$(run_reap "$T/t-mid" "" -- --dry-run)"
-hasnt "$out" "WOULD REAP" "DEFAULT: a 90 m idle log is UNDER the shipped LANE_IDLE_MIN (2 h)"
+hasnt "$out" "WOULD REAP" "DEFAULT: a 150 m idle log is UNDER the shipped LANE_IDLE_MIN (3 h)"
 # ⛔ `trees=<working>/<judged>` MUST ACCOUNT FOR EVERY JUDGED TREE (#2163 review, P3). `live` was
 # incremented only for a CPU delta above the tolerance or a log younger than LIVE_MIN (125 m), so a
-# lane idle BETWEEN the live window and 2 h — this one — counted as neither working nor a candidate and the field
-# under-reported the box. A judged tree is working unless it is a candidate.
-has "$out" "trees=1/1" "DEFAULT: an idle-but-not-stale lane is counted WORKING in trees=<working>/<judged>"
+# lane idle BETWEEN the live window and the idle bound — **this one, at 150 m** — counted as neither
+# working nor a candidate and the field under-reported the box. A judged tree is working unless it is
+# a candidate.
+# ⛔ AND THE FIXTURE HAS TO SIT IN THAT BAND TO PROVE IT (agent-infra#2888 review, F4): the interval
+# is non-empty only while `LIVE_MIN (125) < LANE_IDLE_MIN (180)`. When the idle bound was 120 the band
+# was EMPTY, and a 90-minute fixture was merely "live by log" — the arm passed without ever exercising
+# the accounting it exists for, which is what made the overlap invisible.
+has "$out" "trees=1/1" "DEFAULT: an idle-but-not-live-not-stale lane (150 m, between 125 and 180) is counted WORKING in trees=<working>/<judged>"
 out="$(LANE_REAP_IDLE_MIN=60 run_reap "$T/t-mid" "" -- --dry-run)"
 has "$out" "WOULD REAP root=700" "…and LANE_REAP_IDLE_MIN=60 makes the SAME lane a candidate (the seam is live)"
 
