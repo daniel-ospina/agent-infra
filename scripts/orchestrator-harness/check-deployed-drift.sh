@@ -849,6 +849,14 @@ if [ "$problems" -gt 0 ]; then
 fi
 if [ "$O_ABSENT" -eq 0 ]; then
   note "OK: deployed $O matches $REPO@$REF ($TIP_SHORT) — recorded commit ${HAS:0:12} [current] (record: $RECORD)"
+elif [ -d "$O" ]; then
+  # ⛔ `O_ABSENT` MEANS TWO THINGS AND THE SENTENCE BELOW MUST NOT. It is set both when there is no $O and
+  # when there IS one whose record is unusable (`--surface` keeps going in that case, by design). Reusing
+  # it for the wording made the run print `no deployed dir was present to check` about a dir it had just
+  # listed as `surface: $O` — a false statement about what was measured, on exactly the population the
+  # `--surface` fallback exists for (a hand-placed copy, a farmed cell, an operator-synced $O with no
+  # usable record). The identity half abstained; say that, and say the dir's own bytes were not verified.
+  note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — but $O could NOT be identified (no usable harness record), so its own bytes were NOT verified against a record"
 else
   note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — no deployed dir was present to check"
 fi

@@ -353,6 +353,30 @@ ck "…and the surface pass actually RAN and named its hit (c.sh, hand-placed in
 ck "…and it SAYS the preferred record was unusable (the fallback is never silent)" \
    "$(qF "falling back to the install.sh stamp" "$OUT" && echo 0 || echo 1)"
 
+# ⛔ AND WITH **NO STAMP EITHER** — the population this whole half exists for (a hand-placed copy, a farmed
+# cell, an operator-synced $O): the record halves abstain, the surface pass answers. The summary must not
+# then say "no deployed dir was present to check" about the dir it just listed: `$O_ABSENT` means both
+# "no $O" and "no usable record", and the wording must not inherit the second meaning.
+# The surface candidates are CLEAN here, so the run reaches the OK summary — a surface hit would exit 1
+# first and grade nothing about the message.
+deploy
+clean_surface="$TMP/clean-harness"; rm -rf "$clean_surface"; mkdir -p "$clean_surface"
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$clean_surface"/
+bash "$PROVW" write --o "$O" --src "$SRCDIR" --commit "$(git -C "$REPO" rev-parse HEAD)" --ref main --repo "$REPO" >/dev/null 2>&1
+chmod 000 "$O/.harness-provenance" 2>/dev/null || true
+rm -f "$O/.agent-infra-stamp.json"          # no stamp to fall back to
+OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$clean_surface" HARNESS_PIN_DIR="" \
+        HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
+        bash "$DRIFT" --o "$O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+chmod 644 "$O/.harness-provenance" 2>/dev/null || true
+ck "no usable record AND no stamp: the surface pass still answers cleanly (rc 0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and the identity half admits it SKIPPED for lack of a record" \
+   "$(qF "identity: SKIPPED" "$OUT" && echo 0 || echo 1)"
+ck "…and the run does NOT claim no deployed dir was present (it is present)" \
+   "$(qF "no deployed dir was present to check" "$OUT" && echo 1 || echo 0)"
+ck "…and it says $O could NOT be identified, so its bytes were NOT verified against a record" \
+   "$(qF "could NOT be identified" "$OUT" && echo 0 || echo 1)"
+
 echo
 echo "── §9f a pathless manifest line is CANNOT-VERIFY here too, not a MISSING named after a hash ──"
 # ⛔ `%%` and `#` BOTH RETURN THE WHOLE LINE when the two-space run is absent, so a pathless `<64 hex>`

@@ -291,6 +291,11 @@ bash "$PROV" write --o "$STG/O" --src "$STG/src" --source-dirty bogus >/dev/null
 ck "--source-dirty is VALIDATED (bogus -> 78, never silently recorded)" "$([ "$RC" -eq 78 ] && echo 0 || echo 1)"
 bash "$PROV" write --o "$STG/O" --src "$STG/src" --origin "$STG/no-such-dir" >/dev/null 2>&1; RC=$?
 ck "--origin must be a real directory (a reader has to be able to look at it) -> 78" "$([ "$RC" -eq 78 ] && echo 0 || echo 1)"
+# ⛔ `--origin $O` IS THE TAUTOLOGY REACHED THROUGH THE NEW FLAG: `source=` is what a plain `check --o $O`
+# classifies an edit against, so an origin that IS the target compares the tree with itself and the
+# documented call answers CLEAN over a hand edit. `--src` is refused for exactly this; `--origin` must be.
+bash "$PROV" write --o "$STG/O" --src "$STG/src" --origin "$STG/O" >/dev/null 2>&1; RC=$?
+ck "--origin that resolves to --o is REFUSED (78) — a record cannot be its own source" "$([ "$RC" -eq 78 ] && echo 0 || echo 1)"
 
 echo
 echo "── §2f a manifest line with NO PATH is CANNOT-VERIFY, never a file named after its hash ──"
@@ -308,6 +313,18 @@ printf '#!/usr/bin/env bash\necho HAND-PATCHED\n' > "$MP/O/gh-rest/gh"   # a rea
 MP_OUT="$(bash "$PROV" check --o "$MP/O" 2>&1)"; RC=$?
 ck "a pathless manifest line is UNKNOWN (2), never a clean answer over an unrecorded edit" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 ck "…and it says the line has NO PATH (a reason an operator can act on)" "$(qF "no path" "$MP_OUT" && echo 0 || echo 1)"
+# The SHORT-hash arm is the one that must stay alive: a line that is 10 hex + a two-space run is a
+# manifest-shaped line this reader cannot parse, and it must be CANNOT-VERIFY (not skipped as a header).
+# A FRESH fixture: the record above is already mutated, and its pathless line would answer first.
+SP="$TMP/shorthash"; rm -rf "$SP"; mkdir -p "$SP/O"; cp -R "$SRC"/. "$SP/O"/
+bash "$PROV" write --o "$SP/O" --src "$SRC" --commit 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1
+SPR="$SP/O/.harness-provenance"
+SP_GH="$(sed -n 's/^\([0-9a-f]\{64\}\)  gh-rest\/gh$/\1/p' "$SPR" 2>/dev/null | head -1)"
+{ grep -vF "  gh-rest/gh" "$SPR"; printf 'deadbeef00  gh-rest/gh\n'; } > "$SPR.tmp" 2>/dev/null && mv "$SPR.tmp" "$SPR"
+MP_OUT2="$(bash "$PROV" check --o "$SP/O" 2>&1)"; RC=$?
+ck "the short-hash fixture replaced a real 64-hex entry" "$([ -n "$SP_GH" ] && echo 0 || echo 1)"
+ck "a manifest-shaped line whose hash is NOT 64 hex chars is UNKNOWN (2) — the arm is not dead" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "…and it names the hash length, not 'no path'" "$(qF "not 64 hex chars" "$MP_OUT2" && echo 0 || echo 1)"
 
 echo
 echo "── §3 THE MEASURED INCIDENT: a deploy onto a dirty \$O REFUSES and names what it would discard ──"

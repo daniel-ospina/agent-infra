@@ -183,6 +183,12 @@ write)
   if [ -n "$ORIGIN_ARG" ]; then
     [ -d "$ORIGIN_ARG" ] || die "--origin $ORIGIN_ARG is not a directory (it is recorded as source=, which a reader must be able to look at)"
     SOURCE_REC="$(cd "$ORIGIN_ARG" && pwd -P)" || die "--origin $ORIGIN_ARG cannot be resolved"
+    # ⛔ THE SAME TAUTOLOGY, REACHED THROUGH THE NEW FLAG. `source=` is what a plain `check --o $O`
+    # classifies a phase-A leftover against (`cmp $CSRC/$rel $O/$rel`), so an origin that IS `$O`
+    # compares the tree with itself: the documented `check --o $O` then answers CLEAN over a hand edit
+    # a redeploy destroys — the one state this tool exists to make impossible. `--src` is refused for
+    # exactly this reason three statements above; `--origin` must be too, or the refusal is a bypass.
+    [ "$SOURCE_REC" != "$O_REAL" ] || die "refusing --origin $O — it resolves to --o, and a record whose source IS its target can never report an edit (pass --origin <the live harness directory a redeploy would read>)"
   fi
 
   W="$(mktemp -d "$O/.harness-prov.XXXXXX" 2>/dev/null)" || die "cannot create a work dir in $O (not writable?)"
@@ -379,27 +385,24 @@ check)
   NSEEN=0
   SEEN=""
   while IFS= read -r line; do
-    case "$line" in ''|'#'*) continue ;; esac
     # ⛔ CLASSIFY BY THE `<64 hex>  <path>` PREFIX, NOT BY "the line contains two spaces". A header VALUE
     # can contain a two-space run — the deploy writes `source=<the checkout path>`, and a checkout named
     # with two consecutive spaces produced a record whose own `source=` line was read as a manifest
     # entry: `check` exited 2 "cannot parse" FOREVER (re-recording reproduced it), and the drift reader
     # fabricated a MISSING file from a path that never existed. A record the writer cannot read back is
     # worse than no record, so the discriminator is the format's own first field.
-    case "$line" in
-      ''|'#'*) continue ;;
-    esac
+    # (This filter is the ONLY non-manifest filter: the `*[!0-9a-f]*) bad …` arm that used to sit below
+    # it tested the same string and was unreachable, while its comment claimed to be this reader's
+    # CANNOT-VERIFY path. Removed rather than trusted — a guard that cannot run is worse than none.)
     _h="${line%%  *}"
     case "$_h" in
-      *[!0-9a-f]*) continue ;;          # a `key=value` header field, a comment, or a stray line
+      ''|'#'*) continue ;;              # a blank line or a comment
+      *[!0-9a-f]*) continue ;;          # a `key=value` header field, or a stray line
     esac
-    H_REC="${line%%  *}"
+    H_REC="$_h"
     REL="${line#*  }"
-    # A manifest line is `<64 hex>  <path>`; anything else means a record this reader cannot parse,
-    # which is CANNOT-VERIFY rather than "no entries".
-    case "$H_REC" in
-      *[!0-9a-f]*) bad "UNKNOWN: the record at $REC has a manifest line this reader cannot parse: '$line'"; exit 2 ;;
-    esac
+    # A manifest line is `<64 hex>  <path>`; a hash that is not 64 hex chars means a record this
+    # reader cannot parse, which is CANNOT-VERIFY rather than "no entries".
     [ "${#H_REC}" -eq 64 ] || { bad "UNKNOWN: the record at $REC has a manifest line whose hash is not 64 hex chars: '$line'"; exit 2; }
     # ⛔ THE SEPARATOR IS ITS OWN TEST, BECAUSE `%%` AND `#` BOTH RETURN THE WHOLE LINE WHEN IT IS ABSENT:
     # on a pathless `<64 hex>` line, `${line%%  *}` and `${line#*  }` are the SAME string, so `REL` became the
