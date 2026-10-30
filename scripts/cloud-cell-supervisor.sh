@@ -283,6 +283,137 @@ workers_maybe_live() {
 WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# LANE CEILING — DERIVED on this delivery path too, and a PIN THAT DISAGREES IS LOUD (#3171)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# THE RULING IS NOT CHANGED HERE. `MAX_LANES` is DERIVED, not configured: floor(ncpu × 5/2), the
+# fleet's 2026-10-17 lane ruling (docs/ops/ai-drainer.md:49, docs/ops/fleet-harness-baseline.md:137
+# — "Do not 'fix' a per-box MAX_LANES"). Memory is the drainer's SEPARATE second ceiling
+# (target = min(cpu_ceiling, mem_ceiling)); it is REPORTED here and never applied here, because a
+# memory floor quietly narrowing the lane count would reverse that ruling as a side effect.
+#
+# WHY THIS FILE NEEDED IT AT ALL. Every other delivery path DERIVES the number: install.sh:87
+# renders it into the mac plist, orch-loop.sh:243 and spawn-gate.sh:91 derive it at start. This one
+# — the CELL path — derived it ZERO times: the cell's number is a hand-pushed `keys.env` constant,
+# sourced into this shell, so nothing ever compared it to the derivation. Measured 2026-10-30:
+# cell-3 is 4 cores (derives 10) and its keys.env carried 20, while its memory ceiling was 3 — it
+# ran 10 lanes, thrashed, and killed lanes with ENOSPC. Two delivery paths, one of which could
+# drift with nothing going red. This block is the missing comparison and the missing one-line
+# report (`cpus=N MAX_LANES=M mem_ceiling=K`), so a box whose lane count exceeds its memory ceiling
+# is visible rather than inferred from a thrash.
+#
+# ⛔ PINNED MIRROR, NOT A SOURCE. This file is farmed into a runtime dir and copied outside any
+# checkout (see the note above `_proc_start_epoch`), so it cannot source scripts/lib/lane-ceiling.sh.
+# The derivation below is that library's, mirrored. ⛔ THE DRIFT ARM IS IN
+# orchestrator-harness/selftest.sh (§ "LANE CEILING"), which runs BOTH under the same stubbed probes
+# and reddens on any divergence — name it exactly: a comment that points at a suite which does not
+# contain the arm leaves the next editor pinning nothing. (It is behavioural rather than the
+# byte-identity `pin_dirty` uses because the two bodies legitimately differ in naming; what must not
+# differ is what they ANSWER, which is what the five probe scenarios assert.)
+_lane_is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+_lane_is_limit() { _lane_is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+# Sets LANE_CPU_N / LANE_CPU_MECH in this shell. Order is install.sh:46's, unchanged: sysctl (macOS)
+# → nproc (GNU) → getconf (POSIX; present on both, and the only one a minimal Linux userland keeps).
+_lane_probe_raw() {
+  local n
+  LANE_CPU_MECH=""; LANE_CPU_N=""
+  n="$(sysctl -n hw.ncpu 2>/dev/null)" && [ -n "$n" ] && _lane_is_limit "$n" && { LANE_CPU_MECH=sysctl; LANE_CPU_N="$((10#$n))"; }
+  if [ -z "$LANE_CPU_MECH" ]; then
+    n="$(nproc 2>/dev/null)" && [ -n "$n" ] && _lane_is_limit "$n" && { LANE_CPU_MECH=nproc; LANE_CPU_N="$((10#$n))"; }
+  fi
+  if [ -z "$LANE_CPU_MECH" ]; then
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" && [ -n "$n" ] && _lane_is_limit "$n" && { LANE_CPU_MECH=getconf; LANE_CPU_N="$((10#$n))"; }
+  fi
+  if [ -z "$LANE_CPU_MECH" ]; then
+    # ⛔ LOUD FALLBACK — a constant is never reported as a measurement.
+    log_line "WARN: the CPU count could not be read (sysctl hw.ncpu, nproc and getconf all failed) — falling back to 4 cores, so MAX_LANES derives to 10. This is a CONSTANT, not a measurement." >&2
+    LANE_CPU_MECH=fallback; LANE_CPU_N=4
+  fi
+  [ "$LANE_CPU_N" -ge 1 ] || {
+    log_line "WARN: the CPU probe ($LANE_CPU_MECH) answered 0 — a 0-valued probe is a FAILED probe, not 'no cores'. Falling back to 4 cores." >&2
+    LANE_CPU_MECH=fallback; LANE_CPU_N=4
+  }
+  return 0
+}
+# floor(ncpu × 5/2): 10 cores → 25, 8 → 20, 4 → 10. The fallback of 10 covers a FAILED or absurd
+# derivation only — never a pin.
+_lane_derive() { # $1 = ncpu
+  local n="${1:-}" d
+  _lane_is_limit "$n" || return 1
+  d=$(( 10#$n * 5 / 2 ))
+  [ "$d" -ge 1 ] && [ "$d" -le 999999999 ] || d=10
+  printf '%s\n' "$d"
+}
+# The drainer's own formula and the drainer's own env names (ai-drainer.sh:44), so a pin on one box
+# is honoured by both. REPORTED, never applied: application belongs to the drainer.
+_lane_mem_avail_mb() {
+  local p="${LC_PROC_MEMINFO:-/proc/meminfo}" mb
+  if [ -n "${MEM_AVAIL_MB:-}" ]; then
+    case "$MEM_AVAIL_MB" in ''|*[!0-9]*) ;; *) printf '%s\n' "$((10#$MEM_AVAIL_MB))"; return 0 ;; esac
+  fi
+  if [ -r "$p" ]; then
+    mb="$(awk '/^MemAvailable:/ {a=$2} /^MemFree:/ {f=$2} /^Cached:/ {c=$2}
+              END {if (a!="") v=a; else if (f!="" && c!="") v=f+c; else exit 1
+                   printf "%d", v/1024}' "$p" 2>/dev/null)" || return 1
+  else
+    mb="$(vm_stat 2>/dev/null | awk '/page size of/ {ps=$8} /Pages free/ {gsub(/[.]/,"",$3); f=$3}
+          /Pages inactive/ {gsub(/[.]/,"",$3); i=$3}
+          END {if (ps=="") ps=16384; if (f=="" || i=="") exit 1
+               printf "%d", (f+i)*ps/1048576}')" || return 1
+  fi
+  case "$mb" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$mb"
+}
+_lane_mem_ceiling() { # $1 = mem_avail_mb → "?" when unreadable
+  local avail="${1:-}" floor_mb budget lane_mb usable
+  _lane_is_num "${avail:-}" || { printf '?\n'; return 1; }
+  floor_mb="${MIN_MEM_FREE_MB:-512}"; budget="${MEM_BUDGET_PCT:-75}"; lane_mb="${LANE_MEM_MB:-512}"
+  _lane_is_num "$floor_mb" || floor_mb=512
+  _lane_is_num "$budget"   || budget=75
+  _lane_is_num "$lane_mb"  || lane_mb=512
+  [ "$lane_mb" -ge 1 ] || lane_mb=512
+  usable=$(( (10#$avail - 10#$floor_mb) * 10#$budget / 100 ))
+  [ "$usable" -ge 0 ] || usable=0
+  printf '%s\n' "$(( usable / 10#$lane_mb ))"
+}
+# The ONE line, at every start. `pinned=`/`drift=` appear only when a pin exists, and drift is
+# named with the file that carries it. ⛔ A pin is NEVER rewritten here: it is the operator's, and a
+# tool that overwrites it turns a visible disagreement into a silent one.
+lane_ceiling_report() {
+  local pin="${MAX_LANES:-}" ncpu derived avail memceil
+  _lane_probe_raw; ncpu="$LANE_CPU_N"
+  derived="$(_lane_derive "$ncpu")" || derived=10
+  avail="$(_lane_mem_avail_mb 2>/dev/null)" || avail=""
+  memceil="$(_lane_mem_ceiling "$avail" 2>/dev/null)" || memceil="?"
+  if [ -z "$pin" ]; then
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH (derived: 2.5 x cores — no pin)"
+    return 0
+  fi
+  case "$pin" in
+    ''|*[!0-9]*)
+      log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin DRIFT — the pin is not a whole number, so it cannot be the lane ceiling it names. Fix the MAX_LANES line in ${ENV_FILE:-keys.env}."
+      return 0 ;;
+  esac
+  # ⛔ A DIGIT STRING IS NOT A MAGNITUDE (the `is_limit` rule this repo applies to every other limit).
+  # `$((10#$pin))` on a 20-digit pin WRAPS rather than erroring, so the report would print a wrapped
+  # number as fact and the memory comparison below would compute a garbage slot count — the same
+  # class install.sh:1176 names ("passed the class test, and … lost the lane cap").
+  if ! _lane_is_limit "$pin"; then
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin DRIFT — the pin is not a magnitude (more than nine digits), so it cannot be the lane ceiling it names; it is NOT evaluated and NOT applied. Fix the MAX_LANES line in ${ENV_FILE:-keys.env}."
+    return 0
+  fi
+  if [ "$((10#$pin))" = "$derived" ]; then
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin (agrees with the derivation)"
+  else
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin DRIFT — the pin disagrees with 2.5 x $ncpu cores (=$derived) and stays in force; the ruling is that MAX_LANES is DERIVED, not configured, so remove the MAX_LANES line from ${ENV_FILE:-keys.env} unless this box is deliberately carved out (docs/ops/fleet-harness-baseline.md:137). Reported, never overwritten."
+  fi
+  if [ "$memceil" != "?" ] && [ "$memceil" -lt "$((10#$pin))" ]; then
+    log_line "WARN: the pinned MAX_LANES=$pin EXCEEDS this box's memory ceiling ($memceil lanes — (MemAvailable - ${MIN_MEM_FREE_MB:-512}MB) x ${MEM_BUDGET_PCT:-75}% / ${LANE_MEM_MB:-512}MB): the drainer holds the real target at $memceil, so the extra $((10#$pin - memceil)) lane slot(s) are a thrash risk, not capacity (measured: cell-3 ran 10 lanes against a ceiling of 3 and was killed with ENOSPC, agent-infra#3171)"
+  fi
+  return 0
+}
+cmd_capacity() { lane_ceiling_report; }
 die() { log_line "FATAL: $*" >&2; exit 1; }
 
 # ── the TARGET checkout: the operator's value, else DERIVED from a real checkout ───────────────
@@ -2544,6 +2675,11 @@ end_loop_pid() { # [<pid> <ident>]
 
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
+  # ⛔ THE BOX'S LANE CEILING, IN ONE LINE, BEFORE ANYTHING STARTS (#3171). `$ENV_FILE` is already
+  # sourced into this shell by this point, so a `keys.env` MAX_LANES pin is visible here — and this
+  # is the ONLY place a cell's ceiling is ever compared to the derivation. A warning at start is the
+  # whole point: cell-3's 20-against-a-derivation-of-10 was invisible until it thrashed.
+  lane_ceiling_report
   # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
   # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
   validate_scope
@@ -3406,6 +3542,9 @@ cmd_stop() {
 }
 cmd_status() {
   local cpids own foreign
+  # The ceiling goes in the STATUS report too: `status` is what an operator (and the doctor) reads
+  # when a box is misbehaving, and the answer to "is it over its memory ceiling" belongs there.
+  lane_ceiling_report
   cpids="$(seen_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to report a controller state from an unreadable read"
   own="$(owned_controller_pids)" \
@@ -4212,6 +4351,7 @@ cmd_prune() {
 }
 
 case "${1:-status}" in
+  capacity) cmd_capacity ;;
   check)   cmd_check ;;
   start)   cmd_start ;;
   apply)   shift; cmd_apply "$@" ;;
@@ -4223,5 +4363,5 @@ case "${1:-status}" in
   merge)   shift; cmd_merge "$@" ;;
   reap)    shift; cmd_reap "$@" ;;
   hygiene) shift; cmd_hygiene "$@" ;;
-  *) log_line "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
+  *) log_line "usage: $0 check|start|stop|status|capacity|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac
