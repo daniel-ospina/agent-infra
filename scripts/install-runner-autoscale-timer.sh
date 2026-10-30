@@ -498,24 +498,62 @@ note_repo_change() {
     return 0
 }
 
+# exec_remainder_after_script <newline-separated args> — the command line MINUS the interpreter and the
+# script token (by POSITION, up to two tokens) and MINUS the installer's own `--repo <value>` pair, so
+# what comes back is the mode the pass is actually invoked with.
+# ⛔ THIS IS THE ONE IMPLEMENTATION, AND IT IS SHARED, BECAUSE TWO READERS OF ONE COMMAND LINE ALREADY
+# DISAGREED TWICE. `--status` classified the remainder while `artifact_is_armed` tested the raw line for
+# the `--dry-run`/`--status` SUBSTRING — so an artifact carrying `--apply`, `--install-unit` or
+# `--check-units` (none of which converges) read ARMED to the one that decides whether a dated record is
+# KEPT, and broken to the one an operator reads. A second, weaker classifier is how that happens; there
+# is now one.
+# ⛔ ONLY THE FIRST `--repo` PAIR IS CONFIGURATION. argparse `store`s it, so the LAST one wins: an artifact
+# carrying `--repo "o/r" --repo "evil/pool"` converges `evil/pool` while `artifact_repo_value` (and so
+# `note_repo_change` and `drift_inputs=repo`) report `o/r` from the FIRST — a silent re-point of the pool
+# that nothing compared. A second pair is therefore RE-EMITTED as a bare `--repo` for the classifier to
+# report, and only a first pair carrying a real value is dropped.
+# ⛔ AND A VALUELESS `--repo` IS NOT CONFIGURATION either: this strip used to remove the flag plus whatever
+# token followed, unconditionally, so a TRAILING `--repo` was dropped for having no value and
+# `--repo --dry-run` had its `--dry-run` EATEN as if it were the value. argparse rejects both (measured:
+# rc=2, "argument --repo: expected one argument"). `pending` buffers the flag one token so the next line
+# is judged rather than assumed.
+exec_remainder_after_script() {
+    printf '%s\n' "${1:-}" | awk '
+        { if (NF == 0) next
+          if (++pos <= 2) next
+          if (pending) {
+              pending = 0
+              if ($0 != "" && $0 !~ /^-/) next   # a real value: configuration, dropped with its flag
+              print "--repo"                      # NO value: report the flag, then judge this token too
+          }
+          if ($0 == "--repo") {
+              if (repopairs++) { print "--repo"; next }   # a SECOND pair is a re-point, not configuration
+              pending = 1; next
+          }
+          print }
+        END { if (pending) print "--repo" }'
+}
+
 # artifact_is_armed() — does the INSTALLED artifact actually CONVERGE? Used by `--arm`'s failure path,
 # which must not keep a dated record over an artifact that does not exist or would measure only.
 # ⛔ THE QUESTION IS "IS ANYTHING CONVERGING", NOT "DID THE REPORT SAY SO". The record is the only on-disk
 # statement that this box converges, so it is worth keeping exactly when an armed artifact backs it.
+# ⛔ AND IT IS THE SAME QUESTION `--status` ASKS, so it is answered by the same classifier: an artifact
+# carrying `--apply`, `--install-unit`, `--check-units` or a second `--repo` does not converge, and a
+# substring test for `--dry-run` called every one of them ARMED.
 artifact_is_armed() {
     local art line args
     art="$(artifact_path_for_target)"
     [ -f "$art" ] || return 1
     if [ "$TARGET" = "launchd" ]; then
         args="$(plist_program_args "$art")"
-        args_has_line "$args" "--dry-run" && return 1
-        args_has_line "$args" "--status" && return 1
-        return 0
+    else
+        line="$(unit_exec_line "$art")"
+        [ -n "$line" ] || return 1
+        args="$(printf '%s\n' "$line" | tr ' ' '\n' | tr -d '"')"
     fi
-    line="$(unit_exec_line "$art")"
-    [ -n "$line" ] || return 1
-    case "$line" in *--dry-run*|*--status*) return 1 ;; esac
-    return 0
+    [ -n "$args" ] || return 1
+    [ "$(classify_exec_args "$(exec_remainder_after_script "$args")")" = "armed" ]
 }
 
 # adopt_installed_provisioner — an install that resolves NOTHING must not STRIP a pin the artifact
@@ -1109,7 +1147,7 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             --dry-run)         disarmed=1 ;;
             --status)          disarmed=1; measure=1 ;;
             --json)            : ;;
-            --want|--root)
+            --want|--root|--workdir)
                 # ⛔ PEEK: a flag after a value-taking flag is a MISSING VALUE, not a value. The pass
                 # exits 2 on `--want --json`, so swallowing `--json` as the value made `--status`
                 # report ARMED exit 0 for a schedule that fails every tick (the T19 class, narrowed).
@@ -1145,6 +1183,7 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
             # Dropping it unconditionally certified exactly the state this verb exists to refuse —
             # ARMED exit 0 over a schedule that is RED every nine minutes — so it follows the
             # `--want=`/`--root=` rule: an EMPTY value is reported, a real slug is configuration.
+            --workdir=*)       [ -n "${l#*=}" ] || out="$out $l" ;;
             --want=*)          want_value_ok "${l#*=}" || out="$out $l" ;;
             --root=*|--repo=*) [ -n "${l#*=}" ] || out="$out $l" ;;
             *)                 out="$out $l" ;;
@@ -1796,17 +1835,7 @@ do_status() {
     # required before the pair may be treated as configuration: a real value is dropped with its flag
     # (the T44 rule), and no value RE-EMITS the flag for the classifier to report. `pending` buffers it
     # one token so the next line can be judged rather than assumed.
-    installed_rest="$(printf '%s\n' "$installed_args" | awk '
-        { if (NF == 0) next
-          if (++pos <= 2) next          # token 1 = interpreter, token 2 = the converger script
-          if (pending) {
-              pending = 0
-              if ($0 != "" && $0 !~ /^-/) next   # a real value: configuration, dropped with its flag
-              print "--repo"                      # NO value: report the flag, then judge this token too
-          }
-          if ($0 == "--repo") { pending = 1; next }
-          print }
-        END { if (pending) print "--repo" }')"
+    installed_rest="$(exec_remainder_after_script "$installed_args")"
     installed_kind="$(classify_exec_args "$installed_rest")"
     case "$installed_kind" in
         armed)     log_line "mode=converge (ARMED — no mode argument; the pass repairs and grows toward the ceiling)" ;;
@@ -1821,27 +1850,62 @@ do_status() {
                    rc=1 ;;
         other:*)   installed_mode="${installed_kind#other:}"
                    log_line "mode=$installed_mode"
-                   err "the installed artifact carries arguments this installer did not render ('$installed_mode'). The pass accepts --repo, --root <path>, --want <n>, --status, --dry-run, --json, --install-unit, --check-units and --workdir <path>; anything OUTSIDE that set makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
-                   # ⛔ ONE OF THOSE OUTSIDE-THE-SET CASES IS A RECOGNISED FLAG WITH AN EMPTY VALUE
-                   # (`--want=`, `--root=`, `--repo=`), which reaches this arm because the classifier
-                   # refuses the empty value rather than the flag — so say THAT, or the operator is told
-                   # an argument the pass plainly accepts is unrecognised.
+                   # ⛔ THE GENERIC "EVERY TICK EXITS 2" LINE IS ONLY TRUE FOR AN ARGUMENT THE PASS DOES
+                   # NOT ACCEPT AT ALL — so it is printed only when one REMAINS after the recognised
+                   # non-converging actions are taken out. It was printed unconditionally, ahead of the
+                   # corrective lines below, so the operator read "unrecognized arguments" first about
+                   # switches the same message then listed as accepted (and about `--workdir`, which is a
+                   # legitimate converge and is now benign). A stated reason that is false is the class
+                   # this whole block exists to remove.
+                   unrecognised="$installed_mode"
+                   for known in --install-unit --check-units; do
+                       unrecognised="${unrecognised//$known/}"
+                   done
+                   unrecognised="$(printf '%s' "$unrecognised" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
+                   [ -z "$unrecognised" ] || err "the installed artifact carries arguments this installer did not render ('$unrecognised'). The pass accepts --repo, --root <path>, --want <n>, --status, --dry-run, --json, --install-unit, --check-units and --workdir <path>; anything OUTSIDE that set makes every tick exit 2 (unrecognized arguments). Re-install with this installer, or remove those arguments by hand."
+                   # ⛔ ONE OF THOSE OUTSIDE-THE-SET CASES IS A RECOGNISED SWITCH THE PASS CANNOT TAKE AS
+                   # WRITTEN — with no value, with a value of the wrong SHAPE (`--want` is an int), or as a
+                   # SECOND `--repo` (argparse keeps the LAST, so the pass converges a pool that is not the
+                   # one on disk). It reaches this arm because the classifier refuses the VALUE, so say
+                   # that, or the operator is told an argument the pass plainly accepts is unrecognised.
                    case " $installed_mode " in
-                       *" --want= "*|*" --root= "*|*" --repo= "*|*" --repo "*) err "  one of $installed_mode is a recognised switch with NO VALUE, or with a value the pass cannot take (--want needs a whole number of 0 or more; --root and --repo need a real value). argparse accepts the FLAG and then the pass exits 2 on the VALUE, on every tick: `--repo` is a case in point — a missing one makes every tick exit 2 ("expected one argument") and an empty one makes the pool read `repos//actions/runners`, a 404. Give it a value or remove the argument." ;;
+                       *" --want "*|*" --root "*|*" --repo "*|*" --want= "*|*" --root= "*|*" --repo= "*) err "  one of $installed_mode is a switch the pass cannot take as written. NO VALUE or a value of the wrong shape makes argparse fail every tick (\"--want\" needs a whole number of 0 or more; \"--repo\" with no value is \"expected one argument\"; an empty \"--repo=\" reads the pool as repos//actions/runners, a 404). And a SECOND \"--repo\" pair is not configuration — argparse keeps the LAST, so every tick would converge a DIFFERENT pool than the one this artifact declares. Give it a value, drop the duplicate, or re-install with this installer." ;;
                    esac
                    # ⛔ AND A RECOGNISED ACTION IS NOT AN UNKNOWN ONE — SAY WHAT IT ACTUALLY DOES. The
                    # switches above are accepted, so the "exit 2" reason is FALSE for them, and their real
                    # consequences are different from each other: --install-unit writes and enables a
                    # COMPETING unit pair and then exits (converging nothing), --check-units audits and
-                   # exits 5 on an unusable unit, --workdir only parameterises --install-unit. Folding
-                   # them into the unknown-argument text sent the operator hunting a failure that never
-                   # appears, and hid the consequence that matters: each tick installs a second unit pair.
+                   # exits 5 on an unusable unit. Folding them into the unknown-argument text sent the
+                   # operator hunting a failure that never appears, and hid the consequence that matters:
+                   # each tick installs a second unit pair.
                    case " $installed_mode " in
                        *" --install-unit "*) err "  --install-unit: every tick WRITES AND ENABLES this tool's own unit pair instead of converging, and exits — so the pool is never repaired, while a second unit pair competes with the one this installer manages." ;;
                        *" --check-units "*)  err "  --check-units: every tick AUDITS the installed units and exits (5 when one is unusable) instead of converging — a schedule that reports on the pool and never repairs it." ;;
-                       *" --workdir "*|*" --workdir="*) err "  --workdir only parameterises --install-unit; on its own it changes no tick and is refused by the pass when it has no value." ;;
                    esac
                    rc=1 ;;
+    esac
+    # ⛔ THE ARTIFACT AND THE RECORD MUST AGREE, IN BOTH DIRECTIONS — AND THIS VERB GATED NEITHER. Both
+    # WRITERS refuse the disagreement after every render (`verify_installed_unit`: "does not carry the
+    # DISARMED flag this install decided" / "still carries --dry-run although this install is ARMED — the
+    # record and the artifact disagree"; the plist arm carries its own), so it is a state the installer
+    # refuses to CREATE — which is exactly when a readiness gate earns its keep.
+    # Measured pre-fix, both directions exited 0: an artifact hand-stripped of `--dry-run` with NO record
+    # (`mode=converge (ARMED)` beside `arm_record=absent`) — a box growing capacity with no dated owner
+    # decision, the one state the record's whole design exists to forbid — and a hand-reverted artifact
+    # beside a VALID record, where every tick measures and repairs nothing while the box reads armed. The
+    # ABSENT case is strictly WEAKER than the INVALID record this verb already reds (`arm_record_valid`
+    # fails on both), so the old verdict was incoherent as well as lenient.
+    case "$installed_kind" in
+        armed)
+            if ! arm_record_valid; then
+                err "the installed artifact CONVERGES (no mode argument) but there is NO valid arming record at $ARM_FILE — so nothing on disk says when or why this box began growing capacity, which is the one state this design forbids (a hand-edit, or a foreign artifact). Run --disarm to render it DISARMED, or --arm --reason '…' to sign the decision and re-render."
+                rc=1
+            fi ;;
+        disarmed)
+            if arm_record_valid; then
+                err "a VALID arming record exists at $ARM_FILE but the installed artifact still carries --dry-run — the record and the artifact DISAGREE, so every tick measures and repairs NOTHING while the box reads armed. Re-run --arm (it re-renders the artifact) or --disarm (it revokes the record)."
+                rc=1
+            fi ;;
     esac
     # ⛔ AND THE MODE ABOVE IS THE BASE FILE'S. A `$UNIT.d/*.conf` carrying ExecStart= silently replaces
     # it, so the answer above can be `DISARMED` about a unit that is converging.
@@ -1933,11 +1997,22 @@ do_status() {
         rc=1
     fi
     log_line "script=${installed_script:-unreadable}"
-    if [ -n "$installed_script" ] && [ -f "$installed_script" ] && [ -r "$installed_script" ]; then
+    # ⛔ A RELATIVE SCRIPT IS NOT "PRESENT". `refuse_unusable_target` REFUSES a non-absolute SCRIPT ("a
+    # scheduler resolves the command against a working directory this installer does not choose"), and the
+    # interpreter's own absoluteness is gated eight lines above — but this test used `[ -f ]` against the
+    # READER's cwd, so `ExecStart="…python3.12" "converger.py"` read `script_present=yes` and exit 0 from
+    # any directory where that relative token happened to resolve. A scheduler resolves the script
+    # argument against ITS cwd, so the tick cannot start: 203/EXEC every nine minutes, listed as scheduled.
+    if [ -n "$installed_script" ] && is_absolute_path "$installed_script" \
+       && [ -f "$installed_script" ] && [ -r "$installed_script" ]; then
         log_line "script_present=yes"
     else
         log_line "script_present=no"
-        err "the artifact names ${installed_script:-an unreadable script} which is absent or unreadable — every tick would fail to start (the scheduler still lists it as scheduled)"
+        if [ -n "$installed_script" ] && ! is_absolute_path "$installed_script"; then
+            err "the artifact names the script as '$installed_script', which is NOT AN ABSOLUTE PATH — a scheduler resolves it against a working directory this installer does not choose, so every tick would fail to start while the scheduler lists the job as scheduled. The writers REFUSE to render this; re-install with this installer."
+        else
+            err "the artifact names ${installed_script:-an unreadable script} which is absent or unreadable — every tick would fail to start (the scheduler still lists it as scheduled)"
+        fi
         rc=1
     fi
     # ⛔ THE READINESS VERB IS THE OTHER HALF OF THE SCRATCH GATE. `is_transient_scratch` (and the
