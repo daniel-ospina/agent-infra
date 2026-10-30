@@ -2117,7 +2117,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       case "$_pf_line" in *LANE_CAPABILITY=refused*) _pf_rest="${_pf_line#*LANE_CAPABILITY=refused}" ;; esac
       case "$_pf_rest" in
         [[:space:]]why=?*)
-          _pf_reason="${_pf_rest#*why=}"
+          _pf_reason="${_pf_rest##*why=}"
           _pf_reason="${_pf_reason%%[!a-z0-9-]*}" ;;
       esac
       case "$_pf_line" in
