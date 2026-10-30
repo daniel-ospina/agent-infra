@@ -87,6 +87,17 @@ command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_a
   && command -v repo_target_head_branch >/dev/null 2>&1 && command -v repo_target_slug >/dev/null 2>&1 \
   && command -v repo_target_refuse >/dev/null 2>&1 && [ -n "${REPO_TARGET_REFUSED:-}" ] \
   || { echo "[lane $N] FATAL: $SELF/repo-target.sh is stale (needs repo_target_assert/repo_target_branch_assert/repo_target_head_branch/repo_target_slug/repo_target_refuse and REPO_TARGET_REFUSED) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
+# ── THE LANE'S OWN CREDENTIALS (agent-infra#3060) ───────────────────────────────────────────────────
+# A lane started OUTSIDE the controller inherits no keys and dies in ~7 s with "No API key found for
+# deepseek" — after passing every gate, because the capability gate sources the key file for its own probe
+# call and therefore cannot see that the lane has none. The sourcing lives in lane-env.sh so it is testable
+# without a worktree, a pi binary or a provider (lane-env.test.sh), and it is a TOP-LEVEL snippet on
+# purpose: `. file` inside a function means something different (see that file's header for the three
+# defects that produced from wrapping it). Fail LOUD if it is missing — an unsourced snippet would silently
+# restore the 7-second death this exists to remove.
+[ -r "$SELF/lane-env.sh" ] || { echo "[lane $N] FATAL: $SELF/lane-env.sh missing — refusing to start a lane whose credentials nothing sourced (#3060)" >&2; exit 78; }
+LANE_ENV_LOG="$O/logs/lane-$N.log" LANE_ENV_LABEL="lane $N" . "$SELF/lane-env.sh"
+
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
 # (measured 2026-10-19: three lanes did the whole job, then were refused at the rail). A lane's gate is
