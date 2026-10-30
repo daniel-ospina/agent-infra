@@ -93,49 +93,40 @@ sed -n '/^head_reds() {/,/^}/p' "$ORCH" > "$TMP/headreds.sh"
 # Extracted (like `head_reds` / `refund_bailed_fixer` / `spawn_gate_tok` above, and like
 # pr-dispatch.test.sh's T9), so the shipped predicate is DRIVEN instead of being absent.
 sed -n '/^pr_owner_live() {/,/^}/p' "$ORCH" > "$TMP/ownerlive.sh"
-if [ -s "$TMP/ownerlive.sh" ] && grep -q 'sess "fix-\$pr"' "$TMP/ownerlive.sh"; then
+# ⛔ THE SAME BODY UNDER A PRIVATE NAME, so `drive_route` can WRAP it and COUNT EXECUTIONS. That count
+# is the only thing that can distinguish "the block asks the shipped guard" from "the block happens to
+# spell `pr_owner_live` somewhere" — see the note below on why a text matcher cannot.
+sed 's/^pr_owner_live() {/_shipped_pr_owner_live() {/' "$TMP/ownerlive.sh" > "$TMP/ownerlive-renamed.sh"
+if [ -s "$TMP/ownerlive.sh" ] && [ -s "$TMP/ownerlive-renamed.sh" ] && grep -q 'sess "fix-\$pr"' "$TMP/ownerlive.sh"; then
   ok "the OWNERSHIP guard (pr_owner_live) is extracted from the shipped loop — the block's 'is a worker already on it?' answer is DRIVEN, not an undefined command"
 else
   bad "pr_owner_live could not be extracted from orch-loop.sh — every 'a live worker owns this PR' arm would read an undefined command and grade a SPAWN (the 2026-10-25 red)"
 fi
-# ...and the block must still ASK it. A block that grew its own inline liveness test would be a second
+# ...and the block must still ASK it — A block that grew its own inline liveness test would be a second
 # predicate for one question (the two-predicates-for-two-questions split #2831 exists to keep).
-# ⛔ COMMENTS ARE STRIPPED FIRST, and the matcher is proved to DISCRIMINATE on the spot. A bare
-# `grep -q 'pr_owner_live "$PR"'` over the extracted text is a PROSE test — precisely the failure this
-# file's own header names ("a prose test passes on the sentence and on its absence alike"). Measured
-# 2026-10-30 (#3095 review P1): a block whose guard had been replaced by an inline
-# `pr_owned || sess || claim_live` chain, with `# was pr_owner_live "$PR" "$HEAD_N"` trailing on the
-# same line, SATISFIED that arm and the suite stayed 122/0 — a false PASS on the one invariant the arm
-# exists to hold. It is not cosmetic: under `PL_MOD=1` the inline arm 3 (`claim_live`) treats a pid-less
-# lock as free where the shipped arm 3 (`pl_verdict`) treats it as OWNED, so the un-caught replacement
-# spawns a second worker onto a live claim — the two-lanes-one-branch direction this file exists to red.
-# ⛔ AND IT PINS THE CALL, NOT A SPELLING (#3095 review, cycle 2). The discriminating signal is WHICH
-# COMMAND the block calls. `"$PR"`, `"${PR}"` and `$PR` are the same value with no word-splitting
-# difference, so a matcher that insists on `"$PR"` reds a behaviourally-identical edit — measured on a
-# scratch checkout: normalising the production call to `pr_owner_live "${PR}" "$HEAD_N"` (the
-# shellcheck spelling) turned this shard RED and reported that the guard had been "replaced", which was
-# untrue and sent the reader looking for a regression that did not exist. The brace/quote forms are
-# therefore all accepted, and the arm below proves the tolerance did not turn the matcher into a
-# prose test (the comment-only fixture still does not satisfy it).
-asks_shipped_guard() { sed 's/#.*//' "$1" | grep -qE '(^|[[:space:];])pr_owner_live[[:space:]]+"?\$\{?PR\}?"?'; }
-printf '%s\n' 'elif x; then :; fi  # was pr_owner_live "$PR" "$HEAD_N" "${BR:-}"' > "$TMP/guard-comment-only.sh"
-# The SAME call, spelled three behaviourally-identical ways — each must satisfy the arm, or the arm is
-# asserting a spelling rather than "does the block ask the shipped guard?".
-printf '%s\n' 'elif pr_owner_live "${PR}" "$HEAD_N" "${BR:-}"; then' > "$TMP/guard-braced.sh"
-printf '%s\n' 'elif pr_owner_live "$PR" "$HEAD_N" "${BR:-}"; then'   > "$TMP/guard-plain.sh"
-if asks_shipped_guard "$TMP/redfix.sh"; then
-  ok "the router still asks the SHIPPED ownership guard (no inline re-implementation of 'who owns this PR')"
-else
-  bad "the [redfix] block no longer calls pr_owner_live — its ownership guard was replaced, not driven"
-fi
-for _g in "$TMP/guard-plain.sh" "$TMP/guard-braced.sh"; do
-  asks_shipped_guard "$_g" \
-    && ok "...and it grades the CALL: the equivalent spelling in $(basename "$_g") is accepted (no false red on a correct edit)" \
-    || bad "the 'still asks' arm pins a SPELLING: $(cat "$_g") is the same call and it was graded as a replaced guard"
-done
-asks_shipped_guard "$TMP/guard-comment-only.sh" \
-  && bad "the 'still asks' arm is a PROSE test — a COMMENT mentioning pr_owner_live \"\$PR\" satisfies it (the #3095 review P1 false PASS)" \
-  || ok "...and that arm is not a prose test: a comment-only mention of pr_owner_live is NOT a call"
+#
+# ⛔ THAT INVARIANT IS GRADED BY EXECUTION, NOT BY TEXT, AND THE HISTORY IS THE ARGUMENT FOR IT.
+# Every text matcher this arm has had was a false PASS by construction, and each was defeated in turn
+# (all measured 2026-10-30, #3095 review):
+#   * `grep -q 'pr_owner_live "$PR"'` — satisfied by a COMMENT (`# was pr_owner_live "$PR" …`); the
+#     suite stayed 122/0 on a block whose guard had become an inline `pr_owned || sess || claim_live`
+#     chain. Round 1 stripped comments.
+#   * stripping comments left the SPELLING pinned (`"$PR"` vs `"${PR}"`), so the same call in the
+#     brace form reddened the shard and reported a guard that had not been replaced. Round 2 added
+#     brace/quote tolerance.
+#   * and the tolerant matcher was STILL a prose test, because it matched TEXT THAT NEVER RUNS: with the
+#     shipped call replaced by that same inline chain plus a dead `if false; then pr_owner_live "$PR"
+#     "$HEAD_N" "${BR:-}"; fi` on the next line, this arm printed its ✅ line and the suite reported
+#     126/0 — on the one invariant it exists to hold. Nothing behavioural backstops it (`PL_MOD` is set
+#     only inside the (2b) subshell), and under `PL_MOD=1` the inline arm 3 (`claim_live`) treats a
+#     pid-less lock as free where the shipped arm 3 (`pl_verdict`) treats it as OWNED — so the uncaught
+#     replacement spawns a second worker onto a live claim, i.e. exactly the two-lanes-one-branch
+#     direction this file exists to red.
+# ⛔ SO: `drive_route` sources the SAME shipped body under `_shipped_pr_owner_live` and defines
+# `pr_owner_live` as a counting wrapper. A replacement CANNOT report a call, a dead branch cannot report
+# one, and a comment cannot report one — while every equivalent spelling of a real call does, because it
+# runs. The assertions live in §2, next to the drives that must reach the guard, plus a non-vacuity arm
+# that proves the counter can read 0 (otherwise "called" would be indistinguishable from a constant).
 # [railrefusal] is a plain statement block inside a function in merge-one.sh; at FILE scope the
 # function-local `local`s it does not use are fine, but `tail`/`wc` are external on purpose.
 [ -s "$TMP/isnum.sh" ] || { echo "FATAL: is_num/is_limit not found in orch-loop.sh"; exit 1; }
@@ -270,7 +261,7 @@ echo "=== B: the router spawns ONE fixer on a refusal, and re-rails when the hea
 drive_route() {
   [ "${KEEP:-0}" = "1" ] || rm -rf "$TMP/rO"
   mkdir -p "$TMP/rO/state"
-  : > "$TMP/spy"; : > "$TMP/d.log"; : > "$TMP/rows"
+  : > "$TMP/spy"; : > "$TMP/d.log"; : > "$TMP/rows"; : > "$TMP/guardcalls"
   : > "$TMP/lanes"; _i=0
   while [ "$_i" -lt "${4:-0}" ]; do echo "fix-$_i" >> "$TMP/lanes"; _i=$((_i+1)); done
   if [ "${1:-none}" != "none" ] && { [ "${SEED_REC:-0}" = "1" ] || [ "${KEEP:-0}" != "1" ]; }; then
@@ -338,7 +329,13 @@ drive_route() {
     pr_owned() {
       [ "$1" = "$PR" ] && [ "$2" = "$HEAD_N" ] && [ "$3" = "$BR" ] && [ "${PR_OWNED:-0}" = "1" ]
     }
-    . "$TMP/ownerlive.sh"
+    # ⛔ THE COUNTING WRAPPER (see the note at the extraction, above). The SHIPPED body is sourced under
+    # `_shipped_pr_owner_live`; `pr_owner_live` bumps a counter and forwards `"$@"` unchanged, so the
+    # block's behaviour is UNMODIFIED while its execution of the shipped predicate becomes observable.
+    # No `local`: the counter must survive across calls inside this subshell.
+    . "$TMP/ownerlive-renamed.sh"
+    RF_GUARD_CALLS=0
+    pr_owner_live() { RF_GUARD_CALLS=$((RF_GUARD_CALLS + 1)); _shipped_pr_owner_live "$@"; }
     # `head_reds` asks gh; the stub answers the three shapes it can return. A stub that printed
     # nothing would make the role read UNKNOWN everywhere and silently grade the wrong branch.
     gh() { printf '[{"name":"lint","state":"%s"}]\n' "${GH_STATE:-FAILURE}"; return 0; }
@@ -385,9 +382,13 @@ drive_route() {
       echo FALLTHROUGH >> "$TMP/d.log"
       break
     done
+    # The ONE observation the parent can read out of this subshell. Written last, so it is present even
+    # on a drive that returned early (0 calls).
+    echo "GUARD_CALLS=$RF_GUARD_CALLS" > "$TMP/guardcalls"
   ) >/dev/null 2>&1
 }
 spawns()   { awk 'END{print NR+0}' "$TMP/spy" 2>/dev/null; }
+guard_calls() { sed -n 's/^GUARD_CALLS=//p' "$TMP/guardcalls" 2>/dev/null | head -1; }
 acts()     { awk -F'\t' '$4=="act"'  "$TMP/rows" 2>/dev/null | wc -l | tr -d ' '; }
 waits()    { awk -F'\t' '$4=="wait"' "$TMP/rows" 2>/dev/null | wc -l | tr -d ' '; }
 redfix_n() { awk '{print $2}' "$TMP/rO/state/redfix-4242" 2>/dev/null; }
@@ -442,6 +443,17 @@ drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefde
 { [ "$(redfix_n)" = "0" ] || [ ! -f "$TMP/rO/state/redfix-4242" ]; } \
   && ok "(2) the suppressed spawn consumes NO attempt" \
   || bad "(2) the suppressed spawn consumed an attempt ([$(redfix_n)])"
+# ⛔ THE BLOCK MUST **EXECUTE** THE SHIPPED GUARD — not mention it, and not reach it down a dead branch.
+# The drive above is a suppression that only the shipped predicate can produce (arm 2, `sess fix-4242`),
+# so a zero here means the block answered the question with something OTHER than the shipped function.
+# Measured before this arm existed: the inline-chain-plus-dead-call block ran this very drive and the
+# suite stayed 126/0. `-ge 1` (not `= 1`) is deliberate — the invariant is "the block ASKS the shipped
+# guard"; reddening a block that legitimately asks it twice would be a false red, which is the cheaper
+# error to avoid of the two but still an error.
+_gc="$(guard_calls)"; _gc="${_gc//[!0-9]/}"
+[ "${_gc:-0}" -ge 1 ] \
+  && ok "(2) the block EXECUTED the shipped ownership guard on that drive (${_gc} call(s)) — a replacement, a dead branch or a comment cannot report a call" \
+  || bad "(2) the [redfix] block did not EXECUTE pr_owner_live (read [$(guard_calls)] call(s)) — its ownership guard was REPLACED by an inline re-implementation, a second predicate for one question that diverges from the shipped one under PL_MOD=1"
 # Two whole cycles back to back: the first spawns, the second (same state, session now live) must not.
 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
 _first="$(spawns)"
@@ -455,6 +467,16 @@ _second="$(spawns)"
 PR_OWNED=1 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
 [ "$(spawns)" = "0" ] && ok "(2) a LIVE PROCESS owning the PR suppresses the spawn (the guard's arm 1 is wired, not just its session arm)" \
   || bad "(2) spawns=$(spawns) with a live process owning the PR — arm 1 of the ownership guard is not consulted"
+# ⛔ NON-VACUITY FOR THE CALL COUNTER: it must be able to read 0. A drive whose block never runs (no
+# `railrefusal-4242` record, so the role's entry condition fails) has to report zero calls, or `-ge 1`
+# above is satisfied by a constant and grades nothing.
+# `KEEP` is deliberately NOT set: the role's entry condition is `-f $O/state/railrefusal-<pr>`, and a
+# KEEP=1 drive skips the `rm -rf` while also declining to re-seed that record — so the PREVIOUS drive's
+# record survives, the block runs, and this arm silently measured 1 call (found by this arm on itself).
+drive_route none deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
+[ "$(guard_calls)" = "0" ] \
+  && ok "(2) ...and the counter reads 0 when the role never runs — 'called' is a MEASUREMENT of the block, not a constant" \
+  || bad "(2) the guard-call counter reads [$(guard_calls)] on a drive that cannot reach the block — it is not measuring the block, so the arm above grades a constant"
 
 echo
 echo "  -- (2b) the ownership guard reads a REAL process, not a stub --"
