@@ -2272,18 +2272,35 @@ FAKE_LSOF_CWD=""; FAKE_LSOF_CWD_PID=""; FAKE_PS_ANCESTOR_PID=""
 # ── MUTATIONS: the new legs must be able to FAIL ────────────────────────
 # Each mutant is the reviewed script with ONE gate removed, in a temp copy. A leg
 # that stays green under the mutation is not pinning the gate it claims to pin.
-mutate_reaper() { # <sed-expr> [<extra sed args>] -> path of the mutant
+mutate_reaper() { # <sed-expr> [<extra sed-expr> ...] -> path of the mutant
     # The mutant must sit beside a `lib/` or the script fails closed at startup
     # (the bounded-execution library is resolved relative to the script), which
     # would make EVERY leg pass for the wrong reason. So: one mutant dir, with
     # `lib` symlinked to the reviewed one.
-    local expr="$1" dir="$T/mutants" dest
-    shift
+    #
+    # ⛔ ONE `-e`, ALWAYS — the expressions are JOINED, never passed as repeated
+    # `-e` flags (agent-infra#2541 review, P2, reproduced on darwin 26.6.2 with
+    # BSD sed). macOS/BSD `sed` binds the argv element AFTER `-i` as the BACKUP
+    # SUFFIX when it is not attached (measured: `sed -i -e 's/a/b/' f` succeeds and
+    # leaves `f-e`), so `-i -e A -e B FILE` eats the first `-e` as that suffix and
+    # then reads the SECOND `-e` as a script FILE:
+    #     sed: -e: No such file or directory      (rc 1)
+    # The M2 mutant was therefore BUILT AND NEVER EXECUTED, and the `|| exit 1`
+    # after it ended the whole suite before any of the #2541 assertions ran. That is
+    # the leg that proves the ancestry/patch gate, so the gate was unproven on the
+    # platform whose launchd templates this PR ships. A newline is a command
+    # separator inside ONE sed script, so joining is equivalent to the flags it
+    # replaces and behaves identically under GNU sed.
+    local expr="" dir="$T/mutants" dest a
+    for a in "$@"; do
+        if [ -z "$expr" ]; then expr="$a"; else expr="$expr
+$a"; fi
+    done
     mkdir -p "$dir"
     [ -e "$dir/lib" ] || ln -s "$SCRIPT_DIR/lib" "$dir/lib"
     dest="$dir/mutant-$$.sh"
     cp "$REAPER" "$dest"
-    sed -i -e "$expr" "$@" "$dest"
+    sed -i -e "$expr" "$dest"
     cmp -s "$REAPER" "$dest" && { echo "MUTATION-NOOP: $expr" >&2; return 1; }
     printf '%s\n' "$dest"
 }
@@ -2305,7 +2322,7 @@ assert_contains "$(row_for "$OUT" "$WT_M")" "reason=reclaimable" \
 # not the gate.
 ENV=N4
 MUT2="$(mutate_reaper 's#if is_ancestor_of_main "\$sha"; then merged=1; fi#merged=1#' \
-    -e 's#^        \[ "\$?" = 0 \] && { printf#        { printf#')" || exit 1
+    's#^        \[ "\$?" = 0 \] && { printf#        { printf#')" || exit 1
 OUT="$(REAPER="$MUT2" run_reaper $ENV --dry-run --repo "$T/$ENV/repo")"
 assert_contains "$(row_for "$OUT" "$WT_U")" "refs=merged" "M2 mutation really removed the ancestry test"
 assert_contains "$(row_for "$OUT" "$WT_U")" "reason=reclaimable" \
@@ -2725,6 +2742,38 @@ else
     bad "R4 MUTATION: the mutant did not reproduce the crossover (A='$(r4_named "$T/$ENV/ma.log")' B='$(r4_named "$T/$ENV/mb.log")') — R4 is not discriminating"
 fi
 
+# ── R5: an UNRECOGNISED REAP_WT_ROTATE is OFF *and SAYABLE* ─────────────────
+# ⛔ (agent-infra#2541 review, P2) The `*)` arm of the REAP_WT_ROTATE case had NO
+# fixture: the suite only ever passed `0` or `1`, so DELETING the arm left every
+# assertion green — an arm that can be removed without a red is an arm nothing
+# holds in place. What it protects is a silent regression to the pre-fix shape
+# (`[ "$REAP_WT_ROTATE" = 1 ]`): with that test, `true`, `yes` or a typo quietly
+# turned rotation OFF and restored the starve-the-tail behaviour this PR exists to
+# fix, with no line in the pass artifact a reader could find. Two directions: the
+# artifact NAMES the unrecognised value, and no cursor is moved by a rotation that
+# did not run.
+ENV=R5; mkdir -p "$T/$ENV/home"
+SHARED_R5="$T/$ENV/state"; mkdir -p "$SHARED_R5"
+REAP_WT_STATE_DIR_OVERRIDE="$SHARED_R5" REAP_WT_ROTATE=maybe \
+    REAP_WT_LOG_OVERRIDE="$T/$ENV/typo.log" \
+    run_reaper R5 --dry-run --repo "$REPO_R4A" >/dev/null 2>&1
+assert_contains "$(cat "$T/$ENV/typo.log" 2>/dev/null)" "is not a recognised boolean" \
+    "R5 an unrecognised REAP_WT_ROTATE NAMES ITSELF in the artifact instead of silently disabling rotation"
+assert_contains "$(cat "$T/$ENV/typo.log" 2>/dev/null)" "ROTATE on=0" \
+    "R5 …and the recorded mode says rotation is OFF for that pass"
+assert_eq "$(r4_cursors "$SHARED_R5" | grep -c .)" "0" \
+    "R5 …and NO cursor is written for it (a rotation the pass did not run must not move the cursor)"
+# The control: the SAME fixture with a recognised value writes a cursor and says
+# nothing about an unrecognised boolean — otherwise the three legs above would pass
+# on a reaper that had simply stopped rotating.
+REAP_WT_STATE_DIR_OVERRIDE="$SHARED_R5" REAP_WT_ROTATE=1 \
+    REAP_WT_LOG_OVERRIDE="$T/$ENV/ok.log" \
+    run_reaper R5 --dry-run --repo "$REPO_R4A" >/dev/null 2>&1
+assert_contains "$(cat "$T/$ENV/ok.log" 2>/dev/null)" "ROTATE on=1" \
+    "R5 (control) a RECOGNISED value rotates, so the legs above measure the arm and not a dead rotation"
+assert_absent "$(cat "$T/$ENV/ok.log" 2>/dev/null)" "is not a recognised boolean" \
+    "R5 (control) …and emits no unrecognised-value warning"
+
 # ── L1: the LOCK_STALE > BUDGET clamp is DRIVEN, in three directions ────
 # ⛔ (review P1, #2541) That clamp MUTATES operator configuration at runtime, and it
 # had NO fixture: every budget in this suite was below 1800, so the branch never
@@ -2859,13 +2908,50 @@ assert_absent "$_M5_ROW" "reason=reclaimable" \
     "M5 fail-closed: an unreadable stash register must NOT reap the checkout"
 # A separate reason token from a real stash HIT (review P3): a caller counting
 # reasons can then tell "the lane parked work" from "the probe failed".
-assert_absent "$_M5_ROW" "reason=stranded-stash " \
-    "M5 the UNREADABLE register is reported as stranded-stash-unverifiable, never as the real-hit token"
+# ⛔ EXTRACT THE TOKEN, do not lean on the SEPARATOR (agent-infra#2541 review, P2
+# nit): `report_row` writes `reason=<token>  <detail>` with TWO spaces, so
+# `assert_absent "reason=stranded-stash "` was green only because the real-hit
+# token happened to be followed by a space — reformat the row to one space and the
+# assertion starts firing on the token it is meant to accept, and a row with NO
+# reason field at all would satisfy it. Comparing the parsed field pins the token
+# itself and is what "a separate reason" actually means.
+_M5_REASON="$(sed -n 's/^ *reason=\([^ ]*\).*$/\1/p' <<<"$_M5_ROW" | head -1)"
+assert_eq "$_M5_REASON" "stranded-stash-unverifiable" \
+    "M5 the UNREADABLE register's reason TOKEN is stranded-stash-unverifiable, never the real-hit token"
 MUT5="$T/mutant-no-stash-unverifiable-arm.sh"
 mutate_reaper_anchored "$MUT5" no-stash-unverifiable-arm
 OUT="$(REAPER_OVERRIDE="$MUT5" GIT_BIN_OVERRIDE="$T/bin/git-fail-stash-log" run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_M5")" "reason=reclaimable" \
     "M5 MUTATION: without the unreadable arm 'cannot read' becomes 'clear' and the checkout is WRONGLY reaped => the arm is load-bearing"
+
+# ── E5c: a refs/stash with NO REFLOG is an UNREADABLE register, never a clear one ──
+# ⛔ (agent-infra#2541 review, P2, reproduced end to end) `rev-parse --verify -q
+# refs/stash` answers for the REF; the REGISTER is the reflog. A ref written
+# without one (`git update-ref refs/stash <sha>` — no `--create-reflog`; equally a
+# transferred or cloned ref) makes `log --walk-reflogs -g refs/stash` exit 0 with
+# EMPTY output, which the pre-fix code recorded as `ok` plus an empty file → "no
+# entry for this branch". That is the CANNOT-READ => CLEAR direction the
+# `unreadable` arm exists to forbid: the repo demonstrably HAS a stash ref and the
+# gate cannot say what is parked in it. No work is lost by the wrong reading
+# (`git worktree remove` never touches refs/stash) — the gate is the thing at
+# stake, and a gate that turns an unreadable register into a clear one is the
+# failure mode, not the inconvenience.
+ENV=E5C; REPO="$(mk_repo_pushable $ENV)"
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/e5c main
+commit_in_wt "$REPO" "$RECENT_DATE" e5c
+push_branch "$REPO" feat/e5c
+merge_branch_into_main "$REPO" feat/e5c
+WT_E5C="$T/$ENV-wt"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E5C" feat/e5c
+"$REAL_GIT" -C "$REPO" update-ref refs/stash "$("$REAL_GIT" -C "$REPO" rev-parse refs/heads/feat/e5c)"
+# NON-VACUITY: prove the fixture really is the empty-output shape. If this box's git
+# DID write a reflog for the bare `update-ref`, the leg below would be testing the
+# ordinary register read, not the hole it names.
+assert_eq "$("$REAL_GIT" -C "$REPO" log --walk-reflogs -g refs/stash --format='%gd' 2>/dev/null | grep -c .)" "0" \
+    "E5c precondition: refs/stash EXISTS and the reflog read returns EMPTY output (the cannot-read shape)"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_E5C")" "reason=stranded-stash-unverifiable" \
+    "E5c a stash REF with no readable register ABSTAINS — 'cannot list it' is not 'nothing is parked'"
+assert_dir "$WT_E5C" "E5c …and the checkout is KEPT (an unreadable register reaps nothing)"
 
 # ── P1: no catastrophic pattern substitution on a list-sized string ──────────
 # MEASURED (live, 564-record list, 72 KB): `${LIST//[[:space:]]/}` consumed

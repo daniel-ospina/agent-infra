@@ -262,8 +262,15 @@
 #   unparseable-path (poisoned record) > bare > main-checkout > self-checkout >
 #   worktree-locked > unreadable-path | prunable > live-process > live-cwd >
 #   dirty | ignored-artifact | status-timeout | status-error >
-#   detached-unreachable > open-pr > unpushed-unverifiable | unpushed-commits >
-#   stranded-stash > too-recent > reclaimable
+#   detached-unreachable > open-pr > stranded-stash-unverifiable | stranded-stash >
+#   unpushed-unverifiable > too-recent > reclaimable
+#
+# ⛔ EVERY TOKEN ABOVE IS ONE THE CODE CAN EMIT (agent-infra#2541 review), and the
+# order is the order `abstain_gate` actually runs: the STASH arm first, then the
+# unpushed arm. There is deliberately NO `unpushed-commits` reason: a readable
+# `rev-list --count HEAD --not --remotes` above zero KEEPS nothing — it is carried
+# on the removal row as `unpushed=N` (gate P-a). Advertising it here as a preserve
+# reason told a reader the gate vetoed a shape it in fact reclaims.
 #
 # PRESERVE reasons and why each one is not a bug:
 #   main-checkout          the shared checkout
@@ -301,11 +308,17 @@
 #                          refuse to delete
 #   status-*               the clean gate could not be evaluated => fail-closed
 #   open-pr                an open PR head branch
-#   unpushed-commits       HEAD carries >=1 commit reachable from no remote ref
-#                          — the one shape merged-ness cannot see
-#   unpushed-unverifiable  the unpushed probe could not be read => fail-closed
+#   main-proof-vanished    the ancestry proof that put this row in the removal
+#                          path did not reproduce on the re-take => fail-closed
+#   unpushed-unverifiable  the unpushed probe could not be read => fail-closed.
+#                          NOTE: there is no `unpushed-commits` reason — a READ
+#                          count above zero is a row note (`unpushed=N`), not a
+#                          keep (see gate P-a and the gate-order block)
 #   stranded-stash         the stash register names an entry for this branch —
 #                          the lane may still have work parked for it
+#   stranded-stash-unverifiable
+#                          the stash register could not be read => fail-closed
+#                          (a register we cannot read is not a clear register)
 #   too-recent             HEAD commit not strictly older than --aged-days AND
 #                          the branch is NOT merged (a merged head is exempt)
 #   unreadable-head        HEAD could not be dated
@@ -1596,6 +1609,18 @@ stash_index_load() {
         "$GIT_BIN" -C "$REPO_CANON" log --walk-reflogs -g refs/stash --format='%gd%x09%gs'; then
         STASH_STATE="unreadable"; return 0
     fi
+    # ⛔ AN EXISTING refs/stash THAT LISTED NOTHING IS NOT A CLEAR REGISTER
+    # (agent-infra#2541 review, reproduced). `rev-parse --verify -q refs/stash`
+    # answers for the REF, but the register is the REFLOG: on a repo whose
+    # refs/stash was written without one (`git update-ref refs/stash <sha>`, or a
+    # cloned/transferred ref), `log --walk-reflogs -g refs/stash` exits 0 with
+    # EMPTY output. Reading that as `ok` + an empty file turned "there is a stash
+    # ref here and I cannot list it" into "no entry for this branch" — the
+    # CANNOT-READ => CLEAR direction the unreadable arm exists to forbid. A stash
+    # REF with no readable entry is unreadable, full stop.
+    if [ ! -s "$STASH_OUT" ]; then
+        STASH_STATE="unreadable"; return 0
+    fi
     STASH_STATE="ok"
     return 0
 }
@@ -2586,7 +2611,11 @@ run() {
         # `[ "$REAP_WT_ROTATE" = 1 ]`, so `true`/`yes`/`01` silently restored the
         # starve-the-tail behaviour with no line in the pass artifact a reader
         # could find.
-        0|false|no|FALSE|NO|'') ROTATE_ON=0 ;;
+        0|false|no|FALSE|NO) ROTATE_ON=0 ;;
+        # NOTE: `''` is NOT listed here and cannot be reached — the declaration
+        # above is `${REAP_WT_ROTATE:-1}`, so an empty value is already `1`. Listing
+        # it (as an earlier revision did) made this arm look reachable and hid the
+        # fact that an empty value means ROTATE ON.
         *) ROTATE_ON=0
            log_line "WARN REAP_WT_ROTATE='$REAP_WT_ROTATE' is not a recognised boolean — ROTATION IS OFF for this pass (the stable order's tail can starve)" ;;
     esac
