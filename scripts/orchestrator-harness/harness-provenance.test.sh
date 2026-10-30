@@ -269,6 +269,30 @@ OUT="$(bash "$PROV" show --o "$DO" 2>&1)"
 ck "…and show says the source was DIRTY beside the commit" "$(qF "SOURCE WAS DIRTY" "$OUT" && echo 0 || echo 1)"
 ck "the dirty-source warning is printed, not silent" \
    "$(qF "UNCOMMITTED changes" "$(PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$DREPO/scripts/orchestrator-harness" --o "$DO" --no-notify --accept-discard 2>&1)" && echo 0 || echo 1)"
+# ⛔ AND AN UNTRACKED FILE IS DIRTINESS. `--untracked-files=no` excluded exactly the files this field is
+# most wrong about: the deploy ships everything `find` returns, so a brand-new uncommitted `wip.sh` was
+# hashed into the manifest UNDER the deploy's commit while `sourceDirty` said false — and the drift check
+# then printed `identity: ok` for a box whose bytes are not in the named commit. The legacy stamp
+# (install.sh:1482) counts untracked entries, so the record was WEAKER than the stamp it supersedes.
+# ⛔ AND THE TRACKED EDIT IS COMMITTED FIRST, ON PURPOSE: left modified, it makes `sourceDirty` true on
+# its own and this arm then passes for a reason that has nothing to do with untracked files — a false
+# PASS in the suite about false passes (mutation-tested: with the tree still tracked-dirty, restoring
+# `--untracked-files=no` left all 121 arms green). The ONLY dirtiness here must be the untracked file.
+$G -C "$DREPO" add -A && $G -C "$DREPO" commit -qm 'the tracked edit lands; the box is clean again' >/dev/null 2>&1
+ck "the fixture source is now CLEAN of tracked edits (so the arm grades untracked alone)" \
+   "$([ -z "$($G -C "$DREPO" status --porcelain --untracked-files=no 2>/dev/null)" ] && echo 0 || echo 1)"
+printf '#!/usr/bin/env bash\necho WIP-NEVER-COMMITTED\n' > "$DREPO/scripts/orchestrator-harness/wip.sh"
+cp "$DREPO/scripts/orchestrator-harness/wip.sh" "$DO/wip.sh"
+ck "the fixture source really is untracked (the arm grades an untracked file, not a modified one)" \
+   "$($G -C "$DREPO" status --porcelain 2>/dev/null | grep -qF '?? scripts/orchestrator-harness/wip.sh' && echo 0 || echo 1)"
+PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$DREPO/scripts/orchestrator-harness" --o "$DO" --no-notify >/dev/null 2>&1; RC=$?
+ck "a deploy that SHIPS an untracked source file still completes (0 — the gate does not refuse it)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and the record says sourceDirty=true — the commit does not own those bytes" \
+   "$(qF "sourceDirty=true" "$(cat "$DO/.harness-provenance" 2>/dev/null)" && echo 0 || echo 1)"
+ck "…and wip.sh IS in the manifest (the deploy did ship it — so the field had to see it)" \
+   "$(qF "  wip.sh" "$(cat "$DO/.harness-provenance" 2>/dev/null)" && echo 0 || echo 1)"
+rm -f "$DREPO/scripts/orchestrator-harness/wip.sh" "$DO/wip.sh"    # leave the shared fixture as found
 
 echo
 echo "── §2e a STAGED deploy states sourceDirty and source= for itself (the mac path's two facts) ──"
@@ -333,6 +357,59 @@ MP_OUT2="$(bash "$PROV" check --o "$SP/O" 2>&1)"; RC=$?
 ck "the short-hash fixture replaced a real 64-hex entry" "$([ -n "$SP_GH" ] && echo 0 || echo 1)"
 ck "a manifest-shaped line whose hash is NOT 64 hex chars is UNKNOWN (2) — the arm is not dead" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 ck "…and it names the hash length, not 'no path'" "$(qF "not 64 hex chars" "$MP_OUT2" && echo 0 || echo 1)"
+
+echo
+echo "── §2g the record is read back by a BROADER writer than wrote it, and that is not an edit ──"
+# ⛔ THE THREE WRITERS OF $O HAVE DIFFERENT WRITE SETS, AND NOTHING CROSSED THEM (measured 2026-10-30,
+# review of #3053). `orchestrator-bringup.sh start` records depth-1 `*.sh` only (it passes `--skip` for
+# the rest); `deploy-harness.sh` and `deploy-mac-orchestrator.sh` (phase B) pass NO `--skip` and write
+# the whole staged tree. `install.sh` seeds the WHOLE tree into $O, so on the ordinary Mac `README.md`,
+# `retired/*.sh` and `gh-rest/gh` sit in $O outside a `start` record with the SOURCE's exact bytes.
+# Reproduced with the shipped tool before this arm: `check --o $O --src $SRC` — deploy-harness.sh:366's
+# own call — returned 1 naming README.md an UNCOMMITTED-EDIT, and the deploy turned that into `exit 78`
+# plus "those bytes exist nowhere else: copy them aside": a false statement about the repo's own docs,
+# whose only exit was `--accept-discard`. The gate asks what a run would DISCARD, and overwriting a file
+# with its own contents discards nothing. The arm below pins BOTH halves — the false refusal is gone and
+# the real one (bytes that DIFFER) still bites — because an arm that only proved the first half would
+# be satisfied by deleting the gate.
+CW="$TMP/cross-writer"; rm -rf "$CW"; mkdir -p "$CW/src" "$CW/O"
+cp -R "$SRC"/. "$CW/src"/
+printf '# the docs a real harness ships beside its scripts\n' > "$CW/src/README.md"
+mkdir -p "$CW/src/retired"; printf '#!/usr/bin/env bash\ntrue\n' > "$CW/src/retired/old.sh"
+cp -R "$CW/src"/. "$CW/O"/                     # install.sh seeds the whole tree: IDENTICAL bytes
+CW_WRITE() { bash "$PROV" write --o "$CW/O" --src "$CW/src" --commit 0123456789abcdef0123456789abcdef01234567 \
+               --skip README.md --skip retired/old.sh >/dev/null 2>&1; }
+CW_WRITE; RC=$?
+ck "a 'start'-shaped record is written over a source that ships non-.sh files (rc 0)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and it CLAIMS the depth-1 scripts it wrote" \
+   "$(qF "  claims.sh" "$(cat "$CW/O/.harness-provenance" 2>/dev/null)" && qF "  orch-loop.sh" "$(cat "$CW/O/.harness-provenance" 2>/dev/null)" && echo 0 || echo 1)"
+ck "…and it does NOT claim the docs it skipped (a write set, not the source tree)" \
+   "$(qF "  README.md" "$(cat "$CW/O/.harness-provenance" 2>/dev/null)" && echo 1 || echo 0)"
+OUT="$(bash "$PROV" check --o "$CW/O" --src "$CW/src" 2>&1)"; RC=$?
+ck "…and deploy-harness.sh's BROADER gate does NOT refuse the box it describes (0, not 1)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and names the unrecorded docs SAME-AS-SOURCE, not UNCOMMITTED-EDIT" \
+   "$(qF "SAME-AS-SOURCE   README.md" "$OUT" && echo 0 || echo 1)"
+ck "…and names no patch for an operator to go and recover" "$(qF "UNCOMMITTED-EDIT" "$OUT" && echo 1 || echo 0)"
+PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$CW/src" --o "$CW/O" --no-notify >/dev/null 2>&1; RC=$?
+ck "…and the real deploy COMPLETES on that box (0, not 78 — the P1 this arm exists for)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+# THE HALF THAT MUST STILL BITE. Return $O to the state `start` leaves (a narrow record), then hand-edit
+# one of the docs the record does not claim: its bytes now exist nowhere else, so the refusal is correct
+# and must survive the fix above.
+CW_WRITE
+printf 'locally hand-edited docs — these bytes exist nowhere else\n' > "$CW/O/README.md"
+OUT="$(bash "$PROV" check --o "$CW/O" --src "$CW/src" 2>&1)"; RC=$?
+ck "…but a doc whose bytes DIFFER is still an UNCOMMITTED-EDIT (1)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "…named with the reason it matters: this deploy would OVERWRITE it, bytes that exist nowhere else" \
+   "$(qF "UNCOMMITTED-EDIT   README.md" "$OUT" && qF "would OVERWRITE it, and those bytes exist nowhere else" "$OUT" && echo 0 || echo 1)"
+BEFORE_CW="$($SHA_CMD "$CW/O/README.md" | awk '{print $1}')"
+PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$CW/src" --o "$CW/O" --no-notify >/dev/null 2>&1; RC=$?
+AFTER_CW="$($SHA_CMD "$CW/O/README.md" | awk '{print $1}')"
+ck "…and the deploy still REFUSES it (78), so the fix above did not defuse the gate" \
+   "$([ "$RC" -eq 78 ] && echo 0 || echo 1)"
+ck "…and the hand-edited bytes are untouched" "$([ "$BEFORE_CW" = "$AFTER_CW" ] && echo 0 || echo 1)"
 
 echo
 echo "── §3 THE MEASURED INCIDENT: a deploy onto a dirty \$O REFUSES and names what it would discard ──"

@@ -255,7 +255,17 @@ write)
     # `rev-parse --show-prefix` here (a path relative to the REPO ROOT) from inside the subdirectory
     # matched nothing, so a genuinely dirty source recorded as clean — the one signal this field exists
     # to carry, silently absent. `.` asks about exactly the tree being recorded.
-    if _st="$(git -C "$SRC" status --porcelain --untracked-files=no -- . 2>/dev/null)"; then
+    # ⛔ AND AN UNTRACKED FILE IS DIRTINESS (measured 2026-10-30, review of #3053). `--untracked-files=no`
+    # excluded exactly the files this field is most wrong about: the deploy ships everything `find`
+    # returns, untracked included, so a brand-new uncommitted `wip.sh` was hashed into the manifest
+    # UNDER the deploy's commit while `sourceDirty` said false — and `check-deployed-drift.sh` then
+    # printed `identity: ok` for a box whose bytes are not in the named commit. That is the same defect
+    # this field was added to carry, re-masked: the legacy stamp (install.sh:1482) counts untracked
+    # entries, so the record was WEAKER than the stamp it supersedes on this one input.
+    # The default (`normal`) is deliberate, not an oversight: it respects .gitignore, so a checkout with
+    # `node_modules/` or `__pycache__/` is not permanently "dirty" — an alarm that always fires is an
+    # alarm nobody reads. Files git ignores are outside every deploy's provenance claim.
+    if _st="$(git -C "$SRC" status --porcelain -- . 2>/dev/null)"; then
       if [ -n "$_st" ]; then SRC_DIRTY="true"; else SRC_DIRTY="false"; fi
     fi
   fi
@@ -391,6 +401,7 @@ check)
   PEND=0
   PRESENT=0
   UNSHIPPED=0
+  SAMESRC=0
   # ⛔ THE RECORD NAMES THE TREE IT WAS WRITTEN FROM (`source=`), SO A PLAIN `check` HAS A SOURCE TOO.
   # Classification used `$SRC` only, which is set only by `--src` — so the DOCUMENTED call
   # (`check --o $O`, no `--src`) still labelled a `PHASE=A` leftover "UNCOMMITTED-EDIT … recover the edit",
@@ -514,6 +525,19 @@ check)
         say "PRESENT          $_b — in $O and ABSENT from the record; the record's source ($CSRC) does not ship that name, so no deploy of this tree would overwrite it. Not an edit."
         PRESENT=$((PRESENT + 1)); continue
       fi
+      # ⛔ THE ARM ASKS WHAT A DEPLOY WOULD **DISCARD**, AND IDENTICAL BYTES ARE NOT DISCARDED. Measured
+      # 2026-10-30 (review of #3053): `orchestrator-bringup.sh start` records its WRITE SET (depth-1
+      # `*.sh`), while `install.sh` seeds the WHOLE tree into $O — so on the ordinary Mac `README.md`,
+      # `retired/*.sh` and `gh-rest/gh` sit in $O outside the record with the SOURCE's exact bytes. The
+      # next `deploy-harness.sh` gate then called them UNCOMMITTED-EDITs and refused at 78 with "those
+      # bytes exist nowhere else: copy them aside" — a false statement about the repo's own docs, and
+      # the operator's only way past it `--accept-discard`. A file whose $O bytes ARE the source's is
+      # overwritten with itself: nothing is lost, so there is no patch to hunt and nothing to refuse.
+      # The refusal below still bites whenever the bytes DIFFER — that is the 2026-10-28 hand patch.
+      if [ -n "$CSRC" ] && [ -f "$CSRC/$_b" ] && cmp -s "$CSRC/$_b" "$O/$_b"; then
+        say "SAME-AS-SOURCE   $_b — in $O and ABSENT from the record, but $O already holds the RECORD'S SOURCE bytes, so a deploy would overwrite them with themselves: nothing is discarded and there is no patch here to recover"
+        SAMESRC=$((SAMESRC + 1)); continue
+      fi
       if [ -z "$CSRC" ]; then
         # CANNOT-VERIFY, and it stays a failure: with no source to ask, this file COULD be one a
         # deploy overwrites, and "could be" is not a clean answer here.
@@ -531,7 +555,23 @@ check)
       [ -f "$O/$_r" ] || continue          # absent: the deploy CREATES it, nothing is discarded
       if [ -n "$SKIPS" ] && grep -qxF -- "$_r" <<<"$SKIPS"; then continue; fi
       grep -qxF -- "$_r" <<<"$SEEN" && continue
-      bad "UNCOMMITTED-EDIT   $_r — present in $O and ABSENT from the record (hand-placed, or written by a path that does not record), and the source ships this name, so this deploy would OVERWRITE it"
+      # ⛔ THE CROSS-WRITER CASE, AND WHY IT IS NOT A REFUSAL (measured 2026-10-30, review of #3053). The
+      # three writers of $O have DIFFERENT write sets: `start` records depth-1 `*.sh` only, while
+      # `deploy-harness.sh` and `deploy-mac-orchestrator.sh` (phase B) pass no `--skip` and write the
+      # whole staged tree. So a `start`-recorded box — the verb operators actually run — is read back by
+      # a BROADER gate, and every install.sh-seeded doc came out an UNCOMMITTED-EDIT: reproduced with
+      # the shipped tool, `check --o $O --src $SRC` (exactly deploy-harness.sh:366's call) returned 1 on
+      # `README.md` and `retired/old.sh` whose bytes were IDENTICAL to the source's. The deploy turns
+      # that 1 into `exit 78` + "those bytes exist nowhere else: copy them aside".
+      # The gate's question is "would this run DISCARD bytes?" — and overwriting a file with its own
+      # contents discards nothing. Compared against --src (the bytes THIS deploy writes), because that
+      # is the comparison that decides it. A file whose $O bytes DIFFER still refuses below: that is
+      # the hand patch, and it is the arm that must never go quiet.
+      if cmp -s "$SRC/$_r" "$O/$_r"; then
+        say "SAME-AS-SOURCE   $_r — in $O and ABSENT from the record, but $O already holds the SOURCE's bytes, so this deploy would overwrite them with themselves: nothing is discarded and there is no patch to recover"
+        SAMESRC=$((SAMESRC + 1)); continue
+      fi
+      bad "UNCOMMITTED-EDIT   $_r — present in $O and ABSENT from the record (hand-placed, or written by a path that does not record), and the source ships this name with DIFFERENT bytes, so this deploy would OVERWRITE it, and those bytes exist nowhere else"
       EDITS=$((EDITS + 1))
     done < "$SRCLIST"
   fi
@@ -550,6 +590,9 @@ check)
   fi
   if [ "$PRESENT" -gt 0 ]; then
     say "note: $PRESENT file(s) in $O are carried by the box and NOT shipped by the record's source — no deploy of this tree writes them, so they are reported and not counted as edits"
+  fi
+  if [ "$SAMESRC" -gt 0 ]; then
+    say "note: $SAMESRC file(s) in $O are ABSENT from the record but byte-identical to the source — an unrecorded copy (a narrower writer such as 'start', or install.sh's seed); overwriting them changes nothing, so they are reported and not counted as edits"
   fi
   [ "$EDITS" -eq 0 ] || exit 1
   exit 0
