@@ -99,6 +99,22 @@ cat >"$T/home/onceiling.py" <<'ONEC'
 import json
 print(json.dumps({"verdict": "converged"}))
 ONEC
+# A converger that MEASURED the box and then reports STARVATION (exit 4). 4 is a reason to arm, not a
+# reason to refuse, and nothing exercised that decision until T52 (it was carried by a comment only).
+cat >"$T/home/starved.py" <<'STARVED'
+import json
+print(json.dumps({"repo": "o/r", "verdict": "starvation", "ncpu": 8, "mem_available_mb": 5000,
+                  "ceiling": 3, "reading": "ncpu=8 ceiling=3"}))
+raise SystemExit(4)
+STARVED
+# A converger whose ACTION failed (exit 3) while still answering — a box that was not measured, so
+# `--arm` must refuse it. The other side of the allow-list.
+cat >"$T/home/actionfail.py" <<'ACTIONFAIL'
+import json
+print(json.dumps({"repo": "o/r", "verdict": "action-failed", "ncpu": 8, "mem_available_mb": 5000,
+                  "ceiling": 3, "reading": "ncpu=8 ceiling=3"}))
+raise SystemExit(3)
+ACTIONFAIL
 # The systemctl shim: records every call; answers the verbs both the install and the status path use.
 cat >"$T/bin/systemctl" <<SYSTEMCTL_SHIM
 #!/usr/bin/env bash
@@ -1376,6 +1392,101 @@ assert_contains "$OUT" "cadence=StartInterval=3600" "an hourly plist is reported
 assert_absent "$OUT" "cadence=StartInterval=540" "the constant is not restated over the artifact"
 assert_contains "$OUT" "fires every 3600s" "and next_run's parenthetical is derived from the same read"
 assert_contains "$OUT" "drift_artifact=yes" "the drift verdict independently flags the same edit"
+
+# ── T52: `--arm`'s preflight ALLOW-LIST, which was carried by a comment and pinned by nothing ──────
+# `case "$rc" in 0|4)` is a deliberate policy — 4 is STARVATION, which means the box WAS measured, so it
+# is a reason to arm rather than a reason to refuse — and no case exercised it: every `--arm` fixture
+# exited 0 or 2, so reverting the arm to `0)` kept the suite green. The policy decides whether a starved
+# box can be armed at all, which is the box the whole feature exists for.
+say_case "T52 --arm ACCEPTS exit 4 (starvation) and REFUSES exit 3 (action failed)"
+D="$T/c52"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+ENVV=(RUNNER_AUTOSCALE_SCRIPT="$T/home/actionfail.py")
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a pass that FAILED (rc=3) is a box that was not measured, so --arm refuses it"
+assert_contains "$OUT" "REFUSING to arm" "and the refusal is named"
+assert_nofile "$ARM" "no record is written for an unmeasured box"
+assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service" 2>/dev/null)" "--dry-run" \
+    "and the artifact stays DISARMED after the refused arm"
+ENVV=(RUNNER_AUTOSCALE_SCRIPT="$T/home/starved.py")
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a STARVED box (rc=4) still ARMS — 4 means the box was measured, and starvation is the alarm the timer exists to surface"
+assert_contains "$OUT" "ARMED" "the verb reports it armed"
+assert_file "$ARM" "the record exists"
+assert_contains "$(cat "$ARM" 2>/dev/null)" "ceiling=3" "carrying the ceiling the starved pass still measured"
+rm -f "$ARM"
+
+# ── T53: the arming record and the pass log live where the ARTIFACT says, not where this shell looks ─
+# `STATE_DIR` defaults to `$HOME/.pi/agent/state`, and BOTH `ARM_FILE` and the last-tick log were derived
+# from it ONCE, from the READER's environment — while the artifact EXPORTS the value it was installed with,
+# and the service template states the invariant: "Exported so the scheduled pass and an operator's
+# `--status` read ONE path, not two that look alike." A box installed and armed WITH the seam, then read
+# or re-installed by a routine invocation WITHOUT it, therefore reported `mode=converge (ARMED)` beside
+# `arm_record=absent (<the reader's dir>)` and `last_tick=none` — and a routine `--install` rendered
+# `--dry-run`, silently DISARMING a box the owner had armed. Both are measured here.
+say_case "T53 the record and the pass log are read from the ARTIFACT's declared state dir"
+D="$T/c53"; fresh "$D"; rm -f "$ARM"
+ST3="$D/custom-state"
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$ST3" RUNNER_AUTOSCALE_ARM_FILE="$ST3/runner-autoscale.armed")
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "an install with the STATE_DIR seam set succeeds"
+assert_contains "$(grep '^Environment=RUNNER_AUTOSCALE_STATE_DIR=' "$D/$UNIT_NAME.service" 2>/dev/null)" \
+    "RUNNER_AUTOSCALE_STATE_DIR=$ST3" "the artifact EXPORTS the state dir it was installed with (the seam this case reads back)"
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$ST3" RUNNER_AUTOSCALE_ARM_FILE="$ST3/runner-autoscale.armed")
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "an arm with the seam set succeeds"
+assert_file "$ST3/runner-autoscale.armed" "the record lives in the artifact's own directory"
+printf '%s\n' '{"at":"2026-10-30T00:00:00Z","verdict":"at-ceiling","ceiling":3,"live":3}' >"$ST3/runner-autoscale.log"
+# ⭐ THE MEASURED DEFECT: a ROUTINE invocation that does not set the seam — a bring-up, a sync.
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR= RUNNER_AUTOSCALE_ARM_FILE=)
+OUT="$(run_install Linux "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "--status is green on a box that is armed and ticking"
+assert_contains "$OUT" "arm_record=present ($ST3/runner-autoscale.armed)" \
+    "the record is read from the ARTIFACT's directory, not this shell's default"
+assert_contains "$OUT" "last_tick=at=2026-10-30T00:00:00Z" "and so is the pass log"
+assert_contains "$OUT" "Honouring the ARTIFACT" "and the verb says which path won rather than silently picking one"
+# ⭐ THE SILENT DISARM: the same routine invocation must not drop the owner's dated decision.
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR= RUNNER_AUTOSCALE_ARM_FILE=)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a routine --install (no seam) exits 0"
+assert_absent "$(grep '^ExecStart=' "$D/$UNIT_NAME.service" 2>/dev/null)" "--dry-run" \
+    "and does NOT silently re-render an armed box DISARMED"
+# CONTROL: the adoption is not "assume armed". An EXPLICIT seam pointing at a directory with no record
+# still renders DISARMED, so an operator can disarm deliberately and a fresh box is never armed by this.
+D2="$T/c53b"; fresh "$D2"
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$D2/none" RUNNER_AUTOSCALE_ARM_FILE="$D2/none/runner-autoscale.armed")
+OUT="$(run_install Linux "$D2" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "control: an install with an explicit seam and no record succeeds"
+assert_contains "$(grep '^ExecStart=' "$D2/$UNIT_NAME.service" 2>/dev/null)" "--dry-run" \
+    "…and renders DISARMED, so adoption never arms a box by itself"
+rm -f "$ST3/runner-autoscale.armed" "$ARM"
+
+# ── T54: `--status` refuses a record it cannot honour, and a value the WRITERS would refuse ───────
+# Two one-fact-two-readers splits on the same verb. (a) The record: every writer asks
+# `arm_record_valid` (BOTH `armed-by=` and `armed-date=`), the readiness verb asked `[ -f ]`, so a
+# half-written record — the state the file's own rule calls fail-closed — was certified `present`.
+# (b) The declared values: the writers refuse a `--repo` that is not a plain `owner/name` and a `%` in
+# any rendered value on systemd, and the drift `cmp` structurally cannot catch either, because the
+# render is fed the artifact's OWN values and reproduces the bad one exactly.
+say_case "T54 --status refuses a half-written record and a declared value the writers would refuse"
+D="$T/c54"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: an intact record is green"
+grep -v '^armed-date=' "$ARM" >"$D/half.armed" 2>/dev/null && cp "$D/half.armed" "$ARM"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "a record missing armed-date= is NOT certified green"
+assert_contains "$OUT" "arm_record=INVALID" "it is named INVALID, not merely 'present'"
+assert_contains "$OUT" "DISARMED" "and the output names what the next --install will do"
+rm -f "$ARM"
+D2="$T/c54b"; fresh "$D2"; rm -f "$ARM"
+run_install Linux "$D2" --install >/dev/null 2>&1
+box_sed_i 's|--repo "o/r"|--repo "o/%h"|' "$D2/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D2" --status)"; RC=$?
+assert_eq "$RC" 1 "a declared --repo the writers would REFUSE is not certified green"
+assert_contains "$OUT" "not a plain owner/name" "the refusal names the rule the writers apply"
+rm -f "$ARM"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

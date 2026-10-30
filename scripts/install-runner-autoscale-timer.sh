@@ -545,6 +545,39 @@ adopt_installed_provisioner() {
     return 0
 }
 
+# adopt_installed_state_dir — the ARMING RECORD and the pass log live where the ARTIFACT declares.
+# ⛔ MEASURED HARM, AND IT IS THE SAME CLASS `adopt_installed_provisioner` CLOSES. `STATE_DIR` defaults
+# to `$HOME/.pi/agent/state`, and BOTH `ARM_FILE` and the last-tick log are derived from it ONCE, from
+# the READER's environment. The artifact, however, EXPORTS the value it was installed with
+# (`Environment=RUNNER_AUTOSCALE_STATE_DIR={{STATE_DIR}}`), and the service template states the invariant
+# out loud: "Exported so the scheduled pass and an operator's `--status` read ONE path, not two that look
+# alike." Two consequences, both reproduced on a fixture — a box installed and armed WITH the seam, then
+# read or re-installed by a routine invocation WITHOUT it:
+#   * `--status` printed `mode=converge (ARMED)` beside `arm_record=absent (<the reader's dir>)` and
+#     `last_tick=none`, while the record and the pass log sat in the directory the artifact declares —
+#     the readiness verb telling the operator the OPPOSITE of the truth about the two facts it exists to
+#     report. That is the exact contradictory pair the root guard above names, reached by its other
+#     route (a routine install, not `sudo`).
+#   * an `--install` (a bring-up, a sync) rendered `--dry-run` and SILENTLY DISARMED the box the owner
+#     had armed, leaving the dated record orphaned on disk with no line saying so.
+# So the artifact is the record of what was resolved here too, exactly as it already is for the
+# provisioner pin. An EXPLICIT `RUNNER_AUTOSCALE_STATE_DIR` / `RUNNER_AUTOSCALE_ARM_FILE` from the
+# operator still wins: this adopts only what nobody chose on THIS invocation, and says so.
+adopt_installed_state_dir() {
+    [ -n "${RUNNER_AUTOSCALE_STATE_DIR:-}" ] && return 0
+    local art declared was
+    art="$(artifact_path_for_target)"
+    [ -f "$art" ] || return 0
+    declared="$(artifact_env_value "$art" RUNNER_AUTOSCALE_STATE_DIR)"
+    [ -n "$declared" ] || return 0
+    [ "$declared" = "$STATE_DIR" ] && return 0
+    was="$STATE_DIR"
+    STATE_DIR="$declared"
+    [ -n "${RUNNER_AUTOSCALE_ARM_FILE:-}" ] || ARM_FILE="$STATE_DIR/runner-autoscale.armed"
+    err "note: the installed artifact declares RUNNER_AUTOSCALE_STATE_DIR=$declared, which is NOT where this shell would look ($was). Honouring the ARTIFACT: the scheduled pass writes its log and reads the arming record there, so a reader that used the other path would report the opposite of the truth about both. Set RUNNER_AUTOSCALE_STATE_DIR to override."
+    return 0
+}
+
 # ── the arming record ────────────────────────────────────────────────────────────────────────
 # ⛔ BOTH LINES OR NOTHING: a half-written record (truncated write, an editor buffer flushed early) must
 # render DISARMED. That is the fail-closed direction, and it is the same rule install-launchd.sh applies
@@ -1179,6 +1212,7 @@ do_install_systemd() {
     local tmpd changed=0 linger=""
     [ -f "$src_svc" ] && [ -f "$src_tim" ] || { err "templates missing under $TEMPLATES_DIR (expected $UNIT_NAME.service + $UNIT_NAME.timer)"; return 1; }
     choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. Install by hand, or give the box sudo. NOT silently skipping — a converger that never runs is the failure this exists to remove."; return 1; }
+    adopt_installed_state_dir
     refuse_systemd_unsafe_values || return 1
     adopt_installed_provisioner
     note_repo_change
@@ -1276,6 +1310,7 @@ do_install_launchd() {
     local tmpd changed=0 loaded=0
     [ -f "$src_plist" ] || { err "plist template missing: $src_plist (set LAUNCHD_TEMPLATES_DIR)"; return 1; }
     choose_target || { err "no scheduler available"; return 1; }
+    adopt_installed_state_dir
     adopt_installed_provisioner
     note_repo_change
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
@@ -1383,6 +1418,10 @@ do_arm() {
     # is told THAT rather than "no scheduler available".
     refuse_unusable_target scheduled || return 1
     choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. NOT silently skipping — a converger that never runs is the failure this exists to remove."; return 1; }
+    # ⛔ BEFORE THE RECORD IS READ OR WRITTEN, because the record's location is a fact about the
+    # ARTIFACT. Do_arm writes it, and the re-render it triggers reads it; the two must agree or the verb
+    # reports the label of one path against the state of the other.
+    adopt_installed_state_dir
     if [ "$TARGET" = "system" ] || [ "$TARGET" = "user" ]; then
         # Once the target is known: a value the scheduler would corrupt (`%` specifiers, a stray backslash)
         # is a preflight fact too, and the re-render is where it used to be found.
@@ -1518,6 +1557,12 @@ do_arm() {
 
 do_disarm() {
     refuse_root_invocation || return 1
+    # ⛔ THE RECORD'S LOCATION IS A FACT ABOUT THE ARTIFACT, SO IT IS RESOLVED BEFORE ANY LINE READS IT —
+    # including the preview below, which otherwise says "not armed" about a record that exists in the
+    # directory the artifact declares. ⛔ BUT A PREVIEW MUST NOT DEPEND ON A SCHEDULER: `choose_target`
+    # failing here is not this verb's refusal (the real path refuses through the re-render, with its own
+    # message), so it only means "no artifact path to resolve" and the reader's default stands.
+    choose_target >/dev/null 2>&1 && adopt_installed_state_dir
     # ⛔ NOTHING IS MUTATED BEFORE A DRY RUN RETURNS, AND NOTHING IS DELETED BEFORE THE ARTIFACT
     # PROVES IT IS DISARMED. Both orders were wrong here once, and the failure is the one state the
     # whole design forbids — an ARMED box with no record on disk:
@@ -1655,6 +1700,10 @@ do_status() {
     # fixed for), and here it was worse than noise: it hid REAL drift on those boxes.
     resolve_provisioner
     choose_target || { err "no scheduler available"; return 1; }
+    # ⛔ BEFORE ANYTHING READS THE RECORD OR THE PASS LOG, AND BEFORE THE TARGET LINE BELOW NAMES A
+    # DIRECTORY. `--status` reports `arm_record=`, `last_tick=` and the scope scan, and every one of those
+    # is a claim about the ARTIFACT's directory, not about this shell's default.
+    adopt_installed_state_dir
     log_line "target=$TARGET dir=$UNIT_DIR"
     # The pin is part of what the artifact carries, so the readiness report names it (or says why not).
     log_line "provisioner=${PROVISIONER:-absent} ($PROVISIONER_WHY)"
@@ -1774,7 +1823,24 @@ do_status() {
             rc=1
         fi
     fi
-    log_line "arm_record=$([ -f "$ARM_FILE" ] && printf 'present' || printf 'absent') ($ARM_FILE)"
+    # ⛔ THE RECORD'S EXISTENCE IS NOT THE RECORD'S AUTHORITY. Every writer (arm_flag, do_arm, the
+    # --report-only guard, report_surviving_arm_record) asks `arm_record_valid`, which needs BOTH
+    # `armed-by=` and `armed-date=`; this line asked `[ -f ]` and nothing else. So a half-written record —
+    # the exact state the file's own rule calls fail-closed ("BOTH LINES OR NOTHING") — was reported
+    # `arm_record=present` by the readiness verb while the very next `--install` rendered DISARMED, and
+    # with a DISARMED artifact it read "present" over a box that is not armed at all. Both directions are
+    # a false PASS over a fact the writers gate on.
+    case "$([ -f "$ARM_FILE" ] && printf exists)" in
+        '') log_line "arm_record=absent ($ARM_FILE)" ;;
+        *)
+            if arm_record_valid; then
+                log_line "arm_record=present ($ARM_FILE)"
+            else
+                log_line "arm_record=INVALID (present but missing armed-by=/armed-date=) ($ARM_FILE)"
+                err "the arming record exists but is NOT a valid arming: it is missing $(grep -q '^armed-by=.' "$ARM_FILE" 2>/dev/null || printf 'armed-by= ')or $(grep -q '^armed-date=.' "$ARM_FILE" 2>/dev/null || printf 'armed-date= ')— every writer reads this as NOT ARMED, so the artifact is the LAST word and the next --install will render it DISARMED. Re-run --arm, or --disarm to revoke it cleanly."
+                rc=1
+            fi ;;
+    esac
     # ⛔ THE TARGET IS PART OF THE ANSWER. An artifact whose script is gone starts nothing (203/EXEC on
     # every tick) while the scheduler still lists it as scheduled and healthy.
     # The script is the first ABSOLUTE `.py` argument — not a hard-coded basename. A basename match
@@ -1873,7 +1939,7 @@ do_status() {
         if [ -n "$tmpd" ]; then
             save_home="$HOME"; save_path="$PATH"; save_state="$STATE_DIR"; save_repo="$REPO"
             save_prov="$PROVISIONER"; save_py="$PYTHON"; save_script="$SCRIPT"
-            local d_home d_path d_state d_repo d_prov
+            local d_home d_path d_state d_repo d_prov dv
             d_home="$(artifact_env_value "$installed_path" HOME)"
             d_path="$(artifact_env_value "$installed_path" PATH)"
             d_state="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_STATE_DIR)"
@@ -1881,6 +1947,31 @@ do_status() {
             # templates, so the env read-back was empty on every box and this line did nothing.
             d_repo="$(artifact_repo_value "$installed_path")"
             d_prov="$(artifact_env_value "$installed_path" RUNNER_AUTOSCALE_PROVISIONER)"
+            # ⛔ THE READINESS VERB MUST APPLY THE WRITERS' VALUE GUARDS TO WHAT IT READS BACK. The writers
+            # REFUSE a `--repo` that is not a plain `owner/name` (in `refuse_unusable_target`) and refuse a
+            # `%` or whitespace in any rendered value on the systemd arm (in `refuse_systemd_unsafe_values`);
+            # `--status` judged NONE of them — and the drift `cmp` structurally CANNOT catch it, because the
+            # render is fed the artifact's OWN declared values, so it reproduces the bad value exactly and
+            # reports `drift_artifact=no`. Measured: an artifact hand-edited to `--repo "o/%h"` printed
+            # `mode=converge (ARMED)`, `drift_artifact=no` and exit 0, over a unit whose repo systemd expands
+            # to something else at load time — every tick then exits 2. The T49 class, one key over: the
+            # writers refuse to create this state, so a hand-edited or foreign artifact is HOW it is reached.
+            for dv in "HOME=$d_home" "STATE_DIR=$d_state" "REPO=$d_repo" "PROVISIONER=$d_prov"; do
+                [ -n "${dv#*=}" ] || continue
+                case "${dv#*=}" in
+                    *\\*) err "the installed artifact declares ${dv%%=*} with a BACKSLASH, which no render here can reproduce (the artifact is rendered with sed, where a backslash is an escape) — the artifact is not the one this installer would write"; rc=1 ;;
+                esac
+                if [ "$TARGET" != "launchd" ]; then
+                    case "${dv#*=}" in
+                        *[[:space:]]*) err "the installed artifact declares ${dv%%=*} containing WHITESPACE — systemd splits the rendered unit on it, so the job does not run as written"; rc=1 ;;
+                        *%*) err "the installed artifact declares ${dv%%=*} containing '%', which systemd expands as a SPECIFIER at load time (%h, %i, %n) — the job is handed a value that is not the one on disk, and `last_tick` then stays silent in the path the pass actually logs to"; rc=1 ;;
+                    esac
+                fi
+            done
+            if [ -n "$d_repo" ] && ! [[ "$d_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+                err "the installed artifact declares --repo '$d_repo', which is not a plain owner/name (letters, digits, dot, dash, underscore). The writers REFUSE to render this, so the artifact is hand-edited or foreign; the pass would read a pool that is not the one on disk."
+                rc=1
+            fi
             # A key the artifact does not declare keeps the reader's value: the render must not be fed an
             # EMPTY path to make the comparison match (that would bless the missing line). Reporting the
             # difference is what surfaces it.
@@ -2079,6 +2170,10 @@ do_uninstall() {
     # `--install` re-arms from it. Measured: every other verb refused, this one exited 0 unguarded.
     refuse_root_invocation || return 1
     choose_target || { err "no scheduler available"; return 1; }
+    # ⛔ THE RECORD'S LOCATION IS A FACT ABOUT THE ARTIFACT (see `adopt_installed_state_dir`). Without
+    # this, `--uninstall` reads the reader's path, finds no record, says nothing about a surviving arming
+    # decision — and the next `--install` re-arms the box from the orphaned one.
+    adopt_installed_state_dir
     if [ "$TARGET" = "launchd" ]; then
         # ⛔ A DISARM IS NOT DONE BECAUSE `bootout` RETURNED. The plist can be gone while the LOADED job
         # keeps firing until logout, and `--status` would then answer `installed=no` about a job that is
