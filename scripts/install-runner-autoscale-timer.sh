@@ -106,7 +106,7 @@
 #   SYSTEMD_UNIT_DIR          install dir OVERRIDE (tests: a temp dir, with SYSTEMCTL a fake)
 #   LAUNCHD_AGENTS_DIR        LaunchAgents dir OVERRIDE (tests: a temp dir, with LAUNCHCTL a fake)
 #   ELDATO_PLATFORM           override `uname -s` (tests render the Darwin artifact on any host)
-#   SYSTEMCTL / LAUNCHCTL / SUDO  the tools to call / probe (tests: shims)
+#   SYSTEMCTL / LAUNCHCTL / LOGINCTL / SUDO  the tools to call / probe (tests: shims)
 #   RUNNER_AUTOSCALE_EXTRA_SCOPES  colon-separated EXTRA dirs scanned by `--uninstall`'s "another
 #                              scope" note (TEST SEAM: read-only scan paths only; production sets
 #                              nothing)
@@ -227,6 +227,18 @@ sed_escape_repl() {
 }
 xml_sed_repl() {
     sed_escape_repl "$(printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+}
+# xml_escape_only <text> — the XML-metacharacter half of `xml_sed_repl`, and NOT the sed half.
+# ⛔ USE THIS ONLY WHERE `render` WILL APPLY THE SED LAYER ITSELF. `render` sed-escapes every
+# `{{PLACEHOLDER}}` substitution, because the value lands in a sed *replacement*; a producer that ALSO
+# sed-escapes is escaped TWICE, and in a replacement `\\&` is a literal backslash followed by `&`. So
+# the launchd provisioner pin came out as `/…/inst\\&x.sh` — a path that does not exist — while the
+# systemd arm rendered the identical path correctly (measured; the plist still parsed, nothing compared
+# the value, and the pass would have found no provisioner and exited 3 on every capacity tick).
+# `{{HOME}}`/`{{SCRIPT}}`/… are escaped exactly once by `render` with no producer layer; this helper is
+# how the one COMPOSED value stays in that same shape.
+xml_escape_only() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
 # ── resolve the converger ─────────────────────────────────────────────────────────────────────
@@ -427,7 +439,7 @@ provisioner_env_for() { # provisioner_env_for systemd|launchd
     [ -n "$PROVISIONER" ] || { printf '%s' ""; return 0; }
     case "$1" in
         systemd) printf '%s' "Environment=\"RUNNER_AUTOSCALE_PROVISIONER=$PROVISIONER\"" ;;
-        launchd) printf '%s' "<key>RUNNER_AUTOSCALE_PROVISIONER</key><string>$(xml_sed_repl "$PROVISIONER")</string>" ;;
+        launchd) printf '%s' "<key>RUNNER_AUTOSCALE_PROVISIONER</key><string>$(xml_escape_only "$PROVISIONER")</string>" ;;
     esac
 }
 
@@ -1184,7 +1196,7 @@ sha_of() { # sha_of <file> — portable digest
 }
 
 do_status() {
-    local installed_mode installed_script drift_artifact enabled active next last
+    local installed_mode installed_script drift_artifact enabled active next last linger
     local installed_args installed_rest installed_kind installed_dropins
     local rc=0 installed_path
     resolve_script || return 1
@@ -1304,6 +1316,15 @@ do_status() {
                 fi
             else
                 if render "$TEMPLATES_DIR/$UNIT_NAME.service" "$tmpd/$UNIT_NAME.service" systemd 2>/dev/null; then
+                    # ⛔ THE DRIFT COMPARISON MUST COMPARE THE ARTIFACT THE INSTALL PATH WOULD WRITE, AND
+                    # FOR A USER TARGET THAT ARTIFACT HAS NO `User=` LINE. The install path drops it
+                    # (systemd rejects `User=` in a user unit); this render did not, so the two files
+                    # could never match and `drift_artifact=yes` was reported on a freshly installed,
+                    # untouched artifact — a signal that fires always is a signal nobody reads. Reported
+                    # on the very `--status` the install hands the operator as its remedy.
+                    if [ "$TARGET" = "user" ]; then
+                        sed -i.bak '/^User=/d' "$tmpd/$UNIT_NAME.service" && rm -f "$tmpd/$UNIT_NAME.service.bak"
+                    fi
                     cmp -s "$tmpd/$UNIT_NAME.service" "$installed_path" && drift_artifact=no || drift_artifact=yes
                 fi
             fi
@@ -1337,8 +1358,10 @@ do_status() {
             log_line "loaded=yes"
             last="$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $2; exit}')"
             log_line "last_exit=${last:-unknown}"
+            # 4 (STARVATION) is RED for the same reason as the systemd arm below — see that comment.
             case "${last:-}" in
-                ''|-|0|4) : ;;
+                ''|-|0) : ;;
+                4) err "the last pass exited 4 (STARVATION) — the pass completed and reported a queue that cannot reach this pool with no busy runner; that verdict is the alarm, not a clean tick; see $(last_tick_line "$STATE_DIR/runner-autoscale.log")"; rc=1 ;;
                 *) err "the last pass exited $last — the converger is not completing; see $(last_tick_line "$STATE_DIR/runner-autoscale.log")"; rc=1 ;;
             esac
             log_line "pid=$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $1; exit}' | sed 's/^-$/not-running/')"
@@ -1353,6 +1376,28 @@ do_status() {
         enabled="$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null || echo no)"
         active="$($SC is-active "$UNIT_NAME.timer" 2>/dev/null || echo no)"
         log_line "enabled=$enabled"
+        # ⛔ ENABLED IS GATED, NOT JUST PRINTED — and `static` fails it too. A timer that is active NOW
+        # but not enabled does not come back at the next boot, so the box stops converging at the first
+        # restart. The INSTALL path already refuses this state ("timer is NOT enabled after install — the
+        # converger will not run unattended"); the STATUS path — the verb an operator and the health
+        # sweep call LATER, when a reboot or an operator edit can have changed it — did not, so the
+        # readiness gate was the lenient of the two readers of one fact. `static` means the unit has no
+        # `[Install]` section, so nothing links it into `timers.target`: the same inert-after-reboot
+        # state, reachable only on a hand-edited or foreign unit, which is when a gate earns its keep.
+        # (Same rule the sibling installer records at install-harness-apply-timer.sh's status arm.)
+        case "${enabled:-no}" in
+            enabled) : ;;
+            *) err "the timer is '${enabled:-no}', not enabled — it will not survive a reboot, so this box stops converging at the next restart"; rc=1 ;;
+        esac
+        # ⛔ A USER TIMER WITHOUT LINGER DIES WITH THE LAST SESSION, so the status verb re-checks what the
+        # install path checked (lingering can be cleared later by an operator or an image rebuild). The
+        # install path refuses a non-lingering user install outright; without this arm `--status` printed
+        # a green readiness verdict over a timer that stops firing at logout.
+        if [ "$TARGET" = "user" ]; then
+            linger="$(${LOGINCTL:-loginctl} show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+            log_line "linger=${linger:-unknown}"
+            [ "$linger" = "yes" ] || { err "the user timer will NOT fire after this session ends (linger=${linger:-unknown}) — it stops converging at logout; enable it: sudo loginctl enable-linger $(id -un)"; rc=1; }
+        fi
         log_line "timer_active=$active"
         next="$($SC list-timers --all --no-pager 2>/dev/null | awk -v u="$UNIT_NAME.timer" '$0 ~ u {print $1" "$2" "$3; exit}')"
         log_line "next_run=${next:-unknown}"
@@ -1362,9 +1407,15 @@ do_status() {
             active|activating) : ;;
             *) err "the timer is '${active:-unknown}', not active — the converger will NOT run unattended"; rc=1 ;;
         esac
+        # ⛔ 4 (STARVATION) IS NOT GREEN HERE EITHER. The service unit renders 2/3/4 RED and its own exit
+        # table says "0 is the ONLY green … greening 4 would silently retire the alarm #2875 exists for".
+        # This gate had `4` in the green set, so the readiness verb reported healthy over the one state
+        # the unit is best placed to catch: a queue that cannot reach this pool. It is a DIFFERENT
+        # message from "not completing" (the pass ran and reported), which is why it has its own arm.
         case "${last:-}" in
-            ''|-|0|4) : ;;
+            ''|-|0) : ;;
             unknown) err "cannot read the timer's last run (systemctl show refused) — cannot determine whether the pass is completing"; rc=1 ;;
+            4) err "the timer's last run exited 4 (STARVATION) — the pass completed and reported a queue that cannot reach this pool with no busy runner. The converger's own verdict is the alarm, not a clean tick; see the pass log below"; rc=1 ;;
             *) err "the timer's last run exited $last — the pass is not completing; see the pass log below"; rc=1 ;;
         esac
     fi
