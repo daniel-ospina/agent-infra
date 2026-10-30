@@ -862,7 +862,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
 (it did once, on this box, before the scoping was added).
-`scripts/disk-reaper.test.sh` — 659 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 688 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |

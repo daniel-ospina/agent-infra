@@ -56,6 +56,15 @@
 #       on EITHER surface (the operator-facing class line and the pass record), for the classes that
 #       keep no tally sentinel (`worktree`, `uv`, `duplicate-install`), and `not-run` for a class that
 #       was not selected at all (#4529).
+#   T61 the delegate's OWN `verdict=` reaches the record AND `--print-status` as
+#       `delegate_verdict_worktree=` without moving the exit-code class verdict, and disagreement
+#       gives the ALARM class precedence (`mixed-benign` vs `mixed`) (#3041/#3058).
+#   T62 a reaper pointed at a checkout that is NOT THERE can never be installed BLIND: an all-empty
+#       resolved list is REFUSED (rc=1, no unit written), and an entry dropped from a PARTIALLY
+#       resolvable list is NAMED on stderr instead of vanishing silently (#2159/#2878).
+#       ⚠️ T62 is the number this block took on rebase: it was written as T61 against a base where
+#       T61 was free, and #3041 landed a DIFFERENT T61 first. Two sections cannot share an ID (nor
+#       `ENVNAME`/`$T/t61`), so this one was renumbered rather than merged under a duplicate label.
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -3138,6 +3147,103 @@ assert_eq "$(t61_run_pair reap-ineffective unmeasured)" "mixed" \
     "T61 two DIFFERENT alarms read \`mixed\` — the one case where the cell genuinely cannot say"
 assert_eq "$(t61_run_pair reclaimed unlisted-new-verdict)" "unlisted-new-verdict" \
     "T61 an UNTAUGHT spelling is surfaced as itself (the benign side is an allow-list, so a new verdict fails loud)"
+# ── T62: a reaper pointed at a checkout that is NOT THERE is refused, never installed BLIND ──────
+# MEASURED (pi-cell-1, 2026-10-30). The hourly unit was installed while the tortoise checkout lived
+# at /tmp/cell-t3 (the cell layout, #2878). The checkout later moved to /home/cmux/tortoise and the
+# unit was never re-validated: every hourly pass then logged
+#     WARNING: ignoring '/tmp/cell-t3' — not a git checkout
+#     ⛔ class=venv  FAIL-CLOSED — no repo to scan
+#     ⛔ class=worktree FAIL-CLOSED — no repo to scan
+# and exited 3 — for 34 worktrees and ~60 GB it had never once looked at. The box sat at 100% used
+# with the reaper "on the clock": an inert enforcer that LOOKS installed.
+# This case pins BOTH guards that make that visible, because they cover different shapes:
+#   (a)(b)(c) an ALL-EMPTY resolved list is REFUSED (rc=1) and writes no unit.
+#   (d)       a PARTIALLY resolvable list — the incident's own shape, since the bring-up passes the
+#             operator's colon-joined list verbatim — installs, but the entry git cannot answer for
+#             must be NAMED on stderr. It was dropped in SILENCE before this change, which is
+#             indistinguishable from success while a configured tree is not scanned.
+ENVNAME=t62
+REPO_T62="$(mk_repo t62-repo)"
+inst62() { # inst62 <repos-value> <unit-dir>
+    # The fallback candidates are BLANKED so an empty DISK_REAPER_REPOS really is empty: without this
+    # the ambient REPO/AGENT_INFRA_PATH of the shell running the suite resolves a repo and the empty
+    # case silently becomes the valid case (measured: this assertion read OK-then-RED across hosts).
+    HOME="$T/t62/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$1" \
+    REPO= TORTOISE_REPO= WORKDIR= AGENT_INFRA_PATH= \
+    DISK_REAPER_STATE_DIR="$T/t62/home/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$2" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t62/calls.log" \
+    bash "$INST" --install 2>&1
+}
+mkdir -p "$T/t62/home"
+
+# (a) a REAL checkout installs, and the rendered unit names it
+OUT="$(inst62 "$REPO_T62" "$T/t62/units-ok")"; RC=$?
+assert_eq "$RC" "0" "T62 a real checkout still installs (the guard is not a blanket refusal)"
+assert_contains "$(cat "$T/t62/units-ok/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 the unit carries the checkout it was validated against"
+
+# (b) THE DISARM CASE: the same box after the checkout moved. A path that git does not answer for
+# must be refused — and must write NOTHING, because a written unit is what runs blind every hour.
+# Assert the GUARD'S OWN text, not a bare "REFUSING": any refusal added ahead of the repo check would
+# otherwise keep this green with the repo guard deleted. Two such refusals DO sit ahead of it in
+# `do_install` — DISK_REAPER_WT_AGED_DAYS (installer:596) and the root/SUDO_USER check (installer:1250)
+# — so a bare "REFUSING" match is not hypothetical.
+OUT="$(inst62 "$T/t62/vanished-checkout" "$T/t62/units-blind")"; RC=$?
+assert_contains "$OUT" "no repo resolved on this box" \
+    "T62 a repo that is not a git checkout is REFUSED (never a blind unit)"
+assert_eq "$RC" "1" "T62 ... and the refusal is a NON-ZERO exit, not a printed line on a success path"
+assert_absent "$OUT" "installed: target=" "T62 ... the refusal happens BEFORE anything is installed"
+if [ -f "$T/t62/units-blind/eldato-disk-reaper.service" ]; then
+    bad "T62 a disarmed reaper must not leave a unit behind"
+else
+    ok "T62 no unit is written for an unresolvable repo (nothing can fire blind)"
+fi
+# (c) the empty case is the same defect and must be refused too — asserted on the ARTIFACT as well as
+# the message: this is the case whose own text says "a class that scans nothing is not a pass", so a
+# written unit here is precisely the thing that fires blind.
+OUT="$(inst62 "" "$T/t62/units-empty")"; RC=$?
+assert_contains "$OUT" "no repo resolved on this box" \
+    "T62 an EMPTY repo list is refused (a class that scans nothing is not a pass)"
+assert_eq "$RC" "1" "T62 ... with a non-zero exit"
+assert_absent "$OUT" "installed: target=" "T62 ... and nothing is installed for an empty list"
+if [ -f "$T/t62/units-empty/eldato-disk-reaper.service" ]; then
+    bad "T62 an empty repo list must not leave a unit behind"
+else
+    ok "T62 no unit is written for an empty repo list"
+fi
+# (d) THE SILENT-DROP CASE — the incident's actual shape. A colon-joined list where ONE entry no longer
+# resolves (the bring-up passes the operator's list verbatim) must still install, must keep the entries
+# it CAN use, and must NAME the one it dropped. Silence here is a green install that never scans a
+# configured tree.
+OUT="$(inst62 "$REPO_T62:$T/t62/vanished-checkout" "$T/t62/units-partial")"; RC=$?
+assert_eq "$RC" "0" "T62 a partially resolvable list still installs (one dead entry must not block the rest)"
+assert_contains "$OUT" "so the venv/worktree classes cannot scan it" \
+    "T62 a dropped entry is NAMED, never dropped in silence"
+assert_contains "$OUT" "$T/t62/vanished-checkout" "T62 ... and the warning names WHICH entry was dropped"
+# The channel is MEASURED, not assumed: `inst62` merges 2>&1, so a move from `err` (stderr) to stdout
+# would keep the assertion above green while breaking the property it claims. Re-run the same case with
+# stderr captured SEPARATELY: a warning that is not on stderr cannot reach the operator's log.
+_inst62_stderr() {
+    HOME="$T/t62/home-err" DISK_REAPER="$REAPER" \
+    DISK_REAPER_REPOS="$REPO_T62:$T/t62/vanished-checkout" \
+    REPO= TORTOISE_REPO= WORKDIR= AGENT_INFRA_PATH= \
+    DISK_REAPER_STATE_DIR="$T/t62/home-err/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$T/t62/units-err" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t62/calls.log" \
+    bash "$INST" --install 2>"$T/t62/d.err" >/dev/null
+}
+mkdir -p "$T/t62/home-err"
+_inst62_stderr; ERR_RC=$?
+# The re-run is itself an install: assert it SUCCEEDED and wrote its unit, or the stream measurement
+# would hang off an unverified run.
+assert_eq "$ERR_RC" "0" "T62 the stderr-channel re-run installs (rc=0)"
+assert_file "$T/t62/units-err/eldato-disk-reaper.service" \
+    "T62 ... and writes its unit, so the stream measurement is not taken from a failed run"
+assert_contains "$(cat "$T/t62/d.err" 2>/dev/null)" "so the venv/worktree classes cannot scan it" \
+    "T62 ... and the dropped-entry warning is on STDERR (measured on its own stream, not the merged one)"
+assert_contains "$(cat "$T/t62/units-partial/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 case (d): the unit keeps the entry that DOES resolve"
+assert_absent "$(cat "$T/t62/units-partial/eldato-disk-reaper.service" 2>/dev/null)" \
+    "vanished-checkout" "T62 case (d): ... and never renders a path that cannot be scanned"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
