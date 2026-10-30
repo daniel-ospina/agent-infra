@@ -395,13 +395,32 @@ repo_path_default_hits() {
       if (v ~ /^\// || v ~ /^~/ || v ~ /^\.\//) return 1  # an absolute, home-relative or ./ path
       return 0
     }
+    # ⛔ THE QUESTION IS "IS THERE A DEFAULT", NOT "DOES IT LOOK LIKE A PATH" (#3054 review, P1).
+    # Asking the second let every default spelled as ANOTHER VARIABLE through: `$AI` (which IS
+    # `/tmp/cell-ai` via the same default in deploy-crossbox.sh — this defect one variable over),
+    # `$CELL_HOME/tortoise`, `$O/x`, `$TMPDIR/x`, `$(pwd)`, and any `local`/`readonly` spelling.
+    # The rule this PR states is that a default is only safe if it is TRUE ON EVERY MACHINE, so the
+    # only defaults that are not a finding are: NO default (empty), a SLUG (what `OR` takes), or the
+    # one resolver. Anything else is a private decision about where the repo lives, which is exactly
+    # what this arm exists to refuse.
+    function allowed_default(v) {
+      if (v == "") return 1                              # `${REPO:-}` — no default at all
+      if (v == "$(resolve_repo)") return 1                 # the ONE resolver
+      if (v ~ /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/) return 1 # a slug, as `OR` takes
+      return 0
+    }
     {
       ln = $0
       sub(/^[ \t]+/, "", ln)
       if (ln ~ /^#/) next                                 # a comment is not a default
-      if (ln !~ /^(export[ \t]+)?REPO=/) next
+      # A DECLARATION PREFIX IS NOT AN EXEMPTION (#3054 review, P1): `local REPO="/tmp/x"` and
+      # `readonly REPO=…` were invisible because only `export` was stripped. Strip any of them,
+      # repeatedly (so `local -r REPO=` is seen too), then require the assignment itself.
+      while (ln ~ /^(export|local|readonly|declare|typeset)([ \t]+-[A-Za-z]+)*[ \t]+/)
+        sub(/^(export|local|readonly|declare|typeset)([ \t]+-[A-Za-z]+)*[ \t]+/, "", ln)
+      if (ln !~ /^REPO=/) next
       val = ln
-      sub(/^(export[ \t]+)?REPO=/, "", val)                # the value, without the assignment
+      sub(/^REPO=/, "", val)                              # the value, without the assignment
       sub(/[ \t]+$/, "", val)
       # One layer of MATCHING quotes off, so `${REPO:-…}` is seen as the expansion it is (and not as a
       # string that happens to start with a quote). A value quoted only on one side is left alone.
@@ -412,7 +431,7 @@ repo_path_default_hits() {
         inner = val
         sub(/^\$\{REPO:?-/, "", inner)
         sub(/\}$/, "", inner)
-        if (inner == "" || !pathish(inner)) next          # no default, or a slug: not this arm
+        if (allowed_default(inner)) next                   # no default, a slug, or the resolver: not this arm
         print FILENAME ":" FNR ": " $0
         next
       }

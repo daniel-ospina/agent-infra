@@ -5028,13 +5028,19 @@ if [ -f "$CSS" ]; then
   # A COMMENT mentioning a default must not red (prose is how the defect is recorded), the assignment
   # on the next line must.
   printf '#!/bin/bash\n# REPO="${REPO:-/some/path}" is the shape this arm forbids\nREPO="$HOME/x"\n' > "$TMP/rpdef/h/zz-holdout.sh"
-  out="$(bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+  # ⛔ `env -u O` ON BOTH ARMS (#3054 review, P2). Without it the throwaway run inherits the ambient
+  # `$O`, so on any box whose deployed copy differs from this checkout — i.e. every box mid-change —
+  # the run exits 1 from the DEPLOYED-COPY divergence arms and the "allowed shapes" arm below blames
+  # the REPO arm for it. It was green only in CI, where `$O` is absent, so it proved the shapes are
+  # allowed nowhere that matters. `check-single-source.sh` reads `O_DIR="${O:-}"`, so unsetting it
+  # narrows the run to the half under test instead of inventing a target.
+  out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
   { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:3' <<<"$out"; } && rc=0 \
     || { rc=1; echo "      a private REPO path default exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') (a comment mentioning one must NOT be the hit: the reported line is the assignment's)"; }
   ck "check-single-source: a private REPO path default is refused, naming file AND line (rc 1)" $rc
   # Non-vacuity in the other direction: the shapes the whole harness is converging ON must not red.
   printf '#!/bin/bash\nREPO="${REPO:-}"\nREPO="$1"\nREPO="$(resolve_repo)"\n' > "$TMP/rpdef/h/zz-holdout.sh"
-  bash "$TMP/rpdef/h/check-single-source.sh" >/dev/null 2>&1; rc=$?
+  env -u O bash "$TMP/rpdef/h/check-single-source.sh" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 0 ] && rc=0 \
     || { rc=1; echo "      the ALLOWED shapes (no default / assigned from a caller / the one resolver) exited $rc"; }
   ck "check-single-source: REPO=\"\${REPO:-}\", a caller-assigned REPO and resolve_repo all pass" $rc
