@@ -716,28 +716,49 @@ has_comment_review_record() {
   [ -n "$REVIEW_COMMENT_MATCHED_LINE" ]
 }
 
-# ── #1224: THE HEAD-BOUND RECORD FILE IS THE FIRST SOURCE ────────────────────
+# ── #1224: THREE SOURCES, IN ONE FIXED ORDER — RECORD → COMMENT → BODY ──────
 #
-# THE DEFECT THIS REMOVES FROM THE TRUST PATH. `record-review.sh` mints TWO
-# artifacts for one review: the record FILE
-# (`~/.pi/agent/reviews/<owner>-<repo>-<PR>.json`, carrying `head_sha` and
-# `verdict`) and a marker line APPENDED to the PR BODY. The body is one
-# `gh pr edit` away from anybody — an unrelated typo fix, a corrected claim, the
-# closing keyword `pipeline-compliance` demands — while the file cannot be edited
-# by the PR at all. Measured 2026-09-18: agent-infra#1209 and premise-labs#3788
-# both went RED on a genuinely reviewed head because the body had been improved
-# after the review. So the RECORD is read first and the BODY is the fallback.
+# THE DEFECT THIS REMOVES FROM THE TRUST PATH. `record-review.sh` mints THREE
+# artifacts for one review and they are NOT interchangeable:
+#   1. the record FILE (`~/.pi/agent/reviews/<owner>-<repo>-<PR>.json`), carrying
+#      `head_sha`, `verdict` and now a `sig` — head-bound, PR-ineditable, and
+#      PER BOX;
+#   2. a signed MARKER LINE appended to the PR BODY;
+#   3. a PR COMMENT carrying that same signed marker line.
+# The body is one `gh pr edit` away from anybody — an unrelated typo fix, a
+# corrected claim, the closing keyword `pipeline-compliance` demands — while the
+# file cannot be edited by the PR at all. Measured 2026-09-18: agent-infra#1209 and
+# premise-labs#3788 both went RED on a genuinely reviewed head because the body had
+# been improved after the review. So the RECORD is read first.
 #
-# ⛔ NEVER THE OTHER WAY ROUND, and never silently: which source answered is
-# PRINTED on every (c) arm (`source=record (…)` / `source=body (…)`), so a
-# reader can tell a green proved by an immutable artifact from one proved by a
-# mutable field — and a red that says BOTH were absent.
+# ⛔ WHY THE COMMENT IS BETWEEN THEM, AND NOT AN OPTIONAL EXTRA. The record store
+# is `$HOME/.pi/agent/reviews` — the required `pipeline-compliance` check runs on a
+# clean `ubuntu-latest` runner, where that directory does not exist, so the record
+# arm can NEVER answer there and the measured red would stay red on the only check
+# that blocks a merge. The comment is the copy that TRAVELS; it is also a WIDER
+# write field than the body (on a public repo any account can comment, where a
+# body edit needs write access), so it carries its own admission rule —
+# author_association ∈ OWNER/MEMBER/COLLABORATOR, plus the marker `sig` wherever a
+# gate key is resolvable on the box (the CI runner passes none, and a sig-only arm
+# there would be inert again). See has_comment_review_record.
+#
+# ⛔ NEVER RE-ORDERED, and never silently: which source answered is PRINTED on
+# every (c) arm (`source=record (…)` / `source=comment (…)` / `source=body (…)`),
+# so a reader can tell a green proved by an immutable artifact from one proved by a
+# mutable field — and a red that reports what each arm actually read.
 #
 # ⛔ THIS MAKES THE BODY AUTHORITATIVE NOWHERE. The fallback keeps every existing
 # binding (PR number, repo, head, #513 tier, #1356 shape) so no in-flight PR
 # loses its only surviving copy, and the tier bindings are applied to the
 # verdict OF THE SOURCE THAT ANSWERED. An in-flight PR whose only record is the
 # body still passes, and still prints `source=body`.
+#
+# ⛔ AND A PRE-#1224 RECORD IS NO LONGER EVIDENCE. The record arm requires a `sig`
+# over the four fields the gate reads (see below), so every record minted before
+# that requirement — including every record already sitting on a box — is refused
+# and the gate falls through to the comment, then the body. That is a behaviour
+# change, not an accident: an unsigned private file nobody can audit is exactly
+# the artifact that was unacceptable. Re-running the producer mints a signed one.
 #
 # ⛔ THE HEAD COMPARISON IS THE WHOLE POINT. A record bound to a different
 # revision is the STALE class: accepting it would certify an unreviewed head, so
@@ -2520,6 +2541,27 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   p1224_comment() { # p1224_comment <author_association> <body> — one comment, production frame
     printf '%s%s%s%s' "$1" "$REVIEW_COMMENTS_ASSOC_SEP" "$2" "$REVIEW_COMMENTS_REC_SEP"
   }
+  # ⛔ AND THE FRAME IS BOUND TO THE EXPRESSION ITSELF, not to a second copy of its
+  # bytes. REVIEW_COMMENTS_JQ spells its two separators as jq escapes, so a change
+  # to the EXPRESSION alone (say 0x1f → 0x7c) would leave the constants — and every
+  # vector built from them — describing a transport the gate no longer has, which
+  # is the P1 the vectors exist to catch, one level up. This runs the PRODUCTION
+  # expression over a synthesized API page and requires its output to be
+  # byte-identical to the frame the fixtures build, so the two definitions cannot
+  # drift silently. jq is a hard dependency of the fetch path (`gh api --jq`), and
+  # a box without it CANNOT verify this: that is reported as a failure, never as
+  # a pass.
+  p1224_frame_is_production() {
+    local body got want
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "no 'jq' on this box, so the comment fixtures were NOT proved identical to REVIEW_COMMENTS_JQ's output — install jq (the fetch path's own dependency) and re-run" >&2
+      return 1
+    fi
+    body="review recorded: reviews/$PR_NUMBER.json verdict=clean @ $FIX_HEAD ($GH_REPO)"
+    got="$(printf '[{"author_association":"OWNER","body":%s}]' "$(printf '%s' "$body" | jq -Rs .)" | jq -r "$REVIEW_COMMENTS_JQ")"
+    want="$(p1224_comment OWNER "$body")"
+    [ "$got" = "$want" ]
+  }
   # p1224_marker <verdict> [<head>] — the producer's SIGNED marker line. Note the
   # signed text: it is the MARKER UP TO ` sig=`, NOT the record's
   # `review-record:v1:` canonical text — that is what record-review.sh signs for
@@ -2572,6 +2614,15 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   else
     echo "  ❌ pass 1224c: the body FALLBACK stopped working (failures=$FAILURES) — every in-flight PR whose only record is the body would be stranded" >&2
     grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/c.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224T (#1224: the comment fixture IS the production fetch expression's output) =="
+  if p1224_frame_is_production; then
+    echo "  ✅ pass 1224T: the fixture's comment frame is BYTE-IDENTICAL to what REVIEW_COMMENTS_JQ emits for a live API page (association 0x1f body 0x1e) — the vectors below cannot drift from the transport they model"
+  else
+    echo "  ❌ pass 1224T: the comment fixtures do NOT describe the production fetch frame — REVIEW_COMMENTS_JQ and the p1224_comment separators have diverged, so every comment vector below grades a transport the gate does not have (#1224 P1, the fixture-bypasses-the-transport class)" >&2
     P1224_FAILS=$((P1224_FAILS + 1))
   fi
 
@@ -4033,13 +4084,13 @@ $big_filler"
   }
   RV1224_RC="$(rv1224_drive "$SELF_SRC" "$RV1224_DIR/real.log")"
   RV1224_BAD=0
-  for RV1224_P in 1224a 1224b 1224c 1224d 1224e 1224f 1224g 1224h 1224i 1224j; do
+  for RV1224_P in 1224T 1224a 1224b 1224c 1224d 1224e 1224f 1224g 1224h 1224i 1224j; do
     grep -q "✅ pass $RV1224_P" "$RV1224_DIR/real.log" || RV1224_BAD=$((RV1224_BAD + 1))
   done
   if [[ "$RV1224_RC" == "1" && "$RV1224_BAD" == "0" ]]; then
-    printf '✅ #1224: the REAL gate resolves check (c) from the head-bound SIGNED record FIRST — 1224a passes with the body attestation WIPED (source=record), 1224b REFUSES a record bound to another head naming both shas, 1224c still accepts the body fallback, 1224d accepts the producer marker COMMENT, signed, inside the fetch frame (association + 0x1e) on a box with NO record store (the CI runner, finding 2), 1224e REFUSES an unverifiable sig as not-evidence (finding 3), 1224f reports a present-but-unusable record as UNUSABLE rather than absent (finding 4), 1224g REFUSES an UNSIGNED marker comment, 1224h REFUSES a marker comment from an author GitHub does not attest as OWNER/MEMBER/COLLABORATOR, 1224i reads the verdict from the matched LINE rather than from a stale clean-micro elsewhere in the stream, and 1224j admits a trusted-author marker where NO gate key exists (the required check runner) while saying so\n'
+    printf '✅ #1224: the REAL gate resolves check (c) from the head-bound SIGNED record FIRST — 1224T proves the comment fixtures are BYTE-IDENTICAL to the production fetch expression REVIEW_COMMENTS_JQ emits, 1224a passes with the body attestation WIPED (source=record), 1224b REFUSES a record bound to another head naming both shas, 1224c still accepts the body fallback, 1224d accepts the producer marker COMMENT, signed, inside the fetch frame (association + 0x1e) on a box with NO record store (the CI runner, finding 2), 1224e REFUSES an unverifiable sig as not-evidence (finding 3), 1224f reports a present-but-unusable record as UNUSABLE rather than absent (finding 4), 1224g REFUSES an UNSIGNED marker comment, 1224h REFUSES a marker comment from an author GitHub does not attest as OWNER/MEMBER/COLLABORATOR, 1224i reads the verdict from the matched LINE rather than from a stale clean-micro elsewhere in the stream, and 1224j admits a trusted-author marker where NO gate key exists (the required check runner) while saying so\n'
   else
-    printf '❌ #1224: the record-first read is unpinned or wrong (rc=%s, %s of 10 vectors not green) — check (c) still depends on the mutable PR body alone\n' "$RV1224_RC" "$RV1224_BAD" >&2
+    printf '❌ #1224: the record-first read is unpinned or wrong (rc=%s, %s of 11 vectors not green) — check (c) still depends on the mutable PR body alone\n' "$RV1224_RC" "$RV1224_BAD" >&2
     grep -E 'pass 1224|❌ \[c\]' "$RV1224_DIR/real.log" >&2 || true
     selffail=$((selffail + 1))
   fi
