@@ -124,6 +124,10 @@ GOOD_PY="$(type -P python3.12 2>/dev/null)" || GOOD_PY=""
 if [ -z "$GOOD_PY" ]; then GOOD_PY="$(type -P python3 2>/dev/null)" || GOOD_PY=""; fi
 mkdir -p "$T/home/.pi/agent/state" "$T/sysd" "$T/agents" "$T/bin"
 ARM="$T/home/.pi/agent/state/runner-autoscale.armed"
+# ⛔ THE CROSS-SCOPE SCAN LIST IS PINNED TO A FIXTURE, so no case can read the host's real unit dirs. A
+# box that happens to carry a system-scope install would otherwise add a note to every user-target run,
+# and the suite's verdict would depend on what the machine running it has installed.
+mkdir -p "$T/scopes"
 
 # ENVV carries per-case ENVIRONMENT OVERRIDES (assignments only). They come AFTER the defaults, and
 # env applies later assignments last, so an override wins. Kept as a variable rather than inline
@@ -151,6 +155,7 @@ run_install() {
         RUNNER_AUTOSCALE_REPO="o/r" \
         ELDATO_PLATFORM="$plat" \
         SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" \
+        RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes" \
         ${dirmap[@]+"${dirmap[@]}"} ${ENVV[@]+"${ENVV[@]}"} \
         bash ./install-runner-autoscale-timer.sh "$@" 2>&1
 }
@@ -838,6 +843,68 @@ assert_contains "$OUT" "STARVATION" "launchd names starvation too"
 ENVV=(SHIM_LAST_EXIT=0)
 OUT="$(run_install Darwin "$D" --status)"; RC=$?; ENVV=()
 assert_eq "$RC" 0 "launchd control: last_exit=0 is green"
+
+# ── T34: an interpreter that EXISTS but is too OLD is still not a usable schedule ────────
+# The pass refuses itself below 3.12 (`raise SystemExit(2)`), and the install path refuses such an
+# interpreter — but `--status` checked only presence and executability, so the readiness verb was green
+# over a schedule that exits 2 on every tick. The realistic trigger is not exotic: the installer pins an
+# ABSOLUTE path and the resolver's own candidate list includes a per-lane venv, so a venv recreated on an
+# older interpreter is exactly how the version changes under a unit that never moved.
+say_case "T34 --status reds an interpreter that is present but older than 3.12"
+D="$T/c34"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: the freshly installed artifact's interpreter is green"
+printf '#!/usr/bin/env bash\ncase "$1" in -c) echo 3.11 ;; *) exit 0 ;; esac\n' >"$T/bin/oldpy"
+chmod +x "$T/bin/oldpy"
+sed -i "s|^ExecStart=\"[^\"]*\"|ExecStart=\"$T/bin/oldpy\"|" "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an old-but-present interpreter is NOT a green schedule"
+assert_contains "$OUT" "python_present=yes" "it is present — that is the whole point"
+assert_contains "$OUT" "python_usable=no" "and is reported unusable"
+assert_contains "$OUT" "3.11" "naming the version it read"
+assert_contains "$OUT" "TOO OLD" "naming the consequence, not just the version"
+
+# ── T35: `--status` is the FIFTH reader, and it must carry the root guard too ────────────
+# Under `sudo` HOME resolves to /root, so the ARMING RECORD and the pass's LAST-TICK log are read from
+# /root's state dir while the ARTIFACT (absolute paths) is the user's — an armed and ticking box reported
+# `mode=converge (ARMED)` beside `arm_record=absent (/root/…)` and `last_tick=none`. The guard's own
+# message already names that consequence; the four writers called it and this verb did not.
+say_case "T35 --status is refused under a sudo-invoked root run, like every writer"
+assert_file "$T/bin/id" "precondition: T20's root-identity shim exists"
+ENVV=(PATH="$T/bin:$PATH" SUDO_USER=cmux)
+OUT="$(run_install Linux "$D" --status)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "--status does not answer from /root's state dir"
+assert_contains "$OUT" "REFUSING to run as root" "and says why, like the writers do"
+
+# ── T36: a SECOND scope is a SECOND schedule — the writers must say so ───────────────────
+# The mutual exclusion the service template relies on ("systemd will not start a second instance of an
+# active oneshot") is PER-UNIT, not per-account: a user-scope copy plus a system-scope copy are two
+# different units, so two passes race to restart and add the same runners. `--uninstall` has always
+# scanned for that; the WRITERS did not, and the second install is reachable whenever sudo availability
+# changes between invocations.
+say_case "T36 --install and --arm report a unit pair already installed in ANOTHER scope"
+mkdir -p "$T/scopes/other"; printf 'placeholder\n' >"$T/scopes/other/$UNIT_NAME.service"
+envv_user_scope() { ENVV=(SUDO=false PATH="$T/bin:$PATH" RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes/other"); }
+rm -rf "$T/home/.config"; rm -f "$ARM"
+ENVV=(SUDO=false PATH="$T/bin:$PATH")            # control: the pinned-empty $T/scopes reports nothing
+OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "control: no note when no other scope carries the unit"
+assert_not_contains "$OUT" "ALSO installed in" "and the control is silent"
+rm -rf "$T/home/.config"; rm -f "$ARM"
+envv_user_scope
+OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a second source of schedule is reported, not fatal"
+assert_contains "$OUT" "ALSO installed in" "the note names the other scope"
+assert_contains "$OUT" "another scope" "and says what it is"
+assert_contains "$OUT" "$T/scopes/other" "naming the directory an operator has to look at"
+# ⛔ `--arm` writes the other half of the same decision, so it is scanned too.
+envv_user_scope
+OUT="$(run_install Linux - --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "--arm succeeds (the note is not a refusal)"
+assert_contains "$OUT" "ALSO installed in" "and --arm also reports the other scope"
+rm -rf "$T/scopes/other"
+rm -f "$ARM"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
