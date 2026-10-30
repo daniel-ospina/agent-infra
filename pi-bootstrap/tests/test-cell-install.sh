@@ -577,7 +577,8 @@ fi
 # what proves the refusal happened AT the spawn point instead of before the gate ever ran.
 # ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER (#2387), and it is NOT optional here. The
 # installed shim checks MEMORY before load, so on a box whose MemAvailable is under the shipped 2048
-# floor this arm was decided by the memory gate (rc=72) and the suite reported its own subject — the
+# floor this arm was decided by the memory gate (rc=82, the spawn point's PI_GATE_MEM_REFUSED) and the
+# suite reported its own subject — the
 # LOAD ceiling — as broken. Both arms pin the lever they are about; the refusal arm asserts the exit
 # code, so a memory refusal can never satisfy the load assertion again.
 mkdir -p "$TMP/gate-real" "$TMP/gate-home"

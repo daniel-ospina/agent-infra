@@ -1714,7 +1714,7 @@ cell_preflight_path() {
 #
 # Gated: a refusal does not start the agent at all, and run_agent returns THAT gate's code —
 # AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting),
-# AGENT_MEM_REFUSED (73, evaluated SECOND: a box at its memory floor loses lanes to the OOM killer,
+# AGENT_MEM_REFUSED (81, evaluated SECOND: a box at its memory floor loses lanes to the OOM killer,
 # and unlike a load refusal the consequence is not slowness but a dead batch — agent-infra#2387),
 # AGENT_LOAD_REFUSED (75, which clears when the box quietens), or AGENT_LAND_BACKLOG (74, the creation
 # back-pressure gate: the repo's open-PR count is over its own measured landing ceiling, which clears
@@ -2440,7 +2440,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # arm: the two shim codes say two different things, and collapsing them would report a load
   # refusal for a box whose load is fine — sending the operator to watch a number that will never
   # move while lanes keep dying. The message does NOT assert why the shim refused (it cannot know
-  # that a `pi` exiting 72 for its own reason did not do so); it points at the [pi-gate] line, which
+  # that a `pi` exiting 82 for its own reason did not do so); it points at the [pi-gate] line, which
   # carries the reading and the arithmetic, and it names the remedy the code selects.
   if [ "$rc" = "$PI_GATE_MEM_REFUSED" ]; then
     AGENT_STARTED=0
