@@ -932,6 +932,79 @@ grep -q 'no pid this lane can prove dead' "$RO/logs/fix-7.log"; rc=$?
 ck "...and says WHICH fact was missing, instead of reporting a stale owner it never measured" $rc
 rm -f "$PRLOCK7"
 
+# ⛔ THE OTHER HALF OF THE SAME STATE, AND THE WHOLE POINT OF #3096: an EMPTY record that has OUTLIVED a
+# claim's create window is ABANDONED, not live. Without the arm below, the "empty ⇒ LIVE" control just
+# above is satisfied by a fixer that can NEVER resolve the state and defers forever — which is the drain
+# stall itself, measured 2026-10-30: 4 of cell-1's 5 records and 4 of cell-4's 8 were 0-byte, unheld and
+# 1278-2314 MINUTES old; every fixer bailed on them, `orch-loop.sh` REFUNDED each attempt, so no PR was
+# ever parked, the un-owned count never fell, and `merge-priority` held the ISSUE path shut. AGE is the
+# measurement that separates "a lander mid-claim" (microseconds) from "a claim nothing can ever clear".
+# Backdated with a fixed `touch -t`: `date -v` is BSD-only and `date -d` is GNU-only, so neither belongs
+# in a test that must run on both the Linux runner and the macOS harness hosts.
+: > "$PRLOCK7"; touch -t 202001010000 "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc5=$?
+{ [ "$plrc5" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
+ck "an ORPHANED (0-byte, hours-old) claim is RECLAIMED, not deferred: the fixer runs holding it (rc=$plrc5)" $rc
+grep -q 'RECLAIMED an ORPHANED claim' "$RO/logs/fix-7.log"; rc=$?
+ck "...and the log NAMES the state it reclaimed, so a takeover is not reported as a normal acquisition" $rc
+grep -qF "was older than 2m" "$RO/logs/fix-7.log"; rc=$?
+ck "...and names the AGE it measured, which is what separates it from a lander mid-claim" $rc
+{ ! grep -q 'DEFERRED' "$RO/logs/fix-7.log" && [ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; }; rc=$?
+ck "...and it is NOT a deferral — no bail marker, so the controller does not refund an attempt that did run" $rc
+{ [ ! -f "$PRLOCK7" ] && [ -z "$(ls "$PRLOCK7".reclaim.* 2>/dev/null)" ]; }; rc=$?
+ck "...and neither the claim nor the detached orphan is left behind" $rc
+
+# ⛔ AND THE ARM AND THE TAKEOVER MUST AGREE ON WHAT "NO OWNER" MEANS — the defect this suite found in
+# the first cut of #3096. The arm accepted `whitespace` and `0` as "nothing was ever written", but the
+# takeover compared the detached body to the EMPTY string, so for those two bodies it concluded a peer
+# must have claimed the lock in between: rc=2 + a WARNING that a live peer's claim was "DETACHED and
+# could NOT be restored", for a displacement that never happened. Both are driven here, because a
+# predicate used in one place only relocates the same false report.
+for body in 'blank' 'zero'; do
+  case "$body" in
+    blank) printf '   \n' > "$PRLOCK7" ;;
+    zero)  printf '0\n' > "$PRLOCK7" ;;
+  esac
+  touch -t 202001010000 "$PRLOCK7"
+  fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+      PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc6=$?
+  { [ "$plrc6" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q 'RECLAIMED an ORPHANED claim' "$RO/logs/fix-7.log"; }; rc=$?
+  ck "a $body old record is the SAME abandoned class and is RECLAIMED (rc=$plrc6, the fixer ran)" $rc
+  { ! grep -q 'could NOT be restored' "$RO/logs/fix-7.log" && ! grep -q 'DISPLACED AND COULD NOT BE RESTORED' "$RO/logs/fix-7.log" && ! grep -q 'LOST a race with a peer' "$RO/logs/fix-7.log"; }; rc=$?
+  ck "...and reports NO race lost and NO displaced peer for a $body record — the two false reports the first cut produced (a peer that never existed)" $rc
+  rm -f "$PRLOCK7"
+done
+
+# ⛔ THE CLASS IS NOT "UNPARSEABLE" — it is "nothing was ever written", and the boundary is load-bearing.
+# A non-numeric body is a DIFFERENT defect (a truncated or corrupted write) and reclaiming it on content
+# alone would be an inference, not a measurement. It must therefore stay out of the arm entirely: treated
+# as LIVE, deferred refundably, and left exactly as found.
+printf 'garbage\n' > "$PRLOCK7"; touch -t 202001010000 "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc7=$?
+{ [ "$plrc7" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an old NON-NUMERIC record is NOT reclaimed (rc=$plrc7, no agent) — 'garbage' is a different defect, not an absent owner" $rc
+[ "$(command cat "$PRLOCK7" 2>/dev/null)" = "garbage" ]; rc=$?
+ck "...and it is left EXACTLY as found, so the defect stays visible instead of being overwritten" $rc
+rm -f "$PRLOCK7"
+
+# ⛔ AND AN UNREADABLE RECORD IS NOT AN EMPTY ONE: this arm is the only path that reclaims on CONTENT
+# alone, so "cannot read it" must resolve to NOT-abandoned. (Skipped as root, where the permission bit
+# cannot make a file unreadable — an arm that cannot fail is not evidence.)
+if [ "$(id -u 2>/dev/null || echo 0)" != "0" ]; then
+  printf '1234\n' > "$PRLOCK7"; chmod 000 "$PRLOCK7"; touch -t 202001010000 "$PRLOCK7"
+  fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+      PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc8=$?
+  { [ "$plrc8" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ -e "$PRLOCK7" ]; }; rc=$?
+  ck "an UNREADABLE record is never reclaimed as abandoned (no agent ran, the record survives)" $rc
+  chmod 644 "$PRLOCK7" 2>/dev/null; rm -f "$PRLOCK7"
+fi
+
 # ⛔ AND A LOCK STATE NO RE-DISPATCH CAN CLEAR IS NOT REFUNDED (review of PR #2576, cycle 2 — P2). A
 # `mergeclaim-<PR>.lock` that is a DIRECTORY can never be read as an owner and never be taken; if the
 # refusal were refundable, spawn -> defer -> refund would spin for ever with `fixcount` netting to
