@@ -502,7 +502,7 @@ OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
   # removes the fixture but cannot kill this child, so an interrupted run used to leave a `sleep 300`
   # running well past the suite. Reaped on EVERY exit path of this subshell, and the child is bounded
   # (60 s) so an interrupt costs at most a minute. #3095 review P2.
-  trap 'kill "$_pid" 2>/dev/null' EXIT
+  trap 'kill "$_pid" 2>/dev/null || true' EXIT
   printf '%s\n' "$_pid" > "$OL/state/mergeclaim-4242.lock"
   if pr_owner_live 4242 "$H" fix/thing; then echo 'LIVE=owned'; else echo 'LIVE=not-owned'; fi
   kill "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null
@@ -513,9 +513,23 @@ OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
 ) > "$OL/out" 2>&1
 case "$(cat "$OL/out")" in
   *'ARM1=wrong-args'*) bad "(2b) the shipped predicate called arm 1 with the WRONG arguments: $(tr '\n' ' ' < "$OL/out")" ;;
-  *'ARM1_CALLS=2'*) ok "(2b) arm 1 is asked twice with the shipped argument order (pr, head, and a NON-EMPTY branch — stubbed out, but not argument-blind)" ;;
-  *) bad "(2b) arm 1 was asked $(sed -n 's/.*ARM1_CALLS=//p' "$OL/out" | head -1) time(s), not 2 — `pr_owner_live` dropped or reordered the arm-1 call, and a stub that is never called proves nothing: $(tr '\n' ' ' < "$OL/out")" ;;
 esac
+# ⛔ COMPARE THE COUNT FOR EQUALITY, NOT AS A GLOB PREFIX (#3095 review, cycle 3). A `case` pattern
+# `*'ARM1_CALLS=2'*` is an UNANCHORED substring match, so a predicate that called arm 1 twenty times
+# printed `ARM1_CALLS=20`, satisfied it, and left this ✅ standing — the arm grading "asked twice"
+# about a stub asked twenty times. Measured: 20 passed, 4 and 12 went red. Extraction + string
+# equality has no such band.
+_a1_seen="$(sed -n 's/.*ARM1_CALLS=//p' "$OL/out" | head -1)"
+_a1_seen="${_a1_seen//[!0-9]/}"
+if [ "$_a1_seen" = "2" ]; then
+  ok "(2b) arm 1 is asked EXACTLY twice with the shipped argument order (pr, head, and a NON-EMPTY branch — stubbed out, but not argument-blind)"
+else
+  # ⛔ NO BACKTICKS in this string: inside double quotes they are COMMAND SUBSTITUTION, so
+  # `` `pr_owner_live` `` executed the predicate here, printed `command not found` on the shard's
+  # stderr and left the message with a hole where the name should be — in the one red this arm exists
+  # to produce. Escaped, as every other `ok`/`bad` span in this file is.
+  bad "(2b) arm 1 was asked ${_a1_seen:-0} time(s), not 2 — \`pr_owner_live\` dropped or reordered the arm-1 call, and a stub that is never called proves nothing: $(tr '\n' ' ' < "$OL/out")"
+fi
 case "$(cat "$OL/out")" in
   *'LIVE=owned'*) ok "(2b) a REAL live worker holding the PR's lock reads OWNED — a red-fixer sees the fixer that is actually running" ;;
   *) bad "(2b) the shipped guard did not see a real live pid on the lock: $(tr '\n' ' ' < "$OL/out")" ;;
