@@ -1228,11 +1228,12 @@ rm -f "$ARM"
 # layers — the XML-entity escape PLUS the sed-replacement escape — and the XML half is correct only
 # where the value lands in an XML text node, i.e. the plist. On the systemd arm it wrote the ENTITY
 # into the unit: `HOME=/home/a&b` rendered `Environment=HOME=/home/a&amp;b`, a path the installer never
-# resolved. Nothing downstream could see it — `refuse_unusable_target` refuses only a backslash,
-# `refuse_systemd_unsafe_values` refuses only whitespace and `%`, and both renders of one value produce
-# the same entity, so the drift `cmp` and `--status` both report `drift_artifact=no` while every tick
-# resolves a directory that does not exist (the pass does not complete, and the schedule is installed,
-# enabled and listed). The escape is chosen per ARM now (`repl_for`), which also makes the placeholder
+# resolved. How that surfaced depended on the placeholder — a value reaching `ExecStart=` (SCRIPT,
+# PYTHON) made `verify_installed_unit` REFUSE the install (loud, but a false block: measured, pre-fix
+# this case's install assertion fails because the install exits 1), while a value reaching only
+# `Environment=` is compared by nothing, so the unit installed, enabled and listed. This fixture folds
+# the metacharacter into HOME *and* SCRIPT, which is why it exercises the REFUSED arm; T49 is the
+# reader-side case. The escape is chosen per ARM now (`repl_for`), which also makes the placeholder
 # family agree with the COMPOSED `{{PROVISIONER_ENV}}` family — that one has always been sed-only on
 # systemd, and T31 pins it.
 say_case "T48 an '&' and a '<' are LITERAL in the systemd unit and escaped in the plist"
@@ -1256,6 +1257,48 @@ OUT="$(run_install Darwin "$D2" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 0 "the launchd arm installs the same path"
 assert_contains "$(cat "$D2/$LABEL.plist" 2>/dev/null || true)" "&amp;" "the plist is XML, so it still entity-escapes the '&'"
 assert_eq "$(plist_env "$D2/$LABEL.plist" HOME)" "$AMPC" "and the PARSED value is the real path (the entity round-trips)"
+
+# ── T49: the readiness verb refuses what the writers refuse to create ────────────────────
+# `is_transient_scratch` was reachable only from the three WRITING verbs, so an artifact whose declared
+# paths sit in a mktemp tree was refused by `--install`/`--arm` and then CERTIFIED by `--status`. Worse
+# than a missing check: the drift render is fed the ARTIFACT's own values, so it compares the file to a
+# render of ITSELF, reports `drift_artifact=no`, and exits 0 — green over a unit that exits 127 on every
+# tick the moment that tree is removed, i.e. exactly during the window an operator is looking at it.
+# Measured before this case: the writer exits 1 ("REFUSING … transient scratch space") on the same paths
+# the reader called clean. The writers refuse to CREATE this artifact, so a hand-edited, foreign or
+# pre-fix one is how the state is reached — which is when a readiness gate earns its keep.
+say_case "T49 --status refuses to certify an artifact pointing into transient scratch space"
+SCRATCH="/tmp/tmp.ra-status.$$"
+D="$T/c49"; fresh "$D"; rm -f "$ARM"
+OUT="$(run_install Linux "$D" --install)"; RC=$?
+assert_eq "$RC" 0 "precondition: the artifact installs"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: the untouched artifact is green (the gate is discriminating)"
+box_sed_i "s|^Environment=HOME=.*|Environment=HOME=$SCRATCH|" "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "an artifact in transient scratch is NOT certified green"
+assert_contains "$OUT" "TRANSIENT SCRATCH" "the refusal names what it found"
+assert_contains "$OUT" "127" "and the measured consequence every tick"
+assert_contains "$OUT" "REFUSE TO CREATE" "pointing at the writers, which already refuse this state"
+
+# ── T50: the launchd cadence is READ BACK, not restated from the constant ────────────────
+# The status arm printed `cadence=StartInterval=$INTERVAL_SEC` — the value this installer WOULD write —
+# and derived `next_run=… fires every ${INTERVAL_SEC}s` from the same constant. On a box whose plist
+# carries a hand-edited or foreign interval the readiness gate therefore printed a cadence the artifact
+# contradicts, in the same output that flagged `drift_artifact=yes`, and exited 0. The systemd arm has
+# never had this defect: its `next_run` comes from `list-timers`, an authoritative read.
+say_case "T50 --status reports the StartInterval the plist DECLARES, not the one it would write"
+D="$T/c50"; fresh "$D"; rm -f "$ARM"
+run_install Darwin "$D" --install >/dev/null 2>&1
+OUT="$(run_install Darwin "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "control: the untouched plist is green"
+assert_contains "$OUT" "cadence=StartInterval=540" "control: and reports the installed cadence"
+box_sed_i 's|<integer>540</integer>|<integer>3600</integer>|' "$D/$LABEL.plist"
+OUT="$(run_install Darwin "$D" --status)"; RC=$?
+assert_contains "$OUT" "cadence=StartInterval=3600" "an hourly plist is reported as hourly, not as the constant"
+assert_absent "$OUT" "cadence=StartInterval=540" "the constant is not restated over the artifact"
+assert_contains "$OUT" "fires every 3600s" "and next_run's parenthetical is derived from the same read"
+assert_contains "$OUT" "drift_artifact=yes" "the drift verdict independently flags the same edit"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

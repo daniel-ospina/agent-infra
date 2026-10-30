@@ -250,11 +250,19 @@ xml_escape_only() {
 # placeholder on BOTH arms. The sed half is required on both (the value lands in a `s|…|…|`
 # replacement); the XML half is correct only where the value lands in an XML text node, i.e. the plist.
 # On the systemd arm it wrote the ENTITY into the unit — `HOME=/home/a&b` rendered
-# `Environment=HOME=/home/a&amp;b` — a path that is not the one the installer resolved, and nothing
-# downstream could see it: `refuse_unusable_target` refuses only a backslash,
-# `refuse_systemd_unsafe_values` refuses only whitespace and `%`, and BOTH renders of one value produce
-# the same entity, so the drift `cmp` and `--status` report `drift_artifact=no` while every tick points
-# at a directory that does not exist. The asymmetry is the fix and is asserted in both directions (T48):
+# `Environment=HOME=/home/a&amp;b` — a path that is not the one the installer resolved. How that
+# surfaced depended on the placeholder, and the two consequences are different:
+#   * a value that reaches `ExecStart=` (SCRIPT, PYTHON) made `verify_installed_unit` compare the
+#     rendered command against the real `$SCRIPT` and REFUSE the install — loud, but a false block: a
+#     box whose genuine path contains `&` simply could not be installed.
+#   * a value that reaches only `Environment=` (PATH, RUNNER_AUTOSCALE_STATE_DIR, and HOME when the
+#     checkout lives elsewhere) is compared by NOTHING: `refuse_unusable_target` refuses only a
+#     backslash, `refuse_systemd_unsafe_values` refuses only whitespace and `%`, and the drift render
+#     is fed the artifact's OWN declared values, so `--status` compares the file to a render of itself
+#     and reports `drift_artifact=no`. The unit installs, enables and is listed while the pass is
+#     handed a state dir that is not the resolved one — its log and arming record land elsewhere and
+#     `--status`, reading the REAL state dir, reports `last_tick=none`.
+# The asymmetry is the fix and is asserted in both directions (T48):
 # the systemd arm renders the literal value, the plist still entity-escapes it (a raw `&` there is a
 # malformed XML document launchd refuses). This also makes the PLACEHOLDER family agree with the
 # COMPOSED `{{PROVISIONER_ENV}}` family, which has always been sed-only on systemd (T31 pins it).
@@ -970,6 +978,26 @@ with open(sys.argv[1],"rb") as fh:
         | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*=[[:space:]]*//p'
 }
 
+# plist_start_interval — the CADENCE THE PLIST ACTUALLY DECLARES.
+# ⛔ `StartInterval` IS WHERE THE LAUNCHD CADENCE LIVES, so it has to be READ BACK, not restated. The
+# status arm printed `cadence=StartInterval=$INTERVAL_SEC` — the value this installer WOULD write — and
+# derived `next_run=… fires every ${INTERVAL_SEC}s` from the same constant. On a box whose plist had a
+# hand-edited or foreign interval (measured: `540` edited to `3600`) the readiness gate printed
+# `cadence=StartInterval=540` over an hourly job, in the same output that flagged `drift_artifact=yes`,
+# and exited 0. The systemd arm has never had this defect — its `next_run` comes from `list-timers`.
+# Same class as T37/T39 ("the timer is where the cadence lives"): report the artifact, not the intent.
+plist_start_interval() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import plistlib,sys
+with open(sys.argv[1],"rb") as fh:
+    v = plistlib.load(fh).get("StartInterval")
+print(v if isinstance(v,(int,float)) else "")' "$f" 2>/dev/null && return 0
+    fi
+    /usr/libexec/PlistBuddy -c 'Print :StartInterval' "$f" 2>/dev/null
+}
+
 # ⛔ LINE MATCHING WITHOUT A PIPELINE, BECAUSE THE PIPELINE FORM IS A FALSE-BLOCK FACTORY.
 # `printf '%s\n' "$args" | grep -Fxq "$x"` looks safe and is not: `grep -q` exits on the FIRST match and
 # closes the pipe, the writer dies of SIGPIPE (141), and `set -o pipefail` (line 115) promotes that 141
@@ -1544,6 +1572,33 @@ sha_of() { # sha_of <file> — portable digest
     else return 1; fi
 }
 
+# refuse_transient_installed_artifact <artifact> — the readiness verb's half of the scratch gate.
+# ⛔ `is_transient_scratch` is reachable only from the three WRITING verbs (via `refuse_unusable_target`),
+# so an artifact whose declared paths sit in a mktemp tree was refused by `--install`/`--arm` and then
+# CERTIFIED by `--status`: the drift render is fed the ARTIFACT's own values, so it compares the file to a
+# render of itself, reports `drift_artifact=no`, and exits 0 — green over a unit that exits 127 on every
+# tick the moment that tree is removed, i.e. exactly during the window an operator is looking at it.
+# Measured: the writer exits 1 with "REFUSING … transient scratch space" on the same paths the reader
+# called clean. This is the one-fact-two-readers split T29-T36 closed for `enabled`, `linger`, the
+# provisioner pin, `python_ok` and the root guard, so both verbs consult ONE predicate. The writers
+# refuse to CREATE this artifact; a hand-edited, foreign or pre-fix one is how the state is actually
+# reached, which is when a readiness gate earns its keep.
+refuse_transient_installed_artifact() { # rc belongs to the CALLER: return 1 and let it set rc
+    local art="$1" bad="" v
+    for v in "SCRIPT=${installed_script:-}" \
+             "HOME=$(artifact_env_value "$art" HOME)" \
+             "STATE_DIR=$(artifact_env_value "$art" RUNNER_AUTOSCALE_STATE_DIR)" \
+             "PROVISIONER=$(artifact_env_value "$art" RUNNER_AUTOSCALE_PROVISIONER)"; do
+        is_transient_scratch "${v#*=}" && bad="${bad:+$bad; }$v"
+    done
+    [ -n "$bad" ] || return 0
+    err "the installed artifact points into TRANSIENT SCRATCH SPACE: $bad"
+    err "That tree is removed before the first tick, so every pass exits 127 while the scheduler lists the"
+    err "job as scheduled — the inert-enforcer shape the writing verbs REFUSE TO CREATE. Re-install from"
+    err "the box's real HOME (a login shell or cloud-cell-bringup.sh)."
+    return 1
+}
+
 do_status() {
     local installed_mode installed_script drift_artifact enabled active next last linger
     local installed_args installed_rest installed_kind installed_dropins installed_timer_dropins installed_exec_count
@@ -1743,6 +1798,18 @@ do_status() {
         err "the artifact names ${installed_script:-an unreadable script} which is absent or unreadable — every tick would fail to start (the scheduler still lists it as scheduled)"
         rc=1
     fi
+    # ⛔ THE READINESS VERB IS THE OTHER HALF OF THE SCRATCH GATE. `is_transient_scratch` (and the
+    # refusal it drives, `refuse_unusable_target`) is reachable only from the three WRITING verbs, so an
+    # artifact whose declared paths sit in a mktemp tree was refused by `--install`/`--arm` and then
+    # CERTIFIED by `--status`: the drift render is fed the ARTIFACT's own values, so it compares the file
+    # to a render of itself, reports `drift_artifact=no`, and exits 0 — green over a unit that exits 127
+    # on every tick the moment that tree is removed, i.e. exactly during the window an operator is
+    # looking at it. Measured: the writer exits 1 with "REFUSING … transient scratch space" on the same
+    # paths the reader called clean. This is the same one-fact-two-readers split T29-T36 closed for
+    # `enabled`, `linger`, the provisioner pin, `python_ok` and the root guard, so both verbs consult ONE
+    # predicate. The writers refuse to CREATE this artifact; a hand-edited, foreign or pre-fix one is how
+    # the state is actually reached, which is when a readiness gate earns its keep.
+    refuse_transient_installed_artifact "$installed_path" || rc=1
     # ── drift, both directions, REPORTED (issue #2403 clause 5) ──────────────────────────────
     # artifact drift: the installed file is not what THIS installer would write (a changed interval, repo
     # or mode, or a hand-edit). Not fatal: it is information, and the next `--install` converges it.
@@ -1891,8 +1958,11 @@ do_status() {
                 *) err "the last pass exited $last — the converger is not completing; see $(last_tick_line "$STATE_DIR/runner-autoscale.log")"; rc=1 ;;
             esac
             log_line "pid=$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $1; exit}' | sed 's/^-$/not-running/')"
-            log_line "cadence=StartInterval=$INTERVAL_SEC"
-            log_line "next_run=not reported by launchd (fires every ${INTERVAL_SEC}s from load)"
+            # ⛔ READ BACK FROM THE PLIST, NEVER RESTATED FROM `$INTERVAL_SEC`. See plist_start_interval.
+            local d_interval
+            d_interval="$(plist_start_interval "$installed_path")"
+            log_line "cadence=StartInterval=${d_interval:-unknown}"
+            log_line "next_run=not reported by launchd (fires every ${d_interval:-unknown}s from load)"
         else
             log_line "loaded=no"
             err "the agent is NOT loaded — the artifact is on disk but nothing fires it"
