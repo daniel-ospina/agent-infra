@@ -109,13 +109,30 @@ fi
 # exists to hold. It is not cosmetic: under `PL_MOD=1` the inline arm 3 (`claim_live`) treats a pid-less
 # lock as free where the shipped arm 3 (`pl_verdict`) treats it as OWNED, so the un-caught replacement
 # spawns a second worker onto a live claim — the two-lanes-one-branch direction this file exists to red.
-asks_shipped_guard() { sed 's/#.*//' "$1" | grep -qE '(^|[[:space:];])pr_owner_live[[:space:]]+"\$PR"'; }
+# ⛔ AND IT PINS THE CALL, NOT A SPELLING (#3095 review, cycle 2). The discriminating signal is WHICH
+# COMMAND the block calls. `"$PR"`, `"${PR}"` and `$PR` are the same value with no word-splitting
+# difference, so a matcher that insists on `"$PR"` reds a behaviourally-identical edit — measured on a
+# scratch checkout: normalising the production call to `pr_owner_live "${PR}" "$HEAD_N"` (the
+# shellcheck spelling) turned this shard RED and reported that the guard had been "replaced", which was
+# untrue and sent the reader looking for a regression that did not exist. The brace/quote forms are
+# therefore all accepted, and the arm below proves the tolerance did not turn the matcher into a
+# prose test (the comment-only fixture still does not satisfy it).
+asks_shipped_guard() { sed 's/#.*//' "$1" | grep -qE '(^|[[:space:];])pr_owner_live[[:space:]]+"?\$\{?PR\}?"?'; }
 printf '%s\n' 'elif x; then :; fi  # was pr_owner_live "$PR" "$HEAD_N" "${BR:-}"' > "$TMP/guard-comment-only.sh"
+# The SAME call, spelled three behaviourally-identical ways — each must satisfy the arm, or the arm is
+# asserting a spelling rather than "does the block ask the shipped guard?".
+printf '%s\n' 'elif pr_owner_live "${PR}" "$HEAD_N" "${BR:-}"; then' > "$TMP/guard-braced.sh"
+printf '%s\n' 'elif pr_owner_live "$PR" "$HEAD_N" "${BR:-}"; then'   > "$TMP/guard-plain.sh"
 if asks_shipped_guard "$TMP/redfix.sh"; then
   ok "the router still asks the SHIPPED ownership guard (no inline re-implementation of 'who owns this PR')"
 else
   bad "the [redfix] block no longer calls pr_owner_live — its ownership guard was replaced, not driven"
 fi
+for _g in "$TMP/guard-plain.sh" "$TMP/guard-braced.sh"; do
+  asks_shipped_guard "$_g" \
+    && ok "...and it grades the CALL: the equivalent spelling in $(basename "$_g") is accepted (no false red on a correct edit)" \
+    || bad "the 'still asks' arm pins a SPELLING: $(cat "$_g") is the same call and it was graded as a replaced guard"
+done
 asks_shipped_guard "$TMP/guard-comment-only.sh" \
   && bad "the 'still asks' arm is a PROSE test — a COMMENT mentioning pr_owner_live \"\$PR\" satisfies it (the #3095 review P1 false PASS)" \
   || ok "...and that arm is not a prose test: a comment-only mention of pr_owner_live is NOT a call"
@@ -295,16 +312,32 @@ drive_route() {
     # is the SHIPPED predicate (extracted at the top of this file) and it reads three facts:
     #   arm 1 `pr_owned`  — a live process whose cwd is in the PR's checkout, a cmdline-BOUND lock, or
     #                       a live FOREIGN lease. Not reproducible in a temp fixture (it scans the
-    #                       process table and the worktree), so it is stubbed at `PR_OWNED` here and
-    #                       driven FOR REAL — against real processes and real lock files — by
-    #                       pr-owner-liveness.test.sh and by the (2b) arm below.
+    #                       process table and the worktree), so it is stubbed at `PR_OWNED` here. The
+    #                       REAL drive of this arm is `live-ownership.test.sh`, which extracts the
+    #                       SHIPPED `pr_owned` and calls it against a live process, a foreign live
+    #                       lease and another head (#3095 review, cycle 2 — an earlier draft of this
+    #                       comment cited `pr-owner-liveness.test.sh` and the (2b) arm, and BOTH were
+    #                       false: that suite drives `pl_verdict` and never names `pr_owned`, and (2b)
+    #                       stubs arm 1 out). ⛔ Arm 1 is not driven through `pr_owner_live` ANYWHERE —
+    #                       that is this arm's stated limit, not a coverage claim.
     #   arm 2 `sess`      — the worker RECORD: `fix-<PR>` / `review-<PR>` / `merge-<PR>`. Stubbed above,
     #                       and this is the arm the §2 idempotence assertions are really about.
     #   arm 3 `claim_live`— the cross-box SPAWN GUARD (rc 1 = not held). Stubbed above, with the head
     #                       argument ASSERTED by the stub, so the cross-box arm cannot go dead.
     # Without this depth the block's call is an undefined command (rc 127, falsy) and every suppression
     # arm silently grades a spawn: the exact red this suite measured on origin/main.
-    pr_owned() { [ "${PR_OWNED:-0}" = "1" ]; }
+    # ⛔ ASSERT THE FORWARDED ARGUMENTS (review, #3095 cycle 2). Same discipline as the `claim_live`
+    # stub above, and for the same reason. The shipped arm forwards `pr_owned "$pr" "$sha" "$br"`,
+    # and two of its three answers are GATED on arguments: the live-cwd arm needs a non-empty `br`
+    # and the foreign-lease arm needs a non-empty `sha`. So a mutant that forwards only the PR —
+    # `pr_owned "$pr"` — reads UN-OWNED for a live worker in the PR's checkout and for a live
+    # foreign claim, i.e. it spawns a second fixer onto a branch a live worker holds. Measured on a
+    # scratch checkout of the shipped loop: with that mutant an argument-ignoring stub stayed
+    # `122 passed, 0 failed` — green on the exact two-lanes-one-branch direction this file exists to
+    # red. The assertions are what make the forwarding observable.
+    pr_owned() {
+      [ "$1" = "$PR" ] && [ "$2" = "$HEAD_N" ] && [ "$3" = "$BR" ] && [ "${PR_OWNED:-0}" = "1" ]
+    }
     . "$TMP/ownerlive.sh"
     # `head_reds` asks gh; the stub answers the three shapes it can return. A stub that printed
     # nothing would make the role read UNKNOWN everywhere and silently grade the wrong branch.
@@ -431,8 +464,10 @@ echo "  -- (2b) the ownership guard reads a REAL process, not a stub --"
 # ("is the fixer I think is running actually seen?"). The `[redfix]` fragment's suppression arm and
 # the fleet's `[select]`/`[pr]` arms read the same function, so a predicate that cannot see a live
 # worker double-fixes (two lanes, one branch) or refuses to fix (the measured stall).
-# Nothing is stubbed here except the three facts a temp fixture cannot have: `pr_owned` (arm 1 — driven
-# for real by pr-owner-liveness.test.sh) and the session/claim records.
+# Nothing is stubbed here except the three facts a temp fixture cannot have: `pr_owned` (arm 1 — stubbed
+# OUT and RECORDED as such, so a wrong-argument call is caught rather than silently answering; the real
+# drive of that arm is `live-ownership.test.sh`) and the session/claim records. What this arm really
+# proves is arm 3: `pl_verdict` deciding about a pid that genuinely exists, and reaping when it is gone.
 OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
 # A SUBSHELL, deliberately: it sources the shipped module and sets PL_MOD/LOG, and a leak of those
 # into the main shell would silently re-point every LATER drive at the release arm instead of the
@@ -442,7 +477,13 @@ OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
   O="$OL"; LOG="$OL/log"; PL_MOD=1
   . "$HERE/pr-owner-liveness.sh"
   . "$TMP/ownerlive.sh"
-  pr_owned() { return 1; }
+  # arm 1 must still be ASKED with the shipped argument order, even though it is stubbed out here: the
+  # marker line makes a wrong-argument call OBSERVABLE (a silent `return 1` would let `pr_owner_live`
+  # reach arm 3 for the wrong reason and this arm would grade a coincidence). #3095 review, cycle 2.
+  pr_owned() {
+    { [ "$1" = "4242" ] && [ "$2" = "$H" ] && [ "$3" = "" ]; } || echo 'ARM1=wrong-args'
+    return 1
+  }
   sess() { return 1; }
   claim_live() { return 1; }
   H="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
@@ -461,6 +502,10 @@ OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
   [ -f "$OL/state/mergeclaim-4242.lock" ] && echo 'LOCK=kept' || echo 'LOCK=gone'
   kill "$_pid" 2>/dev/null
 ) > "$OL/out" 2>&1
+case "$(cat "$OL/out")" in
+  *'ARM1=wrong-args'*) bad "(2b) the shipped predicate called arm 1 with the WRONG arguments: $(tr '\n' ' ' < "$OL/out")" ;;
+  *) ok "(2b) arm 1 is asked with the shipped argument order (stubbed out, but not argument-blind)" ;;
+esac
 case "$(cat "$OL/out")" in
   *'LIVE=owned'*) ok "(2b) a REAL live worker holding the PR's lock reads OWNED — a red-fixer sees the fixer that is actually running" ;;
   *) bad "(2b) the shipped guard did not see a real live pid on the lock: $(tr '\n' ' ' < "$OL/out")" ;;
