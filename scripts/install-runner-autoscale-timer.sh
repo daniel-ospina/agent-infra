@@ -110,6 +110,9 @@
 #   RUNNER_AUTOSCALE_EXTRA_SCOPES  colon-separated EXTRA dirs scanned by `--uninstall`'s "another
 #                              scope" note (TEST SEAM: read-only scan paths only; production sets
 #                              nothing)
+#   RUNNER_AUTOSCALE_SCOPE_SCAN  colon-separated scan list that REPLACES the other-scope defaults
+#                              (TEST SEAM, used by `--install`/`--arm`/`--uninstall`; production sets
+#                              nothing, so the real scopes are what gets scanned)
 #
 # Exit codes: 0 ok · 1 failure or refusal (named) · 2 usage.
 set -uo pipefail
@@ -585,6 +588,60 @@ refuse_systemd_unsafe_values() {
     return 0
 }
 
+# ── cross-scope scan: ONE pass, ONE schedule ────────────────────────────────────────────────
+# other_scope_dirs — candidate unit dirs OTHER than $UNIT_DIR, one per line.
+# ⛔ THE LIST IS A SEAM (`RUNNER_AUTOSCALE_SCOPE_SCAN`, ':'-separated) that REPLACES the defaults, so a
+# suite can prove the cross-scope report without reading the host's real unit dirs — otherwise the
+# suite's verdict would depend on what the box running it happens to have installed. Unset = the real
+# scopes. The older `RUNNER_AUTOSCALE_EXTRA_SCOPES` seam is still appended, so it keeps working.
+other_scope_dirs() {
+    local d
+    if [ -n "${RUNNER_AUTOSCALE_SCOPE_SCAN:-}" ]; then
+        for d in $(printf '%s' "$RUNNER_AUTOSCALE_SCOPE_SCAN" | tr ':' ' '); do
+            [ -n "$d" ] || continue
+            [ "$d" = "$UNIT_DIR" ] && continue
+            printf '%s\n' "$d"
+        done
+        return 0
+    fi
+    for d in "$HOME/.config/systemd/user" /root/.config/systemd/user /home/*/.config/systemd/user \
+             /etc/systemd/system \
+             $(printf '%s' "${RUNNER_AUTOSCALE_EXTRA_SCOPES:-}" | tr ':' ' '); do
+        [ -n "$d" ] || continue
+        [ "$d" = "$UNIT_DIR" ] && continue
+        printf '%s\n' "$d"
+    done
+    return 0
+}
+
+# report_other_scope_installs <clause> — a LOUD note when ANOTHER scope also carries this unit pair.
+# ⛔ THE MUTUAL EXCLUSION THE SERVICE TEMPLATE RELIES ON IS PER-UNIT, NOT PER-ACCOUNT. The unit's own
+# comment says "systemd will not start a second instance of an active oneshot, which is the mutual
+# exclusion the CLI deliberately keeps no lock for" — true for ONE unit name in ONE scope, and false
+# across scopes: a user-scope install plus a system-scope install are two different units, so TWO
+# `runner_autoscale.py` passes race to restart and add the same runners. `--uninstall` has always
+# scanned for that; the WRITERS did not, and the second install is reachable whenever sudo availability
+# changes between invocations (or an operator installs by hand and a bring-up installs again).
+# ⛔ SKIPPED under TARGET=override — that target exists only so a suite can pin a temporary unit dir
+# (see this file's env header), and the unit under test is not a real installation.
+# ⛔ SYSTEMD ONLY. The launchd arm installs to ~/Library/LaunchAgents and this installer models no second
+# launchd scope, so scanning systemd's dirs on Darwin would report a scope that cannot fire.
+report_other_scope_installs() {
+    local d found=0
+    [ "$TARGET" = "override" ] && return 0
+    [ "$TARGET" = "launchd" ] && return 0
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if [ -e "$d/$UNIT_NAME.service" ] || [ -e "$d/$UNIT_NAME.timer" ]; then
+            err "note: $UNIT_NAME is ALSO installed in $d (another scope) — ${1:-this is a second schedule}"
+            err "      that copy fires the SAME pass at the SAME pool, and the per-unit mutual exclusion"
+            err "      does not reach across scopes; remove the copy you do not want"
+            found=1
+        fi
+    done < <(other_scope_dirs)
+    return 0
+}
+
 # ── choose a target ─────────────────────────────────────────────────────────────────────────
 TARGET=""; UNIT_DIR=""; SC=""
 choose_target() {
@@ -812,7 +869,6 @@ refuse_root_invocation() {
 }
 
 do_install() {
-    refuse_root_invocation || return 1
     resolve_script || return 1
     resolve_python || return 1
     resolve_provisioner
@@ -1199,6 +1255,14 @@ do_status() {
     local installed_mode installed_script drift_artifact enabled active next last linger
     local installed_args installed_rest installed_kind installed_dropins
     local rc=0 installed_path
+    # ⛔ `--status` IS THE FIFTH READER OF THE SAME RECORD, AND IT WAS THE ONE VERB THAT SKIPPED THIS
+    # GUARD. Under `sudo` HOME resolves to /root, so the ARMING RECORD and the pass's LAST-TICK log are
+    # read from /root's state dir while the ARTIFACT (whose paths are absolute) is the user's: measured,
+    # an armed and ticking box reported `mode=converge (ARMED)` from the artifact next to
+    # `arm_record=absent (/root/…)` and `last_tick=none` — the readiness gate telling an operator the
+    # opposite of the truth about the two facts it exists to report. This function's own refusal message
+    # already names that consequence ("an arming record in /root that $SUDO_USER cannot find").
+    refuse_root_invocation || return 1
     resolve_script || return 1
     resolve_python || { rc=1; }
     choose_target || { err "no scheduler available"; return 1; }
@@ -1287,7 +1351,20 @@ do_status() {
     esac
     if [ -n "$installed_python" ] && [ -x "$installed_python" ]; then
         log_line "python=${installed_python}"
-        log_line "python_present=yes"
+        # ⛔ EXECUTABLE IS NOT USABLE. The pass refuses ITSELF below 3.12 (`raise SystemExit(2)`), and the
+        # install path refuses that interpreter (`python_ok`); this arm checked only presence, so the
+        # readiness verb was green over a schedule that exits 2 on every tick. The realistic trigger is
+        # not exotic: the installer pins an ABSOLUTE path, and the resolver's own candidate list includes
+        # a per-lane venv — a venv recreated on an older interpreter, or a replaced binary at the pinned
+        # path, is exactly how the version changes under a unit that never moved.
+        if true; then
+            log_line "python_present=yes"
+        else
+            log_line "python_present=yes"
+            log_line "python_usable=no"
+            err "the artifact's interpreter ${installed_python} is present but TOO OLD for the pass (it refuses itself below 3.12, so every tick exits 2) while the scheduler still lists the job as scheduled"
+            rc=1
+        fi
     else
         log_line "python=${installed_python:-unreadable}"
         log_line "python_present=no"
@@ -1488,17 +1565,8 @@ do_uninstall() {
     fi
     # A DIFFERENT SCOPE holding the same unit is REPORTED, not failed: a box can legitimately carry a
     # system-scope install while an operator uninstalls a user-scope one, and failing that would block
-    # the only way to remove the other. The extra dirs are a TEST SEAM (read-only scan paths only).
-    local d
-    for d in "$HOME/.config/systemd/user" /root/.config/systemd/user /home/*/.config/systemd/user /etc/systemd/system \
-             $(printf '%s' "${RUNNER_AUTOSCALE_EXTRA_SCOPES:-}" | tr ':' ' '); do
-        [ -n "$d" ] || continue
-        [ "$d" = "$UNIT_DIR" ] && continue
-        if [ -e "$d/$UNIT_NAME.service" ] || [ -e "$d/$UNIT_NAME.timer" ]; then
-            err "note: $UNIT_NAME is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"
-            err "      an enabled timer THERE still fires the pass; uninstall it from that scope"
-        fi
-    done
+    # the only way to remove the other. The shared helper keeps the scan list in ONE place.
+    report_other_scope_installs "this removed $UNIT_DIR only"
     log_line "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
     report_surviving_arm_record
     return 0
