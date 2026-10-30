@@ -923,7 +923,7 @@ ck "(m22) an attached data flag before the endpoint still resolves the endpoint 
 # (m23) GraphQL returns `null` for a node the viewer cannot see; `.get` on it raised and the caller got a
 # Python traceback instead of the NAMED refusal (so objective.py could not read VERDICT=GH-RATE-LIMITED).
 ck "(m23) a null node in a connection is REFUSED by name, not an AttributeError" \
-   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); d={'data':{'repository':{'issue':{'comments':{'pageInfo':{'hasNextPage':False},'nodes':[None]}}}}}; sys.exit(0 if m._enc_issue_comments(d) is None else 1)" && echo 0 || echo 1)"
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); _pi=dict(hasNextPage=False); _c=dict(pageInfo=_pi,nodes=[None]); _i=dict(comments=_c); d=dict(data=dict(repository=dict(issue=_i))); sys.exit(0 if m._enc_issue_comments(d) is None else 1)" && echo 0 || echo 1)"
 
 # (m24) a HALF-WRITTEN budget.json is not a measurement: the sed parse read a torn document the layer's
 # json.load rejects, so the rail announced an exhaustion `--health` called gh-ok.
@@ -1027,6 +1027,18 @@ ck "(o) an EMPTY box says no-reads-counted — an invented averted=0 would be a 
    $(grep -q '^gh-read-cache no-reads-counted$' <<<"$OUT" && echo 0 || echo 1)
 ck "(o) … and still exits 0 (nothing to report is not an error)" \
    $([ "$RC" -eq 0 ] && echo 0 || echo 1)
+# ⛔ AN UNREADABLE INSTRUMENT IS NOT "NOTHING COUNTED" — AND IT MUST NOT EXIT 0 (review round 2, P2).
+# A directory where the counters file belongs makes the read raise OSError, which is the real shape of
+# a permission/remount failure. Returning 0 there told any caller gating on the exit status that the
+# instrument was fine, which is the false-PASS polarity `--health` already refuses.
+reset_env o3 coreok
+rm -f "$GH_LIMIT_DIR/read-cache-stats.jsonl"
+mkdir -p "$GH_LIMIT_DIR/read-cache-stats.jsonl"
+stats
+ck "(o3) an UNREADABLE instrument says UNREADABLE, not no-reads-counted" \
+   $(grep -q '^gh-read-cache UNREADABLE ' <<<"$OUT" && echo 0 || echo 1)
+ck "(o3) … and exits 3, so it can never read as green to a caller gating on rc" \
+   $([ "$RC" -eq 3 ] && echo 0 || echo 1)
 
 echo "── (p) THE FLOOR CAN SEE (#2342 review P1): a blind box MEASURES before it refuses ────────────"
 # The floor acts on a MEASURED `remaining`, and before this the only writer of a non-zero one was the

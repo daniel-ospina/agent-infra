@@ -3104,7 +3104,13 @@ def main(argv):
             # ⛔ AN UNREADABLE INSTRUMENT IS NOT “NOTHING COUNTED” (review P2). `--health` already
             # refuses to call an unparseable record `gh-ok`; the same rule applies to the counters.
             sys.stdout.write("gh-read-cache UNREADABLE %s\n" % why)
-            return 0
+            # ⛔ AND IT EXITS 3, NOT 0 (review round 2, P2). Returning 0 made an UNREADABLE
+            # instrument report success to any caller gating on the exit status — the exact
+            # false-PASS polarity this block's own comment names: `--health` refuses to call an
+            # unparseable record `gh-ok` and returns 3 there. The genuinely-empty arm below keeps
+            # 0, because "nothing has been counted yet" IS an answer; "I could not read the
+            # counters" is not.
+            return 3
         since, doc = stats_report()
         if not doc:
             # ⛔ AN EMPTY COUNTER IS NOT “ZERO SAVING”. It is “nothing has been counted yet”, and
