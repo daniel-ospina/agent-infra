@@ -978,8 +978,10 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     name: "REAP_WT_LOCK_STALE_SECONDS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_LOCK_STALE_SECONDS:-1800}",
+    overrides: ['REAP_WT_LOCK_STALE_SECONDS="$REAP_WT_LOCK_STALE_CLAMPED"'],
     axis: "retention",
     guardedBy: NONE,
+    note: "the lock horizon whose SECOND declaration is the #2541 clamp: a horizon at or below the pass BUDGET is RAISED to 4x the budget before `lock_acquire` runs, because a live owner's lock is broken by an age test that ignores the budget. The clamp is recorded as an override rather than left unmodelled — the forward scan checks EVERY declaration line, so a hand-edited horizon that skipped the clamp would otherwise drift invisibly. Found RED on main and on every PR cut from it (identical violation on this PR's base as on `origin/main`); registered here, not exempted, per the inherited-red precedent above.",
   },
   {
     name: "VENV_MIN_AGE",
@@ -1371,6 +1373,23 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "reap",
     guardedBy: "scripts/orchestrator-harness/lane-container-reap.test.sh — case B keeps a container YOUNGER than the floor and case A reaps one past it (the too-young rule, not the default value; the default is pinned by `value` above)",
     note: "#2868/#2870 lane test-DB containers: a container younger than four hours is never reaped, which is what stops the sweep from killing a test database a lane is still using. The bare name `MIN_AGE` is in-family by SHAPE, and registering it makes the gate STRICTER, not blind: `reverseViolations` matches name AND owner, so a future script reusing the bare name fails the reverse scan by design — the correct fix then is to rename that declaration (`X_MIN_AGE`, as `CR_MIN_AGE`/`VENV_MIN_AGE` already do), NOT to add the new file to this term's owners, which would demand it carry this exact default and declaration count.",
+  },
+  {
+    name: "RUNNER_MIN_AGE",
+    owners: ["scripts/disk-reaper.sh"],
+    value: "${DISK_REAPER_RUNNER_MIN_AGE:-3600}",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "#3057 — the ENTRY POINT's pass-through of the runner `_work` mtime floor to its owner (`reap-runner-work.sh`, whose own `RUNNER_WORK_MIN_AGE` is registered below), mirroring VENV_MIN_AGE above. It exists so the scheduled cell pass can tune the floor without editing the owner, and it is registered because a floor only the scheduler knows about is invisible to the audit that exists to notice exactly that. `guardedBy: NONE` is deliberate and not a gap: the suite exercises this bound only through its ENV spelling (`DISK_REAPER_RUNNER_MIN_AGE=3600`), which never mentions the bare symbol — citing `scripts/disk-reaper-runner-work.test.sh` here would be the exact misattribution the citation test refuses (the `IDLE_S` row's precedent). The DEFAULT literal is pinned by `value` above through the forward check, and the pass-through it feeds is what cases (a)/(b) drive: a floor coerced to 0 would reap the YOUNG fixture and red them.",
+  },
+  {
+    name: "RUNNER_WORK_MIN_AGE",
+    owners: ["scripts/reap-runner-work.sh"],
+    value: "${REAP_RW_MIN_AGE:-3600}",
+    overrides: ['RUNNER_WORK_MIN_AGE="$2"'],
+    axis: "reap",
+    guardedBy: "scripts/disk-reaper-runner-work.test.sh — MUT_A deletes the floor from the `-newer` reference computation and the suite goes RED, so the arm is load-bearing rather than decorative",
+    note: "#3057 — the runner `_work` class's too-young rule: an entry whose NEWEST content (including its own top directory) is younger than this is never a candidate, whatever else the rules say. It is the clause that makes mtime a positive proof of death, so a running job that writes continuously inside its checkout restores its floor and survives. NAMED WITH A PREFIX ON PURPOSE: it was landed as the bare `MIN_AGE`, which the reverse scan reads as the REGISTERED `MIN_AGE` term owned by `scripts/orchestrator-harness/lane-container-reap.sh`, and the fix recorded on that row is a RENAME, not a second owner — adding this file to that term's owners would demand it carry the container reaper's 14400 s default and declaration count. 3600 s is the shipped default; the only empirically validated value for a job whose artefacts land OUTSIDE its checkout is 7200 s (the measured 120-minute hand reap), which is why the seam is a dial and the file's header points at it.",
   },
   // — the #1881 fix lane: three MORE reverse-scan reds inherited from main —
   // Measured 2026-10-29 at `890544aff` (the #1881 head, whose base carried them): `verify` went RED
