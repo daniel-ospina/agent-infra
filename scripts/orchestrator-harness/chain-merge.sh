@@ -131,7 +131,6 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and retur
     disk) printf 'disk' ;;
     fork) printf 'fork' ;;
     land) printf 'land' ;;
-    capability) printf 'capability' ;;
     skew) printf 'skew' ;;
     *) printf 'load' ;;
   esac
