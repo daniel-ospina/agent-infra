@@ -4028,6 +4028,92 @@ const DISPATCH_CLASS_REMEDIES: Record<DispatchFailureClass, string> = {
 };
 
 /**
+ * #10219: WHICH rendered shapes count as a verdict LINE — one set, read by BOTH tokens.
+ *
+ * `#190` asked for hasPass/hasFail parity, but parity was only ever given on the bare token:
+ * hasFail also read the label form (`Result: FAIL`, `status=FAIL`) and `FAILED`, while hasPass
+ * read neither — so a verifier that RENDERS its verdict (`Result: PASS`, `> PASS`,
+ * `[16:42] PASS`, `[x] PASS`) produced a reply the gate could not parse. In a `pi -p` / task
+ * child that is a hard refusal (#285), which is the `Unverified files …` loop the finding
+ * described; in an interactive session the #5724 fail-open silently blessed the prompt's files
+ * instead. Both readings are worse than simply reading the verdict, and neither is a
+ * protection: the PASS merge is still prompt-scoped and hashed FROM DISK, and FAIL is still
+ * tested FIRST, so a reply carrying both still blocks.
+ *
+ * The three shapes are the ones a model actually emits: a bare token with an optional list/bold/
+ * quote marker (`PASS`, `- PASS`, `**PASS**`, `1. PASS`, `> PASS`), a labelled verdict
+ * (`Result: PASS`), and a bracketed line prefix (`[16:42] PASS`, `[x] PASS`). Every arm stays
+ * LINE-anchored — that is what keeps prose out (`PASS criteria are met` mid-sentence, `the
+ * verifier did not PASS`) — and `\b` after the token keeps `PASSED`/`bypass` out.
+ */
+function verdictLine(token: "PASS" | "FAIL"): RegExp {
+  const tok = `${token}(?:\\b|:|—)`;
+  return new RegExp(
+    [
+      `(?:^|\\n)\\s*(?:[-*•]|\\d+\\.)?\\s*(?:>\\s*)*\\*{0,3}${tok}`, // bare / listed / bold / quoted
+      `(?:^|\\n)\\s*(?:result|verdict|status|outcome)\\s*[:=]\\s*\\*{0,3}${tok}`, // labelled
+      `(?:^|\\n)\\s*\\[[^\\]\\n]{0,40}\\]\\s*\\*{0,3}${tok}`, // bracketed prefix
+    ].join("|"),
+    "i",
+  );
+}
+
+/**
+ * #10219: the line the gate TESTED as a verdict, so a refusal says WHY it was refused.
+ * The finding's third ask was that a lane not have to bisect by re-dispatching: a reply
+ * rendered as `[16:42] PASS` was refused with no statement about the line that was read.
+ *
+ * The candidate line is the FIRST non-empty line of the reply that mentions PASS/FAIL — a
+ * line-anchored verdict line OR ordinary prose that mentions the token (`The PASS criteria are
+ * met by f.py`). It is deliberately NOT a filter for "the verifier's prose or a file it quoted":
+ * the gate cannot tell an unread verdict from prose, so the bound is 120 chars on a SINGLE line,
+ * and it is the LINE the gate tested — never the whole reply.
+ *
+ * ⛔ The note is filed under the DISPATCH that wrote it (`verdictLineDispatchSeq`). A stale note
+ * must never be rendered as if it described a LATER reply: `empty-content` / `no-text` return
+ * BEFORE the parse, so they write no note, and a leftover one rendered under their ceremony
+ * would contradict the ceremony above it and point the lane at the wrong remedy ("re-shape this
+ * line") for a line the gate had already read — and blocked on (review r1 P2). A correlation id
+ * on the record is the convergent shape: OpenTelemetry's Logs Data Model carries `SpanId` on a
+ * log record precisely so a diagnostic is attributable to the operation that produced it
+ * (data-model, "Field: SpanId").
+ */
+let lastVerdictLineTested: string | null = null;
+let lastVerdictLineKnown = false;
+/** Monotonic id of the current [VGATE] dispatch — the identity a tested-line note is filed under. */
+let verdictLineDispatchSeq = 0;
+let lastVerdictLineSeq = -1;
+/** Bumped at the START of every [VGATE] dispatch, before any outcome is recorded. */
+function beginVerdictDispatch(): void {
+  verdictLineDispatchSeq++;
+}
+function noteVerdictText(text: string): void {
+  const line = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0 && /PASS|FAIL/i.test(l));
+  lastVerdictLineTested = line ? line.slice(0, 120) : null;
+  lastVerdictLineKnown = true;
+  lastVerdictLineSeq = verdictLineDispatchSeq;
+}
+function clearVerdictLine(): void {
+  lastVerdictLineTested = null;
+  lastVerdictLineKnown = false;
+  lastVerdictLineSeq = -1;
+}
+/** The #10219 diagnostic appended to a block whose last dispatch was a FORMAT failure. */
+export function verdictLineDiagnostics(): string {
+  if (!lastVerdictLineKnown) return "";
+  // A note filed under an EARLIER dispatch belongs to THAT reply, not to the one the ceremony
+  // above describes — suppress it rather than misattribute the line.
+  if (lastVerdictLineSeq !== verdictLineDispatchSeq) return "";
+  if (lastVerdictLineTested === null) {
+    return "\n  ⚠️ No line of the last verifier reply mentioned PASS or FAIL — there was no verdict to read.";
+  }
+  return (
+    `\n  ⚠️ The last verifier reply mentioned a verdict on this line, and the gate did NOT read it as one: "${lastVerdictLineTested}"`
+    + " — an accepted verdict line is `PASS` / `Result: PASS` / `> PASS` / `[16:42] PASS` on its own line, or the exact JSON shape."
+  );
+}
+
+/**
  * #561: state-bearing diagnostics appended to a blocked git op after a failed
  * [VGATE] dispatch. Empty state (lastDispatchClass null) appends nothing —
  * fresh-session messages are byte-identical, keeping all pinned message tests
@@ -4074,6 +4160,7 @@ export function recordDispatchJudgment(klass: DispatchFailureClass): void {
 export function recordDispatchSuccess(): void {
   lastDispatchClass = null;
   dispatchStreak = 0;
+  clearVerdictLine(); // #10219: a merge means the verdict WAS read — drop the tested-line note
 }
 
 /** #561: read-only state accessor — lets the pure-export unit suite pin the taxonomy post-conditions (record fns return void). */
@@ -4168,6 +4255,7 @@ export default function (pi: ExtensionAPI) {
     blockAttempts.clear();
     lastDispatchClass = null; // #561: ceremony diagnostics are session-scoped
     dispatchStreak = 0;
+    clearVerdictLine(); // #10219: the tested-line note is session-scoped too
 
     // Detect: disabled when no write/edit capability or opt-out
     // ponytail: dedicated escape hatch — ELDATO_ALLOW_MAIN_EDITS is the worktree
@@ -4766,8 +4854,11 @@ export default function (pi: ExtensionAPI) {
     // task-restricted agents — the old text unconditionally claimed the task
     // tool).
     const ceremonyDiag = lastDispatchClass ? formatCeremonyDiagnostics(lastDispatchClass, dispatchStreak, isTaskSubAgent() ? "capable" : "interactive") : ""; // #561: append at the CALL SITE only — buildSubAgentBlockMessage stays hermetic for its pinned tests
+    // #10219: name the line the gate tested — only for the FORMAT classes (a fail-verdict or
+    // a zero-merge PASS is a judgment, not a parse failure, and must not claim a line was rejected).
+    const verdictLineDiag = lastDispatchClass && FORMAT_CLASSES.has(lastDispatchClass) ? verdictLineDiagnostics() : "";
     const reason = isTaskSubAgent()
-      ? buildSubAgentBlockMessage(reasons, cwd, allBlocked) + ceremonyDiag
+      ? buildSubAgentBlockMessage(reasons, cwd, allBlocked) + ceremonyDiag + verdictLineDiag
       : [
           "⛔ Verification gate — blocking git operation.",
           "",
@@ -4777,7 +4868,7 @@ export default function (pi: ExtensionAPI) {
           `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`,
           "",
           "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
-        ].join("\n") + ceremonyDiag;
+        ].join("\n") + ceremonyDiag + verdictLineDiag;
 
     console.log(`[verification-gate] 🚫 Blocked: ${unverified.length} unverified, ${mismatched.length} mismatched`);
     lastBlockedCwd = cwd; // stash authoritative cwd for the merge path (#5607)
@@ -4801,6 +4892,8 @@ export default function (pi: ExtensionAPI) {
     const isVerifier = agent === "verifier" || prompt.includes("[VGATE]");
     if (!isVerifier) return undefined;
     lastVerifierNote = null; // #1660: the disposition always reflects the LATEST verifier dispatch (a stale zero-merge note must not outlive the dispatch that supersedes it)
+    beginVerdictDispatch(); // #10219: a tested-line note is filed under THIS dispatch, so one that never
+    // reaches the parse (empty-content / no-text / background) cannot resurrect its predecessor's line
 
     // #1662 — a `task({ background: true })` dispatch returns a RETURNS-EARLY
     // notice AT DISPATCH, not a verifier verdict. Its content is deliberately
@@ -4870,6 +4963,8 @@ export default function (pi: ExtensionAPI) {
 
     // Plain-text fallback (Pi task sub-agents often return markdown, not JSON)
     if (!result) {
+      // #10219: remember the line the gate is about to TEST, so a refusal names it.
+      noteVerdictText(textContent);
       // #132 A.3b: an explicit FAIL judgment (schema-incomplete JSON FAIL or
       // plain-text FAIL) must block, never fail open — "don't commit" is not
       // a JSON-compliance issue. Not a dispatch failure either: keep blocking,
@@ -4881,9 +4976,11 @@ export default function (pi: ExtensionAPI) {
       // P2: also covers list-marker lines (- FAIL:, * FAIL:), inline verdict
       // labels (Result: FAIL, Verdict: FAIL), and past-tense FAILED on line/
       // ❌ anchors (still excludes "Failure"/"Failing" prose via \b).
-      const hasFail = /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*FAIL(?:\b|:|—)/i.test(textContent)
+      // #10219: the bare/labelled arms are now SHARED with hasPass (verdictLine)
+      // so a quoted `> FAIL` or a bracketed `[16:42] FAIL` blocks here instead of
+      // falling through to the unparseable fail-open.
+      const hasFail = verdictLine("FAIL").test(textContent)
         || /❌.*FAIL(?:\b|:|—)/i.test(textContent)
-        || /(?:^|\n)\s*(?:result|verdict|status|outcome)\s*[:=]\s*FAIL(?:\b|:|—)/i.test(textContent)
         || /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*FAILED(?:\b|:|—)/i.test(textContent)
         || /❌.*FAILED(?:\b|:|—)/i.test(textContent)
         || /\{\s*['"]?status['"]?\s*:\s*['"]?FAIL['"]?/i.test(textContent)
@@ -4902,7 +4999,10 @@ export default function (pi: ExtensionAPI) {
       // #190: hasPass parity with hasFail — list/bold markers (-, *, **, ***)
       // and a word boundary so PASSED/PASSES never match (the fail-open branch
       // below still rescues genuinely unparseable-but-verifier-intent responses).
-      const hasPass = /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*\*{0,3}PASS(?:\b|:|—)/i.test(textContent)
+      // #10219: and now the SAME rendered shapes hasFail reads (verdictLine) —
+      // `Result: PASS`, `> PASS`, `[16:42] PASS`. Without them a lane's rendered
+      // verdict was refused in print mode and only fail-opened in interactive mode.
+      const hasPass = verdictLine("PASS").test(textContent)
         || /✅.*PASS(?:\b|:|—)/i.test(textContent);
 
       if (hasPass) {

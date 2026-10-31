@@ -3063,6 +3063,82 @@ assert_contains "$ST60" "classified_venv=?" \
 assert_contains "$(grep -F 'class=venv' <<<"$OUT")" "candidates=1" \
     "T60 the class LINE agrees with the record about the candidate count"
 
+# ── T61: the delegate's OWN verdict is lifted, and does NOT move the class verdict (#3041) ────────
+# `verdict_worktree=` is derived from the delegate's EXIT CODE, and an ineffective reap exits 0 BY
+# DESIGN — so the status file said `verdict_worktree=ok` for a pass that reclaimed nothing on a box at
+# 0 bytes free. The delegate's own `verdict=` is now carried alongside it in a SEPARATE field, with
+# the same `?` / `not-run` vocabulary as `main_proof=`/`pr_merged=` but NOT their disagreement polarity
+# (see the five-leg table at the end of this block: `mixed` here means two ALARM answers). Both
+# properties matter: the answer must be reachable at the surface the fleet reads, and lifting it must
+# not change a verdict that operators and wrappers already key on.
+ENVNAME=t61
+REPO_D1="$(mk_repo t61a)"
+REPO_D2="$(mk_repo t61b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=12 classified=12 remove=0 preserved=12 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:12 main_proof=local pr_merged=na verdict=reap-ineffective"' \
+    'exit 0' >"$T/t61-delegate.sh"
+chmod +x "$T/t61-delegate.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-delegate.sh" run_reaper --apply --repo "$REPO_D1" --only worktree 2>&1)"
+ST61="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST61" "delegate_verdict_worktree=reap-ineffective" \
+    "T61 the delegate's own verdict reaches the STATUS FILE, not just the echoed text"
+assert_contains "$ST61" "verdict_worktree=ok" \
+    "T61 ... beside an UNCHANGED class verdict (the exit code still decides it)"
+assert_contains "$ST61" "classified_worktree=12" "T61 ... and the tally it came with"
+# ⛔ AND IT MUST BE REACHABLE FROM THE READER, not merely present in the file (the rule at
+# `disk-reaper.sh`'s print_status: "a field the reader does not print does not exist"). Asserting the
+# raw file alone let the field be written and unreadable from `--print-status`, which is the surface
+# the fleet's supervisor reads.
+PST61="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$PST61" "delegate_verdict_worktree=reap-ineffective" \
+    "T61 ... and \`--print-status\` PRINTS it (a written field the reader cannot see does not exist)"
+assert_contains "$PST61" "verdict_worktree=ok" "T61 ... beside the unchanged exit-code verdict"
+# A delegate that does not print the field (an older farmed copy) answers NOTHING: `?`, never `idle`.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=2 classified=2 remove=0 preserved=2 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:2 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t61-old.sh"
+chmod +x "$T/t61-old.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-old.sh" run_reaper --apply --repo "$REPO_D1" --only worktree 2>&1)"
+ST61B="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST61B" "delegate_verdict_worktree=?" \
+    "T61 an absent field is \`?\` — never a benign \`idle\`"
+# ⛔ THE ALARM CLASS HAS PRECEDENCE, AND THE TWO KINDS OF DISAGREEMENT ARE SPELLED DIFFERENTLY
+# (#3058 review, P1). A plain `main_proof=`-style "any disagreement => mixed" rule is wrong for a
+# field that is PRINTED WITH A ⛔ for every value outside the benign allow-list: `reap-ineffective`
+# + `idle` (the alarm) and `reclaimed` + `idle` (two ordinary readings) would BOTH read `mixed`, so a
+# healthy multi-repo cell prints a ⛔ on every pass AND `⛔ worktree-delegate=reap-ineffective` — the
+# one line this whole feature exists to put in front of an operator — is never reachable at all.
+# Five legs, each of which fails for a different wrong implementation: benign-only disagreement is
+# `mixed-benign` (and the reader keeps it SILENT); an alarm beside a benign answer is THAT ALARM;
+# the same pair in the other repo order is the same answer (never last-answer-wins); two DIFFERENT
+# alarms are `mixed` (the only case where the cell cannot say); and an UNTAUGHT spelling is surfaced
+# as itself, because the benign side is an allow-list and not a deny-list.
+t61_pair() { # t61_pair <verdict-for-t61a> <verdict-for-t61b> -> writes the two-repo delegate shim
+    local d="$T/t61-pair.sh"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'v=@V1@' \
+        'for a in "$@"; do case "$a" in */t61b) v=@V2@ ;; esac; done' \
+        'echo "SUMMARY examined=1 classified=1 remove=0 preserved=1 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:1 main_proof=local pr_merged=na verdict=$v"' \
+        'exit 0' >"$d"
+    sed -i.bak "s/@V1@/$1/; s/@V2@/$2/" "$d" && rm -f "$d.bak"
+    chmod +x "$d"
+}
+t61_run_pair() { # t61_run_pair <v1> <v2> -> prints the record's delegate_verdict_worktree=
+    t61_pair "$1" "$2"
+    WORKTREE_REAPER="$T/t61-pair.sh" run_reaper --apply --repo "$REPO_D1" --repo "$REPO_D2" --only worktree >/dev/null 2>&1
+    sed -n 's/^delegate_verdict_worktree=//p' "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null | head -1
+}
+assert_eq "$(t61_run_pair reclaimed idle)" "mixed-benign" \
+    "T61 two BENIGN answers that disagree read \`mixed-benign\` (never a ⛔ on a healthy cell, never last-answer-wins)"
+assert_eq "$(t61_run_pair reap-ineffective idle)" "reap-ineffective" \
+    "T61 an ALARM beside a benign answer is carried as ITSELF — \`mixed\` here left the ⛔ line unable to name the alarm"
+assert_eq "$(t61_run_pair idle reap-ineffective)" "reap-ineffective" \
+    "T61 …and the repo ORDER does not decide it (no last-answer-wins, either way round)"
+assert_eq "$(t61_run_pair reap-ineffective unmeasured)" "mixed" \
+    "T61 two DIFFERENT alarms read \`mixed\` — the one case where the cell genuinely cannot say"
+assert_eq "$(t61_run_pair reclaimed unlisted-new-verdict)" "unlisted-new-verdict" \
+    "T61 an UNTAUGHT spelling is surfaced as itself (the benign side is an allow-list, so a new verdict fails loud)"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

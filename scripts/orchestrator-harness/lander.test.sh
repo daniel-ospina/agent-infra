@@ -251,7 +251,7 @@ has "$OUT" "#104 skipped: draft" && ok "DRAFT: skipped with the draft reason" ||
 has "$OUT" "CI queue depth: 3 queued, 9 in progress (12 workflow runs)" \
   && ok "QUEUE LINE: the CI queue depth is printed on a run that merged nothing" \
   || bad "QUEUE LINE: no queue-depth line on a no-merge run ($OUT)"
-n="$(printf '%s\n' "$OUT" | grep -c 'CI queue depth')"
+n="$(grep -c 'CI queue depth' <<<"$OUT")"
 [ "$n" = "1" ] && ok "QUEUE LINE: exactly once per run" || bad "QUEUE LINE: printed $n times, expected exactly 1"
 
 # ══ CASE 5 — BLOCKED with green checks: reported with its blocker ════════════════════════════
@@ -726,7 +726,7 @@ if [ "${1:-}" = "--nonvacuity" ]; then
     printf 'ok        — non-vacuity: the PENDING arm is the one that breaks (not an unrelated crash)\n'
   else
     printf 'FAIL      — non-vacuity: the mutant failed, but NOT on the PENDING arm — the arm may be passing for the wrong reason\n'
-    printf '%s\n' "$MOUT" | grep 'FAIL' | sed 's/^/    /'
+    grep 'FAIL' <<<"$MOUT" | sed 's/^/    /'
     exit 1
   fi
   printf '\nnon-vacuity: PASS\n'

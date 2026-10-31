@@ -30,7 +30,7 @@ cell's own `cmux list-workspaces --json`; on a Linux cell that command cannot an
 (worker-terminal.sh records the same measurement — agent-infra#2368), so the prescribed
 population is unobtainable there. What IS true on such a box is that NO cmux-workspace lane
 exists, because no cmux workspace was ever created — a reading this file MEASURES (see
-`cmux_layout_store`), never infers from the producer's prose.
+`cmux_layout_probe`), never infers from the producer's prose.
 
 WHAT THIS SCRIPT IS, AND IS NOT
 -------------------------------
@@ -122,21 +122,40 @@ def roster_path(override: str | None) -> str:
     return override or os.path.join(home(), ROSTER_REL)
 
 
-def cmux_layout_store() -> str | None:
-    """The persisted cmux workspace layout, or None when this box has none.
+def cmux_layout_probe() -> tuple[str | None, str | None]:
+    """The persisted cmux workspace layout as ``(path, error)`` — three outcomes, not two.
 
     ⛔ THIS IS THE MEASUREMENT, NOT A GUESS. It answers "has this box ever had cmux
-    workspaces?" — which is the question that separates a FAILED READ (the layout exists and
-    the CLI could not read it) from an EMPTY POPULATION (no layout was ever written here). The
-    two have opposite remedies and opposite polarities: the first must refuse, the second must
+    workspaces?" — the question that separates a FAILED READ (the layout exists and the CLI
+    could not read it) from an EMPTY POPULATION (no layout was ever written here). The two
+    have opposite remedies and opposite polarities: the first must refuse, the second must
     provision a zero-row roster. Matching the CLI's error text instead would repeat the
     phrase-pin class that silently removed the holder re-route (#2848).
+
+    ⛔ THREE OUTCOMES, because "I could not read it" is NOT "there is none" (#3032 HIGH).
+    ``os.path.isfile`` cannot tell them apart: it returns **False** for EACCES on the file *or
+    any ancestor*, for ELOOP, and for a layout path that is a directory. Reading that False as
+    "absent" sent control to the ``not-applicable`` arm, which WRITES a zero-row roster with
+    rc 0 and states as measured fact that no layout was ever persisted — while the box's real
+    cmux lanes are silently dropped from the population. So presence is measured by a READ:
+
+      ``(path, None)``     a layout is present AND readable
+      ``(None, None)``     no candidate exists at all — genuinely absent
+      ``(path, reason)``   a candidate EXISTS and cannot be read — the first must refuse
     """
     for parts in LAYOUT_CANDIDATES:
         p = os.path.join(home(), *parts)
-        if os.path.isfile(p):
-            return p
-    return None
+        try:
+            with open(p, "rb"):
+                pass
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # genuinely absent: no such file, or an ancestor is not a directory
+        except OSError as exc:
+            # EACCES on the file or an ancestor, ELOOP, IsADirectoryError, EIO — the path is
+            # THERE and we could not read it. That is a failed read, never an empty fleet.
+            return p, f"{type(exc).__name__}: {exc.strerror or exc}"
+        return p, None
+    return None, None
 
 
 def run(argv: list[str], timeout: int = 45) -> tuple[int, str, str]:
@@ -555,9 +574,17 @@ def main(argv: list[str] | None = None) -> int:
     if not measured and not refusal:
         # The daemon does not answer. WHICH FACT IS THAT? A box with a persisted layout HAS
         # cmux workspaces and its list could not be read (refuse); a box with no layout has
-        # none at all (a truthful zero-row roster).
-        layout = cmux_layout_store()
-        if layout:
+        # none at all (a truthful zero-row roster); and a layout that EXISTS but cannot be READ
+        # is the FIRST of those, never the second (#3032 HIGH: `isfile` collapsed all three).
+        layout, layout_error = cmux_layout_probe()
+        if layout_error:
+            refusal = (
+                "the cmux daemon does not answer and this box's persisted workspace layout "
+                f"({layout}) could NOT BE READ ({layout_error}) — a layout that exists and is "
+                "unreadable is not an absent one, so this box's lane population cannot be "
+                "measured and must not be reported as empty"
+            )
+        elif layout:
             refusal = (
                 "the cmux daemon does not answer and this box HAS a persisted workspace layout "
                 f"({layout}) — so it has cmux-workspace lanes its roster could not enumerate. "
