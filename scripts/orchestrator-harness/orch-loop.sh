@@ -5905,12 +5905,23 @@ PY
     # issues would have made it invisible.
     # ⛔ The datum already exists and needs no new state: `mp_recent_land` reads the
     # `state/merged-<PR>.done` markers the merge sweep writes on every land. Its shortlist is bounded
-    # (2x the merge-priority window), so an EMPTY answer means "no land inside that bound" — which is
-    # the stalled condition, not an absence of evidence, PROVIDED a marker exists at all. A box that
-    # has never landed anything prints nothing: an unread baseline must not be reported as a stall
-    # (agent-infra#1931).
-    _land_any=0
-    for _f in "$O"/state/merged-*.done; do [ -e "$_f" ] && { _land_any=1; break; }; done
+    # (2x the merge-priority window), so an EMPTY answer means "no land inside that bound" — which IS
+    # the stalled condition, and it is the gate's own question.
+    # ⛔ AN EMPTY ANSWER IS THE STALL, NOT "UNKNOWN" (agent-infra#2929, measured 2026-10-27). This
+    # block used to escalate ONLY when `mp_recent_land` returned a number, i.e. only when a land was
+    # already inside the window — the dead-man's-switch inversion: an escalation that fires only on a
+    # SUCCESS event cannot report the ABSENCE of success events. On this Mac: 178 `merged-*.done`, 0
+    # within 360m, 16-19 un-owned PRs, `lanes=0` — the arm that exists for exactly that state never
+    # ran, for hours, and wrote no escalation record and no artifact.
+    # ⛔ IT DELIBERATELY REVERSES THE EARLIER CARVE-OUT. The previous arm kept SILENCE for a box whose
+    # markers were all outside the window, on the grounds that "an unread baseline must not be reported
+    # as a stall" (agent-infra#1931). The markers are THIS box's own merge-one successes, so after a
+    # state loss their absence is unmeasurable in BOTH directions — and #2929 names silence as the
+    # wrong side of that ambiguity: a box that cannot show it has landed is a box to escalate, not one
+    # to leave quiet. What keeps that honest is the WINDOW, not the carve-out: the synthesised age is
+    # the smallest the gate can justify (`_stallmin + 1`), so a stall is UNDERSTATED and never
+    # invented, the printed line says the answer was empty, and a fresh numeric stamp still reads
+    # "drain alive" — the polarity of #2929 ask 3 is unchanged.
     # ⛔ NORMALISE THE TUNABLE (review P3): `[ "200m" -ge … ]` ERRORS (rc 2), an errored test is
     # FALSE, and the else arm would print "drain alive" — a false all-clear on the very condition this
     # line exists to name, every cycle. Every other knob in this file is normalised first (`is_num`,
@@ -5923,9 +5934,23 @@ PY
     _stallraw="${MERGE_STALL_MIN:-180}"
     _stallmin=180
     case "$_stallraw" in ''|*[!0-9]*) : ;; *) _stallmin=$(( 10#$_stallraw )) ;; esac
+    # ⛔ THE DISPATCH BELOW MUST SEE "DID THIS PASS STALL", NOT "WHAT IS THE COUNTER".
+    # `_dpass` is set only inside the stall arm; read on the drain-alive path it defaults to 0,
+    # and `0 % 3 == 0` dispatched a stall-repair worker on every HEALTHY pass (verifier,
+    # 2026-10-27). Initialised here — at the top of the block, so every pass resets it, which is
+    # also the reset the drain-alive path needs — and set to 1 only inside the stall arm.
+    _stalled=0
     _lm="$(mp_recent_land 2>/dev/null || true)"
     if is_num "${_lm:-}"; then
+      _lmsyn=0
       _lage=$(( ( $(date +%s) - (10#${_lm}) ) / 60 ))
+    else
+      # ⛔ NO LAND MARKER INSIDE THE WINDOW IS THE STALL ITSELF (#2929 ask 1). Synthesise the stamp so
+      # the gate EVALUATES instead of skipping: `_stallmin + 1` is the smallest age the empty answer can
+      # justify, so the escalation fires and the printed age never claims more staleness than was run.
+      _lmsyn=1
+      _lage=$(( _stallmin + 1 ))
+    fi
       # ⛔ A FUTURE STAMP IS NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N` passes a file
       # stamped in the future (a negative age is "less than N minutes ago"), so clamping it to 0 would
       # render a clock step-back as "drain alive" — and after the release valve was removed this line
@@ -5933,9 +5958,10 @@ PY
       # ruling removed. `dispatch_funnel` refuses the same shape for its own record ("A FUTURE at= IS
       # NOT A FRESH RECORD"). Print the UNMEASURED
       # case instead: it is neither a stall nor an all-clear, and it says which it is.
-      if [ "$_lage" -lt 0 ]; then
+      if [ "$_lmsyn" = "0" ] && [ "$_lage" -lt 0 ]; then
         echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
-      elif [ "$_lage" -ge "$_stallmin" ]; then
+      elif [ "$_lmsyn" = "1" ] || [ "$_lage" -ge "$_stallmin" ]; then
+        _stalled=1
         # ── THE STALL IS ALSO AN ESCALATION (agent-infra#2590) ───────────────────────────────
         # The stall line alone escalated to nobody: it was printed 8 times on a live box that sat at
         # `lanes=0`, 9 un-owned, nothing landing for 3.4h, and its operator read the log as normal.
@@ -6012,8 +6038,14 @@ PY
           _whysrc="$_whysrc; dominant named wait: \"${PRDISP_TOP:0:140}\""
         fi
         _whysrc="$_whysrc)"
+        # ⛔ THE LINE MUST NOT PRESENT THE SYNTHESISED AGE AS A MEASURED ONE. When the marker answer was
+        # EMPTY the age is the window's own lower bound, not "when this box last landed" — so the line
+        # says which it is, in the same place the age is printed (#2929's own reading: an empty answer
+        # means no recent land, "which is exactly the gate's own question").
+        _lmtail=""
+        [ "${_lmsyn:-0}" = "1" ] && _lmtail=" (no land marker inside the window at all — the empty answer to 'has this box landed' IS the stall, so the age is the window's lower bound and the real stall may be older)"
         if [ "${_spk:-}" = "0" ]; then
-          echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
+          echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m${_lmtail}, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
         else
           # ⛔ AN UNMEASURED COUNT MUST NOT CARRY A POSITIVE DIAGNOSIS (review 2-P2). "the workers run
           # and nothing lands" is a claim ABOUT SPAWNS, and the UNMEASURED arm did not measure them —
@@ -6023,7 +6055,7 @@ PY
           else
             _spn_tail="this pass cannot say whether any worker was started — the LAND problem is measured, the spawn reading is not"
           fi
-          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — ${_spn_tail}. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}.${_refsuf:-}" >> "$LOG"
+          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m${_lmtail} while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — ${_spn_tail}. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}.${_refsuf:-}" >> "$LOG"
         fi
       else
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
@@ -6035,8 +6067,24 @@ PY
         # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
         [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
       fi
-    elif [ "${_land_any:-0}" = "1" ]; then
-      echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
+    # ── THE ESCALATION MUST DISPATCH, NOT ONLY COMPLAIN (owner decision 2026-10-27) ──────────────
+    # Printed 8 times on a live box at lanes=0 for 3.4h; nothing was ever done about the stall itself.
+    # Owner ruling: the issue path MAY open (the #2832 escape), and a stall must ALSO put a worker on
+    # the LAND problem. It hangs off `_stalled` — the flag the ONE stall arm sets — so it fires on
+    # BOTH stall shapes ("started nothing" = DEADLOCK, "workers run, nothing lands" = STALLED) and on
+    # NEITHER of the other two ("drain alive", "UNMEASURED"), which is the whole gate: a dispatcher
+    # reading the pass COUNTER instead of the stall dispatched on every healthy pass (`0 % 3 == 0`).
+    # ⛔ IT IS BOUNDED AND IT FAILS CLOSED: stall-fix.sh dispatches one read-only diagnostician per
+    # DRAIN_STALL_FIX_EVERY stalled passes, and it never touches a PR a lane holds; when it cannot
+    # dispatch (no brief dir, no dispatch script, no worktree) it SAYS so instead of returning silently.
+    # ⛔ ITS OUTPUT GOES TO $LOG, like every other line this block prints: on launchd the loop's stdout
+    # is a different file, and an escalation the operator cannot find where he reads is not one.
+    if [ "${_stalled:-0}" = "1" ] && [ -x "$O/stall-fix.sh" ]; then
+      O="$O" UPN_WORK="${UPN_WORK:-}" HARNESS_REPO="${HARNESS_REPO:-}" \
+        PRDISP_SPAWNS="${PRDISP_SPAWNS:-}" \
+        bash "$O/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" >> "$LOG" 2>&1 || true
+    elif [ "${_stalled:-0}" = "1" ]; then
+      echo "[dispatch] DRAIN STALL -> STALL FIX MISSING ($O/stall-fix.sh absent or not executable) — the escalation recorded the stall and dispatched nobody" >> "$LOG"
     fi
     # [drain-health:end]
   else

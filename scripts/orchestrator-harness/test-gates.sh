@@ -1646,6 +1646,24 @@ PYEOF
   grep -q '^passes=2$' "$DO/state/drain-stall" \
     && { echo "  ok …and a second stalled pass COUNTS itself (pass 2) rather than restarting at 1"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the pass counter did not advance: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1)); }
+  # ⛔ ASK 2 OF #2929, AND THIS LEG FAILS ON THE UNFIXED BLOCK: a state dir with **NO `merged-*.done`
+  # AT ALL** — a fresh cell, a box after state loss, any box that has never landed — beside un-owned
+  # PRs. The gate used to SKIP on an empty answer, so the log stayed empty AND no artifact was written:
+  # the dead-man's switch could not report the one state it most exists for. `_drain ''` creates no
+  # marker at all, so removing the applied fix in the shipped block reddens HERE, by name.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain '' 180 0)"
+  case "$_out" in
+    *"DRAIN DEADLOCK"*"STARTED NO WORKER"*) echo "  ok a box that has NEVER landed (no merged-*.done at all) escalates — the empty answer IS the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    *"DRAIN STALLED"*"no land marker inside the window") echo "  ok a markerless box names the empty answer as the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    "") echo "  ❌ a state dir with NO land marker produced NO line at all — the escalation is disabled by the exact condition it exists for (#2929): '$_out'"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a markerless box produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if [ -s "$DO/state/drain-stall" ] && grep -q '^passes=1$' "$DO/state/drain-stall"; then
+    echo "  ok …and it WRITES the escalation record (state/drain-stall), so the next pass still knows"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a markerless box left no escalation artifact (#2929 ask 2): $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
   _out="$(_drain 200 180 4)"
   case "$_out" in
     *"DRAIN STALLED"*"spawned 4 worker(s)"*) echo "  ok a stall that DID spawn workers names them (a LAND problem, not an idle one)"; PASS=$((PASS+1)) ;;
