@@ -409,7 +409,20 @@ bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=
 
 # ── pr-doctor.py: the fleet's own generated worker brief must carry the contract, or every worker the
 # beat spawns is refused. Driven through the module, not grepped from the source.
-out="$("$ROOT/../venv-brief-probe" 2>/dev/null; python3 - "$ROOT" <<'PY' 2>/dev/null
+# ⛔ THE PROBE IS ISOLATED, AND ITS ISOLATION IS ASSERTED BELOW (agent-infra#2708, review). Before
+# agent-infra#2708 `brief()`'s success path logged NOTHING, so an unisolated probe neither resolved the
+# box's `brief-gate.sh` copies nor wrote anything outside the repo. Both changed: `research_section()`
+# now `log()`s a provenance line ("rendered by <copy> and admitted by N validator(s)"), `log()` appends
+# to `$STATE_DIR/pr-doctor.log` resolved AT CALL TIME from `HOME`, and `_brief_gate_paths()` widened the
+# ladder to `$AGENT_INFRA_PATH` and the farm with a VETO from any rung that refuses. Unisolated, that is
+# two defects in one line: this shard appends a fabricated provenance line to the operator's LIVE log
+# (indistinguishable from a real pass's, naming a copy no pass used -- the class
+# `test_pr_doctor.py::_clean_env` already closed for pytest), and its verdict becomes a statement about
+# what this box happens to have installed. `O` an empty dir + a private `HOME` + no `AGENT_INFRA_PATH`
+# leaves the TREE's own copy as the only rung, which is what the arm is about.
+mkdir -p "$TMP/pd-o" "$TMP/fakehome"
+out="$("$ROOT/../venv-brief-probe" 2>/dev/null; env -u AGENT_INFRA_PATH O="$TMP/pd-o" HOME="$TMP/fakehome" \
+        python3 - "$ROOT" <<'PY' 2>/dev/null
 import importlib.util, sys, os
 root = sys.argv[1]
 spec = importlib.util.spec_from_file_location("pd", os.path.join(root, "scripts", "pr-doctor.py"))
@@ -438,6 +451,19 @@ PY
 # that does not inherit it. `sigpipe-grep-guard` is repo-wide regardless, so the expansion stands on its
 # own merits and not on a `pipefail` claim this file cannot make.)
 [ "${out##*$'\n'}" = "ok" ]; ck $? "pr-doctor.py's generated brief carries the research contract (driven through brief())"
+# ⛔ AND THE PROVENANCE LINE LANDS IN THE FIXTURE, NAMING THE TREE'S OWN COPY -- asserted by EFFECT,
+# not by the presence of `HOME=`/`O=` above, and not by a prefix match either. Both halves of the
+# defect are graded here because both are visible in the one line: WHERE it went (inside the private
+# home, so the live operator log was never touched) and WHICH COPY it names (`_brief_gate_paths`,
+# `pr-doctor.py:3470-3482`, resolves `$ROOT/scripts/orchestrator-harness/brief-gate.sh` and nothing
+# else once `O` is an empty dir, `HOME` is private and `$AGENT_INFRA_PATH` is unset). Measured: a
+# PREFIX-ONLY grep is green on a half-revert that keeps `HOME=` and drops `O=`/`env -u`, because the
+# line still lands in the fixture -- it just names the BOX's copy and its validator count (the
+# box-dependence half of the defect, unasserted). Pinning the whole line reds that half-revert, so the
+# `O=` and `env -u` in the invocation above cannot rot silently. `-F`: `$ROOT` is a path, not a regex.
+grep -qF "brief: research contract rendered by $ROOT/scripts/orchestrator-harness/brief-gate.sh and admitted by 1 validator(s)" \
+  "$TMP/fakehome/.pi/agent/state/pr-doctor.log"; ck $? \
+  "…and its provenance line names the TREE's own copy (1 validator) and lands in the FIXTURE, never the live log"
 bash "$GATE" --check "$ROOT/.pd-brief.txt" worker >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "…and that generated brief PASSES the validator (worker role) (rc=$rc)"
 rm -f "$ROOT/.pd-brief.txt"

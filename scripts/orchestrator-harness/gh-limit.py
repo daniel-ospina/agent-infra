@@ -2844,6 +2844,70 @@ def reaches_api(argv):
     return argv[0] not in NO_REQUEST
 
 
+def makes_no_request_strictly(argv):
+    """The BOX-LOCK exemption. ⛔ DELIBERATELY NARROWER THAN `makes_request()` — they answer different
+    questions and only one of them is safe here.
+
+    `makes_request()` answers "can this call spend the ACCOUNT's budget?", and it is CORRECTLY
+    fail-OPEN about a few shapes that still reach the network: `gh api rate_limit` is exempt from the
+    limit yet is a real request, an `gh api` argv it cannot attribute is called "no evidence" rather
+    than "no request", and `NO_REQUEST_ANY` matches a help-looking token ANYWHERE in argv (`gh issue
+    create -t help` is a mutation with a title). Using that predicate for the LOCK — whose invariant is
+    the much stricter "one gh REQUEST in flight per box" — serialised nothing for those shapes:
+    measured in review, `api rate_limit` and `api --unknown-flag repos/o/r` went from peak 1 in flight
+    to peak 6, i.e. the fix would have traded a starved credential read for an UNSERIALISED fleet
+    (the exact failure #1988/#2005 exists to prevent), and a `gh issue create -t help` would have run
+    `pace_mutation`/`mark_mutation` outside the lock.
+
+    So this predicate is an exact allow-list of forms whose argv is PROVABLY local, and everything
+    else — including every form `makes_request()` merely cannot attribute — keeps the lock. The cost
+    of a MISS here is one serialised local read (a queue, i.e. today's behaviour); the cost of a
+    false POSITIVE is an unserialised API call.
+
+    ⛔ `reaches_api()` IS NOT IT EITHER, AND FOR THE SAME REASON IN THE OTHER DIRECTION. It answers the
+    BUDGET question (#2342), whose safe default is the opposite — "an argv I cannot attribute is
+    assumed to spend the pool" — so it answers False for `gh api rate_limit` (an exempt call that IS a
+    real request), for anything in `NO_REQUEST` (which includes the `alias`/`config` WRITE forms), and
+    for any argv carrying a help-looking token via `NO_REQUEST_ANY` (`gh issue create -t help` is a
+    real mutation with a title). Keyed on it the lock would be skipped for a live meter call, for two
+    concurrent `gh config set`s that then lose a setting, and for a mutation whose title is `help`.
+    Three predicates, three questions, three safe defaults: this file deliberately derives none of
+    them from another."""
+    if not argv:
+        return True                      # bare `gh` prints help
+    if argv[0] in ("alias", "config"):
+        # ⛔ NOT THE WHOLE `NO_REQUEST` SET (review finding, 2026-10-30): `gh config set`, `gh alias
+        # set`/`delete` do a LOAD-MODIFY-WRITE of `~/.config/gh/config.yml` — the same file for both —
+        # and the box lock was their ONLY serialiser (no pacing predicate covers them: `MUTATING_PAIRS`
+        # has no config/alias pair). Exempting them wholesale would let two concurrent `gh config set`
+        # calls LOSE A SETTING (writer vs writer — closed by this allow-list). ⛔ THE READER RACE IS
+        # ACCEPTED, NOT CLOSED (review finding, 2026-10-30): an exempt `config get` can still observe a
+        # writer's truncate-then-write window, because it takes no lock. Accepted deliberately — no
+        # harness caller reads gh config (grepped), and a reader cannot CORRUPT the file, so the cost is
+        # a transient misread against a lock that every credential refresh pays for. Serialising readers
+        # with writers is the alternative, and it would put a LOCAL read back in the queue this change
+        # exists to empty. The exemption is about REQUESTS; the write forms make none but they DO write,
+        # so the only READ-ONLY forms are exempt — with ONE stated exception, because that rule is about
+        # what a concurrent writer can LOSE: `config clear-cache` does write, but only the on-disk
+        # API-response cache (it deletes it) and never `config.yml`, so it is a CACHE-ONLY WRITER —
+        # request-free, and destroying a local cache is not a setting two callers can lose, which is what
+        # puts it here rather than with `config set` (review note: the sentence above read as a universal
+        # rule this tuple entry contradicted).
+        # ⛔ and the BARE forms (`gh alias`, `gh config`) print help and are request-free — they are
+        # exempt too, which the `len(argv) == 1` half expresses (an `("alias", "")` tuple entry could
+        # never match: the tuple is only reached with two argv entries).
+        if len(argv) == 1:
+            return True
+        return (argv[0], argv[1]) in (
+            ("alias", "list"),
+            ("config", "get"), ("config", "list"), ("config", "clear-cache"))
+    if argv[0] in NO_REQUEST:
+        return True                      # --version/version/help/--help/-h/completion
+    # `gh auth token [--hostname H] [-s]` reads hosts.yml or the keyring; nothing else under `auth` is
+    # exempt (`auth status` VALIDATES the token against the API — it takes the lock).
+    return len(argv) >= 2 and argv[0] == "auth" and argv[1] == "token"
+
+
 def bucket_for(argv):
     if not argv:
         return "graphql"
@@ -4250,7 +4314,9 @@ def _named_floor_refusal(remaining, floor, reset, dated):
 
 
 def _dispatch(real_gh, gh_argv):
-    """Run, back off, retry — holding the single-flight lock for each ATTEMPT and NOT for the wait.
+    """Run, back off, retry — holding the single-flight lock for each ATTEMPT THAT ISSUES A REQUEST
+    (see `makes_no_request_strictly`: a provably local form skips the lock entirely, because a call
+    that makes no request cannot overlap one) and NOT for the wait.
 
     ⛔ THE LOCK IS RELEASED DURING A WAIT, deliberately. The invariant is "one gh request in flight
     per box", not "one caller in the queue": holding it through a 60/120/240 s backoff would park
@@ -4474,7 +4540,22 @@ def _dispatch(real_gh, gh_argv):
                         log_event("account budget: %s still at its share after waiting %ds — proceeding "
                                   "OVER the partition (recorded, not silent)" % (bucket, int(w0)))
         attempt += 1
-        lock = acquire_lock()
+        # ⛔ THE SINGLE-FLIGHT LOCK IS FOR REQUESTS, NOT FOR CALLS (#3138). Its invariant is "one gh
+        # REQUEST in flight per box" — and a call that makes NO request cannot overlap anyone. Taking
+        # the lock anyway made a purely LOCAL read queue behind every API call on the box, and the
+        # measured consequence was not slow: it was a REFUSED WORKER. `wt_gh_token` / the launch-line
+        # guard run `gh auth token` (an OFFLINE hosts.yml/keyring read — `makes_request()` is False)
+        # under a 10 s alarm, through the `gh-rest` PATH shim, i.e. through THIS function — so on a
+        # busy box the credential read waited its turn and the alarm fired first. Measured on the mac
+        # 2026-10-30 (uncontended): `gh-rest/gh auth token` 4.1 s vs the real binary's 0.009 s; 8
+        # concurrent shim calls on a cell: 436/571/691/858/1052/1259/1395/1529 ms — strictly linear,
+        # which is a queue, not work. `worker-terminal.sh` then reported rc=98 ("the credential
+        # contract FAILS") and agent-infra merged 0 PRs for 9 hours while the controller classified
+        # correctly. ⛔ THE PREDICATE IS `makes_no_request_strictly`, NOT `counts_budget`: the budget
+        # predicate is fail-OPEN for shapes that DO reach the network (`api rate_limit`, an
+        # unattributable `api` argv, a help-looking flag VALUE) and using it here unserialised them
+        # (review finding, measured: peak 1 -> peak 6). See that function's own note.
+        lock = None if makes_no_request_strictly(gh_argv) else acquire_lock()
         try:
             if mutating:
                 w = pace_mutation()
