@@ -32,7 +32,9 @@ aboutObjects: agent-infra, issue-3131, mergify, ci-main, atomic-land
 > batch only with a clean review recorded at its LIVE head (`~/.pi/agent/reviews/<owner>-<repo>-<N>.json`,
 > `head_sha` == live `headRefOid`); a PR's own CI is not the gate. Verdicts: `BATCH-GREEN`,
 > `BATCH-GREEN(BASELINE(ids))`, `BATCH-RED(ids)`. A culprit is DROPPED from the batch, never fixed inside
-> it. Owner doctrine: tortoise#10399 / `docs/ops/batch-integration.md`.
+> it. Owner doctrine: tortoise#10399 - stated there in full, and written up in the TORTOISE repo's
+> `docs/ops/batch-integration.md`, which lands with tortoise PR #10400 (that path does not exist on
+> tortoise `main` yet, so the issue comment is the durable copy).
 
 > **For Pi:** Use `executing-plans` to implement this plan task-by-task.
 
