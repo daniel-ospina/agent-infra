@@ -56,18 +56,28 @@
 #   inside cmux ("Access denied - only processes started inside cmux can connect"), measured by
 #   running the launchd job. So a launchd job / systemd unit can never ACT on a pane, however healthy
 #   it is. The arm therefore stops at the FILE, and the file's consumer must be a process that is a
-#   legitimate ancestor: the controller loop / the tmux-resident doctor. `cloud-cell-doctor.sh`'s
-#   `lanes` role calls this script on the cells for exactly that reason; `cloud-cell-supervisor.sh
-#   status` reads the per-role record it writes.
+#   legitimate ancestor: the controller loop / the tmux-resident doctor.
+#   ⛔ NO SUCH CALLER EXISTS IN THIS REPO, AND THIS COMMENT USED TO SAY ONE DID (2026-10-31, review).
+#   It claimed "cloud-cell-doctor.sh's `lanes` role calls this script on the cells for exactly that
+#   reason; cloud-cell-supervisor.sh status reads the per-role record it writes" -- and neither file
+#   mentions lane-arm or LANE-QUEUE at all (measured: no match in either). A comment asserting a
+#   wired producer is the very failure this PR removes, asserted one layer up. So, plainly: the ONLY
+#   caller today is the timer/service `install-lane-arm-timer.sh` installs -- and on a host that
+#   authorises cmux by ancestry that timer is a CANARY, not a producer (see below). The producer does
+#   not exist yet; it has to be ADDED -- a `lanes` role in the cell doctor, or the controller loop
+#   calling this script from a cmux descendant and then draining state/LANE-QUEUE.tsv.
 #
 # PORTABILITY: bash 3.2 (macOS) and bash 5 (Linux). No `timeout(1)` (macOS does not ship it -- hence
 # `bounded()`), no /proc, no `free`, no GNU-only flags. `python3` is the only dependency, which both
 # platforms already need for the classifier itself.
 #
-# EXIT: 0 published a fresh verdict (lists + queue)
+# EXIT: 0 published a fresh verdict (the snapshot, the recap and the queue)
 #       4 could not measure, the sample was too old, the lists failed, or the queue could not be
-#         rendered/published -- NOTHING from this pass is published as current, and the previous
-#         snapshot AND queue are left standing (nothing is lost, and no half-published pair).
+#         rendered/published. NOTHING THIS FILE OWNS is published as current: the previous snapshot
+#         AND queue are left standing (nothing is lost, and no half-published pair). The recap/beat
+#         pair is written by `lane-actions.py` inside its own bound publish -- step 4 renders it
+#         AFTER the queue, so a queue failure writes nothing, and the residual (a failure between the
+#         renderer and the final rename) is lane-actions.py's own torn-pair exit 3/4 to report.
 #       2 a usage error (a non-numeric/zero --budget or --max-snapshot-age, or a bad flag).
 #
 # ⛔ WHAT THIS ARM NEEDS FROM ITS CONTEXT, BECAUSE IT CANNOT SUPPLY IT. The classifier enumerates the
@@ -104,6 +114,9 @@ STALE_LOCK_S=900
 BUDGET=240
 MAX_AGE=900
 SHOW=0
+# The pid of whatever `bounded()` currently has in flight, so the signal handler can stop it instead
+# of orphaning it (see the trap block). Emptied by `bounded()` on the normal path.
+CUR_PID=""
 
 # ⛔ A NON-NUMERIC BOUND SILENTLY REMOVES THE BOUND (2026-10-31, review). `bounded()` sleeps for
 # "$secs" and the watchdog `exit 0`s when `sleep` rejects the value -- so `--budget abc` left the child
@@ -128,6 +141,12 @@ while [ $# -gt 0 ]; do
 done
 
 mkdir -p "$STATE" 2>/dev/null || { echo "lane-arm: cannot create $STATE" >&2; exit 4; }
+
+# ⛔ THE ERROR CHANNEL MUST SURVIVE THE COMMAND IT INTERRUPTS (2026-10-31, review). A trap that fires
+# while `bounded()` is running inherits THAT command's redirections -- so the interruption message was
+# written into the per-pass capture and then removed with it, and the operator saw NOTHING while the
+# pass exited 4 (measured). Keep a copy of the arm's own stderr on fd 3 and report through it.
+exec 3>&2
 
 log() { printf '%s LANE-ARM %s\n' "$(date '+%m-%d %H:%M:%S')" "$1" >>"$LOG" 2>/dev/null || true; }
 
@@ -157,13 +176,32 @@ bounded() {
   # ⛔ THE WATCHDOG OWNS ITS OWN SLEEPER: the first version forked the sleeper in the MAIN shell and
   # `wait`ed on it from inside a subshell, which cannot work ("pid N is not a child of this shell"),
   # so the watchdog exited at once and the bound killed nothing, ever.
-  ( sleep "$secs" || exit 0
+  # ⛔ AND THE WATCHDOG MUST NOT LEAK ITS SLEEPER (2026-10-31, review). `sleep` is a CHILD of the
+  # watchdog subshell, so `kill "$wd"` left the sleeper reparented to init for the rest of the bound
+  # -- measured: eight `sleep 240` processes after eight passes. That is harmless TODAY only because
+  # the process that would fire the stale `kill` is the one that died; an accident, not an invariant,
+  # and not something this file may rely on. So the subshell traps TERM and kills its OWN sleeper.
+  # ⛔ `_hit` GUARDS THE ORDERING: if the trap fires before `wait` returns, the subshell exits WITHOUT
+  # falling through to the child-identity check -- a watchdog that outlived its own kill could
+  # otherwise signal a pid the parent has already reaped and the OS has recycled, which is exactly
+  # the destructive-from-a-stale-reading class the comment above is about.
+  # No GNU-only constructs: `wait` on an explicit job and a TERM trap both exist in bash 3.2.
+  ( _slp=""; _hit=0
+    trap '_hit=1; kill "$_slp" 2>/dev/null; exit 0' TERM
+    sleep "$secs" & _slp=$!
+    wait "$_slp" 2>/dev/null; local _sw=$?
+    [ "$_hit" = 0 ] || exit 0
+    [ "$_sw" = 0 ] || exit 0
     [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$me" ] || exit 0
     kill -TERM "$pid" 2>/dev/null
-    sleep 5
+    sleep 5 & _slp=$!
+    wait "$_slp" 2>/dev/null
+    [ "$_hit" = 0 ] || exit 0
     [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$me" ] || exit 0
     kill -KILL "$pid" 2>/dev/null ) 2>/dev/null & local wd=$!
+  CUR_PID="$pid"
   wait "$pid" 2>/dev/null; local rc=$?
+  CUR_PID=""
   kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
   return $rc
 }
@@ -200,8 +238,33 @@ if [ -e "$LOCK" ]; then
   fi
   rm -f "$LOCK" 2>/dev/null || true
 fi
-( set -C; : >"$LOCK" ) 2>/dev/null || { echo "lane-arm: cannot create $LOCK in $STATE (read-only or full?)" >&2; log "FAIL cannot create lock"; exit 4; }
-trap 'rm -f "$LOCK" "$SNAP.prev.$$" 2>/dev/null || true' EXIT INT TERM
+( set -C; : >"$LOCK" ) 2>/dev/null || { echo "lane-arm: cannot create $LOCK in $STATE -- the state dir is read-only or full, OR another pass won the race for it, OR a file another user owns is in the way (this dir is shared by the timer's identity and the cmux descendant's, whose owners must match -- see install-lane-arm-timer.sh)" >&2; log "FAIL cannot create lock"; exit 4; }
+# ⛔ AN EXTERNAL SIGNAL IS NOT THE BOUND (2026-10-31, review). With ONE cleanup trap on
+# EXIT/INT/TERM, a TERM to the arm interrupted `wait` inside `bounded()`, and the interrupted wait's
+# status then landed in the `137|143` arm below -- so a pass an operator killed was reported as
+# "classifier KILLED at the 240s bound", which sends the reader to tune a budget, and the sampler was
+# left ORPHANED (measured: the python3 child reparented to init and still running). That is the
+# misreport this file's own header quotes the cells for. So the signal handler kills the in-flight
+# child, says what actually happened, and exits 4 with nothing published.
+# ⛔ ONE CLEANUP LIST, COVERING EVERY TEMP FILE THIS PASS CAN LEAVE BEHIND (2026-10-31, review).
+# The queue temp was rendered in step 3 and only renamed in step 5, so any failure in between (e.g. the
+# renderer in step 4) leaked `LANE-QUEUE.tsv.arm.<pid>` into the state dir on every abstaining pass --
+# measured. On the success path all of these have already been rename()d away, so removing them here
+# is a no-op; on every abort path it is the whole cleanup.
+_on_cleanup() {
+  rm -f "$LOCK" "$SNAP.prev.$$" \
+        "${TMP:-}" "${QTMP:-}" \
+        "${STATUS_ERR_TMP:-}" "${ACTIONS_OUT_TMP:-}" "${ACTIONS_ERR_TMP:-}" 2>/dev/null || true
+}
+_on_signal() {
+  [ -n "$CUR_PID" ] && kill -TERM "$CUR_PID" 2>/dev/null
+  _on_cleanup
+  echo "lane-arm: INTERRUPTED by a signal -- NOT the ${BUDGET}s bound; nothing from this pass is published, and the previous snapshot and queue are left standing" >&3
+  log "INTERRUPTED by signal"
+  exit 4
+}
+trap _on_cleanup EXIT
+trap _on_signal INT TERM
 
 # ── 1. THE MEASUREMENT (never mtime, never ps -o pcpu -- that is lane-status.py's own rule) ─────
 [ -f "$SC/lane-status.py" ] || fail "classifier ABSENT at $SC/lane-status.py -- install it before scheduling this arm (on the cells it was missing entirely on 2026-10-31, which made lane-actions.py fail on every pass)"
@@ -217,14 +280,34 @@ TMP="$SNAP.arm.$$"
 # Reporting the second for both sends the reader to tune a budget instead of to the actual error —
 # which is exactly the misreport this script's header quotes from the cells ("failed after 0.0s of a
 # 60.0s budget", where nothing timed out at all).
+# ⛔ THE DIAGNOSTIC CAPTURES ARE PER-PASS AND PUBLISHED BY RENAME -- NEVER TRUNCATED IN PLACE
+# (2026-10-31, review). These were fixed names opened with `>`, and the timer installs a SYSTEM unit
+# while the only context that can MEASURE is a cmux descendant: two identities, one fixed-name file.
+# Measured: a root pass left `lane-arm.status.err` owned by root, the next user pass could not even
+# OPEN it ("Permission denied"), so bash never ran the classifier -- and the pass reported
+# "classifier EXITED 1 -- not a timeout", naming the wrong program and locking that identity out on
+# every later pass. A per-pass name removes the collision (a rename replaces the target and needs
+# only write permission on the DIRECTORY), and a capture that could not be created is now its own
+# diagnosis instead of a classifier exit.
+STATUS_ERR="$STATE/lane-arm.status.err"
+STATUS_ERR_TMP="$STATUS_ERR.$$"
+ACTIONS_OUT="$STATE/lane-arm.actions.out"
+ACTIONS_OUT_TMP="$ACTIONS_OUT.$$"
+ACTIONS_ERR="$STATE/lane-arm.actions.err"
+ACTIONS_ERR_TMP="$ACTIONS_ERR.$$"
 SAMPLE_T0="$(now_s)"
-bounded "$BUDGET" "$PY" "$SC/lane-status.py" --json --no-cache >"$TMP" 2>"$STATE/lane-arm.status.err"
+bounded "$BUDGET" "$PY" "$SC/lane-status.py" --json --no-cache >"$TMP" 2>"$STATUS_ERR_TMP"
 rc=$?
+if [ ! -e "$STATUS_ERR_TMP" ]; then
+  rm -f "$TMP"
+  fail "cannot even WRITE the status capture in $STATE (as $(id -un 2>/dev/null || echo 'this user')) -- the classifier was NEVER INVOKED, so this is not a classifier fault; nothing is published"
+fi
+mv -f "$STATUS_ERR_TMP" "$STATUS_ERR" 2>/dev/null || true
 if [ "$rc" -ne 0 ]; then
   rm -f "$TMP"
   case "$rc" in
-    137|143) fail "classifier KILLED at the ${BUDGET}s bound (see $STATE/lane-arm.status.err); previous snapshot left standing" ;;
-    *)     fail "classifier EXITED $rc — not a timeout (see $STATE/lane-arm.status.err); previous snapshot left standing" ;;
+    137|143) fail "classifier KILLED at the ${BUDGET}s bound (see $STATUS_ERR); previous snapshot left standing" ;;
+    *)     fail "classifier EXITED $rc — not a timeout (see $STATUS_ERR); previous snapshot left standing" ;;
   esac
 fi
 # A partial/half-written snapshot must never be published, and neither must an empty one.
@@ -275,30 +358,7 @@ if [ "$sa" -gt "$MAX_AGE" ]; then
   fail "the sample took ${sa}s (> ${MAX_AGE}s) -- a reading that old is not presented as current"
 fi
 
-# ── 3. THE LISTS (cache-aware: --stdin never re-samples, so this cannot double the cost) ───────
-[ -f "$SC/lane-actions.py" ] || fail "lane-actions.py ABSENT at $SC/lane-actions.py"
-if ! bounded "$BUDGET" "$PY" "$SC/lane-actions.py" --stdin "$TMP" >"$STATE/lane-arm.actions.out" 2>"$STATE/lane-arm.actions.err"; then
-  rm -f "$TMP"
-  fail "lane-actions.py failed (see $STATE/lane-arm.actions.err); previous snapshot AND recap left standing"
-fi
-# ⛔ EVERYTHING IS RENDERED *BEFORE* THE SNAPSHOT IS PUBLISHED, so this file's own promise -- "a pass
-# that cannot measure publishes nothing and the previous artifacts are left standing" -- is TRUE for
-# the queue as well as the lists. ⛔ THE QUEUE USED TO RENDER *AFTER* THE PUBLISH (2026-10-31,
-# review): measured, a pass that abstained at the queue step exited 4 having ALREADY replaced
-# lane-status.last.json, leaving a NEW snapshot beside a STALE LANE-QUEUE.tsv and a stale `wedged=`
-# story -- the partial publish the contract above denies. The temp file is therefore still in place
-# when the renderer runs; it is renamed to $SNAP only once every consumer of these bytes has
-# succeeded (see the publish block at the end of the handoff section).
-# The other order destroys the last good fleet view in a pass that then abstains: a degraded read is still
-# valid JSON with a list, so it would replace the good snapshot and only then be refused by
-# lane-actions.py. `--stdin <path>` does not re-sample, and lane-actions derives its age from that
-# file's mtime, so rendering against the temp file changes nothing it reports.
-# ⛔ AND THIS IS THE ONLY `mv` TO $SNAP IN THIS FILE, and it happens at the END. An earlier revision
-# left the old publish in place here as well, so the temp file was already gone when the renderer
-# ran: every pass exited 4 AND the snapshot had been replaced. Three revisions of this ordering have
-# now shipped; the invariant is "one publish, last, restored if it fails part-way".
-
-# ── 4. THE HANDOFF: one machine-readable line per WEDGED lane ─────────────────────────────────
+# ── 3. THE HANDOFF: one machine-readable line per WEDGED lane ─────────────────────────────────
 # The .md is prose for a human; a consumer should not have to parse it. This is the contract.
 # Columns: verdict <TAB> lane <TAB> workspace <TAB> session <TAB> why
 # The WHY is BUILT FROM THE SNAPSHOT FIELDS, never parsed out of the prose recap: the recap is for a
@@ -306,6 +366,9 @@ fi
 # (the "a gate that cannot answer its own question" class). Every number a human needs to judge the
 # row -- the CPU delta, the child, the tool and its own declared bound, how long it has been quiet --
 # is on the line, so the reader never has to go and re-measure to decide whether it is a wedge.
+# ⛔ THIS RENDERS FIRST, BEFORE ANYTHING IS WRITTEN -- INCLUDING THE RECAP (2026-10-31, review).
+# It reads only $TMP, so it can, and doing it here is what makes "a queue failure publishes nothing"
+# true: the renderer (step 4) is the last thing that can write, and it owns its own bound pair.
 QTMP="$QUEUE.arm.$$"
 # The pass marker the queue header carries (see the comment at the header). `sa` is the SAMPLE age
 # measured above -- the wall time this pass spent obtaining its reading -- so it is a real datum and
@@ -335,14 +398,17 @@ for ev in lanes:
     if not isinstance(ev, dict):
         continue
     st = str(ev.get("state") or ev.get("verdict") or "").upper().replace("-", "_")
-    # ⛔ THE QUEUE IS THE MACHINE FORM OF LIST 2, SO IT MUST USE LIST 2'S RULE — not a WEDGED-only
-    # filter. `lane-actions.py` puts STALLED, DEAD and CHILD-STUCK in its `wedged` bucket (the same
-    # rows a human sees under "TO UNBLOCK"), and it renders a raw WEDGED row through the words layer,
-    # which can land it in LIST 1 or REPORT instead. So `st != "WEDGED"` disagreed with the recap in
-    # BOTH directions: a fleet of parked children rendered `wedged=0` / exit 0 here while the human
-    # list showed them as to-unblock, and a WEDGED row could be queued after the words layer had
-    # already dispositioned it. Match the bucket, and keep the split-token form because the verdict
-    # arrives hyphenated.
+    # ⛔ THE QUEUE IS A SUPERSET OF LIST 2, AND THE SET IS NAMED HERE SO A CONSUMER CAN SEE WHAT IT
+    # IS DRAINING (2026-10-31, review). list 2's `wedged` bucket is `("STALLED", "DEAD",
+    # "CHILD-STUCK")` over the WORDS-LAYER verdict (lane-actions.py:1769); a bare `WEDGED` is NOT in
+    # that tuple and would fall to `report` (:1786). This queue reads the SNAPSHOT's own vocabulary
+    # instead (WEDGED is the classifier's word for a wedge), so it is a SUPERSET, not "list 2's rule":
+    # a row here may be a lane the words layer later dispositions into LIST 1 or REPORT. That is
+    # deliberate -- the snapshot's wedge verdict is the thing a consumer must re-measure, and the
+    # three gates in docs/ops/fleet-liveness.md are re-measured AT THE MOMENT OF ACTION, never taken
+    # from this file. A previous comment claimed this matched list 2's bucket exactly, which was
+    # wrong in both directions; superset-and-re-measure is the honest description.
+    # Keep the split-token form: the snapshot's verdict arrives hyphenated (`CHILD-STUCK`).
     if st not in ("WEDGED", "STALLED", "DEAD", "CHILD_STUCK", "CHILD_STUCK_PARKED"):
         continue
     lane = str(ev.get("lane") or ev.get("name") or "-")
@@ -377,6 +443,57 @@ then
   rm -f "$QTMP"
   fail "could not render the wedged queue from the snapshot — nothing published; previous snapshot AND queue left standing"
 fi
+
+# ── 4. THE LISTS (cache-aware: --stdin never re-samples, so this cannot double the cost) ───────
+[ -f "$SC/lane-actions.py" ] || fail "lane-actions.py ABSENT at $SC/lane-actions.py"
+if ! bounded "$BUDGET" "$PY" "$SC/lane-actions.py" --stdin "$TMP" >"$ACTIONS_OUT_TMP" 2>"$ACTIONS_ERR_TMP"; then
+  rm -f "$TMP" "$ACTIONS_OUT_TMP" "$ACTIONS_ERR_TMP"
+  fail "lane-actions.py failed (see $ACTIONS_ERR); previous snapshot AND recap left standing"
+fi
+if [ ! -e "$ACTIONS_ERR_TMP" ]; then
+  rm -f "$TMP"
+  fail "cannot even WRITE the renderer capture in $STATE (as $(id -un 2>/dev/null || echo 'this user')) -- lane-actions.py was NEVER INVOKED, so this is not a renderer fault; nothing is published"
+fi
+mv -f "$ACTIONS_OUT_TMP" "$ACTIONS_OUT" 2>/dev/null || true
+mv -f "$ACTIONS_ERR_TMP" "$ACTIONS_ERR" 2>/dev/null || true
+# ⛔ THE RENDERER RUNS *LAST* BECAUSE IT IS THE ONLY THING THAT WRITES OUTSIDE THIS FILE'S PUBLISH
+# (2026-10-31, review). `lane-actions.py` publishes state/NEEDS-ACTION.md and its .beat sidecar as a
+# BOUND pair inside `write_pair`, and its own `--out` seam is not usable here: write_pair fixes the
+# beat at $STATE/NEEDS-ACTION.beat and stamps it with the digest of the recap it wrote, so rendering
+# to a staging path would publish a beat bound to a file no reader hashes (lane-actions.py:2246-2251
+# says so itself). So the recap CANNOT be made part of this file's rename-pair transaction without
+# re-implementing write_pair. What this file can do is order for it: the queue is rendered FIRST
+# (from $TMP, before anything is written), then the renderer, then the pair is published. A queue
+# failure therefore writes NOTHING AT ALL, where the old order had already written the recap. The
+# residual, stated instead of implied: a failure between the renderer and the publish leaves a NEW
+# recap beside the PREVIOUS snapshot and queue. That is exactly the pair lane-actions.py owns and
+# reports as torn/withheld on its own terms (its exit 3/4), so a reader is not misled -- but this
+# file's "nothing from this pass is published" promise is about the SNAPSHOT AND QUEUE it owns, and
+# the header now says so rather than claiming more.
+# The other order destroys the last good fleet view in a pass that then abstains: a degraded read is still
+# valid JSON with a list, so it would replace the good snapshot and only then be refused by
+# lane-actions.py. `--stdin <path>` does not re-sample, and lane-actions derives its age from that
+# file's mtime, so rendering against the temp file changes nothing it reports.
+# ⛔ AND THIS IS THE ONLY `mv` TO $SNAP IN THIS FILE, and it happens at the END. An earlier revision
+# left the old publish in place here as well, so the temp file was already gone when the renderer
+# ran: every pass exited 4 AND the snapshot had been replaced. Three revisions of this ordering have
+# now shipped; the invariant is "one publish, last, restored if it fails part-way".
+# ⛔ EVERYTHING IS RENDERED *BEFORE* THE SNAPSHOT IS PUBLISHED, so this file's own promise -- "a pass
+# that cannot measure publishes nothing and the previous artifacts are left standing" -- is TRUE for
+# the queue as well as the lists. ⛔ THE QUEUE USED TO RENDER *AFTER* THE PUBLISH (2026-10-31,
+# review): measured, a pass that abstained at the queue step exited 4 having ALREADY replaced
+# lane-status.last.json, leaving a NEW snapshot beside a STALE LANE-QUEUE.tsv and a stale `wedged=`
+# story -- the partial publish the contract above denies. The temp file is therefore still in place
+# when the renderer runs; it is renamed to $SNAP only once every consumer of these bytes has
+# succeeded (see the publish block at the end of the handoff section).
+# The other order destroys the last good fleet view in a pass that then abstains: a degraded read is still
+# valid JSON with a list, so it would replace the good snapshot and only then be refused by
+# lane-actions.py. `--stdin <path>` does not re-sample, and lane-actions derives its age from that
+# file's mtime, so rendering against the temp file changes nothing it reports.
+# ⛔ AND THIS IS THE ONLY `mv` TO $SNAP IN THIS FILE, and it happens at the END. An earlier revision
+# left the old publish in place here as well, so the temp file was already gone when the renderer
+# ran: every pass exited 4 AND the snapshot had been replaced. Three revisions of this ordering have
+# now shipped; the invariant is "one publish, last, restored if it fails part-way".
 
 # ── 5. ONE PUBLISH, LAST, AND RESTORED IF IT FAILS PART-WAY ──────────────────────────────────
 # The snapshot is the PRIMARY artifact and the queue is derived from it, so both temp files are fully

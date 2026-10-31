@@ -75,6 +75,14 @@ LABEL="eldato-lane-arm"
 
 VERB="install"
 DRY=0
+# ⛔ WHO THE UNIT RUNS AS, RENDERED INTO IT (2026-10-31, review). Empty means "let systemd decide"
+# (root, for a system unit) -- which is correct only when the state dir is root's too. See the
+# scope-selection block below: a system unit whose $STATE_DIR belongs to another user would otherwise
+# write its files as root, and the user-owned producer (the only context that can MEASURE) is then
+# locked out of its own state dir. RENDER_ID carries the multi-line directives; RENDER_HOME overrides
+# the HOME the unit exports.
+RENDER_ID=""
+RENDER_HOME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --install)   VERB="install" ;;
@@ -133,7 +141,7 @@ Documentation=agent-infra scripts/lane-arm.sh
 
 [Service]
 Type=oneshot
-Environment=HOME=$HOME
+Environment=HOME=${RENDER_HOME:-$HOME}
 Environment=LANE_ARM_SCRIPTS=$SCRIPTS_DIR
 Environment=LANE_ARM_STATE=$STATE_DIR
 # ⛔ UNQUOTED, DELIBERATELY. systemd splits an ExecStart into words HONOURING quotes, and the FIRST
@@ -145,7 +153,16 @@ Environment=LANE_ARM_STATE=$STATE_DIR
 # (Named in prose, not in backticks: see the heredoc rule immediately below — this comment lives INSIDE
 # the expansion heredoc, so a backticked span here would run as a command substitution and corrupt the
 # unit. That is the recorded regression this file already carries a rule about.)
-ExecStart=/bin/bash $ARM
+# ⛔ AND THE IDENTITY IS PART OF THE CONTRACT (2026-10-31, review). A system unit runs as ROOT unless
+# it says otherwise, while \$STATE_DIR usually belongs to the INSTALLING user -- and the only context
+# that can MEASURE (a cmux descendant) runs as that user. Two identities, one state dir: measured, a
+# root pass left a root-owned capture that made the next user pass fail to OPEN its own log and report
+# "classifier EXITED 1" (the wrong program, permanently). So a unit landing in a SYSTEM dir is
+# rendered as the owner of \$STATE_DIR, with that user's HOME; root-owned state keeps the root default.
+# Empty for a --user unit, where systemd REJECTS User=.
+# (Named in prose, not in backticks -- see the heredoc rule above: this comment is INSIDE the
+# expansion heredoc and a backticked span here would run as command substitution.)
+${RENDER_ID}ExecStart=/bin/bash $ARM
 # NOT 'Restart=' and NOT 'SuccessExitStatus=4': exit 4 means "could not measure", and a timer that
 # swallows it is the no-op gate this repo keeps removing. The failure stays visible in
 # 'systemctl --failed' and in the journal.
@@ -228,6 +245,16 @@ except OSError: raise SystemExit(1)' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || 
     macos)
       "$LAUNCHCTL" list 2>/dev/null | grep -F 'com.eldato.lane-arm' || say "job      : not installed"
       ;;
+    # ⛔ AN UNKNOWN PLATFORM IS NOT A SCHEDULE (2026-10-31, review). This `case` had no `*)` arm, so on
+    # any platform that is neither Linux nor Darwin `--status` printed the platform/arm/classifier/queue
+    # lines, said NOTHING about the timer, and exited 0 -- a status verb reporting success about the one
+    # question it could not answer, which is the no-op shape `install` and `uninstall` already refuse
+    # (:272, :339). It refuses here too, and exits 1 because nothing was verified.
+    *)
+      say "timer    : UNKNOWN platform $(uname -s) -- cannot verify a schedule here"
+      say "FAIL: unsupported platform $(uname -s) -- --status cannot answer whether anything is scheduled" >&2
+      exit 1
+      ;;
   esac
   exit 0
 }
@@ -293,6 +320,30 @@ case "$OS" in
     else
       fail "no systemd target: no passwordless sudo for /etc/systemd/system and no user manager. The arm is NOT scheduled — install manually or grant sudo."
     fi
+    # ⛔ PREFERRING A SYSTEM UNIT IS ONLY SAFE IF THE UNIT ALSO GETS THE RIGHT IDENTITY. Compute it
+    # HERE, before anything is rendered or --dry-run printed, from the owner of the state dir the arm
+    # writes into. `stat -c` is GNU, and this block is only reached for systemd (Linux) -- the macOS
+    # path below never renders a User=: a launchd agent already runs as its owner.
+    RENDER_ID=""
+    RENDER_HOME=""
+    case "$D" in
+      /etc/systemd/system|/etc/systemd/system/|/lib/systemd/system|/lib/systemd/system/|/usr/lib/systemd/system|/usr/lib/systemd/system/)
+        _owner="$(stat -c '%U' "$STATE_DIR" 2>/dev/null || true)"
+        if [ -n "$_owner" ] && [ "$_owner" != root ]; then
+          _group="$(stat -c '%G' "$STATE_DIR" 2>/dev/null || true)"
+          RENDER_HOME="$(getent passwd "$_owner" 2>/dev/null | cut -d: -f6)"
+          if [ -z "$RENDER_HOME" ]; then RENDER_HOME="$(eval echo "~$_owner" 2>/dev/null)"; fi
+          [ -n "$RENDER_HOME" ] || fail "cannot resolve HOME for $_owner (owner of $STATE_DIR) -- refusing to render a $(basename "$D") unit whose HOME would not match the state dir it writes"
+          case "$RENDER_HOME" in *[[:space:]]*) fail "the HOME of $_owner ('$RENDER_HOME') contains whitespace -- systemd would split the Environment= line";; esac
+          RENDER_ID="User=$_owner"
+          if [ -n "$_group" ]; then RENDER_ID="$RENDER_ID
+Group=$_group"; fi
+          RENDER_ID="$RENDER_ID
+"
+          say "identity: the unit runs as $_owner ($RENDER_HOME) -- the owner of $STATE_DIR, not root"
+        fi
+        ;;
+    esac
     if [ "$DRY" = 1 ]; then
       say "--- would install $D/${LABEL}.service ---"; service_body
       say "--- would install $D/${LABEL}.timer ---"; timer_body
