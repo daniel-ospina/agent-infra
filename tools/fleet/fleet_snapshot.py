@@ -61,7 +61,12 @@ The population decision, stated as the thing it buys and the thing it costs:
   transcript's last-write age in the detail. **``dead`` is NOT reachable for this
   population** and that is deliberate: ``dead`` requires a fenced incarnation
   positively observed absent (#1178 C1), and a dispatch lane has no durable pid
-  to fence — the same position the ref-claim registry is in.
+  to fence — the same position the ref-claim registry is in. The invariant is
+  held by an ARM in ``liveness.evaluate`` (a borrowed incarnation that reads
+  ``absent`` is the same abstention), not by there being no case that reaches
+  ``dead``: a lane whose bound process exits between the pass's ``/proc`` read
+  and its own probe is ordinary fleet life, and it too reads
+  ``unknown/no-bound-incarnation``.
 * **The bounded staleness, named.** A transcript row is kept while its last
   write is inside the reaper's own idle proof (``liveness.IDLE_MS`` = 24 h) or a
   live process is bound to it. Beyond 24 h the lane is retirement, not a stuck
@@ -411,6 +416,10 @@ def dispatch_lanes(
             "holder_pid": v.holder_pid,
             "evidence": v.detail or ev.dispatch_detail,
         })
+    # `dead` is unreachable for this population by construction (the borrowed-
+    # incarnation arm in liveness.evaluate), so this key is an ordering habit, not
+    # a reachable case — kept so a future change that DID make `dead` reachable
+    # would still sort the false DEAD first rather than bury it.
     rows.sort(key=lambda r: (r["state"] != "dead", r["state"] != "wedged", -int(r["transcript_age_s"])))
     declaration = {
         "population": liveness.DISPATCH_POPULATION,
@@ -423,8 +432,9 @@ def dispatch_lanes(
         "excluded_cmux_claimed": claimed,
         "dead_reachable": False,
         "dead_note": ("a dispatch lane has no durable fenced incarnation, so `dead` is "
-                      "unreachable by design (#1178 C1); an exited lane reports "
-                      "`unknown/no-bound-incarnation` with its transcript age"),
+                      "unreachable by design (#1178 C1) — an unbound lane AND a lane whose "
+                      "bound process is no longer listed both report "
+                      "`unknown/no-bound-incarnation` with their transcript age"),
         "window_h": within_ms / 3_600_000.0,
     }
     if len(rows) > limit:

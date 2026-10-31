@@ -947,6 +947,30 @@ def evaluate(ev: Evidence) -> Verdict:
 
     # (2) Identity — the ONLY source of `dead` (C1, C4).
     if not holders:
+        if ev.identity_population == DISPATCH_POPULATION and is_dead_evidence(cands):
+            # A DISPATCH lane's incarnation is BORROWED, never FENCED: the pid is
+            # read out of a separate process's environment, so the probe answers
+            # "this pid is listed" and never "this pid IS this transcript".
+            # A witness reading here therefore says only that the process this
+            # row was bound to is no longer listed — the SAME uncertainty as an
+            # unbound row (`unknown/no-bound-incarnation`), not the fenced-
+            # incarnation-positively-absent proof `dead` requires (#1178 C1).
+            # Without this arm a lane that exited between the pass's /proc read
+            # and its own probe — ordinary fleet life — renders `dead`, which is
+            # the exact false DEAD this population exists to remove, on the very
+            # rows the report prints "`dead` is unreachable" above. So `dead` is
+            # unreachable HERE BY CONSTRUCTION (an arm returns first), not merely
+            # by there being no case that currently reaches it.
+            return Verdict(
+                "unknown",
+                "no-bound-incarnation",
+                witnesses=tuple(f"{c.pid}:{c.observed}" for c in cands),
+                detail="; ".join(filter(None, [
+                    ev.dispatch_detail or "",
+                    "bound incarnation(s) not observed: %s" % ",".join(
+                        f"{c.pid}:{c.observed}" for c in cands),
+                ])),
+            )
         if is_dead_evidence(cands):
             # Non-growth is required too, and it must be POSITIVELY known: an
             # unreadable JSONL cannot prove non-growth (fail safe).
@@ -966,7 +990,10 @@ def evaluate(ev: Evidence) -> Verdict:
             # pass, which is what an exited lane and an unreadable binding look
             # like alike. It is NOT `dead`: `dead` needs a fenced incarnation
             # positively observed absent (#1178 C1), and this population has no
-            # durable pid to fence — exactly the position a claim is in.
+            # durable pid to fence — exactly the position a claim is in. The
+            # BOUND-then-absent shape reaches the same abstention one arm above
+            # (the borrowed-incarnation gate), so this population cannot read
+            # `dead` on any path, bound or unbound.
             if ev.identity_population == DISPATCH_POPULATION:
                 return Verdict("unknown", "no-bound-incarnation",
                                detail=ev.dispatch_detail or "")
