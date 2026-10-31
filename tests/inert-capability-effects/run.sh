@@ -524,6 +524,58 @@ else
     bad "§4 the deployed copy was not used even though it is healthy and first on the ladder (log: $(log_of "$out_ok" | tr '\n' ' ' | head -c 300))"
 fi
 
+# ── ARM 4: a copy that CANNOT GRADE must not veto the copies that can ──────────────────────────
+# The defect this closes: `_section_admitted` treated EVERY non-zero as a refusal, so one copy that
+# cannot run a `--check` at all (78 = the gate's own BRIEF_GATE_UNAVAILABLE, 2 = a half-written file,
+# 126 = not executable, 127 = no interpreter) blanked the contract for EVERY brief on the box -- while
+# reporting that copy as REFUSING, which it never did. An ungradable instrument is not a verdict.
+ungradable_gate() { # <dir> -- renders the real contract, cannot grade it
+    local d="$1"
+    mkdir -p "$d"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -u' 'case "${1:-}" in'
+        # --section DELEGATES to the pinned gate: this arm grades GRADING, not rendering, so the
+        # contract it emits must be the shipped one and not a fixture the pinned gate would refuse.
+        printf '%s\n' "  --section) exec bash '$PINNED_GATE' --section \"\${2:-worker}\" ;;"
+        printf '%s\n' '  --check) echo "brief-gate.sh: cannot run --check (no verdict)" >&2; exit 78 ;;' \
+                      '  *) exit 78 ;;' 'esac'
+    } >"$d/brief-gate.sh"
+    chmod +x "$d/brief-gate.sh"
+}
+ungradable_gate "$ORCH"
+out_ung="$(brief_probe "$ROOT/scripts/pr-doctor.py" "$ORCH")"
+brief_of "$out_ung" "$WORK/brief-ungradable.txt"
+if [ -s "$WORK/brief-ungradable.txt" ] && gate_admits "$WORK/brief-ungradable.txt"; then
+    ok "§4 an UNGRADABLE \$O copy (exit 78) does not blank the contract — a copy that CAN grade still splices one"
+else
+    bad "§4 one ungradable copy on the ladder blanked the research contract for every brief, so every order loses the research-first contract it is graded against (log: $(log_of "$out_ung" | tr '\n' ' ' | head -c 400))"
+fi
+
+# ── ARM 5 (the opposite verdict, one copy removed): when NO copy can grade, splice NOTHING ────
+# This is the half that stops ARM 4's fix from opening the gate: admitting a contract nobody graded
+# would be the "pass that was not refused" shape #2708 exists to remove. The ungradable copy is made
+# the ONLY copy on the ladder: the farm is moved aside, and the probe is pointed at a SANDBOX copy of
+# pr-doctor.py so the checkout's own `orchestrator-harness/brief-gate.sh` sibling (a healthy copy the
+# real ladder always reaches) is not beside it. Without that, the arm would grade against a copy the
+# fixture does not control and would pass vacuously.
+mkdir -p "$WORK/allbad"
+cp "$ROOT/scripts/pr-doctor.py" "$WORK/allbad/pr-doctor.py"
+cp "$ROOT/scripts/objective.py" "$WORK/allbad/objective.py" 2>/dev/null || true
+mv "$FARM/brief-gate.sh" "$WORK/farm-brief-gate.hold"
+out_allbad="$(brief_probe "$WORK/allbad/pr-doctor.py" "$ORCH")"
+brief_of "$out_allbad" "$WORK/brief-allbad.txt"
+if grep -q 'RESEARCH FIRST' "$WORK/brief-allbad.txt"; then
+    bad "§4 with NO gradable copy the contract was spliced anyway — an unreadable instrument was counted as an admittance (fail-open, log: $(log_of "$out_allbad" | tr '\n' ' ' | head -c 400))"
+else
+    ok "§4 with NO gradable copy nothing is spliced (fail-closed) and the reason names the missing verdict"
+fi
+if log_of "$out_allbad" | grep -q 'could GRADE\|could not GRADE'; then
+    ok "§4 …and the log says no copy could GRADE it, instead of blaming a copy for refusing"
+else
+    bad "§4 the log did not name the ungradable reason (log: $(log_of "$out_allbad" | tr '\n' ' ' | head -c 400))"
+fi
+mv "$WORK/farm-brief-gate.hold" "$FARM/brief-gate.sh"
+
 # ── --mutations: plant the PRE-FIX acceptance back in and require the suite to go RED ───────
 # The mutation is the capability going inert the way it ACTUALLY went inert: the acceptance predicate
 # is restored to the presence test (here: unconditional), so the stale copy's section is spliced and
@@ -545,6 +597,25 @@ if [ "$MUTATIONS" -eq 1 ]; then
             ok "§4 --mutations: with the presence test restored, the stale contract reaches the brief and the gate REFUSES it — ARM 1 is LIVE"
         else
             bad "§4 --mutations: the mutant did not reproduce the defect (marker=$marker_hits) — the mutation did not land, so it proves nothing"
+        fi
+    fi
+
+    # ⛔ THE SECOND MUTATION: put the "every non-zero is a REFUSAL" acceptance back and require ARM 4
+    # to go RED. Without this, ARM 4 could be passing on a fixture that never reached the ungradable
+    # branch — the same vacuity the first mutation exists to rule out for ARM 1.
+    mkdir -p "$WORK/mut4b"
+    sed 's|^        if out.returncode in _GATE_UNGRADABLE_RCS or not said:$|        if False:  # MUTANT: pre-fix — any non-zero is a refusal|' \
+        "$ROOT/scripts/pr-doctor.py" >"$WORK/mut4b/pr-doctor.py"
+    if cmp -s "$ROOT/scripts/pr-doctor.py" "$WORK/mut4b/pr-doctor.py"; then
+        bad "§4 --mutations: the ungradable verdict line was not found, so the mutant IS the original file — stale proof, not evidence"
+    else
+        ungradable_gate "$ORCH"
+        out_mut2="$(brief_probe "$WORK/mut4b/pr-doctor.py" "$ORCH")"
+        brief_of "$out_mut2" "$WORK/brief-mut4b.txt"
+        if grep -q 'RESEARCH FIRST' "$WORK/brief-mut4b.txt"; then
+            bad "§4 --mutations: with the pre-fix acceptance restored the contract was still spliced, so ARM 4 is not testing the ungradable branch"
+        else
+            ok "§4 --mutations: with 'any non-zero is a refusal' restored, ONE ungradable copy blanks the contract — ARM 4 is LIVE"
         fi
     fi
 fi

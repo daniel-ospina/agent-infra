@@ -3426,8 +3426,10 @@ next step of merging. Do the work:
 # The measured drift is STALENESS, and staleness is MONOTONE: an old contract is a SUBSET of the new
 # one (a missing `CONTRADICTION TEST:` line, a missing field), so the OLD validator accepts the NEW
 # section -- it only insists on the labels it knows -- while the NEW validator refuses the OLD section.
-# Requiring EVERY resolvable gate to accept therefore reds in exactly one direction: the stale one. It
-# cannot refuse a fresh contract for being fresh. A copy that refuses a section over a RENAMED or
+# Requiring every resolvable gate that can GRADE to accept therefore reds in exactly one direction:
+# the stale one. It cannot refuse a fresh contract for being fresh. A copy that cannot grade at all is
+# neither an admittance nor a refusal (see `_section_admitted`'s three outcomes) -- it simply does not
+# get a vote, which is what stops one half-written copy from blanking the contract for every brief. A copy that refuses a section over a RENAMED or
 # REMOVED label is a real format split, and a brief it would refuse is a brief that some dispatch WILL
 # refuse -- which is why the polarity stays fail-closed rather than trusting whichever copy ran first.
 _RESEARCH_SECTION = None
@@ -3464,24 +3466,47 @@ def _brief_gate_paths() -> list:
     return out
 
 
-def _section_admitted(section: str, validators: list) -> tuple:
-    """(True, "") when every gate that COULD judge a brief carrying `section` accepts it.
+# Exit codes with which `brief-gate.sh` says "I have NO VERDICT", not "I refuse": 78 is its own
+# documented BRIEF_GATE_UNAVAILABLE ("a cannot-verify is never a pass"), 2 is a shell/parse failure on
+# a partially written copy, 126 is "not executable" and 127 is "no interpreter". Counting any of these
+# as a REFUSAL is what let one ungradable copy on the ladder blank the contract for every brief -- and
+# it reported that copy as refusing, which it never did.
+_GATE_UNGRADABLE_RCS = (2, 78, 126, 127)
 
-    A validator that cannot be run is ungradable, not a refusal (the contract's own rule: an unreadable
-    instrument is not a refusal in a live dispatch path). A validator that RUNS and refuses is the
-    answer, and it is returned with the gate's own words so the log names the fix.
+
+def _section_admitted(section: str, validators: list) -> tuple:
+    """(True, "") when a gate that COULD judge `section` ADMITS it and no gate that RAN refuses it.
+
+    Three outcomes, kept apart on purpose: a copy that RUNS and exits 0 ADMITS; a copy that runs and
+    REFUSES is the answer, returned with the gate's own words so the log names the fix; a copy that
+    cannot grade at all (no `--check` verb, a partial file, no interpreter) is UNGRADABLE and does not
+    veto the copies that can. What is NOT allowed is admitting on no verdict: when every copy is
+    ungradable the contract is not spliced, and the reason says so -- an unreadable instrument is not an
+    admittance (the polarity the measured nine-hour stall needs).
     """
+    admitted, ungradable = 0, []
     for v in validators:
         try:
             out = subprocess.run(["bash", v, "--check", "-", _BRIEF_GATE_ROLE],
                                  input=section + _SECTION_PROBE,
                                  capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            ungradable.append("%s: cannot run (%s)" % (v, type(exc).__name__))
             continue                    # ungradable here; a copy that CAN run still gets its say
-        if out.returncode != 0:
-            said = " ".join(((out.stderr or "") + " " + (out.stdout or "")).split())
-            return False, ("%s REFUSES the contract this copy would splice (exit %s) %s"
-                           % (v, out.returncode, said[:200]))
+        if out.returncode == 0:
+            admitted += 1
+            continue
+        said = " ".join(((out.stderr or "") + " " + (out.stdout or "")).split())
+        if out.returncode in _GATE_UNGRADABLE_RCS or not said:
+            # A declared cannot-run code, or a silent non-zero from a copy that is not the gate's
+            # documented refusal: no verdict either way, so it must not outvote a copy that has one.
+            ungradable.append("%s: exit %s, no verdict" % (v, out.returncode))
+            continue
+        return False, ("%s REFUSES the contract this copy would splice (exit %s) %s"
+                       % (v, out.returncode, said[:200]))
+    if admitted == 0:
+        return False, ("no brief-gate.sh copy could GRADE the contract -- an ungradable copy is not an "
+                       "admittance (%s)" % ("; ".join(ungradable)[:300] or "no copy to grade with"))
     return True, ""
 
 # ⛔ THE DELIVERY CONTRACT (#2981) IS THE OTHER HALF OF THE SAME LESSON, and it is the half this file
