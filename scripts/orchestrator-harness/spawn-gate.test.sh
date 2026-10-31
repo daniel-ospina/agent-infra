@@ -932,6 +932,57 @@ grep -q 'no pid this lane can prove dead' "$RO/logs/fix-7.log"; rc=$?
 ck "...and says WHICH fact was missing, instead of reporting a stale owner it never measured" $rc
 rm -f "$PRLOCK7"
 
+# ⛔ AN ORPHANED RECORD IS NOT A MID-CREATE ONE, AND ONLY ITS AGE TELLS THEM APART (agent-infra#3096
+# review P1-2 — the arm shipped with NO test, so its 45 lines could be deleted with every shard green).
+# The two cases above and below use the SAME BYTES; the empty record above is FRESH and must DEFER, the
+# one here is aged past `PRLOCK_NO_OWNER_GRACE_MIN` and must be RECLAIMED. That pair is what pins the
+# arm: delete it and the fresh case still passes while this one goes red.
+# The mechanism the arm exists for, measured on three Linux cells: `prlock_live_owner` needs a pid > 0
+# that is ALIVE and `prlock_stale_owner` needs a pid > 0 that is DEAD, so a 0-byte record is NEITHER — it
+# fell through every arm into "treated as LIVE" for ever, the controller refunded each attempt, and the
+# un-owned count never fell.
+aged_empty() { # <writer> -> installs an AGED record at the fixer's lock path
+  rm -f "$PRLOCK7"; eval "$1" > "$PRLOCK7" 2>/dev/null || : > "$PRLOCK7"
+  touch -t 202001010000 "$PRLOCK7" 2>/dev/null
+}
+run_fixer() { # one fixer run against whatever record is installed; leaves PI_LOG/MERGE_LOG/log fresh
+  fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+  rm -f "$RO/state/fixbail-7-"*
+  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+      PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1
+}
+aged_empty ': > "$PRLOCK7"'
+[ -s "$PRLOCK7" ] || [ -f "$PRLOCK7" ]; rc=$?
+{ [ -f "$PRLOCK7" ] && [ -n "$(find "$PRLOCK7" -maxdepth 0 -mmin +2 2>/dev/null)" ]; }; rc=$?
+ck "(9b-orphan) the fixture really is an AGED empty record (or the reclaim arm below is vacuous)" $rc
+run_fixer; plrc6=$?
+{ [ "$plrc6" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG"; }; rc=$?
+ck "(9b-orphan) an AGED empty record is RECLAIMED and the fixer RUNS holding it (rc=$plrc6) — an orphan names no owner and no liveness test can resolve it" $rc
+grep -q 'RECLAIMED an ORPHANED claim' "$RO/logs/fix-7.log"; rc=$?
+ck "(9b-orphan) ...and the log NAMES what it reclaimed, not a generic takeover" $rc
+{ ! grep -q 'DEFERRED' "$RO/logs/fix-7.log" && [ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; }; rc=$?
+ck "(9b-orphan) ...and it is NOT a deferral — no bail marker, so no attempt is refunded for a PR nothing was doing" $rc
+# ⛔ THE P2 SHAPES: the predicate admits whitespace-only and `0` as well as 0 bytes, and the takeover's
+# first CAS compares the record against the value it was HANDED. Called with a hard-coded `""` it matched
+# only a 0-byte record, so these two were admitted and then defer with "the takeover LOST a race with a
+# peer that reclaimed it first" — a race that never happened, about a process with no artifact behind it.
+for _shape in 'printf "   \n"' 'printf "0\n"'; do
+  rm -f "$PRLOCK7"; eval "$_shape" > "$PRLOCK7" 2>/dev/null; touch -t 202001010000 "$PRLOCK7" 2>/dev/null
+  run_fixer; plrc7=$?
+  { [ "$plrc7" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q 'RECLAIMED an ORPHANED claim' "$RO/logs/fix-7.log" && ! grep -q 'LOST a race' "$RO/logs/fix-7.log"; }; rc=$?
+  ck "(9b-orphan) an AGED record whose body is '$_shape' is RECLAIMED too, with NO invented peer race (rc=$plrc7)" $rc
+done
+# THE DELIBERATE NARROWING — a NON-empty unparseable body is a different defect and stays LIVE (`only
+# "nothing was ever written here" is provable from content alone`). Without this, a regression could
+# widen the arm to every garbled record and every other test above would still pass.
+rm -f "$PRLOCK7"; printf 'not-a-pid\n' > "$PRLOCK7"; touch -t 202001010000 "$PRLOCK7" 2>/dev/null
+run_fixer; plrc8=$?
+{ [ "$plrc8" -eq 0 ] && [ ! -s "$PI_LOG" ] && grep -q 'no pid this lane can prove dead' "$RO/logs/fix-7.log"; }; rc=$?
+ck "(9b-orphan) an AGED GARBLED record still DEFERS — the arm reclaims only 'nothing was ever written here' (rc=$plrc8)" $rc
+{ [ -f "$PRLOCK7" ] && [ "$(cat "$PRLOCK7" 2>/dev/null)" = 'not-a-pid' ]; }; rc=$?
+ck "(9b-orphan) ...and the garbled record is left EXACTLY as found" $rc
+rm -f "$PRLOCK7"
+
 # ⛔ AND A LOCK STATE NO RE-DISPATCH CAN CLEAR IS NOT REFUNDED (review of PR #2576, cycle 2 — P2). A
 # `mergeclaim-<PR>.lock` that is a DIRECTORY can never be read as an owner and never be taken; if the
 # refusal were refundable, spawn -> defer -> refund would spin for ever with `fixcount` netting to
