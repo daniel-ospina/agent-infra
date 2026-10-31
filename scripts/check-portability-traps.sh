@@ -50,6 +50,7 @@
 #     n="$(box_ncpu)"                                  # the shim, which probes for you
 #     command -v nproc >/dev/null 2>&1 && n="$(nproc)"
 #     command -v timeout >/dev/null 2>&1 || { … }      # the presence probe, then the call
+#     command -v nproc >/dev/null 2>&1 && n="$(nproc)"  # the `&&` form is the guarded one
 #     sed -i.bak -e 's/a/b/' f && rm -f f.bak          # portable to BOTH (suffix is attached)
 #     box_sed_i 's/a/b/' f                             # the shim
 #
@@ -81,9 +82,21 @@
 #     `if grep -q timeout f`, `while grep -q free "$f"`. The wrapper group is `[^;&|(){}]*` (any
 #     number of words), which is what makes `sudo -u root sed`, `nice -n 5 sed` and `env A=1 timeout`
 #     detectable; the cost is this shape. One reasoned `# portability-ok:` clears it.
-#   · A `# portability: off|linux-only` declaration takes effect FROM ITS OWN LINE ONWARD: the records
-#     above it were already scanned. Put the marker in the first 20 lines (the header contract) and it
-#     covers the file; put it mid-file and it covers only what follows.
+#   · A `# portability: off|linux-only` declaration takes effect FROM ITS OWN LINE ONWARD, wherever it
+#     is written: the records above it were already scanned, and it covers the rest of the file. Two
+#     limits apply. (a) It must be at TOP LEVEL — a marker inside a shell string or a heredoc is DATA,
+#     not a declaration. (b) It cannot rescue a read that was already broken: a marker below an
+#     unbalanced quote is itself being read as data, so the file still reports `context-unbalanced`
+#     rather than being silently switched off.
+#   · A presence probe guards the call CONDITIONED on it (`… && call`), not every call on its line:
+#     `command -v sed >/dev/null; sed -i …` runs unconditionally and `… || free -m` runs exactly when
+#     the tool is ABSENT, so both are still flagged.
+#   · A CPU chain written one arm per line is clean from its SECOND arm onward: the lookback is
+#     BACKWARD, so the FIRST arm is flagged (nothing behind it can reveal that a second mechanism
+#     follows). Split chains are rare; a single arm is the shape the rule exists for.
+#   · Inside `${…}` a single-quoted span is literal for DELIMITERS (a `}` there does not close the
+#     brace) but its `$( … )` still RUNS — measured in bash 5.2. The reader models that as its own
+#     context so neither half is lost.
 #
 # BASELINE — the ratchet
 # ----------------------
@@ -302,7 +315,12 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
       # `}` left a phantom open quote — the file then reported `context-unbalanced` and every later
       # line went unscanned, losing the real finding one line below.
       if (c == "\"") { st_push("D"); SN[length(ST)] = 0; out = out "\""; continue }
-      if (c == SQ) { ansi = (i > 1 && substr(line, i - 1, 1) == "$"); st_push("S"); AC[length(ST)] = ansi; SN[length(ST)] = 0; out = out SQ; continue }
+      # ⛔ A SINGLE QUOTE INSIDE `${…}` IS A LITERAL SPAN, BUT EXPANSIONS STILL RUN (review cycle-7
+      # P1): measured in bash 5.2 — `${x:-\047a}b\047}` prints `\047a}b\047` (the `}` is literal, it does not
+      # close the brace) while `${x:-\047$(nproc)\047}` prints `\0478\047` (the substitution RUNS). Modelling it as
+      # a real single quote read `$(nproc)` as DATA and lost a live CPU finding; plain code
+      # pops the brace at the literal `}`. It is its own context: L.
+      if (c == SQ) { st_push("L"); out = out SQ; continue }
       if (c == "$" && substr(line, i + 1, 1) == "(") {
         if (substr(line, i + 2, 1) == "(") { st_push("C"); AR[length(ST)] = 1; PD[length(ST)] = 2; out = out "$(("; i += 2; continue }
         st_push("C"); PD[length(ST)] = 1; out = out "$("; i++; continue
@@ -311,6 +329,18 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
       if (c == "`") { st_push("K"); out = out "`"; continue }
       if (c == "{") PD[d]++
       else if (c == "}") { PD[d]--; if (PD[d] <= 0) { out = out "}"; st_pop(); continue } }
+      out = out c; continue
+    }
+    # ── inside a LITERAL span opened by a single quote INSIDE `${…}`: delimiters there are literal (a
+    # `}` does not close the brace), but `$( … )`, `${ … }` and backticks STILL RUN — see the B branch.
+    if (top == "L") {
+      if (c == SQ) { out = out SQ; st_pop(); continue }
+      if (c == "$" && substr(line, i + 1, 1) == "(") {
+        if (substr(line, i + 2, 1) == "(") { st_push("C"); AR[length(ST)] = 1; PD[length(ST)] = 2; out = out "$(("; i += 2; continue }
+        st_push("C"); PD[length(ST)] = 1; out = out "$("; i++; continue
+      }
+      if (c == "$" && substr(line, i + 1, 1) == "{") { st_push("B"); PD[length(ST)] = 1; out = out "${"; i++; continue }
+      if (c == "`") { st_push("K"); out = out "`"; continue }
       out = out c; continue
     }
     # ── inside a backtick substitution: code; a backtick closes it
@@ -536,7 +566,7 @@ function hd_name(line,   j, n, c, q, marker) {
 
 # cp(code, tool) — is `tool` in COMMAND POSITION: line start, or after a separator, or after `(`
 # (which covers `$(tool …)`), allowing leading whitespace. This is what keeps prose and arguments out.
-function cp(code, tool,   re) {
+function cp(code, tool,   re, c2) {
   # ⛔ THE SEPARATOR CLASS INCLUDES THE QUOTE CHARACTERS (they are literal inside a bracket
   # expression), so a command that FOLLOWS a quoted argument is still in command position:
   # `tb_timeout "${T}" stat -c %Y f` calls `stat`, and that is a real BSD trap. Without them the
@@ -579,7 +609,10 @@ function cp(code, tool,   re) {
   # `grep` is NOT in either class, so `if grep -q timeout f` stays clean (that was the collision the
   # kw1 narrowing below exists for).
   ctl = "(if|then|elif|else|do|while|until)"
-  wrap = "((env|sudo|command|nohup|xargs|time|exec|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)([^;&|(){}]*[ \t])?)"
+  # ⛔ `eval` TAKES THE REST OF ITS LINE AS THE COMMAND (review cycle-7 P1): dropping it from the
+  # class made `eval sed -i …` and `eval timeout 5 …` CLEAN — a shape that was flagged before this
+  # cycle. It belongs in the junk-taking group for the same reason `sudo -u root` does.
+  wrap = "((env|sudo|command|nohup|xargs|time|exec|eval|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)([^;&|(){}]*[ \t])?)"
   pre = "(" asg "(" ctl "[ \t]+|![ \t]+|" wrap ")*)"
   re = "(^|" SEP ")[ \t]*" pre pfx tool rb
   re2 = "(^|" SEP ")[ \t]*" asg pfx tool rb
@@ -605,18 +638,28 @@ function cp(code, tool,   re) {
   # immediately followed by the closing paren is a command, never a case label.
   # DECLARED LIMIT: `x="$(free|head -3)"` (a PIPE, no space, straight after the tool) is not matched.
   subst = "[$][(][ \t]*" asg pfx tool "[ \t]*[)]"
+  # ⛔ `find … -exec TOOL` WAS ONLY CAUGHT BY LUCK (review cycle-7 P2): `-exec` is never in command
+  # position (`(^|SEP)`), so the plain spelling `find . -exec sed -i {} +` stayed CLEAN — the suite
+  # fixture only fired because a quoted argument left a `"` (a SEPARATOR char) before it. `-exec`
+  # takes a command, so it is its own infix form.
+  iexec = "[ \t]-exec[ \t]+([^;&|(){}]*[ \t])?" pfx tool rb
   # `command -v <tool>` / `type <tool>` / `hash <tool>` / `which <tool>` is a PROBE for EVERY rule, not
   # just timeout/setsid/cpu: `command -v free` is code ASKING whether free exists (review cycle-5 P2).
   probe = "(^|" SEP ")[ \t]*(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
-  # ⛔ A PROBE LINE IS CLEAN WHOLESALE, AND THE EXTRA TESTS WERE THE BUG (review cycle-6 P1): the
-  # guard used to be `probe && !re && !re2 && !subst`, but `command` is itself a WRAPPER keyword, so
-  # `re` matches the probe itself — the exception never fired for the `command -v` spelling and only
-  # worked for `type`/`hash`/`which`. Measured: `command -v free >/dev/null || :` in a correct file
-  # reported `free-macos-absent`. `timeout`/`setsid`/`cpu` already suppress a probe line wholesale
-  # (probed()), so cp() doing the same is the consistent rule, and it is CORRECT for the blessed
-  # idiom: when `command -v timeout` fails on macOS the guarded call never runs.
-  if (code ~ probe) return 0
-  return (code ~ re || code ~ re2 || code ~ re3 || code ~ subst)
+  # ⛔ A PROBE GUARDS THE CALL CONDITIONED ON IT — NOT THE WHOLE LINE (review cycle-7 P1). Two
+  # separate defects met here. (a) The cycle-6 wholesale return was introduced because `command` is
+  # itself a wrapper keyword, so `re` matched the PROBE and the old `probe && !re` exception never
+  # fired for the `command -v` spelling; the fix for that is to strip the probe span, not to bless
+  # the line. (b) Blessing the line hid real traps: `command -v sed >/dev/null; sed -i …` runs the
+  # call UNCONDITIONALLY, and `command -v free || free -m` runs it exactly when the tool is ABSENT —
+  # the host the rule exists for. So after the probe is marked, only a `&&`-joined call is guarded.
+  if (code ~ probe) {
+    c2 = code
+    sub(probe, "\001", c2)
+    if (c2 ~ ("\001[^;|]*&&[^;|]*" pre pfx tool rb)) return 0
+    return (c2 ~ re || c2 ~ re2 || c2 ~ re3 || c2 ~ subst || c2 ~ iexec)
+  }
+  return (code ~ re || code ~ re2 || code ~ re3 || code ~ subst || code ~ iexec)
 }
 
 # seg_has(code, tool) — `tool` appears as a WORD anywhere on the line. Used for CPU mechanisms, which
@@ -704,7 +747,12 @@ FNR == 1 {
 # (it used to be the first 20 lines only, contradicting the header promise "from its own line onward"
 # — review cycle-6 P2: a mid-file declaration was a silent no-op. A declaration is read here, outside
 # a heredoc, and covers the rest of the file.
-heredoc == "" && /^# *portability:/ {
+# ⛔ A MARKER INSIDE AN OPEN QUOTE IS DATA, NOT A DECLARATION (review cycle-7 P1): the guard tested
+# the heredoc state but not the quote state, so `msg=\047header … # portability: off … footer\047` switched
+# the file off from inside a string, and — worse — a marker below an UNBALANCED quote silently
+# covered the tail that was already being read as data, which is the false-CLEAN the EOF rules exist
+# to report. A declaration is only read at top level.
+heredoc == "" && ST == "" && /^# *portability:/ {
   line = $0
   sub(/^# *portability: */, "", line)
   tag = line; sub(/[ \t].*$/, "", tag)
@@ -868,7 +916,11 @@ function cpu_rule(code,   n, mech) {
   # across three lines were three findings on correct code — live and baselined in
   # scripts/orchestrator-harness/ai-drainer.sh:255-257. A DIFFERENT mechanism within the lookback
   # window means the author is choosing, which is what the rule asks for.
-  if (mech && cpu_other(mech)) return 0
+  # ⛔ PASS THE MASK, NOT THE FLAG (review cycle-7 P0): `mech` is 1 for ALL THREE mechanisms, so
+  # `cpu_other(1)` treated a repeated `sysctl` (mask 2) or `getconf` (mask 4) as a DIFFERENT
+  # mechanism and cleared it — a repeat of the same mechanism is not a chain, which is exactly what
+  # this guard exists to say. Only `nproc` repeats were caught, and the asymmetry was invisible.
+  if (mech && cpu_other(cpu_mech(code))) return 0
   return mech
 }
 

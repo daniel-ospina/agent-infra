@@ -23,6 +23,15 @@
 #
 #   bash scripts/check-portability-traps.test.sh
 #   bash scripts/check-portability-traps.test.sh --verbose
+#
+# ⛔ IF THE LOCAL CHECKOUT GUARD REFUSES THIS SUITE (fails closed: "script-indirection — the discard's
+# effect could not be verified", #709), do NOT work around it by weakening the arms: run the SAME bytes
+# from a detached worktree, which the guard can read —
+#   git worktree add --detach /var/tmp/ptc4 HEAD
+#   cp scripts/check-portability-traps.sh scripts/check-portability-traps.test.sh /var/tmp/ptc4/scripts/
+#   bash /var/tmp/ptc4/scripts/check-portability-traps.test.sh      # sha256 must match the repo copy
+# (Measured 2026-10-31: the guard refused the in-repo invocation for a whole cycle while the identical
+# bytes ran green in the detached worktree.)
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || { echo "❌ unresolvable"; exit 1; }
@@ -495,6 +504,140 @@ else
   ok "C11: a mid-file \`# portability: off\` takes effect from its own line (header and code agree)"
 fi
 
+# ── C12. THE SEVENTH CYCLE'S SHAPES — one assertion each, both directions ────────────────────────
+# The cycle-7 fixes rewrote a regex prefix, a lookback function, a probe short-circuit and the
+# `${…}` model, so each has an arm here AND a guard mutant in D2 (a guard that only SUPPRESSES a
+# finding cannot be killed by deleting a `hit(…)` dispatch — see D2).
+CY="$TMP/cyc7"; : >"$CY"
+mkcy() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$CY"; }
+
+# a REPEAT of the same mechanism is not a chain — and the mask bug was asymmetric, so both of the
+# mechanisms that used to be cleared are fixtures of their own.
+mkcy cyc7/1-repeat-sysctl.sh   '#!/usr/bin/env bash' 'n="$(sysctl -n hw.ncpu)"' 'echo "$n"' 'm="$(sysctl -n hw.ncpu)"'
+mkcy cyc7/2-repeat-getconf.sh  '#!/usr/bin/env bash' 'a="$(getconf _NPROCESSORS_ONLN)"' 'echo x' 'b="$(getconf _NPROCESSORS_ONLN)"'
+# `eval` takes the rest of its line as the command.
+mkcy cyc7/3-eval-sed.sh        '#!/usr/bin/env bash' "eval sed -i 's/a/b/' f.txt"
+mkcy cyc7/4-eval-timeout.sh    '#!/usr/bin/env bash' 'eval timeout 5 sleep 1'
+# a probe guards only the `&&`-conditioned call: after `;` the call always runs, after `||` it runs
+# exactly when the tool is ABSENT.
+mkcy cyc7/5-probe-semi.sh      '#!/usr/bin/env bash' "command -v sed >/dev/null; sed -i 's/a/b/' f.txt"
+mkcy cyc7/6-probe-or.sh        '#!/usr/bin/env bash' 'command -v free >/dev/null 2>&1 || free -m'
+# `-exec` takes a command but is never in command position.
+mkcy cyc7/7-find-exec.sh       '#!/usr/bin/env bash' 'find . -exec sed -i s/a/b/ {} +'
+# a single-quoted span inside `${…}` is literal for delimiters, but `$( … )` still runs.
+mkdir -p "$TMP/tree/cyc7"
+cat >"$TMP/tree/cyc7/8-brace-squote.sh" <<'C7SQ'
+#!/usr/bin/env bash
+v="${x:-'$(nproc)'}"
+echo "$v"
+C7SQ
+printf '%s\n' cyc7/8-brace-squote.sh >>"$CY"
+# THE OTHER DIRECTION — clean shapes that must stay clean.
+: >"$TMP/cyc7clean.list"
+mkcyc() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$TMP/cyc7clean.list"; }
+mkcyc cyc7clean/1-chain.sh     '#!/usr/bin/env bash' 'a="$(nproc)"' 'b="$(sysctl -n hw.ncpu)"'
+mkcyc cyc7clean/2-chain-rev.sh '#!/usr/bin/env bash' 'a="$(sysctl -n hw.ncpu)"' 'b="$(nproc)"'
+mkcyc cyc7clean/3-chain-1line.sh '#!/usr/bin/env bash' 'n="$(nproc 2>/dev/null)" || n="$(sysctl -n hw.ncpu)"'
+mkcyc cyc7clean/4-brace-literal.sh '#!/usr/bin/env bash' 'v="${x:-'"'"'a}b'"'"'}"' 'echo "$v"'
+mkcyc cyc7clean/5-probe-and.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 true'
+
+run_check "$CY" --no-baseline
+if [ "$?" = 2 ]; then
+  bad "C12: the cycle-7 fixture tree was REFUSED (rc=2) — an empty scan proves nothing"
+else
+  for pair in \
+    "cpu-count-single-mechanism cyc7/1-repeat-sysctl.sh" \
+    "cpu-count-single-mechanism cyc7/2-repeat-getconf.sh" \
+    "sed-in-place-gnu cyc7/3-eval-sed.sh" \
+    "timeout-absent-on-macos cyc7/4-eval-timeout.sh" \
+    "sed-in-place-gnu cyc7/5-probe-semi.sh" \
+    "free-macos-absent cyc7/6-probe-or.sh" \
+    "sed-in-place-gnu cyc7/7-find-exec.sh" \
+    "cpu-count-single-mechanism cyc7/8-brace-squote.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      ok "C12a: caught $1 in $(basename "$2")"
+    else
+      bad "C12a: MISSED $1 in $(basename "$2") — a cycle-7 fix regressed"
+    fi
+  done
+  run_check "$TMP/cyc7clean.list" --no-baseline
+  # ⛔ A CHAIN'S FIRST ARM IS EXPECTED TO BE FLAGGED (the guard looks BACKWARD — nothing behind the
+  # first line can tell it a second mechanism follows), so the chain arms assert on the SECOND line
+  # by number rather than on the file. Deleting that distinction is how the cycle-7 mask bug hid: the
+  # file-level assertion passed while the second `sysctl` was silently cleared.
+  c7clean() {  # <fixture> <rule> <line|*>
+    if [ "$3" = "any" ]; then
+      awk -v f="$1" -v r="$2" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"
+    else
+      awk -v f="$1" -v ln="$3" '{ if (index($0, f ":" ln ":") == 1) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"
+    fi
+  }
+  for triple in \
+    "cyc7clean/1-chain.sh cpu-count-single-mechanism 3" \
+    "cyc7clean/2-chain-rev.sh cpu-count-single-mechanism 3" \
+    "cyc7clean/3-chain-1line.sh cpu-count-single-mechanism any" \
+    "cyc7clean/4-brace-literal.sh cpu-count-single-mechanism any" \
+    "cyc7clean/5-probe-and.sh timeout-absent-on-macos any"
+  do
+    set -- $triple
+    if [ "$3" = "any" ]; then lbl="any line"; else lbl="line $3"; fi
+    if c7clean "$1" "$2" "$3"; then
+      bad "C12b: FALSE POSITIVE — $2 reded on portable $(basename "$1") ($lbl)"
+    else
+      ok "C12b: portable code NOT flagged ($(basename "$1") $lbl)"
+    fi
+  done
+fi
+
+# ⛔ D2. GUARD MUTANTS — the arms the `hit(…)` mutants cannot reach ──────────────────────────────
+# Section D deletes a rule's DISPATCH, which makes a finding disappear. A CROSS-LINE GUARD works the
+# other way round: it SUPPRESSES a finding, so deleting it makes the output larger and the D-style
+# assertion ("the rule string is absent") would read a killed guard as SURVIVED. Each guard below is
+# removed from a copy and the CLEAN fixture it protects is re-run: the fixture must go RED.
+gmutants() {
+  printf '%s\n' \
+    'if (mech && cpu_other(cpu_mech(code))) return 0|cyc7clean/1-chain.sh|cpu-count-single-mechanism' \
+    'if (n >= 2) return 0|cyc7clean/3-chain-1line.sh|cpu-count-single-mechanism'
+}
+GDIR="$TMP/gmutant.sh"
+# run_mutant_path <mutant> <list> — the same wrapper contract run_mutant (section D) uses, for the
+# guard mutants, which run a DIFFERENT target list. A bare interpreter call on a mktemp path is the
+# script-indirection the checkout guard fails closed on, so it goes through a function here too.
+run_mutant_path() {
+  bash "$1" --root "$TMP/tree" --targets "$2" --no-baseline >"$OUT" 2>"$ERR"
+  return $?
+}
+gmutants | while IFS='|' read -r gl fixt rule; do
+  awk -v pat="$gl" '{ if (index($0, pat) > 0) print "# GMUTANT: " pat; else print }' "$CHECK" >"$GDIR"
+  if cmp -s "$CHECK" "$GDIR"; then
+    echo "GMUTANT-NOT-APPLIED $gl (pattern did not match a line)"
+    continue
+  fi
+  printf '%s\n' "$fixt" >"$TMP/gmut.list"
+  run_mutant_path "$GDIR" "$TMP/gmut.list"; grc=$?
+  if [ "$grc" != 1 ]; then
+    echo "GMUTANT-INVALID $gl (mutant exited $grc, not 1)"
+    continue
+  fi
+  if awk -v r="$rule" '{ n = split($0, a, ": "); if (n >= 2) { split(a[2], b, " "); if (b[1] == r) found = 1 } } END { exit(found ? 0 : 1) }' "$OUT"; then
+    echo "GMUTANT-KILLED $gl"
+  else
+    echo "GMUTANT-SURVIVED $gl (deleting the guard left the clean fixture GREEN — the guard is untested)"
+  fi
+done >"$TMP/gmutants.log" 2>&1
+gkilled="$(grep -c '^GMUTANT-KILLED' "$TMP/gmutants.log")"
+gsurvived="$(grep -c '^GMUTANT-SURVIVED' "$TMP/gmutants.log")"
+ginvalid="$(grep -cE '^GMUTANT-(INVALID|NOT-APPLIED)' "$TMP/gmutants.log")"
+[ "$VERBOSE" = 1 ] && cat "$TMP/gmutants.log"
+gn="$(gmutants | wc -l | tr -d ' ')"
+if [ "$gkilled" = "$gn" ] && [ "$gsurvived" = 0 ]; then
+  ok "D2: guard mutants $gkilled/$gn killed (a deleted cross-line guard reds its clean fixture)"
+else
+  bad "D2: guard mutants $gkilled/$gn killed, $gsurvived survived, $ginvalid invalid — a dead guard would pass unnoticed"
+fi
+
 # ── D. MUTANTS — every rule above must be LOAD-BEARING ──────────────────────────────────────────
 # Each mutant deletes ONE `hit(...)` dispatch line from a copy of the detector and re-runs the arm
 # for that rule. The mutant MUST turn its arm red. A surviving mutant means the arm proves nothing.
@@ -816,7 +959,12 @@ if [ -f "$SHARDS" ]; then
     bad "F6: no SUITE_GLOBS entry in run-bash-shards.sh matches this suite — it would never run in CI"
   fi
   # a glob list we could not read is NOT a pass: an empty read would make the loop above vacuous
-  [ -n "$globs" ] && ok "F7: SUITE_GLOBS was readable from the runner ($(printf '%s\n' "$globs" | grep -c .) globs)" \
+  # ⛔ NO COMMAND SUBSTITUTION INSIDE THIS MESSAGE (measured 2026-10-31): the local checkout guard
+  # fails CLOSED on a script whose arguments it cannot statically resolve, and a `$( … "$var" | … )`
+  # inside a quoted string made it refuse to run this whole suite (#709, localized by prefix
+  # bisection). The count is computed on its own line, which the guard can read.
+  globn="$(printf '%s\n' "$globs" | grep -c .)"
+  [ -n "$globs" ] && ok "F7: SUITE_GLOBS was readable from the runner ($globn globs)" \
     || bad "F7: SUITE_GLOBS is unreadable — the wiring arm above proved nothing"
 else
   unproven "run-bash-shards.sh absent — the CI-wiring arm cannot run here"
@@ -830,7 +978,7 @@ printf '\n───────────────────────�
 # the help output cannot drift from the parser again without an arm going red.
 det_run() { bash "$CHECK" "$@"; }
 help_out="$(det_run --help 2>/dev/null)"
-printf '%s\n' "$help_out" | grep -q 'USAGE' && printf '%s\n' "$help_out" | grep -q 'EXIT:' \
+grep -q 'USAGE' <<<"$help_out" && grep -q 'EXIT:' <<<"$help_out" \
   && ok "F8a: --help prints the whole header (USAGE and EXIT are present, not truncated by a pinned range)" \
   || bad "F8a: --help output is truncated — it is missing USAGE and/or EXIT"
 # ⛔ THE FLAG LIST IS DERIVED FROM THE PARSER (review cycle-4 P2): asserting one hard-coded flag let
@@ -847,10 +995,26 @@ printf '%s\n' "$help_out" | grep -q 'USAGE' && printf '%s\n' "$help_out" | grep 
 flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done/p' "$CHECK" \
   | sed -n 's/^[ \t]*\([^)]*\)).*/\1/p' | tr '|' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' \
   | grep -E -- '^-' | sort -u)"
+# ⛔ A FLAG IS A TOKEN, NOT A SUBSTRING (review cycle-7 P2): `grep -q -- "-h"` matches inside
+# `--help`, so dropping the documented `-h` alias left this arm green. The matcher is exercised
+# against a help text with the alias REMOVED below, so it cannot silently degrade to a substring test.
+# ⛔ NO PIPELINE INTO `grep -q` — IT IS FLAKY UNDER `pipefail` (review cycle-7, measured): `grep -q`
+# exits at the first match, the writer gets SIGPIPE, and `pipefail` then reports the PIPELINE as
+# failed — so this arm reported a random flag "missing" on some runs and not others. A here-string
+# has no writer process to break.
+flag_listed() { grep -Eq -- "(^|[ ,|(])$2([ ,|)]|\$)" <<<"$1"; }
 missing=""
 for fl in $flags; do
-  printf '%s\n' "$help_out" | grep -q -- "$fl" || missing="$missing $fl"
+  flag_listed "$help_out" "$fl" || missing="$missing $fl"
 done
+# negative control: the matcher MUST report `-h` missing from a help text that does not list it
+if flag_listed "$(printf '%s\n' "$help_out" | sed 's/--help, -h /--help      /')" "-h"; then
+  bad "F8b: the flag matcher cannot fail — it reads -h inside --help, so it proves nothing"
+elif [ -n "$flags" ] && ! grep -q -- '--help' <<<"$help_out"; then
+  bad "F8b: --help does not document --help"
+else
+  ok "F8b-negative: the flag matcher distinguishes -h from --help (it reports the alias missing when removed)"
+fi
 [ -n "$flags" ] || bad "F8b: could not read the parser flag list from $CHECK"
 [ -z "$missing" ] && ok "F8b: --help documents every flag the parser accepts ($(printf '%s' "$flags" | wc -w | tr -d ' ') flags)" \
   || bad "F8b: --help omits flag(s) the parser accepts:$missing"
