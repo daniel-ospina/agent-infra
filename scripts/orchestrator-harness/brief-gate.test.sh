@@ -433,8 +433,10 @@ PY
 # capture to "ok" made that legitimate log line a red in this shard -- a test that fails because the
 # capability got MORE observable. The probe still has to reach its final `print("ok")`, which is after
 # every assert, so nothing is weakened: a failed assert or a crash leaves the last line short of "ok".
-# Parameter expansion, not a pipe: `${out##*$'\n'}` has no subprocess to SIGPIPE (the suite runs under
-# `pipefail`, and `sigpipe-grep-guard` is one of the repo's own CI checks).
+# Parameter expansion, not a pipe: `${out##*$'\n'}` has no subprocess to SIGPIPE. (This file sets only
+# `set -u`; `run-bash-shards.sh` sets `pipefail` for ITSELF but spawns each shard as `bash "$1"`, a child
+# that does not inherit it. `sigpipe-grep-guard` is repo-wide regardless, so the expansion stands on its
+# own merits and not on a `pipefail` claim this file cannot make.)
 [ "${out##*$'\n'}" = "ok" ]; ck $? "pr-doctor.py's generated brief carries the research contract (driven through brief())"
 bash "$GATE" --check "$ROOT/.pd-brief.txt" worker >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "…and that generated brief PASSES the validator (worker role) (rc=$rc)"
