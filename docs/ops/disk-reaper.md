@@ -395,6 +395,37 @@ patch-ids against all of main's history (a reverted change still matches, and
 whitespace is ignored) and says nothing about whether any ref still holds the
 commit. Multi-commit squash merges do not match either, so they stay on the floor.
 
+**The survival allowlist has exactly ONE remove-eligible exception: `remote-holds` (#3041).**
+Survival is an **allowlist** — only `refs/heads/*` counts — because a remote-tracking,
+tag, stash or bisect ref is revocable by routine commands (`fetch --prune`,
+`fetch --prune-tags`, `stash drop`, `bisect reset`) and the commit would then be on
+nothing. That rule is right, and on its own it is **over-conservative against the remote
+itself**: a tip that was pushed and whose branch still exists on the remote is
+restorable with one `git fetch`, yet the allowlist preserved it for ever. The measured
+cost (pi-cell-4, 2026-10-29): `examined=52 classified=52 remove=0 preserved=52`, the box
+at **0 bytes free**, both repair loops at `cap: 0`, no cell able to dispatch for ~13 h;
+an operator then reclaimed 62 clean checkouts (7.7 GB) by hand, losing no commits.
+
+So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when a
+bounded `git ls-remote --heads <remote> refs/heads/<branch>` answers with **exactly this
+HEAD sha**. The advertised refname is matched literally and exactly once (⚠️ because `ls-remote`
+matches a pattern against the ref's **tail, from any slash separator**, so `refs/heads/<b>` also selects
+an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metacharacters: `check-ref-format`
+rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
+remote is the **longest configured remote name** prefixing the ref, not the first path
+segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
+refname or different sha leaves the verdict where it was — `remote-only-ref`, PRESERVE — and a
+TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one timeout,
+not one per candidate. The row is `remote-holds:<remote>/<branch>`, and — like
+`remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
+only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref),
+so the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that
+becomes prunable mid-pass, after a snapshot that saw it present) is closed for **every** reason by the
+reason-independent pre-prune re-read. Blocking on the reason instead would disable the `prunable`
+reclaim path for as long as ONE preserve row lives — `no-pr`, `too-recent` and `too-young` rows carry
+`refs=remote-holds:` too, for up to the whole aged-days floor — which is the F7 defect one reason
+class over. A26c pins both arms (the `reason=` REMOVE row and the `refs=` PRESERVE row).
+
 A lane **scratch** checkout — a directory whose basename matches
 `REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
 `REAP_WT_SCRATCH_AGE_DAYS` (default `1`): a dead lane's throwaway dir is not a
@@ -540,7 +571,7 @@ degraded, exclusion holds only against passes that resolved the same state dir.
 ```
 mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
-verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
+verdict_uv=deferred verdict_venv=ok verdict_worktree=ok delegate_verdict_worktree=reap-ineffective
 would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
 skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
 freed_mb_unmeasured=
@@ -573,11 +604,85 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
         removed=<n> failed=<n> late_preserved=<n> prune_blocked=<0|1> reasons=<reason>:<n>,…
         main_proof=<auto|local|unavailable|auto-unfetched|ambiguous>
         main_ref=<refs/heads/…|refs/remotes/…|?> pr_merged=<ok|na|unavailable>
+        verdict=<dry-run|reclaimed|idle|reap-ineffective|unmeasured>
 ```
 
+⛔ **`verdict=` is the pass's own ANSWER, and the counters alone cannot supply it (#3041).** A pass
+can be perfectly self-consistent (`examined=52 classified=52 remove=0 preserved=52`) while reclaiming
+NOTHING on a box at 0 bytes free — pi-cell-4, 2026-10-29: that pass was the whole incident, and every
+number in it was true. So the pass must also say what its numbers MEAN:
+
+| `verdict=` | condition |
+|---|---|
+| `dry-run` | the pass was not armed — nothing may be removed, and that is the correct answer |
+| `reclaimed` | armed, and at least one checkout was removed |
+| `idle` | armed, removed nothing, and the **reason** is benign: free space is at or above the floor, or fewer than `REAP_WT_INEFFECTIVE_MIN_EXAMINED` records were **examined** (not *classified* — a budget-starved pass defers the rest, and deciding two of fifty-two while removing none on a full box is the incident, not an idle pass) |
+| `reap-ineffective` | armed, examined `>= REAP_WT_INEFFECTIVE_MIN_EXAMINED` (default 10) records, removed NONE, and free space is UNDER `REAP_WT_DISK_FLOOR_MB` (default 4096 MiB) — a reaper that cannot reclaim on a full box |
+| `unmeasured` | the condition depended on free space and `df` could not answer — **never** read as `idle` |
+
+⛔ **`reap-ineffective` also writes a durable record**, `$STATE_DIR/reap-ineffective.<repo>`, atomically
+(tmp + `mv`), carrying `verdict=`, `epoch=`, `repo=`, `mode=`, the counters, `free_mb=`, `floor_mb=`,
+`reasons=` and a one-line `remedy=`. A **summary line is not a verdict**: the line is gone when the
+next pass prints, and the incident is only visible afterwards if something durably said so. Any pass
+that **evaluated** the condition and found it not held REMOVES the file — so the record's presence
+means *the condition holds now*, not *it once held*; `unmeasured` deletes it too (a disk we could not
+read is not a disk we proved healthy).
+
+⛔ **ONE RECORD PER REPO, not one per state dir.** `disk-reaper.sh` runs the worktree delegate once per
+repo **with the same state dir**, so a single fixed filename is last-writer-wins ACROSS repos: an
+ineffective repo followed by any repo with room had its alarm erased by a pass that never looked at
+it — measured in a fixture. The path therefore carries the checkout's basename (readable) plus a
+`cksum` of its canonical path (unique, so two checkouts named alike cannot collide), and each record
+is owned by that repo's own pass. Presence means *THIS repo's condition holds, as of its `epoch=`*;
+sum the records to read the box. The residual, stated: dropping a repo from `DISK_REAPER_REPOS`
+leaves its last record behind, so compare `epoch=` rather than assuming the newest pass rewrote every
+file.
+
+⛔ **A `--dry-run` never touches the record.** It removes nothing by construction, so it has evaluated
+none of the live condition and cannot say whether the condition holds. This matters because
+`disk-reaper.sh` **defaults** to `DISK_REAPER_DRY_RUN=1`, so a "delete unless the verdict is
+reap-ineffective" rule let a routine dry run on a full cell erase the armed pass's alarm.
+
+A fail-closed abort evaluated nothing, so it neither writes nor deletes the file. ⚠️ **Not every abort
+prints a footer**: the `git worktree list` failure, the empty-list refusal, the unwritable-log refusal
+and the lock-held refusal exit 3 before a footer is reachable (the unwritable-log one cannot log
+anything at all), while the `gh` and `ps` aborts do print one — and where a footer is printed it
+carries `VERDICT=?`, never an empty field. ⛔ **A record that could
+not be WRITTEN says so** (log `record=NOT-WRITTEN`, and the pass states that the verdict exists only
+on its own line): this branch fires when free space is under the floor, i.e. exactly when `ENOSPC` is
+live, so a missing file is never evidence that the condition cleared. `REAP_WT_FREE_MB` (a witness)
+and `DF_BIN` are the test seams; the measured paths are `df -Pm <repo>` under `REAP_WT_DF_TIMEOUT`.
+
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
-`classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=` and
-`pr_merged=`. `examined = classified + deferred` and `classified = remove + preserved` are the two
+`classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=`,
+`pr_merged=` and `delegate_verdict_worktree=` (the delegate's own `verdict=`; it carries the same
+`?`/`not-run` vocabulary, but **not** `main_proof=`'s disagreement polarity — see below; it is printed
+by `--print-status` **and** on the cell health verb's
+per-class line (`scripts/cloud-cell-supervisor.sh`, `⛔ worktree-delegate=`) — a field the reader does not print
+does not exist, so a status channel that showed only `worktree=ok` for an ineffective reap was
+publishing the incident's own misleading sentence — and it is deliberately SEPARATE from
+`verdict_worktree=`, which stays the exit-code reading — an ineffective reap exits 0 by design, so
+without this field the fleet's record said `worktree=ok` for it).
+
+⛔ **A DISAGREEMENT IS NOT ONE THING, because this field feeds an ALARM.** `main_proof=` and
+`pr_merged=` collapse any disagreement to `mixed` and nothing reads that token. This field is printed
+with a ⛔ for every value outside the benign allow-list, so the same rule would mean two opposite
+things at once on the multi-repo shape (`DISK_REAPER_REPOS`, or `--repo` repeated):
+`reap-ineffective` + `idle` (**the alarm**) and `reclaimed` + `idle` (**two ordinary readings**) would
+both read `mixed`, painting a ⛔ onto healthy cells and making `⛔ worktree-delegate=reap-ineffective`
+unreachable. The aggregation therefore gives the **alarm class precedence** and spells the two cases
+differently (`scripts/disk-reaper.sh`, `_dclass`):
+
+| answers across repos | record | cell health verb |
+|---|---|---|
+| all agree | that answer | `ok`/`?`/`not-run`/`dry-run`/`reclaimed`/`idle` are silent; anything else prints ⛔ |
+| ordinary readings disagree (`reclaimed` + `idle`) | `mixed-benign` | silent |
+| an alarm answer, alone or beside any benign answer | **that alarm**, e.g. `reap-ineffective` | `⛔ worktree-delegate=reap-ineffective` |
+| two DIFFERENT alarm answers (`reap-ineffective` + `unmeasured`) | `mixed` | `⛔ worktree-delegate=mixed` — the only case where the cell cannot say |
+| a spelling this reader has not been taught | itself — the benign side is an allow-list | ⛔ (fail-loud) |
+
+The class is an ALLOW-LIST and not a deny-list for that last row: a verdict added to the reaper later
+must be SURFACED by a reader that was never taught it, never silently swallowed by one. `examined = classified + deferred` and `classified = remove + preserved` are the two
 identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict
 was already `remove`, so folding it into `deferred` would deflate `preserved` and make the line
 contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote
@@ -757,7 +862,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
 (it did once, on this box, before the scoping was added).
-`scripts/disk-reaper.test.sh` — 659 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 713 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -817,6 +922,8 @@ own fixture: without that, a `--apply` assertion anywhere in it would sweep the 
 | T58 | the INSTALLED ARTIFACT is read back before `enable --now`: a clean install says it read `ExecStart` + `HOME` out of the artifact; a `50-mask.conf` drop-in that REPLACES `ExecStart` makes the install refuse (naming the drop-in files that exist) and nothing is armed; removing it restores a clean install; an ADDED `ExecStart` (a pre-flight) is accepted and still verified; a drop-in that moves `Environment=HOME` is refused and names both HOMEs; and a `gh` that does not resolve is reported. It also pins the **wrapper preference** (`disk-reaper-run.sh` beside the reaper) on a deliberately UNPINNED install — nothing else measures it, and a timer-started raw reaper inherits no HOME/keys/`gh`, fails the open-PR gate closed and reclaims nothing (#2354) |
 | T58b | the plist **textual** fallback (no usable parser) still refuses a stale arming decision: a good artifact passes and the message names `EnvironmentVariables.HOME` as NOT verified; a stale one (no `--apply`) is refused, naming the missing flag |
 | T55 | **a full disk does not stop the pass** (#2443): an uncreatable state dir falls back to a tmpfs candidate — the classes RUN, the record is written with `state_dir=`/`state_dir_primary=` and says why, and the pass discloses it; the fallback lock is a REAL lock (a live holder still defers, 6); nothing writable anywhere is still a refusal naming every candidate; a writable configured dir produces the unchanged record; and the record returns to the configured path on the next pass once it can be written |
+| T62 | the **installer** refuses to render a unit that scans nothing: an all-empty resolved list is refused (rc=1, no unit written) and an entry dropped from a PARTIALLY resolvable list is NAMED on **stderr** — quoting git's own first line, measured on its own stream — while the entries it CAN use still install. It also pins the absolute-path arm hoisted above the git probe (a relative / `git@host:owner/repo.git` candidate is dropped for the reason that applies, not blamed on a missing checkout) and the `<git gave no message>` fallback (#2159/#2878) |
+| T63 | the **hourly pass** applies the same rule in its own `resolve_repos`: git's own error line reaches the operator (`git cannot use it here (fatal: cannot change to …)`) instead of the blanket `not a git checkout`, a silent non-zero git renders `<git gave no message>`, and a probe killed by the BOUND (rc=124, a dead or hung mount) is named as a timeout rather than as a git that said nothing (#2159) |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
 flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1
