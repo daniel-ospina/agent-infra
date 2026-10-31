@@ -83,9 +83,9 @@ FIX_DELIVERY_BRIEF="$(bash "$delivery_sh" --delivery-brief prfix)" || {
 # checkout and a DIFFERENT target repo used to materialise a worktree in the checkout and run there,
 # reporting failures about branches instead of about the repo. Missing = FATAL, because a silently
 # skipped assertion is the defect. `REPO_TARGET_REFUSED` (72) is distinct from every gate code.
-. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
 command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
-  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
 . "$SELF/gate-policy.sh" 2>/dev/null || { echo "[fix $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a fixer that cannot say whether its gates are on" >&2; exit 78; }
 apply_gate_policy fix-one
@@ -174,13 +174,26 @@ fi
   if git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
     git worktree add ".worktrees/fix-$PR" "$BR" >> "$L.log" 2>&1
   else
-    git fetch origin "$BR" --quiet >> "$L.log" 2>&1
+    # ⛔ NAME THE DESTINATION, NOT JUST THE SOURCE (#3009, the SAME defect pr-doctor had).
+    # `git fetch origin "$BR"` does NOT create `refs/remotes/origin/$BR`: with no colon the fetched
+    # ref lands in FETCH_HEAD, and a remote-tracking ref is only ALSO updated when a CONFIGURED
+    # `remote.<name>.fetch` refspec maps that source. A full clone maps every branch, so the bug is
+    # invisible on a dev box — but a CELL checkout is a SINGLE-BRANCH clone
+    # (`+refs/heads/main:refs/remotes/origin/main`), so the fetch SUCCEEDS (rc=0), creates nothing,
+    # and the very next line asks for the ref it just declined to create. The guard then fires with
+    # a FABRICATED diagnosis (`branch is not in <OR> — a BRANCH/REPO mismatch`) — a false accusation
+    # of the wrong repo, which is worse than a silent failure because it sends the operator at the
+    # remote instead of at the clone. The leading `+` keeps the update valid after the force-push a
+    # PR branch routinely gets.
+    git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet >> "$L.log" 2>&1
     # ⛔ NAME THE REPO, NOT A MATERIALISATION FAILURE (#2694). The measured message a human read
     # first was `cannot materialise <branch>`, which says nothing about the repo the branch is
     # missing FROM. If the branch is not in THIS repo, say so — with the branch and the slug — and
     # stop. A fetch that failed for network reasons is covered too: the branch is unproven here, and
     # the refusal names both possibilities rather than blaming worktree creation.
     if ! git rev-parse --verify -q "refs/remotes/origin/$BR" >/dev/null 2>&1; then
+      # Reached only when the fetch genuinely could not read the branch (network, auth, a real
+      # BRANCH/REPO mismatch) — the refspec above no longer produces a FALSE hit here.
       repo_target_branch_assert "fixer #$PR" "$REPO_ABS" "$BR" "$OR" >> "$L.log"
       echo "[fix $PR] REFUSED: branch '$BR' is not in $OR (checkout $REPO_ABS) — it could not be read after fetching origin. This is a BRANCH/REPO mismatch, not a worktree-materialisation failure; refusing before any fixer starts" >> "$L.log"
       refund_gate_attempt
@@ -248,12 +261,13 @@ fi
 # ⛔ WHY THIS FILE AND NOT THE CALLER. The controller already refuses to spawn when `claim_live`
 # says the lock is held, but `fix-one.sh` is ALSO reached directly and by `adopt-fix.sh`, and a
 # guard that lives only in the controller leaves those paths pushing at a live lander — the same
-# argument the CI-queue gate above makes for itself, and the reason both read the same state.
+# argument the repo-identity assert above makes for itself (it runs here, not only in the spawner,
+# because `adopt-fix.sh` reaches this script without the controller in the path at all).
 #
 # ⛔ THE DIRECTION IS DEFER, NEVER BLOCK-AND-HOLD. Contention writes the SAME refundable bail marker
-# the CI-queue and cross-box refusals write, so the controller refunds the attempt and re-decides
-# from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
-# entirely. Nothing here is sticky — the marker describes one cycle, not a state.
+# the cross-box refusal writes, so the controller refunds the attempt and re-decides from a fresh read
+# next cycle: nothing is dropped, and a lander that lands the PR ends the work entirely. Nothing here
+# is sticky — the marker describes one cycle, not a state.
 #
 # ⛔ A STALE CLAIM IS TAKEN OVER, NOT REFUSED (#2574 (b)) — AND THE TAKEOVER IS A RENAME, NEVER
 # `rm && write`. Measured staleness is the whole licence: the record's pid is numeric and `kill -0`
@@ -377,8 +391,8 @@ release_prlock() { # never removes a lock we do not own: a lander that outlived 
 # run must not pretend to have booked one.
 # ⛔ THE FIRST LINE IS A STABLE TOKEN (`DEFERRED: the LANDER`), because `adopt-fix.sh` — the operator
 # surface onto this script — has to name the cause in the log the operator reads, exactly as it does
-# for the CI-queue deferral. A second, cosmetic reword would silently make `adopt-fix <PR>` report
-# SUCCESS for a run that pushed nothing (review of PR #2576, P2).
+# for the PR-owner lock arm below. A second, cosmetic reword would silently make `adopt-fix <PR>`
+# report SUCCESS for a run that pushed nothing (review of PR #2576, P2).
 prlock_defer() { # prlock_defer <why>
   echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
   if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then

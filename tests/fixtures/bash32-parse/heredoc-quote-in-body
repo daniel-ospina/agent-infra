@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# #2976 — the SAME defect as `heredoc-quote-in-body.sh`, on a file with NO `.sh` SUFFIX. It exists
+# because the suffixless half of the gate's population is the half a `*.sh` glob cannot see, which is
+# the half that drifted: the gate named 4 of this tree's 9 suffixless bash entry points, so a defect
+# here shipped GREEN. The apostrophe below is the whole fixture — 3.2's `$( )` scanner walks this
+# here-doc body as code, enters single-quote mode, and fails the file (reported ~60 lines lower).
+# tests/bash32-parse/run.sh copies this file into a throwaway git repo (as `ops/broken-tool`) and
+# requires the gate to NAME it: a derivation that cannot see a suffixless bash program is the
+# false PASS #2976 fixes.
+out="$(python3 - "$SUT" <<'PYMOD'
+# the operator's own copy of the tool
+print(1)
+PYMOD
+)"
+echo "$out"

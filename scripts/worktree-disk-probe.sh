@@ -201,6 +201,22 @@ du_total() { # <dir> -> stdout KiB | nothing
     return 0
 }
 
+# `du` counts a hardlinked INODE ONCE per invocation, which is exactly what makes a report that `du`s
+# each worktree SEPARATELY and adds the results count the same shared bytes once per worktree — the
+# defect that made a hardlinked estate read as "no room" (agent-infra#2159). `--count-links` (GNU) /
+# `-l` (BSD) counts each NAME instead, so ONE walk of the whole estate yields the number such a report
+# would print. Both figures from the same walk budget, so the gap between them is the size of the lie
+# and an operator can see it in one place instead of deriving it from N script runs.
+du_total_counting_links() { # <dir> -> stdout KiB | nothing
+    local out
+    # ONE walk. `-l` is the documented synonym for `--count-links` in GNU coreutils ("-l,
+    # --count-links") AND the BSD spelling, so probing for the long form cost a whole extra walk of a
+    # potentially 100 GB+ estate to learn what the shipped `du --help` already says (review finding).
+    out="$("$DU_BIN" -lsk "$1" 2>/dev/null)" || { printf '%s\n' "$out" | awk '$1 ~ /^[0-9]+$/ {print $1}'; return 1; }
+    printf '%s\n' "$out" | awk '$1 ~ /^[0-9]+$/ {print $1}'
+    return 0
+}
+
 # ONE nlink sampler for BOTH modes (#1858 review P2). They used to differ in two ways — the cap
 # (`--sample`) was honoured only by report(), and measure()'s glob was `-name '*.py'` while report()'s
 # also caught `*.so`/`*.pyd` — so `--sample 500` silently meant "one .py file" in measure mode, and the
@@ -240,7 +256,7 @@ uv_cache_dir() {
 # ── report mode (non-destructive) ─────────────────────────────────────────────────────────────
 report() {
     local dir_canon row fs size used avail cap estate_dev cache cache_dev links_total links_shared
-    local venv
+    local venv apparent_full
 
     [ -n "$DIR" ] || {
         if [ -d "$PWD/.worktrees" ]; then DIR="$PWD/.worktrees"; else DIR="$PWD"; fi
@@ -269,7 +285,12 @@ report() {
         # (a root-run `uv sync`, another uid's venv — measured: 7836 KiB printed, rc=1, on a tree
         # holding ~58 MB). Discarding that status published a LOWER bound as "an UPPER BOUND"
         # (#1858 review P1). A partial walk is still worth showing, so print it and NAME it.
+        # `apparent_full` decides whether the [distinct] pair below may be printed at all: `du` reports
+        # a PARTIAL total with a non-zero status, and subtracting a complete walk from a partial one
+        # produced a clamped `0 KiB SHARED` — a number that looks measured and means nothing.
+        apparent_full=0
         if duk="$(du_total "$dir_canon")"; then
+            apparent_full=1
             [ -n "$duk" ] || die 3 "\`du -sk\` gave no usable answer for '$dir_canon' — re-run with --no-du to report the regime without it"
             printf '[apparent] %s KiB  (%s, one walk of the estate; this is an UPPER BOUND, never the real figure)\n' "$duk" "$DU_BIN -sk"
         else
@@ -278,6 +299,26 @@ report() {
             esac
             printf '[apparent] %s KiB  (%s -sk read a PARTIAL walk — it exited non-zero, so an\n' "$duk" "$DU_BIN"
             echo "           unreadable subtree was skipped and this is a LOWER bound, NOT an upper bound)."
+        fi
+        # ── DISTINCT vs PER-NAME BYTES (agent-infra#2159) ─────────────────────────────────────────
+        # `[apparent]` above is already DISTINCT: `du` counts a hardlinked inode once. The figure that
+        # misled every capacity read is the other one — what you get by `du`-ing each worktree and
+        # ADDING the results, which counts a shared inode once per worktree (measured: 18,134 MB across
+        # six worktrees against 11,538 MB distinct, `libtorch_cpu.so` being one inode). Both numbers,
+        # from ONE walk each, so the gap is visible where the decision is made.
+        local duk_named
+        if [ "$apparent_full" -eq 0 ]; then
+            echo "[distinct] (not measured — the apparent walk above was PARTIAL, so subtracting it would"
+            echo "           report a difference between two incompatible readings; fix the unreadable subtree)"
+        elif duk_named="$(du_total_counting_links "$dir_canon")" && [ -n "${duk:-}" ] && [ -n "$duk_named" ]; then
+            local shared_kb=$(( duk_named - duk ))
+            [ "$shared_kb" -ge 0 ] || shared_kb=0
+            printf '[distinct] %s KiB counted PER NAME (%s -l, what a per-worktree `du` sum reports)\n' "$duk_named" "$DU_BIN"
+            printf '           %s KiB DISTINCT (hardlinked inodes once — the bytes this estate actually holds)\n' "$duk"
+            printf '           %s KiB SHARED by more than one name — a capacity read that sums per-worktree\n' "$shared_kb"
+            echo "           figures overstates by this much, and on a hardlinked box 'no room left' is not what the disk says"
+        else
+            echo "[distinct] (not measured — --count-links/-l could not read the estate, or --no-du was given)"
         fi
     fi
 

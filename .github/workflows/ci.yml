@@ -102,6 +102,40 @@ jobs:
       - name: SIGPIPE guard suite (detection, continuations, exceptions, positive controls)
         run: bash tests/sigpipe-grep/run.sh
 
+  bash32-parse:
+    # #2930 — every shipped `*.sh` must PARSE under Apple's bash 3.2, which is the harness's runtime
+    # platform and which Linux CI (bash 5) can never observe. The class is a false PASS with a
+    # platform trigger: `merge-reminder.test.sh` failed `bash -n` under 3.2 at line 2629 (a here-doc
+    # body inside a `$( )` carrying an apostrophe desynchronised 3.2's scanner, so the reported line
+    # is ~60 lines below the defect), `install.sh` runs `bash -n` over every shipped script and
+    # refused, and the harness could not be installed on a stock Mac at all — while every CI check
+    # was green. #2248 is the same family, one step worse: 3.2 does not merely fail to parse a
+    # here-doc inside a substitution, it EXECUTES the body's words as commands (a controller that
+    # died at source time while its supervisor logged "controller is alive" for an hour).
+    #
+    # The gate runs the REAL 3.2 parser in the digest-pinned `bash:3.2` image — the same
+    # zero-new-deps docker shape `check-workflow-actionlint.sh` already uses. ⛔ Not a textual scan
+    # for `$( … <<'X'`: a proxy drifts from bash's own scanner, and WHICH PARSER reads the file is
+    # the entire question this leg answers.
+    #
+    # ⛔ FAIL-CLOSED, deliberately: no docker, no interpreter, or an interpreter that is not 3.x
+    # exits 2 and NAMES the cause, so a leg that cannot run never reads green — that is precisely
+    # the #2930 class this closes.
+    runs-on: ubuntu-latest
+    # #2055: a bound, so a hung `docker run` fails fast and names itself. MEASURED: the whole sweep
+    # is ~5 s for 331 files plus a cold image pull (~2 s) — 10 min is ~100x that and cannot
+    # false-block, while still being far below the range where a hang holds the runner.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - name: Every shipped script parses under bash 3.2 (#2930)
+        timeout-minutes: 5
+        run: bash scripts/check-bash32-parse.sh
+      - name: bash-3.2 parse gate suite (fixtures, fail-closed arms, mutations)
+        timeout-minutes: 5
+        run: bash tests/bash32-parse/run.sh
+
   search-cost:
     # #1069 — the ignore-blind recursive search that walks .worktrees/*/node_modules
     # (169 GB per checkout; three sessions at load ~18 on 10 CPUs for 80 minutes).
@@ -244,7 +278,7 @@ jobs:
         # #1187 — scripts/test_cmux_payload.py: the cmux sender's payload-TAIL checker
         # (scripts/lib/cmux_payload.py) is exec'd by orch-send.sh, so a suite CI never
         # runs is a suite the repo does not have.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
