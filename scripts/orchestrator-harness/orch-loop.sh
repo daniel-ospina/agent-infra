@@ -2366,10 +2366,12 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # has already judged CLEAN and simply has not spawned. Two different repairs, and until now one word.
   # ⛔ IT NAMES ITS REFERENT (#3110 review, P2). `$tail` renders at the END of the line, after
   # `backlog=<wc -l candidates.txt>` — a DIFFERENT number — so a bare "N of those" read as "of the 219".
-  # It is gated on the `blacklisted` part having rendered at all — a record whose TOTAL is absent OR not
-  # numeric (`skipped_checked=-`) — because a gate on `is_num "$sk_q"` alone would then state a fact
-  # about a bucket that is not on the line. (It is NOT a version-skew guard: `skipped_checked` and
-  # `skipped_checked_queued` were introduced together in #2183, so an older writer emits NEITHER.)
+  # It is gated on the `blacklisted` part having rendered at all, in TWO ways, for two real populations.
+  # `skipped_checked` shipped in #2040 while its sub-breakdown (including `skipped_checked_queued`) only
+  # arrived in #2183 — so a record from that window carries the TOTAL and no queued count, which the
+  # `is_num "$sk_q"` conjunct excludes. The `is_num "$sk_ck"` conjunct covers the other case: a total
+  # that is absent or non-numeric, which would otherwise print `7 of the  blacklisted` — a backlog
+  # claimed against a bucket that is not on the line.
   if is_num "$sk_ck" && is_num "$sk_q" && [ "$sk_q" -gt 0 ]; then
     tail="$tail — $backlog_q of the $sk_ck blacklisted are the DISPATCH BACKLOG (CLEAN-judged, awaiting the issue path), not suppressed"
   fi
