@@ -237,9 +237,13 @@ comps = [r for r in rows if r["compacting"]]
 # compaction trigger (783,616 = 800,000 − 16,384) — incl. the band
 # a pre-dial sub-300K floor would have misclassified as legacy. Pre-clamp
 # 1M-drift sessions (≥900K) also belong here (they ARE the drift (a) detects);
-# only the sub-trigger legacy/200K-window sessions (~196–205K) are excluded
-# from the cache-share economics pool. NOT single-regime for one window after
-# the 2026-09-21 withdrawal — see REGIME HISTORY above.
+# only the sub-trigger legacy sessions are excluded from the cache-share
+# economics pool — at this floor that is the pre-clamp 200K transient
+# (~196–205K) PLUS the three retired eras (400K-era 383–406K, 300K-era
+# 283,616–300,000, withdrawn 700K-era 650–700K), which is what the printed
+# line enumerates: a 390K record is a retired clamp era, not a 200K transient.
+# NOT single-regime for one window after the 2026-09-21 withdrawal — see
+# REGIME HISTORY above.
 clamp_comps = [r for r in comps if r["max_tokensBefore"] >= regime_tb]
 legacy_comps = [r for r in comps if r["max_tokensBefore"] < regime_tb]
 n_comp_recs = sum(r["comp_count"] for r in comps)
@@ -335,8 +339,9 @@ print(f"- sessions scanned: {len(rows)}   compacting sessions: {len(comps)}")
 if legacy_comps:
     print(f"- legacy sub-{regime_tb/1000:.1f}K-window compacting sessions excluded "
           f"from the cache-share pool: {len(legacy_comps)} (sub-trigger: the pre-clamp "
-          f"200K window, plus the retired 300K-era 283,616–300,000 and 700K-era "
-          f"650,000–700,000 records this floor now excludes)")
+          f"200K window (~196,000–205,000), plus the retired 400K-era 383,000–406,000, "
+          f"300K-era 283,616–300,000 and 700K-era 650,000–700,000 records this floor now "
+          f"excludes — same eras as watch-truncation.sh's triage note)")
 print(f"- compaction records: {n_comp_recs}   max tokensBefore: {max_tb:,}")
 
 print("")
