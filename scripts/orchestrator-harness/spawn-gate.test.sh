@@ -983,6 +983,23 @@ ck "(9b-orphan) an AGED GARBLED record still DEFERS — the arm reclaims only 'n
 ck "(9b-orphan) ...and the garbled record is left EXACTLY as found" $rc
 rm -f "$PRLOCK7"
 
+# ⛔ EVERY `prlock_defer` CAUSE IS MAPPED BY `adopt-fix.sh`, AND A REWORD SILENTLY UNMAPS IT (review of
+# #3096, P2 + the same class recorded at `fix-one.sh:411-414`). `adopt-fix.sh` matches the CAUSE TOKEN on
+# the `[fix <PR>] DEFERRED: <cause>` line and maps each to an operator line + exit 79; a cause it does not
+# recognise gets NO line and exit 0 — SUCCESS reported for a run that pushed nothing. The orphan arm's two
+# new deferrals originally began `state/mergeclaim-…`, matching no arm at all. This pins the invariant
+# STRUCTURALLY (driving a takeover race through the whole script is not reachable from a test): every
+# `prlock_defer "…"` in `fix-one.sh` must start with a token `adopt-fix.sh` greps for.
+UNMAPPED=""
+for _tok in $(sed -n 's/.*prlock_defer "\([^"]*\)".*/\1/p' "$HERE/fix-one.sh" | sed 's/[ (].*//' | sort -u); do
+  grep -qF "DEFERRED: $_tok" "$HERE/adopt-fix.sh" || UNMAPPED="$UNMAPPED $_tok"
+done
+[ -z "$UNMAPPED" ]; rc=$?
+ck "(9b-orphan) every prlock_defer CAUSE in fix-one.sh is a token adopt-fix.sh maps (unmapped:${UNMAPPED:- none})" $rc
+grep -q 'prlock_defer "state/mergeclaim' "$HERE/fix-one.sh"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "(9b-orphan) …and no deferral is spelled with the raw lock path as its cause (the exact rewording that broke adopt-fix)" $rc
+
 # ⛔ AND A LOCK STATE NO RE-DISPATCH CAN CLEAR IS NOT REFUNDED (review of PR #2576, cycle 2 — P2). A
 # `mergeclaim-<PR>.lock` that is a DIRECTORY can never be read as an owner and never be taken; if the
 # refusal were refundable, spawn -> defer -> refund would spin for ever with `fixcount` netting to
