@@ -415,25 +415,26 @@ say_case "11. the helper owns the verdict, so a caller cannot announce success o
 # (it sits after the copy-fail and verify-fail gates, which both `exit 1`).
 n_success_lines="$(grep -c 'harness deploy VERIFIED' "$DEPLOY")"
 [ "$n_success_lines" = "1" ] && ok "one success-notification site" || bad "$n_success_lines success-notification sites (expected 1)"
-# ⛔ PINNED ON THE MESSAGE, NOT ON THE PRINTER'S NAME — THIS PIN HAS NOW BEEN STALE TWICE FOR THE
-# SAME REASON, one rename apart. It began as `grep -c 'say "$PROG: VERIFIED'`, counting the helper
-# `say` BY NAME; `ef5f36c69` (#2910/#2925, "the print helper named after a TTS binary — rename
-# `say` → `log_line`") renamed one function and the message did not move a byte, so the arm reported
-# "0 VERIFIED print sites" over correct code. `eb9df41f5` (#3127) repaired that by retargeting the
-# grep to `log_line "$PROG: VERIFIED` — which is the SAME pin with the new name substituted in, so the
-# next `printf` rewrite or helper sweep (the very rename that broke it) breaks it again in exactly
-# the same way. A pin that has to be re-cut on every rename is not pinning what the comment above
-# claims ("the success string is emitted on exactly one line of the helper"); it is pinning the
-# printer's spelling. Counting non-comment lines that EMIT `$PROG: VERIFIED` is that claim, and it
-# survives any helper rename, `printf` rewrite or `say`→`log_line`-style sweep.
-# ⛔ STILL EXACTLY ONE — this is not an "at least one" assertion wearing an "exactly one" label, and
-# it is not an always-green rewrite. MEASURED, both polarities: the printer-name form on clean
-# `origin/main` (`9c36fed22`) reported "0 VERIFIED print sites" (RED over correct code — that is the
-# reproduction); changing the one site's message → "0 ... (expected 1)" RED; ADDING a second
-# `$PROG: VERIFIED` line → "2 ... (expected 1)" RED; reverting → CLEAN. It reds on a LOST print and
-# on a second one, and it no longer reds on a printer rename — because the print did not move.
+# ⛔ PINNED ON THE MESSAGE, NOT ON THE PRINTER'S NAME (review of PR #3097). It began as
+# `grep -c 'say "$PROG: VERIFIED'`; `ef5f36c69` (#2910/#2925) renamed that one helper `say` ->
+# `log_line` and the arm reported "0 VERIFIED print sites" over a message that had not moved a byte.
+# `eb9df41f5` (#3127) re-cut it to `log_line "$PROG: VERIFIED` — the SAME pin with the new name
+# substituted in, so the next rename or `printf` rewrite breaks it identically. No helper is named
+# now: this reads the message, which survives the sweep that broke it, because it did not move.
 n_verified_print="$(grep -v '^[[:space:]]*#' "$DEPLOY" | grep -c '\$PROG: VERIFIED')"
 [ "$n_verified_print" = "1" ] && ok "one VERIFIED print site" || bad "$n_verified_print VERIFIED print sites (expected 1)"
+# ⛔ A SITE IS NOT A PRINT, and on its own the count above is WEAKER than the printer-name form it
+# replaces. Measured: turning the emission into a non-emitting mention
+# (`VERDICT_TEXT="$PROG: VERIFIED …"`) leaves the count at 1 and the suite CLEAN, while the old form
+# counts 0 and reds. So the PRINT is pinned too — no helper named here either, so no rename can stale
+# it. It reads CASE 10's healthy run rather than deploying a third time.
+if [ "${RC:-1}" -ne 0 ]; then
+  bad "case 10's healthy deploy did not exit 0 (rc=${RC:-unset}), so the print assertion has no output to read"
+elif grep -qF -- "$(basename "$DEPLOY"): VERIFIED" <<< "$OUT"; then
+  ok "the helper really prints '<prog>: VERIFIED', not merely mentions the message"
+else
+  bad "the helper never printed '$(basename "$DEPLOY"): VERIFIED' — the message is mentioned but not emitted: $(printf '%.160s' "${OUT:-}")"
+fi
 # The helper's non-comment lines are CAPTURED once and tested in the shell: a non-quiet grep piped
 # into `grep -q` is the #841/#864 SIGPIPE false-negative (the quiet grep exits early, the producer
 # dies of SIGPIPE, and under `pipefail` the assertion reports the wrong cause).
@@ -1204,38 +1205,23 @@ fi
 # at head `orch-loop.sh` carried 21 mentions and `refresh-candidates.sh` 5, while the floors said 20
 # and 4 — reverting a single remedy left both green, which is the defect this arm exists to catch.
 # The rule: each number is `grep -c 'deploy-harness\.sh' <file>` as measured NOW.
-# ⛔ `fix-one.sh:2` WAS STALE, AND #3127 RE-EARNED IT RATHER THAN RE-CUTTING IT — the two answers
-# to this arm, recorded so the next reader does not have to re-derive them. `f8c40181a` (#3023,
-# "repair work is priced by the FLEET, not by the CI queue") deleted fix-one.sh's ci-queue gate
-# outright and the two `deploy-harness.sh` mentions went with the warning that carried them, leaving
-# `grep -c` = 0 against a floor of 2 — the arm pointed at prose its own PR had deleted and read RED
-# over a tree that was correct. There were two honest repairs: delete the entry, or make
-# fix-one.sh's `repo-target.sh` refusals ("missing" and "is stale") name the verified helper, so the
-# file really does hand out two redeploy remedies. `eb9df41f5` (#3127) took the second. That is the
-# better one and the floor stays at the measured count: those two refusals previously refused a fixer
-# WITHOUT naming any way to fix the box, so the count was met by adding the remedy an operator needed
-# rather than by dropping the assertion that noticed it. `-ge` is used below, so a floor one BELOW
-# today's count tolerates exactly one reverted remedy — which is why each number is the measured
-# count of REMEDY mentions, never `0` or `1`. Two entries were measurably below that and are
-# recorded here rather than silently tolerated (found by review of PR #3097):
-#   ⛔ `orch-loop.sh` read 21 while the file carried 23 — drift from `191078ad4` (#2958) and
-#   `4b21a05ad` (#3113), which each added a remedy and re-cut no floor, so TWO reverted remedies
-#   there were invisible. That is exactly the defect the paragraph above names. Re-cut to 23,
-#   measured: all 23 mentions are remedy sites (every one reads "re-seed/fix: bash …
-#   deploy-harness.sh --repo . --o $O").
-#   ⛔ `check-deployed-drift.sh` reads 3 and KEEPS a floor of 1 DELIBERATELY — this is the one entry
-#   that must NOT be re-cut to its raw count. Of its three mentions, two are PROSE naming the
-#   producer (`:65` a comment; `:294` an "unknown: no harness record … written by the deploy path:"
-#   message) and only `:869` hands out a redeploy. Pinning 3 would pin two sentences, so a comment
-#   reword would red this arm over correct code — precisely the `say`→`log_line` brittleness this
-#   change exists to retire, moved one target to the left. Its residual is STATED, not hidden:
-#   replacing the remedy at `:869` with a bare `cp` IS caught by arm (2) below, but DELETING that
-#   line is caught by neither arm. A remedy-shaped count (rather than a mention count) would fix it;
-#   that is a change to the ARM, not to this number, so it is a follow-up rather than a floor
-#   smuggled in here.
-# Adding the three files that gained remedies above (`lane.sh:3`, `lane-merge.sh:2`,
-# `spawn-gate.sh:3`) is the same doctrine applied to them: a file that gains a remedy gets a floor, or
-# arm (1) is silent on it and arm (2) is silent on a remedy replaced by prose.
+# ⛔ TWO ENTRIES WERE MEASURABLY BELOW THAT RULE (review of PR #3097). `orch-loop.sh` read 21 against
+# 23 — the drift is `c8b9a8233` (#2850, 21->22) and `8a3e53597` (#2466/#2534, 22->23), each of which
+# added a remedy and re-cut no floor, so TWO reverted remedies there were invisible. Re-cut to 23;
+# all 23 mentions are `bash …deploy-harness.sh … --o $O` invocations (`:440` spells it
+# `$O/deploy-harness.sh --src`).
+# ⛔ `check-deployed-drift.sh` reads 3 and KEEPS floor 1 DELIBERATELY — it must not be re-cut to its
+# raw count. Only `:869` hands out a redeploy; `:65` is a comment and `:294` an "unknown: … written
+# by the deploy path:" message, so pinning 3 would pin two sentences and a COMMENT REWORD would red
+# this arm over correct code — the `say`->`log_line` brittleness this PR retires, one target left.
+# Its residual, measured: `:869` -> a bare `cp` IS caught by arm (2); DELETING `:869` is caught by
+# neither arm. That residual and arm (1)'s substring match (a `redeploy-harness.sh` satisfies a
+# `deploy-harness.sh` floor — this is a MENTION count, not a remedy count) are ONE follow-up: #2453,
+# which records that the honest per-file caveat here was replaced by an overclaim. Re-cutting a floor
+# hides neither: do not raise one to make this comment true, and do not lower one to make it pass.
+# `fix-one.sh:2` and `lane.sh:3` / `lane-merge.sh:2` / `spawn-gate.sh:3` came from #3127 and are kept —
+# it re-earned the fix-one.sh floor by giving those two refusals the remedy they lacked, instead of
+# dropping the assertion that noticed they had none.
 REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:23 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:3 lane-merge.sh:2 spawn-gate.sh:3"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
