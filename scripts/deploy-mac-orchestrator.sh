@@ -116,7 +116,20 @@ git -C "$AI_MAIN" fetch -q origin main 2>/dev/null || true
 REV="$(git -C "$AI_MAIN" rev-parse --short "$SRC_REF" 2>/dev/null)"
 [ -n "$REV" ] || { log "FATAL: cannot resolve $SRC_REF in $AI_MAIN"; exit 1; }
 rm -rf "$STAGE"; mkdir -p "$STAGE"
-git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness scripts/lib/lane-ceiling.sh | tar -x -C "$STAGE" || {
+# ⛔ THE LIBRARY PATHSPEC IS CONDITIONAL, AND THAT IS NOT TIDINESS (review P1, agent-infra#3146).
+# `git archive` FAILS when ANY pathspec matches nothing, so naming `scripts/lib/lane-ceiling.sh`
+# unconditionally turned every ref that predates it into a FATAL — `SRC_REF` is the documented
+# ROLLBACK lever (`SRC_REF=<tag>`), so after this merged, a rollback aborted in phase A with `$STAGE`
+# already `rm -rf`d: nothing staged, nothing deployed. Worse, the graceful branch below ("a ref that
+# predates the library is not a FATAL") could never be reached, so a comment claimed behaviour that
+# was unreachable — the "comment that names code which is not here" class this PR exists to remove.
+# The probe asks the REF, not the working tree: `cat-file -e` is a tree lookup, so a ref carrying the
+# library is archived WITH it and one that does not is archived without it.
+ARCHIVE_PATHS=(scripts/orchestrator-harness)
+if git -C "$AI_MAIN" cat-file -e "$SRC_REF:scripts/lib/lane-ceiling.sh" 2>/dev/null; then
+  ARCHIVE_PATHS+=(scripts/lib/lane-ceiling.sh)
+fi
+git -C "$AI_MAIN" archive "$SRC_REF" "${ARCHIVE_PATHS[@]}" | tar -x -C "$STAGE" || {
   log "FATAL: could not extract the harness from $SRC_REF"; exit 1; }
 H="$STAGE/scripts/orchestrator-harness"
 [ -f "$H/claims.sh" ] || { log "FATAL: $SRC_REF has no claims.sh — refusing to deploy"; exit 1; }
