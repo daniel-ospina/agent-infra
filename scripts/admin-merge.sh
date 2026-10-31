@@ -6299,9 +6299,10 @@ NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unre
 #     pytest exit 4 having run NOTHING). CANDIDACY AND CLEARANCE ARE NOT THE SAME
 #     SET (#1185): `repro_scope` admits ONE guard-step identity into the
 #     candidate set when the base's baseline was read and holds no row for its
-#     step, so the rail can REPORT that the base cannot speak to it — and both
-#     filters above keep it out of the runner's argv and out of the base's
-#     capture, so a candidate of that class is still never cleared.
+#     step, so the rail can REPORT that the base cannot speak to it — while the
+#     two filters in `reproduce_residual_on_base` keep it out of the runner's
+#     argv AND out of the base's own capture before `intersect_sets`, so a
+#     candidate of that class is still never cleared.
 #     `repro_scope` then
 #     `repro_candidates` are the one place that decision is made, and the cleared
 #     set is its intersection with the base's own failures (`intersect_sets`,
@@ -6678,7 +6679,9 @@ intersect_sets() {
 # repro_scope <residual> <unattributable> <out> <scratch> [<mainfails>] — the ids
 # a base run could even SPEAK TO: the residual minus UNATTRIBUTABLE identities,
 # minus guard-step identities THE BASE HAS A RECORD OF, and minus the other
-# NON-NODEID families. All are excluded on doctrine, not on evidence:
+# NON-NODEID families. Every arm is excluded on DOCTRINE — and the guard-step arm
+# alone is additionally decided on EVIDENCE from the base's OWN baseline
+# (`main_measured_files`), which is #1185's narrowing:
 #   * UNATTRIBUTABLE is "a class red across runs under a MOVING id — the identity
 #     provably will not be the same next run, so it cannot be attributed to this
 #     PR". Reproducing ONE of the moving ids on the base says nothing about the
@@ -8292,7 +8295,7 @@ main() {
       # carries a main-side measurement, or every id's FILE is measured on main
       # (MEASURED-ABSENT). Naming the wrong one would be a false report.
       if [ ! -s "$TMP/repro-scope.txt" ]; then
-        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job). A guard-step is NOT in this class only when main's baseline was READ, is non-empty, and holds no row for its step (#1185) — then it reaches the candidate set and is reported there; an EMPTY or unreadable baseline keeps it in THIS class, because a failure-only baseline cannot tell 'main is green' from 'main has no run' (#7734). The refusal stands"
+        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job). A guard-step is NOT in this class only when it is not UNATTRIBUTABLE (that arm wins first) AND main's baseline was READ, is non-empty, and holds no row for its step (#1185) — then it reaches the candidate set and is reported there; an EMPTY or unreadable baseline keeps it in THIS class, because a failure-only baseline cannot tell 'main is green' from 'main has no run' (#7734). The refusal stands"
       elif [ ! -s "$TMP/repro-idlevel.txt" ]; then
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to carries a main-side measurement, so there is no missing measurement to construct — the refusal stands"
       else
