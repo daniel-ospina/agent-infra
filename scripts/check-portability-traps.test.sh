@@ -255,6 +255,24 @@ printf 'glued/1-brace.sh\nglued/2-subst.sh\n' >"$TMP/glued-targets"
 flags "sed-in-place-gnu" "$TMP/glued-targets"
 [ "$?" = 0 ] && ok "C21: a '#' GLUED to \${ } / \$( ) is data, not a comment — the trap to its right is still reported (it was silently unscanned on main)" \
   || bad "C21: a glued '#' truncated the line and hid a real trap"
+# ⛔ C22 — THE SAME RULE INSIDE A SUBSTITUTION, WHICH THE FIRST FIX MISSED (review cycle-2 P0). The
+# glued-`#` exemption first landed at TOP LEVEL only, so `z=$( … ${y}#tag; sed -i … )` still truncated the
+# code view inside the substitution and the live `sed -i` went unreported with the run exiting 0.
+mkdir -p "$TMP/tree/glued2"
+printf '%s\n' '#!/usr/bin/env bash' 'z=$(' '  echo a ${y}#tag; sed -i "s/a/b/" f' ')' >"$TMP/tree/glued2/1-subst.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'y=`echo ${v}#tag; sed -i "s/a/b/" f`' >"$TMP/tree/glued2/2-backtick.sh"
+printf 'glued2/1-subst.sh\nglued2/2-backtick.sh\n' >"$TMP/glued2-targets"
+flags "sed-in-place-gnu" "$TMP/glued2-targets"
+[ "$?" = 0 ] && ok "C22: a '#' glued to \${ } INSIDE a \$( ) / backtick substitution is data too — the trap on that line is still reported" \
+  || bad "C22: a glued '#' inside a substitution hid a real trap (the fix was top-level only)"
+# ⛔ C23 — AND THE MARKER MUST STILL WORK THERE, because it IS a comment in the shell: a per-line
+# hatch inside `$( … )` was honoured on `origin/main` and stopped being honoured when CMT_AT became the
+# only gate — over-block on a documented escape hatch, so this arm pins the other direction.
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(sed -i "s/a/b/" f # portability-ok: caller pins GNU sed' ')' >"$TMP/tree/glued2/3-inner-ok.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'y=`sed -i "s/a/b/" f # portability-ok: caller pins GNU sed`' >"$TMP/tree/glued2/4-inner-ok-backtick.sh"
+printf 'glued2/3-inner-ok.sh\nglued2/4-inner-ok-backtick.sh\n' >"$TMP/inner-ok-targets"
+not_flags "sed-in-place-gnu" "$TMP/inner-ok-targets" && ok "C23: a reasoned '# portability-ok:' INSIDE a \$( ) and a backtick substitution still suppresses (it is a real comment there)" \
+  || bad "C23: the per-line hatch stopped working inside \$( … ) — over-block on a documented escape"
 
 # C6/C7 — the file-level declaration: a reasoned skip works; a bare one REFUSES.
 L="$TMP/linuxonly"; : >"$L"
@@ -1665,74 +1683,74 @@ fi
 # backticks), skips heredoc BODIES at top level (a body is data, and its `$(` must not open a depth),
 # and reports any heredoc opener seen while depth > 0.
 subst_heredoc_pin() {
-  # A CHAR-LEVEL CONTEXT-STACK scan across lines, NOT a per-line grep. Two measurements forced it:
+  # A CHAR-LEVEL CONTEXT-STACK scan across lines, NOT a per-line grep. The measurements that forced
+  # each part, so a later "simplification" cannot silently remove coverage:
   #   · a per-line quote model desynchronises on the detector own 1200-line SINGLE-QUOTED awk
-  #     program, so a phantom `$(` reads every later `<<` as "inside a substitution" (5 false hits);
-  #   · the same-line pattern missed the MULTI-LINE spelling entirely, which is an equal parse
-  #     failure on bash 3.2.57 and therefore an equal hole in the only 3.2 coverage bash-5 CI has.
-  # So this mirrors the model the detector itself uses: push on `$(`, `$((' (arithmetic), a double
-  # quote, a single/ANSI-C quote and a backtick; pop on the matching close. A heredoc opener seen
-  # while the stack sits on a COMMAND SUBSTITUTION is the defect. Two exclusions keep it honest:
-  # `$(( … ))` is ARITHMETIC (a `<<` there is a left shift, not a heredoc) and a top-level heredoc
-  # BODY is data, so a `$(` inside a body cannot open a depth.
+  #     program, so a phantom `$(` reads every later `<<` as "inside a substitution";
+  #   · the same-line pattern missed the MULTI-LINE spelling, an equal parse failure on bash 3.2.57;
+  #   · the `case`-arm label `)` does NOT close the substitution (`$(case … in a) cat <<EOF …)`) —
+  #     popping there reads the opener as TOP LEVEL, records it, skips the body and reports nothing;
+  #   · `$(( … ))` closes with TWO `)`, so a counter is required (`AR`/`PD` per depth), not a pop on
+  #     the first `)` — popping there closes the ENCLOSING substitution and a heredoc after an
+  #     arithmetic expansion in the same substitution becomes invisible;
+  #   · `case` nesting is PER DEPTH (`CD`), not one global counter, or an inner `esac` decrements the
+  #     outer level and the outer substitution is never popped — every later line then reads as
+  #     "inside a substitution" and a legitimate top-level heredoc is reported.
+  # Two exclusions keep it honest: `$(( … ))` is arithmetic (a `<<` there is a left shift) and a
+  # top-level heredoc BODY is data, so a `$(` inside a body cannot open a depth.
   awk '
-    BEGIN { SQ = sprintf("%c", 39); hd = ""; hdstrip = 0; ST = ""; cased = 0 }
+    BEGIN { SQ = sprintf("%c", 39); hd = ""; hdstrip = 0; ST = "" }
     function s_top() { return (length(ST) > 0) ? substr(ST, length(ST), 1) : "" }
-    
-    function s_push(ch) { ST = ST ch }
-    function s_pop() { ST = substr(ST, 1, length(ST) - 1) }
+    function s_push(ch, ar) { ST = ST ch; d = length(ST); AR[d] = ar; PD[d] = (ar == 2) ? 2 : 1; CD[d] = 0 }
+    function s_pop() { d = length(ST); ST = substr(ST, 1, d - 1) }
     {
       line = $0
       if (hd != "") { t = line; if (hdstrip) sub(/^\t+/, "", t); if (t == hd) hd = ""; next }
       n = length(line); i = 1; prev = " "
       while (i <= n) {
-        c = substr(line, i, 1); nx = substr(line, i + 1, 1); t = s_top()
+        c = substr(line, i, 1); nx = substr(line, i + 1, 1); t = s_top(); d = length(ST)
         if (t == "S") { if (c == SQ) s_pop(); prev = c; i++; continue }
         if (t == "A") { if (c == "\\") { i += 2; continue } if (c == SQ) s_pop(); prev = c; i++; continue }
         if (t == "D") {
           if (c == "\\") { i += 2; continue }
           if (c == "\"") { s_pop(); prev = c; i++; continue }
-          if (c == "$" && nx == "(") { s_push("C"); i += 2; continue }
-          if (c == "`") { s_push("K"); prev = c; i++; continue }
+          if (c == "$" && nx == "(") { if (substr(line, i + 2, 1) == "(") { s_push("C", 2); i += 3; continue } s_push("C", 1); i += 2; continue }
+          if (c == "`") { s_push("K", 0); prev = c; i++; continue }
           prev = c; i++; continue
         }
         if (t == "K") { if (c == "\\") { i += 2; continue } if (c == "`") s_pop(); prev = c; i++; continue }
         if (t == "C") {
           if (c == "\\") { i += 2; continue }
-          # ⛔ A `case` ARM INSIDE A SUBSTITUTION ENDS IN `)`, AND THAT `)` DOES NOT CLOSE THE
-          # SUBSTITUTION (review cycle-2 of this pin, measured): without this, `RULES=$(case … in
-          # all) cat <<\047EOF\047 … esac)` popped the substitution at the arm label, the opener was
-          # then read as a TOP-LEVEL heredoc (body skipped as data, no hit), and bash 3.2.57 still
-          # refused the file (`syntax error near unexpected token \047;;\047`). The pin exists to be
-          # the only 3.2 coverage on bash-5 CI, so a shape it cannot see is a shape the gate cannot
-          # see there either.
           if (c ~ /[A-Za-z]/ && (i == 1 || substr(line, i - 1, 1) ~ /[^A-Za-z0-9_]/)) {
             rest2 = substr(line, i)
-            if (rest2 ~ /^case([ \t;)(|&]|$)/) { cased++; i += 4; prev = "e"; continue }
-            if (rest2 ~ /^esac([ \t;)(|&]|$)/) { if (cased > 0) cased--; i += 4; prev = "c"; continue }
+            if (rest2 ~ /^case([ \t;)(|&]|$)/) { CD[d] = 1; i += 4; prev = "e"; continue }
+            if (rest2 ~ /^esac([ \t;)(|&]|$)/) { CD[d] = 0; i += 4; prev = "c"; continue }
           }
-          if (c == ")" && AR[length(ST)] == 0 && cased == 0) { s_pop(); prev = c; i++; continue }
-          if (c == ")" && AR[length(ST)] == 1) { s_pop(); if (nd > 0) nd--; prev = c; i++; continue }
-          if (c == SQ) {
-            if (prev == "$") s_push("A"); else s_push("S")
-            prev = c; i++; continue
+          if (AR[d] == 2) {
+            if (c == "(") { PD[d]++; prev = c; i++; continue }
+            if (c == ")") { PD[d]--; if (PD[d] <= 0) s_pop(); prev = c; i++; continue }
           }
-          if (c == "\"") { s_push("D"); prev = c; i++; continue }
-          if (c == "`") { s_push("K"); prev = c; i++; continue }
+          if (c == ")" && CD[d] == 0) { s_pop(); prev = c; i++; continue }
+          if (c == SQ) { if (prev == "$") s_push("A", 0); else s_push("S", 0); prev = c; i++; continue }
+          if (c == "\"") { s_push("D", 0); prev = c; i++; continue }
+          if (c == "`") { s_push("K", 0); prev = c; i++; continue }
           if (c == "$" && nx == "(") {
-            if (substr(line, i + 2, 1) == "(") { s_push("C"); AR[length(ST)] = 1; nd++; i += 3; continue }
-            s_push("C"); i += 2; continue
+            if (substr(line, i + 2, 1) == "(") { s_push("C", 2); i += 3; continue }
+            s_push("C", 1); i += 2; continue
           }
-          if (c == "<" && nx == "<" && substr(line, i + 2, 1) != "=" && AR[length(ST)] == 0) { print FNR; i += 2; prev = c; continue }
+          if (c == "<" && nx == "<" && substr(line, i + 2, 1) != "=" && AR[d] != 2) { print FNR; i += 2; prev = c; continue }
           prev = c; i++; continue
         }
         # top level
         if (c == "\\") { i += 2; prev = c; continue }
         if (c == "#" && (i == 1 || prev ~ /[ \t;&|(){}]/)) break
-        if (c == SQ) { if (prev == "$") s_push("A"); else s_push("S"); prev = c; i++; continue }
-        if (c == "\"") { s_push("D"); prev = c; i++; continue }
-        if (c == "$" && nx == "(") { s_push("C"); AR[length(ST)] = (substr(line, i + 2, 1) == "(") ? 1 : 0; i += 2; continue }
-        if (c == "`") { s_push("K"); prev = c; i++; continue }
+        if (c == SQ) { if (prev == "$") s_push("A", 0); else s_push("S", 0); prev = c; i++; continue }
+        if (c == "\"") { s_push("D", 0); prev = c; i++; continue }
+        if (c == "$" && nx == "(") {
+          if (substr(line, i + 2, 1) == "(") { s_push("C", 2); i += 3; continue }
+          s_push("C", 1); i += 2; continue
+        }
+        if (c == "`") { s_push("K", 0); prev = c; i++; continue }
         if (c == "<" && nx == "<" && substr(line, i + 2, 1) != "=") {
           rest = substr(line, i + 2)
           if (substr(rest, 1, 1) == "-") { rest = substr(rest, 2); hdstrip = 1 } else hdstrip = 0
@@ -1789,6 +1807,37 @@ if [ -n "$(subst_heredoc_pin "$TMP/f9-case.sh")" ]; then
   ok "F9f-negative: the shape matcher REPORTS a heredoc opened inside a CASE ARM of a substitution (the arm-label ')' must not close it)"
 else
   bad "F9f: the matcher popped the substitution at the case arm label and missed a 3.2-fatal heredoc"
+fi
+# F9g — the CONTROL for F9f: a nested `case` inside a nested `$( … )`, followed by a legitimate
+# TOP-LEVEL heredoc, must NOT be reported. A single global case counter leaks across depths when the
+# inner `esac` fires, the outer substitution is then never popped, and every later line reads as
+# "inside a substitution" — an over-block on valid code, which is the other way this gate gets
+# switched off.
+{ printf 'R=$(case "$1" in'; printf '\n'; printf '  a) y=$(case "$2" in b) echo 1;; esac) ;;'; printf '\n'; printf 'esac)'; printf '\n'; printf 'cat <<%sM%s' "'" "'"; printf '\n'; printf 'body'; printf '\n'; printf 'M'; printf '\n'; } >"$TMP/f9-nested.sh"
+if [ -z "$(subst_heredoc_pin "$TMP/f9-nested.sh")" ]; then
+  ok "F9g: a nested case plus a legit TOP-LEVEL heredoc is NOT reported (case nesting is per depth, not one global counter)"
+else
+  bad "F9g: the matcher reported a top-level heredoc after a nested case — the case counter leaked across depths"
+fi
+# F9h — `$(( … ))` closed with TWO `)`: a pop on the first one closes the ENCLOSING substitution, so a
+# heredoc after an arithmetic expansion in the same substitution is invisible. Measured: bash 3.2.57
+# refuses this fixture (`unexpected EOF while looking for matching quote`) while bash 5 parses it.
+{ printf 'x=$( y=$(( 1 << 4 )) ; cat <<%sM%s' "'" "'"; printf '\n'; printf "it%ss a quote" "'"; printf '\n'; printf 'M'; printf '\n'; printf ')'; printf '\n'; } >"$TMP/f9-arith.sh"
+if [ -n "$(subst_heredoc_pin "$TMP/f9-arith.sh")" ]; then
+  ok "F9h-negative: the matcher REPORTS a heredoc after an ARITHMETIC expansion in the same substitution (\$(( )) closes on two parens)"
+else
+  bad "F9h: the matcher popped the substitution on the first ) of \$(( )) and missed the heredoc"
+fi
+# F9i — the SECOND arm of a `case` inside a substitution, after a NESTED `case` has closed. A single
+# global case counter is cleared by the inner `esac`, so the next arm label `)` pops the OUTER
+# substitution and the heredoc in that arm is read as a top-level opener (recorded, body skipped,
+# nothing reported). Measured: the per-depth matcher reports line 3, a global-counter mutant reports
+# nothing, and bash 3.2.57 refuses the file.
+{ printf 'R=$(case x in'; printf '\n'; printf '  a) y=$(case b in b) echo 1;; esac) ;;'; printf '\n'; printf '  b) cat <<%sM%s' "'" "'"; printf '\n'; printf "it%ss a quote" "'"; printf '\n'; printf 'M'; printf '\n'; printf ' ;;'; printf '\n'; printf 'esac)'; printf '\n'; } >"$TMP/f9-twoarm.sh"
+if [ -n "$(subst_heredoc_pin "$TMP/f9-twoarm.sh")" ]; then
+  ok "F9i-negative: the matcher REPORTS a heredoc in the SECOND case arm after a nested case closed (case state is per depth)"
+else
+  bad "F9i: a nested esac cleared the outer case state and the next arm heredoc was missed"
 fi
 # F9c — the real parse, under this host's bash and under a real bash 3.x if the host has one
 if bash -n "$CHECK" 2>"$TMP/f9.err"; then

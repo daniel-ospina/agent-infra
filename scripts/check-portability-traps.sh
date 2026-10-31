@@ -229,10 +229,15 @@ RULES="$(portability_rule_table)"
 # the emitted baseline shipped a silently truncated justification. A table that cannot be transported
 # intact is a REFUSAL, not a best effort.
 case "$RULES" in
-  *"$(printf '\034')"*) echo "❌ the rule table contains the \034 transport separator — template integrity cannot be guaranteed" >&2; exit 2 ;;
+  *"$(printf '\034')"*) echo "❌ the rule table contains the 0x1c transport separator — template integrity cannot be guaranteed" >&2; exit 2 ;;
 esac
+# ⛔ NO BACKTICKS IN AN ECHO MESSAGE (review cycle-2 P2): the first spelling of this refusal said
+# "`id<TAB>trap<TAB>replacement`" INSIDE DOUBLE QUOTES, so the shell COMMAND-SUBSTITUTED it — the
+# operator's message lost the column names and `id` ran with `<TAB>` as a redirect target, printing
+# `TAB: No such file or directory` on every malformed-table refusal. A refusal path is not a place to
+# discover quoting.
 if ! printf '%s\n' "$RULES" | awk -F'\t' 'NF != 3 || $1 == "" || $2 == "" || $3 == "" { bad = 1 } END { exit(bad ? 1 : 0) }'; then
-  echo "❌ the rule table is MALFORMED (a row must be `id<TAB>trap<TAB>replacement`, all three non-empty) — refusing to scan with a broken table" >&2
+  echo "❌ the rule table is MALFORMED — a row must be id, trap and replacement separated by TABS with all three non-empty; refusing to scan with a broken table" >&2
   exit 2
 fi
 
@@ -426,19 +431,13 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
       # the prose as an OPEN QUOTE and swallowed the rest of the file — every later finding gone,
       # gate green, and the baseline reported the loss as a "fixed finding". A comment inside `$( … )`
       # or inside backticks is as real as one at top level.
-      if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;&|(){}]/)) {
-        if (i > 1 && substr(line, i - 1, 1) == "{") { out = out c; continue }
-        break
-      }
+      if (c == "#" && cmt_start(line, i)) { CMT_AT = i; break }
       out = out c; continue
     }
     # ── inside `$( … )`: code, with nested quotes and parens of its own
     if (top == "C") {
       if (c == "\\") { i++; continue }
-      if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;&|(){}]/)) {
-        if (i > 1 && substr(line, i - 1, 1) == "{") { out = out c; continue }
-        break
-      }
+      if (c == "#" && cmt_start(line, i)) { CMT_AT = i; break }
       if (c == "\"") { st_push("D"); SN[length(ST)] = 0; out = out "\""; continue }
       if (c == SQ) { ansi = (i > 1 && substr(line, i - 1, 1) == "$"); st_push("S"); AC[length(ST)] = ansi; SN[length(ST)] = 0; out = out SQ; continue }
       if (c == "$" && substr(line, i + 1, 1) == "(") {
@@ -482,19 +481,10 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
     }
     # ── TOP LEVEL: code, comments, and the opener of each context
     if (c == "\\") { i++; continue }
-    if (c == "#") { prev = (i == 1) ? " " : substr(line, i - 1, 1)
-                    # ⛔ A `#` GLUED TO THE PREVIOUS WORD IS NOT A COMMENT (review cycle-18b P1, and it
-                    # was a FALSE PASS twice over): bash starts a comment only when `#` begins a WORD.
-                    # `${x}#c`, `$(cmd)#c` and `"a"#c` keep it in the word — measured:
-                    # `x=abc; echo ${x}# portability-ok: r` prints `abc# portability-ok: r`, i.e. the
-                    # text is DATA — while this class read `${x}#…` as a comment, so (a) the code view
-                    # was TRUNCATED there and every trap to its right went unscanned, and (b) with the
-                    # marker spelling the new CMT_AT hatch then BLESSED the line. The `}` and the `)`
-                    # that CLOSED a context are exactly those cases; a `)` that closes a case arm or a
-                    # subshell is still a real word boundary, so it keeps its place in the class.
-                    if (prev == "{") { out = out c; continue }
-                    if (prev == "}" || (prev == ")" && i - 1 == LAST_POP)) { out = out c; continue }
-                    if (prev ~ /[ \t;&|(){}]/) { CMT_AT = i; break } }
+    # ⛔ A `#` THAT DOES NOT BEGIN A COMMENT IS DATA AND FALLS THROUGH TO `out = out c` (review
+    # cycle-18b P1 / cycle-2 P0): `${x}#c`, `$(cmd)#c` and `"a"#c` keep the `#` in the WORD, so
+    # treating them as comments both truncated the code view and let the marker bless the line.
+    if (c == "#" && cmt_start(line, i)) { CMT_AT = i; break }
     if (c == SQ) { ansi = (i > 1 && substr(line, i - 1, 1) == "$"); st_push("S"); AC[length(ST)] = ansi; SN[length(ST)] = 0; out = out SQ; continue }
     if (c == "\"") { st_push("D"); SN[length(ST)] = 0; out = out "\""; continue }
     if (c == "$" && substr(line, i + 1, 1) == "(") {
@@ -506,6 +496,26 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
     out = out c
   }
   return out
+}
+
+# ── cmt_start(line, i) — 1 when the `#` at offset i BEGINS A COMMENT, 0 when it is part of a WORD.
+# ⛔ ONE DECISION, THREE CALL SITES (review cycle-2 P0). The glued-`#` rule was first applied at TOP
+# LEVEL only, so inside `$( … )` and inside backticks a `#` glued to `${…}` or to a closed `$( … )`
+# was still read as a comment: the code view was truncated there and a LIVE `sed -i` on the same line
+# went unreported, with the run exiting 0 — a false PASS reached from program text, which is the one
+# direction this file forbids. Measured shape:
+#     z=$(
+#       echo a ${y}#tag; sed -i "s/a/b/" f      ← the sed was never scanned
+#     )
+# The three branches (top level, `$( … )`, backticks) now ask this single function, so a fix in one
+# place cannot leave the other two behind — the failure mode the review found twice.
+function cmt_start(line, i,   prev) {
+  prev = (i == 1) ? " " : substr(line, i - 1, 1)
+  if (prev == "{") return 0
+  if (prev == "}") return 0
+  if (prev == ")" && i - 1 == LAST_POP) return 0
+  if (prev ~ /[ \t;&|(){}]/) return 1
+  return 0
 }
 
 # quoted_procfs(line) — 1 when the line names a procfs path inside a QUOTED word.
@@ -530,6 +540,7 @@ function no_comment(line,   i, n, c, out, q, prev) {
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
     if (q != "") { out = out c; if (c == q) q = ""; continue }
+    if (c == "#" && cmt_start(line, i)) { CMT_AT = i; break }
     if (c == "#") { prev = (i == 1) ? " " : substr(line, i - 1, 1)
                     if (prev ~ /[ \t;&|(){}]/) break }
     if (c == SQ || c == "\"") { q = c; out = out c; continue }
