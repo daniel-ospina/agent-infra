@@ -83,14 +83,14 @@ box_mtime() {
   # and would print the wrong thing, so the -c form is attempted BEFORE -f on a Linux-looking box.
   case "$(box_os)" in
     linux)
-      if v="$(stat -c %Y "$f" 2>/dev/null)"; then BOX_MTIME_MECH="stat-c"; fi
+      if v="$(stat -c %Y "$f" 2>/dev/null)"; then BOX_MTIME_MECH="stat-c"; fi  # portability-ok: OS-GUARDED — this arm runs only inside `case "$(box_os)" in linux)`; macOS takes the `stat -f` arm below
       ;;
   esac
   if [ -z "$v" ]; then
     if v="$(stat -f %m "$f" 2>/dev/null)"; then BOX_MTIME_MECH="stat-f"; fi
   fi
   if [ -z "$v" ]; then
-    if v="$(stat -c %Y "$f" 2>/dev/null)"; then BOX_MTIME_MECH="stat-c"; fi
+    if v="$(stat -c %Y "$f" 2>/dev/null)"; then BOX_MTIME_MECH="stat-c"; fi  # portability-ok: LAST-RESORT ARM of the probe chain — it runs only after the `stat -f` arm above declined, and `box_mtime` is the shim the rule points at
   fi
   case "$v" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s\n' "$v"
@@ -105,7 +105,7 @@ box_epoch_to_iso() {
       ;;
   esac
   if [ -z "$v" ]; then
-    if v="$(date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then BOX_DATE_MECH="date-d"; fi
+    if v="$(date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then BOX_DATE_MECH="date-d"; fi  # portability-ok: LAST-RESORT ARM of box_epoch_to_iso's probe chain — it runs only after the `date -r` arm declined, and this function IS the shim the rule points at
   fi
   if [ -z "$v" ]; then
     if v="$(date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then BOX_DATE_MECH="date-r"; fi
@@ -129,10 +129,10 @@ box_sed_i() {
   if sed --version >/dev/null 2>&1; then
     # GNU sed: -i and the empty suffix must NOT be separated, or the script becomes the suffix.
     BOX_SED_MECH="gnu"
-    sed -i'' -e "$expr" "$f"
+    sed -i'' -e "$expr" "$f"  # portability-ok: GNU BRANCH of box_sed_i — chosen by probing `sed --version`, so the empty suffix is attached the GNU way on purpose
   else
     BOX_SED_MECH="bsd"
-    sed -i '' -e "$expr" "$f"
+    sed -i '' -e "$expr" "$f"  # portability-ok: BSD BRANCH of box_sed_i — the empty suffix must be a SEPARATE argument here, which is what BSD requires
   fi
 }
 
@@ -254,7 +254,7 @@ box_selftest() {
   # assert the file was NOT changed where the platform is BSD — this is the measured reason the shim
   # exists, and it fails loudly if a future "portable" rewrite reintroduces the spelling.
   printf 'alpha\n' > "$tmp"
-  sed -i 's/alpha/beta/' "$tmp" >/dev/null 2>&1 || true
+  sed -i 's/alpha/beta/' "$tmp" >/dev/null 2>&1 || true  # portability-ok: DELIBERATE PROBE — the GNU spelling is run on purpose to assert it is silent on BSD; this is the measured reason the shim exists
   if [ "$os" = "darwin" ]; then
     if [ "$(head -1 "$tmp")" = "alpha" ]; then
       printf 'PASS sed-i-gnu-spelling-is-silent-on-bsd (file unchanged, exit 0) — the shim is required\n'
