@@ -34,8 +34,9 @@ THE THREE NUMBERS, and which question each answers
               here): bytes that VANISH if this tree is deleted. This is what "reap it"
               actually frees, and the honest per-lane marginal cost when the cache is warm.
               It is 0 on a perfectly-shared env — a real, GOOD reading, not a missing one.
-  fair_kb     blocks divided across their link count (sum(blocks / nlink)): this tree's
-              share of everything it touches, for ATTRIBUTION between trees. It is NOT
+  fair_kb     sum over inodes of blocks * min(seen, nlink) / nlink: this tree's share of
+              everything it touches, for ATTRIBUTION between trees. The minute a tree owns
+              every link of an inode, its share is that WHOLE inode (min(seen, nlink) == nlink). It is NOT
               "the bytes freed if this tree is deleted" — while any other link survives
               (the uv cache holds one), the blocks stay allocated. `private_kb` is the
               freed-bytes figure.

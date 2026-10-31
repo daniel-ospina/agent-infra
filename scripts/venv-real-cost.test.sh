@@ -67,8 +67,8 @@ echo "── 1b. fair_kb still reports the share for PRIVATE files (not 0) ─�
 # bytes. Reporting 0 for exactly the class this tool exists to name was a real regression.
 out="$("$PY" "$TOOL" --tsv "$T/priv")"
 fair="$(printf '%s' "$out" | cut -f2)"
-[ "$fair" -ge 2000 ] && ok "a private tree's fair share is its own bytes (${fair} KB)" \
-    || bad "fair_kb collapsed to $fair for a private tree"
+[ "$fair" -ge 2000 ] && [ "$fair" -le 2200 ] && ok "a private tree's fair share is its own bytes (${fair} KB)" \
+    || bad "fair_kb wrong for a private tree: $fair (collapsed to 0, or a units error)"
 
 echo "── 2. a HARDLINKED pair is counted ONCE, not twice ──────────────────────────────────────"
 mkdir -p "$T/s1" "$T/s2"
@@ -83,6 +83,27 @@ if [ "$(stat -c %h "$T/s1/blob.bin" 2>/dev/null || stat -f %l "$T/s1/blob.bin")"
     [ "$total" -ge 1000 ] && ok "total still reports the full blocks (the \`du\` figure)" || bad "total lost the blocks: $total"
 else
     ok "hardlinks unavailable on this filesystem — discrimination not exercised"
+fi
+
+echo "── 2b. a hardlinked pair INSIDE one tree is private, and fair == total for it ───────────"
+# The complement of case 2: both links live in the tree, so deleting the tree frees the blocks even
+# though nlink > 1. `fair_kb` must then be the WHOLE inode, not half — the docstring says so explicitly.
+mkdir -p "$T/intra"
+dd if=/dev/zero of="$T/intra/a.bin" bs=1024 count=20480 status=none
+ln "$T/intra/a.bin" "$T/intra/b.bin" 2>/dev/null || true
+if [ "$(stat -c %h "$T/intra/a.bin" 2>/dev/null || stat -f %l "$T/intra/a.bin")" = "2" ]; then
+    out="$("$PY" "$TOOL" --json "$T/intra")"
+    priv="$(printf '%s' "$out" | sed -n 's/.*"private_kb": \([0-9]*\).*/\1/p')"
+    fair="$(printf '%s' "$out" | sed -n 's/.*"fair_kb": \([0-9]*\).*/\1/p')"
+    total="$(printf '%s' "$out" | sed -n 's/.*"total_kb": \([0-9]*\).*/\1/p')"
+    [ "$priv" -ge 20000 ] && ok "an in-tree hardlinked pair is PRIVATE (${priv} KB) — the blocks die with the tree" \
+        || bad "in-tree pair reported private=$priv (a bare nlink>1 test reads 0 here)"
+    [ "$fair" -eq "$priv" ] && ok "its fair share is the whole inode, matching private ($fair KB)" \
+        || bad "fair share should equal private for an in-tree pair: fair=$fair private=$priv"
+    [ "$total" -le 21000 ] && ok "and total counts the inode ONCE, like du (${total} KB)" \
+        || bad "total double-counted the inode: $total"
+else
+    ok "hardlinks unavailable here — in-tree pair not exercised"
 fi
 
 echo "── 3. the DEGRADED class is named, and it is not the small-tree case ───────────────────"

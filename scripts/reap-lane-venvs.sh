@@ -391,6 +391,24 @@ run_bounded() {
     : >"$out" 2>/dev/null || { : ; }
     "$@" >"$out" 2>&1 &
     pid=$!
+    # ⛔ NORMALISE AND RANGE-CHECK HERE, NOT ONLY AT ONE CALL SITE (#2159 review, rounds 3-4). The
+    # predicate below parses with strtoimax: an all-digit value above 2^63-1 makes the COMPARISON ITSELF
+    # error, `if` then takes the else branch and NO WATCHDOG IS ARMED — silently, on every one of the
+    # six bound seams (ps/cwd/tmux/git/remove/cost), not just the one that got a per-seam check. Leading
+    # zeros are stripped first (`00` is zero, which is already the documented "no watchdog" spelling, so
+    # it means exactly what `0` means), the digit count is capped at 9 (~31 years), and an over-range
+    # value falls back LOUDLY rather than being handed to a comparison that would abort.
+    _bnd_norm="${secs#"${secs%%[!0]*}"}"
+    case "$secs" in
+        ''|*[!0-9]*) _bnd_norm="" ;;
+    esac
+    if [ -n "${_bnd_norm:-}" ] && [ "${#_bnd_norm}" -gt 9 ]; then
+        echo "warn: probe bound '$secs' is out of range (at most 9 digits) — using 120s instead of arming no watchdog" >&2
+        log "warn: probe bound '$secs' out of range — fell back to 120s"
+        secs=120
+    elif [ -n "${_bnd_norm:-}" ]; then
+        secs="$_bnd_norm"
+    fi
     if is_pos_int "$secs" && [ "$secs" -gt 0 ]; then
         (
             # ⛔ `cd /` IS LOAD-BEARING (#1932). This watchdog is a CHILD of the reaper and inherits its
@@ -1052,16 +1070,23 @@ parse_args() {
     # validation was added to prevent (the same class #2158 fixed for the age floor). String compare
     # for the zero test, and a length cap before any numeric comparison, so the check cannot itself
     # emit an arithmetic error.
+    # ⛔ LEADING ZEROS ARE NORMALISED FIRST, exactly as the age floor does it (#2158): a string compare
+    # against "0" refuses only that spelling, so `00`/`000` would pass and then mean zero to
+    # `run_bounded`'s numeric test — no watchdog, no warning: the same fail-open in a different spelling.
+    # Strip them, then range-check the NORMALISED form (so `000060` is a valid 60s, not a false refusal).
     _vct="${REAP_VENV_VENV_COST_TIMEOUT:-}"
+    _vct_norm="${_vct#"${_vct%%[!0]*}"}"
     _vct_ok=0
     case "$_vct" in
         ''|*[!0-9]*) _vct_ok=0 ;;
-        *) [ "${#_vct}" -le 5 ] && [ "$_vct" != "0" ] && _vct_ok=1 ;;
+        *) [ "${#_vct_norm}" -ge 1 ] && [ "${#_vct_norm}" -le 5 ] && [ "$_vct_norm" != "0" ] && _vct_ok=1 ;;
     esac
     if [ "$_vct_ok" = "0" ]; then
         echo "warn: REAP_VENV_VENV_COST_TIMEOUT='${REAP_VENV_VENV_COST_TIMEOUT:-}' is not a positive integer — using 60s; an invalid bound in run_bounded arms no watchdog at all" >&2
         log "warn: REAP_VENV_VENV_COST_TIMEOUT invalid ('${REAP_VENV_VENV_COST_TIMEOUT:-}') — fell back to 60s"
         REAP_VENV_VENV_COST_TIMEOUT=60
+    else
+        REAP_VENV_VENV_COST_TIMEOUT="$_vct_norm"
     fi
     while [ $# -gt 0 ]; do
         a="$1"
