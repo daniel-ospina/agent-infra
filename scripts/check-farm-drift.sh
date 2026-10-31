@@ -4,8 +4,12 @@
 #   ./check-farm-drift.sh [--dest <dir>] [--src <checkout>] [--pin-file <file>]
 #                         [--ref <git-ref>] [--quiet] [--no-pin-identity]
 #
-# Exit: 0 = match, 1 = DRIFT (a named file differs — the farm is not the shipped code),
-#       3 = UNSOURCED only (on the box, in no repo file — a deploy cannot fix it, a human must),
+# Exit: 0 = match, 1 = DRIFT THE FARM OWES (a farm-declared file differs, or a declared file never
+#           landed — the farm is not the shipped code, and re-running the farm is the remedy),
+#       3 = a deploy CANNOT fix it: an UNSOURCED file (on the box, in no repo file) or a STALE file
+#           that NO farm array delivers (differs from its source, and no farm leg puts it there).
+#           Loud, never a pass, and never the installer's fatal arm — otherwise setup.sh exits 1 on a
+#           file its own printed remedy cannot fix, and sync.sh (`set -euo pipefail`) dies every run.
 #       2 = UNKNOWN (cannot verify — NEVER a pass).
 #
 # ── WHY THIS EXISTS: tortoise#10114 ─────────────────────────────────────────────────────────────
@@ -45,8 +49,12 @@
 #    a check that answers "identical to the wrong tree" is the false PASS this class produces.
 #
 # ── WHAT IS *NOT* "DRIFT" ───────────────────────────────────────────────────────────────────────
-# A file on the box with NO source in the checkout is `UNSOURCED` and fails (exit 1): that is the
-# class that lost real fixes (#2231 — three fixes existed only in a home-dir tree). The single
+# A file on the box with NO source in the checkout is `UNSOURCED`, and a file that DIFFERS from its
+# source but that NO farm array delivers is `STALE (NOT farm-declared)`. Both are exit 3 with
+# UNSOURCED — loud, never a pass, and never the installer's fatal arm, because a deploy cannot fix
+# either (that arm deadlocked setup.sh: measured 2026-10-31, ONE such file → exit 1, and a second
+# full run left it stale). `UNSOURCED` is the class that lost real fixes (#2231 — three fixes
+# existed only in a home-dir tree). The single
 # exception is a name this script DECLARES local: `*.bak-*` (a repair path's own backup beside the
 # live script it replaced). Declared, never inferred — the same doctrine as #1924's retirement list,
 # because "absent from the repo" and "never shipped" are otherwise indistinguishable.
@@ -212,13 +220,34 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
     say "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
 fi
 
+if [ "$PIN_IDENTITY" -eq 1 ] && [ -e "$PIN_FILE" ] && [ ! -f "$PIN_FILE" ]; then
+    # A pin record that EXISTS but is not a regular file (a directory, a dangling symlink) is
+    # "cannot read the pin", not "no pin" — the same `[ -f ]`-is-too-weak class the declaration arm
+    # below already refuses (it would silently demote cannot-verify to a pass).
+    say_err "$PROG: UNKNOWN — pin record $PIN_FILE exists but is not a readable regular file; the"
+    say_err "   commit this box should run cannot be read, so nothing was verified."
+    exit 2
+fi
+
 if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ]; then
-    # ⛔ "NO PIN YET" AND "PIN LOST" ARE INDISTINGUISHABLE AND BOTH SKIP THE TRAP ARM. A first install
-    # legitimately has no pin record; a box whose record was deleted or whose path was mistyped reads
-    # identically — and then the arm that exists for "a byte comparison against the tree it farms FROM
-    # is green regardless" is simply off, with no line saying so. Note it, on stderr, and stay 0 so a
-    # first-time install is unaffected.
-    say_err "$PROG: note — no pin record at $PIN_FILE: pin identity NOT verified (a first install has none; a box that LOST one reads the same)."
+    # ⛔ A LOST PIN IS NOT A FIRST INSTALL. `.harness-path` exists ONLY as the pin's SECOND record
+    # ("A pin is TWO records" — §1 above, and harness-apply-pass.sh's header), so a box carrying
+    # `.harness-path` and no HARNESS-PIN HAD a pin and lost it (or its path is mistyped). Staying 0
+    # there printed `OK` while the wrong-tree trap arm was off — the false PASS this whole file
+    # exists against (reproduced on main 2026-10-31: `.harness-path` present, HARNESS-PIN absent →
+    # `OK — 1/1 sourced file(s) match`, rc=0). A FIRST install has NEITHER record; that one stays 0,
+    # so a first-time install is unaffected (and 2 would not block it anyway — setup.sh:1069's `*)`
+    # arm warns and continues; it is 0 that would claim a verification that never happened).
+    _hp="${CELL_HOME:-$HOME}/.harness-path"
+    if [ -e "$_hp" ] || [ -L "$_hp" ]; then
+        say_err "$PROG: UNKNOWN — pin record $PIN_FILE is ABSENT, but $_hp EXISTS and that file is the"
+        say_err "   pin's SECOND record. A box with a pin TREE on record and no pin SHA has LOST its pin"
+        say_err "   (or the path is wrong), so the wrong-tree trap arm cannot run and nothing verified"
+        say_err "   WHICH commit this farm should be. That is 'cannot verify', never a pass."
+        say_err "   Next: restore $PIN_FILE, or re-cut the pin deliberately (scripts/harness-apply-pass.sh)."
+        exit 2
+    fi
+    say_err "$PROG: note — no pin record at $PIN_FILE and no $_hp: this is a FIRST INSTALL, so there is nothing to compare the source tree against. pin identity NOT verified."
 fi
 
 # ── the source lookup map ──────────────────────────────────────────────────────────────────────
@@ -324,6 +353,7 @@ EOF_LINKS
 [ "$broken_link" -eq 0 ] || exit 2
 
 stale=0
+stale_rows=""
 unsourced=0
 same=0
 matched=0
@@ -366,6 +396,7 @@ while IFS= read -r rel; do
         fi
         if [ "$src_exec" -eq 1 ] && [ ! -x "$DEST/$rel" ]; then
             stale=$((stale+1))
+            stale_rows+="$rel"$'\n'
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "NOT-EXECUTABLE" >&2
             continue
         fi
@@ -374,6 +405,7 @@ while IFS= read -r rel; do
             [ "$QUIET" -eq 1 ] || printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "ok"
         else
             stale=$((stale+1))
+            stale_rows+="$rel"$'\n'
             # BOTH shas, always: "N stale files" is not actionable; a pair is.
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "STALE" >&2
         fi
@@ -392,6 +424,8 @@ EOF_ROWS
 # relative to $DEST. Read it when it exists; say so when it does not.
 DECL="$(dirname "$DEST")/state/farm-declared.txt"
 missing=0
+decl_ok=0
+decl_rel_set=""
 if [ -f "$DECL" ]; then
     # ⛔ A PRESENT-BUT-EMPTY OR UNREADABLE DECLARATION IS `UNKNOWN`, NOT "NOTHING WAS DECLARED".
     # `$(cat "$DECL" 2>/dev/null)` discards the read's failure and an empty list declares nothing, so a
@@ -414,6 +448,7 @@ if [ -f "$DECL" ]; then
     while IFS= read -r dpath; do
         [ -n "$dpath" ] || continue
         case "$dpath" in scripts/*) rel="${dpath#scripts/}" ;; *) continue ;; esac
+        decl_rel_set+="$dpath"$'\n'
         is_declared_local "$rel" && continue
         if [ ! -e "$DEST/$rel" ]; then
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "DECLARED-BUT-ABSENT" >&2
@@ -422,8 +457,41 @@ if [ -f "$DECL" ]; then
     done <<EOF_DECL
 $decl_body
 EOF_DECL
+    decl_ok=1
 else
     say_err "$PROG: note — no $DECL, so what the farm DECLARES could not be graded; only the files already on the box were (a declared-but-absent script is invisible to this run)."
+fi
+
+# ── SCOPE THE FATAL VERDICT TO WHAT THE FARM OWES ─────────────────────────
+# ⛔ A STALE FILE NO FARM ARRAY DELIVERS MUST NOT BE FATAL — the installer cannot fix it, so the
+# fatal arm fires on a correct box and NEVER CONVERGES: `pi-bootstrap/setup.sh` turns rc=1 into
+# `exit 1`, and `sync.sh:72` calls it under `set -euo pipefail` with no `|| true`, so every later
+# sync step is skipped on every run and auto-sync can never complete. Measured 2026-10-31 on a box
+# that had just installed clean: ONE stale file that no farm array delivers (`admin-merge.sh` —
+# grep count 0 in setup.sh) → rc=1 → `⛔ FARM DID NOT CONVERGE` → setup.sh exit 1, and a second full
+# setup.sh run left the file STILL STALE, so the printed remedy ("re-run the farm") could never
+# clear it. The farm's own declaration is the population it owes, and this check already reads it,
+# so the class is knowable rather than guessed: DECLARED stale stays FATAL (that IS #10114 — the farm
+# delivers it and did not converge it), while drift OUTSIDE the declaration joins UNSOURCED in the
+# "a deploy cannot fix it, a human must" verdict (3) — loud, never a pass.
+stale_declared=$stale
+stale_outside=0
+if [ "$decl_ok" -eq 1 ] && [ -n "$stale_rows" ]; then
+    stale_declared=0
+    while IFS= read -r _srel; do
+        [ -n "$_srel" ] || continue
+        # Fixed-string, newline-fenced containment (bash 3.2-safe) — never a regex built from a path.
+        case $'\n'"$decl_rel_set" in
+            *$'\n'"scripts/$_srel"$'\n'*) stale_declared=$((stale_declared+1)) ;;
+            *)
+                stale_outside=$((stale_outside+1))
+                say_err "   $_srel is STALE and NOT farm-declared: no farm array in pi-bootstrap/setup.sh delivers it,"
+                say_err "   so re-running the farm cannot converge it. A deploy cannot fix this one; declare it in a farm"
+                say_err "   array, or delete it, or retire it in pi-bootstrap/farm-retired.txt." ;;
+        esac
+    done <<EOF_STALE
+$stale_rows
+EOF_STALE
 fi
 
 total=$((same+stale+unsourced))
@@ -433,10 +501,10 @@ if [ "$matched" -eq 0 ]; then
     exit 2
 fi
 if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
-    say "$PROG: OK — $same/$matched sourced file(s) match the source at ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC$([ -n "${PIN_SHA:-}" ] && printf ' = pin')"
+    say "$PROG: OK — $same/$matched sourced file(s) match the source at ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC$([ -n "$SRC_READ" ] && [ -n "${PIN_SHA:-}" ] && printf ' = pin')"
     exit 0
 fi
-say_err "$PROG: DRIFT — $stale stale, $missing declared-but-absent, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."
+say_err "$PROG: DRIFT — $stale stale ($stale_declared farm-declared — a re-run must fix these; $stale_outside outside the farm), $missing declared-but-absent, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."
 say_err "   A STALE file is a copy launchd/systemd will EXECUTE that is not the code the repo ships."
 say_err "   A NOT-EXECUTABLE file is byte-identical but cannot be run — the same silent no-op class."
 say_err "   A DECLARED-BUT-ABSENT file is one the farm owes and never landed."
@@ -447,5 +515,5 @@ say_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent 
 # it is the normal historical state of this directory (#1552 measured 27 such files). Collapsing the
 # two made a deploy abort for ever on a file no farm can fix, taking every later step of sync.sh with
 # it (measured: two such names on this box). A caller that can fix drift in one step takes 1 or 3.
-if [ "$stale" -gt 0 ] || [ "$missing" -gt 0 ]; then exit 1; fi
+if [ "$stale_declared" -gt 0 ] || [ "$missing" -gt 0 ]; then exit 1; fi
 exit 3
