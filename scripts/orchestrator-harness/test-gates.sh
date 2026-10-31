@@ -1975,6 +1975,13 @@ PYEOF
   wpin "…and the cycle states the PR path's outcome in one line" "$ORCH" '[pr] PR path:'
   wpin "…and a cycle that spawned NOTHING says so instead of implying work" "$ORCH" 'NO UNIT SPAWNED this cycle'
   wpin "the acting case has a catch-all arm (no class falls through silently)" "$ORCH" "no acting arm for class '"
+  # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NOT A CLASS (#3110). `check-class.py` prints a token on every
+  # path, so `V` empty means the classifier never ANSWERED — and the residual arm then named the class
+  # `<empty>` and re-read the same PR for ever (measured: `#10214 no acting arm for class '<empty>'`).
+  # The guard is pinned by its OBSERVABLE effect on `V`, not by its prose, so a re-word keeps it green.
+  wpin "…and an EMPTY classifier verdict is mapped to the NOCHECKS reading arm, not a class" "$ORCH" '      V="NOCHECKS"'
+  wpin "…and the mapping is confined to the empty case (a real class is never overwritten)" "$ORCH" 'if [ -z "${V:-}" ]; then'
+  wpin "…and the empty verdict is LOGGED with the classifier that produced it" "$ORCH" 'the classifier produced NO VERDICT (empty output from $_CK_PY)'
   # ⛔ `first #-` WAS A NONSENSE TOKEN (#2126). The first target may only be a PR a unit touched.
   if grep -qF '(first #${FIRST_PR:--})' "$ORCH"; then
     echo "  ❌ the blocked line still renders \`first #-\` (it names no PR, so it names nothing)"; FAIL=$((FAIL+1))
@@ -2718,6 +2725,20 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   case "$out" in
     *"UNPROVEN suppression"*) echo "  FAIL a record with checked_unjustified unset grew an invented unproven count: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok a record with no checked_unjustified= invents no unproven count"; PASS=$((PASS+1)) ;; esac
+  # ⛔ A QUEUED ENTRY IS NOT A SUPPRESSED ONE (#3110). The 151 measured on the live box were COUNTED
+  # inside `blacklisted`, the bucket an operator reads as "nothing to do" — while they are the dispatch
+  # backlog (CLEAN-judged, still in candidates.txt awaiting the issue path). The line must SAY so,
+  # name its referent (the number it is a part of, not the pool), and must NOT say it when the
+  # `blacklisted` part was never rendered (an older writer's record with no `skipped_checked=`).
+  case "$out" in
+    *"— 7 of the 40 blacklisted are the DISPATCH BACKLOG"*)
+      echo "  ok the queued entries are named as the DISPATCH BACKLOG, with their referent"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the 7 queued entries still read as one more kind of suppression: $out"; FAIL=$((FAIL+1)) ;; esac
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit skipped_checked_queued=7 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"DISPATCH BACKLOG"*) echo "  ❌ a backlog was named with no blacklisted bucket on the line to name it against: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok no queued count grows a backlog sentence for a bucket that was never rendered"; PASS=$((PASS+1)) ;; esac
   # ⛔ A CAUSE/RESIDUE CONTRADICTION IS ITS OWN STATEMENT, never "the parts do not sum".
   printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=183 limit=6 reconciled=1 stop=none stop_conflict=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(195)" "" 1000000000)"

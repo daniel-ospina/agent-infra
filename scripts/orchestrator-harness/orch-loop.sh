@@ -4614,15 +4614,16 @@ while true; do
     # `#10214 no acting arm for class '<empty>' — nothing spawned (unreadable/empty check surface;
     # re-read next cycle)` — the PR was never acted on by any arm.
     # ⛔ THE FIX IS A READING ARM, NOT A PERMISSION — AND IT IS NOT A ONE-STEP BYPASS EITHER. Mapping it
-    # to `NOCHECKS` ROUTES it into the NOCHECKS arm, which asks a second, DIFFERENT source (the
-    # check-runs authority via `nochk-resolve.py`, not the `gh pr checks` rollup that just failed). The
-    # EMPTY read itself reaches no acting arm: it is intercepted by the NOCHECKS arm and can only wait.
-    # What CAN then act is the resolver's own answer — `RECOVERED:GREEN` is handed to the ordinary
-    # GREEN arm and merges, `RECOVERED:FAILED:*` reaches the CI fixer — so a merge here rests on a
-    # real read at the live head, never on the failed one that produced the empty output (a reviewer
-    # P1 on this very block: the first draft of this comment claimed NOCHECKS can never merge, and the
-    # recovery path two statements below contradicts that). The alternatives are worse: GREEN on an
-    # unread surface merges blind, and leaving it `<empty>` is the indefinite re-read this replaces.
+    # to `NOCHECKS` ROUTES it into the NOCHECKS arm, which RE-RUNS this same read with retries and, only
+    # when that still cannot answer, consults a DIFFERENT source (the check-runs authority) — so the
+    # first thing it does is not an action, it is another attempt at the question. The EMPTY read itself
+    # reaches no acting arm; what CAN act is the resolver's own answer — `RECOVERED:GREEN` is handed to
+    # the ordinary GREEN arm and merges, `RECOVERED:FAILED:*` reaches the CI fixer — and the resolver
+    # emits `RECOVERED:<label>` only for a label a read actually produced (`nochk-resolve.py`,
+    # `graded()`), never for an empty or ungraded surface. So a merge here rests on a read that
+    # ANSWERED at the live head, never on the failed one that produced the empty output. The
+    # alternatives are worse: GREEN on an unread surface merges blind, and leaving it `<empty>` is the
+    # indefinite re-read this replaces.
     if [ -z "${V:-}" ]; then
       V="NOCHECKS"
       echo "#$PR the classifier produced NO VERDICT (empty output from $_CK_PY) — treating it as an UNREAD surface and handing it to the NOCHECKS arm to re-read from the run list" >>"$LOG"

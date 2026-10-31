@@ -20,8 +20,8 @@ NOT a pass and NOT a pending: this TOKEN reaches neither the merge arm nor the f
 (`nochk-resolve.py`) is what turns that non-answer into a named verdict — and ITS answer is what may reach
 an acting arm (`RECOVERED:GREEN` merges, `RECOVERED:FAILED:*` reaches the fixer), so a merge after a
 NOCHECKS rests on that second read at the live head, never on the empty one that produced this token.
-All five `NOCHECKS`-producing paths above must keep printing it: an empty stdout from this file is READ
-as a read failure by the caller (#3110), not as a class.
+Every `NOCHECKS`-producing path in this file must keep printing it: an empty stdout from this file is
+READ as a read failure by the caller (#3110), not as a class.
 """
 import json
 import os
