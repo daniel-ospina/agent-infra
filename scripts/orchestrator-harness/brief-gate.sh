@@ -64,8 +64,16 @@ BRIEF_GATE_UNAVAILABLE=78
 # `web_search` tool (model stated explicitly, `sonar`); rung 3 = `web_fetch`. A rung digit
 # alone is not a decision — the tool is what makes the plan executable, so both are required.
 # ⛔ `exa` is deliberately ABSENT from this vocabulary: the server was uninstalled by owner
-# ruling (2026-10-31, "external research should be perplexity") and a brief naming it is now
-# REFUSED. Named here so the absence reads as a decision, not an omission.
+# ruling (2026-10-31, "external research should be perplexity"). Named here so the absence
+# reads as a decision, not an omission.
+# ⚠️ WHAT THAT BUYS, PRECISELY (a review measured the wider claim and it was false): a brief
+# whose `RUNG:` line names ONLY `exa` is REFUSED, because no allowed tool is then present.
+# The gate checks PRESENCE and SHAPE, never content — a brief naming `exa` ALONGSIDE an
+# allowed tool still passes (`RUNG: 3 — web_fetch / exa` → exit 0), and that is correct: it
+# also lets a brief mention `exa` solely to prohibit it (`RUNG: 3 — web_fetch (exa is
+# uninstalled)`) pass, which a substring ban would wrongly refuse. So the vocabulary makes
+# `exa` an unusable ROUTE, not a forbidden WORD. See "WHAT THIS FILE DELIBERATELY DOES NOT
+# DO" above; the prohibition itself lives in the research skill and the owner's ruling.
 BRIEF_GATE_TOOLS='perplexity, web_search, web_fetch, context7'
 
 # brief_gate_missing <brief-file|-> — print ONE token per missing element, nothing when complete.
