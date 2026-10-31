@@ -6,11 +6,17 @@
 # in place (content-merge), so repo updates flow to the live install and local
 # extras survive. Never deletes anything outside ~/.pi/agent.
 #
-# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly two things: a legacy $DEST/tools/fleet/
-# (#1277, a pi boot-blocker) and the farm artifacts DECLARED in
+# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly three things: a legacy $DEST/tools/fleet/
+# (#1277, a pi boot-blocker), the farm artifacts DECLARED in
 # pi-bootstrap/farm-retired.txt (#1924 — a retired script must stop existing on the
-# machines, not just stop being delivered). Nothing else is ever removed; a local extra
-# that is not declared retired is kept.
+# machines, not just stop being delivered), and the `exa` server entry in
+# $DEST/.mcp.json (owner ruling 2026-10-31, reversing #419: the merge is
+# `{**dst, **src}`, so dropping `exa` from the template alone would leave every
+# already-provisioned machine loading it). Nothing else is ever removed; a local extra
+# that is not declared retired is kept — `exa` is removed because it was a BASE server
+# being retired, not a local extra. NOTE the pop keys on the NAME only: a machine whose
+# `.mcp.json` carries a hand-rolled server the operator happened to name `exa` will be
+# de-configured too, which is why it is listed here rather than happening quietly.
 # ============================================================
 set -euo pipefail
 
