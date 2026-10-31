@@ -34,15 +34,31 @@ echo "[adopt-fix $PR] worktree=$WT branch=$BR $(date)" >> "$O/logs/adopt-$PR.log
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
 # 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate
-# refused it (#1765). 73 = the MEMORY gate refused it (#2387). Name ALL THREE here: the fixer's own
-# line is inside fix-$PR.log, and this is the log a manual operator reads (#1720). They are not
-# interchangeable — a load refusal is cleared by the box quietening, a memory refusal by resident
-# lanes FINISHING, and a disk refusal only by reclaiming space — so reporting one as another sends the
-# operator to wait for a remedy that cannot arrive. ⛔ 73 is the one that would silently be reported as
-# a LOAD refusal by omission (it matches neither branch below), which is the exact false-cause class
-# this block exists to fix; the memory branch therefore sits ABOVE the load one.
-if [ "$rc" = "73" ]; then
+# refused it (#1765). 81 = the MEMORY gate refused it (#2387). 73 = the FORK gate refused it
+# (agent-infra#2293). Name ALL FOUR here: the fixer's own line is inside fix-$PR.log, and this is the
+# log a manual operator reads (#1720). They are not interchangeable — a load refusal is cleared by the
+# box quietening, a memory refusal by resident lanes FINISHING, a disk refusal only by reclaiming
+# space, and a fork refusal only by restarting or draining the BOX from outside — so reporting one as
+# another sends the operator to wait for a remedy that cannot arrive.
+# ⛔ 81, NOT 73 (review of #2591, P1 — the arm this block exists for had it backwards). The renumber
+# AGENT_MEM_REFUSED 73→81 was applied in every sibling and not here, so this branch sat on the literal
+# 73, which is AGENT_FORK_REFUSED: a box out of PROCESSES was reported as "memory", i.e. WITH THE
+# OPPOSITE REMEDY — precisely the false-cause class the comment above says this block prevents — while
+# a real memory refusal (81) matched no arm and fell to `exit "$rc"` writing NO LINE AT ALL.
+# `fix-one.sh` propagates the gate's own code (`exit "$ar"`), so both codes really do arrive here.
+# Read them from the helper's own variables, tolerantly, for the $O-skew reason `fix-one.sh`'s and
+# `lane.sh`'s arms give: this script sources no gate today, so the default is what a caller normally
+# gets — and if it ever sources one, a pre-#2387 copy defines no AGENT_MEM_REFUSED, where the default
+# keeps the arm inert on a tree that can never return 81 instead of aborting under `set -u`.
+if [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then
   echo "[adopt-fix $PR] fixer NOT started (MEMORY gate) — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes finish, NOT by waiting for load; the reading and the floor are in fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then
+  # ⛔ A FORK REFUSAL IS NAMED, NOT LEFT TO FALL THROUGH (the same P1). It is neither a memory nor a
+  # load refusal and its remedy exists nowhere on this box: the box cannot start the retry it is being
+  # told to wait for, so the operator must restart or drain it from OUTSIDE. `fix-one.sh` writes its
+  # fork line to fix-$PR.log only, so without this arm this log got no line — the silence the
+  # capability arm below was added to end.
+  echo "[adopt-fix $PR] fixer NOT started (FORK gate) — this box is out of PROCESSES (agent-infra#2293) and cannot start the retry, so waiting will NOT clear it: restart or drain the BOX from outside. Nothing was pushed and no attempt was consumed; the reading is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "71" ]; then

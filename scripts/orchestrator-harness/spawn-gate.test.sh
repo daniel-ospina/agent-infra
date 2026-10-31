@@ -52,8 +52,10 @@ echo "==> spawn-gate self-test ($HERE)"
 # ── the MEMORY gate's neutraliser (agent-infra#2387) ───────────────────────────
 # EVERY arm in this suite except section 12 wants the memory gate out of the way, for exactly the
 # reason the disk arms pin `DISK_MIN_FREE_MB=1` below: a spawn assertion must be decided by its
-# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `73` to a
-# load-gate arm and the suite would report "load-gate regressions" that are not regressions. It is
+# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `81` to a
+# load-gate arm and the suite would report "load-gate regressions" that are not regressions. (`81`,
+# NOT `73`: 73 is `AGENT_FORK_REFUSED` on main. That literal is the one the review of #2591 caught in
+# `adopt-fix.sh`, and this file's §10 arms now drive both codes separately.) It is
 # exported once rather than repeated at fourteen call sites, and it is a FLOOR, not a switch: there
 # is still a comparison, still a probe and still a refusal path — section 12 drives all three, and
 # the DEFAULT floor is asserted there under `env -u MEM_MIN_AVAIL_MB` (the same idiom the disk arm
@@ -1194,6 +1196,53 @@ printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO
 ck "adopt-fix.sh propagates the DISK refusal 77 (got $arc2) — not normalised to a load refusal" $rc
 grep -q 'DISK gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
+# ⛔ THE MEMORY AND FORK ARMS (review of #2591, P1 — THE ARM THIS SUITE NEVER DROVE). The 75 and 77
+# arms above were green while `adopt-fix.sh` keyed its MEMORY branch on the literal `73`, which is
+# AGENT_FORK_REFUSED on main: a box out of PROCESSES was reported as "memory" (the OPPOSITE remedy —
+# wait for lanes to finish, on a box that cannot start the retry), and a REAL memory refusal (81)
+# matched no arm and wrote no line into `adopt-<PR>.log`, the one log the manual operator reads
+# (#1720). Neither code was ever driven here, which is exactly why it passed. Both are driven now, and
+# each asserts BOTH directions: its own gate is named, AND the other's is not.
+#
+# 81 (the memory gate). `MEM_MIN_AVAIL_MB=999999999` refuses the floor arm on any host — the mem gate is
+# a FLOOR, so an impossible floor is a deterministic refusal rather than a reading-dependent one, and
+# it runs BEFORE the load gate, so `MAX_LOAD=999999999` keeps this arm from being a load refusal.
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$RREPO" \
+    DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MEM_MIN_AVAIL_MB=999999999 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arcm=$?
+[ "$arcm" -eq 81 ]; rc=$?
+ck "adopt-fix.sh propagates the MEMORY refusal 81 (got $arcm) — not normalised to a load refusal" $rc
+grep -q 'fixer NOT started (MEMORY gate)' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh NAMES the MEMORY gate on a memory refusal (81 was silent without this arm)" $rc
+grep -q 'FORK gate' "$RO/logs/adopt-7.log"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and does NOT report the memory refusal as a FORK refusal (each code has its own remedy)" $rc
+# 73 (the fork gate). A genuinely starved box cannot be manufactured on a CI host, so the fork gate's
+# INSTRUMENT is what is stubbed, not its verdict: `spawn_fork_state` consumes
+# `cap_procs_pair_vars`/`cap_h_for_vars` from `capacity.sh`, and `spawn_gate_load_capacity` searches
+# `$O` FIRST — so a copy at `$RO` is the gate's own documented seam, and what is still being driven is
+# the real `run_agent` -> real fork arm -> real `fix-one.sh` `exit "$ar"` -> real `adopt-fix.sh`.
+cat > "$RO/capacity.sh" <<'CAPSTUB'
+cap_procs_pair_vars() { printf -v "$1" '%s' 15840; printf -v "$2" '%s' 15841; printf -v "$3" '%s' fixture; return 0; }
+cap_h_for_vars() { printf -v "$3" '%s' "$(( ${2:-0} - ${1:-0} ))"; return 0; }
+CAPSTUB
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$RREPO" \
+    DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MEM_MIN_AVAIL_MB=1 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arcf=$?
+[ "$arcf" -eq 73 ]; rc=$?
+ck "adopt-fix.sh propagates the FORK refusal 73 (got $arcf) — it is a capacity code of its own" $rc
+grep -q 'fixer NOT started (FORK gate)' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh NAMES the FORK gate on a fork refusal" $rc
+grep -q 'MEMORY gate' "$RO/logs/adopt-7.log"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and does NOT name it a MEMORY refusal — the P1: 'wait for resident lanes' on a box out of PROCESSES" $rc
+grep -q 'restart or drain the BOX from outside' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and carries the remedy that actually helps (restart/drain the box from OUTSIDE), not 'wait'" $rc
+rm -f "$RO/capacity.sh"   # EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)
 
 : > "$MERGE_LOG"
 
@@ -2226,7 +2275,13 @@ ck "a PRESENT-but-NON-NUMERIC MemAvailable FAILS (rc=$mrc, '${got:-<empty>}') �
 # …and the same input driven END TO END must reach the UNREADABLE remedy, not the LOW one — and must
 # never write a fabricated `0` into the durable series. The reading is taken by the SHIPPED parser
 # (below) and then handed to the shipped `run_agent` through the same probe seam every other arm uses.
-bad_avail="$(read_mem "$TMP/meminfo-badfield2")"
+# ⛔ THIS READ `meminfo-badfield2` — A PATH NOTHING WROTE (found by running this suite on a Darwin host
+# while fixing #2591). A MISSING file is not the input under test: `read_mem` legitimately falls through
+# to the live probe there, so the run took a REAL reading (`avail=1028`), the two assertions below
+# reddened on a host the gate was fine on — and, worse, the one above PASSED for the wrong reason (a
+# LOW reading refuses 81 exactly like an UNREADABLE one, so "REFUSES as UNREADABLE" was satisfied by a
+# refusal that never said UNREADABLE). One path, written once, used twice.
+bad_avail="$(read_mem "$TMP/meminfo-badfield")"
 res="$(drive_mem "${bad_avail:-UNREADABLE}" 2048)"
 [ "$res" = "rc=81 started=0" ]; rc=$?
 ck "…and end to end that input REFUSES as UNREADABLE rather than as a LOW reading ($res)" $rc
