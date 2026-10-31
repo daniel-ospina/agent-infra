@@ -24,10 +24,17 @@
 # function-level section stayed green over a delete of the fix's only effect.
 #
 # ⛔ ACCEPTED FALSE-RED (deliberate — do not "fix"): P3's `assert_not_contains` reds when a COMMENT
-# quotes the pre-fix argv, even though behaviour is untouched (measured at this head: 14 passed / 1
-# failed; section PA — the structural arm — stays GREEN, which is the proof that PA is judging behaviour
-# and not text). That is the safe direction — an over-block, one word to reword — and it is accepted.
-# Leave P3 alone.
+# quotes the pre-fix argv, even though behaviour is untouched (section PA — the structural arm — stays
+# GREEN through such a comment, which is the proof that PA is judging behaviour and not text). That is
+# the safe direction — an over-block, one word to reword — and it is accepted. Leave P3 alone.
+#
+# ⛔ THAT IS A PROPERTY OF THE TEST, NOT A MEASUREMENT OF THIS HEAD (review P2, 2026-10-31). An earlier
+# revision of this note read "measured at this head: 14 passed / 1 failed" — FALSE at the shipped head,
+# where the suite is 15 passed / 0 failed because no comment in `pr-doctor.py` quotes the pre-fix argv
+# (`grep -nF '"fetch", "origin", branch'` and `grep -nF 'fetch_ref or branch'` are both empty). A
+# false "accepted red" is worse than no note: it trains the next reader to expect a P3 failure and to
+# wave it through, which is exactly the guard the arm exists to be. A measurement is only valid for the
+# revision it was taken at, so the revision is not named here.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

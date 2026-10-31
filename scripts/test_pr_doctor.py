@@ -4597,6 +4597,69 @@ def test_an_unreadable_file_list_on_a_rest_pass_holds_the_pr_for_a_human(monkeyp
     assert payload.get("surface_partial") == 0, payload
 
 
+# ── THE CASCADE LINE: ONE LINE PER PASS, AND IT MUST NOT LIE ──────────────────────────────────────
+# These pin the two false statements the block itself was written to prevent (review P1/P2,
+# 2026-10-31). Neither was pinned before, which is how both shipped: a line whose whole purpose is
+# "say which rung the chain is on, honestly" had no assertion behind either half of it.
+
+
+def test_the_cascade_wait_rung_counts_the_surface_holds_not_just_running(monkeypatch):
+    """`wait=` must not read 0 while PRs are held on the blindness axis rung 3 defines.
+
+    ⛔ THE MEASURED DEFECT (review P2): `_r3` summed only `skipped-running` + `skipped-unreadable`,
+    but `_finish` folds `surface_unreadable`/`surface_partial`/`surface_abandoned` onto the SAME
+    blindness axis (`blind = unread + blind_surface + blind_partial + blind_abandoned`). So a pass
+    that held every PR for an unusable changed-file list printed
+
+        cascade: order=merge>fix>wait merge=0 fix=0 wait=0 slots=6
+        nothing to dispatch (no mergeable, no repairable)
+
+    -- rung 3 explicitly DENIED while the work sat on it. That is the same silence the block exists
+    to remove, one population over. The PR here is held, not dispatched, so `wait` must be >= 1 and
+    the line must NOT say "nothing to dispatch".
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(51)], ("record-review", "why", []))
+    assert payload.get("surface_unreadable") == 1, payload
+    assert payload.get("dispatched") == 0, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined            # ONE line per pass, never zero and never two
+    assert "wait=0 " not in casc[0] + " ", casc[0]
+    assert "nothing to dispatch" not in casc[0], casc[0]
+
+
+def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatch):
+    """Rung 1 must name what is ELIGIBLE; only `_finish` may say what was dispatched.
+
+    ⛔ THE MEASURED DEFECT (review P1): the arm printed `merge->handed to admin-merge.sh` off
+    `counts['call-rail']` plus the AGGREGATE `budgets['total']`. Two facts decide a row AFTER that
+    line prints, and either makes the sentence false:
+      * the COOLDOWN/`covered` arm removes a row dispatched on the previous pass at the same head,
+        while `counts` (built from `classified`, ABOVE that arm) still counts it -- so in steady
+        state nearly every pass claimed a handoff with `dispatched 0` on the very next line;
+      * rung 1 is `ACTION_CLASS['call-rail'] == 'review'`, so a zero REVIEW budget with fix slots
+        free refuses it while the aggregate total still reads > 0.
+    Both arms are pinned here: neither may emit the word "handed".
+    """
+    # (a) a plain call-rail row -> eligible, and NO handoff claim.
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(52)], ("call-rail", "gated", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "handed" not in casc[0], casc[0]
+    assert "merge->eligible" in casc[0], casc[0]
+    # (b) the steady-state arm: the row is on COOLDOWN at the SAME head, so NOTHING is dispatched --
+    #     the line must still not claim a handoff.
+    head = "a" * 40                       # `_pr`'s default head, which is what the cooldown matches
+    _rc, joined, payload = _drive_pass(
+        monkeypatch, [_pr(53)], ("call-rail", "gated", []),
+        state={"53": {"action": "call-rail", "head": head, "at_epoch": pr.now()}})
+    assert payload.get("dispatched") == 0, (joined, payload)
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "handed" not in casc[0], casc[0]
+
+
 def test_two_failed_file_reads_stop_the_per_pr_requests_but_still_refuse(monkeypatch):
     """The per-PR read is BOUNDED: after two failures the pass stops asking, and still refuses.
 

@@ -5133,8 +5133,9 @@ def run_pass(args, rubric_note: str = "") -> int:
     # take. A rung that is skipped for capacity must SAY so; that silence is what the brief bans.
     #
     # ⛔ EVERY COUNT BELOW READS THE KEY `counts` ACTUALLY HOLDS (review P1, 2026-10-30). `running` and
-    # `unreadable` are diverted into `skipped[...]` BEFORE `classified` is built (`:4896`, `:4878`),
-    # and `counts` is built from `classified` plus `skipped` under a `skipped-` prefix -- so the bare
+    # `unreadable` are diverted into `skipped[...]` BEFORE `classified` is built (`:4889`/`:4898`
+    # unreadable, `:4908` running), and `counts` is built from `classified` plus `skipped` under a
+    # `skipped-` prefix (`:5105`) -- so the bare
     # keys can never exist and `counts.get("running", 0)` was STRUCTURALLY 0. That was a false
     # statement of exactly the kind this line exists to prevent: a pass would print
     # `pass: 22 open PRs :: skipped-running=6 ...` immediately above
@@ -5146,28 +5147,61 @@ def run_pass(args, rubric_note: str = "") -> int:
     _r2 = sum(counts.get(k, 0)
               for k in ("resolve-conflict", "record-review", "fix-ci", "rerun-checks",
                         "blocked-by-rail"))
-    _r3 = counts.get("skipped-running", 0) + counts.get("skipped-unreadable", 0)
+    # ⛔ rung 3 IS EVERY ROW THE PASS HELD, NOT TWO OF THEM (review P2, 2026-10-31). `running` and
+    # `unreadable` are the obvious holds, but `_finish` folds THREE MORE populations onto the SAME
+    # blindness axis (`blind = unread + blind_surface + blind_partial + blind_abandoned`) -- an
+    # unusable changed-file list is a held PR for a reason the operator must see. Leaving them out
+    # let this line print `wait=0 ... nothing to dispatch` while PRs sat held on precisely the
+    # unreadable classification it defines as rung 3: the same silence the block exists to remove,
+    # one population over. `surface` is NOT folded in (it is an ASK-USER, not blindness) and is
+    # printed as its own `held=` term so neither count can absorb the other.
+    _r3 = sum(counts.get(k, 0)
+              for k in ("skipped-running", "skipped-unreadable", "skipped-surface_unreadable",
+                        "skipped-surface_partial", "skipped-surface_abandoned"))
+    _held = counts.get("skipped-surface", 0)   # ASK-USER: held for a HUMAN, not for a re-read
     _casc = ["order=merge>fix>wait",
              "merge=%d" % _r1,
              "fix=%d" % _r2,
-             "wait=%d" % _r3,
-             "slots=%d" % budgets["total"]]
+             "wait=%d" % _r3]
+    if _held:
+        _casc.append("held=%d" % _held)
+    _casc.append("slots=%d" % budgets["total"])
     # ⛔ NO ARM ASSERTS A DISPATCH IT HAS NOT MADE (review P2). `budgets["total"]` is an AGGREGATE
     # (`fix + review`) while the loop spends PER CLASS, and a PR can still be refused for a live
     # worker or an unreadable liveness after the slot check -- so "dispatched" is a claim only
-    # `_finish` can make from the real counters. These arms state what rung the chain is on and
-    # whether a slot was available, and nothing more.
-    _slots = budgets["total"]
+    # `_finish` can make from the real counters.
+    # ⛔ AND THE AGGREGATE ALONE IS NOT EVEN "A SLOT IS AVAILABLE" (review P1, 2026-10-31). Two
+    # further facts decide a row AFTER this line prints, and both made the old arms LIE:
+    #   * the COOLDOWN/`covered` arm (`:5484`) removes a row dispatched on the previous pass at the
+    #     same head for COOLDOWN_S (45 min), while `counts` -- built from `classified` ABOVE that
+    #     arm -- still counts it. In steady state nearly every pass prints "handed to admin-merge.sh"
+    #     with `dispatched 0` on the line below it.
+    #   * the PER-CLASS gate (`spent[cls] >= budgets[cls]`, `:5553`) refuses a row the aggregate
+    #     total still admits: rung 1 IS `ACTION_CLASS["call-rail"] == "review"` (`:1223`), so with
+    #     `budgets["review"] == 0` and `budgets["fix"] == 3` the merge arm claimed a handoff the
+    #     loop would refuse.
+    # So the arms now name ELIGIBILITY and the class budget that would serve it, and never the
+    # dispatch itself. `dispatched`/`_finish` remain the only source of what actually went out.
     _noslot = ("no available slot: inflight=%d alive=%d unproven=%d"
                % (budgets["inflight"], budgets["alive"], budgets["unknown"]))
     if _r1:
-        _casc.append("merge->handed to admin-merge.sh (the rail decides, this pass does not)"
-                     if _slots > 0 else "merge->NO SLOT (%s)" % _noslot)
+        _casc.append("merge->eligible (%d), the rail decides; review slots=%d"
+                     % (_r1, budgets["review"])
+                     if budgets["review"] > 0 else "merge->NO SLOT (review budget 0: %s)" % _noslot)
     if _r2:
-        _casc.append("fix->eligible, dispatch budget total=%d" % _slots
-                     if _slots > 0 else "fix->NO SLOT (%s)" % _noslot)
+        _casc.append("fix->eligible (%d); fix slots=%d review slots=%d"
+                     % (_r2, budgets["fix"], budgets["review"])
+                     if budgets["fix"] > 0 or budgets["review"] > 0
+                     else "fix->NO SLOT (%s)" % _noslot)
+    # ⛔ "NOTHING TO DISPATCH" IS A CLAIM ABOUT THE WHOLE QUEUE, NOT ABOUT TWO RUNGS (found by the
+    # new pin, 2026-10-31). The arm fired on `not _r1 and not _r2` alone, so once `wait=` was made
+    # honest the line read `wait=1 slots=7 nothing to dispatch (no mergeable, no repairable)` -- a
+    # SELF-CONTRADICTING sentence, which is the same defect one clause over. A pass that HELD work
+    # did not have nothing to dispatch; it had nothing it was willing to dispatch.
     if not _r1 and not _r2:
-        _casc.append("nothing to dispatch (no mergeable, no repairable)")
+        _casc.append("nothing dispatchable -- held=%d, the chain is on rung 3" % (_r3 + _held)
+                     if (_r3 or _held) else
+                     "nothing to dispatch (no mergeable, no repairable)")
     log("cascade: " + " ".join(_casc))
 
     # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
