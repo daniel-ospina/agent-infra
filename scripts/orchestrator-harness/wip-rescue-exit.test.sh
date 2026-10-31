@@ -35,14 +35,91 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$HERE/spawn-gate.sh"
 PASS=0; FAIL=0
-ck() { # ck <name> <0|1>
-  if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
-  else printf '  ❌ %s\n' "$1"; FAIL=$((FAIL+1)); fi
+
+# ⛔ DEFECT A — THIS SUITE MUST NOT BE A FUNCTION OF THE BOX IT RUNS ON (agent-infra#2935 seam).
+# Every arm below drives the SHIPPED `run_agent` with a STUB `pi`. `run_agent` also asks the box one
+# bounded question first (`cell-lane-preflight.sh`, #2935) — "can you complete one model call and
+# RETURN?" — and this suite has no business answering it: the stub never emits the probe's answer
+# token, so with the gate live every arm here would be measured against a gate this file is not
+# testing. On a DEV BOX that usually went unnoticed because the gate passed for its own reasons
+# (an ambient provider key, a real `pi` on PATH); on a CI RUNNER it does not: there is no `pi`
+# install, the probe reports `why=pi-missing`, `run_agent` returns 71 (`AGENT_CAPABILITY_REFUSED`)
+# BEFORE any spawn, and all 14 rescue arms cascaded into a false red — a red that cost a lane a whole
+# triage cycle because of DEFECT B below (the suite discarded the child's output, so the refusal
+# arrived as `rc=71 started=0` with NO reason attached).
+#
+# THE SEAM IS THE HARNESS'S OWN, NOT AN AD-HOC `if` IN THIS FILE: `LANE_PREFLIGHT=0` is the escape
+# `spawn-gate.sh` documents on the refusal line itself ("Override with LANE_PREFLIGHT=0 once an
+# operator has measured it by hand"), and it is the same declaration its sibling suites make for the
+# same reason (`spawn-gate.test.sh`, `brief-gate.test.sh`, `capacity-transfer.test.sh`,
+# `lane-bound.test.sh`) — with the capability gate's OWN arms kept where they belong: the capability
+# block in `spawn-gate.test.sh` and `cell-lane-preflight.test.sh`.
+#
+# ⛔ AND IT IS DECLARED, NOT SILENT: a skip would have been the WRONG instrument here. A skip is a
+# MACHINE-DEPENDENT verdict — it can hide a genuine failure on a machine that DOES have the
+# capability, which is worse than a red. The seam is machine-INDEPENDENT: §0 below asserts, with a
+# FIXTURE probe verdict, that the gate refuses at 71 when the capability is absent AND that this
+# suite's setting starts the lane anyway — and S0 asserts THIS FILE's declaration is in force, which
+# is what makes deleting the line red on any box (a review caught the earlier version of this comment
+# claiming §0 covered that when it did not: §0's own arms PASS `LANE_PREFLIGHT` explicitly, so on a
+# pi-equipped box the suite stayed green with the line deleted — measured, 71/0 — while a runner
+# would still cascade).
+export LANE_PREFLIGHT=0
+
+# ⛔ DEFECT B — A FAILING ARM MUST SHOW THE CHILD'S OWN WORDS, NOT A NUMBER.
+# Every arm below used to run `run_agent … >/dev/null 2>&1`. That is how the CI failure above became
+# an unreasoned `rc=71 started=0`: the refusal, its reason (`why=pi-missing`) and the gate that
+# produced it were all written to fds that went nowhere. So the child's stdout/stderr now lands in
+# `<lane-log>.agent` (greppable beside the lane's own log), `ck` prints it — plus the reason lines in
+# the lane log — ON THE ARM THAT FAILED, and a red run KEEPS $TMP and prints its path instead of
+# deleting the evidence. A green run stays quiet and cleans up.
+ARM_LANE=""; ARM_LOG=""
+arm() { # arm <lane-log> — point the failure dump at THIS arm's artefacts
+  ARM_LANE="$1"; ARM_LOG="$1.agent"
 }
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+_dump() { # _dump <file> <what>
+  local f="${1:-}" what="${2:-log}"
+  [ -n "$f" ] || return 0
+  if [ ! -s "$f" ]; then printf '  ── %s: %s exists but is EMPTY ──\n' "$what" "$f"; return 0; fi
+  printf '  ── %s: %s ──\n' "$what" "$f"
+  # THE REASON FIRST: gate lines are exactly what vanished when the child was silenced.
+  grep -E '^\[[a-z-]+(-gate|-bound)?\]|LANE_CAPABILITY=' "$f" 2>/dev/null | tail -25 | sed 's/^/  │ /'
+  printf '  ── …and the last 40 lines of it ──\n'
+  tail -40 "$f" | sed 's/^/  │ /'
+}
+ck() { # ck <name> <0|1>
+  if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1)); return 0; fi
+  printf '  ❌ %s\n' "$1"; FAIL=$((FAIL+1))
+  _dump "${ARM_LANE:-}" "the lane log"
+  _dump "${ARM_LOG:-}" "run_agent's own stdout/stderr"
+  return 1
+}
+TMP="$(mktemp -d)"
+cleanup() {
+  if [ "${FAIL:-1}" -ne 0 ]; then
+    printf '  ⚠️  %s failed — artefacts KEPT for grepping: %s\n' "$FAIL" "$TMP"
+  else rm -rf "$TMP"; fi
+}
+trap cleanup EXIT
 mkdir -p "$TMP/bin"
 
 echo "==> wip-rescue-exit contract ($HERE)"
+# The declaration, with the pre-flight's OWN inputs measured now — so a CI log says WHY this suite
+# does not ask the box, instead of leaving it to be inferred from a code comment. The probe itself is
+# NOT run here (one bounded model call, 5-25 s, and it is not what this suite tests); §0 drives the
+# gate with a fixture verdict in both directions instead.
+_pf_pi="$(command -v pi 2>/dev/null || true)"
+_pf_keyvar="$(printf '%s' "${PI_LANE_PROVIDER:-deepseek}" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9\n' '_')_API_KEY"
+eval "_pf_key=\${${_pf_keyvar}:-}"
+_pf_keys="none"
+for _c in "${CELL_HOME:-}/keys.env" "${HOME:-}/keys.env"; do
+  [ -n "${_c%/keys.env}" ] && [ -r "$_c" ] && { _pf_keys="$_c"; break; }
+done
+echo "==> capability pre-flight: DECLARED OFF (LANE_PREFLIGHT=0) — this suite stubs 'pi' and does not"
+echo "    test the #2935 gate; on a runner with no pi install that gate refuses every arm at rc=71."
+echo "    measured here: pi=${_pf_pi:-NONE} · $_pf_keyvar=$([ -n "$_pf_key" ] && echo set || echo unset) · keys.env=$_pf_keys"
+echo "    NOT a silent bypass — S0 asserts THIS declaration, §0 asserts rc=71 without the seam and a"
+echo "    started lane with it."
 
 [ -s "$GATE" ] && bash -n "$GATE"; rc=$?
 ck "spawn-gate.sh exists and parses" $rc
@@ -106,16 +183,81 @@ drive() { # drive <gate> <cap> <label> [wip-path]
     KIND=lane; TAG=2834
     load1() { printf 1; }
     if [ -n "$8" ]; then WIP_PATH="$8"; fi
-    run_agent "$4" "$5" "$6" "$7" >/dev/null 2>&1
+    # ⛔ NOT `>/dev/null 2>&1` (defect B): the child output goes beside its lane log, where the
+    # failure dump in ck prints it. `$5` IS the lane log path, so `.agent` is one glob away.
+    run_agent "$4" "$5" "$6" "$7" >>"$5.agent" 2>&1
     printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
   ' _ "$gate" "$WT" "$O" "$cap" "$O/logs/lane.log" "$PROMPT" "$label" "$wip"
 }
 wiprefs() { git -C "$BARE" for-each-ref --format='%(refname)' 'refs/wip/*' 2>/dev/null; }
 
+# ── §0 THE SEAM IS LOAD-BEARING, AND THE CI FAILURE IS REPRODUCED IN BOTH DIRECTIONS ─────────────
+# The declaration at the top of this file would be decoration if nothing asserted it, so the gate is
+# DRIVEN here — not on the box's real capability (that is `cell-lane-preflight.test.sh`'s job, and a
+# verdict about this box is exactly the box-dependent reading that made CI red) but on a FIXTURE
+# verdict reached through the harness's own `CELL_PREFLIGHT_SH` seam. `why=pi-missing` is the shape a
+# CI runner produces: no `pi` install, so the probe cannot measure and every spawn is refused.
+#
+# S1-S3 pin the failure this suite used to REPORT WITHOUT SAYING: rc=71, no agent, and the reason
+# (`LANE_CAPABILITY=refused why=pi-missing` + the gate line) present in the lane log. S4-S5 pin the
+# escape: the SAME box, the SAME fixture verdict, `LANE_PREFLIGHT=0` as this file sets it — the lane
+# starts and the gate writes nothing. A single arm could be green by accident; the pair cannot.
+# S0 (below) is the third leg: the file's OWN declaration, which the per-invocation arms cannot see.
+mkfake_pf() { # mkfake_pf <why> <exit>
+  { printf '#!/usr/bin/env bash\n'
+    printf 'echo "[cell-lane-preflight] LANE_CAPABILITY=refused why=%s host=ci-runner attempts=1 bound=45s"\n' "$1"
+    printf 'exit %s\n' "$2"; } > "$TMP/fake-preflight.sh"
+  chmod +x "$TMP/fake-preflight.sh"
+}
+drive_pf() { # drive_pf <LANE_PREFLIGHT> <lane-log> -> "rc=<n> started=<n>"
+  # ⛔ ITS OWN `$O` (#2834's ledger contract). `run_agent` appends one `lane-end.tsv` row per terminal,
+  # so driving it here in the FIXTURE's `$O` would put a §0 row ahead of arm A's and break A5's
+  # `NR==1` ("the first row is this lane's") — an assertion this suite must not weaken to make room
+  # for a pre-flight arm. A private ledger keeps the two surfaces independent.
+  env PATH="$TMP/bin:$PATH" PI_LOG="$PFO/pi.log" O="$PFO" DISK_MIN_FREE_MB=1 \
+      LANE_PREFLIGHT="$1" CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh" \
+    bash -c '
+      . "$1"
+      cd "$2" || exit 2
+      O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+      KIND=lane; TAG=2834
+      load1() { printf 1; }
+      run_agent 300 "$4" "$5" "$6" >>"$4.agent" 2>&1
+      printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+    ' _ "$GATE" "$WT" "$PFO" "$2" "$PROMPT" "preflight-$1"
+}
+PFO="$TMP/pf-O"; mkdir -p "$PFO/logs" "$PFO/state"
+# ⛔ S0 asserts THIS FILE's own declaration, and it is not redundant with S1-S5: those arms PASS
+# `LANE_PREFLIGHT` explicitly per invocation (S1=1, S4=0), so they prove the GATE's two directions
+# while saying nothing about what the arms below inherit. Without S0, deleting the `export` above left
+# the suite GREEN on a pi-equipped box (measured: 71 passed / 0 failed) with the arms merely running a
+# live probe, and only a runner would have noticed. This is the one assertion that makes the
+# declaration load-bearing on every box.
+ck "S0 this suite's OWN pre-flight declaration is in force, so the arms below cannot silently inherit a LIVE capability gate" \
+  $([ "${LANE_PREFLIGHT:-}" = "0" ] && echo 0 || echo 1)
+pi_stub clean
+mkfake_pf pi-missing 2
+: > "$PFO/logs/preflight.log"; rm -f "$PFO/pi.log"
+res="$(drive_pf 1 "$PFO/logs/preflight.log")"
+arm "$PFO/logs/preflight.log"
+ck "S1 a box with NO capability is REFUSED at 71 before any spawn, exactly as the CI runner was ($res)" \
+  $([ "$res" = "rc=71 started=0" ] && echo 0 || echo 1)
+ck "S2 …the refusal NAMES the gate and its reason in the lane log (why=pi-missing), instead of arriving as a bare number" \
+  $(grep -q 'LANE_CAPABILITY=refused why=pi-missing' "$PFO/logs/preflight.log" && grep -q 'capability-gate. REFUSED' "$PFO/logs/preflight.log" && echo 0 || echo 1)
+ck "S3 …and NO agent was started (no stub run was reached)" $([ ! -s "$PFO/pi.log" ] && echo 0 || echo 1)
+: > "$PFO/logs/preflight0.log"; rm -f "$PFO/pi.log"
+res0="$(drive_pf 0 "$PFO/logs/preflight0.log")"
+arm "$PFO/logs/preflight0.log"
+ck "S4 …and LANE_PREFLIGHT=0 — the seam this suite declares — starts the SAME lane on the SAME box ($res0)" \
+  $([ "$res0" = "rc=0 started=1" ] && [ -s "$PFO/pi.log" ] && echo 0 || echo 1)
+ck "S5 …with NO capability reading written at all, so the seam is a real escape and not a second gate" \
+  $(! grep -q 'capability-gate' "$PFO/logs/preflight0.log" && echo 0 || echo 1)
+
 # ── A) THE DEFECT ITSELF: a lane that ends BEFORE its cap, with work in the tree ──────────────────
 pi_stub dirty
 : > "$O/logs/lane.log"
 res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 drive "$GATE" 300 "early exit")"
+arm "$O/logs/lane.log"
 ck "A1 the stub lane really ran and exited before its cap ($res)" $([ "$res" = "rc=0 started=1" ] && echo 0 || echo 1)
 [ -n "$(wiprefs)" ]; rc=$?
 ck "A2 an early exit WITH uncommitted work leaves a refs/wip/* ref on ORIGIN (refs: $(wiprefs | tr '\n' ' '))" $rc
@@ -159,9 +301,10 @@ res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi2.log" bash -c '
   O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
-  run_agent 300 "$4" "$5" "mutant" >/dev/null 2>&1
+  run_agent 300 "$4" "$5" "mutant" >>"$4.agent" 2>&1
   printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
 ' _ "$MUT/spawn-gate.sh" "$WT" "$O" "$O/logs/mut.log" "$PROMPT")"
+arm "$O/logs/mut.log"
 ck "B1b the MUTANT lane itself ran (so B2/B3 test the removed call, not a refusal that never dispatched) ($res)" \
   $([ "$res" = "rc=0 started=1" ] && echo 0 || echo 1)
 grep -q 'PI_RAN' "$O/pi2.log" 2>/dev/null; rcpi=$?
@@ -183,10 +326,11 @@ res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi3.log" bash -c '
   O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
-  run_agent 300 "$4" "$5" "clean exit" >/dev/null 2>&1
+  run_agent 300 "$4" "$5" "clean exit" >>"$4.agent" 2>&1
   printf "rc=%s" "$?"
 ' _ "$GATE" "$WT" "$O" "$O/logs/clean.log" "$PROMPT")"
 after="$(wiprefs | wc -l | tr -d ' ')"
+arm "$O/logs/clean.log"
 [ "$before" = "$after" ] && grep -q 'tree=clean rescue=nothing' "$O/logs/clean.log"; rc=$?
 ck "C1 a clean exit creates NO ref and the record says tree=clean rescue=nothing ($before -> $after refs)" $rc
 grep -q 'unpushed=0' "$O/logs/clean.log"; rc=$?
@@ -202,8 +346,9 @@ PATH="$TMP/bin:$PATH" PI_LOG="$O/pi4.log" bash -c '
   O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
-  run_agent 300 "$4" "$5" "unpushed exit" >/dev/null 2>&1
+  run_agent 300 "$4" "$5" "unpushed exit" >>"$4.agent" 2>&1
 ' _ "$GATE" "$WT" "$O" "$O/logs/unpushed.log" "$PROMPT"
+arm "$O/logs/unpushed.log"
 grep -q 'tree=unpushed-only rescue=nothing unpushed=1' "$O/logs/unpushed.log"; rc=$?
 ck "D1 a CLEAN tree whose branch holds an unpushed commit is recorded as unpushed-only, with the count" $rc
 grep -q 'exist ONLY locally' "$O/logs/unpushed.log"; rc=$?
@@ -225,7 +370,8 @@ PATH="$TMP/bin:$PATH" O="$ISO/harness/O" AGENT_INFRA_PATH= HOME="$ISO/home" bash
   WIP_PATH="$2"
   : > "$3"
   terminal_wip_rescue "no-rescuer" 0 0 "$3"
-' _ "$ISO/harness/spawn-gate.sh" "$WT" "$ISO/harness/O/lane.log" 2>/dev/null; rc=$?
+' _ "$ISO/harness/spawn-gate.sh" "$WT" "$ISO/harness/O/lane.log" 2>>"$ISO/harness/O/lane.log.agent"; rc=$?
+arm "$ISO/harness/O/lane.log"
 grep -q 'rescue=UNAVAILABLE' "$ISO/harness/O/lane.log"; rcu=$?
 grep -q 'NOT FOUND' "$ISO/harness/O/lane.log"; rcf=$?
 ck "E1 a missing bg-rescue-wip.sh is reported as rescue=UNAVAILABLE with the searched homes — never 'nothing to rescue'" $([ "$rcu" -eq 0 ] && [ "$rcf" -eq 0 ] && echo 0 || echo 1)
@@ -242,7 +388,8 @@ mkdir -p "$TMP/notgit"
 O="$O" WIP_PATH="$TMP/notgit" bash -c '
   . "$1"
   terminal_wip_rescue "mis-pointed" 0 0 "$2"
-' _ "$GATE" "$O/logs/notgit.log" 2>/dev/null
+' _ "$GATE" "$O/logs/notgit.log" 2>>"$O/logs/notgit.log.agent"
+arm "$O/logs/notgit.log"
 grep -q 'tree=not-a-worktree rescue=UNAVAILABLE' "$O/logs/notgit.log"; rc=$?
 ck "F1 a WIP_PATH that is not a git worktree is tree=not-a-worktree, never a clean verdict" $rc
 grep -q 'the worktree was CLEAN\|nothing was lost' "$O/logs/notgit.log"; rcc=$?
@@ -266,7 +413,8 @@ mkdir -p "$WT/nested/deep"
 O="$O" WIP_PATH="$WT/nested/deep" bash -c '
   . "$1"
   terminal_wip_rescue "nested-root" 0 0 "$2"
-' _ "$GATE" "$O/logs/nested.log" 2>/dev/null
+' _ "$GATE" "$O/logs/nested.log" 2>>"$O/logs/nested.log.agent"
+arm "$O/logs/nested.log"
 grep -q 'tree=not-a-worktree rescue=UNAVAILABLE' "$O/logs/nested.log"; rcn=$?
 ck "F4 a WIP_PATH that is INSIDE a worktree but not its root is tree=not-a-worktree, not a measured subdirectory" $rcn
 grep -q 'inside the worktree at' "$O/logs/nested.log"; rcn2=$?
@@ -291,7 +439,8 @@ O="$O" bash -c '
   . "$1"
   cd "$2" || exit 2
   terminal_wip_rescue "forgot-wip-path" 0 0 "$3"
-' _ "$GATE" "$FOREIGN" "$O/logs/foreign.log" 2>/dev/null
+' _ "$GATE" "$FOREIGN" "$O/logs/foreign.log" 2>>"$O/logs/foreign.log.agent"
+arm "$O/logs/foreign.log"
 awk -F'\t' '$2=="forgot-wip-path" && $5=="unpushed-only" && $9=="'"$FOREIGN"'" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcf7=$?
 ck "F7 a cwd that IS another checkout's root is MEASURED (tree=unpushed-only) and recorded with THAT root in the row — the surface a wrong-tree archive is caught on" $rcf7
 grep -qF "at $FOREIGN" "$O/logs/foreign.log" && grep -q 'tree=unpushed-only' "$O/logs/foreign.log"; rcf8=$?
@@ -322,10 +471,11 @@ PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
   KIND=lane; TAG=2834
   load1() { printf 1; }
   WIP_PATH="$2"
-  run_agent 300 "$4" "$6" "wip-path wins" >/dev/null 2>&1
+  run_agent 300 "$4" "$6" "wip-path wins" >>"$4.agent" 2>&1
   printf "rc=%s" "$?"
 ' _ "$GATE" "$WT" "$O" "$O/logs/wipath.log" "$MAINCO" "$PROMPT" >/dev/null
 
+arm "$O/logs/wipath.log"
 ck "H1 the lane really ended inside the OTHER dirty checkout (its own untracked file is there)" \
   $([ -f "$MAINCO/early.txt" ] && echo 0 || echo 1)
 wk="$(git -C "$BARE" show "refs/wip/$SLUG:wtwork.txt" 2>/dev/null)"
@@ -350,7 +500,7 @@ drive_cap() { # drive_cap <label> <log>
     O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
     KIND=lane; TAG=2834
     load1() { printf 1; }
-    run_agent 1 "$4" "$5" "$6" >/dev/null 2>&1
+    run_agent 1 "$4" "$5" "$6" >>"$4.agent" 2>&1
     printf "rc=%s" "$?"
   ' _ "$GATE" "$WT" "$O" "$2" "$PROMPT" "$1"
 }
@@ -358,6 +508,7 @@ pi_stub sleepdirty
 : > "$O/logs/cap.log"
 rm -f "$WT/capdirty.txt"
 res="$(drive_cap "cap exit" "$O/logs/cap.log")"
+arm "$O/logs/cap.log"
 grep -q '\[cap\] .*cap' "$O/logs/cap.log"; rccap=$?
 grep -q '\[wip\] end label=cap exit rc=.* cap=1 tree=dirty rescue=refs/wip/' "$O/logs/cap.log"; rcend=$?
 ck "G1 the CAP kill still snapshots (#2045 unchanged) AND the exit path rescues it off-box, recorded as cap=1" $([ "$rccap" -eq 0 ] && [ "$rcend" -eq 0 ] && echo 0 || echo 1)
@@ -375,6 +526,7 @@ res_fail="$(drive_cap "cap failing" "$O/logs/capfail.log")"
 : > "$O/logs/capoff.log"
 res_off="$(WIP_RESCUE_DISABLE=1 drive_cap "cap disabled" "$O/logs/capoff.log")"
 ck "G3 an unreachable remote does NOT change the lane's exit status ($res_fail with a failing rescue, $res_off with the rescue disabled)" $([ "$res_fail" = "$res_off" ] && echo 0 || echo 1)
+arm "$O/logs/capfail.log"
 grep -q 'STILL ONLY ON THIS DISK' "$O/logs/capfail.log"; rcfail=$?
 ck "G4 …and the failing rescue is LOUD: it names the worktree as the only copy" $rcfail
 # ⛔ THE ARCHIVE THAT WAS PINNED IS RECORDED AS SUCH (review F2, PR #2975). bg-rescue-wip.sh exits 2
@@ -386,6 +538,7 @@ ck "G6 …and the archive that DID get pinned locally is recorded as rescue=arch
 grep -q 'rescue=FAILED' "$O/logs/capfail.log"; rcfailed=$?
 ck "G7 …so FAILED is no longer printed over a worktree whose work is in fact pinned" $([ "$rcfailed" -ne 0 ] && echo 0 || echo 1)
 grep -q 'rescue=DISABLED' "$O/logs/capoff.log"; rcdis=$?
+arm "$O/logs/capoff.log"
 ck "G5 …and the operator hatch (WIP_RESCUE_DISABLE=1) says the tree was NOT examined instead of implying it was clean" $rcdis
 # ⛔ AND THE HATCH STILL WRITES A ROW (review F1, PR #2975). A hatch that blanks the ledger is
 # indistinguishable from a lane that never ended — the exact ambiguity `lane-end.tsv` exists to close.
@@ -407,9 +560,10 @@ before_sha="$(git -C "$WT" rev-parse -q --verify refs/wip-local/work 2>/dev/null
 TMPDIR="$TMP/no-such-tmpdir" O="$O" WIP_PATH="$WT" bash -c '
   . "$1"
   terminal_wip_rescue "stale ref" 0 0 "$2"
-' _ "$GATE" "$O/logs/staleref.log" 2>/dev/null
+' _ "$GATE" "$O/logs/staleref.log" 2>>"$O/logs/staleref.log.agent"
 rcstale=$?
 after_sha="$(git -C "$WT" rev-parse -q --verify refs/wip-local/work 2>/dev/null)"
+arm "$O/logs/staleref.log"
 ck "I1 the fixture really left a STALE ref unchanged by this run (before=$before_sha after=$after_sha)" \
   $([ -n "$before_sha" ] && [ "$before_sha" = "$after_sha" ] && echo 0 || echo 1)
 grep -q 'rescue=archived-local' "$O/logs/staleref.log"; rcac=$?
@@ -463,13 +617,15 @@ chmod +x "$TMP/bin-warn/git"
 rawst="$(git -C "$WT" status --porcelain -uall 2>/dev/null)"
 blindst="$(PATH="$TMP/bin-warn:$PATH" GIT_OPTIONAL_LOCKS=0 git -C "$WT" status --porcelain -uall 2>"$TMP/werr")"; blindrc=$?
 if [ -n "$rawst" ] && [ "$blindrc" -eq 0 ] && [ -z "$blindst" ] && grep -q 'could not open directory' "$TMP/werr"; then j1=0; else j1=1; fi
+arm ""   # J1 asserts the FIXTURE, not a lane: no product log applies to it
 ck "J1 the fixture reproduces the blind spot: the work IS uncommitted (real status sees it) yet the wrapped status exits 0 with NO output and a warning on stderr" $j1
 : > "$O/logs/blind.log"
 PATH="$TMP/bin-warn:$PATH" O="$O" WIP_PATH="$WT" bash -c '
   . "$1"
   terminal_wip_rescue "blinded status" 0 0 "$2"
-' _ "$GATE" "$O/logs/blind.log" 2>/dev/null
+' _ "$GATE" "$O/logs/blind.log" 2>>"$O/logs/blind.log.agent"
 rcblind=$?
+arm "$O/logs/blind.log"
 grep -q 'tree=cannot-verify' "$O/logs/blind.log"; rcblindtree=$?
 ck "J2 an INCOMPLETE listing is recorded as cannot-verify, so an empty enumeration is never published as a clean tree" $rcblindtree
 grep -q 'tree=clean' "$O/logs/blind.log"; rcblindclean=$?
@@ -498,6 +654,7 @@ seed_sha="$(git -C "$WT" rev-parse HEAD)"
 # it first so the conflict is the one this arm needs: the pin unwritable, the push unaffected.
 git -C "$WT" update-ref -d "refs/wip-local/$SLUG" 2>/dev/null
 git -C "$WT" update-ref "refs/wip-local/$SLUG/dfblock" "$seed_sha" 2>/dev/null; rcdf=$?
+arm ""   # K0 asserts the FIXTURE's D/F conflict, not a lane
 ck "K0 the fixture really made refs/wip-local/$SLUG unwritable (a D/F conflict: a child ref exists under it)" $rcdf
 # ⛔ `pi_stub` only INSTALLS the stub; it RUNS inside `run_agent`. This arm drives `terminal_wip_rescue`
 # directly, so it creates the dirty file itself — the same way arms E/F/G do.
@@ -506,8 +663,9 @@ printf 'the work a lane leaves behind\n' > "$WT/early.txt"
 O="$O" WIP_PATH="$WT" bash -c '
   . "$1"
   terminal_wip_rescue "df-conflict" 0 0 "$2"
-' _ "$GATE" "$O/logs/df.log" 2>/dev/null; rcdf2=$?
+' _ "$GATE" "$O/logs/df.log" 2>>"$O/logs/df.log.agent"; rcdf2=$?
 gotdf="$(git -C "$BARE" show "refs/wip/$SLUG:early.txt" 2>/dev/null)"
+arm "$O/logs/df.log"
 ck "K1 the push DID succeed, so origin really holds the work ('$gotdf')" \
   $([ "$gotdf" = "the work a lane leaves behind" ] && echo 0 || echo 1)
 awk -F'\t' '$2=="df-conflict" && $5=="dirty" && $6=="refs/wip/'"$SLUG"'" && $7=="" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rck2=$?
@@ -543,6 +701,7 @@ chmod +x "$TMP/bin-norev/git"
 # A COMPLETE, EMPTY listing, so the ONLY thing that can stop a `clean` verdict is the unpushed read.
 git -C "$WT" reset -q --hard HEAD && git -C "$WT" clean -q -xdf
 injected="$(PATH="$TMP/bin-norev:$PATH" git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null)"; injrc=$?
+arm ""   # L0/L1 assert the FIXTURE wrapper, not a lane
 ck "L0 the fixture really makes the unpushed count UNREADABLE on this host (rc=$injrc, out='${injected}')" \
   $([ "$injrc" -ne 0 ] && [ -z "$injected" ] && echo 0 || echo 1)
 realcount="$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null)"
@@ -552,8 +711,9 @@ ck "L1 …and the REAL git still answers, so the arm is not vacuous on a host th
 PATH="$TMP/bin-norev:$PATH" O="$O" WIP_PATH="$WT" bash -c '
   . "$1"
   terminal_wip_rescue "unreadable unpushed" 0 0 "$2"
-' _ "$GATE" "$O/logs/norev.log" 2>/dev/null
+' _ "$GATE" "$O/logs/norev.log" 2>>"$O/logs/norev.log.agent"
 rcnorev=$?
+arm "$O/logs/norev.log"
 awk -F'\t' '$2=="unreadable unpushed" && $5=="cannot-verify" && $8=="?" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcl1=$?
 ck "L2 an unreadable unpushed count is recorded as tree=cannot-verify with the column '?', never as a measured 0" $rcl1
 awk -F'\t' '$2=="unreadable unpushed" && $5=="clean" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcl2=$?
@@ -575,8 +735,9 @@ git -C "$WT" reset -q --hard HEAD && git -C "$WT" clean -q -xdf
 TMPDIR="$TMP/does-not-exist" O="$O" WIP_PATH="$WT" bash -c '
   . "$1"
   terminal_wip_rescue "no temp dir" 0 0 "$2"
-' _ "$GATE" "$O/logs/notmp.log" 2>/dev/null
+' _ "$GATE" "$O/logs/notmp.log" 2>>"$O/logs/notmp.log.agent"
 rcnotmp=$?
+arm "$O/logs/notmp.log"
 grep -q 'NO status reading was taken' "$O/logs/notmp.log"; rcm1=$?
 ck "M1 a failed mktemp is reported as 'NO status reading was taken', naming TMPDIR" $rcm1
 grep -q 'git status rc=' "$O/logs/notmp.log"; rcm2=$?

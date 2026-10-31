@@ -144,6 +144,8 @@
 #   at the point it is read — see `is_pos_int "$REAP_VENV_FREE_FLOOR_MB"`.)
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
+#   REAP_VENV_SCAN_CAP (test seam: pins the runaway-guard exhaustion branch, which is unreachable with
+#   the derived cap)
 #
 # Exit codes: 0 pass completed (removals or none), 2 usage, 3 fail-closed abort (nothing removed),
 #             4 pass completed but at least one removal FAILED,
@@ -465,8 +467,9 @@ self_load() {
 }
 
 # argv_witness_for <canon> — a pid whose command line names the worktree.
-argv_witness_for() {
+argv_witness_for() { # <canon> [<exclude-pids>]
     local canon="$1" base="${1##*/}" tok d pid line
+    local exclude="${2:-}"
     [ -n "$canon" ] && [ -s "$PS_TABLE" ] || return 1
     # Exact path-boundary match first (the common case: an absolute path in argv).
     #
@@ -483,6 +486,7 @@ argv_witness_for() {
         pid="${line%% *}"
         [ -n "$pid" ] || continue
         is_self_pid "$pid" && continue
+        case " $exclude " in *" $pid "*) continue ;; esac
         printf 'pid=%s argv=%s\n' "$pid" "$(printf '%s' "$line" | cut -c1-140)"
         return 0
     done <<<"$(awk -v a="$canon" '
@@ -506,6 +510,7 @@ argv_witness_for() {
         [ -n "$line" ] || continue
         pid="${line%% *}"
         is_self_pid "$pid" && continue
+        case " $exclude " in *" $pid "*) continue ;; esac
         for tok in $line; do
             case "$tok" in *"/$base") ;; *) continue ;; esac
             case "$tok" in "$canon"|"$canon"/*) printf 'pid=%s argv=%s\n' "$pid" "$(printf '%s' "$line" | cut -c1-140)"; return 0 ;; esac
@@ -563,12 +568,13 @@ cwd_load() {
     return 0
 }
 
-cwd_witness_for() {
-    local canon="$1" pid path
+cwd_witness_for() { # <canon> [<exclude-pids>] — pids this classification has already DEMOTED
+    local canon="$1" exclude="${2:-}" pid path
     [ -n "$canon" ] && [ -s "${CWD_TABLE:-}" ] || return 1
     while IFS="$TAB" read -r pid path; do
         [ -n "$pid" ] && [ -n "$path" ] || continue
         is_self_pid "$pid" && continue
+        case " $exclude " in *" $pid "*) continue ;; esac
         inside "$canon" "$path" || continue
         printf 'pid=%s cwd=%s\n' "$pid" "$path"
         return 0
@@ -597,12 +603,13 @@ tmux_load() {
     return 1
 }
 
-tmux_witness_for() {
-    local canon="$1" pid path cpane
+tmux_witness_for() { # <canon> [<exclude-pids>]
+    local canon="$1" exclude="${2:-}" pid path cpane
     [ "$TMUX_STATE" = "ok" ] && [ -s "${TMUX_TABLE:-}" ] || return 1
     while IFS="$TAB" read -r pid path; do
         [ -n "$pid" ] && [ -n "$path" ] || continue
         is_self_pid "$pid" && continue
+        case " $exclude " in *" $pid "*) continue ;; esac
         cpane="$(canonicalize "$path")"
         [ -n "$cpane" ] || cpane="$path"
         inside "$canon" "$cpane" || continue
@@ -644,8 +651,15 @@ IDLE_SHELL="${REAP_VENV_IDLE_SHELL:-1}"
 proc_start_epoch() {
     local pid="${1:-}" v e rest
     [ -n "$pid" ] && is_pos_int "$pid" || return 1
-    if [ -r "/proc/$pid" ]; then
-        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+    # ⛐ THE ROOT IS `$REAP_VENV_PROC_ROOT`, NOT A LITERAL `/proc` (review round 5, P2). The variable
+    # already means "where the process table lives" (the cwd scan reads it), and leaving this one read
+    # pinned to `/proc` made the fallback UNTESTABLE on a Linux host: a fixture pid that happens to be
+    # live takes this branch, so an arm for the `10#` parse below passes (or fails) on whatever process
+    # owns that pid — it discriminates only in a fresh container. With the seam honoured, a fixture
+    # root that does not contain the pid falls through to `ps` deterministically, in production it is
+    # still `/proc`, and the arm pins the parse it claims to pin.
+    if [ -r "$REAP_VENV_PROC_ROOT/$pid" ]; then
+        v="$(stat -c '%Y' "$REAP_VENV_PROC_ROOT/$pid" 2>/dev/null)"
         case "$v" in ''|*[!0-9]*) v="" ;; esac
         [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
     fi
@@ -655,9 +669,15 @@ proc_start_epoch() {
     e="$("$PS_BIN" -o etime= -p "$pid" 2>/dev/null | tr -d ' \t')"
     [ -n "$e" ] || return 1
     case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
+    # ⛔ EVERY FIELD IS FORCED TO BASE 10 (review round 1, P2-falsified-in-part): `ps -o etime` prints
+    # zero-padded components, so a perfectly ordinary `1:08:30` reaches the arithmetic as `08` and bash
+    # rejects it as a bad OCTAL constant, and the expansion ABORTS: `proc_start_epoch` returns NOTHING,
+    # the rule could not prove the holder predated HEAD, and the holder stayed LIVE — an INERT
+    # enforcer, never a false reap, on every host that reaches this fallback (on macOS it is the
+    # PRIMARY path). `10#` makes the parse literal decimal.
     v=0
     case "$e" in
-        *-*) v=$(( ${e%%-*} * 86400 )); e="${e#*-}" ;;
+        *-*) v=$(( 10#${e%%-*} * 86400 )); e="${e#*-}" ;;
     esac
     local f1 f2 f3 rest
     case "$e" in
@@ -666,7 +686,7 @@ proc_start_epoch() {
         *)     f1=0; f2=0; f3="$e" ;;
     esac
     is_pos_int "$f1" && is_pos_int "$f2" && is_pos_int "$f3" || return 1
-    v=$(( v + f1 * 3600 + f2 * 60 + f3 ))
+    v=$(( v + 10#$f1 * 3600 + 10#$f2 * 60 + 10#$f3 ))
     printf '%s\n' "$(( $(now_epoch) - v ))"
 }
 
@@ -695,15 +715,15 @@ has_child() {
 }
 
 # head_epoch_for <worktree> -> epoch of the worktree's HEAD commit ("" when git cannot date it).
-# Bounded like every other git call in this script, and cached per pass: the same worktree is probed
-# at classification and again at removal.
-HEAD_EPOCH_CACHE=""
+# Bounded like every other git call here. ⛔ NO CACHE, DELIBERATELY (review round 1, P2): every caller
+# runs inside `$( )` (`live="$(live_witness …)"`), so a shell-variable cache set here is born and dies
+# in the same subshell — an earlier version claimed "cached per pass" and did not cache at all. A cache
+# that only APPEARS to exist is worse than none: it makes the next reader believe the cost is paid. The
+# probe runs ONLY when a shell holder was actually found, so it is one bounded `git log` per demotion
+# candidate, not per worktree.
 head_epoch_for() {
-    local wt="${1:-}" out rc v k
+    local wt="${1:-}" out rc v
     [ -n "$wt" ] || return 1
-    while IFS="$TAB" read -r k v; do
-        [ "$k" = "$wt" ] && [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
-    done <<<"$HEAD_EPOCH_CACHE"
     out="$(bound_file headep)" || return 1
     run_bounded "$REAP_VENV_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$wt" log -1 --format=%ct
     rc=$?
@@ -711,7 +731,6 @@ head_epoch_for() {
     rm -f "$out"
     [ "$rc" = 0 ] || return 1
     is_pos_int "$v" || return 1
-    HEAD_EPOCH_CACHE="$HEAD_EPOCH_CACHE$wt$TAB$v"$'\n'
     printf '%s\n' "$v"
 }
 
@@ -729,51 +748,83 @@ stale_shell_holder() {
     return 0
 }
 
-# demote_row <table-var-name> <pid> — drop that holder's row from a probe TABLE FILE, so the witness
-# scan moves on to the NEXT holder instead of stopping at the first one. It mutates the shared file on
-# purpose: the witness readers run inside `$( )` subshells, so a shell variable holding "already
-# demoted pids" could not cross that boundary, while the file can (measured: without this, ONE idle
-# shell + one busy lane in the same worktree demoted the idle shell and then never looked at the busy
-# one — the env was reaped under a live lane, which is the exact failure this reaper exists to avoid).
-demote_row() { # demote_row <table-var-name> <pid>
-    local var="${1:-}" pid="${2:-}" f
-    [ -n "$var" ] && [ -n "$pid" ] && is_pos_int "$pid" || return 0
-    f="${!var:-}"
-    [ -n "$f" ] && [ -s "$f" ] || return 0
-    awk -v p="$pid" -F"$TAB" '$1 != p' "$f" >"$f.demoted" 2>/dev/null && mv -f "$f.demoted" "$f" 2>/dev/null
-    return 0
-}
-
+# live_witness <canon> — "<witness>\t<evidence>" when a live holder exists, nothing when none.
+#
+# ⛔ EVERY HOLDER IS EXAMINED, AND THE SCAN IS BOUNDED BY CONSTRUCTION (review round 1, P1+P2). A
+# worktree routinely holds an idle shell left over from an earlier lane AND a live lane's own shell, so
+# stopping at the first hit decides the whole worktree from whichever pid the probe happened to list
+# first. The first version advanced the scan by REWRITING THE PROBE TABLE — a loop with no bound: the
+# `awk`/`mv` result was never checked, so a failed write (ENOSPC on a full cell — the exact state this
+# reaper runs in) left the same row in place, the same pid came back, and the pass never terminated.
+# It also leaked across worktrees: a pid inside a NESTED worktree matches both canons, so demoting it
+# for the inner one removed the evidence the outer one needed.
+# The scan therefore carries its own EXCLUDE LIST (pid-scoped, per classification) and a hard
+# iteration cap four greater than the probe tables' total row count: a demotion that somehow fails to
+# advance the cursor ends the loop instead of spinning it, and one worktree's demotion cannot affect
+# another's.
 live_witness() {
-    local canon="$1" hit pid note=""
-    # EVERY holder is examined, not just the first (see demote_row): a worktree routinely holds an idle
-    # shell left over from an earlier lane AND a live lane's own shell, and taking the first hit would
-    # decide the verdict for the whole worktree from whichever pid the probe happened to list first.
-    while hit="$(tmux_witness_for "$canon")"; do
+    local canon="$1" hit pid seen="" cap n=0
+    # The cap is a RUNAWAY GUARD, not a schedule: it must exceed the number of DISTINCT holders any
+    # probe could report, so it counts EVERY table — including PS, which the argv arm reads (review
+    # round 2, P2: counting only cwd+tmux made the cap collapse to 4 on a host with no lsof and no
+    # tmux server, and a worktree with five holders was then truncated and read as unheld).
+    cap=$(( $(wc -l <"${CWD_TABLE:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${TMUX_TABLE:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${PS_TABLE:-/dev/null}" 2>/dev/null || echo 0) + 4 ))
+    [ "$cap" -ge 4 ] || cap=4
+    # ⛐ THE CAP HAS A TEST SEAM (`REAP_VENV_SCAN_CAP`), because its EXHAUSTION BRANCH is otherwise
+    # unreachable: the default is rows(cwd)+rows(tmux)+rows(ps)+4 and every iteration consumes a distinct
+    # pid, so "n > cap" cannot fire in a healthy pass — which meant the branch's POLARITY (a truncated
+    # scan is a LIVE holder, never "no holder") had no arm at all, and reverting it to `return 1` kept the
+    # suite green while a truncated scan would read as "every holder was demoted" and the env deleted
+    # (review round 8, P2). Production never sets this; a suite does, to drive the backstop.
+    if is_pos_int "${REAP_VENV_SCAN_CAP:-}" && [ "${REAP_VENV_SCAN_CAP}" -ge 1 ]; then cap="$REAP_VENV_SCAN_CAP"; fi
+    while hit="$(tmux_witness_for "$canon" "$seen")"; do
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            log "stale-shell-scan TRUNCATED at $cap holders — treating this one as LIVE (fail-closed); report it"
+            printf 'live-tmux-pane\t%s\n' "$hit"; return 0
+        fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pane_pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
-            note="$note pid=$pid(tmux-pane)"
-            demote_row TMUX_TABLE "$pid"
+            log "stale-shell: pid=$pid(tmux-pane) — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
+            seen="$seen$pid "
         else
             printf 'live-tmux-pane\t%s\n' "$hit"; return 0
         fi
     done
-    while hit="$(cwd_witness_for "$canon")"; do
+    while hit="$(cwd_witness_for "$canon" "$seen")"; do
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            log "stale-shell-scan TRUNCATED at $cap holders — treating this one as LIVE (fail-closed); report it"
+            printf 'live-cwd\t%s\n' "$hit"; return 0
+        fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
-            note="$note pid=$pid(cwd)"
-            demote_row CWD_TABLE "$pid"
+            log "stale-shell: pid=$pid(cwd) — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
+            seen="$seen$pid "
         else
             printf 'live-cwd\t%s\n' "$hit"; return 0
         fi
     done
-    if hit="$(argv_witness_for "$canon")"; then printf 'live-argv\t%s\n' "$hit"; return 0; fi
-    # A DEMOTED HOLDER IS NAMED, never silent: the pass log is where an operator decides whether a
-    # stale-cwd reading was right, and a demotion nobody can see is the same defect as a KEEP nobody
-    # can explain (#2721).
-    if [ -n "$note" ]; then
-        log "stale-shell:$note — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
-    fi
+    while hit="$(argv_witness_for "$canon" "$seen")"; do
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            log "stale-shell-scan TRUNCATED at $cap holders — treating this one as LIVE (fail-closed); report it"
+            printf 'live-argv\t%s\n' "$hit"; return 0
+        fi
+        pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
+        if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
+            log "stale-shell: pid=$pid(argv) — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
+            seen="$seen$pid "
+        else
+            printf 'live-argv\t%s\n' "$hit"; return 0
+        fi
+    done
+    # A DEMOTED HOLDER IS NAMED, never silent — and named AT THE DEMOTION (review round 1): an
+    # aggregate line emitted at the END of this function never ran whenever a live holder was found
+    # after a demoted one, because that branch returns early. Measured: an idle shell demoted and a
+    # working shell keeping the same worktree logged NO demotion at all, i.e. the one case an operator
+    # most needs to read was the silent one. The pass log is where a KEEP is explained, so each
+    # demotion is written where it happens.
     return 1
 }
 

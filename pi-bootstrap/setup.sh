@@ -553,7 +553,7 @@ fi
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -1018,6 +1018,60 @@ if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-launchd.sh"
     echo "    WARNING: launchd install reported failures (see above) — run:"
     echo "      $INFRA_ROOT/scripts/install-launchd.sh --status"
   fi
+fi
+
+# ── 7b. THE DEPLOY VERIFIES ITSELF (tortoise#10114) ───────────────────────────────────────────
+# Every farm leg above copies from $INFRA_ROOT. A copy that has just been written is NOT evidence
+# that the DEPLOYED bytes are the SHIPPED bytes — and it is no evidence at all when $INFRA_ROOT is
+# not the tree this box is pinned to. That is exactly how the original defect survived a "successful"
+# install: the farm refreshed from an Aug-7 checkout while the box was pinned elsewhere, so every
+# file it wrote was stale and NOTHING said so. launchd then executed that stale copy
+# (`com.tortoise.pr-doctor.plist` targets $DEST/scripts/pr-doctor.py) and the whole PR-repair fleet
+# dispatched 0 orders for nine hours while each pass reported rc=0.
+#
+# So the deploy ends by GRADING ITS OWN RESULT: `check-farm-drift.sh` compares every deployed file
+# against the source at the ref and prints `file | deployed sha | source sha | verdict`.
+#   rc=1 (a named file differs)        → FATAL. The farm did not converge, and a stale script would
+#                                        be executed. A failed install is louder than a silent
+#                                        no-op fleet.
+#   rc=2 (cannot compare / not the pin) → LOUD WARNING naming both shas, and the install continues:
+#                                        a fresh box legitimately has no pin record yet, and aborting
+#                                        there would fail every first-time install for a reason that
+#                                        is not a defect. The line prints on every run until it is
+#                                        resolved, which is what makes it observable.
+if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
+  echo ""
+  echo "==> Farm drift (deployed vs shipped)"
+  # GRADES WORKTREE BYTES, because that is what the farm legs above just `cp`'d. Grading against HEAD
+  # would red a farm that is byte-identical to the tree this script was told to farm from (the normal
+  # hot-fix path: box at pin, a farmed script edited, setup.sh re-run) — a false CRASH, the mirror of
+  # the false PASS this whole leg exists against. Pin identity is still checked inside.
+  # NOTHING IS WRITTEN INTO $DEST/state: that directory is not created by this file (:466 says so), and
+  # a log path there failed closed in the worst way — the STALE detail went to /dev/null and a
+  # non-writable dir turned a MATCHING farm into "FARM DID NOT CONVERGE". The detail is captured in a
+  # shell variable and always printed.
+  _farm_rc=0
+  _farm_msg="$(bash "$INFRA_ROOT/scripts/check-farm-drift.sh" \
+                --dest "$DEST/scripts" --src "$INFRA_ROOT" --ref HEAD --src-mode worktree \
+                --pin-file "$DEST/state/HARNESS-PIN" --quiet 2>&1 >/dev/null)" || _farm_rc=$?
+  case "$_farm_rc" in
+    0) echo "    farm: OK — every sourced file matches the bytes the farm copied"
+       # The pass can still carry a NOTE (e.g. "no pin record: pin identity NOT verified"). Printing it
+       # is the difference between "verified" and "verified except the trap arm", and --quiet put it on
+       # stderr while this line hid it.
+       [ -z "$_farm_msg" ] || printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
+    1) echo "    ⛔ FARM DID NOT CONVERGE — a deployed script is not the shipped code:"
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /'
+       echo "    Refusing to report a successful install over a farm that launchd would execute as stale code."
+       exit 1 ;;
+    3) echo "    ⚠️  farm: UNSOURCED file(s) — on the box, in no repo file (this is NOT drift, and NOT a pass):"
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
+    *) echo "    ⚠️  farm: COULD NOT VERIFY (exit $_farm_rc) — this is NOT a pass:"
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
+  esac
+else
+  echo ""
+  echo "    ⚠️  farm drift NOT verified — $INFRA_ROOT/scripts/check-farm-drift.sh is absent"
 fi
 
 echo ""

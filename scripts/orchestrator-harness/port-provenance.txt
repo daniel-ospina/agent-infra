@@ -130,12 +130,28 @@
 #        it is additive: re-copying the original produces a file that parses, passes every gate test
 #        that predates the change, and simply never refuses. It is a to-do item on any future merge
 #        of the two copies, not drift.
-#        ⛔ AND THE VOLUME IS A CALLER'S ARGUMENT, NOT `$PWD` (`DISK_GATE_PATH`). `fix-one.sh` and
-#        `adopt-fix.sh` `cd "$REPO"` and only NAME the worktree in the agent's prompt, so their `$PWD`
-#        is the MAIN CHECKOUT; `fix-one.sh` therefore passes `DISK_GATE_PATH="$WT"` explicitly. On a
+#        ⛔ AND THE VOLUME IS A CALLER'S ARGUMENT, NOT `$PWD` (`DISK_GATE_PATH`). `fix-one.sh` cds to
+#        `$REPO` — whose `$PWD` is therefore the MAIN CHECKOUT, not the worktree — so it passes
+#        `DISK_GATE_PATH="$WT"` explicitly; `adopt-fix.sh` also cds to `$REPO`, creates `$WT` itself and
+#        then RUNS `fix-one.sh` as a child, so it reaches that explicit path and sets none of its own. On a
 #        cell the two share one volume (the worktree lives under `$REPO/.worktrees`), which is why the
 #        wrong reading stayed invisible; on a box that splits them it would measure a healthy
 #        directory and start the agent onto a full one.
+#     D5b THE HEADROOM GATE ON TOP OF THE FLOOR IS agent-infra-ONLY TOO (agent-infra#2721). A floor
+#        answers "is the filesystem full?"; it cannot answer "does the tree this lane is about to
+#        provision fit?" — cell-4 passed a 500 MB floor with 2,286 MB free on every spawn and still
+#        wedged. `disk_lane_costs` produces THREE numbers: the marginal `tree` and the worst-case `self`
+#        FROM THE TARGET, and the `reserve` from 4x `DISK_MIN_FREE_MB` -- the DISPATCH floor, and
+#        deliberately NOT `DISK_WARN_FREE_MB`, which is a reporting knob an operator lowers to quiet the
+#        logs, so wiring an enforcement bound to it would let a log change loosen admission. The python
+#        markers are looked for at the top level AND one level down, because `uv.lock` alone admitted a
+#        pip/monorepo lane on 1 GB of headroom. `disk_lane_need` is `max(tree, self) + reserve`, and the
+#        refusal is NAMED `DISK-NOHEADROOM` on code 77 with all three terms in the line. A re-port that
+#        keeps `disk_ok` and drops this reads as complete: the floor still refuses, so nothing looks
+#        broken, and the only symptom is a cell that fills one admitted lane at a time.
+#        ⛔ AND CODE 77 NOW MEANS TWO THINGS. `lane.sh`/`fix-one.sh`/`adopt-fix.sh` each print their
+#        own one-liner for 77, and each said "the filesystem is below DISK_MIN_FREE_MB" — a false
+#        cause for the headroom arm, whose whole point is that the floor was MET. They name both.
 #        ⚠️ AND IT DID NOT REACH `merge-one.sh` (agent-infra#1884 CLOSED THAT PATH): that file still
 #        carries its OWN `run_agent()` with no gate of its own, so before #1884 the `chain-<N>`
 #        first-review path was UNGATED. It is now gated at the SPAWN POINT by the `pi` shim below, and

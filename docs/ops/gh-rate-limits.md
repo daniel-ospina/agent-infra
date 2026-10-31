@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2227, gh-rate-limits, gh-limit, issue-2139, issue-2143
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, gh-rate-limits, gh-limit
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -411,6 +411,11 @@ The conditional-GET PASS CACHE has its own three: `GH_LIMIT_PASS_CACHE` (unset/`
 other value enables it — `refresh-candidates.sh` sets it for the sweep), `GH_LIMIT_PASS_CACHE_MAX_ENTRY`
 (4 MiB — the largest single `--include` response it will keep) and `GH_LIMIT_PASS_CACHE_MAX_BYTES`
 (64 MiB — the whole cache's budget); an entry over either bound is simply not cached.
+`GH_LIMIT_PROBE_TIMEOUT` (20 s, clamped 1–120 — the bound on the exempt `/rate_limit` meter probe,
+which runs while the BOX-WIDE LOCK is held; a timeout costs one window with no snapshot, never a
+stalled box), `GH_LIMIT_BUDGET_TTL` (30 s — how long a snapshot is trusted), `GH_LIMIT_CORE_FLOOR`
+(800 — the reserve; `--stats` prints which knob supplied it) and `GH_LIMIT_ESSENTIAL=1` (this read
+cannot be deferred — set on the landing's own reads, per call; **never by a poll**).
 Every knob
 is range-clamped, and `nan`/`inf` fall back to the documented default rather than disabling a bound
 (an `inf` lock timeout would be a hang, a `nan` wait a traceback).
@@ -522,6 +527,431 @@ next move was a raw REST merge — a bypass of the rail rather than of the limit
 shim's retries (above) run first and each re-send is bounded by
 `AGENT_GH_GATE_MAX_ATTEMPTS` × the gh-limit layer's 4, so a call that exhausted both layers
 means the window outlasted that budget.
+
+## The other direction: an EMPTY `core` is served from GraphQL (2026-10-22)
+
+⛔ **The section below is the GraphQL->REST direction. This one is its mirror, and it is the incident
+that exhausted a budget in a single hour.**
+
+MEASURED 2026-10-22 14:03Z, on one account, one identity (`daniel-ospina`), every lane and the merge
+rail sharing it:
+
+```
+core    : 5000 used / 0 remaining,     resets in 12 min
+graphql :  255 used / 4745 remaining
+```
+
+The REST pool was empty and the GraphQL pool was 95% free. Nothing could use it. `repo-authority.sh`
+could not read branch protection, the rail fell back to `REQ_SOURCE=fallback`, every PR was refused
+with "the merge contract is UNKNOWN", and `gh auth status` reported **"the token … is invalid"** —
+three confident diagnoses, all wrong. A budget our own polling spent is indistinguishable, from inside
+a lane, from GitHub being down; the layer's job is to say which one it is.
+
+**Where it lives:** `scripts/orchestrator-harness/gh-limit.py` (the one helper both entry points call)
+and `repo-authority.sh` for the reader that was lying.
+
+### 1. Both budgets, at no cost on the hot path
+
+`--budget` spends **one** `GET /rate_limit` — an endpoint that is **exempt from the primary limit**
+(measured answering normally with `core` at 0) — and records both pools for `GH_LIMIT_BUDGET_TTL`
+(30 s) in `$GH_LIMIT_DIR/budget.json`, under the single-flight lock like every other request. A
+dispatcher about to fan out calls it once; every call it then makes reads the shared snapshot.
+
+```bash
+python3 scripts/orchestrator-harness/gh-limit.py --budget
+# core=0/5000 resets_in=12m graphql=4745/5000 resets_in=22m
+```
+
+⛔ **The per-call path never probes.** The first draft read `/rate_limit` from every `core` call; that is
+one extra request per call site per box, and it made the layer's cost depend on call frequency. The
+layer now learns the budget from exactly two places that already had a reason to ask: the `--budget`
+verb, and the refusal path's own `probe_rate_limit` (which now records *both* pools while it is there).
+The durable `last-limit` record is the third, free, source — so the **first** refused `core` call on any
+lane is the evidence every other lane fails over on, without a request of its own.
+
+### 2. Fail over, only where the answer is EXACT
+
+`graphql_plan()` maps a REST read to a GraphQL query with a **field-for-field REST body encoder**; the
+caller's own `--jq` is then applied to that body exactly as it would be to a real one. Admission is
+`conditional_plan`'s — a plain GET, one positional, no `--paginate`/`-i`/`-H`/`--template` — so a shape
+the layer refuses to intercept can never be failed over either.
+
+| REST read (core) | Served from GraphQL | Notes |
+|---|---|---|
+| `repos/{o}/{r}/pulls/{n}` | ✅ | state, draft, merged, mergeable, title, **body**, head.sha, head.ref, base.sha, base.ref, changed_files, additions, deletions, comments (count), created_at/updated_at/closed_at/merged_at, user, html_url |
+| `repos/{o}/{r}/pulls/{n}/reviews` | ✅ | id, state, body, submitted_at, commit_id, user |
+| `repos/{o}/{r}/issues/{n}/comments` | ✅ | id, body, created_at, html_url, user |
+| `repos/{o}/{r}/branches/{b}/protection[/…]` | ❌ **no equivalent** | GraphQL has no branch-protection query. Refused with the named state. |
+| `repos/{o}/{r}/commits/{sha}/check-runs`, `/status` | ❌ **deliberately absent** | `statusCheckRollup` mixes `CheckRun` and `StatusContext` nodes; a StatusContext has no `check_run` representation, so a synthesized list would silently drop legacy statuses — a red surface that reads green. Fail closed. |
+| any mutation (merge, comment, PATCH) | ❌ never | There is no GraphQL equivalent that IS the same write. (`gh api` mutations are refused by name when `core` is empty; `gh pr merge` is GraphQL-bucketed by `bucket_for`, so it is not gated by the core rule at all — a pre-existing heuristic, stated here rather than implied.) |
+
+⛔ **`merge_commit_sha` IS THE FIELD THAT MUST NOT BE REPRODUCED.** For an **unmerged** PR, REST
+`merge_commit_sha` is the *tentative* test-merge commit and GraphQL's `mergeCommit` is **null** — the
+merge rail's own header says so, and that is precisely why `admin-merge.sh` reads the REST object
+instead of `gh pr view --json mergeCommit`. Serving that name from the GraphQL field made the merge ref
+read `absent` for every open PR, and the rail then BLOCKS with *"no CI run has evaluated the merge of
+this PR into its base"* — a fabricated CI diagnosis, for the whole empty-core window, on the very
+merges the failover exists to keep alive. There is no faithful source, so the projection is refused
+(tests `(g2)`), and the rail's read fails closed on the NAMED state instead of blaming CI.
+
+⛔ **A `--jq` IS REQUIRED FOR A FAILOVER.** A raw body (no projection) carries no evidence about which
+fields the caller will read, and the encoder is a **subset** of a REST pull object — the fleet's own
+adapter (`gh-rest/gh`) projects `labels`, `assignees`, `mergeStateStatus`, so a labelled PR read back
+as `[]` with rc 0. A read with no `--jq` is therefore refused by name on an empty core, never answered
+from a partial body. Serving *a projection we can verify* is the contract; `field-for-field` describes
+the listed fields, not the whole REST object.
+
+⛔ **A `--jq` THAT NAMES A FIELD THE ENCODER DOES NOT PRODUCE IS NOT FAILED OVER.** `jq` prints `null`
+for an absent field **and exits 0**, so a partly-reproduced body is not a near miss — it is an empty
+answer with a success status. Measured in review of this change: `--jq .body` returned `null`/rc 0, and
+`record-review.sh` reads `.body` precisely to tell "the GET failed" from "the body is empty" before it
+PATCHes a PR description. `_projection_ok()` therefore admits a projection only when every name it
+references is reproducible — **dotted, bracketed (`.["body"]`), and with no recursive descent (`..`) or
+shape operator (`keys`, `to_entries`, `getpath`, `paths`, `map_values`, `tojson`)** whose output cannot
+be shown to stay inside the body. Otherwise the read is **not** failed over, and with the pool empty it
+is refused by name. Over-blocking costs a refusal that was coming anyway; under-blocking costs a
+confident wrong answer.
+
+⛔ **THE GATE IS A CLOSED GRAMMAR, NOT A LIST OF FORBIDDEN SPELLINGS — AND THAT IS THE LESSON OF FIVE
+ROUNDS.** Each round closed one jq syntax that reached a field without appearing as a dotted path and
+left the next one open: `.name` → `."name"` → `{name}` → `[.]`/`@json`/`tostring`/`length` →
+`del(.body)` / `.title |= "x"` / `. + {state:.state}` (that last one emitted a 22-key SUBSET with rc 0
+where REST answers 46 keys). A NEGATIVE rule is defeated by the next construct a helpful reader can
+spell; a POSITIVE rule is not. The gate is now a parser over the shapes the fleet actually writes —
+paths, array/object construction, strings with interpolations, parentheses, `//` with a literal,
+`if <path> then <literal> else <literal> end` (what `atomic-land.sh` reads to turn `.merged` into
+MERGED/OPEN, whose refusal made a LANDED PR read as still open for the whole confirmation wait), and the
+`@tsv`/`@csv`/`@base64`/`tostring` filters **applied to a stage** — with three semantic rules on top:
+every key must be one the encoder reproduces, walking THROUGH a container is allowed only into a name that
+container actually carries (`.user.html_url` passed the flat allow-list and answered `null`, because
+`user` reproduces only `login`), and a `[]` that ends an expression is refused (an iteration whose RESULT
+is emitted is an identity read). Anything the parser cannot derive fails closed with the named state. A
+false refusal costs one read that was going to be refused on an empty pool anyway; a false admission
+costs a confident wrong answer with a success status.
+
+**The low-water band is not exhaustion.** `CORE_LOW_WATER` (default 100) moves *reads* to GraphQL so
+the tail of the pool is preserved for **writes** — writes are refused ONLY at `remaining == 0`, and no
+`gh-core-exhausted` record is written while the pool still has headroom (including on the
+failover-FAILURE path, where the honest name is `gh-graphql-unavailable`, not an empty core pool). A
+band that refused writes would preserve a reserve no caller could spend, and would assert "EMPTY"
+about a pool that is not.
+
+**The FLOOR is where reads stop spending the reserve (#2342, 2026-10-23).** The band above was 100
+requests — small enough that it was never reached before the pool was *gone*. Measured 2026-10-23
+04:11Z: one identity (`daniel-ospina`) shared by the Mac, three cells and ~20 lanes read `core
+remaining = 0` **at the same moment**, so every lane lost the ability to read or write GitHub at once.
+The same night's brief recorded what the instruments then did with it: `PR states={None: 23}` followed
+by "cancelled 0 of 69", ten autonomy rows reading `stalled` on boxes at load 3/8 with memory free, and
+a `KeyError: 'data'` that turned a landing count into no number. **A failed read must never be
+representable as a state**, and the pool is spent by POLLING in the last minutes of the window.
+
+* **`GH_LIMIT_CORE_FLOOR` (default 800)** — below it a READ stops spending `core`. Where an EXACT
+  GraphQL equivalent exists it fails over (unchanged, free to the caller); where none exists it is
+  **refused by name** — `gh-core-floor remaining=<n> floor=<800> resets_in=<Nm>`, stdout EMPTY, no
+  request spent — unless the caller declares that the work cannot proceed without it
+  (`GH_LIMIT_ESSENTIAL=1`). The refusal asserts NOTHING about exhaustion (`remaining` is printed and
+  `--health` stays `gh-ok`), and it records itself in `events.log`, because every rail caller passes
+  `2>/dev/null` and a policy that leaves no trace is the "absence reported as a state" failure this
+  whole change is about.
+  * **A BLIND BOX MEASURES.** The floor can only act on a MEASURED `remaining`, and the only non-zero
+    source of one is the shared `budget.json`. The `--budget` verb is not called by any harness
+    script, so a core-only read with no snapshot and no durable record now spends **one exempt
+    `/rate_limit` probe** (under the layer's own lock, re-reading the snapshot inside it, so a burst
+    of lanes costs ONE probe) — otherwise the guard would be a gate that can never fire. A probe that
+    fails is stamped and not retried inside the TTL. A core-only read whose validator is already
+    cached is allowed the same single speculative conditional GET the empty-pool arm allows, so a
+    free `304` is never refused as if it cost quota.
+* **`GH_LIMIT_ESSENTIAL=1`** is the caller's declaration that the work *cannot proceed* without the
+  read. ⛔ IT IS SET **PER CALL**, and there is exactly ONE in-tree declaration:
+  `repo-authority.sh::required_checks` — the protection read, which has no exact GraphQL equivalent
+  and gates every landing — as a command-scoped env assignment
+  (`GH_LIMIT_ESSENTIAL=1 "$gh" api …/protection/required_status_checks`). Without it the floor would
+  refuse the merge contract for the last minutes of every window, `REQ_SOURCE=fallback` would follow,
+  and the rail would print "the merge contract is UNKNOWN" — the misdiagnosis this whole change exists
+  to remove. **A poll is never essential**: if polling were, the reserve would be spent exactly the
+  way the incident spent it.
+  ⛔ **A SCRIPT-SCOPE `export` IS THE DEFECT, NOT A SHORTCUT** (#2342 review, P1). `admin-merge.sh`,
+  `atomic-land.sh` and `record-review.sh` each carried one, and it exempted every `gh` in those
+  scripts — including the `gh run list` FIRST-CHECKS wait this PR measures at 30 of 41 core calls
+  (73 %) in one merge cycle, and `atomic-land.sh::check_count`'s two paginated `check-runs` reads per
+  verify iteration (up to ~1,080 requests, more than the entire 800-request reserve). Their declarations
+  were removed; `gh-core-failover.test.sh` pins both halves (no file-scope `export` anywhere in-tree,
+  the per-call prefix still present). Note what the export did NOT buy a landing: `essential()` has one
+  call site and it is on the NON-mutating arm, so a WRITE is never floor-refused either way — the
+  export only spent the reserve.
+* `GH_LIMIT_CORE_LOW_WATER` still works (the deployed cells and this runbook carried it before);
+  `GH_LIMIT_CORE_FLOOR` is the same number under the name that says what it does, and it wins when
+  both are set.
+* **STATED CONSEQUENCE — during the band, landing SELECTION pauses.** The floor refuses the drain's own
+  classification reads (`gh pr checks`, the REST PR listing) because they are core-only and unbounded
+  per cycle — that per-candidate fan-out is exactly the spend this guard exists to stop (134 core
+  requests per refresh pass; three boxes ≈ 6,030/h against a 5,000/h pool). A lane that is TOLD to
+  land still can: the landing's own **write** is never floor-refused (`essential()` is consulted only
+  on the non-mutating arm) and the ONE read it cannot do without declares itself per call
+  (`repo-authority.sh::required_checks`), so the reserve is spent by the landing it was kept for.
+  The rails' POLLS are deliberately floor-refusable — that spend is what the reserve protects
+  against, and exempting it (as three script-scope exports used to) made the guard unable to fire on
+  its own target. What stops during the band is the sweep picking NEW work, and the rail's polls are
+  refused BY NAME (`gh-core-floor remaining=<n>`). That is a deliberate trade, not an oversight —
+  and its cost is that the drain reads `wait`/`unreadable` for the last ~16 % of each window unless
+  it names the reason. It does not yet:
+  `orch-loop.sh`'s three classification reads send stderr to `2>/dev/null`, so a `gh-core-floor`
+  refusal reaches the cycle as "check surface unreadable or empty" — the incident's own signature.
+  Tracked separately (agent-infra#2448); until it lands, a band-shaped stall must be diagnosed with
+  `gh-limit.py --stats` (`floor=`) and `events.log`'s `pressure: gh-core-floor` line, never from the
+  cycle's wording.
+
+**A REFUSAL IS NEVER “not red”.** `record-review.sh`'s clause-E veto exists to stop a signed `clean`
+being re-bound onto a head whose own checks are failing. It used to read a REFUSED `check-runs` call as
+an EMPTY surface (`2>/dev/null || true` then `[ -n "$raw" ] || return 1`), i.e. as “not red” — the
+fail-open the veto exists to close, and a floor refusal would have made it deterministic for the last
+minutes of every window. The read is now **tri-state**: `0` red, `1` not shown red, `2` the surface
+COULD NOT BE READ — and `2` refuses the carry with its own message. `atomic-land.sh`'s merge
+confirmation got the same treatment: `... || echo OPEN` became a branch on the read's exit status that
+says `UNREADABLE` and quotes the layer's own reason (the old text asserted “the box ran out of budget”
+for a cause it never established — a 404 and a spent pool produced the same sentence).
+
+**The saving is an INSTRUMENT, not a claim.** `gh-limit.py --stats` reads local counters only — no
+request, no credentials — so it answers at the exact moment the budget is gone:
+
+```
+$ … gh-limit.py --stats
+gh-read-cache since=2026-10-23T04:41Z floor=800 (default)
+  pr-list        hit=212    miss=9      ttl=5s
+  run-list       hit=67     miss=8      ttl=10s
+  single-flight  share=41   → coalesced (N lanes, one request)
+  TOTAL          averted=320 → gh requests this box did not send (served hits + successful coalesces)
+```
+
+Every TTL hit and every **successful** single-flight share is one request the box did NOT send;
+`averted` is their sum. A shared FAILURE is not counted: a refusal that 25 lanes coalesce into would
+otherwise report `averted=24` at the exact moment nothing was served and nothing was saved — the
+instrument reading best during the incident it exists to measure. An **empty** counter prints
+`gh-read-cache no-reads-counted`, never `averted=0`, and an unreadable one prints
+`gh-read-cache UNREADABLE <path> (<reason>)` — a measurement nobody made is the defect this file exists
+to prevent, not the format of the report. Counters are appended as one JSON line per event
+(`O_APPEND`, so concurrent lanes cannot lose each other's counts), folded into a cumulative carry at
+1 MiB (so `averted` can never go DOWN after a rotation), and `floor=` names WHICH knob set the floor —
+a stale legacy `GH_LIMIT_CORE_LOW_WATER=100` on a deployed cell would otherwise shadow the 800 default
+silently.
+
+**Why the TTLs are 5 s / 10 s and `gh pr checks` is NOT cached — the contradiction test (#2342).**
+The 2026-10-23 brief proposed `pr-list 60 s`, `checks 30 s`, `issue 120 s`. Two are declined on the
+record, and the reason is MEASURED rather than preferred: a check-run answer and a head sha **are the
+merge decision**, and both flip on the SAME head. `gh pr checks` went `SUCCESS` → `PENDING` between two
+reads 1 s apart (a re-run), and two `pr view` reads 1 s apart across a head flip both returned the OLD
+sha from one request. A TTL there does not make an answer older — it makes it **wrong in the direction
+that authorises a landing that must not happen**, because the other merge path in the fleet does not
+pin `--match-head-commit`. The hot poll the brief identified is real (30 of 41 calls in one measured
+merge cycle, 73 %), but it is `run list` + `jobs`, i.e. run STATE, and that IS cached at 10 s.
+Concurrent identical check reads are still coalesced by single flight, so 25 lanes asking within one
+second send ONE request and every one of them gets an answer that is fresh by construction — which is
+what the brief's "same freshness, a fraction of the calls" asks for.
+
+**A refusal we could not DATE is still evidence, for a bounded window.** A core call refused without a
+reset (no `--include` framing, and every `GH_LIMIT_NO_WAIT` caller skips the probe) is recorded as
+`gh-core-exhausted resets_in=?`, and it is honoured for `GH_LIMIT_HEALTH_UNKNOWN_WINDOW` (900 s) from
+its own `at=`. Deriving "healthy" from `reset == 0` made `--health` say `gh-ok` while the pool was
+spent and nothing failed over (test `(h2)`).
+
+⛔ **A GAIN, NOT A LAUNDER.** Servings are recorded in `events.log` as
+`failover: gh-core-exhausted resets_in=4m (core remaining=0) — serving \`gh api …\` from the GraphQL pool`.
+A **live** line, produced by this head against the real API (2026-10-22 17:24Z, `GH_LIMIT_CORE_LOW_WATER=4900`
+to enter the band, PR agent-infra#1818):
+
+```
+1792689889 failover: core remaining=4490 reset=1792692989 — serving
+             `gh api repos/daniel-ospina/agent-infra/pulls/1818` from the GraphQL pool
+1792689890 failover: served `gh api repos/daniel-ospina/agent-infra/pulls/1818` from GraphQL (core still exhausted)
+$ … --jq '{state,head:.head.sha,mergeable}'
+{"head":"69010c198098fe536b036c40c050a40cda0befcb","mergeable":null,"state":"closed"}   rc=0
+```
+
+⛔ **THESE ARE THE ONLY TWO SHAPES THE LAYER WRITES**, and a quote that mixes them is a quote of a line
+this code cannot produce (found in review: an earlier draft of this paragraph showed
+`gh-core-exhausted resets_in=4m (core remaining=0) — serving …`, which is neither branch). When the
+emptiness has a PHRASE (`gh-core-exhausted …`) the log says so and omits the counts; on the band path it
+prints `core remaining=<n> reset=<epoch>` instead. Read `events.log`, never a transcription of it.
+
+### 3. The TTL read cache (a companion to single flight)
+
+Single flight (#2243) collapses **concurrent** duplicates; it shares only a result that completed after
+the caller arrived, so N lanes asking one question a minute apart still make N requests. A TTL cache
+admitted **per query class** removes those: `pr-list` 5 s and `run-list` 10 s. An **unlisted shape is
+never cached — there is deliberately no default**. Only a **success** is stored.
+`GH_LIMIT_READ_CACHE=0` disables it.
+
+⛔ **NOTHING THAT CARRIES A MERGE DECISION IS CACHED — NOT THE CHECK SURFACE, NOT THE HEAD.** Both were
+10 s classes until review measured what they cost:
+
+* `gh pr checks` — `merge-one.sh` computes its gate from `gh pr checks --json name,state`, breaks on
+  `SUCCESS`, and the merge it then issues carries no `--match-head-commit`, while the cache key has no
+  head sha in it. A 10 s window could serve the PREVIOUS head's `SUCCESS` to a PR whose new head was
+  already `PENDING` (measured: two reads a second apart across exactly that flip both returned `SUCCESS`
+  on ONE request).
+* `gh pr view --json headRefOid` — the head the review evidence and the signed marker are bound to
+  (`record-review.sh`: `@ <head>`), re-read through this same cache. On the rail a stale head is refused
+  by GitHub (`--match-head-commit`); on the other merge path the merge is UNPINNED, so nothing
+  re-validates it — a stale entry parks a reviewed PR or accepts the previous head's marker while the
+  merge lands the live head (measured: two reads 1 s apart across a head flip both returned the old sha
+  on ONE request).
+
+**Concurrent** identical reads of those shapes are still coalesced by single flight — the
+25-lanes-one-call property the incident asks for — without ever handing a later caller an older answer.
+What a TTL may hold is an answer that is not a verdict: a board LISTING and a run-state POLL.
+
+⛔ **THE CACHE COVERS THE SUBCOMMAND (GRAPHQL) SURFACE ONLY, AND THAT BOUNDARY IS THE SAFETY ARGUMENT.**
+`gh api` is excluded outright — not an omission:
+- it already HAS a validator: `conditional_fetch` returns the server-confirmed body on change and costs
+  **no quota** on a `304`, so a TTL entry there is strictly staler and unvalidated;
+- `record-review.sh` and `atomic-land.sh` READ `pulls/{n}`'s `.body` and PATCH it back **whole**, so a
+  10 s stale body is a LOST UPDATE — lane A's marker, or a human's edit, silently gone with both lanes
+  exiting 0 (found and reproduced in review round 5);
+- `admin-merge.sh` reads `commits/…/status` for a merge DECISION, where a 10 s window can miss a
+  just-landed red.
+
+Tests `(c)`/`(c1)`/`(c2)`/`(c3b)`/`(c4)` pin the boundary in both directions: five identical `gh pr
+view` calls cost one request, while two `.body` reads cost two **even with `GH_LIMIT_CONDITIONAL=0`**.
+
+⛔ **`run-list` is in the list because it was MEASURED, not because it seemed reasonable** — see the
+budget arithmetic below: 30 of the 41 calls in one merge cycle were a single FIRST-CHECKS poll loop
+issuing byte-identical argv 16 times against data that changed zero times.
+
+⛔ **A CLASS WHOSE ANSWER IS A DECISION DOES NOT GET A TTL, AND THIS WAS LEARNED THE HARD WAY.**
+`pr checks` carried a 10 s class until review measured what that costs: it *authorises* a merge
+(`merge-one.sh` computes its gate from `gh pr checks --json name,state`, then merges unpinned), the key
+has no head sha, and two reads a second apart across a SUCCESS→PENDING flip both returned SUCCESS on one
+request. The “GitHub refuses a merge whose required checks are not green” argument does not save it — the
+decision is made from the read, not re-validated against a head. `pr-state` fell the same way a round
+later for the same reason: on the unpinned merge path nothing re-reads the head, and the review recorder
+binds its evidence to the head it read. Both are **not** classes any more; concurrent reads are still
+coalesced by single flight, which is the 25-lanes-one-call property this change is for, and no later
+caller is ever handed an older answer. What a TTL may hold is a shape that is not a verdict: the board
+listing, and the run-state poll (a stale run state only delays the next poll). Any future class must
+state that argument for itself; an unlisted shape is never cached, and `READ_UNCACHEABLE_FLAGS` refuses a
+shape that frames or reshapes the output (`--paginate` returns one page per invocation, so a replay
+answers a different question).
+
+### 4. The named state (what a lane should SAY)
+
+```bash
+python3 scripts/orchestrator-harness/gh-limit.py --health
+# gh-core-exhausted resets_in=12m     (exit 3)
+# gh-ok                              (exit 0)
+```
+
+It reads **local state only** — no request, no credentials, no quota — which is what makes it usable at
+exactly the moment every `gh` call is being refused, and it is age-bounded — by the record's own reset
+when the reset is known, and by `GH_LIMIT_HEALTH_UNKNOWN_WINDOW` (900 s) for an UNDATED record, which is
+printed as `resets_in=?` rather than a number nobody measured — so a closed window cannot keep asserting
+itself. It also **agrees with the layer's own decision**: a fresh shared meter snapshot (the `--budget`
+probe) outranks the durable record in both directions, so `core=0` from the meter is named even before
+any call has been refused, and a meter with headroom is not contradicted by a stale record. The
+low-water **band** is not exhaustion and is reported as `gh-ok`. `repo-authority.sh` repeats the token
+verbatim instead of
+reporting an unreadable contract as if the repo were broken. A `core` refusion from the helper carries
+the same token **and** keeps the words `rate limit`, because `objective.py`'s `TRANSPORT_MARKERS` turn
+that phrase into `VERDICT=GH-RATE-LIMITED`.
+
+⛔ **AND A `304` IS NOT A SUCCESSFUL CORE CALL.** It is exempt from the primary limit by design, so it
+is not evidence that the pool recovered — the same rule that keeps `api rate_limit` out of
+`makes_request()`. Counting it as one unlinked the health record and annotated `last-limit`
+`recovered=`, after which no lane on the box failed over and `--health` reported `gh-ok` on a spent
+pool: the 2026-10-22 misdiagnosis, restored by the one optimisation that is supposed to be free
+(test `(l)`).
+
+⛔ **THE SECONDARY LIMIT HAS ITS OWN TOKEN, AND IT IS NOT EXHAUSTION.** A burst/concurrency refusal
+arrives as a 403/429 in the same shape as a primary one, but its `x-ratelimit-remaining` is **above
+zero** — so it is named `gh-secondary-rate-limited remaining=<n>`, and it never gates a write. The one
+shape that DOES leave a health record is a refusal that carried **no** remaining counter at all: absent
+is UNKNOWN, not zero, so the record is written **undated** (`remaining=? reset=0`), which diverts reads
+but may not refuse a write (see the next rule, and test `(k2)`). Without that distinction a transient
+burst froze every merge/comment/PATCH on
+the box for up to an hour and told the operator the pool was empty while thousands of requests were
+left. The durable `last-limit` record carries `remaining=` for the same reason.
+
+⛔ **DATED EVIDENCE MAY REFUSE; UNDATED EVIDENCE MAY ONLY DIVERT.** A record whose reset is known is a
+measurement, and it may refuse a read outright. A record written from a refusal that carried **no**
+reset cannot say when the window ends, so it may only *divert* a read to GraphQL — never refuse one —
+and it expires on its own after `GH_LIMIT_HEALTH_UNKNOWN_WINDOW` (900 s). Two failures are pinned here:
+the window a reader *invents* must never be written back as if it were observed (that turned one
+headerless refusal into "core empty until T+15m" with no way to clear it, because the only cure is a
+successful core call and none was being attempted), and `--health` must not report `gh-ok` from a
+`reset=0` record.
+
+⛔ **THE EVIDENCE IS THREE FILES AND NONE OF THEM MAY BE CLOBBERED BY ANOTHER BUCKET'S NEWS.**
+`last-limit` holds ONE record per box (pre-existing design), so a GraphQL refusal overwrites the `core`
+observation — and the health record, which is keyed to `core` explicitly, is what keeps the window
+alive afterwards (`health_reset()`). Two measured consequences of getting this wrong, both fixed and
+pinned by tests `(h)`/`(i)`: a both-pools refusal made `--health` say `gh-ok` (the state vanishing
+exactly when it was worst), and a GraphQL-served read annotated the **core** record `recovered=`
+(destroying the free evidence the failover runs on, and making the heartbeat print
+`gh=recovered(bucket=core …)` for a pool that was still refusing calls). A GraphQL success now records
+recovery for `graphql`, and only a real `core` success clears `gh-core-exhausted`.
+
+### What this does NOT fix
+
+- **The secondary (concurrency) limit is shared across REST and GraphQL.** Switching pools moves the
+  request, not the refusal. Pacing (`gh-shim`, the box lock) is the answer to that one.
+- **Reads are conserved, not free.** A failover read still spends GraphQL quota; if BOTH pools are
+  empty the named state is all that is left, and it fails closed (test `(b)`).
+- **`check-runs`, branch protection and `merge_commit_sha` still cannot be read from an empty core.**
+  They fail closed with the name; they do not degrade.
+- **A FRESH meter outranks a durable record.** If `/rate_limit` reports headroom while calls are being
+  refused — the measured "lying meter" of #1988 (`4999/5000` beside every GraphQL call refused) — then
+  `core_pressure()` trusts the fresh snapshot and does NOT fail over for up to `GH_LIMIT_BUDGET_TTL`.
+  The record is deliberately subordinate to a newer measurement; the cost of being wrong is a window of
+  refused reads, not a wrong answer.
+- **A degraded state dir splits the two readers.** `repo-authority.sh` reads only the primary state
+  dir, while `gh-limit.py` falls back to `$TMPDIR/gh-limit-<uid>`; in that state both say nothing rather
+  than disagree, and the `--health` verb is the one that still answers.
+
+### Where the budget actually goes (measured, not estimated)
+
+⛔ **One merge cycle, counted end to end** (2026-10-22, PR 9134, `--dry-run`, a counting pass-through in
+front of the real `gh`):
+
+| | count |
+|---|---|
+| total `gh` invocations | **41** |
+| `REQ_SOURCE`/core-bucket invocations | **38** |
+| GraphQL invocations (`gh pr view`) | 3 |
+| `--paginate` invocations (each page is another request, so the true draw is HIGHER) | 16 |
+| **of which one FIRST-CHECKS poll loop** (`run list` + `jobs?per_page=100`) | **30 (73 %)** |
+
+That is a **blocked** cycle — the rail stopped at its lane precondition, so the merge itself, the
+evidence comment, the CI re-run and the base-suite reads are NOT in it. **41 is a floor.**
+
+The loop is the duplication: 15 iterations at 10 s each, **two** invocations per iteration, and
+`run list` ran with byte-identical argv **16 times** against data that had not changed once in 150 s.
+The TTL cache now covers `run list`.
+
+⛔ **MEASURED AGAIN AFTER THE CACHE LANDED, AND THE HONEST NUMBER IS SMALLER THAN “COVERS IT”.** One
+lane's blocked FIRST-CHECKS wait was re-run through this layer with a counting pass-through in front of
+the real `gh` (2026-10-22 17:30Z, PR 2336, `--dry-run --no-rerun`, 700 s): **89 sends, of which 71
+(80 %) were the same byte-identical `run list`** — roughly 1:1, because the loop's cadence and the
+`run-list` TTL are BOTH 10 s, so the next poll lands just after the entry expires. The saving here is
+therefore **cross-lane, not per-lane**: several lanes asking inside the same 10 s window share one call
+(that is the coalescing the incident asks for), while a single lane polling at the TTL's own cadence
+gets almost none. The lever that lowers *this* number is the loop's cadence or its argv, not the
+cache — raising the TTL above the cadence would buy ~half of it back at the price of delaying the
+detection of a finished run by up to one interval. Stated, not tuned. The `--paginate` half is
+deliberately not cached and remains a per-iteration request.
+
+⛔ **And the merge rail is not the main consumer.** A refresh pass is measured in this repo at **134
+core requests**, of which **72 (54 %)** are the same three fleet-wide answers asked once per candidate.
+At the shipped 240 s cycle (`CYC:-240`) a single box runs that pass **15×/hour**:
+
+```
+134 core/pass × 15 passes/h  = 2,010 core/h  per box
+                             → 2 boxes  ≈ 4,020/h   (under 5,000)
+                             → 3 boxes  ≈ 6,030/h   (OVER — the pool dies before the hour does)
+```
+
+with ~11 live lanes measured on one box (38 core per merge cycle each). So the pool is spent by
+**polling**, in two places: the per-candidate refresh fan-out and the per-iteration check poll. The
+failover and the cache make that spend survivable; they do not make it free — the duplication in those
+two loops is the lever that actually lowers it.
 
 ## Fallback: REST for the operations gh uses GraphQL for
 
