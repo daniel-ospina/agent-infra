@@ -46,6 +46,17 @@ elif [ "$rc" = "71" ]; then
   # LINE — a run that did nothing, silently. Waiting does not clear it, so it must not be folded into
   # the load arm above.
   echo "[adopt-fix $PR] fixer NOT started (CAPABILITY gate) — this box could not complete one model call and RETURN (#2935); see the [capability-gate] REFUSED line in $O/logs/fix-$PR.log for which reading refused. Waiting will not clear it: repair the box (installed pi/extension set, provider credential) or dispatch the PR elsewhere." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "81" ]; then
+  # ⛔ THE HARNESS-SKEW REFUSAL IS THE ONE THIS SCRIPT COULD NOT NAME EITHER (follow-up review of
+  # #2991, P1/P2), and it is the SAME defect the 71 arm above documents, one code later: `fix-one.sh`
+  # propagates the gate's OWN code, so the new 81 arrived here with no arm, matched no `elif`, fell to
+  # `exit "$rc"` and wrote NO LINE into `adopt-$PR.log` — a run that did nothing, silently, on the
+  # page an operator reads (#1720). It is also why the fixer's own `[capability-gate] REFUSED` line in
+  # `fix-$PR.log` is not enough: that is not the log this script exists to fill.
+  # The remedy is NOT the capability arm's: a box that cannot complete a call is repaired here or the
+  # item moves to a peer, while a skewed helper PAIR is identical everywhere, so handing the PR to
+  # another box only circulates it. Sync the pair and re-run.
+  echo "[adopt-fix $PR] fixer NOT started (HARNESS/MISMATCH gate) — the caller and the deployed cell-lane-preflight.sh DISAGREE (version skew or a corrupt/truncated copy), which is a property of the helper PAIR and not of this box: nothing was pushed, no attempt was consumed, and dispatching the PR to another box would refuse identically. Repair: cp scripts/orchestrator-harness/*.sh \$O/ on EVERY box that dispatches, then re-run. The reading that refused is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "72" ]; then
   # A worktree that exists but is the wrong repo (or a branch the target repo does not have) is
   # refused by fix-one.sh with 72. Name it in the log the manual operator reads (#1720/#2694).
