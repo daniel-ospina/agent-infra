@@ -29,13 +29,25 @@
 #   "a dated failure". The moment the classifier lands, this timer starts producing with no
 #   re-install.
 #
+# ⛔ WHAT A TIMER CAN AND CANNOT DO HERE (2026-10-31, review). It cannot MEASURE on a host that
+#   authorises cmux by ancestry. `lane-status.py` enumerates the fleet through the `cmux` CLI, and
+#   cmux refuses any process it did not start -- "Access denied - only processes started inside cmux
+#   can connect"; `live-workspaces-publisher.py:11-13` calls launchd "the ONE context that can never
+#   be authorized", and docs/ops/fleet-liveness.md:561 records the same. So on macOS this unit is a
+#   CANARY: it runs, it detects the refusal, and it exits 4 naming ANCESTRY rather than blaming the
+#   renderer. The producing context is a cmux descendant (the controller loop / an orchestrator
+#   workspace). Installing the unit is still right -- an arm that reports "I cannot measure here, and
+#   here is why" every 30 minutes is the opposite of the failure this PR removes.
+#
 # SCHEDULED COST (stated, because cell-3 runs 8 GB / ~4.8 GB free / ~54 % swap):
 #   The pass is one `lane-status.py` sample (its own budget bounds it) plus one `lane-actions.py`
 #   render against that snapshot (`--stdin`, so it never re-samples). Measured on the mac:
-#   ~170-280 s wall and ~40-60 s CPU for 15-27 lanes, i.e. a few percent of one core for a few
-#   minutes. Interval below is 30 min, so the duty cycle stays well under 1 %. When the classifier
-#   is ABSENT the pass costs ~0.1 s (it fails before sampling) -- a cell cannot be made slower by
-#   this timer being installed before the classifier is.
+#   ~170-280 s wall and ~40-60 s CPU for 15-27 lanes. Over the 1800 s interval below that is a
+#   duty cycle of ~2.2-3.3 % of ONE core (40-60 s per 1800 s) -- a few percent, NOT "well under 1 %",
+#   which is what an earlier revision of this comment claimed while sitting next to the correct
+#   figure. Quote the ratio, not a reassuring adjective. When the classifier is ABSENT the pass costs
+#   ~0.1 s (it fails before sampling) -- a cell cannot be made slower by this timer being installed
+#   before the classifier is.
 #
 # Usage:
 #   install-lane-arm-timer.sh [--install] [--dry-run] [--uninstall] [--status] [--help]
@@ -238,9 +250,24 @@ if [ "$VERB" = uninstall ]; then
       say "uninstalled ${LABEL}.timer"
       ;;
     macos)
-      "$LAUNCHCTL" bootout "gui/$(id -u)/com.eldato.lane-arm" 2>/dev/null || true
-      rm -f "$HOME/Library/LaunchAgents/com.eldato.lane-arm.plist"
-      say "uninstalled com.eldato.lane-arm"
+      # ⛔ VERIFY, NEVER THE SEND -- the same rule the Linux branch above spells out. `bootout` is
+      # `|| true`'d (the label may legitimately be absent), so claiming removal unconditionally is
+      # how a job that is STILL loaded keeps firing every ${INTERVAL}s while the operator is told it
+      # stopped. The install path itself admits a legacy `launchctl load` fallback, so "gone from gui/"
+      # is not the same question as "gone".
+      # ⛔ THE macOS LABEL IS NOT $LABEL: $LABEL is the systemd unit name (`eldato-lane-arm`) and the
+      # plist label is `com.eldato.lane-arm` (see the plist above and the install path below). Using
+      # $LABEL here would both bootout the WRONG label and then fail to find the plist it just left.
+      ML="com.eldato.lane-arm"
+      P="$HOME/Library/LaunchAgents/${ML}.plist"
+      "$LAUNCHCTL" bootout "gui/$(id -u)/${ML}" 2>/dev/null || true
+      "$LAUNCHCTL" bootout "user/$(id -u)/${ML}" 2>/dev/null || true
+      rm -f "$P" 2>/dev/null || true
+      _still="$("$LAUNCHCTL" list 2>/dev/null | grep -F "$ML" || true)"
+      if [ -n "$_still" ] || [ -e "$P" ]; then
+        fail "removal reported but ${ML} is STILL present -- not uninstalled. Still loaded as: ${_still:-<none listed>} ; plist present: $([ -e "$P" ] && echo yes || echo no)"
+      fi
+      say "uninstalled ${ML} (verified absent from launchctl and LaunchAgents)"
       ;;
     *) fail "unsupported platform $(uname -s)" ;;
   esac
