@@ -27,6 +27,16 @@
 #     `if-none-match` next time; a `304 Not Modified` does not count against the primary limit, so
 #     a poll that changes nothing costs nothing. (GraphQL has no ETag — that is why this layer
 #     targets `gh api`, and why the sweeps moved to REST.)
+#   * FAIL OVER, IN BOTH DIRECTIONS. The REST adapter beside this file serves a GRAPHQL refusal over
+#     REST (#1959). This file adds the other direction — the one that took the fleet down on
+#     2026-10-22: `core: 5000 used / 0 remaining` beside `graphql: 4769 remaining`. The pools are
+#     separate, so an exhausted `core` still has real headroom, and a read with an exact GraphQL
+#     equivalent is served from it instead of waiting out a 12-minute reset. A read with NO exact
+#     equivalent (branch protection has none) is REFUSED with a NAME, never answered empty.
+#   * NAME THE STATE A LANE SHOULD SAY. `gh-core-exhausted resets_in=12m` replaces the sentence that
+#     reads like a broken repository (“the token is invalid”, “branch protection UNREADABLE”). A
+#     budget that OUR OWN polling spent is indistinguishable, from inside a lane, from GitHub being
+#     down — so the layer says which one it is, in one token a caller can print verbatim.
 #
 # ⛔ ACCOUNT SCOPE, NOT BOX SCOPE (agent-infra#2137). The two remedies above bound what THIS BOX
 # sends; they do not bound what the ACCOUNT sends. Four boxes acting as ONE account share ONE pair of
@@ -554,8 +564,23 @@ def log_event(line):
 
 
 # ── single flight ───────────────────────────────────────────────────────────────────────────────
-def acquire_lock():
+# ⛔ THIS PROCESS'S CUMULATIVE LOCK WAIT. `NO_WAIT` bounds the time a bounded caller may spend in the
+# lock queue for the WHOLE call, not per acquire: `_dispatch` takes the lock twice on the floor path
+# (the exempt meter probe, then the call), and a per-acquire budget made that two budgets. Read and
+# written only by `acquire_lock`, reset never — a process is one call.
+_LOCK_WAIT_SPENT = [0.0]
+
+
+def acquire_lock(strict=False):
     """One gh call in flight per box. Returns the fd to hold (or None when re-entrant/unavailable).
+
+    ⛔ `strict=True` IS FOR THE METER PROBES ONLY (#2342 review P1). The permissive path deliberately
+    PROCEEDS UNSERIALISED once its bound expires — that is right for an ordinary call, whose caller
+    would otherwise be killed inside the layer — but it returns a real fd anyway, so `if lock is None`
+    never fires for contention. A probe that rides the permissive path therefore issues a request the
+    file says it never issues unserialised, past the very bound NO_WAIT exists to keep. In strict mode
+    a wait that expires (or a lock this process cannot use) returns None, and the caller skips the
+    request entirely: no snapshot is a legitimate answer, an unserialised meter call is not.
 
     `flock` is a KERNEL lock, so a holder that dies (killed worker, crashed lane) releases it —
     there is no stale-lock state to reap. `flock(1)` is NOT portable to macOS, which is why this
@@ -577,11 +602,22 @@ def acquire_lock():
     # its own subprocess bound (the heartbeat's 90 s refresh), so a busy box turned a rate-limit
     # verdict into a silent timeout — the same non-goal, reached from the lock. Proceed UNSERIALISED
     # after NO_WAIT_LOCK_S and say so, rather than being killed mid-wait with no record at all.
+    #
+    # ⛔ AND THE NO_WAIT BUDGET IS PER PROCESS, NOT PER ACQUIRE (#2342 review, the merge regression).
+    # `_dispatch` takes this lock TWICE on the floor path — once for the exempt meter probe and once
+    # for the call itself — so a per-acquire budget DOUBLED the wait a bounded caller imposed on
+    # itself (measured: 2 x NO_WAIT_LOCK_S = 10 s, against a suite bound of `<= 10` s and against every
+    # caller that budgeted one 5 s wait). The second acquire sees what the first one spent: a caller
+    # whose lock budget is gone proceeds UNSERIALISED AT ONCE (the same documented fallback) instead of
+    # paying the budget again.
     budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT else LOCK_TIMEOUT
-    deadline = time.monotonic() + budget      # real monotonic: the fake clock is for BACKOFF
+    budget = max(0.0, budget - _LOCK_WAIT_SPENT[0])
+    _wait_start = time.monotonic()
+    deadline = _wait_start + budget           # real monotonic: the fake clock is for BACKOFF
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _LOCK_WAIT_SPENT[0] += time.monotonic() - _wait_start
             break
         except OSError as exc:
             if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
@@ -589,12 +625,26 @@ def acquire_lock():
                 # filesystem without flock — SMB/CIFS, some FUSE mounts) would spin here for the full
                 # LOCK_TIMEOUT on EVERY gh call and then proceed unserialised anyway: a 10-minute
                 # stall on the box that looks like a slow network.
+                _LOCK_WAIT_SPENT[0] += time.monotonic() - _wait_start
                 log_event("WARNING gh.lock unusable (%s) — proceeding UNSERIALISED" % exc)
+                if strict:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return None
                 break
             if time.monotonic() >= deadline:
                 # Bounded, and announced in the evidence log rather than blocking for ever: an
                 # unbounded wait behind one slow gh call would park the whole box's merge sweep.
+                _LOCK_WAIT_SPENT[0] += time.monotonic() - _wait_start
                 log_event("WARNING gh.lock not acquired within %ds — proceeding UNSERIALISED" % int(budget))
+                if strict:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return None            # strict callers must NOT issue an unserialised request
                 break
             time.sleep(0.02)
     os.set_inheritable(fd, False)
@@ -839,6 +889,17 @@ MUTATING_PAIRS = {
     ("issue", "reopen"), ("run", "rerun"), ("run", "cancel"), ("release", "create"),
     ("release", "edit"), ("release", "delete"), ("label", "create"), ("label", "edit"),
     ("label", "delete"), ("repo", "edit"), ("workflow", "run"),
+    # ⛔ A WRITE THE TABLE DID NOT KNOW WAS A WRITE. These reached the READ branch, so the refusal told the
+    # operator “this READ has no exact GraphQL equivalent” about a mutation — the diagnostic falsehood this
+    # file exists to remove — and they were not PACED, because pacing keys on the same predicate. The
+    # safety outcome was right (refused, nothing spent); the one line a human reads was wrong (round 7).
+    ("secret", "set"), ("secret", "delete"), ("variable", "set"), ("variable", "delete"),
+    ("cache", "delete"), ("gist", "create"), ("gist", "delete"), ("gist", "edit"),
+    ("codespace", "create"), ("codespace", "delete"), ("codespace", "stop"),
+    ("ruleset", "create"), ("ruleset", "edit"), ("ruleset", "delete"),
+    ("ssh-key", "add"), ("ssh-key", "delete"), ("gpg-key", "add"), ("gpg-key", "delete"),
+    ("repo", "create"), ("repo", "delete"), ("repo", "fork"), ("repo", "rename"),
+    ("repo", "archive"), ("repo", "sync"), ("repo", "unarchive"),
 }
 METHOD_FLAGS = ("-X", "--method")
 DATA_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
@@ -948,11 +1009,20 @@ class Result(object):
         self.rc, self.out, self.err, self.status = rc, out, err, status
 
 
-def run(real_gh, argv, extra=None):
+def run(real_gh, argv, extra=None, timeout=None):
     cmd = [real_gh] + list(argv) + list(extra or [])
     env = dict(os.environ)
     env[REENTRANCY_ENV] = "1"       # a gh child that re-enters this helper must not deadlock on our lock
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # ⛔ A BOUNDED CALLER MUST NOT BE HELD BY AN UNBOUNDED ONE (#2342 review P2). The meter probe
+        # runs while the box-wide LOCK is held, so a stalled `/rate_limit` (a proxy black hole, a TLS
+        # stall) would otherwise park every gh call on the box — including the landing rail's own —
+        # for the whole `GH_LIMIT_LOCK_TIMEOUT` and then de-serialise the box. A timeout is a FAILED
+        # call (rc 124, `timeout`'s own code), which every caller already treats as "no measurement".
+        return Result(124, b"", ("gh-limit: the call did not finish within %ss\n" % timeout).encode())
     return Result(p.returncode, p.stdout, p.stderr)
 
 
@@ -961,10 +1031,17 @@ def run(real_gh, argv, extra=None):
 # re-create by hand — `--paginate`, `--template`, `-H`, `-f`, a non-GET method — is left COMPLETELY
 # alone: adding a conditional header to a call whose response we cannot reproduce is not a slow
 # answer, it is a wrong one (the rule the REST adapter beside this file states for flags).
-def conditional_plan(argv):
+def conditional_plan(argv, honour_kill_switch=True):
+    """The parsed shape of a plain GET `gh api <path>`, or None when this layer must not touch it.
+
+    ⛔ THE PARSE AND THE TRANSPORT SWITCH ARE SEPARATE ON PURPOSE. `GH_LIMIT_CONDITIONAL=0` disables
+    the ETag/`--include` round trip; it must NOT also disable the GraphQL failover, which needs the
+    same parse and nothing else. Coupling them meant an operator turning off one optimisation lost
+    the other — and the failover is the one that keeps merges readable at 2am. Every safety refusal
+    below still applies to both transports."""
     if not argv or argv[0] != "api":
         return None
-    if os.environ.get("GH_LIMIT_CONDITIONAL", "1") == "0":
+    if honour_kill_switch and os.environ.get("GH_LIMIT_CONDITIONAL", "1") == "0":
         return None
     path = None
     jq = None
@@ -1394,6 +1471,12 @@ API_VALUE_FLAGS = frozenset(METHOD_FLAGS) | frozenset(DATA_FLAGS) | frozenset({
 })
 API_BARE_FLAGS = frozenset({
     "-i", "--include", "--paginate", "--slurp", "--silent", "--silent-errors", "--verbose",
+    # a real `gh api` flag in 2.102.0 (`gh api --allow-escape-sequences` answers “accepts 1 arg(s),
+    # received 0”, i.e. it parses). Absent from this vocabulary it made `api_endpoint` answer None,
+    # which made `makes_request` answer “no API request” and SKIPPED the write guard entirely — one
+    # request into a measured-empty pool, and the headerless refusal then rewrote the dated record as
+    # undated, after which every known-spelling write was sent too (measured, round 9).
+    "--allow-escape-sequences",
 })
 
 
@@ -1436,6 +1519,16 @@ def api_endpoint(gh_argv):
                 continue
             return None                     # an unknown flag: we cannot say what the next token is
         if a.startswith("-"):
+            # ⛔ AN ATTACHED DATA FLAG (`-fbody=x`, `-Fbody=x`) IS A VALUE-BEARING FLAG, NOT THE ENDPOINT —
+            # `_data_flag_value` already knows the spelling, and returning None here made
+            # `makes_request()` answer “this call makes no API request”, which SKIPPED the core-budget
+            # guard entirely: `gh api -fbody=x repos/o/r/issues` (a POST, because a field implies it) was
+            # sent into a pool measured at zero and retried to the attempt cap — 7 requests and 439 s —
+            # while the same call with the flag AFTER the endpoint spent nothing (measured, round 8).
+            _is_data, _ = _data_flag_value(a)
+            if _is_data and "=" in a:
+                i += 1
+                continue
             return None
         return a
     return None
@@ -2004,6 +2097,12 @@ def single_flight(real_gh, gh_argv):
             # a cache entry, and this is not a cache: handing one out as current is the exact failure
             # #2243 clause 5 forbids.
             log_event("single-flight: shared the in-flight answer for `%s` (rc=%d)" % (res["request"], res["rc"]))
+            if res["rc"] == 0:
+                # ⛔ A SHARED **FAILURE** IS NOT AN AVERTED REQUEST (review P2). Counting every share
+                # made the instrument read BEST during the incident it exists to measure: a refusal
+                # shared by 25 lanes reported `averted=24` while nothing was served and nothing was
+                # saved. Only a SERVED share is one request the box did not send.
+                stats_record("single-flight", "share")
             return res["rc"], res["out"], res["err"]
         leader = _read_json(leader_path)
         # ⛔ A MISSING CLAIM IS NOT A STALE ONE. `_leader_stale(None, …)` answers True for an absent
@@ -2085,11 +2184,443 @@ def single_flight(real_gh, gh_argv):
         time.sleep(FLIGHT_POLL_S)
 
 
+# ── READ CACHE: a TTL per query class, for facts a merge can survive being seconds old ─────────
+# WHY, ON TOP OF SINGLE FLIGHT (#2243). Single flight removes the DUPLICATE call; it deliberately
+# shares only a result that COMPLETED AFTER the caller arrived, so N lanes that ask the same question
+# a minute apart still make N requests. Measured 2026-10-22: the fleet spent the account's whole REST
+# pool (5000/h) on polls whose answers had not changed — a PR's head sha, its required checks, its
+# comments — while `/rate_limit` answered `core: 0 remaining` and GraphQL still held 4769.
+#
+# ⛔ THIS IS NOT THE FLIGHT PATH'S STALE-SERVE, AND THE DIFFERENCE IS THE POINT. `FLIGHT_STALE_SERVE`
+# hands out an answer of UNKNOWN age while a refresh runs, which is why it is off by default and
+# LABELLED when on. This hands out an answer PROVABLY younger than its class's TTL — a bound, not a
+# bet — and it is silent on the caller's streams (the “streams are sacred” rule: a cache notice on a
+# successful call would corrupt the JSON that `gh-rest/gh` and `rest_list` parse).
+#
+# ⛔ AN UNLISTED SHAPE IS NEVER CACHED. There is deliberately NO default TTL: a default is how a
+# cache silently starts lying about a fact nobody reasoned about.
+#
+# ⛔ AND THE `gh api` SURFACE IS NOT IN THE LIST AT ALL — THAT BOUNDARY IS THE WHOLE SAFETY ARGUMENT.
+# An unvalidated TTL is only defensible where nothing else validates staleness AND the value is not
+# read-modify-written. `gh api` fails BOTH tests:
+#   * it already HAS a validator — the ETag/`conditional_fetch` path returns the real body on change and
+#     costs no quota on a 304, so a TTL entry there is strictly worse (staler, unvalidated);
+#   * `record-review.sh` and `atomic-land.sh` READ `pulls/{n}`'s `.body` and PATCH it back whole, so a
+#     10 s stale body is a LOST UPDATE — lane A's marker, or a human's edit, silently gone, both lanes
+#     exiting 0 (found in review round 5, reproduced: two reads 1 s apart, one request, the second the
+#     first body); and `admin-merge.sh` reads `commits/…/status` for a merge DECISION, where a 10 s
+#     window can miss a just-landed red.
+#
+# So the TTL cache covers exactly the ETag-free surface: the SUBCOMMANDS below, which are GraphQL (no
+# ETag exists at all) and are the traffic whose only saving today is single flight. Their TTLs are
+# sized to the poll cadence that produces the waste, so the cost of staleness is one poll:
+#   * `pr-list` 5 s — a board read polled per lane;
+#   * `run-list` 10 s — the MEASURED hotspot; see its entry below.
+# ⛔ AND NO DECISION-CARRYING SHAPE IS CACHED — not `pr-state` (the head a merge and the review evidence
+# are bound to) and not `checks` (whether to merge). See READ_SUBCOMMAND_CLASSES.
+# ⛔ AND ONLY A SUCCESS IS STORED. A failure is evidence about a MOMENT; caching one turns a transient
+# fault into a stable “unreadable” for every lane on the box (the pass cache's rule, restated because
+# it is the same defect class and it has bitten this file before).
+READ_CACHE_ENV = "GH_LIMIT_READ_CACHE"        # "0" disables the TTL cache entirely
+READ_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_READ_CACHE_MAX_BYTES", 32 << 20, 1024, 1 << 30)
+
+# (class, path pattern, TTL seconds) — matched against the ENDPOINT `api_endpoint` attributes.
+# Subcommand shapes only (GraphQL) — see the boundary argument above. There is intentionally no `gh
+# api` class: that surface is the ETag path's, and caching it unvalidated is a lost-update hazard.
+# The SUBCOMMANDS whose answer is one of those classes. A board LISTING and a run-state POLL are not
+# decisions; the head sha and the check surface are, and they are deliberately absent.
+READ_SUBCOMMAND_CLASSES = (
+    # ⛔ `pr-state` IS NOT HERE EITHER, AND FOR THE SAME REASON AS `checks` BELOW: `gh pr view --json
+    # headRefOid` IS THE HEAD A DECISION IS MADE ON. The licence for a 10 s window was “a stale head
+    # sha makes GitHub REFUSE a merge whose sha no longer matches” — true on the rail
+    # (`admin-merge.sh --match-head-commit`), FALSE on the other merge path, whose merge is UNPINNED,
+    # and false again for the review recorder, which binds evidence and checks the signed marker against
+    # the head it read (`record-review.sh`: `@ <head>`). Both re-read through THIS cache, so a stale
+    # entry could park a reviewed PR or accept the previous head's marker while an unpinned merge lands
+    # the live head — measured: two reads 1 s apart across a head flip both returned the old sha on ONE
+    # request. What remains cached is the two shapes whose answer is not a decision: a board LISTING
+    # (bounded staleness, no verdict) and a RUN-LIST poll.
+    ("pr-list",  ("pr", "list"), 5),
+    # ⛔ `gh pr checks` IS DELIBERATELY **NOT** HERE, AND IT WAS REMOVED FOR A REASON THAT IS MEASURED.
+    # Its answer is a MERGE DECISION: `merge-one.sh` computes its gate from `gh pr checks --json
+    # name,state`, breaks on SUCCESS, and the merge it then issues is unpinned (no
+    # `--match-head-commit`), while the cache key carries no head sha. So a 10 s window can serve the
+    # PREVIOUS head's SUCCESS for a PR whose new head is PENDING. Measured with the class in place: two
+    # reads 1 s apart across a SUCCESS->PENDING flip both returned SUCCESS on ONE request. It is not
+    # covered by the “a stale head is caught server-side” argument that licenses `pr-state`, because
+    # nothing in the decision re-reads the head. Cheap and safe still holds: single flight coalesces
+    # CONCURRENT identical reads (the 25-lanes-one-call property the incident asks for) without ever
+    # serving an older answer to a later caller.
+    #
+    # ⛔ MEASURED HOTSPOT, and the reason the next one IS here. One merge cycle was counted end to end
+    # (2026-10-22, PR 9134): 41 gh invocations, of which **30 — 73 % — were ONE poll loop**, the
+    # FIRST-CHECKS wait. Each 10-second iteration issues `run list …` plus
+    # `jobs?per_page=100 --paginate`, and `run list` ran with BYTE-IDENTICAL argv 16 times against data
+    # that had not changed once in 150 s. That loop reads RUN STATE, which is not a merge key: a stale
+    # `completed` only delays the next poll, and no decision is taken on it.
+    ("run-list", ("run", "list"), 10),
+)
+# Flags that make an answer depend on something beyond the endpoint (a page, a header framing, a
+# template, a changed representation). A shape carrying one is NEVER cached: `--paginate` returns ONE
+# PAGE per invocation, so replaying it would answer a different question than the caller asked.
+READ_UNCACHEABLE_FLAGS = frozenset({
+    "--paginate", "--include", "-i", "--slurp", "--template", "-t", "-H", "--header",
+    "--input", "-p", "--preview",
+})
+
+
+def read_cache_enabled():
+    return cfg(READ_CACHE_ENV, "1") != "0"
+
+
+def read_class(gh_argv):
+    """(name, ttl) for an invocation the TTL cache admits, or None.
+
+    ⛔ THE SAME REFUSALS AS THE FLIGHT PATH, FOR THE SAME REASONS: never a mutation (replaying its
+    stdout reports work it did not do — and it would DROP it), never `auth` (its stdout IS the
+    credential, and this cache is on disk), never `/rate_limit` (it is the budget METER: a frozen
+    meter cannot see the exhaustion this section exists to make survivable)."""
+    if not gh_argv:
+        return None
+    if gh_argv[0] == "auth" or not makes_request(gh_argv):
+        return None
+    # ⛔ THE STATED CONTRACT, IMPLEMENTED. `READ_UNCACHEABLE_FLAGS` was defined and never consulted, so
+    # a shape carrying `--template` / `--include` / `--paginate` was cached anyway — measured: three
+    # `gh pr list --template '{{.number}}'` calls made ONE request and `events.log` recorded two
+    # `pr-list` hits. `--paginate` returns ONE PAGE per invocation, so a cached replay answers a
+    # different question than the caller asked; the rest frame or reshape the output. A future flag
+    # added to that set must take effect, which it only does if something reads it.
+    for a in gh_argv:
+        if a in READ_UNCACHEABLE_FLAGS or any(a.startswith(f + "=") for f in READ_UNCACHEABLE_FLAGS):
+            return None
+    if gh_argv[0] == "api":
+        # ⛔ `gh api` IS NEVER TTL-CACHED — not an omission, the safety boundary (see the header).
+        # It has an ETag validator, and its body is read-modify-written by the review recorder.
+        return None
+    if len(gh_argv) >= 2:
+        for name, pair, ttl in READ_SUBCOMMAND_CLASSES:
+            if (gh_argv[0], gh_argv[1]) == pair:
+                return name, ttl
+    return None
+
+
+def read_cache_dir():
+    d = os.path.join(state_dir(), "reads")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return d if os.path.isdir(d) else None
+
+
+def read_cache_get(key, ttl):
+    """(rc, out, err) from the fleet-wide TTL cache when it is FRESH, else None."""
+    d = read_cache_dir()
+    if d is None:
+        return None
+    try:
+        with open(os.path.join(d, key + ".json")) as fh:
+            e = json.load(fh)
+        if int(e["rc"]) != 0:
+            return None            # never trust a stored failure (see the exclusion list)
+        if clock() - float(e["at"]) > ttl:
+            return None            # too old for THIS class: ask GitHub
+        if float(e["at"]) > clock() + 60:
+            # ⛔ A STAMP FROM THE FUTURE IS NOT A FRESH ENTRY. A clock step backwards (NTP, a VM
+            # resume) would otherwise serve an entry as fresh until wall time catches up — the same
+            # class `pace_mutation` already refuses to honour.
+            return None
+        return (0, base64.b64decode(e["out_b64"].encode("ascii")),
+                base64.b64decode(e["err_b64"].encode("ascii")))
+    except (OSError, ValueError, KeyError, TypeError, binascii.Error):
+        return None                # a corrupt/partial entry is a MISS, never an error
+
+
+def read_cache_put(key, rc, out, err):
+    """Store ONE successful answer, bounded in BYTES (the entries here are small, and a byte bound
+    is the one that actually protects the disk). A full cache must never fail a call."""
+    d = read_cache_dir()
+    if d is None or rc != 0:
+        return
+    size = len(out) + len(err) + 512
+    try:
+        used = sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d))
+        if used + size > READ_CACHE_MAX_BYTES:
+            entries = sorted(((os.path.getmtime(os.path.join(d, n)), n)
+                              for n in os.listdir(d) if n.endswith(".json")), key=lambda t: t[0])
+            for _, n in entries:
+                fp = os.path.join(d, n)
+                used -= os.path.getsize(fp)
+                os.unlink(fp)
+                if used + size <= READ_CACHE_MAX_BYTES:
+                    break
+            if used + size > READ_CACHE_MAX_BYTES:
+                return
+    except OSError:
+        return
+    p = os.path.join(d, key + ".json")
+    tmp = p + ".tmp-%d" % os.getpid()
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"at": clock(), "rc": rc,
+                       "out_b64": base64.b64encode(out).decode("ascii"),
+                       "err_b64": base64.b64encode(err).decode("ascii")}, fh)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# ── THE SAVING MUST BE MEASURABLE (#2342) ────────────────────────────────────────────────────────
+# “A cache that cannot show its hit rate is not an instrument.” Every TTL hit and every single-flight
+# share is ONE `gh` request this box did NOT send, and the whole point of the layer is to turn the
+# fleet's spend into a number an operator can read instead of a suspicion. So each event is APPENDED
+# as one JSON line (`O_APPEND` on a small line is atomic, so concurrent lanes cannot lose each
+# other's counts the way a read-modify-write of one JSON document would), the log is rotated at 1 MiB
+# (one old file kept: counters must never be a disk leak), and `--stats` aggregates both files.
+# ⛔ IT IS A LOCAL FILE READ — no request, no credentials, so it is usable at the exact moment the
+# budget is gone, which is when the question “what did the cache save us?” is asked.
+STATS_FILE = "read-cache-stats.jsonl"
+STATS_CARRY_FILE = "read-cache-totals.json"
+STATS_ROTATE_BYTES = 1 << 20
+
+
+def _stats_add(doc, cls, kind, at=None):
+    one = doc["classes"].setdefault(cls, {})
+    one[kind] = one.get(kind, 0) + 1
+    if isinstance(at, int) and (doc.get("since") is None or at < doc["since"]):
+        doc["since"] = at
+
+
+def stats_carry():
+    try:
+        with open(os.path.join(state_dir(), STATS_CARRY_FILE)) as fh:
+            doc = json.load(fh)
+        if isinstance(doc.get("classes"), dict):
+            return {"since": doc.get("since"), "classes": doc["classes"]}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"since": None, "classes": {}}
+
+
+def _stats_write_carry(doc):
+    p = os.path.join(state_dir(), STATS_CARRY_FILE)
+    tmp = p + ".tmp-%d" % os.getpid()
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, p)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def stats_fold():
+    """Rotation: fold the live file into a CUMULATIVE carry, then empty it.
+
+    ⛔ ROTATION MUST NOT MAKE THE COUNT GO DOWN (review P2). Replacing a `…jsonl.1` dropped the totals
+    it held, so `averted` could read SMALLER on a later run — “lost data, or a cache regression” to the
+    only reader this instrument has. Folding first makes the total monotone; nothing is summed twice
+    because a successful fold REMOVES the live file."""
+    p = os.path.join(state_dir(), STATS_FILE)
+    # ⛔ RENAME BEFORE READING (#2342 review P2). Read-then-unlink lost every event appended between
+    # the two (measured 3/3 on a 300 k-line file) and let two folds contribute the same lines to the
+    # carry. The rename is atomic, so concurrent appends land in a FRESH live file, and the fold only
+    # ever owns the renamed one.
+    folded = p + ".folding-%d" % os.getpid()
+    try:
+        os.replace(p, folded)
+    except OSError:
+        return
+    try:
+        with open(folded) as fh:
+            lines = fh.readlines()
+    except OSError:
+        lines = []
+    # ⛔ A CORRUPT CARRY IS NOT A ZERO (review P2). Overwriting it with a carry built only from the
+    # live file made the reported total DROP while `--stats` stopped saying UNREADABLE — the exact
+    # symptom the fold exists to prevent, reachable one rotation later. Skip the fold and let the
+    # instrument report UNREADABLE until a human clears it.
+    carry_path = os.path.join(state_dir(), STATS_CARRY_FILE)
+    if os.path.exists(carry_path):
+        try:
+            with open(carry_path) as fh:
+                json.load(fh)
+        except (OSError, ValueError):
+            log_event("stats: the cumulative carry is unparseable — fold SKIPPED, counters kept in %s"
+                      % folded)
+            os.rename(folded, p + ".unreadable-carry")
+            return
+    doc = stats_carry()
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        cls, kind = e.get("cls"), e.get("kind")
+        if isinstance(cls, str) and isinstance(kind, str):
+            _stats_add(doc, cls, kind, e.get("at"))
+    if _stats_write_carry(doc):
+        try:
+            os.unlink(folded)
+        except OSError:
+            pass
+    else:
+        # ⛔ A FAILED CARRY WRITE MUST NOT EAT THE EVENTS (review P2). Put them back where the reader
+        # looks; an orphan `*.folding-<pid>` is invisible to `stats_report`, so ENOSPC/EACCES/a kill
+        # would silently shrink every later total.
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, "".join(lines).encode())
+            finally:
+                os.close(fd)
+            os.unlink(folded)
+        except OSError:
+            pass                       # the `.folding-*` copy remains the only record; do not lose it
+
+
+def stats_record(cls, kind):
+    """Count ONE cache event. Never fails a call and never touches the caller's streams."""
+    try:
+        p = os.path.join(state_dir(), STATS_FILE)
+        try:
+            if os.path.getsize(p) > STATS_ROTATE_BYTES:
+                stats_fold()
+        except OSError:
+            pass                        # absent, or unfreezable: appending still works
+        line = json.dumps({"at": int(clock()), "cls": cls, "kind": kind},
+                          separators=(",", ":")) + "\n"
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def stats_readable():
+    """(ok, reason) — an instrument that cannot be READ is not `no-reads-counted`.
+
+    ⛔ THE CARRY IS PART OF THE COUNTER (#2342 review P2). A corrupt `read-cache-totals.json` was
+    silently treated as zero, which made the cumulative `averted` DROP — the one property the fold
+    exists to guarantee — and the report then read as lost data or a cache regression."""
+    for name in (STATS_FILE, STATS_CARRY_FILE):
+        p = os.path.join(state_dir(), name)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p) as fh:
+                fh.read(1)
+        except OSError as exc:
+            return (False, "%s (%s)" % (p, exc))
+    p = os.path.join(state_dir(), STATS_CARRY_FILE)
+    if os.path.exists(p):
+        try:
+            with open(p) as fh:
+                json.load(fh)
+        except (OSError, ValueError):
+            return (False, "%s (unparseable carry — the cumulative totals cannot be trusted)" % p)
+    return (True, "")
+
+
+def stats_report():
+    """(earliest stamp, {class: {kind: count}}) — the CUMULATIVE counters of this box.
+
+    ⛔ A TORN LINE IS A LOST COUNT, NEVER A WRONG ONE: it is skipped, so the totals can under-report
+    (an instrument that is honest about its floor) but never invent hits."""
+    doc = stats_carry()
+    out = doc["classes"]
+    since = doc.get("since")
+    try:
+        with open(os.path.join(state_dir(), STATS_FILE)) as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                cls, kind = e.get("cls"), e.get("kind")
+                if not isinstance(cls, str) or not isinstance(kind, str):
+                    continue
+                one = out.setdefault(cls, {})
+                one[kind] = one.get(kind, 0) + 1
+                at = e.get("at")
+                if isinstance(at, int) and (since is None or at < since):
+                    since = at
+    except OSError:
+        pass
+    return since, out
+
+
+def floor_source():
+    """WHICH knob set the floor — the one whose VALUE is in force, not the one merely present.
+
+    `GH_LIMIT_CORE_LOW_WATER` still works, so a box that carries the old value KEEPS it; without this
+    the fleet's effective floor can be 100 while the runbook and the PR say 800.
+    ⛔ PRESENCE IS NOT PARSEABILITY (#2342 review P2). `GH_LIMIT_CORE_FLOOR=abc` is ignored by
+    `cfg_int` (which falls back to the legacy value), so reporting it as the source pointed an operator
+    at a knob the layer was not reading. A set-but-unparseable value is NAMED as such."""
+    new = cfg("GH_LIMIT_CORE_FLOOR", "")
+    legacy = cfg("GH_LIMIT_CORE_LOW_WATER", "")
+    if new:
+        try:
+            int(float(new))
+            return "GH_LIMIT_CORE_FLOOR"
+        except (TypeError, ValueError, OverflowError):
+            return ("GH_LIMIT_CORE_FLOOR (unparseable, ignored)"
+                    + (" — using GH_LIMIT_CORE_LOW_WATER" if legacy else " — using the default"))
+    if legacy:
+        return "GH_LIMIT_CORE_LOW_WATER (legacy)"
+    return "default"
+
+
+def read_cache_class(gh_argv):
+    """The TTL class for this invocation, or None — the ADMISSION gate, one place.
+
+    ⛔ ONE CACHE PER SHAPE, AND THE ETAG PATH WINS ITS OWN. A `gh api` GET that `conditional_fetch`
+    will revalidate already has a stronger mechanism: a `304` costs NO quota and returns a body the
+    server just confirmed is current. Wrapping a TTL cache over that would hand out an OLDER body
+    where a fresh one was free — a slower AND staler answer — and would break the documented
+    “the second poll SENDS if-none-match” guarantee. So the TTL cache applies exactly where the ETag
+    path cannot: shapes `conditional_plan` refuses, and every SUBCOMMAND (`gh pr view` / `pr list` /
+    `pr checks` are GraphQL, which has no ETag at all)."""
+    if not read_cache_enabled() or conditional_plan(gh_argv) is not None:
+        return None
+    return read_class(gh_argv)
+
+
 def _run_shared(real_gh, gh_argv):
-    """(rc, out, err) for this invocation: coalesced when eligible, plainly captured otherwise."""
+    """(rc, out, err) for this invocation: TTL cache, then coalesced, then plain.
+
+    The ORDER is the whole saving: a fresh cache entry spends no request and no lock; a miss goes to
+    the single flight, so N lanes arriving together still make ONE call; and only a miss with no
+    leader above it reaches the transport (where `_dispatch` may fail over core->GraphQL)."""
+    cls = read_cache_class(gh_argv)
+    if cls is None:
+        if flight_eligible(gh_argv):
+            return single_flight(real_gh, gh_argv)
+        return _run_captured(real_gh, gh_argv)
+    name, ttl = cls
+    key = flight_key(gh_argv)          # ONE key definition: host + credential + repo pin + request
+    hit = read_cache_get(key, ttl)
+    if hit is not None:
+        stats_record(name, "hit")      # ONE request this box did NOT send — counted where it happens
+        log_event("read-cache: %s hit — within its %ds TTL, so no request was made" % (name, ttl))
+        return hit
+    stats_record(name, "miss")
     if flight_eligible(gh_argv):
-        return single_flight(real_gh, gh_argv)
-    return _run_captured(real_gh, gh_argv)
+        rc, out, err = single_flight(real_gh, gh_argv)
+    else:
+        rc, out, err = _run_captured(real_gh, gh_argv)
+    read_cache_put(key, rc, out, err)
+    return rc, out, err
 
 
 def dispatch(real_gh, gh_argv):
@@ -2113,7 +2644,7 @@ def dispatch(real_gh, gh_argv):
         _emit_streams(rc, out, err)
         pass_cache_put(gh_argv, out, err, rc)
         return rc
-    if flight_eligible(gh_argv):
+    if flight_eligible(gh_argv) or read_cache_class(gh_argv) is not None:
         return _emit_streams(*_run_shared(real_gh, gh_argv))
     return _dispatch(real_gh, gh_argv)
 
@@ -2214,7 +2745,31 @@ class Limit(object):
 # calls (`pr`, `issue`) is GraphQL. This is a HEURISTIC and it is stated as one: the authoritative
 # signal is the response header when the refused call carried one, and the label exists so a failure
 # says WHICH pool to look at instead of pointing at whichever counter happens to look healthy.
+# Subcommands gh serves over REST **for the shapes this file can see**: `run`/`workflow`/`release`/
+# `label`/`cache`/`secret`/`variable` have REST-only reads.
+# ⛔ `repo` AND `gist` ARE DELIBERATELY ABSENT (#2342 review, P1). They were added "because their
+# WRITES are REST calls", and that reason is unreachable: `is_mutating` answers `core` for every
+# mutation BEFORE this set is consulted, and `repo create/delete/edit/fork/…` are all in
+# `MUTATING_PAIRS`. So the entries could never affect a write — their only reachable effect was on
+# READS, and `gh repo view` / `gh repo list` are `RepositoryInfo` GraphQL queries. Labelling then
+# `core` refused them, with ZERO requests, inside a dated-empty core window while GraphQL had
+# thousands left: `admin-merge.sh`'s `gh repo view --json nameWithOwner` printed an empty slug and
+# the rail reported "the repo identity could not be resolved" — the misdiagnosis this layer exists to
+# delete (measured on the 2026-10-22 path). Writes stay covered by `is_mutating`.
 REST_SUBCOMMANDS = {"run", "workflow", "release", "label", "cache", "secret", "variable"}
+# ⛔ THE DEFAULT FOR AN UNKNOWN VERB IS `core`, NOT `graphql`. Labelling every unlisted verb `graphql`
+# meant `codespace delete`, `ruleset delete`, `ssh-key delete` and their kin were described as a healthy
+# GraphQL READ: unguarded against an empty core pool, and their refusal filed under a pool that was fine
+# (the 2026-10-22 false-healthy line, reachable from any verb nobody had listed). Enumerating the verbs
+# that are genuinely GraphQL is a finite list this file CAN know — gh's own GraphQL-first surface.
+# ⛔ `repo` AND `gist` ARE LISTED HERE BECAUSE THEIR *READS* ARE GRAPHQL (#2342 review, P1), and the
+# fall-through default below is `core` for an unlisted verb — so removing them from REST_SUBCOMMANDS
+# alone would still label `gh repo view` as a core read. Their WRITES are unaffected: `is_mutating`
+# answers `core` before either set is consulted (`repo create/delete/edit/fork/rename/archive/sync`,
+# `gist create/delete/edit` are all in MUTATING_PAIRS), so this only reclassifies the reads that
+# `RepositoryInfo` actually serves from GraphQL.
+GRAPHQL_SUBCOMMANDS = {"pr", "issue", "search", "project", "browse", "auth", "extension", "alias",
+                       "repo", "gist"}
 
 
 # Subcommands/flag forms that never reach the API. `makes_request()` gates the RECOVERY record: a
@@ -2263,6 +2818,32 @@ def makes_request(argv):
     return not any(a in NO_REQUEST_ANY for a in argv)
 
 
+def reaches_api(argv):
+    """Does this invocation SPEND a non-exempt API request?
+
+    ⛔ SEPARATE FROM `makes_request` ON PURPOSE, because the two questions have OPPOSITE safe defaults.
+    `makes_request` answers “may this call be EVIDENCE that a bucket recovered”, where an unattributable
+    argv must be NO evidence (it could be the exempt meter, and counting it erased a live limit). The
+    BUDGET GUARD needs the opposite default: an argv the layer cannot attribute must be TREATED as
+    spending the pool, or a flag nobody listed becomes a way to send a write into an empty pool.
+    Measured, round 9: `gh api --allow-escape-sequences -X POST …` — an argv `api_endpoint` could not
+    attribute — skipped the guard (1 request into a dated-empty pool instead of 0), its headerless
+    refusal rewrote the dated record as UNDATED, and after that every known-spelling write was sent too
+    (0,0,1,1,1 across five identical writes) while the real reset disappeared from the token."""
+    if not argv:
+        return False
+    if any(a in NO_REQUEST_ANY for a in argv):
+        return False
+    if argv[0] == "auth" and len(argv) >= 2 and argv[1] == "token":
+        return False                     # an OFFLINE keyring lookup, not a request
+    if argv[0] == "api":
+        ep = api_endpoint(argv)
+        if ep is not None and ep.strip("/").lower() == "rate_limit":
+            return False                 # exempt by design: the meter itself
+        return True                      # attributable or NOT: assume it spends the pool
+    return argv[0] not in NO_REQUEST
+
+
 def bucket_for(argv):
     if not argv:
         return "graphql"
@@ -2275,7 +2856,15 @@ def bucket_for(argv):
         # (review round 3); an unattributable argv answers `core`, the conservative label.
         sub = api_endpoint(argv) or ""
         return "graphql" if sub.strip("/").lower() == "graphql" else "core"
-    return "core" if argv[0] in REST_SUBCOMMANDS else "graphql"
+    # ⛔ ANY MUTATION IS A `core` CALL UNLESS IT GOES THROUGH `api graphql` (handled above). A write has
+    # no second pool, and `gh-rest/gh` translates the GraphQL-shaped ones (`pr merge`, `pr comment`,
+    # `issue comment`, `issue close`) into REST writes.
+    if is_mutating(argv):
+        return "core"
+    if argv[0] in REST_SUBCOMMANDS:
+        return "core"
+    # an UNKNOWN verb is not evidence that it spends GraphQL — see GRAPHQL_SUBCOMMANDS
+    return "graphql" if argv[0] in GRAPHQL_SUBCOMMANDS else "core"
 
 
 def probe_rate_limit(real_gh, bucket):
@@ -2289,15 +2878,22 @@ def probe_rate_limit(real_gh, bucket):
     attempt lock (a caller must not hold the box while it sleeps 60s), so without this it would be
     the ONE gh request the layer issues unserialised — during backoff, exactly when the other boxes
     and the other lanes are most likely to be issuing their own. One invariant, no exemptions."""
-    lock = acquire_lock()
+    lock = acquire_lock(strict=True)
+    if lock is None:
+        return None, None          # no serialised slot, no probe (never unserialised)
     try:
-        r = run(real_gh, ["api", "rate_limit"])
+        r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
     finally:
         release_lock(lock)
     try:
         if r.rc != 0:
             return None, None
         d = json.loads(r.out.decode("utf-8", "replace"))
+        # ⛔ WHILE WE ARE HERE, RECORD BOTH POOLS. This request has already been made (the refused
+        # call carried no usable header), and one `/rate_limit` read is exactly what the other 24
+        # lanes need to choose a transport without a request of their own. Before the 2026-10-22
+        # fix the answer was thrown away after extracting one bucket.
+        write_budget(d)
         res = (d.get("resources") or {}).get(bucket) or {}
         remaining = res.get("remaining")
         reset = res.get("reset")
@@ -2396,11 +2992,26 @@ def plan_wait(limit, attempt, real_gh, now, kind=None):
         p_remaining, p_reset = probe_rate_limit(real_gh, limit.bucket)
         remaining = p_remaining if remaining is None else remaining
         reset = p_reset if reset is None else reset
-    if kind == "primary" and remaining == 0 and reset and reset > now:
+    # ⛔ A MEASURED ZERO IS THE EVIDENCE, NOT THE CLASSIFICATION WORD (the merge of #2137 with the
+    # failover layer). #2137's rule — never adopt a bucket reset for a SECONDARY refusal — was written
+    # for the measured shape it found: a burst refusal whose `remaining` was 3200 beside a reset ~43
+    # minutes away, where adopting the reset blocked the whole box on a pool with thousands left. That
+    # rule is `remaining == 0` BELOW, and it is the load-bearing half: a refusal that (or whose exempt
+    # probe) reports a zero count and a dated reset has MEASURED that the pool is empty until that
+    # time, whatever word the prose fell back to. Keying on `kind == "primary"` instead made an
+    # `unclassified` refusal (gh's prose-only shape, no HTTP status — exactly the 2026-10-22 incident)
+    # pay the full 60/120/240 s backoff curve in-call: measured on the merged tree, the failed read
+    # that this layer exists to fail FAST sat ~7 minutes before giving up, past every caller's bound,
+    # and its 12-minute reset was never named. So:
+    #   * `secondary` keeps the curve — GitHub enforces it on burst/concurrency, and its reset is not a
+    #     recovery time (a probed `remaining` of 0 there is the lying-counter case #2137 measured);
+    #   * any other kind adopts a dated reset ONLY on a measured `remaining == 0`.
+    # `retry-after` never reaches here (the server's own delay is honoured above, verbatim).
+    if remaining == 0 and reset and reset > now and kind != "secondary":
         return float(reset - now) + 1.0, reset, "reset", remaining
     # Exponential, JITTERED UPWARDS only, so the floor the docs state (>= 1 minute) is never
-    # breached by jitter: 60, 120, 240 … A secondary/unclassified refusal lands here, with the reset
-    # recorded as EVIDENCE (the bucket's own number) but never as this call's wait.
+    # breached by jitter: 60, 120, 240 … A secondary refusal lands here, with the reset recorded as
+    # EVIDENCE (the bucket's own number) but never as this call's wait.
     base = BASE_WAIT * (2 ** (attempt - 1))
     return base * (1.0 + random.random() * 0.2), reset, "backoff", remaining
 
@@ -2411,14 +3022,35 @@ def fail_loudly(limit, attempts, waited, reset, kind=None, remaining=None, marke
     # `UNKNOWN`/`STALL`. "rate_limited" does not contain it, so the token would be lost at exactly the
     # boundary this layer exists to make honest.
     #
+    # ⛔ AND ONLY EMPTINESS MAY BE CALLED EMPTINESS. A SECONDARY (concurrency/burst) refusal arrives in
+    # the same shape as a primary one and `classify` admits both — but it carries
+    # `x-ratelimit-remaining: 3200`, and naming it `gh-core-exhausted` froze every write on the box for up
+    # to an hour while the pool had thousands of requests left, with a message saying the pool was EMPTY.
+    # A number we can SEE above zero refutes exhaustion, so it gets its own name and writes no health
+    # record at all.
+    named = ""
+    if limit.bucket == "core":
+        rem = getattr(limit, "remaining", None)
+        if rem == 0:
+            named = "%s — " % record_core_exhausted(reset, rem)
+        elif rem is None:
+            # ⛔ ABSENT IS UNKNOWN, NOT ZERO. A secondary refusal is governed by `retry-after` and is
+            # NOT counted by the primary counters, so it may arrive carrying a reset and no remaining
+            # at all. Persisting that reset made a DATED “the pool is empty” claim out of a burst —
+            # writes then refused with no request, for up to an hour, on a pool with thousands left.
+            # An undated record still DIVERTS reads to GraphQL and still names the state; it just
+            # cannot refuse anything (the round-3 rule).
+            named = "%s — " % record_core_exhausted(None, None)
+        else:
+            named = "gh-secondary-rate-limited remaining=%d — " % rem
     # ⛔ AND THE LINE CARRIES ITS OWN EVIDENCE (agent-infra#2137, requirement 4): the classification
     # used, the marker's AGE, the remaining count read, and the attempt number. Without the age a
     # refusal built on a 40-minute-old record is indistinguishable from one that just happened, so an
     # operator cannot tell whether to wait or to fix something else.
     sys.stderr.write(
-        "gh-limit: gh rate limit (bucket=%s reset=%s kind=%s) — FAILED after %d attempt(s), %ds waited. "
+        "gh-limit: %sgh rate limit (bucket=%s reset=%s kind=%s) — FAILED after %d attempt(s), %ds waited. "
         "evidence: remaining=%s marker_age=%s. This is a REFUSED call, not an empty answer%s\n"
-        % (limit.bucket, reset if reset else "?", kind or limit_kind(limit), attempts, int(waited),
+        % (named, limit.bucket, reset if reset else "?", kind or limit_kind(limit), attempts, int(waited),
            ("%d" % remaining) if remaining is not None else "?",
            ("%ds" % marker_age_s) if marker_age_s is not None else "none",
            (" (%s)" % limit.message) if limit.message else ""))
@@ -2427,6 +3059,9 @@ def fail_loudly(limit, attempts, waited, reset, kind=None, remaining=None, marke
 def main(argv):
     real_gh = None
     self_path = None
+    health = False
+    budget = False
+    stats = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -2439,15 +3074,83 @@ def main(argv):
         elif a == "--self" and i + 1 < len(argv):
             self_path = argv[i + 1]
             i += 2
+        elif a in ("--health", "--gh-health"):
+            # ⛔ A NAMED HEALTH VERB, SO A LANE NEVER HAS TO INTERPRET A FAILURE. It reads local
+            # state only: no request, no credentials, no quota — which is what makes it usable at
+            # exactly the moment every `gh` call is being refused.
+            health = True
+            i += 1
+        elif a in ("--budget", "--gh-budget"):
+            # ⛔ THE ONE PLACE A CALLER SPENDS ONE EXEMPT REQUEST TO LEARN BOTH POOLS, and the reason
+            # the hot path can stay free. A dispatcher about to run a burst calls this ONCE; every
+            # call it then makes reads the shared snapshot instead.
+            budget = True
+            i += 1
+        elif a in ("--stats", "--gh-stats"):
+            # ⛔ THE CACHE'S OWN HIT RATE, WHICH IS THE ONLY WAY TO PROVE THE SAVING (#2342). Local
+            # counters only: no request, no quota, no credentials. See `stats_report`.
+            stats = True
+            i += 1
         else:
-            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path> -- <argv>)\n" % a)
+            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path>|--health|--budget|--stats -- <argv>)\n" % a)
             return 2
+    if health:
+        token, rc = health_token()
+        sys.stdout.write(token + "\n")
+        return rc
+    if stats:
+        ok, why = stats_readable()
+        if not ok:
+            # ⛔ AN UNREADABLE INSTRUMENT IS NOT “NOTHING COUNTED” (review P2). `--health` already
+            # refuses to call an unparseable record `gh-ok`; the same rule applies to the counters.
+            sys.stdout.write("gh-read-cache UNREADABLE %s\n" % why)
+            # ⛔ AND IT EXITS 3, NOT 0 (review round 2, P2). Returning 0 made an UNREADABLE
+            # instrument report success to any caller gating on the exit status — the exact
+            # false-PASS polarity this block's own comment names: `--health` refuses to call an
+            # unparseable record `gh-ok` and returns 3 there. The genuinely-empty arm below keeps
+            # 0, because "nothing has been counted yet" IS an answer; "I could not read the
+            # counters" is not.
+            return 3
+        since, doc = stats_report()
+        if not doc:
+            # ⛔ AN EMPTY COUNTER IS NOT “ZERO SAVING”. It is “nothing has been counted yet”, and
+            # printing `averted=0` would be a measurement nobody made — the same class of lie this
+            # layer exists to stop a caller from telling itself.
+            sys.stdout.write("gh-read-cache no-reads-counted\n")
+            return 0
+        ttl = {name: t for name, _pair, t in READ_SUBCOMMAND_CLASSES}
+        averted = 0
+        stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(since)) if since else "?"
+        sys.stdout.write("gh-read-cache since=%s floor=%d (%s)\n"
+                         % (stamp, CORE_FLOOR, floor_source()))
+        for cls in sorted(doc):
+            kinds = doc[cls]
+            hit, miss, share = (kinds.get("hit", 0), kinds.get("miss", 0), kinds.get("share", 0))
+            if cls == "single-flight":
+                sys.stdout.write("  %-14s share=%-6d \u2192 coalesced (N lanes, one request)\n"
+                                 % (cls, share))
+                averted += share
+                continue
+            sys.stdout.write("  %-14s hit=%-6d miss=%-6d ttl=%ds\n" % (cls, hit, miss, ttl.get(cls, 0)))
+            averted += hit
+        sys.stdout.write("  %-14s averted=%-6d \u2192 gh requests this box did not send (hits + shares)\n"
+                         % ("TOTAL", averted))
+        return 0
     gh_argv = list(argv[i:])
     if real_gh is None:
-        # The explicit argument outranks the env pin (`gh-rest/gh` resolves the real gh itself, with
-        # a documented self-skip); the pin exists for a caller that already knows, and `--self` is
-        # last because it has to walk PATH.
         real_gh = os.environ.get("GH_LIMIT_REAL_GH") or resolve_real_gh(self_path)
+    if budget:
+        snap = probe_budget(real_gh) if real_gh and os.path.isfile(real_gh) else None
+        if snap is None:
+            sys.stdout.write("gh-budget-unknown\n")
+            return 3                   # never a guessed number: “I could not read the meter”
+        sys.stdout.write("core=%s/%s resets_in=%s graphql=%s/%s resets_in=%s\n"
+                         % (snap["core"]["remaining"], snap["core"].get("limit", 5000),
+                            resets_in(snap["core"]["reset"]),
+                            (snap.get("graphql") or {}).get("remaining", "?"),
+                            (snap.get("graphql") or {}).get("limit", 5000),
+                            resets_in((snap.get("graphql") or {}).get("reset"))))
+        return 0
     if not real_gh or not os.path.isfile(real_gh) or not os.access(real_gh, os.X_OK):
         sys.stderr.write("gh-limit: cannot locate the real gh (set GH_LIMIT_REAL_GH)\n")
         return 127
@@ -2502,6 +3205,1050 @@ def resolve_real_gh(self_path):
     return None
 
 
+# ── BOTH BUDGETS, THE CORE->GRAPHQL FAILOVER, AND THE NAMED HEALTH STATE ────────────────────────
+# MEASURED 2026-10-22 14:03Z, the incident this section exists for:
+#
+#     core:   5000 used / 0 remaining, resets in 12 min
+#     graphql: 255 used / 4745 remaining
+#
+# Both counters are the SAME account, so both are ours. The REST pool was empty and the GraphQL pool
+# had 95% of a budget, and NOTHING in the fleet could use it: every read that hits `core` failed, the
+# rail's protection read failed, `repo-authority.sh` fell back to `REQ_SOURCE=fallback`, every PR was
+# refused with “the merge contract is UNKNOWN”, and `gh auth status` reported “the token is invalid”.
+# A budget our own polling spent was indistinguishable, from inside a lane, from GitHub being down.
+#
+# Three mechanisms, each stated where it applies:
+#
+#   1. READ BOTH BUDGETS, CHEAPLY AND SHARED. `GET /rate_limit` is exempt from the primary limit (it
+#      answered normally with `core` at 0), so it is the ONE meter that works when the pool is empty.
+#      Its snapshot is kept for `GH_LIMIT_BUDGET_TTL` in the box's state dir, so 25 lanes cost ONE
+#      probe per TTL window, not 25.
+#   2. FAIL OVER — BUT ONLY WHERE THE ANSWER IS EXACT. A REST read with a GraphQL equivalent of the
+#      SAME SHAPE is served from the GraphQL pool. `conditional_plan` is the admission gate (a plain
+#      GET, one positional, no `--paginate`/`-i`/`-H`), and the equivalent must reproduce the REST BODY
+#      field for field before the caller's own `--jq` is applied — the same “never drop a flag and
+#      answer anyway” rule the REST adapter states. A path with NO exact equivalent (branch
+#      protection is the one that actually bit) is NOT approximated: it fails closed with the name.
+#   3. NAME THE STATE, AND NEVER RETRY INTO THE LIMIT. When `core` is empty, a read with no equivalent
+#      is refused ONCE with `gh-core-exhausted resets_in=<Nm>` — no request, no retry (a retry loop is
+#      what turned a rate limit into a 4,482-fork storm once already). A mutation is never failed
+#      over (there is no GraphQL equivalent of an evidence comment that is the same comment) and it is
+#      refused the same way, so the rail says the truth instead of “UNKNOWN”.
+BUDGET_TTL = cfg_secs("GH_LIMIT_BUDGET_TTL", 30, 5, 600)
+# Fail over while there is still a RESERVE left, because the tail of the pool is the only budget a
+# MUTATION can use: writes have no second pool, so spending the last reads on polls would take merges
+# down before it took polling down.
+#
+# ⛔ THE FLOOR IS A GUARD THAT ACTS BEFORE THE WALL (#2342, measured 2026-10-23 04:11Z). The reserve
+# was 100, which is a number small enough to never be noticed — and it was never reached before the
+# pool was GONE: one identity, one bucket, the Mac plus three cells and ~20 lanes, `core remaining=0`
+# at the same moment for all of them, so every lane lost the ability to read or write GitHub and the
+# instruments then reported the absence as a state. The pool is spent by POLLING inside the last
+# minutes of the window, and the last ~800 requests are the only budget a MUTATION has. So below the
+# floor a READ stops spending `core` at all:
+#   * it fails over to GraphQL where an EXACT equivalent exists (`graphql_plan`), and
+#   * where none exists it is REFUSED BY NAME — `gh-core-floor remaining=N floor=F resets_in=<Nm>` —
+#     unless the caller declares that this work cannot proceed without it (`GH_LIMIT_ESSENTIAL=1`).
+# The refusal asserts NOTHING about exhaustion: the pool still has `remaining`, and claiming otherwise
+# is the false diagnosis this file exists to delete (see `core_pressure`). The escape hatch is not a
+# convenience: a landing's protection read has no GraphQL equivalent, so the rail's own reader sets it
+# (`repo-authority.sh::required_checks`) — “essential” is exactly “this landing cannot proceed”.
+#
+# ⛔ ONE CONCEPT, ONE NUMBER. `GH_LIMIT_CORE_LOW_WATER` still works (it is what the runbook and the
+# deployed cells carry); `GH_LIMIT_CORE_FLOOR` is the name that says what it does, and it wins.
+CORE_FLOOR = cfg_int("GH_LIMIT_CORE_FLOOR",
+                     cfg_int("GH_LIMIT_CORE_LOW_WATER", 800, 0, 4950), 0, 4950)
+CORE_LOW_WATER = CORE_FLOOR
+ESSENTIAL_ENV = "GH_LIMIT_ESSENTIAL"       # "1" = this read cannot be deferred (a landing)
+FAILOVER_ENV = "GH_LIMIT_FAILOVER"          # "0" disables the failover (the named state still applies)
+HEALTH_FILE = "health"
+
+
+def essential():
+    """Has the CALLER declared this read cannot be deferred?
+
+    ⛔ IT IS OPT-IN AND IT IS NAMED, because the floor is a policy about SPEND and a policy that every
+    caller can silently set is not one. `essential` is true only for the work a landing cannot
+    complete without: the rail's own protection read. A poll is never essential — if polling were,
+    the reserve would be spent exactly the way the 2026-10-23 incident spent it."""
+    return cfg(ESSENTIAL_ENV, "0") == "1"
+
+
+def failover_enabled():
+    return cfg(FAILOVER_ENV, "1") != "0"
+
+
+def resets_in(reset):
+    """`<Nm>` — the phrase the named state carries. Ceiling, never a fraction: “resets in 0m” for a
+    window 40 s away would read as “about to clear” and invite the retry this exists to prevent."""
+    try:
+        d = int(reset) - int(clock())
+    except (TypeError, ValueError):
+        return "?"
+    if d <= 0:
+        return "0m"
+    return "%dm" % max(1, (d + 59) // 60)
+
+
+def read_budget():
+    """The last recorded snapshot of BOTH pools, or None — NO REQUEST IS MADE.
+
+    ⛔ THIS IS THE HOT PATH AND IT MUST BE FREE. The first draft of this layer probed `/rate_limit` from
+    every `core` call, which is “only” one exempt request per box per TTL window — but it is a request
+    PER CALL SITE on a box running a fleet, and it made this layer's cost depend on how often callers
+    call rather than on what they need. Measured against the existing suite it also shifted every
+    request-count assertion by one. The meter is therefore read in exactly two places, both of which
+    already had a reason to ask: the `--budget` verb, and the refusal path's own `probe_rate_limit`
+    (which runs at most once per refused call and now records BOTH pools while it is there)."""
+    try:
+        with open(os.path.join(state_dir(), "budget.json")) as fh:
+            d = json.load(fh)
+        at = float(d.get("at") or 0)
+        if clock() - at > BUDGET_TTL:
+            return None                # too old to decide a TRANSPORT on
+        if at > clock() + 60:
+            return None                # a stamp from the FUTURE is not fresh (a clock stepped back)
+        return d if isinstance(d.get("core"), dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def write_budget(doc):
+    """Record both pools from a `/rate_limit` document. Shared: ONE probe answers every process."""
+    try:
+        res = doc.get("resources") or {}
+        snap = {"at": clock()}
+        for b in ("core", "graphql"):
+            one = res.get(b) or {}
+            rem, reset, limit = one.get("remaining"), one.get("reset"), one.get("limit")
+            if isinstance(rem, int) and isinstance(reset, int):
+                snap[b] = {"remaining": rem, "reset": reset,
+                           "limit": limit if isinstance(limit, int) else 5000}
+        if "core" not in snap:
+            return None
+        write_state("budget.json", json.dumps(snap))
+        return snap
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def probe_budget(real_gh):
+    """ONE exempt `/rate_limit` read, under the single-flight lock (the `--budget` verb's work)."""
+    lock = acquire_lock(strict=True)
+    if lock is None:
+        return None                    # no serialised slot, no probe (never unserialised)
+    try:
+        r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
+    finally:
+        release_lock(lock)
+    if r.rc != 0:
+        return None
+    try:
+        return write_budget(json.loads(r.out.decode("utf-8", "replace")))
+    except ValueError:
+        return None
+
+
+PROBE_STAMP = "budget-probe-at"
+# The probe holds the box-wide lock, so it carries its OWN bound. It reads one small exempt
+# document: 20 s is generous, and a timeout costs only "no snapshot this window".
+PROBE_TIMEOUT_S = cfg_secs("GH_LIMIT_PROBE_TIMEOUT", 20.0, 1.0, 120.0)
+
+
+def _probe_due():
+    """Is a `/rate_limit` probe allowed in this window?
+
+    ⛔ A FAILED PROBE MUST NOT BECOME A PROBE PER CALL. `write_budget` only lands on SUCCESS, so
+    without this stamp a box whose probe fails (a torn state dir, a proxy error) would probe on every
+    single gh call — the “cost depends on how often callers call” defect `read_budget` documents."""
+    try:
+        with open(os.path.join(state_dir(), PROBE_STAMP)) as fh:
+            at = float((fh.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return True
+    if at > clock() + 60:
+        return True                    # a stamp from the FUTURE is not a stamp (a clock stepped back)
+    return (clock() - at) >= BUDGET_TTL
+
+
+def _stamp_probe():
+    try:
+        with open(os.path.join(state_dir(), PROBE_STAMP), "w") as fh:
+            fh.write("%d" % int(clock()))
+    except OSError:
+        pass
+
+
+def budget_snapshot_or_probe(real_gh):
+    """A FRESH meter snapshot: the free file read, or at most ONE exempt probe per box per TTL.
+
+    ⛔ THE LOCK IS WHAT MAKES “ONE PROBE PER BOX” TRUE. The snapshot is re-read INSIDE the lock, so a
+    burst of lanes arriving together costs one request and the rest read the answer — the same shape
+    as every other coalescing in this file. The probe is exempt from the primary limit (it answered
+    with `core` at 0 on 2026-10-22), so it spends no quota; the stamp bounds it when the probe FAILS.
+    """
+    snap = read_budget()
+    if snap is not None:
+        return snap
+    if not (real_gh and os.path.isfile(real_gh)):
+        return None
+    lock = acquire_lock(strict=True)
+    if lock is None:
+        # ⛔ NO LOCK, NO PROBE (#2342 review P1). A bounded caller (`GH_LIMIT_NO_WAIT`) that could not
+        # take the box lock has already spent its budget waiting; issuing the meter call anyway would
+        # put ONE gh request in flight UNSERIALISED — the single invariant this layer exists to keep —
+        # and would outlive the bound the caller asked for. No snapshot is a legitimate answer. (Strict
+        # mode is what makes this true under CONTENTION: the permissive path returns a real fd after
+        # logging "proceeding UNSERIALISED", so `is None` alone never fires for a held lock.)
+        return None
+    try:
+        snap = read_budget()           # a peer may have probed while we waited for the lock
+        if snap is not None:
+            return snap
+        if not _probe_due():
+            return None                # a probe was already ATTEMPTED this window and did not land
+        _stamp_probe()
+        # ⛔ BOUNDED, LIKE THE OTHER LOCK-HOLDING PROBE (#2342 review P2). This one runs on the PRIMARY
+        # read path (`_dispatch`), so an unbounded `/rate_limit` here is the worse of the two: it would
+        # hold the box-wide lock for `GH_LIMIT_LOCK_TIMEOUT` and then de-serialise the box.
+        r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
+    finally:
+        release_lock(lock)
+    if r.rc != 0:
+        return None
+    try:
+        return write_budget(json.loads(r.out.decode("utf-8", "replace")))
+    except ValueError:
+        return None
+
+
+def core_record_reset():
+    """The reset on a LIVE `core` refusal record (bucket=core, no `recovered=`), or None.
+
+    ⛔ A RECOVERED RECORD IS NOT EVIDENCE, and the two facts cannot be confused: `record_recovery`
+    annotates the same line, so reading `reset=` alone would keep failing over on a pool that had
+    already answered a call. This is the durable half of the meter — it is written by the FIRST
+    refused `core` call on any lane and read here by every lane, at no cost."""
+    try:
+        with open(os.path.join(state_dir(), "last-limit")) as fh:
+            parts = dict(kv.split("=", 1) for kv in fh.read().split() if "=" in kv)
+    except (OSError, ValueError):
+        return None
+    if parts.get("bucket") != "core" or "recovered" in parts:
+        return None
+    # ⛔ A RECORD THAT SHOWS HEADROOM REFUTES ITS OWN EXHAUSTION, AND ONE THAT SHOWS NOTHING PROVES
+    # NOTHING. `remaining` is written only when the refused response carried it. `> 0` is a burst
+    # refusal (never exhaustion); ABSENT means the response did not say — and an older writer recorded
+    # primary and secondary refusals identically with no count at all, so trusting an uncounted record
+    # would gate every write on the box for the length of the primary window. Only an OBSERVED zero is
+    # evidence of emptiness; the undated health record carries the rest.
+    rem = as_int(parts.get("remaining"))
+    if rem != 0:
+        return None
+    reset = as_int(parts.get("reset"))
+    return reset if reset and reset > clock() else None
+
+
+HEALTH_UNKNOWN_WINDOW = cfg_secs("GH_LIMIT_HEALTH_UNKNOWN_WINDOW", 900, 60, 86400)
+
+
+def _health_record():
+    try:
+        with open(os.path.join(state_dir(), HEALTH_FILE)) as fh:
+            return dict(kv.split("=", 1) for kv in fh.read().split() if "=" in kv)
+    except (OSError, ValueError):
+        return None
+
+
+def health_state():
+    """(reset, dated) for the current `core` health record, or (None, False).
+
+    ⛔ `dated` IS THE POINT, AND IT DECIDES WHAT THE EVIDENCE MAY BE USED FOR. A record whose reset we
+    know is a measurement: it may REFUSE a read outright. A record written from a refusal that carried
+    no reset (the `--include`-less shape, and every `GH_LIMIT_NO_WAIT` caller, which skips the probe)
+    is undated: it is honoured for a BOUNDED window, and it may only DIVERT a read to GraphQL. It may
+    not pre-emptively refuse one, because it cannot say when the window ends — and a pre-emptive
+    refusal that no core call can ever clear (no call is attempted, so `record_core_ok` never fires)
+    would park the box for the full window. Attempting the read is self-correcting: it re-records the
+    truth in one request.
+
+    ⛔ AND `reset=0` IS NOT “HEALTHY”. Deriving health from it made `--health` say `gh-ok` while the
+    pool was spent and nothing failed over (review round 2, finding 4)."""
+    parts = _health_record()
+    if not parts or parts.get("bucket") != "core":
+        return None, False
+    reset = as_int(parts.get("reset"))
+    if reset and reset > clock():
+        return reset, True
+    if reset:
+        # ⛔ A DATED RECORD WHOSE WINDOW HAS PASSED IS SPENT — it is NOT re-served as an undated one.
+        # Falling through to the `at` branch below kept `--health` printing `gh-core-exhausted` for up
+        # to HEALTH_UNKNOWN_WINDOW AFTER the pool had actually reset, which is the token lying in the
+        # other direction.
+        return None, False
+    at = as_int(parts.get("at"))
+    if at and clock() - at <= HEALTH_UNKNOWN_WINDOW:
+        return int(at + HEALTH_UNKNOWN_WINDOW), False
+    return None, False
+
+
+def health_reset():
+    """Just the window (for `--health`): the reset of a current `core` health record, or None."""
+    return health_state()[0]
+
+
+def _record_is_unreadable():
+    """True when the health file EXISTS with content but yields no state at all.
+
+    ⛔ THE DIFFERENCE BETWEEN “NO RECORD” AND “A RECORD I COULD NOT READ” IS THE DIFFERENCE BETWEEN A
+    HEALTHY POOL AND A BROKEN INSTRUMENT, and `--health` used to print `gh-ok` for both. An absent record
+    is genuinely `gh-ok`; a SPENT dated window is `gh-ok` too (it is an answer). An unparseable one is
+    neither — it is the one verb an operator trusts at the moment nothing else works, answering from a
+    file it could not parse."""
+    try:
+        with open(os.path.join(state_dir(), HEALTH_FILE)) as fh:
+            text = fh.read().strip()
+    except OSError:
+        return False               # no record is not an unreadable record
+    if not text:
+        return False               # an empty file is an absent record
+    parts = dict(kv.split("=", 1) for kv in text.split() if "=" in kv)
+    if parts.get("bucket") != "core":
+        return True                # a record about something else, or a truncated one
+    reset = as_int(parts.get("reset"))
+    at = as_int(parts.get("at"))
+    if reset is not None and reset > 0:
+        return False               # dated (current or spent) — health_state() has the verdict
+    return not (at and at > 0)     # undated and not even datable
+
+
+def core_pressure():
+    """(reset, remaining, dated) when the CORE pool is known to be low/empty, else None.
+
+    ⛔ NO REQUEST IS MADE HERE — the whole call path depends on that. Three FREE sources of truth: a
+    snapshot someone else already paid for (the `--budget` verb, or the refusal path's own probe); the
+    durable `last-limit` record that the FIRST refused `core` call on ANY lane writes; and the named
+    health record, which survives a GraphQL refusal overwriting that single record.
+
+    `dated` says whether the WINDOW is known, and that governs what the evidence may be used for (see
+    `health_state`)."""
+    # ⛔ THE FLOOR IS NOT THE FAILOVER (#2342 review P2). This used to return None whenever
+    # `GH_LIMIT_FAILOVER=0`, which silently removed the floor AND the dated-empty write guard — the two
+    # things the kill switch's own contract says still apply (“0 disables the failover (the named state
+    # still applies)”). An operator turning failover off during GraphQL trouble would have sent a
+    # measured-empty read (and, on the mutating arm, a WRITE) into the pool. Only the TRANSPORT choice
+    # is gated now, at the `graphql_plan` call site.
+    now = clock()
+    snap = read_budget()
+    if snap is not None:
+        core = snap.get("core") or {}
+        rem, reset = core.get("remaining"), core.get("reset")
+        if isinstance(rem, int) and isinstance(reset, int) and rem <= CORE_LOW_WATER and reset > now:
+            return reset, rem, True         # a MEASUREMENT: may refuse a read outright
+        return None                    # a FRESH snapshot that says the pool is fine outranks a record
+    reset = core_record_reset()
+    if reset:
+        return reset, 0, True           # the refused call OBSERVED zero — that IS a measurement
+    reset, dated = health_state()
+    if reset:
+        # ⛔ `remaining` IS NOT OBSERVED ON THE UNDATED PATH — and it IS on the dated one. Getting the
+        # two arms backwards broke BOTH directions at once (review round 2, regression of the round-1
+        # fix): hard-coding 0 declared the pool empty on undated evidence (refusing writes), while
+        # hard-coding None removed the ONE durable record that survives a GraphQL refusal overwriting
+        # `last-limit`, so a known-empty DATED pool started SENDING writes into it (measured: 1 request
+        # spent against a record saying `remaining=0 reset=<12m away>`).
+        #   dated   -> the record carries the zero that WAS observed: a measurement, may refuse.
+        #   undated -> `remaining=?`: unknown; reads divert, nothing is asserted, writes are sent.
+        rec = _health_record() or {}
+        rem = as_int(rec.get("remaining"))
+        return reset, (rem if (dated and rem == 0) else None), dated
+    return None
+
+
+def record_core_exhausted(reset, remaining):
+    """Write the NAMED state and return its phrase. One file, one line, per box.
+
+    ⛔ IT IS REWRITTEN ONLY WHEN IT CHANGES. This is called from the per-call budget check, so on a box
+    in the low-water band it would otherwise be a temp-file + rename per gh call — thousands an hour,
+    for a line whose whole content is the same until the reset moves or the count crosses zero.
+
+    ⛔ BUT AN **UNDATED** RECORD MUST STILL BE RE-STAMPED, OR IT EXPIRES MID-INCIDENT. Its `at=` is the
+    ONLY thing that says how old the evidence is, and `health_state()` age-bounds it — so freezing `at=`
+    (which “the fields that carry meaning are equal” did, since it excludes `at=`) meant that fifteen
+    minutes into an ONGOING undated exhaustion the record stopped counting: `--health` said `gh-ok`,
+    `core_pressure` said None, the read was SENT into the empty pool, and the rail went back to “the merge
+    contract is UNKNOWN” while the pool was still empty (measured, round 8: five refusals at T…T+1300 left
+    `at=T`). A refresh is cheap and bounded — once per half-window, not once per call."""
+    phrase = "gh-core-exhausted resets_in=%s" % resets_in(reset)
+    line = "%s at=%d bucket=core remaining=%s reset=%s" % (
+        phrase, int(clock()), remaining if remaining is not None else "?", reset or 0)
+    p = os.path.join(state_dir(), HEALTH_FILE)
+    try:
+        with open(p) as fh:
+            cur = fh.read().strip()
+        # `at=` moves every second by definition, so compare the FIELDS THAT CARRY MEANING rather than
+        # the whole line: the phrase, the bucket and the reset window.
+        keep = [kv for kv in cur.split() if not kv.startswith("at=")]
+        if keep == [kv for kv in line.split() if not kv.startswith("at=")]:
+            # …and an UNDATED record (reset=0) is re-stamped once per half-window so it cannot age out
+            # while the exhaustion continues. A DATED one needs no re-stamp: its `reset` is the bound.
+            cur_at = as_int(next((kv.split("=", 1)[1] for kv in cur.split() if kv.startswith("at=")), None))
+            dated = reset is not None and int(reset or 0) > 0
+            if dated or (cur_at and clock() - cur_at <= HEALTH_UNKNOWN_WINDOW // 2):
+                return phrase
+    except OSError:
+        pass
+    write_state(HEALTH_FILE, line)
+    return phrase
+
+
+def record_core_ok():
+    """A `core` call SUCCEEDED, so the named state no longer holds. ⛔ BUCKET-SCOPED exactly like
+    `record_recovery`: a GraphQL success proves nothing about a core pool, and clearing on it would
+    report the opposite of the truth on the one line an operator reads."""
+    try:
+        os.unlink(os.path.join(state_dir(), HEALTH_FILE))
+    except OSError:
+        pass
+
+
+def health_token():
+    """(token, exit) for `--health`: the NAMED state a lane can print verbatim, or `gh-ok`.
+
+    ⛔ AGE-BOUNDED, like `last-limit`: a record whose window has passed is not a current state (the
+    record outlives the process that wrote it, so without this a one-off exhaustion would be asserted
+    for ever). Exit 3 = exhausted, 0 = healthy — never 1, which callers read as “the check failed”.
+
+    ⛔ AND IT AGREES WITH `core_pressure`, WHICH IS THE POINT. An undated record (a refusal that carried
+    no reset) is a current state for `HEALTH_UNKNOWN_WINDOW`; deriving “healthy” from `reset == 0` made
+    `--health` say `gh-ok` at the exact moment the pool was spent and the failover had stopped.
+
+    ⛔ A FRESH METER OUTRANKS THE RECORD, IN BOTH DIRECTIONS — and reading only the record got both of
+    them wrong (measured, review round 6): a `--budget` probe that had JUST measured `core=0` still
+    read `gh-ok` here, because nothing had been refused yet and so no health record existed. That is
+    the incident's own false-healthy line, printed by the verb an operator is told to trust. The
+    reverse direction lies too: a record from a window that has since cleared read `gh-core-exhausted`
+    beside a meter saying 3000 remaining. `read_budget()` is a FILE READ (no request), so consulting it
+    here costs nothing and cannot be the reason a box polls the meter.
+
+    ⛔ AND IT NEVER REPORTS A NUMBER NOBODY MEASURED. An UNDATED record is a refusal that carried no
+    reset (every `GH_LIMIT_NO_WAIT` caller skips the probe, and eight heartbeat tools set it). Printing
+    the synthetic `HEALTH_UNKNOWN_WINDOW` as `resets_in=<Nm>` stated a 15m window for a refusal that
+    came with a 12m one (measured) — a lane would wait out the wrong number. The window is UNKNOWN, so
+    the token says `?`, in the same slot and the same shape, and callers that only read the TOKEN are
+    unaffected."""
+    snap = read_budget()
+    if snap is not None:
+        core = snap.get("core") or {}
+        rem, mreset = core.get("remaining"), core.get("reset")
+        if isinstance(rem, int) and isinstance(mreset, int):
+            # ⛔ A FRESH SNAPSHOT ALWAYS WINS — INCLUDING WHEN ITS WINDOW HAS ALREADY PASSED. The first
+            # version required `mreset > now`, so a fresh meter whose reset was in the past fell THROUGH
+            # to the durable record and reported an exhaustion the rail and the write guard both treat as
+            # closed (measured, round 7: `--health` said `resets_in=12m` rc 3 while `core_pressure()` said
+            # None and the rail printed nothing — the verb telling a lane to wait for a window nobody
+            # else believes in). Either the meter has headroom (gh-ok), or it is empty inside a live
+            # window (named), or its window is over (gh-ok, whatever the older record says).
+            if mreset <= clock():
+                return "gh-ok", 0
+            if rem == 0:
+                return "gh-core-exhausted resets_in=%s" % resets_in(mreset), 3
+            # ⛔ THE LOW-WATER BAND IS NOT EXHAUSTION — the same distinction `core_pressure` makes for
+            # writes. An operator reading `gh-core-exhausted` at remaining=50 would chase a window that
+            # has not started; the failover is a transport choice, not a pool state.
+            return "gh-ok", 0
+    reset, dated = health_state()
+    if reset is None:
+        # ⛔ THE DURABLE `core` REFUSAL RECORD IS THE LAYER'S OWN MEASUREMENT and `core_pressure()`
+        # already trusts it — reading only the health file here made the two disagree in the window that
+        # matters most: a refused core call is recorded in `last-limit` on EVERY attempt, while the
+        # `health` record is only written when the layer gives up. So mid-backoff (or with the failing
+        # lane killed before it gave up) `core_pressure` refused every WRITE with zero requests and
+        # diverted every READ, while this verb printed `gh-ok` rc 0 — the incident's own false-healthy
+        # line, from the one verb an operator is told to trust (measured, review round 6).
+        rec_reset = core_record_reset()
+        if rec_reset is not None:
+            return "gh-core-exhausted resets_in=%s" % resets_in(rec_reset), 3
+        # ⛔ “I COULD NOT READ THE RECORD” IS NOT “THE POOL IS FINE”. A record that exists but cannot be
+        # parsed (a truncated write, a hand edit, a version skew) used to be served as `gh-ok` rc 0 — an
+        # answer that was never obtained, reported as healthy, from the one verb an operator trusts at
+        # the exact moment nothing else works. A SPENT dated window is different (it is an answer), and
+        # is still `gh-ok`.
+        if _record_is_unreadable():
+            return "gh-health-unknown", 3
+        return "gh-ok", 0
+    if not dated:
+        return "gh-core-exhausted resets_in=?", 3
+    return "gh-core-exhausted resets_in=%s" % resets_in(reset), 3
+
+
+# ── the GraphQL equivalents (EXACT bodies only) ──────────────────────────────────────────────
+# ⛔ EVERY ENCODER BELOW MAY RETURN None, AND None MEANS “I CANNOT REPRODUCE THE REST BODY”. It is
+# never filled in with a plausible default: a synthesized empty `check_runs` or a null `head` would
+# be the failure this whole file exists to prevent — an EMPTY answer read as a green tree.
+_GQL_PR = ("query($owner:String!,$name:String!,$number:Int!)"
+           "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
+           "{number state isDraft merged mergeable headRefOid headRefName baseRefOid baseRefName "
+           "title body url updatedAt createdAt closedAt mergedAt "
+           "changedFiles additions deletions comments{totalCount} author{login}}}}")
+_GQL_ISSUE_COMMENTS = ("query($owner:String!,$name:String!,$number:Int!)"
+                       "{repository(owner:$owner,name:$name){issue(number:$number)"
+                       "{comments(first:30){pageInfo{hasNextPage} nodes{databaseId body createdAt url author{login}}}}}}")
+_GQL_PR_REVIEWS = ("query($owner:String!,$name:String!,$number:Int!)"
+                   "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
+                       "{reviews(first:30){pageInfo{hasNextPage} nodes{databaseId state submittedAt body commit{oid} author{login}}}}}}")
+
+# ⛔ THE NAMES EACH ENCODER CAN ACTUALLY PRODUCE, AND WHY THAT LIST IS A GATE RATHER THAN A COMMENT.
+# `jq` on a field that is ABSENT prints `null` and exits 0, so a partial equivalence is not a small
+# imprecision — it is an EMPTY ANSWER WITH A SUCCESS STATUS, which is the one failure this file
+# exists to prevent. Measured during review of this very change: `--jq .body` against a failover
+# returned `null`/rc 0, and `record-review.sh` reads `.body` precisely to tell “the GET failed” from
+# “the body is empty” before it PATCHes a PR description. A caller's `--jq` is therefore admitted only
+# when every name it references is one this encoder produces; otherwise the read is NOT failed over
+# (and, with the pool empty, refused by name instead of answered wrongly). Over-blocking here costs a
+# refusal that would have happened anyway; under-blocking costs a confident wrong answer.
+PULL_NAMES = frozenset({
+    "number", "state", "draft", "merged", "mergeable", "title", "body", "html_url",
+    "updated_at", "created_at", "closed_at", "merged_at", "changed_files", "additions",
+    "deletions", "comments", "head", "base", "user", "sha", "ref", "login",
+})
+# A CONTAINER is a name whose VALUE the encoder reproduces only partly (`head` is {sha,ref}, while REST
+# also has head.label/head.repo/head.user). Naming one as the END of a projection therefore asks for a
+# partial object, which is the same defect as asking for an unproduced field.
+FAILOVER_CONTAINERS = frozenset({"head", "base", "user"})
+# ⛔ THE ALLOW-LIST IS FLAT (the encoder produces those names at the ROOT), SO WALKING THROUGH A CONTAINER
+# MUST BE CHECKED AGAINST WHAT THAT CONTAINER ACTUALLY CARRIES. The rule used to look only at the LAST
+# key, so `.user.html_url` was admitted — `user` is a container, `html_url` is a root name, and the
+# encoder's `user` object has only `login`: the read answered `null` with rc 0 where REST returns a real
+# URL (measured; an exhaustive sweep of 490 admitted two-segment programs found 21 divergences, all of
+# this one shape). One map, so a new container cannot be added without saying what it reproduces.
+CONTAINER_CHILDREN = {
+    "head": frozenset({"sha", "ref"}),
+    "base": frozenset({"sha", "ref"}),
+    "user": frozenset({"login"}),
+}
+# ⛔ `merge_commit_sha` IS DELIBERATELY ABSENT, AND THIS IS THE MOST DANGEROUS FIELD TO GET WRONG.
+# For an UNMERGED PR, REST `merge_commit_sha` is the TENTATIVE test-merge commit and GraphQL
+# `mergeCommit` is **null** — the rail's own header says so (“GraphQL `mergeCommit` is NULL for any
+# unmerged PR (verified on an open PR whose REST `merge_commit_sha` was populated)”), which is exactly
+# why `admin-merge.sh:2049` reads the REST object instead of `gh pr view --json mergeCommit`.
+# Reproducing the NAME from the OTHER field turns every open PR's merge ref into “absent”, and
+# `resolve_merge_ref` then BLOCKS with `no CI run has evaluated the merge of this PR into its base` —
+# a fabricated CI diagnosis for the whole empty-core window, on the very merges this failover exists to
+# keep alive. There is no GraphQL equivalent, so the projection is refused (fail closed).
+COMMENT_NAMES = frozenset({"id", "body", "created_at", "html_url", "user", "login"})
+REVIEW_NAMES = frozenset({"id", "state", "body", "submitted_at", "commit_id", "user", "login"})
+# jq operators/shapes that can reach a field WITHOUT naming it in a `.name` form. A projection using
+# one cannot be shown to stay inside the reproduced body, so it is refused rather than guessed at.
+PROJECTION_SHAPE_OPS = ("getpath", "to_entries", "with_entries", "keys", "keys_unsorted", "tojson",
+                        "paths", "leaf_paths", "map_values", "values", "path", "env", "has",
+                        # the STREAM family and the recursive walkers emit whole subtrees without
+                        # naming a field: `[tostream]` / `[recurse]` both returned the encoder's entire
+                        # subset with rc 0 (review round 2).
+                        "tostream", "truncate_stream", "fromstream", "recurse", "walk")
+PROJECTION_VALUE_FILTERS = ("select", "if", "first", "last", "nth", "until", "while", "recurse", "walk",
+                            "input", "inputs")
+# ⛔ WHY THIS IS A PARSER AND NOT A BLOCKLIST. Five review rounds each closed one jq syntax that
+# reached a field without appearing as a dotted path — `.name`, then `."name"`, then `{name}`, then
+# `[.]`/`@json`/`tostring`/`length`, then `del(.body)` / `.title |= "x"` / `. + {state:.state}`. That
+# list cannot be finished: jq's grammar is open, and every round's fix taught the same lesson — a
+# NEGATIVE rule ("this construct is not allowed") is defeated by the next construct that a helpful
+# reader can spell, while a POSITIVE rule ("only these shapes are projections") is not.
+#
+# So the gate is now a CLOSED GRAMMAR over the shapes the fleet actually writes. Anything this parser
+# cannot derive is REFUSED, which for this layer means a read that fails closed with the named state
+# (and which would have been refused by an empty pool anyway). A false refusal costs one read; a false
+# admission hands a lane a confident wrong answer with a success status.
+#
+#   program   := pipe ( '|' pipe )*            (the top level)
+#   pipe      := atom ( ',' atom )*
+#   atom      := path [ '//' literal ]
+#              | '[' [ atom ( ',' atom )* ] ']'
+#              | '{' [ IDENT ':' atom ( ',' IDENT ':' atom )* ] '}'   (shorthand `{x}` is NOT admitted)
+#              | '(' program ')'
+#              | string                    ("text \(program) text")
+#              | FILTER                    (@tsv @csv @base64 tostring)
+#   path      := '.' ( IDENT | '"' IDENT '"' | '[' '"' IDENT '"' ']' ) ( '.' IDENT | '[' '"' IDENT '"' ']' | '[]' )*
+#   literal   := '"' … '"' | NUMBER | true | false | null | '{}' | '[]'
+#
+# SEMANTIC RULES on top of the grammar: every key must be in the encoder's allow-list; the LAST key of
+# a path may not be a CONTAINER (a partly-reproduced object is not an answer); `[]` may not be terminal
+# (an iteration whose RESULT is emitted is an identity read); and at least one allowed key must be read
+# at all (otherwise the program emits whatever the encoder produced, which is the defect this exists to
+# refuse). `merge_commit_sha` is absent from every allow-list on purpose — see the comment there.
+_PROJ_FILTERS = ("@tsv", "@csv", "@base64", "tostring")
+_PROJ_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PROJ_NUMBER = re.compile(r"-?[0-9]+(?:\.[0-9]+)?")
+
+
+class _ProjectionRefused(Exception):
+    """The program is not a projection this layer can prove. Always a refusal, never a default."""
+
+
+class _ProjectionParser(object):
+    def __init__(self, text, allowed):
+        self.s = text
+        self.i = 0
+        self.allowed = allowed
+        self.leaf = False
+
+    # ── lexical helpers ─────────────────────────────────────────────────────────────────────────
+    def ws(self):
+        while self.i < len(self.s) and self.s[self.i] in " \t\r\n":
+            self.i += 1
+
+    def peek(self):
+        self.ws()
+        return self.s[self.i] if self.i < len(self.s) else ""
+
+    def take(self, ch):
+        self.ws()
+        if self.i >= len(self.s) or self.s[self.i] != ch:
+            raise _ProjectionRefused("expected %r at %d" % (ch, self.i))
+        self.i += 1
+
+    def ident(self):
+        self.ws()
+        m = _PROJ_IDENT.match(self.s, self.i)
+        if not m:
+            raise _ProjectionRefused("expected an identifier at %d" % self.i)
+        self.i = m.end()
+        return m.group(0)
+
+    def key(self, name):
+        if name not in self.allowed:
+            raise _ProjectionRefused("field %r is not reproduced by the encoder" % name)
+        # ⛔ THE LEAF FLAG IS SET BY A KEY THAT PASSES THE MEMBERSHIP RULE, and only there: a program
+        # that names no admissible key emits whatever the encoder produced, which is the defect this
+        # refuses. The CONTAINER rule is applied to the LAST key of a path, not to every segment —
+        # `.head.sha` walks THROUGH the container `head` to reach the scalar `sha`, and rejecting the
+        # intermediate segment refused every in-tree projection (`[.base.sha,.head.sha]`).
+        self.leaf = True
+
+    # ── grammar ────────────────────────────────────────────────────────────────────────────────
+    def program(self, top=True):
+        self.pipe()
+        while self.peek() == "|":
+            self.take("|")
+            # ⛔ A FILTER IS ONLY EVER APPLIED TO A STAGE, NEVER USED AS A BARE VALUE. `[.state,
+            # tostring]` is `tostring` applied to the WHOLE object — an identity read — while
+            # `.body | tostring` is a scalar derived from a named field. So a filter is admissible in
+            # the stage after a `|`, and nowhere else.
+            self.pipe(filters=True)
+        self.ws()
+        # ⛔ END-OF-INPUT IS A TOP-LEVEL RULE ONLY: a nested `(.a)` or `\(.b)` must stop at its own
+        # closing delimiter, and checking here refused every parenthesised in-tree projection.
+        if top and self.i != len(self.s):
+            raise _ProjectionRefused("unconsumed input at %d: %r" % (self.i, self.s[self.i:self.i + 12]))
+
+    def pipe(self, filters=False):
+        self.atom(filters)
+        while self.peek() == ",":
+            self.take(",")
+            self.atom(filters)
+
+    def atom(self, filters=False):
+        c = self.peek()
+        if c == "[":
+            self.array()
+        elif c == "{":
+            self.obj()
+        elif c == "(":
+            self.take("(")
+            self.program(top=False)
+            self.take(")")
+        elif c == '"':
+            self.string()
+        elif c == ".":
+            self.path()
+        elif c == "@" or (filters and _PROJ_IDENT.match(self.s, self.i)):
+            self.filter()
+        elif c == "i" and self.s.startswith("if ", self.i):
+            # ⛔ `if <path> then <literal> else <literal> end` IS A PROJECTION: every branch is a named
+            # field or a constant, and `scripts/atomic-land.sh` reads exactly this to turn `.merged` into
+            # "MERGED"/"OPEN". Refusing it made that caller's poll fall through its own `|| echo OPEN`
+            # and report a LANDED PR as unmerged for the whole wait (review round 6).
+            self.i += 3
+            self.atom()
+            self.ws()
+            if not self.s.startswith("then", self.i):
+                raise _ProjectionRefused("if without then")
+            self.i += 4
+            self.literal()
+            self.ws()
+            if not self.s.startswith("else", self.i):
+                raise _ProjectionRefused("if without else")
+            self.i += 4
+            self.literal()
+            self.ws()
+            if not self.s.startswith("end", self.i):
+                raise _ProjectionRefused("if without end")
+            self.i += 3
+        else:
+            raise _ProjectionRefused("not a projection atom at %d: %r" % (self.i, self.s[self.i:self.i + 12]))
+
+    def filter(self):
+        self.ws()
+        start = self.i
+        for f in _PROJ_FILTERS:
+            if self.s.startswith(f, self.i):
+                self.i += len(f)
+                # a filter APPLIED to an argument (`tostring(`, `@csv {`) is not this shape
+                if self.peek() and self.peek() in "({":
+                    raise _ProjectionRefused("filter %r takes an argument" % f)
+                return
+        self.i = start
+        raise _ProjectionRefused("not an allowed filter at %d: %r" % (self.i, self.s[self.i:self.i + 12]))
+
+    def array(self):
+        self.take("[")
+        if self.peek() == "]":
+            self.take("]")
+            return                                 # `[]` as a literal is admitted only after `//`
+        self.pipe()
+        self.take("]")
+
+    def obj(self):
+        self.take("{")
+        if self.peek() == "}":
+            self.take("}")
+            return
+        while True:
+            k = self.ident()
+            if self.peek() != ":":
+                # `{name}` is `{name: .name}` — a key read with no dot. Refused: the shape is not in
+                # the grammar, and admitting it is how the shorthand escaped five rounds ago.
+                raise _ProjectionRefused("object shorthand %r is not a projection" % k)
+            self.take(":")
+            self.atom()
+            if self.peek() == ",":
+                self.take(",")
+                continue
+            self.take("}")
+            return
+
+    def string(self):
+        self.take('"')
+        while True:
+            if self.i >= len(self.s):
+                raise _ProjectionRefused("unterminated string")
+            ch = self.s[self.i]
+            if ch == "\\" and self.s[self.i:self.i + 2] == "\\(":
+                self.i += 2
+                self.program(top=False)
+                self.take(")")
+                continue
+            if ch == "\\":
+                self.i += 2
+                continue
+            self.i += 1
+            if ch == '"':
+                return
+
+    def literal(self):
+        self.ws()
+        c = self.s[self.i:self.i + 1]
+        if c == '"':
+            self.string()
+            return
+        for kw in ("true", "false", "null"):
+            if self.s.startswith(kw, self.i):
+                self.i += len(kw)
+                return
+        m = _PROJ_NUMBER.match(self.s, self.i)
+        if m:
+            self.i = m.end()
+            return
+        if self.s.startswith("{}", self.i):
+            self.i += 2
+            return
+        if self.s.startswith("[]", self.i):
+            self.i += 2
+            return
+        raise _ProjectionRefused("not a literal at %d" % self.i)
+
+    def path(self):
+        names = []
+        self.take(".")
+        self.ws()
+        if self.peek() == '"':
+            names.append(self._quoted())
+            self.key(names[-1])
+        elif self.peek() == "[":
+            self.take("[")
+            if self.peek() == "]":
+                # `.[]` as the FIRST segment: iteration over the root list. Legal only when something
+                # after it names a field, exactly like the mid-path form below.
+                self.take("]")
+                if self.peek() in ("", ",", "]", "}", ")"):
+                    raise _ProjectionRefused("terminal iteration would emit whole objects")
+            else:
+                self.take('"')
+                names.append(self._quoted(consumed_open=True))
+                self.take("]")
+                self.key(names[-1])
+        else:
+            names.append(self.ident())
+            self.key(names[-1])
+        while True:
+            c = self.peek()
+            if c == ".":
+                self.take(".")
+                names.append(self.ident())
+                self.key(names[-1])
+            elif c == "[":
+                self.take("[")
+                if self.peek() == "]":
+                    self.take("]")
+                    # ⛔ AN ITERATION WHOSE RESULT IS EMITTED IS AN IDENTITY READ. It is legal only
+                    # with something AFTER it that names a field (`.[] | .state`, `.[].x`); a `[]`
+                    # that ENDS the expression hands back whole sub-objects — the encoder's SUBSET
+                    # served as the answer. A following `|` is not terminal: the next stage decides.
+                    if self.peek() in ("", ",", "]", "}", ")"):
+                        raise _ProjectionRefused("terminal iteration would emit whole objects")
+                    continue
+                self.take('"')
+                names.append(self._quoted(consumed_open=True))
+                self.take("]")
+                self.key(names[-1])
+            else:
+                break
+        if names and names[-1] in FAILOVER_CONTAINERS:
+            raise _ProjectionRefused("field %r is a container the encoder reproduces only partly" % names[-1])
+        # ⛔ EVERY container on the way must be walked INTO a name it actually carries (see
+        # CONTAINER_CHILDREN). `.user.html_url` passes the flat allow-list and would answer `null`.
+        for i, name in enumerate(names[:-1]):
+            kids = CONTAINER_CHILDREN.get(name)
+            if kids is not None and names[i + 1] not in kids:
+                raise _ProjectionRefused("field %r is not reproduced inside %r" % (names[i + 1], name))
+        if self.peek() == "/" and self.s[self.i:self.i + 2] == "//":
+            self.i += 2
+            self.literal()
+
+    def _quoted(self, consumed_open=False):
+        if not consumed_open:
+            self.take('"')
+        name = self.ident()                     # a literal identifier only: no computed keys
+        self.take('"')
+        return name
+
+
+def _projection_ok(jq, allowed):
+    """Does this `--jq` program stay inside the body the encoder can produce?
+
+    ⛔ A CLOSED GRAMMAR, NOT A LIST OF FORBIDDEN CONSTRUCTS — see the block above `_PROJ_FILTERS`.
+    Five rounds of blocklist fixes each closed one spelling and left the next one open
+    (`.name` → `."name"` → `{name}` → `[.]`/`@json`/`tostring`/`length` → `del(.body)` /
+    `.title |= "x"` / `. + {state:.state}`), and the measured cost of the last one was a program that
+    emitted the encoder's 22-key SUBSET where REST returns 46 keys, with rc 0. A rule that says only
+    what IS a projection cannot be escaped by a spelling nobody thought of."""
+    if not jq or not jq.strip():
+        return False
+    if ".." in jq:
+        return False                # recursive descent: no depth bound, no field attribution
+    p = _ProjectionParser(jq, allowed)
+    try:
+        p.program()
+    except _ProjectionRefused:
+        return False
+    return p.leaf
+
+
+def _enc_pull(doc):
+    pr = (((doc.get("data") or {}).get("repository") or {}).get("pullRequest"))
+    if not isinstance(pr, dict):
+        return None
+    # REST's `state` is lowercase and reports a merged PR as `closed` with `merged: true`; GraphQL has
+    # its own third value. Mapping it ANY other way would make a merged PR look open.
+    state = {"OPEN": "open", "CLOSED": "closed", "MERGED": "closed"}.get((pr.get("state") or "").upper(), "")
+    mergeable = {"MERGEABLE": True, "CONFLICTING": False}.get((pr.get("mergeable") or "").upper())
+    return json.dumps({
+        "number": pr.get("number"), "state": state, "draft": bool(pr.get("isDraft")),
+        "merged": bool(pr.get("merged")), "mergeable": mergeable, "title": pr.get("title"),
+        "body": pr.get("body"), "html_url": pr.get("url"),
+        "updated_at": pr.get("updatedAt"), "created_at": pr.get("createdAt"),
+        "closed_at": pr.get("closedAt"), "merged_at": pr.get("mergedAt"),
+        "changed_files": pr.get("changedFiles"), "additions": pr.get("additions"),
+        "deletions": pr.get("deletions"),
+        # REST's `comments` on a PR is a COUNT, not a list — same shape, from totalCount.
+        "comments": (pr.get("comments") or {}).get("totalCount"),
+        "head": {"sha": pr.get("headRefOid"), "ref": pr.get("headRefName")},
+        "base": {"sha": pr.get("baseRefOid"), "ref": pr.get("baseRefName")},
+        "user": {"login": (pr.get("author") or {}).get("login")},
+    }).encode()
+
+
+def _enc_issue_comments(doc):
+    issue = (((doc.get("data") or {}).get("repository") or {}).get("issue"))
+    if not isinstance(issue, dict):
+        return None
+    # ⛔ A MISSING CONNECTION IS NOT AN EMPTY ONE. Substituting `[]` answered rc 0 with an EMPTY body for
+    # a document that simply did not carry `comments` — an empty answer with a success status, the one
+    # shape this file exists to prevent (measured, review round 4). `nodes` present-and-empty is a real
+    # “no comments”; `comments` absent is “I cannot reproduce the REST body”, which is `None`.
+    conn = issue.get("comments")
+    if not isinstance(conn, dict):
+        return None
+    # ⛔ AN ABSENT `pageInfo` IS NOT “COMPLETE”. Testing only `hasNextPage is True` read a missing (or
+    # null) `pageInfo` as the end of the list and emitted a window truncated at `first:30` as the whole
+    # answer — the exact “a truncated list reported as complete is a different answer” this guard
+    # forbids, from the guard's own blind spot (measured, round 7). The connection must SAY it is
+    # complete: `hasNextPage` false.
+    if (conn.get("pageInfo") or {}).get("hasNextPage") is not False:
+        return None
+    nodes = conn.get("nodes")
+    if not isinstance(nodes, list) or any(not isinstance(n, dict) for n in nodes):
+        # ⛔ GraphQL returns `null` for a node the viewer cannot see, and `.get` on it raised an
+        # AttributeError — the caller got a Python traceback instead of the named refusal, so
+        # `objective.py`'s TRANSPORT_MARKERS could not turn it into VERDICT=GH-RATE-LIMITED
+        # (measured, round 8). A list we cannot reproduce faithfully is `None`, like every other
+        # unrepresentable shape here.
+        return None
+    return json.dumps([{"id": n.get("databaseId"), "body": n.get("body"),
+                        "created_at": n.get("createdAt"), "html_url": n.get("url"),
+                        "user": {"login": (n.get("author") or {}).get("login")}} for n in nodes]).encode()
+
+
+def _enc_pr_reviews(doc):
+    pr = (((doc.get("data") or {}).get("repository") or {}).get("pullRequest"))
+    if not isinstance(pr, dict):
+        return None
+    conn = pr.get("reviews")
+    if not isinstance(conn, dict):
+        return None                    # a missing connection is not an empty review list (see above)
+    if (conn.get("pageInfo") or {}).get("hasNextPage") is not False:
+        return None                    # absent pageInfo = “I cannot prove this is the whole list”
+    nodes = conn.get("nodes")
+    if not isinstance(nodes, list) or any(not isinstance(n, dict) for n in nodes):
+        return None                    # a null node is not a review we can reproduce (see comments)
+    return json.dumps([{"id": n.get("databaseId"), "state": n.get("state"), "body": n.get("body"),
+                        "submitted_at": n.get("submittedAt"),
+                        "commit_id": (n.get("commit") or {}).get("oid"),
+                        "user": {"login": (n.get("author") or {}).get("login")}} for n in nodes]).encode()
+
+
+# path regex -> (GraphQL query, encoder). ⛔ `repos/{o}/{r}/commits/{sha}/check-runs` IS DELIBERATELY
+# ABSENT. `statusCheckRollup` mixes `CheckRun` nodes with `StatusContext` nodes, and a StatusContext
+# has NO representation as a REST `check_run` — a synthesized list would silently drop every legacy
+# status and could turn a red surface into a green one. The honest answer for that path is the named
+# state (fail closed), not a plausible-looking body. Recorded in docs/ops/gh-rate-limits.md.
+GRAPHQL_EQUIVALENTS = (
+    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)$"), _GQL_PR, _enc_pull, PULL_NAMES),
+    (re.compile(r"^repos/([^/]+)/([^/]+)/issues/(\d+)/comments$"), _GQL_ISSUE_COMMENTS,
+     _enc_issue_comments, COMMENT_NAMES),
+    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)/reviews$"), _GQL_PR_REVIEWS,
+     _enc_pr_reviews, REVIEW_NAMES),
+)
+
+
+def graphql_plan(plan):
+    """(gh argv, encoder) that answers `plan`'s REST read from the GraphQL pool, or None.
+
+    ⛔ THE ADMISSION IS `conditional_plan`'S, NOT A SECOND ONE. That function already refuses every
+    shape whose output this layer would have to re-create by hand (`--paginate`, `-i`, `-H`, `-f`, a
+    non-GET method, `--template`). Taking the plan as input means a shape it refuses can never be
+    failed over either — one gate, two transports.
+
+    ⛔ AND THE PROJECTION IS ADMITTED SEPARATELY. A REST body we can only PARTLY reproduce is not a
+    near miss: `--jq` prints `null` for a missing field and exits 0, so the caller is told the read
+    succeeded while a field it needed does not exist. `_projection_ok` therefore refuses any `--jq`
+    that names something the encoder does not produce.
+
+    ⛔ A GHES HOST IS REFUSED — BOTH SPELLINGS. `gh` reads the host from `GH_HOST` when `--hostname`
+    is absent, so checking only the flag let a box with `GH_HOST=<ghes>` be failed over to an endpoint
+    this layer has no reason to trust (the same class the ETag cache key already guards)."""
+    if plan is None or plan.get("host"):
+        return None
+    host_env = (os.environ.get("GH_HOST") or "").strip().lower()
+    if host_env and host_env != "github.com":
+        return None
+    path = (plan.get("path") or "").strip("/")
+    for pat, query, enc, allowed in GRAPHQL_EQUIVALENTS:
+        m = pat.match(path)
+        if not m:
+            continue
+        if not _projection_ok(plan.get("jq"), allowed):
+            log_event("failover: NOT attempted for `%s` — the --jq names a field the encoder cannot "
+                      "reproduce, so answering it would return null with a success status" % path)
+            return None
+        owner, name, number = m.group(1), m.group(2), m.group(3)
+        # ⛔ VARIABLES, NOT INTERPOLATION. The path comes from argv, so a string-substituted query
+        # would be an injection surface; gh types `-F number=` as an Int, which is what the query
+        # declares.
+        gargv = ["api", "graphql", "-f", "query=" + query,
+                 "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=" + number]
+        return gargv, enc
+    return None
+
+
+def run_failover(real_gh, fo):
+    """One GraphQL request, encoded back into the REST body the caller expects.
+
+    ⛔ A GRAPHQL `errors` ARRAY IS A FAILURE, not an empty result — the same rule as a refused REST
+    call. The caller applies its own `--jq` afterwards (`emit`), exactly as on the REST path, so a
+    projection can never be silently dropped by the transport change."""
+    gargv, enc = fo
+    res = run(real_gh, gargv)
+    if res.rc != 0:
+        return Result(res.rc, res.out, res.err)
+    try:
+        doc = json.loads(res.out.decode("utf-8", "replace"))
+    except ValueError:
+        return Result(1, b"", b"gh-limit: failover answered with bytes that are not JSON\n")
+    if doc.get("errors"):
+        return Result(1, b"", ("gh-limit: graphql failover refused: %s\n"
+                               % json.dumps(doc["errors"])[:400]).encode())
+    body = enc(doc)
+    if body is None:
+        return Result(1, b"", b"gh-limit: graphql failover cannot reproduce the REST body (object absent)\n")
+    return Result(0, body, b"")
+
+
+def _named_core_refusal(phrase, why):
+    """The single line a lane prints instead of “branch protection UNREADABLE” — STDOUT-CLEAN.
+
+    It keeps the words `rate limit` because `objective.py`'s TRANSPORT_MARKERS turn a refused read
+    into `VERDICT=GH-RATE-LIMITED` from that phrase, and a named state that lost the classifier's
+    marker would be MORE honest to a human and LESS honest to the beat. ⛔ AND IT NO LONGER ASSERTS
+    “the REST pool is EMPTY”: the same helper is called for `gh-graphql-unavailable` and for a
+    low-water refusal, where that sentence would be false about the pool."""
+    sys.stderr.write(
+        "gh-limit: %s — gh rate limit: this is the GitHub BUDGET, not a broken repo, an invalid "
+        "token, or GitHub being down. %s\n" % (phrase, why))
+
+
+def _named_floor_refusal(remaining, floor, reset, dated):
+    """The floor's own refusal: NAMED, STDOUT-CLEAN, and TRUE about the pool.
+
+    ⛔ IT SAYS `remaining=<n>`, NOT `remaining=0`. The pool is not empty; it is inside the reserve
+    this layer keeps for writes, and a message that over-claimed emptiness would be the same false
+    diagnosis as `repo-authority.sh` printing “the merge contract is UNKNOWN” for a spent budget —
+    the defect the whole change exists to remove. `resets_in=?` when the window was never measured,
+    for the same reason (`_record_is_unreadable`).
+
+    ⛔ IT KEEPS THE WORDS `gh rate limit` because `objective.py`'s TRANSPORT_MARKERS classify a
+    refused read from that phrase, and here the budget genuinely IS the reason. It writes NO health
+    record: nothing was measured as exhausted, and a floor refusal is not evidence about the pool.
+    ⛔ BUT IT DOES RECORD ITSELF IN `events.log` (review P2). Every rail caller passes `2>/dev/null`,
+    so a fleet-wide floor refusal was invisible everywhere — `--health` said `gh-ok`, no `last-limit`
+    was written, and the only copy of the reason was the stderr the caller discarded. A local append
+    costs no request, and it makes the policy findable after the fact."""
+    log_event("pressure: gh-core-floor remaining=%s floor=%d resets_in=%s — read refused; the reserve "
+              "is kept for writes (GH_LIMIT_ESSENTIAL=1 defers this policy)"
+              % ("?" if remaining is None else remaining, floor,
+                 resets_in(reset) if dated else "?"))
+    sys.stderr.write(
+        "gh-limit: gh-core-floor remaining=%s floor=%d resets_in=%s — gh rate limit: this is the "
+        "GitHub BUDGET, not a broken repo, an invalid token, or GitHub being down. The REST pool is "
+        "inside the reserve this layer keeps for WRITES (a merge has no second pool), and this read "
+        "has NO exact GraphQL equivalent, so it is refused rather than spending that reserve. "
+        "Nothing was sent. If this work cannot proceed without this read, re-run with %s=1"
+        "%s.\n"
+        % ("?" if remaining is None else remaining, floor,
+           resets_in(reset) if dated else "?", ESSENTIAL_ENV,
+           "" if dated else " (the window was never measured, so no reset is claimed)"))
+
+
 def _dispatch(real_gh, gh_argv):
     """Run, back off, retry — holding the single-flight lock for each ATTEMPT and NOT for the wait.
 
@@ -2512,6 +4259,9 @@ def _dispatch(real_gh, gh_argv):
     requests overlap) while letting an independent call proceed (it will be refused and back off on
     its own if the bucket is still empty, which is the honest behaviour)."""
     plan = conditional_plan(gh_argv)
+    # The failover uses the SAME parse with the ETag kill-switch ignored (see `conditional_plan`):
+    # turning off conditional requests must not take the second transport with it.
+    read_plan = plan if plan is not None else conditional_plan(gh_argv, honour_kill_switch=False)
     attempt = 0
     waited = 0.0
     mutating = is_mutating(gh_argv)
@@ -2538,6 +4288,143 @@ def _dispatch(real_gh, gh_argv):
     # pace local commands against a network budget.
     counts_budget = makes_request(gh_argv)
     res = None
+    # ⛔ BUDGET FIRST, TRANSPORT SECOND — AND THE BUDGET READ IS FREE. `core_pressure` touches two
+    # local files (a snapshot someone already paid for, and the durable refusal record) and makes NO
+    # request, so this decision costs nothing on the hot path. It is also why a box does not need to
+    # poll the meter to benefit: the FIRST refused `core` call anywhere writes the record every other
+    # lane then reads.
+    fo = None
+    core_reset = None                     # kept so a LATER record cannot erase the reset we acted on
+    core_empty = False                    # did the DECISION say the pool was empty (not merely low)?
+    core_dated = False                    # …and did it know WHEN the window ends?
+    # ⛔ A SPECULATIVE CONDITIONAL READ IS ALLOWED **ONCE**, NEVER ONCE PER RETRY. See the branch that
+    # sets it: a cached validator offers a POSSIBLE 304, not a free request, so a changed resource must
+    # be refused rather than retried into the pool the layer has measured as empty.
+    _speculative_read = False
+    # ⛔ THE GUARD IS NOT `bucket == core`, BECAUSE THE RAIL'S OWN MERGE IS LABELLED `graphql`.
+    # `bucket_for` answers `core` only for `REST_SUBCOMMANDS`, so `gh pr merge` → `graphql` — while
+    # `gh-rest/gh` TRANSLATES that same command into `api -X PUT repos/…/pulls/N/merge`, which IS a
+    # core write (and it delegates the verbatim form for `--admin`, an unmodelled flag, which is
+    # exactly what `admin-merge.sh` passes). Measured before this fix: with a dated-empty core record,
+    # `gh pr merge --admin --match-head-commit …` was SENT (1 request), the refusal was recorded
+    # against `graphql`, a 64 s wait and a retry followed, NO health record was written — and once the
+    # 30 s snapshot expired, `--health` said `gh-ok`: the 2026-10-22 misdiagnosis, from the path that
+    # matters most. A WRITE therefore consults the CORE record whatever pool gh labels it with: there
+    # is no second pool for a write, and a refusal is retryable while a retry storm is not. (The
+    # over-block this accepts: on a box with no REST adapter a GraphQL-native merge could have
+    # succeeded during a core-empty window — refused, visible, and re-runnable; the alternative is the
+    # burst this layer exists to prevent.)
+    bucket = bucket_for(gh_argv)
+    if reaches_api(gh_argv) and (bucket == "core" or (mutating and bucket == "graphql")):
+        # ⛔ MEASURE THE POOL BEFORE DECIDING ON IT (#2342 review P1). The floor can only act on a
+        # MEASURED `remaining`, and the only non-zero source of one is `budget.json` — whose only
+        # writer WAS the `--budget` verb, which NO harness script calls, plus the refusal path's own
+        # probe (which by definition runs once the pool is already EMPTY). So the floor was a gate
+        # that could never fire in production: the no-op-enforcer class it exists to prevent, and the
+        # suite only reached it because a test called `--budget` explicitly. `read_budget()` stays the
+        # free hot path; this spends ONE exempt `/rate_limit` per box per TTL, and only when there is
+        # no fresh snapshot to read.
+        # ⛔ ONLY WHERE THE FLOOR COULD ACT, AND ONLY WHEN NOTHING LOCAL IS KNOWN. A probe on every
+        # read would spend a request to learn something the existing mechanisms already record (the
+        # refusal path probes once for the whole box), and a read that CAN fail over needs no floor: it
+        # is served from GraphQL either way. So a probe happens for a read that has NO exact
+        # equivalent, when no snapshot and no durable record exists — the exact case in which the
+        # guard would otherwise be blind.
+        if read_budget() is None and core_pressure() is None and graphql_plan(read_plan) is None:
+            budget_snapshot_or_probe(real_gh)
+        pressure = core_pressure()
+        if pressure is not None:
+            reset, remaining, core_dated = pressure
+            core_reset = reset
+            core_empty = (remaining == 0)
+            # ⛔ “EXHAUSTED” IS A CLAIM ABOUT THE POOL, AND IT MUST BE TRUE. In the low-water band
+            # (0 < remaining <= CORE_LOW_WATER) the pool is NOT empty: reads move to GraphQL to keep
+            # the reserve, but nothing is asserted exhausted and no write is refused. The earlier
+            # draft refused writes and wrote `gh-core-exhausted` at remaining=50 — a false diagnosis
+            # produced by the very layer that exists to stop false diagnoses.
+            empty = core_empty
+            # ⛔ THE NAMED STATE IS WRITTEN WHENEVER IT IS TRUE — including on the failover path, where
+            # the read SUCCEEDS. The pool being empty is a fact about the budget that lanes,
+            # `repo-authority.sh` and an operator all need to see; a GraphQL-served read does not make
+            # it stop being true (only a real `core` success does — see `record_core_ok`).
+            phrase = record_core_exhausted(reset if core_dated else None, remaining) if empty else None
+            if mutating:
+                if empty and core_dated:
+                    # ⛔ A WRITE HAS NO SECOND POOL. `merge`, `comment` and `PATCH` have no GraphQL
+                    # equivalent that IS the same write, so there is nothing to fail over TO — and
+                    # retrying into an empty pool is what turned one limit into a 4,482-fork storm.
+                    # ⛔ BUT ONLY A DATED WINDOW MAY REFUSE WITHOUT SENDING ONE. An undated refusal
+                    # (no reset) may have been a burst that cleared seconds ago, and nothing would
+                    # ever clear the record if no call were attempted — `record_core_ok` fires on a
+                    # SUCCESS, so a box that refuses pre-emptively could never recover itself.
+                    _named_core_refusal(
+                        record_core_exhausted(reset if core_dated else None, remaining),
+                        "This call WRITES (no GraphQL equivalent of the same write) and is NOT retried.")
+                    return 1
+                # In the band (or with undated evidence) a WRITE is what the reserve exists for.
+            else:
+                fo = graphql_plan(read_plan) if failover_enabled() else None
+                if fo is not None:
+                    log_event("failover: %s — serving `%s` from the GraphQL pool"
+                              % (phrase or "core remaining=%s reset=%s"
+                                 % ("?" if remaining is None else remaining, reset),
+                                 _flight_label(gh_argv)))
+                elif empty and core_dated:
+                    # ⛔ UNLESS A FREE REVALIDATION IS AVAILABLE. A `gh api` GET with a stored ETag costs
+                    # NOTHING on a 304 (“a 304 does not count against the primary limit” — this file's
+                    # own promise), so refusing it before trying would be an over-block against the
+                    # guarantee that makes polling affordable. Only a call that WOULD spend quota is
+                    # refused pre-emptively.
+                    if plan is not None and cache_get(cache_key(plan)) is not None:
+                        # ⛔ A CACHED VALIDATOR OFFERS A *POSSIBLE* 304 — IT IS NOT ONE. Sending the
+                        # call is therefore a bet that it spends nothing, and when the resource HAS
+                        # changed the request goes into a pool the layer has MEASURED as empty and
+                        # then enters the ordinary retry ladder. Measured, round 9: the incident's own
+                        # read (`branches/main/protection`) with one cached validator made FOUR
+                        # conditional GETs into the empty pool and reported `waited=599s`, where the
+                        # same box with no validator made ZERO requests and refused by name. So the
+                        # bet is allowed exactly ONCE — a 304 succeeds and costs nothing, anything
+                        # else is refused WITHOUT a retry, which is what “never retry into the limit”
+                        # means here.
+                        _speculative_read = True
+                        log_event("pressure: core empty but a validator is cached for `%s` — "
+                                  "attempting the conditional GET ONCE (a 304 spends no quota; a "
+                                  "changed resource is refused, not retried)"
+                                  % _flight_label(gh_argv))
+                    else:
+                        # ⛔ NO EXACT EQUIVALENT, EMPTY POOL: refuse with the NAME. Approximating it
+                        # (an empty `check_runs`, a null protection set, a `--jq` of a field we
+                        # cannot produce) is the one thing that would make a lane read “nothing is
+                        # required” — a red tree mistaken for a green one.
+                        _named_core_refusal(
+                            phrase,
+                            "This read has NO exact GraphQL equivalent, so it is refused rather "
+                            "than approximated.")
+                        return 1
+                elif isinstance(remaining, int) and 0 < remaining <= CORE_FLOOR and not essential():
+                    # ⛔ THE FLOOR, ENFORCED — and this is the branch #2342 is about. It used to say
+                    # “remaining > 0 but low and no equivalent: the read can still succeed, so let
+                    # it”, i.e. a read with no failover was allowed to spend the RESERVE. That is the
+                    # spend that empties the pool in the last minutes of every window and takes every
+                    # WRITE down with it (measured 2026-10-23 04:11Z: `core remaining=0` for the Mac
+                    # and all three cells at once). The reserve is for work that cannot be deferred;
+                    # a caller that says it cannot be deferred asks for it by name.
+                    # ⛔ BUT A CACHED VALIDATOR IS CONSULTED FIRST (review P1). Refusing a read whose
+                    # 304 would have cost NOTHING is stricter than total exhaustion, and the arm above
+                    # already states the rule: “refusing it before trying would be an over-block
+                    # against the guarantee that makes polling affordable”. Same bet, same bound: a
+                    # 304 succeeds free, a CHANGED resource is refused without a retry.
+                    if plan is not None and cache_get(cache_key(plan)) is not None:
+                        _speculative_read = True
+                        log_event("floor: core remaining=%d <= floor=%d but a validator is cached for "
+                                  "`%s` — attempting the conditional GET ONCE (a 304 spends no "
+                                  "quota; a changed resource is refused, not retried)"
+                                  % (remaining, CORE_FLOOR, _flight_label(gh_argv)))
+                    else:
+                        _named_floor_refusal(remaining, CORE_FLOOR, reset, core_dated)
+                        return 1
+                # remaining UNKNOWN (an undated record — no measurement, so no floor claim), or the
+                # caller declared this read essential: it can still succeed, so it is sent.
     while True:
         # ⛔ THE PARTITION IS TAKEN IMMEDIATELY BEFORE THE SEND (requirement 1): the slot is a
         # REQUEST, so a retry spends another one, and NO_WAIT callers proceed over the partition with
@@ -2594,7 +4481,12 @@ def _dispatch(real_gh, gh_argv):
                 if w > 0:
                     pause(w)
                 mark_mutation()
-            res, headers = run_attempt(real_gh, gh_argv, plan)
+            if fo is not None:
+                # Inside the lock, like every other request: the failover is not an exemption from
+                # “one gh request in flight per box”.
+                res, headers = run_failover(real_gh, fo), {}
+            else:
+                res, headers = run_attempt(real_gh, gh_argv, plan)
         finally:
             release_lock(lock)
         if res.rc == 0:
@@ -2608,8 +4500,27 @@ def _dispatch(real_gh, gh_argv):
             # still refusing — and `cloud-cell-supervisor.sh`'s `cmd_check` runs `gh --version`
             # through this very layer, so the operator's diagnostic ERASED the evidence it was run
             # to read (review round 8).
-            if makes_request(gh_argv):
-                record_recovery(bucket_for(gh_argv))
+            if makes_request(gh_argv) and getattr(res, "status", None) != 304:
+                # ⛔ A REVALIDATED `304` IS NOT A SUCCESSFUL CORE CALL. It is exempt from the primary
+                # limit BY DESIGN — the same “exempt, therefore not evidence” class `makes_request`
+                # already excludes for `api rate_limit`. Counting it here made one cached-validation
+                # poll ERASE the exhaustion evidence: `record_core_ok()` unlinked the health record and
+                # `record_recovery("core")` marked `last-limit` recovered, so once the 30 s budget
+                # snapshot expired every lane on the box stopped failing over and `--health` said
+                # `gh-ok` while the pool was spent — the exact 2026-10-22 misdiagnosis this layer
+                # exists to remove, reachable from the one optimisation that is supposed to be free.
+                # The bucket that recovers is the one that ANSWERED, not the one the argv names.
+                record_recovery("graphql" if fo is not None else bucket_for(gh_argv))
+                if fo is None and bucket_for(gh_argv) == "core":
+                    record_core_ok()
+            if fo is not None:
+                log_event("failover: served `%s` from GraphQL (core still exhausted)"
+                          % _flight_label(gh_argv))
+                if res.err:
+                    sys.stderr.buffer.write(res.err)
+                # The caller's OWN `--jq` is applied to the synthesized REST body, exactly as it would
+                # be to a real one — so the transport change is invisible to the projection.
+                return emit(res.out, read_plan["jq"], read_plan["silent"])
             if plan is not None:
                 if res.err:
                     sys.stderr.buffer.write(res.err)
@@ -2617,6 +4528,55 @@ def _dispatch(real_gh, gh_argv):
             sys.stdout.buffer.write(res.out)
             sys.stderr.buffer.write(res.err)
             return 0
+        if fo is not None:
+            # ⛔ NO RETRY ACROSS POOLS. The GraphQL pool WAS the alternative and it refused too, so
+            # trying again here is precisely the “retry into the limit” this layer forbids: the next
+            # honest event is the reset, not another request. Name the state and leave.
+            #
+            # ⛔ THE RESET IS TAKEN FROM THE DECISION, NOT RE-READ AFTER THE RECORD IS OVERWRITTEN.
+            # `record_limit("graphql", …)` replaces `last-limit` (one record per box, by design), so
+            # asking `recorded_reset("core")` afterwards returns None — and a health record written
+            # with `reset=0` makes `--health` report `gh-ok` at the exact moment BOTH pools are empty
+            # and `repo-authority.sh` goes silent. `core_reset` was captured before any of that.
+            limit = classify(res, gh_argv, headers)
+            if limit is not None:
+                # ⛔ THE CLASSIFICATION DECIDES THE WINDOW HERE TOO (#2137). Passing the remaining
+                # count in the old positional slot would have written a GraphQL `kind=` of "remaining=3200",
+                # and recording the bucket reset as the window is the full-window block that #2137
+                # exists to remove.
+                _fo_kind = limit_kind(limit)
+                record_limit("graphql", limit.reset, attempt, 0.0, limit.status, _fo_kind,
+                             marker_until(_fo_kind, limit.reset, None, clock()), limit.remaining)
+            # ⛔ THE BAND IS NOT EXHAUSTION, ON THIS PATH TOO. `core_empty` is false when the pool still
+            # had headroom (the read was moved to GraphQL to PRESERVE that headroom): writing
+            # `gh-core-exhausted … remaining=0` here made `health_reset()` report pressure, so every
+            # WRITE on the box was refused without spending a request until the reset — the round-1
+            # finding, reintroduced through the failover-failure branch. What actually failed is the
+            # GraphQL transport, so that is what gets named.
+            if core_empty:
+                phrase = record_core_exhausted(core_reset if core_dated else None, 0)
+            else:
+                phrase = "gh-graphql-unavailable resets_in=%s" % resets_in(core_reset)
+            _named_core_refusal(
+                phrase,
+                "The GraphQL failover was refused as well, so BOTH pools are empty for this read."
+                if limit is not None and core_empty else
+                "The GraphQL failover was refused, so this read cannot be served on either transport."
+                if limit is not None else
+                "The GraphQL failover could not reproduce the REST body, so this read is refused.")
+            # ⛔ THE FAILOVER CHILD'S STDOUT IS **NOT** WRITTEN HERE (#2342 review, P2). `run_failover`
+            # returns the GraphQL child's `Result` verbatim, and `gh api graphql` prints its ERROR
+            # DOCUMENT on stdout (`{"data":null,"errors":[…]}` — the same measured shape this file
+            # records for `gh api`). Copying it out broke the contract this change states twice —
+            # "every refusal path exits non-zero with EMPTY stdout" — so a caller that reacts to
+            # emptiness/`-n` rather than to the exit status (exactly the pattern
+            # `record-review.sh::target_head_red` was fixed for) was handed a foreign document instead
+            # of "nothing". The "never SUBTRACT what the child printed" rule does not reach these
+            # bytes: the caller asked for a REST read the failover substituted, so this is the LAYER's
+            # transport, not the child the caller invoked. stderr IS kept — it is the diagnosis.
+            if res.err:
+                sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
+            return res.rc or 1
         limit = classify(res, gh_argv, headers)
         if limit is None:
             # Not a limit: replay the child and let the caller decide. No retry, no rewrite, BOTH
@@ -2633,6 +4593,24 @@ def _dispatch(real_gh, gh_argv):
             return res.rc
         now = clock()
         kind = limit_kind(limit)
+        if _speculative_read and attempt >= 1:
+            # The ONE speculative conditional GET was made and did not pay off (no 304):
+            # refuse by name, do not retry into the pool.
+            reset = limit.reset or recorded_reset(limit.bucket)
+            # The age names the evidence that was used (see the give-up arm below).
+            prior = read_marker() if limit.reset is None else None
+            page = marker_age(prior) if prior and prior.get("bucket") == limit.bucket else 0
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                         record_window(limit, kind, reset, None, now), limit.remaining)
+            log_event("GAVE UP (speculative conditional read) bucket=%s status=%s kind=%s attempts=%d remaining=%s marker_age=%ds"
+                      % (limit.bucket, limit.status, kind, attempt,
+                         "%d" % limit.remaining if limit.remaining is not None else "?", page))
+            fail_loudly(limit, attempt, waited, reset, kind, limit.remaining, page)
+            if res.out:
+                sys.stdout.buffer.write(res.out)
+            if res.err:
+                sys.stderr.buffer.write(res.err)
+            return res.rc
         if attempt >= MAX_ATTEMPTS:
             # ⛔ CHECKED BEFORE `plan_wait`, because that may spend one more `/rate_limit` request
             # (the probe) — and this is the attempt that is about to fail, on a box that is already
