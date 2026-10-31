@@ -337,6 +337,20 @@ if not_flags "context-unbalanced" "$TMP/extglob-targets" && flags "stat-c-gnu" "
 else
   bad "C28: valid code gained a context-unbalanced (or lost its real finding) — a false red on correct code"
 fi
+# ⛔ C29 — `! case` (review cycle-5 P0). Command position is an ENUMERATION, and `!` was the one
+# prefix bash accepts that it omitted: the arm label then popped the substitution, the glued `#` was
+# called DATA, and the apostrophe in that prose swallowed the rest of the file — a regression against
+# the previous head, which had accepted any non-word byte. The fixture keeps the apostrophe for the
+# same reason C24 does (without it the arm proves nothing).
+CASQ3=$(printf '\047')
+mkdir -p "$TMP/tree/bangcase"
+{ printf '%s\n' '#!/usr/bin/env bash';
+  printf 'x=$(! case a in a)# don%st reorder\n' "$CASQ3";
+  printf '%s\n' '  sed -i s/a/b/ f' '  stat -c %Y g' '  ;;' 'esac)' '# it is fine'; } >"$TMP/tree/bangcase/1.sh"
+printf 'bangcase/1.sh\n' >"$TMP/bangcase-targets"
+flags "sed-in-place-gnu" "$TMP/bangcase-targets" && flags "stat-c-gnu" "$TMP/bangcase-targets" \
+  && ok "C29: \"! case\" inside a substitution keeps its arm model — the live traps are reported (! is a command prefix)" \
+  || bad "C29: the arm model was skipped after an ! prefix and the live traps went unreported"
 # ⛔ E15 — A REFUSAL MESSAGE MUST NOT EXECUTE ANYTHING (review cycle-3 P2). The malformed-table
 # message once carried backticks inside double quotes, so the shell command-substituted them: `id` ran
 # with `<TAB>` as a redirect target and the operator lost the column names.

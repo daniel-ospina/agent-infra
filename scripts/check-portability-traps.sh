@@ -560,7 +560,12 @@ function cmd_boundary(line, i,   j, prev, w) {
   while (j >= 1 && substr(line, j, 1) ~ /[ \t]/) j--
   if (j < 1) return 1
   prev = substr(line, j, 1)
-  if (prev ~ /[;&|({]/) return 1
+  # ⛔ `!` IS A COMMAND PREFIX TOO (review cycle-5 P0): `! case … in a)# comment` skipped the whole
+  # arm model, the arm label `)` popped the substitution, the glued `#` was called DATA and the
+  # apostrophe in that prose swallowed the rest of the file — a REGRESSION against the previous head,
+  # which had accepted any non-word byte. The enumeration is the defect class: every character bash
+  # accepts before a command must be listed, so `!` belongs with `;`, `&`, `|`, `(`, `{`.
+  if (prev ~ /[;&|({!]/) return 1
   if (prev == ")") return 1
   if (prev ~ /[A-Za-z0-9_]/) {
     w = ""
