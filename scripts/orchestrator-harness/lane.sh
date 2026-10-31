@@ -247,14 +247,14 @@ if [ ! -f "$LANE_MERGE_CMD" ]; then
   # while the brief pointed at nothing. Say nothing rather than something false, and name the remedy.
   if [ "$SELF/lane-merge.sh" != "$LANE_MERGE_CMD" ] && [ -f "$SELF/lane-merge.sh" ]; then
     LANE_MERGE_CMD="$SELF/lane-merge.sh"
-    echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Sync: cp scripts/orchestrator-harness/*.sh $O/" >> "$O/logs/lane-$N.log"
+    echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O/" >> "$O/logs/lane-$N.log"
   else
     # ⛔ THE BRIEF MUST SAY WHAT THIS LINE SAYS (landing-review finding 2): the merge-loop section below is
     # rendered from $MERGE_LOOP_NOTE, so this arm now really does tell the lane the tool is missing and
     # what to do instead — previously the log promised that and the brief named a path that did not exist
     # (exit 127, unmapped by the brief's own exit-code table).
-    MERGE_LOOP_NOTE="⛔ THE MERGE LOOP IS NOT INSTALLED ON THIS BOX ($LANE_MERGE_CMD does not exist). Do NOT hand-roll a polling loop: if you cannot reach \`merged\`, report the exact blocker as a hand-off comment per **Handoff** below and stop. An operator can install it with: \`cp $SELF/*.sh $O/\`"
-    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief now says so and tells the lane to hand off instead of running a missing path; sync first: cp $SELF/*.sh $O/" >> "$O/logs/lane-$N.log"
+    MERGE_LOOP_NOTE="⛔ THE MERGE LOOP IS NOT INSTALLED ON THIS BOX ($LANE_MERGE_CMD does not exist). Do NOT hand-roll a polling loop: if you cannot reach \`merged\`, report the exact blocker as a hand-off comment per **Handoff** below and stop. An operator can install it from the agent-infra checkout (NOT from this lane worktree) with: \`bash scripts/orchestrator-harness/deploy-harness.sh --repo <agent-infra> --o $O\`"
+    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief now says so and tells the lane to hand off instead of running a missing path; redeploy first FROM THE agent-infra CHECKOUT (not this lane worktree) with bash scripts/orchestrator-harness/deploy-harness.sh --repo <agent-infra> --o $O/" >> "$O/logs/lane-$N.log"
   fi
 fi
 cat > "$O/logs/prompt-$N.txt" <<EOF

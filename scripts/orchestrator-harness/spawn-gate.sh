@@ -2158,7 +2158,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
           echo "[capability-gate] WARN $label: the capability probe produced no verdict at all (rc=$_pf_rc) — PROCEEDING, because a probe that cannot run is not a verdict about the box. If lanes on this box stall, start from the absence of a LANE_CAPABILITY line above." >> "$log" ;;
       esac
     else
-      echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
+      echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log"
     fi
   fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
@@ -2201,7 +2201,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     sh "$_lb_sh" watch --pid "$pid" --log "$log" --wall "$_lb_wall" --tag "$label" \
        --verdict-file "$log.lanebound" >/dev/null 2>&1 &
   else
-    echo "[lane-bound] WARN $label: lane-bound.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane has the WALL CLOCK only (${_lb_wall}s) and NO silence bound, so a lane that parks produces nothing until the clock expires. Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
+    echo "[lane-bound] WARN $label: lane-bound.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane has the WALL CLOCK only (${_lb_wall}s) and NO silence bound, so a lane that parks produces nothing until the clock expires. Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log"
     # ⛔ `_lb_wall = 0` IS THE DOCUMENTED "THIS AXIS IS OFF" SWITCH (lane-bound.sh: `0` disables the
     # wall, loudly), and `sleep 0` here would KILL THE LANE INSTANTLY — the exact inverse of what the
     # operator asked for, on the one path where no helper exists to honour the contract (#2888 review,
