@@ -2274,6 +2274,112 @@ grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-
   && pass "#3715: the empty-candidate reason names the repro_scope UNATTRIBUTABLE/guard-step exclusion" \
   || fail "#3715: an unattributable residual never reached the repro_scope exclusion message"
 
+# HALF 10b — #1185: a guard-step identity whose STEP the base has never measured is
+# a DIFFERENT fact from "a guard-step a reproduction can never clear", and the rail
+# must name the right one. The measured shape (issue #3085's post-merge detector):
+# `guard-step::UNKNOWN-STEP::FAILED-extensions-shared-heartbeat-progress-edges.test.ts`
+# — a job-level annotation from a NON-pytest lane (`UNKNOWN STEP` is GitHub's own
+# placeholder), which no local pytest argv can execute. When that lane's workflow
+# does not run on main at all, `main-fails.txt`'s silence is a STRUCTURAL absence,
+# not evidence of novelty (#7734's distinction), and the old ONE message conflated
+# the two. The id is now ADMITTED into the candidate set — and reported as what it
+# is — while nothing is cleared and the refusal stands.
+#
+# BASELINE-DISCRIMINATING: on the pre-change rail this scenario emits the
+# "every refused failure is UNATTRIBUTABLE … or a guard-step" message
+# (repro_scope excluded it unconditionally), so the assertion on the NEW message
+# can only pass once the scope admits it.
+GUARD_UNKNOWN_STEP_LOG() {  # <annotation message>  — a job-level (UNKNOWN STEP) capture
+  printf 'js (1)\tUNKNOWN STEP\t2026-10-30T10:00:00.0000000Z ##[error]%s\n' "$1"
+  printf 'js (1)\tUNKNOWN STEP\t2026-10-30T10:00:00.9000000Z ##[error]Process completed with exit code 1.\n'
+}
+GUARD_NOREC='guard-step::UNKNOWN-STEP::FAILED-extensions-shared-heartbeat-progress-edges.test.ts'
+new_scen repro-base-guardnostep
+repro_base_sha
+HEAD_G1="ee1e000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_G1" > "$SCEN/head"
+lane_fail "$HEAD_G1" 961 > "$SCEN/runs-$HEAD_G1"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/heartbeat-progress-edges.test.ts' > "$SCEN/log-961"
+printf '1\n' > "$SCEN/jobs-count-961"
+lane_fail main7777 991 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-991"   # main: NO guard-step row at all
+repro_script_log "$SCEN/repro-log.sh" 'tests/test_never.py::test_never' "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#1185: a guard-step red still BLOCKS (exit $rc) — nothing was cleared" \
+                || { fail "#1185: a guard-step whose step the base never measured CLEARED the residual"; sed 's/^/      /' "$SCEN/err"; }
+grep -qF -- "$GUARD_NOREC" "$SCEN/err" \
+  && pass "#1185: the guard-step id is reported (it is the residue the operator must act on)" \
+  || fail "#1185: the guard-step id vanished from the refusal"
+grep -q "holds no row for their units" "$SCEN/err" \
+  && pass "#1185: the refusal names the BASE-SIDE-RECORD class: main holds no row for that unit" \
+  || { fail "#1185: the base-side-record reason was never reported — the scope did not admit the id"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && fail "#1185: the id was still reported as an UNREPRODUCIBLE class instead of a no-base-record one" \
+  || pass "#1185: …and it is NOT reported as the old 'a reproduction can never clear these' class"
+[ -s "$SCEN/repro-request.txt" ] \
+  && { fail "#1185: a guard-step id reached a LOCAL runner (pytest would exit 4 having run NOTHING)"; sed 's/^/      /' "$SCEN/repro-request.txt"; } \
+  || pass "#1185: no local run was attempted for an id no local runner can execute"
+grep -q "^   pre-existing:" "$SCEN/err" \
+  && fail "#1185: an id was reported pre-existing off an admission" \
+  || pass "#1185: admission into the candidate set cleared nothing"
+
+# HALF 10c — ⛔ THE CONDITION'S FORBIDING DIRECTION: a guard-step id whose STEP the
+# base HAS a record of is NOT admitted. There main evaluated that step, so its
+# absence from the failure set is a MEASUREMENT (MEASURED-ABSENT) and the scope
+# must keep excluding it — otherwise a real failure on a measured step would be
+# filed as "the base has no record of it", i.e. a block turned into a misdiagnosis.
+new_scen repro-base-guardhasstep
+repro_base_sha
+HEAD_G2="ee2e000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_G2" > "$SCEN/head"
+lane_fail "$HEAD_G2" 962 > "$SCEN/runs-$HEAD_G2"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/heartbeat-progress-edges.test.ts' > "$SCEN/log-962"
+printf '1\n' > "$SCEN/jobs-count-962"
+lane_fail main7778 992 > "$SCEN/runs-main"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/some-other-suite.test.ts' > "$SCEN/log-992"
+printf '1\n' > "$SCEN/jobs-count-992"   # main measured the SAME step (a different shape)
+repro_script_log "$SCEN/repro-log.sh" 'tests/test_never.py::test_never' "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#1185: a guard-step on a step main DID measure still BLOCKS (exit $rc)" \
+                || { fail "#1185: a measured-step guard-step red cleared the residual"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "holds no row for their units" "$SCEN/err" \
+  && fail "#1185: a guard-step whose step main MEASURED was reported as a no-base-record class" \
+  || pass "#1185: …and it is NOT reported as a no-base-record class (the base DID measure that step)"
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && pass "#1185: the measured-step id keeps the original exclusion (the condition forbids admitting it)" \
+  || { fail "#1185: the measured-step id left the exclusion class — the widening was unconditional"; sed 's/^/      /' "$SCEN/err"; }
+
+# HALF 10d — ⛔ AN EMPTY BASE BASELINE ADMITS NOTHING. A FAILURE-ONLY baseline that
+# is empty cannot tell "main is GREEN" from "main has no run at all" (#7734), so
+# "the base holds no record of this unit" is not a claim the rail can make from
+# it. The id must keep the PRE-CHANGE exclusion and block — fail closed. Without
+# this case the admission would be the DEFAULT (`main_units` empty -> no
+# `continue`), which is the one direction this change must never take.
+new_scen repro-base-guardgreenmain
+repro_base_sha
+HEAD_G3="ee3e000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_G3" > "$SCEN/head"
+lane_fail "$HEAD_G3" 963 > "$SCEN/runs-$HEAD_G3"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/heartbeat-progress-edges.test.ts' > "$SCEN/log-963"
+printf '1\n' > "$SCEN/jobs-count-963"
+lane_pass main8888 993        # main is GREEN over the window: no failing row at all
+repro_script_log "$SCEN/repro-log.sh" 'tests/test_never.py::test_never' "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#1185: an EMPTY base baseline still BLOCKS the guard-step red (exit $rc)" \
+                || pass "#1185: (informational) the rail took another arm on a green-main fixture (exit $rc)"
+grep -q "holds no row for their units" "$SCEN/err" \
+  && fail "#1185: an EMPTY base baseline was read as 'the base holds no record' — it cannot tell green from never-run" \
+  || pass "#1185: an empty base baseline is NOT read as a no-base-record claim"
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && pass "#1185: …it keeps the pre-change exclusion (an empty baseline admits nothing)" \
+  || pass "#1185: (informational) the empty-baseline arm reported through another refusal"
+
 # HALF 11 — the base reproduction must NOT pre-empt the E5 rotation rule. A
 # clearance that empties the residual would otherwise SKIP the re-run, which is
 # the only mechanism that collects the second sample `detect_rotating_identity`
