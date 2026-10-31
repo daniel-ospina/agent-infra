@@ -538,6 +538,27 @@ PS_BIN="$PS_BIN_IN"
 # a home the session never uses: with credentials in the repointed home the preflight said "ok:
 # gh auth" and the cell started, and then every gh call in the session failed.
 export HOME="$CELL_HOME"
+# ── THE uv CACHE + LINK-MODE PIN (agent-infra#2159) ─────────────────────────────────────────────────
+# THIS process is where a cell's lanes get their environment from: `worker-terminal.sh` snapshots the
+# controller's exported environment into every worker it spawns, so a pin exported HERE reaches every
+# lane on the box — and its absence is exactly what made a COLD-cache cell materialise a full 5.8 GB
+# `.venv` per worktree (measured: cell-3 went 17 GB free -> 257 MB free in ~50 minutes as its lanes
+# synced, while a warm-cache cell paid ~nothing for the same 5.8 GB of `du`).
+# It is set AFTER `$ENV_FILE` was sourced above, so a `keys.env` line WINS: this file defaults, it
+# never overrides an operator's pin. `UV_ENV_DEFAULTED` records which halves this box had to supply,
+# and `cmd_check` prints it — a box that silently defaulted is the state nobody could see before.
+SUP_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+UV_ENV_HELPER="${SUP_HERE:+$SUP_HERE/orchestrator-harness/uv-env.sh}"
+if [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ]; then
+  . "$UV_ENV_HELPER"
+  uv_env_apply
+else
+  UV_ENV_HELPER=""
+  [ -n "${UV_CACHE_DIR:-}" ] || UV_CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-}/.cache}/uv"
+  [ -n "${UV_LINK_MODE:-}" ] || UV_LINK_MODE=hardlink
+  export UV_CACHE_DIR UV_LINK_MODE
+  UV_ENV_DEFAULTED="inline"
+fi
 LOCK="$O/.orch.lock"
 # Recomputed AFTER $ENV_FILE is sourced (it may repoint $O), exactly like $LOCK above.
 ROLES_DIR="$O/state/roles"
@@ -2063,6 +2084,17 @@ cmd_check_provenance() {
 cmd_check() {
   validate_scope
   [ -d "$CELL_HOME" ] && [ -w "$CELL_HOME" ] || die "HOME=$CELL_HOME missing or not writable"
+  # ── the uv pin, and WHAT A WORKTREE VENV COSTS ON THIS BOX (agent-infra#2159) ──────────────────
+  # `check` is the verb an operator runs before trusting a cell with lanes, so it is where a COLD cache
+  # has to be stated: on a cold cache each new worktree venv is a full ~5.8 GB copy, and the box then
+  # fills while every other instrument reads healthy. The reading comes from `uv-env.sh` — the same
+  # sentence the bring-up and a lane print — so there is one authority, not three opinions.
+  log_line "uv: UV_CACHE_DIR=${UV_CACHE_DIR:-?} UV_LINK_MODE=${UV_LINK_MODE:-?} (defaulted: ${UV_ENV_DEFAULTED:-none})"
+  if [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ]; then
+    uv_env_report --estate "$REPO" 2>/dev/null | while IFS= read -r _uvl; do [ -n "$_uvl" ] && log_line "$_uvl"; done
+  else
+    log_line "uv: WARN no uv-env.sh beside this supervisor — the cold-cache reading is UNAVAILABLE on this box (a cold cache is then only discovered as free disk disappearing)"
+  fi
   if [ ! -d "$HARNESS" ]; then
     # The remedy depends on WHY the path is absent. When `$HARNESS` is the path the RECORD names,
     # "clone the repo first" is the one action that cannot help — the record is stale and `apply` is
@@ -3587,12 +3619,41 @@ cmd_status() {
     _drs="$(bash "$_dr" --print-status 2>/dev/null)"; _drc=$?
     _dst="$(printf '%s\n' "$_drs" | sed -n 's/^status=//p' | head -1)"
     _det="$(printf '%s\n' "$_drs" | sed -n 's/^detail=//p' | head -1)"
+    # ⛔ THE DELEGATE'S OWN VERDICT, ON EVERY ARM (#3041 review, P2). An ineffective reap EXITS 0 by
+    # design, so `ok=1 rc=0` is the correct exit-code reading of the exact pass the #3041 incident was
+    # read from — `worktree=<MB>` and nothing else WAS the incident's misleading sentence. The reaper
+    # records the real answer as `delegate_verdict_worktree=`; a field the reader does not print does
+    # not exist. Printed WHENEVER IT CARRIES INFORMATION (`ok`/`?`/`not-run`/absent stay silent, so a
+    # genuinely healthy cell gains no noise).
+    #
+    # ⛔ THE SILENT SET IS THE BENIGN SET, NOT "OK-LIKE" SPELLINGS (#3058 review, P2). The delegate's
+    # vocabulary is the pass verdict this file's own sibling defines — `dry-run|reclaimed|idle|`
+    # `reap-ineffective|unmeasured` (pi-reap-worktrees.sh:642) plus TWO disagreement spellings at the
+    # entry point (disk-reaper.sh's `_dclass`): `mixed` when two ALARM answers disagree, and
+    # `mixed-benign` when two ordinary ones do. Only the alarm class is the ⛔, and every member of it
+    # is reprinted by a headline above: `reap-ineffective` (an armed pass that reclaimed nothing),
+    # `unmeasured`, and `mixed` (two alarm answers — the cell cannot say which). `dry-run`, `reclaimed`,
+    # `idle` and `mixed-benign` are the ORDINARY readings of a healthy pass — `dry-run` is even the
+    # shipped default (disk-reaper.sh:167), so a `ok`-only silent set painted ⛔ worktree-delegate=dry-run
+    # onto every pass of every cell that has not armed the reaper, and `idle` onto every armed pass with
+    # nothing to reclaim.
+    # ⛔ `mixed-benign` MUST STAY SILENT, AND THAT IS NOT A FAIL-OPEN (#3058 review, P1): the aggregator
+    # already lifted any ALARM answer out of the disagreement, so by the time this token is printed there
+    # is provably no alarm behind it. If it were printed instead, every healthy multi-repo cell — one
+    # repo with something to reclaim, one with nothing — would print a ⛔ on every pass.
+    # ⛔ The ⛔ is the operator's alarm channel, and the defect it creates is the one this same file
+    # names ten lines below for the ⏸ symbol: a glyph seen on healthy cells is a glyph the operator has
+    # been trained to skip, so the one line that MUST be read — `⛔ worktree-delegate=reap-ineffective`
+    # — is exactly what gets skipped. Polarity is therefore FAIL-LOUD: an unrecognised spelling (a new
+    # verdict added to the reaper and not taught to this reader) is printed, never swallowed.
+    _dr_del="$(printf '%s\n' "$_drs" | sed -n 's/^delegate_verdict_worktree=//p' | head -1)"
+    _dr_del_note() { case "${_dr_del:-}" in ''|ok|'?'|not-run|dry-run|reclaimed|idle|mixed-benign) printf '' ;; *) printf ' ⛔ worktree-delegate=%s' "$_dr_del" ;; esac; }
     if [ "$_drc" -eq 0 ]; then
             # ⛔ THE UNIT IS CONDITIONAL. A per-class field may read `unmeasured` (df could not answer),
             # and the old format appended a hardcoded MB to it — `uv=unmeasuredMB` reads as a byte count
             # to every consumer. Numeric values keep their unit; the sentinel is printed as it stands.
             _dr_mb() { case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}" ;; *) printf '%sMB' "$1" ;; esac; }
-            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))"
+            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))$(_dr_del_note)"
     elif [ "$_dst" = "never" ]; then
       log_line "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
     elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
@@ -3609,10 +3670,10 @@ cmd_status() {
       # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
       # the channel here — which is why it must not go quiet.)
       log_line "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
     else
       log_line "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
     fi
   fi
   # the loop's own view of itself

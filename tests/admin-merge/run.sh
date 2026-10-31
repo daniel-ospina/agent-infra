@@ -2274,6 +2274,120 @@ grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-
   && pass "#3715: the empty-candidate reason names the repro_scope UNATTRIBUTABLE/guard-step exclusion" \
   || fail "#3715: an unattributable residual never reached the repro_scope exclusion message"
 
+# HALF 10b — #1185: a guard-step identity whose STEP the base has never measured is
+# a DIFFERENT fact from "a guard-step a reproduction can never clear", and the rail
+# must name the right one. The measured shape (issue #3085's post-merge detector):
+# `guard-step::UNKNOWN-STEP::FAILED-extensions-shared-heartbeat-progress-edges.test.ts`
+# — a job-level annotation from a NON-pytest lane (`UNKNOWN STEP` is GitHub's own
+# placeholder), which no local pytest argv can execute. When that lane's workflow
+# does not run on main at all, `main-fails.txt`'s silence is a STRUCTURAL absence,
+# not evidence of novelty (#7734's distinction), and the old ONE message conflated
+# the two. The id is now ADMITTED into the candidate set — and reported as what it
+# is — while nothing is cleared and the refusal stands.
+#
+# BASELINE-DISCRIMINATING: on the pre-change rail this scenario emits the
+# "every refused failure is UNATTRIBUTABLE … or a guard-step" message
+# (repro_scope excluded it unconditionally), so the assertion on the NEW message
+# can only pass once the scope admits it.
+GUARD_UNKNOWN_STEP_LOG() {  # <annotation message>  — a job-level (UNKNOWN STEP) capture
+  printf 'js (1)\tUNKNOWN STEP\t2026-10-30T10:00:00.0000000Z ##[error]%s\n' "$1"
+  printf 'js (1)\tUNKNOWN STEP\t2026-10-30T10:00:00.9000000Z ##[error]Process completed with exit code 1.\n'
+}
+GUARD_NOREC='guard-step::UNKNOWN-STEP::FAILED-extensions-shared-heartbeat-progress-edges.test.ts'
+new_scen repro-base-guardnostep
+repro_base_sha
+HEAD_G1="ee1e000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_G1" > "$SCEN/head"
+lane_fail "$HEAD_G1" 961 > "$SCEN/runs-$HEAD_G1"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/heartbeat-progress-edges.test.ts' > "$SCEN/log-961"
+printf '1\n' > "$SCEN/jobs-count-961"
+lane_fail main7777 991 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-991"   # main: NO guard-step row at all
+repro_script_log "$SCEN/repro-log.sh" 'tests/test_never.py::test_never' "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#1185: a guard-step red still BLOCKS (exit $rc) — nothing was cleared" \
+                || { fail "#1185: a guard-step whose step the base never measured CLEARED the residual"; sed 's/^/      /' "$SCEN/err"; }
+grep -qF -- "$GUARD_NOREC" "$SCEN/err" \
+  && pass "#1185: the guard-step id is reported (it is the residue the operator must act on)" \
+  || fail "#1185: the guard-step id vanished from the refusal"
+grep -q "holds no row for their units" "$SCEN/err" \
+  && pass "#1185: the refusal names the BASE-SIDE-RECORD class: main holds no row for that unit" \
+  || { fail "#1185: the base-side-record reason was never reported — the scope did not admit the id"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && fail "#1185: the id was still reported as an UNREPRODUCIBLE class instead of a no-base-record one" \
+  || pass "#1185: …and it is NOT reported as the old 'a reproduction can never clear these' class"
+[ -s "$SCEN/repro-request.txt" ] \
+  && { fail "#1185: a guard-step id reached a LOCAL runner (pytest would exit 4 having run NOTHING)"; sed 's/^/      /' "$SCEN/repro-request.txt"; } \
+  || pass "#1185: no local run was attempted for an id no local runner can execute"
+grep -q "^   pre-existing:" "$SCEN/err" \
+  && fail "#1185: an id was reported pre-existing off an admission" \
+  || pass "#1185: admission into the candidate set cleared nothing"
+
+# HALF 10c — ⛔ THE CONDITION'S FORBIDING DIRECTION: a guard-step id whose STEP the
+# base HAS a record of is NOT admitted. There main evaluated that step, so its
+# absence from the failure set is a MEASUREMENT (MEASURED-ABSENT) and the scope
+# must keep excluding it — otherwise a real failure on a measured step would be
+# filed as "the base has no record of it", i.e. a block turned into a misdiagnosis.
+new_scen repro-base-guardhasstep
+repro_base_sha
+HEAD_G2="ee2e000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_G2" > "$SCEN/head"
+lane_fail "$HEAD_G2" 962 > "$SCEN/runs-$HEAD_G2"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/heartbeat-progress-edges.test.ts' > "$SCEN/log-962"
+printf '1\n' > "$SCEN/jobs-count-962"
+lane_fail main7778 992 > "$SCEN/runs-main"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/some-other-suite.test.ts' > "$SCEN/log-992"
+printf '1\n' > "$SCEN/jobs-count-992"   # main measured the SAME step (a different shape)
+repro_script_log "$SCEN/repro-log.sh" 'tests/test_never.py::test_never' "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#1185: a guard-step on a step main DID measure still BLOCKS (exit $rc)" \
+                || { fail "#1185: a measured-step guard-step red cleared the residual"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "holds no row for their units" "$SCEN/err" \
+  && fail "#1185: a guard-step whose step main MEASURED was reported as a no-base-record class" \
+  || pass "#1185: …and it is NOT reported as a no-base-record class (the base DID measure that step)"
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && pass "#1185: the measured-step id keeps the original exclusion (the condition forbids admitting it)" \
+  || { fail "#1185: the measured-step id left the exclusion class — the widening was unconditional"; sed 's/^/      /' "$SCEN/err"; }
+
+# HALF 10d — ⛔ AN EMPTY BASE BASELINE ADMITS NOTHING. A FAILURE-ONLY baseline that
+# is empty cannot tell "main is GREEN" from "main has no run at all" (#7734), so
+# "the base holds no record of this unit" is not a claim the rail can make from
+# it. The id must keep the PRE-CHANGE exclusion and block — fail closed. Without
+# this case the admission would be the DEFAULT (`main_units` empty -> no
+# `continue`), which is the one direction this change must never take.
+new_scen repro-base-guardgreenmain
+repro_base_sha
+HEAD_G3="ee3e000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_G3" > "$SCEN/head"
+lane_fail "$HEAD_G3" 963 > "$SCEN/runs-$HEAD_G3"
+GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/heartbeat-progress-edges.test.ts' > "$SCEN/log-963"
+printf '1\n' > "$SCEN/jobs-count-963"
+# ⛔ THE REDIRECT IS LOAD-BEARING (#1185 review, cycle 2): without it main has NO
+# listing at all, the rail blocks at step 2b ("never TESTED main") BEFORE the repro
+# section ever runs, and this scenario pins nothing while its two `|| pass` arms
+# report GREEN. Every arm below is `pass`/`fail`-able for that reason, and the
+# old-exclusion arm is a hard FAIL so "reached the wrong branch" cannot read clean.
+lane_pass main8888 993 > "$SCEN/runs-main"   # main is GREEN over the window: no failing row
+repro_script_log "$SCEN/repro-log.sh" 'tests/test_never.py::test_never' "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#1185: an EMPTY base baseline still BLOCKS the guard-step red (exit $rc)" \
+                || fail "#1185: an empty base baseline let the guard-step red through"
+grep -q "holds no row for their units" "$SCEN/err" \
+  && fail "#1185: an EMPTY base baseline was read as 'the base holds no record' — it cannot tell green from never-run" \
+  || pass "#1185: an empty base baseline is NOT read as a no-base-record claim"
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && pass "#1185: …it keeps the pre-change exclusion (an empty baseline admits nothing)" \
+  || { fail "#1185: the empty-baseline fixture never reached the repro section — the arm is unpinned"; sed 's/^/      /' "$SCEN/err"; }
+[ -s "$SCEN/repro-request.txt" ] \
+  && fail "#1185: the empty-baseline fixture handed ids to a runner" \
+  || pass "#1185: …and nothing was handed to a runner"
+
 # HALF 11 — the base reproduction must NOT pre-empt the E5 rotation rule. A
 # clearance that empties the residual would otherwise SKIP the re-run, which is
 # the only mechanism that collects the second sample `detect_rotating_identity`
@@ -13089,23 +13203,28 @@ rc=$?
 grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
   && pass "(a) …and the FIRST-CHECKS wait names its own expiry" \
   || { fail "(a) the FIRST-CHECKS expiry is not named"; sed 's/^/      /' "$TMP/err"; }
-# ⛔ THE PIN NAMES THE ARM THIS FIXTURE REACHES, AND THAT ARM CHANGED. This scenario is the
-# head with NO run and NO check-run — a readable, PROVEN-EMPTY surface. The rail no longer
-# answers that state with the generic "NO run of the lane ever attached to this head" sentence:
-# its `never-started` refusal splits three ways, and the proven-empty one now says so and cites
-# the read it rests on ("…returned total_count 0 ACROSS EVERY WORKFLOW … An EMPTY surface is not
-# a wrong lane name"). The generic sentence is the arm for NO probe evidence at all — an UNREAD
-# probe, or a rail that never asked (the probe is only attempted when the lane filter is active
-# and its re-derive budget is unspent, so `--any-workflow` never reaches it) — which is a different
-# fact about the head from "proven empty", pinned by (a5) below so it stays measured. Re-pointing
-# the pin at the arm the fixture actually reaches is not a weakening: the state assertion, its evidence, and the
-# FOUR negatives that follow (RE-RUN wait, MERGE-REF wait, no merge made, no evidence posted) are all still demanded.
+# ⛔ THE STATE IS NAMED, AND THE HEAD THAT CARRIES *NO* CHECK-RUN IS NAMED AS SUCH.
+# #2862/#3017 taught this wait to DISCRIMINATE an empty-but-readable check surface
+# from an empty filtered list, and this fixture's head carries neither a run nor a
+# check-run (the fake gh answers `total_count 0` for a head it has never seen). The
+# refusal therefore reports the PRECISE shape — "nothing has attached at all" — and
+# the broader "the lane never attached" wording is reserved for the case this wait
+# cannot resolve (see (a0), where the discriminating READ fails). Pinning the old
+# wording here made the assertion demand a LESS precise message than the rail now
+# earns: it went red on the #2862 commit and stayed red for every PR after it.
 grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
-  && pass "(a) …naming checks-never-started (a PROVEN-EMPTY surface, not 'still running', not a CI verdict)" \
-  || fail "(a) the never-started state is not distinguished"
-grep -q 'returned total_count 0 ACROSS EVERY WORKFLOW' "$TMP/err" \
-  && pass "(a) …from the head's OWN check-runs read (total_count 0), not from a guess about the lane" \
-  || { fail "(a) the proven-empty arm did not cite the head-check read it rests on"; sed 's/^/      /' "$TMP/err" | head -8; }
+  && pass "(a) …naming checks-never-started (not 'still running', not a CI verdict)" \
+  || { fail "(a) the never-started state is not distinguished"; sed 's/^/      /' "$TMP/err" | head -20; }
+grep -q 'total_count 0 ACROSS EVERY WORKFLOW' "$TMP/err" \
+  && pass "(a) …and names the PROVEN-EMPTY surface it read, not a guess about the lane name" \
+  || fail "(a) the proof is not named — an empty surface is being reported as a lane-name guess"
+# ⛔ …AND IT NEVER GUESSES THE LANE NAME WITHOUT THAT PROOF (#2862). The proof above
+# is a check-runs read that RETURNED zero; when the read itself fails, the two
+# readings ("this repo's CI is named otherwise" vs "nothing has started yet") are
+# indistinguishable and the rail must KEEP the filter rather than drop it.
+grep -q "is not this repo's CI" "$TMP/err" "$TMP/out" \
+  && fail "(a) an UNREAD check surface was read as a lane-name mismatch" \
+  || pass "(a) …and it does not drop the lane filter on an unproven surface"
 grep -q 'ADMIN_MERGE_FIRST_CHECKS_WAIT' "$TMP/err" \
   && pass "(a) …and names the window it owns" \
   || fail "(a) the FIRST-CHECKS window knob is missing"
@@ -13118,26 +13237,33 @@ grep -q 'pr merge' "$SCEN/calls" && fail "(a) a merge was attempted with no chec
 [ -f "$SCEN/comment" ] && fail "(a) evidence was posted with no checks" \
   || pass "(a) no evidence posted"
 
-# (a5) THE SAME NO-RUN STATE, WITH AN UNREADABLE PROBE, IS THE OTHER ARM. (a) rests on a
-# head-checks read that ANSWERED 0; when that read FAILS the rail cannot claim the surface is
-# empty, so it must fall back to the generic sentence — the one (a) used to pin. Pinning both
-# halves is what keeps "proven empty" and "could not be read" from collapsing into one answer:
-# without this arm, a rewrite that reported an unread probe as proven-empty would pass (a) alone,
-# and the two states would be indistinguishable to an operator deciding whether CI even started.
-new_scen waits-first-never-unreadable
-HEAD_WFU="e4e4000000000000000000000000000000000000"
+# (a0) THE UNPROVABLE EMPTY — same fresh-PR shape, but the check-runs probe FAILS.
+# An unread count is NOT evidence that the lane name is wrong, so the rail must KEEP
+# the filter and fall back to the LEGACY bounded window, and its refusal must say
+# exactly that ("NO run of the lane ever attached"), not claim an empty surface it
+# never read. This is the arm (a) used to cover by accident; it is asserted here
+# because fail-closed is the direction that matters (#2862's own rule).
+new_scen waits-first-never-unread
+HEAD_WFU="e3e3000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_WFU" > "$SCEN/head"
-: > "$SCEN/pr-check-runs-unreadable"
+: > "$SCEN/pr-health-unreadable"
 SUITE_FIRST_CHECKS_WAIT=2 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "(a5) an UNREADABLE head-check probe still BLOCKS (exit $rc)" \
-  || fail "(a5) an unreadable head surface CERTIFIED the merge"
+[ "$rc" -ne 0 ] && pass "(a0) an unreadable check surface still BLOCKS (exit $rc)" \
+  || fail "(a0) an unreadable check surface certified the merge"
 grep -q 'NO run of the lane ever attached to this head' "$TMP/err" \
-  && pass "(a5) …and it falls back to the generic never-attached arm" \
-  || { fail "(a5) an UNREAD probe is not told apart from a PROVEN-EMPTY surface"; sed 's/^/      /' "$TMP/err" | head -8; }
+  && pass "(a0) …and says the lane never attached, which is all an unread probe supports" \
+  || { fail "(a0) the unproven-empty refusal is not named"; sed 's/^/      /' "$TMP/err" | head -20; }
+grep -q 'could not be READ' "$TMP/out" \
+  && pass "(a0) …naming the failed read, so the two readings stay distinguishable" \
+  || fail "(a0) the failed read is not named on the wait's own surface"
 grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
-  && fail "(a5) the UNREAD probe was reported as a PROVEN-EMPTY surface — the (a) arm's claim would rest on nothing" \
-  || pass "(a5) …and it does NOT borrow the proven-empty arm's wording"
+  && fail "(a0) an UNREADABLE probe was reported as a proven-empty head" \
+  || pass "(a0) …and never claims an empty surface it did not read"
+# The filter must have been KEPT: no unfiltered re-read may have happened.
+grep -q 'DROPPING the lane filter' "$TMP/out" \
+  && fail "(a0) the lane filter was dropped on an unread count (fail-open)" \
+  || pass "(a0) the lane filter is KEPT when the discriminating read fails (fail-closed)"
 
 # (a2) CHECKS STARTED BUT ARE STILL RUNNING — the #2233/#2234 shape, exactly:
 # one queued/in-progress lane run. The wait must report the RUN it observed (id +
@@ -14489,18 +14615,31 @@ job_step "$SCEN/jobs-gen-9811-1.json" "bash-suites" in_progress 1 2 \
   "Bash shards — the ONE list both lanes run" "Bash shards — step 1 running" 5000
 lane_fail mainpr 9812 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9812"
-# ⛔ A 1s CEILING CANNOT OBSERVE ANYTHING. The promotion is read from a per-poll REPORT, and the
-# clock that expires the wait is a `$SECONDS` DELTA: on a fast, idle host the first poll advances it
-# by 0 and the report prints (green); on a loaded runner one poll costs ≥1s, the 1s ceiling expires
-# on the FIRST poll, the verdict returns before the report case, and this assertion fails while the
-# promotion never had a poll to appear in (measured: red on a loaded Linux box, green on an idle
-# one — the (h) fixture BELOW has the identical shape). 5s of ceiling keeps the scenario short and
-# leaves room for the polls the assertion needs; the promotion itself is unchanged.
-SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=5 SUITE_FIRST_CHECKS_STALL=2 \
+# ⛔ THE CEILING MUST BE ABOVE THE WINDOW, OR THE WAIT CANNOT *REPORT* AT ALL.
+# This fixture used to be a COIN FLIP, and the RAIL is what fixed it — not a larger
+# window. It set CEILING == WAIT == POLL == 1s while every report line was printed
+# only on polls that had NOT expired, so whenever `$SECONDS` (a whole-second clock)
+# ticked during the first poll — ~1 in 5 on a loaded runner — the wait returned before
+# printing anything and the assertion below read a surface nobody had written.
+# Measured: run 41110313398, job 124250724527 ("expired after 1s (ceiling 1s)", no
+# report line above it, 226ms of wall clock). `wait_for_first_checks` now prints the
+# closing observation before returning, so the window stays deliberately tight: it
+# yields AT LEAST one reported observation (two when no second boundary falls inside
+# the first poll — the count is clock-dependent and nothing asserts it) and the window
+# cannot silently grow.
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=1 SUITE_FIRST_CHECKS_STALL=2 \
   SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 grep -q 'stall bound 10000s' "$SCEN/out" "$SCEN/err" \
   && pass "(f) …and a 5000s completed step PROMOTES the stall period to 10000s at runtime" \
-  || { fail "(f) the stall period was not promoted from the observed step"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -12; }
+  || { fail "(f) the stall period was not promoted from the observed step"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -40; }
+# …AND THE REFUSAL CARRIES IT. The promotion is a property of the WAIT, not of one
+# report line: a refusal that names the derived 8760s while the wait was actually
+# bounded by 10000s tells the operator the wrong number in the only message they
+# read. This arm is what makes the property provable when no report line was
+# printed at all.
+grep -q 'stall bound (10000s)' <(tr -s '[:space:]' ' ' < "$SCEN/err") \
+  && pass "(f) …and the refusal that ends the wait states the promoted bound, not the derived one" \
+  || { fail "(f) the refusal names a stall bound the wait was not using"; sed 's/^/      /' "$SCEN/err" | head -20; }
 
 # (g) AN UNREADABLE STRETCH IS NOT A SILENT ONE. The Jobs surface fails for SIX
 # polls and then recovers with the SAME fingerprint (the job never left step 4/8).
@@ -14593,28 +14732,9 @@ SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=60 SUITE_FIRST_CHECKS_STALL
 rc=$?
 [ "$rc" -ne 0 ] && pass "(h) a short Jobs digest does not clear the wait — the rail BLOCKS (exit $rc)" \
   || fail "(h) a partial digest was read as 'all runs terminal' and the lane was certified"
-# ⛔ THE WITNESS IS THE REFUSAL, NOT ONLY THE INFORMATIONAL POLL LINE — because the poll line is
-# NOT deterministic here. `PROGRESS SIGNAL is unavailable` is printed by the report case that runs
-# only when a poll finishes BEFORE the window expires, and the clock is a `$SECONDS` delta: on a
-# fast, idle host the first poll advances it by 0 (the line prints, this scenario was green); on a
-# loaded runner one poll costs ≥1s, the window (1s) expires on the FIRST poll, the verdict returns
-# before the report case is reached, and the POSITIVE witness assertion on `$SCEN/out` fails — while
-# the rail behaved correctly, and the negatives around it still pass in that shape, which is why the
-# failure read as a silent loss of the witness rather than as a visibly wrong verdict (measured: red
-# on a loaded Linux box and on GitHub's runner, green on an idle one — the same fixture, two verdicts). The refusal that closes the wait
-# (`block_on_first_checks`) is emitted on EVERY non-terminal close, and this fixture's state closes
-# as `unobservable` (the short-digest arm sets `signal_ok=0`), which routes to the `*)` arm — the
-# arm that carries the "their per-job/per-step PROGRESS could not be read" spelling. So the witness
-# is the refusal's `*)` arm, deterministic for THIS fixture, not every non-terminal close: a close
-# routed to `stalled`/`ceiling`/`never-started`/`unreadable` emits a different sentence and would
-# not satisfy this grep (nor should it — those are different, tested claims). It is still the
-# deterministic witness that the signal was MISSING rather than terminal; the poll line is
-# accepted too because it does print when a poll happens to finish before the window. Both spellings are alternation in ONE grep, ERE, so this is a
-# single assertion — not a widened search that could pass on either file for the wrong reason.
-grep -qE '(PROGRESS SIGNAL is unavailable|their per-job/per-step PROGRESS could not be read)' \
-  "$SCEN/out" "$SCEN/err" \
+grep -q 'PROGRESS SIGNAL is unavailable' "$SCEN/out" \
   && pass "(h) …the short digest is named as a MISSING SIGNAL, not as a terminal lane" \
-  || { fail "(h) the short digest was not reported as a missing signal"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -10; }
+  || { fail "(h) the short digest was not reported as a missing signal"; sed 's/^/      /' "$SCEN/out" | head -10; }
 grep -q 'wait CLEARED' "$SCEN/out" "$SCEN/err" \
   && fail "(h) the wait reported CLEARING on an incomplete digest" \
   || pass "(h) …and it never claimed the lane was terminal"
