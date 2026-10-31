@@ -139,3 +139,75 @@ derive_or() {
   slug="$(repo_slug_from_remote "$url")" || return 1
   printf '%s\n' "$slug"
 }
+
+# resolve_repo — the ONE way a script turns this box's `REPO` into a VERIFIED checkout path.
+#
+# ⛔ `REPO` IS SET ONCE PER BOX, AND A SCRIPT THAT DOES NOT FIND IT REFUSES BY NAME.
+# `OR` got this treatment in #2040 (`derive_or`, above). `REPO` never did, so scripts kept PRIVATE
+# defaults and three of them were wrong on every box but the one they were written on:
+#   report.sh         `$HOME/eldato/tortoise`  — ONE DEVELOPER'S HOME DIRECTORY
+#   deploy-crossbox.sh `/tmp/cell-ai`          — a CELL path, so wrong on every laptop
+#   pi-reap-worktrees.sh `$PWD`                — worst: under launchd `$PWD` is `/`, which is a REAL
+#                                                directory that is not a repo, so the pass fails LATER
+#                                                and far from the cause as "not a git repository: /"
+# A default is only safe if it is TRUE ON EVERY MACHINE. A home directory, a cell path and `$PWD`
+# never are — `$PWD` is not even stable across two invocations of the same script. So this function
+# carries NO default of its own: it reads the operator's value, PROVES it is a git checkout, and
+# otherwise refuses with the two supported ways to set it.
+#
+# Contract: rc 0 and the canonicalized path on stdout; rc 2 and a refusal on STDERR (2 = "the
+# operator's value is absent or wrong", the same code `derive_or` uses for a bad `OR` pin — one
+# vocabulary for configuration errors). stdout carries the VALUE ONLY, so callers write
+#   REPO="$(resolve_repo)" || exit $?
+# and never have to parse a message out of a path. ⛔ Call it BARE — not inside a function that must
+# survive the refusal: the refusal is the caller's `exit`, because a subshell could not end the pass.
+#
+# ⛔ `refresh-candidates.sh` ALSO DEFINES A `resolve_repo`, AND THAT IS NOT A SECOND COPY OF THIS RULE.
+# Its resolver (line ~255) answers "is this checkout PROVISIONABLE for the DECLARED queue target
+# `$OR`" and derives `$SC`; this one answers "is REPO a checkout at all", with no `$OR` in scope. It
+# is loaded at that script's own top level, so ITS definition wins inside ITS process — deliberately.
+# Neither may be dropped in favour of the other: one is the box's config check, the other is the
+# queue/checkout pairing check (#1901).
+resolve_repo() {
+  local repo="${REPO:-}" top=""
+  # ⛔ SET-BUT-EMPTY IS "UNSET", NOT A REASON TO FALL BACK. A blank line in a plist or a keys.env is
+  # an operator typo; treating it as "nothing was set" is how a typo becomes a silent default.
+  if [ -z "$repo" ]; then
+    echo "REPO is unset — the harness has no default for it, on purpose: every default it ever carried" >&2
+    echo "was a path that is true on ONE machine and absent on the next, and \$PWD is not even stable." >&2
+    _resolve_repo_remedy
+    return 2
+  fi
+  # ⛔ THE GIT ENV IS SCRUBBED, NOT JUST `-C` (the rule this file already applies to its identity
+  # reads, MEMORY.md [git/identity]): `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` OUTRANK `-C`, so an
+  # ambient `GIT_DIR` makes `rev-parse --show-toplevel` succeed for a directory that is not a
+  # checkout at all — this validation would certify the wrong thing and every later `git -C "$REPO"`
+  # call would read the repo the ENVIRONMENT named. Fail-closed means the validation closes that too.
+  if ! top="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+        git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || [ -z "$top" ]; then
+    echo "REPO=$repo is not a git checkout (git -C $repo rev-parse --show-toplevel failed)." >&2
+    _resolve_repo_remedy
+    return 2
+  fi
+  # The value printed is the path the OPERATOR NAMED, not the toplevel git reports: a caller given a
+  # subdirectory keeps it (each caller validates what it uses itself), so `$REPO` never silently
+  # becomes the parent checkout. `pwd -P` canonicalizes, so a symlinked checkout is ONE path — the same
+  # reason refresh-candidates.sh stores `REPO="$(cd "$cand" && pwd -P)"`.
+  ( cd "$repo" 2>/dev/null && pwd -P ) || printf '%s\n' "$repo"
+}
+
+# The two supported ways `REPO` reaches a box. Printed on EVERY refusal, because the operator reading
+# it is, by construction, looking at a box where it was never set — a message that only says "REPO is
+# unset" leaves them to invent a third way, which is how a `export REPO=` in one shell becomes a
+# default in the next script.
+_resolve_repo_remedy() {
+  cat >&2 <<'REMEDY'
+  Set it the ONE way this box has for it, never a per-script default:
+    * macOS / launchd: the job's EnvironmentVariables —
+        ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+      rendered by install.sh from `REPO=/path/to/checkout bash scripts/orchestrator-harness/install.sh`
+    * Linux / cell:    the cell's keys.env ($CELL_HOME/keys.env), which cloud-cell-supervisor.sh
+      sources (`set -a; . $ENV_FILE`) before it starts the controller
+  REPO is the CHECKOUT PATH of the repo this box grades — never an owner/name slug.
+REMEDY
+}
