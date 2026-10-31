@@ -1536,14 +1536,17 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
     out["alive"] = alive
     out["unknown"] = unknown
     out["total"] = out["fix"] + out["review"]
-    # ⛔ `capped` RECORDS WHETHER THE OVERRIDE ACTUALLY BOUND (review P1, 2026-10-31). Without it the
-    # NO SLOT arm had to infer the cause of a 0 AGGREGATE from the number alone, and `total == 0` has
-    # TWO causes: `--max` clamped it, or BOTH class budgets are already spent (`fix + review == 0` --
-    # the ordinary saturated fleet at the shipped MAX_FIX=3/MAX_REVIEW=3). The arm named `--max` for
-    # both, so a saturated pass sent the operator to a flag they never passed, while the `_noslot`
-    # figures appended to the same clause (`inflight=6 ...`) said nothing held a slot. The provenance
-    # is known HERE, so it is recorded here instead of guessed at the call site.
+    # ⛔ `capped` AND THE PER-CLASS PROVENANCE RECORD WHAT THE ARM MAY **NOT** INFER (review P1,
+    # 2026-10-31). Without them the NO SLOT arm had to guess the cause of a 0 AGGREGATE from the
+    # number alone, and a 0 class budget has THREE causes: the cap is configured 0, every slot is in
+    # use, or (for `total`) the `--max` override clamped it. The arm named `--max` for all of them,
+    # so a saturated pass sent the operator to a flag they never passed -- and after the first fix it
+    # named "both class budgets are SPENT" for a pass where NOTHING was spent, with `inflight=0
+    # alive=0 unproven=0` appended to the same clause saying so. The provenance is known HERE, so it
+    # is recorded here instead of guessed at the call site.
     out["capped"] = False
+    out["cap"] = {"fix": cap["max_fix"], "review": cap["max_review"]}
+    out["used_by_class"] = dict(used)
     if total_override is not None:
         _cap = max(0, total_override)
         out["capped"] = _cap < out["total"]
@@ -5144,9 +5147,9 @@ def run_pass(args, rubric_note: str = "") -> int:
     # must SAY so; that silence is what the brief bans.
     #
     # ⛔ EVERY COUNT BELOW READS THE KEY `counts` ACTUALLY HOLDS (review P1, 2026-10-30). `running` and
-    # `unreadable` are diverted into `skipped[...]` BEFORE `classified` is built (`:4889`/`:4898`
-    # unreadable, `:4908` running), and `counts` is built from `classified` plus `skipped` under a
-    # `skipped-` prefix (`:5105`) -- so the bare
+    # `unreadable` are diverted into `skipped[...]` BEFORE `classified` is built (the classification
+    # loop above writes `skipped["unreadable"]` and `skipped["running"]`), and `counts` is built from
+    # `classified` plus `skipped` under a `skipped-` prefix (`counts["skipped-" + a]`) -- so the bare
     # keys can never exist and `counts.get("running", 0)` was STRUCTURALLY 0. That was a false
     # statement of exactly the kind this line exists to prevent: a pass would print
     # `pass: 22 open PRs :: skipped-running=6 ...` immediately above
@@ -5178,13 +5181,17 @@ def run_pass(args, rubric_note: str = "") -> int:
             _c = ACTION_CLASS.get(_a, "fix")
             _r2_by_class[_c] = _r2_by_class.get(_c, 0) + _n
     _r2 = sum(_r2_by_class.values())
-    # ⛔ rung 3 IS EVERY ROW ON THE BLINDNESS AXIS, NOT TWO OF THEM (review P2, 2026-10-31).
-    # `running` and `unreadable` are the obvious holds, but `_finish` folds THREE MORE populations
-    # onto the SAME blindness axis (`blind = unread + blind_surface + blind_partial +
-    # blind_abandoned`) -- an unusable changed-file list is a held PR for a reason the operator must
-    # see. Leaving them out let this line print `wait=0 ... nothing to dispatch` while PRs sat held
-    # on precisely the unreadable classification it defines as rung 3: the same silence the block
-    # exists to remove, one population over.
+    # ⛔ rung 3 IS EVERY ROW THE PASS HELD WITHOUT DISPATCHING, AND THAT IS NOT `_finish`'s `blind`
+    # (review P1, 2026-10-31). Two of the populations are obvious -- `running` (the head is still
+    # executing) and `unreadable` -- and `_finish` folds THREE MORE onto its blindness axis
+    # (`blind = unread + blind_surface + blind_partial + blind_abandoned`): an unusable changed-file
+    # list is a held PR for a reason the operator must see. Leaving those three out let this line
+    # print `wait=0 ... nothing to dispatch` while PRs sat held on precisely the classification it
+    # defines as rung 3: the same silence the block exists to remove, one population over.
+    # ⛔ SO `wait=` IS `blind` PLUS `running`, NOT `blind` ITSELF -- `_finish`'s equation has NO
+    # `running` term (`skipped["running"]` is written in the classification loop and read only
+    # here), and an earlier revision of this comment claimed the identity `blind == wait`, which the
+    # quoted equation eight lines above refutes.
     # ⛔ AND THE THREE ARE NAMED SEPARATELY, BECAUSE THE PER-PR LINE CALLS THEM ASK-USER (review P1,
     # 2026-10-31). The same pass logs `ASK-USER #<n> (...) -- a human decides` for each of them (the
     # `surface_partial` / `surface_unreadable` / `surface_abandoned` arms above), and a 100+-file
@@ -5199,14 +5206,15 @@ def run_pass(args, rubric_note: str = "") -> int:
     # revision of this comment said surface was "not carried under `held=`" and then said, one
     # clause later, that the arm below folds it in: a self-refuting banner is worse than no banner,
     # because a maintainer could obey either half. What is guaranteed: `surface=` names the
-    # SDK-surface ASK-USER split, `wait=` names the whole blindness axis, `filelist=` the
+    # SDK-surface ASK-USER split, `wait=` names every hold without a dispatch (`_finish`'s `blind`
+    # PLUS `running`), `filelist=` the
     # unusable-changed-file-list part of it (a human decides), and `held=` is the arm's total only
     # in the arm that says so.
     _r3_wait = sum(counts.get(k, 0) for k in ("skipped-running", "skipped-unreadable"))
     _r3_files = sum(counts.get(k, 0)
                     for k in ("skipped-surface_unreadable", "skipped-surface_partial",
                               "skipped-surface_abandoned"))
-    _r3 = _r3_wait + _r3_files      # the same axis `_finish` calls `blind`
+    _r3 = _r3_wait + _r3_files      # `_finish`'s `blind` PLUS `running` (a hold, but not a blind read)
     _held = counts.get("skipped-surface", 0)   # ASK-USER: held for a HUMAN, not for a re-read
     # ⛔ RUNG 2 SPANS TWO CLASSES, SO ITS TOTAL IS NOT A CLASS COUNT (review P2, round 4). `fix=%d`
     # printed `_r2` -- the sum over BOTH budget classes -- while the arms below name a CLASS
@@ -5254,11 +5262,12 @@ def run_pass(args, rubric_note: str = "") -> int:
     #     still admits: rung 1 IS `ACTION_CLASS["call-rail"] == "review"` (`:1222`), so a zero REVIEW
     #     budget with fix slots free refuses it while `budgets["total"]` still reads > 0.
     # ⛔ AND NEITHER AGGREGATE NOR CLASS ALONE IS "A SLOT EXISTS" (review P1, round 3). The loop ALSO
-    # breaks on `dispatched >= budgets["total"]`, and `pass_budgets` sets
-    # `out["total"] = min(out["total"], max(0, total_override))` (`:1540`) while leaving
-    # `out["fix"]`/`out["review"]` at their own values -- so `--max 0` (a documented operator flag,
-    # `:4715`) yields `{'fix': 3, 'review': 3, 'total': 0}` and the arms printed
-    # `slots=0 merge->candidate (2), the rail decides; review slots=3` while dispatching nothing.
+    # breaks on `dispatched >= budgets["total"]`, and `pass_budgets` clamps `out["total"]` to the
+    # `--max` override through `_cap` (`out["total"] = min(out["total"], _cap)`) while leaving
+    # `out["fix"]`/`out["review"]` at their own values -- so `--max 0` (the documented operator flag,
+    # `--max`) yields `{'fix': 3, 'review': 4, 'total': 0}` at the shipped defaults and the arms
+    # printed `slots=0 merge->candidate (2), the rail decides; review slots=3` while dispatching
+    # nothing.
     # The binding number is `min(budgets[cls], budgets["total"])`, and that is what is printed.
     # So no arm says "handed"/"dispatched"/"eligible": every one names a CANDIDATE count and the
     # EFFECTIVE slots that could serve it. "Candidate" is the only claim this line can keep, because
@@ -5272,32 +5281,42 @@ def run_pass(args, rubric_note: str = "") -> int:
 
     # ⛔ THE NO-SLOT ARM MUST NAME THE CONSTRAINT THAT ACTUALLY BOUND (review P2, round 4). Both arms
     # hardcoded `"<class> budget 0"`, but `_eff` is `min(budgets[cls], budgets["total"])` -- so with
-    # the documented `--max 0` override (`{'fix': 3, 'review': 3, 'total': 0}`) the arm told the
-    # operator `review budget 0` while `MAX_REVIEW` was 3, sending them at the wrong knob. The
-    # appended `_noslot` numbers contradicted it in the same clause (`inflight=0 alive=0 unproven=0`
-    # says nothing holds a slot). Name the BINDING term: the class, the aggregate, or both.
-    # ⛔ AND `--max` MAY ONLY BE NAMED WHEN `--max` ACTUALLY BOUND (review P1, round 7). `total == 0`
-    # has two causes and this arm named `--max` for both: `pass_budgets` ALSO yields
-    # `{'fix': 0, 'review': 0, 'total': 0}` at the shipped MAX_FIX/MAX_REVIEW once both classes are
-    # spent, with `total_override is None`. Measured on this head with NO `--max` passed and six
-    # in-flight rows:
-    #     pass: ... budget fix=0 review=0 total=0
-    #     cascade: ... fix->NO SLOT (fix budget 0 and the aggregate ceiling (--max) 0: no available
-    #                        slot: inflight=6 alive=0 unproven=6)
-    # -- the operator sent at a flag they never passed, and the figures in the same clause refuted
-    # it. `budgets["capped"]` is the provenance `pass_budgets` now records, so the cause is STATED
-    # from the fact rather than inferred from a zero.
+    # the documented `--max 0` override (`{'fix': 3, 'review': 4, 'total': 0}` at the shipped caps)
+    # the arm told the operator `review budget 0` while the REVIEW cap was 4, sending them at the
+    # wrong knob. The appended `_noslot` numbers contradicted it in the same clause (`inflight=0
+    # alive=0 unproven=0` says nothing holds a slot). Name the BINDING term: the class, the aggregate,
+    # or both.
+    # ⛔ AND A 0 CLASS BUDGET HAS THREE CAUSES, SO NONE OF THEM MAY BE INFERRED FROM THE ZERO (review
+    # P1, round 7; P1 again round 8). `total == 0` is BOTH "`--max` clamped it" AND "both class
+    # budgets are 0" (`total = fix + review`, `total_override is None`), and a 0 class budget is
+    # BOTH "every slot is in use" AND "the cap is CONFIGURED 0" (`capacity()` accepts `"0"`).
+    # Round 7 fixed the first and then asserted the second: with `MAX_FIX=0 MAX_REVIEW=0` and NO
+    # in-flight rows it printed "both class budgets are spent", while the `_noslot` figures appended
+    # to the same clause read `inflight=0 alive=0 unproven=0` -- nothing had been spent. Both
+    # provenances are now recorded by `pass_budgets` (`capped`, `cap`, `used_by_class`), so every
+    # clause below is STATED from the fact.
+    def _cls_state(_c):
+        """Why THIS class budget is 0 -- configured that way, or consumed."""
+        _cap = (budgets.get("cap") or {}).get(_c)
+        _use = (budgets.get("used_by_class") or {}).get(_c)
+        if _cap is None or _use is None:
+            return "%s budget 0" % _c          # a caller that did not go through pass_budgets
+        if _cap <= 0:
+            return "%s budget 0 (the cap is 0, so nothing was spent)" % _c
+        return "%s budget 0 (%d of %d slots in use)" % (_c, _use, _cap)
+
     def _why(_c):
         _cls_b, _tot = budgets[_c], budgets["total"]
+        _other = "review" if _c == "fix" else "fix"
         if _tot <= 0 and budgets.get("capped"):
             if _cls_b <= 0:
                 return "%s budget 0 and the aggregate ceiling (--max) 0" % _c
             return "the aggregate ceiling (--max) 0, %s budget %d" % (_c, _cls_b)
         if _tot <= 0:
-            # NOT capped, so `total == 0` means both classes are spent (`fix + review == 0`).
-            return ("%s budget 0 and no headroom in the other class either -- both class budgets "
-                    "are spent" % _c)
-        return "%s budget 0" % _c
+            # NOT capped, so `total == 0` means both class budgets are 0 -- and `_cls_state` says
+            # WHY each one is, without ever claiming a spend it cannot see.
+            return "no class budget left -- %s; %s" % (_cls_state(_c), _cls_state(_other))
+        return _cls_state(_c)
 
     if _r1:
         _e = _eff("review")

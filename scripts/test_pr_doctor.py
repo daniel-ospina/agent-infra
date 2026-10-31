@@ -4664,6 +4664,24 @@ def test_the_cascade_names_the_unusable_file_list_part_of_the_wait(monkeypatch):
     assert "a human must resolve" not in casc[0], casc[0]
 
 
+def test_the_cascade_wait_rung_counts_a_still_running_head(monkeypatch):
+    """`wait=` must count the `running` rows -- the half that was left unpinned (review P2, round 8).
+
+    ⛔ Removing `skipped-running` from `_r3_wait` left every other cascade test GREEN, so the
+    population whose structural-0 defect is this block's stated reason to exist had no assertion
+    behind it. ⛔ AND `running` IS NOT `_finish`'s BLINDNESS AXIS: `blind = unread + blind_surface +
+    blind_partial + blind_abandoned` has no `running` term, so `wait=` is `blind` PLUS `running` --
+    not `blind` itself, which is what an earlier revision of the block's comment claimed.
+    """
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(71)], ("running", "", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=1" in casc[0], casc[0]
+    assert "nothing to dispatch" not in casc[0], casc[0]
+    assert "rung 3" in casc[0], casc[0]
+    assert "filelist=" not in casc[0], casc[0]
+
+
 def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatch):
     """Rung 1 must name what is ELIGIBLE; only `_finish` may say what was dispatched.
 
@@ -4815,13 +4833,13 @@ def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
         monkeypatch, [_pr(63)], ("record-review", "why", []))
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
-    assert "review->NO SLOT (review budget 0:" in casc[0], casc[0]
+    assert "review->NO SLOT (review budget 0 (the cap is 0" in casc[0], casc[0]
     assert "aggregate ceiling" not in casc[0], casc[0]
 
-    # (c) BOTH CLASSES SPENT AT THE SHIPPED CAPS, NO `--max` PASSED (review P1, round 7). This is the
-    #     ordinary saturated fleet, and `total == 0` for a reason that has nothing to do with `--max`.
-    #     The old arm named the ceiling anyway, sending the operator at a flag they never passed while
-    #     `inflight=` in the same clause said nothing held a slot.
+    # (c) BOTH CAPS CONFIGURED TO 0, NO `--max` PASSED (review P1, round 7; RELABELLED round 8).
+    #     `capacity()` accepts `"0"`, so this is the CONFIGURED-ZERO cause, NOT the saturated one --
+    #     an earlier revision of this comment called it "the ordinary saturated fleet at the shipped
+    #     caps", which is a different fixture (case (d) below) and a different sentence.
     monkeypatch.setenv("MAX_FIX", "0")
     monkeypatch.setenv("MAX_REVIEW", "0")
     _rc, joined, _payload = _drive_pass(
@@ -4830,7 +4848,34 @@ def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
     assert len(casc) == 1, joined
     assert "review->NO SLOT" in casc[0], casc[0]
     assert "aggregate ceiling" not in casc[0], casc[0]
-    assert "both class budgets are spent" in casc[0], casc[0]
+    # NOTHING WAS SPENT, so the arm may not say a budget was consumed -- the appended
+    # `inflight=0 ...` refuted that in the same clause (review P1, round 8).
+    assert "the cap is 0, so nothing was spent" in casc[0], casc[0]
+    assert "slots in use" not in casc[0], casc[0]
+
+    # (d) THE GENUINELY SATURATED FLEET: shipped caps, EVERY slot held (review P2, round 8). This is
+    #     the population round 7's comment described and whose fixture was never built -- so the
+    #     opposite word ("spent") had no test either, and a revert to a blanket sentence stayed green.
+    for _k in ("MAX_FIX", "MAX_REVIEW"):
+        monkeypatch.delenv(_k, raising=False)
+    _now = pr.now()
+    _busy = {}
+    for _i in range(3):
+        _busy[str(900 + _i)] = {"action": "fix-ci", "head": "b" * 40,
+                                "at_epoch": _now, "worker": "w%d" % _i}
+    for _i in range(4):
+        _busy[str(910 + _i)] = {"action": "record-review", "head": "b" * 40,
+                                "at_epoch": _now, "worker": "r%d" % _i}
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(70)], ("record-review", "why", []), state=_busy)
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->NO SLOT" in casc[0], casc[0]
+    assert "no class budget left" in casc[0], casc[0]
+    assert "4 of 4 slots in use" in casc[0], casc[0]
+    assert "3 of 3 slots in use" in casc[0], casc[0]
+    assert "the cap is 0" not in casc[0], casc[0]
+    assert "aggregate ceiling" not in casc[0], casc[0]
 
 
 def test_the_cascade_rung2_total_is_not_reported_as_a_class_count(monkeypatch):
