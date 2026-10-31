@@ -869,27 +869,28 @@ assert_contains "$out" "lane_venv_real=?" "a timed-out probe is UNKNOWN, never a
 assert_eq "$rc" "0" "a timed-out probe does not fail the pass"
 # An INVALID bound arms no watchdog at all in run_bounded, so it must be refused loudly, not silently.
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=2 REAP_VENV_VENV_COST_TIMEOUT=abc --gc --repo "$RH")"; rc=$?
-assert_contains "$out" "is not a positive integer" "an invalid timeout is named, not silently unbounded"
+assert_contains "$out" "is not a number" "an invalid timeout is named, not silently unbounded"
 # ⛔ AN ALL-DIGIT VALUE ABOVE intmax IS THE FAIL-OPEN CASE (review round 3): `is_pos_int` accepts it and
 # `[ <huge> -eq 0 ]` ERRORS rather than returning false, so a "digits and not zero" check let it through
 # and armed no watchdog at all. A string-compare + length cap is what makes this reachable-and-refused.
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=2 REAP_VENV_VENV_COST_TIMEOUT=99999999999999999999999 --gc --repo "$RH")" 2>&1; rc=$?
-assert_contains "$out" "is not a positive integer" "an over-range all-digit timeout is refused too, not accepted as a bound"
+assert_contains "$out" "out of range" "an over-range all-digit timeout is refused too, not accepted as a bound"
+assert_not_contains "$out" "integer expression expected" "the cost-seam validation does not itself emit an arithmetic error"
 # ⛔ LEADING ZEROS SPELL ZERO (review round 4, P1): a string compare against "0" refuses only that
 # spelling, so `00`/`000` passed validation and then meant zero to run_bounded's numeric test — no
 # watchdog, no warning. Exactly the fail-open this validation exists to prevent.
 for z in 00 000 00000; do
     out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" REAP_VENV_VENV_COST_TIMEOUT="$z" --gc --repo "$RH")" 2>&1; rc=$?
-    assert_contains "$out" "is not a positive integer" "a zero spelled '$z' is refused, not silently unbounded"
+    assert_contains "$out" "using 60s" "a zero spelled '$z' is refused loudly, not silently unbounded"
 done
 # …and a merely zero-PADDED positive value is VALID (60), not a false refusal.
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" REAP_VENV_VENV_COST_TIMEOUT=000060 --gc --repo "$RH")" 2>&1; rc=$?
-assert_not_contains "$out" "is not a positive integer" "000060 is a valid 60s bound, not a false refusal"
+assert_not_contains "$out" "REAP_VENV_VENV_COST_TIMEOUT=" "000060 is a valid 60s bound, not a false refusal"
 # The root fix: an over-range bound at a SIBLING seam warns instead of aborting the comparison.
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" REAP_VENV_PS_TIMEOUT=99999999999999999999999 --gc --repo "$RH")" 2>&1; rc=$?
 assert_contains "$out" "out of range" "a sibling bound seam is validated at the root (run_bounded), not only at one call site"
 assert_not_contains "$out" "integer expression expected" "and no probe bound can abort its own comparison"
-assert_not_contains "$out" "integer expression expected" "the validation does not itself emit an arithmetic error"
+# (the venv-cost seam's own arithmetic-error assertion sits with its run, above)"
 
 echo " H5d an unmeasurable probe reads UNKNOWN, never 0 (#2159)"
 # A `0` here would read as "a lane env is free", which is the exact over-admission this line exists to

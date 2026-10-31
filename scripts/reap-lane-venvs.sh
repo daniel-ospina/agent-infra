@@ -380,6 +380,33 @@ run_probe() {
 # run_bounded <seconds> <outfile> <cmd...> — 0 ok, 124 timed out, else the command's status.
 # stdout AND stderr are merged into <outfile>: a caller that needs to tell "tmux has no server" (a
 # KNOWN zero) from "tmux failed" (an unsound pass) can only do that from stderr text.
+# bound_seconds <value> <fallback> <label> — normalise a watchdog bound and echo it. Always echoes a
+# usable value; the fallback is announced on stderr (and the log) when the input was not usable.
+# ⛔ `0` IS A DELIBERATE DISABLE, not an accident: the header documents it, and it is the only spelling
+# that arms no watchdog WITHOUT a warning. Every other unusable shape — non-numeric, negative, empty,
+# or an all-digit value long enough to overflow the eventual `[ -gt ]` — falls back loudly, because an
+# unbounded probe that nobody asked for is the failure the six seams exist to prevent.
+bound_seconds() {
+    local raw="${1:-}" fallback="$2" label="$3" norm
+    norm="${raw#"${raw%%[!0]*}"}"
+    case "$raw" in
+        ''|*[!0-9]*)
+            echo "warn: $label='$raw' is not a number — using ${fallback}s (an unusable bound would arm no watchdog)" >&2
+            log "warn: $label='$raw' not a number — fell back to ${fallback}s"
+            printf '%s\n' "$fallback"; return 0 ;;
+    esac
+    if [ -z "$norm" ]; then
+        # All zeros (or literal "0"): the documented disable.
+        printf '0\n'; return 0
+    fi
+    if [ "${#norm}" -gt 9 ]; then
+        echo "warn: $label='$raw' is out of range (at most 9 digits) — using ${fallback}s instead of arming no watchdog" >&2
+        log "warn: $label='$raw' out of range — fell back to ${fallback}s"
+        printf '%s\n' "$fallback"; return 0
+    fi
+    printf '%s\n' "$norm"
+}
+
 run_bounded() {
     local secs="$1" out="$2"; shift 2
     local pid wd="" s rc=0 sentinel="" done_flag=""
@@ -391,24 +418,14 @@ run_bounded() {
     : >"$out" 2>/dev/null || { : ; }
     "$@" >"$out" 2>&1 &
     pid=$!
-    # ⛔ NORMALISE AND RANGE-CHECK HERE, NOT ONLY AT ONE CALL SITE (#2159 review, rounds 3-4). The
-    # predicate below parses with strtoimax: an all-digit value above 2^63-1 makes the COMPARISON ITSELF
-    # error, `if` then takes the else branch and NO WATCHDOG IS ARMED — silently, on every one of the
-    # six bound seams (ps/cwd/tmux/git/remove/cost), not just the one that got a per-seam check. Leading
-    # zeros are stripped first (`00` is zero, which is already the documented "no watchdog" spelling, so
-    # it means exactly what `0` means), the digit count is capped at 9 (~31 years), and an over-range
-    # value falls back LOUDLY rather than being handed to a comparison that would abort.
-    _bnd_norm="${secs#"${secs%%[!0]*}"}"
-    case "$secs" in
-        ''|*[!0-9]*) _bnd_norm="" ;;
-    esac
-    if [ -n "${_bnd_norm:-}" ] && [ "${#_bnd_norm}" -gt 9 ]; then
-        echo "warn: probe bound '$secs' is out of range (at most 9 digits) — using 120s instead of arming no watchdog" >&2
-        log "warn: probe bound '$secs' out of range — fell back to 120s"
-        secs=120
-    elif [ -n "${_bnd_norm:-}" ]; then
-        secs="$_bnd_norm"
-    fi
+    # ⛔ ONE PREDICATE FOR EVERY BOUND (#2159 review, round 5). The test below parses with strtoimax: an
+    # all-digit value above 2^63-1 makes the COMPARISON ITSELF error, `if` takes the else branch and NO
+    # WATCHDOG IS ARMED — silently, at every one of the six bound seams (ps/cwd/tmux/git/remove/cost).
+    # The same normalisation is used by the cost seam's own validation; two validators with different
+    # caps and messages is the state that must not ship (see the `REAP_VENV_MIN_AGE_SECONDS` note).
+    #   "0060" -> 60   "100000" -> 100000   "-1"/"abc"/"30s"/""  -> invalid, LOUD fallback
+    #   "0"/"00"/"000" -> zero, which is the DOCUMENTED disable spelling: intentional, so silent.
+    secs="$(bound_seconds "$secs" 120 probe-bound)"
     if is_pos_int "$secs" && [ "$secs" -gt 0 ]; then
         (
             # ⛔ `cd /` IS LOAD-BEARING (#1932). This watchdog is a CHILD of the reaper and inherits its
@@ -1070,23 +1087,16 @@ parse_args() {
     # validation was added to prevent (the same class #2158 fixed for the age floor). String compare
     # for the zero test, and a length cap before any numeric comparison, so the check cannot itself
     # emit an arithmetic error.
-    # ⛔ LEADING ZEROS ARE NORMALISED FIRST, exactly as the age floor does it (#2158): a string compare
-    # against "0" refuses only that spelling, so `00`/`000` would pass and then mean zero to
-    # `run_bounded`'s numeric test — no watchdog, no warning: the same fail-open in a different spelling.
-    # Strip them, then range-check the NORMALISED form (so `000060` is a valid 60s, not a false refusal).
-    _vct="${REAP_VENV_VENV_COST_TIMEOUT:-}"
-    _vct_norm="${_vct#"${_vct%%[!0]*}"}"
-    _vct_ok=0
-    case "$_vct" in
-        ''|*[!0-9]*) _vct_ok=0 ;;
-        *) [ "${#_vct_norm}" -ge 1 ] && [ "${#_vct_norm}" -le 5 ] && [ "$_vct_norm" != "0" ] && _vct_ok=1 ;;
-    esac
-    if [ "$_vct_ok" = "0" ]; then
-        echo "warn: REAP_VENV_VENV_COST_TIMEOUT='${REAP_VENV_VENV_COST_TIMEOUT:-}' is not a positive integer — using 60s; an invalid bound in run_bounded arms no watchdog at all" >&2
-        log "warn: REAP_VENV_VENV_COST_TIMEOUT invalid ('${REAP_VENV_VENV_COST_TIMEOUT:-}') — fell back to 60s"
+    # ⛔ THE SAME PREDICATE AS run_bounded (#2159 review, round 5), not a second one with its own cap
+    # and wording: the two disagreed (5 vs 9 digits, 60 vs 120s) and the narrower one refused a VALID
+    # value with the message "is not a positive integer". The cost walk gets its own default only —
+    # and it refuses the disable spelling, because an unbounded cost walk is never what an operator
+    # wants (it is the one seam where "0 = no watchdog" is not a legitimate choice).
+    REAP_VENV_VENV_COST_TIMEOUT="$(bound_seconds "${REAP_VENV_VENV_COST_TIMEOUT:-}" 60 REAP_VENV_VENV_COST_TIMEOUT)"
+    if [ "$REAP_VENV_VENV_COST_TIMEOUT" = "0" ]; then
+        echo "warn: REAP_VENV_VENV_COST_TIMEOUT=0 disables the cost probe's watchdog, which this seam does not allow — using 60s" >&2
+        log "warn: REAP_VENV_VENV_COST_TIMEOUT=0 refused (unbounded cost walk) — fell back to 60s"
         REAP_VENV_VENV_COST_TIMEOUT=60
-    else
-        REAP_VENV_VENV_COST_TIMEOUT="$_vct_norm"
     fi
     while [ $# -gt 0 ]; do
         a="$1"
