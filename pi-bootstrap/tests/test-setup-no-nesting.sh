@@ -525,6 +525,7 @@ script:pi-reap-worktrees.sh script:pr-doctor.py
 script:publish-live-workspaces.py
 script:session-postmortem.sh
 script:record-review.sh
+script:venv-real-cost.py
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
 script:harness-apply-pass.sh
 lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
@@ -537,6 +538,14 @@ foreign:cmux_dispatch.py"
 # population, not an exemption. Verified against the CODE, not the diff (#1899): the exec site is
 # `templates/systemd/eldato-harness-apply.service` + `templates/launchd/harness-apply/*.plist`, both
 # naming `$HOME/.pi/agent/scripts/harness-apply-pass.sh`.
+# `script:venv-real-cost.py` joined on 2026-10-31 (#2159, PR #3137): the hardlink-aware cost probe
+# `reap-lane-venvs.sh` execs at `$(dirname "${BASH_SOURCE[0]}")/venv-real-cost.py` (:166 — the F2
+# self-dir sibling form, which is why the derivation sees it). It is DELIVERED — the SAME landing
+# added it to `pi-bootstrap/setup.sh`'s `fleet_srcs`, so a fresh $DEST/scripts gets the probe beside
+# the reaper that calls it — so this is a re-pin of the derived population, NOT a
+# `LANE_PRODUCERS_EXEMPT` entry. Verified against the CODE: the reaper's `VENV_REAL_BIN` default is
+# the only exec site, and `fleet_srcs` is what puts the file there.
+#
 # `script:disk-reaper-run.sh` joined on 2026-10-24 (#2354, PR #2361): the scheduled wrapper the
 # timer unit execs, ADDED to `fleet_srcs` in the same landing (a fresh $DEST/scripts otherwise gets
 # `install-disk-reaper-timer.sh` + `disk-reaper.sh` without the entry point the unit calls — the exact
