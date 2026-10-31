@@ -319,6 +319,26 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: Fleet snapshot suite (#1178 unit 5, zero-dep)
+        # #1178 `one-instrument-two-populations` — the BOX-WIDE reading
+        # (tools/fleet/fleet_snapshot.py): capacity + BOTH lane populations in one
+        # shot. Registered here for the reason this job's own text records — a
+        # suite that no job executes passes by never running, and this one carries
+        # the pins for the whole second population (bound and unbound dispatch
+        # lanes, `dead` never reachable there, UNMEASURED-never-0, MAX_LANES).
+        # Zero-dep by construction: a standalone script driving temp fixtures with
+        # a `bash` shim in place of the identity CLI — no live process, no ps read,
+        # no network. VISIBLE, not merge-blocking (`pipeline-compliance` is the
+        # repo's only required check, #646).
+        run: python3.12 tools/fleet/fleet_snapshot.test.py
+      - name: Fleet snapshot mutation evidence (#1178 unit 5, zero-dep)
+        # The suite above is only a pin if it can FAIL. `--mutations` reintroduces
+        # each of the 5 defects into a TEMP copy of the module and re-runs the
+        # suite against it in a subprocess, naming the pin that must go red — a
+        # mutation whose pin still passes is reported as a suite failure. Its own
+        # step, so one verdict cannot suppress the other (the rule every suite in
+        # this job follows).
+        run: python3.12 tools/fleet/fleet_snapshot.test.py --mutations
       - name: PR state router suite (#2866, zero-dep)
         # #2866 — the router is the ONE answer to "what does this PR need next, and should anything
         # be running for it right now". Its rules are what decide whether CI is spent (a `cancelled`
