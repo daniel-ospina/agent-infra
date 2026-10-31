@@ -606,8 +606,27 @@ if [ -f "$REPO/pyproject.toml" ] && [ ! -x "$REPO/.worktrees/dispatch-scout/.ven
 fi
 
 # ── shipped scripts ──────────────────────────────────────────────────────────────
+# ⛔ #2930 — A TEST SUITE'S PARSE ERROR MUST NOT BE ABLE TO REFUSE AN INSTALL. This sweep is what
+# stopped a stock Mac from installing the harness AT ALL: `merge-reminder.test.sh` carries a
+# here-doc inside a `$( )` whose body contains an apostrophe, bash 3.2's substitution scanner does
+# not know about here-documents and desynchronises (#2248 is the same class), `bash -n` failed, and
+# `die` ran — over a file NOTHING EXECUTES at runtime. The two are not the same risk: a runtime
+# script that does not parse is a controller that crash-loops under KeepAlive (refuse, as before); a
+# `*.test.sh` that does not parse on THIS host is a suite that cannot run here (report it BY NAME
+# and continue). The class is caught before merge by scripts/check-bash32-parse.sh, which sweeps
+# every shipped `*.sh` under a real bash 3.2 in both CI lanes.
 for f in "$HERE"/*.sh; do
-  bash -n "$f" || die "syntax error in $(basename "$f")"
+  if err="$(bash -n "$f" 2>&1)"; then continue; fi
+  case "$(basename "$f")" in
+    *.test.sh)
+      warn "syntax error in the TEST suite $(basename "$f") — reported, NOT fatal (no runtime script runs it):"
+      printf '%s\n' "$err" | sed 's/^/        /'
+      ;;
+    *)
+      printf '%s\n' "$err" >&2
+      die "syntax error in $(basename "$f")"
+      ;;
+  esac
 done
 # the gh REST adapter is a bin shim, not a *.sh — check it explicitly (#1959)
 [ -f "$HERE/gh-rest/gh" ] && { bash -n "$HERE/gh-rest/gh" || die "syntax error in gh-rest/gh"; }
@@ -995,9 +1014,21 @@ ok "harness pinned: ${PIN_HEAD:0:12} at $HARNESS"
 # ⛔ THE PINNED TREE IS NOW A SHIPPED SURFACE, SO IT GETS THE SAME SYNTAX SWEEP the checkout got above.
 # A pin can name a commit whose `orch-loop.sh` does not parse (a bad land), and launchd would then
 # KeepAlive-crash-loop on it with nothing but syntax errors in launchd.err. Refuse at install time.
+# The `*.test.sh` carve-out is the one the checkout sweep above documents (#2930): a tested-but-broken
+# suite is reported by name, never a refused install.
 for _f in "$HARNESS"/*.sh; do
   [ -f "$_f" ] || continue
-  bash -n "$_f" || pin_refuse "syntax error in the PINNED $(basename "$_f") ($HARNESS) — this commit cannot run, and installing it would crash-loop under KeepAlive"
+  if _err="$(bash -n "$_f" 2>&1)"; then continue; fi
+  case "$(basename "$_f")" in
+    *.test.sh)
+      warn "syntax error in the PINNED test suite $(basename "$_f") — reported, NOT fatal (#2930):"
+      printf '%s\n' "$_err" | sed 's/^/        /'
+      ;;
+    *)
+      printf '%s\n' "$_err" >&2
+      pin_refuse "syntax error in the PINNED $(basename "$_f") ($HARNESS) — this commit cannot run, and installing it would crash-loop under KeepAlive"
+      ;;
+  esac
 done
 ok "pinned scripts parse ($HARNESS)"
 
@@ -1170,7 +1201,31 @@ done
 # literal `4`; 2.5x cores now) — exit 0, plutil OK, and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
 # below can only fire on a genuinely unrendered TEMPLATE token, never on a value that merely looks
 # like one (a legal `O=/tmp/__DATA__host` used to be refused with a diagnostic naming the wrong cause).
-for _v in "$O" "$REPO" "$OR" "$SCOPE" "$HOME" "$DAEMON_PATH" \
+# ⛔ THE uv PIN IS RESOLVED FROM THE INSTALLER'S OWN ENVIRONMENT, WITH THE REPO'S DEFAULTS BEHIND IT
+# (agent-infra#2159). The daemon's environment is what `worker-terminal.sh` snapshots into every lane,
+# so a pin that lives only in one operator's shell profile never reaches a lane; it has to be rendered
+# HERE. An explicit value in the installing shell WINS (a box whose cache sits on another volume is a
+# legitimate operator decision, and its cost is then reported by `uv-env.sh report`); otherwise the
+# shipped default is used.
+UV_ENV_RENDER_HELPER="$HERE/uv-env.sh"
+UV_CACHE_DIR_RENDER=""
+UV_LINK_MODE_RENDER=""
+if [ -r "$UV_ENV_RENDER_HELPER" ]; then
+  # ⛔ `set -euo pipefail` is in force: a bare failing substitution ABORTS the install at the
+  # assignment, with no diagnostic, instead of reaching the two `die` messages below. `|| true` puts
+  # the failure on the diagnosable path (the empty-value refusal), where it names what is wrong.
+  UV_CACHE_DIR_RENDER="$(bash -c '. "$1" >/dev/null 2>&1; uv_env_cache_dir' _ "$UV_ENV_RENDER_HELPER" 2>/dev/null)" || true
+  UV_LINK_MODE_RENDER="$(bash -c '. "$1" >/dev/null 2>&1; uv_env_link_mode' _ "$UV_ENV_RENDER_HELPER" 2>/dev/null)" || true
+fi
+[ -n "$UV_CACHE_DIR_RENDER" ] || UV_CACHE_DIR_RENDER="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+[ -n "$UV_LINK_MODE_RENDER" ] || UV_LINK_MODE_RENDER="${UV_LINK_MODE:-hardlink}"
+# An EMPTY value would render `<string></string>`, which launchd passes as an EMPTY variable — and an
+# empty `UV_CACHE_DIR` is worse than no pin: uv would resolve its own default while the plist claims to
+# have pinned one. Refuse rather than render a claim about a path nothing names.
+[ -n "$UV_CACHE_DIR_RENDER" ] || die "the uv cache pin resolved to an EMPTY path — refusing to render a plist that claims to pin a cache it cannot name"
+[ -n "$UV_LINK_MODE_RENDER" ] || die "the uv link-mode pin resolved to an EMPTY value — refusing to render a plist that claims to pin a link mode it cannot name"
+for _v in "$O" "$REPO" "$OR" "$SCOPE" "$HOME" "$UV_CACHE_DIR_RENDER" "$UV_LINK_MODE_RENDER" \
+           "$DAEMON_PATH" \
            "$HARNESS" "$HARNESS_ENTRY" "$HARNESS_PIN" "$HARNESS_PIN_FILE" "$HARNESS_PIN_DIR" "$HARNESS_REPO" "$MAT_FOR_PLIST"; do
   case "$_v" in *__[A-Z_]*__*) die "a substituted value contains a template token ('$_v') — sed applies its rules in order, so a later rule would rewrite it" ;; esac
   case "$_v" in *$'\n'*) die "a substituted value contains a newline, which sed cannot put in a replacement" ;; esac
@@ -1202,6 +1257,8 @@ sed \
   -e "s|__SCOPE__|$(esc "$SCOPE")|g" \
   -e "s|__HOME__|$(esc "$HOME")|g" \
   -e "s|__PATH__|$(esc "$DAEMON_PATH")|g" \
+  -e "s|__UV_CACHE_DIR__|$(esc "$UV_CACHE_DIR_RENDER")|g" \
+  -e "s|__UV_LINK_MODE__|$(esc "$UV_LINK_MODE_RENDER")|g" \
   -e "s|__MAX_LOAD__|$MAX_LOAD|g" \
   -e "s|__MAX_LANES__|$MAX_LANES|g" \
   -e "s|__MAX_REVIEW__|$MAX_REVIEW|g" \
@@ -1348,7 +1405,7 @@ DRIFTED=""
 # startup warning. That is exactly the partial-reseed drift this list exists to catch.
 # gate-policy.sh (#2319) is the same class and is REQUIRED now: every pi-spawning carrier sources it
 # and `exit 78`s without it, so a $O copy predating it stops every lane and every merge on the box.
-for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
+for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

@@ -100,9 +100,9 @@ FIX_DELIVERY_BRIEF="$(bash "$delivery_sh" --delivery-brief prfix)" || {
 # checkout and a DIFFERENT target repo used to materialise a worktree in the checkout and run there,
 # reporting failures about branches instead of about the repo. Missing = FATAL, because a silently
 # skipped assertion is the defect. `REPO_TARGET_REFUSED` (72) is distinct from every gate code.
-. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
 command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
-  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
 . "$SELF/gate-policy.sh" 2>/dev/null || { echo "[fix $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a fixer that cannot say whether its gates are on" >&2; exit 78; }
 apply_gate_policy fix-one
@@ -280,12 +280,13 @@ fi
 # ⛔ WHY THIS FILE AND NOT THE CALLER. The controller already refuses to spawn when `claim_live`
 # says the lock is held, but `fix-one.sh` is ALSO reached directly and by `adopt-fix.sh`, and a
 # guard that lives only in the controller leaves those paths pushing at a live lander — the same
-# argument the CI-queue gate above makes for itself, and the reason both read the same state.
+# argument the repo-identity assert above makes for itself (it runs here, not only in the spawner,
+# because `adopt-fix.sh` reaches this script without the controller in the path at all).
 #
 # ⛔ THE DIRECTION IS DEFER, NEVER BLOCK-AND-HOLD. Contention writes the SAME refundable bail marker
-# the CI-queue and cross-box refusals write, so the controller refunds the attempt and re-decides
-# from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
-# entirely. Nothing here is sticky — the marker describes one cycle, not a state.
+# the cross-box refusal writes, so the controller refunds the attempt and re-decides from a fresh read
+# next cycle: nothing is dropped, and a lander that lands the PR ends the work entirely. Nothing here
+# is sticky — the marker describes one cycle, not a state.
 #
 # ⛔ A STALE CLAIM IS TAKEN OVER, NOT REFUSED (#2574 (b)) — AND THE TAKEOVER IS A RENAME, NEVER
 # `rm && write`. Measured staleness is the whole licence: the record's pid is numeric and `kill -0`
@@ -409,8 +410,8 @@ release_prlock() { # never removes a lock we do not own: a lander that outlived 
 # run must not pretend to have booked one.
 # ⛔ THE FIRST LINE IS A STABLE TOKEN (`DEFERRED: the LANDER`), because `adopt-fix.sh` — the operator
 # surface onto this script — has to name the cause in the log the operator reads, exactly as it does
-# for the CI-queue deferral. A second, cosmetic reword would silently make `adopt-fix <PR>` report
-# SUCCESS for a run that pushed nothing (review of PR #2576, P2).
+# for the PR-owner lock arm below. A second, cosmetic reword would silently make `adopt-fix <PR>`
+# report SUCCESS for a run that pushed nothing (review of PR #2576, P2).
 prlock_defer() { # prlock_defer <why>
   echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
   if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then

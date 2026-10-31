@@ -52,7 +52,7 @@ EXTERNAL: look OUTSIDE this repo for how comparable systems solve this — vendo
     took from it. Skipping the rung is not allowed; `web_fetch` on a primary source always exists.
 RUNG: 2 — web_search model="sonar"   ⛔ REPLACE with the rung you will actually use, naming the tool:
     1 = perplexity MCP (`mcp__seo-intelligence__perplexity_search`) · 2 = `web_search` with the model
-    passed explicitly (`sonar`) · 3 = `web_fetch` / exa (`mcp_load exa`). If the rung you wanted does
+    passed explicitly (`sonar`) · 3 = `web_fetch`. If the rung you wanted does
     not load, name the rung you took AND the error you saw — a silent fallback erases the config gap.
 CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling, a decision section in
     a plan doc, a decision comment on an issue, a Tortoise point carrying one? Quote it, and say

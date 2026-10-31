@@ -66,6 +66,16 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 HOME = os.path.expanduser("~")
 STATE = f"{HOME}/.pi/agent/state"
 SCRIPTS = f"{HOME}/.pi/agent/scripts"
+# The SHARED definition of "is that bounce label still the truth?" lives with this
+# file in the repo. Deployed copies live in `$SCRIPTS` (both files are synced there),
+# so the import is resolved against BOTH: the repo first, so the running copy and the
+# copy under test cannot diverge, then the deployed tree.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+if SCRIPTS not in sys.path:
+    sys.path.append(SCRIPTS)
+import _bounce_state as bs                                    # noqa: E402
 REGISTRY = f"{STATE}/lane-registry.tsv"
 CMUX_DISPATCH = f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"
 
@@ -83,6 +93,15 @@ LAND_TAIL_B = 2_000_000
 
 MAX_PER_TICK = 3
 MIN_GAP_S = 900
+# ⛔ THE BOUNCE STATE IS READ PER ISSUE, SO IT IS BOUNDED AND THE CAP IS STATED.
+# `lanes_with_open_question()` already spends 9 list calls; asking whether each
+# `question-bounced` label is still current costs ONE timeline read per such issue.
+# Measured 2026-10-29: 26 open issues carry that label across the three repos, so the
+# unconditioned cost is ~26 reads. The cap is a RUNAWAY GUARD, not a policy: an issue
+# past it is treated as CURRENT (its lane is not nudged), and the pass LOGS the cap
+# rather than silently reading fewer issues as "no question".
+MAX_BOUNCE_READS = 40
+BOUNCE_READ_TIMEOUT_S = 30
 # How often a lane with NO work of its own may be told to pull the next item from the
 # shared priority stack. Deliberately longer than the stall cadence: an idle lane nudged
 # every tick is pure noise, and MAX_PER_TICK would then be spent on idle lanes instead of
@@ -269,6 +288,21 @@ def sh(argv: list[str], timeout: int = 120) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def sh_stdout(argv: list[str], timeout: int = 120) -> tuple[int, str]:
+    """`sh`, but STDOUT ONLY — for callers that PARSE the output.
+
+    `sh` merges stderr into the returned text, which is right for the diagnostics that
+    print it and wrong for a parser: a warning gh wrote to stderr would be handed to the
+    reduction as if it were a row. On failure this returns an empty payload rather than
+    the exception text, for the same reason — a caller that cannot read must get nothing
+    to read, never a message that looks like data.
+    """
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "")
+    except Exception:                                            # noqa: BLE001
+        return 1, ""
+
 def tail_text(path: str, nbytes: int = TURN_BYTES) -> str:
     try:
         size = os.path.getsize(path)
@@ -387,14 +421,73 @@ def jev_choice(state: str) -> tuple[str | None, dict]:
     return choice, meta
 
 
-def lanes_with_open_question() -> tuple[set, bool]:
+def bounce_still_current(repo: str, n: int) -> bool | None:
+    """Is this issue's `question-bounced` label still the newest word on its thread?
+
+    True / False / None (= could not read). The three-valued answer is the point: the
+    caller treats `None` exactly like True (count the lane as having used the protocol),
+    because a nudger that messages a lane on a read it could not perform is asserting
+    state it does not have — the standing rule in this file's header.
+
+    ⛔ THE DEFECT THIS CLOSES (agent-infra#2844). The issue reports the polarity
+    backwards — it says a stale label produces a *duplicate owner question*. It does
+    not: `used_protocol` only ever SUPPRESSES the `question_no_protocol` nudge
+    (`kind = None` below). So the real cost of a stale label is the opposite, and
+    worse — a lane that asks a FRESH question without the protocol is **not told to
+    use it**, and the question stays in a conversation and never reaches the queue.
+    Same failure class the issue is about (an artefact that lives only in a
+    conversation), mirrored onto the lane's side.
+
+    Measured 2026-10-29 over the three repos: of the 26 OPEN issues carrying
+    `question-bounced`, 22 had a comment newer than the label's own `labeled` event —
+    i.e. 22 labels were no longer the newest word on their thread. The first of them
+    (`tortoise#2944`) was bounced 2026-09-29 and last commented 2026-10-14.
+    """
+    def run(argv):
+        # ⛔ #1988, and the reason `_bounce_state` takes `run` as an ARGUMENT at all.
+        # `bounce_view` emits `["gh", "api", …]` — a bare name that resolves through
+        # PATH, where `heartbeat-loop.sh`'s pinned PATH lets the real gh OUTRANK the
+        # seeded shims. Passing that straight to `sh` would make this file's only
+        # unserialised gh call, on a per-tick, per-bounced-issue path, against the
+        # account four boxes share. The sibling reader rebinds it the same way.
+        rc, out = sh_stdout([GH] + list(argv[1:]), timeout=BOUNCE_READ_TIMEOUT_S)
+        return rc, out
+
+    try:
+        view = bs.bounce_view(repo, n, run)
+    except Exception as exc:                                     # noqa: BLE001
+        # This pass is a nudger for a whole fleet. A defect in the derivation must cost a
+        # withheld nudge, never the pass: `holds` keeps the label's authority (see above).
+        log(f"WARN bounce state raised for {repo}#{n}: {exc} — treating it as current")
+        return None
+    if not view.read:
+        return None                    # UNKNOWN — the caller must not claim either way
+    return not view.stale
+
+
+def lanes_with_open_question(known_lanes=None) -> tuple[set, bool]:
     """Lane labels whose open issues carry a question. (labels, ok)
 
     `ok=False` means a surface could not be read — the caller must NOT treat that
     as "no questions". A failing query reading as an empty set is the exact
     silent-negative this fleet has hit four times.
+
+    ⛔ `question-bounced` COUNTS ONLY WHILE IT IS CURRENT (agent-infra#2844). The label
+    is a projection: it records that a bounce happened, not that the question is still
+    pending, and nothing re-validates it. So each issue carrying it is checked against
+    its own timeline (`scripts/_bounce_state.py`, the ONE definition, shared with
+    `undelivered-answers.py`). `owner-decision` and `owner-answered` are NOT checked:
+    those are the queue's live membership and the delivered-answer record, and neither
+    is contradicted by the thread having moved — checking them would only add reads.
+
+    `known_lanes`, when given, BOUNDS the currency checks to the lanes the caller can
+    actually classify. It never bounds the returned set: `owner-decision` and
+    `owner-answered` membership is reported for every lane, because a lane absent from
+    the registry is not a lane this pass may act on, but the log line that names it is
+    still evidence. A required lane therefore cannot be dropped by this filter.
     """
     out, ok = set(), True
+    bounce_issues = []                 # (repo, number, lane labels) — checked below
     for repo in REPOS:
         for label in ("owner-decision", "question-bounced", "owner-answered"):
             rc, txt = sh([GH, "issue", "list", "--repo", repo, "--state", "open",
@@ -412,7 +505,43 @@ def lanes_with_open_question() -> tuple[set, bool]:
                 continue
             for r in rows:
                 names = [l["name"] for l in r.get("labels", [])]
-                out.update(n for n in names if n.startswith("lane:"))
+                lane_names = [n for n in names if n.startswith("lane:")]
+                if label == "question-bounced":
+                    bounce_issues.append((repo, r["number"], lane_names))
+                else:
+                    out.update(lane_names)
+    # An unreadable bounce state keeps the label's authority (see bounce_still_current),
+    # so a failed timeline read can only ever ADD a lane to `holds` — never remove one
+    # and never make this scan report `ok=False`, which would stop classification
+    # entirely for a surface that is merely slow.
+    # `reads` counts READS, not loop positions: the registry bound above `continue`s
+    # without spending one, so an index-based cap both over-counts what was read and prints
+    # a number that is not the number of issues skipped (`len(...) - MAX` is a constant,
+    # emitted once per over-cap issue). The behaviour — over-cap ⇒ CURRENT, never dropped —
+    # is unchanged; only the claim it logs is now true.
+    reads = capped = 0
+    for repo, number, lane_names in bounce_issues:
+        if known_lanes is not None and not (set(lane_names) & known_lanes):
+            out.update(lane_names)     # unclassifiable lane: keep the label's answer
+            continue
+        if reads >= MAX_BOUNCE_READS:
+            capped += 1
+            out.update(lane_names)
+            continue
+        reads += 1
+        current = bounce_still_current(repo, number)
+        if current is None:
+            log(f"WARN bounce state unreadable for {repo}#{number} — "
+                f"counting it as current (no nudge on an unread state)")
+            out.update(lane_names)
+        elif current:
+            out.update(lane_names)
+        else:
+            log(f"bounce label SUPERSEDED on {repo}#{number} — not counted as "
+                f"`protocol used` (the thread moved after the bounce)")
+    if capped:
+        log(f"CAP bounce-state reads at {MAX_BOUNCE_READS}: {capped} issue(s) treated "
+            f"as CURRENT (never dropped)")
     return out, ok
 
 
@@ -1016,21 +1145,28 @@ def main(argv: list[str]) -> int:
             log("SKIP lock held")
             return 0
 
-    # A failing question scan must NOT read as "no questions" — it makes every
-    # lane look like it never used the protocol, which would nudge healthy lanes.
-    holds, scan_ok = lanes_with_open_question()
-    if not scan_ok:
-        log("SKIP question scan incomplete — refusing to classify (fail closed)")
-        return 0
-    if holds:
-        log("protocol used (queued): " + ", ".join(sorted(holds)))
-
+    # ⛔ THE REGISTRY IS READ FIRST SO THE QUESTION SCAN CAN BE BOUNDED BY IT. Checking
+    # whether each bounced issue's label is still current costs one timeline read; an
+    # issue whose lane is not in the registry cannot influence `used_protocol` (that set is
+    # only consulted for rows below), so asking about it is pure spend. Measured
+    # 2026-10-29: 26 open issues carried `question-bounced`, of which only a handful named
+    # a live lane. Nothing else about the order changes: `holds` is still resolved before
+    # any lane is classified.
     rows = registry()
     if a.lane:
         rows = [r for r in rows if r["lane"] == a.lane]
     if not rows:
         log("no lanes to classify")
         return 0
+
+    # A failing question scan must NOT read as "no questions" — it makes every
+    # lane look like it never used the protocol, which would nudge healthy lanes.
+    holds, scan_ok = lanes_with_open_question({r.get("issue_label") for r in rows})
+    if not scan_ok:
+        log("SKIP question scan incomplete — refusing to classify (fail closed)")
+        return 0
+    if holds:
+        log("protocol used (queued): " + ", ".join(sorted(holds)))
 
     # One lane-status sample gives sid/size/verdict for every lane at once.
     # TIMEOUT 180s -> 75s (2026-10-05). The parent is bounded to ~150s by the pass
