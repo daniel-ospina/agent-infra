@@ -20,21 +20,25 @@
 # reference`; section P pins the call sites on the shipped file by SPELLING, and section PA re-pins the
 # EFFECTIVE ARGV structurally AND pins how many sites there are (comments, spacing and aliases cannot
 # satisfy it, and a DECOY site cannot license it — see the count pin below). Both halves are needed: measured
-# (review P1), reverting JUST the call sites left this suite 9 passed / 0 failed / rc=0 — every
-# function-level section stayed green over a delete of the fix's only effect.
+# (review P1), reverting JUST the call sites left this suite fully GREEN — every function-level section
+# stayed green over a delete of the fix's only effect.
 #
 # ⛔ ACCEPTED FALSE-RED (deliberate — do not "fix"): P3's `assert_not_contains` reds when a COMMENT
 # quotes the pre-fix argv, even though behaviour is untouched (section PA — the structural arm — stays
 # GREEN through such a comment, which is the proof that PA is judging behaviour and not text). That is
 # the safe direction — an over-block, one word to reword — and it is accepted. Leave P3 alone.
 #
-# ⛔ THAT IS A PROPERTY OF THE TEST, NOT A MEASUREMENT OF THIS HEAD (review P2, 2026-10-31). An earlier
-# revision of this note read "measured at this head: 14 passed / 1 failed" — FALSE at the shipped head,
-# where the suite is 21 passed / 0 failed because no comment in `pr-doctor.py` quotes the pre-fix argv
-# (`grep -nF '"fetch", "origin", branch'` and `grep -nF 'fetch_ref or branch'` are both empty). A
-# false "accepted red" is worse than no note: it trains the next reader to expect a P3 failure and to
+# ⛔ THAT IS A PROPERTY OF THE TEST, NOT A MEASUREMENT OF THIS HEAD (review P2, 2026-10-31). Earlier
+# revisions of this note read "measured at this head: 14 passed / 1 failed", then "… 15 passed / 0
+# failed", then "… 21 passed / 0 failed" — each FALSE at the head it shipped on, the count going stale the
+# moment the suite grew (section L has been widened again since). Three corrections of the SAME number is
+# the evidence that the number is the wrong artifact, so there is NO COUNT here. The falsifiable claim is
+# the property: this suite is green because no comment in `pr-doctor.py` quotes the pre-fix argv
+# (`grep -nF '"fetch", "origin", branch'` and `grep -nF 'fetch_ref or branch'` are both empty at this
+# head), so the accepted false-red does not fire, and a run that DOES fire it is red for that reason alone.
+# A false "accepted red" is worse than no note: it trains the next reader to expect a P3 failure and to
 # wave it through, which is exactly the guard the arm exists to be. A measurement is only valid for the
-# revision it was taken at, so the revision is not named here.
+# revision it was taken at; `tail -1` on a run is the only count this file will ever let a reader check.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -149,9 +153,9 @@ assert_not_contains "$(cat "$SRC")" 'fetch_ref or branch' \
 # ⛔ AND THE NUMBER OF SITES IS PINNED, BECAUSE `any(...)` OVER A LIST IS NOT A PROPERTY OF THE FILE
 # (measured 2026-10-30, review round 4). The last guard here was `any(is_helper(e) for e, _ in ops)`,
 # and it judged the SURVIVORS of a per-site filter — so it asked "does SOME site look right", which a
-# site that contributes nothing to the behaviour satisfies. Measured at that revision (the suite held 15
-# assertions then, not today's 21, so the counts below are NOT this head's — quoting them as if they
-# were is the same stale-measurement trap this note warns about): rewriting the base arm's operand to
+# site that contributes nothing to the behaviour satisfies. Measured at review round 4's revision (the suite
+# was SHORTER then than the one that ships — the counts below are that revision's, NOT this head's, and
+# quoting them as if they were is the same stale-measurement trap this note warns about): rewriting the base arm's operand to
 # `_ref2 = "refs/heads/%s" % branch` (a plain name holding a bare `refs/heads/...` string — the
 # bare-refspec DISEASE, and `ok_expr` cannot tell it from a fork's `refs/pull/<n>/head`) gave 13 passed /
 # 2 failed (P1, P5): RED, so the guard did work. ADDING ONE DEAD SITE —
@@ -371,24 +375,183 @@ fi
 # next line asks for the ref it just declined to create — for `fix-one.sh` with a FABRICATED diagnosis
 # (`branch is not in <OR> — a BRANCH/REPO mismatch`), which accuses the wrong repo.
 #
-# STATED LIMIT: these three are pinned STRUCTURALLY (fixed-string grep), not driven — each needs live
-# gates, a lane table, or a claim taken before it will run, so a fixture that drove them would be a
-# second implementation of the chain. The BEHAVIOUR of the exact refspec form is measured above, on a
-# real single-branch clone, and this section pins that the same form is what these scripts carry and
-# that the bare form is GONE from them (a fix in one file only is how this bug class survives).
+# ⛔ THIS SECTION DRIVES THE SHIPPED LINES, IT DOES NOT GREP FOR THEM (review P2, 2026-10-31). It used
+# to be two `assert_contains`/`assert_not_contains` string pins and it was BYPASSABLE at 0 failed —
+# measured: `# git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"` (a COMMENT, which cannot
+# change behaviour) satisfied the contains, and `git fetch origin "$BR"  --quiet` (two spaces) escaped
+# the not-contains, so the pin reported green over all three scripts reverted. That is the failure this
+# file's own section PA records for `pr-doctor.py`, one file over: TEXT IS THE WRONG THING TO PIN.
+# So the argv is EXTRACTED from the shipped script (comments skipped, whitespace normalised) and RUN —
+# git receives the script's own words, and the assertion is on the EFFECT (the tracking ref appears, the
+# worktree materialises), never on the spelling.
+#
+# STATED LIMIT (what is NOT driven): the three scripts are not run END TO END — each needs live gates,
+# a lane table, or a claim taken before it will run, so driving them whole would be a second
+# implementation of the chain. The lines under test are the ones that were broken, and they are the ones
+# executed. An expression shape the extractor cannot see (`git fetch origin "$B"` where `B=$BR`) remains
+# the declared residual class this file records for section PA.
+live_line() { # <file> <anchor> [<also-required>] -> first NON-COMMENT line with both, whitespace-normalised
+    awk -v a="$2" -v b="${3-}" '
+        { ln = $0; sub(/^[ \t]+/, "", ln) }
+        ln ~ /^#/ { next }
+        index(ln, a) > 0 && (b == "" || index(ln, b) > 0) { gsub(/[ \t]+/, " ", ln); print; exit }
+    ' "$1"
+}
+
+# ⛔ EVERY live line, never the FIRST one (the decoy arm — this file's section PA records the same
+# fail-open for `pr-doctor.py`: "does SOME site look right" is satisfied by a site that contributes
+# nothing). A decoy `if false: git fetch origin …` above a reverted bare fetch is caught HERE, because
+# the bare line is also enumerated and also run.
+live_lines() { # <file> <anchor> [<also-required>] -> ALL non-comment matching lines, one per record
+    awk -v a="$2" -v b="${3-}" '
+        { ln = $0; sub(/^[ \t]+/, "", ln) }
+        ln ~ /^#/ { next }
+        index(ln, a) > 0 && (b == "" || index(ln, b) > 0) { gsub(/[ \t]+/, " ", ln); print }
+    ' "$1"
+}
+
+# A whole shipped BLOCK (from <first-line> up to the next line that is exactly `fi` at column 0), so the
+# test runs the script's own DECISION — an `if` whose condition it never re-implements — instead of one
+# line lifted out of it. A decoy line inside a dead branch cannot pass this: the block decides.
+live_block() { # <file> <exact first line>
+    awk -v start="$2" '
+        $0 == start { on = 1 }
+        on { print }
+        on && $0 == "fi" && NR > 0 { exit }
+    ' "$1"
+}
+
+# Run extracted text VERBATIM in <dir>, with the script's own variables bound, and return its status.
+# The subshell is what makes this safe: the shipped lines carry `exit 1` on failure and redirections to
+# `$L.log`, and neither may touch this suite.
+run_shipped() { # <dir> <branch> <worktree> <text> -> rc
+    ( cd "$1" || exit 99
+      BR="$2"; WT="$3"; PR="4242"; wt_registered=0
+      L="$WORK/shipped.log"; O="$WORK/o"
+      export BR WT PR L O wt_registered
+      eval "$4" ) >/dev/null 2>&1
+}
+
+mkdir -p "$WORK/o/logs"
+_SIB_N=0
 for _sib in scripts/orchestrator-harness/fix-one.sh \
             scripts/orchestrator-harness/adopt-fix.sh \
             scripts/orchestrator-harness/merge-one.sh; do
-    if [ -f "$HERE/../$_sib" ]; then
-        _txt="$(cat "$HERE/../$_sib")"
-        assert_contains "$_txt" 'fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"' \
-            "$_sib fetches with the explicit destination refspec (#3009, chain-wide)"
-        assert_not_contains "$_txt" 'git fetch origin "$BR" --quiet' \
-            "$_sib carries no bare 'fetch origin \$BR' (the shape that creates no tracking ref)"
-    else
+    _SIB_N=$((_SIB_N + 1))
+    _sibf="$HERE/../$_sib"
+    if [ ! -f "$_sibf" ]; then
         bad "$_sib is missing — the chain cannot be pinned without it"
+        continue
     fi
+    live_lines "$_sibf" 'git fetch origin' '$BR' > "$WORK/sib-lines.txt"
+    if [ ! -s "$WORK/sib-lines.txt" ]; then
+        bad "$_sib has no live (non-comment) 'git fetch origin … \$BR' line — the PR-branch fetch is GONE"
+        continue
+    fi
+    # ⛔ THE BEHAVIOURAL ARM, PER LINE: run each live fetch line on a FRESH single-branch clone (the
+    # cell's shape) and require the tracking ref to appear. A bare `fetch origin "$BR"` — any spacing,
+    # any comment above it, decoy or not — returns 0 here and creates nothing, so it is RED.
+    while IFS= read -r _fl; do
+        [ -n "$_fl" ] || continue
+        _SIB_N=$((_SIB_N + 1))
+        _sd="$WORK/sib-$_SIB_N"
+        if ! git clone -q --single-branch --branch main "$WORK/origin.git" "$_sd" 2>/dev/null; then
+            bad "could not clone the single-branch fixture for $_sib ('$_fl')"
+            continue
+        fi
+        run_shipped "$_sd" fix/some-branch "$WORK/wt-$_SIB_N" "$_fl" || true   # the shipped line may end in `|| true`
+        if git -C "$_sd" rev-parse --verify --quiet refs/remotes/origin/fix/some-branch >/dev/null; then
+            ok "$_sib's live fetch line CREATES refs/remotes/origin/\$BR on a single-branch clone (driven, not grepped): '$_fl'"
+        else
+            bad "$_sib's live fetch line created NO tracking ref on a single-branch clone — the #3009 bug is live again: '$_fl'"
+        fi
+    done < "$WORK/sib-lines.txt"
 done
+
+# ── LA. `adopt-fix.sh`'s WORKTREE BLOCK — the inert-fix arm (review P1, 2026-10-31) ─────────────
+# The fetch above is necessary and NOT sufficient for this caller. `git worktree add "$WT" "$BR"` is
+# DWIM, and DWIM does not consult the tracking ref — it resolves a bare name through
+# `remote.<name>.fetch` CONFIGURED refspecs. So `adopt-fix.sh` was still dying one line after a
+# now-green fetch, with the fixer never started, and the section above stayed green over it.
+# ⛔ DRIVEN AS A BLOCK, NOT A LINE: the script's own `if [ "$wt_registered" -eq 0 ]; then … fi` is
+# extracted and executed with `wt_registered=0`, so the branch it takes is the branch it ships. A decoy
+# `-b … origin/$BR` line inside a dead branch cannot satisfy this, because the block decides, not a grep.
+_adoptf="$HERE/../scripts/orchestrator-harness/adopt-fix.sh"
+if [ ! -f "$_adoptf" ]; then
+    bad "adopt-fix.sh is missing — its worktree block cannot be driven"
+else
+    _ad="$WORK/sib-adopt"
+    _afl="$(live_line "$_adoptf" 'git fetch origin' '$BR')"
+    _ablk="$(live_block "$_adoptf" 'if [ "$wt_registered" -eq 0 ]; then')"
+    if git clone -q --single-branch --branch main "$WORK/origin.git" "$_ad" 2>/dev/null; then
+        [ -n "$_afl" ] && run_shipped "$_ad" fix/some-branch "$WORK/wt-adopt" "$_afl"
+        # ⛔ THE MUTANT (the PRE-FIX form): DWIM, on the SAME clone where the fixed fetch has just
+        # created the tracking ref. It must STILL fail — that is the measured fact that made the first
+        # #3009 fix inert, and it is what proves the block below is load-bearing rather than decorative.
+        if ( cd "$_ad" && git worktree add "$WORK/wt-dwim" fix/some-branch ) >/dev/null 2>"$WORK/dwim.err"; then
+            bad "MUTANT: the DWIM form WORKED on a single-branch clone — the premise of the driver arm is wrong"
+        elif grep -qi 'invalid reference' "$WORK/dwim.err"; then
+            ok "MUTANT: the bare DWIM form (the pre-fix line) reproduces 'fatal: invalid reference' EVEN WITH the tracking ref present"
+        else
+            bad "MUTANT: the DWIM form failed for a different reason: $(head -2 "$WORK/dwim.err" | tr '\n' ' ')"
+        fi
+        if [ -z "$_ablk" ]; then
+            bad "adopt-fix.sh's worktree block ('if [ \"\$wt_registered\" -eq 0 ]') is not where this test looks — the arm cannot be driven"
+        elif run_shipped "$_ad" fix/some-branch "$WORK/wt-adopt" "$_ablk"; then
+            # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
+            # `pipefail` is the exact bug adopt-fix.sh:31-34 documents (#864). Same idiom, same reason.
+            _wtl="$(git -C "$_ad" worktree list --porcelain)"
+            case "$_wtl" in
+                *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's OWN worktree block materialises the branch on a single-branch clone (driven)" ;;
+                *) bad "adopt-fix.sh's worktree block returned 0 but no worktree is on branch fix/some-branch" ;;
+            esac
+        else
+            bad "adopt-fix.sh's OWN worktree block FAILED on a single-branch clone — the fixer never starts (the pre-fix DWIM line?)"
+        fi
+        # ⛔ THE LOCAL-BRANCH ARM (the other half of the two-arm block this fix introduces). When
+        # `refs/heads/$BR` already exists — a previous adopt whose worktree was pruned — the block must
+        # still materialise, on the LOCAL branch, without `-b` (which would fail: the branch exists).
+        # Driving it here keeps the new arm from being the one thing in this block that nothing covers.
+        _ld="$WORK/sib-local"
+        if git clone -q --single-branch --branch main "$WORK/origin.git" "$_ld" 2>/dev/null; then
+            [ -n "$_afl" ] && run_shipped "$_ld" fix/some-branch "$WORK/wt-local" "$_afl"
+            if git -C "$_ld" branch fix/some-branch refs/remotes/origin/fix/some-branch >/dev/null 2>&1; then
+                if run_shipped "$_ld" fix/some-branch "$WORK/wt-local" "$_ablk"; then
+                    _wtl2="$(git -C "$_ld" worktree list --porcelain)"
+                    case "$_wtl2" in
+                        *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's block also materialises an ALREADY-LOCAL branch (the re-adopt arm, no -b collision)" ;;
+                        *) bad "adopt-fix.sh's block returned 0 for a pre-existing local branch but no worktree is on it" ;;
+                    esac
+                else
+                    bad "adopt-fix.sh's block FAILED when refs/heads/\$BR already exists — a re-adopt would die"
+                fi
+            else
+                bad "could not pre-create the local branch for the local-arm fixture"
+            fi
+        else
+            bad "could not clone the local-branch fixture for adopt-fix.sh"
+        fi
+    else
+        bad "could not clone the single-branch fixture for adopt-fix.sh"
+    fi
+    # ⛔ THE CONTROL, ISOLATING THE CAUSE. Same clone shape, the ref held constant, NO fetch re-run:
+    # the ONLY change is `remote.origin.fetch`, and the outcome flips to 0. That is the evidence that the
+    # operative mechanism is the configured refspec mapping and not the tracking ref — stated here so a
+    # future reader cannot "simplify" the fix back to DWIM on the theory that the ref was the problem.
+    _cfgd="$WORK/sib-cfg"
+    if git clone -q --single-branch --branch main "$WORK/origin.git" "$_cfgd" 2>/dev/null; then
+        [ -n "$_afl" ] && run_shipped "$_cfgd" fix/some-branch "$WORK/wt-cfg" "$_afl"
+        git -C "$_cfgd" config --add remote.origin.fetch \
+            '+refs/heads/fix/some-branch:refs/remotes/origin/fix/some-branch'
+        if ( cd "$_cfgd" && git worktree add "$WORK/wt-cfg" fix/some-branch ) >/dev/null 2>&1; then
+            ok "CONTROL: the DWIM form succeeds once remote.origin.fetch maps the branch — the CAUSE is the config, not the ref"
+        else
+            bad "CONTROL: DWIM still failed after widening remote.origin.fetch — the stated cause is not isolated"
+        fi
+    else
+        bad "could not clone the control fixture for adopt-fix.sh"
+    fi
+fi
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

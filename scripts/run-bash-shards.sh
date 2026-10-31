@@ -318,7 +318,7 @@ fi
 # correct COUNT (10 each) and print ✅ while 10 of the 80 shards never run at all. The list grows, so
 # that decay is scheduled rather than hypothetical. The set is compared at the end.
 shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
-# ⛔ THE SKIPPED PATHS ARE RECORDED TOO, WITH THEIR REASON (agent-infra#3084). `shard_skipped` was a
+# ⛔ THE SKIPPED PATHS ARE RECORDED TOO, WITH THEIR REASON (agent-infra#3079). `shard_skipped` was a
 # bare counter, so a slice could SAY it had skipped 31 shards and name none of them — and the
 # `ran + skipped == listed` check had no way to tell "this slice skipped 31 by design" from "31
 # shards vanished and the counter drifted to the same number". One line per skip, `<path>\t<reason>`.
@@ -328,7 +328,7 @@ shard_skip_log="${shard_ran_log}.skipped"
 trap 'rm -f "$shard_ran_log" "$shard_skip_log"' EXIT
 
 # shard_unaccounted — the listed shards this run neither EXECUTED nor SKIPPED, one path per line.
-# ⛔ DERIVED FROM THE LIST, never from the counters (agent-infra#3084). `executed + skipped == listed`
+# ⛔ DERIVED FROM THE LIST, never from the counters (agent-infra#3079). `executed + skipped == listed`
 # on its own can be satisfied while a specific shard is missing — the counters are what the loop
 # writes, and a loop that never reached a shard writes neither. This compares the derived list
 # against the two logs, so the answer is `which shards`, not `how many`.
@@ -558,7 +558,7 @@ echo "── hermetic suites ─────────────────
 # The order is the list's (LC_ALL=C sort -u) — see DERIVATION: every suite is hermetic, so no
 # suite depends on running before or after another.
 #
-# ⛔ THE LIST IS READ INTO MEMORY BEFORE THE FIRST SHARD RUNS (agent-infra#3084). It used to be
+# ⛔ THE LIST IS READ INTO MEMORY BEFORE THE FIRST SHARD RUNS (agent-infra#3079). It used to be
 # `while read shard; do run_shard "$shard"; done <<<"$shard_paths"`, and that loop's stdin WAS the
 # list: every shard inherited it, so a shard that read stdin consumed the lines the driver had not
 # reached yet and the loop simply ENDED — no error, no name. Measured on main's `script-validate`
@@ -570,13 +570,44 @@ echo "── hermetic suites ─────────────────
 # hermetic contract is stated rather than inherited.
 shard_array=()
 while IFS= read -r shard; do
-  [ -n "$shard" ] || continue
+  # A line with no non-blank text is not a path, so it is not queued. The counter at `:275` counts
+  # `awk 'NF { n++ } END { print n + 0 }'`, i.e. lines with at least one field, so the two agree on
+  # everything that can actually arrive: the list comes from `shard_discover` (`:143`), which emits
+  # only glob-matched paths that passed `[ -f "$f" ]`, and the containment loop above re-verifies
+  # each is a real file (exit 1 at `:506`) — so every line here is a non-blank path and both sides
+  # count it exactly once. They are NOT identical as predicates — a CR/VT/FF-only line is a field to
+  # awk's default FS and is stripped by bash's `[[:space:]]` — and that residue cannot arrive either:
+  # such a line is not a file, so the containment loop above exits 1 on it. The assertion below says
+  # what a divergence would mean.
+  [ -n "${shard//[[:space:]]/}" ] || continue
   shard_array+=("$shard")
 done <<<"$shard_paths"
-# The array is built from the same variable the count came from, so a truncated read (a blank line,
-# a partial list) is caught HERE, before any shard is executed, and named as its own defect.
+# ⛔ WHAT THIS COMPARISON IS, AND WHAT IT IS NOT (`#3099` review, P2 — this comment has now claimed a
+# protection that does not exist TWICE: first as a truncation detector, then as the arm that caught a
+# whitespace-only list line with an inverted message). Neither is true.
+#   * It is NOT what makes the list safe: the read above is IN-PROCESS — a here-string consumed by the
+#     driver alone — so no child can shorten it. The ARRAY is what makes the list safe.
+#   * It is NOT reachable from a blank list line, blank OR whitespace-only: the target-containment
+#     loop above rejects a non-file target (`[ ! -f "$t" ]` → exit 1, "does not exist") before this
+#     line is reached, and a whitespace-only line is not a file.
+#   * The net that NAMES an un-reached shard is the end-of-run set difference below
+#     (`shard_unaccounted`, a `comm -23` of the derived list against the two logs) — what the 8ap
+#     mutant exercises, not this.
+# What remains is a DEFENSIVE ASSERTION, and it fails CLOSED (exit 1 below, before the first shard
+# runs). ⛔ Do NOT look for a live trigger — there is none, and asserting one is what this block got
+# wrong twice already. Given the current derivation, this comparison CANNOT fire: `shard_discover`
+# (`:143`, and `[ -f "$f" ]` at `:147`) emits only glob-matched paths that passed that check, the
+# containment loop above
+# re-verifies each is a real file inside the checkout, and the read above is in-process — so no line
+# reaching it can be blank and no line can be lost. It is kept for the case where that CONTRACT
+# changes (a derivation that can emit a non-path, or a read that becomes an external process), and a
+# firing means "the derivation or the read changed", never "a shard is missing". The arm that names a
+# missing shard is the end-of-run set difference (`shard_unaccounted`), and it is proven by the 8ap
+# mutant. The predicates are not identical either way — bash's `[[:space:]]` covers CR/VT/FF where
+# awk's default FS does not — which is why this is a comparison of two derivations and not a tautology
+# to be deleted.
 if [ "${#shard_array[@]}" -ne "$listed" ]; then
-  echo "❌ the list reads $listed shard(s) but only ${#shard_array[@]} could be read into the run — refusing to start (the list and the checkout disagree)"
+  echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run. Refusing to start (this is a DERIVATION or READ change, not a missing shard: the end-of-run set difference names those)."
   exit 1
 fi
 for shard in ${shard_array[@]+"${shard_array[@]}"}; do
@@ -588,7 +619,7 @@ echo "────────────────────────�
 # floor would still see the same listed count. `executed + skipped == listed` also means the list
 # was traversed end to end: a slice cannot quietly stop early.
 #
-# ⛔ AND IT NAMES WHAT IS MISSING (agent-infra#3084). The count alone is the defect that hid this
+# ⛔ AND IT NAMES WHAT IS MISSING (agent-infra#3079). The count alone is the defect that hid this
 # for 32 shards: `executed 107 of 139 listed shard(s)` says a number is wrong and nothing else, so
 # the reader cannot tell which suites never ran, and the merge rail cannot tell "this shard is red"
 # from "this shard did not run". The set difference below is computed from the LIST and the two logs
