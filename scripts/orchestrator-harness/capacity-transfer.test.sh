@@ -641,6 +641,51 @@ else
   yck "a NON-NUMERIC issue id is not a yield" '../../etc' dispatch
 fi
 
+# ── §3b THE WORDS ON THE DISPATCH LINE, PER GATE (follow-up review of #2991, P2) ────────────────
+# `lane.sh` writes `gate=skew` for a harness-pair refusal, and this controller is the reader that
+# turns the record into the line an operator actually greps. It used to distinguish only `land`, so a
+# skew record fell into the generic arm and published "yielded to peers — this box refused it for
+# capacity": false in BOTH clauses (it is not capacity, and no peer can take it — a peer runs the same
+# caller/probe pair and refuses identically), on the highest-traffic operator surface, arguing against
+# the one remedy that works. The block is EXTRACTED from the shipped controller and driven with each
+# gate word, so this pins the sentence actually written, not a re-implementation of it.
+# Pre-fix: the `skew` case prints "yielded to peers" and the two §3b assertions below red while both
+# CONTROLS stay green — so this arm cannot be satisfied by changing every line's wording.
+echo
+echo "=== §3b the dispatch line names the remedy the gate's OWN gate implies (skew is not capacity) ==="
+_yif="$(grep -n 'CAPACITY_YIELD_GATE:-}" = "land"' "$ORCH" | head -1 | cut -d: -f1)"
+_ydrv="$TMP/orch-yield-words.sh"
+if [ -n "$_yif" ]; then
+  awk -v s="$_yif" 'NR>=s { print; if (NR>s && $0=="        fi") exit }' "$ORCH" > "$_ydrv"
+fi
+ywords() { # <gate-word> -> the dispatch line the shipped block writes for it
+  : > "$TMP/disp-words.log"
+  ( ISS=42 CAPACITY_YIELD_GATE="$1" CAPACITY_YIELD_WHY="gate=$1 until=1999999999 (900s left)" \
+      LOG="$TMP/disp-words.log" bash "$_ydrv" ) >/dev/null 2>&1
+  cat "$TMP/disp-words.log" 2>/dev/null
+}
+{ [ -s "$_ydrv" ] && head -1 "$_ydrv" | grep -q 'CAPACITY_YIELD_GATE'; }; rc=$?
+ck "the dispatch line's gate block is extractable from the shipped orch-loop.sh (extraction non-empty)" $rc
+_skewline="$(ywords skew)"
+{ [ -n "$_skewline" ] && ! printf '%s' "$_skewline" | grep -q 'yielded to peers'; }; rc=$?
+ck "a 'skew' yield is NOT reported as 'yielded to peers' (read: '${_skewline:-<nothing>}')" $rc
+{ printf '%s' "$_skewline" | grep -q 'HARNESS/MISMATCH'; }; rc=$?
+ck "...and names the gate that refused it (HARNESS/MISMATCH)" $rc
+{ printf '%s' "$_skewline" | grep -q 'NO peer can clear it'; }; rc=$?
+ck "...and says NO peer can clear it, so the operator does not wait for one" $rc
+{ printf '%s' "$_skewline" | grep -q 'cp scripts/orchestrator-harness/\*.sh'; }; rc=$?
+ck "...and publishes the one remedy that works: sync the helper pair" $rc
+# CONTROLS: the two gates whose wording was already right must be unchanged, in both directions.
+_loadline="$(ywords load)"
+{ printf '%s' "$_loadline" | grep -q 'yielded to peers'; }; rc=$?
+ck "control: a LOAD refusal still reads 'yielded to peers' (a peer CAN clear it) (read: '${_loadline:-<nothing>}')" $rc
+_landline="$(ywords land)"
+{ printf '%s' "$_landline" | grep -q 'LAND-BACKLOG' && ! printf '%s' "$_landline" | grep -q 'yielded to peers'; }; rc=$?
+ck "control: a LAND-BACKLOG refusal still stands down WITHOUT the peer claim" $rc
+# ...and the funnel's own note must not tell an operator that a skew stand-down frees the item either.
+{ grep -q 'harness-skew' "$ORCH"; }; rc=$?
+ck "the dispatch funnel's yields note names the non-transferable harness-skew gate too" $rc
+
 # ── §4 the inventory: the three readers/writers exist exactly once ──────────────────────────────
 echo
 echo "=== §4 one definition of the record's format, named by every party that reads or writes it ==="
