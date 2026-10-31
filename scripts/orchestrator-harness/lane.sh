@@ -439,8 +439,9 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
   echo "[lane $N] ⚠️ NO merge-phase verdict (state/lanemerge-issue-$N.verdict absent) — the lane ended without either reaching merged or naming a blocker; merge-rate.sh will count it as PR_OPENED (or UNKNOWN if the log carries no status token), never as MERGED." >> "$O/logs/lane-$N.log"
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
-# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71)
-# or AGENT_DISK_REFUSED (77);
+# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (81)
+# or AGENT_DISK_REFUSED (77) — all seven are mapped to a `gate=` word below (the sixth, `skew`, is the
+# harness-pair refusal: 71's shape on the remedy axis, because it never clears on this box either);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
 if [ "$AGENT_STARTED" = "0" ]; then
@@ -520,7 +521,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
         # refuses identically, and the operator's remedy is a `cp` of the helper pair on EVERY box. The
         # record is still written (chain-merge.sh must stop waiting for a PR that cannot appear), and
         # the words say exactly what it buys, the same way `land` does.
-        echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is `cp scripts/orchestrator-harness/*.sh \$O/` wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
+        echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is cp scripts/orchestrator-harness/*.sh \$O/ wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
       else
         echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
       fi
