@@ -572,6 +572,102 @@ ck "single flight: the /rate_limit PROBE is serialised too (it runs outside the 
 ck "single flight: … and that measurement really saw the probe (the leader's 4 attempts + 3 probes)" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -gt 4 ] && echo 0 || echo 1)"
 
+# ── G1b. A NO-REQUEST CALL NEVER TAKES THE BOX LOCK (#3138) ────────────────────────────────────
+# ⛔ WHAT THIS PINS. The single-flight lock's invariant is "one gh REQUEST in flight per box". A call
+# that makes NO request cannot overlap anyone, so it must not QUEUE for the lock either — and taking it
+# anyway is what starved the review actuator: `worker-terminal.sh` runs `gh auth token` (offline
+# hosts.yml/keyring read) under a 10 s alarm through the `gh-rest` shim, so on a busy box the local
+# credential read waited behind API traffic and the alarm fired first. The probe then REFUSED the
+# worker (rc=98) and no attestation was minted, i.e. 0 merges for 9 h on a controller that had
+# diagnosed the PRs correctly. Measured on the mac 2026-10-30: 4.1 s shim vs 0.009 s real binary.
+# ⛔ THE ASSERTION IS PEAK OVERLAP, NOT WALL TIME (corrected after review, 2026-10-30 — this header
+# used to describe a wall-clock bound the arm no longer carries): `max_inflight` is computed from the
+# stub's own `start|`/`end|` rows, so it is load-insensitive. The measured milliseconds are REPORTED in
+# the assertion text as evidence and are never asserted — the pre-fix floor is >= 3.6 s for six 0.6 s
+# holders, which is exactly why overlap (peak 6 vs peak 1) is the discriminator that cannot flake.
+# The CONTROLs below re-pin the other direction — API reads, `api rate_limit` and a help-looking flag
+# VALUE all still measure peak 1 — so deleting the fast path is the only way this pair stays green.
+reset_env coalesce
+: >"$STUB_LOG"
+_t0="$(date +%s%N)"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- auth token >"$TMP/g1b-$i" 2>&1 ) &
+done
+wait
+_t1="$(date +%s%N)"
+_tms=$(( (_t1 - _t0) / 1000000 ))
+# ⛔ THE DISCRIMINATOR IS `max_inflight`, NOT the wall clock: wall time on a loaded cell is the flake
+# surface, and the overlap the stub itself logs is load-insensitive. The measured milliseconds are
+# still REPORTED (never asserted).
+ck "no-request: 6 concurrent \`gh auth token\` calls do NOT queue on the box lock [${_tms}ms, peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -gt 1 ] && echo 0 || echo 1)"
+ck "no-request: … and every caller still got its own answer (nothing swallowed) [$(( $(calls) ))]" \
+   "$([ "$(calls)" -eq 6 ] && [ "$(cat "$TMP"/g1b-* | grep -c 'ok')" -ge 6 ] && echo 0 || echo 1)"
+# ⛔ THE OTHER DIRECTION, IN THE SAME SUITE RUN: a REQUEST still takes the lock. If the fast path were
+# implemented as "skip the lock for everything" this stays green while the serialisation invariant
+# (#1988/#2005 — one request in flight) is destroyed, which is the failure the lock exists to prevent.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api "repos/o/r/pulls/7$i" >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: … while 6 concurrent API READS are still SERIALISED (never 2 in flight) [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ AND THE TWO SHAPES A FAIL-OPEN PREDICATE WOULD HAVE UNSERIALISED (review finding, measured: peak 6
+# before this arm existed). `makes_request()` answers False for BOTH — `api rate_limit` is exempt from
+# the limit but is a real request, and `-t help` is a flag VALUE that the help matcher mistakes — so a
+# lock keyed on the BUDGET predicate would have let them overlap. The lock is keyed on
+# `makes_no_request_strictly`, whose whole purpose is that these two keep it.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api rate_limit >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: the EXEMPT \`api rate_limit\` still takes the box lock (exempt from the LIMIT, not from the lock) [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- issue create -t help -b x >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: a help-LOOKING flag VALUE (\`issue create -t help\`) still takes the box lock [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+
+# ⛔ THE `auth` CLAUSE IS ITS OWN FAIL-OPEN BOUNDARY (review finding, 2026-10-30): the predicate exempts
+# `auth token` and NOTHING else under `auth`, because `gh auth status` VALIDATES the token against the
+# API. Measured with the predicate widened to every `auth` form: this arm drops to peak 6. Without it,
+# moving `auth status` onto the fast path left the suite green.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- auth status >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: auth status VALIDATES the token against the API, so it still takes the box lock [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ AND THE WRITE FORMS OF `config`/`alias`: they rewrite ~/.config/gh/config.yml, and the box lock was
+# their ONLY serialiser (no pacing predicate covers them). `config set` keeps it although it makes no
+# request; `config get` is read-only and stays on the fast path.
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- config set editor vim >/dev/null 2>&1 ) &
+done
+wait
+ck "CONTROL: config set REWRITES config.yml with no request — it still takes the box lock [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+reset_env coalesce
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- config get editor >/dev/null 2>&1 ) &
+done
+wait
+ck "...while the READ-ONLY config get is exempt and overlaps [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -gt 1 ] && echo 0 || echo 1)"
+
 # ── G2. COALESCING: identical concurrent READS share ONE load (agent-infra#2243) ────────────────
 # ⛔ WHAT THIS SECTION IS FOR. Serialisation (#1988/#2005) decides WHO GOES NEXT; it does not decide
 # whether the work is worth doing twice. Thirteen lanes asking for the SAME read queued thirteen
@@ -1500,8 +1596,18 @@ ck "NO_WAIT: every bounded caller sets it for the layer AND still imports [${_po
 # ⛔ L10. THE MUTATION STAMP MUST BE WRITTEN UNDER THE ATTEMPT LOCK, at the moment the request leaves.
 # Measured, three concurrent processes: 1.014 s / 1.002 s gaps. Stamping outside the lock (or before
 # it) is what let a lock-holding competitor compress two mutations below the gap.
-_disp="$(sed -n '/^def dispatch(/,/^def run_attempt/p' "$HELPER")"
-_lock_at="$(printf '%s\n' "$_disp" | grep -n 'lock = acquire_lock()' | head -1 | cut -d: -f1)"
+# ⛔ THE RANGE IS `_dispatch`, NOT `dispatch` (rebased head, measured). `dispatch()` is the meter probe;
+# it takes its own `acquire_lock(strict=True)` and `mark_mutation` lives in `_dispatch` — so the old
+# `def dispatch(` range spanned BOTH functions and this pin passed only because the METER's lock happened
+# to be spelled `lock = acquire_lock()`. Main now spells it `strict=True`, the anchor vanished, and the
+# arm reported the invariant BROKEN while it held. It is anchored on the function the comment names.
+_disp="$(sed -n '/^def _dispatch(/,/^def run_attempt/p' "$HELPER")"
+# ⛔ AND ON THE NON-STRICT CALL, not on the assignment's spelling: #3138 made the attempt lock
+# CONDITIONAL (`lock = None if makes_no_request_strictly(gh_argv) else acquire_lock()`), and an anchor of
+# `lock = acquire_lock()` would have survived the LESS correct spelling only. The three
+# `acquire_lock(strict=True)` meter probes are outside this range AND carry an argument; a `_dispatch`
+# that takes no attempt lock at all still fails here (empty `_lock_at`).
+_lock_at="$(printf '%s\n' "$_disp" | grep -n 'acquire_lock()' | head -1 | cut -d: -f1)"
 _mark_at="$(printf '%s\n' "$_disp" | grep -n 'mark_mutation()' | head -1 | cut -d: -f1)"
 ck "mutative: the send stamp is written AFTER the attempt lock, inside it (not at reservation time)" \
    "$([ -n "$_lock_at" ] && [ -n "$_mark_at" ] && [ "$_lock_at" -lt "$_mark_at" ] && echo 0 || echo 1)"
