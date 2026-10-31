@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `fork|load|mem|disk|land` and returns 0 iff THIS dispatch was refused by a gate
+cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -106,19 +106,41 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land` and returns 0 iff THI
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability / 73 fork /
-  # 74 land-backlog / 75 load / 77 disk / 81 memory), not a gate: an unrecognised value is reported as
-  # `load` because the refusal itself is already proven by fields 1-2, and refusing to end the wait over
-  # one corrupt byte is the fleet-wide idleness R8 removes.
+  # 74 land-backlog / 75 load / 77 disk / 81 memory / 83 harness skew), not a gate: an unrecognised
+  # value is reported as `load` because the refusal itself is already proven by fields 1-2, and refusing
+  # to end the wait over one corrupt byte is the fleet-wide idleness R8 removes.
   # ⛔ EACH NON-LOAD VALUE IS NAMED BECAUSE ITS REMEDY IS THE OPPOSITE OF A LOAD WAIT: `fork` is the
   # box's own inability to start a process (restart or drain it from OUTSIDE, agent-infra#2293); `mem`
   # is resident lanes having to FINISH and release their working set (agent-infra#2387); `land` is not
   # a property of this box at all. The codes are distinct for exactly that reason, and this arm was
   # CAUGHT as part of a P0 collision on the integration batch: two gates that share a code with
   # opposite remedies make every caller mislabel one of them.
+  # ⛔ `mem` IS KEPT AND `skew` IS RENUMBERED TO 83 ON THIS TRAIN, because the two changes that landed
+  # here each independently chose 81 as "the first free code above the sysexits band" — `mem` from
+  # agent-infra#2387 and `skew` from the #2991 follow-up — and a code that two gates share makes one of
+  # them UNREACHABLE in this very `case`, whichever order its arms are written in. `mem` keeps 81
+  # because it SHIPPED first (it is on main); `skew` moves to the next free value.
   # Field 2 is deliberately NOT consulted here — the yield window is the controller's
   # business (`capacity_yield_live`), and an incoherent window must not make a proven refusal
   # unreadable. README §7.2d states exactly this per-reader split.
-  case "${gate:-}" in disk) printf 'disk' ;; fork) printf 'fork' ;; land) printf 'land' ;; mem) printf 'mem' ;; *) printf 'load' ;; esac
+  #
+  # ⛔ EVERY GATE THIS CHAIN CAN REPORT AN EXIT CODE FOR MUST BE NAMED *HERE*, OR ITS ARM BELOW IS
+  # DEAD CODE (follow-up to #2991, P1, measured). This normaliser decides which arm of the loop's
+  # `case "$_cap_gate"` runs, so a value it folds into `*` can never reach its own arm — however
+  # carefully that arm was written. `capability` was missing here while its arm existed below, so a
+  # CAPABILITY refusal exited 75 and the operator was sent to a LOAD reading that cannot explain it:
+  # measured on the merged tree with a `gate=capability` record, `exit=75`, log `refused at the load
+  # gate`. The arm below and this line are ONE unit; a suite arm now drives each gate through this
+  # file and pins the exit code, so the pair cannot drift apart again.
+  case "${gate:-}" in
+    disk) printf 'disk' ;;
+    fork) printf 'fork' ;;
+    land) printf 'land' ;;
+    mem) printf 'mem' ;;
+    capability) printf 'capability' ;;
+    skew) printf 'skew' ;;
+    *) printf 'load' ;;
+  esac
   return 0
 }
 
@@ -256,11 +278,28 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # handing the issue to a peer box is exactly right (unlike `land`, which follows the item, or a
       # brief refusal, which no peer can clear). Without this arm the chain exited 75 and told the
       # operator to look at a LOAD reading for a refusal that load cannot explain.
+      # ⛔ AND IT NEEDS ITS NAME IN `cap_refusal_gate`'s NORMALISER TOO — that function proves the
+      # refusal, but its `case` chooses the VALUE this arm dispatches on, so folding `capability` into
+      # its `*` arm made this one unreachable and put the load remedy back (follow-up to #2991, P1,
+      # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
+      # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
+      # 83 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
+      # and either rejected its own arguments (a usage/version skew between the caller and the deployed
+      # helper) or died without a verdict (`rc=2` on a corrupt copy). ⛔ IT MUST NOT BE 71: every reader
+      # treats 71 as a property of THIS box, so the operator is told to repair the box's pi/extension
+      # set or hand the item to a peer — and the peer runs the SAME helper pair and refuses identically.
+      # The chain still stops here (no PR can appear), and the EXIT trap still releases
+      # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
+      # ⛔ 83 AND NOT THE 81 THIS CHANGE WAS AUTHORED WITH: 81 is `AGENT_MEM_REFUSED` (#2387), which
+      # landed on the train first. Sharing it here would have made one of the two arms unreachable.
+      skew) _cap_rc=83 ;;
       *)    _cap_rc=75 ;;
     esac
     if [ "$_cap_gate" = "land" ]; then
       echo "[chain $N] land-backlog: lane-$N was refused because the repo's open-PR backlog is over its own landing ceiling (#2409), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This is NOT a capacity transfer: the backlog is repo-wide, so handing the issue to a peer box would not clear it — the remedy is to LAND the open queue (or dispatch a P0-blocker / base-red repair, which are exempt)" >> "$LOG"
+    elif [ "$_cap_gate" = "skew" ]; then
+      echo "[chain $N] harness mismatch: lane-$N was refused because the lane's caller and the deployed cell-lane-preflight.sh disagree (a usage/version skew, or a corrupt copy), so the capability probe measured nothing — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: every box running the same helper pair refuses identically, so handing the issue to a peer would only circulate it — the remedy is to sync the pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever lanes run" >> "$LOG"
     else
       echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"
     fi
