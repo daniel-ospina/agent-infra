@@ -1978,7 +1978,8 @@ PYEOF
   # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NOT A CLASS (#3110). `check-class.py` prints a token on every
   # path, so `V` empty means the classifier never ANSWERED — and the residual arm then named the class
   # `<empty>` and re-read the same PR for ever (measured: `#10214 no acting arm for class '<empty>'`).
-  # The guard is pinned by its OBSERVABLE effect on `V`, not by its prose, so a re-word keeps it green.
+  # The assignment and its condition are pinned by their SOURCE TEXT; the log message carries its own
+  # pin below, which is deliberate — the message names the classifier, so a re-word there is a change.
   wpin "…and an EMPTY classifier verdict is mapped to the NOCHECKS reading arm, not a class" "$ORCH" '      V="NOCHECKS"'
   wpin "…and the mapping is confined to the empty case (a real class is never overwritten)" "$ORCH" 'if [ -z "${V:-}" ]; then'
   wpin "…and the empty verdict is LOGGED with the classifier that produced it" "$ORCH" 'the classifier produced NO VERDICT (empty output from $_CK_PY)'

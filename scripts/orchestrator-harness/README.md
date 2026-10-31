@@ -2260,6 +2260,10 @@ refresh log)` when the count could not be recorded: the `checked.txt` rewrite fa
 `state/checked-release` publish did not land, or the record predates the pass — the entries are then in
 fact still suppressed),
 `— UNPROVEN suppression: K checked entr(ies) with no proven fact`,
+`— K of the N blacklisted are the DISPATCH BACKLOG (CLEAN-judged, awaiting the issue path), not suppressed`
+(the `queued` keep-fact means "still in `candidates.txt`", i.e. waiting for the ISSUE PATH — `checked.txt`
+stops a re-pre-flight, never a dispatch — so these are work the box has already judged CLEAN, not
+suppression, and the two need different repairs; #3110),
 `— K checked entr(ies) deferred by the release cap` (a STANDING residue means `CHECKED_RELEASE_MAX` is too
 small for this cell — it accepts up to **96** asks per pass, four times the default; above that the value is
 coerced to 96 with a WARN, because each ask is an un-timeouted `git` call), `— checked classification REFUSED this pass (<slug>): nothing could be released`
