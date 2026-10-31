@@ -368,84 +368,8 @@ PID=$!
 echo "$PID" > "$PIDF"
 disown "$PID" 2>/dev/null || true
 
-# ── THE START ASSERTION (agent-infra, measured 2026-10-31) ─────────────────────────────────────
-# ⛔ A DISPATCH IS NOT DONE WHEN ITS FILES LAND. Measured on this fleet: the caller printed
-# `launched <name> pid=…` for a lane that never existed — the brief and the launch script were written,
-# a transport round-trip (`cmux vm exec` + `chmod +x`) timed out, and `ps` showed 0 pi processes on the
-# box while the report said "dispatched". The false success is produced RIGHT HERE: the pid is captured
-# before anything proves the worker became a process, and a worker whose gates refuse (brief/disk/load)
-# or whose `pi` cannot start exits in well under a second — writing `.rc` — while this script still
-# prints `launched` and exits 0.
-#
-# So the assertion is POSITIVE and it is read HERE, in the worker's own process tree (this script runs
-# ON the box, so "here" IS the box — the caller's exit code is not evidence): after a bounded settle
-# window the worker must still be ALIVE and must not yet have written its exit status. Anything else is
-# a hard failure that NAMES the cell-side state — the pid, the log, its byte count, the rc if one was
-# recorded, and the log's last line — and exits 75, so a caller cannot mistake it for a launch.
-#
-# ONE step, ONE exit code (the brief's FA5 bound): no new gate, no registry, no daemon. `NB_START_SETTLE`
-# (default 5s) is the only knob, so a test can shorten it — floored at 2, because a 1-second window
-# elapses in the sleep it just requested and certifies the t=0 reading this block exists to remove
-# (a fresh-context review measured `NB_START_SETTLE=1 → 362 ms, zero sleeps`).
-NB_SETTLE="${NB_START_SETTLE:-5}"
-case "$NB_SETTLE" in ''|*[!0-9]*) NB_SETTLE=5 ;; esac
-[ "$NB_SETTLE" -ge 2 ] || NB_SETTLE=2
-# ⛔ THE WINDOW MUST ACTUALLY ELAPSE. The first cut broke out on the FIRST `kill -0` success, which is
-# true at t=0 for every launch — including the ones that die a millisecond later — so it certified the
-# exact defect it exists for (measured in this suite's own T1). The worker is a PROXY (`&`) that then
-# execs/forks `run_agent`; only surviving the whole window is evidence a lane runs.
-# ⛔ SLEEP FIRST, THEN TEST (#485 class, fresh-context review P2): testing first made the window
-# `NB_SETTLE-1` seconds and made `NB_SETTLE=1` certify the t=0 reading this block exists to remove.
-nb_started=0
-nb_waited=0
-while [ "$nb_waited" -lt "$NB_SETTLE" ]; do
-  sleep 1
-  nb_waited=$((nb_waited + 1))
-  # ⛔ A RECORDED EXIT STATUS IS A DIFFERENT FACT FROM "NOTHING RAN" (fresh-context review P1). The
-  # first cut reported `NOT STARTED` for a worker that STARTED AND FINISHED inside the window — while
-  # quoting its own `rc=0` in the same message — so a caller would re-dispatch a lane that had already
-  # run (and possibly pushed). The three states are read apart below.
-  if [ -f "$RC" ]; then break; fi
-  if ! kill -0 "$PID" 2>/dev/null; then break; fi
-  [ "$nb_waited" -ge "$NB_SETTLE" ] && nb_started=1
-done
-nb_rc="$(cat "$RC" 2>/dev/null || echo '<none>')"
-if [ "$nb_started" != 1 ] && [ "$nb_rc" != '<none>' ]; then
-  nb_bytes="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ' || echo 0)"
-  nb_last="$(awk 'END{print}' "$LOG" 2>/dev/null)"
-  # rc=0 ALONE IS NOT EVIDENCE A LANE RAN (round-2 review, P1): a `run_agent` that returns 0 without
-  # writing a byte started nothing, and minting a row for it reproduces the defect this block exists
-  # for. The worker's first log write is the positive evidence; with it the early finish is real.
-  if [ "$nb_rc" = "0" ] && [ "${nb_bytes:-0}" -gt 0 ]; then
-    printf 'finished early: %s exited rc=0 inside the %ss window (no lane is running now)\n' "$NAME" "$NB_SETTLE" >&2
-  elif [ "$nb_rc" = "0" ]; then
-    printf 'NOT STARTED: %s — exited rc=0 inside the %ss window WITHOUT WRITING A SINGLE LOG BYTE.\n' "$NAME" "$NB_SETTLE" >&2
-    printf '  cell-side state: pid=%s rc=0 log=%s (0 bytes) worktree=%s\n' "$PID" "$LOG" "$WT" >&2
-    printf '  This is NOT a dispatch: do not record it as one.\n' >&2
-    exit 75
-  else
-    printf 'FAILED EARLY: %s started and exited rc=%s inside the %ss window — NO LANE IS RUNNING.\n' \
-      "$NAME" "$nb_rc" "$NB_SETTLE" >&2
-    printf '  cell-side state: pid=%s rc=%s log=%s (%s bytes) worktree=%s\n' \
-      "$PID" "$nb_rc" "$LOG" "${nb_bytes:-0}" "$WT" >&2
-    printf '  last log line: %s\n' "${nb_last:-<log empty>}" >&2
-    printf '  This is NOT a dispatch: do not record it as one.\n' >&2
-    exit 75
-  fi
-elif [ "$nb_started" != 1 ]; then
-  nb_bytes="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ' || echo 0)"
-  nb_last="$(awk 'END{print}' "$LOG" 2>/dev/null)"
-  printf 'NOT STARTED: %s — the launch files landed but NO LANE IS RUNNING.\n' "$NAME" >&2
-  printf '  cell-side state: pid=%s alive=no rc=none log=%s (%s bytes) worktree=%s\n' \
-    "$PID" "$LOG" "${nb_bytes:-0}" "$WT" >&2
-  printf '  last log line: %s\n' "${nb_last:-<log empty>}" >&2
-  printf '  This is NOT a dispatch: do not record it as one. The pid above is gone.\n' >&2
-  exit 75
-fi
-
-# Durable record — written ONLY after the assertion above (a row here is a claim that a lane started,
-# so an unverified dispatch must not be able to write one), and it keeps the original purpose: a later
-# session can see what was dispatched and when, and find the exit status via `--status`.
+# Durable record, so a later session can see what was dispatched and when (and can find the exit
+# status later via `--status`, rather than inferring it from a log tail).
 mkdir -p "$O/state" "$D"
 printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$NAME" "$(git branch --show-current 2>/dev/null)" "$PID" "$(date '+%H:%M:%S')" >> "$D/dispatch-log.tsv"
 
