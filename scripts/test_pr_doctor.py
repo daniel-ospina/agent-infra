@@ -4642,12 +4642,13 @@ def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatc
         free refuses it while the aggregate total still reads > 0.
     Both arms are pinned here: neither may emit the word "handed".
     """
-    # (a) a plain call-rail row -> eligible, and NO handoff claim.
+    # (a) a plain call-rail row -> candidate, and NO handoff claim.
     _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(52)], ("call-rail", "gated", []))
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
     assert "handed" not in casc[0], casc[0]
-    assert "merge->eligible" in casc[0], casc[0]
+    assert "dispatched" not in casc[0], casc[0]
+    assert "merge->candidate" in casc[0], casc[0]
     # (b) the steady-state arm: the row is on COOLDOWN at the SAME head, so NOTHING is dispatched --
     #     the line must still not claim a handoff.
     head = "a" * 40                       # `_pr`'s default head, which is what the cooldown matches
@@ -4658,6 +4659,46 @@ def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatc
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
     assert "handed" not in casc[0], casc[0]
+
+
+def test_the_cascade_fix_arm_is_judged_on_its_OWN_class_budget(monkeypatch):
+    """`fix->candidate` must not be claimed when the FIX budget is exhausted but REVIEW is free.
+
+    ⛔ THE MEASURED DEFECT (review P1, 2026-10-31): `_r2` summed FIVE actions that span BOTH budget
+    classes -- `resolve-conflict`/`fix-ci`/`rerun-checks`/`blocked-by-rail` are FIX, `record-review`
+    is REVIEW (`ACTION_CLASS`) -- and then gated on `budgets["fix"] > 0 or budgets["review"] > 0`.
+    So with one `fix-ci` row and `MAX_FIX=0 MAX_REVIEW=3` the line read
+
+        fix->eligible (1); fix slots=0 review slots=3
+
+    -- asserting eligibility and refuting itself in the same clause, while the dispatch loop refused
+    the row at the per-class gate. `budgets["fix"] == 0` is the NORMAL busy-fleet state at the
+    shipped `MAX_FIX=3` (three fix workers holding their slots), so this was not an edge case.
+    The mirror is pinned here: a fix-class row with no fix slot must take the NO SLOT arm.
+    """
+    monkeypatch.setenv("MAX_FIX", "0")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(54)], ("fix-ci", "red", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix->NO SLOT" in casc[0], casc[0]
+    assert "fix->candidate" not in casc[0], casc[0]
+    assert "fundamental" not in casc[0], casc[0]
+    assert payload.get("dispatched") == 0, (joined, payload)
+
+
+def test_the_cascade_fix_arm_names_the_class_it_is_reporting(monkeypatch):
+    """The rung-2 term is emitted PER CLASS, so a review-class row is never reported as `fix->`.
+
+    Before the per-class split, a lone `record-review` row printed `fix->eligible (1)` -- a
+    mislabelled rung, which is what let the OR-gate false claim hide: the label named the wrong
+    budget, so a reader could not see that the row's own class was the one with no slot.
+    """
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(55)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->candidate" in casc[0], casc[0]
+    assert "fix->" not in casc[0], casc[0]
 
 
 def test_two_failed_file_reads_stop_the_per_pr_requests_but_still_refuse(monkeypatch):
