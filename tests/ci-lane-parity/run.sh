@@ -1705,7 +1705,7 @@ else
 fi
 
 echo ""
-echo "8ap. A SHARD MUST NOT BE ABLE TO DRAIN THE LIST (#3084)"
+echo "8ap. A SHARD MUST NOT BE ABLE TO DRAIN THE LIST (#3079)"
 # ⛔ WHAT THIS ARM EXISTS FOR — the largest silent coverage hole this runner has had. The loop used
 # to be `while IFS= read -r shard; do run_shard "$shard"; done <<<"$shard_paths"`, so the shard list
 # lived on the driver's STDIN and every shard inherited it. A shard that reads stdin therefore
@@ -1824,6 +1824,72 @@ else
       pass "the </dev/null arm alone is sufficient (a stdin-fed loop cannot be drained when the shard's stdin is closed)"
     else
       fail "with the stdin-fed loop and </dev/null the run still shortened (rc $RC): $(cat "$TMP/runner-drain-stdinloop.out")"
+    fi
+  fi
+  # ⛔ THE SKIP REASON IS PINNED TOO (`#3099` review, P2). `slice_skips` writes `<path>\t<slice i/n>`
+  # into `shard_skip_log` and the mismatch verdict prints those lines, but NO fixture ever entered
+  # that branch: every arm above induces a mismatch with `(0 skipped)`, so the print could have
+  # emitted an empty or garbled line and this suite would still be green — the same "a diagnostic is
+  # claimed but nothing measures it" gap the mutant arms exist to close for the other blocks. The
+  # fixture below reaches the branch BY CONSTRUCTION: 4 shards, the slice skips position 1, and the
+  # shard at position 2 drains the list — so the run ends with one DELIBERATE skip recorded and one
+  # shard never reached, which is the only state that prints BOTH the `(1 skipped)` count with its
+  # per-shard reasons and the NEVER-RAN list. The GREEN CONTROL on the unmutated runner is part of
+  # the arm: without it, a fixture that reds for some unrelated reason would count as proof.
+  SKIP_FIX="$TMP/skip-reason-fixture"
+  mkdir -p "$SKIP_FIX/scripts" "$SKIP_FIX/tests/ci-lane-parity"
+  stage_guard "$SKIP_FIX"
+  printf '#!/bin/bash\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-a.sh"
+  printf '#!/bin/bash\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-b.sh"
+  printf '#!/bin/bash\nwhile IFS= read -r _l; do :; done\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-c.sh"
+  printf '#!/bin/bash\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-d.sh"
+  awk '\
+    /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"tests/ci-lane-parity/skip-*.sh\" )"; skip = 1; next }
+    skip && /^\)$/ { skip = 0; next }
+    skip { next }
+    { print }
+  ' "$RUNNER" >"$SKIP_FIX/scripts/runner-skip.sh"
+  if cmp -s "$RUNNER" "$SKIP_FIX/scripts/runner-skip.sh"; then
+    fail "the skip-reason fixture did not narrow SUITE_GLOBS — it would run the real shard list"
+  else
+    BASH_SHARD_SLICE=1/2 $FIXTURE_BOUND bash "$SKIP_FIX/scripts/runner-skip.sh" >"$TMP/runner-skip-control.out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] && grep -q 'bash shards passed (slice 1/2 of 4' "$TMP/runner-skip-control.out"; then
+      pass "skip-reason CONTROL: the fixed runner executes slice 1/2 of 4 and reports green (rc 0)"
+    else
+      fail "the skip-reason control run is not green (rc $RC — want 0 + 'bash shards passed (slice 1/2 of 4'): $(cat "$TMP/runner-skip-control.out")"
+    fi
+    awk '
+      /^for shard in / { print "while IFS= read -r shard; do"
+                         print "  [ -n \"$shard\" ] || continue"
+                         print "  run_shard \"$shard\""
+                         print "done <<<\"$shard_paths\""
+                         inold = 1; next }
+      inold { if ($0 == "done") { inold = 0 }; next }
+      { print }
+    ' "$SKIP_FIX/scripts/runner-skip.sh" \
+      | sed 's| bash "\$1" </dev/null| bash "$1"|' >"$SKIP_FIX/scripts/runner-skip-mutant.sh"
+    if cmp -s "$SKIP_FIX/scripts/runner-skip.sh" "$SKIP_FIX/scripts/runner-skip-mutant.sh"; then
+      fail "the skip-reason mutant did not change the file — the loop's shape or the shard call moved, and this arm now measures nothing"
+    else
+      BASH_SHARD_SLICE=1/2 $FIXTURE_BOUND bash "$SKIP_FIX/scripts/runner-skip-mutant.sh" >"$TMP/runner-skip-mutant.out" 2>&1
+      RC=$?
+      MOUT="$(cat "$TMP/runner-skip-mutant.out")"
+      if [ "$RC" -eq 1 ] && grep -q 'executed 2 of 4 listed shard(s) (1 skipped)' <<<"$MOUT"; then
+        pass "MUTANT: a mismatch that also SKIPPED a shard reports 'executed 2 of 4 … (1 skipped)' (rc 1)"
+      else
+        fail "the skip-reason mutant did not report the expected mismatch (rc $RC — want 1 + 'executed 2 of 4 listed shard(s) (1 skipped)'): $MOUT"
+      fi
+      if grep -qF '⏭  SKIPPED: tests/ci-lane-parity/skip-b.sh (slice 1/2)' <<<"$MOUT"; then
+        pass "…and the verdict PRINTS the skipped shard WITH its reason ('slice 1/2') — skipped=N is never an unexplained shortfall"
+      else
+        fail "the verdict printed no per-shard skip reason (want '⏭  SKIPPED: tests/ci-lane-parity/skip-b.sh (slice 1/2)'): $MOUT"
+      fi
+      if grep -qF 'NEVER RAN: tests/ci-lane-parity/skip-d.sh' <<<"$MOUT"; then
+        pass "…and the same block still NAMES the shard the drain skipped over (skip-d.sh) — the reason print did not displace the set difference"
+      else
+        fail "the skip-reason block displaced the NEVER-RAN naming (want 'NEVER RAN: tests/ci-lane-parity/skip-d.sh'): $MOUT"
+      fi
     fi
   fi
 fi
