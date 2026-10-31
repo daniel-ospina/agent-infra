@@ -600,7 +600,7 @@ function atoms() {
 #   `command -v setsid >/dev/null 2>&1; setsid sleep 1`         CLEAN  (runs unconditionally)
 #   `if command -v timeout …; then :; else timeout 5 sleep 1; fi` CLEAN (the else arm IS the trap)
 # A NEGATED probe (`if ! command -v …; then …`) guards nothing, so it is never a guard.
-function conditioned(tool, code,   pr, c2, cal, arm, m1, m2, p_and, p_then, rest2, tail, pass) {
+function conditioned(tool, code,   pr, c2, cal, arm, m1, m2, p_and, p_then, rest2, tail, pass, scan) {
   # ⛔ A PROBE IS OFTEN INSIDE A KEYWORD (review cycle-8): the first version anchored at `(^|SEP)`,
   # so `if command -v timeout …` matched NOTHING — every guarded form in this tree is written that
   # way, and the conditioning test then reported clean code as a trap (bounded.sh, box.sh,
@@ -651,7 +651,17 @@ function conditioned(tool, code,   pr, c2, cal, arm, m1, m2, p_and, p_then, rest
   rest2 = arm
   if (match(rest2, "[ \t]else([ \t]|$)") > 0) rest2 = substr(rest2, 1, RSTART - 1)
   for (pass = 1; pass <= 4; pass++) {
-    if (match(rest2, "[;|]") == 0) { m1 = m1 rest2; break }
+    # ⛔ A BARE `&` ENDS THE ARM (review cycle-10 P0): `… && timeout 5 a & timeout 5 b` backgrounds
+    # the guarded arm and then runs the second call UNCONDITIONALLY — the line came back CLEAN for
+    # every one of the six tools this class covers, and `probe && a & b` is a house idiom in this
+    # tree (scripts/orchestrator-harness/live-ownership.test.sh:66). The `&` that must NOT cut is the
+    # one in `&&` (the AND-join that keeps the arm open) and the one in a redirection (`>&1`, `<&0`),
+    # so both are masked on a length-preserving COPY and the cut position is applied to the original:
+    # widening the class without masking reds correctly guarded `2>/dev/null && …` chains.
+    scan = rest2
+    gsub(/&&/, "\002\002", scan)
+    gsub(/[<>]&/, "\002\002", scan)
+    if (match(scan, "[;|&]") == 0) { m1 = m1 rest2; break }
     m1 = m1 substr(rest2, 1, RSTART - 1)
     tail = substr(rest2, RSTART)
     if (match(tail, "^[;|][ \t]*then[ \t]+") == 0) break
@@ -1141,12 +1151,17 @@ function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat
       while (j <= n2 && substr(seg, j, 1) ~ /[A-Za-z]/) { cl = cl substr(seg, j, 1); j++ }
       if (cl !~ /i/) continue
       rest = (j > n2) ? "" : substr(seg, j, 1)
+      # ⛔ A PORTABLE SPELLING ENDS ITS OWN SEGMENT, NOT THE WHOLE LINE (review cycle-10 P0): these
+      # three arms are the PORTABLE spellings, and `return 0` abandoned every remaining segment — so
+      # `command -v sed … && sed -i.bak -e s/a/b/ f & sed -i -e s/a/b/ g` reported CLEAN with a live
+      # GNU-only `-i` in the second segment, because the first segment was portable. Same class as
+      # the cycle-9/10 probe defects: one correct construct exonerating the rest of the line.
       # the flag is not the LAST letter of the cluster: the rest of the cluster is an attached suffix
-      if (substr(cl, length(cl), 1) != "i") return 0
+      if (substr(cl, length(cl), 1) != "i") break
       # attached UNQUOTED suffix: portable to both (`.bak`, `BAK`)
-      if (rest ~ /^[A-Za-z0-9_.]/) return 0
+      if (rest ~ /^[A-Za-z0-9_.]/) break
       # attached QUOTED suffix: `@@` marks NON-EMPTY content, so this is portable too
-      if (rest ~ /["\047]/ && substr(seg, j + 1, 2) == "@@") return 0
+      if (rest ~ /["\047]/ && substr(seg, j + 1, 2) == "@@") break
       # attached EMPTY quotes (`-i""`, `-i''`): the BSD spelling, on either side of the separator
       q1 = substr(seg, j, 1); q2 = substr(seg, j + 1, 1)
       if (q1 != "" && q1 == q2 && (q1 == "\"" || q1 == SQ)) { hit("sed-in-place-bsd", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); return 0 }

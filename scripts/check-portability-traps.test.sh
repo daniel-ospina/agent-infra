@@ -706,6 +706,13 @@ mkc4 cyc9/3-then-else.sh '#!/usr/bin/env bash' 'if command -v timeout >/dev/null
 mkc4 cyc9/4-plain-then-guarded.sh '#!/usr/bin/env bash' 'timeout 5 a; command -v timeout >/dev/null 2>&1 && timeout 5 b'
 mkc4 cyc9/5-shim-mentioned-cpu.sh '#!/usr/bin/env bash' 'grep -q box_ncpu lib/box.sh; n="$(nproc)"'
 mkc4 cyc9/6-shim-mentioned-sed.sh '#!/usr/bin/env bash' "grep -c box_sed_i lib/box.sh >/dev/null; sed -i -e 's/a/b/' f"
+# a BARE `&` ends the arm: the left arm is backgrounded and the right call runs unconditionally
+mkc4 cyc9/8-guarded-then-background.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 a & timeout 5 b'
+# …for every tool this class covers, because the cut is shared
+mkc4 cyc9/9-background-breadth.sh '#!/usr/bin/env bash' 'command -v readlink >/dev/null 2>&1 && readlink -f a & readlink -f b'
+mkc4 cyc9/10-background-cpu.sh '#!/usr/bin/env bash' 'command -v nproc >/dev/null 2>&1 && n="$(nproc)" & n="$(nproc)"'
+# a PORTABLE sed spelling in one segment must not exonerate a GNU-only `-i` in the next
+mkc4 cyc9/11-sed-portable-then-gnu.sh '#!/usr/bin/env bash' 'command -v sed >/dev/null 2>&1 && sed -i.bak -e s/a/b/ f & sed -i -e s/a/b/ g'
 mkc4 cyc9/7-repeat-one-probed.sh '#!/usr/bin/env bash' 'command -v nproc >/dev/null 2>&1 && n="$(nproc)"; m="$(nproc)"'
 
 # …and the forms that ARE conditioned must stay clean, including a whole `&&` chain
@@ -713,6 +720,11 @@ mkc4c cyc9clean/1-and-chain.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/n
 mkc4c cyc9clean/2-then-single.sh '#!/usr/bin/env bash' 'if command -v timeout >/dev/null 2>&1; then timeout 5 a; fi'
 mkc4c cyc9clean/3-then-multiline.sh '#!/usr/bin/env bash' 'if command -v timeout >/dev/null 2>&1; then' '  timeout 5 a' 'fi'
 mkc4c cyc9clean/4-shim-called.sh '#!/usr/bin/env bash' 'n="$(box_ncpu)"' 'box_sed_i "s/a/b/" f'
+# the `&` that must NOT end the arm: an AND-join and a redirection
+mkc4c cyc9clean/5-redirect-and-chain.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 a 2>/dev/null && timeout 5 b'
+mkc4c cyc9clean/6-and-after-redirect.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 a >/dev/null 2>&1 && timeout 5 b'
+# a portable sed spelling alone (its own segment) stays clean
+mkc4c cyc9clean/7-sed-portable.sh '#!/usr/bin/env bash' "sed -i.bak -e 's/a/b/' f && rm -f f.bak"
 
 run_check "$C4" --no-baseline
 if [ "$?" = 2 ]; then
@@ -725,7 +737,11 @@ else
     "timeout-absent-on-macos cyc9/4-plain-then-guarded.sh" \
     "cpu-count-single-mechanism cyc9/5-shim-mentioned-cpu.sh" \
     "sed-in-place-gnu cyc9/6-shim-mentioned-sed.sh" \
-    "cpu-count-single-mechanism cyc9/7-repeat-one-probed.sh"
+    "cpu-count-single-mechanism cyc9/7-repeat-one-probed.sh" \
+    "timeout-absent-on-macos cyc9/8-guarded-then-background.sh" \
+    "readlink-f-bsd-absent cyc9/9-background-breadth.sh" \
+    "cpu-count-single-mechanism cyc9/10-background-cpu.sh" \
+    "sed-in-place-gnu cyc9/11-sed-portable-then-gnu.sh"
   do
     set -- $pair
     if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -739,7 +755,10 @@ else
     "timeout-absent-on-macos cyc9clean/1-and-chain.sh" \
     "timeout-absent-on-macos cyc9clean/2-then-single.sh" \
     "timeout-absent-on-macos cyc9clean/3-then-multiline.sh" \
-    "cpu-count-single-mechanism cyc9clean/4-shim-called.sh"
+    "cpu-count-single-mechanism cyc9clean/4-shim-called.sh" \
+    "timeout-absent-on-macos cyc9clean/5-redirect-and-chain.sh" \
+    "timeout-absent-on-macos cyc9clean/6-and-after-redirect.sh" \
+    "sed-in-place-gnu cyc9clean/7-sed-portable.sh"
   do
     set -- $pair
     if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -753,6 +772,13 @@ else
   # alone reads these CLEAN (that WAS the P0). Removing the count comparison must turn the fixture
   # back into a false PASS — if it does not, the count is not what catches it and the next edit can
   # drop it silently.
+  # ⛔ THE BARE-`&` CUT IS PINNED BY OPPOSING ARMS, NOT BY A TEXT MUTANT: C14a/8 (background must be
+  # CAUGHT) and C14b/5-6 (an `&&` join and a redirection must stay CLEAN) fail in opposite
+  # directions — narrowing the class reds C14a/8, widening it without the masking reds C14b/5. A
+  # string-surgery mutant here would be brittle (the pattern is an awk regex literal, and escaping it
+  # from inside this file is its own quoting exercise), so the two arms carry the load and the
+  # mutation section's other entries cover the dispatch/guard polarity.
+
   MUT9="$TMP/cyc9mut.sh"
   awk '{ if (index($0, "if (toolcalls(c2, tool) != toolcalls(m1, tool)) return 0") > 0) print "# MUT9"; else print }' "$CHECK" >"$MUT9"
   if cmp -s "$CHECK" "$MUT9"; then
