@@ -555,22 +555,38 @@ function cmt_start(line, i,   prev) {
 # unreported at rc=0 (the same silent-CLEAN shape the previous cycle fixed one construct earlier).
 # The test looks back over spaces to the nearest non-space byte: a shell operator (`;`, `&`, `|`, `(`,
 # `{`), an arm label / subshell close `)`, the start of the line, or a command-introducing keyword.
-function cmd_boundary(line, i,   j, prev, w) {
+function cmd_boundary(line, i,   j, prev, w, w2, k) {
+  # \u26d4 THE CLASS IS FINITE AND IT IS NOW CLOSED (review cycle-6 P1). bash accepts exactly these
+  # before a command: the operators `; & | ( {`, an arm label / subshell close `)`, the negation `!`,
+  # and the reserved words that TAKE a command \u2014 `if then elif else while until do`, `time` (with
+  # its own -p/-- options) and `coproc` (with an optional NAME). Enumerating only the first group
+  # left `time -p case` and `coproc C case` unrecognised, and each reproduced the silent rc=0 green
+  # over two live traps that the `!` fix had just closed \u2014 not present in this tree, and not a
+  # regression, but the same false-PASS class. The lookback therefore WALKS: option words are skipped,
+  # `time`/`coproc` are recognised, and a bare NAME one word after `coproc` is recognised too.
   j = i - 1
-  while (j >= 1 && substr(line, j, 1) ~ /[ \t]/) j--
-  if (j < 1) return 1
-  prev = substr(line, j, 1)
-  # ⛔ `!` IS A COMMAND PREFIX TOO (review cycle-5 P0): `! case … in a)# comment` skipped the whole
-  # arm model, the arm label `)` popped the substitution, the glued `#` was called DATA and the
-  # apostrophe in that prose swallowed the rest of the file — a REGRESSION against the previous head,
-  # which had accepted any non-word byte. The enumeration is the defect class: every character bash
-  # accepts before a command must be listed, so `!` belongs with `;`, `&`, `|`, `(`, `{`.
-  if (prev ~ /[;&|({!]/) return 1
-  if (prev == ")") return 1
-  if (prev ~ /[A-Za-z0-9_]/) {
+  while (1) {
+    while (j >= 1 && substr(line, j, 1) ~ /[ \t]/) j--
+    if (j < 1) return 1
+    prev = substr(line, j, 1)
+    if (prev ~ /[;&|({!]/) return 1
+    if (prev == ")") return 1
+    if (prev !~ /[A-Za-z0-9_-]/) return 0
     w = ""
-    while (j >= 1 && substr(line, j, 1) ~ /[A-Za-z0-9_]/) { w = substr(line, j, 1) w; j-- }
-    if (w == "then" || w == "do" || w == "else" || w == "elif" || w == "if" || w == "while" || w == "until" || w == "time") return 1
+    while (j >= 1 && substr(line, j, 1) ~ /[A-Za-z0-9_-]/) { w = substr(line, j, 1) w; j-- }
+    # the `time` options and a `--` word belong to the PREFIX \u2014 keep walking left
+    if (w ~ /^-/) continue
+    if (w == "time" || w == "coproc") return 1
+    if (w == "then" || w == "do" || w == "else" || w == "elif" || w == "if" || w == "while" || w == "until") return 1
+    # `coproc NAME case`: the bare name is part of the prefix, so look one word further left
+    k = j
+    while (k >= 1 && substr(line, k, 1) ~ /[ \t]/) k--
+    if (k >= 1) {
+      w2 = ""
+      while (k >= 1 && substr(line, k, 1) ~ /[A-Za-z0-9_]/) { w2 = substr(line, k, 1) w2; k-- }
+      if (w2 == "coproc") return 1
+    }
+    return 0
   }
   return 0
 }

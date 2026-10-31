@@ -363,6 +363,24 @@ elif grep -q 'id, trap and replacement' "$TMP/e15.err" && ! grep -qE 'no such us
 else
   bad "E15: the refusal message ran a command or lost the column names — $(head -2 "$TMP/e15.err" | tr '\n' ' ')"
 fi
+# ⛔ C30/C31 — THE OTHER COMMAND-TAKING RESERVED WORDS (review cycle-6 P1). The prefix enumeration
+# omitted `time` options and `coproc [NAME]`, and each reproduced the same silent rc=0 green over two
+# live traps: the arm model was skipped, the arm label popped the substitution, the glued `#` was
+# DATA, the apostrophe in that prose swallowed the rest of the file, and a SECOND apostrophe later in
+# the body balanced the stack so nothing was even reported as unbalanced. The class is closed now:
+# operators, `!`, and the reserved words that TAKE a command (`if then elif else while until do time
+# coproc`) including their option/name words.
+mkdir -p "$TMP/tree/prefix"
+{ printf '%s\n' '#!/usr/bin/env bash';
+  printf 'x=$(time -p case a in a)# don%st reorder\n' "$CASQ3";
+  printf '%s\n' '  sed -i s/a/b/ f' '  stat -c %Y g' '  ;;' 'esac)' "# it${CASQ3}s fine"; } >"$TMP/tree/prefix/1-time-opt.sh"
+{ printf '%s\n' '#!/usr/bin/env bash';
+  printf 'x=$(coproc C case a in a)# don%st reorder\n' "$CASQ3";
+  printf '%s\n' '  sed -i s/a/b/ f' '  stat -c %Y g' '  ;;' 'esac)' "# it${CASQ3}s fine"; } >"$TMP/tree/prefix/2-coproc-name.sh"
+printf 'prefix/1-time-opt.sh\nprefix/2-coproc-name.sh\n' >"$TMP/prefix-targets"
+flags "sed-in-place-gnu" "$TMP/prefix-targets" && flags "stat-c-gnu" "$TMP/prefix-targets" \
+  && ok "C30/C31: a time option and a coproc NAME before case keep the arm model — the live traps are reported (the prefix class is closed)" \
+  || bad "C30/C31: an option/name word before case was not recognised as a command prefix, hiding live traps"
 
 # C6/C7 — the file-level declaration: a reasoned skip works; a bare one REFUSES.
 L="$TMP/linuxonly"; : >"$L"
