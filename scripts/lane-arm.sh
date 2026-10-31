@@ -121,22 +121,25 @@ log() { printf '%s LANE-ARM %s\n' "$(date '+%m-%d %H:%M:%S')" "$1" >>"$LOG" 2>/d
 bounded() {
   local secs="$1"; shift
   "$@" & local pid=$!
-  local cmd
-  cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || cmd=""
-  sleep "$secs" & local sp=$!
-  ( wait "$sp" 2>/dev/null || exit 0
-    # only signal the pid we started, and only if it is still the same process image
-    [ -n "$cmd" ] || exit 0
-    cur="$(ps -o command= -p "$pid" 2>/dev/null)" || exit 0
-    [ "$cur" = "$cmd" ] || exit 0
+  local me=$$
+  # ⛔ THE OWNERSHIP PREDICATE IS `ppid == me`, NOT AN IMAGE COMPARISON. An image/`lstart` comparison
+  # looks safer and is WRONG here: `/usr/bin/python3` on macOS is a shim that RE-EXECS the framework
+  # python, so the command line and even the image change microseconds after the fork -- and a
+  # re-proof that compares the image therefore declines to kill the very process this bound exists
+  # for. Measured: a 30 s `python3` child under a 2 s bound ran the full 30 s and the arm reported
+  # success. `ppid` survives exec, and it is exactly the question being asked -- is this still MY
+  # child? -- while a RECYCLED pid answers no (its parent is some other process, or it is gone).
+  # ⛔ THE WATCHDOG OWNS ITS OWN SLEEPER: the first version forked the sleeper in the MAIN shell and
+  # `wait`ed on it from inside a subshell, which cannot work ("pid N is not a child of this shell"),
+  # so the watchdog exited at once and the bound killed nothing, ever.
+  ( sleep "$secs" || exit 0
+    [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$me" ] || exit 0
     kill -TERM "$pid" 2>/dev/null
     sleep 5
-    cur="$(ps -o command= -p "$pid" 2>/dev/null)" || exit 0
-    [ "$cur" = "$cmd" ] || exit 0
+    [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$me" ] || exit 0
     kill -KILL "$pid" 2>/dev/null ) 2>/dev/null & local wd=$!
   wait "$pid" 2>/dev/null; local rc=$?
-  kill "$sp" "$wd" 2>/dev/null
-  wait "$sp" 2>/dev/null; wait "$wd" 2>/dev/null
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
   return $rc
 }
 
@@ -185,11 +188,14 @@ if lanes is None or not isinstance(lanes,list): raise SystemExit(1)' "$TMP" 2>/d
   rm -f "$TMP"
   fail "classifier output did not parse as a snapshot; not publishing it"
 fi
-mv "$TMP" "$SNAP" || { rm -f "$TMP"; fail "cannot publish $SNAP"; }
 
 # ── 2. FRESHNESS IS PART OF THE VERDICT (a measurement artifact is not a state) ─────────────────
-sa="$(age_s "$SNAP")" || fail "snapshot vanished after publish"
+# Measured on the TEMP file -- the bytes this pass actually produced. Measuring $SNAP here would be a
+# tautology (its mtime is microseconds old whatever the data age), which is how an earlier revision
+# came to advertise a refusal it could never perform.
+sa="$(age_s "$TMP")" || fail "the temp snapshot vanished before the freshness check"
 if [ "${sa:-999999}" -gt "$MAX_AGE" ]; then
+  rm -f "$TMP"
   fail "snapshot is ${sa}s old (> ${MAX_AGE}s) -- refusing to present it as current"
 fi
 
@@ -205,6 +211,9 @@ fi
 # valid JSON with a list, so it would replace the good snapshot and only then be refused by
 # lane-actions.py. `--stdin <path>` does not re-sample, and lane-actions derives its age from that
 # file's mtime, so rendering against the temp file changes nothing it reports.
+# ⛔ AND THIS IS THE ONLY `mv` TO $SNAP IN THIS FILE. An earlier revision left the old publish in
+# place as well, so the temp file was already gone when the renderer ran: every pass exited 4 AND the
+# snapshot had been replaced -- the exact failure this ordering exists to prevent, twice over.
 mv "$TMP" "$SNAP" || { rm -f "$TMP"; fail "cannot publish $SNAP"; }
 
 # ── 4. THE HANDOFF: one machine-readable line per WEDGED lane ─────────────────────────────────
