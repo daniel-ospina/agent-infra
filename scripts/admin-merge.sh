@@ -6239,6 +6239,20 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
+# ⛔ ONE PATTERN FOR "an id NO LOCAL REPRODUCTION can execute" (#3715, #1185).
+# These families name no pytest nodeid, so handed to the runner as ARGV ONE of
+# them makes pytest EXIT 4 having run NOTHING (`ERROR: file or directory not
+# found`) and the whole base run clears nothing. TWO readers ask this question —
+# `reproduce_residual_on_base`, which must not hand them to the runner, and the
+# #3715 block, which reports that the surviving candidate set names nothing a
+# local run could execute. A second copy of the REGEX is exactly the drift the
+# rail's one-derivation rule forbids, so the regex lives here and nowhere else.
+# (This is ONE pattern with TWO readers, not one enumeration of the families:
+# `repro_scope`'s `case` arms answer a DIFFERENT question — admission into the
+# candidate set, which is #1185's narrowing — so a family added here must be
+# considered there too, and vice versa.)
+NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^bash-shard::|^runner::|^pipeline-compliance::'
+
 # ══ reproduce_residual_on_base — THE MISSING MEASUREMENT (#3715) ═══════════
 #
 # THE DEFECT. `main-rates.txt` is a FAILURE-ONLY projection over the last N runs
@@ -6312,15 +6326,22 @@ build_evidence() {
 #     baseline measured (a sibling failure in the same file): the rail's own
 #     `attribute_residual` calls that MEASURED-ABSENT, "not present on main",
 #     which is evidence of novelty. Only the absence of ANY measurement of the
-#     file is the missing measurement this constructs. AND EVERY NON-NODEID
-#     CLASS IS NEVER A CANDIDATE, because a base run cannot speak to what it
-#     asserts: an UNATTRIBUTABLE id (a class red across runs under a MOVING id —
-#     "cannot be attributed to this PR", and therefore never a merge), a
-#     guard-step identity (no local runner), and the other non-nodeid families a
-#     local pytest cannot execute (`collect-error::<file>` #6798,
+#     file is the missing measurement this constructs. AND A NON-NODEID CLASS
+#     IS NEVER CLEARABLE, because a base run cannot speak to what it asserts: an
+#     UNATTRIBUTABLE id (a class red across runs under a MOVING id — "cannot be
+#     attributed to this PR", and therefore never a merge), a guard-step
+#     identity (no local runner), and the other non-nodeid families a local
+#     pytest cannot execute (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
 #     `bash-shard::<path>` #2643, `runner::<job>` — passed as argv they make
-#     pytest exit 4 having run NOTHING). `repro_scope` then
+#     pytest exit 4 having run NOTHING). CANDIDACY AND CLEARANCE ARE NOT THE SAME
+#     SET (#1185): `repro_scope` admits ONE guard-step identity into the
+#     candidate set when the base's baseline was read and holds no row for its
+#     step, so the rail can REPORT that the base cannot speak to it — while the
+#     two filters in `reproduce_residual_on_base` keep it out of the runner's
+#     argv AND out of the base's own capture before `intersect_sets`, so a
+#     candidate of that class is still never cleared.
+#     `repro_scope` then
 #     `repro_candidates` are the one place that decision is made, and the cleared
 #     set is its intersection with the base's own failures (`intersect_sets`,
 #     below);
@@ -6334,7 +6355,11 @@ build_evidence() {
 #     invalid bound clears NOTHING and the rail blocks exactly as before — an
 #     unrun reproduction is never read as "pre-existing";
 #   * guard-step identities are NOT reproduced (they have no local runner) and
-#     always remain in the residual.
+#     always remain in the residual — `repro_scope` admits one into the
+#     CANDIDATE set only when the base holds no record of its step (#1185), and
+#     even then nothing local can execute it: `reproduce_residual_on_base`
+#     filters it from its argv AND from the base's own capture before the
+#     intersection, so it can never be cleared.
 #
 # The worktree is a throwaway under $TMP and is always removed.
 #
@@ -6372,10 +6397,12 @@ reproduce_residual_on_base() {
   # directory not found`), so a residual that mixes a collection error with real
   # nodeids aborted the whole base run and cleared nothing — the false block this
   # repair exists to remove, with no diagnostic naming the cause. (`repro_scope`
-  # already filters them from the candidate set; this is the function's own
-  # guard, so the contract holds for any caller.)
+  # filters them from the candidate set — EXCEPT the guard-step ids #1185 admits,
+  # the ones the base holds no record of, admitted so the rail can REPORT that
+  # fact; this is the function's own guard, so the contract holds for every
+  # caller, and it is also what keeps a base CAPTURE from volunteering one.)
   local nodeids
-  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^bash-shard::' -e '^runner::' -e '^pipeline-compliance::' "$residual" 2>/dev/null || true)"
+  nodeids="$(grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -6500,7 +6527,25 @@ reproduce_residual_on_base() {
   # implementation (never a second subtraction, never `comm -12`).
   if [ -n "$reproduced" ]; then
     printf '%s\n' "$reproduced" | sort -u > "$work/reproduced.all"
-    intersect_sets "$work/reproduced.all" "$residual" "$out" "$work/rep-outside.txt" || {
+    # ⛔ THE ARGV FILTER ABOVE DOES NOT BOUND WHAT MAY BE CLEARED (#1185 review,
+    # cycle 2). ⚠️ THIS FILTER IS UNFIXTURED: the cycle-2 author wrote a
+    # rail-level fixture for it and MEASURED that it did not discriminate (the
+    # same scenario cleared nothing with the filter removed), so the case was
+    # deleted rather than shipped as a vacuous green — the effect below is
+    # established by direct measurement of the parser instead
+    # (`python3 scripts/ci_exemption.py ids --log` on a capture carrying the
+    # `##[error]FAILED …` annotation prints the `guard-step::` id). `grep -Ev`
+    # bounds what the runner was ASKED to run; a CAPTURE can
+    # still volunteer an identity its argv never named — `ids --log` recovers
+    # them from anywhere in the log, and a capture carrying a `##[error]FAILED …`
+    # annotation emits a `guard-step::` identity. Since #1185 a guard-step id CAN
+    # be in `$residual` (the candidate set), so before this filter it could be
+    # subtracted from the rail's residual by the base's own output: a failure no
+    # local run can execute, CLEARED. One more filter on the BASE'S side, through
+    # the same one pattern, keeps "an id no local reproduction can execute can
+    # never be cleared" true whichever side reports it.
+    grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$work/reproduced.all" > "$work/reproduced.exec" 2>/dev/null || : > "$work/reproduced.exec"
+    intersect_sets "$work/reproduced.exec" "$residual" "$out" "$work/rep-outside.txt" || {
       : > "$out"; return 1
     }
   fi
@@ -6671,16 +6716,43 @@ intersect_sets() {
   return 0
 }
 
-# repro_scope <residual> <unattributable> <out> <scratch> — the ids a base run
-# could even SPEAK TO: the residual minus UNATTRIBUTABLE identities, minus
-# guard-step identities, and minus the other NON-NODEID families. All are
-# excluded on doctrine, not on evidence:
+# repro_scope <residual> <unattributable> <out> <scratch> [<mainfails>] — the ids
+# a base run could even SPEAK TO, PLUS (since #1185) the guard-step ids the base
+# holds NO record of: those are admitted so the rail can REPORT that fact, never
+# because a run could speak to them (nothing local can execute one — see the
+# caller's own branch). The set is the residual minus UNATTRIBUTABLE identities,
+# minus guard-step identities THE BASE HAS A RECORD OF, and minus the other
+# NON-NODEID families. Every arm is excluded on DOCTRINE — and the guard-step arm
+# alone is additionally decided on EVIDENCE from the base's OWN baseline
+# (`main_measured_files`), which is #1185's narrowing:
 #   * UNATTRIBUTABLE is "a class red across runs under a MOVING id — the identity
 #     provably will not be the same next run, so it cannot be attributed to this
 #     PR". Reproducing ONE of the moving ids on the base says nothing about the
 #     class, and the class is never a merge (`detect_rotating_identity`, E5).
-#   * a guard-step identity has no local pytest runner, so it cannot be
-#     reproduced and must always remain in the residual.
+#   * a guard-step identity has no local pytest runner, so a local run cannot
+#     reproduce it — but that is a statement about the RUNNER, and it is only
+#     half of the question. The other half is whether the BASE holds any record
+#     of the id's UNIT at all (#1185): main's baseline is a union over main's own
+#     runs, and a `pull_request`-only workflow NEVER RUNS ON MAIN, so its
+#     `guard-step::<step>::<shape>` ids can never appear there however red main
+#     is. Excluding that id as "a reproduction can never clear it" conflated two
+#     different facts and named neither: the failure is real and on this head,
+#     but the base has NO RECORD of the step, so `main-fails.txt`'s silence is a
+#     structural absence, not evidence of novelty (#7734's own distinction). So
+#     a guard-step id is admitted into the candidate set ONLY when
+#     `main_measured_files` holds no row for its UNIT — the SAME derivation
+#     `repro_candidates` applies at its FILE level, so the scope and the
+#     clearance cannot disagree.
+#     ⛔ WHAT THE CONDITION FORBIDS: it never admits a guard-step id whose step
+#     main's baseline DID measure. There main HAS evaluated the unit, its
+#     absence from the failure set is a measurement (MEASURED-ABSENT), and
+#     reading it as "the base holds no record" would let a REAL failure be filed
+#     as unmeasurable — the widening direction that turns a block into a
+#     misdiagnosis. An EMPTY or unreadable baseline admits nothing either, and
+#     that is a deliberate refusal, not an oversight: a failure-only baseline
+#     that is empty cannot tell "main is GREEN" from "main has no run at all"
+#     (#7734), so this function cannot assert the base holds no record on it.
+#     The id then keeps the pre-change exclusion — fail closed.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
 #     `bash-shard::<path>` #2643, `runner::<job>`,
@@ -6690,17 +6762,36 @@ intersect_sets() {
 #     NAME, never measurements a local run can clear (#3715 review, P2).
 # Return contract: 0 = computed (out may be empty) · 1 = could not compute.
 repro_scope() {
-  local residual="$1" unattrib="$2" out="$3" scratch="$4" nid
+  local residual="$1" unattrib="$2" out="$3" scratch="$4" mainfails="${5:-}" nid ukey main_units=""
   if [ -s "$unattrib" ]; then
     run_failure_set --diff "$residual" "$unattrib" > "$scratch" 2>/dev/null || return 1
   else
     cp "$residual" "$scratch" || return 1
   fi
+  # THE BASE-SIDE RECORD, through the ONE derivation `repro_candidates` uses. An
+  # absent or EMPTY baseline leaves this empty, which ADMITS NOTHING below: a
+  # failure-only baseline that is empty cannot tell "main is green" from "main
+  # has no run", so "the base holds no record of this unit" is not a claim this
+  # function can make from it (fail closed — the pre-change exclusion stands).
+  if [ -n "$mainfails" ] && [ -s "$mainfails" ]; then
+    main_units="$(main_measured_files "$mainfails")"
+  fi
   : > "$out"
   while IFS= read -r nid; do
     [ -n "$nid" ] || continue
     case "$nid" in
-      guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
+      guard-step::*)
+        # #1185: admissible ONLY when the base's record is POSITIVELY readable and
+        # holds no row for the id's UNIT. An empty record admits nothing.
+        ukey="$(failure_file_key "$nid")"
+        if [ -z "$main_units" ]; then
+          continue
+        fi
+        if grep -qxF -- "$ukey" <<<"$main_units" 2>/dev/null; then
+          continue
+        fi
+        ;;
+      collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
       bash-shard::*|runner::*|pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
@@ -8237,7 +8328,7 @@ main() {
     # (step 2). An id WITH a row stays refused no matter what the base does.
     local cand="$TMP/repro-candidates.txt"
     if ! repro_scope "$TMP/unique.txt" "$TMP/unique.unattributable" \
-         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" \
+         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" "$TMP/main-fails.txt" \
        || ! repro_candidates "$TMP/repro-scope.txt" "$TMP/main-fails.txt" "$cand" \
          "$TMP/repro-idlevel.txt" "$TMP/main-files.txt"; then
       repro_line="Reproduction on base: attempted on base $repro_base; the candidate set could not be computed through the shared parser — the refusal stands (fail closed)"
@@ -8247,12 +8338,25 @@ main() {
       # carries a main-side measurement, or every id's FILE is measured on main
       # (MEASURED-ABSENT). Naming the wrong one would be a false report.
       if [ ! -s "$TMP/repro-scope.txt" ]; then
-        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job) — the refusal stands"
+        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job). A guard-step is NOT in this class only when it is not UNATTRIBUTABLE (that arm wins first) AND main's baseline was READ, is non-empty, and holds no row for its step (#1185) — then it reaches the candidate set and is reported there; an EMPTY or unreadable baseline keeps it in THIS class, because a failure-only baseline cannot tell 'main is green' from 'main has no run' (#7734). The refusal stands"
       elif [ ! -s "$TMP/repro-idlevel.txt" ]; then
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to carries a main-side measurement, so there is no missing measurement to construct — the refusal stands"
       else
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to sits in a FILE main's baseline measured (MEASURED-ABSENT), which is evidence of novelty — the refusal stands"
       fi
+    elif ! grep -Eqv "$NON_LOCAL_REPRO_ID_RE" "$cand" 2>/dev/null; then
+      # #1185: THE CANDIDATE SET NAMES NO ID A LOCAL RUN COULD EXECUTE. The scope
+      # admitted such an id because `main_measured_files` carries no row for its
+      # unit, and no local runner can execute it — so NOTHING WAS ATTEMPTED, and
+      # the honest report is the fact that made it unmeasurable rather than "the
+      # reproduction could not RUN" (it never ran because it was never runnable).
+      # The message names NO family on purpose: the admission is `repro_scope`'s
+      # case arms, the report's classifier is `NON_LOCAL_REPRO_ID_RE`, and a
+      # family added to one and not the other must not produce a message that
+      # asserts WHICH family the operator is looking at.
+      # NOTHING IS CLEARED: the failure is on this head, and the refusal stands
+      # exactly as before.
+      repro_line="Reproduction on base: NOT attempted on base $repro_base — no candidate names an id a LOCAL run could execute, and the base's failure baseline holds no row for their units, so neither a local reproduction nor main's rate table can speak to them. The refusal stands"
     elif ! is_full_sha "$repro_base"; then
       # A REF NAME is not a pinned base. `check_surface_probe` falls back to the
       # REF when the commits API cannot resolve a SHA, and `git worktree add main`
