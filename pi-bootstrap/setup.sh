@@ -6,11 +6,17 @@
 # in place (content-merge), so repo updates flow to the live install and local
 # extras survive. Never deletes anything outside ~/.pi/agent.
 #
-# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly two things: a legacy $DEST/tools/fleet/
-# (#1277, a pi boot-blocker) and the farm artifacts DECLARED in
+# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly three things: a legacy $DEST/tools/fleet/
+# (#1277, a pi boot-blocker), the farm artifacts DECLARED in
 # pi-bootstrap/farm-retired.txt (#1924 — a retired script must stop existing on the
-# machines, not just stop being delivered). Nothing else is ever removed; a local extra
-# that is not declared retired is kept.
+# machines, not just stop being delivered), and the `exa` server entry in
+# $DEST/.mcp.json (owner ruling 2026-10-31, reversing #419: the merge is
+# `{**dst, **src}`, so dropping `exa` from the template alone would leave every
+# already-provisioned machine loading it). Nothing else is ever removed; a local extra
+# that is not declared retired is kept — `exa` is removed because it was a BASE server
+# being retired, not a local extra. NOTE the pop keys on the NAME only: a machine whose
+# `.mcp.json` carries a hand-rolled server the operator happened to name `exa` will be
+# de-configured too, which is why it is listed here rather than happening quietly.
 # ============================================================
 set -euo pipefail
 
@@ -88,6 +94,18 @@ src = json.load(open(sys.argv[1]))
 dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
 src_servers = src.get("mcpServers", {})
 dst_servers = dst.get("mcpServers", {})
+# ⛔ THE ONE DELIBERATE EXCEPTION TO "local extras preserved" (#419 reversed by the
+# owner, 2026-10-31: "exa should be uninstalled because I never wanted it. external
+# research should be perplexity"). `exa` is NOT a local extra to carry forward — it
+# was a BASE server, and the merge below is `{**dst_servers, **src_servers}`, which
+# preserves any key that already exists in dst. So dropping it from the TEMPLATE
+# alone would leave every ALREADY-PROVISIONED machine still loading it: the new
+# template wins on the keys it still has, and exa is not one of them, so dst's copy
+# is what survives. That is the opposite of what the operator expects from a
+# bring-up, and it is invisible (the merge prints "local extras preserved" either
+# way). This pop IS the migration.
+if dst_servers.pop("exa", None) is not None:
+    print("    exa removed from .mcp.json (owner ruling 2026-10-31 — uninstalled, not configured)")
 merged = {**dst, **src, "mcpServers": {**dst_servers, **src_servers}}
 json.dump(merged, open(sys.argv[2], "w"), indent=2)
 print("    .mcp.json merged (base servers win; local extras preserved)")

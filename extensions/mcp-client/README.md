@@ -92,7 +92,13 @@ stops the server, the next tool call transparently reconnects it.
 
 ## Pre-loaded core
 
-`tortoise` (memory graph) is the only always-eager core server. `exa` (semantic search) was demoted to lazy (#419) — Perplexity is the primary search source; Exa loads on demand via `mcp_load` for semantic/scholarly/entity discovery. `tortoise` is launched
+`tortoise` (memory graph) is the only always-eager core server; every other base
+server is lazy (`mcp_load` on demand). **There is no `exa`** — it was uninstalled by
+owner ruling (2026-10-31: *"exa should be uninstalled because I never wanted it.
+external research should be perplexity"*), which reverses #419's "demote to lazy"
+arrangement. External search is Perplexity: the `seo-intelligence` MCP server
+(`perplexity_research` / `perplexity_search`, rung 1) or the built-in `web_search`
+tool (rung 2). `tortoise` is launched
 with `${TORTOISE_HOME}/.venv/bin/python3` (the venv has `fastmcp`; global
 python3 does not).
 
