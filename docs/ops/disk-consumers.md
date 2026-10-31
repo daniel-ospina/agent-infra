@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-10-27
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-2159, issue-1852, issue-9672, issue-2542, issue-1939, disk-reclaim, /tmp-consumers, uv-cache, lane-scratch, ci-runners, cell-home
+aboutObjects: agent-infra, issue-2159, issue-1852, issue-9672, issue-2542, issue-1939, issue-3043, disk-reclaim, /tmp-consumers, uv-cache, lane-scratch, ci-runners, runner-work, cell-home
 ---
 
 # What actually fills a cloud cell — measured
@@ -65,8 +65,58 @@ venv, every review/mutation scratch copy, and the uv cache, and nothing sweeps i
 | `/var` | 765 MB | journal 96 MB | — | — |
 | `/tmp/actions-runner` | 28 KB | leftover empty `tortoise-cell4-1`; the farm moved to `/opt` here | — | — |
 
-### What a "5 GB venv" actually is
+### The runner `_work` sink — measured on cell c1, 2026-10-28 (a THIRD cell, at 98%)
 
+The two cells above were diagnosed on 2026-10-27. The next day a third cell hit the wall with a bucket
+neither of them led us to, and **no class in `scripts/disk-reaper.sh` matched it**:
+
+| cell | vm id | `df -m /` | the sink | `_work` per runner |
+|---|---|---|---|---|
+| c1 | `vm-efa6cc8fdb974e61b5c054acf41d8846` (8 cores, **12 runners**) | **98% used, 3.5 G free** | `/opt/gh-runner-x64-{2,4,5,6,7,8}/_work` = **19 G** | 2.6 G – 4.7 G |
+
+**Why it accumulates.** A GitHub Actions runner cleans its own `_work/<entry>` **only on a NORMAL job
+end**. A job that is cancelled, crashes, or is OOM-killed leaves its full checkout behind, and nothing
+on the box ever revisits it. Six of c1's twelve runners held 19 G of exactly that.
+
+**Why it had no owner.** Runner `_work` is not a package cache (`uv`), not a lane env (`venv`), not a
+checkout of a repo we track (`worktree`), and not a duplicate install (`duplicate-install`) — so the
+hourly pass was green while 19 G of the box sat in none of its classes. The **structural** reason is
+that `scripts/disk-reaper-run.sh` had ZERO coverage of `gh-runner`/`_work` (grep proves it), so a box
+that GAINED five runners in a week silently lost its headroom and nothing measured it.
+
+**The policy, now `class=runner-work`** (`scripts/reap-runner-work.sh`, owner; the class in
+`scripts/disk-reaper.sh` only runs and accounts for it):
+
+* discovery is a bounded, documented glob list: `/opt/gh-runner*/_work`, `$HOME/actions-runner*/_work`,
+  `/tmp/actions-runner*/_work` (`DISK_REAPER_RUNNER_GLOBS`);
+* **the gate is mtime over the entry and its content**: an entry is a candidate only when **nothing in
+  it has been written for longer than `DISK_REAPER_RUNNER_MIN_AGE`** (default 3600 s), the entry's own
+  top directory included — the conservative direction, since any write there restores the floor. The
+  in-entry witness is the checkout's OWN writes; `_work/_temp` (step scripts, command logs) is a SIBLING
+  of `_work/<repo>` at the runner root (`actions/runner` `WellKnownDirectory`), so writes there do not
+  refresh the checkout's floor. So mtime is a positive proof of death for that entry; there is no local
+  busy-check on a runner to
+  consult, and a `pgrep`-shaped guess would keep every dead entry while ANY runner is idle. ⚠️ Residual:
+  a job that writes NOTHING inside its checkout for longer than the floor is indistinguishable from a
+  dead entry by that test — a whole-job exposure for a job whose artefacts land in `$TMPDIR`,
+  `~/.cache` or `_work/_temp`, not just one quiet step. Raise the floor for such a box
+  (`DISK_REAPER_RUNNER_MIN_AGE=7200`, the only empirically validated value; the shipped default is
+  3600 s), which is
+  the intended response;
+* **`_work/_tool` and `_work/_actions` are DELIBERATELY RETAINED**: they are the runner's cross-job
+  caches (downloaded actions, fetched toolchains), so reaping them does not free dead checkout — it
+  forces a re-download on the NEXT job and makes every later CI run slower. That is a different trade
+  from this class's, so they are excluded before anything is measured and counted (`retained=`);
+* the hand reap that validated it (delete `_work` entries whose newest content was older than 120 min)
+  took c1 **98% → 90% without disturbing a single running job**.
+
+⛔ **The other sink on the same box is NOT this class.** c1's `/tmp` held **148 826 entries older than
+24 h ≈ 15 G** (and c4's `/tmp` measured **48 G**). That population needs its own class and it is harder:
+a live lane's cwd can BE under `/tmp` (measured: a running `pi` lane cwd'd in
+`/tmp/cell-t3/.worktrees/…`), so an mtime floor alone is not sufficient evidence. Filed as **#3043**,
+not fixed here.
+
+### What a "5 GB venv" actually is
 `du -xsh` inside `/tmp/cell-t3/.venv` (cell 4) and `/tmp/cell-t3/.worktrees/fix-10021/.venv`
 (cell 3) — both 5.7 GB, identically shaped:
 
@@ -215,6 +265,22 @@ FAIL-CLOSED abort: PR-state gate unverifiable for /tmp/cell-ai
 (#1939). Fail-closed is right; the cost is one lost window per occurrence, and the exit 3 paints the
 unit red on a healthy box (#2036 territory).
 
+### G8 — the runner `_work` sink was in NO class at all (**fixed**: `class=runner-work`)
+Measured on c1 the next day (see *The runner `_work` sink* above): **19 G** in six
+`/opt/gh-runner-x64-*/_work` directories, on a box at **98 % used, 3.5 G free**, with the hourly pass
+reporting healthy. `scripts/disk-reaper-run.sh` had zero coverage of `gh-runner`/`_work`, so the sink
+was unmeasurable by construction. Shipped as `class=runner-work` + `scripts/reap-runner-work.sh`
+(owner), with the mtime gate and the `_tool`/`_actions` carve-out; its suite fails against the
+pre-change tree (4 passed / 13 failed) and kills all nine of its mutants
+(`scripts/disk-reaper-runner-work.test.sh`).
+
+### G9 — the stale `/tmp` sink (filed as **#3043**, deliberately NOT fixed with G8)
+c1's `/tmp` held **148 826 entries older than 24 h ≈ 15 G**; c4's `/tmp` measured **48 G**. It is not
+the same trade as G8: a live lane's cwd can be under `/tmp` (measured, a running `pi` lane cwd'd in
+`/tmp/cell-t3/.worktrees/…`), and a scratch copy is the only artifact of an unfinished review, so
+nothing can prove it landed (this doc's G2 and `docs/ops/disk-reaper.md`'s rule 6). It needs a liveness
+witness plus an owner ruling on what scratch counts as evidence — see **#3043**.
+
 ## Age distribution — the disk is a rolling 7-day window, not a rot
 
 Top 250 `/tmp` children, summed by directory mtime (covers ~71 GB of cell 3's 86 GB, ~58 GB of cell 4's 69 GB):
@@ -345,7 +411,9 @@ diagnosis only. What a follow-up PR would touch, per finding:
 | **G1** `/home/cmux/tortoise` outside `DISK_REAPER_REPOS` | nothing in code — an installer argument. `install-disk-reaper-timer.sh --repo` on each cell, then verify `classes=` and the worktree census in the next pass. |
 | **G2** lane-scratch population unbounded | a decision, not a patch: replacing `systemd-tmpfiles`' 30 d with an aged class needs an owner ruling on what scratch counts as evidence. Out of scope by design (see the two rules in `docs/ops/disk-reaper.md`). |
 | **G3** uv bound unclaimable on a busy cell | `scripts/pi-cache-reap.sh` — a deferral that recurs on N consecutive passes cannot stay a silent `deferral`; it needs a named escalation (raise the bound deliberately, or report `bound-unclaimed-for=…` in the status record) plus a test. Two-arm change, not one line. |
-| **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:522`) already names both delegates, so the list is not the defect. Needs its own test. |
+| **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:556`) already names both delegates, so the list is not the defect. Needs its own test. |
+| **G8** the runner `_work` sink had no class | **shipped** (2026-10-28): `scripts/reap-runner-work.sh` + `class=runner-work` in `scripts/disk-reaper.sh`, pinned in both scheduled artifacts and in the farm list. A class an operator has to remember to enable is the hole it closes, so it is in the DEFAULT `--only` list — and its globs are in `DISK_REAPER_RUNNER_GLOBS`, so an explicit-but-unmatched layout is a refusal rather than a measured zero. |
+| **G9** stale `/tmp` has no class | filed as **#3043** — a liveness witness (`scripts/lib/live-paths.sh`) per candidate, an owner ruling on what scratch counts as evidence, and an exclusion set that is not a name list. |
 | **G5** `/tmp` swept only at 30 d | policy (`/etc/tmpfiles.d/`), one owner decision; no repo change. |
 | **G6** cell 4's `cell-reclaim.service` failing since 02:09 | not yet diagnosed — the message (`no PR surface readable`) is *correct* fail-closed behaviour; the open question is why that read fails while `gh pr list` succeeds from the same `HOME`. Needs a read-only repro before any patch. |
 | **G7** one transient `gh` failure costs a repo's pass | `#2036` territory (exit-code semantics already split); the recoverable half is a bounded retry inside `pi-reap-worktrees.sh`'s gh probe, with a test that a second failure still fails closed. |
