@@ -5176,8 +5176,12 @@ def run_pass(args, rubric_note: str = "") -> int:
              "merge=%d" % _r1,
              "fix=%d" % _r2,
              "wait=%d" % _r3]
+    # ⛔ ONE LABEL, ONE QUANTITY (review P2, 2026-10-31). This term is the ASK-USER count ALONE; the
+    # "nothing dispatchable" arm below prints `_r3 + _held`. Naming both `held=` emitted
+    # `wait=1 held=1 ... nothing dispatchable -- held=2` in ONE line -- no double-count (the keys are
+    # disjoint) but an ambiguous report, which is the same defect class this block exists to remove.
     if _held:
-        _casc.append("held=%d" % _held)
+        _casc.append("surface=%d" % _held)
     _casc.append("slots=%d" % budgets["total"])
     # ⛔ NO ARM ASSERTS A DISPATCH IT HAS NOT MADE (review P2). `budgets["total"]` is an AGGREGATE
     # (`fix + review`) while the loop spends PER CLASS, and a PR can still be refused for a live
@@ -5186,31 +5190,39 @@ def run_pass(args, rubric_note: str = "") -> int:
     # ⛔ AND THE AGGREGATE ALONE IS NOT EVEN "A SLOT IS AVAILABLE" (review P1, 2026-10-31). TWO
     # further facts decide a row AFTER this line prints, and both made the old arms LIE:
     #   * the COOLDOWN/`covered` arm -- `if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S
-    #     and prev.get("head") == p["headRefOid"]:` (`:5518`, cited by TEXT because the number drifts)
-    #     removes a row dispatched on the previous pass at the same head, while `counts` -- built
-    #     from `classified` ABOVE that arm -- still counts it. In steady state nearly every pass
-    #     claimed a handoff with `dispatched 0` on the line immediately below.
-    #   * the PER-CLASS gate -- `if spent[cls] >= budgets[cls]:` (`:5587`, same reason for the text
-    #     citation) refuses a row the aggregate total still admits: rung 1 IS
-    #     `ACTION_CLASS["call-rail"] == "review"` (`:1222`), so a zero REVIEW budget with fix slots
-    #     free refuses it while `budgets["total"]` still reads > 0.
+    #     and prev.get("head") == p["headRefOid"]:` removes a row dispatched on the previous pass at the
+    #     same head, while `counts` -- built from `classified` ABOVE that arm -- still counts it. In
+    #     steady state nearly every pass claimed a handoff with `dispatched 0` on the line below.
+    #   * the PER-CLASS gate -- `if spent[cls] >= budgets[cls]:` -- refuses a row the aggregate total
+    #     still admits: rung 1 IS `ACTION_CLASS["call-rail"] == "review"` (`:1222`), so a zero REVIEW
+    #     budget with fix slots free refuses it while `budgets["total"]` still reads > 0.
+    # ⛔ AND NEITHER AGGREGATE NOR CLASS ALONE IS "A SLOT EXISTS" (review P1, round 3). The loop ALSO
+    # breaks on `dispatched >= budgets["total"]`, and `pass_budgets` sets
+    # `out["total"] = min(out["total"], max(0, total_override))` (`:1540`) while leaving
+    # `out["fix"]`/`out["review"]` at their own values -- so `--max 0` (a documented operator flag,
+    # `:4715`) yields `{'fix': 3, 'review': 3, 'total': 0}` and the arms printed
+    # `slots=0 merge->candidate (2), the rail decides; review slots=3` while dispatching nothing.
+    # The binding number is `min(budgets[cls], budgets["total"])`, and that is what is printed.
     # So no arm says "handed"/"dispatched"/"eligible": every one names a CANDIDATE count and the
-    # class budget that would serve it. "Candidate" is the only claim this line can keep, because
+    # EFFECTIVE slots that could serve it. "Candidate" is the only claim this line can keep, because
     # cooldown and liveness are decided below it. `dispatched`/`_finish` remain the only source of
     # what actually went out.
     _noslot = ("no available slot: inflight=%d alive=%d unproven=%d"
                % (budgets["inflight"], budgets["alive"], budgets["unknown"]))
+    # THE EFFECTIVE SLOTS ARE THE BINDING ONE: the loop breaks on the aggregate AND refuses per class.
+    def _eff(_c):
+        return min(budgets[_c], budgets["total"])
     if _r1:
-        _casc.append("merge->candidate (%d), the rail decides; review slots=%d"
-                     % (_r1, budgets["review"])
-                     if budgets["review"] > 0
-                     else "merge->NO SLOT (review budget 0: %s)" % _noslot)
+        _e = _eff("review")
+        _casc.append("merge->candidate (%d), the rail decides; review slots=%d" % (_r1, _e)
+                     if _e > 0 else "merge->NO SLOT (review budget 0: %s)" % _noslot)
     for _cls in ("fix", "review"):
         _n = _r2_by_class.get(_cls, 0)
         if not _n:
             continue
-        _casc.append("%s->candidate (%d), %s slots=%d" % (_cls, _n, _cls, budgets[_cls])
-                     if budgets[_cls] > 0
+        _e = _eff(_cls)
+        _casc.append("%s->candidate (%d), %s slots=%d" % (_cls, _n, _cls, _e)
+                     if _e > 0
                      else "%s->NO SLOT (%s budget 0: %s)" % (_cls, _cls, _noslot))
     # ⛔ "NOTHING TO DISPATCH" IS A CLAIM ABOUT THE WHOLE QUEUE, NOT ABOUT TWO RUNGS (found by the
     # new pin, 2026-10-31). The arm fired on `not _r1 and not _r2` alone, so once `wait=` was made

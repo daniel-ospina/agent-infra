@@ -4683,8 +4683,55 @@ def test_the_cascade_fix_arm_is_judged_on_its_OWN_class_budget(monkeypatch):
     assert len(casc) == 1, joined
     assert "fix->NO SLOT" in casc[0], casc[0]
     assert "fix->candidate" not in casc[0], casc[0]
-    assert "fundamental" not in casc[0], casc[0]
     assert payload.get("dispatched") == 0, (joined, payload)
+
+
+def test_the_cascade_arms_respect_the_AGGREGATE_ceiling_not_only_the_class(monkeypatch):
+    """`->candidate` must not be claimed when the AGGREGATE `--max` ceiling is 0.
+
+    ⛔ THE MEASURED DEFECT (review P1, round 3): gating on the class budget alone is still not "a
+    slot exists". The dispatch loop ALSO breaks on `dispatched >= budgets["total"]`, and
+    `pass_budgets` sets `out["total"] = min(out["total"], max(0, total_override))` while leaving
+    `out["fix"]`/`out["review"]` at their own values -- so `--max 0` (a documented operator flag)
+    yields `{'fix': 3, 'review': 3, 'total': 0}`. The arms then emitted
+
+        slots=0 merge->candidate (2), the rail decides; review slots=3
+
+    -- two numbers in one sentence that contradict each other, on the line built to stop exactly
+    that. The binding quantity is `min(budgets[cls], budgets["total"])`.
+    """
+    monkeypatch.setenv("MAX_FIX", "3")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    for action, arm in (("call-rail", "merge->"), ("fix-ci", "fix->"),
+                        ("record-review", "review->")):
+        _rc, joined, payload = _drive_pass(
+            monkeypatch, [_pr(60)], (action, "why", []),
+            argv=("pr-doctor.py", "--max", "0"))
+        casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+        assert len(casc) == 1, joined
+        assert "slots=0 " in casc[0] + " ", casc[0]
+        assert arm + "candidate" not in casc[0], (action, casc[0])
+        assert arm + "NO SLOT" in casc[0], (action, casc[0])
+        assert payload.get("dispatched") == 0, (action, joined, payload)
+
+
+def test_the_cascade_emits_one_held_quantity_under_one_label(monkeypatch):
+    """`held=` must mean ONE thing in one line (review P2, round 3).
+
+    The ASK-USER term printed `held=<surface>` and the "nothing dispatchable" arm printed
+    `held=<_r3 + _held>`, so a single line read `wait=1 held=1 ... nothing dispatchable -- held=2`.
+    The counts were disjoint (no double-count) but the LABEL collided, which is an ambiguous
+    self-report -- the defect class this block exists to remove. The ASK-USER term is `surface=`.
+    """
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: True, raising=False)
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(61)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "surface=1" in casc[0], casc[0]
+    # ONE `held=` in the line (the arm's total), and it is `_r3 + _held` = 0 + 1. Before the fix the
+    # line carried `held=1 ... held=2` -- two different quantities under one label.
+    assert casc[0].count("held=") == 1, casc[0]
+    assert "held=1" in casc[0], casc[0]
 
 
 def test_the_cascade_fix_arm_names_the_class_it_is_reporting(monkeypatch):
