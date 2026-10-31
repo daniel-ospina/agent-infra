@@ -177,6 +177,42 @@ chk "C1 rc 3 (REFUSED)" '[ "$RC" -eq 3 ]'
 chk "C2 the refusal names the persisted layout" 'case "$OUT" in *"persisted workspace layout"*) true;; *) false;; esac'
 chk "C3 nothing was written" '[ ! -e "$ROSTER" ]'
 
+# ⛔ #3032 HIGH: an UNREADABLE layout is not an ABSENT one. `cmux_layout_store` decided presence with
+# `os.path.isfile`, which is False for EACCES on the file OR ANY ANCESTOR, for ELOOP, and for a
+# layout path that is a directory — so "I could not read it" collapsed into "there is none", control
+# reached the `not-applicable` arm, and a zero-row roster was WRITTEN with rc 0 while the box's real
+# cmux lanes were dropped from the population. Reproduced on the pre-fix tree both ways below.
+echo
+echo "== C2. REFUSED: a layout that EXISTS but cannot be READ is not an absent one (#3032 HIGH) =="
+mk_case layoutdir; mk_stub 1 junk
+# a DIRECTORY at the layout path: deterministic on every platform and as every user, no chmod.
+mkdir -p "$CASE/home/Library/Application Support/cmux/session-com.cmuxterm.app.json"
+tmux_path
+run_it --apply
+chk "C4 an UNREADABLE layout refuses (rc 3) instead of writing a zero-row roster (#3032 HIGH)" \
+    '[ "$RC" -eq 3 ]'
+chk "C5 …and it says the layout could not be READ, not that none was ever persisted" \
+    'case "$OUT" in *"could NOT BE READ"*) true;; *) false;; esac'
+chk "C6 …and NOTHING was written (this is the fail-open the finding pins)" '[ ! -e "$ROSTER" ]'
+
+# The reviewer's exact repro: the layout FILE exists, its directory is `chmod 000`, so `isfile`
+# answered False and the pre-fix tree called it "never persisted". Guarded: running as root, or on a
+# filesystem that does not enforce the mode, cannot produce EACCES and would make this vacuous.
+mk_case layouteacces; mk_stub 1 junk; tmux_path
+mkdir -p "$CASE/home/Library/Application Support/cmux"
+: > "$CASE/home/Library/Application Support/cmux/session-com.cmuxterm.app.json"
+chmod 000 "$CASE/home/Library/Application Support/cmux"
+if [ "$(id -u)" -eq 0 ]; then
+  printf 'skip C7 (running as root: EACCES is not enforceable)\n'
+elif [ -r "$CASE/home/Library/Application Support/cmux" ] || [ -x "$CASE/home/Library/Application Support/cmux" ]; then
+  printf 'skip C7 (this filesystem does not enforce the 000 mode)\n'
+else
+  run_it --apply
+  chk "C7 EACCES on the layout's DIRECTORY refuses (rc 3), not 'never persisted' (#3032 HIGH)" \
+      '[ "$RC" -eq 3 ] && [ ! -e "$ROSTER" ] && case "$OUT" in *"could NOT BE READ"*) true;; *) false;; esac'
+fi
+chmod 755 "$CASE/home/Library/Application Support/cmux"
+
 echo
 echo "== D. NOT-APPLICABLE: no daemon, no layout, tmux — the truthful roster is ZERO ROWS =="
 mk_case cell; mk_stub 1 junk; tmux_path
@@ -410,8 +446,45 @@ chk "G4 the bring-up's rc-3 arm WARNS, and never dies (a die would false-block e
     'grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" > "$T/g4.seg" 2>/dev/null; grep -q "warn " "$T/g4.seg" && ! grep -q "die " "$T/g4.seg"'
 chk "G5 the supervisor's rc-3 arm WARNS, and never dies" \
     'grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" > "$T/g5.seg" 2>/dev/null; grep -q "log_line \"warn" "$T/g5.seg" && ! grep -q "die " "$T/g5.seg"'
-chk "G6 rc 3 and the crash arm NEVER print the ok line (only the rc-0 arm is 'provisioned')" \
-    'grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" > "$T/g6a.seg" 2>/dev/null; grep -A3 "rvrc\" -ne 0" "$ROOT/scripts/cloud-cell-supervisor.sh" > "$T/g6b.seg" 2>/dev/null; ! grep -q "ok: lane roster" "$T/g6a.seg" && ! grep -q "ok: lane roster" "$T/g6b.seg"'
+# ⛔ #3032 HIGH: G6 COULD NOT FAIL. Its two `grep -A3` windows (`"rvrc\" -eq 3"`, `"rvrc\" -ne 0"`)
+# ended above the ok line, so both `! grep -q "ok: lane roster"` halves were unconditionally true, and
+# the bring-up's arm was asserted nowhere. MEASURED: mutating `elif [ "$rvrc" -ne 0 ]` and
+# `elif [ "$provrc" -ne 0 ]` to `elif false` left the suite at 76 passed / 0 failed — i.e. the
+# crash-vs-provision polarity, the one thing review finding 2 existed to fix, had no coverage.
+# A `grep -A<N>` window is a guess about distance; the arm is now REPLAYED: the real if/elif/else
+# block is extracted from the shipped file and EXECUTED against a forced rc with the file's own
+# warn/log_line/ok stubbed. `elif false` then prints the ok line for rc 1 and the arm reddens.
+arm_block() { # arm_block <file> <var> — print the shipped rc-dispatch block, verbatim
+  awk -v needle="if [ \"\$$2\" -eq 3 ]; then" '
+    index($0, needle) { on = 1 }
+    on { print }
+    on && /^[[:space:]]*fi[[:space:]]*$/ { exit }
+  ' "$1"
+}
+run_arm() { # run_arm <file> <var> <rc> — replay that block with the rc forced
+  local f="$1" var="$2" rc="$3" snip="$T/arm.$2.$3.sh"
+  arm_block "$f" "$var" > "$snip"
+  [ -s "$snip" ] || { printf 'ARM NOT FOUND\n'; return 9; }
+  (
+    log_line() { printf 'LL %s\n' "$*"; }
+    warn()     { printf 'W  %s\n' "$*"; }
+    ok()       { printf 'OK %s\n' "$*"; }
+    eval "$var=$rc"
+    . "$snip"
+  )
+}
+chk "G6 the supervisor's rc-1 CRASH arm warns and NEVER claims 'provisioned' (#3032 HIGH)" \
+    'run_arm "$ROOT/scripts/cloud-cell-supervisor.sh" rvrc 1 > "$T/g6.out"; grep -q "FAILED" "$T/g6.out" && ! grep -q "ok: lane roster" "$T/g6.out"'
+chk "G6b …and its rc-0 arm DOES print the ok line (so G6 cannot pass by printing nothing)" \
+    'run_arm "$ROOT/scripts/cloud-cell-supervisor.sh" rvrc 0 > "$T/g6b.out"; grep -q "ok: lane roster" "$T/g6b.out"'
+chk "G6c …and its rc-3 arm never claims 'provisioned' either" \
+    'run_arm "$ROOT/scripts/cloud-cell-supervisor.sh" rvrc 3 > "$T/g6c.out"; ! grep -q "ok: lane roster" "$T/g6c.out"'
+chk "G7 the BRING-UP's rc-1 CRASH arm warns and never claims a roster (#3032 HIGH)" \
+    'run_arm "$ROOT/scripts/cloud-cell-bringup.sh" provrc 1 > "$T/g7.out"; grep -q "FAILED" "$T/g7.out" && ! grep -q "lane roster: this box" "$T/g7.out"'
+chk "G7b …and its rc-0 arm DOES print its ok line" \
+    'run_arm "$ROOT/scripts/cloud-cell-bringup.sh" provrc 0 > "$T/g7b.out"; grep -q "lane roster: this box" "$T/g7b.out"'
+chk "G7c …and its rc-3 arm never claims a roster" \
+    'run_arm "$ROOT/scripts/cloud-cell-bringup.sh" provrc 3 > "$T/g7c.out"; ! grep -q "lane roster: this box" "$T/g7c.out"'
 chk "G3 this suite is WIRED into the shard list (an unwired suite reds bash-suites by design)" \
     'bash "$ROOT/scripts/run-bash-shards.sh" --list | grep -qx "scripts/orchestrator-harness/provision-lane-registry.test.sh"'
 
