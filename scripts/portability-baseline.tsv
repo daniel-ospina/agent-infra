@@ -1,0 +1,106 @@
+# scripts/portability-baseline.tsv — grandfathered cross-platform findings
+#
+# WHY A BASELINE AND NOT A FIX: every entry below is a PRE-EXISTING trap on this tree. The
+# check still reports each one (run with --no-baseline), and a NEW trap — a new instance of a
+# baselined rule raising a file count, or a rule/file not listed at all — FAILS.
+#
+# ⛔ WHAT THIS FILE DOES NOT DO: a count may FALL freely and the gate stays green, so a
+# SCAN LOSS (a span that stopped being read) is grandfathered too until the row is re-emitted.
+# A fall is therefore not proof of a fix. Re-emit after any change to the scanner.
+#
+# FORMAT: <path>\t<rule>\t<count>\t<justification — REQUIRED>
+# Rewrite with: bash scripts/check-portability-traps.sh --emit-baseline
+# The 4th column is REQUIRED: an entry with no justification is reported as a finding.
+# A count may FALL freely; it may not RISE (a rise is a new trap, and it reds).
+scripts/ci_runner_pool.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/ci_runner_pool.test.sh	timeout-absent-on-macos	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/cleanup-stale-branches.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/cloud-cell-bringup.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/cloud-cell-bringup.sh	timeout-absent-on-macos	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/cloud-cell-quiesce.sh	procfs-macos-absent	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/cloud-cell-supervisor.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/cloud-cell-supervisor.sh	stat-c-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/cloud-cell-supervisor.test.sh	date-d-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/cloud-cell-supervisor.test.sh	procfs-macos-absent	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/conflict-rebase-timer.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/conflict-rebase-timer.sh	setsid-absent-on-macos	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no `setsid` binary — `( … ) &` or python3 `os.setsid`, or the sweep's portable detach
+scripts/conflict-rebase.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/daily-backup.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/disk-reaper-classes.test.sh	free-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS: `vm_stat`; portable: the `box_*` memory probe
+scripts/disk-reaper-classes.test.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/disk-reaper.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/disk-reaper.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/fleet-schedule.test.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/gh-shim/gh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/harness-unit.test.sh	date-d-gnu	4	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/harness-up	procfs-macos-absent	4	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/harness-up	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/install-controller-service.sh	readlink-f-bsd-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is `cd "$(dirname f)" && pwd -P` (or a box.sh helper added for it)
+scripts/install-controller-service.sh	stat-c-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/install-controller-service.test.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/install-controller-service.test.sh	stat-c-gnu	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/install-controller-service.test.sh	timeout-absent-on-macos	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/install-launchd.test.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/install-repair-service.sh	bash4-mapfile	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is bash 3.2 has neither — `while IFS= read -r line; do …; done`
+scripts/install-repair-service.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/lib/box.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/lib/box.sh	sed-in-place-bsd	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is same: `sed -i.bak … && rm`, or `box_sed_i`
+scripts/lib/box.sh	sed-in-place-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is `sed -i.bak -e … && rm -f f.bak` (portable to BOTH), or `box_sed_i` (scripts/lib/box.sh)
+scripts/lib/box.sh	stat-c-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/lib/box.test.sh	sed-in-place-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is `sed -i.bak -e … && rm -f f.bak` (portable to BOTH), or `box_sed_i` (scripts/lib/box.sh)
+scripts/lib/fleet-inventory.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-bringup.sh	stat-c-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-harness/ai-drainer.sh	cpu-count-single-mechanism	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is `box_ncpu` (scripts/lib/box.sh) — it probes all three and reports which answered
+scripts/orchestrator-harness/ai-drainer.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/box-status.sh	bash4-mapfile	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is bash 3.2 has neither — `while IFS= read -r line; do …; done`
+scripts/orchestrator-harness/box-status.sh	procfs-macos-absent	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/capacity.sh	procfs-macos-absent	9	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/chain-merge.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-harness/cloud-cell-doctor.hardening.test.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/cloud-cell-doctor.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/cloud-cell-doctor.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-harness/cloud-cell-doctor.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/cloud-cell-doctor.test.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/cloud-cell-doctor.test.sh	timeout-absent-on-macos	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/orchestrator-harness/deploy-harness.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-harness/gh-limit.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/gh-limit.test.sh	timeout-absent-on-macos	4	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/orchestrator-harness/heartbeat-lock.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/lander.test.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/lane-container-reap.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/lane-merge.test.sh	timeout-absent-on-macos	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/orchestrator-harness/lane-reap.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-harness/live-ownership.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/merge-rate.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-harness/merge-reminder.test.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/nochk-resolve.test.sh	date-d-gnu	7	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/pr-dispatch.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/pr-owner-liveness.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/refresh-provision.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/orchestrator-harness/report.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/orchestrator-harness/spawn-gate.test.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/watchdog-loop.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/orchestrator-harness/worker-terminal.test.sh	timeout-absent-on-macos	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/pi-cache-reap.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/pi-reap-worktrees.sh	stat-c-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/pi-reap-worktrees.test.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/pi-reap-worktrees.test.sh	sed-in-place-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is `sed -i.bak -e … && rm -f f.bak` (portable to BOTH), or `box_sed_i` (scripts/lib/box.sh)
+scripts/pi-task-session-prune.sh	stat-c-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/pr-repair-loop.sh	cpu-count-single-mechanism	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is `box_ncpu` (scripts/lib/box.sh) — it probes all three and reports which answered
+scripts/pr-repair-loop.sh	procfs-macos-absent	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/pr-repair-loop.sh	timeout-absent-on-macos	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/pr-repair-loop.test.sh	setsid-absent-on-macos	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no `setsid` binary — `( … ) &` or python3 `os.setsid`, or the sweep's portable detach
+scripts/pr-repair-loop.test.sh	timeout-absent-on-macos	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+scripts/rail-run.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/reap-abandoned-worktrees.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/reap-duplicate-installs.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/reap-lane-venvs.sh	stat-c-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/reap-lane-venvs.test.sh	procfs-macos-absent	5	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/scan-orphans.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/scratch-worktree.sh	procfs-macos-absent	4	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/sweep-orphans.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/wait-for-load.sh	procfs-macos-absent	3	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
+scripts/watch-truncation.test.sh	date-d-gnu	1	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
+scripts/worktree-disk-probe.sh	stat-c-gnu	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
+scripts/worktree-disk-probe.test.sh	timeout-absent-on-macos	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
+tests/gh-shim/run.sh	procfs-macos-absent	2	portability-baseline: pre-existing, NOT yet repaired — portable replacement is macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
