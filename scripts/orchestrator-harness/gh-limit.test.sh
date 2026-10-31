@@ -64,31 +64,23 @@ reset_env() {  # fresh state dir, clock, counters — one scenario per box
 # inferred from a counter the stub is trusted to keep.
 cat >"$TMP/stub-gh" <<'STUB'
 #!/usr/bin/env bash
-n="$(cat "$GH_LIMIT_TEST_COUNT" 2>/dev/null || echo 0)"
-n=$(( n + 1 )); printf '%s\n' "$n" >"$GH_LIMIT_TEST_COUNT"
 # ⛔ EVERY invocation is logged, INCLUDING the exempt `/rate_limit` probe and the arms that exit
 # early — a test that counts requests must see all of them (the probe used to be invisible here).
 printf 'call|%s\n' "$*" >>"$GH_LIMIT_TEST_STUBLOG"
-case "$GH_LIMIT_SCENARIO" in
-  converge|limited|coalesce|leaderfail|slow)
-    printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
-    case "$GH_LIMIT_SCENARIO" in
-      converge|limited) sleep 0.1 ;;
-      leaderfail) sleep 0.4 ;;
-      coalesce) sleep 0.6 ;;
-      slow)
-        # PARKED until the test releases it (bounded, so a broken fixture cannot hang the suite).
-        _pi=0
-        while [ "$_pi" -lt 100 ] && [ ! -e "$GH_LIMIT_TEST_RELEASE" ]; do sleep 0.1; _pi=$(( _pi + 1 )); done ;;
-    esac
-    printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG" ;;
-esac
+# ⛔ THE EXEMPT METER IS NOT WORKLOAD (#2342). `gh-limit.py` spends ONE `/rate_limit` probe per box per
+# TTL when it has no snapshot, so the floor guard can act at all. It is answered HERE, before the
+# per-scenario counter below is incremented: that counter models "how many LOADS did this read take",
+# and a lane that shifted every scenario's counter by one would make fixtures like `n<=1 => fail` mean
+# something other than what they say. The call is still logged above, so `meter_calls()` can pin it.
 case "$*" in
   *"api rate_limit"*)
-    # The exempt endpoint, measured to report healthy headroom while another bucket is empty. Two
+    # It is a real invocation, so it emits the same start/end markers the in-flight assertions count.
+    printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
+    # The exempt endpoint, measured to report healthy headroom while another bucket is empty. Three
     # scenarios make it report something ELSE, which is what the account-scope tests revalidate
     # against: `probeempty` = the bucket really is out (a reset ~43 min away), `probehead` = the
-    # bucket has headroom, so any marker claiming otherwise is stale.
+    # bucket has headroom, so any marker claiming otherwise is stale, and `probereplace` = a
+    # CONCURRENT WRITER replacing `last-limit` while the probe is in flight.
     case "${GH_LIMIT_SCENARIO:-}" in
       probeempty) _rem=0; _reset=1700002580 ;;
       probehead)  _rem=4573; _reset=1700003600 ;;
@@ -104,7 +96,24 @@ case "$*" in
     esac
     printf '{"resources":{"core":{"remaining":%d,"reset":%d},"graphql":{"remaining":%d,"reset":%d}}}' \
       "$_rem" "$_reset" "$_rem" "$_reset"
+    printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
     exit 0 ;;
+esac
+n="$(cat "$GH_LIMIT_TEST_COUNT" 2>/dev/null || echo 0)"
+n=$(( n + 1 )); printf '%s\n' "$n" >"$GH_LIMIT_TEST_COUNT"
+case "$GH_LIMIT_SCENARIO" in
+  converge|limited|coalesce|leaderfail|slow)
+    printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
+    case "$GH_LIMIT_SCENARIO" in
+      converge|limited) sleep 0.1 ;;
+      leaderfail) sleep 0.4 ;;
+      coalesce) sleep 0.6 ;;
+      slow)
+        # PARKED until the test releases it (bounded, so a broken fixture cannot hang the suite).
+        _pi=0
+        while [ "$_pi" -lt 100 ] && [ ! -e "$GH_LIMIT_TEST_RELEASE" ]; do sleep 0.1; _pi=$(( _pi + 1 )); done ;;
+    esac
+    printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG" ;;
 esac
 case "$GH_LIMIT_SCENARIO" in
   coalesce)
@@ -273,7 +282,13 @@ export GH_LIMIT_TEST_RELEASE="$TMP/release"
 
 # ── helpers ─────────────────────────────────────────────────────────────────────────────────────
 run_helper() { python3 "$HELPER" --real-gh "$TMP/stub-gh" -- "$@"; }
-calls() { grep -c '^call|' "$STUB_LOG" 2>/dev/null || true; }
+# ⛔ THE EXEMPT METER IS NOT A "LOAD" (#2342). `gh-limit.py` spends ONE `/rate_limit` probe per box
+# per `GH_LIMIT_BUDGET_TTL` when it has no snapshot to read, so the floor guard can act at all — it is
+# exempt from the primary limit and it is SHARED by every lane. Counting it as an underlying call would
+# make every coalescing assertion below measure the meter instead of the read. `meter_calls()` pins it
+# separately, so the exclusion cannot hide an unbounded probe.
+calls() { grep '^call|' "$STUB_LOG" 2>/dev/null | grep -vc 'api rate_limit' || true; }
+meter_calls() { grep '^call|' "$STUB_LOG" 2>/dev/null | grep -c 'api rate_limit' || true; }
 calls_for() { grep -c -- "^call|$1" "$STUB_LOG" 2>/dev/null || true; }
 sleeps() { tr '\n' ' ' < "$SLEEPS" | sed 's/ *$//'; }
 # A wait must be AT LEAST its documented floor (and below the floor + its jitter ceiling): asserting
@@ -352,10 +367,27 @@ ck "NO_WAIT: the log and the stderr agree on the borrowed record's AGE (log=${_l
    "$([ -n "$_log_age" ] && [ "$_log_age" -gt 0 ] && [ "$_log_age" = "$_err_age" ] && echo 0 || echo 1)"
 
 # ── B. A secondary limit with NO headers: >=60s, doubling, bounded, then FAIL LOUDLY ──────────
+# ⛔ THE VEHICLE IS A GRAPHQL READ, NOT A MUTATION, because a MUTATION is now recorded against `core`
+# (a write has no second pool, and the REST adapter translates the GraphQL-shaped writes into REST
+# ones — see `bucket_for`). The assertion is unchanged: the failure must name the bucket that was
+# actually refused, never whichever counter happens to look healthy.
 reset_env secondary
-out="$(run_helper pr comment 5 --repo o/r --body hi 2>"$TMP/err-B")"; rc=$?
+out="$(run_helper pr view 5 --repo o/r 2>"$TMP/err-B")"; rc=$?
 ck "secondary: the 4th attempt is not retried — exactly 4 attempts, then a loud failure" \
-   "$([ "$(calls_for 'pr comment')" -eq 4 ] && echo 0 || echo 1)"
+   "$([ "$(calls_for 'pr view')" -eq 4 ] && echo 0 || echo 1)"
+# and the rule that made this vehicle necessary is itself pinned: a WRITE is bucketed `core`.
+ck "secondary: a MUTATION is bucketed core (a write has no second pool)" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.bucket_for(['pr','merge','7'])=='core' and m.bucket_for(['repo','delete','o/r','--yes'])=='core' and m.bucket_for(['pr','view','7'])=='graphql' else 1)" && echo 0 || echo 1)"
+# ⛔ `repo`/`gist` ARE NOT `REST_SUBCOMMANDS` (#2342 review, P1). They were added "because their WRITES
+# are REST calls", but `is_mutating` answers `core` BEFORE that set is consulted — so the entries could
+# never affect a write, while their only reachable effect mislabelled `gh repo view`/`gh repo list`
+# (GraphQL `RepositoryInfo` queries) as `core`. The consequence was measured on the landing path:
+# inside a dated-empty core window `admin-merge.sh`'s `gh repo view --json nameWithOwner` was refused
+# with ZERO requests, printed an empty slug, and the rail reported "the repo identity could not be
+# resolved" while GraphQL had thousands of requests left. This pins BOTH directions.
+ck "bucket_for: a GraphQL-only repo/gist READ is graphql, while their WRITES stay core" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.bucket_for(['repo','view','o/r','--json','nameWithOwner'])=='graphql' and m.bucket_for(['repo','list'])=='graphql' and m.bucket_for(['gist','list'])=='graphql' and m.bucket_for(['gist','create','-f','x=y'])=='core' and m.bucket_for(['repo','delete','o/r','--yes'])=='core' else 1)" && echo 0 || echo 1)"
+
 ck "secondary: the failure is LOUD on stderr (never a silent success)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 ck "secondary: the message NAMES the bucket (graphql, not the REST counter that looks healthy)" \
    "$(has 'bucket=graphql' "$(cat "$TMP/err-B")" && echo 0 || echo 1)"
@@ -579,6 +611,12 @@ ck "(b) 5 concurrent DIFFERENT reads make 5 calls (no over-collapsing) [$(calls)
    "$([ "$(calls)" -eq 5 ] && echo 0 || echo 1)"
 ck "(b) … and they are still SERIALISED, never 2 in flight (#2005 stands) [peak $(max_inflight)]" \
    "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ THE EXCLUSION MUST NOT HIDE AN UNBOUNDED PROBE (#2342 review P2). `calls()` above stops counting
+# the exempt `/rate_limit` meter so the coalescing assertions measure the READ; this is the assertion
+# that keeps the meter honest — five different reads on a box with no snapshot cost AT MOST one probe
+# (the TTL stamp), never one per call.
+ck "(b) … and the box spent AT MOST ONE exempt meter probe for them [meter=$(meter_calls)]" \
+   "$([ "$(meter_calls)" -le 1 ] && echo 0 || echo 1)"
 
 # (c) a FAILING leader: every follower learns the failure, with the leader's error, and none reports
 # the success a later call would have produced.
@@ -2180,14 +2218,30 @@ ck "marker: a marker 2580s away does not park the caller for MAX_WAIT and then s
 
 # ⛔ M9. THE GATE IS BUCKET-SCOPED. A graphql marker must not park a REST read: the two pools are
 # separate, and the REST path is what keeps dispatch alive while GraphQL is refused (#1962/#1939).
+# ⛔ AND THE FIXTURE CARRIES A LIVE WINDOW ON PURPOSE — the merge with the #2342 floor made the old
+# fixture VACUOUS in one direction. With a marker whose window has ENDED (or one older than
+# MARKER_MAX_AGE) the gate ignores it for reasons that have nothing to do with the bucket, so "no wait"
+# would pass with the scoping deleted. A 120 s window inside the age bound is one the gate WOULD pay
+# (or revalidate) for a `graphql` call, so the reads below can tell the two apart.
 reset_env gate-bucket
-printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=?\n' > "$GH_LIMIT_DIR/last-limit"
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700000120 remaining=0\n' > "$GH_LIMIT_DIR/last-limit"
 run_helper api repos/o/r/pulls/1 >/dev/null 2>&1
-# ⛔ AND IT SPENDS NO PROBE. Without this half the assertion was vacuous: a foreign marker that was
-# read would be REVALIDATED (the stub answers 4999) and cleared, so "no sleep" passed even with the
-# bucket scoping deleted (found in review).
-ck "marker: a GRAPHQL marker does not block a CORE call (the pools are separate, no probe spent)" \
-   "$([ -z "$(sleeps)" ] && ! has 'api rate_limit' "$(cat "$STUB_LOG")" && echo 0 || echo 1)"
+ck "marker: a GRAPHQL marker does not block a CORE call (the pools are separate, no wait incurred)" \
+   "$([ -z "$(sleeps)" ] && echo 0 || echo 1)"
+# ⛔ AND THE FOREIGN MARKER IS NEVER CONSULTED — pinned on the ARTIFACT, not on the request count. A
+# consulted marker with a live window is REVALIDATED, and that annotation writes `stale=` onto the
+# record: the artifact is the direct evidence, and it stays meaningful however the floor's own meter
+# probe is admitted later.
+ck "marker: … and the foreign marker is NOT annotated stale= (it was never consulted for a core decision)" \
+   "$(grep -q 'stale=' "$GH_LIMIT_DIR/last-limit" && echo 1 || echo 0)"
+# ⛔ THE PROBE COUNT IS BOUNDED AT ONE, NOT ZERO, AND THAT IS A DELIBERATE CHANGE OF THE ASSERTION.
+# The #2342 floor spends ONE exempt `/rate_limit` read per box per TTL so that it can act on a MEASURED
+# `remaining` at all (its own suite pins exactly that: gh-core-failover.test.sh (p)/(p2)); a core call
+# with nothing local known about `core` is exactly where it fires. A marker REVALIDATION is a different
+# request on the same endpoint, so a SECOND meter read is the signature of a bucket leak — which is what
+# this assertion is for.
+ck "marker: … and only the FLOOR's own single exempt meter read was spent [meter=$(meter_calls)]" \
+   "$([ "$(meter_calls)" -le 1 ] && echo 0 || echo 1)"
 
 # ⛔ M10. A STAMP FROM THE FUTURE IS NOT PERMISSION TO REFUSE EVERY CALL. A clock that stepped back
 # leaves `budget-<bucket>` entries ahead of `now`; honouring them made `next slot` hours away and
