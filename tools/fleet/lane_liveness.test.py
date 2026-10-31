@@ -78,6 +78,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.normpath(os.path.join(HERE, "lane_liveness.py"))
 LIVENESS_PATH = os.path.normpath(os.path.join(HERE, "liveness.py"))
+FLEET_SNAPSHOT_PATH = os.path.normpath(os.path.join(HERE, "fleet_snapshot.py"))
 LIB_PATH = os.path.normpath(os.path.join(HERE, "..", "..", "scripts", "lib", "pid-identity.sh"))
 
 PASS = 0
@@ -507,7 +508,16 @@ def leg_env_error(module=None):
             fh.write("{not json")
         rc, out, gh = run_report(fx, module=module)
         assert_eq(rc, 2, "a corrupt store exits 2")
-        assert_contains(out, "no verdict, no issue", "the env error is logged distinctly")
+        assert_contains(out, "no cmux verdict, no issue", "the env error is logged distinctly")
+        # #3134 review 5 — the DISPATCH population is enumerated from a DIFFERENT
+        # directory (the session transcripts), so a cmux-store failure is not a
+        # reason to withhold it. Before the reorder, `dispatch_rows` sat after
+        # this `return 2`, so every cell (which has no cmux store at all) printed
+        # the ERROR and never rendered the population it was added for.
+        assert_contains(out, "### Dispatch lanes",
+                        "the dispatch section still renders on the env-error path")
+        assert_not_contains(out, "hook store unreadable or shape-drifted: %s\n### Dispatch lanes" % fx.store,
+                            "the dispatch section is not swallowed by the cmux error")
         if gh:
             bad("env error called gh: %s" % gh)
         else:
@@ -858,12 +868,72 @@ def leg_disclosure(module=None):
         shutil.rmtree(shim, ignore_errors=True)
 
 
+def leg_dispatch(module=None):
+    print("── DISPATCH — the second population is rendered, declared and counted (#1178) ──")
+    fx = Fixture([live_lane()], ps_rows=[ps_row(PID_ALIVE)])
+    disp_sid = "01a19020-0000-7000-8000-00000000000a"
+    try:
+        # A lane the cmux store does NOT own (`pi -p`, no workspace): its only
+        # durable trace is the transcript, which is exactly what the dispatch
+        # population enumerates. It must appear in the report's dispatch section
+        # and must NOT move the cmux verdict counts.
+        write_transcript(fx, disp_sid, "/tmp/lane-dispatch", [
+            {"type": "session", "id": disp_sid, "cwd": "/tmp/lane-dispatch"},
+            {"type": "message", "timestamp": datetime.datetime.fromtimestamp(
+                (NOW_MS - 600_000) / 1000.0, datetime.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"), "message": {
+                "role": "assistant", "stopReason": "stop",
+                "content": [{"type": "text", "text": "done"}]}},
+        ], age_s=600)
+        rc, out, gh = run_report(fx, module=module)
+        assert_eq(rc, 0, "a clean cmux fleet still exits 0 with a dispatch row present")
+        assert_contains(out, "### Dispatch lanes", "the report renders the second population")
+        assert_contains(out, "durable session transcripts", "it declares the population's source")
+        assert_contains(out, "`dead` is **unreachable**",
+                        "it declares the limit that makes the section report-only")
+        assert_contains(out, disp_sid[:8], "a lane only the dispatch population can see is listed")
+        if gh:
+            bad("a dispatch row is report-only but gh was called: %s" % gh)
+        else:
+            ok("a dispatch row never reaches the escalation policy")
+
+        # …and the same population is machine-readable.
+        rc2, out2, _gh2 = run_report(fx, "--json", "--dry-run", module=module)
+        assert_eq(rc2, 0, "--json on a clean fleet exits 0")
+        payload = None
+        for line in out2.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                payload = json.loads(line)
+                break
+        if payload is None:
+            bad("no JSON object in the --json output")
+            return
+        assert_eq([r["sid"] for r in payload.get("dispatch_lanes", [])], [disp_sid],
+                  "--json carries the dispatch rows")
+        assert_eq((payload.get("dispatch_declaration") or {}).get("dead_reachable"), False,
+                  "the declaration carries the dead-unreachable claim")
+        assert_eq(payload.get("counts"), {"running-quiet": 1},
+                  "the cmux counts are unchanged by the second population")
+    finally:
+        fx.close()
+
+    # The UNMEASURED arm renders as a NAMED abstention, never as "0 lanes".
+    import lane_liveness as ll  # noqa: E402  (this file's own subject)
+    section = ll.render_dispatch_section(
+        [], {"population": "dispatch", "state": "UNMEASURED(no fleet_snapshot.py)"})
+    assert_contains(section, "UNMEASURED(no fleet_snapshot.py)",
+                    "an unmeasured dispatch population renders its named reason")
+    assert_contains(section, "NOT measured on this box", "…and says so in words")
+    assert_not_contains(section, "| lane |", "…and renders no table that could read as zero lanes")
+
+
 LEGS = [("CLEAN", leg_clean), ("TRIP", leg_trip), ("DEDUP", leg_dedup),
         ("DRY-RUN", leg_dry_run), ("ENV-ERROR", leg_env_error),
         ("STALE-DEAD", leg_stale_dead), ("CLOSED-WORKSPACE", leg_closed_workspace),
         ("PS-CACHE", leg_ps_cache), ("TURN-BOUNDARY", leg_turn_boundary),
         ("COMPACTION", leg_compaction), ("MD-ESCAPE", leg_md_escape),
-        ("DISCLOSURE", leg_disclosure)]
+        ("DISCLOSURE", leg_disclosure), ("DISPATCH", leg_dispatch)]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -963,6 +1033,23 @@ MUTATIONS = [
         "the population gap stops being declared, so the report's silence reads as a verdict again (#1777)",
         target="report",
     ),
+    Mutation(
+        "drop-dispatch-section",
+        '    body += "\\n" + dispatch_section',
+        '    body += ""',
+        leg_dispatch, 0,
+        "the second population stops being rendered, so its silence reads as 'nothing is running' (#1777/#1178)",
+        target="report",
+    ),
+    Mutation(
+        "drop-the-dead-unreachable-claim",
+        '    lines.append("`dead` is **unreachable** in this population: %s."\n'
+        '                 % decl.get("dead_note", "no durable fenced incarnation"))\n',
+        '    pass  # claim dropped\n',
+        leg_dispatch, 0,
+        "the section stops declaring the limit that makes it report-only, so a `dead` row would be read as escalatable",
+        target="report",
+    ),
 ]
 
 
@@ -972,6 +1059,12 @@ def _mutant_dir(mut):
         liv_src = fh.read()
     with open(MODULE_PATH, "r", encoding="utf-8") as fh:
         rep_src = fh.read()
+    # The production geometry carries the snapshot module beside the driver (both
+    # are farmed), so the mutant does too — otherwise `dispatch_rows` takes its
+    # ImportError arm and every mutation would silently grade the UNMEASURED
+    # path instead of the code it claims to mutate.
+    with open(FLEET_SNAPSHOT_PATH, "r", encoding="utf-8") as fh:
+        snap_src = fh.read()
     target_path = LIVENESS_PATH if mut.target == "classifier" else MODULE_PATH
     target_src = liv_src if mut.target == "classifier" else rep_src
     if target_src.count(mut.old) != 1:
@@ -983,6 +1076,8 @@ def _mutant_dir(mut):
         rep_src = rep_src.replace(mut.old, mut.new, 1)
     with open(os.path.join(tmp, "liveness.py"), "w", encoding="utf-8") as fh:
         fh.write(liv_src)
+    with open(os.path.join(tmp, "fleet_snapshot.py"), "w", encoding="utf-8") as fh:
+        fh.write(snap_src)
     out = os.path.join(tmp, "lane_liveness.py")
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(rep_src)
