@@ -4808,6 +4808,38 @@ def test_the_cascade_rung2_total_is_not_reported_as_a_class_count(monkeypatch):
     assert "(fix " not in casc[0], casc[0]
 
 
+def test_the_cascade_names_the_WAIT_axis_separately_from_an_ASK_USER_hold(monkeypatch):
+    """`the chain is on rung 3` must not be printed on a pass whose wait count is 0.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 5): the terminal arm fired on `(_r3 or _held)` and
+    always appended the same sentence, so a pass whose ONLY hold was an ASK-USER surface row read
+
+        cascade: order=merge>fix>wait merge=0 fix=0 wait=0 surface=1 slots=7
+        nothing dispatchable -- held=1, the chain is on rung 3
+
+    — `wait=0` and "on rung 3" in one clause, while rung 3 is defined in this same block as
+    `running`/unreadable (blindness), explicitly NOT the ASK-USER population. Naming a rung by its
+    own definition the chain is not on is the same self-contradicting clause this arm was rewritten
+    for one round earlier, one population over.
+    """
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: True, raising=False)
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(66)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=0" in casc[0], casc[0]
+    assert "rung 3" not in casc[0], casc[0]
+    assert "ASK-USER" in casc[0], casc[0]
+    # and the WAIT axis still makes its own claim when it is the population that holds.
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: False, raising=False)
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(67)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "the chain is on rung 3" in casc[0], casc[0]
+    assert "ASK-USER" not in casc[0], casc[0]
+
+
 def test_two_failed_file_reads_stop_the_per_pr_requests_but_still_refuse(monkeypatch):
     """The per-PR read is BOUNDED: after two failures the pass stops asking, and still refuses.
 

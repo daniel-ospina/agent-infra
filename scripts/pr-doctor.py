@@ -5167,7 +5167,11 @@ def run_pass(args, rubric_note: str = "") -> int:
     # let this line print `wait=0 ... nothing to dispatch` while PRs sat held on precisely the
     # unreadable classification it defines as rung 3: the same silence the block exists to remove,
     # one population over. `surface` is NOT folded in (it is an ASK-USER, not blindness) and is
-    # printed as its own `held=` term so neither count can absorb the other.
+    # printed as its own `surface=` term — ⛔ IT IS NOT CARRIED UNDER `held=` (review P2, round 5):
+    # the terminal arm below DOES fold it into its `held=<total>` now, and an earlier revision of
+    # this comment claimed the opposite in the same block, inviting a "repair" that re-creates the
+    # `held=` label collision that block already fixed. What is guaranteed is that the LINE names
+    # the split (`surface=` beside `wait=`) before that arm states the total.
     _r3 = sum(counts.get(k, 0)
               for k in ("skipped-running", "skipped-unreadable", "skipped-surface_unreadable",
                         "skipped-surface_partial", "skipped-surface_abandoned"))
@@ -5255,10 +5259,25 @@ def run_pass(args, rubric_note: str = "") -> int:
     # honest the line read `wait=1 slots=7 nothing to dispatch (no mergeable, no repairable)` -- a
     # SELF-CONTRADICTING sentence, which is the same defect one clause over. A pass that HELD work
     # did not have nothing to dispatch; it had nothing it was willing to dispatch.
+    # ⛔ AND "ON RUNG 3" IS A CLAIM ABOUT THE WAIT AXIS, NOT ABOUT HOLDS IN GENERAL (review P2,
+    # round 5). The arm fired on `(_r3 or _held)` and always appended "the chain is on rung 3", so a
+    # pass whose ONLY hold was an ASK-USER surface row printed
+    # `wait=0 surface=1 ... nothing dispatchable -- held=1, the chain is on rung 3` -- naming a rung
+    # its own definition (`running` or an unreadable classification) says it is NOT on, and
+    # contradicting its own `wait=0` in the same clause. The two populations are named separately:
+    # rung 3 is the WAIT axis; an ASK-USER hold is a HUMAN decision, and saying so is the whole point
+    # of `surface=` existing.
     if not _r1 and not _r2:
-        _casc.append("nothing dispatchable -- held=%d, the chain is on rung 3" % (_r3 + _held)
-                     if (_r3 or _held) else
-                     "nothing to dispatch (no mergeable, no repairable)")
+        if _r3 and _held:
+            _casc.append("nothing dispatchable -- held=%d (%d waiting on rung 3, "
+                         "%d held for a HUMAN/ASK-USER)" % (_r3 + _held, _r3, _held))
+        elif _r3:
+            _casc.append("nothing dispatchable -- held=%d, the chain is on rung 3" % _r3)
+        elif _held:
+            _casc.append("nothing dispatchable -- held=%d, held for a HUMAN (ASK-USER), "
+                         "not on the rung-3 wait axis" % _held)
+        else:
+            _casc.append("nothing to dispatch (no mergeable, no repairable)")
     log("cascade: " + " ".join(_casc))
 
     # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
