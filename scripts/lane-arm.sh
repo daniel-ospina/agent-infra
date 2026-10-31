@@ -154,13 +154,17 @@ fail() { echo "lane-arm: $1" >&2; log "FAIL $1"; exit 4; }
 
 # ── lock: one arm at a time; break a stale one (a SIGKILLed run cannot clean up) ────────────────
 if [ -e "$LOCK" ]; then
-  la="$(age_s "$LOCK")" || la=0
+  # ⛔ DROP THE `|| la=0`. With it, an UNREADABLE stamp became 0, which is `-lt STALE_LOCK_S`, so the
+  # pass skipped with exit 0 and the `''` arm of the case below was UNREACHABLE — the "unreadable is
+  # maximally stale" half of this rule was described but not implemented. Leaving `la` empty lets the
+  # case see it.
+  la="$(age_s "$LOCK")"
   # ⛔ A NEGATIVE AGE IS NOT A FRESH LOCK. A backward clock step, a copied file or `touch -t` puts the
   # mtime in the future, and a negative number satisfies `-lt STALE_LOCK_S` — so the pass would skip
   # with exit 0 forever and the stale-break below would be unreachable until real time passed
   # mtime+900. Under `Type=oneshot` that exit 0 reads as SUCCESS: a healthy timer with nothing
-  # produced, which is the no-op-gate class this whole arm exists to refuse. Treat an unreadable or
-  # future stamp as MAXIMALLY stale (break it), never as a fresh lock.
+  # produced, which is the no-op-gate class this whole arm exists to refuse. An UNREADABLE or FUTURE
+  # stamp is MAXIMALLY stale (break it), never a fresh lock.
   case "$la" in ''|-*) la=$STALE_LOCK_S ;; esac
   if [ "$la" -lt "$STALE_LOCK_S" ]; then
     echo "lane-arm: another pass holds $LOCK (${la}s) -- skipping" >&2
@@ -270,7 +274,15 @@ for ev in lanes:
     if not isinstance(ev, dict):
         continue
     st = str(ev.get("state") or ev.get("verdict") or "").upper().replace("-", "_")
-    if st != "WEDGED":
+    # ⛔ THE QUEUE IS THE MACHINE FORM OF LIST 2, SO IT MUST USE LIST 2'S RULE — not a WEDGED-only
+    # filter. `lane-actions.py` puts STALLED, DEAD and CHILD-STUCK in its `wedged` bucket (the same
+    # rows a human sees under "TO UNBLOCK"), and it renders a raw WEDGED row through the words layer,
+    # which can land it in LIST 1 or REPORT instead. So `st != "WEDGED"` disagreed with the recap in
+    # BOTH directions: a fleet of parked children rendered `wedged=0` / exit 0 here while the human
+    # list showed them as to-unblock, and a WEDGED row could be queued after the words layer had
+    # already dispositioned it. Match the bucket, and keep the split-token form because the verdict
+    # arrives hyphenated.
+    if st not in ("WEDGED", "STALLED", "DEAD", "CHILD_STUCK", "CHILD_STUCK_PARKED"):
         continue
     lane = str(ev.get("lane") or ev.get("name") or "-")
     ws = str(ev.get("ws") or ev.get("workspace") or ev.get("workspaceId") or "-")
