@@ -713,6 +713,9 @@ mkc4 cyc9/9-background-breadth.sh '#!/usr/bin/env bash' 'command -v readlink >/d
 mkc4 cyc9/10-background-cpu.sh '#!/usr/bin/env bash' 'command -v nproc >/dev/null 2>&1 && n="$(nproc)" & n="$(nproc)"'
 # a PORTABLE sed spelling in one segment must not exonerate a GNU-only `-i` in the next
 mkc4 cyc9/11-sed-portable-then-gnu.sh '#!/usr/bin/env bash' 'command -v sed >/dev/null 2>&1 && sed -i.bak -e s/a/b/ f & sed -i -e s/a/b/ g'
+# a CORRECT shim call in one segment must not exonerate a GNU-only call in the next
+mkc4 cyc9/12-shim-then-gnu-sed.sh '#!/usr/bin/env bash' 'box_sed_i "s/a/b/" f; sed -i "s/a/b/" g'
+mkc4 cyc9/13-shim-then-plain-nproc.sh '#!/usr/bin/env bash' 'n="$(box_ncpu)"; m="$(nproc)"'
 mkc4 cyc9/7-repeat-one-probed.sh '#!/usr/bin/env bash' 'command -v nproc >/dev/null 2>&1 && n="$(nproc)"; m="$(nproc)"'
 
 # …and the forms that ARE conditioned must stay clean, including a whole `&&` chain
@@ -725,6 +728,8 @@ mkc4c cyc9clean/5-redirect-and-chain.sh '#!/usr/bin/env bash' 'command -v timeou
 mkc4c cyc9clean/6-and-after-redirect.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 a >/dev/null 2>&1 && timeout 5 b'
 # a portable sed spelling alone (its own segment) stays clean
 mkc4c cyc9clean/7-sed-portable.sh '#!/usr/bin/env bash' "sed -i.bak -e 's/a/b/' f && rm -f f.bak"
+# the shim on its own stays clean — the exemption is per call, not revoked
+mkc4c cyc9clean/8-shim-only.sh '#!/usr/bin/env bash' 'box_sed_i "s/a/b/" f' 'n="$(box_ncpu)"' 'echo "$n"'
 
 run_check "$C4" --no-baseline
 if [ "$?" = 2 ]; then
@@ -741,7 +746,9 @@ else
     "timeout-absent-on-macos cyc9/8-guarded-then-background.sh" \
     "readlink-f-bsd-absent cyc9/9-background-breadth.sh" \
     "cpu-count-single-mechanism cyc9/10-background-cpu.sh" \
-    "sed-in-place-gnu cyc9/11-sed-portable-then-gnu.sh"
+    "sed-in-place-gnu cyc9/11-sed-portable-then-gnu.sh" \
+    "sed-in-place-gnu cyc9/12-shim-then-gnu-sed.sh" \
+    "cpu-count-single-mechanism cyc9/13-shim-then-plain-nproc.sh"
   do
     set -- $pair
     if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -758,7 +765,8 @@ else
     "cpu-count-single-mechanism cyc9clean/4-shim-called.sh" \
     "timeout-absent-on-macos cyc9clean/5-redirect-and-chain.sh" \
     "timeout-absent-on-macos cyc9clean/6-and-after-redirect.sh" \
-    "sed-in-place-gnu cyc9clean/7-sed-portable.sh"
+    "sed-in-place-gnu cyc9clean/7-sed-portable.sh" \
+    "cpu-count-single-mechanism cyc9clean/8-shim-only.sh"
   do
     set -- $pair
     if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then

@@ -1046,11 +1046,12 @@ function cpu_rule(code,   n, mech) {
   if (inpos(code, "nproc") && !cpu_guarded("nproc", code)) { n++; mech = 1 }
   if (code ~ /hw\.ncpu/ && inpos(code, "sysctl") && !cpu_guarded("sysctl", code)) { n++; mech = 1 }
   if (code ~ /_NPROCESSORS_ONLN/ && inpos(code, "getconf") && !cpu_guarded("getconf", code)) { n++; mech = 1 }
-  # ⛔ A SHIM NAME MENTIONED IS NOT A SHIM CALLED (review cycle-9 P1): this was a bare substring
-  # test, so `grep -q box_ncpu lib/box.sh; n="$(nproc)"` inherited the exemption from a word in an
-  # ARGUMENT and the very trap the rule exists for came back CLEAN (same class as the cycle-8
-  # `# portability-ok:` fix, one construct over). The shim must be INVOKED.
-  if (inpos(code, "box_ncpu")) return 0
+  # ⛔ THE SHIM NEEDS NO EXEMPTION HERE AT ALL (review cycle-11 P1): `box_ncpu` names no mechanism
+  # word, so a line that only calls the shim scores zero and returns clean by itself. The line-wide
+  # exemption was therefore pure loss: `n="$(box_ncpu)"; m="$(nproc)"` inherited it and the
+  # single-mechanism `nproc` read came back CLEAN (cycle-9 narrowed it from a substring test to an
+  # invocation test, which fixed the MENTION case and left the line-wide SCOPE). Per-call is what
+  # the header blesses, and that is now the code.
   # ⛔ A PROBE ON THIS LINE IS ALREADY ACCOUNTED FOR PER TOOL (review cycle-8 P0): these two
   # line-wide returns blessed every mechanism on a probe line, so `command -v nproc >/dev/null 2>&1 ||
   # n="$(nproc)"` — a read that runs exactly on the host where nproc is missing — was CLEAN.
@@ -1119,15 +1120,21 @@ function timeout_rule(code) {
 #      `readlink -nf` / `grep -qP`.
 #   3. the ATTACHED empty-quote spelling `sed -i""` / `-i''` was reported under the GNU rule (wrong
 #      key, wrong failure mode): it is the BSD spelling whichever side of the separator it sits on.
-function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat) {
+function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat, shim) {
   if (!cp(code, "sed")) return 0
-  # ⛔ THE SHIM MUST BE CALLED, NOT MENTIONED (review cycle-9 P1 — see cpu_rule for the measurement).
-  if (cp(code, "box_sed_i") || code ~ ("[$][(][ \t]*box_sed_i" rb)) return 0
+  # ⛔ THE SHIM MUST BE CALLED, NOT MENTIONED — AND IN ITS OWN SEGMENT (cycle-9 P1, cycle-11 P1): a
+  # whole-line test let `box_sed_i "s/a/b/" f; sed -i "s/a/b/" g` pass, so a correct construct in one
+  # segment exonerated a live GNU-only `-i` in the next — the same class this file keeps closing one
+  # construct further out. The exemption is now evaluated inside the segment loop, per segment.
+  shim = cp(code, "box_sed_i") || code ~ ("[$][(][ \t]*box_sed_i" rb)
   t = code
   gsub(/[|&;(){}]/, "\n", t)
   n = split(t, segs, "\n")
   for (k = 1; k <= n; k++) {
     seg = segs[k]
+    # a segment that INVOKES the shim is not a `sed` call at all (the shim calls sed itself, with a
+    # suffix, which is why it is the blessed replacement)
+    if (shim && (cp(seg, "box_sed_i") || seg ~ ("[$][(][ \t]*box_sed_i" rb))) continue
     if (!cp(seg, "sed")) continue
     # the LONG form is GNU-only on every suffix (BSD sed has no `--in-place` at all)
     if (seg ~ /--in-place([=][^ \t]*)?([ \t]|$)/) { hit("sed-in-place-gnu", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); return 0 }
