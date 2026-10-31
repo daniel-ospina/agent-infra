@@ -290,13 +290,22 @@ mksw survive/7-phantom-open.sh \
 mkdir -p "$TMP/tree/survive"
 printf '#!/bin/bash\r\ncat <<EOF\r\nbody\r\nEOF\r\nsed -i \x27s/a/b/\x27 f\r\n' >"$TMP/tree/survive/8-crlf.sh"
 printf '%s\n' survive/8-crlf.sh >>"$SW"
+# 9 — a LEGAL quoted `}` inside `${…}`: the default value is the quoted string `a}b`, so a brace
+#     reader that pops on the first `}` leaves a phantom open quote and the rest of the file goes
+#     unscanned (review cycle-6 P2, reported honestly as context-unbalanced — a false RED, not a
+#     false PASS, but it also LOST the real trap one line below).
+mksw survive/9-brace-quote.sh \
+  '#!/usr/bin/env bash' \
+  'x="${y:-"a}b"}"' \
+  'p="${path#\"}"' \
+  "sed -i 's/a/b/' f.txt"
 
 run_check "$SW" --no-baseline
 # EVERY ASSERTION IS PER FILE: a desync in ONE fixture must not be blamed on the other four (the
 # first version grepped the whole output, so one bad fixture reddened all five arms).
 for f in survive/1-comment-sub.sh survive/2-len-arith.sh survive/3-shift.sh \
          survive/4-heredoc-sub.sh survive/5-awk-multi.sh survive/6-ansi-c.sh \
-         survive/7-phantom-open.sh survive/8-crlf.sh; do
+         survive/7-phantom-open.sh survive/8-crlf.sh survive/9-brace-quote.sh; do
   mine="$(awk -v f="$f" 'index($0, f ":") == 1' "$OUT")"
   if printf '%s\n' "$mine" | grep -qE 'context-unbalanced|heredoc-unterminated'; then
     bad "C8: CONTEXT DESYNC on $f — the model lost the quote state on a real construct"
@@ -362,6 +371,20 @@ mkz fixed/23-flock-sed.sh       '#!/usr/bin/env bash' 'flock /tmp/l sed -i s/a/b
 mkz fixed/24-exec-sed.sh        '#!/usr/bin/env bash' 'find . -name "*.sh" -exec sed -i "s/a/b/" {} +'
 mkz fixed/25-free-sep.sh        '#!/usr/bin/env bash' 'if free; then echo ok; fi'
 mkz fixed/26-readlink-missing.sh '#!/usr/bin/env bash' 'p=$(readlink --canonicalize-missing x)'
+# ⛔ THE PREFIX IS A CHAIN (review cycle-6 P0): a keyword followed by `!` or by a wrapper that takes
+# its own arguments left the tool INVISIBLE — including a live
+# `if ! timeout 300 docker run …` in scripts/orchestrator-harness/worker-terminal.test.sh:2309 that
+# sat baselined as clean while the other three calls in that file were reported.
+mkz fixed/27-if-not-timeout.sh  '#!/usr/bin/env bash' 'if ! timeout 5 ssh h true; then echo hung; fi'
+mkz fixed/28-if-sudo-timeout.sh '#!/usr/bin/env bash' 'if sudo timeout 5 systemctl restart x; then :; fi'
+mkz fixed/29-if-nice-sed.sh     '#!/usr/bin/env bash' "if nice -n 5 sed -i 's/a/b/' f; then :; fi"
+mkz fixed/30-then-env-timeout.sh '#!/usr/bin/env bash' 'then env FOO=1 timeout 5 true'
+# ⛔ A REPEAT IS NOT A CHAIN, AND A WORD IS NOT A MECHANISM (review cycle-6 P0): the cross-line CPU
+# guard accepted a SUBSTRING on any earlier line, so a second `nproc` was cleared by the first (a
+# repeat of the same mechanism) and an unguarded `sysctl -n hw.ncpu` was cleared by the variable name
+# `nproc_` six lines above.
+mkz fixed/31-cpu-repeat.sh      '#!/usr/bin/env bash' 'n="$(nproc)"' 'echo unrelated' 'm="$(nproc)"'
+mkz fixed/32-cpu-word.sh        '#!/usr/bin/env bash' 'cpu_cap=$(( nproc_ / 2 ))' 'echo one' 'echo two'   'echo three' 'echo four' 'n="$(sysctl -n hw.ncpu)"'
 run_check "$Z" --no-baseline
 for pair in \
   "timeout-absent-on-macos fixed/1-assign-timeout.sh" \
@@ -389,7 +412,13 @@ for pair in \
   "sed-in-place-gnu fixed/23-flock-sed.sh" \
   "sed-in-place-gnu fixed/24-exec-sed.sh" \
   "free-macos-absent fixed/25-free-sep.sh" \
-  "readlink-f-bsd-absent fixed/26-readlink-missing.sh"
+  "readlink-f-bsd-absent fixed/26-readlink-missing.sh" \
+  "timeout-absent-on-macos fixed/27-if-not-timeout.sh" \
+  "timeout-absent-on-macos fixed/28-if-sudo-timeout.sh" \
+  "sed-in-place-gnu fixed/29-if-nice-sed.sh" \
+  "timeout-absent-on-macos fixed/30-then-env-timeout.sh" \
+  "cpu-count-single-mechanism fixed/31-cpu-repeat.sh" \
+  "cpu-count-single-mechanism fixed/32-cpu-word.sh"
 do
   set -- $pair
   if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -414,6 +443,10 @@ mkz2 fixed-clean/10-readlink-probe.sh '#!/usr/bin/env bash' 'if command -v readl
 mkz2 fixed-clean/11-arith-var.sh '#!/usr/bin/env bash' 'cpu_cap=$(( nproc_ / 2 ))'
 mkz2 fixed-clean/12-proc-test.sh '#!/usr/bin/env bash' '[ -d /proc/self ]' 'if [ -r /proc/loadavg ]; then echo y; fi'
 mkz2 fixed-clean/13-proc-value.sh '#!/usr/bin/env bash' 'OUT="$(TMPDIR=/proc/nope bash ./x)"' 'AGENT_GH_GATE_DIR="/proc/nope/gate" bash "$SHIM" api user'
+# ⛔ A `command -v` PROBE LINE IS CLEAN WHOLESALE (review cycle-6 P1): `command` is itself a wrapper
+# keyword, so the old "probe AND nothing else matched" guard never fired for the `command -v` spelling
+# and `command -v free >/dev/null || :` reded a correct file.
+mkz2 fixed-clean/15-command-v-free.sh '#!/usr/bin/env bash' 'command -v free >/dev/null 2>&1 || :'
 mkz2 fixed-clean/14-probe-and-arg.sh '#!/usr/bin/env bash' 'if grep -q timeout scripts/x.sh; then :; fi' 'command -v free >/dev/null 2>&1' 'if have timeout; then :; fi' 'lc_err "after ${timeout}s"'
 run_check "$Z2" --no-baseline
 if [ "$?" = 2 ]; then
@@ -442,6 +475,24 @@ else
       ok "C10b: portable code NOT flagged ($(basename "$2"))"
     fi
   done
+fi
+
+# ── C11. A DECLARATION TAKES EFFECT FROM ITS OWN LINE ONWARD, WHEREVER IT IS (cycle-6 P2) ───────
+# The header promised this from the first commit, but the reader only honoured a declaration in the
+# first 20 lines, so a mid-file `# portability: off` was a silent no-op — the promise and the code
+# disagreed, and the arm below is the agreement.
+mkdir -p "$TMP/tree/midfile"
+{ printf '#!/usr/bin/env bash\n'
+  i=1; while [ "$i" -le 22 ]; do printf 'echo line%s\n' "$i"; i=$((i+1)); done
+  printf '# portability: off this file is a Linux-only helper by design\n'
+  printf "sed -i 's/a/b/' f.txt\n"; } >"$TMP/tree/midfile/late-off.sh"
+printf 'midfile/late-off.sh\n' >"$TMP/midfile.list"
+run_check "$TMP/midfile.list" --no-baseline
+mine="$(awk -v f="midfile/late-off.sh" 'index($0, f ":") == 1' "$OUT")"
+if printf '%s\n' "$mine" | grep -q 'sed-in-place-gnu'; then
+  bad "C11: a mid-file \`# portability: off\` was IGNORED — the header promises it takes effect from its own line"
+else
+  ok "C11: a mid-file \`# portability: off\` takes effect from its own line (header and code agree)"
 fi
 
 # ── D. MUTANTS — every rule above must be LOAD-BEARING ──────────────────────────────────────────
@@ -787,7 +838,15 @@ printf '%s\n' "$help_out" | grep -q 'USAGE' && printf '%s\n' "$help_out" | grep 
 # ⛔ DERIVE THE FLAG TOKENS, NOT THE `)`-TERMINATED ARMS (review cycle-5 P1): `--help|-h)` does not
 # end in `)` until the `|` is crossed, so the arm list silently omitted `--help` — the very flag the
 # previous cycle added to the docs, which is exactly the drift this arm exists to catch.
-flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done/p' "$CHECK" | grep -o -- '--[a-z][a-z-]*' | sort -u)"
+# ⛔ SHORT ALIASES ARE FLAGS TOO (review cycle-6 P2): `--help|-h)` accepts `-h`, and a derivation
+# that only greps `--[a-z-]*` cannot see it — so the arm claimed completeness while the short alias
+# was undocumented. Both spellings are derived now, and both must appear in --help.
+# ⛔ TAKE THE ARM TOKENS ONLY (review cycle-6 P2): grepping the whole `while` block for `-[A-Za-z]`
+# also matched the loop CONDITION's `-gt`, so the arm demanded a documented `-g`. The flags are the
+# `|`-split tokens at the head of each arm line, which is exactly what the parser accepts.
+flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done/p' "$CHECK" \
+  | sed -n 's/^[ \t]*\([^)]*\)).*/\1/p' | tr '|' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' \
+  | grep -E -- '^-' | sort -u)"
 missing=""
 for fl in $flags; do
   printf '%s\n' "$help_out" | grep -q -- "$fl" || missing="$missing $fl"

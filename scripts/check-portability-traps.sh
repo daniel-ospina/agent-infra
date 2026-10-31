@@ -64,9 +64,10 @@
 #   · A trap assembled at runtime (`t=$(printf 'npr'; printf 'oc')`) or held in a variable
 #     (`$CPU_CMD`) is undetectable in the TEXT. Recorded, not closed.
 #   · A file that is ITSELF Linux-only is out of scope by DECLARATION, not by omission: put
-#     `# portability: linux-only <reason>` in its first 20 lines (the `# shard: off <reason>` idiom
-#     `scripts/run-bash-shards.sh` already uses). A marker with NO reason REFUSES the run (exit 2) —
-#     an unexplained exclusion is an omission, not a decision.
+#     `# portability: linux-only <reason>` on a line of its own — in the header or anywhere above the
+#     code it covers, because the declaration takes effect FROM ITS OWN LINE ONWARD (the
+#     `# shard: off <reason>` idiom `scripts/run-bash-shards.sh` already uses). A marker with NO
+#     reason REFUSES the run (exit 2) — an unexplained exclusion is an omission, not a decision.
 #   · A single correct line inside an otherwise-portable file gets a trailing
 #     `# portability-ok: <reason>`. Same rule: no reason ⇒ still flagged.
 #   · Heredoc bodies are skipped (a data line is not a command). A heredoc whose marker is computed
@@ -105,7 +106,7 @@
 #   bash scripts/check-portability-traps.sh --emit-baseline # print a baseline for the current tree
 #   bash scripts/check-portability-traps.sh --root DIR --targets FILE   # scan a fixture tree
 #   bash scripts/check-portability-traps.sh --baseline FILE             # ratchet against another file
-#   bash scripts/check-portability-traps.sh --help                      # this text
+#   bash scripts/check-portability-traps.sh --help, -h                 # this text
 #
 # EXIT: 0 clean (possibly with grandfathered findings) · 1 a NEW trap is present · 2 usage/refusal
 #
@@ -151,7 +152,7 @@ readlink-f-bsd-absent	`readlink -f`	`cd "$(dirname f)" && pwd -P` (or a box.sh h
 grep-P-bsd-absent	`grep -P` (PCRE)	`grep -E`; BSD grep has no `-P`
 date-d-gnu	`date -d @<epoch>` / `date -d '<expr>'`	BSD: `date -r <epoch>`; portable: `box_epoch_to_iso` (scripts/lib/box.sh)
 stat-c-gnu	`stat -c %Y` (GNU format)	BSD: `stat -f %m`; portable: `box_mtime` (scripts/lib/box.sh)
-free-macos-absent	`free` (memory report)	macOS: `vm_stat`; portable: the `box_*` memory probe
+free-macos-absent	`free` (memory report)	`vm_stat` on macOS and `/proc/meminfo` on Linux (this tree does that per file today, e.g. `scripts/orchestrator-harness/orch-loop.sh`; no `box_*` memory shim exists yet)
 procfs-macos-absent	`/proc/<pid>/…` (procfs)	macOS has no procfs — `ps`/`lsof`, and `# portability: linux-only <reason>` for a script that genuinely is
 bash4-declare-A	`declare -A` (associative array)	bash 3.2 has none — parallel indexed arrays, or `case`
 bash4-mapfile	`mapfile` / `readarray`	bash 3.2 has neither — `while IFS= read -r line; do …; done`
@@ -291,9 +292,23 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
       SN[length(ST)] = 1
       continue
     }
-    # ── inside `${ … }`: code; braces nest
+    # ── inside `${ … }`: code; braces nest, and a QUOTED `}` is not a brace
     if (top == "B") {
       d = length(ST)
+      # a backslash escapes the next char inside `${…}` too (`${path#\"}`, `${x%\\}`)
+      if (c == "\\") { i++; continue }
+      # ⛔ A QUOTE INSIDE `${…}` HIDES ITS `}` (review cycle-6 P2): `x="${y:-"a}b"}"` is legal shell
+      # (the default value is the quoted string `a}b`), and a brace reader that popped on the first
+      # `}` left a phantom open quote — the file then reported `context-unbalanced` and every later
+      # line went unscanned, losing the real finding one line below.
+      if (c == "\"") { st_push("D"); SN[length(ST)] = 0; out = out "\""; continue }
+      if (c == SQ) { ansi = (i > 1 && substr(line, i - 1, 1) == "$"); st_push("S"); AC[length(ST)] = ansi; SN[length(ST)] = 0; out = out SQ; continue }
+      if (c == "$" && substr(line, i + 1, 1) == "(") {
+        if (substr(line, i + 2, 1) == "(") { st_push("C"); AR[length(ST)] = 1; PD[length(ST)] = 2; out = out "$(("; i += 2; continue }
+        st_push("C"); PD[length(ST)] = 1; out = out "$("; i++; continue
+      }
+      if (c == "$" && substr(line, i + 1, 1) == "{") { st_push("B"); PD[length(ST)] = 1; out = out "${"; i++; continue }
+      if (c == "`") { st_push("K"); out = out "`"; continue }
       if (c == "{") PD[d]++
       else if (c == "}") { PD[d]--; if (PD[d] <= 0) { out = out "}"; st_pop(); continue } }
       out = out c; continue
@@ -555,7 +570,18 @@ function cp(code, tool,   re) {
   # messages, and strip_code emits `${…}` bodies as code because an expansion IS code — admitting `}`
   # flagged 6 correct lines in launchd-cycle.sh and in this suite.
   rb = "([ \t;&]|$)"
-  re = "(^|" SEP ")[ \t]*" asg kw "?[ \t]*" pfx tool rb
+  # ⛔ THE PREFIX IS A CHAIN, NOT ONE TOKEN (review cycle-6 P0): `kw "?" tool` allowed at most ONE
+  # keyword, so `if ! timeout 5 x`, `if sudo timeout 5 x`, `if nice -n 5 sed -i`, `then env FOO=1
+  # timeout 5 x` were ALL invisible — including a live
+  # `if ! timeout 300 docker run …` at scripts/orchestrator-harness/worker-terminal.test.sh:2309,
+  # which sat baselined as clean while the other three calls in that file were reported. The prefix is
+  # any sequence of {control-flow keyword, `!`, wrapper-with-its-arguments}, after the assignments.
+  # `grep` is NOT in either class, so `if grep -q timeout f` stays clean (that was the collision the
+  # kw1 narrowing below exists for).
+  ctl = "(if|then|elif|else|do|while|until)"
+  wrap = "((env|sudo|command|nohup|xargs|time|exec|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)([^;&|(){}]*[ \t])?)"
+  pre = "(" asg "(" ctl "[ \t]+|![ \t]+|" wrap ")*)"
+  re = "(^|" SEP ")[ \t]*" pre pfx tool rb
   re2 = "(^|" SEP ")[ \t]*" asg pfx tool rb
   # ⛔ A WRAPPER OFTEN CARRIES ITS OWN ARGUMENTS (review cycle-2 P2): `env FOO=1 timeout 5 …`,
   # `sudo -u root sed -i …`, `xargs -n1 timeout 5 …`, `nice -n 5 sed -i …` all put words between the
@@ -582,7 +608,14 @@ function cp(code, tool,   re) {
   # `command -v <tool>` / `type <tool>` / `hash <tool>` / `which <tool>` is a PROBE for EVERY rule, not
   # just timeout/setsid/cpu: `command -v free` is code ASKING whether free exists (review cycle-5 P2).
   probe = "(^|" SEP ")[ \t]*(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
-  if (code ~ probe && !(code ~ re) && !(code ~ re2) && !(code ~ subst)) return 0
+  # ⛔ A PROBE LINE IS CLEAN WHOLESALE, AND THE EXTRA TESTS WERE THE BUG (review cycle-6 P1): the
+  # guard used to be `probe && !re && !re2 && !subst`, but `command` is itself a WRAPPER keyword, so
+  # `re` matches the probe itself — the exception never fired for the `command -v` spelling and only
+  # worked for `type`/`hash`/`which`. Measured: `command -v free >/dev/null || :` in a correct file
+  # reported `free-macos-absent`. `timeout`/`setsid`/`cpu` already suppress a probe line wholesale
+  # (probed()), so cp() doing the same is the consistent rule, and it is CORRECT for the blessed
+  # idiom: when `command -v timeout` fails on macOS the guarded call never runs.
+  if (code ~ probe) return 0
   return (code ~ re || code ~ re2 || code ~ re3 || code ~ subst)
 }
 
@@ -667,8 +700,11 @@ FNR == 1 {
   ST = ""; split("", SN); split("", PD); split("", AR); split("", AC)
 }
 
-# ── DECLARED SCOPE: `# portability: linux-only <reason>` / `# portability: off <reason>`, header only
-FNR <= 20 && heredoc == "" && /^# *portability:/ {
+# ── DECLARED SCOPE: `# portability: linux-only <reason>` / `# portability: off <reason>`, any line
+# (it used to be the first 20 lines only, contradicting the header promise "from its own line onward"
+# — review cycle-6 P2: a mid-file declaration was a silent no-op. A declaration is read here, outside
+# a heredoc, and covers the rest of the file.
+heredoc == "" && /^# *portability:/ {
   line = $0
   sub(/^# *portability: */, "", line)
   tag = line; sub(/[ \t].*$/, "", tag)
@@ -756,7 +792,7 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # `-r` — 17 live findings were labelled "NOT yet repaired" while being portable as written.
   hit("date-d-gnu",               ((cmd_opt(code, "date", "-d") || opt_long(code, "date", "date")) && !cmd_opt(code, "date", "-r") && !cmd_opt(code, "date", "-v")), "box_epoch_to_iso (scripts/lib/box.sh)")
   hit("stat-c-gnu",               ((cmd_opt(code, "stat", "-c") || opt_long(code, "stat", "format")) && !cmd_opt(code, "stat", "-f")), "box_mtime (scripts/lib/box.sh)")
-  hit("free-macos-absent",        cp(code, "free"), "vm_stat, or the box_* memory probe")
+  hit("free-macos-absent",        cp(code, "free"), "`vm_stat` on macOS and `/proc/meminfo` on Linux (this tree does that per file today, e.g. `scripts/orchestrator-harness/orch-loop.sh`; no `box_*` memory shim exists yet)")
   # ⛔ `${x#/proc/}` IS A PARAMETER EXPANSION, NOT A READ (review cycle-1 P2): the `code` view keeps
   # `${…}` bodies (they are code), so the bare `/proc/` test flagged a string-strip expression. The
   # expansion is masked out before the unquoted test; a QUOTED path is still caught by quoted_procfs.
@@ -832,7 +868,7 @@ function cpu_rule(code,   n, mech) {
   # across three lines were three findings on correct code — live and baselined in
   # scripts/orchestrator-harness/ai-drainer.sh:255-257. A DIFFERENT mechanism within the lookback
   # window means the author is choosing, which is what the rule asks for.
-  if (mech && cpu_other(code)) return 0
+  if (mech && cpu_other(mech)) return 0
   return mech
 }
 
@@ -858,10 +894,28 @@ function probed(tool, code,   i, p, pr) {
   }
   return 0
 }
-function cpu_other(code,   i, p) {
+# cpu_mech(code) — a bitmask of the CPU mechanisms READ ON THIS LINE (1 nproc, 2 sysctl, 4 getconf).
+# Each bit is set only in COMMAND POSITION, which is the same property the same-line rule tests.
+function cpu_mech(code,   m) {
+  m = 0
+  if (inpos(code, "nproc")) m += 1
+  if (code ~ /hw\.ncpu/ && inpos(code, "sysctl")) m += 2
+  if (code ~ /_NPROCESSORS_ONLN/ && inpos(code, "getconf")) m += 4
+  return m
+}
+# cpu_other(cur) — 1 when a DIFFERENT mechanism was read within the lookback window.
+# ⛔ A WORD IS NOT A MECHANISM, AND A REPEAT IS NOT A CHAIN (review cycle-6 P0): the cycle-5 version
+# tested a SUBSTRING on any previous line, so `m="$(nproc)"` four lines below `n="$(nproc)"` was
+# cleared (a repeat of the SAME mechanism, i.e. not a chain at all) and so was an unguarded
+# `sysctl -n hw.ncpu` sitting below the variable name `nproc_` — the exact "a mechanism is a command,
+# not a word" defect, reintroduced across lines. Both are now measured in command position, and only
+# a DIFFERENT mechanism counts.
+function cpu_other(cur,   i, p, m) {
   for (i = 1; i <= 8; i++) {
     p = (FNR - i) % 8
-    if (p in hist && hist[p] ~ /(nproc|hw\.ncpu|_NPROCESSORS_ONLN)/) return 1
+    if (!(p in hist)) continue
+    m = cpu_mech(hist[p])
+    if (m != 0 && m != cur) return 1
   }
   return 0
 }
