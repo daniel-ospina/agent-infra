@@ -93,31 +93,20 @@
 # region and moved the job from :896 to :945, which left an earlier version of this very
 # block citing an unrelated `http-pool-hygiene` step — the declaration then looked
 # unsubstantiated, i.e. the false absence came back through the citation instead of the
-# logic. A later merge onto main moved it AGAIN, :945 -> :970, and the rebase of this
-# branch re-created the same rot: the numbers below were re-located by their quotes and
-# corrected — which is the rule working, not an exception to it). A THIRD move re-created
-# it once more: merging main into this branch pushed the job :970 -> :993 and
-# `script-validate` ci-main.yml:376 -> :386, and every coordinate below was re-located by
-# its quote again, in the same commit that moved it — because a citation that rots in the
-# very commit that moves the lines reads to the next lane as proof the claim is false.
-# Re-locate by the quote, and fix the number when you move it. A FOURTH move (the merge that
-# resolved this branch's conflicts) pushed every ci.yml coordinate again — +64 for the four job
-# coordinates and +11 for the :395 citation — and each was re-located by its quote in that same
-# commit; ci-main.yml's coordinates did not move.
-#   * ci.yml:1057 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
-#     `shard: [1, 2, …]` at :1147, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
-#     one check per slice, and each slice's step is `bash scripts/run-bash-shards.sh`
-#     (ci.yml:1185, `run: bash scripts/run-bash-shards.sh`);
-#   * ci-main.yml:388 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
-#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:476 is that
-#     call: `bash scripts/run-bash-shards.sh`; main publishes ONE check named
-#     `script-validate` (ci-main.yml:386);
-#   * ci.yml:1159 — "ci-main.yml's `script-validate`: one runtime for the list, in
-#     both lanes" (also ci.yml:406, "today — ci-main.yml's script-validate job runs bash
-#     shards only"). ⛔ NOT ci.yml:1060: that line is the HISTORY of the pre-#1369 split
-#     ("while main's `script-validate` ran the bash sweeps + the hermetic suites") and
-#     describes a body WIDER than the list, so citing it here would argue AGAINST the
-#     containment this pair rests on (review cycle 3).
+# logic. That preamble is the rule working, not an exception to it: a citation that rots in the
+# very commit that moves the lines reads to the next lane as proof the claim is false, so every
+# reference below is a QUOTE first and a line number never. Re-locate by the quote.
+#   * ci.yml — the PR lane's job is `bash-suites`, matrix `shard: [1, 2, …]`, so it PUBLISHES
+#     `bash-suites (1)` … `bash-suites (N)`, one check per slice, and each slice's step is
+#     `run: bash scripts/run-bash-shards.sh`;
+#   * ci-main.yml — "the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job
+#     calls the one runner below, UNSHARDED", and that call is the step
+#     `bash scripts/run-bash-shards.sh`; main publishes ONE check named `script-validate`;
+#   * ci.yml — "ci-main.yml's `script-validate`: one runtime for the list, in both lanes",
+#     and "today — ci-main.yml's script-validate job runs bash shards only". ⛔ NOT the block
+#     that is the HISTORY of the pre-#1369 split ("while main's `script-validate` ran the bash
+#     sweeps + the hermetic suites"): it describes a body WIDER than the list, so citing it
+#     here would argue AGAINST the containment this pair rests on (review cycle 3).
 #   So main's ONE check RUNS the same list the PR slices, one shard at a time: the
 #   base reports this program under the other lane's name.
 #
@@ -1399,7 +1388,8 @@ fetch_run_failed_job_names() {
 # ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
 # `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
 # programs that PR job runs — the lane-parity guard and its mutation self-test — are
-# STEPS inside `script-validate` (ci-main.yml:456, :462). So a `bash-suites-gate` red
+# STEPS inside `script-validate` (named, not line-cited: see the note there). So a
+# `bash-suites-gate` red
 # ALSO has a base counterpart under that name, and this ONE pair does not map it: that
 # refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
 # scoping decision recorded on #2610), NOT a claim that the programs differ. Mapping
@@ -1600,11 +1590,11 @@ named_unattributable_runs() {
               say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
               say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
               say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
-              say_err "       (.github/workflows/ci-main.yml:476), and '${name}' is one shard of that same"
-              say_err "       list on a PR (.github/workflows/ci.yml:1057/1185), one runtime in both lanes"
-              say_err "       (ci.yml:1159). The base therefore carries a red under a name that RUNS this"
-              say_err "       list — but that job has FIVE other steps (node --check :444, the lane-parity"
-              say_err "       guard :456, its self-test :462, plus checkout :429 and setup-node :434), so the"
+              say_err "       (.github/workflows/ci-main.yml, step 'Bash shards'), and '${name}' is one"
+              say_err "       shard of that same list on a PR (.github/workflows/ci.yml, one runtime in both"
+              say_err "       lanes). The base therefore carries a red under a name that RUNS this list — but"
+              say_err "       that job has SIX other steps (checkout, setup-node, node --check, the lane-parity"
+              say_err "       guard, its self-test, and the origin/main materialization that #3131 added), so the"
               say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
               say_err "       an established identity: no identity was produced, so nothing here is"
               say_err "       comparable yet"

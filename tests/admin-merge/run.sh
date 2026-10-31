@@ -14880,7 +14880,7 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
 # unqualified absence answer, and (n2) is the mutation — with the equivalence
 # deleted the mapped answer must disappear, so these assertions rest on that arm alone.
 # ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: main has no gate
-# JOB, so its two programs run as STEPS inside `script-validate` (ci-main.yml:456/:462) and
+# JOB, so its two programs run as STEPS inside `script-validate` (named, not line-cited) and
 # that red also has a base counterpart under the other name. (n1) pins the SCOPING decision
 # (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own note says
 # so rather than claiming the programs differ.
