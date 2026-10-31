@@ -990,6 +990,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_WT_LOCK_STALE_SECONDS:-1800}",
     axis: "retention",
     guardedBy: NONE,
+    overrides: ['REAP_WT_LOCK_STALE_SECONDS="$REAP_WT_LOCK_STALE_CLAMPED"'],
+    note: "#2541 review P2 — the lock horizon is RAISED to 4x REAP_WT_BUDGET_SECONDS when the two are configured the wrong way round (a stale-lock age test that ignores the budget breaks a LIVE owner's lock). It is registered as an override, not left unrecorded, because it is a second, value-CHANGING assignment to the same bound: the effective horizon in force is then the clamped one, so an unrecorded clamp is a green gate over a wrong effective value. The clamp is never silent — it is reported as a WARN before the lock is taken, so the artifact always names the horizon actually in force.",
   },
   {
     name: "VENV_MIN_AGE",
