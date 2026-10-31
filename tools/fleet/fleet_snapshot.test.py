@@ -11,10 +11,16 @@ WHAT IS PINNED, AND WHY EACH ONE EXISTS
    gate, which must still fire for the population whose identity source IS the
    store. A mutation that moves the store gate out of its population branch reds
    the first pin.
-2. **A dispatch lane with no bound incarnation is an ABSTENTION, never `dead`.**
-   This population has no durable fenced incarnation, so `dead` is unreachable
-   by design (#1178 C1). A mutation that lets `dead` be reached from an
-   unbound-transcript Evidence reds the second pin.
+2. **A dispatch lane can never read `dead`, BOUND or UNBOUND.**
+   This population has no durable fenced incarnation: the pid it reports is
+   BORROWED from a separate process's environment, and the probe answers
+   "this pid is listed", never "this pid IS this transcript". So a witness
+   reading is the same uncertainty as an unbound row — and a lane whose bound
+   process exits between the pass's `/proc` read and its own probe (ordinary
+   fleet life) must not render the false DEAD this population exists to
+   remove. Pins `2a`-`2c` hold the unbound shape, `2d`-`2g` the bound-then-
+   absent shape through the REAL acquisition path, and `2e` proves the arm is
+   population-scoped rather than a blanket suppression of death evidence.
 3. **The two REAL shapes from 2026-10-30**, as transcripts:
    * a lane **alive and silent inside one long `bash` call** must read
      `running-quiet/tool-in-flight` (the false-DEAD reading that started this);
@@ -31,6 +37,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -42,12 +50,91 @@ if HERE not in sys.path:
 import liveness  # noqa: E402
 import fleet_snapshot as fs  # noqa: E402
 
+LIVENESS_PATH = os.path.join(HERE, "liveness.py")
+SNAPSHOT_PATH = os.path.join(HERE, "fleet_snapshot.py")
+SELF_PATH = os.path.abspath(__file__)
+
 FAILS = []
+PINS = [0]
 
 
 def ck(name, cond, detail=""):
+    PINS[0] += 1
     if not cond:
         FAILS.append("%s%s" % (name, (": " + detail) if detail else ""))
+
+
+# ── mutation evidence: a green pin is only a pin if it can go RED ──────────
+# Each entry reintroduces ONE defect into a TEMP copy of the module and re-runs
+# this whole suite against it in a subprocess. The paired pin is named, and a
+# mutation the suite does not catch is reported as a suite failure — the same
+# discipline every other fleet suite here follows (`liveness.test.py
+# --mutations`, `lane_liveness.test.py --red-control`).
+MUTATIONS = [
+    ("drop-borrowed-incarnation-arm", "classifier",
+     "if ev.identity_population == DISPATCH_POPULATION and is_dead_evidence(cands):",
+     "if False and is_dead_evidence(cands):",
+     "2d",
+     "a dispatch lane whose bound pid reads `absent` renders `dead` again (the false DEAD #1178 removes)"),
+    ("unscope-the-store-gate", "classifier",
+     "if ev.identity_population == CMUX_POPULATION and not ev.store_ok:",
+     "if not ev.store_ok:",
+     "1b",
+     "every dispatch lane on a store-less box reads `store-unreadable` instead of a verdict"),
+    ("no-swap-reports-zero", "snapshot",
+     '        if total == 0:\n            return None, unmeasured("no swap configured")',
+     '        if total == 0:\n            return 0, ""',
+     "4e",
+     "a box with no swap reports 0% pressure, which reads as the opposite claim"),
+    ("unbound-max-lanes", "snapshot",
+     "if derived < 1 or derived > 100:",
+     "if False:",
+     "5c",
+     "an absurd core count fans the box out to a ten-digit lane ceiling"),
+    ("any-process-is-a-lane", "snapshot",
+     'if comm not in ("pi", "node", "Pi"):',
+     "if False:",
+     "6b",
+     "every process with a PI_SESSION_ID in its env is bound as a lane holder"),
+]
+
+
+def run_mutations():
+    print("── MUTATIONS — each reintroduced defect must make its paired pin RED ──\n")
+    caught = missed = 0
+    for name, target, old, new, pin, why in MUTATIONS:
+        tmp = tempfile.mkdtemp(prefix="fleet-snap-mut-")
+        try:
+            for src in (LIVENESS_PATH, SNAPSHOT_PATH, SELF_PATH):
+                shutil.copy2(src, tmp)
+            path = os.path.join(tmp, "liveness.py" if target == "classifier" else "fleet_snapshot.py")
+            with open(path, "r", encoding="utf-8") as fh:
+                source = fh.read()
+            if source.count(old) != 1:
+                raise SystemExit("mutation anchor not unique in %s (%d hits):\n%s"
+                                 % (path, source.count(old), old))
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(source.replace(old, new, 1))
+            proc = subprocess.run([sys.executable, os.path.join(tmp, os.path.basename(SELF_PATH))],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=tmp)
+            out = proc.stdout.decode("utf-8", "replace")
+            red = proc.returncode != 0 and ("  - " + pin) in out
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        print("── %s → %s" % (name, why))
+        print("   suite rc=%d, pinned %s went red=%s" % (proc.returncode, pin, red))
+        if red:
+            caught += 1
+            print("   ✅ RED — the suite caught the reintroduced defect\n")
+        else:
+            missed += 1
+            print("   ❌ NOT RED — the suite did NOT catch its own defect\n")
+    print("MUTATIONS=%d caught=%d missed=%d" % (len(MUTATIONS), caught, missed))
+    return 0 if missed == 0 else 1
+
+
+if "--mutations" in sys.argv[1:]:
+    sys.exit(run_mutations())
 
 
 def write_transcript(path, entries):
@@ -110,6 +197,63 @@ ck("2c `dead` is unreachable for this population",
        sid="s", store_ok=None, identity_population=liveness.DISPATCH_POPULATION,
        candidates=[], jsonl_grew=g, jsonl_age_ms=a, now_ms=0)).state != "dead"
        for g in (False, True, None) for a in (0, liveness.IDLE_MS * 2, None)))
+
+# ── 2d/2e. the BOUND-then-absent shape: borrowed incarnation, never a fence ──
+# A dispatch lane's pid comes out of another process's environment, so `absent`
+# on it says only "the process this row was bound to is no longer listed". These
+# pins FAIL on the pre-fix ladder, which returned `dead/incarnations-absent`.
+for observed in ("absent", "zombie"):
+    v = liveness.evaluate(liveness.Evidence(
+        sid="s", store_ok=None, identity_population=liveness.DISPATCH_POPULATION,
+        candidates=[liveness.Candidate(pid=4242, observed=observed, kind="argv")],
+        jsonl_grew=False, jsonl_age_ms=liveness.IDLE_MS // 2, now_ms=0,
+        dispatch_detail="bound pid=4242; transcript x.jsonl, last write 83m00s ago"))
+    ck("2d a bound-then-%s dispatch lane abstains instead of reading dead" % observed,
+       (v.state, v.reason) == ("unknown", "no-bound-incarnation"), str(v))
+    ck("2d' the abstention keeps the probe reading as evidence (%s)" % observed,
+       ("4242:%s" % observed) in (v.witnesses or ()) and "4242" in (v.detail or ""), str(v))
+
+# 2e: the arm is POPULATION-SCOPED. The identical candidate set still reads
+# `dead` in the cmux population — whose incarnation IS fenced — so 2d cannot be
+# satisfied by a blanket suppression of death evidence.
+v = liveness.evaluate(liveness.Evidence(
+    sid="s", store_ok=True,
+    candidates=[liveness.Candidate(pid=4242, observed="absent", kind="argv")],
+    jsonl_grew=False, jsonl_age_ms=liveness.IDLE_MS // 2, now_ms=0))
+ck("2e the same absent binding still reads dead in the cmux population (arm is population-scoped)",
+   (v.state, v.reason) == ("dead", "incarnations-absent"), str(v))
+
+# 2f/2g/2h: the REAL acquisition path. `gather_dispatch`'s pid branch had no pin
+# at all — 3a/3b/3c pass pid=None and then overwrite `ev.candidates` by hand. A
+# 3-line shim stands in for the identity CLI, so the binding, the probe mapping
+# and the ladder are exercised end to end with no live process and no ps read.
+shim_dir = tempfile.mkdtemp(prefix="fleet-snap-lib-")
+
+
+def shim(name, body):
+    path = os.path.join(shim_dir, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n%s\n" % body)
+    return path
+
+
+absent_lib = shim("absent.sh", 'echo "absent pid=$2"; exit 1')
+holder_lib = shim("holder.sh", 'echo "holder pid=$2"; exit 0')
+bind_dir = tempfile.mkdtemp(prefix="fleet-snap-bind-")
+bind_sid = "01a19016-0000-7000-8000-000000000003"
+p = resting_transcript(bind_dir, bind_sid, 4 * 3600)
+ev = liveness.gather_dispatch(bind_sid, pid=4242, transcript=p, sessions_dir=bind_dir,
+                              lib=absent_lib)
+ck("2f gather_dispatch turns the bound pid into a probed candidate (real acquisition path)",
+   [(c.pid, c.observed) for c in ev.candidates] == [(4242, "absent")], str(ev.candidates))
+v = liveness.evaluate(ev)
+ck("2g a bound pid the probe reports ABSENT reads an abstention, never dead",
+   (v.state, v.reason) == ("unknown", "no-bound-incarnation"), str(v))
+ev = liveness.gather_dispatch(bind_sid, pid=4242, transcript=p, sessions_dir=bind_dir,
+                              lib=holder_lib)
+v = liveness.evaluate(ev)
+ck("2h the SAME row with a live holder is still classified (the arm does not blind a live lane)",
+   (v.state, v.reason) == ("running-quiet", "turn-ended"), str(v))
 
 # ── 3. the two REAL shapes from 2026-10-30 ──────────────────────────────────
 tmp = tempfile.mkdtemp(prefix="fleet-snap-test-")
@@ -209,4 +353,4 @@ if FAILS:
         print("  - " + f)
     sys.exit(1)
 print("PASS: %d pins hold (population extension, 2 real shapes, UNMEASURED, MAX_LANES, binding)"
-      % 18)
+      % PINS[0])
