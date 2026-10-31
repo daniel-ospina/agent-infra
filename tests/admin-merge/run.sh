@@ -13265,6 +13265,34 @@ grep -q 'DROPPING the lane filter' "$TMP/out" \
   && fail "(a0) the lane filter was dropped on an unread count (fail-open)" \
   || pass "(a0) the lane filter is KEPT when the discriminating read fails (fail-closed)"
 
+# (a5) THE OTHER UNREAD READ — the DISCRIMINATING PROBE itself fails. (a0) above fails the
+# RUNS list, so the wait never learns whether the lane has a run at all. Here the runs list is
+# READABLE and empty and it is `first_checks_head_check_count` that dies (`pr-check-runs-unreadable`,
+# the fake gh's own seam for exactly this endpoint) — the read (a) rests its "PROVEN-EMPTY" claim
+# on. `FIRST_CHECKS_HEAD_CHECKS` is assigned ONLY when that probe SUCCEEDS, so a failed probe leaves
+# it empty, the `= "0"` arm is not taken, and the refusal must fall back to the generic sentence.
+# ⛔ The direction that matters: an unread probe may never be reported as a proven-empty surface,
+# because that is the reading that would let a wait conclude "nothing exists" from "I could not look".
+# Distinct from (a0) on purpose: the two arms fail different reads, and a rewrite could keep one
+# fail-closed while collapsing the other.
+new_scen waits-first-never-unreadable
+HEAD_WFU="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WFU" > "$SCEN/head"
+: > "$SCEN/pr-check-runs-unreadable"
+SUITE_FIRST_CHECKS_WAIT=2 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a5) an UNREADABLE head-check probe still BLOCKS (exit $rc)" \
+  || fail "(a5) an unreadable head surface CERTIFIED the merge"
+grep -q 'NO run of the lane ever attached to this head' "$TMP/err" \
+  && pass "(a5) …and it falls back to the generic never-attached arm" \
+  || { fail "(a5) an UNREAD probe is not told apart from a PROVEN-EMPTY surface"; sed 's/^/      /' "$TMP/err" | head -8; }
+grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
+  && fail "(a5) the UNREAD probe was reported as a PROVEN-EMPTY surface — the (a) arm's claim would rest on nothing" \
+  || pass "(a5) …and it does NOT borrow the proven-empty arm's wording"
+grep -q 'DROPPING the lane filter' "$TMP/out" \
+  && fail "(a5) the lane filter was dropped on a failed PROBE (fail-open)" \
+  || pass "(a5) …and the lane filter is KEPT when the probe itself fails (fail-closed)"
+
 # (a2) CHECKS STARTED BUT ARE STILL RUNNING — the #2233/#2234 shape, exactly:
 # one queued/in-progress lane run. The wait must report the RUN it observed (id +
 # status), then block; it must not claim a stall (no per-shard bound exists yet).
