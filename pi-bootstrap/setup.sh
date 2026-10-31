@@ -1055,7 +1055,11 @@ if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
                 --dest "$DEST/scripts" --src "$INFRA_ROOT" --ref HEAD --src-mode worktree \
                 --pin-file "$DEST/state/HARNESS-PIN" --quiet 2>&1 >/dev/null)" || _farm_rc=$?
   case "$_farm_rc" in
-    0) echo "    farm: OK — every sourced file matches the bytes the farm copied" ;;
+    0) echo "    farm: OK — every sourced file matches the bytes the farm copied"
+       # The pass can still carry a NOTE (e.g. "no pin record: pin identity NOT verified"). Printing it
+       # is the difference between "verified" and "verified except the trap arm", and --quiet put it on
+       # stderr while this line hid it.
+       [ -z "$_farm_msg" ] || printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
     1) echo "    ⛔ FARM DID NOT CONVERGE — a deployed script is not the shipped code:"
        printf '%s\n' "$_farm_msg" | sed 's/^/      /'
        echo "    Refusing to report a successful install over a farm that launchd would execute as stale code."

@@ -37,6 +37,7 @@ mkdir -p "$TMP" || { echo "cannot create $TMP" >&2; exit 1; }
 SRC="$TMP/src"
 mkdir -p "$SRC/scripts" "$SRC/tools/fleet"
 printf '#!/usr/bin/env python3\nprint("hello")\n' > "$SRC/scripts/alpha.py"
+chmod 755 "$SRC/scripts/alpha.py"
 printf '#!/bin/bash\necho beta\n'                > "$SRC/scripts/beta.sh"
 printf 'print("gamma")\n'                        > "$SRC/tools/fleet/gamma.py"
 printf 'print("nested")\n'                       > "$SRC/scripts/nested_only.py"
@@ -185,6 +186,45 @@ OUT="$TMP/out"; ERR="$TMP/err"
 ( cd "$TMP" && bash "$CHECK" --dest "$F15" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
 RC=$?
 ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "ref mode still calls that same copy STALE (rc=$RC)"
+
+# 16. A PRESENT-BUT-EMPTY declaration is UNKNOWN (a recording that failed is not a farm that owes nothing).
+C16="$TMP/c16"; mk_farm "$C16/scripts"; mkdir -p "$C16/state"; : > "$C16/state/farm-declared.txt"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && bash "$CHECK" --dest "$C16/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "an EMPTY farm declaration is UNKNOWN, not a pass (rc=$RC)"
+
+# 17. A link name that is a REGEX METACHARACTER must not let an empty layer through.
+C17="$TMP/c17"; mk_farm "$C17/scripts"; mkdir -p "$C17/scripts/lib" "$C17/empty"
+printf 'print("lib")\n' > "$C17/scripts/lib/x.py"
+mkdir -p "$TMP/c17src"; cp -r "$SRC/scripts/." "$TMP/c17src/" 2>/dev/null
+ln -s "$C17/empty" "$C17/scripts/li."
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && bash "$CHECK" --dest "$C17/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a metachar link name cannot hide an EMPTY symlinked layer (rc=$RC)"
+
+# 18. A byte-identical copy that CANNOT BE EXECUTED is drift, not ok.
+F18="$TMP/f18"; mk_farm "$F18"; chmod 644 "$F18/alpha.py"   # source is 755 in the repo
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && bash "$CHECK" --dest "$F18" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "a non-executable copy of an executable script is drift (rc=$RC)"
+grep -q 'NOT-EXECUTABLE' "$ERR" && ck 0 "...and is labelled NOT-EXECUTABLE" || ck 1 "...and is labelled NOT-EXECUTABLE"
+
+# 19. --src-mode worktree must STILL refuse an explicit --ref that does not resolve.
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && bash "$CHECK" --dest "$F18" --src "$SRC" --ref no-such-ref --src-mode worktree --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "worktree mode still refuses an unresolvable explicit --ref (rc=$RC)"
+
+# 20. An ABSENT pin record is NOTED (pin identity not verified), not silently skipped.
+F20="$TMP/f20"; mk_farm "$F20"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && bash "$CHECK" --dest "$F20" --src "$SRC" --ref HEAD --pin-file "$TMP/no-such-pin" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 0 ] && echo 0 || echo 1) "an absent pin record leaves the pass at 0 (first install) (rc=$RC)"
+grep -qi 'pin identity NOT verified' "$ERR" && ck 0 "...but says pin identity was NOT verified" || ck 1 "...but says pin identity was NOT verified"
 
 echo ""
 if [ "$fail" -eq 0 ]; then

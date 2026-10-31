@@ -160,6 +160,13 @@ else
     SRC_SHA=""
     SRC_HAS_GIT=0
 fi
+# ⛔ HOISTED ABOVE BOTH MODE BRANCHES. An explicitly-passed --ref that does not resolve is operator
+# error in BOTH modes — pin identity is read from the resolved commit regardless — and leaving it only
+# in the `ref` branch re-opened the round-1 finding in the mode setup.sh actually uses.
+if [ "$REF_EXPLICIT" -eq 1 ] && [ "$SRC_HAS_GIT" -eq 0 ]; then
+    say_err "$PROG: UNKNOWN — --ref '$REF' does not resolve in $SRC (not a git checkout?); refusing to grade anything."
+    exit 2
+fi
 if [ "$SRC_MODE_REQ" = "worktree" ]; then
     # The caller asked for the bytes ON DISK. Identity is still read from the resolved commit.
     SRC_MODE="worktree"
@@ -167,11 +174,6 @@ elif [ "$SRC_HAS_GIT" -eq 0 ]; then
     # No git (a tarball install) — compare the working tree, and SAY SO on STDERR so --quiet cannot
     # hide a weaker comparison.
     say_err "$PROG: note — $SRC has no ref '$REF' (not a git checkout?); comparing the WORKING TREE."
-    # AN EXPLICITLY-PASSED --ref THAT DOES NOT RESOLVE IS OPERATOR ERROR, NEVER A MODE.
-    if [ "$REF_EXPLICIT" -eq 1 ]; then
-        say_err "$PROG: UNKNOWN — --ref '$REF' does not resolve in $SRC; refusing to grade the working tree instead."
-        exit 2
-    fi
     SRC_MODE="worktree"
 else
     SRC_MODE="ref:$REF"
@@ -208,6 +210,15 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
         PIN_TREE_NOTE="no .harness-path record on this box"
     fi
     say "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
+fi
+
+if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ]; then
+    # ⛔ "NO PIN YET" AND "PIN LOST" ARE INDISTINGUISHABLE AND BOTH SKIP THE TRAP ARM. A first install
+    # legitimately has no pin record; a box whose record was deleted or whose path was mistyped reads
+    # identically — and then the arm that exists for "a byte comparison against the tree it farms FROM
+    # is green regardless" is simply off, with no line saying so. Note it, on stderr, and stay 0 so a
+    # first-time install is unaffected.
+    say_err "$PROG: note — no pin record at $PIN_FILE: pin identity NOT verified (a first install has none; a box that LOST one reads the same)."
 fi
 
 # ── the source lookup map ──────────────────────────────────────────────────────────────────────
@@ -292,9 +303,17 @@ while IFS= read -r ln; do
         if [ ! -r "$DEST/$ln" ] || [ ! -x "$DEST/$ln" ]; then
             say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that cannot be read; its layer contributes no rows and cannot be graded."
             broken_link=1
-        elif ! printf '%s\n' "$rows" | grep -q "^$ln/"; then
-            say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that contributed NO files; an empty layer is not a matching layer."
-            broken_link=1
+        else
+            # ⛔ FIXED-STRING CONTAINMENT, NEVER `grep "^$ln/"`: a link named `li.` built the regex
+            # `^li./`, which matched the unrelated row `lib/x.py`, so an EMPTY symlinked directory was
+            # graded OK — defeating the very arm that exists because "a farm whose fleet/ is a symlink
+            # to a stale tree read as OK". `case` on a newline-fenced string is literal (bash 3.2-safe).
+            case $'\n'"$rows" in
+                *$'\n'"$ln"/*) : ;;
+                *)
+                    say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that contributed NO files; an empty layer is not a matching layer."
+                    broken_link=1 ;;
+            esac
         fi
     elif [ "$QUIET" -eq 0 ]; then
         printf '%-46s | %-12s | %-12s | %s\n' "$ln" "-" "-" "SYMLINK (graded via its target)"
@@ -332,6 +351,24 @@ while IFS= read -r rel; do
             exit 2
         fi
         matched=$((matched+1))
+        # ⛔ THE EXECUTABLE BIT IS PART OF "IS THIS THE CODE?" A byte-identical copy that launchd
+        # cannot exec is the same silent no-op class as #10114 (the file that must run, that cannot),
+        # and three of the five farm legs swallow the failure (`chmod +x "$dest" 2>/dev/null || true`
+        # in pi-bootstrap/setup.sh), so existence + byte-equality stays green over it. Git stores the
+        # bit; the working tree carries it.
+        src_exec=0
+        if [ -n "$SRC_READ" ]; then
+            case "$(git -C "$SRC" ls-tree "$SRC_READ" -- "$src" 2>/dev/null | cut -d' ' -f1)" in
+                100755) src_exec=1 ;;
+            esac
+        else
+            [ -x "$SRC/$src" ] && src_exec=1
+        fi
+        if [ "$src_exec" -eq 1 ] && [ ! -x "$DEST/$rel" ]; then
+            stale=$((stale+1))
+            printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "NOT-EXECUTABLE" >&2
+            continue
+        fi
         if [ "$d_sha" = "$s_sha" ]; then
             same=$((same+1))
             [ "$QUIET" -eq 1 ] || printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "ok"
@@ -356,21 +393,34 @@ EOF_ROWS
 DECL="$(dirname "$DEST")/state/farm-declared.txt"
 missing=0
 if [ -f "$DECL" ]; then
+    # ⛔ A PRESENT-BUT-EMPTY OR UNREADABLE DECLARATION IS `UNKNOWN`, NOT "NOTHING WAS DECLARED".
+    # `$(cat "$DECL" 2>/dev/null)` discards the read's failure and an empty list declares nothing, so a
+    # farm missing three shipped files graded rc=0 with no note — the #1924 "green tick over a no-op"
+    # failure, one file over. The writer can even produce the empty case: `farm_record_declared`
+    # accepts an empty list and returns 0 while the box holds 84 files, so "0 declared" is
+    # contradictory, never a fact.
+    decl_body="$(cat "$DECL" 2>/dev/null)"
+    decl_rc=$?
+    if [ "$decl_rc" -ne 0 ]; then
+        say_err "$PROG: UNKNOWN — the farm declaration $DECL exists but could not be read (exit $decl_rc);"
+        say_err "   what the farm OWES cannot be graded, and a missing file cannot be ruled out."
+        exit 2
+    fi
+    if [ -z "$(printf '%s' "$decl_body" | tr -d '[:space:]')" ]; then
+        say_err "$PROG: UNKNOWN — the farm declaration $DECL is EMPTY. A farm that owes nothing is"
+        say_err "   indistinguishable from a recording that failed, so this is not a pass."
+        exit 2
+    fi
     while IFS= read -r dpath; do
         [ -n "$dpath" ] || continue
         case "$dpath" in scripts/*) rel="${dpath#scripts/}" ;; *) continue ;; esac
         is_declared_local "$rel" && continue
         if [ ! -e "$DEST/$rel" ]; then
-            case " $rows " in
-                *" $rel "*) : ;;
-                *)
-                    # also cover a nested row (declared flat, present under a subdir is NOT a match)
-                    printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "DECLARED-BUT-ABSENT" >&2
-                    missing=$((missing+1)) ;;
-            esac
+            printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "DECLARED-BUT-ABSENT" >&2
+            missing=$((missing+1))
         fi
     done <<EOF_DECL
-$(cat "$DECL" 2>/dev/null)
+$decl_body
 EOF_DECL
 else
     say_err "$PROG: note — no $DECL, so what the farm DECLARES could not be graded; only the files already on the box were (a declared-but-absent script is invisible to this run)."
@@ -388,6 +438,7 @@ if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
 fi
 say_err "$PROG: DRIFT — $stale stale, $missing declared-but-absent, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."
 say_err "   A STALE file is a copy launchd/systemd will EXECUTE that is not the code the repo ships."
+say_err "   A NOT-EXECUTABLE file is byte-identical but cannot be run — the same silent no-op class."
 say_err "   A DECLARED-BUT-ABSENT file is one the farm owes and never landed."
 say_err "   An UNSOURCED file is on the box and in no repo file — declare it local or delete it."
 say_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent checkout, then re-run this."
