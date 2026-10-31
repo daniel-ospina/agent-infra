@@ -3506,6 +3506,56 @@ ${MISSING}"
     fi
   fi
 
+  # ── Durable channel: the SAME signed marker as an append-only PR COMMENT ──
+  # (agent-infra#1224, producer half — the gate has shipped the consumer half
+  # since 2026-09 and docs/ai-review-gate.md carried "Producer status: the
+  # producer half is NOT deployed" for a month.) Why it is not optional: the PR
+  # body is a MUTABLE field that lanes rewrite routinely, so a body-only marker
+  # is one edit away from being no marker at all, and the edit that removed it
+  # is invisible — the next read reports "No AI review evidence found" for a
+  # review that genuinely happened. Measured 2026-10-31: tortoise#10410 carries a
+  # signed clean marker at its exact head d96ffe8c, its only gate attempt was
+  # created BEFORE that marker landed and concluded `failure` with
+  # "No AI review evidence found in PR #10410 body or comments", and the head
+  # then held that red with the verdict present. tortoise#10424's own review
+  # comment reports the same shape (a `reviews/10424.json ... clean @ 3805f492`
+  # attestation that no longer covers the head it sits on, after a body edit).
+  # The gate already unions body ∪ comments and HMAC-verifies both, admitting
+  # only OWNER/MEMBER/COLLABORATOR comments, so this ADDS AVAILABILITY and
+  # changes no security property: a forged or stale comment still fails the
+  # HMAC or the binding rules. Idempotent — post only when no admitted comment
+  # already carries this exact marker text. Best-effort: NEVER fails the record.
+  # The BODY mirror above stays: it is what fires `edited` and re-runs the gate
+  # (a comment alone fires `issue_comment`, which this gate deliberately does
+  # not trigger on — see the skip-footgun rule in the workflow header).
+  if [ -n "${MARKER:-}" ] && [ "${MARKER_SIGNED:-0}" = "1" ]; then
+    # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
+    # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
+    PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
+    HAVE_COMMENT=0
+    if EXISTING_COMMENT_BODIES="$(command gh api --paginate \
+         "repos/$REPO/issues/$PR/comments" --jq "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null)"; then
+      if grep -qxF -- "$MARKER" <<<"$EXISTING_COMMENT_BODIES"; then
+        HAVE_COMMENT=1
+      fi
+    else
+      # Fail SOFT here but LOUDLY, and do not conflate this with "no comment
+      # exists": `gh api` prints HTTP error bodies to STDOUT, so an unguarded
+      # capture would read an error body as comment text and could then believe
+      # the marker is already posted when it is not.
+      echo "⚠️ record-review: could not read the PR's comments (transient API failure?) — the durable comment copy of the marker was not verified this run; the body copy above is unaffected. Re-run record-review.sh to retry." >&2
+      HAVE_COMMENT=-1
+    fi
+    if [ "$HAVE_COMMENT" = "0" ]; then
+      if command jq -Rn --arg body "$MARKER" '{body: $body}' 2>/dev/null \
+          | command gh api -X POST "repos/$REPO/issues/$PR/comments" --input - >/dev/null 2>&1; then
+        echo "review evidence posted to $REPO#$PR as a durable comment (body mirror retained: it is what re-triggers the gate)"
+      else
+        echo "note: could not post the durable comment copy of the review evidence (record and body copy still saved)" >&2
+      fi
+    fi
+  fi
+
   # ── Stale gate-run remediation (#633) ──────────────────────────────────
   # A completed pre-evidence FAILURE (the push-triggered run that evaluated
   # the body before this marker existed) does not durably block a merge once
@@ -3593,6 +3643,17 @@ ${MISSING}"
       # empty gate-name match from minting a literal `null` id. The local name
       # filter is a belt over the server filter, and $gate arrives via --arg —
       # no jq-program interpolation.
+      # ⛔ `cancelled` STAYS IN THE NON-RED SET — a recorded repo rule, pinned by
+      # `record-review.test.sh` case 14.14c ("cancelled is non-red per the repo
+      # rule") and by AGENTS.md §"Reading verification state" step 4. A required
+      # check does need a green conclusion, so a head whose newest attempt is
+      # `cancelled` IS blocked — but flipping that predicate here would silently
+      # reverse the ruling for every consumer of the polarity. It is a REOPEN, not
+      # an edit: the evidence (tortoise #10406 had 4 of its newest 8 gate runs
+      # `cancelled`; #10443 newest was `cancelled` at 17:39 until a job rerun
+      # rescued it at 17:47; #10437 `cancelled` at 18:00 → green at 18:04) is
+      # recorded in the PR body and in tortoise#10399, and the decision stays where
+      # it lives. Deliberately UNCHANGED.
       if ! NEWEST_RED_ID="$(printf '%s' "$GATE_JSON" \
         | jq -r --arg gate "$GATE_CHECK" \
           '[.check_runs[] | select(.name == $gate)] | sort_by(.id) | reverse | .[0] | select(. != null) | select(.status != "queued" and .status != "in_progress" and .status != "waiting" and .status != "requested" and .status != "pending") | select((.conclusion // "") as $c | ($c != "success" and $c != "neutral" and $c != "skipped" and $c != "cancelled" and $c != "stale")) | .id' \
