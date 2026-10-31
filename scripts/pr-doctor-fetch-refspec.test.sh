@@ -28,13 +28,14 @@
 # GREEN through such a comment, which is the proof that PA is judging behaviour and not text). That is
 # the safe direction — an over-block, one word to reword — and it is accepted. Leave P3 alone.
 #
-# ⛔ THAT IS A PROPERTY OF THE TEST, NOT A MEASUREMENT OF THIS HEAD (review P2, 2026-10-31). An earlier
-# revision of this note read "measured at this head: N passed / M failed" — FALSE at the shipped head, and
-# then FALSE AGAIN after the note was corrected, because section L grew after the number was taken (the
-# same class twice: a stale count is not a smaller problem than a stale diagnosis, it is the same one).
-# So there is NO COUNT here. The falsifiable claim is the property: this suite is green because no comment
-# in `pr-doctor.py` quotes the pre-fix argv (`grep -nF '"fetch", "origin", branch'` and
-# `grep -nF 'fetch_ref or branch'` are both empty at this head), so the accepted false-red does not fire.
+# ⛔ THAT IS A PROPERTY OF THE TEST, NOT A MEASUREMENT OF THIS HEAD (review P2, 2026-10-31). Earlier
+# revisions of this note read "measured at this head: 14 passed / 1 failed", then "… 15 passed / 0
+# failed", then "… 21 passed / 0 failed" — each FALSE at the head it shipped on, the count going stale the
+# moment the suite grew (section L has been widened again since). Three corrections of the SAME number is
+# the evidence that the number is the wrong artifact, so there is NO COUNT here. The falsifiable claim is
+# the property: this suite is green because no comment in `pr-doctor.py` quotes the pre-fix argv
+# (`grep -nF '"fetch", "origin", branch'` and `grep -nF 'fetch_ref or branch'` are both empty at this
+# head), so the accepted false-red does not fire, and a run that DOES fire it is red for that reason alone.
 # A false "accepted red" is worse than no note: it trains the next reader to expect a P3 failure and to
 # wave it through, which is exactly the guard the arm exists to be. A measurement is only valid for the
 # revision it was taken at; `tail -1` on a run is the only count this file will ever let a reader check.
@@ -152,12 +153,15 @@ assert_not_contains "$(cat "$SRC")" 'fetch_ref or branch' \
 # ⛔ AND THE NUMBER OF SITES IS PINNED, BECAUSE `any(...)` OVER A LIST IS NOT A PROPERTY OF THE FILE
 # (measured 2026-10-30, review round 4). The last guard here was `any(is_helper(e) for e, _ in ops)`,
 # and it judged the SURVIVORS of a per-site filter — so it asked "does SOME site look right", which a
-# site that contributes nothing to the behaviour satisfies. Measured, at this head: rewriting the base
-# arm's operand to `_ref2 = "refs/heads/%s" % branch` (a plain name holding a bare `refs/heads/...`
-# string — the bare-refspec DISEASE, and `ok_expr` cannot tell it from a fork's `refs/pull/<n>/head`)
-# gave 13 passed / 2 failed (P1, P5): RED, so the guard did work. ADDING ONE DEAD SITE —
-# `if False: _git(["fetch", "origin", _fetch_refspec(branch)])` — gave 15 passed / 0 failed, rc=0:
-# GREEN, over a file whose measured bug was fully live. That is the fail-open this pin closes, and it is
+# site that contributes nothing to the behaviour satisfies. Measured at review round 4's revision (the suite
+# was SHORTER then than the one that ships — the counts below are that revision's, NOT this head's, and
+# quoting them as if they were is the same stale-measurement trap this note warns about): rewriting the base arm's operand to
+# `_ref2 = "refs/heads/%s" % branch` (a plain name holding a bare `refs/heads/...` string — the
+# bare-refspec DISEASE, and `ok_expr` cannot tell it from a fork's `refs/pull/<n>/head`) gave 13 passed /
+# 2 failed (P1, P5): RED, so the guard did work. ADDING ONE DEAD SITE —
+# `if False: _git(["fetch", "origin", _fetch_refspec(branch)])` — gave 15 passed / 0 failed, rc=0 at
+# that revision: GREEN, over a file whose measured bug was fully live. That is the fail-open this pin
+# closes, and it is
 # the shape that matters: a decoy is CHEAPER than a fix, so "some site is right" is not falsifiable by a
 # revert.
 #
