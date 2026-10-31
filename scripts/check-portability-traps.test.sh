@@ -17,9 +17,12 @@
 #   · A trap assembled at runtime, or held in a variable, is undetectable in the TEXT — declared in
 #     the detector's header, not testable here.
 #
-# HERMETIC: every fixture is built under $TMP; nothing in the real tree is read except the detector,
-# its baseline, the rule table it prints, and `scripts/lib/box.sh` (for the fallback arms). The
-# detector is invoked with `--targets` so the REAL tree is never scanned by an arm.
+# HERMETIC *FIXTURES*: every fixture is built under $TMP, and the arms A–E scan ONLY fixture target
+# lists (`--targets`) — no arm's verdict depends on a real file. But this suite is NOT tree-independent,
+# and the earlier wording claimed it was (review finding, three cycles): F1 scans the detector+brief
+# themselves, F4/F5 scan the REPO'S OWN TREE under the shipped baseline (that IS the gate), and F6 reads
+# `scripts/run-bash-shards.sh` to prove the suite is discovered. The consequence a reader must know: a
+# lane that adds a real trap reds THIS shard, by design.
 #
 #   bash scripts/check-portability-traps.test.sh
 #   bash scripts/check-portability-traps.test.sh --verbose
@@ -316,9 +319,9 @@ for f in survive/1-comment-sub.sh survive/2-len-arith.sh survive/3-shift.sh \
          survive/4-heredoc-sub.sh survive/5-awk-multi.sh survive/6-ansi-c.sh \
          survive/7-phantom-open.sh survive/8-crlf.sh survive/9-brace-quote.sh; do
   mine="$(awk -v f="$f" 'index($0, f ":") == 1' "$OUT")"
-  if printf '%s\n' "$mine" | grep -qE 'context-unbalanced|heredoc-unterminated'; then
+  if grep -qE 'context-unbalanced|heredoc-unterminated' <<<"$mine"; then
     bad "C8: CONTEXT DESYNC on $f — the model lost the quote state on a real construct"
-  elif printf '%s\n' "$mine" | grep -q 'sed-in-place-gnu'; then
+  elif grep -q 'sed-in-place-gnu' <<<"$mine"; then
     ok "C8: quote state survives $f — a trap AFTER the construct is still caught"
   else
     bad "C8: SCAN LOST after $f — the trap on its last line was not reported"
@@ -498,7 +501,7 @@ mkdir -p "$TMP/tree/midfile"
 printf 'midfile/late-off.sh\n' >"$TMP/midfile.list"
 run_check "$TMP/midfile.list" --no-baseline
 mine="$(awk -v f="midfile/late-off.sh" 'index($0, f ":") == 1' "$OUT")"
-if printf '%s\n' "$mine" | grep -q 'sed-in-place-gnu'; then
+if grep -q 'sed-in-place-gnu' <<<"$mine"; then
   bad "C11: a mid-file \`# portability: off\` was IGNORED — the header promises it takes effect from its own line"
 else
   ok "C11: a mid-file \`# portability: off\` takes effect from its own line (header and code agree)"
@@ -1246,7 +1249,7 @@ run_check "$E" --baseline "$TMP/base-nojust.tsv"
 # `grep -P` sat in it undetected. Scanning both makes the class self-policing.
 SELF="$TMP/self"; printf 'scripts/check-portability-traps.sh\nscripts/check-portability-traps.test.sh\n' >"$SELF"
 ( cd "$HERE/.." && bash "$CHECK" --root "$(cd "$HERE/.." && pwd)" --targets "$SELF" --no-baseline >"$OUT" 2>"$ERR" )
-if [ "$?" = 0 ]; then ok "F1: the detector is CLEAN under its own 19 rules (no trap in its own source) — bash-3.2 PARSABILITY is not what this arm measures"
+if [ "$?" = 0 ]; then ok "F1: the detector is CLEAN under its own 19 rules (no trap in its own source) — bash-3.2 PARSABILITY is a SEPARATE arm, F9 (F1 was the only arm and it says so: a keyword list is not a parse)"
 else bad "F1: the detector flags ITSELF — $(head -3 "$OUT")"; fi
 
 [ -f "$BASELINE" ] && ok "F2: the shipped baseline exists ($(grep -vc '^#' "$BASELINE") entries)" \
@@ -1381,7 +1384,11 @@ if [ "$real_rc" != 0 ]; then printf '%s\n' "$real_out" | sed 's/^/    /' >&2; fi
 [ "$real_rc" = 0 ] && ok "F4: the repo's own tree is clean under the shipped baseline (what CI enforces)" \
   || bad "F4: the repo's own tree REDS under its shipped baseline (regenerate only if the rise is PRE-EXISTING)"
 
-printf '%s\n' "$real_out" | grep -q 'no NEW cross-platform traps'
+# ⛔ NO PIPELINE INTO `grep -q` — THE SIGPIPE FALSE-NEGATIVE (#841/#861). Under `pipefail` a `grep -q`
+# that finds its match exits early, the writer takes SIGPIPE, and the PIPELINE reports failure — so a
+# PRESENT verdict line read as "not found". Here that would be a guard asserting a guard. A here-string
+# has no writer process to break, which is why this site and the three in C8/C11 use one.
+grep -q 'no NEW cross-platform traps' <<<"$real_out"
 ok_or_bad=$?
 [ "$ok_or_bad" = 0 ] && ok "F5: the verdict line is printed (silence is never a pass)" \
   || bad "F5: the real-tree run printed no verdict line"
@@ -1460,8 +1467,13 @@ grep -q 'USAGE' <<<"$help_out" && grep -q 'EXIT:' <<<"$help_out" \
 # ⛔ TAKE THE ARM TOKENS ONLY (review cycle-6 P2): grepping the whole `while` block for `-[A-Za-z]`
 # also matched the loop CONDITION's `-gt`, so the arm demanded a documented `-g`. The flags are the
 # `|`-split tokens at the head of each arm line, which is exactly what the parser accepts.
+# ⛔ `[ \t]` IS NOT A WHITESPACE CLASS IN BSD `sed` (found by running this suite on macOS, cycle-17):
+# BSD sed has no `\t` escape, so inside a bracket expression it is the two characters `\` and `t` —
+# which made `s/[ \t]*$//` strip the trailing `t` off `--root` (derived as `--roo`) and reddened F8b on
+# the one host this suite had never been run on. `[[:space:]]` is the portable spelling and is what the
+# detector would flag a bare `[ \t]` in a `sed` script for.
 flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done/p' "$CHECK" \
-  | sed -n 's/^[ \t]*\([^)]*\)).*/\1/p' | tr '|' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' \
+  | sed -n 's/^[[:space:]]*\([^)]*\)).*/\1/p' | tr '|' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
   | grep -E -- '^-' | sort -u)"
 # ⛔ A FLAG IS A TOKEN, NOT A SUBSTRING (review cycle-7 P2): `grep -q -- "-h"` matches inside
 # `--help`, so dropping the documented `-h` alias left this arm green. The matcher is exercised
@@ -1486,6 +1498,71 @@ fi
 [ -n "$flags" ] || bad "F8b: could not read the parser flag list from $CHECK"
 [ -z "$missing" ] && ok "F8b: --help documents every flag the parser accepts ($(printf '%s' "$flags" | wc -w | tr -d ' ') flags)" \
   || bad "F8b: --help omits flag(s) the parser accepts:$missing"
+
+# ── F9. THIS FILE MUST PARSE ON THE HOST THE CLASS EXISTS FOR (review cycle-17 P1) ─────────────
+# ⛔ THE DEFECT THIS PINS. The rule table was built as a heredoc INSIDE `$( … )`. bash 3.2.57 — macOS
+# `/bin/bash`, and the host this whole detector exists for — does not treat such a body as data: it
+# PARSES it as code, so one apostrophe in a table line desynchronised the parse and every mode died at
+# parse time (rc=2): `--help`, `--list-rules` and the scan. bash 5 parses it, and CI is
+# ubuntu-latest-only, so the gate was inert exactly where the traps live and green where they do not —
+# the same class as #2828/#2930 (a test suite that did not parse under 3.2 refused every install) and
+# #2248 (a heredoc-in-`$( … )` body whose WORDS ran as commands). F1 says of itself "bash-3.2
+# PARSABILITY is not what this arm measures": F9 is the arm that does.
+#
+# Three arms, because no single one is available everywhere:
+#   F9a  the SHAPE is pinned TEXTUALLY — this is the half that fires on bash-5 CI, where a real 3.2
+#        cannot speak. It is a textual pin and says so; #2976 chose the same trade for the same reason.
+#   F9b  NEGATIVE CONTROL — the matcher must REPORT the shape on a fixture that carries it, so F9a
+#        cannot pass by matching nothing (the class of arm this suite refuses to ship).
+#   F9c  the detector PARSES under this host's own bash, and under a REAL bash 3.x when one exists —
+#        parse AND a live `--list-rules` run, so an inert-on-3.2 gate cannot read as green. When the
+#        host has no 3.x the arm prints `UNPROVEN-ON`, never a pass.
+# ⛔ THE SHAPE IS MATCHED WITHOUT MATCHING THIS FILE'S OWN PROSE: only non-comment lines of the
+# detector are read, so the comment block above (which names the shape) cannot red the arm.
+subst_heredoc_pin() {
+  grep -nE '\$\([^)]*<<-?['"'"'"]?[A-Za-z_]|`[^`]*<<-?['"'"'"]?[A-Za-z_]' "$1" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#'
+}
+if subst_heredoc_pin "$CHECK" >"$TMP/f9.hits" 2>/dev/null; then
+  bad "F9a: the detector carries a heredoc INSIDE a command substitution — bash 3.2 parses that body as CODE, so every mode dies at parse time ($(head -1 "$TMP/f9.hits"))"
+else
+  ok "F9a: no heredoc inside a \$( … ) in the detector (the shape that made every mode rc=2 on bash 3.2.57)"
+fi
+# the negative control: a fixture carrying the OLD shape MUST be reported, or F9a proves nothing
+printf 'RULES=$(cat <<%sRULES%s\na body with an apostrophe: it is fine\nRULES\n)\n' "'" "'" >"$TMP/f9-neg.sh"
+if [ -n "$(subst_heredoc_pin "$TMP/f9-neg.sh")" ]; then
+  ok "F9b-negative: the shape matcher REPORTS the heredoc-in-\$( … ) form on a fixture that carries it (so F9a can fail)"
+else
+  bad "F9b: the shape matcher cannot fail — it reported nothing on a fixture that carries the exact old shape"
+fi
+# F9c — the real parse, under this host's bash and under a real bash 3.x if the host has one
+if bash -n "$CHECK" 2>"$TMP/f9.err"; then
+  ok "F9c: the detector PARSES under this host's bash $BASHV (bash -n is clean)"
+else
+  bad "F9c: the detector does not parse under this host's bash $BASHV — $(head -2 "$TMP/f9.err" | tr '\n' ' ')"
+fi
+# a real bash 3.x, discovered (never assumed): the host's /bin/bash is 3.2.57 on macOS
+B3=""
+for cand in /bin/bash /usr/local/bin/bash /opt/homebrew/bin/bash /opt/homebrew/opt/bash/bin/bash; do
+  [ -x "$cand" ] || continue
+  case "$("$cand" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" in
+    3) B3="$cand"; break ;;
+  esac
+done
+if [ -n "$B3" ]; then
+  b3v="$("$B3" -c 'echo "$BASH_VERSION"' 2>/dev/null)"
+  if ! "$B3" -n "$CHECK" 2>"$TMP/f9b3.err"; then
+    bad "F9c32: the detector does not PARSE under $B3 (bash $b3v) — $(head -2 "$TMP/f9b3.err" | tr '\n' ' ')"
+  else
+    b3rules="$("$B3" "$CHECK" --list-rules 2>"$TMP/f9b3.run" | grep -c '  trap:')"; b3rc=$?
+    if [ "$b3rules" -ge 19 ]; then
+      ok "F9c32: the detector parses AND prints its rule table under a real bash 3.x ($B3, $b3v): $b3rules rules"
+    else
+      bad "F9c32: bash 3.x parsed the file but the rule table was not produced ($b3rules rules, rc=$b3rc) — a parse-only pass would hide an inert gate"
+    fi
+  fi
+else
+  unproven "no bash 3.x interpreter on this host (probed /bin/bash, /usr/local/bin/bash, the homebrew paths) — F9a's textual pin is the only 3.2 coverage here"
+fi
 
 printf 'PASS %d · FAIL %d · SKIP %d · UNPROVEN %d   [ran on %s, bash %s]\n' \
   "$PASS" "$FAIL" "$SKIP" "$UNPROVEN" "$OS" "$BASHV"

@@ -123,11 +123,17 @@
 #
 # EXIT: 0 clean (possibly with grandfathered findings) · 1 a NEW trap is present · 2 usage/refusal
 #
-# BASH 3.2-SAFE: no `declare -A`, no `mapfile`, no `${x,,}`, no `&>>`, no `wait -n`. This script is
-# subject to its own rules: the suite's F1 arm runs it over its own source.
+# BASH 3.2-SAFE: no `declare -A`, no `mapfile`, no `${x,,}`, no `&>>`, no `wait -n`, AND no heredoc
+# inside a `$( … )` — a FEATURE list is not a PARSE list, and the parse half is the one that has
+# already cost this repo an install (#2828, #2930, #2248). This script is subject to its own rules:
+# the suite's F1 arm runs it over its own source, and F9 PARSES it with a real bash 3.x.
 # AWK: POSIX subset, so both `mawk` (Linux) and the BSD `awk` on macOS accept it. The apostrophe is
 # spelled with `sprintf("%c", 39)`/octal `\047` rather than `\x27`, which is a gawk extension
-# (review cycle-2 P2). The dialect is UNPROVEN-ON(macOS, not run under its awk on this Linux box).
+# (review cycle-2 P2). THE DIALECT IS NOW OBSERVED ON BOTH (review cycle-17): the same tree under macOS
+# BSD `awk` (version 20200816) prints the same `126 grandfathered across 75 file/rule pairs` as Linux
+# `mawk`, with no SHRUNK row — i.e. the shipped baseline is dialect-STABLE, not merely Linux-consistent
+# (a divergence would have been a CI-only ratchet hole, since the gate fires on Linux). What remains
+# UNPROVEN-ON(macOS, …) is the measured trap TABLE's per-row answers for mechanisms this host lacks.
 
 set -uo pipefail
 
@@ -154,7 +160,19 @@ done
 # ── THE RULE TABLE ────────────────────────────────────────────────────────────────────────────────
 # One line per rule, `id<TAB>trap<TAB>portable replacement`. This table is the `--list-rules` output
 # and the documentation at once, so a rule cannot exist in the scanner and be missing from the docs.
-RULES=$(cat <<'RULES'
+#
+# ⛔ THE HEREDOC LIVES IN A FUNCTION BODY, NEVER INSIDE `$( … )` (review cycle-17 P1). bash 3.2.57 —
+# macOS `/bin/bash`, the host this whole class exists for — does not treat a heredoc body inside a
+# command substitution as data: it PARSES it as code. The apostrophe in `sweep's` below opened a quote
+# that never closed, and the dangling construct surfaced 44 lines away as
+# `line 221: syntax error near unexpected token ';;'` — so a reader debugged `targets()` instead of the
+# table. EVERY mode died at parse time (rc=2): `--help`, `--list-rules` and the scan, which made the
+# gate inert exactly where the traps live while bash 5 CI stayed green (#2828/#2930 is the same class;
+# #2248 is the same family one step worse). The substitution below carries NO heredoc, which is the
+# form #2976 lands. The suite's F9 arm parses this file with a real bash 3.x and pins the shape
+# textually, so a re-nesting reds on bash 5 CI too.
+portability_rule_table() {
+  cat <<'RULES'
 cpu-count-single-mechanism	A CPU count read through exactly ONE of `sysctl -n hw.ncpu` (macOS-only), `nproc` (Linux-only), `getconf _NPROCESSORS_ONLN`	`box_ncpu` (scripts/lib/box.sh) — it probes all three and reports which answered
 timeout-absent-on-macos	GNU `timeout` wrapper (`timeout <secs> cmd`)	macOS ships no `timeout` — use a `sleep`+`kill -0` watchdog, or `bounded.sh` (scripts/lib/bounded.sh owns this, #2046)
 setsid-absent-on-macos	`setsid` to detach a child	macOS has no `setsid` binary — `( … ) &` or python3 `os.setsid`, or the sweep's portable detach
@@ -175,7 +193,8 @@ bash4-wait-n	`wait -n` (wait for any one child)	bash 3.2 has none — poll with 
 heredoc-unterminated	a heredoc opener this reader cannot close, so every following line is unreachable — INCLUDING the over-block polarity: a COMPUTED marker (`cat <<$M`, `cat <<"$M"`) is not tracked, so such a body is read as CODE (a trap inside it is flagged, and a valid quoted marker can report this rule)	close the heredoc, or declare the file `# portability: off <reason>` — an unreachable span is an unscanned span
 context-unbalanced	a quote or substitution this reader cannot close, so the tail of the file was read as DATA and nothing there can be flagged	close the quote, or declare the file `# portability: off <reason>` — a silent truncation is the false-CLEAN this file exists to prevent
 RULES
-)
+}
+RULES="$(portability_rule_table)"
 
 case "$MODE" in
   help)
