@@ -131,8 +131,10 @@ machine's pi instance.
 - **MCP servers:** pi loads MCP servers from the first `.mcp.json` found walking
   up from your working directory to the repo's git top-level, falling back to
   `~/.pi/agent/.mcp.json` (the base config). A repo-local `.mcp.json` overrides
-  the base config for that repo. Base servers: exa, brave-search,
-  playwright-browser, gemini, tortoise.
+  the base config for that repo. Base servers: brave-search,
+  playwright-browser, gemini, tortoise (plus `seo-intelligence`, the Perplexity
+  research server). **`exa` is not among them** — it was uninstalled by owner
+  ruling (2026-10-31); do not re-add it.
 - **Tortoise MCP server:** the base config runs the local `tortoise.mcp_server`
   stdio server. It needs `TORTOISE_HOME` pointing at your tortoise checkout
   (setup.sh auto-wires it if the checkout is in a standard location, e.g.
