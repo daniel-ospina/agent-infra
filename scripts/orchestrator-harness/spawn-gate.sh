@@ -2150,7 +2150,19 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
        --verdict-file "$log.lanebound" >/dev/null 2>&1 &
   else
     echo "[lane-bound] WARN $label: lane-bound.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane has the WALL CLOCK only (${t}s) and NO silence bound, so a lane that parks produces nothing until the clock expires. Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
-    ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    # ⛔ THE DEGRADED FALLBACK KEEPS #2033's FIX, BECAUSE THE ORPHAN IS WHAT BREAKS THE REAP RATHER
+    # THAN THE WATCHDOG (measured 2026-10-18). A plain `( sleep "$t"; kill … ) &` does NOT take its
+    # `sleep` down when the subshell is killed, so every lane leaves an ORPHANED `sleep 2400`
+    # reparented to launchd with its CWD still the lane's worktree. `wt-lifecycle.sh`'s cwd witness
+    # then answers "yes, a live process holds this checkout" every single time and the empty-worktree
+    # reap can never fire — the inert-enforcer shape #2033 exists to remove. So both sleeps are
+    # backgrounded and kept in `s` (the TERM trap takes them down) and `wait "$w"` makes the teardown
+    # observable rather than racy. Keep this in step with lane-bound.sh's own teardown.
+    ( trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
+      sleep "$t" & s=$!; wait "$s" 2>/dev/null
+      kill -TERM "$pid" 2>/dev/null
+      sleep 15 & s=$!; wait "$s" 2>/dev/null
+      kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   fi
   w=$!
   [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
