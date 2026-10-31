@@ -5129,8 +5129,9 @@ def run_pass(args, rubric_note: str = "") -> int:
     #                  (repair the red, re-review, rail), `rerun-checks`, `blocked-by-rail`.
     #   rung 3 WAIT    nothing to dispatch: `running` (the head is still executing) or an unreadable
     #                  classification. Stated, never silent.
-    # `no slot` is the rung-2 refusal and it prints the reason with it -- the budget it could not
-    # take. A rung that is skipped for capacity must SAY so; that silence is what the brief bans.
+    # `no slot` is the refusal BOTH budget-gated rungs take (rung 1 as well — see below), and it
+    # prints the reason with it -- the budget it could not take. A rung that is skipped for capacity
+    # must SAY so; that silence is what the brief bans.
     #
     # ⛔ EVERY COUNT BELOW READS THE KEY `counts` ACTUALLY HOLDS (review P1, 2026-10-30). `running` and
     # `unreadable` are diverted into `skipped[...]` BEFORE `classified` is built (`:4889`/`:4898`
@@ -5151,10 +5152,17 @@ def run_pass(args, rubric_note: str = "") -> int:
     # class (`ACTION_CLASS`, `:1222`), so a pass whose only rung-2 rows were fix-class printed
     # `fix->eligible (1); fix slots=0 review slots=3` and refuted itself in the same clause -- with
     # `budgets["fix"] == 0` reachable at the shipped `MAX_FIX=3` whenever three fix workers hold
-    # their slots, i.e. the normal busy-fleet state. The classes come from `ACTION_CLASS` itself,
-    # never a second hand-kept list, so a new action is classified once.
+    # their slots, i.e. the normal busy-fleet state. The CLASS of each action still comes from
+    # `ACTION_CLASS` (the one mapping), and the SET of rung-2 actions is derived from `ranked` —
+    # ⛔ NOT from a second hand-kept list (review P2, round 6). This block used to iterate a literal
+    # of the five names while its own comment claimed it did not, and nothing pinned that literal to
+    # `ranked`: a new dispatchable action added to `ranked` would have been counted by neither rung,
+    # so the pass would print `merge=0 fix=0 wait=0 ... nothing to dispatch` with a dispatchable row
+    # in hand — the exact false statement this block exists to prevent, with no assertion behind it.
     _r2_by_class: dict[str, int] = {}
-    for _a in ("resolve-conflict", "record-review", "fix-ci", "rerun-checks", "blocked-by-rail"):
+    for _a in ranked:
+        if _a == "call-rail":      # rung 1, counted separately as `_r1` above
+            continue
         _n = counts.get(_a, 0)
         if _n:
             _c = ACTION_CLASS.get(_a, "fix")
@@ -5167,11 +5175,13 @@ def run_pass(args, rubric_note: str = "") -> int:
     # let this line print `wait=0 ... nothing to dispatch` while PRs sat held on precisely the
     # unreadable classification it defines as rung 3: the same silence the block exists to remove,
     # one population over. `surface` is NOT folded in (it is an ASK-USER, not blindness) and is
-    # printed as its own `surface=` term — ⛔ IT IS NOT CARRIED UNDER `held=` (review P2, round 5):
-    # the terminal arm below DOES fold it into its `held=<total>` now, and an earlier revision of
-    # this comment claimed the opposite in the same block, inviting a "repair" that re-creates the
-    # `held=` label collision that block already fixed. What is guaranteed is that the LINE names
-    # the split (`surface=` beside `wait=`) before that arm states the total.
+    # issued as its own `surface=` term — and ⛔ `held=` APPEARS EXACTLY ONCE PER LINE, as the
+    # TERMINAL ARM's TOTAL `_r3 + _held`, never as the ASK-USER count alone (review P2, round 6). An
+    # earlier revision of this comment said surface was "not carried under `held=`" and then said,
+    # one clause later, that the arm below folds it in: a self-refuting banner is worse than no
+    # banner, because a maintainer could obey either half. What is guaranteed: `surface=` names the
+    # ASK-USER split, `wait=` names the blindness axis, and `held=` is their sum only in the arm
+    # that says so.
     _r3 = sum(counts.get(k, 0)
               for k in ("skipped-running", "skipped-unreadable", "skipped-surface_unreadable",
                         "skipped-surface_partial", "skipped-surface_abandoned"))

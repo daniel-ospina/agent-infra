@@ -4840,6 +4840,39 @@ def test_the_cascade_names_the_WAIT_axis_separately_from_an_ASK_USER_hold(monkey
     assert "ASK-USER" not in casc[0], casc[0]
 
 
+def test_every_rung2_action_in_the_ranking_is_COUNTED(monkeypatch):
+    """The rung-2 SET must come from `ranked`, so a new dispatchable action cannot go uncounted.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 6): the block iterated a hand-kept literal of the five
+    rung-2 actions while its own comment claimed the classes came from `ACTION_CLASS`, "never a
+    second hand-kept list... so a new action is classified once". Nothing pinned the literal to
+    `ranked`: an action added there (and to `ACTION_CLASS`) would be counted by neither `_r1`
+    (hardcoded `call-rail`) nor `_r2`, and the pass would print
+
+        cascade: order=merge>fix>wait merge=0 fix=0 wait=0 ... nothing to dispatch (no mergeable,
+        no repairable)
+
+    with a dispatchable row in hand — the precise false statement this block exists to remove, and
+    the same class this file keeps re-finding. The derivation is now `ranked` itself; this pin
+    drives EVERY rung-2 action through a pass and asserts its class arm appears, so a literal that
+    drops one reddens here.
+    """
+    import pathlib as _pl
+    src = _pl.Path(pr.__file__).read_text(encoding="utf-8")
+    assert '"resolve-conflict", "record-review", "fix-ci", "rerun-checks", "blocked-by-rail"' \
+        not in src, "a second hand-kept rung-2 action list is back — derive from `ranked`"
+    n = 70
+    for action in ("rerun-checks", "record-review", "resolve-conflict", "blocked-by-rail", "fix-ci"):
+        n += 1
+        _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(n)], (action, "why", []))
+        casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+        assert len(casc) == 1, (action, joined)
+        _cls = pr.ACTION_CLASS[action]
+        assert "%s->" % _cls in casc[0], (action, casc[0])
+        assert "nothing to dispatch" not in casc[0], (action, casc[0])
+        assert "fix=0 " not in casc[0] + " ", (action, casc[0])
+
+
 def test_two_failed_file_reads_stop_the_per_pr_requests_but_still_refuse(monkeypatch):
     """The per-PR read is BOUNDED: after two failures the pass stops asking, and still refuses.
 
