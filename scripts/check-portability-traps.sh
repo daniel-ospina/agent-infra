@@ -71,6 +71,10 @@
 #     `# portability-ok: <reason>`. Same rule: no reason ⇒ still flagged.
 #   · Heredoc bodies are skipped (a data line is not a command). A heredoc whose marker is computed
 #     is not tracked — declared over-block, both polarities named in `--list-rules`.
+#   · A tool terminated by a PIPE with no space (`x="$(free|head -3)"`) is not matched: allowing `|`
+#     as a right border also matched `case` labels (`timeout) printf …`) and flagged correct code, so
+#     the substitution form is matched by its own exact shape instead. Write the space, or use the
+#     shim. Measured: 5 correct files reded before this limit was drawn.
 #
 # BASELINE — the ratchet
 # ----------------------
@@ -93,6 +97,7 @@
 #   bash scripts/check-portability-traps.sh --emit-baseline # print a baseline for the current tree
 #   bash scripts/check-portability-traps.sh --root DIR --targets FILE   # scan a fixture tree
 #   bash scripts/check-portability-traps.sh --baseline FILE             # ratchet against another file
+#   bash scripts/check-portability-traps.sh --help                      # this text
 #
 # EXIT: 0 clean (possibly with grandfathered findings) · 1 a NEW trap is present · 2 usage/refusal
 #
@@ -185,7 +190,13 @@ targets() {
       # `context-unbalanced` for its quotes — a finding about a file that is not shell at all.
       { git ls-files 'bin/*'; git ls-files; } | LC_ALL=C sort -u | while IFS= read -r f; do
         case "$f" in
-          *.*) case "$f" in bin/*) ;; *) continue ;; esac ;;
+          *.sh) continue ;;
+          # ⛔ THE SHEBANG TEST RUNS ON EVERY NON-`.sh` TRACKED FILE THE COMMENT PROMISES (review
+          # cycle-4 P2): the extensionless-only branch missed a dotted shell script (`.bash`,
+          # `.command`, `.helper`), so a live trap in such a file was invisible with no notice. The
+          # bounded set below is what actually exists in shell-file conventions, and the cost stays
+          # one `head -1` per candidate.
+          *.*) case "$f" in bin/*|*.bash|*.command|*.ksh|*.zsh) ;; *) continue ;; esac ;;
         esac
         case "$(head -1 -- "$f" 2>/dev/null)" in
           '#!'*sh|'#!'*sh\ *) printf '%s\n' "$f" ;;
@@ -510,7 +521,15 @@ function cp(code, tool,   re) {
   # shapes was CLEAN. Up to three words are allowed through; the cost is a rare false POSITIVE after
   # a wrapper keyword (visible, one reasoned escape away), never a silent pass over a real trap.
   re3 = "(^|" SEP ")[ \t]*" asg kw "([^;&|(){}]*[ \t])?" pfx tool "([ \t]|$)"
-  return (code ~ re || code ~ re2 || code ~ re3)
+  # ⛔ AND A BARE COMMAND INSIDE A SUBSTITUTION IS MATCHED BY ITS OWN SHAPE (review cycle-4 P1):
+  # `x="$(free)"` puts `)` directly after the tool, so the whitespace border missed it. The widening
+  # that allowed `)`/`|` as a general right border ALSO matched CASE PATTERNS (`timeout)  printf …`)
+  # and words inside `${…}`, i.e. it reded correct code in five files — and a detector that reds on
+  # correct code gets switched off. This form has no such collision: inside `$( … )` a bare tool
+  # immediately followed by the closing paren is a command, never a case label.
+  # DECLARED LIMIT: `x="$(free|head -3)"` (a PIPE, no space, straight after the tool) is not matched.
+  subst = "[$][(][ \t]*" asg pfx tool "[ \t]*[)]"
+  return (code ~ re || code ~ re2 || code ~ re3 || code ~ subst)
 }
 
 # seg_has(code, tool) — `tool` appears as a WORD anywhere on the line. Used for CPU mechanisms, which
@@ -644,7 +663,11 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # cycle-2 discipline was applied to `sed`, `date` and `stat` but not here, so
   # `readlink x || grep -f pats f` reded `readlink-f-bsd-absent` (there is no `-f` on readlink) and
   # `grep -n mapfile README.md` reded `bash4-mapfile`.
-  hit("readlink-f-bsd-absent",    (cmd_cluster(code, "readlink", "f") || opt_long(code, "readlink", "canonicalize")), "cd … && pwd -P")
+  # AND THE CANONICAL CAPABILITY PROBE IS A GUARD (review cycle-4 P2): `if command -v readlink &&
+  # readlink -f -- "$d" >/dev/null 2>&1; then out="$(readlink -f -- "$d")"` is the guarded form — the
+  # same `command -v` contract every other rule honours — and BOTH lines were flagged, then baselined
+  # as "NOT yet repaired". probed() is the one lookback this file already trusts.
+  hit("readlink-f-bsd-absent",    ((cmd_cluster(code, "readlink", "f") || opt_long(code, "readlink", "canonicalize")) && !probed("readlink", code)), "cd … && pwd -P")
   hit("grep-P-bsd-absent",        cmd_cluster(code, "grep", "P"), "grep -E")
   # ⛔ A LINE THAT ALREADY NAMES THE BSD COUNTERPART IS THE GUARDED CHAIN (review cycle-1 P2):
   # `stat -c %Y f || stat -f %m f` and `date -d @$t || date -r $t` are portable as written — that is
@@ -657,8 +680,15 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # THE LONG FORM IS THE SAME TRAP (review cycle-3 P1): `date --date=@0`, `stat --format=%Y` and
   # `readlink --canonicalize` are the GNU-only spellings of the exact options the short-form rules
   # name (`/bin/date: illegal option -- -` on macOS), and every one of them was CLEAN.
-  hit("date-d-gnu",               (cp(code, "date") && (opt_has(code, "-d") || opt_long(code, "date", "date")) && !cmd_opt(code, "date", "-r")), "box_epoch_to_iso (scripts/lib/box.sh)")
-  hit("stat-c-gnu",               (cp(code, "stat") && (opt_has(code, "-c") || opt_long(code, "stat", "format")) && !cmd_opt(code, "stat", "-f")), "box_mtime (scripts/lib/box.sh)")
+  # THE OPTION MUST BELONG TO THE COMMAND, BOTH SIDES (review cycle-4 P1): the counterpart was
+  # scoped in cycle 2 but the OPTION was still line-wide, so `[ -d "$d" ] && date -u +%s` reded
+  # date-d-gnu — a `-d` that belongs to a TEST. Four live instances were baselined as "pre-existing,
+  # NOT yet repaired" traps while they were portable code.
+  # AND `date -v` IS THE OTHER BSD COUNTERPART (review cycle-4 P1): macOS answers the EXPRESSION form
+  # with `-v`, so `date -u -d 4 minutes ago … || date -u -v-4M …` is a guarded chain exactly like
+  # `-r` — 17 live findings were labelled "NOT yet repaired" while being portable as written.
+  hit("date-d-gnu",               ((cmd_opt(code, "date", "-d") || opt_long(code, "date", "date")) && !cmd_opt(code, "date", "-r") && !cmd_opt(code, "date", "-v")), "box_epoch_to_iso (scripts/lib/box.sh)")
+  hit("stat-c-gnu",               ((cmd_opt(code, "stat", "-c") || opt_long(code, "stat", "format")) && !cmd_opt(code, "stat", "-f")), "box_mtime (scripts/lib/box.sh)")
   hit("free-macos-absent",        cp(code, "free"), "vm_stat, or the box_* memory probe")
   # ⛔ `${x#/proc/}` IS A PARAMETER EXPANSION, NOT A READ (review cycle-1 P2): the `code` view keeps
   # `${…}` bodies (they are code), so the bare `/proc/` test flagged a string-strip expression. The
@@ -671,13 +701,23 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # `local -A` AND `typeset -A` ARE THE SAME TRAP AS `declare -A` (review cycle-3 P1): `local -A`
   # is the common spelling inside a function and a hard failure on /bin/bash 3.2.57, and the rule
   # tested `declare` only — so the spelling most functions actually use was invisible.
-  if ((cp(code, "declare") || cp(code, "local") || cp(code, "typeset")) && word_has(code, "-A")) hit("bash4-declare-A", 1, "indexed arrays, or case")
+  # THE OPTION MUST BELONG TO THE DECLARATION, NOT TO THE LINE (review cycle-4 P1): line-scoped
+  # matching flagged `local d; ls -A "$d"` and `[ -A "$x" ]`, i.e. portable code. `local -A` is the
+  # spelling most functions use, so the rule is worth having — command-scoped, it still catches it.
+  if (cmd_opt(code, "declare", "-A") || cmd_opt(code, "local", "-A") || cmd_opt(code, "typeset", "-A")) hit("bash4-declare-A", 1, "indexed arrays, or case")
   if (cp(code, "mapfile") || cp(code, "readarray")) hit("bash4-mapfile", 1, "while IFS= read -r line")
-  if (code ~ /\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[,\^]{2}/) hit("bash4-case-modify", 1, "tr")
+  # ONE MODIFIER IS ENOUGH (review cycle-4 P2): `${x,}` and `${x^}` are equally absent from bash
+  # 3.2, and the rule demanded two. The `[,^]` position still excludes the operator forms
+  # (`${x:-}`, `${x##}`, `${x%%}`), which put a different character there.
+  if (code ~ /\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[,\^]{1,2}/) hit("bash4-case-modify", 1, "tr")
   if (code ~ /&>>/) hit("bash4-append-amp", 1, ">>f 2>&1")
   # ⛔ THE OPTION MUST BELONG TO `wait` (review cycle-1 P2): `word_has(code, "-n")` flagged
   # `[ -n "$1" ] && { kill "$1"; wait "$1"; }` — a `-n` TEST, not `wait -n`.
-  if (cp(code, "wait") && code ~ /wait[ \t]+-[A-Za-z]*n([ \t]|$)/) hit("bash4-wait-n", 1, "poll with kill -0")
+  # ⛔ THE RIGHT BORDER IS THE SEPARATOR CLASS, NOT WHITESPACE (review cycle-4 P1): the idiomatic
+  # spellings are `if wait -n; then` and `until wait -n; do`, and BOTH were missed because the rule
+  # demanded a space after the flag. A rule that only fires on `wait -n 2>/dev/null` measures almost
+  # nothing.
+  if (cp(code, "wait") && code ~ /wait[ \t]+-[A-Za-z]*n([^A-Za-z]|$)/) hit("bash4-wait-n", 1, "poll with kill -0")
 
   # ── guard lookback: a `command -v <tool>` probe within the previous 8 CODE lines guards the call
   p = (FNR - 1) % 8
@@ -814,7 +854,11 @@ END {
   # test deletes a single LINE, so a `hit(...)` that shares its line with the closing `}` leaves the
   # block unbalanced and the mutant dies of a syntax error instead of deleting the rule (measured:
   # `heredoc-unterminated` MUTANT-INVALID while every other rule was killed).
-  if (heredoc != "") {
+  # ⛔ A DECLARED-OFF FILE IS OUT OF SCOPE AT EOF TOO (review cycle-4 P2): the `# portability: off`
+  # declaration was honoured per line but not here, so a Python fixture inside a declared-off file
+  # still reported `heredoc-unterminated` — with a remedy text ("declare the file off") that the file
+  # ALREADY does.
+  if (heredoc != "" && mode == "") {
     HIT_PATH = FILENAME; HIT_LINE = hd_line
     hit("heredoc-unterminated", 1, "close the heredoc, or declare the file `# portability: off <reason>`")
   }
@@ -822,7 +866,7 @@ END {
   # cycle-1 P1). A file that ends inside a quote is a file whose tail was read as DATA, so a finding
   # there would be MISSED with no message — the exact silent truncation `heredoc-unterminated` exists
   # to prevent, arriving through the other door. Now it is a rule: visible, counted, baselinable.
-  if (length(ST) > 0) {
+  if (length(ST) > 0 && mode == "") {
     HIT_PATH = FILENAME; HIT_LINE = FNR
     hit("context-unbalanced", 1, "close the quote/substitution, or declare the file `# portability: off <reason>`")
   }

@@ -308,6 +308,21 @@ for f in survive/1-comment-sub.sh survive/2-len-arith.sh survive/3-shift.sh \
 done
 
 # C9 — the other direction: a context the file never closes must be REPORTED, never swallowed.
+# C9b — a file that DECLARES itself out of scope must not report the EOF rules: its own remedy text
+# ("declare the file `# portability: off <reason>`") is what it already does, so a finding there is
+# unfixable by its own instruction.
+SO="$TMP/offdecl"; : >"$SO"
+mkso() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$SO"; }
+mkso offdecl/1.sh '#!/bin/bash' '# portability: off the fixture body below is Python, not shell' "cat <<'EOF' > /dev/null" 'x = 1'
+run_check "$SO" --no-baseline
+if [ "$?" = 2 ]; then
+  bad "C9b: the declared-off arm was REFUSED (rc=2) — an empty scan proves nothing"
+elif grep -qE 'heredoc-unterminated|context-unbalanced' "$OUT"; then
+  bad "C9b: a file declared '# portability: off' still reported an EOF rule — the remedy it prints is one it already applies"
+else
+  ok "C9b: a declared-off file reports no EOF rule"
+fi
+
 SX="$TMP/unbalanced"; : >"$SX"
 mksx() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$SX"; }
 mksx unbalanced/1.sh '#!/usr/bin/env bash' 'x="$( # an apostrophe here must not hide the rest' 'true'
@@ -339,6 +354,9 @@ mkz fixed/15-local-A.sh         '#!/usr/bin/env bash' 'f() { local -A m; m[x]=1;
 mkz fixed/16-typeset-A.sh       '#!/usr/bin/env bash' 'typeset -A n'
 mkz fixed/17-stat-then-rm.sh    '#!/usr/bin/env bash' 'm="$(stat -c %Y "$f" 2>/dev/null || rm -f "$f")"'
 mkz fixed/18-date-then-rm.sh    '#!/usr/bin/env bash' 'd="$(date -d @0 +%s)"; rm -r "$tmp"'
+mkz fixed/19-wait-n-sep.sh      '#!/usr/bin/env bash' 'if wait -n; then echo ok; fi'
+mkz fixed/20-subst-bare.sh      '#!/usr/bin/env bash' 'x="$(free)"'
+mkz fixed/21-case-single.sh     '#!/usr/bin/env bash' 'v="x"; echo "${v,}"'
 run_check "$Z" --no-baseline
 for pair in \
   "timeout-absent-on-macos fixed/1-assign-timeout.sh" \
@@ -358,7 +376,10 @@ for pair in \
   "bash4-declare-A fixed/15-local-A.sh" \
   "bash4-declare-A fixed/16-typeset-A.sh" \
   "stat-c-gnu fixed/17-stat-then-rm.sh" \
-  "date-d-gnu fixed/18-date-then-rm.sh"
+  "date-d-gnu fixed/18-date-then-rm.sh" \
+  "bash4-wait-n fixed/19-wait-n-sep.sh" \
+  "free-macos-absent fixed/20-subst-bare.sh" \
+  "bash4-case-modify fixed/21-case-single.sh"
 do
   set -- $pair
   if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -375,6 +396,11 @@ mkz2 fixed-clean/2-ssh-i-sed.sh  '#!/usr/bin/env bash' "ssh -i key h true; sed -
 mkz2 fixed-clean/3-readlink.sh   '#!/usr/bin/env bash' 'readlink x || grep -f pats f'
 mkz2 fixed-clean/4-mapfile-arg.sh '#!/usr/bin/env bash' 'grep -n mapfile README.md'
 mkz2 fixed-clean/5-probe-timeout.sh '#!/usr/bin/env bash' 'if command -v -- timeout >/dev/null 2>&1; then timeout 5 true; fi'
+mkz2 fixed-clean/6-test-d-flag.sh '#!/usr/bin/env bash' '[ -d "$d" ] && date -u +%s'
+mkz2 fixed-clean/7-test-c-flag.sh '#!/usr/bin/env bash' 'if [ -c "$f" ]; then stat "$f"; fi'
+mkz2 fixed-clean/8-local-d.sh    '#!/usr/bin/env bash' 'local d; ls -A "$d"'
+mkz2 fixed-clean/9-date-v-chain.sh '#!/usr/bin/env bash' 'YOUNG="$(date -u -d 4 minutes ago +%s 2>/dev/null || date -u -v-4M +%s)"'
+mkz2 fixed-clean/10-readlink-probe.sh '#!/usr/bin/env bash' 'if command -v readlink >/dev/null 2>&1 && readlink -f -- "$d" >/dev/null 2>&1; then out="$(readlink -f -- "$d")"; fi'
 run_check "$Z2" --no-baseline
 if [ "$?" = 2 ]; then
   bad "C10b: the portable-code arm was REFUSED (rc=2) — an empty scan proves nothing"
@@ -384,7 +410,12 @@ else
     "sed-in-place-gnu fixed-clean/2-ssh-i-sed.sh" \
     "readlink-f-bsd-absent fixed-clean/3-readlink.sh" \
     "bash4-mapfile fixed-clean/4-mapfile-arg.sh" \
-    "timeout-absent-on-macos fixed-clean/5-probe-timeout.sh"
+    "timeout-absent-on-macos fixed-clean/5-probe-timeout.sh" \
+    "date-d-gnu fixed-clean/6-test-d-flag.sh" \
+    "stat-c-gnu fixed-clean/7-test-c-flag.sh" \
+    "bash4-declare-A fixed-clean/8-local-d.sh" \
+    "date-d-gnu fixed-clean/9-date-v-chain.sh" \
+    "readlink-f-bsd-absent fixed-clean/10-readlink-probe.sh"
   do
     set -- $pair
     if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -728,9 +759,16 @@ help_out="$(bash "$CHECK" --help 2>/dev/null)"
 printf '%s\n' "$help_out" | grep -q 'USAGE' && printf '%s\n' "$help_out" | grep -q 'EXIT:' \
   && ok "F8a: --help prints the whole header (USAGE and EXIT are present, not truncated by a pinned range)" \
   || bad "F8a: --help output is truncated — it is missing USAGE and/or EXIT"
-printf '%s\n' "$help_out" | grep -q -- '--baseline FILE' \
-  && ok "F8b: --help documents every flag the parser accepts (--baseline is listed)" \
-  || bad "F8b: --help omits a flag the parser accepts (--baseline)"
+# ⛔ THE FLAG LIST IS DERIVED FROM THE PARSER (review cycle-4 P2): asserting one hard-coded flag let
+# `--help` itself go undocumented. Every `--flag)` arm of the argument parser must appear in the text.
+flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done/p' "$CHECK" | grep -o -- '--[a-z-]*)' | tr -d ')' | sort -u)"
+missing=""
+for fl in $flags; do
+  printf '%s\n' "$help_out" | grep -q -- "$fl" || missing="$missing $fl"
+done
+[ -n "$flags" ] || bad "F8b: could not read the parser flag list from $CHECK"
+[ -z "$missing" ] && ok "F8b: --help documents every flag the parser accepts ($(printf '%s' "$flags" | wc -w | tr -d ' ') flags)" \
+  || bad "F8b: --help omits flag(s) the parser accepts:$missing"
 
 printf 'PASS %d · FAIL %d · SKIP %d · UNPROVEN %d   [ran on %s, bash %s]\n' \
   "$PASS" "$FAIL" "$SKIP" "$UNPROVEN" "$OS" "$BASHV"
