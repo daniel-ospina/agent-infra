@@ -456,6 +456,26 @@ jobs:
 
   script-validate:
     runs-on: ubuntu-latest
+    # ⛔ #3131 — the SAME checkout fact that made `extension-tests`' guard assertion unjudgeable here
+    # also lives in this job, one level down: `merge-reminder.test.sh` §27b requires
+    # `box-status.sh` to print `ref: origin/main=<sha>`, which it emits ONLY when
+    # `git rev-parse --verify origin/main` resolves (`box-status.sh:325-331` — an unresolvable
+    # ref yields no `ref:` line at all, and `REF_WHY` is set only on a REFUSAL, so the grep
+    # fails with no diagnostic). A push to a non-main branch checks out a single ref
+    # (`+<sha>:refs/remotes/origin/<branch>`), so `origin/main` does not exist and the
+    # assertion reds for a reason that has nothing to do with the tree.
+    #   MEASURED (controlled, content held constant): with `origin/main` present the shard is
+    # green; deleting ONLY `refs/remotes/origin/main` flips exactly one assertion — §27b — and
+    # nothing else in the suite. Confirmed across three runs: the PR lane (fetch of
+    # `refs/remotes/pull/N/merge`) reds; `CI on main` on an `integration/**` branch (fetch of
+    # only that branch) reds; `CI on main` on `main` (fetch of `refs/remotes/origin/main`)
+    # passes.
+    #   So materialize the ref here too, under the SAME two conditions as the `extension-tests`
+    # preamble: not the main ref, and actually inside a git work tree. The `--git-dir` clause is
+    # load-bearing for the same reason as there — this repo executes committed `run:` bodies in
+    # non-repo temp dirs (e.g. `scripts/check-pi-pin-lockstep.mjs`), where an unguarded fetch exits
+    # 128 under `bash -e` and takes the step down. No `|| true`: a fetch that cannot produce the
+    # ref must fail loudly, because silently skipping reinstates the false red.
     # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the one
     # runner below, UNSHARDED (main runs once per merge, so the queue a hang would starve is
     # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation
@@ -531,6 +551,20 @@ jobs:
         # old 70 min was sized from a measurement taken before #2529 and could not fail fast.
         timeout-minutes: 15
         run: bash tests/ci-lane-parity/run.sh
+      - name: Materialize origin/main so checkout-keyed assertions are judgeable (#3131)
+        # ⛔ NO `if:` on this step. The lane-parity guard refuses a conditional step in this job
+        # ("a step that may not run, whose failure cannot fail the run"), and it is right to: the
+        # main lane's coverage must be unconditional. The condition lives INSIDE the shell instead,
+        # exactly as the `extension-tests` preamble does it.
+        run: |
+          # `merge-reminder.test.sh` §27b needs `origin/main` to resolve (see the job comment).
+          # NOT `|| true`: a fetch that cannot produce the ref must fail loudly, because silently
+          # skipping it reinstates the false red it exists to remove. The `--git-dir` clause is the
+          # one non-failure skip: outside a repository there is no tracking ref to create, and this
+          # repo executes committed `run:` bodies in non-repo temp dirs under `bash -e`.
+          if [ "${GITHUB_REF:-}" != "refs/heads/main" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+            git fetch --depth=1 --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          fi
       - name: Bash shards — the ONE list both lanes run (#1369)
         # #1369 — the ONE list of bash shards is scripts/run-bash-shards.sh, and BOTH lanes
         # call it: a shard added there is in both lanes by construction, so a lane split
