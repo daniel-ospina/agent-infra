@@ -34,6 +34,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
 # these arms go red, which is the assertion that the line is load-bearing rather than decorative.
 export LANE_PREFLIGHT=0
+# ⛔ AND THE MEMORY ARM IS NEUTRALISED FOR THE SAME REASON, one gate over (agent-infra#2387). Every arm
+# below drives the SHIPPED `run_agent` with `MAX_LOAD=1000 DISK_MIN_FREE_MB=1` so that a load or disk
+# refusal cannot decide an arm about the BRIEF. `run_agent` now also consults available memory before
+# load, so on a box under the shipped 2048 MB floor the positive control (`rc=0 started=1`) returned 73
+# and the suite reported its own subject — the research-first contract — as broken. `1` disables the
+# floor's ability to bind; the SHIPPED default and its arithmetic are asserted in spawn-gate.test.sh,
+# which owns them.
+export MEM_MIN_AVAIL_MB=1
 ROOT="$(cd "$HERE/../.." && pwd)"
 GATE="$HERE/brief-gate.sh"
 PASS=0; FAIL=0
@@ -195,7 +203,13 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…the stub pi really ran (the refusal above 
 mkdir -p "$TMP/nolib"
 cp "$HERE/spawn-gate.sh" "$TMP/nolib/"
 : > "$PI_LOG"
-res="$( cd "$FIXREPO" && env -u AGENT_INFRA_PATH PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+# ⛔ AND THE MEMORY FLOOR IS NEUTRALISED (`MEM_MIN_AVAIL_MB=1`), for the reason the disk and load
+# confounders are: this arm is about the BRIEF gate's cannot-verify path, and the memory gate sits at
+# the SAME spawn point (#2387), so on a box below its 2048 MB floor the spawn is refused 81 before the
+# validator is ever sought and the suite reports its own subject as broken. One line, same shape the
+# sibling suites carry. (Both isolation idioms merged: main's `env -u AGENT_INFRA_PATH` is the one the
+# note above documents — an empty assignment and `env -u` drive the same not-found path.)
+res="$( cd "$FIXREPO" && env -u AGENT_INFRA_PATH PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "no validator" >/dev/null 2>&1
            printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$TMP/nolib/spawn-gate.sh" "$TMP/nolib.log" "$CANON" )"
 [ "$res" = "rc=78 started=0" ]; ck $? "a MISSING validator is 78/cannot-verify, not a pass ($res)"
@@ -491,8 +505,14 @@ mv "$GATE" "$GATE.moved"
 # ⛔ `env -u AGENT_INFRA_PATH`: see the note at the §"MISSING validator" arm — the variable is a
 # documented fifth search root and is exported on every cell, so without this the "missing validator"
 # fixture finds the REAL one and the arm refuses 72 (the worktree precondition) instead of 78.
+# ⛔ AND THE BRANCH MUST BE THE ONE THE FIXTURE IS ON (measured: `fix/x` -> rc=72,
+# `REPO_TARGET_REFUSED`, `branch-missing`). lane.sh asserts the checkout's own origin AND attached
+# branch (#2724/#2694) BEFORE it looks for a validator, so a lane told a branch the fixture does not
+# have is refused for the REPO-IDENTITY reason and never reaches the missing-validator path this arm
+# is about — the assertion then reads as "the fail-closed arm is broken" when the arm had not run. The
+# fixture is born on `init.defaultBranch=fix/research-first-gate` above; one word, same branch.
 ( cd "$TMP" && env -u AGENT_INFRA_PATH O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
-    HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/x daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
+    HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/research-first-gate daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
 mv "$GATE.moved" "$GATE"
 [ "$rc" -eq 78 ]; ck $? "a MISSING validator refuses the LANE with 78 (fail-closed: never a lane nobody asked to look first) (rc=$rc)"
 
@@ -528,8 +548,6 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
 # at all). Declared here so the reference is accounted for; the broader class is named in the STATED
 # LIMIT below rather than silently believed to be covered.
-# the at all). Declared here so the reference is accounted for; the broader class is named in the STATED
-# LIMIT below rather than silently believed to be covered.
 #
 # ⛔ AND A SUITE THAT BUILDS ITS OWN FIXTURES FROM THIS VALIDATOR IS A MEMBER TOO (#1881 review P2).
 # `scripts/test_cmux_payload.py` asks `brief-gate.sh --section lane` for the RESEARCH contract its
@@ -545,6 +563,16 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
 # superset), independently of any branch. Declared here because an equality that is red on its own
 # base stops being a signal: every PR inherits the same red and nobody can attribute it.
+#
+# …and what each of the five is, by role, so the list is not a name list with no reasons:
+#   ai-drainer.sh              — a WORKER-shaped dispatch; it names the gate as the reason its role is
+#                                `worker` and not `prfix` (the #2910 note).
+#   ai-drainer.test.sh         — the suite that drives it.
+#   lane-bound.test.sh         — drives `run_agent`, so it renders a brief fixture from the validator
+#                                (the class the review-cycle-3 note above describes).
+#   reviewer-preflight.test.sh — the delivery-brief renderer that the same dispatch paths splice.
+#   wip-rescue-exit.test.sh    — renders its brief fixture from the validator AND drives the
+#                                `brief-gate.sh`-unresolvable arm (its own note at :138).
 EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"

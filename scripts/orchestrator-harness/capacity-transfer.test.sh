@@ -72,6 +72,13 @@ ck() { # ck <name> <0|1>
 }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 O="$TMP/O"; mkdir -p "$O/state" "$O/logs" "$TMP/bin"
+# ⛔ THE MEMORY GATE'S NEUTRALISER (agent-infra#2387), for exactly the reason every arm below pins
+# `DISK_MIN_FREE_MB=1`: since #2387 `run_agent` refuses a spawn when available memory is below its
+# floor, so without this a memory-tight box answers 82 to a LOAD arm and the suite reports a
+# capacity-transfer regression that is not one. It is a FLOOR, not a switch — there is still a probe,
+# still a comparison, still a refusal path (driven in spawn-gate.test.sh §12, which owns the floor's
+# arithmetic and asserts the shipped default under `env -u`).
+export MEM_MIN_AVAIL_MB=1
 LANE="$HERE/lane.sh"; CHAIN="$HERE/chain-merge.sh"; ORCH="$HERE/orch-loop.sh"; CLAIMS="$HERE/claims.sh"
 for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
@@ -998,6 +1005,65 @@ run_bounded 20 env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
 ck "§LB chain-merge.sh maps a 'land' record to exit 74 (got $BOUNDED_RC) — not 75, not a 90-minute wait" $rc
 grep -q 'land-backlog: lane-106' "$O/logs/chain-106.log"; rc=$?
 ck "§LB …and says it is NOT a capacity transfer (the remedy is to land, not to wait for a peer)" $rc
+
+# …and a `mem` record (the SPAWN gate's memory refusal, agent-infra#2387) maps to ITS code — 81, not
+# 75. This is the arm that catches a `mem` falling through the default: the classification is right
+# either way (a memory refusal IS a capacity transfer, unlike `land`), but a `load` label sends the
+# operator to watch a 1-min average that will never move while lanes are OOM-killed — the exact
+# wrong-cause class the `disk`/`land` arms above exist to remove.
+acquire_claim 107
+NOW3="$(date +%s)"; EP3=$(( NOW3 - 1 ))
+printf '%s\t%s\t%s\n' "$EP3" "$(( EP3 + 900 ))" "mem" > "$O/state/capacity-refused-107"
+run_bounded 20 env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
+  CHAIN_CLAIM_COMMIT="$(chain_gen 107)" \
+  bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 107 feat/107-tm
+{ [ "$BOUNDED_RC" -eq "${AGENT_MEM_REFUSED:-81}" ]; }; rc=$?
+ck "§LB chain-merge.sh maps a 'mem' record to exit 81 (got $BOUNDED_RC) — not 75, not the load remedy" $rc
+grep -q 'refused at the mem gate' "$O/logs/chain-107.log"; rc=$?
+ck "§LB …and NAMES the memory gate, not the load one (the load wording is not universal)" $rc
+
+# ── the POST-MERGE-ONE reporting arms (#2387 review P3) ──────────────────────────────────────
+# The arms above cover the refusal RECORD (the lane's own path). This one covers the other place a
+# refusal reaches an operator: merge-one.sh exits 81 on a memory refusal and 75 on a load one, and
+# this block used to test `rc = 75` only — so a memory refusal propagated the right code and said
+# NOTHING, on the very path (a chain with no controller running) the line exists to cover.
+# $O/merge-one.sh is a stub that exits the code under test; `gh pr list` fabricates a PR so the chain
+# reaches the merge step at all.
+mkdir -p "$TMP/bin-pr"
+cat > "$TMP/bin-pr/gh" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in "pr list") printf '2591\n' ;; esac
+exit 0
+STUB
+chmod +x "$TMP/bin-pr/gh"
+for _pair in "${AGENT_MEM_REFUSED:-81}:MEMORY" "75:load"; do
+  _code="${_pair%%:*}"; _word="${_pair##*:}"
+  cat > "$O/merge-one.sh" <<STUB
+#!/usr/bin/env bash
+exit $_code
+STUB
+  chmod +x "$O/merge-one.sh"
+  acquire_claim 108
+  # ⛔ THE TWO WAITS MUST BE PINNED, OR THE ARM NEVER REACHES ITS SUBJECT (measured: BOUNDED_RC=124,
+  # both iterations). `chain-merge.sh:300` defaults `LANE_PHASE_GRACE=90` and `LANE_HANDOFF_WAIT=1800`,
+  # and this rig writes no merge-phase marker, so the chain sat out the FULL 90s grace waiting for a
+  # lane that does not exist while `run_bounded 30` killed it at 30 — the arm reported "the post-merge
+  # step does not name the code" over a chain that had never executed the post-merge step. The sibling
+  # suite pins both for exactly this reason (`chain-merge-verdict.test.sh:252`).
+  run_bounded 30 env O="$O" CHAIN_POLLS=2 CHAIN_POLL_SECS=1 PATH="$TMP/bin-pr:$PATH" \
+    LANE_PHASE_GRACE=0 LANE_HANDOFF_WAIT=2 CHAIN_CLAIM_COMMIT="$(chain_gen 108)" \
+    bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 108 feat/108-tm
+  { [ "$BOUNDED_RC" -eq "$_code" ] && grep -q "reviewer NOT started (${_word}" "$O/logs/chain-108.log"; }; rc=$?
+  ck "§LB a merge-one rc=$_code is NAMED as the $_word gate refusal (exit $BOUNDED_RC) — the post-merge step reports what the code means" $rc
+  # ⛔ AND THE MEMORY ARM MUST NOT BORROW THE LOAD REMEDY: a memory floor does not clear when the box
+  # quietens, and telling an operator to watch a 1-min average is the false-cause class #2387 exists
+  # for. Read from THIS pass's log, before the next iteration overwrites it.
+  if [ "$_code" = "${AGENT_MEM_REFUSED:-81}" ]; then
+    grep -q 'will NOT clear by waiting for load' "$O/logs/chain-108.log"; rc=$?
+    ck "§LB …and the memory line says it will NOT clear by waiting for load (the two remedies differ)" $rc
+  fi
+done
+rm -f "$O/merge-one.sh"
 
 # ── the derivation, driven directly, so the SIZING RULE is a measurement and not a slogan ──
 # Little's law in practice: L_max = λW. 40 landings/24h with a 24h lead budget allows 40 open; with a

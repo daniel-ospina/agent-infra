@@ -1134,7 +1134,8 @@ SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
 # pipe. The timeout below is a guard on the DISPATCHER, which returns in well under a second -- not
 # on the worker.
 SPAWN_CALL_TIMEOUT_S = 120
-# A gate refusal (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75) consumed nothing, so it must not
+# A gate refusal (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75 / AGENT_LAND_BACKLOG=74 /
+# AGENT_MEM_REFUSED=81) consumed nothing, so it must not
 # be recorded. `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 the moment the
 # worker is launched, so the refusal code only ever lands in `$O/bg/<name>.rc`; this is the bound
 # dispatch() gives it to appear before concluding that the worker launched.
@@ -1159,11 +1160,17 @@ _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
 # report WHICH bound the box hit instead of a bare "nobody took it". Keep this the single copy: the
 # keys are the gate's own exported constants, pinned against that file by
 # `test_the_capacity_seams_are_the_gates_own_numbers`.
-GATE_REFUSAL_BOUND = {73: "fork", 74: "land-backlog", 75: "load", 77: "disk"}
+# ⛔ AND THE TWO LATE ARRIVALS GO IN THE SAME TABLE, NOT A SECOND ONE (#2387, #2935): the memory gate
+# (81) and the capability gate (71) both refuse a spawn for a cause that is NOT load, so a flat tuple
+# with no axis would have to report them as an unnamed code — and the memory refusal in particular
+# refuses EVERY spawn on a box at its floor, which is the population this file exists to account for.
+# They are axes here because they carry their own remedy; see the two "⛔ THE LATE ARRIVALS" comments.
+GATE_REFUSAL_BOUND = {71: "capability", 73: "fork", 74: "land-backlog", 75: "load", 77: "disk",
+                      81: "memory"}
 GATE_REFUSALS = tuple(sorted(GATE_REFUSAL_BOUND))
 # The NEXT ACTION per axis -- a verdict without one is a diagnosis the reader has to re-derive (#2710).
-# The four remedies genuinely differ, which is why `spawn-gate.sh` gives them four codes: only the
-# load refusal clears by waiting, and telling an operator to wait for the other three wastes the one
+# The remedies genuinely differ, which is why `spawn-gate.sh` gives them one code each: only the
+# load refusal clears by waiting, and telling an operator to wait for any other one wastes the one
 # resource the report exists to save.
 GATE_NEXT_ACTION = {
     "load": "wait -- load clears by itself and the controller re-dispatches",
@@ -1171,6 +1178,14 @@ GATE_NEXT_ACTION = {
     "land-backlog": "land/fix the open PRs -- this box is healthy; waiting does NOT clear it",
     "fork": "restart this box from outside, or let its lanes drain -- it is out of PROCESSES and "
             "cannot be cleaned up from inside, and waiting does NOT clear it",
+    # ⛔ THE LATE ARRIVALS (#2387, #2935), each with the remedy its own gate names, because the two
+    # are NOT interchangeable: memory clears when resident lanes FINISH (a wait, but for the lanes and
+    # not for the load average), while a capability refusal is a broken box that no amount of waiting
+    # repairs -- it needs an operator or a different box.
+    "memory": "let resident lanes finish (or stop one deliberately) -- it clears when they release "
+              "their working set, and waiting for LOAD does not clear it",
+    "capability": "repair this box (installed pi/extension set, provider credential) or dispatch the "
+                  "PR elsewhere -- it could not complete one call and return; waiting cannot clear it",
 }
 # ⛔ THE TOKEN COMES FIRST, THE SENTENCE AFTER IT (review P1, #2291). `record_exit()`'s own contract
 # is that the reason is a PREFIX because both readers cut the tail -- the tightest at 110 chars
@@ -1182,7 +1197,8 @@ GATE_NEXT_ACTION = {
 # is emitted FIRST and the prose after it: the remedy survives every cut, and the sentence is what a
 # human reads when the line is not truncated.
 GATE_NEXT_TOKEN = {"load": "wait", "disk": "prune-disk",
-                   "land-backlog": "land-prs", "fork": "restart-box"}
+                   "land-backlog": "land-prs", "fork": "restart-box",
+                   "memory": "finish-lanes", "capability": "repair-box"}
 # The OTHER verdicts' next actions, short enough to survive the same cut. A verdict without one is a
 # diagnosis the reader has to re-derive (#2710).
 VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
@@ -1195,12 +1211,20 @@ VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
 # `[land-backlog]` is the creation back-pressure gate (agent-infra#2409, exit 74). Without it a
 # refusal read as "launched", so the row burned a 45-min cooldown and a 90-min budget slot for a
 # worker that never started -- the exact accounting failure the 75/77 discrimination exists for.
-# `[fork-gate]` is the FIFTH and it was missing (#2291): a fork refusal (73) was not in
-# `GATE_REFUSALS` either, so the one state that means "this box cannot start a process at all" --
-# MEASURED on cell-4 at load 0.32x (#2293) -- was read as a DISPATCH: it wrote a spawn row and burnt
-# a 90-min budget slot for an agent that never existed. The marker is the gate's own line.
+# `[mem-gate]` is the available-memory gate (agent-infra#2387, exit 81), and it is the same failure one
+# class over: a box sitting at its memory floor refuses EVERY pr-doctor spawn, so an unknown code
+# would burn a cooldown and a class slot on each pass for work that cannot start at all.
+# ⛔ AND `[fork-gate]` AND `[capability-gate]` ARE THE SAME DISCIPLINE APPLIED TO THE TWO CODES THAT
+# ARRIVED AFTER THIS TUPLE DID (#2293, #2935). They are added here WITH the codes above, because the
+# pair is the discriminator: a code in `GATE_REFUSALS` whose marker is missing here is INERT — the
+# predicate demands both, so the row is booked `launched` and burns the cooldown and the budget slot
+# for a worker that never started. That is the exact defect the `[mem-gate]` half of this change
+# exists to fix, found twice more in the same file rather than left for the next lane.
+# ⛔ THE MARKER SET AND THE CODE TABLE ARE ONE LIST IN TWO HALVES (#2291): every axis in
+# `GATE_REFUSAL_BOUND` needs its marker here, and `test_a_FORK_and_a_CAPABILITY_refusal_VOID_the_row_too`
+# loops over the pairs so a seventh code cannot arrive half-wired either.
 REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED",
-                   "[fork-gate] REFUSED")
+                   "[fork-gate] REFUSED", "[mem-gate] REFUSED", "[capability-gate] REFUSED")
 # `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
 # and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
 # refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent
@@ -3667,12 +3691,14 @@ def read_rc(path: str):
 
 
 def gate_refused(name: str, code) -> bool:
-    """True iff a 74/75/77 `.rc` was written by the GATE, not by a `pi` that exited 74/75 itself.
+    """True iff a gate code (`GATE_REFUSALS`) `.rc` was written by the GATE, not by a `pi` that exited it itself.
 
     The codes share the 0-255 exit namespace with `pi`, so the code alone is ambiguous -- and the
     two meanings have OPPOSITE consequences here ("nothing consumed, do not record" vs "an agent
     ran, record it"). The discriminator is durable and already on disk: `spawn-gate.sh` appends
-    `[load-gate] REFUSED` / `[disk-gate] REFUSED` / `[land-backlog] REFUSED` to the worker log BEFORE
+    `[load-gate] REFUSED` / `[disk-gate] REFUSED` / `[land-backlog] REFUSED` / `[fork-gate] REFUSED`
+    / `[mem-gate] REFUSED` / `[capability-gate] REFUSED`
+    to the worker log BEFORE
     run_agent returns, and the harness writes `.rc` only after that -- so at the instant the code is
     readable the marker is too. A `pi` that failed on its own writes no gate line.
 
@@ -3859,10 +3885,13 @@ def gate_refusal_code(detail: str) -> int:
 
 
 def gate_refusal_axis(detail: str) -> str:
-    """The BOUND the box hit -- `load` | `disk` | `land-backlog` | `fork` -- or "".
+    """The BOUND the box hit -- `load` | `disk` | `land-backlog` | `fork` | `memory` | `capability`
+    -- or "".
 
     Empty means "not a capacity refusal": the transport refused, and the next action is to repair
-    the chain rather than to wait (#2291).
+    the chain rather than to wait (#2291). The two late axes (#2387's memory gate, #2935's capability
+    gate) are here because their remedies also differ from load's: memory clears when resident lanes
+    finish, and a capability refusal clears only when the BOX is repaired.
     """
     return GATE_REFUSAL_BOUND.get(gate_refusal_code(detail), "")
 
@@ -4088,9 +4117,9 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     `record` says whether the ATTEMPT belongs in the state file even though nothing was launched.
     Two of the three refusal classes differ in exactly that:
 
-      * a GATE refusal (load 75 / disk 77 / land-backlog 74) consumed nothing and CLEARS BY ITSELF
-        -> not recorded; a row would burn a 45-min cooldown and a 90-min budget slot for work that
-        never ran;
+      * a GATE refusal (capability 71 / fork 73 / land-backlog 74 / load 75 / disk 77 / memory 81) consumed nothing and CLEARS
+        BY ITSELF -> not recorded; a row would burn a 45-min cooldown and a 90-min budget slot for
+        work that never ran;
       * a WORKTREE refusal that is a verdict about the tree (uncommitted work, commits the PR
         head does not have, a file the next checkout would overwrite, a path we may not delete)
         does NOT clear by waiting -> recorded, so the PR reaches a cooldown instead of logging the

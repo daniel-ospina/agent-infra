@@ -571,7 +571,10 @@ swap_usage_mb() { # [<meminfo-file>]
 # empty, MEM_UNKNOWN was set every cycle, and the capacity gate named `mem_probe_failed` forever —
 # the controller completed cycles and dispatched nothing, which is the false green #1702 exists to
 # remove. The macOS page size is derived from vm_stat's own header (16 KiB is Apple silicon; Intel
-# Macs are supported and a hardcoded 16384 over-reports memory 4x -- the unsafe direction).
+# Macs are supported and a hardcoded 16384 over-reports memory 4x -- the unsafe direction). ⛔ SO AN
+# UNPARSEABLE HEADER IS UNMEASURABLE, NOT 16384 (review, P3): the old `if (ps=="") ps=16384` default
+# made this one arm fail OPEN on a 4 KiB-page host, contradicting the fail-closed ruling stated three
+# lines above and mirrored in spawn-gate.sh's copy of this body (the two are pinned byte-identical).
 # The argument is a TEST SEAM (the call site passes nothing).
 mem_avail_mb() { # [<meminfo-file>]
   local p="${1:-/proc/meminfo}" mb
@@ -581,13 +584,14 @@ mem_avail_mb() { # [<meminfo-file>]
       /^MemFree:/ {f=$2}
       /^Cached:/ {c=$2}
       END {if (a!="") v=a; else if (f!="" && c!="") v=f+c; else exit 1
+           if (v !~ /^[0-9]+$/) exit 1
            printf "%d", v/1024}' "$p" 2>/dev/null)" || return 1
   else
     mb="$(vm_stat 2>/dev/null | awk '
       /page size of/ {ps=$8}
       /Pages free/ {gsub(/[.]/,"",$3); f=$3}
       /Pages inactive/ {gsub(/[.]/,"",$3); i=$3}
-      END {if (ps=="") ps=16384; if (f=="" || i=="") exit 1
+      END {if (ps !~ /^[0-9]+$/) exit 1; if (f=="" || i=="") exit 1
            printf "%d", (f+i)*ps/1048576}')" || return 1
   fi
   is_num "$mb" || return 1

@@ -165,7 +165,11 @@
 #        `~/.pi/agent/state/spawn-gate.tsv` (allowed runs included), and it exits `PI_GATE_REFUSED=76`
 #        — a third code, because 75 must stay attributable to a `pi` that exits 75 for its own reason.
 #        `run_agent` translates 76 into `AGENT_LOAD_REFUSED` with `AGENT_STARTED=0` and writes NO
-#        walltime row. The tortoise original has none of it. WHY THIS MATTERS FOR A RE-PORT: exactly
+#        walltime row. ⛔ AND SINCE agent-infra#2387 IT ALSO GATES AVAILABLE MEMORY, fail-CLOSED, with
+#        its own code `PI_GATE_MEM_REFUSED=82` (translated to `AGENT_MEM_REFUSED=81`) and two APPENDED
+#        ledger columns (mem_avail, mem_floor): a re-port that carries only the load half leaves the
+#        spawn point memory-blind, which is precisely the incident #2387 records (six dmesg OOM kills
+#        inside two hours on a cell whose load gate was satisfied). The tortoise original has none of it. WHY THIS MATTERS FOR A RE-PORT: exactly
 #        D5's reason — the addition is invisible in a passing test run, because a file that carries
 #        only the library half still satisfies every check that predates #1884, and the box simply
 #        stops gating hand-written runners again. There is NO tortoise counterpart to keep in sync,

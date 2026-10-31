@@ -154,6 +154,17 @@
     <string>__MIN_SWAP_FREE__</string>
     <key>MIN_MEM_FREE_MB</key>
     <string>__MIN_MEM_FREE_MB__</string>
+    <!-- the SPAWN gate's available-memory floor (agent-infra#2387) and the two factors it is derived
+         from. RENDERED, not README-only: the gate names MEM_MIN_AVAIL_MB in its own refusal line as the
+         operator's lever, and a plist-managed cell (the population the six dmesg OOM kills came from)
+         can only set what this template substitutes. The floor refuses a spawn when MemAvailable is
+         below it; it fails CLOSED, so an unreadable probe refuses too. -->
+    <key>MEM_MIN_AVAIL_MB</key>
+    <string>__MEM_MIN_AVAIL_MB__</string>
+    <key>MEM_LANE_RESERVE_MB</key>
+    <string>__MEM_LANE_RESERVE_MB__</string>
+    <key>MEM_SPAWN_RESERVE_LANES</key>
+    <string>__MEM_SPAWN_RESERVE_LANES__</string>
     <key>BATCH</key>
     <string>__BATCH__</string>
     <key>PRODUCT_FLOOR</key>

@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `fork|load|disk|land` and returns 0 iff THIS dispatch was refused by a gate
+cap_refusal_gate() { # -> prints `fork|load|mem|disk|land` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -105,19 +105,20 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land` and returns 0 iff THIS di
   # of turning the slack negative — it buys no slack, exactly as documented above.
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
-  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (73 fork / 74 land-backlog /
-  # 75 load / 77 disk), not a gate: an unrecognised value is reported as `load` because the refusal
-  # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
-  # fleet-wide idleness R8 removes. `fork` is named rather than folded into `load` because its remedy is
-  # the OPPOSITE of a load wait — the box must be restarted or drained from OUTSIDE (agent-infra#2293) —
-  # and a chain that told its caller "load" would send the operator to wait for a retry the box cannot
-  # even spawn. Its code is 73, NOT 74: 74 is the land-backlog gate below, and two gates that share a
-  # code with opposite remedies make every caller mislabel one of them (measured on this integration
-  # branch — the batch's own review caught it as a P0; see also spawn-gate.sh's AGENT_FORK_REFUSED).
+  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability / 73 fork /
+  # 74 land-backlog / 75 load / 77 disk / 81 memory), not a gate: an unrecognised value is reported as
+  # `load` because the refusal itself is already proven by fields 1-2, and refusing to end the wait over
+  # one corrupt byte is the fleet-wide idleness R8 removes.
+  # ⛔ EACH NON-LOAD VALUE IS NAMED BECAUSE ITS REMEDY IS THE OPPOSITE OF A LOAD WAIT: `fork` is the
+  # box's own inability to start a process (restart or drain it from OUTSIDE, agent-infra#2293); `mem`
+  # is resident lanes having to FINISH and release their working set (agent-infra#2387); `land` is not
+  # a property of this box at all. The codes are distinct for exactly that reason, and this arm was
+  # CAUGHT as part of a P0 collision on the integration batch: two gates that share a code with
+  # opposite remedies make every caller mislabel one of them.
   # Field 2 is deliberately NOT consulted here — the yield window is the controller's
   # business (`capacity_yield_live`), and an incoherent window must not make a proven refusal
   # unreadable. README §7.2d states exactly this per-reader split.
-  case "${gate:-}" in disk) printf 'disk' ;; fork) printf 'fork' ;; land) printf 'land' ;; *) printf 'load' ;; esac
+  case "${gate:-}" in disk) printf 'disk' ;; fork) printf 'fork' ;; land) printf 'land' ;; mem) printf 'mem' ;; *) printf 'load' ;; esac
   return 0
 }
 
@@ -244,6 +245,11 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # anything. The exit code must differ for the same reason 75 and 77 differ from each other —
       # the remedy is different — and it must be a STOP here for the same reason: no PR can appear.
       land) _cap_rc=74 ;;
+      # 81 is spawn-gate.sh's AGENT_MEM_REFUSED (#2387): available memory is below the spawn gate's
+      # floor. A capacity refusal like load — a peer with free RAM can take the issue — but a
+      # DIFFERENT reading whose remedy is a DIFFERENT event (resident lanes finishing, not the load)
+      # so it exits with its own code rather than reporting 75.
+      mem)  _cap_rc="${AGENT_MEM_REFUSED:-81}" ;;
       # 71 is spawn-gate.sh's AGENT_CAPABILITY_REFUSED (#2935): the box could not complete one model
       # call and RETURN. Distinct from 75 for the usual reason — the remedy differs — and it lands in
       # the SAME yield path as load, deliberately: a capability refusal is a property of THIS box, so
@@ -433,13 +439,19 @@ fi
 
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
 rc=$?
-# A load refusal (75) is not a failure of the work: nothing ran and nothing was consumed. Name it
+# A capacity refusal is not a failure of the work: nothing ran and nothing was consumed. Name it
 # HERE, in the log the operator reads for this chain — the reviewer's own line is inside
 # merge-$PR.log, and on a box with no controller running nothing else would ever re-dispatch it.
+# ⛔ ONE CAUSE PER CODE (#2387 review P3): this block used to test `rc = 75` only, so a memory
+# refusal — merge-one.sh's own PI_GATE_MEM_REFUSED arm now exits 81 — propagated the right code and
+# said NOTHING, on the very path (chain-<N>, no controller running) the line exists to cover. The
+# remedies differ, so they are separate arms rather than a shared "capacity" sentence: a load floor
+# clears when the box quietens, a memory floor only when resident lanes finish or are stopped.
 echo "[chain $N] merge-one rc=$rc $(date)" >> "$LOG"
-if [ "$rc" = "75" ]; then
-  echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG"
-fi
+case "$rc" in
+  75) echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG" ;;
+  81) echo "[chain $N] reviewer NOT started (MEMORY gate) — nothing was consumed. Re-run this chain when resident lanes have finished and released their working set (this will NOT clear by waiting for load); the reading, the floor and its derivation are on the [mem-gate] REFUSED line in merge-$PR.log" >> "$LOG" ;;
+esac
 echo "[chain $N] done $(date)" >> "$LOG"
 # ⛔ EXIT WITH merge-one.sh's STATUS (#1720 review). This script used to end on the `echo …done…`
 # above, so `$?` was the STATUS OF `echo` — always 0 — and a caller doing `chain-merge.sh … && next`

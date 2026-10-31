@@ -2419,6 +2419,66 @@ def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
     assert pr.gate_refused("prd-9", 74) is False
 
 
+def test_a_MEMORY_refusal_VOIDS_the_row(tmp_path, monkeypatch):
+    """Exit 81 is a gate refusal, not a launch (agent-infra#2387).
+
+    Same accounting failure as the 74 arm above, and on a box at its memory floor it is not a rare
+    one: EVERY pr-doctor spawn is refused, so an unrecognised code records a "launched" row on every
+    pass -- a 45-min cooldown and a 90-min budget slot each time, for a worker that never started.
+    Both halves again: the code must be in GATE_REFUSALS and the marker must be the gate's own line.
+    ⛔ 81, NOT 73: the memory pair was renumbered when this branch met main, because 73 is
+    `AGENT_FORK_REFUSED` there and 72 is `REPO_TARGET_REFUSED` -- so this test pins the number the
+    gate actually returns, not the one the first draft chose.
+    """
+    assert 81 in pr.GATE_REFUSALS
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-9.rc").write_text("81\n")
+    (d / "bg" / "prd-9.log").write_text(
+        "[mem-gate] REFUSED bg prd-9: LOW MemAvailable=653M < mem_min_avail_mb=2048M "
+        "(= mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2) -- no agent was started\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-9", 81) is True
+    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == ["9"]
+    # The cooldown-KEEPING direction: an agent that exits 81 itself is not a gate refusal.
+    (d / "bg" / "prd-9.log").write_text(
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=81\n")
+    assert pr.gate_refused("prd-9", 81) is False
+
+
+def test_a_FORK_and_a_CAPABILITY_refusal_VOID_the_row_too(tmp_path, monkeypatch):
+    """The other two codes that arrived after GATE_REFUSALS did (agent-infra#2293, #2935).
+
+    ⛔ A CODE WITHOUT ITS MARKER IS INERT, and that is the shape this file keeps producing: the
+    predicate demands BOTH, so a code added to the tuple without the marker leaves the row booked
+    `launched` -- the accounting failure the 74/81 arms exist to prevent, one gate over. Asserted as
+    a loop over both pairs so a third one cannot be added half-way either.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    for code, marker in ((73, "[fork-gate] REFUSED"),
+                         (71, "[capability-gate] REFUSED")):
+        # ⛔ A FRESH ROW PER ITERATION: `void_refused_rows` DELETES the key it voids, so reusing one
+        # dict made the second pair assert `[] == ["9"]` — a vacuous failure that reported the
+        # capability gate as inert when the arm had already consumed the row itself.
+        st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                    "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+        assert code in pr.GATE_REFUSALS, code
+        assert marker in pr.REFUSAL_MARKERS, marker
+        (d / "bg" / "prd-9.rc").write_text("%d\n" % code)
+        (d / "bg" / "prd-9.log").write_text(
+            "%s bg prd-9: no agent was started, nothing was consumed\n" % marker)
+        assert pr.gate_refused("prd-9", code) is True, (code, marker)
+        assert pr.void_refused_rows(st) == ["9"], (code, marker)
+        # …and the cooldown-KEEPING direction for each: a `pi` that exits it itself is not a refusal.
+        (d / "bg" / "prd-9.log").write_text(
+            "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=%d\n" % code)
+        assert pr.gate_refused("prd-9", code) is False, code
+
+
 def test_the_refusal_markers_are_the_gates_own_lines():
     """Anti-drift on the ONE piece of prose this file reads: reword it in spawn-gate.sh and the
     refusal detection silently stops working (every refusal would read as a real dispatch)."""
@@ -2637,11 +2697,18 @@ def test_the_agent_ran_marker_is_still_written_after_the_wait():
     assert launch_ln, "spawn-gate.sh no longer launches the agent with `pi -p`"
     launch = min(launch_ln)
     # the `if [ "$rc" = "$PI_GATE_REFUSED" ]` branch: from its guard line to the marker line
+    # ⛔ INCLUDING THE MEMORY GUARD (#2387): the shim has its own refusal branch (`PI_GATE_MEM_REFUSED`,
+    # written after `pi` was launched because the shim IS the `pi`), and `[mem-gate] REFUSED` is echoed
+    # there. Testing only the load guard would force that marker to be treated as evidence of a run.
     gate_branch = [i for i, l in enumerate(lines, 1) if "PI_GATE_REFUSED" in l
                    and l.lstrip().startswith("if ")]
     assert gate_branch, ("spawn-gate.sh no longer has a `PI_GATE_REFUSED` branch -- a spawn-point "
                         "refusal would now read as a real run")
-    guard = min(gate_branch)
+    mem_branch = [i for i, l in enumerate(lines, 1) if "PI_GATE_MEM_REFUSED" in l
+                  and l.lstrip().startswith("if ")]
+    assert mem_branch, ("spawn-gate.sh no longer has a `PI_GATE_MEM_REFUSED` branch -- a memory "
+                        "refusal would now read as a real run")
+    guard = min(gate_branch + mem_branch)
     for marker in pr.REFUSAL_MARKERS:
         sites = [i for i, l in enumerate(lines, 1) if marker in l and l.lstrip().startswith("echo")]
         assert sites, ("%r is no longer echoed by spawn-gate.sh -- gate_refused() would read every "
