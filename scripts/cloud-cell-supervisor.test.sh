@@ -4704,6 +4704,10 @@ run_stop() { # <state-dir>; runs the SHIPPED stop, returns its rc in S_RC, outpu
     HARNESS="$C2/harness" bash "$SUP" stop 2>&1)" || S_RC=$?
 }
 : > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/o"
+# The killed controller left a lock naming a DEAD pid (a kill/OOM/reboot does). The leftover path must
+# reach `stop`'s shared tail, which is what releases it — an early return there would leave the next
+# `start` to `acq()` a lock whose recycled pid makes it exit 0 silently, dispatching nothing.
+printf '999999\n' > "$C2/o/.orch.lock"
 run_stop "$C2/o"
 case "$S_RC:$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE)" in
   0:SESSION-GONE) ok "stop CLEARS a leftover session whose own pane command names THIS state dir — the measured 'neither start nor stop can clear' case (#2315 ask a)" ;;
@@ -4712,6 +4716,10 @@ esac
 case "$S_OUT" in
   *"clearing this state dir's leftover"*) ok "…and SAYS it cleared a leftover rather than reporting a plain stop" ;;
   *) bad "the clear was silent about what it was: [$S_OUT]" ;;
+esac
+case "$([ -f "$C2/o/.orch.lock" ] && echo LOCK-LEFT || echo LOCK-GONE)" in
+  LOCK-GONE) ok "…and the leftover path still reaches the shared tail, so the dead owner's lock is RELEASED (not left for the next start to trip on)" ;;
+  *) bad "the stale .orch.lock survived a cleared leftover — the next start would acq() a dead pid's lock and exit 0" ;;
 esac
 # (12) THE PEER CASE — same shape, a DIFFERENT state dir in the pane command. This must still refuse:
 #      the machine-scoped session name is not evidence, and killing a peer cell's session is the #1856

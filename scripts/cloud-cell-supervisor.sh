@@ -3635,18 +3635,18 @@ cmd_stop() {
       log_line "session '$SESSION' holds no controller, but its own pane command names this state dir ($O) — clearing this state dir's leftover (#2315)"
       tmux kill-session -t "=$SESSION" || die "tmux kill-session failed for '$SESSION' — the leftover session may still be running"
       tmux has-session -t "=$SESSION" 2>/dev/null && die "session '$SESSION' still exists after kill-session — refusing to report a cleared leftover"
-      if [ -n "$stop_unit" ]; then
-        unit_stop_effect_verdict "$stop_unit" || rc=1
-        [ "$rc" -eq 0 ] || return 1
-      fi
-      if [ -n "$stop_unit" ]; then log_line "controller stopped (systemd $stop_unit) — its leftover session '$SESSION' was cleared"; else log_line "not running — cleared this state dir's leftover session '$SESSION'"; fi
-      [ "$rc" -eq 0 ] || return 1
-      return 0
+      log_line "cleared this state dir's leftover session '$SESSION'"
+      # ⛔ AND THEN THE SHARED TAIL, NOT AN EARLY RETURN. The tail is what re-reads ownership, proves
+      # nothing of ours is alive, verifies the unit's effect and RELEASES $LOCK — a killed controller
+      # leaves a lock on disk naming a dead pid, and skipping that release would leave the next `start`
+      # to `acq()` a lock that names a recycled pid (silent exit 0, nothing dispatches). The leftover
+      # path therefore falls THROUGH; the branches below are skipped by making the kill an `else`.
+    else
+      # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
+      # success while the controller is still running (the same "failed precondition as success" shape).
+      tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
+      log_line "controller stopped (tmux '$SESSION')"
     fi
-    # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
-    # success while the controller is still running (the same "failed precondition as success" shape).
-    tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
-    log_line "controller stopped (tmux '$SESSION')"
   fi
   # Terminate the owners this cell may signal, and PROVE they are gone BEFORE releasing the lock. A
   # lock removed while its owner lives is #1761's duplicate: the next `start` acquires it and runs a
