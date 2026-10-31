@@ -870,6 +870,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     ],
     note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). THREE shapes reach `claim-unreadable` and the bound governs only the third: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because that test is the `if` and the age test only the `elif` — the bound must never be read as re-admitting a failed read), and an `ok` header older than this bound. The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
+  {
+    name: "LANE_ARM_SNAPSHOT_MAX_AGE",
+    owners: ["scripts/lane-arm.sh"],
+    value: "=900",
+    axis: "hygiene",
+    guardedBy: NONE,
+    overrides: ['LANE_ARM_SNAPSHOT_MAX_AGE="$2"'],
+    note: "how old a lane-arm pass's own SAMPLE may be before the reading is refused rather than presented as current (900 s), reachable as `--max-snapshot-age`. The age it bounds is honestly measured — the wall time from asking for the sample to having it in hand — so it is non-zero and CAN be exceeded (`--budget 1200` against this 900 s default makes the refusal live rather than an advertisement); a bound that could never fire was the defect the 2026-10-31 review found, when the test read the mtime of the file the pass had just written and every row stamped `snapshot_age=0s` as a constant. Deliberately NOT named `MAX_AGE`: that symbol is a REGISTERED term owned by `scripts/monitor-worker.sh` (a worker-log freshness bound at `${2:-60}`), and the reverse scan refused the collision — one name over two unrelated numbers is the divergence this registry exists to surface. Registered as a co-owner instead would be a lie: the forward check requires the SAME value in every owner, and 60 s is not 900 s. The value is asserted by THIS registry's forward check; the shipped arm has no dedicated suite, which is why guardedBy is NONE rather than naming one that does not drive it.",
+  },
   // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
   //
   // These are not kill bounds. They are the two readings the bounded
@@ -1434,6 +1443,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     rationale:
       "a MEASURED age in seconds — how old the cached CI-queue reading is (0 on a fresh read, the record's own `at=` delta on a cache hit) — printed in the verdict token so an operator can judge it. It is never a bound: the freshness DECISION is `CIQ_STALE_MAX`/`CIQ_TTL`, and the age is compared against them, not used as one. The `_AGE` suffix rule matches its initializer/assignment lines. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE is exempted (#2333 review)",
     owner: "#2426",
+  },
+  {
+    symbol: "LANE_ARM_SNAPSHOT_AGE",
+    rationale:
+      "a MEASURED age in seconds — the wall time a lane-arm pass spent obtaining its own sample, exported to the queue renderer and stamped into the queue header as `snapshot_age=<N>s` so a reader can judge the datum's currency. It is never a bound: the freshness DECISION is LANE_ARM_SNAPSHOT_MAX_AGE (registered on its own row above), and this age is what that bound is COMPARED AGAINST. The `_AGE` suffix rule matches the `export LANE_ARM_SNAPSHOT_AGE` line. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE and CIQ_AGE are exempted — the failure this exemption guards against is a stamp that reads zero seconds on every row because it was arithmetic rather than a measurement, which is fixed by measuring it, never by registering it",
+    owner: "#1567",
   },
   {
     symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",

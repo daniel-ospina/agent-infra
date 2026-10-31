@@ -112,7 +112,14 @@ LOG="$STATE/lane-arm.log"
 LOCK="$STATE/lane-arm.lock"
 STALE_LOCK_S=900
 BUDGET=240
-MAX_AGE=900
+# ⛔ NOT `MAX_AGE` (2026-10-31, verify). That name is a REGISTERED term owned by
+# `scripts/monitor-worker.sh` (a worker-log freshness bound, `${2:-60}`), and re-declaring it here
+# made ONE name out of TWO unrelated numbers -- the exact divergence the stall-term registry exists
+# to surface. The registry refuses a registered term declared in an unregistered file, and co-owner
+# registration is impossible by construction here (the forward check requires the SAME value in every
+# owner, and these differ: 60 s vs 900 s). So the name is distinct and self-describing, and it is
+# registered in `extensions/shared/heartbeat-progress-edges.ts` on its own row.
+LANE_ARM_SNAPSHOT_MAX_AGE=900
 SHOW=0
 # The pid of whatever `bounded()` currently has in flight, so the signal handler can stop it instead
 # of orphaning it (see the trap block). Emptied by `bounded()` on the normal path.
@@ -133,7 +140,7 @@ while [ $# -gt 0 ]; do
                          BUDGET="$2"; shift 2 ;;
     --max-snapshot-age)  [ $# -ge 2 ] || { echo "lane-arm: --max-snapshot-age needs a value" >&2; exit 2; }
                          _is_pos_int "$2" || { echo "lane-arm: --max-snapshot-age must be a positive integer of seconds, not '$2'" >&2; exit 2; }
-                         MAX_AGE="$2"; shift 2 ;;
+                         LANE_ARM_SNAPSHOT_MAX_AGE="$2"; shift 2 ;;
     --print)             SHOW=1; shift ;;
     -h|--help)           sed -n '2,80p' "$0"; exit 0 ;;
     *) echo "lane-arm: unknown argument '$1'" >&2; exit 2 ;;
@@ -349,13 +356,13 @@ fi
 # marker exists to prevent, so the stamp was worse than none.
 # The age this arm can HONESTLY measure is the age of its own reading: the wall time from the moment
 # it asked for a sample to the moment the sample is in hand. That is a real bound on how stale the
-# data is (nothing between T0 and now can have aged it), it is non-zero, and it CAN exceed MAX_AGE --
+# data is (nothing between T0 and now can have aged it), it is non-zero, and it CAN exceed the bound --
 # e.g. `--budget 1200` against the 900 s default -- which is what makes the refusal a live gate
 # rather than an advertisement. `--no-cache` above is what makes the sample fresh in the first place.
 sa=$(( $(now_s) - SAMPLE_T0 ))
-if [ "$sa" -gt "$MAX_AGE" ]; then
+if [ "$sa" -gt "$LANE_ARM_SNAPSHOT_MAX_AGE" ]; then
   rm -f "$TMP"
-  fail "the sample took ${sa}s (> ${MAX_AGE}s) -- a reading that old is not presented as current"
+  fail "the sample took ${sa}s (> ${LANE_ARM_SNAPSHOT_MAX_AGE}s) -- a reading that old is not presented as current"
 fi
 
 # ── 3. THE HANDOFF: one machine-readable line per WEDGED lane ─────────────────────────────────
