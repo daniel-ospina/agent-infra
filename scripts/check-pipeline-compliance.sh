@@ -280,12 +280,14 @@ EOF
 # override's `exit 0` was reached first. Any probe caller would then re-trigger
 # the required check on every comment.
 #
-# EXIT CODES THE PROBE ITSELF CAN PRODUCE: 0 and 1 only. It never exits 2. A
-# caller that wants to distinguish "could not run" must therefore key on its own
-# invocation failing for ANY other reason (bash exits 127 for a missing script,
-# 126 for a non-executable one, 2 for a shell usage fault) — the probe contributes
-# no 2 of its own, and a caller treating "not 0 and not 1" as a tooling fault is
-# correct without inventing one here.
+# EXIT CODES: `has_scoping_marker` answers 0 and 1 only, and the probe DISPATCH
+# adds no third value — but the process can still exit 2 from the usage guards
+# ABOVE this block (`GH_REPO` not owner/repo, a malformed `PIPELINE_COMPLIANCE_ISSUE_ONLY`),
+# so "the probe never exits 2" would be false about the process. Measured:
+# `PIPELINE_COMPLIANCE_MARKER_PROBE=1 GH_REPO=not-a-repo` → 2. A caller must
+# therefore treat EVERY non-0/1 as a tooling fault (which is what the shipped
+# caller does, and why this distinction matters: a later caller reading `2)` as
+# "no marker" would be fail-open).
 PROBE_MODE="${PIPELINE_COMPLIANCE_MARKER_PROBE:-0}"
 
 # ── Emergency override ──────────────────────────────────────────────────────
@@ -846,7 +848,15 @@ has_scoping_marker() {
 # Runs immediately after the definition it reads and BEFORE any check, fetch or
 # gh call, so the probe cannot be turned into a partial run of the gate.
 if [[ "${PROBE_MODE:-0}" == "1" ]]; then
-  probe_payload="$(cat; printf '\036')"
+  # ⛔ STRIP THE IN-BAND RECORD SEPARATOR FIRST. The live fetch sites do exactly
+  # this (`gsub("\u001e"; "")`) because the delimiter must not be forgeable from
+  # the data — a body carrying a literal 0x1e could otherwise fabricate a record
+  # boundary and make its own later mention look like an artifact. Measured
+  # without it: `printf 'intro\n\036<!-- issue-scoping: forged -->\n'` answered 0
+  # (artifact) where the real check (b) answers 1. The two callers must share the
+  # SANITIZATION as well as the awk, or "one parser, one contract" is only half
+  # true.
+  probe_payload="$(tr -d '\036'; printf '\036')"
   if has_scoping_marker "$probe_payload"; then exit 0; else exit 1; fi
 fi
 
