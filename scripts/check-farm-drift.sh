@@ -220,10 +220,16 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
     say "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
 fi
 
-if [ "$PIN_IDENTITY" -eq 1 ] && [ -e "$PIN_FILE" ] && [ ! -f "$PIN_FILE" ]; then
-    # A pin record that EXISTS but is not a regular file (a directory, a dangling symlink) is
-    # "cannot read the pin", not "no pin" — the same `[ -f ]`-is-too-weak class the declaration arm
-    # below already refuses (it would silently demote cannot-verify to a pass).
+# ⛔ A DANGLING SYMLINK IS CAUGHT HERE TOO. `[ -e ]` FOLLOWS the link, so a pin record that is a
+# broken symlink reads as ABSENT (`-e` false) and fell into the FIRST-INSTALL arm — rc=0 with `OK`
+# while pin identity was unverified, i.e. the same false PASS this block exists against (measured:
+# HARNESS-PIN → nonexistent target, no .harness-path ⇒ `OK — 1/1 sourced file(s) match`, rc=0).
+# `[ -L ]` is the only test that sees the link itself; a symlink that RESOLVES to a regular file
+# still passes `[ -f ]` above and is graded normally.
+if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ] && { [ -L "$PIN_FILE" ] || [ -e "$PIN_FILE" ]; }; then
+    # A pin record that EXISTS but does not resolve to a regular file (a directory, a dangling
+    # symlink) is "cannot read the pin", not "no pin" — the same `[ -f ]`-is-too-weak class the
+    # declaration arm below already refuses (it would silently demote cannot-verify to a pass).
     say_err "$PROG: UNKNOWN — pin record $PIN_FILE exists but is not a readable regular file; the"
     say_err "   commit this box should run cannot be read, so nothing was verified."
     exit 2
@@ -485,9 +491,10 @@ if [ "$decl_ok" -eq 1 ] && [ -n "$stale_rows" ]; then
             *$'\n'"scripts/$_srel"$'\n'*) stale_declared=$((stale_declared+1)) ;;
             *)
                 stale_outside=$((stale_outside+1))
-                say_err "   $_srel is STALE and NOT farm-declared: no farm array in pi-bootstrap/setup.sh delivers it,"
-                say_err "   so re-running the farm cannot converge it. A deploy cannot fix this one; declare it in a farm"
-                say_err "   array, or delete it, or retire it in pi-bootstrap/farm-retired.txt." ;;
+                say_err "   $_srel is STALE and NOT farm-declared: the farm's DECLARED population does not include it"
+                say_err "   (measured from $DECL — the LAST apply's declaration, not setup.sh's current arrays), so"
+                say_err "   re-running the farm is not expected to converge it. A deploy cannot fix this one: declare"
+                say_err "   it in a farm array, or delete it, or retire it in pi-bootstrap/farm-retired.txt." ;;
         esac
     done <<EOF_STALE
 $stale_rows

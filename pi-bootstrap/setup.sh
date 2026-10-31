@@ -1064,7 +1064,7 @@ if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
        printf '%s\n' "$_farm_msg" | sed 's/^/      /'
        echo "    Refusing to report a successful install over a farm that launchd would execute as stale code."
        exit 1 ;;
-    3) echo "    ⚠️  farm: UNSOURCED file(s) — on the box, in no repo file (this is NOT drift, and NOT a pass):"
+    3) echo "    ⚠️  farm: files a DEPLOY CANNOT FIX (exit 3) — this is NOT a pass:"
        printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
     *) echo "    ⚠️  farm: COULD NOT VERIFY (exit $_farm_rc) — this is NOT a pass:"
        printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;

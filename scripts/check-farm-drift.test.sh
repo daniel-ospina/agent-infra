@@ -242,6 +242,17 @@ RC=$?
 ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a LOST pin (.harness-path present, HARNESS-PIN absent) is UNKNOWN, not a pass (rc=$RC)"
 ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict at all"
 
+# 21b. ⛔ A DANGLING-SYMLINK pin record is the SAME false PASS, because `[ -e ]` FOLLOWS the link: it
+# read as ABSENT and fell into the first-install arm (rc=0 + `OK`) while pin identity was
+# unverified. `[ -L ]` is the only test that sees the link itself.
+F21B="$TMP/f21b"; mk_farm "$F21B"; mkdir -p "$TMP/pinlink"
+ln -s "$TMP/does-not-exist/HARNESS-PIN" "$TMP/pinlink/HARNESS-PIN"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$TMP/pinlink" bash "$CHECK" --dest "$F21B" --src "$SRC" --ref HEAD --pin-file "$TMP/pinlink/HARNESS-PIN" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a DANGLING-SYMLINK pin record is UNKNOWN, not a pass (rc=$RC)"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict at all"
+
 # 22. ⛔ A STALE FILE NO FARM ARRAY DELIVERS IS NOT FATAL. `admin-merge.sh`, `heartbeat-loop.sh` and
 # the declared #1553 gap live on the box and are delivered by NO farm array (measured: grep count 0 in
 # pi-bootstrap/setup.sh), so setup.sh's rc=1 arm fired on a file its own printed remedy could never
