@@ -26,7 +26,8 @@
 #   E. REAL tools: a real process cwd'd into a real linked worktree keeps that env; the same fixture
 #      reaps once it is gone; the reaper is excluded from its own ancestry (so `--worktree` can reap
 #      at all); and a REAL private tmux server proves the pane witness both ways.
-#   F. wiring pins: lane.sh reaps in its EXIT trap, fix-one.sh reaps AFTER the merge chain, the cell
+#   F. wiring pins: lane.sh reaps in its EXIT trap AND from the TERM/INT/HUP handlers that actually
+#      kill a lane (a SIGHUP'd shell runs no EXIT trap), fix-one.sh reaps AFTER the merge chain, the cell
 #      supervisor no longer blind-`rm`s a `.venv` and delegates to the reaper instead, setup.sh farms
 #      the reaper so a cell can find it.
 #   G. the `uv` download cache is never referenced — deleting it re-spends the space whether or not
@@ -574,10 +575,43 @@ else
 fi
 
 echo "── F. wiring pins ───────────────────────────────────────────────────────────────────"
-if grep -qF 'trap '"'"'reap_lane_venv "$PWD" "lane $N"'"'"' EXIT' "$HARNESS/lane.sh"; then
-  ok "lane.sh reaps its own worktree from an EXIT trap (a TERM'd session included)"
+# ⛔ THIS PIN MOVED WITH THE WIRING, AND IT PINS THE WIRING, NOT A SPELLING (#2033). `lane.sh` no
+# longer installs `trap 'reap_lane_venv "$PWD" "lane $N"' EXIT`: the reap is now `lane_exit_cleanup`,
+# reached from an EXIT trap AND from explicit TERM/INT/HUP handlers, because a shell killed by SIGHUP
+# with only an EXIT trap installed runs NO trap (measured on /bin/bash 3.2.57) and `tmux kill-session`
+# delivers exactly that. A literal pin on the old form therefore does not merely go stale — it would
+# PASS on the shape this change exists to remove if it were restored, and it FAILS on the shape that
+# fixes the signal defect. So the three facts that carry the behaviour are pinned separately, each
+# independently falsifiable: the trap is installed, the function it names really reaps, and the
+# signals that actually kill a lane reach it.
+if grep -qE '^[[:space:]]*trap .lane_exit_cleanup. EXIT' "$HARNESS/lane.sh"; then
+  ok "lane.sh reaps its own worktree from an EXIT trap"
 else
-  bad "lane.sh has no EXIT-trap reap — an exiting lane leaves its venv behind"
+  bad "lane.sh has no EXIT trap naming lane_exit_cleanup — an exiting lane leaves its venv behind"
+fi
+if awk '/^lane_exit_cleanup\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$HARNESS/lane.sh" \
+     | grep -qF 'reap_lane_venv "$LANE_WT" "lane $N"'; then
+  ok "…and the function that trap names actually reaps the lane's venv"
+else
+  bad "lane_exit_cleanup does not call reap_lane_venv — the EXIT trap reaps nothing"
+fi
+# The signal half is the load-bearing half: `tmux kill-session`, an operator's `kill -HUP`, and a
+# Ctrl-C all bypass an EXIT trap, so each needs its OWN handler (a shell killed by a signal with only
+# an EXIT trap runs nothing). One assertion per signal, so a handler lost later names the signal.
+for _sig in HUP TERM INT; do
+  if grep -qE "^[[:space:]]*trap .*lane_exit_cleanup.* ${_sig}$" "$HARNESS/lane.sh"; then
+    ok "…and a ${_sig} reaches it (a signal-killed lane reaps too)"
+  else
+    bad "no ${_sig} handler reaches lane_exit_cleanup — a ${_sig}'d lane keeps its venv and worktree"
+  fi
+done
+# ⛔ AND A DRY RUN MUST DISARM ALL FOUR TRAPS, not just EXIT: the cleanup is now reachable from the
+# signal handlers, so an armed HUP/TERM would let a Ctrl-C in a preview run the very deletion the
+# dry-run guard exists to prevent (a preview that removes a build artifact is the defect).
+if grep -qE '^[[:space:]]*trap - EXIT INT TERM HUP[[:space:]]*$' "$HARNESS/lane.sh"; then
+  ok "…and a dry run disarms every trap that could reach the cleanup (a preview deletes nothing)"
+else
+  bad "lane.sh's dry-run branch does not clear all four traps — a Ctrl-C in LANE_DRY_RUN=1 would run the cleanup"
 fi
 if grep -qF 'reap_lane_venv "$WT" "fix $PR"' "$HARNESS/fix-one.sh"; then
   ok "fix-one.sh reaps its worktree"
