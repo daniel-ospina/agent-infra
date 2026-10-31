@@ -555,15 +555,16 @@ function cmt_start(line, i,   prev) {
 # unreported at rc=0 (the same silent-CLEAN shape the previous cycle fixed one construct earlier).
 # The test looks back over spaces to the nearest non-space byte: a shell operator (`;`, `&`, `|`, `(`,
 # `{`), an arm label / subshell close `)`, the start of the line, or a command-introducing keyword.
-function cmd_boundary(line, i,   j, prev, w, w2, k) {
-  # \u26d4 THE CLASS IS FINITE AND IT IS NOW CLOSED (review cycle-6 P1). bash accepts exactly these
-  # before a command: the operators `; & | ( {`, an arm label / subshell close `)`, the negation `!`,
-  # and the reserved words that TAKE a command \u2014 `if then elif else while until do`, `time` (with
-  # its own -p/-- options) and `coproc` (with an optional NAME). Enumerating only the first group
-  # left `time -p case` and `coproc C case` unrecognised, and each reproduced the silent rc=0 green
-  # over two live traps that the `!` fix had just closed \u2014 not present in this tree, and not a
-  # regression, but the same false-PASS class. The lookback therefore WALKS: option words are skipped,
-  # `time`/`coproc` are recognised, and a bare NAME one word after `coproc` is recognised too.
+function cmd_boundary(line, i,   j, prev, w, w2, k, kk) {
+  # \u26d4 THE CLASS IS FINITE, CLOSED, AND NOW VERIFIED AT EVERY STEP (review cycle-7 P2). bash accepts
+  # exactly these before a command: the operators `; & | ( {`, an arm label / subshell close `)`, the
+  # negation `!`, and the reserved words that TAKE a command \u2014 `if then elif else while until do`,
+  # `time` (with its own `-p`/`--`) and `coproc` (with an optional NAME).
+  # The first version of this walk ACCEPTED such a word and returned 1, which made `echo coproc case`
+  # and `echo time -p case` open a `case` that never closes \u2014 a false `context-unbalanced` on valid
+  # code (the mirror of the false PASS this walk exists to prevent, and the direction C28 names). So an
+  # accepted prefix word is not a verdict: it moves the walk LEFT and the same question is asked about
+  # it, until an operator, the line start, or a word that opens nothing answers for real.
   j = i - 1
   while (1) {
     while (j >= 1 && substr(line, j, 1) ~ /[ \t]/) j--
@@ -572,19 +573,19 @@ function cmd_boundary(line, i,   j, prev, w, w2, k) {
     if (prev ~ /[;&|({!]/) return 1
     if (prev == ")") return 1
     if (prev !~ /[A-Za-z0-9_-]/) return 0
-    w = ""
-    while (j >= 1 && substr(line, j, 1) ~ /[A-Za-z0-9_-]/) { w = substr(line, j, 1) w; j-- }
-    # the `time` options and a `--` word belong to the PREFIX \u2014 keep walking left
-    if (w ~ /^-/) continue
-    if (w == "time" || w == "coproc") return 1
-    if (w == "then" || w == "do" || w == "else" || w == "elif" || w == "if" || w == "while" || w == "until") return 1
-    # `coproc NAME case`: the bare name is part of the prefix, so look one word further left
-    k = j
-    while (k >= 1 && substr(line, k, 1) ~ /[ \t]/) k--
-    if (k >= 1) {
+    w = ""; k = j
+    while (k >= 1 && substr(line, k, 1) ~ /[A-Za-z0-9_-]/) { w = substr(line, k, 1) w; k-- }
+    # an option word belongs to the preceding command word: skip it, ask again further left
+    if (w ~ /^-/) { j = k; continue }
+    # a command-taking reserved word only opens a command if IT is at a command boundary
+    if (w == "time" || w == "coproc" || w == "then" || w == "do" || w == "else" || w == "elif" || w == "if" || w == "while" || w == "until") { j = k; continue }
+    # `coproc NAME case`: the bare name is part of the prefix, so step to its `coproc` and ask again
+    kk = k
+    while (kk >= 1 && substr(line, kk, 1) ~ /[ \t]/) kk--
+    if (kk >= 1) {
       w2 = ""
-      while (k >= 1 && substr(line, k, 1) ~ /[A-Za-z0-9_]/) { w2 = substr(line, k, 1) w2; k-- }
-      if (w2 == "coproc") return 1
+      while (kk >= 1 && substr(line, kk, 1) ~ /[A-Za-z0-9_]/) { w2 = substr(line, kk, 1) w2; kk-- }
+      if (w2 == "coproc") { j = kk; continue }
     }
     return 0
   }

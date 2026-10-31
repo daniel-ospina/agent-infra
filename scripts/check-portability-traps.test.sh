@@ -377,10 +377,17 @@ mkdir -p "$TMP/tree/prefix"
 { printf '%s\n' '#!/usr/bin/env bash';
   printf 'x=$(coproc C case a in a)# don%st reorder\n' "$CASQ3";
   printf '%s\n' '  sed -i s/a/b/ f' '  stat -c %Y g' '  ;;' 'esac)' "# it${CASQ3}s fine"; } >"$TMP/tree/prefix/2-coproc-name.sh"
-printf 'prefix/1-time-opt.sh\nprefix/2-coproc-name.sh\n' >"$TMP/prefix-targets"
-flags "sed-in-place-gnu" "$TMP/prefix-targets" && flags "stat-c-gnu" "$TMP/prefix-targets" \
-  && ok "C30/C31: a time option and a coproc NAME before case keep the arm model — the live traps are reported (the prefix class is closed)" \
-  || bad "C30/C31: an option/name word before case was not recognised as a command prefix, hiding live traps"
+# ⛔ ONE TARGET LIST PER ARM (measured AGAIN here): a shared list let the `coproc` fixture satisfy both
+# arms while the `time -p` fixture was still hidden, so together they proved nothing about `time -p`.
+# Each shape is now its own arm, and each was mutation-verified separately.
+printf 'prefix/1-time-opt.sh\n' >"$TMP/prefix-time-targets"
+printf 'prefix/2-coproc-name.sh\n' >"$TMP/prefix-coproc-targets"
+flags "sed-in-place-gnu" "$TMP/prefix-time-targets" && flags "stat-c-gnu" "$TMP/prefix-time-targets" \
+  && ok "C30: a time OPTION before case keeps the arm model — both live traps are reported" \
+  || bad "C30: a time option before case was not recognised as a command prefix, hiding live traps"
+flags "sed-in-place-gnu" "$TMP/prefix-coproc-targets" && flags "stat-c-gnu" "$TMP/prefix-coproc-targets" \
+  && ok "C31: a coproc NAME before case keeps the arm model — both live traps are reported" \
+  || bad "C31: a coproc NAME before case was not recognised as a command prefix, hiding live traps"
 
 # C6/C7 — the file-level declaration: a reasoned skip works; a bare one REFUSES.
 L="$TMP/linuxonly"; : >"$L"
@@ -490,6 +497,22 @@ for f in survive/1-comment-sub.sh survive/2-len-arith.sh survive/3-shift.sh \
     bad "C8: SCAN LOST after $f — the trap on its last line was not reported"
   fi
 done
+
+# ⛔ C32 — THE OTHER POLARITY OF THE SAME WALK (review cycle-7 P2). A prefix word is not a verdict: the
+# first version of `cmd_boundary()` ACCEPTED `time`/`coproc` and returned, so `a=$(echo coproc case)`
+# and `a=$(echo time -p case)` opened a `case` that never closes and got a false `context-unbalanced` on
+# valid code — the mirror of the false PASS this walk exists to prevent. An accepted prefix now moves
+# the walk LEFT and the same question is asked about it, which also closes the pre-existing
+# `echo if case` over-accept at one root.
+mkdir -p "$TMP/tree/prefixarg"
+printf '%s\n' '#!/usr/bin/env bash' 'a=$(echo coproc case)' 'echo ok' >"$TMP/tree/prefixarg/1.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'a=$(echo coproc JOB case)' 'echo ok' >"$TMP/tree/prefixarg/2.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'a=$(echo time -p case)' 'echo ok' >"$TMP/tree/prefixarg/3.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'a=$(echo if case)' 'echo ok' >"$TMP/tree/prefixarg/4.sh"
+printf 'prefixarg/1.sh\nprefixarg/2.sh\nprefixarg/3.sh\nprefixarg/4.sh\n' >"$TMP/prefixarg-targets"
+not_flags "context-unbalanced" "$TMP/prefixarg-targets" \
+  && ok "C32: a command-taking keyword used as an ARGUMENT (echo coproc/time -p/if case) does not open a case — no false context-unbalanced on valid code" \
+  || bad "C32: an argument-position keyword was accepted as a command prefix and invented context-unbalanced"
 
 # C9 — the other direction: a context the file never closes must be REPORTED, never swallowed.
 # C9b — a file that DECLARES itself out of scope must not report the EOF rules: its own remedy text
