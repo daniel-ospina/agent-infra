@@ -109,7 +109,10 @@ LIST="$( cd "$ROOT" && bash scripts/run-bash-shards.sh --list 2>/dev/null )"
 LRC=$?
 ck $([ "$LRC" -eq 0 ] && echo 0 || echo 1) "run-bash-shards.sh --list exits 0 (rc=$LRC)"
 REL="${BASH_SOURCE[0]#"$ROOT"/}"; REL="${REL#./}"
-ck $(printf '%s\n' "$LIST" | grep -qxF "$REL" && echo 0 || echo 1) \
+# ⛔ NO PIPE INTO A QUIET GREP (#841/#864): the producer is a builtin, so it inverts to a
+# here-string — under `pipefail` a `grep -q` that exits at the first match leaves the writer with
+# SIGPIPE, and the whole `ck` reads 1 on a LIST that DOES contain the path.
+ck $(grep -qxF "$REL" <<<"$LIST" && echo 0 || echo 1) \
    "...and '‑‑list' CONTAINS '$REL' — this suite runs on the PR lane, not only on issue_comment"
 
 echo ""
