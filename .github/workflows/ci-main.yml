@@ -149,9 +149,9 @@ jobs:
         # Glob-collected: every extensions/*/test*.mjs suite, including #744's
         # main-worktree-guard/test-module-load.mjs (the index.ts module-LOAD
         # regression pin) — no explicit line for it, that would double-run it.
-        # ⚠️ This leg is POST-MERGE only (on: push → main, plus `integration/**` since
-        # #3131); the per-PR run of the #744 suite is wired in ci.yml — the per-PR
-        # workflow that runs the test suites. (This comment used to add "pipeline-compliance.yml is also
+        # ⚠️ This leg runs on the PUSH lane only — `main`, and `integration/**` since #3131 —
+        # never on a pull request (this workflow has no `pull_request` trigger). The per-PR run of
+        # the #744 suite is wired in ci.yml, the workflow that runs the test suites on PRs. (This comment used to add "pipeline-compliance.yml is also
         # PR-triggered, but runs no test suite" — stale since #991, which wired
         # the pipeline-compliance fixture suite in, and since #1027, which added
         # tests/materialize-agents/run.sh to the same required job.)
@@ -333,8 +333,10 @@ jobs:
         # #5550/#1491 — the push-scope PROOF (D1–D3 + F1–F14). It was wired into
         # NO lane while its three siblings ran, so a previously-unrun suite could
         # rot unobserved; this step closes that gap and runs beside its siblings.
-        # NOTE this lane is trigger `push: [main]` (post-merge, like the unit/e2e
-        # suites above): a regression is reported on main AFTER merge, not before.
+        # NOTE this lane runs on the PUSH lane only — `main` (post-merge, where a regression is
+        # reported AFTER merge) and, since #3131, `integration/**` (a PRE-merge batch gate, where the
+        # same red blocks the batch instead) — like the unit/e2e suites above. This workflow has no
+        # `pull_request` trigger, so nothing here gates a PR.
         # A PR-gating leg is the follow-up (the suite value-imports ./index.js,
         # which imports the pi SDK, so it needs a scoped `npm ci` that ci.yml's
         # verify job deliberately avoids — the same constraint as its siblings).
