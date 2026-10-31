@@ -4711,6 +4711,81 @@ def test_the_cascade_wait_rung_counts_an_unreadable_classification(monkeypatch):
     assert "fix=1" in casc[0], casc[0]
 
 
+def test_the_cascade_counts_a_PARTIAL_file_page(monkeypatch):
+    """`surface_partial` must reach `wait=` and `filelist=` -- the bucket was unpinned.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 11). `_r3_files` sums THREE buckets, and dropping
+    `skipped-surface_partial` from it left the suite exactly at baseline (`8 failed, 310 passed`
+    over the whole file, same names) -- the bucket was unpinned through the cascade line, while its
+    sibling test only ever drove `surface_unreadable`. A 100-entry page is the fixture that reaches
+    this bucket by construction (`len(files) >= 100` -> `FILES_TRUNCATED`), and it is also the
+    population round 7 called out: the wait IS rung 3 (#2136 r2), and "a human must resolve" is the
+    clause that says it will not clear by waiting.
+    """
+    _p = _pr(74)
+    _p["files"] = [{"path": "docs/%d.md" % _i} for _i in range(100)]
+    _rc, joined, payload = _drive_pass(monkeypatch, [_p], ("record-review", "why", []))
+    assert payload.get("surface_partial") == 1, payload
+    assert payload.get("dispatched") == 0, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=1" in casc[0], casc[0]
+    assert "filelist=1" in casc[0], casc[0]
+    # on the wait axis (#2136 r2), AND decomposed so the human decision is unmissable
+    assert "the chain is on rung 3" in casc[0], casc[0]
+    assert "a human must resolve" in casc[0], casc[0]
+
+
+def test_the_cascade_counts_an_ABANDONED_file_read(monkeypatch):
+    """`surface_abandoned` must reach `wait=` too -- the third bucket, equally unpinned.
+
+    ⛔ MEASURED (review P2, round 11): dropping `skipped-surface_abandoned` from `_r3_files` left
+    the suite at baseline (`8 failed, 310 passed`). The bucket is written AFTER the two-strike
+    bound (`_asked = file_read_failures < 2`), so reaching it needs THREE unusable-file PRs, not
+    one: the first two are real failed reads and the third is never attempted.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(75), _pr(76), _pr(77)],
+                                       ("record-review", "why", []))
+    assert payload.get("surface_unreadable") == 2, payload
+    assert payload.get("surface_abandoned") == 1, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=3" in casc[0], casc[0]
+    assert "filelist=3" in casc[0], casc[0]
+
+
+def test_the_cascade_both_population_arm_prints_the_TOTAL_not_the_ask_user_count(monkeypatch):
+    """When BOTH hold populations are non-empty, `held=` is their SUM -- the third arm's twin.
+
+    ⛔ MEASURED (review P2, round 11): changing the both-arm's `% (_r3 + _held, ...)` to
+    `% (_held, ...)` left the suite at baseline (`8 failed, 310 passed`). `held=` would then be
+    the ASK-USER count alone while the same line still said "1 waiting on rung 3", i.e. the
+    double-quantity defect rounds 3/6 closed for the other two arms, resurrected in the one arm
+    nobody had a fixture for.
+    """
+    monkeypatch.setattr(pr, "CLASSIFIER", pr.CLASSIFIER)
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: p["number"] == 79,
+                        raising=False)
+
+    def _classify(p):
+        if p["number"] == 78:
+            return None          # a blind check-run read: held on the retry axis
+        return ("record-review", "why", [])
+
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(78), _pr(79)], _classify)
+    assert payload.get("unreadable") == 1, payload
+    # the surface hold is not a sidecar field; it is asserted on the two lines that carry it
+    assert "ASK-USER #79" in joined, joined
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert casc[0].count("held=") == 1, casc[0]   # ONE label per line
+    assert "held=2" in casc[0], casc[0]           # _r3 (1 unreadable) + _held (1 surface)
+    assert "wait=1" in casc[0], casc[0]
+    assert "surface=1" in casc[0], casc[0]
+
+
 def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatch):
     """Rung 1 must name what is ELIGIBLE; only `_finish` may say what was dispatched.
 

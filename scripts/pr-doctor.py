@@ -5292,10 +5292,15 @@ def run_pass(args, rubric_note: str = "") -> int:
     #   rung 3 WAIT    nothing to dispatch: `running` (the head is still executing), an unreadable
     #                  classification, or an unusable changed-file list. ⛔ ONE DEFINITION, and every
     #                  mention of the axis in this block means exactly this: rung 3 is every row the
-    #                  pass HELD WITHOUT A DISPATCH that a later pass retries on its own, and `wait=`
-    #                  IS that set (`_finish`'s `blind` PLUS `running` -- noting that `blind` alone has
-    #                  NO `running` term). ONE subset is named INSIDE it: `filelist=`, the part no
-    #                  re-read will clear, so a human must resolve it. OUTSIDE it sits `surface=` --
+    #                  pass HELD WITHOUT A DISPATCH, and `wait=` IS that set (`_finish`'s `blind`
+    #                  PLUS `running` -- noting that `blind` alone has NO `running` term). ⛔ "A LATER
+    #                  PASS RETRIES IT" IS TRUE OF ONLY PART OF IT (review P1, round 11): the
+    #                  `running` and `unreadable` rows are retried on their own, while ONE subset --
+    #                  `filelist=`, the three unusable-changed-file-list buckets -- will NOT clear by
+    #                  re-reading, so a human must resolve it. It stays ON the axis (#2136 r2;
+    #                  reclassifying it would REVERSE that recorded decision), which is why the arm
+    #                  below does not attribute the wait to the RETRY axis when every held row is
+    #                  that subset. OUTSIDE it sits `surface=` --
     #                  the SDK-surface hold, an ESCALATION for a human rather than a wait -- which is
     #                  why it is never counted in `wait=` (review P2, round 9: the banner, the
     #                  `_r3` comment and the `surface=` comment each described a DIFFERENT set, so a
@@ -5408,7 +5413,7 @@ def run_pass(args, rubric_note: str = "") -> int:
     # disjoint) but an ambiguous report, which is the same defect class this block exists to remove.
     if _held:
         _casc.append("surface=%d" % _held)
-    _casc.append("slots=%d" % budgets["total"])
+    _casc.append("slots=%d (aggregate)" % budgets["total"])
     # ⛔ NO ARM ASSERTS A DISPATCH IT HAS NOT MADE (review P2). `budgets["total"]` is an AGGREGATE
     # (`fix + review`) while the loop spends PER CLASS, and a PR can still be refused for a live
     # worker or an unreadable liveness after the slot check -- so "dispatched" is a claim only
@@ -5429,7 +5434,11 @@ def run_pass(args, rubric_note: str = "") -> int:
     # `--max`) yields `{'fix': 3, 'review': 4, 'total': 0}` at the shipped defaults and the arms
     # printed `slots=0 merge->candidate (2), the rail decides; review slots=3` while dispatching
     # nothing.
-    # The binding number is `min(budgets[cls], budgets["total"])`, and that is what is printed.
+    # The binding number is `min(budgets[cls], budgets["total"])`, and that is what the PER-CLASS
+    # arms print (`fix slots=` / `review slots=`). ⛔ THE STANDALONE `slots=` IS A DIFFERENT
+    # QUANTITY -- the AGGREGATE -- and it now SAYS SO in the line (review P2, round 11): printed bare
+    # it sat beside `fix slots=1` as `slots=4`, two numbers under one word, which is the ambiguous
+    # report this block exists to remove.
     # So no arm says "handed"/"dispatched"/"eligible": every one names a CANDIDATE count and the
     # EFFECTIVE slots that could serve it. "Candidate" is the only claim this line can keep, because
     # cooldown and liveness are decided below it. `dispatched`/`_finish` remain the only source of
@@ -5530,6 +5539,13 @@ def run_pass(args, rubric_note: str = "") -> int:
                          "%d held for a HUMAN/ASK-USER)"
                          % (_r3 + _held, _r3, _files_clause, _held))
         elif _r3:
+            # ⛔ "THE CHAIN IS ON RUNG 3" IS KEPT HERE, AND IT IS TRUE UNDER THE BANNER'S DEFINITION
+            # (review P1, round 11 -- resolved by CORRECTING THE DEFINITION, not the arm).
+            # `test_the_cascade_names_the_WAIT_axis_separately_from_an_ASK_USER_hold` pins this
+            # arm's claim for a `surface_unreadable`-only hold, and #2136 r2 keeps those rows ON
+            # the axis: so the wait IS rung 3, and what a reader must additionally be told is that
+            # THIS wait needs a human. The round-7 decomposition below is that clause; the banner
+            # above no longer claims the whole axis clears by re-reading, which was the falsehood.
             _casc.append("nothing dispatchable -- held=%d, the chain is on rung 3%s"
                          % (_r3, _files_clause))
         elif _held:
