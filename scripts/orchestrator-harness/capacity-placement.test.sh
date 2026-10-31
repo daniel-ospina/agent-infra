@@ -1105,10 +1105,12 @@ MUT
   # (a) a `secondary` address never displaces the address of record. ⛔ THE SECONDARY LINE COMES FIRST
   #     ON PURPOSE: with the primary first, the `s == bs` guard inside the numeric term already refuses
   #     the displacement and the `s < bs` clause grades nothing (round 3 measured exactly that).
-  #     ⛔ AND NOTE THE PLATFORM: `ip addr add … secondary` is refused by iproute2 6.x (~"secondary option
-  #     is not mutable from userspace") and `ip -j addr show` reports `secondary:false` for a labelled
-  #     alias, so this flag is KERNEL-set — the fixture is the only way to reach the branch, and the
-  #     trailing label is in the shape real `ip` prints it.
+  #     ⛔ WHAT THE KERNEL DOES (round 4 corrected three wrong claims that stood here): a plain second
+  #     `ip addr add 10.1.0.9/24 dev eth0` — no keyword, no label — is printed as `scope global
+  #     secondary`; `ip addr add … secondary` is ACCEPTED by iproute2 6.x with a warning and lands the
+  #     same way; and a labelled alias reports `secondary: true, label: 'eth0:1'` in `ip -j addr show`.
+  #     So the flag is a real shape, and this fixture is in that shape (the label trails, `$2` is the
+  #     device).
   ipfix eth0 \
     '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global secondary eth0:1' \
     '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0'
@@ -1124,15 +1126,36 @@ MUT
   A10B="$(boxidnet)"
   ck "(10) a secondary never displaces the primary ($A10), and the tie-break is NUMERIC — octets give .9.10, a string compare gives .10.9 ($A10B)" \
      "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.10 ] && echo 0 || echo 1)"
-  # (11) CLAUSE 3'S RESERVED/UNSPECIFIED PREFIXES (review round 3, finding 2): both are addable on this
-  # kernel and both appear in `ip -4 -o addr show scope global` (measured under `unshare -rn`), so a
-  # clause that drops them publishes an address no peer can use as an identity.
+  # (11) CLAUSE 3'S UNSPECIFIED AND RESERVED PREFIXES (review round 3, finding 2; round 4, finding 1):
+  # each is addable on this kernel and each appears in `ip -4 -o addr show scope global` (measured under
+  # `unshare -rn`), so a clause that drops one publishes an address no peer can use as an identity.
+  # ⛔ BOTH HALVES OF THE RESERVED RANGE ARE FED: `224.0.0.7` only exercises `22[4-9]\.` (224-229), so
+  # round 4 measured that dropping `2[3-5][0-9]\.` (230-255) stayed green while the mutant published
+  # `239.0.0.1`. `239.0.0.1` is in 224/4 (multicast) and is that alternative's own slice.
   ipfix eth0 '3: eth0 inet 0.9.9.9/24 scope global eth0'
   A11="$(boxidnet)"; RC=$?
   ipfix eth0 '3: eth0 inet 224.0.0.7/24 scope global eth0'
   A11B="$(boxidnet)"; RC2=$?
-  ck "(11) an unspecified (0/8) or multicast/reserved (224/4) address REFUSES rather than being published ([$A11] rc=$RC, [$A11B] rc=$RC2)" \
-     "$([ "$RC" -eq 1 ] && [ -z "$A11" ] && [ "$RC2" -eq 1 ] && [ -z "$A11B" ] && echo 0 || echo 1)"
+  ipfix eth0 '3: eth0 inet 239.0.0.1/24 scope global eth0'
+  A11C="$(boxidnet)"; RC3=$?
+  ck "(11) unspecified (0/8) and BOTH halves of the reserved range (224-229, 230-255) REFUSE rather than being published ([$A11] rc=$RC, [$A11B] rc=$RC2, [$A11C] rc=$RC3)" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A11" ] && [ "$RC2" -eq 1 ] && [ -z "$A11B" ] && [ "$RC3" -eq 1 ] && [ -z "$A11C" ] && echo 0 || echo 1)"
+  # (12) THE DARWIN ARM — the branch this change does NOT touch, driven here so its ONE prefix filter
+  # (the shared tail guard, `127.*|169.254.*`) is graded somewhere in the suite. It is reached the way a
+  # Mac reaches it: no `ip` on PATH. Round 4 measured that deleting that tail guard was 209/0 green.
+  DAB="$TMP/bin-darwin"; mkdir -p "$DAB"
+  printf '#!/bin/sh\necho "  interface: eth9"\n' > "$DAB/route"
+  printf '#!/bin/sh\necho cmux\n' > "$DAB/hostname"
+  printf '#!/bin/sh\necho Linux\n' > "$DAB/uname"
+  chmod +x "$DAB/route" "$DAB/hostname" "$DAB/uname"
+  [ -e "$DAB/awk" ] || ln -s "$(command -v awk)" "$DAB/awk" 2>/dev/null || true
+  # ⛔ the ifconfig stub BAKES its answer in: an exported variable would not survive the restricted PATH.
+  da_ifconfig() { printf '#!/bin/sh\nprintf "\\tinet %s netmask 0xffff0000\\n"\n' "$1" > "$DAB/ifconfig"; chmod +x "$DAB/ifconfig"; }
+  boxidnet_darwin() ( da_ifconfig "$1"; PATH="$DAB"; CAP_BOXID=""; . "$CAP"; cap_boxid_net ) 2>/dev/null
+  A12="$(boxidnet_darwin 10.238.144.2)"; RC=$?
+  A12B="$(boxidnet_darwin 169.254.7.7)"; RC2=$?
+  ck "(12) the Darwin arm (no \`ip\` on PATH) answers its interface address ($A12) and REFUSES a link-local one (rc=$RC2, boxid=[$A12B])" \
+     "$([ "$RC" -eq 0 ] && [ "$A12" = 10.238.144.2 ] && [ "$RC2" -eq 1 ] && [ -z "$A12B" ] && echo 0 || echo 1)"
 else
   echo "  ⏭ §14 (1)-(5), (8)-(11) SKIPPED: this platform has no /proc/net/route, so the Linux arm of"
   echo "    cap_boxid_net is unreachable here — including the arms that grade clauses 1 and 2 and the"
@@ -1143,6 +1166,10 @@ fi
 # reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
 ck "(6) the controller CAPTURES the publish output and logs why=… (no more silent refusal)" \
    "$(grep -qF -- 'cap_publish "$REPO" "$CAP_REC" 2>&1' "$LOOP" && grep -qF -- 'why=${CAP_PUB_WHY:-unknown}' "$LOOP" && echo 0 || echo 1)"
+# (6b) …and the CAP_BOXID remedy is named ONLY for the reason that has one (review round 4, finding 5:
+# the round-3 fix was ungraded). The grep pins the COMPARISON, so widening it to `-n` goes red.
+ck "(6b) the CAP_BOXID hint is gated on why=no-box-identity, so a push/head/record refusal does not misdirect the operator" \
+   "$(grep -qF -- '[ "${CAP_PUB_WHY:-}" = "no-box-identity" ] && CAP_PUB_HINT=' "$LOOP" && echo 0 || echo 1)"
 # (7) THE MAC CANNOT BE AFFECTED. A Darwin box resolves its identity from `kern.uuid` FIRST
 # (`cap_boxid_auto` source 1), so it never reaches the Linux arm this fix changes. That precedence is
 # the property, not a comment: asserted here so a future edit that reorders the sources — or that makes

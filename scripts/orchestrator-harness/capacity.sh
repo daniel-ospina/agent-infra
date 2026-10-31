@@ -366,7 +366,10 @@ cap_hw_uuid() {
 #      docker0 is at a LOWER ifindex than the cells' VLAN child, so ordering alone would never save us;
 #   2. the device is not a pseudo/container/tunnel device by name (defence in depth for clause 1);
 #   3. the address is a dotted quad that is not loopback (127/8), link-local (169.254/16), unspecified
-#      (0/8), multicast or reserved (224/4 and up).
+#      (0/8), multicast or reserved (224/4 and up). The 0/8 and 224/4 branches are graded by §14 (11) and
+#      the link-local branch by (1)/(2); the 127/8 branch is DEFENCE ONLY on Linux (`ip addr add 127.0.0.5`
+#      reports `scope host`, so `scope global` already drops it) — the tail guard below is its only
+#      backstop, and (12) grades that guard through the Darwin arm, which this change does not touch.
 # THE CHOICE AMONG SEVERAL SURVIVORS IS DOCUMENTED AND TOTAL: the LOWEST interface index wins, then a
 # PRIMARY address before a `secondary` alias, then the NUMERICALLY lower address (compared as octets, not
 # as a string — `10.9.9.9` < `10.9.9.10`, which a string compare gets backwards). The choice is therefore
@@ -377,10 +380,12 @@ cap_hw_uuid() {
 # docker network, a VPN) can never preempt one that already existed.
 # ⛔ EVERY CLAUSE IS GRADED BY ITS OWN ARM in capacity-placement.test.sh §14: (8) a foreign device with a
 # NON-REJECTED name at a lower ifindex is never the identity (clause 1), (9) an egress device that is a
-# tunnel refuses rather than adopting its address (clause 2), (11) the reserved/unspecified prefixes
-# refuse (clause 3), (3)/(4) the choice is stable, total and ifindex-ordered, (10) the secondary and
-# octet tie-breaks. The dotted-quad `$4` guard is deliberately UNGRADED: `ip -4 -o addr` always puts the
-# address in `$4`, so it is defence only, not a mechanism.
+# tunnel refuses rather than adopting its address (clause 2), (11) the unspecified/reserved prefixes
+# refuse (clause 3), (12) the Darwin arm refuses a link-local address, (3)/(3b) the choice is stable,
+# total and ifindex-ordered, (10) the secondary and octet tie-breaks. The dotted-quad `$4` guard is
+# deliberately UNGRADED: `ip -4 -o addr` always puts the address in `$4`, so it is defence only, not a
+# mechanism. Arm (4) is the no-address refusal — kept as a guard, NOT as proof: the old body refused that
+# fixture too, so it does not discriminate.
 # ⛔ THIS IS ALSO THE SUITE'S IDENTITY SEAM: the arms in capacity-placement.test.sh §12 override THIS
 # FUNCTION to stand up two boxes with two identities on one hostname — the whole point of #2707 is
 # that `CAP_HOST` is NOT what distinguishes them.
@@ -389,8 +394,10 @@ cap_boxid_net() {
   if command -v ip >/dev/null 2>&1 && [ -r /proc/net/route ]; then
     out="$(ip -4 -o addr show scope global 2>/dev/null)" || return 1
     [ -n "$out" ] || return 1
-    # The egress device — clause 1's anchor. `ip route show default` can print several lines (multipath,
-    # and one per table); the first one naming a device is the route this box actually leaves by.
+    # The egress device — clause 1's anchor. `ip route show default` prints the MAIN table only (a route
+    # in a custom table does not appear here), and it prints SEVERAL lines when the main table holds a
+    # multipath default or several defaults at different metrics; the first one naming a device wins,
+    # which is iproute2's own metric-ascending order.
     dev="$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')" || dev=""
     [ -n "$dev" ] || return 1
     cand="$(printf '%s\n' "$out" | CAP_EGRESS_DEV="$dev" awk '
