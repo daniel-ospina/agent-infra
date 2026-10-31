@@ -139,6 +139,19 @@ PY
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
 assert_eq "$RC" "1" "no-compaction 1M-era length stop exits 1"
 assert_contains "$OUT" "'1M-era(≥900K)': 1" "triage bucket uses session ceiling (1M-era, not small-window)"
+# ⛔ THE ≥900K BUCKET IS AMBIGUOUS AT THIS GEOMETRY, and the note must say so.
+# The drift floor is 116,384 tokens past the 783,616 trigger and compaction runs
+# on agent_end, so a CLAMPED session's own mid-turn overrun can land here too
+# (policy §7.1). The old note told the owner such a record is "NOT evidence
+# about the 800K clamp" — an exclusion in the exact direction the pre-committed
+# rollback decision reads, and a confident claim the band cannot support.
+assert_contains "$OUT" "AMBIGUOUS" "≥900K triage note names the band as ambiguous, not 1M-era evidence"
+assert_contains "$OUT" "RESOLVED window" "≥900K triage note tells the owner to attribute by the session's own window"
+if grep -qF "NOT evidence about the 800K clamp" <<<"$OUT"; then
+  bad "≥900K triage note still excludes the band as 'NOT evidence about the 800K clamp' (a clamped overrun can reach it)"
+else
+  ok "≥900K triage note no longer excludes the band outright"
+fi
 
 # DATA-ABSENCE GATE: an unreadable session in the window must NOT vanish into
 # a CLEAN pass — rc=2, names the failures.

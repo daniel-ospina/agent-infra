@@ -88,8 +88,8 @@ CLAMP=800000
 #
 #   1. INDEPENDENT — reserveTokens must equal the reviewed value (16384). This is the only
 #      constraint that survives a COORDINATED move of the window and the reserve. Asserting only
-#      the geometry below reads green on `contextWindow 1000000 / reserveTokens 716384`, which
-#      preserves the 783616 trigger while inflating the summarization cap to 0.8 x 716384 — the
+#      the geometry below reads green on `contextWindow 1000000 / reserveTokens 216384`, which
+#      preserves the 783616 trigger while inflating the summarization cap to 0.8 x 216384 — the
 #      exact reserve-inflation workaround the recorded owner directive on #1227 forbids
 #      ("Do not implement the decoupling by inflating reserveTokens"). Removing this pin
 #      introduced that false PASS, and a guard whose only reserve constraint CLAMP can move is

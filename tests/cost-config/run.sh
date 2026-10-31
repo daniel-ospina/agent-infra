@@ -1738,7 +1738,7 @@ rm -rf "$TMP37"
 
 echo ""
 # ── 38. the independent reserve pin is what survives a COORDINATED window+reserve move.
-#      `contextWindow 1000000 / reserveTokens 216384` preserves the 283616 trigger, so a
+#      `contextWindow 1000000 / reserveTokens 216384` preserves the 783616 trigger, so a
 #      geometry-only guard reads GREEN while inflating the summarization cap to 0.8 x 216384 —
 #      the reserve-inflation workaround the recorded owner directive on #1227 forbids. This is
 #      a regression test for the false PASS that removing the pin introduced.

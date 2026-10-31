@@ -322,7 +322,17 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # not a change somewhere else (the commit's only other edit is a renumbered header comment). The
 # shipped egress is untouched by it: `send` token = 6, MSG reads outside the appends = 0, block
 # depth at the last MSG= = 25 and at the send = 24 — all pinned above and all unmoved.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "16972079405712"
+# ⛔ RE-PINNED A FOURTH TIME 2026-10-31, DELIBERATELY, WITH THE DIFF CHECKED — and this one is
+# the 2026-10-19 class (a REWRITE of one matched line), not an added block. The 300K→800K context
+# clamp move (owner decision 2026-10-31, `docs/ops/cost-config-policy.md` §7.1) teaches the pane
+# probe's footer signature to accept `/800k` (pi renders `formatTokens(800000)`), keeping `/300k`
+# for historical transcripts — so `_pane_has_pi`'s `for _m in (...)` line changed, and the pattern
+# above hashes `for` lines inside heredoc PYTHON as well as shell. Verified when re-pinning, not
+# assumed: the matched-line COUNT is 169 before and after, and the diff of the matched lines is
+# exactly that one line (`for _m in ("/800k",…)`). The executable-line pin below did NOT move
+# (same one-line rewrite), and the shipped egress is untouched: the `send` token, the MSG reads
+# outside the appends, and both block depths are unmoved and pinned above.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "25224790895720"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.

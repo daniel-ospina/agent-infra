@@ -51,10 +51,17 @@
 #
 # SUPERSEDED 2026-10-31 (owner decision): the clamp moved 300K → 800K, so the
 # floor is 783616 and this paragraph's 283616 is history, kept because it dates
-# the era it describes. THE SAME REGIME-PURITY CAVEAT APPLIES AGAIN: for one
-# window the clamp population mixes sessions that compacted under the 300K
-# clamp (283,616–300,000) with the new geometry. Read n_clamp on the first
-# post-change run knowing that. The cache-share band (65–70%) below was
+# the era it describes.
+# THE TRANSIENT IS THE OPPOSITE OF MIXED — IT IS STARVED, and the direction
+# matters because it decides whether a CLEAN run is evidence. Every compaction
+# in 283,616–783,615 (i.e. EVERY 300K-clamp-era compaction) is now BELOW the
+# floor, so it lands in legacy_comps and is EXCLUDED from the cache-share pool:
+# for the first window after this change n_clamp UNDER-COUNTS, an n<3 reading is
+# the EXPECTED transient rather than a clean week, and (b)'s CLEAN line prints
+# its own `(b) not evaluated` qualifier whenever the pool never reached the
+# threshold. The inflation direction cannot happen — no 300K-clamp record can
+# sit at/above 783,616 — so nothing can be double-counted either.
+# The cache-share band (65–70%) below was
 # MEASURED under the 300K clamp and has NOT been re-measured at 800K: the
 # 0.65 floor is kept as a lower-bound alarm, not because 65–70% is the
 # expected reading at 800K (a larger window keeps more input cacheable, so the
@@ -313,14 +320,23 @@ for r in rows:
         by_hour[h] = by_hour.get(h, 0.0) + v
 
 # ── render ──────────────────────────────────────────────────────────────────
-CEILING_TB = 900000   # must match session-postmortem.sh's parser constant
+CEILING_TB = 900000   # must match session-postmortem.sh's parser constant.
+# At the 800K geometry this is only 116,384 above the 783,616 trigger, and
+# compaction is checked on agent_end — so a CLAMPED session's own mid-turn
+# overrun can reach this band too (`policy §7.1`: a session may overrun toward
+# the provider's real 1,000,000 before it is rejected). A record here is
+# therefore AMBIGUOUS: 1M-era drift (the clamp is not live) OR this geometry's
+# own overrun. Attribute it by the session's resolved window, never by
+# tokensBefore alone.
 print(f"# Fleet cost report — {len(rows)} session(s) in window "
       f"({len(comps)} compacting, {n_clamp} in the shipped 800K-clamp regime)")
 print("")
 print(f"- sessions scanned: {len(rows)}   compacting sessions: {len(comps)}")
 if legacy_comps:
     print(f"- legacy sub-{regime_tb/1000:.1f}K-window compacting sessions excluded "
-          f"from the cache-share pool: {len(legacy_comps)} (pre-clamp/200K-transient)")
+          f"from the cache-share pool: {len(legacy_comps)} (sub-trigger: the pre-clamp "
+          f"200K window, plus the retired 300K-era 283,616–300,000 and 700K-era "
+          f"650,000–700,000 records this floor now excludes)")
 print(f"- compaction records: {n_comp_recs}   max tokensBefore: {max_tb:,}")
 
 print("")
@@ -393,7 +409,13 @@ print(f"- genuine stopReason:length (ceiling-truncation) records: {n_len} "
 # ── escalation ──────────────────────────────────────────────────────────────
 esc = []
 if ceil_recs > 0:
-    esc.append(f"ceiling-compaction count {ceil_recs} > 0 (1M drift — clamp not live?)")
+    esc.append(
+        f"ceiling-compaction count {ceil_recs} > 0 (records at/above {CEILING_TB:,} — "
+        f"either 1M-era drift (clamp not live) OR a clamped session's own mid-turn "
+        f"overrun, which at this geometry is reachable: {CEILING_TB - int(regime_tb):,} "
+        f"tokens past the {int(regime_tb):,} trigger, inside the provider's real 1M. "
+        f"Attribute the record by its session's RESOLVED window before concluding the "
+        f"clamp is not live)")
 if cache_share is not None and n_with_cost >= 3 and cache_share < floor:
     esc.append(f"cache-share {cache_share:.1%} < floor {floor:.0%} "
                "(below the expected 800K-clamp regime)")
@@ -407,6 +429,18 @@ if esc:
     print("the weekly report reader is the owner. Run scripts/watch-truncation.sh")
     print("for the pre-committed rollback procedure._")
     sys.exit(1)
-print("## ✅ CLEAN — thresholds within the shipped 800K-clamp regime")
+# A CLEAN verdict must not claim a threshold it never evaluated: (b) is SKIPPED
+# when the pooled share is undefined or fewer than 3 clamp sessions carry cost
+# data, and after the 2026-10-31 geometry move that is the EXPECTED reading for
+# the first window (every 300K-era compaction is now sub-floor and excluded).
+# Printing an unqualified CLEAN over a starved pool is a false PASS in the one
+# report whose job is to answer "did the clamp work?".
+cache_evaluated = cache_share is not None and n_with_cost >= 3
+if cache_evaluated:
+    print("## ✅ CLEAN — thresholds within the shipped 800K-clamp regime")
+else:
+    print(f"## ✅ CLEAN — but the cache-share threshold was NOT evaluated "
+          f"(n_clamp={n_clamp}, n_with_cost={n_with_cost}; see (b)) — (a) is within "
+          f"thresholds, (b) is unmeasured this window")
 sys.exit(0)
 PYEOF
