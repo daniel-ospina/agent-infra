@@ -1857,7 +1857,11 @@ PYEOF
   # ── THE FUNNEL'S ARITHMETIC CLOSES IN THE FLOOR BRANCH (review cycle 3, P2) ─────────────────
   # In the fail-closed floor the population IS the listing, so the swept set's parked count must not
   # be printed as an extra part: `26 PRs: 26 un-owned (0 owned, 5 parked)` does not add up.
-  grep -q 'SEL_PARKED=0' <<<"$FLOOR_SRC" 2>/dev/null || true
+  # ⛔ NO BARE `$FLOOR_SRC` HERE (CI red at a397f5353, bash-suites (2)): a leftover line read
+  # `$FLOOR_SRC`, a name nothing ever assigns. Under bash 3.2 a here-string tolerates an unset
+  # expansion, so this suite stayed GREEN on macOS while CI's bash 5 reported
+  # `line 1860: FLOOR_SRC: unbound variable` on every Linux run. The real slice is `_FLOOR_SRC`
+  # (assigned and graded on the next two lines); this name has no other use in the file.
   _FLOOR_SRC="$(sed -n '/⛔ AND THE PARKED PART DIES WITH THE POPULATION/,/FLOOR_NOTE=/p' "$ORCH")"
   if grep -q 'SEL_PARKED=0' <<<"$_FLOOR_SRC"; then
     echo "  ok the fail-closed floor re-bases the parked part (funnel arithmetic closes)"; PASS=$((PASS+1))
@@ -2937,8 +2941,33 @@ ISSUES 2')"
   fi
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
-  awk '/^  \*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_star_arm.sh"
-  awk '/^  CLEAN\*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_clean_arm.sh"
+  # ⛔ THE SLICE IS SCOPED TO THE VERDICT CASE, NOT "THE FIRST `*)` IN THE FILE" (CI red at
+  # a397f5353, bash-suites (2)). #3037 added a SECOND `case` upstream of the verdict case whose
+  # `*)` arm is also spelled `^  \*)$` — the check-carry one — so a first-match extractor captured
+  # THAT arm (and everything after it up to the next `^    ;;$`, which is inside the verdict case's
+  # CLEAN arm). Both assertions below then graded text that is not the verdict arm:
+  # `review_state_record "$(verdict_class …)"` fell outside the slice, and the CLEAN arm's
+  # `review_state_clear` fell INSIDE it — reported as "the clear is in the no-verdict arm" on a
+  # correct tree. The verdict case is the only `case` whose CLEAN arm is spelled `^  CLEAN*)$`, so
+  # locate that line first and take the `*)` arm AFTER it: within one `case`, source order
+  # guarantees the verdict's `*)` follows its `CLEAN*)`.
+  _vclean_ln="$(grep -n '^  CLEAN\*)$' "$MERGE" | head -1 | cut -d: -f1)"
+  _vstar_ln="$(grep -n '^  \*)$' "$MERGE" | cut -d: -f1 | awk -v c="${_vclean_ln:-0}" '$1 > c {print $1; exit}')"
+  if [ -z "${_vclean_ln:-}" ] || [ -z "${_vstar_ln:-}" ]; then
+    echo "  ❌ could not locate the verdict case's CLEAN*/`*)` arms in merge-one.sh (clean=${_vclean_ln:-none} star=${_vstar_ln:-none}) — the arms below would grade the wrong case"; FAIL=$((FAIL+1))
+  else
+    awk -v s="$_vstar_ln" 'NR>=s {print; if ($0 ~ /^    ;;$/) exit}' "$MERGE" > "$TMP/merge_star_arm.sh"
+    awk -v s="$_vclean_ln" 'NR>=s {print; if ($0 ~ /^    ;;$/) exit}' "$MERGE" > "$TMP/merge_clean_arm.sh"
+  fi
+  # ⛔ FIXTURE (non-vacuity of the SLICE ITSELF): if the star arm were extracted from the wrong
+  # `case` again, the two assertions below would grade a slice that is not the verdict arm — and
+  # `review_state_clear` would appear in it. At a397f5353 this exact line was the red one.
+  if grep -qF 'NOT CLEAN or no verdict at head=' "$TMP/merge_star_arm.sh" \
+     && ! grep -qF 'review_state_clear' "$TMP/merge_star_arm.sh"; then
+    echo "  ✅ the NO-VERDICT slice IS the verdict case's `*)` arm (not an upstream case's arm)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the NO-VERDICT slice is not the verdict case's `*)` arm — the wiring assertions below would grade text that is not the arm they name"; FAIL=$((FAIL+1))
+  fi
   if grep -qF 'review_state_record "$(verdict_class "$LAST")"' "$TMP/merge_star_arm.sh" \
      && ! grep -qF 'touch "$O/state/needsfix-$PR-$HEAD"' "$TMP/merge_star_arm.sh"; then
     echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
