@@ -7336,6 +7336,178 @@ def test_HALF_a_rubric_seam_is_a_hybrid_rubric_and_refuses_even_the_built_in_rep
         pr.canonical_paths()
 
 
+# ── 13. A PASS'S VERDICT IS AN EFFECT — the drift that refuses every order, and the byte that doesn't ──
+#
+# ⛔ THE MEASURED DEFECT (agent-infra#2708, 2026-10-27, the FIRST of the three). `pr-doctor` refused
+# every order because the PR's own worktree had drifted (uncommitted work at a head the PR had moved
+# off), and the outside view was indistinguishable from a working repair loop: `EXIT` line in the log,
+# 45-minute cooldowns ticking, a fresh heartbeat, a HEALTHY watchdog, **zero** dispatches, five
+# separate stalls while 18-25 PRs sat unmoving.
+#
+# The assertions the suite had were about COUNTERS (`dispatched == 0`, `refused-recorded == 1`), which a
+# broken transport satisfies just as well as a correct refusal. §13 asserts the EFFECT instead: with the
+# drift present, NOTHING was placed (no spawn artifact exists), the pass names the refusal, and the
+# worktree still holds the uncommitted work; with the drift removed, the SAME pass places ONE order and
+# the spawn artifact exists. Then it makes the drift check inert in-run and requires the pair to FLIP —
+# a fixture that flips when the capability is disabled is the only thing that proves the arms observe
+# the capability rather than the fixture.
+
+def _drifted_worktree(monkeypatch, tmp_path):
+    """A real repo, a real PR branch one commit ahead, and a worktree parked on the OLD head, DIRTY.
+
+    Returns `(pr_dict, head2, wt_path)`. This is the shape `materialise_worktree` refuses
+    persistently: `_ensure_head` will not reset a worktree with uncommitted tracked changes, because
+    doing so would destroy a lane's work.
+    """
+    repo, g = _git_repo(tmp_path)
+    # ⛔ THE ORIGIN IS NOT DECORATION: the pass adopts its checkout from `PR_DOCTOR_REPO_DIR` ONLY
+    # when that directory PROVES the slug (`_origin_slug`), so a fixture with no origin makes the pass
+    # grade a checkout it cannot attest and the arm never reaches the worktree it is about. This is
+    # the documented production pair `pr-repair-loop.sh` sets, not a test-only hook.
+    g("remote", "add", "origin", "git@github.com:daniel-ospina/agent-infra.git")
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, err = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+    assert wt and err == "", (wt, err)
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("commit", "--allow-empty", "-qm", "the PR's new head")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    gw("checkout", "--detach", head1)                       # the worktree is now BEHIND the PR head
+    (pathlib.Path(wt) / "f.txt").write_text("uncommitted lane work\n")
+    return _prb(1, head2, "feat/x"), head2, wt
+
+
+def _drive_effect_pass(monkeypatch, tmp_path, prd, logs, spawn, repo="", saved=None):
+    """One REAL pass: real `materialise_worktree`/`dispatch`, stub only the spawn and liveness.
+
+    `PR_DOCTOR_REPO`/`PR_DOCTOR_REPO_DIR` is the DOCUMENTED production seam `pr-repair-loop.sh` and
+    `install-repair-service.sh` set, not a test-only hook: the pass adopts its checkout from it (when
+    that directory PROVES the slug), so the fixture repo is the checkout this pass acts on instead of
+    whatever tree the suite happens to run from. `saved` collects the register the pass writes.
+    """
+    for k, v in (("MAX_FIX", "16"), ("MAX_REVIEW", "12")):
+        monkeypatch.setenv(k, v)
+    if repo:
+        # THE JOB SEAM, as the launcher sets it (`pr-repair-loop.sh`): slug + the checkout that proves it.
+        monkeypatch.setenv("PR_DOCTOR_REPO", _TEST_REPO)
+        monkeypatch.setenv("PR_DOCTOR_REPO_DIR", str(repo))
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    sink = {} if saved is None else saved
+    monkeypatch.setattr(pr, "save_state", lambda st: sink.update(st))
+    monkeypatch.setattr(pr, "open_prs", lambda: [prd])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "red", []))
+    # ⛔ `worker_live` IS STUBBED, `dispatch` IS NOT: the question is what the pass DOES with a worktree
+    # it cannot materialise, so the transport below `dispatch()` must stay real.
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"] + ([] if repo else ["--repo", _TEST_REPO]))
+    rc = pr.main()
+    payload = {}
+    try:
+        with open(pr.STATUS) as fh:
+            payload = json.load(fh)
+    except Exception:
+        pass
+    return rc, payload
+
+
+def _spawn_artifacts(orch):
+    bg = pathlib.Path(orch) / "bg"
+    return sorted(p.name for p in bg.glob("*.rc")) if bg.is_dir() else []
+
+
+def test_a_drifted_worktree_places_nothing_and_the_same_pass_places_one_without_it(
+        monkeypatch, tmp_path):
+    """The pair, on ONE byte of difference: uncommitted work in the PR's worktree, and its absence."""
+    d = tmp_path / "orch"
+    d.mkdir()
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setenv("O", str(d))
+    prd, head2, wt = _drifted_worktree(monkeypatch, tmp_path)
+    repo = pathlib.Path(pr.REPO_DIR)
+    seen = _stub_the_spawn(monkeypatch, rc_ok=True)
+
+    # ── ARM 1: the drift is present. Nothing may be placed, and the pass must SAY the refusal. ──
+    logs = []
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state1"))
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "state1.status.json"))
+    rc, payload = _drive_effect_pass(monkeypatch, tmp_path, prd, logs, seen, repo)
+    joined = "\n".join(logs)
+    assert payload.get("dispatched") == 0, payload
+    assert payload.get("prs") == [], "the record must not name a PR that was never placed: %r" % payload
+    assert not seen, "the spawn was INVOKED for an order the worktree was never materialised for"
+    assert _spawn_artifacts(d) == [], "a spawn artifact exists for a pass that placed nothing"
+    # ⛔ THE EFFECT THAT WAS INVISIBLE: the pass must name the refusal and its CAUSE, not report an
+    # empty queue and not report a budget cap.
+    assert "refused-recorded=1" in joined, joined
+    assert "nothing to do" not in joined, joined
+    assert "uncommitted" in joined, joined
+    # …and the work it must never destroy is still there.
+    assert (pathlib.Path(wt) / "f.txt").read_text() == "uncommitted lane work\n", \
+        "a refused reset destroyed the lane's uncommitted work"
+
+    # ── ARM 2: the SAME pass, one byte later. The drift is gone and the order must be PLACED. ──
+    subprocess.run(["git", "-C", wt, "checkout", "--", "f.txt"], check=True,
+                   capture_output=True, text=True)
+    assert (pathlib.Path(wt) / "f.txt").read_text() == "base\n"
+    logs2 = []
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state2"))
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "state2.status.json"))
+    saved = {}
+    rc2, payload2 = _drive_effect_pass(monkeypatch, tmp_path, prd, logs2, seen, repo, saved)
+    joined2 = "\n".join(logs2)
+    assert payload2.get("dispatched") == 1, (payload2, joined2)
+    assert payload2.get("prs") == [1], payload2
+    assert saved.get("1", {}).get("kind") == "spawn", saved
+    assert _spawn_artifacts(d), "the pass reported a dispatch with NO spawn artifact on disk"
+    assert seen, "the pass counted a dispatch without ever invoking the spawn"
+    assert subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True,
+                          text=True).stdout.strip() == head2, \
+        "the worktree was not moved to the PR head on the pass that DID place the order"
+
+
+def test_the_drift_arm_is_LIVE_a_pass_whose_drift_check_is_inert_places_the_order(
+        monkeypatch, tmp_path):
+    """The in-run mutation: disable the drift check and the pair above must FLIP.
+
+    Without this, ARM 1 of the test above could be green for the wrong reason (e.g. the fixture never
+    reaching `dispatch()` at all), which is exactly the "a test that supplies the thing production
+    lacks" shape this epic exists to end. The mutation is the capability going inert in the way it
+    went inert in the field: `_ensure_head` stops refusing, and an order is placed into a worktree that
+    still holds the lane's uncommitted work.
+    """
+    d = tmp_path / "orch"
+    d.mkdir()
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setenv("O", str(d))
+    prd, _head2, wt = _drifted_worktree(monkeypatch, tmp_path)
+    repo = pathlib.Path(pr.REPO_DIR)
+    seen = _stub_the_spawn(monkeypatch, rc_ok=True)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "state.status.json"))
+    # THE MUTANT: every reconciliation succeeds, so a dirty, off-branch worktree is "fine". BOTH gates
+    # are neutralised because the fixture trips both: `_ensure_branch` refuses to switch a dirty tree
+    # onto the PR branch, and `_ensure_head` refuses to reset one whose head moved. Disabling only one
+    # measures the other -- the first draft of this arm reported "the pass still placed nothing" about
+    # a mutation that had landed precisely.
+    monkeypatch.setattr(pr, "_ensure_branch", lambda *a, **k: "")
+    monkeypatch.setattr(pr, "_ensure_head", lambda *a, **k: "")
+
+    logs = []
+    rc, payload = _drive_effect_pass(monkeypatch, tmp_path, prd, logs, seen, repo)
+    assert payload.get("dispatched") == 1 and payload.get("prs") == [1], \
+        ("with the drift check made inert the pass still placed nothing, so ARM 1 above is asserting "
+         "the fixture and not the capability", payload, "\n".join(logs))
+    assert (pathlib.Path(wt) / "f.txt").read_text() == "uncommitted lane work\n", \
+        "the mutant placed an order into a worktree holding uncommitted work — the field defect"
 # ── REVIEW ROUND 2 (#2710): the budget gate ran BEFORE the refusal accounting ─────────────────────
 def _four_refused_rows(monkeypatch, logs, refusals, orch_dir):
     """The incident's own shape: four rows in their cooldown, an EMPTY `$O/bg`, shipped defaults.

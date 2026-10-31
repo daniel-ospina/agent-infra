@@ -456,28 +456,22 @@ jobs:
 
   script-validate:
     runs-on: ubuntu-latest
-    # ⛔ #3131 — the SAME checkout fact that made `extension-tests`' guard assertion unjudgeable here
-    # also lives in this job, one level down: `merge-reminder.test.sh` §27b requires
-    # `box-status.sh` to print `ref: origin/main=<sha>`, which it emits ONLY when
-    # `git rev-parse --verify origin/main` resolves (`box-status.sh:325-331` — an unresolvable
-    # ref yields no `ref:` line at all, and `REF_WHY` is set only on a REFUSAL, so the grep
-    # fails with no diagnostic). A push to a non-main branch checks out a single ref
-    # (`+<sha>:refs/remotes/origin/<branch>`), so `origin/main` does not exist and the
-    # assertion reds for a reason that has nothing to do with the tree.
-    #   MEASURED (controlled, content held constant): with `origin/main` present the shard is
-    # green; deleting ONLY `refs/remotes/origin/main` flips exactly one assertion — §27b — and
-    # nothing else in the suite. Confirmed across three runs: the PR lane (fetch of
-    # `refs/remotes/pull/N/merge`) reds; `CI on main` on an `integration/**` branch (fetch of
-    # only that branch) reds; `CI on main` on `main` (fetch of `refs/remotes/origin/main`)
-    # passes.
-    #   So materialize the ref here too, under the SAME two conditions as the `extension-tests`
-    # preamble: not the main ref, and actually inside a git work tree. `--git-dir` is a cheap
-    # precondition here — unlike `extension-tests`, nothing in THIS job executes a committed
-    # `run:` body in a non-repo temp dir (that harness targets `test-command`), so the clause is a
-    # guard against a future caller rather than a present need; it costs one `git` call and it
-    # fails closed in the direction that matters (no repo ⇒ nothing to materialize). No `|| true`:
-    # a fetch that cannot produce the ref must fail loudly, because silently skipping reinstates
-    # the false red.
+    # ⛔ #3131 — `merge-reminder.test.sh` §27b is the SECOND ambient-ref reader on this matrix. It
+    # requires `box-status.sh` to print `ref: origin/main=<sha>`, a line emitted ONLY when
+    # `git -C "$REPO" rev-parse --verify origin/main` resolves; an unresolvable ref produces no
+    # `ref:` line at all (and no diagnostic — `REF_WHY` is set only on a refusal), so the grep
+    # simply misses. A push to a non-main branch checks out ONE ref, so `origin/main` does not exist
+    # and the job reds for a reason unrelated to the tree. MEASURED on the batch matrix: the shard
+    # failed on `integration/batch-*` while the same file passes on `main`, and it was the ONLY new
+    # shard against main's own run (§27b was the sole failing assertion; a controlled experiment with
+    # content held constant flipped exactly that assertion by deleting only `refs/remotes/origin/main`).
+    #   So the ref is materialized here too, under the same two conditions as the `extension-tests`
+    # preamble, with the same no-`|| true` rule.
+    #   ⚠ THIS IS A WORKAROUND, AND IT MUST NOT BE SILENTLY REMOVED: the real fix is #3160 — §27b is
+    # about the SUBDIRECTORY rule and should point its candidate at the suite's own fixture repo (which
+    # carries its own `origin/main`) instead of the ambient checkout. That fixture change is in flight
+    # on the batch branch, NOT in this PR, so this step stays until #3160 lands; removing it earlier
+    # would reinstate the false red on every `integration/**` run.
     # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the one
     # runner below, UNSHARDED (main runs once per merge, so the queue a hang would starve is
     # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation
@@ -554,16 +548,13 @@ jobs:
         timeout-minutes: 15
         run: bash tests/ci-lane-parity/run.sh
       - name: Materialize origin/main so checkout-keyed assertions are judgeable (#3131)
-        # ⛔ NO `if:` on this step. The lane-parity guard refuses a conditional step in this job
-        # ("a step that may not run, whose failure cannot fail the run"), and it is right to: the
-        # main lane's coverage must be unconditional. The condition lives INSIDE the shell instead,
-        # exactly as the `extension-tests` preamble does it.
+        # ⛔ NO `if:` on this step: `scripts/check-ci-lane-parity.sh` refuses a conditional step around the
+        # shard call ("a step that may not run, whose failure cannot fail the run"), so the condition
+        # lives inside the shell — exactly as the `extension-tests` preamble does it.
         run: |
-          # `merge-reminder.test.sh` §27b needs `origin/main` to resolve (see the job comment).
-          # NOT `|| true`: a fetch that cannot produce the ref must fail loudly, because silently
-          # skipping it reinstates the false red it exists to remove. The `--git-dir` clause is the
-          # one non-failure skip: outside a repository there is no tracking ref to create, and this
-          # repo executes committed `run:` bodies in non-repo temp dirs under `bash -e`.
+          # See the job comment. NOT `|| true`: a fetch that cannot produce the ref must fail loudly,
+          # because silently skipping it reinstates the false red this step removes. The `--git-dir`
+          # clause is the one non-failure skip — no repository means no tracking ref to create.
           if [ "${GITHUB_REF:-}" != "refs/heads/main" ] && git rev-parse --git-dir >/dev/null 2>&1; then
             git fetch --depth=1 --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
           fi
@@ -620,6 +611,29 @@ jobs:
       - name: SIGPIPE guard suite (hermetic, zero network)
         run: bash tests/sigpipe-grep/run.sh
 
+  bash32-parse-guard:
+    # #2930 — post-merge re-check of the bash-3.2 parse gate. The runtime platform of this harness is
+    # macOS, whose `/bin/bash` is 3.2.57 (bash 4+ is GPLv3, so Apple never shipped it), while every CI
+    # runner is Linux/bash 5 — so a construct 3.2 cannot parse ships GREEN and only breaks at the
+    # destination. That is what happened: `merge-reminder.test.sh` failed `bash -n` at line 2629
+    # under 3.2, `install.sh`'s `bash -n` sweep refused, and NO Mac could install the harness. This is
+    # the MAIN-line red signal: a merge that reintroduces the shape fails here even if its PR check
+    # was bypassed. Family: #2248 (3.2 executes a here-doc body's words inside a `$( )`).
+    #
+    # The gate runs the real 3.2 parser in the digest-pinned `bash:3.2` image, and is FAIL-CLOSED: no
+    # docker, no interpreter, or an interpreter that is not 3.x exits 2 and names the cause.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - name: Every shipped script parses under bash 3.2 (#2930)
+        timeout-minutes: 5
+        run: bash scripts/check-bash32-parse.sh
+      - name: bash-3.2 parse gate suite (fixtures, fail-closed arms, mutations)
+        timeout-minutes: 5
+        run: bash tests/bash32-parse/run.sh
+
   pi-config-extensions-guard:
     # #498/#502 — post-merge re-check of the pi-config extension-farm parity gate
     # (issue #95 invariant): every TRACKED extensions/ top-level entry except
@@ -673,7 +687,7 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
+    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
     if: failure() && github.ref == 'refs/heads/main'
     # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131), in DIFFERENT directions.
     #   `failure()` must stay: the steps derive the failing set from `needs`, and the
