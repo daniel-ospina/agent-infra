@@ -260,9 +260,12 @@ write)
     # `git status` over the whole directory made `start` — whose write set is depth-1 `*.sh` only, and
     # which states that with `--skip` — record `sourceDirty=true` for an untracked scratch file it never
     # ships. Downstream that is not a warning: `check-deployed-drift.sh` turns a dirty record into a
-    # `DRIFT(identity)` line and exit 1, and with the commit current the report falls through to
+    # `DRIFT(identity)` line and exit 1, and with the commit current the report used to fall through to
     # `harness=payload-differs` — a false statement about `$O`'s bytes whose stated remedy ("redeploy to
-    # adopt") cannot clear it, stamped into dispatch rows. So a status path THIS CALLER declared it does
+    # adopt") cannot clear it, stamped into dispatch rows. (#3090 gave that state its own token,
+    # `harness=source-dirty:<sha12>`, whose remedy is "redeploy from a CLEAN checkout"; the falsehood this
+    # comment exists to prevent is unchanged either way: a dirty record still cannot name its bytes.)
+    # So a status path THIS CALLER declared it does
     # not write (`--skip`) is not dirtiness FOR THIS RECORD: a record must not contradict itself, and
     # one that lists `files=` for the write set cannot take its dirty answer from a wider set.
     # `-uall` expands an untracked DIRECTORY into the files inside it, because `start` skips non-depth-1
