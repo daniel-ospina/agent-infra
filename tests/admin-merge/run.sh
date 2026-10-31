@@ -13089,9 +13089,28 @@ rc=$?
 grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
   && pass "(a) …and the FIRST-CHECKS wait names its own expiry" \
   || { fail "(a) the FIRST-CHECKS expiry is not named"; sed 's/^/      /' "$TMP/err"; }
-grep -q 'NO run of the lane ever attached to this head' "$TMP/err" \
+# ⛔ THE STATE IS NAMED, AND THE HEAD THAT CARRIES *NO* CHECK-RUN IS NAMED AS SUCH.
+# #2862/#3017 taught this wait to DISCRIMINATE an empty-but-readable check surface
+# from an empty filtered list, and this fixture's head carries neither a run nor a
+# check-run (the fake gh answers `total_count 0` for a head it has never seen). The
+# refusal therefore reports the PRECISE shape — "nothing has attached at all" — and
+# the broader "the lane never attached" wording is reserved for the case this wait
+# cannot resolve (see (a0), where the discriminating READ fails). Pinning the old
+# wording here made the assertion demand a LESS precise message than the rail now
+# earns: it went red on the #2862 commit and stayed red for every PR after it.
+grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
   && pass "(a) …naming checks-never-started (not 'still running', not a CI verdict)" \
-  || fail "(a) the never-started state is not distinguished"
+  || { fail "(a) the never-started state is not distinguished"; sed 's/^/      /' "$TMP/err" | head -20; }
+grep -q 'total_count 0 ACROSS EVERY WORKFLOW' "$TMP/err" \
+  && pass "(a) …and names the PROVEN-EMPTY surface it read, not a guess about the lane name" \
+  || fail "(a) the proof is not named — an empty surface is being reported as a lane-name guess"
+# ⛔ …AND IT NEVER GUESSES THE LANE NAME WITHOUT THAT PROOF (#2862). The proof above
+# is a check-runs read that RETURNED zero; when the read itself fails, the two
+# readings ("this repo's CI is named otherwise" vs "nothing has started yet") are
+# indistinguishable and the rail must KEEP the filter rather than drop it.
+grep -q "is not this repo's CI" "$TMP/err" "$TMP/out" \
+  && fail "(a) an UNREAD check surface was read as a lane-name mismatch" \
+  || pass "(a) …and it does not drop the lane filter on an unproven surface"
 grep -q 'ADMIN_MERGE_FIRST_CHECKS_WAIT' "$TMP/err" \
   && pass "(a) …and names the window it owns" \
   || fail "(a) the FIRST-CHECKS window knob is missing"
@@ -13103,6 +13122,34 @@ grep -q 'pr merge' "$SCEN/calls" && fail "(a) a merge was attempted with no chec
   || pass "(a) no merge attempted"
 [ -f "$SCEN/comment" ] && fail "(a) evidence was posted with no checks" \
   || pass "(a) no evidence posted"
+
+# (a0) THE UNPROVABLE EMPTY — same fresh-PR shape, but the check-runs probe FAILS.
+# An unread count is NOT evidence that the lane name is wrong, so the rail must KEEP
+# the filter and fall back to the LEGACY bounded window, and its refusal must say
+# exactly that ("NO run of the lane ever attached"), not claim an empty surface it
+# never read. This is the arm (a) used to cover by accident; it is asserted here
+# because fail-closed is the direction that matters (#2862's own rule).
+new_scen waits-first-never-unread
+HEAD_WFU="e3e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WFU" > "$SCEN/head"
+: > "$SCEN/pr-health-unreadable"
+SUITE_FIRST_CHECKS_WAIT=2 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a0) an unreadable check surface still BLOCKS (exit $rc)" \
+  || fail "(a0) an unreadable check surface certified the merge"
+grep -q 'NO run of the lane ever attached to this head' "$TMP/err" \
+  && pass "(a0) …and says the lane never attached, which is all an unread probe supports" \
+  || { fail "(a0) the unproven-empty refusal is not named"; sed 's/^/      /' "$TMP/err" | head -20; }
+grep -q 'could not be READ' "$TMP/out" \
+  && pass "(a0) …naming the failed read, so the two readings stay distinguishable" \
+  || fail "(a0) the failed read is not named on the wait's own surface"
+grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
+  && fail "(a0) an UNREADABLE probe was reported as a proven-empty head" \
+  || pass "(a0) …and never claims an empty surface it did not read"
+# The filter must have been KEPT: no unfiltered re-read may have happened.
+grep -q 'DROPPING the lane filter' "$TMP/out" \
+  && fail "(a0) the lane filter was dropped on an unread count (fail-open)" \
+  || pass "(a0) the lane filter is KEPT when the discriminating read fails (fail-closed)"
 
 # (a2) CHECKS STARTED BUT ARE STILL RUNNING — the #2233/#2234 shape, exactly:
 # one queued/in-progress lane run. The wait must report the RUN it observed (id +
@@ -14454,11 +14501,31 @@ job_step "$SCEN/jobs-gen-9811-1.json" "bash-suites" in_progress 1 2 \
   "Bash shards — the ONE list both lanes run" "Bash shards — step 1 running" 5000
 lane_fail mainpr 9812 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9812"
+# ⛔ THE CEILING MUST BE ABOVE THE WINDOW, OR THE WAIT CANNOT *REPORT* AT ALL.
+# This fixture used to be a COIN FLIP, and the RAIL is what fixed it — not a larger
+# window. It set CEILING == WAIT == POLL == 1s while every report line was printed
+# only on polls that had NOT expired, so whenever `$SECONDS` (a whole-second clock)
+# ticked during the first poll — ~1 in 5 on a loaded runner — the wait returned before
+# printing anything and the assertion below read a surface nobody had written.
+# Measured: run 41110313398, job 124250724527 ("expired after 1s (ceiling 1s)", no
+# report line above it, 226ms of wall clock). `wait_for_first_checks` now prints the
+# closing observation before returning, so the window stays deliberately tight: it
+# yields AT LEAST one reported observation (two when no second boundary falls inside
+# the first poll — the count is clock-dependent and nothing asserts it) and the window
+# cannot silently grow.
 SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=1 SUITE_FIRST_CHECKS_STALL=2 \
   SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 grep -q 'stall bound 10000s' "$SCEN/out" "$SCEN/err" \
   && pass "(f) …and a 5000s completed step PROMOTES the stall period to 10000s at runtime" \
-  || { fail "(f) the stall period was not promoted from the observed step"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -12; }
+  || { fail "(f) the stall period was not promoted from the observed step"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -40; }
+# …AND THE REFUSAL CARRIES IT. The promotion is a property of the WAIT, not of one
+# report line: a refusal that names the derived 8760s while the wait was actually
+# bounded by 10000s tells the operator the wrong number in the only message they
+# read. This arm is what makes the property provable when no report line was
+# printed at all.
+grep -q 'stall bound (10000s)' <(tr -s '[:space:]' ' ' < "$SCEN/err") \
+  && pass "(f) …and the refusal that ends the wait states the promoted bound, not the derived one" \
+  || { fail "(f) the refusal names a stall bound the wait was not using"; sed 's/^/      /' "$SCEN/err" | head -20; }
 
 # (g) AN UNREADABLE STRETCH IS NOT A SILENT ONE. The Jobs surface fails for SIX
 # polls and then recovers with the SAME fingerprint (the job never left step 4/8).
