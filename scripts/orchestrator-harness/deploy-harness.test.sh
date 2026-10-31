@@ -415,7 +415,7 @@ say_case "11. the helper owns the verdict, so a caller cannot announce success o
 # (it sits after the copy-fail and verify-fail gates, which both `exit 1`).
 n_success_lines="$(grep -c 'harness deploy VERIFIED' "$DEPLOY")"
 [ "$n_success_lines" = "1" ] && ok "one success-notification site" || bad "$n_success_lines success-notification sites (expected 1)"
-n_verified_print="$(grep -c 'say "\$PROG: VERIFIED' "$DEPLOY")"
+n_verified_print="$(grep -c 'log_line "\$PROG: VERIFIED' "$DEPLOY")"
 [ "$n_verified_print" = "1" ] && ok "one VERIFIED print site" || bad "$n_verified_print VERIFIED print sites (expected 1)"
 # The helper's non-comment lines are CAPTURED once and tested in the shell: a non-quiet grep piped
 # into `grep -q` is the #841/#864 SIGPIPE false-negative (the quiet grep exits early, the producer
@@ -1038,6 +1038,25 @@ printf '{"payloadSha256":"%s"}\n' "$STAMP_LIVE" > "$O19/.agent-infra-stamp.json"
 notify_reset; deploy "$SRC19" "$O19"
 grep -qi "identity record STALE" <<< "$OUT" && bad "a CURRENT stamp was reported as stale (false alarm)" || ok "a current identity record is not flagged"
 
+# ── 19b. WHEN THIS RUN RECORDED THE BOX, the stamp's readers are named — not left with no remedy ───
+# ⛔ The `SUPERSEDED` line is TRUE for the drift gate (it prefers .harness-provenance) and was, on its
+# own, an operator dead end: `bin/harness doctor`, `harness-up` and `bringup status` still answer
+# "which commit is this box running?" from the STAMP, so after this run THEY report the old commit.
+# A verdict that says "superseded" and stops reads as "nothing to do"; the one command that refreshes
+# the answer they give has to be in the same breath.
+say_case "19b. a superseded stamp NAMES the readers still on it, and their remedy"
+SRC19p="$T/src19p"; O19p="$T/o19p"; make_src "$SRC19p"; make_target "$O19p"
+cp "$HERE/harness-provenance.sh" "$SRC19p/"; chmod +x "$SRC19p/harness-provenance.sh"
+printf '{"payloadSha256":"deadbeefdeadbeef"}\n' > "$O19p/.agent-infra-stamp.json"
+notify_reset; deploy "$SRC19p" "$O19p"
+[ -f "$O19p/.harness-provenance" ] && ok "19b: this run recorded .harness-provenance" \
+                                 || bad "19b: no provenance record after a deploy from a source that ships the writer"
+grep -qi "SUPERSEDED by" <<< "$OUT" && ok "19b: the verdict says the record supersedes the stale stamp" \
+                                     || bad "19b: the stale stamp was not explained — $OUT"
+grep -qi "bin/harness doctor" <<< "$OUT" && grep -qi "re-run install.sh" <<< "$OUT" \
+  && ok "19b: …and NAMES the readers still on the stamp plus the command that refreshes them" \
+  || bad "19b: 'superseded' with no remedy for the answers that are still stale — $OUT"
+
 # ── 19c. AN UNREADABLE STAMP IS "CANNOT CHECK", NOT "NO RECORD" ──────────────────────────────────
 # Review P3 (cycle 8), REPRODUCED before this case existed: the stamp is read with
 # `REC="$(sed … 2>/dev/null | head -1)"` and the assignment's status was never read, so a present but
@@ -1168,7 +1187,7 @@ fi
 # at head `orch-loop.sh` carried 21 mentions and `refresh-candidates.sh` 5, while the floors said 20
 # and 4 — reverting a single remedy left both green, which is the defect this arm exists to catch.
 # The rule: each number is `grep -c 'deploy-harness\.sh' <file>` as measured NOW.
-REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1"
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:3 lane-merge.sh:2 spawn-gate.sh:3"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
@@ -1499,6 +1518,51 @@ if [ -f "$HERE/install.sh" ]; then
 else
   bad "install.sh is missing — producer/checker agreement cannot be asserted"
 fi
+
+# ── THE REFUSAL GATE: a deploy that would discard a live patch REFUSES, and no env can disarm it ──
+# ⛔ THIS GATE HAD NO ARM AT ALL. `deploy-harness.sh`'s preflight (c) is the code that exists to stop
+# the measured 2026-10-28 loss (a hand fix to `$O/merge-one.sh` reverted twice), and neither this suite
+# nor `selftest.sh` named `--accept-discard` anywhere — so the gate could have been deleted, or made
+# unreachable, with every suite green. The three shapes are pinned in the order that matters: the
+# refusal exists, it PRESERVES the patch, and the override is a flag rather than an ambient variable.
+say_case "R. an uncommitted edit in \$O is REFUSED (78), preserved, and only a FLAG may discard it"
+SRCR="$T/srcR"; OR="$T/oR"; make_src "$SRCR"; make_target "$OR"
+# The record is what makes an edit distinguishable from a deploy, so the source must ship the writer.
+cp "$HERE/harness-provenance.sh" "$SRCR/"; chmod +x "$SRCR/harness-provenance.sh"
+notify_reset; deploy "$SRCR" "$OR"
+[ "$RC" -eq 0 ] && ok "R: a first deploy still succeeds (the gate does not block the healthy path)" \
+                || bad "R: a first deploy exited $RC — $OUT"
+[ -f "$OR/.harness-provenance" ] && ok "R: the deploy RECORDED \$O (so the next run can tell an edit)" \
+                                 || bad "R: no .harness-provenance after a successful deploy"
+printf '#!/bin/bash\necho HAND PATCH\n' > "$OR/claims.sh"
+PATCH_HASH="$(sha256_of "$OR/claims.sh")"
+notify_reset; deploy "$SRCR" "$OR"
+[ "$RC" -eq 78 ] && ok "R: an uncommitted edit -> exit 78 (refused before touching the target)" \
+                || bad "R: exit $RC over a hand-patched \$O, want 78 — the patch is not protected — $OUT"
+grep -q "UNCOMMITTED-EDIT.*claims.sh" <<< "$OUT" && ok "R: the refusal NAMES the file and its verdict" \
+                                               || bad "R: the refusal named no file — $OUT"
+[ "$(sha256_of "$OR/claims.sh")" = "$PATCH_HASH" ] && ok "R: the patch is STILL THERE (a refusal copies nothing)" \
+                                                   || bad "R: the patch was overwritten by a refused deploy"
+notify_has "deploy REFUSED" && ok "R: a refusal notifies REFUSED (a distinct verdict, not silence)" \
+  || bad "R: a refusal notified nothing — $(notify_last)"
+notify_success && bad "R: a refused deploy notified SUCCESS" || ok "R: a refusal emits no success notification"
+# ⛔ THE AMBIENT-ENV ARM. `ACCEPT_DISCARD` exported for `deploy-mac-orchestrator.sh` (which documents
+# it as an env seam) used to disarm THIS script's refusal too. The variable is exported into the deploy
+# exactly as a wrapper or a profile would, and the refusal must still fire.
+export ACCEPT_DISCARD=1
+notify_reset; deploy "$SRCR" "$OR"
+unset ACCEPT_DISCARD
+[ "$RC" -eq 78 ] && ok "R: an exported ACCEPT_DISCARD does NOT disarm the refusal (a flag, not an env default)" \
+                || bad "R: exported ACCEPT_DISCARD=1 disarmed the refusal (rc=$RC) — the gate is reachable from ambient env"
+[ "$(sha256_of "$OR/claims.sh")" = "$PATCH_HASH" ] && ok "R: the patch survived the ambient-variable attempt too" \
+                                                   || bad "R: the ambient variable let the patch be discarded"
+# …and the deliberate override does what it says.
+notify_reset; deploy "$SRCR" "$OR" --accept-discard
+[ "$RC" -eq 0 ] && ok "R: --accept-discard proceeds (exit 0) — the refusal is never the last word" \
+                || bad "R: --accept-discard exited $RC — $OUT"
+[ "$(sha256_of "$OR/claims.sh")" != "$PATCH_HASH" ] && ok "R: --accept-discard really did discard the edit (not a no-op)" \
+                                                   || bad "R: --accept-discard left the patch — the flag is a no-op"
+
 
 echo
 echo "════════════════════════════════════════"

@@ -773,13 +773,24 @@ _au_hits=0; AUTHORITY_UNKNOWN=1
 sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
 if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
   mkdir -p "$TMP/auO/state"
-  _au_run() { # _au_run <flag> -> prints how many PRs passed the guard
+  _au_run() { # _au_run <flag> [<claim-verdict rc>] -> prints how many PRs passed the guard
     _c=0
+    _clv_rc="${2:-0}"
     _ghsave="$(declare -f gh 2>/dev/null)"
     for PR in 1111 2222; do
-      AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"
+      AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"; LOG="$TMP/auO/guard.log"
+      mkdir -p "$O/state"; : > "$LOG"
       gh() { case "$1 $2" in "pr view") echo deadbeef ;; *) return 1 ;; esac; }
       disp() { return 0; }   # the shipped block records the refusal first; the recorder is not under test
+      # THE CLAIM GUARD IS INSIDE THIS EXTRACTED RANGE (agent-infra#2466) and decides BEFORE the
+      # authority guard. Stubbed here so this drive grades the authority guard; the claim guard's own
+      # answers are pinned by the two cases below and by the ownership cases earlier in this file.
+      claim_selection_verdict() {
+        CLAIM_SEL_VERDICT="claim-absent"; CLAIM_SEL_WHY="fixture"; CLAIM_SEL_OWNER=""; CLAIM_SEL_UNTIL=""
+        case "$_clv_rc" in 1) CLAIM_SEL_VERDICT="claim-held"; CLAIM_SEL_OWNER="cell-2:9"; CLAIM_SEL_UNTIL="9999999999" ;;
+                           2) CLAIM_SEL_VERDICT="claim-unreadable"; CLAIM_SEL_WHY="fixture: the registry could not answer" ;; esac
+        return "$_clv_rc"
+      }
       # shellcheck disable=SC1090
       . "$TMP/aublock.sh"
       _c=$((_c+1))   # reached only when no `continue` fired
@@ -787,10 +798,18 @@ if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
     [ -n "$_ghsave" ] && eval "$_ghsave" || unset -f gh 2>/dev/null
     echo "$_c"
   }
-  [ "$(_au_run 1)" = "0" ] && { echo "  ✅ the SHIPPED guard continues every PR when set (dead-branch wrapping would break extraction or this)"; PASS=$((PASS+1)); } \
+  [ "$(_au_run 1 0)" = "0" ] && { echo "  ✅ the SHIPPED guard continues every PR when set (dead-branch wrapping would break extraction or this)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the shipped guard did not continue every PR when set"; FAIL=$((FAIL+1)); }
-  [ "$(_au_run 0)" = "2" ] && { echo "  ✅ …and lets every PR through when clear"; PASS=$((PASS+1)); } \
+  [ "$(_au_run 0 0)" = "2" ] && { echo "  ✅ …and lets every PR through when clear"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the shipped guard continued when clear"; FAIL=$((FAIL+1)); }
+  # THE MULTI-CELL GUARD (agent-infra#2466): a foreign live claim SKIPS the PR before ANY arm (merge,
+  # arm, reviewer, fixer, red-fixer) can act on it, and an UNREADABLE registry skips it too. Both are
+  # driven through the SHIPPED block; leaving these to prose is how the guard could be deleted with
+  # every other assertion here still green.
+  [ "$(_au_run 0 1)" = "0" ] && { echo "  ✅ a claim-held PR is SKIPPED before any arm acts (the peer's declared window is respected)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a claim-held PR was acted on — two cells can take the same PR"; FAIL=$((FAIL+1)); }
+  [ "$(_au_run 0 2)" = "0" ] && { echo "  ✅ a claim-UNREADABLE registry SKIPS the PR too (an absent answer is not freedom)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ an unreadable registry let a PR through — the fail-open this change removes"; FAIL=$((FAIL+1)); }
 else
   echo "  ❌ could not extract the shipped AUTHORITY_UNKNOWN block from orch-loop.sh"; FAIL=$((FAIL+1))
 fi
@@ -1142,18 +1161,28 @@ echo "=== ownership is a LIVE FACT (owner ruling, 2026-10-18) ==="
 # rename/reformat/regression fails here instead of silently skipping.
 INST="$HERE/install.sh"
 LO="$HERE/live-ownership.sh"
-for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count unowned_scan; do
+# ⛔ `claim_selection_verdict` is the SELECTION wrapper (agent-infra#2466) and it is extracted with
+# the rest: pr_owned -> claim_foreign_live -> claim_selection_verdict -> claims.sh's
+# claim_snapshot_verdict, i.e. THREE layers and only one of them may decide. A missing piece of that
+# chain has to fail HERE rather than quietly reading as "unowned".
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_selection_verdict claim_live claim_lease_live unowned_pr_count unowned_scan; do
   ex "$_fn" > "$TMP/$_fn.sh"
 done
 grep -E '^is_num\(\) \{'    "$ORCH" > "$TMP/is_num.sh"
 grep -E '^_this_host\(\) \{' "$ORCH" > "$TMP/this_host.sh"
 _own_ok=1
-for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count unowned_scan is_num this_host; do
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_selection_verdict claim_live claim_lease_live unowned_pr_count unowned_scan is_num this_host; do
   [ -s "$TMP/$_fn.sh" ] || { echo "  ❌ could not extract $_fn() from orch-loop.sh — the rule moved or was reformatted"; _own_ok=0; }
 done
 [ -f "$LO" ] || { echo "  ❌ $LO is missing — the ownership predicate moved"; _own_ok=0; }
+# ⛔ THE CLAIM VERDICT ITSELF IS SOURCED FROM claims.sh, NEVER RE-IMPLEMENTED (agent-infra#2466).
+# `claim_snapshot_verdict` is the one reader; its inputs (`_lease_is_live`, `claim_orphan_reason`,
+# `claim_file_mtime`) and its tunable (`CLAIM_SNAPSHOT_MAX_AGE`) all live beside the writer they
+# read, so a fixture here cannot pin a polarity the SHIPPED reader does not have.
+[ -f "$HERE/claims.sh" ] || { echo "  ❌ $HERE/claims.sh is missing — the claim verdict moved"; _own_ok=0; }
+grep -qE '^claim_snapshot_verdict\(\) \{' "$HERE/claims.sh" || { echo "  ❌ claims.sh carries no claim_snapshot_verdict() — the one verdict moved or was renamed"; _own_ok=0; }
 cat "$TMP/is_num.sh" "$TMP/this_host.sh" "$TMP/fix_slots.sh" "$TMP/review_slots.sh" \
-    "$TMP/pr_owned.sh" "$TMP/claim_foreign_live.sh" "$TMP/claim_live.sh" "$TMP/claim_lease_live.sh" "$TMP/unowned_pr_count.sh" "$TMP/unowned_scan.sh" > "$TMP/ownfunctions.sh"
+    "$TMP/pr_owned.sh" "$TMP/claim_foreign_live.sh" "$TMP/claim_selection_verdict.sh" "$TMP/claim_live.sh" "$TMP/claim_lease_live.sh" "$TMP/unowned_pr_count.sh" "$TMP/unowned_scan.sh" > "$TMP/ownfunctions.sh"
 if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   # the SHIPPED predicate, not a re-implementation of it
   # shellcheck source=/dev/null
@@ -1166,12 +1195,23 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   LO_LIVE="$O/state/live.tsv"
   # Subshell helpers: the shipped functions are sourced, never copied, and `O` points at a fixture
   # state dir so nothing here can touch a real box.
-  _own()    { ( . "$TMP/ownfunctions.sh"; unowned_pr_count "$1" ); }
-  _owned()  { ( . "$TMP/ownfunctions.sh"; if pr_owned "$1" "${2:-}" "${3:-}"; then printf 'owned'; else printf 'unowned'; fi ); }
+  # shellcheck source=/dev/null
+  _own()    { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; unowned_pr_count "$1" ); }
+  _owned()  { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; if pr_owned "$1" "${2:-}" "${3:-}"; then printf 'owned'; else printf 'unowned'; fi ); }
   # The live table is the MACHINE's answer: "<branch>\t<worktree>\t<pid>\t<cwd>". A fixture row here
   # stands in for a real process — the suite that proves the PROBE really reads processes is
   # live-ownership.test.sh, which spawns them.
   _live() { printf '%s\n' "$@" > "$LO_LIVE"; }
+  # A REGISTRY THAT ANSWERED AND HOLDS NOTHING (agent-infra#2466). Every case below that expects
+  # "unowned" needs this file to exist: a MISSING snapshot is `claim-unreadable` (the registry never
+  # answered). Cases that want a claim overwrite it; the missing/failed/stale classes are pinned
+  # explicitly further down.
+  # ⛔ AND `claim-unreadable` DOES **NOT** OWN THE PR (review, P1 — this comment used to say it did,
+  # and the code was written to match). `unowned_scan` computes `n - owned`, so an "owned" answer for
+  # a registry nobody could read drives the un-owned count to 0 and OPENS the issue path — the
+  # fail-open that function's own rule forbids. The sweep needs no protection from this predicate: it
+  # gates on `claim_selection_verdict` directly, where rc 2 acts on nothing.
+  : > "$O/state/claims-snapshot"
 
   # (1) THE LIVE ARM. One row per holding process; the branch is the primary signal.
   _live 'fix/7-thing	/repo/.worktrees/x	1234	/repo/.worktrees/x'
@@ -1252,7 +1292,82 @@ FAKE
   eqv "THIS box's own claim does not own a PR — only a live process can" "unowned" "$(_owned 12 ddd000000000)"
   printf 'refs/claims/12-ddd000000000	otherbox:1	1\n' > "$O/state/claims-snapshot"
   eqv "an EXPIRED foreign claim does not own its PR (the lease window is respected)" "unowned" "$(_owned 12 ddd000000000)"
+  # AN EMPTY SNAPSHOT IS NOT AN ABSENT ONE (agent-infra#2466). The remaining cases need "a registry
+  # that ANSWERED and holds nothing", so they leave a fresh, empty file — which reads claim-absent.
+  # The DELETED file now means claim-unreadable (pinned immediately below), and the two must never be
+  # conflated: that conflation WAS the fail-open.
+  : > "$O/state/claims-snapshot"
+  eqv "an EMPTY but fresh snapshot is a registry that answered: the PR is unowned" \
+      "unowned" "$(_owned 12 ddd000000000)"
   rm -f "$O/state/claims-snapshot"
+  # ⛔ THE POLARITY IS THE POINT (review, P1). An unreadable registry is NOT FREEDOM — the sweep
+  # acts on nothing — but it is NOT "OWNED" either: `unowned_scan` computes `n - owned`, so an
+  # "owned" answer empties the count and OPENS the issue path on a registry nobody read, which is
+  # the fail-open its own rule forbids. All three unreadable shapes below therefore read UNOWNED.
+  eqv "a MISSING snapshot is claim-UNREADABLE: the PR is NOT owned (the sweep still acts on nothing)" \
+      "unowned" "$(_owned 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tfailed\t0\n' "$(date +%s)" > "$O/state/claims-snapshot"
+  eqv "a snapshot written from a FAILED fetch is NOT ownership either (its entries are a stale read)" \
+      "unowned" "$(_owned 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tok\t0\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
+  eqv "a snapshot OLDER than the age bound is NOT ownership (a claim published since would be invisible)" \
+      "unowned" "$(_owned 12 ddd000000000)"
+  # ⛔ AND THE RC ITSELF, ON THE SHIPPED CHAIN (review, P1). Everything above grades `pr_owned` /
+  # `unowned_pr_count`, and BOTH answer "unowned" for rc 0 (claim-absent) and for rc 2
+  # (claim-unreadable) — they cannot tell the two words apart, and that separation IS this change.
+  # Measured: reverting the missing-file arm to the pre-fix `claim-absent; return 0` left EVERY
+  # assertion above green, because a reverted reader still says "unowned". So pin the rc the sweep
+  # actually branches on (`claim_selection_verdict`, the shipped wrapper over the shipped reader):
+  # 0 would be FREE, 1 HELD, 2 UNREADABLE — and the sweep acts on rc 0 only.
+  _seen()   { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; claim_selection_verdict "$1" "${2:-}" >/dev/null; echo $? ); }
+  : > "$O/state/claims-snapshot"
+  eqv "a FRESH, EMPTY snapshot is a registry that answered: the SELECTION verdict is rc 0 (free)" \
+      "0" "$(_seen 12 ddd000000000)"
+  rm -f "$O/state/claims-snapshot"
+  eqv "a MISSING snapshot makes the SELECTION verdict rc 2 (UNREADABLE), never free" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tfailed\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(date +%s)" > "$O/state/claims-snapshot"
+  eqv "a FAILED-FETCH header is rc 2 even when its rows are a LIVE lease (the entries are a stale read)" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tok\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
+  eqv "an OVER-AGE header is rc 2 even when its rows are a LIVE lease" \
+      "2" "$(_seen 12 ddd000000000)"
+  # ⛔ A FUTURE STAMP IS DROPPED, NEVER TRUSTED (review, P2). The reader used to CLAMP `read_at` ahead
+  # of the local clock to fresh (`age=0`), so the further ahead a stamp, the longer it was believed —
+  # with no age bound at all. Same one-sided-age rule AGENTS.md records for `skill-reads.json`.
+  printf '#claim-snapshot\t%d\tok\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(( $(date +%s) + 999 ))" > "$O/state/claims-snapshot"
+  eqv "a read instant AHEAD of this box's clock is rc 2 (its age cannot be established)" \
+      "2" "$(_seen 12 ddd000000000)"
+  # A header this reader cannot parse is not an old writer: the mtime fallback belongs ONLY to a first
+  # line that is not a header at all (that is what a pre-header writer produces).
+  printf '#claim-snapshot\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a header with NO usable read instant is rc 2, not a mtime-believed snapshot" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf 'refs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a HEADER-LESS snapshot from an older writer still answers (mtime fallback kept)" \
+      "1" "$(_seen 12 ddd000000000)"
+  # ⛔ A SNAPSHOT THAT EXISTS BUT CANNOT BE READ IS UNREADABLE, NOT ABSENT (review, P1). `[ -f ]` is a
+  # stat, so it passes on a file this process cannot open; the reader then answered `claim-absent`
+  # (FREE) with the confidently wrong reason "no entry … read 0s ago". Root ignores permissions, so
+  # the arm is skipped (LOUDLY, never silently) on a root runner rather than being vacuous.
+  if [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+    printf 'refs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+    chmod 000 "$O/state/claims-snapshot" 2>/dev/null || true
+    eqv "an UNREADABLE snapshot file is rc 2 — a failed read is not an empty registry" \
+        "2" "$(_seen 12 ddd000000000)"
+    chmod 644 "$O/state/claims-snapshot" 2>/dev/null || true
+  else
+    echo "  ⏭ SKIP an UNREADABLE snapshot file is rc 2 — the arm needs a non-root uid (chmod 000 is ignored by root)"
+  fi
+  : > "$O/state/claims-snapshot"
+  # ⛔ AND THE GATE DIRECTION, not just the word. This is the assertion that catches the flip:
+  # with the old `*) return 0` arm every unreadable shape counted as owned, the un-owned count went
+  # to 0, and the drain gate opened with the whole PR queue invisible.
+  printf '12:ddd000000000:fix/12-b\n' > "$O/state/last-open-prs"
+  rm -f "$O/state/claims-snapshot"
+  eqv "…so an unreadable registry leaves the PR counted UN-OWNED and the issue path STAYS SHUT" \
+      "1" "$(_own 1)"
+  : > "$O/state/claims-snapshot"
 
   # (4) THE COUNT over a real listing, through the SHIPPED unowned_pr_count. Rows are
   # `number:head:branch` — the branch is in the row because ownership is per-PR and LIVE.
@@ -1860,6 +1975,14 @@ PYEOF
   wpin "…and the cycle states the PR path's outcome in one line" "$ORCH" '[pr] PR path:'
   wpin "…and a cycle that spawned NOTHING says so instead of implying work" "$ORCH" 'NO UNIT SPAWNED this cycle'
   wpin "the acting case has a catch-all arm (no class falls through silently)" "$ORCH" "no acting arm for class '"
+  # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NOT A CLASS (#3110). `check-class.py` prints a token on every
+  # path, so `V` empty means the classifier never ANSWERED — and the residual arm then named the class
+  # `<empty>` and re-read the same PR for ever (measured: `#10214 no acting arm for class '<empty>'`).
+  # The assignment and its condition are pinned by their SOURCE TEXT; the log message carries its own
+  # pin below, which is deliberate — the message names the classifier, so a re-word there is a change.
+  wpin "…and an EMPTY classifier verdict is mapped to the NOCHECKS reading arm, not a class" "$ORCH" '      V="NOCHECKS"'
+  wpin "…and the mapping is confined to the empty case (a real class is never overwritten)" "$ORCH" 'if [ -z "${V:-}" ]; then'
+  wpin "…and the empty verdict is LOGGED with the classifier that produced it" "$ORCH" 'the classifier produced NO VERDICT (empty output from $_CK_PY)'
   # ⛔ `first #-` WAS A NONSENSE TOKEN (#2126). The first target may only be a PR a unit touched.
   if grep -qF '(first #${FIRST_PR:--})' "$ORCH"; then
     echo "  ❌ the blocked line still renders \`first #-\` (it names no PR, so it names nothing)"; FAIL=$((FAIL+1))
@@ -2383,13 +2506,16 @@ echo "=== the land probe is DRIVEN, not described (the stall line reads it) ==="
 # real dependencies (is_num, the mtime reader, the ownership arms) — a missing one makes `bash -n` or
 # the probe itself fail loudly instead of returning a plausible empty answer.
 {
-  ex file_mtime_epoch; ex pr_owned; ex claim_foreign_live; ex claim_live; ex claim_lease_live
+  ex file_mtime_epoch; ex pr_owned; ex claim_foreign_live; ex claim_selection_verdict; ex claim_live; ex claim_lease_live
   ex unowned_scan; ex unowned_pr_count; ex mp_recent_land
   grep -E '^is_num\(\) \{' "$ORCH"; grep -E '^_this_host\(\) \{' "$ORCH"
 } > "$TMP/pr_all.sh"
 if bash -n "$TMP/pr_all.sh" 2>/dev/null; then
   PO="$TMP/probeO"; mkdir -p "$PO/state"
-  _probe() { ( O="$PO"; WSESS=""; . "$TMP/pr_all.sh"; "$@" ); }
+  # A REGISTRY THAT ANSWERED AND HOLDS NOTHING (agent-infra#2466): without it the PRs here read
+  # `claim-unreadable` and every count is 0 — which is correct behaviour and the wrong fixture.
+  : > "$PO/state/claims-snapshot"
+  _probe() { ( O="$PO"; WSESS=""; . "$HERE/claims.sh"; . "$TMP/pr_all.sh"; "$@" ); }
   # (1) a landed PR is evidence of progress; nothing else is.
   eqv "no state/merged-*.done -> no land recorded" "" "$(_probe mp_recent_land)"
   : > "$PO/state/merged-1.done"
@@ -2411,7 +2537,7 @@ if bash -n "$TMP/pr_all.sh" 2>/dev/null; then
   # fixture's live table stands in for the process, as in the ownership section above.
   printf 'fix/7-thing\t/repo/.worktrees/x\t1234\t/repo/.worktrees/x\n' > "$PO/state/live.tsv"
   eqv "a 3-FIELD row whose HEAD REF is held by a live process reads OWNED" "1" \
-      "$( ( O="$PO"; LO_SCAN=1; LO_LIVE="$PO/state/live.tsv"; . "$TMP/pr_all.sh"; . "$LO"; unowned_pr_count 2 ) )"
+      "$( ( O="$PO"; LO_SCAN=1; LO_LIVE="$PO/state/live.tsv"; . "$HERE/claims.sh"; . "$TMP/pr_all.sh"; . "$LO"; unowned_pr_count 2 ) )"
   rm -f "$PO/state/live.tsv"
   # ⛔ THE OLDER-ROW TOLERANCE IS KEPT, RE-POINTED: a 2-field row has no branch, so only the local
   # arms can own it — it must parse, never crash and never invent a branch.
@@ -2600,6 +2726,20 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   case "$out" in
     *"UNPROVEN suppression"*) echo "  FAIL a record with checked_unjustified unset grew an invented unproven count: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok a record with no checked_unjustified= invents no unproven count"; PASS=$((PASS+1)) ;; esac
+  # ⛔ A QUEUED ENTRY IS NOT A SUPPRESSED ONE (#3110). The 151 measured on the live box were COUNTED
+  # inside `blacklisted`, the bucket an operator reads as "nothing to do" — while they are the dispatch
+  # backlog (CLEAN-judged, still in candidates.txt awaiting the issue path). The line must SAY so,
+  # name its referent (the number it is a part of, not the pool), and must NOT say it when the
+  # `blacklisted` part was never rendered (an older writer's record with no `skipped_checked=`).
+  case "$out" in
+    *"— 7 of the 40 blacklisted are the DISPATCH BACKLOG"*)
+      echo "  ok the queued entries are named as the DISPATCH BACKLOG, with their referent"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the 7 queued entries still read as one more kind of suppression: $out"; FAIL=$((FAIL+1)) ;; esac
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit skipped_checked_queued=7 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"DISPATCH BACKLOG"*) echo "  ❌ a backlog was named with no blacklisted bucket on the line to name it against: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok no queued count grows a backlog sentence for a bucket that was never rendered"; PASS=$((PASS+1)) ;; esac
   # ⛔ A CAUSE/RESIDUE CONTRADICTION IS ITS OWN STATEMENT, never "the parts do not sum".
   printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=183 limit=6 reconciled=1 stop=none stop_conflict=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(195)" "" 1000000000)"
@@ -2647,6 +2787,12 @@ echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisa
   awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  # ⛔ THE SHARED (PR, head) REVIEW BUDGET IS PART OF THE PRODUCER NOW (agent-infra#2971): the
+  # verdict-less branch Spends `state/reviewdisp-<PR>` through these helpers instead of its own
+  # private counter, so an extraction without them leaves `rev_budget_spend` undefined (127) and the
+  # branch silently writes a marker but never counts or parks — the unbounded loop, wearing a green
+  # face. Extracted, never stubbed, for the same reason as the two functions above.
+  sed -n '/# \[revbudget:begin\]/,/# \[revbudget:end\]/p' "$MERGE" | sed '1d;$d'
 } > "$TMP/reviewstate.sh"
 ex review_gate_state > "$TMP/fn_review_gate_state.sh"
 # ⛔ NON-EMPTY AND DEFINED, not merely `bash -n`-clean (P2, first review round): `bash -n` on an EMPTY
@@ -2658,6 +2804,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
    && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
+   && grep -q '^rev_budget_spend() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_gate_state() {' "$TMP/fn_review_gate_state.sh" \
    && bash -n "$TMP/reviewstate.sh" 2>/dev/null && bash -n "$TMP/fn_review_gate_state.sh" 2>/dev/null; then
   RS="$TMP/rso"; mkdir -p "$RS/state"
@@ -2675,7 +2822,10 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
   # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
   _rc() { ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$1"; . "$TMP/reviewstate.sh"; review_state_clear ); }
-  _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS/parkreason"; : > "$RS/merge.log"; }
+  # ⛔ AND THE SHARED (PR, head) RECORD (agent-infra#2971): `reviewdisp-<PR>` is the ONE review budget
+# — the controller spends it on dispatch, merge-one.sh spends it on a verdict-less run — so a
+# leftover record here would make a later "one timeout" drive read as a cap that had been hit.
+_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
 
   eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
   eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
@@ -2772,18 +2922,18 @@ ISSUES 2')"
   # reviewed at a head that had been. Both resets are driven.
   _clean; _rs NO-VERDICT 9999aaaa; _rs NO-VERDICT 9999aaaa; _rc 9999aaaa
   _rs NO-VERDICT 9999aaaa
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a verified CLEAN resets the verdict-less counter (one timeout after it does not park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   _clean; _rs NO-VERDICT 7777bbbb; _rs NO-VERDICT 7777bbbb; _rs ISSUES 7777bbbb
   rm -f "$RS/state/needsfix-2132-7777bbbb"; : > "$RS/state/fixspend-2132-7777bbbb"
   _rs NO-VERDICT 7777bbbb
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a FINDINGS verdict resets it too (a fixer is the remedy, not a park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
@@ -3282,6 +3432,137 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   wpin "the collision-ledger walk-past increments SKIP_COLLIDED" "$REFRESH" 'SKIP_COLLIDED=$((SKIP_COLLIDED + 1))'
 else
   echo "  ❌ could not extract the funnel-record block from refresh-candidates.sh (or it is not valid shell) — the writer's arithmetic is ungraded"; FAIL=$((FAIL+1))
+fi
+
+# ── THE GATE VECTOR: every arm that fired, with the winner UNCHANGED (#2924 indicator (a), #2927) ──
+# ⛔ THE MEASURED DEFECT THIS GRADES. `GATE_WHY` is one string assigned by an `elif` chain, so the
+# first arm that fires MASKS every arm behind it — and the first is `merge-priority`, which is set
+# whenever any workable un-owned PR exists. Measured 2026-10-27: 349/384 cycles named merge-priority
+# with 25 free lane slots, 88.5% of those gated cycles ALSO had a capacity gate that would have
+# refused, and 64 were refused while `ci-queue=ok`. An operator reading the line could not tell
+# "waiting for the PR sweep" (healthy) from "throttled by a gate" (the defect).
+# The block is EXTRACTED from the live controller, never mirrored, so a reformat or a replaced arm
+# fails here instead of silently ungrading the suite.
+echo
+echo "══ the gate vector: EVERY arm that fired, and the winner is exactly what the old chain chose"
+GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
+if [ "$(printf '%s' "$GV" | grep -c .)" -lt 10 ]; then
+  echo "  ❌ could not extract the gate-vector block from $ORCH — the idle reason is ungraded"; FAIL=$((FAIL+1))
+else
+  gv() { # gv [VAR=value ...] -> "GATE_WHY<TAB>GATE_VEC"; sane defaults, then the caller's overrides
+    ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=0
+      FORK_STARVED=0; FORK_WHY=""; CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000
+      LANES_UNKNOWN=0; LANES=0; MAX_LANES=20; L=1; MAX_LOAD=12
+      CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none
+      CIQ=1; CIQ_RC=1; CIQ_VER="ok(queued=3 running=1 runners=20 ceiling=40)"
+      SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+      for _a in "$@"; do export "$_a"; done
+      eval "$GV"
+      printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" )
+  }
+  _t="$(gv)"; _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  [ "$_why" = "<open>" ] && echo "  ok (v1) a box with no gate reports NO winner" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v1) a clean box reported a winner: $_why"; FAIL=$((FAIL+1)); }
+  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Ten tokens is the arm count
+  # this block has; an arm DELETED from the vector while its predicate stays reddens here.
+  _missing=""
+  for _arm in 'merge-priority' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
+    case "$_vec" in *"$_arm"*) ;; *) _missing="$_missing $_arm" ;; esac
+  done
+  [ -z "$_missing" ] && echo "  ok (v2) every gate arm has its own verdict on the idle line" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v2) the vector does not name:$_missing"; FAIL=$((FAIL+1)); }
+  # ⛔ THE MEASURED CO-BINDING CASE (#2924 indicator (b)). merge-priority fires AND the queue is deep
+  # AND slots are free. The winner must STILL be merge-priority — the vector is additive, never a
+  # change of decision — while the queue arm is now VISIBLE beside it.
+  _t="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+           CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20)"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  case "$_why" in
+    merge-priority*) echo "  ok (v3) the winner is UNCHANGED (merge-priority still decides the cycle)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v3) the vector changed the DECISION (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'merge-priority('*) echo "  ok (v4) …and merge-priority is in the vector" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v4) merge-priority is missing from the vector: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'ci-queue=REFUSE('*) echo "  ok (v5) …and the capacity gate it MASKED is now visible too (the 2026-10-27 shape)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v5) the mask is back — a co-binding ci-queue refusal is invisible: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'slots=17 free of 20'*) echo "  ok (v6) …and the free lane slots it was throttled WITH (17 of 20)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v6) the free-slot count is not on the line: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ FIRST-WINS IS THE OLD CHAIN'S SEMANTICS, and it is the half a naive rewrite breaks: with the
+  # load arm and the lanes arm both firing, the winner must be the EARLIER one (load), not the last.
+  _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+  case "$_why" in
+    load=*) echo "  ok (v7) two arms firing ⇒ the EARLIER one wins, exactly as the elif chain did" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v7) the arm ORDER changed (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE DRIFT GUARD, and it is STRUCTURAL rather than prose: every arm that can ASSIGN `GATE_WHY`
+  # must also write its verdict to `GATE_VEC` in the SAME block, within three lines. A new arm added
+  # without its token reddens here — which is the only way this stays true as arms are added, and the
+  # exact defect that produced #2924 (a gate whose own report did not exist).
+  printf '%s\n' "$GV" > "$TMP/gv-block.sh"
+  if python3 - "$TMP/gv-block.sh" <<'ARMS'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+bad = []
+n = 0
+for i, ln in enumerate(lines):
+    if 'GATE_WHY="${GATE_WHY:-' in ln:
+        n += 1
+        window = " ".join(lines[i:i + 3])
+        if "GATE_VEC=" not in window:
+            bad.append(i + 1)
+print("ARMS=%d BAD=%s" % (n, ",".join(map(str, bad)) or "none"))
+sys.exit(1 if bad or n < 9 else 0)
+ARMS
+  then echo "  ok (v8) all $(grep -c 'GATE_WHY="\${GATE_WHY:-' <<<"$GV") GATE_WHY arms write a GATE_VEC verdict beside them" && PASS=$((PASS+1))
+  else echo "  ❌ (v8) an arm assigns GATE_WHY without a vector verdict — it can fire invisibly"; FAIL=$((FAIL+1)); fi
+  # ⛔ NO `elif AMONG THE VECTORED ARMS: a chain is how the mask comes back (#2924). The winner is
+  # chosen by `GATE_WHY="${GATE_WHY:-…}"`, which is order-preserving and chain-free.
+  if grep -qE '^[[:space:]]*elif ' <<<"$GV"; then
+    echo "  ❌ (v9) an \`elif\` is back inside the vector block — the first arm masks the rest again"; FAIL=$((FAIL+1))
+  else echo "  ok (v9) the arms are independent guards, not a masking chain"; PASS=$((PASS+1)); fi
+  # ── the two mutants ────────────────────────────────────────────────────────────────────────────
+  mut_gv() { # <name> <old> <new> -> path to the mutant block
+    printf '%s\n' "$GV" > "$TMP/gv-$1.in"
+    python3 - "$TMP/gv-$1.in" "$TMP/gv-$1.sh" "$2" "$3" <<'MUT'
+import sys
+src = open(sys.argv[1]).read(); old, new = sys.argv[3], sys.argv[4]
+assert old in src, "mutation target not found: " + old
+open(sys.argv[2], "w").write(src.replace(old, new))
+MUT
+    printf '%s' "$TMP/gv-$1.sh"
+  }
+  # (m1) RESTORE THE OLD BEHAVIOUR: the vector is not built at all (as a chain that only names its
+  # winner). (v5) is the arm that must redden.
+  _m="$(mut_gv novec 'GATE_VEC="$GATE_VEC ' 'GATE_VEC_UNUSED="${GATE_VEC:-}' 2>/dev/null)"
+  if [ -n "$_m" ] && [ -f "$_m" ]; then
+    GV="$(cat "$_m")"
+    _vec="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+               CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20 | cut -f2)"
+    case "$_vec" in
+      *'ci-queue=REFUSE('*) echo "  ❌ (m1) the no-vector mutant STILL reports the masked arm — (v5) is not load-bearing"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m1) FAILS when the vector is removed: a co-binding capacity refusal goes invisible again"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m1) could not build the no-vector mutant"; FAIL=$((FAIL+1)); fi
+  # (m2) RESTORE THE CHAIN: EVERY arm assigns unconditionally — which is exactly what a chain does —
+  # so the LAST arm that fires wins instead of the first. (v7) is the arm that must redden.
+  printf '%s\n' "$GV" > "$TMP/gv-lastwins.sh"
+  if python3 - "$TMP/gv-lastwins.sh" <<'MUT2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+n = s.count('GATE_WHY="${GATE_WHY:-')
+assert n >= 9, "only %d arms to rewrite" % n
+open(p, 'w').write(s.replace('GATE_WHY="${GATE_WHY:-', 'GATE_WHY="'))
+MUT2
+  then
+    GV="$(cat "$TMP/gv-lastwins.sh")"
+    _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+    case "$_why" in
+      load=*) echo "  ❌ (m2) the last-wins mutant still reports the EARLIER arm — (v7) does not test the order"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m2) FAILS when an arm stops honouring first-wins (winner became '$_why')"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m2) could not build the last-wins mutant"; FAIL=$((FAIL+1)); fi
+  GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
 fi
 
 echo

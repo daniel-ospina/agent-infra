@@ -52,7 +52,7 @@ EXTERNAL: look OUTSIDE this repo for how comparable systems solve this — vendo
     took from it. Skipping the rung is not allowed; `web_fetch` on a primary source always exists.
 RUNG: 2 — web_search model="sonar"   ⛔ REPLACE with the rung you will actually use, naming the tool:
     1 = perplexity MCP (`mcp__seo-intelligence__perplexity_search`) · 2 = `web_search` with the model
-    passed explicitly (`sonar`) · 3 = `web_fetch` / exa (`mcp_load exa`). If the rung you wanted does
+    passed explicitly (`sonar`) · 3 = `web_fetch`. If the rung you wanted does
     not load, name the rung you took AND the error you saw — a silent fallback erases the config gap.
 CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling, a decision section in
     a plan doc, a decision comment on an issue, a Tortoise point carrying one? Quote it, and say
@@ -75,6 +75,42 @@ switch, or remove worktrees, and never touch the repo's main checkout.
   changed and exact test evidence.
 - Use the research skill for non-trivial research; never call `web_search` directly.
 - Never ask the human anything. File a pre-existing bug with an issue instead of fixing it silently.
+
+<!-- BEGIN delivery-contract — drift-pinned from scripts/orchestrator-harness/reviewer-preflight.sh --delivery-brief lane; edit THERE, not here (reviewer-preflight.test.sh §G compares this block byte for byte) -->
+## COMMIT AS YOU GO — a killed lane must leave a PR behind (agent-infra#2981)
+
+**Commit as soon as you have a coherent unit, push it, then KEEP IMPROVING it.** Do not save your
+work for one commit at the end. The wall clock does not warn before it fires: a lane killed at its
+cap takes the uncommitted tree with it, so a lane that holds everything delivers NOTHING — its work
+is indistinguishable from no work at all while it exists only in a worktree that is about to be
+reaped.
+
+MEASURED 2026-10-27/28 (agent-infra#2981): five repair lanes in one batch, all five killed at their
+2400 s cap — **0 commits, 0 PRs, 144 KB of work** recovered only as rescue patch files. Not one of
+them had done the wrong work. Not one of them had delivered it.
+
+- A commit is a checkpoint, not a ceremony: commit when what you have BUILDS, or when the next thing
+  you are about to write would make the tree worse. Several small commits are the deliverable; one
+  perfect commit that never happens is not.
+- **Open the PR as soon as the first commit is pushed**, then keep improving it — the PR
+  being open is a starting line, not a finish line. Once it exists you do NOT open a second PR for
+  the same work.
+- **Push after every commit**, not once at the end — a commit that exists only in your worktree does
+  not survive the worktree being reaped, and it is not what the merge chain reads.
+- Keep working on the SAME branch once the PR exists. Do not restate the whole change in one final
+  commit at the end of the run; that is the shape this rule exists to remove.
+
+## ON RESUME — read the tree before you touch it
+
+If you did not write the tree you just found, **read `git status` and `git diff` FIRST** — before
+any edit, and before any checkout. An uncommitted tree in THIS worktree is your PREDECESSOR's work on
+this same task: a lane killed at its cap leaves exactly that, and it can be tens of KB of finished,
+tested work.
+
+Adopt it: read the diff, keep what is right, finish what is unfinished, commit it. ⛔ **Never discard
+it** — no `git checkout -- .`, no `git stash`, no `git clean`, no `git reset --hard` over
+uncommitted work, and never "start from a clean tree". Discarding it is how the same work dies twice.
+<!-- END delivery-contract -->
 
 <!-- BEGIN landing-artifacts — drift-pinned from scripts/orchestrator-harness/reviewer-preflight.sh --landing-brief self; edit THERE, not here (reviewer-preflight.test.sh §F compares this block byte for byte) -->
 ## Landing artifacts — what makes this PR pass `pipeline-compliance` (agent-infra#2325)

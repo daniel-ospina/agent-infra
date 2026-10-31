@@ -6,11 +6,17 @@
 # in place (content-merge), so repo updates flow to the live install and local
 # extras survive. Never deletes anything outside ~/.pi/agent.
 #
-# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly two things: a legacy $DEST/tools/fleet/
-# (#1277, a pi boot-blocker) and the farm artifacts DECLARED in
+# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly three things: a legacy $DEST/tools/fleet/
+# (#1277, a pi boot-blocker), the farm artifacts DECLARED in
 # pi-bootstrap/farm-retired.txt (#1924 — a retired script must stop existing on the
-# machines, not just stop being delivered). Nothing else is ever removed; a local extra
-# that is not declared retired is kept.
+# machines, not just stop being delivered), and the `exa` server entry in
+# $DEST/.mcp.json (owner ruling 2026-10-31, reversing #419: the merge is
+# `{**dst, **src}`, so dropping `exa` from the template alone would leave every
+# already-provisioned machine loading it). Nothing else is ever removed; a local extra
+# that is not declared retired is kept — `exa` is removed because it was a BASE server
+# being retired, not a local extra. NOTE the pop keys on the NAME only: a machine whose
+# `.mcp.json` carries a hand-rolled server the operator happened to name `exa` will be
+# de-configured too, which is why it is listed here rather than happening quietly.
 # ============================================================
 set -euo pipefail
 
@@ -88,6 +94,18 @@ src = json.load(open(sys.argv[1]))
 dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
 src_servers = src.get("mcpServers", {})
 dst_servers = dst.get("mcpServers", {})
+# ⛔ THE ONE DELIBERATE EXCEPTION TO "local extras preserved" (#419 reversed by the
+# owner, 2026-10-31: "exa should be uninstalled because I never wanted it. external
+# research should be perplexity"). `exa` is NOT a local extra to carry forward — it
+# was a BASE server, and the merge below is `{**dst_servers, **src_servers}`, which
+# preserves any key that already exists in dst. So dropping it from the TEMPLATE
+# alone would leave every ALREADY-PROVISIONED machine still loading it: the new
+# template wins on the keys it still has, and exa is not one of them, so dst's copy
+# is what survives. That is the opposite of what the operator expects from a
+# bring-up, and it is invisible (the merge prints "local extras preserved" either
+# way). This pop IS the migration.
+if dst_servers.pop("exa", None) is not None:
+    print("    exa removed from .mcp.json (owner ruling 2026-10-31 — uninstalled, not configured)")
 merged = {**dst, **src, "mcpServers": {**dst_servers, **src_servers}}
 json.dump(merged, open(sys.argv[2], "w"), indent=2)
 print("    .mcp.json merged (base servers win; local extras preserved)")
@@ -179,17 +197,24 @@ copied=0; kept=0
 for e in "$SRC"/extensions/*; do
   base="$(basename "$e")"
   dest="$DEST/extensions/$base"
-  # ⛔ NEVER copy a test file into the live farm (#1509). pi's extension loader
-  # EXECUTES every `.ts` under $DEST/extensions, so a `*.test.ts` there is not a
-  # test — it is an extension that runs its suite at session start and whose
-  # stdout replaces the session's answer. Measured 2026-10-25: 12 test files were
-  # farmed by this loop, every dispatched child on the box answered with
+  # ⛔ NEVER copy a test file into the live farm (#1509/#2841). pi's extension loader
+  # EXECUTES a top-level `.ts` OR `.js` under $DEST/extensions
+  # (`dist/core/package-manager.js::collectAutoExtensionEntries`:
+  # `entry.name.endsWith(".ts") || entry.name.endsWith(".js")`; pi's
+  # `docs/extensions.md` says the same — "direct TypeScript or JavaScript files"), so
+  # such a file there is not a test — it is an extension that runs its suite at session
+  # start and whose stdout replaces the session's answer. Measured 2026-10-25: 12 test
+  # files were farmed by this loop, every dispatched child on the box answered with
   # `auto-sync.test.ts` output instead of a reply, and no log named the cause.
+  # THIS LIST IS THE LOADER'S SET, not a subset of it (#2841): the original guard matched
+  # `*.test.ts` only, so a `*.spec.ts` / `*.test.js` / `*.spec.js` — all EXECUTED by the
+  # same loader — was copied and its suite ran at every session start. `.tsx`, `.mts`
+  # and `.cjs` are deliberately absent: the loader does not load them.
   # This loop is COPY-ONLY (like the scripts farm), so skipping here is not
   # enough — a test copied by an earlier run stays until it is removed, and it
-  # stays EXECUTING. Remove both halves.
+  # stays EXECUTING. Remove both halves (see the sweep below).
   case "$base" in
-    *.test.ts)
+    *.test.ts|*.spec.ts|*.test.js|*.spec.js)
       if [ -e "$dest" ]; then
         rm -f "$dest" && echo "    removed test file from live farm: $base"
       fi
@@ -214,17 +239,31 @@ for e in "$SRC"/extensions/*; do
   fi
   copied=$((copied+1))
 done
-# ⛔ RECURSIVE sweep for test files in the live farm (#1509). The `case` in the loop
+# ⛔ RECURSIVE sweep for test files in the live farm (#1509/#2841). The `case` in the loop
 # above only guards TOP-LEVEL entries, and two paths escape it: (a) an entry that is a
 # directory is copied with `cp -R`, which brings any `*.test.ts` inside it
 # (`builtin-tools/`, `verification-gate/` both carry one), and (b) this loop is
 # COPY-ONLY, so a test farmed by an earlier run whose source has since left the repo is
 # never visited at all. Both are EXECUTED by pi's extension loader at session start,
 # so the sweep is the half that makes the farm safe, not the `case`.
+# The name set is the `case`'s set, on purpose: ONE definition of "a test file pi would
+# execute", used by the writer and by the gate (scripts/check-pi-config-extensions.sh
+# check 6). A name added to one and not the other is the fail-open #2841 measured.
+# ⛔ `node_modules` IS PRUNED, because it is not the farm's to sweep: the loader skips it
+# (`if (entry.name === "node_modules") continue`), check 6's nested arm skips it
+# (`grep -v '/node_modules/'`), and a `*.test.js` inside an installed dependency is a
+# THIRD-PARTY file `npm install` put there — npm does not re-extract an already-installed
+# package, so deleting it corrupts the tree for good. Measured 2026-10-28 on this box:
+# 169 of the farm's 232 name-matching files sit under `/node_modules/`. Widening the set
+# without the prune grew a pre-existing over-delete by 10 files (`*.test.js` 9,
+# `*.spec.js` 1); the prune removes the whole class instead of only the newly-added names.
+# NB the sweep does NOT follow symlinked farm directories (`find` without `-L` does not
+# descend into them), which is what keeps a symlink-farmed machine from having its own
+# checkout's tracked test files deleted through the link.
 while IFS= read -r tf; do
   [ -n "$tf" ] || continue
   rm -f "$tf" && echo "    removed test file from live farm: ${tf#"$DEST/extensions/"}"
-done <<< "$(find "$DEST/extensions" -type f -name '*.test.ts' 2>/dev/null)"
+done <<< "$(find "$DEST/extensions" -type d -name node_modules -prune -o -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) -print 2>/dev/null)"
 
 echo "    extensions: $copied refreshed, $kept farm symlinks kept"
 
@@ -522,11 +561,17 @@ fi
 # dispatcher at `scripts/orchestrator-harness/retired/queue_verdicts.py` (still importable from
 # there, which is what keeps the retired copy runnable as a record). A farmed file that no live step
 # execs is a dependency the farm delivers to nobody.
+# agent-infra#2834 farms bg-rescue-wip.sh: `run_agent` (`spawn-gate.sh`) now EXECS it on every terminal
+# transition, and resolves it from `$O`, the harness dir's parent, `$AGENT_INFRA_PATH/scripts` and
+# `~/.pi/agent/scripts` — THIS farm is the fourth of those. It is the only one that works on a box
+# whose `$O` is the flat `scripts/orchestrator-harness/*` payload (the file lives one directory ABOVE
+# that) and whose launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile):
+# without it every at-risk lane recorded `rescue=UNAVAILABLE`, i.e. the rescue was loud and inert.
 # agent-infra#2374 adds registry-sync.sh: `cloud-cell-bringup.sh` runs it (the farmed copy is the
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -589,7 +634,12 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
 # Mac that is strictly better than the pre-#2046 behaviour it replaces (every
 # class fail-closed with `timeout: command not found` while the pass completed).
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh)
+# #1187 adds `cmux_payload.py`: `orch-send.sh` (farmed above) resolves its payload-integrity
+# check as `$(dirname "${BASH_SOURCE[0]}")/lib/cmux_payload.py`. Farming the sender WITHOUT the
+# checker makes EVERY orchestrator dispatch REFUSE with `NOT SENT` (exit 7) and type nothing —
+# a fail-closed FALSE BLOCK on every lane order, which is the right direction and still a box that
+# cannot dispatch. Farm them together. (main meanwhile added `live-paths.sh`; both are carried.)
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -986,6 +1036,60 @@ if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-launchd.sh"
     echo "    WARNING: launchd install reported failures (see above) — run:"
     echo "      $INFRA_ROOT/scripts/install-launchd.sh --status"
   fi
+fi
+
+# ── 7b. THE DEPLOY VERIFIES ITSELF (tortoise#10114) ───────────────────────────────────────────
+# Every farm leg above copies from $INFRA_ROOT. A copy that has just been written is NOT evidence
+# that the DEPLOYED bytes are the SHIPPED bytes — and it is no evidence at all when $INFRA_ROOT is
+# not the tree this box is pinned to. That is exactly how the original defect survived a "successful"
+# install: the farm refreshed from an Aug-7 checkout while the box was pinned elsewhere, so every
+# file it wrote was stale and NOTHING said so. launchd then executed that stale copy
+# (`com.tortoise.pr-doctor.plist` targets $DEST/scripts/pr-doctor.py) and the whole PR-repair fleet
+# dispatched 0 orders for nine hours while each pass reported rc=0.
+#
+# So the deploy ends by GRADING ITS OWN RESULT: `check-farm-drift.sh` compares every deployed file
+# against the source at the ref and prints `file | deployed sha | source sha | verdict`.
+#   rc=1 (a named file differs)        → FATAL. The farm did not converge, and a stale script would
+#                                        be executed. A failed install is louder than a silent
+#                                        no-op fleet.
+#   rc=2 (cannot compare / not the pin) → LOUD WARNING naming both shas, and the install continues:
+#                                        a fresh box legitimately has no pin record yet, and aborting
+#                                        there would fail every first-time install for a reason that
+#                                        is not a defect. The line prints on every run until it is
+#                                        resolved, which is what makes it observable.
+if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
+  echo ""
+  echo "==> Farm drift (deployed vs shipped)"
+  # GRADES WORKTREE BYTES, because that is what the farm legs above just `cp`'d. Grading against HEAD
+  # would red a farm that is byte-identical to the tree this script was told to farm from (the normal
+  # hot-fix path: box at pin, a farmed script edited, setup.sh re-run) — a false CRASH, the mirror of
+  # the false PASS this whole leg exists against. Pin identity is still checked inside.
+  # NOTHING IS WRITTEN INTO $DEST/state: that directory is not created by this file (:466 says so), and
+  # a log path there failed closed in the worst way — the STALE detail went to /dev/null and a
+  # non-writable dir turned a MATCHING farm into "FARM DID NOT CONVERGE". The detail is captured in a
+  # shell variable and always printed.
+  _farm_rc=0
+  _farm_msg="$(bash "$INFRA_ROOT/scripts/check-farm-drift.sh" \
+                --dest "$DEST/scripts" --src "$INFRA_ROOT" --ref HEAD --src-mode worktree \
+                --pin-file "$DEST/state/HARNESS-PIN" --quiet 2>&1 >/dev/null)" || _farm_rc=$?
+  case "$_farm_rc" in
+    0) echo "    farm: OK — every sourced file matches the bytes the farm copied"
+       # The pass can still carry a NOTE (e.g. "no pin record: pin identity NOT verified"). Printing it
+       # is the difference between "verified" and "verified except the trap arm", and --quiet put it on
+       # stderr while this line hid it.
+       [ -z "$_farm_msg" ] || printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
+    1) echo "    ⛔ FARM DID NOT CONVERGE — a deployed script is not the shipped code:"
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /'
+       echo "    Refusing to report a successful install over a farm that launchd would execute as stale code."
+       exit 1 ;;
+    3) echo "    ⚠️  farm: UNSOURCED file(s) — on the box, in no repo file (this is NOT drift, and NOT a pass):"
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
+    *) echo "    ⚠️  farm: COULD NOT VERIFY (exit $_farm_rc) — this is NOT a pass:"
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
+  esac
+else
+  echo ""
+  echo "    ⚠️  farm drift NOT verified — $INFRA_ROOT/scripts/check-farm-drift.sh is absent"
 fi
 
 echo ""

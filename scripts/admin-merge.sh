@@ -704,6 +704,19 @@
 
 set -uo pipefail
 
+# ⛔ THE RESERVE IS SPENT BY LANDINGS ONLY — AND "THE RESERVE" IS NOT THIS SCRIPT (#2342 review, P1).
+# `gh-limit.py` keeps a reserve below `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read
+# that could not be served from GraphQL. This file used to carry a file-scope
+# `export GH_LIMIT_ESSENTIAL=1` here, which made EVERY `gh` in this script — and in every child it
+# spawns — exempt from that floor. That is the opposite of the policy the layer states
+# (`gh-limit.py::essential()`: "A poll is never essential"; docs/ops/gh-rate-limits.md:454): the
+# floor's reason to exist is the spend measured on THIS rail's own poll loops, so exempting them left
+# the guard unable to fire on its target. ⛔ AND IT BOUGHT THE LANDING'S WRITE NOTHING: `essential()`
+# has exactly one call site, on the NON-mutating arm — a write is refused only by the dated-empty
+# guard, which never consults it. The one in-tree declaration is therefore per call, on the read a
+# landing genuinely cannot do without: `repo-authority.sh::required_checks`
+# (`GH_LIMIT_ESSENTIAL=1 "$gh" api …/protection/required_status_checks`).
+
 # File-scope so the EXIT trap can read it after `main` returns (P1-2).
 TMP=""
 # The stderr-capture file for the two READ PROBES (`resolve_head` / `resolve_draft`).
@@ -867,6 +880,34 @@ FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-$FAILSAFE_RERUN_TIMEOUT}"
 FIRST_CHECKS_STALL="${ADMIN_MERGE_FIRST_CHECKS_STALL:-8760}"
 FIRST_CHECKS_CEILING="${ADMIN_MERGE_FIRST_CHECKS_CEILING:-18064}"
 FIRST_CHECKS_POLL="${ADMIN_MERGE_FIRST_CHECKS_POLL:-60}"
+
+# ── THE CONFIGURED LANE THAT DOES NOT EXIST IN THIS REPO (#2862) ──
+# `WORKFLOW` defaults to `python-ci.yml`, a TORTOISE layout. On a repo whose CI
+# lives in `.github/workflows/ci.yml` (premise-labs runs its CI in `ci.yml`)
+# `gh run list --workflow python-ci.yml` matches NOTHING, and to this wait "no run
+# matched the filter" and "the PR was pushed a second ago" are the SAME state — so
+# it burned the whole legacy window and then refused with "CI never started" about
+# a PR whose checks had all passed (measured 2026-10-26, premise-labs#572: 12
+# checks, 0 failing; `--any-workflow` merged it in under two minutes).
+#
+# A repo needs no configuration to be MERGEABLE: `gh pr checks` resolves the
+# surface fine. So the filter is a TORTOSE-SHAPED OPTIMISATION, not a contract,
+# and the wait now DROPS it when it is PROVEN to select nothing while the head
+# carries checks — re-reading the list the way `--any-workflow` does.
+#
+# ⛔ AND THAT IS NOT A MERGE-DECISION LOOSENING. §4.5 (`check_surface_probe` on
+# the head) grades the evaluated tree across EVERY workflow and is untouched by
+# this: a genuinely red required check is refused there whatever lane this wait
+# happened to list. The filter only ever chose WHICH runs the wait watched.
+#
+# The drop is bounded by a COUNT, not a time: it may ATTEMPT the discriminating
+# read at most this many times per wait, and an attempt costs ONE tiny
+# `check-runs?per_page=1` read (its `total_count` is the whole surface), paid ONLY
+# on the broken path — arm (a), a repo that does have the configured workflow,
+# never pays it at all because its filtered list is non-empty. All four arms stay
+# inside the existing verdict table, so nothing here can outlive the stall/ceiling
+# bounds below. Set it to 0 to restore the pre-#2862 hardcoded-lane behaviour.
+FIRST_CHECKS_REDERIVE_MAX="${ADMIN_MERGE_FIRST_CHECKS_REDERIVE_MAX:-1}"
 # The maximum number of PENDING RUNS whose job lists this wait will fingerprint in
 # one poll. Beyond it the read is deliberately NOT attempted, because a partially
 # observed surface could show "no change" for a run that is in fact advancing —
@@ -3180,7 +3221,7 @@ lane_shard_set() {
   : > "$allnames"
   LANE_SET_LISTED=0; LANE_SET_WINDOW="$limit"; LANE_SET_CONSULTED=0
   LANE_SET_MEASURED=0; LANE_SET_NONMEASURING=0; LANE_SET_JOBS=0
-  LANE_SET_JOB_SAMPLE=""; LANE_SET_EMPTY_STOP=""
+  LANE_SET_JOB_SAMPLE=""; LANE_SET_EMPTY_STOP=""; LANE_SET_ALLNAMES=""
   while :; do
     if ! lane_run_ids "$flag" "$value" "$raw" > "$listing"; then
       say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
@@ -3266,6 +3307,12 @@ lane_shard_set() {
   # code lane was in the window at all", and those two have opposite remedies —
   # so the refusal NAMES what it saw. Read BEFORE the accumulator is removed.
   LANE_SET_JOB_SAMPLE="$(lane_job_sample "$allnames")"
+  # #2842: the RAW executed names of this side, not only the rendered sample. A
+  # refusal whose remedy is "set the prefix" has to be able to name a prefix that
+  # WORKS for the names this window carried — and the sample is a RENDERING
+  # (` | `-joined, truncated, with a `(+N more)` tail), so parsing a rendering
+  # back is not a datum. Read BEFORE the accumulator is removed.
+  LANE_SET_ALLNAMES="$(sort -u "$allnames" 2>/dev/null | grep '[^[:space:]]' || true)"
   rm -f "$allnames"
   # Drop any blank line before the union: a single blank entry would be counted
   # as a shard by `wc -l` and would match the empty pattern under `grep -xF`.
@@ -3540,6 +3587,63 @@ print("true" if c else "false")
   return 0
 }
 
+# lane_prefix_candidates <names-file> <out-file> [<max>] — the exact, copy-pasteable
+# retry values for a parity FAMILY that selected nothing (#2842).
+#
+# The refusal has named ADMIN_MERGE_LANE_JOB_PREFIX since #4844 and the executed job
+# names the window carried since #7734 — and a lane still paid a whole extra cycle,
+# because a knob plus a name list leaves the operator to GUESS the value and the
+# obvious guess is wrong: the family match is a case-SENSITIVE prefix (`lane_shards`
+# compares with Python `startswith`), so the lowercase `unit` the rail's own example
+# teaches selects NOTHING in a repo whose job is `Unit tests`. The operator follows
+# the printed remedy, is refused a second time, and the only remaining door the same
+# message names is the override — which is the steer #2842 reports.
+#
+# So this DERIVES the value instead of describing it. A job NAME is trivially a
+# prefix that selects itself (`'Unit tests'.startswith('Unit tests')`), so the
+# suggestion cannot be wrong about the name it came from; WHICH name is the test
+# shard stays the operator's decision, and the evidence states the family, so a
+# narrowed family is disclosed rather than silent. Auto-deriving the family instead
+# (the issue's first suggestion) is deliberately NOT done here: the rail cannot know
+# which executed names are test shards, and a family derived from the WRONG names
+# would quietly take a real shard out of the comparison — a fail-open in the gate
+# this file exists to be.
+#
+# LIFECYCLE names are excluded: `lane_has_test_shard` refuses a family made only of
+# bookkeeping jobs, so suggesting one would hand the operator a value that lands on a
+# DIFFERENT refusal. Blank lines are dropped for the same reason `lane_count` drops
+# them (a blank entry is a name that measures nothing), and the overflow is COUNTED,
+# never dropped silently.
+lane_prefix_candidates() {
+  local f="$1" out="$2" max="${3:-6}"
+  # The scan file MUST NOT be the caller's output path: the `rm -f` below would
+  # then delete the very answer this function just wrote — which is exactly the bug
+  # a first run of it had (the file was created, filled and removed in one call).
+  local lifecycle="$TMP/lane-lifecycle-cand.txt" list="$TMP/lane-candidate-scan.tmp"
+  local total="" name="" quoted=""
+  : > "$out"
+  [ -f "$f" ] || return 0
+  printf '%s\n' "$LANE_LIFECYCLE_JOBS" > "$lifecycle"
+  # NO `grep -c` UPSTREAM OF A QUIET CONSUMER (#864): every stage here reads its
+  # input to EOF, so no writer takes SIGPIPE under `pipefail`.
+  grep '[^[:space:]]' "$f" 2>/dev/null | sort -u | grep -vxF -f "$lifecycle" > "$list" || true
+  total="$(grep -c '[^[:space:]]' "$list" 2>/dev/null || true)"; total="${total:-0}"
+  [ "$total" -gt 0 ] || { rm -f "$list"; return 0; }
+  sed -n "1,${max}p" "$list" | {
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      # POSIX single-quote escaping, so a name holding a quote is still copy-pasteable.
+      quoted="$(printf '%s' "$name" | sed "s/'/'\\\\''/g")"
+      printf "ADMIN_MERGE_LANE_JOB_PREFIX='%s'\n" "$quoted"
+    done
+  } >> "$out"
+  if [ "$total" -gt "$max" ]; then
+    printf '(… +%s more executed job name(s) not listed here)\n' "$((total - max))" >> "$out"
+  fi
+  rm -f "$list"
+  return 0
+}
+
 # lane_parity_check <head> <main-run-limit> — decide whether the two sides are
 # comparable AT ALL, and leave both named shard sets behind so the evidence and
 # the refusal can state the lanes instead of asserting a bare `0 | 0`.
@@ -3557,6 +3661,17 @@ print("true" if c else "false")
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
+# #2842: WHICH condition left the reference EMPTY, when that condition is not an
+# unreadable list. The refusal used to assert ONE cause for every empty reference
+# ("the shard lists are not readable"), which is FALSE — and misleading in a
+# specific direction — when the job lists WERE readable and the family simply
+# matched none of them: the operator is told the coverage was unmeasurable when in
+# fact it was measured and MISNAMED.
+#   "family"    — readable job lists, and none of the executed names matches the family
+#   "lifecycle" — the family matches, but only workflow BOOKKEEPING jobs
+#   ""          — no such claim holds (unreadable/unobserved reference), so the
+#                 generic wording — which IS accurate there — is kept verbatim.
+LANE_PARITY_EMPTY_KIND=""
 # #6928: the diff-gated shards the target's selector DECLINED for this head, and
 # the verdict it answered. Set by lane_parity_check on the forgiveness path; read
 # by the evidence builder so a certified `PR ⊇ main` line is DISCLOSED as resting
@@ -3573,6 +3688,7 @@ lane_parity_check() {
   local head="$1" main_runs="$2" rc=0
   local LANE_PR_FROZEN="" LANE_MAIN_FROZEN="" LANE_DECLINED_FROZEN=""
   LANE_PARITY_REASON=""
+  LANE_PARITY_EMPTY_KIND=""
   if [ -z "${TMP:-}" ] || [ ! -d "${TMP:-}" ]; then
     say_err "admin-merge: ✗ internal error — lane parity called without a TMP directory"
     LANE_PARITY_REASON="the rail's own working directory is missing"
@@ -3598,6 +3714,9 @@ lane_parity_check() {
     LANE_PARITY_REASON="the PR head's lane runs could not be listed or read"
     return 2
   fi
+  # #2842: the PR window's RAW executed names, frozen here — the refusal that names
+  # the prefix knob reads them when this head's family selected nothing of its own.
+  printf '%s\n' "${LANE_SET_ALLNAMES:-}" > "$TMP/lane-pr-alljobs.txt"
   # ── FREEZE EACH REFERENCE AS SOON AS ITS OWN FETCH RETURNS (#1439) ──────────
   # freezing BOTH after both fetches is not enough, because a cross-alias makes the
   # second fetch OVERWRITE the first reference: with `lane-main.txt` a symlink to
@@ -3614,6 +3733,9 @@ lane_parity_check() {
     LANE_PARITY_REASON="main's lane runs could not be listed or read"
     return 2
   fi
+  # #2842: main's RAW executed names, frozen for the refusal's derived retry value.
+  # Read here, not later: the scratch dir is shared and a later write could alias it.
+  printf '%s\n' "${LANE_SET_ALLNAMES:-}" > "$TMP/lane-main-alljobs.txt"
   LANE_MAIN_FROZEN="$(cat "$TMP/lane-main.txt")"
   # Capture MAIN's window accounting NOW: the LANE_SET_* globals are overwritten
   # by every lane_shard_set call, and the reason below is a claim about MAIN.
@@ -3660,11 +3782,15 @@ lane_parity_check() {
     if [ "$main_jobs" -eq 0 ]; then
       LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
     else
+      # #2842: the lists WERE readable — this is a NAMING mismatch, and the refusal
+      # must say so rather than borrow the unreadable-list wording above.
+      LANE_PARITY_EMPTY_KIND="family"
       LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: --workflow <file>. --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
     fi
     return 2
   fi
   if ! lane_has_test_shard "$TMP/lane-main.txt"; then
+    LANE_PARITY_EMPTY_KIND="lifecycle"
     LANE_PARITY_REASON="the shard family '${LANE_JOB_PREFIX}*' matched ONLY lifecycle jobs on main ($(tr '\n' ' ' < "$TMP/lane-main.txt" | sed 's/ $//')) — a bookkeeping family measures no test"
     return 2
   fi
@@ -4196,6 +4322,31 @@ for path in sys.argv[1:]:
 PY
 }
 
+# first_checks_head_check_count <head> → the number of check-runs GitHub holds for
+# this head ACROSS EVERY WORKFLOW, and rc 0 when that surface was READ; rc 1 when
+# it could not be read at all.
+#
+# ⛔ A READ THAT FAILED IS NOT A ZERO, and the caller must not collapse them: 0 is
+# the evidence that NOTHING exists at this head yet (arm (d) — an empty surface,
+# which the wait may only report as "no run has appeared"), while an unreadable
+# surface is evidence of NOTHING and must never license the same sentence.
+#
+# `per_page=1` is deliberate: `total_count` on the first page IS the whole
+# surface, so the probe cannot be expensive enough to matter inside a poll. The
+# value is read with sed rather than jq/python because it must survive the cell's
+# transport-controlled gh chain, which is not guaranteed to serve `--jq`.
+first_checks_head_check_count() {
+  local head="$1" slug body n
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  body="$TMP/fc-head-checks.json"
+  if ! $GH api "$slug/commits/$head/check-runs?per_page=1" > "$body" 2>/dev/null; then
+    return 1
+  fi
+  n="$(sed -n 's/.*"total_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$body" | head -1)"
+  [ -n "$n" ] || return 1
+  printf '%s\n' "$n"
+}
+
 # wait_for_first_checks <head> → 0 the lane is terminal at this head (there is
 # something to compare), 1 it is not (and FIRST_CHECKS_* say which way).
 #
@@ -4212,9 +4363,11 @@ wait_for_first_checks() {
   local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
   local now last_clock dt fp summary max_step digest jobs
   local max_step_run fp_run summary_run read_ok n_lines idx
-  local stall_bound ceiling_bound signal_ok poll_step remaining adv
+  local stall_bound ceiling_bound signal_ok poll_step remaining adv wait_word expired
+  local rederive_left lane_filter_active head_checks
   local -a jobs_files=() pending_ids=()
   FIRST_CHECKS_WAITED=0; FIRST_CHECKS_QUIET=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""
+  FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
   FIRST_CHECKS_FINGERPRINT=""; FIRST_CHECKS_MISSING=0; FIRST_CHECKS_MISSING_STREAK=0
   stall_bound="$FIRST_CHECKS_STALL"
@@ -4243,9 +4396,18 @@ wait_for_first_checks() {
   # rejects it (`unknown flag`), and `2>/dev/null || true` hid that, so a
   # diagnostic built on it was silently dead for the very invocation
   # commit-workflow's own docs prescribe.
+  #
+  # The filter lives in `lane_filter_active`, NOT in `$ANY_WORKFLOW`: dropping it
+  # is a decision about THIS WAIT only (#2862). `ANY_WORKFLOW` also steers the
+  # failure-set lane and the base-window messages further down, so reusing it here
+  # would silently widen surfaces this fix has no business touching.
+  lane_filter_active=0
   if [ "${ANY_WORKFLOW:-0}" -ne 1 ] && [ -n "${WORKFLOW:-}" ]; then
+    lane_filter_active=1
     args+=(--workflow "$WORKFLOW")
   fi
+  rederive_left="$FIRST_CHECKS_REDERIVE_MAX"
+  case "$rederive_left" in ''|*[!0-9]*) rederive_left=1 ;; esac
   last_clock="$SECONDS"
   while :; do
     # shellcheck disable=SC2086
@@ -4268,6 +4430,54 @@ wait_for_first_checks() {
         [ -n "$obs" ] && obs="$obs; "
         obs="${obs}run ${id} status=${status} conclusion=${conclusion:--}${created:+ created=${created}}"
       done < <(printf '%s\n' "$out" | awk -F'\t' '{ printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }')
+    fi
+
+    # ── THE CONFIGURED LANE THAT SELECTS NOTHING HERE (#2862) ─────────────
+    # An EMPTY filtered list is ambiguous, and the ambiguity is what hung
+    # premise-labs#572: it means "this repo's CI is named otherwise" just as
+    # readily as "the PR was pushed a second ago", and the old wait could only
+    # read it the second way — so a misconfiguration was paid for with the whole
+    # window and reported as "CI never started" about a green PR.
+    #
+    # The discriminator costs one read: if the HEAD carries check-runs, they come
+    # from workflows whose names this repo actually has, so the configured name is
+    # NOT one of them and the filter is dropped. If the head carries NONE, the
+    # empty list was TRUE (nothing exists yet) and arm (d) reports it as such.
+    # ⛔ An UNREADABLE count drops nothing: an unread instrument is not a
+    # misconfiguration, and guessing it here would be the same class of error as
+    # reading it as "no runs".
+    #
+    # ⚠️ NO CLOCK ADVANCES on the re-derive poll. It is an immediate retry that
+    # answered nothing about the lane, so charging it to `missing` would let a
+    # misconfiguration eat the window one read at a time — the defect, not the fix.
+    if [ "$rc" -eq 0 ] && [ "$total" -eq 0 ] && [ "$lane_filter_active" -eq 1 ] \
+       && [ "$rederive_left" -gt 0 ]; then
+      # ⚠️ THE BUDGET IS SPENT ON THE ATTEMPT, NOT ON THE OUTCOME. Charging it only
+      # on a successful drop would make an UNREADABLE probe retry on every poll —
+      # one REST call per poll, forever, on the very path whose defect is "this wait
+      # burns its budget". One attempt per wait is the bound; a probe that fails
+      # leaves the pre-existing behaviour (the bounded legacy window) in place, and
+      # the message names the operator's escape.
+      rederive_left=$((rederive_left - 1))
+      if head_checks="$(first_checks_head_check_count "$head")"; then
+        # The count is recorded either way: a PROVEN-EMPTY head is a different
+        # state from an unread one, and the refusal must be able to say which.
+        FIRST_CHECKS_HEAD_CHECKS="$head_checks"
+        if [ "$head_checks" -gt 0 ]; then
+          lane_filter_active=0
+          args=()
+          [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
+          FIRST_CHECKS_REDERIVED="$WORKFLOW"
+          info "admin-merge: … FIRST-CHECKS wait: the configured lane '$WORKFLOW' has NO run at head $head, but this head carries $head_checks check-run(s) across every workflow — so '$WORKFLOW' is not this repo's CI (it is the TORTOISE default; a repo may name its CI anything, premise-labs uses ci.yml). DROPPING the lane filter for this wait and re-reading the head unfiltered. The merge decision is NOT loosened: §4.5 grades the head's evaluated tree across EVERY workflow, so a red required check is refused there exactly as before."
+          continue
+        fi
+      else
+        # An unreadable count is NOT evidence of a misconfiguration, and it must not
+        # be turned into one. Fail CLOSED — keep the filter, keep the window — but
+        # say so, because the alternative reading ("this repo's CI is elsewhere") is
+        # the exact ambiguity #2862 is about.
+        info "admin-merge: … FIRST-CHECKS wait: the configured lane '$WORKFLOW' has NO run at head $head, and the head's check-runs could not be READ — so 'this workflow is named differently here' and 'nothing has started yet' remain indistinguishable. KEEPING the filter and the bounded window (${FIRST_CHECKS_WAIT}s). If this repo's CI is named differently, pass --any-workflow."
+      fi
     fi
 
     # ── THE PROGRESS OBSERVATION ──────────────────────────────────────────
@@ -4411,43 +4621,64 @@ wait_for_first_checks() {
       FIRST_CHECKS_OUTCOME="$FIRST_CHECKS_STATE"
       return 1
     fi
+    # ── THE VERDICT ───────────────────────────────────────────────────────
+    # ⛔ THE EXPIRING POLL STILL REPORTS (#2862 CI regression). The verdict used to
+    # `return 1` from inside this table, i.e. BEFORE the report below — so the ONE
+    # poll an operator most needs to read (the one that ended the wait) was the only
+    # one that printed nothing about what it had observed. That is not a cosmetic
+    # gap: `$SECONDS` is a whole-second clock, so any poll whose work straddles a
+    # second boundary charges 1s, and a wait whose window IS 1s therefore expired on
+    # its FIRST observation whenever that happened — ~1 poll in 5 on a loaded runner.
+    # Measured: run 41110313398, job 124250724527 reddened `tests/admin-merge/run.sh`
+    # with "✗ BLOCK — the FIRST-CHECKS wait expired after 1s (ceiling 1s)" and NO
+    # report line above it, on a total wall clock of 226ms. Every fixture that
+    # asserts on a report line was therefore a coin flip, and the shard reddened
+    # every PR. Setting `expired` and reporting before returning makes the observation
+    # deterministic WITHOUT loosening a bound: the same verdict, the same instant, one
+    # more line — and the wait still sleeps zero additional seconds.
+    expired=0
     case "$FIRST_CHECKS_STATE" in
       still-running)
         if [ "$quiet" -ge "$stall_bound" ]; then
           FIRST_CHECKS_OUTCOME="stalled"
-          return 1
-        fi
-        if [ "$waited" -ge "$ceiling_bound" ]; then
+          expired=1
+        elif [ "$waited" -ge "$ceiling_bound" ]; then
           FIRST_CHECKS_OUTCOME="ceiling"
-          return 1
+          expired=1
         fi ;;
       never-started|unreadable)
         if [ "$waited" -ge "$FIRST_CHECKS_WAIT" ]; then
           FIRST_CHECKS_OUTCOME="$FIRST_CHECKS_STATE"
-          return 1
+          expired=1
         fi ;;
       unobservable)
         if [ "$missing" -ge "$FIRST_CHECKS_WAIT" ] || [ "$waited" -ge "$ceiling_bound" ]; then
           FIRST_CHECKS_OUTCOME="unobservable"
-          return 1
+          expired=1
         fi ;;
     esac
 
     # ── THE REPORT (patience, not a hang: say WHAT was observed) ──────────
+    # ⛔ A REPORT PRINTED ON THE POLL THAT ENDS THE WAIT MAY NOT SAY IT IS STILL
+    # WAITING. The observation is the same either way; only the tense changes, and a
+    # line that says "waiting" one line above a refusal that says "the window is
+    # spent" is the kind of message this repo treats as a defect, not a nicety.
+    wait_word="— waiting."
+    [ "$expired" -eq 1 ] && wait_word="— the bound is now spent, so this is the CLOSING observation."
     case "$FIRST_CHECKS_STATE" in
       never-started)
-        info "admin-merge: … FIRST-CHECKS wait: no run has appeared for head $head yet (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — waiting." ;;
+        info "admin-merge: … FIRST-CHECKS wait: no run has appeared for head $head yet (${waited}s of the ${FIRST_CHECKS_WAIT}s window) $wait_word" ;;
       unreadable)
-        info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — still waiting; unreachable is not empty." ;;
+        info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) $wait_word unreachable is not empty." ;;
       unobservable)
-        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${missing_streak}s consecutively) — waiting, and NOT calling it a stall: an unread instrument is not a stalled run." ;;
+        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${missing_streak}s consecutively) $wait_word This wait does NOT call it a stall: an unread instrument is not a stalled run." ;;
       *)
         if [ "$FIRST_CHECKS_TRANSITIONS" -eq 0 ]; then
-          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, no change observed yet (${waited}s of the ${ceiling_bound}s ceiling; stall bound ${stall_bound}s) — waiting. first observation: $summary"
+          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, no change observed yet (${waited}s of the ${ceiling_bound}s ceiling; stall bound ${stall_bound}s) $wait_word first observation: $summary"
         elif [ "$quiet" -eq 0 ]; then
-          info "admin-merge: … FIRST-CHECKS wait: still RUNNING and PROGRESSING — change #${FIRST_CHECKS_TRANSITIONS} observed at ${waited}s (${pending} run(s) pending, stall bound ${stall_bound}s, ceiling ${ceiling_bound}s): $summary"
+          info "admin-merge: … FIRST-CHECKS wait: still RUNNING and PROGRESSING — change #${FIRST_CHECKS_TRANSITIONS} observed at ${waited}s (${pending} run(s) pending, stall bound ${stall_bound}s, ceiling ${ceiling_bound}s): $summary $wait_word"
         else
-          info "admin-merge: … FIRST-CHECKS wait: still RUNNING, no change for ${quiet}s of the ${stall_bound}s stall bound (${waited}s of the ${ceiling_bound}s ceiling, ${FIRST_CHECKS_TRANSITIONS} change(s) so far) — last: $FIRST_CHECKS_LAST_CHANGE"
+          info "admin-merge: … FIRST-CHECKS wait: still RUNNING, no change for ${quiet}s of the ${stall_bound}s stall bound (${waited}s of the ${ceiling_bound}s ceiling, ${FIRST_CHECKS_TRANSITIONS} change(s) so far) — last: $FIRST_CHECKS_LAST_CHANGE $wait_word"
         fi ;;
     esac
 
@@ -4455,6 +4686,10 @@ wait_for_first_checks() {
     # bound it reports (the #1395 lesson again). The room is whichever verdict is
     # next: the stall clock for an observed surface, the legacy window for an
     # unobserved one, and the ceiling always.
+    # ⛔ AN EXPIRED WAIT DOES NOT SLEEP: the report above was the last thing it owed.
+    if [ "$expired" -eq 1 ]; then
+      return 1
+    fi
     remaining=$((ceiling_bound - waited))
     case "$FIRST_CHECKS_STATE" in
       still-running) [ $((stall_bound - quiet)) -lt "$remaining" ] && remaining=$((stall_bound - quiet)) ;;
@@ -4517,8 +4752,27 @@ block_on_first_checks() {
       say_err "admin-merge: ✗ BLOCK — the FIRST-CHECKS wait expired after ${FIRST_CHECKS_WAITED}s (window ${FIRST_CHECKS_WAIT}s) — no classification attempted."
       say_err "   waited for: the lane's runs on head $head to APPEAR and reach status=completed"
       say_err "   last observed: ${FIRST_CHECKS_OBSERVED:-nothing readable}"
-      say_err "   what was missing: NO run of the lane ever attached to this head. This is the"
-      say_err "   fresh-PR race (or the lane does not trigger on pull requests), not a failure."
+      if [ -n "${FIRST_CHECKS_REDERIVED:-}" ]; then
+        # The discriminating read DID fire and found nothing at all — so the
+        # configured name is not the whole story, and saying "the lane did not
+        # trigger on pull_request" would be a guess this wait cannot support.
+        say_err "   what was missing: NO run attached to this head in the configured lane"
+        say_err "   ('${FIRST_CHECKS_REDERIVED}'), AND the filter was DROPPED (that name selects nothing here)"
+        say_err "   and the UNFILTERED read still returned nothing, AND the head carries no check-run"
+        say_err "   at all. So this is a genuinely empty surface at this head — not a lane-name mismatch."
+      elif [ "${FIRST_CHECKS_HEAD_CHECKS:-}" = "0" ]; then
+        # The probe READ the head and found ZERO checks under EVERY workflow. The
+        # empty list was TRUE, so the "does not trigger on pull_request" guess the
+        # old text offered is unnecessary — and it would have been wrong: the
+        # configured lane name was never the question.
+        say_err "   what was missing: NOTHING has attached to this head at all — a check-runs read at"
+        say_err "   this head returned total_count 0 ACROSS EVERY WORKFLOW, so the head carries no check-run"
+        say_err "   at all and the configured lane ('${WORKFLOW:-}<none>') never even came into it."
+        say_err "   An EMPTY surface is not a wrong lane name: nothing has started yet."
+      else
+        say_err "   what was missing: NO run of the lane ever attached to this head. This is the"
+        say_err "   fresh-PR race (or the lane does not trigger on pull requests), not a failure."
+      fi
       say_err "   There is no run whose progress could be observed, so this wait keeps the LEGACY"
       say_err "   bounded window rather than a stall bound."
       say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
@@ -5985,6 +6239,20 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
+# ⛔ ONE PATTERN FOR "an id NO LOCAL REPRODUCTION can execute" (#3715, #1185).
+# These families name no pytest nodeid, so handed to the runner as ARGV ONE of
+# them makes pytest EXIT 4 having run NOTHING (`ERROR: file or directory not
+# found`) and the whole base run clears nothing. TWO readers ask this question —
+# `reproduce_residual_on_base`, which must not hand them to the runner, and the
+# #3715 block, which reports that the surviving candidate set names nothing a
+# local run could execute. A second copy of the REGEX is exactly the drift the
+# rail's one-derivation rule forbids, so the regex lives here and nowhere else.
+# (This is ONE pattern with TWO readers, not one enumeration of the families:
+# `repro_scope`'s `case` arms answer a DIFFERENT question — admission into the
+# candidate set, which is #1185's narrowing — so a family added here must be
+# considered there too, and vice versa.)
+NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^bash-shard::|^runner::|^pipeline-compliance::'
+
 # ══ reproduce_residual_on_base — THE MISSING MEASUREMENT (#3715) ═══════════
 #
 # THE DEFECT. `main-rates.txt` is a FAILURE-ONLY projection over the last N runs
@@ -6058,15 +6326,22 @@ build_evidence() {
 #     baseline measured (a sibling failure in the same file): the rail's own
 #     `attribute_residual` calls that MEASURED-ABSENT, "not present on main",
 #     which is evidence of novelty. Only the absence of ANY measurement of the
-#     file is the missing measurement this constructs. AND EVERY NON-NODEID
-#     CLASS IS NEVER A CANDIDATE, because a base run cannot speak to what it
-#     asserts: an UNATTRIBUTABLE id (a class red across runs under a MOVING id —
-#     "cannot be attributed to this PR", and therefore never a merge), a
-#     guard-step identity (no local runner), and the other non-nodeid families a
-#     local pytest cannot execute (`collect-error::<file>` #6798,
+#     file is the missing measurement this constructs. AND A NON-NODEID CLASS
+#     IS NEVER CLEARABLE, because a base run cannot speak to what it asserts: an
+#     UNATTRIBUTABLE id (a class red across runs under a MOVING id — "cannot be
+#     attributed to this PR", and therefore never a merge), a guard-step
+#     identity (no local runner), and the other non-nodeid families a local
+#     pytest cannot execute (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
 #     `bash-shard::<path>` #2643, `runner::<job>` — passed as argv they make
-#     pytest exit 4 having run NOTHING). `repro_scope` then
+#     pytest exit 4 having run NOTHING). CANDIDACY AND CLEARANCE ARE NOT THE SAME
+#     SET (#1185): `repro_scope` admits ONE guard-step identity into the
+#     candidate set when the base's baseline was read and holds no row for its
+#     step, so the rail can REPORT that the base cannot speak to it — while the
+#     two filters in `reproduce_residual_on_base` keep it out of the runner's
+#     argv AND out of the base's own capture before `intersect_sets`, so a
+#     candidate of that class is still never cleared.
+#     `repro_scope` then
 #     `repro_candidates` are the one place that decision is made, and the cleared
 #     set is its intersection with the base's own failures (`intersect_sets`,
 #     below);
@@ -6080,7 +6355,11 @@ build_evidence() {
 #     invalid bound clears NOTHING and the rail blocks exactly as before — an
 #     unrun reproduction is never read as "pre-existing";
 #   * guard-step identities are NOT reproduced (they have no local runner) and
-#     always remain in the residual.
+#     always remain in the residual — `repro_scope` admits one into the
+#     CANDIDATE set only when the base holds no record of its step (#1185), and
+#     even then nothing local can execute it: `reproduce_residual_on_base`
+#     filters it from its argv AND from the base's own capture before the
+#     intersection, so it can never be cleared.
 #
 # The worktree is a throwaway under $TMP and is always removed.
 #
@@ -6118,10 +6397,12 @@ reproduce_residual_on_base() {
   # directory not found`), so a residual that mixes a collection error with real
   # nodeids aborted the whole base run and cleared nothing — the false block this
   # repair exists to remove, with no diagnostic naming the cause. (`repro_scope`
-  # already filters them from the candidate set; this is the function's own
-  # guard, so the contract holds for any caller.)
+  # filters them from the candidate set — EXCEPT the guard-step ids #1185 admits,
+  # the ones the base holds no record of, admitted so the rail can REPORT that
+  # fact; this is the function's own guard, so the contract holds for every
+  # caller, and it is also what keeps a base CAPTURE from volunteering one.)
   local nodeids
-  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^bash-shard::' -e '^runner::' -e '^pipeline-compliance::' "$residual" 2>/dev/null || true)"
+  nodeids="$(grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -6246,7 +6527,25 @@ reproduce_residual_on_base() {
   # implementation (never a second subtraction, never `comm -12`).
   if [ -n "$reproduced" ]; then
     printf '%s\n' "$reproduced" | sort -u > "$work/reproduced.all"
-    intersect_sets "$work/reproduced.all" "$residual" "$out" "$work/rep-outside.txt" || {
+    # ⛔ THE ARGV FILTER ABOVE DOES NOT BOUND WHAT MAY BE CLEARED (#1185 review,
+    # cycle 2). ⚠️ THIS FILTER IS UNFIXTURED: the cycle-2 author wrote a
+    # rail-level fixture for it and MEASURED that it did not discriminate (the
+    # same scenario cleared nothing with the filter removed), so the case was
+    # deleted rather than shipped as a vacuous green — the effect below is
+    # established by direct measurement of the parser instead
+    # (`python3 scripts/ci_exemption.py ids --log` on a capture carrying the
+    # `##[error]FAILED …` annotation prints the `guard-step::` id). `grep -Ev`
+    # bounds what the runner was ASKED to run; a CAPTURE can
+    # still volunteer an identity its argv never named — `ids --log` recovers
+    # them from anywhere in the log, and a capture carrying a `##[error]FAILED …`
+    # annotation emits a `guard-step::` identity. Since #1185 a guard-step id CAN
+    # be in `$residual` (the candidate set), so before this filter it could be
+    # subtracted from the rail's residual by the base's own output: a failure no
+    # local run can execute, CLEARED. One more filter on the BASE'S side, through
+    # the same one pattern, keeps "an id no local reproduction can execute can
+    # never be cleared" true whichever side reports it.
+    grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$work/reproduced.all" > "$work/reproduced.exec" 2>/dev/null || : > "$work/reproduced.exec"
+    intersect_sets "$work/reproduced.exec" "$residual" "$out" "$work/rep-outside.txt" || {
       : > "$out"; return 1
     }
   fi
@@ -6417,16 +6716,43 @@ intersect_sets() {
   return 0
 }
 
-# repro_scope <residual> <unattributable> <out> <scratch> — the ids a base run
-# could even SPEAK TO: the residual minus UNATTRIBUTABLE identities, minus
-# guard-step identities, and minus the other NON-NODEID families. All are
-# excluded on doctrine, not on evidence:
+# repro_scope <residual> <unattributable> <out> <scratch> [<mainfails>] — the ids
+# a base run could even SPEAK TO, PLUS (since #1185) the guard-step ids the base
+# holds NO record of: those are admitted so the rail can REPORT that fact, never
+# because a run could speak to them (nothing local can execute one — see the
+# caller's own branch). The set is the residual minus UNATTRIBUTABLE identities,
+# minus guard-step identities THE BASE HAS A RECORD OF, and minus the other
+# NON-NODEID families. Every arm is excluded on DOCTRINE — and the guard-step arm
+# alone is additionally decided on EVIDENCE from the base's OWN baseline
+# (`main_measured_files`), which is #1185's narrowing:
 #   * UNATTRIBUTABLE is "a class red across runs under a MOVING id — the identity
 #     provably will not be the same next run, so it cannot be attributed to this
 #     PR". Reproducing ONE of the moving ids on the base says nothing about the
 #     class, and the class is never a merge (`detect_rotating_identity`, E5).
-#   * a guard-step identity has no local pytest runner, so it cannot be
-#     reproduced and must always remain in the residual.
+#   * a guard-step identity has no local pytest runner, so a local run cannot
+#     reproduce it — but that is a statement about the RUNNER, and it is only
+#     half of the question. The other half is whether the BASE holds any record
+#     of the id's UNIT at all (#1185): main's baseline is a union over main's own
+#     runs, and a `pull_request`-only workflow NEVER RUNS ON MAIN, so its
+#     `guard-step::<step>::<shape>` ids can never appear there however red main
+#     is. Excluding that id as "a reproduction can never clear it" conflated two
+#     different facts and named neither: the failure is real and on this head,
+#     but the base has NO RECORD of the step, so `main-fails.txt`'s silence is a
+#     structural absence, not evidence of novelty (#7734's own distinction). So
+#     a guard-step id is admitted into the candidate set ONLY when
+#     `main_measured_files` holds no row for its UNIT — the SAME derivation
+#     `repro_candidates` applies at its FILE level, so the scope and the
+#     clearance cannot disagree.
+#     ⛔ WHAT THE CONDITION FORBIDS: it never admits a guard-step id whose step
+#     main's baseline DID measure. There main HAS evaluated the unit, its
+#     absence from the failure set is a measurement (MEASURED-ABSENT), and
+#     reading it as "the base holds no record" would let a REAL failure be filed
+#     as unmeasurable — the widening direction that turns a block into a
+#     misdiagnosis. An EMPTY or unreadable baseline admits nothing either, and
+#     that is a deliberate refusal, not an oversight: a failure-only baseline
+#     that is empty cannot tell "main is GREEN" from "main has no run at all"
+#     (#7734), so this function cannot assert the base holds no record on it.
+#     The id then keeps the pre-change exclusion — fail closed.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
 #     `bash-shard::<path>` #2643, `runner::<job>`,
@@ -6436,17 +6762,36 @@ intersect_sets() {
 #     NAME, never measurements a local run can clear (#3715 review, P2).
 # Return contract: 0 = computed (out may be empty) · 1 = could not compute.
 repro_scope() {
-  local residual="$1" unattrib="$2" out="$3" scratch="$4" nid
+  local residual="$1" unattrib="$2" out="$3" scratch="$4" mainfails="${5:-}" nid ukey main_units=""
   if [ -s "$unattrib" ]; then
     run_failure_set --diff "$residual" "$unattrib" > "$scratch" 2>/dev/null || return 1
   else
     cp "$residual" "$scratch" || return 1
   fi
+  # THE BASE-SIDE RECORD, through the ONE derivation `repro_candidates` uses. An
+  # absent or EMPTY baseline leaves this empty, which ADMITS NOTHING below: a
+  # failure-only baseline that is empty cannot tell "main is green" from "main
+  # has no run", so "the base holds no record of this unit" is not a claim this
+  # function can make from it (fail closed — the pre-change exclusion stands).
+  if [ -n "$mainfails" ] && [ -s "$mainfails" ]; then
+    main_units="$(main_measured_files "$mainfails")"
+  fi
   : > "$out"
   while IFS= read -r nid; do
     [ -n "$nid" ] || continue
     case "$nid" in
-      guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
+      guard-step::*)
+        # #1185: admissible ONLY when the base's record is POSITIVELY readable and
+        # holds no row for the id's UNIT. An empty record admits nothing.
+        ukey="$(failure_file_key "$nid")"
+        if [ -z "$main_units" ]; then
+          continue
+        fi
+        if grep -qxF -- "$ukey" <<<"$main_units" 2>/dev/null; then
+          continue
+        fi
+        ;;
+      collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
       bash-shard::*|runner::*|pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
@@ -7983,7 +8328,7 @@ main() {
     # (step 2). An id WITH a row stays refused no matter what the base does.
     local cand="$TMP/repro-candidates.txt"
     if ! repro_scope "$TMP/unique.txt" "$TMP/unique.unattributable" \
-         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" \
+         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" "$TMP/main-fails.txt" \
        || ! repro_candidates "$TMP/repro-scope.txt" "$TMP/main-fails.txt" "$cand" \
          "$TMP/repro-idlevel.txt" "$TMP/main-files.txt"; then
       repro_line="Reproduction on base: attempted on base $repro_base; the candidate set could not be computed through the shared parser — the refusal stands (fail closed)"
@@ -7993,12 +8338,25 @@ main() {
       # carries a main-side measurement, or every id's FILE is measured on main
       # (MEASURED-ABSENT). Naming the wrong one would be a false report.
       if [ ! -s "$TMP/repro-scope.txt" ]; then
-        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job) — the refusal stands"
+        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job). A guard-step is NOT in this class only when it is not UNATTRIBUTABLE (that arm wins first) AND main's baseline was READ, is non-empty, and holds no row for its step (#1185) — then it reaches the candidate set and is reported there; an EMPTY or unreadable baseline keeps it in THIS class, because a failure-only baseline cannot tell 'main is green' from 'main has no run' (#7734). The refusal stands"
       elif [ ! -s "$TMP/repro-idlevel.txt" ]; then
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to carries a main-side measurement, so there is no missing measurement to construct — the refusal stands"
       else
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to sits in a FILE main's baseline measured (MEASURED-ABSENT), which is evidence of novelty — the refusal stands"
       fi
+    elif ! grep -Eqv "$NON_LOCAL_REPRO_ID_RE" "$cand" 2>/dev/null; then
+      # #1185: THE CANDIDATE SET NAMES NO ID A LOCAL RUN COULD EXECUTE. The scope
+      # admitted such an id because `main_measured_files` carries no row for its
+      # unit, and no local runner can execute it — so NOTHING WAS ATTEMPTED, and
+      # the honest report is the fact that made it unmeasurable rather than "the
+      # reproduction could not RUN" (it never ran because it was never runnable).
+      # The message names NO family on purpose: the admission is `repro_scope`'s
+      # case arms, the report's classifier is `NON_LOCAL_REPRO_ID_RE`, and a
+      # family added to one and not the other must not produce a message that
+      # asserts WHICH family the operator is looking at.
+      # NOTHING IS CLEARED: the failure is on this head, and the refusal stands
+      # exactly as before.
+      repro_line="Reproduction on base: NOT attempted on base $repro_base — no candidate names an id a LOCAL run could execute, and the base's failure baseline holds no row for their units, so neither a local reproduction nor main's rate table can speak to them. The refusal stands"
     elif ! is_full_sha "$repro_base"; then
       # A REF NAME is not a pinned base. `check_surface_probe` falls back to the
       # REF when the commits API cannot resolve a SHA, and `git worktree add main`
@@ -8672,10 +9030,45 @@ $attribution_line"
       # and names the route that does work, instead of one that cannot.
       if [ "$parity_rc" -eq 2 ]; then
         say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY and the"
-        say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
-        say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
-        say_err "   readable — and an unreadable shard list is NOT an empty one."
+        # #2842: STATE THE CONDITION THAT ACTUALLY HELD. Every empty reference used
+        # to be described as an UNREADABLE list. That is accurate when the listing or
+        # a job list could not be read — and FALSE, in the direction of "your repo's
+        # coverage cannot be measured", when the lists were read perfectly and simply
+        # carried no job in the family. The operator then chases a comparability
+        # defect that does not exist while the one-line naming fix sits unread in WHY.
+        case "${LANE_PARITY_EMPTY_KIND:-}" in
+          family)
+            say_err "   lane coverage could not be established: the shard FAMILY '${LANE_JOB_PREFIX}*'"
+            say_err "   selected NOTHING from job lists that WERE READABLE. That is a NAMING"
+            say_err "   mismatch — NOT an unreadable list and NOT a red check: no failing check"
+            say_err "   was measured on either side, so nothing here says this PR is broken."
+            say_err "   The job name(s) it executed are listed in WHY below." ;;
+          lifecycle)
+            say_err "   lane coverage could not be established: the shard FAMILY '${LANE_JOB_PREFIX}*'"
+            say_err "   matched only workflow LIFECYCLE (bookkeeping) jobs, which measure no test."
+            say_err "   That is a MISNAMED family — NOT an unreadable list and NOT a red check." ;;
+          *)
+            say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
+            say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
+            say_err "   readable — and an unreadable shard list is NOT an empty one." ;;
+        esac
         say_err "   WHY: ${LANE_PARITY_REASON}."
+        # #2842: THE REMEDY MUST CARRY A VALUE THAT WORKS. Naming the knob and the
+        # names it saw still leaves the operator to guess the value, and the guess the
+        # rail's own example teaches ('unit') is refuted by a case-SENSITIVE prefix
+        # match against 'Unit tests'. So the retry command is DERIVED from the names
+        # this window actually executed.
+        if [ "${LANE_PARITY_EMPTY_KIND:-}" = "family" ] || [ "${LANE_PARITY_EMPTY_KIND:-}" = "lifecycle" ]; then
+          lane_prefix_candidates "$TMP/lane-main-alljobs.txt" "$TMP/lane-candidates.txt"
+          if [ -s "$TMP/lane-candidates.txt" ]; then
+            say_err "   THE RETRY VALUE, derived from the job name(s) main's lane EXECUTED — the"
+            say_err "   family is a PREFIX match and CASE-SENSITIVE ('unit' does NOT select"
+            say_err "   'Unit tests'), so pick the line whose name is the TEST shard:"
+            sed 's/^/      /' "$TMP/lane-candidates.txt" >&2
+            say_err "   Re-run the rail unchanged with it exported. This repairs a NAME — it is"
+            say_err "   not a bypass, and it is not what AGENT_ADMIN_MERGE_OVERRIDE=1 is for."
+          fi
+        fi
       else
         say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY, and the"
         say_err "   PR's lane did NOT EXECUTE $(lane_count "$TMP/lane-missing.txt") test shard(s) that main's lane executes."
@@ -8710,6 +9103,18 @@ $attribution_line"
         say_err "   Remedy: run the FULL lane for this head (the shards above are what main"
         say_err "   measures), then re-run the rail. If this lane's test shards are not named"
         say_err "   '${LANE_JOB_PREFIX}*', set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use."
+        # #2842: the OTHER shape of the same defect — main's family matched, this
+        # head's did not. Then the useful names are the PR's, and naming only the knob
+        # leaves the operator to guess the value against a CASE-SENSITIVE match.
+        if [ "$(lane_count "$TMP/lane-pr.txt")" -eq 0 ]; then
+          lane_prefix_candidates "$TMP/lane-pr-alljobs.txt" "$TMP/lane-candidates.txt"
+          if [ -s "$TMP/lane-candidates.txt" ]; then
+            say_err "   This head's lane EXECUTED job name(s) the family '${LANE_JOB_PREFIX}*' does not"
+            say_err "   match (a PREFIX match, and CASE-SENSITIVE: 'unit' does NOT select"
+            say_err "   'Unit tests'). The retry value(s), for the name that is the TEST shard:"
+            sed 's/^/      /' "$TMP/lane-candidates.txt" >&2
+          fi
+        fi
         say_err "   If this repo's PR lane CANNOT run them by design (a trigger-split repo,"
         say_err "   see #1349), the audited route is AGENT_ADMIN_MERGE_OVERRIDE=1, which is"
         say_err "   logged as admin_merge_override."

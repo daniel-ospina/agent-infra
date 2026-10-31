@@ -156,16 +156,68 @@ case "${1:-}" in
   surface)
     [ "${CMUX_HOST:-0}" = "1" ] || { echo 'cmux: unknown resource scope "surface"' >&2; exit 1; }
     if [ "${2:-}" = "ls" ]; then exit 0; fi
-    if [ "${2:-}" = "new-terminal" ]; then printf 'surface:term_host42\n'; exit 0; fi
+    if [ "${2:-}" = "new-terminal" ]; then
+      # ⛔ `--machine` IS MANDATORY IN THE CURRENT CLI, AND ITS ABSENCE IS WHAT LOST EVERY SPAWN
+      # (`Error: surface new-terminal: --machine <id|local> is required`, measured 2026-10-29 — six
+      # refusals in one pass while the controller read healthy). A stub that answers regardless of
+      # argv is a PERMISSIVE stub, and a permissive stub is exactly why the default in
+      # worker-terminal.sh had no assertion: the old "add the flag only when WT_MACHINE is set" shape
+      # satisfied every arm here. Modelled faithfully, so the default is EXECUTED — and so a revert
+      # reproduces the OUTAGE (refusal, no record) instead of merely a missing word.
+      _mt=""; shift 2
+      while [ "$#" -gt 0 ]; do
+        case "${1:-}" in
+          --machine) _mt="${2:-}"; shift ;;
+          --) break ;;
+        esac
+        shift
+      done
+      [ -n "$_mt" ] || { echo 'Error: surface new-terminal: --machine <id|local> is required' >&2; exit 1; }
+      printf 'surface:term_host42\n'; exit 0
+    fi
     ;;
   layout)
-    [ "${CMUX_LAYOUT_RC:-0}" = "0" ] || { echo "cmux: layout apply failed" >&2; exit "${CMUX_LAYOUT_RC}"; }
+    # ⛔ FAIL-ONCE, and WITH A CHOSEN MESSAGE (agent-infra#2404). The measured refusal carried the
+    # daemon's own JSON (`"reason":"database or disk is full"`); an arm that can only make the create
+    # fail cannot drive the message this change exists to stop relaying.
+    if [ -n "${CMUX_LAYOUT_FAIL_ONCE:-}" ]; then
+      if [ -f "$CMUX_LAYOUT_FAIL_ONCE" ]; then rm -f "$CMUX_LAYOUT_FAIL_ONCE"; else : > "$CMUX_LAYOUT_FAIL_ONCE"; printf '%s\n' "${CMUX_LAYOUT_MSG:-cmux: layout apply failed}" >&2; exit "${CMUX_LAYOUT_RC:-1}"; fi
+    fi
+    [ "${CMUX_LAYOUT_RC:-0}" = "0" ] || { printf '%s\n' "${CMUX_LAYOUT_MSG:-cmux: layout apply failed}" >&2; exit "${CMUX_LAYOUT_RC}"; }
     cat >/dev/null 2>&1 || true          # the layout document arrives on stdin
     if [ "${CMUX_NO_ID:-0}" = "1" ]; then printf '{"warnings": []}\n'; exit 0; fi
     # a workspace with NO terminal id: the create half-succeeded, so the refusal must undo it
     if [ "${CMUX_NO_ID_WS:-0}" = "1" ]; then printf '{"workspace_id": "ws_half9"}\n'; exit 0; fi
     printf '{"workspace_id": "ws_%s", "panes": [{"surfaces": [{"terminal_id": "term_%s"}]}]}\n' \
       "${CMUX_WS_SUFFIX:-x}" "${CMUX_WS_SUFFIX:-x}"
+    ;;
+  server)
+    # ⛔ THE GUEST CLI'S `server` VERBS — and the macOS host CLI's ABSENCE of them, which is the other
+    # half of the contract: `cmux server --help` answers `Error: Unknown command 'server'` on this
+    # controller (measured 2026-10-28), so a probe that treated that as "the session is down" would
+    # name an outage on every Mac spawn that failed for any reason.
+    [ "${CMUX_SERVER_UNSUPPORTED:-0}" = "1" ] && { echo "Error: Unknown command 'server'. Run 'cmux --help' for the full command list." >&2; exit 1; }
+    case "${2:-}" in
+      status)
+        [ -n "${CMUX_SERVER_STATUS:-}" ] || { echo "cannot connect to the local server" >&2; exit 1; }
+        printf '%s\n' "$CMUX_SERVER_STATUS"; exit "${CMUX_SERVER_STATUS_RC:-0}" ;;
+      ensure)
+        printf '%s\n' "ENSURE $*" >> "${CMUX_ENSURE_LOG:-/dev/null}"
+        # ⛔ THE REAL CLI ANSWERS ON STDOUT — `status started` (measured on cell-4, the PR's own
+        # artifact). A stub that printed NOTHING made the command-substitution defect at
+        # `worker-terminal.sh`'s `_ensclaim` invisible: the substitution yielded an EMPTY string instead
+        # of the real answer, so the mangled evidence line looked merely terse rather than self-
+        # contradictory (review #3031 round 7, finding P1). Faithful stdout is what makes R2's new
+        # "it does not relay the CLI's answer as its own claim" arm discriminating.
+        # FAIL-ONCE models the measured flake on cell-3: `ensure` failed once and succeeded on retry.
+        if [ -n "${CMUX_ENSURE_FAIL_ONCE:-}" ]; then
+          if [ -f "$CMUX_ENSURE_FAIL_ONCE" ]; then rm -f "$CMUX_ENSURE_FAIL_ONCE"; else : > "$CMUX_ENSURE_FAIL_ONCE"; echo 'the detached session owner did not become ready' >&2; exit 1; fi
+        fi
+        if [ "${CMUX_ENSURE_RC:-0}" = "0" ]; then printf '%s\n' "${CMUX_ENSURE_SAY:-status started}"; exit 0; fi
+        echo "the detached session owner did not become ready" >&2
+        exit "${CMUX_ENSURE_RC:-0}" ;;
+      *) exit 0 ;;
+    esac
     ;;
   terminal)
     [ "${2:-}" = "close" ] && printf '%s\n' "${3:-}" >> "${CMUX_CLOSED:-/dev/null}"
@@ -427,6 +479,21 @@ ck "…that carries the caller's command verbatim" $rc
 ck "the env snapshot (the keys the terminal does NOT inherit) is written 0600" $rc
 grep -q '^export O=' "$TMP/O1/state/env-lane-7.sh" && rc=0 || rc=1
 ck "…and it carries O, which a durable terminal would otherwise lose" $rc
+# THE uv PIN IS IN THE SNAPSHOT (agent-infra#2159). A lane is the process that runs `uv sync`, so this
+# snapshot is the ONE delivery point that reaches every worker on every platform — the controller's
+# `export -p` alone leaves a box that never pinned its cache at the filesystem's mercy (measured: a
+# cold-cache cell MATERIALISED ~5.8 GB per worktree and went 17 GB free -> 257 MB in ~50 minutes).
+grep -q '^export UV_CACHE_DIR=' "$TMP/O1/state/env-lane-7.sh" && grep -q '^export UV_LINK_MODE=' "$TMP/O1/state/env-lane-7.sh" && rc=0 || rc=1
+ck "…and the uv cache + link-mode pin, so the lane's venv is hardlinked rather than a full copy (#2159)" $rc
+# …and the DEFAULT is what a box that never pinned it gets: with both variables unset in the caller's
+# environment the snapshot must still carry the repo's values. Without this case the line above passes
+# on any box whose shell profile happens to set them (this box's own does), proving nothing.
+rm -rf "$TMP/O4"
+# XDG_CACHE_HOME is unset TOO: on a host that sets it the snapshot would be $XDG_CACHE_HOME/uv and the
+# case would red for a reason that has nothing to do with the pin (hermetic-or-nothing).
+env -u UV_CACHE_DIR -u UV_LINK_MODE -u XDG_CACHE_HOME bash "$TMP/b1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O4" "$TMP/cmux4.log" >/dev/null 2>&1
+grep -q "^export UV_LINK_MODE='hardlink'$" "$TMP/O4/state/env-lane-7.sh" && grep -q "^export UV_CACHE_DIR='.*\.cache/uv'$" "$TMP/O4/state/env-lane-7.sh" && rc=0 || rc=1
+ck "…and with both UNSET in the caller it emits the repo DEFAULTS (the pin is not left to a profile)" $rc
 # A failed create must NOT look like a worker: no record, no run script, non-zero rc.
 rm -rf "$TMP/O2"; CMUX_LAYOUT_RC=1 bash "$TMP/b1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2" "$TMP/cmux2.log" >"$TMP/b2.out" 2>&1
 grep -q 'rc=1' "$TMP/b2.out" && [ ! -f "$TMP/O2/state/worker-lane-7" ] && rc=0 || { rc=1; cat "$TMP/b2.out"; }
@@ -656,15 +723,18 @@ envout="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-plain" XDG_CONFIG_HOME="$TMP
 case "$envout" in *"XDG=[unset] GHCD=[unset]"*) rc=0 ;; *) rc=1; echo "      $envout";; esac
 ck "…and a DEFAULT-config probe UNSETS both, so an inherited config dir cannot repoint the worker's gh" $rc
 # ⛔ A `keys.env` THAT FAILS TO SOURCE IS FATAL (review finding): `wt_runfile` already dies (`|| exit
-# 98`), and the tmux arm must agree — otherwise a failed source silently drops the token assignment
-# and runs a credential-less lane on a spawn that returned 0 and wrote its record.
+# 94`), and the tmux arm must agree — otherwise a failed source silently drops the token assignment
+# and runs a credential-less lane on a spawn that returned 0 and wrote its record. ⛔ 94, NOT 98
+# (review finding): this comment said 98, which was the code BEFORE the env-file arms got their own
+# code — a `keys.env` fault was never a gh-credential fault, and the stale number is exactly the
+# conflation that renumbering removed.
 rm -rf "$TMP/home-badkeys" "$TMP/O4t"; gh_hosts_fixture "$TMP/home-badkeys"
 printf 'GH_TOKEN=ghp_ok\nBADLINE ( (\n' > "$TMP/home-badkeys/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t" "$TMP/home-badkeys" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 env -i PATH=/usr/bin:/bin "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
-[ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
-ck "a keys.env that fails to source EXITS 98 (the worker's own shell dies before it runs the command)" $rc
+[ "$rcs" = "94" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
+ck "a keys.env that fails to source EXITS 94, an ENV-FILE fault not a credential one (the worker's own shell dies before it runs the command)" $rc
 # ⛔ THAT GUARD IS NOW ENFORCED BEFORE ANY SESSION EXISTS (P1 review finding, 2026-10-23, MEASURED).
 # This note used to say only that `tmux new-session -d` returns 0 as soon as the session object exists,
 # so a worker that exits 98 in its first millisecond is still recorded as started — true, and filed as
@@ -736,8 +806,8 @@ printf 'GH_TOKEN=ghp_ok\nexit 0\n' > "$TMP/home-exit/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t1x" "$TMP/home-exit" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-exit" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"; rcs=$?
-[ "$reach" = "" ] && [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
-ck "a keys.env with a top-level 'exit 0' exits 98 (the file terminated its shell, so the token check never ran)" $rc
+[ "$reach" = "" ] && [ "$rcs" = "94" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
+ck "a keys.env with a top-level 'exit 0' exits 94 (the file terminated its shell, so the token check never ran)" $rc
 # ⛔ …AND A FILE THAT PARSES BUT ABORTS **BEFORE** THE TOKEN IS STILL FATAL (the other half, measured):
 # `return 1` is legal in a sourced file and `sh -n` accepts it, so a syntax pre-check alone would let the
 # source stop before the token assignment and run the worker credential-less on an rc=0 spawn. The guard
@@ -748,9 +818,14 @@ rm -rf "$TMP/home-return" "$TMP/O4t3"; mkdir -p "$TMP/home-return"
 printf 'FOO=1\nreturn 1\nGH_TOKEN=ghp_ok\n' > "$TMP/home-return/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t3" "$TMP/home-return" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
-[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
-ck "a keys.env that aborts BEFORE the token exits 98 (a parse check alone would have run it)" $rc
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"; rcs=$?
+# ⛔ THE CODE IS PINNED, NOT JUST THE REFUSAL (review finding, 2026-10-31): this arm used to assert only
+# that the prefix refused, so it stayed green whatever code was emitted — and the 98 message was free to
+# deny this very shape ("a 98 never means a bad keys.env") with nothing to contradict it. The sentinel
+# still sees a `return 1` source succeed, so this file is NOT a 94; the credential guard fires and
+# answers 98, which is the fact the refusal text must state rather than deny.
+[ "$reach" = "" ] && [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
+ck "a keys.env that aborts BEFORE the token exits 98 — an ENV-FILE fault in the gh bucket, so 98 must not claim gh-only" $rc
 # …and the same abort AFTER the token has been exported is NOT fatal — the environment holds the
 # credential the worker needs, which is the question the guard is asking.
 rm -rf "$TMP/home-return2" "$TMP/O4t4"; mkdir -p "$TMP/home-return2"
@@ -935,13 +1010,123 @@ rm -rf "$TMP/home-guard" "$TMP/O4t9"; gh_hosts_fixture "$TMP/home-guard"
 printf 'EXTRA=1\n' > "$TMP/home-guard/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t9" "$TMP/home-guard" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-case "$pfx" in *"*) false || exit 98"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *) rc=1 ;; esac
+case "$pfx" in *"*) false; exit 97"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *) rc=1 ;; esac
 ck "…the guard never credits a file the worker's own gh could not spend (no gh => REFUSED, not blessed)" $rc
 if command -v perl >/dev/null 2>&1; then
-  case "$pfx" in *"perl -e 'alarm 10; exec @ARGV' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
+  # ⛔ THE `; exit 93` IS PART OF THE PIN (#3138 review): perl's failed `exec` returns FALSE and the
+  # one-liner ends with status 0, so without it the guard BLESSES a worker whose gh could not be run —
+  # the fail-open direction. The bound and the absolute path are pinned here; the fail-closed tail is
+  # pinned by the same string.
+  case "$pfx" in *"perl -e 'alarm 10; exec @ARGV; exit 93' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
   ck "…and its gh call is BOUNDED and ABSOLUTE (a hung gh would freeze the controller's whole cycle)" $rc
   case "$pfx" in *"|| gh auth token"*|*"|gh auth token"*) rc=1 ;; *) rc=0 ;; esac
   ck "…and no bare gh lookup survives in the guard (it is the build-time absolute path)" $rc
+fi
+# ── THE GUARD NAMES WHICH FAULT IT HIT (#3138) ──────────────────────────────────
+# ⛔ WHAT THIS PINS, AND WHY THE POLARITY MATTERS. `exit 98` used to mean BOTH "no credential" and "the
+# local read had not finished when the alarm fired". The second is not a credential fault at all — it is
+# a probe that could not answer — and on 2026-10-30 the conflation is what read as `the credential
+# contract FAILS (rc=98)` for a credential that was present, on a controller that had diagnosed the PR
+# queue correctly: the mac's review worker was REFUSED every cycle and agent-infra merged 0 PRs for 9 h.
+# The two arms below are the DISCRIMINATION: the same absent-credential fixture, the only difference
+# being the exit status gh itself produced.
+if command -v perl >/dev/null 2>&1; then
+  # (a) THE PROBE COULD NOT ANSWER — SIGALRM is what perl's `alarm` raises on the exec'd child, and the
+  # stub reproduces exactly that status, so the mapping (and not just the string) is pinned.
+  rm -rf "$TMP/bin-alarm" "$TMP/home-alarm" "$TMP/O4alarm"; mkdir -p "$TMP/bin-alarm"; gh_hosts_fixture "$TMP/home-alarm"
+  printf '#!/usr/bin/env bash\nkill -ALRM $$ 2>/dev/null || exit 142\nsleep 5\n' > "$TMP/bin-alarm/gh"
+  chmod +x "$TMP/bin-alarm/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-alarm/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-alarm" "$TMP/O4alarm" "$TMP/home-alarm" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-alarm:/usr/bin:/bin" HOME="$TMP/home-alarm" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "96" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 96: the PROBE could not answer)"; }
+  ck "…a PROBE that could not answer in time exits 96 (a TIMING fault, not an absent credential)" $rc
+  # (b) THE CREDENTIAL IS ABSENT — gh ran and answered with nothing. Same fixture, different status.
+  rm -rf "$TMP/bin-notoken" "$TMP/home-notoken" "$TMP/O4notoken"; mkdir -p "$TMP/bin-notoken"; gh_hosts_fixture "$TMP/home-notoken"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin-notoken/gh"
+  chmod +x "$TMP/bin-notoken/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-notoken/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-notoken" "$TMP/O4notoken" "$TMP/home-notoken" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-notoken:/usr/bin:/bin" HOME="$TMP/home-notoken" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 98: credential absent)"; }
+  ck "…and a credential that is ABSENT/UNREADABLE still exits 98 (the fail-closed direction, unchanged)" $rc
+  # (c) THE REFUSAL TEXT CARRIES THE REMEDY, NOT JUST THE NUMBER. Asserted at the SOURCE because producing
+  # a real `wt_spawn` refusal for each arm costs a tmux surface; the decoder is a pure `case` on $pre_rc.
+  grep -qF 'the credential PROBE could not answer in time' "$LIB" \
+    && grep -qF 'the GH CREDENTIAL is absent or unreadable' "$LIB" \
+    && grep -qF 'an ENVIRONMENT FILE the launch line sources is unreadable' "$LIB" \
+    && grep -qF 'the MODEL credential is blank in the worker (rc=95' "$LIB" \
+    && grep -qF 'the credential read NEVER RAN or was KILLED' "$LIB" \
+    && grep -qF 'the launch-line PRE-CHECK could not finish' "$LIB" \
+    && grep -qF 'NO gh BINARY could be resolved' "$LIB" && rc=0 || rc=1
+  ck "…and the refusal text distinguishes them with a remedy each (probe-timing vs the credential arms)" $rc
+  # (d) THE OTHER ARMS GET THEIR OWN CODES TOO, so a `keys.env` that will not parse cannot be reported
+  # as an absent gh credential — the opposite conflation, and the one review caught. ⛔ THE CODES ARE
+  # PINNED, NOT JUST THE MESSAGE TEXT (review finding, 2026-10-30): the first version grepped prose that
+  # is emitted regardless of the status, so reverting `exit 95` to `exit 98` — the exact P1 it was
+  # supposed to guard — left the suite at 299/0.
+  # ⛔ EACH ENV-FILE ARM SEPARATELY (review finding, 2026-10-30): a single `grep -q 'exit 94; if
+  # command -v bash'` is satisfied by the `pi-keys.env` arm ALONE, so reverting the `keys.env` arm to 98
+  # — the exact mis-attribution this arm was written for, restored on the other half — stayed green.
+  # The count is pinned at 2 so a revert of EITHER arm reddens.
+  # ⛔ LITERALS, NOT SUBSTRINGS (review finding, 2026-10-30): `grep -q 'exit 93'` is satisfied by the
+  # COMMENT above the guard and by the SIBLING arm, so deleting the real emitter `93) exit 93` or the
+  # `_guard="false; exit 93"` arm left the suite at 300/0 while a non-executable gh was reported as
+  # "the GH CREDENTIAL is absent" and a box with no `perl` got the same wrong remedy. Each emission is
+  # now pinned by the comment-free literal around it.
+  _94n="$(grep -c 'exit 94; if command -v bash' "$LIB")"
+  [ "$_94n" = "2" ] && grep -qF '126|127|13[0-9]|14[0-9]|15[0-9]) exit 93 ;; *) exit 98' "$LIB" \
+    && grep -qF '_guard="false; exit 93"' "$LIB" && grep -qF 'exec @ARGV; exit 93' "$LIB" \
+    && grep -qF 'this lane could not authenticate a single model call" >&2; exit 95 ;; esac' "$LIB" \
+    && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
+  ck "…and BOTH env-file arms emit 94 (count: $_94n) and the 93/95/98 EMISSIONS are pinned literally" $rc
+  # ⛔ THE FAULT MUST NAME THE **DEFECT**, NOT AN UNRELATED PR (review finding, 2026-10-31): the 96 remedy
+  # cited `agent-infra#3099`, which is a MERGED PR about the shard list — so an operator who hit this
+  # timing fault was sent to an issue that cannot explain it, which is the dead-end diagnosis this very
+  # change exists to remove, one level up. #3138 is the defect. Pinned in BOTH directions: the right
+  # number must be present AND the wrong one must be gone, because a later edit that copies an old
+  # comment would otherwise reinstate it silently.
+  grep -qF 'agent-infra#3138' "$LIB" && ! grep -qF '#3099' "$LIB" && rc=0 || rc=1
+  ck "…and the 96 remedy cites the DEFECT (#3138), never the unrelated shard PR (#3099)" $rc
+  # ⛔ NO DECODED MESSAGE MAY DENY A FAULT IT CAN ACTUALLY REPORT (review finding, 2026-10-31): two
+  # claims contradicted the code they sit next to — the 98 text said "a 98 never means a bad keys.env"
+  # while the `home-return` arm above produces exactly that, and the guard's own contract still said "no
+  # gh at all → exits 98" twelve lines above the `_guard="false; exit 97"` that emits 97. A maintainer
+  # trusting either one would delete the 97 arm (and this suite's 97 arm) as dead code and restore the
+  # bucketing this change removes. Pinned in both directions, like the #3138 pin.
+  ! grep -qF 'a 98 never means a bad keys.env' "$LIB" \
+    && grep -qF 'fires BEFORE its token line also lands here' "$LIB" \
+    && ! grep -qF 'so with no gh at all the fallthrough exits' "$LIB" \
+    && grep -qF 'IT IS **NOT** 98' "$LIB" && rc=0 || rc=1
+  ck "…and no refusal text DENIES a fault it can report (98 is not gh-only; no gh at all is 97, not 98)" $rc
+  # ⛔ AND 93 IS PROVEN BEHAVIOURALLY, which no grep can do: build the launch line with a resolvable
+  # gh, then make that gh NON-EXECUTABLE before the pane runs it. perl's failed `exec` returns FALSE and
+  # ends the one-liner with status 0 — so without the `; exit 93` tail this arm sees rc=0, i.e. a BLESSED
+  # worker with no credential, which is the fail-open direction the guard exists to close.
+  rm -rf "$TMP/bin-noexec" "$TMP/home-noexec" "$TMP/O4noexec"; mkdir -p "$TMP/bin-noexec"; gh_hosts_fixture "$TMP/home-noexec"
+  printf '#!/usr/bin/env bash\nprintf %%s\\n gho_never_used\n' > "$TMP/bin-noexec/gh"
+  chmod +x "$TMP/bin-noexec/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-noexec/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-noexec" "$TMP/O4noexec" "$TMP/home-noexec" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  chmod -x "$TMP/bin-noexec/gh"
+  env -i PATH="$TMP/bin-noexec:/usr/bin:/bin" HOME="$TMP/home-noexec" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "93" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 93: the resolved gh could not be executed)"; }
+  ck "…and a gh that cannot be EXECUTED at pane time exits 93 — never 0 (perl's failed exec would bless)" $rc
+  # 97 HAD NO COVERAGE AT ALL: the only line that looked like a pin was unreachable (`bin-absent` still
+  # resolves a gh). Driven with a PATH carrying NO gh, the way `bin-storenogh` drives the spawn arm.
+  rm -rf "$TMP/bin-nogharm" "$TMP/home-nogharm" "$TMP/O4nogharm"; mkdir -p "$TMP/bin-nogharm"; gh_hosts_fixture "$TMP/home-nogharm"
+  for _u in bash env grep mkdir date rm sed cat perl; do
+    _p="$(command -v "$_u" 2>/dev/null)" && ln -sf "$_p" "$TMP/bin-nogharm/$_u"
+  done
+  printf 'EXTRA=1\n' > "$TMP/home-nogharm/keys.env"
+  out="$(env -i PATH="$TMP/bin-nogharm" bash "$TMP/c8.sh" "$LIB" "$TMP/bin-nogharm" "$TMP/O4nogharm" "$TMP/home-nogharm" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-nogharm" HOME="$TMP/home-nogharm" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "97" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 97: no gh anywhere on this box)"; }
+  ck "…and a box with NO gh anywhere exits 97 (its own code — the 98 remedy sends you after a credential that is not the fault)" $rc
 fi
 # ⛔ AND THE GATE-SIDE PROBE IS BOUNDED TOO (recorded rule, README §"Two platform rules …": a plain
 # `gh auth token` can hang for the life of the shell, rc=142 measured — and `wt_spawn` runs on the
@@ -952,7 +1137,11 @@ fi
 # module, so it cannot call the helper. Anything with NEITHER is an unbounded probe, which is the
 # defect. The helper is then separately pinned: a name without the alarm would be a gate that reads
 # correct and enforces nothing.
-n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -vc 'alarm')"
+# ⛔ A MESSAGE IS NOT A CALL SITE (#3138). The refusal text now names `gh auth token` when it explains
+# which fault it hit, and that string must not be read as an unbounded probe — the predicate is about
+# INVOCATIONS. So the operator-facing message lines (`pre_fault=` / `wt_warn`) are excluded; every line
+# that can actually EXECUTE the read must still arrive through `wt_bounded` or the pane's own `alarm`.
+n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -vE '^[0-9]+:[[:space:]]+9[0-9]\) pre_fault=' | grep -vc 'alarm')"
 [ "$n_unbounded" = "0" ] && rc=0 || rc=1
 ck "every non-comment 'gh auth token' in the library is BOUNDED (through the helper, or the pane's own alarm)" $rc
 awk '/^wt_bounded\(\) \{/,/^}/' "$LIB" | grep -q "alarm shift; exec @ARGV" && rc=0 || rc=1
@@ -1330,6 +1519,27 @@ grep -q 'CMUX surface new-terminal --machine vm-abc --cwd /tmp --no-open -- /bin
 ck "…and spawns with the named primitive: --machine/--cwd/--no-open and the run script" $rc
 grep -qx 'grammar=surface' "$TMP/O8/state/worker-merge-5" && rc=0 || rc=1
 ck "…recording which grammar produced it" $rc
+
+# ⛔ THE DEFAULT IS THE WHOLE FIX, SO IT MUST BE EXECUTED BY SOMETHING (#2210). Before this arm,
+# every `grammar=surface` scenario set WT_MACHINE EXPLICITLY (G and I above), so the defaulted value
+# was dead code to the suite: restore `if [ -n "${WT_MACHINE:-}" ]` and every assertion still passed.
+# Driven with WT_MACHINE UNSET — precisely the box state that lost all six spawns — and against a
+# stub that now REFUSES the flag's absence, so the failure mode is the outage itself.
+cat > "$TMP/g1b.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_HOST=1 CMUX_LOG="$4"
+unset WT_MACHINE
+. "$1"
+wt_spawn "merge-5" "/tmp" 'bash /tmp/merge-one.sh --argv /tmp/a'; echo "rc=$?"
+SH
+out="$(bash "$TMP/g1b.sh" "$LIB" "$TMP/bin-host" "$TMP/O8b" "$TMP/cmux8b.log" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an UNSET WT_MACHINE still spawns (the current CLI refuses the flag's absence)" $rc
+grep -q 'CMUX surface new-terminal --machine local --cwd /tmp --no-open -- /bin/bash .*run-merge-5.sh' "$TMP/cmux8b.log" && rc=0 || rc=1
+ck "…and the default target is \`local\` — the machine this process runs on" $rc
+[ -f "$TMP/O8b/state/worker-merge-5" ] && rc=0 || rc=1
+ck "…and the worker is RECORDED, so it can be reaped (the outage left nothing to track)" $rc
 
 echo
 echo "── I) a surface-grammar worker is TRACKED BY ITS TERMINAL ID (it has no workspace name) ──"
@@ -2250,6 +2460,265 @@ else
     ck "parse DECLARED BLIND: no 3.x /bin/bash and no docker — the legs cannot see the macOS 3.2 parse class" 0
   fi
 fi
+
+echo
+echo "── R) a create refusal carries the READINGS it took, and recovers the SESSION once (#2404) ──"
+# ⛔ THE MEASURED DEFECT THIS SECTION PINS (cell-3, 2026-11-02, agent-infra#2404). Every spawn was
+# refused with `workspace create failed: {"reason":"database or disk is full"}` on a box whose `/` had
+# 28 G free, whose inodes were 25 % used and whose `~/.cmux` was 37 M. The daemon named a cause it had
+# not checked, the refusal RELAYED IT AS THE REASON, and the reader was sent to `df` while a
+# three-day-old durable session owner stayed unable to allocate a workspace. So: a refusal must carry
+# the readings, must not present the daemon's message as the cause, and — where the reading says the
+# SESSION is the finding — must try the one idempotent recovery once before giving up.
+scenario shortdf
+cat > "$TMP/bin-shortdf/df" <<'SH'
+#!/usr/bin/env bash
+# A volume AT/BELOW the floor: 1000 KB free, and 5 % inodes so only the SPACE arm can fire.
+case "$*" in
+  *"-Pi"*|*" -i"*) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/x 100 100 10 1%% 5 95 5%% /\n' ;;
+  *) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 4000000 3999000 1000 99%% /\n' ;;
+esac
+SH
+chmod +x "$TMP/bin-shortdf/df"
+# ⛔ THE HEALTHY-VOLUME FIXTURE IS A READING TOO, AND IT MUST COME FROM THE FIXTURE (review round 1,
+# finding 3). R1/R2/R4/R5/R6/R7 pin WT_CMUX_STATE_DIR at a fixture, but only `shortdf` carried a `df`
+# STUB — so every "healthy volume" arm read the RUNNER'S OWN volume against the DEFAULT floors (1024 MB /
+# 95 %). A runner with <1 GB free in $TMP (or ≥95 % inodes) made WT_PROBE_SHORT=1, flipped the verdict to
+# `space`, and reddened a CORRECT tree: the arms were a function of CI's disk, not of their fixtures.
+# 4 GB free / 12 % inodes — unambiguously above both floors, on both the -Pk and -Pi shapes.
+scenario okdf
+cat > "$TMP/bin-okdf/df" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"-Pi"*|*" -i"*) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/x 8000000 1000000 7000000 12%% 1000 9000 12%% /\n' ;;
+  *) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 8000000 3819776 4194304 12%% /\n' ;;
+esac
+SH
+chmod +x "$TMP/bin-okdf/df"
+# The driver: the SHIPPED library, one spawn, the state dir pinned at a fixture so `df`/`du` ALWAYS
+# answer (an unpinned run reads the box's own $HOME and reports UNREADABLE, which would make the
+# measured-value assertions vacuous on a runner that has no ~/.cmux).
+cat > "$TMP/r1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR" "$5"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+export WT_CMUX_STATE_DIR="$5" WT_CMUX_SESSION=cloud WT_SERVER_ENSURE_SLEEP=0
+. "$1"
+wt_spawn "lane-8" "$5" 'printf RAN_OK'; echo "rc=$?"
+SH
+DISKFULL='workspace create failed: {"code":"operation.failed","details":{"operation":"resource.runtime","reason":"database or disk is full"},"message":"database or disk is full"}'
+# (R1) the cell-3 reading itself: volume healthy, owner ANSWERED `status running`, ensure did not help.
+rm -rf "$TMP/OR1" "$TMP/rstate1"; : > "$TMP/ensure1.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure1.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR1" "$TMP/cmuxr1.log" "$TMP/rstate1" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: a create refused on a healthy box still refuses (the spawn is not silently retried into success)" $rc
+case "$out" in *"FALSE CAUSE"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …and the refusal names the daemon's \`database or disk is full\` a FALSE CAUSE, because the volume was measured" $rc
+case "$out" in *"MEASURED on this box"*"free="*"inodes="*"state="*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …carrying the readings it took (free, inodes, state size) rather than a bare claim" $rc
+case "$out" in *"server status=status running"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …including the session owner's own answer, which is what the incident's table reported" $rc
+case "$out" in *"which this probe did NOT verify as the cause: workspace create failed"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …and the daemon's message is LABELLED a claim, not passed off as the reason" $rc
+[ "$(grep -c '^ENSURE server ensure --session cloud' "$TMP/ensure1.log" 2>/dev/null)" = "2" ] && rc=0 || { rc=1; cat "$TMP/ensure1.log"; }
+ck "R1: the recovery ran \`cmux server ensure --session cloud\` TWICE (the measured fail-once flake)" $rc
+case "$out" in *"tried 2 time(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1: …and the refusal states how many recovery attempts were spent, so the residual is on the record" $rc
+grep -q '^lane-8	' "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null && rc=0 || rc=1
+ck "R1: …and the refusal still reaches the controller's refusal record, under the WORKER's name" $rc
+# ⛔ THE VERDICT MUST SURVIVE THE RECORD'S 240-CHAR CUT (review #3031 round 6, finding F3).
+# `wt_refusal_record` bounds every reason (`cut -c1-240`) so a refusal storm cannot fill the volume, and
+# the MEASURED line alone can spend most of that on `server status=` — so with the READING last, the
+# verdict this change exists to deliver was truncated OUT of the row the controller folds into its
+# `[pr]`/`[dispatch]` lines (measured: the row ended `… retry; READI`, with `FALSE CAUSE` gone). A row
+# that merely EXISTS is not the property; the VERDICT being in it is.
+case "$(cat "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null)" in
+  *"verdict=owner-running"*) rc=0 ;;
+  *) rc=1; cut -c1-240 "$TMP/OR1/state/spawn-refused.tsv" 2>/dev/null ;;
+esac
+ck "R1c: …and the RECORDED reason carries the verdict itself, not only a row that survived the 240-char cut" $rc
+# (R1b) THE RETRY BOUND IS A KNOB, NOT A WORD IN A DOC (review round 3, finding 2). The operator doc
+# claimed the ensure runs "once"; the code runs it up to WT_SERVER_ENSURE_ATTEMPTS (default 2), and the
+# doc now says so. An implementation that had quietly hardcoded ONE attempt would still satisfy R1 —
+# the default happens to be 2 — while silently ignoring the knob. So this arm sets 3 and demands 3.
+rm -rf "$TMP/OR1b" "$TMP/rstate1b"; : > "$TMP/ensure1b.log"
+out="$(WT_SERVER_ENSURE_ATTEMPTS=3 CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure1b.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR1b" "$TMP/cmuxr1b.log" "$TMP/rstate1b" 2>&1)"
+[ "$(grep -c '^ENSURE server ensure --session cloud' "$TMP/ensure1b.log" 2>/dev/null)" = "3" ] && rc=0 || { rc=1; cat "$TMP/ensure1b.log"; }
+ck "R1b: the ensure retry bound is the KNOB (WT_SERVER_ENSURE_ATTEMPTS=3 → 3 attempts), not a hardcoded once" $rc
+case "$out" in *"tried 3 time(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R1b: …and the refusal's own spent-attempt count matches the calls actually made" $rc
+# (R2) THE RECOVERY MUST EARN ITS PLACE: ensure answers on the retry, the re-attempted create succeeds.
+rm -rf "$TMP/OR2" "$TMP/rstate2"; : > "$TMP/ensure2.log"
+out="$(CMUX_LAYOUT_FAIL_ONCE="$TMP/r2.fail" CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure2.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR2" "$TMP/cmuxr2.log" "$TMP/rstate2" 2>&1)"
+rm -f "$TMP/r2.fail"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2: when the session is the fault, ONE ensure + ONE re-attempt SAVES the spawn (rc=0, not a refusal)" $rc
+grep -qx 'kind=terminal' "$TMP/OR2/state/worker-lane-8" 2>/dev/null && rc=0 || rc=1
+ck "R2: …and the saved worker is RECORDED (a recovered spawn is a real spawn, tracked and reapable)" $rc
+case "$out" in *"RECOVERED lane-8"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2: …with the recovery SAID OUT LOUD, so the box's instability is visible in the log" $rc
+case "$out" in *"REFUSED lane-8"*) rc=1 ;; *) rc=0 ;; esac
+ck "R2: …and NO refusal recorded for a spawn that succeeded" $rc
+[ "$(grep -c 'CMUX layout apply' "$TMP/cmuxr2.log")" = "2" ] && rc=0 || { rc=1; cat "$TMP/cmuxr2.log"; }
+ck "R2: …because the create really WAS attempted twice (the recovery is exercised, not decorative)" $rc
+# ⛔ …AND THE EVIDENCE LINE IS BUILT FROM THE ENSURE IT MEASURED, NOT FROM A SECOND CALL IT RAN
+# (review #3031 round 7, finding P1). `_ensclaim`'s backticks were UNESCAPED inside a double-quoted
+# string, so the shell COMMAND-SUBSTITUTED them: one extra, UNBOUNDED `cmux server ensure` per recovered
+# spawn (bypassing `wt_bounded`), and the line reported that call's STDOUT as the ensure's answer.
+[ "$(grep -c '^ENSURE server ensure --session cloud' "$TMP/ensure2.log" 2>/dev/null)" = "1" ] && rc=0 || { rc=1; cat "$TMP/ensure2.log"; }
+ck "R2: …and the recovery makes EXACTLY ONE bounded ensure call — the evidence line does not issue a second, unbounded one" $rc
+case "$out" in *'`cmux server ensure --session cloud` answered on attempt 1'*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2: …and the RECOVERED line NAMES the command it ensured, so the claim is about a call that happened" $rc
+case "$out" in *"status started"*) rc=1; echo "      $out" ;; *) rc=0 ;; esac
+ck "R2: …and it does NOT relay the CLI's own stdout (\`status started\`) as the ensure's answer" $rc
+# (R2b) …AND IT MUST NOT BE CREDITED WITH A RECOVERY IT DID NOT MAKE (review #3031 round 6, finding F2).
+# `wt_cmux_session_ensure || true` discarded the ensure's status while the RECOVERED line said it
+# "answered on attempt N" — so a box whose ensure failed BOTH attempts but whose re-attempted create
+# succeeded (the flake this path exists for) produced evidence line asserting the opposite of what
+# happened. An arm that only ever makes `ensure` succeed cannot reach that state, so this one fails it.
+rm -rf "$TMP/OR2b" "$TMP/rstate2b"; : > "$TMP/ensure2b.log"
+out="$(CMUX_LAYOUT_FAIL_ONCE="$TMP/r2b.fail" CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure2b.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR2b" "$TMP/cmuxr2b.log" "$TMP/rstate2b" 2>&1)"
+rm -f "$TMP/r2b.fail"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2b: a create that succeeds on the re-attempt is still a SPAWN (rc=0) even when the ensure never answered" $rc
+case "$out" in *"did NOT answer (rc=1 after 2 attempt(s)"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2b: …and the RECOVERED line reports the ensure's FAILURE, with the attempts spent and its rc" $rc
+case "$out" in *"answered on attempt"*) rc=1 ;; *) rc=0 ;; esac
+ck "R2b: …and it does NOT claim the ensure 'answered' — the false half the discarded status used to print" $rc
+case "$out" in *"so the ensure did NOT clear it"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R2b: …and it names WHICH fact it has: the re-attempt carried the spawn, not the repair" $rc
+# (R3) a volume that IS short: the daemon's message is consistent, and RESTARTING A SESSION FREES NOTHING.
+rm -rf "$TMP/OR3" "$TMP/rstate3"; : > "$TMP/ensure3.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure3.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-shortdf" "$TMP/OR3" "$TMP/cmuxr3.log" "$TMP/rstate3" 2>&1)"
+case "$out" in *"IS at or below the floor"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R3: a volume MEASURED short is reported as short (the reading decides, not the daemon's wording)" $rc
+[ ! -s "$TMP/ensure3.log" ] && rc=0 || rc=1
+ck "R3: …and NO recovery is attempted on a short volume (restarting a session frees no space)" $rc
+# (R4) THE macOS HOST CLI: no `server` verb at all. That is not an outage, and must not be called one.
+rm -rf "$TMP/OR4" "$TMP/rstate4"; : > "$TMP/ensure4.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_UNSUPPORTED=1 CMUX_ENSURE_LOG="$TMP/ensure4.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR4" "$TMP/cmuxr4.log" "$TMP/rstate4" 2>&1)"
+case "$out" in *"NO \`server\` verb"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R4: a CLI with no \`server\` verb says exactly that (a missing verb is not a dead session)" $rc
+[ ! -s "$TMP/ensure4.log" ] && rc=0 || rc=1
+ck "R4: …and no ensure is attempted where the verb does not exist" $rc
+# (R5) the operator's off switch: no probe, no recovery, and NO invented readings.
+rm -rf "$TMP/OR5" "$TMP/rstate5"; : > "$TMP/ensure5.log"
+out="$(WT_SESSION_RECOVER=0 CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure5.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR5" "$TMP/cmuxr5.log" "$TMP/rstate5" 2>&1)"
+[ ! -s "$TMP/ensure5.log" ] && rc=0 || rc=1
+ck "R5: \$WT_SESSION_RECOVER=0 takes no probe and no recovery (the operator's stop switch works)" $rc
+case "$out" in *"no readings taken"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R5: …and the refusal says no reading was taken instead of printing an empty 'MEASURED' claim" $rc
+# ⛔ THE OFF SWITCH MUST NOT DESCRIBE A READ IT DID NOT ATTEMPT (review round 1, finding 2). The old text
+# said "NEITHER the session owner nor the state volume could be READ on this box" — a FAILED read, which
+# claims an attempt this branch deliberately skipped, inside the very message that exists to stop that.
+case "$out" in *"WT_SESSION_RECOVER=0"*"NO reading was taken"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R5: …and the READING states the probe was DISABLED, so no cause is asserted either way" $rc
+# ⛔ THE OFF SWITCH MUST ALSO SAY WHAT IT DID NOT DO (review round 5, finding F2): every other refusal
+# carries a `— recovery: …` clause, and this branch was the one that left the residual to be inferred
+# from silence — a reader could not tell whether a repair had been attempted at all.
+case "$out" in *"recovery: NOT attempted"*"WT_SESSION_RECOVER=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R5: …and it STATES that no recovery was attempted, instead of leaving it to be inferred from silence" $rc
+case "$out" in *"could be READ"*) rc=1 ;; *) rc=0 ;; esac
+ck "R5: …and it does NOT claim a read was attempted and failed (the false half the old arm passed over)" $rc
+# (R6) THE HAPPY PATH STAYS FREE: a create that answers must not pay for a probe or an ensure.
+rm -rf "$TMP/OR6" "$TMP/rstate6"; : > "$TMP/ensure6.log"
+out="$(CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_LOG="$TMP/ensure6.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR6" "$TMP/cmuxr6.log" "$TMP/rstate6" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R6: a spawn whose create answers succeeds as before (the probe is not on the happy path)" $rc
+[ ! -s "$TMP/ensure6.log" ] && rc=0 || rc=1
+ck "R6: …and it calls NO server verb at all (no cost, no risk on the 1,500-spawn path)" $rc
+# ⛔ HERE-STRING-FREE ON PURPOSE: `producer | grep -q` lets grep exit on first match, the producer
+# takes SIGPIPE, and under `pipefail` a MATCH then reads as a failure (#841/#864,
+# scripts/check-no-sigpipe-grep.sh). Command substitution, not a pipe.
+[ "$(grep -c '^CMUX server ' "$TMP/cmuxr6.log" 2>/dev/null)" = "0" ] && rc=0 || rc=1
+ck "R6: …verified on the CLI's own call log, not on the module's prose" $rc
+# (R7) A STOPPED OWNER IS NOT A RUNNING ONE. `case` takes the FIRST matching pattern, and `not running`
+# CONTAINS `running` — so the positive pattern first made two of the five down signatures dead code and
+# printed FALSE CAUSE for a session that had just said it was down (review round 1, finding 1). Every
+# other R arm supplied only a running-shaped `server status`, so the whole owner-down verdict was
+# untested; this arm is the one that would have caught it.
+rm -rf "$TMP/OR7" "$TMP/rstate7"; : > "$TMP/ensure7.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status not running' CMUX_SERVER_STATUS_RC=0 CMUX_ENSURE_LOG="$TMP/ensure7.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR7" "$TMP/cmuxr7.log" "$TMP/rstate7" 2>&1)"
+case "$out" in *"did NOT answer"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R7: a rc=0 \`status not running\` is read as DOWN, not swallowed by \`*running*\`" $rc
+case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
+ck "R7: …so the refusal does NOT call the daemon a FALSE CAUSE on a box whose owner said it was down" $rc
+case "$out" in *"answers \`status running\`"*) rc=1 ;; *) rc=0 ;; esac
+ck "R7: …and it does not claim the owner answered \`status running\` when it answered the opposite" $rc
+# (R8) A VERDICT IS NOT A READING (review round 4, finding F1). `fine` is derived from
+# WT_PROBE_SPACE_READ alone, so a box whose `df -Pi` yields NO `N%` column (inodes reported `-`, the
+# ZFS-shaped home) reaches `fine` with `inodes=UNREADABLE` — and the arm used to print "free space,
+# inodes and state size all measured" in the same refusal that printed `inodes=UNREADABLE` a few words
+# earlier. That is this PR's own defect class inside the sentence that exists to end it, so it gets an
+# arm: a fixture whose free space is healthy and whose inode column is ABSENT.
+scenario partdf
+cat > "$TMP/bin-partdf/df" <<'SH'
+#!/usr/bin/env bash
+# Free space healthy; the inode column reports NO percentage at all (the `-` shape), so the probe's
+# `df -Pi` awk finds no `N%` field and inodes is UNREADABLE while `fk` is a real reading.
+case "$*" in
+  *"-Pi"*|*" -i"*) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/x 8000000 1000000 7000000 12 - - - /\n' ;;
+  *) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 8000000 3819776 4194304 12%% /\n' ;;
+esac
+SH
+chmod +x "$TMP/bin-partdf/df"
+rm -rf "$TMP/OR8" "$TMP/rstate8"; : > "$TMP/ensure8.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status running, generation 22667b14-395d' CMUX_ENSURE_RC=1 CMUX_ENSURE_LOG="$TMP/ensure8.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-partdf" "$TMP/OR8" "$TMP/cmuxr8.log" "$TMP/rstate8" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8: a partly-readable volume still refuses (the fixture drives the arm, not the runner's disk)" $rc
+case "$out" in *"inodes=UNREADABLE"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8: …and the reading line prints the unmeasured inode column as UNREADABLE (not as fine)" $rc
+case "$out" in *"free space, inodes and state size all measured"*) rc=1 ;; *) rc=0 ;; esac
+ck "R8: …so the READING does NOT claim all three were measured while the line above says UNREADABLE" $rc
+case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
+ck "R8: …and it does NOT issue a FALSE-CAUSE verdict on an incomplete volume reading (inode exhaustion IS a full-disk cause)" $rc
+case "$out" in *"could NOT read inodes"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8: …but it NAMES what it could not read, so the operator knows which reading is missing" $rc
+# (R8b) THE SAME RULE ON THE ARM MOST LIKELY TO FIRE (review round 5, finding F1). R8 above exercises
+# `owner-running`; THIS one drives the identical partial volume against `owner-down` — the reading in
+# this PR's own cell-4 artifact, and the state a cell with a refused socket is in. That arm was left
+# behind by the round-4 fix and kept saying "not on the disk the daemon named" on free space alone.
+rm -rf "$TMP/OR8b" "$TMP/rstate8b"; : > "$TMP/ensure8b.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status not running' CMUX_SERVER_STATUS_RC=0 CMUX_ENSURE_LOG="$TMP/ensure8b.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-partdf" "$TMP/OR8b" "$TMP/cmuxr8b.log" "$TMP/rstate8b" 2>&1)"
+case "$out" in *"did NOT answer"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8b: a down owner on a partly-readable volume still reports the owner as DOWN" $rc
+case "$out" in *"not on the disk the daemon named"*) rc=1 ;; *) rc=0 ;; esac
+ck "R8b: …but it does NOT exonerate the disk on free space alone (inodes were UNREADABLE)" $rc
+case "$out" in *"could NOT read inodes"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R8b: …and it names the reading it does not have, so the operator is not steered past it" $rc
+[ "$(grep -c 'ENSURE ' "$TMP/ensure8b.log" 2>/dev/null)" -gt 0 ] && rc=0 || rc=1
+ck "R8b: …and the recovery still runs, because a DOWN owner IS a reading that names the session" $rc
+# (R9) NO READING, NO RETRY (review round 4, finding F2). The recovery used to be gated on the ABSENCE
+# of a disqualifier (`owner != unsupported`, `not short`), which `WT_PROBE_VERDICT=unreadable`
+# satisfies — so a daemon that did not answer within WT_SERVER_TIMEOUT, the very state this path runs
+# in, bought ensure calls plus a SECOND `cmux layout apply` on the controller's synchronous spawn path,
+# for a box the probe could not read at all. The file header and the operator doc both say the recovery
+# runs only "where the reading says the SESSION is the finding", so this arm pins the gate to the
+# VERDICT and asserts BOTH halves: nothing was ensured, and the create was attempted exactly once.
+rm -rf "$TMP/OR9" "$TMP/rstate9"; : > "$TMP/ensure9.log"; : > "$TMP/cmuxr9.log"
+out="$(CMUX_LAYOUT_RC=1 CMUX_LAYOUT_MSG="$DISKFULL" CMUX_SERVER_STATUS='status: warmup pending' CMUX_SERVER_STATUS_RC=0 CMUX_ENSURE_LOG="$TMP/ensure9.log" \
+  bash "$TMP/r1.sh" "$LIB" "$TMP/bin-okdf" "$TMP/OR9" "$TMP/cmuxr9.log" "$TMP/rstate9" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R9: an owner whose answer the classifier cannot read still refuses the spawn" $rc
+[ "$(grep -c 'ENSURE ' "$TMP/ensure9.log" 2>/dev/null)" = "0" ] && rc=0 || rc=1
+ck "R9: …and NO ensure is attempted, because no reading names the session as the finding" $rc
+[ "$(grep -c 'layout apply' "$TMP/cmuxr9.log" 2>/dev/null)" = "1" ] && rc=0 || { rc=1; cat "$TMP/cmuxr9.log"; }
+ck "R9: …and the create is attempted exactly ONCE (an undiagnosed failure is not retried on a guess)" $rc
+case "$out" in *"recovery: NOT attempted"*"could not READ the session owner"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "R9: …and the refusal SAYS so, instead of leaving the residual to be inferred from an absent line" $rc
+case "$out" in *"FALSE CAUSE"*) rc=1 ;; *) rc=0 ;; esac
+ck "R9: …and it does not call the daemon's cause false on a probe that established no cause either" $rc
 
 echo
 echo "── P) the module INITIALISES under bash 3.2 — no heredoc inside a command substitution (#2248) ──"

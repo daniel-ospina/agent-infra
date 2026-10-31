@@ -54,6 +54,17 @@
 # argument, where a `$(…)` substituion would silently supply the status of `cat` instead.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ⛔ THE CAPABILITY GATE IS DISABLED FOR THE ARMS IN THIS FILE, BY NAME AND ON PURPOSE (agent-infra#2935).
+# `run_agent` measures the box — one bounded `pi` call — immediately before every launch, and these
+# arms drive `run_agent` with a STUB `pi` that never emits the probe's answer token. With the gate live
+# here, each arm would spend up to 2 x LANE_PREFLIGHT_BOUND on a stub and then be REFUSED by a gate
+# this file is not testing, so an arm about the LOAD or DISK gate would report a capability refusal.
+# The capability gate has its own arms (`cell-lane-preflight.test.sh`, and the capability block in
+# `spawn-gate.test.sh`, which re-enables it with LANE_PREFLIGHT=1). This is the documented operator
+# escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
+# these arms go red, which is the assertion that the line is load-bearing rather than decorative.
+export LANE_PREFLIGHT=0
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));

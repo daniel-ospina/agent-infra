@@ -110,6 +110,17 @@ trap 'rm -rf "$TMP"' EXIT
 # `stand-in-shard.sh`; it is not this suite's current cost and a bound sized from it protects
 # nothing. Re-measure before quoting a number here.
 CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
+# ⛔ THE FIXTURE COPIES ARE HERMETIC: THEY MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING.
+# `stage_guard` gives each fixture root the real helper so `run-bash-shards.sh`'s fail-closed load
+# succeeds — but the copies then call `fixture_guard_placement` with the DEFAULT root set, so a
+# fixture's exit code would depend on whether the machine running this suite happens to have a
+# controller executing from a cell root. Measured on a box with 4 live controllers: 22 of 121
+# assertions failed here versus 15 with this line, and the 7 extra were all `rc 78` guard refusals —
+# i.e. the suite's verdict became host-dependent, which is what "hermetic" in this file's header
+# forbids. `${FIXTURE_LIVE_ROOTS-…}` takes an explicit empty value as "no roots" (no colon on
+# purpose), so this is exactly the seam the helper advertises for a caller like this one. The real
+# gate still runs in `run-bash-shards.sh` itself, which is not a fixture.
+FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 # cheap_runner <out-file> <one-shard-target> — a copy of the REAL runner whose DISCOVERY points at
 # exactly one cheap target. ⛔ Since agent-infra#2609 the list is DERIVED (`SUITE_GLOBS` + each
 # suite's own `# shard:` marker), so this fixture replaces that ONE data list instead of rewriting
@@ -123,6 +134,18 @@ cheap_runner() {
     { print }
   ' "$RUNNER" >"$1"
 }
+# stage_guard <fixture-root> — copy the #3011 placement-guard helper into a fixture tree.
+# ⛔ EVERY FIXTURE ROOT THAT RUNS A COPY OF THE DRIVER MUST CARRY THE GUARD HELPER. The driver sources
+# `$SHARD_ROOT/scripts/orchestrator-harness/fixture-hermetic.sh` and REFUSES (exit 2) when that load
+# fails — deliberately fail-closed, because an unloadable guard is the "enforcer that cannot fire"
+# class #3011 exists to close. A minimal fixture copies only the driver, so without this the copy is
+# refused BEFORE it exercises anything, and ~17 arms here red in BOTH lanes (measured: `rc=2`,
+# "cannot load …/fixture-hermetic.sh"). Staging the helper keeps the driver's contract intact in the
+# fixture — the alternative, weakening the refusal to a warning, reopens exactly the bypass.
+stage_guard() {
+  mkdir -p "$1/scripts/orchestrator-harness" &&
+    cp "$ROOT/scripts/orchestrator-harness/fixture-hermetic.sh" "$1/scripts/orchestrator-harness/"
+}
 # The fixture ROOT. The runner anchors discovery to the tree it LIVES in (agent-infra#2609 review:
 # `--list` used to read the script's own text and worked from any cwd, while the run path was
 # cwd-relative — one driver, two contracts). A copy therefore sits at <root>/scripts/<name> and
@@ -130,6 +153,7 @@ cheap_runner() {
 # caller's cwd. `scripts/sweepable.sh` keeps the syntax sweep non-empty (the `swept` sentinel).
 FIX="$TMP/fixture"
 mkdir -p "$FIX/scripts" "$FIX/tests/ci-lane-parity"
+stage_guard "$FIX"
 cp "$ROOT/$CHEAP" "$FIX/$CHEAP"
 printf '#!/bin/bash\n:\n' >"$FIX/scripts/sweepable.sh"
 cheap_runner "$FIX/scripts/runner-cheap.sh" "$CHEAP"
@@ -520,10 +544,23 @@ else
   $FIXTURE_BOUND bash "$FIX/scripts/runner-norecord.sh" >"$TMP/runner-norecord.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-norecord.out")"
-  if [ "$RC" -eq 1 ] && grep -qE '(failure-recording|sweep) arm is broken' <<<"$OUT"; then
-    pass "a runner that cannot record failures FAILS its own sentinel (rc 1)"
+  # ⛔ THE TWO CLAUSES ARE REPORTED SEPARATELY (#2838). This arm asserted a CONJUNCTION and then
+  # reported only the rc — so when the rc clause was the one that HELD it printed
+  # `returned rc 1 (want 1)`, a message describing a satisfied clause and never naming the grep
+  # that failed. It read as a shard outage; the actual diagnosis was "the sentinel text is absent",
+  # which has a different cause and a different fix (measured 2026-10-29: the runner's coverage
+  # guard exited 1 at `executed 104 of 1 listed shard(s)` before the sentinel at the end of the file
+  # was reachable, because the tree still carried an enumerated `run_shard` block — #2838).
+  # ⛔ AND ONLY THE TAIL OF `$OUT` IS PUBLISHED. The whole capture was 213 lines of this fixture's
+  # own `No such file or directory` spray, carrying `::error::`/`##[error]` strings that GitHub
+  # turns into CHECK-RUN ANNOTATIONS — one failed assertion put a page of fabricated shard failures
+  # on a PR's check surface. A message is a diagnosis, not a transcript.
+  if [ "$RC" -ne 1 ]; then
+    fail "a runner with no failure-recording arm returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -3 | tr '\n' '|')"
+  elif ! grep -qE '(failure-recording|sweep) arm is broken' <<<"$OUT"; then
+    fail "the mutated runner exited 1, but NOT on its sentinel: no '(failure-recording|sweep) arm is broken' line in $(wc -l <<<"$OUT" | tr -d ' ') line(s) of output — the exit came from somewhere else (often the coverage guard's 'executed N of M listed shard(s)', which exits before the sentinel is reachable); tail: $(printf '%s' "$OUT" | tail -3 | tr '\n' '|')"
   else
-    fail "a runner with no failure-recording arm returned rc $RC (want 1): $OUT"
+    pass "a runner that cannot record failures FAILS its own sentinel (rc 1)"
   fi
 fi
 
@@ -776,6 +813,7 @@ echo "8r. A SUBSTITUTED-OUT-OF-REPO TARGET → the RUNNER must refuse it"
 # OUTSIDE the checkout, so the refusal under test is the containment check and not an empty list.
 printf 'exit 0\n' >"$TMP/not-in-the-repo.sh"
 cheap_runner "$TMP/runner-subst.sh" "$TMP/not-in-the-repo.sh"
+stage_guard "$TMP"          # this copy's SHARD_ROOT is $TMP itself (see run-bash-shards.sh:100-110)
 if cmp -s "$RUNNER" "$TMP/runner-subst.sh"; then
   fail "the substitution mutation did not change the file"
 else
@@ -858,6 +896,7 @@ echo ""
 echo "8w. A SYMLINKED SHARD TARGET → the RUNNER must refuse it"
 SYMDIR="$TMP/symrepo"
 mkdir -p "$SYMDIR/scripts"
+stage_guard "$SYMDIR"
 printf 'exit 0\n' >"$TMP/outside-target.sh"
 ln -sf "$TMP/outside-target.sh" "$SYMDIR/scripts/linked.sh"
 cheap_runner "$SYMDIR/runner.sh" "scripts/linked.sh"
@@ -944,6 +983,7 @@ echo "8am. THE FAILING SHARD IS NAMED — deleting the naming must turn this arm
 NAMED_FAIL="tests/ci-lane-parity/stand-in-fail.sh"
 NAMED_FIX="$TMP/named-fixture"
 mkdir -p "$NAMED_FIX/scripts" "$NAMED_FIX/tests/ci-lane-parity"
+stage_guard "$NAMED_FIX"
 # Non-empty sweep: the fixture runner refuses to report success over a sweep that parsed nothing.
 printf '#!/bin/bash\n:\n' >"$NAMED_FIX/scripts/sweepable.sh"
 cp "$ROOT/$CHEAP" "$NAMED_FIX/$CHEAP"
@@ -990,6 +1030,8 @@ PARENTDIR="$TMP/parentrepo"
 mkdir -p "$PARENTDIR" "$TMP/outside-dir"
 printf 'exit 0\n' >"$TMP/outside-dir/stub.sh"
 ln -sfn "$TMP/outside-dir" "$PARENTDIR/scripts"
+# staged AFTER the symlink exists, so it lands through it exactly where the driver will look.
+stage_guard "$PARENTDIR"
 cheap_runner "$PARENTDIR/runner.sh" "scripts/stub.sh"
 ( cd "$PARENTDIR" && bash runner.sh ) >"$TMP/runner-parentsym.out" 2>&1
 RC=$?
@@ -1081,9 +1123,9 @@ awk 'BEGIN { done = 0 }
   "$PR" >"$TMP/ci-pr-gateif.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-gateif.yml"
 if [ "$RC" -eq 2 ]; then
-  pass "an `if:` on the guard-covering job's first step is refused (the guard cannot be switched off)"
+  pass "an 'if:' on the guard-covering job's first step is refused (the guard cannot be switched off)"
 else
-  fail "an `if:` on bash-suites-gate's step returned rc $RC (want 2): $OUT"
+  fail "an 'if:' on bash-suites-gate's step returned rc $RC (want 2): $OUT"
 fi
 
 # A sibling `push:` block that filters paths must not be read as narrowing pull_request.
@@ -1532,6 +1574,7 @@ echo "8an. ATTRIBUTION — a SWEEP failure is named too, so a MIXED run has no u
 # So the fixture is a TREE: one passing shard, and a syntax-sweep target with a real syntax error.
 SWEEP_FIX="$TMP/sweepname-fixture"
 mkdir -p "$SWEEP_FIX/scripts" "$SWEEP_FIX/tests/ci-lane-parity"
+stage_guard "$SWEEP_FIX"
 printf 'if then\n' >"$SWEEP_FIX/scripts/broken.sh"
 printf '#!/bin/bash\nexit 0\n' >"$SWEEP_FIX/tests/ci-lane-parity/pass.sh"
 awk '\
@@ -1568,6 +1611,286 @@ else
     pass "RED CONTROL: with the naming helper gutted the sweep failure is un-named again (rc 1)"
   else
     fail "the no-name control did not revert to an un-named verdict (rc $RC2): $SWEEP_NONAME"
+  fi
+fi
+
+echo ""
+echo "8ao. FAIL-CLOSED PAST THE DERIVED LIST — a second list must REFUSE, and the call-count arm (#2838)"
+# ⛔ WHY THIS IS A RUNTIME ARM AND NOT A TEXT PIN (review finding on #2838). `slice_skips` now
+# refuses any call beyond the DERIVED list, declares exactly ONE past-list call (the runtime
+# failure-recording sentinel) BY NAME, bounds that budget at 1, and the run also compares the CALL
+# count against `$listed`. Measured before this arm existed: `grep -rn 'past_list\|past the derived
+# list\|entered run_shard'` matched the runner and NOTHING ELSE — so the refusal, the budget or the
+# count check could be deleted (or downgraded to a skip) with every other assertion here green, which
+# is the exact vacuity the code comment at the count check claims to survive. The fixture is the
+# existing one-stand-in `$FIX` tree, so each arm is one cheap execution, and the mutation is the SHAPE
+# the defect actually had: rows appended after the derived loop.
+# (a) THE DEFECT'S OWN SHAPE — an UNDECLARED call after the loop refuses instead of running.
+awk -v ins="run_shard \"$CHEAP\"\n" \
+  '/^  run_shard "\$shard"$/ { inloop = 1 } { print } inloop && /^done$/ { printf "%s", ins; inloop = 0 }' \
+  "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-pastlist.sh"
+if cmp -s "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-pastlist.sh"; then
+  fail "the past-list mutation did not change the file (the fixture no longer matches the runner's loop)"
+else
+  $FIXTURE_BOUND bash "$FIX/scripts/runner-pastlist.sh" >"$TMP/runner-pastlist.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-pastlist.out")"
+  if [ "$RC" -eq 1 ] && grep -q 'PAST the derived list' <<<"$OUT"; then
+    pass "an UNDECLARED run_shard call past the derived list REFUSES (rc 1) instead of running extra work"
+  else
+    fail "an undeclared past-list call returned rc $RC (want 1 + 'PAST the derived list'): $OUT"
+  fi
+  # (b) THE DECLARED BUDGET IS ONE, and it is the SENTINEL's. A second declared call — appended after
+  # the sentinel, which is the only shape that gets past the tally arm — must trip the budget and NAME
+  # it, so a second sentinel cannot be added without raising `past_list_budget` deliberately.
+  cp "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-pastbudget.sh"
+  printf '%s\n' 'shard_past_list=1' "run_shard \"$CHEAP\"" 'shard_past_list=0' >>"$FIX/scripts/runner-pastbudget.sh"
+  $FIXTURE_BOUND bash "$FIX/scripts/runner-pastbudget.sh" >"$TMP/runner-pastbudget.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-pastbudget.out")"
+  if [ "$RC" -eq 1 ] && grep -q '2 call(s) past the derived list' <<<"$OUT" && grep -q 'declared budget is 1' <<<"$OUT"; then
+    pass "a SECOND declared past-list call trips the declared budget (rc 1, 'declared budget is 1')"
+  else
+    fail "a second declared past-list call returned rc $RC (want 1 + 'declared budget is 1'): $OUT"
+  fi
+  # (c) NON-VACUITY FOR THE CALL-COUNT ARM — the arm exists for the case the refusal is later
+  # downgraded to a skip, so the mutant is exactly that: the UNdeclared refusal becomes a silent,
+  # UNCOUNTED skip (a counted skip would red the `executed + skipped == listed` tally instead, which is
+  # why the count arm would otherwise be untestable) and the derived loop is duplicated. `ran + skipped`
+  # then still equals `$listed`, so ONLY the call count can catch it.
+  awk '
+    /^      echo "❌ call #/ { print "      return 0"; skipexit = 1; next }
+    skipexit && /^      exit 1$/ { skipexit = 0; next }
+    { print }
+  ' "$FIX/scripts/runner-cheap.sh" >"$TMP/runner-cheap-silentskip.sh"
+  if cmp -s "$FIX/scripts/runner-cheap.sh" "$TMP/runner-cheap-silentskip.sh"; then
+    fail "the silent-skip mutation did not change the file (the refusal's text moved)"
+  else
+    # ⛔ ONE-LINE WITH `\n` ESCAPES, NOT A LITERAL MULTI-LINE STRING: BWK awk (macOS's `/usr/bin/awk`)
+    # refuses a newline inside a `-v` string ("awk: newline in string"), so the fixture file came out
+    # EMPTY and this arm reported "the mutation did not change the file" on every macOS run while
+    # passing on the Linux runner. `-v` assignments DO expand `\n`, so the injected text is identical
+    # and the arm now measures the runner on both hosts instead of measuring awk's dialect.
+    awk -v ins='while IFS= read -r shard; do\n  [ -n "$shard" ] || continue\n  run_shard "$shard"\ndone <<<"$shard_paths"\n' \
+      '/^  run_shard "\$shard"$/ { inloop = 1 } { print } inloop && /^done$/ { printf "%s", ins; inloop = 0 }' \
+      "$TMP/runner-cheap-silentskip.sh" >"$FIX/scripts/runner-relist.sh"
+    $FIXTURE_BOUND bash "$FIX/scripts/runner-relist.sh" >"$TMP/runner-relist.out" 2>&1
+    RC=$?
+    OUT="$(cat "$TMP/runner-relist.out")"
+    if [ "$RC" -eq 1 ] && grep -q 'entered run_shard 2 time(s)' <<<"$OUT"; then
+      pass "a RE-READ of the list is caught by the call count even when the skip is silent (rc 1, 2 calls vs 1 listed)"
+    else
+      fail "a doubled list with a silent skip returned rc $RC (want 1 + 'entered run_shard 2 time(s)'): $OUT"
+    fi
+    # ⛔ THE CONTROL: delete ONLY the call-count arm from that same mutant and it must go GREEN. That
+    # is what makes the assertion above a measurement of the arm rather than of some other check.
+    awk '
+      /^if \[ \$\(\(slice_calls - past_list_calls\)\) -ne "\$listed" \]; then$/ { skip = 1; next }
+      skip { if ($0 == "fi") { skip = 0 }; next }
+      { print }
+    ' "$FIX/scripts/runner-relist.sh" >"$FIX/scripts/runner-relist-nocount.sh"
+    if cmp -s "$FIX/scripts/runner-relist.sh" "$FIX/scripts/runner-relist-nocount.sh"; then
+      fail "the count-arm deletion did not change the file (the arm's text moved)"
+    else
+      $FIXTURE_BOUND bash "$FIX/scripts/runner-relist-nocount.sh" >"$TMP/runner-relist-nocount.out" 2>&1
+      RC=$?
+      OUT="$(cat "$TMP/runner-relist-nocount.out")"
+      if [ "$RC" -eq 0 ] && grep -q '✅ all 1 bash shards passed' <<<"$OUT"; then
+        pass "RED CONTROL: with the call-count arm deleted the same doubled list reports GREEN (so the arm is the one that catches it)"
+      else
+        fail "the count-arm control did not revert to a green run (rc $RC — want 0; something else is red and the arm is unproven): $OUT"
+      fi
+    fi
+  fi
+fi
+
+echo ""
+echo "8ap. A SHARD MUST NOT BE ABLE TO DRAIN THE LIST (#3079)"
+# ⛔ WHAT THIS ARM EXISTS FOR — the largest silent coverage hole this runner has had. The loop used
+# to be `while IFS= read -r shard; do run_shard "$shard"; done <<<"$shard_paths"`, so the shard list
+# lived on the driver's STDIN and every shard inherited it. A shard that reads stdin therefore
+# consumed the lines the driver had not reached yet, the loop simply ENDED — no error, no name — and
+# the runner reported `executed 107 of 139 listed shard(s) (0 skipped)`. Measured on main's
+# `script-validate` job 2026-10-30: the last timing row was `▸ 60s scripts/pi-reap-idle.test.sh`
+# (position 107) and 32 shards — everything sorted after it — never ran on main or on ANY PR, while
+# the job was read as "a count mismatch" rather than "32 suites are not covered".
+#
+# The fixture is three shards where the SECOND one reads stdin to EOF: with the defect it drains
+# `drain-c.sh`, so the driver executes 2 of 3 and says so (that is the mutant below). With the fix
+# both arms are independently sufficient — the list is read into an ARRAY (a child cannot reach it)
+# and every shard is handed `</dev/null` — so this arm also pins each arm's sufficiency, because a
+# future refactor that drops one of them must not be able to reintroduce the hole quietly.
+DRAIN_FIX="$TMP/drain-fixture"
+mkdir -p "$DRAIN_FIX/scripts" "$DRAIN_FIX/tests/ci-lane-parity"
+stage_guard "$DRAIN_FIX"
+printf '#!/bin/bash\nexit 0\n' >"$DRAIN_FIX/tests/ci-lane-parity/drain-a.sh"
+printf '#!/bin/bash\nwhile IFS= read -r _l; do :; done\nexit 0\n' >"$DRAIN_FIX/tests/ci-lane-parity/drain-b.sh"
+printf '#!/bin/bash\nexit 0\n' >"$DRAIN_FIX/tests/ci-lane-parity/drain-c.sh"
+awk '\
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"tests/ci-lane-parity/drain-*.sh\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$RUNNER" >"$DRAIN_FIX/scripts/runner-drain.sh"
+if cmp -s "$RUNNER" "$DRAIN_FIX/scripts/runner-drain.sh"; then
+  fail "the stdin-drain fixture did not narrow SUITE_GLOBS — it would run the real 139-shard list"
+else
+  $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain.sh" >"$TMP/runner-drain.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-drain.out")"
+  if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' <<<"$OUT"; then
+    pass "a shard that reads stdin to EOF does not shorten the run (3 of 3 executed, rc 0)"
+  else
+    fail "a stdin-draining shard SHORTENED the run (rc $RC — want 0 + 'all 3 bash shards passed'): $OUT"
+  fi
+  # MUTANT (the pre-fix shape, both arms reverted): the loop reads the list FROM STDIN and the shard
+  # inherits it. The run must then reproduce the defect — a SHORT count — and, crucially, NAME the
+  # shard it never reached, which the pre-fix message could not.
+  awk '
+    /^for shard in / { print "while IFS= read -r shard; do"
+                       print "  [ -n \"$shard\" ] || continue"
+                       print "  run_shard \"$shard\""
+                       print "done <<<\"$shard_paths\""
+                       inold = 1; next }
+    inold { if ($0 == "done") { inold = 0 }; next }
+    { print }
+  ' "$DRAIN_FIX/scripts/runner-drain.sh" \
+    | sed 's| bash "\$1" </dev/null| bash "$1"|' >"$DRAIN_FIX/scripts/runner-drain-mutant.sh"
+  if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-mutant.sh"; then
+    fail "the drain mutant did not change the file — the loop's shape or the shard call moved, and this arm now measures nothing"
+  else
+    $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-mutant.sh" >"$TMP/runner-drain-mutant.out" 2>&1
+    RC=$?
+    MOUT="$(cat "$TMP/runner-drain-mutant.out")"
+    if [ "$RC" -eq 1 ] && grep -q 'executed 2 of 3 listed shard(s)' <<<"$MOUT"; then
+      pass "MUTANT (pre-fix shape): the drain reproduces the defect — executed 2 of 3 (rc 1)"
+    else
+      fail "the pre-fix mutant did not reproduce the short run (rc $RC — want 1 + 'executed 2 of 3'): $MOUT"
+    fi
+    if grep -qF 'NEVER RAN: tests/ci-lane-parity/drain-c.sh' <<<"$MOUT"; then
+      pass "…and the verdict NAMES the shard that never ran (a count alone cannot say which suite is uncovered)"
+    else
+      fail "the verdict did not name the un-reached shard (want 'NEVER RAN: tests/ci-lane-parity/drain-c.sh'): $MOUT"
+    fi
+    if grep -qF 'NEVER RAN: tests/ci-lane-parity/drain-a.sh' <<<"$MOUT" || grep -qF 'NEVER RAN: tests/ci-lane-parity/drain-b.sh' <<<"$MOUT"; then
+      fail "the verdict named a shard that DID run — a block naming every shard attributes nothing: $MOUT"
+    else
+      pass "…and it names ONLY the shard that was skipped over"
+    fi
+  fi
+  # EACH ARM ALONE: revert one at a time. Both must stay green, so neither can be dropped as
+  # "redundant" without this arm going red — the belt-and-braces is pinned, not assumed.
+  #
+  # ⛔ AND THE FIXTURE'S OWN STDIN IS THE LIST, NOT THE CALLER'S (#3099 review). `runner-drain-nostdin`
+  # is the driver with `</dev/null` stripped, so its drainer inherits whatever fd 0 the TEST process
+  # holds — a TTY, a pipe, an `ssh host 'bash tests/…'`. With neither `timeout` nor `gtimeout`
+  # installed (the macOS default, so `$FIXTURE_BOUND` is EMPTY) that is an UNBOUNDED HANG, which
+  # falsifies the guarantee stated at `FIXTURE_BOUND`'s definition above; with the bound present it is
+  # a red naming the wrong cause (rc 124). And at EOF the arm cannot fail for the reason it names: a
+  # shard handed EOF drains nothing whether the list is in an array or on stdin, so it would report
+  # "the ARRAY alone is sufficient" for a runner whose array had also been removed. Handing it the
+  # LIST fixes both — the shard still gets a stream it COULD drain, so a future refactor that drops the
+  # ARRAY while `</dev/null` is absent shortens the run and reds this arm, and the caller's stdin stops
+  # mattering.
+  printf '%s\n' tests/ci-lane-parity/drain-a.sh tests/ci-lane-parity/drain-b.sh \
+                tests/ci-lane-parity/drain-c.sh >"$TMP/drain-stdin.txt"
+  sed 's| bash "\$1" </dev/null| bash "$1"|' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-nostdin.sh"
+  if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-nostdin.sh"; then
+    fail "the </dev/null removal did not change the file — the shard call moved, and this arm now measures the UNMUTATED runner"
+  else
+    $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-nostdin.sh" <"$TMP/drain-stdin.txt" >"$TMP/runner-drain-nostdin.out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-nostdin.out"; then
+      pass "the ARRAY alone is sufficient (a shard without </dev/null, handed a stream it could drain, still cannot shorten the list)"
+    else
+      fail "without </dev/null the run still shortened (rc $RC) — the array is not doing the work this arm claims: $(cat "$TMP/runner-drain-nostdin.out")"
+    fi
+  fi
+  awk '
+    /^for shard in / { print "while IFS= read -r shard; do"
+                       print "  [ -n \"$shard\" ] || continue"
+                       print "  run_shard \"$shard\""
+                       print "done <<<\"$shard_paths\""
+                       inold = 1; next }
+    inold { if ($0 == "done") { inold = 0 }; next }
+    { print }
+  ' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-stdinloop.sh"
+  if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-stdinloop.sh"; then
+    fail "the loop revert did not change the file — the loop's shape moved, and this arm now measures the UNMUTATED runner"
+  else
+    $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-stdinloop.sh" >"$TMP/runner-drain-stdinloop.out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-stdinloop.out"; then
+      pass "the </dev/null arm alone is sufficient (a stdin-fed loop cannot be drained when the shard's stdin is closed)"
+    else
+      fail "with the stdin-fed loop and </dev/null the run still shortened (rc $RC): $(cat "$TMP/runner-drain-stdinloop.out")"
+    fi
+  fi
+  # ⛔ THE SKIP REASON IS PINNED TOO (`#3099` review, P2). `slice_skips` writes `<path>\t<slice i/n>`
+  # into `shard_skip_log` and the mismatch verdict prints those lines, but NO fixture ever entered
+  # that branch: every arm above induces a mismatch with `(0 skipped)`, so the print could have
+  # emitted an empty or garbled line and this suite would still be green — the same "a diagnostic is
+  # claimed but nothing measures it" gap the mutant arms exist to close for the other blocks. The
+  # fixture below reaches the branch BY CONSTRUCTION: 4 shards, the slice skips position 1, and the
+  # shard at position 2 drains the list — so the run ends with one DELIBERATE skip recorded and one
+  # shard never reached, which is the only state that prints BOTH the `(1 skipped)` count with its
+  # per-shard reasons and the NEVER-RAN list. The GREEN CONTROL on the unmutated runner is part of
+  # the arm: without it, a fixture that reds for some unrelated reason would count as proof.
+  SKIP_FIX="$TMP/skip-reason-fixture"
+  mkdir -p "$SKIP_FIX/scripts" "$SKIP_FIX/tests/ci-lane-parity"
+  stage_guard "$SKIP_FIX"
+  printf '#!/bin/bash\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-a.sh"
+  printf '#!/bin/bash\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-b.sh"
+  printf '#!/bin/bash\nwhile IFS= read -r _l; do :; done\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-c.sh"
+  printf '#!/bin/bash\nexit 0\n' >"$SKIP_FIX/tests/ci-lane-parity/skip-d.sh"
+  awk '\
+    /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"tests/ci-lane-parity/skip-*.sh\" )"; skip = 1; next }
+    skip && /^\)$/ { skip = 0; next }
+    skip { next }
+    { print }
+  ' "$RUNNER" >"$SKIP_FIX/scripts/runner-skip.sh"
+  if cmp -s "$RUNNER" "$SKIP_FIX/scripts/runner-skip.sh"; then
+    fail "the skip-reason fixture did not narrow SUITE_GLOBS — it would run the real shard list"
+  else
+    BASH_SHARD_SLICE=1/2 $FIXTURE_BOUND bash "$SKIP_FIX/scripts/runner-skip.sh" >"$TMP/runner-skip-control.out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] && grep -q 'bash shards passed (slice 1/2 of 4' "$TMP/runner-skip-control.out"; then
+      pass "skip-reason CONTROL: the fixed runner executes slice 1/2 of 4 and reports green (rc 0)"
+    else
+      fail "the skip-reason control run is not green (rc $RC — want 0 + 'bash shards passed (slice 1/2 of 4'): $(cat "$TMP/runner-skip-control.out")"
+    fi
+    awk '
+      /^for shard in / { print "while IFS= read -r shard; do"
+                         print "  [ -n \"$shard\" ] || continue"
+                         print "  run_shard \"$shard\""
+                         print "done <<<\"$shard_paths\""
+                         inold = 1; next }
+      inold { if ($0 == "done") { inold = 0 }; next }
+      { print }
+    ' "$SKIP_FIX/scripts/runner-skip.sh" \
+      | sed 's| bash "\$1" </dev/null| bash "$1"|' >"$SKIP_FIX/scripts/runner-skip-mutant.sh"
+    if cmp -s "$SKIP_FIX/scripts/runner-skip.sh" "$SKIP_FIX/scripts/runner-skip-mutant.sh"; then
+      fail "the skip-reason mutant did not change the file — the loop's shape or the shard call moved, and this arm now measures nothing"
+    else
+      BASH_SHARD_SLICE=1/2 $FIXTURE_BOUND bash "$SKIP_FIX/scripts/runner-skip-mutant.sh" >"$TMP/runner-skip-mutant.out" 2>&1
+      RC=$?
+      MOUT="$(cat "$TMP/runner-skip-mutant.out")"
+      if [ "$RC" -eq 1 ] && grep -q 'executed 2 of 4 listed shard(s) (1 skipped)' <<<"$MOUT"; then
+        pass "MUTANT: a mismatch that also SKIPPED a shard reports 'executed 2 of 4 … (1 skipped)' (rc 1)"
+      else
+        fail "the skip-reason mutant did not report the expected mismatch (rc $RC — want 1 + 'executed 2 of 4 listed shard(s) (1 skipped)'): $MOUT"
+      fi
+      if grep -qF '⏭  SKIPPED: tests/ci-lane-parity/skip-b.sh (slice 1/2)' <<<"$MOUT"; then
+        pass "…and the verdict PRINTS the skipped shard WITH its reason ('slice 1/2') — skipped=N is never an unexplained shortfall"
+      else
+        fail "the verdict printed no per-shard skip reason (want '⏭  SKIPPED: tests/ci-lane-parity/skip-b.sh (slice 1/2)'): $MOUT"
+      fi
+      if grep -qF 'NEVER RAN: tests/ci-lane-parity/skip-d.sh' <<<"$MOUT"; then
+        pass "…and the same block still NAMES the shard the drain skipped over (skip-d.sh) — the reason print did not displace the set difference"
+      else
+        fail "the skip-reason block displaced the NEVER-RAN naming (want 'NEVER RAN: tests/ci-lane-parity/skip-d.sh'): $MOUT"
+      fi
+    fi
   fi
 fi
 
@@ -1654,6 +1977,7 @@ fi
 # ── (b) the fixture repo: discovery, opt-out, order, and a NAMED failure ─────────────────────
 PROBE="$TMP/probe-repo"
 mkdir -p "$PROBE/tests/zzz-probe" "$PROBE/tests/zzz-off" "$PROBE/tests/aaa" "$PROBE/scripts"
+stage_guard "$PROBE"
 cp "$RUNNER" "$PROBE/scripts/runner.sh"
 # A sweepable file, so the fixture runner's own sweep self-check has work to do (it refuses to
 # report success over a sweep that parsed nothing).
@@ -1739,6 +2063,7 @@ rm -rf "$PROBE/tests/zzz-fail"
 # broken modulus at a width that divides the list evenly (9 shards / 3 slices).
 PROBE2="$TMP/slice-repo"
 mkdir -p "$PROBE2/scripts"
+stage_guard "$PROBE2"
 cp "$RUNNER" "$PROBE2/scripts/runner.sh"
 printf '#!/bin/bash\n:\n' >"$PROBE2/scripts/sweepable.sh"
 for i in 1 2 3 4 5 6 7 8 9; do

@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
 # ci-queue.sh — CI BACK-PRESSURE: how deep is the repo's CI queue, and may this box send it more
-# work yet? Sourced by `orch-loop.sh` (the cycle's read, before dispatch), by `fix-one.sh` (the
-# lane whose whole job is to PUSH a new head), and by `dispatch-merge.sh` (the batch dispatcher),
-# and runnable STANDALONE (`bash ci-queue.sh status --repo owner/name`), because the same bytes must
-# answer the question on whichever surface asks it. It never calls `set` — a sourced library must
+# work yet? Sourced by `orch-loop.sh` (the cycle's read, before the ISSUE dispatch, plus the CI rerun
+# site) and by `dispatch-merge.sh` (the batch dispatcher) — and NOT by `fix-one.sh`, which stopped
+# reading it in #2927 because a fixer is REPAIR — and runnable STANDALONE
+# (`bash ci-queue.sh status --repo owner/name`), because the same bytes must answer the question on
+# whichever surface asks it. It never calls `set` — a sourced library must
 # not mutate its caller's shell options.
 #
-# ── COVERAGE, AND THE ONE DELIBERATE EXCLUSION (#2296 review cycle 4) ───────────────────────────
-# Gated: the controller's read before dispatch, the THREE fixer spawn arms whose product is a pushed
-# head (the CONFLICTED, the CI-red and the review-gate ones), every pre-push check in `fix-one.sh`,
-# the batch dispatcher, and the CI RERUN.
-# ⛔ AND ONE FIXER ARM IS NOT GATED YET, DISCLOSED RATHER THAN IMPLIED: the RED-TREE fixer
-# (`orch-loop.sh`'s `MAX_RED_FIX` spawn) books its attempt and spawns BEFORE any `ciq_push_ok` call,
-# so on a deep queue that lane still starts, is deferred by `fix-one.sh` on its first push, and hands
-# the attempt back through `fixbail` on a later cycle. The cost is CHURN — a fixer spawned to do work
-# it then declines to push — not added CI; the refund line names BOTH causes (`another box holds the
-# claim, or the CI-queue gate deferred the push`), so it does not misdirect anyone to a lease that
-# never existed. It is the fourth fixer spawn arm; home agent-infra #2408.
+# ── COVERAGE (#2296 review cycle 4, revised by #2927) ───────────────────────────────────────────
+# Gated, because each one ADDS a run to the queue: the ISSUE path (`orch-loop.sh`'s dispatch block,
+# which reads before dispatch), the CI RERUN, and the batch dispatcher `dispatch-merge.sh`.
+# ⛔ AND EVERY FIXER SURFACE IS *NOT* GATED, BY DESIGN — A FIXER IS REPAIR (#2927). This block used to
+# list the THREE fixer spawn arms (CONFLICTED, CI-red, review-gate) and every pre-push check in
+# `fix-one.sh` as GATED; that census outlived the gate. It is the class of coverage claim a reader
+# trusts and then stops checking (#2540) — read from the other side, an operator would have believed
+# the repair path was protected when this module no longer sees it at all. Repair acts on a PR that
+# already exists, so its bound is this box's lane slots (`MAX_LANES` vs lanes alive) and the
+# load/disk/headroom gate, which is what a lane actually consumes; the depth this gate prices is
+# CI concurrency belonging to NEW-PR work. See the class rule below for the basis, and #2927 for the
+# measurement (41 consecutive repair dispatches skipped while 8 runners and ~11 lane slots sat idle).
+# ⛔ THE FOURTH-ARM CHURN IS GONE WITH IT (#2408's disclosure, superseded). `orch-loop.sh`'s RED-TREE
+# fixer used to book its attempt, spawn, and then be turned away at `fix-one.sh`'s first push, so the
+# cost was CHURN. Nothing on the repair path reads this module now, so that refusal cannot happen,
+# and the refund line no longer has to name a second cause — it reads `another box holds the claim`,
+# not `another box holds the claim, or the CI-queue gate deferred the push`. A lane that is started
+# will push.
 # ⛔ AND IT IS NOT THE ONLY UNGATED PUSHER — this paragraph used to claim it was, which is the class
 # of coverage claim a reader trusts and then stops checking (#2540). `pr-doctor`'s `prfix` workers
 # are the other one, and they are not an orch-loop arm at all: `pr-doctor.py` spawns up to `MAX_FIX`
@@ -24,9 +32,14 @@
 # (:1723-1733) or `gh run rerun …` (:1898), through `nonblocking-dispatch.sh`/`spawn-gate.sh`,
 # neither of which reads this module — `rg -c 'ciq|ci-queue' scripts/pr-doctor.py` is 0. The `prfix`
 # kind is declared for the CREATION back-pressure gate (#2409), not this one, so on the repo whose
-# 92-deep queue this header opens with, a launchd job still adds CI behind it. Wiring that surface
-# is agent-infra #2540; the standalone verb below (`status`, rc 0 deep / 1 ok / 2 unknown) exists so
-# a caller that is not bash can branch on it.
+# 92-deep queue this header opens with, a launchd job still adds CI behind it. ⛔ THAT SURFACE STAYS
+# UNGATED BY DECISION, NOT BY OMISSION: #2540 asks for it to be gated, and #2927 rules repair — of
+# which a `prfix` worker is one — out of this gate on purpose (its bound is the box's lane slots and
+# the load/disk gate). So wiring it is a RE-OPEN OF #2927, argued there with the measurement, and NOT
+# an execution of #2540; the README's §CI back-pressure says the same thing, because two opposite
+# instructions in two files this change touches is how the next lane picks the wrong one. The
+# standalone verb below (`status`, rc 0 deep / 1 ok / 2 unknown) exists so a caller that is not bash
+# can branch on it — it does not by itself decide that anything should be wired to it.
 # ⛔ NOT gated, on purpose: the merge rail's second-sample re-run (`admin-merge.sh`, the flake retry).
 # It is not an omission — a rail that is MERGING removes a PR and its load from the system, and
 # refusing the retry would replace a merge with a stuck red head; the retry happens only inside that
@@ -102,15 +115,82 @@
 #     tokens are `deep(… state=cache age=Ns)` and `ok(… state=cache age=Ns)`, and the CLI line is
 #     `state=cache source=record(cache) age=Ns` — a grep for `cache(` matched only this comment.
 #     #2333 review, P2.) Past that window the record is dropped and the verdict is UNKNOWN again.
-#   * `runners` is MEASURED when the repo endpoint answers with an online runner count. When no count
-#     is measured there are THREE cases and they do not share one answer (#2333 review cycles 9-11):
-#     the endpoint ANSWERING `total_count: 0` is the hosted-CI shape (GitHub-hosted runners never
-#     appear in that list — it is agent-infra's measured shape) and derives from the account's
-#     concurrent-job allowance; the endpoint answering with a DECLARED fleet nothing online, and the
-#     endpoint REFUSING outright, both mean no parallelism was measured and fail CLOSED to the
-#     measured floor (`max(1, in_progress)` — a runner is running, so a runner exists). The record
-#     says `runners=<n>(busy)` when the endpoint answered with an online count, `runners=~<n>` when
-#     it did not.
+#   * `runners` is the FLEET SIZE — the supply side of the derivation, never the demand side. It is
+#     MEASURED when the repo endpoint answers with an online runner count.
+#     ⛔ NEVER THE IN-PROGRESS COUNT (#2927). `running` is how many JOBS are executing; deriving the
+#     ceiling's runner term from it made the gate read the box's own load as the world's capacity and
+#     printed it in the same `runners=` field a real measurement uses — measured 2026-10-27 on cell 4:
+#     `queued=33 running=2 runners=~2 => ceiling=4 => DEEP`, on an agent-infra whose jobs run on
+#     GitHub-HOSTED runners while its own 8-runner self-hosted fleet sat all-online and all-idle, and
+#     41 consecutive PR-repair dispatches were skipped by that one number. When no count is measured
+#     there are THREE cases and they do not share one answer (#2333 review cycles 9-11, revised by
+#     #2927):
+#       (a) the endpoint ANSWERING `total_count: 0` is the hosted-CI shape (GitHub-hosted runners
+#           never appear in that list — agent-infra's measured shape) and derives from the account's
+#           concurrent-job allowance;
+#       (b) the endpoint answering with a DECLARED fleet and nothing online means the hosted jobs ARE
+#           the running parallelism, so `running` is a legitimate SUPPLY LOWER BOUND (and dropping it
+#           was measured to pin the ceiling at 2 on a repo that runs on hosted capacity — arm (b12));
+#       (c) the endpoint REFUSING outright or answering with no parseable `total_count` means NOTHING
+#           was measured, so the count falls to the module's own documented floor of ONE runner (the
+#           same value `ciq_ceiling` floors at — a 0 ceiling would defer every push for ever) and the
+#           token NAMES the reading that failed (`fleet=unreadable(<the endpoint's words>)`), because
+#           an inference presented as a measurement is the defect this gate exists to avoid.
+#     The record says `runners=<n>(busy)` when the endpoint answered with an online count,
+#     `runners=~<n>` when it did not.
+#   * ⛔ WHAT THIS GATE IS ALLOWED TO GATE IS TWO CLASSES, AND THE LINE IS THE ACTION'S COST (#2927).
+#     ONLY work that ADDS A NEW CI RUN is queue-gated: opening a PR from an issue (agent-infra's
+#     `dispatch-merge.sh`, and `orch-loop.sh`'s ISSUE path) and the CI RERUN (`orch-loop.sh`'s rerun
+#     site — the one verb in the sweep that queues a fresh run for the same head). REPAIR — acting on a
+#     PR that already exists (a red-check fixer, a review-findings fixer, a conflict/rebase fixer, the
+#     PR-sickness queue) — is NOT queue-gated by this module and must
+#     not become so again: its real bounds are the lane slots (`MAX_LANES` vs lanes alive) and the
+#     load/headroom gate.
+#     ⛔ THE BASIS IS A DECISION PLUS A MEASUREMENT, NOT A COST CLAIM — and it used to be stated as a
+#     cost claim, which is what made it refutable. "Its pass is already spent" is NOT true: a repair
+#     push does start a fresh CI run. Two things are true, and they are what carry the exclusion:
+#       (i) the NUMBER was the wrong quantity — `queued=33 running=2` derived `ceiling=4` and read
+#           DEEP off demand-as-supply, so the gate was refusing repair on a reading of the box's own
+#           load rather than of the world's capacity; and
+#       (ii) ON THIS REPO SOME REPAIR PUSHES SUPERSEDE — AND SUPERSESSION IS A PROPERTY OF THE
+#           WORKFLOW, NOT OF "A REPAIR PUSH". A `pull_request` / `pull_request_target` workflow
+#           supersedes its PR's earlier run only if it declares a `concurrency:` GROUP; a workflow
+#           with NO `concurrency:` block STACKS, and a repair push adds a run to it. ⛔ SO ENUMERATE
+#           BY TRIGGER + CONCURRENCY, NEVER BY MEMORY: the previous revision of this paragraph
+#           named ONE stacking workflow and there are TWO — a hand-maintained list of filenames is
+#           the defect that produced that round, which is why the PROPERTY above is the rule and
+#           the four names below are only its measurement at this commit. Every workflow in
+#           `.github/workflows/` that fires on a PR push:
+#             ci.yml                     `pull_request` (default opened/synchronize/reopened),
+#                                        `group: ci-${{ github.ref }}`, cancel-in-progress: true
+#                                                                             → SUPERSEDES
+#             harness-single-source.yml  `pull_request` (same defaults), `group:
+#                                        harness-single-source-${{ github.ref }}`, same flag
+#                                                                             → SUPERSEDES
+#             pipeline-compliance.yml    `pull_request` on main, types [opened, synchronize,
+#                                        reopened, edited], NO `concurrency:` block
+#                                                                             → STACKS (#2474)
+#             workflow-lock.yml          `pull_request_target`, the same four types, NO
+#                                        `concurrency:` block                    → STACKS (#2474)
+#           BOTH stacking files omit the block deliberately (#2474): a per-PR group cannot tell a
+#           head from its successor, and a cancelled leg reads NON-RED — which on
+#           `pipeline-compliance` means the repo's ONLY required check (#646) would read
+#           green-with-no-verdict on the newest tree, and on `workflow-lock` would satisfy the
+#           guard-generation wait while contributing no verdict. So the required check is one of the
+#           two that DOES stack, and a repair push costs a run there every time.
+#           NOT in the set, and why: `ci-main.yml` (`push: [main]`) and `enforce-skills.yml`
+#           (`schedule` + `push: [main]`) never fire on a PR push, and `admin-merge-detector.yml`
+#           fires on `workflow_run` of main's CI. The four reusable `workflow_call` files
+#           (`docs-ci`, `drift-check`, `node-ci`, `python-ci`) run as JOBS inside a caller's RUN,
+#           so they inherit the CALLER's concurrency group and add no run of their own.
+#           That is why the exclusion does not rest on supersession — it rests on the decision plus
+#           (i): the reading that skipped 41 deploys was wrong about the QUANTITY, not merely
+#           silent about one of the two stacking workflows.
+#     What does NOT change, and a fixer must still expect: the push voids that PR's head-bound review
+#     attestation (#2148), so the review chain re-runs.
+#     Gating repair on this number is what produced 41 skips while 11 lane slots and 8 runners sat
+#     idle. If a future change wants to defer a repair dispatch, it is not a tuning change — it
+#     re-opens #2927.
 #   * TWO DECLARED RESIDUALS ON THE MEASUREMENT ITSELF — both stated, neither closed by reading
 #     harder:
 #     (i) ONLY `status=queued` IS COUNTED (#2333 review, P2). A run parked behind an environment
@@ -225,12 +305,47 @@ ciq_record_usable() {
   [ -n "$got" ] && [ "$got" = "$want" ]
 }
 
+# ciq_fleet_restore <record> -> the value for CIQ_FLEET, with its `fleet=` key re-attached.
+# ⛔ THE RECORD STORES THE DISCLOSURE WITHOUT ITS KEY (#2927 review, P3). The writer printed
+# `fleet=%s` from a value that ALREADY began `fleet=`, so every on-disk record read
+# `fleet=fleet=unreadable(…)`. It round-tripped (a reader stripped one) and a test pinned the doubled
+# form, so nothing broke — but an on-disk record is permanent text an operator reads, and a doubled
+# key is a small permanent tax on the one field whose whole job is to be read by a human. The
+# record's own `fleet=` line IS the key; this re-attaches it. An EMPTY stored value (the honest value
+# for every branch that DID measure, and for every older record that has no `fleet=` line at all)
+# restores as empty, never as `fleet=`.
+# ⛔ THE RECORD OUTLIVES THE MODULE, SO THIS READ ACCEPTS BOTH SHAPES (#2928 review, P3). A record is
+# permanent text in a state dir shared with whatever else runs out of it, so a `fleet=fleet=…` line
+# written by the PRE-FIX writer can still be read HERE, after the writer changed — the mixed-version
+# direction (old record, new reader) that a reader CAN close from its own side. `${v#fleet=}` strips
+# a STORED key before this function attaches its own, so an old-format and a new-format record both
+# restore keyed exactly ONCE. It is a tolerance rather than a version field because the strip can
+# never eat a real payload: `CIQ_FLEET`'s only producer is branch (c), whose text always begins
+# `unreadable(`, so a value that itself starts `fleet=` can only be the doubled legacy form.
+# The OPPOSITE direction — an OLD reader meeting a NEW record — needs nothing here and cannot
+# mis-decide: that reader strips one `fleet=` and prints the disclosure WITHOUT its label
+# (`unreadable(…) fallback=…`); `fleet=` is a human-facing disclosure that no branch of `ciq_eval`
+# does arithmetic on, so the numbers, the ceiling and the verdict are byte-identical, only a label is
+# lost, and it returns by itself when the reader is upgraded. That is why the window is tolerable
+# rather than a version negotiation.
+ciq_fleet_restore() {
+  local v
+  v="$(printf '%s\n' "${1:-}" | sed -n 's/^fleet=//p' | head -1)"
+  v="${v#fleet=}"
+  if [ -n "$v" ]; then printf 'fleet=%s\n' "$v"; fi
+}
+
 # ciq_read <owner/repo> [<state-dir>] -> sets the CIQ_* record; 0 = usable reading, 2 = UNKNOWN.
 # Record fields (all set on every call, so a caller never reads a previous call's leftovers):
 #   CIQ_QUEUED  runs waiting for a runner
 #   CIQ_RUNNING runs executing now
 #   CIQ_RUNNERS runners that can execute them (measured; `~` lower bound when inferred)
 #   CIQ_BUSY    runners currently busy (blank when the endpoint did not answer)
+#   CIQ_FLEET   the fleet read's OWN disclosure — set ONLY on branch (c), where nothing was measured
+#               (`fleet=unreadable(<the endpoint's words>) fallback=…`). Empty when a count WAS
+#               measured. It is persisted in the record and restored by both cache arms, because a
+#               disclosure that survives only in memory is absent on exactly the path (cache) an
+#               operator reads it from (#2927).
 #   CIQ_CEILING the derived ceiling for CIQ_RUNNERS
 #   CIQ_STATE   fresh | cache | unknown
 #   CIQ_AGE     seconds the record has been standing (0 for a fresh read)
@@ -243,13 +358,13 @@ ciq_record_usable() {
 ciq_read() {
   # ⛔ EVERY NAME THIS FUNCTION ASSIGNS IS `local` (#2333 review, P2). `_errf` and `_sf` were the two
   # that were not, so a sourced `ciq_read` leaked them into the CALLER's shell — and this module is
-  # sourced into `orch-loop.sh`'s single 4,600-line cycle body plus `fix-one.sh` and
-  # `dispatch-merge.sh`. Nothing collides today; the module's own contract ("a sourced library must
+  # sourced into `orch-loop.sh`'s single 4,600-line cycle body and `dispatch-merge.sh` (it was sourced
+  # into `fix-one.sh` too until #2927 removed the repair path's last read). Nothing collides today; the module's own contract ("a sourced library must
   # not mutate its caller's shell") is what this list exists to honour, and a future local in the
   # caller would be silently clobbered mid-cycle.
-  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor="" _errf="" _sf=""
+  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor="" _errf="" _rerrf="" _sf="" _fleetwhy=""
   CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_STATE=unknown; CIQ_AGE=""; CIQ_REPO="$repo"
-  CIQ_STREAK=""; CIQ_CAUSE=""
+  CIQ_STREAK=""; CIQ_CAUSE=""; CIQ_FLEET=""
   [ -n "$repo" ] || return 2
   dir="${dir:-$(ciq_state_dir)}"
   f="$dir/ci-queue-$(ciq_slug "$repo")"
@@ -274,6 +389,15 @@ ciq_read() {
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
         CIQ_BUSY="$(printf '%s\n' "$cached" | sed -n 's/^busy=//p' | head -1)"
+        # ⛔ THE FLEET DISCLOSURE RIDES THE RECORD TOO (#2927). `CIQ_FLEET` is the ONE place branch (c)
+        # says WHICH reading failed (`fleet=unreadable(...)`), and both cache arms reset it — so on a
+        # TTL or staleness hit the token used to drop the disclosure and keep only `runners=~1`, i.e.
+        # exactly the "inference presented as a measurement" the field exists to prevent, on the path
+        # cache exists for. `busy=` is the precedent: a disclosure field carried through the record.
+        # The key is re-attached on the way back (ciq_fleet_restore): the record stores the VALUE, so
+        # the line reads `fleet=unreadable(…)` on disk and not `fleet=fleet=unreadable(…)`.
+        # An older record has no `fleet=` line, which reads as empty — no behaviour change.
+        CIQ_FLEET="$(ciq_fleet_restore "$cached")"
         if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
           # ⛔ `cache`, NOT `fresh` (#2333 review P1). A TTL hit is a RECORD — up to `ttl` seconds
           # old — and calling it fresh is the exact claim this module exists to refuse: the token
@@ -294,6 +418,11 @@ ciq_read() {
   # endpoint actually returned together with the length of the streak.
   mkdir -p "$dir" 2>/dev/null || true
   _errf="$dir/ciq-err"; : > "$_errf" 2>/dev/null || true
+  # ⛔ THE FLEET READ GETS ITS OWN SCRATCH FILE (#2927). The queue reads and the runner read shared
+  # one, so the `unknown(...)` cause named the first HTTP status in the file — which is the QUEUED
+  # read's, not the runner read's. Branch (c) below has to say WHICH reading failed, so it needs the
+  # runner call's own words.
+  _rerrf="$dir/ciq-rerr"; : > "$_rerrf" 2>/dev/null || true
   queued="$(ciq_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>>"$_errf" \
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || queued=""
   running="$(ciq_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" 2>>"$_errf" \
@@ -307,7 +436,7 @@ ciq_read() {
   # flag shifts the URL into `$3`, every stub takes its `*) exit 1` arm, and the count would silently
   # go unmeasured — with the suite red for a reason that hides the parse it exists to cover.
   # Concatenated pages still count correctly: the OBJECTS are counted, never `total_count`.
-  if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate 2>>"$_errf")"; then
+  if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate 2>>"$_rerrf")"; then
     # ANSWERED. `rn_answered` is what separates a measured hosted zero from an unreadable endpoint
     # (see the three-branch decision below); without it both collapse into the permissive arm.
     rn_answered=1
@@ -345,6 +474,7 @@ ciq_read() {
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
         CIQ_BUSY="$(printf '%s\n' "$cached" | sed -n 's/^busy=//p' | head -1)"
+        CIQ_FLEET="$(ciq_fleet_restore "$cached")"
         if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
           CIQ_STATE=cache; CIQ_AGE="$age"
           CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
@@ -392,46 +522,69 @@ ciq_read() {
     #     NOT the hosted shape: claiming the allowance here quadruples the ceiling and ALLOWS the
     #     incident's own 31-deep queue with nothing able to drain it (measured on
     #     `{"total_count":5,"runners":[{"status":"offline"}]}`). Fail CLOSED to the measured floor.
-    # (c) REFUSED / unparseable — nothing was measured at all, so the allowance is a GUESS in the
-    #     permissive direction: measured, one refused `actions/runners` call turned `queued=31`
-    #     running=5 (a 5-runner fleet) into `~20`/ceiling 40 => ALLOWED, and OVERWROTE a good record
-    #     with the poisoned one for TTL+STALE_MAX (~16 min) — the one shape where the gate reports
-    #     `fresh` while permitting 4x its true ceiling. Fail CLOSED to the measured floor too.
+    # (c) REFUSED / unparseable — NOTHING was measured. The allowance is a GUESS in the permissive
+    #     direction: measured, one refused `actions/runners` call turned `queued=31` running=5 (a
+    #     5-runner fleet) into `~20`/ceiling 40 => ALLOWED, and OVERWROTE a good record with the
+    #     poisoned one for TTL+STALE_MAX (~16 min) — the shape where the gate reports `fresh` while
+    #     permitting 4x its true ceiling. Fail CLOSED.
     #
-    # The measured floor applies to EVERY branch: every executing run occupies a runner, so `running`
-    # is parallelism that demonstrably exists — bounded by the allowance, because a garbled count must
-    # not become a ceiling the gate can never reach (9 digits pass `ciq_is_count` and would yield
-    # ceiling 999999998, switching back-pressure off while the token still reads like a measurement).
-    # ⛔ CLAMPED, NEVER DISCARDED (#2333 review, P2). This test used to DISCARD a measured count that
-    # exceeded the allowance, which is not what the sentence above asks for and carried a 20x CLIFF with
-    # no disclosure: on the unmeasured branches ((b) declared-but-offline, (c) refused) a repo running 19
-    # or 20 concurrent jobs derived ceiling 38/40 and ALLOWED, while 21 — ONE MORE executing job — fell to
-    # `runners=~1`/ceiling 2 and DEFERRED every CI-spending act on the box, still printing `state=fresh` as
-    # though 1 runner were the measurement. That is the fleet-wide stop this module's header names as
-    # unacceptable, reached by a change of one digit, and arm (b6c) encoded it while its own label said
-    # "bounded by the allowance". Clamping keeps the garble bound and bounds it at the module's OWN
-    # accepted maximum ceiling (2x the hosted allowance — the same width the allowance path already
-    # yields), so `running=21` derives 40 — the CLAMP, not the allowance, is what bounds it — and
-    # a 9-digit garble derives 40 too, never 999999998.
+    # ⛔ AND IT MUST NOT BE CLOSED WITH THE IN-PROGRESS COUNT — THAT IS THE DEFECT THIS ARM EXISTS
+    # FOR NOW (#2927, measured 2026-10-27 on cell 4). This branch used to take `floor="$running"`:
+    # with nothing measured, the number of jobs EXECUTING stood in for the size of the FLEET. That is
+    # DEMAND answering a SUPPLY question, and the two are not even correlated in the direction the
+    # gate needs — a box measured `queued=33 running=2 runners=~2 => ceiling 4 => DEFERRED` while its
+    # repo's 8-registered, all-online, all-idle fleet could not appear in the number at all (the
+    # queue it was gating belonged to GitHub-HOSTED concurrency), and 41 consecutive PR-repair
+    # dispatches were skipped by it with 11 lane slots idle. So this branch now uses the module's OWN
+    # documented floor — ONE runner, the same value `ciq_ceiling` floors at, because a ceiling of 0
+    # would defer every push for ever — and it NAMES the reading it could not take, in the token
+    # (`CIQ_FLEET`), so an operator sees an inference and not a measurement.
+    #
+    # The in-progress count is still a legitimate SUPPLY LOWER BOUND on the two ANSWERED branches,
+    # where it is bounded by the allowance so a garbled count cannot become a ceiling the gate can
+    # never reach (9 digits pass `ciq_is_count` and would yield ceiling 999999998, switching
+    # back-pressure off while the token still reads like a measurement). ⛔ IT IS CLAMPED, NEVER
+    # DISCARDED (#2333 review, P2): DISCARDING a count that exceeded the allowance carried a 20x CLIFF
+    # with no disclosure — a repo running 19 or 20 concurrent jobs derived ceiling 38/40 and ALLOWED,
+    # while 21 — ONE MORE executing job — fell to `runners=~1`/ceiling 2 and DEFERRED every
+    # CI-spending act on the box, still printing `state=fresh` as though 1 runner were the
+    # measurement. That is the fleet-wide stop this module's header names as unacceptable, reached by
+    # a change of one digit. The clamp keeps the garble bound at the module's OWN accepted maximum
+    # ceiling (2x the hosted allowance — the same width the allowance path already yields).
     floor=1
-    if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ]; then
-      floor="$running"
-      if [ "$floor" -gt "$(ciq_hosted_concurrency)" ]; then floor="$(ciq_hosted_concurrency)"; fi
-    fi
     # ⛔ THE ALLOWANCE DEMANDS POSITIVE EVIDENCE: A **PARSED** `total_count == 0` (#2333 review
-    # cycle 12, P1). Until this cycle the test was `[ -z "$declared" ] || [ "$declared" -eq 0 ]`, and
+    # cycle 12, P1). Until that cycle the test was `[ -z "$declared" ] || [ "$declared" -eq 0 ]`, and
     # `declared` is EMPTY exactly when the answered page carried no parseable `total_count` — i.e.
     # branch (c), unparseable — so an ANSWERED-but-unusable body took the hosted ALLOWANCE, and the
     # shape the (c) comment above records as measured-dangerous came back through the front door:
     # `queued=31` on a repo with nothing online became `~20`/ceiling 40 => ALLOWED, the gate
-    # reporting a measurement it never made. Only a parsed zero selects the allowance; anything else
-    # unmeasured fails CLOSED to the floor, which is what (b) and (c) both say.
+    # reporting a measurement it never made. Only a parsed zero selects the allowance.
     if [ "${rn_answered:-0}" = 1 ] && [ "${declared:-x}" = "0" ]; then
       runners="$(ciq_hosted_concurrency)"
-    else
+    elif [ "${rn_answered:-0}" = 1 ] && [ -n "${declared:-}" ]; then
+      # (b) AN ANSWERED READ: the fleet is declared and nothing of it is online. `running` is a
+      # genuine SUPPLY LOWER BOUND here — jobs are executing, so that much capacity exists somewhere
+      # — and dropping it was MEASURED to be worse than keeping it (arm (b12): a stale/decommissioned
+      # self-hosted entry on a repo that actually runs on hosted capacity pinned the ceiling at 2, so
+      # a 4-deep queue deferred for ever).
+      if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ]; then
+        floor="$running"
+        if [ "$floor" -gt "$(ciq_hosted_concurrency)" ]; then floor="$(ciq_hosted_concurrency)"; fi
+      fi
       runners="$floor"
+    else
+      # (c) NOTHING was measured — see the ⛔ above. Name the reading that failed, in the endpoint's
+      # own words, so `fleet=unreadable(HTTP 404)` is not confused with a fleet of one runner.
+      runners="$floor"
+      if [ "${rn_answered:-0}" != 1 ]; then
+        _fleetwhy="$(grep -o 'HTTP [0-9][0-9][0-9]' "$_rerrf" 2>/dev/null | head -1)"
+        [ -n "${_fleetwhy:-}" ] || _fleetwhy="$(sed -n '1s/[[:space:]]*//p' "$_rerrf" 2>/dev/null | cut -c1-60)"
+        [ -n "${_fleetwhy:-}" ] || _fleetwhy="no answer"
+        CIQ_FLEET="fleet=unreadable(the actions/runners endpoint refused: ${_fleetwhy}) fallback=runners=~${runners} (the 1-runner floor, NOT the in-progress count)"
+      else
+        CIQ_FLEET="fleet=unreadable(the actions/runners page carried no parseable total_count) fallback=runners=~${runners} (the 1-runner floor, NOT the in-progress count)"
+      fi
     fi
-    if [ "$floor" -gt "$runners" ]; then runners="$floor"; fi
     runners="~$runners"
   fi
   CIQ_QUEUED="$queued"; CIQ_RUNNING="${running:-0}"; CIQ_RUNNERS="$runners"; CIQ_BUSY="$busy"
@@ -440,8 +593,12 @@ ciq_read() {
   rm -f "$dir/ciq-unknown-$(ciq_slug "$repo")" 2>/dev/null || true
   CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
   mkdir -p "$dir" 2>/dev/null || true
-  { printf 'repo=%s\nqueued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nat=%s\n' \
-      "$repo" "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "$now"; } > "$f" 2>/dev/null || true
+  # `fleet=` is written even when empty: the cache arms restore whatever is here, and an EMPTY field
+  # is the honest value for every branch that DID measure (only branch (c) has something to disclose).
+  # ⛔ THE VALUE GOES IN WITHOUT ITS OWN `fleet=` PREFIX (#2927 review, P3): `CIQ_FLEET` already begins
+  # `fleet=`, so `${CIQ_FLEET#fleet=}` is what stops the record reading `fleet=fleet=unreadable(…)`.
+  { printf 'repo=%s\nqueued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nfleet=%s\nat=%s\n' \
+      "$repo" "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "${CIQ_FLEET#fleet=}" "$now"; } > "$f" 2>/dev/null || true
   return 0
 }
 
@@ -490,14 +647,16 @@ ciq_eval() {
     # ⛔ STATE AND AGE RIDE THE `deep` TOKEN TOO (#2333 review P1). The cached record is the ONE
     # fail-open here, and a `deep(...)` that said neither `state=cache` nor `age=<n>s` presented a
     # minutes-old reading exactly as it presents a fresh one — on the branch that then DEFERS.
-    printf 'deep(queued=%s running=%s runners=%s%s ceiling=%s derived=ceil(%s*%s/%s) state=%s%s)' \
+    printf 'deep(queued=%s running=%s runners=%s%s ceiling=%s derived=ceil(%s*%s/%s) state=%s%s%s)' \
       "$q" "$r" "${CIQ_RUNNERS}" "$( { [ "${CIQ_RUNNERS#\~}" = "$CIQ_RUNNERS" ] && [ -n "${CIQ_BUSY:-}" ]; } && printf ' busy=%s' "$CIQ_BUSY" )" \
       "$c" "$n" "$(ciq_horizon_min)" "$(ciq_job_p90_min)" "${CIQ_STATE}" \
-      "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )"
+      "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )" \
+      "$( [ -n "${CIQ_FLEET:-}" ] && printf ' %s' "$CIQ_FLEET" )"
     return 0
   fi
-  printf 'ok(queued=%s running=%s runners=%s ceiling=%s state=%s%s)' \
-    "$q" "$r" "${CIQ_RUNNERS}" "$c" "${CIQ_STATE}" "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )"
+  printf 'ok(queued=%s running=%s runners=%s ceiling=%s state=%s%s%s)' \
+    "$q" "$r" "${CIQ_RUNNERS}" "$c" "${CIQ_STATE}" "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )" \
+    "$( [ -n "${CIQ_FLEET:-}" ] && printf ' %s' "$CIQ_FLEET" )"
   return 1
 }
 
@@ -567,7 +726,7 @@ ciq_ci_allowed() {
 # Prints the verdict, the record and the derivation. Exit code follows the verdict (0 deep, 1 ok,
 # 2 unknown) so an operator (or a hook) can branch on it without parsing.
 ciq_cli() {
-  local repo="" verb="${1:-status}" operand="" v drc rc
+  local repo="" verb="${1:-status}" operand="" v drc rc src
   # ⛔ `shift 2>/dev/null` IS NOT `shift 2` WITH STDERR SILENCED (#2333 review cycle 2, P2): bash parses
   # `2>` as an FD redirect, so that spelling shifts ONE positional and drops the verb — accidentally
   # right here, and a trap for the next editor who adds a second `shift`. Drop the verb explicitly.
@@ -593,9 +752,25 @@ ciq_cli() {
       # assigned nowhere in the repo, so it said `source=gh` on the run where gh had failed), and the
       # record's PATH is labelled a path — `at=` in the record is an epoch second, so printing a
       # path under that label was a second unmeasured claim.
-      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" \
-        "$( case "${CIQ_STATE}" in fresh) printf 'gh' ;; cache) printf 'record(cache)' ;; *) printf 'unknown' ;; esac )" \
-        "${CIQ_AGE:-?}"
+      # ⛔ NO `case` INSIDE A `$( )` HERE (#2969). On bash 3.2 — macOS's `/bin/bash`, and the
+      # interpreter the launchd controller is started with — the `)` that closes a `case` PATTERN is
+      # read as the closer of the SUBSTITUTION: the substitution is re-parsed at EXECUTION, bash
+      # reports `syntax error near unexpected token 'newline'` against this line, and substitutes the
+      # LITERAL remainder of the line instead of a value. Measured on this box: `source=` printed
+      # ` printf 'gh' ;; cache) printf 'record(cache)' ;; *) printf 'unknown' ;; esac )` while the
+      # command still exited 0 — a corrupted field under a green exit, so every consumer read the
+      # `source` of the reading as script text. `bash -n` is blind to it (it parses the outer script
+      # only) and bash 4.4+ parse it correctly, which is why only 3.2 boxes were wrong.
+      # ⛔ PARENTHESISING THE PATTERN IS NOT THE FIX: bash counts parens, so `(fresh)` only helps
+      # until the `*)` catch-all, whose own `)` closes the substitution (measured: the shape
+      # `in (fresh) … *) …` still fails). Hoisting the `case` out of the substitution removes the
+      # ambiguity for every bash instead of for the ones that happen to parse it.
+      case "${CIQ_STATE}" in
+        fresh) src='gh' ;;
+        cache) src='record(cache)' ;;
+        *)     src='unknown' ;;
+      esac
+      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" "$src" "${CIQ_AGE:-?}"
       printf 'record: queued=%s running=%s runners=%s busy=%s record-file=%s\n' \
         "${CIQ_QUEUED:-?}" "${CIQ_RUNNING:-?}" "${CIQ_RUNNERS:-?}" "${CIQ_BUSY:-?}" "$(ciq_state_dir)/ci-queue-$(ciq_slug "${repo:-}")"
       printf 'derivation: ceiling = ceil(runners * horizon / job_p90) = ceil(%s * %s / %s) = %s\n' \

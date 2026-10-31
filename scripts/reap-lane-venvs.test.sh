@@ -127,6 +127,15 @@ fi
 [ -n "${FAKE_PS_FAIL:-}" ] && exit 1
 [ -n "${FAKE_PS_SLEEP:-}" ] && sleep "$FAKE_PS_SLEEP"
 [ -n "${FAKE_PS_EMPTY:-}" ] && exit 0
+# ⛔ ARG-AWARE, because the sandbox's OTHER consumer is `proc_start_epoch` (review round 1): it asks
+# `ps -o etimes=` first and falls back to the BSD-style `ps -o etime=`. A shim that answered EVERY
+# invocation with the process table made that fallback unreachable — the zero-padded-`etime` parse
+# could not be driven at all, so its bug was invisible to this suite. These arms are matched before
+# the table output for exactly that reason.
+case " $* " in
+  *" -o etimes="*) [ -n "${FAKE_ETIMES:-}" ] && { printf '%s\n' "$FAKE_ETIMES"; exit 0; }; exit 1 ;;
+  *" -o etime="*)  [ -n "${FAKE_ETIME:-}" ]  && { printf '%s\n' "$FAKE_ETIME";  exit 0; }; exit 1 ;;
+esac
 if [ -n "${FAKE_PS_SEQ_DIR:-}" ] && [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
 if [ -n "${FAKE_PS_TABLE:-}" ] && [ -f "$FAKE_PS_TABLE" ]; then cat "$FAKE_PS_TABLE"; exit 0; fi
 # The default is NON-EMPTY and matches nothing: an empty table is a probe FAILURE by design.
@@ -171,6 +180,31 @@ fi
 printf '%s\t%s\n' "${FAKE_DU_KB:-2097152}" "$last"
 SHIM
 chmod +x "$T/bin/df" "$T/bin/du"
+
+# `PYTHON_BIN` shim — stands in for the hard-link-aware probe (#2159) so the capacity line is asserted
+# rather than measured. It is invoked as `$PYTHON_BIN $VENV_REAL_BIN --tsv <path>`, so it ignores the
+# script argument and answers from a table exactly like the `du` shim above: `<path-substring><TAB>
+# <private_kb><TAB><fair_kb><TAB><total_kb><TAB><dedupe>`. A table is what makes "the LARGEST private
+# count, never the last or the mean" DISCRIMINATING — with one value for every path, largest-of,
+# first-seen, last-seen and mean all print the same number and the suite cannot tell them apart.
+# `FAKE_VENV_COST_FAIL` models a box with no python: the probe must then read UNKNOWN, never 0.
+cat > "$T/bin/venv-cost" <<'SHIM'
+#!/usr/bin/env bash
+echo "fake-python $*" >/dev/null
+[ -n "${FAKE_VENV_COST_FAIL:-}" ] && { echo "fake-python: no such helper" >&2; exit 1; }
+# A probe that HANGS is the only way to prove the call site is bounded at all (#2159 review, P2):
+# success and immediate-failure both take the same `|| return 1` path with or without run_bounded.
+[ -n "${FAKE_VENV_COST_SLEEP:-}" ] && sleep "$FAKE_VENV_COST_SLEEP"
+for a in "$@"; do last="$a"; done
+if [ -n "${FAKE_VENV_COST_TABLE:-}" ] && [ -f "$FAKE_VENV_COST_TABLE" ]; then
+    while IFS="$(printf '\t')" read -r pat priv fair total dedupe; do
+        [ -n "$pat" ] || continue
+        case "$last" in *"$pat"*) printf '%s\t%s\t%s\t%s\n' "$priv" "$fair" "$total" "$dedupe"; exit 0 ;; esac
+    done < "$FAKE_VENV_COST_TABLE"
+fi
+printf '%s\t%s\t%s\t%s\n' "${FAKE_VENV_PRIV:-102400}" "${FAKE_VENV_FAIR:-825364}" "${FAKE_VENV_TOTAL:-5940900}" "${FAKE_VENV_DEDUPE:-ok}"
+SHIM
+chmod +x "$T/bin/venv-cost"
 
 # run_shimmed <args…> — the reaper with the three liveness shims, the capacity shims and a throwaway
 # log; prints stdout+stderr. Extra `VAR=value` words before the flags become the environment of the ONE
@@ -717,7 +751,7 @@ run_cap() {
         case "$1" in *=*) envs+=("$1"); shift ;; *) break ;; esac
     done
     PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" TMUX_BIN="$T/bin/tmux" \
-    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_FREE_FLOOR_MB=2048 \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" PYTHON_BIN="$T/bin/venv-cost" REAP_VENV_FREE_FLOOR_MB=2048 \
     REAP_VENV_LOG="$T/reap-cap.log" \
     env "${envs[@]}" bash "$REAPER" "$@" 2>&1
 }
@@ -773,7 +807,7 @@ printf 'dead\t1048576\nlive1\t4194304\nlive2\t2097152\n' > "$T/du-h.tsv"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DU_TABLE="$T/du-h.tsv" --gc --repo "$RH")"; rc=$?
 # Exact full-line pin: a bare `lanes_headroom=2` would be satisfied by `lanes_headroom=2048` (a real
 # wrong answer when the units are misread), so assert the whole capacity line instead.
-assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
+assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB lane_venv_real=100MB venv_dedupe=ok venv_degraded=0 free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
     "the LARGEST env drives the line: 4096MB, not first=1024/last=2048/mean~2389, headroom=(10240-2048)/4096=2"
 assert_eq "$rc" "0" "the mixed-size pass exits 0"
 
@@ -785,11 +819,88 @@ echo " H5b ORDER-INDEPENDENCE: the LARGEST lane is found whatever order discover
 # and last-seen cannot satisfy both.
 printf 'dead\t1048576\nlive1\t2097152\nlive2\t4194304\n' > "$T/du-h2.tsv"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DU_TABLE="$T/du-h2.tsv" --gc --repo "$RH")"; rc=$?
-assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
+assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB lane_venv_real=100MB venv_dedupe=ok venv_degraded=0 free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
     "the largest lane is found with the sizes swapped too (same exhaustive line)"
 assert_eq "$rc" "0" "the swapped-size pass exits 0"
 
-echo " H6 a reaped pass still asserts the floor AND the removal is not undone by it"
+echo " H5c the REAL (hard-link-aware) cost is the LARGEST private count — not the last, not the mean (#2159)"
+# The defect this section exists for: `du` prices a hardlinked env at its full tree size (5.66 GB) and
+# a private copy at the SAME number, so the two classes are indistinguishable and the box looks ~20x
+# fuller than it is. `lane_venv_real` is the private-block count — the bytes that VANISH on reaping.
+# Discriminating table: private sizes 1024/4096/2048-ish KB in an order where largest-of, first-seen,
+# last-seen and mean all differ. `git worktree list` order is not a contract, so the pair below (largest
+# on the OTHER live lane) makes first-seen/last-seen fail at least one run.
+printf 'dead\t1024\t2000\t5940900\tdegraded\nlive1\t4194304\t5000000\t5940900\tok\nlive2\t2048\t3000\t5940900\tok\n' > "$T/vc-h.tsv"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_TABLE="$T/vc-h.tsv" --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=4096MB" "the LARGEST private count drives the line (4096, not last=2 or mean~1367)"
+assert_contains "$out" "venv_degraded=1" "the one degraded class is COUNTED, not averaged away"
+assert_contains "$out" "venv_dedupe=degraded" "one degraded env makes the pass's dedupe verdict degraded (fail-loud, not 'mostly ok')"
+# ⛔ THE `du` DIVISOR MUST NOT MOVE. The real cost is REPORTED beside it and never replaces it: `du` is
+# the cold-cache upper bound, and a headroom computed from the warm-cache number would dispatch lanes a
+# box cannot hold the first time the cache is missing (a fail-OPEN on the one line that gates dispatch).
+assert_contains "$out" "lane_venv_max=2048MB" "the du divisor is unchanged — the real cost is reported, never substituted"
+assert_contains "$out" "lanes_headroom=4" "headroom still divides the UPPER BOUND (10240-2048)/2048, so it cannot over-admit"
+assert_eq "$rc" "0" "a degraded-dedupe pass still completes"
+
+printf 'dead\t1024\t2000\t5940900\tok\nlive1\t2048\t3000\t5940900\tok\nlive2\t4194304\t5000000\t5940900\tok\n' > "$T/vc-h2.tsv"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_TABLE="$T/vc-h2.tsv" --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=4096MB" "the largest private count is found with the sizes swapped too (order-independent)"
+assert_contains "$out" "venv_degraded=0" "no degraded env in this table"
+
+echo " H5c2 a MEASURED zero prints 0MB, not ? — a perfectly-shared env is not a broken probe"
+# The ideal box: every byte shared, so private_kb == 0 and dedupe=ok. Printing `?` here would tell a
+# reader the probe failed on the box that is working exactly as intended (#2159 review, P2).
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_PRIV=0 FAKE_VENV_FAIR=0 --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=0MB" "a measured private cost of 0 is reported as 0MB"
+assert_contains "$out" "venv_dedupe=ok" "and the dedupe verdict still says the sharing is in force"
+assert_not_contains "$out" "lane_venv_real=?" "a shared env is never reported as an unmeasurable one"
+assert_eq "$rc" "0" "the ideal-box pass exits 0"
+
+echo " H5c3 the cost probe is BOUNDED — a hanging probe cannot hang the pass"
+# Only a hanging probe can discriminate a bare call from a `run_bounded` one: success and an immediate
+# failure are identical on both paths, so replacing the call with an unbounded one stayed green before
+# this case existed (#2159 review, P2).
+t0=$SECONDS
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=30 REAP_VENV_VENV_COST_TIMEOUT=1 --gc --repo "$RH")"; rc=$?
+elapsed=$((SECONDS - t0))
+[ "$elapsed" -lt 20 ] && ok "a 30s probe bounded at 1s let the pass finish in ${elapsed}s" \
+    || bad "the probe ran unbounded — the pass took ${elapsed}s (expected < 20s)"
+assert_contains "$out" "lane_venv_real=?" "a timed-out probe is UNKNOWN, never a partial number"
+assert_eq "$rc" "0" "a timed-out probe does not fail the pass"
+# An INVALID bound arms no watchdog at all in run_bounded, so it must be refused loudly, not silently.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=2 REAP_VENV_VENV_COST_TIMEOUT=abc --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "is not a number" "an invalid timeout is named, not silently unbounded"
+# ⛔ AN ALL-DIGIT VALUE ABOVE intmax IS THE FAIL-OPEN CASE (review round 3): `is_pos_int` accepts it and
+# `[ <huge> -eq 0 ]` ERRORS rather than returning false, so a "digits and not zero" check let it through
+# and armed no watchdog at all. A string-compare + length cap is what makes this reachable-and-refused.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=2 REAP_VENV_VENV_COST_TIMEOUT=99999999999999999999999 --gc --repo "$RH")" 2>&1; rc=$?
+assert_contains "$out" "out of range" "an over-range all-digit timeout is refused too, not accepted as a bound"
+assert_not_contains "$out" "integer expression expected" "the cost-seam validation does not itself emit an arithmetic error"
+# ⛔ LEADING ZEROS SPELL ZERO (review round 4, P1): a string compare against "0" refuses only that
+# spelling, so `00`/`000` passed validation and then meant zero to run_bounded's numeric test — no
+# watchdog, no warning. Exactly the fail-open this validation exists to prevent.
+for z in 00 000 00000; do
+    out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" REAP_VENV_VENV_COST_TIMEOUT="$z" --gc --repo "$RH")" 2>&1; rc=$?
+    assert_contains "$out" "using 60s" "a zero spelled '$z' is refused loudly, not silently unbounded"
+done
+# …and a merely zero-PADDED positive value is VALID (60), not a false refusal.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" REAP_VENV_VENV_COST_TIMEOUT=000060 --gc --repo "$RH")" 2>&1; rc=$?
+assert_not_contains "$out" "REAP_VENV_VENV_COST_TIMEOUT=" "000060 is a valid 60s bound, not a false refusal"
+# The root fix: an over-range bound at a SIBLING seam warns instead of aborting the comparison.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" REAP_VENV_PS_TIMEOUT=99999999999999999999999 --gc --repo "$RH")" 2>&1; rc=$?
+assert_contains "$out" "out of range" "a sibling bound seam is validated at the root (run_bounded), not only at one call site"
+assert_not_contains "$out" "integer expression expected" "and no probe bound can abort its own comparison"
+# (the venv-cost seam's own arithmetic-error assertion sits with its run, above)"
+
+echo " H5d an unmeasurable probe reads UNKNOWN, never 0 (#2159)"
+# A `0` here would read as "a lane env is free", which is the exact over-admission this line exists to
+# prevent. A box with no python3 is a real host state (a fresh cell before setup), so it is modelled.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_FAIL=1 --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=?" "an unmeasurable real cost is printed as ?, not as 0"
+assert_contains "$out" "venv_dedupe=unknown" "and the dedupe verdict is unknown, never 'ok'"
+assert_eq "$rc" "0" "an unmeasurable probe does not fail the pass (nothing was mis-deleted)"
+
+ echo " H6 a reaped pass still asserts the floor AND the removal is not undone by it"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" --gc --repo "$RH" --apply)"; rc=$?
 assert_contains "$out" "reaped=1" "the dead lane's env was reaped"
 assert_contains "$out" "capacity: lanes_live=2 " "the capacity line is printed on an ARMED pass too"
@@ -1026,6 +1137,203 @@ else
   kill "$IDLE_SHELL_PID" 2>/dev/null; wait "$IDLE_SHELL_PID" 2>/dev/null
 fi
 rm -f "$T/kfifo"
+
+# ── K5: EVERY holder is examined, and the scan TERMINATES (§2721 review round 1, P1+P2) ───────────
+# The first version advanced the scan by REWRITING THE PROBE TABLE, which was (a) unbounded — a failed
+# write on a full cell left the row in place and the loop never terminated, in the one state this
+# reaper exists for — and (b) shared, so a pid inside a nested worktree consumed the evidence another
+# worktree needed. Both defects reduce to "the scan must reach holder N+1 without mutating anything",
+# which is what this arm pins: THREE holders, the first two idle shells, the third a working one. The
+# verdict must be KEEP, it must come from the THIRD pid, and the pass must FINISH (a reintroduced
+# mutation loop hangs here instead of returning).
+RK5="$(newrepo k5)"
+W_K5="$(mkwt "$RK5" idle3)"
+mkfifo "$T/k5fifo"
+( cd "$W_K5" && exec bash -c 'read -r _x' < "$T/k5fifo" ) 2>/dev/null &
+K5A=$!
+( cd "$W_K5" && exec bash -c 'read -r _x' < "$T/k5fifo" ) 2>/dev/null &
+K5B=$!
+sleep 1
+K5_HEAD=$(( $(date +%s) + 600 ))
+GIT_AUTHOR_DATE="@$K5_HEAD" GIT_COMMITTER_DATE="@$K5_HEAD" \
+  git -C "$W_K5" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "two idle shells sat down first"
+( cd "$W_K5" && exec bash -c 'while :; do sleep 3600; done' ) 2>/dev/null &
+K5C=$!
+sleep 1
+if [ "$(readlink "/proc/$K5A/cwd" 2>/dev/null || true)" = "$(canon "$W_K5")" ] &&
+   [ "$(readlink "/proc/$K5C/cwd" 2>/dev/null || true)" = "$(canon "$W_K5")" ]; then
+  echo " K5 two IDLE shells then a WORKING holder: the verdict comes from the third, and the pass ends"
+  # The real drive: the FIRST two holders are demoted (named), the THIRD keeps the env, and the pass
+  # returns instead of spinning. `timeout` is the assertion that it TERMINATES — a hung pass fails.
+  out="$(timeout 300 env PS_BIN=/bin/ps LSOF_BIN="$(command -v lsof || true)" TMUX_BIN=/nonexistent/tmux \
+          DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_FREE_FLOOR_MB=2048 \
+          REAP_VENV_LOG="$T/reap-k5.log" bash "$REAPER" --worktree "$W_K5" --apply 2>&1)"; rc=$?
+  assert_eq "$rc" "0" "the pass completes (a reintroduced table-mutation loop would hang and time out)"
+  assert_contains "$out" "KEEP live-cwd" "the THIRD holder decides: a working shell still keeps the env"
+  exists "$W_K5/.venv" "so the env survives"
+  k5log="$(cat "$T/reap-k5.log" 2>/dev/null)"
+  assert_contains "$k5log" "stale-shell:" "the demoted holders are still NAMED in the pass log"
+  kill -9 "$K5C" 2>/dev/null; wait "$K5C" 2>/dev/null
+  for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    case "$_p" in "$K5A"|"$K5B") continue ;; esac
+    [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$(canon "$W_K5")" ] && kill -9 "$_p" 2>/dev/null
+  done
+  sleep 1
+else
+  echo "  ⏭ SKIP K5: could not place the holders inside the worktree"
+fi
+kill "$K5A" "$K5B" 2>/dev/null; wait "$K5A" "$K5B" 2>/dev/null
+rm -f "$T/k5fifo"
+
+# ── K6: a ZERO-PADDED `ps -o etime` parses as DECIMAL, so the BSD fallback can demote at all ───────
+# `ps -o etime` prints zero-padded fields (`1:08:30`), and bash rejects `08` as a bad OCTAL constant:
+# the arithmetic ERRORED, the start time came back EMPTY, and the holder stayed live for ever — the
+# rule silently never fired on any host that reaches the fallback. The arm pins the HOURS component
+# specifically: HEAD is 1,000s in the past and the elapsed time is 1:08:30, so a parse that DROPS the
+# hours (start = now-510) reads the shell as YOUNGER than HEAD and keeps it — the mutant fails here.
+RK6="$(newrepo k6)"
+W_K6="$(mkwt "$RK6" etime)"
+mkvenv "$W_K6"
+K6_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K6_TS" GIT_COMMITTER_DATE="@$K6_TS" \
+  git -C "$W_K6" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+printf '1 0 /sbin/launchd\n4242 1 /bin/bash\n' > "$T/k6-ps.txt"
+printf 'p4242\nn%s\n' "$(canon "$W_K6")" > "$T/k6-lsof.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k6-ps.txt" FAKE_LSOF_TABLE="$T/k6-lsof.txt" \
+        FAKE_ETIME='1:08:30' REAP_VENV_PROC_ROOT="$T/no-proc" \
+        --worktree "$W_K6" --apply)"
+assert_contains "$out" "REAP" "a 1:08:30 idle shell that predates HEAD is demoted, so the env is reaped"
+absent "$W_K6/.venv" "the env was actually removed"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "stale-shell:" "…and the demotion is named"
+
+# ── K7: the store cap may not TRUNCATE the scan into "no live holder" (#2721 review round 2, P2) ──
+# The cap is a runaway guard, and its first version counted only the cwd+tmux tables — so on a host
+# with no lsof (`REAP_VENV_ALLOW_DEGRADED_CWD=1`) and no tmux server it collapsed to 4, and a worktree
+# with five holders was truncated at the fourth and read as UNHELD, reaping a live lane's env. The
+# fifth holder here is a `python3` (never demotable), so the verdict must be KEEP: reaching it is the
+# property, and the pre-fix tree stops one row short and prints REAP.
+RK7="$(newrepo k7)"
+W_K7="$(mkwt "$RK7" five)"
+mkvenv "$W_K7"
+K7_TS=$(( $(date +%s) + 600 ))
+GIT_AUTHOR_DATE="@$K7_TS" GIT_COMMITTER_DATE="@$K7_TS" \
+  git -C "$W_K7" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD after the holders sat down"
+K7_CANON="$(canon "$W_K7")"
+{
+  printf '1 0 /sbin/launchd\n'
+  i=0
+  while [ "$i" -lt 4 ]; do
+    i=$((i + 1)); printf '%s 1 /bin/bash -c cd %s idle-%s\n' "$((5000 + i))" "$K7_CANON" "$i"
+  done
+  printf '5100 1 /usr/bin/python3 %s/.venv/bin/python\n' "$K7_CANON"
+} > "$T/k7-ps.txt"
+: > "$T/reap.log"   # the log is APPEND-ONLY across the whole suite: read only THIS pass
+out="$(run_shimmed FAKE_PS_TABLE="$T/k7-ps.txt" FAKE_LSOF_FAIL=1 \
+        REAP_VENV_PROC_ROOT="$T/no-proc" REAP_VENV_ALLOW_DEGRADED_CWD=1 FAKE_ETIMES=600 \
+        --worktree "$W_K7" --apply)"
+assert_contains "$out" "KEEP" "the scan reaches the FIFTH holder and keeps the env (the cap does not truncate)"
+assert_contains "$out" "live-argv" "…and the verdict names the argv witness that decided it"
+exists "$W_K7/.venv" "the env survives — an idle shell and a working lane share the worktree"
+# ⛔ AND THE SCAN WAS NOT TRUNCATED (review round 3, P2). Mutation-verified: reverting the cap to the
+# round-2 form (cwd+tmux only) left this arm GREEN, because a truncation prints `live-argv` for the
+# fifth holder too — byte-identical to reaching it. The pass log's `TRUNCATED` line is the ONLY
+# observable that separates "the cap holds" from "the cap cut the scan short and we got lucky", so the
+# assertion has to read it, and its ABSENCE is the claim.
+if grep -q 'stale-shell-scan TRUNCATED' "$T/reap.log" 2>/dev/null; then
+  bad "…but the scan WAS truncated (reap.log names it) — the cap cut the witness list short"
+else
+  ok "…and the scan was NOT truncated, so the cap cannot hide a holder behind a lucky witness (log clean)"
+fi
+
+# ── K8/K9: the per-record EXCLUDE LIST is what makes the CWD and TMUX arms terminate ─────────────
+# The idle-shell rule demotes a holder and adds its pid to the exclude list, so the next probe call
+# advances instead of re-reporting the pid it just demoted. K7 pins that for the ARGV table, and the two
+# remaining sites were UNEVEN in coverage — measured on the 207-assertion tree: deleting the skip from
+# `cwd_witness_for` left it at 203/207 (FOUR red: K2's `k/idle` pair and K6's `1:08:30` pair already
+# reached that site), while deleting the skip from `tmux_witness_for` left 207/207 GREEN. So K9 is the arm that closed a real gap
+# and K8 makes the cwd site explicit rather than incidental — stated that way round because the failure
+# mode of a lost skip is the same at both sites: the scan re-reads the pid it just demoted until the
+# runaway cap, then fails closed, i.e. the KEEP rule silently stops firing for the exact cell-4 shape
+# (#2721: 59 checkouts held by idle shells) with every arm green. Each fixture has ONE holder, in ONE
+# table, so the arm is only green when the scan advances past it and reaps.
+RK8="$(newrepo k8)"
+W_K8="$(mkwt "$RK8" cwdskip)"
+K8_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K8_TS" GIT_COMMITTER_DATE="@$K8_TS" \
+  git -C "$W_K8" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+K8_CANON="$(canon "$W_K8")"
+printf '1 0 /sbin/launchd\n65002 1 /bin/bash\n' > "$T/k8-ps.txt"
+printf 'p65002\nn%s\n' "$K8_CANON" > "$T/k8-lsof.txt"
+: > "$T/reap.log"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k8-ps.txt" FAKE_LSOF_TABLE="$T/k8-lsof.txt" \
+        FAKE_ETIME='10:00:00' REAP_VENV_PROC_ROOT="$T/no-proc" \
+        --worktree "$W_K8" --apply)"
+assert_contains "$out" "REAP" "K8 a lone CWD holder that is an idle shell is demoted and the env reaped"
+absent "$W_K8/.venv" "K8 the env was actually removed"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "stale-shell: pid=65002(cwd)" \
+    "K8 ...and the CWD demotion is named with its witness"
+if grep -q 'TRUNCATED' "$T/reap.log" 2>/dev/null; then
+  bad "K8 the scan was TRUNCATED - the cwd witness did not advance past the demoted pid"
+else
+  ok "K8 and the scan advanced (no TRUNCATED line): the exclude list is consulted by the cwd probe"
+fi
+
+RK9="$(newrepo k9)"
+W_K9="$(mkwt "$RK9" tmuxskip)"
+K9_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K9_TS" GIT_COMMITTER_DATE="@$K9_TS" \
+  git -C "$W_K9" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+K9_CANON="$(canon "$W_K9")"
+printf '1 0 /sbin/launchd\n65003 1 /bin/bash\n' > "$T/k9-ps.txt"
+printf '65003\t%s\n' "$K9_CANON" > "$T/k9-tmux.txt"
+: > "$T/reap.log"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k9-ps.txt" FAKE_TMUX_TABLE="$T/k9-tmux.txt" \
+        FAKE_ETIME='10:00:00' REAP_VENV_PROC_ROOT="$T/no-proc" \
+        --worktree "$W_K9" --apply)"
+assert_contains "$out" "REAP" "K9 a lone TMUX-PANE holder that is an idle shell is demoted too (the pane witness has the same rule)"
+absent "$W_K9/.venv" "K9 the env was actually removed"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "stale-shell: pid=65003(tmux-pane)" \
+    "K9 ...and the pane demotion is named with its witness"
+if grep -q 'TRUNCATED' "$T/reap.log" 2>/dev/null; then
+  bad "K9 the scan was TRUNCATED - the tmux witness did not advance past the demoted pid"
+else
+  ok "K9 and the scan advanced (no TRUNCATED line): the exclude list is consulted by the tmux probe"
+fi
+
+# ── K10: the CAP-EXHAUSTION branch keeps the env (a truncated scan is never "no holder") ───────
+# The cap is a runaway guard, and its exhaustion branch is otherwise unreachable (the default exceeds any
+# holder count, and each iteration consumes a distinct pid) — so its POLARITY was unpinned: reverting it to
+# "give up" kept this suite green while a truncated scan would read as "every holder was demoted" and the
+# lane's env deleted (review round 8, P2). `REAP_VENV_SCAN_CAP` (a test seam; production never sets it)
+# makes the branch reachable: three demotable idle shells and a cap of two.
+RK10="$(newrepo k10)"
+W_K10="$(mkwt "$RK10" caps)"
+K10_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K10_TS" GIT_COMMITTER_DATE="@$K10_TS" \
+  git -C "$W_K10" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+K10_CANON="$(canon "$W_K10")"
+{
+  printf '1 0 /sbin/launchd\n'
+  i=0
+  while [ "$i" -lt 3 ]; do
+    i=$((i + 1))
+    printf '%s 1 /bin/bash\n' "$((64000 + i))"
+  done
+} > "$T/k10-ps.txt"
+# The cwd table carries the same three pids (lsof's `p<pid>` / `n<path>` records), so the cwd witness
+# alone can exhaust the cap and the demotions never drain it.
+{
+  i=0
+  while [ "$i" -lt 3 ]; do i=$((i + 1)); printf 'p%s\nn%s\n' "$((64000 + i))" "$K10_CANON"; done
+} > "$T/k10-lsof.txt"
+: > "$T/reap.log"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k10-ps.txt" FAKE_LSOF_TABLE="$T/k10-lsof.txt" \
+        FAKE_ETIME='10:00:00' REAP_VENV_PROC_ROOT="$T/no-proc" REAP_VENV_SCAN_CAP=2 \
+        --worktree "$W_K10" --apply)"
+assert_contains "$out" "KEEP" "K10 a TRUNCATED scan keeps the env (it is never read as 'no live holder')"
+exists "$W_K10/.venv" "K10 ...the env is still there"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "TRUNCATED" \
+    "K10 ...and the pass says the scan was truncated, so the keeper is explainable"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"

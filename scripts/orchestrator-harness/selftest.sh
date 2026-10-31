@@ -100,10 +100,28 @@ PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
 # ── 1) every script parses ───────────────────────────────────────────────────────
+# ⛔ #2930 — RUNTIME AND TEST SUITES ARE NOT THE SAME RISK, AND THIS SWEEP USED TO BLOCK ON BOTH.
+# `harness-up up` REFUSES to start on a failed self-test, so a `*.test.sh` that does not parse on THIS
+# host used to stop a healthy controller from starting at all — the catch-22 `install.sh` had, one
+# level up, and it has already happened twice (this file's own comment above records the 3.2 `case`
+# pattern, and #2930 records `merge-reminder.test.sh`). A RUNTIME script still refuses: the controller
+# executes it and launchd would crash-loop. A TEST suite is reported BY NAME and never counted as a
+# failure — it cannot affect the runtime, and the class is gated before merge by
+# scripts/check-bash32-parse.sh (a real bash 3.2 over every shipped `*.sh`, in both CI lanes).
 rc=0
 for f in "$HERE"/*.sh "$HERE"/retired/*.sh; do
   [ "$(basename "$f")" = "selftest.sh" ] && continue
-  bash -n "$f" || { echo "      syntax error: $f"; rc=1; }
+  case "$(basename "$f")" in
+    *.test.sh)
+      if ! _err="$(bash -n "$f" 2>&1)"; then
+        echo "      syntax error in the TEST suite $(basename "$f") — reported, NOT fatal (#2930):"
+        printf '%s\n' "$_err" | sed 's/^/        /'
+      fi
+      ;;
+    *)
+      bash -n "$f" || { echo "      syntax error: $f"; rc=1; }
+      ;;
+  esac
 done
 ck "all shell scripts parse (bash -n)" $rc
 
@@ -586,6 +604,13 @@ awk '/^n=0$/{f=1} f{print} /^done < /{f=0}' "$REFRESH" > "$TMP/refreshloop.sh"
 # `"$SC/.venv/bin/python" tools/collision_preflight.py` with those, so the extraction must supply
 # them or the check would pass by running an empty command (no VERDICT) rather than the stub.
 if need "$TMP/refreshloop.sh" "the refresh loop body is extracted from the shipped refresh-candidates.sh"; then
+  # THE CLAIM VERDICT IS A SEPARATE CONTRACT, stubbed for the walk fixtures (agent-infra#2466). The
+  # walk's own questions are "is this candidate consumed", "is it retried", "does a landed record free
+  # a slot"; the cross-box claim read is pinned by §5b-bis below and by refresh-scout.test.sh's
+  # claim-* cases. Without the stub every fixture here would take the fail-closed INCOMPLETE arm, which
+  # is correct behaviour and the wrong fixture — the same shape as supplying $PY/$PREFLIGHT above.
+  { printf '%s\n' 'issue_claim_verdict() { CLAIM_RESULT=""; return 0; }'
+    cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-drive.sh"
   RL="$TMP/refresh"; mkdir -p "$RL/fakesc/.venv/bin"
   printf '10\n20\n30\n40\n50\n' > "$RL/.pool"
   : > "$RL/checked.txt"; : > "$RL/candidates.txt"; : > "$RL/dispatched.txt"
@@ -595,7 +620,7 @@ if need "$TMP/refreshloop.sh" "the refresh loop body is extracted from the shipp
 echo "VERDICT: CLEAN"
 PY
   chmod +x "$RL/fakesc/.venv/bin/python"
-  O="$RL" LIMIT=3 SC="$RL/fakesc" PY="$RL/fakesc/.venv/bin/python" PREFLIGHT="$RL/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/refreshloop.out" 2>&1
+  O="$RL" LIMIT=3 SC="$RL/fakesc" PY="$RL/fakesc/.venv/bin/python" PREFLIGHT="$RL/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/refreshloop.out" 2>&1
   checked="$(tr '\n' ' ' < "$RL/checked.txt")"
   case "$checked" in *40*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: the candidate past LIMIT is NOT marked checked" $rc
@@ -604,6 +629,13 @@ PY
   cands="$(tr '\n' ' ' < "$RL/candidates.txt")"
   case "$cands" in *10*20*30*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: the pre-flighted CLEAN candidates reach the backlog" $rc
+
+  # ⛔ THE FAIL-CLOSED CLAIM READ IS NOT DRIVEN HERE (agent-infra#2466), ON PURPOSE. This fixture
+  # extracts the WALK, so `issue_claim_verdict` — the function that owns the missing-registry verdict —
+  # is not defined in it, and a case here would grade the extraction's 127 fallback rather than the
+  # shipped answer (measured: it "passed" while naming neither the registry nor the exit code). The
+  # real contract is driven against the SHIPPED script in refresh-scout.test.sh's `claim-absent` case
+  # (nothing queued, the refusal names the registry, the pass exits non-zero).
 
   # ── 5c) a pre-flight that produced NO verdict must not blacklist the issue ───────────────────
   # Same loop, but the stub python now fails the way a broken scout venv / API failure does: it
@@ -620,7 +652,7 @@ echo "boom: could not reach the graph" >&2
 exit 1
 PY
   chmod +x "$RV/fakesc/.venv/bin/python"
-  O="$RV" LIMIT=5 SC="$RV/fakesc" PY="$RV/fakesc/.venv/bin/python" PREFLIGHT="$RV/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/verdict.out" 2>&1
+  O="$RV" LIMIT=5 SC="$RV/fakesc" PY="$RV/fakesc/.venv/bin/python" PREFLIGHT="$RV/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/verdict.out" 2>&1
   case "$(tr '\n' ' ' < "$RV/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: an ERRORED pre-flight does NOT blacklist the issue" $rc
   case "$(tr '\n' ' ' < "$RV/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
@@ -640,12 +672,12 @@ S="$(dirname "$0")/.pass"
 if [ -f "$S" ]; then echo "VERDICT: CLEAN"; else : > "$S"; echo "VERDICT: COLLISION"; fi
 PY
   chmod +x "$RC/fakesc/.venv/bin/python"
-  O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/collide-1.out" 2>&1
+  O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/collide-1.out" 2>&1
   case "$(tr '\n' ' ' < "$RC/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: a COLLISION does not permanently blacklist the issue" $rc
   case "$(tr '\n' ' ' < "$RC/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: a COLLISION is not queued" $rc
-  O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/collide-2.out" 2>&1
+  O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/collide-2.out" 2>&1
   case "$(tr '\n' ' ' < "$RC/candidates.txt")" in *10*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: the COLLISION is re-attempted and queued once it clears" $rc
 
@@ -665,7 +697,7 @@ echo x >> "$(dirname "$0")/.calls"
 echo "VERDICT: LANDED (exit 4) — 1 authoritative terminal signal(s)"
 PY
   chmod +x "$RL2/fakesc/.venv/bin/python"
-  O="$RL2" LIMIT=5 SC="$RL2/fakesc" PY="$RL2/fakesc/.venv/bin/python" PREFLIGHT="$RL2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-1.out" 2>&1
+  O="$RL2" LIMIT=5 SC="$RL2/fakesc" PY="$RL2/fakesc/.venv/bin/python" PREFLIGHT="$RL2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/landed-1.out" 2>&1
   case "$(tr '\n' ' ' < "$RL2/landed.txt")" in *10*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: a LANDED verdict is recorded in landed.txt (not checked.txt)" $rc
   case "$(tr '\n' ' ' < "$RL2/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
@@ -684,7 +716,7 @@ PY
     ck "shipped refresh: the landed set and its remedy are printed when it is recorded" $rc
   fi
   # a SECOND pass, where no new verdict arrives at all (the issue is skipped via landed.txt).
-  O="$RL2" LIMIT=5 SC="$RL2/fakesc" PY="$RL2/fakesc/.venv/bin/python" PREFLIGHT="$RL2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-2.out" 2>&1
+  O="$RL2" LIMIT=5 SC="$RL2/fakesc" PY="$RL2/fakesc/.venv/bin/python" PREFLIGHT="$RL2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/landed-2.out" 2>&1
   # ... and the set is still named on that later pass. That is what makes the entry a reported
   # decision instead of an invisible permanent suppression.
   sum2="$(O="$RL2" bash "$TMP/landedsum.sh" 2>&1)"
@@ -704,12 +736,12 @@ PY
 case "$*" in *" 10 "*) echo "VERDICT: LANDED (exit 4)";; *) echo "VERDICT: CLEAN";; esac
 PY
   chmod +x "$RC2/fakesc/.venv/bin/python"
-  O="$RC2" LIMIT=1 SC="$RC2/fakesc" PY="$RC2/fakesc/.venv/bin/python" PREFLIGHT="$RC2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-cap-1.out" 2>&1
+  O="$RC2" LIMIT=1 SC="$RC2/fakesc" PY="$RC2/fakesc/.venv/bin/python" PREFLIGHT="$RC2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/landed-cap-1.out" 2>&1
   case "$(tr '\n' ' ' < "$RC2/landed.txt")" in *10*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: the LANDED entry is recorded while the slot is spent" $rc
   [ "$(tr '\n' ' ' < "$RC2/candidates.txt" | wc -w | tr -d ' ')" = "0" ] && rc=0 || rc=1
   ck "shipped refresh loop: the LIMIT-1 pass pre-flights one issue and queues none of them" $rc
-  O="$RC2" LIMIT=1 SC="$RC2/fakesc" PY="$RC2/fakesc/.venv/bin/python" PREFLIGHT="$RC2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-cap-2.out" 2>&1
+  O="$RC2" LIMIT=1 SC="$RC2/fakesc" PY="$RC2/fakesc/.venv/bin/python" PREFLIGHT="$RC2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/landed-cap-2.out" 2>&1
   case "$(tr '\n' ' ' < "$RC2/candidates.txt")" in *20*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: a recorded LANDED entry frees the next pass's LIMIT slot (20 queued)" $rc
 
@@ -725,12 +757,12 @@ PY
 echo 'boom: no verdict' >&2; exit 1
 PY
   chmod +x "$RL3/fakesc/.venv/bin/python"
-  O="$RL3" LIMIT=2 RETRY_MAX=3 SC="$RL3/fakesc" PY="$RL3/fakesc/.venv/bin/python" PREFLIGHT="$RL3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/retry-1.out" 2>&1
+  O="$RL3" LIMIT=2 RETRY_MAX=3 SC="$RL3/fakesc" PY="$RL3/fakesc/.venv/bin/python" PREFLIGHT="$RL3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/retry-1.out" 2>&1
   # attempt 1 must NOT blacklist it: a transient failure is recoverable
   if grep -q 'attempt 1/3' "$TMP/retry-1.out" && ! grep -qx 10 "$RL3/checked.txt"; then rc=0; else rc=1; fi
   ck "shipped refresh loop: a failed pre-flight is retried, not blacklisted on attempt 1" $rc
   for _pass in 2 3; do
-    O="$RL3" LIMIT=2 RETRY_MAX=3 SC="$RL3/fakesc" PY="$RL3/fakesc/.venv/bin/python" PREFLIGHT="$RL3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/retry.out" 2>&1
+    O="$RL3" LIMIT=2 RETRY_MAX=3 SC="$RL3/fakesc" PY="$RL3/fakesc/.venv/bin/python" PREFLIGHT="$RL3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/retry.out" 2>&1
   done
   if grep -q 'marked checked after 3 verdict-less attempts' "$TMP/retry.out" && [ "$(tr '\n' ' ' < "$RL3/checked.txt")" = "10 " ]; then rc=0; else rc=1; fi
   ck "shipped refresh loop: a persistently non-verdict entry is retried then bounded (RETRY_MAX)" $rc
@@ -755,7 +787,7 @@ exit 2
 PY
   chmod +x "$RV2/fakesc/.venv/bin/python"
   for _pass in 1 2 3 4 5; do
-    O="$RV2" LIMIT=2 RETRY_MAX=2 SC="$RV2/fakesc" PY="$RV2/fakesc/.venv/bin/python" PREFLIGHT="$RV2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/inc.out" 2>&1
+    O="$RV2" LIMIT=2 RETRY_MAX=2 SC="$RV2/fakesc" PY="$RV2/fakesc/.venv/bin/python" PREFLIGHT="$RV2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" > "$TMP/inc.out" 2>&1
   done
   if [ ! -s "$RV2/checked.txt" ] && [ ! -s "$RV2/candidates.txt" ] && grep -q 'INCOMPLETE' "$TMP/inc.out"; then rc=0; else
     rc=1; echo "      checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] candidates=[$(tr '\n' ' ' < "$RV2/candidates.txt")]"
@@ -770,7 +802,7 @@ PY
   vlessf() { printf '#!/bin/bash\necho "boom: no verdict" >&2; exit 1\n' > "$1/fakesc/.venv/bin/python"; chmod +x "$1/fakesc/.venv/bin/python"; }
   incptf() { printf '#!/bin/bash\necho "VERDICT: INCOMPLETE (exit 2) - 1 surface(s) could not be queried; NOT clean"\nexit 2\n' > "$1/fakesc/.venv/bin/python"; chmod +x "$1/fakesc/.venv/bin/python"; }
   # ploopf <dir> <retry_max> <out>: one pass of the SHIPPED loop against that fixture
-  ploopf() { O="$1" LIMIT=2 RETRY_MAX="$2" SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" >> "$3" 2>&1; }
+  ploopf() { O="$1" LIMIT=2 RETRY_MAX="$2" SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-drive.sh" >> "$3" 2>&1; }
   RV3="$TMP/inc-mixed3"; mkdir -p "$RV3/fakesc/.venv/bin"
   printf '10\n20\n' > "$RV3/.pool"
   : > "$RV3/checked.txt"; : > "$RV3/candidates.txt"; : > "$RV3/dispatched.txt"; : > "$RV3/landed.txt"
@@ -1895,7 +1927,12 @@ mem_def="$(dval MIN_MEM_FREE_MB)"
 swp_def="$(dval MIN_SWAP_FREE)"
 [ "$mem_def" = "512" ] && rcd=0 || { rcd=1; echo "      MIN_MEM_FREE_MB resolves to '$mem_def' -- README documents 512"; }
 ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped files" $rcd
-GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
+# ⛔ BY THE MARKERS, NOT BY `^  fi$` (agent-infra#2924/#2927). The chain's closing `fi` used to be the
+# only bare `  fi` after the entry line, so the extraction could stop there; the gate VECTOR put each
+# arm in its own guard, and several of those guards close on a bare `  fi` — the first one truncated
+# the block to the merge-priority arm, ELEVEN assertions still passed and the three below went red.
+# A marker is the range the code itself declares, so adding an arm cannot silently shorten the test.
+GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/# \[gatevec:end\]/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
 mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]
@@ -2149,6 +2186,14 @@ ck "the retired copy's banner warns against reuse" $rc
 if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loop.sh"; then
   mkdir -p "$TMP/CL/state"
   O="$TMP/CL"
+  # ⛔ THE VERDICT ITSELF IS SOURCED FROM claims.sh, NOT EXTRACTED (agent-infra#2466). The lease
+  # polarity and the orphan rule live beside the writer (`_lease_is_live`, `claim_orphan_reason`),
+  # and `claim_lease_live` is now a three-line mapping onto `claim_snapshot_verdict`. Extracting the
+  # mapper without the verdict would let this suite pass on a fixture whose verdict the shipped
+  # reader no longer produces — the drift class this section exists to catch.
+  CLAIM_REPO="$TMP/CL"
+  # shellcheck disable=SC1090
+  . "$HERE/claims.sh"
   # shellcheck disable=SC1090
   . "$TMP/claimlive.sh"
   printf '%s' "$$" > "$O/state/mergeclaim-1.lock"
@@ -3419,35 +3464,39 @@ fi
 # NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
-# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
-# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
-# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
-# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
-# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
-# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
-# With nesting, the two populations are disjoint by construction, so each is counted directly. The
-# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
-# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
-# ⛔ THREE fixer defer arms, in TWO spellings (#2333 review, P2). Two sites write the predicate as
-# the WHOLE condition (`if ciq_push_ok; then`, counted by `fixer_defer_sites`); the REVIEW-GATE site
-# SHARES the condition with its own eligibility (`if [ "$_fix_eligible" = "1" ] && ciq_push_ok;
-# then`), which the literal pattern cannot see — so without `fixer_defer_shared`, deleting that
-# `&& ciq_push_ok` left this check green while the site stopped deferring. (The fourth CI-queue
-# defer, the #PR CI RERUN, is not a fixer spawn and is pinned by ci-queue.test.sh's wiring arms.)
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY, AND IN BOTH DIRECTIONS.
+# ⛔ THE FIXER DEFER COUNT IS NOW ZERO ON PURPOSE (#2927). The three fixer spawn sites used to nest a
+# `ciq_push_ok` deferral inside their own eligibility. They no longer do: a fixer is REPAIR — it acts
+# on a PR that already exists — so the class rule in ci-queue.sh's header excludes it from queue
+# gating. ⛔ NOT because "its pass is already spent" (a repair push DOES start a fresh run): the basis
+# is #2927's decision plus the measurement that the NUMBER was demand read as supply. Measured 2026-10-27 on cell 4, that gate skipped 41
+# consecutive repair dispatches while 8 self-hosted runners and ~11 lane slots sat idle, against a
+# queue depth that belonged to GitHub-HOSTED concurrency and to NEW-PR work.
+# So `fixer_defer_sites`/`fixer_defer_shared` are pinned at 0: a gate RE-ADDED to any fixer arm
+# reddens this line, and `fixer_sites` still pins the load gate each one carries. The one CI-queue
+# defer that survives is the #PR CI RERUN (`! ciq_push_ok`), which genuinely ADDS a run to the queue;
+# it is not a fixer spawn and is pinned both here and by ci-queue.test.sh's wiring arms.
 fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
 fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
+rerun_gate=$(grep -cF '! ciq_push_ok' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
-merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
+# ⛔ AND THE REVIEW ORDER IS ITS OWN SPAWN SITE (agent-infra#2971). The re-record arm used to spawn
+# under the `merge-<PR>` tag and compare against `wt_count merge-)`; it now dispatches `review-<PR>`
+# and compares against `wt_count review- merge-)` (one review-lane budget across both tag families,
+# the semantics the ceiling always had). Without this the literal pattern above would stop seeing the
+# site — the count would read 1 and this check would be pinning half of what it names.
+merge_site=$(grep -E 'wt_count (review- )?merge-\)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
-[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
-ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
-[ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
-ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
+[ "$fixer_defer_sites" = "0" ] && rc=0 || rc=1
+ck "NO fixer spawn arm is CI-queue-gated (#2927 — a fixer is REPAIR; found $fixer_defer_sites, expected 0)" $rc
+[ "$fixer_defer_shared" = "0" ] && rc=0 || rc=1
+ck "…and the review-gate fixer's eligibility no longer shares a queue gate either (found $fixer_defer_shared, expected 0)" $rc
+[ "$rerun_gate" = "1" ] && rc=0 || rc=1
+ck "…while the one act that ADDS a run to the queue — the CI rerun — is still gated (found $rerun_gate, expected 1)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
-ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
+ck "both merge spawn sites (the review order review-<PR> + rail-mode GREEN merge-<PR>) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1

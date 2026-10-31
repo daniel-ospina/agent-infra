@@ -8,7 +8,7 @@ status: live
 tags: [fleet, cmux, cells, dispatch, capacity, recovery, harness]
 summary: "How to provision, measure, recover, and dispatch on cmux cloud cells, and how work actually lands from them."
 created: 2026-10-19
-updated: 2026-10-27
+updated: 2026-10-28
 ---
 
 > ⛔ **This skill MUST be read in full — not skimmed.** Every section below is a measurement that cost a lost lane, a
@@ -240,6 +240,27 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   `surface` scope at all (`cmux surface ls` → `cmux: unknown resource scope "surface"`), and the guest-side equivalent is
   `cmux layout apply` with a one-surface layout, which produces the same artifact — a shell in the cwd plus a command typed
   into it. `scripts/orchestrator-harness/worker-terminal.sh:30-32` carries that correction with its own measurement).
+- **⛔ "`cloud agent` fails while `cloud exec` works" is a GUEST-DAEMON verdict, and the volume is not necessarily why.**
+  Measured from the Mac, 2026-10-27/28 (agent-infra#2946): `cmux cloud agent … --machine <vm>` and
+  `cmux surface new-terminal --machine <vm>` answered only `Error: The Cloud VM request failed. Retry, or check the
+  machine's status with cmux vm ls.`, while `cloud exec` and `cloud push` succeeded on the same box in the same minute. On the guest,
+  in that same minute: `cmux server status` → `cannot connect to the local server`; `cmux tree --json` → rc 3, `cannot connect
+  to session socket /tmp/cmux-tui-1000/cloud.sock: No such file or directory (os error 2)`; `cmux self --json` → `"route":
+  null, "reachable": false` **for the box itself**. The cause is in the box's own journal — `sudo journalctl -u
+  cmux-tui-daemon | grep -c 'cannot be recovered atomically'` → **56,053**, first line `2026-10-26T03:51:02Z` (a day BEFORE the
+  Mac-side symptom, so a local app restart is not the cause) — a fresh server pid every ~3 s, each dying with `cmux-tui: flush
+  terminal journal during mux drop: session journal stopped` + `cmux-tui: multiple interrupted resource creations cannot be
+  recovered atomically`. So the session daemon never stays up, nothing answers on `:1337`, and **every spawn verb fails while
+  the PROVIDER-CHANNEL verbs (`cloud exec`, `cloud push`) keep working — the guest's own read path does NOT** (`cmux tree --json`
+  → rc 3, measured above) — which is why the error's own advice ("check the machine's status") sends the reader
+  to a healthy machine. ⛔ **The space lever does NOT apply here:** that volume read `3996 MB · 1892 used · 2089 free · 48 %`
+  holding a **1.9 GB** `workspace-registry.sqlite3`, so growing the loop file (step 5 below) changes nothing — this refusal is
+  **state** ("interrupted resource creations"), not a full volume. The **candidate** repair is the owner-gated registry reset
+  tracked in **agent-infra#2312** — **NOT measured against this state**: that issue's own repro is a FULL volume
+  (`database or disk is full`, `0 bytes free`), and step 5 below frames the reset as the space-reclaim fallback. Take it only
+  as an owner decision, and treat it as unverified for spawn until `cmux cloud agent … -- "reply OK"` returns a `terminal_id`
+  on that box afterwards. Until it is taken, **`tmux` is the surface that still starts a worker** on that box, and `cmux vm ls`
+  reading `reachable linked` for a peer says nothing about whether its link opens (#2345).
   ⛔ **The guest-CLI advice in this bullet and every bullet above assumes the guest CLI RUNS AT ALL, and on a measured cell shape it does
   not:** `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the `cmux-tui` symlink dangling and no daemon
   process (agent-infra#2368; the same measurement as `worker-terminal.sh:168-171` and `scripts/orchestrator-harness/README.md:568`).

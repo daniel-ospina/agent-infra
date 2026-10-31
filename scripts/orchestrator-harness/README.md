@@ -421,6 +421,7 @@ a killed worker cannot take the controller down with it.
 |---|---|---|---|
 | `lane-<N>` | `lane.sh` | `.worktrees/tm-<N>` on `feat/<N>-tm` | implement issue #N → commit → push → open PR → **take it to `merged`** through `lane-merge.sh` (bounded) |
 | `chain-<N>` | `chain-merge.sh` | — | wait for the PR **and for the lane's merge-phase verdict**, then delegate to `merge-one.sh` if the lane did not merge it |
+| `review-<PR>` | `merge-one.sh` | — | **the review ORDER** for a `(PR, head)`: a fresh-context reviewer → evidence comment → signed record, then the same landing path as `merge-<PR>` if it came back CLEAN. Dispatched by the PR path on `NEEDS-REVIEW` (agent-infra#2971) — it was spawned under the `merge-<PR>` tag until then, so a pass that REVIEWED read in the log as another merge worker and `merge-10213` was re-spawned pass after pass |
 | `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = (a head-bound record already at the head, else the same fresh review → signed record first) → the repo's own `scripts/admin-merge.sh` (#1825) |
 | `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings, **a failing required check**, or **a rail refusal that names a red tree** (agent-infra#2223 — the RED-FIXER role in the sweep), push, re-run the merge chain. ONE fixer per PR by construction: all three reasons spawn under this session name, so a second reason while a fixer lives finds the session and spawns nothing |
 | `cell-doctor` | `cloud-cell-doctor.sh loop` | `state/roles/`, `logs/doctor.log` | the cell's **own** scheduled roles — `doctor` (reap + restart a missing controller), `merge` (land attested PRs on the standard rail), `hygiene` (caches/worktrees **+ the cross-box review-record registry**: `registry-sync.sh union`, hourly, from a dedicated throwaway worktree of the agent-infra checkout, and **best-effort** — a failed sync logs the box/store/exit code and the pass continues, so a dark or rate-limited store can never fail a hygiene pass or block a merge decision; agent-infra#2577). Started by `cloud-cell-supervisor.sh start`; see §6.5.7 |
@@ -445,8 +446,8 @@ a killed worker cannot take the controller down with it.
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge/**fix** a given PR. Taken by `merge-one.sh`, by the doctor's `merge` role, and — since the pusher hole was closed (#2574) — by `fix-one.sh`, the one worker whose product is a NEW HEAD: without it a lander could re-resolve a head that a fixer then moved under it, and the rail refuses with the just-minted attestation stale. A LIVE holder makes the fixer DEFER with a refundable bail marker and no attempt consumed. A claim whose pid `kill -0` proves GONE is TAKEN OVER — measured, and by `mv` aside + verify, never `rm && write`: the record is renamed aside, what was detached is checked against the dead pid that was measured, and a record that turns out to be a peer's LIVE claim is put back with `ln` (create-if-absent) **if the path is still free** — if a third party has re-claimed it in between, the displaced claim cannot be reinstated, which is logged as a WARNING and reported as its own deferral (never as "nothing was deleted"). `fix-one.sh` also CREATES the record with its pid already in it (a pre-written file `ln`-ed into place), because a noclobber create that writes the pid afterwards leaves the file briefly EMPTY and the other three readers treat "no owner" as a reason to `rm` it. An EMPTY or unparseable record is **not** stale (that same window), so it is treated as LIVE. A lock state no re-dispatch can clear (a path that is not a regular file, or an unwritable `$O/state`) is REFUSED and the attempt is CONSUMED, so `MAX_FIX_TRIES` parks the PR instead of a refunded spin. **Per box** — the cross-box fence for the landing path is `refs/claims/pr-<PR>` in the shared repo (§7.2b) |
 | `state/needsfix-<PR>-<head>` | "a reviewer reported real issues at this exact head" — the only state that authorises a fixer ON THE REVIEW-GATE ARM (the CI-red and CONFLICTING arms dispatch on a red required check / an unmergeable head with no marker at all, by design). Deleted when a fixer is spawned, and cleared by a CLEAN verdict whose signed marker VERIFIED at that head; a verdict-less run never deletes it (nothing was pushed, so it supersedes nothing) |
 | `state/needsreview-<PR>-<head>` | "a reviewer run at this head produced NO usable verdict" — the remedy is another REVIEW, never a fixer (agent-infra#2132). Written by `merge-one.sh` ONLY (the controller cannot see whether evidence exists). One marker per PR; swept when a GATE-authority PR goes GREEN, when the PR is MERGED/CLOSED, when the signed marker verifies, and by `prune_orphan_markers` once per cycle for PRs that left the open listing (never for a marker newer than the listing). On a rail repo GREEN does not imply evidence, so the sweep does not run there |
-| `state/reviewcount-<PR>` | `"<head> <n>"`: CONSECUTIVE verdict-less reviewer runs at this head, capped by `MAX_REVIEW_TRIES`. A push (new head) and any run that did produce a verdict reset it |
-| `state/reviewdisp-<PR>` | `"<head> <n>"`: the review lanes the **CONTROLLER** has dispatched for that (PR, head), written only after a spawn succeeded. The head is the key, so a push re-arms it; an unchanged head is never re-reviewed **once CLEAN evidence exists at it** (`REVIEW-AT-HEAD`), and otherwise spends at most `MAX_REVIEW_TRIES` re-records before `REVIEW-CAP` — the budget is per head, not per PR (agent-infra#2653). Before the spawn the arm asks `review_disp_decide`, and an **unreadable head is not a key** (a review spent on an unnamed head cannot be keyed, compared or recorded — the arm refuses and names the head): **`REVIEW-AT-HEAD`** — the enforcer's store already holds a CLEAN record at exactly this head (BOTH store names are read: the repo-qualified file and the legacy `<pr>.json`, the same pair `merge-one.sh::record_at_head` checks) — so no second review is bought for an unchanged head; **`REVIEW-CAP n/max`** parks a head that spent `MAX_REVIEW_TRIES` re-records with no verdict. None is ever a silent skip. `MAX_REVIEW_TRIES=0` is **REPORT-ONLY** (no dispatch, nothing parked — the `MAX_RED_FIX_TRIES=0` idiom), and an UNWRITABLE record is named rather than swallowed (`reviewdisp` ⇒ park, `reviewathead` ⇒ `REVIEW-AT-HEAD-UNBOUNDED`; an unwritable `parked-<PR>` ⇒ `PARK DID NOT LAND`, never `PARKED`): a swallowed write makes the bound itself best-effort, which is exactly how a cap becomes unbounded. Pruned on MERGED/CLOSED and by `prune_orphan_markers` |
+| `state/reviewcount-<PR>` | **RETIRED** (agent-infra#2971): its `"<head> <n>"` budget is now the `state/reviewdisp-<PR>` record below — ONE budget shared by the two arms instead of two books neither could see. A leftover file is inert and is deleted wherever the old one was |
+| `state/reviewdisp-<PR>` | `"<head> <n>"`: review ATTEMPTS at this `(PR, head)`, spent by BOTH arms (agent-infra#2971) — the **CONTROLLER** on a dispatch, and `merge-one.sh` when a reviewer run produced no usable verdict on a path nothing counted above it (`REV_PAID=1` in the spawn command tells it the controller already paid, so one attempt is never counted twice). The controller dispatched for that (PR, head), written only after a spawn succeeded. The head is the key, so a push re-arms it; an unchanged head is never re-reviewed **once CLEAN evidence exists at it** (`REVIEW-AT-HEAD`), and otherwise spends at most `MAX_REVIEW_TRIES` re-records before `REVIEW-CAP` — the budget is per head, not per PR (agent-infra#2653). Before the spawn the arm asks `review_disp_decide`, and an **unreadable head is not a key** (a review spent on an unnamed head cannot be keyed, compared or recorded — the arm refuses and names the head): **`REVIEW-AT-HEAD`** — the enforcer's store already holds a CLEAN record at exactly this head (BOTH store names are read: the repo-qualified file and the legacy `<pr>.json`, the same pair `merge-one.sh::record_at_head` checks) — so no second review is bought for an unchanged head; **`REVIEW-CAP n/max`** parks a head that spent `MAX_REVIEW_TRIES` re-records with no verdict. None is ever a silent skip. `MAX_REVIEW_TRIES=0` is **REPORT-ONLY** (no dispatch, nothing parked — the `MAX_RED_FIX_TRIES=0` idiom), and an UNWRITABLE record is named rather than swallowed (`reviewdisp` ⇒ park, `reviewathead` ⇒ `REVIEW-AT-HEAD-UNBOUNDED`; an unwritable `parked-<PR>` ⇒ `PARK DID NOT LAND`, never `PARKED`): a swallowed write makes the bound itself best-effort, which is exactly how a cap becomes unbounded. Pruned on MERGED/CLOSED and by `prune_orphan_markers` |
 | `state/reviewathead-<PR>` | `"<head> <n>"`: consecutive `REVIEW-AT-HEAD` refusals at that head (agent-infra#2653). ⛔ It exists because AT-HEAD is the ONE state that neither dispatches nor parks, and its remedy (a re-record) is `merge-one.sh`'s, which the withholding branch prevents from running — so at `MAX_REVIEW_TRIES` the PR PARKS as **`REVIEW-AT-HEAD-STUCK`** with the exact re-record command, instead of logging a wait row for ever. Pruned with `reviewdisp` |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
 | `state/railrefusal-<PR>` | the rail's last refusal, **head-bound**: `head=`, `attempt=`, `override=`, `class=` (`red-tree`/`override`/`conflict`/`unreadable`/`other`), `reason=` (**verbatim**) and `detail=`. Written by `merge-one.sh` (every ingress) and by the cell doctor's `merge` role. The sweep spawns a red-fixer for a `red-tree` class at the CURRENT head only; a stored head ≠ the current head means a push happened, so the record is dropped and the new head is **re-railed** (agent-infra#2223). Absent ⇒ nothing to repair |
@@ -468,6 +469,7 @@ a killed worker cannot take the controller down with it.
 | `logs/` | one log per worker: `lane-*.log`, `lane-merge-<PR>.log` (the lane's merge-loop chain), `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` — `merge-rate.sh` deliberately does NOT count `lane-merge-*.log` as a lane |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
 | `state/capwip.tsv` | one row per cap kill **on every path** — epoch, label, cap seconds, elapsed, exit status, the verdict (`COMPLETE`/`PARTIAL`/`NOTHING-LOST`/`LOST`/`UNSNAPSHOTABLE`) and the snapshot dir (empty where no directory exists). The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
+| `state/lane-end.tsv` | one row per **terminal agent transition, cap or not** (#2834) — epoch, label, exit status, cap flag, the tree verdict (`dirty`/`clean`/`unpushed-only`/`cannot-verify`/`not-a-worktree`/`not-measured`), the rescue (`refs/wip/<slug>`/`archived-local`/`nothing`/`FAILED`/`UNAVAILABLE`/`DISABLED`), the local ref that pins the archived commit, the unpushed-commit count, and **the root that was measured** (`root` — the only column that can expose a wrong-tree archive). ⛔ **Every path writes through ONE writer** (`lane_end_record`), including the two that return BEFORE the measurement — `not-measured` (the operator hatch) and `not-a-worktree` (a root that is not a worktree ROOT: not a repository at all, or a path *inside* one) — because an absence used to be indistinguishable from a lane that never ended. ⛔ The root rule is the CALLEE'S (`bg-rescue-wip.sh:96-103`, `--show-toplevel` = `pwd -P`), not a weaker one (`rev-parse --git-dir` succeeds anywhere inside a repo, so it used to ratify a corner of a checkout and then fail one layer down as `rescue=FAILED`); what it does **not** catch — and does not claim to — is a caller that sets no `WIP_PATH` while its cwd sits at the ROOT of another checkout, which is why the measured root is a recorded column rather than an assumed one. ⛔ **`FAILED` means the rescue failed AND no ref pins anything**; `archived-local` is the third state, `bg-rescue-wip.sh` having exited 2 while `refs/wip-local/<slug>` is valid (a PARTIAL archive and a failed push both land there — the replayed callee lines above say which). ⛔ **The `ref` column names the LOCAL `refs/wip-local` pin and is EMPTY over an archive in exactly one case**: `bg-rescue-wip.sh` pushed `refs/wip/<slug>` and could not write that pin (it is guarded — `:246-252` warns and carries on), so the row reads `rescue=refs/wip/<slug>` with an empty ref and a loud line saying so. An empty ref alone is **not** "nothing was archived". The exit-path companion to `capwip.tsv`: the cap is not the common termination (`hit its … cap` appeared in **0** of 373 lane logs on the measured session), so without this row a lane that simply ENDED left no trace at all — its report said IN PROGRESS, the branch had no new commit, and the only copy of the work was a scratch worktree a reaper eventually deletes |
 
 ### Why the *reviewer* is a separate process from the *controller*
 
@@ -516,6 +518,44 @@ worker staged, its branch or its stash (it runs `git status --no-optional-locks`
 git command fail on a lock the rescue took), and it calls a backup
 `COMPLETE` only after re-parsing it.
 
+⛔ **AND A LANE THAT ENDS IS ITS OWN FACT TOO (#2834).** The cap is the RARE termination: on one
+measured fleet session of 373 dispatched lanes, `hit its … cap` appeared in **zero** lane logs, while
+**148** worktrees were left holding uncommitted or unpushed work and `origin` held no `refs/wip/*` from
+that session. So `run_agent` now ALSO runs the shipped `scripts/bg-rescue-wip.sh` at the end of every
+invocation **that started an agent** — after `wait`, after the cap snapshot, before it returns — and the
+tool puts the work on
+**origin** under `refs/wip/<branch-slug>` (built with `git commit-tree` through a throwaway index, never
+`git stash`, whose ref is repo-global and whose `pop` can silently drop a PEER lane's entry). Three
+things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
+  * the root is `WIP_PATH` when the caller sets it and `$PWD` otherwise, because `fix-one.sh` `cd`s into
+    the MAIN checkout while the work lives in the fixer's worktree — archiving the wrong tree would be
+    worse than no rescue, since it reports a capture the lane never received;
+  * it costs a network call only when there IS something to save (one `git status` + one `rev-list`
+    otherwise), and it never changes the lane's exit status: a lane's status and the fate of its
+    worktree are different facts;
+  * `unpushed-only` is MEASURED and NAMED but never archived **here**, and the reason is the callee's
+    contract rather than branch safety: `bg-rescue-wip.sh` archives only a NON-EMPTY `git status`
+    (`:150-166`), so a clean-but-unpushed tree makes it exit 0 having done nothing, and `refs/wip/<slug>`
+    is a non-force ref built with `commit-tree` — not a branch. Teaching it to archive `HEAD`'s tree is a
+    change to that shipped tool's contract and is deliberately out of scope, so #2834's ask 1 is met for
+    the DIRTY half and recorded for the unpushed half: the commits live in the repo's object database and
+    survive the WORKTREE being removed, but not the BRANCH being deleted.
+  * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
+    (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
+    the spawn and therefore reach neither the rescue nor the ledger. That is the honest reading: nothing
+    ran, so there is no terminal transition to record, and a refused lane writes NO `lane-end.tsv` row —
+    an absent row is not "the lane ended clean", which is why the remedy for a fleet-wide gap here is the
+    log of the refusal, not this table.
+A rescuer that cannot be FOUND is `rescue=UNAVAILABLE` and a loud line naming the homes it searched —
+never a silent skip, which is how an operator's own copy of this call was a no-op for a whole session
+(`cd` before `_HERE` was resolved from a relative `BASH_SOURCE`, so `[ -f … ] && bash …` degenerated to
+`false`). ⛔ **`UNAVAILABLE` carries TWO causes, and the `tree` column says which**: `tree=not-a-worktree`
+means the ROOT was refused and no search happened at all (the rescuer is usually present), while any other
+`tree` value means the rescuer was genuinely not found. A count of `UNAVAILABLE` rows is therefore not a
+count of boxes missing the script — read the `tree` column with it. The launcher publishes the verdict in `$D/<name>.end`, so `--status` answers "what happened to
+the work" as well as "what was the exit code":
+`caplane failed rc=143 (cap 1s hit — …) end: tree=dirty rescue=refs/wip/work (refs/wip-local/work@87d4aba)`.
+
 ⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
 `task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
 PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
@@ -559,7 +599,7 @@ own `pi` workers, which do not go through `task`.
 
 ### 2.1 The worker launcher — `worker-terminal.sh`
 
-Every worker (`lane-*`, `chain-*`, `merge-*`, `fix-*`) is started by ONE module, `wt_spawn`, never by
+Every worker (`lane-*`, `chain-*`, `merge-*`, `review-*`, `fix-*`) is started by ONE module, `wt_spawn`, never by
 a hand-written command in a caller. It asks the box what it can actually provide and **refuses** when
 the answer is nothing (no cmux answer AND no `tmux` binary):
 
@@ -640,7 +680,22 @@ Around the spawn, three properties hold:
   `state/env-<worker>.sh` (mode 0600, the controller's exported names) and the run script sources it.
   On a **tmux** surface (macOS launchd, or a Linux cell) the contract is different and explicit: the
   launch line exports `HOME` — the one that actually holds the `gh` credential — sources that HOME's
-  `keys.env` when it exists, and exports `O`; a box where that produces no credential is REFUSED.
+  `keys.env` when it exists, sources `pi-keys.env` **when it is the file that assigns the model-key
+  variable** (that file is `<home>/pi-keys.env` on a Mac, where the LANE MODEL credential lives; one
+  carrying only other settings is NOT sourced, so box-local knobs do not belong there), and exports
+  `O`; a box where that produces no credential is REFUSED. Two credentials are gated, both
+  BEFORE any session exists: the `gh` token and the model key `models.json` names for the lane
+  provider. The model key may come from the caller (only when this spawn creates the server), from a
+  file the launch line sources, or from the tmux SERVER's own global environment — and the caller-side
+  pre-check is given exactly the environment the pane would inherit, so the gate's answer and the
+  pre-check's answer cannot disagree. The launch line also **pins the pair** it resolved
+  (`PI_LANE_PROVIDER` and `PI_LANE_MODEL`) so the lane runs, and bills, the provider whose credential
+  was checked. The pair is resolved in the order the launch line establishes it: `keys.env` then
+  `pi-keys.env` (last non-blank value wins), and **then the caller's own exported
+  `PI_LANE_PROVIDER`/`PI_LANE_MODEL`** — the caller is a source too, and a value it names is measured
+  and pinned like any other. What is *cleared* rather than inherited is a model **no** source names, so
+  a stale value on the tmux server cannot land beside a provider the gate checked; the lane's own
+  `${PI_LANE_MODEL:-deepseek-flash}` default then applies.
 
 The stale-worker reap targets the same census (`reap_stale_workers()` → `wt_close`), because the
 workspace, not a session name, is now the identity: `wt_close` closes the terminal + workspace and
@@ -892,9 +947,27 @@ green `CELL READY` means a guarded lane: two components that decide whether the 
 cells today. `cell-install.sh --verify` now prints one `activation:` line for the shim, resolved
 through the **same** candidates `review-enforcer` reads, so the row is checked rather than asserted.
 
+#### When a cell says it is provisioned and is not — the eight measured signatures
+
+Measured 2026-10-27 while provisioning `pi-cell-1` / cell 3 / cell 4: every row below is a failure an
+operator hit **after** some step had reported success. **The gate is the authority; this table is its
+index** — `scripts/cloud-cell-bringup.sh --check` fails closed with `CHECK FAILED [<check name>]` (or a
+supervisor `FATAL`) and prints the FIX line, so read the refusal, not this table, for the current state
+of any single check. Nothing here is a procedure to run *instead* of `--check`.
+
+| failure signature | cause | the command that fixes it |
+|---|---|---|
+| `cell-install.sh --install` ends right after `LAYER VERIFIED`, and no pin is recorded | the layer is not the cell: the harness pin is created by a **separate** gate, so an install can succeed over a cell that has none (#2909) | `HOME=$HOME CELL_HOME=$HOME bash scripts/cloud-cell-bringup.sh --check` — `check_harness_pin` **refuses** a cell with no pin now; it is the only writer, so there is nothing to run first |
+| `FAIL com.eldato.ai-drainer: placeholder(s) this runtime does not know: {{AI_DRAINER_O}}`, `no StartInterval…`, then `the declared job set is BROKEN — refusing …` and the controller dies `rc=1` | shipped job declarations vs shipped runtime (#2908) | fix the declaration in `templates/launchd` and re-run `--check`; `check_schedule` refuses a non-zero `fleet-schedule.py --verify` **or any `FAIL` line** |
+| `REPO is not set and no single checkout could be derived` | TWO homes — `/home/cmux` (checkout) and `/tmp/cell-home` (farm/state/keys) | `CELL_HOME=$HOME WORKDIR=$HOME/<repo> bash scripts/cloud-cell-bringup.sh --check`; `check_one_home env` refuses a `CELL_HOME` that is not this box's home, and any cell-state path in `/tmp` outside it |
+| 17 jobs `broken target: …/.pi/agent/scripts/… does not resolve — the farm is INCOMPLETE` **while the farm is installed** | the same two homes: the declarations expand `{{HOME}}` to the home the farm is NOT under | the same fix as the row above — one home, re-run `--check` |
+| `install-*-timer.sh --status` prints `installed` for a 7-line hand-written `/tmp` shim | a hand-written unit is indistinguishable from a rendered one by name | re-render it: `scripts/cloud-cell-supervisor.sh apply` (or the owning installer's `--install`); `check_one_home units` refuses a rendered unit whose `Environment=`/`ExecStart=` carries a `/tmp` path, and the installer `--status` DRIFT arm (drainer lane) refuses a unit it did not render |
+| `FATAL: doctor session 'cell-doctor' belongs to another state dir (…)` | a stale tmux session minted by a **previous** state dir blocks the doctor role | `tmux kill-session -t cell-doctor` — the `FATAL` prints it with the owning state dir; the supervisor never clears another state dir's session (#1856) |
+| `FATAL: a controller runs from this machine's shared harness path (pid …)` | a leftover inner-chain member (`tmux → bash -c → orch-loop.sh`) from a previous state dir blocks the first start | `kill <pid>` — the `FATAL` now prints it with each pid's state dir; the supervisor does not signal a pid it cannot prove it owns |
+| `claims.sh: line 1205: printf: write error: No space left on device`, controller dead, on a cell that printed `CELL READY` | no reaping **before** lanes: the reaper came from the scheduler that would not start | `bash scripts/orchestrator-harness/disk-reaper.sh --apply --repo <checkout>`; `check_reaping_armed` runs the shared `disk-floor.sh` floor+reclaim pass and refuses a cell still under it after the pass |
+
 **On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
 checkout:
-
 ```bash
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
 #    Put it where $O will point (default ~/orchestrator): the daemon executes $O/<script>,
@@ -902,7 +975,9 @@ checkout:
 #
 #    ⛔ PREFER THE VERSIONED SHAPE — this is §11's rule, applied to the install step (§11 is why the
 #    three-way fork happened: `~/orchestrator` was 8 of 8 files with NO git). Two supported routes:
-#      * macOS:  bash scripts/deploy-mac-orchestrator.sh   (copies the harness, stamps the commit)
+#      * macOS:  bash scripts/deploy-mac-orchestrator.sh   (copies the harness and RECORDS the commit
+#                 + a per-file manifest in $O/.harness-provenance — §4.3; add --dry-run to see the plan
+#                 and what it would overwrite without writing anything)
 #      * any box: make $O a symlink farm into a git clone, so "which commit is this?" has an answer —
 #                 bin/harness doctor reports that as kind=linked-checkout
 #
@@ -999,7 +1074,7 @@ the same overclaim this file exists to remove. The others, named with the gap ea
 | Path | What it still does |
 |---|---|
 | `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:539`) and `$O/gh-limit.py` (`install.sh:556`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:822`, `:1003`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
-| `deploy-mac-orchestrator.sh` phase A (`:113-121`, with `install_file` at `:76-80`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
+| `deploy-mac-orchestrator.sh` phase A (`:292-296`, with `install_file` at `:106-110`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
 | `deploy-crossbox.sh` step 3 (`:57-92`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
 | `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:1281`; called at `:1872`, `:2523`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
 | `cloud-cell-quiesce.sh` step 4 (`scripts/cloud-cell-quiesce.sh:74-79`) | the cell-recovery redeploy: `cp "$HARNESS"/*.sh "$O"/ 2>/dev/null || true` — depth-1, **rc discarded**, then `seeded $O with $(ls "$O"/*.sh | wc -l)` read from the **target**, and a controller started on it (`:89-92`). That is all three mechanisms #2041 names, verbatim; it is listed here rather than quietly omitted |
@@ -1075,14 +1150,21 @@ said the shim had "no comparator on any path" (false — `check-single-source.sh
 above, not by a count). An unverified claim in a file about unverified claims is this issue, so both are
 stated here.
 
-**And re-run `install.sh` afterwards if you want the box to stay attributable.** `install.sh` folds
-`$O/*.sh` into `$O/.agent-infra-stamp.json` (`payloadSha256`), and `check-deployed-drift.sh` reports
-a mismatch as *"a post-install hand edit"*. A redeploy changes those bytes and does not re-stamp —
-this helper will not write the provenance record (install.sh owns it) — so the verdict says
-`identity record STALE — run install.sh to re-stamp` and records `STALE-STAMP` in the ledger. Without
-that step every legitimate redeploy turns the drift gate's top-severity alarm into its normal state,
-and a real hand edit stops standing out. `orchestrator-bringup.sh` already does this
-(`deploy_harness`, then `install.sh`).
+**AND THIS HELPER NOW RECORDS THE BOX'S OWN PROVENANCE (`agent-infra`, 2026-10-29).** At the end of a
+verified deploy it writes `$O/.harness-provenance` — the source commit, the ref, and a sha256 for
+every file the source shipped — through the shipped `harness-provenance.sh`. That record is what makes
+*"which commit is this box running?"* answerable **with no checkout present**, and what lets the NEXT
+deploy tell a hand patch from its own last run. `check-deployed-drift.sh` reads it FIRST and falls back
+to `install.sh`'s `.agent-infra-stamp.json`, so a box that was attributable before this record existed
+still is. §4.3 is the operator's page for it.
+
+Because the record is now written by the deploy, a stamp left stale by a redeploy is **superseded**
+rather than an alarm: the verdict says `legacy identity record STALE … superseded by
+.harness-provenance` and records `STALE-STAMP` in the ledger, but `check-deployed-drift.sh` will no
+longer call this deploy *"a post-install hand edit"* — the newer record describes the bytes it just
+verified. If the provenance write FAILS, the old advice stands and is printed with it: re-run
+`install.sh` to re-record the stamp. `orchestrator-bringup.sh` still does `deploy_harness`, then
+`install.sh`.
 
 ⛔ **A stamp is only compared when the fold over `$O/*.sh` actually completed.** If any `*.sh` in the
 runtime is unreadable (a root-owned `0600` leftover, a script the repo no longer ships) or no
@@ -1127,8 +1209,8 @@ observe.
 ```bash
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
-tmux ls                                      # no cmux answer (macOS launchd, or a Linux cell): lane-*, chain-*, merge-*, fix-*
-cmux workspace list                          # a cell: wt-lane-*, wt-chain-*, wt-merge-*, wt-fix-*
+tmux ls                                      # no cmux answer (macOS launchd, or a Linux cell): lane-*, chain-*, merge-*, review-*, fix-*
+cmux workspace list                          # a cell: wt-lane-*, wt-chain-*, wt-merge-*, wt-review-*, wt-fix-*
 ```
 
 `install.sh --uninstall` removes the agent (`launchctl bootout`), **reads the domain back**, and only then
@@ -1201,6 +1283,178 @@ operator's rescue route when the box is over its ceiling, and the refusal messag
 caller that exports its own `MAX_LOAD` sets its own ceiling, and a box where neither installer has
 run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the installed copy.
 
+### 4.3 "Which commit is this box running?" — ask it, and read the answer
+
+`$O` is **not a checkout**, so `git` cannot answer this (`cd ~/orchestrator && git rev-parse --show-toplevel`
+→ `fatal: not a git repository`). The deploy path therefore leaves a record beside the bytes —
+`$O/.harness-provenance`, written by `harness-provenance.sh` at the end of a **complete** deploy
+(`deploy-harness.sh`, `deploy-mac-orchestrator.sh` phase B, and `orchestrator-bringup.sh start` — the
+three writers that also refuse-to-overwrite and record; the OTHER paths that write `$O/*.sh` are named,
+with the gap each still carries, in the coverage table earlier in this section). Plain text, one `sha256  path` line per
+file the deploy wrote, so a box answers with no checkout, no network and no `jq`. The manifest is the
+**write set**, not the source tree: `start` installs only the depth-1 `*.sh`, so it records only those
+(it passes `--skip` for every file it does not write) — a `README.md` that a full deploy put in `$O` is
+therefore neither claimed by `start`'s record nor able to refuse a `start` that never touches it.
+
+```bash
+# THE ONE-LINE ANSWER — works on a box with no checkout at all
+bash ~/orchestrator/harness-provenance.sh show --o ~/orchestrator
+#   harness commit 5712e52776c8   ref origin/main   recorded 2026-10-29T10:02:11Z   78 file(s)
+
+# HAS ANYTHING IN $O CHANGED SINCE THAT DEPLOY? (question (a) — names the file, and which side is newer)
+bash ~/orchestrator/harness-provenance.sh check --o ~/orchestrator
+
+# IS THE BOX THE CHECKOUT AT $REF RIGHT NOW? (question (b) — needs the checkout; also answers (a))
+bash ~/orchestrator/check-deployed-drift.sh --o ~/orchestrator --repo <agent-infra checkout>
+```
+
+**The two questions are different, and the report never conflates them.** This was the 2026-10-29
+defect: a box printed `harness=diverged:5712e52776c8` for a state the two questions describe
+differently, so a diagnosis made against the checkout described code the box was not running.
+
+A box that answers **both** questions cleanly carries **no `harness=` token at all** — its token is
+`[current]` inside the `OK:` line. Only a box that does NOT match gets one, because a token in a
+dispatch row is a claim that something is wrong:
+
+| summary token | question | what it means | what to do |
+|---|---|---|---|
+| *(none — `OK: … [current]`)* | (a)+(b) | the record names this commit AND `$O` holds exactly those bytes | nothing |
+| `harness=behind:<sha12>` | (a) | the box is recorded from `<sha12>`, an **ancestor** of the ref: a known, deliberate state | redeploy when you mean to adopt the new tip |
+| `harness=diverged:<sha12>` | (a) | `<sha12>` is **not an ancestor** of the ref — the box runs code main does not carry | find out why before redeploying |
+| `harness=uncommitted-edit:<file>` | (a) | `$O` holds bytes **no deploy wrote** (`<file>` differs from the record) — a hand patch | **recover the patch first**: a redeploy destroys it (§4.1 refusal) |
+| `harness=source-dirty:<sha12>` | (a) | the record names `<sha12>` — **this** commit — but its own `sourceDirty=true` (or, for a legacy *stamp* record, `agentInfraDirty=true`) says the deploy was staged from a checkout with uncommitted changes, so `<sha12>` does **not** describe the bytes on the box | redeploy from a **clean** checkout: that is what makes the box identifiable at all |
+| `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
+| `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
+| `harness=surface` | neither — not a statement about `$O`'s bytes | a surface hit on a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) is the only failing comparison. It appears in **two shapes**: `$O` was never compared at all — absent, or a `--surface` run that found no readable record for it (the body prints `identity: SKIPPED`) — **or** `$O` was compared and answered clean on all three questions | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it. On the first shape `$O` also has no usable deploy record, so redeploying is what would make the box identifiable |
+
+### Precedence when more than one state is true
+
+`uncommitted-edit:<file>` › `behind:`/`diverged:` › `incomplete:<file>` › `source-dirty:<sha12>` ›
+(`surface` | `payload-differs`). The token is ONE line, so the order is the answer to "which fact does
+an operator act on first": unrecoverable bytes, then where the box sits, then code that is missing,
+then a record that cannot describe the box at all, then the last two.
+
+**`surface` is never a statement about `$O`'s own bytes, and it has TWO shapes.** A token is printed
+only when the run found a problem (`problems > 0` in the script), and with no `$O` every question
+about `$O` abstains — so the `O_ABSENT` arm can only be reached when the **surface pass** is what
+differed. On that shape `$O` was **never compared at all** (absent, or a `--surface` run with no
+readable record for it — the body prints `identity: SKIPPED`); on the other shape `$O` **was**
+compared and answered clean on all three questions, which is the `Q_BYTES=0` precondition — a
+condition on *that* arm alone, not on `surface` as a token. `$O`-absent alone emits **no** token at
+all (a clean surface pass is an `OK` summary): the token names a drift, and the drift is always the
+other dir.
+
+**The last two are therefore ALTERNATIVES, not a chain:** a surface hit that coincides with `$O`'s
+own bytes differing reports `payload-differs` — and the other-directory fact is then carried by the
+report body's "for a surface hit, reseed the copy the RUNNING component uses" line, not by the
+token. It is stated here rather than left to the `if` order in the code; `check-deployed-drift.test.sh`
+§9b grades the `incomplete` over `source-dirty` case, `dirty + behind/diverged` is the other combined
+state the chain produces (it reports `behind:`/`diverged:`), and §9g grades the `O_ABSENT` shape —
+the one that emits `surface` with no question about `$O` answered.
+
+The refusal has **two directions**, and both matter: a file whose bytes differ from the record, and a
+file `$O` carries that the record never saw — *when the incoming source ships that name*, because that is
+the file the copy overwrites. (A hand-placed file the source does not ship is merely reported; the deploy
+does not delete it.) `harness-provenance.sh check` refuses a record that cannot describe itself — no
+record, an unreadable one, `files=0`, or a `files=` count that disagrees with the manifest below it — so a
+damaged record can never be the gate's "clean". Three more states are ROUTINE, not edits, and all are
+named as such so nobody goes looking for a patch that does not exist: a **`STALE-RECORD`** byte (the
+check) or a **`PENDING`** file (the writer) is `$O` already holding the *ref's / source's* bytes while the
+record predates them — what `deploy-mac-orchestrator.sh`'s phase-A-only run deliberately leaves behind;
+the remedy is a completed deploy, and nothing you wrote is discarded. A **`SAME-AS-SOURCE`** file is `$O`
+carrying a name the record never saw *with the source's own bytes*, which happens routinely because each
+`write` REPLACES the record: a broad deploy records the docs, then `orchestrator-bringup.sh start`
+re-records the box with its narrower write set and those names drop out of the manifest. Overwriting them
+with themselves discards nothing, so they are reported and **not** counted — there is no patch to hunt,
+and the deploy does not refuse. (A file whose bytes **differ** from the source still refuses, naming it an
+`UNCOMMITTED-EDIT`: that one is a real patch, and it is the arm that must never go quiet.) And a record written from a
+checkout with uncommitted changes says **`sourceDirty=true`** instead of implying the commit owns those
+bytes — `show` prints `(SOURCE WAS DIRTY …)` beside the commit, and the check reports it as an identity
+problem (the legacy stamp called the same fact `agentInfraDirty`, and the better record used to MASK it).
+A deploy that **stages through a temporary directory** (`deploy-mac-orchestrator.sh` extracts
+`git archive <ref>`) cannot derive either of two fields from that directory — it is not a checkout, and
+the deploy deletes it — so it states both: `--source-dirty false` (a `git archive` payload is a commit's
+tree, so the commit DOES own those bytes) and `--origin <live harness dir>` (what is recorded as
+`source=`, which a plain `check` classifies a phase-A leftover against). ⛔ Underived, such a record said
+`sourceDirty=unknown`, which the check **refuses** — and since this record is preferred over the legacy
+stamp, a mac box that was attributable *lost* its attribution. ⛔ And a manifest line that lost its
+`<sha256>  <path>` separator is **UNKNOWN**, never a file named after its digest: `%%` and `#` both
+return the whole line when the separator is absent, so the two readers now test for it explicitly.
+Two rules keep the gate honest in both directions:
+`--src` narrows the check to the files that deploy would actually WRITE (`--skip <relpath>` for a partial
+deploy such as `deploy-mac-orchestrator.sh`'s phase A, which never writes `orch-loop.sh`), and a `--src`
+that ships no files is **UNKNOWN**, not "nothing to discard". And `write` itself **refuses** to record a
+tree whose bytes differ from the source: a record may only ever describe a deploy, never bless a patch.
+
+`check-deployed-drift.sh` prints the question beside each line (`DRIFT(record):`, `DRIFT(identity):`,
+`DRIFT(checkout):`), and **a missing or unreadable record is exit 2 — UNKNOWN, never "clean"**. An
+unnameable alarm is weak, but silence is what lost the fix: with only `install.sh`'s legacy stamp there
+is no per-file manifest, so the report fails the run and *says* it cannot name the file.
+
+**A redeploy REFUSES to overwrite an uncommitted edit.** Measured 2026-10-28: a hand-applied fix to
+`$O/merge-one.sh` was reverted **twice** by redeploys (the file's mtime moved at 20:02 and again at
+20:15, after the patch), the box ran unpatched code, and a production fix looked like it had
+"stopped working". Those three writers compare `$O` against its own record **before
+copying**, print every file they would discard with which side is newer, and exit **78 with nothing
+written** (`orchestrator-bringup.sh start` refuses with its own rc=1 and the same file list, because
+its contract is `0 ok · 1 refused · 2 cannot-determine`). ⛔ They are NOT every path that writes
+`$O/*.sh`: a cell's `deploy-crossbox.sh` step 3, `cloud-cell-supervisor.sh seed_and_stamp` and
+`cloud-cell-quiesce.sh` step 4 still copy with neither the refusal nor the record — the coverage table
+earlier in this section names each, and routing them through this helper is #2041's remaining work:
+
+```bash
+bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator
+#   REFUSING: /Users/me/orchestrator carries UNCOMMITTED EDITS that this deploy would OVERWRITE
+#   UNCOMMITTED-EDIT   merge-one.sh — … edited AFTER the record …
+#   → copy the patch aside (or land it in the repo), or re-run with --accept-discard
+
+bash scripts/deploy-mac-orchestrator.sh --dry-run     # the plan, and the refusal, writing nothing
+bash scripts/deploy-mac-orchestrator.sh --accept-discard   # discard them deliberately
+bash scripts/orchestrator-bringup.sh start --accept-discard # the same, on the verb operators run
+```
+
+`--accept-discard` is a **flag on every one of them**. `deploy-mac-orchestrator.sh` also reads
+`ACCEPT_DISCARD=1` from the environment (its `PHASE`/`WAIT`/`DRY_RUN` are env too);
+`deploy-harness.sh` and `orchestrator-bringup.sh` deliberately do **not**, because an export set for the
+mac path used to silently disarm the gate on the two scripts that protect the same live patch. So on
+these two the gate is **not reachable through ambient environment**; on `deploy-mac-orchestrator.sh` it
+is, by that script's own documented env seam — pass the flag there too if you want the same guarantee.
+
+`--dry-run` prints the **plan** (`new` / `unchanged` / `overwrite` per file) *before* the gate runs, so
+a run that would refuse shows both the refusal and the exact list `--accept-discard` would destroy; it
+exits `0` when the deploy would proceed and **`78` when it would refuse** (a dry run that reports a
+refusal with `0` would be the same silence in a new place). A ref that predates
+`harness-provenance.sh` ships no checker: the deploy then says **it cannot tell** what it would
+discard — it does not read as clean.
+
+A box with **no record at all** cannot prove what it would discard, so the deploy says so out loud
+instead of assuming it is safe — and it names the lever that works: **`--accept-discard`** proceeds and
+writes the record at the end, so every *later* deploy can tell an edit from its own bytes. (Writing a
+record by hand onto a box that is behind or half-deployed does NOT work — the writer refuses to describe
+bytes `$O` does not have, which is why neither deploy prints that as its remedy. A box that still holds
+exactly the ref it was deployed from can be recorded with
+`harness-provenance.sh write --o $O --src <checkout>/scripts/orchestrator-harness`.)
+
+**The alternative, and its price — a symlink farm.** `$O` may instead be symlinks into a git clone
+(`bin/harness doctor` reports that as `kind=linked-checkout`), which makes the commit answerable **by
+construction**: `$O/orch-loop.sh → <clone>/scripts/orchestrator-harness/orch-loop.sh`, so there is
+nothing to record and nothing to drift. The price is paid by anything that **writes into `$O`**, and
+the two shipped writers do NOT agree about it — measured on a farm-shaped target:
+
+* `deploy-harness.sh` **refuses** a symlink at the destination, per file, by name (`-L` leaf guard),
+  exit `1` — the farm is safe from it and its deploys simply never land;
+* `scripts/deploy-mac-orchestrator.sh` installs *stage-then-rename* (`cp` to a temp path in the same
+  directory, then `mv -f`), and a rename over a symlink **replaces the LINK**, so the same deploy
+  silently converts the farm entry into a regular copy of the ref and exits `0`. Nothing fails and
+  nothing warns: the farm is unwound one file at a time, and the next `doctor` no longer says
+  `kind=linked-checkout`.
+
+So the farm is a **choice about who owns the bytes**, not a free upgrade: it suits a box that tracks
+one clone exactly, and it must be paired with a discipline that never runs a copying deploy into `$O`
+— including `--dry-run`-first habits, because the macOS route will not tell you. A fix applied "in
+place" on a farm also edits the checkout itself (its own, different, blast radius). The record +
+manifest path above is what a box that is copied into every deploy should use.
+
 ### Tuning (10-core / 32 GB box — the values that were actually used)
 
 | Var | Value | Why |
@@ -1214,7 +1468,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
-| `MAX_REVIEW_TRIES` | `3` | verdict-less reviewer runs at ONE head before that head is parked (agent-infra#2132). Keyed on the head — `state/reviewcount-<PR>` records `"<head> <n>"`, a push resets it, and any run that DID produce a verdict (findings, or a verified CLEAN) resets it too — it bounds CONSECUTIVE verdict-less runs — so a reviewer that keeps hitting its cap cannot buy an unbounded run of paid reviews. ⛔ **THE SAME LIMIT IS READ BY TWO FILES** (agent-infra#2653): `merge-one.sh` bounds its own reviewer runs with it, and `orch-loop.sh` — which dispatches the `merge-<PR>` review lane — keys its `state/reviewdisp-<PR>` budget on it. Two readers, ONE budget (the controller coerces it to the same default, and the suite pins the count). ⚠ A head whose signed marker verified but whose gate never reaches SUCCESS is no longer re-reviewed by the controller at all: the store's head-bound CLEAN record is read directly (`REVIEW-AT-HEAD`, agent-infra#2517's record key), which bounds the paid side of the agent-infra#1756 class — what remains is that such a head has no *actuator* in the controller (the gate re-triggers on `edited`, so a RE-RECORD, not a review, is its remedy; that arm is `merge-one.sh`'s CLEAN path) |
+| `MAX_REVIEW_TRIES` | `3` | verdict-less reviewer runs at ONE head before that head is parked (agent-infra#2132). ⛔ ONE budget, keyed on the head, spent by BOTH arms in `state/reviewdisp-<PR>` (agent-infra#2971: the controller on dispatch, `merge-one.sh` on a verdict-less run that nobody counted — `REV_PAID=1` marks the dispatcher-paid case so an attempt is never counted twice) — so "we already tried review twice at this head" is the same number to both, and `REVIEW-CAP` and the reviewer-side park cannot disagree. The record is `"<head> <n>"`, a push resets it, and any run that DID produce a verdict (findings, or a verified CLEAN) resets it too — it bounds CONSECUTIVE verdict-less runs — so a reviewer that keeps hitting its cap cannot buy an unbounded run of paid reviews. ⛔ **THE SAME LIMIT IS READ BY TWO FILES** (agent-infra#2653): `merge-one.sh` bounds its own reviewer runs with it, and `orch-loop.sh` — which dispatches the `review-<PR>` review ORDER — keys its `state/reviewdisp-<PR>` budget on it. Two readers, ONE budget (the controller coerces it to the same default, and the suite pins the count). ⛔ AND A REVIEWER RUN THAT ENDS WITHOUT ITS `CLEAN`/`ISSUES` MARKER IS A COUNTED FAILED ATTEMPT, never silence (agent-infra#2971): `merge-one.sh`'s EXIT trap records it with its exit code and last line, which is the artifact whose absence made the 2026-10-28 log simply stop at 23:30. ⚠ A head whose signed marker verified but whose gate never reaches SUCCESS is no longer re-reviewed by the controller at all: the store's head-bound CLEAN record is read directly (`REVIEW-AT-HEAD`, agent-infra#2517's record key), which bounds the paid side of the agent-infra#1756 class — what remains is that such a head has no *actuator* in the controller (the gate re-triggers on `edited`, so a RE-RECORD, not a review, is its remedy; that arm is `merge-one.sh`'s CLEAN path) |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (the `[cap]` gate's swap arm, beside `swap_usage_mb`/`mem_avail_mb`, for the gate; the same `swap_total=0` arm for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
@@ -1437,10 +1691,15 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    it); any other value is fatal, so a typo cannot silently pick a scope. In a multi-box fleet
    **exactly one box takes `broad` and the rest pin `SCOPE=own`** (measured 2026-10-13: a freshly
    started cell logged `[scope] open=14 -> BROAD` and auto-armed #8425/#8420 within ~25s).
-   ⛔ **This is a partition, not coordination.** Ownership is still inferred from *local*
-   branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
-   the same PR (§7.2b, tortoise#5052) — the pin must not be mistaken for a claim registry.
-   ⛔ **And it is not the cross-box barrier for any operation.** It selects PR branches by naming
+   ⛔ **This is a partition, not coordination.** `SCOPE` decides which *names* a box looks at; it says
+   nothing about who is working them, so on its own two `own`-pinned boxes can still race the same PR
+   (§7.2b, tortoise#5052). What excludes a concurrent holder is the **claim registry, consulted by
+   selection** (agent-infra#2466): `pr_owned()` / `claim_live()` read ONE snapshot verdict, and the
+   sweep prints the decision for every PR — `claim-held` → skipped, `claim-absent` → free,
+   `claim-unreadable` → nothing acted on. Since that landed a second and third controller are safe by
+   COUNTER, not by permission: two cells may see the same candidate, and exactly one wins the CAS. The
+   pin remains the cheapest way to avoid paying twice for the same verdict.
+   ⛔ **And it is not the cross-box barrier for any operation.** `SCOPE` selects PR branches by naming
    convention, which every box shares; what excludes a concurrent holder is the claim registry, now
    measured per operation in **§7.2d** (agent-infra#1908). That measurement retires the pin's
    *safety* role for dispatch and review and keeps an exclusion requirement on the landing row.
@@ -1812,7 +2071,7 @@ Every entry point this directory's consolidation carried, classified against the
 | `scripts/merge-queue.py` | the DRAIN line for the heartbeat (open PRs vs merged-today, and which lane is on it) | runs INSIDE `orchestrator-heartbeat.sh` | no unit of its own | no unit of its own | current — but it is **not a merge-queue runner**, despite the name: landings are performed by `cloud-cell-doctor.sh merge` (cell) and `orch-loop.sh`'s own sweep (Mac) |
 | `scripts/orchestrator-harness/claims.sh` | cross-box claim registry — a **LIBRARY** (sourced by the controller and the lanes) | sourced; the registry itself is DATA on the remote (`refs/claims/*`) | none needed | none needed | current (not a service: `up` never installs it) |
 | `scripts/orchestrator-harness/capacity.sh` | measured placement — a **LIBRARY** plus a `probe` CLI | sourced per dispatch | none needed | none needed | current |
-| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch and before every push | none needed | none needed | current |
+| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch of NEW-PR work and before a CI rerun — **never** by a repair push (#2927) | none needed | none needed | current |
 | `scripts/orchestrator-harness/disk-floor.sh` | the pre-dispatch disk floor — a **LIBRARY** | sourced by the controller | none needed | none needed | current |
 | `scripts/deploy-mac-orchestrator.sh` | copies the harness into `$O` and stamps the commit | by hand (§4 step 1) | — | — | current for the DEPLOY; ACTIVATION is `install.sh --start` / `harness-up up` |
 | `scripts/cloud-cell-bringup.sh` | full cell PROVISIONING (clone, keys, farm, units) | by hand, once per cell | installs several units | — | current — provisioning is not convergence: `up` does not run it |
@@ -2027,6 +2286,10 @@ refresh log)` when the count could not be recorded: the `checked.txt` rewrite fa
 `state/checked-release` publish did not land, or the record predates the pass — the entries are then in
 fact still suppressed),
 `— UNPROVEN suppression: K checked entr(ies) with no proven fact`,
+`— K of the N blacklisted are the DISPATCH BACKLOG (CLEAN-judged, awaiting the issue path), not suppressed`
+(the `queued` keep-fact means "still in `candidates.txt`", i.e. waiting for the ISSUE PATH — `checked.txt`
+stops a re-pre-flight, never a dispatch — so these are work the box has already judged CLEAN, not
+suppression, and the two need different repairs; #3110),
 `— K checked entr(ies) deferred by the release cap` (a STANDING residue means `CHECKED_RELEASE_MAX` is too
 small for this cell — it accepts up to **96** asks per pass, four times the default; above that the value is
 coerced to 96 with a WARN, because each ask is an un-timeouted `git` call), `— checked classification REFUSED this pass (<slug>): nothing could be released`
@@ -2308,7 +2571,10 @@ exit of `pr-doctor.py` writes `$STATE/pr-doctor.status.json` (`rc`, a one-line r
 went out) and prints `dispatched N of M queued — <why>`, so `dispatched 0` is never healthy while the
 queue has runnable items; `objective.py` renders the last pass's verdict as `PR-DOCTOR(last run):
 RED rc=N Nm ago — <reason>` beside the queue's own shape, and `heartbeat-loop.sh` prints the same
-verdict and launchd's last exit. The `issue_work` field is **PUBLISHED AND UNREAD**: the retired
+verdict and launchd's last exit. ⛔ AND "RED rc=N" IS NOT THE WHOLE VOCABULARY (review P3, #2291): a
+pass that consumed nothing because the BOX's own spawn gate refused every order is
+`WAITING (no capacity) rc=6` (on the load axis; a disk/fork/land-backlog refusal is a repair, never a
+wait — the axis and its remedy ride the same line), so a reader keyed on `RED` alone does not see it. The `issue_work` field is **PUBLISHED AND UNREAD**: the retired
 `retired/queue-dispatch.py` was its only consumer — it SKIPPED new issue work while un-owned PRs
 existed, refusing only on a positive, FRESH reading (a missing, stale, unreadable or refused record
 blocked nothing and said so).
@@ -2371,7 +2637,9 @@ repo=daniel-ospina/tortoise             open_prs=0     unplaced=0     dispatched
 
 The verdict words are the exit codes' own vocabulary and stay distinct: `clean` (`0`), `REFUSING`
 (`2` — I could not READ the queue), `UNPLACED` (`3` — I read it, placed the work, no worker took it),
-`CRASH` (`4`). Each entry is `owner/name`, or `owner/name=<checkout>` when the checkout is not the one
+`CRASH` (`4`), `NO-CAPACITY` (`6` — the BOX's own spawn gate refused the order, so nothing was
+consumed; never `RED`, which is the generic unknown-code fallback). Each entry is `owner/name`, or
+`owner/name=<checkout>` when the checkout is not the one
 `REPO` names; `?` in a column means the pass never got far enough to count it. Repeated `--repo`
 flags REPLACE the `PR_DOCTOR_REPOS` default rather than joining it (a named list is the narrower
 instruction), and a checkout is only used when its `origin` proves the resolved repo — a remote on
@@ -2427,9 +2695,10 @@ the two cannot disagree), and re-offers the DEAD ones **through the one dispatch
 dispatcher itself recorded** (`name worktree prompt cap kind`).
 
 ⛔ **AND THE LIVENESS QUESTION IS ASKED OF THE WORKTREE, NOT OF ONE NAME.** `pr-doctor.worker_name()`
-is MODE-QUALIFIED (`prd-<tag>-42` in a multi-repo pass) while the worktree is `prd-42` in **both**
-modes, so two orders can name one directory — the #2280 defect, which `worker_live_for()`
-(`pr-doctor.py:3526`) fixes on the doctor's side and which this supervisor must not reintroduce one
+is REPO-QUALIFIED (`prd-<repo-tag>-42`, in **every** mode since #2725) while the worktree is
+`prd-42` in **both** modes, so two orders can name one directory — the #2280 defect, which
+`worker_live_for()` (`pr-doctor.py:3637`) fixes on the doctor's side and which this supervisor must
+not reintroduce one
 layer down (`nonblocking-dispatch.sh` performs **no** liveness check of its own, so this is the only
 guard there is). Before every re-offer it asks `--status` for **every order that records the same
 worktree**, plus the doctor's own alias `prd-<n>` when that differs from the order's name: a `running`
@@ -2885,7 +3154,13 @@ still licenses nothing: without the posture the verdict is `25`.
 **A lane is never spawned from a behind checkout without that fact on the spawn line.**
 `HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
 **every** dispatch row (`disp`) and to the `lane-`/`chain-` spawn line in `dispatch-merge.sh`
-(`[harness=…]`). An absent token reads `unknown`, never `current`. Refusals go to `$LOG` **and** to
+(`[harness=…]`). ⛔ ONE EXCEPTION, and the sha stays LAST so `${TOKEN##*:}` still reads it:
+`restart-pending` carries WHY it is pending between the two — `<relation>:<pending>:<sha12>`, where
+`<pending>` is `deferred` / `safe` / `inert` / `unprovable` (agent-infra#2641). A bare
+`restart-pending` was the always-on alarm that change removed, so the token now says which pending
+state the box is in instead of repeating one word for ever. Consumers that only DISPLAY the token are
+unaffected; a consumer that PARSES it must read the sha from the LAST field, not the second.
+An absent token reads `unknown`, never `current`. Refusals go to `$LOG` **and** to
 stderr, once per cycle — a warning that prints on every tool call is how #1140's noise hid a signal.
 `HARNESS_REFRESH=off` disables the re-pin and says, once per cycle, that a stale checkout will now go
 unnamed (a pinned-build escape hatch, not a way to avoid a red line).
@@ -3209,6 +3484,46 @@ cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network ca
 **data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
 reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
 
+#### Selection consults the registry, and an unreadable registry is not freedom (agent-infra#2466)
+
+The registry alone does not make two cells safe: what a cell *selects* has to consult it. Before #2466 the sweep read the snapshot with a bare `awk` and answered "not owned" whenever the file was
+**absent**, so every way a registry READ can fail reported as "nobody holds it" — no registry
+provisioned, a snapshot written from a failed fetch (the fetch's `|| true` leaves the previous cache in
+place, so the file is a stale read presented as current), or a snapshot older than the cycle reading it.
+Those are exactly the states in which two cells disagree. Measured 2026-10-23 with the registry's own
+writer (`CLAIM_OWNER_HOST=cell-2`, `refs/claims/9777-abc123def456`, live 1800 s lease): a fresh snapshot
+read OWNED; an **absent** snapshot and an **empty** one both read UNOWNED.
+
+One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `_lease_is_live` and
+`claim_orphan_reason` (no second verdict path). It publishes five words:
+
+| verdict | rc | meaning for SELECTION |
+|---|---|---|
+| `claim-absent` | 0 | the registry was READ, is FRESH, and holds nothing for this key → free |
+| `claim-expired` | 0 | an entry whose lease window has passed → free |
+| `claim-orphaned` | 0 | a live window whose holder cannot be a live lane (agent-infra#2094) → free |
+| `claim-held` | 1 | a live, non-orphaned window → **skip** (owner + `until` in the log line) |
+| `claim-unreadable` | 2 | the registry could not answer → **nothing is spawned, armed or merged** |
+
+Freshness is part of the verdict, not a separate guard: `claim_snapshot` writes a
+`#claim-snapshot\t<read_at>\t<ok|failed>\t<refs>` header, and a snapshot older than
+`CLAIM_SNAPSHOT_MAX_AGE` (900 s, ≈3.75 cycles at the shipped `CYC=240`) or written from a failed
+fetch reads `claim-unreadable`. A snapshot whose WRITE failed is never published at all: the
+previous one is left in place **with its own header**, so it keeps answering only while that header
+says `ok` and it is inside `CLAIM_SNAPSHOT_MAX_AGE` — and it is `claim-unreadable` otherwise, or
+when there is no previous snapshot at all. A failed publish is therefore not automatically a
+stand-down, and it is reported separately (`CLAIM_SNAPSHOT_WRITE`) from a failed fetch. Publishing a 0-byte
+snapshot instead would read as "nothing is claimed", which is why that is refused.
+
+**Two signals, merged, never intersected.** Selection keeps the LOCAL evidence it always had — a live
+process whose cwd is the head's checkout, a live merge lock — and adds the registry. Either one can
+BLOCK; neither can cancel the other. Conflict resolution is therefore a **union**: a local live holder
+with no claim blocks (that is the #4256 class — work the registry cannot see, e.g. a branch never
+pushed), and a foreign live claim blocks even where no local process exists (the cross-box case).
+The one asymmetry is deliberate and pre-existing: a claim held by THIS box does not by itself count as
+ownership for selection — a live process must prove it (`claim-own` is free for selection, HELD for the
+spawn guard). And `SCOPE` is untouched: it decides which names a box looks at, not who owns them.
+
 **A claim can also be DEAD while its term is not (#2094).** Renaming a machine used to orphan every
 lease it held: `claim_owner()` stamped `$(hostname -s):$$`, liveness was "`lease_until` is in the
 future", and `claim_prune` reaped by expiry alone — so the old host name never matched again and a
@@ -3467,13 +3782,19 @@ reap. The decisions that are not obvious:
   persistent condition is visible rather than a silent no-queue. rc=2 does **not** write that marker —
   it is transient by construction, so the pass exits 1 and the cycle is logged `FAILED rc=1` and
   retried; the marker would make a network blip look like a broken cell. This
-  is the opposite polarity from the PR claim's fail-open, and it was applied to **every** exit, not
-  just the obvious one: an unrecognised status is treated as INCOMPLETE, so no future code path can
-  widen the CLEAN arm by accident. The one limit is stated rather than hidden — a box where
-  `claims.sh` is **not installed at all** falls through to the pre-registry behaviour **loudly**,
-  because making a missing file refuse would turn such a box merge-only, a bigger and less
-  reversible failure. (The file reaches `$O` by `cp -p "$H"/*.sh "$O"/` in
-  `scripts/deploy-crossbox.sh` — `install.sh` itself only diffs and reports drift; it does not copy.)
+  is the opposite polarity from the PR claim's ACQUISITION fail-open, and it was applied to **every**
+  exit, not just the obvious one: an unrecognised status is treated as INCOMPLETE, so no future code
+  path can widen the CLEAN arm by accident.
+  ⛔ **A MISSING registry file REFUSES TOO (agent-infra#2466, reversing the earlier "loud fallthrough").**
+  The old rule let an unprovisioned box keep dispatching unclaimed, on the argument that refusing would
+  make it merge-only. Two things invalidated that: the PR path now also abstains on an unreadable
+  registry (so such a box is not "merge-only", it is SILENT), and the fallthrough was never loud where
+  it mattered — `issue_claim_verdict` already answered INCOMPLETE for a missing file and the call site
+  simply did not ask it. Missing, unreadable and stale are therefore ONE polarity: refuse, publish
+  `claim-unreadable`, and name the one-line remedy (`deploy-harness.sh`); `refresh-candidates.sh
+  --check` refuses the same state up front, because a check that blesses what the run refuses is a
+  false PASS. (The file reaches `$O` by `cp -p "$H"/*.sh "$O"/` in `scripts/deploy-crossbox.sh` —
+  `install.sh` itself only diffs and reports drift; it does not copy.)
 
 Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
 under `set -u`, so a caller with no commit to fence on aborted with
@@ -4226,26 +4547,33 @@ The remedy is `ci-queue.sh`: one sourced module (also runnable standalone —
 question — may this box send more CI-spending work yet. The ceiling is **derived**, not a constant:
 `ceil(runners × horizon_min ÷ job_p90_min)`, and it is a **measured queue read, NOT a lane cap**: the
 owner ruling of 2026-10-17 ("dispatch should be gated on capacity, not on number of lanes") is why
-nothing here re-states a lane ceiling. Three surfaces read it, so they cannot disagree: `orch-loop.sh`
-(one read per PASS — the sweep's and the dispatch block's, so at most TWO live reads per cycle —
-in-shell, before dispatch — and THREE fixer spawn arms: the CONFLICTED one, the
-CI-red one, and the review-gate one, whose product is also a new head — plus the CI RERUN, which is
-the only other surface in the sweep that ADDS queue), `fix-one.sh` (the lane
-whose whole product is a NEW HEAD), and `dispatch-merge.sh` (the batch that stampedes). ⛔ The FOURTH
-fixer spawn arm — the RED-TREE one — is NOT gated yet: it books its attempt and spawns before any
-`ciq_push_ok` call, so a deep queue still starts that lane and `fix-one.sh` defers its first push.
-Disclosed rather than implied; home agent-infra #2408. ⛔ That census is the SWEEP's, not the
-fleet's: `pr-doctor`'s `prfix` workers are a **second** ungated pusher and are not an orch-loop arm
-at all — `pr-doctor.py` spawns up to `MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or
-`gh run rerun`) with no queue read (`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd
-job still adds CI behind a deep queue; wiring that surface is agent-infra #2540.
+nothing here re-states a lane ceiling. ⛔ **Repair does not read it at all (#2927).** The two actions
+that DO — the two that add a run to the queue — are `orch-loop.sh` (one read per PASS — the sweep's
+and the dispatch block's, so at most TWO live reads per cycle — in-shell, before the ISSUE dispatch,
+plus the CI RERUN site, which queues a fresh run for the same head) and `dispatch-merge.sh` (the batch
+that stampedes, issue→PR). ⛔ THE FIXER ARMS AND `fix-one.sh` ARE NO LONGER ON THAT LIST, AND THAT IS
+THE CHANGE: a fixer is REPAIR on a PR that already exists, bounded by lane slots, the cross-box claim
+and the load/disk gate. The depth this module prices is CI concurrency belonging to NEW-PR work; gating
+repair with it skipped 41 consecutive repair dispatches while 8 runners and ~11 lane slots sat idle.
+The former FOURTH-arm disclosure (the RED-TREE fixer spawning before any `ciq_push_ok` call, home
+#2408) is therefore moot — nothing on the repair path reads this module, so a started lane pushes
+instead of being turned away. ⛔ That census is the SWEEP's, not the fleet's: `pr-doctor`'s `prfix`
+workers remain an **ungated** pusher and are not an orch-loop arm at all — `pr-doctor.py` spawns up to
+`MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or `gh run rerun`) with no queue read
+(`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd job still adds CI behind a deep queue.
+⚠️ #2540 asked for the OPPOSITE — more gating on repair pushes — and #2927 records why its premise (a
+fixer push is the queue pressure) is what the measurement contradicts; wiring that surface is a
+re-open of #2927, not an execution of #2540.
 
 Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired into
 `run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work
 (fail-closed, because the alternative makes a `gh` outage indistinguishable from an empty queue),
 and every deferral emits ONE line naming the depth, the runners, the ceiling and WHAT was deferred —
-silence is what makes a deferral look like a bug. A deferral writes the same bail marker the
-cross-box refusal writes, so it consumes no attempt and is re-decided from a fresh read next cycle.
+silence is what makes a deferral look like a bug. A deferral consumes no attempt: the ISSUE-batch
+arm releases its claims and drops its rows, and the CI-rerun arm withholds the rerun and records why
+(`state/rerun-<PR>-<RID>` is not written). The `fixbail-*` marker is NOT written by either — it
+belongs to `fix-one.sh`'s own three pre-agent deferrals (the cross-box refusal, the PR-OWNER lock, and a
+PR-owner takeover that could not complete), which is where it is written.
 
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
@@ -4268,7 +4596,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | Reaching `MAX_FIX_TRIES` fell through to the re-record branch | an unfixable PR burned a full fresh-context review **every cycle, forever** | terminal `state/parked-<PR>` state, keyed to the head so a new push re-arms it |
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
-| **the scout worktree was created once and never updated** — the pass pre-flighted with whatever copy `chore/dispatch-scout` froze at (measured 2026-10-19: **191** commits behind `origin/main`; re-measured 2026-10-20 on a cell: **258** behind, the branch tip still `430ff7cce` from 2026-10-16) | a fix to the gate could not reach the harness that runs it: the cell pre-flighted with a lane-liveness reader whose cmux verb that build no longer has, so **every** candidate came back `INCOMPLETE`, the pass ABORTED `judged 12 / usable 0`, and the cell dispatched nothing behind a log line that read `FAILED rc=1 (transient — retried next cycle)` (agent-infra#2174) | the pass now `git fetch` es `main` into `refs/remotes/origin/main` (destination named, so a mis-mapped `remote.origin.fetch` cannot make a no-op fetch look like currency) and moves the scout to that tip **on every pass**, logging the gate it judged with (`[refresh] gate: <path> cksum=<n>`, plus `unversioned=1` when the gate lives in a tree this pass cannot version); a scout that cannot be refreshed **refuses to judge**, naming the sha and the failed step, with rc=3 (`NOT PROVISIONABLE`: `.git` link that does not resolve, no `origin`, no `main`, no `origin/main` after a fetch, a gate whose bytes are not the ones at the checked-out commit) or rc=1 (`TRANSIENT`: network, uncommitted tracked work, commits not in `origin/main`, an untracked file in the way) — so the loop writes a MERGE-ONLY marker only for the permanent causes, quoting the refusal; `--check` refuses the offline-judgeable causes too, read-only: a scout whose `.git` link does not resolve, a worktree with no `origin`, commits ahead of `origin/main`, or (when a move is needed) uncommitted tracked work — the last two as rc=1 with a `TRANSIENT: scout` token, so the two consumers' diagnosis follows the refusal instead of always naming a provisioning defect — plus, for a scout that is its own worktree, a gate that is untracked or edited relative to `HEAD`; remote reachability, a trunk that is not `main`, and that byte test on a NON-worktree scout are deliberately left to nobody: the byte test is skipped on both paths for that shape, whose whole protection is the announced `unversioned=1` (#2217); uncommitted work in the scout is never discarded |
+| **the scout worktree was created once and never updated** — the pass pre-flighted with whatever copy `chore/dispatch-scout` froze at (measured 2026-10-19: **191** commits behind `origin/main`; re-measured 2026-10-20 on a cell: **258** behind, the branch tip still `430ff7cce` from 2026-10-16) | a fix to the gate could not reach the harness that runs it: the cell pre-flighted with a lane-liveness reader whose cmux verb that build no longer has, so **every** candidate came back `INCOMPLETE`, the pass ABORTED `judged 12 / usable 0`, and the cell dispatched nothing behind a log line that read `FAILED rc=1 (transient — retried next cycle)` (agent-infra#2174) | the pass now `git fetch` es `main` into `refs/remotes/origin/main` (destination named, so a mis-mapped `remote.origin.fetch` cannot make a no-op fetch look like currency) and moves the scout to that tip **on every pass**, logging the gate it judged with (`[refresh] gate: <path> cksum=<n>`, plus `unversioned=1` when the gate lives in a tree this pass cannot version); a scout that cannot be refreshed **refuses to judge**, naming the sha and the failed step, with rc=3 (`NOT PROVISIONABLE`: `.git` link that does not resolve, no `origin`, no `main`, no `origin/main` after a fetch, a gate whose bytes are not the ones at the checked-out commit) or rc=1 (`TRANSIENT`: network, uncommitted tracked work, commits not in `origin/main`, an untracked file in the way) — so the loop writes a MERGE-ONLY marker only for the permanent causes, quoting the refusal; `--check` refuses the offline-judgeable causes too, read-only: a scout whose `.git` link does not resolve, a worktree with no `origin`, an UNRELATED history that shares no ancestor with `origin/main` (a fetch cannot connect it), or (when a move is needed) uncommitted tracked work — those as rc=1 with a `TRANSIENT: scout` token, so the two consumers' diagnosis follows the refusal instead of always naming a provisioning defect — plus, for a scout that is its own worktree, a gate that is untracked or edited relative to `HEAD`; `--check` **WARNS** instead of refusing when it holds a count it cannot ATTRIBUTE offline — a SHALLOW checkout whose graph does not connect to the trunk (#2953), and a CONNECTED count in a FULL checkout, which reads identically for local commits and for commits a STALE `refs/remotes/origin/main` has not fetched (#2956) — because the run path fetches before it decides and a false FAIL there refuses to START a cell (`cloud-cell-bringup.sh` `die`s on a non-zero `--check`); remote reachability, a trunk that is not `main`, and that byte test on a NON-worktree scout are deliberately left to nobody: the byte test is skipped on both paths for that shape, whose whole protection is the announced `unversioned=1` (#2217); uncommitted work in the scout is never discarded |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
 | **`refresh-candidates.sh` hardcoded a tortoise/Python shape** (`uv sync --extra embeddings --extra parity` and tortoise's `tools/collision_preflight.py`) | a cell pointed at a non-Python repo (agent-infra has no `pyproject.toml`) aborted **every** cycle, and because `orch-loop.sh` runs the refresh in a **backgrounded subshell** the non-zero exit could not fail the loop: the controller reported `RUNNING` with `lanes: 0` **forever** — a cell that looks alive and can only merge (agent-infra#1736) | the venv step is skipped only when it is genuinely **not applicable** (no `pyproject.toml`) — a real `uv sync` failure is still fatal, loud, and prints uv's own output; the extras are read from the project; the tool is resolved per repo (own copy, else a `TORTOISE_REPO` checkout) and its absence is a **permanent** `rc=3`; `--check` gives the same verdict read-only so `cloud-cell-supervisor.sh check`/`start` refuse a merge-only repo with the reason; and `orch-loop.sh` now reads the rc — permanent writes a `MERGE-ONLY` marker and stops retrying, transient still retries |
 | **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses (`keyfile_has_key` states it explicitly, and the supervisor re-exports `HOME=$CELL_HOME` after sourcing so both agree on every path) — and each of the four cases has a check that a mutation turns red, except that the two HOME guards are now equivalent: with the re-export in place, reading `$HOME` or `$CELL_HOME` gives the same answer, so the behavioural pin is the check that a keys.env `HOME=` cannot change the verdict. |
@@ -4493,6 +4821,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
 | `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
+| `pr-review-order.test.sh` | **agent-infra#2971 — the answer to `NEEDS-REVIEW` is a REVIEW ORDER.** The PR path printed the correct remedy (`NEEDS-REVIEW … the remedy is another review`) and then spawned `merge-<PR>` — the same tag a LANDING worker carries — so a pass that did the right thing read as a re-run of the thing that had just been refused, for ever. Driven against the SHIPPED fragments: a `NEEDS-REVIEW` head with capacity dispatches `review-<PR>` and NO `merge-10213`, the order is recorded on the `(PR, head)` key it was ordered for, and its spawn carries `REV_PAID=1`; the `(PR, head)` review budget is ONE record (`state/reviewdisp-<PR>`) spent by the controller's dispatch AND by `merge-one.sh`'s verdict-less run — counted once, never twice — and a reviewer run that ends WITHOUT a `CLEAN`/`ISSUES` marker is a COUNTED failed attempt carrying its exit code and last line instead of leaving a log that simply stops (the 2026-10-28 silence at 23:30). Mutation: put the spawn tag back to `merge-$PR` and D1 reddens naming `merge-10213`. Hermetic (stub cmux/gh, no network, no tmux) |
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`; the repo-authority contract and the rail branch driven from `merge-one.sh`; and (agent-infra#1952) the **landing claim** — a second box refused the same PR, three independent keys, fenced release, release frees the PR, non-vacuity, and `merge-one.sh`'s acquire-before-the-review ordering. Hermetic. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
@@ -4516,7 +4845,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-reminder.py` | the fleet's **10-minute merge reminder, with a narrow evidence-gated ACTUATOR arm** (#2603, §6.5.9). Answers three questions — closest to landing, merged-but-not-LIVE, and one red shared across PRs — and on a complete-evidence GO dispatches `scripts/admin-merge.sh <PR> --repo …` (never a merge of its own, never an override). Its emitted line carries the MEASURED readings (`reds=0 in-flight=21 attested@head=no claim=none rail=idle`); an unread value is `UNREADABLE` and dispatches nothing. Cost-bounded: `rate_limit` FIRST, ≤9 metered REST calls (the 9th is the per-candidate mergeability read, which the LIST endpoint does not compute), a thin budget SKIPS the cycle by name. Runs from launchd (macOS) or a systemd-user/cron timer (Linux): `--install-timer` / `--uninstall-timer`. Not part of the loop |
 | `box-status.sh` | ONE box's harness identity (`harness: <sha> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>`), the stamp and pin beside it, `controller: RUNNING(pid …)|STOPPED`, **`running: <sha12>|NONE|UNREADABLE|MIXED`** — the commit the RUNNING controller's own argv resolves to, which is what "activated" means (`harness-refresh.sh` calls the pin-ahead-of-process state `restart-pending`; the pin alone certified a box as `deployed AND activated` while it executed pre-fix code, #2680) — the repo it compares against is resolved `HARNESS_REPO`-first / the payload's own checkout / this script's own checkout / the conventional `$HOME/orchestrator` — and every candidate must CARRY the harness — `scripts/orchestrator-harness/box-status.sh` **tracked as a regular file at exactly that path by the candidate's own repo** (`git ls-files -s`: index mode `100644`/`100755` **and** the recorded path equal to the marker, so a prefix match is not the file), which skips a checkout that is merely *some* repo, one that only reaches the harness through the gitignored `scripts -> $AGENT_INFRA_PATH/scripts` pointer every tortoise/eldato checkout carries (#9475), one that tracks a SYMLINK (mode `120000`) or a GITLINK (`160000`) at the marker path and so ships no harness bytes, and one whose marker path is a DIRECTORY (the index records a nested file) — none of them can be read as the harness repo (#2679); a subdirectory candidate is ACCEPTED, the same as `harness_repo_of()` (a literal-path test refused what `harness-refresh.sh` and `check-deployed-drift.sh` accept), and a refused candidate is NAMED on `ref:` (`ref: UNRESOLVED (--repo: … has NO INDEX ENTRY for …)` / `(… not a TRACKED REGULAR FILE there (mode …))` / `(… records … instead …)`) instead of leaving the line out, because an absent line reads as "no opinion" when the answer is "compared against nothing" — and `roles: idle|busy:<role>(pid=…,age=…)` from the doctor's own role locks. Exit 2 = CANNOT VERIFY — an unanswered identity is never `current`. This is the deploy arm's evidence, so it refuses to answer from an unread process table — and it reads the controller's argv as NUL-separated fields (`/proc/<pid>/cmdline`, `mapfile -d ''`), not a whitespace split, because a harness path may contain a space and a split one answered `running: UNREADABLE` for an ACTIVATED box; the `ps` fallback has no NUL-preserving form, so a space there yields UNREADABLE rather than a wrong tree, never a guess. `MIXED` is driven directly by two real trees in the suite, not only reached through a stub |
 | `merge-reminder.test.sh` | #2603: drives the shipped reminder through EVERY gate with a fixture reviews dir, a stub `gh`/`ps`/rail and a REAL `refs/claims/*` ref — attested+quiet dispatches; `attested=stale`, `in-flight=3`, `reds=1`, a held claim, a live rail and a `mergeable=null` each refuse BY NAME and dispatch nothing; `rate_limit` is the FIRST call and a thin budget spends nothing else; the grouping rule is pinned both ways (a re-run to success is not red; a same-named job in another workflow cannot mask a red); the deploy arm refuses a mid-flight role pass and otherwise dispatches the box's own verb and VERIFIES it by artifact; two MUTANTS prove the gates are live. A CI shard |
-| `worker-supply.sh` | **the SUPPLY half of the repair pool** (agent-infra#2700, §"The SUPPLY half"): walks the ORDER POPULATION (`$O/bg/prd-*.started`, the dispatcher's own acceptance record), asks the HARNESS for each order's liveness (`nonblocking-dispatch.sh --status` — the reader `pr-doctor.worker_live()` asks, so the two cannot disagree), and re-offers the DEAD ones **through that same dispatcher with the argv it recorded** (`name worktree prompt cap kind`), never spawning `pi` and never calling `gh`. Polarity: `running` LIVE · `done` COMPLETE (the brief ran; the doctor re-grades the PR — supply never replays finished work) · `failed|lost` DEAD · unreadable UNKNOWN (spawns nothing — a second worker in one deterministic worktree destroys the first's log/.rc/.pid) · `running` past cap+slack is a REPORT (`stale-claim`), never an action. ⛔ The liveness question is asked of the **WORKTREE, not of one name** (#2280): `pr-doctor.worker_name()` is mode-qualified while the worktree is `prd-<n>` in both modes, so before re-offering an order the supervisor asks `--status` for every order recording the same worktree PLUS the doctor's alias `prd-<n>` — a `running` holder refuses (`live`, slot held) and an unanswerable holder refuses too (`unknown`). A re-offer ACCEPTED but already ENDED (a fast-failing worker that left a `.rc`) is written to the ledger and is **not** counted as a live slot. One pass = `refill`/`heal`; `--loop` is the service, `status` prints the last record PLUS a fresh count, `--dry-run` writes NOTHING (no ledger row and no pass record — the record is the last REAL pass's evidence). Single-instance guard is an atomic `mkdir` + pid + CAS takeover, and SIGTERM EXITS (a trap that only released the lock left the loop running without its guard). Budget = `fix + review` from the orchestrator plist — the ONE source `pr-doctor.capacity()` reads, never rendered into a unit. Exit `0` pass · `2` refusing · `3` undelivered · `4` already-running · `6` deferred (dead orders remain — a pass that re-offered SOME is still a `6`, because a bounded pass is not a clean one). Installed by `scripts/install-worker-supply.sh` (Linux/systemd) or `scripts/install-launchd.sh` (macOS) |
+| `worker-supply.sh` | **the SUPPLY half of the repair pool** (agent-infra#2700, §"The SUPPLY half"): walks the ORDER POPULATION (`$O/bg/prd-*.started`, the dispatcher's own acceptance record), asks the HARNESS for each order's liveness (`nonblocking-dispatch.sh --status` — the reader `pr-doctor.worker_live()` asks, so the two cannot disagree), and re-offers the DEAD ones **through that same dispatcher with the argv it recorded** (`name worktree prompt cap kind`), never spawning `pi` and never calling `gh`. Polarity: `running` LIVE · `done` COMPLETE (the brief ran; the doctor re-grades the PR — supply never replays finished work) · `failed|lost` DEAD · unreadable UNKNOWN (spawns nothing — a second worker in one deterministic worktree destroys the first's log/.rc/.pid) · `running` past cap+slack is a REPORT (`stale-claim`), never an action. ⛔ The liveness question is asked of the **WORKTREE, not of one name** (#2280): `pr-doctor.worker_name()` is repo-qualified (`prd-<repo-tag>-<n>`, in EVERY mode since #2725) while the worktree is `prd-<n>`, so before re-offering an order the supervisor asks `--status` for every order recording the same worktree PLUS the unqualified `prd-<n>` back-compat alias (the PRE-#2725 worker's name; the doctor no longer writes it, and — unlike the doctor's own read — this arm is not attributed to a checkout, so another repo's pre-rename worker can hold the order `live`, which is the safe direction) — a `running` holder refuses (`live`, slot held) and an unanswerable holder refuses too (`unknown`). A re-offer ACCEPTED but already ENDED (a fast-failing worker that left a `.rc`) is written to the ledger and is **not** counted as a live slot. One pass = `refill`/`heal`; `--loop` is the service, `status` prints the last record PLUS a fresh count, `--dry-run` writes NOTHING (no ledger row and no pass record — the record is the last REAL pass's evidence). Single-instance guard is an atomic `mkdir` + pid + CAS takeover, and SIGTERM EXITS (a trap that only released the lock left the loop running without its guard). Budget = `fix + review` from the orchestrator plist — the ONE source `pr-doctor.capacity()` reads, never rendered into a unit. Exit `0` pass · `2` refusing · `3` undelivered · `4` already-running · `6` deferred (dead orders remain — a pass that re-offered SOME is still a `6`, because a bounded pass is not a clean one). Installed by `scripts/install-worker-supply.sh` (Linux/systemd) or `scripts/install-launchd.sh` (macOS) |
 | `worker-supply.test.sh` | the #2700 contract, DRIVEN (not grepped): a stub dispatcher that shares the REAL one's grammar **and its fd discipline** (`exec >/dev/null 2>&1` in the worker — without it the supervisor's captured call blocks for the worker's whole life, which is how the first attempt at this fix died inside its own suite at 45+ minutes), the doctor's OWN `worker_live_for()` imported from the shipped `pr-doctor.py` and asked before/after as the accept check (`absent → live`), the single-instance guard BOTH ways (a second supervisor exits 4 and touches no worker; a stale lock is taken over), the bounded SIGTERM stop, the budget (2 spawns for `1+1` against 4 dead orders, `rc=6` and the bound named), mid-order death re-offered EXACTLY once (then twice, then stopped at `MAX_REFILLS`), the plist/env precedence pinned against `pr-doctor.capacity()`, the unit/plist properties (`--loop`, `KillMode=process`, `Restart=always`, no rendered `MAX_FIX`), the installer's one-command render + its Darwin refusal, **two MUTATIONS** (neuter the refill → the refill case reddens; delete the lock → the two-supervisor case reddens) and **its own wall-clock bound** (asserted ≤60 s, measured ~27 s). Hermetic, a CI shard |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
@@ -4572,10 +4901,13 @@ the `$HARNESS` this box was handed) and compares every `*.sh` basename against `
 dir, and files main ships that a deployed dir is **missing** — and it exits **2 (BROKEN)** when a
 candidate cannot be examined (unreadable, unlistable, an unsearchable ancestor, an unresolvable link),
 when the pin DIR record it would read cannot be examined, or when no candidate directory exists at all.
-With `--surface` and **no record on the box** — no `$O`, or a `$O` without a readable
-`.agent-infra-stamp.json` — the record-based halves print `SKIPPED` and the surface answer still
-arrives; that is the point, because a box with no record is exactly the class whose harness may have
-diverged. (`--o` still selects the deployed dir; the default is `$HOME/orchestrator`.)
+With `--surface` and **no usable record on the box** — no `$O`, a `$O` with no readable
+`.harness-provenance` **and** no readable `.agent-infra-stamp.json` — the record-based halves print
+`SKIPPED` and the surface answer still arrives; that is the point, because a box with no record is
+exactly the class whose harness may have diverged. A record that is present but *unusable* is not a
+reason to skip the surface pass either: a readable stamp answers the record halves instead (and the run
+says so), and only when neither record can be read does the identity half abstain.
+(`--o` still selects the deployed dir; the default is `$HOME/orchestrator`.)
 It is runnable from any box (it reads `origin/main` from the hub checkout it is given, never from the
 box it inspects) and `scripts/harness-status` runs it as its fifth row.
 

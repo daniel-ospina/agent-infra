@@ -89,6 +89,38 @@ HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 HARNESS_PIN_RECORD="${HARNESS_PIN_RECORD:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
 MODE="${1:---check}"
+# ── THE uv CACHE + LINK-MODE PIN (agent-infra#2159) ──────────────────────────────────────────────
+# A worktree `.venv` costs what the box's uv CACHE makes it cost, and that is not a property of the
+# lane: measured 2026-10-30 across the three cells, a box with a warm cache hardlinks every venv to it
+# (5.8 GB of `du` per worktree, ~0 distinct bytes), while a box with NO cache materialises the full
+# 5.8 GB per worktree — cell-3 went 17 GB free -> 257 MB free in ~50 minutes as its lanes synced.
+# So the pin is DELIVERED here, not left to whichever profile an operator happened to edit:
+#   * set EARLY (before keys.env is sourced below), so a `keys.env` line still WINS — this file
+#     defaults, it never overrides an operator's pin;
+#   * exported, so it reaches every process this bring-up starts and every process the cell's
+#     supervisor starts later (which is where lanes inherit it from);
+#   * REPORTED by `check_uv_env` below, so a cold cache is a stated condition rather than a surprise
+#     measured 50 minutes later as 257 MB of free disk.
+# A helper that cannot be read is not fatal here (a bring-up must still be able to report the state of
+# a box): `check_uv_env` says so and the values are computed from the same one-line formula.
+BRINGUP_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+UV_ENV_HELPER="${BRINGUP_HERE:+$BRINGUP_HERE/orchestrator-harness/uv-env.sh}"
+if [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ]; then
+  . "$UV_ENV_HELPER"
+  # ⛔ THE DEFAULT RESOLVES UNDER $CELL_HOME, NOT THE AMBIENT $HOME: `export HOME=$CELL_HOME` happens
+  # further down, and a bring-up started with HOME=/root would otherwise pin /root/.cache/uv for a cell
+  # whose lanes run under /tmp/cell-home — two caches, no cross-sharing, and every venv a full copy.
+  uv_env_apply "${CELL_HOME:-${HOME:-}}"
+else
+  UV_ENV_HELPER=""
+  [ -n "${UV_CACHE_DIR:-}" ] || UV_CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-}/.cache}/uv"
+  [ -n "${UV_LINK_MODE:-}" ] || UV_LINK_MODE=hardlink
+  export UV_CACHE_DIR UV_LINK_MODE
+fi
+# Set by `check_disk_reaper` and read by `check_reaping_armed`, so the two checks name the SAME reaper
+# and the same last-pass reading (#2916 check 5).
+DISK_REAPER_RESOLVED=""
+DISK_REAPER_LAST=""
 # ── swap seams (agent-infra#2390) — every path and knob overridable, for the same reason the token
 # path is: a hermetic suite must never create swap (or edit /etc) on the host that runs it.
 SWAPFILE="${SWAPFILE:-/swapfile}"
@@ -270,6 +302,155 @@ setup_home() {
   if [ "${HOME_ORIG:-}" = "/home/ubuntu" ] && [ ! -d /home/ubuntu ]; then
     warn "the image's default HOME=/home/ubuntu does not exist — this script overrides it"
   fi
+}
+
+# ── ONE HOME (agent-infra#2916 check 1) ─────────────────────────────────────────────────────────
+# MEASURED 2026-10-27, provisioning three cells: a cell ran with TWO homes — `/home/cmux` (the
+# checkout) and `/tmp/cell-home` (the farm, the state, `keys.env`) — and everything below followed
+# from that one fact, each of them reported as success somewhere:
+#   `REPO is not set and no single checkout could be derived`;
+#   17 jobs `broken target: /home/cmux/.pi/agent/scripts/… does not resolve — the farm is INCOMPLETE`
+#     while the farm WAS installed (under the other home);
+#   units hand-written with `ExecStart=/tmp/cell-home/...`, which each installer's `--status` then
+#     certified as "installed" for 109 h.
+# So the state is not detectable downstream: a check has to REFUSE it, at the gate, before a lane.
+#
+# ⛔ THE PREDICATE IS `CELL_HOME == the account's home`, NOT `HOME == CELL_HOME`. `setup_home` below
+# EXPORTS `HOME=$CELL_HOME`, so by the time any later check runs the two are equal BY ASSIGNMENT and
+# an equality test between them can never fail — a vacuous gate. The comparison therefore uses
+# `HOME_ORIG` (captured before `setup_home`) when that directory exists, else the passwd record. On
+# a cell `cmux vm exec` hands over `HOME=/home/ubuntu`, which does NOT exist (header (1)), so the
+# passwd home is the honest answer there; on a laptop the two agree.
+# Nothing repairs this: a second home is not a state any role can merge back — the remedy is to
+# start the cell with `CELL_HOME=$HOME` and re-run. Named, not invented: no doctor role is added.
+#
+# FIXTURE SEAM, declared rather than hidden: `CELL_VOLATILE_ROOTS` is the list of roots a cell's
+# state must not live in. Its shipped default (`/tmp:/var/tmp`) is what the red arm runs against; a
+# hermetic suite sets it because ITS OWN home is under the host's temp dir, exactly like
+# `SYSTEMD_UNIT_DIR` / `SWAP_SUDO` / `GH_TOKEN_FILE` — the alternative is a suite that cannot have a
+# good cell at all.
+CELL_VOLATILE_ROOTS="${CELL_VOLATILE_ROOTS:-/tmp:/var/tmp}"
+
+_one_home_want() { # the account's own home — what CELL_HOME must BE
+  local acct=""
+  if [ -n "${HOME_ORIG:-}" ] && [ -d "${HOME_ORIG}" ]; then printf '%s\n' "$HOME_ORIG"; return 0; fi
+  acct="$(getent passwd "$(id -un)" 2>/dev/null | awk -F: 'NR==1{print $6}')"
+  [ -n "$acct" ] || acct="$(cd ~"$(id -un)" 2>/dev/null && pwd -P)"
+  printf '%s\n' "${acct:-${HOME_ORIG:-${HOME:-}}}"
+}
+
+# is <path> under a volatile root AND outside the one home? (see the block above: a volatile path
+# that IS under CELL_HOME is the volatile-home question, answered by the equality test, not here)
+_one_home_under_volatile() {
+  local p="${1:-}" root
+  case "$p" in /*) ;; *) return 1 ;; esac
+  case "$p" in "${CELL_HOME:-/nonexistent}"|"${CELL_HOME:-/nonexistent}"/*) return 1 ;; esac
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    case "$p" in "$root"|"$root"/*) return 0 ;; esac
+  done <<EOF
+$(printf '%s' "$CELL_VOLATILE_ROOTS" | tr ':' '\n')
+EOF
+  return 1
+}
+
+# The unit directories this cell's installers WRITE to, in the order they try them — the same
+# read-side seams the supervisor uses (`CONTROLLER_SYSTEM_UNIT_DIR` / `…_USER_UNIT_DIR`, the reason
+# its suite pins both sides), plus the installers' own `SYSTEMD_UNIT_DIR` write seam.
+_one_home_unit_dirs() {
+  local d
+  for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" \
+           "${CONTROLLER_USER_UNIT_DIR:-${HOME:-}/.config/systemd/user}"; do
+    [ -n "$d" ] && printf '%s\n' "${d%/}"
+  done | awk 'NF && !s[$0]++'
+}
+
+# Path-SHAPED tokens in one unit line. Splitting on `=` too is what makes `Environment=REPO=/tmp/x`
+# yield `/tmp/x` rather than `REPO=/tmp/x`, and splitting on quotes/semicolons is what makes a path
+# inside `ExecStart=/bin/bash -lc 'cd /tmp/x && …'` visible at all.
+_one_home_scan_unit() { # <unit file> -> "<offending value>\t<file>" per hit
+  local f="$1" line p
+  while IFS= read -r line; do
+    case "$line" in
+      Environment=*|EnvironmentFile=*|ExecStart=*|WorkingDirectory=*) ;;
+      *) continue ;;
+    esac
+    while IFS= read -r p; do
+      case "$p" in /*) ;; *) continue ;; esac
+      _one_home_under_volatile "$p" && printf '%s\t%s\n' "$p" "$f"
+    done <<EOF
+$(printf '%s' "$line" | tr ' \t"\047;,=' '\n')
+EOF
+  done < "$f"
+}
+
+check_one_home() { # <env|units>
+  local leg="${1:-env}" want got bad="" line val dirs f n=0
+  want="$(_one_home_want)"; want="$(cd "$want" 2>/dev/null && pwd -P || printf '%s' "$want")"
+  got="$(cd "${CELL_HOME:-/nonexistent}" 2>/dev/null && pwd -P || printf '%s' "${CELL_HOME:-}")"
+  if [ -z "${CELL_HOME:-}" ] || [ "$got" != "$want" ]; then
+    die "CHECK FAILED [one home]: CELL_HOME ('${CELL_HOME:-<unset>}') is not this box's home ('${want:-<unknown>}') — the cell would run with TWO homes, which is the measured root of 'REPO is not set and no single checkout could be derived', of scheduled jobs whose farmed targets do not resolve because they look under the OTHER home, and of installers certifying a hand-written /tmp unit as their own. FIX: start the cell with CELL_HOME=\$HOME (measured-good: CELL_HOME=/home/cmux REPO=/home/cmux/tortoise), then re-run: HOME=\$HOME CELL_HOME=\$HOME bash $0 --check"
+  fi
+  if [ "$leg" = "env" ]; then
+    # The paths THIS run will hand the cell. A /tmp one that is not under the one home is a second
+    # tree no instrument is pointed at — the state the check exists to refuse.
+    for line in ENV_FILE WORKDIR HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_PIN_RECORD TEMPLATES_DIR; do
+      eval "val=\${$line:-}"
+      _one_home_under_volatile "$val" && bad="$bad${bad:+
+}$val\t\$$line"
+    done
+    # …and the file the cell's own session will source. Its ASSIGNMENTS, not its path.
+    if [ -f "${ENV_FILE:-}" ]; then
+      while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; *=*) ;; *) continue ;; esac
+        val="${line#*=}"; val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+        case "$val" in /*) ;; *) continue ;; esac
+        _one_home_under_volatile "$val" && bad="$bad${bad:+
+}$val\t$ENV_FILE"
+      done < "$ENV_FILE"
+    fi
+    if [ -n "$bad" ]; then
+      die "CHECK FAILED [one home]: a cell-state path lives outside the ONE home ($got) in a volatile root — this cell's farm, pin or checkout would be a second tree that a reboot deletes and no instrument looks at (measured: ENV_FILE=/tmp/cell-home/keys.env, REPO=/tmp/cell-t3, HARNESS_PIN_DIR=/tmp/cell-home/harness-next):
+$(printf '%s\n' "$bad" | sed 's/^/    /')
+FIX: move the state under \$HOME (CELL_HOME=\$HOME, and point WORKDIR/ENV_FILE/HARNESS_PIN_DIR there), then re-run this --check."
+    fi
+    ok "one home: CELL_HOME=$got (this box's home) — the env this run hands the cell carries no path outside it"
+    return 0
+  fi
+  # ── units leg — runs LAST in --check, because the installers RENDER the units (scanning earlier
+  # would certify an empty directory: the vacuity trap this fleet has been bitten by).
+  # macOS renders NO systemd unit, so there is nothing to scan there — but "the platform has none"
+  # stops being true the moment a run NAMES a unit directory (`SYSTEMD_UNIT_DIR` /
+  # `CONTROLLER_SYSTEM_UNIT_DIR` are the same seams the suite and the supervisor use), and a leg that
+  # refused to look whenever it was pointed at one could never be tested on a dev box. So the skip is
+  # scoped to "Darwin AND no explicit unit dir".
+  if [ "$(uname -s 2>/dev/null)" = "Darwin" ] \
+     && [ -z "${SYSTEMD_UNIT_DIR:-}${CONTROLLER_SYSTEM_UNIT_DIR:-}${CONTROLLER_USER_UNIT_DIR:-}" ]; then
+    warn "one home: the RENDERED UNITS were NOT scanned on macOS — the cell's systemd units are a Linux surface and launchd is out of scope here. Verify with: grep -HnE '^(Environment|ExecStart)=' \${CONTROLLER_USER_UNIT_DIR:-\$HOME/.config/systemd/user}/*.plist 2>/dev/null | grep /tmp"
+    return 0
+  fi
+  dirs="$(_one_home_unit_dirs)"
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    for f in "$dir"/eldato-*.service "$dir"/eldato-*.timer; do
+      [ -f "$f" ] || continue
+      n=$((n + 1))
+      val="$(_one_home_scan_unit "$f")"
+      [ -z "$val" ] || bad="$bad${bad:+
+}$val"
+    done
+  done <<EOF
+$dirs
+EOF
+  if [ "$n" -eq 0 ]; then
+    die "CHECK FAILED [one home]: no rendered eldato-*.service|timer was found in any unit directory ($(printf '%s' "$dirs" | tr '\n' ' ')) — this leg cannot scan anything, and 'nothing to scan' is NOT a pass. Either the installers above did not render, or they rendered somewhere this check does not read: re-run with SYSTEMD_UNIT_DIR/CONTROLLER_SYSTEM_UNIT_DIR naming the real directory."
+  fi
+  if [ -n "$bad" ]; then
+    die "CHECK FAILED [one home]: a RENDERED UNIT carries a path outside the ONE home ($got) in a volatile root — the measured state is a hand-written unit (`ExecStart=/tmp/cell-home/...`) that each installer's --status then certifies as 'installed', because a hand-written unit is indistinguishable from a rendered one:
+$(printf '%s\n' "$bad" | sed 's/^/    /')
+FIX: re-render it from the one home — 'cloud-cell-supervisor.sh apply' (or the owning installer's --install) — then re-run this --check."
+  fi
+  ok "one home: $n rendered unit(s) in $(printf '%s' "$dirs" | tr '\n' ' ') — no Environment=/ExecStart= path outside $got"
 }
 
 # ── toolchain — all preinstalled, but verify rather than assume ──────────────────
@@ -554,6 +735,55 @@ check_dispatch() {
   local out outrc
   out=""
   outrc=0
+  # ── THE LANE ROSTER (agent-infra#1935) ─────────────────────────────────────────────────────
+  # The pre-flight's holder surface is built FROM `$HOME/.pi/agent/state/lane-registry.tsv`
+  # (tortoise `tools/fleet_state.py`), and the only thing that ever wrote it was the RETIRED cmux
+  # dispatcher — so a cell has no roster, `load_registry` reports `measured=False`, the board
+  # cannot answer, and EVERY candidate is INCOMPLETE. Measured on cell 1, 2026-10-28:
+  #     issue assignee/holder INCOMPLETE … the roster was NEVER PROVISIONED in this cell
+  #     [refresh] ABORT: none of the 12 candidate(s) … judged NOTHING
+  # Provisioned HERE, from this box's OWN population, so "never provisioned" cannot recur.
+  # ⛔ THIS `--check` PATH WRITES, DELIBERATELY AND IN THE OPEN (#3032 review F7). A `--check` that
+  # silently mutated state would be a contract change; this one is stated instead: the roster is a
+  # PREREQUISITE of dispatch, `--check` is the last gate before a cell is started, and a check that
+  # only REPORTED an unprovisioned roster would leave the cell dispatching nothing — the defect
+  # (#1935) this whole change removes. The write is idempotent (a second run writes nothing) and
+  # non-destructive (a hand-maintained roster is never replaced, and an existing derived roster is
+  # never shrunk by an arm that measured nothing).
+  # ⛔ rc=3 is a WARNING, not a death: it means the population could not be MEASURED on this box,
+  # and the harness's reduced-surface path (refresh-candidates.sh, #2848) can still dispatch by
+  # handing the holder question to the cross-box claim registry. Killing a cell over an
+  # unmeasurable roster would be a false block; refusing to write an empty one is the rule that
+  # matters (#8175), and that lives in the provisioner.
+  if [ -f "$harness/provision-lane-registry.py" ] && command -v python3 >/dev/null 2>&1; then
+    local provout provrc
+    provout=""; provrc=0
+    provout="$(HOME="${CELL_HOME:-$HOME}" python3 "$harness/provision-lane-registry.py" --apply 2>&1)" || provrc=$?
+    printf '%s\n' "$provout" | sed 's/^/    /'
+    if [ "$provrc" -eq 3 ]; then
+      warn "the LANE ROSTER could not be provisioned (the population was unmeasurable — see above);"
+      warn "  the pre-flight's holder surface stays INCOMPLETE until it can be (agent-infra#1935)"
+    elif [ "$provrc" -ne 0 ]; then
+      # ⛔ A CRASH IS NOT A PROVISION (review finding 2): the provisioner's documented exits are
+      # 0/2/3, so any other non-zero is a failure of the tool itself, never "provisioned".
+      warn "the LANE ROSTER provisioning FAILED (rc=$provrc — not the tool's own refusal, so it crashed);"
+      warn "  the roster is in an UNKNOWN state and the holder surface may stay INCOMPLETE (agent-infra#1935)"
+    else
+      ok "lane roster: this box's own population (agent-infra#1935)"
+    fi
+  else
+    # ⛔ TWO CAUSES, TWO DIAGNOSES. The guard above has two halves (the tool is present AND an
+    # interpreter exists), and naming only the first made an absent `python3` read as a missing
+    # harness file — sending the operator to re-pull a file that is already there (review round 2,
+    # minor). The supervisor needs no twin here: its `cmd_check` dependency loop
+    # (cloud-cell-supervisor.sh:2101) dies on a missing python3 before this line is reached.
+    if [ ! -f "$harness/provision-lane-registry.py" ]; then
+      warn "provision-lane-registry.py not found at $harness — the lane roster is not provisioned here;"
+    else
+      warn "python3 is not on PATH — the lane roster provisioner cannot run here;"
+    fi
+    warn "  the pre-flight's holder surface will refuse every candidate (agent-infra#1935)"
+  fi
   out="$(REPO="$WORKDIR" OR="$REPO_SLUG" O="$CELL_HOME/orchestrator" bash "$harness/refresh-candidates.sh" --check 2>&1)" || outrc=$?
   if [ "$outrc" -ne 0 ]; then
     printf '%s\n' "$out" >&2
@@ -744,18 +974,21 @@ _pin_is_worktree_of() {
 check_harness_pin() {
   local repo want sha dir got pin_py root_ok=0
   repo="${HARNESS_REPO:-${LAYER_ROOT:-}}"
+  # ⛔ ALL THREE EXITS BELOW ARE REFUSALS, NOT WARNINGS (#2916 check 2, correcting #2909). They used to
+  # `warn … return 0`, so `check_harness_pin` could DECLINE TO PIN and bring-up still reached
+  # `CELL READY` — and the measured signature is a cell where `cell-install.sh --install` printed
+  # `LAYER VERIFIED` and ended with NO PIN AT ALL (a `bash -x` trace stops right there), which is a
+  # success message over a cell whose controller has no harness to run from and silently falls back to
+  # a hand-copied tree (§11's defect). "Cannot pin" is not "nothing to pin".
   if [ -z "$repo" ]; then
-    warn "no agent-infra checkout to pin the harness from (the operational-layer step found none) — skipping the pin; a controller started here would fall back to a hand-copied tree"
-    return 0
+    die "CHECK FAILED [harness pin]: no agent-infra checkout to pin the harness from (the operational-layer step found none) — a cell with no pin runs whatever tree it was handed (the hand-copied harness §11 exists to remove). FIX: put an agent-infra checkout on the cell and re-run with INFRA_ROOT=<checkout> (cell-install.sh --install records the LAYER only; THIS check is what pins the harness)"
   fi
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || {
-    warn "\$HARNESS_REPO=$repo is not a git checkout — cannot pin the harness; fix it and re-run"
-    return 0
+    die "CHECK FAILED [harness pin]: \$HARNESS_REPO=$repo is not a git checkout, so nothing can be pinned and no commit can be recorded. FIX: point HARNESS_REPO/INFRA_ROOT at a real checkout and re-run"
   }
   want="$(git -C "$repo" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
   if [ -z "$want" ]; then
-    warn "cannot resolve $HARNESS_REF in $repo — cannot pin the harness (a box with no pin still starts, but on whatever tree it was handed)"
-    return 0
+    die "CHECK FAILED [harness pin]: cannot resolve $HARNESS_REF in $repo — a cell with no pin starts on whatever tree it was handed, and nothing records which commit that was. FIX: fetch the ref on the cell's checkout (git -C $repo fetch origin) or set HARNESS_REF to a commit it carries, then re-run"
   fi
   sha="$(printf '%s' "$want" | cut -c1-12)"
   # A pin ROOT that exists must BE (or CONTAIN) a real worktree of this checkout. The measured trap is
@@ -1006,6 +1239,47 @@ check_caches() {
     warn "  from 7.1GB in ~/.cache/uv to 258MB free and refused every dispatch (#1987). Reclaim it now:"
     warn "    bash ${reaper:-$HOME/.pi/agent/scripts/pi-cache-reap.sh} --apply"
   fi
+}
+
+# ── (5b) the uv cache + link-mode pin, and what a worktree venv COSTS here (agent-infra#2159) ────
+# The cache report above answers "is the cache over its bound". It cannot answer the question the
+# lanes actually pay for: on THIS box, is a worktree's `.venv` hardlinked into the cache (cheap) or
+# materialised (a full copy, ~5.8 GB measured on a tortoise checkout)? Same size, opposite
+# consequence — and nothing on the cell reported the difference, which is why "disk is the ceiling"
+# and "the venvs are nearly free" were both true on different cells at the same time.
+# The reading is the helper's (`uv-env.sh report`), so the same sentence is printed by the supervisor
+# and by a lane — one authority, not a second opinion that drifts.
+check_uv_env() {
+  local out
+  # Re-apply AFTER keys.env has been sourced (it is sourced by `check_provider`, which runs earlier):
+  # `uv_env_apply` only fills what is UNSET, so an operator's keys.env line still wins, and the
+  # `defaulted` record recomputed here is the honest one — reporting "defaulted cache" for a cell
+  # whose keys.env pinned it would accuse the operator of a default they did not take.
+  [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ] && uv_env_apply "${CELL_HOME:-${HOME:-}}"
+  if [ -z "$UV_ENV_HELPER" ] || [ ! -r "$UV_ENV_HELPER" ]; then
+    warn "uv pin: no uv-env.sh beside this script — the values above are this file's inline default and the cold-cache reading is UNAVAILABLE (a cold cache is then only discovered as free disk disappearing)"
+  else
+    out="$(uv_env_report --estate "${WORKDIR:-$REPO}" 2>&1)" || out="[uv-env] report FAILED — the cold-cache reading is unavailable on this box"
+    # ⛔ THE CHANNEL CARRIES THE VERDICT. A COLD cache printed through `ok` is a green line for the one
+    # condition this check exists to raise, and an operator scanning for `warn:` never sees it (review
+    # finding). Everything that is a COST or a CANNOT-VERIFY is a warning; a measured/warm reading is ok.
+    printf '%s\n' "$out" | while IFS= read -r line; do
+      case "$line" in
+        '') continue ;;
+        *verdict=COLD-CACHE*|*verdict=NOT-SHARED*|*verdict=NOT-SHARING-BY-DESIGN*|*verdict=CACHE-UNMEASURABLE*|*verdict=SHARING-UNMEASURED*|*"report FAILED"*)
+          warn "$line" ;;
+        *) ok "$line" ;;
+      esac
+    done
+  fi
+  case "${UV_ENV_DEFAULTED:-}" in
+    none) ok "uv pin: UV_CACHE_DIR=$UV_CACHE_DIR UV_LINK_MODE=$UV_LINK_MODE (operator-set, not defaulted)" ;;
+    ''|*)
+      # The DEFAULT is what this bring-up ran with; the DURABLE home for an operator override is the
+      # cell's keys.env, which is sourced after these defaults and therefore wins. Say that, because a
+      # default that vanishes on the next shell is exactly the "operator's sed on one box" this fixes.
+      warn "uv pin: defaulted ${UV_ENV_DEFAULTED:-?} (UV_CACHE_DIR=$UV_CACHE_DIR UV_LINK_MODE=$UV_LINK_MODE) — this bring-up exports it for every process it starts; to make it durable on this CELL, put the same two lines in $ENV_FILE" ;;
+  esac
 }
 
 # ── (6) swap: a memory spike must PAGE, not OOM-kill the lanes (agent-infra#2390) ───────────────
@@ -1296,7 +1570,46 @@ check_disk_reaper() {
   [ "$rc" -eq 0 ] || die "the disk reaper timer is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
   next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
   last="$(printf '%s\n' "$out" | sed -n 's/^  status=//p' | head -1)"
+  # Globals, for `check_reaping_armed` below: the SAME resolved reaper and last-pass reading, so the
+  # two checks cannot disagree about which reaper is armed or when it last ran.
+  DISK_REAPER_RESOLVED="$reaper"; DISK_REAPER_LAST="${last:-never}"
   ok "disk reaper scheduled — timer next=${next:-?} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
+}
+
+# ── reaping ARMED, not merely installed (#2916 check 5) ─────────────────────────────────────────
+# MEASURED (row 8): a cell that had printed `CELL READY` died with
+# `claims.sh: line 1205: printf: write error: No space left on device` — the controller gone, no
+# reaping. The reaper that would have prevented it comes from the scheduler that would not start
+# (#2908), so "a timer is installed" was true and irrelevant: BYTES are the precondition.
+#
+# ⛔ IT REUSES THE FLEET'S ONE FLOOR, IT DOES NOT INVENT A SECOND. `disk-floor.sh` is the shared
+# pre-dispatch floor (orch-loop.sh and refresh-candidates.sh source it; its header carries the two
+# measured 100% cells), so the number and the always-safe reclaim pass are the same ones the
+# controller applies on every cycle. A second threshold here would be the "two contracts for one
+# safety rule" defect docs/ops/fleet-liveness.md §3 names.
+# WHO REPAIRS IT: the pass itself (the cheap always-safe subset), and after that the armed timer
+# `check_disk_reaper` just installed — the measured remaining classes (lane worktrees, lane venvs,
+# duplicate installs) are `disk-reaper.sh`'s. What NEITHER can free needs a human, and the refusal
+# says so instead of dispatching lanes onto a full disk.
+check_reaping_armed() {
+  local floor="" cand rc=0 out
+  for cand in "${DISK_FLOOR_LIB:-}" \
+              "${HOME:-}/.pi/agent/scripts/orchestrator-harness/disk-floor.sh" \
+              "${LAYER_ROOT:-}/scripts/orchestrator-harness/disk-floor.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/orchestrator-harness/disk-floor.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-floor.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { floor="$cand"; break; }
+  done
+  [ -n "$floor" ] || die "CANNOT VERIFY [reaping armed before lanes]: disk-floor.sh not found (looked at \$DISK_FLOOR_LIB, \$HOME/.pi/agent/scripts/orchestrator-harness, \$LAYER_ROOT/scripts/orchestrator-harness, and beside this script) — the disk floor and its reclaim pass cannot be run, and a cell certified without them stops dispatching at ~97% used with 'No space left on device' (row 8). FIX: re-run the operational-layer step (it farms the harness scripts) and re-run this check"
+  # shellcheck source=/dev/null
+  . "$floor"
+  out="$(disk_floor_gate "${CELL_HOME:-$HOME}" 2>&1)"; rc=$?
+  [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/    /'
+  case "$rc" in
+    0) ok "reaping armed before lanes: free disk meets the floor (DISK_FLOOR_MB=${DISK_FLOOR_MB:-?}), reaper last_pass=${DISK_REAPER_LAST:-?}" ;;
+    2) die "CANNOT VERIFY [reaping armed before lanes]: df did not answer, so the floor could not be measured — refusing a cell whose free space is unknown (a full disk is the state row 8 measured, and it arrives without any other signal). FIX: repair the mount/df read on this box, then re-run" ;;
+    *) die "CHECK FAILED [reaping armed before lanes]: the filesystem is below the disk floor even after the safe reclaim pass — lanes dispatched onto this cell write until 'No space left on device' kills the controller (measured).${out:+ The pass said: $out} Reaper last_pass=${DISK_REAPER_LAST:-?}. FIX: free bytes now — the remaining classes are disk-reaper.sh's: bash ${DISK_REAPER_RESOLVED:-<disk-reaper.sh>} --apply --repo ${WORKDIR:-<checkout>} — or lower DISK_FLOOR_MB deliberately; then re-run this check" ;;
+  esac
 }
 
 # check_harness_apply — put ACTIVATION on the clock too (#2416), through the SAME one-install-verb
@@ -1513,7 +1826,35 @@ check_schedule() {
   # the ones that cannot run here. Burying it in the indented block would make "deployed" a claim.
   local verdict; verdict="$(printf '%s\n' "$out" | grep -E '^SCHEDULE VERIFIED' | head -1)"
   [ -n "$verdict" ] || die "the scheduler printed no SCHEDULE VERIFIED verdict — refusing to report a cell ready on an unverified schedule (#1864)"
-  ok "scheduled layer live: $verdict"
+
+  check_schedule_verify "$sched" "$root" "$verdict"
+}
+
+# ── the schedule LOADS IN FULL, asserted by the verify verb (#2916 check 4) ────────────────────
+# `--install` ends by calling cmd_verify(), so its rc covers most of this — but the measured signature
+# is "`fleet-schedule.py --verify` non-zero, OR ANY `FAIL` line", and a gate that only greps for the
+# success line accepts a log that carries BOTH (the pre-fix code did exactly that: it grepped for
+# `SCHEDULE VERIFIED` and never looked at `FAIL`).
+# The controller's `--start` shares these declarations (`load_jobs`), so a set that verifies here is
+# the set `--start` will accept; a set that does not is #2908 — `FAIL com.eldato.ai-drainer:
+# placeholder(s) this runtime does not know: {{AI_DRAINER_O}}`, no reaping, no liveness, controller
+# rc=1 on every restart.
+# WHO REPAIRS IT: nobody automatic. The DECLARATION is the defect (a shipped template against the
+# shipped runtime), and neither the watchdog nor the loop can start on a set they cannot read — so
+# this refuses and names the FAIL lines, instead of leaving a cell that prints `CELL READY` and then
+# cannot keep a controller alive.
+check_schedule_verify() { # <farmed fleet-schedule.py> <checkout root> <verdict line>
+  local sched="$1" root="$2" verdict="$3" out rc=0 fails
+  out="$(HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" \
+         FLEET_SCHEDULE_STATE="$CELL_HOME/.pi/agent/state/fleet-schedule" \
+         python3 "$sched" --verify 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  fails="$(printf '%s\n' "$out" | grep -E '^ *FAIL')"
+  [ -z "$fails" ] || die "CHECK FAILED [scheduled layer]: fleet-schedule.py --verify printed FAIL (rc=$rc) — the declared job set does not load in full, so this cell would run with no reaping, no liveness detection and no canary AND the controller would refuse to start on it (#1864/#2908). The FAIL lines:
+$(printf '%s\n' "$fails" | sed 's/^/    /')
+FIX: repair the declaration each line names in $root/templates/launchd (a placeholder this runtime does not know, or a job with no StartInterval) and re-run this check — a template/vs-runtime skew is a repo fix, not a cell fix"
+  [ "$rc" -eq 0 ] || die "CHECK FAILED [scheduled layer]: fleet-schedule.py --verify exited $rc and printed no FAIL line — refusing a cell whose schedule cannot be verified (CANNOT-VERIFY is never a pass)"
+  ok "scheduled layer live: $verdict; --verify rc=0 with no FAIL line"
 }
 
 main() {
@@ -1533,6 +1874,11 @@ main() {
   case "$MODE" in
     --check)
       check_provider
+      # IMMEDIATELY after the env is sourced and HOME is forced: the ONE-home predicate reads the
+      # paths this run will hand the cell, so it must run while they are still the run's own values
+      # (later steps rewrite WORKDIR/HARNESS_PIN_DIR, and a check that reads them afterwards grades
+      # its own repair).
+      check_one_home env
       check_gh
       check_repo
       check_dispatch
@@ -1550,10 +1896,17 @@ main() {
       check_provider_layer
       check_schedule
       check_caches
+      # AFTER the cache report, and for the same reason: the bound is one question, the COST of a
+      # worktree venv on this box is the other (a hardlinked venv versus a 5.8 GB copy, #2159).
+      check_uv_env
       # Before the reaper's install step: a cell that cannot get swap must be refused EARLY, not
       # after the scheduler work — and the reading is what the operator needs from the refusal.
       check_swap
       check_disk_reaper
+      # AFTER the reaper is armed and its state recorded: BYTES are the precondition for lanes, and
+      # the measured failure (row 8) was a cell that had printed CELL READY and then filled its disk
+      # with no reaping. Reuses the fleet's one floor (disk-floor.sh), not a second threshold.
+      check_reaping_armed
       # Both schedulers/supervisors are installed AFTER the layer exists: each installer is resolved
       # FROM that layer (the harness-apply one from #2416, the controller one from #2402), so measuring
       # either earlier would probe a directory that has not been populated yet.
@@ -1563,12 +1916,16 @@ main() {
       # are systemd timers on the SAME manager this box just proved it has. Without this check they are
       # "reachable" only in the sense that a template exists — which is the inert-enforcer shape.
       check_cell_timers
+      # ⛔ LAST, and only here: the units leg scans what the installers above RENDERED. Running it
+      # earlier would scan an empty (or previous state dir's) directory and certify nothing — the
+      # vacuity trap. It reads the rendered files, never the installer's intent.
+      check_one_home units
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      log_line "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, scheduled layer, caches reported, swap active, harness activation scheduled)"
+      log_line "CELL READY — all links verified (one home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
       ;;
     *)
       log_line "unknown mode: $MODE (use --check)"; exit 2 ;;

@@ -1072,6 +1072,57 @@ case "$PROV_OUT" in
   *"self-refresh STALE"*) ok "status flags a verdict older than two of the LOOP's cycles (CYC default 240)" ;;
   *) bad "status did not flag a 1000s-old self-refresh verdict: $PROV_OUT" ;;
 esac
+# (e3b) THE RESTART DECISION IS READABLE FROM `status` (agent-infra#2641). `restart-pending` used to be
+# a word with no transition, and on a cell it was PERMANENT (the running identity was unreadable there),
+# so `status` printed `harness: …[current]` and `self-refresh: restart-pending` about the same box for
+# ever. The per-cycle record now carries the pending REASON and a request; `status` must print it,
+# because an operator acts from this verb and a recorded decision nobody can read is not a decision.
+printf 'restart request=pending requested_at=%s waited=12s requested_by=harness-refresh.sh@abc running=abc123 pin=def456 pending=deferred actuation=blocked blocked=lanes lanes=2 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 12 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"request=pending"*"pending=deferred"*) ok "status prints the restart REQUEST (the state, not just the word)" ;;
+  *) bad "status does not surface the restart request: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"actuation=blocked"*"blocked=lanes"*) ok "…including what would be interrupted (blocked=lanes)" ;;
+  *) bad "status hides what blocks the restart: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
+  *) bad "status prints the record but not what it means: $PROV_OUT" ;;
+esac
+# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". On that path
+# `harness-refresh.sh` returns from `set_pending` BEFORE `inflight_gate` is consulted, so no population is
+# ever evaluated as the BLOCKER. The record's `lanes=` is still written — it is measured separately, before
+# `set_pending`, and may legitimately be a NON-ZERO number (measured: a live `$O/lane.sh` gives
+# `blocked=identity lanes=1`) — but it is not why the restart is blocked. The identity is. So the generic
+# blocked sentence named a cause that does not exist and told the operator to wait for a population that
+# may never be the thing holding the restart back. The identity cause needs its own arm, and it comes first.
+# ⛔ AND THE SPECIMEN CARRIES A NON-ZERO lanes= ON PURPOSE: it is the HARDEST case for this arm. A record
+# with `blocked=identity lanes=1` has a lane population the operator can SEE, so the generic "wait for that
+# population to go idle" advice looks plausible — yet `inflight_gate` was never consulted on this path, so
+# lanes= is not the blocker and waiting would never clear it. If the arm ever regresses to the generic one,
+# this specimen is what catches it.
+printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 9 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"cannot be PROVEN"*) ok "…an unprovable IDENTITY is explained as such, on its own arm" ;;
+  *) bad "status does not explain an unprovable identity: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — on this path inflight_gate is never consulted, so no population is the blocker and the message names a cause that does not exist: $PROV_OUT" ;;
+  *) ok "…and does NOT claim an interruption that was never established" ;;
+esac
+# An ABSENT record is not "nothing pending": no cycle has ever recorded one.
+rm -f "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"NO REQUEST RECORD"*) ok "…and an absent record is reported as absent, not as 'nothing pending'" ;;
+  *) bad "an absent request record was silent: $PROV_OUT" ;;
+esac
+
 prov apply >/dev/null 2>&1   # leave the record and the seed consistent for the cases below
 
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
@@ -3049,6 +3100,68 @@ case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
 esac
+# (3b) ⛔ THE INCIDENT SHAPE: an ineffective reap EXITS 0 by design, so `ok=1 rc=0 verdict_worktree=ok`
+# is the CORRECT exit-code reading of the exact pass #3041 was read from — `worktree=<MB>` and nothing
+# else was that pass's misleading sentence. The reaper records the real answer separately as
+# `delegate_verdict_worktree=`, and a field the reader does not print does not exist.
+# ⛔ ORDERING IS LOAD-BEARING: these legs REWRITE the status file above, so they must run AFTER every
+# assertion that reads the previous pass's record (the first draft was inserted mid-block and silently
+# invalidated the `worktree=fail-closed` case).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=reap-ineffective\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"worktree=24MB"*"worktree-delegate=reap-ineffective"*) \
+    ok "status: the HEALTHY line carries the delegate's verdict beside the exit-code reading" ;;
+  *) bad "status: an ineffective reap on a healthy pass still reads as plain ok — $OUT" ;;
+esac
+# (3c) …and it does NOT bolt the note onto a genuinely healthy cell (no noise for `ok`/absent).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"worktree-delegate="*) bad "status: a healthy delegate verdict still grew a note — $OUT" ;;
+  *) ok "status: a healthy cell gains no delegate note (the field is printed only when it informs)" ;;
+esac
+# (3d) ⛔ THE SILENT SET MUST BE THE BENIGN SET, NOT AN "OK-LIKE" SET (#3058 review, P2). The delegate
+# vocabulary is `dry-run|reclaimed|idle|reap-ineffective|unmeasured` (pi-reap-worktrees.sh:642) plus
+# `mixed` at the entry point. THREE of those are a healthy pass and NONE of them may carry the ⛔:
+# `dry-run` is the SHIPPED DEFAULT (disk-reaper.sh:167) — so an ok-like silent set painted
+# `⛔ worktree-delegate=dry-run` onto every pass of every cell that had not armed the reaper — and
+# `idle` is the ordinary reading of an armed pass with nothing to reclaim. The ⛔ is the alarm channel,
+# so a ⛔ on a healthy cell is exactly what trains the operator to skip the one line that must be read.
+# Both polarities are pinned here: benign => silent, alarm-or-unrecognised => ⛔ (fail-loud, so a NEW
+# verdict added to the reaper and not taught to this reader is surfaced rather than swallowed).
+# ⛔ `mixed-benign` IS IN THE BENIGN LOOP AND MUST STAY THERE (#3058 review, P1): it is the entry
+# point's spelling for "two repos with ORDINARY answers that differ" (one reclaimed, one idle) — the
+# everyday shape of a multi-repo cell — and the aggregator has already lifted any alarm answer out of
+# it before the token exists. `mixed` is the alarm spelling (two answers of the alarm class) and stays
+# in the alarm loop below.
+for _dv_benign in dry-run idle reclaimed ok '?' not-run mixed-benign; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=%s\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$([ "$_dv_benign" = dry-run ] && printf dry-run || printf apply)" "$_dv_benign" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"worktree-delegate="*) bad "status: the BENIGN delegate verdict '$_dv_benign' grew a ⛔ note — $OUT" ;;
+    *"disk reaper: last pass"*) ok "status: the BENIGN delegate verdict '$_dv_benign' prints no ⛔ note, and the pass line is still there" ;;
+    *) bad "status: the healthy pass line vanished for delegate verdict '$_dv_benign' — $OUT" ;;
+  esac
+done
+for _dv_alarm in reap-ineffective unmeasured mixed unlisted-new-verdict; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$_dv_alarm" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"⛔ worktree-delegate=$_dv_alarm"*) ok "status: the ALARM delegate verdict '$_dv_alarm' is printed with the ⛔ (fail-loud)" ;;
+    *) bad "status: the ALARM delegate verdict '$_dv_alarm' was swallowed — $OUT" ;;
+  esac
+done
+# ⛔ THE PAIRED ASSERTION LIVES ABOVE, IMMEDIATELY AFTER BLOCK (3)'s OWN `OUT`, and it must stay
+# there: blocks (3b)/(3c) each REWRITE `disk-reaper.status` and reassign `OUT`, so an assertion left
+# down here reads (3c)'s healthy record — which never prints `verdict_worktree=` at all — and the
+# fail-closed property silently stops being tested while still claiming to be (#3058 review).
 # (3b) a DEFERRAL (rc=6) is NOT a failure on the operator's surface. The record keeps ok=0 and
 # `--print-status` still exits 3 (this verb's own exit code comes from the DOCTOR's status, so the
 # headline is the channel here — which is why it must be honest and must not go quiet), but it must not
@@ -4353,6 +4466,7 @@ fn() { sed -n "/^$1()/,/^}/p" "$SUP"; }
   echo 'log_line() { printf "%s\n" "$*"; }'
   for f in _proc_root _scan_controller_paths _controller_env_state_dir _pid_is_foreign_root_leak \
            _reap_still_leak cell_own_foreign_root_pids reap_own_foreign_root_leaks \
+           _session_pane_state_dir doctor_session_state_dir session_names_own_state_dir \
            doctor_session_foreign doctor_session_orphaned_foreign; do fn "$f"; done
 } > "$C/lib.sh"
 # The conjunction legs (2)-(5) need the /proc read replaced: $FAKE_O is what it would say. The
@@ -4363,6 +4477,21 @@ cp "$C/lib.sh" "$C/lib2.sh"
 cat >> "$C/lib.sh" <<'SH'
 _controller_env_state_dir() { printf '%s\n' "${FAKE_O:-}"; }
 SH
+
+# (0) PRECONDITION — every function this section drives must EXIST in $SUP. Legs (2)/(2b)/(4) assert
+#     "SAFE", which is exactly what a MISSING function prints, so without this arm the whole negative
+#     half of the contract passes over an implementation that was renamed or deleted (and a run against
+#     the pre-#2315 script reports green for the arms that matter most).
+_zz_missing=""
+for f in _proc_root _scan_controller_paths _controller_env_state_dir _pid_is_foreign_root_leak \
+         _reap_still_leak cell_own_foreign_root_pids reap_own_foreign_root_leaks \
+         _session_pane_state_dir doctor_session_state_dir session_names_own_state_dir \
+         doctor_session_foreign doctor_session_orphaned_foreign; do
+  fn "$f" | grep -q "^$f()" || _zz_missing="$_zz_missing $f"
+done
+[ -z "$_zz_missing" ] \
+  && ok "every function this section drives exists in the shipped supervisor (the negative arms below cannot pass over nothing)" \
+  || bad "MISSING from the supervisor under test:${_zz_missing} — the 'SAFE'/'refused' arms would pass vacuously"
 
 # (1) SHAPE — a shell whose command STRING merely mentions the path is not a controller
 out="$(printf '%s\n' "4242 bash -c 'vim /x/orch-loop.sh'" "4243 bash /x/orch-loop.sh" | bash -c '. "$C/lib.sh"; _scan_controller_paths')"
@@ -4426,9 +4555,22 @@ esac
 exit 1
 SH
 chmod +x "$C/bin/tmux"
-printf "%s\n" "set -a; . '/home/cmux/keys.env'; exec env REPO='daniel-ospina/agent-infra' HARNESS_REPO='premise-labs/agent-infra' O='$C/live' tee -a '$C/live/logs/cell-doctor.log'" > "$C/pane.txt"
+# ⛔ THE FIXTURE IS THE DEPLOYED STRING, IN THE DEPLOYED ORDER — `O='…'` comes BEFORE
+# `HARNESS_REPO='…'` in the real command (see the rendered doctor string in `start_doctor_loop`).
+# An earlier fixture put O LAST, and greedy `.*O='` then picked the right value BY ACCIDENT: the leg
+# went green on the P0-2 defect and proved nothing. Order is the whole test.
+printf "%s\n" "set -a; [ ! -f '/home/cmux/cell-home/.pi/keys.env' ] || . '/home/cmux/cell-home/.pi/keys.env'; set +a; export ORCH_FOREGROUND=0; unset GH_REPO; HOME='/home/cmux/cell-home' CELL_HOME='/home/cmux/cell-home' O='$C/live' REPO='daniel-ospina/agent-infra' OR='daniel-ospina/agent-infra' SESSION='orch' SCOPE='auto' ENV_FILE='/home/cmux/cell-home/.pi/keys.env' DOCTOR_SESSION='cell-doctor' HARNESS_REPO='premise-labs/agent-infra' HARNESS_REF='main' MIN_FREE_MB='8192' bash '/home/cmux/harness/scripts/orchestrator-harness/cloud-cell-doctor.sh' loop 2>&1 | tee -a '$C/live/logs/cell-doctor.log'" > "$C/pane.txt"
 mkdir -p "$C/live/logs"
-out="$(PATH="$C/bin:$PATH" O="$C/o" DOCTOR_SESSION=cell-doctor bash -c '. "$C/lib.sh"; doctor_session_foreign && echo FOREIGN; doctor_session_orphaned_foreign && echo ORPHAN-ACCEPTED || echo REFUSED')"
+out="$(PATH="$C/bin:$PATH" O="$C/o" DOCTOR_SESSION=cell-doctor bash -c '. "$C/lib.sh"; doctor_session_state_dir || echo PARSE-FAILED; doctor_session_foreign && echo FOREIGN; doctor_session_orphaned_foreign && echo ORPHAN-ACCEPTED || echo REFUSED')"
+# ⛔ THE PARSE IS ASSERTED, NOT JUST THE DECISION (found by extraction while landing this change).
+# `REFUSED` alone is what a MISSING `doctor_session_state_dir` also produces — the leg went green over a
+# helper that no longer existed. Naming the value the parse must extract is what makes this arm
+# sensitive to the P0-2 defect AND to its own fixture: `premise-labs/agent-infra` here means the greedy
+# match won.
+case "$out" in
+  "$C/live"*) ok "the anchored parse extracts the REAL \$O from a rendered command that also carries REPO=/HARNESS_REPO= (a bare REFUSED would pass over a missing helper)" ;;
+  *) bad "the doctor parse did not yield the live state dir (got [$(printf '%s' "$out" | tr '\n' '/')]) — the P0-2 greedy match may have won" ;;
+esac
 case "$out" in
   *FOREIGN*REFUSED*) ok "a doctor session from a LIVE state dir is refused even with REPO=/HARNESS_REPO= in the string (the P0-2 greedy-parse defect)" ;;
   *) bad "the doctor parse mis-read the rendered command — a live peer's session could be killed: [$out]" ;;
@@ -4437,7 +4579,10 @@ esac
                        || ok "no peer doctor session was killed (killed.log is empty by absence)"
 
 # (7) and a session naming a state dir that no longer exists IS recoverable
-printf "%s\n" "set -a; . '/home/cmux/keys.env'; exec env REPO='daniel-ospina/agent-infra' HARNESS_REPO='premise-labs/agent-infra' O='$C/gone/o' tee -a '$C/gone/o/logs/cell-doctor.log'" > "$C/pane.txt"
+# (7) and a session naming a state dir that no longer exists IS recoverable. Same deployed ORDER
+#     (`O='…'` first): with an unanchored parse this one extracts the HARNESS_REPO tail, which is not an
+#     absolute path, so the orphan branch can never fire on a real rendered command.
+printf "%s\n" "set -a; [ ! -f '/home/cmux/cell-home/.pi/keys.env' ] || . '/home/cmux/cell-home/.pi/keys.env'; set +a; export ORCH_FOREGROUND=0; unset GH_REPO; HOME='/home/cmux/cell-home' CELL_HOME='/home/cmux/cell-home' O='$C/gone/o' REPO='daniel-ospina/agent-infra' OR='daniel-ospina/agent-infra' SESSION='orch' SCOPE='auto' ENV_FILE='/home/cmux/cell-home/.pi/keys.env' DOCTOR_SESSION='cell-doctor' HARNESS_REPO='premise-labs/agent-infra' HARNESS_REF='main' MIN_FREE_MB='8192' bash '/home/cmux/harness/scripts/orchestrator-harness/cloud-cell-doctor.sh' loop 2>&1 | tee -a '$C/gone/o/logs/cell-doctor.log'" > "$C/pane.txt"
 out="$(PATH="$C/bin:$PATH" O="$C/o" DOCTOR_SESSION=cell-doctor bash -c '. "$C/lib.sh"; doctor_session_foreign && echo FOREIGN; doctor_session_orphaned_foreign || echo REFUSED')"
 case "$out" in
   *FOREIGN*"$C/gone/o"*) ok "a doctor session naming a VANISHED state dir is identified as recoverable (#2315)" ;;
@@ -4487,16 +4632,138 @@ case "$reaped" in
   *) : ;;
 esac
 
-# (10) where /proc is absent the reap is inert AND says so, rather than reporting a clean sweep
-if [ -d /proc ]; then
-  ok "SKIPPED (this box has /proc — the Linux collection path is exercised on a cell, not here)"
-else
-  out="$(bash -c '. "$C/lib.sh"; cell_own_foreign_root_pids "'"$C"'/o" || echo NO-PROC; reap_own_foreign_root_leaks "'"$C"'/o" 1 && echo REAP-RC0')"
-  case "$out" in
-    *NO-PROC*REAP-RC0*) ok "without /proc the collector fails closed and the reap is a silent no-op (never a blind kill)" ;;
-    *) bad "the reap did not fail closed without /proc: [$out]" ;;
-  esac
-fi
+# (9b) ⛔ CANNOT-MEASURE IS FAIL-CLOSED (#2315). A `ps` that fails returns the SAME empty answer a
+# genuinely leak-free box returns — which is why the collector captures the table first and treats a
+# failed read as CANNOT DETERMINE. Without that split this leg's box reports "reaped: no controller from
+# another harness root serves … any more": a broken cell reading as a clean one.
+mkdir -p "$C/bin3"
+cat > "$C/bin3/ps" <<'SH'
+#!/bin/bash
+exit 1
+SH
+chmod +x "$C/bin3/ps"
+out="$(PATH="$C/bin3:$PATH" PROC_ROOT="$PR" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; cell_own_foreign_root_pids "$O" "$HARNESS" || echo COLLECT-NOT-DETERMINED; reap_own_foreign_root_leaks "$O" 1; echo "RC=$?"')"
+case "$out" in
+  *COLLECT-NOT-DETERMINED*"RC=2"*) ok "an UNREADABLE process table is CANNOT-DETERMINE (collector rc 1, reap rc 2), never a clean sweep" ;;
+  *) bad "a failed \`ps\` was reported as an answer — got [$(printf '%s' "$out" | tr '\n' ' ')]" ;;
+esac
+case "$out" in
+  *"reaped:"*) bad "the reap printed its PASS line over a table it could not read: [$(printf '%s' "$out" | tr '\n' ' ')]" ;;
+  *) ok "the reap never prints its 'reaped: no controller …' pass line when it could not measure" ;;
+esac
+
+# (10) where /proc is absent the collector cannot answer, and the reap SAYS SO instead of reporting a
+#      clean sweep. The absence is simulated through PROC_ROOT (the seam's whole purpose) so this leg
+#      runs identically on a Linux cell and on a Mac — a host-gated skip would leave the macOS case
+#      unpinned, and "skipped green" is how the /proc half of a safety rule rots.
+out="$(PATH="$C/bin2:$PATH" PROC_ROOT="$C/noproc-absent" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; cell_own_foreign_root_pids "$O" "$HARNESS" || echo COLLECT-NOT-DETERMINED; reap_own_foreign_root_leaks "$O" 1; echo "RC=$?"')"
+case "$out" in
+  *COLLECT-NOT-DETERMINED*"cannot determine"*"RC=2"*) ok "without /proc the collector cannot answer and the reap returns CANNOT-DETERMINE (rc 2) out loud — never a blind kill" ;;
+  *) bad "the reap did not fail closed without /proc: [$(printf '%s' "$out" | tr '\n' ' ')]" ;;
+esac
+case "$out" in
+  *"reaped:"*) bad "without /proc the reap claimed a clean sweep it never performed" ;;
+  *) : ;;
+esac
+
+# (11) THE ISSUE'S TITLE, END TO END: a killed controller's leftover SESSION is cleared by `stop`
+#      when — and only when — its own pane command names THIS state dir. This is ask (a) as written:
+#      "stop may clear a session it can prove belongs to this state dir by shape (no lock, no
+#      controller)". Driven against the SHIPPED script (not the extracted functions): the decision
+#      lives in cmd_stop's refusal path, and a re-implementation of it would pass on the broken copy.
+C2="$T/own-session"; mkdir -p "$C2/bin" "$C2/o" "$C2/home"
+: > "$C2/home/keys.env"
+# The tmux double is STATEFUL: a session exists while $C2/session does, and kill-session removes it —
+# so "did stop clear it" is answered by the next has-session, exactly as the real verb reads it.
+cat > "$C2/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in
+  has-session) [ -f "$C2/session" ] && exit 0 || exit 1 ;;
+  list-panes)   [ -f "$C2/session" ] && cat "$C2/pane.txt" || exit 1 ;;
+  kill-session) printf '%s\n' "\$*" >> "$C2/killed"; rm -f "$C2/session"; exit 0 ;;
+  ls)           [ -f "$C2/session" ] && echo orch || true ; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$C2/bin/tmux"
+# A process table with nothing of ours in it: this is the state a killed controller leaves behind. It
+# must be NON-EMPTY — an empty answer is what `owned_controller_pids`/`seen_controller_pids` read as
+# "the table could not be read" (their own rc-1 rule), and that refusal is a different arm.
+cat > "$C2/bin/ps" <<'SH'
+#!/bin/bash
+echo "1 0 /sbin/launchd"
+exit 0
+SH
+chmod +x "$C2/bin/ps"
+render_leftover_pane() { # <state-dir>; the DEPLOYED order, O= first
+  printf '%s\n' "set -a; [ ! -f '$C2/home/keys.env' ] || . '$C2/home/keys.env'; set +a; unset GH_REPO; PATH='$1/gh-limit':\"\$PATH\" HOME='$C2/home' CELL_HOME='$C2/home' REPO='daniel-ospina/agent-infra' O='$1' OR='daniel-ospina/agent-infra' SCOPE='auto' HARNESS_REPO='premise-labs/agent-infra' HARNESS_REF='main' bash '$1/orch-loop.sh' 2>&1 | tee -a '$1/logs/controller.log'" > "$C2/pane.txt"
+}
+run_stop() { # <state-dir>; runs the SHIPPED stop, returns its rc in S_RC, output in S_OUT
+  S_RC=0; S_OUT="$(PATH="$C2/bin:$PATH" CELL_HOME="$C2/home" ENV_FILE="$C2/home/keys.env" \
+    SESSION=orch O="$1" REPO="$C2/home" OR=daniel-ospina/agent-infra SCOPE=own \
+    HARNESS="$C2/harness" bash "$SUP" stop 2>&1)" || S_RC=$?
+}
+: > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/o"
+run_stop "$C2/o"
+case "$S_RC:$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE)" in
+  0:SESSION-GONE) ok "stop CLEARS a leftover session whose own pane command names THIS state dir — the measured 'neither start nor stop can clear' case (#2315 ask a)" ;;
+  *) bad "stop did not clear this state dir's own leftover session (rc=$S_RC, $(cat "$C2/killed" 2>/dev/null | tr '\n' ' ')) — out: [$(printf '%s' "$S_OUT" | tr '\n' ' ')]" ;;
+esac
+case "$S_OUT" in
+  *"clearing this state dir's leftover"*) ok "…and SAYS it cleared a leftover rather than reporting a plain stop" ;;
+  *) bad "the clear was silent about what it was: [$S_OUT]" ;;
+esac
+# (12) THE PEER CASE — same shape, a DIFFERENT state dir in the pane command. This must still refuse:
+#      the machine-scoped session name is not evidence, and killing a peer cell's session is the #1856
+#      hazard this whole fence exists for.
+: > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/peer-cell"
+run_stop "$C2/o"
+case "$S_RC:$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE)" in
+  0:*) bad "stop reported SUCCESS over a session that is not this state dir's (rc=0) — #1856" ;;
+  *:SESSION-GONE) bad "stop KILLED a peer state dir's session ($(cat "$C2/killed" | tr '\n' ' ')) — #1856" ;;
+  *) ok "stop still REFUSES a session whose pane command names another state dir (peer cell: refused, not killed)" ;;
+esac
+case "$S_OUT" in
+  *"does not name $C2/o"*) ok "…and the refusal names the evidence it lacked (the pane command does not name this state dir)" ;;
+  *) bad "the refusal does not say what it could not prove: [$S_OUT]" ;;
+esac
+# (13) and an UNREADABLE pane is a refusal too — a tmux that cannot answer must never authorise a kill.
+: > "$C2/session"; : > "$C2/killed"; : > "$C2/pane.txt"
+run_stop "$C2/o"
+case "$S_RC:$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE)" in
+  0:*) bad "stop reported success over an unreadable session (rc=0)" ;;
+  *:SESSION-GONE) bad "stop killed a session whose pane could not be read — fail-OPEN" ;;
+  *) ok "an UNREADABLE pane refuses the clear (fail-closed: no evidence, no kill)" ;;
+esac
+# (14) AND `start` TAKES OVER: the service-mode handover (`ORCH_FOREGROUND=1`, what the systemd unit
+#      runs) used to wait out an orphan session it could never end and then die naming a remedy `stop`
+#      refused to perform — the "active forever, nothing cycles" shape the issue measured. With the
+#      session provably ours it is cleared and the start proceeds to launch (the launch itself fails
+#      here — there is no harness in the fixture — so the assertion is on the CLEARING, not on the
+#      launch, and it is BOUNDED: a regression to an unbounded wait must redden this leg, not hang CI.
+#      The bound is a watchdog process, not `timeout(1)` — that is GNU coreutils and absent on macOS,
+#      where this suite must run (the whole section exists to run here).
+run_bounded() { # <seconds> <cmd…>; kills the command at the bound, returns its rc
+  local secs="$1" p w r; shift
+  ( "$@" ) & p=$!
+  ( sleep "$secs"; kill -9 "$p" 2>/dev/null ) & w=$!
+  wait "$p"; r=$?
+  kill "$w" 2>/dev/null || true
+  return "$r"
+}
+: > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/o"
+F_OUT="$(PATH="$C2/bin:$PATH" CELL_HOME="$C2/home" ENV_FILE="$C2/home/keys.env" \
+  SESSION=orch O="$C2/o" REPO="$C2/home" OR=daniel-ospina/agent-infra SCOPE=own \
+  HARNESS="$C2/harness" ORCH_FOREGROUND=1 CONTROLLER_ORPHAN_TIMEOUT=5 \
+  run_bounded 60 bash "$SUP" start 2>&1)" || true
+case "$F_OUT" in
+  *"clearing this state dir's leftover"*) ok "service-mode start CLEARS this state dir's orphan session instead of waiting out a session nothing owns (#2315)" ;;
+  *) bad "service-mode start did not clear this state dir's orphan session: [$(printf '%s' "$F_OUT" | tr '\n' ' ' | cut -c1-400)]" ;;
+esac
+case "$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE)" in
+  SESSION-GONE) ok "…and the leftover session is actually GONE after the handover" ;;
+  *) bad "the handover reported a clear but the session is still there" ;;
+esac
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

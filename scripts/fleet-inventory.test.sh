@@ -18,6 +18,10 @@
 #       code (a Mac is not broken for having no cell supervisor) while never rendering as OK.
 #   §5  THE EXIT CODE REFLECTS THE WORST ROW — 0 all-OK/SKIPPED, 1 any not-OK, 2 any UNKNOWN
 #       (an unreadable process table is an abstention, never a pass).
+#   §10 THE STATE NEVER RIDES IN THE ENVIRONMENT — a process table past ARG_MAX still reads (E2BIG
+#       made every read degrade to `[UNKNOWN]` on a busy box), the snapshot is shared with subshells
+#       and absent from a child's environment, and an ABSENT job definition is SKIPPED while an
+#       unreadable one stays UNKNOWN.
 #
 # NON-VACUITY. Each arm is a behaviour of the SHIPPED predicates, so it is shown non-vacuous by
 # pointing the suite at a neutered copy of the library — the recipe at the bottom of this header.
@@ -57,23 +61,41 @@
 #       suite goes from ~35s to ~5min: the wall clock is the symptom the arm pins)
 #   (s) nest the cell-identity test back inside "supervisor script missing" → §9p + §4 (a Linux dev
 #       box / CI runner reads MISSING again: the entry point's supervisor path always EXISTS)
+#   (u) drop the `waiting-exits` arm of `_fleet_row_launchd_job` (pr-doctor's 6 → the FAILING arm)
+#       → §6's "exit (6) … reads WAITING" arm ONLY. Measured: it reddens that one arm and leaves the
+#       exit-7 control green, which is the proof the allowance is narrow rather than generic.
+#   (v) add 6 to `fleet_state_severity`'s "not OK" side (WAITING fails the table)   → §6's "WAITING
+#       is a PASS for the table's exit code" arm only
+#   (w2) treat EVERY bound as self-clearing (drop the axis split)                   → §6's "a DISK
+#       refusal reads FAILING" + "it FAILS the table's exit code" arms AND the UNKNOWN arm
+#   (x) read the axis but default an unreadable one to WAITING                     → §6's UNKNOWN arm
+#       only (the fail-open direction: "cannot tell" became a pass)
+#   (x2) return on the capacity arm BEFORE the freshness arms (the pre-review shape) → §6's "a STALE
+#       exit 6 is LATE" + "it fails the table's exit code" arms only. The fresh-arm controls
+#       ("WAITING is a PASS", "never rendered OK") stay GREEN by design: they pin the OPPOSITE
+#       direction, so a mutation that removes the freshness check cannot redden them.
+#   (x3) read `refusal_bound` WITHOUT checking the record is the pass being explained → §6's
+#       "a record from a DIFFERENT pass is UNKNOWN" arm only.
+#       ⛔ THE LABELS ABOVE ARE SUFFIXED `2`/`3` RATHER THAN RE-LETTERED (review P3, #2291): `(w)`
+#       below is a PRE-EXISTING entry (the §9r mutation), and one fixer must be able to name ONE
+#       mutation and get ONE reddened arm. Leave the pre-existing letters alone; suffix the new ones.
 #   (t) do not clear a pidfile the row has PROVEN stale                        → §9q (2 arms: start
 #       cannot repair the row, and the row stays FAILING afterwards)
-#   (u) have the caller assume it started something                          → §9r only
-#   (v) accept any non-empty FLEET_CELL_HOME as cell identity                → §9p only (a defaulted
+#   (w) have the caller assume it started something                          → §9r only
+#   (y) accept any non-empty FLEET_CELL_HOME as cell identity                → §9p only (a defaulted
 #       path made every Linux box a "cell": the entry point defaults CELL_HOME)
-#   (w) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
+#   (z) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
 #       manufactured a duplicate, then read OK over two live loops)
-#   (x) refuse the repair entirely                                         → §9q (2 arms)
-#   (aa) render a STALE lander-drain record as OK (delete the LATE verdict)    → §9u only (2 arms)
-#   (y) hard-code the heartbeat loop's bound instead of reading
+#   (aa) refuse the repair entirely                                         → §9q (2 arms)
+#   (ab) render a STALE lander-drain record as OK (delete the LATE verdict)    → §9u only (2 arms)
+#   (ac) hard-code the heartbeat loop's bound instead of reading
 #       `FLEET_HEARTBEAT_LATE_S`                                           → §9t's LATE arm only
-#   (z) hard-code the cadence row's bound instead of reading
+#   (ad) hard-code the cadence row's bound instead of reading
 #       `FLEET_CADENCE_LATE_S`                                             → §9t's LATE arm only
-#   (aa) drop `+ $FLEET_JOB_SLACK_S` from the launchd freshness bound       → §9t's job-slack OK arm
-#   (ab) hard-code the controller's bound instead of reading
+#   (ae) drop `+ $FLEET_JOB_SLACK_S` from the launchd freshness bound       → §9t's job-slack OK arm
+#   (af) hard-code the controller's bound instead of reading
 #       `FLEET_CONTROLLER_LATE_S`                                           → §9t's controller LATE arm
-#   (ac) restore the zero-tolerance fence (drop the shared 5 s slack)            → §9v (deterministic
+#   (ag) restore the zero-tolerance fence (drop the shared 5 s slack)            → §9v (deterministic
 #       on EVERY platform). §9k's owner arm and §9u's fresh-lock arm assert the same property but are
 #       only probabilistic: they redden when the two clock sources disagree (the Linux-only accident
 #       that produced the bug), and stayed GREEN on macOS — which is why §9v was added
@@ -87,6 +109,20 @@
 #       wait cannot redden it — and a mutation that made the wait a blindfold would redden only it.
 #   (ag) arithmetic on the settle bound without `10#` (the octal form)    → §9x(d) only
 #       [(af) does not redden §9x(d): the pre-fix library never evaluates the bound at all]
+#   (ARG1) put the process table BACK INTO THE ENVIRONMENT (`export FLEET_PS_CACHE` / `_LAUNCHD_CACHE`)
+#       → MEASURED: 3 red — §10a's two read arms (controller and landers both UNKNOWN on a 1.3 MB
+#       table) + §10b (a child's `env` names the cache). §10b reddens at ANY size, §10a only once the
+#       table passes ARG_MAX, which is why both arms exist and why §10a asserts its own premise size.
+#       ⛔ §10a's RENDER arms stay GREEN here, and that is deliberate: the render runs in a FRESH
+#       subshell where `fleet_rows` never ran, so it inherits no cache — the whole-table death is an
+#       entry-point-flow failure, and an arm that asserted the render's EXIT CODE reddened instead on
+#       data an unrelated row had already made UNKNOWN (measured). It asserts the render, not the code.
+#   (ARG2) read `EnvironmentVariables.O` BEFORE the plist existence test (the pre-fix order in
+#       `fleet_row_second_controller`) → MEASURED: 8 red — §10c (3 arms) plus the cascade the pre-fix
+#       order caused on origin/main: §8 (2), §9h, §9r and §9x(c) (no table at all, so the arm reads
+#       garbage). The control §10c(b) stays GREEN: it pins the direction that must NOT change (an
+#       unreadable file is still an abstention), so a mutation of the ORDER cannot redden it — and
+#       §10a stays GREEN, which is the proof the §10a arms are not coupled to this row.
 # A red in a section the mutation does not name means the arm is coupled to the wrong behaviour —
 # e.g. (b) reddening §2 would mean §2 is asserting the controller's duplicate logic.
 
@@ -516,6 +552,87 @@ ROWS="$(run_rows 'fleet_rows ""')"
 st="$(state_of "$ROWS" pr-doctor)"
 [ "$st" = "OK" ] && ok "§6 the same job with last exit 0 reads OK (so §6 is not 'always FAILING')" \
                  || bad "§6 last exit 0 should read OK, got [$st]"
+# ⛔ #2291: `pr-doctor`'s OWN exit 6 is the dispatcher saying "the box's gate refused every order,
+# nothing was consumed". It is neither a failure (the pre-#2291 reading, which sent operators to
+# repair a healthy busy box) nor OK (the queue is not moving). WAITING, and a PASS for the code —
+# ⛔ BUT ONLY FOR THE AXIS THAT SELF-CLEARS (review P2, #2291). The severity follows the `refusal_bound`
+# in the component's OWN record, because `spawn-gate.sh` says per axis whether waiting clears it: load
+# does (`:1399`), disk (`:1392`), fork (`:1344`) and land-backlog (`:1461`) explicitly do not. All
+# three arms below are driven from that record, and the absence of one is an abstention, never a pass.
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+printf 'PID\tStatus\tLabel\n-\t6\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "WAITING" ] && ok "§6 pr-doctor's NO-CAPACITY exit (6) on the LOAD axis reads WAITING — no room, nothing failed" \
+                      || bad "§6 last exit 6 with bound=load should read WAITING, got [$st]"
+# ⛔ `severity_of_row`, NOT `severity_of` (the helper exists for exactly this): a whole-fixture table
+# answers a different question — this box leaves `second-controller` UNKNOWN, so `severity_of` returns
+# 2 whatever this row says and the arm could not redden for its own behaviour (measured here: it did
+# not, on a green WAITING row).
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=0" ] && ok "§6 …and WAITING is a PASS for the table's exit code" \
+                                        || bad "§6 WAITING must not fail the table, got $(severity_of_row "$ROWS" pr-doctor)"
+case "$(printf '%s\n' "$ROWS" | awk -F'\t' '$1=="pr-doctor"{print $4}')" in
+  OK) bad "§6 …but it must NEVER render OK — the queue is not moving while the box has no room" ;;
+  *)  ok "§6 …and it is never rendered OK (a distinct state, like SKIPPED)" ;;
+esac
+# ⛔ A NON-CLEARING BOUND IS NOT A PASS. A full disk, fork exhaustion and a land-backlog hold all
+# refuse the same way and NONE of them clears by waiting; counting them as a pass would make the
+# table's exit code go green on a stall that can never self-clear (the signal
+# `orchestrator-bringup.sh:1394` exists to keep). FAILING, with the axis named.
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "refusal_bound": "disk=4"}\n' > "$STATE/pr-doctor.status.json"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "FAILING" ] && ok "§6 …but a DISK refusal (waiting does not clear it) reads FAILING, not WAITING" \
+                       || bad "§6 a disk-bound exit 6 should read FAILING, got [$st]"
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=1" ] && ok "§6 …and it FAILS the table's exit code (a non-clearing stall is not green)" \
+                                                  || bad "§6 a disk-bound exit 6 must not pass the table, got $(severity_of_row "$ROWS" pr-doctor)"
+case "$(detail_of "$ROWS" pr-doctor)" in
+  *disk*) ok "§6 …and the detail names the axis that has to be cleared by hand" ;;
+  *)      bad "§6 the disk refusal's detail does not name the axis: $(detail_of "$ROWS" pr-doctor)" ;;
+esac
+# ⛔ AND AN UNREADABLE BOUND IS AN ABSTENTION: exit 6 with no `refusal_bound` (an older record, or an
+# unreadable one) cannot say whether it self-clears, and "cannot tell" is never a pass.
+printf '{"rc": 6, "verdict": "NO-CAPACITY"}\n' > "$STATE/pr-doctor.status.json"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "UNKNOWN" ] && ok "§6 …and exit 6 with NO readable bound is UNKNOWN — an abstention, never a pass" \
+                       || bad "§6 exit 6 without a readable bound should read UNKNOWN, got [$st]"
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=2" ] && ok "§6 …which is the table's fail-closed code" \
+                                                 || bad "§6 UNKNOWN must exit 2, got $(severity_of_row "$ROWS" pr-doctor)"
+# ⛔ AND A CAPACITY PASS IS NOT EXEMPT FROM FRESHNESS (review P1, #2291). The `6` arm used to `return`
+# BEFORE every freshness arm, so a LOADED job that had produced no output for longer than
+# 2×StartInterval+slack read WAITING — a PASS for the table's exit code — for ever. That is exactly
+# the "a job that stopped running cannot be distinguished from a healthy one" state this file's own
+# header says must never be green.
+printf '{"rc": 6, "verdict": "NO-CAPACITY", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+printf 'PID\tStatus\tLabel\n-\t6\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+touch -t 202001010000 "$STATE/pr-doctor.out"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "LATE" ] && ok "§6 …and a STALE exit 6 is LATE, not WAITING — 'wait' is not the answer to 'nothing is running'" \
+                   || bad "§6 a stale exit 6 should read LATE, got [$st]"
+[ "$(severity_of_row "$ROWS" pr-doctor)" = "RC=1" ] && ok "§6 …which fails the table's exit code (a dead job is not green)" \
+                                                   || bad "§6 a stale exit 6 must not pass the table, got $(severity_of_row "$ROWS" pr-doctor)"
+# ⛔ AND THE AXIS MUST COME FROM THE SAME PASS (review P1, #2291). Both launchers write the one record
+# and EVERY pass that had any gate refusal writes `refusal_bound` — `rc 0` and `rc 3` passes included —
+# so a `6` explaining a DISK refusal could have been rendered WAITING from a later load-bound pass's
+# record: the exact "waiting does not clear a full disk" mislabel the axis split exists to prevent.
+# A record whose `rc`/`verdict` disagree with the exit this row is explaining is UNREADABLE, and an
+# unreadable read is an abstention — never a pass.
+touch "$STATE/pr-doctor.out"     # fresh again: the AXIS, not the clock, is under test here
+printf '{"rc": 3, "verdict": "UNDELIVERED", "refusal_bound": "load=1"}\n' > "$STATE/pr-doctor.status.json"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "UNKNOWN" ] && ok "§6 …and a record from a DIFFERENT pass (rc=3 against the row's exit 6) is UNKNOWN, not WAITING" \
+                      || bad "§6 a mismatched record should read UNKNOWN, got [$st]"
+# ⛔ CONTROL: the allowance is for 6 ALONE. A different non-zero exit on the same row is FAILING —
+# otherwise this arm would be "every exit is WAITING", the false-PASS direction.
+printf 'PID\tStatus\tLabel\n-\t7\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" pr-doctor)"
+[ "$st" = "FAILING" ] && ok "§6 …but exit 7 on the same row is still FAILING (the allowance is narrow)" \
+                       || bad "§6 exit 7 should still be FAILING, got [$st]"
+rm -f "$STATE/pr-doctor.status.json"
 # A job that is declared but NOT in the launchd domain will never run — MISSING, not OK.
 printf 'PID\tStatus\tLabel\n' > "$LC_LIST"
 ROWS="$(run_rows 'fleet_rows ""')"
@@ -1514,6 +1631,118 @@ case "$OUT" in
   *)                   bad "§9x(d) start did not complete with FLEET_START_SETTLE_S=08 — $OUT (rc=$SRC)" ;;
 esac
 pkill -9 -f "$SCRIPTS/heartbeat-loop.sh" 2>/dev/null
+
+
+# ── §10 THE STATE MUST NOT RIDE IN THE ENVIRONMENT (ARG_MAX / E2BIG) ──────────────────────────
+# ⛔ THE DEFECT THIS PINS IS A PRODUCTION ONE, not a fixture quirk. `fleet_rows` cached the process
+# table in `FLEET_PS_CACHE` and EXPORTED it, so every child the inventory spawned (`cat`, `awk`, `ps`,
+# `launchctl`, `date`) inherited the whole table in its ENVIRONMENT — and `execve` bounds argv+envp
+# together by ARG_MAX (1 MiB on macOS; on Linux a single string past 128 KiB fails by itself).
+# MEASURED 2026-10-30 on a loaded box: a 1,167,325-byte `ps -eo pid=,ppid=,command=` output made EVERY
+# read die with `cat: Argument list too long`, so `controller` and `landers` printed `<ps unreadable>
+# UNKNOWN` and `fleet_render_table` could not find its controller row at all — the health screen went
+# blank exactly when the box was too busy to be healthy. The fix is that the snapshot is a shell
+# VARIABLE (a subshell inherits it; no `execve` ever sees it) and reaches awk on STDIN.
+# So §10a is BEHAVIOURAL (a table past the measured failing size still reads), and §10b pins the
+# MECHANISM directly (a subshell sees it, a child process does not) so a re-added `export` reddens
+# immediately instead of only on a box that happens to be busy enough.
+
+# The table read, padded past ARG_MAX with INERT rows — a busy box, faithfully. Everything else (the
+# age reads included) still goes to the real `ps`, so the fixture's own processes stay visible: this
+# arm must fail for the SIZE, not because the stub answers only one of ps's shapes.
+cat > "$BIN/ps-padded" <<'PSPAD'
+#!/bin/bash
+case "$*" in *etime*) exec /bin/ps "$@" ;; esac
+/bin/ps "$@"
+awk -v n="${PS_PAD_TO:-1150000}" 'BEGIN{
+  pad = ""; for (i=0;i<400;i++) pad = pad "x"
+  blk = ""
+  for (i=0;i<25;i++) blk = blk sprintf("%6d %5d /bin/bash /srv/lanes/lane-%d.sh --issue %d --prompt %s\n", 200000+i, 1, i, i, pad)
+  while (n > 0) { printf "%s", blk; n -= length(blk) }
+}'
+PSPAD
+chmod +x "$BIN/ps-padded"
+
+say_case "§10 the process table must not ride in the environment (ARG_MAX / E2BIG)"
+seed_quiet_box
+mk_proc_script "$O/orch-loop.sh"; PC="$(spawn_component "$O/orch-loop.sh")"
+sleep 0.3
+# The size is the arm's premise, so it is MEASURED here, never assumed: a stub that quietly emitted a
+# small table would make §10a pass while proving nothing.
+PSIZE="$(PS_PAD_TO=1150000 "$BIN/ps-padded" -eo pid=,ppid=,command= | wc -c | tr -d ' ')"
+[ "${PSIZE:-0}" -ge 1150000 ] && ok "§10 the fixture table is ${PSIZE} bytes (>= the measured failing 1,167,325)" \
+                              || bad "§10 the padded table is only ${PSIZE} bytes — the arm would not reach the defect"
+ROWS="$(run_rows 'FLEET_PS='"$BIN"'/ps-padded; fleet_rows ""')"
+st="$(state_of "$ROWS" controller)"; d="$(detail_of "$ROWS" controller)"
+[ "$st" = "OK" ] && ok "§10a a table past ARG_MAX still reads the controller OK (pid $PC)" \
+                  || bad "§10a the controller reads [$st] on a ${PSIZE}-byte table — $d"
+stl="$(state_of "$ROWS" landers)"
+[ "$stl" = "OK" ] && ok "§10a …and the landers row is read, not '<ps unreadable>'" \
+                   || bad "§10a the landers row reads [$stl] on a ${PSIZE}-byte table — $(detail_of "$ROWS" landers)"
+# ⛔ THE RENDER ARM ASSERTS THE RENDER, NOT THE EXIT CODE. `RC=2` is also what an UNKNOWN row of any
+# OTHER component produces, so asserting it here coupled this arm to §10c's row (measured: a mutant of
+# the second-controller ordering reddened it). The E2BIG signature is specific and is asserted instead:
+# every child dies, so `fleet_render_table`'s own `cat`/`awk` see nothing and it prints "cannot
+# determine: the inventory produced no controller row".
+RENDER="$(printf '%s\n' "$ROWS" | run_rows 'fleet_render_table' 2>&1)"
+case "$RENDER" in
+  *"cannot determine"*) bad "§10a the table refused to certify itself — its own read died (the E2BIG signature)" ;;
+  *)                    ok "§10a the rendered table certifies itself instead of refusing on a dead read" ;;
+esac
+# ⛔ here-string, never a pipe: `grep -q` exits at its first match and the writer takes
+# SIGPIPE (141), which under `pipefail` flips this assertion to the `bad` branch — a false
+# negative in the very assertion that pins the row (#841/#864, `scripts/check-no-sigpipe-grep.sh`).
+grep -q '^controller ' <<<"$RENDER" \
+  && ok "§10a …and the controller ROW is in it (the screen the operator reads)" \
+  || bad "§10a no controller row in the rendered table — $(printf '%s' "$RENDER" | head -2)"
+kill9 "$PC"
+
+# §10b THE MECHANISM, pinned where it can redden cheaply: the snapshot is inherited by a SUBSHELL
+# (that is what makes ONE `ps` read serve every row) and is ABSENT from a child process's environment
+# (that is what keeps `execve` small at any table size). It drives `fleet_rows` — the function that
+# actually primes the cache — so an `export` added at EITHER site (the snapshot reader or the table
+# driver) reddens here, at EVERY table size, instead of only on a box busy enough to hit ARG_MAX.
+say_case "§10b the snapshot is shared with subshells and kept out of children's environment"
+SUBSEEN="$(run_rows 'fleet_ps_snapshot >/dev/null; printf "%s" "$(fleet_ps_snapshot)" | wc -c | tr -d " "')"
+[ "${SUBSEEN:-0}" -gt 0 ] && ok "§10b a SUBSHELL still sees the one snapshot (${SUBSEEN} bytes) with no export" \
+                          || bad "§10b a subshell cannot see the snapshot — the one-read cache broke"
+EXPORTED="$(run_rows 'fleet_rows "" >/dev/null; env' | grep -c '^FLEET_\(PS\|LAUNCHD\)_CACHE=' || true)"
+[ "${EXPORTED:-1}" -eq 0 ] && ok "§10b neither snapshot cache is in a CHILD's environment (export is the defect)" \
+                          || bad "§10b a snapshot cache is EXPORTED — a big table then makes every exec fail with E2BIG"
+
+# §10c A MISSING JOB DEFINITION IS 'NOT INSTALLED', NOT 'CANNOT DETERMINE'. `fleet_plist_value`
+# answers rc 2 both for a key it cannot extract and for a file that is not there, so reading it before
+# the existence test turned the NORMAL case (a box with no second controller) into UNKNOWN with a
+# detail that ASSERTED the plist existed — and the whole table then exited 2 on every such box. The
+# unreadable verdict is NOT removed: §10c(b) drives a plist that exists and cannot be parsed, which
+# must still abstain.
+say_case "§10c an absent job definition is SKIPPED; an unreadable one is still UNKNOWN"
+seed_quiet_box
+rm -f "$A/com.eldato.ai-multi-repo.plist"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" second-controller)"; d="$(detail_of "$ROWS" second-controller)"
+[ "$st" = "SKIPPED" ] && ok "§10c no second-controller job on this box reads SKIPPED (not UNKNOWN)" \
+                      || bad "§10c an ABSENT definition must read SKIPPED, got [$st] — $d"
+# The AFIRMATION the pre-fix code printed — `"$plist exists but its declared O could not be read"`
+# — is what must be gone. NOT a bare `*exists*` match: this row's honest SKIPPED note says "neither a
+# job definition (…) nor a second controller's identity (…) exists here", so a loose glob reddens on
+# the correct sentence (measured).
+case "$d" in
+  *"exists but its declared O could not be read"*) bad "§10c the detail claims the absent definition exists — [$d]" ;;
+  *)                   ok "§10c …and the note does not claim a file that is not there" ;;
+esac
+[ "$(severity_of_row "$ROWS" second-controller)" = "RC=0" ] \
+  && ok "§10c …so it is a PASS for the table's exit code (SKIPPED), not a permanent 2" \
+  || bad "§10c an absent definition still fails the table, got $(severity_of_row "$ROWS" second-controller)"
+printf 'not a plist at all\n' > "$A/com.eldato.ai-multi-repo.plist"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" second-controller)"
+[ "$st" = "UNKNOWN" ] && ok "§10c(b) a plist that EXISTS and cannot be parsed still abstains (UNKNOWN)" \
+                      || bad "§10c(b) an unreadable definition must stay UNKNOWN, got [$st] — $(detail_of "$ROWS" second-controller)"
+[ "$(severity_of_row "$ROWS" second-controller)" = "RC=2" ] \
+  && ok "§10c(b) …and it is the table's fail-closed code (2)" \
+  || bad "§10c(b) an unreadable definition must fail closed with 2, got $(severity_of_row "$ROWS" second-controller)"
+rm -f "$A/com.eldato.ai-multi-repo.plist"
 
 
 printf '\n%s\n' "──────────────────────────────────────────────"
