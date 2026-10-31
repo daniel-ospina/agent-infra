@@ -292,6 +292,18 @@ bash scripts/ci_runner_pool.sh reconcile            # the pass (idempotent; NOT 
                                                    # restart -> reclaim -> add, one pass, that order
 ```
 
+⛔ **THE SCHEDULED CAPACITY AUTHORITY IS A DIFFERENT PASS.** On a box that carries the autoscale
+timer (`eldato-runner-autoscale.timer`, installed + ARMED separately — see
+[runner-autoscale.md](runner-autoscale.md)), `runner_autoscale.py` ticks every 9 minutes and derives
+the ceiling from `min(cores, memory, disk)`. `ci_runner_pool.sh` derives its own ceiling (cores plus a
+memory floor, no disk term), so a hand `reconcile`/`add` on a converged box can put the pool ABOVE
+the converger's measured ceiling; the next tick then reports `over-ceiling` and grows nothing — and
+it never **removes** anything either, so the surplus stays until a human removes it (see
+[runner-autoscale.md](runner-autoscale.md), which states the same limit). Treat `runner_autoscale.py`
+as the scheduled authority
+and `ci_runner_pool.sh` as the manual/incumbent tool: **do not hand-run `reconcile` on a converged
+box.** Reconciling the two for good is #3056.
+
 Rules, each measured rather than preferred:
 
 - **Which repo, and the token.** `RUNNER_POOL_REPO` (bare `owner/name`, default

@@ -1689,9 +1689,10 @@ case "$RENDER" in
   *"cannot determine"*) bad "§10a the table refused to certify itself — its own read died (the E2BIG signature)" ;;
   *)                    ok "§10a the rendered table certifies itself instead of refusing on a dead read" ;;
 esac
-# ⛔ here-string, never a pipe: `grep -q` exits at its first match and the writer takes
-# SIGPIPE (141), which under `pipefail` flips this assertion to the `bad` branch — a false
-# negative in the very assertion that pins the row (#841/#864, `scripts/check-no-sigpipe-grep.sh`).
+# ⛔ A HERE-STRING, NOT A PIPE INTO A QUIET GREP (#841/#864). `grep -q` exits at its first match while
+# `printf` is still writing, so the writer takes SIGPIPE (141) and `pipefail` reports the PIPELINE as
+# non-zero — the `||` branch then fails a table that plainly carries the row. Backed by a temp file,
+# there is no earlier writer left to kill. `scripts/check-no-sigpipe-grep.sh` enforces this shape.
 grep -q '^controller ' <<<"$RENDER" \
   && ok "§10a …and the controller ROW is in it (the screen the operator reads)" \
   || bad "§10a no controller row in the rendered table — $(printf '%s' "$RENDER" | head -2)"
