@@ -13089,9 +13089,23 @@ rc=$?
 grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
   && pass "(a) …and the FIRST-CHECKS wait names its own expiry" \
   || { fail "(a) the FIRST-CHECKS expiry is not named"; sed 's/^/      /' "$TMP/err"; }
-grep -q 'NO run of the lane ever attached to this head' "$TMP/err" \
-  && pass "(a) …naming checks-never-started (not 'still running', not a CI verdict)" \
+# ⛔ THE PIN NAMES THE ARM THIS FIXTURE REACHES, AND THAT ARM CHANGED. This scenario is the
+# head with NO run and NO check-run — a readable, PROVEN-EMPTY surface. The rail no longer
+# answers that state with the generic "NO run of the lane ever attached to this head" sentence:
+# its `never-started` refusal splits three ways, and the proven-empty one now says so and cites
+# the read it rests on ("…returned total_count 0 ACROSS EVERY WORKFLOW … An EMPTY surface is not
+# a wrong lane name"). The generic sentence is the arm for NO probe evidence at all — an UNREAD
+# probe, or a rail that never asked (the probe is only attempted when the lane filter is active
+# and its re-derive budget is unspent, so `--any-workflow` never reaches it) — which is a different
+# fact about the head from "proven empty", pinned by (a5) below so it stays measured. Re-pointing
+# the pin at the arm the fixture actually reaches is not a weakening: the state assertion, its evidence, and the
+# three negatives that follow are all still demanded.
+grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
+  && pass "(a) …naming checks-never-started (a PROVEN-EMPTY surface, not 'still running', not a CI verdict)" \
   || fail "(a) the never-started state is not distinguished"
+grep -q 'returned total_count 0 ACROSS EVERY WORKFLOW' "$TMP/err" \
+  && pass "(a) …from the head's OWN check-runs read (total_count 0), not from a guess about the lane" \
+  || { fail "(a) the proven-empty arm did not cite the head-check read it rests on"; sed 's/^/      /' "$TMP/err" | head -8; }
 grep -q 'ADMIN_MERGE_FIRST_CHECKS_WAIT' "$TMP/err" \
   && pass "(a) …and names the window it owns" \
   || fail "(a) the FIRST-CHECKS window knob is missing"
@@ -13103,6 +13117,27 @@ grep -q 'pr merge' "$SCEN/calls" && fail "(a) a merge was attempted with no chec
   || pass "(a) no merge attempted"
 [ -f "$SCEN/comment" ] && fail "(a) evidence was posted with no checks" \
   || pass "(a) no evidence posted"
+
+# (a5) THE SAME NO-RUN STATE, WITH AN UNREADABLE PROBE, IS THE OTHER ARM. (a) rests on a
+# head-checks read that ANSWERED 0; when that read FAILS the rail cannot claim the surface is
+# empty, so it must fall back to the generic sentence — the one (a) used to pin. Pinning both
+# halves is what keeps "proven empty" and "could not be read" from collapsing into one answer:
+# without this arm, a rewrite that reported an unread probe as proven-empty would pass (a) alone,
+# and the two states would be indistinguishable to an operator deciding whether CI even started.
+new_scen waits-first-never-unreadable
+HEAD_WFU="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WFU" > "$SCEN/head"
+: > "$SCEN/pr-check-runs-unreadable"
+SUITE_FIRST_CHECKS_WAIT=2 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a5) an UNREADABLE head-check probe still BLOCKS (exit $rc)" \
+  || fail "(a5) an unreadable head surface CERTIFIED the merge"
+grep -q 'NO run of the lane ever attached to this head' "$TMP/err" \
+  && pass "(a5) …and it falls back to the generic never-attached arm" \
+  || { fail "(a5) an UNREAD probe is not told apart from a PROVEN-EMPTY surface"; sed 's/^/      /' "$TMP/err" | head -8; }
+grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
+  && fail "(a5) the UNREAD probe was reported as a PROVEN-EMPTY surface — the (a) arm's claim would rest on nothing" \
+  || pass "(a5) …and it does NOT borrow the proven-empty arm's wording"
 
 # (a2) CHECKS STARTED BUT ARE STILL RUNNING — the #2233/#2234 shape, exactly:
 # one queued/in-progress lane run. The wait must report the RUN it observed (id +
@@ -14551,9 +14586,27 @@ SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=60 SUITE_FIRST_CHECKS_STALL
 rc=$?
 [ "$rc" -ne 0 ] && pass "(h) a short Jobs digest does not clear the wait — the rail BLOCKS (exit $rc)" \
   || fail "(h) a partial digest was read as 'all runs terminal' and the lane was certified"
-grep -q 'PROGRESS SIGNAL is unavailable' "$SCEN/out" \
+# ⛔ THE WITNESS IS THE REFUSAL, NOT ONLY THE INFORMATIONAL POLL LINE — because the poll line is
+# NOT deterministic here. `PROGRESS SIGNAL is unavailable` is printed by the report case that runs
+# only when a poll finishes BEFORE the window expires, and the clock is a `$SECONDS` delta: on a
+# fast, idle host the first poll advances it by 0 (the line prints, this scenario was green); on a
+# loaded runner one poll costs ≥1s, the window (1s) expires on the FIRST poll, the verdict returns
+# before the report case is reached, and every assertion here about `$SCEN/out` fails while the
+# rail behaved correctly (measured: red on a loaded Linux box and on GitHub's runner, green on an
+# idle one — the same fixture, two verdicts). The refusal that closes the wait
+# (`block_on_first_checks`) is emitted on EVERY non-terminal close, and this fixture's state closes
+# as `unobservable` (the short-digest arm sets `signal_ok=0`), which routes to the `*)` arm — the
+# arm that carries the "their per-job/per-step PROGRESS could not be read" spelling. So the witness
+# is the refusal's `*)` arm, deterministic for THIS fixture, not every non-terminal close: a close
+# routed to `stalled`/`ceiling`/`never-started`/`unreadable` emits a different sentence and would
+# not satisfy this grep (nor should it — those are different, tested claims). It is still the
+# deterministic witness that the signal was MISSING rather than terminal; the poll line is
+# accepted too because it does print when a poll happens to finish before the window. Both spellings are alternation in ONE grep, ERE, so this is a
+# single assertion — not a widened search that could pass on either file for the wrong reason.
+grep -qE '(PROGRESS SIGNAL is unavailable|their per-job/per-step PROGRESS could not be read)' \
+  "$SCEN/out" "$SCEN/err" \
   && pass "(h) …the short digest is named as a MISSING SIGNAL, not as a terminal lane" \
-  || { fail "(h) the short digest was not reported as a missing signal"; sed 's/^/      /' "$SCEN/out" | head -10; }
+  || { fail "(h) the short digest was not reported as a missing signal"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -10; }
 grep -q 'wait CLEARED' "$SCEN/out" "$SCEN/err" \
   && fail "(h) the wait reported CLEARING on an incomplete digest" \
   || pass "(h) …and it never claimed the lane was terminal"
