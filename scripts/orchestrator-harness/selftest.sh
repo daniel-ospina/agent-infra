@@ -5060,12 +5060,39 @@ if [ -f "$CSS" ]; then
   { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:3' <<<"$out"; } && rc=0 \
     || { rc=1; echo "      a private REPO path default exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') (a comment mentioning one must NOT be the hit: the reported line is the assignment's)"; }
   ck "check-single-source: a private REPO path default is refused, naming file AND line (rc 1)" $rc
+  # ⛔ A DEFAULT SPELLED AS ANOTHER VARIABLE IS THE SAME DEFECT, ONE INDIRECTION OVER (#3054 review,
+  # P1). `pathish` only recognised `$HOME`/`$PWD`/a literal path, and `allowed_default` (which catches
+  # `$AI`, `$CELL_HOME/x`, `$(pwd)`) was reached ONLY inside the `${REPO:-…}` branch — so measured at
+  # 637c21c19 these two passed GREEN over a live private default. Both spellings are fixtures here;
+  # `$AI` is not a made-up name: it is deploy-crossbox.sh's old default one variable over.
+  for _aspell in '$AI' '$(pwd)' '${CELL_HOME:-}/tortoise'; do
+    printf '#!/bin/bash\nREPO="%s"\n' "$_aspell" > "$TMP/rpdef/h/zz-holdout.sh"
+    out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:2' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      REPO=\"$_aspell\" exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>')"; }
+    ck "check-single-source: a private REPO default spelled REPO=\"$_aspell\" is refused" $rc
+  done
   # Non-vacuity in the other direction: the shapes the whole harness is converging ON must not red.
-  printf '#!/bin/bash\nREPO="${REPO:-}"\nREPO="$1"\nREPO="$(resolve_repo)"\n' > "$TMP/rpdef/h/zz-holdout.sh"
-  env -u O bash "$TMP/rpdef/h/check-single-source.sh" >/dev/null 2>&1; rc=$?
+  # ⛔ THE CARVE-OUTS ARE PINNED HERE (#3054 review, P1), because the rule that catches `$AI` can
+  # over-reach: a value THIS FILE holds (`$L_DIR`, and a substitution derived from a `for` variable)
+  # is something the script MEASURED, and a SLUG — literal or defaulted — is not a checkout path at
+  # all. If a later widening starts reddening these, it reds the shipped tree instead.
+  {
+    printf '#!/bin/bash\n'
+    printf 'REPO="${REPO:-}"\n'
+    printf 'REPO="$1"\n'
+    printf 'REPO="$(resolve_repo)"\n'
+    printf 'REPO="${HARNESS_REPO:-${HARNESS_APPLY_REPO:-}}"\n'   # a nested EMPTY default supplies nothing
+    printf 'REPO="$REPO"\nREPO="${REPO:?REPO is required}"\n'      # the operator's OWN value, re-asserted
+    printf 'REPO="${FLEET_REPO:-daniel-ospina/agent-infra}"\n'      # a SLUG default
+    printf 'REPO="daniel-ospina/agent-infra"\n'                       # a SLUG literal
+    printf 'L_DIR="/tmp/x"\nREPO="$L_DIR"\n'                        # a value THIS FILE holds
+    printf 'for cand in /tmp\ndo\n  REPO="$(cd "$cand" && pwd -P)"\ndone\n'
+  } > "$TMP/rpdef/h/zz-holdout.sh"
+  out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
   [ "$rc" -eq 0 ] && rc=0 \
-    || { rc=1; echo "      the ALLOWED shapes (no default / assigned from a caller / the one resolver) exited $rc"; }
-  ck "check-single-source: REPO=\"\${REPO:-}\", a caller-assigned REPO and resolve_repo all pass" $rc
+    || { rc=1; echo "      the ALLOWED shapes (no default / assigned from a caller / the one resolver / an empty default / the operator's own value / a slug / a value this file holds) exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' | head -3)"; }
+  ck "check-single-source: REPO=\"\${REPO:-}\", a caller-assigned REPO, resolve_repo, an EMPTY default, a SLUG and a value THIS FILE holds all pass" $rc
   # ⛔ THE POPULATION IS TWO DIRECTORIES, AND THIS ARM PINS IT (verification finding, P1). The scan was
   # `$HERE/*.sh` only, so two of the three offenders this arm was written for — `pi-reap-worktrees.sh`
   # and `deploy-crossbox.sh`, both in the repo's `scripts/` — sat OUTSIDE it: measured, putting

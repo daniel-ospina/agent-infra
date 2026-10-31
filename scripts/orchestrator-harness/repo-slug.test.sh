@@ -26,7 +26,7 @@
 #      their own loud words, none falls back to `$HOME/eldato/tortoise`, `/tmp/cell-ai` or `$PWD`, and
 #      report.sh still exits 0 read-only on a real fixture (the property that made it safe to run
 #      while the loop is working is preserved, not traded away).
-#   M  `--mutation-proof`: the anti-vacuity gate. Four mutations are applied to a THROWAWAY copy of
+#   M  `--mutation-proof`: the anti-vacuity gate. Five mutations are applied to a THROWAWAY copy of
 #      this tree and each must make the arms above go RED. A suite that stays green when the resolver
 #      is reverted is a finding against the suite, so the proof ships with it.
 #
@@ -309,6 +309,22 @@ open(p, "w").write(s.replace(old, new))
   { [ "$mut_rc" -eq 1 ] && [ -n "$mut_red" ]; }
   m4_st=$?   # captured before the `$(…)` below — see A7 (#3054 review, P1)
   ck "M4 a planted private REPO default in scripts/ reddens check-single-source.sh (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | cut -c1-100)" "$m4_st"
+
+  # M5 — THE SAME GATE, THE SPELLINGS IT USED TO MISS (#3054 review, P1): a default spelled as
+  # ANOTHER VARIABLE (`$AI` — which IS `/tmp/cell-ai` through the default deploy-crossbox.sh used to
+  # carry, i.e. this defect one variable over) and as a COMMAND SUBSTITUTION (`$(pwd)` — the exact
+  # form the arm's own comment named as covered). MEASURED against the pre-fix script at 637c21c19:
+  # both passed GREEN (rc 0, "scanned 63+94") beside a `${REPO:-$PWD}` that reddened. An arm that
+  # cannot fail is decoration, so this one is run against that pre-fix script too and FAILS there.
+  for _m5 in '$AI' '$(pwd)'; do
+    mut_copy
+    printf 'REPO="%s"\n' "$_m5" >> "$MUTDIR/pi-reap-worktrees.sh"
+    mut_out="$(bash "$MUTDIR/orchestrator-harness/check-single-source.sh" 2>&1)"; mut_rc=$?
+    mut_red="$(printf '%s\n' "$mut_out" | grep -i 'PRIVATE' | head -2)"
+    { [ "$mut_rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$mut_red"; }
+    m5_st=$?   # captured before the `$(…)` in the message — see A7 (#3054 review, P1)
+    ck "M5 a REPO default spelled REPO=\"$_m5\" reddens check-single-source.sh (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | cut -c1-100)" "$m5_st"
+  done
   rm -rf "$T/mut"
 elif [ "${1:-}" = "--mutation-proof" ]; then
   echo

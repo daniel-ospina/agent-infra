@@ -373,13 +373,28 @@ fi
 #
 # WHAT IT DOES NOT FLAG, on purpose — each is a shape that is not this defect:
 #   REPO="${REPO:-}"        an explicit "no default" (the shape to converge on)
+#   REPO="${X:-}"           an EMPTY default of another variable supplies nothing either, at any depth
 #   REPO="$1" / "$2"        assigned from a CALLER (fix-one.sh, merge-one.sh, chain-merge.sh, adopt-fix)
 #   REPO=""                initialised empty, then filled by the "--repo" arm or by resolve_repo
 #   REPO="$(resolve_repo)" the ONE resolver
+#   REPO="$REPO"           re-asserting the operator's OWN value (`${REPO:?…}` is the loud form)
 #   a COMMENT mentioning a default     prose is how the defect gets recorded; punishing it deletes the
 #                                      record (the same rule the fork arm's prose exemption states)
 #   a SLUG default (`…:-owner/name`)   a different defect (REPO is the CHECKOUT PATH, never a slug);
 #                                      the shape rule for a slug is repo_slug_valid's, not this arm's
+#   a SLUG literal (`REPO="owner/name"`) and a REPO SLUG QUERIED FROM THE REMOTE
+#                                      (`$(command gh repo view … nameWithOwner)`) — owner/name is
+#                                      never a wrong checkout path, so it is not what this arm refuses
+#   a variable THIS FILE ASSIGNS, and a substitution derived from one (`REPO="$L_DIR"`,
+#                                      `REPO="$(cd "$cand" && pwd -P)"`, `REPO="$1"; OR="$2"`):
+#                                      the value is something the script already MEASURED, not an
+#                                      ambient guess. This is the carve-out that keeps every legitimate
+#                                      spelling in the shipped population green — the population was
+#                                      enumerated with `rg -n 'REPO=' scripts/ …` before the rule was
+#                                      narrowed, and each of its ~15 shapes is pinned in a suite arm
+#   a COMMAND'S ASSIGNMENT PREFIX (`REPO="$TMP/x" O="$TMP/o" env … bash foo`): the caller supplying
+#                                      the value for ONE invocation — the `REPO="$1"` class, not a default
+#   a `case` PATTERN (`REPO=*|OR=*|…)`)  a match expression, not an assignment of a value
 #   a TEST fixture (`*.test.sh`)       a developer instrument, not a shipped surface — the deployed arm
 #                                      already excludes them for the same reason, and a fixture whose
 #                                      repo is "/repo" is not operator advice
@@ -417,6 +432,84 @@ repo_path_default_hits() {
       if (v ~ /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/) return 1 # a slug, as `OR` takes
       return 0
     }
+    # ⛔ THE SAME QUESTION, NOW ASKED OF THE PLAIN-ASSIGNMENT SPELLING (#3054 review, P1).
+    # `allowed_default` above was reached ONLY inside the `${REPO:-…}` branch, so the arm graded the
+    # `:-` spelling and not `REPO=<value>` — and the two disagreed on the SAME defect: MEASURED at
+    # 637c21c19 with the fixtures planted in `scripts/`, `REPO="${REPO:-$PWD}"` reddened (rc 1) while
+    # `REPO="$AI"` and `REPO="$(pwd)"` both passed GREEN (rc 0, "scanned 63+94") — over a live
+    # private path default, one token from the defect this PR removes (`AI="${AI:-/tmp/cell-ai}"` is
+    # the old default in deploy-crossbox.sh). `$(pwd)` is the exact form the comment above named as
+    # covered, so the comment and the code disagreed — the same defect class as the gap.
+    # A value is therefore sanctioned only if it comes from a place the BOX decides (an empty default,
+    # a positional, the one resolver), is not a path at all (a slug, a `case` pattern), or is a value
+    # THIS FILE already holds (`own[]`, collected below) — anything else is a private guess.
+    function sanctioned(v,  e, p, rest, nm, named, unknown) {
+      # An EMPTY default supplies nothing, at any depth: `${GH_REPO:-}`, `${A:-${B:-}}`.
+      e = v; p = ""
+      while (e != p) { p = e; sub(/\$\{[A-Za-z_][A-Za-z0-9_]*:?-\}/, "", e) }
+      if (e == "") return 1
+      if (v ~ /^\$\(resolve_repo\)/) return 1                    # the ONE resolver (also `|| exit $?`)
+      if (v ~ /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/) return 1       # a slug literal
+      # a SLUG DEFAULT — the exemption `allowed_default` already makes, so the two spellings agree:
+      # `${FLEET_REPO:-daniel-ospina/agent-infra}` is a different defect (REPO-as-SLUG), not a path.
+      if (v ~ /^\$\{[A-Za-z_][A-Za-z0-9_]*:?-[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\}$/) return 1
+      if (v ~ /^[*?[]/ || index(v, "|") > 0) return 1              # a `case` PATTERN, not a value
+      # An ASSIGNMENT PREFIX ON A COMMAND (`REPO="$TMP/x" O="$TMP/o" env …`): the caller supplies the
+      # value for ONE invocation — the `REPO="$1"` class. Recognised by a second `NAME=` after the
+      # first word.
+      if (v ~ /^("[^"]*"|[^ \t]*)[ \t]+[A-Za-z_][A-Za-z0-9_]*=/) return 1
+      # Every NAMED expansion must be one this file already holds (`$1`-`$9` are not named and are
+      # caller-supplied). `$AI`/`$TMPDIR`/`$CELL_HOME` are assigned NOWHERE in the file that reads
+      # them → they are AMBIENT, i.e. a private default one variable over.
+      if (!ownready) collect_own()
+      rest = v; named = 0; unknown = 0
+      while (match(rest, /\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
+        named++
+        nm = substr(rest, RSTART, RLENGTH)
+        sub(/^\$\{?/, "", nm)
+        rest = substr(rest, RSTART + RLENGTH)
+        if (nm != "REPO" && !(nm in own)) unknown = 1
+      }
+      if (named) return !unknown
+      if (index(v, "$(") == 0) return 1          # positionals and literals only
+      # A COMMAND SUBSTITUTION THAT READS NOTHING is computed from AMBIENT state — `$(pwd)` is the
+      # `$PWD` default one indirection over. One carve-out: a value ASKED OF THE REMOTE for the
+      # owner/name slug (`nameWithOwner`) is never a wrong checkout path.
+      if (index(v, "nameWithOwner") || index(v, "repo view")) return 1
+      return 0
+    }
+    # The names THIS file assigns, collected the FIRST TIME a REPO value actually needs them — the
+    # scan is over the whole file (because `REPO="$L_DIR"` may be set hundreds of lines after
+    # `L_DIR=`), and only the handful of files whose REPO value is an expansion need it at all, so it
+    # is collected lazily rather than re-reading all 157 shipped scripts to grade a dozen. Loop
+    # variables (`for cand in …`) and `read` targets count as assignments.
+    # A line whose first non-space char is `#` is skipped and a bare-word comment is cut, so a variable
+    # merely MENTIONED in prose is not mistaken for one the file holds. ⚠️ This is a textual rule about
+    # the FILE, so a file that merely SPELLS `AI=` (inside a string, say) widens the carve-out for the
+    # rest of that file. That direction is deliberate and named rather than silent: the alternative —
+    # refusing every `REPO="$WORD"` — reddens ~15 legitimate spellings in the shipped population
+    # (`$L_DIR`, `$RAIL_REPO`, `$CWD_REPO`, `$repo_path`, `$HERE/../..`, `${_main:-$cand}`), and a gate
+    # that refuses honest trees is how a gate gets switched off. The shapes it must NOT refuse are
+    # pinned in selftest.sh, and the shapes it MUST flag in the M5 arm of repo-slug.test.sh.
+    function collect_own(  aline, a, w, nw, rd, i, nm) {
+      split("", own)
+      while ((getline aline < FILENAME) > 0) {
+        if (aline ~ /^[ \t]*#/) continue
+        a = aline
+        sub(/[ \t]#.*$/, "", a)
+        nw = split(a, w, /[ \t;(){}&|]+/)
+        rd = 0
+        for (i = 1; i <= nw; i++) {
+          if (w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { nm = w[i]; sub(/=.*/, "", nm); own[nm] = 1 }
+          else if (w[i-1] == "for" && w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*$/) own[w[i]] = 1
+          else if (w[i] == "read") rd = 1
+          else if (rd && w[i] !~ /^-/ && w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*$/) own[w[i]] = 1
+        }
+      }
+      close(FILENAME)
+      ownready = 1
+    }
+    FNR == 1 { ownready = 0 }
     {
       ln = $0
       sub(/^[ \t]+/, "", ln)
@@ -456,7 +549,11 @@ repo_path_default_hits() {
         print FILENAME ":" FNR ": " $0
         next
       }
-      if (pathish(val)) print FILENAME ":" FNR ": " $0
+      # The two spellings must agree, so the plain-assignment branch asks the SAME question the
+      # `${REPO:-…}` branch asks: not "does it look like a path" (which missed `$AI` and `$(pwd)`)
+      # but "is this value the decision of the BOX, or a guess by this script".
+      if (pathish(val)) { print FILENAME ":" FNR ": " $0; next }
+      if (index(val, "$") > 0 && !sanctioned(val)) print FILENAME ":" FNR ": " $0
     }
   ' "$@"
 }
