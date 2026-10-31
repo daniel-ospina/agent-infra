@@ -410,13 +410,13 @@ if [ ! -f "$chain" ]; then
   else
     say_err "lane-merge: $O/merge-one.sh is missing and the copy beside this script ($_d) is not the"
     say_err "  harness $O — refusing to select the merge authority from a checkout that may be a lane's"
-    say_err "  own branch. Sync it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
+    say_err "  own branch. Redeploy it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
     exit 2
   fi
 fi
   if [ ! -f "$chain" ]; then
     say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
-    say_err "            hand-roll a merge; sync the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)"
+    say_err "            hand-roll a merge; redeploy the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
     return 1
   fi
   # ⛔ THE CHECKOUT THE CHAIN RUNS FROM IS RESOLVED, NEVER INHERITED (landing-review F1). Resolved here,
