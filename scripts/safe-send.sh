@@ -110,7 +110,7 @@ PSCREEN="$(cmux read-screen --workspace "$WS" --lines 10 2>/dev/null)"
 if [ -n "$PSCREEN" ]; then
   PLAST="$(printf '%s\n' "$PSCREEN" | sed -n '$p')"
   case "$PLAST" in
-    *"%/300k"*|*"• high"*|*"• low"*|*"• medium"*) : ;;
+    *"%/800k"*|*"%/300k"*|*"• high"*|*"• low"*|*"• medium"*) : ;;
     *)
       if [ "$MODE" != "--force" ] || grep -qE '(%|\$|#)[[:space:]]*$' <<<"$PLAST"; then
         echo "REFUSED [$LABEL] $WS — NO pi IN THIS PANE (last line: $(printf '%s' "$PLAST" | tail -c 70))."
