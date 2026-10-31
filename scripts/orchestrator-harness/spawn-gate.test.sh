@@ -984,18 +984,47 @@ ck "(9b-orphan) ...and the garbled record is left EXACTLY as found" $rc
 rm -f "$PRLOCK7"
 
 # ⛔ EVERY `prlock_defer` CAUSE IS MAPPED BY `adopt-fix.sh`, AND A REWORD SILENTLY UNMAPS IT (review of
-# #3096, P2 + the same class recorded at `fix-one.sh:411-414`). `adopt-fix.sh` matches the CAUSE TOKEN on
+# #3096, P2 + the same class recorded at `fix-one.sh:411-414`). `adopt-fix.sh` matches the CAUSE on
 # the `[fix <PR>] DEFERRED: <cause>` line and maps each to an operator line + exit 79; a cause it does not
 # recognise gets NO line and exit 0 — SUCCESS reported for a run that pushed nothing. The orphan arm's two
 # new deferrals originally began `state/mergeclaim-…`, matching no arm at all. This pins the invariant
 # STRUCTURALLY (driving a takeover race through the whole script is not reachable from a test): every
-# `prlock_defer "…"` in `fix-one.sh` must start with a token `adopt-fix.sh` greps for.
-UNMAPPED=""
-for _tok in $(sed -n 's/.*prlock_defer "\([^"]*\)".*/\1/p' "$HERE/fix-one.sh" | sed 's/[ (].*//' | sort -u); do
-  grep -qF "DEFERRED: $_tok" "$HERE/adopt-fix.sh" || UNMAPPED="$UNMAPPED $_tok"
-done
+# `prlock_defer "…"` in `fix-one.sh` must START WITH a cause prefix `adopt-fix.sh` actually greps for.
+#
+# ⛔ THE PIN MUST COMPARE THE CAUSE, NOT ITS ARTICLE (review of PR #3153, P2). The first form derived its
+# token as "the first word" (`sed 's/[ (].*//'`) and grepped `DEFERRED: <token>`. Every shipped cause
+# begins with the word `the`, so all five collapsed to ONE token and `grep -qF 'DEFERRED: the'`
+# succeeded on the article: a new cause spelled `the lock path is a DIRECTORY …` would have passed
+# GREEN while matching no arm of `adopt-fix.sh` — the exact fail-open the pin exists to close. The
+# prefixes are now READ FROM `adopt-fix.sh` itself (single source of truth, no second copy to drift)
+# and a cause is mapped only when it STARTS WITH one of them; the negative control below proves that
+# a cause sharing only the article is rejected.
+MAPPED_CAUSES="$(sed -n "s/.*grep -q 'DEFERRED: \(.*\)' .*/\1/p" "$HERE/adopt-fix.sh" | sort -u)"
+_n_pfx="$(grep -c '[^[:space:]]' <<<"$MAPPED_CAUSES" 2>/dev/null || true)"
+{ [ "${_n_pfx:-0}" -ge 2 ] && ! grep -qx 'the' <<<"$MAPPED_CAUSES"; }; rc=$?
+ck "(9b-orphan) adopt-fix.sh's mapped CAUSE PREFIXES were extracted (got ${_n_pfx:-0}, and none is the bare article)" $rc
+_pl_unmapped() { # stdin: one cause per line -> stdout: causes matching NO mapped prefix
+  while IFS= read -r _cause; do
+    [ -n "$_cause" ] || continue
+    _hit=0
+    while IFS= read -r _pfx; do
+      [ -n "$_pfx" ] || continue
+      case "$_cause" in "$_pfx"*) _hit=1; break ;; esac
+    done <<PREFIXES
+$MAPPED_CAUSES
+PREFIXES
+    [ "$_hit" = 1 ] || printf '%s\n' "${_cause:0:48}"
+  done
+}
+UNMAPPED="$(sed -n 's/.*prlock_defer "\([^"]*\)".*/\1/p' "$HERE/fix-one.sh" | _pl_unmapped | tr '\n' ' ')"
 [ -z "$UNMAPPED" ]; rc=$?
-ck "(9b-orphan) every prlock_defer CAUSE in fix-one.sh is a token adopt-fix.sh maps (unmapped:${UNMAPPED:- none})" $rc
+ck "(9b-orphan) every prlock_defer CAUSE in fix-one.sh starts with a prefix adopt-fix.sh maps (unmapped:${UNMAPPED:- none})" $rc
+# NEGATIVE CONTROL — without it the assertion above cannot demonstrate it discriminates: this cause
+# shares the article with both mapped causes and matches NEITHER, so it must be REPORTED. Under the
+# pre-fix "first word" pin it was silently accepted (it starts `the `), which is the vacuity here.
+SYNTH_UNMAPPED="$(printf '%s\n' 'the lock path is a DIRECTORY and no re-dispatch can clear it' | _pl_unmapped)"
+[ -n "$SYNTH_UNMAPPED" ]; rc=$?
+ck "(9b-orphan) …and a synthetic cause sharing only the article is REJECTED (the pin grades the cause, not \`the\`)" $rc
 grep -q 'prlock_defer "state/mergeclaim' "$HERE/fix-one.sh"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "(9b-orphan) …and no deferral is spelled with the raw lock path as its cause (the exact rewording that broke adopt-fix)" $rc
