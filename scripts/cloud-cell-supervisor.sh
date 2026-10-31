@@ -669,6 +669,27 @@ PS_BIN="$PS_BIN_IN"
 # a home the session never uses: with credentials in the repointed home the preflight said "ok:
 # gh auth" and the cell started, and then every gh call in the session failed.
 export HOME="$CELL_HOME"
+# ── THE uv CACHE + LINK-MODE PIN (agent-infra#2159) ─────────────────────────────────────────────────
+# THIS process is where a cell's lanes get their environment from: `worker-terminal.sh` snapshots the
+# controller's exported environment into every worker it spawns, so a pin exported HERE reaches every
+# lane on the box — and its absence is exactly what made a COLD-cache cell materialise a full 5.8 GB
+# `.venv` per worktree (measured: cell-3 went 17 GB free -> 257 MB free in ~50 minutes as its lanes
+# synced, while a warm-cache cell paid ~nothing for the same 5.8 GB of `du`).
+# It is set AFTER `$ENV_FILE` was sourced above, so a `keys.env` line WINS: this file defaults, it
+# never overrides an operator's pin. `UV_ENV_DEFAULTED` records which halves this box had to supply,
+# and `cmd_check` prints it — a box that silently defaulted is the state nobody could see before.
+SUP_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+UV_ENV_HELPER="${SUP_HERE:+$SUP_HERE/orchestrator-harness/uv-env.sh}"
+if [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ]; then
+  . "$UV_ENV_HELPER"
+  uv_env_apply
+else
+  UV_ENV_HELPER=""
+  [ -n "${UV_CACHE_DIR:-}" ] || UV_CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-}/.cache}/uv"
+  [ -n "${UV_LINK_MODE:-}" ] || UV_LINK_MODE=hardlink
+  export UV_CACHE_DIR UV_LINK_MODE
+  UV_ENV_DEFAULTED="inline"
+fi
 LOCK="$O/.orch.lock"
 # Recomputed AFTER $ENV_FILE is sourced (it may repoint $O), exactly like $LOCK above.
 ROLES_DIR="$O/state/roles"
@@ -2194,6 +2215,17 @@ cmd_check_provenance() {
 cmd_check() {
   validate_scope
   [ -d "$CELL_HOME" ] && [ -w "$CELL_HOME" ] || die "HOME=$CELL_HOME missing or not writable"
+  # ── the uv pin, and WHAT A WORKTREE VENV COSTS ON THIS BOX (agent-infra#2159) ──────────────────
+  # `check` is the verb an operator runs before trusting a cell with lanes, so it is where a COLD cache
+  # has to be stated: on a cold cache each new worktree venv is a full ~5.8 GB copy, and the box then
+  # fills while every other instrument reads healthy. The reading comes from `uv-env.sh` — the same
+  # sentence the bring-up and a lane print — so there is one authority, not three opinions.
+  log_line "uv: UV_CACHE_DIR=${UV_CACHE_DIR:-?} UV_LINK_MODE=${UV_LINK_MODE:-?} (defaulted: ${UV_ENV_DEFAULTED:-none})"
+  if [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ]; then
+    uv_env_report --estate "$REPO" 2>/dev/null | while IFS= read -r _uvl; do [ -n "$_uvl" ] && log_line "$_uvl"; done
+  else
+    log_line "uv: WARN no uv-env.sh beside this supervisor — the cold-cache reading is UNAVAILABLE on this box (a cold cache is then only discovered as free disk disappearing)"
+  fi
   if [ ! -d "$HARNESS" ]; then
     # The remedy depends on WHY the path is absent. When `$HARNESS` is the path the RECORD names,
     # "clone the repo first" is the one action that cannot help — the record is stale and `apply` is

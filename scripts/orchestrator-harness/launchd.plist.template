@@ -75,6 +75,25 @@
     <key>HOME</key>
     <string>__HOME__</string>
 
+    <!-- ── THE uv CACHE + LINK-MODE PIN (agent-infra#2159) ───────────────────────────────────────
+         Both values are rendered from the INSTALLER's environment where set (an operator pin always
+         wins) and from the repo's defaults where not: `UV_CACHE_DIR=$HOME/.cache/uv`,
+         `UV_LINK_MODE=hardlink`.
+
+         Why they belong in the DAEMON's environment rather than in each lane: a lane is the process
+         that runs `uv sync`, and `worker-terminal.sh` snapshots THIS process's environment into every
+         worker it spawns. So a pin placed here reaches every lane on the box — including a lane whose
+         own `keys.env` says nothing about uv — and a box that never pinned the cache leaves its lanes
+         at the filesystem's mercy. Measured (2026-10-30, three cmux cells): a box with a WARM cache
+         hardlinks each `.venv` to the cache and a 5.8 GB `du` costs ~0 distinct bytes, while a
+         COLD-cache box MATERIALISED 5.8 GB per worktree and went 17 GB free -> 257 MB in ~50 min.
+         `UV_LINK_MODE=hardlink` is pinned rather than left to uv's default so the sharing is positive
+         and measurable (`nlink > 1` on a `site-packages` file) instead of platform-dependent. -->
+    <key>UV_CACHE_DIR</key>
+    <string>__UV_CACHE_DIR__</string>
+    <key>UV_LINK_MODE</key>
+    <string>__UV_LINK_MODE__</string>
+
     <!-- target -->
     <key>OR</key>
     <string>__OR__</string>
