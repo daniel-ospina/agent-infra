@@ -415,7 +415,21 @@ say_case "11. the helper owns the verdict, so a caller cannot announce success o
 # (it sits after the copy-fail and verify-fail gates, which both `exit 1`).
 n_success_lines="$(grep -c 'harness deploy VERIFIED' "$DEPLOY")"
 [ "$n_success_lines" = "1" ] && ok "one success-notification site" || bad "$n_success_lines success-notification sites (expected 1)"
-n_verified_print="$(grep -c 'say "\$PROG: VERIFIED' "$DEPLOY")"
+# ⛔ PINNED ON THE MESSAGE, NOT ON THE PRINTER'S NAME (stale pin, 2026-10-30). This read
+# `grep -c 'say "$PROG: VERIFIED'` — it counted the helper `say` by name, so `ef5f36c69`
+# ("the print helper named after a TTS binary — rename `say` → `log_line`") renames ONE function and
+# this arm reported "0 VERIFIED print sites" over a message that had not moved a byte. The rename was
+# deliberate and the print site was never lost; the pin was describing the printer instead of the
+# print. Counting non-comment lines that emit `$PROG: VERIFIED` is the assertion the comment above
+# actually states ("the success string is emitted on exactly one line of the helper") and it survives
+# any helper rename, `printf` rewrite or `say`→`log_line`-style sweep. Still EXACTLY ONE: a second
+# success-announcing line is a deliberate review, not a count that may drift.
+# MEASURED, both polarities, so this is not an always-green rewrite: the old form on clean
+# origin/main reported "0 VERIFIED print sites" (RED over correct code); renaming the one site's
+# message → "0 ... (expected 1)" RED; adding a SECOND `$PROG: VERIFIED` line → "2 ... (expected 1)"
+# RED; reverting → CLEAN. The arm reads the emission, so it reds on a LOST print and on a second
+# one, and it no longer reds on a printer rename.
+n_verified_print="$(grep -v '^[[:space:]]*#' "$DEPLOY" | grep -c '\$PROG: VERIFIED')"
 [ "$n_verified_print" = "1" ] && ok "one VERIFIED print site" || bad "$n_verified_print VERIFIED print sites (expected 1)"
 # The helper's non-comment lines are CAPTURED once and tested in the shell: a non-quiet grep piped
 # into `grep -q` is the #841/#864 SIGPIPE false-negative (the quiet grep exits early, the producer
@@ -1187,7 +1201,24 @@ fi
 # at head `orch-loop.sh` carried 21 mentions and `refresh-candidates.sh` 5, while the floors said 20
 # and 4 — reverting a single remedy left both green, which is the defect this arm exists to catch.
 # The rule: each number is `grep -c 'deploy-harness\.sh' <file>` as measured NOW.
-REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1"
+# ⛔ `fix-one.sh:2` WAS REMOVED DELIBERATELY, NOT RELAXED (2026-10-30). `f8c40181a` ("repair work is
+# priced by the FLEET, not by the CI queue", #3023) deleted fix-one.sh's ci-queue gate outright —
+# "the lane that pushes no longer reads the queue at all" — and the two mentions went with the
+# warning that carried them: "no ci-queue.sh at $SELF/ci-queue.sh; … re-seed the running copy: bash
+# scripts/orchestrator-harness/deploy-harness.sh --repo . --o <dir>". A remedy for a gate that no
+# longer exists is not a remedy site, so the file has NO `deploy-harness.sh` mention left to floor
+# (`grep -c` = 0). ⛔ THE ROOT CAUSE WAS THIS LINE, NOT THE DELETION: `f8c40181a` removed the block
+# and did not touch this floor, so the arm pointed at prose its own PR had deleted and read RED over
+# a tree that was correct — measured on clean origin/main: 251 pass / 3 fail, this arm among them.
+# ⛔ AND IT IS NOT LOWERED TO 1 OR 0, which is the failure mode this arm keeps catching: `-ge 0` is
+# decoration, and `-ge 1` would tolerate exactly one reverted remedy. An entry that can be satisfied
+# by zero occurrences is deleted, not renumbered. fix-one.sh is NOT left unguarded — arm (2) below
+# scans every shipped script, so re-adding a bare `cp *.sh` remedy there still reds the suite
+# (measured: appending one to fix-one.sh:54 reported "fix-one.sh: 54" and FAIL=1). If fix-one.sh ever
+# grows a redeploy remedy again, it comes back to this list WITH a floor: one deliberate token, which
+# is the point.
+
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 nochk-guard.sh:2 launchd-controller.sh:1"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
