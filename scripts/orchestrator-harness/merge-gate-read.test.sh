@@ -27,8 +27,9 @@
 #   §1b the read returned NOTHING AT ALL (no payload, rc 1 — the degraded-shim shape) → the same
 #                          verdict, saying the read produced no payload.
 #   §1e a capture that cannot be created at all → the verdict REPORTS the degraded capture (never
-#                          "gh printed nothing"), and the cleanup never names /dev/null (an `rm -f
-#                          /dev/null` on a root worker unlinks the device node).
+#                          "gh printed nothing"), and no removal TARGETS the /dev/null device node (an
+#                          `rm -f /dev/null` on a root worker unlinks it and every later `>/dev/null`
+#                          on that box creates a regular file in devtmpfs).
 #   §2  `<caller> / <job>` → `gate=SUCCESS (try 1)` and MERGED: the name is matched verbatim or after
 #                          stripping the `<caller> / ` prefix — the normalisation admin-merge.sh
 #                          already applies to job names.
@@ -309,17 +310,34 @@ qF 'gate=UNAVAILABLE rc=1' <<<"$log" && ok "§1b empty read: UNAVAILABLE, with t
 # device node on a root worker — after which every later `>/dev/null` on that box creates a regular
 # file in devtmpfs. TMPDIR is pointed at a path that cannot exist, so neither mktemp nor the pid
 # fallback can be written.
+# ⛔ AND THAT UNCREATABLE PATH MUST NOT BE SPELLED UNDER /dev/null (measured 2026-10-28, agent-infra).
+# It was `/dev/null/definitely-not-a-dir/merge-gate`, so EVERY path the worker built from it began with
+# the device node's spelling — including the DIFF-READ capture, which merge-one.sh rm's unconditionally
+# (merge-one.sh:932, `merge-$PR-cc.$$`). The rm probe therefore recorded
+# `rm -f /dev/null/definitely-not-a-dir/merge-gate/merge-7-cc.<pid>`, and the /dev/null arm below — a
+# SUBSTRING search — matched the FIXTURE'S OWN PATH rather than a removal of the device. The fixture
+# was red about a cleanup that never happened: nothing was named and the file never existed.
+# A nonexistent directory is exactly as uncreatable and names nothing: mktemp gets ENOENT, and the
+# pid-suffixed fallback's `: >` gets ENOENT. ENOENT is not a permission error, so this holds for a
+# ROOT worker too (which is the population the arm exists for) on Linux and macOS alike.
 mkmrg
-out="$(run_merge PRCHECKS_MODE=fail GATE_READ_TRIES=1 TMPDIR=/dev/null/definitely-not-a-dir/merge-gate)"; rc=$?
+out="$(run_merge PRCHECKS_MODE=fail GATE_READ_TRIES=1 TMPDIR="$MRG/no-such-dir/merge-gate")"; rc=$?
 log="$(mrglog)"
 [ "$rc" -eq 4 ] && ok "§1e no capture: the worker still refuses legibly (exit 4)" \
                 || bad "§1e no capture: rc=$rc; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
 qF 'capture unavailable' <<<"$log" && ok "§1e no capture: the verdict REPORTS the degraded capture (never 'gh printed nothing')" \
                                    || bad "§1e no capture: the degraded capture was reported as silence; log=$(tr '\n' ' ' <<<"$log")"
-if q '/dev/null' "$(cat "$MRG/rm.log" 2>/dev/null)"; then
-  bad "§1e no capture: the cleanup ATTEMPTED to remove /dev/null (rm log: $(tr '\n' ';' < "$MRG/rm.log")) — on a root worker that unlinks the device node"
+# ⛔ THE PREDICATE IS "NO rm ARGUMENT IS THE DEVICE NODE", NOT "the log contains the substring
+# /dev/null" (measured 2026-10-28). The substring form is the wrong question in BOTH directions: it
+# reddened on a path that merely BEGAN with `/dev/null` (a false positive that reddened a correct
+# cleanup), and it is satisfied by any path beneath the device — while the hazard the arm exists for is
+# reached only by naming the device node ITSELF, which `rm -f` unlinks. Argument-exact, then: every
+# recorded removal is scanned field by field and the arm fires on an exact `/dev/null` argument.
+devnull_rm="$(awk '{ for (i = 1; i <= NF; i++) if ($i == "/dev/null") { print; next } }' "$MRG/rm.log" 2>/dev/null)"
+if [ -n "$devnull_rm" ]; then
+  bad "§1e no capture: the cleanup TARGETED the /dev/null device node ($(tr '\n' ';' <<<"$devnull_rm")) — on a root worker that unlinks it, and every later >/dev/null on the box writes to devtmpfs"
 else
-  ok "§1e no capture: the cleanup never names /dev/null, even when that is the only sink available"
+  ok "§1e no capture: no removal TARGETS the /dev/null device node, even when that is the only sink available"
 fi
 if [ -s "$MRG/rm.log" ]; then
   ok "§1e no capture: the rm probe is LIVE (it recorded $(wc -l < "$MRG/rm.log") removal(s) on this run), so the assertion above is not vacuous"

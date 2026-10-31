@@ -248,12 +248,13 @@ fi
 # ⛔ WHY THIS FILE AND NOT THE CALLER. The controller already refuses to spawn when `claim_live`
 # says the lock is held, but `fix-one.sh` is ALSO reached directly and by `adopt-fix.sh`, and a
 # guard that lives only in the controller leaves those paths pushing at a live lander — the same
-# argument the CI-queue gate above makes for itself, and the reason both read the same state.
+# argument the repo-identity assert above makes for itself (it runs here, not only in the spawner,
+# because `adopt-fix.sh` reaches this script without the controller in the path at all).
 #
 # ⛔ THE DIRECTION IS DEFER, NEVER BLOCK-AND-HOLD. Contention writes the SAME refundable bail marker
-# the CI-queue and cross-box refusals write, so the controller refunds the attempt and re-decides
-# from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
-# entirely. Nothing here is sticky — the marker describes one cycle, not a state.
+# the cross-box refusal writes, so the controller refunds the attempt and re-decides from a fresh read
+# next cycle: nothing is dropped, and a lander that lands the PR ends the work entirely. Nothing here
+# is sticky — the marker describes one cycle, not a state.
 #
 # ⛔ A STALE CLAIM IS TAKEN OVER, NOT REFUSED (#2574 (b)) — AND THE TAKEOVER IS A RENAME, NEVER
 # `rm && write`. Measured staleness is the whole licence: the record's pid is numeric and `kill -0`
@@ -377,8 +378,8 @@ release_prlock() { # never removes a lock we do not own: a lander that outlived 
 # run must not pretend to have booked one.
 # ⛔ THE FIRST LINE IS A STABLE TOKEN (`DEFERRED: the LANDER`), because `adopt-fix.sh` — the operator
 # surface onto this script — has to name the cause in the log the operator reads, exactly as it does
-# for the CI-queue deferral. A second, cosmetic reword would silently make `adopt-fix <PR>` report
-# SUCCESS for a run that pushed nothing (review of PR #2576, P2).
+# for the PR-owner lock arm below. A second, cosmetic reword would silently make `adopt-fix <PR>`
+# report SUCCESS for a run that pushed nothing (review of PR #2576, P2).
 prlock_defer() { # prlock_defer <why>
   echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
   if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
@@ -574,7 +575,7 @@ $FIX_DELIVERY_BRIEF
 
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
-If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
+If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
 If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
@@ -680,7 +681,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
   elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
     why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
-    why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
+    # ⛔ CODE 77 IS TWO CONDITIONS (review round 1, P2): below the floor, and above it without the
+    # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
+    # operator a full filesystem was the cause when it was not.
+    why="disk gate: either below DISK_MIN_FREE_MB, or no headroom for one lane's dependency tree (DISK-NOHEADROOM) — the '[disk-gate] REFUSED' line above names which, with both terms; reclaim space (cloud-cell-supervisor.sh prune --caches) — this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi
