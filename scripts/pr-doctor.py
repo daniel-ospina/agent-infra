@@ -2526,7 +2526,7 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
         else:
             if dry:
                 return path, ""   # a real run would fetch origin/<branch> and create the branch
-            _, ferr, frc = _git(["fetch", "origin", branch, "--quiet"], timeout=300)
+            _, ferr, frc = _git(["fetch", "origin", _fetch_refspec(branch), "--quiet"], timeout=300)
             if frc != 0:
                 return "", "cannot materialise %s: origin/%s could not be fetched (%s)" % (
                     branch, branch, (ferr or "").strip()[:160])
@@ -2546,6 +2546,55 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
 
 def _git(args, timeout=120):
     return sh_err(["git", "-C", REPO_DIR] + list(args), timeout=timeout)
+
+
+# ⛔ THE REFSPEC THAT MAKES `origin/<branch>` EXIST -- agent-infra#2716 follow-up (measured 2026-10-30).
+#
+# `git fetch origin <branch>` DOES NOT CREATE `refs/remotes/origin/<branch>`. With no colon in the
+# refspec the ref lands in FETCH_HEAD, and git only ALSO updates a remote-tracking ref when one of
+# the remote's CONFIGURED `remote.<name>.fetch` refspecs maps that source ref. On a NORMAL clone the
+# configured refspec is `+refs/heads/*:refs/remotes/origin/*`, which matches -- so the bug is
+# invisible there. On a SINGLE-BRANCH clone the configured refspec is
+# `+refs/heads/main:refs/remotes/origin/main`, and ONLY `main` matches. Every other branch is
+# fetched into FETCH_HEAD and nowhere else.
+#
+# WHAT THAT COST. The cell checkout `/tmp/cell-t3` is a single-branch clone. So this file fetched
+# the branch (rc=0 -- the fetch SUCCEEDS), then asked for `git worktree add <path> -b <b> origin/<b>`,
+# which failed with `fatal: invalid reference: origin/<b>`. That refusal was reported as
+# `N order(s) no worker accepted`, which reads as a TRANSPORT failure, and it repeated on every pass
+# for weeks -- measured `27 order(s) no worker accepted -> VERDICT=UNDELIVERED next=repair-chain`
+# (agent-infra#3009). No worker was ever at fault: the order never reached one, because the ref it
+# would have checked out was never created. The proof is one line:
+#
+#   $ git -C /tmp/cell-t3 config --get-all remote.origin.fetch
+#   +refs/heads/main:refs/remotes/origin/main          <- single-branch
+#   $ git -C /tmp/cell-t3 rev-parse --verify refs/remotes/origin/fix/ci-runner-label-contract
+#   (rc=1, ABSENT)                                          <- measured 2026-10-30T17:39Z, BEFORE the fix
+#   $ git -C /tmp/cell-t3 ls-remote --heads origin fix/ci-runner-label-contract
+#   5f7c29a8d93b22f54b630195f37babed15894a8c  refs/heads/fix/ci-runner-label-contract   <- present on origin
+#
+# ⛔ THAT rc=1 IS A DATED MEASUREMENT, NOT A RUNNABLE PROOF, AND IT MUST SAY SO (review P2). Once a
+# fixed pass runs it CREATES the ref, so re-running the line returns rc=0 and a reader would conclude
+# the premise was stale. The refspec-vs-clone mechanism is pinned instead by
+# `scripts/pr-doctor-fetch-refspec.test.sh`, whose MUTANT section reproduces the exact
+# `fatal: invalid reference` on a fresh fixture at any time.
+#
+# The fix is to name the DESTINATION, so the ref is created whatever the clone's configured refspec
+# is. The leading `+` keeps the update valid when the branch was rewritten (a force-push), which a
+# PR branch routinely is.
+def _fetch_refspec(name: str) -> str:
+    """`<name>` -> a refspec that leaves `origin/<name>` resolvable after the fetch.
+
+    ⛔ THE `refs/` PASSTHROUGH IS DEFENCE, NOT A LIVE CALL SITE (review P2). Both shipped callers
+    either pass a bare branch name or short-circuit before reaching here (`fetch_ref or
+    _fetch_refspec(branch)`, where `fetch_ref` is `""` or `refs/pull/<n>/head`), so no current call
+    passes a qualified ref. It is kept so a future caller that does pass one is not silently given
+    `refs/remotes/origin/refs/pull/...` -- an invented ref nothing reads -- and it is NOT credited
+    with protecting the fork arm, which the `or` already does.
+    """
+    if name.startswith("refs/"):
+        return name
+    return "+refs/heads/%s:refs/remotes/origin/%s" % (name, name)
 
 
 def _live_worktree(path: str):
@@ -2739,7 +2788,8 @@ def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "", dry: bo
         # A fork PR's head lives at refs/pull/<n>/head, NOT origin/<branch> (which does not exist
         # for a fork). Fetching the WRONG ref leaves the object absent and every later probe fails
         # with a misleading error, so fetch the right one and name a persistent absence clearly.
-        sh_err(["git", "-C", path, "fetch", "origin", fetch_ref or branch, "--quiet"], timeout=300)
+        sh_err(["git", "-C", path, "fetch", "origin", fetch_ref or _fetch_refspec(branch),
+                "--quiet"], timeout=300)
         _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
         if have != 0:
             return ("PR head %s is not present locally and could not be fetched -- refusing to "
@@ -5092,6 +5142,62 @@ def run_pass(args, rubric_note: str = "") -> int:
         (len(prs), " ".join("%s=%d" % kv for kv in sorted(counts.items())),
          cap["max_fix"], cap["max_review"], budgets["inflight"], budgets["alive"],
          budgets["unknown"], budgets["fix"], budgets["review"], budgets["total"]))
+
+    # ── THE CASCADE, AND ITS ORDER, ON ONE LINE PER PASS ──────────────────────────────────────────
+    # The repair chain is THREE rungs, and each pass walks them in this order (the owner's canonical
+    # logic). Making the order VISIBLE here is not decoration: before this line, a pass printed the
+    # per-class counts and every individual refusal, so an operator could not tell from a single line
+    # WHICH rung the chain was on -- and a pass that did nothing was indistinguishable from a pass
+    # whose queue was empty, which is the silence that hid four dead actuators for weeks.
+    #
+    #   rung 1 MERGE   `call-rail` -- every gated check green, a clean attestation at this head, and
+    #                  the rail itself would take it. This rung is NOT re-implemented here and no
+    #                  gate is loosened: the ORDER hands it to `admin-merge.sh`, which decides.
+    #   rung 2 FIX     the blocking cause, chosen by cause -- `resolve-conflict` (rebase, then record
+    #                  + rail), `record-review` (fresh-context review, then record + rail), `fix-ci`
+    #                  (repair the red, re-review, rail), `rerun-checks`, `blocked-by-rail`.
+    #   rung 3 WAIT    nothing to dispatch: `running` (the head is still executing) or an unreadable
+    #                  classification. Stated, never silent.
+    # `no slot` is the rung-2 refusal and it prints the reason with it -- the budget it could not
+    # take. A rung that is skipped for capacity must SAY so; that silence is what the brief bans.
+    #
+    # ⛔ EVERY COUNT BELOW READS THE KEY `counts` ACTUALLY HOLDS (review P1, 2026-10-30). `running` and
+    # `unreadable` are diverted into `skipped[...]` BEFORE `classified` is built (`:4896`, `:4878`),
+    # and `counts` is built from `classified` plus `skipped` under a `skipped-` prefix -- so the bare
+    # keys can never exist and `counts.get("running", 0)` was STRUCTURALLY 0. That was a false
+    # statement of exactly the kind this line exists to prevent: a pass would print
+    # `pass: 22 open PRs :: skipped-running=6 ...` immediately above
+    # `cascade: ... wait=0 ... nothing to dispatch`, i.e. rung 3 denied while six PRs waited on it.
+    # rung 1 is BUDGET-GATED TOO (`ACTION_CLASS["call-rail"] == "review"`, `:1223`, and the dispatch
+    # loop breaks on `dispatched >= budgets["total"]`), so claiming a handoff is only true when a
+    # slot exists -- otherwise it takes the same NO SLOT arm as rung 2, for the same reason.
+    _r1 = counts.get("call-rail", 0)
+    _r2 = sum(counts.get(k, 0)
+              for k in ("resolve-conflict", "record-review", "fix-ci", "rerun-checks",
+                        "blocked-by-rail"))
+    _r3 = counts.get("skipped-running", 0) + counts.get("skipped-unreadable", 0)
+    _casc = ["order=merge>fix>wait",
+             "merge=%d" % _r1,
+             "fix=%d" % _r2,
+             "wait=%d" % _r3,
+             "slots=%d" % budgets["total"]]
+    # ⛔ NO ARM ASSERTS A DISPATCH IT HAS NOT MADE (review P2). `budgets["total"]` is an AGGREGATE
+    # (`fix + review`) while the loop spends PER CLASS, and a PR can still be refused for a live
+    # worker or an unreadable liveness after the slot check -- so "dispatched" is a claim only
+    # `_finish` can make from the real counters. These arms state what rung the chain is on and
+    # whether a slot was available, and nothing more.
+    _slots = budgets["total"]
+    _noslot = ("no available slot: inflight=%d alive=%d unproven=%d"
+               % (budgets["inflight"], budgets["alive"], budgets["unknown"]))
+    if _r1:
+        _casc.append("merge->handed to admin-merge.sh (the rail decides, this pass does not)"
+                     if _slots > 0 else "merge->NO SLOT (%s)" % _noslot)
+    if _r2:
+        _casc.append("fix->eligible, dispatch budget total=%d" % _slots
+                     if _slots > 0 else "fix->NO SLOT (%s)" % _noslot)
+    if not _r1 and not _r2:
+        _casc.append("nothing to dispatch (no mergeable, no repairable)")
+    log("cascade: " + " ".join(_casc))
 
     # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
     # lane; with the fleet busy it printed "no idle lanes -- nothing dispatched this pass" and
