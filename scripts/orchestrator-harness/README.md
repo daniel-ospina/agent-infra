@@ -1325,20 +1325,26 @@ dispatch row is a claim that something is wrong:
 | `harness=source-dirty:<sha12>` | (a) | the record names `<sha12>` — **this** commit — but its own `sourceDirty=true` (or, for a legacy *stamp* record, `agentInfraDirty=true`) says the deploy was staged from a checkout with uncommitted changes, so `<sha12>` does **not** describe the bytes on the box | redeploy from a **clean** checkout: that is what makes the box identifiable at all |
 | `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
 | `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
-| `harness=surface` | neither — another dir | `$O` itself is clean; a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) differs from `$REF` | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it |
+| `harness=surface` | neither (two shapes — see below) | **either** nothing was compared at all — no `$O`, or a `--surface` run that found no readable record for it (the body prints `identity: SKIPPED`) **or** `$O` itself is clean and a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) differs from `$REF` | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it — and on the first shape the missing deploy record is itself the thing to fix |
 
 ### Precedence when more than one state is true
 
 `uncommitted-edit:<file>` › `behind:`/`diverged:` › `incomplete:<file>` › `source-dirty:<sha12>` ›
 (`surface` | `payload-differs`). The token is ONE line, so the order is the answer to "which fact does
 an operator act on first": unrecoverable bytes, then where the box sits, then code that is missing,
-then a record that cannot describe the box at all, then the last two. **Those last two are
-ALTERNATIVES, not a chain:** `surface` is emitted only when `$O` itself answered clean
-(`Q_BYTES=0`), so a surface hit that coincides with `$O`'s own bytes differing reports
-`payload-differs` — and the other-directory fact is then carried by the report body's "for a surface
-hit, reseed the copy the RUNNING component uses" line, not by the token. It is stated here rather
-than left to the `if` order in the code, and `check-deployed-drift.test.sh` §9b grades the
-`incomplete` over `source-dirty` case, which is the one a combined state actually produces.
+then a record that cannot describe the box at all, then the last two.
+
+**`surface` has TWO populations, and the first one precedes the list above entirely.** When there is
+nothing to compare — `$O` is absent, or a `--surface` run found no readable record for it — no
+question was asked about any deployed dir, so that state alone emits `harness=surface` and the chain
+below is never reached (`O_ABSENT`, and the body prints `identity: SKIPPED`). **Only the second
+population enters the chain**, and `Q_BYTES=0` is a precondition for *that* arm alone: **those last
+two are ALTERNATIVES, not a chain**, so a surface hit that coincides with `$O`'s own bytes differing
+reports `payload-differs` — and the other-directory fact is then carried by the report body's "for a
+surface hit, reseed the copy the RUNNING component uses" line, not by the token. It is stated here
+rather than left to the `if` order in the code; `check-deployed-drift.test.sh` §9b grades the
+`incomplete` over `source-dirty` case, which is the one a combined state actually produces, and §9g
+grades the `O_ABSENT` population that emits `surface` with no `$O` compared at all.
 
 The refusal has **two directions**, and both matter: a file whose bytes differ from the record, and a
 file `$O` carries that the record never saw — *when the incoming source ships that name*, because that is

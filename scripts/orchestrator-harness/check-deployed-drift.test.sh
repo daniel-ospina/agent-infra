@@ -423,6 +423,32 @@ ck "…and it names the real reason (a manifest line with no path)" \
    "$(qF "manifest line with no path" "$OUT" && echo 0 || echo 1)"
 
 echo
+echo "── §9g a run with NO \$O compared answers harness=surface, and says nothing was identified ──"
+# ⛔ THIS GRADES A POPULATION NO ASSERTION COVERED BEFORE (review of #3090). A box with no `$O` at
+# all, or a `--surface` run that found no readable record for one, emits `surface` because NOTHING was
+# compared — so `Q_BYTES=0` is the initialisation at the top of the script, NOT an answer about `$O`.
+# §5b grades the OTHER `surface` population (a clean `$O` plus a hit in another dir) and §9e runs with
+# the surface candidates CLEAN, so it reaches the OK summary and prints no token at all. Nothing stated
+# what THIS population's token is, which is why the README could describe it as `Q_BYTES=0`-gated.
+# ⛔ WHAT IT DOES AND DOES NOT PROVE. It DOES redden (2 arms) if this population's token becomes
+# `payload-differs` — measured by mutating the `O_ABSENT` arm to emit it. It does NOT discriminate
+# removal of that arm on its own: every reachable `O_ABSENT` run exits non-zero via a surface HIT, and
+# the `SURF_HIT && Q_BYTES=0` arm below then answers `surface` identically, so the two are
+# observationally redundant here. Say so rather than let a later reader believe this pins the arm.
+absent_O="$TMP/definitely-not-here"; rm -rf "$absent_O"
+no_o_extra="$TMP/extra-absent"; rm -rf "$no_o_extra"; mkdir -p "$no_o_extra"
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$no_o_extra/"
+printf '#!/usr/bin/env bash\necho hand-placed\n' > "$no_o_extra/c.sh"
+OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$no_o_extra" HARNESS_PIN_DIR="" \
+        HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
+        bash "$DRIFT" --o "$absent_O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+ck "rc is 1 — the surface pass answered, and its hit is a drift" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "…the identity half reports SKIPPED for the absent \$O" "$(qF "identity: SKIPPED" "$OUT" && echo 0 || echo 1)"
+ck "…and the one-line answer is harness=surface" "$(qF "harness=surface" "$OUT" && echo 0 || echo 1)"
+ck "…and NOT payload-differs, which would name a question nothing asked" \
+   "$(qF "harness=payload-differs" "$OUT" && echo 1 || echo 0)"
+
+echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
 # ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (#2838). This check used to
 # grep the runner's SOURCE for its own `run_shard` row — the text of a list that no longer exists:
