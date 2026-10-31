@@ -570,13 +570,15 @@ echo "── hermetic suites ─────────────────
 # hermetic contract is stated rather than inherited.
 shard_array=()
 while IFS= read -r shard; do
-  # A line with no non-blank text is not a path, so it is not queued. `listed`'s `awk 'NF'` agrees on
-  # every line that can REACH here: a blank line is skipped by both (awk `NF=0`), and anything else
-  # that gets this far is a real file path — glob-matched, `[ -f ]`-checked, and re-verified by the
-  # containment loop above — which both of them count exactly once. The two are NOT identical as
-  # predicates: a CR/VT/FF-only line is counted by awk's default FS and stripped by bash's
-  # `[[:space:]]`. Such a line is not a file, so it exits 1 up there (`[ ! -f "$t" ]`) and never
-  # arrives; the assertion below says what a divergence would mean if the contract changed.
+  # A line with no non-blank text is not a path, so it is not queued. The counter at `:275` counts
+  # `awk 'NF { n++ } END { print n + 0 }'`, i.e. lines with at least one field, so the two agree on
+  # everything that can actually arrive: the list comes from `shard_discover` (`:143`), which emits
+  # only glob-matched paths that passed `[ -f "$f" ]`, and the containment loop above re-verifies
+  # each is a real file (exit 1 at `:506`) — so every line here is a non-blank path and both sides
+  # count it exactly once. They are NOT identical as predicates — a CR/VT/FF-only line is a field to
+  # awk's default FS and is stripped by bash's `[[:space:]]` — and that residue cannot arrive either:
+  # such a line is not a file, so the containment loop above exits 1 on it. The assertion below says
+  # what a divergence would mean.
   [ -n "${shard//[[:space:]]/}" ] || continue
   shard_array+=("$shard")
 done <<<"$shard_paths"
@@ -594,7 +596,8 @@ done <<<"$shard_paths"
 # What remains is a DEFENSIVE ASSERTION, and it fails CLOSED (exit 1 below, before the first shard
 # runs). ⛔ Do NOT look for a live trigger — there is none, and asserting one is what this block got
 # wrong twice already. Given the current derivation, this comparison CANNOT fire: `shard_discover`
-# (`:147`) emits only glob-matched paths that passed `[ -f "$f" ]`, the containment loop above
+# (`:143`, and `[ -f "$f" ]` at `:147`) emits only glob-matched paths that passed that check, the
+# containment loop above
 # re-verifies each is a real file inside the checkout, and the read above is in-process — so no line
 # reaching it can be blank and no line can be lost. It is kept for the case where that CONTRACT
 # changes (a derivation that can emit a non-path, or a read that becomes an external process), and a
