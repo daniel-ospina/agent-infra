@@ -672,7 +672,7 @@ def _pane_has_pi(uuid):
     if not _p.strip():
         return None
     _p=_p.replace("\x1b","")
-    for _m in ("/300k","/1M","/2M","(auto)","\u2022 high","\u2022 medium","\u2022 low"):
+    for _m in ("/800k","/300k","/1M","/2M","(auto)","\u2022 high","\u2022 medium","\u2022 low"):
         if _m in _p:
             return True
     return False

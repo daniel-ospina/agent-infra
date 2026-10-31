@@ -1,5 +1,5 @@
 #!/bin/bash
-# check-cost-config.sh — #341 drift guard: deepseek context clamp @300K (shipped w/ #476 guard-sync).
+# check-cost-config.sh — #341 drift guard: deepseek context clamp @800K (owner decision 2026-10-31).
 #
 # Config-as-authority: models.json is the runtime clamp surface (pi's
 # provider-composer resolves override.contextWindow ?? model.contextWindow —
@@ -9,9 +9,9 @@
 # Semantics (detect-not-block for the catalog class — a hard red on the store
 # would break auto-sync when pi's refresh legitimately reverts it):
 #   models.json    drift — any deepseek-served id with a contextWindow
-#                  above 300000, OR any deepseek-served entry whose
+#                  above 800000, OR any deepseek-served entry whose
 #                  contextWindow is absent, non-numeric, or not equal to
-#                  300000 (the GEOMETRY ANCHOR: `<= 300000` alone is an
+#                  800000 (the GEOMETRY ANCHOR: `<= 800000` alone is an
 #                  UPPER BOUND, so a window BELOW the ceiling would leave
 #                  the derived reserve leg certifying a trigger the runtime
 #                  does not use)                             → BLOCK (exit 1)
@@ -65,25 +65,31 @@ command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib on
 # exit-2 path.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# #1213's 300K→700K dial (2026-09-18, PR #1226) is WITHDRAWN (2026-09-21):
-# the floor fix it was sequenced behind is deployed (pi-patch #1214(b),
+# #1213's 300K→700K dial (2026-09-18, PR #1226) was WITHDRAWN (2026-09-21)
+# because the floor fix it was sequenced behind is deployed (pi-patch #1214(b),
 # `MIN_USABLE_MAX_TOKENS = 1024` — never clamp below a usable output budget),
 # which closes the one-token silent-death mechanism the wider window was bought
-# for, at a recurring ~+20% fleet spend. Re-raising 700K needs a NEW decision
-# — see docs/ops/cost-config-policy.md §7's withdrawal record for the residual
-# (the floor fix is verified against the silent-death failure only, not every
-# failure the wider window covered).
-CLAMP=300000
+# for. That withdrawal rested on a COST argument against a hazard code now
+# covers; it did not establish that 300K is the right window.
+#
+# OWNER DECISION 2026-10-31 (verbatim): the 300K window "was done to reduce
+# costs but I feel that context loss in the orchestrator is costing us way
+# more" → the clamp moves to 800,000 with the whole geometry following it.
+# This SUPERSEDES §7's 300K clamp (see docs/ops/cost-config-policy.md §7,
+# "2026-10-31 decision"). 800,000 sits inside the deepseek provider's real
+# 1,000,000 window, so nothing here exceeds a provider limit; what moves is
+# how much conversation survives before summarisation.
+CLAMP=800000
 
 # The compaction trigger the truncation watcher and the cost report band on:
-#   FLEET_REGIME_TB = CLAMP − compaction.reserveTokens   (283,616 = 300,000 − 16,384)
+#   FLEET_REGIME_TB = CLAMP − compaction.reserveTokens   (783,616 = 800,000 − 16,384)
 #
 # Two assertions, and BOTH are needed:
 #
 #   1. INDEPENDENT — reserveTokens must equal the reviewed value (16384). This is the only
 #      constraint that survives a COORDINATED move of the window and the reserve. Asserting only
 #      the geometry below reads green on `contextWindow 1000000 / reserveTokens 716384`, which
-#      preserves the 283616 trigger while inflating the summarization cap to 0.8 x 716384 — the
+#      preserves the 783616 trigger while inflating the summarization cap to 0.8 x 716384 — the
 #      exact reserve-inflation workaround the recorded owner directive on #1227 forbids
 #      ("Do not implement the decoupling by inflating reserveTokens"). Removing this pin
 #      introduced that false PASS, and a guard whose only reserve constraint CLAMP can move is
@@ -186,11 +192,16 @@ REVIEWED_RESERVE=16384
 #                              DEFAULT_HTTP_IDLE_TIMEOUT_MS (300000,
 #                              dist/core/http-dispatcher.js) — do NOT go below
 #                              it without a measurement: it is also the ceiling
-#                              on a 300K-context prefill's time-to-first-byte.
+#                              on a full-window prefill's time-to-first-byte
+#                              (was written "300K-context" under the 300K clamp;
+#                               the clamp moved to 800K on 2026-10-31, so the
+#                               ceiling now applies to a larger prefill — the
+#                               constant itself is pi's default and does NOT
+#                               move with the window).
 #   RETRY_PROVIDER_TIMEOUT_MS  the legitimate-call ceiling (SDK total request
 #                              timeout). Must EXCEED the idle ceiling so a hung
 #                              attempt is cut by idle, not by the full budget;
-#                              must stay high enough that a 300K-context
+#                              must stay high enough that a full-context
 #                              compaction/summarization is not false-killed.
 #   RETRY_MAX_BACKOFF_MS       the patch's backoff cap (read back out of
 #                              scripts/patch-pi-retry.sh — one source of truth).

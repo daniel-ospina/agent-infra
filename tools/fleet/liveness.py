@@ -217,6 +217,10 @@ __all__ = [
     "evaluate",
     "collect_candidates",
     "gather",
+    "gather_dispatch",
+    "CMUX_POPULATION",
+    "DISPATCH_POPULATION",
+    "POPULATIONS",
     "lib_path",
     "load_store",
     "jsonl_state",
@@ -325,6 +329,29 @@ CPU_LIVENESS_TOOL_NAMES = frozenset({"bash"})
 
 HOLDER = "holder"
 WITNESS_OBSERVED = frozenset({"absent", "zombie"})
+
+# ── the two populations (enumeration only — ONE predicate) ────────────────
+# #1178 is a rule about PREDICATES, not about coverage: a second classification
+# of "wedged"/"dead" (or a second identity rule) is the defect. A second
+# POPULATION is the sanctioned extension, because the states a lane can be in do
+# not depend on how it was found. So the population a lane came from rides on
+# the evidence as a LABEL and never as a verdict input.
+#
+#   cmux      a cmux-surface lane the fleet has a hook-store record for. The
+#             store supplies *which lanes exist and which incarnation they had*;
+#             a lane whose process is gone stays enumerated (the store outlives
+#             the process). This is the only population that consults the store,
+#             so it is the only one for which an unreadable store is an
+#             abstention-before-anything-else.
+#   dispatch  a lane the orchestrator dispatched as `pi -p` (nohup, on this box
+#             or a cell). It has NO cmux workspace and NO hook-store record, so
+#             the cmux population cannot contain it BY CONSTRUCTION. It is
+#             enumerated from its durable session transcript instead — the same
+#             durability property the store provides — and its incarnation, when
+#             one is bound, is read with the SAME probe CLI.
+CMUX_POPULATION = "cmux"
+DISPATCH_POPULATION = "dispatch"
+POPULATIONS = (CMUX_POPULATION, DISPATCH_POPULATION)
 # Everything else the probe can say: an ABSTENTION. `off-fence` is a live
 # process whose identity could not be matched (C1); `unreadable` is a failed or
 # unusable read (C3).
@@ -519,11 +546,22 @@ class ClaimRead:
 
 @dataclass
 class Evidence:
-    """Everything a verdict may rest on. Absent fields are ``None``/defaults."""
+    """Everything a verdict may rest on. Absent fields are ``None``/defaults.
+
+    ``identity_population`` names WHICH population supplied this lane (see
+    ``POPULATIONS``). It changes nothing about the verdict rules; it exists so
+    that the ONE ``evaluate`` can be reached by a population whose identity
+    source is not the cmux hook store without that population's evidence being
+    read as a broken store. Adding a POPULATION is #1178's sanctioned move;
+    adding a PREDICATE is not, and nothing here classifies a state.
+    """
 
     sid: str = ""
     ps_ok: bool = True
-    store_ok: bool = True
+    # True/False, or None meaning "this population does not consult the store"
+    # (a dispatch lane has no hook-store record by construction).
+    store_ok: Optional[bool] = True
+    identity_population: str = CMUX_POPULATION
     candidates: List[Candidate] = field(default_factory=list)
     # True/False/None — None means the JSONL's growth could not be established.
     jsonl_grew: Optional[bool] = None
@@ -537,6 +575,10 @@ class Evidence:
     # the claim logic is reachable ONLY when a caller explicitly supplies it, so
     # the existing verdict ladder is unchanged (pinned by a test + mutation).
     claim_read: Optional[ClaimRead] = None
+    # Free-text detail for the DISPATCH population's abstention (which transcript
+    # was read, how old it is, why no incarnation was bound). Never a verdict
+    # input: it is rendered, not decided.
+    dispatch_detail: str = ""
     now_ms: int = 0
     idle_ms: int = IDLE_MS
     record_veto_ms: int = RECORD_VETO_MS
@@ -885,7 +927,11 @@ def evaluate(ev: Evidence) -> Verdict:
     #     never a guessed verdict, and never `dead` (C3, T12).
     if not ev.ps_ok:
         return Verdict("unknown", "ps-unreadable")
-    if not ev.store_ok:
+    # The store gate applies to the population whose IDENTITY SOURCE is the
+    # store. A dispatch lane has no store record by construction, so reading the
+    # absence of one as "store-unreadable" would report every dispatch lane as
+    # unmeasurable on a box that never had a cmux store (every cell).
+    if ev.identity_population == CMUX_POPULATION and not ev.store_ok:
         return Verdict("unknown", "store-unreadable")
 
     cands = list(ev.candidates)
@@ -914,6 +960,16 @@ def evaluate(ev: Evidence) -> Verdict:
         if not cands:
             # C4 — an empty candidate set is an abstention, exactly where the
             # reviewed kill path abstains (`SKIP incarnation-unmatched`).
+            # A dispatch lane with no BOUND incarnation is the same abstention
+            # with a different, named cause: the lane is enumerated (its
+            # transcript is durable) and no live process claims it in this
+            # pass, which is what an exited lane and an unreadable binding look
+            # like alike. It is NOT `dead`: `dead` needs a fenced incarnation
+            # positively observed absent (#1178 C1), and this population has no
+            # durable pid to fence — exactly the position a claim is in.
+            if ev.identity_population == DISPATCH_POPULATION:
+                return Verdict("unknown", "no-bound-incarnation",
+                               detail=ev.dispatch_detail or "")
             # #1777: a ref-claim read REFINES this abstention — it never precedes
             # the ladder, so no session verdict can be overridden by a claim.
             if ev.claim_read is not None:
@@ -1557,6 +1613,73 @@ def gather(
         jsonl_turn=turn,
         tool=tool,
         record=record,
+        now_ms=now,
+    )
+
+
+def gather_dispatch(
+    sid: str,
+    *,
+    pid: Optional[int] = None,
+    transcript: Optional[str] = None,
+    sessions_dir: str = DEFAULT_SESSIONS_DIR,
+    lib: Optional[str] = None,
+    now_ms: Optional[int] = None,
+) -> Evidence:
+    """Acquire evidence for a DISPATCH lane (`pi -p`, no cmux workspace).
+
+    This is ACQUISITION ONLY, and it is the same acquisition the cmux path does —
+    the transcript's growth/age, its last-turn boundary and its in-flight tool all
+    come from the SAME helpers (``jsonl_state`` / ``turn_from_jsonl`` /
+    ``tool_from_jsonl``). The only difference is where the CANDIDATE comes from:
+    a dispatch lane has no hook-store record and no ``pi --session <id>`` argv, so
+    a caller that has bound a pid to this transcript supplies it, and it is read
+    with the SAME probe CLI (``probe_argv`` — the ``kind="argv"`` identity the
+    cmux path already uses for a live writer with no store record).
+
+    ``pid=None`` is a real state, not an error: the lane is enumerated from its
+    durable transcript and NOTHING claims it in this pass. That reads
+    ``unknown/no-bound-incarnation`` — never ``dead``, because this population has
+    no durable fenced incarnation and ``dead`` requires one positively observed
+    absent (#1178 C1).
+
+    The store is not consulted, so ``store_ok`` is ``None`` ("not applicable")
+    rather than a claim about a store this population never needs.
+    """
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    ps_ok = True
+    cands: List[Candidate] = []
+    bound_note = "unbound"
+    if pid is not None:
+        res = probe_argv(int(pid), lib=lib)
+        if "ps-read-failed" in res.detail:
+            ps_ok = False
+        cands.append(Candidate(int(pid), observed_from_probe(res.rc, res.status), "argv", None))
+        bound_note = "bound pid=%d" % int(pid)
+
+    sfile = transcript or session_file_for(sid, None, sessions_dir)
+    grew, age = jsonl_state(sfile, now)
+    turn = turn_from_jsonl(sfile)
+    tool = tool_from_jsonl(sfile, now, silence_age_ms=age)
+
+    if sfile is None:
+        detail = "%s; no transcript for session %s under %s" % (bound_note, sid[:8], sessions_dir)
+    else:
+        detail = "%s; transcript %s, last write %s" % (
+            bound_note, os.path.basename(sfile),
+            "UNMEASURED" if age is None else "%dm%02ds ago" % (age // 60000, (age % 60000) // 1000),
+        )
+    return Evidence(
+        sid=sid,
+        ps_ok=ps_ok,
+        store_ok=None,
+        identity_population=DISPATCH_POPULATION,
+        candidates=cands,
+        jsonl_grew=grew,
+        jsonl_age_ms=age,
+        jsonl_turn=turn,
+        tool=tool,
+        dispatch_detail=detail,
         now_ms=now,
     )
 
