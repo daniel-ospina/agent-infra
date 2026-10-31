@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # fleet-cost-report.sh — weekly visible-fleet cost/truncation report (#341 PR-B).
 #
-# Answers "did the clamp work?" for the fleet running under the shipped 300K
-# clamp (#341 PR-A; 400K→300K dialed by #476's Compaction fix / PR #511).
+# Answers "did the clamp work?" for the fleet running under the shipped 800K
+# clamp (#341 PR-A; 400K→300K dialed by PR #511; 300K→800K by the owner
+# decision of 2026-10-31).
 # Aggregates per-session metrics from pi session JSONLs via the
 # SHARED parser (session-postmortem.sh --summary — ONE parser for the retro
 # summary, this report, and watch-truncation.sh; #373 parser-sharing contract).
@@ -14,8 +15,8 @@
 #       post-clamp compaction as ceiling). Expected post-clamp: 0.
 #       Escalate when > 0.
 #   (b) cache-share of spend over COMPACTING sessions in the clamp population
-#       (max compaction tokensBefore ≥ FLEET_REGIME_TB 283616 = the 300K-clamp
-#       compaction trigger, 300000 − 16384 — sessions compacting AT/ABOVE the
+#       (max compaction tokensBefore ≥ FLEET_REGIME_TB 783616 = the 800K-clamp
+#       compaction trigger, 800000 − 16384 — sessions compacting AT/ABOVE the
 #       trigger ARE post-clamp, not legacy; the floor only excludes the
 #       pre-clamp 200K-transient legacy sessions (~196–205K), whose smaller
 #       window has different cache economics and never belonged to the clamp).
@@ -28,7 +29,7 @@
 #       in a single-regime window: 85.9% pre-clamp / ~70% post-clamp — #373-era
 #       clamp-level independent; compaction-included would read ~62% and
 #       false-alarm). Escalate below the floor (FLEET_CACHE_FLOOR default
-#       0.65 = the pre-registered band low) — real drift below the 300K-clamp
+#       0.65 = the pre-registered band low) — real drift below the 800K-clamp
 #       regime trips; small-n weeks (n<3 compacting sessions) are reported not
 #       escalated (a single-session share is noise).
 #
@@ -36,17 +37,28 @@
 # is WITHDRAWN (the deployed floor fix — `MIN_USABLE_MAX_TOKENS = 1024`,
 # pi-patch #1214(b) — closes the one-token silent death the wider window was
 # bought for, at a recurring ~+20% fleet spend), so (b)'s regime floor is back
-# at 283616. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions that
-# compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction records
-# in that era's session files (measured 2026-09-21) sit at/above the 650000
-# trigger (650,134–650,426), putting the 2 sessions carrying them into n_clamp
-# and into the cache-share pools of a run whose window still reaches them. The
-# number is still reported
+# at 283616 AT THAT DATE. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions
+# that compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction
+# records in that era's session files (measured 2026-09-21) sit at/above the
+# 650000 trigger (650,134–650,426), putting the 2 sessions carrying them into
+# n_clamp and into the cache-share pools of a run whose window still reaches
+# them. The number is still reported
 # (it is the same cache economics — cache-level independent); read n_clamp on
 # the first post-withdrawal run knowing it mixes regimes for that one window.
 # The TRUNCATION instrument is unaffected: it buckets only
 # stopReason:"length" records, and the retired era produced none — its bucket
 # is empty (watch-truncation.sh, header).
+#
+# SUPERSEDED 2026-10-31 (owner decision): the clamp moved 300K → 800K, so the
+# floor is 783616 and this paragraph's 283616 is history, kept because it dates
+# the era it describes. THE SAME REGIME-PURITY CAVEAT APPLIES AGAIN: for one
+# window the clamp population mixes sessions that compacted under the 300K
+# clamp (283,616–300,000) with the new geometry. Read n_clamp on the first
+# post-change run knowing that. The cache-share band (65–70%) below was
+# MEASURED under the 300K clamp and has NOT been re-measured at 800K: the
+# 0.65 floor is kept as a lower-bound alarm, not because 65–70% is the
+# expected reading at 800K (a larger window keeps more input cacheable, so the
+# expected share is plausibly higher — the instrument has no 800K anchor yet).
 #   (c) output+reasoning share over non-cache tokens — the #365 TREND
 #       instrument (recorded every run, never escalates). Formula matches the
 #       pre-registered "real median 58%": per-session (output+reasoning) /
@@ -67,8 +79,8 @@
 #   PI_SESSIONS_DIR / --sessions-dir   session JSONL root (default ~/.pi/agent/sessions)
 #   FLEET_WINDOW_DAYS / --days         report window (default 7)
 #   FLEET_CACHE_FLOOR                  cache-share escalation floor (default 0.65)
-#   FLEET_REGIME_TB                    clamp-population floor (default 283616 =
-#                                       the 300K-clamp compaction trigger)
+#   FLEET_REGIME_TB                    clamp-population floor (default 783616 =
+#                                       the 800K-clamp compaction trigger)
 #   SPM_SH                             shared-parser script path override (tests)
 # NOTE: the ceiling classification (tokensBefore ≥ 900000) lives in the SHARED
 # parser (session-postmortem.sh) — the single source of truth for report/watch/
@@ -81,7 +93,7 @@ SPM_SH="${SPM_SH:-$SCRIPT_DIR/session-postmortem.sh}"
 SESSIONS_DIR="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
 WINDOW_DAYS="${FLEET_WINDOW_DAYS:-7}"
 CACHE_FLOOR="${FLEET_CACHE_FLOOR:-0.65}"
-REGIME_TB="${FLEET_REGIME_TB:-283616}"
+REGIME_TB="${FLEET_REGIME_TB:-783616}"
 # Frozen ONCE, before anything reads it: `--print-regime-floor` reports this value
 # and the banding below interpolates this value, so freezing is what makes those
 # two the SAME by construction — a later assignment cannot make the answer
@@ -214,8 +226,8 @@ rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
 rows = [r for r in rows if not r.get("error")]
 
 comps = [r for r in rows if r["compacting"]]
-# clamp population: compactions at/above the 300K-clamp
-# compaction trigger (283,616 = 300,000 − 16,384) — incl. the band
+# clamp population: compactions at/above the 800K-clamp
+# compaction trigger (783,616 = 800,000 − 16,384) — incl. the band
 # a pre-dial sub-300K floor would have misclassified as legacy. Pre-clamp
 # 1M-drift sessions (≥900K) also belong here (they ARE the drift (a) detects);
 # only the sub-trigger legacy/200K-window sessions (~196–205K) are excluded
@@ -303,7 +315,7 @@ for r in rows:
 # ── render ──────────────────────────────────────────────────────────────────
 CEILING_TB = 900000   # must match session-postmortem.sh's parser constant
 print(f"# Fleet cost report — {len(rows)} session(s) in window "
-      f"({len(comps)} compacting, {n_clamp} in the shipped 300K-clamp regime)")
+      f"({len(comps)} compacting, {n_clamp} in the shipped 800K-clamp regime)")
 print("")
 print(f"- sessions scanned: {len(rows)}   compacting sessions: {len(comps)}")
 if legacy_comps:
@@ -324,11 +336,13 @@ if cache_share is None or n_with_cost < 3:
           if cache_share is not None else
           f"- no message cost data (n={n_clamp}) — undefined, not escalated")
 else:
-    band = "✓ in 300K-clamp regime" if cache_share >= floor else "✗ BELOW FLOOR"
+    band = "✓ in 800K-clamp regime" if cache_share >= floor else "✗ BELOW FLOOR"
     print(f"- cache-share: {cache_share:.1%}   floor: {floor:.0%}   {band}   "
           f"(n={n_with_cost} cost-bearing of {n_clamp} clamp sessions)")
     print(f"  (compaction-call spend ${comp_cost:.2f} excluded — cacheRead≈0 "
-          "summarizer calls; 300K-clamp expected 65–70%, measured ~70% (#373-era anchors)")
+          "summarizer calls; the 65–70% band was MEASURED under the 300K clamp "
+          "(#373-era anchors) and has NOT been re-measured at the 800K clamp — "
+          f"{floor:.0%} is a lower-bound alarm, not an expectation here)")
 
 print("")
 print("## (c) Output+reasoning share over non-cache tokens (#365 trend)")
@@ -382,7 +396,7 @@ if ceil_recs > 0:
     esc.append(f"ceiling-compaction count {ceil_recs} > 0 (1M drift — clamp not live?)")
 if cache_share is not None and n_with_cost >= 3 and cache_share < floor:
     esc.append(f"cache-share {cache_share:.1%} < floor {floor:.0%} "
-               "(below the expected 300K-clamp regime)")
+               "(below the expected 800K-clamp regime)")
 print("")
 if esc:
     print("## ❌ ESCALATION")
@@ -393,6 +407,6 @@ if esc:
     print("the weekly report reader is the owner. Run scripts/watch-truncation.sh")
     print("for the pre-committed rollback procedure._")
     sys.exit(1)
-print("## ✅ CLEAN — thresholds within the shipped 300K-clamp regime")
+print("## ✅ CLEAN — thresholds within the shipped 800K-clamp regime")
 sys.exit(0)
 PYEOF

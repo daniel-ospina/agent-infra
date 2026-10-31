@@ -9,7 +9,7 @@ aboutSubjects: organisation-design-team
 aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, issue-1227, issue-1316, pi-config, cost-config-policy
 ---
 
-# Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)
+# Cost-Config Policy — deepseek context clamp @800K & drift guard (#341)
 
 One place that pins the agent-infra fleet's **token-cost guardrail contract**:
 what the shipped 300K deepseek context clamp means, why the guard's classes
@@ -448,3 +448,53 @@ property; this guard is the pattern to copy, not a substitute for it.
   300,000, because cold re-ingestion at the 1M ceiling is the cost amplifier
   the clamp exists to stop, and the mechanism that once justified widening it
   (the single-token clamp death) is now closed in code.
+  ⛔ **SUPERSEDED 2026-10-31 — see the decision below. Do not "restore" 300K.**
+
+### 7.1 2026-10-31 decision — the clamp moves 300K → 800K (owner)
+
+**Decision (owner, 2026-10-31, verbatim):** the 300K window *"was done to
+reduce costs but I feel that context loss in the orchestrator is costing us
+way more"* → **800,000 tokens**, with the whole geometry following it.
+
+**What moved (one commit, per #1316):** every deepseek-served `contextWindow`
+in `models.json` 300000 → 800000 (`maxTokens` 384000 unchanged — it is an
+output cap, not the window); the guard's `CLAMP` 300000 → 800000; the regime
+floor in BOTH instruments 283616 → **783616**; `watch-truncation.sh`'s band
+constants (`REGIME_TB_FLOOR` → 783616, `REGIME_TB_ERA_CEIL` → 900000, moved
+together as this section requires); and the two literal `/300k` footer parsers
+(`orchestrator-heartbeat.sh`, `safe-send.sh`) now also accept `/800k`, keeping
+`/300k` for historical transcripts. `settings.json`'s `reserveTokens` **stays**
+at the reviewed 16384 — the #1227 directive is untouched.
+
+**Trigger arithmetic:** `contextTokens > contextWindow − reserveTokens`
+(pi `core/compaction/compaction.js`: `shouldCompact`), so
+**800,000 − 16,384 = 783,616**. No new knob was introduced.
+
+**Why this does not reverse §7's withdrawal on its own terms.** The 2026-09-21
+withdrawal rested on a *cost* argument (≈+20% recurring fleet spend) against a
+*hazard* that code now covers (`MIN_USABLE_MAX_TOKENS = 1024`, pi-patch
+#1214(b)). It did not establish 300K as the right window; it declined to pay
+for a hazard fix with tokens. This decision re-prices the same trade from the
+other side — context loss in the orchestrator outweighs the spend — which is
+the owner's call to make, made explicitly, with the number stated.
+
+**Consequence the reader must know (mid-turn band).** Compaction is checked on
+`agent_end`, so a long multi-tool turn can pass the trigger before it is seen.
+Under the 300K clamp that band was ~283.6K–300K; it is now **~783.6K–800K**,
+and a session can overrun past 800K toward the provider's real 1,000,000
+before the provider rejects it. `watch-truncation.sh` fires on the FIRST
+`stopReason:"length"` record — the band constants above describe the NEW
+regime, so a firing record in 783.6K–900K is this geometry's own overrun,
+while records below the floor now also contain the retired eras (400K-era
+383–406K, 700K-era 650–700K) and are not evidence about this clamp.
+
+**Sessions mid-flight:** a running `pi` session keeps the context window it
+resolved at start; the new window applies when the session restarts. Nothing
+live is retroactively resized, and nothing must be killed for this to hold.
+
+**OVERRIDES:** the 300K §7 clamp and its own `OVERRIDES` line (window clamped
+at 300,000 against the vendor's 1,000,000, on the cold-re-ingestion cost
+argument) — replaced by the owner's 2026-10-31 ruling that orchestrator
+context loss costs more than the re-ingestion spend; 800,000 remains inside
+the provider's real 1,000,000 window. Re-clamping to 300K again requires
+re-approval, exactly as this section already required.
