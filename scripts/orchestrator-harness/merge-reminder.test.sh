@@ -3177,10 +3177,27 @@ ck "§27b harness_repo_of REFUSES the same directory-at-marker-path shape" \
 # refused — i.e. a regression to a literal-path marker shipped green).
 # `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for `HARNESS_REPO`; a reader that
 # tested the literal path would refuse it and the deploy probe would read CANNOT VERIFY forever.
-out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+#
+# ⛔ AND THE CANDIDATE IS A FIXTURE REPO, NEVER THIS CHECKOUT (fix for #3153's P1: DETERMINISTIC red on
+# every non-`main` run of this shard, and the only failure in it — 336 passed / 1 failed). The first
+# version passed `$HERE_TOP/scripts`, so a `ref:` line could only be produced when the CHECKOUT happened
+# to carry a remote-tracking `refs/remotes/origin/main`. `actions/checkout` creates exactly ONE
+# remote-tracking ref and names it after the PUSHED branch: on a `main` push that is `origin/main`
+# (measured GREEN — run 41203069850, same file, same assertion), on an `integration/**` push it is
+# `origin/integration/...` and `origin/main` does not exist, so `git rev-parse --verify origin/main`
+# answers nothing and box-status correctly prints `ref: UNRESOLVED` (measured RED — run 41201860711). The
+# subject of this case is the SUBDIR rule, not the ambient checkout's refs, so the candidate is
+# `$REPO_SRC/scripts`: a real subdirectory of a real harness checkout whose `origin/main` is pushed to
+# its own origin. A literal-path test still refuses it (`$REPO_SRC/scripts/scripts/orchestrator-harness/
+# box-status.sh` does not exist), so the pin keeps its discriminating power — and it is now hermetic.
+ck "§27b the subdir candidate really is a SUBDIRECTORY of the harness fixture (not its toplevel)" \
+   "$( [ "$(git -C "$REPO_SRC/scripts" rev-parse --show-toplevel 2>/dev/null)" = "$(git -C "$REPO_SRC" rev-parse --show-toplevel 2>/dev/null)" ] && echo 0 || echo 1 )"
+out="$(env REPO= HARNESS_REPO="$REPO_SRC/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b box-status ACCEPTS a SUBDIRECTORY candidate of the harness repo" \
    "$(grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+ck "§27b ...and the ref it reports is the FIXTURE's origin/main, so the case needs no ambient checkout ref" \
+   "$(grep -q "^ref: origin/main=$MAIN12" <<<"$out" && echo 0 || echo 1)"
 # ...and the negative control uses an EXISTING directory: a `scripts/` subdirectory of a checkout whose
 # index does not track the harness file. A nonexistent path would be refused for being no checkout at all,
 # which says nothing about the marker (round-4 review follow-up: the first version proved only that).

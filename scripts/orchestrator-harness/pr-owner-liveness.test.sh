@@ -179,12 +179,26 @@ rm -f "$OLK"
 # UNDISCRIMINATED: deleting the guard left both suites green. They fail closed, so the risk is not worse
 # behaviour, it is a silent regression in the arm that deletes files.
 # 1. A SYMLINK is not a record: `[ -f ]` follows it, so a `rm` would delete the TARGET.
+# ⛔ THE FIXTURE MUST LIVE AT THE PATH THE CALL RESOLVES (review of #3153). `pl_reap_no_owner <state>
+# <pr>` derives its record from `pl_lock_path` = `"$state/mergeclaim-<pr>.lock"`, so calling it with
+# the WRONG PR silently targeted a path that did not exist: `pl_record_no_owner` then returned 1 on
+# "no such file" and the target was untouched for a reason that had nothing to do with the `[ -L ]`
+# guard. The arm passed with the guard DELETED, and it passed on the tree where `pl_reap_no_owner` did
+# not exist at all (`command not found`, and the trailing `printf ok` still ran). So the fixture is
+# created at `pl_lock_path "$TMP" 4321` — the exact path the reap resolves — and the assertion reads
+# the reap's OWN rc (1 = nothing touched), not a captured `OUT` nobody asserts.
+OLLINK="$(pl_lock_path "$TMP" 4321)"; rm -f "$OLLINK"
+# The TARGET must be a real (aged, empty) orphan record: an unreadable/absent target would make the
+# raise below pass for the wrong reason, which is exactly the defect this arm is being repaired for.
 : > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
-OLLINK="$TMP/orphan-link.lock"; rm -f "$OLLINK"; ln -s "$OLK" "$OLLINK" 2>/dev/null
+ln -s "$OLK" "$OLLINK" 2>/dev/null
+check "(a4h) the fixture IS the record path the reap resolves (pl_lock_path) and its target is a real old record" \
+  "[ -L '$OLLINK' ] && [ -e '$OLK' ] && [ -n \"\$(find '$OLK' -maxdepth 0 -mmin +2 2>/dev/null)\" ]"
 check "(a4h) a symlinked record is NOT admitted (content alone is not the record's own — `rm` would hit the target)" \
   "! pl_record_no_owner '$OLLINK' >/dev/null"
-OUT="$( pl_reap_no_owner "$TMP" orphan-link >/dev/null 2>&1; printf '%s' ok )"
-check "(a4h) …and the reap refuses it, leaving the target intact" "[ -e '$OLK' ]"
+pl_reap_no_owner "$TMP" 4321 >/dev/null 2>&1; OREAP=$?
+check "(a4h) …and the reap REFUSES it with rc=1 (nothing touched), leaving the symlink AND its target intact" \
+  "[ $OREAP -eq 1 ] && [ -L '$OLLINK' ] && [ -e '$OLK' ]"
 rm -f "$OLLINK" "$OLK"
 # 2. a WHITESPACE-ONLY body is no owner, and is admitted (the module side of the fix-one '   \n' fixture).
 : > "$OLK"; printf '   \n' > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null

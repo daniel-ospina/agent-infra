@@ -132,8 +132,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
-say_err() { printf '%s\n' "$*" >&2; }
+note() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+note_err() { printf '%s\n' "$*" >&2; }
 
 # ── the digest, portable ────────────────────────────────────────────────────────────────────────
 # `sha256sum` is GNU; macOS ships `shasum`. Comparing a `sha256sum` line to a `shasum -a 256` line
@@ -144,7 +144,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
     _digest_stream() { shasum -a 256 2>/dev/null | cut -d' ' -f1; }
 else
-    say_err "$PROG: UNKNOWN — neither sha256sum nor shasum is on PATH; cannot compare bytes."
+    note_err "$PROG: UNKNOWN — neither sha256sum nor shasum is on PATH; cannot compare bytes."
     exit 2
 fi
 
@@ -220,14 +220,14 @@ fi
 if [ -z "$SRC" ]; then
     # The checkout THIS script lives in — `scripts/check-farm-drift.sh` → the repo root above it.
     SRC="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)" || {
-        say_err "$PROG: UNKNOWN — cannot resolve the source checkout from $0"
+        note_err "$PROG: UNKNOWN — cannot resolve the source checkout from $0"
         exit 2
     }
 fi
 
-[ -d "$DEST" ] || { say_err "$PROG: UNKNOWN — no farm at $DEST (nothing is deployed, so nothing can be verified)"; exit 2; }
-[ -d "$SRC" ]  || { say_err "$PROG: UNKNOWN — source checkout $SRC does not exist"; exit 2; }
-[ -d "$SRC/scripts" ] || { say_err "$PROG: UNKNOWN — $SRC carries no scripts/ tree; this is not an agent-infra checkout"; exit 2; }
+[ -d "$DEST" ] || { note_err "$PROG: UNKNOWN — no farm at $DEST (nothing is deployed, so nothing can be verified)"; exit 2; }
+[ -d "$SRC" ]  || { note_err "$PROG: UNKNOWN — source checkout $SRC does not exist"; exit 2; }
+[ -d "$SRC/scripts" ] || { note_err "$PROG: UNKNOWN — $SRC carries no scripts/ tree; this is not an agent-infra checkout"; exit 2; }
 
 # ── the SOURCE the bytes are compared against ───────────────────────────────────────────────────
 # A worktree/ref read, not the working tree: an uncommitted edit in the checkout must not be able to
@@ -243,7 +243,7 @@ fi
 # error in BOTH modes — pin identity is read from the resolved commit regardless — and leaving it only
 # in the `ref` branch re-opened the round-1 finding in the mode setup.sh actually uses.
 if [ "$REF_EXPLICIT" -eq 1 ] && [ "$SRC_HAS_GIT" -eq 0 ]; then
-    say_err "$PROG: UNKNOWN — --ref '$REF' does not resolve in $SRC (not a git checkout?); refusing to grade anything."
+    note_err "$PROG: UNKNOWN — --ref '$REF' does not resolve in $SRC (not a git checkout?); refusing to grade anything."
     exit 2
 fi
 if [ "$SRC_MODE_REQ" = "worktree" ]; then
@@ -252,7 +252,7 @@ if [ "$SRC_MODE_REQ" = "worktree" ]; then
 elif [ "$SRC_HAS_GIT" -eq 0 ]; then
     # No git (a tarball install) — compare the working tree, and SAY SO on STDERR so --quiet cannot
     # hide a weaker comparison.
-    say_err "$PROG: note — $SRC has no ref '$REF' (not a git checkout?); comparing the WORKING TREE."
+    note_err "$PROG: note — $SRC has no ref '$REF' (not a git checkout?); comparing the WORKING TREE."
     SRC_MODE="worktree"
 else
     SRC_MODE="ref:$REF"
@@ -266,19 +266,19 @@ SRC_READ=""
 if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
     PIN_SHA="$(head -n 1 "$PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
     if [ -z "$PIN_SHA" ]; then
-        say_err "$PROG: UNKNOWN — pin record $PIN_FILE is EMPTY; cannot say which commit this box should run."
+        note_err "$PROG: UNKNOWN — pin record $PIN_FILE is EMPTY; cannot say which commit this box should run."
         exit 2
     fi
     if [ -z "$SRC_SHA" ]; then
-        say_err "$PROG: UNKNOWN — a pin exists ($PIN_SHA) but $SRC is not a git checkout, so the comparison source cannot be identified."
+        note_err "$PROG: UNKNOWN — a pin exists ($PIN_SHA) but $SRC is not a git checkout, so the comparison source cannot be identified."
         exit 2
     fi
     if [ "$PIN_SHA" != "$SRC_SHA" ]; then
-        say_err "$PROG: UNKNOWN — COMPARING AGAINST THE WRONG TREE. This box is pinned at $PIN_SHA"
-        say_err "   but $SRC is at $SRC_SHA. A byte comparison against the tree it farms FROM is green"
-        say_err "   regardless of whether the deployed bytes are the PINNED code — that is the false PASS"
-        say_err "   (tortoise#10114: the farm was refreshed from an Aug-7 checkout while the pin said otherwise)."
-        say_err "   Next: farm from the pinned tree (HARNESS-PIN-consistent checkout), or advance the pin deliberately."
+        note_err "$PROG: UNKNOWN — COMPARING AGAINST THE WRONG TREE. This box is pinned at $PIN_SHA"
+        note_err "   but $SRC is at $SRC_SHA. A byte comparison against the tree it farms FROM is green"
+        note_err "   regardless of whether the deployed bytes are the PINNED code — that is the false PASS"
+        note_err "   (tortoise#10114: the farm was refreshed from an Aug-7 checkout while the pin said otherwise)."
+        note_err "   Next: farm from the pinned tree (HARNESS-PIN-consistent checkout), or advance the pin deliberately."
         exit 2
     fi
     # A pin is TWO records (scripts/harness-apply-pass.sh's header): the sha in HARNESS-PIN and the
@@ -288,7 +288,7 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
     else
         PIN_TREE_NOTE="no .harness-path record at $_HP_CHECKED"
     fi
-    say "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
+    note "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
 fi
 
 # ⛔ A DANGLING SYMLINK IS CAUGHT HERE TOO. `[ -e ]` FOLLOWS the link, so a pin record that is a
@@ -301,8 +301,8 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ] && { [ -L "$PIN_FILE" ] || 
     # A pin record that EXISTS but does not resolve to a regular file (a directory, a dangling
     # symlink) is "cannot read the pin", not "no pin" — the same `[ -f ]`-is-too-weak class the
     # declaration arm below already refuses (it would silently demote cannot-verify to a pass).
-    say_err "$PROG: UNKNOWN — pin record $PIN_FILE exists but is not a readable regular file; the"
-    say_err "   commit this box should run cannot be read, so nothing was verified."
+    note_err "$PROG: UNKNOWN — pin record $PIN_FILE exists but is not a readable regular file; the"
+    note_err "   commit this box should run cannot be read, so nothing was verified."
     exit 2
 fi
 
@@ -320,11 +320,11 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ]; then
     # looks in a root the caller never named, finds nothing, and reports a FIRST INSTALL over a farm
     # whose pin was lost (P2-1, measured — see the derivation block above).
     if [ -n "$_hp_hit" ]; then
-        say_err "$PROG: UNKNOWN — pin record $PIN_FILE is ABSENT, but $_hp_hit EXISTS and that file is the"
-        say_err "   pin's SECOND record. A box with a pin TREE on record and no pin SHA has LOST its pin"
-        say_err "   (or the path is wrong), so the wrong-tree trap arm cannot run and nothing verified"
-        say_err "   WHICH commit this farm should be. That is 'cannot verify', never a pass."
-        say_err "   Next: restore $PIN_FILE (at the pin's OWN root), or re-cut the pin deliberately (scripts/harness-apply-pass.sh)."
+        note_err "$PROG: UNKNOWN — pin record $PIN_FILE is ABSENT, but $_hp_hit EXISTS and that file is the"
+        note_err "   pin's SECOND record. A box with a pin TREE on record and no pin SHA has LOST its pin"
+        note_err "   (or the path is wrong), so the wrong-tree trap arm cannot run and nothing verified"
+        note_err "   WHICH commit this farm should be. That is 'cannot verify', never a pass."
+        note_err "   Next: restore $PIN_FILE (at the pin's OWN root), or re-cut the pin deliberately (scripts/harness-apply-pass.sh)."
         exit 2
     fi
     # ⛔ AN EXPLICIT --harness-path-file THAT DOES NOT EXIST IS NOT "NO RECORD" — IT IS AN ASSERTION
@@ -335,13 +335,13 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ]; then
     # flag spelled right, or with no flag at all, ⇒ rc=2). Only reached when NO record was found
     # anywhere, so a verifiable pin is never turned into UNKNOWN by a note-only typo.
     if [ "$HP_EXPLICIT" -eq 1 ]; then
-        say_err "$PROG: UNKNOWN — pin record $PIN_FILE is ABSENT and --harness-path-file $HP_FILE does not"
-        say_err "   exist either. An explicit record path is an assertion about where the pin's SECOND"
-        say_err "   record lives: if it cannot be read then a lost pin cannot be ruled out, and 'first"
-        say_err "   install' over one is the false PASS this arm exists against. Point it at the record, or omit it."
+        note_err "$PROG: UNKNOWN — pin record $PIN_FILE is ABSENT and --harness-path-file $HP_FILE does not"
+        note_err "   exist either. An explicit record path is an assertion about where the pin's SECOND"
+        note_err "   record lives: if it cannot be read then a lost pin cannot be ruled out, and 'first"
+        note_err "   install' over one is the false PASS this arm exists against. Point it at the record, or omit it."
         exit 2
     fi
-    say_err "$PROG: note — no pin record at $PIN_FILE and no $_HP_CHECKED ($HP_WHY): this is a FIRST INSTALL, so there is nothing to compare the source tree against. pin identity NOT verified."
+    note_err "$PROG: note — no pin record at $PIN_FILE and no $_HP_CHECKED ($HP_WHY): this is a FIRST INSTALL, so there is nothing to compare the source tree against. pin identity NOT verified."
 fi
 
 # ── the source lookup map ──────────────────────────────────────────────────────────────────────
@@ -401,13 +401,13 @@ is_declared_local() {
 rows="$( cd "$DEST" && find -L . -type f 2>/dev/null )"
 walk_rc=$?
 if [ "$walk_rc" -ne 0 ]; then
-    say_err "$PROG: UNKNOWN — the farm walk under $DEST failed (exit $walk_rc): an unreadable directory"
-    say_err "   or a symlink whose target cannot be read. The bytes such a layer would execute cannot be graded."
+    note_err "$PROG: UNKNOWN — the farm walk under $DEST failed (exit $walk_rc): an unreadable directory"
+    note_err "   or a symlink whose target cannot be read. The bytes such a layer would execute cannot be graded."
     exit 2
 fi
 rows="$(printf '%s\n' "$rows" | sed 's|^\./||' | LC_ALL=C sort)"
 if [ -z "$(printf '%s' "$rows" | tr -d '[:space:]')" ]; then
-    say_err "$PROG: UNKNOWN — $DEST holds no regular files; an EMPTY farm is not a matching farm."
+    note_err "$PROG: UNKNOWN — $DEST holds no regular files; an EMPTY farm is not a matching farm."
     exit 2
 fi
 
@@ -420,11 +420,11 @@ link_rows="$( cd "$DEST" && find . -type l 2>/dev/null | sed 's|^\./||' | LC_ALL
 while IFS= read -r ln; do
     [ -n "$ln" ] || continue
     if [ ! -e "$DEST/$ln" ]; then
-        say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINK to a target that does not resolve."
+        note_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINK to a target that does not resolve."
         broken_link=1
     elif [ -d "$DEST/$ln" ]; then
         if [ ! -r "$DEST/$ln" ] || [ ! -x "$DEST/$ln" ]; then
-            say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that cannot be read; its layer contributes no rows and cannot be graded."
+            note_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that cannot be read; its layer contributes no rows and cannot be graded."
             broken_link=1
         else
             # ⛔ FIXED-STRING CONTAINMENT, NEVER `grep "^$ln/"`: a link named `li.` built the regex
@@ -434,7 +434,7 @@ while IFS= read -r ln; do
             case $'\n'"$rows" in
                 *$'\n'"$ln"/*) : ;;
                 *)
-                    say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that contributed NO files; an empty layer is not a matching layer."
+                    note_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that contributed NO files; an empty layer is not a matching layer."
                     broken_link=1 ;;
             esac
         fi
@@ -461,7 +461,7 @@ while IFS= read -r rel; do
     fi
     d_sha="$(_digest "$DEST/$rel")"
     if [ -z "$d_sha" ]; then
-        say_err "$PROG: UNKNOWN — $DEST/$rel exists but cannot be read; cannot grade it."
+        note_err "$PROG: UNKNOWN — $DEST/$rel exists but cannot be read; cannot grade it."
         exit 2
     fi
     if src="$(resolve_source "$rel")"; then
@@ -471,7 +471,7 @@ while IFS= read -r rel; do
             s_sha="$(_digest "$SRC/$src")"
         fi
         if [ -z "$s_sha" ]; then
-            say_err "$PROG: UNKNOWN — $src is in the source map but its bytes could not be read at ${SRC_READ:-worktree}"
+            note_err "$PROG: UNKNOWN — $src is in the source map but its bytes could not be read at ${SRC_READ:-worktree}"
             exit 2
         fi
         matched=$((matched+1))
@@ -531,13 +531,13 @@ if [ -f "$DECL" ]; then
     decl_body="$(cat "$DECL" 2>/dev/null)"
     decl_rc=$?
     if [ "$decl_rc" -ne 0 ]; then
-        say_err "$PROG: UNKNOWN — the farm declaration $DECL exists but could not be read (exit $decl_rc);"
-        say_err "   what the farm OWES cannot be graded, and a missing file cannot be ruled out."
+        note_err "$PROG: UNKNOWN — the farm declaration $DECL exists but could not be read (exit $decl_rc);"
+        note_err "   what the farm OWES cannot be graded, and a missing file cannot be ruled out."
         exit 2
     fi
     if [ -z "$(printf '%s' "$decl_body" | tr -d '[:space:]')" ]; then
-        say_err "$PROG: UNKNOWN — the farm declaration $DECL is EMPTY. A farm that owes nothing is"
-        say_err "   indistinguishable from a recording that failed, so this is not a pass."
+        note_err "$PROG: UNKNOWN — the farm declaration $DECL is EMPTY. A farm that owes nothing is"
+        note_err "   indistinguishable from a recording that failed, so this is not a pass."
         exit 2
     fi
     while IFS= read -r dpath; do
@@ -563,15 +563,15 @@ EOF_DECL
     # declaration containing only `lib/whatever.sh` ⇒ rc=3 "alpha.py is STALE and NOT farm-declared"
     # over drift the farm DOES owe, while the same bytes with alpha.py declared ⇒ rc=1.
     if [ -z "$decl_rel_set" ]; then
-        say_err "$PROG: UNKNOWN — the farm declaration $DECL carries no path this check can grade"
-        say_err "   ($decl_offshape line(s) dropped for not being scripts/<rel>). What the farm OWES is"
-        say_err "   therefore unknown, and grading stale drift against it would report every file as"
-        say_err "   'outside the farm' — switching the #10114 fatal arm off. This is not a pass."
+        note_err "$PROG: UNKNOWN — the farm declaration $DECL carries no path this check can grade"
+        note_err "   ($decl_offshape line(s) dropped for not being scripts/<rel>). What the farm OWES is"
+        note_err "   therefore unknown, and grading stale drift against it would report every file as"
+        note_err "   'outside the farm' — switching the #10114 fatal arm off. This is not a pass."
         exit 2
     fi
     decl_ok=1
 else
-    say_err "$PROG: note — no $DECL, so what the farm DECLARES could not be graded; only the files already on the box were (a declared-but-absent script is invisible to this run)."
+    note_err "$PROG: note — no $DECL, so what the farm DECLARES could not be graded; only the files already on the box were (a declared-but-absent script is invisible to this run)."
 fi
 
 # ── SCOPE THE FATAL VERDICT TO WHAT THE FARM OWES ─────────────────────────
@@ -597,10 +597,10 @@ if [ "$decl_ok" -eq 1 ] && [ -n "$stale_rows" ]; then
             *$'\n'"scripts/$_srel"$'\n'*) stale_declared=$((stale_declared+1)) ;;
             *)
                 stale_outside=$((stale_outside+1))
-                say_err "   $_srel is STALE and NOT farm-declared: the farm's DECLARED population does not include it"
-                say_err "   (measured from $DECL — the LAST apply's declaration, not setup.sh's current arrays), so"
-                say_err "   re-running the farm is not expected to converge it. A deploy cannot fix this one: declare"
-                say_err "   it in a farm array, or delete it, or retire it in pi-bootstrap/farm-retired.txt." ;;
+                note_err "   $_srel is STALE and NOT farm-declared: the farm's DECLARED population does not include it"
+                note_err "   (measured from $DECL — the LAST apply's declaration, not setup.sh's current arrays), so"
+                note_err "   re-running the farm is not expected to converge it. A deploy cannot fix this one: declare"
+                note_err "   it in a farm array, or delete it, or retire it in pi-bootstrap/farm-retired.txt." ;;
         esac
     done <<EOF_STALE
 $stale_rows
@@ -620,30 +620,30 @@ else
 fi
 
 total=$((same+stale+unsourced))
-say ""
+note ""
 if [ "$matched" -eq 0 ]; then
-    say_err "$PROG: UNKNOWN — no SOURCED file was graded; an all-declared-local farm is not a matching farm."
+    note_err "$PROG: UNKNOWN — no SOURCED file was graded; an all-declared-local farm is not a matching farm."
     exit 2
 fi
 if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
-    say "$PROG: OK — $same/$matched sourced file(s) match the source at ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC$([ -n "$SRC_READ" ] && [ -n "${PIN_SHA:-}" ] && printf ' = pin')"
+    note "$PROG: OK — $same/$matched sourced file(s) match the source at ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC$([ -n "$SRC_READ" ] && [ -n "${PIN_SHA:-}" ] && printf ' = pin')"
     exit 0
 fi
-say_err "$PROG: DRIFT — $stale stale ($stale_split), $missing declared-but-absent, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."
-say_err "   A STALE file is a copy launchd/systemd will EXECUTE that is not the code the repo ships."
-say_err "   A NOT-EXECUTABLE file is byte-identical but cannot be run — the same silent no-op class."
-say_err "   A DECLARED-BUT-ABSENT file is one the farm owes and never landed."
-say_err "   An UNSOURCED file is on the box and in no repo file — declare it local or delete it."
-# ⛔ NEVER PRINT A REMEDY THE RUN JUST CONTRADICTED. `:519` used to say "re-run the farm"
+note_err "$PROG: DRIFT — $stale stale ($stale_split), $missing declared-but-absent, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."
+note_err "   A STALE file is a copy launchd/systemd will EXECUTE that is not the code the repo ships."
+note_err "   A NOT-EXECUTABLE file is byte-identical but cannot be run — the same silent no-op class."
+note_err "   A DECLARED-BUT-ABSENT file is one the farm owes and never landed."
+note_err "   An UNSOURCED file is on the box and in no repo file — declare it local or delete it."
+# ⛔ NEVER PRINT A REMEDY THE RUN JUST CONTRADICTED. `:519` used to note "re-run the farm"
 # unconditionally, so on the exit-3 path the LAST line an operator reads was the one remedy the
 # per-file lines above it explicitly say cannot work (`re-running the farm is not expected to converge
 # it`). Exit 3 means the deploy is not the remedy — and when nothing is farm-declared and nothing is
 # declared-but-absent, there is nothing a re-run COULD fix, so the re-run advice is dropped entirely.
 if [ "$stale_declared" -eq 0 ] && [ "$missing" -eq 0 ]; then
-    say_err "   Next: this is NOT re-runnable into a pass — declare each file above in a farm array"
-    say_err "   (pi-bootstrap/setup.sh), delete it, or retire it in pi-bootstrap/farm-retired.txt; then re-run this."
+    note_err "   Next: this is NOT re-runnable into a pass — declare each file above in a farm array"
+    note_err "   (pi-bootstrap/setup.sh), delete it, or retire it in pi-bootstrap/farm-retired.txt; then re-run this."
 else
-    say_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent checkout, then re-run this."
+    note_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent checkout, then re-run this."
 fi
 # ⛔ THREE VERDICTS, NOT TWO. STALE (1) is the #10114 defect and a deploy must never report success
 # over it. UNSOURCED-only (3) is a DIFFERENT fact — a name on the box that no repo file explains — and
