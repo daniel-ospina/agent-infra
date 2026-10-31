@@ -66,10 +66,23 @@ set -u
 PROG="check-farm-drift"
 
 help_text() {
-    # ⛔ NOT `awk … "$0"`. Reading the script through an interpreter is a script-indirection shape
-    # (extensions/main-worktree-guard #709) and it refused this file's own invocation
-    # nondeterministically, so the diagnostic path to a drift check was itself flaky.
-    sed -n '2,/^set -u$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+    # ⛔ THE USAGE TEXT IS A LITERAL HEREDOC, NOT A READ OF "$0". Reading this file through an
+    # interpreter is a script-indirection shape (extensions/main-worktree-guard #709) and it refused
+    # this script's own invocation nondeterministically (measured: same bytes, 6 refusals / 4 runs),
+    # which made the fleet's diagnostic path to a drift check flaky. A diagnostic that cannot be
+    # invoked is not a diagnostic.
+    cat <<'USAGE'
+check-farm-drift.sh — is the FARMED copy of the harness the code the repo ships?
+
+  ./check-farm-drift.sh [--dest <dir>] [--src <checkout>] [--pin-file <file>]
+                        [--ref <git-ref>] [--src-mode ref|worktree] [--quiet] [--no-pin-identity]
+
+Exit: 0 = match, 1 = DRIFT (a named file differs — the farm is not the shipped code),
+      3 = UNSOURCED only (on the box, in no repo file — a deploy cannot fix it, a human must),
+      2 = UNKNOWN (cannot verify — NEVER a pass).
+
+See the header comment of this file for why it exists (tortoise#10114).
+USAGE
 }
 
 DEST=""
@@ -77,6 +90,13 @@ SRC=""
 PIN_FILE=""
 REF="HEAD"
 REF_EXPLICIT=0
+# WHAT THE DEPLOYED BYTES ARE COMPARED AGAINST. `ref` grades the COMMITTED tree ("is the deployed file
+# the code the repo ships?"). `worktree` grades the bytes on disk — which is what a farm leg actually
+# `cp`'d, so a deploy verifying its own result must use it: grading a worktree-farmed copy against
+# HEAD turns the normal hot-fix path (box at pin, an agent edits a farmed script, re-runs setup.sh)
+# into a permanent "FARM DID NOT CONVERGE" that the deploy cannot fix from its own side. Pin identity
+# is still read from the resolved commit in BOTH modes.
+SRC_MODE_REQ="ref"
 QUIET=0
 PIN_IDENTITY=1
 while [ $# -gt 0 ]; do
@@ -85,6 +105,9 @@ while [ $# -gt 0 ]; do
         --src)      [ $# -ge 2 ] || { echo "$PROG: --src needs a path" >&2; exit 2; }; SRC="$2"; shift 2 ;;
         --pin-file) [ $# -ge 2 ] || { echo "$PROG: --pin-file needs a path" >&2; exit 2; }; PIN_FILE="$2"; shift 2 ;;
         --ref)      [ $# -ge 2 ] || { echo "$PROG: --ref needs a git ref" >&2; exit 2; }; REF="$2"; REF_EXPLICIT=1; shift 2 ;;
+        --src-mode) [ $# -ge 2 ] || { echo "$PROG: --src-mode needs ref|worktree" >&2; exit 2; }
+                    case "$2" in ref|worktree) SRC_MODE_REQ="$2" ;; *) echo "$PROG: --src-mode must be ref or worktree" >&2; exit 2 ;; esac
+                    shift 2 ;;
         --no-pin-identity) PIN_IDENTITY=0; shift ;;
         --quiet|-q) QUIET=1; shift ;;
         --help|-h)  help_text; exit 0 ;;
@@ -132,23 +155,31 @@ fi
 # make a stale deployed copy look current.
 if git -C "$SRC" rev-parse --verify --quiet "$REF^{commit}" >/dev/null 2>&1; then
     SRC_SHA="$(git -C "$SRC" rev-parse "$REF^{commit}")"
-    SRC_MODE="ref:$REF"
+    SRC_HAS_GIT=1
 else
-    # No git (a tarball install) — compare the working tree, and SAY SO. A silent fall back to the
-    # worktree would present a weaker comparison as the same one.
     SRC_SHA=""
+    SRC_HAS_GIT=0
+fi
+if [ "$SRC_MODE_REQ" = "worktree" ]; then
+    # The caller asked for the bytes ON DISK. Identity is still read from the resolved commit.
     SRC_MODE="worktree"
-    # ⛔ ON STDERR, so --quiet cannot hide it: a weaker comparison must never be silent.
+elif [ "$SRC_HAS_GIT" -eq 0 ]; then
+    # No git (a tarball install) — compare the working tree, and SAY SO on STDERR so --quiet cannot
+    # hide a weaker comparison.
     say_err "$PROG: note — $SRC has no ref '$REF' (not a git checkout?); comparing the WORKING TREE."
-    # ⛔ AN EXPLICITLY-PASSED --ref THAT DOES NOT RESOLVE IS OPERATOR ERROR, NEVER A MODE. Falling
-    # back to the working tree there contradicts this file's own contract (an uncommitted edit must
-    # not be able to make a stale deployed copy look current), and a misspelled ref would silently
-    # grade a weaker thing than the caller asked for.
+    # AN EXPLICITLY-PASSED --ref THAT DOES NOT RESOLVE IS OPERATOR ERROR, NEVER A MODE.
     if [ "$REF_EXPLICIT" -eq 1 ]; then
         say_err "$PROG: UNKNOWN — --ref '$REF' does not resolve in $SRC; refusing to grade the working tree instead."
         exit 2
     fi
+    SRC_MODE="worktree"
+else
+    SRC_MODE="ref:$REF"
 fi
+# WHAT THE BYTES ARE READ FROM: the ref when grading "is this the shipped code", the working tree when
+# a deploy is grading what it just copied. Pin identity uses $SRC_SHA either way.
+SRC_READ=""
+[ "$SRC_MODE" = "worktree" ] || SRC_READ="$SRC_SHA"
 
 # ── 1. PIN IDENTITY (the trap that made the first repair look done) ────────────────────────────
 if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
@@ -183,7 +214,7 @@ fi
 # Read through the ref (git cat-file), so the bytes graded are the COMMITTED ones.
 # Is $1 a tracked path at the ref? (`ls-tree` on the exact path — cheap, and it refuses a path the
 # ref does not carry instead of silently grading an untracked working-tree file.)
-at_ref() { [ -n "$SRC_SHA" ] && git -C "$SRC" cat-file -e "$SRC_SHA:$1" 2>/dev/null; }
+at_ref() { [ -n "$SRC_READ" ] && git -C "$SRC" cat-file -e "$SRC_READ:$1" 2>/dev/null; }
 
 resolve_source() {  # $1 = dest-relative path → prints the repo-relative source path, or nothing
     _rel="$1"
@@ -196,7 +227,7 @@ resolve_source() {  # $1 = dest-relative path → prints the repo-relative sourc
         "pi-bootstrap/lib/$_base" \
         "tools/fleet/$_base"
     do
-        if [ -n "$SRC_SHA" ]; then
+        if [ -n "$SRC_READ" ]; then
             if at_ref "$_cand"; then printf '%s\n' "$_cand"; return 0; fi
         else
             if [ -f "$SRC/$_cand" ]; then printf '%s\n' "$_cand"; return 0; fi
@@ -219,29 +250,58 @@ is_declared_local() {
     return 1
 }
 
-# ── 2. THE WHOLE POPULATION ────────────────────────────────────────────────────────────────────
+# ── 2. THE WHOLE POPULATION ────────────────────────────────────────────────────────────────
 # EVERY regular file under $DEST, at every depth. A depth-1 glob is how the farm's own drift stayed
 # invisible: `fleet/` and `lib/` are half the layer.
-rows="$(cd "$DEST" && find -L . -type f | sed 's|^\./||' | LC_ALL=C sort)"
-if [ -z "$rows" ]; then
+# ⛔ THE WALK'S OWN EXIT IS PART OF THE VERDICT. `rows="$(find ... | sed | sort)"` reports the LAST
+# pipeline stage's status, so an unreadable symlinked layer printed `Permission denied`, contributed
+# ZERO rows, and the run reported OK while the executed bytes were the stale ones — the exact false
+# PASS the symlink arm exists to prevent. The walk is written to a file and its status is checked.
+# ⛔ THE WALK'S OWN EXIT IS PART OF THE VERDICT, AND NO TEMP FILE IS WRITTEN INTO THE FARM.
+# `rows="$(find ... | sed | sort)"` reports the LAST pipeline stage's status, so an unreadable symlinked
+# layer printed `Permission denied`, contributed ZERO rows, and the run reported OK while the executed
+# bytes were the stale ones — the exact false PASS the symlink arm exists to prevent.
+# A bare `$( cd "$DEST" && find ... )` carries find's own status, so no pipe and no temp file are
+# needed; writing the temp file INTO $DEST made the walk enumerate its own scratch file and report it
+# UNSOURCED (measured — it turned every matching farm into exit 3).
+rows="$( cd "$DEST" && find -L . -type f 2>/dev/null )"
+walk_rc=$?
+if [ "$walk_rc" -ne 0 ]; then
+    say_err "$PROG: UNKNOWN — the farm walk under $DEST failed (exit $walk_rc): an unreadable directory"
+    say_err "   or a symlink whose target cannot be read. The bytes such a layer would execute cannot be graded."
+    exit 2
+fi
+rows="$(printf '%s\n' "$rows" | sed 's|^\./||' | LC_ALL=C sort)"
+if [ -z "$(printf '%s' "$rows" | tr -d '[:space:]')" ]; then
     say_err "$PROG: UNKNOWN — $DEST holds no regular files; an EMPTY farm is not a matching farm."
     exit 2
 fi
 
 # ⛔ A SYMLINK IN THE FARM IS GRADED, NOT SKIPPED. `find -type f` alone never reports a link, so a
-# farm whose `fleet/` is a symlink to a stale tree read as OK while the executed bytes were the stale
-# ones — the exact false PASS this file exists against. `-L` grades the TARGET's bytes (which is what
-# launchd/bash/python execute); a link whose target is unreachable is exit 2, never a pass.
+# farm whose `fleet/` is a symlink to a stale tree read as OK. `-L` grades the TARGET's bytes (what
+# launchd/bash/python actually execute); a link whose target does not resolve, or a DIRECTORY link
+# that contributed no rows, is exit 2 — never a pass.
 broken_link=0
-link_rows="$(cd "$DEST" && find . -type l | sed 's|^\./||' | LC_ALL=C sort)"
-for ln in $link_rows; do
+link_rows="$( cd "$DEST" && find . -type l 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort )"
+while IFS= read -r ln; do
+    [ -n "$ln" ] || continue
     if [ ! -e "$DEST/$ln" ]; then
-        say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINK to a target that does not resolve; the bytes it would execute cannot be graded."
+        say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINK to a target that does not resolve."
         broken_link=1
+    elif [ -d "$DEST/$ln" ]; then
+        if [ ! -r "$DEST/$ln" ] || [ ! -x "$DEST/$ln" ]; then
+            say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that cannot be read; its layer contributes no rows and cannot be graded."
+            broken_link=1
+        elif ! printf '%s\n' "$rows" | grep -q "^$ln/"; then
+            say_err "$PROG: UNKNOWN — $DEST/$ln is a SYMLINKED DIRECTORY that contributed NO files; an empty layer is not a matching layer."
+            broken_link=1
+        fi
     elif [ "$QUIET" -eq 0 ]; then
         printf '%-46s | %-12s | %-12s | %s\n' "$ln" "-" "-" "SYMLINK (graded via its target)"
     fi
-done
+done <<EOF_LINKS
+$link_rows
+EOF_LINKS
 [ "$broken_link" -eq 0 ] || exit 2
 
 stale=0
@@ -250,7 +310,8 @@ same=0
 matched=0
 [ "$QUIET" -eq 1 ] || printf '%s\n' "file | deployed | source | verdict"
 
-for rel in $rows; do
+while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
     if is_declared_local "$rel"; then
         [ "$QUIET" -eq 1 ] || printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "LOCAL (declared)"
         continue
@@ -261,13 +322,13 @@ for rel in $rows; do
         exit 2
     fi
     if src="$(resolve_source "$rel")"; then
-        if [ -n "$SRC_SHA" ]; then
-            s_sha="$(git -C "$SRC" cat-file blob "$SRC_SHA:$src" 2>/dev/null | _digest_stream)"
+        if [ -n "$SRC_READ" ]; then
+            s_sha="$(git -C "$SRC" cat-file blob "$SRC_READ:$src" 2>/dev/null | _digest_stream)"
         else
             s_sha="$(_digest "$SRC/$src")"
         fi
         if [ -z "$s_sha" ]; then
-            say_err "$PROG: UNKNOWN — $src is in the source map but its bytes could not be read at $SRC_SHA"
+            say_err "$PROG: UNKNOWN — $src is in the source map but its bytes could not be read at ${SRC_READ:-worktree}"
             exit 2
         fi
         matched=$((matched+1))
@@ -283,16 +344,51 @@ for rel in $rows; do
         unsourced=$((unsourced+1))
         printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "-" "UNSOURCED" >&2
     fi
-done
+done <<EOF_ROWS
+$rows
+EOF_ROWS
+
+# ⛔ A DECLARED-BUT-ABSENT FILE IS DRIFT, NOT SILENCE. The population above is what is ON THE BOX, so a
+# file the farm declares and never landed (a failed `cp`, a partial farm, a hand-deletion) was
+# invisible — launchd executing an ABSENT script is the same silent no-op class as #10114.
+# `pi-bootstrap/lib/farm-retire.sh` records that declaration at `$DEST/state/farm-declared.txt`,
+# relative to $DEST. Read it when it exists; say so when it does not.
+DECL="$(dirname "$DEST")/state/farm-declared.txt"
+missing=0
+if [ -f "$DECL" ]; then
+    while IFS= read -r dpath; do
+        [ -n "$dpath" ] || continue
+        case "$dpath" in scripts/*) rel="${dpath#scripts/}" ;; *) continue ;; esac
+        is_declared_local "$rel" && continue
+        if [ ! -e "$DEST/$rel" ]; then
+            case " $rows " in
+                *" $rel "*) : ;;
+                *)
+                    # also cover a nested row (declared flat, present under a subdir is NOT a match)
+                    printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "DECLARED-BUT-ABSENT" >&2
+                    missing=$((missing+1)) ;;
+            esac
+        fi
+    done <<EOF_DECL
+$(cat "$DECL" 2>/dev/null)
+EOF_DECL
+else
+    say_err "$PROG: note — no $DECL, so what the farm DECLARES could not be graded; only the files already on the box were (a declared-but-absent script is invisible to this run)."
+fi
 
 total=$((same+stale+unsourced))
 say ""
-if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ]; then
+if [ "$matched" -eq 0 ]; then
+    say_err "$PROG: UNKNOWN — no SOURCED file was graded; an all-declared-local farm is not a matching farm."
+    exit 2
+fi
+if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
     say "$PROG: OK — $same/$matched sourced file(s) match the source at ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC$([ -n "${PIN_SHA:-}" ] && printf ' = pin')"
     exit 0
 fi
-say_err "$PROG: DRIFT — $stale stale, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."
+say_err "$PROG: DRIFT — $stale stale, $missing declared-but-absent, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."
 say_err "   A STALE file is a copy launchd/systemd will EXECUTE that is not the code the repo ships."
+say_err "   A DECLARED-BUT-ABSENT file is one the farm owes and never landed."
 say_err "   An UNSOURCED file is on the box and in no repo file — declare it local or delete it."
 say_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent checkout, then re-run this."
 # ⛔ THREE VERDICTS, NOT TWO. STALE (1) is the #10114 defect and a deploy must never report success
@@ -300,5 +396,5 @@ say_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent 
 # it is the normal historical state of this directory (#1552 measured 27 such files). Collapsing the
 # two made a deploy abort for ever on a file no farm can fix, taking every later step of sync.sh with
 # it (measured: two such names on this box). A caller that can fix drift in one step takes 1 or 3.
-if [ "$stale" -gt 0 ]; then exit 1; fi
+if [ "$stale" -gt 0 ] || [ "$missing" -gt 0 ]; then exit 1; fi
 exit 3

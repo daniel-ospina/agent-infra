@@ -1042,21 +1042,28 @@ fi
 if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
   echo ""
   echo "==> Farm drift (deployed vs shipped)"
+  # GRADES WORKTREE BYTES, because that is what the farm legs above just `cp`'d. Grading against HEAD
+  # would red a farm that is byte-identical to the tree this script was told to farm from (the normal
+  # hot-fix path: box at pin, a farmed script edited, setup.sh re-run) — a false CRASH, the mirror of
+  # the false PASS this whole leg exists against. Pin identity is still checked inside.
+  # NOTHING IS WRITTEN INTO $DEST/state: that directory is not created by this file (:466 says so), and
+  # a log path there failed closed in the worst way — the STALE detail went to /dev/null and a
+  # non-writable dir turned a MATCHING farm into "FARM DID NOT CONVERGE". The detail is captured in a
+  # shell variable and always printed.
   _farm_rc=0
-  _farm_err="$DEST/state/farm-drift.last.err"
-  [ -d "$DEST/state" ] || _farm_err=/dev/null   # never let a state-dir anomaly impersonate drift
-  bash "$INFRA_ROOT/scripts/check-farm-drift.sh" --dest "$DEST/scripts" --src "$INFRA_ROOT" \
-       --pin-file "$DEST/state/HARNESS-PIN" --quiet >/dev/null 2>"$_farm_err" || _farm_rc=$?
+  _farm_msg="$(bash "$INFRA_ROOT/scripts/check-farm-drift.sh" \
+                --dest "$DEST/scripts" --src "$INFRA_ROOT" --ref HEAD --src-mode worktree \
+                --pin-file "$DEST/state/HARNESS-PIN" --quiet 2>&1 >/dev/null)" || _farm_rc=$?
   case "$_farm_rc" in
-    0) echo "    farm: OK — every sourced file matches the shipped bytes" ;;
+    0) echo "    farm: OK — every sourced file matches the bytes the farm copied" ;;
     1) echo "    ⛔ FARM DID NOT CONVERGE — a deployed script is not the shipped code:"
-       sed 's/^/      /' "$_farm_err"
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /'
        echo "    Refusing to report a successful install over a farm that launchd would execute as stale code."
        exit 1 ;;
     3) echo "    ⚠️  farm: UNSOURCED file(s) — on the box, in no repo file (this is NOT drift, and NOT a pass):"
-       sed 's/^/      /' "$_farm_err" ;;
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
     *) echo "    ⚠️  farm: COULD NOT VERIFY (exit $_farm_rc) — this is NOT a pass:"
-       sed 's/^/      /' "$_farm_err" ;;
+       printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
   esac
 else
   echo ""
