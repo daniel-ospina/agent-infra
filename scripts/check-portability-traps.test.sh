@@ -242,6 +242,20 @@ flags "sed-in-place-gnu" "$TMP/qmark-plain"
 [ "$?" = 0 ] && ok "C20: the sibling fixture, identical except for the quoted text, DOES flag (so C19 measures the hatch, not a broken fixture)" \
   || bad "C20: the control fixture did not flag — C19 proves nothing"
 
+# ⛔ AND THE GLUED FORM, WHICH WAS A FALSE PASS TWICE OVER (review cycle-18b P1): bash starts a comment
+# only where a `#` begins a WORD, so `${x}#` and `$(cmd)#` keep the text as DATA (measured:
+# `x=abc; echo ${x}# portability-ok: r` prints it) — but this reader took the `#` as a comment, truncated
+# the code view there, and then BLESSED the line through the marker. Both fixtures below failed to report
+# their `sed -i` on `origin/main`; the same shape without the marker was equally silent, which is why the
+# arm asserts the TRAP, not the marker.
+mkdir -p "$TMP/tree/glued"
+printf '%s\n' '#!/usr/bin/env bash' 'x=abc; echo ${x}# portability-ok: nothing special; sed -i "s/a/b/" g.txt' >"$TMP/tree/glued/1-brace.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(echo a)# portability-ok: nothing special; sed -i "s/a/b/" g.txt' >"$TMP/tree/glued/2-subst.sh"
+printf 'glued/1-brace.sh\nglued/2-subst.sh\n' >"$TMP/glued-targets"
+flags "sed-in-place-gnu" "$TMP/glued-targets"
+[ "$?" = 0 ] && ok "C21: a '#' GLUED to \${ } / \$( ) is data, not a comment — the trap to its right is still reported (it was silently unscanned on main)" \
+  || bad "C21: a glued '#' truncated the line and hid a real trap"
+
 # C6/C7 — the file-level declaration: a reasoned skip works; a bare one REFUSES.
 L="$TMP/linuxonly"; : >"$L"
 mk4_lo() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$L"; }
@@ -1285,15 +1299,65 @@ if [ "$erc" = 0 ] && [ "$rows" = 1 ] && [ "$cols" = 1 ]; then
 else
   bad "E8: --emit-baseline emitted rows=$rows justified=$cols rc=$erc (expected 1/1/0) — an empty or short emit is a false PASS"
 fi
-# one-true-awk model: an awk that REFUSES the `-v rules=` assignment (exit 2, the macOS message)
+# ⛔ A FAITHFUL ONE-TRUE-AWK MODEL, AND A SEPARATE STATUS-BARRIER ARM (review cycle-18b P2). The first
+# version of this stub refused ANY `rules=` argument, so it passed through whichever barrier was left
+# standing — measured: with the flattening reverted (`rules_flat="$RULES"`), the arm stayed GREEN, i.e.
+# the transport fix was pinned by nothing. Two arms now: E9 refuses only a value carrying a literal
+# newline (what one-true-awk actually does), and E11 is a stub that PRINTS a row and then FAILS, which
+# only the status check can catch.
 mkdir -p "$TMP/awkrefuse"
-printf '#!/bin/sh\nfor a in "$@"; do case "$a" in rules=*) echo "awk: newline in string" >&2; exit 2;; esac; done\nexec %s "$@"\n' "$(command -v awk)" >"$TMP/awkrefuse/awk"
+printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    rules=*) v="${a#rules=}"; n=$(printf %%s "$v" | wc -l | tr -d " ");\n             if [ "$n" != 0 ]; then echo "awk: newline in string" >&2; exit 2; fi;;\n  esac\ndone\nexec %s "$@"\n' "$(command -v awk)" >"$TMP/awkrefuse/awk"
 chmod +x "$TMP/awkrefuse/awk"
 PATH="$TMP/awkrefuse:$PATH" "$CHECK" --root "$TMP/tree" --targets "$TMP/emit-targets" --emit-baseline >"$TMP/emit2.tsv" 2>"$TMP/emit2.err"; erc2=$?
-if [ "$erc2" = 2 ] && ! grep -q '^emit/' "$TMP/emit2.tsv"; then
-  ok "E9: a choked awk REFUSES the emit (rc=2, no rows) instead of printing an empty baseline that reads as 'nothing to grandfather'"
+rows2="$(grep -v '^#' "$TMP/emit2.tsv" | grep -c . || true)"
+if [ "$erc2" = 0 ] && [ "$rows2" = 1 ]; then
+  ok "E9: the table reaches awk with NO literal newline in the -v value — a faithful one-true-awk model (which refuses exactly that) emits the row"
 else
-  bad "E9: a failing awk produced rc=$erc2 with $(grep -c '^emit/' "$TMP/emit2.tsv") row(s) — the macOS false-PASS shape"
+  bad "E9: the faithful one-true-awk model rejected the table (rc=$erc2, rows=$rows2) — the flattening is not in effect"
+fi
+mkdir -p "$TMP/awkfail"
+printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    rules=*) printf "fake/row.sh\\ttimeout-absent-on-macos\\t1\\tplaceholder\\n"; echo "awk: device error" >&2; exit 2;;\n  esac\ndone\nexec %s "$@"\n' "$(command -v awk)" >"$TMP/awkfail/awk"
+chmod +x "$TMP/awkfail/awk"
+PATH="$TMP/awkfail:$PATH" "$CHECK" --root "$TMP/tree" --targets "$TMP/emit-targets" --emit-baseline >"$TMP/emit4.tsv" 2>"$TMP/emit4.err"; erc4=$?
+if [ "$erc4" = 2 ] && ! grep -q '^fake/row.sh' "$TMP/emit4.tsv"; then
+  ok "E11: an awk that PRINTS then FAILS is refused (rc=2, no rows) — the status barrier, which the row-count reconciliation cannot see"
+else
+  bad "E11: an awk that printed a row and then failed produced rc=$erc4 with $(grep -c '^fake/row.sh' "$TMP/emit4.tsv") row(s)"
+fi
+
+# ⛔ THE TABLE ITSELF IS AN INPUT WITH A REQUIRED COLUMN (review cycle-18b P2): a rule field carrying the
+# transport separator or a TAB silently truncated the justification (rc=0, row count still reconciled),
+# and an EMPTY replacement degraded to the placeholder. Both are refusals now, and both arms mutate a
+# COPY of the detector — the table is the file’s own data, so this is the only way to exercise it.
+tdir="$TMP/tbl"; mkdir -p "$tdir"
+awk -F'\t' 'BEGIN { OFS = "\t" } $1 == "cpu-count-single-mechanism" { $3 = "" } { print }' "$CHECK" >"$tdir/bad-empty.sh"
+bash "$tdir/bad-empty.sh" --list-rules >"$TMP/e12.out" 2>"$TMP/e12.err"; e12=$?
+if [ "$e12" = 2 ] && grep -q 'MALFORMED' "$TMP/e12.err"; then
+  ok "E12: a rule row with an EMPTY replacement REFUSES the run (exit 2) instead of degrading to a placeholder"
+else
+  bad "E12: an empty replacement was accepted (rc=$e12, out=$(head -1 "$TMP/e12.out"))"
+fi
+awk -F'\t' 'BEGIN { OFS = "\t" } $1 == "cpu-count-single-mechanism" { $3 = $3 sprintf("%c", 28) "tail" } { print }' "$CHECK" >"$tdir/bad-sep.sh"
+bash "$tdir/bad-sep.sh" --list-rules >"$TMP/e13.out" 2>"$TMP/e13.err"; e13=$?
+if [ "$e13" = 2 ] && grep -q 'transport separator' "$TMP/e13.err"; then
+  ok "E13: a rule field carrying the \034 transport separator REFUSES the run (exit 2) — a truncated justification is not shipped"
+else
+  bad "E13: a rule field carrying the transport separator was accepted (rc=$e13)"
+fi
+
+# ⛔ E14 — A FAILED COUNT IS NOT A ZERO COUNT (review cycle-18b P2): `grep -c … || true` conflated
+# rc=1 (no match → prints 0) with rc>=2 (grep FAILED → prints nothing), and the emptiness fallback
+# turned a failed count into `total=0`, i.e. `✅ no cross-platform traps` over a non-empty finding list.
+# Measured before the fix with a grep stub exiting 2: 126 findings printed, exit 0.
+mkdir -p "$TMP/badgrep"
+printf '#!/bin/sh\nexit 2\n' >"$TMP/badgrep/grep"
+chmod +x "$TMP/badgrep/grep"
+printf 'emit/1-cpu.sh\n' >"$TMP/one-target"
+PATH="$TMP/badgrep:$PATH" "$CHECK" --root "$TMP/tree" --targets "$TMP/one-target" --no-baseline >"$TMP/e14.out" 2>"$TMP/e14.err"; e14=$?
+if [ "$e14" = 2 ] && grep -q 'finding count FAILED' "$TMP/e14.err"; then
+  ok "E14: a FAILED finding count REFUSES (exit 2) — a broken count can no longer read as zero findings"
+else
+  bad "E14: a failed finding count produced rc=$e14 (expected 2) — the count barrier is not in effect"
 fi
 # and the quieter half: an awk that exits 0 having printed nothing must ALSO refuse, because the row
 # COUNT is reconciled against the live finding pairs. This is the barrier a status check alone misses.
@@ -1612,8 +1676,9 @@ subst_heredoc_pin() {
   # `$(( … ))` is ARITHMETIC (a `<<` there is a left shift, not a heredoc) and a top-level heredoc
   # BODY is data, so a `$(` inside a body cannot open a depth.
   awk '
-    BEGIN { SQ = sprintf("%c", 39); hd = ""; hdstrip = 0; ST = "" }
+    BEGIN { SQ = sprintf("%c", 39); hd = ""; hdstrip = 0; ST = ""; cased = 0 }
     function s_top() { return (length(ST) > 0) ? substr(ST, length(ST), 1) : "" }
+    
     function s_push(ch) { ST = ST ch }
     function s_pop() { ST = substr(ST, 1, length(ST) - 1) }
     {
@@ -1634,7 +1699,19 @@ subst_heredoc_pin() {
         if (t == "K") { if (c == "\\") { i += 2; continue } if (c == "`") s_pop(); prev = c; i++; continue }
         if (t == "C") {
           if (c == "\\") { i += 2; continue }
-          if (c == ")" && AR[length(ST)] == 0) { s_pop(); prev = c; i++; continue }
+          # ⛔ A `case` ARM INSIDE A SUBSTITUTION ENDS IN `)`, AND THAT `)` DOES NOT CLOSE THE
+          # SUBSTITUTION (review cycle-2 of this pin, measured): without this, `RULES=$(case … in
+          # all) cat <<\047EOF\047 … esac)` popped the substitution at the arm label, the opener was
+          # then read as a TOP-LEVEL heredoc (body skipped as data, no hit), and bash 3.2.57 still
+          # refused the file (`syntax error near unexpected token \047;;\047`). The pin exists to be
+          # the only 3.2 coverage on bash-5 CI, so a shape it cannot see is a shape the gate cannot
+          # see there either.
+          if (c ~ /[A-Za-z]/ && (i == 1 || substr(line, i - 1, 1) ~ /[^A-Za-z0-9_]/)) {
+            rest2 = substr(line, i)
+            if (rest2 ~ /^case([ \t;)(|&]|$)/) { cased++; i += 4; prev = "e"; continue }
+            if (rest2 ~ /^esac([ \t;)(|&]|$)/) { if (cased > 0) cased--; i += 4; prev = "c"; continue }
+          }
+          if (c == ")" && AR[length(ST)] == 0 && cased == 0) { s_pop(); prev = c; i++; continue }
           if (c == ")" && AR[length(ST)] == 1) { s_pop(); if (nd > 0) nd--; prev = c; i++; continue }
           if (c == SQ) {
             if (prev == "$") s_push("A"); else s_push("S")
@@ -1702,6 +1779,16 @@ if [ -z "$(subst_heredoc_pin "$TMP/f9-toplevel.sh")" ]; then
   ok "F9e: a top-level heredoc whose BODY contains a substitution is NOT reported (bodies are data, not code)"
 else
   bad "F9e: the shape matcher reported a legit top-level heredoc body — over-block on correct code"
+fi
+# F9f — the `case`-arm spelling: the arm label `)` does NOT close the substitution, so a matcher that
+# pops there reads the opener as TOP LEVEL (records the heredoc, skips the body, reports nothing) and
+# bash 3.2.57 still refuses the file. Measured with `bash:3.2` docker: `syntax error near unexpected
+# token ';;'`. This is the shape a `$(case … esac)` rule table would carry.
+{ printf 'RULES=$(case "${1:-}" in'; printf '\n'; printf '  all) cat <<%sMUTEOF%s' "'" "'"; printf '\n'; printf "it%ss a quote" "'"; printf '\n'; printf 'MUTEOF'; printf '\n'; printf '  ;;'; printf '\n'; printf 'esac)'; printf '\n'; } >"$TMP/f9-case.sh"
+if [ -n "$(subst_heredoc_pin "$TMP/f9-case.sh")" ]; then
+  ok "F9f-negative: the shape matcher REPORTS a heredoc opened inside a CASE ARM of a substitution (the arm-label ')' must not close it)"
+else
+  bad "F9f: the matcher popped the substitution at the case arm label and missed a 3.2-fatal heredoc"
 fi
 # F9c — the real parse, under this host's bash and under a real bash 3.x if the host has one
 if bash -n "$CHECK" 2>"$TMP/f9.err"; then
