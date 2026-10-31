@@ -65,6 +65,7 @@ import {
   hasGhCommandWord,
   mergeVerbInText,
   readsNonMergeGhCall,
+  writesOnlyTrackerRecords,
   ghShimWillEnforce,
   isExecutableShim,
   hasLiteralAdminFlag,
@@ -10103,6 +10104,86 @@ testAsync("a report write is allowed at 0 dispatches while every shipping write 
       }
     });
   });
+});
+
+// ── A tracker write is NOT a shipping op (#485 class; measured on pi-cell-1, 2026-10-31) ──────
+//
+// THE DEFECT. A bare `gh pr comment` was already outside the floor (#3132). What reached it is the
+// shape a report-only lane ACTUALLY runs — write the body to a file, then post it:
+//     cd <wt> && cat > /tmp/f.md <<'MDEOF' …prose with `backticks`… MDEOF
+//     gh pr comment <n> --repo <o/r> --body-file /tmp/f.md 2>&1 | tail -2; rm -f /tmp/f.md
+// Two lanes parked on exactly that (gate-events.jsonl, 2026-10-30T19:41:53Z and 23:49:08Z). The
+// heredoc opener line is COMPOUND, so `heredocBodyIsData` declines to mask the body; the prose's
+// backticks then blind the positive non-merge read, and `isGhPrMergeCommand`'s broad `gh`+`pr` arm
+// fires on a COMMENT. The first two commands below are those rows, so the pin is on real text.
+//
+// POLARITY IS UNCHANGED AND IS PINNED TOO: a readable merge, a SPLICED verb, a quoted group word, an
+// admin flag, a `git` verb ANYWHERE (including inside a substitution or a heredoc body), and a
+// comment compounded with a shipping op all keep the floor. Deleting the classifier clause turns the
+// first two assertions RED — mutant measured: 2 of 23 rows wrong, exactly these two.
+const REPORT_ONLY_COMMENT = [
+  "cd /home/cmux/tortoise/.worktrees/fix-10343 && cat > /tmp/fu10343.md <<'MDEOF'",
+  "### Follow-up: the re-run is now GREEN at the same head",
+  "",
+  "`test (g)` is the shard that produced the failures. **Same SHA, no code change.**",
+  "MDEOF",
+  "gh pr comment 10343 --repo daniel-ospina/tortoise --body-file /tmp/fu10343.md 2>&1 | tail -2; rm -f /tmp/fu10343.md",
+].join("\n");
+const REPORT_ONLY_COMMENT_2 = [
+  "cd /home/cmux/agent-infra/.worktrees/rv-ai-3054 && cat > /tmp/rv3054-followup.md <<'EOF'",
+  "## Attribution closed — the two reds are pre-existing, not this PR",
+  "",
+  "| tree | result |",
+  "|---|---|",
+  "| base | **550 passed, 2 failed** |",
+  "EOF",
+  "gh pr comment 3054 --repo daniel-ospina/agent-infra --body-file /tmp/rv3054-followup.md 2>&1 | tail -2",
+].join("\n");
+
+pending.push(async () => {
+  console.log("\n── tracker writes are read-side at the ≥1-dispatch floor (#485 class)");
+  for (const [label, command] of [
+    ["parked lane fi-10343 (gh pr comment + heredoc + pipe)", REPORT_ONLY_COMMENT],
+    ["parked lane rv-ai-3054 (gh pr comment + heredoc + `||`)", REPORT_ONLY_COMMENT_2],
+    ["bare gh pr comment", "gh pr comment 1234 --body-file /tmp/x.md"],
+    ["bare gh issue comment", "gh issue comment 1224 --body-file /tmp/x.md"],
+    ["gh pr edit (already outside — signed-marker reason)", "gh pr edit 3099 --body-file /tmp/body.md"],
+  ] as Array<[string, string]>) {
+    equal(isGitOp(command), false, `${label}: a tracker write must not be a shipping op`);
+    equal(writesOnlyTrackerRecords(command), true, `${label}: the classification must be the reason`);
+  }
+  // The escapes that must NOT be granted. Each is a real shipping op this floor exists for.
+  for (const [label, command] of [
+    ["readable merge", "gh pr merge 999 --squash"],
+    ["admin merge", "gh pr merge 999 --admin"],
+    ["spliced verb", "gh pr m$'e'rge 99900010 --admin"],
+    ["quoted group word", 'gh "pr" m$`printf e`rge 99900010'],
+    ["comment AND merge", "gh issue comment 1 --body-file /tmp/x.md && gh pr merge 2"],
+    ["comment AND push", "gh pr comment 1 --body-file /tmp/x.md; git push origin main"],
+    ["push INSIDE a substitution in the body", 'gh pr comment 1 --body "$(git push)"'],
+    ["git verb inside a heredoc body", "cat > /tmp/f.md <<'EOF'\ngit push origin main\nEOF\ngh pr comment 1 --body-file /tmp/f.md"],
+    ["var-supplied verb", 'V="pr merge"; gh $V 999 --admin'],
+    // Round 1 and round 2 findings (fresh-context reviews) — every one measured as a fail-open
+    // before it was fixed, and each is now a row here so the spelling class cannot come back.
+    ['git -C push in a substitution', 'gh pr comment 1 --body "$(git -C /wt push)"'],
+    ['git global option before the verb', 'gh pr comment 1 --body "$(git --no-pager push)"'],
+    ['quote-spliced command word in a body', 'gh pr comment 1 --body "$(\'git\' push)"'],
+    ['opener hidden inside a # comment', 'gh pr comment 1 --body-file /tmp/f.md  # cat <<\'EOF\'\ngh --repo o/r pr merge 9\nEOF'],
+    [';# comment opener hides an executed merge', 'gh pr comment 1 --body-file /tmp/x.md;# cat <<\'EOF\'\ngh -R o/r pr merge 9 --squash\nEOF'],
+    ['a heredoc handed to sh is a script', 'sh <<\'EOF\'\ngh -R o/r pr merge 9 --squash\nEOF\ngh pr comment 1 --body-file /tmp/x.md'],
+    ['bare git -C push is a shipping op', 'git -C /wt push origin main'],
+    ['bare git --no-pager push', 'git --no-pager push origin main'],
+    ['git -c k=v commit', 'git -c user.x=1 commit -am x'],
+    ['comment AND git -C push', 'gh pr comment 1 --body-file /tmp/x.md && git -C /wt push origin main'],
+    // Round 3: the mask's proof that a body is DATA is line-local, so these four shapes EXECUTE
+    // the body while the opener line still looks like `cat >`. Each measured, each now pinned.
+    ['continuation hides a pipe into sh', 'cat <<\'EOF\' \\\n| sh\ngit -C /wt push origin HEAD:main\nEOF'],
+    ['process substitution in the remainder', 'cat <<\'EOF\' > >(sh)\ngit -C /wt push origin HEAD:main\nEOF'],
+    ['process substitution in the prefix', 'tee >(sh) <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF'],
+    ['redirect plus process substitution', 'cat <<\'EOF\' 1> >(bash -s)\ngit -C /wt push origin HEAD:main\nEOF'],
+  ] as Array<[string, string]>) {
+    equal(isGitOp(command), true, `${label}: must keep the floor`);
+  }
 });
 
 // ── Summary ───────────────────────────────────────────
