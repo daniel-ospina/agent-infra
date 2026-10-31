@@ -1802,12 +1802,36 @@ wt_count() {
 # The env snapshot: everything the controller exports, plus O (which the controller sets but does
 # NOT export — a worker falling back to $HOME/orchestrator is how a box silently runs a different
 # harness). Mode 0600 and removed with the worker: it carries the same secrets as the cell's keys.env.
+#
+# ⛔ THE uv PIN IS EMITTED AFTER `export -p`, AND THAT POSITION IS THE WHOLE POINT (agent-infra#2159).
+# A lane is the process that runs `uv sync`, so it is the one that decides whether a worktree's `.venv`
+# is hardlinked to the cache or MATERIALISED as a full copy (~5.8 GB measured on a cold-cache cell).
+# `export -p` carries whatever the CONTROLLER happened to have; on a box where nobody pinned the cache
+# that is nothing, and a cold cache is then invisible: measured, cell-3 went 17 GB free -> 257 MB free
+# in ~50 minutes as its lanes synced. Emitting the pin LAST means an operator's value in the
+# controller's environment still WINS (`uv_env_apply` only fills what is unset), while a box that
+# never set it gets the repo's default instead of the filesystem's accident.
+# The helper is a SIBLING file; if it cannot be read the two lines below are emitted from the same
+# one-line formula rather than dropped — a worker must never be launched into a different cost regime
+# because a helper went missing, and a silent drop here is exactly the failure this pin exists for.
+wt_uv_env_lines() {
+  local here helper
+  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+  helper="$here/uv-env.sh"
+  if [ -n "$here" ] && [ -r "$helper" ]; then
+    UV_CACHE_DIR="${UV_CACHE_DIR:-}" UV_LINK_MODE="${UV_LINK_MODE:-}" bash -c '. "$1" >/dev/null 2>&1; uv_env_export_lines' _ "$helper" 2>/dev/null && return 0
+  fi
+  wt_warn "uv-env.sh not readable beside worker-terminal.sh — emitting the cache/link-mode pin from the inline default (the pin itself is not optional, agent-infra#2159)"
+  printf 'export UV_CACHE_DIR=%s\n' "$(wt_q "${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}")"
+  printf 'export UV_LINK_MODE=%s\n' "$(wt_q "${UV_LINK_MODE:-hardlink}")"
+}
+
 wt_env_snapshot() { # <name> -> prints the path
   local dir f
   dir="$(wt_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   f="$dir/env-$1.sh"
   ( umask 077
-    { export -p; printf 'export O=%s\n' "$(wt_q "${O:-}")"; } > "$f" ) 2>/dev/null || return 1
+    { export -p; printf 'export O=%s\n' "$(wt_q "${O:-}")"; wt_uv_env_lines; } > "$f" ) 2>/dev/null || return 1
   chmod 600 "$f" 2>/dev/null || true
   printf '%s\n' "$f"
 }
