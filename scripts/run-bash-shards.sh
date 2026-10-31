@@ -570,10 +570,9 @@ echo "── hermetic suites ─────────────────
 # hermetic contract is stated rather than inherited.
 shard_array=()
 while IFS= read -r shard; do
-  # Drop a line with no non-blank text: it is not a path, so it is neither counted nor queued. The
-  # predicate is the SAME CLASS as `listed`'s `awk 'NF'` above — deliberately not literally identical
-  # (bash's `[[:space:]]` also covers CR/VT/FF, which awk's default FS does not); that residue is
-  # fail-closed, and the check below says how.
+  # Drop a line with no non-blank text: it is not a path, so it is neither counted nor queued. Not
+  # literally identical to `listed`'s `awk 'NF'` (bash's `[[:space:]]` also covers CR/VT/FF) — the
+  # assertion below says why that difference cannot start a run either way.
   [ -n "${shard//[[:space:]]/}" ] || continue
   shard_array+=("$shard")
 done <<<"$shard_paths"
@@ -588,13 +587,20 @@ done <<<"$shard_paths"
 #   * The net that NAMES an un-reached shard is the end-of-run set difference below
 #     (`shard_unaccounted`, a `comm -23` of the derived list against the two logs) — what the 8ap
 #     mutant exercises, not this.
-# What remains is a cheap INVARIANT between two derivations of ONE list, and it fails CLOSED: refuse
-# to start rather than run a list the count does not describe. Its only reachable trigger is a
-# REFACTOR that moves one predicate and not the other — the present pair can already diverge on a
-# CR-only line (`awk 'NF'` counts it, bash's `[[:space:]]` strips it), and that divergence exits 1
-# here instead of starting a run.
+# What remains is a DEFENSIVE ASSERTION, and it fails CLOSED (exit 1 below, before the first shard
+# runs). ⛔ Do NOT look for a live trigger — there is none, and asserting one is what this block got
+# wrong twice already. Given the current derivation, this comparison CANNOT fire: `shard_discover`
+# (`:147`) emits only glob-matched paths that passed `[ -f "$f" ]`, the containment loop above
+# re-verifies each is a real file inside the checkout, and the read above is in-process — so no line
+# reaching it can be blank and no line can be lost. It is kept for the case where that CONTRACT
+# changes (a derivation that can emit a non-path, or a read that becomes an external process), and a
+# firing means "the derivation or the read changed", never "a shard is missing". The arm that names a
+# missing shard is the end-of-run set difference (`shard_unaccounted`), and it is proven by the 8ap
+# mutant. The predicates are not identical either way — bash's `[[:space:]]` covers CR/VT/FF where
+# awk's default FS does not — which is why this is a comparison of two derivations and not a tautology
+# to be deleted.
 if [ "${#shard_array[@]}" -ne "$listed" ]; then
-  echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run (a skip predicate moved on one side only). Refusing to start."
+  echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run. Refusing to start (this is a DERIVATION or READ change, not a missing shard: the end-of-run set difference names those)."
   exit 1
 fi
 for shard in ${shard_array[@]+"${shard_array[@]}"}; do
