@@ -3148,7 +3148,7 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
     # `pr_owned` call and this one, or a claim caught mid-creation) the arms SPAWNED A SECOND WORKER on
     # a live claim and logged it as a release. Only rc=1 is a release.
     # ⛔ AND AN OWNED VERDICT THAT REPORTS A DESTRUCTION IS NOT DISCARDED (review of #3096, P2-3). rc 0 is
-    # "owned", so the old one-liner threw `_v` away — but two of `pl_verdict`'s OWNED sentences exist ONLY
+    # "owned", so the old one-liner threw `_v` away — but three of `pl_verdict`'s OWNED sentences exist ONLY
     # to be read: a claim this pass detached and could not put back (`peer may be working blind`), and a
     # record that vanished mid-reclaim. Leaving no artifact for those is the "process claim with no
     # evidence" class this file bans, and `fix-one.sh`'s equivalent outcome writes a WARNING line.
