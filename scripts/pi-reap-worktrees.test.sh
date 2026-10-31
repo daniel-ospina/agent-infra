@@ -107,6 +107,30 @@
 #   prune-block scope        A23  (a present-dir revocable-ref row must NOT set
 #                                PRUNE_BLOCKED — the commit is held by a ref, so
 #                                deregistering the admin record cannot orphan it)
+#   ⛔ #3041 — THE REMOTE IS THE EVIDENCE, NOT THE FETCH CACHE
+#   remote-holds REMOVE      A26a (a clean checkout whose tip the REMOTE still advertises
+#                                (bounded `git ls-remote`) is REMOVE-eligible with
+#                                reason=remote-holds:<r>/<b>; --apply removes it, the
+#                                local cache is then destroyed, and the commit is
+#                                FETCHED BACK — the claim is proved, not asserted)
+#   remote-holds PRESERVE    A26b (remote branch deleted / remote sha MISMATCH (stale
+#                                cache) / probe FAILS / probe TIMES OUT => reason stays
+#                                remote-only-ref, nothing removed, and the pass is not
+#                                vacuously "nothing to do")
+#   remote-holds prunes      A26c (a remote-holds row does NOT block the path-filterless prune —
+#                                the tracking ref still holds the commit, F7/A23; pinned for BOTH
+#                                the REMOVE row (`reason=`) and the PRESERVE row (`refs=`), the
+#                                second of which blocks the `prunable` reclaim for a whole
+#                                aged-days floor if the reason alone is allowed to gate it)
+#   pass verdict             A27  (an armed pass that EXAMINES a population, removes NONE
+#                                and sits under the disk floor RECORDS
+#                                $STATE_DIR/reap-ineffective + verdict=reap-ineffective;
+#                                above the floor / small population / dry run /
+#                                unmeasurable disk each read their own verdict, a
+#                                deferral-heavy pass still reads reap-ineffective (it
+#                                examined the population even though it decided little), and
+#                                the stale file is cleared by any pass that clears the
+#                                condition)
 
 set -uo pipefail
 
@@ -457,17 +481,84 @@ for a in "$@"; do
 done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+cat >"$T/bin/git-lsremote-fail" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26c: fails `ls-remote` ONLY (the #3041 remote-holds probe).
+# Everything else is the real git, so the fixture's other probes answer normally
+# and the pass must fall through to `remote-only-ref` — a probe that cannot run
+# is NEVER a removal.
+for a in "$@"; do [ "$a" = "ls-remote" ] && exit 128; done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+cat >"$T/bin/git-lsremote-hang" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26d: `ls-remote` never returns, so the probe blows its
+# watchdog (REAP_WT_GIT_TIMEOUT=1 in that fixture) with rc 124. A network probe
+# that hangs must read as PRESERVE, and it must do so FAST — an unbounded one
+# would hang the pass that exists to unblock the box.
+for a in "$@"; do [ "$a" = "ls-remote" ] && { sleep "${FAKE_LSREMOTE_SLEEP:-8}"; exit 0; }; done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+# ⛔ `ls-remote` COUNTERS for A26g — the dead-remote cache (#3041) is load-bearing and had NO
+# fixture (review of #3058, P2). The cache is a FILE because the probe runs inside a command
+# substitution, so no in-process variable survives; and it only matters when a pass has MORE THAN
+# ONE candidate that reaches the probe. Counting the shims' invocations is what discriminates
+# "one timeout per remote per pass" from "one per candidate": with the same fixture and a WORKING
+# `ls-remote` both candidates are counted (2), and with a FAILING one the second is suppressed (1).
+for _shim in git-lsremote-count git-lsremote-fail-count; do
+cat >"$T/bin/$_shim" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26g: count each `ls-remote` and then either answer it for
+# real (git-lsremote-count) or fail it the way a dead transport does
+# (git-lsremote-fail-count). COUNTING is the point — the verdict is identical
+# either way, so only the invocation count can tell the cache apart from
+# "no cache" (which costs one REAP_WT_GIT_TIMEOUT per candidate).
+for a in "$@"; do
+    if [ "$a" = "ls-remote" ]; then
+        c=0
+        [ -n "${FAKE_LSREMOTE_COUNTER:-}" ] && [ -f "$FAKE_LSREMOTE_COUNTER" ] && c="$(cat "$FAKE_LSREMOTE_COUNTER")"
+        c=$((c + 1))
+        [ -n "${FAKE_LSREMOTE_COUNTER:-}" ] && printf '%s\n' "$c" >"$FAKE_LSREMOTE_COUNTER"
+        case "$0" in *fail-count) exit 128 ;; esac
+        break
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+done
+# DF_BIN shims for the pass-verdict fixtures (#3041). `df -Pm` prints a POSIX
+# table whose second line's 4th field is Available; these pin BOTH the parse and
+# the two branches it feeds, without depending on the host's real free space.
+cat >"$T/bin/df-low" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' 'Filesystem 1048576-blocks Used Available Capacity Mounted on'
+printf '%s\n' '/dev/fake 100000 99900 100 100% /tmp'
+SHIM
+cat >"$T/bin/df-roomy" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' 'Filesystem 1048576-blocks Used Available Capacity Mounted on'
+printf '%s\n' '/dev/fake 100000 20000 80000 20% /tmp'
+SHIM
+cat >"$T/bin/df-fail" <<'SHIM'
+#!/usr/bin/env bash
+# `df` that cannot answer (a dead mount, a missing binary). The verdict must read
+# UNMEASURED — never "plenty of room", which is the fail-open direction.
+exit 1
+SHIM
 chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
          "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" "$T/bin/git-fail-remote-probe" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
          "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status" "$T/bin/git-race-delete-a25" \
          "$T/bin/git-list-fail-after-probes" "$T/bin/git-empty-list" "$T/bin/comm" \
-         "$T/bin/git-fail-stash-log"
+         "$T/bin/git-fail-stash-log" \
+         "$T/bin/git-lsremote-fail" "$T/bin/git-lsremote-hang" \
+         "$T/bin/git-lsremote-count" "$T/bin/git-lsremote-fail-count" \
+         "$T/bin/df-low" "$T/bin/df-roomy" "$T/bin/df-fail"
 
 # ── fixture builders ───────────────────────────────────────────────────
-mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
-    local envname="$1" d="$T/$1/repo"
+mk_repo() { # <env-name> [<subdir>] -> prints the repo path (one OLD commit on `main`)
+    local envname="$1" d="$T/$1/${2:-repo}"
     mkdir -p "$d" "$T/$1/home" "$T/$1/state"
     "$REAL_GIT" init -q -b main "$d"
     "$REAL_GIT" -C "$d" config user.email t@t
@@ -508,6 +599,17 @@ run_reaper() {
     # network round trip that would make a fixture's verdict depend on the host's connectivity and the
     # remote's state. `local` is the documented test seam; the `auto` path has its own coverage in the
     # disk-reaper suite (T3), against a LOCAL bare origin.
+    #
+    # ⛔ NO COMMENT LINES ANYWHERE BELOW THIS POINT (until the closing `bash "$REAPER"`). The list
+    # below is ONE backslash-continued command: a `#` on a joined logical line starts a COMMENT, which
+    # ends the env prefix there. The assignments before it then become plain shell variables — and a
+    # name that was never exported (every REAP_WT_* seam) is NOT inherited by the child, so the reaper
+    # silently falls back to its defaults and the real clock (strace, 2026-10-29: the log went to
+    # `$HOME/.pi/agent/state/…` instead of `$T/$env/reap.log`, and 164 assertions failed).
+    # #3041 seams: the free-space witness DEFAULTS to a healthy number so every existing fixture stays
+    # hermetic (no `df` on the host's real state, no verdict firing by accident); a fixture that wants
+    # the probe sets REAP_WT_FREE_MB_OVERRIDE="" (empty = "measure it") and points DF_BIN_OVERRIDE at a
+    # shim. `${VAR-default}`, not `${VAR:-default}`: SET-BUT-EMPTY is a real, meaningful value here.
     HOME="$T/$envname/home" \
     PATH="$T/bin:$PATH" \
     REAP_WT_STATE_DIR="${REAP_WT_STATE_DIR_OVERRIDE:-$T/$envname/state}" \
@@ -530,6 +632,11 @@ run_reaper() {
     REAP_WT_GH_TIMEOUT="${REAP_WT_GH_TIMEOUT:-20}" \
     REAP_WT_REMOVE_TIMEOUT="${REAP_WT_REMOVE_TIMEOUT:-120}" \
     REAP_WT_GIT_TIMEOUT="${REAP_WT_GIT_TIMEOUT:-20}" \
+    REAP_WT_FREE_MB="${REAP_WT_FREE_MB_OVERRIDE-999999}" \
+    REAP_WT_DISK_FLOOR_MB="${REAP_WT_DISK_FLOOR_MB_OVERRIDE:-4096}" \
+    REAP_WT_INEFFECTIVE_MIN_EXAMINED="${REAP_WT_INEFFECTIVE_MIN_EXAMINED_OVERRIDE:-10}" \
+    REAP_WT_DF_TIMEOUT="${REAP_WT_DF_TIMEOUT_OVERRIDE:-15}" \
+    DF_BIN="${DF_BIN_OVERRIDE:-df}" \
     REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}" \
     BOUNDED_LIB="$T/lib/bounded.sh" \
     PS_BIN="${PS_BIN_OVERRIDE:-$T/bin/ps}" \
@@ -557,6 +664,7 @@ run_reaper() {
     FAKE_LATE_COUNTER="${FAKE_LATE_COUNTER:-}" \
     FAKE_LATE_ON="${FAKE_LATE_ON:-1}" \
     FAKE_STATUS_COUNTER="${FAKE_STATUS_COUNTER:-}" \
+    FAKE_LSREMOTE_COUNTER="${FAKE_LSREMOTE_COUNTER:-}" \
     FAKE_SLOW_STATUS_ON="${FAKE_SLOW_STATUS_ON:-2}" \
     FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-3}" \
     DU_CANARY="${DU_CANARY:-}" \
@@ -685,6 +793,22 @@ register_stash() {
         "$("$REAL_GIT" -C "$1" rev-parse "refs/heads/$2")"
 }
 footer() { tail -1 "$T/$1/reap.log" 2>/dev/null; }
+
+# verdict_path <env> <repo> — the per-repo record `reap_verdict_path()` computes in the reaper.
+# ⛔ IT MIRRORS THE SCRIPT, so every fixture also asserts the reaper's own `record=<path>` log line
+# against it — a drift between this copy and the script then fails loudly instead of quietly testing a
+# path nothing writes (the #3041 review found the record was ONE fixed filename, i.e. last-writer-wins
+# across the repos `disk-reaper.sh` feeds it; this helper is what makes that testable).
+verdict_path() {
+    local base sum
+    # ⛔ STRIP THE NEWLINE FIRST — `basename | tr -c … '_'` maps the newline itself to `_`, so the
+    # obvious one-liner produces `repo_` while the reaper produces `repo`, and every assertion then
+    # tests a path nothing writes. The reaper's derivation is two steps for exactly this reason.
+    base="$(basename "$2")"
+    base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
+    sum="$(printf '%s' "$2" | cksum | awk '{ print $1 }')"
+    printf '%s/%s/state/reap-ineffective.%s.%s\n' "$T" "$1" "${base:-repo}" "${sum:-0}"
+}
 
 echo "── pi-reap-worktrees.test.sh ─────────────────────────────────────"
 echo "gate fixtures (each drives ONE gate to its fail path)"
@@ -1699,6 +1823,14 @@ assert_contains "$(row_for "$OUT" "$WT_A19B")" "reason=reclaimable" \
 # gc-eligible and no record of it is left. The reaper must therefore only accept
 # a ref `fetch --prune` cannot touch; a remote-tracking-only holder is PRESERVE
 # with the revocable ref NAMED, so the operator can judge it.
+# ⛔ #3041 RE-SCOPED THIS FIXTURE, DELIBERATELY. The remote branch is deleted
+# BEFORE the pass. With it still present, the one bounded `git ls-remote` the
+# reaper now runs proves the REMOTE holds this head, and the row becomes
+# REMOVE-eligible (`remote-holds:…`, pinned by A26a). That is the whole point of
+# #3041 — the local tracking ref is a CACHE, and a remote that still advertises
+# the sha is a real survival mechanism. What A20 pins is the case #3041 does NOT
+# relax: the remote no longer has the branch (deleted, or never pushed), so the
+# probe answers nothing and the pre-existing revocable-ref verdict stands.
 ENV=A20; REPO="$(mk_repo $ENV)"
 BARE="$T/$ENV/remote.git"
 "$REAL_GIT" init -q --bare "$BARE"
@@ -1710,6 +1842,8 @@ A20_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
 "$REAL_GIT" -C "$REPO" checkout -q main
 "$REAL_GIT" -C "$REPO" branch -D tmp-a20 >/dev/null
 "$REAL_GIT" -C "$REPO" fetch -q upstream
+# the REMOTE branch is gone; the LOCAL tracking ref (a cache) still holds the sha
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a20
 WT_A20="$T/$ENV-det"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A20" "$A20_SHA"
 # precondition: the ONLY holder of that commit is the remote-tracking ref
@@ -1717,6 +1851,8 @@ assert_contains "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A20_SHA" --f
     "refs/remotes/upstream/feat/a20" "A20 precondition: the commit is held by a remote-tracking ref"
 assert_absent "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A20_SHA" --format='%(refname)')" \
     "refs/heads/" "A20 precondition: no LOCAL ref holds it (that is the point)"
+assert_absent "$("$REAL_GIT" -C "$BARE" for-each-ref --format='%(refname)')" \
+    "feat/a20" "A20 precondition: the REMOTE no longer has the branch (so the probe must fall through)"
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_A20")" "reason=remote-only-ref" \
     "A20 a remote-tracking-only holder => PRESERVE (never a removal on a revocable ref)"
@@ -1724,13 +1860,15 @@ assert_contains "$(row_for "$OUT" "$WT_A20")" "refs/remotes/upstream/feat/a20" \
     "A20 the revocable ref is NAMED so the operator can judge it"
 assert_absent "$(row_for "$OUT" "$WT_A20")" "reason=reclaimable" \
     "A20 it is NOT classified reclaimable on a remote-tracking ref"
+assert_absent "$(row_for "$OUT" "$WT_A20")" "remote-holds:" \
+    "A20 the probe did NOT claim the remote holds it (it does not)"
 OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A20 --apply exits 0 (a preserve is not a failure)"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A20 --apply removed nothing"
 assert_dir "$WT_A20" "A20 --apply left the checkout on disk"
 # the falsifier, run for real: the ref this fixture would have relied on IS
-# revocable — deleting the remote branch and pruning takes the commit to NO ref
-"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a20
+# revocable — pruning takes the commit to NO ref (the remote branch is already
+# deleted above; `fetch --prune` now drops the stale local tracking ref)
 "$REAL_GIT" -C "$REPO" fetch -q --prune upstream
 assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A20_SHA" --format='%(refname)' | wc -l | tr -d ' ')" "0" \
     "A20 falsifier: after \`fetch --prune\` the commit is on NO ref — the old 'survival' was revocable"
@@ -1884,6 +2022,14 @@ assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A22_SHA" --format=
 # commit (the ref holds it) — unlike detached-unreachable, where the record's
 # HEAD is the last handle. Blocking on it made one long-lived remote-only row
 # disable the whole `prunable` reclaim path on every later pass.
+# ⛔ #3041 KEEPS THIS PROPERTY AND SHARPENS IT. The remote branch is deleted
+# before the pass so the row stays `remote-only-ref` (a remote that still
+# advertised the sha would make it `remote-holds` — which does NOT block either:
+# #3041 keeps the reason-independent decision, and A26c/A26c2 pin BOTH the REMOVE
+# (`reason=`) and the PRESERVE (`refs=`) row as non-blocking. A26f is the
+# slashed-remote-NAME leg, not this one). The two fixtures together are the whole
+# distinction: same local refs, same prune armed, opposite verdict, and the deciding
+# fact is whether an `ls-remote` could prove the remote holds the commit.
 ENV=A23; REPO="$(mk_repo $ENV)"
 BARE="$T/$ENV/remote.git"
 "$REAL_GIT" init -q --bare "$BARE"
@@ -1895,6 +2041,7 @@ A23_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
 "$REAL_GIT" -C "$REPO" checkout -q main
 "$REAL_GIT" -C "$REPO" branch -D tmp-a23 >/dev/null
 "$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a23   # the remote no longer holds it
 WT_A23A="$T/$ENV-present"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A23A" "$A23_SHA"
 WT_A23B="$(add_named_wt "$REPO" "$ENV-gone" feat/a23-gone)"
@@ -1980,6 +2127,9 @@ assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A24_SHA" --format=
 # preserved as `remote-only-ref`, its admin HEAD is the commit's last DURABLE
 # handle, so the prune ORPHANS the commit: the F9 class through a window the
 # snapshot cannot see. The shim removes the live checkout at its own refs probe.
+# ⛔ #3041: the remote branch is deleted first, so the live row is still a
+# `remote-only-ref` PRESERVE (a remote that still held the sha would make it
+# `remote-holds` and the pass would remove it instead — A26a covers that).
 ENV=A25; REPO="$(mk_repo $ENV)"
 BARE="$T/$ENV/remote.git"
 "$REAL_GIT" init -q --bare "$BARE"
@@ -1991,6 +2141,7 @@ A25_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
 "$REAL_GIT" -C "$REPO" checkout -q main
 "$REAL_GIT" -C "$REPO" branch -D tmp-a25 >/dev/null
 "$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a25   # the remote no longer holds it
 WT_A25X="$T/$ENV-live"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A25X" "$A25_SHA"
 WT_A25Y="$(add_named_wt "$REPO" "$ENV-gone" feat/a25-gone)"
@@ -3322,6 +3473,557 @@ assert_dir "$WT_LAT_TRAP" \
     "G2721o …but a LATER failed re-read still PRESERVES: one transient failure must not disarm the guard"
 assert_contains "$OUT" "(live-probe-unavailable)" \
     "G2721o …and names the probe it lost, so the preservation is explainable"
+
+echo ""
+echo "── #3041: the remote-holds probe (a fetch CACHE is not the only copy) ──"
+
+# ── A26a: the REMOTE holds this HEAD => REMOVE, and the claim is PROVED ─
+# MEASURED 2026-10-29 on pi-cell-4: `examined=52 classified=52 remove=0 preserved=52`,
+# every row held only by refs/remotes/*, and the box then reached 0 bytes free — so no
+# cell could dispatch a worker and the repo went ~13 h with no landing. The allowlist was
+# answering "is this local ref removable by `fetch --prune`?" when the question a removal
+# owes is "can this commit still be recovered after the checkout is gone?". One bounded
+# `ls-remote` answers THAT, and this fixture proves the answer by taking it: the checkout
+# is removed, the local cache is then destroyed, and the commit is fetched BACK from the
+# remote.
+ENV=A26a; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26a
+commit_in_wt "$REPO" "$OLD_DATE" a26a
+A26A_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a26a:refs/heads/feat/a26a
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26a >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A26A="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26A" "$A26A_SHA"
+assert_contains "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26A_SHA" --format='%(refname)')" \
+    "refs/remotes/upstream/feat/a26a" "A26a precondition: the only local holder is a remote-tracking ref"
+assert_absent "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26A_SHA" --format='%(refname)')" \
+    "refs/heads/" "A26a precondition: no LOCAL branch holds it"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26a)" "$A26A_SHA" \
+    "A26a precondition: the REMOTE points its branch at exactly this HEAD"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26A")" "remove" \
+    "A26a a checkout whose tip the REMOTE still advertises is REMOVE-eligible (was: preserved forever)"
+assert_contains "$(row_for "$OUT" "$WT_A26A")" "reason=remote-holds:upstream/feat/a26a" \
+    "A26a the reason NAMES the remote and branch the removal was proved against"
+assert_contains "$(row_for "$OUT" "$WT_A26A")" "refs=remote-holds:upstream/feat/a26a" \
+    "A26a the survival evidence is carried on the row"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A26a --apply exits 0"
+assert_contains "$(footer $ENV)" "REMOVED=1" "A26a --apply removed the checkout"
+assert_nodir "$WT_A26A" "A26a the checkout is gone from disk"
+assert_contains "$OUT" "verdict=reclaimed" "A26a the pass verdict says it RECLAIMED (not 'idle')"
+# ⛔ THE CLAIM, PROVED RATHER THAN ASSERTED: destroy the local cache, then get the
+# commit back from the remote.
+"$REAL_GIT" -C "$REPO" update-ref -d refs/remotes/upstream/feat/a26a
+if "$REAL_GIT" -C "$REPO" rev-parse --verify -q refs/remotes/upstream/feat/a26a >/dev/null 2>&1; then
+    bad "A26a the local tracking ref survived its own deletion (fixture is broken)"
+else
+    ok "A26a the local cache is GONE — nothing local names the commit any more"
+fi
+"$REAL_GIT" -C "$REPO" fetch -q upstream "+refs/heads/feat/a26a:refs/remotes/upstream/feat/a26a"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse refs/remotes/upstream/feat/a26a 2>/dev/null)" "$A26A_SHA" \
+    "A26a 'git fetch upstream feat/a26a' restores the exact commit after the checkout is gone"
+# …and independently of THIS repo's object database, so the proof is about the REMOTE.
+"$REAL_GIT" clone -q --bare "$BARE" "$T/$ENV/second"
+if "$REAL_GIT" -C "$T/$ENV/second" cat-file -e "$A26A_SHA^{commit}" 2>/dev/null; then
+    ok "A26a a FRESH clone of the remote has the commit — the remote is the durable copy"
+else
+    bad "A26a a fresh clone of the remote does NOT have the commit — the removal lost it"
+fi
+
+# ── A26b: every way the probe can FAIL still PRESERVES (fail-closed) ────
+# The new arm only ever REMOVES on proof. Each of these is a different way the proof
+# cannot be taken, and each must leave the pre-#3041 verdict untouched.
+ENV=A26b; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26b
+commit_in_wt "$REPO" "$OLD_DATE" a26b
+A26B_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a26b:refs/heads/feat/a26b
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26b >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A26B="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26B" "$A26B_SHA"
+# (1) the remote branch is DELETED: the local tracking ref is stale, and a stale cache is
+#     not evidence. This is the direction that must never become a removal.
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a26b
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
+    "A26b remote branch deleted => PRESERVE, reason unchanged"
+assert_absent "$(row_for "$OUT" "$WT_A26B")" "remote-holds:" \
+    "A26b …and nothing claims the remote holds it"
+# (2) the remote HAS the branch name, but at a DIFFERENT sha (a force-push): the local
+#     cache lied in the other direction. A branch NAME is not a commit.
+#     ⛔ Write the bare repo's ref DIRECTLY. A `git push` into it ALSO moves the local
+#     tracking ref `refs/remotes/upstream/feat/a26b` (a push updates the upstream's
+#     remote-tracking ref), which destroys this fixture's premise — the tip would then be held
+#     by nothing at all and the arm would test `detached-unreachable` instead of the mismatch.
+#     The premise is asserted immediately after, so that mistake cannot be silent again.
+"$REAL_GIT" -C "$BARE" update-ref refs/heads/feat/a26b "$("$REAL_GIT" -C "$REPO" rev-parse main)"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26b)" "$("$REAL_GIT" -C "$REPO" rev-parse main)" \
+    "A26b precondition: the remote branch now points somewhere else"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse refs/remotes/upstream/feat/a26b)" "$A26B_SHA" \
+    "A26b precondition: the local tracking ref still holds the old sha (the premise survives)"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
+    "A26b remote sha MISMATCH => PRESERVE (a branch name is not proof of the commit)"
+# (3) the probe FAILS. (4) the probe HANGS past its watchdog.
+#     ⛔ THE REMOTE IS RESTORED FIRST (#3041 review, P2). While the remote points at a DIFFERENT
+#     sha, a perfectly working `ls-remote` already yields `remote-only-ref` at the awk's `$1 == sha`
+#     test — so the two arms below would pass with the `rc != 0` path INVERTED or DELETED. With the
+#     remote pointing at THIS HEAD again, the ONLY thing left that can produce `remote-only-ref` is
+#     the failure/timeout arm, so each leg discriminates its own path.
+"$REAL_GIT" -C "$BARE" update-ref refs/heads/feat/a26b "$A26B_SHA"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26b)" "$A26B_SHA" \
+    "A26b precondition: the remote holds this HEAD again (a working probe WOULD now claim proof)"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-lsremote-fail" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
+    "A26b a FAILING probe => PRESERVE (fail-closed, never a removal)"
+# The hang leg also measures that the WATCHDOG is what ended the probe: the shim sleeps 30 s, so a
+# pass that returned in under 20 s cannot have waited for it. Without this the leg is satisfied by a
+# probe that hangs and is then ignored — the property is "bounded", not "unbounded but correct".
+# ⛔ `REAP_WT_GIT_TIMEOUT` IS GLOBAL FOR THE PASS, NOT PER-PROBE (#3058 review, P2). This leg used to
+# set it to 1 s, which also bounded EVERY other git call the same record makes (`for-each-ref
+# --contains`, `merge-base`, `log -1`, `cherry`) — so on a loaded box any ONE of them returning 124
+# made `commits_survive` answer "" and the row read `detached-unreachable`, failing the assertion below
+# for a reason that has nothing to do with the probe (a plausible contributor to the "load-sensitive,
+# no mechanism established" runs this PR's body records). 5 s still ends the 30 s shim by the watchdog,
+# and is enough headroom that only a genuinely wedged git call can hit it. The elapsed bound (20 s)
+# keeps the two implementations apart: 5 < 20 < 30.
+A26B_T0=$SECONDS
+OUT="$(FAKE_LSREMOTE_SLEEP=30 REAP_WT_GIT_TIMEOUT=5 GIT_BIN_OVERRIDE="$T/bin/git-lsremote-hang" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+A26B_HANG_S=$((SECONDS - A26B_T0))
+assert_contains "$(row_for "$OUT" "$WT_A26B")" "reason=remote-only-ref" \
+    "A26b a TIMED-OUT probe => PRESERVE"
+if [ "$A26B_HANG_S" -lt 20 ]; then
+    ok "A26b …and the WATCHDOG ended it (${A26B_HANG_S}s, the shim sleeps 30) — an unbounded probe would hang the pass"
+else
+    bad "A26b the probe was not bounded by REAP_WT_GIT_TIMEOUT (${A26B_HANG_S}s elapsed, the shim sleeps 30)"
+fi
+# NON-VACUITY: the pass must not have collapsed into "nothing to do" — the record is
+# really examined and classified.
+assert_contains "$OUT" "examined=2 classified=2" \
+    "A26b non-vacuity: the record WAS examined and classified (not silently skipped)"
+# The ARMED pass must not remove it either — so put the remote back in the state the fail-closed
+# arms were proved in (the branch is gone), not the one the discrimination step needed. Without this
+# the probe SUCCEEDS and the armed pass removes the checkout, which is the A26a direction, not this
+# fixture's claim.
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a26b
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A26b --apply exits 0 (a preserve is not a failure)"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A26b --apply removed nothing"
+assert_dir "$WT_A26B" "A26b the checkout is still on disk"
+
+# ── A26g: the DEAD-REMOTE CACHE — load-bearing, and until now pinned by NOTHING (#3058 review, P2)
+# `remote_is_dead`/`remote_mark_dead` had ZERO fixture coverage. A26b cannot supply it, and its own ⛔
+# note says why: its fixture has exactly TWO records, the main checkout (preserved by the
+# main-checkout gate BEFORE `commits_survive`) and ONE detached worktree — so exactly one record ever
+# reaches the probe, and "one timeout per remote per pass" is behaviourally IDENTICAL to "one per
+# candidate" there. The cache is the difference between a dead transport costing ONE
+# REAP_WT_GIT_TIMEOUT (20 s) and one PER CANDIDATE: on the 52-candidate population this PR was written
+# from, 52 x 20 s blows the 300 s REAP_WT_BUDGET_SECONDS, the tail defers, `PRUNE_BLOCKED=1`, and the
+# pass reclaims nothing — the F7 "a reaper that silently never reaps" state #3041 exists to end.
+# So this fixture is the smallest one that can tell the two implementations apart: TWO probe-reaching
+# candidates, and a COUNTING `ls-remote` whose invocation count is the verdict. The rows are the same
+# in both legs by design — only the count moves.
+ENV=A26g; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+WT_A26G1=""; WT_A26G2=""
+for _g in 1 2; do
+    "$REAL_GIT" -C "$REPO" checkout -q -b "tmp-a26g$_g"
+    commit_in_wt "$REPO" "$OLD_DATE" "a26g$_g"
+    _gsha="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+    "$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g$_g:refs/heads/feat/a26g$_g"
+    "$REAL_GIT" -C "$REPO" checkout -q main
+    "$REAL_GIT" -C "$REPO" branch -D "tmp-a26g$_g" >/dev/null
+    "$REAL_GIT" -C "$REPO" fetch -q upstream
+    "$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det$_g" "$_gsha"
+    # the remote branch is GONE, so the tip is held only by `refs/remotes/upstream/feat/a26g$_g`:
+    # this is the `remote-only-ref` class, and the probe is the ONLY thing that runs for it.
+    "$REAL_GIT" -C "$BARE" update-ref -d "refs/heads/feat/a26g$_g"
+    if [ "$_g" = 1 ]; then WT_A26G1="$T/$ENV-det$_g"; else WT_A26G2="$T/$ENV-det$_g"; fi
+done
+assert_eq "$("$REAL_GIT" -C "$REPO" worktree list | wc -l | tr -d ' ')" "3" \
+    "A26g precondition: main checkout + TWO detached worktrees"
+assert_eq "$("$REAL_GIT" -C "$BARE" for-each-ref refs/heads | wc -l | tr -d ' ')" "0" \
+    "A26g precondition: the remote advertises NO branch (both tracking refs are stale)"
+# (1) NON-VACUITY, and it has to come first: with a WORKING counting `ls-remote` every candidate that
+#     reaches the probe is counted. A cache that is never reached cannot be told apart from one that
+#     suppresses a call the fixture never made — this leg is what makes leg (2)'s `1` mean something.
+A26G_CNT_ALIVE="$T/$ENV/cnt-alive"; rm -f "$A26G_CNT_ALIVE"
+OUT="$(FAKE_LSREMOTE_COUNTER="$A26G_CNT_ALIVE" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-count" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(cat "$A26G_CNT_ALIVE" 2>/dev/null)" "2" \
+    "A26g non-vacuity: BOTH probe-reaching candidates really do call ls-remote (a working remote costs one call each)"
+assert_contains "$(row_for "$OUT" "$WT_A26G1")" "reason=remote-only-ref" \
+    "A26g candidate 1 PRESERVEs (stale tracking ref, remote branch gone)"
+assert_contains "$(row_for "$OUT" "$WT_A26G2")" "reason=remote-only-ref" \
+    "A26g candidate 2 PRESERVEs"
+assert_contains "$OUT" "examined=3 classified=3" \
+    "A26g non-vacuity: all three records were examined and classified (not silently skipped)"
+# (2) THE CACHE. Same fixture, same two candidates, a FAILING transport: the first probe marks the
+#     remote dead for the rest of the pass and the second candidate must not pay for another timeout.
+A26G_CNT_DEAD="$T/$ENV/cnt-dead"; rm -f "$A26G_CNT_DEAD"
+OUT="$(FAKE_LSREMOTE_COUNTER="$A26G_CNT_DEAD" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-fail-count" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(cat "$A26G_CNT_DEAD" 2>/dev/null)" "1" \
+    "A26g the dead-remote cache makes a FAILING remote cost ONE ls-remote for the WHOLE pass, not one per candidate (52 x 20s would exceed REAP_WT_BUDGET_SECONDS and reclaim nothing)"
+assert_contains "$(row_for "$OUT" "$WT_A26G1")" "reason=remote-only-ref" \
+    "A26g a FAILING probe => PRESERVE (fail-closed, never a removal)"
+assert_contains "$(row_for "$OUT" "$WT_A26G2")" "reason=remote-only-ref" \
+    "A26g …and candidate 2 PRESERVEs off the CACHED verdict rather than its own call"
+assert_contains "$OUT" "examined=3 classified=3" \
+    "A26g the cached verdict does not shrink the population (all three still examined)"
+
+# ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
+# This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:
+#   · block it, and a long-lived PRESERVE row (`no-pr`/`too-recent`/`too-young` rows carry
+#     `refs=remote-holds:` too, for up to the whole aged-days floor) disables the `prunable` reclaim
+#     path on every pass — F7's "a reaper that silently never reaps";
+#   · don't block it, and the F17 window (a record that becomes prunable MID-PASS, after a snapshot
+#     that saw it present) could be swept — except that window is closed for EVERY reason by the
+#     reason-independent pre-prune RE-READ (A25), which is the mechanism that is supposed to cover it.
+# So both legs below must hold in the SAME fixture family: the REMOVE row (`reason=`) and the
+# PRESERVE row (`refs=`). The second is the arm a fixture never reached before this review.
+ENV=A26c; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26c
+commit_in_wt "$REPO" "$OLD_DATE" a26c
+A26C_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a26c:refs/heads/feat/a26c
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26c >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A26C="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26C" "$A26C_SHA"
+# a second, GONE-dir record: it is a `remove/prunable` row, i.e. it ARMS the prune that a
+# blocking remote-holds row would have suppressed.
+WT_A26C_GONE="$(add_named_wt "$REPO" "$ENV-gone" feat/a26c-gone)"
+rm -rf "$WT_A26C_GONE"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26C")" "reason=remote-holds:upstream/feat/a26c" \
+    "A26c precondition: the present-dir row is a remote-holds REMOVE"
+assert_contains "$(row_for "$OUT" "$WT_A26C_GONE")" "reason=prunable" \
+    "A26c precondition: the gone-dir row arms the prune"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A26c --apply exits 0"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=0" \
+    "A26c a REMOVE remote-holds row does NOT block the prune (its tracking ref still holds the commit)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNED " \
+    "A26c …so the global prune RAN (the F7 defect is not re-opened one reason class over)"
+assert_absent "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A26C_GONE" \
+    "A26c …and the gone-dir record was deregistered as intended"
+assert_nodir "$WT_A26C" "A26c …and the proved-reclaimable checkout was removed"
+# leg 2 — a PRESERVE row carrying `refs=remote-holds:` (the arm no fixture reached): the age floor
+# keeps it, so the checkout STAYS, and a prune-blocking implementation would suppress the prune for
+# the whole floor's duration. `--aged-days 3650` makes the HEAD "not old enough" => too-recent.
+ENV=A26c2; REPO2="$(mk_repo $ENV)"
+BARE2="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE2"
+"$REAL_GIT" -C "$REPO2" remote add upstream "$BARE2"
+"$REAL_GIT" -C "$REPO2" checkout -q -b tmp-a26c2
+commit_in_wt "$REPO2" "$OLD_DATE" a26c2
+A26C2_SHA="$("$REAL_GIT" -C "$REPO2" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO2" push -q upstream tmp-a26c2:refs/heads/feat/a26c2
+"$REAL_GIT" -C "$REPO2" checkout -q main
+"$REAL_GIT" -C "$REPO2" branch -D tmp-a26c2 >/dev/null
+"$REAL_GIT" -C "$REPO2" fetch -q upstream
+WT_A26C2="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO2" worktree add -q --detach "$WT_A26C2" "$A26C2_SHA"
+WT_A26C2_GONE="$(add_named_wt "$REPO2" "$ENV-gone" feat/a26c2-gone)"
+rm -rf "$WT_A26C2_GONE"
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=3650 run_reaper $ENV --dry-run --repo "$REPO2")"
+assert_contains "$(row_for "$OUT" "$WT_A26C2")" "refs=remote-holds:upstream/feat/a26c2" \
+    "A26c2 precondition: a PRESERVE row carries refs=remote-holds: (the arm a stale test never reached)"
+assert_absent "$(row_for "$OUT" "$WT_A26C2")" "reason=remote-holds:" \
+    "A26c2 precondition: …and it is not a removal (the age floor keeps it)"
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=3650 run_reaper $ENV --apply --repo "$REPO2")"; RC=$?
+assert_eq "$RC" "0" "A26c2 --apply exits 0"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=0" \
+    "A26c2 a PRESERVE remote-holds row does NOT block the prune (F7: one long-lived row must not disable it)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNED " "A26c2 …and the prune ran on the same pass"
+assert_absent "$("$REAL_GIT" -C "$REPO2" worktree list --porcelain)" "$WT_A26C2_GONE" \
+    "A26c2 …the gone-dir record was deregistered"
+assert_dir "$WT_A26C2" "A26c2 …while the age-floored checkout is still on disk"
+
+# ── A26e: a GONE-dir record is NEVER probed — pinned, because probing it is the fail-open ─
+# `commits_survive` is called WITHOUT the probe on the gone-directory path (`classify_one`), and the
+# reason is security-relevant: for a gone dir the admin HEAD is the commit's LAST DURABLE handle, so
+# a `remote-holds` verdict there would turn `preserve remote-only-ref` into `remove prunable` and
+# deregister the only handle to a commit whose local cache can be pruned away. Nothing pinned it —
+# A26c's gone row holds a BRANCH, so it reaches `remove prunable` legitimately and cannot tell the
+# two apart. This leg is the discriminator: the remote DOES advertise the sha, so the probe would
+# say yes — the row must read `remote-only-ref` anyway.
+ENV=A26e; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26e
+commit_in_wt "$REPO" "$OLD_DATE" a26e
+A26E_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a26e:refs/heads/feat/a26e
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26e >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A26E="$T/$ENV-gone"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26E" "$A26E_SHA"
+rm -rf "$WT_A26E"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26e)" "$A26E_SHA" \
+    "A26e precondition: the REMOTE advertises this sha (so a probe here would answer YES — non-vacuous)"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26E")" "reason=remote-only-ref" \
+    "A26e ⛔ a GONE-dir record held only by a remote-tracking ref still PRESERVES (its admin HEAD is the last handle)"
+# ⛔ THE BACKTICKS IN THESE MESSAGES ARE ESCAPED ON PURPOSE. A backticked span inside a
+# DOUBLE-QUOTED string is COMMAND SUBSTITUTION, so the unescaped first draft of these two messages
+# ran `remote-holds` and `remove` as commands — measured on CI as `scripts/pi-reap-worktrees.test.sh:
+# line 3781: remote-holds: command not found` on stderr, with the word silently blanked out of the
+# message it was supposed to decorate ("(a  here would deregister the last handle)"). The assertions
+# still passed, which is exactly why it survived review: the damage was to the MESSAGE the operator
+# reads, not to the check. Same hazard as `git commit -m` with an inline-code span.
+assert_absent "$(row_for "$OUT" "$WT_A26E")" "remote-holds:" \
+    "A26e …and the probe is NOT consulted for it (a \`remote-holds\` here would deregister the last handle)"
+assert_absent "$(row_for "$OUT" "$WT_A26E")" "reason=prunable" \
+    "A26e …so it is never a \`remove\` row"
+
+# ── A26f: a remote name may contain a SLASH — the longest prefix wins, not the first segment ─
+# `refs/remotes/origin2/sub/feat` is remote `origin2/sub` + branch `feat`, OR remote `origin2` +
+# branch `sub/feat`. Only the first is true here, and the two readings give DIFFERENT verdicts, so
+# this fixture fails if the code ever splits at the first path segment: it would query `origin2` for
+# `refs/heads/sub/feat`, get nothing, and PRESERVE a checkout whose remote does hold the commit.
+# ⛔ IT IS `origin2/sub` AND NOT `origin/sub` BECAUSE GIT ITSELF REFUSES THAT PAIR. This leg was RED
+# ON CI AND GREEN ON THE AUTHORING BOX, and the difference is the git version, not the code: `git
+# remote add` DIES on a remote name that is a SUBSET or a SUPERSET of an existing remote —
+# `builtin/remote.c`, `check_remote_collision`:
+#   fatal: remote name 'origin/sub' is a subset of existing remote 'origin'
+# — so with `origin` configured, `origin/sub` cannot be created AT ALL (measured: git 2.54 in a
+# container, and the CI box's 2.56). The whole fixture then collapsed rather than failing one leg:
+# the add failed, `git push origin/sub` was 'not a valid push target', no tracking ref was ever
+# created, and all four preconditions went red — while a local git 2.43 (which has no such check)
+# accepted the pair, so the leg looked green where it was written. Making the slashed remote's first
+# segment a NON-remote is the fix because it is version-independent: `origin2` is a real prefix of
+# the ref path but is not a remote, so the first-segment reading still probes the wrong thing and
+# still PRESERVES, while the longest-configured-prefix reading finds `origin2/sub` and reclaims. The
+# precondition below pins that discriminator, so the leg cannot go vacuous if `origin2` ever becomes
+# a remote for some other reason.
+ENV=A26f; REPO="$(mk_repo $ENV)"
+BARE_ORIGIN="$T/$ENV/origin.git"
+BARE_SUB="$T/$ENV/sub.git"
+"$REAL_GIT" init -q --bare "$BARE_ORIGIN"
+"$REAL_GIT" init -q --bare "$BARE_SUB"
+"$REAL_GIT" -C "$REPO" remote add origin "$BARE_ORIGIN"
+"$REAL_GIT" -C "$REPO" remote add origin2/sub "$BARE_SUB"
+assert_eq "$("$REAL_GIT" -C "$REPO" config --get remote.origin2.url || true)" "" \
+    "A26f precondition: 'origin2' is NOT a configured remote (so the first-segment reading is the WRONG one)"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26f
+commit_in_wt "$REPO" "$OLD_DATE" a26f
+A26F_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q origin2/sub tmp-a26f:refs/heads/feat
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26f >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q origin2/sub
+assert_contains "$("$REAL_GIT" -C "$REPO" remote)" "origin2/sub" "A26f precondition: the slashed remote is configured"
+assert_contains "$("$REAL_GIT" -C "$REPO" for-each-ref --format='%(refname)' refs/remotes/origin2/sub)" \
+    "refs/remotes/origin2/sub/feat" "A26f precondition: the only local holder is refs/remotes/origin2/sub/feat"
+assert_absent "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26F_SHA" --format='%(refname)')" \
+    "refs/heads/" "A26f precondition: no LOCAL branch holds it (otherwise the probe is bypassed)"
+assert_eq "$("$REAL_GIT" -C "$BARE_SUB" rev-parse refs/heads/feat)" "$A26F_SHA" \
+    "A26f precondition: remote 'origin2/sub' advertises branch 'feat' at this sha"
+WT_A26F="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A26F" "$A26F_SHA"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A26F")" "reason=remote-holds:origin2/sub/feat" \
+    "A26f the LONGEST remote name prefixes the ref ('origin2/sub' + 'feat'), not the first segment"
+
+# ── A27: the pass RECORDS a verdict when it is ineffective (#3041, part 2) ──
+# The measured failure was not a bug in any single row: it was a pass that examined a large
+# population, removed nothing, sat under a disk floor, and printed a summary line that read
+# like a healthy pass. The silence is the defect. The verdict is a FILE plus a `verdict=`
+# field, and the file is cleared by any pass that does not hold the condition (a verdict
+# that outlives its condition would be read as the box's current state).
+mk_dirty_pop() { # <env> <n> -> repo path; n worktrees that all PRESERVE (reason=dirty)
+    local envname="$1" n="$2" d i wt
+    d="$(mk_repo "$envname")"
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        wt="$T/$envname-wt$i"
+        "$REAL_GIT" -C "$d" worktree add -q --detach "$wt" main
+        printf 'operator data %s\n' "$i" >"$wt/untracked-$i.txt"
+        i=$((i + 1))
+    done
+    printf '%s\n' "$d"
+}
+ENV=A27; REPO="$(mk_dirty_pop $ENV 11)"
+VERDICT_FILE="$(verdict_path $ENV "$REPO")"
+# (a) under the floor, >= the population floor, zero removals => the verdict is RECORDED.
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A27a exit code is UNCHANGED (a diagnosis, not a failed pass)"
+assert_contains "$OUT" "verdict=reap-ineffective" "A27a the SUMMARY carries verdict=reap-ineffective"
+assert_contains "$OUT" "VERDICT: reap-ineffective" "A27a the pass SAYS it, out loud"
+assert_file "$VERDICT_FILE" "A27a the verdict is RECORDED at \$STATE_DIR/reap-ineffective.<repo>"
+# ⛔ NON-VACUITY for the path itself: the reaper's own log must name the SAME file this fixture expects,
+# or the assertions below are testing a path nothing writes (the mirror-drift class).
+assert_contains "$(cat "$T/$ENV/reap.log")" "record=$VERDICT_FILE" \
+    "A27a …and the reaper's own log names that exact path (no mirror drift)"
+assert_contains "$(cat "$VERDICT_FILE" 2>/dev/null)" "repo=$REPO" \
+    "A27a the record names the repo it belongs to"
+if [ -f "$VERDICT_FILE" ]; then
+    V="$(cat "$VERDICT_FILE")"
+    assert_contains "$V" "verdict=reap-ineffective" "A27a the record states the verdict"
+    assert_contains "$V" "classified=12" "A27a the record carries what the pass examined"
+    assert_contains "$V" "free_mb=100" "A27a the record carries the measured headroom"
+    assert_contains "$V" "floor_mb=4096" "A27a …and the floor it was compared against"
+    assert_contains "$V" "reasons=dirty:11" "A27a …and the reasons that blocked reclamation"
+fi
+# (b) the SAME population with room on the disk is idle, and CLEARS the stale verdict.
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=999999 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A27b exit 0"
+assert_contains "$OUT" "verdict=idle" "A27b plenty of room + nothing to do => verdict=idle"
+assert_nofile "$VERDICT_FILE" "A27b a pass that does NOT hold the condition REMOVES the stale verdict"
+# (c) the free-space probe is exercised for real (a POSIX `df -Pm` table, column 4).
+OUT="$(REAP_WT_FREE_MB_OVERRIDE= DF_BIN_OVERRIDE="$T/bin/df-low" run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=reap-ineffective" "A27c 'df -Pm' is parsed: Available=100 < floor => ineffective"
+assert_file "$VERDICT_FILE" "A27c …and recorded"
+OUT="$(REAP_WT_FREE_MB_OVERRIDE= DF_BIN_OVERRIDE="$T/bin/df-roomy" run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=idle" "A27c …and Available=80000 > floor => idle"
+assert_nofile "$VERDICT_FILE" "A27c …with the verdict cleared"
+# (d) a `df` that cannot answer is UNMEASURED — never "plenty of room" (fail-open).
+OUT="$(REAP_WT_FREE_MB_OVERRIDE= DF_BIN_OVERRIDE="$T/bin/df-fail" run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=unmeasured" "A27d an unmeasurable disk => verdict=unmeasured"
+assert_nofile "$VERDICT_FILE" "A27d …and NO ineffective verdict is claimed on no measurement"
+# (e) ⛔ A DRY RUN MUST NOT DISTURB THE RECORD (#3041 review, P1). It removes nothing by
+# definition, so it has evaluated none of the live condition — and `disk-reaper.sh` DEFAULTS to
+# DRY_RUN=1, so a dry run that deleted the record made the entry point's own default mode the thing
+# that erases the armed pass's alarm. The order matters and is the point: arm (file present) FIRST,
+# then dry-run, then assert it is STILL there — the earlier revision asserted `nofile` after leg (d)
+# had already removed it, so it passed whatever the dry run did.
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=reap-ineffective" "A27e precondition: an armed pass under the floor records"
+assert_file "$VERDICT_FILE" "A27e precondition: the record is on disk"
+V_BEFORE="$(cat "$VERDICT_FILE" 2>/dev/null)"
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --dry-run --repo "$REPO")"; RC=$?
+assert_contains "$OUT" "verdict=dry-run" "A27e a dry run is 'dry-run', never 'reap-ineffective'"
+assert_file "$VERDICT_FILE" "A27e ⛔ …and a DRY RUN does NOT delete an armed pass's record (it evaluated nothing)"
+assert_eq "$(cat "$VERDICT_FILE" 2>/dev/null)" "$V_BEFORE" \
+    "A27e …and it left the record BYTE-IDENTICAL (a rewrite would be an unevaluated claim)"
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=999999 run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=idle" "A27e …while an ARMED pass with room DOES clear it"
+assert_nofile "$VERDICT_FILE" "A27e …so 'cleared' remains the armed pass's own verdict to give"
+# (f) a small population reclaims nothing legitimately: no verdict, or the alarm is noise.
+OUT="$(REAP_WT_FREE_MB_OVERRIDE=100 REAP_WT_INEFFECTIVE_MIN_EXAMINED_OVERRIDE=50 \
+    run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$OUT" "verdict=idle" "A27f below the population floor => idle (not an alarm)"
+assert_nofile "$VERDICT_FILE" "A27f …and nothing recorded"
+# (g) the SUMMARY is still ONE line and still carries the fields the disk-reaper lifts.
+SUM_A27="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$SUM_A27" "pr_merged=" "A27g the SUMMARY still carries the fields the disk-reaper lifts"
+assert_eq "$(printf '%s\n' "$SUM_A27" | grep -c '^SUMMARY ')" "1" \
+    "A27g …and exactly ONE SUMMARY line per pass"
+# (h) ⛔ A DEFERRAL-HEAVY PASS IS NOT IDLE (#3041 review, P1). The gate is EXAMINED, not
+# CLASSIFIED: a budget-starved pass decides a handful and defers the rest, so gating on
+# `classified` reported the benign `idle` for a pass that scanned the whole population, removed
+# nothing and sat under the floor — the exact shape that starved pi-cell-4. This leg FORCES
+# deferral: a real clock (a pinned epoch makes `elapsed` a constant 0), a 1s budget, and a status
+# probe that sleeps 2s on the 1st call. With the old gate `classified` would be 1 < 10 => `idle`.
+ENV=A27h; REPO_H="$(mk_dirty_pop $ENV 11)"
+VERDICT_FILE_H="$(verdict_path $ENV "$REPO_H")"
+OUT_H="$(REAP_WT_NOW_EPOCH_OVERRIDE= REAP_WT_FREE_MB_OVERRIDE=100 REAP_WT_BUDGET_SECONDS=1 \
+    FAKE_STATUS_COUNTER="$T/$ENV/cnt" FAKE_SLOW_STATUS_ON=1 FAKE_STATUS_SLEEP=2 \
+    GIT_BIN_OVERRIDE="$T/bin/git-slow-nth-status" run_reaper $ENV --apply --repo "$REPO_H")"; RC=$?
+assert_eq "$RC" "0" "A27h a deferral-heavy pass still exits 0"
+DEF_H="$(printf '%s\n' "$OUT_H" | sed -n 's/.* deferred=\([0-9][0-9]*\) .*/\1/p' | tail -1)"
+case "${DEF_H:-}" in ''|*[!0-9]*) bad "A27h the SUMMARY did not carry a deferred count (non-vacuity: the fixture did not defer)" ;; *)
+    if [ "$DEF_H" -ge 8 ]; then ok "A27h the fixture really deferred ${DEF_H} of 12 records (non-vacuity)"
+    else bad "A27h the fixture did not defer enough to test the gate (deferred=${DEF_H}, want >= 8)"; fi ;;
+esac
+assert_contains "$OUT_H" "verdict=reap-ineffective" \
+    "A27h EXAMINED >= the floor with 0 removals under the floor => reap-ineffective, NOT the benign idle"
+assert_file "$VERDICT_FILE_H" "A27h …and it is recorded"
+
+# (i) ⛔ THE RECORD IS PER REPO, NOT PER STATE DIR (#3041 review, P1). `disk-reaper.sh` runs this
+# script ONCE PER REPO with the SAME `REAP_WT_STATE_DIR`, so one fixed filename made the record
+# LAST-WRITER-WINS ACROSS REPOS: measured, an ineffective 12-record repo followed by any repo with
+# room reported `idle` and DELETED the first repo's record — the silence restored by the multi-repo
+# loop production actually runs. Both halves are pinned: the dangerous ORDER, and that two checkouts
+# with the SAME basename still get distinct records (which a bare basename would not give).
+ENV=A27i; REPO_I1="$(mk_dirty_pop $ENV 11)"
+REPO_I2="$(mk_repo $ENV x/same)"
+REPO_I3="$(mk_repo $ENV y/same)"
+VFILE_I1="$(verdict_path $ENV "$REPO_I1")"
+VFILE_I2="$(verdict_path $ENV "$REPO_I2")"
+VFILE_I3="$(verdict_path $ENV "$REPO_I3")"
+OUT_I="$(REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO_I1")"
+assert_contains "$OUT_I" "verdict=reap-ineffective" "A27i precondition: repo #1 is ineffective and records"
+assert_file "$VFILE_I1" "A27i precondition: repo #1's own record is on disk"
+OUT_I="$(REAP_WT_FREE_MB_OVERRIDE=999999 run_reaper $ENV --apply --repo "$REPO_I2")"
+assert_contains "$OUT_I" "verdict=idle" "A27i repo #2 (one checkout) is legitimately idle"
+assert_file "$VFILE_I1" \
+    "A27i ⛔ repo #2's benign pass does NOT erase repo #1's alarm (the state dir is SHARED)"
+assert_nofile "$VFILE_I2" "A27i …and repo #2 does not inherit one it never earned"
+if [ "$VFILE_I2" != "$VFILE_I3" ]; then
+    ok "A27i two checkouts with the SAME basename get DIFFERENT records (the checksum, not the basename, decides)"
+else
+    bad "A27i two checkouts named 'same' collapsed onto one record path: $VFILE_I2"
+fi
+# (j) ⛔ A SWALLOWED RECORD WRITE MUST SAY SO (#3058 review, P2). This is the branch that fires when
+# free space is under the floor — i.e. exactly when ENOSPC is live — and until now NOTHING pinned it:
+# a regression here (an `mv` that returns 0 on a failed rename, or the `{ …; } >"$tmp"` group's status
+# becoming the last `printf` rather than the first failure) would silently restore the "a missing file
+# means the condition cleared" reading that this whole record exists to remove.
+# ⛔ THE FIXTURE IS A `mv` SHIM, NOT `chmod` AND NOT A DIRECTORY AT THE RECORD PATH. Two drafts that
+# look right and are not:
+#   · `chmod 500` on the state dir — the suites run as ROOT on the Linux cells, and root writes into a
+#     0500 directory, so the write would SUCCEED and this leg would assert the opposite of what it ran;
+#   · a DIRECTORY standing at `$vfile` — `mv -f <file> <dir>` SUCCEEDS by moving the file INTO the
+#     directory, so RECORD_OK stayed 1 and the leg's first draft reported `record=<path>` and
+#     `Recorded at` (measured: four red assertions, and the "no tmp left behind" one passed for the
+#     wrong reason because the tmp file had been moved INSIDE the directory).
+# The shim fails exactly ONE call — `mv -f <tmp> <$STATE_DIR/reap-ineffective.…>` — and passes every
+# other move through to the real binary, so the fixture cannot mask an unrelated failure.
+REAL_MV="$(command -v mv)"
+mkdir -p "$T/failmv"
+printf '%s\n' '#!/usr/bin/env bash' \
+    '# Fails ONLY the verdict record.s own move (see the A27j note above); every other move is real.' \
+    'for _a in "$@"; do case "$_a" in *reap-ineffective*) exit 1 ;; esac; done' \
+    "exec $(printf '%q' "$REAL_MV") \"\$@\"" >"$T/failmv/mv"
+chmod +x "$T/failmv/mv"
+ENV=A27j; REPO_J="$(mk_dirty_pop $ENV 11)"
+VFILE_J="$(verdict_path $ENV "$REPO_J")"
+assert_nofile "$VFILE_J" "A27j precondition: no record yet (the leg must create the only one it fails to write)"
+OUT_J="$(PATH="$T/failmv:$PATH" REAP_WT_FREE_MB_OVERRIDE=100 run_reaper $ENV --apply --repo "$REPO_J")"; RC_J=$?
+assert_eq "$RC_J" "0" "A27j an unwritable record still exits 0 (the condition is a diagnosis, not a failure)"
+assert_contains "$OUT_J" "verdict=reap-ineffective" \
+    "A27j the pass still STATES its verdict when the record could not be written"
+# ⛔ THE `VERDICT …record=` LINE IS A `log` LINE, so it lands in the LOG FILE and not on stdout — the
+# same reason A27a reads the log for `record=<path>`. Asserting it against stdout (the first draft)
+# failed on correct behaviour, which is exactly the kind of red that gets "fixed" by weakening the
+# subject instead of the assertion.
+RW_LOGJ="$T/$ENV/reap.log"
+assert_contains "$(cat "$RW_LOGJ" 2>/dev/null)" "record=NOT-WRITTEN" \
+    "A27j ⛔ the log line says the record was NOT written (never the path it failed to write)"
+assert_absent "$(cat "$RW_LOGJ" 2>/dev/null)" "record=$VFILE_J" \
+    "A27j …and it does NOT name a path as if it had been written there"
+assert_absent "$OUT_J" "Recorded at" \
+    "A27j …nor does the out-loud block claim 'Recorded at'"
+assert_contains "$OUT_J" "could NOT be written" \
+    "A27j …and it says so in words, so the verdict's only remaining home is stated"
+assert_contains "$OUT_J" "a missing file is NOT" \
+    "A27j …including that a missing file is never evidence the condition cleared"
+assert_nofile "$VFILE_J" "A27j nothing landed at the record path either (a shim that halves the write is not a pass)"
+assert_eq "$(find "$T/$ENV/state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "A27j no \`.tmp.<pid>\` is left behind by the failed move"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
