@@ -20,6 +20,18 @@ when ALL of these hold:
   4. it carries a `lane:` label, or the relay reports NO LANE ROUTE for it
 This script reports, per answered issue, which of those is missing.
 
+⛔ CONDITION 3 IS QUALIFIED BY THE THREAD, NOT JUST THE LABEL (agent-infra#2844).
+`ask-owner.py::owner_answered_at` keys "a bounce happened" on the label's PRESENCE,
+which is a projection: any actor may write a label, and nothing re-validates one. So
+this file does not repeat that shortcut. It asks `scripts/_bounce_state.py` whether the
+bounce label's own `labeled` event is still the NEWEST thing on the thread. If it is not
+(SUPERSEDED), the row is reported as a CONTRADICTION — "the label says pending, the
+thread says it moved, which is true?" — rather than as the flat "the lane must clear it"
+this file used to print. It is deliberately NOT auto-healed and NOT counted as delivered:
+an auto-removal would be a second writer of the same state, and counting it delivered
+would be a false PASS, because the gate would still re-score on its own label-keyed rule.
+That gate-side rule is agent-infra#1969's declared gap; it is not changed here.
+
 Usage:
     python3 undelivered-answers.py            # human table
     python3 undelivered-answers.py --json     # machine
@@ -29,6 +41,7 @@ Last line is always machine-readable: `UNDELIVERED count=N answered=M`.
 import json
 import os
 import subprocess
+import sys
 
 # ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). This script is run by the heartbeat under
 # `run_bounded`, so it has a subprocess bound of its own (90 s) while the layer's first documented
@@ -37,7 +50,15 @@ import subprocess
 # and return at once, so this process's own deferral takes over. Applies to CHILDREN only.
 os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
-import sys
+# ONE definition of "is that bounce label still the truth?", shared with
+# turn-classify.py (agent-infra#2844; the recorded rule is §R3 of
+# docs/research/2026-10-21-issue-2273-founder-comms-research.md — "no duplicated
+# derivation … One definition, in agent-infra, exercised by a test that crosses the
+# boundary"). This file used to carry its own copy of the timeline filter, which is how
+# it came to attribute a post-bounce removal to "the gate's own bounce" on an issue whose
+# bounce was hours old.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _bounce_state as bs                                    # noqa: E402
 
 REPOS = ["daniel-ospina/tortoise", "daniel-ospina/premise-labs",
          "daniel-ospina/agent-infra"]
@@ -52,7 +73,8 @@ REPOS = ["daniel-ospina/tortoise", "daniel-ospina/premise-labs",
 ANSWERED = "owner-answered"      # human-facing: "the owner replied"
 DELIVERED = "answer-delivered"   # written ONLY by ask-owner.py
 QUEUE = "owner-decision"         # "a decision is still owed"
-BOUNCED = "question-bounced"     # gate sent it back; the lane must clear it
+BOUNCED = "question-bounced"     # gate sent it back; see _bounce_state for the ONE
+                                # definition of whether it is still the truth
 
 
 # ⛔ EVERY gh CALL MUST REACH THE LIMIT LAYER (#1988). These tools are the heartbeat's children, and
@@ -100,47 +122,39 @@ def declaration_count(repo, n):
     return int(out.strip()) if rc == 0 and out.strip().isdigit() else None
 
 
-def unlabeled_event_count(repo, n):
-    """Count `unlabeled owner-decision` events ACROSS ALL PAGES, EXCLUDING the
-    gate's own bounce removal.
+def bounce_view(repo, n):
+    """The issue's bounce state, from its TIMELINE — one read, one definition.
 
-    ⛔ The timeline endpoint returns the **FIRST page** by default, so a bare
-    call shows the OLDEST events and silently misses the most recent ones — which
-    is exactly where a removal lives. Measured 2026-09-26: the unpaginated form
-    reported *"no `unlabeled owner-decision` event (removal never happened)"* for
-    **#1026**, while the event sits at `2026-09-26T12:57:19Z` (verified: every
-    "labeled" and "unlabeled" event for that label, newest last).
+    ⛔ This replaces a local `unlabeled_event_count` that counted removals newer than
+    the newest `labeled question-bounced` event and then let `diagnose` assume the
+    label was the truth. The endpoint detail that made the old form correct in shape
+    is preserved: a bare timeline call returns the **FIRST page**, so the read is
+    paginated and emits one line per event, never `|length` (under `--paginate`,
+    `--jq` runs per page and a count would arrive as one number per page). Measured
+    2026-09-26: the unpaginated form reported *"no `unlabeled owner-decision` event
+    (removal never happened)"* for **#1026**, whose event sits at
+    `2026-09-26T12:57:19Z`.
 
-    ⛔ Do **not** use `|length` here: under `--paginate`, `--jq` runs **per page**,
-    so `|length` emits one number PER PAGE and the caller cannot sum them (it
-    would fall into the `None`/UNVERIFIED branch and silently disarm this check).
-    Emitting one line per matching event and counting lines is pagination-safe.
+    What is NEW is the third question the old read could not answer: *is the bounce
+    label still the newest word on this thread?* On 2026-10-29, 22 of the 26 open
+    issues carrying `question-bounced` across the three repos had thread activity
+    after the label's own event (see `scripts/_bounce_state.py`), so "the label is
+    present" is not the same claim as "the question is pending" — and this file used
+    to make the second claim from the first.
 
-    ⛔ THE GATE WRITES THIS EVENT TOO (agent-infra#1903): a bounce removes
-    `owner-decision`. This count is the RAW event count (removals newer than the
-    newest `labeled question-bounced` event) — `diagnose` applies the label-state
-    rule on top, so a bounced question is never reported as "conditions satisfied
-    — PENDING (clean)", i.e. as an answer that does not exist.
+    `None` = the read FAILED (UNKNOWN), which must never read as "nothing there".
     """
-    rc, out, _ = sh([GH, "api",
-                     "repos/%s/issues/%d/timeline?per_page=100" % (repo, n),
-                     "--paginate",
-                     "--jq",
-                     '.[]|select((.event=="unlabeled" and .label.name=="%s") '
-                     'or (.event=="labeled" and .label.name=="%s"))'
-                     r'|"\(.event)\t\(.created_at)"' % (QUEUE, BOUNCED)])
-    if rc != 0:
+    def run(argv):
+        rc, out, _ = sh([GH] + list(argv[1:]))
+        return rc, out
+
+    try:
+        view = bs.bounce_view(repo, n, run)
+    except Exception:                                            # noqa: BLE001
+        # A detector must not die on its own derivation: an unreadable view is UNKNOWN,
+        # and UNKNOWN is reported as such (see the `view is None` branch in `diagnose`).
         return None
-    removed, bounced = [], []
-    for ln in out.splitlines():
-        if not ln.strip():
-            continue
-        ev, _, at = ln.partition("\t")
-        if not at.strip():
-            continue
-        (removed if ev.strip() == "unlabeled" else bounced).append(at.strip())
-    newest_bounce = max(bounced) if bounced else ""
-    return len([at for at in removed if at > newest_bounce])
+    return None if view.state == bs.UNKNOWN else view
 
 
 def diagnose(repo, issue):
@@ -150,11 +164,28 @@ def diagnose(repo, issue):
     blockers = []
     if DELIVERED in names:
         return ["DELIVERED"], lanes
+    # The timeline read is needed by condition 1 (is the bounce label still the
+    # truth?) and condition 3 (whose removal was it?), so it is taken ONCE here.
+    view = bounce_view(repo, issue["number"])
     # condition 1 — the three exclusions
     if QUEUE in names:
         blockers.append("owner-decision kept (question still owed OR partial answer)")
     if BOUNCED in names:
-        blockers.append("question-bounced left on (the lane must clear it)")
+        if view is not None and view.stale:
+            # ⛔ THE CONTRADICTION, REPORTED RATHER THAN RESOLVED (agent-infra#2844,
+            # and the issue's own item 2). The label says "pending"; the thread says
+            # it moved. This file is READ-ONLY by design, so it may not clear the
+            # label — that would be a second silent writer of the same state, which is
+            # the defect class this change is about. Saying "the lane must clear it"
+            # would be worse than useless here: it asserts a fault from a projection
+            # the record contradicts.
+            blockers.append(
+                "CONTRADICTION: `question-bounced` was applied at %s, but the thread "
+                "moved at %s (%s) — the label says the question is pending, the thread "
+                "says it has moved. Which is true?"
+                % (view.bounce_at[:19], view.moved_at[:19], view.moved_by))
+        else:
+            blockers.append("question-bounced left on (the lane must clear it)")
     # condition 2
     n_decl = declaration_count(repo, issue["number"])
     if n_decl == 0:
@@ -162,19 +193,31 @@ def diagnose(repo, issue):
     elif n_decl is None:
         blockers.append("UNVERIFIED: could not read comments")
     # condition 3
-    n_unl = unlabeled_event_count(repo, issue["number"])
-    if n_unl is None:
+    if view is None:
         blockers.append("UNVERIFIED: could not read timeline")
-    elif n_unl == 0:
+    elif view.removals_after_bounce == 0:
         blockers.append("no `unlabeled owner-decision` event (removal never happened)")
-    elif BOUNCED in names:
+    elif BOUNCED in names and not view.stale:
         # The gate's own bounce writes this removal (agent-infra#1903), so while
-        # `question-bounced` is present it is not an owner answer — do NOT tell the
-        # operator a removal "never happened" when one did, and do not pass this
-        # off as "conditions satisfied".
+        # `question-bounced` is present AND still the newest word on the thread it
+        # is not an owner answer — do NOT tell the operator a removal "never
+        # happened" when one did, and do not pass this off as "conditions satisfied".
         blockers.append("only `unlabeled owner-decision` events while "
                         "`question-bounced` is present — the gate's own bounce, "
                         "not an owner answer")
+    elif BOUNCED in names:
+        # ⛔ THE STALE CASE (agent-infra#2844). The label is present but the thread has
+        # moved past it, so the removal that post-dates the bounce may well BE the
+        # owner's answer and the label is the thing that is wrong. Report the
+        # disagreement — do NOT resolve it. Dropping the blocker here would let this
+        # row become `PENDING (clean — delivers on a tick)`, which would be a FALSE
+        # PASS: `ask-owner.py::owner_answered_at` still keys on the label, so the gate
+        # would re-score the question rather than deliver. Removing the label from here
+        # would be a second writer of the same state, i.e. the class this issue is
+        # about. So: name the contradiction and leave both artefacts alone.
+        blockers.append("a `unlabeled owner-decision` event post-dates a SUPERSEDED "
+                        "`question-bounced` — a candidate owner answer, but the label "
+                        "disagrees; not countable as either until they agree")
     # condition 4
     if not lanes:
         blockers.append("NO LANE ROUTE: no `lane:` label")
