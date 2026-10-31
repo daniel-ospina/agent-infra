@@ -347,8 +347,30 @@ fleet_gate() {
     echo "   procedure is printed there."
     exit 1
   fi
+  # ⛔ THE AGGREGATE MUST NOT RE-ASSERT A THRESHOLD THE REPORT DID NOT EVALUATE. `report_rc == 0`
+  # means "no escalation", NOT "every threshold was measured": fleet-cost-report.sh skips (b) when
+  # the clamp pool is undefined or fewer than 3 sessions carry cost data, and after the 2026-10-31
+  # geometry move that is the EXPECTED first-window reading (every 300K-era compaction is now
+  # sub-floor and excluded, so the pool is STARVED, not mixed). The flat "thresholds within" line
+  # printed that week would have been a false PASS at the aggregate level, in the one report whose
+  # job is to answer "did the clamp work?". The report publishes its own verdict as a machine
+  # marker (`# fleet-verdict: clean cache-share-evaluated=<yes|no>`); read THAT rather than its
+  # prose, and read it FAIL-SAFE: an absent/malformed marker (an older report) takes the qualified
+  # branch, because under-claiming is the only safe direction here.
+  # A here-string, not a pipe: `printf … | grep -q` under `set -o pipefail` takes the ELSE branch
+  # when the pattern IS present (grep exits at its first match, the producer takes SIGPIPE, and
+  # pipefail promotes 141 to the pipeline status) — the documented false-negative of this gate
+  # class (see MEMORY.md, [shell]).
   echo ""
-  echo "✅ fleet gate clean — thresholds within the shipped 800K-clamp regime."
+  if grep -qxF '# fleet-verdict: clean cache-share-evaluated=yes' <<<"$report"; then
+    echo "✅ fleet gate clean — thresholds within the shipped 800K-clamp regime."
+  else
+    echo "✅ fleet gate clean — no escalation, BUT the cache-share threshold (b) was NOT evaluated this window"
+    echo "   (fewer than 3 cost-bearing clamp-regime sessions, so (b) never runs)."
+    echo "   This is the EXPECTED reading for the first window after the 2026-10-31 floor"
+    echo "   move — every 300K-era compaction is now sub-floor and excluded — so treat it"
+    echo "   as UNMEASURED (see the report's (b)), never as a clean week."
+  fi
   exit 0
 }
 

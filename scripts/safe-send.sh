@@ -109,8 +109,19 @@ fi
 PSCREEN="$(cmux read-screen --workspace "$WS" --lines 10 2>/dev/null)"
 if [ -n "$PSCREEN" ]; then
   PLAST="$(printf '%s\n' "$PSCREEN" | sed -n '$p')"
+  # ⛔ THE BUDGET LITERALS MUST COVER EVERY WINDOW THIS FLEET CAN RUN, NOT JUST THE CURRENT
+  # ONE. pi draws the budget through `formatTokens`: `count < 1e6 → round(count/1000)+"k"`,
+  # else `(count/1e6).toFixed(1)+"M"` — so 800000 renders `800k`, 1,000,000 renders `1.0M`
+  # (NOT `1M`), and 1048576 (`kimi-k3`) also renders `1.0M`. `%/800k` is the shipped
+  # 800K clamp and `%/300k` is kept for historical transcripts; `%/1.0M` is the window the
+  # rollback procedure PRESCRIBES (models.json contextWindow 800000 → 1000000 — see
+  # docs/ops/cost-config-policy.md §7.1 and watch-truncation.sh's printed procedure), so
+  # omitting it makes this probe refuse (`exit 3`, "NO pi IN THIS PANE") a live pi pane
+  # running exactly the geometry its own rollback tells the owner to adopt. `%/262k` is the
+  # other shipped non-deepseek window (`qwen3.8-max`, 262144) — the same hole, and this probe
+  # has no `(auto)`/model-bullet rescue arm to catch it the way the heartbeat's does.
   case "$PLAST" in
-    *"%/800k"*|*"%/300k"*|*"• high"*|*"• low"*|*"• medium"*) : ;;
+    *"%/800k"*|*"%/300k"*|*"%/1.0M"*|*"%/262k"*|*"• high"*|*"• low"*|*"• medium"*) : ;;
     *)
       if [ "$MODE" != "--force" ] || grep -qE '(%|\$|#)[[:space:]]*$' <<<"$PLAST"; then
         echo "REFUSED [$LABEL] $WS — NO pi IN THIS PANE (last line: $(printf '%s' "$PLAST" | tail -c 70))."

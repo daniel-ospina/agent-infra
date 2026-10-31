@@ -436,6 +436,12 @@ if esc:
 # Printing an unqualified CLEAN over a starved pool is a false PASS in the one
 # report whose job is to answer "did the clamp work?".
 cache_evaluated = cache_share is not None and n_with_cost >= 3
+# ⛔ A MACHINE-READABLE VERDICT BESIDE THE PROSE, because the WRAPPER (cron-quality-gates.sh
+# `fleet`) restates this conclusion at the aggregate level and must not have to parse wording to
+# know whether (b) ran. Grepping the human line is exactly the coupling that let the wrapper keep
+# printing "thresholds within" over a pool it never measured; a stable marker makes the two
+# readers the SAME fact. Read by cron-quality-gates.sh:351.
+print(f"# fleet-verdict: clean cache-share-evaluated={'yes' if cache_evaluated else 'no'}")
 if cache_evaluated:
     print("## ✅ CLEAN — thresholds within the shipped 800K-clamp regime")
 else:

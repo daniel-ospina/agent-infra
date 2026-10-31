@@ -481,13 +481,37 @@ way more"* → **800,000 tokens**, with the whole geometry following it.
 
 **What moved (one commit, per #1316):** every deepseek-served `contextWindow`
 in `models.json` 300000 → 800000 (`maxTokens` 384000 unchanged — it is an
-output cap, not the window); the guard's `CLAMP` 300000 → 800000; the regime
+output cap, not the window); **the same 10 deepseek-served rows in the shipped
+`pi-bootstrap/pi-config/models-store.json`** — `deepseek:{v4-flash,
+v4-flash-vision-exp, v4-pro}`, `openrouter:deepseek/deepseek-{v4-flash,
+v4-flash-0731, v4-pro, ~deepseek-v4-flash-latest}`,
+`qwen-token-plan:deepseek-{v4-flash,v4-flash-0731,v4-pro}` — plus that file's
+`checkedAt` bump, which is what makes the migration load-bearing rather than
+cosmetic (`pi-bootstrap/setup.sh`'s `merge_models_store` does
+`merged = {**dst, **src}` and lets the NEWER `checkedAt` win per provider, so a
+bumped snapshot carrying the OLD window would REVERT those 10 entries on the
+next install); the guard's `CLAMP` 300000 → 800000; the regime
 floor in BOTH instruments 283616 → **783616**; `watch-truncation.sh`'s band
 constants (`REGIME_TB_FLOOR` → 783616, `REGIME_TB_ERA_CEIL` → 900000, moved
-together as this section requires); and the two literal `/300k` footer parsers
+together as this section requires); the two literal `/300k` footer parsers
 (`orchestrator-heartbeat.sh`, `safe-send.sh`) now also accept `/800k`, keeping
 `/300k` for historical transcripts. `settings.json`'s `reserveTokens` **stays**
 at the reviewed 16384 — the #1227 directive is untouched.
+
+⛔ **Why the shipped STORE rows are on this list (and why a guard cannot see
+them).** The store is
+the `WARN`-class defense-in-depth surface (§5) and pi's 4h refresh overwrites it,
+which is why an earlier draft of this section described its change as
+"`checkedAt` only". That description was wrong and is worth recording: the 10
+window rows moved WITH it, and they have to. `pi-bootstrap/setup.sh`'s
+`merge_models_store` does `merged = {**dst, **src}` and then keeps the provider
+block whose `checkedAt` is NEWER (`setup.sh:155-166`), so bumping the shipped
+snapshot's `checkedAt` while leaving `300000` in it makes the OLD window WIN over
+a live 800K one — every install from that snapshot reverts the geometry. Nothing
+would say so: the guard asserts only an UPPER bound (`deepseek-served $v >
+${CLAMP}` → block/warn, `check-cost-config.sh:591`), and `300000 ≤ 800000`
+prints `✅`. A future geometry move migrates these same rows, or it does not
+bump `checkedAt`.
 
 **Trigger arithmetic:** `contextTokens > contextWindow − reserveTokens`
 (pi `core/compaction/compaction.js`: `shouldCompact`), so

@@ -332,15 +332,29 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # exactly that one line (`for _m in ("/800k",…)`). The executable-line pin below did NOT move
 # (same one-line rewrite), and the shipped egress is untouched: the `send` token, the MSG reads
 # outside the appends, and both block depths are unmoved and pinned above.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "25224790895720"
+# ⛔ RE-PINNED A FIFTH TIME 2026-10-31, DELIBERATELY, WITH THE DIFF CHECKED — the SAME line, twice
+# in one day, and the second edit is a CORRECTION of the first: `"/1M"`/`"/2M"` are literals pi
+# NEVER DRAWS (`formatTokens`: `count < 1e6 → round(count/1000)+"k"`, else
+# `(count/1e6).toFixed(1)+"M"` → 1,000,000 and 1,048,576 both render `1.0M`), so the tuple was
+# blind to the two windows it most needed to see: the 1,000,000 rollback this PR's own procedure
+# prescribes, and the shipped `kimi-k3` window — and `qwen3.8-max` (262144) renders `/262k`, which
+# the tuple did not carry either. Verified when re-pinning, not assumed: matched-line COUNT is 169
+# before and after, the diff of the matched lines is exactly this one line, and the byte delta
+# 5720 → 5732 reconciles character for character (`1.0` twice = +4, `,"/262k"` = +8). The
+# executable-line pin below did NOT move, and the shipped egress is untouched.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "9059128745732"
 # ⛔ AND THE FOOTER SIGNATURE MUST ACCEPT THE BUDGET pi ACTUALLY DRAWS (2026-10-31).
 # `_pane_has_pi` decides whether a pane is driven by pi from a footer marker, so a marker that
 # does not match the LIVE rendering reads a settled lane as unread/idle — the failure that cost a
 # lane 95 minutes (see the function's own note). The owner decision of 2026-10-31 moved the clamp
 # 300K → 800K and pi renders `formatTokens(800000)` = `/800k`; `/300k` must stay for historical
-# transcripts. Assert BOTH literals are present in the tuple, so deleting either one — or the
-# pair-projecting rewrite that would pin it to one era — fails here instead of at a dead lane.
-for _needle in '"/800k"' '"/300k"'; do
+# transcripts. `formatTokens` is NOT integer division: 1,000,000 and 1,048,576 render `/1.0M`, so
+# `/1.0M` is the marker for the 1,000,000 window this PR's rollback procedure PRESCRIBES and for
+# the shipped `kimi-k3` window — the tuple carried the dead `/1M` form instead, i.e. the probe was
+# blind to both; `/262k` is the shipped `qwen3.8-max` window. Assert every literal is present in the
+# tuple, so deleting any one — or the pair-projecting rewrite that would pin it to one era — fails
+# here instead of at a dead lane.
+for _needle in '"/800k"' '"/300k"' '"/1.0M"' '"/262k"'; do
   if grep -qF -- "$_needle" <<<"$(grep -F 'for _m in (' "$HB")"; then
     pass "_pane_has_pi's footer signature accepts ${_needle}"
   else

@@ -413,9 +413,19 @@ bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=
 # pre-existing `/300k` literal was equally untested. A probe that does not match the live footer
 # reads a LIVE, settled lane as a bare login shell and REFUSES the send (rc 3) — the failure that
 # motivated the literal. Driven, not grepped: the stub's LAST line carries the budget and NOTHING
-# else the probe matches (no `• high` bullet, no `/1M`), so these arms flip only on the legacy and
-# current budget literals. `%/500k` is the negative control: a budget pi never draws is refused.
-for _budget in '%/800k' '%/300k' '%/500k'; do
+# else the probe matches (no `• high` bullet, no model-bullet arm), so these arms flip only on the
+# budget literals. `%/500k` is the negative control: a budget pi never draws is refused.
+# ⛔ `%/1.0M` IS NOT A NICETY — it is the window this fleet PRESCRIBES for its own rollback
+# (`models.json` contextWindow 800000 → 1000000, docs/ops/cost-config-policy.md §7.1 and
+# watch-truncation.sh's printed procedure) and the shipped `kimi-k3` window (1,048,576). pi draws
+# it as `1.0M`, NOT `1M` (`formatTokens`: `count < 1e6 → round(count/1000)+"k"`, else
+# `(count/1e6).toFixed(1)+"M"`), so a tuple written from the `/1M` guess matches no footer at all:
+# after the owner executes the rollback procedure every lane would read "NO pi IN THIS PANE" and
+# every send would exit 3. `%/262k` is the other shipped non-deepseek window (`qwen3.8-max`,
+# 262144 → pi renders `262k`); unlike the heartbeat's probe, safe-send's has NO `(auto)` or
+# model-bullet rescue arm, so an unlisted window is an outright refusal. Pin every shipped window
+# here, not just the current clamp.
+for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
   printf '#!/bin/sh\necho "CMUX_RAN $*" >> "$CMUX_LOG"\ncase "$1 $2" in "read-screen --workspace") echo "~/Documents/GitHub/agent-infra"; echo "  deepseek-flash %s";; esac\nexit 0\n' "$_budget" > "$TMP/bin/cmux"
   chmod +x "$TMP/bin/cmux"
   : > "$CMUX_LOG"
