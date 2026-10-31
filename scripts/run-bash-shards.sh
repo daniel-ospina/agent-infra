@@ -570,22 +570,29 @@ echo "── hermetic suites ─────────────────
 # hermetic contract is stated rather than inherited.
 shard_array=()
 while IFS= read -r shard; do
-  # The SAME predicate as `listed`'s `awk 'NF'` above: a line with no non-blank text is not a path,
-  # so it is neither counted nor queued. Two different predicates here made the check below fire on
-  # the one input it was never meant to describe (a whitespace-only line) with an inverted message.
+  # Drop a line with no non-blank text: it is not a path, so it is neither counted nor queued. The
+  # predicate is the SAME CLASS as `listed`'s `awk 'NF'` above — deliberately not literally identical
+  # (bash's `[[:space:]]` also covers CR/VT/FF, which awk's default FS does not); that residue is
+  # fail-closed, and the check below says how.
   [ -n "${shard//[[:space:]]/}" ] || continue
   shard_array+=("$shard")
 done <<<"$shard_paths"
-# ⛔ WHAT THIS COMPARISON IS, AND WHAT IT IS NOT (`#3099` review, P2 — the comment here used to claim
-# a protection that does not exist). The read above is IN-PROCESS: a here-string consumed by the
-# driver alone, so no child can shorten it and this check is NOT what makes the list safe — the
-# ARRAY is. The net that NAMES an un-reached shard is the end-of-run set difference below
-# (`shard_unaccounted`, a `comm -23` of the derived list against the two logs), which is what the
-# 8ap mutant exercises. This is a cheap INVARIANT instead, and its only reachable trigger is a
-# refactor: `listed` counts non-blank lines (`awk 'NF'`) and the array drops lines with no non-blank
-# text, so a divergence means one predicate moved and the other did not — a truncation of an
-# in-process read is not reachable, so do not read this as a truncation detector. It fails CLOSED:
-# refuse to start rather than run a list the count does not describe.
+# ⛔ WHAT THIS COMPARISON IS, AND WHAT IT IS NOT (`#3099` review, P2 — this comment has now claimed a
+# protection that does not exist TWICE: first as a truncation detector, then as the arm that caught a
+# whitespace-only list line with an inverted message). Neither is true.
+#   * It is NOT what makes the list safe: the read above is IN-PROCESS — a here-string consumed by the
+#     driver alone — so no child can shorten it. The ARRAY is what makes the list safe.
+#   * It is NOT reachable from a blank list line, blank OR whitespace-only: the target-containment
+#     loop above rejects a non-file target (`[ ! -f "$t" ]` → exit 1, "does not exist") before this
+#     line is reached, and a whitespace-only line is not a file.
+#   * The net that NAMES an un-reached shard is the end-of-run set difference below
+#     (`shard_unaccounted`, a `comm -23` of the derived list against the two logs) — what the 8ap
+#     mutant exercises, not this.
+# What remains is a cheap INVARIANT between two derivations of ONE list, and it fails CLOSED: refuse
+# to start rather than run a list the count does not describe. Its only reachable trigger is a
+# REFACTOR that moves one predicate and not the other — the present pair can already diverge on a
+# CR-only line (`awk 'NF'` counts it, bash's `[[:space:]]` strips it), and that divergence exits 1
+# here instead of starting a run.
 if [ "${#shard_array[@]}" -ne "$listed" ]; then
   echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run (a skip predicate moved on one side only). Refusing to start."
   exit 1
