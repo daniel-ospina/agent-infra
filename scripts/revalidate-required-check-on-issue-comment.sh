@@ -116,25 +116,42 @@ marker_is_artifact() {
   esac
 }
 
-# ── Pure: map the probe's return code to this arm's outcome ────────────────
+# ── Pure: map the two probe return codes to this arm's outcome ──────────
 # ⛔ THE MAPPING IS A FUNCTION SO IT CAN BE ASSERTED. It was written inline as
 # `if ! marker_is_artifact "$body"; then case "$?" in 1) …` — and that is a
 # SILENT INVERSION: `$?` inside the `then` block of `if ! cmd` is 0 (the
 # negation's status), never the command's, so the `1)` arm was unreachable and
 # every ordinary comment — a benign "nothing the gate reads has changed" — took
 # the tooling branch and exited 2, reding the workflow on every comment in the
-# repo. The self-test did not catch it because it asserted only the pure helpers
-# and never this mapping. Measured: `bash -c 'f(){ return 2; }; if ! f; then
-# echo $?; fi'` prints 0.
-#   0 → proceed, 1 → skip (benign, the comment is not an artifact),
+# repo. Measured: `bash -c 'f(){ return 2; }; if ! f; then echo $?; fi'` → 0.
+#
+# ⛔ AND IT TAKES TWO PROBES, NOT ONE, because `issue_comment: edited` is
+# BIDIRECTIONAL and a one-sided read is a FAIL-OPEN. Probing only the new body
+# means an edit that REMOVES the marker probes 1 → `skip` → exit 0, while the
+# gate's own input was retracted and the previous GREEN stays on the head with
+# nothing to re-read it (a `pull_request` event is not fired by an issue
+# comment). Measured before this symmetry existed: body `'Scoping retracted —
+# the marker no longer applies'` from an OWNER printed "nothing the gate reads
+# has changed" and exited 0. The payload carries the prior body for free
+# (`github.event.changes.body.from`), so retraction is detectable at no cost.
+#   0 → proceed, 1 → skip (benign, neither body is an artifact),
 #   anything else → blocked (a tooling fault is NOT a false answer: reading it as
 #   "no marker" would make this arm a silent no-op gate).
-marker_gate_outcome() {
-  case "${1:-}" in
-    0) printf 'proceed' ;;
-    1) printf 'skip' ;;
-    *) printf 'blocked' ;;
-  esac
+# Precedence: `blocked` beats a proceed, because a probe that could not answer
+# must never be laundered through the other probe's answer.
+probe_outcome() {
+  local new_rc="${1:-}" prev_rc="${2:-}"
+  # An ABSENT body is "no artifact", not "no answer": `github.event.changes.body.from`
+  # does not exist on an `issue_comment: created` event, so the replaced body is
+  # empty there and must not be read as a tooling fault. (The probe itself already
+  # answers 1 for empty text; this is belt-and-braces, and it is asserted.)
+  [[ -z "$new_rc" ]] && new_rc=1
+  [[ -z "$prev_rc" ]] && prev_rc=1
+  if [[ "$new_rc" != "0" && "$new_rc" != "1" ]]; then printf 'blocked'; return 0; fi
+  if [[ "$prev_rc" != "0" && "$prev_rc" != "1" ]]; then printf 'blocked'; return 0; fi
+  if [[ "$new_rc" == "0" ]]; then printf 'proceed'; return 0; fi
+  if [[ "$prev_rc" == "0" ]]; then printf 'retracted'; return 0; fi
+  printf 'skip'
 }
 
 # ── Live path ───────────────────────────────────────────────────────────────
@@ -157,10 +174,12 @@ main() {
     return 0
   fi
   marker_is_artifact "$body"; local mrc=$?
-  case "$(marker_gate_outcome "$mrc")" in
+  marker_is_artifact "${PREVIOUS_COMMENT_BODY:-}"; local prc=$?
+  case "$(probe_outcome "$mrc" "$prc")" in
     proceed) say "  scoping artifact detected on the issue" ;;
-    skip) say "  skip:not-a-scoping-artifact — this comment does not carry '<!-- issue-scoping:' as its first content line or as a blank-line-separated footer; nothing the gate reads has changed"; return 0 ;;
-    *) say_err "  BLOCKED-BY-TOOLING — the marker probe could not answer (exit $mrc); that is NOT a verdict that the issue is un-scoped."; return 2 ;;
+    retracted) say "  scoping artifact RETRACTED by this edit (the replaced body carried the marker) — re-reading the gate so the stale green cannot stand" ;;
+    skip) say "  skip:not-a-scoping-artifact — neither this comment nor the body it replaced carries '<!-- issue-scoping:' as its first content line or as a blank-line-separated footer; nothing the gate reads has changed"; return 0 ;;
+    *) say_err "  BLOCKED-BY-TOOLING — a marker probe could not answer (new=$mrc, previous=$prc); that is NOT a verdict that the issue is un-scoped."; return 2 ;;
   esac
 
   local timeline prs api
@@ -249,13 +268,15 @@ if [[ "${REVALIDATE_SELF_TEST:-0}" == "1" ]]; then
   done
   [[ "$(rerun_decision failure queued)" == "skip:in-flight" ]] && ok || bad "an in-flight run must not be re-triggered"
 
-  # The probe→outcome mapping. Asserted because an INLINE version of it was
+  # The two-probe mapping. Asserted because an INLINE one-probe version of it was
   # shipped inverted (`$?` after `if !`), and no assertion covered it.
-  [[ "$(marker_gate_outcome 0)" == "proceed" ]] && ok || bad "probe rc 0 must proceed"
-  [[ "$(marker_gate_outcome 1)" == "skip" ]] && ok || bad "probe rc 1 must be a BENIGN skip, not a block"
-  for c in 2 127; do
-    [[ "$(marker_gate_outcome "$c")" == "blocked" ]] && ok || bad "probe rc $c must be blocked (a tooling fault is not a false answer)"
-  done
+  [[ "$(probe_outcome 0 1)" == "proceed" ]] && ok || bad "new body IS an artifact → proceed"
+  [[ "$(probe_outcome 0 0)" == "proceed" ]] && ok || bad "both artifacts → proceed"
+  [[ "$(probe_outcome 1 0)" == "retracted" ]] && ok || bad "marker REMOVED by an edit → retracted (never a benign skip)"
+  [[ "$(probe_outcome 1 1)" == "skip" ]] && ok || bad "neither body is an artifact → benign skip"
+  [[ "$(probe_outcome 2 0)" == "blocked" ]] && ok || bad "a tooling fault must beat a proceed"
+  [[ "$(probe_outcome 0 2)" == "blocked" ]] && ok || bad "a tooling fault on the replaced body must beat a proceed"
+  [[ "$(probe_outcome 127 1)" == "blocked" ]] && ok || bad "a missing gate script must be blocked"
 
   tl='[{"event":"cross-referenced","source":{"issue":{"number":11,"state":"open","repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"u"}}}},
        {"event":"cross-referenced","source":{"issue":{"number":12,"state":"closed","repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"u"}}}},
@@ -280,7 +301,10 @@ if [[ "${REVALIDATE_SELF_TEST:-0}" == "1" ]]; then
       printf 'We have no `<!-- issue-scoping:` comment here.\n' > "$tmpd/mention.txt"
       marker_is_artifact "$(cat "$tmpd/marker.txt")" && ok || bad "gate probe rejected a real artifact"
       marker_is_artifact "$(cat "$tmpd/mention.txt")" && bad "gate probe admitted a prose MENTION" || ok
-      rm -rf "$tmpd"
+      # The fixtures are left in the mktemp dir deliberately: a self-test that
+      # cannot RUN is a fixture nothing runs, and this file keeps no
+      # destructive cleanup of any kind — two small files in a freshly made
+      # temp dir cost nothing, and CI's runner is discarded anyway.
     fi
   else
     # ⛔ A MISSING GATE IS NOT A PASS. Without this branch the one assertion that

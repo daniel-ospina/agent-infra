@@ -68,8 +68,17 @@ on:
   # `complexity:micro` label skips b–e entirely), and setting a label is an
   # `issues: labeled` event, which also fires no `pull_request` event. That arm
   # is NOT added here and the window stays open for it; closing it needs the same
-  # rerun logic keyed on a labels event, filed as a residual in the PR rather
-  # than claimed. Do not read this trigger as covering labels.
+  # rerun logic keyed on a labels event. Do not read this trigger as covering
+  # labels. A second, narrower window: a comment landing while the newest run for
+  # the head is already `in_progress` is skipped (the API cannot re-run an
+  # in-flight run), so that one run can still mint a verdict nothing re-reads.
+  #
+  # ⛔ THE `edited` ARM IS BIDIRECTIONAL AND MUST BE READ THAT WAY. Retracting the
+  # marker is an edit that REMOVES `<!-- issue-scoping:`, and a one-sided read of
+  # the new body would call that "nothing changed" and leave the previous GREEN
+  # standing on evidence that no longer exists — a fail-open. So the prior body
+  # (`github.event.changes.body.from`, absent on `created`) is probed too, and a
+  # retraction re-reads the gate exactly like an addition does.
   #
   # WHAT THIS IS NOT: it does not post, edit or re-post any marker (that would be
   # manufacturing evidence), it does not touch the gate's logic or any refusal
@@ -328,6 +337,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          # The body this comment REPLACED, so a marker RETRACTION re-reads the
+          # gate instead of leaving a stale green standing. Absent on `created`
+          # (the expression yields an empty string), which is why the trust and
+          # marker checks are unaffected on the add path.
+          PREVIOUS_COMMENT_BODY: ${{ github.event.changes.body.from }}
           COMMENT_AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
         run: |
           set -euo pipefail
