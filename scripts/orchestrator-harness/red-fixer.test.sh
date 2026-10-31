@@ -83,6 +83,50 @@ else
 fi
 sed -n '/^head_reds() {/,/^}/p' "$ORCH" > "$TMP/headreds.sh"
 [ -s "$TMP/headreds.sh" ] || { echo "FATAL: head_reds not found in orch-loop.sh"; exit 1; }
+# ⛔ THE BLOCK'S OWNERSHIP GUARD IS A SHIPPED FUNCTION DEFINED OUTSIDE THE BLOCK (agent-infra#2832,
+# 2026-10-25). The `[redfix]` fragment asks `pr_owner_live` "does a live worker already own this PR?",
+# and that function is defined UP BY `pr_owned` — outside the markers. A drive that sources only the
+# block therefore runs `pr_owner_live` as an UNDEFINED COMMAND: rc 127, falsy, and EVERY "a live
+# worker already owns this PR" arm silently becomes a SPAWN. Measured on origin/main: 6 ❌ in §2 with
+# `spawns=1` while `fix-4242` / `merge-4242` were live — the suite going red for the one reason that
+# is NOT a product defect, namely that the harness could not see the guard it was asserting about.
+# Extracted (like `head_reds` / `refund_bailed_fixer` / `spawn_gate_tok` above, and like
+# pr-dispatch.test.sh's T9), so the shipped predicate is DRIVEN instead of being absent.
+sed -n '/^pr_owner_live() {/,/^}/p' "$ORCH" > "$TMP/ownerlive.sh"
+# ⛔ THE SAME BODY UNDER A PRIVATE NAME, so `drive_route` can WRAP it and COUNT EXECUTIONS. That count
+# is the only thing that can distinguish "the block asks the shipped guard" from "the block happens to
+# spell `pr_owner_live` somewhere" — see the note below on why a text matcher cannot.
+sed 's/^pr_owner_live() {/_shipped_pr_owner_live() {/' "$TMP/ownerlive.sh" > "$TMP/ownerlive-renamed.sh"
+if [ -s "$TMP/ownerlive.sh" ] && [ -s "$TMP/ownerlive-renamed.sh" ] && grep -q 'sess "fix-\$pr"' "$TMP/ownerlive.sh"; then
+  ok "the OWNERSHIP guard (pr_owner_live) is extracted from the shipped loop — the block's 'is a worker already on it?' answer is DRIVEN, not an undefined command"
+else
+  bad "pr_owner_live could not be extracted from orch-loop.sh — every 'a live worker owns this PR' arm would read an undefined command and grade a SPAWN (the 2026-10-25 red)"
+fi
+# ...and the block must still ASK it — A block that grew its own inline liveness test would be a second
+# predicate for one question (the two-predicates-for-two-questions split #2831 exists to keep).
+#
+# ⛔ THAT INVARIANT IS GRADED BY EXECUTION, NOT BY TEXT, AND THE HISTORY IS THE ARGUMENT FOR IT.
+# Every text matcher this arm has had was a false PASS by construction, and each was defeated in turn
+# (all measured 2026-10-30, #3095 review):
+#   * `grep -q 'pr_owner_live "$PR"'` — satisfied by a COMMENT (`# was pr_owner_live "$PR" …`); the
+#     suite stayed 122/0 on a block whose guard had become an inline `pr_owned || sess || claim_live`
+#     chain. Round 1 stripped comments.
+#   * stripping comments left the SPELLING pinned (`"$PR"` vs `"${PR}"`), so the same call in the
+#     brace form reddened the shard and reported a guard that had not been replaced. Round 2 added
+#     brace/quote tolerance.
+#   * and the tolerant matcher was STILL a prose test, because it matched TEXT THAT NEVER RUNS: with the
+#     shipped call replaced by that same inline chain plus a dead `if false; then pr_owner_live "$PR"
+#     "$HEAD_N" "${BR:-}"; fi` on the next line, this arm printed its ✅ line and the suite reported
+#     126/0 — on the one invariant it exists to hold. Nothing behavioural backstops it (`PL_MOD` is set
+#     only inside the (2b) subshell), and under `PL_MOD=1` the inline arm 3 (`claim_live`) treats a
+#     pid-less lock as free where the shipped arm 3 (`pl_verdict`) treats it as OWNED — so the uncaught
+#     replacement spawns a second worker onto a live claim, i.e. exactly the two-lanes-one-branch
+#     direction this file exists to red.
+# ⛔ SO: `drive_route` sources the SAME shipped body under `_shipped_pr_owner_live` and defines
+# `pr_owner_live` as a counting wrapper. A replacement CANNOT report a call, a dead branch cannot report
+# one, and a comment cannot report one — while every equivalent spelling of a real call does, because it
+# runs. The assertions live in §2, next to the drives that must reach the guard, plus a non-vacuity arm
+# that proves the counter can read 0 (otherwise "called" would be indistinguishable from a constant).
 # [railrefusal] is a plain statement block inside a function in merge-one.sh; at FILE scope the
 # function-local `local`s it does not use are fine, but `tail`/`wc` are external on purpose.
 [ -s "$TMP/isnum.sh" ] || { echo "FATAL: is_num/is_limit not found in orch-loop.sh"; exit 1; }
@@ -217,7 +261,7 @@ echo "=== B: the router spawns ONE fixer on a refusal, and re-rails when the hea
 drive_route() {
   [ "${KEEP:-0}" = "1" ] || rm -rf "$TMP/rO"
   mkdir -p "$TMP/rO/state"
-  : > "$TMP/spy"; : > "$TMP/d.log"; : > "$TMP/rows"
+  : > "$TMP/spy"; : > "$TMP/d.log"; : > "$TMP/rows"; : > "$TMP/guardcalls"
   : > "$TMP/lanes"; _i=0
   while [ "$_i" -lt "${4:-0}" ]; do echo "fix-$_i" >> "$TMP/lanes"; _i=$((_i+1)); done
   if [ "${1:-none}" != "none" ] && { [ "${SEED_REC:-0}" = "1" ] || [ "${KEEP:-0}" != "1" ]; }; then
@@ -232,6 +276,11 @@ drive_route() {
     unwritable) rm -f "$TMP/rO/state/redfix-4242"; mkdir -p "$TMP/rO/state/redfix-4242" ;;
   esac
   [ "${9:-0}" = "1" ] && : > "$TMP/rO/state/fixbail-4242-${3}"
+  # ⛔ A PID-LESS LOCK, ON DEMAND (#3095 review, cycle 4). This is the ONE input on which the SHIPPED
+  # predicate and an inline `pr_owned || sess || claim_live` chain return OPPOSITE answers, so it is what
+  # proves the block ACTED ON the guard rather than merely calling it — see the (2c) arms. Seeded here,
+  # AFTER the `rm -rf`, so a wiping drive still starts with it.
+  [ "${PL_LOCK_PIDLESS:-0}" = "1" ] && : > "$TMP/rO/state/mergeclaim-4242.lock"
   (
     PR=4242; BR=fix/thing; OR=daniel-ospina/agent-infra; REPO=/nonexistent
     O="$TMP/rO"; LOG="$TMP/d.log"; HEAD_N="${3:-}"
@@ -255,6 +304,47 @@ drive_route() {
     # the sha is empty, so `claim_live "$PR"` without it makes the cross-box arm dead in production
     # while a stub that ignores its arguments keeps the suite green.
     claim_live() { [ "$2" = "$HEAD_N" ] && [ "$CLAIM_HELD" = "1" ]; }
+    # ⛔ THE OWNERSHIP GUARD'S DEPENDENCIES, DECLARED — NOT ASSUMED AWAY (2026-10-25). `pr_owner_live`
+    # is the SHIPPED predicate (extracted at the top of this file) and it reads three facts:
+    #   arm 1 `pr_owned`  — a live process whose cwd is in the PR's checkout, a cmdline-BOUND lock, or
+    #                       a live FOREIGN lease. Not reproducible in a temp fixture (it scans the
+    #                       process table and the worktree), so it is stubbed at `PR_OWNED` here. The
+    #                       REAL drive of this arm is `live-ownership.test.sh`, which extracts the
+    #                       SHIPPED `pr_owned` and calls it against a live process, a foreign live
+    #                       lease and another head (#3095 review, cycle 2 — an earlier draft of this
+    #                       comment cited `pr-owner-liveness.test.sh` and the (2b) arm, and BOTH were
+    #                       false: that suite drives `pl_verdict` and never names `pr_owned`, and (2b)
+    #                       stubs arm 1 out). ⛔ Arm 1 is not driven through `pr_owner_live` ANYWHERE —
+    #                       that is this arm's stated limit, not a coverage claim.
+    #   arm 2 `sess`      — the worker RECORD: `fix-<PR>` / `review-<PR>` / `merge-<PR>`. Stubbed above,
+    #                       and this is the arm the §2 idempotence assertions are really about.
+    #   arm 3 `claim_live`— the cross-box SPAWN GUARD (rc 1 = not held). Stubbed above, with the head
+    #                       argument ASSERTED by the stub, so the cross-box arm cannot go dead.
+    # Without this depth the block's call is an undefined command (rc 127, falsy) and every suppression
+    # arm silently grades a spawn: the exact red this suite measured on origin/main.
+    # ⛔ ASSERT THE FORWARDED ARGUMENTS (review, #3095 cycle 2). Same discipline as the `claim_live`
+    # stub above, and for the same reason. The shipped arm forwards `pr_owned "$pr" "$sha" "$br"`,
+    # and two of its three answers are GATED on arguments: the live-cwd arm needs a non-empty `br`
+    # and the foreign-lease arm needs a non-empty `sha`. So a mutant that forwards only the PR —
+    # `pr_owned "$pr"` — reads UN-OWNED for a live worker in the PR's checkout and for a live
+    # foreign claim, i.e. it spawns a second fixer onto a branch a live worker holds. Measured on a
+    # scratch checkout of the shipped loop: with that mutant an argument-ignoring stub stayed
+    # `122 passed, 0 failed` — green on the exact two-lanes-one-branch direction this file exists to
+    # red. The assertions are what make the forwarding observable.
+    pr_owned() {
+      [ "$1" = "$PR" ] && [ "$2" = "$HEAD_N" ] && [ "$3" = "$BR" ] && [ "${PR_OWNED:-0}" = "1" ]
+    }
+    # ⛔ THE COUNTING WRAPPER (see the note at the extraction, above). The SHIPPED body is sourced under
+    # `_shipped_pr_owner_live`; `pr_owner_live` bumps a counter and forwards `"$@"` unchanged, so the
+    # block's behaviour is UNMODIFIED while its execution of the shipped predicate becomes observable.
+    # No `local`: the counter must survive across calls inside this subshell.
+    . "$TMP/ownerlive-renamed.sh"
+    RF_GUARD_CALLS=0
+    pr_owner_live() { RF_GUARD_CALLS=$((RF_GUARD_CALLS + 1)); _shipped_pr_owner_live "$@"; }
+    # ⛔ ROUTE_PL_MOD=1 arms the shipped predicate's arm 3 (the `pl_verdict` RELEASE/OWNED module). Without
+    # it the predicate never reaches `pl_verdict` and the (2c) arms cannot make the two predicates
+    # disagree. Sourced here, like the (2b) subshell does, so the arm is the REAL module.
+    if [ "${ROUTE_PL_MOD:-0}" = "1" ]; then . "$HERE/pr-owner-liveness.sh"; PL_MOD=1; fi
     # `head_reds` asks gh; the stub answers the three shapes it can return. A stub that printed
     # nothing would make the role read UNKNOWN everywhere and silently grade the wrong branch.
     gh() { printf '[{"name":"lint","state":"%s"}]\n' "${GH_STATE:-FAILURE}"; return 0; }
@@ -301,9 +391,13 @@ drive_route() {
       echo FALLTHROUGH >> "$TMP/d.log"
       break
     done
+    # The ONE observation the parent can read out of this subshell. Written last, so it is present even
+    # on a drive that returned early (0 calls).
+    echo "GUARD_CALLS=$RF_GUARD_CALLS" > "$TMP/guardcalls"
   ) >/dev/null 2>&1
 }
 spawns()   { awk 'END{print NR+0}' "$TMP/spy" 2>/dev/null; }
+guard_calls() { sed -n 's/^GUARD_CALLS=//p' "$TMP/guardcalls" 2>/dev/null | head -1; }
 acts()     { awk -F'\t' '$4=="act"'  "$TMP/rows" 2>/dev/null | wc -l | tr -d ' '; }
 waits()    { awk -F'\t' '$4=="wait"' "$TMP/rows" 2>/dev/null | wc -l | tr -d ' '; }
 redfix_n() { awk '{print $2}' "$TMP/rO/state/redfix-4242" 2>/dev/null; }
@@ -358,6 +452,17 @@ drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefde
 { [ "$(redfix_n)" = "0" ] || [ ! -f "$TMP/rO/state/redfix-4242" ]; } \
   && ok "(2) the suppressed spawn consumes NO attempt" \
   || bad "(2) the suppressed spawn consumed an attempt ([$(redfix_n)])"
+# ⛔ THE BLOCK MUST **EXECUTE** THE SHIPPED GUARD — not mention it, and not reach it down a dead branch.
+# The drive above is a suppression that only the shipped predicate can produce (arm 2, `sess fix-4242`),
+# so a zero here means the block answered the question with something OTHER than the shipped function.
+# Measured before this arm existed: the inline-chain-plus-dead-call block ran this very drive and the
+# suite stayed 126/0. `-ge 1` (not `= 1`) is deliberate — the invariant is "the block ASKS the shipped
+# guard"; reddening a block that legitimately asks it twice would be a false red, which is the cheaper
+# error to avoid of the two but still an error.
+_gc="$(guard_calls)"; _gc="${_gc//[!0-9]/}"
+[ "${_gc:-0}" -ge 1 ] \
+  && ok "(2) the block EXECUTED the shipped ownership guard on that drive (${_gc} call(s)) — a replacement, a dead branch or a comment cannot report a call" \
+  || bad "(2) the [redfix] block did not EXECUTE pr_owner_live (read [$(guard_calls)] call(s)) — its ownership guard was replaced, not driven. ⚠️ THIS ARM GRADES INVOCATION ONLY: it cannot see a call whose ANSWER is discarded, and a decorative call beside an inline chain reads green here. That is the (2c) arms' job, below — do not read this ✅ as 'the block acts on the shipped guard'."
 # Two whole cycles back to back: the first spawns, the second (same state, session now live) must not.
 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
 _first="$(spawns)"
@@ -366,6 +471,132 @@ _second="$(spawns)"
 [ "$_first" = "1" ] && [ "$_second" = "0" ] \
   && ok "(2) cycle 1 spawns 1, cycle 2 spawns 0 — idempotent across cycles, not just within one" \
   || bad "(2) across cycles: first=$_first second=$_second"
+# ...and the SHIPPED predicate's OTHER arm (arm 1: a live process / bound lock / foreign lease owns
+# the PR) must suppress too. Stubbed at `pr_owned`, so this grades the BLOCK's wiring, not the arm.
+PR_OWNED=1 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
+[ "$(spawns)" = "0" ] && ok "(2) a LIVE PROCESS owning the PR suppresses the spawn (the guard's arm 1 is wired, not just its session arm)" \
+  || bad "(2) spawns=$(spawns) with a live process owning the PR — arm 1 of the ownership guard is not consulted"
+# ⛔ (2c) THE DECISION, NOT THE INVOCATION (#3095 review, cycle 4). The counter above grades "was the
+# guard CALLED"; a block that calls it DECORATIVELY — `pr_owner_live … >/dev/null 2>&1 || true` — and
+# answers from an inline chain is STILL a second predicate for one question, and it read 124/0 with the
+# arm above ✅ (measured at this head). So this pair drives the ONE input on which the shipped predicate
+# and an inline `pr_owned || sess || claim_live` chain give OPPOSITE answers:
+#   * a `mergeclaim-4242.lock` that EXISTS but carries NO readable pid, under `PL_MOD=1`.
+#     Shipped arm 3 (`pl_verdict`) says **OWNED** — a lock whose pid is not yet written is a claim
+#     MID-CREATION, treated live and never reaped (`pr-owner-liveness.sh:106-111`, "THE CREATION WINDOW
+#     IS NOT A DEAD OWNER"). The inline chain's `claim_live` says **free**.
+# So suppression in drive 1 can only come from ACTING ON the shipped answer, and drive 2 (same drive,
+# lock removed → `pl_verdict` RELEASES) must SPAWN — otherwise the pair would pass on any block that
+# suppresses for an unrelated reason, i.e. the same shape of false PASS this file keeps re-learning.
+# ⛔ AND THE DIVERGENCE IS THE POINT, not a fixture detail: #2831 exists to keep ONE predicate for this
+# question, and the header above records that an uncaught replacement SPAWNS a second worker onto a live
+# claim. This pair is that claim driven instead of asserted.
+PL_LOCK_PIDLESS=1 ROUTE_PL_MOD=1 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
+[ "$(spawns)" = "0" ] \
+  && ok "(2c) a pid-less lock under PL_MOD=1 reads OWNED to the SHIPPED predicate, and the block ACTED on it: it suppressed instead of spawning on a claim mid-creation" \
+  || bad "(2c) spawns=$(spawns) — the block did not act on the shipped guard's answer: with a pid-less lock the shipped arm 3 says OWNED and an inline \`claim_live\` says free, so a SPAWN means the answer was DISCARDED (a decorative call is not a decision)"
+ROUTE_PL_MOD=1 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
+[ "$(spawns)" = "1" ] \
+  && ok "(2c) ...and with NO lock the same drive SPAWNS (pl_verdict RELEASES) — so the arm above grades the guard's ANSWER, not suppression in general" \
+  || bad "(2c) spawns=$(spawns) with no lock — the drive suppresses for a reason of its own, so the arm above proves nothing about the guard"
+
+# ⛔ NON-VACUITY FOR THE CALL COUNTER: it must be able to read 0. A drive whose block never runs (no
+# `railrefusal-4242` record, so the role's entry condition fails) has to report zero calls, or `-ge 1`
+# above is satisfied by a constant and grades nothing.
+# `KEEP` is deliberately NOT set: the role's entry condition is `-f $O/state/railrefusal-<pr>`, and a
+# KEEP=1 drive skips the `rm -rf` while also declining to re-seed that record — so the PREVIOUS drive's
+# record survives, the block runs, and this arm silently measured 1 call (found by this arm on itself).
+drive_route none deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 1 0 ""
+[ "$(guard_calls)" = "0" ] \
+  && ok "(2) ...and the counter reads 0 when the role never runs — 'called' is a MEASUREMENT of the block, not a constant" \
+  || bad "(2) the guard-call counter reads [$(guard_calls)] on a drive that cannot reach the block — it is not measuring the block, so the arm above grades a constant"
+
+echo
+echo "  -- (2b) the ownership guard reads a REAL process, not a stub --"
+# ⛔ THE PREDICATE DRIVEN AGAINST A REAL PID AND A REAL LOCK FILE, IN BOTH DIRECTIONS. The §2 arms
+# above prove the BLOCK asks the guard; this proves the GUARD answers correctly about a process that
+# really exists — which is the question an operator has when a red PR is refused a fixer
+# ("is the fixer I think is running actually seen?"). The `[redfix]` fragment's suppression arm and
+# the fleet's `[select]`/`[pr]` arms read the same function, so a predicate that cannot see a live
+# worker double-fixes (two lanes, one branch) or refuses to fix (the measured stall).
+# Nothing is stubbed here except the three facts a temp fixture cannot have: `pr_owned` (arm 1 — stubbed
+# OUT and RECORDED as such, so a wrong-argument call is caught rather than silently answering; the real
+# drive of that arm is `live-ownership.test.sh`) and the session/claim records. What this arm really
+# proves is arm 3: `pl_verdict` deciding about a pid that genuinely exists, and reaping when it is gone.
+OL="$TMP/ol"; mkdir -p "$OL/state"; : > "$OL/log"
+# A SUBSHELL, deliberately: it sources the shipped module and sets PL_MOD/LOG, and a leak of those
+# into the main shell would silently re-point every LATER drive at the release arm instead of the
+# ownership arm (measured while writing this arm: a stray `[` instead of `(` leaked `PL_MOD=1` and
+# turned the cross-box case red for a reason that had nothing to do with the cross-box case).
+(
+  O="$OL"; LOG="$OL/log"; PL_MOD=1
+  . "$HERE/pr-owner-liveness.sh"
+  . "$TMP/ownerlive.sh"
+  # arm 1 must still be ASKED with the shipped argument order, even though it is stubbed out here. Two
+  # things make that real, and NEITHER is optional (#3095 review, cycle 3):
+  #   * a wrong-argument call leaves a marker (`ARM1=wrong-args`); and
+  #   * the branch argument is driven NON-EMPTY. Driven as `""` — which is how this fixture used to call
+  #     it — `[ "$3" = "" ]` is satisfied by a TWO-argument call too, so the assertion could not see a
+  #     dropped `br`, which is the one argument the live-cwd arm of the shipped `pr_owned` is gated on.
+  #   * and the call must HAPPEN at all: a stub that is never called proves nothing, so the count is
+  #     asserted below against the number of drives. Measured before this: with the shipped arm-1 call
+  #     DELETED from `pr_owner_live`, this fixture still printed the ✅ line.
+  _a1_calls=0
+  pr_owned() {
+    _a1_calls=$((_a1_calls + 1))
+    { [ "$1" = "4242" ] && [ "$2" = "$H" ] && [ "$3" = "fix/thing" ]; } || echo 'ARM1=wrong-args'
+    return 1
+  }
+  sess() { return 1; }
+  claim_live() { return 1; }
+  H="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  # A REAL worker: a live child holding this PR's lock, exactly as `fix-one.sh` does for a whole run.
+  sleep 60 &
+  _pid=$!
+  # ⛔ A LEAKED WORKER IS A SUITE DEFECT, not just untidiness: the suite-level `trap 'rm -rf "$TMP"' EXIT`
+  # removes the fixture but cannot kill this child, so an interrupted run used to leave a `sleep 300`
+  # running well past the suite. Reaped on EVERY exit path of this subshell, and the child is bounded
+  # (60 s) so an interrupt costs at most a minute. #3095 review P2.
+  trap 'kill "$_pid" 2>/dev/null || true' EXIT
+  printf '%s\n' "$_pid" > "$OL/state/mergeclaim-4242.lock"
+  if pr_owner_live 4242 "$H" fix/thing; then echo 'LIVE=owned'; else echo 'LIVE=not-owned'; fi
+  kill "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null
+  if pr_owner_live 4242 "$H" fix/thing; then echo 'DEAD=owned'; else echo 'DEAD=released'; fi
+  [ -f "$OL/state/mergeclaim-4242.lock" ] && echo 'LOCK=kept' || echo 'LOCK=gone'
+  kill "$_pid" 2>/dev/null
+  echo "ARM1_CALLS=$_a1_calls"
+) > "$OL/out" 2>&1
+case "$(cat "$OL/out")" in
+  *'ARM1=wrong-args'*) bad "(2b) the shipped predicate called arm 1 with the WRONG arguments: $(tr '\n' ' ' < "$OL/out")" ;;
+esac
+# ⛔ COMPARE THE COUNT FOR EQUALITY, NOT AS A GLOB PREFIX (#3095 review, cycle 3). A `case` pattern
+# `*'ARM1_CALLS=2'*` is an UNANCHORED substring match, so a predicate that called arm 1 twenty times
+# printed `ARM1_CALLS=20`, satisfied it, and left this ✅ standing — the arm grading "asked twice"
+# about a stub asked twenty times. Measured: 20 passed, 4 and 12 went red. Extraction + string
+# equality has no such band.
+_a1_seen="$(sed -n 's/.*ARM1_CALLS=//p' "$OL/out" | head -1)"
+_a1_seen="${_a1_seen//[!0-9]/}"
+if [ "$_a1_seen" = "2" ]; then
+  ok "(2b) arm 1 is asked EXACTLY twice with the shipped argument order (pr, head, and a NON-EMPTY branch — stubbed out, but not argument-blind)"
+else
+  # ⛔ NO BACKTICKS in this string: inside double quotes they are COMMAND SUBSTITUTION, so
+  # `` `pr_owner_live` `` executed the predicate here, printed `command not found` on the shard's
+  # stderr and left the message with a hole where the name should be — in the one red this arm exists
+  # to produce. Escaped, as every other `ok`/`bad` span in this file is.
+  bad "(2b) arm 1 was asked ${_a1_seen:-0} time(s), not 2 — \`pr_owner_live\` dropped or reordered the arm-1 call, and a stub that is never called proves nothing: $(tr '\n' ' ' < "$OL/out")"
+fi
+case "$(cat "$OL/out")" in
+  *'LIVE=owned'*) ok "(2b) a REAL live worker holding the PR's lock reads OWNED — a red-fixer sees the fixer that is actually running" ;;
+  *) bad "(2b) the shipped guard did not see a real live pid on the lock: $(tr '\n' ' ' < "$OL/out")" ;;
+esac
+case "$(cat "$OL/out")" in
+  *'DEAD=released'*'LOCK=gone'*) ok "(2b) ...and when that worker really exits, the same predicate RELEASES and removes the stale lock (the PR becomes drainable again)" ;;
+  *) bad "(2b) a dead worker was not released, or its lock survived: $(tr '\n' ' ' < "$OL/out")" ;;
+esac
+case "$(cat "$OL/log")" in
+  *'[reap] #4242 released'*) ok "(2b) the release is LOGGED with its reason (a reap nobody can read is indistinct from a lost PR)" ;;
+  *) bad "(2b) the release left no [reap] line: $(tr '\n' ' ' < "$OL/log")" ;;
+esac
 
 echo
 echo "  -- (3) the caps fire, and nothing loops --"

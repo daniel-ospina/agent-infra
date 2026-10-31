@@ -106,7 +106,7 @@ def _classify_one(monkeypatch, tmp_path, verdict):
                                                                          "refactor."}]}}) + "\n")
     monkeypatch.setattr(tc, "KILL", str(tmp_path / "TURN-CLASSIFY-OFF-does-not-exist"))
     monkeypatch.setattr(tc, "log", lambda *a, **k: None)
-    monkeypatch.setattr(tc, "lanes_with_open_question", lambda: (set(), True))
+    monkeypatch.setattr(tc, "lanes_with_open_question", lambda *_a, **_k: (set(), True))
     monkeypatch.setattr(tc, "registry", lambda: [{"lane": "L1", "ws": "WS1", "issue_label": ""}])
     monkeypatch.setattr(tc, "sh", lambda argv, timeout=120: (0, json.dumps([{
         "lane": "L1", "ws": "WS1", "sid": "abc123", "size": size,
