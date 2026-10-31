@@ -153,8 +153,9 @@ await test("parses as valid config with the expected server set", () => {
 
   // #1656: seo-intelligence is the research-ladder RUNG 1 server, added to the
   // base template after this suite was written; it is lazy (starts on demand).
+  // `exa` was removed from the base template by owner ruling 2026-10-31 (never
+  // wanted; external research is Perplexity), so it is not in `expected`.
   const expected = [
-    "exa",
     "brave-search",
     "playwright-browser",
     "gemini",
@@ -168,8 +169,8 @@ await test("parses as valid config with the expected server set", () => {
   ok(tortoise.cwd.includes("TORTOISE_HOME"), "tortoise cwd uses TORTOISE_HOME");
   ok(tortoise.env.PYTHONPATH.includes("TORTOISE_HOME"), "PYTHONPATH uses TORTOISE_HOME");
 
-  // #199/#419: tiering — tortoise is the eager core; exa is lazy (semantic/scholarly fallback, #419).
-  equal(config.mcpServers.exa.lazy, true, "exa is lazy (#419 — not core)");
+  // #199/#419: tiering — tortoise is the eager core; every other server is lazy.
+  // (`exa`'s "lazy fallback" assertion that lived here is gone with the server.)
   equal(config.mcpServers.tortoise.lazy, undefined, "tortoise is core (eager)");
   equal(config.mcpServers["playwright-browser"].lazy, true, "playwright is lazy");
   equal(config.mcpServers.gemini.lazy, true, "gemini is lazy");
