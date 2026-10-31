@@ -4983,6 +4983,29 @@ if [ -f "$CSS" ]; then
     cp "$HERE/$_nf" "$CSD/payload/$_nf"
   done
   rm -rf "$CSD/payload"
+  # ⛔ THE LIBRARY THE FLAT DEPLOY SOURCES IS ONE DIRECTORY OFF THIS SCRIPT (review P1, agent-infra#3146).
+  # `deploy-mac-orchestrator.sh` stages `scripts/lib/lane-ceiling.sh` to `$O/lib/`, and `install.sh`
+  # SOURCES it there — the whole `capacity:` line and the whole drift verdict are its bytes. Every arm
+  # above copies only this directory, so the compared set could never see it: measured at this head, a
+  # one-byte append to `$O/lib/lane-ceiling.sh` printed "ok: one source of truth" and exited 0. The
+  # control arm is what makes the second arm non-vacuous (it proves the fixture is otherwise clean, so
+  # rc 1 is attributable to the append and not to a missing file).
+  rm -rf "$TMP/csslib"; mkdir -p "$TMP/csslib/repo/scripts/lib" "$TMP/csslib/o"
+  cp -a "$HERE" "$TMP/csslib/repo/scripts/orchestrator-harness"
+  printf '#!/usr/bin/env bash\nlc_selftest_fixture() { :; }\n' > "$TMP/csslib/repo/scripts/lib/lane-ceiling.sh"
+  cp -a "$HERE"/. "$TMP/csslib/o"/
+  mkdir -p "$TMP/csslib/o/lib"
+  cp "$TMP/csslib/repo/scripts/lib/lane-ceiling.sh" "$TMP/csslib/o/lib/lane-ceiling.sh"
+  CSSL="$TMP/csslib/repo/scripts/orchestrator-harness/check-single-source.sh"
+  bash "$CSSL" --o "$TMP/csslib/o" >/dev/null 2>&1
+  ck "check-single-source: an IDENTICAL deployed \$O/lib/lane-ceiling.sh passes (control)" $?
+  printf '\n# STALE\n' >> "$TMP/csslib/o/lib/lane-ceiling.sh"
+  cssl_out="$(bash "$CSSL" --o "$TMP/csslib/o" 2>&1)"; rc=$?
+  [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a diverged \$O/lib/lane-ceiling.sh exited $rc — the flat deploy's library is outside the compared set again"; }
+  ck "check-single-source: a ONE-BYTE divergence in the deployed \$O/lib/lane-ceiling.sh is refused (rc 1)" $rc
+  grep -qF -- 'DIFFERS from canonical: lib/lane-ceiling.sh' <<<"$cssl_out" && rc=0 || rc=1
+  ck "…and the DIVERGENCE names lib/lane-ceiling.sh, not an unrelated file" $rc
+  rm -rf "$TMP/csslib"
   # ⛔ A SHIPPED NAME WITH WHITESPACE IS STILL A SHIPPED FILE (review P2, round 4): `DEPLOY_SET` was a
   # whitespace-joined STRING, so `hotfix 2.sh` split into two tokens that name nothing and a DIVERGING
   # copy reported "ok: one source of truth" (measured rc 0 with a live control at rc 1).
