@@ -271,12 +271,32 @@ mksw survive/5-awk-multi.sh \
   '  $1 == b { print $2 }' \
   "' f.txt" \
   "sed -i 's/a/b/' f.txt"
+# 6 — ANSI-C quoting: `\` ESCAPES the quote inside `$'…'`, so the span does not close at the first
+#     apostrophe. Reading it as closed RE-OPENS a phantom span and every later line becomes data.
+mkdir -p "$TMP/tree/survive"
+cat >"$TMP/tree/survive/6-ansi-c.sh" <<'C8ANSI'
+#!/usr/bin/env bash
+msg=$'it\'s a live lane\'s checkout'
+echo "$msg"
+sed -i 's/a/b/' f.txt
+C8ANSI
+printf '%s\n' survive/6-ansi-c.sh >>"$SW"
+# 7 — a QUOTED argument that merely SPELLS a heredoc opener is DATA, not an opener.
+mksw survive/7-phantom-open.sh \
+  '#!/usr/bin/env bash' \
+  'x="a \" cat <<EOF b"' \
+  "sed -i 's/a/b/' f.txt"
+# 8 — CRLF: an exact terminator compare that keeps the \r never matches, so the body never ends.
+mkdir -p "$TMP/tree/survive"
+printf '#!/bin/bash\r\ncat <<EOF\r\nbody\r\nEOF\r\nsed -i \x27s/a/b/\x27 f\r\n' >"$TMP/tree/survive/8-crlf.sh"
+printf '%s\n' survive/8-crlf.sh >>"$SW"
 
 run_check "$SW" --no-baseline
 # EVERY ASSERTION IS PER FILE: a desync in ONE fixture must not be blamed on the other four (the
 # first version grepped the whole output, so one bad fixture reddened all five arms).
 for f in survive/1-comment-sub.sh survive/2-len-arith.sh survive/3-shift.sh \
-         survive/4-heredoc-sub.sh survive/5-awk-multi.sh; do
+         survive/4-heredoc-sub.sh survive/5-awk-multi.sh survive/6-ansi-c.sh \
+         survive/7-phantom-open.sh survive/8-crlf.sh; do
   mine="$(awk -v f="$f" 'index($0, f ":") == 1' "$OUT")"
   if printf '%s\n' "$mine" | grep -qE 'context-unbalanced|heredoc-unterminated'; then
     bad "C8: CONTEXT DESYNC on $f — the model lost the quote state on a real construct"
@@ -293,6 +313,87 @@ mksx() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n
 mksx unbalanced/1.sh '#!/usr/bin/env bash' 'x="$( # an apostrophe here must not hide the rest' 'true'
 flags "context-unbalanced" "$SX" && ok "C9: an UNCLOSED context is reported, not silently swallowed" \
   || bad "C9: an unclosed context was NOT reported — the scan ended without a word (false PASS)"
+
+# ── C10. THE SHAPES A REVIEW CYCLE CORRECTED — one assertion each ───────────────────────────────
+# Every entry below was WRONG at some point in this change review history, and each fix is only as
+# durable as its arm: without these, a later edit can revert one and the suite still reports green.
+# Two directions, because a detector fails in two ways: a MISSED trap (C10a) and a WRONGLY RED trap
+# on portable code (C10b).
+Z="$TMP/fixed"; : >"$Z"
+mkz() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$Z"; }
+mkz fixed/1-assign-timeout.sh   '#!/usr/bin/env bash' 'FOO=1 timeout 5 cmd'
+mkz fixed/2-assign-sed.sh       '#!/usr/bin/env bash' "LC_ALL=C sed -i 's/a/b/' f.txt"
+mkz fixed/3-probe-other.sh      '#!/usr/bin/env bash' 'command -v jq >/dev/null 2>&1' 'timeout 5 cmd'
+mkz fixed/4-env-timeout.sh      '#!/usr/bin/env bash' 'env FOO=1 timeout 5 sleep 1'
+mkz fixed/5-sudo-sed.sh         '#!/usr/bin/env bash' "sudo -u root sed -i 's/a/b/' f.txt"
+mkz fixed/6-xargs-timeout.sh    '#!/usr/bin/env bash' 'xargs -n1 timeout 5 echo'
+mkz fixed/7-sed-cluster-i.sh    '#!/usr/bin/env bash' "sed -Ei 's/a/b/' f.txt"
+mkz fixed/8-sed-cluster-ni.sh   '#!/usr/bin/env bash' "sed -ni 'p' f.txt"
+mkz fixed/9-sed-long.sh         '#!/usr/bin/env bash' "sed --in-place 's/a/b/' f.txt"
+mkz fixed/10-stat-attached.sh   '#!/usr/bin/env bash' 'stat -c%s f.txt'
+mkz fixed/11-date-attached.sh   '#!/usr/bin/env bash' 'd=$(date -d@0 +%s)'
+mkz fixed/12-stat-long.sh       '#!/usr/bin/env bash' 'stat --format=%Y f.txt'
+mkz fixed/13-date-long.sh       '#!/usr/bin/env bash' 'd=$(date --date=@0 +%s)'
+mkz fixed/14-readlink-long.sh   '#!/usr/bin/env bash' 'p=$(readlink --canonicalize ./x)'
+mkz fixed/15-local-A.sh         '#!/usr/bin/env bash' 'f() { local -A m; m[x]=1; }'
+mkz fixed/16-typeset-A.sh       '#!/usr/bin/env bash' 'typeset -A n'
+mkz fixed/17-stat-then-rm.sh    '#!/usr/bin/env bash' 'm="$(stat -c %Y "$f" 2>/dev/null || rm -f "$f")"'
+mkz fixed/18-date-then-rm.sh    '#!/usr/bin/env bash' 'd="$(date -d @0 +%s)"; rm -r "$tmp"'
+run_check "$Z" --no-baseline
+for pair in \
+  "timeout-absent-on-macos fixed/1-assign-timeout.sh" \
+  "sed-in-place-gnu fixed/2-assign-sed.sh" \
+  "timeout-absent-on-macos fixed/3-probe-other.sh" \
+  "timeout-absent-on-macos fixed/4-env-timeout.sh" \
+  "sed-in-place-gnu fixed/5-sudo-sed.sh" \
+  "timeout-absent-on-macos fixed/6-xargs-timeout.sh" \
+  "sed-in-place-gnu fixed/7-sed-cluster-i.sh" \
+  "sed-in-place-gnu fixed/8-sed-cluster-ni.sh" \
+  "sed-in-place-gnu fixed/9-sed-long.sh" \
+  "stat-c-gnu fixed/10-stat-attached.sh" \
+  "date-d-gnu fixed/11-date-attached.sh" \
+  "stat-c-gnu fixed/12-stat-long.sh" \
+  "date-d-gnu fixed/13-date-long.sh" \
+  "readlink-f-bsd-absent fixed/14-readlink-long.sh" \
+  "bash4-declare-A fixed/15-local-A.sh" \
+  "bash4-declare-A fixed/16-typeset-A.sh" \
+  "stat-c-gnu fixed/17-stat-then-rm.sh" \
+  "date-d-gnu fixed/18-date-then-rm.sh"
+do
+  set -- $pair
+  if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    ok "C10a: caught $1 in $(basename "$2")"
+  else
+    bad "C10a: MISSED $1 in $(basename "$2") — a corrected shape regressed"
+  fi
+done
+
+Z2="$TMP/fixed-clean"; : >"$Z2"
+mkz2() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$Z2"; }
+mkz2 fixed-clean/1-grep-i-sed.sh '#!/usr/bin/env bash' "grep -i foo f.txt | sed -e 's/a/b/' g.txt"
+mkz2 fixed-clean/2-ssh-i-sed.sh  '#!/usr/bin/env bash' "ssh -i key h true; sed -i.bak -e 's/a/b/' f"
+mkz2 fixed-clean/3-readlink.sh   '#!/usr/bin/env bash' 'readlink x || grep -f pats f'
+mkz2 fixed-clean/4-mapfile-arg.sh '#!/usr/bin/env bash' 'grep -n mapfile README.md'
+mkz2 fixed-clean/5-probe-timeout.sh '#!/usr/bin/env bash' 'if command -v -- timeout >/dev/null 2>&1; then timeout 5 true; fi'
+run_check "$Z2" --no-baseline
+if [ "$?" = 2 ]; then
+  bad "C10b: the portable-code arm was REFUSED (rc=2) — an empty scan proves nothing"
+else
+  for pair in \
+    "sed-in-place-gnu fixed-clean/1-grep-i-sed.sh" \
+    "sed-in-place-gnu fixed-clean/2-ssh-i-sed.sh" \
+    "readlink-f-bsd-absent fixed-clean/3-readlink.sh" \
+    "bash4-mapfile fixed-clean/4-mapfile-arg.sh" \
+    "timeout-absent-on-macos fixed-clean/5-probe-timeout.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      bad "C10b: FALSE POSITIVE — $1 reded on portable $(basename "$2")"
+    else
+      ok "C10b: portable code NOT flagged ($(basename "$2"))"
+    fi
+  done
+fi
 
 # ── D. MUTANTS — every rule above must be LOAD-BEARING ──────────────────────────────────────────
 # Each mutant deletes ONE `hit(...)` dispatch line from a copy of the detector and re-runs the arm
@@ -619,6 +720,18 @@ fi
 
 # ── REPORT ──────────────────────────────────────────────────────────────────────────────────────
 printf '\n────────────────────────────────────────\n'
+# ── F8. `--help` IS THE FLAG DOCUMENTATION, SO IT MUST BE COMPLETE AND ACCURATE ─────────────────
+# A pinned line range cut the header off mid-sentence and never printed USAGE or EXIT (review
+# cycle-3 P2), and `--baseline FILE` was implemented but undocumented. Both are checked as text, so
+# the help output cannot drift from the parser again without an arm going red.
+help_out="$(bash "$CHECK" --help 2>/dev/null)"
+printf '%s\n' "$help_out" | grep -q 'USAGE' && printf '%s\n' "$help_out" | grep -q 'EXIT:' \
+  && ok "F8a: --help prints the whole header (USAGE and EXIT are present, not truncated by a pinned range)" \
+  || bad "F8a: --help output is truncated — it is missing USAGE and/or EXIT"
+printf '%s\n' "$help_out" | grep -q -- '--baseline FILE' \
+  && ok "F8b: --help documents every flag the parser accepts (--baseline is listed)" \
+  || bad "F8b: --help omits a flag the parser accepts (--baseline)"
+
 printf 'PASS %d · FAIL %d · SKIP %d · UNPROVEN %d   [ran on %s, bash %s]\n' \
   "$PASS" "$FAIL" "$SKIP" "$UNPROVEN" "$OS" "$BASHV"
 if [ "$FAIL" -gt 0 ]; then

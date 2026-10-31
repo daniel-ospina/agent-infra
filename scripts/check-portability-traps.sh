@@ -91,7 +91,8 @@
 #   bash scripts/check-portability-traps.sh --no-baseline   # strict: every finding is a finding
 #   bash scripts/check-portability-traps.sh --list-rules    # the rule table (id, trap, replacement)
 #   bash scripts/check-portability-traps.sh --emit-baseline # print a baseline for the current tree
-#   bash scripts/check-portability-traps.sh --root DIR --targets FILE
+#   bash scripts/check-portability-traps.sh --root DIR --targets FILE   # scan a fixture tree
+#   bash scripts/check-portability-traps.sh --baseline FILE             # ratchet against another file
 #
 # EXIT: 0 clean (possibly with grandfathered findings) · 1 a NEW trap is present · 2 usage/refusal
 #
@@ -151,7 +152,9 @@ RULES
 
 case "$MODE" in
   help)
-    sed -n '2,80p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # THE RANGE IS DERIVED, NOT PINNED (review cycle-3 P2): `2,80p` cut the header off mid-sentence
+    # and never printed the USAGE or EXIT sections once the header grew past line 80.
+    sed -n '2,/^set -uo pipefail/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
     exit 0 ;;
   list-rules)
     printf '%s\n' "$RULES" | awk -F'\t' '{ printf "%-28s\n  trap:        %s\n  replacement: %s\n", $1, $2, $3 }'
@@ -492,14 +495,21 @@ function cp(code, tool,   re) {
   # wrapper word that puts its next word in command position; and the tool may be spelled with a PATH.
   kw = "(if|then|elif|else|do|while|until|exec|env|sudo|command|nohup|xargs|time|!|eval|busybox|stdbuf)"
   pfx = "([-./][^ \t]*/)?"
-  re = "(^|" SEP ")[ \t]*" kw "?[ \t]*" pfx tool "([ \t]|$)"
-  re2 = "(^|" SEP ")[ \t]*" pfx tool "([ \t]|$)"
+  # A LEADING `VAR=value` ASSIGNMENT DOES NOT END COMMAND POSITION (review cycle-3 P0): `FOO=1
+  # timeout 5 cmd` and `LC_ALL=C sed -i ...` are ordinary shell, and every one of the 19 rules was
+  # blind to them. Measured on this tree: `scripts/orchestrator-harness/gh-limit.test.sh` has SEVEN
+  # executable `timeout` calls, three of them assignment-prefixed (1093, 1233, 1593), and the
+  # detector reported four — the baseline row was saturated at 4, so those three live macOS traps sat
+  # there reported CLEAN, and a lane could add another one and stay green.
+  asg = "([A-Za-z_][A-Za-z0-9_]*=[^ \t;&|(){}]*[ \t]+)*"
+  re = "(^|" SEP ")[ \t]*" asg kw "?[ \t]*" pfx tool "([ \t]|$)"
+  re2 = "(^|" SEP ")[ \t]*" asg pfx tool "([ \t]|$)"
   # ⛔ A WRAPPER OFTEN CARRIES ITS OWN ARGUMENTS (review cycle-2 P2): `env FOO=1 timeout 5 …`,
   # `sudo -u root sed -i …`, `xargs -n1 timeout 5 …`, `nice -n 5 sed -i …` all put words between the
   # wrapper and the tool, and the tight form above required them adjacent — so every one of those
   # shapes was CLEAN. Up to three words are allowed through; the cost is a rare false POSITIVE after
   # a wrapper keyword (visible, one reasoned escape away), never a silent pass over a real trap.
-  re3 = "(^|" SEP ")[ \t]*" kw "([^;&|(){}]*[ \t])?" pfx tool "([ \t]|$)"
+  re3 = "(^|" SEP ")[ \t]*" asg kw "([^;&|(){}]*[ \t])?" pfx tool "([ \t]|$)"
   return (code ~ re || code ~ re2 || code ~ re3)
 }
 
@@ -510,6 +520,28 @@ function cp(code, tool,   re) {
 # so BOTH were invisible — including `scripts/daily-backup.sh:327`, which is scanned and contributed
 # nothing. The right border for a short option is "not another LETTER", so `-c%s` matches and a flag
 # like `-ci` does not.
+# opt_long(code, tool, name) — 1 when ONE command invokes `tool` with the GNU long option `--name`
+# (with or without `=value`). Same command scoping as cmd_opt.
+function opt_long(code, tool, name,   t, k, segs, n) {
+  t = code
+  gsub(/[|&;(){}]/, "\n", t)
+  n = split(t, segs, "\n")
+  for (k = 1; k <= n; k++) {
+    if (cp(segs[k], tool) && segs[k] ~ ("--" name "([=][^ \t]*)?([ \t]|$)")) return 1
+  }
+  return 0
+}
+# cmd_cluster(code, tool, letters) — `tool` invoked with a SHORT OPTION CLUSTER containing `letters`
+# (`readlink -nf`, `grep -qP`). Scoped to the tool own command, never to the whole line.
+function cmd_cluster(code, tool, letters,   t, k, segs, n) {
+  t = code
+  gsub(/[|&;(){}]/, "\n", t)
+  n = split(t, segs, "\n")
+  for (k = 1; k <= n; k++) {
+    if (cp(segs[k], tool) && segs[k] ~ ("(^|[ \t])-[A-Za-z]*" letters "([ \t=]|$)")) return 1
+  }
+  return 0
+}
 # cmd_opt(code, tool, opt) — 1 when ONE command on the line invokes `tool` with option `opt`.
 # Segments are split on the shell separators, so a flag belonging to a DIFFERENT command cannot
 # suppress a finding (review cycle-2 P1).
@@ -608,8 +640,12 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # ⛔ THE OPTION MAY BE CLUSTERED (review finding 6): `readlink -nf` and `grep -qP` are the same trap
   # as `-f` / `-P` and the first version missed them — including a live `grep -qP` in this change own
   # suite. Match the cluster, not the standalone word.
-  hit("readlink-f-bsd-absent",    (cp(code, "readlink") && code ~ /(^|[ \t])-[A-Za-z]*f([ \t]|$)/), "cd … && pwd -P")
-  hit("grep-P-bsd-absent",        (cp(code, "grep") && code ~ /(^|[ \t])-[A-Za-z]*P([ \t=]|$)/), "grep -E")
+  # AND THE OPTION MUST BELONG TO THAT COMMAND, NOT MERELY TO THE LINE (review cycle-3 P1): the
+  # cycle-2 discipline was applied to `sed`, `date` and `stat` but not here, so
+  # `readlink x || grep -f pats f` reded `readlink-f-bsd-absent` (there is no `-f` on readlink) and
+  # `grep -n mapfile README.md` reded `bash4-mapfile`.
+  hit("readlink-f-bsd-absent",    (cmd_cluster(code, "readlink", "f") || opt_long(code, "readlink", "canonicalize")), "cd … && pwd -P")
+  hit("grep-P-bsd-absent",        cmd_cluster(code, "grep", "P"), "grep -E")
   # ⛔ A LINE THAT ALREADY NAMES THE BSD COUNTERPART IS THE GUARDED CHAIN (review cycle-1 P2):
   # `stat -c %Y f || stat -f %m f` and `date -d @$t || date -r $t` are portable as written — that is
   # the idiom the header promises is clean — and 35 of the baselined date/stat findings were exactly
@@ -618,8 +654,11 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # `-r` let `rm -f` disarm the stat rule and `rm -r` disarm the date rule, so
   # `stat -c %Y "$f" 2>/dev/null || rm -f "$f"` — an idiom this tree writes constantly, and
   # DESTRUCTIVE on macOS, where the GNU form fails and the `||` branch runs — came back CLEAN.
-  hit("date-d-gnu",               (cp(code, "date") && opt_has(code, "-d") && !cmd_opt(code, "date", "-r")), "box_epoch_to_iso (scripts/lib/box.sh)")
-  hit("stat-c-gnu",               (cp(code, "stat") && opt_has(code, "-c") && !cmd_opt(code, "stat", "-f")), "box_mtime (scripts/lib/box.sh)")
+  # THE LONG FORM IS THE SAME TRAP (review cycle-3 P1): `date --date=@0`, `stat --format=%Y` and
+  # `readlink --canonicalize` are the GNU-only spellings of the exact options the short-form rules
+  # name (`/bin/date: illegal option -- -` on macOS), and every one of them was CLEAN.
+  hit("date-d-gnu",               (cp(code, "date") && (opt_has(code, "-d") || opt_long(code, "date", "date")) && !cmd_opt(code, "date", "-r")), "box_epoch_to_iso (scripts/lib/box.sh)")
+  hit("stat-c-gnu",               (cp(code, "stat") && (opt_has(code, "-c") || opt_long(code, "stat", "format")) && !cmd_opt(code, "stat", "-f")), "box_mtime (scripts/lib/box.sh)")
   hit("free-macos-absent",        cp(code, "free"), "vm_stat, or the box_* memory probe")
   # ⛔ `${x#/proc/}` IS A PARAMETER EXPANSION, NOT A READ (review cycle-1 P2): the `code` view keeps
   # `${…}` bodies (they are code), so the bare `/proc/` test flagged a string-strip expression. The
@@ -629,8 +668,11 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # is not a read, and the fully-quoted view carried it — 1 false finding on `scripts/harness-up`.
   # A path inside a quoted WORD is still caught, by quoted_procfs on the raw line.
   if (unexpanded(code) ~ /\/proc\// || quoted_procfs(raw)) hit("procfs-macos-absent", 1, "ps/lsof, or declare the file linux-only")
-  if (cp(code, "declare") && word_has(code, "-A")) hit("bash4-declare-A", 1, "indexed arrays, or case")
-  if (word_has(code, "mapfile") || word_has(code, "readarray")) hit("bash4-mapfile", 1, "while IFS= read -r line")
+  # `local -A` AND `typeset -A` ARE THE SAME TRAP AS `declare -A` (review cycle-3 P1): `local -A`
+  # is the common spelling inside a function and a hard failure on /bin/bash 3.2.57, and the rule
+  # tested `declare` only — so the spelling most functions actually use was invisible.
+  if ((cp(code, "declare") || cp(code, "local") || cp(code, "typeset")) && word_has(code, "-A")) hit("bash4-declare-A", 1, "indexed arrays, or case")
+  if (cp(code, "mapfile") || cp(code, "readarray")) hit("bash4-mapfile", 1, "while IFS= read -r line")
   if (code ~ /\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[,\^]{2}/) hit("bash4-case-modify", 1, "tr")
   if (code ~ /&>>/) hit("bash4-append-amp", 1, ">>f 2>&1")
   # ⛔ THE OPTION MUST BELONG TO `wait` (review cycle-1 P2): `word_has(code, "-n")` flagged
@@ -685,7 +727,12 @@ function probed(tool, code,   i, p, pr) {
   # below accepts arguments after a wrapper keyword, so `command -v -- timeout` started reading as an
   # UNGUARDED call and reded `scripts/lib/bounded.sh:67` — the one file that owns this shim. The
   # optional `--` is part of the probe, not an argument to the tool.
-  pr = "command (-v|-V) (--[ \t]+)?|(hash|type) " tool
+  # THE PROBE MUST NAME THE TOOL, IN BOTH ALTERNATIVES (review cycle-3 P0). The cycle-2 widening
+  # dropped `tool` from the FIRST alternative, so `command -v jq` on the line (or within the 8-line
+  # lookback) disarmed the timeout, setsid AND cpu rules — `timeout 300 env …` in
+  # scripts/reap-lane-venvs.test.sh:1066 was reported CLEAN on a live tree, and two of the four
+  # executable `timeout` calls in worker-terminal.test.sh were shielded by `command -v tmux`.
+  pr = "(command (-v|-V) (--[ \t]+)?|(hash|type) )" tool
   if (code ~ pr) return 1
   for (i = 1; i <= 8; i++) {
     p = (FNR - i) % 8
