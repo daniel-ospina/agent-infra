@@ -64,19 +64,35 @@ trusted_association() {
 }
 
 # ── Pure decision: given the newest completed attempt, re-run or not? ───────
-# `rerun` only when the newest attempt is a genuine red. Anything non-red is
-# left alone: re-running a green check burns a runner and can only replace a
-# PASS with a later verdict, which is strictly worse. An UNKNOWN conclusion is
-# treated as red — the merge rail's own polarity allow-list (@#2474), because a
-# value nobody named must never fall through a gap.
+# `rerun` when the newest attempt is a genuine red.
+#
+# ⛔ EXCEPT WHEN THE MARKER WAS RETRACTED (`force=1`), AND THAT EXCEPTION IS
+# LOAD-BEARING. A retraction's newest run is BY CONSTRUCTION GREEN — the gate saw
+# the marker when it ran — so a polarity that only re-runs reds would make the
+# retraction arm a log line with no effect. Measured on the first version: with a
+# stubbed `gh` returning `completed/success`, a retraction printed "re-reading the
+# gate so the stale green cannot stand" and then `skip:already-non-red`, dispatch
+# NO, exit 0. A GREEN THAT STANDS ON RETRACTED EVIDENCE IS THE STALE VERDICT THIS
+# ARM EXISTS TO KILL, so `force` re-runs it — and only it.
+#
+# `skip:in-flight` stays UNCONDITIONAL even under force: the API cannot re-run an
+# in-flight run, and pretending otherwise would be a lie in the log.
+# An UNKNOWN conclusion is treated as red — the merge rail's own polarity
+# allow-list (@#2474), because a value nobody named must never fall through a gap.
 rerun_decision() {
-  local conclusion="${1:-}" status="${2:-completed}"
+  local conclusion="${1:-}" status="${2:-completed}" force="${3:-0}"
   case "$status" in
     completed) ;;
     *) printf 'skip:in-flight'; return 0 ;;
   esac
   case "$conclusion" in
-    success|neutral|skipped|cancelled|stale) printf 'skip:already-non-red' ;;
+    success|neutral|skipped|cancelled|stale)
+      if [[ "$force" == "1" ]]; then
+        printf 'rerun:retracted'
+      else
+        printf 'skip:already-non-red'
+      fi
+      ;;
     *) printf 'rerun' ;;
   esac
 }
@@ -175,7 +191,10 @@ main() {
   fi
   marker_is_artifact "$body"; local mrc=$?
   marker_is_artifact "${PREVIOUS_COMMENT_BODY:-}"; local prc=$?
-  case "$(probe_outcome "$mrc" "$prc")" in
+  local outcome force=0
+  outcome="$(probe_outcome "$mrc" "$prc")"
+  [[ "$outcome" == "retracted" ]] && force=1
+  case "$outcome" in
     proceed) say "  scoping artifact detected on the issue" ;;
     retracted) say "  scoping artifact RETRACTED by this edit (the replaced body carried the marker) — re-reading the gate so the stale green cannot stand" ;;
     skip) say "  skip:not-a-scoping-artifact — neither this comment nor the body it replaced carries '<!-- issue-scoping:' as its first content line or as a blank-line-separated footer; nothing the gate reads has changed"; return 0 ;;
@@ -228,9 +247,9 @@ main() {
       rc=2; continue
     fi
     local decision
-    decision="$(rerun_decision "${verdict##*/}" "${verdict%%/*}")"
+    decision="$(rerun_decision "${verdict##*/}" "${verdict%%/*}" "$force")"
     case "$decision" in
-      rerun)
+      rerun|rerun:retracted)
         if gh api -X POST "repos/$repo/actions/runs/$run_id/rerun" >/dev/null 2>&1; then
           say "  PR #$pr  RERUN dispatched (run $run_id, ${verdict##*/}) — the same check over the current issue state; its verdict stands either way"
         else
@@ -267,6 +286,11 @@ if [[ "${REVALIDATE_SELF_TEST:-0}" == "1" ]]; then
     [[ "$(rerun_decision "$c" completed)" == "skip:already-non-red" ]] && ok || bad "non-red '$c' must not re-run"
   done
   [[ "$(rerun_decision failure queued)" == "skip:in-flight" ]] && ok || bad "an in-flight run must not be re-triggered"
+  # A retraction's newest run is GREEN by construction; forcing is what makes the
+  # retraction arm do anything at all.
+  [[ "$(rerun_decision success completed 1)" == "rerun:retracted" ]] && ok || bad "a GREEN run must be re-run when the marker was retracted"
+  [[ "$(rerun_decision success completed 0)" == "skip:already-non-red" ]] && ok || bad "a GREEN run must NOT be re-run otherwise"
+  [[ "$(rerun_decision failure queued 1)" == "skip:in-flight" ]] && ok || bad "force must not override skip:in-flight (the API cannot re-run it)"
 
   # The two-probe mapping. Asserted because an INLINE one-probe version of it was
   # shipped inverted (`$?` after `if !`), and no assertion covered it.

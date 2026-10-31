@@ -78,7 +78,10 @@ on:
   # the new body would call that "nothing changed" and leave the previous GREEN
   # standing on evidence that no longer exists — a fail-open. So the prior body
   # (`github.event.changes.body.from`, absent on `created`) is probed too, and a
-  # retraction re-reads the gate exactly like an addition does.
+  # retraction forces a re-read EVEN OF A GREEN RUN — a retraction's newest run is
+  # green by construction, so a polarity that only re-runs reds would leave the
+  # stale verdict standing while the log claimed otherwise (measured: the first
+  # version printed "re-reading the gate" and then dispatched nothing).
   #
   # WHAT THIS IS NOT: it does not post, edit or re-post any marker (that would be
   # manufacturing evidence), it does not touch the gate's logic or any refusal
