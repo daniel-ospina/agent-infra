@@ -1031,14 +1031,21 @@ fi
 #
 # So the deploy ends by GRADING ITS OWN RESULT: `check-farm-drift.sh` compares every deployed file
 # against the source at the ref and prints `file | deployed sha | source sha | verdict`.
-#   rc=1 (a named file differs)        → FATAL. The farm did not converge, and a stale script would
-#                                        be executed. A failed install is louder than a silent
-#                                        no-op fleet.
+#   rc=1 (a farm-DECLARED file differs, or a declared file never landed) → FATAL. The farm owes these
+#                                        and did not converge them, and a stale script would be
+#                                        executed. A failed install is louder than a silent no-op
+#                                        fleet.
 #   rc=2 (cannot compare / not the pin) → LOUD WARNING naming both shas, and the install continues:
 #                                        a fresh box legitimately has no pin record yet, and aborting
 #                                        there would fail every first-time install for a reason that
 #                                        is not a defect. The line prints on every run until it is
 #                                        resolved, which is what makes it observable.
+#   rc=3 (drift NO FARM ARRAY DELIVERS — an UNSOURCED file, or a STALE file outside the declaration)
+#                                      → LOUD WARNING and the install continues. This arm exists
+#                                        because rc=1 was fatal for them too and a deploy cannot fix
+#                                        either: measured 2026-10-31, ONE such file → rc=1 → exit 1,
+#                                        and a second full run left it stale, so the printed remedy
+#                                        could never clear it. Fatal only over what the farm owes.
 if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
   echo ""
   echo "==> Farm drift (deployed vs shipped)"
@@ -1064,7 +1071,7 @@ if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
        printf '%s\n' "$_farm_msg" | sed 's/^/      /'
        echo "    Refusing to report a successful install over a farm that launchd would execute as stale code."
        exit 1 ;;
-    3) echo "    ⚠️  farm: UNSOURCED file(s) — on the box, in no repo file (this is NOT drift, and NOT a pass):"
+    3) echo "    ⚠️  farm: files a DEPLOY CANNOT FIX (exit 3) — this is NOT a pass:"
        printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
     *) echo "    ⚠️  farm: COULD NOT VERIFY (exit $_farm_rc) — this is NOT a pass:"
        printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
