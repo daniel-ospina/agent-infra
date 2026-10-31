@@ -1868,13 +1868,26 @@ hu_row_next() {
 # reads a LIVE artefact: the scripts the box would EXECUTE are syntax-parsed where they are, and each
 # platform probe in the shim is called and must answer. A remembered "last run: ok" file is
 # deliberately absent — that is exactly the record this row refuses to trust.
+#
+# ⛔ #2930 — A TEST SUITE'S PARSE ERROR IS NOT A BOX-LEVEL BREAK, AND THIS ROW MADE IT ONE. `up`
+# REFUSES TO START on a failed self-test, so a `*.test.sh` that cannot parse on THIS host (macOS is
+# bash 3.2.57; CI is bash 5) turned a healthy controller into `selftest BROKEN` that could not be
+# started — the same catch-22 `install.sh` had, at the one place that decides whether the box runs at
+# all (`merge-reminder.test.sh` was that file). A `*.test.sh` is never executed by the controller, so
+# it joins no `bad` list: it is NAMED in the OK row instead, because the operator still needs to know
+# the suite cannot run HERE. Runtime scripts keep the refusal. The class is gated before merge by
+# scripts/check-bash32-parse.sh (a real bash 3.2 over every shipped `*.sh`, in both CI lanes).
 hu_row_selftest() {
-  local f bad="" nb=0 probes=""
+  local f bad="" nb=0 probes="" tb=""
   [ -d "$HARNESS" ] || { hu_row selftest - - "BROKEN (the harness dir $HARNESS does not exist — nothing was parsed)"; return 2; }
   for f in "$HARNESS"/*.sh; do
     [ -f "$f" ] || continue
     nb=$((nb + 1))
-    bash -n "$f" 2>/dev/null || bad="$bad $(basename "$f")"
+    if bash -n "$f" 2>/dev/null; then continue; fi
+    case "$(basename "$f")" in
+      *.test.sh) tb="$tb $(basename "$f")" ;;
+      *) bad="$bad $(basename "$f")" ;;
+    esac
   done
   [ "$nb" -gt 0 ] || { hu_row selftest - - "BROKEN (0 scripts found in $HARNESS — a check over nothing is not a pass)"; return 2; }
   # Each platform question, asked rather than assumed. The NAME goes in the row so a Mac operator can
@@ -1884,7 +1897,8 @@ hu_row_selftest() {
   if hp_stat_mtime "$0" >/dev/null 2>&1; then probes="$probes mtime"; else bad="$bad mtime"; fi
   if _t="$(hp_mktemp_d)" && [ -n "$_t" ]; then rmdir "$_t" 2>/dev/null; probes="$probes tmp"; else bad="$bad tmp"; fi
   if [ -n "$bad" ]; then hu_row selftest - - "BROKEN (failed:${bad}; parsed $nb script(s) in $HARNESS)"; return 2; fi
-  hu_row selftest - - "OK (bash -n on $nb live script(s) in $HARNESS; shim probes answered:${probes})"; return 0
+  # `tb` is REPORTED, never fatal — see the #2930 block above the loop.
+  hu_row selftest - - "OK (bash -n on $nb live script(s) in $HARNESS${tb:+; test suite(s) that do NOT parse here (#2930, reported not fatal):${tb}}; shim probes answered:${probes})"; return 0
 }
 
 # ── self-heal: the two repairs that are SAFE WHILE LANES WORK ───────────────────────────────────

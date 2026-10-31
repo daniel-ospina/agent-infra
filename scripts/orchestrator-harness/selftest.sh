@@ -100,10 +100,28 @@ PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
 # ── 1) every script parses ───────────────────────────────────────────────────────
+# ⛔ #2930 — RUNTIME AND TEST SUITES ARE NOT THE SAME RISK, AND THIS SWEEP USED TO BLOCK ON BOTH.
+# `harness-up up` REFUSES to start on a failed self-test, so a `*.test.sh` that does not parse on THIS
+# host used to stop a healthy controller from starting at all — the catch-22 `install.sh` had, one
+# level up, and it has already happened twice (this file's own comment above records the 3.2 `case`
+# pattern, and #2930 records `merge-reminder.test.sh`). A RUNTIME script still refuses: the controller
+# executes it and launchd would crash-loop. A TEST suite is reported BY NAME and never counted as a
+# failure — it cannot affect the runtime, and the class is gated before merge by
+# scripts/check-bash32-parse.sh (a real bash 3.2 over every shipped `*.sh`, in both CI lanes).
 rc=0
 for f in "$HERE"/*.sh "$HERE"/retired/*.sh; do
   [ "$(basename "$f")" = "selftest.sh" ] && continue
-  bash -n "$f" || { echo "      syntax error: $f"; rc=1; }
+  case "$(basename "$f")" in
+    *.test.sh)
+      if ! _err="$(bash -n "$f" 2>&1)"; then
+        echo "      syntax error in the TEST suite $(basename "$f") — reported, NOT fatal (#2930):"
+        printf '%s\n' "$_err" | sed 's/^/        /'
+      fi
+      ;;
+    *)
+      bash -n "$f" || { echo "      syntax error: $f"; rc=1; }
+      ;;
+  esac
 done
 ck "all shell scripts parse (bash -n)" $rc
 
