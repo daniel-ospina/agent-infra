@@ -468,6 +468,8 @@ ck "(h) …and the control stub really produced output past the idle bound (${ti
 # run, so before this change that knob was INERT on every wired path — an operator setting it would
 # have changed nothing while believing the bound had moved. Driven, not grepped: a chatty lane and a
 # 3 s backstop; if the seam is dead the lane finishes and this stays RED.
+# ⚠️ THE DIRECTION IS PART OF THE CONTRACT (see (l0)–(l1)): this case asks the override to SHORTEN a
+# 120 s caller to 3 s, which is always allowed. Asking it to LENGTHEN is refused.
 res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
         DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=30 LANE_BOUND_WALL_S=3 \
         bash "$TMP/bin/drive_ra.sh" "$GATE" 120 "$TMP/logs/h3.log" "$TMP/brief.txt")"
@@ -475,6 +477,85 @@ want "$res" "bound=exceeded-wallclock"; rc=$?
 ck "(h3) LANE_BOUND_WALL_S reaches the bound through run_agent (it used to be an inert knob) ($res)" $rc
 grep -q 'backstop OVERRIDDEN by LANE_BOUND_WALL_S=3' "$TMP/logs/h3.log"; rc=$?
 ck "(h3) …and the override is NAMED in the lane log, so the bound that ran and the bound reported cannot disagree" $rc
+
+# ── (l) THE OVERRIDE MAY SHORTEN A RUN, NEVER LENGTHEN IT (review P1) ──────────────────────────
+# ⛔ THE DEFECT THIS CLOSES. `run_agent` honoured `LANE_BOUND_WALL_S` for EVERY caller, so setting the
+# documented knob to the documented backstop (7200) let a caller that had declared a short bound run
+# PAST the cross-box claim lease derived from that bound — `fix-one.sh` leases `FIX_BOUND + 1200`, and
+# `merge-one.sh` `REVIEW_TIMEOUT + gate-wait + 300` — and a peer would read the claim as expired and
+# start a SECOND fixer/reviewer on the same head. That is the duplicate-paid-work class this PR's own
+# P1 already closed on the fix-one path, reachable again from outside the file. The rule is now
+# `min($t, LANE_BOUND_WALL_S)` with the refusal written into the lane log.
+# ⛔ THE REVIEW'S CITED INSTANCE WAS FALSIFIED; THE CLASS WAS NOT (checked against source, not prose).
+# The finding named `merge-one.sh`'s reviewer as the run that would outlive a 3000 s `CLAIM_LEASE`. It
+# would not: `merge-one.sh` carries its OWN `run_agent`, a plain `sleep` watchdog that never reads
+# `LANE_BOUND_WALL_S` — so no reviewer was ever exposed to this knob. What IS reachable is every caller
+# that passes a bound smaller than the override and leases from it: `fix-one.sh` leases
+# `FIX_BOUND + 1200`, so `FIX_TIMEOUT=2400` + `LANE_BOUND_WALL_S=7200` = a 7200 s fixer behind a 3600 s
+# claim (a peer starts a second fixer on the branch), and any future caller inherits the same trap. The
+# clamp is therefore derived from the CALLER's bound, not from a list of known call sites, and (l1)
+# reproduces the live shape through the shipped `run_agent` rather than through merge-one's copy.
+#
+# ⛔ WHY A PURE-FUNCTION TABLE (l0), GIVEN (l1) DRIVES THE REAL THING. `run_agent` is driven below, but
+# the boundary cases (equal, OFF, a typo, a non-numeric caller bound) each cost a real arm and a real
+# process; the resolver is a pure function on purpose (`spawn-gate.sh`'s `lane_wall_bound`) so the table
+# can pin all six without six lanes. (l1)/(l2) then prove the resolver is the one actually consulted.
+# ⛔ THE RESOLVER IS DRIVEN THROUGH A FILE, NOT A `bash -c '. "$1"; …'` PAYLOAD: a `bash -c` whose
+# script path is a VARIABLE is the `script-indirection` form the checkout-hygiene guard refuses (it
+# cannot statically resolve what the shell will run), so that spelling makes this table unrunnable in
+# exactly the sessions that need it. A written fixture is inspectable and runs anywhere.
+cat > "$TMP/bin/resolve_wall.sh" <<'RESOLVE_EOF'
+#!/bin/bash
+. "$1" || exit 9
+lane_wall_bound "$2"
+RESOLVE_EOF
+chmod +x "$TMP/bin/resolve_wall.sh"
+resolve_wall() { # resolve_wall <LANE_BOUND_WALL_S or ''> <caller seconds> → "<secs> <state>"
+  ( unset LANE_BOUND_WALL_S; [ -n "$1" ] && export LANE_BOUND_WALL_S="$1"
+    bash "$TMP/bin/resolve_wall.sh" "$GATE" "$2" 2>/dev/null )
+}
+for tbl in "600|2400|600 applied" "7200|2400|2400 refused" "7200|7200|7200 applied" \
+           "0|2400|2400 refused" "10m|2400|2400 unchanged" "600|abc|abc unchanged"; do
+  IFS='|' read -r t_env t_caller t_want <<<"$tbl"
+  got="$(resolve_wall "$t_env" "$t_caller")"
+  [ "$got" = "$t_want" ]; rc=$?
+  ck "(l0) LANE_BOUND_WALL_S=$t_env against a caller bound of ${t_caller}s resolves to '$t_want' (got '${got:-?}')" $rc
+done
+
+# (l1) DRIVEN, RED BEFORE THE FIX: a caller that declared 4 s and an override asking for 600 s. Pre-fix
+# the override won, the chatty lane outlived its own declared bound and FINISHED (`rc=0 bound=none`) —
+# in production the same shape is a 7200 s reviewer/fixer holding a claim lease sized from the
+# 1800 s / 2400 s bound it declared. Post-fix the wall stays 4 s and the WALL kills it.
+cat > "$TMP/bin/pi" <<'PISTUB3'
+#!/bin/sh
+i=0
+while [ "$i" -lt 20 ]; do echo "tick $i"; sleep 0.5; i=$((i+1)); done
+exit 0
+PISTUB3
+chmod +x "$TMP/bin/pi"; : > "$PI_LOG"
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+        DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=30 LANE_BOUND_WALL_S=600 \
+        bash "$TMP/bin/drive_ra.sh" "$GATE" 4 "$TMP/logs/l1.log" "$TMP/brief.txt")"
+want "$res" "bound=exceeded-wallclock"; rc=$?
+ck "(l1) an override ABOVE the caller's declared bound is REFUSED: the lane is still killed at the caller's 4 s ($res)" $rc
+grep -q 'LANE_BOUND_WALL_S=600 REFUSED' "$TMP/logs/l1.log"; rc=$?
+ck "(l1) …and the refusal is NAMED in the lane log, so the operator is not left with a silent no-op" $rc
+
+# (l2) AND THE ARM-TIME PRE-EMPTION WARNING REACHES A HUMAN (review P2). `run_agent` launches the
+# watchdog as `sh lane-bound.sh watch … >/dev/null 2>&1`, so the arm-time `printf`s were discarded on
+# every real lane and the claim "warned at arm time" was true only of a tty. `warn_line` appends them
+# to the lane log too.
+# ⛔ ITS OWN RUN, WITH THE OVERRIDE UNSET, SO IT IS RED ONLY FOR THE DISCARDED WARNING. Reusing (l1)'s
+# log would make this assertion green as soon as the CLAMP landed (pre-fix (l1) arms a 600 s wall, which
+# is above the allowance, so no pre-emption warning is even due), and it would then be pinning the wrong
+# fix: here the wall is 4 s on BOTH trees, so the only difference is whether the warning survives.
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+        DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=30 \
+        bash "$TMP/bin/drive_ra.sh" "$GATE" 4 "$TMP/logs/l2.log" "$TMP/brief.txt")"
+want "$res" "bound=exceeded-wallclock"; rc=$?
+ck "(l2) FIXTURE: a 4 s caller bound below the 30 s allowance is wall-killed on this tree too ($res)" $rc
+grep -q 'the BACKSTOP (wall=4s) is NOT above the PROGRESS allowance (idle=30s)' "$TMP/logs/l2.log"; rc=$?
+ck "(l2) the arm-time pre-emption WARN lands in the LANE LOG (where an operator looks), not only on a tty" $rc
 
 # ── (k) THE VERDICT SURVIVES A TERM→KILL ESCALATION (review finding, NEW — MEASURED) ──────────
 # `emit_line` wrote the verdict file with `>`, so each line REPLACED the last: on a KILL escalation the
