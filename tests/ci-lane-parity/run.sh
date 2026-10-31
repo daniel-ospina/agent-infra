@@ -1627,7 +1627,7 @@ echo "8ao. FAIL-CLOSED PAST THE DERIVED LIST — a second list must REFUSE, and 
 # the defect actually had: rows appended after the derived loop.
 # (a) THE DEFECT'S OWN SHAPE — an UNDECLARED call after the loop refuses instead of running.
 awk -v ins="run_shard \"$CHEAP\"\n" \
-  '/^  run_shard "\$shard"$/ { inloop = 1 } { print } inloop && /^done <<<"\$shard_paths"$/ { printf "%s", ins; inloop = 0 }' \
+  '/^  run_shard "\$shard"$/ { inloop = 1 } { print } inloop && /^done$/ { printf "%s", ins; inloop = 0 }' \
   "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-pastlist.sh"
 if cmp -s "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-pastlist.sh"; then
   fail "the past-list mutation did not change the file (the fixture no longer matches the runner's loop)"
@@ -1666,12 +1666,13 @@ else
   if cmp -s "$FIX/scripts/runner-cheap.sh" "$TMP/runner-cheap-silentskip.sh"; then
     fail "the silent-skip mutation did not change the file (the refusal's text moved)"
   else
-    awk -v ins='while IFS= read -r shard; do
-  [ -n "$shard" ] || continue
-  run_shard "$shard"
-done <<<"$shard_paths"
-' \
-      '/^  run_shard "\$shard"$/ { inloop = 1 } { print } inloop && /^done <<<"\$shard_paths"$/ { printf "%s", ins; inloop = 0 }' \
+    # ⛔ ONE-LINE WITH `\n` ESCAPES, NOT A LITERAL MULTI-LINE STRING: BWK awk (macOS's `/usr/bin/awk`)
+    # refuses a newline inside a `-v` string ("awk: newline in string"), so the fixture file came out
+    # EMPTY and this arm reported "the mutation did not change the file" on every macOS run while
+    # passing on the Linux runner. `-v` assignments DO expand `\n`, so the injected text is identical
+    # and the arm now measures the runner on both hosts instead of measuring awk's dialect.
+    awk -v ins='while IFS= read -r shard; do\n  [ -n "$shard" ] || continue\n  run_shard "$shard"\ndone <<<"$shard_paths"\n' \
+      '/^  run_shard "\$shard"$/ { inloop = 1 } { print } inloop && /^done$/ { printf "%s", ins; inloop = 0 }' \
       "$TMP/runner-cheap-silentskip.sh" >"$FIX/scripts/runner-relist.sh"
     $FIXTURE_BOUND bash "$FIX/scripts/runner-relist.sh" >"$TMP/runner-relist.out" 2>&1
     RC=$?
@@ -1700,6 +1701,108 @@ done <<<"$shard_paths"
         fail "the count-arm control did not revert to a green run (rc $RC — want 0; something else is red and the arm is unproven): $OUT"
       fi
     fi
+  fi
+fi
+
+echo ""
+echo "8ap. A SHARD MUST NOT BE ABLE TO DRAIN THE LIST (#3084)"
+# ⛔ WHAT THIS ARM EXISTS FOR — the largest silent coverage hole this runner has had. The loop used
+# to be `while IFS= read -r shard; do run_shard "$shard"; done <<<"$shard_paths"`, so the shard list
+# lived on the driver's STDIN and every shard inherited it. A shard that reads stdin therefore
+# consumed the lines the driver had not reached yet, the loop simply ENDED — no error, no name — and
+# the runner reported `executed 107 of 139 listed shard(s) (0 skipped)`. Measured on main's
+# `script-validate` job 2026-10-30: the last timing row was `▸ 60s scripts/pi-reap-idle.test.sh`
+# (position 107) and 32 shards — everything sorted after it — never ran on main or on ANY PR, while
+# the job was read as "a count mismatch" rather than "32 suites are not covered".
+#
+# The fixture is three shards where the SECOND one reads stdin to EOF: with the defect it drains
+# `drain-c.sh`, so the driver executes 2 of 3 and says so (that is the mutant below). With the fix
+# both arms are independently sufficient — the list is read into an ARRAY (a child cannot reach it)
+# and every shard is handed `</dev/null` — so this arm also pins each arm's sufficiency, because a
+# future refactor that drops one of them must not be able to reintroduce the hole quietly.
+DRAIN_FIX="$TMP/drain-fixture"
+mkdir -p "$DRAIN_FIX/scripts" "$DRAIN_FIX/tests/ci-lane-parity"
+stage_guard "$DRAIN_FIX"
+printf '#!/bin/bash\nexit 0\n' >"$DRAIN_FIX/tests/ci-lane-parity/drain-a.sh"
+printf '#!/bin/bash\nwhile IFS= read -r _l; do :; done\nexit 0\n' >"$DRAIN_FIX/tests/ci-lane-parity/drain-b.sh"
+printf '#!/bin/bash\nexit 0\n' >"$DRAIN_FIX/tests/ci-lane-parity/drain-c.sh"
+awk '\
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"tests/ci-lane-parity/drain-*.sh\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$RUNNER" >"$DRAIN_FIX/scripts/runner-drain.sh"
+if cmp -s "$RUNNER" "$DRAIN_FIX/scripts/runner-drain.sh"; then
+  fail "the stdin-drain fixture did not narrow SUITE_GLOBS — it would run the real 139-shard list"
+else
+  $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain.sh" >"$TMP/runner-drain.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-drain.out")"
+  if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' <<<"$OUT"; then
+    pass "a shard that reads stdin to EOF does not shorten the run (3 of 3 executed, rc 0)"
+  else
+    fail "a stdin-draining shard SHORTENED the run (rc $RC — want 0 + 'all 3 bash shards passed'): $OUT"
+  fi
+  # MUTANT (the pre-fix shape, both arms reverted): the loop reads the list FROM STDIN and the shard
+  # inherits it. The run must then reproduce the defect — a SHORT count — and, crucially, NAME the
+  # shard it never reached, which the pre-fix message could not.
+  awk '
+    /^for shard in / { print "while IFS= read -r shard; do"
+                       print "  [ -n \"$shard\" ] || continue"
+                       print "  run_shard \"$shard\""
+                       print "done <<<\"$shard_paths\""
+                       inold = 1; next }
+    inold { if ($0 == "done") { inold = 0 }; next }
+    { print }
+  ' "$DRAIN_FIX/scripts/runner-drain.sh" \
+    | sed 's| bash "\$1" </dev/null| bash "$1"|' >"$DRAIN_FIX/scripts/runner-drain-mutant.sh"
+  if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-mutant.sh"; then
+    fail "the drain mutant did not change the file — the loop's shape or the shard call moved, and this arm now measures nothing"
+  else
+    $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-mutant.sh" >"$TMP/runner-drain-mutant.out" 2>&1
+    RC=$?
+    MOUT="$(cat "$TMP/runner-drain-mutant.out")"
+    if [ "$RC" -eq 1 ] && grep -q 'executed 2 of 3 listed shard(s)' <<<"$MOUT"; then
+      pass "MUTANT (pre-fix shape): the drain reproduces the defect — executed 2 of 3 (rc 1)"
+    else
+      fail "the pre-fix mutant did not reproduce the short run (rc $RC — want 1 + 'executed 2 of 3'): $MOUT"
+    fi
+    if grep -qF 'NEVER RAN: tests/ci-lane-parity/drain-c.sh' <<<"$MOUT"; then
+      pass "…and the verdict NAMES the shard that never ran (a count alone cannot say which suite is uncovered)"
+    else
+      fail "the verdict did not name the un-reached shard (want 'NEVER RAN: tests/ci-lane-parity/drain-c.sh'): $MOUT"
+    fi
+    if grep -qF 'NEVER RAN: tests/ci-lane-parity/drain-a.sh' <<<"$MOUT" || grep -qF 'NEVER RAN: tests/ci-lane-parity/drain-b.sh' <<<"$MOUT"; then
+      fail "the verdict named a shard that DID run — a block naming every shard attributes nothing: $MOUT"
+    else
+      pass "…and it names ONLY the shard that was skipped over"
+    fi
+  fi
+  # EACH ARM ALONE: revert one at a time. Both must stay green, so neither can be dropped as
+  # "redundant" without this arm going red — the belt-and-braces is pinned, not assumed.
+  sed 's| bash "\$1" </dev/null| bash "$1"|' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-nostdin.sh"
+  $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-nostdin.sh" >"$TMP/runner-drain-nostdin.out" 2>&1
+  RC=$?
+  if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-nostdin.out"; then
+    pass "the ARRAY alone is sufficient (a shard without </dev/null still cannot shorten the list)"
+  else
+    fail "without </dev/null the run still shortened (rc $RC) — the array is not doing the work this arm claims: $(cat "$TMP/runner-drain-nostdin.out")"
+  fi
+  awk '
+    /^for shard in / { print "while IFS= read -r shard; do"
+                       print "  [ -n \"$shard\" ] || continue"
+                       print "  run_shard \"$shard\""
+                       print "done <<<\"$shard_paths\""
+                       inold = 1; next }
+    inold { if ($0 == "done") { inold = 0 }; next }
+    { print }
+  ' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-stdinloop.sh"
+  $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-stdinloop.sh" >"$TMP/runner-drain-stdinloop.out" 2>&1
+  RC=$?
+  if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-stdinloop.out"; then
+    pass "the </dev/null arm alone is sufficient (a stdin-fed loop cannot be drained when the shard's stdin is closed)"
+  else
+    fail "with the stdin-fed loop and </dev/null the run still shortened (rc $RC): $(cat "$TMP/runner-drain-stdinloop.out")"
   fi
 fi
 
