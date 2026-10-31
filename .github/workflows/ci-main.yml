@@ -37,6 +37,26 @@ jobs:
       script-validate: false
       skill-lint: false
       test-command: |
+        # #3131 — this matrix now also runs on `integration/**` (#3139), and ONE
+        # guard assertion is keyed to the checkout rather than to the change:
+        # `extensions/main-worktree-guard/test.mjs` expects the sanctioned-recovery
+        # script `git checkout main && git pull --ff-only` to be ALLOWED, which the
+        # classifier can only grant when `main` is a verifiable checkout target
+        # (`_recoveryCheckoutVerifiable` → a local `refs/heads/main`, or exactly one
+        # remote whose fetch refspec maps onto an EXISTING tracking ref). A
+        # single-ref checkout of a non-main branch leaves NEITHER, so the guard
+        # correctly answers `block` and the assertion fails for a reason that has
+        # nothing to do with the batch — measured on run 41190178021: green on
+        # `main`, red on `integration/batch-20261031-16`, guard code byte-identical
+        # to main.
+        #   Materialize the DWIM source rather than weaken the assertion: the test
+        # then measures the guard, not the checkout depth, and every future
+        # `integration/**` run stays judgeable. NOT `|| true` — a fetch that cannot
+        # produce `origin/main` must fail the job loudly, because silently skipping
+        # it would restore the false red it exists to remove.
+        if [ "${GITHUB_REF:-}" != "refs/heads/main" ]; then
+          git fetch --depth=1 origin '+refs/heads/main:refs/remotes/origin/main'
+        fi
         failures=0
         # #2188 — a suite that CRASHES (an uncaught assertion) prints no aggregate
         # line at all, so `scripts/ci_exemption.py ids` yielded ZERO identities for
