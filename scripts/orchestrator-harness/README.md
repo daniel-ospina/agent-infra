@@ -343,9 +343,10 @@ without a human in the loop:
   free and cell-3 at 0.04 load, and **47 P0/P1 issues went untouched with ~20 vCPU idle on the same
   account**; the gap was filled by hand with six manually-created dispatch lanes. The transfer
   mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
-  worker gate's own refusal, whatever it bound on (that gate binds on **load, disk or land** — the
-  last one is repo-wide and is recorded as NOT transferable in §7.2/§7.2g; the lanes/swap/memory terms
-  belong to the controller's separate gate, which refuses before any claim is taken), because load is a
+  worker gate's own refusal, whatever it bound on (that gate binds on **load, memory, disk or land**
+  — the last one is repo-wide and is recorded as NOT transferable in §7.2/§7.2g; the lanes/swap terms
+  — and the controller's OWN memory arm, a DIFFERENT floor (`MIN_MEM_FREE_MB`, §7 below: two
+  populations, one probe) — belong to the controller's separate gate, which refuses before any claim is taken), because load is a
   symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
   capacity gate a caller can skip is not a gate (agent-infra#1884).
 
@@ -1276,8 +1277,8 @@ nothing refused, logged or counted, and the box went to load 258 against its own
 refusal is loud (1-min load, ceiling, the item, and the calling process), counted in
 `~/.pi/agent/state/spawn-gate.tsv` (allowed runs too; bounded by a one-generation rotation at 5 MiB,
 because this is the highest-volume sink in the tree and a device that fills silently is #1765's
-defect), and exits 76, which `run_agent` translates to
-the callers' usual `AGENT_LOAD_REFUSED`/`AGENT_STARTED=0`. Its stated limits are in the file's header:
+defect), and exits 76 (a LOAD refusal) or 72 (a MEMORY refusal, #2387), which `run_agent` translates to
+the callers' usual `AGENT_LOAD_REFUSED` / `AGENT_MEM_REFUSED` with `AGENT_STARTED=0`. Its stated limits are in the file's header:
 the real binary by ABSOLUTE path or a `PATH` reset is not gated (deliberately — that is the
 operator's rescue route when the box is over its ceiling, and the refusal message prints it), a
 caller that exports its own `MAX_LOAD` sets its own ceiling, and a box where neither installer has
@@ -1471,7 +1472,8 @@ manifest path above is what a box that is copied into every deploy should use.
 | `MAX_REVIEW_TRIES` | `3` | verdict-less reviewer runs at ONE head before that head is parked (agent-infra#2132). ⛔ ONE budget, keyed on the head, spent by BOTH arms in `state/reviewdisp-<PR>` (agent-infra#2971: the controller on dispatch, `merge-one.sh` on a verdict-less run that nobody counted — `REV_PAID=1` marks the dispatcher-paid case so an attempt is never counted twice) — so "we already tried review twice at this head" is the same number to both, and `REVIEW-CAP` and the reviewer-side park cannot disagree. The record is `"<head> <n>"`, a push resets it, and any run that DID produce a verdict (findings, or a verified CLEAN) resets it too — it bounds CONSECUTIVE verdict-less runs — so a reviewer that keeps hitting its cap cannot buy an unbounded run of paid reviews. ⛔ **THE SAME LIMIT IS READ BY TWO FILES** (agent-infra#2653): `merge-one.sh` bounds its own reviewer runs with it, and `orch-loop.sh` — which dispatches the `review-<PR>` review ORDER — keys its `state/reviewdisp-<PR>` budget on it. Two readers, ONE budget (the controller coerces it to the same default, and the suite pins the count). ⛔ AND A REVIEWER RUN THAT ENDS WITHOUT ITS `CLEAN`/`ISSUES` MARKER IS A COUNTED FAILED ATTEMPT, never silence (agent-infra#2971): `merge-one.sh`'s EXIT trap records it with its exit code and last line, which is the artifact whose absence made the 2026-10-28 log simply stop at 23:30. ⚠ A head whose signed marker verified but whose gate never reaches SUCCESS is no longer re-reviewed by the controller at all: the store's head-bound CLEAN record is read directly (`REVIEW-AT-HEAD`, agent-infra#2517's record key), which bounds the paid side of the agent-infra#1756 class — what remains is that such a head has no *actuator* in the controller (the gate re-triggers on `edited`, so a RE-RECORD, not a review, is its remedy; that arm is `merge-one.sh`'s CLEAN path) |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (the `[cap]` gate's swap arm, beside `swap_usage_mb`/`mem_avail_mb`, for the gate; the same `swap_total=0` arm for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
-| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
+| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it. ⛔ This is the CONTROLLER's dispatch arm; the SPAWN gate's own floor is `MEM_MIN_AVAIL_MB` below — two populations, one probe (`mem_avail_mb`, byte-identical in both files and pinned by `spawn-gate.test.sh`) |
+| `MEM_MIN_AVAIL_MB` | **derived**: `MEM_LANE_RESERVE_MB * MEM_SPAWN_RESERVE_LANES` = `1024 * 2` = `2048` | MB of available memory the SPAWN gate requires before it starts any agent (`spawn-gate.sh`, agent-infra#2387 — **fail-CLOSED**, unlike the disk and load probes). The reserve is MEASURED, not chosen: a lane's peak is `pi` PLUS the pytest shard it runs, and both halves were measured on a 10-core/32 GB box — all 54 resident `pi` processes (mean 56 MB, max **449 MB** RSS) and four EXECUTING shards against a private FalkorDB (`/usr/bin/time -l` max RSS: 151 / 164 / 359 / **564** MB). 449 + 564 = 1013 MB, so the reserve is **1024 MB**, and the ×2 pays for the lane being spawned AND a peer already inside its own peak window — the allocation that lands on a peaking box. ⛔ Both figures are SAMPLE MAXIMA (n=54, n=4) and a sample maximum is a LOWER bound on the real peak, which is why the floor carries two. The refusal prints all three numbers so it can be re-computed against the box (`mem_min_avail_mb=2048M = mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2`). ⚠️ It is a capacity POLICY knob, not a lane cap: raising it refuses earlier, lowering it refuses later, and neither changes how many lanes may run. ⚠️ A floor is a floor, not a headroom policy — see the #2387 note below for what it does and does not refuse |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `PRODUCT_FLOOR` | `1` | how many slots of each batch are filled from `candidates.product.txt` FIRST (§2 "State files (`$O/`)" `candidates.txt` row, agent-infra#2054). Clamped to `[0, BATCH]`; `0` **disables** the floor and is a legitimate setting. A missing or non-numeric value falls back to the default `1` — never to `0`, which would silently switch the guarantee off. An UNMET floor LOGS AND DEGRADES (`product-floor unmet … queue=<state>`), and it never refuses a batch or caps the fleet, because a floor is not a quota. The report names its verdict either way — `product-floor MET product=<n> batch=<n> floor=<n>` on a batch that met it, `product-floor unmet (product=… batch=… floor=…) queue=<state>` on one that did not, `product-floor N/A` where no product channel exists — so "the floor worked" is never inferred from silence. ⛔ **THE FLOOR YIELDS TO AN EMERGENCY, AND SAYS SO.** Before it reorders, `floor_emergency` asks two questions of state already on disk: is a `P0-blocker` candidate inside the batch window (`candidates.emergency.txt`, derived from the item's own label), and is there a `red-tree` rail refusal for a PR that is not parked? Either one — or an emergency class that could not be read (`p0-unknown`) — stands the floor down for that cycle and logs `product-floor OVERRIDDEN emergency=<reason>` with the counts the batch actually got. The floor reorders a SEVERITY-ordered queue, so this is the one failure it must never cause; a missed product slot re-asserts itself next cycle, a P0 delayed behind a share target does not. Its intake side (`refresh-candidates.sh` → `write_product_queues`) classifies by PRODUCT_REPOS + the `harness` LABEL and records what it decided in `state/product-class`, which the dispatch line repeats: `NOT-A-PRODUCT-REPO` / `BUDGET-SKIPPED` / `LISTING-FAILED` / `LISTING-TRUNCATED` / `WRITE-FAILED` / `OK product=<n> harness=<m>`. ⛔ THE RECORD DESCRIBES THE TWO QUEUE FILES, so only the function that WRITES them invalidates it: `write_product_queues` writes `PENDING …` as its first action and every arm below overwrites it, while a pass that refuses before reaching the writer (the environment check, the budget, the pool read) or SKIPS because the pool is unchanged (#1984) leaves the previous record alone — it is still true, because neither queue file changed. `PENDING` therefore means *a split started and did not record a class*, and the loop reports it as an UNKNOWN class, never as `the split RAN and found none`. A SHORTFALL is unmet too — `PB < PRODUCT_FLOOR`, not only `PB = 0` — so a floor of 2 that fills one slot still logs `product-floor unmet … queue=<state>` |
 | `PRODUCT_REPOS` | `daniel-ospina/tortoise` | **comma-separated** `owner/repo` list (no spaces, matched as an element — `$(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ')` then `*" $repo "*`), read by `refresh-candidates.sh` and deciding **which repo counts as PRODUCT**: an issue is product work when its repo is in this list AND it does not carry the `harness` label. ⛔ **TODAY ONLY THE ENTRY EQUAL TO `$OR` CAN EVER MATCH**: the backlog is read from `$OR` alone, and the intake is called with `$OR`, so every other element in the list is inert until a pass spans more than one repo. The list form is kept because that is the shape the decision has; it is not a multi-repo queue. If `$OR` is absent from the list, EVERY candidate is harness and the loop prints `product-floor N/A` — which is how a box says "no product channel here", not an error. This is the single input the whole floor rests on, so it is documented here rather than only in `ARCHITECTURE.md`: a repo **outside** the list reports `NOT-A-PRODUCT-REPO` and the loop prints `product-floor N/A`, which is **not** an unmet floor and **not** a finding about product work. ⛔ **`$ENV_FILE`-only: `install.sh` neither renders nor validates it** (its numeric `[`-based validator would reject a list, so a `__PRODUCT_REPOS__` placeholder is deliberately absent), which means exporting it and re-running `install.sh` has no effect, and a hand-added plist key is overwritten by the next render — set it in `$ENV_FILE` on a cell, or edit the `PRODUCT_REPOS=` default in `refresh-candidates.sh` (search the assignment, not a line number — it moved once already) |
@@ -1484,20 +1486,13 @@ manifest path above is what a box that is copied into every deploy should use.
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 | `SWEEP_ROWS_PER_CYCLE` | `8` | the sweep's per-cycle **window**: how many swept PRs are read per cycle, rotating via `state/sweep-cursor`. A full 70-row pass costs minutes (≥2 `gh pr view` per row) and the controller is relaunched every 12–45 s, so an unbounded pass was torn down before the arms at its end — measured: 0 dispatches in 555 cycles (#2640). The cursor advances AFTER the pass, by the rows that actually produced a disposition, so an interrupted window resumes at its unfinished row instead of stepping over its tail |
 
-⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `SWEEP_ROWS_PER_CYCLE`, `MERGE_STALL_MIN`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist.** The template
-carries 19 placeholders — the thirteen limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
-— and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
-of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
-overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
-scripts.
-(That list is hand-kept and had drifted by one — a stall bound was missing from it while being exactly
-the silent no-effect this paragraph warns about. Verify it rather than trusting it: every knob in the table
-above that has no `__NAME__` placeholder in `launchd.plist.template` must be named here, except the three
-wall-clock timeouts (named as a phrase in the sentence) and the `AGENT_GH_GATE_*` family, which is
-documented in its own gate section.)
+⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `SWEEP_ROWS_PER_CYCLE`, `MERGE_STALL_MIN`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist** — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__SWEEP_ROWS_PER_CYCLE__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__` exists in `launchd.plist.template`. So exporting one of these and re-running `install.sh` silently has no effect, and a hand-added plist key is overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the scripts.
+Everything ELSE in the table above IS rendered, and that includes the three memory knobs (`MEM_MIN_AVAIL_MB`, `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`). ⛔ THEY USED TO BE THE COUNTER-EXAMPLE AND THIS PARAGRAPH IS WHY IT HAD TO CHANGE (#2387): `spawn-gate.sh`'s own refusal line and the section below tell an operator to raise `MEM_MIN_AVAIL_MB`, so a floor that was NOT in the template made that advice silently do nothing — every lane kept 2048 while the operator believed they had raised the floor protecting the box. A knob the docs name as a remedy must be a knob the installer renders.
+The template also carries the non-limit tokens `SCOPE`, `O`, `REPO`, `OR`, `PATH`, `HOME`, `LABEL`, `ENTRY`, `CYC`, `BATCH` and the `HARNESS*` identity tokens.
+(This list is not trusted by eye: `product-floor.test.sh`'s P12 arm RECOMPUTES it — every knob in the table above that has no `__NAME__` placeholder in `launchd.plist.template` must be named here, except the three wall-clock timeouts (named as a phrase in the first sentence) and the `AGENT_GH_GATE_*` family, which is documented in its own gate section. A knob added to the table without a placeholder, or a placeholder removed from the template, reddens that arm.)
 
 ⛔ **And every limit that IS rendered must be a whole number, in range, and not a template token.**
-The thirteen are substituted verbatim — deliberately not routed through the escaping path, since a whole
+They are substituted verbatim — deliberately not routed through the escaping path, since a whole
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
 configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
@@ -1564,12 +1559,34 @@ pre-fix inline read sat ~620 lines below the FIRST spawn site, ~225 below the la
 obey; raising the default floor is a separate decision (it is a capacity policy, not a wiring bug)
 and is deliberately not made here.
 
-⚠️ **The SPAWN POINT is still memory-blind** (agent-infra#2387): `spawn-gate.sh`'s `run_agent()` gates
-on load and the disk floor and consults no memory probe, so a worker started by `lane.sh`/`fix-one.sh`
-— or by an installed `pi` — is bounded by memory only through the controller's decision to start it.
-A different population from these six sites, and it needs its own polarity decision: that file's disk
-gate fails OPEN on purpose (a live dispatch path must not stop every lane on the box for ever), while
-this memory arm fails CLOSED.
+✅ **The SPAWN POPULATION is memory-gated too** (agent-infra#2387 **FIXED**). It used to be the one
+gap: `spawn-gate.sh`'s `run_agent()` gated on load, the disk floor and the land ratio and consulted
+**no memory probe at all**, so a worker started by `lane.sh`/`fix-one.sh`/`nonblocking-dispatch.sh`,
+by `merge-one.sh`'s own unported `run_agent` (the `chain-<N>` first review of every own-lane PR), by a
+hand-written `tmux new-session … pi` runner, or by an interactive session was bounded by memory only
+through the controller's decision to start it. Both of that file's spawn surfaces now read it —
+`run_agent()` (after the disk gate, before the load gate) and the installed-`pi` SHIM — with the
+`mem_avail_mb` probe this file already carries, and the polarity is the DISPATCH gate's, not the disk
+gate's: **fail-CLOSED**, verdict `UNREADABLE`, spawn refused. That is a deliberate divergence from
+the disk gate's fail-open, and the reason is structural rather than stylistic — an unreadable `df` is
+a per-volume nuisance on a live path, while an unreadable memory probe is indistinguishable from "the
+box is fine" and treating it as capacity is exactly how a box talks itself into an OOM. Refusals are
+`AGENT_MEM_REFUSED` (81) from `run_agent` and `PI_GATE_MEM_REFUSED` (82) at the spawn point, the
+latter translated into the former so no caller learns a new code; `lane.sh` records the capacity
+yield with `gate=mem` and `fix-one.sh` names the memory gate rather than the load one.
+
+⛔ **WHAT THIS DOES NOT BUY, again stated rather than implied.** The floor is `2048 MB` by default
+(see the `MEM_MIN_AVAIL_MB` row) and it is a HEADROOM floor, not a headroom policy: a box reading
+`available=8379 MB` clears it. So the cell-4 figures in #2387 are NOT all refused by the shipped
+default, and the note in that issue deserves one correction: `rc=143` is SIGTERM — this harness's own
+wall-clock watchdog, or the stale-worker reaper — and NOT the OOM killer's SIGKILL (137), so those
+eight lane deaths are evidence that lanes died, not evidence that memory killed them. The memory
+evidence is the six `dmesg` OOM lines, and the surviving `free -m` snapshot cannot be dated against
+them (memory freed by the dead lanes is indistinguishable from memory that was free throughout). What
+the change removes is the STRUCTURAL gap: no floor — not even a raised one — could bind a spawn path
+that read no memory figure. What would have refused the documented cell-3 reading (`653 MB`) is the
+shipped default, and an operator who wants a higher floor sets `MEM_MIN_AVAIL_MB` — a capacity
+policy, deliberately not made here.
 
 ⚠️ **The account's CONCURRENCY cap is a shared FLEET resource — the ceiling on parallelism is
 neither CPU, RAM nor disk.** Every limit in the table above bounds *this box*: load, lanes, swap,
@@ -4080,21 +4097,27 @@ already holding):
 
 | part | where | what it does |
 |---|---|---|
-| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk\|land>` (`land` = the creation back-pressure refusal, §7.2g) | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
-| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk / 74 land-backlog) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
+| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|mem\|disk\|land>` (`mem` = the SPAWN gate's memory refusal, #2387; `land` = the creation back-pressure refusal, §7.2g) | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 73 memory / 77 disk / 74 land-backlog) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
 | the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
 
 **Decisions worth not re-litigating.**
 
 - **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
-  (`load` or `disk` — opposite remedies — and, since #2409, `land`: the creation gate's refusal, whose
-  remedy is on neither this box nor any peer's; and, since #2293, `fork`: a box out of PROCESSES, whose
-  remedy is a restart or a drain from OUTSIDE, never a wait), and the transfer is driven by the refusal
+  (`load`, `mem` or `disk` — three readings with three different remedies — and, since #2409,
+  `land`: the creation gate's refusal, whose remedy is on neither this box nor any peer's; since
+  #2293, `fork`: a box out of PROCESSES, whose remedy is a restart or a drain from OUTSIDE, never a
+  wait; and since #2935, `capability`: the box could not complete one model call and RETURN, whose
+  remedy is to repair or replace the box, never to wait). The transfer is driven by the refusal
   event. Load is a symptom of contention rather than a measure of capacity
   (`docs/ops/load-policy.md`), which is also why a lowering of `MAX_LOAD` — the ×8 change proposed in
-  #1907, closed unmerged 2026-10-22 — could not have moved a single item. ⚠️ NOTE what the record can
-  carry: the WORKER gate binds on **load, disk, land or fork** (`spawn-gate.sh`), so those are the four
-  values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate, which
+  #1907, closed unmerged 2026-10-22 — could not have moved a single item. ⚠️ NOTE what the record
+  can carry: the WORKER gate binds on **fork, load, memory, disk, capability or land**
+  (`spawn-gate.sh`), so those are the values field 3 can ever hold, each with its own code
+  (73 fork / 74 land / 75 load / 77 disk / 81 memory / 71 capability — `mem` is #2387's memory
+  refusal). The lanes/swap terms — and the CONTROLLER's own memory arm, which compares `mem_avail`
+  against `MIN_MEM_FREE_MB`, a different floor for a different population (§7) — belong to the
+  CONTROLLER's own gate, which
   refuses *before* any claim is taken and therefore writes no record at all (§1 above). A reader that
   predates #2409 and knows only `load`/`disk` must treat `land` as `load` (it is non-numeric for its
   purposes, and `chain-merge.sh` maps an unrecognised value the same way) rather than as "no refusal";
@@ -4116,7 +4139,7 @@ already holding):
   corrupt byte. Past that, each consumes the fields it needs and no others:
   - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
     this chain's start minus the ordering slack, and not older than the record's own yield window).
-    It reports **field 3** as the exit code (75 load / 77 disk / 74 land) and maps an unrecognised value
+    It reports **field 3** as the exit code (75 load / 73 memory / 77 disk / 74 land) and maps an unrecognised value
     to `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
     one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
     yield window must not make a proven refusal unreadable.
@@ -4687,8 +4710,9 @@ were deleted.
   (`mem_spawn_ok()`, measured once per cycle by `measure_mem` before the first site) with the load
   arm, refusing at `mem_avail <= MIN_MEM_FREE_MB` and on an UNKNOWN probe. It is recorded here rather
   than deleted because the failure mode is the point: two gates over two populations, the resource
-  that actually kills the box consulted on one of them. ⚠️ The **spawn point** (`spawn-gate.sh`'s
-  `run_agent`) is still memory-blind — a different population, tracked as agent-infra#2387.
+  that actually kills the box consulted on one of them. ✅ The **spawn point** (`spawn-gate.sh`'s
+  `run_agent`, and the installed-`pi` shim beside it) was still memory-blind at the time — a
+  different population, tracked as agent-infra#2387 and fixed since (`MEM_MIN_AVAIL_MB`).
 - **The check classifier's `(app, name)` grouping and its newest-by-`id` selection cannot take effect
   at the call site** (agent-infra#1733). `gh pr checks --json name,state,workflow` carries no `id` and
   no `app`, so the newest attempt is decided by row order, and two non-Actions checks that share a
@@ -4721,8 +4745,9 @@ were deleted.
   `tmux new-session -d -s <name> "… pi -p …"`, no `lane.sh`, so `MAX_LOAD` was never read — on a box
   at load 258 on 10 cores against its own ceiling of 100. **✔ FIXED** — `spawn-gate.sh` is also an
   executable installed as `$HOME/.pi/agent/bin/pi` (first on PATH), so every `pi` resolves the gate; a
-  refusal names the reading/ceiling/item/caller, is counted in `~/.pi/agent/state/spawn-gate.tsv`,
-  and exits 76 (translated to the callers' 75). Named residuals: an invocation that bypasses PATH
+  refusal names the reading/ceiling/item/caller (or, for memory, the reading/floor/item/caller — #2387), is
+  counted in `~/.pi/agent/state/spawn-gate.tsv`, and exits 76 for load or 72 for memory (translated to the
+  callers' 75 / 73). Named residuals: an invocation that bypasses PATH
   (absolute path, `env -i`, a `PATH` reset) is not gated — that is the operator's documented rescue,
   and `MAX_LOAD` stays the operator's own tunable — and the **`task`/sub-agent dispatch does not pass
   through PATH at all** (`getPiInvocation` spawns `process.execPath` + the entry script so a truncated
@@ -4818,7 +4843,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
 | `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` for PRs and `refs/claims/issue-<N>` for issues (agent-infra#1850), same CAS, lease-as-data and `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `refresh-candidates.sh`, `chain-merge.sh`, `dispatch-merge.sh`, `merge-one.sh` and `fix-one.sh` |
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
-| `spawn-gate.sh` | the load and disk gate (`disk_free_mb`/`disk_ok` `:193-231`, `can_spawn` `:269`) plus the ONE `run_agent()` (`:305`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
+| `spawn-gate.sh` | the load, memory, disk and land gate (`disk_free_mb`/`disk_ok` `:200-243`, `mem_avail_mb` `:334`, `mem_gate_verdict` `:366`, `can_spawn` `:440`) plus the ONE `run_agent()` (`:781`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⚠️ Line numbers drift — search the function names, not the numbers. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail. Since agent-infra#2258 it ALSO splices the canonical `RESEARCH FIRST` block (from `brief-gate.sh --section lane`) and refuses (78) if the brief it just generated fails the validator, so a brief that lost the contract cannot reach a lane |
 | `brief-gate.sh` | the RESEARCH contract, enforced at the dispatch seam (agent-infra#2258): a brief must carry a `RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:`/tool line) and a `CONTRADICTION TEST:` line, or the dispatch is REFUSED with **80** — nothing consumed — by a message that names every missing element and prints the block to paste. `--check <file\|-> [role]` · `--section [role]` (the ONE source of the block every generated brief splices and `templates/LANE-BRIEF.md` copies) · `--missing` · `--line`. Executed by `spawn-gate.sh::run_agent`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and `pr-doctor.py`; `0` pass / `80` refused / `78` cannot-verify (missing, empty, unknown role, or an unresolvable validator — never a pass). Presence and shape only: it cannot judge the research itself, and its own refusal says so |

@@ -40,11 +40,16 @@ echo "[adopt-fix $PR] worktree=$WT branch=$BR ($WT_RESULT) $(date)" >> "$O/logs/
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
 # 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate
-# refused it (#1765). Name BOTH here: the fixer's own line is inside fix-$PR.log, and this is the log
-# a manual operator reads (#1720). They are not interchangeable — a load refusal is cleared by the
-# box quietening, a disk refusal only by reclaiming space — so reporting one as the other sends the
-# operator to wait for a remedy that cannot arrive.
-if [ "$rc" = "75" ]; then
+# refused it (#1765). 73 = the MEMORY gate refused it (#2387). Name ALL THREE here: the fixer's own
+# line is inside fix-$PR.log, and this is the log a manual operator reads (#1720). They are not
+# interchangeable — a load refusal is cleared by the box quietening, a memory refusal by resident
+# lanes FINISHING, and a disk refusal only by reclaiming space — so reporting one as another sends the
+# operator to wait for a remedy that cannot arrive. ⛔ 73 is the one that would silently be reported as
+# a LOAD refusal by omission (it matches neither branch below), which is the exact false-cause class
+# this block exists to fix; the memory branch therefore sits ABOVE the load one.
+if [ "$rc" = "73" ]; then
+  echo "[adopt-fix $PR] fixer NOT started (MEMORY gate) — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes finish, NOT by waiting for load; the reading and the floor are in fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "71" ]; then
   # ⛔ THE CAPABILITY REFUSAL (#2935) IS THE ONE THIS SCRIPT COULD NOT NAME AT ALL (review of #2991,

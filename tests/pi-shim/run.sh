@@ -121,9 +121,15 @@ chmod +x "$LSHIMDIR/sysctl"
 #   direct → `pi …` typed straight into a shell
 # The PATH order is the production order: the shim directory is FIRST, so `pi` IS the gate.
 # FAKE_LOAD / MAX_LOAD / TAG / PI_FAKE_RC come from the caller's environment.
+# ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER, for the same reason $LSHIMDIR stubs the LOAD
+# probe: every arm below is about the LOAD ceiling, and since agent-infra#2387 the shim consults
+# available memory BEFORE load. Without this a memory-tight box answers 72 to a load arm and the arm
+# reports a #1884 regression that is not one. Section 12 drives the memory arm on purpose, at a floor
+# this box cannot meet; the SHIPPED default floor is asserted in spawn-gate.test.sh (env -u), which owns
+# the arithmetic.
 run_shim() { # run_shim runner|direct [argv…]
   local how="$1"; shift
-  PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" \
+  PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-1}" \
   PATH="$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
   bash -c '
     how="$1"; runner="$2"; shift 2
@@ -186,8 +192,10 @@ after="$(ledger_rows)"
   && pass "the row carries verdict=refused, the reading (999), the ceiling (10) and the item tag (t3)" \
   || fail "the ledger row does not record verdict/load/ceiling/tag: $(sed -n "${after}p" "$LEDGER" | cut -f2-4,8)"
 nf="$(sed -n "${after}p" "$LEDGER" | awk -F'\t' '{print NF}')"
-[ "$nf" = "10" ] && pass "the row has all 10 fields (epoch, verdict, load, max, pid, ppid, KIND, TAG, cwd, caller)" \
-  || fail "the ledger row has $nf fields, expected 10 — a truncated row cannot be counted reliably"
+[ "$nf" = "12" ] && pass "the row has all 12 fields (epoch, verdict, load, max, pid, ppid, KIND, TAG, cwd, caller, mem_avail, mem_floor) — the memory columns are APPENDED so every cut -f1-10 reader survives" \
+  || fail "the ledger row has $nf fields, expected 12 — a truncated row cannot be counted reliably"
+[ "$(ledger_field "$after" 12)" != "" ] && pass "…and field 12 carries the FLOOR that was in force (so a later reader can recompute the refusal without the log)" \
+  || fail "the ledger row records no memory floor"
 # The running count is in the message too: "counted" must be visible in the log line, not only in a
 # file an operator has to know to look for.
 reset_probe
@@ -264,7 +272,11 @@ FAKE_LOAD=9 MAX_LOAD=10 run_shim direct -p "just under" >/dev/null 2>&1; rc=$?
 mkdir -p "$TMP/neutral"
 ln -sf "$SHIM" "$TMP/neutral/pi"
 reset_probe
-PI_PROBE="$TMP/probe" FAKE_LOAD=1 MAX_LOAD=10 \
+# ⛔ AND THE NEUTRALISER REACHES EVERY ARM THAT BYPASSES run_shim (review, P2). This one calls `pi`
+# directly (its whole point is a PATH shape), so it missed the floor that run_shim injects: on a
+# memory-tight box the symlink-farm arm was refused by the MEMORY gate with rc=72 and reported "a
+# symlink-farm installation could not find the real pi" — a #1884 regression that is not one.
+PI_PROBE="$TMP/probe" FAKE_LOAD=1 MAX_LOAD=10 MEM_MIN_AVAIL_MB=1 \
   PATH="$LSHIMDIR:$TMP/neutral:$TMP/real:$PATH" pi -p "through a symlink farm" >"$TMP/out8" 2>&1 &
 p8=$!
 ( sleep 10; kill -KILL "$p8" 2>/dev/null ) >/dev/null 2>&1 &
@@ -375,6 +387,126 @@ for f in "$SETUP_SH" "$CELL_INSTALL"; do
   label="$(basename "$f") installs the spawn-point gate as \$DEST/bin/pi"
   [ "$rc" -eq 0 ] && pass "$label" || fail "$label — the gate would reach no box through this installer"
 done
+
+# ── 12. the spawn point is MEMORY-gated too, and says so in its own words (#2387) ──
+# WHY IT IS THIS SUITE'S BUSINESS: the memory arm's whole justification is the population that reaches
+# the gate HERE and nowhere else — merge-one.sh's unported `run_agent` (the `chain-<N>` first review of
+# every own-lane PR), a hand-written `tmux new-session … pi` runner, and an interactive session. If the
+# arm did not exist at the spawn point, that population would still be bounded by memory only through
+# the controller's decision to start it. The floor is driven to a value this box cannot meet, so the
+# REFUSAL is real: the reading is the box's own (`mem_avail_mb`), not a stub.
+reset_probe
+before="$(ledger_rows)"
+err="$(TAG=mem-2387 FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=999999999 run_shim runner 2>&1 >/dev/null)"; rc=$?
+after="$(ledger_rows)"
+# ⛔ 82, NOT 72 (renumbered at the merge onto main): 72 is `REPO_TARGET_REFUSED` (#2694) there, so the
+# draft's number asserted a code the shim no longer returns — and 72 would have made a memory refusal
+# indistinguishable from a repo-identity refusal in every caller.
+[ "$rc" -eq 82 ] \
+  && pass "the spawn point REFUSES on memory with its own code (82), distinct from the load one (76)" \
+  || fail "a memory-refused spawn returned $rc — 76 would make every caller report a load refusal"
+[ ! -s "$TMP/probe" ] \
+  && pass "…and the real pi was NOT started on that refusal" \
+  || fail "a memory-refused spawn still started the real pi: $(tr '\n' ' ' < "$TMP/probe")"
+grep -q 'REFUSED (memory) LOW MemAvailable=[0-9]*M < mem_min_avail_mb=999999999M' <<<"$err" \
+  && pass "…and the line carries the MEASURED reading, the floor and (below) the arithmetic" \
+  || fail "the memory refusal does not carry the reading/floor: $(head -1 <<<"$err")"
+grep -q 'mem_lane_reserve_mb=.*x mem_spawn_reserve_lanes=' <<<"$err" \
+  && pass "…the DERIVATION of the floor, so the operator can recompute it against the box" \
+  || fail "the memory refusal does not state how its floor was derived: $(head -1 <<<"$err")"
+grep -q 'NOT clear by waiting for load' <<<"$err" \
+  && pass "…and the remedy says it does NOT clear by waiting for load (it clears when lanes finish)" \
+  || fail "the memory refusal's remedy points at load, which is the whole false-cause class: $(head -1 <<<"$err")"
+{ [ "$after" -eq "$(( before + 1 ))" ] && [ "$(ledger_field "$after" 2)" = "refused" ]; } \
+  && pass "…and it is counted in the SAME durable ledger as a load refusal, verdict=refused ($before -> $after, no second ledger)" \
+  || fail "the memory refusal was not counted in the spawn-point ledger ($before -> $after)"
+# The OTHER direction at the spawn point: with a floor the box meets, the real pi RUNS. Without this
+# pair the refusal above would pass on a gate that refuses every spawn.
+reset_probe
+FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 run_shim runner >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && [ -s "$TMP/probe" ] \
+  && pass "POSITIVE CONTROL: with a floor this box meets, the spawn point RUNS the real pi (rc=$rc)" \
+  || fail "the memory gate refused a spawn the box could afford (rc=$rc)"
+# ── and the TRANSLATION, 82 -> AGENT_MEM_REFUSED, so no caller learns a new code ──
+# ⛔ THE BRIEF IS RE-RENDERED HERE (review, P2). `$TMP/brief.txt` is the SHARED fixture, and the fake
+# lane runner above writes `aligned` into it on every `run_shim runner` call — so by the time this arm
+# ran, `run_agent`'s research-first gate read `aligned` and refused 80 (`AGENT_BRIEF_REFUSED`) before
+# the spawn point was ever reached. Measured: `rc=80 started=0`, with `[brief-gate] REFUSED` as the
+# only line in the log — the arm reported the MEMORY translation as broken while it had never run.
+"$ROOT/scripts/orchestrator-harness/brief-gate.sh" --section lane > "$TMP/brief.txt"
+mkdir -p "$TMP/bin82"
+printf '#!/usr/bin/env bash\nexit 82\n' > "$TMP/bin82/pi"
+chmod +x "$TMP/bin82/pi"
+cp "$TMP/bin76/gh" "$TMP/bin82/gh" 2>/dev/null || printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin82/gh"
+chmod +x "$TMP/bin82/gh"
+rm -f "$TMP/O/state/walltime.tsv"; : > "$TMP/agent.log"
+res="$(PATH="$TMP/bin82:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 bash -c '
+  . "$1"
+  cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
+  load1() { printf "1"; }
+  run_agent 1 "$2" "$3" "layered mem refusal" >/dev/null 2>&1
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+' _ "$GATE" "$TMP/agent.log" "$TMP/brief.txt" "$FIXREPO" 2>/dev/null)"
+# ⛔ 81, NOT 73: 73 is `AGENT_FORK_REFUSED` on main, so asserting it here would accept the FORK code as
+# proof of the memory translation.
+[ "$res" = "rc=81 started=0" ] \
+  && pass "run_agent turns the spawn point's 82 into AGENT_MEM_REFUSED with AGENT_STARTED=0 ($res)" \
+  || fail "a spawn-point MEMORY refusal was not translated for the callers ($res)"
+grep -q '\[mem-gate\] REFUSED .*spawn point refused the launch for MEMORY' "$TMP/agent.log" \
+  && pass "…and the translated line NAMES memory (not load), which is what the callers' remedy keys on" \
+  || fail "the translated refusal did not name memory: $(cat "$TMP/agent.log")"
+[ ! -s "$TMP/O/state/walltime.tsv" ] \
+  && pass "…and writes NO walltime row (no agent ran, so no zero-duration sample may be fabricated)" \
+  || fail "a spawn-point memory refusal fabricated a walltime row: $(cat "$TMP/O/state/walltime.tsv")"
+
+# ── 12b. UNREADABLE is a REFUSAL WITH ITS OWN REMEDY (review P2, agent-infra#2387) ──
+# LOW and UNREADABLE are both refusals but they CLEAR DIFFERENTLY: a low floor clears when resident
+# lanes finish, and NOTHING will ever finish to fix a broken probe. The shim printed the wait-for-lanes
+# advice for both, so an operator on a box whose /proc/meminfo or vm_stat is unreadable was told to
+# wait for an event that cannot arrive — contradicting run_agent's own arm for the same state, on the
+# one surface that reaches merge-one's reviewers and hand-written runners.
+# Reachability differs by platform: the probe prefers /proc/meminfo, so on Linux UNREADABLE cannot be
+# produced from PATH and the arm SKIPS LOUDLY rather than pretending to have exercised it.
+if [ -r /proc/meminfo ]; then
+  checks=$((checks + 1)); echo "   ⏭  SKIPPED the UNREADABLE-remedy arm: /proc/meminfo is readable here, so the probe cannot be forced unreadable from PATH (run this suite on macOS to exercise it)"
+else
+  mkdir -p "$TMP/unreadshim"
+  # The macOS branch of the probe: `vm_stat` answers nothing, so mem_avail_mb returns non-zero and the
+  # shim has no reading to compare. NOT a low reading — no reading at all.
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/unreadshim/vm_stat"
+  chmod +x "$TMP/unreadshim/vm_stat"
+  reset_probe
+  before="$(ledger_rows)"
+  err="$(PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" TAG=mem-unreadable MAX_LOAD=999999999 \
+    PATH="$TMP/unreadshim:$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
+    bash -c 'pi -p x' 2>&1 >/dev/null)"; rc=$?
+  [ "$rc" -eq 72 ] \
+    && pass "an UNREADABLE probe REFUSES (rc=$rc) — fail-closed, not fail-open like the disk gate" \
+    || fail "an unreadable memory probe returned $rc instead of refusing with 72 (fail-OPEN)"
+  [ ! -s "$TMP/probe" ] \
+    && pass "…and the real pi did NOT start on it" \
+    || fail "an unreadable probe still started pi: $(tr '\n' ' ' < "$TMP/probe")"
+  grep -q 'REFUSED (memory) UNREADABLE' <<<"$err" \
+    && pass "…and the line names the STATE as UNREADABLE (not a number, not LOW)" \
+    || fail "the refusal did not carry UNREADABLE: $(head -1 <<<"$err")"
+  grep -q 'the PROBE is broken, not the box' <<<"$err" \
+    && pass "…and the remedy says the PROBE is broken, which is the action that can actually clear it" \
+    || fail "the UNREADABLE remedy does not name the broken probe: $(grep -i remedy <<<"$err" | head -1)"
+  if grep -q 're-dispatch when resident lanes finish' <<<"$err"; then rc=1; else rc=0; fi
+  ck_unread_no_wait=$rc
+  [ "$ck_unread_no_wait" -eq 0 ] \
+    && pass "…and it does NOT tell the operator to wait for lanes to finish (nothing finishes to fix a probe)" \
+    || fail "the UNREADABLE refusal borrowed the LOW remedy, which can never clear it"
+  # The reading is persisted for the population this surface serves: `-` was the old row's answer to
+  # "what was the memory reading", and a shim refusal used to record the LOAD pair instead.
+  after="$(ledger_rows)"
+  [ "$(ledger_field "$after" 11)" = "UNREADABLE" ] \
+    && pass "…and the durable row records WHY (field 11 = UNREADABLE), not the load reading it did not bind on" \
+    || fail "the shim's memory row does not record the memory reading (field 11 = '$(ledger_field "$after" 11)')"
+  { [ "$after" -eq "$(( before + 1 ))" ] && [ "$(ledger_field "$after" 2)" = "refused" ]; } \
+    && pass "…and it is still exactly ONE row in the same ledger ($before -> $after)" \
+    || fail "the shim wrote $(( after - before )) rows for one refusal ($before -> $after)"
+fi
 
 echo
 if [ "$failures" -gt 0 ]; then

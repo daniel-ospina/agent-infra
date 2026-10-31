@@ -179,7 +179,7 @@ drive() { # drive <gate> <cap> <label> [wip-path]
   bash -c '
     . "$1"
     cd "$2" || exit 2
-    O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+    O="$3"; MAX_LOAD=999999999; MEM_MIN_AVAIL_MB=1; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
     KIND=lane; TAG=2834
     load1() { printf 1; }
     if [ -n "$8" ]; then WIP_PATH="$8"; fi
@@ -298,7 +298,7 @@ rm -f "$WT/early.txt"
 res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi2.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; MEM_MIN_AVAIL_MB=1; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "mutant" >>"$4.agent" 2>&1
@@ -323,7 +323,7 @@ pi_stub clean
 res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi3.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; MEM_MIN_AVAIL_MB=1; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "clean exit" >>"$4.agent" 2>&1
@@ -343,7 +343,7 @@ pi_stub unpushed
 PATH="$TMP/bin:$PATH" PI_LOG="$O/pi4.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; MEM_MIN_AVAIL_MB=1; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "unpushed exit" >>"$4.agent" 2>&1
@@ -467,7 +467,7 @@ pi_stub dirty                                                         # …whose
 PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
   . "$1"
   cd "$5" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; MEM_MIN_AVAIL_MB=1; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   WIP_PATH="$2"
@@ -497,7 +497,7 @@ drive_cap() { # drive_cap <label> <log>
   PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" bash -c '
     . "$1"
     cd "$2" || exit 2
-    O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+    O="$3"; MAX_LOAD=999999999; MEM_MIN_AVAIL_MB=1; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
     KIND=lane; TAG=2834
     load1() { printf 1; }
     run_agent 1 "$4" "$5" "$6" >>"$4.agent" 2>&1

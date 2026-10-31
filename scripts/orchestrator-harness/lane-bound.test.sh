@@ -313,7 +313,11 @@ EOF
 # The observed shape: a `pi` that starts, prints nothing and burns no CPU.
 printf '#!/bin/sh\necho PI_STARTED >> "$PI_LOG"\nsleep 60\n' > "$TMP/bin/pi"; chmod +x "$TMP/bin/pi"
 export PI_LOG="$TMP/pi.log"; : > "$PI_LOG"
-res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+# ⛔ MEM_MIN_AVAIL_MB=1 NEUTRALISES THE MEMORY ARM (#2387) on every arm that drives the SHIPPED
+# `run_agent`: it now consults available memory BEFORE load, so on a box under the shipped 2048 MB
+# floor these drivers returned 73 and the suite reported the LIFETIME BOUND as broken. `1` takes the
+# floor out of the decision; its own arithmetic and default are asserted in spawn-gate.test.sh.
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 MEM_MIN_AVAIL_MB=1 \
         DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=2 \
         bash "$TMP/bin/drive_ra.sh" "$GATE" 120 "$TMP/logs/h.log" "$TMP/brief.txt")"
 want "$res" "bound=stalled"; rc=$?
@@ -344,7 +348,7 @@ while [ "$i" -lt 20 ]; do echo "tick $i"; sleep 0.2; i=$((i+1)); done
 exit 0
 PISTUB
 chmod +x "$TMP/bin/pi"; : > "$PI_LOG"
-res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 MEM_MIN_AVAIL_MB=1 \
         DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=2 \
         bash "$TMP/bin/drive_ra.sh" "$GATE" 120 "$TMP/logs/h2.log" "$TMP/brief.txt")"
 want "$res" "rc=0 started=1 elapsed="; rc=$?
