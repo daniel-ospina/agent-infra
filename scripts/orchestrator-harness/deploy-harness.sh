@@ -378,10 +378,22 @@ elif [ -f "$SRC/harness-provenance.sh" ]; then
       fatal "  to discard them deliberately, re-run with --accept-discard."
       notify "orchestrator: harness deploy REFUSED" "Nothing was copied: $O carries unrecorded edits this deploy would overwrite and no completed deploy records them (see stderr / --accept-discard). (#2041)" high
       exit 78 ;;
-    *)  # CANNOT-VERIFY (no readable record): the refusal cannot fire, but SILENCE about it is how the
-        # next redeploy quietly reverts a patch. Said out loud, once, on the path that will overwrite.
-      log_line "  ⚠ UNKNOWN whether $O carries uncommitted edits: no readable provenance record there."
-      log_line "    Files this run overwrites are NOT recoverable, and nothing can tell you which they are."
+    *)  # CANNOT-VERIFY: the refusal cannot fire, but SILENCE about it is how the next redeploy quietly
+        # reverts a patch. Said out loud, once, on the path that will overwrite.
+      # ⛔ "NO READABLE RECORD THERE" WAS A GUESS, AND A FALSE ONE ON MOST OF THIS ARM (measured
+      # 2026-10-30, review of #3053). `*)` is every code that is neither 0 nor 1: `files=0`, a `files=`
+      # count that disagrees with the manifest, an unparseable manifest line, an unreadable file in `$O`
+      # — all rc 2 with a record that is PRESENT AND READABLE — and `die`'s 78 (no
+      # sha256sum/shasum on PATH, `--src` not a directory). ⛔ NOT `commit=UNKNOWN`: `check` never reads
+      # the commit field (only `show` does), so a record written with `commit=UNKNOWN` exits 0 clean and
+      # 1 once a file is edited — measured, never 2. Naming it here would be another false enumeration
+      # in the fix for false enumerations (review of #3090). The checker printed the real reason and
+      # this branch DISCARDED it, then asserted a cause. The one fact every one of these shares is that
+      # NO ANSWER was produced, so that is what is claimed, and the checker's own words are printed.
+      printf '%s\n' "$DISC_OUT" >&2
+      log_line "  ⚠ UNKNOWN whether $O carries uncommitted edits: the provenance record could not be USED"
+      log_line "    (the checker's own verdict is above). The files this run overwrites may include bytes no"
+      log_line "    deploy wrote — those are NOT recoverable, and nothing here can tell you which they are."
       # ⛔ NO `write --o $O --src $SRC` REMEDY HERE, and it is not an oversight: the writer refuses a
       # SOURCE that ships a file $O does not have ("the deploy is not complete"), which is exactly the
       # state a behind-or-half-deployed box is in — the one this branch is printed for. Measured: the
@@ -425,7 +437,7 @@ LEDGER_WRITTEN=0
 copy_fail=()
 detail=()
 if [ "$DISCARD_UNKNOWN" -eq 1 ]; then
-  detail+=("DISCARD-UNKNOWN	.harness-provenance	(no readable record — cannot tell which files this run would discard)")
+  detail+=("DISCARD-UNKNOWN	.harness-provenance	(the record could not be used — cannot tell which files this run would discard)")
 fi
 for rel in "${REL[@]}"; do
   dst="$O/$rel"
