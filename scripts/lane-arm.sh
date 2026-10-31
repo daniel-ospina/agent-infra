@@ -118,6 +118,9 @@ SHOW=0
 # The pid of whatever `bounded()` currently has in flight, so the signal handler can stop it instead
 # of orphaning it (see the trap block). Emptied by `bounded()` on the normal path.
 CUR_PID=""
+# The pid of the WATCHDOG subshell `bounded()` forked, so a signal can stop it instead of leaving it (and
+# its `sleep`) reparented to init for the rest of the bound. Emptied on the normal path, like CUR_PID.
+CUR_WD=""
 
 # ⛔ A NON-NUMERIC BOUND SILENTLY REMOVES THE BOUND (2026-10-31, review). `bounded()` sleeps for
 # "$secs" and the watchdog `exit 0`s when `sleep` rejects the value -- so `--budget abc` left the child
@@ -153,7 +156,7 @@ done
 # the stall-term registry exists to surface. The registry refused the collision, and co-owner
 # registration is impossible by construction (the forward check requires the SAME value in every
 # owner, and 60 s is not this bound). Both bounds below are registered on their own rows.
-LANE_ARM_SNAPSHOT_MAX_AGE="${LANE_ARM_SNAPSHOT_MAX_AGE_OPT:-$(( BUDGET * 2 ))}"
+LANE_ARM_SNAPSHOT_MAX_AGE="${LANE_ARM_SNAPSHOT_MAX_AGE_OPT:-$(( BUDGET * 2 + 60 ))}"
 # ⛔ A LOCK REAP BOUND MUST EXCEED THE LONGEST LEGITIMATE PASS, or a second pass reaps a LIVE lock and
 # the two interleave their artefacts (one pass's snapshot beside the other's queue). The longest
 # legitimate pass is 2 x BUDGET; deriving the bound makes that inequality structural instead of a
@@ -221,8 +224,10 @@ bounded() {
     [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$me" ] || exit 0
     kill -KILL "$pid" 2>/dev/null ) 2>/dev/null & local wd=$!
   CUR_PID="$pid"
+  CUR_WD="$wd"
   wait "$pid" 2>/dev/null; local rc=$?
   CUR_PID=""
+  CUR_WD=""
   kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
   return $rc
 }
@@ -238,58 +243,91 @@ except OSError: raise SystemExit(1)' "$1" 2>/dev/null
 
 fail() { echo "lane-arm: $1" >&2; log "FAIL $1"; exit 4; }
 
-# ── lock: one arm at a time; break a stale one (a SIGKILLed run cannot clean up) ────────────────
-if [ -e "$LOCK" ]; then
-  # ⛔ DROP THE `|| la=0`. With it, an UNREADABLE stamp became 0, which is `-lt LANE_ARM_LOCK_REAP_S`, so the
-  # pass skipped with exit 0 and the `''` arm of the case below was UNREACHABLE — the "unreadable is
-  # maximally stale" half of this rule was described but not implemented. Leaving `la` empty lets the
-  # case see it.
-  la="$(age_s "$LOCK")"
-  # ⛔ A NEGATIVE AGE IS NOT A FRESH LOCK. A backward clock step, a copied file or `touch -t` puts the
-  # mtime in the future, and a negative number satisfies `-lt LANE_ARM_LOCK_REAP_S` — so the pass would skip
-  # with exit 0 forever and the stale-break below would be unreachable until real time passed
-  # mtime+the reap window. Under `Type=oneshot` that exit 0 reads as SUCCESS: a healthy timer with nothing
-  # produced, which is the no-op-gate class this whole arm exists to refuse. An UNREADABLE or FUTURE
-  # stamp is MAXIMALLY stale (break it), never a fresh lock.
+# ── lock: one arm at a time, as a DIRECTORY mutex (a takeover must be atomic) ───────────────────
+# ⛔ WHY A DIRECTORY AND NOT A PID FILE (2026-10-31, review cycle 3, MEASURED). A single file cannot
+# express "reap a stale lock" atomically. `rm`-then-create let two passes both judge one stale lock and
+# both claim it; `mv`-aside-then-restore left a window in which another pass claimed while the first
+# still believed it owned the lock. Measured with 6 concurrent passes started together: 15 of 20 rounds
+# produced 2-4 SIMULTANEOUS publications, i.e. interleaved snapshot/queue pairs — exactly what this lock
+# exists to prevent. `mkdir` and `mv` on a DIRECTORY are atomic on every POSIX filesystem, so exactly
+# one pass wins the claim and exactly one wins a takeover.
+LOCKD="$LOCK.d"
+# The holder's pid, or empty when the lock carries none (unreadable, or the instant between mkdir and
+# the pid write).
+lock_pid() { head -1 "$LOCKD/pid" 2>/dev/null | tr -cd '0-9'; }
+# Is this pid a LIVE pass of THIS program? `ps -o pid=` rather than `kill -0`: the state dir is shared
+# between the timer's identity and a cmux descendant's, and `kill -0` against another user's LIVE pid
+# fails with EPERM — which would read as "dead" and break a live lock. The args are then RE-PROVED,
+# because a recycled pid belongs to some unrelated process and must never hold this lock.
+lock_is_live_arm() {
+  [ -n "${1:-}" ] || return 1
+  ps -o pid= -p "$1" >/dev/null 2>&1 || return 1
+  ps -o args= -p "$1" 2>/dev/null | grep -q 'lane-arm\.sh'
+}
+claim_lock() {
+  mkdir "$LOCKD" 2>/dev/null || return 1
+  printf '%s\n' "$$" >"$LOCKD/pid" 2>/dev/null || { rm -rf "$LOCKD" 2>/dev/null; return 1; }
+  return 0
+}
+# A LIVE holder is the ONE case where exit 0 is honest: that pass owns the publish, so nothing was
+# measured here and nothing was lost. It is also what a second timer fire looks like.
+_skip_live() {
+  echo "lane-arm: another pass holds $LOCKD (pid $1, ${2}s old) -- skipping; that pass owns the publish" >&2
+  log "SKIP lock held by live pid $1 (${2}s)"
+  exit 0
+}
+if [ -e "$LOCKD" ] || [ -e "$LOCK" ]; then
+  # ⛔ A LEGACY PLAIN-FILE LOCK IS STILL RESPECTED: an earlier revision of this script wrote one and the
+  # cells ran it, so its pid decides exactly as the directory's would. It is never re-created.
+  la="$(age_s "$LOCKD" 2>/dev/null || true)"
+  [ -n "$la" ] || la="$(age_s "$LOCK" 2>/dev/null || true)"
+  # ⛔ AN UNREADABLE OR FUTURE STAMP IS MAXIMALLY STALE, NEVER A FRESH LOCK: a backward clock step, a
+  # copied file or `touch -t` puts the mtime ahead, and a negative age satisfies `-lt`, so the pass would
+  # skip with exit 0 forever — SUCCESS with nothing produced, the no-op-gate class this file exists to
+  # remove.
   case "$la" in ''|-*) la=$LANE_ARM_LOCK_REAP_S ;; esac
-  # ⛔ OWNERSHIP IS A PID, NOT AN MTIME (2026-10-31, review). An mtime-only lock cannot tell a pass
-  # that is WORKING from one that was SIGKILLed, so a dead holder's lock made EVERY fire for the whole
-  # reap window print "skipping" and exit 0 -- under Type=oneshot that is SUCCESS with nothing
-  # produced: the no-op-gate shape this file exists to remove, and the reason the window had to be
-  # guesswork in the first place. The holder records its pid, and a pid that no longer exists is stale
-  # IMMEDIATELY, not after the window.
-  # ⛔ `ps -o pid=`, NOT `kill -0`: this lock lives in a state dir shared between the timer's identity
-  # and a cmux descendant's, and `kill -0` against another user's LIVE pid fails with EPERM -- which
-  # would read as "dead" and break a live lock. `ps` answers the only question asked (does this pid
-  # exist?) for any owner.
-  # ⛔ AND THE PID MUST STILL BE RUNNING THE ARM: a recycled pid belongs to some unrelated process, and
-  # accepting that as a live holder is the stale-measurement class. The args are RE-PROVED here, never
-  # assumed from the pid existing.
-  lp="$(head -1 "$LOCK" 2>/dev/null | tr -cd '0-9')"
-  if [ -n "$lp" ] && [ "$lp" != "$$" ] \
-     && ps -o pid= -p "$lp" >/dev/null 2>&1 \
-     && ps -o args= -p "$lp" 2>/dev/null | grep -q 'lane-arm\.sh'; then
-    # A LIVE holder is the ONE case where exit 0 is honest: that pass owns the publish, so this pass
-    # has nothing to do and nothing was lost. It is also what a second timer fire looks like.
-    echo "lane-arm: another pass holds $LOCK (pid $lp, ${la}s old) -- skipping" >&2
-    log "SKIP lock held by live pid $lp (${la}s)"
-    exit 0
-  fi
+  lp="$(lock_pid)"
+  [ -n "$lp" ] || lp="$(head -1 "$LOCK" 2>/dev/null | tr -cd '0-9')"
+  [ "$lp" = "$$" ] && lp=""     # our own leftover cannot hold us out
+  if lock_is_live_arm "${lp:-}"; then _skip_live "$lp" "$la"; fi
   if [ -z "$lp" ] && [ "$la" -lt "$LANE_ARM_LOCK_REAP_S" ]; then
-    # No pid recorded (an older pass's lock, or a file someone created by hand): age is the only
-    # evidence there is. Refusing to break a lock this pass cannot identify is the conservative
-    # direction, and it is BOUNDED by the reap window rather than open-ended.
-    echo "lane-arm: $LOCK carries no holder pid and is ${la}s old (< ${LANE_ARM_LOCK_REAP_S}s) -- treating it as held; this pass will not break a lock it cannot identify" >&2
-    log "SKIP unidentified lock ${la}s"
-    exit 0
+    # ⛔ AN UNIDENTIFIABLE LOCK IS A REFUSAL, NOT A SKIP (2026-10-31, review). This exited 0 while
+    # publishing nothing, and 0 means "published a fresh verdict" in this file's own header. The
+    # mkdir→pid-write window is the one benign cause, so it is re-read once before refusing; a lock that
+    # is still nameless after that is a lock this pass cannot reason about, and refusing to BREAK it
+    # stays right (it may belong to a live pass this identity cannot inspect).
+    sleep 1
+    lp="$(lock_pid)"
+    [ -n "$lp" ] || lp="$(head -1 "$LOCK" 2>/dev/null | tr -cd '0-9')"
+    [ "$lp" = "$$" ] && lp=""
+    if lock_is_live_arm "${lp:-}"; then _skip_live "$lp" "$la"; fi
+    if [ -z "$lp" ] && [ "$la" -lt "$LANE_ARM_LOCK_REAP_S" ]; then
+      fail "$LOCKD carries no readable holder pid and is ${la}s old (< ${LANE_ARM_LOCK_REAP_S}s) -- this pass cannot tell whether another pass is running, so it will not break the lock AND will not claim a pass. Nothing was measured and nothing was published; if no pass is running, remove $LOCKD (and any $LOCK beside it)."
+    fi
   fi
-  # Everything left is stale: the recorded holder is GONE (its pid no longer exists, or is now some
-  # other program), or there is no pid and the window has expired, or the stamp is unreadable/future.
-  echo "lane-arm: breaking a stale $LOCK (pid ${lp:-unknown}, ${la}s old)" >&2
+  # Stale: take it over ATOMICALLY. Exactly one contender's `mv` succeeds (the source is gone for every
+  # other), and whoever wins the subsequent `mkdir` alone owns the lock — there is no instant in which
+  # two passes both hold it.
+  echo "lane-arm: breaking a stale $LOCKD (pid ${lp:-unknown}, ${la}s old)" >&2
   log "REAP stale lock pid=${lp:-unknown} age=${la}s"
-  rm -f "$LOCK" 2>/dev/null || true
+  if [ -d "$LOCKD" ]; then
+    if mv "$LOCKD" "$LOCKD.reap.$$" 2>/dev/null; then
+      rm -rf "$LOCKD.reap.$$" 2>/dev/null || true
+    else
+      log "REAP lost the takeover race -- another pass moved it first"
+    fi
+  fi
+  if [ -e "$LOCK" ]; then
+    mv "$LOCK" "$LOCK.legacy-reap.$$" 2>/dev/null && rm -f "$LOCK.legacy-reap.$$" 2>/dev/null
+  fi
 fi
-( set -C; printf '%s\n' "$$" >"$LOCK" ) 2>/dev/null || { echo "lane-arm: cannot create $LOCK in $STATE -- the state dir is read-only or full, OR another pass won the race for it, OR a file another user owns is in the way (this dir is shared by the timer's identity and the cmux descendant's, whose owners must match -- see install-lane-arm-timer.sh)" >&2; log "FAIL cannot create lock"; exit 4; }
+if ! claim_lock; then
+  lp="$(lock_pid)"
+  if lock_is_live_arm "${lp:-}"; then _skip_live "$lp" "$(age_s "$LOCKD" 2>/dev/null || echo '?')"; fi
+  echo "lane-arm: cannot create $LOCKD in $STATE -- the state dir is read-only or full, OR a lock this pass cannot identify is present (this dir is shared by the timer's identity and the cmux descendant's, whose owners must match -- see install-lane-arm-timer.sh). Nothing was measured and nothing was published" >&2
+  log "FAIL cannot create lock"
+  exit 4
+fi
 # ⛔ AN EXTERNAL SIGNAL IS NOT THE BOUND (2026-10-31, review). With ONE cleanup trap on
 # EXIT/INT/TERM, a TERM to the arm interrupted `wait` inside `bounded()`, and the interrupted wait's
 # status then landed in the `137|143` arm below -- so a pass an operator killed was reported as
@@ -303,11 +341,23 @@ fi
 # measured. On the success path all of these have already been rename()d away, so removing them here
 # is a no-op; on every abort path it is the whole cleanup.
 _on_cleanup() {
-  rm -f "$LOCK" "$SNAP.prev.$$" \
-        "${TMP:-}" "${QTMP:-}" \
+  # ⛔ ONLY THE LOCK THIS PASS ACTUALLY OWNS (2026-10-31, review). Releasing it BY PATH let a pass whose
+  # lock had been taken over delete the NEW holder's lock -- measured: "lock contains B's live pid ... A
+  # exited; lock file: DELETED BY A" -- after which a third pass claims it while B is still working and
+  # two passes publish interleaved artefacts. The mutex is released only while its pid is THIS process.
+  if [ "$(head -1 "$LOCKD/pid" 2>/dev/null | tr -cd '0-9')" = "$$" ]; then rm -rf "$LOCKD" 2>/dev/null || true; fi
+  rm -rf "$LOCKD.reap.$$" 2>/dev/null || true
+  rm -f "$LOCK.legacy-reap.$$" "$SNAP.prev.$$" \
+        "${TMP:-}" "${QTMP:-}" "${STAMP_TMP:-}" \
         "${STATUS_ERR_TMP:-}" "${ACTIONS_OUT_TMP:-}" "${ACTIONS_ERR_TMP:-}" 2>/dev/null || true
 }
 _on_signal() {
+  # ⛔ THE WATCHDOG IS KILLED FIRST (2026-10-31, review): it is a SUBSHELL `bounded()` forked, so
+  # exiting the main shell left it (and its `sleep`) reparented to init for the rest of the bound --
+  # measured: `1 /bin/bash ./lane-arm.sh` plus its `sleep 240` after a TERM. Harmless, because its own
+  # ppid re-proof stops it signalling anything, but one leaked process per interrupted pass while this
+  # file asserts the opposite. Killing the watchdog first also stops it racing the child kill below.
+  [ -n "$CUR_WD" ] && kill "$CUR_WD" 2>/dev/null
   [ -n "$CUR_PID" ] && kill -TERM "$CUR_PID" 2>/dev/null
   _on_cleanup
   echo "lane-arm: INTERRUPTED by a signal -- NOT the ${BUDGET}s bound; nothing from this pass is published, and the previous snapshot and queue are left standing" >&3
@@ -456,6 +506,23 @@ print("# verdict\tlane\tworkspace\tsession\twhy")
 print("# generated\t%s\tsnapshot_age=%ss" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), os.environ.get("LANE_ARM_SNAPSHOT_AGE", "?")))
 print("# consumer: a process that HOLDS SESSION ANCESTRY (controller loop / tmux-resident doctor)")
 print("# drains a PARKED-CHILD row with scripts/unblock-lane.sh <child> <sid>; report-only until then.")
+# ⛔ A VERDICT WORD THIS RENDERER DOES NOT KNOW IS DISCLOSED, NEVER SILENTLY DROPPED (2026-10-31,
+# review). The filter below accepts a fixed tuple, and the classifier's repo and live copies have
+# DIVERGED (564 lines, #1553), so a new or renamed verdict word is a live risk: rows it classified
+# as wedge-family would vanish from the only machine-readable handoff while the pass exited 0 and
+# counted nothing (measured: a 3-row snapshot carrying STALLED-PARKED and CHILD-STUCK-ORPHAN
+# published 1 row and reported wedged=1). Rows are therefore BUFFERED so the header can state how
+# many were not recognised, and that count goes into the PUBLISHED queue -- not stderr, which an
+# abstaining pass discards along with everything else it produced.
+WEDGE_FAMILY = ("WEDGED", "STALLED", "DEAD", "CHILD_STUCK", "CHILD_STUCK_PARKED")
+# The classifier's OWN vocabulary (lane-status.py:63-67, :149, :177-181), normalized the same way. A
+# word outside BOTH sets is the disclosure above; a word inside KNOWN_OTHER is a deliberate non-wedge
+# verdict and is correctly not queued.
+KNOWN_OTHER = ("WORKING", "WAITING_CHILD", "WIP_IDLE", "DONE_IDLE", "EMPTY", "UNKNOWN",
+               "UNBOUND", "CHILD_OVERDUE", "LONG_TOOL", "UNATTRIBUTED_WORKING",
+               "RECENT_INBOUND", "WAITING")
+rows = []
+unrecognized = {}
 n = 0
 for ev in lanes:
     if not isinstance(ev, dict):
@@ -472,7 +539,10 @@ for ev in lanes:
     # from this file. A previous comment claimed this matched list 2's bucket exactly, which was
     # wrong in both directions; superset-and-re-measure is the honest description.
     # Keep the split-token form: the snapshot's verdict arrives hyphenated (`CHILD-STUCK`).
-    if st not in ("WEDGED", "STALLED", "DEAD", "CHILD_STUCK", "CHILD_STUCK_PARKED"):
+    if st not in WEDGE_FAMILY:
+        if st not in KNOWN_OTHER:
+            _k = st or "<no-verdict>"
+            unrecognized[_k] = unrecognized.get(_k, 0) + 1
         continue
     lane = str(ev.get("lane") or ev.get("name") or "-")
     ws = str(ev.get("ws") or ev.get("workspace") or ev.get("workspaceId") or "-")
@@ -504,8 +574,12 @@ for ev in lanes:
     # with `unblock-lane.sh`, i.e. the ONE distinction the only documented action depends on was thrown
     # away at the moment of writing. Measured with a two-row snapshot (one WEDGED, one CHILD-STUCK):
     # the queue contained `WEDGED` twice. `st` is already the normalized uppercase voter, so emit it.
-    print("%s\t%s\t%s\t%s\t%s" % (st, lane, ws, sid, why.replace("\t", " ").replace("\n", " ")))
+    rows.append("%s\t%s\t%s\t%s\t%s" % (st, lane, ws, sid, why.replace("\t", " ").replace("\n", " ")))
     n += 1
+if unrecognized:
+    print("# unrecognized\t%d\twords=%s" % (sum(unrecognized.values()), ",".join(sorted(unrecognized))))
+for _r in rows:
+    print(_r)
 # ⛔ NO stderr COUNT HERE (2026-10-31, review): this printed `wedged=N` to stderr on a pass that could
 # still abort and publish NOTHING, so an operator or a log scraper saw a count from a discarded pass.
 # The count is derived from the PUBLISHED queue after the publish instead (the success path at the end).
@@ -583,8 +657,9 @@ if [ "$pub_age" -gt "$LANE_ARM_SNAPSHOT_MAX_AGE" ]; then
 fi
 # Same-directory temp, then a rename: never a truncating in-place rewrite of a file another pass could
 # be about to publish (the state dir is shared between two identities -- see the lock block).
-if awk -v age="$pub_age" 'BEGIN{FS="\t";OFS="\t"} /^# generated\t/{sub(/snapshot_age=[^[:space:]]*/, "snapshot_age=" age "s")} {print}' "$QTMP" >"$QTMP.stamp" 2>/dev/null && mv -f "$QTMP.stamp" "$QTMP"; then :; else
-  rm -f "$TMP" "$QTMP" "$QTMP.stamp"
+STAMP_TMP="$QTMP.stamp"
+if awk -v age="$pub_age" 'BEGIN{FS="\t";OFS="\t"} /^# generated\t/{sub(/snapshot_age=[^[:space:]]*/, "snapshot_age=" age "s")} {print}' "$QTMP" >"$STAMP_TMP" 2>/dev/null && mv -f "$STAMP_TMP" "$QTMP"; then :; else
+  rm -f "$TMP" "$QTMP" "$STAMP_TMP"
   fail "cannot correct the queue's snapshot_age stamp before publishing -- publishing a stamp this pass knows is wrong is worse than publishing nothing"
 fi
 snapshot_age=$pub_age
@@ -598,8 +673,19 @@ snapshot_age=$pub_age
 SNAP_PREV="$SNAP.prev.$$"
 SNAP_HAD_PREV=0
 if [ -e "$SNAP" ] && cp -p "$SNAP" "$SNAP_PREV" 2>/dev/null; then SNAP_HAD_PREV=1; fi
+# ⛔ A RENAME INTO A DIRECTORY EXITS 0 (2026-10-31, review). `mv tmp "$SNAP"` where $SNAP is a
+# DIRECTORY moves the temp INSIDE it and reports success, so both "publishes" succeeded, nothing was
+# current, and the pass printed a success line with `wedged=0` (grep on a directory yields nothing).
+# Measured in BOTH directions (queue is a dir: snapshot replaced, queue not; snapshot is a dir: queue
+# replaced, lanes=? ). So each destination is verified to be a REGULAR FILE at the expected path
+# before a success is claimed -- a non-regular one takes the same restore-and-fail path as a failed
+# rename, because "mv returned 0" is not evidence that anything was published.
 mv "$TMP" "$SNAP" || { rm -f "$TMP" "$SNAP_PREV"; fail "cannot publish $SNAP — nothing published"; }
-if ! mv "$QTMP" "$QUEUE"; then
+if [ ! -f "$SNAP" ]; then
+  rm -f "$SNAP_PREV"
+  fail "cannot publish $SNAP -- the destination is NOT a regular file (a directory is in the way), so 'mv' reported success while nothing was published. A human must inspect $SNAP; this pass published NOTHING"
+fi
+if ! mv "$QTMP" "$QUEUE" || [ ! -f "$QUEUE" ]; then
   rm -f "$QTMP"
   # ⛔ SAY WHAT ACTUALLY HAPPENED, per branch. Claiming "restored" when there was no backup to
   # restore would be the same false-PASS the rest of this file refuses: the first-ever pass has no
@@ -623,15 +709,29 @@ rm -f "$SNAP_PREV"
 # the state it read.
 ROWS="$(grep -vc '^#' "$QUEUE" 2>/dev/null || true)"
 ROWS="${ROWS:-0}"
+# ⛔ THE COUNT IS CALLED WHAT IT IS, AND AN UNRECOGNISED VERDICT IS SURFACED HERE TOO (2026-10-31,
+# review). `wedged=N` was really the whole wedge FAMILY (measured WEDGED + CHILD_STUCK -> wedged=2),
+# and a word the renderer did not know vanished silently. The loader states both.
+UNREC="$(awk -F'\t' '/^# unrecognized\t/{print $2}' "$QUEUE" 2>/dev/null || true)"
+UNREC="${UNREC:-0}"
 LANES="$("$PY" -c 'import json,sys
 d=json.load(open(sys.argv[1])); l=d.get("lanes") if isinstance(d,dict) else d
 print(len(l) if isinstance(l,list) else 0)' "$SNAP" 2>/dev/null || echo '?')"
 
-echo "lane-arm: lanes=$LANES wedged=$ROWS snapshot_age=${snapshot_age}s recap=$RECAP queue=$QUEUE"
-log "OK lanes=$LANES wedged=$ROWS age=${snapshot_age}s"
+# ⛔ THE RECAP IS NAMED ONLY IF IT EXISTS (2026-10-31, review). `lane-actions.py` derives its output
+# from the identity's OWN $HOME/.pi/agent/state, not from $LANE_ARM_STATE (which is a supported seam),
+# so naming $RECAP unconditionally pointed an operator at a file this pass never wrote. State what is
+# there; the arm does not claim a recap it cannot see.
+if [ -f "$RECAP" ]; then RECAP_MSG="recap=$RECAP"; else RECAP_MSG="recap=NOT-WRITTEN (lane-actions.py writes under its own \$HOME/.pi/agent/state)"; fi
+
+echo "lane-arm: lanes=$LANES wedge_family=$ROWS unrecognized=$UNREC snapshot_age=${snapshot_age}s $RECAP_MSG queue=$QUEUE"
+log "OK lanes=$LANES wedge_family=$ROWS unrecognized=$UNREC age=${snapshot_age}s"
 if [ "$SHOW" = "1" ]; then
   echo "---- LIST 1 / LIST 2 (first 40 lines) ----"
   head -40 "$RECAP" 2>/dev/null
+fi
+if [ "$UNREC" -gt 0 ]; then
+  echo "lane-arm: ⛔ $UNREC lane row(s) carried a verdict word this arm does not know -- they are NOT in the queue. Words: $(cat "$QUEUE" 2>/dev/null | awk -F'\t' '/^# unrecognized\t/{print $3}')" >&2
 fi
 if [ "$ROWS" -gt 0 ]; then
   echo "lane-arm: $ROWS lane(s) in the wedge family, each with the classifier's OWN verdict:"
