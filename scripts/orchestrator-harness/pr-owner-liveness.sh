@@ -93,7 +93,8 @@ pl_lock_pid() { # <state> <pr> -> the recorded pid, or nothing
 # ⛔ THE HOLE THESE THREE FUNCTIONS CLOSE. `pl_lock_pid` strips every non-digit, so a record that
 # names NOBODY — 0 bytes, whitespace, or a `noclobber` create caught before its `echo $$` — yields the
 # empty pid and lands in the "claim mid-creation" arm below, which is correct for the WINDOW and wrong
-# for ever. Measured 2026-10-30 on three Linux cells: `state/mergeclaim-<PR>.lock` records were 0-byte,
+# for ever. Measured 2026-10-30 on TWO of three Linux cells (lock counts were taken for cell-1 and cell-4):
+# `state/mergeclaim-<PR>.lock` records were 0-byte,
 # unheld and **1278-2314 MINUTES** old, so THIS verdict told the controller `OWNED … never reaped`, the
 # fixer arms spawned nothing, while `pr_owned` (which needs a pid > 0) counted the same PRs UN-owned and
 # held the whole issue path shut. One state, two opposite verdicts, zero lanes — and a second arm in
@@ -140,8 +141,13 @@ pl_reap_no_owner() { # <state> <pr> -> 0 reaped · 1 nothing touched · 3 a peer
   # DETACH by `mv`, never `rm`: what was moved can be inspected, and only one racer can move a given
   # record, which is the compare-and-swap. This is `fix-one.sh`'s `prlock_takeover` shape, applied to
   # the one state it cannot see from a pid.
+  # ⛔ THE VERIFY RE-CHECKS AGE, NOT JUST CONTENT (review of #3096, P3). For an orphan the measured content
+  # is `""`, so content alone cannot tell the record this pass MEASURED from a DIFFERENT, FRESH empty
+  # record a peer created in between — and `merge-one.sh` / `cloud-cell-doctor.sh` both `rm -f` the lock and
+  # re-create it under `noclobber`, so such a record does exist briefly. Age is the discriminating
+  # measurement (`mv` preserves mtime), so it is re-taken on what was actually detached.
   mv -f "$f" "$side" 2>/dev/null || return 1
-  if ! pl_record_no_owner "$side" >/dev/null; then
+  if ! pl_record_no_owner "$side" >/dev/null || ! pl_record_outlived_create_window "$side"; then
     # What we detached is NOT the abandoned record we measured: a peer claimed it in the instant between
     # the read and the `mv`. Put it back with `ln` (create-if-absent), so a claim displaced for an
     # instant is not lost — and say so loudly if a third party re-claimed the path first.
