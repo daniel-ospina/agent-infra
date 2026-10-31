@@ -239,6 +239,14 @@ NB="$HERE/nonblocking-dispatch.sh"
 # directory on the resulting PATH, which makes it the only honest place to put one. (The visible
 # symptom of getting this wrong: the "positive control" ran the REAL pi and wrote a real session.)
 cp "$TMP/bin/pi" "$TMP/bg-o/gh-rest/pi"; chmod +x "$TMP/bg-o/gh-rest/pi"
+# ⛔ AND THE `gh` STUB NEEDS THE SAME SEAM, MEASURED ON THE MAC (this arm was red on macOS and green
+# on the runner, which is the worst shape for a pin). `nonblocking-dispatch.sh` puts
+# `/opt/homebrew/bin:/usr/local/bin` at the FRONT of PATH, so a `gh` stub in `$TMP/bin` is outranked
+# by a real `/opt/homebrew/bin/gh` here: the landing gate then reads a repository that does not exist,
+# refuses `UNREADABLE open-PR count`, and the worker exits 74 while the stub `pi` never runs. Ubuntu
+# runners have no `/opt/homebrew`, so the stub won there and the defect only appeared locally. Same
+# directory, same reason as the `pi` line above — it is the only path that outranks the prepend.
+cp "$TMP/bin/gh" "$TMP/bg-o/gh-rest/gh"; chmod +x "$TMP/bg-o/gh-rest/gh"
 : > "$PI_LOG"
 out="$( cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
        bash "$NB" bgtest "$TMP/wt" "$TMP/no-research.txt" 5 2>&1 )"; rc=$?
@@ -519,7 +527,11 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
 # superset), independently of any branch. Declared here because an equality that is red on its own
 # base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# ⛔ `scripts/check-farm-drift.sh` (#3120) is a NAMER, not a dispatch path — it names `brief-gate.sh`
+# in the comment that explains why the farmed copy of `pr-doctor.py` went stale. It still had to be
+# declared: this census counts REFERENCERS, and it arrived on `main` after the list was last edited,
+# so the arm was red on its own base again (measured: `ADDED: scripts/check-farm-drift.sh`).
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
