@@ -16,8 +16,12 @@ must be this file's answer and not a lookalike.
   stdout  ONE token: `GREEN` | `PENDING:<names>` | `FAILED:<names>` | `NOCHECKS`
 
 `NOCHECKS` means "this read produced no check rows" — an EMPTY surface, or an unreadable one. It is
-NOT a pass and NOT a pending: it reaches neither the merge arm nor the fixer arm. The NOCHECKS arm
-(`nochk-resolve.py`) is what turns that non-answer into a named verdict.
+NOT a pass and NOT a pending: this TOKEN reaches neither the merge arm nor the fixer arm. The NOCHECKS arm
+(`nochk-resolve.py`) is what turns that non-answer into a named verdict — and ITS answer is what may reach
+an acting arm (`RECOVERED:GREEN` merges, `RECOVERED:FAILED:*` reaches the fixer), so a merge after a
+NOCHECKS rests on that second read at the live head, never on the empty one that produced this token.
+All five `NOCHECKS`-producing paths above must keep printing it: an empty stdout from this file is READ
+as a read failure by the caller (#3110), not as a class.
 """
 import json
 import os

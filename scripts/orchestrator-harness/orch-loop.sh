@@ -2329,6 +2329,17 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       *)          parts+=("$notr not reached (cause not recorded)") ;;
     esac
   fi
+  # ⛔ A QUEUED ENTRY IS NOT A SUPPRESSED ONE (#3110, measured on the live mac box: `219 candidates ->
+  # 0 queued, 9 peer-owned, 209 blacklisted (checked: queued 151, dispatched 53, pr 5)`). The 151 were
+  # COUNTED inside `blacklisted`, which is the bucket an operator reads as "suppressed, nothing to do" —
+  # while in fact they are the dispatch backlog: `refresh-candidates.sh` writes a CLEAN candidate to
+  # `candidates.txt` AND `checked.txt` (checked.txt is what stops a re-pre-flight, NOT what stops the
+  # dispatch), so they are waiting for the ISSUE PATH, not excluded. Printing them as blacklisted is
+  # how "the selector spawns zero" read as "there is nothing to spawn" on the one line an operator has.
+  # The sub-breakdown and the reconciled total are unchanged; what changes is that the backlog is
+  # NAMED as backlog beside them instead of reading as one more kind of suppression.
+  local backlog_q=""
+  if is_num "$sk_q" && [ "$sk_q" -gt 0 ]; then backlog_q="$sk_q"; fi
   local joined="" p
   for p in ${parts[@]+"${parts[@]}"}; do joined="${joined:+$joined, }$p"; done
   # A record that does not add up is NOT printed as a clean decomposition: the parts names what
@@ -2350,6 +2361,17 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # recorded something other than `none`, and never with an extra literal: the occurrence count is
   # already inside the field.
   local tail=""
+  # ⛔ THE BACKLOG IS STATED AS ITS OWN FACT, because it is the ONLY part of that line an operator can
+  # ACT on: `209 blacklisted` is a suppression to audit, `151 in the dispatch backlog` is work the box
+  # has already judged CLEAN and simply has not spawned. Two different repairs, and until now one word.
+  # ⛔ IT NAMES ITS REFERENT (#3110 review, P2). `$tail` renders at the END of the line, after
+  # `backlog=<wc -l candidates.txt>` — a DIFFERENT number — so a bare "N of those" read as "of the 219".
+  # It is gated on the `blacklisted` part having rendered at all: a record carrying
+  # `skipped_checked_queued` without a numeric `skipped_checked` (the older-writer case the parts above
+  # handle explicitly) would otherwise state a fact about a bucket that is not on the line.
+  if is_num "$sk_ck" && is_num "$sk_q" && [ "$sk_q" -gt 0 ]; then
+    tail="$tail — $backlog_q of the $sk_ck blacklisted are the DISPATCH BACKLOG (CLEAN-judged, awaiting the issue path), not suppressed"
+  fi
   case "${unusable:-}" in ''|none) : ;; *) tail="$tail — failing surface: $unusable" ;; esac
   # ⛔ A FAILED REWRITE IS NOT "NOTHING WAS RELEASED". The writer publishes `checked_released=-`
   # when the atomic `checked.txt` rewrite failed — the entries ARE still suppressed and nobody knows
@@ -4583,6 +4605,28 @@ while true; do
     # so the arm calls this file instead of a lookalike. `$_CK_PY` is resolved once at startup (see
     # there) and is an ABSOLUTE path, so this pipeline's subshell inherits it.
     V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
+    # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NEVER A CLASS (#3110). `check-class.py` ALWAYS prints one
+    # token, so `V` empty means the classifier never answered at all — a python that could not start, a
+    # file that vanished between the startup guard and this line, a killed pipeline. That reached the
+    # residual `*)` arm below, which printed `no acting arm for class '<empty>' — nothing spawned
+    # (re-read next cycle)` and then classified it `<empty>` AGAIN on the next cycle, for ever: a
+    # pattern that cannot match the population reads as nothing to do. MEASURED in this box's own log:
+    # `#10214 no acting arm for class '<empty>' — nothing spawned (unreadable/empty check surface;
+    # re-read next cycle)` — the PR was never acted on by any arm.
+    # ⛔ THE FIX IS A READING ARM, NOT A PERMISSION — AND IT IS NOT A ONE-STEP BYPASS EITHER. Mapping it
+    # to `NOCHECKS` ROUTES it into the NOCHECKS arm, which asks a second, DIFFERENT source (the
+    # check-runs authority via `nochk-resolve.py`, not the `gh pr checks` rollup that just failed). The
+    # EMPTY read itself reaches no acting arm: it is intercepted by the NOCHECKS arm and can only wait.
+    # What CAN then act is the resolver's own answer — `RECOVERED:GREEN` is handed to the ordinary
+    # GREEN arm and merges, `RECOVERED:FAILED:*` reaches the CI fixer — so a merge here rests on a
+    # real read at the live head, never on the failed one that produced the empty output (a reviewer
+    # P1 on this very block: the first draft of this comment claimed NOCHECKS can never merge, and the
+    # recovery path two statements below contradicts that). The alternatives are worse: GREEN on an
+    # unread surface merges blind, and leaving it `<empty>` is the indefinite re-read this replaces.
+    if [ -z "${V:-}" ]; then
+      V="NOCHECKS"
+      echo "#$PR the classifier produced NO VERDICT (empty output from $_CK_PY) — treating it as an UNREAD surface and handing it to the NOCHECKS arm to re-read from the run list" >>"$LOG"
+    fi
     # ── THE NOCHECKS CLASS GETS AN ARM (agent-infra#2719) ─────────────────────────────────────────
     # ⛔ WHAT THIS REPLACES. `NOCHECKS` used to mean THREE different events at once — the read failed,
     # no run had registered yet, and no run will ever exist — because the pipeline above discards the
