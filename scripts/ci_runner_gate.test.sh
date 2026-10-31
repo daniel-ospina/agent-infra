@@ -49,9 +49,13 @@ assert_absent() { # <path> <label>
 }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/ci-runner-gate-test.XXXXXX")"
-trap 'rm -rf "$T"' EXIT
+# CI_GATE_TEST_KEEP=1 keeps the scratch dir so a failing arm can be read back (it is wiped by
+# default; a suite that always leaves 300 MB behind trains people to ignore its leftovers).
+if [ "${CI_GATE_TEST_KEEP:-0}" = 1 ]; then trap 'echo "scratch kept: $T"' EXIT; else trap 'rm -rf "$T"' EXIT; fi
 BIN="$T/bin"; mkdir -p "$BIN"
 GH_LOG="$T/gh.log"
+GH_ROWS_STATE="$T/rows-live.tsv"
+export GH_ROWS_STATE
 CMUX_LOG="$T/cmux.log"
 
 # ── `gh` test double ────────────────────────────────────────────────────────
@@ -139,6 +143,51 @@ if [[ "$*" == *"--input -"* ]]; then
     case "$a" in */runners/*/labels) put_id="${a#*/runners/}"; put_id="${put_id%%/*}" ;; esac
   done
   printf 'PUT %s BODY %s\n' "${put_id:-?}" "$put_body" >> "$GH_LOG"
+  # ⛔ APPLY THE BODY TO THE INVENTORY (agent-infra#3060). GitHub replaces a runner's CUSTOM labels
+  # with the body and re-adds the host-derived read-only ones. A double that only RECORDS the PUT
+  # serves the pre-write rows on the next read, so "the label stuck" (and "it did not") is
+  # inexpressible — which is exactly the distinction the verify step exists to make.
+  #   GH_PUT_DROP_LABEL  models the runner AGENT re-asserting its own configured set: the API accepts
+  #                      the body and the label is gone on the next read. That is the measured
+  #                      production behaviour of a server-side PUT (60-120s, 2026-10-29).
+  if [ -n "${put_id:-}" ] && [ -n "${put_body:-}" ]; then
+    # GH_PUT_DROP_LABEL models the runner AGENT re-asserting its own configured set 60-120 s after a
+    # server-side PUT. That timing is the WHOLE defect: the writing pass re-reads milliseconds later
+    # and therefore SEES the label, so a synchronous check cannot catch it — only the NEXT pass can.
+    # So the drop is DEFERRED by one rows read (GH_DROP_DEFER_FIRST_READ=0 turns it back into the
+    # instantaneous model, which the suite uses to pin the synchronous arm on its own).
+    python3 - "$GH_ROWS_STATE" "$put_id" "$put_body" "${GH_PUT_DROP_LABEL-}" "${GH_PUT_DROP_DEFER-1}" "${GH_ROWS_STATE}.drop" <<'PYAPPLY'
+import json, sys, os
+state, rid, body, drop = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+defer, dropfile = sys.argv[5], sys.argv[6]
+try:
+    labels = [l for l in (json.loads(body).get("labels") or []) if isinstance(l, str)]
+except Exception:
+    sys.exit(0)                      # an unparseable body changes nothing (the gate never sends one)
+READONLY = {"self-hosted", "Linux", "macOS", "Windows", "X64", "ARM64", "ARM"}
+rows = []
+if os.path.exists(state):
+    rows = [l for l in open(state).read().split("\n") if l]
+kept, host = [], []
+for row in rows:
+    if "\t" not in row:
+        kept.append(row); continue
+    i, name = row.split("\t", 1)
+    if i == rid:
+        if name in READONLY:
+            host.append(name)        # the server re-adds these; the body never carries them
+    else:
+        kept.append(row)
+if drop and defer != "0":
+    # deferred: the label goes in NOW (so this pass's verify sees it) and is removed by the NEXT rows
+    # read — the measured 60-120 s window, expressed in the only clock the double has.
+    open(dropfile + ".pending", "w").write(drop)
+elif drop:
+    labels = [l for l in labels if l != drop]
+out = kept + ["%s\t%s" % (rid, h) for h in host] + ["%s\t%s" % (rid, l) for l in labels]
+open(state, "w").write("\n".join(out) + "\n")
+PYAPPLY
+  fi
 fi
 case "$*" in
   # ── `/actions/runs/{id}/jobs` serves TWO callers, told apart by the jq they ask for ────────
@@ -296,7 +345,13 @@ case "$*" in
     # current_mode asks for a COUNT (a --jq expression with `select(`); runner_rows asks for the
     # `<id>TAB<label>` pairs. Anything else is the pre-#2327 ids-only read.
     if [[ "$*" == *"select("* ]]; then
-      printf '%s\n' "${GH_FALLBACK_N:-0}"
+      if [ -n "${GH_FALLBACK_N+x}" ]; then
+        printf '%s\n' "$GH_FALLBACK_N"     # an explicit statement of the pool's current state
+      elif [ -f "$GH_ROWS_STATE" ]; then
+        awk -F'\t' '$2=="ubuntu-latest"{n++} END{print n+0}' "$GH_ROWS_STATE"
+      else
+        printf '0\n'
+      fi
       exit 0
     fi
     case "${GH_MODE:-ok}" in
@@ -307,15 +362,18 @@ case "$*" in
       # `-` not `:-`: the empty-pool case below sets GH_POOL_IDS to the EMPTY string on purpose,
       # and `:-` would swallow that into the default, making the case vacuous.
       *)
-        if [ -n "${GH_RUNNER_ROWS_FILE:-}" ]; then
-          cat "$GH_RUNNER_ROWS_FILE"
-        else
-          for _id in ${GH_POOL_IDS-101 102}; do
-            for _l in self-hosted Linux ARM64 self-hosted-arm64 ubuntu-latest; do
-              printf '%s\t%s\n' "$_id" "$_l"
-            done
-          done
-        fi ;;
+        if [ ! -f "$GH_ROWS_STATE" ]; then
+          if [ -n "${GH_RUNNER_ROWS_FILE:-}" ]; then
+            cat "$GH_RUNNER_ROWS_FILE" > "$GH_ROWS_STATE"
+          else
+            for _id in ${GH_POOL_IDS-101 102}; do
+              for _l in self-hosted Linux ARM64 self-hosted-arm64 ubuntu-latest; do
+                printf '%s\t%s\n' "$_id" "$_l"
+              done
+            done > "$GH_ROWS_STATE"
+          fi
+        fi
+        cat "$GH_ROWS_STATE" ;;
     esac
     exit 0 ;;
 esac
@@ -380,8 +438,22 @@ run_gate() {
   STATE_DIR="$T/state-$name"
   # KEEP_STATE=1 makes the next call a REPEAT pass against the SAME home + state dir, for cases
   # whose whole point is what the NEXT tick does (a retried relabel). It is one-shot.
-  if [ "$KEEP_STATE" = 1 ]; then KEEP_STATE=0; else mkdir -p "$STATE_DIR" "$home"; fi
+  KEEP_STATE_NEXT=0
+  if [ "$KEEP_STATE" = 1 ]; then KEEP_STATE=0; KEEP_STATE_NEXT=1; else mkdir -p "$STATE_DIR" "$home"; fi
   : > "$GH_LOG"
+  [ "$KEEP_STATE_NEXT" = 1 ] || rm -f "$GH_ROWS_STATE"
+  # a re-assertion pending from the PREVIOUS pass lands now: the runner agent overwrote the label set in
+  # the 60-120 s between ticks, so this pass must find it gone (that is the defect being pinned).
+  if [ -f "$GH_ROWS_STATE.drop.pending" ] && [ -f "$GH_ROWS_STATE" ]; then
+    python3 - "$GH_ROWS_STATE" "$(cat "$GH_ROWS_STATE.drop.pending")" <<'PYDROP'
+import sys
+state, drop = sys.argv[1], sys.argv[2]
+rows = [l for l in open(state).read().split("\n") if l]
+out = [r for r in rows if not r.endswith("\t" + drop)]
+open(state, "w").write("\n".join(out) + "\n")
+PYDROP
+    rm -f "$GH_ROWS_STATE.drop.pending"
+  fi
   # ⛔ CMUX_LOG is NOT truncated per run (review: the truncation made the suite's closing
   # "no run invoked cmux" assertion VACUOUS — every invocation wiped the previous run's line, and
   # the last four runs exit before `notify()`, so the count was always 0 even with the leg enabled).
@@ -394,6 +466,19 @@ run_gate() {
     export CI_GATE_STATE_DIR="$STATE_DIR"
     export CI_GATE_REPO="test-org/test-repo"
     export CI_GATE_QUEUE_THRESHOLD="$GH_THRESHOLD_DEFAULT"
+    # The disengage streak is a PRODUCTION default of 3 (agent-infra#3060): one hostile reading must
+    # not strip the label the queue is using. Arms that are not about the streak keep the immediate
+    # semantics, or they would all be asserting the same counter; the streak has its own section,
+    # which runs with NO override so the shipped default is what is pinned.
+    _streak_given=0
+    for _a in "$@"; do
+      case "$_a" in CI_GATE_DISENGAGE_TICKS=*) _streak_given=1 ;; --) break ;; esac
+    done
+    [ "$_streak_given" = 1 ] || export CI_GATE_DISENGAGE_TICKS=1
+    # …and an arm that says `=default` gets the SHIPPED value: the program reads an empty/absent knob
+    # as its own default, so this is not an override (a mutant that lowers the default is then fatal
+    # to the hysteresis arms, which is the point of testing a default rather than a number).
+    [ "${CI_GATE_DISENGAGE_TICKS-}" = default ] && export CI_GATE_DISENGAGE_TICKS='' ; true
     export CI_GATE_ORCH_WS=""
     while [ $# -gt 0 ] && [ "$1" != "--" ]; do
       export "$1"
@@ -554,6 +639,123 @@ run_gate incident-real CURL_BODY='{"components":[{"name":"Actions","status":"ope
   GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
 assert_eq "$RC" "0" "a live Actions incident still exits 0 (the fix is not 'always fail')"
 assert_contains "$OUT" "TRANSITION unknown -> local" "a live Actions incident routes CI to the local pool"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# agent-infra#3060 — A PUT THAT RETURNED 0 IS NOT AN ATTACHED LABEL, AND DISENGAGING IS NOT FREE
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# Measured on the live pool 2026-10-29: `gh api -X PUT …/runners/<id>/labels` returns 0 and the label
+# is GONE within 60-120 s, because the runner AGENT re-asserts its own configured label set. The gate
+# counted PUT exit statuses, so it logged `set_labels ok=12 fail=0 engagement=on`, recorded a
+# transition to `local`, and left the pool with ZERO carriers — the queue kept queueing while the
+# instrument said the pool was routed. Same false success as tortoise#6897's `ok=16 fail=0`.
+echo "── #3060: a REJECTED write is a failure — the transition must not be recorded ──"
+# GH_PUT_DROP_DEFER=0 = the API refuses the label outright (visible on the verify re-read). This is the
+# SYNCHRONOUS arm: it proves the rejection path, and nothing more.
+run_gate verify-drop GH_QUEUED=5 GH_FALLBACK_N=0 GH_PUT_DROP_LABEL=ubuntu-latest GH_PUT_DROP_DEFER=0 \
+  CI_GATE_QUEUE_THRESHOLD=1 --
+assert_contains "$OUT" "set_labels accepted=0 rejected=2" "(v1) the rejection is COUNTED (nothing is reported as accepted)"
+assert_contains "$OUT" "set_labels REJECTED runner=101" "(v1) and the runner the API refused is NAMED"
+assert_contains "$OUT" "wanted=[self-hosted-arm64,ubuntu-latest," "(v1) the log states what was wanted"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "(v2) NO transition is recorded on a rejected write"
+assert_not_contains "$OUT" "TRANSITION" "(v2) and no transition is announced"
+assert_eq "$RC" "2" "(v3) a rejected write is fail-closed (exit 2), not a silent success"
+
+echo "── #3060: an ACCEPTED write still records the transition (the failure is specific) ──"
+run_gate verify-ok GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_contains "$OUT" "set_labels accepted=2 rejected=0" "(v4) the write is accepted for both runners"
+assert_contains "$OUT" "SYNCHRONOUS" "(v4) …and the log says the claim is synchronous, not durable"
+assert_contains "$OUT" "TRANSITION " "(v4) a verified engagement still records the transition"
+assert_contains "$OUT" "-> local" "(v4) …into local"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(v5) mode=local is written"
+# the POSITIVE CONTROL for the write itself: the API received a body carrying the label for each runner
+assert_contains "$(put_body_for 101)" "ubuntu-latest" "(v5) the API received the fallback label for runner 101"
+
+echo "── #3060 durability: the label evaporates 60-120s later, so the NEXT pass must catch it ──"
+# THE MEASURED DEFECT (VGATE P1). The writing pass re-reads milliseconds later and legitimately sees
+# the label, so a synchronous check CANNOT close it. The drop is deferred to the next rows read (the
+# 60-120 s window). The pass after that must (a) notice, (b) say so, (c) re-apply, (d) fail closed.
+run_gate dur GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 \
+  GH_PUT_DROP_LABEL=ubuntu-latest --
+assert_contains "$OUT" "set_labels accepted=2 rejected=0" "(d1) the writing pass sees the label — synchronously it is honest"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d1) …and records engagement"
+KEEP_STATE=1
+run_gate dur GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_contains "$OUT" "ENGAGEMENT LOST" "(d2) the next pass MEASURES the loss — this is the half a synchronous check cannot do"
+assert_contains "$OUT" "measures NO carrier" "(d2) …and names what it measured"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=1" "(d3) the verdict file carries the loss for a reader that is not a human"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(d4) the label is re-applied rather than silently abandoned"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(d5) the state stays engaged — re-applying does not disengage"
+KEEP_STATE=1
+run_gate dur GH_QUEUED=5 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "engagement_lost=0" "(d6) a pass that finds the carrier present clears the flag"
+KEEP_STATE=0
+echo "── #3060: disengage needs 3 consecutive github readings (the shipped default) ──"
+assert_contains "$(cat "$GATE")" 'DISENGAGE_TICKS="${CI_GATE_DISENGAGE_TICKS:-3}"' \
+  "(h0) the shipped default is 3, and an empty/absent/non-numeric value falls back to it"
+# ⛔ A REPEAT PASS REUSES THE NAME: `run_gate` derives the state dir from it, so a sequence that wants
+# the NEXT tick to see the previous one's state must keep the same name (with KEEP_STATE=1).
+run_gate hyst GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(h1) engaged"
+KEEP_STATE=1
+run_gate hyst GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=default --
+assert_contains "$OUT" "hysteresis: holding local (github reading 1/3)" "(h2) the first github reading HOLDS"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(h2) …and the pool stays engaged"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(h2) …with no PUT at all — a hold is not a re-assert"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "held=1 streak=1" "(h2) the verdict says the gate HELD (not that a strip failed)"
+KEEP_STATE=1
+run_gate hyst GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=default --
+assert_contains "$OUT" "hysteresis: holding local (github reading 2/3)" "(h3) the second reading still holds"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(h3) still engaged"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(h3) still no strip"
+KEEP_STATE=1
+run_gate hyst GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=default --
+assert_contains "$OUT" "hysteresis: disengage confirmed (3/3)" "(h4) the third reading releases the pool"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "(h4) mode=github is recorded"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "(h4) …and only now is the label stripped"
+KEEP_STATE=0
+# …and the streak RESETS on any engage reading.
+run_gate hyst-reset GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+KEEP_STATE=1
+run_gate hyst-reset GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=default --
+assert_contains "$OUT" "holding local (github reading 1/3)" "(h5) streak starts at 1"
+KEEP_STATE=1
+run_gate hyst-reset GH_QUEUED=5 GH_FALLBACK_N=1 CI_GATE_QUEUE_THRESHOLD=1 --
+KEEP_STATE=1
+run_gate hyst-reset GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=default --
+assert_contains "$OUT" "holding local (github reading 1/3)" "(h6) an engage reading resets the streak to 1"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(h6) and the pool is still engaged"
+KEEP_STATE=0
+# ⛔ THE HOLD KEYS ON `prev`, NOT ON `mode` (VGATE P2, measured): with prev=local and a reading that
+# resolves mode=unknown, keying on mode skipped the hold, reset the streak, and the `prev != want`
+# re-converge arm stripped the pool — one hostile reading taking capacity.
+run_gate hyst-prev GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+KEEP_STATE=1
+run_gate hyst-prev GH_QUEUED=5 GH_FALLBACK_N=1 GH_INPROGRESS=null CI_GATE_DISENGAGE_TICKS=default --
+# The unreadable-mode pass FAILS CLOSED before the policy block (measured: "in_progress count UNREADABLE
+# … FAIL-CLOSED"), so the keying cannot be reached end-to-end — pin it on the source, and state why.
+assert_contains "$OUT" "FAIL-CLOSED" "(h7) an unreadable mode reading changes nothing at all"
+assert_contains "$(cat "$GATE")" 'if [ "$want" = "github" ] && [ "$prev" = "local" ]; then' \
+  "(h7) the hold keys on prev (the durable record), never on this pass's reading"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(h7) …and the unreadable pass strips nothing"
+KEEP_STATE=0
+# ⛔ OUT-OF-RANGE KNOBS MUST NOT RELEASE ON THE FIRST READING (VGATE P2, measured fail-open): the file
+# bounds every other `[ -ge ]` operand to 9 digits because an errored comparison reads FALSE.
+run_gate hyst-big GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+KEEP_STATE=1
+run_gate hyst-big GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=999999999999999999999 --
+assert_contains "$OUT" "hysteresis: holding local (github reading 1/3)" "(h8) a 21-digit tick count falls back to the shipped default instead of releasing"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(h8) …and the pool is still engaged"
+KEEP_STATE=1
+run_gate hyst-big GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=0 --
+assert_contains "$OUT" "hysteresis: holding local" "(h9) a zero tick count falls back to the default too"
+KEEP_STATE=0
+# a corrupt streak file must not read as a release either
+run_gate hyst-corrupt GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+printf '%s' '999999999999999999999' > "$STATE_DIR/ci-runner-gate.disengage-streak"
+KEEP_STATE=1
+run_gate hyst-corrupt GH_QUEUED=0 GH_FALLBACK_N=1 CI_GATE_DISENGAGE_TICKS=default --
+assert_contains "$OUT" "hysteresis: holding local (github reading 1/3)" "(h10) a 21-digit streak file is discarded, not wrapped into a release"
+KEEP_STATE=0
 
 # ⛔ agent-infra#2904 — THE THROUGHPUT (ABSORPTION) LEG. The measured defect: a run sat QUEUED for 3 h
 # while the component was operational, there was no Actions incident, and the queue was under the

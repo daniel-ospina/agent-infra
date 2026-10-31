@@ -1092,12 +1092,19 @@ case "$PROV_OUT" in
   *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
   *) bad "status prints the record but not what it means: $PROV_OUT" ;;
 esac
-# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". `harness-refresh.sh`
-# writes `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
-# is a CLAIM, and NOTHING was measured busy there — so the generic blocked sentence named a cause that
-# does not exist and told the operator to wait for a population that may never exist. The identity cause
-# needs its own arm, and it must come first.
-printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=unknown checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". On that path
+# `harness-refresh.sh` returns from `set_pending` BEFORE `inflight_gate` is consulted, so no population is
+# ever evaluated as the BLOCKER. The record's `lanes=` is still written — it is measured separately, before
+# `set_pending`, and may legitimately be a NON-ZERO number (measured: a live `$O/lane.sh` gives
+# `blocked=identity lanes=1`) — but it is not why the restart is blocked. The identity is. So the generic
+# blocked sentence named a cause that does not exist and told the operator to wait for a population that
+# may never be the thing holding the restart back. The identity cause needs its own arm, and it comes first.
+# ⛔ AND THE SPECIMEN CARRIES A NON-ZERO lanes= ON PURPOSE: it is the HARDEST case for this arm. A record
+# with `blocked=identity lanes=1` has a lane population the operator can SEE, so the generic "wait for that
+# population to go idle" advice looks plausible — yet `inflight_gate` was never consulted on this path, so
+# lanes= is not the blocker and waiting would never clear it. If the arm ever regresses to the generic one,
+# this specimen is what catches it.
+printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
   "$(( $(date +%s) - 9 ))" > "$P/o/state/restart-request"
 prov status
 case "$PROV_OUT" in
@@ -1105,8 +1112,8 @@ case "$PROV_OUT" in
   *) bad "status does not explain an unprovable identity: $PROV_OUT" ;;
 esac
 case "$PROV_OUT" in
-  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — nothing was measured busy, so the message names a cause that does not exist: $PROV_OUT" ;;
-  *) ok "…and does NOT claim an interruption that was never measured" ;;
+  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — on this path inflight_gate is never consulted, so no population is the blocker and the message names a cause that does not exist: $PROV_OUT" ;;
+  *) ok "…and does NOT claim an interruption that was never established" ;;
 esac
 # An ABSENT record is not "nothing pending": no cycle has ever recorded one.
 rm -f "$P/o/state/restart-request"
@@ -3093,6 +3100,68 @@ case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
 esac
+# (3b) ⛔ THE INCIDENT SHAPE: an ineffective reap EXITS 0 by design, so `ok=1 rc=0 verdict_worktree=ok`
+# is the CORRECT exit-code reading of the exact pass #3041 was read from — `worktree=<MB>` and nothing
+# else was that pass's misleading sentence. The reaper records the real answer separately as
+# `delegate_verdict_worktree=`, and a field the reader does not print does not exist.
+# ⛔ ORDERING IS LOAD-BEARING: these legs REWRITE the status file above, so they must run AFTER every
+# assertion that reads the previous pass's record (the first draft was inserted mid-block and silently
+# invalidated the `worktree=fail-closed` case).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=reap-ineffective\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"worktree=24MB"*"worktree-delegate=reap-ineffective"*) \
+    ok "status: the HEALTHY line carries the delegate's verdict beside the exit-code reading" ;;
+  *) bad "status: an ineffective reap on a healthy pass still reads as plain ok — $OUT" ;;
+esac
+# (3c) …and it does NOT bolt the note onto a genuinely healthy cell (no noise for `ok`/absent).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"worktree-delegate="*) bad "status: a healthy delegate verdict still grew a note — $OUT" ;;
+  *) ok "status: a healthy cell gains no delegate note (the field is printed only when it informs)" ;;
+esac
+# (3d) ⛔ THE SILENT SET MUST BE THE BENIGN SET, NOT AN "OK-LIKE" SET (#3058 review, P2). The delegate
+# vocabulary is `dry-run|reclaimed|idle|reap-ineffective|unmeasured` (pi-reap-worktrees.sh:642) plus
+# `mixed` at the entry point. THREE of those are a healthy pass and NONE of them may carry the ⛔:
+# `dry-run` is the SHIPPED DEFAULT (disk-reaper.sh:167) — so an ok-like silent set painted
+# `⛔ worktree-delegate=dry-run` onto every pass of every cell that had not armed the reaper — and
+# `idle` is the ordinary reading of an armed pass with nothing to reclaim. The ⛔ is the alarm channel,
+# so a ⛔ on a healthy cell is exactly what trains the operator to skip the one line that must be read.
+# Both polarities are pinned here: benign => silent, alarm-or-unrecognised => ⛔ (fail-loud, so a NEW
+# verdict added to the reaper and not taught to this reader is surfaced rather than swallowed).
+# ⛔ `mixed-benign` IS IN THE BENIGN LOOP AND MUST STAY THERE (#3058 review, P1): it is the entry
+# point's spelling for "two repos with ORDINARY answers that differ" (one reclaimed, one idle) — the
+# everyday shape of a multi-repo cell — and the aggregator has already lifted any alarm answer out of
+# it before the token exists. `mixed` is the alarm spelling (two answers of the alarm class) and stays
+# in the alarm loop below.
+for _dv_benign in dry-run idle reclaimed ok '?' not-run mixed-benign; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=%s\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$([ "$_dv_benign" = dry-run ] && printf dry-run || printf apply)" "$_dv_benign" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"worktree-delegate="*) bad "status: the BENIGN delegate verdict '$_dv_benign' grew a ⛔ note — $OUT" ;;
+    *"disk reaper: last pass"*) ok "status: the BENIGN delegate verdict '$_dv_benign' prints no ⛔ note, and the pass line is still there" ;;
+    *) bad "status: the healthy pass line vanished for delegate verdict '$_dv_benign' — $OUT" ;;
+  esac
+done
+for _dv_alarm in reap-ineffective unmeasured mixed unlisted-new-verdict; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$_dv_alarm" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"⛔ worktree-delegate=$_dv_alarm"*) ok "status: the ALARM delegate verdict '$_dv_alarm' is printed with the ⛔ (fail-loud)" ;;
+    *) bad "status: the ALARM delegate verdict '$_dv_alarm' was swallowed — $OUT" ;;
+  esac
+done
+# ⛔ THE PAIRED ASSERTION LIVES ABOVE, IMMEDIATELY AFTER BLOCK (3)'s OWN `OUT`, and it must stay
+# there: blocks (3b)/(3c) each REWRITE `disk-reaper.status` and reassign `OUT`, so an assertion left
+# down here reads (3c)'s healthy record — which never prints `verdict_worktree=` at all — and the
+# fail-closed property silently stops being tested while still claiming to be (#3058 review).
 # (3b) a DEFERRAL (rc=6) is NOT a failure on the operator's surface. The record keeps ok=0 and
 # `--print-status` still exits 3 (this verb's own exit code comes from the DOCTOR's status, so the
 # headline is the channel here — which is why it must be honest and must not go quiet), but it must not

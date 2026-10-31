@@ -1002,74 +1002,59 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
   # ref keyed on <PR>-<head-sha>. The pid check above CANNOT see it — a remote pid is not
   # inspectable — so the claim's LEASE is the liveness signal. Read from the snapshot refreshed
   # once at the top of this cycle, not from the network per PR.
-  local sha="${2:-}" ref until owner now
-  [ -n "$sha" ] || return 1
-  [ -f "$O/state/claims-snapshot" ] || return 1
-  if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
-  until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
-  owner="$(awk -F'\t' -v r="$ref" '$1==r{print $2; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
-  # ⛔ AN OVERSIZED LEASE IS UNPARSEABLE, AND UNPARSEABLE MEANS LIVE (P2, fourth review round,
-  # 2026-10-14). This reader now agrees with claim_acquire()'s, which applies the SAME 18-digit
-  # bound before its comparison (claims.sh; the bound is 18, not 9, because a lease is an EPOCH
-  # SECOND — 10 digits today). Without it the two readers DISAGREED about the same datum: the bare
-  # `[ "$now" -le "$until" ]` below ERRORS at or above 2**63 (rc=2, and an errored test is FALSE),
-  # so claim_live() reported a foreign full-width claim as DEAD while claim_acquire() correctly
-  # refused that head as live. The controller therefore reached the spawn branch EVERY cycle, the
-  # refused fixer wrote fixbail-<pr>-<head>, and refund_bailed_fixer deleted that marker and
-  # `parked-<pr>` on the next cycle — so the cap never tripped and the PR was never parked: one
-  # refused spawn plus 1 GitHub call and 3 remote round trips per cycle, indefinitely, on a PR no
-  # box could work. The conservative direction is the same one claims.sh takes: treat it as LIVE.
   #
-  # ⛔ AND ABSENT IS STILL NOT THE SAME AS UNPARSEABLE (P2, fifth review round, 2026-10-14). An entry
-  # MISSING from the snapshot means "no visible claim" -> NOT live. An entry whose lease reads `0`
-  # means "a claim EXISTS whose lease is unreadable", and claims.sh treats exactly that as LIVE
-  # (claim_acquire's `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via
-  # `[ "$until" != "0" ]`). A negative lease collapses to the same `0` — `_lease_of`'s `[0-9]*`
-  # cannot match a minus sign — and so does any other non-digit. Collapsing the sentinel into the
-  # absent case made these two readers DISAGREE on the one input class claims.sh documents as a
-  # sentinel, with the very same consequence described above (the controller re-spawns a fixer
-  # claim_acquire refuses; refund_bailed_fixer un-parks the PR every cycle, so the cap never trips).
-  # `-n` is checked FIRST because absent (not live) and unreadable (live) must never be merged; the
-  # non-digit test then covers the literal negative, which claim_prune also reads as "keep".
-  [ -n "${until:-}" ] || return 1
-  [ "${#until}" -gt 18 ] || [ "$until" = "0" ] && return 0
-  [ -z "${until//[0-9]/}" ] || return 0
-  # ⛔ AN ORPHANED HOLDER IS NOT IN FLIGHT, AND THIS READER MUST AGREE WITH THE REGISTRY
-  # (agent-infra#2094). `claim_acquire`/`claim_issue_preflight`/`claim_prune` all consult
-  # `claim_orphan_reason`; this PR-keyed snapshot reader did not, so after a rename a PR claim stamped
-  # by the dead host kept the PR OUT of the sweep for its whole term and merge-one's new reclaim arm
-  # was never reached — the issue path self-healed and the PR path did not. Guarded with `declare -f`
-  # ⛔ AND NO `declare -f` GATE IS NEEDED (cycle-15 review): selftest.sh EXTRACTS this function
-  # standalone and drives it without claims.sh, where `claim_orphan_reason` is UNDEFINED — the call
-  # below then exits 127, which is non-zero, so the `if` falls through to the pre-existing polarity
-  # exactly as intended. The gate that used to sit here was inert: removing it changed no behaviour in
-  # any harness (measured — a mutation of it left every suite green), so the honest code is the branch
-  # alone. The extraction-only path is pinned by O16, which asserts the polarity still decides there.
-  if [ -n "${owner:-}" ] && claim_orphan_reason "$owner" "$ref" >/dev/null 2>&1; then return 1; fi
-  # ⛔ THE CLOCK PROBE ABSTAINS TOWARD LIVE, LIKE EVERY OTHER PROBE IN THIS LADDER (P2, cycle-23
-  # review). `[ "$(date +%s)" -le "$until" ]` folded an UNREADABLE clock into "not in flight": bash
-  # printed `[: …: integer expression expected` on every call and the test read FALSE, so for the
-  # duration of a clock failure this reader reported every worker-held PR as free — the sweep then
-  # attempted a spawn per PR, `claim_acquire` refused each on its OWN clock guard, `fixbail-<pr>-<head>`
-  # was written and `refund_bailed_fixer` un-parked it, so the cap never tripped (the same per-cycle
-  # churn the oversized-lease case above produced, plus a stderr line per call). The three readers in
-  # claims.sh all treat the same unreadable clock as LIVE (`_lease_is_live` returns LIVE for a
-  # non-numeric `now`; `claim_acquire` says "local clock unreadable" and holds; `claim_issue_preflight`
-  # is INCOMPLETE, never CLEAN) — and this function is the one this file calls "ONE implementation of
-  # the lease polarity", so it abstains the same way instead of being the one reader that fails open.
-  now="$(date +%s 2>/dev/null)"
-  case "$now" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$now" -le "$until" ] && return 0
-  return 1
+  # ⛔ THE READING MOVED TO claims.sh (agent-infra#2466): `claim_snapshot_verdict` is now the ONE
+  # snapshot reader, and this function is its SPAWN-GUARD polarity. It used to re-derive the
+  # polarity here from two bare `awk` calls, which meant this file and claims.sh could disagree
+  # about the same datum (they did — the oversized-lease and `0`-sentinel classes documented below)
+  # AND that every way the READ can fail — no snapshot at all, a snapshot written from a FAILED
+  # fetch, a snapshot older than the cycle reading it — collapsed into the guard this function used
+  # to carry (`[ -f "$O/state/claims-snapshot" ] || return 1`): "not live" for a registry that never
+  # answered. That is the multi-cell duplicate, not a
+  # prediction of one: two cells with `SCOPE=own` each select the same PR whenever the one signal
+  # they share is unreadable. An UNREADABLE REGISTRY IS NOT FREEDOM, so rc 2 (`claim-unreadable`)
+  # BLOCKS here exactly like a live lease — the spawn guard answers the conservative question
+  # ("may I work this?").
+  local sha="${2:-}" ref
+  [ -n "$sha" ] || return 1
+  if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
+  # ⛔ rc 0 = free (claim-absent | claim-expired | claim-orphaned), 1 = held, 2 = unreadable.
+  # ONLY 0 MAY FREE THIS HEAD. A MISSING READER (`claims.sh` not sourced at all, or older than this
+  # change) exits 127 — also not 0, so it abstains the same way instead of inventing a verdict. That
+  # is deliberate: the old `declare -f` gate was inert precisely because its absence fell through to
+  # the BLOCKING branch, and here the same absence must not fall through to the FREE one.
+  claim_snapshot_verdict "$O/state/claims-snapshot" "$ref" >/dev/null
+  case $? in 0) return 1 ;; *) return 0 ;; esac
 }
 
+# ── WHY THE SHARED READER ANSWERS AS IT DOES (the regressions that pinned each answer) ─────────
+# Every case below is now decided in ONE place — claims.sh's `claim_snapshot_verdict`, which calls
+# `_lease_is_live` and `claim_orphan_reason` — and the tests that pinned them (`selftest.sh` §14,
+# `test-gates.sh` (2)-(3)) drive the SHIPPED functions, so moving the mechanism did not move the
+# answers:
+#   • an OVERSIZED (>= 2**63) lease is UNPARSEABLE, and unparseable means LIVE (P2, 4th round) —
+#     the bare `[ "$now" -le "$until" ]` ERRORS there and an errored test is FALSE, so the old
+#     reader called a live foreign claim DEAD and the controller spawned for it every cycle while
+#     `claim_acquire` refused the head;
+#   • the `0` sentinel is NOT the ABSENT case — a claim EXISTS whose lease cannot be parsed, so it
+#     is LIVE, and a negative lease collapses to the same `0` (`_lease_of`'s `[0-9]*` cannot match
+#     a minus sign) as does any other non-digit;
+#   • an entry ABSENT from a snapshot that was READ is free — but only if the read is TRUSTWORTHY
+#     (that qualifier is new, and it is the whole of agent-infra#2466);
+#   • an ORPHANED holder is not in flight (`claim_orphan_reason`, agent-infra#2094) — a renamed
+#     box's own PR claim must stop reading as owned, or the PR never re-enters the queue;
+#   • an UNREADABLE CLOCK in the `now` probe is LIVE, never "not in flight" (P2, cycle-23 review).
+
 # refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
-# fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
-# already owns this head) — OR when the CI-queue gate DEFERS the push before any work (fix-one.sh's
-# `ciq_ci_allowed` arm, #2296). Both are "no agent work was done", which is the only property this
-# marker asserts; the LOG LINE below names both causes, because a deferral logged as a cross-box
-# refusal sends an operator hunting for a lease that never existed (the #1720 "the log names the
-# wrong cause" class). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# fix-one.sh writes $O/state/fixbail-<pr>-<head> on any of its THREE pre-agent deferrals: the
+# cross-box CAS refusal (another box already owns this head), the PR-OWNER lock
+# (`mergeclaim-<PR>.lock` held by a live pid, #2576), and a PR-owner takeover that could not complete.
+# Every one is "no agent work was done", which is the only property this marker asserts; the LOG LINE
+# below names the cause it was given, because a deferral logged as a cross-box refusal sends an
+# operator hunting for a lease that never existed (the #1720 "the log names the wrong cause" class).
+# ⛔ THERE IS NO CI-QUEUE ARM HERE OR IN fix-one.sh (#2927): a repair path reads no CI queue, so it
+# can never write a `DEFERRED by the CI-queue gate` line — the arm that used to sit here was
+# unreachable, and naming it sent a manual operator to wait for a deferral that cannot happen. The controller books the attempt at SPAWN (fixcount+1) and, on the
 # reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
 # used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
 # refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
@@ -1097,12 +1082,12 @@ refund_bailed_fixer() {
     if [ -f "$O/state/fixspend-$pr-$head" ]; then
       rm -f "$O/state/fixspend-$pr-$head"
       touch "$O/state/needsfix-$pr-$head"
-      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, findings marker restored" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, findings marker restored" >>"$LOG"
     else
-      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
     fi
   else
-    echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n" >>"$LOG"
+    echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
   rm -f "$O/state/parked-$pr"
@@ -2347,6 +2332,17 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       *)          parts+=("$notr not reached (cause not recorded)") ;;
     esac
   fi
+  # ⛔ A QUEUED ENTRY IS NOT A SUPPRESSED ONE (#3110, measured on the live mac box: `219 candidates ->
+  # 0 queued, 9 peer-owned, 209 blacklisted (checked: queued 151, dispatched 53, pr 5)`). The 151 were
+  # COUNTED inside `blacklisted`, which is the bucket an operator reads as "suppressed, nothing to do" —
+  # while in fact they are the dispatch backlog: `refresh-candidates.sh` writes a CLEAN candidate to
+  # `candidates.txt` AND `checked.txt` (checked.txt is what stops a re-pre-flight, NOT what stops the
+  # dispatch), so they are waiting for the ISSUE PATH, not excluded. Printing them as blacklisted is
+  # how "the selector spawns zero" read as "there is nothing to spawn" on the one line an operator has.
+  # The sub-breakdown and the reconciled total are unchanged; what changes is that the backlog is
+  # NAMED as backlog beside them instead of reading as one more kind of suppression.
+  local backlog_q=""
+  if is_num "$sk_q" && [ "$sk_q" -gt 0 ]; then backlog_q="$sk_q"; fi
   local joined="" p
   for p in ${parts[@]+"${parts[@]}"}; do joined="${joined:+$joined, }$p"; done
   # A record that does not add up is NOT printed as a clean decomposition: the parts names what
@@ -2368,6 +2364,20 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # recorded something other than `none`, and never with an extra literal: the occurrence count is
   # already inside the field.
   local tail=""
+  # ⛔ THE BACKLOG IS STATED AS ITS OWN FACT, because it is the ONLY part of that line an operator can
+  # ACT on: `209 blacklisted` is a suppression to audit, `151 in the dispatch backlog` is work the box
+  # has already judged CLEAN and simply has not spawned. Two different repairs, and until now one word.
+  # ⛔ IT NAMES ITS REFERENT (#3110 review, P2). `$tail` renders at the END of the line, after
+  # `backlog=<wc -l candidates.txt>` — a DIFFERENT number — so a bare "N of those" read as "of the 219".
+  # It is gated on the `blacklisted` part having rendered at all, in TWO ways, for two real populations.
+  # `skipped_checked` shipped in #2040 while its sub-breakdown (including `skipped_checked_queued`) only
+  # arrived in #2183 — so a record from that window carries the TOTAL and no queued count, which the
+  # `is_num "$sk_q"` conjunct excludes. The `is_num "$sk_ck"` conjunct covers the other case: a total
+  # that is absent or non-numeric, which would otherwise print `7 of the  blacklisted` — a backlog
+  # claimed against a bucket that is not on the line.
+  if is_num "$sk_ck" && is_num "$sk_q" && [ "$sk_q" -gt 0 ]; then
+    tail="$tail — $backlog_q of the $sk_ck blacklisted are the DISPATCH BACKLOG (CLEAN-judged, awaiting the issue path), not suppressed"
+  fi
   case "${unusable:-}" in ''|none) : ;; *) tail="$tail — failing surface: $unusable" ;; esac
   # ⛔ A FAILED REWRITE IS NOT "NOTHING WAS RELEASED". The writer publishes `checked_released=-`
   # when the atomic `checked.txt` rewrite failed — the entries ARE still suppressed and nobody knows
@@ -3077,6 +3087,60 @@ pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently wor
   return 1
 }
 
+# claim_selection_verdict <pr> <head-sha> -> the PUBLISHED verdict for SELECTION
+#   rc 0 = FREE  (claim-absent | claim-expired | claim-orphaned | claim-own)
+#   rc 1 = HELD  (claim-held — a foreign, live, non-orphaned window: SKIP this head)
+#   rc 2 = UNREADABLE (claim-unreadable — the registry could not answer; NOT freedom)
+# Globals: CLAIM_SEL_VERDICT (the word), CLAIM_SEL_OWNER, CLAIM_SEL_UNTIL, CLAIM_SEL_WHY.
+#
+# ⛔ THIS IS POLICY OVER ONE VERDICT, NOT A SECOND VERDICT PATH (agent-infra#2466). The answer to
+# "is this key held?" is claims.sh's `claim_snapshot_verdict` — which itself calls `_lease_is_live`
+# and `claim_orphan_reason`, the two functions every other claim reader shares. This wrapper adds
+# the ONE thing that is selection's own question and not the registry's: a claim held by THIS box is
+# not evidence that a worker is alive (a live process is, and `pr_owned`'s arms 1-2 prove that), so
+# an own claim reads FREE here. That asymmetry is deliberate and pre-existing (see the note under
+# `claim_foreign_live`); `claim_live` keeps the conservative polarity for the SPAWN guard.
+#
+# ⛔ AN UNREADABLE REGISTRY IS NEVER FREEDOM, AND IT IS NOT "HELD" EITHER: it is its own word, so
+# the sweep can print WHY it did nothing (`claim-unreadable: <reason>`) instead of a reason that
+# asserts a holder it never read. Both rc 1 and rc 2 block; the difference is what the operator is
+# told, and an abstention must carry a NAMED reason (`docs/ops/fleet-liveness.md` §4).
+claim_selection_verdict() {
+  local pr="${1:-}" sha="${2:-}" ref host me rc
+  CLAIM_SEL_VERDICT=""; CLAIM_SEL_OWNER=""; CLAIM_SEL_UNTIL=""; CLAIM_SEL_WHY=""
+  if [ -z "$sha" ]; then
+    CLAIM_SEL_VERDICT="claim-absent"; CLAIM_SEL_WHY="no head sha to key a claim on"; return 0
+  fi
+  if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$pr" "$sha")"; else ref="refs/claims/${pr}-${sha:0:12}"; fi
+  # ⛔ CALLED DIRECTLY, never in `$( )`: a command substitution would discard the globals this
+  # function's caller prints. (Same trap `claim_acquire` documents — its contract is globals too.)
+  claim_snapshot_verdict "$O/state/claims-snapshot" "$ref" >/dev/null
+  rc=$?
+  CLAIM_SEL_VERDICT="${CLAIM_VERDICT:-claim-unreadable}"
+  CLAIM_SEL_WHY="${CLAIM_VERDICT_WHY:-}"
+  CLAIM_SEL_OWNER="${CLAIM_SNAPSHOT_OWNER:-}"; CLAIM_SEL_UNTIL="${CLAIM_SNAPSHOT_UNTIL:-}"
+  # rc 0|1|2: free, held, unreadable. ANYTHING ELSE (127 from a missing reader, or a future code)
+  # is UNREADABLE, never free: a verdict this function does not recognise is not a licence to work
+  # a head, and calling it "held" would print a reason asserting a holder that was never read.
+  case "$rc" in
+    0) return 0 ;;
+    2) return 2 ;;
+    1) : ;;
+    *) CLAIM_SEL_VERDICT="claim-unreadable"
+       CLAIM_SEL_WHY="no snapshot verdict was produced (rc=$rc — the reader is missing: is \$O/claims.sh sourced?)"
+       return 2 ;;
+  esac
+  # rc 1: a live lease. Ask whose, with BOTH probes abstaining toward BLOCKING:
+  # a sentinel or unanswerable host name is not an identity, so it cannot prove "this is mine".
+  host="${CLAIM_SNAPSHOT_OWNER%%:*}"
+  me="$(_this_host)"
+  if [ -n "$host" ] && [ -n "$me" ] && [ "$host" = "$me" ]; then
+    CLAIM_SEL_VERDICT="claim-own"; CLAIM_SEL_WHY="this box's own claim (${CLAIM_SNAPSHOT_OWNER:-?}) — only a live process proves work"
+    return 0
+  fi
+  return 1
+}
+
 # ── OWNERSHIP IN THE SPAWN ARMS: PROVEN, OR RELEASED (agent-infra#2831) ─────────────────────────
 # ⛔ THE MEASURED DEFECT: `[pr] PR path: NO UNIT SPAWNED this cycle — 8 row(s) with a named reason
 # (most common: 5 a worker already owns this PR)` while `lanes=0/0` and NO such workers existed. The
@@ -3127,41 +3191,40 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
 # "may I work this?", which is the conservative question; this answers "is someone already working
 # it?", which is the selection question. Two questions, two predicates, deliberately.
 claim_foreign_live() {
-  local pr="$1" sha="${2:-}" ref owner host f p
-  [ -n "$sha" ] || return 1
-  [ -f "$O/state/claims-snapshot" ] || return 1
-  if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$pr" "$sha")"; else ref="refs/claims/$pr-${sha:0:12}"; fi
-  [ -n "$ref" ] || return 1
-  owner="$(awk -F'\t' -v r="$ref" '$1==r{print $2; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
-  [ -n "${owner:-}" ] || return 1
-  host="${owner%%:*}"
-  [ "$host" != "$(_this_host)" ] || return 1
-  # ⛔ AN ORPHANED HOLDER IS NOT OWNERSHIP (agent-infra#2094) — AND THAT RULE IS INHERITED, NOT
-  # DUPLICATED (cycle-17 review). `pr_owned` reads ownership through THIS function, which ends in the
-  # ONE lease reader, `claim_lease_live`; #2094 put the `claim_orphan_reason` consult there, so a renamed
-  # box's own PR claim stops reading as owned and the PR re-enters the un-owned queue (measured in the
-  # incident: `backlog empty queue=READ(192)` — the ISSUE path self-healed because it asked, the PR
-  # path did not). A second consult HERE would be dead code: removing it changed no assertion in any
-  # suite, which is exactly how a duplicate guard is supposed to fail its own mutation test. Keep the
-  # rule in the reader every path shares.
-  # ⛔ THE LEASE ALONE DECIDES — NEVER `claim_live` (review R2, P1). `claim_live` is the SPAWN GUARD and
-  # its first arm is a deliberately-loose local-lock pid test; delegating ownership to it let a STALE
-  # `mergeclaim-<pr>.lock` whose pid had been recycled make even an EXPIRED foreign lease read live, so
-  # a PR left the un-owned queue for ever — the dangerous direction, reached through the cross-box arm
-  # after arm 2 was already fixed. One lease reader, no lock arm.
-  claim_lease_live "$pr" "$sha"
+  # ⛔ rc 2 (claim-unreadable) IS NOT FREEDOM — BUT IT IS NOT "OWNED" EITHER (review, P1). Only
+  # rc 1 (claim-held: a live lease on this head, held by another box) is OWNERSHIP. rc 0 (free, or
+  # this box's own claim), rc 2 (unreadable), and any code a future reader invents — including a
+  # MISSING reader (127) — are NOT owned.
+  #
+  # WHY THE POLARITY IS THIS WAY ROUND. The consumers disagree about which answer is conservative:
+  #   * `unowned_scan` computes `u = n - owned`. OVER-counting `owned` drives `u` to 0, and a zero
+  #     un-owned count is what OPENS the issue path — see that function's own rule: "assuming they
+  #     were owned would OPEN the issue path on a listing we could not read — the fail-open this
+  #     file's is_limit discipline exists to prevent". A predicate that answers "owned" for an
+  #     unreadable registry therefore causes exactly the fail-open it is documented to prevent
+  #     (measured: stale / failed-fetch / absent registry all yielded unowned=0 and the gate opened
+  #     with every open PR invisible).
+  #   * The SWEEP does not read this predicate. Its spawn is gated on `claim_selection_verdict`
+  #     directly (see the `case` at the sweep below), where rc 2 acts on NOTHING. So a permissive
+  #     answer here buys no spawn-side safety and costs the drain gate.
+  # Both directions therefore fail CLOSED: the sweep acts on nothing, and the count keeps the issue
+  # path shut because the PRs it could not classify are still counted as un-owned work.
+  claim_selection_verdict "${1:-}" "${2:-}" >/dev/null
+  case $? in 1) return 0 ;; *) return 1 ;; esac
 }
 # ⛔ THE FLEET-WIDE `box` SENTINEL IS NOT AN IDENTITY HERE EITHER (cycle-21 review). Falling back to
-# the literal `box` made a probe-blind box read EVERY peer's `box:<pid>` claim as its OWN — the
-# comparison is `[ "$host" != "$(_this_host)" ]` — so `claim_foreign_live` returned "not foreign" and
-# `pr_owned()` dropped that PR out of the owned set: the sweep then spawned for it every cycle and
-# `claim_acquire` refused (where `box` IS correctly not an identity). Not a steal (nothing is deleted),
-# but the churn the live-ownership rewrite exists to remove. An unanswerable name now prints NOTHING,
-# so `[ "$host" != "$(_this_host)" ]` STAYS TRUE (a non-empty `$host` is unequal to the empty string),
-# the guard does NOT fire, and the claim falls through to `claim_lease_live` — the same "the lease
-# decides" answer every genuinely foreign holder gets. (Cycle-22 correction: the first version of this
-# comment said "the `!=` test then fails and the guard abstains", which is the opposite polarity among
-# `!=` + `|| return 1` and would have read as correct to anyone not tracing the operator.)
+# the literal `box` made a probe-blind box read EVERY peer's `box:<pid>` claim as its OWN, so
+# `claim_foreign_live` returned "not foreign" and `pr_owned()` dropped that PR out of the owned set:
+# the sweep then spawned for it every cycle and `claim_acquire` refused (where `box` IS correctly not
+# an identity). Not a steal (nothing is deleted), but the churn the live-ownership rewrite exists to
+# remove. 
+# ⛔ AND THE FIX IS STATED AS THE RULE, NOT AS THE OPERATOR (agent-infra#2466): `claim_selection_verdict`
+# calls an own claim only when BOTH names answered and are EQUAL (`[ -n "$host" ] && [ -n "$me" ] &&
+# [ "$host" = "$me" ]`). An unanswerable name now prints NOTHING, so the equality cannot hold and the
+# claim reads FOREIGN — the same "the lease decides" answer every genuinely foreign holder gets. The
+# previous shape (`[ "$host" != "$(_this_host)" ]`) accidentally did the right thing with an empty
+# `_this_host`, and a cycle-22 correction to this comment had to walk back a prior claim about which
+# polarity it produced; the equality form removes the question.
 _this_host() { local h; h="$(hostname -s 2>/dev/null)"; case "$h" in ''|box) return 1 ;; esac; printf '%s' "$h"; }
 
 # How many OPEN PRs nothing is currently working. <open_prs>
@@ -3693,11 +3756,48 @@ while true; do
     # read free (spawn -> CAS-refusal churn) and live ones read held (the fleet refuses work) with
     # nothing in the operator's only surface saying why. Same idiom as `claim_prune` below.
     claim_snapshot "$O/state/claims-snapshot" 2>>"$LOG"
+    # ⛔ THE READ'S OWN VERDICT IS PUBLISHED EVERY CYCLE (agent-infra#2466). Without this line the
+    # only way to learn that selection is standing down is to notice that nothing happened — the
+    # `backlog empty queue=READ(192)` shape, one surface over.
+    # ⛔ AND A FAILED FETCH IS NOT A FAILED PUBLISH (review, P2). Both used to print the same
+    # "the fetch did NOT answer … no PR is spawned or armed" line, which was FALSE for a write
+    # failure: the fetch answered and nothing was published, so the PREVIOUS snapshot is still on
+    # disk with its OWN header — and whether it is believed is that header's answer, not this
+    # comment's: the reader believes it only while the header says `ok` AND it is inside the age
+    # bound, and answers `claim-unreadable` for a prior `failed` header or for no prior snapshot at
+    # all. Two causes with opposite consequences must not share one sentence — an auditor was being
+    # pointed at the network when the cause was the disk.
+    # ⛔ FOUR ARMS, NOT THREE (round-3 review, P2). Fetch and publish FAIL INDEPENDENTLY — a full disk
+    # breaks BOTH in one cycle (`git fetch` writes packs into $REPO/.git, the publish writes under
+    # $O/state) — and the conjunction is the case where the "the failed answer WAS published, so
+    # everything is unreadable" sentence is FALSE: nothing was published, so whatever snapshot was
+    # already on disk still answers, with its own header and its own `read_at`. Measured on the
+    # shipped reader: `fetch=failed write=failed` → `claim-held`, not `claim-unreadable`. A `refs=`
+    # count is printed ONLY where the number describes what was published or what the fetch answered;
+    # on a failed publish the body could not be produced, so the count is not knowable and is not
+    # claimed.
+    if [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ] && [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
+      echo "[claims] snapshot read=ok refs=${CLAIM_SNAPSHOT_REFS:-?} max_age=${CLAIM_SNAPSHOT_MAX_AGE:-?}s" >> "$LOG"
+    elif [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ]; then
+      echo "[claims] ⛔ snapshot write=failed (read=ok) — nothing was published, so the PREVIOUS snapshot is still in place — believed ONLY while that file's own header says ok and it is inside ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, and claim-unreadable otherwise (or when there is no previous snapshot at all). This is a WRITE failure under \$O/state (disk, permissions), not a network one: check the disk, not the registry" >> "$LOG"
+    elif [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
+      echo "[claims] ⛔ claim-unreadable: the fetch did NOT answer (read=${CLAIM_SNAPSHOT_FETCH:-?} refs=${CLAIM_SNAPSHOT_REFS:-?}) — its failed header WAS published, so every selection answer this cycle is claim-unreadable: no PR is spawned or armed and no issue dispatched on the assumption that silence means freedom" >> "$LOG"
+    else
+      echo "[claims] ⛔ BOTH halves failed (fetch=${CLAIM_SNAPSHOT_FETCH:-?} write=${CLAIM_SNAPSHOT_WRITE:-?}): nothing was fetched AND nothing was published, so selection this cycle ran on WHATEVER SNAPSHOT WAS ALREADY ON DISK — believed only while that file's own header says ok and it is inside ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, and unreadable otherwise (or when there is no previous snapshot at all). The cause is on THIS BOX on both sides — \$REPO/.git for the fetch, \$O/state for the publish — not only in the registry" >> "$LOG"
+    fi
     # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
     if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
       touch "$O/state/.claims-pruned"
       ( claim_prune >> "$LOG" 2>&1 ) &
     fi
+  else
+    # ⛔ NO REGISTRY IS NOT A FREE FLEET (agent-infra#2466). This arm used to be silent — there was
+    # nothing to snapshot — and every reader below then saw NO SNAPSHOT FILE, which they answered as
+    # "not owned". So a cell that was never provisioned (or whose registry was removed) selected
+    # exactly as if it were alone on the repo, which is the duplicate dispatch this whole mechanism
+    # exists to prevent. It is now the loud, named abstention: nothing is selected until the one-line
+    # remedy is run. `refresh-candidates.sh --check` refuses the same state up front.
+    echo "[claims] ⛔ claim-unreadable: no registry at $O/claims.sh — every PR reads claim-unreadable, so NOTHING is spawned or armed this cycle (silence is not freedom); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
   fi
 
   # ── machine-global package caches (agent-infra#1987) ───────────────────────
@@ -4127,6 +4227,36 @@ while true; do
       rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
       disp "$PR" - - wait "${PR_ST:-closed} since the count was read (nothing to do)"; continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    # ── THE DURABLE CLAIM DECIDES BEFORE ANY ARM ACTS (agent-infra#2466) ──────────────────────
+    # ⛔ THIS IS THE SELECTION POINT, and it is the one place where a second controller's work is
+    # invisible: everything below (`redfix`, the parked guard, the spawn guards, the GREEN arm that
+    # auto-arms a merge) acts on a PR, and the local evidence they share — a live process here, a
+    # `mergeclaim-<PR>.lock` here — cannot cross a machine boundary. `SCOPE=own` does not help (it
+    # is a partition by branch-name, not ownership, README §7.2.3), so before this guard the only
+    # thing that stopped two cells was LUCK: whichever read the other's claim first.
+    # ⛔ ORDER: this runs BEFORE the redfix role on purpose. A peer that holds the head is the one
+    # that repairs it; consuming this box's rail-refusal budget (and its red-fix caps) on a head it
+    # does not hold is how a PR gets parked by a box that never worked it.
+    # ⛔ rc 2 IS A `wait`, NOT AN `act`: an unreadable registry means the sweep does not know, and
+    # "does not know" must never arm a merge or spawn a lane. The reason is a PUBLISHED verdict
+    # word, not prose, so the log and `state/prdisp.tsv` can be read mechanically.
+    claim_selection_verdict "$PR" "${HEAD_N:-}"
+    case $? in
+      0) # ⛔ THE FREE DECISION IS PRINTED TOO, with its verdict word (agent-infra#2466). A log that
+         # records only the SKIPS answers "why is that PR not moving?" and not "why did THIS box take
+         # THAT PR?" — and the second question is the one an operator asks when two cells' work looks
+         # interleaved. It is ONE line per PR per cycle and it names the state: `claim-absent` (the
+         # registry answered, nothing holds it), `claim-expired` / `claim-orphaned` (a claim existed and
+         # its window or its holder is gone), `claim-own` (this box's own claim — only a live process
+         # proves work, which the arms below do).
+         echo "#$PR claim-free (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-the registry answered and holds nothing}) — the sweep may act on this head" >>"$LOG" ;;
+      1) echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?} — a peer's declared window, not this box's work)" >>"$LOG"
+         disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?}"
+         continue ;;
+      *) echo "#$PR NOT ACTED ON (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-the registry could not answer}) — an unreadable claim registry is NOT freedom; nothing is spawned or armed for this head" >>"$LOG"
+         disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-registry unreadable} (fail-closed)"
+         continue ;;
+    esac
     # [redfix:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
     # ⛔ THE RED-FIXER ROLE: REFUSE -> SPAWN A FIXER -> RE-RAIL WHEN THE HEAD MOVES.
     #
@@ -4309,7 +4439,7 @@ while true; do
             refund_bailed_fixer "$PR" "$HEAD_N" 0
             RF_N=$(( RF_N - 1 ))
             printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || true
-            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim, or the CI-queue gate deferred the push) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
+            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
           fi
           # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT (review P1, cycle 3). `fix-one.sh` writes
           # `fixgate-<PR>-<head>` when the load/disk gate refused the agent at the spawn point, so
@@ -4481,6 +4611,29 @@ while true; do
     # so the arm calls this file instead of a lookalike. `$_CK_PY` is resolved once at startup (see
     # there) and is an ABSOLUTE path, so this pipeline's subshell inherits it.
     V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
+    # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NEVER A CLASS (#3110). `check-class.py` ALWAYS prints one
+    # token, so `V` empty means the classifier never answered at all — a python that could not start, a
+    # file that vanished between the startup guard and this line, a killed pipeline. That reached the
+    # residual `*)` arm below, which printed `no acting arm for class '<empty>' — nothing spawned
+    # (re-read next cycle)` and then classified it `<empty>` AGAIN on the next cycle, for ever: a
+    # pattern that cannot match the population reads as nothing to do. MEASURED in this box's own log:
+    # `#10214 no acting arm for class '<empty>' — nothing spawned (unreadable/empty check surface;
+    # re-read next cycle)` — the PR was never acted on by any arm.
+    # ⛔ THE FIX IS A READING ARM, NOT A PERMISSION — AND IT IS NOT A ONE-STEP BYPASS EITHER. Mapping it
+    # to `NOCHECKS` ROUTES it into the NOCHECKS arm, which RE-RUNS this same read with retries and, only
+    # when that still cannot answer, consults a DIFFERENT source (the check-runs authority) — so the
+    # first thing it does is not an action, it is another attempt at the question. The EMPTY read itself
+    # reaches no acting arm; what CAN act is the resolver's own answer — `RECOVERED:GREEN` is handed to
+    # the ordinary GREEN arm and merges, `RECOVERED:FAILED:*` reaches the CI fixer — and the resolver
+    # emits `RECOVERED:<label>` only for a label a read actually produced (`nochk-resolve.py`,
+    # `graded()`), never for an empty or ungraded surface. So a merge here rests on a read that
+    # ANSWERED at the live head, never on the failed one that produced the empty output. The
+    # alternatives are worse: GREEN on an unread surface merges blind, and leaving it `<empty>` is the
+    # indefinite re-read this replaces.
+    if [ -z "${V:-}" ]; then
+      V="NOCHECKS"
+      echo "#$PR the classifier produced NO VERDICT (empty output from $_CK_PY) — treating it as an UNREAD surface and handing it to the NOCHECKS arm to re-read from the run list" >>"$LOG"
+    fi
     # ── THE NOCHECKS CLASS GETS AN ARM (agent-infra#2719) ─────────────────────────────────────────
     # ⛔ WHAT THIS REPLACES. `NOCHECKS` used to mean THREE different events at once — the read failed,
     # no run had registered yet, and no run will ever exist — because the pipeline above discards the
@@ -6097,7 +6250,15 @@ PY
         echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
-        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)" >> "$LOG"
+        # ⛔ NO REGISTRY IS NOT FREEDOM, NOT EVEN FOR DISPATCH (agent-infra#2466). This arm used to
+        # warn and dispatch unclaimed, on the argument that a box with no registry should not become
+        # merge-only. That argument was written when the PR path still worked without the registry;
+        # it no longer does (both paths now abstain), and a cell that dispatches unclaimed is exactly
+        # the duplicate-dispatch shape the issue claim exists for — it cannot take the claim AND it
+        # cannot see a peer's. The cost of abstaining is one command and one cycle of delay; the cost
+        # of dispatching is two lanes on one issue.
+        echo "[dispatch] #$ISS NOT dispatched — claim-unreadable: no registry at $O/claims.sh, so this box can neither take the issue claim nor see a peer's; an absent registry is not evidence of freedom. Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
+        continue
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$ORDER_FILE"
