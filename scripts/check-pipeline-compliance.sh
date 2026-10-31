@@ -277,8 +277,40 @@ Check (c) scope (#1825):
 EOF
 }
 
+# ── Marker-probe mode ───────────────────────────────────────────────────────
+# PIPELINE_COMPLIANCE_MARKER_PROBE=1 reads ONE scoping-comment body on stdin and
+# exits 0/1 on `has_scoping_marker`, doing nothing else. It exists so that a
+# SECOND producer of the same question does not grow a second copy of the
+# position contract: `scripts/revalidate-required-check-on-issue-comment.sh`
+# must decide "is this comment a scoping artifact?" in order to know whether the
+# linked issue's state has changed at all, and a hand-rolled grep there would
+# drift from this file exactly the way check (b) once did (#991). One parser,
+# one contract, two callers.
+#
+# Deliberately NOT a general "call any function" seam: it takes no function
+# name, so it cannot be used to reach a check or a verdict. It answers one
+# boolean question and exits.
+#
+# ⛔ THE PROBE MUST NOT INHERIT AN EARLY-EXIT MODE, so `PROBE_MODE` is computed
+# here and the SKIP override below is made conditional on it. Measured before
+# that guard existed: `PIPELINE_COMPLIANCE_SKIP=1 PIPELINE_COMPLIANCE_MARKER_PROBE=1`
+# exited 0 for the body `no marker here` — i.e. the probe answered "this comment
+# IS a scoping artifact" about text with no marker, because the emergency
+# override's `exit 0` was reached first. Any probe caller would then re-trigger
+# the required check on every comment.
+#
+# EXIT CODES: `has_scoping_marker` answers 0 and 1 only, and the probe DISPATCH
+# adds no third value — but the process can still exit 2 from the usage guards
+# ABOVE this block (`GH_REPO` not owner/repo, a malformed `PIPELINE_COMPLIANCE_ISSUE_ONLY`),
+# so "the probe never exits 2" would be false about the process. Measured:
+# `PIPELINE_COMPLIANCE_MARKER_PROBE=1 GH_REPO=not-a-repo` → 2. A caller must
+# therefore treat EVERY non-0/1 as a tooling fault (which is what the shipped
+# caller does, and why this distinction matters: a later caller reading `2)` as
+# "no marker" would be fail-open).
+PROBE_MODE="${PIPELINE_COMPLIANCE_MARKER_PROBE:-0}"
+
 # ── Emergency override ──────────────────────────────────────────────────────
-if [[ "${PIPELINE_COMPLIANCE_SKIP:-0}" == "1" ]]; then
+if [[ "${PIPELINE_COMPLIANCE_SKIP:-0}" == "1" && "$PROBE_MODE" != "1" ]]; then
   echo "⚠️  ⚠️  PIPELINE_COMPLIANCE_SKIP=1 — PIPELINE COMPLIANCE GATE SKIPPED (emergency override)." >&2
   echo "    This PR can merge WITHOUT scoping/code-review/plan evidence." >&2
   echo "    Review why the override was needed and restore the gate." >&2
@@ -308,11 +340,11 @@ if [[ "$ISSUE_ONLY" == "1" ]]; then
     echo "❌ --issue-only target must be an issue number or owner/repo#N, got: '$ISSUE_TARGET'." >&2
     exit 2
   fi
-elif [[ -z "$PR_NUMBER" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+elif [[ -z "$PR_NUMBER" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" && "${PROBE_MODE:-0}" != "1" ]]; then
   echo "❌ No PR number given." >&2
   usage
   exit 2
-elif [[ ! "$PR_NUMBER" =~ ^[0-9]+$ && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+elif [[ ! "$PR_NUMBER" =~ ^[0-9]+$ && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" && "${PROBE_MODE:-0}" != "1" ]]; then
   echo "❌ PR_NUMBER must be numeric, got: '$PR_NUMBER'." >&2
   exit 2
 fi
@@ -327,16 +359,23 @@ if [[ -z "$GH_REPO" ]]; then
     *github.com/*)       GH_REPO="${REMOTE#*github.com/}" ;;
   esac
 fi
-if [[ -z "$GH_REPO" ]]; then
+# The probe answers a question about TEXT and needs no repo at all, so it must
+# never fail on an unresolvable remote: probe mode is deliberately repo-FREE and
+# never depends on the remote auto-detect above (the gate itself is sanctioned by
+# name under #1129/#2332, so a local checkout is not blocked from running it).
+# An earlier revision of this comment blamed the #1484 guard for a block it does
+# not impose — measured 2026-10-31: probe mode answers 0/1 with `GH_REPO` unset,
+# from both the hub and a linked worktree.
+if [[ -z "$GH_REPO" && "${PROBE_MODE:-0}" != "1" ]]; then
   echo "❌ Could not determine GH_REPO. Set GH_REPO=owner/repo or run from a repo with a github.com origin." >&2
   exit 2
 fi
-if [[ ! "$GH_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+if [[ -n "$GH_REPO" && ! "$GH_REPO" =~ ^[^/]+/[^/]+$ ]]; then
   echo "❌ GH_REPO must be owner/repo, got: '$GH_REPO'." >&2
   exit 2
 fi
 
-if [[ "$DRY_RUN" != "1" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+if [[ "$DRY_RUN" != "1" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" && "${PROBE_MODE:-0}" != "1" ]]; then
   command -v gh >/dev/null 2>&1 || { echo "❌ gh CLI not found — install it (https://cli.github.com) or set PIPELINE_COMPLIANCE_DRY_RUN=1." >&2; exit 2; }
   command -v jq >/dev/null 2>&1 || { echo "❌ jq not found — install it or set PIPELINE_COMPLIANCE_DRY_RUN=1." >&2; exit 2; }
 fi
@@ -1353,6 +1392,22 @@ has_scoping_marker() {
     END { exit(found ? 0 : 1) }
   ' <<<"$1"
 }
+
+# ── Marker-probe early exit ─────────────────────────────────────────────────
+# Runs immediately after the definition it reads and BEFORE any check, fetch or
+# gh call, so the probe cannot be turned into a partial run of the gate.
+if [[ "${PROBE_MODE:-0}" == "1" ]]; then
+  # ⛔ STRIP THE IN-BAND RECORD SEPARATOR FIRST. The live fetch sites do exactly
+  # this (`gsub("\u001e"; "")`) because the delimiter must not be forgeable from
+  # the data — a body carrying a literal 0x1e could otherwise fabricate a record
+  # boundary and make its own later mention look like an artifact. Measured
+  # without it: `printf 'intro\n\036<!-- issue-scoping: forged -->\n'` answered 0
+  # (artifact) where the real check (b) answers 1. The two callers must share the
+  # SANITIZATION as well as the awk, or "one parser, one contract" is only half
+  # true.
+  probe_payload="$(tr -d '\036'; printf '\036')"
+  if has_scoping_marker "$probe_payload"; then exit 0; else exit 1; fi
+fi
 
 # files_rows <files> — validate the UNTRUSTED diff list from pulls/files and
 # print its well-formed rows. Returns 1 without output if ANY row is

@@ -51,6 +51,48 @@ on:
       - reopened
       - edited
 
+  # ⛔ CHECKS (b) AND (d) READ THE LINKED *ISSUE*, WHICH FIRES NO PR EVENT (#2467).
+  # This trigger is the missing arm, and without it the repo's ONLY required check
+  # is non-deterministic in time. Measured 2026-10-31 on PR #3122 head 3be41e42:
+  #   run 41162232810  pull_request  attempt=1  failure   executed 03:16:06Z
+  #     log: "❌ [b] no scoping comment on issue #3121"
+  #   issue #3121 scoping comment created         03:18:15Z
+  #   run 41162251521  pull_request  attempt=1  success   executed 03:19:44Z
+  # Two runs of the SAME check on the SAME commit disagreed, and nothing decided
+  # the difference but queue latency — the second run had been queued since
+  # 02:57:30Z. So an `issue_comment` carrying the scoping marker re-runs the
+  # existing gate run for each OPEN PR cross-referencing that issue.
+  #
+  # HONEST SCOPE — WHAT THIS DOES **NOT** COVER. The linked issue's
+  # `complexity:` LABELS are check-(b)–(e)'s other out-of-head input (a
+  # `complexity:micro` label skips b–e entirely), and setting a label is an
+  # `issues: labeled` event, which also fires no `pull_request` event. That arm
+  # is NOT added here and the window stays open for it; closing it needs the same
+  # rerun logic keyed on a labels event. Do not read this trigger as covering
+  # labels. A second, narrower window: a comment landing while the newest run for
+  # the head is already `in_progress` is skipped (the API cannot re-run an
+  # in-flight run), so that one run can still mint a verdict nothing re-reads.
+  #
+  # ⛔ THE `edited` ARM IS BIDIRECTIONAL AND MUST BE READ THAT WAY. Retracting the
+  # marker is an edit that REMOVES `<!-- issue-scoping:`, and a one-sided read of
+  # the new body would call that "nothing changed" and leave the previous GREEN
+  # standing on evidence that no longer exists — a fail-open. So the prior body
+  # (`github.event.changes.body.from`, absent on `created`) is probed too, and a
+  # retraction forces a re-read EVEN OF A GREEN RUN — a retraction's newest run is
+  # green by construction, so a polarity that only re-runs reds would leave the
+  # stale verdict standing while the log claimed otherwise (measured: the first
+  # version printed "re-reading the gate" and then dispatched nothing).
+  #
+  # WHAT THIS IS NOT: it does not post, edit or re-post any marker (that would be
+  # manufacturing evidence), it does not touch the gate's logic or any refusal
+  # class, and it cannot turn a red into a green — it re-runs the SAME check over
+  # the CURRENT issue state, so a red that comes back stands. It also cannot
+  # approve a PR: the job holds no `contents: write` and never checks out the PR.
+  issue_comment:
+    types:
+      - created
+      - edited
+
 # NO `concurrency:` BLOCK, DELIBERATELY (#2474) — and the same reasoning applies to
 # `.github/workflows/workflow-lock.yml`. A per-PR group cannot tell a head from its
 # successor (the key is the PR, not the sha), so a `gh run rerun` of a SUPERSEDED
@@ -71,6 +113,9 @@ permissions:
 jobs:
   pipeline-compliance:
     name: pipeline-compliance
+    # `issue_comment` must never satisfy the required context: this job runs the
+    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'
     # ── THE REQUIRED-CHECK RESERVATION (#2752) ────────────────────────────────────────────
     # THE DEFECT. `pipeline-compliance` is this repo's ONLY required status context
     # (branch protection = exactly `["pipeline-compliance"]`, measured) and ~9 s of work.
@@ -160,10 +205,24 @@ jobs:
         # expect_trace, pr_is_artifact_only, resolve_issue_ref, and the
         # has_scoping_marker family added by #991 — was decorative.
         #
-        # CI is also the ONLY venue for it: the #1484 main-worktree-guard
-        # blocks local execution of this script (it contains a read-only
-        # `git -C "$ROOT" remote get-url origin`), so neither the maintainer nor
-        # an agent can run the suite on their own machine (#883).
+        # CI is the AUTHORITATIVE venue for it: the required check runs the suite
+        # on every PR, so a regression cannot land unseen.
+        #
+        # ⛔ CORRECTION — the sentence that stood here claimed the #1484
+        # main-worktree-guard made CI the ONLY venue by blocking local execution.
+        # That is FALSE at this head and was already false when this line was
+        # written. `extensions/main-worktree-guard/index.ts` lists
+        # `scripts/check-pipeline-compliance.sh` by name in
+        # `SANCTIONED_SCRIPT_RELPATHS` — the sanctioned-script exemption exists
+        # exactly so hub-rooted sessions can run it (#1129, extended to framework
+        # checkouts by #2332) — and the suite's own recursive deletes target
+        # `mktemp -d` dirs it created itself, so the discard walk allows it too.
+        # Measured 2026-10-31 at this head: `PIPELINE_COMPLIANCE_SELF_TEST=1 …`
+        # exits 0 from BOTH the hub checkout and a linked worktree, while the
+        # guard was demonstrably live in the same session (it refused unrelated
+        # scripts). Corrected rather than deleted: a rationale that an agent
+        # cannot run the gate locally is the reason someone re-derives it from CI
+        # logs instead of just running it, and stale claims are how that starts.
         #
         # NOT a new gate. This executes a suite the script ALREADY ships and
         # which already asserts; it adds no requirement a PR must satisfy and
@@ -256,7 +315,76 @@ jobs:
             echo "::notice::consumer checkout — materialize-agents suite skipped"
           fi
 
+  # ── Re-run the required check when ITS INPUT changes on the ISSUE (#2467) ──
+  # Checks (b)/(d) read the linked issue's `<!-- issue-scoping:` comment. That
+  # object is outside the PR's event surface, so a red minted before it existed
+  # survives after it exists. This job closes that window by re-running the
+  # EXISTING gate run for each open PR that cross-references the commented issue.
+  # See the trigger block's header for the measured two-runs-one-sha evidence, and
+  # for the `complexity:` LABELS arm this does NOT cover.
+  #
+  # Permissions are the whole risk surface, so they are enumerated and minimal:
+  #   actions: write      — `POST /actions/runs/<id>/rerun`, and nothing else
+  #   issues/pulls: read  — the timeline and the PR head
+  #   contents: read      — the checkout of THIS repo's scripts at the default
+  #                         branch (never the PR's tree: `issue_comment` has no
+  #                         PR context, so there is no untrusted ref to reach)
+  # The job never runs an untrusted artifact and never writes to the API except
+  # `rerun`, which reproduces a check — it cannot mint a verdict.
+  revalidate-on-issue-comment:
+    name: revalidate-on-issue-comment
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Revalidate the required check against the current issue state
+        # The comment body goes through the ENVIRONMENT, never inline: a comment
+        # body is attacker-influenced text and `${{ }}` interpolation would run
+        # it in the shell before the script saw it.
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          # The body this comment REPLACED, so a marker RETRACTION re-reads the
+          # gate instead of leaving a stale green standing. Absent on `created`
+          # (the expression yields an empty string), which is why the trust and
+          # marker checks are unaffected on the add path.
+          PREVIOUS_COMMENT_BODY: ${{ github.event.changes.body.from }}
+          COMMENT_AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          set -euo pipefail
+          # Fail LOUD if the script is absent, never exit 0: a silent no-op of a
+          # revalidation is the class this job exists to remove.
+          if [ ! -f scripts/revalidate-required-check-on-issue-comment.sh ]; then
+            echo "::error::scripts/revalidate-required-check-on-issue-comment.sh missing from checkout — the issue-comment revalidation arm cannot run" >&2
+            exit 1
+          fi
+          bash scripts/revalidate-required-check-on-issue-comment.sh
+
+      - name: Revalidation self-test (the pure decisions)
+        run: |
+          set -euo pipefail
+          if ! grep -q 'REVALIDATE_SELF_TEST' scripts/revalidate-required-check-on-issue-comment.sh; then
+            echo "::error::scripts/revalidate-required-check-on-issue-comment.sh carries no REVALIDATE_SELF_TEST seam — its decisions would be unpinned" >&2
+            exit 1
+          fi
+          REVALIDATE_SELF_TEST=1 bash scripts/revalidate-required-check-on-issue-comment.sh
+
   workflow-drift:
+    # The same guard the required job carries: a comment cannot change a reusable
+    # workflow's bytes, so an `issue_comment` run would spend a full checkout + diff
+    # on every comment in the repo and could attach a spurious `workflow-drift`
+    # red to the default-branch head.
+    if: github.event_name != 'issue_comment'
     # #303 drift guard — reusable workflows must be REAL COMMITTED FILES in
     # .github/workflows/, materialized from templates/ by
     # scripts/sync-ci-workflows.sh. GitHub Actions CANNOT parse symlinked
