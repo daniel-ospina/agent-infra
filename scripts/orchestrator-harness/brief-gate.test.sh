@@ -545,7 +545,17 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
 # superset), independently of any branch. Declared here because an equality that is red on its own
 # base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# ⛔ AND A SUITE THAT DRIVES THE BACKGROUND DISPATCHER IS A MEMBER TOO (fresh-context review of #3161,
+# P2). `nonblocking-dispatch.test.sh` writes its own `$O/brief-gate.sh` and defines `brief_gate_lib` /
+# `brief_gate_run` stubs, so it matches four times — and it is exactly the class this arm's own comment
+# names: ANY suite that drives a dispatch path needs a COMPLIANT fixture. Declared rather than filtered
+# out by a `.test.sh` pattern, because that filter would silently absorb the next caller.
+# ⛔ AND `scripts/check-farm-drift.sh` ARRIVED ON `main` WITHOUT BEING DECLARED (#3163 lane, measured):
+# it names `brief-gate.sh` at its line 14, so this equality was ALREADY red on `main` — verified by
+# running this arm's own expression against `origin/main`'s tree, where `found` = `EXPECTED` +
+# `scripts/check-farm-drift.sh`. Declared in the same edit that restores the arm, so the red this
+# branch inherits is fixed rather than immediately re-reddened.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

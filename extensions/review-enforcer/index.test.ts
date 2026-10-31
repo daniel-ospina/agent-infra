@@ -66,6 +66,7 @@ import {
   mergeVerbInText,
   readsNonMergeGhCall,
   writesOnlyTrackerRecords,
+  withoutQuotedHeredocBodies,
   ghShimWillEnforce,
   isExecutableShim,
   hasLiteralAdminFlag,
@@ -10184,6 +10185,116 @@ pending.push(async () => {
   ] as Array<[string, string]>) {
     equal(isGitOp(command), true, `${label}: must keep the floor`);
   }
+});
+
+// ── The quoted-heredoc masker REUSES every refusal its sibling masker makes (#485 class) ────────
+//
+// THE DEFECT (fresh-context review, P0). `withoutQuotedHeredocBodies` relaxed ONE clause —
+// `heredocBodyIsData`'s refusal to look at a COMPOUND opener line, which is the false positive it
+// exists to remove — and its first cut dropped the other five, making it STRICTLY more permissive
+// than the masker it derives from. So text bash can EXECUTE became text the ≥1-dispatch floor read
+// as a comment body, and both shapes below reached zero dispatches where `origin/main` refuses them:
+//
+//   shape A (written then executed)   pre-fix: isGitOp=false, writesOnlyTrackerRecords=true
+//   shape B (framed body piped to sh) pre-fix: isGitOp=false
+//
+// A and B are regressions THIS diff introduced, not residual behaviour — the masker, not the arm,
+// was the cause (which is why `writesOnlyTrackerRecords(A)` is pinned false as well).
+//
+// The remaining rows are one per REFUSAL the sibling masker cites a measured incident for, because
+// the bug was a CLASS (every refusal dropped) and not a spelling: `.sh` is the file being run,
+// `-R o/r` is this suite's canonical unreadable merge (`GIT_COMMIT_PATTERN`/`GH_PR_PATTERN` do not
+// cross a global option, so only the broad `gh`+`pr` arm can catch it).
+const _MASK_A = 'gh -R o/r pr merge 9 --squash';
+const WRITTEN_THEN_EXECUTED = [
+  "cd /tmp && cat > /tmp/x.sh <<'EOF'",
+  _MASK_A,
+  "EOF",
+  "bash /tmp/x.sh; gh pr comment 1 --body-file /tmp/y.md",
+].join("\n");
+const FRAMED_THEN_PIPED = [
+  "if true; then",
+  "cat <<'EOF'",
+  _MASK_A,
+  "EOF",
+  "fi | bash && gh pr comment 1 --body-file /tmp/y.md",
+].join("\n");
+const SHADOWED_READER = [
+  "cat() { sh; }",
+  "cat <<'EOF'",
+  _MASK_A,
+  "EOF",
+  "gh pr comment 1 --body-file /tmp/y.md",
+].join("\n");
+const PREFIX_SUBSTITUTION = [
+  "x=$(cat <<'EOF'",
+  _MASK_A,
+  "EOF",
+  ")",
+  'eval "$x"',
+  "gh pr comment 1 --body-file /tmp/y.md",
+].join("\n");
+const PREFIX_CONTINUATION = [
+  "cd /tmp \\",
+  "cat <<'EOF'",
+  _MASK_A,
+  "EOF",
+  "gh pr comment 1 --body-file /tmp/y.md",
+].join("\n");
+const EXPANDED_TARGET = [
+  "cat > $HOME/x.sh <<'EOF'",
+  _MASK_A,
+  "EOF",
+  "bash ~/x.sh; gh pr comment 1 --body-file /tmp/y.md",
+].join("\n");
+const SECOND_OPENER = ["cat <<'A' <<'B'", _MASK_A, "A", "B", "gh pr comment 1 --body-file /tmp/y.md"].join("\n");
+const INPUT_REDIRECT = [
+  "cat < /etc/hosts <<'EOF'",
+  _MASK_A,
+  "EOF",
+  "gh pr comment 1 --body-file /tmp/y.md",
+].join("\n");
+// …and the shape the masker EXISTS for must still mask, including the `2>&1 | tail -2; rm -f`
+// suffix every lane writes: the file is published as data (`--body-file`) and removed, never run.
+const PUBLISHED_THEN_REMOVED = [
+  "cd /tmp && cat > /tmp/f.md <<'EOF'",
+  _MASK_A,
+  "EOF",
+  "gh pr comment 1 --body-file /tmp/f.md 2>&1 | tail -2; rm -f /tmp/f.md",
+].join("\n");
+
+testAsync("the quoted-heredoc masker's refusals are the sibling masker's proofs", async () => {
+  console.log("\n── the quoted-heredoc masker's refusals are the sibling masker's proofs");
+  for (const [label, command] of [
+    ["written then executed", WRITTEN_THEN_EXECUTED],
+    ["framed body piped to a shell", FRAMED_THEN_PIPED],
+    ["shadowed reader", SHADOWED_READER],
+    ["substitution in the prefix", PREFIX_SUBSTITUTION],
+    ["continuation in the prefix", PREFIX_CONTINUATION],
+    ["constructed redirect target", EXPANDED_TARGET],
+    ["second heredoc opener on the opener line", SECOND_OPENER],
+    ["input redirection beside the opener", INPUT_REDIRECT],
+  ] as Array<[string, string]>) {
+    equal(isGitOp(command), true, `${label}: the body is EXECUTABLE — it must stay readable and keep the floor`);
+    equal(
+      withoutQuotedHeredocBodies(command).includes(_MASK_A),
+      true,
+      `${label}: the merge text must survive the mask (the refusal is what keeps the floor)`,
+    );
+  }
+  // …and the classification that let it through is pinned CLOSED on both shapes.
+  equal(writesOnlyTrackerRecords(WRITTEN_THEN_EXECUTED), false,
+    "written then executed: a lane that RUNS the body is not a tracker write");
+  equal(writesOnlyTrackerRecords(FRAMED_THEN_PIPED), false,
+    "framed then piped: a frame hands the body to the shell, so it is not a tracker write");
+  // POSITIVE CONTROL: the mask still does its job on the parked shape, or these refusals would have
+  // bought safety by re-parking the lane this change exists for.
+  equal(withoutQuotedHeredocBodies(PUBLISHED_THEN_REMOVED).includes(_MASK_A), false,
+    "published-then-removed: the data body IS masked (the fix's own shape is not re-parked)");
+  equal(isGitOp(PUBLISHED_THEN_REMOVED), false,
+    "published-then-removed: a published body is not a shipping op");
+  equal(writesOnlyTrackerRecords(PUBLISHED_THEN_REMOVED), true,
+    "published-then-removed: the classification is the reason");
 });
 
 // ── Summary ───────────────────────────────────────────

@@ -3847,6 +3847,21 @@ def _confirm(name: str) -> tuple[str, str]:
     return "unconfirmed", "`--status` could not be read (the harness is missing or broken)"
 
 
+def _gate_refusal_from_artifacts(name: str) -> str:
+    """`gate REFUSED rc=<n> (<axis>)` when the WORKER's own artifacts prove a gate refusal, else ''.
+
+    ⛔ NON-POLLING, ON PURPOSE. `_confirm()` waits `CONFIRM_WINDOW_S` for a code that may never come;
+    this is called on a path where the dispatcher has ALREADY waited its own settle window, so every
+    artifact that will ever exist is already on disk. It reads `.rc` and asks the SAME `gate_refused()`
+    the confirm path asks -- the gate marker in the worker log plus a code in `GATE_REFUSALS` -- so the
+    two cannot disagree about what a refusal is, and no second definition of "refused" is introduced.
+    """
+    code = read_rc(bg_path(name, "rc"))
+    if code is not None and gate_refused(name, code):
+        return "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
+    return ""
+
+
 def gate_refusal_code(detail: str) -> int:
     """The gate's code from `_confirm()`'s detail (`"gate REFUSED rc=75"`), else 0.
 
@@ -4179,6 +4194,22 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     _, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=SPAWN_CALL_TIMEOUT_S,
                            cwd=HOME, env=_orch_env(), capture=False)
     if rc != 0:
+        # ⛔ THE DISPATCHER'S NON-ZERO EXIT CAN CARRY A GATE REFUSAL, AND THE AXIS MUST SURVIVE IT
+        # (#2291 class, measured 2026-10-31). `nonblocking-dispatch.sh` no longer reports `launched`
+        # for a lane that never ran: a worker its gates refused (74 land-backlog / 75 load / 77 disk)
+        # now makes the DISPATCHER exit 75 with `FAILED EARLY`, instead of returning 0 and leaving the
+        # code in `.rc`. That is the right report -- but read naively it collapses "the BOX refused"
+        # into "the TRANSPORT refused", which is the defect #2291 was filed for: a loaded box would
+        # tell the operator to REPAIR THE DISPATCH CHAIN. So the durable artifacts are believed first,
+        # exactly as `_confirm` believes them: the gate writes its own marker to the worker log and
+        # its own code to `.rc`, and `gate_refused` requires BOTH. No marker (a missing dispatcher, a
+        # `NOT STARTED` launch with no `.rc`, a brief refused in the foreground) keeps the transport
+        # reading and the dispatcher's own words.
+        gate = _gate_refusal_from_artifacts(name)
+        if gate:
+            log("spawn %s: %s -- no agent started, nothing consumed (the dispatcher exited rc=%s)"
+                % (name, gate, rc))
+            return False, gate, False
         # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh or a missing
         # brief-gate.sh), rc=80 (THE BRIEF WAS REFUSED by the research-first gate -- see
         # agent-infra#2258: the fix is in `brief()`/`brief-gate.sh`, not in the box), rc=2 (no
