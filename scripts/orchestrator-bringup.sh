@@ -9,6 +9,10 @@
 #   bash scripts/orchestrator-bringup.sh --reseed [verb]  # regenerate the machine-local config, then verb
 #   bash scripts/orchestrator-bringup.sh start --prune    # …and REMOVE unshipped files from $O. Never
 #                                                        # one that something resolves BY PATH (#2059)
+#   bash scripts/orchestrator-bringup.sh start --accept-discard
+#                                                        # …even though $O carries UNCOMMITTED EDITS this
+#                                                        # deploy would overwrite. Refused by default:
+#                                                        # those bytes exist nowhere else (#3049)
 #
 # `start`/`stop`/`status` cover the WHOLE FLEET, not only the controller: the inventory (ONE declared
 # list of components, each with its own liveness predicate) lives in lib/fleet-inventory.sh. `status`
@@ -100,11 +104,18 @@ usage() { # <exit-code>
   exit "${1:-0}"
 }
 
-VERB=""; RESEED=0; PRUNE=0
+VERB=""; RESEED=0; PRUNE=0; ACCEPT_DISCARD=0
 for a in "$@"; do
   case "$a" in
     check|start|stop|restart|status) VERB="$a" ;;
     --reseed)               RESEED=1 ;;
+    # ⛔ A FLAG, NOT AN ENV DEFAULT — deliberately, and unlike `deploy-mac-orchestrator.sh`, which reads
+    # `ACCEPT_DISCARD=1` from the environment because its PHASE/WAIT/DRY_RUN are env too. This is the
+    # verb an operator runs by hand on the box whose live tree carries a patch; a variable exported
+    # once in a profile, or set by a wrapper that drives the mac deploy, must not quietly disarm the
+    # refusal that protects that patch. `deploy-harness.sh` was fixed to the same rule for the same
+    # reason: a gate that a stray `export` can switch off is not a gate.
+    --accept-discard)       ACCEPT_DISCARD=1 ;;
     # ⛔ OFF unless asked for. A deploy no longer deletes anything from the live tree by default
     # (#2059): the mirror ran `rm -f` over every `$O/*.sh` the checkout does not ship, which is
     # exactly the files this box's launchd job and armed schedules resolve BY PATH.
@@ -587,7 +598,14 @@ check_harness_pin() {
       # launches (see deploy_harness), so drift is the state `start` exists to repair; refusing it
       # here would false-block the only command that fixes it. What is NOT mendable is an identity
       # nobody can read — that is the rc=2 arm below.
-      warn "the deployed harness at $O has drifted from $src_repo ($(printf '%s' "$out" | grep -c '^DRIFT:' ) finding(s); first: $(printf '%s' "$out" | head -1)) — 'start' redeploys $O from $src_repo before launching"
+      # ⛔ THE COUNT PATTERN CARRIES NO COLON, and that is the whole point: the checker labels each
+      # finding with the QUESTION it failed — `DRIFT(identity):` / `DRIFT(record):` / `DRIFT(checkout):`
+      # — since the two-question split. A pattern anchored on `^DRIFT:` matched only the unlabelled
+      # remainder (`MISSING`, `STALE-RECORD`, the surface arms), so on exactly the box this warning
+      # exists for (the deployed copy DIFFERS from the checkout — the common repair case, on the verb
+      # that redeploys it) it printed `0 finding(s)` beside a live drift report. A count that
+      # contradicts its own first line is worse than no count.
+      warn "the deployed harness at $O has drifted from $src_repo ($(printf '%s' "$out" | grep -c '^DRIFT' ) finding(s); first: $(printf '%s' "$out" | head -1)) — 'start' redeploys $O from $src_repo before launching"
       ;;
     *)
       # ⛔ ABSENT AND UNREADABLE ARE DIFFERENT FACTS, and only one of them is this run's to refuse.
@@ -670,6 +688,7 @@ deploy_harness() {
   [ -d "$SRC_HARNESS" ] || unknown "no harness at $SRC_HARNESS — nothing to deploy into $O"
   mkdir -p "$O/logs" "$O/state" "$O/wip" || refuse "cannot create the state dir $O"
   local src f b tmp n=0 changed="" stale="" keep="" why conflict=0
+  local dout="" drc=0
   # ── THE PLAN, before anything is written ────────────────────────────────────────────────────────
   # Two halves, because they are two different risks: a shipped file whose bytes DIFFER is about to be
   # overwritten (a hand edit in $O is lost), and a file $O carries and the checkout does not is what
@@ -688,6 +707,61 @@ deploy_harness() {
     why="$(resolver_reason "$b")"
     if [ -n "$why" ]; then keep="$keep $b"; else stale="$stale $b"; fi
   done
+  # ── WHAT THIS FUNCTION WRITES, STATED TO THE CHECKER — the write set, not the source tree ─────
+  # ⛔ `harness-provenance.sh` inventories `--src` RECURSIVELY and treats "the source ships it, `$O` does
+  # not" as a FAILED deploy. This function copies ONLY depth-1 `*.sh`, while a real harness directory
+  # also ships `README.md`, `ARCHITECTURE.md`, `*.py`, `retired/`, `gh-rest/gh`, `gh-limit/gh` — so told
+  # the whole directory, every `write` below refused ("the source ships README.md but $O has no such
+  # file"), NO box was ever recorded by the verb operators actually run, and the refusal right below sat
+  # on `drc=2` CANNOT-TELL forever — the gate was inert on exactly the population it was added for.
+  # (`--skip` is the writer's own seam for this; `check` already had it, `write` now honours it too.)
+  # A `find` that fails here collapses to "skip nothing", so the worst case is the old refusal, never a
+  # manifest describing bytes this run did not write.
+  local skip_args=()
+  if [ -f "$SRC_HARNESS/harness-provenance.sh" ]; then
+    while IFS= read -r _rel; do
+      [ -n "$_rel" ] || continue
+      case "$_rel" in
+        */*) ;;          # nested — this function copies no subdirectory, so it writes none of these
+        *.sh) continue ;; # depth-1 *.sh — exactly the set the copy loop below installs
+      esac
+      skip_args+=(--skip "$_rel")
+    done < <( cd "$SRC_HARNESS" 2>/dev/null && find . -type f -print 2>/dev/null | sed 's|^\./||' )
+  fi
+  # ── THE REFUSAL, before anything is written ────────────────────────────────────────────────────
+  # ⛔ THIS FUNCTION IS A THIRD WRITER OF `$O/*.sh`, and it was the only one with no gate. The two
+  # deploy paths (`deploy-harness.sh`, `deploy-mac-orchestrator.sh`) refuse to overwrite a file whose
+  # bytes no deploy wrote and exit 78 naming it — the 2026-10-28 incident, a hand patch to
+  # `$O/merge-one.sh` reverted TWICE. But the Mac verb operators actually run is `start`, and this
+  # function copied over the same files unconditionally: the patch was lost after a warning, and the
+  # box carried bytes no record described. A refusal on two of three writers is a gate with a door
+  # beside it. Same checker, same source, same three answers as `deploy-harness.sh`'s preflight (c).
+  if [ "$ACCEPT_DISCARD" = 1 ]; then
+    warn "deploy: --accept-discard — an uncommitted edit in $O (if any) WILL be overwritten by this run"
+  elif [ -f "$SRC_HARNESS/harness-provenance.sh" ]; then
+    # The checker is the SOURCE's copy: the `$O` copy may be the very thing under suspicion.
+    dout="$(bash "$SRC_HARNESS/harness-provenance.sh" check --o "$O" --src "$SRC_HARNESS" ${skip_args[@]+"${skip_args[@]}"} 2>&1)" || drc=$?
+    case "$drc" in
+      0) : ;;
+      1)
+        # ⛔ PRINT THE FILE LIST BEFORE REFUSING. `refuse` is one line by contract, and the one line
+        # cannot hold which files, which side is newer, and what to do — that is the whole diagnosis.
+        printf '%s\n' "$dout" >&2
+        # ⛔ "EXIST NOWHERE ELSE" WAS A FABRICATED FACT (measured 2026-10-30, review of #3053): a phase-A
+        # landing at an INTERMEDIATE commit then a moved ref reproduces this refusal over bytes a real
+        # deploy wrote, which are in git. The refusal stays (fail-closed); the claim does not.
+        refuse "the deploy would OVERWRITE unrecorded edits in $O that no completed deploy describes — nothing was copied; copy them aside (if they came from a partial deploy, they are the commit THAT run deployed), then re-run, or re-run with 'start --accept-discard' to discard them deliberately"
+        ;;
+      *)
+        # CANNOT-VERIFY (no readable record). The refusal cannot fire, but silence is how the next
+        # redeploy quietly reverts a patch — said once, on the path that will overwrite. The run
+        # below RECORDS the box, so every later deploy can tell an edit from its own bytes.
+        warn "deploy: UNKNOWN whether $O carries uncommitted edits (no readable provenance record there) — files this run overwrites are NOT recoverable; this run records the box, so later deploys can name an edit"
+        ;;
+    esac
+  else
+    warn "deploy: the source ships no harness-provenance.sh, so this deploy cannot tell whether $O carries uncommitted edits — files it overwrites are NOT recoverable"
+  fi
   for src in "$SRC_HARNESS"/*.sh; do
     [ -f "$src" ] || continue
     f="$(basename "$src")"; tmp="$O/.seed-$f.$$"
@@ -696,6 +770,23 @@ deploy_harness() {
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || unknown "no *.sh in $HARNESS_BRINGUP — refusing to load a daemon with nothing to run"
+  # ── THE RECORD: which commit this tree is, and which bytes this run wrote ─────────────────────────
+  # ⛔ WRITTEN ONLY AFTER THE COPY COMPLETED: a record over a half-copied tree would be a claim about
+  # bytes that are not all there. That is also why `install.sh`'s stamp alone was not enough — it
+  # describes `$O` at install time, and every later `start` invalidated it without saying so.
+  if [ -f "$SRC_HARNESS/harness-provenance.sh" ]; then
+    local pcommit="" ppargs=()
+    pcommit="$(git -C "$SRC_HARNESS" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || pcommit=""
+    [ -n "$pcommit" ] && ppargs+=(--commit "$pcommit")
+    # ⛔ `${arr[@]+…}` IS REQUIRED under `set -u` on bash 3.2: an EMPTY array expands to an unbound-
+    # variable error there, so a source that is not a git checkout would abort the deploy AT THE
+    # RECORD instead of writing commit=UNKNOWN.
+    if bash "$SRC_HARNESS/harness-provenance.sh" write --o "$O" --src "$SRC_HARNESS" ${ppargs[@]+"${ppargs[@]}"} ${skip_args[@]+"${skip_args[@]}"}; then
+      log_line "deploy: recorded $O/.harness-provenance (commit ${pcommit:-UNKNOWN}) — every later deploy can now tell an edit from its own bytes"
+    else
+      warn "deploy: could NOT write $O/.harness-provenance — the bytes above are deployed, but this run did not record which commit they came from, so the NEXT deploy cannot tell an edit from its own bytes"
+    fi
+  fi
   # ── the removal policy ─────────────────────────────────────────────────────────────────────────
   if [ -n "$stale" ]; then
     if [ "$PRUNE" = 1 ]; then
