@@ -79,7 +79,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() { awk 'NR>1 && /^set -u$/{exit} NR>1{sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"; }
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 78; }
-say() { printf '%s\n' "$*"; }
+# ⛔ NOT `say` (#2910). macOS ships /usr/bin/say, the text-to-speech binary, so a `say` helper that
+# a call site cannot see resolves to a VOICE ON THE SPEAKER instead of a log line — and it exits 0,
+# so the run reads green while it talks. `note` is the name the rest of the harness already uses.
+note() { printf '%s\n' "$*"; }
 # Every refusal/failure prints on stderr and names the file, so an operator reading only stderr has
 # the whole reason — the same discipline deploy-harness.sh follows.
 bad() { printf '%s: %s\n' "$PROG" "$*" >&2; }
@@ -362,8 +365,8 @@ write)
   fi
   trap - EXIT
   rm -rf "$W"
-  say "recorded $REC"
-  say "  commit ${COMMIT:0:12}   ref $REF   $N file(s)"
+  note "recorded $REC"
+  note "  commit ${COMMIT:0:12}   ref $REF   $N file(s)"
   if [ "$SRC_DIRTY" = "true" ]; then
     bad "WARNING — the source at $SRC_REAL had UNCOMMITTED changes: commit ${COMMIT:0:12} does NOT describe"
     bad "  these bytes (the record says so: sourceDirty=true). Land the change, redeploy, and the box's"
@@ -561,7 +564,7 @@ check)
       # It is REPORTER, not counted, and not a finding — while a file the source DOES ship is exactly
       # the `--src` arm's case, and stays a refusal (the gate both deploys call uses --src).
       if [ -n "$CSRC" ] && [ ! -f "$CSRC/$_b" ]; then
-        say "PRESENT          $_b — in $O and ABSENT from the record; the record's source ($CSRC) does not ship that name, so no deploy of this tree would overwrite it. Not an edit."
+        note "PRESENT          $_b — in $O and ABSENT from the record; the record's source ($CSRC) does not ship that name, so no deploy of this tree would overwrite it. Not an edit."
         PRESENT=$((PRESENT + 1)); continue
       fi
       # ⛔ THE ARM ASKS WHAT A DEPLOY WOULD **DISCARD**, AND IDENTICAL BYTES ARE NOT DISCARDED. Measured
@@ -574,7 +577,7 @@ check)
       # overwritten with itself: nothing is lost, so there is no patch to hunt and nothing to refuse.
       # The refusal below still bites whenever the bytes DIFFER — that is the 2026-10-28 hand patch.
       if [ -n "$CSRC" ] && [ -f "$CSRC/$_b" ] && cmp -s "$CSRC/$_b" "$O/$_b"; then
-        say "SAME-AS-SOURCE   $_b — in $O and ABSENT from the record, but $O already holds the RECORD'S SOURCE bytes, so a deploy would overwrite them with themselves: nothing is discarded and there is no patch here to recover"
+        note "SAME-AS-SOURCE   $_b — in $O and ABSENT from the record, but $O already holds the RECORD'S SOURCE bytes, so a deploy would overwrite them with themselves: nothing is discarded and there is no patch here to recover"
         SAMESRC=$((SAMESRC + 1)); continue
       fi
       if [ -z "$CSRC" ]; then
@@ -617,7 +620,7 @@ check)
       # widens an existing blind spot by one file class rather than opening a new one — stated because
       # the sentence above would otherwise be read as covering it.
       if cmp -s "$SRC/$_r" "$O/$_r"; then
-        say "SAME-AS-SOURCE   $_r — in $O and ABSENT from the record, but $O already holds the SOURCE's bytes, so this deploy would overwrite them with themselves: nothing is discarded and there is no patch to recover"
+        note "SAME-AS-SOURCE   $_r — in $O and ABSENT from the record, but $O already holds the SOURCE's bytes, so this deploy would overwrite them with themselves: nothing is discarded and there is no patch to recover"
         SAMESRC=$((SAMESRC + 1)); continue
       fi
       # ⛔ "EXIST NOWHERE ELSE" IS NOT KNOWABLE HERE EITHER (same measurement). The file is absent from
@@ -636,16 +639,16 @@ check)
     bad "UNKNOWN: the record at $REC says files=$NMAN but carries $NSEEN manifest line(s) — it is truncated or hand-edited, so the entries it does carry cannot be trusted as the whole set"; exit 2
   fi
   if [ "$PEND" -gt 0 ]; then
-    say "note: $PEND file(s) at $O already hold the SOURCE's bytes and the record predates them — an unrecorded or partial deploy; a completed deploy records it, nothing of yours is at risk"
+    note "note: $PEND file(s) at $O already hold the SOURCE's bytes and the record predates them — an unrecorded or partial deploy; a completed deploy records it, nothing of yours is at risk"
   fi
   if [ "$MISS" -gt 0 ]; then
-    say "note: $MISS file(s) the record names are ABSENT from $O — a redeploy would create them; that is not a discard, so it is not a refusal"
+    note "note: $MISS file(s) the record names are ABSENT from $O — a redeploy would create them; that is not a discard, so it is not a refusal"
   fi
   if [ "$PRESENT" -gt 0 ]; then
-    say "note: $PRESENT file(s) in $O are carried by the box and NOT shipped by the record's source — no deploy of this tree writes them, so they are reported and not counted as edits"
+    note "note: $PRESENT file(s) in $O are carried by the box and NOT shipped by the record's source — no deploy of this tree writes them, so they are reported and not counted as edits"
   fi
   if [ "$SAMESRC" -gt 0 ]; then
-    say "note: $SAMESRC file(s) in $O are ABSENT from the record but byte-identical to the source — an unrecorded copy (a narrower writer such as 'start', or install.sh's seed); overwriting them changes nothing, so they are reported and not counted as edits"
+    note "note: $SAMESRC file(s) in $O are ABSENT from the record but byte-identical to the source — an unrecorded copy (a narrower writer such as 'start', or install.sh's seed); overwriting them changes nothing, so they are reported and not counted as edits"
   fi
   [ "$EDITS" -eq 0 ] || exit 1
   exit 0
