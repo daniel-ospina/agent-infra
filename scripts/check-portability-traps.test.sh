@@ -974,6 +974,61 @@ for pair in "stat-c-gnu cyc12/3-two-stat-one-line.sh" "timeout-absent-on-macos c
     || bad "C17c: two $1 instances on one line counted $n_inst, not 2 — the ratchet cannot see the second"
 done
 
+# ── C18. THE FIFTEENTH CYCLE — a unit can carry several traps, and a sequence is not a guard ──────
+C8="$TMP/cyc13"; : >"$C8"
+C8C="$TMP/cyc13clean"; : >"$C8C"
+mkc8()  { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C8"; }
+mkc8c() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C8C"; }
+
+mkc8 cyc13/1-two-calls-one-unit-and.sh '#!/usr/bin/env bash' 'mt=$(stat -c %Y "$f" && stat -c %Z "$f")'
+mkc8 cyc13/2-two-calls-case-arms.sh '#!/usr/bin/env bash' 'case x in a) stat -c %Y a ;; b) stat -c %Z b ;; esac'
+# the BSD counterpart BEFORE the GNU call in a `&&` sequence is not a guard: both arms run on both hosts
+mkc8 cyc13/3-counterpart-first-sequence.sh '#!/usr/bin/env bash' 'stat -f %m f && stat -c %Y f'
+mkc8c cyc13clean/1-or-chain.sh '#!/usr/bin/env bash' 'stat -c %Y a || stat -f %m b'
+mkc8c cyc13clean/2-if-else.sh '#!/usr/bin/env bash' 'if [ -n "$E" ]; then stat -c %Y a; else stat -f %m a; fi'
+
+run_check "$C8" --no-baseline
+for pair in \
+  "stat-c-gnu cyc13/1-two-calls-one-unit-and.sh" \
+  "stat-c-gnu cyc13/2-two-calls-case-arms.sh" \
+  "stat-c-gnu cyc13/3-counterpart-first-sequence.sh"
+do
+  set -- $pair
+  if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    ok "C18a: caught $1 in $(basename "$2")"
+  else
+    bad "C18a: MISSED $1 in $(basename "$2")"
+  fi
+done
+# two GNU invocations inside ONE unit must be TWO findings — the ratchet compares the count
+for f in cyc13/1-two-calls-one-unit-and.sh cyc13/2-two-calls-case-arms.sh; do
+  printf '%s\n' "$f" >"$TMP/cyc13one.list"
+  run_check "$TMP/cyc13one.list" --no-baseline
+  n_u="$(awk -v r="stat-c-gnu" '{ n = split($0, a, ": "); if (n >= 2) { split(a[2], b, " "); if (b[1] == r) c++ } } END { print c + 0 }' "$OUT")"
+  [ "$n_u" = 2 ] && ok "C18b: two GNU calls in one unit of $(basename "$f") count 2" \
+    || bad "C18b: two GNU calls in one unit of $(basename "$f") counted $n_u, not 2"
+done
+run_check "$C8C" --no-baseline
+for pair in \
+  "stat-c-gnu cyc13clean/1-or-chain.sh" \
+  "stat-c-gnu cyc13clean/2-if-else.sh"
+do
+  set -- $pair
+  if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    bad "C18c: FALSE POSITIVE — $1 reded on portable $(basename "$2")"
+  else
+    ok "C18c: portable fallback NOT flagged ($(basename "$2"))"
+  fi
+done
+
+# two mapfile calls on one line must count twice too
+printf '%s\n' 'mapfile a; mapfile b' >"$TMP/tree/cyc13/4-two-mapfile.sh"
+printf '%s\n' cyc13/4-two-mapfile.sh >"$TMP/mf.list"
+run_check "$TMP/mf.list" --no-baseline
+n_mf="$(awk -v r="bash4-mapfile" '{ n = split($0, a, ": "); if (n >= 2) { split(a[2], b, " "); if (b[1] == r) c++ } } END { print c + 0 }' "$OUT")"
+[ "$n_mf" = 2 ] && ok "C18d: two mapfile calls on one line are counted twice" \
+  || bad "C18d: two mapfile calls on one line counted $n_mf, not 2"
+
 # ⛔ A SECOND LIVE TRAP ON THE SAME LINE IS COUNTED (review cycle-12 P2): the ratchet is keyed on the
 # COUNT, so a `return` after the first hit let `sed -i …; sed -i …` report 1 where two lines report 2
 # — a fresh trap appended beside an existing one stayed green forever.

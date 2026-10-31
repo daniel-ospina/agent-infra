@@ -927,14 +927,30 @@ function gnu_only_unit(code, tool, shortf, longf, bsd1, bsd2,   segs, n, k, c, p
       if (j == gi) continue
       if (cmd_opt(parts[j], tool, bsd1) || (bsd2 != "" && cmd_opt(parts[j], tool, bsd2))) { good = 1; break }
     }
-    # …or in the SAME part, BEFORE the GNU call (`if stat -f … && …`, `stat -f … ; `)
-    if (!good && (cmd_opt(parts[gi], tool, bsd1) || (bsd2 != "" && cmd_opt(parts[gi], tool, bsd2)))) {
-      gpos = index(parts[gi], shortf != "" ? shortf : longf)
-      bpos = index(parts[gi], bsd1)
-      if (bsd2 != "" && (bpos == 0 || (index(parts[gi], bsd2) > 0 && index(parts[gi], bsd2) < bpos))) bpos = index(parts[gi], bsd2)
-      if (bpos > 0 && (gpos == 0 || bpos < gpos)) good = 1
-    }
-    if (!good) c++
+    # ⛔ A COUNTERPART EARLIER IN THE SAME PART IS NOT A GUARD (review cycle-15 P2): `stat -f %m f &&
+    # stat -c %Y f` runs BOTH on both hosts — on macOS the second fails outright, on Linux `-f` is the
+    # filesystem form and returns a different value — so the value silently differs per host. The
+    # block that blessed it contradicted the sentence four lines above it. Only a DIFFERENT fallback
+    # part (an earlier platform arm or a later `||` arm) is a guard.
+    # ⛔ ONE UNIT CAN CARRY SEVERAL TRAPS (review cycle-15 P1): counting the UNIT made a second
+    # `stat -c` / `date -d` joined by `&&`, `|` or a `case` arm invisible, so appending it to an
+    # already-baselined line left the ratchet green — the same bypass the per-line count had, one
+    # join further in. Count the invocations in the unit.
+    if (!good) c += gnu_n(segs[k], tool, shortf, longf)
+  }
+  return c
+}
+
+# gnu_n(code, tool, shortf, longf) — how many times the GNU spelling is INVOKED in `code`,
+# command-scoped (`cmd_opt` idiom: split on separators, then require the tool in that segment).
+function gnu_n(code, tool, shortf, longf,   t, k, segs, n, c) {
+  t = code
+  gsub(/[|&;(){}]/, "\n", t)
+  n = split(t, segs, "\n")
+  c = 0
+  for (k = 1; k <= n; k++) {
+    if (!cp(segs[k], tool)) continue
+    if ((shortf != "" && cmd_opt(segs[k], tool, shortf)) || (longf != "" && opt_long(segs[k], tool, longf))) c++
   }
   return c
 }
@@ -1199,7 +1215,10 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # matching flagged `local d; ls -A "$d"` and `[ -A "$x" ]`, i.e. portable code. `local -A` is the
   # spelling most functions use, so the rule is worth having — command-scoped, it still catches it.
   if (cmd_opt(code, "declare", "-A") || cmd_opt(code, "local", "-A") || cmd_opt(code, "typeset", "-A")) hit("bash4-declare-A", 1, "indexed arrays, or case")
-  if (cp(code, "mapfile") || cp(code, "readarray")) hit("bash4-mapfile", 1, "while IFS= read -r line")
+  # ⛔ COUNTED, AND THE REASON IT WAS NOT IS GONE (review cycle-15 P2): `cmd_calls()` takes a STRING
+  # pattern — the limitation was only about regex CONSTANTS — and it was defined and never used while
+  # this rule emitted one row per line, so `mapfile a; mapfile b` counted 1.
+  hit("bash4-mapfile", cmd_calls("mapfile", code) + cmd_calls("readarray", code), "while IFS= read -r line")
   # ONE MODIFIER IS ENOUGH (review cycle-4 P2): `${x,}` and `${x^}` are equally absent from bash
   # 3.2, and the rule demanded two. The `[,^]` position still excludes the operator forms
   # (`${x:-}`, `${x##}`, `${x%%}`), which put a different character there.
