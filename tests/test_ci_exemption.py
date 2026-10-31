@@ -2698,9 +2698,10 @@ def test_bash_shard_bold_rendering_matches_its_sibling_parser():
 # per-shard line nor the step-prefixed `##[error]bash shard failed:` annotation — the generic
 # `##[error]Process completed with exit code 1.` it DOES carry (its last line) is deliberately never
 # an identity. That is an artifact of the excerpt, not of the run: the run's own annotation
-# attributes this shard on `main` (guard-step pass, predates #2648), and #2648's per-shard
-# `bash-shard::` family — the base of this commit — is a second read of it. The recap arm is
-# therefore REDUNDANCY, as the module's `#: THE RUNNER'S RECAP LINE` note states.
+# names this shard on `main` — since #3105 `bash_shard_annotation_key` re-homes it onto the shard
+# family, and before that the guard-step pass slugged it into a `guard-step::` key — and #2648's
+# per-shard `bash-shard::` family — the base of this commit — is a second read of it. The recap arm
+# is therefore REDUNDANCY, as the module's `#: THE RUNNER'S RECAP LINE` note states.
 
 _RECAP_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "rail" / "bash-suites-shard-recap.txt"
@@ -3626,3 +3627,276 @@ def test_a_shard_label_is_never_DROPPED_even_when_it_looks_like_source():
     assert ci_exemption.bash_shard_failures(
         "❌ failing shard(s): scripts/x.test.sh, ./scripts/y.test.sh"
     )[0] == ["bash-shard::scripts/x.test.sh", "bash-shard::scripts/y.test.sh"]
+
+
+# ==========================================================================
+# #3105 — THE SHARD ANNOTATION CARRIES THE SHARD'S OWN IDENTITY
+# ==========================================================================
+#
+# THE DEFECT, MEASURED. `scripts/run-bash-shards.sh`'s `run_shard` announces a failing shard
+# TWICE from ONE variable: as its own `❌ failed shard: <path>` line (#2643), and as a GitHub
+# annotation `::error::bash shard failed: <path>`. The annotation reaches the GUARD-STEP pass,
+# which SLUGS the message into `guard-step::<step>::<shape>`. `_slug` is not injective — `/`,
+# `-`, `:` and a space all fold to `-` — so `scripts/a-b.test.sh` and `scripts/a/b.test.sh`
+# produced ONE identity. Measured on main's own `script-validate` capture (run 41058049016):
+# 12 shards arrived as `guard-step::UNKNOWN-STEP::bash-shard-failed-<slugged path>` BESIDE the
+# 12 canonical `bash-shard::<path>` ids for the same shards.
+#
+# WHY IT IS CATEGORY A AND NOT COSMETIC. An identity is what `decide` compares against the
+# base's rate table, so a base red on one colliding path could exempt a NEW red on the other —
+# the fail-OPEN direction, and #2648's exact defect, which was closed for the `bash-shard::`
+# producer while this second producer of the SAME event was left folding paths.
+#
+# THE FIX maps the annotation onto the shard family's own injective `_shard_token`, so one
+# event has one identity on both trees, and the export the operator reads names the shard.
+_SHARD_JOB = "bash-suites (2)"
+_SHARD_STEP = "UNKNOWN STEP"   # GitHub's own placeholder for a job-level annotation
+_SHARD_EXIT = "##[error]Process completed with exit code 1."
+
+
+def _shard_capture(*contents: str) -> str:
+    """A `--log-failed` capture carrying ``contents`` in one failed step, byte-shaped."""
+    prefix = f"{_SHARD_JOB}\t{_SHARD_STEP}\t2026-10-30T10:00:00."
+    lines = [f"{prefix}{i:07d}Z {content}" for i, content in enumerate(contents)]
+    lines.append(f"{prefix}9000000Z {_SHARD_EXIT}")
+    return "\n".join(lines) + "\n"
+
+
+def test_shard_annotation_carries_the_shard_identity_not_a_slug():
+    """The guard-step door emits the SHARD's identity for the shard's own annotation.
+
+    MUTATION: drop the `bash_shard_annotation_key` branch from ``guard_step_failures`` → the
+    id becomes `guard-step::<step>::bash-shard-failed-scripts-a-b.test.sh` → RED here, and on
+    the real capture the SAME suite is reported twice under two identities, one of which the
+    base can never match.
+    """
+    parsed = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh"), raw_log=True
+    )
+
+    assert parsed.ids == ["bash-shard::scripts/a/b.test.sh"]
+    assert parsed.bash_shard == ["bash-shard::scripts/a/b.test.sh"], (
+        "a shard id must be reported with the SHARD family — the operator's remedy is the "
+        "shard, not a guard step"
+    )
+    assert parsed.guard_steps == [], "the shard event is not a guard-step identity as well"
+
+
+def test_shard_annotation_identity_is_injective_where_the_guard_key_was_not():
+    """⛔ THE CATEGORY-A PROPERTY: two different shards must not share one identity.
+
+    This is the vector the change CLOSES. Before it, both paths folded to the same guard key,
+    so `decide` could return `exempt` for a shard nobody had ever run on the base — a false
+    PASS, not a false block.
+
+    MUTATION: route the annotation back through `guard_step_key` → the two ids become equal →
+    RED with the collision named.
+    """
+    dash = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a-b.test.sh"), raw_log=True
+    )
+    slash = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh"), raw_log=True
+    )
+
+    assert dash.ids and slash.ids
+    assert dash.ids != slash.ids, (
+        "two DIFFERENT shards still share one identity — a base red on one can exempt a new "
+        f"red on the other (both read {dash.ids[0]!r})"
+    )
+    # …and neither is the lossy key, which is the identity that could not discriminate.
+    assert not any("guard-step::" in i for i in dash.ids + slash.ids)
+
+
+def test_shard_annotation_and_its_sibling_line_are_one_identity():
+    """ONE failing shard, ONE id — even when the capture carries both of its shapes.
+
+    The two shapes come from the same shell variable in `run_shard`, so a capture that carries
+    both must not report the suite twice: a duplicate id inflates the PR's failing set and
+    names the same failure under two names.
+
+    MUTATION: let the annotation keep a guard key while the shard line keeps its own → two ids
+    for one suite → RED.
+    """
+    parsed = parse_failed_ids(
+        _shard_capture(
+            "❌ failed shard: scripts/selftest.sh",
+            "##[error]bash shard failed: scripts/selftest.sh",
+        ),
+        raw_log=True,
+    )
+
+    assert parsed.ids == ["bash-shard::scripts/selftest.sh"]
+    assert parsed.bash_shard == ["bash-shard::scripts/selftest.sh"]
+    assert parsed.guard_steps == []
+
+
+def test_shard_annotation_ids_door_and_signatures_door_agree():
+    """§4.6 compares signatures; a id signed by one door only fails closed and BLOCKS."""
+    log = _shard_capture("##[error]bash shard failed: scripts/worker.test.sh")
+    parsed_ids = ci_exemption.parse_failed_ids(log, raw_log=True)
+    parsed_sigs = ci_exemption.parse_pr_failure_text(log)
+
+    assert parsed_ids.ids == parsed_sigs.ids == ["bash-shard::scripts/worker.test.sh"]
+    assert parsed_sigs.signatures[parsed_ids.ids[0]] == frozenset(
+        {ci_exemption._BASH_SHARD_SIG}
+    ), "the annotation's id must carry the SHARD family's signature, or the subset rule blocks"
+
+
+def test_shard_annotation_is_exempted_only_when_the_base_measured_the_same_shard():
+    """The exemption fires on the IDENTICAL suite — the whole point of the mapping.
+
+    ⛔ THE IDENTITY ASSERTION IS THE LOAD-BEARING ONE (#3105 review, cycle 1). Asserting only
+    "the decision exempts it" is VACUOUS: a `guard-step::` key is admitted by `_GUARD_KEY_RE`
+    too, so the pre-change code exempts it identically and the vector stays green with the
+    mapping removed. Pinning the IDENTITY is what makes the mutation RED.
+    """
+    key = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh"), raw_log=True
+    ).ids[0]
+    assert key == "bash-shard::scripts/a/b.test.sh", (
+        f"the annotation did not carry the shard identity: {key!r}"
+    )
+    main_rates = parse_rates(f"{key}\t3\t8\n")
+    assert main_rates.rejected == []
+
+    decision = decide(
+        {key: Failure(rate=Rate(3, 8), signatures=frozenset({"bash-shard"}))},
+        main_rates.rates,
+        main_signatures={key: frozenset({"bash-shard"})},
+        k_pr=8,
+    )
+
+    assert not decision.any_blocked
+    assert decision.visible_exemptions(), "an exemption must be RECORDED, never silent"
+
+
+def test_shard_annotation_absent_from_main_still_blocks():
+    """⛔ THE POLARITY PROOF: a NEW red still refuses. Nothing here widens the exemption.
+
+    A shard the base has never measured yields an id absent from the base's table, and that is
+    still a PR-unique failure — the change moves an identity, it does not excuse a shard.
+    """
+    key = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/brand-new.test.sh"), raw_log=True
+    ).ids[0]
+    assert key == "bash-shard::scripts/brand-new.test.sh", (
+        f"the PR's id is not the shard identity ({key!r}) — this vector would be vacuous"
+    )
+
+    decision = decide(
+        {key: Failure(rate=Rate(3, 8), signatures=frozenset({"bash-shard"}))},
+        {},                      # the base measured NOTHING
+        main_signatures={},
+        k_pr=8,
+    )
+
+    assert decision.any_blocked
+    assert decision.blocked[0].blocked is True
+    assert "absent from main's failure set" in decision.blocked[0].reason
+
+
+def test_a_colliding_path_cannot_be_exempted_by_its_sibling():
+    """⛔ THE FAIL-OPEN VECTOR, END TO END: the base is red on `a/b`, the PR breaks `a-b`.
+
+    Under the slugged identity both were `…bash-shard-failed-scripts-a-b.test.sh`, so main's
+    measurement of one exempted the other — a false PASS. With the shard token they are
+    different ids, and the PR's is unknown to the base, so it BLOCKS.
+
+    ⛔ THE PARAMETERS MATTER, and the first version of this vector had them WRONG (#3105 review,
+    cycle 1). The exemption fires on the ATTRIBUTION-ONLY branch — `k_pr < min_runs` (#5250),
+    which is the production norm because a PR head carries ONE sample per check. At `k_pr=8` the
+    RATE comparison catches the collision first (`1.0 > 0.375 * 1.5`) and the vector passed even
+    with the defect present. So it runs at `k_pr=1`, and it pins the identity explicitly: under
+    the mutation `pr_key` becomes `guard-step::UNKNOWN-STEP::…`, which still satisfies
+    `!= base_key`, so a collision assertion alone would not catch the regression.
+    """
+    base_key = "bash-shard::scripts/a/b.test.sh"
+    pr_key = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a-b.test.sh"), raw_log=True
+    ).ids[0]
+    assert pr_key == "bash-shard::scripts/a-b.test.sh", (
+        f"the PR's id is not the shard identity ({pr_key!r}) — a lossy key can collide with a "
+        "sibling path"
+    )
+    assert pr_key != base_key
+
+    decision = decide(
+        {pr_key: Failure(rate=Rate(1, 1), signatures=frozenset({"bash-shard"}))},
+        {base_key: Rate(3, 8)},          # the base is red on the OTHER path only
+        main_signatures={base_key: frozenset({"bash-shard"})},
+        k_pr=1,
+    )
+
+    assert decision.any_blocked, (
+        "a shard the base never measured was exempted on a SIBLING path's history — the "
+        "collision that made this change necessary"
+    )
+
+
+def test_shard_annotation_redirect_is_narrow_to_a_path():
+    """⛔ NARROWNESS (#3105 review, cycle 1): only a SHARD PATH is redirected.
+
+    Keyed on the phrase alone, ANY failed step's annotation beginning `bash shard failed:`
+    became a shard identity (`bash shard failed: see logs` → `bash-shard::see%20logs`) — losing
+    that failure's step-scoped guard identity, and moving the declared echoed-source residual
+    onto an id that IS in the base's table whenever the base is red on that shard, i.e. turning
+    a blocking phantom into an exemptable one. Every shard `run-bash-shards.sh --list` prints is
+    repo-relative, so requiring a `/` excludes no real shard.
+
+    MUTATION: drop the `/` requirement → the first two assertions RED.
+    """
+    assert ci_exemption.bash_shard_annotation_key("bash shard failed: see logs") is None
+    assert ci_exemption.bash_shard_annotation_key("bash shard failed: none") is None
+    assert ci_exemption.bash_shard_annotation_key("redislite server leak: 16") is None
+    assert ci_exemption.bash_shard_annotation_key(
+        "bash shard failed: scripts/orchestrator-harness/selftest.sh"
+    ) == "bash-shard::scripts/orchestrator-harness/selftest.sh"
+
+
+def test_shard_annotation_preserves_internal_spacing_so_paths_cannot_collide():
+    """⛔ ONE SPACE AND TWO SPACES ARE DIFFERENT FILES (#3105 review, cycle 1).
+
+    `_attributable_annotation` collapses whitespace before the guard SHAPE sees it. Routing that
+    collapsed text into `_shard_token` made `scripts/a  b.test.sh` and `scripts/a b.test.sh`
+    share ONE identity — the very collision class this change closes — and made one file
+    disagree with the prose door, which matches the raw line.
+
+    MUTATION: pass the collapsed message into `bash_shard_annotation_key` → the two ids become
+    equal → RED; and the two doors stop agreeing → RED.
+    """
+    one = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a b.test.sh"), raw_log=True
+    )
+    two = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a  b.test.sh"), raw_log=True
+    )
+    prose_one = parse_failed_ids(
+        _shard_capture("❌ failed shard: scripts/a b.test.sh"), raw_log=True
+    )
+    prose_two = parse_failed_ids(
+        _shard_capture("❌ failed shard: scripts/a  b.test.sh"), raw_log=True
+    )
+
+    assert one.ids and two.ids
+    assert one.ids != two.ids, f"two DIFFERENT paths share one id: {one.ids}"
+    assert one.ids == prose_one.ids, (one.ids, prose_one.ids)
+    assert two.ids == prose_two.ids, (two.ids, prose_two.ids)
+
+
+def test_shard_annotation_family_is_reported_identically_by_both_doors():
+    """⛔ THE COUNTERS, NOT JUST THE IDS (#3105 review, cycle 1).
+
+    The `ids` door partitioned the redirected key into the shard family while the `signatures`
+    door did not, so the second printed `guard-steps=1 … bash-shard=0` and then labelled a
+    `bash-shard::` id "guard-step failure ATTRIBUTED" — the wrong-surface reporting both doors
+    exist to avoid.
+    """
+    log = _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh")
+    ids_door = ci_exemption.parse_failed_ids(log, raw_log=True)
+    sig_door = ci_exemption.parse_pr_failure_text(log)
+
+    assert ids_door.guard_steps == sig_door.guard_steps == []
+    assert ids_door.bash_shard == sig_door.bash_shard == [
+        "bash-shard::scripts/a/b.test.sh"
+    ]
