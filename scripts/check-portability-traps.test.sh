@@ -691,6 +691,84 @@ for spec in "cyc7/1-repeat-sysctl.sh 2" "cyc7/1-repeat-sysctl.sh 4" \
   fi
 done
 
+# ── C14. THE NINTH CYCLE — a CONDITIONED CALL is not a conditioned LINE, and a shim MENTION is not a CALL
+# The cycle-8 fix asked "is there a conditioned call on this line?", which a line carrying BOTH a
+# guarded and an unguarded call of the same tool answers YES — the trap is blessed by its neighbour.
+# Every fixture below was measured CLEAN at the previous head.
+C4="$TMP/cyc9"; : >"$C4"
+C4C="$TMP/cyc9clean"; : >"$C4C"
+mkc4()  { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C4"; }
+mkc4c() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C4C"; }
+
+mkc4 cyc9/1-guarded-then-plain.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 a; timeout 5 b'
+mkc4 cyc9/2-guarded-or-fallback.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 a || timeout 5 b'
+mkc4 cyc9/3-then-else.sh '#!/usr/bin/env bash' 'if command -v timeout >/dev/null 2>&1; then timeout 5 a; else timeout 5 b; fi'
+mkc4 cyc9/4-plain-then-guarded.sh '#!/usr/bin/env bash' 'timeout 5 a; command -v timeout >/dev/null 2>&1 && timeout 5 b'
+mkc4 cyc9/5-shim-mentioned-cpu.sh '#!/usr/bin/env bash' 'grep -q box_ncpu lib/box.sh; n="$(nproc)"'
+mkc4 cyc9/6-shim-mentioned-sed.sh '#!/usr/bin/env bash' "grep -c box_sed_i lib/box.sh >/dev/null; sed -i -e 's/a/b/' f"
+mkc4 cyc9/7-repeat-one-probed.sh '#!/usr/bin/env bash' 'command -v nproc >/dev/null 2>&1 && n="$(nproc)"; m="$(nproc)"'
+
+# …and the forms that ARE conditioned must stay clean, including a whole `&&` chain
+mkc4c cyc9clean/1-and-chain.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 a && timeout 5 b'
+mkc4c cyc9clean/2-then-single.sh '#!/usr/bin/env bash' 'if command -v timeout >/dev/null 2>&1; then timeout 5 a; fi'
+mkc4c cyc9clean/3-then-multiline.sh '#!/usr/bin/env bash' 'if command -v timeout >/dev/null 2>&1; then' '  timeout 5 a' 'fi'
+mkc4c cyc9clean/4-shim-called.sh '#!/usr/bin/env bash' 'n="$(box_ncpu)"' 'box_sed_i "s/a/b/" f'
+
+run_check "$C4" --no-baseline
+if [ "$?" = 2 ]; then
+  bad "C14: the cycle-9 fixture tree was REFUSED (rc=2) — an empty scan proves nothing"
+else
+  for pair in \
+    "timeout-absent-on-macos cyc9/1-guarded-then-plain.sh" \
+    "timeout-absent-on-macos cyc9/2-guarded-or-fallback.sh" \
+    "timeout-absent-on-macos cyc9/3-then-else.sh" \
+    "timeout-absent-on-macos cyc9/4-plain-then-guarded.sh" \
+    "cpu-count-single-mechanism cyc9/5-shim-mentioned-cpu.sh" \
+    "sed-in-place-gnu cyc9/6-shim-mentioned-sed.sh" \
+    "cpu-count-single-mechanism cyc9/7-repeat-one-probed.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      ok "C14a: caught $1 in $(basename "$2")"
+    else
+      bad "C14a: MISSED $1 in $(basename "$2") — a conditioned call is blessing the rest of its line"
+    fi
+  done
+  run_check "$C4C" --no-baseline
+  for pair in \
+    "timeout-absent-on-macos cyc9clean/1-and-chain.sh" \
+    "timeout-absent-on-macos cyc9clean/2-then-single.sh" \
+    "timeout-absent-on-macos cyc9clean/3-then-multiline.sh" \
+    "cpu-count-single-mechanism cyc9clean/4-shim-called.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      bad "C14b: FALSE POSITIVE — $1 reded on correctly guarded $(basename "$2")"
+    else
+      ok "C14b: guarded code NOT flagged ($(basename "$2"))"
+    fi
+  done
+
+  # ⛔ THE COUNT IS THE MECHANISM, SO IT MUST BE LOAD-BEARING (review cycle-9): the `&&`-arm test
+  # alone reads these CLEAN (that WAS the P0). Removing the count comparison must turn the fixture
+  # back into a false PASS — if it does not, the count is not what catches it and the next edit can
+  # drop it silently.
+  MUT9="$TMP/cyc9mut.sh"
+  awk '{ if (index($0, "if (toolcalls(c2, tool) != toolcalls(m1, tool)) return 0") > 0) print "# MUT9"; else print }' "$CHECK" >"$MUT9"
+  if cmp -s "$CHECK" "$MUT9"; then
+    bad "C14c: the count guard was NOT FOUND in the detector — its text moved, so this arm is dead"
+  else
+    printf '%s\n' cyc9/1-guarded-then-plain.sh >"$TMP/cyc9mut.list"
+    bash "$MUT9" --root "$TMP/tree" --targets "$TMP/cyc9mut.list" --no-baseline >"$OUT" 2>"$ERR"
+    mrc=$?
+    if [ "$mrc" = 0 ]; then
+      ok "C14c: deleting the call-COUNT comparison re-opens the false PASS (the count is load-bearing)"
+    else
+      bad "C14c: the count guard survived its own deletion (rc=$mrc) — something else catches the fixture, so the count may be dead code"
+    fi
+  fi
+fi
+
 # ⛔ D2. GUARD MUTANTS — the arms the `hit(…)` mutants cannot reach ──────────────────────────────
 # Section D deletes a rule's DISPATCH, which makes a finding disappear. A CROSS-LINE GUARD works the
 # other way round: it SUPPRESSES a finding, so deleting it makes the output larger and the D-style

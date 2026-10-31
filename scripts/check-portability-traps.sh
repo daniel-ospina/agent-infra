@@ -600,7 +600,7 @@ function atoms() {
 #   `command -v setsid >/dev/null 2>&1; setsid sleep 1`         CLEAN  (runs unconditionally)
 #   `if command -v timeout …; then :; else timeout 5 sleep 1; fi` CLEAN (the else arm IS the trap)
 # A NEGATED probe (`if ! command -v …; then …`) guards nothing, so it is never a guard.
-function conditioned(tool, code,   pr, c2) {
+function conditioned(tool, code,   pr, c2, cal, arm, m1, m2, p_and, p_then, rest2, tail, pass) {
   # ⛔ A PROBE IS OFTEN INSIDE A KEYWORD (review cycle-8): the first version anchored at `(^|SEP)`,
   # so `if command -v timeout …` matched NOTHING — every guarded form in this tree is written that
   # way, and the conditioning test then reported clean code as a trap (bounded.sh, box.sh,
@@ -620,9 +620,63 @@ function conditioned(tool, code,   pr, c2) {
   # a value assignment has no spaces inside `$( … )`, so it needs its own form:
   # `NCPU="$(nproc …)"` — the assignment atom above cannot span the parentheses.
   cal = "(" pre pfx tool rb "|[A-Za-z_][A-Za-z0-9_]*=[\"\047]?[$][(][ \t]*" asg pfx tool ")"
-  if (c2 ~ ("\001[^;|]*&&[^|]*" cal)) return 1
-  if (c2 ~ ("\001[^|]*[ \t]then[ \t]+" cal)) return 1
-  return 0
+  if (c2 !~ ("\001[^;|]*&&[^|]*" cal) && c2 !~ ("\001[^|]*[ \t]then[ \t]+" cal)) return 0
+  # ⛔ ONE CONDITIONED CALL DOES NOT BLESS THE OTHER CALLS ON THE SAME LINE (review cycle-9 P0).
+  # This is the "condition the CALL, never the line" defect a fourth time, now one call out: the
+  # test above asks "is there a conditioned call on this line", so a line carrying BOTH a guarded
+  # and an UNGUARDED call of the same tool came back CLEAN — including the `||` shape the header
+  # promises to flag, whenever the left arm is itself conditioned:
+  #     command -v timeout >/dev/null 2>&1 && timeout 5 a;  timeout 5 b      ← b runs always
+  #     command -v timeout >/dev/null 2>&1 && timeout 5 a || timeout 5 b      ← b runs on absence
+  #     if command -v timeout …; then timeout 5 a; else timeout 5 b; fi       ← b runs on absence
+  #     timeout 5 a; command -v timeout … && timeout 5 b                      ← a runs always
+  # Measured breadth: the same shape hid sed -i, nproc, sysctl, setsid, free and readlink -f.
+  # The rule is now a COUNT: every invocation of the tool on the line must sit inside the single
+  # conditioned arm, and nothing may precede the probe.
+  # The arm starts AFTER its opener — the `;` that terminates the probe COMMAND ITSELF
+  # (`if probe; then …`) is not a boundary, and cutting there was measured to flag the canonical
+  # guarded form. Whichever opener comes first is the one that carries the arm.
+  arm = substr(c2, index(c2, "\001") + 1)
+  p_and = index(arm, "&&")
+  p_then = 0
+  if (match(arm, "[ \t]then[ \t]+") > 0) p_then = RSTART + RLENGTH
+  if (p_then > 0 && (p_and == 0 || p_then <= p_and)) arm = substr(arm, p_then)
+  else if (p_and > 0) arm = substr(arm, p_and + 2)
+  else return 0
+  # … and it ends at the first UNCONDITIONAL continuation: `;`, a pipe, or an `else` branch — except
+  # a `;` that merely OPENS the arm of a same-line `then`. Literal cutting stopped at that `;` and
+  # reported `if probe && readlink -f -- d; then out="$(readlink -f -- d)"; fi` — the guarded form
+  # the readlink rule is written for — as an unflagged trap (measured: fixed-clean/10-readlink-probe).
+  m1 = ""
+  rest2 = arm
+  if (match(rest2, "[ \t]else([ \t]|$)") > 0) rest2 = substr(rest2, 1, RSTART - 1)
+  for (pass = 1; pass <= 4; pass++) {
+    if (match(rest2, "[;|]") == 0) { m1 = m1 rest2; break }
+    m1 = m1 substr(rest2, 1, RSTART - 1)
+    tail = substr(rest2, RSTART)
+    if (match(tail, "^[;|][ \t]*then[ \t]+") == 0) break
+    rest2 = substr(tail, RLENGTH + 1)
+  }
+  if (toolcalls(m1, tool) == 0) return 0
+  if (toolcalls(substr(c2, 1, index(c2, "\001") - 1), tool) > 0) return 0
+  if (toolcalls(c2, tool) != toolcalls(m1, tool)) return 0
+  return 1
+}
+
+# toolcalls(code, tool) — how many times `tool` is INVOKED in `code`: command position, or the
+# `find … -exec` position. Counting is what distinguishes "the call is conditioned" from "a call on
+# this line is conditioned"; a boolean cannot, and the boolean is what shipped four times.
+function toolcalls(code, tool,   t, n) {
+  t = code
+  n = gsub("(^|" SEP ")[ \t]*" pre pfx tool rb, "\003", t)
+  # a call reached through a substitution is a call — `n="$(nproc)"` is how every probe arm in this
+  # tree writes it, and a count that missed it read the canonical guarded form as UNGUARDED (measured:
+  # guarded/3-probe.sh went red the moment the count was introduced).
+  t = code
+  n += gsub("[$][(][^()]*" tool "([^A-Za-z0-9_]|$)", "\003", t)
+  t = code
+  n += gsub("[ \t]-(exec|execdir|ok|okdir)[ \t]+([^;&|(){}]*[ \t])?" pfx tool rb, "\003", t)
+  return n
 }
 
 # probe_then(tool, code) — the LOOKBACK half: a previous line that OPENS a conditional ON the probe
@@ -982,7 +1036,11 @@ function cpu_rule(code,   n, mech) {
   if (inpos(code, "nproc") && !cpu_guarded("nproc", code)) { n++; mech = 1 }
   if (code ~ /hw\.ncpu/ && inpos(code, "sysctl") && !cpu_guarded("sysctl", code)) { n++; mech = 1 }
   if (code ~ /_NPROCESSORS_ONLN/ && inpos(code, "getconf") && !cpu_guarded("getconf", code)) { n++; mech = 1 }
-  if (code ~ /box_ncpu/) return 0
+  # ⛔ A SHIM NAME MENTIONED IS NOT A SHIM CALLED (review cycle-9 P1): this was a bare substring
+  # test, so `grep -q box_ncpu lib/box.sh; n="$(nproc)"` inherited the exemption from a word in an
+  # ARGUMENT and the very trap the rule exists for came back CLEAN (same class as the cycle-8
+  # `# portability-ok:` fix, one construct over). The shim must be INVOKED.
+  if (inpos(code, "box_ncpu")) return 0
   # ⛔ A PROBE ON THIS LINE IS ALREADY ACCOUNTED FOR PER TOOL (review cycle-8 P0): these two
   # line-wide returns blessed every mechanism on a probe line, so `command -v nproc >/dev/null 2>&1 ||
   # n="$(nproc)"` — a read that runs exactly on the host where nproc is missing — was CLEAN.
@@ -1053,7 +1111,8 @@ function timeout_rule(code) {
 #      key, wrong failure mode): it is the BSD spelling whichever side of the separator it sits on.
 function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat) {
   if (!cp(code, "sed")) return 0
-  if (code ~ /box_sed_i/) return 0
+  # ⛔ THE SHIM MUST BE CALLED, NOT MENTIONED (review cycle-9 P1 — see cpu_rule for the measurement).
+  if (cp(code, "box_sed_i") || code ~ ("[$][(][ \t]*box_sed_i" rb)) return 0
   t = code
   gsub(/[|&;(){}]/, "\n", t)
   n = split(t, segs, "\n")
