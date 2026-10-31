@@ -2960,14 +2960,32 @@ implemented or explicitly not claimed:
 | remove by proof, not by label | `lc_guard_mutate` reads the loaded job's `path =` and refuses unless it is this plist |
 | an unreadable domain is UNKNOWN | `lc_probe` is the tri-state read, and every DECISION POINT that must distinguish 'not loaded' from 'could not read' re-probes with it: `lc_ensure`, the `--uninstall` read-back in `install.sh` (`block="$(lc_probe "$LABEL")"` — its verdict is the probe's own status, not a derived second read), `lc_guard_mutate`, `lc_assert_running`, `lc_assert_stable`, and `lc_bootout` (which refuses to treat a label as 'not loaded' rather than removing by a failed read). The thin wrappers `lc_pid` and `lc_runs` fold UNKNOWN into empty, so their callers must not read empty as 'not loaded'. Those decisions re-probe — **except `lc_restart`, and that is a hole this row names rather than hides**: a restart is unconditional, so it needs no probe to decide *whether* to act, but the folded `lc_pid` read it takes BEFORE the start is passed into `lc_assert_running` as `replaced`, so when that read is UNREADABLE (rather than 'not loaded') `replaced` is empty and the "the old process survived the start" check is silently SKIPPED. Not every read in the file is tri-state: `lc_min_runtime` falls back to launchd's own 10 s default, and a successful-but-empty `print-disabled` reads as `unset` (no override), because that is exactly what it means |
 
-⛔ **What is still GAP is the reporting side, and it is the item that matters most**: nothing
-**detects** a job that has been disabled or booted out — `KeepAlive`/`RunAtLoad`
-(`launchd.plist.template:15-18`) relaunch a job that EXITS, which is not the same state as one launchd
-no longer has, and `com.eldato.lane-liveness.plist` watches LANES by design with no controller alive.
-On 2026-10-17 the label was disabled twice more *during this PR's own review* by agent sessions running
-the pre-#1975 flow from other checkouts; both times a human reading `launchctl print` found it, not an
-instrument. A watchdog that runs `enable` + `bootstrap` when the label is absent, and reports it, is
-the missing piece — agent-infra#1860.
+**Status: the DETECTION/reporting half is now CLOSED too (agent-infra#1986), inside the tracked
+watchdog.** The paragraph that used to sit here said *"a watchdog that runs `enable` + `bootstrap`
+when the label is absent, and reports it, is the missing piece — agent-infra#1860"*. The gap it named
+was measured: on 2026-10-17 the label was disabled twice more *during that PR's own review* by agent
+sessions running the pre-#1975 flow from other checkouts, and both times a human reading
+`launchctl print` found it, not an instrument — `KeepAlive`/`RunAtLoad` relaunch a job that EXITS,
+which is not the same state as one launchd no longer has. That arm now
+lives in the ONE tracked watchdog, `scripts/orchestrator-harness/watchdog-loop.sh` (launchd job
+`com.eldato.controller-watchdog`, `StartInterval` 300; the cell timer runs the same file):
+
+| state, MEASURED with `launchctl print` in **both** `gui/` and `user/` | the ONE verb the loop issues |
+|---|---|
+| loaded (rc 0) | `launchctl kickstart -k gui/<uid>/<label>` — the wedge cure it always had |
+| **REMOVED** (absent from every domain) | `launchctl enable` then `launchctl bootstrap gui/<uid> <plist>` — the state `KeepAlive` cannot reach, and the one a routine `-w`/`bootout` flow leaves behind |
+| **UNREADABLE** (`Bad request.`, a silent non-zero read) | `kickstart` only — never a bootstrap, because that action must not re-load a job that may exist |
+| REMOVED **with no plist on disk** | nothing; `verdict=RESTART-UNAVAILABLE` names the install that renders it |
+
+⛔ IT IS NOT A SECOND AGENT, AND THAT IS THE WHOLE POINT. A second launchd watchdog was proposed and
+reviewed (#1986) and the review rejected it on this repo's own recorded decision: `templates/launchd/RETIRED`
+(#2303) retires the hand-provisioned `com.eldato.orchestrator-watchdog` **because two loaded watchdogs
+are two MUTATING actors restarting one controller**, and `docs/ops/fleet-liveness.md` names
+`watchdog-loop.sh` as its replacement. The capability was folded into that file instead: one actor, one
+`controller-watchdog.streak` budget, no label for `install-launchd.sh`'s `retire_pass` to fight and no
+second plist for `install.sh` to render. Proven by `watchdog-loop.test.sh` §8b (a stubbed `uname` +
+`launchctl` argv log: REMOVED → `enable`+`bootstrap`, loaded → `kickstart -k`, unreadable →
+`kickstart`, no-plist → `RESTART-UNAVAILABLE`), which reddens on the pre-fold script.
 
 ### 6.5.7 The cell's own roles run on a schedule, not when someone looks
 

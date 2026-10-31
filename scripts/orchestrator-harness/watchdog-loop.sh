@@ -53,7 +53,12 @@
 # different datum and at a different cadence, and its whole safety comes from being bounded: one
 # restart per observation, a re-check afterwards, and a stop after N consecutive wedges.
 #
-# PLATFORM. macOS: the controller job is launchd's (`launchctl kickstart -k gui/<uid>/<label>`).
+# PLATFORM. macOS: the controller job is launchd's. WHICH launchd verb is MEASURED, not assumed:
+#   loaded  → `launchctl kickstart -k gui/<uid>/<label>` (cures a wedge)
+#   REMOVED → `launchctl enable` + `launchctl bootstrap gui/<uid> <plist>` (agent-infra#1986: KeepAlive
+#             cannot reach a job that is no longer in the domain, and `kickstart` fails for ever on it,
+#             so a controller launchd REMOVED is put back from the plist `install.sh` rendered)
+#   unreadable → `kickstart` (never a bootstrap: that action cannot double-load an existing job)
 # Linux cell: there is no launchd and no KeepAlive — a cell's controller is launched by
 # `cloud-cell-supervisor.sh start`, which is exactly the verb its own doctor role uses, so that is the
 # restart this file runs there. Neither branch is invented here; both are the box's existing owner.
@@ -72,6 +77,7 @@
 #   LABEL         macOS launchd label of the stack job (default: com.eldato.orchestrator-stack)
 #   SUPERVISOR    Linux restart verb (default: $O/cloud-cell-supervisor.sh, else this dir's sibling)
 #   WATCHDOG_STATE_DIR / WATCHDOG_LOG  state + decision log (default: $HOME/.pi/agent/state[/controller-watchdog.log])
+#   WATCHDOG_PLIST   the plist a REMOVED job is bootstrapped from (default: $HOME/Library/LaunchAgents/<LABEL>.plist)
 # ⛔ AN UNWRITABLE STATE DIR DISABLES RESTARTING, BY DESIGN. The cap is a count on disk; when it cannot
 # be kept, restarting is treated as EXHAUSTED and `PERSIST-FAILED` is logged on every pass THAT CAN BE
 # LOGGED — the decision log lives inside the state dir, so a fully unwritable dir loses it too and the
@@ -112,6 +118,10 @@ MAX_CONSEC="${MAX_CONSEC:-3}"; num_ok "$MAX_CONSEC" || MAX_CONSEC=3
 [ "$MAX_CONSEC" -ge 1 ] || { _bad="$_bad MAX_CONSEC=$MAX_CONSEC(<1)"; MAX_CONSEC=3; }
 
 STATE_DIR="${WATCHDOG_STATE_DIR:-$HOME/.pi/agent/state}"
+# The plist a REMOVED job is re-loaded from. `install.sh` renders it to this exact path (`$HOME`,
+# resolved from the passwd database, is the only place launchd reads from), so the watchdog never
+# invents a second install location: an absent plist is REPORTED (RESTART-UNAVAILABLE), not guessed at.
+PLIST_PATH="${WATCHDOG_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
 LOG="${WATCHDOG_LOG:-$STATE_DIR/controller-watchdog.log}"
 STREAK_FILE="$STATE_DIR/controller-watchdog.streak"
 CRASH_FILE="$STATE_DIR/controller-watchdog.crash"
@@ -285,6 +295,41 @@ controller_pid() {
 }
 
 # ── the restart, per platform. ONE verb, the box's own owner ─────────────────────────────────────
+# launchd_job_state — is the controller's launchd job IN the domain? 0 = loaded, 1 = absent from every
+# domain, 2 = UNKNOWN (the read established nothing).
+# ⛔ WHY THIS EXISTS AT ALL (agent-infra#1986): a REMOVED job is not a crashed one, and `kickstart`
+# cannot put one back. Measured five times on 2026-10-17 — a persistent-disable verb, or a `bootout`
+# whose `bootstrap` then failed, leaves `Setting service … to disabled` → `removing service`: the job
+# is no longer in the domain, `KeepAlive` cannot reach it, the controller simply stops dispatching,
+# and nothing logs an error the fleet can see. `launchctl kickstart -k` on such a label exits
+# non-zero for ever, so the ONE restart this file issues — bounded by the shared on-disk budget —
+# would never restore it. The capability therefore lives HERE, in the tracked agent, and not in a
+# second launchd job: `templates/launchd/RETIRED` retired the hand-provisioned
+# `com.eldato.orchestrator-watchdog` precisely because two loaded watchdogs are two MUTATING actors
+# on one controller, and `docs/ops/fleet-liveness.md` names `watchdog-loop.sh` as its replacement.
+# ⛔ `launchctl print`, NOT `launchctl list <label>`: the repo pins `print` against a captured real
+# block (`pid =` / `last exit code =`), while two shipped files disagree about what `list <label>`
+# prints on current macOS.
+# ⛔ BOTH DOMAINS, because a job loaded from an SSH session lives in `user/`, so a `gui/`-only read
+# would call a RUNNING controller "not loaded" and issue a bootstrap over it.
+# ⛔ A DOMAIN-LEVEL REJECTION (`Could not find domain …`) means that domain cannot hold the job — not
+# that the read failed — so it continues to the next domain. A bare `Bad request.` is launchd
+# rejecting the REQUEST, which is UNKNOWN (2) and NEVER "absent": deciding a mutation from an error
+# message is how a healthy job gets re-bootstrapped underneath a live controller.
+launchd_job_state() {
+  local d out rc unknown=""
+  for d in "gui/$(id -u)" "user/$(id -u)"; do
+    out="$(launchctl print "$d/$LABEL" 2>&1)"; rc=$?
+    [ "$rc" -eq 0 ] && { printf '0\n'; return 0; }
+    case "$out" in
+      *"Could not find service"*|*"not find service"*|*"service not found"*) continue ;;
+      *"Could not find domain"*) continue ;;
+      *) unknown=1 ;;
+    esac
+  done
+  if [ -n "$unknown" ]; then printf '2\n'; return 0; fi
+  printf '1\n'
+}
 restart_stack() {
   local rc=0
   if [ -n "${WATCHDOG_RESTART_CMD:-}" ]; then
@@ -305,7 +350,25 @@ restart_stack() {
   case "$(uname -s 2>/dev/null)" in
     Darwin)
       if ! command -v launchctl >/dev/null 2>&1; then rc=127
-      else launchctl kickstart -k "gui/$(id -u)/$LABEL" >>"$LOG" 2>&1 || rc=$?; fi ;;
+      else
+        # ONE restart, but WHICH verb depends on a MEASURED state — see launchd_job_state above. A
+        # loaded job takes the wedge-curing `kickstart -k`; a job launchd has REMOVED is re-enabled
+        # (a `-w` unload leaves a persistent Disabled override, and `bootstrap` of a disabled label is
+        # a no-op that can still exit 0) and then `bootstrap`ed from its plist. An UNKNOWN read takes
+        # the kickstart: it is the action that cannot double-load a job that exists, and refusing to
+        # act on an unreadable state is exactly how the measured hour was spent.
+        case "$(launchd_job_state)" in
+          1)
+            if [ -f "$PLIST_PATH" ]; then
+              launchctl enable "gui/$(id -u)/$LABEL" >>"$LOG" 2>&1 || true
+              launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" >>"$LOG" 2>&1 || rc=$?
+            else
+              rc=127
+              log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=$LABEL is NOT loaded and no $PLIST_PATH exists — there is nothing to bootstrap; run scripts/orchestrator-harness/install.sh"
+            fi ;;
+          *) launchctl kickstart -k "gui/$(id -u)/$LABEL" >>"$LOG" 2>&1 || rc=$? ;;
+        esac
+      fi ;;
     *)
       # ⛔ NOT a second launcher and NOT a systemd unit invented here: on a cell the controller is
       # started by the cell supervisor, and `start` is the SAME verb the doctor role runs to bring
