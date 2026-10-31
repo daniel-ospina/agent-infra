@@ -159,6 +159,11 @@ SCRIPT_NAME="reap-lane-venvs.sh"
 ISSUE_REF="#1932"
 TAB="$(printf '\t')"
 
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 2>/dev/null || true)}"
+# The sibling probe, resolved beside this script: both are `fleet_srcs`, so a cell runs them from
+# $DEST/scripts and a repo-relative pointer would not resolve where this line is actually read.
+VENV_REAL_BIN="${VENV_REAL_BIN:-$(dirname "${BASH_SOURCE[0]}")/venv-real-cost.py}"
+
 PS_BIN="${PS_BIN:-/bin/ps}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
 TMUX_BIN="${TMUX_BIN:-tmux}"
@@ -177,6 +182,9 @@ REAP_VENV_CWD_TIMEOUT="${REAP_VENV_CWD_TIMEOUT:-20}"
 REAP_VENV_TMUX_TIMEOUT="${REAP_VENV_TMUX_TIMEOUT:-15}"
 REAP_VENV_GIT_TIMEOUT="${REAP_VENV_GIT_TIMEOUT:-20}"
 REAP_VENV_REMOVE_TIMEOUT="${REAP_VENV_REMOVE_TIMEOUT:-120}"
+# The hard-link-aware cost walk (#2159). Bounded like every other probe; on timeout the reading is
+# UNKNOWN (`?`), never a partial number.
+REAP_VENV_VENV_COST_TIMEOUT="${REAP_VENV_VENV_COST_TIMEOUT:-60}"
 REAP_VENV_ALLOW_DEGRADED_CWD="${REAP_VENV_ALLOW_DEGRADED_CWD:-0}"
 # The `/proc` fallback's root. A TEST SEAM (nothing in production sets it): the degraded-cwd branch
 # below is unreachable on Linux unless `/proc` can be made to look absent, and an unreachable
@@ -215,6 +223,11 @@ DF_BEFORE=""
 # "zero" or "fine".
 LANES_LIVE=0
 LANE_VENV_KB_MAX=0
+# The hard-link-aware readings (#2159). Every one of them is `?`/`unknown` when unmeasurable —
+# never 0, which would read as "free".
+LANE_VENV_REAL_KB_MAX=0
+VENV_DEDUPE="unknown"
+VENV_DEGRADED=0
 CAPACITY_FLOOR_OK="unknown"
 # The floor ACTUALLY asserted by the pass (validated, defaulted). The audit row must carry this, not the
 # raw environment value: with `REAP_VENV_FREE_FLOOR_MB=abc` the comparison uses 2048 and an operator
@@ -856,6 +869,36 @@ venv_newest_mtime() {
 }
 
 du_kb() { "$DU_BIN" -sk "$1" 2>/dev/null | awk 'NR==1 {print $1}'; }
+
+# venv_real_cost <path> — the HARD-LINK-AWARE cost of one env (#2159), as
+# "private_kb<TAB>fair_kb<TAB>total_kb<TAB>dedupe", or "" when it cannot be measured.
+#
+# ⛔ WHY A SECOND NUMBER, WHEN `du` ALREADY RUNS. `du` answers "how many blocks are under this
+# path"; it does NOT answer "how many bytes does a lane cost the filesystem". Where `uv` links
+# packages out of its cache they diverge by more than an order of magnitude, and the headroom
+# arithmetic below was built on the first question. MEASURED on cell-1 (2026-10-31, tortoise):
+#     du -sk <wt>/.venv   5,940,904 KB
+#     private blocks         101,404 KB   <- what reaping it actually frees
+# and the SAME checkout held an env with 5,935,940 private KB (nlink==1 throughout: hardlinking
+# had degraded to a full copy). So the two classes are 58x apart and `du` cannot tell them apart.
+#
+# ⛔ THE HEADROOM DIVISOR IS *NOT* CHANGED TO THIS VALUE. `du` is the UPPER BOUND — sound for a cold
+# cache, which is exactly the case a lane that follows this one lands in — so it remains the gate.
+# What this adds is the measurement the bound was hiding: `lane_venv_real` names the real marginal
+# cost, and `venv_dedupe=degraded` names the class that genuinely does cost the full figure. A
+# reader can then see a box that is 20x less full than `du` implies WITHOUT the pass becoming
+# optimistic about a cache it cannot prove is warm.
+venv_real_cost() {
+    [ -n "${PYTHON_BIN:-}" ] && [ -r "${VENV_REAL_BIN:-}" ] || return 1
+    # ⛔ BOUNDED LIKE EVERY OTHER PROBE (#2159 review, P2). This walk touches the filesystem, and a
+    # stale or unresponsive mount blocks it — an unbounded probe inside the reaper turns "the pass is
+    # slow" into "the pass never returns", which is the failure mode `run_bounded` exists for. The
+    # watchdog kills it and the rc is non-zero, so the caller reads `?`/`unknown` rather than a number.
+    local out
+    out="$(bound_file costout)" || return 1
+    run_bounded "$REAP_VENV_VENV_COST_TIMEOUT" "$out" "$PYTHON_BIN" "$VENV_REAL_BIN" --tsv "$1" || return 1
+    awk -F"$TAB" 'NF==4 && $1 ~ /^[0-9]+$/ {print; found=1} END {exit !found}' "$out"
+}
 df_free_kb() { "$DF_BIN" -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4}'; }
 
 # ── classification ───────────────────────────────────────────────────────────────────────────
@@ -1111,6 +1154,20 @@ report_row() {
     # The per-lane figure the headroom below divides by: the LARGEST env this pass saw, so the answer
     # is "how many lanes fit if they are all this expensive" rather than an average that under-budgets.
     is_pos_int "${kb:-}" && [ "$kb" -gt "$LANE_VENV_KB_MAX" ] && LANE_VENV_KB_MAX="$kb"
+    # The real cost of THIS env (#2159). Measured per row, not derived: the private-block count is
+    # the one number `du` cannot produce, and it is what separates a 99 MB env from a 5.6 GB one
+    # that `du` prices identically. Tracked as a MAX over the pass, like the `du` figure above, so
+    # the reported per-lane cost is the worst env seen rather than a mean.
+    if [ -d "$path/.venv" ] && real_row="$(venv_real_cost "$path/.venv")"; then
+        real_priv="${real_row%%$TAB*}"; real_rest="${real_row#*$TAB}"
+        real_dedupe="${real_rest##*$TAB}"
+        is_pos_int "$real_priv" && [ "$real_priv" -gt "$LANE_VENV_REAL_KB_MAX" ] && LANE_VENV_REAL_KB_MAX="$real_priv"
+        case "$real_dedupe" in
+            degraded) VENV_DEGRADED=$((VENV_DEGRADED + 1)); VENV_DEDUPE="degraded" ;;
+            ok) [ "$VENV_DEDUPE" = "degraded" ] || VENV_DEDUPE="ok" ;;
+            *)  : ;;
+        esac
+    fi
     if [ "$verdict" = reap ]; then
         REAPABLE=$((REAPABLE + 1))
         is_pos_int "$kb" && DU_KB=$((DU_KB + kb))
@@ -1215,10 +1272,18 @@ report_capacity() { # report_capacity <free_kb_after>
             [ "$free_mb" -gt "$floor" ] && headroom=$(( (free_mb - floor) / per_lane_mb ))
         fi
     fi
-    log_line "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
+    # The real-cost pair (#2159): `lane_venv_real` is the LARGEST private-block count seen (what
+    # reaping one such env actually frees), and `venv_dedupe` says whether this box's link regime is
+    # in force. `?`/`unknown` when the probe could not run — never 0.
+    local real_mb="?"
+    if [ "${LANE_VENV_REAL_KB_MAX:-0}" -gt 0 ]; then
+        real_mb=$((LANE_VENV_REAL_KB_MAX / 1024))
+        [ "$real_mb" -ge 1 ] || real_mb=1
+    fi
+    log_line "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB lane_venv_real=${real_mb}MB venv_dedupe=$VENV_DEDUPE venv_degraded=$VENV_DEGRADED free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
     [ -n "$why" ] && log_line "[$SCRIPT_NAME] capacity: $why"
-    log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
-        "$LANES_LIVE" "${per_lane_mb:-}" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
+    log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tlane_venv_real_mb=%s\tvenv_dedupe=%s\tvenv_degraded=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
+        "$LANES_LIVE" "${per_lane_mb:-}" "${real_mb}" "$VENV_DEDUPE" "$VENV_DEGRADED" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
     CAPACITY_FLOOR_OK="$floor_ok"
     CAPACITY_FLOOR_MB="$floor"
     return 0

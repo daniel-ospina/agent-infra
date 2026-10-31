@@ -153,17 +153,20 @@ summarised, so there is no `free_after`, no `floor_ok` and no headroom to report
 the log (`FAIL-CLOSED abort: …`) and removes nothing; it never reports a floor it did not measure.
 
 ```
-capacity: lanes_live=K lane_venv_max=M MB free_after=F MB floor=L MB floor_ok=yes|no|unknown lanes_headroom=N
+capacity: lanes_live=K lane_venv_max=M MB lane_venv_real=R MB venv_dedupe=ok|degraded|unknown venv_degraded=C free_after=F MB floor=L MB floor_ok=yes|no|unknown lanes_headroom=N
 ```
 
 | field | kind | meaning |
 |---|---|---|
 | `lanes_live` | MEASURED | lane **envs** this pass KEPT because a live holder was found — a count of retained envs, **not** of worktrees: a live worktree with no `.venv` yet produces no row and is not counted |
 | `lane_venv_max` | MEASURED | the LARGEST lane env this pass saw — the worst case, never the mean. Its representativeness is only as good as the sample: a PARTIALLY-synced env is small and inflates `lanes_headroom`. The divisor is printed so a reader can reject the quotient |
+| `lane_venv_real` | MEASURED | the LARGEST **private-block** count (files with `nlink == 1`) this pass saw — the bytes that actually vanish when such an env is reaped. `?` when the probe could not run. ⛔ **It is REPORTED, never the divisor** — see the next row |
+| `venv_dedupe` | MEASURED | `ok` / `degraded` / `unknown`: whether this box's hardlink-sharing regime is in force for the envs **seen in this pass** (pre-removal — a dead env this pass reaps is still counted). `degraded` means an env is paying its full `du` size, i.e. `UV_CACHE_DIR` is likely on another filesystem or `UV_LINK_MODE` is unset |
+| `venv_degraded` | MEASURED | how many envs in this pass were `degraded` — the count, not a ratio, so one legacy env cannot be averaged away |
 | `free_after` | MEASURED | filesystem free space after the pass |
 | `floor` | STATED | `REAP_VENV_FREE_FLOOR_MB` (default 2048 = one measured lane env, ~1.85 GB) |
 | `floor_ok` | ASSERTED | `yes` / `no` / `unknown`. **`unknown` is never read as satisfied** — a `df` that cannot answer is never read as "enough", and the line names it and names why. It does **not** change the exit code: an unmeasurable `df` is not evidence of a *breach* (that is `no`, which exits 5). **Read `floor_ok`, never the pass's rc, as the floor verdict** |
-| `lanes_headroom` | DERIVED | `(free_after - floor) / lane_venv_max`, floored at 0; `?` when an input is unreadable — never a fabricated number |
+| `lanes_headroom` | DERIVED | `(free_after - floor) / lane_venv_max`, floored at 0; `?` when an input is unreadable — never a fabricated number. ⛔ It divides the **`du` upper bound on purpose** (#2159): a headroom computed from the warm-cache `lane_venv_real` would over-admit the first time the cache was missing. `lane_venv_real` is reported beside the bound, never substituted for it |
 
 A pass that ends **below the floor exits 5** — **unless a removal also FAILED, in which case it exits 4**
 (the severity order is 3 abort > 4 removal failed > 5 over-bound). The capacity line still reads
@@ -257,3 +260,60 @@ cell, `REAP_VENV_LOG` defaults to `$HOME/.pi/agent/state/reap-lane-venvs.log`.
 * **`lanes_headroom` divides by the largest env seen in THAT pass.** A pass over a repo
   with no lane venv at all prints `?` rather than assuming a size: a headroom number
   invented from a default is the same lie as a `du` figure quoted as reclaimed space.
+
+## The real cost of an env, and the retention rule (#2159)
+
+`du` answers *"how many blocks are under this path"*. It does **not** answer *"how many bytes does a
+lane cost the filesystem"*, and where `uv` links packages out of its cache the two diverge by more
+than an order of magnitude. The capacity arithmetic inherited the first question.
+
+**MEASURED on cell-1, 2026-10-31** (tortoise checkout, `uv sync --extra embeddings --extra parity`,
+`UV_LINK_MODE=hardlink`, 12 GB `uv` cache on the same filesystem):
+
+| reading | value | question it answers |
+|---|---|---|
+| `du -sk <wt>/.venv` | 5,940,904 KB | every block under the tree — an **upper bound** |
+| private blocks (`nlink == 1`) | 101,404 KB | what **reaping it actually frees** |
+| three fresh worktrees, `df` delta | 880,408 KB total (~293 MB each, ~4–144 MB of it the venv) | what the filesystem **actually spent** |
+| files hardlinked to the cache | 249 / 300 sampled (`nlink` 5–6) | whether sharing is in force |
+| one env in the same checkout | 5,935,940 private KB, `nlink == 1` throughout | the **degraded** class |
+
+So a live lane env that `du` prices at 5.66 GB can cost **99 MB of real disk**, and the *same*
+checkout held an env costing the **full 5.66 GB** because hardlinking had degraded to a copy. The two
+classes are **58× apart** and `du` cannot tell them apart. `uv`'s own default is `clone` on
+macOS/Linux (`hardlink` is the Windows default), and hardlinking degrades silently to a full copy
+when the cache lives on another filesystem — which is why this is a *state to be measured*, not an
+assumption to be made.
+
+### What the reaper now reports
+
+The capacity line carries three new keys, all MEASURED per env, `?`/`unknown` when unmeasurable
+(never `0`, which would read as "free"):
+
+- `lane_venv_real=<MB>` — the largest **private-block** count seen: the bytes that vanish when that
+  env is reaped.
+- `venv_dedupe=ok|degraded|unknown` and `venv_degraded=<count>` — whether this box's link regime is
+  in force, and how many envs are paying the full price.
+
+⛔ **`lane_venv_max` (the `du` figure) remains the headroom divisor, deliberately.** It is the
+cold-cache upper bound, and a box that dispatches against a *warm*-cache number would over-admit the
+first time the cache was missing. The real figure is **reported beside** the bound, not substituted
+for it: a reader can now see a box that is ~20× less full than `du` implies without the pass becoming
+optimistic about a cache it cannot prove is warm. Implementation: `scripts/venv-real-cost.py`
+(tested by `scripts/venv-real-cost.test.sh`, whose assertions are mutation-checked — zeroing private
+bytes, forcing the verdict, and following symlinks each turn it red).
+
+### Retention rule — what keeps this from refilling
+
+1. **A `.venv` is still per-worktree, and that is not changed.** File-level hardlinks are not a
+   shared environment: no lane's `uv sync` can rewrite another's site-packages, and the recorded
+   rejection of a machine-wide shared env (above) stands. Isolation survives; only the *bytes* are
+   shared.
+2. **`UV_CACHE_DIR` must stay on the same filesystem as the worktrees.** Cross-filesystem linking
+   falls back to a full copy — a 58× regression per env. `venv_dedupe=degraded` is how a box says so.
+3. **`UV_LINK_MODE` is never unset on a cell.** The default is `clone`, which only shares on
+   reflink-capable filesystems; on ext4 it is a full copy.
+4. **The `uv` cache is still never deleted** (above): deleting it re-spends the space as duplicated
+   venvs *and* destroys the sharing that makes them cheap.
+5. **A degraded env is reported, not silently reclaimed** — it belongs to a lane like any other; the
+   reaper's liveness contract governs removal, and its size governs only the report.

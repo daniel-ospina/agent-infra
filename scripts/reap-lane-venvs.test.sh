@@ -181,6 +181,28 @@ printf '%s\t%s\n' "${FAKE_DU_KB:-2097152}" "$last"
 SHIM
 chmod +x "$T/bin/df" "$T/bin/du"
 
+# `PYTHON_BIN` shim — stands in for the hard-link-aware probe (#2159) so the capacity line is asserted
+# rather than measured. It is invoked as `$PYTHON_BIN $VENV_REAL_BIN --tsv <path>`, so it ignores the
+# script argument and answers from a table exactly like the `du` shim above: `<path-substring><TAB>
+# <private_kb><TAB><fair_kb><TAB><total_kb><TAB><dedupe>`. A table is what makes "the LARGEST private
+# count, never the last or the mean" DISCRIMINATING — with one value for every path, largest-of,
+# first-seen, last-seen and mean all print the same number and the suite cannot tell them apart.
+# `FAKE_VENV_COST_FAIL` models a box with no python: the probe must then read UNKNOWN, never 0.
+cat > "$T/bin/venv-cost" <<'SHIM'
+#!/usr/bin/env bash
+echo "fake-python $*" >/dev/null
+[ -n "${FAKE_VENV_COST_FAIL:-}" ] && { echo "fake-python: no such helper" >&2; exit 1; }
+for a in "$@"; do last="$a"; done
+if [ -n "${FAKE_VENV_COST_TABLE:-}" ] && [ -f "$FAKE_VENV_COST_TABLE" ]; then
+    while IFS="$(printf '\t')" read -r pat priv fair total dedupe; do
+        [ -n "$pat" ] || continue
+        case "$last" in *"$pat"*) printf '%s\t%s\t%s\t%s\n' "$priv" "$fair" "$total" "$dedupe"; exit 0 ;; esac
+    done < "$FAKE_VENV_COST_TABLE"
+fi
+printf '%s\t%s\t%s\t%s\n' "${FAKE_VENV_PRIV:-102400}" "${FAKE_VENV_FAIR:-825364}" "${FAKE_VENV_TOTAL:-5940900}" "${FAKE_VENV_DEDUPE:-ok}"
+SHIM
+chmod +x "$T/bin/venv-cost"
+
 # run_shimmed <args…> — the reaper with the three liveness shims, the capacity shims and a throwaway
 # log; prints stdout+stderr. Extra `VAR=value` words before the flags become the environment of the ONE
 # invocation (the shims).
@@ -726,7 +748,7 @@ run_cap() {
         case "$1" in *=*) envs+=("$1"); shift ;; *) break ;; esac
     done
     PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" TMUX_BIN="$T/bin/tmux" \
-    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_FREE_FLOOR_MB=2048 \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" PYTHON_BIN="$T/bin/venv-cost" REAP_VENV_FREE_FLOOR_MB=2048 \
     REAP_VENV_LOG="$T/reap-cap.log" \
     env "${envs[@]}" bash "$REAPER" "$@" 2>&1
 }
@@ -782,7 +804,7 @@ printf 'dead\t1048576\nlive1\t4194304\nlive2\t2097152\n' > "$T/du-h.tsv"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DU_TABLE="$T/du-h.tsv" --gc --repo "$RH")"; rc=$?
 # Exact full-line pin: a bare `lanes_headroom=2` would be satisfied by `lanes_headroom=2048` (a real
 # wrong answer when the units are misread), so assert the whole capacity line instead.
-assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
+assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB lane_venv_real=100MB venv_dedupe=ok venv_degraded=0 free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
     "the LARGEST env drives the line: 4096MB, not first=1024/last=2048/mean~2389, headroom=(10240-2048)/4096=2"
 assert_eq "$rc" "0" "the mixed-size pass exits 0"
 
@@ -794,11 +816,43 @@ echo " H5b ORDER-INDEPENDENCE: the LARGEST lane is found whatever order discover
 # and last-seen cannot satisfy both.
 printf 'dead\t1048576\nlive1\t2097152\nlive2\t4194304\n' > "$T/du-h2.tsv"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DU_TABLE="$T/du-h2.tsv" --gc --repo "$RH")"; rc=$?
-assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
+assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB lane_venv_real=100MB venv_dedupe=ok venv_degraded=0 free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
     "the largest lane is found with the sizes swapped too (same exhaustive line)"
 assert_eq "$rc" "0" "the swapped-size pass exits 0"
 
-echo " H6 a reaped pass still asserts the floor AND the removal is not undone by it"
+echo " H5c the REAL (hard-link-aware) cost is the LARGEST private count — not the last, not the mean (#2159)"
+# The defect this section exists for: `du` prices a hardlinked env at its full tree size (5.66 GB) and
+# a private copy at the SAME number, so the two classes are indistinguishable and the box looks ~20x
+# fuller than it is. `lane_venv_real` is the private-block count — the bytes that VANISH on reaping.
+# Discriminating table: private sizes 1024/4096/2048-ish KB in an order where largest-of, first-seen,
+# last-seen and mean all differ. `git worktree list` order is not a contract, so the pair below (largest
+# on the OTHER live lane) makes first-seen/last-seen fail at least one run.
+printf 'dead\t1024\t2000\t5940900\tdegraded\nlive1\t4194304\t5000000\t5940900\tok\nlive2\t2048\t3000\t5940900\tok\n' > "$T/vc-h.tsv"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_TABLE="$T/vc-h.tsv" --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=4096MB" "the LARGEST private count drives the line (4096, not last=2 or mean~1367)"
+assert_contains "$out" "venv_degraded=1" "the one degraded class is COUNTED, not averaged away"
+assert_contains "$out" "venv_dedupe=degraded" "one degraded env makes the pass's dedupe verdict degraded (fail-loud, not 'mostly ok')"
+# ⛔ THE `du` DIVISOR MUST NOT MOVE. The real cost is REPORTED beside it and never replaces it: `du` is
+# the cold-cache upper bound, and a headroom computed from the warm-cache number would dispatch lanes a
+# box cannot hold the first time the cache is missing (a fail-OPEN on the one line that gates dispatch).
+assert_contains "$out" "lane_venv_max=2048MB" "the du divisor is unchanged — the real cost is reported, never substituted"
+assert_contains "$out" "lanes_headroom=4" "headroom still divides the UPPER BOUND (10240-2048)/2048, so it cannot over-admit"
+assert_eq "$rc" "0" "a degraded-dedupe pass still completes"
+
+printf 'dead\t1024\t2000\t5940900\tok\nlive1\t2048\t3000\t5940900\tok\nlive2\t4194304\t5000000\t5940900\tok\n' > "$T/vc-h2.tsv"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_TABLE="$T/vc-h2.tsv" --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=4096MB" "the largest private count is found with the sizes swapped too (order-independent)"
+assert_contains "$out" "venv_degraded=0" "no degraded env in this table"
+
+echo " H5d an unmeasurable probe reads UNKNOWN, never 0 (#2159)"
+# A `0` here would read as "a lane env is free", which is the exact over-admission this line exists to
+# prevent. A box with no python3 is a real host state (a fresh cell before setup), so it is modelled.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_FAIL=1 --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=?" "an unmeasurable real cost is printed as ?, not as 0"
+assert_contains "$out" "venv_dedupe=unknown" "and the dedupe verdict is unknown, never 'ok'"
+assert_eq "$rc" "0" "an unmeasurable probe does not fail the pass (nothing was mis-deleted)"
+
+ echo " H6 a reaped pass still asserts the floor AND the removal is not undone by it"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" --gc --repo "$RH" --apply)"; rc=$?
 assert_contains "$out" "reaped=1" "the dead lane's env was reaped"
 assert_contains "$out" "capacity: lanes_live=2 " "the capacity line is printed on an ARMED pass too"
