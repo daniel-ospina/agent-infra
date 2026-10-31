@@ -3419,24 +3419,41 @@ next step of merging. Do the work:
 #
 # ⚠️ STATED RESIDUAL, not a hidden one: on a box with exactly ONE `brief-gate.sh`, that copy's opinion
 # is the only opinion available (it is both renderer and validator, so it admits itself). The ladder
-# below is what breaks that circle on a real box -- `spawn-gate.sh` resolves the same four roots, so a
-# box always has more than one copy once the farm is installed.
+# below is meant to break that circle, but ⛔ DO NOT ASSUME IT DOES ON A GIVEN BOX: measured 2026-10-27
+# on the deployed harness, the ladder resolved exactly ONE copy (the farm carried 149 scripts and NO
+# `brief-gate.sh`, and neither pr-doctor LaunchAgent exported `AGENT_INFRA_PATH`), which is what
+# `admitted by 1 validator(s)` reports. More than one rung exists only where a second copy is actually
+# installed; until then the provenance line is the only thing that says the circle is unbroken.
 #
 # ⛔ WHY CROSS-GRADING CANNOT OVER-BLOCK (asked and answered, because it is the obvious objection).
 # The measured drift is STALENESS, and staleness is MONOTONE: an old contract is a SUBSET of the new
 # one (a missing `CONTRADICTION TEST:` line, a missing field), so the OLD validator accepts the NEW
 # section -- it only insists on the labels it knows -- while the NEW validator refuses the OLD section.
-# Requiring every resolvable gate that can GRADE to accept therefore reds in exactly one direction:
-# the stale one. It cannot refuse a fresh contract for being fresh. A copy that cannot grade at all is
-# neither an admittance nor a refusal (see `_section_admitted`'s three outcomes) -- it simply does not
-# get a vote, which is what stops one half-written copy from blanking the contract for every brief. A copy that refuses a section over a RENAMED or
-# REMOVED label is a real format split, and a brief it would refuse is a brief that some dispatch WILL
-# refuse -- which is why the polarity stays fail-closed rather than trusting whichever copy ran first.
+# Requiring every resolvable gate that can GRADE to accept reds in exactly one direction: the stale
+# one. It cannot refuse a fresh contract for being fresh, because staleness is monotone. A copy that
+# cannot grade at all is neither an admittance nor a refusal (see `_section_admitted`'s three
+# outcomes) -- it simply does not get a vote, which is what stops one half-written copy from blanking
+# the contract for every brief.
+#
+# ⛔ STATED RESIDUAL, and it is the OVER-BLOCK direction, named rather than hidden. A refusal from ANY
+# rung that runs stops the splice, including a rung this dispatch would never resolve. That is
+# deliberate: the ladder cannot know which rung a FUTURE dispatch takes (it takes the FIRST existing
+# one, and a stale first rung self-admitting its own stale contract is precisely the measured defect
+# ARM 1 pins), so "the strictest copy that can run has a veto" is what stops a stale `$O` from
+# outvoting the rest. The price is a format-split copy further down -- typically the farm -- also
+# suspending the contract until it is redeployed. That fails CLOSED, and the log names the refusing
+# copy and its own words. ⛔ It is NOT a claim that every dispatch would refuse such a brief; the
+# wider ladder is wider on purpose, and the log does not assert the narrower effect.
 _RESEARCH_SECTION = None
-# The role `spawn-gate.sh::brief_gate_role` maps this file's spawn to. Its `case` maps an unrecognised
-# KIND (pr-doctor passes `prfix`) to `lane`, so `lane` is the role that will judge the brief -- grade
-# with the judge's role, not with the role this text happens to be rendered for.
-_BRIEF_GATE_ROLE = "lane"
+# The role this file's brief is judged with. `nonblocking-dispatch.sh:175` -- the dispatcher every
+# `prfix` worker goes through -- regrades the brief it is about to send with `worker`, and `--section`
+# above is rendered for `worker`, so `worker` is the judge's role. The choice is NOT load-bearing for
+# the verdict: `brief-gate.sh --check` is role-independent across the four declared roles (measured --
+# a shipped section exits 0, a section with no `CONTRADICTION TEST:` exits 80, for both `lane` and
+# `worker`; only an UNKNOWN role yields 78, and 78 is now ungradable rather than a refusal). Grading
+# with `lane` would therefore not admit anything `worker` refuses -- but stating that `lane` is "the
+# role that will judge the brief" was simply wrong, so it says `worker`.
+_BRIEF_GATE_ROLE = "worker"
 # What `--check` is handed: the section PLUS a minimal order. The gate's contract is about a BRIEF, and
 # a bare section is what it calls EMPTY/NO-FILE -- grading a fragment would test the wrong shape.
 _SECTION_PROBE = "\n## the order\n\nDo the work the section above describes.\n"
@@ -3475,7 +3492,7 @@ _GATE_UNGRADABLE_RCS = (2, 78, 126, 127)
 
 
 def _section_admitted(section: str, validators: list) -> tuple:
-    """(True, "") when a gate that COULD judge `section` ADMITS it and no gate that RAN refuses it.
+    """(True, "", n) when a gate that COULD judge `section` ADMITS it and no gate that RAN refuses it.
 
     Three outcomes, kept apart on purpose: a copy that RUNS and exits 0 ADMITS; a copy that runs and
     REFUSES is the answer, returned with the gate's own words so the log names the fix; a copy that
@@ -3483,6 +3500,8 @@ def _section_admitted(section: str, validators: list) -> tuple:
     veto the copies that can. What is NOT allowed is admitting on no verdict: when every copy is
     ungradable the contract is not spliced, and the reason says so -- an unreadable instrument is not an
     admittance (the polarity the measured nine-hour stall needs).
+
+    `n` is how many copies actually ADMITTED, so the log can say that rather than how many copies exist.
     """
     admitted, ungradable = 0, []
     for v in validators:
@@ -3503,11 +3522,11 @@ def _section_admitted(section: str, validators: list) -> tuple:
             ungradable.append("%s: exit %s, no verdict" % (v, out.returncode))
             continue
         return False, ("%s REFUSES the contract this copy would splice (exit %s) %s"
-                       % (v, out.returncode, said[:200]))
+                       % (v, out.returncode, said[:200])), admitted
     if admitted == 0:
         return False, ("no brief-gate.sh copy could GRADE the contract -- an ungradable copy is not an "
-                       "admittance (%s)" % ("; ".join(ungradable)[:300] or "no copy to grade with"))
-    return True, ""
+                       "admittance (%s)" % ("; ".join(ungradable)[:300] or "no copy to grade with")), 0
+    return True, "", admitted
 
 # ⛔ THE DELIVERY CONTRACT (#2981) IS THE OTHER HALF OF THE SAME LESSON, and it is the half this file
 # OWNS. Measured 2026-10-27/28: five `prfix` workers — the briefs THIS function composes — were all
@@ -3571,7 +3590,7 @@ def research_section() -> str:
             refused.append("%s: --section exited %s with %d bytes of text"
                            % (cand, out.returncode, len(section)))
             continue
-        ok, why = _section_admitted(section, paths)
+        ok, why, graded = _section_admitted(section, paths)
         if not ok:
             refused.append("%s: %s" % (cand, why))
             continue
@@ -3579,16 +3598,27 @@ def research_section() -> str:
         # ⛔ NAME THE COPY THAT RENDERED IT (agent-infra#2708). The measured 6h32m stall was a fix that
         # reached a copy the driver never resolves; with this line a reader of ONE pass can tell which
         # copy produced the contract instead of inferring it from the deploy scripts.
+        # ⛔ `graded`, NOT `len(paths)`: a copy that has no verdict did not admit anything, and reporting
+        # copies that merely EXIST made "1 renderer + 4 ungradable" (the self-admitting circle) read
+        # exactly like "5 agreeing validators" -- the R3 provenance claim would be false.
         log("brief: research contract rendered by %s and admitted by %d validator(s)"
-            % (cand, len(paths)))
+            % (cand, graded))
         return _RESEARCH_SECTION
-    log("brief: NO brief-gate.sh copy on this box renders a research contract the dispatch gates WILL "
-        "ADMIT -- every worker brief would be refused rc=80, so this pass splices none: %s"
+    # ⛔ THE EFFECT, STATED ACCURATELY. A refusing rung vetoes the splice even when the rung a dispatch
+    # would RESOLVE admits the contract (see the STATED RESIDUAL above), so this message must not claim
+    # "every worker brief would be refused rc=80" -- that is false in exactly that shape, and a log that
+    # asserts an effect it did not measure is the defect this file exists to remove. The reason string
+    # names what actually happened, with the refusing gate's own words.
+    log("brief: NO brief-gate.sh copy on this box rendered a research contract the dispatch ladder WILL "
+        "ADMIT -- this pass splices none, so the worker brief carries no research-first contract and no "
+        "pass can vouch for it: %s"
         % ("; ".join(refused)[:600] or "no brief-gate.sh on any resolved root"))
     # ⛔ A FAILURE IS NOT CACHED. Only a SUCCESS is. A one-off (an install mid-flight, a $O being
     # re-seeded) must not degrade every later brief in this process for ever — and a cached ""
     # is exactly the "fix that is not live" shape: the box would keep composing section-less briefs
-    # long after the validator appeared. The cost of not caching is one `bash` call per brief.
+    # long after the validator appeared. The cost of not caching is a `--section` render per candidate
+    # plus one `--check` per (candidate, validator) pair -- quadratic in the ladder length on a box where
+    # NO candidate is admitted, and the reason the success case returns early.
     return ""
 
 

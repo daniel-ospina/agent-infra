@@ -585,7 +585,7 @@ if [ "$MUTATIONS" -eq 1 ]; then
     stale_gate "$ORCH" new
     mkdir -p "$WORK/mut4"
     cp "$ROOT/scripts/objective.py" "$WORK/mut4/objective.py"
-    sed 's|^        ok, why = _section_admitted(section, paths)$|        ok, why = True, ""   # MUTANT: the pre-fix presence test|' \
+    sed 's|^        ok, why, graded = _section_admitted(section, paths)$|        ok, why, graded = True, "", len(paths)   # MUTANT: the pre-fix presence test|' \
         "$ROOT/scripts/pr-doctor.py" >"$WORK/mut4/pr-doctor.py"
     if cmp -s "$ROOT/scripts/pr-doctor.py" "$WORK/mut4/pr-doctor.py"; then
         bad "§4 --mutations: the acceptance line was not found, so the mutant IS the original file — stale proof, not evidence"
@@ -604,6 +604,12 @@ if [ "$MUTATIONS" -eq 1 ]; then
     # to go RED. Without this, ARM 4 could be passing on a fixture that never reached the ungradable
     # branch — the same vacuity the first mutation exists to rule out for ARM 1.
     mkdir -p "$WORK/mut4b"
+    # ⛔ THE SIBLING IS PART OF THE MUTANT. `mut4` copies `objective.py` and this block did not, so the
+    # probe died at `_brief_body` (`CLASSIFIER.REQUIRED`) and emitted ZERO bytes; `brief_probe` sends
+    # stderr to /dev/null, so the only signal was an empty brief and "no RESEARCH FIRST" read as PASS --
+    # the arm credited a mutant that never ran. A mutant fixture has to be as complete as the shipped
+    # file or its silence is indistinguishable from the effect it is supposed to prove.
+    cp "$ROOT/scripts/objective.py" "$WORK/mut4b/objective.py"
     sed 's|^        if out.returncode in _GATE_UNGRADABLE_RCS or not said:$|        if False:  # MUTANT: pre-fix — any non-zero is a refusal|' \
         "$ROOT/scripts/pr-doctor.py" >"$WORK/mut4b/pr-doctor.py"
     if cmp -s "$ROOT/scripts/pr-doctor.py" "$WORK/mut4b/pr-doctor.py"; then
@@ -612,8 +618,16 @@ if [ "$MUTATIONS" -eq 1 ]; then
         ungradable_gate "$ORCH"
         out_mut2="$(brief_probe "$WORK/mut4b/pr-doctor.py" "$ORCH")"
         brief_of "$out_mut2" "$WORK/brief-mut4b.txt"
-        if grep -q 'RESEARCH FIRST' "$WORK/brief-mut4b.txt"; then
+        # ⛔ TWO ASSERTS, and the second is what stops a CRASHED probe from passing: the mutant must
+        # both lose the contract AND say why. With the pre-fix acceptance restored the ungradable copy
+        # is reported as a REFUSER, so the log carries its words -- a 0-byte brief from a probe that
+        # died (`AttributeError`, a missing sibling, a syntax error) carries neither and reds here.
+        if [ "$(wc -c <"$WORK/brief-mut4b.txt")" -eq 0 ]; then
+            bad "§4 --mutations: the ungradable mutant's probe produced NO output at all — the fixture is broken, so the arm below would pass vacuously"
+        elif grep -q 'RESEARCH FIRST' "$WORK/brief-mut4b.txt"; then
             bad "§4 --mutations: with the pre-fix acceptance restored the contract was still spliced, so ARM 4 is not testing the ungradable branch"
+        elif ! log_of "$out_mut2" | grep -q 'REFUSES the contract this copy would splice'; then
+            bad "§4 --mutations: the mutant spliced nothing but never exercised the acceptance path (no REFUSES line) — the mutation did not land (log: $(log_of "$out_mut2" | tr '\n' ' ' | head -c 400))"
         else
             ok "§4 --mutations: with 'any non-zero is a refusal' restored, ONE ungradable copy blanks the contract — ARM 4 is LIVE"
         fi
