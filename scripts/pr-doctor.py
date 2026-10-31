@@ -1536,8 +1536,18 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
     out["alive"] = alive
     out["unknown"] = unknown
     out["total"] = out["fix"] + out["review"]
+    # ⛔ `capped` RECORDS WHETHER THE OVERRIDE ACTUALLY BOUND (review P1, 2026-10-31). Without it the
+    # NO SLOT arm had to infer the cause of a 0 AGGREGATE from the number alone, and `total == 0` has
+    # TWO causes: `--max` clamped it, or BOTH class budgets are already spent (`fix + review == 0` --
+    # the ordinary saturated fleet at the shipped MAX_FIX=3/MAX_REVIEW=3). The arm named `--max` for
+    # both, so a saturated pass sent the operator to a flag they never passed, while the `_noslot`
+    # figures appended to the same clause (`inflight=6 ...`) said nothing held a slot. The provenance
+    # is known HERE, so it is recorded here instead of guessed at the call site.
+    out["capped"] = False
     if total_override is not None:
-        out["total"] = min(out["total"], max(0, total_override))
+        _cap = max(0, total_override)
+        out["capped"] = _cap < out["total"]
+        out["total"] = min(out["total"], _cap)
     return out
 
 
@@ -5168,23 +5178,35 @@ def run_pass(args, rubric_note: str = "") -> int:
             _c = ACTION_CLASS.get(_a, "fix")
             _r2_by_class[_c] = _r2_by_class.get(_c, 0) + _n
     _r2 = sum(_r2_by_class.values())
-    # ⛔ rung 3 IS EVERY ROW THE PASS HELD, NOT TWO OF THEM (review P2, 2026-10-31). `running` and
-    # `unreadable` are the obvious holds, but `_finish` folds THREE MORE populations onto the SAME
-    # blindness axis (`blind = unread + blind_surface + blind_partial + blind_abandoned`) -- an
-    # unusable changed-file list is a held PR for a reason the operator must see. Leaving them out
-    # let this line print `wait=0 ... nothing to dispatch` while PRs sat held on precisely the
-    # unreadable classification it defines as rung 3: the same silence the block exists to remove,
-    # one population over. `surface` is NOT folded in (it is an ASK-USER, not blindness) and is
-    # issued as its own `surface=` term — and ⛔ `held=` APPEARS EXACTLY ONCE PER LINE, as the
-    # TERMINAL ARM's TOTAL `_r3 + _held`, never as the ASK-USER count alone (review P2, round 6). An
-    # earlier revision of this comment said surface was "not carried under `held=`" and then said,
-    # one clause later, that the arm below folds it in: a self-refuting banner is worse than no
-    # banner, because a maintainer could obey either half. What is guaranteed: `surface=` names the
-    # ASK-USER split, `wait=` names the blindness axis, and `held=` is their sum only in the arm
-    # that says so.
-    _r3 = sum(counts.get(k, 0)
-              for k in ("skipped-running", "skipped-unreadable", "skipped-surface_unreadable",
-                        "skipped-surface_partial", "skipped-surface_abandoned"))
+    # ⛔ rung 3 IS EVERY ROW ON THE BLINDNESS AXIS, NOT TWO OF THEM (review P2, 2026-10-31).
+    # `running` and `unreadable` are the obvious holds, but `_finish` folds THREE MORE populations
+    # onto the SAME blindness axis (`blind = unread + blind_surface + blind_partial +
+    # blind_abandoned`) -- an unusable changed-file list is a held PR for a reason the operator must
+    # see. Leaving them out let this line print `wait=0 ... nothing to dispatch` while PRs sat held
+    # on precisely the unreadable classification it defines as rung 3: the same silence the block
+    # exists to remove, one population over.
+    # ⛔ AND THE THREE ARE NAMED SEPARATELY, BECAUSE THE PER-PR LINE CALLS THEM ASK-USER (review P1,
+    # 2026-10-31). The same pass logs `ASK-USER #<n> (...) -- a human decides` for each of them (the
+    # `surface_partial` / `surface_unreadable` / `surface_abandoned` arms above), and a 100+-file
+    # page never clears by waiting at all -- yet a bare `wait=` folded them into "the chain is on
+    # rung 3", which is the frame that says nothing needs doing. They STAY on the blindness axis
+    # (`_finish`'s `blind`, agent-infra#2136 r2 -- reclassifying them would REVERSE that recorded
+    # decision, so it is not done here); `filelist=` instead DECOMPOSES the axis, so the
+    # human-decision part of the wait is visible rather than renamed away.
+    # ⛔ `skipped-surface` IS NOT FOLDED IN: it is an ASK-USER, not blindness, and is issued as its
+    # own `surface=` term — and ⛔ `held=` APPEARS EXACTLY ONCE PER LINE, as the TERMINAL ARM's
+    # TOTAL `_r3 + _held`, never as the ASK-USER count alone (review P2, round 6). An earlier
+    # revision of this comment said surface was "not carried under `held=`" and then said, one
+    # clause later, that the arm below folds it in: a self-refuting banner is worse than no banner,
+    # because a maintainer could obey either half. What is guaranteed: `surface=` names the
+    # SDK-surface ASK-USER split, `wait=` names the whole blindness axis, `filelist=` the
+    # unusable-changed-file-list part of it (a human decides), and `held=` is the arm's total only
+    # in the arm that says so.
+    _r3_wait = sum(counts.get(k, 0) for k in ("skipped-running", "skipped-unreadable"))
+    _r3_files = sum(counts.get(k, 0)
+                    for k in ("skipped-surface_unreadable", "skipped-surface_partial",
+                              "skipped-surface_abandoned"))
+    _r3 = _r3_wait + _r3_files      # the same axis `_finish` calls `blind`
     _held = counts.get("skipped-surface", 0)   # ASK-USER: held for a HUMAN, not for a re-read
     # ⛔ RUNG 2 SPANS TWO CLASSES, SO ITS TOTAL IS NOT A CLASS COUNT (review P2, round 4). `fix=%d`
     # printed `_r2` -- the sum over BOTH budget classes -- while the arms below name a CLASS
@@ -5193,14 +5215,24 @@ def run_pass(args, rubric_note: str = "") -> int:
     # fixed for `held=`. The rung total stays (it is the ladder count, `order=merge>fix>wait`); the
     # class split is printed beside it whenever a REVIEW-class row exists, so `fix=` can never be
     # read as a fix-class count it does not hold.
+    # ⛔ AND THE SPLIT MUST NOT RE-USE THE LABEL IT EXISTS TO DISAMBIGUATE (review P2, round 7). It
+    # read `fix=1(fix 0/review 1)` -- the word `fix` against two different numbers inside ONE token,
+    # which is exactly the ambiguity the paragraph above claims to have removed. The split is now
+    # qualified (`fix=1 (rung2: fix 0/review 1)`): the outer `fix=` is the LADDER rung and the inner
+    # one is plainly the CLASS breakdown.
     _r2_split = ""
     if _r2_by_class.get("review"):
-        _r2_split = "(fix %d/review %d)" % (_r2_by_class.get("fix", 0),
-                                            _r2_by_class.get("review", 0))
+        _r2_split = " (rung2: fix %d/review %d)" % (_r2_by_class.get("fix", 0),
+                                                    _r2_by_class.get("review", 0))
     _casc = ["order=merge>fix>wait",
              "merge=%d" % _r1,
              "fix=%d%s" % (_r2, _r2_split),
              "wait=%d" % _r3]
+    # `filelist=` is a DECOMPOSITION of `wait=`, never a peer of it (review P1, round 7): it names
+    # the part of the wait that cannot clear by re-reading, so `wait=2 filelist=1` says "two held,
+    # one of them a human's to answer" instead of implying both are just in flight.
+    if _r3_files:
+        _casc.append("filelist=%d" % _r3_files)
     # ⛔ ONE LABEL, ONE QUANTITY (review P2, 2026-10-31). This term is the ASK-USER count ALONE; the
     # "nothing dispatchable" arm below prints `_r3 + _held`. Naming both `held=` emitted
     # `wait=1 held=1 ... nothing dispatchable -- held=2` in ONE line -- no double-count (the keys are
@@ -5244,12 +5276,27 @@ def run_pass(args, rubric_note: str = "") -> int:
     # operator `review budget 0` while `MAX_REVIEW` was 3, sending them at the wrong knob. The
     # appended `_noslot` numbers contradicted it in the same clause (`inflight=0 alive=0 unproven=0`
     # says nothing holds a slot). Name the BINDING term: the class, the aggregate, or both.
+    # ⛔ AND `--max` MAY ONLY BE NAMED WHEN `--max` ACTUALLY BOUND (review P1, round 7). `total == 0`
+    # has two causes and this arm named `--max` for both: `pass_budgets` ALSO yields
+    # `{'fix': 0, 'review': 0, 'total': 0}` at the shipped MAX_FIX/MAX_REVIEW once both classes are
+    # spent, with `total_override is None`. Measured on this head with NO `--max` passed and six
+    # in-flight rows:
+    #     pass: ... budget fix=0 review=0 total=0
+    #     cascade: ... fix->NO SLOT (fix budget 0 and the aggregate ceiling (--max) 0: no available
+    #                        slot: inflight=6 alive=0 unproven=6)
+    # -- the operator sent at a flag they never passed, and the figures in the same clause refuted
+    # it. `budgets["capped"]` is the provenance `pass_budgets` now records, so the cause is STATED
+    # from the fact rather than inferred from a zero.
     def _why(_c):
         _cls_b, _tot = budgets[_c], budgets["total"]
-        if _cls_b <= 0 and _tot <= 0:
-            return "%s budget 0 and the aggregate ceiling (--max) 0" % _c
-        if _tot <= 0:
+        if _tot <= 0 and budgets.get("capped"):
+            if _cls_b <= 0:
+                return "%s budget 0 and the aggregate ceiling (--max) 0" % _c
             return "the aggregate ceiling (--max) 0, %s budget %d" % (_c, _cls_b)
+        if _tot <= 0:
+            # NOT capped, so `total == 0` means both classes are spent (`fix + review == 0`).
+            return ("%s budget 0 and no headroom in the other class either -- both class budgets "
+                    "are spent" % _c)
         return "%s budget 0" % _c
 
     if _r1:
@@ -5277,12 +5324,22 @@ def run_pass(args, rubric_note: str = "") -> int:
     # contradicting its own `wait=0` in the same clause. The two populations are named separately:
     # rung 3 is the WAIT axis; an ASK-USER hold is a HUMAN decision, and saying so is the whole point
     # of `surface=` existing.
+    # ⛔ AND A WAIT THAT ONLY A HUMAN CAN END MUST SAY SO (review P1, round 7). The three
+    # unusable-changed-file-list holds are on the blindness axis (`_finish`, #2136 r2) AND are
+    # announced per PR as `ASK-USER ... a human decides`; a bare "the chain is on rung 3" told the
+    # operator to wait for something a re-read will never clear. The decomposition is appended to
+    # this arm so the sentence keeps rung 3 as the axis and still names the human decision inside it.
+    _files_note = ("%d of them on an unusable changed-file list, which a human must resolve"
+                   % _r3_files) if _r3_files else ""
+    _files_clause = (" -- " + _files_note) if _files_note else ""
     if not _r1 and not _r2:
         if _r3 and _held:
-            _casc.append("nothing dispatchable -- held=%d (%d waiting on rung 3, "
-                         "%d held for a HUMAN/ASK-USER)" % (_r3 + _held, _r3, _held))
+            _casc.append("nothing dispatchable -- held=%d (%d waiting on rung 3%s, "
+                         "%d held for a HUMAN/ASK-USER)"
+                         % (_r3 + _held, _r3, _files_clause, _held))
         elif _r3:
-            _casc.append("nothing dispatchable -- held=%d, the chain is on rung 3" % _r3)
+            _casc.append("nothing dispatchable -- held=%d, the chain is on rung 3%s"
+                         % (_r3, _files_clause))
         elif _held:
             _casc.append("nothing dispatchable -- held=%d, held for a HUMAN (ASK-USER), "
                          "not on the rung-3 wait axis" % _held)
