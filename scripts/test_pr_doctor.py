@@ -5026,6 +5026,14 @@ def test_the_cascade_rung2_total_is_not_reported_as_a_class_count(monkeypatch):
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
     assert "fix=1 (rung2: fix 0/review 1)" in casc[0], casc[0]
+    # ⛔ THE AGGREGATE `slots=` SAYS SO, AND THIS IS THE ASSERTION BEHIND IT (review P2, round 12).
+    # The standalone term prints `budgets["total"]` while the per-class arms print the EFFECTIVE
+    # `min(budgets[cls], total)` -- two quantities under one word at `MAX_FIX=1 MAX_REVIEW=3`
+    # (`slots=4 ... fix slots=1`). Dropping the `(aggregate)` suffix left the suite byte-identical, so
+    # the disambiguation had nothing holding it: this line is what makes the ambiguity unable to
+    # return silently, and it asserts BOTH tokens are present so the suffix is not mere decoration.
+    assert "slots=" in casc[0] and "(aggregate)" in casc[0], casc[0]
+    assert "review slots=" in casc[0], casc[0]
     # and the fix-only case keeps the plain token, because there the total IS the class count.
     _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(65)], ("fix-ci", "red", []))
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]

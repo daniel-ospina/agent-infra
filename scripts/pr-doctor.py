@@ -5291,20 +5291,25 @@ def run_pass(args, rubric_note: str = "") -> int:
     #                  (repair the red, re-review, rail), `rerun-checks`, `blocked-by-rail`.
     #   rung 3 WAIT    nothing to dispatch: `running` (the head is still executing), an unreadable
     #                  classification, or an unusable changed-file list. ⛔ ONE DEFINITION, and every
-    #                  mention of the axis in this block means exactly this: rung 3 is every row the
-    #                  pass HELD WITHOUT A DISPATCH, and `wait=` IS that set (`_finish`'s `blind`
-    #                  PLUS `running` -- noting that `blind` alone has NO `running` term). ⛔ "A LATER
-    #                  PASS RETRIES IT" IS TRUE OF ONLY PART OF IT (review P1, round 11): the
-    #                  `running` and `unreadable` rows are retried on their own, while ONE subset --
-    #                  `filelist=`, the three unusable-changed-file-list buckets -- will NOT clear by
-    #                  re-reading, so a human must resolve it. It stays ON the axis (#2136 r2;
-    #                  reclassifying it would REVERSE that recorded decision), which is why the arm
-    #                  below does not attribute the wait to the RETRY axis when every held row is
-    #                  that subset. OUTSIDE it sits `surface=` --
-    #                  the SDK-surface hold, an ESCALATION for a human rather than a wait -- which is
-    #                  why it is never counted in `wait=` (review P2, round 9: the banner, the
-    #                  `_r3` comment and the `surface=` comment each described a DIFFERENT set, so a
-    #                  reader could obey any one of three).
+    #                  mention of the axis in this block means exactly this: rung 3 is EXACTLY the
+    #                  rows `counts` records as `skipped-running` + `skipped-unreadable` +
+    #                  `skipped-surface_unreadable` / `skipped-surface_partial` /
+    #                  `skipped-surface_abandoned` (`_finish`'s `blind` PLUS `running` -- noting that
+    #                  `blind` alone has NO `running` term), and `wait=` IS that set. ⛔ "HELD WITHOUT
+    #                  A DISPATCH" IS NOT THE DEFINITION ON ITS OWN (review P1, rounds 11-12): a
+    #                  `skipped-surface` row is ALSO held without a dispatch, and it is an
+    #                  ESCALATION rather than a wait -- printed as `surface=` and counted only in
+    #                  `held=`, never in `wait=`. ⛔ AND "A LATER PASS RETRIES IT" IS TRUE OF ONLY
+    #                  PART OF rung 3: the `running` and `unreadable` rows are retried on their own,
+    #                  while ONE subset -- `filelist=`, the three unusable-changed-file-list
+    #                  buckets -- will NOT clear by re-reading, so a human must resolve it. That
+    #                  subset STAYS on the axis (#2136 r2; reclassifying it would REVERSE that
+    #                  recorded decision), which is why the arm below still says the chain is on
+    #                  rung 3 for it and DECOMPOSES the human part (round 7), rather than denying
+    #                  the axis it is on.
+    #                  (Review P2, round 9: the banner, the `_r3` comment and the `surface=`
+    #                  comment each described a DIFFERENT set, so a reader could obey any one of
+    #                  three. This paragraph is the ONE set, stated by KEY.)
     # `no slot` is the refusal BOTH budget-gated rungs take (rung 1 as well — see below), and it
     # prints the reason with it -- the budget it could not take. A rung that is skipped for capacity
     # must SAY so; that silence is what the brief bans.
