@@ -100,9 +100,9 @@ FIX_DELIVERY_BRIEF="$(bash "$delivery_sh" --delivery-brief prfix)" || {
 # checkout and a DIFFERENT target repo used to materialise a worktree in the checkout and run there,
 # reporting failures about branches instead of about the repo. Missing = FATAL, because a silently
 # skipped assertion is the defect. `REPO_TARGET_REFUSED` (72) is distinct from every gate code.
-. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
 command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
-  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
 . "$SELF/gate-policy.sh" 2>/dev/null || { echo "[fix $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a fixer that cannot say whether its gates are on" >&2; exit 78; }
 apply_gate_policy fix-one
