@@ -301,6 +301,42 @@ printf 'gluedproc/1.sh\n' >"$TMP/gluedproc-targets"
 flags "procfs-macos-absent" "$TMP/gluedproc-targets" \
   && ok "C25: a /proc read to the right of a GLUED '#' is still reported (no_comment asks the same decision, not a superset)" \
   || bad "C25: the glued '#' truncated the /proc read — no_comment is still on its own class test"
+# ⛔ C26 — TWO `case`s NESTED AT THE SAME SUBSTITUTION DEPTH (review cycle-4 P0). A per-depth
+# BOOLEAN is cleared by the inner `esac`, so the outer arm label `)` pops the substitution, becomes
+# LAST_POP, and the `#` after it is read as DATA: an apostrophe in the prose opens a phantom quote
+# span and the two live traps below it are never reported (rc=0). The state is a COUNTER now.
+# The apostrophe in the prose is load-bearing — without it the arm proves nothing (measured).
+CASQ2=$(printf '\047')
+mkdir -p "$TMP/tree/casenest"
+{ printf '%s\n' '#!/usr/bin/env bash' 'out=$(' '  case "$a" in' '    x) case "$b" in' '         p) echo p ;;' '       esac' '       ;;';
+  printf '    y)# don%st reorder the arms\n' "$CASQ2";
+  printf '%s\n' '       sed -i s/a/b/ f' '       stat -c %Y g' '       ;;' '  esac' ')' 'echo ok' '# documented: it is the arm order that matters'; } >"$TMP/tree/casenest/1.sh"
+printf 'casenest/1.sh\n' >"$TMP/casenest-targets"
+flags "sed-in-place-gnu" "$TMP/casenest-targets" && flags "stat-c-gnu" "$TMP/casenest-targets" \
+  && ok "C26: case nesting at the SAME depth keeps the outer arm label from popping the substitution — the live traps are reported" \
+  || bad "C26: a nested esac at the same depth let the outer arm label pop the substitution and hid live traps"
+# ⛔ C27 — `echo esac` IS NOT AN `esac` (review cycle-4 P0): keyword recognition after any non-word
+# byte meant a plain SPACE counted, so an `esac` in an argument cleared the arm state and the next arm
+# label popped the substitution — the same silent green over live traps.
+mkdir -p "$TMP/tree/esacarg"
+{ printf '%s\n' '#!/usr/bin/env bash' 'x=$(case b in a) echo esac;; b)# don'"'"'t reorder';
+  printf '%s\n' '   sed -i s/a/b/ f' '   stat -c %Y g' '   ;;' 'esac)' 'echo ok' '# note: it is documented above'; } >"$TMP/tree/esacarg/1.sh"
+printf 'esacarg/1.sh\n' >"$TMP/esacarg-targets"
+flags "sed-in-place-gnu" "$TMP/esacarg-targets" && flags "stat-c-gnu" "$TMP/esacarg-targets" \
+  && ok "C27: an \"esac\" in an ARGUMENT does not clear the arm state (command position, not word position) — the live traps are reported" \
+  || bad "C27: \"echo esac\" was taken as a real esac and the traps below went unreported"
+# ⛔ C28 — THE OVER-BLOCK DIRECTION (review cycle-4 P2): an extglob arm label `@(a|b))` and an
+# `echo case` argument must NOT invent `context-unbalanced` on valid code — that is a false red, and the
+# row `--emit-baseline` would mint as permanent. The traps must still be reported.
+mkdir -p "$TMP/tree/extglob"
+printf '%s\n' '#!/usr/bin/env bash' 'shopt -s extglob' 'x=$(case a in @(a|b)) sed -i s/a/b/ f;; esac)' 'stat -c %Y g' >"$TMP/tree/extglob/1.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(echo case)' 'stat -c %Y g' >"$TMP/tree/extglob/2.sh"
+printf 'extglob/1.sh\nextglob/2.sh\n' >"$TMP/extglob-targets"
+if not_flags "context-unbalanced" "$TMP/extglob-targets" && flags "stat-c-gnu" "$TMP/extglob-targets"; then
+  ok "C28: an extglob arm label and an \"echo case\" argument do not invent context-unbalanced, and the real traps are still reported"
+else
+  bad "C28: valid code gained a context-unbalanced (or lost its real finding) — a false red on correct code"
+fi
 # ⛔ E15 — A REFUSAL MESSAGE MUST NOT EXECUTE ANYTHING (review cycle-3 P2). The malformed-table
 # message once carried backticks inside double quotes, so the shell command-substituted them: `id` ran
 # with `<TAB>` as a redirect target and the operator lost the column names.

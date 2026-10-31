@@ -444,14 +444,19 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
       # single-quote span, and two LIVE traps below it (`sed -i`, `stat -c`) went unreported with the
       # run exiting 0 (“if the quotes balance, the scan is silently CLEAN”). The mirror of the CD state
       # the suite pin already carries, so the two models cannot drift.
-      if (c ~ /[A-Za-z]/ && (i == 1 || substr(line, i - 1, 1) ~ /[^A-Za-z0-9_]/)) {
+      if (c ~ /[A-Za-z]/ && cmd_boundary(line, i)) {
         rest2 = substr(line, i)
         # ⛔ `i += 3`, NOT 4: this loop advances `i` in its own `for (i = 1; i <= n; i++)`, so an
         # extra `i++` consumes exactly one more byte (the same trap the heredoc branch documents).
         # With 4, the character AFTER the keyword was skipped — measured: the scan desynchronised and
         # invented 5 findings across ci_runner_pool.sh and cloud-cell-bringup.sh.
-        if (rest2 ~ /^case([ \t;)(|&]|$)/) { CD[length(ST)] = 1; out = out "case"; i += 3; continue }
-        if (rest2 ~ /^esac([ \t;)(|&]|$)/) { CD[length(ST)] = 0; out = out "esac"; i += 3; continue }
+        # ⛔ AND A COUNTER, NOT A BOOLEAN (review cycle-4 P0): two `case`s can nest at the SAME
+        # substitution depth (`$( case a in x) case b in … esac ;; y)# comment … esac )`), where a
+        # per-depth boolean is cleared by the INNER `esac` — the outer arm label then pops the
+        # substitution, becomes LAST_POP, and the `#` after it is read as DATA, with the same silent
+        # green over live traps.
+        if (rest2 ~ /^case([ \t;)(|&]|$)/) { CD[length(ST)]++; out = out "case"; i += 3; continue }
+        if (rest2 ~ /^esac([ \t;)(|&]|$)/) { if (CD[length(ST)] > 0) CD[length(ST)]--; out = out "esac"; i += 3; continue }
       }
       if (c == "#" && cmt_start(line, i)) { CMT_AT = i; break }
       if (c == "\"") { st_push("D"); SN[length(ST)] = 0; out = out "\""; continue }
@@ -491,10 +496,14 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
         }
       }
       d = length(ST)
-      if (c == "(") PD[d]++
+      # ⛔ A `(` INSIDE AN ARM IS AN EXTGLOB/PATTERN PAREN, NOT A SUBSTITUTION PAREN (review cycle-4
+      # P2): `@(a|b))` incremented PD without a matching `)`, and a VALID file gained a spurious
+      # `context-unbalanced` — a false red on correct code, and the row `--emit-baseline` would mint as
+      # permanent. Inside an arm, `(` is consumed with its label `)` and PD is left alone.
+      if (c == "(") { if (CD[d] == 0) PD[d]++ }
       else if (c == ")") {
         # an arm label: data, and it must not become LAST_POP (see the case note above)
-        if (CD[d] == 1) { out = out ")"; continue }
+        if (CD[d] > 0) { out = out ")"; continue }
         PD[d]--; if (PD[d] <= 0) { LAST_POP = i; out = out ")"; st_pop(); continue }
       }
       out = out c; continue
@@ -535,6 +544,29 @@ function cmt_start(line, i,   prev) {
   if (prev == "}") return 0
   if (prev == ")" && i - 1 == LAST_POP) return 0
   if (prev ~ /[ \t;&|(){}]/) return 1
+  return 0
+}
+
+# ── cmd_boundary(line, i) — 1 when a keyword starting at i sits where a COMMAND may begin.
+# ⛔ WORD POSITION IS NOT COMMAND POSITION (review cycle-4 P0): `case`/`esac` were recognised after any
+# non-word character, so a plain SPACE was enough — `echo esac` inside a `case` arm cleared the arm
+# state, the next arm label `)` popped the substitution as if it had closed, and the `#` after it was
+# then read as DATA: an apostrophe in the prose opened a phantom quote span and two LIVE traps went
+# unreported at rc=0 (the same silent-CLEAN shape the previous cycle fixed one construct earlier).
+# The test looks back over spaces to the nearest non-space byte: a shell operator (`;`, `&`, `|`, `(`,
+# `{`), an arm label / subshell close `)`, the start of the line, or a command-introducing keyword.
+function cmd_boundary(line, i,   j, prev, w) {
+  j = i - 1
+  while (j >= 1 && substr(line, j, 1) ~ /[ \t]/) j--
+  if (j < 1) return 1
+  prev = substr(line, j, 1)
+  if (prev ~ /[;&|({]/) return 1
+  if (prev == ")") return 1
+  if (prev ~ /[A-Za-z0-9_]/) {
+    w = ""
+    while (j >= 1 && substr(line, j, 1) ~ /[A-Za-z0-9_]/) { w = substr(line, j, 1) w; j-- }
+    if (w == "then" || w == "do" || w == "else" || w == "elif" || w == "if" || w == "while" || w == "until" || w == "time") return 1
+  }
   return 0
 }
 
