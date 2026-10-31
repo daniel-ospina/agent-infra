@@ -175,6 +175,34 @@ check "(a4g) a reclaim that could not detach says so, and does NOT assert a caus
   "[ $RC -eq 0 ] && case \"\$OUT\" in *'could NOT be detached'*) true ;; *) false ;; esac && case \"\$OUT\" in *'unwritable'*) false ;; *) true ;; esac"
 check "(a4g) …and the abandoned record is still on disk, unchanged" "[ -e '$OLK' ]"
 rm -f "$OLK"
+# ⛔ THE GUARDS THAT MAKE A `rm`-BEARING ARM SAFE (review of #3096, P3-4). Each of these was measured as
+# UNDISCRIMINATED: deleting the guard left both suites green. They fail closed, so the risk is not worse
+# behaviour, it is a silent regression in the arm that deletes files.
+# 1. A SYMLINK is not a record: `[ -f ]` follows it, so a `rm` would delete the TARGET.
+: > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OLLINK="$TMP/orphan-link.lock"; rm -f "$OLLINK"; ln -s "$OLK" "$OLLINK" 2>/dev/null
+check "(a4h) a symlinked record is NOT admitted (content alone is not the record's own — `rm` would hit the target)" \
+  "! pl_record_no_owner '$OLLINK' >/dev/null"
+OUT="$( pl_reap_no_owner "$TMP" orphan-link >/dev/null 2>&1; printf '%s' ok )"
+check "(a4h) …and the reap refuses it, leaving the target intact" "[ -e '$OLK' ]"
+rm -f "$OLLINK" "$OLK"
+# 2. a WHITESPACE-ONLY body is no owner, and is admitted (the module side of the fix-one '   \n' fixture).
+: > "$OLK"; printf '   \n' > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$(pl_verdict "$O" 7171 1 1)"; RC=$?
+check "(a4i) an AGED whitespace-only record is RELEASED (the module half of the shape fix-one reclaims)" \
+  "[ $RC -eq 1 ] && case \"\$OUT\" in RELEASED*) true ;; *) false ;; esac"
+check "(a4i) …and it is REMOVED" "[ ! -e '$OLK' ]"
+# 3. an UNREADABLE record is not evidence of anything — no `|| echo 0` shortcut, and never reaped.
+: > "$OLK"; printf '\n' > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null; chmod 000 "$OLK" 2>/dev/null
+if [ ! -r "$OLK" ]; then
+  OUT="$(pl_verdict "$O" 7171 1 1)"; RC=$?
+  check "(a4j) an UNREADABLE aged record is not reclaimed — what cannot be read is not evidence (rc=$RC)" \
+    "[ $RC -eq 0 ] && [ -e '$OLK' ]"
+  chmod 600 "$OLK" 2>/dev/null
+else
+  printf '  (skipped) cannot make a file unreadable here — chmod 000 had no effect (root?)\n'
+fi
+rm -f "$OLK"
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 echo "(c) a PR whose worker is ALIVE is still respected"
