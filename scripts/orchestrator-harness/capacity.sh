@@ -364,9 +364,14 @@ cap_hw_uuid() {
 #      VLAN is not "the ONE address a peer can reach it on" — measured, review round 6). This is the
 #      structural clause, and it is the same rule the Darwin arm encodes: the address a peer can reach me
 #      on is the address on the interface my traffic leaves by. For any device that does NOT carry egress
-#      it makes a container bridge or a VPN structurally unable to supply the value, whatever it is named
-#      and whatever order the kernel lists it in — docker0 is at a LOWER ifindex than the cells' VLAN
-#      child, so ordering alone would never save us.
+#      it makes a container bridge or a VPN unable to supply the value by ACCIDENT of ordering or naming —
+#      docker0 is at a LOWER ifindex than the cells' VLAN child, so ordering alone would never save us.
+#      ⛔ CLAUSE 1'S CHILD HALF IS A NAME TEST, AND SAYS SO: a device is accepted as a "VLAN child" when
+#      it is NAMED `<egress>.<n>`, so a bridge/VPN device deliberately named that way IS trusted (measured,
+#      review round 9: a dummy named `eth0.9` at a lower ifindex was published). Closing that needs a
+#      TYPE check (`ip -d link show`), which was considered and not taken: it adds a query and a failure
+#      mode for every candidate, and the only way to reach the hole is to name a device after the egress
+#      device on purpose. The alternative is to say this plainly, which is what this paragraph does.
 #      ⛔ KNOWN RESIDUAL, stated rather than implied: `up` is IFF_UP, NOT carrier/operstate. A device that
 #      is admin-up with NO CARRIER (a dead VLAN over a dead veth) still lists its address and can be
 #      chosen (measured, review round 7). Requiring `LOWER_UP` was considered and NOT taken: it adds a
@@ -1228,6 +1233,37 @@ cap_ref_deletable() {
 # Anything else fresh under our hostname is another box's reading: KEPT (it is the evidence) and counted
 # in `foreign=`. The first draft of this fix instead inferred authorship from (key, boot) equality, which
 # a mis-keyed peer satisfies — see `cap_ref_deletable`.
+# cap_pub_why <publish-output> -> the reason `cap_publish` refused/failed, or nothing.
+# ⛔ IT IS FIELD-ANCHORED **AND TOKEN-BOUNDED** (`-F'why='` then the first whitespace-delimited token):
+# a push failure carries MORE on the line (`publish=failed why=push-refused ref=refs/boxes/...`), so both
+# `$NF` (the ref) and the whole remainder (`push-refused ref=…`) report a "reason" that names nothing
+# usable — which is how a why-field silently stops being one (review round 9).
+cap_pub_why() {
+  printf '%s\n' "${1:-}" | awk -F'why=' '/^publish=(refused|failed)/{split($2, t, " "); print t[1]; exit}'
+}
+
+# cap_publish_logged <repo> <record> <logfile> <namespace> — PUBLISH, and on failure write the reason to
+# <logfile>. Returns `cap_publish`'s status. THIS EXISTS BECAUSE A SILENT REFUSAL IS THE DEFECT (#3167):
+# the controller called `cap_publish … >/dev/null 2>&1`, so a box that could not name itself went
+# INELIGIBLE with nothing in the log saying why. Keeping the logic HERE (not inline in orch-loop.sh) is
+# what lets the suite grade it as BEHAVIOUR — the polarity, the reason and the remedy gate — instead of
+# grepping the controller's text for fragments (review round 9).
+# ⛔ THE REMEDY IS NAMED ONLY FOR THE REASON THAT HAS ONE: `no-box-identity` means "this box cannot name
+# itself"; `push-refused`/`no-head`/`invalid-record` do not, and pointing an operator at CAP_BOXID for
+# those would send them to a boxid that is already right.
+cap_publish_logged() {
+  local repo rec log ns out why bid hint
+  repo="${1:-}"; rec="${2:-}"; log="${3:-}"; ns="${4:-$CAP_NS}"
+  out="$(cap_publish "$repo" "$rec" 2>&1)" && return 0
+  why="$(cap_pub_why "$out")"
+  bid="$(cap_kv "$rec" boxid)"
+  hint=""
+  [ "${why:-}" = "no-box-identity" ] && hint='; a box that cannot name itself cannot publish it — the operator seam is CAP_BOXID'
+  printf '[capacity] this box'"'"'s reading could not be PUBLISHED to %s (%s) — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings) — why=%s boxid=%s host=%s%s\n' \
+    "$ns" "$(printf '%s' "$out" | tr '\n' ' ')" "${why:-unknown}" "${bid:-<none>}" "$(cap_host)" "$hint" >> "$log"
+  return 1
+}
+
 cap_publish() {
   local repo="${1:-.}" rec="${2:-}" ref sha old orec h bid now foreign ledger
   # ⛔ NO NAME, NO RECORD — and this is checked BEFORE the record's other fields, because "I could not

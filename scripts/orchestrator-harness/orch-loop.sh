@@ -5635,19 +5635,12 @@ PY
       CAP_FORK_BOUND_SELF="$(cap_fork_bound "$CAP_REC" 2>/dev/null)" || CAP_FORK_BOUND_SELF=""
       CAP_LPC_SELF="$(cap_kv "$CAP_REC" lpc)"
       # ⛔ THE REFUSAL'S REASON IS PART OF THE DIAGNOSIS (#3167). `cap_publish` is fail-closed by design —
-      # it prints `publish=refused why=<reason>` and returns 1 — but this call discarded that output, so a
-      # box that could not name itself went INELIGIBLE for a whole lane's worth of cycles with no gate
-      # red and nothing in the log saying why. The reason is surfaced now, on the same one line.
-      CAP_PUB="$(cap_publish "$REPO" "$CAP_REC" 2>&1)" || {
-        CAP_PUB_WHY="$(printf '%s\n' "${CAP_PUB:-}" | awk -F'why=' '/^publish=(refused|failed)/{print $2; exit}')"
-        CAP_PUB_BID="$(cap_kv "$CAP_REC" boxid)"
-        # ⛔ THE REMEDY IS ONLY NAMED FOR THE REASON THAT HAS ONE (review round 3): `no-box-identity`
-        # means "this box cannot name itself"; `push-refused`/`no-head`/`invalid-record` do not, and
-        # pointing an operator at CAP_BOXID for those would send them to a boxid that is already right.
-        CAP_PUB_HINT=""
-        [ "${CAP_PUB_WHY:-}" = "no-box-identity" ] && CAP_PUB_HINT='; a box that cannot name itself cannot publish it — the operator seam is CAP_BOXID'
-        echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS ($(printf '%s' "$CAP_PUB" | tr '\n' ' ') — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings) — why=${CAP_PUB_WHY:-unknown} boxid=${CAP_PUB_BID:-<none>} host=$(cap_host)$CAP_PUB_HINT" >> "$LOG"
-      }
+      # it prints `publish=refused why=<reason>` and returns 1 — but this call used to discard that output
+      # (`>/dev/null 2>&1`), so a box that could not name itself went INELIGIBLE for a whole lane's worth of
+      # cycles with no gate red and nothing in the log saying why. `cap_publish_logged` surfaces it on one
+      # line AND is driven by the suite (§14 (16)-(18)), so its polarity, its reason parsing and its
+      # CAP_BOXID gate are graded behaviour rather than a grep of this file's text.
+      cap_publish_logged "$REPO" "$CAP_REC" "$LOG" "$CAP_NS" || true
       CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
       [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"
       # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.

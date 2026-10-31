@@ -354,8 +354,8 @@ ck "orch-loop.sh sources capacity.sh from \$O, falling back to its own directory
    "$(grep -q 'capacity.sh' "$LOOP" && grep -q '_cap_mod' "$LOOP" && echo 0 || echo 1)"
 ck "…and gates on the INTERFACE (declare -f), not on the file, so a stale copy cannot read as wired" \
    "$(grep -q 'declare -f cap_probe_local cap_place cap_read_fleet cap_publish' "$LOOP" && echo 0 || echo 1)"
-ck "the cycle PROBES this box and PUBLISHES the reading" \
-   "$(grep -q 'cap_probe_local "\$REPO"' "$LOOP" && grep -q 'cap_publish "\$REPO"' "$LOOP" && echo 0 || echo 1)"
+ck "the cycle PROBES this box and PUBLISHES the reading (through the logged publish, #3167)" \
+   "$(grep -q 'cap_probe_local "\$REPO"' "$LOOP" && grep -q 'cap_publish_logged "\$REPO"' "$LOOP" && echo 0 || echo 1)"
 ck "…READS the fleet and ASKS cap_place for the target box" \
    "$(grep -q 'cap_read_fleet "\$REPO"' "$LOOP" && grep -q 'cap_place "\$(cap_host)"' "$LOOP" && echo 0 || echo 1)"
 ck "the placement verdict is in the [capacity] log line (the decision is visible every cycle)" \
@@ -1212,12 +1212,45 @@ ck "(12) the Darwin arm (no \`ip\` on PATH — runs on macOS too) answers its in
 # (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
 # controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
 # reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
-ck "(6) the controller CAPTURES the publish output and logs why=… (no more silent refusal)" \
-   "$(grep -qF -- 'cap_publish "$REPO" "$CAP_REC" 2>&1' "$LOOP" && grep -qF -- 'why=${CAP_PUB_WHY:-unknown}' "$LOOP" && echo 0 || echo 1)"
-# (6b) …and the CAP_BOXID remedy is named ONLY for the reason that has one (review round 4, finding 5:
-# the round-3 fix was ungraded). The grep pins the COMPARISON, so widening it to `-n` goes red.
-ck "(6b) the CAP_BOXID hint is gated on why=no-box-identity, so a push/head/record refusal does not misdirect the operator" \
-   "$(grep -qF -- '[ "${CAP_PUB_WHY:-}" = "no-box-identity" ] && CAP_PUB_HINT=' "$LOOP" && echo 0 || echo 1)"
+ck "(6) the controller REALLY CALLS the logging publish (not a local re-implementation, and not the silent form)" \
+   "$(grep -qF -- 'cap_publish_logged "$REPO" "$CAP_REC" "$LOG" "$CAP_NS"' "$LOOP" && echo 0 || echo 1)"
+# (16)-(18) THE DIAGNOSTIC IS GRADED AS BEHAVIOUR (review round 9, finding 1). Text greps for fragments
+# were the defect: the reason PARSING could be neutered (`why=unknown` for a real `no-box-identity`), the
+# field could be read as `$NF` (a push refusal then reports the ref as the reason), and the block's
+# POLARITY could be flipped (`&&`), all with the suite green. So the shipped `cap_publish_logged` is driven
+# against a local bare origin instead.
+O16="$TMP/origin-log.git"; W16="$TMP/work-log"
+( git init -q --bare "$O16" && git init -q "$W16" && cd "$W16" && git config user.email t@t \
+  && git config user.name t && git commit -q --allow-empty -m init && git remote add origin "$O16" \
+  && git push -q origin HEAD:main ) >/dev/null 2>&1
+LOGL="$TMP/cap-log.txt"
+VALID="host=cmux ncpu=4 load1=56 lpc=14 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=$NOW procs=400 procs_max=15641 fork=1 boot=$A_BOOT"
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log1" cap_publish_logged "$W16" "$VALID" "$LOGL" refs/boxes || RC=$?
+L16="$(cat "$LOGL" 2>/dev/null)"
+ck "(16) a refused publish (no boxid) returns 1 and its log line NAMES the reason — why=no-box-identity, plus the CAP_BOXID seam (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && qF 'why=no-box-identity' "$L16" && qF 'the operator seam is CAP_BOXID' "$L16" && echo 0 || echo 1)"
+# an invalid record (a valid boxid, but `fork=` is not a number) — a DIFFERENT reason, so the remedy must
+# NOT be offered (pointing the operator at a boxid that is already right is a misdiagnosis).
+L16REC="host=cmux ncpu=4 load1=56 lpc=14 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=$NOW procs=400 procs_max=15641 fork=x boot=$A_BOOT boxid=10.238.144.2"
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log3" cap_publish_logged "$W16" "$L16REC" "$LOGL" refs/boxes || RC=$?
+L17="$(cat "$LOGL" 2>/dev/null)"
+ck "(17) a DIFFERENT refusal reason is named (why=invalid-record) and the CAP_BOXID remedy is NOT offered (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && qF 'why=invalid-record' "$L17" && ! qF 'the operator seam is CAP_BOXID' "$L17" && echo 0 || echo 1)"
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log4" cap_publish_logged "$W16" "$VALID boxid=10.238.144.2" "$LOGL" refs/boxes || RC=$?
+ck "(18) a SUCCESSFUL publish returns 0 and writes NO refusal line (rc=$RC, log bytes=$(wc -c < "$LOGL" | tr -d ' ')) — the polarity cannot be inverted silently" \
+   "$([ "$RC" -eq 0 ] && [ ! -s "$LOGL" ] && echo 0 || echo 1)"
+# (19) A PUSH FAILURE carries MORE on the line (`publish=failed why=push-refused ref=refs/boxes/...`), so
+# the reason must be read FIELD-ANCHORED: `$NF` would report the ref as the reason (review round 9).
+W17="$TMP/work-log-bad"; git init -q "$W17"; ( cd "$W17" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$TMP/does-not-exist.git" ) >/dev/null 2>&1
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log5" cap_publish_logged "$W17" "$VALID boxid=10.238.144.2" "$LOGL" refs/boxes || RC=$?
+L19="$(cat "$LOGL" 2>/dev/null)"
+ck "(19) a PUSH failure is reported as why=push-refused — the ref on the line does NOT become the reason (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && qF '— why=push-refused boxid=' "$L19" && ! qF '— why=push-refused ref=' "$L19" && echo 0 || echo 1)"
 # (7) THE MAC CANNOT BE AFFECTED. A Darwin box resolves its identity from `kern.uuid` FIRST
 # (`cap_boxid_auto` source 1), so it never reaches the Linux arm this fix changes. That precedence is
 # the property, not a comment: asserted here so a future edit that reorders the sources — or that makes
