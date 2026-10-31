@@ -905,17 +905,31 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     asserts the call ARRIVES at the gate -- which is where the load gate lives -- by recording it.
     If the routing is ever "simplified" back to a direct `pi` spawn, this goes RED.
 
-    ⛔ AND IT PINS THE OTHER HALF OF THE P0: the stub worker SLEEPS 3 s, so a CAPTURED call can only
-    return promptly if the worker subshell closed the parent's stdout/stderr (`exec >/dev/null
-    2>&1`). Without that line this test takes the worker's lifetime; measured pre-fix, 5.02 s for a
-    5 s worker. Removing the `exec` from the harness reddens THIS test and nothing else, which is
-    the point: pr-doctor no longer captures, so no shipped pr-doctor caller would notice.
+    ⛔ AND IT PINS THE OTHER HALF OF THE P0: the stub worker SLEEPS 10 s and writes to its log file,
+    so a CAPTURED call can only return well before the worker's lifetime if the worker subshell
+    closed the parent's stdout/stderr (`exec >/dev/null 2>&1`). Without that line this test takes
+    the worker's lifetime; measured pre-fix, 5.02 s for a 5 s worker. Removing the `exec` from the
+    harness reddens THIS test and nothing else, which is the point: pr-doctor no longer captures, so
+    no shipped pr-doctor caller would notice.
+
+    ⛔ THE SETTLE WINDOW IS PART OF THE CONTRACT NOW (agent-infra, measured 2026-10-31). The
+    dispatcher no longer reports `launched` at pid-capture time: it waits `NB_START_SETTLE` (floored
+    at 2 s) and only then decides, so a captured call MUST now take at least the window. This test
+    pins `NB_START_SETTLE=2` and a worker that OUTLIVES it: the earlier 3 s stub + default 5 s window
+    put the worker inside the window, and a worker that exits rc=0 without writing a single log byte
+    is now `NOT STARTED` / exit 75 by design (pinned behaviourally in
+    `scripts/orchestrator-harness/nonblocking-dispatch.test.sh`, T1/"silent rc=0"). The elapsed
+    bound is therefore measured against the WORKER's lifetime, not a fixed 2 s: the pipe property is
+    "returns long before the worker ends", and the window is a property of the dispatcher.
     """
     d = tmp_path / "orch"
     d.mkdir()
     marker = tmp_path / "marker.txt"
+    # `$2` is the dispatcher's LOG path — the worker's own bytes are what make a completed dispatch
+    # count as one (`rc=0` + an empty log is `NOT STARTED`).
     (d / "spawn-gate.sh").write_text(
-        'run_agent() { echo "GATED $*" > "$MARK"; sleep 3; echo ran; return 0; }\n')
+        'run_agent() { echo "GATED $*" > "$MARK"; echo "[stub] lane up" >> "$2"; '
+        'sleep 10; echo ran; return 0; }\n')
     # …and the REAL brief validator, because `nonblocking-dispatch.sh` refuses an unvalidated brief
     # in the FOREGROUND, before `run_agent` — which is the call this test asserts arrives (#2258).
     shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
@@ -928,14 +942,14 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     # dispatcher backgrounds anything, so the routing this test proves would never be exercised.
     prompt.write_text(subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--section", "worker"],
                                      capture_output=True, text=True, check=True).stdout)
-    env = dict(os.environ, O=str(d), MARK=str(marker))
+    env = dict(os.environ, O=str(d), MARK=str(marker), NB_START_SETTLE="2")
     nb = _HARNESS / "nonblocking-dispatch.sh"
     t0 = time.monotonic()
-    r = subprocess.run(["bash", str(nb), "prd-1", str(wt), str(prompt), "5"],
+    r = subprocess.run(["bash", str(nb), "prd-1", str(wt), str(prompt), "30"],
                        capture_output=True, text=True, env=env, timeout=30)
     elapsed = time.monotonic() - t0
     assert r.returncode == 0, r.stderr
-    assert elapsed < 2.0, ("the captured call waited %.2fs for a 3 s worker -- the worker "
+    assert elapsed < 8.0, ("the captured call waited %.2fs for a 10 s worker -- the worker "
                            "subshell is holding the caller's pipe" % elapsed)
     for _ in range(100):
         if marker.exists():
@@ -943,6 +957,41 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
         time.sleep(0.05)
     assert marker.exists(), "nonblocking-dispatch.sh did not route through run_agent()"
     assert "GATED" in marker.read_text()
+
+def test_a_not_started_launch_is_NEVER_reported_as_a_capacity_refusal(monkeypatch, tmp_path):
+    """⛔ THE DISPATCHER'S NEW NON-ZERO EXIT MUST NOT LOSE THE GATE'S AXIS (#2291 class).
+
+    `nonblocking-dispatch.sh` now exits 75 for "a launch whose lane never ran". 75 is ALSO
+    `spawn-gate.sh`'s `AGENT_LOAD_REFUSED`, so a caller that read the dispatcher's code as the gate's
+    code would report a lane that never started as A LOADED BOX -- telling an operator to wait for
+    capacity that was never the problem, while the real cause went unnamed.
+
+    This pins both directions on the SAME non-zero exit: (a) a worker whose GATE refused carries its
+    own code and its own marker (load here), so `dispatch()` keeps the axis and `main()` can still
+    exit 6 with "the box refused"; (b) a worker that started nothing and wrote nothing (the
+    dispatcher's `NOT STARTED`, no `.rc` at all) is NOT given the load axis it does not have -- it
+    stays a transport reading, which is what "nothing was dispatched" means.
+    """
+    # (a) the gate refused the worker: `.rc`=75 plus `[load-gate] REFUSED` in the worker log.
+    d, wt = _orch(tmp_path / "gated",
+                  'run_agent() { echo "[load-gate] REFUSED $1: load=99 >= max_load=40" >> "$2"; '
+                  'return 75; }\n')
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    ok, detail, record = pr.dispatch(_pr(11), "fix-ci", _OK_BRIEF, dry=False)
+    assert (ok, record) == (False, False), (ok, detail)
+    assert pr.gate_refusal_axis(detail) == "load", (
+        "a gate refusal must keep its axis even though the DISPATCHER's own exit code is also 75: %r"
+        % (detail,))
+    assert pr.gate_refusal_code(detail) == 75, detail
+
+    # (b) no lane, no marker, no `.rc`: the dispatcher's `NOT STARTED`. Nothing may claim an axis.
+    d2, wt2 = _orch(tmp_path / "silent", "run_agent() { return 0; }\n")
+    _wire_dispatch(monkeypatch, tmp_path / "silent", d2, wt2)
+    ok2, detail2, record2 = pr.dispatch(_pr(12), "fix-ci", _OK_BRIEF, dry=False)
+    assert (ok2, record2) == (False, False), (ok2, detail2)
+    assert pr.gate_refusal_axis(detail2) == "", (
+        "a launch that started nothing must NOT borrow the load axis: %r" % (detail2,))
+    assert "NOT STARTED" in detail2 or "rc=" in detail2, detail2
 
 
 def test_load_gate_refuses_when_the_ceiling_is_reached():
@@ -1855,12 +1904,14 @@ def test_fix_and_review_budgets_are_separate(monkeypatch):
 # distinguish the defect: a worker that exits at once closes its own end of the pipe, so even a
 # captured pre-fix call returned promptly for that shape.
 _WORKERS = {
-    # silent for its whole life
-    "sleeps past the window and writes nothing": "run_agent() { sleep 6; return 0; }\n",
+    # silent for its whole life. ⛔ 20 s, not 6: the dispatcher's settle window (2 s here) plus the
+    # pass's own work must finish WELL BEFORE the worker ends, or "the call returned with the worker
+    # still running" would be a coincidence rather than a measurement.
+    "sleeps past the window and writes nothing": "run_agent() { sleep 20; return 0; }\n",
     # writes IMMEDIATELY (the shape where a caller with a pipe receives output first) and runs on
-    "writes at once, then sleeps": 'run_agent() { echo starting; sleep 6; return 0; }\n',
+    "writes at once, then sleeps": 'run_agent() { echo starting; sleep 20; return 0; }\n',
     # writes to BOTH streams at the end
-    "sleeps, then writes to stdout and stderr": 'run_agent() { sleep 6; echo OUT; echo ERR >&2; }\n',
+    "sleeps, then writes to stdout and stderr": 'run_agent() { sleep 20; echo OUT; echo ERR >&2; }\n',
 }
 
 
@@ -1905,6 +1956,13 @@ def _wire_dispatch(monkeypatch, tmp_path, d, wt):
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setenv("O", str(d))
+    # ⛔ THE DISPATCHER'S START ASSERTION IS PART OF THE TIMING NOW (agent-infra, measured
+    # 2026-10-31): it does not report `launched` until a settle window has elapsed, so every dispatch
+    # through the REAL script costs at least `NB_START_SETTLE` seconds — floored at 2, because a
+    # 1 s window elapses in the sleep it just asked for and certifies nothing. Pinned to the floor
+    # here so a test measuring "the call does not wait for the WORKER" keeps measuring that and not
+    # the window; `nonblocking-dispatch.test.sh` owns the window's own contract (T1b, the floor).
+    monkeypatch.setenv("NB_START_SETTLE", "2")
 
 
 def _stub_the_spawn(monkeypatch, rc_ok=False):
@@ -1936,8 +1994,13 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
 
     PRE-FIX (`sh_err(spawn_argv(...), timeout=120)` with `capture_output=True`): `subprocess.run`
     blocks on EOF of the capture pipe, and the worker subshell inherits it -- so this call lasted
-    the worker's whole life. For the sleeping worker that is 6 s here and TimeoutExpired at
+    the worker's whole life. For the sleeping worker that is 20 s here and TimeoutExpired at
     timeout=120 in production, which returned rc=-1, logged `FAIL`, and wrote NO state row.
+
+    ⛔ THE BOUND IS THE WINDOW PLUS SLACK, NOT A FIXED 3 s. The dispatcher now blocks for its own
+    `NB_START_SETTLE` (2 s, pinned in `_wire_dispatch`) before it decides, and the worker it waits on
+    lives 20 s — so returning in under 10 s still proves the call did not wait for the WORKER, which
+    is what this test is about. Measured pre-fix: 6.02 s for a 6 s worker; measured here: ~2.1 s.
     """
     d, wt = _orch(tmp_path, _WORKERS[label])
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
@@ -1945,7 +2008,7 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
     ok, detail, record = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
     elapsed = time.monotonic() - t0
     assert ok is True and record is True, (ok, detail)
-    assert elapsed < 3.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
+    assert elapsed < 10.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
 
 
 def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, tmp_path):
