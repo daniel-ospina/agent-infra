@@ -4667,6 +4667,516 @@ def test_an_unreadable_file_list_on_a_rest_pass_holds_the_pr_for_a_human(monkeyp
     assert payload.get("surface_partial") == 0, payload
 
 
+# ── THE CASCADE LINE: ONE LINE PER PASS, AND IT MUST NOT LIE ──────────────────────────────────────
+# These pin the two false statements the block itself was written to prevent (review P1/P2,
+# 2026-10-31). Neither was pinned before, which is how both shipped: a line whose whole purpose is
+# "say which rung the chain is on, honestly" had no assertion behind either half of it.
+
+
+def test_the_cascade_wait_rung_counts_the_surface_holds_not_just_running(monkeypatch):
+    """`wait=` must not read 0 while PRs are held on the blindness axis rung 3 defines.
+
+    ⛔ THE MEASURED DEFECT (review P2): `_r3` summed only `skipped-running` + `skipped-unreadable`,
+    but `_finish` folds `surface_unreadable`/`surface_partial`/`surface_abandoned` onto the SAME
+    blindness axis (`blind = unread + blind_surface + blind_partial + blind_abandoned`). So a pass
+    that held every PR for an unusable changed-file list printed
+
+        cascade: order=merge>fix>wait merge=0 fix=0 wait=0 slots=6
+        nothing to dispatch (no mergeable, no repairable)
+
+    -- rung 3 explicitly DENIED while the work sat on it. That is the same silence the block exists
+    to remove, one population over. The PR here is held, not dispatched, so `wait` must be >= 1 and
+    the line must NOT say "nothing to dispatch".
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(51)], ("record-review", "why", []))
+    assert payload.get("surface_unreadable") == 1, payload
+    assert payload.get("dispatched") == 0, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined            # ONE line per pass, never zero and never two
+    assert "wait=0 " not in casc[0] + " ", casc[0]
+    assert "nothing to dispatch" not in casc[0], casc[0]
+
+
+def test_the_cascade_names_the_unusable_file_list_part_of_the_wait(monkeypatch):
+    """A wait only a HUMAN can end must be named as one (review P1, round 7).
+
+    The three unusable-changed-file-list buckets are on `_finish`'s blindness axis (agent-infra#2136
+    r2) AND are announced per PR as `ASK-USER ... a human decides`. Folding them into a bare `wait=`
+    printed `wait=1 ... the chain is on rung 3` directly under that ASK-USER line, i.e. the frame
+    that says waiting is the answer -- for a 100+-file page that no re-read will ever change. They
+    STAY in `wait=` (reclassifying them would reverse #2136 r2); the line must DECOMPOSE the axis.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(68)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    # still on the blindness axis ...
+    assert "wait=1" in casc[0], casc[0]
+    # ... and decomposed, with the human decision named next to the rung claim.
+    assert "filelist=1" in casc[0], casc[0]
+    assert "a human must resolve" in casc[0], casc[0]
+    # the per-PR ASK-USER line and the cascade line now agree about WHO ends this hold.
+    assert "ASK-USER" in joined, joined
+    # a pass with NO unusable-file-list hold must not print the term at all (no zero-count clause).
+    # NOTE: the fixture's `files: []` is what routes a row through this gate, so the negative case
+    # needs a real (non-empty) list AND `SURFACE_BLIND` off -- the same shape `_pr` gives a normally
+    # read PR, not a different code path.
+    monkeypatch.setattr(pr, "SURFACE_BLIND", False)
+    _read = _pr(69)
+    _read["files"] = [{"path": "scripts/pr-doctor.py"}]
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_read], ("fix-ci", "red", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "filelist=" not in casc[0], casc[0]
+    assert "a human must resolve" not in casc[0], casc[0]
+
+
+def test_the_cascade_wait_rung_counts_a_still_running_head(monkeypatch):
+    """`wait=` must count the `running` rows -- the half that was left unpinned (review P2, round 8).
+
+    ⛔ Removing `skipped-running` from `_r3_wait` left every other cascade test GREEN, so the
+    population whose structural-0 defect is this block's stated reason to exist had no assertion
+    behind it. ⛔ AND `running` IS NOT `_finish`'s BLINDNESS AXIS: `blind = unread + blind_surface +
+    blind_partial + blind_abandoned` has no `running` term, so `wait=` is `blind` PLUS `running` --
+    not `blind` itself, which is what an earlier revision of the block's comment claimed.
+    """
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(71)], ("running", "", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=1" in casc[0], casc[0]
+    assert "nothing to dispatch" not in casc[0], casc[0]
+    assert "rung 3" in casc[0], casc[0]
+    assert "filelist=" not in casc[0], casc[0]
+
+
+def test_the_cascade_wait_rung_counts_an_unreadable_classification(monkeypatch):
+    """`wait=` must count the `skipped-unreadable` rows -- the OTHER half of the wait axis.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 10): `_r3_wait` sums `skipped-running` +
+    `skipped-unreadable`, and only the `running` half had an assertion behind it. Deleting
+    `skipped-unreadable` from that sum left the suite GREEN (mutation: `("skipped-running",)` ->
+    `12 passed` over `-k "cascade or rung2 or rung3 or wait or held"`, identical to the unmutated
+    baseline), so the population #1872 r2 exists for could be dropped in silence -- while the banner
+    above names "an unreadable classification" as one of rung 3's three populations.
+
+    The fixture MUST be a MIXED pass: an all-unreadable pass returns at the REFUSING arm
+    (`not classified and skipped.get("unreadable") == len(prs)`), which sits ABOVE the cascade line,
+    so it can never reach the term under test.
+    """
+    def _classify(p):
+        if p["number"] == 73:
+            return None          # a blind check-run read is a HOLD, never work
+        return ("fix-ci", "red", [])
+
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(72), _pr(73)], _classify)
+    assert "1 PR(s) had UNREADABLE checks" in joined, joined
+    assert payload.get("unreadable") == 1, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    # the wait axis counts it, beside the rung-2 row that did go out
+    assert "wait=1" in casc[0], casc[0]
+    assert "fix=1" in casc[0], casc[0]
+
+
+def test_the_cascade_counts_a_PARTIAL_file_page(monkeypatch):
+    """`surface_partial` must reach `wait=` and `filelist=` -- the bucket was unpinned.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 11). `_r3_files` sums THREE buckets, and dropping
+    `skipped-surface_partial` from it left the suite exactly at baseline (`8 failed, 310 passed`
+    over the whole file, same names) -- the bucket was unpinned through the cascade line, while its
+    sibling test only ever drove `surface_unreadable`. A 100-entry page is the fixture that reaches
+    this bucket by construction (`len(files) >= 100` -> `FILES_TRUNCATED`), and it is also the
+    population round 7 called out: the wait IS rung 3 (#2136 r2), and "a human must resolve" is the
+    clause that says it will not clear by waiting.
+    """
+    _p = _pr(74)
+    _p["files"] = [{"path": "docs/%d.md" % _i} for _i in range(100)]
+    _rc, joined, payload = _drive_pass(monkeypatch, [_p], ("record-review", "why", []))
+    assert payload.get("surface_partial") == 1, payload
+    assert payload.get("dispatched") == 0, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=1" in casc[0], casc[0]
+    assert "filelist=1" in casc[0], casc[0]
+    # on the wait axis (#2136 r2), AND decomposed so the human decision is unmissable
+    assert "the chain is on rung 3" in casc[0], casc[0]
+    assert "a human must resolve" in casc[0], casc[0]
+
+
+def test_the_cascade_counts_an_ABANDONED_file_read(monkeypatch):
+    """`surface_abandoned` must reach `wait=` too -- the third bucket, equally unpinned.
+
+    ⛔ MEASURED (review P2, round 11): dropping `skipped-surface_abandoned` from `_r3_files` left
+    the suite at baseline (`8 failed, 310 passed`). The bucket is written AFTER the two-strike
+    bound (`_asked = file_read_failures < 2`), so reaching it needs THREE unusable-file PRs, not
+    one: the first two are real failed reads and the third is never attempted.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(75), _pr(76), _pr(77)],
+                                       ("record-review", "why", []))
+    assert payload.get("surface_unreadable") == 2, payload
+    assert payload.get("surface_abandoned") == 1, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=3" in casc[0], casc[0]
+    assert "filelist=3" in casc[0], casc[0]
+
+
+def test_the_cascade_both_population_arm_prints_the_TOTAL_not_the_ask_user_count(monkeypatch):
+    """When BOTH hold populations are non-empty, `held=` is their SUM -- the third arm's twin.
+
+    ⛔ MEASURED (review P2, round 11): changing the both-arm's `% (_r3 + _held, ...)` to
+    `% (_held, ...)` left the suite at baseline (`8 failed, 310 passed`). `held=` would then be
+    the ASK-USER count alone while the same line still said "1 waiting on rung 3", i.e. the
+    double-quantity defect rounds 3/6 closed for the other two arms, resurrected in the one arm
+    nobody had a fixture for.
+    """
+    monkeypatch.setattr(pr, "CLASSIFIER", pr.CLASSIFIER)
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: p["number"] == 79,
+                        raising=False)
+
+    def _classify(p):
+        if p["number"] == 78:
+            return None          # a blind check-run read: held on the retry axis
+        return ("record-review", "why", [])
+
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(78), _pr(79)], _classify)
+    assert payload.get("unreadable") == 1, payload
+    # the surface hold is not a sidecar field; it is asserted on the two lines that carry it
+    assert "ASK-USER #79" in joined, joined
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert casc[0].count("held=") == 1, casc[0]   # ONE label per line
+    assert "held=2" in casc[0], casc[0]           # _r3 (1 unreadable) + _held (1 surface)
+    assert "wait=1" in casc[0], casc[0]
+    assert "surface=1" in casc[0], casc[0]
+
+
+def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatch):
+    """Rung 1 must name what is ELIGIBLE; only `_finish` may say what was dispatched.
+
+    ⛔ THE MEASURED DEFECT (review P1): the arm printed `merge->handed to admin-merge.sh` off
+    `counts['call-rail']` plus the AGGREGATE `budgets['total']`. Two facts decide a row AFTER that
+    line prints, and either makes the sentence false:
+      * the COOLDOWN/`covered` arm removes a row dispatched on the previous pass at the same head,
+        while `counts` (built from `classified`, ABOVE that arm) still counts it -- so in steady
+        state nearly every pass claimed a handoff with `dispatched 0` on the very next line;
+      * rung 1 is `ACTION_CLASS['call-rail'] == 'review'`, so a zero REVIEW budget with fix slots
+        free refuses it while the aggregate total still reads > 0.
+    Both arms are pinned here: neither may emit the word "handed".
+    """
+    # (a) a plain call-rail row -> candidate, and NO handoff claim.
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(52)], ("call-rail", "gated", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "handed" not in casc[0], casc[0]
+    assert "dispatched" not in casc[0], casc[0]
+    assert "merge->candidate" in casc[0], casc[0]
+    # (b) the steady-state arm: the row is on COOLDOWN at the SAME head, so NOTHING is dispatched --
+    #     the line must still not claim a handoff.
+    head = "a" * 40                       # `_pr`'s default head, which is what the cooldown matches
+    _rc, joined, payload = _drive_pass(
+        monkeypatch, [_pr(53)], ("call-rail", "gated", []),
+        state={"53": {"action": "call-rail", "head": head, "at_epoch": pr.now()}})
+    assert payload.get("dispatched") == 0, (joined, payload)
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    # ⛔ THE ASSERTION MUST BE ABLE TO RED (review P2, round 9). `"handed"` appears in NO emitted
+    # cascade string (only in this block's comments), so `assert "handed" not in ...` was satisfied
+    # by every arm that ever shipped and pinned nothing about THIS line. What the line must actually
+    # say is pinned instead: the candidate claim IS made, and NO dispatch word is (only `_finish`
+    # may say a dispatch happened).
+    assert "merge->candidate" in casc[0], casc[0]
+    assert "dispatched" not in casc[0], casc[0]
+    assert "handed" not in casc[0], casc[0]
+
+
+def test_the_cascade_fix_arm_is_judged_on_its_OWN_class_budget(monkeypatch):
+    """`fix->candidate` must not be claimed when the FIX budget is exhausted but REVIEW is free.
+
+    ⛔ THE MEASURED DEFECT (review P1, 2026-10-31): `_r2` summed FIVE actions that span BOTH budget
+    classes -- `resolve-conflict`/`fix-ci`/`rerun-checks`/`blocked-by-rail` are FIX, `record-review`
+    is REVIEW (`ACTION_CLASS`) -- and then gated on `budgets["fix"] > 0 or budgets["review"] > 0`.
+    So with one `fix-ci` row and `MAX_FIX=0 MAX_REVIEW=3` the line read
+
+        fix->eligible (1); fix slots=0 review slots=3
+
+    -- asserting eligibility and refuting itself in the same clause, while the dispatch loop refused
+    the row at the per-class gate. `budgets["fix"] == 0` is the NORMAL busy-fleet state at the
+    shipped `MAX_FIX=3` (three fix workers holding their slots), so this was not an edge case.
+    The mirror is pinned here: a fix-class row with no fix slot must take the NO SLOT arm.
+    """
+    monkeypatch.setenv("MAX_FIX", "0")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(54)], ("fix-ci", "red", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix->NO SLOT" in casc[0], casc[0]
+    assert "fix->candidate" not in casc[0], casc[0]
+    assert payload.get("dispatched") == 0, (joined, payload)
+
+
+def test_the_cascade_arms_respect_the_AGGREGATE_ceiling_not_only_the_class(monkeypatch):
+    """`->candidate` must not be claimed when the AGGREGATE `--max` ceiling is 0.
+
+    ⛔ THE MEASURED DEFECT (review P1, round 3): gating on the class budget alone is still not "a
+    slot exists". The dispatch loop ALSO breaks on `dispatched >= budgets["total"]`, and
+    `pass_budgets` sets `out["total"] = min(out["total"], max(0, total_override))` while leaving
+    `out["fix"]`/`out["review"]` at their own values -- so `--max 0` (a documented operator flag)
+    yields `{'fix': 3, 'review': 3, 'total': 0}`. The arms then emitted
+
+        slots=0 merge->candidate (2), the rail decides; review slots=3
+
+    -- two numbers in one sentence that contradict each other, on the line built to stop exactly
+    that. The binding quantity is `min(budgets[cls], budgets["total"])`.
+    """
+    monkeypatch.setenv("MAX_FIX", "3")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    for action, arm in (("call-rail", "merge->"), ("fix-ci", "fix->"),
+                        ("record-review", "review->")):
+        _rc, joined, payload = _drive_pass(
+            monkeypatch, [_pr(60)], (action, "why", []),
+            argv=("pr-doctor.py", "--max", "0"))
+        casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+        assert len(casc) == 1, joined
+        assert "slots=0 " in casc[0] + " ", casc[0]
+        assert arm + "candidate" not in casc[0], (action, casc[0])
+        assert arm + "NO SLOT" in casc[0], (action, casc[0])
+        assert payload.get("dispatched") == 0, (action, joined, payload)
+
+
+def test_the_cascade_emits_one_held_quantity_under_one_label(monkeypatch):
+    """`held=` must mean ONE thing in one line (review P2, round 3).
+
+    The ASK-USER term printed `held=<surface>` and the "nothing dispatchable" arm printed
+    `held=<_r3 + _held>`, so a single line read `wait=1 held=1 ... nothing dispatchable -- held=2`.
+    The counts were disjoint (no double-count) but the LABEL collided, which is an ambiguous
+    self-report -- the defect class this block exists to remove. The ASK-USER term is `surface=`.
+    """
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: True, raising=False)
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(61)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "surface=1" in casc[0], casc[0]
+    # ONE `held=` in the line (the arm's total), and it is `_r3 + _held` = 0 + 1. Before the fix the
+    # line carried `held=1 ... held=2` -- two different quantities under one label.
+    assert casc[0].count("held=") == 1, casc[0]
+    assert "held=1" in casc[0], casc[0]
+
+
+def test_the_cascade_fix_arm_names_the_class_it_is_reporting(monkeypatch):
+    """The rung-2 term is emitted PER CLASS, so a review-class row is never reported as `fix->`.
+
+    Before the per-class split, a lone `record-review` row printed `fix->eligible (1)` -- a
+    mislabelled rung, which is what let the OR-gate false claim hide: the label named the wrong
+    budget, so a reader could not see that the row's own class was the one with no slot.
+    """
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(55)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->candidate" in casc[0], casc[0]
+    assert "fix->" not in casc[0], casc[0]
+
+
+def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
+    """A NO SLOT arm must name the term that is actually 0, not a hardcoded class.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 4): both arms printed `"<class> budget 0"`, but the
+    gate is `_eff(c) = min(budgets[c], budgets["total"])`. With the documented `--max 0` override
+    `budgets` is `{'fix': 3, 'review': 3, 'total': 0}`, so the line said
+
+        slots=0 merge->NO SLOT (review budget 0: inflight=0 alive=0 unproven=0)
+
+    — `MAX_REVIEW` was 3 and the appended numbers say nothing holds a slot, so the sentence named a
+    cause its own evidence refuted and sent the operator at the wrong knob. The arm must name the
+    AGGREGATE ceiling when that is the binding term, and the CLASS when the class is 0. Both
+    directions are pinned here so neither can be satisfied by a string that fits one of them.
+    """
+    # (a) the aggregate ceiling binds while the class budget is healthy -> name the ceiling.
+    monkeypatch.setenv("MAX_FIX", "3")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(62)], ("record-review", "why", []),
+        argv=("pr-doctor.py", "--max", "0"))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->NO SLOT" in casc[0], casc[0]
+    assert "aggregate ceiling" in casc[0], casc[0]
+    assert "review budget 0:" not in casc[0], casc[0]
+
+    # (b) the CLASS budget binds (and the ceiling is healthy) -> still name the class, honestly.
+    monkeypatch.setenv("MAX_REVIEW", "0")
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(63)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->NO SLOT (review budget 0 (the cap is 0" in casc[0], casc[0]
+    assert "aggregate ceiling" not in casc[0], casc[0]
+
+    # (c) BOTH CAPS CONFIGURED TO 0, NO `--max` PASSED (review P1, round 7; RELABELLED round 8).
+    #     `capacity()` accepts `"0"`, so this is the CONFIGURED-ZERO cause, NOT the saturated one --
+    #     an earlier revision of this comment called it "the ordinary saturated fleet at the shipped
+    #     caps", which is a different fixture (case (d) below) and a different sentence.
+    monkeypatch.setenv("MAX_FIX", "0")
+    monkeypatch.setenv("MAX_REVIEW", "0")
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(67)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->NO SLOT" in casc[0], casc[0]
+    assert "aggregate ceiling" not in casc[0], casc[0]
+    # NOTHING WAS SPENT, so the arm may not say a budget was consumed -- the appended
+    # `inflight=0 ...` refuted that in the same clause (review P1, round 8).
+    assert "the cap is 0, so nothing was spent" in casc[0], casc[0]
+    assert "slots in use" not in casc[0], casc[0]
+
+    # (d) THE GENUINELY SATURATED FLEET: shipped caps, EVERY slot held (review P2, round 8). This is
+    #     the population round 7's comment described and whose fixture was never built -- so the
+    #     opposite word ("spent") had no test either, and a revert to a blanket sentence stayed green.
+    for _k in ("MAX_FIX", "MAX_REVIEW"):
+        monkeypatch.delenv(_k, raising=False)
+    _now = pr.now()
+    _busy = {}
+    for _i in range(3):
+        _busy[str(900 + _i)] = {"action": "fix-ci", "head": "b" * 40,
+                                "at_epoch": _now, "worker": "w%d" % _i}
+    for _i in range(4):
+        _busy[str(910 + _i)] = {"action": "record-review", "head": "b" * 40,
+                                "at_epoch": _now, "worker": "r%d" % _i}
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(70)], ("record-review", "why", []), state=_busy)
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->NO SLOT" in casc[0], casc[0]
+    assert "no class budget available" in casc[0], casc[0]
+    assert "4 of 4 slots in use" in casc[0], casc[0]
+    assert "3 of 3 slots in use" in casc[0], casc[0]
+    assert "the cap is 0" not in casc[0], casc[0]
+    assert "aggregate ceiling" not in casc[0], casc[0]
+
+    # (e) A CLASS CONFIGURED 0 THAT STILL HAS CHARGED ROWS (review P1, round 9). `out[c] = max(0,
+    #     cap - used[c])` clamps at 0, so "the cap is 0" does NOT imply "nothing was spent" -- and
+    #     the round-8 wording said exactly that while the same clause printed `inflight=1`.
+    monkeypatch.setenv("MAX_FIX", "0")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    _charged = {"950": {"action": "fix-ci", "head": "c" * 40,
+                        "at_epoch": pr.now(), "worker": "w-charged"}}
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(72)], ("fix-ci", "red", []), state=_charged)
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix->NO SLOT" in casc[0], casc[0]
+    assert "still charged" in casc[0], casc[0]
+    assert "nothing was spent" not in casc[0], casc[0]
+    assert "inflight=1" in casc[0], casc[0]
+
+
+def test_the_cascade_rung2_total_is_not_reported_as_a_class_count(monkeypatch):
+    """`fix=` is the RUNG-2 total, and it must not read as a fix-CLASS count.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 4): `_r2 = sum(_r2_by_class.values())` spans both budget
+    classes, while the arms below name a class (`fix->` / `review->`). A pass whose only rung-2 row
+    was `record-review` therefore printed
+
+        cascade: order=merge>fix>wait merge=0 fix=1 wait=0 slots=6 review->candidate (1), review slots=3
+
+    — `fix=1` on a pass with NO fix-class row at all: one label, two quantities. The split is now
+    printed beside the total whenever a review-class row exists, so the line cannot be misread.
+
+    ⛔ THE SPLIT ITSELF COLLIDED WITH THE LABEL IT DISAMBIGUATES (review P2, round 7): it emitted
+    `fix=1(fix 0/review 1)`, i.e. the word `fix` against two different numbers inside one token —
+    exactly the ambiguity the paragraph above says was removed. It is now qualified so the outer
+    `fix=` is plainly the LADDER rung and the inner one the CLASS breakdown.
+    """
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(64)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix=1 (rung2: fix 0/review 1)" in casc[0], casc[0]
+    # ⛔ THE AGGREGATE `slots=` SAYS SO, AND THIS IS THE ASSERTION BEHIND IT (review P2, round 12).
+    # The standalone term prints `budgets["total"]` while the per-class arms print the EFFECTIVE
+    # `min(budgets[cls], total)` -- two quantities under one word at `MAX_FIX=1 MAX_REVIEW=3`
+    # (`slots=4 ... fix slots=1`). Dropping the `(aggregate)` suffix left the suite byte-identical, so
+    # the disambiguation had nothing holding it: this line is what makes the ambiguity unable to
+    # return silently, and it asserts BOTH tokens are present so the suffix is not mere decoration.
+    assert "slots=" in casc[0] and "(aggregate)" in casc[0], casc[0]
+    assert "review slots=" in casc[0], casc[0]
+    # and the fix-only case keeps the plain token, because there the total IS the class count.
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(65)], ("fix-ci", "red", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix=1 " in casc[0] + " ", casc[0]
+    assert "(rung2: " not in casc[0], casc[0]
+
+
+def test_the_cascade_names_the_WAIT_axis_separately_from_an_ASK_USER_hold(monkeypatch):
+    """`the chain is on rung 3` must not be printed on a pass whose wait count is 0.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 5): the terminal arm fired on `(_r3 or _held)` and
+    always appended the same sentence, so a pass whose ONLY hold was an ASK-USER surface row read
+
+        cascade: order=merge>fix>wait merge=0 fix=0 wait=0 surface=1 slots=7
+        nothing dispatchable -- held=1, the chain is on rung 3
+
+    — `wait=0` and "on rung 3" in one clause, while rung 3 is defined in this same block as
+    `running`/unreadable (blindness), explicitly NOT the ASK-USER population. Naming a rung by its
+    own definition the chain is not on is the same self-contradicting clause this arm was rewritten
+    for one round earlier, one population over.
+    """
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: True, raising=False)
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(66)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "wait=0" in casc[0], casc[0]
+    assert "rung 3" not in casc[0], casc[0]
+    assert "ASK-USER" in casc[0], casc[0]
+    # and the WAIT axis still makes its own claim when it is the population that holds.
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    monkeypatch.setattr(pr.CLASSIFIER, "touches_surface", lambda p: False, raising=False)
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(67)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "the chain is on rung 3" in casc[0], casc[0]
+    assert "ASK-USER" not in casc[0], casc[0]
+
+
+def test_every_rung2_action_in_the_ranking_is_COUNTED(monkeypatch):
+    """The rung-2 SET must come from `ranked`, so a new dispatchable action cannot go uncounted.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 6): the block iterated a hand-kept literal of the five
+    rung-2 actions while its own comment claimed the classes came from `ACTION_CLASS`, "never a
+    second hand-kept list... so a new action is classified once". Nothing pinned the literal to
+    `ranked`: an action added there (and to `ACTION_CLASS`) would be counted by neither `_r1`
+    (hardcoded `call-rail`) nor `_r2`, and the pass would print
+
+        cascade: order=merge>fix>wait merge=0 fix=0 wait=0 ... nothing to dispatch (no mergeable,
+        no repairable)
+
+    with a dispatchable row in hand — the precise false statement this block exists to remove, and
+    the same class this file keeps re-finding. The derivation is now `ranked` itself; this pin
+    drives EVERY rung-2 action through a pass and asserts its class arm appears, so a literal that
+    drops one reddens here.
+    """
+    import pathlib as _pl
+    src = _pl.Path(pr.__file__).read_text(encoding="utf-8")
+    assert '"resolve-conflict", "record-review", "fix-ci", "rerun-checks", "blocked-by-rail"' \
+        not in src, "a second hand-kept rung-2 action list is back — derive from `ranked`"
+    n = 70
+    for action in ("rerun-checks", "record-review", "resolve-conflict", "blocked-by-rail", "fix-ci"):
+        n += 1
+        _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(n)], (action, "why", []))
+        casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+        assert len(casc) == 1, (action, joined)
+        _cls = pr.ACTION_CLASS[action]
+        assert "%s->" % _cls in casc[0], (action, casc[0])
+        assert "nothing to dispatch" not in casc[0], (action, casc[0])
+        assert "fix=0 " not in casc[0] + " ", (action, casc[0])
+
+
 def test_two_failed_file_reads_stop_the_per_pr_requests_but_still_refuse(monkeypatch):
     """The per-PR read is BOUNDED: after two failures the pass stops asking, and still refuses.
 
@@ -5008,7 +5518,12 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "load_state", lambda: dict(state or {}))
     monkeypatch.setattr(pr, "save_state", lambda st: None)   # never touch the live state file
     monkeypatch.setattr(pr, "open_prs", lambda: prs)
-    monkeypatch.setattr(pr, "classify", lambda p: classified)
+    monkeypatch.setattr(pr, "classify",
+                        # ⛔ A CALLABLE LETS ONE PASS CARRY DIFFERENT CLASSIFICATIONS PER PR. A mixed
+                        # pass is the ONLY shape that reaches the cascade's `wait=` term with a
+                        # rung-2 row beside it, because an all-unreadable pass RETURNS at the
+                        # REFUSING arm (above the cascade line). A tuple stays the common case.
+                        classified if callable(classified) else (lambda p: classified))
     monkeypatch.setattr(pr, "worker_live", live if callable(live) else (lambda name: live))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
