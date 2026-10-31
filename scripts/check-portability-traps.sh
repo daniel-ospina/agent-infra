@@ -472,12 +472,35 @@ function unexpanded(line,   v) {
 # passed as VALUES (`TMPDIR=/proc/definitely-not-writable bash …`, `*_DIR="/proc/nope/gate"`), none of
 # which reads procfs. The header blesses exactly this idiom for the other rules ("the presence probe,
 # then the call"), so the probe line must not carry a finding whose remedy is the thing it probes for.
-function procfs_rule(code, raw) {
-  if (code ~ /\[[ \t]+-[A-Za-z]+[ \t]+"?\/proc\//) return 0          # [ -d /proc/self ]
-  if (code ~ /\[\[[ \t]+-[A-Za-z]+[ \t]+"?\/proc\//) return 0         # [[ -r /proc/x ]]
-  if (raw ~ /=[ \t]*["\047]?[^ \t"\047;&|()]*\/proc\//) return 0      # VAR=/proc/… or VAR="/proc/…"
-  if (proc_read(code)) return 1
-  return quoted_procfs(raw)
+function procfs_rule(code, raw,   v, w, r2) {
+  # ⛔ THE PROBE AND THE ASSIGNMENT VALUE ARE MASKED, NOT EXCUSED (review cycle-12 P1): these three
+  # arms each returned 0 for the WHOLE LINE, so a probe — or an assignment VALUE — anywhere on it
+  # blessed every procfs READ beside it:
+  #     [ -r /proc/loadavg ] && read -r load _ < /proc/loadavg        ← the read ran UNREPORTED
+  #     PROC_DIR=/proc/self; grep -c . /proc/1/status                 ← same
+  # The header promises "a presence probe guards the call CONDITIONED on it, not every call on its
+  # line", and masking the construct is what that sentence means: the real shape in this tree
+  # (capacity.sh:341 then :364, one probe then a read) collapses onto one line without loss.
+  # ⛔ MASK ON THE `code` VIEW ONLY: masking the probe out of `raw` lost four real findings whose
+  # probe path IS the read (harness-up:379, box-status.sh:242, watchdog-loop.sh:251,
+  # sweep-orphans.sh:111 — `[ -r "/proc/$pid/cmdline" ]`), so a QUOTED probe is still caught below.
+  v = code
+  gsub(/\[[ \t]+-[A-Za-z]+[ \t]+"?\/proc\//, "\001", v)
+  gsub(/\[\[[ \t]+-[A-Za-z]+[ \t]+"?\/proc\//, "\001", v)
+  w = v
+  gsub(/=[ \t]*["\047]?[^ \t"\047;&|()]*\/proc\//, "=\001", w)
+  if (proc_read(w)) return 1
+  # ⛔ THE SAME MASKING APPLIES TO THE QUOTED VIEW, OR A FIXTURE STRING IS A FINDING (masking the
+  # `code` view alone surfaced two rows that are DATA, not reads: this suite ships
+  # a fixture ARGUMENT holding `[ -r /proc/loadavg ]`, and tests/gh-shim/run.sh passes
+  # `AGENT_GH_GATE_DIR="/proc/nope/gate"` as an env VALUE. Both are the trap-as-data class the C
+  # section exists for). The real findings this must keep are the QUOTED PROBE PATHS — `[ -r
+  # "/proc/$pid/cmdline" ]` in harness-up:379 and three siblings — where the probe IS the read: only a
+  # probe whose own `[` is INSIDE a quote is masked, and an assignment VALUE is masked outright.
+  r2 = raw
+  gsub(/["\047][ \t]*\[\[?[ \t]+-[A-Za-z]+[ \t]+"?\/proc\//, "\001", r2)
+  gsub(/=[ \t]*["\047]?[^ \t"\047;&|()]*\/proc\//, "=\001", r2)
+  return quoted_procfs(r2)
 }
 # proc_read(code) — a /proc/ path that is NOT the right-hand side of an assignment.
 function proc_read(code,   v, i, prev) {
@@ -607,8 +630,13 @@ function conditioned(tool, code,   pr, c2, cal, arm, m1, m2, p_and, p_then, rest
   # install-controller-service.sh). The control keywords and a leading assignment are admitted here;
   # a wrapper-with-args is NOT, so `grep -q command -v` still cannot pose as a probe.
   pr = "(^|" SEP ")[ \t]*" asg pctl "(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
-  if (code !~ pr) return 0
-  if (code ~ /if[ \t]+!/) return 0
+  if (!match(code, pr)) return 0
+  # ⛔ THE NEGATION TEST IS SCOPED TO THE PROBE ITSELF (review cycle-12 P2): `code ~ /if[ \t]+!/` was
+  # LINE-wide, so an unrelated negated test later on the line destroyed a correctly-probed call —
+  # `command -v timeout … && timeout 5 sleep 1; if ! [ -d "$d" ]; then mkdir -p "$d"; fi` reded while
+  # the same line without the trailing test was clean, i.e. portable code flagged. Only the PROBE
+  # being negated (`if ! command -v …`) makes it no guard at all.
+  if (substr(code, RSTART, RLENGTH) ~ /!/) return 0
   c2 = code
   sub(pr, "\001", c2)
 
@@ -698,7 +726,9 @@ function toolcalls(code, tool,   t, n) {
 # live macOS trap) is the one this file never takes.
 function probe_then(tool, code,   i, p, pr) {
   pr = "(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool "[^|(){}]*[ \t]then[ \t]*$"
-  if (code ~ /if[ \t]+!/) return 0
+  # ⛔ NO LINE-WIDE NEGATION TEST HERE EITHER (review cycle-12 P2): the historical probe line is
+  # checked for its own `!` in the loop below, and the CURRENT line carrying an unrelated `if !`
+  # says nothing about the opener 1-8 lines up.
   for (i = 1; i <= 8; i++) {
     p = (FNR - i) % 8
     if (p in hist && hist[p] ~ pr && hist[p] !~ /if[ \t]+!/) return 1
@@ -824,12 +854,47 @@ function cmd_long_re(code, tool, pat,   t, k, segs, n) {
 }
 # cmd_cluster(code, tool, letters) — `tool` invoked with a SHORT OPTION CLUSTER containing `letters`
 # (`readlink -nf`, `grep -qP`). Scoped to the tool own command, never to the whole line.
+# cmdunits(code, segs) — split a LINE into COMMAND UNITS and return the count. A unit is what runs
+# together in one alternative budget: `&&`/`||`, a pipeline, a redirection and an arm-opening `;`
+# (`; then`, `; else`, `; fi` …) do NOT separate units, because a guarded chain written either way is
+# ONE construction. `;` and a BARE `&` do. Masking is length-preserving and only used for the split,
+# so a caller can still test the original text.
+function cmdunits(code, segs,   t, n) {
+  t = code
+  gsub(/&&/, "\002\002", t)
+  gsub(/[<>]&/, "\002\002", t)
+  gsub(/;[ \t]*(then|else|elif|fi|do|done)([ \t]|$)/, "\002\002\002\002", t)
+  gsub(/;/, "\n", t)
+  gsub(/&/, "\n", t)
+  return split(t, segs, "\n")
+}
+
+# gnu_only_unit(code, tool, shortflag, longform, bsd1, bsd2) — 1 when SOME command unit calls `tool`
+# with the GNU spelling and carries NO BSD counterpart of its own.
+function gnu_only_unit(code, tool, shortf, longf, bsd1, bsd2,   segs, n, k, hasg) {
+  n = cmdunits(code, segs)
+  for (k = 1; k <= n; k++) {
+    if (!cp(segs[k], tool)) continue
+    hasg = (shortf != "" && cmd_opt(segs[k], tool, shortf)) || (longf != "" && opt_long(segs[k], tool, longf))
+    if (!hasg) continue
+    if (cmd_opt(segs[k], tool, bsd1)) continue
+    if (bsd2 != "" && cmd_opt(segs[k], tool, bsd2)) continue
+    return 1
+  }
+  return 0
+}
+
 function cmd_cluster(code, tool, letters,   t, k, segs, n) {
   t = code
   gsub(/[|&;(){}]/, "\n", t)
   n = split(t, segs, "\n")
   for (k = 1; k <= n; k++) {
-    if (cp(segs[k], tool) && segs[k] ~ ("(^|[ \t])-[A-Za-z]*" letters "([ \t=]|$)")) return 1
+    # ⛔ BSD REJECTS THE FLAG WHEREVER IT SITS IN THE CLUSTER (review cycle-12 P1): requiring the
+    # letter to END the cluster made `grep -Pq x` and `readlink -fn -- d` CLEAN while `grep -qP` and
+    # `readlink -nf` flagged — the flag POSITION is not a property of the trap. The trailing
+    # `[A-Za-z]*` admits the rest of the cluster; `.bak`-style suffixes are not `[A-Za-z]*`, so the
+    # portable `sed -i.bak` spelling is untouched (sed has its own rule anyway).
+    if (cp(segs[k], tool) && segs[k] ~ ("(^|[ \t])-[A-Za-z]*" letters "[A-Za-z]*([ \t=]|$)")) return 1
   }
   return 0
 }
@@ -958,7 +1023,7 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # ⛔ THE LONG OPTION FAMILY, NOT JUST ONE MEMBER (review cycle-5 P2): `--canonicalize-missing` and
   # `--canonicalize-existing` are GNU-only too, and BSD/macOS readlink has neither.
   hit("readlink-f-bsd-absent",    ((cmd_cluster(code, "readlink", "f") || cmd_long_re(code, "readlink", "--canonicalize(-[a-z]+)?")) && !conditioned("readlink", code) && !probe_then("readlink", code)), "cd … && pwd -P")
-  hit("grep-P-bsd-absent",        cmd_cluster(code, "grep", "P"), "grep -E")
+  hit("grep-P-bsd-absent",        (cmd_cluster(code, "grep", "P") || cmd_long_re(code, "grep", "--perl-regexp")), "grep -E")
   # ⛔ A LINE THAT ALREADY NAMES THE BSD COUNTERPART IS THE GUARDED CHAIN (review cycle-1 P2):
   # `stat -c %Y f || stat -f %m f` and `date -d @$t || date -r $t` are portable as written — that is
   # the idiom the header promises is clean — and 35 of the baselined date/stat findings were exactly
@@ -977,8 +1042,17 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # AND `date -v` IS THE OTHER BSD COUNTERPART (review cycle-4 P1): macOS answers the EXPRESSION form
   # with `-v`, so `date -u -d 4 minutes ago … || date -u -v-4M …` is a guarded chain exactly like
   # `-r` — 17 live findings were labelled "NOT yet repaired" while being portable as written.
-  hit("date-d-gnu",               ((cmd_opt(code, "date", "-d") || opt_long(code, "date", "date")) && !cmd_opt(code, "date", "-r") && !cmd_opt(code, "date", "-v")), "box_epoch_to_iso (scripts/lib/box.sh)")
-  hit("stat-c-gnu",               ((cmd_opt(code, "stat", "-c") || opt_long(code, "stat", "format")) && !cmd_opt(code, "stat", "-f")), "box_mtime (scripts/lib/box.sh)")
+  # ⛔ THE COUNTERPART MUST BELONG TO THE SAME COMMAND (review cycle-12 P0). The comment above says
+  # exactly that, but the code tested `!cmd_opt(code, …)` — a LINE-wide negation — so ONE guarded
+  # chain exonerated an unguarded call beside it:
+  #     stat -c %Y f || stat -f %m f; stat -c %Y g          ← the second command is a live trap
+  #     t=$(date -d @0 +%s || date -r 0 +%s); echo "$(date -d "$t" +%F)"
+  # Both came back CLEAN. `gnu_only_unit()` evaluates per COMMAND UNIT: `;` and a bare `&` separate
+  # units, `&&`/`||`/redirections and an arm-opening `;` (as in `if probe; then GNU; else BSD; fi`)
+  # stay INSIDE one unit — so the blessed chains stay clean and only a unit with no counterpart is
+  # reported.
+  hit("date-d-gnu",               gnu_only_unit(code, "date", "-d", "date", "-r", "-v"), "box_epoch_to_iso (scripts/lib/box.sh)")
+  hit("stat-c-gnu",               gnu_only_unit(code, "stat", "-c", "format", "-f", ""), "box_mtime (scripts/lib/box.sh)")
   hit("free-macos-absent",        cp(code, "free"), "`vm_stat` on macOS and `/proc/meminfo` on Linux (this tree does that per file today, e.g. `scripts/orchestrator-harness/orch-loop.sh`; no `box_*` memory shim exists yet)")
   # ⛔ `${x#/proc/}` IS A PARAMETER EXPANSION, NOT A READ (review cycle-1 P2): the `code` view keeps
   # `${…}` bodies (they are code), so the bare `/proc/` test flagged a string-strip expression. The
@@ -1120,7 +1194,7 @@ function timeout_rule(code) {
 #      `readlink -nf` / `grep -qP`.
 #   3. the ATTACHED empty-quote spelling `sed -i""` / `-i''` was reported under the GNU rule (wrong
 #      key, wrong failure mode): it is the BSD spelling whichever side of the separator it sits on.
-function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat, shim) {
+function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat, shim, segdone) {
   if (!cp(code, "sed")) return 0
   # ⛔ THE SHIM MUST BE CALLED, NOT MENTIONED — AND IN ITS OWN SEGMENT (cycle-9 P1, cycle-11 P1): a
   # whole-line test let `box_sed_i "s/a/b/" f; sed -i "s/a/b/" g` pass, so a correct construct in one
@@ -1137,7 +1211,12 @@ function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat
     if (shim && (cp(seg, "box_sed_i") || seg ~ ("[$][(][ \t]*box_sed_i" rb))) continue
     if (!cp(seg, "sed")) continue
     # the LONG form is GNU-only on every suffix (BSD sed has no `--in-place` at all)
-    if (seg ~ /--in-place([=][^ \t]*)?([ \t]|$)/) { hit("sed-in-place-gnu", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); return 0 }
+    # ⛔ A SECOND LIVE TRAP ON THE SAME LINE IS STILL A TRAP (review cycle-12 P2): these arms RETURNED
+    # from the whole rule after one hit, so `sed -i s/a/b/ f; sed -i s/c/d/ g` counted 1 while the
+    # same two calls on two lines counted 2 — and the ratchet is keyed on the COUNT, so appending a
+    # fresh `; sed -i …` to a line that already carried a finding stayed green. `break` leaves the
+    # option walk for THIS segment and lets the segment loop reach the next one.
+    if (seg ~ /--in-place([=][^ \t]*)?([ \t]|$)/) { hit("sed-in-place-gnu", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); break }
     n2 = length(seg)
     # ⛔ ONLY OPTIONS THAT BELONG TO THE TOOL, NOT TO AN EARLIER COMMAND (review cycle-8 P1): the walk
     # examined every `-word` in the segment, so `find . -execdir sed -i …` read `-execdir` as a sed
@@ -1149,7 +1228,9 @@ function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat
     if (match(seg, pfx "sed" rb) > 0) toolat = RSTART + RLENGTH
     else toolat = 0
     # walk every option TOKEN and examine the one that carries an `i`
+    segdone = 0
     for (i = 1; i <= n2; i++) {
+      if (segdone) break
       if (substr(seg, i, 1) != "-" || (i > 1 && substr(seg, i - 1, 1) !~ /[ \t]/)) continue
       if (i < toolat) continue
       if (substr(seg, i + 1, 1) == "-") continue
@@ -1171,14 +1252,15 @@ function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat
       if (rest ~ /["\047]/ && substr(seg, j + 1, 2) == "@@") break
       # attached EMPTY quotes (`-i""`, `-i''`): the BSD spelling, on either side of the separator
       q1 = substr(seg, j, 1); q2 = substr(seg, j + 1, 1)
-      if (q1 != "" && q1 == q2 && (q1 == "\"" || q1 == SQ)) { hit("sed-in-place-bsd", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); return 0 }
+      if (q1 != "" && q1 == q2 && (q1 == "\"" || q1 == SQ)) { hit("sed-in-place-bsd", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); segdone = 1; break }
       # a SEPARATOR then two empty quotes: `-i ""`
       if (rest ~ /[ \t]/ && (substr(seg, j + 1, 2) == "\047\047" || substr(seg, j + 1, 2) == "\"\"")) {
-        hit("sed-in-place-bsd", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); return 0
+        hit("sed-in-place-bsd", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); segdone = 1; break
       }
       # BARE `-i` (end of word) is the GNU spelling, and so is `-i` followed by a real script
       hit("sed-in-place-gnu", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i")
-      return 0
+      segdone = 1
+      break
     }
   }
   return 0

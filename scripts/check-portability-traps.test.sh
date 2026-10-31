@@ -803,6 +803,85 @@ else
   fi
 fi
 
+# ── C15. THE TWELFTH CYCLE — the last whole-line exemptions, and two constructs that were too narrow
+# Cycles 9-11 closed the "one construct exonerates the rest of the line" class for the probe, the sed
+# segments and the shims. An audit of every early `return`/`code ~` in the rule functions found the
+# remaining ones, each measured CLEAN at the previous head.
+C5="$TMP/cyc10"; : >"$C5"
+C5C="$TMP/cyc10clean"; : >"$C5C"
+mkc5()  { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C5"; }
+mkc5c() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C5C"; }
+
+# the BSD counterpart must belong to the SAME command: one guarded chain does not bless the next call
+mkc5 cyc10/1-stat-chain-then-gnu.sh '#!/usr/bin/env bash' 'stat -c %Y f || stat -f %m f; stat -c %Y g'
+mkc5 cyc10/2-date-chain-then-gnu.sh '#!/usr/bin/env bash' 't=$(date -d @0 +%s || date -r 0 +%s); echo "$(date -d "$t" +%F)"'
+# a probe (or an assignment VALUE) masks ITS OWN construct, not every read on the line
+mkc5 cyc10/3-probe-then-read.sh '#!/usr/bin/env bash' '[ -r /proc/loadavg ] && read -r load _ < /proc/loadavg'
+# the flag letter need not END the cluster, and grep has a long spelling too
+mkc5 cyc10/4-grep-cluster-mid.sh '#!/usr/bin/env bash' 'grep -Pq x f'
+mkc5 cyc10/5-grep-long.sh '#!/usr/bin/env bash' 'grep --perl-regexp -q x f'
+mkc5 cyc10/6-readlink-cluster-mid.sh '#!/usr/bin/env bash' 'readlink -fn -- d'
+
+# and the constructs that must stay clean
+mkc5c cyc10clean/1-guarded-chain.sh '#!/usr/bin/env bash' 'stat -c %Y f || stat -f %m f'
+mkc5c cyc10clean/2-if-else-chain.sh '#!/usr/bin/env bash' 'if [ -n "$E" ]; then d=$(date -d @0 +%s); else d=$(date -r 0 +%s); fi'
+mkc5c cyc10clean/3-probe-only.sh '#!/usr/bin/env bash' '[ -d /proc/self ]'
+mkc5c cyc10clean/4-proc-as-value.sh '#!/usr/bin/env bash' 'AGENT_GH_GATE_DIR="/proc/nope/gate" bash "$SHIM" api user'
+# an unrelated negated test later on the line must not destroy a correctly-probed call
+mkc5c cyc10clean/5-trailing-negation.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 sleep 1; if ! [ -d "$d" ]; then mkdir -p "$d"; fi'
+
+# a QUOTED probe PATH is the read — masking must not swallow it
+# (the fixture text carries the very shape it asserts, so the line needs the documented escape — the
+# detector scans THIS file, and the quoted path would otherwise be a finding on data)
+mkc5 cyc10/7-quoted-probe-read.sh '#!/usr/bin/env bash' 'if [ -r "/proc/$pid/cmdline" ]; then tr "\000" " " < "/proc/$pid/cmdline"; fi'  # portability-ok: fixture text for the C15a quoted-probe arm
+
+run_check "$C5" --no-baseline
+if [ "$?" = 2 ]; then
+  bad "C15: the cycle-12 fixture tree was REFUSED (rc=2) — an empty scan proves nothing"
+else
+  for pair in \
+    "stat-c-gnu cyc10/1-stat-chain-then-gnu.sh" \
+    "date-d-gnu cyc10/2-date-chain-then-gnu.sh" \
+    "procfs-macos-absent cyc10/3-probe-then-read.sh" \
+    "grep-P-bsd-absent cyc10/4-grep-cluster-mid.sh" \
+    "grep-P-bsd-absent cyc10/5-grep-long.sh" \
+    "readlink-f-bsd-absent cyc10/6-readlink-cluster-mid.sh" \
+    "procfs-macos-absent cyc10/7-quoted-probe-read.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      ok "C15a: caught $1 in $(basename "$2")"
+    else
+      bad "C15a: MISSED $1 in $(basename "$2") — a whole-line exemption is exonerating a real call"
+    fi
+  done
+  run_check "$C5C" --no-baseline
+  for pair in \
+    "stat-c-gnu cyc10clean/1-guarded-chain.sh" \
+    "date-d-gnu cyc10clean/2-if-else-chain.sh" \
+    "procfs-macos-absent cyc10clean/3-probe-only.sh" \
+    "procfs-macos-absent cyc10clean/4-proc-as-value.sh" \
+    "timeout-absent-on-macos cyc10clean/5-trailing-negation.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      bad "C15b: FALSE POSITIVE — $1 reded on correct $(basename "$2")"
+    else
+      ok "C15b: guarded/data code NOT flagged ($(basename "$2"))"
+    fi
+  done
+fi
+
+# ⛔ A SECOND LIVE TRAP ON THE SAME LINE IS COUNTED (review cycle-12 P2): the ratchet is keyed on the
+# COUNT, so a `return` after the first hit let `sed -i …; sed -i …` report 1 where two lines report 2
+# — a fresh trap appended beside an existing one stayed green forever.
+printf '%s\n' 'sed -i "s/a/b/" f; sed -i "s/c/d/" g' >"$TMP/tree/cyc10/8-two-sed-one-line.sh"
+printf '%s\n' cyc10/8-two-sed-one-line.sh >"$TMP/two.list"
+run_check "$TMP/two.list" --no-baseline
+n_two="$(awk -v r="sed-in-place-gnu" '{ n = split($0, a, ": "); if (n >= 2) { split(a[2], b, " "); if (b[1] == r) c++ } } END { print c + 0 }' "$OUT")"
+[ "$n_two" = 2 ] && ok "C15c: two sed-in-place traps on ONE line are counted twice (the ratchet can see the second)" \
+  || bad "C15c: two sed-in-place traps on one line counted $n_two, not 2 — a trap added beside an existing one stays green"
+
 # ⛔ D2. GUARD MUTANTS — the arms the `hit(…)` mutants cannot reach ──────────────────────────────
 # Section D deletes a rule's DISPATCH, which makes a finding disappear. A CROSS-LINE GUARD works the
 # other way round: it SUPPRESSES a finding, so deleting it makes the output larger and the D-style
