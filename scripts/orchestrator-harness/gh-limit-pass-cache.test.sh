@@ -57,7 +57,18 @@ ghx() {
   RC=$?
   ERR="$(cat "$T/.err")"
 }
-stub_calls() { wc -l < "$LOG" | tr -d ' '; }
+# ⛔ TWO COUNTERS, BECAUSE THE METER IS NOT A CACHE CANDIDATE (#2342 review, P2).
+# `gh-limit.py` spends ONE exempt `/rate_limit` probe on a core-only read when the box holds no budget
+# snapshot (`budget_snapshot_or_probe`) — the probe that lets the floor SEE rather than guess. It is a
+# real `--real-gh` invocation, so a single counter made every "N calls => N requests" assertion here
+# depend on whether a snapshot happened to exist yet: the FIRST block (fresh `$STATE`) counted 3 for 2
+# calls and went red on a suite this PR does not otherwise touch. `stub_calls` now counts the CALLER's
+# requests only and `meter_calls` pins the probe separately — the same split `gh-limit.test.sh`
+# already carries (`calls()` / `meter_calls()`).
+# ⛔ THE METER'S ARGV IS `api --include rate_limit` (the layer asks for the response headers), so a
+# `^api rate_limit$` pattern counts ZERO meter calls and excludes NOTHING — measured on the tree.
+stub_calls() { grep -vc 'rate_limit$' "$LOG" 2>/dev/null || true; }
+meter_calls() { grep -c 'rate_limit$' "$LOG" 2>/dev/null || true; }
 reset_log() { : > "$LOG"; }
 
 # ── 1) OFF BY DEFAULT ───────────────────────────────────────────────────────────────────────────
@@ -66,6 +77,10 @@ ghx "" "" -- api repos/o/r/pulls
 ghx "" "" -- api repos/o/r/pulls
 [ "$(stub_calls)" = "2" ] && ok "off: with GH_LIMIT_PASS_CACHE unset, two identical calls make two requests" \
                           || bad "off: a cached answer was served with the feature OFF ($(stub_calls) requests, want 2)"
+# …and the split is NOT a place for the probe to hide: a blind box spends exactly ONE meter read for
+# the whole block, and it is counted where it belongs.
+[ "$(meter_calls)" = "1" ] && ok "off: the blind box's ONE exempt /rate_limit probe is counted separately (1)" \
+                          || bad "off: the meter probe accounting moved ($(meter_calls) meter calls, want 1)"
 # ⛔ AND `0` IS OFF TOO. The value is a DIRECTORY, so `bool(value)` made the documented disable
 # ENABLE the cache — and `makedirs("0")` created a directory literally named `0` in the caller's cwd.
 # A switch that does the opposite of what it says is worse than none: the operator who turned the
@@ -131,7 +146,7 @@ ghx "$CACHE" "" -- api repos/o/r/pulls
 reset_log; rm -rf "$CACHE"
 ghx "$CACHE" "" -- api rate_limit
 ghx "$CACHE" "" -- api rate_limit
-[ "$(stub_calls)" = "2" ] && ok "meter: /rate_limit is ALWAYS asked live (2 for 2 calls)" \
+[ "$(meter_calls)" = "2" ] && ok "meter: /rate_limit is ALWAYS asked live (2 for 2 calls)" \
                           || bad "meter: /rate_limit was memoised — the pacing gate would read a budget that cannot move"
 
 # ── 6) THE CREDENTIAL IS NEVER WRITTEN TO DISK ───────────────────────────────────────────────
