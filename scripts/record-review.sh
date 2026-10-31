@@ -4065,6 +4065,20 @@ ${MISSING}"
   if [ -n "${MARKER:-}" ] && [ "${MARKER_SIGNED:-0}" = "1" ]; then
     # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
     # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
+    # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract says a producer
+    # must declare its admission residuals AT THE CONSTANT (ai-review-gate.yml
+    # :86-87, :421-424), so they live here rather than in a PR body nobody re-reads:
+    #   1. AUTHOR SET. A recording identity whose comment reports
+    #      `author_association` outside {OWNER, MEMBER, COLLABORATOR} (a GitHub-App
+    #      or bot token) is INVISIBLE to its own dedup read and to the gate → one
+    #      duplicate comment per run, and no comment-borne evidence admitted. It
+    #      degrades to the pre-change behaviour (the body mirror still carries the
+    #      verdict), so the record is never lost. Unarmed on this fleet: `gh`
+    #      authenticates as the repo owner (OWNER ⇒ admitted).
+    #   2. READ-FAILURE ARM. When the comment read FAILS (HAVE_COMMENT=-1) the
+    #      durable post is SKIPPED for that run BY DESIGN — an error body printed
+    #      to STDOUT must never be read as comment text. The body copy is
+    #      unaffected and the warning names the retry.
     PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
     HAVE_COMMENT=0
     if EXISTING_COMMENT_BODIES="$(command gh api --paginate \
