@@ -120,7 +120,8 @@ printf 'LANE_CANARY_A="unclosed\nLANE_CANARY_B=b8\n' > "$T/broken.env"
 out="$(logprobe "$T/broken.env")"
 # ⛔ HERE-STRINGS, NOT PIPES INTO A QUIET GREP (#841/#864). Under `pipefail`, `grep -q` exiting at its
 # first match leaves the `printf` writer to take SIGPIPE (141), and the pipeline status becomes non-zero
-# — so these assertions take the `else` branch and fail a verdict that IS in the output.
+# — so a file that DID report `SOURCED WITH ERRORS` falls down the `elif` and the assertions fail a
+# verdict that IS in the output. `scripts/check-no-sigpipe-grep.sh` enforces this shape.
 if grep -q 'SOURCED WITH ERRORS' <<<"$out"; then ok "(A8) an unparseable file reports SOURCED WITH ERRORS"
 elif grep -q 'env: sourced' <<<"$out"; then bad "(A8) an unparseable file was reported as a clean 'sourced': $out"
 else bad "(A8) no verdict at all for an unparseable file: $out"; fi
