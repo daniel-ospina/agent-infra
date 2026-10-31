@@ -2188,7 +2188,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     # was "for capacity" and the item is "free for other boxes" is FALSE for it — the remedy is to land
     # an open PR, on this box or any other. `capacity_yield_live` exports the gate, so the sentence can
     # name it instead of assuming load.
-    ynote=" | yields=$yld (stood down by a GATE refusal — this is NOT \"the fleet has nothing to do\"; a load/disk stand-down leaves them free for other boxes, a land-backlog one is repo-wide and clears only by landing)"
+    ynote=" | yields=$yld (stood down by a GATE refusal — this is NOT \"the fleet has nothing to do\"; a load/disk/capability stand-down leaves them free for other boxes, while a land-backlog or harness-skew one is NOT transferable and clears only by landing an open PR / syncing the helper pair)"
   fi
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
@@ -6153,6 +6153,15 @@ PY
         Y=$((Y+1))
         if [ "${CAPACITY_YIELD_GATE:-}" = "land" ]; then
           echo "[dispatch] #$ISS stood down — this box refused it at the LAND-BACKLOG gate (the repo's open-PR backlog is over its own landing ceiling; repo-wide, so NO peer can clear it by waiting — the remedy is to land an open PR) until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        elif [ "${CAPACITY_YIELD_GATE:-}" = "skew" ]; then
+          # ⛔ THE THIRD NON-TRANSFERABLE GATE, AND THE THIRD READER TO GET THE WORDS (follow-up review of
+          # #2991, P2, measured). lane.sh writes `gate=skew`, and this branch used to fall into the `else`
+          # below — publishing "yielded to peers — this box refused it for capacity" on the line an
+          # operator greps first. Both clauses are false for a skew refusal: it is not capacity, and no
+          # peer can take it (a peer runs the same caller/probe pair and refuses identically), so the
+          # operator would wait for a peer while the one working remedy — syncing the helper pair — goes
+          # unmentioned. Same shape as the `land` arm above, which is the precedent for this one.
+          echo "[dispatch] #$ISS stood down — this box refused it at the HARNESS/MISMATCH gate (the caller and the deployed cell-lane-preflight.sh disagree: version skew or a corrupt copy; every box running the same pair refuses identically, so NO peer can clear it — the remedy is to sync the helper pair, cp scripts/orchestrator-harness/*.sh \$O/ on every box) until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
         else
           echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
         fi
