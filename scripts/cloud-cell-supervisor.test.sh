@@ -4334,6 +4334,170 @@ if [ -n "$sched_ln" ] && [ -n "$queue_ln" ]; then
 fi
 
 
+# ── (zz) A CELL CAN RECOVER FROM ITS OWN LEFTOVERS — AND ONLY ITS OWN (agent-infra#2315) ─────────
+# Measured 2026-10-28 on pi-cell-3 and pi-cell-4: ~12h where `systemctl is-active` said `active` and
+# nothing cycled. Two leftovers had no recovery: a doctor session from a state dir that no longer
+# exists, and a controller of THIS cell's state dir leaked from another harness root.
+# ⛔ WHAT THESE LEGS MUST PROVE IS THE *SCOPE*, NOT THE AMBITION. An earlier revision of this change
+# matched "mentions orch-loop.sh AND carries O=ours", which is ALSO true of the sanctioned controller:
+# it would have killed the process `foreground_handover` exists to wait for, and the suite passed,
+# because no arm asserted that a sanctioned controller SURVIVES. Leg (3) is that arm.
+# ⛔ The decision half is portable on purpose: `_pid_is_foreign_root_leak` reads O through
+# `_controller_env_state_dir`, which the legs below override. That is what lets the CONJUNCTION be
+# tested on macOS, where /proc does not exist — instead of the whole matter skipping green.
+say_case "a cell recovers from its OWN leftovers — and never touches the sanctioned controller or a peer (#2315)"
+C="$T/own-guard"; mkdir -p "$C/o" "$C/h" "$C/bin" "$C/gone" "$C/peer"
+export C SUP
+fn() { sed -n "/^$1()/,/^}/p" "$SUP"; }
+{
+  echo 'log_line() { printf "%s\n" "$*"; }'
+  for f in _proc_root _scan_controller_paths _controller_env_state_dir _pid_is_foreign_root_leak \
+           _reap_still_leak cell_own_foreign_root_pids reap_own_foreign_root_leaks \
+           doctor_session_foreign doctor_session_orphaned_foreign; do fn "$f"; done
+} > "$C/lib.sh"
+# The conjunction legs (2)-(5) need the /proc read replaced: $FAKE_O is what it would say. The
+# COLLECTION legs (8)-(9) need the REAL reader — they supply a fake proc root — so they source
+# `lib2.sh`, which is the same set WITHOUT this override. Sharing one lib made legs 8-9 read an empty
+# O and report "the collection selected nothing", which is how a fixture can look like a code defect.
+cp "$C/lib.sh" "$C/lib2.sh"
+cat >> "$C/lib.sh" <<'SH'
+_controller_env_state_dir() { printf '%s\n' "${FAKE_O:-}"; }
+SH
+
+# (1) SHAPE — a shell whose command STRING merely mentions the path is not a controller
+out="$(printf '%s\n' "4242 bash -c 'vim /x/orch-loop.sh'" "4243 bash /x/orch-loop.sh" | bash -c '. "$C/lib.sh"; _scan_controller_paths')"
+case "$out" in
+  "4243 /x/orch-loop.sh") ok "only the controller SHAPE (argv is <shell> <path>) is a candidate — a command string that mentions the path is not (#2315)" ;;
+  *) bad "shape rule wrong — got [$out]" ;;
+esac
+
+# (2) THE NEGATIVE ARM — the sanctioned controller must NEVER be reaped (this is the P0-1 defect)
+O="$C/o"; H="$C/h"
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/o" bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 1 "'"$C"'/o/orch-loop.sh" "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  SAFE) ok "the SANCTIONED controller (\$O/orch-loop.sh carrying O=\$O) is NOT a reap candidate (#2315 P0-1)" ;;
+  *) bad "the reap would kill the cell's OWN controller — the P0-1 defect is back: [$out]" ;;
+esac
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/o" bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 2 "'"$C"'/h/orch-loop.sh" "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  SAFE) ok "the HARNESS-root controller (\$HARNESS/orch-loop.sh) is NOT a reap candidate (#2315)" ;;
+  *) bad "the reap would kill the harness controller: [$out]" ;;
+esac
+
+# (2b) THE DEPLOYED LAYOUT: the controller lives at <harness>/scripts/orchestrator-harness/orch-loop.sh,
+# not <harness>/orch-loop.sh. An equality test against the shallow shape excludes nothing and selects
+# the cell's own controller — measured live on pi-cell-4. This leg pins the nesting.
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/o" bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 21 "'"$C"'/h/scripts/orchestrator-harness/orch-loop.sh" "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  SAFE) ok "a controller NESTED under the harness root (\$HARNESS/scripts/orchestrator-harness/…) is NOT a candidate — the deployed layout" ;;
+  *) bad "the deployed nesting evaded the root exclusion — the cell's own controller would be reaped: [$out]" ;;
+esac
+
+# (3) a leak IS found: foreign root + our state dir in the environment
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/o" bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 3 /tmp/harness-refresh.x/s2/pinroot/abc/orch-loop.sh "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  LEAK) ok "a controller from ANOTHER root serving THIS state dir IS a candidate (the leak #2095 generates)" ;;
+  *) bad "a genuine foreign-root leak was not selected: [$out]" ;;
+esac
+
+# (4) PEER SAFETY — foreign root, but the environment names a DIFFERENT state dir
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/peer/o" bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 4 /tmp/other/orch-loop.sh "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  SAFE) ok "a PEER state dir's controller is never a candidate (#1761 — the property an over-broad match destroys)" ;;
+  *) bad "the reap selected a PEER cell's controller: [$out]" ;;
+esac
+
+# (5) trailing slash on either side must not silently disable the (safe) match
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/o/" bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 5 /tmp/other/orch-loop.sh "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  LEAK) ok "a trailing slash in O= does not defeat the match (normalised both sides)" ;;
+  *) bad "a trailing slash turned a real leak into a silent no-op" ;;
+esac
+
+# (6) the doctor parse against a VERBATIM rendered command (REPO=/HARNESS_REPO= present — the P0-2
+#     shape: their tails end in O='. An unanchored parse extracts `premise-labs/agent-infra` from it.)
+mkdir -p "$C/live"
+cat > "$C/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in
+  list-panes) cat "$C/pane.txt" ; exit 0 ;;
+  kill-session) printf '%s\n' "\$2" >> "$C/killed.log"; exit 0 ;;
+esac
+exit 1
+SH
+chmod +x "$C/bin/tmux"
+printf "%s\n" "set -a; . '/home/cmux/keys.env'; exec env REPO='daniel-ospina/agent-infra' HARNESS_REPO='premise-labs/agent-infra' O='$C/live' tee -a '$C/live/logs/cell-doctor.log'" > "$C/pane.txt"
+mkdir -p "$C/live/logs"
+out="$(PATH="$C/bin:$PATH" O="$C/o" DOCTOR_SESSION=cell-doctor bash -c '. "$C/lib.sh"; doctor_session_foreign && echo FOREIGN; doctor_session_orphaned_foreign && echo ORPHAN-ACCEPTED || echo REFUSED')"
+case "$out" in
+  *FOREIGN*REFUSED*) ok "a doctor session from a LIVE state dir is refused even with REPO=/HARNESS_REPO= in the string (the P0-2 greedy-parse defect)" ;;
+  *) bad "the doctor parse mis-read the rendered command — a live peer's session could be killed: [$out]" ;;
+esac
+[ -f "$C/killed.log" ] && bad "a peer's doctor session was KILLED (killed.log exists) — #1761 violation" \
+                       || ok "no peer doctor session was killed (killed.log is empty by absence)"
+
+# (7) and a session naming a state dir that no longer exists IS recoverable
+printf "%s\n" "set -a; . '/home/cmux/keys.env'; exec env REPO='daniel-ospina/agent-infra' HARNESS_REPO='premise-labs/agent-infra' O='$C/gone/o' tee -a '$C/gone/o/logs/cell-doctor.log'" > "$C/pane.txt"
+out="$(PATH="$C/bin:$PATH" O="$C/o" DOCTOR_SESSION=cell-doctor bash -c '. "$C/lib.sh"; doctor_session_foreign && echo FOREIGN; doctor_session_orphaned_foreign || echo REFUSED')"
+case "$out" in
+  *FOREIGN*"$C/gone/o"*) ok "a doctor session naming a VANISHED state dir is identified as recoverable (#2315)" ;;
+  *) bad "a vanished state dir's doctor session was not identified — got [$out]" ;;
+esac
+
+# (8) THE COLLECTION PATH, EXERCISED END TO END WITH A FAKE PROC ROOT + A STUBBED `ps`.
+# Without PROC_ROOT this leg cannot exist on a Mac, and the function that decides LIFE OR DEATH for a
+# running controller would ship with its happy path untested. The table below is the measured shape of
+# the incident: the sanctioned controller, a real leak (foreign root, OUR state dir), and a peer's
+# controller (foreign root, THEIR state dir) — all three alive at once.
+PR="$C/proc"; mkdir -p "$PR/101" "$PR/202" "$PR/303" "$C/bin2"
+printf 'O=%s\0' "$O"      > "$PR/101/environ"   # sanctioned controller
+printf 'O=%s\0' "$O"      > "$PR/202/environ"   # leak: foreign root, our state dir
+printf 'O=%s\0' "$C/peer/o" > "$PR/303/environ" # peer: foreign root, their state dir
+cat > "$C/bin2/ps" <<SH
+#!/bin/bash
+case "\$*" in
+  *"-eo pid=,command="*)
+    echo "101 bash $O/orch-loop.sh"
+    echo "202 bash /tmp/harness-refresh.zz/s2/pinroot/abc/orch-loop.sh"
+    echo "303 bash /tmp/other-cell/orch-loop.sh"
+    echo "404 sh -c vim /tmp/somewhere/orch-loop.sh"   # a STRING that mentions the path, not a controller
+    exit 0 ;;
+  *"-o pid=,command= -p 202"*) echo "202 bash /tmp/harness-refresh.zz/s2/pinroot/abc/orch-loop.sh"; exit 0 ;;
+  *"-o command= -p 202"*) echo "bash /tmp/harness-refresh.zz/s2/pinroot/abc/orch-loop.sh"; exit 0 ;;
+  *"-p 101"*) echo "101 bash $O/orch-loop.sh"; exit 0 ;;
+  *"-p 303"*) echo "303 bash /tmp/other-cell/orch-loop.sh"; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$C/bin2/ps"
+out="$(PATH="$C/bin2:$PATH" PROC_ROOT="$PR" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; cell_own_foreign_root_pids "$O" "$HARNESS"')"
+case "$out" in
+  202) ok "the COLLECTION path selects exactly the real leak — not the sanctioned controller (101), not the peer (303), not a command STRING (404)" ;;
+  *) bad "collection selected the wrong set — expected [202], got [$out]" ;;
+esac
+
+# (9) and the reap actually signals it, with the audit line naming only that pid
+reaped="$(PATH="$C/bin2:$PATH" PROC_ROOT="$PR" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; reap_own_foreign_root_leaks "$O" 1; echo "RC=$?"')"
+case "$reaped" in
+  *"pid 202"*) ok "the reap names the leak it is about to signal (auditable: which pid, which state dir)" ;;
+  *) bad "the reap did not name the pid it acted on — got [$(printf '%s' "$reaped" | tr '\n' ' ')]" ;;
+esac
+case "$reaped" in
+  *"RC=2"*) bad "the reap reported CANNOT-DETERMINE on a readable table (rc 2)" ;;
+  *) : ;;
+esac
+
+# (10) where /proc is absent the reap is inert AND says so, rather than reporting a clean sweep
+if [ -d /proc ]; then
+  ok "SKIPPED (this box has /proc — the Linux collection path is exercised on a cell, not here)"
+else
+  out="$(bash -c '. "$C/lib.sh"; cell_own_foreign_root_pids "'"$C"'/o" || echo NO-PROC; reap_own_foreign_root_leaks "'"$C"'/o" 1 && echo REAP-RC0')"
+  case "$out" in
+    *NO-PROC*REAP-RC0*) ok "without /proc the collector fails closed and the reap is a silent no-op (never a blind kill)" ;;
+    *) bad "the reap did not fail closed without /proc: [$out]" ;;
+  esac
+fi
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }

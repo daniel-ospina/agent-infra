@@ -668,6 +668,131 @@ LOCK_START_SLACK_SECONDS=5
 # ⛔ rc 1 = THE PROCESS TABLE COULD NOT BE READ. Every caller must treat that as cannot-determine:
 # an empty answer is what a broken `ps` returns, and acting on it is how a live controller gets
 # reported STOPPED.
+# ── reap this cell's own leaked controllers (#2315) ─────────────────────────────────────────────
+# A controller that serves THIS cell's state dir from a DIFFERENT harness root is a leak of this
+# cell's own (measured 2026-10-28: `harness-apply`'s proof-run left 16 on pi-cell-4 and refilled them
+# every 5 minutes, after which the ownership fence refused every start — #2095 + #2315).
+#
+# ⛔ THE RULE IS A CONJUNCTION AND EVERY TERM IS LOAD-BEARING (review P0-1, #2315). An earlier
+# revision matched "the ps line mentions orch-loop.sh AND the environment carries O=ours". Both are
+# true of the SANCTIONED controller, so it would have killed the very process `foreground_handover`
+# exists to wait for — and `O` is published into every worker session, so the match was even wider.
+# The terms:
+#   1. SHAPE    — argv is exactly `<shell> <path>/orch-loop.sh` (the rule `_controller_ps_awk` applies),
+#                 so a shell whose command STRING merely mentions the path is not a candidate.
+#   2. ROOT     — the path is OUTSIDE every sanctioned root (`$O/orch-loop.sh`, `$HARNESS/orch-loop.sh`).
+#                 That is what the word FOREIGN means. The earlier revision's comment claimed this
+#                 exclusion while the code implemented none — the defect, not a comment typo.
+#   3. CELL     — `/proc/<pid>/environ` carries `O=<our state dir>` (trailing slash normalised). This is
+#                 what keeps us inside #1761: a peer lane carries a DIFFERENT O and is never a candidate.
+#   4. IDENTITY — terms 1-3 are re-read immediately before EACH signal, so a recycled pid is neither
+#                 TERMed nor KILLed.
+#
+# ⛔ THE SPLIT IS DELIBERATE. `_scan_controller_paths` is the portable half (a ps table in, `pid path`
+# out) and `cell_own_foreign_root_pids` adds only the Linux `/proc` read. So the DECISION runs and is
+# tested on macOS — where /proc does not exist — instead of the suite skipping the whole matter green.
+_scan_controller_paths() { # stdin "<pid> <command>"; stdout "<pid> <script-path>" for controllers only
+  local p rest
+  while read -r p rest; do
+    case "$p" in ''|*[!0-9]*) continue ;; esac
+    [ "$p" = "$$" ] && continue
+    # shellcheck disable=SC2086 # word splitting is the point: argv is what we classify
+    set -- $rest
+    [ "$#" -eq 2 ] || continue
+    case "$1" in *bash|bash|*/sh|sh) ;; *) continue ;; esac
+    case "$2" in */orch-loop.sh) ;; *) continue ;; esac
+    printf '%s %s\n' "$p" "$2"
+  done
+}
+
+# ⛔ `PROC_ROOT` EXISTS SO THE COLLECTION PATH IS TESTABLE WHERE /proc IS ABSENT (macOS). Without a
+# seam, the only honest test of this function is on a Linux cell, and the suite on a Mac reports either
+# a vacuous pass or a skip — the failure mode that let an earlier revision of this change ship a matcher
+# that also selected the sanctioned controller. Production never sets it: the default IS /proc, and a
+# fake root must be a directory that is not the real one.
+_proc_root() { printf '%s' "${PROC_ROOT:-/proc}"; }
+
+_controller_env_state_dir() { # <pid>; the O= the process was EXEC'd with; rc 1 when unreadable
+  local pr; pr="$(_proc_root)"
+  [ -r "$pr/$1/environ" ] || return 1
+  tr '\0' '\n' < "$pr/$1/environ" 2>/dev/null | sed -n 's/^O=//p' | head -1
+}
+
+_pid_is_foreign_root_leak() { # <pid> <script-path> <state-dir> <harness-or-empty>
+  local p="$1" path="$2" d="${3%/}" h="${4:-}" o
+  h="${h%/}"
+  # ⛔ THE ROOT TEST IS A PREFIX, NOT `$root/orch-loop.sh` (found LIVE on pi-cell-4, 2026-10-28). The
+  # deployed controller is `<harness>/scripts/orchestrator-harness/orch-loop.sh`, so an equality test
+  # against `$HARNESS/orch-loop.sh` excluded NOTHING and the collector selected the cell's own
+  # controller (measured: selected 1122734 and 2792080, the sanctioned pids, alongside the real leak).
+  # The unit tests passed because their fixture used the shallow `<root>/orch-loop.sh` shape — the same
+  # class of mistake as the greedy doctor parse: a fixture that is not the deployed string.
+  case "$path" in "$d"|"$d"/*) return 1 ;; esac
+  if [ -n "$h" ]; then case "$path" in "$h"|"$h"/*) return 1 ;; esac; fi
+  o="$(_controller_env_state_dir "$p")" || return 1
+  [ "${o%/}" = "$d" ] || return 1
+  return 0
+}
+
+_reap_still_leak() { # <pid> <state-dir> <harness-or-empty>; the identity re-read before a signal
+  local p="$1" line path
+  line="$(ps -o pid=,command= -p "$p" 2>/dev/null)"
+  [ -n "$line" ] || return 1
+  path="$(printf '%s\n' "$line" | _scan_controller_paths | awk 'NR==1 { print $2 }')"
+  [ -n "$path" ] || return 1
+  _pid_is_foreign_root_leak "$p" "$path" "$2" "$3"
+}
+
+cell_own_foreign_root_pids() { # <state-dir> [harness]; rc 1 where /proc is absent (macOS)
+  local d="${1:-}" h="${2:-}" p path
+  [ -n "$d" ] || return 1
+  [ -d "$(_proc_root)" ] || return 1
+  ps -eo pid=,command= 2>/dev/null | _scan_controller_paths | while read -r p path; do
+    _pid_is_foreign_root_leak "$p" "$path" "$d" "$h" && printf '%s\n' "$p"
+  done
+  # ⛔ "NO CANDIDATES" IS rc 0, NOT rc 1 (review of my own first cut). The pipeline's status is its last
+  # command's, so a clean sweep where NOTHING matched returned 1 — and the caller reads 1 as CANNOT
+  # DETERMINE, turning the commonest good outcome into a spurious failure. Only a caller that cannot
+  # read the table at all is rc 1.
+  return 0
+}
+
+reap_own_foreign_root_leaks() { # <state-dir> [grace-seconds]; audited, bounded, non-fatal
+  # rc 0 — nothing to reap, or every candidate ended
+  # rc 1 — a candidate survived TERM and KILL (named out loud)
+  # rc 2 — CANNOT DETERMINE: the process table could not be read. Never a pass (the #1856 rule: a
+  #        failed read is not "no controller").
+  local d="${1:-}" g="${2:-10}" pids p i=0
+  [ -n "$d" ] || return 1
+  [ -d "$(_proc_root)" ] || return 0
+  pids="$(cell_own_foreign_root_pids "$d" "${HARNESS:-}")" || return 2
+  [ -n "$pids" ] || return 0
+  log_line "reaping leaked controller(s) holding THIS state dir ($d) from another harness root: pid $(printf '%s' "$pids" | tr '\n' ' ')"
+  for p in $pids; do
+    _reap_still_leak "$p" "$d" "${HARNESS:-}" || continue
+    kill -TERM "$p" 2>/dev/null && i=$((i + 1))
+  done
+  while [ "$i" -gt 0 ] && [ "$g" -gt 0 ]; do
+    sleep 1; g=$((g - 1)); i=0
+    for p in $pids; do _reap_still_leak "$p" "$d" "${HARNESS:-}" && kill -0 "$p" 2>/dev/null && i=$((i + 1)); done
+  done
+  if [ "$i" -gt 0 ]; then
+    log_line "warn: $i leaked controller(s) ignored TERM — sending KILL to the pids that still match"
+    for p in $pids; do
+      _reap_still_leak "$p" "$d" "${HARNESS:-}" || continue
+      kill -KILL "$p" 2>/dev/null || true
+    done
+    sleep 1
+  fi
+  local left
+  left="$(cell_own_foreign_root_pids "$d" "${HARNESS:-}")" || return 2
+  if [ -n "$left" ]; then
+    log_line "warn: leaked controller(s) SURVIVED the reap for $d: pid $(printf '%s' "$left" | tr '\n' ' ') — this start cannot rely on ownership; a human must act"
+    return 1
+  fi
+  log_line "reaped: no controller from another harness root serves $d any more"
+  return 0
+}
 owned_controller_pids() {
   local a b rc
   a="$(_controller_pids_path "$O/orch-loop.sh" "")" || return 1
@@ -2410,6 +2535,30 @@ scheduler_ensure() {
 # 1 = ours, or unknown (no pane answer at all): the caller heals rather than refusing a session it
 #     cannot prove is foreign — refusing on "unknown" would make `start` unable to repair its own
 #     leftover on a box whose `list-panes` is unavailable.
+# A doctor session judged FOREIGN whose named state dir does not exist serves nothing: the box it
+# belonged to is gone (a retired pin root, a removed cell home). `doctor_session_foreign` cannot tell
+# that apart from a live peer cell, and dying is right for a live peer — but with no way to clear a
+# dead one, `start` could never succeed again (#2315). Scoped to the ONE thing that makes it safe:
+# the named $O is ABSENT. A peer's state dir exists, so a live peer is still refused.
+doctor_session_orphaned_foreign() {
+  local cmd o
+  cmd="$(tmux list-panes -t "=$DOCTOR_SESSION" -F '#{pane_start_command}' 2>/dev/null)" || return 1
+  [ -n "$cmd" ] || return 1
+  # ⛔ ANCHOR THE MATCH, AND REQUIRE AN ABSOLUTE PATH (review P0-2, #2315). A greedy `.*O=` matches
+  # the LAST occurrence, and the rendered doctor string also carries `REPO='...'` and
+  # `HARNESS_REPO='...'` — whose tails end in `O='`. Measured on a rendered string: the unanchored form
+  # extracted `premise-labs/agent-infra`, a path that never exists, so EVERY foreign doctor session
+  # read as "retired" and this branch would have killed a LIVE PEER cell's doctor loop (the #1761
+  # property). The anchor is `O='` at a word boundary; a value that is not an absolute path is a parse
+  # failure, never an orphan.
+  o="$(printf '%s' "$cmd" | sed -n "s/.*[[:space:]\"']O='\([^']*\)'.*/\1/p" | head -1)"
+  [ -n "$o" ] || return 1
+  case "$o" in /*) ;; *) return 1 ;; esac
+  [ -d "$o" ] && return 1
+  printf '%s\n' "$o"
+  return 0
+}
+
 doctor_session_foreign() {
   local cmd
   cmd="$(tmux list-panes -t "=$DOCTOR_SESSION" -F '#{pane_start_command}' 2>/dev/null)" || return 1
@@ -2531,6 +2680,12 @@ cmd_start() {
   #     looking supervised forever.
   foreground_handover() {
     local _own _seen _saidd=0 _waited=0 _bound="${CONTROLLER_HANDOVER_TIMEOUT:-3600}"
+    # ⛔ REAP BEFORE THE LOOP: the loop's first act is to BREAK when nothing owns and no session
+    # exists — the state a cell is left in when its controller died — so an in-loop reap is
+    # unreachable in the case that matters. Scoped to OUR state dir (env O=), so a peer's controller
+    # is still refused, never killed (#2315 / #2095 / #1761).
+    reap_own_foreign_root_leaks "$O" || true
+
     local _orphan_bound="${CONTROLLER_ORPHAN_TIMEOUT:-60}"
     while :; do
       _own="$(owned_controller_pids 2>/dev/null)" \
@@ -2544,6 +2699,12 @@ cmd_start() {
       # dispatches nothing. So: no owned controller + a SEE-able one that is not ours = die, as the
       # non-service path does.
       if [ -z "$_own" ]; then
+        # ⛔ REAP OUR OWN LEAKS BEFORE REFUSING (#2315). The refusal below is right — a controller
+        # that is not provably this state dir's must never be handed to — but it left the cell
+        # permanently unstartable, because the leak it refuses is this cell's OWN and nothing ever
+        # cleared it: measured 12h dead on two cells, refilled every 5 minutes by #2095. Reaping is
+        # scoped to OUR state dir (env O=), so a peer's controller is still refused, never killed.
+        reap_own_foreign_root_leaks "$O" || true
         _seen="$(seen_controller_pids 2>/dev/null)" || _seen=""
         if [ -n "$_seen" ]; then
           die "a controller runs from this machine's shared harness path (pid $(_pids_join "$_seen")) and is not provably this state dir's — refusing to wait for it (that would supervise nothing while reporting an active unit); stop it from the state dir that owns it, or give this repo its own SESSION in $ENV_FILE"
@@ -2601,6 +2762,14 @@ cmd_start() {
   # deliberate --stop — un-stopping a schedule on a start that never started anything.
   # ⛔ ALSO AFTER #2235'S GH_REPO REFUSAL, the same rule one refusal later: a start that refuses must
   # not have cleared the OFF switch on its way to refusing.
+  # ⛔ REAP HERE, NOT ONLY IN SERVICE MODE (review P1-4, #2315). `foreground_handover` runs only when
+  # ORCH_FOREGROUND=1, so an operator's own `start` on a wedged cell missed it entirely and went on to
+  # report `already running (tmux session 'orch', …)` and return 0 — the measured 12-hour false green.
+  # Placed beside `scheduler_ensure`, BEFORE the `has-session` early return, so every verb that can act
+  # as the recovery path inherits it. Scoped to OUR state dir (env O=) plus the sanctioned-root
+  # exclusion, so a peer lane's controller is still never a candidate (#1761).
+  reap_own_foreign_root_leaks "$O" || true
+
   scheduler_ensure
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
@@ -3114,6 +3283,10 @@ unit_stop_effect_verdict() { # <unit>
 }
 cmd_stop() {
   local rc=0 lpid lident rpid rident i
+  # ⛔ #2315 NAMES `stop` EXPLICITLY ("neither start nor stop can clear"). A leaked controller from
+  # another harness root is invisible to the ownership reads below (foreign path, no lock), so `stop`
+  # walked past it and the refusal further down blamed the session. Reap first, same peer-safe scope.
+  reap_own_foreign_root_leaks "$O" || true
   # FIRST: drop the desired-state marker, THEN bump the generation. Both orders matter:
   #  * `.desired` gone before anything else means a pass that starts in the window below sees a
   #    "not started" cell (the doctor supervises nothing and launches no restart), and a pass already
@@ -3606,7 +3779,12 @@ start_doctor_loop() {
       return 0
     fi
     if doctor_session_foreign; then
-      die "doctor session '$DOCTOR_SESSION' belongs to another state dir — a session name is shared across cells, so it is not evidence that $OR has a doctor; pin a distinct DOCTOR_SESSION per cell in $ENV_FILE, or stop the cell that owns it"
+      if _gone_o="$(doctor_session_orphaned_foreign)"; then
+        log_line "doctor session '$DOCTOR_SESSION' belongs to the retired state dir '$_gone_o', which no longer exists — replacing it"
+        tmux kill-session -t "=$DOCTOR_SESSION" 2>/dev/null || true
+      else
+        die "doctor session '$DOCTOR_SESSION' belongs to another state dir — a session name is shared across cells, so it is not evidence that $OR has a doctor; pin a distinct DOCTOR_SESSION per cell in $ENV_FILE, or stop the cell that owns it"
+      fi
     fi
     # Ours-but-stale (its loop record is gone) or unprovable: replacing it is the heal `start` exists
     # for, and the alternative — reporting "already running" — would leave this cell with no doctor at
