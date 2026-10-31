@@ -3452,7 +3452,8 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     gate = (_HARNESS / "spawn-gate.sh").read_text()
     exported = dict(re.findall(r"^(AGENT_[A-Z_]+)=(\d+)$", gate, re.M))
     for const, code in (("AGENT_FORK_REFUSED", 73), ("AGENT_LAND_BACKLOG", 74),
-                        ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77)):
+                        ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77),
+                        ("AGENT_CAPABILITY_REFUSED", 71), ("AGENT_MEM_REFUSED", 81)):
         assert exported.get(const) == str(code), (
             "spawn-gate.sh no longer exports %s=%d -- GATE_REFUSAL_BOUND is stale" % (const, code))
         assert pr.GATE_REFUSAL_BOUND[code], "the gate declares %d and this file does not" % code
@@ -3465,8 +3466,14 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     # operator to "land/fix the open PRs -- this box is healthy", and a land-backlog hold would
     # tell them to restart a healthy box. Derived from the gate's own CONSTANT NAMES, so a
     # renumbering or a rename on either side reddens here.
+    # ⛔ THE LATE ARRIVALS ARE IN THE TABLE TOO (review of #2591, P2). `71: capability` and
+    # `81: memory` are new rows this change adds, and leaving them out reintroduced the very defect
+    # this block was written for on the new rows: a swap of `71 <-> 81` kept every assertion above
+    # green (same keys, both values truthy, same value SET) while an operator with a box at its
+    # MEMORY floor would be told to repair the box and one with a broken box to wait for lanes.
     want = {"AGENT_FORK_REFUSED": "fork", "AGENT_LAND_BACKLOG": "land-backlog",
-            "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk"}
+            "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk",
+            "AGENT_CAPABILITY_REFUSED": "capability", "AGENT_MEM_REFUSED": "memory"}
     for const, axis in want.items():
         code = int(exported[const])
         assert pr.GATE_REFUSAL_BOUND[code] == axis, (
