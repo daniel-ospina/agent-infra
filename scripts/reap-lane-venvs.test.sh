@@ -192,6 +192,9 @@ cat > "$T/bin/venv-cost" <<'SHIM'
 #!/usr/bin/env bash
 echo "fake-python $*" >/dev/null
 [ -n "${FAKE_VENV_COST_FAIL:-}" ] && { echo "fake-python: no such helper" >&2; exit 1; }
+# A probe that HANGS is the only way to prove the call site is bounded at all (#2159 review, P2):
+# success and immediate-failure both take the same `|| return 1` path with or without run_bounded.
+[ -n "${FAKE_VENV_COST_SLEEP:-}" ] && sleep "$FAKE_VENV_COST_SLEEP"
 for a in "$@"; do last="$a"; done
 if [ -n "${FAKE_VENV_COST_TABLE:-}" ] && [ -f "$FAKE_VENV_COST_TABLE" ]; then
     while IFS="$(printf '\t')" read -r pat priv fair total dedupe; do
@@ -843,6 +846,30 @@ printf 'dead\t1024\t2000\t5940900\tok\nlive1\t2048\t3000\t5940900\tok\nlive2\t41
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_TABLE="$T/vc-h2.tsv" --gc --repo "$RH")"; rc=$?
 assert_contains "$out" "lane_venv_real=4096MB" "the largest private count is found with the sizes swapped too (order-independent)"
 assert_contains "$out" "venv_degraded=0" "no degraded env in this table"
+
+echo " H5c2 a MEASURED zero prints 0MB, not ? — a perfectly-shared env is not a broken probe"
+# The ideal box: every byte shared, so private_kb == 0 and dedupe=ok. Printing `?` here would tell a
+# reader the probe failed on the box that is working exactly as intended (#2159 review, P2).
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_PRIV=0 FAKE_VENV_FAIR=0 --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "lane_venv_real=0MB" "a measured private cost of 0 is reported as 0MB"
+assert_contains "$out" "venv_dedupe=ok" "and the dedupe verdict still says the sharing is in force"
+assert_not_contains "$out" "lane_venv_real=?" "a shared env is never reported as an unmeasurable one"
+assert_eq "$rc" "0" "the ideal-box pass exits 0"
+
+echo " H5c3 the cost probe is BOUNDED — a hanging probe cannot hang the pass"
+# Only a hanging probe can discriminate a bare call from a `run_bounded` one: success and an immediate
+# failure are identical on both paths, so replacing the call with an unbounded one stayed green before
+# this case existed (#2159 review, P2).
+t0=$SECONDS
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=30 REAP_VENV_VENV_COST_TIMEOUT=1 --gc --repo "$RH")"; rc=$?
+elapsed=$((SECONDS - t0))
+[ "$elapsed" -lt 20 ] && ok "a 30s probe bounded at 1s let the pass finish in ${elapsed}s" \
+    || bad "the probe ran unbounded — the pass took ${elapsed}s (expected < 20s)"
+assert_contains "$out" "lane_venv_real=?" "a timed-out probe is UNKNOWN, never a partial number"
+assert_eq "$rc" "0" "a timed-out probe does not fail the pass"
+# An INVALID bound arms no watchdog at all in run_bounded, so it must be refused loudly, not silently.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=2 REAP_VENV_VENV_COST_TIMEOUT=abc --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "is not a positive integer" "an invalid timeout is named, not silently unbounded"
 
 echo " H5d an unmeasurable probe reads UNKNOWN, never 0 (#2159)"
 # A `0` here would read as "a lane env is free", which is the exact over-admission this line exists to

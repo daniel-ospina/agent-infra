@@ -28,19 +28,21 @@ This tool names that class instead of averaging it away. (The full table, with t
 is in docs/ops/lane-venv-reaper-policy.md.)
 
 THE THREE NUMBERS, and which question each answers
-  total_kb    every allocated block under the path (== `du -sk`, the UPPER BOUND).
-  private_kb  blocks whose inode has nlink == 1: bytes that VANISH if this tree is
-              deleted. This is what "reap it" actually frees, and it is the honest
-              per-lane marginal cost when the cache is warm.
+  total_kb    every allocated block under the path, each INODE once and including the named
+              directory's own blocks (== `du -sk`, the UPPER BOUND).
+  private_kb  blocks whose every link lies INSIDE this tree (nlink == 1, or all links seen
+              here): bytes that VANISH if this tree is deleted. This is what "reap it"
+              actually frees, and the honest per-lane marginal cost when the cache is warm.
+              It is 0 on a perfectly-shared env — a real, GOOD reading, not a missing one.
   fair_kb     blocks divided across their link count (sum(blocks / nlink)): this tree's
               share of everything it touches, for ATTRIBUTION between trees. It is NOT
               "the bytes freed if this tree is deleted" — while any other link survives
               (the uv cache holds one), the blocks stay allocated. `private_kb` is the
               freed-bytes figure.
 
-`du -sk` and `total_kb` agree by construction; a mismatch means the walk and `du` saw
-different things (a tree changing mid-walk), so both are reported and neither is silently
-preferred.
+`total_kb` counts each inode once and includes the named directory's own blocks, so it agrees
+with `du -sk` on the same tree; a residual mismatch means the tree changed mid-walk (or `du`
+crossed a mount), so both are reported and neither is silently preferred.
 
 Portability: POSIX `os.lstat` + `st_blocks`/`st_nlink`. No `stat -c` (GNU) vs `stat -f`
 (BSD) divergence, no `find -printf` (GNU only). Symlinks are never followed, so this can
@@ -76,9 +78,19 @@ def measure(root: str) -> dict:
     if not stat.S_ISDIR(st.st_mode):
         raise NotADirectoryError(root)
 
-    total_kb = private_kb = fair_kb = 0
+    # `du` counts the NAMED directory's own blocks too, and the walk below only sees its entries —
+    # seed it here, or `total_kb` is silently one directory short of the figure it claims to equal.
+    root_kb = (getattr(st, "st_blocks", 0) * 512) // 1024
+
+    total_kb = root_kb
+    private_kb = fair_kb = 0
     files = shared_files = 0
     errors = 0
+    # inode -> [blocks_kb, nlink, times_seen]. ⛔ COUNTS PER INODE, NOT PER NAME (review P2):
+    # `du` counts a multiply-linked inode ONCE per invocation, and two names for one inode inside a
+    # single tree (a hardlinked pair, which `uv` produces) would otherwise double `total_kb` —
+    # measured 2x on a 20 MiB pair — and flatten the private/total ratio the verdict rests on.
+    inodes: dict = {}
     denom = 1024  # st_blocks is in 512-byte units on every platform we run on
 
     stack = [root]
@@ -114,14 +126,27 @@ def measure(root: str) -> dict:
                 # Never followed, and a symlink's own blocks are negligible.
                 continue
             files += 1
-            total_kb += blocks // denom
             nlink = getattr(s, "st_nlink", 1)
             if nlink > 1:
                 shared_files += 1
-                fair_kb += blocks // (denom * nlink)
+            key = (getattr(s, "st_dev", 0), getattr(s, "st_ino", 0))
+            slot = inodes.get(key)
+            if slot is None:
+                inodes[key] = [blocks // denom, nlink, 1]
             else:
-                private_kb += blocks // denom
-                fair_kb += blocks // denom
+                slot[2] += 1
+
+    for blocks_kb, nlink, seen in inodes.values():
+        total_kb += blocks_kb
+        # ⛔ "PRIVATE" MEANS THE BLOCKS CANNOT SURVIVE THIS TREE'S DELETION. `nlink == 1` is the
+        # common case, but an inode whose EVERY link lives inside the tree is just as private even
+        # though nlink > 1 — measured: a 20 MiB hardlinked PAIR inside one tree freed 20,484 KB on
+        # `rm -rf`, and a bare `nlink > 1` test reported private=0 for it. Only a link we did not
+        # see (nlink > seen) can be keeping the blocks alive afterwards.
+        if seen >= nlink:
+            private_kb += blocks_kb
+        else:
+            fair_kb += (blocks_kb * seen) // nlink
 
     if total_kb == 0:
         dedupe = "unknown"

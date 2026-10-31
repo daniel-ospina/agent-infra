@@ -105,8 +105,11 @@ mkdir -p "$T/trunc/ok" "$T/trunc/hidden"
 dd if=/dev/zero of="$T/trunc/ok/blob.bin" bs=1024 count=512 status=none
 dd if=/dev/zero of="$T/trunc/hidden/big.bin" bs=1024 count=4096 status=none
 if chmod 000 "$T/trunc/hidden" 2>/dev/null && [ ! -r "$T/trunc/hidden" ]; then
-    "$PY" "$TOOL" --tsv "$T/trunc" >/dev/null 2>&1
-    assert_eq "$?" "3" "an unreadable subdirectory makes the reading PARTIAL (exit 3), not a quiet under-count"
+    trunc_out="$("$PY" "$TOOL" --tsv "$T/trunc" 2>/dev/null)"; trunc_rc=$?
+    assert_eq "$trunc_rc" "3" "an unreadable subdirectory makes the reading PARTIAL (exit 3), not a quiet under-count"
+    # The exit code alone is not enough: an implementation that exits 3 while still emitting
+    # `dedupe=ok` would pass the line above (#2159 review, P2).
+    assert_eq "$(printf '%s' "$trunc_out" | cut -f4)" "partial" "and the verdict says 'partial', not 'ok'"
     chmod 755 "$T/trunc/hidden"
 else
     ok "cannot make a directory unreadable here (running as root?) — truncation case not exercised"

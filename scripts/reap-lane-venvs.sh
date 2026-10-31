@@ -143,6 +143,7 @@
 #   reaping every holder-free env regardless of age. (The sibling FREE FLOOR is validated the same way,
 #   at the point it is read — see `is_pos_int "$REAP_VENV_FREE_FLOOR_MB"`.)
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
+#   REAP_VENV_VENV_COST_TIMEOUT (the hard-link-aware cost walk; default 60s)
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
 #   REAP_VENV_SCAN_CAP (test seam: pins the runaway-guard exhaustion branch, which is unreachable with
 #   the derived cap)
@@ -226,6 +227,11 @@ LANE_VENV_KB_MAX=0
 # The hard-link-aware readings (#2159). Every one of them is `?`/`unknown` when unmeasurable —
 # never 0, which would read as "free".
 LANE_VENV_REAL_KB_MAX=0
+# ⛔ A MEASURED ZERO IS NOT AN UNKNOWN (#2159 review, P2). A perfectly-shared env reports
+# private_kb == 0 — that is the IDEAL reading, and printing `?` for it beside `venv_dedupe=ok`
+# tells a reader the probe is broken on a box that is working exactly as intended. Only a failed
+# or timed-out probe is `?`, so the two states get their own flag.
+LANE_VENV_REAL_MEASURED=0
 VENV_DEDUPE="unknown"
 VENV_DEGRADED=0
 CAPACITY_FLOOR_OK="unknown"
@@ -1036,6 +1042,15 @@ remove_one() {
 # ── modes ────────────────────────────────────────────────────────────────────────────────────
 parse_args() {
     local a
+    # ⛔ `run_bounded` arms NO watchdog unless its bound is a positive integer, so a misconfigured
+    # timeout silently makes the probe UNBOUNDED — the exact failure the call site claims to
+    # prevent (measured: `0` and `abc` both ran a 30 s probe to completion). Validated here, where
+    # the other seams are, with a loud fallback rather than a silent one.
+    if ! is_pos_int "${REAP_VENV_VENV_COST_TIMEOUT:-}" || [ "$REAP_VENV_VENV_COST_TIMEOUT" -eq 0 ]; then
+        echo "warn: REAP_VENV_VENV_COST_TIMEOUT='${REAP_VENV_VENV_COST_TIMEOUT:-}' is not a positive integer — using 60s; an invalid bound in run_bounded arms no watchdog at all" >&2
+        log "warn: REAP_VENV_VENV_COST_TIMEOUT invalid ('${REAP_VENV_VENV_COST_TIMEOUT:-}') — fell back to 60s"
+        REAP_VENV_VENV_COST_TIMEOUT=60
+    fi
     while [ $# -gt 0 ]; do
         a="$1"
         case "$a" in
@@ -1161,7 +1176,10 @@ report_row() {
     if [ -d "$path/.venv" ] && real_row="$(venv_real_cost "$path/.venv")"; then
         real_priv="${real_row%%$TAB*}"; real_rest="${real_row#*$TAB}"
         real_dedupe="${real_rest##*$TAB}"
-        is_pos_int "$real_priv" && [ "$real_priv" -gt "$LANE_VENV_REAL_KB_MAX" ] && LANE_VENV_REAL_KB_MAX="$real_priv"
+        if is_pos_int "$real_priv"; then
+            LANE_VENV_REAL_MEASURED=1
+            [ "$real_priv" -gt "$LANE_VENV_REAL_KB_MAX" ] && LANE_VENV_REAL_KB_MAX="$real_priv"
+        fi
         case "$real_dedupe" in
             degraded) VENV_DEGRADED=$((VENV_DEGRADED + 1)); VENV_DEDUPE="degraded" ;;
             ok) [ "$VENV_DEDUPE" = "degraded" ] || VENV_DEDUPE="ok" ;;
@@ -1275,10 +1293,10 @@ report_capacity() { # report_capacity <free_kb_after>
     # The real-cost pair (#2159): `lane_venv_real` is the LARGEST private-block count seen (what
     # reaping one such env actually frees), and `venv_dedupe` says whether this box's link regime is
     # in force. `?`/`unknown` when the probe could not run — never 0.
+    # Gated on MEASURED, not on `> 0`: a shared env legitimately reports 0 private KB.
     local real_mb="?"
-    if [ "${LANE_VENV_REAL_KB_MAX:-0}" -gt 0 ]; then
+    if [ "${LANE_VENV_REAL_MEASURED:-0}" = "1" ]; then
         real_mb=$((LANE_VENV_REAL_KB_MAX / 1024))
-        [ "$real_mb" -ge 1 ] || real_mb=1
     fi
     log_line "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB lane_venv_real=${real_mb}MB venv_dedupe=$VENV_DEDUPE venv_degraded=$VENV_DEGRADED free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
     [ -n "$why" ] && log_line "[$SCRIPT_NAME] capacity: $why"
