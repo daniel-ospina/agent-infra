@@ -5,12 +5,12 @@
     "scripts/check-pipeline-compliance.sh": "288389f6b8f5d93ccce96648f8679ce1fa5358183de6bac5e007910918f5ae86",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
-    "scripts/record-review.sh": "66fb36403f1e4d23f0c81a704cf45bf8874952b88041ee06f2b66bddbb6ea1f1",
-    "scripts/admin-merge.sh": "7a5c4a20cc561c460fece80e611a76af901af620803d598290fa67dfbec49e32",
+    "scripts/record-review.sh": "d4afafe5989b1e56bb6fcb801c2dae70f5f5360e778943060a119888165e7e18",
+    "scripts/admin-merge.sh": "d67d83b68dfd3465dbaca6da5b7d3b5e2876867f0c9d4b07da19c22b8a474ddb",
     "scripts/gh-shim/gh": "11a0f554a923eb459a26b98d2f8c7f21d0cabe324d7c3b4754dc7c8ce3c909d0"
   },
   "delegates": {
-    "scripts/admin-merge.sh": "7a5c4a20cc561c460fece80e611a76af901af620803d598290fa67dfbec49e32",
+    "scripts/admin-merge.sh": "d67d83b68dfd3465dbaca6da5b7d3b5e2876867f0c9d4b07da19c22b8a474ddb",
     "scripts/check-pipeline-compliance.sh": "288389f6b8f5d93ccce96648f8679ce1fa5358183de6bac5e007910918f5ae86",
     "scripts/checkout-hygiene/hub-worktree-refresh-advance.sh": "88bde611c5f53bc75c94d56f97b8d6048d21029b1396cb0db162b082ebb9a643",
     "scripts/checkout-hygiene/hub-worktree-salvage-commit.sh": "f747ad00b5babe4474a625b3564f27d3e6523f05147bef79126ff5e4a5a5c29e",
@@ -20,7 +20,7 @@
     "scripts/ci_exemption.py": "9bbb8269903b931eb9af18dbbbcb87ff3e2201dd161e0189b86887fdb94179c0",
     "scripts/gh-shim/gh": "11a0f554a923eb459a26b98d2f8c7f21d0cabe324d7c3b4754dc7c8ce3c909d0",
     "scripts/lib/diff-normalize.py": "b62b90d6588dfee446a7034f415c13d0e9a4a366222144db0b89922988febe7c",
-    "scripts/record-review.sh": "66fb36403f1e4d23f0c81a704cf45bf8874952b88041ee06f2b66bddbb6ea1f1",
+    "scripts/record-review.sh": "d4afafe5989b1e56bb6fcb801c2dae70f5f5360e778943060a119888165e7e18",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/verify-admin-merge-evidence.sh": "cc32da5d99e2a02939d2c4fdf73c1c96c8dd1cc59d447bff13e75ad31d0f5f53"
   }

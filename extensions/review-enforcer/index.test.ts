@@ -10006,6 +10006,105 @@ test("#1382 (i2): the frame guard cannot be walked past by a spelling it does no
     "a framed DATA writer is NOT masked — the declared over-block, for a silent admin merge avoided");
 });
 
+// ── #485/#2204: the floor covers SHIPPING writes, not tracker/report writes ──
+//
+// MEASURED 2026-10-31 (a Linux cell, `extensions/review-enforcer/index.ts` at
+// 448766 bytes AND the deployed copy at ~/.pi/agent/extensions/review-enforcer,
+// 425373 bytes — both builds, same answer): at ZERO dispatches a tracker/report
+// write is ALREADY allowed and a shipping write is ALREADY refused. The table the
+// probe printed, verbatim (isGitOp / readsOnlyGhRead / gate verdict):
+//
+//   ALLOWED  isGitOp=false :: "gh issue comment 1224 --body-file /tmp/x.md"
+//   ALLOWED  isGitOp=false :: "gh api -X POST repos/o/r/issues/1224/comments -F body=@/tmp/x.md"
+//   ALLOWED  isGitOp=false :: "gh api -X PATCH repos/o/r/issues/comments/123 -F body=@/tmp/x.md"
+//   ALLOWED  isGitOp=false :: "gh issue edit 1224 --body-file /tmp/x.md"
+//   ALLOWED  isGitOp=false :: "gh pr edit 3113 --body-file /tmp/x.md"
+//   ALLOWED  isGitOp=false :: "cat > /tmp/report.md <<'EOF' … EOF"
+//   BLOCKED  isGitOp=true  :: "git commit -m x"
+//   BLOCKED  isGitOp=true  :: "git push origin main"
+//   BLOCKED  isGitOp=true  :: "gh pr create --title t --body-file /tmp/x.md"
+//
+// WHY THIS TEST EXISTS ANYWAY — it pins a classification that is currently only
+// IMPLICIT. `isGitOp` is the one predicate that decides it (GIT_COMMIT_PATTERN /
+// GH_PR_PATTERN / isAdminMergeCommand), and its own arms are deliberately broad —
+// #2204's comment records that "a construct plus `gh`+`pr` is enough" to make a
+// command a candidate — so the tracker/report carve-out is a property of the
+// ABSENCE of a pattern, not of a stated rule. A future arm added to isGitOp for a
+// real reason ("`gh api` can write, so gate it" is the plausible wrong one — a
+// tracker comment cannot ship code) would silently put report-only lanes back
+// behind a reviewer dispatch, which is the wedge this test forbids.
+//
+// ⛔ `gh pr edit` IS PINNED AS OUTSIDE, ON PURPOSE, and the reason is mechanical:
+// the PR-body attestation is the HMAC-SIGNED marker (`record-review.sh`,
+// #2872/#2873 — "a body edit cannot mint one": `--recover-body` VERIFIES the
+// signature and refuses an unverified marker as "a body EDIT, not evidence").
+// So a `gh pr edit` can only DELETE an attestation, which makes the rail REFUSE
+// (fail-closed) — it cannot forge one, so gating it would buy no safety and would
+// block the ordinary "fix the PR body" write at 0 dispatches. If that reasoning
+// is ever believed wrong, the fix belongs in the signed-marker verification, not
+// in a new dispatch floor.
+//
+// FAILS-BEFORE NOTE (honest): (a) and (b) below already passed before this test
+// existed — the behaviour the investigation asked for is already in the code — and
+// (c) asserts the measured status quo rather than a change. So this is a
+// REGRESSION PIN, not a fix: it fails if someone widens the shipping floor onto
+// tracker/report writes, which is the only way the wedge can come back.
+section("#485/#2204: tracker/report writes are not shipping ops (dispatch floor)");
+
+testAsync("a report write is allowed at 0 dispatches while every shipping write stays refused", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start"); // no skip env → gate ENABLED, 0 dispatches
+
+        // (a) a tracker write — the deliverable of a report-only lane.
+        for (const command of [
+          "gh issue comment 1224 --body-file /tmp/x.md",
+          "gh issue edit 1224 --body-file /tmp/x.md",
+          "gh api -X POST repos/o/r/issues/1224/comments -F body=@/tmp/x.md",
+          "gh api -X PATCH repos/o/r/issues/comments/123 -F body=@/tmp/x.md",
+          "cat > /tmp/report.md <<'EOF'\nqueue before: 98\nEOF",
+        ]) {
+          equal(
+            await fire("tool_call", { toolName: "bash", input: { command } }),
+            undefined,
+            `${command} writes no code, so it must not need a reviewer dispatch`
+          );
+        }
+
+        // (b) every shipping write is STILL refused at 0 dispatches. One verb per line,
+        // so a future relaxation of any single arm of `isGitOp` shows up here.
+        for (const command of [
+          "git commit -m x",
+          "git push origin main",
+          "git push origin feature-branch",
+          "gh pr create --title t --body-file /tmp/x.md",
+        ]) {
+          const blocked = await fire("tool_call", { toolName: "bash", input: { command } });
+          ok(blocked && blocked.block === true, `${command} must stay refused at 0 dispatches`);
+          ok(
+            /No reviewers were dispatched in this session before the git operation/.test(String(blocked.reason)),
+            "the refusal must state the floor's own reason, not a generic denial"
+          );
+        }
+
+        // (c) the PR-body write is outside the floor — see the signed-marker note above.
+        equal(
+          await fire("tool_call", { toolName: "bash", input: { command: "gh pr edit 3113 --body-file /tmp/x.md" } }),
+          undefined,
+          "a PR-body edit cannot MINT an attestation (signed marker), so it is not a shipping op"
+        );
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 // ── Summary ───────────────────────────────────────────
 // Run the async factory tests strictly sequentially (they mutate process.env).
 for (const run of pending) await run();

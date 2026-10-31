@@ -941,6 +941,27 @@ fi
 if [ -z "$(mutating)" ]; then ok "plain install made ZERO mutating launchctl calls (a validation run cannot disturb a live controller)"
 else bad "plain install MUTATED launchd: $(mutating)"; fi
 
+# ⛔ #2930 — A TEST SUITE'S PARSE ERROR MUST NOT REFUSE AN INSTALL; A RUNTIME SCRIPT'S STILL MUST.
+# This is the incident's own gate: `merge-reminder.test.sh` carries a here-doc body inside a `$( )`
+# holding an apostrophe, bash 3.2's substitution scanner cannot follow it and desynchronises (#2248 is
+# the same class), `bash -n` failed — and `install.sh`'s sweep `die`d, so NO Mac could install the
+# harness, over a file nothing executes at runtime. The pair below makes the split measurable in both
+# directions, so a later "simplification" back to one `die` cannot pass.
+printf 'if [ -z "$x" ; then\n' > "$STAGE/zz-broken.test.sh"
+fresh
+out="$(ORUN 2>&1)"; rc=$?
+assert_eq "$rc" "0" "a syntax-broken *.test.sh does NOT refuse the install (#2930)"
+assert_contains "$out" "syntax error in the TEST suite zz-broken.test.sh" "…and it is REPORTED by name, never silently skipped"
+assert_not_contains "$out" "syntax error in zz-broken.test.sh" "…and it is not dressed up as a runtime failure"
+rm -f "$STAGE/zz-broken.test.sh"
+printf 'if [ -z "$x" ; then\n' > "$STAGE/zz-broken-runtime.sh"
+fresh
+out="$(ORUN 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a syntax-broken RUNTIME script still REFUSES the install (the runtime half is not relaxed)"
+else bad "install.sh would install a runtime script that does not parse — a controller that crash-loops under KeepAlive"; fi
+assert_contains "$out" "syntax error in zz-broken-runtime.sh" "…naming the runtime script it refused"
+rm -f "$STAGE/zz-broken-runtime.sh"
+
 # --start with a healthy box: the job comes up and the start is PROVEN.
 fresh "$(( $(date +%s) - 5 ))"
 out="$(ORUN --start 2>&1)"; rc=$?
