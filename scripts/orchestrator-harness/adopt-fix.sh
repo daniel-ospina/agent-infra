@@ -25,7 +25,12 @@ fi
 # for a foreign branch that is the ONE ref the adopt path just fetched, so the residue was durable.
 # shellcheck source=/dev/null
 . "$SELF/wt-lifecycle.sh" || { echo "[adopt-fix $PR] FATAL: $SELF/wt-lifecycle.sh missing — refusing to adopt without its rollback (#2033)" | tee -a "$O/logs/adopt-$PR.log"; exit 78; }
-git fetch origin "$BR" --quiet 2>/dev/null || true
+# ⛔ NAME THE DESTINATION (#3009): a bare `fetch origin "$BR"` leaves FETCH_HEAD and creates
+# `refs/remotes/origin/$BR` only when the clone's configured refspec maps that source — true on a
+# full clone, FALSE on a cell's single-branch clone (`remote.origin.fetch` = `+refs/heads/main:…`).
+# The leading `+` tolerates the force-push a PR branch routinely gets. This fetch is what the
+# NEXT block needs (`origin/$BR` must resolve), and what the peer lanes read.
+git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet 2>/dev/null || true
 WT=".worktrees/adopt-$PR"
 # `wt_provision` creates the worktree OR leaves nothing behind, ATTACHES the existing branch when it
 # holds commits (the normal adopt case), and repairs a half-materialised/interrupted record instead of

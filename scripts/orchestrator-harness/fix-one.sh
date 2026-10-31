@@ -207,8 +207,21 @@ fi
   # failed for network reasons is covered too: the branch is unproven here, and the refusal names
   # both possibilities rather than blaming worktree creation.
   if ! git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
-    git fetch origin "$BR" --quiet >> "$L.log" 2>&1
+    # ⛔ NAME THE DESTINATION, NOT JUST THE SOURCE (#3009, the SAME defect pr-doctor had).
+    # `git fetch origin "$BR"` does NOT create `refs/remotes/origin/$BR`: with no colon the fetched
+    # ref lands in FETCH_HEAD, and a remote-tracking ref is only ALSO updated when a CONFIGURED
+    # `remote.<name>.fetch` refspec maps that source. A full clone maps every branch, so the bug is
+    # invisible on a dev box — but a CELL checkout is a SINGLE-BRANCH clone
+    # (`+refs/heads/main:refs/remotes/origin/main`), so the fetch SUCCEEDS (rc=0), creates nothing,
+    # and the very next line asks for the ref it just declined to create. The guard then fires with
+    # a FABRICATED diagnosis (`branch is not in <OR> — a BRANCH/REPO mismatch`) — a false accusation
+    # of the wrong repo, which is worse than a silent failure because it sends the operator at the
+    # remote instead of at the clone. The leading `+` keeps the update valid after the force-push a
+    # PR branch routinely gets.
+git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$L.log" 2>&1
     if ! git rev-parse --verify -q "refs/remotes/origin/$BR" >/dev/null 2>&1; then
+      # Reached only when the fetch genuinely could not read the branch (network, auth, a real
+      # BRANCH/REPO mismatch) — the refspec above no longer produces a FALSE hit here.
       repo_target_branch_assert "fixer #$PR" "$REPO_ABS" "$BR" "$OR" >> "$L.log"
       echo "[fix $PR] REFUSED: branch '$BR' is not in $OR (checkout $REPO_ABS) — it could not be read after fetching origin. This is a BRANCH/REPO mismatch, not a worktree-materialisation failure; refusing before any fixer starts" >> "$L.log"
       refund_gate_attempt
