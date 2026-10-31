@@ -592,6 +592,30 @@ ck "a ref with NO checker: the dry run says it CANNOT TELL what it would discard
 ck "…and names the actual reason (the staged harness ships no harness-provenance.sh)" \
    "$(qF "ships no harness-provenance.sh" "$OUT" && echo 0 || echo 1)"
 ck "…and does not claim the box is clean" "$(qF "nothing to discard" "$OUT" && echo 1 || echo 0)"
+# ⛔ THE LIBRARY PATHSPEC MUST NOT BE UNCONDITIONAL (review P1, agent-infra#3146). `git archive` FAILS
+# when ANY pathspec matches nothing, and `SRC_REF` is the documented ROLLBACK lever — so naming
+# `scripts/lib/lane-ceiling.sh` unconditionally made every pre-library ref a FATAL in phase A (with
+# `$STAGE` already `rm -rf`d: nothing staged, nothing deployed) and made the graceful "a ref that
+# predates the library is not a FATAL" branch below UNREACHABLE. Measured pre-fix on this fixture:
+# `fatal: pathspec 'scripts/lib/lane-ceiling.sh' did not match any files` + rc 1, no deploy.
+M5="$TMP/macold"
+OUT="$(AI_MAIN="$R2" SRC_REF=main O="$M5" PHASE=A STAGE="$TMP/stage3d" bash "$MACDEP" 2>&1)"; RC=$?
+ck "a ref that PREDATES scripts/lib/lane-ceiling.sh still deploys (0, not the archive's FATAL)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and takes the NAMED branch instead of dying inside git archive (the branch a comment claimed)" \
+   "$(qF "has no scripts/lib/lane-ceiling.sh" "$OUT" && echo 0 || echo 1)"
+ck "…and stages no \$O/lib for a later probe to trust" "$([ -e "$M5/lib/lane-ceiling.sh" ] && echo 1 || echo 0)"
+# the other direction: a ref that HAS it is archived WITH it and lands where install.sh probes.
+R3="$TMP/repo-lib"; rm -rf "$R3"; mkdir -p "$R3/scripts/orchestrator-harness" "$R3/scripts/lib"
+cp "$SRC/orch-loop.sh" "$SRC/claims.sh" "$R3/scripts/orchestrator-harness/"
+printf '#!/usr/bin/env bash\nlc_probe_fixture() { :; }\n' > "$R3/scripts/lib/lane-ceiling.sh"
+( cd "$R3" && $G init -q -b main . && $G add -A && $G commit -qm withlib ) >/dev/null 2>&1
+M6="$TMP/maclib"
+OUT="$(AI_MAIN="$R3" SRC_REF=main O="$M6" PHASE=A STAGE="$TMP/stage3e" bash "$MACDEP" 2>&1)"; RC=$?
+ck "a ref that SHIPS the library stages it at \$O/lib/lane-ceiling.sh (0)" \
+   "$([ "$RC" -eq 0 ] && [ -f "$M6/lib/lane-ceiling.sh" ] && echo 0 || echo 1)"
+ck "…byte-identical to the ref's own copy" "$(cmp -s "$R3/scripts/lib/lane-ceiling.sh" "$M6/lib/lane-ceiling.sh" && echo 0 || echo 1)"
+ck "…and does NOT take the 'no library' branch it now carries" "$(qF "has no scripts/lib/lane-ceiling.sh" "$OUT" && echo 1 || echo 0)"
 # ⛔ PHASE=A IS ITS OWN WRITE SET. A run that leaves `orch-loop.sh` to phase B must not refuse over it —
 # and must not offer `--accept-discard` for a file it never writes.
 M2="$TMP/macA"; cp -R "$MO"/. "$M2"/                                         # carries the dirty claims.sh
