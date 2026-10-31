@@ -773,13 +773,24 @@ _au_hits=0; AUTHORITY_UNKNOWN=1
 sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
 if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
   mkdir -p "$TMP/auO/state"
-  _au_run() { # _au_run <flag> -> prints how many PRs passed the guard
+  _au_run() { # _au_run <flag> [<claim-verdict rc>] -> prints how many PRs passed the guard
     _c=0
+    _clv_rc="${2:-0}"
     _ghsave="$(declare -f gh 2>/dev/null)"
     for PR in 1111 2222; do
-      AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"
+      AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"; LOG="$TMP/auO/guard.log"
+      mkdir -p "$O/state"; : > "$LOG"
       gh() { case "$1 $2" in "pr view") echo deadbeef ;; *) return 1 ;; esac; }
       disp() { return 0; }   # the shipped block records the refusal first; the recorder is not under test
+      # THE CLAIM GUARD IS INSIDE THIS EXTRACTED RANGE (agent-infra#2466) and decides BEFORE the
+      # authority guard. Stubbed here so this drive grades the authority guard; the claim guard's own
+      # answers are pinned by the two cases below and by the ownership cases earlier in this file.
+      claim_selection_verdict() {
+        CLAIM_SEL_VERDICT="claim-absent"; CLAIM_SEL_WHY="fixture"; CLAIM_SEL_OWNER=""; CLAIM_SEL_UNTIL=""
+        case "$_clv_rc" in 1) CLAIM_SEL_VERDICT="claim-held"; CLAIM_SEL_OWNER="cell-2:9"; CLAIM_SEL_UNTIL="9999999999" ;;
+                           2) CLAIM_SEL_VERDICT="claim-unreadable"; CLAIM_SEL_WHY="fixture: the registry could not answer" ;; esac
+        return "$_clv_rc"
+      }
       # shellcheck disable=SC1090
       . "$TMP/aublock.sh"
       _c=$((_c+1))   # reached only when no `continue` fired
@@ -787,10 +798,18 @@ if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
     [ -n "$_ghsave" ] && eval "$_ghsave" || unset -f gh 2>/dev/null
     echo "$_c"
   }
-  [ "$(_au_run 1)" = "0" ] && { echo "  ✅ the SHIPPED guard continues every PR when set (dead-branch wrapping would break extraction or this)"; PASS=$((PASS+1)); } \
+  [ "$(_au_run 1 0)" = "0" ] && { echo "  ✅ the SHIPPED guard continues every PR when set (dead-branch wrapping would break extraction or this)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the shipped guard did not continue every PR when set"; FAIL=$((FAIL+1)); }
-  [ "$(_au_run 0)" = "2" ] && { echo "  ✅ …and lets every PR through when clear"; PASS=$((PASS+1)); } \
+  [ "$(_au_run 0 0)" = "2" ] && { echo "  ✅ …and lets every PR through when clear"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the shipped guard continued when clear"; FAIL=$((FAIL+1)); }
+  # THE MULTI-CELL GUARD (agent-infra#2466): a foreign live claim SKIPS the PR before ANY arm (merge,
+  # arm, reviewer, fixer, red-fixer) can act on it, and an UNREADABLE registry skips it too. Both are
+  # driven through the SHIPPED block; leaving these to prose is how the guard could be deleted with
+  # every other assertion here still green.
+  [ "$(_au_run 0 1)" = "0" ] && { echo "  ✅ a claim-held PR is SKIPPED before any arm acts (the peer's declared window is respected)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a claim-held PR was acted on — two cells can take the same PR"; FAIL=$((FAIL+1)); }
+  [ "$(_au_run 0 2)" = "0" ] && { echo "  ✅ a claim-UNREADABLE registry SKIPS the PR too (an absent answer is not freedom)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ an unreadable registry let a PR through — the fail-open this change removes"; FAIL=$((FAIL+1)); }
 else
   echo "  ❌ could not extract the shipped AUTHORITY_UNKNOWN block from orch-loop.sh"; FAIL=$((FAIL+1))
 fi
@@ -1142,18 +1161,28 @@ echo "=== ownership is a LIVE FACT (owner ruling, 2026-10-18) ==="
 # rename/reformat/regression fails here instead of silently skipping.
 INST="$HERE/install.sh"
 LO="$HERE/live-ownership.sh"
-for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count unowned_scan; do
+# ⛔ `claim_selection_verdict` is the SELECTION wrapper (agent-infra#2466) and it is extracted with
+# the rest: pr_owned -> claim_foreign_live -> claim_selection_verdict -> claims.sh's
+# claim_snapshot_verdict, i.e. THREE layers and only one of them may decide. A missing piece of that
+# chain has to fail HERE rather than quietly reading as "unowned".
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_selection_verdict claim_live claim_lease_live unowned_pr_count unowned_scan; do
   ex "$_fn" > "$TMP/$_fn.sh"
 done
 grep -E '^is_num\(\) \{'    "$ORCH" > "$TMP/is_num.sh"
 grep -E '^_this_host\(\) \{' "$ORCH" > "$TMP/this_host.sh"
 _own_ok=1
-for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count unowned_scan is_num this_host; do
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_selection_verdict claim_live claim_lease_live unowned_pr_count unowned_scan is_num this_host; do
   [ -s "$TMP/$_fn.sh" ] || { echo "  ❌ could not extract $_fn() from orch-loop.sh — the rule moved or was reformatted"; _own_ok=0; }
 done
 [ -f "$LO" ] || { echo "  ❌ $LO is missing — the ownership predicate moved"; _own_ok=0; }
+# ⛔ THE CLAIM VERDICT ITSELF IS SOURCED FROM claims.sh, NEVER RE-IMPLEMENTED (agent-infra#2466).
+# `claim_snapshot_verdict` is the one reader; its inputs (`_lease_is_live`, `claim_orphan_reason`,
+# `claim_file_mtime`) and its tunable (`CLAIM_SNAPSHOT_MAX_AGE`) all live beside the writer they
+# read, so a fixture here cannot pin a polarity the SHIPPED reader does not have.
+[ -f "$HERE/claims.sh" ] || { echo "  ❌ $HERE/claims.sh is missing — the claim verdict moved"; _own_ok=0; }
+grep -qE '^claim_snapshot_verdict\(\) \{' "$HERE/claims.sh" || { echo "  ❌ claims.sh carries no claim_snapshot_verdict() — the one verdict moved or was renamed"; _own_ok=0; }
 cat "$TMP/is_num.sh" "$TMP/this_host.sh" "$TMP/fix_slots.sh" "$TMP/review_slots.sh" \
-    "$TMP/pr_owned.sh" "$TMP/claim_foreign_live.sh" "$TMP/claim_live.sh" "$TMP/claim_lease_live.sh" "$TMP/unowned_pr_count.sh" "$TMP/unowned_scan.sh" > "$TMP/ownfunctions.sh"
+    "$TMP/pr_owned.sh" "$TMP/claim_foreign_live.sh" "$TMP/claim_selection_verdict.sh" "$TMP/claim_live.sh" "$TMP/claim_lease_live.sh" "$TMP/unowned_pr_count.sh" "$TMP/unowned_scan.sh" > "$TMP/ownfunctions.sh"
 if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   # the SHIPPED predicate, not a re-implementation of it
   # shellcheck source=/dev/null
@@ -1166,12 +1195,23 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   LO_LIVE="$O/state/live.tsv"
   # Subshell helpers: the shipped functions are sourced, never copied, and `O` points at a fixture
   # state dir so nothing here can touch a real box.
-  _own()    { ( . "$TMP/ownfunctions.sh"; unowned_pr_count "$1" ); }
-  _owned()  { ( . "$TMP/ownfunctions.sh"; if pr_owned "$1" "${2:-}" "${3:-}"; then printf 'owned'; else printf 'unowned'; fi ); }
+  # shellcheck source=/dev/null
+  _own()    { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; unowned_pr_count "$1" ); }
+  _owned()  { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; if pr_owned "$1" "${2:-}" "${3:-}"; then printf 'owned'; else printf 'unowned'; fi ); }
   # The live table is the MACHINE's answer: "<branch>\t<worktree>\t<pid>\t<cwd>". A fixture row here
   # stands in for a real process — the suite that proves the PROBE really reads processes is
   # live-ownership.test.sh, which spawns them.
   _live() { printf '%s\n' "$@" > "$LO_LIVE"; }
+  # A REGISTRY THAT ANSWERED AND HOLDS NOTHING (agent-infra#2466). Every case below that expects
+  # "unowned" needs this file to exist: a MISSING snapshot is `claim-unreadable` (the registry never
+  # answered). Cases that want a claim overwrite it; the missing/failed/stale classes are pinned
+  # explicitly further down.
+  # ⛔ AND `claim-unreadable` DOES **NOT** OWN THE PR (review, P1 — this comment used to say it did,
+  # and the code was written to match). `unowned_scan` computes `n - owned`, so an "owned" answer for
+  # a registry nobody could read drives the un-owned count to 0 and OPENS the issue path — the
+  # fail-open that function's own rule forbids. The sweep needs no protection from this predicate: it
+  # gates on `claim_selection_verdict` directly, where rc 2 acts on nothing.
+  : > "$O/state/claims-snapshot"
 
   # (1) THE LIVE ARM. One row per holding process; the branch is the primary signal.
   _live 'fix/7-thing	/repo/.worktrees/x	1234	/repo/.worktrees/x'
@@ -1252,7 +1292,82 @@ FAKE
   eqv "THIS box's own claim does not own a PR — only a live process can" "unowned" "$(_owned 12 ddd000000000)"
   printf 'refs/claims/12-ddd000000000	otherbox:1	1\n' > "$O/state/claims-snapshot"
   eqv "an EXPIRED foreign claim does not own its PR (the lease window is respected)" "unowned" "$(_owned 12 ddd000000000)"
+  # AN EMPTY SNAPSHOT IS NOT AN ABSENT ONE (agent-infra#2466). The remaining cases need "a registry
+  # that ANSWERED and holds nothing", so they leave a fresh, empty file — which reads claim-absent.
+  # The DELETED file now means claim-unreadable (pinned immediately below), and the two must never be
+  # conflated: that conflation WAS the fail-open.
+  : > "$O/state/claims-snapshot"
+  eqv "an EMPTY but fresh snapshot is a registry that answered: the PR is unowned" \
+      "unowned" "$(_owned 12 ddd000000000)"
   rm -f "$O/state/claims-snapshot"
+  # ⛔ THE POLARITY IS THE POINT (review, P1). An unreadable registry is NOT FREEDOM — the sweep
+  # acts on nothing — but it is NOT "OWNED" either: `unowned_scan` computes `n - owned`, so an
+  # "owned" answer empties the count and OPENS the issue path on a registry nobody read, which is
+  # the fail-open its own rule forbids. All three unreadable shapes below therefore read UNOWNED.
+  eqv "a MISSING snapshot is claim-UNREADABLE: the PR is NOT owned (the sweep still acts on nothing)" \
+      "unowned" "$(_owned 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tfailed\t0\n' "$(date +%s)" > "$O/state/claims-snapshot"
+  eqv "a snapshot written from a FAILED fetch is NOT ownership either (its entries are a stale read)" \
+      "unowned" "$(_owned 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tok\t0\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
+  eqv "a snapshot OLDER than the age bound is NOT ownership (a claim published since would be invisible)" \
+      "unowned" "$(_owned 12 ddd000000000)"
+  # ⛔ AND THE RC ITSELF, ON THE SHIPPED CHAIN (review, P1). Everything above grades `pr_owned` /
+  # `unowned_pr_count`, and BOTH answer "unowned" for rc 0 (claim-absent) and for rc 2
+  # (claim-unreadable) — they cannot tell the two words apart, and that separation IS this change.
+  # Measured: reverting the missing-file arm to the pre-fix `claim-absent; return 0` left EVERY
+  # assertion above green, because a reverted reader still says "unowned". So pin the rc the sweep
+  # actually branches on (`claim_selection_verdict`, the shipped wrapper over the shipped reader):
+  # 0 would be FREE, 1 HELD, 2 UNREADABLE — and the sweep acts on rc 0 only.
+  _seen()   { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; claim_selection_verdict "$1" "${2:-}" >/dev/null; echo $? ); }
+  : > "$O/state/claims-snapshot"
+  eqv "a FRESH, EMPTY snapshot is a registry that answered: the SELECTION verdict is rc 0 (free)" \
+      "0" "$(_seen 12 ddd000000000)"
+  rm -f "$O/state/claims-snapshot"
+  eqv "a MISSING snapshot makes the SELECTION verdict rc 2 (UNREADABLE), never free" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tfailed\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(date +%s)" > "$O/state/claims-snapshot"
+  eqv "a FAILED-FETCH header is rc 2 even when its rows are a LIVE lease (the entries are a stale read)" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tok\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
+  eqv "an OVER-AGE header is rc 2 even when its rows are a LIVE lease" \
+      "2" "$(_seen 12 ddd000000000)"
+  # ⛔ A FUTURE STAMP IS DROPPED, NEVER TRUSTED (review, P2). The reader used to CLAMP `read_at` ahead
+  # of the local clock to fresh (`age=0`), so the further ahead a stamp, the longer it was believed —
+  # with no age bound at all. Same one-sided-age rule AGENTS.md records for `skill-reads.json`.
+  printf '#claim-snapshot\t%d\tok\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(( $(date +%s) + 999 ))" > "$O/state/claims-snapshot"
+  eqv "a read instant AHEAD of this box's clock is rc 2 (its age cannot be established)" \
+      "2" "$(_seen 12 ddd000000000)"
+  # A header this reader cannot parse is not an old writer: the mtime fallback belongs ONLY to a first
+  # line that is not a header at all (that is what a pre-header writer produces).
+  printf '#claim-snapshot\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a header with NO usable read instant is rc 2, not a mtime-believed snapshot" \
+      "2" "$(_seen 12 ddd000000000)"
+  printf 'refs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a HEADER-LESS snapshot from an older writer still answers (mtime fallback kept)" \
+      "1" "$(_seen 12 ddd000000000)"
+  # ⛔ A SNAPSHOT THAT EXISTS BUT CANNOT BE READ IS UNREADABLE, NOT ABSENT (review, P1). `[ -f ]` is a
+  # stat, so it passes on a file this process cannot open; the reader then answered `claim-absent`
+  # (FREE) with the confidently wrong reason "no entry … read 0s ago". Root ignores permissions, so
+  # the arm is skipped (LOUDLY, never silently) on a root runner rather than being vacuous.
+  if [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+    printf 'refs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+    chmod 000 "$O/state/claims-snapshot" 2>/dev/null || true
+    eqv "an UNREADABLE snapshot file is rc 2 — a failed read is not an empty registry" \
+        "2" "$(_seen 12 ddd000000000)"
+    chmod 644 "$O/state/claims-snapshot" 2>/dev/null || true
+  else
+    echo "  ⏭ SKIP an UNREADABLE snapshot file is rc 2 — the arm needs a non-root uid (chmod 000 is ignored by root)"
+  fi
+  : > "$O/state/claims-snapshot"
+  # ⛔ AND THE GATE DIRECTION, not just the word. This is the assertion that catches the flip:
+  # with the old `*) return 0` arm every unreadable shape counted as owned, the un-owned count went
+  # to 0, and the drain gate opened with the whole PR queue invisible.
+  printf '12:ddd000000000:fix/12-b\n' > "$O/state/last-open-prs"
+  rm -f "$O/state/claims-snapshot"
+  eqv "…so an unreadable registry leaves the PR counted UN-OWNED and the issue path STAYS SHUT" \
+      "1" "$(_own 1)"
+  : > "$O/state/claims-snapshot"
 
   # (4) THE COUNT over a real listing, through the SHIPPED unowned_pr_count. Rows are
   # `number:head:branch` — the branch is in the row because ownership is per-PR and LIVE.
@@ -2383,13 +2498,16 @@ echo "=== the land probe is DRIVEN, not described (the stall line reads it) ==="
 # real dependencies (is_num, the mtime reader, the ownership arms) — a missing one makes `bash -n` or
 # the probe itself fail loudly instead of returning a plausible empty answer.
 {
-  ex file_mtime_epoch; ex pr_owned; ex claim_foreign_live; ex claim_live; ex claim_lease_live
+  ex file_mtime_epoch; ex pr_owned; ex claim_foreign_live; ex claim_selection_verdict; ex claim_live; ex claim_lease_live
   ex unowned_scan; ex unowned_pr_count; ex mp_recent_land
   grep -E '^is_num\(\) \{' "$ORCH"; grep -E '^_this_host\(\) \{' "$ORCH"
 } > "$TMP/pr_all.sh"
 if bash -n "$TMP/pr_all.sh" 2>/dev/null; then
   PO="$TMP/probeO"; mkdir -p "$PO/state"
-  _probe() { ( O="$PO"; WSESS=""; . "$TMP/pr_all.sh"; "$@" ); }
+  # A REGISTRY THAT ANSWERED AND HOLDS NOTHING (agent-infra#2466): without it the PRs here read
+  # `claim-unreadable` and every count is 0 — which is correct behaviour and the wrong fixture.
+  : > "$PO/state/claims-snapshot"
+  _probe() { ( O="$PO"; WSESS=""; . "$HERE/claims.sh"; . "$TMP/pr_all.sh"; "$@" ); }
   # (1) a landed PR is evidence of progress; nothing else is.
   eqv "no state/merged-*.done -> no land recorded" "" "$(_probe mp_recent_land)"
   : > "$PO/state/merged-1.done"
@@ -2411,7 +2529,7 @@ if bash -n "$TMP/pr_all.sh" 2>/dev/null; then
   # fixture's live table stands in for the process, as in the ownership section above.
   printf 'fix/7-thing\t/repo/.worktrees/x\t1234\t/repo/.worktrees/x\n' > "$PO/state/live.tsv"
   eqv "a 3-FIELD row whose HEAD REF is held by a live process reads OWNED" "1" \
-      "$( ( O="$PO"; LO_SCAN=1; LO_LIVE="$PO/state/live.tsv"; . "$TMP/pr_all.sh"; . "$LO"; unowned_pr_count 2 ) )"
+      "$( ( O="$PO"; LO_SCAN=1; LO_LIVE="$PO/state/live.tsv"; . "$HERE/claims.sh"; . "$TMP/pr_all.sh"; . "$LO"; unowned_pr_count 2 ) )"
   rm -f "$PO/state/live.tsv"
   # ⛔ THE OLDER-ROW TOLERANCE IS KEPT, RE-POINTED: a 2-field row has no branch, so only the local
   # arms can own it — it must parse, never crash and never invent a branch.
